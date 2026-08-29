@@ -1718,5 +1718,425 @@ class TorchIdentityFieldsAgainstADryRunDumpTests(unittest.TestCase):
         )
 
 
+# ============================================================================
+# unit 63 H4b — finetune-run A/B merger tests (docs-ci domain).
+# ============================================================================
+
+
+def _finetune_run_tier(arm="fused", **overrides):
+    """A minimal, fully-populated `FinetuneRunTier`-shaped dict — every
+    `FINETUNE_RUN_IDENTITY_FIELDS` entry, every `PROVENANCE_FIELDS` entry
+    (report.rs), the three premise legs (`admission_is_dense`,
+    `learning_happened_delta`, `tie_fraction`), and the measurement fields
+    (`final_epoch`, `held_out_example_mean`, `held_out_count`,
+    `final_loss_diagnostic`, `trajectory`). Defaults to MNRL (`margin=None`,
+    `temperature=20.0`) and a CLEAN premise (padded transport, learning
+    happened, no ties) — every mutant test below overrides exactly the one
+    field it means to break.
+    """
+    tier = {
+        "seed": 42,
+        "batch": 32,
+        "seq": 64,
+        "lora_rank": 8,
+        "lora_alpha": 16.0,
+        "lora_dropout": 0.05,
+        "margin": None,
+        "target_modules": ["Wqkv", "Wo", "Wi"],
+        "batched_forward": True,
+        "backbone_dtype": "f32",
+        "steps_measured": 100,
+        "checkpoint_config_sha256": "cfg-sha",
+        "checkpoint_weights_sha256": "weights-sha",
+        "checkpoint_weights_size_bytes": 12345,
+        "max_grad_norm": None,
+        "warmup": None,
+        "row_lengths": None,
+        "epochs": 1,
+        "lr": 0.0002,
+        "schedule": "constant",
+        "warmup_steps": 0,
+        "weight_decay": 0.01,
+        "grad_accum": 1,
+        "validation_fraction": 0.1,
+        "split_rule": "last-N-pairs-by-mining-order",
+        "split_seed": 42,
+        "dataset_sha256": "dataset-sha",
+        "heldout_ids_sha256": "heldout-ids-sha",
+        "heldout_batch_partition_sha256": "partition-sha",
+        "embedding_loss": "mnrl",
+        "temperature": 20.0,
+        "matryoshka_dims": [],
+        "early_stopping_patience": 10000,
+        "early_stopping_metric": "val_loss",
+        "eval_cadence": 1,
+        # provenance (PROVENANCE_FIELDS)
+        "arm": arm,
+        "device_name": "cuda:0-fixture",
+        "kernels_disabled_requested": [] if arm == "fused" else ["attention_block_flash", "adamw_step_fused"],
+        "kernels_disabled_fired": [] if arm == "fused" else ["attention_block_flash", "adamw_step_fused"],
+        "flash_compiled": True,
+        "build_features": ["cuda"],
+        "attention_arm": "fused" if arm == "fused" else "eager",
+        # premise legs
+        "admission_is_dense": False,
+        "learning_happened_delta": 0.05,
+        "tie_fraction": 0.0,
+        # measurements
+        "final_epoch": 0,
+        "held_out_example_mean": 0.5,
+        "held_out_count": 128,
+        "final_loss_diagnostic": 0.4,
+        "trajectory": [
+            {
+                "epoch": 0,
+                "held_out_mean": 0.5,
+                "held_out_tie_fraction": 0.0,
+                "held_out_batch_partition_sha256": "partition-sha",
+            }
+        ],
+    }
+    tier.update(overrides)
+    return tier
+
+
+def _write_finetune_run_leg(raw_dir, seed, arm, repeat, tier, exit_code="0"):
+    base = os.path.join(raw_dir, f"seed{seed}__{arm}__{repeat}")
+    with open(base + ".json", "w") as fh:
+        json.dump({"tiers": {"finetune_run": tier}}, fh)
+    with open(base + ".exit", "w") as fh:
+        fh.write(exit_code)
+    with open(base + ".stderr", "w") as fh:
+        fh.write("")
+
+
+class SignTestMirrorTests(unittest.TestCase):
+    """`ab_merge.sign_test` is a Python u128-equivalent mirror of
+    `jammi_numerics::stats::sign_test::sign_test` (branch
+    `numerics/63-sign-test`) — every case here is transcribed directly from
+    that module's own `tests/it/stats.rs` cases, hand-computation comments
+    included, so a divergence between the two implementations is caught by
+    literally re-running the SAME arithmetic this suite's Rust twin already
+    pins.
+    """
+
+    def test_golden_n12_k11_pinned_cell(self):
+        # CONTRACT H2 / PLAN v2 delta 3's pre-registered decision cell:
+        # t=11, tail=C(12,11)+C(12,12)=12+1=13, p=2*13/4096=13/2048.
+        diffs = [1.0] * 11 + [-1.0]
+        r = ab_merge.sign_test(diffs)
+        self.assertEqual((r["n"], r["n_pos"], r["n_neg"], r["ties"]), (12, 11, 1, 0))
+        expected = 13.0 / 2048.0
+        self.assertEqual(
+            r["p_value"].hex(),
+            expected.hex(),
+            f"golden cell (n=12, k=11) must equal 13/2048 bit-for-bit, got {r['p_value']}",
+        )
+        self.assertLess(abs(r["p_value"] - 0.0064), 0.0005)
+
+    def test_exact_small_n_all_same_sign(self):
+        r = ab_merge.sign_test([2.0, 3.0, 1.0, 0.5, 7.0])
+        self.assertEqual((r["n"], r["n_pos"], r["n_neg"], r["ties"]), (5, 5, 0, 0))
+        self.assertEqual(r["p_value"].hex(), (2.0 / 32.0).hex())
+
+    def test_exact_small_n_one_dissent(self):
+        r = ab_merge.sign_test([2.0, 3.0, 1.0, 0.5, -7.0])
+        self.assertEqual((r["n"], r["n_pos"], r["n_neg"], r["ties"]), (5, 4, 1, 0))
+        self.assertEqual(r["p_value"].hex(), (12.0 / 32.0).hex())
+
+    def test_exact_small_n_balanced_saturates_at_one(self):
+        r = ab_merge.sign_test([1.0, 1.0, -1.0, -1.0])
+        self.assertEqual((r["n"], r["n_pos"], r["n_neg"], r["ties"]), (4, 2, 2, 0))
+        self.assertEqual(r["p_value"], 1.0)
+
+    def test_two_sided_symmetry(self):
+        diffs = [3.0, 1.5, -2.0, 4.0, 0.2, -0.1, 5.0, -6.0, 0.9, 2.2, -1.1, 8.0]
+        flipped = [-d for d in diffs]
+        r = ab_merge.sign_test(diffs)
+        rf = ab_merge.sign_test(flipped)
+        self.assertEqual(r["n"], rf["n"])
+        self.assertEqual(r["n_pos"], rf["n_neg"])
+        self.assertEqual(r["n_neg"], rf["n_pos"])
+        self.assertEqual(r["p_value"].hex(), rf["p_value"].hex())
+
+    def test_reports_ties_without_dropping_them(self):
+        r = ab_merge.sign_test([1.0, 1.0, 1.0, 0.0, 0.0, -1.0])
+        self.assertEqual(r["n"], 4, "ties must be excluded from n, not folded in")
+        self.assertEqual((r["n_pos"], r["n_neg"], r["ties"]), (3, 1, 2))
+        self.assertEqual(r["p_value"].hex(), (10.0 / 16.0).hex())
+
+    def test_refuses_empty_input(self):
+        with self.assertRaises(ab_merge.SignTestError) as ctx:
+            ab_merge.sign_test([])
+        self.assertIn("n=0", str(ctx.exception))
+
+    def test_refuses_all_ties_with_a_distinct_message(self):
+        with self.assertRaises(ab_merge.SignTestError) as ctx:
+            ab_merge.sign_test([0.0, 0.0, 0.0])
+        msg = str(ctx.exception)
+        self.assertTrue("tie" in msg or "tied" in msg, msg)
+
+    def test_refuses_nan(self):
+        with self.assertRaises(ab_merge.SignTestError):
+            ab_merge.sign_test([1.0, float("nan"), -1.0])
+
+    def test_admits_infinite_as_a_well_defined_sign(self):
+        r = ab_merge.sign_test([float("inf"), float("-inf"), 1.0, 2.0, 3.0])
+        self.assertEqual((r["n"], r["n_pos"], r["n_neg"], r["ties"]), (5, 4, 1, 0))
+
+    def test_negative_control_balanced_is_not_significant(self):
+        diffs = [1.0] * 6 + [-1.0] * 6
+        r = ab_merge.sign_test(diffs)
+        self.assertEqual(r["n"], 12)
+        self.assertGreater(r["p_value"], 0.5)
+
+    def test_is_invariant_to_input_order(self):
+        ordered = [1.0, -1.0, 1.0, 1.0, 0.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, 1.0]
+        shuffled = list(reversed(ordered))
+        shuffled = shuffled[3:] + shuffled[:3]  # rotate_left(3)
+        self.assertNotEqual(ordered, shuffled)
+        a = ab_merge.sign_test(ordered)
+        b = ab_merge.sign_test(shuffled)
+        self.assertEqual((a["n"], a["n_pos"], a["n_neg"], a["ties"]), (b["n"], b["n_pos"], b["n_neg"], b["ties"]))
+        self.assertEqual(a["p_value"].hex(), b["p_value"].hex())
+
+
+class FinetuneRunArmPremiseMutantTests(unittest.TestCase):
+    """`finetune_run_arm_premise_violations` — one mutant per premise leg
+    (CONTRACT Frame / H4: admission_is_dense / learning-happened / tie cap,
+    conjunctive). A clean tier clears all three; each mutation trips exactly
+    the leg it targets, proving none of the three checks is vacuous.
+    """
+
+    def test_clean_tier_has_no_violations(self):
+        self.assertEqual(ab_merge.finetune_run_arm_premise_violations("fused", _finetune_run_tier()), [])
+
+    def test_dense_leg_is_a_violation(self):
+        tier = _finetune_run_tier(admission_is_dense=True)
+        v = ab_merge.finetune_run_arm_premise_violations("fused", tier)
+        self.assertTrue(any("admission_is_dense" in m for m in v), v)
+
+    def test_no_learning_happened_is_a_violation(self):
+        tier = _finetune_run_tier(learning_happened_delta=0.0)
+        v = ab_merge.finetune_run_arm_premise_violations("fused", tier)
+        self.assertTrue(any("learning_happened_delta" in m for m in v), v)
+
+        tier2 = _finetune_run_tier(learning_happened_delta=-0.01)
+        v2 = ab_merge.finetune_run_arm_premise_violations("fused", tier2)
+        self.assertTrue(any("learning_happened_delta" in m for m in v2), v2)
+
+    def test_saturated_tie_fraction_is_a_violation(self):
+        # C16's own hinge-saturation shape: tie_fraction -> 1.0.
+        tier = _finetune_run_tier(tie_fraction=1.0)
+        v = ab_merge.finetune_run_arm_premise_violations("fused", tier)
+        self.assertTrue(any("tie_fraction" in m for m in v), v)
+
+    def test_tie_fraction_just_under_cap_is_clean(self):
+        tier = _finetune_run_tier(tie_fraction=ab_merge.FINETUNE_RUN_TIE_FRACTION_CAP - 0.01)
+        self.assertEqual(ab_merge.finetune_run_arm_premise_violations("fused", tier), [])
+
+
+class FinetuneRunCrossArmIdentityTests(unittest.TestCase):
+    """Cross-arm identity check (`generic_leg_premise_violations` over
+    `FINETUNE_RUN_IDENTITY_FIELDS`) — the fused/alloff legs of ONE seed must
+    share every identity field; `arm`/`attention_arm` (provenance) are
+    allowed, indeed expected, to differ.
+    """
+
+    def test_matching_identity_is_clean(self):
+        fused = ab_merge.finetune_run_leg_identity(_finetune_run_tier(arm="fused"))
+        alloff = ab_merge.finetune_run_leg_identity(_finetune_run_tier(arm="alloff"))
+        self.assertEqual(
+            ab_merge.generic_leg_premise_violations(
+                ab_merge.FINETUNE_RUN_IDENTITY_FIELDS, fused, alloff, "fused", "alloff"
+            ),
+            [],
+        )
+
+    def test_differing_heldout_ids_sha256_is_a_violation(self):
+        fused = ab_merge.finetune_run_leg_identity(_finetune_run_tier(arm="fused"))
+        alloff = ab_merge.finetune_run_leg_identity(
+            _finetune_run_tier(arm="alloff", heldout_ids_sha256="different-sha")
+        )
+        v = ab_merge.generic_leg_premise_violations(
+            ab_merge.FINETUNE_RUN_IDENTITY_FIELDS, fused, alloff, "fused", "alloff"
+        )
+        self.assertTrue(any("heldout_ids_sha256" in m for m in v), v)
+
+    def test_null_is_a_value_for_margin_and_temperature(self):
+        # Both arms MNRL (margin=None both sides) must match cleanly --
+        # a present null on BOTH sides is the stated premise, never MISSING.
+        fused = ab_merge.finetune_run_leg_identity(_finetune_run_tier(arm="fused"))
+        alloff = ab_merge.finetune_run_leg_identity(_finetune_run_tier(arm="alloff"))
+        self.assertIsNot(fused["margin"], ab_merge._MISSING)
+        self.assertIsNone(fused["margin"])
+        self.assertEqual(
+            ab_merge.generic_leg_premise_violations(
+                ab_merge.FINETUNE_RUN_IDENTITY_FIELDS, fused, alloff, "fused", "alloff"
+            ),
+            [],
+        )
+
+
+class FinetuneRunDeterminismFloorTests(unittest.TestCase):
+    """`build_finetune_run_report`'s r1/r2 determinism-floor reporting
+    (CONTRACT H4/PLAN.md v2 delta 6): the delta is ALWAYS measured and
+    reported; it is RED (a `determinism_floor.findings` entry, and the
+    overall `status` collapses to `INVALID`) only when it exceeds the
+    cross-seed spread of `d_i`.
+    """
+
+    def _write_seed(self, raw_dir, seed, fused_mean, alloff_mean, fused_r2_mean=None, alloff_r2_mean=None):
+        fused_r2_mean = fused_mean if fused_r2_mean is None else fused_r2_mean
+        alloff_r2_mean = alloff_mean if alloff_r2_mean is None else alloff_r2_mean
+        _write_finetune_run_leg(
+            raw_dir, seed, "fused", "r1", _finetune_run_tier(arm="fused", seed=seed, held_out_example_mean=fused_mean)
+        )
+        _write_finetune_run_leg(
+            raw_dir,
+            seed,
+            "fused",
+            "r2",
+            _finetune_run_tier(arm="fused", seed=seed, held_out_example_mean=fused_r2_mean),
+        )
+        _write_finetune_run_leg(
+            raw_dir,
+            seed,
+            "alloff",
+            "r1",
+            _finetune_run_tier(arm="alloff", seed=seed, held_out_example_mean=alloff_mean),
+        )
+        _write_finetune_run_leg(
+            raw_dir,
+            seed,
+            "alloff",
+            "r2",
+            _finetune_run_tier(arm="alloff", seed=seed, held_out_example_mean=alloff_r2_mean),
+        )
+
+    def test_identical_r1_r2_never_reds(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_seed(raw_dir, 1, 0.40, 0.50)
+            self._write_seed(raw_dir, 2, 0.35, 0.52)
+            self._write_seed(raw_dir, 3, 0.42, 0.48)
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, [1, 2, 3])
+        self.assertEqual(merged["determinism_floor"]["findings"], [])
+        self.assertEqual(merged["determinism_floor"]["max_delta"], 0.0)
+        self.assertEqual(merged["status"], "GREEN")
+
+    def test_delta_exceeding_cross_seed_spread_reds(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            # Three seeds whose d_i are tightly clustered (small cross-seed
+            # spread), then one seed's OWN r1/r2 repeat disagrees by far
+            # more than that spread -- the exact shape the floor exists to
+            # catch (a nondeterminism the seed spread would otherwise mask).
+            self._write_seed(raw_dir, 1, 0.400, 0.500)
+            self._write_seed(raw_dir, 2, 0.401, 0.501)
+            self._write_seed(raw_dir, 3, 0.399, 0.499, fused_r2_mean=0.700)
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, [1, 2, 3])
+        self.assertGreater(len(merged["determinism_floor"]["findings"]), 0)
+        self.assertTrue(any("seed 3" in f and "fused" in f for f in merged["determinism_floor"]["findings"]))
+        self.assertEqual(merged["status"], "INVALID")
+
+    def test_fewer_than_two_d_values_falls_back_to_zero_spread(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_seed(raw_dir, 1, 0.40, 0.50, fused_r2_mean=0.41)
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, [1])
+        self.assertEqual(merged["cross_seed_spread"], 0.0)
+        self.assertGreater(len(merged["determinism_floor"]["findings"]), 0)
+
+
+class BuildFinetuneRunReportEndToEndTests(unittest.TestCase):
+    """`build_finetune_run_report` / `ab_merge.main(["finetune-run", ...])`
+    — the REAL entry point `finetune_run_ab.sh` invokes, driven against
+    fixture leg directories (never a hand-rolled call to `sign_test` alone
+    standing in for the merge).
+    """
+
+    def _write_clean_seed(self, raw_dir, seed, fused_mean, alloff_mean):
+        for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+            for repeat in ("r1", "r2"):
+                _write_finetune_run_leg(
+                    raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                )
+
+    def test_end_to_end_green_matches_direct_sign_test(self):
+        seeds = [1, 2, 3, 4, 5]
+        # fused strictly beats alloff (lower held-out loss) on every seed --
+        # unanimous sign, mirrors the golden (12, 11) shape at n=5, k=5.
+        means = {1: (0.30, 0.50), 2: (0.32, 0.48), 3: (0.29, 0.55), 4: (0.31, 0.47), 5: (0.28, 0.52)}
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in seeds:
+                self._write_clean_seed(raw_dir, seed, *means[seed])
+            merged, table = ab_merge.build_finetune_run_report(raw_dir, seeds)
+
+        self.assertEqual(merged["status"], "GREEN")
+        expected_d = [means[s][0] - means[s][1] for s in seeds]
+        expected = ab_merge.sign_test(expected_d)
+        self.assertEqual(merged["sign_test"]["n"], expected["n"])
+        self.assertEqual(merged["sign_test"]["n_pos"], expected["n_pos"])
+        self.assertEqual(merged["sign_test"]["n_neg"], expected["n_neg"])
+        self.assertEqual(merged["sign_test"]["p_value"].__class__, float)
+        self.assertEqual(merged["sign_test"]["p_value"], expected["p_value"])
+        self.assertIn("sign_test:", table)
+        self.assertEqual(len(merged["per_seed"]), len(seeds))
+        for seed in seeds:
+            self.assertIn("fused", merged["per_seed"][str(seed)]["trajectory"])
+            self.assertIn("alloff", merged["per_seed"][str(seed)]["trajectory"])
+
+    def test_a_single_seed_premise_violation_invalidates_the_whole_merge(self):
+        seeds = [1, 2, 3]
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_clean_seed(raw_dir, 1, 0.30, 0.50)
+            self._write_clean_seed(raw_dir, 2, 0.31, 0.49)
+            # seed 3's fused leg saturates its tie fraction -- a single
+            # tripped premise leg on ONE seed collapses the whole merge's
+            # status, mirroring build_report's own INVALID carve-out.
+            for repeat in ("r1", "r2"):
+                _write_finetune_run_leg(
+                    raw_dir, 3, "fused", repeat, _finetune_run_tier(arm="fused", seed=3, tie_fraction=1.0)
+                )
+                _write_finetune_run_leg(
+                    raw_dir, 3, "alloff", repeat, _finetune_run_tier(arm="alloff", seed=3)
+                )
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, seeds)
+
+        self.assertEqual(merged["status"], "INVALID")
+        self.assertTrue(merged["per_seed"]["3"]["leg_premise_violations"])
+        # seeds 1/2 stay premise-clean and still contribute their own d_i to
+        # the record, even though the OVERALL merge is INVALID.
+        self.assertIsNotNone(merged["per_seed"]["1"]["d_i"])
+        self.assertIsNotNone(merged["per_seed"]["2"]["d_i"])
+        self.assertNotIn("3", merged["d_values"])
+
+    def test_main_finetune_run_dispatch_writes_report_and_exits_0_on_green(self):
+        seeds = [1, 2, 3]
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed, (fm, am) in zip(seeds, [(0.30, 0.50), (0.32, 0.48), (0.29, 0.55)]):
+                self._write_clean_seed(raw_dir, seed, fm, am)
+            rc = ab_merge.main(["finetune-run", raw_dir, out_dir, "1,2,3"])
+            self.assertEqual(rc, 0)
+            report_path = os.path.join(out_dir, "finetune_run_ab_report.json")
+            self.assertTrue(os.path.exists(report_path))
+            with open(report_path) as fh:
+                merged = json.load(fh)
+            self.assertEqual(merged["status"], "GREEN")
+
+    def test_main_finetune_run_dispatch_exits_1_on_invalid(self):
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for repeat in ("r1", "r2"):
+                _write_finetune_run_leg(
+                    raw_dir, 1, "fused", repeat, _finetune_run_tier(arm="fused", seed=1, admission_is_dense=True)
+                )
+                _write_finetune_run_leg(raw_dir, 1, "alloff", repeat, _finetune_run_tier(arm="alloff", seed=1))
+            rc = ab_merge.main(["finetune-run", raw_dir, out_dir, "1"])
+            self.assertEqual(rc, 1)
+
+    def test_empty_raw_dir_is_a_hard_failure(self):
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            rc = ab_merge.main(["finetune-run", raw_dir, out_dir, "1,2,3"])
+        self.assertEqual(rc, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

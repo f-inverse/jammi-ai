@@ -309,6 +309,11 @@ pub struct Tiers {
     /// device. Recorded, never gated. Populated by `finetune-step`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finetune_step: Option<FinetuneStepTier>,
+    /// The finetune-run tier (unit 63, CONTRACT H4): one full (seed, arm)
+    /// fine-tune run driving the REAL `TrainingLoopBuilder` and the public
+    /// per-example held-out evaluation seam. Populated by `finetune-run`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finetune_run: Option<FinetuneRunTier>,
     /// The CPU-hermetic conformal-coverage tier: the engine's split-conformal
     /// calibration drives a marginal coverage that is gated against a committed
     /// floor (`coverage_floor = measured − MARGIN`, the recall-floor idiom), one
@@ -1813,6 +1818,307 @@ impl FinetuneStepTier {
     ];
 }
 
+/// One epoch's held-out example-mean loss point, recorded during
+/// [`crate::finetune_run`]'s resume-cycled multi-epoch drive (CONTRACT H4:
+/// "full per-epoch trajectory recorded").
+#[derive(Debug, Serialize)]
+pub struct EpochHeldOut {
+    /// 0-based epoch index this point was measured after.
+    pub epoch: usize,
+    /// `HeldOutLoss::mean` — the example-mean over the committed held-out
+    /// fixture, measured via `TrainingLoop::evaluate_held_out` immediately
+    /// after this epoch's `run()` leg returned.
+    pub held_out_mean: f64,
+    /// `HeldOutLoss::tie_fraction` at this epoch.
+    pub held_out_tie_fraction: f64,
+    /// `HeldOutLoss::batch_partition_sha256` at this epoch — recorded per
+    /// point (not only at the final epoch) because the partition is
+    /// deterministic from `(held-out ids, batch_size)` alone and should
+    /// therefore read IDENTICAL at every point; a divergence here across
+    /// epochs is itself a finding (the held-out id list or batch size
+    /// silently changed mid-run).
+    pub held_out_batch_partition_sha256: String,
+}
+
+/// The finetune-run tier (unit 63, CONTRACT H4 / PLAN (d)): one full
+/// (seed, arm) fine-tune run driving the REAL
+/// [`jammi_ai::fine_tune::trainer::TrainingLoopBuilder`] and the public
+/// per-example held-out evaluation seam
+/// ([`jammi_ai::fine_tune::trainer::TrainingLoop::evaluate_held_out`], unit
+/// 63 H1) — see [`crate::finetune_run`]'s module doc for the full design
+/// (resume-cycled per-epoch trajectory, arm-as-provenance, the disjoint
+/// held-out/train-split convention).
+///
+/// ## The endpoint is `held_out_example_mean`, never `final_loss_diagnostic`
+///
+/// CONTRACT H4/Frame: `d_i` (the C16/H2 paired sign test's per-seed datum)
+/// is the FINAL-epoch `evaluate_held_out().mean` — [`Self::held_out_example_mean`],
+/// paired with [`Self::final_epoch`]. [`Self::final_loss_diagnostic`] is
+/// `TrainingResult::final_loss` (`best_val_loss`, a MIN-over-epochs order
+/// statistic, `trainer.rs:1038/1048`) — recorded for comparison ONLY, never
+/// the quantity a downstream merger should read as `d_i`.
+///
+/// ## Identity vs provenance (E3's disjoint convention, followed here)
+///
+/// [`Self::IDENTITY_FIELDS`] and [`Self::PROVENANCE_FIELDS`] are DISJOINT
+/// sets — [`EncodeStepTier`]'s convention (its own doc's "provenance never
+/// compared cross-producer"), not [`FinetuneStepTier`]'s superset-that-
+/// includes-provenance-as-K7-completeness-additions convention. This is a
+/// DELIBERATE deviation from "superset of the existing 18" read literally:
+/// `attention_arm` is one of `FinetuneStepTier`'s 18 comparison fields
+/// there, but on THIS tier it moves to provenance alongside the new `arm`
+/// field, because the arm is the C16/H2 experiment's INDEPENDENT VARIABLE —
+/// a merger that paired legs only when `attention_arm` (or `arm`) agreed
+/// could never pair a fused leg with an alloff leg at all, defeating the
+/// A/B protocol the sign test exists to run (CONTRACT H4: "the arm is
+/// provenance, never identity"). Every other one of `FinetuneStepTier`'s 18
+/// carries over into [`Self::IDENTITY_FIELDS`] verbatim (by name; `warmup`
+/// and `row_lengths` read a DIFFERENT `NullMeans` reason here than there,
+/// because a full multi-epoch real-text run has no per-tier
+/// "discard-before-timing" convention and no single fixed row-lengths vector
+/// over variable-length real text).
+///
+/// ## `margin`/`temperature`: objective-selected nullness (H4a-delta, CONTRACT
+/// amendment 2026-08-28)
+///
+/// Unlike `FinetuneStepTier` (which always trains a hardcoded-margin Triplet
+/// and so declares `margin` unconditionally `NonNull`), this tier runs
+/// EITHER objective over the SAME committed fixture — H4a found the
+/// committed H3 fixture TRIPLET-shaped, while the Frame's own
+/// "embedding_loss+temp" phrasing anticipated MNRL, and H5 step 0's
+/// dynamic-range probe needs BOTH to choose between them. So `margin` and
+/// `temperature` are BOTH `Option`, and exactly one is `Some` per run,
+/// selected by [`crate::finetune_run::Objective`]: `Objective::Triplet` →
+/// `margin` non-null (the real, configured Triplet margin — never
+/// `FinetuneStepTier`'s hardcoded `0.3`), `temperature` null
+/// (`NullMeans("objective is triplet")`); `Objective::Mnrl` → `temperature`
+/// non-null, `margin` null (`NullMeans("objective is mnrl")`). See each
+/// field's own doc below.
+#[derive(Debug, Serialize)]
+pub struct FinetuneRunTier {
+    // ── Identity: FinetuneStepTier's 18 (minus attention_arm — see struct
+    //    doc), carried over by name ────────────────────────────────────
+    pub seed: u64,
+    pub batch: usize,
+    /// `--max-seq-length` — the tokenizer truncation cap this run's config
+    /// used (NOT a per-batch measured width: real text pairs vary in
+    /// length row to row, unlike `finetune-step`'s fixed synthetic `seq`).
+    pub seq: usize,
+    pub lora_rank: usize,
+    pub lora_alpha: f64,
+    pub lora_dropout: f64,
+    /// The Triplet objective's margin — `Some` only when
+    /// [`crate::finetune_run::Objective::Triplet`] was selected for this
+    /// run; `null` (`NullMeans("objective is mnrl")`) when
+    /// [`crate::finetune_run::Objective::Mnrl`] was selected instead — see
+    /// the struct doc's "objective-selected nullness" section and
+    /// [`Self::temperature`]'s doc for MNRL's own scale knob.
+    pub margin: Option<f64>,
+    pub target_modules: Vec<String>,
+    /// Always `true`: `TrainingLoop::encode_chunk`'s `Pairs`/`Triplet` arms
+    /// always encode anchor+positive(+negative) in ONE joined forward via
+    /// `encode_groups` — production has no un-batched arm for this tier to
+    /// record `false` for (unlike `finetune-step`, which offers both as a
+    /// within-run A/B).
+    pub batched_forward: bool,
+    pub backbone_dtype: String,
+    /// Cumulative optimizer steps (`TrainingResult::total_steps` summed)
+    /// across every resume-cycled epoch leg this run took.
+    pub steps_measured: usize,
+    pub checkpoint_config_sha256: String,
+    pub checkpoint_weights_sha256: String,
+    pub checkpoint_weights_size_bytes: u64,
+    /// `null` means clipping was off (`FineTuneConfig::max_grad_norm ==
+    /// 0.0`) — same `NullMeans` reason `FinetuneStepTier::max_grad_norm`
+    /// carries.
+    pub max_grad_norm: Option<f64>,
+    /// `null`: a full run has no "discard before timing" pre-step
+    /// convention (unlike `finetune-step`'s own `warmup`, a per-tier
+    /// micro-benchmark concept) — see `warmup_steps` for this tier's real
+    /// LR-schedule warmup analogue.
+    pub warmup: Option<usize>,
+    /// `null`: real text is variable-length per micro-batch, so no single
+    /// fixed vector describes "the" row lengths across a whole multi-epoch
+    /// run the way `finetune-step`'s fixed synthetic batch can.
+    pub row_lengths: Option<Vec<usize>>,
+
+    // ── Identity: new fields (PLAN (d) / CONTRACT H4 v1+v2) ─────────────
+    pub epochs: usize,
+    pub lr: f64,
+    pub schedule: String,
+    pub warmup_steps: usize,
+    pub weight_decay: f64,
+    pub grad_accum: usize,
+    pub validation_fraction: f64,
+    /// How `run()`'s internal early-stopping validation slice was carved
+    /// out of the TRAIN rows this tier fed it — `TrainingDataLoader::split`
+    /// is a plain positional (unshuffled) fraction split, never RNG-based,
+    /// so this is a fixed constant across every leg this tier can produce.
+    pub split_rule: String,
+    /// The run's overall seed also governs (indirectly, via how the caller
+    /// assembled `train_pairs`' row order) the split point — `split()`
+    /// itself takes no separate seed parameter.
+    pub split_seed: u64,
+    pub dataset_sha256: String,
+    pub heldout_ids_sha256: String,
+    /// `HeldOutLoss::batch_partition_sha256` at the FINAL epoch — the
+    /// partition the reported [`Self::held_out_example_mean`] was scored
+    /// under (CONTRACT H1 v2 delta 9: a property of `(model, partition)`).
+    pub heldout_batch_partition_sha256: String,
+    /// `"triplet"` or `"mnrl"` — [`crate::finetune_run::Objective::as_str`],
+    /// selected by the run's `--objective` flag (CONTRACT amendment
+    /// 2026-08-28). Named in CONTRACT H4 as "embedding_loss+temperature";
+    /// this tier trains BOTH objectives it names (H4a-delta), over the SAME
+    /// committed fixture, so this field is genuinely NonNull either way.
+    pub embedding_loss: String,
+    /// MNRL's similarity-scale knob — `Some` only when
+    /// [`crate::finetune_run::Objective::Mnrl`] was selected for this run;
+    /// `null` (`NullMeans("objective is triplet")`) when
+    /// [`crate::finetune_run::Objective::Triplet`] was selected instead —
+    /// see the struct doc's "objective-selected nullness" section and
+    /// [`Self::margin`]'s doc for the Triplet objective's own scale knob.
+    pub temperature: Option<f64>,
+    pub matryoshka_dims: Vec<usize>,
+    pub early_stopping_patience: usize,
+    pub early_stopping_metric: String,
+    /// How often (in epochs) `evaluate_held_out` was called against the
+    /// held-out fixture during this run's resume-cycle — always including
+    /// the final epoch regardless of this cadence (see
+    /// [`crate::finetune_run::run`]'s doc).
+    pub eval_cadence: usize,
+
+    // ── Provenance: PROVENANCE_FIELDS, disjoint from identity ───────────
+    /// The CALLER-declared arm (`--arm`) — see this struct's own doc for
+    /// why this is provenance, never identity.
+    pub arm: String,
+    pub device_name: String,
+    pub kernels_disabled_requested: Vec<String>,
+    pub kernels_disabled_fired: Vec<String>,
+    pub flash_compiled: bool,
+    pub build_features: Vec<&'static str>,
+    /// The PROCESS-resolved attention reference class
+    /// ([`crate::finetune_step::attention_arm`]) — what actually ran,
+    /// distinct from the caller's declared `arm` (mirrors
+    /// `FinetuneStepTier::attention_arm`'s own semantics), but PROVENANCE
+    /// here (not identity) for the same reason `arm` is.
+    pub attention_arm: String,
+
+    // ── Premise legs (CONTRACT H4: "recorded per run, conjunctive, for
+    //    the merger to refuse on") ───────────────────────────────────────
+    /// `admission.is_dense` for this arm's real-text forward path — always
+    /// `false` (v2 delta 8): the committed fixture's variable-length arxiv
+    /// pairs take the PADDED transport, never the dense branch T6's
+    /// 1.55x figure was measured on. Pre-registered rather than measured —
+    /// see [`crate::finetune_run::run`]'s own doc for why this tier's
+    /// real-text path never reaches `forward_with_lengths`'s dense/padded
+    /// fork at all.
+    pub admission_is_dense: bool,
+    /// `first_epoch_train_probe_mean - final_epoch_train_probe_mean` — the
+    /// "learning-happened" floor leg (CONTRACT H4), measured via the SAME
+    /// public seam over a fixed TRAIN-side probe batch (never the held-out
+    /// fixture) at epoch 0 and at the final epoch. Positive means the
+    /// probe's loss went DOWN over the run (learning happened); see
+    /// [`crate::finetune_run::run`]'s doc for why this is a probe under
+    /// the seam's own per-example convention, not the trainer's internal
+    /// `avg_train_loss`.
+    pub learning_happened_delta: f64,
+    /// `HeldOutLoss::tie_fraction` at the final epoch — the "tie cap"
+    /// premise leg.
+    pub tie_fraction: f64,
+
+    // ── Measurements: recorded, never gated here (the merger gates) ─────
+    /// 0-based index of the final epoch this run reached (`epochs - 1`).
+    pub final_epoch: usize,
+    /// THE endpoint (see struct doc): `evaluate_held_out().mean` at
+    /// `final_epoch`.
+    pub held_out_example_mean: f64,
+    pub held_out_count: usize,
+    /// `TrainingResult::final_loss` at the LAST epoch leg — DIAGNOSTIC
+    /// ONLY, explicitly never `d_i` (see struct doc).
+    pub final_loss_diagnostic: f64,
+    /// The full per-epoch held-out trajectory (CONTRACT H4/v2 delta 4),
+    /// one point per epoch this run actually evaluated (every
+    /// `eval_cadence`th epoch, plus the final epoch unconditionally).
+    pub trajectory: Vec<EpochHeldOut>,
+}
+
+impl FinetuneRunTier {
+    /// The comparison identity: `FinetuneStepTier`'s 18 (minus
+    /// `attention_arm`, moved to provenance — see struct doc) plus the 18
+    /// new fields PLAN (d) / CONTRACT H4 name. 17 + 18 = 35.
+    ///
+    /// DISJOINT from [`Self::PROVENANCE_FIELDS`] (E3's convention, not
+    /// `FinetuneStepTier`'s superset one) — see struct doc.
+    pub const IDENTITY_FIELDS: &'static [(&'static str, Nullable)] = &[
+        // FinetuneStepTier's 18, minus attention_arm (17 entries).
+        ("seed", Nullable::NonNull),
+        ("batch", Nullable::NonNull),
+        ("seq", Nullable::NonNull),
+        ("lora_rank", Nullable::NonNull),
+        ("lora_alpha", Nullable::NonNull),
+        ("lora_dropout", Nullable::NonNull),
+        // H4a-delta (CONTRACT amendment 2026-08-28): unlike
+        // `FinetuneStepTier::margin` (always NonNull, hardcoded Triplet),
+        // this tier's `margin` is null exactly when `Objective::Mnrl` was
+        // selected — see the struct doc's "objective-selected nullness"
+        // section.
+        ("margin", Nullable::NullMeans("objective is mnrl")),
+        ("target_modules", Nullable::NonNull),
+        ("batched_forward", Nullable::NonNull),
+        ("backbone_dtype", Nullable::NonNull),
+        ("steps_measured", Nullable::NonNull),
+        ("checkpoint_config_sha256", Nullable::NonNull),
+        ("checkpoint_weights_sha256", Nullable::NonNull),
+        ("checkpoint_weights_size_bytes", Nullable::NonNull),
+        ("max_grad_norm", Nullable::NullMeans("no clip")),
+        (
+            "warmup",
+            Nullable::NullMeans(
+                "a full run has no discard-before-timing convention; see warmup_steps",
+            ),
+        ),
+        (
+            "row_lengths",
+            Nullable::NullMeans(
+                "real text is variable-length; no single fixed row_lengths applies across a \
+                 whole multi-epoch run",
+            ),
+        ),
+        // New (18 entries).
+        ("epochs", Nullable::NonNull),
+        ("lr", Nullable::NonNull),
+        ("schedule", Nullable::NonNull),
+        ("warmup_steps", Nullable::NonNull),
+        ("weight_decay", Nullable::NonNull),
+        ("grad_accum", Nullable::NonNull),
+        ("validation_fraction", Nullable::NonNull),
+        ("split_rule", Nullable::NonNull),
+        ("split_seed", Nullable::NonNull),
+        ("dataset_sha256", Nullable::NonNull),
+        ("heldout_ids_sha256", Nullable::NonNull),
+        ("heldout_batch_partition_sha256", Nullable::NonNull),
+        ("embedding_loss", Nullable::NonNull),
+        ("temperature", Nullable::NullMeans("objective is triplet")),
+        ("matryoshka_dims", Nullable::NonNull),
+        ("early_stopping_patience", Nullable::NonNull),
+        ("early_stopping_metric", Nullable::NonNull),
+        ("eval_cadence", Nullable::NonNull),
+    ];
+
+    /// Provenance — recorded, present on every run, but NEVER a comparison
+    /// key (see struct doc for why `arm`/`attention_arm` live here rather
+    /// than in [`Self::IDENTITY_FIELDS`]).
+    pub const PROVENANCE_FIELDS: &'static [(&'static str, Nullable)] = &[
+        ("arm", Nullable::NonNull),
+        ("device_name", Nullable::NonNull),
+        ("kernels_disabled_requested", Nullable::NonNull),
+        ("kernels_disabled_fired", Nullable::NonNull),
+        ("flash_compiled", Nullable::NonNull),
+        ("build_features", Nullable::NonNull),
+        ("attention_arm", Nullable::NonNull),
+    ];
+}
+
 /// The on-GPU throughput/latency tier: the engine's two GPU-model serving
 /// verbs — [`generate_text_embeddings`](jammi_ai::session::InferenceSession::generate_text_embeddings)
 /// (embed) and [`infer`](jammi_ai::session::InferenceSession::infer)
@@ -2542,6 +2848,211 @@ mod tests {
                     "provenance.{field} is declared NonNull but serialized as null"
                 );
             }
+        }
+    }
+
+    /// A minimal, fully-populated [`FinetuneRunTier`] for the tests below.
+    fn sample_finetune_run_tier() -> FinetuneRunTier {
+        FinetuneRunTier {
+            seed: 42,
+            batch: 4,
+            seq: 64,
+            lora_rank: 8,
+            lora_alpha: 16.0,
+            lora_dropout: 0.05,
+            margin: Some(0.3),
+            target_modules: vec!["Wqkv".to_string()],
+            batched_forward: true,
+            backbone_dtype: "f32".to_string(),
+            steps_measured: 3,
+            checkpoint_config_sha256: "a".repeat(64),
+            checkpoint_weights_sha256: "b".repeat(64),
+            checkpoint_weights_size_bytes: 1024,
+            max_grad_norm: Some(1.0),
+            warmup: None,
+            row_lengths: None,
+            epochs: 2,
+            lr: 2e-4,
+            schedule: "constant".to_string(),
+            warmup_steps: 0,
+            weight_decay: 0.01,
+            grad_accum: 1,
+            validation_fraction: 0.1,
+            split_rule: "positional_fraction_split".to_string(),
+            split_seed: 42,
+            dataset_sha256: "c".repeat(64),
+            heldout_ids_sha256: "d".repeat(64),
+            heldout_batch_partition_sha256: "e".repeat(64),
+            embedding_loss: "triplet".to_string(),
+            temperature: None,
+            matryoshka_dims: Vec::new(),
+            early_stopping_patience: 10_000,
+            early_stopping_metric: "val_loss".to_string(),
+            eval_cadence: 1,
+            arm: "fused".to_string(),
+            device_name: "cpu".to_string(),
+            kernels_disabled_requested: Vec::new(),
+            kernels_disabled_fired: Vec::new(),
+            flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
+            build_features: build_features(),
+            attention_arm: "fused".to_string(),
+            admission_is_dense: false,
+            learning_happened_delta: 0.1,
+            tie_fraction: 0.0,
+            final_epoch: 1,
+            held_out_example_mean: 0.5,
+            held_out_count: 4,
+            final_loss_diagnostic: 0.5,
+            trajectory: vec![EpochHeldOut {
+                epoch: 1,
+                held_out_mean: 0.5,
+                held_out_tie_fraction: 0.0,
+                held_out_batch_partition_sha256: "e".repeat(64),
+            }],
+        }
+    }
+
+    /// The MNRL twin of [`sample_finetune_run_tier`] (unit 63 H4a-delta,
+    /// CONTRACT amendment 2026-08-28): the SAME sample values, except
+    /// `margin`/`temperature` swap which one is `Some` and
+    /// `embedding_loss` reads `"mnrl"` — exactly the flip
+    /// [`crate::finetune_run::Objective::Mnrl`] produces on a real run.
+    /// `20.0` is `MultipleNegativesRanking`'s standard default temperature
+    /// (`jammi_wire::fine_tune::EmbeddingLoss::MultipleNegativesRanking`'s
+    /// own doc).
+    fn sample_finetune_run_tier_mnrl() -> FinetuneRunTier {
+        FinetuneRunTier {
+            margin: None,
+            embedding_loss: "mnrl".to_string(),
+            temperature: Some(20.0),
+            ..sample_finetune_run_tier()
+        }
+    }
+
+    /// Identity-value semantics per objective (unit 63 H4a-delta, task item
+    /// 4): a Triplet-objective tier reads `margin: Some(_)`, `temperature:
+    /// null`, `embedding_loss: "triplet"`.
+    #[test]
+    fn finetune_run_tier_triplet_objective_has_margin_nonnull_temperature_null() {
+        let tier = sample_finetune_run_tier();
+        assert!(tier.margin.is_some(), "Triplet run must report a margin");
+        assert!(
+            tier.temperature.is_none(),
+            "Triplet run must report temperature: null"
+        );
+        assert_eq!(tier.embedding_loss, "triplet");
+    }
+
+    /// The MNRL mirror of the test above: `margin: null`, `temperature:
+    /// Some(_)`, `embedding_loss: "mnrl"` — the nullness genuinely FLIPS
+    /// between the two objectives, not merely "one of them happens to be
+    /// null on this sample".
+    #[test]
+    fn finetune_run_tier_mnrl_objective_has_temperature_nonnull_margin_null() {
+        let tier = sample_finetune_run_tier_mnrl();
+        assert!(tier.margin.is_none(), "MNRL run must report margin: null");
+        assert!(
+            tier.temperature.is_some(),
+            "MNRL run must report a temperature"
+        );
+        assert_eq!(tier.embedding_loss, "mnrl");
+    }
+
+    /// The MNRL sample must ALSO satisfy `IDENTITY_FIELDS`/`PROVENANCE_FIELDS`
+    /// presence (the same self-check `finetune_run::run` performs before
+    /// returning) — `margin: null` under `Nullable::NullMeans("objective is
+    /// mnrl")` must NOT trip the `NonNull` panic branch now that `margin`'s
+    /// own declared nullability changed (H4a-delta).
+    #[test]
+    fn finetune_run_tier_mnrl_sample_satisfies_identity_and_provenance_presence() {
+        let tier = sample_finetune_run_tier_mnrl();
+        let value = serde_json::to_value(&tier).expect("serialize MNRL FinetuneRunTier");
+        assert_identity_fields_present(&value, FinetuneRunTier::IDENTITY_FIELDS);
+        assert_identity_fields_present(&value, FinetuneRunTier::PROVENANCE_FIELDS);
+    }
+
+    /// Cardinality pin: `FinetuneStepTier`'s 18 minus `attention_arm` (17)
+    /// plus the 18 new CONTRACT H4 fields = 35.
+    #[test]
+    fn finetune_run_tier_identity_fields_cardinality_is_35() {
+        assert_eq!(FinetuneRunTier::IDENTITY_FIELDS.len(), 35);
+    }
+
+    /// `PROVENANCE_FIELDS` carries `arm` + `attention_arm` (moved out of
+    /// identity — see struct doc) plus the four fields every other tier's
+    /// provenance carries (`device_name`, `kernels_disabled_requested`,
+    /// `kernels_disabled_fired`, `flash_compiled`, `build_features`) = 7.
+    #[test]
+    fn finetune_run_tier_provenance_fields_cardinality_is_7() {
+        assert_eq!(FinetuneRunTier::PROVENANCE_FIELDS.len(), 7);
+    }
+
+    /// DISJOINTNESS: `IDENTITY_FIELDS` and `PROVENANCE_FIELDS` share no
+    /// field name — E3's convention (see struct doc), never
+    /// `FinetuneStepTier`'s superset-that-includes-provenance one. A field
+    /// appearing in both would be a merger-facing ambiguity: is it a
+    /// comparison key or not?
+    #[test]
+    fn finetune_run_tier_identity_and_provenance_are_disjoint() {
+        let identity: std::collections::HashSet<&str> = FinetuneRunTier::IDENTITY_FIELDS
+            .iter()
+            .map(|(f, _)| *f)
+            .collect();
+        let provenance: std::collections::HashSet<&str> = FinetuneRunTier::PROVENANCE_FIELDS
+            .iter()
+            .map(|(f, _)| *f)
+            .collect();
+        let overlap: Vec<&&str> = identity.intersection(&provenance).collect();
+        assert!(
+            overlap.is_empty(),
+            "IDENTITY_FIELDS and PROVENANCE_FIELDS overlap on {overlap:?} — a field cannot be \
+             both a comparison key and provenance-only"
+        );
+    }
+
+    /// `arm` and `attention_arm` are explicitly ABSENT from
+    /// `IDENTITY_FIELDS` — the negative-control half of the disjointness
+    /// pin above, naming the two fields the deviation from
+    /// `FinetuneStepTier`'s convention is ABOUT (see struct doc: "the arm
+    /// is provenance, never identity").
+    #[test]
+    fn finetune_run_tier_arm_and_attention_arm_are_not_identity() {
+        let identity_names: Vec<&str> = FinetuneRunTier::IDENTITY_FIELDS
+            .iter()
+            .map(|(f, _)| *f)
+            .collect();
+        assert!(!identity_names.contains(&"arm"));
+        assert!(!identity_names.contains(&"attention_arm"));
+    }
+
+    /// Unification contract C3.1 (this tier's own instance): every field
+    /// named in `FinetuneRunTier::IDENTITY_FIELDS` and
+    /// `FinetuneRunTier::PROVENANCE_FIELDS` must be present on a real,
+    /// serialized tier, and a field declared `NonNull` must not read
+    /// `null`.
+    #[test]
+    fn finetune_run_tier_identity_and_provenance_fields_are_emitted() {
+        let tier = sample_finetune_run_tier();
+        let value = serde_json::to_value(&tier).expect("serialize FinetuneRunTier");
+        assert_identity_fields_present(&value, FinetuneRunTier::IDENTITY_FIELDS);
+        assert_identity_fields_present(&value, FinetuneRunTier::PROVENANCE_FIELDS);
+    }
+
+    /// Determinism of the identity tuple across two constructions: building
+    /// two `FinetuneRunTier`s from the SAME inputs (here, two identical
+    /// calls to the sample builder — the tier-level analogue of the seam's
+    /// own `two_calls_are_bitwise_identical` test) must serialize every
+    /// `IDENTITY_FIELDS` entry to the SAME JSON value.
+    #[test]
+    fn finetune_run_tier_identity_tuple_is_deterministic_across_two_constructions() {
+        let a = serde_json::to_value(sample_finetune_run_tier()).expect("serialize a");
+        let b = serde_json::to_value(sample_finetune_run_tier()).expect("serialize b");
+        for (field, _) in FinetuneRunTier::IDENTITY_FIELDS {
+            assert_eq!(
+                a.get(*field),
+                b.get(*field),
+                "identity field {field:?} differs across two constructions from identical inputs"
+            );
         }
     }
 

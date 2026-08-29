@@ -11,6 +11,10 @@ use candle_core::{backprop::GradStore, DType, Device, Tensor, Var};
 use candle_nn::VarMap;
 use jammi_db::catalog::Catalog;
 use jammi_db::store::ArtifactStore;
+// `Digest::new`/`Digest::update`/`Digest::finalize` for
+// `evaluate_held_out`'s `batch_partition_sha256` (H1, unit 63) — the same
+// trait `model/backend/candle.rs`'s content-digest hashing imports.
+use sha2::Digest;
 
 use crate::fine_tune::adamw::{AdamW, ParamsAdamW};
 use jammi_db::error::{JammiError, Result};
@@ -926,11 +930,16 @@ impl TrainingLoop {
             let avg_val_loss: Option<f64> = match self.config.early_stopping_metric {
                 EarlyStoppingMetric::TrainLoss => None,
                 EarlyStoppingMetric::ValLoss => {
-                    // Disable dropout for the validation pass.
-                    self.target.set_training(false);
-                    let val_loss = self.evaluate(&val_loader)?;
-                    self.target.set_training(true);
-                    Some(val_loss)
+                    // Disable dropout for the validation pass — the exact
+                    // `set_training(false)` / `evaluate` / `set_training(true)`
+                    // sequence this used to spell out inline, now shared with
+                    // `evaluate_held_out` (H1, unit 63) via
+                    // `with_dropout_disabled` so there is exactly one place
+                    // that bracket can get wrong. Pure structural refactor:
+                    // same three operations in the same order, so `evaluate`'s
+                    // return value — and every pinned value downstream of it
+                    // (early stopping, `checkpoint_best`) — is unchanged.
+                    Some(self.with_dropout_disabled(|loop_| loop_.evaluate(&val_loader))?)
                 }
             };
 
@@ -2038,6 +2047,128 @@ impl TrainingLoop {
         }
     }
 
+    /// Per-example decomposition of [`Self::compute_loss`] (H1, unit 63,
+    /// CONTRACT H1): the seam [`Self::evaluate_held_out`] calls this instead
+    /// of `compute_loss` to get one loss per row, BEFORE any batch-mean
+    /// reduction, rather than `compute_loss`'s single reduced scalar.
+    ///
+    /// This is a NEW, independent computation path. It calls none of
+    /// `compute_loss`'s own code and does not touch `compute_loss`,
+    /// `evaluate`, or any of the batch-mean-reducing free functions
+    /// (`mnrl_loss` / `triplet_loss` / `cosent_loss` / `angle_loss` /
+    /// `cosine_mse_loss`) — every one of those stays byte-for-byte
+    /// unchanged (see the module doc's "example-mean is a NEW quantity"
+    /// note on [`jammi_wire::fine_tune::HeldOutLoss`]). It reuses only the
+    /// pure, stateless building blocks those functions also call
+    /// (`l2_normalize_rows`, `cosine_similarity`, `contiguous_matmul`),
+    /// which cannot perturb any pinned training value because calling a
+    /// pure function a second time from new code changes nothing about its
+    /// existing call sites.
+    ///
+    /// Only the batch kinds with a mathematically well-defined per-row
+    /// decomposition are supported:
+    /// - `Pairs` (MNRL, always — the only objective this shape trains):
+    ///   row-direction (and, symmetrically, column-direction) NLL against
+    ///   the diagonal positive. Batch-coupled by construction — a row's
+    ///   loss depends on every other row's positive sharing the batch.
+    /// - `Triplet`: the MNRL variant (row NLL with the explicit negative
+    ///   appended as an extra similarity column, also batch-coupled) when
+    ///   `MultipleNegativesRanking` is configured, else the row-independent
+    ///   margin loss `max(0, cos(a,n) − cos(a,p) + margin)`.
+    /// - `Contrastive` with `CosineMse` (row-independent squared error).
+    /// - `Classification` (row-independent cross-entropy).
+    ///
+    /// `Contrastive` with `CoSent`/`AnglE` is a typed refusal: both fold
+    /// EVERY valid pair in the batch into ONE scalar via a pairwise
+    /// log-sum-exp ordering ([`pairwise_ordering_loss`]) — there is no row
+    /// `i` whose loss is independent of every other row, so inventing a
+    /// per-row split would not be a decomposition of the real objective, it
+    /// would be a different number scored under a different name. `Ner`
+    /// (token-level; this seam has not chosen a per-example convention for
+    /// it) and `Regression` (S18's distributional head — a different
+    /// objective family, out of this unit's scope) are typed refusals for
+    /// the same reason: a fabricated decomposition is worse than an honest
+    /// refusal.
+    fn compute_loss_per_example(&self, batch: &super::data::TrainingBatch) -> Result<Vec<f64>> {
+        match batch {
+            super::data::TrainingBatch::Pairs { anchors, positives } => self
+                .matryoshka_wrap_per_example(&[anchors, positives], &|dims| {
+                    mnrl_loss_per_example(&dims[0], &dims[1], None, self.mnrl_scale(), true)
+                }),
+            super::data::TrainingBatch::Triplet {
+                anchor,
+                positive,
+                negative,
+            } => match self.config.embedding_loss {
+                Some(super::EmbeddingLoss::MultipleNegativesRanking { .. }) => self
+                    .matryoshka_wrap_per_example(&[anchor, positive, negative], &|dims| {
+                        mnrl_loss_per_example(
+                            &dims[0],
+                            &dims[1],
+                            Some(&dims[2]),
+                            self.mnrl_scale(),
+                            true,
+                        )
+                    }),
+                _ => self.matryoshka_wrap_per_example(&[anchor, positive, negative], &|dims| {
+                    self.triplet_loss_per_example(&dims[0], &dims[1], &dims[2])
+                }),
+            },
+            super::data::TrainingBatch::Contrastive {
+                embeddings_a,
+                embeddings_b,
+                scores,
+            } => match self.config.embedding_loss {
+                Some(super::EmbeddingLoss::CosineMse) => self
+                    .matryoshka_wrap_per_example(&[embeddings_a, embeddings_b], &|dims| {
+                        cosine_mse_loss_per_example(&dims[0], &dims[1], scores)
+                    }),
+                Some(super::EmbeddingLoss::CoSent) | None => Err(JammiError::FineTune(
+                    "evaluate_held_out: CoSENT is a pairwise-ordering objective over every \
+                     valid pair in the batch (one log-sum-exp over ALL pairs) — it has no \
+                     per-row decomposition. Choose CosineMse for a per-example held-out \
+                     graded-pair eval, or Pairs/MultipleNegativesRanking (or Triplet) for a \
+                     batch-coupled/row-independent one."
+                        .into(),
+                )),
+                Some(super::EmbeddingLoss::AnglE) => Err(JammiError::FineTune(
+                    "evaluate_held_out: AnglE is a pairwise-ordering objective over every \
+                     valid pair in the batch, the same as CoSENT — it has no per-row \
+                     decomposition."
+                        .into(),
+                )),
+                Some(super::EmbeddingLoss::MultipleNegativesRanking { .. }) => {
+                    Err(JammiError::FineTune(
+                        "MultipleNegativesRanking is an in-batch-negative objective over \
+                         (anchor, positive) rows; it cannot score a graded (text_a, text_b, \
+                         score) batch."
+                            .into(),
+                    ))
+                }
+                Some(super::EmbeddingLoss::Triplet { .. }) => Err(JammiError::FineTune(
+                    "Triplet loss needs (anchor, positive, negative) rows; it cannot score a \
+                     graded (text_a, text_b, score) batch."
+                        .into(),
+                )),
+            },
+            super::data::TrainingBatch::Classification { embeddings, labels } => {
+                let logits = self.classify(embeddings)?;
+                cross_entropy_per_row(&logits, labels)
+            }
+            super::data::TrainingBatch::Ner { .. } => Err(JammiError::FineTune(
+                "evaluate_held_out: NER's natural unit is a token, not a held-out example — \
+                 this seam does not define a per-example convention for NER in v1."
+                    .into(),
+            )),
+            super::data::TrainingBatch::Regression { .. } => Err(JammiError::FineTune(
+                "evaluate_held_out: Regression (S18) trains a different distributional-head \
+                 objective family; a per-example held-out decomposition for it is out of \
+                 this unit's scope."
+                    .into(),
+            )),
+        }
+    }
+
     /// Proper-scoring regression loss (S18), dispatched on the configured
     /// [`RegressionLoss`]. `input` is the distributional head's raw z-space output
     /// (`(batch, k)`); `target` is the **z-scored** `(batch,)` outcome.
@@ -2099,6 +2230,18 @@ impl TrainingLoop {
         objective: &dyn Fn(Vec<Tensor>) -> Result<Tensor>,
     ) -> Result<Tensor> {
         matryoshka_sum(&self.config.matryoshka_dims, embeddings, objective)
+    }
+
+    /// Per-example counterpart of [`Self::matryoshka_wrap`] (H1, unit 63):
+    /// thin wrapper over the free [`matryoshka_sum_per_example`], used by
+    /// [`Self::compute_loss_per_example`] exactly as `matryoshka_wrap` is
+    /// used by `compute_loss`.
+    fn matryoshka_wrap_per_example(
+        &self,
+        embeddings: &[&Tensor],
+        objective: &dyn Fn(Vec<Tensor>) -> Result<Vec<f64>>,
+    ) -> Result<Vec<f64>> {
+        matryoshka_sum_per_example(&self.config.matryoshka_dims, embeddings, objective)
     }
 
     /// Apply the classification head to projected embeddings.
@@ -2244,6 +2387,61 @@ impl TrainingLoop {
         Ok(loss)
     }
 
+    /// Per-example decomposition of [`Self::triplet_loss`] (H1, unit 63):
+    /// `max(0, cos(anchor, negative) - cos(anchor, positive) + margin)` per
+    /// row, read back to host before the mean `triplet_loss` takes instead.
+    /// Row-independent by construction — the margin objective on row `i`
+    /// never reads any other row — so this is a genuine decomposition, not
+    /// an approximation of one. Reuses the SAME [`cosine_similarity`] calls
+    /// `triplet_loss` makes; does not touch `triplet_loss` itself.
+    fn triplet_loss_per_example(
+        &self,
+        anchor: &Tensor,
+        positive: &Tensor,
+        negative: &Tensor,
+    ) -> Result<Vec<f64>> {
+        let margin = match self.config.embedding_loss {
+            Some(super::EmbeddingLoss::Triplet { margin }) => margin,
+            _ => 0.3,
+        };
+
+        let pos_sim = cosine_similarity(anchor, positive)?;
+        let neg_sim = cosine_similarity(anchor, negative)?;
+
+        let diff = ((&neg_sim - &pos_sim)
+            .map_err(|e| JammiError::FineTune(format!("Triplet per-example diff: {e}")))?
+            + margin)
+            .map_err(|e| JammiError::FineTune(format!("Triplet per-example margin: {e}")))?;
+
+        let host = diff
+            .to_dtype(DType::F32)
+            .map_err(|e| JammiError::FineTune(format!("Triplet per-example dtype: {e}")))?
+            .to_vec1::<f32>()
+            .map_err(|e| JammiError::FineTune(format!("Triplet per-example to_vec1: {e}")))?;
+
+        Ok(host.into_iter().map(|v| v.max(0.0) as f64).collect())
+    }
+
+    /// Bracket `f` with dropout disabled, mirroring the exact
+    /// `set_training(false)` / call / `set_training(true)` sequence
+    /// [`Self::run`] wraps its [`Self::evaluate`] call in (R3). Shared by
+    /// `run` and [`Self::evaluate_held_out`] (H1, unit 63) so the held-out
+    /// seam cannot be called dropout-hot — it goes through the SAME bracket
+    /// the existing validation pass uses, rather than a second copy of it,
+    /// so there is exactly one place that can get this wrong.
+    ///
+    /// On `Err` from `f`, `?` propagates BEFORE `set_training(true)` runs —
+    /// this mirrors `run`'s pre-existing call site exactly (an `evaluate()`
+    /// error there already aborts the whole training loop, so the dropout
+    /// flag never observably matters again), not a new bug: refactoring the
+    /// bracket into this helper changes nothing about that control flow.
+    fn with_dropout_disabled<T>(&mut self, f: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        self.target.set_training(false);
+        let result = f(self)?;
+        self.target.set_training(true);
+        Ok(result)
+    }
+
     /// Run forward pass over validation set without gradient updates.
     fn evaluate(&self, val_loader: &TrainingDataLoader) -> Result<f64> {
         if val_loader.is_empty() {
@@ -2292,6 +2490,205 @@ impl TrainingLoop {
             total_loss / count as f64
         } else {
             0.0
+        })
+    }
+
+    /// The public per-pair held-out evaluation seam (H1, unit 63, CONTRACT
+    /// H1). Scores the current weights against a committed held-out split
+    /// and returns a [`jammi_wire::fine_tune::HeldOutLoss`]: one loss per
+    /// example plus the example-mean, count, tie-fraction, and the batch
+    /// partition identity — the quantity C16/H2's paired sign test consumes
+    /// (`d_i` = this method's `mean`, paired by seed, at the final epoch).
+    ///
+    /// ## The example-mean is a NEW quantity, not `evaluate`'s batch-mean
+    /// `Self::evaluate` is untouched by this unit, byte for byte (diff the
+    /// method above this one). Its private, monitoring-only batch-mean
+    /// semantics — early stopping, `checkpoint_best`, every pinned value
+    /// that reads it — keep reading exactly what they read today. This
+    /// method computes an entirely separate per-example decomposition via
+    /// `Self::compute_loss_per_example` and reduces it with its OWN plain
+    /// arithmetic mean over `per_example`, independent of `evaluate`'s
+    /// mean-of-per-batch-means.
+    ///
+    /// ## The batch partition IS identity
+    /// `example_ids` must be the SAME length as `val_loader`'s row count, in
+    /// the EXACT order the loader will yield rows, and that count MUST be a
+    /// multiple of `self.config.batch_size` (v2 delta 2) — the committed
+    /// held-out fixture is sized this way so every batch is FULL (no ragged
+    /// final batch) and every example sees exactly `batch_size - 1` in-batch
+    /// negatives. The partition rule is: walk `example_ids` (and the
+    /// loader's rows) in the given fixed order and group every consecutive
+    /// `batch_size` of them into one batch — no shuffling, no re-ordering,
+    /// no random split. Two calls over the same `(val_loader, example_ids,
+    /// self.config.batch_size)` therefore produce the IDENTICAL partition,
+    /// and — since dropout is disabled here and the forward pass is
+    /// otherwise deterministic on CPU — the identical `HeldOutLoss`.
+    ///
+    /// [`jammi_wire::fine_tune::HeldOutLoss::batch_partition_sha256`] is the
+    /// SHA-256 hex digest of the partition's canonical form: the JSON
+    /// serialization of `Vec<Vec<String>>`, one inner vec per batch holding
+    /// that batch's example ids in order — e.g. `[["id-a","id-b"],
+    /// ["id-c","id-d"]]` for a 4-example, `batch_size = 2` split. Hashing
+    /// the GROUPED (not flat) id list puts the batch BOUNDARIES in the
+    /// digest, not just the flat id order, matching the struct doc's "which
+    /// examples shared a batch, and in what order."
+    ///
+    /// ## Dropout bracket
+    /// Delegates to `Self::with_dropout_disabled` — the SAME bracket
+    /// `run()` wraps its `evaluate()` call in — so calling this seam
+    /// mid-training cannot draw a dropout mask or perturb the training RNG
+    /// stream (see the `no_rng_perturbation` test in this module).
+    ///
+    /// ## Typed refusals
+    /// - Empty held-out set (`val_loader.is_empty()` or `example_ids` empty).
+    /// - `example_ids.len()` not a multiple of `self.config.batch_size`.
+    /// - A produced batch whose row count is not exactly
+    ///   `self.config.batch_size`, or a batch sequence that consumes fewer
+    ///   or more ids than `example_ids` supplies (example-kind mismatch
+    ///   between the committed id partition and the batch actually
+    ///   produced — e.g. the loader and the id list disagree about how rows
+    ///   group). `val_loader.len()` is NOT compared directly against
+    ///   `example_ids.len()` up front: for a precomputed loader `len()` is
+    ///   the BATCH count, not the row count (see
+    ///   [`super::data::TrainingDataLoader::len`]), so the row-level check
+    ///   happens per batch, as rows are actually produced.
+    /// - A batch kind `Self::compute_loss_per_example` does not support
+    ///   (CoSENT/AnglE/NER/Regression — see that method's doc).
+    /// - A non-finite per-example loss: refused rather than folded into the
+    ///   mean, because a NaN example silently dropped or silently averaged
+    ///   in would corrupt every downstream paired-sign-test cell with no
+    ///   visible signal.
+    pub fn evaluate_held_out(
+        &mut self,
+        val_loader: &TrainingDataLoader,
+        example_ids: &[String],
+    ) -> Result<super::HeldOutLoss> {
+        self.with_dropout_disabled(|loop_| loop_.evaluate_held_out_inner(val_loader, example_ids))
+    }
+
+    /// The read-only body [`Self::evaluate_held_out`] runs inside
+    /// [`Self::with_dropout_disabled`]'s bracket. Split out so the bracket
+    /// (which needs `&mut self`) and the computation (which only needs
+    /// `&self`, exactly like `evaluate`) stay separate — mirroring how
+    /// `evaluate` itself takes `&self` and its caller in `run` owns the
+    /// surrounding `&mut self` bracket.
+    fn evaluate_held_out_inner(
+        &self,
+        val_loader: &TrainingDataLoader,
+        example_ids: &[String],
+    ) -> Result<super::HeldOutLoss> {
+        if val_loader.is_empty() || example_ids.is_empty() {
+            return Err(JammiError::FineTune(
+                "evaluate_held_out: empty held-out set — refusing to fabricate a HeldOutLoss \
+                 over zero examples"
+                    .into(),
+            ));
+        }
+        let batch_size = self.config.batch_size;
+        if batch_size == 0 || !example_ids.len().is_multiple_of(batch_size) {
+            return Err(JammiError::FineTune(format!(
+                "evaluate_held_out: {} held-out examples is not a multiple of batch_size {} \
+                 (v2 delta 2) — the committed held-out fixture must be sized so every batch \
+                 is full, fixing every example at the same batch_size - 1 in-batch negatives",
+                example_ids.len(),
+                batch_size
+            )));
+        }
+
+        let mut per_example: Vec<super::ExampleLoss> = Vec::with_capacity(example_ids.len());
+        let mut id_batches: Vec<Vec<String>> = Vec::new();
+        let mut offset = 0usize;
+
+        let mut consume = |batch: super::data::TrainingBatch| -> Result<()> {
+            let n = batch_row_count(&batch)?;
+            if n != batch_size {
+                return Err(JammiError::FineTune(format!(
+                    "evaluate_held_out: a held-out batch has {n} rows but config.batch_size \
+                     is {batch_size} — every held-out batch must be exactly batch_size rows \
+                     (kind mismatch between the committed id partition and the batch actually \
+                     produced)"
+                )));
+            }
+            if offset + n > example_ids.len() {
+                return Err(JammiError::FineTune(format!(
+                    "evaluate_held_out: the batch partition needs at least {} example ids \
+                     but only {} were supplied — the id list and the loader disagree about \
+                     how many rows the held-out split has (kind mismatch)",
+                    offset + n,
+                    example_ids.len()
+                )));
+            }
+            let ids = &example_ids[offset..offset + n];
+            offset += n;
+            let losses = self.compute_loss_per_example(&batch)?;
+            if losses.len() != n {
+                return Err(JammiError::FineTune(format!(
+                    "evaluate_held_out: internal: {} per-example losses for a {n}-row batch",
+                    losses.len()
+                )));
+            }
+            let mut batch_ids = Vec::with_capacity(n);
+            for (id, loss) in ids.iter().zip(losses) {
+                if !loss.is_finite() {
+                    return Err(JammiError::FineTune(format!(
+                        "evaluate_held_out: non-finite loss ({loss}) for held-out example \
+                         '{id}' — refusing to fold it into the example-mean"
+                    )));
+                }
+                per_example.push(super::ExampleLoss {
+                    example_id: id.clone(),
+                    loss,
+                });
+                batch_ids.push(id.clone());
+            }
+            id_batches.push(batch_ids);
+            Ok(())
+        };
+
+        if val_loader.is_precomputed() {
+            for batch in val_loader.batches(batch_size)? {
+                consume(batch?)?;
+            }
+        } else {
+            for chunk in val_loader.text_chunks(batch_size) {
+                let batch = self.encode_chunk(&chunk)?;
+                consume(batch)?;
+            }
+        }
+
+        if offset != example_ids.len() {
+            return Err(JammiError::FineTune(format!(
+                "evaluate_held_out: internal: consumed {offset} of {} example ids — the \
+                 loader produced fewer rows than the id list promised",
+                example_ids.len()
+            )));
+        }
+
+        let count = per_example.len();
+        let sum: f64 = per_example.iter().map(|e| e.loss).sum();
+        let mean = sum / count as f64;
+        // The tie/hinge-floor value is 0.0 for every objective this seam
+        // supports (MNRL's saturated in-batch cross-entropy, the margin
+        // triplet's `max(0, ·)`, and cosine-MSE/classification's exact
+        // residual match) — see `cross_entropy_per_row`'s doc for why MNRL
+        // rounds to EXACTLY 0.0 (not merely close to it) on a saturated row.
+        let tie_count = per_example.iter().filter(|e| e.loss == 0.0).count();
+        let tie_fraction = tie_count as f64 / count as f64;
+
+        let partition_json = serde_json::to_vec(&id_batches).map_err(|e| {
+            JammiError::FineTune(format!("evaluate_held_out: partition hash serialize: {e}"))
+        })?;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(&partition_json);
+        let batch_partition_sha256 = hex::encode(hasher.finalize());
+
+        Ok(super::HeldOutLoss {
+            per_example,
+            mean,
+            count,
+            tie_fraction,
+            batch_partition_sha256,
+            in_batch_negatives_per_example: batch_size - 1,
         })
     }
 
@@ -2762,6 +3159,31 @@ fn cosine_mse_loss(emb_a: &Tensor, emb_b: &Tensor, scores: &Tensor) -> Result<Te
         .map_err(|e| JammiError::FineTune(format!("cosine-MSE mean: {e}")))
 }
 
+/// Per-example decomposition of [`cosine_mse_loss`] (H1, unit 63): the same
+/// `(scale·cos(a,b) − scale·score)²` residual per row, read back to host
+/// before the mean `cosine_mse_loss` takes instead. Row-independent by
+/// construction. Reuses the SAME [`cosine_similarity`] call `cosine_mse_loss`
+/// makes; does not touch `cosine_mse_loss` itself.
+fn cosine_mse_loss_per_example(
+    emb_a: &Tensor,
+    emb_b: &Tensor,
+    scores: &Tensor,
+) -> Result<Vec<f64>> {
+    let cos = cosine_similarity(emb_a, emb_b)?;
+    let pred = (&cos * PAIRWISE_SCALE)
+        .map_err(|e| JammiError::FineTune(format!("cosine-MSE per-example scale: {e}")))?;
+    let target = (scores * PAIRWISE_SCALE)
+        .map_err(|e| JammiError::FineTune(format!("cosine-MSE per-example target scale: {e}")))?;
+    let diff = (&pred - &target)
+        .map_err(|e| JammiError::FineTune(format!("cosine-MSE per-example diff: {e}")))?;
+    let host = diff
+        .to_dtype(DType::F32)
+        .map_err(|e| JammiError::FineTune(format!("cosine-MSE per-example dtype: {e}")))?
+        .to_vec1::<f32>()
+        .map_err(|e| JammiError::FineTune(format!("cosine-MSE per-example to_vec1: {e}")))?;
+    Ok(host.into_iter().map(|v| (v * v) as f64).collect())
+}
+
 /// L2-normalise every row of a `[n, d]` tensor to unit length, sharing the norm
 /// computation with [`cosine_similarity`] (sum of squares along dim 1, sqrt,
 /// clamped away from zero). The cosine-similarity *matrix* MNRL needs is then a
@@ -2867,6 +3289,158 @@ fn mnrl_loss(
         .map_err(|e| JammiError::FineTune(format!("mnrl mean: {e}")))
 }
 
+/// Per-example decomposition of [`mnrl_loss`] (H1, unit 63): builds the
+/// IDENTICAL `(n, n [+ hard negatives])` row-direction similarity/logits
+/// matrix `mnrl_loss` builds (same [`l2_normalize_rows`] /
+/// `contiguous_matmul` calls, same scale, same hard-negative concatenation),
+/// but instead of reducing it with `candle_nn::loss::cross_entropy`'s mean,
+/// reads it back to host and returns each anchor row's own NLL via
+/// [`cross_entropy_per_row`] — one `f64` per row instead of their mean. When
+/// `symmetric`, each returned value is `0.5 * (row_i + col_i)`, matching the
+/// row+column average `mnrl_loss` itself takes, just per row instead of over
+/// the whole batch.
+///
+/// This is a separate computation from `mnrl_loss` — it does not call it,
+/// and `mnrl_loss` is unchanged (see the module doc's "example-mean is a
+/// NEW quantity" note). MNRL's per-example loss is BATCH-COUPLED by
+/// construction: row `i`'s value depends on every other row's positive
+/// sharing the similarity matrix, which is exactly why
+/// [`jammi_wire::fine_tune::HeldOutLoss`] carries `batch_partition_sha256`
+/// and `in_batch_negatives_per_example` — a different partition of the same
+/// example set changes every value this function returns.
+fn mnrl_loss_per_example(
+    anchor: &Tensor,
+    positive: &Tensor,
+    hard_negatives: Option<&Tensor>,
+    scale: f64,
+    symmetric: bool,
+) -> Result<Vec<f64>> {
+    let n = anchor
+        .dim(0)
+        .map_err(|e| JammiError::FineTune(format!("mnrl per-example dim: {e}")))?;
+
+    let a_norm = l2_normalize_rows(anchor)?;
+    let p_norm = l2_normalize_rows(positive)?;
+    let p_t = p_norm
+        .t()
+        .map_err(|e| JammiError::FineTune(format!("mnrl per-example transpose: {e}")))?;
+    let sim = (jammi_encoders::contiguous_matmul(&a_norm, &p_t)
+        .map_err(|e| JammiError::FineTune(format!("mnrl per-example matmul: {e}")))?
+        * scale)
+        .map_err(|e| JammiError::FineTune(format!("mnrl per-example scale: {e}")))?;
+
+    let labels = Tensor::arange(0u32, n as u32, anchor.device())
+        .map_err(|e| JammiError::FineTune(format!("mnrl per-example labels: {e}")))?;
+
+    let row_logits = match hard_negatives {
+        None => sim.clone(),
+        Some(neg) => {
+            let neg_norm = l2_normalize_rows(neg)?;
+            let neg_t = neg_norm.t().map_err(|e| {
+                JammiError::FineTune(format!("mnrl per-example neg transpose: {e}"))
+            })?;
+            let neg_sim = (jammi_encoders::contiguous_matmul(&a_norm, &neg_t)
+                .map_err(|e| JammiError::FineTune(format!("mnrl per-example neg matmul: {e}")))?
+                * scale)
+                .map_err(|e| JammiError::FineTune(format!("mnrl per-example neg scale: {e}")))?;
+            Tensor::cat(&[&sim, &neg_sim], 1)
+                .map_err(|e| JammiError::FineTune(format!("mnrl per-example neg cat: {e}")))?
+        }
+    };
+
+    let row_losses = cross_entropy_per_row(&row_logits, &labels)?;
+    if !symmetric {
+        return Ok(row_losses);
+    }
+
+    let col_logits = sim
+        .t()
+        .map_err(|e| JammiError::FineTune(format!("mnrl per-example col transpose: {e}")))?;
+    let col_losses = cross_entropy_per_row(&col_logits, &labels)?;
+
+    Ok(row_losses
+        .iter()
+        .zip(col_losses.iter())
+        .map(|(r, c)| 0.5 * (r + c))
+        .collect())
+}
+
+/// Read `logits` `(n, c)` and integer `labels` `(n,)` back to host and
+/// compute each row's cross-entropy NLL, `log_sum_exp(row) - row[label]`, in
+/// `f32` arithmetic (the tensor's native compute precision) via a
+/// numerically stable max-subtract log-sum-exp, folded in the FIXED column
+/// order `0..c` (family J determinism — a host reduction over a bounded set
+/// of elements folds them in the same order every call, on every platform).
+/// Returns one `f64` per row.
+///
+/// This is the SAME per-row term `candle_nn::loss::cross_entropy`'s mean
+/// reduces over, read back individually instead of pre-reduced — it does
+/// not call `candle_nn::loss::cross_entropy` and changes no value that
+/// function produces. When the target column sits far enough above every
+/// other column in a row (a well-separated, near-converged batch), the
+/// max-subtracted `sum_exp` rounds to EXACTLY `1.0f32` (every other term is
+/// smaller than `f32`'s ~1.19e-7 relative epsilon) and the row's loss rounds
+/// to EXACTLY `0.0` — the objective's true floor, not an approximation of
+/// it, which is what lets [`TrainingLoop::evaluate_held_out`]'s
+/// `tie_fraction` read a genuine `1.0` on a saturated held-out split.
+fn cross_entropy_per_row(logits: &Tensor, labels: &Tensor) -> Result<Vec<f64>> {
+    let logits_host = logits
+        .to_dtype(DType::F32)
+        .map_err(|e| JammiError::FineTune(format!("per-row NLL logits dtype: {e}")))?
+        .to_vec2::<f32>()
+        .map_err(|e| JammiError::FineTune(format!("per-row NLL logits to_vec2: {e}")))?;
+    let labels_host = labels
+        .to_dtype(DType::U32)
+        .map_err(|e| JammiError::FineTune(format!("per-row NLL labels dtype: {e}")))?
+        .to_vec1::<u32>()
+        .map_err(|e| JammiError::FineTune(format!("per-row NLL labels to_vec1: {e}")))?;
+    if logits_host.len() != labels_host.len() {
+        return Err(JammiError::FineTune(format!(
+            "per-row NLL: {} logit rows but {} labels",
+            logits_host.len(),
+            labels_host.len()
+        )));
+    }
+
+    let mut out = Vec::with_capacity(logits_host.len());
+    for (row, &label) in logits_host.iter().zip(labels_host.iter()) {
+        let label = label as usize;
+        let target = *row.get(label).ok_or_else(|| {
+            JammiError::FineTune(format!(
+                "per-row NLL: label {label} out of range for a {}-wide row",
+                row.len()
+            ))
+        })?;
+        let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum_exp = 0.0f32;
+        for &v in row {
+            sum_exp += (v - max).exp();
+        }
+        let logsumexp = max + sum_exp.ln();
+        out.push((logsumexp - target) as f64);
+    }
+    Ok(out)
+}
+
+/// Number of rows a [`super::data::TrainingBatch`] carries, regardless of
+/// kind — the per-batch row count [`TrainingLoop::evaluate_held_out`] checks
+/// against `config.batch_size` and uses to slice its flat `example_ids` list
+/// per batch.
+fn batch_row_count(batch: &super::data::TrainingBatch) -> Result<usize> {
+    let dim0 = |t: &Tensor| {
+        t.dim(0)
+            .map_err(|e| JammiError::FineTune(format!("held-out batch row count: {e}")))
+    };
+    match batch {
+        super::data::TrainingBatch::Contrastive { embeddings_a, .. } => dim0(embeddings_a),
+        super::data::TrainingBatch::Pairs { anchors, .. } => dim0(anchors),
+        super::data::TrainingBatch::Triplet { anchor, .. } => dim0(anchor),
+        super::data::TrainingBatch::Classification { embeddings, .. } => dim0(embeddings),
+        super::data::TrainingBatch::Ner { hidden_states, .. } => dim0(hidden_states),
+        super::data::TrainingBatch::Regression { input, .. } => dim0(input),
+    }
+}
+
 /// Dispatch a graded-pair `(a, b, score)` batch onto the configured
 /// [`EmbeddingLoss`]. CoSENT (the default), AnglE, and cosine-MSE consume
 /// graded pairs. The in-batch-negative and triplet objectives are not
@@ -2945,6 +3519,62 @@ fn matryoshka_sum(
         });
     }
     total.ok_or_else(|| JammiError::FineTune("matryoshka_dims was unexpectedly empty".into()))
+}
+
+/// Per-example counterpart of [`matryoshka_sum`] (H1, unit 63): narrows every
+/// input tensor to each configured prefix width exactly as `matryoshka_sum`
+/// does, but sums the per-example `Vec<f64>` `objective` returns elementwise
+/// (in the FIXED `dims` order — family J determinism) instead of summing a
+/// device `Tensor`. Does not touch `matryoshka_sum`.
+fn matryoshka_sum_per_example(
+    dims: &[usize],
+    embeddings: &[&Tensor],
+    objective: &dyn Fn(Vec<Tensor>) -> Result<Vec<f64>>,
+) -> Result<Vec<f64>> {
+    if dims.is_empty() {
+        return objective(embeddings.iter().map(|t| (*t).clone()).collect());
+    }
+
+    let full_dim = embeddings
+        .first()
+        .ok_or_else(|| JammiError::FineTune("matryoshka per-example: no embeddings".into()))?
+        .dim(1)
+        .map_err(|e| JammiError::FineTune(format!("matryoshka per-example dim: {e}")))?;
+
+    let mut total: Option<Vec<f64>> = None;
+    for &dim in dims {
+        if dim > full_dim {
+            return Err(JammiError::FineTune(format!(
+                "matryoshka_dims entry {dim} exceeds the embedding width {full_dim}"
+            )));
+        }
+        let truncated: Vec<Tensor> = embeddings
+            .iter()
+            .map(|t| {
+                t.narrow(1, 0, dim).map_err(|e| {
+                    JammiError::FineTune(format!("matryoshka per-example narrow: {e}"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let losses = objective(truncated)?;
+        total = Some(match total {
+            None => losses,
+            Some(acc) => {
+                if acc.len() != losses.len() {
+                    return Err(JammiError::FineTune(format!(
+                        "matryoshka per-example: dim {dim} produced {} losses, a prior dim \
+                         produced {} — the per-example count must stay fixed across prefixes",
+                        losses.len(),
+                        acc.len()
+                    )));
+                }
+                acc.iter().zip(losses.iter()).map(|(a, b)| a + b).collect()
+            }
+        });
+    }
+    total.ok_or_else(|| {
+        JammiError::FineTune("matryoshka_dims was unexpectedly empty (per-example)".into())
+    })
 }
 
 /// Test-only handle to [`mnrl_loss`] for the GradCache gradient-equivalence
@@ -8229,5 +8859,429 @@ mod resume_invariant {
         let path = dir.path().join(name);
         candle_core::safetensors::save(&map, &path).unwrap();
         (name.to_string(), Bytes::from(std::fs::read(&path).unwrap()))
+    }
+}
+
+/// H1 (unit 63): CPU-hermetic tests for the public per-pair held-out
+/// evaluation seam — [`TrainingLoop::evaluate_held_out`] /
+/// [`TrainingLoop::compute_loss_per_example`] and their supporting free
+/// functions ([`mnrl_loss_per_example`], [`cross_entropy_per_row`]).
+#[cfg(test)]
+mod held_out_eval_tests {
+    use std::sync::Arc;
+
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::{VarBuilder, VarMap};
+
+    use super::super::adamw::{AdamW, ParamsAdamW};
+    use super::super::data::{TrainingBatch, TrainingDataLoader};
+    use super::super::lora::{build_classification_head, build_projection_head};
+    use super::super::target::TrainingTarget;
+    use super::super::FineTuneConfig;
+    use super::{TrainingLoop, TrainingLoopBuilder};
+    use jammi_db::error::JammiError;
+
+    const HIDDEN: usize = 2;
+    const NUM_CLASSES: usize = 3;
+
+    /// A minimal real [`TrainingLoop`] over a `Pairs`/MNRL-shaped
+    /// `ProjectionHead` — mirrors `host_read_discipline::minimal_loop`. The
+    /// held-out seam's `Pairs` path never touches `self.target`, so a bare,
+    /// unclaimed catalog is enough (`evaluate_held_out`/`compute_loss` never
+    /// reach the catalog either).
+    async fn minimal_pairs_loop(device: &Device, config: FineTuneConfig) -> TrainingLoop {
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
+        let head = build_projection_head(HIDDEN, &config, &varmap, &vb).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.keep();
+        let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
+        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+            .device(device.clone())
+            .job_id("held-out-pairs-job".into())
+            .worker_id("held-out-pairs-worker".into())
+            .catalog(catalog)
+            .artifact_dir(dir_path)
+            .build()
+            .unwrap()
+    }
+
+    fn ids(labels: &[&str]) -> Vec<String> {
+        labels.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A 4-example, `batch_size = 2` `Pairs` held-out set: batch 0's anchor
+    /// == positive on orthonormal unit rows (`cos ∈ {1, 0}`, scale 20 ⇒ a
+    /// 20-wide logit gap — comfortably past f32's saturation threshold, see
+    /// `cross_entropy_per_row`'s doc), so EVERY example in batch 0 saturates
+    /// to an exact `0.0` floor. Batch 1 uses a smaller, non-saturating
+    /// separation so its losses are strictly positive — a mixed fixture that
+    /// exercises both the floor and the general case in one held-out set.
+    fn mixed_pairs_fixture(device: &Device) -> (TrainingDataLoader, Vec<String>) {
+        let saturated = TrainingBatch::Pairs {
+            anchors: Tensor::new(&[[1.0f32, 0.0], [0.0, 1.0]], device).unwrap(),
+            positives: Tensor::new(&[[1.0f32, 0.0], [0.0, 1.0]], device).unwrap(),
+        };
+        let unsaturated = TrainingBatch::Pairs {
+            anchors: Tensor::new(&[[1.0f32, 0.0], [0.0, 1.0]], device).unwrap(),
+            positives: Tensor::new(&[[0.8f32, 0.6], [0.6, 0.8]], device).unwrap(),
+        };
+        let loader = TrainingDataLoader::from_precomputed(vec![saturated, unsaturated]);
+        (loader, ids(&["ex-0", "ex-1", "ex-2", "ex-3"]))
+    }
+
+    /// All four examples on the saturated pattern above — every batch, every
+    /// row, `cos = {1, 0}` — so `tie_fraction` must read exactly `1.0`.
+    fn fully_saturated_pairs_fixture(device: &Device) -> (TrainingDataLoader, Vec<String>) {
+        let batch = |device: &Device| TrainingBatch::Pairs {
+            anchors: Tensor::new(&[[1.0f32, 0.0], [0.0, 1.0]], device).unwrap(),
+            positives: Tensor::new(&[[1.0f32, 0.0], [0.0, 1.0]], device).unwrap(),
+        };
+        let loader = TrainingDataLoader::from_precomputed(vec![batch(device), batch(device)]);
+        (loader, ids(&["ex-0", "ex-1", "ex-2", "ex-3"]))
+    }
+
+    fn mnrl_config(batch_size: usize) -> FineTuneConfig {
+        FineTuneConfig {
+            batch_size,
+            embedding_loss: Some(super::super::EmbeddingLoss::MultipleNegativesRanking {
+                temperature: 20.0,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Sum-consistency: `sum(per_example.loss) == mean * count`, targeting
+    /// the SEAM's example-mean (not `evaluate`'s legacy batch-mean, which
+    /// this fixture never calls).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sum_of_per_example_equals_mean_times_count() {
+        let device = Device::Cpu;
+        let mut loop_ = minimal_pairs_loop(&device, mnrl_config(2)).await;
+        let (loader, example_ids) = mixed_pairs_fixture(&device);
+
+        let held_out = loop_.evaluate_held_out(&loader, &example_ids).unwrap();
+
+        let sum: f64 = held_out.per_example.iter().map(|e| e.loss).sum();
+        assert!(
+            (sum - held_out.mean * held_out.count as f64).abs() < 1e-9,
+            "sum {sum} must equal mean {} * count {} within f64 tolerance",
+            held_out.mean,
+            held_out.count
+        );
+    }
+
+    /// `count == per_example.len()` on the seam's actual output (not just
+    /// the wire type's construction-time invariant `jammi-wire` already pins).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn count_matches_per_example_len() {
+        let device = Device::Cpu;
+        let mut loop_ = minimal_pairs_loop(&device, mnrl_config(2)).await;
+        let (loader, example_ids) = mixed_pairs_fixture(&device);
+
+        let held_out = loop_.evaluate_held_out(&loader, &example_ids).unwrap();
+
+        assert_eq!(held_out.count, held_out.per_example.len());
+        assert_eq!(held_out.count, 4);
+    }
+
+    /// Determinism: two calls over the identical `(loader, ids)` produce a
+    /// bitwise-identical `HeldOutLoss` — every per-example id and loss, the
+    /// mean, the tie fraction, the partition hash, and the negatives count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_calls_are_bitwise_identical() {
+        let device = Device::Cpu;
+        let mut loop_ = minimal_pairs_loop(&device, mnrl_config(2)).await;
+        let (loader, example_ids) = mixed_pairs_fixture(&device);
+
+        let first = loop_.evaluate_held_out(&loader, &example_ids).unwrap();
+        let second = loop_.evaluate_held_out(&loader, &example_ids).unwrap();
+
+        assert_eq!(first.count, second.count);
+        assert_eq!(first.mean.to_bits(), second.mean.to_bits());
+        assert_eq!(first.tie_fraction.to_bits(), second.tie_fraction.to_bits());
+        assert_eq!(first.batch_partition_sha256, second.batch_partition_sha256);
+        assert_eq!(
+            first.in_batch_negatives_per_example,
+            second.in_batch_negatives_per_example
+        );
+        assert_eq!(first.per_example.len(), second.per_example.len());
+        for (a, b) in first.per_example.iter().zip(second.per_example.iter()) {
+            assert_eq!(a.example_id, b.example_id);
+            assert_eq!(a.loss.to_bits(), b.loss.to_bits());
+        }
+    }
+
+    /// `tie_fraction == 1.0` on a genuinely saturated held-out split — every
+    /// row's loss rounds to an EXACT `0.0` in `f32` (see
+    /// `cross_entropy_per_row`'s doc), not merely close to it, so the
+    /// fraction-at-floor computed from `f64 == 0.0` comparisons reads a
+    /// clean `1.0` rather than falling just short of it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tie_fraction_is_one_on_a_saturated_split() {
+        let device = Device::Cpu;
+        let mut loop_ = minimal_pairs_loop(&device, mnrl_config(2)).await;
+        let (loader, example_ids) = fully_saturated_pairs_fixture(&device);
+
+        let held_out = loop_.evaluate_held_out(&loader, &example_ids).unwrap();
+
+        assert_eq!(
+            held_out.tie_fraction, 1.0,
+            "every example must sit exactly at the saturated floor"
+        );
+        for example in &held_out.per_example {
+            assert_eq!(
+                example.loss, 0.0,
+                "example '{}' must be an exact 0.0 floor, got {}",
+                example.example_id, example.loss
+            );
+        }
+    }
+
+    /// Partition-hash stability: the SAME `(ids, order, batch_size)` always
+    /// hashes to the same `batch_partition_sha256`, and a DIFFERENT batch
+    /// grouping of the identical id set hashes to a different digest — the
+    /// hash is sensitive to batch boundaries, not just the flat id list.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn partition_hash_is_stable_and_boundary_sensitive() {
+        let device = Device::Cpu;
+
+        // Same partition (batch_size = 2, same fixture) called twice.
+        let mut loop_2 = minimal_pairs_loop(&device, mnrl_config(2)).await;
+        let (loader, example_ids) = mixed_pairs_fixture(&device);
+        let a = loop_2.evaluate_held_out(&loader, &example_ids).unwrap();
+        let b = loop_2.evaluate_held_out(&loader, &example_ids).unwrap();
+        assert_eq!(a.batch_partition_sha256, b.batch_partition_sha256);
+
+        // Same 4 ids, same flat order, but a DIFFERENT batch_size (4 instead
+        // of 2) regroups them into one batch instead of two — a different
+        // partition over the identical id set.
+        let saturated_one_batch = TrainingBatch::Pairs {
+            anchors: Tensor::new(
+                &[[1.0f32, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]],
+                &device,
+            )
+            .unwrap(),
+            positives: Tensor::new(
+                &[[1.0f32, 0.0], [0.0, 1.0], [0.8, 0.6], [0.6, 0.8]],
+                &device,
+            )
+            .unwrap(),
+        };
+        let mut loop_4 = minimal_pairs_loop(&device, mnrl_config(4)).await;
+        let loader_one_batch = TrainingDataLoader::from_precomputed(vec![saturated_one_batch]);
+        let c = loop_4
+            .evaluate_held_out(&loader_one_batch, &example_ids)
+            .unwrap();
+        assert_ne!(
+            a.batch_partition_sha256, c.batch_partition_sha256,
+            "regrouping the identical id set into a different batch partition must change \
+             the partition hash"
+        );
+    }
+
+    /// Typed refusal: an empty held-out set (empty loader, empty ids) must
+    /// not fabricate a `HeldOutLoss` over zero examples.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refuses_an_empty_held_out_set() {
+        let device = Device::Cpu;
+        let mut loop_ = minimal_pairs_loop(&device, mnrl_config(2)).await;
+        let loader = TrainingDataLoader::from_precomputed(vec![]);
+
+        let err = loop_.evaluate_held_out(&loader, &[]).unwrap_err();
+        assert!(
+            matches!(err, JammiError::FineTune(ref m) if m.contains("empty")),
+            "expected an 'empty held-out set' refusal, got {err:?}"
+        );
+    }
+
+    /// Typed refusal: example-kind mismatch — a produced batch's row count
+    /// does not match `config.batch_size`, so the committed id partition and
+    /// the batch actually produced disagree about how rows group.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refuses_a_batch_whose_row_count_mismatches_batch_size() {
+        let device = Device::Cpu;
+        // batch_size = 2, but the ONE precomputed batch carries all 4 rows
+        // (never split into two batch_size-2 batches) — `example_ids.len()
+        // == 4` is a multiple of `batch_size`, so this trips the PER-BATCH
+        // row-count check specifically, not the leading multiple-of check.
+        let mut loop_ = minimal_pairs_loop(&device, mnrl_config(2)).await;
+        let batch = TrainingBatch::Pairs {
+            anchors: Tensor::new(
+                &[[1.0f32, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]],
+                &device,
+            )
+            .unwrap(),
+            positives: Tensor::new(
+                &[[1.0f32, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]],
+                &device,
+            )
+            .unwrap(),
+        };
+        let loader = TrainingDataLoader::from_precomputed(vec![batch]);
+        let example_ids = ids(&["ex-0", "ex-1", "ex-2", "ex-3"]);
+
+        let err = loop_.evaluate_held_out(&loader, &example_ids).unwrap_err();
+        assert!(
+            matches!(err, JammiError::FineTune(ref m) if m.contains("kind mismatch")),
+            "expected a batch-size kind-mismatch refusal, got {err:?}"
+        );
+    }
+
+    /// Typed refusal: a non-finite per-example loss is refused, never folded
+    /// into the mean. `positive` row 1 is `NaN`, which poisons that column of
+    /// the similarity matrix and so every row's `log_sum_exp` in the batch —
+    /// the seam must surface this as a typed error, not a `NaN` `mean`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refuses_a_non_finite_per_example_loss() {
+        let device = Device::Cpu;
+        let mut loop_ = minimal_pairs_loop(&device, mnrl_config(2)).await;
+        let batch = TrainingBatch::Pairs {
+            anchors: Tensor::new(&[[1.0f32, 0.0], [0.0, 1.0]], &device).unwrap(),
+            positives: Tensor::new(&[[1.0f32, 0.0], [f32::NAN, f32::NAN]], &device).unwrap(),
+        };
+        let loader = TrainingDataLoader::from_precomputed(vec![batch]);
+        let example_ids = ids(&["ex-0", "ex-1"]);
+
+        let err = loop_.evaluate_held_out(&loader, &example_ids).unwrap_err();
+        assert!(
+            matches!(err, JammiError::FineTune(ref m) if m.contains("non-finite")),
+            "expected a non-finite-loss refusal, got {err:?}"
+        );
+    }
+
+    fn weight_bytes(map: &std::collections::HashMap<String, Tensor>) -> Vec<(String, Vec<u8>)> {
+        let mut out: Vec<(String, Vec<u8>)> = map
+            .iter()
+            .map(|(name, t)| {
+                let bits: Vec<u8> = t
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|v| v.to_bits().to_le_bytes())
+                    .collect();
+                (name.clone(), bits)
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// A minimal real [`TrainingLoop`] over a `Classification`-shaped
+    /// `ProjectionHead` with seeded dropout ON (`lora_dropout > 0.0`) — the
+    /// no-RNG-perturbation fixture needs a target whose forward path
+    /// actually draws a dropout mask when training, unlike the dropout-free
+    /// `Pairs` fixture above.
+    async fn minimal_classification_loop(
+        device: &Device,
+        config: FineTuneConfig,
+    ) -> (TrainingLoop, VarMap) {
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
+        let head = build_classification_head(HIDDEN, NUM_CLASSES, &config, &varmap, &vb).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.keep();
+        let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
+        let loop_ = TrainingLoopBuilder::new(
+            TrainingTarget::ProjectionHead { head },
+            varmap.clone(),
+            config,
+        )
+        .device(device.clone())
+        .job_id("held-out-rng-job".into())
+        .worker_id("held-out-rng-worker".into())
+        .catalog(catalog)
+        .artifact_dir(dir_path)
+        .build()
+        .unwrap();
+        (loop_, varmap)
+    }
+
+    fn classification_batch(device: &Device) -> TrainingBatch {
+        TrainingBatch::Classification {
+            embeddings: Tensor::new(&[[1.0f32, 0.2], [0.1, -0.4]], device).unwrap(),
+            labels: Tensor::new(&[0u32, 1u32], device).unwrap(),
+        }
+    }
+
+    /// One real training micro-step: forward `compute_loss` (drawing the
+    /// classifier layer's seeded dropout mask when training is on),
+    /// backward, `AdamW::step`. Mirrors `resume_invariant::step_epoch`'s
+    /// shape.
+    fn train_step(loop_: &TrainingLoop, opt: &mut AdamW, device: &Device) {
+        let batch = classification_batch(device);
+        let loss = loop_.compute_loss(&batch).unwrap();
+        let grads = loss.backward().unwrap();
+        opt.step(&grads).unwrap();
+    }
+
+    /// No-RNG-perturbation (H1, unit 63): a training run with a seam call
+    /// interleaved between two of its steps is bitwise identical to the same
+    /// run without it. `evaluate_held_out` disables dropout for its own
+    /// forward via `with_dropout_disabled` — the SAME bracket `run()` uses
+    /// around `evaluate` — so it draws no mask and leaves the seeded dropout
+    /// stream exactly where the training forwards left it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_rng_perturbation_across_an_interleaved_seam_call() {
+        let device = Device::Cpu;
+        let config = FineTuneConfig {
+            lora_dropout: 0.3,
+            seed: 11,
+            batch_size: 2,
+            ..Default::default()
+        };
+
+        // Run A: 4 plain training steps.
+        let (a_loop, a_varmap) = minimal_classification_loop(&device, config.clone()).await;
+        let mut a_opt = AdamW::new(
+            a_varmap.all_vars(),
+            ParamsAdamW {
+                lr: 1e-2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for _ in 0..4 {
+            train_step(&a_loop, &mut a_opt, &device);
+        }
+        let w_a = a_loop.target.named_trainable_weights().unwrap();
+
+        // Run B: 2 training steps, an interleaved `evaluate_held_out` call
+        // (dropout-hot target, dropout-off forward), then 2 more training steps.
+        let (mut b_loop, b_varmap) = minimal_classification_loop(&device, config.clone()).await;
+        let mut b_opt = AdamW::new(
+            b_varmap.all_vars(),
+            ParamsAdamW {
+                lr: 1e-2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        train_step(&b_loop, &mut b_opt, &device);
+        train_step(&b_loop, &mut b_opt, &device);
+
+        let held_out_loader =
+            TrainingDataLoader::from_precomputed(vec![classification_batch(&device)]);
+        let held_out_ids = ids(&["ho-0", "ho-1"]);
+        let held_out = b_loop
+            .evaluate_held_out(&held_out_loader, &held_out_ids)
+            .unwrap();
+        assert_eq!(held_out.count, 2);
+
+        train_step(&b_loop, &mut b_opt, &device);
+        train_step(&b_loop, &mut b_opt, &device);
+        let w_b = b_loop.target.named_trainable_weights().unwrap();
+
+        assert_eq!(
+            weight_bytes(&w_a),
+            weight_bytes(&w_b),
+            "an interleaved evaluate_held_out call must not perturb the seeded dropout \
+             stream — the post-seam training steps must be byte-identical to the same \
+             steps without it"
+        );
     }
 }

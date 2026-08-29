@@ -531,9 +531,29 @@ separate record.
   silent skip) — never the caller-supplied/run order, and never a
   cross-sign pair. Returns `null` if no such transition exists in that
   branch. `sensitivity` is scoped to the degradation branch ONLY —
-  `"RED_FOR_INVESTIGATION"` never enters it, by construction (it can only
-  occur among positive-eps or otherwise improvement-concordant doses, and
-  the branch here is `eps < 0` doses' own `detected` value regardless).
+  `"RED_FOR_INVESTIGATION"` never enters it, by construction (the straddle
+  predicate matches the literal string `"RED"` only). This is true
+  REGARDLESS of eps sign — `"RED_FOR_INVESTIGATION"` is NOT restricted to
+  positive-eps doses (unit-63 round-9 audit finding 3 corrects that prior
+  claim here): a NEGATIVE-eps dose can read `"RED_FOR_INVESTIGATION"` too
+  (an anomalous improvement detected under DEFLATION, the opposite of that
+  branch's own predicted degradation direction) — never folded into
+  `sensitivity` either way, but reported separately under
+  `mutant_dose_ladder.dose_anomalies` (see below) rather than silently
+  dropped.
+- **Dose anomalies** (unit-63 round-9 audit finding 3):
+  `mutant_dose_ladder.dose_anomalies` — every NEGATIVE-eps (`eps < 0`) dose
+  column whose `detected` is `"RED_FOR_INVESTIGATION"`
+  (`ab_merge.mutant_dose_ladder_anomalies`), each recorded as
+  `{dose_label, eps, detected, finding: "anomalous improvement under
+  deflation (eps < 0)"}`. A NON-EMPTY list gates this merge's own exit
+  code exactly as the primary decision's own `RED_FOR_INVESTIGATION`
+  state does (`ab_merge.main`'s own three-outcome gate) — "investigated,
+  never silently celebrated" applies here too, not just to the primary
+  decision.
+  A POSITIVE-eps dose reading `"RED_FOR_INVESTIGATION"` is NEVER a member
+  of this list; that is the ORDINARY, PREDICTED two-sided-falsification
+  confirming arm instead (see below), not an anomaly.
   A positive-eps (`eps > 0`) dose reading `"RED"` OR `"RED_FOR_INVESTIGATION"`
   is reported separately, under `mutant_dose_ladder.two_sided_falsification`
   (unit-63 round-8 audit finding 2: BOTH arms are reported there, with the

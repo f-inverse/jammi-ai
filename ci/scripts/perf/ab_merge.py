@@ -3119,10 +3119,13 @@ def mutant_dose_ladder_sensitivity(dose_columns):
     (`eps < 0.0`) subset of `dose_columns` is sorted by `abs(eps)` ascending,
     or `None` if no such transition exists in that degradation-only,
     magnitude-ordered subset (every negative dose RED, every negative dose
-    not-detected/INVALID, the transition runs the OTHER way, or there are
-    fewer than two negative-eps doses to straddle at all). A positive-eps
-    dose is NEVER a member of this subset, regardless of its own `detected`
-    value.
+    not-detected/INVALID, the transition runs the OTHER way, a negative
+    dose reads `RED_FOR_INVESTIGATION` -- unit-63 round-9 audit finding 3:
+    an ANOMALY, an improvement detected under deflation, reported
+    separately by `mutant_dose_ladder_anomalies` and never a `"RED"`
+    straddle member here -- or there are fewer than two negative-eps doses
+    to straddle at all). A positive-eps dose is NEVER a member of this
+    subset, regardless of its own `detected` value.
     """
     negative = sorted(
         (col for col in dose_columns if _dose_label_eps(col["dose_label"]) < 0.0),
@@ -3132,6 +3135,48 @@ def mutant_dose_ladder_sensitivity(dose_columns):
         if lower["detected"] == "not-detected" and higher["detected"] == "RED":
             return {"lower": lower["dose_label"], "higher": higher["dose_label"]}
     return None
+
+
+def mutant_dose_ladder_anomalies(dose_columns):
+    """Unit-63 round-9 audit finding 3: a NEGATIVE-eps dose (silent lr
+    DEFLATION, this family's DEGRADATION-PREDICTED branch) reading
+    `"RED_FOR_INVESTIGATION"` is itself an ANOMALY -- a real, gate-detected
+    IMPROVEMENT under deflation, the opposite of that branch's own
+    predicted direction. `mutant_dose_ladder_sensitivity` correctly never
+    treats it as a `"RED"` straddle member (see that function's own doc),
+    but "never a straddle member" is not the same as "reported somewhere":
+    before this fix, a negative-eps `RED_FOR_INVESTIGATION` column silently
+    vanished -- `sensitivity` reads `None`, `sensitivity_error` reads
+    `None`, and the merge's own exit code stayed 0 -- exactly the class of
+    silent pass-through the primary decision rule's own
+    `RED_FOR_INVESTIGATION` gate exists to prevent (`main`'s own
+    `fr_merged["status"] in ("INVALID", "RED", "RED_FOR_INVESTIGATION")`
+    check): "anomalous improvement is investigated, never silently
+    celebrated".
+
+    Returns the list of `{"dose_label", "eps", "detected", "finding"}`
+    entries for every NEGATIVE-eps (`eps < 0.0`) dose column whose
+    `detected` is `"RED_FOR_INVESTIGATION"`, in `dose_columns`' own order,
+    with `finding` set to the literal string `"anomalous improvement under
+    deflation (eps < 0)"`. A POSITIVE-eps dose reading `RED_FOR_INVESTIGATION`
+    is NEVER a member of this list -- that is the ORDINARY, PREDICTED
+    two-sided-falsification confirming arm (see
+    `mutant_dose_ladder_two_sided_falsification`), not an anomaly. Empty
+    when no negative-eps dose reads `RED_FOR_INVESTIGATION`. Each dose's
+    SIGNED eps is parsed via `_dose_label_eps` (same refusal behaviour as
+    the other two dose-ladder findings).
+    """
+    out = []
+    for col in dose_columns:
+        eps = _dose_label_eps(col["dose_label"])
+        if eps < 0.0 and col["detected"] == "RED_FOR_INVESTIGATION":
+            out.append({
+                "dose_label": col["dose_label"],
+                "eps": eps,
+                "detected": col["detected"],
+                "finding": "anomalous improvement under deflation (eps < 0)",
+            })
+    return out
 
 
 def mutant_dose_ladder_two_sided_falsification(dose_columns):
@@ -3298,15 +3343,18 @@ def main(argv=None):
             try:
                 sensitivity = mutant_dose_ladder_sensitivity(dose_columns)
                 two_sided_falsification = mutant_dose_ladder_two_sided_falsification(dose_columns)
+                dose_anomalies = mutant_dose_ladder_anomalies(dose_columns)
             except MutantDoseLadderSensitivityError as exc:
                 sensitivity = None
                 two_sided_falsification = []
+                dose_anomalies = []
                 sensitivity_error = str(exc)
             fr_merged["mutant_dose_ladder"] = {
                 "doses": dose_columns,
                 "sensitivity": sensitivity,
                 "sensitivity_error": sensitivity_error,
                 "two_sided_falsification": two_sided_falsification,
+                "dose_anomalies": dose_anomalies,
                 "note": (
                     "CONTRACT amendment 2026-08-29b item 3, signed per addendum 2026-08-29c: each "
                     "dose column merges the mutant, substituted into the fused arm, against the "
@@ -3315,10 +3363,15 @@ def main(argv=None):
                     "(mutant_leg_repeat_tag's own file-naming isolation). 'sensitivity' names the "
                     "adjacent-dose pair straddling detection WITHIN the degradation-direction "
                     "(negative-eps) branch only, magnitude-ordered, or null when no such transition "
-                    "exists there; a positive-eps dose reading RED is reported separately under "
-                    "'two_sided_falsification', never folded into 'sensitivity'; "
-                    "'sensitivity_error' names a dose_label that failed to parse as a signed eps "
-                    "value, never silently ignored."
+                    "exists there; a positive-eps dose reading RED or RED_FOR_INVESTIGATION is "
+                    "reported separately under 'two_sided_falsification' (RED refutes the held-out-"
+                    "improvement prediction, RED_FOR_INVESTIGATION confirms it), never folded into "
+                    "'sensitivity'; a NEGATIVE-eps dose reading RED_FOR_INVESTIGATION (an anomalous "
+                    "improvement detected under deflation, unit-63 round-9 audit finding 3) is "
+                    "reported under 'dose_anomalies' instead and gates this merge's own exit code "
+                    "exactly as the primary decision's own RED_FOR_INVESTIGATION state does -- "
+                    "investigated, never silently celebrated; 'sensitivity_error' names a "
+                    "dose_label that failed to parse as a signed eps value, never silently ignored."
                 ),
             }
             dose_lines = ["", "# mutant dose ladder (amendment 2026-08-29b item 3; addendum 2026-08-29c signs it)"]
@@ -3334,6 +3387,8 @@ def main(argv=None):
                 dose_lines.append(f"  sensitivity: {sensitivity}")
             if two_sided_falsification:
                 dose_lines.append(f"  two_sided_falsification: {two_sided_falsification}")
+            if dose_anomalies:
+                dose_lines.append(f"  dose_anomalies: {dose_anomalies}")
             fr_table = fr_table + "\n" + "\n".join(dose_lines)
             if sensitivity_error is not None:
                 print(
@@ -3346,6 +3401,21 @@ def main(argv=None):
                 print(
                     f"finetune_run_ab mutant-dose-ladder: FAIL — dose column(s) {invalid_doses} are "
                     "INVALID (correctness-of-measurement problem, see the table above)",
+                    file=sys.stderr,
+                )
+                exit_code = 1
+            if dose_anomalies:
+                # unit-63 round-9 audit finding 3: mirrors the primary
+                # decision rule's own RED_FOR_INVESTIGATION gate (below) --
+                # an anomalous improvement under deflation is investigated,
+                # never silently celebrated, even though it can never be a
+                # 'sensitivity' straddle member.
+                anomalous_doses = [a["dose_label"] for a in dose_anomalies]
+                print(
+                    f"finetune_run_ab mutant-dose-ladder: FAIL — dose column(s) {anomalous_doses} "
+                    "read RED_FOR_INVESTIGATION at a NEGATIVE eps (anomalous improvement under "
+                    "deflation, see 'dose_anomalies' above) -- investigated, never silently "
+                    "celebrated",
                     file=sys.stderr,
                 )
                 exit_code = 1

@@ -72,7 +72,7 @@ Usage (from ``cookbook/book/``)::
                                                           # train_pairs.jsonl is absent, followed
                                                           # ALWAYS by a byte-verification against
                                                           # train_ids_sha256.json
-                                                          # (``ci/scripts/perf/verify_train_pairs.py``)
+                                                          # (ci/scripts/perf/verify_train_pairs.py)
                                                           # before any measured leg runs.
 """
 

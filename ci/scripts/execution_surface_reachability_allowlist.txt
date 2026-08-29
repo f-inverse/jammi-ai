@@ -101,7 +101,19 @@ cargo build $FLASH_BUILD_FLAG -p jammi-bench --features cuda,jammi-encoders/flas
 # suite that tests this script's own EXTRACTED merge/table-stage Python
 # module, never invokes the bash script itself) — an operator/perf-lane
 # tool, run by hand on a rented pod. ---
-cargo build --release -p jammi-bench --features cuda --manifest-path "$REPO_ROOT/Cargo.toml"	shared, byte-identical tuple: finetune_ab.sh's own build-and-check-out-ref leg (`run_cmd cargo build ...`) AND finetune_run_ab.sh's own build leg (unit 63 H4b, `run_cmd cargo build ...`) — both operator-run, invoked from no merge-path workflow; needs the CUDA toolchain. finetune_run_ab.sh's own gpu-howwell.yml is workflow_dispatch + PR-label `run-howwell` only (gpu-prove.yml's own off-merge-path shape), so it credits neither script.
+cargo build --release -p jammi-bench --features cuda --manifest-path "$REPO_ROOT/Cargo.toml"	finetune_ab.sh's own build-and-check-out-ref leg (`run_cmd cargo build ...`) — operator-run, invoked from no merge-path workflow; needs the CUDA toolchain. (finetune_run_ab.sh once shared this exact tuple, but its CONTRACT 63 Frame correction moved it to the flash-attn spelling — see that script's own row below.)
+
+# --- ci/scripts/perf/finetune_run_ab.sh — the unit-63 how-well campaign
+# driver (unification contract C5.1's `run_cmd` provenance-logging
+# wrapper, same shape as finetune_ab.sh above). Its own gpu-howwell.yml is
+# workflow_dispatch + PR-label `run-howwell` only (gpu-prove.yml's own
+# off-merge-path shape), so no merge-path workflow credits it. The build
+# carries flash-attn BY CONTRACT: the CONTRACT 63 Frame pre-registers the
+# arms as "fused cascade vs ALLOFF=attention_block_flash,adamw_step_fused"
+# (the script's own comment: building WITHOUT flash-attn nulls the
+# experiment the campaign exists to run), mirroring fa2_ab.sh's/
+# stacked_sweep.sh's own flash-A/B feature list. ---
+cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn --manifest-path "$REPO_ROOT/Cargo.toml"	finetune_run_ab.sh's own build leg (unit 63 H4b, `run_cmd cargo build ...`) — operator-run on a rented pod, invoked from no merge-path workflow (gpu-howwell.yml is dispatch/label-only, see this section's header); needs the CUDA toolchain + a provisioned CUTLASS submodule.
 
 # --- ci/scripts/perf/stacked_sweep.sh — a stacked-optimization timing sweep
 # (unification contract C5.1's `run_cmd` provenance-logging wrapper).

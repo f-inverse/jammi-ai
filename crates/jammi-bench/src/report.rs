@@ -1958,6 +1958,23 @@ pub struct EpochHeldOut {
 /// [`Self::PROVENANCE_FIELDS`]: still recorded on every run, never a
 /// comparison key here.
 ///
+/// (e) Round-7 audit, finding 1: [`Self::mutant_id`]/[`Self::mutant_base_sha`]/
+/// [`Self::mutant_patch_sha256`] are OMITTED from BOTH [`Self::IDENTITY_FIELDS`]
+/// and [`Self::PROVENANCE_FIELDS`] entirely — not merely moved between them
+/// like (c)'s three fields. A mutant leg's identity/provenance tuples are, by
+/// the mutant campaign's own design (`mutants/README.md`'s "what M1 does NOT
+/// touch"), IDENTICAL to a clean `fused` leg's: the patch changes which
+/// binary produced the numbers, never what the run claims to have measured.
+/// Naming the mutant on either tuple would make a mutant leg permanently
+/// unpairable with the clean legs it exists to be diffed against — the same
+/// reason [`Self::arm`] itself is provenance rather than identity (struct
+/// doc, above), taken one step further: these three are neither. They are a
+/// third, honest-labeling category — a caller's self-report of which patch
+/// produced this leg, checked for internal completeness (all-or-none) by the
+/// producer and cross-checked against the dose column's own claim by
+/// `ci/scripts/perf/ab_merge.py`, never compared leg-to-leg the way
+/// [`Self::IDENTITY_FIELDS`] is.
+///
 /// ## `margin`/`temperature`: objective-selected nullness (H4a-delta, CONTRACT
 /// amendment 2026-08-28)
 ///
@@ -2220,6 +2237,41 @@ pub struct FinetuneRunTier {
     /// the full correction and the (deliberately absent) contract citation
     /// this replaces.
     pub train_probe_series: Vec<f64>,
+
+    // ── Mutant provenance (unit 63 round-7 audit, finding 1) — honest
+    //    labeling, NOT identity or provenance ───────────────────────────
+    //
+    // These three mirror [`crate::finetune_run::FinetuneRunParams::mutant_id`]/
+    // `mutant_base_sha`/`mutant_patch_sha256` verbatim (see that struct's own
+    // doc for the full "why not identity/provenance" rationale, repeated
+    // here in short): a mutant leg's own IDENTITY_FIELDS/PROVENANCE_FIELDS
+    // are IDENTICAL to a clean `fused` leg's (the mutant only patches which
+    // binary produced the numbers, never what the run was configured to
+    // measure), so a mutant's name belongs to neither comparison tuple —
+    // deliberately absent from both [`Self::IDENTITY_FIELDS`] and
+    // [`Self::PROVENANCE_FIELDS`] below. They are a CALLER-DECLARED
+    // self-report (a mutant leg names itself; this process cannot verify
+    // from inside itself which patch it was actually built from), not a
+    // measured or derived fact — closer to a signature than a
+    // premise/provenance leg. All three are `None` for an ordinary
+    // (non-mutant) leg, and `#[serde(skip_serializing_if =
+    // "Option::is_none")]` omits the keys entirely in that case, so a normal
+    // leg's emitted JSON (and every committed golden built from one) is
+    // byte-for-byte unchanged by this addition. `ci/scripts/perf/ab_merge.py`'s
+    // mutant-dose-ladder merge mode reads these three keys BY THESE EXACT
+    // NAMES to attribute a dose column's legs to a specific, auditable
+    // mutant patch.
+    /// `--mutant-id`: the mutant's own label (e.g. `"eps-0.10"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mutant_id: Option<String>,
+    /// `--mutant-base-sha`: the git commit sha this mutant's patch was cut
+    /// against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mutant_base_sha: Option<String>,
+    /// `--mutant-patch-sha256`: sha256 (hex) of the mutant patch's own
+    /// content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mutant_patch_sha256: Option<String>,
 }
 
 impl FinetuneRunTier {
@@ -3125,6 +3177,9 @@ mod tests {
                 held_out_batch_partition_sha256: "e".repeat(64),
             }],
             train_probe_series: vec![0.6, 0.55, 0.5],
+            mutant_id: None,
+            mutant_base_sha: None,
+            mutant_patch_sha256: None,
         }
     }
 
@@ -3206,6 +3261,69 @@ mod tests {
     #[test]
     fn finetune_run_tier_provenance_fields_cardinality_is_10() {
         assert_eq!(FinetuneRunTier::PROVENANCE_FIELDS.len(), 10);
+    }
+
+    /// Unit 63 round-7 audit, finding 1: the three mutant-provenance fields
+    /// are honest-labeling, NOT identity or provenance (struct doc, (e)) —
+    /// pinning their absence from BOTH comparison consts so a future edit
+    /// that reflexively adds a new field to one of these tuples cannot
+    /// silently sweep the mutant fields in with it.
+    #[test]
+    fn mutant_fields_are_absent_from_both_identity_and_provenance_tuples() {
+        for (field, _) in FinetuneRunTier::IDENTITY_FIELDS {
+            assert!(
+                !field.starts_with("mutant_"),
+                "{field:?} is a mutant-provenance field but appears in IDENTITY_FIELDS"
+            );
+        }
+        for (field, _) in FinetuneRunTier::PROVENANCE_FIELDS {
+            assert!(
+                !field.starts_with("mutant_"),
+                "{field:?} is a mutant-provenance field but appears in PROVENANCE_FIELDS"
+            );
+        }
+    }
+
+    /// A normal (non-mutant) leg's `mutant_id`/`mutant_base_sha`/
+    /// `mutant_patch_sha256` are all `None`, and `#[serde(skip_serializing_if
+    /// = "Option::is_none")]` must OMIT all three keys entirely from the
+    /// emitted JSON (never emit them as explicit `null`s) — the exact
+    /// "normal legs' JSON is byte-unchanged" guarantee finding 1 requires,
+    /// so a committed golden built before this change is unaffected.
+    #[test]
+    fn mutant_fields_are_omitted_entirely_when_none() {
+        let tier = sample_finetune_run_tier();
+        assert!(tier.mutant_id.is_none());
+        let value = serde_json::to_value(&tier).expect("serialize FinetuneRunTier");
+        let obj = value.as_object().expect("object");
+        for field in ["mutant_id", "mutant_base_sha", "mutant_patch_sha256"] {
+            assert!(
+                !obj.contains_key(field),
+                "{field:?} must be OMITTED (not merely null) when None, got {:?}",
+                obj.get(field)
+            );
+        }
+    }
+
+    /// A fully-labeled mutant leg emits all three keys as plain strings —
+    /// the shape `ci/scripts/perf/ab_merge.py`'s mutant-dose-ladder mode
+    /// reads by these exact key names.
+    #[test]
+    fn mutant_fields_are_emitted_when_all_present() {
+        let tier = FinetuneRunTier {
+            mutant_id: Some("eps-0.10".to_string()),
+            mutant_base_sha: Some("f".repeat(40)),
+            mutant_patch_sha256: Some("a".repeat(64)),
+            ..sample_finetune_run_tier()
+        };
+        let value = serde_json::to_value(&tier).expect("serialize FinetuneRunTier");
+        let obj = value.as_object().expect("object");
+        assert_eq!(obj["mutant_id"], serde_json::json!("eps-0.10"));
+        assert_eq!(obj["mutant_base_sha"], serde_json::json!("f".repeat(40)));
+        assert_eq!(
+            obj["mutant_patch_sha256"],
+            serde_json::json!("a".repeat(64))
+        );
     }
 
     /// DISJOINTNESS: `IDENTITY_FIELDS` and `PROVENANCE_FIELDS` share no

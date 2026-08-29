@@ -215,6 +215,23 @@ struct FinetuneRunArgs {
     /// state.
     #[arg(long)]
     work_dir: PathBuf,
+    /// Unit 63 round-7 audit, finding 1: the mutant's own label (e.g.
+    /// `"eps-0.10"`) — OPTIONAL, and all-or-none with `--mutant-base-sha` /
+    /// `--mutant-patch-sha256` (a partial mutant label is refused; see
+    /// `finetune_run::run`'s own leading validation). Omitted entirely for
+    /// an ordinary (non-mutant) leg — see
+    /// `finetune_run::FinetuneRunParams::mutant_id`'s own doc for why these
+    /// three are honest-labeling fields, never identity or provenance.
+    #[arg(long)]
+    mutant_id: Option<String>,
+    /// The git commit sha this mutant's patch was cut against — see
+    /// `mutant_id`'s doc.
+    #[arg(long)]
+    mutant_base_sha: Option<String>,
+    /// sha256 (hex) of the mutant patch's own content — see `mutant_id`'s
+    /// doc.
+    #[arg(long)]
+    mutant_patch_sha256: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -832,6 +849,9 @@ async fn main() -> std::process::ExitCode {
                 expect_dense,
                 cuda,
                 work_dir,
+                mutant_id,
+                mutant_base_sha,
+                mutant_patch_sha256,
             } = *args;
             let arm = match arm.parse::<finetune_run::Arm>() {
                 Ok(a) => a,
@@ -944,6 +964,9 @@ async fn main() -> std::process::ExitCode {
                 expect_dense,
                 cuda_device: cuda,
                 work_dir,
+                mutant_id,
+                mutant_base_sha,
+                mutant_patch_sha256,
             };
             run_finetune_run(params).await
         }

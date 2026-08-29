@@ -230,6 +230,27 @@ fn finetune_run_smoke_end_to_end_cpu_hermetic() {
     assert_eq!(trajectory[0]["epoch"], serde_json::json!(0));
     assert_eq!(trajectory[1]["epoch"], serde_json::json!(1));
 
+    // Advisory (e) (unit 63 round-7 audit): `train_probe_series` must exist
+    // and carry exactly `epochs + 1` entries (the init probe plus one per
+    // epoch — CONTRACT amendment 2026-08-29b) in the CLI-level report the
+    // merger actually reads, not merely in an in-process unit test —
+    // `--epochs 2` here, so `2 + 1 == 3`.
+    let train_probe_series = obj["train_probe_series"]
+        .as_array()
+        .expect("train_probe_series array");
+    assert_eq!(
+        train_probe_series.len(),
+        3,
+        "train_probe_series must carry epochs (2) + 1 entries (the init probe plus one per \
+         epoch): {train_probe_series:?}"
+    );
+    for (i, v) in train_probe_series.iter().enumerate() {
+        assert!(
+            v.as_f64().is_some(),
+            "train_probe_series[{i}] must be a finite number, got {v:?}"
+        );
+    }
+
     // `--arm fused` was declared; the process made no kernel-disable claim.
     assert_eq!(obj["arm"], serde_json::json!("fused"));
 
@@ -330,5 +351,19 @@ fn finetune_run_smoke_mnrl_end_to_end_cpu_hermetic() {
         trajectory.len(),
         2,
         "expected one evaluate_held_out point per epoch at eval_cadence=1: {trajectory:?}"
+    );
+
+    // Advisory (e) (unit 63 round-7 audit): the MNRL objective's
+    // `train_probe_series` must carry the same `epochs + 1` shape as the
+    // Triplet leg — this field's shape does not depend on which objective
+    // was selected.
+    let train_probe_series = obj["train_probe_series"]
+        .as_array()
+        .expect("train_probe_series array");
+    assert_eq!(
+        train_probe_series.len(),
+        3,
+        "train_probe_series must carry epochs (2) + 1 entries (the init probe plus one per \
+         epoch): {train_probe_series:?}"
     );
 }

@@ -2717,13 +2717,30 @@ def build_finetune_run_report(raw_dir, seeds, lr0_seeds=(), allow_missing_lr0_co
 MUTANT_DECISION_THRESHOLD = FINETUNE_RUN_DECISION_THRESHOLD
 MUTANT_GATE_SEED_COUNT = FINETUNE_RUN_GATE_SEED_COUNT
 
-# unit-63 round-8 audit finding 3: the sane domain for this family's own
-# SIGNED `eps` (CONTRACT.md addendum 2026-08-29c: the update-scale
-# multiplier is `(1+eps)`) -- the scheduled ladder never exceeds `|eps| =
-# 0.50`; a magnitude past `1.0` is no longer a "silent lr (in/de)flation"
-# dose (at `eps <= -1.0` the update-scale multiplier is non-positive, a
-# different failure shape entirely, not a member of this monotone family).
+# unit-63 round-8 audit finding 3 (round-9 audit finding 2 makes the
+# domain ASYMMETRIC -- a single `abs(eps) > MAX` check is not this
+# family's real shape): the sane domain for this family's own SIGNED
+# `eps` (CONTRACT.md addendum 2026-08-29c: the update-scale multiplier is
+# `(1+eps)`) is `eps in (-1.0, -MUTANT_DOSE_LADDER_MIN_ABS_EPS] union
+# [MUTANT_DOSE_LADDER_MIN_ABS_EPS, MUTANT_DOSE_LADDER_MAX_ABS_EPS]`:
+#   - `eps <= -1.0` is refused, EXCLUSIVE of the bound itself: at
+#     `eps == -1.0` the update-scale multiplier `(1+eps)` is exactly
+#     zero (a zero-update leg -- this constant's own prior doc already
+#     named it "not a member of this monotone family"), and past it the
+#     multiplier is NEGATIVE (a sign flip, a different failure shape
+#     entirely). A single symmetric `abs(eps) > MUTANT_DOSE_LADDER_MAX_ABS_EPS`
+#     check let `eps == -1.0` through (`abs(-1.0) == 1.0`, not `> 1.0`) --
+#     the round-9 audit demonstrated it reported as the Acceptance-5-
+#     discharging degradation bound for a zero-update leg.
+#   - `eps > 1.0` is refused as the family-sanity cap: the scheduled
+#     ladder never exceeds `|eps| = 0.50`; nothing past `1.0` has ever
+#     been a scheduled dose.
+#   - `0.0 < abs(eps) < MUTANT_DOSE_LADDER_MIN_ABS_EPS` is refused as
+#     below the smallest ever-scheduled dose (`|eps| = 0.10`) -- a
+#     manufactured `eps=1e-9` sitting at the bottom of a straddle is
+#     refused rather than silently accepted as a real, schedulable dose.
 MUTANT_DOSE_LADDER_MAX_ABS_EPS = 1.0
+MUTANT_DOSE_LADDER_MIN_ABS_EPS = 0.01
 
 
 def mutant_leg_repeat_tag(dose_label):
@@ -3000,11 +3017,13 @@ def _dose_label_eps(dose_label):
     dropped" this module's own doc promises, and never delivers, for that
     one shape. The same applies to a non-finite magnitude (`inf`/`-inf`,
     which trivially satisfies `> 0.0`/`< 0.0` but is not a real dose at
-    all) and to a magnitude outside this family's own sane domain (`|eps|
-    > MUTANT_DOSE_LADDER_MAX_ABS_EPS`, see that constant's own doc). Every
-    one of these is refused here, loudly, by the SAME exception every
-    other unparseable label raises -- never a silent pass-through to a
-    partition predicate that was never designed to reject them.
+    all) and to a value outside this family's own sane, ASYMMETRIC domain
+    (`eps <= -1.0`, `eps > MUTANT_DOSE_LADDER_MAX_ABS_EPS`, or `0.0 <
+    abs(eps) < MUTANT_DOSE_LADDER_MIN_ABS_EPS` -- unit-63 round-9 audit
+    finding 2, see those constants' own doc). Every one of these is
+    refused here, loudly, by the SAME exception every other unparseable
+    label raises -- never a silent pass-through to a partition predicate
+    that was never designed to reject them.
     """
     prefix = "eps"
     if not dose_label.startswith(prefix):
@@ -3034,11 +3053,30 @@ def _dose_label_eps(dose_label):
             "or improvement (eps > 0.0) branch and must never be silently dropped from both "
             "findings"
         )
-    if abs(value) > MUTANT_DOSE_LADDER_MAX_ABS_EPS:
+    # unit-63 round-9 audit finding 2: the domain is ASYMMETRIC, never a
+    # single `abs(value) > MAX` check -- that check alone would let
+    # `eps == -1.0` through (`abs(-1.0) == MUTANT_DOSE_LADDER_MAX_ABS_EPS`,
+    # not `>`), a zero-update leg (multiplier `(1+eps) == 0`) this
+    # family's own doc already declares out of family. Refused EXCLUSIVE
+    # of the bound itself: `eps == -1.0` is refused, `eps == -0.99` is not.
+    if value <= -1.0:
         raise MutantDoseLadderSensitivityError(
-            f"dose_label {dose_label!r} parses to eps={value!r}, whose magnitude exceeds this "
-            f"family's own sane domain (|eps| <= {MUTANT_DOSE_LADDER_MAX_ABS_EPS}) -- never "
-            "silently accepted as though it were a scheduled dose"
+            f"dose_label {dose_label!r} parses to eps={value!r} (<= -1.0) -- at this magnitude "
+            "the update-scale multiplier (1+eps) is zero or negative, a different failure shape "
+            "entirely and never a member of this monotone silent-(in/de)flation family, even "
+            "though a single symmetric |eps| cap would have let it through"
+        )
+    if value > MUTANT_DOSE_LADDER_MAX_ABS_EPS:
+        raise MutantDoseLadderSensitivityError(
+            f"dose_label {dose_label!r} parses to eps={value!r}, which exceeds this family's own "
+            f"sane domain (eps <= {MUTANT_DOSE_LADDER_MAX_ABS_EPS}) -- never silently accepted as "
+            "though it were a scheduled dose"
+        )
+    if abs(value) < MUTANT_DOSE_LADDER_MIN_ABS_EPS:
+        raise MutantDoseLadderSensitivityError(
+            f"dose_label {dose_label!r} parses to eps={value!r}, whose magnitude is below this "
+            f"family's own smallest ever-scheduled dose (|eps| >= {MUTANT_DOSE_LADDER_MIN_ABS_EPS}) "
+            "-- never silently accepted as though it were a real, schedulable dose"
         )
     return value
 

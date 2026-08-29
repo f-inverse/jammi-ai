@@ -477,9 +477,16 @@ separate record.
   on. `dose_label` is an operator-chosen string from the scheduled set
   (e.g. `"eps-0.50"`), but it IS reinterpreted by the merger — parsed as a
   signed `eps` float (`ab_merge._dose_label_eps`) to place the column in
-  the degradation/improvement branch and (unit-63 round-8 audit finding 3)
-  validated finite, non-zero, and within this family's own sane domain
-  (`|eps| <= MUTANT_DOSE_LADDER_MAX_ABS_EPS`); an unparseable, non-finite,
+  the degradation/improvement branch and (unit-63 round-8 audit finding 3;
+  round-9 audit finding 2 makes the domain ASYMMETRIC) validated finite,
+  non-zero, and within this family's own sane domain — `eps in
+  (-1.0, -MUTANT_DOSE_LADDER_MIN_ABS_EPS] union
+  [MUTANT_DOSE_LADDER_MIN_ABS_EPS, MUTANT_DOSE_LADDER_MAX_ABS_EPS]`
+  (`eps == -1.0` itself is refused, EXCLUSIVE: the update-scale multiplier
+  `(1+eps)` is zero there, a zero-update leg, not a member of this
+  family — a single symmetric `|eps| <= MAX` check would have let it
+  through; a magnitude below `MUTANT_DOSE_LADDER_MIN_ABS_EPS` is refused
+  as below the smallest ever-scheduled dose); an unparseable, non-finite,
   zero, or out-of-domain label is refused loudly, never silently
   passed through as an opaque tag.
 - **Per-leg recorded fields**: every field a clean `fused` leg already

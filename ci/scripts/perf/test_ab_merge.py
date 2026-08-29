@@ -3973,6 +3973,24 @@ class MutantDoseLadderTests(unittest.TestCase):
         with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
             ab_merge.mutant_dose_ladder_sensitivity(columns)
 
+    def test_eps_domain_boundary_oracle(self):
+        # unit-63 round-9 audit finding 2: the domain is ASYMMETRIC --
+        # `eps <= -1.0` (multiplier sign bound, exclusive of -1.0 itself)
+        # and `eps > 1.0` (the family-sanity cap) are refused on the high
+        # end, and `0 < abs(eps) < 0.01` (below the smallest ever-scheduled
+        # dose) is refused on the low end. A single symmetric
+        # `abs(eps) > 1.0` check would have wrongly ACCEPTED eps=-1.0 (a
+        # zero-update leg) as though it were a real degradation dose.
+        refused = ("eps-1.0", "eps1.01", "eps0.009")
+        accepted = {"eps-0.99": -0.99, "eps1.0": 1.0, "eps-0.01": -0.01}
+        for dose_label in refused:
+            with self.subTest(dose_label=dose_label, expect="refused"):
+                with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+                    ab_merge._dose_label_eps(dose_label)
+        for dose_label, expected_value in accepted.items():
+            with self.subTest(dose_label=dose_label, expect="accepted"):
+                self.assertAlmostEqual(ab_merge._dose_label_eps(dose_label), expected_value)
+
     def test_cli_wiring_folds_the_dose_ladder_into_the_same_artifact(self):
         with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
             for seed in range(1, 13):

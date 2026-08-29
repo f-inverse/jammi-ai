@@ -1,0 +1,28 @@
+diff --git a/crates/jammi-kernels/src/ops/adamw_step.rs b/crates/jammi-kernels/src/ops/adamw_step.rs
+index 58a1418c..cf9fb551 100644
+--- a/crates/jammi-kernels/src/ops/adamw_step.rs
++++ b/crates/jammi-kernels/src/ops/adamw_step.rs
+@@ -637,11 +637,22 @@ pub fn adamw_step_fused_t(
+         grad,
+         AdamMomentUpdate::new(params.beta2, true),
+     )?;
++    // MUTANT M_eps_0.02 (Unit 63 H5 kernel-mutant dose family, docs/plans/
++    // 63-how-well/mutants/M_eps_0.02.patch): sustained silent-lr-inflation —
++    // the fused AdamW update's effective learning rate is scaled by
++    // (1+eps) with eps=0.02, applied uniformly at every step (a SUSTAINED
++    // one-direction perturbation, unlike M1's bias-correction transient
++    // which fades toward 1.0 as t grows). See mutants/README.md for the
++    // dose-family design and the pre-published predicted per-dose effect.
++    // NEVER MERGE: this line must read `params.lr` unscaled on the
++    // production kernel.
++    const LR_INFLATION_FACTOR: f64 = 1.02_f64;
++    let lr_dose = params.lr * LR_INFLATION_FACTOR;
+     super::apply_inplace3(
+         theta,
+         first_moment,
+         second_moment,
+-        AdamThetaUpdate::new(params.lr, params.weight_decay, scale_m, scale_v, params.eps),
++        AdamThetaUpdate::new(lr_dose, params.weight_decay, scale_m, scale_v, params.eps),
+     )
+ }
+ 

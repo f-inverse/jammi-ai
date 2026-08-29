@@ -1325,6 +1325,16 @@ FINETUNE_RUN_EXPECTED_ADMISSION_IS_DENSE = False
 # (the probe's own baseline), never the floor value itself.
 FINETUNE_RUN_LEARNING_HAPPENED_FLOOR = 0.0
 FINETUNE_RUN_TIE_FRACTION_CAP = 0.5
+# unit-63 round-7 audit advisory (d): amendment 2026-08-29b item 4's boundary
+# constraint ("decaying LR schedules stay disabled for this tier until the
+# resume-cycle LR-horizon defect ... is fixed; the campaign's constant/
+# 0-warmup setting is unaffected") had NO mechanical enforcement anywhere in
+# this merger -- `schedule` is a `FINETUNE_RUN_IDENTITY_FIELDS` member (so a
+# fused/alloff MISMATCH was already caught), but a leg that ran a DECAYING
+# schedule on BOTH arms identically would clear that identity check
+# unchallenged. `finetune_run_named_arm_premise_violations` below now checks
+# the POSITIVE fact the boundary constraint depends on.
+FINETUNE_RUN_EXPECTED_SCHEDULE = "constant"
 
 # The pre-registered decision rule (CONTRACT Frame / PLAN.md v2 delta 3/4,
 # unit-63 audit finding 1 -- `build_finetune_run_report` used to compute the
@@ -1587,7 +1597,8 @@ def finetune_run_named_arm_premise_violations(arm, tier):
     """`finetune_run_arm_premise_violations`'s own STRUCTURED core -- returns
     `[(premise_name, message), ...]` for the CONTRACT Frame's three
     conjunctive premise legs (`admission_is_dense`, `learning_happened`,
-    `tie_fraction`), so a caller building `premise_failure_diagnostic`
+    `tie_fraction`) PLUS the `schedule` boundary constraint (unit-63 round-7
+    audit advisory (d)), so a caller building `premise_failure_diagnostic`
     (amendment 2026-08-29b item 1(c)) can name WHICH premise leg(s) failed on
     a given leg, not merely that leg's flattened message strings.
     `finetune_run_arm_premise_violations` below is a thin wrapper over this
@@ -1595,6 +1606,16 @@ def finetune_run_named_arm_premise_violations(arm, tier):
     in this module already appends to.
     """
     named = []
+    schedule = tier.get("schedule")
+    if schedule != FINETUNE_RUN_EXPECTED_SCHEDULE:
+        named.append((
+            "schedule",
+            f"{arm}: schedule={schedule!r}, expected {FINETUNE_RUN_EXPECTED_SCHEDULE!r} -- "
+            "CONTRACT amendment 2026-08-29b item 4: decaying LR schedules stay disabled for this "
+            "tier until the resume-cycle LR-horizon defect (total_steps recomputed per cycle) is "
+            "fixed; `schedule` is already recorded on the tier, so this boundary constraint is "
+            "mechanically enforced here rather than left to operator discipline alone",
+        ))
     is_dense = tier.get("admission_is_dense")
     if is_dense != FINETUNE_RUN_EXPECTED_ADMISSION_IS_DENSE:
         named.append((

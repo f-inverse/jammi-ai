@@ -2297,9 +2297,10 @@ class SignTestMirrorTests(unittest.TestCase):
 
 class FinetuneRunArmPremiseMutantTests(unittest.TestCase):
     """`finetune_run_arm_premise_violations` — one mutant per premise leg
-    (CONTRACT Frame / H4: admission_is_dense / learning-happened / tie cap,
-    conjunctive). A clean tier clears all three; each mutation trips exactly
-    the leg it targets, proving none of the three checks is vacuous.
+    (CONTRACT Frame / H4: admission_is_dense / learning-happened / tie cap /
+    schedule, conjunctive). A clean tier clears all four; each mutation
+    trips exactly the leg it targets, proving none of the four checks is
+    vacuous.
     """
 
     def test_clean_tier_has_no_violations(self):
@@ -2309,6 +2310,15 @@ class FinetuneRunArmPremiseMutantTests(unittest.TestCase):
         tier = _finetune_run_tier(admission_is_dense=True)
         v = ab_merge.finetune_run_arm_premise_violations("fused", tier)
         self.assertTrue(any("admission_is_dense" in m for m in v), v)
+
+    def test_decaying_schedule_is_a_violation(self):
+        # unit-63 round-7 audit advisory (d): amendment 2026-08-29b item 4's
+        # decaying-schedule ban had no mechanical enforcement -- `schedule`
+        # is already recorded on the tier, so a non-"constant" schedule must
+        # be refused here, citing that item.
+        tier = _finetune_run_tier(schedule="cosine")
+        v = ab_merge.finetune_run_arm_premise_violations("fused", tier)
+        self.assertTrue(any("schedule" in m and "item 4" in m for m in v), v)
 
     # amendment 2026-08-29b: the learning-happened premise is now DERIVED
     # from the raw `train_probe_series` (series[0] - series[-1] > floor),

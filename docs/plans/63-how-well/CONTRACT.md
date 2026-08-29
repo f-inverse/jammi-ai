@@ -281,3 +281,14 @@ Resolution (still pre-spend, still one monotone one-parameter family — update 
   the adjacent-dose pair straddling detection within the negative branch.
 Patches M_eps_-0.10 / M_eps_-0.50 are cut from the same single-constant template; the
 prediction table gains their rows (same arithmetic, committed data only) before any leg runs.
+
+**Postscript, 2026-08-29c** (docs-ci, unit-63 round-7 audit advisory (a)): amendment
+2026-08-29b item 2(ii)'s own diagnostic-d-column sentence ("v1's diagnostic d-column reads
+n_neg=8/12, mean_d=-0.0238, p=0.2266") mixes two different denominators — the sign counts
+(n_pos/n_neg) and mean_d/p are all computed over the v1 run's 11 CLEAN (premise-passing)
+seeds (seed 4's alloff leg is the run's one premise failure, per that item's own basis
+paragraph), never the pre-registered 12-seed gate count. The correct, denominator-consistent
+statement: n_pos=3, n_neg=8 of 11; mean_d=-0.0238, p=0.2266, both also over the same 11. Item
+2(ii)'s own prose is left exactly as originally recorded (append-only); this postscript is
+the correction of record. measurements/campaign-v1/README.md carries the identical fix in
+place, with its own dated correction note.

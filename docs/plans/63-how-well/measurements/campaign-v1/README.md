@@ -21,9 +21,18 @@ x {r1, r2} + lr=0 controls x2 seeds, merged by `ab_merge.py`'s finetune-run mode
   both bit-identical across r1/r2).
 - Determinism floor: exactly 0.0 (every r1/r2 pair bit-identical).
 - lr=0 controls: delta exactly 0.0, both arms, both seeds — the floor bites.
-- Diagnostic d-column (NOT a verdict; the run is INVALID): n_neg=8/12,
-  mean_d=-0.0238, p=0.2266 — the fused arm TRENDS BETTER on held-out loss; no
-  degradation signal.
+- Diagnostic d-column (NOT a verdict; the run is INVALID): computed over the
+  11 CLEAN (premise-passing) seeds — seed 4's alloff leg is the one premise
+  failure named above, so its pair is excluded from this diagnostic too —
+  n_pos=3, n_neg=8 of 11; mean_d=-0.0238, p=0.2266, both also over the same
+  11 — the fused arm TRENDS BETTER on held-out loss; no degradation signal.
+  **Correction, 2026-08-29c** (docs-ci, unit-63 round-7 audit advisory (a)):
+  an earlier revision of this line stated `n_neg=8/12`, mixing the 11-seed
+  sign-count denominator with the pre-registered 12-seed gate count; the
+  diagnostic d-column was always computed over the 11 clean seeds only.
+  CONTRACT.md amendment 2026-08-29b item 2(ii) carried the identical
+  mixed-denominator wording — see that amendment's own 2026-08-29c
+  postscript for the correction of record there.
 
 ## Why it is INVALID, root-caused (pressure-tested)
 

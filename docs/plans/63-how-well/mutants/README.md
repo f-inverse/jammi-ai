@@ -33,13 +33,39 @@ over an entire training run). M1 stands as an honestly-recorded
 non-detection, **not** a sensitivity bound; it is not deleted, and `M1.patch`
 remains committed as a file (never applied to tree state on this branch).
 
-## The new dose family: sustained silent-lr-inflation, `M_eps_{0.02,0.10,0.50}`
+## The dose family: sustained silent-lr-(in/de)flation, signed `eps`
 
 **Shape:** the fused AdamW update's effective learning rate is scaled by
 `(1+eps)`, applied uniformly at **every** step — a one-parameter, monotone,
 **sustained** perturbation (unlike M1's transient, this does not decay
-toward 1.0 as `t` grows; `(1+eps)` is constant for all `t`). Three doses:
-`eps in {0.02, 0.10, 0.50}`.
+toward 1.0 as `t` grows; `(1+eps)` is constant for all `t`).
+
+**Superseded (falsified pre-spend, NOT scheduled to run):** amendment
+2026-08-29b item 3 originally named `eps in {0.02, 0.10, 0.50}` (positive
+only — silent lr INFLATION). The REQUIRED pre-spend prediction table below
+(Step 2/3, original version) showed the `(1+eps)` direction as held-out
+IMPROVEMENT, not degradation, for both measured seeds — a positive dose
+therefore cannot discharge "mutant column proven RED (degradation)". `M_eps_0.02.patch`
+and `M_eps_0.10.patch` stay committed as the falsified-but-recorded
+doses (documentation of the falsification, current-truth discipline); they
+are not part of the scheduled ladder below.
+
+**Current (CONTRACT.md addendum 2026-08-29c): the signed ladder,
+`eps in {-0.50, -0.10, +0.50}`.** Same one-parameter monotone family,
+`eps` now SIGNED:
+- Negative doses (`-0.10`, `-0.50`) are silent lr DEFLATION — the
+  undertrained-regression class — and carry the predicted DEGRADATION
+  direction (Step 2 below: secant symmetric, predicted per-seed shift
+  `+|eps|*slope_seed`, sign-consistent across both measured seeds).
+- `+0.50` is retained deliberately as the two-sided falsification cell for
+  the improvement prediction itself: if it reads RED-for-investigation
+  shaped as improvement, the original prediction is confirmed; if it
+  instead degrades, the secant extrapolation is refuted and that must be
+  recorded here.
+- Acceptance 5's "mutant column proven RED" is discharged by the smallest
+  detected DEGRADATION dose (expected among the negative eps values); the
+  reported sensitivity is the adjacent-dose pair straddling detection
+  within the negative branch.
 
 **Where it lives:** `adamw_step_fused_t` in
 `crates/jammi-kernels/src/ops/adamw_step.rs`, immediately before the
@@ -82,15 +108,22 @@ campaign's fused arm. Nothing else changes:
   framing exactly, not just the gradient term in isolation.
 
 **Files:**
-- `M_eps_0.02.patch` — sha256 `c173ae2bee0db87ac7719c3cd9ae8d12480e81bf5cab1832c18c0788741275f1`
-- `M_eps_0.10.patch` — sha256 `63b7f53c5b19a5e2081551fb25564154460f6c0c4bcc55520d964f75990a607c`
-- `M_eps_0.50.patch` — sha256 `30abfc1cf4d81be321de45d600e0741bb8a00169f34253fa3009e2ade55d2e98`
+- `M_eps_0.02.patch` — sha256 `c173ae2bee0db87ac7719c3cd9ae8d12480e81bf5cab1832c18c0788741275f1` — **falsified, not scheduled**
+- `M_eps_0.10.patch` — sha256 `63b7f53c5b19a5e2081551fb25564154460f6c0c4bcc55520d964f75990a607c` — **falsified, not scheduled**
+- `M_eps_0.50.patch` — sha256 `30abfc1cf4d81be321de45d600e0741bb8a00169f34253fa3009e2ade55d2e98` — **scheduled** (two-sided falsification cell)
+- `M_eps_-0.10.patch` — sha256 `8e3df8e66f7ab5850fac15ce97a109159963683c74526509051cb8661892895e` — **scheduled**
+- `M_eps_-0.50.patch` — sha256 `1b0389f1ff117846259f47b850b0112b99bfb2ae96b868cd612694bada45c372` — **scheduled**
 
-All three are unified diffs against base sha
-`ca559b4f16cd1129a2f95ccdd82288b3418e0d0a` (CONTRACT amendment 2026-08-29b's
-commit), verified `git apply --check` clean at that sha, and each verified
-apply -> `cargo build -p jammi-kernels` (exit 0) -> `git checkout --` revert,
-independently, one dose at a time (never two doses applied simultaneously).
+`M_eps_0.02.patch`/`M_eps_0.10.patch`/`M_eps_0.50.patch` are unified diffs
+against base sha `ca559b4f16cd1129a2f95ccdd82288b3418e0d0a` (CONTRACT
+amendment 2026-08-29b's commit); `M_eps_-0.10.patch`/`M_eps_-0.50.patch` are
+unified diffs against base sha `cba0b835` (CONTRACT addendum 2026-08-29c's
+commit — `crates/jammi-kernels/src/ops/adamw_step.rs` is byte-identical
+between the two base shas, so all five patches apply against either
+checkout). Every patch is verified `git apply --check` clean at its base
+sha, and each is verified apply -> `cargo build -p jammi-kernels` (exit 0)
+-> `git checkout --` revert, independently, one dose at a time (never two
+doses applied simultaneously).
 
 ## Prediction table — REQUIRED BEFORE ANY SPEND
 
@@ -159,6 +192,22 @@ held-out-mean as scale increases):
 | 0.02 | `-0.016016 * 0.02 = -0.00032032` | `-0.110074 * 0.02 = -0.00220147` | `-0.204131 * 0.02 = -0.00408262` |
 | 0.10 | `-0.016016 * 0.10 = -0.00160161` | `-0.110074 * 0.10 = -0.01100736` | `-0.204131 * 0.10 = -0.02041312` |
 | 0.50 | `-0.016016 * 0.50 = -0.00800803` | `-0.110074 * 0.50 = -0.05503681` | `-0.204131 * 0.50 = -0.10206559` |
+| -0.10 (addendum 2026-08-29c) | `-0.016016 * -0.10 = +0.00160161` | `-0.110074 * -0.10 = +0.01100736` | `-0.204131 * -0.10 = +0.02041312` |
+| -0.50 (addendum 2026-08-29c) | `-0.016016 * -0.50 = +0.00800803` | `-0.110074 * -0.50 = +0.05503681` | `-0.204131 * -0.50 = +0.10206559` |
+
+**Signed-family cross-check:** the same linear-secant formula
+(`Δmean(eps) = -slope*eps`) applied to negative `eps` predicts POSITIVE
+`Δmean` (held-out mean INCREASES) with IDENTICAL magnitude to the
+corresponding positive dose — `eps=-0.10` mirrors `eps=+0.10`'s magnitude
+exactly (`0.01100736` either way, sign flipped), and `eps=-0.50` mirrors
+`eps=+0.50`'s magnitude exactly (`0.05503681`). Both measured seed slopes
+are positive (`0.016016`, `0.204131`), so this sign flip is
+**sign-consistent across both seeds** — a negative dose is predicted to
+DEGRADE held-out loss regardless of which of the two seed slopes turns out
+to be closer to the true local derivative. This is the "undertrained-
+regression" direction addendum 2026-08-29c names: less effective lr moves
+the model back toward its untrained (`s=0`) state, which is measured
+WORSE (`3.422173`) than the trained (`s=1`) state at both seeds.
 
 **Predicted DIRECTION (all doses, both ends of the range): IMPROVEMENT
 (held-out mean DECREASES), not degradation.** This is the naive
@@ -186,44 +235,54 @@ Committed benchmarks to compare the predicted shift against:
 
 | eps | predicted abs(Δmean) (avg_slope) | vs. cross_seed_spread (0.0826) | vs. already-non-detected effect (0.0238, 8/12) | predicted verdict |
 |---|---|---|---|---|
-| 0.02 | 0.00220 | 2.7% of spread | 9.2% of the effect that already failed to reach 11/12 | **predicted NOT detected** (very high confidence — an order of magnitude below both benchmarks) |
-| 0.10 | 0.01101 | 13.3% of spread | 46.3% of the effect that already failed to reach 11/12 | **predicted NOT detected** (high confidence — still smaller than an effect that already failed) |
-| 0.50 | 0.05504 | 66.6% of spread | 2.31x the effect that already failed to reach 11/12 | **predicted NOT reliably detected**, but this is the closest call: the shift exceeds the already-non-detected effect by >2x, yet stays below 1 full cross-seed-spread-unit, so >=11/12 concordance is not confidently predicted either way. Using the strong-end per-seed slope (`0.204131`) instead of the average, eps=0.50's predicted shift (`-0.10207`) would EXCEED the cross-seed spread — the two available seeds disagree sharply on whether this dose is detectable at all. **eps=0.50 is the dose most worth actually spending on**, both because it is the pre-registered largest dose and because the n=2 slope estimate leaves its predicted magnitude genuinely uncertain. |
+| 0.02 (falsified, not scheduled) | 0.00220 | 2.7% of spread | 9.2% of the effect that already failed to reach 11/12 | **predicted NOT detected** (very high confidence — an order of magnitude below both benchmarks) |
+| 0.10 (falsified, not scheduled) | 0.01101 | 13.3% of spread | 46.3% of the effect that already failed to reach 11/12 | **predicted NOT detected** (high confidence — still smaller than an effect that already failed) |
+| +0.50 (scheduled — two-sided falsification cell) | 0.05504 | 66.6% of spread | 2.31x the effect that already failed to reach 11/12 | **predicted NOT reliably detected**, but this is the closest call: the shift exceeds the already-non-detected effect by >2x, yet stays below 1 full cross-seed-spread-unit, so >=11/12 concordance is not confidently predicted either way. Using the strong-end per-seed slope (`0.204131`) instead of the average, eps=+0.50's predicted shift (`-0.10207`) would EXCEED the cross-seed spread — the two available seeds disagree sharply on whether this dose is detectable at all. If a sign test DOES fire here, the predicted DIRECTION is still improvement (RED-for-investigation, not RED-for-degradation) — that is what makes this the falsification cell for the Step-2 direction prediction, not a degradation candidate. |
+| -0.10 (scheduled — addendum 2026-08-29c) | 0.01101 | 13.3% of spread | 46.3% of the effect that already failed to reach 11/12 | **predicted NOT detected** (same magnitude reasoning as `+0.10`, direction now DEGRADATION — the correct sign for the acceptance-5 claim, but the predicted magnitude is still smaller than an effect that already failed to reach 11/12 on this same gate) |
+| -0.50 (scheduled — addendum 2026-08-29c) | 0.05504 | 66.6% of spread | 2.31x the effect that already failed to reach 11/12 | **predicted NOT reliably detected, but the best DEGRADATION-direction candidate of the three scheduled doses** — same magnitude/confidence caveats as `+0.50` (strong-end seed slope would push it to `0.10207`, above the cross-seed spread), but now in the direction that could actually discharge acceptance 5's "mutant column proven RED (degradation)" if the true local derivative tracks closer to the strong-end (seed1) slope than the weak-end (seed2) one. **This is the dose most likely, among the three scheduled, to produce the pair straddling detection that amendment 2026-08-29c's "reported sensitivity" clause asks for** — though the adjacent pair straddling detection, if one exists, is expected between `-0.50` and `-0.10` within the negative branch, per the addendum's own framing, not between `-0.50` and `+0.50`. |
 
-**Important design-level flag, not a refusal:** because the predicted
-direction (Step 2) is IMPROVEMENT under the naive linear-extrapolation
-model, even a dose that DID reach >=11/12+mean would read RED-for-
-improvement under the Frame's two-sided rule, not RED-for-degradation.
-Amendment 2026-08-29b item 3's acceptance criterion ("mutant column proven
-RED", discharged by "the smallest detected dose") is scoped to the
-DEGRADATION direction (mirroring M1's pass criterion). If the actual pod
-run confirms the naive-linear direction rather than reversing it at higher
-doses, that is itself a finding requiring the dose family's sign to be
-revisited (e.g., whether `(1-eps)` — a silent lr DEFLATION — would be the
-degradation-producing member of this same family in this particular
-small-scale/short-run regime) rather than silently reinterpreting an
-improvement-direction RED as satisfying the degradation-sensitivity claim.
-This report does not redesign the family (the `(1+eps)` shape is what
-amendment 2026-08-29b item 3 pre-registers); it records the prediction so
-the eventual pod result can be checked against it before any RED/GREEN
-verdict is claimed.
+**Design-level flag, resolved by addendum 2026-08-29c:** the original
+positive-only ladder's predicted direction (Step 2) was IMPROVEMENT under
+the naive linear-extrapolation model, so even a dose that DID reach
+`>=11/12+mean` would have read RED-for-improvement under the Frame's
+two-sided rule, not RED-for-degradation — unable to discharge amendment
+2026-08-29b item 3's acceptance criterion, which is scoped to the
+DEGRADATION direction (mirroring M1's pass criterion). This is exactly the
+`(1-eps)`-shaped revisit flagged in the prior revision of this section:
+CONTRACT.md addendum 2026-08-29c signs the family (`eps in {-0.50, -0.10,
++0.50}`) so the negative doses carry the predicted DEGRADATION direction
+(same secant, sign-consistent across both measured seeds — see the
+signed-family cross-check above), while `+0.50` is RETAINED, not dropped,
+as the two-sided falsification cell for the original improvement
+prediction itself. No family redesign beyond signing `eps` was needed; the
+`(1+eps)` shape is unchanged, only which values of `eps` are scheduled to
+run changed.
 
-No dose is refused for lack of data — all three are supported by the same
-committed two-seed secant; the confidence intervals above (not point
-estimates) are the honest product of what is actually committed.
+No dose is refused for lack of data — all five doses (falsified and
+scheduled) are supported by the same committed two-seed secant; the
+confidence intervals above (not point estimates) are the honest product of
+what is actually committed.
 
 ## On-pod procedure (dose legs only — substituted INTO the fused arm)
 
+**Scheduled ladder (CONTRACT.md addendum 2026-08-29c): `eps in {-0.50,
+-0.10, +0.50}`.** `eps in {0.02, 0.10}` are falsified pre-spend (Step 2/3
+above) and are NOT run on the pod; their patches stay committed as the
+falsification record only.
+
 The mutant-vs-fused pairing used by M1 is explicitly RETIRED. Per amendment
-2026-08-29b item 3, each dose column is produced by substituting the mutant
-into the fused arm itself and merging against the SAME v2 `alloff` legs
-under the SAME `>=11/12+mean` rule — the gate's own statistic, not a
-separate ad hoc comparison.
+2026-08-29b item 3 (merge procedure) and addendum 2026-08-29c (signed
+ladder), each dose column is produced by substituting the mutant into the
+fused arm itself and merging against the SAME v2 `alloff` legs under the
+SAME `>=11/12+mean` rule — the gate's own statistic, not a separate ad hoc
+comparison.
 
 1. On the pod, clone/checkout at the recorded base sha into a **scratch
-   worktree**, separate from the campaign's production checkout:
+   worktree**, separate from the campaign's production checkout (either
+   `ca559b4f16cd1129a2f95ccdd82288b3418e0d0a` or
+   `cba0b835` — `adamw_step.rs` is byte-identical between them):
    ```sh
-   git worktree add /workspace/scratch-mutant-dose ca559b4f16cd1129a2f95ccdd82288b3418e0d0a --detach
+   git worktree add /workspace/scratch-mutant-dose cba0b835 --detach
    cd /workspace/scratch-mutant-dose
    ```
 2. Verify the patch applies cleanly and record its hash before touching
@@ -254,16 +313,23 @@ separate ad hoc comparison.
    `>=11/12+mean` sign-test statistic — the same code path the real A/B
    verdict uses, not a bespoke mutant-vs-fused comparison.
 6. Record, per dose leg, in the column artifact:
-   - `base_sha = ca559b4f16cd1129a2f95ccdd82288b3418e0d0a`
+   - `base_sha` = the scratch checkout's base sha (`ca559b4f16cd1129a2f95ccdd82288b3418e0d0a` or `cba0b835`)
    - `patch_sha256` = the dose's recorded sha256 above
-   - `dose_label = eps_0.02` / `eps_0.10` / `eps_0.50`
+   - `dose_label = eps-0.50` / `eps-0.10` / `eps0.50` (operator-chosen
+     string per the merger's `--mutant-legs DOSE_LABEL:PATCH_SHA256:SEEDS`
+     convention — never `eps0.02`/`eps0.10`, which are not scheduled)
    - the same held-out-loss / step-count / dispatch-counter fields the
      clean fused legs record, so each dose column is diff-able against the
      `alloff`/fused columns field-for-field.
 7. The reported sensitivity is the pair of ADJACENT doses straddling
-   detection (per amendment item 3) — run doses in ascending order and stop
-   describing the sweep as "complete" only once a straddling pair is found
-   or all three have been run without one.
+   detection (per amendment item 3 and addendum 2026-08-29c) — run the
+   scheduled ladder in ascending `eps` order (`-0.50`, `-0.10`, `+0.50`) and
+   stop describing the sweep as "complete" only once a straddling pair is
+   found or all three have been run without one. The straddling pair, if
+   one exists, is expected within the negative branch (`-0.50` -> `-0.10`,
+   the DEGRADATION direction); a transition at `-0.10` -> `+0.50` would
+   additionally confirm or refute the Step-2 improvement prediction for
+   `+0.50`, which is a separate, non-degradation finding.
 8. Tear down the scratch worktree and its build artifacts after the legs
    complete; do not leave a patched binary or scratch checkout on the pod
    past the dose-leg run. Each patch is committed to this repo as a FILE
@@ -297,54 +363,83 @@ the per-step L2 divergence in `theta` (`cargo test -p jammi-kernels --lib
 mutant_dose_demonstration -- --nocapture`, patch applied, CPU only):
 
 ```
-eps=0.02:
+eps=0.02 (falsified, not scheduled):
 step=1 l2_divergence=3.508513e-5
 step=2 l2_divergence=7.017026e-5
 step=3 l2_divergence=1.0525539e-4
 step=4 l2_divergence=1.4034052e-4
 step=5 l2_divergence=1.7542565e-4
 
-eps=0.10:
+eps=0.10 (falsified, not scheduled):
 step=1 l2_divergence=1.7608417e-4
 step=2 l2_divergence=3.5216834e-4
 step=3 l2_divergence=5.28184e-4
 step=4 l2_divergence=7.0419966e-4
 step=5 l2_divergence=8.801983e-4
 
-eps=0.50:
+eps=0.50 (scheduled — two-sided falsification cell):
 step=1 l2_divergence=8.7980856e-4
 step=2 l2_divergence=1.7595316e-3
 step=3 l2_divergence=2.6392546e-3
 step=4 l2_divergence=3.5189774e-3
 step=5 l2_divergence=4.3986836e-3
+
+eps=-0.10 (scheduled — addendum 2026-08-29c):
+step=1 l2_divergence=1.7599607e-4
+step=2 l2_divergence=3.5199214e-4
+step=3 l2_divergence=5.279882e-4
+step=4 l2_divergence=7.039843e-4
+step=5 l2_divergence=8.799804e-4
+
+eps=-0.50 (scheduled — addendum 2026-08-29c):
+step=1 l2_divergence=8.7986013e-4
+step=2 l2_divergence=1.7597203e-3
+step=3 l2_divergence=2.6395635e-3
+step=4 l2_divergence=3.5194065e-3
+step=5 l2_divergence=4.39925e-3
 ```
 
-The step-5 divergence scales linearly with `eps` as the design intends
+The step-5 divergence scales linearly with `|eps|` as the design intends
 (sustained, monotone family): `8.801983e-4 / 1.7542565e-4 = 5.017` (expected
 `5x`, since `0.10 / 0.02 = 5`); `4.3986836e-3 / 1.7542565e-4 = 25.076`
 (expected `25x`, since `0.50 / 0.02 = 25`) — both within floating-point
 accumulation tolerance of the exact ratio, confirming each dose is a real,
 proportionally-scaled numeric perturbation on this crate's own oracle, not
-a no-op and not a copy-paste of a different dose's constant.
+a no-op and not a copy-paste of a different dose's constant. The two new
+signed doses confirm the same magnitude relationship holds for negative
+`eps`: `eps=-0.10`'s step-5 divergence (`8.799804e-4`) matches `eps=+0.10`'s
+(`8.801983e-4`) to within `~2.2e-7` (a floating-point accumulation-order
+difference between `1.10*lr` and `0.90*lr`, not a design defect), and
+`eps=-0.50`'s (`4.39925e-3`) matches `eps=+0.50`'s (`4.3986836e-3`) to
+within `~6e-6` — confirming `|1+eps|`-driven magnitude symmetry of the
+perturbation at the kernel level, independent of sign.
 
 `git checkout -- crates/jammi-kernels/src/ops/adamw_step.rs` restored the
 clean tree after each dose; neither the patches nor the temporary test are
-part of any commit on this branch (all three patches ARE committed, as
+part of any commit on this branch (all five patches ARE committed, as
 files only, alongside this README).
 
-## Dose ladder (CONTRACT amendment 2026-08-29b item 3) — merger interface
+## Dose ladder (CONTRACT amendment 2026-08-29b item 3; addendum 2026-08-29c signs it) — merger interface
 
 M1 above is recorded as a NON-DETECTION (a sign-flipping early transient,
 never a sensitivity bound — see the campaign-v1 finding this amendment
 corrects). The corrected design is a one-parameter, monotone, SUSTAINED
-dose family — the fused AdamW update scaled by `(1+eps)`,
-`eps in {0.02, 0.10, 0.50}` — each dose run as its own scratch-worktree
-mutant (the SAME on-pod procedure above: patched `jammi-kernels`, the SAME
-`run_leg` vector, torn down after). This section documents ONLY the
-merger's own consuming interface (`ci/scripts/perf/ab_merge.py`); the
-per-dose PREDICTED effect (held-out example-mean units, stated BEFORE the
-spend, per the amendment's own falsifiability requirement) is a separate,
-not-yet-authored record this section does not substitute for.
+dose family — the fused AdamW update scaled by `(1+eps)`. Amendment
+2026-08-29b item 3 originally named `eps in {0.02, 0.10, 0.50}`
+(positive-only); this README's own required pre-spend prediction table
+falsified that direction before any spend (Step 2/3 above: predicted
+IMPROVEMENT, not degradation, on both measured seeds). CONTRACT.md
+addendum 2026-08-29c resolves this by SIGNING the family:
+**the scheduled ladder is now `eps in {-0.50, -0.10, +0.50}`** —
+`eps in {0.02, 0.10}` remain committed as the falsified-but-recorded
+doses, not scheduled to run. Each scheduled dose runs as its own
+scratch-worktree mutant (the SAME on-pod procedure above: patched
+`jammi-kernels`, the SAME `run_leg` vector, torn down after). This
+section documents ONLY the merger's own consuming interface
+(`ci/scripts/perf/ab_merge.py`); the per-dose PREDICTED effect (held-out
+example-mean units, stated BEFORE the spend, per the amendment's own
+falsifiability requirement) is the Step 1-3 prediction table above, not a
+separate record.
 
 - **Leg naming**: a dose's legs are recorded under the SAME `raw_dir` a
   campaign already uses, tagged `seed{seed}__fused__mutant-{dose_label}`
@@ -391,7 +486,18 @@ not-yet-authored record this section does not substitute for.
 - `M1.patch` — the retired mutant's committed unified diff (patch-file-only;
   never applied to tree state on this branch). Kept for the record; see
   `measurements/campaign-v1/mutant-m1/` for its measured non-detection.
-- `M_eps_0.02.patch`, `M_eps_0.10.patch`, `M_eps_0.50.patch` — the new dose
-  family's committed unified diffs against `ca559b4f16cd1129a2f95ccdd82288b3418e0d0a`
-  (patch-file-only; never applied to tree state on this branch).
+- `M_eps_0.02.patch`, `M_eps_0.10.patch` — falsified pre-spend (positive-eps
+  direction predicted IMPROVEMENT, not degradation); committed unified
+  diffs against `ca559b4f16cd1129a2f95ccdd82288b3418e0d0a` kept as the
+  falsification record, patch-file-only, NOT scheduled to run.
+- `M_eps_0.50.patch` — the two-sided falsification cell for the
+  positive-eps improvement prediction; committed unified diff against
+  `ca559b4f16cd1129a2f95ccdd82288b3418e0d0a`; **scheduled**.
+- `M_eps_-0.10.patch`, `M_eps_-0.50.patch` — the signed family's
+  degradation-direction doses (CONTRACT.md addendum 2026-08-29c); committed
+  unified diffs against `cba0b835` (byte-identical base file to
+  `ca559b4f16cd1129a2f95ccdd82288b3418e0d0a` for `adamw_step.rs`);
+  **scheduled**.
+- All five `M_eps_*.patch` files are patch-file-only — never applied to
+  tree state on this branch.
 - `README.md` — this file.

@@ -683,20 +683,33 @@ fn run_impl(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    // unit-63 round-9 audit advisory (b): lowercased AFTER trim, not
-    // merely `to_string`'d -- a sha is case-insensitive hex, but the
-    // merger's own downstream comparison (ab_merge.py's
-    // `finetune_run_mutant_column_violations`) is exact string equality
-    // against the caller-supplied `--mutant-legs` spec, so an
-    // uppercase-hex-emitting producer must normalize case here, at the
-    // SAME point every other producer-stamped-field trim already happens,
-    // rather than let the two sides silently disagree only on letter case.
+    // unit-63 round-9 audit advisory (b), comment corrected by round-10
+    // audit F2: lowercased AFTER trim, not merely `to_string`'d, so the
+    // stamped artifact records canonical-case hex (sha is case-insensitive
+    // by domain). CANONICALIZATION ONLY -- `mutant_base_sha` has no
+    // downstream comparison anywhere in this pair (ab_merge.py only checks
+    // it for presence, `finetune_run_mutant_column_violations`'s `for
+    // field in (...)` loop), so nothing here depends on this lowercasing;
+    // it exists solely so a human reading the artifact sees one consistent
+    // case convention.
     let mutant_base_sha = params
         .mutant_base_sha
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_lowercase);
+    // Same canonicalization, but `mutant_patch_sha256` DOES have a
+    // downstream comparison: ab_merge.py's
+    // `finetune_run_mutant_column_violations` checks this leg's own
+    // stamped value against the caller-supplied `--mutant-legs` spec.
+    // Round-9 advisory (b) lowercased ONLY this producer side, which
+    // regressed an all-uppercase leg/spec pair (previously an exact-string
+    // match) into a false "labeling error" the moment this side started
+    // normalizing and the caller side did not. Round-10 audit F2 fixed the
+    // comparison ITSELF (ab_merge.py:2823/:3434) to case-fold both sides at
+    // the comparison site, so this producer-side lowercasing is back to
+    // being canonicalization of the artifact, never something the
+    // comparison's correctness depends on.
     let mutant_patch_sha256 = params
         .mutant_patch_sha256
         .as_deref()

@@ -480,13 +480,22 @@ separate record.
   the degradation/improvement branch and (unit-63 round-8 audit finding 3;
   round-9 audit finding 2 makes the domain ASYMMETRIC) validated finite,
   non-zero, and within this family's own sane domain — `eps in
-  (-1.0, -MUTANT_DOSE_LADDER_MIN_ABS_EPS] union
-  [MUTANT_DOSE_LADDER_MIN_ABS_EPS, MUTANT_DOSE_LADDER_MAX_ABS_EPS]`
-  (`eps == -1.0` itself is refused, EXCLUSIVE: the update-scale multiplier
+  (MUTANT_DOSE_LADDER_NEG_EPS_EXCLUSIVE_BOUND, -MUTANT_DOSE_LADDER_MIN_ABS_EPS]
+  union [MUTANT_DOSE_LADDER_MIN_ABS_EPS, MUTANT_DOSE_LADDER_MAX_EPS]`
+  (unit-63 round-10 audit advisory (b): `MUTANT_DOSE_LADDER_NEG_EPS_EXCLUSIVE_BOUND`
+  is `-1.0`, named rather than a bare literal so the `(1+eps)==0` rationale
+  below has one place to live; `MUTANT_DOSE_LADDER_MAX_EPS` was renamed
+  from `..._MAX_ABS_EPS` since every call site compares the SIGNED value
+  directly, never `abs()` — a one-sided positive-branch ceiling, not a
+  magnitude cap). `eps == MUTANT_DOSE_LADDER_NEG_EPS_EXCLUSIVE_BOUND`
+  itself is refused, EXCLUSIVE: the update-scale multiplier
   `(1+eps)` is zero there, a zero-update leg, not a member of this
   family — a single symmetric `|eps| <= MAX` check would have let it
   through; a magnitude below `MUTANT_DOSE_LADDER_MIN_ABS_EPS` is refused
-  as below the smallest ever-scheduled dose); an unparseable, non-finite,
+  as below this family's own sanity floor, set deliberately BELOW the
+  smallest ever-SCHEDULED dose (`|eps| = 0.10`) so a genuine sub-schedule
+  diagnostic dose (e.g. `eps=0.02` above) is still admitted while a
+  manufactured near-zero eps is refused); an unparseable, non-finite,
   zero, or out-of-domain label is refused loudly, never silently
   passed through as an opaque tag.
 - **Per-leg recorded fields**: every field a clean `fused` leg already

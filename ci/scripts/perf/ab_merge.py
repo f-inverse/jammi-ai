@@ -2721,25 +2721,43 @@ MUTANT_GATE_SEED_COUNT = FINETUNE_RUN_GATE_SEED_COUNT
 # domain ASYMMETRIC -- a single `abs(eps) > MAX` check is not this
 # family's real shape): the sane domain for this family's own SIGNED
 # `eps` (CONTRACT.md addendum 2026-08-29c: the update-scale multiplier is
-# `(1+eps)`) is `eps in (-1.0, -MUTANT_DOSE_LADDER_MIN_ABS_EPS] union
-# [MUTANT_DOSE_LADDER_MIN_ABS_EPS, MUTANT_DOSE_LADDER_MAX_ABS_EPS]`:
-#   - `eps <= -1.0` is refused, EXCLUSIVE of the bound itself: at
-#     `eps == -1.0` the update-scale multiplier `(1+eps)` is exactly
-#     zero (a zero-update leg -- this constant's own prior doc already
-#     named it "not a member of this monotone family"), and past it the
-#     multiplier is NEGATIVE (a sign flip, a different failure shape
-#     entirely). A single symmetric `abs(eps) > MUTANT_DOSE_LADDER_MAX_ABS_EPS`
-#     check let `eps == -1.0` through (`abs(-1.0) == 1.0`, not `> 1.0`) --
-#     the round-9 audit demonstrated it reported as the Acceptance-5-
-#     discharging degradation bound for a zero-update leg.
-#   - `eps > 1.0` is refused as the family-sanity cap: the scheduled
-#     ladder never exceeds `|eps| = 0.50`; nothing past `1.0` has ever
-#     been a scheduled dose.
-#   - `0.0 < abs(eps) < MUTANT_DOSE_LADDER_MIN_ABS_EPS` is refused as
-#     below the smallest ever-scheduled dose (`|eps| = 0.10`) -- a
+# `(1+eps)`) is `eps in (MUTANT_DOSE_LADDER_NEG_EPS_EXCLUSIVE_BOUND,
+# -MUTANT_DOSE_LADDER_MIN_ABS_EPS] union [MUTANT_DOSE_LADDER_MIN_ABS_EPS,
+# MUTANT_DOSE_LADDER_MAX_EPS]`:
+#   - `eps <= MUTANT_DOSE_LADDER_NEG_EPS_EXCLUSIVE_BOUND` (`-1.0`) is
+#     refused, EXCLUSIVE of the bound itself: at exactly that bound the
+#     update-scale multiplier `(1+eps)` is exactly zero (a zero-update
+#     leg -- this constant's own prior doc already named it "not a member
+#     of this monotone family"), and past it the multiplier is NEGATIVE (a
+#     sign flip, a different failure shape entirely). Unit-63 round-10
+#     audit advisory (b): named here rather than left as a bare `-1.0`
+#     literal scattered across every call site, so the `(1+eps)==0`
+#     rationale has exactly one place to live. A single symmetric
+#     `abs(eps) > MUTANT_DOSE_LADDER_MAX_EPS` check let this bound through
+#     (`abs(-1.0) == 1.0`, not `> 1.0`) -- the round-9 audit demonstrated it
+#     reported as the Acceptance-5-discharging degradation bound for a
+#     zero-update leg.
+#   - `eps > MUTANT_DOSE_LADDER_MAX_EPS` (`1.0`) is refused as the
+#     family-sanity cap: the scheduled ladder never exceeds `|eps| = 0.50`;
+#     nothing past `1.0` has ever been a scheduled dose. Unit-63 round-10
+#     audit advisory (b): renamed from `..._MAX_ABS_EPS` -- despite the old
+#     name, every call site compares the SIGNED `value` directly
+#     (`value > MUTANT_DOSE_LADDER_MAX_EPS`), never `abs(value)`; this is a
+#     one-sided ceiling on the POSITIVE branch only, not a magnitude cap,
+#     and the old `_ABS_` name claimed a symmetry this domain does not have.
+#   - `0.0 < abs(eps) < MUTANT_DOSE_LADDER_MIN_ABS_EPS` is refused. Unit-63
+#     round-10 audit advisory (a): `MUTANT_DOSE_LADDER_MIN_ABS_EPS` (0.01)
+#     is NOT "the smallest ever-scheduled dose" -- that is `|eps| = 0.10`
+#     (the scheduled ladder's own floor). `MUTANT_DOSE_LADDER_MIN_ABS_EPS`
+#     is a sanity floor deliberately set BELOW the schedule, so that a
+#     genuine sub-schedule diagnostic dose (e.g. `eps=0.02`, the
+#     falsified-but-recorded dose above) is still admitted, while a
 #     manufactured `eps=1e-9` sitting at the bottom of a straddle is
 #     refused rather than silently accepted as a real, schedulable dose.
-MUTANT_DOSE_LADDER_MAX_ABS_EPS = 1.0
+#     (This one IS a magnitude/`abs()` comparison -- unlike the two bounds
+#     above, both signed branches share this same floor.)
+MUTANT_DOSE_LADDER_NEG_EPS_EXCLUSIVE_BOUND = -1.0
+MUTANT_DOSE_LADDER_MAX_EPS = 1.0
 MUTANT_DOSE_LADDER_MIN_ABS_EPS = 0.01
 
 
@@ -2788,6 +2806,18 @@ def finetune_run_mutant_column_violations(dose_label, patch_sha256, tier):
     labeling-error mismatch. The producer side stamps already-trimmed
     values (a concurrent bench-dispatch fix); this check does not rely on
     that and re-trims independently, on both sides, every time.
+
+    Unit-63 round-10 audit F2: the sha comparison is also done CASE-FOLDED
+    on both sides -- sha hex is case-insensitive by domain, and the
+    producer now lowercases its own stamped `mutant_patch_sha256`
+    (finetune_run.rs's own round-9 advisory (b) fix) while the CLI's own
+    `--mutant-legs` spec is only ever stripped, never case-normalized,
+    before it reaches here. A case-sensitive compare of a canonicalized-
+    lowercase leg value against an uppercase-hex caller spec would report a
+    factually false "labeling error" for a pair that names the exact same
+    patch -- refused here by folding case at the ONE place this comparison
+    is actually made, so it holds regardless of which side (if either)
+    happens to have normalized its own case beforehand.
     """
     violations = list(finetune_run_dispatch_proof_violations("fused", tier))
     violations += finetune_run_arm_premise_violations("fused", tier)
@@ -2803,7 +2833,7 @@ def finetune_run_mutant_column_violations(dose_label, patch_sha256, tier):
     if (
         leg_patch_sha256 is not None
         and str(leg_patch_sha256).strip()
-        and str(leg_patch_sha256).strip() != str(patch_sha256).strip()
+        and str(leg_patch_sha256).strip().lower() != str(patch_sha256).strip().lower()
     ):
         violations.append(
             f"leg's own mutant_patch_sha256={leg_patch_sha256!r} does not match this dose "
@@ -3018,9 +3048,10 @@ def _dose_label_eps(dose_label):
     one shape. The same applies to a non-finite magnitude (`inf`/`-inf`,
     which trivially satisfies `> 0.0`/`< 0.0` but is not a real dose at
     all) and to a value outside this family's own sane, ASYMMETRIC domain
-    (`eps <= -1.0`, `eps > MUTANT_DOSE_LADDER_MAX_ABS_EPS`, or `0.0 <
-    abs(eps) < MUTANT_DOSE_LADDER_MIN_ABS_EPS` -- unit-63 round-9 audit
-    finding 2, see those constants' own doc). Every one of these is
+    (`eps <= MUTANT_DOSE_LADDER_NEG_EPS_EXCLUSIVE_BOUND`, `eps >
+    MUTANT_DOSE_LADDER_MAX_EPS`, or `0.0 < abs(eps) <
+    MUTANT_DOSE_LADDER_MIN_ABS_EPS` -- unit-63 round-9 audit finding 2, see
+    those constants' own doc). Every one of these is
     refused here, loudly, by the SAME exception every other unparseable
     label raises -- never a silent pass-through to a partition predicate
     that was never designed to reject them.
@@ -3074,30 +3105,92 @@ def _dose_label_eps(dose_label):
         )
     # unit-63 round-9 audit finding 2: the domain is ASYMMETRIC, never a
     # single `abs(value) > MAX` check -- that check alone would let
-    # `eps == -1.0` through (`abs(-1.0) == MUTANT_DOSE_LADDER_MAX_ABS_EPS`,
-    # not `>`), a zero-update leg (multiplier `(1+eps) == 0`) this
-    # family's own doc already declares out of family. Refused EXCLUSIVE
-    # of the bound itself: `eps == -1.0` is refused, `eps == -0.99` is not.
-    if value <= -1.0:
+    # `eps == MUTANT_DOSE_LADDER_NEG_EPS_EXCLUSIVE_BOUND` through
+    # (`abs(-1.0) == MUTANT_DOSE_LADDER_MAX_EPS`, not `>`), a zero-update
+    # leg (multiplier `(1+eps) == 0`) this family's own doc already
+    # declares out of family. Refused EXCLUSIVE of the bound itself:
+    # `eps == MUTANT_DOSE_LADDER_NEG_EPS_EXCLUSIVE_BOUND` is refused,
+    # `eps == -0.99` is not.
+    if value <= MUTANT_DOSE_LADDER_NEG_EPS_EXCLUSIVE_BOUND:
         raise MutantDoseLadderSensitivityError(
-            f"dose_label {dose_label!r} parses to eps={value!r} (<= -1.0) -- at this magnitude "
-            "the update-scale multiplier (1+eps) is zero or negative, a different failure shape "
-            "entirely and never a member of this monotone silent-(in/de)flation family, even "
-            "though a single symmetric |eps| cap would have let it through"
+            f"dose_label {dose_label!r} parses to eps={value!r} (<= "
+            f"{MUTANT_DOSE_LADDER_NEG_EPS_EXCLUSIVE_BOUND}) -- at this magnitude the update-scale "
+            "multiplier (1+eps) is zero or negative, a different failure shape entirely and never "
+            "a member of this monotone silent-(in/de)flation family, even though a single "
+            "symmetric |eps| cap would have let it through"
         )
-    if value > MUTANT_DOSE_LADDER_MAX_ABS_EPS:
+    if value > MUTANT_DOSE_LADDER_MAX_EPS:
         raise MutantDoseLadderSensitivityError(
             f"dose_label {dose_label!r} parses to eps={value!r}, which exceeds this family's own "
-            f"sane domain (eps <= {MUTANT_DOSE_LADDER_MAX_ABS_EPS}) -- never silently accepted as "
+            f"sane domain (eps <= {MUTANT_DOSE_LADDER_MAX_EPS}) -- never silently accepted as "
             "though it were a scheduled dose"
         )
     if abs(value) < MUTANT_DOSE_LADDER_MIN_ABS_EPS:
         raise MutantDoseLadderSensitivityError(
             f"dose_label {dose_label!r} parses to eps={value!r}, whose magnitude is below this "
-            f"family's own smallest ever-scheduled dose (|eps| >= {MUTANT_DOSE_LADDER_MIN_ABS_EPS}) "
-            "-- never silently accepted as though it were a real, schedulable dose"
+            f"family's own sanity floor (|eps| >= {MUTANT_DOSE_LADDER_MIN_ABS_EPS}), set "
+            "deliberately BELOW the smallest ever-SCHEDULED dose (|eps| = 0.10) -- this refuses a "
+            "manufactured near-zero eps while still admitting a genuine sub-schedule diagnostic "
+            "dose, never silently accepted as though it were a real, schedulable dose"
         )
     return value
+
+
+def mutant_dose_ladder_reject_duplicate_doses(dose_columns):
+    """Unit-63 round-10 audit F1: numeric label aliasing defeats
+    `mutant_dose_ladder_sensitivity`'s own injectivity assumption (see that
+    function's own doc -- dose columns are sorted by `abs(eps)`, and Python's
+    STABLE sort then breaks a tie between two equal-magnitude entries by the
+    caller-supplied order, "never the caller-supplied order" is a lie the
+    moment two distinct literal labels parse to the SAME eps). `eps-0.1` /
+    `eps-0.100` / `eps-.10` / `eps-1e-1` all parse to the identical
+    `eps=-0.1` float while each filing a DISTINCT leg file
+    (`mutant_leg_repeat_tag` tags a leg by the literal `dose_label` string,
+    byte-for-byte) -- a stable sort tiebreak on caller order can then emit a
+    zero-width "straddle" between two doses that are, by every measurement
+    this module makes, THE SAME DOSE, not an adjacent pair.
+
+    Refuses (raises `MutantDoseLadderSensitivityError`, never silently picks
+    one of the aliases and drops the rest) over the FULL, already-assembled
+    `dose_columns` list when:
+      - two entries share the exact same literal `dose_label` string
+        (checked FIRST, independent of parseability -- two identically-
+        spelled labels are refused even if that label fails to parse as an
+        eps value at all), or
+      - two entries parse (via `_dose_label_eps`) to the SAME eps value
+        under two DIFFERENT literal labels -- named in the refusal by BOTH
+        labels and the shared eps: one dose, one label; a same-dose
+        disagreement between two legs is a determinism question, never a
+        sensitivity interval.
+
+    Called once, over the whole supplied set, at the CLI's own
+    `--mutant-legs` assembly -- the same input edge every other dose-ladder
+    guard in this module already lives at, and BEFORE
+    `mutant_dose_ladder_sensitivity`/`_two_sided_falsification`/`_anomalies`
+    ever see the list, so a straddle/anomaly finding can never be computed
+    over an aliased set in the first place.
+    """
+    seen_labels = set()
+    for col in dose_columns:
+        label = col["dose_label"]
+        if label in seen_labels:
+            raise MutantDoseLadderSensitivityError(
+                f"dose_label {label!r} is supplied more than once in --mutant-legs -- one dose, "
+                "one label; a repeated literal label can never name two distinct doses"
+            )
+        seen_labels.add(label)
+    seen_eps = {}
+    for col in dose_columns:
+        label = col["dose_label"]
+        eps = _dose_label_eps(label)
+        if eps in seen_eps:
+            other_label = seen_eps[eps]
+            raise MutantDoseLadderSensitivityError(
+                f"dose labels {other_label!r} and {label!r} both parse to the same eps={eps!r} "
+                "-- two dose labels resolve to the same eps: one dose, one label; a same-dose "
+                "disagreement is a determinism question, never a sensitivity interval"
+            )
+        seen_eps[eps] = label
 
 
 def mutant_dose_ladder_sensitivity(dose_columns):
@@ -3348,7 +3441,14 @@ def main(argv=None):
                 # point every other producer-stamped-field trim happens --
                 # a whitespace-only `--mutant-legs` sha must compare as
                 # empty, never as some never-matching opaque string.
-                patch_sha256 = patch_sha256.strip()
+                # unit-63 round-10 audit F2: also lowercased here -- sha hex
+                # is case-insensitive by domain, and the producer now
+                # canonicalizes its own stamped sha to lowercase, so the
+                # caller-supplied spec is folded to the SAME case rather
+                # than relying solely on the comparison site
+                # (finetune_run_mutant_column_violations, which case-folds
+                # independently too, so this holds either way).
+                patch_sha256 = patch_sha256.strip().lower()
                 mutant_seeds = [s for s in mutant_seeds_s.split(",") if s]
                 dose_columns.append(build_mutant_dose_column(fr_raw_dir, dose_label, patch_sha256, mutant_seeds))
             # unit-63 round-7 audit finding 4 / CONTRACT.md addendum
@@ -3360,6 +3460,12 @@ def main(argv=None):
             # correctness-of-measurement problem this merge gates on.
             sensitivity_error = None
             try:
+                # unit-63 round-10 audit F1 -- refused BEFORE the straddle/
+                # falsification/anomaly scans ever see the (possibly
+                # aliased) set, over the FULL assembled `dose_columns`, at
+                # the same input edge every other dose-ladder guard lives
+                # at (see this function's own doc).
+                mutant_dose_ladder_reject_duplicate_doses(dose_columns)
                 sensitivity = mutant_dose_ladder_sensitivity(dose_columns)
                 two_sided_falsification = mutant_dose_ladder_two_sided_falsification(dose_columns)
                 dose_anomalies = mutant_dose_ladder_anomalies(dose_columns)

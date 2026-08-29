@@ -213,7 +213,35 @@ if [ -n "$REPORT_JSON" ] && [ -f "$REPORT_JSON" ]; then
         rc=1
       fi
       ;;
-    GREEN|DRY_RUN|INCOMPLETE) : ;;
+    GREEN)
+      if [ "$rc" -ne 0 ]; then
+        # unit-63 round-10 audit advisory (d): a GREEN main decision does
+        # NOT itself force rc=0 -- the mutant dose ladder (an INVALID dose
+        # column, a negative-eps dose_anomaly, or a sensitivity_error, all
+        # folded into main()'s own exit code in ab_merge.py) can still fail
+        # the merge while the primary A/B decision itself reads GREEN.
+        # Name the actual cause here BY NAME, mirroring this script's own
+        # loud-naming idiom above, so a GREEN-but-nonzero run is legible
+        # outside the collapsed log group instead of looking like an
+        # unexplained contradiction.
+        CAUSE="$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+ladder = d.get("mutant_dose_ladder") or {}
+causes = []
+if ladder.get("sensitivity_error"):
+    causes.append("sensitivity_error")
+if ladder.get("dose_anomalies"):
+    causes.append("dose_anomalies")
+invalid_doses = [c.get("dose_label") for c in ladder.get("doses", []) if c.get("detected") == "INVALID"]
+if invalid_doses:
+    causes.append("invalid_doses=" + ",".join(invalid_doses))
+print(",".join(causes) if causes else "unknown (no dose_anomalies/sensitivity_error/invalid dose column found)")
+' "$REPORT_JSON" 2>/dev/null || echo "unknown (could not inspect ${REPORT_JSON})")"
+        echo "::error::how-well status=GREEN but exit=${rc} -- the mutant dose ladder failed the merge's own exit code (${CAUSE}), not the primary A/B decision."
+      fi
+      ;;
+    DRY_RUN|INCOMPLETE) : ;;
     *) echo "::warning::how-well status=${STATUS} unrecognised." ;;
   esac
 else

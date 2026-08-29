@@ -122,6 +122,37 @@ JAMMI_BUILD_TIMINGS_LOCK_WAIT_SECS="${JAMMI_BUILD_TIMINGS_LOCK_WAIT_SECS:-3600}"
 
 fail() { echo "::error::$*" >&2; exit 1; }
 
+# --- provenance cross-check (unification contract C5.1), same shape as
+# finetune_ab.sh's/stacked_sweep.sh's/clip_artifact_producer.sh's own
+# check_bin_provenance(): called after EACH `cargo build -p jammi-bench`
+# below (T1's clone build, the cold build, and the FA2 leg's own build)
+# BEFORE this producer trusts the git_sha it is about to stamp into the
+# result JSON's own `git_sha` field. A build that exits 0 says nothing
+# about whether the resulting binary is provably the one THIS checkout's
+# HEAD produced — a stale/cached artifact resurrected from a different
+# CARGO_TARGET_DIR, or a linker/sccache misconfiguration that silently
+# reused a prior binary, would still exit 0 and still be a real gap this
+# script's own byte-equality leg (iv) cannot see (it compares clone vs.
+# cold to EACH OTHER, never either one against the sha it claims to have
+# built). Refuses loudly (never warns-and-continues) on any mismatch,
+# unknown, or unreadable provenance reading, exactly like its siblings.
+check_bin_provenance() {
+  local bin="$1"
+  local sha sha_re='^[0-9a-fA-F]{40}$'
+  sha="$(git rev-parse HEAD)"
+  if ! [[ "$sha" =~ $sha_re ]]; then
+    fail "provenance cross-check: HEAD did not resolve to a 40-hex commit ('$sha') -- refusing"
+  fi
+  [ -x "$bin" ] || fail "provenance cross-check: no executable at $bin -- the build above did not produce the binary this leg is about to stamp git_sha=$sha for"
+  local bin_prov_json bin_prov_sha
+  bin_prov_json="$("$bin" provenance 2>&1)" || fail "'$bin provenance' failed: $bin_prov_json"
+  bin_prov_sha="$(printf '%s' "$bin_prov_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["build_sha"])' 2>&1)" \
+    || fail "could not parse build_sha from '$bin provenance' output: $bin_prov_json"
+  if [ -z "$bin_prov_sha" ] || [ "$bin_prov_sha" != "$sha" ]; then
+    fail "'$bin provenance' reports build_sha=$bin_prov_sha, but this checkout is at sha=$sha -- refusing before this producer's JSON stamps git_sha=$sha against a binary that does not agree"
+  fi
+}
+
 NO_LOCK=0
 for _a in "$@"; do [ "$_a" = "--no-lock" ] && NO_LOCK=1; done
 if [ "$NO_LOCK" != "1" ]; then
@@ -291,6 +322,7 @@ clone_rc=$?
 clone_t1=$(date +%s)
 clone_wall=$((clone_t1 - clone_t0))
 [ "$clone_rc" -eq 0 ] || fail "clone build (T1) failed (exit $clone_rc) — see /tmp/pod_build_timings.clone_t1.log"
+check_bin_provenance "$CLONE_DIR/release/jammi-bench"
 sccache_after="$(sccache --show-stats 2>/dev/null || echo 'sccache not running')" # tripwire-ok: same as sccache_before above
 clone_features="cuda"
 
@@ -416,6 +448,7 @@ if [ -n "$_main_sha" ] && [ "$_head_sha" = "$_main_sha" ]; then
       fa2_rc=$?
       fa2_t1=$(date +%s)
       if [ "$fa2_rc" -eq 0 ]; then
+        check_bin_provenance "$CLONE_FA2_DIR/release/jammi-bench"
         fa2_wall=$((fa2_t1 - fa2_t0))
         fa2_features="cuda,jammi-kernels/flash-attn"
         fa2_ran="true"
@@ -483,6 +516,10 @@ CARGO_TARGET_DIR="$COLD_DIR" cargo build --release -p jammi-bench --features cud
   > /tmp/pod_build_timings.cold_build.log 2>&1 || fail "cold build (separate empty target dir) failed"
 cold_t1=$(date +%s)
 cold_wall=$((cold_t1 - cold_t0))
+# After the wall-clock stop, not before it -- this cross-check must never
+# inflate the measured cold_build_wall_s number it is only verifying the
+# provenance of.
+check_bin_provenance "$COLD_DIR/release/jammi-bench"
 cold_hashes="$(snapshot_hashes "$COLD_DIR")"
 # round-4 audit A4: an EMPTY match set on both sides made byte_equal read
 # "true" (empty string equals empty string) — the SAME empty-glob vacuity

@@ -4551,5 +4551,458 @@ class MutantDoseLadderTests(unittest.TestCase):
         self.assertIn("same mutant measured twice", ladder["sensitivity_error"])
 
 
+class RedProofColumnTests(unittest.TestCase):
+    """Unit 63 — the RED-proof column as a first-class merger output
+    (`RED_PROOF_LABEL_PREFIX`, `partition_red_proof_dose_columns`,
+    `build_red_proof_summary`): `redproof-nobc`/`redproof-signflip`
+    participate fully in `build_mutant_dose_column`, but are excluded from
+    the eps-family scans, and read out via `red_proof`/`red_proof_verdict`
+    in the SAME artifact -- the honest alternative to reading a verdict out
+    of a separate, exit-1-expected invocation.
+    """
+
+    PATCH_SHA = "eps0-02-patch-sha"
+
+    def _write_alloff(self, raw_dir, seed, mean=0.50):
+        _write_finetune_run_leg(
+            raw_dir, seed, "alloff", "r1", _finetune_run_tier(arm="alloff", seed=seed, held_out_example_mean=mean)
+        )
+
+    def test_is_red_proof_dose_label(self):
+        self.assertTrue(ab_merge.is_red_proof_dose_label("redproof-nobc"))
+        self.assertTrue(ab_merge.is_red_proof_dose_label("redproof-signflip"))
+        self.assertTrue(ab_merge.is_red_proof_dose_label("redproof-"))
+        self.assertFalse(ab_merge.is_red_proof_dose_label("eps0.50"))
+        self.assertFalse(ab_merge.is_red_proof_dose_label("eps-0.10"))
+        self.assertFalse(ab_merge.is_red_proof_dose_label("bogus"))
+
+    def test_partition_splits_by_prefix_preserving_order(self):
+        columns = [
+            {"dose_label": "eps-0.50"},
+            {"dose_label": "redproof-nobc"},
+            {"dose_label": "eps0.50"},
+            {"dose_label": "redproof-signflip"},
+        ]
+        eps_cols, red_proof_cols = ab_merge.partition_red_proof_dose_columns(columns)
+        self.assertEqual([c["dose_label"] for c in eps_cols], ["eps-0.50", "eps0.50"])
+        self.assertEqual([c["dose_label"] for c in red_proof_cols], ["redproof-nobc", "redproof-signflip"])
+
+    def test_bare_redproof_prefix_is_refused(self):
+        columns = [{"dose_label": "redproof-"}]
+        with self.assertRaises(ab_merge.RedProofLabelError) as ctx:
+            ab_merge.partition_red_proof_dose_columns(columns)
+        self.assertIn("redproof-", str(ctx.exception))
+        self.assertIn("no mutant name", str(ctx.exception))
+
+    def test_eps_family_scans_never_call_dose_label_eps_on_a_redproof_label(self):
+        # a RED-proof label would raise inside `_dose_label_eps` (it never
+        # starts with "eps") -- proving the eps-family scans are unaffected
+        # by a co-scheduled RED-proof column means calling them on the
+        # PARTITIONED eps-only subset never raises.
+        eps_cols = [
+            {"dose_label": "eps-0.10", "detected": "not-detected"},
+            {"dose_label": "eps-0.50", "detected": "RED"},
+        ]
+        # sanity: calling these on the full (unpartitioned) set WOULD raise.
+        mixed = eps_cols + [{"dose_label": "redproof-nobc", "detected": "not-detected", "patch_sha256": "x"}]
+        with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+            ab_merge.mutant_dose_ladder_sensitivity(mixed)
+        # the partitioned eps-only subset is unaffected.
+        self.assertEqual(
+            ab_merge.mutant_dose_ladder_sensitivity(eps_cols),
+            {"lower": "eps-0.10", "higher": "eps-0.50"},
+        )
+        self.assertEqual(ab_merge.mutant_dose_ladder_two_sided_falsification(eps_cols), [])
+        self.assertEqual(ab_merge.mutant_dose_ladder_anomalies(eps_cols), [])
+
+    def test_build_red_proof_summary_proven_when_any_column_reads_red(self):
+        # direct dict fixtures -- `build_red_proof_summary` only reads the
+        # fields `build_mutant_dose_column` already computed, never
+        # re-derives them.
+        columns = [
+            {
+                "dose_label": "redproof-nobc",
+                "patch_sha256": "sha-nobc",
+                "detected": "not-detected",
+                "n_pos": 6,
+                "n_neg": 6,
+                "mean_d": 0.01,
+                "p_value": 1.0,
+                "clean_pair_count": 12,
+            },
+            {
+                "dose_label": "redproof-signflip",
+                "patch_sha256": "sha-signflip",
+                "detected": "RED",
+                "n_pos": 12,
+                "n_neg": 0,
+                "mean_d": 0.55,
+                "p_value": 0.0002,
+                "clean_pair_count": 12,
+            },
+        ]
+        red_proof, verdict = ab_merge.build_red_proof_summary(columns)
+        self.assertEqual(verdict, "PROVEN")
+        self.assertEqual(len(red_proof), 2)
+        self.assertEqual(
+            red_proof[1],
+            {
+                "dose_label": "redproof-signflip",
+                "patch_sha256": "sha-signflip",
+                "detected": "RED",
+                "n_pos": 12,
+                "n_neg": 0,
+                "mean_d": 0.55,
+                "p_value": 0.0002,
+                "clean_pair_count": 12,
+            },
+        )
+
+    def test_build_red_proof_summary_not_proven_names_every_column(self):
+        columns = [
+            {
+                "dose_label": "redproof-nobc",
+                "patch_sha256": "sha-nobc",
+                "detected": "not-detected",
+                "n_pos": 6,
+                "n_neg": 6,
+                "mean_d": 0.01,
+                "p_value": 1.0,
+                "clean_pair_count": 12,
+            },
+            {
+                "dose_label": "redproof-signflip",
+                "patch_sha256": "sha-signflip",
+                "detected": "not-detected",
+                "n_pos": 7,
+                "n_neg": 5,
+                "mean_d": 0.02,
+                "p_value": 0.5,
+                "clean_pair_count": 12,
+            },
+        ]
+        _red_proof, verdict = ab_merge.build_red_proof_summary(columns)
+        self.assertTrue(verdict.startswith("NOT_PROVEN"))
+        self.assertIn("redproof-nobc=not-detected", verdict)
+        self.assertIn("redproof-signflip=not-detected", verdict)
+
+    def test_build_red_proof_summary_records_red_for_investigation_as_is(self):
+        # a RED-proof column reading RED_FOR_INVESTIGATION is an anomaly for
+        # a mutant EXPECTED to degrade -- recorded as-is (its own 'detected'
+        # field), never counted toward PROVEN.
+        columns = [
+            {
+                "dose_label": "redproof-nobc",
+                "patch_sha256": "sha-nobc",
+                "detected": "RED_FOR_INVESTIGATION",
+                "n_pos": 1,
+                "n_neg": 11,
+                "mean_d": -0.30,
+                "p_value": 0.00635,
+                "clean_pair_count": 12,
+            },
+        ]
+        red_proof, verdict = ab_merge.build_red_proof_summary(columns)
+        self.assertEqual(red_proof[0]["detected"], "RED_FOR_INVESTIGATION")
+        self.assertTrue(verdict.startswith("NOT_PROVEN"))
+        self.assertIn("redproof-nobc=RED_FOR_INVESTIGATION", verdict)
+
+    def _write_redproof_leg(self, raw_dir, seeds, dose_label, patch_sha256, seed_to_mean, alloff_mean=0.50):
+        for seed in seeds:
+            self._write_alloff(raw_dir, seed, mean=alloff_mean)
+            _write_mutant_leg(
+                raw_dir,
+                seed,
+                dose_label,
+                _mutant_tier(seed=seed, held_out_example_mean=seed_to_mean(seed), mutant_patch_sha256=patch_sha256),
+            )
+
+    def test_cli_wiring_redproof_red_is_proven_with_rc_zero_and_green_primary(self):
+        # redproof column RED -> PROVEN + rc 0 (with a GREEN primary decision).
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                mutant_mean = 0.99 if seed != 12 else 0.10  # 11/12 degradation-concordant
+                _write_mutant_leg(
+                    raw_dir,
+                    seed,
+                    "redproof-signflip",
+                    _mutant_tier(seed=seed, held_out_example_mean=mutant_mean, mutant_patch_sha256="sha-signflip"),
+                )
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    f"redproof-signflip:sha-signflip:{seeds_s}",
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 0)
+        self.assertEqual(merged["status"], "GREEN")
+        ladder = merged["mutant_dose_ladder"]
+        self.assertIsNone(ladder["sensitivity_error"])
+        self.assertEqual(ladder["doses"][0]["detected"], "RED")
+        self.assertEqual(ladder["red_proof"], [
+            {
+                "dose_label": "redproof-signflip",
+                "patch_sha256": "sha-signflip",
+                "detected": "RED",
+                "n_pos": ladder["doses"][0]["n_pos"],
+                "n_neg": ladder["doses"][0]["n_neg"],
+                "mean_d": ladder["doses"][0]["mean_d"],
+                "p_value": ladder["doses"][0]["p_value"],
+                "clean_pair_count": 12,
+            }
+        ])
+        self.assertEqual(ladder["red_proof_verdict"], "PROVEN")
+
+    def test_cli_wiring_redproof_not_detected_is_not_proven_with_nonzero_rc(self):
+        # redproof not-detected -> NOT_PROVEN + rc != 0.
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                # against this seed's own alloff mean (0.50 for seed<=6,
+                # 0.40 otherwise): 10/12 positive-concordant (seeds 1-10),
+                # 2/12 negative-concordant (seeds 11-12) -- well under the
+                # 11/12 threshold in either direction, so this column reads
+                # not-detected regardless of the alloff baseline shift by
+                # seed group.
+                if seed <= 6:
+                    mutant_mean = 0.55  # vs alloff 0.50: +0.05
+                elif seed <= 10:
+                    mutant_mean = 0.45  # vs alloff 0.40: +0.05
+                else:
+                    mutant_mean = 0.35  # vs alloff 0.40: -0.05
+                _write_mutant_leg(
+                    raw_dir,
+                    seed,
+                    "redproof-nobc",
+                    _mutant_tier(seed=seed, held_out_example_mean=mutant_mean, mutant_patch_sha256="sha-nobc"),
+                )
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    f"redproof-nobc:sha-nobc:{seeds_s}",
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 1)
+        self.assertEqual(merged["status"], "GREEN")  # isolation: primary decision alone is GREEN
+        ladder = merged["mutant_dose_ladder"]
+        self.assertEqual(ladder["doses"][0]["detected"], "not-detected")
+        self.assertTrue(ladder["red_proof_verdict"].startswith("NOT_PROVEN"))
+        self.assertIn("redproof-nobc=not-detected", ladder["red_proof_verdict"])
+
+    def test_cli_wiring_redproof_and_eps_doses_co_scheduled_are_mutually_unaffected(self):
+        # redproof + eps doses co-scheduled -> eps scans unaffected by the
+        # redproof column and vice versa.
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                # eps-0.50 alone: 11/12 degradation-concordant -> RED,
+                # exactly this suite's own single-dose RED shape.
+                eps_mean = 0.70 if seed != 12 else 0.30
+                _write_mutant_leg(
+                    raw_dir, seed, "eps-0.50", _mutant_tier(seed=seed, held_out_example_mean=eps_mean, mutant_patch_sha256="sha-eps-neg50")
+                )
+                # redproof-signflip: guaranteed-degradation shape -> RED.
+                redproof_mean = 0.99 if seed != 12 else 0.10
+                _write_mutant_leg(
+                    raw_dir,
+                    seed,
+                    "redproof-signflip",
+                    _mutant_tier(seed=seed, held_out_example_mean=redproof_mean, mutant_patch_sha256="sha-signflip"),
+                )
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    f"eps-0.50:sha-eps-neg50:{seeds_s}",
+                    "--mutant-legs",
+                    f"redproof-signflip:sha-signflip:{seeds_s}",
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 0)
+        ladder = merged["mutant_dose_ladder"]
+        self.assertIsNone(ladder["sensitivity_error"])
+        # eps scan sees only the eps column -- a single negative-eps dose
+        # can never form a straddle pair (needs >=2), so `sensitivity` is
+        # null, unaffected by the co-scheduled redproof column's presence.
+        self.assertIsNone(ladder["sensitivity"])
+        self.assertEqual(ladder["dose_anomalies"], [])
+        self.assertEqual(ladder["two_sided_falsification"], [])
+        # redproof summary sees only the redproof column, unaffected by the
+        # co-scheduled eps column.
+        self.assertEqual(len(ladder["red_proof"]), 1)
+        self.assertEqual(ladder["red_proof"][0]["dose_label"], "redproof-signflip")
+        self.assertEqual(ladder["red_proof_verdict"], "PROVEN")
+        # both columns still appear, in full, in 'doses'.
+        detected_by_label = {d["dose_label"]: d["detected"] for d in ladder["doses"]}
+        self.assertEqual(detected_by_label, {"eps-0.50": "RED", "redproof-signflip": "RED"})
+
+    def test_cli_wiring_redproof_column_still_subject_to_duplicate_sha_refusal(self):
+        # a redproof-labeled column is still subject to the duplicate-PATCH_SHA
+        # arm of `mutant_dose_ladder_reject_duplicate_doses`, run over the
+        # FULL dose_columns set (never skipped for a RED-proof label).
+        shared_sha = "sha-shared-redproof-and-eps"
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                _write_mutant_leg(
+                    raw_dir, seed, "eps-0.50", _mutant_tier(seed=seed, held_out_example_mean=0.70, mutant_patch_sha256=shared_sha)
+                )
+                _write_mutant_leg(
+                    raw_dir, seed, "redproof-signflip", _mutant_tier(seed=seed, held_out_example_mean=0.70, mutant_patch_sha256=shared_sha)
+                )
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    f"eps-0.50:{shared_sha}:{seeds_s}",
+                    "--mutant-legs",
+                    f"redproof-signflip:{shared_sha}:{seeds_s}",
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 1)
+        ladder = merged["mutant_dose_ladder"]
+        self.assertIsNone(ladder["sensitivity"])
+        self.assertIsNotNone(ladder["sensitivity_error"])
+        self.assertIn("eps-0.50", ladder["sensitivity_error"])
+        self.assertIn("redproof-signflip", ladder["sensitivity_error"])
+        self.assertIn(shared_sha, ladder["sensitivity_error"])
+        self.assertIn("same mutant measured twice", ladder["sensitivity_error"])
+
+    def test_cli_wiring_redproof_rfi_recorded_with_named_anomaly(self):
+        # a redproof column reading RED_FOR_INVESTIGATION is recorded as-is
+        # (an anomaly for a mutant EXPECTED to degrade) -- never folded into
+        # 'dose_anomalies' (that list is eps-only), and never counted toward
+        # PROVEN.
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                # 11/12 read BETTER than alloff -- improvement-concordant,
+                # the opposite of this mutant's own predicted direction.
+                mutant_mean = 0.10 if seed != 12 else 0.90
+                _write_mutant_leg(
+                    raw_dir,
+                    seed,
+                    "redproof-nobc",
+                    _mutant_tier(seed=seed, held_out_example_mean=mutant_mean, mutant_patch_sha256="sha-nobc"),
+                )
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    f"redproof-nobc:sha-nobc:{seeds_s}",
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 1)
+        ladder = merged["mutant_dose_ladder"]
+        self.assertEqual(ladder["doses"][0]["detected"], "RED_FOR_INVESTIGATION")
+        self.assertEqual(ladder["dose_anomalies"], [])  # eps-only list, never a redproof member
+        self.assertEqual(ladder["red_proof"][0]["detected"], "RED_FOR_INVESTIGATION")
+        self.assertTrue(ladder["red_proof_verdict"].startswith("NOT_PROVEN"))
+        self.assertIn("redproof-nobc=RED_FOR_INVESTIGATION", ladder["red_proof_verdict"])
+
+    def test_cli_wiring_bare_redproof_prefix_is_refused(self):
+        # label "redproof-" bare -> refused.
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                _write_mutant_leg(
+                    raw_dir, seed, "redproof-", _mutant_tier(seed=seed, held_out_example_mean=0.70, mutant_patch_sha256="sha-bare")
+                )
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    f"redproof-:sha-bare:{seeds_s}",
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 1)
+        ladder = merged["mutant_dose_ladder"]
+        self.assertIsNone(ladder["sensitivity"])
+        self.assertIsNotNone(ladder["sensitivity_error"])
+        self.assertIn("redproof-", ladder["sensitivity_error"])
+        self.assertIn("no mutant name", ladder["sensitivity_error"])
+
+
 if __name__ == "__main__":
     unittest.main()

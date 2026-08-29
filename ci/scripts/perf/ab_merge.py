@@ -2760,6 +2760,33 @@ MUTANT_DOSE_LADDER_NEG_EPS_EXCLUSIVE_BOUND = -1.0
 MUTANT_DOSE_LADDER_MAX_EPS = 1.0
 MUTANT_DOSE_LADDER_MIN_ABS_EPS = 0.01
 
+# CONTRACT.md addendum 2026-08-29c's RED-proof label class (mutants/README.md's
+# "RED-proof mutants" section, unit 63 -- `M_nobc`/`M_signflip`): a dose
+# column OUTSIDE the (1+eps) lr-scale family this module's eps-family scans
+# (`mutant_dose_ladder_sensitivity`, `_two_sided_falsification`,
+# `_anomalies`, and the duplicate-EPS arm of
+# `mutant_dose_ladder_reject_duplicate_doses`) measure -- a `dose_label`
+# carrying this literal prefix can never parse as a signed `eps`
+# (`_dose_label_eps` would raise on it, by design), so it is partitioned OUT
+# of those scans before they ever see it, never fed through a widened
+# `_dose_label_eps`. It still participates fully in `build_mutant_dose_column`
+# (premises, partner premises, identity, `detected` computation) and in the
+# duplicate-LABEL / duplicate-PATCH_SHA arms of
+# `mutant_dose_ladder_reject_duplicate_doses` -- only the duplicate-EPS arm
+# and the three eps-only findings are excluded.
+RED_PROOF_LABEL_PREFIX = "redproof-"
+
+
+def is_red_proof_dose_label(dose_label):
+    """True iff `dose_label` carries the literal RED-PROOF prefix
+    (`RED_PROOF_LABEL_PREFIX`) -- e.g. `"redproof-nobc"`, `"redproof-signflip"`
+    (mutants/README.md's own `M_nobc`/`M_signflip` pair). This is a pure
+    string-prefix test, never an `_dose_label_eps` parse attempt -- a
+    RED-proof label is never expected to parse as a signed eps, by
+    construction.
+    """
+    return dose_label.startswith(RED_PROOF_LABEL_PREFIX)
+
 
 def mutant_leg_repeat_tag(dose_label):
     """The `repeat` slot a mutant leg's `.exit`/`.json`/`.stderr` triple is
@@ -3028,6 +3055,23 @@ class MutantDoseLadderSensitivityError(ValueError):
     """
 
 
+class RedProofLabelError(ValueError):
+    """Raised by `partition_red_proof_dose_columns` when a `dose_label`
+    carries the RED-PROOF prefix (`RED_PROOF_LABEL_PREFIX`, `"redproof-"`)
+    but names no mutant after it (`dose_label == RED_PROOF_LABEL_PREFIX`
+    exactly, the bare `"redproof-"` label). A RED-proof column identifies a
+    specific named mutant outside the (1+eps) lr-scale family
+    (mutants/README.md's own "RED-proof mutants" section, e.g.
+    `redproof-nobc`, `redproof-signflip`) -- an empty name after the prefix
+    is refused loudly here, never silently accepted as an anonymous
+    RED-proof column. `main` catches this alongside
+    `MutantDoseLadderSensitivityError` and folds it into the same
+    `sensitivity_error`/non-zero-exit refusal path, the same
+    correctness-of-measurement carve-out every other typed refusal in this
+    module gets.
+    """
+
+
 def _dose_label_eps(dose_label):
     """Parse a dose column's own SIGNED `eps` value from its `dose_label`
     (CONTRACT.md addendum 2026-08-29c's own convention -- mutants/README.md's
@@ -3136,7 +3180,7 @@ def _dose_label_eps(dose_label):
     return value
 
 
-def mutant_dose_ladder_reject_duplicate_doses(dose_columns):
+def mutant_dose_ladder_reject_duplicate_doses(dose_columns, eps_dose_columns=None):
     """Unit-63 round-10 audit F1: numeric label aliasing defeats
     `mutant_dose_ladder_sensitivity`'s own injectivity assumption (see that
     function's own doc -- dose columns are sorted by `abs(eps)`, and Python's
@@ -3184,7 +3228,23 @@ def mutant_dose_ladder_reject_duplicate_doses(dose_columns):
     `mutant_dose_ladder_sensitivity`/`_two_sided_falsification`/`_anomalies`
     ever see the list, so a straddle/anomaly finding can never be computed
     over an aliased set in the first place.
+
+    `eps_dose_columns` (unit 63, RED-proof label class,
+    `RED_PROOF_LABEL_PREFIX`): the duplicate-LABEL and duplicate-PATCH_SHA
+    arms above run over the FULL `dose_columns` (a RED-proof column is
+    subject to both, exactly like any eps-family column), but the
+    duplicate-EPS arm calls `_dose_label_eps` on every column it scans --
+    which raises, BY DESIGN, on a RED-proof label (it is not a member of
+    the signed-eps family and is never expected to parse as one). Passing
+    the caller's own already-partitioned eps-only subset here (defaulting
+    to `dose_columns` itself when omitted, preserving this function's prior
+    behaviour when no RED-proof column is present) scopes that one arm to
+    the eps family only, per this unit's own instruction: partition on the
+    label prefix BEFORE the scan, never widen `_dose_label_eps`'s own
+    strict domain to admit a RED-proof label.
     """
+    if eps_dose_columns is None:
+        eps_dose_columns = dose_columns
     seen_labels = set()
     for col in dose_columns:
         label = col["dose_label"]
@@ -3195,7 +3255,7 @@ def mutant_dose_ladder_reject_duplicate_doses(dose_columns):
             )
         seen_labels.add(label)
     seen_eps = {}
-    for col in dose_columns:
+    for col in eps_dose_columns:
         label = col["dose_label"]
         eps = _dose_label_eps(label)
         if eps in seen_eps:
@@ -3391,6 +3451,101 @@ def mutant_dose_ladder_two_sided_falsification(dose_columns):
     return out
 
 
+def partition_red_proof_dose_columns(dose_columns):
+    """Splits the FULL, already-built `dose_columns` list (every column
+    `build_mutant_dose_column` produced, regardless of label shape) into
+    `(eps_dose_columns, red_proof_dose_columns)` by the `dose_label`'s own
+    PREFIX (`RED_PROOF_LABEL_PREFIX`) -- BEFORE any of the eps-family scans
+    (`mutant_dose_ladder_sensitivity`, `_two_sided_falsification`,
+    `_anomalies`, and the duplicate-EPS arm of
+    `mutant_dose_ladder_reject_duplicate_doses`) ever see the list. This is
+    the split unit 63's own RED-proof label class requires: a partition on
+    the label prefix, never a widening of `_dose_label_eps`'s own strict
+    eps-only domain -- an eps-family label keeps its existing strict
+    validation untouched, and a RED-proof label is never asked to satisfy
+    it.
+
+    Raises `RedProofLabelError` for a bare-prefix label (`dose_label ==
+    RED_PROOF_LABEL_PREFIX`, i.e. `"redproof-"` with an empty mutant name
+    after it) -- refused loudly here, at the same input edge every other
+    dose-ladder label guard in this module already lives at, never silently
+    accepted as an anonymous RED-proof column.
+
+    `eps_dose_columns`/`red_proof_dose_columns` each preserve `dose_columns`'
+    own relative order.
+    """
+    eps_dose_columns = []
+    red_proof_dose_columns = []
+    for col in dose_columns:
+        label = col["dose_label"]
+        if is_red_proof_dose_label(label):
+            if label == RED_PROOF_LABEL_PREFIX:
+                raise RedProofLabelError(
+                    f"dose_label {label!r} is the bare RED-PROOF prefix ({RED_PROOF_LABEL_PREFIX!r}) "
+                    "with no mutant name after it -- a RED-proof column must name a specific mutant "
+                    "(e.g. 'redproof-nobc', 'redproof-signflip'), never an anonymous prefix"
+                )
+            red_proof_dose_columns.append(col)
+        else:
+            eps_dose_columns.append(col)
+    return eps_dose_columns, red_proof_dose_columns
+
+
+def build_red_proof_summary(red_proof_dose_columns):
+    """The first-class RED-proof merger output (unit 63): the honest
+    alternative to reading a verdict out of a separate, exit-1-expected
+    invocation (mutants/README.md's own retired "minimal labeling
+    convention" section) -- `M_nobc`/`M_signflip` (CONTRACT.md addendum
+    2026-08-29c) are OUTSIDE the (1+eps) lr-scale family this module's
+    eps-family scans measure, but their own measured verdict
+    (`build_mutant_dose_column`'s own `detected`/`n_pos`/`n_neg`/`mean_d`/
+    `p_value`/`clean_pair_count`) is computed identically to any other dose
+    column and is reported here as a real, first-class field in THIS
+    merge's own artifact.
+
+    Returns `(red_proof, red_proof_verdict)`:
+      - `red_proof`: one `{dose_label, patch_sha256, detected, n_pos, n_neg,
+        mean_d, p_value, clean_pair_count}` entry per RED-proof column, in
+        `red_proof_dose_columns`' own order -- the exact subset of fields
+        `build_mutant_dose_column` already computed, never a re-derivation.
+      - `red_proof_verdict`: the literal string `"PROVEN"` iff at least one
+        RED-proof column's own `detected` reads the literal string `"RED"`
+        (degradation-concordant: the mutant EXPECTED to degrade actually
+        measured worse than alloff at the pre-registered threshold) --
+        acceptance 5's "mutant column proven RED" is discharged. A
+        RED-proof column reading `"RED_FOR_INVESTIGATION"` is recorded
+        AS-IS in its own `detected` field (an anomaly: this mutant is
+        EXPECTED to degrade with certainty or high confidence per
+        mutants/README.md's own prediction, so an improvement-concordant
+        detection here is itself a finding to investigate, never a second
+        way to discharge acceptance 5) -- it never counts toward
+        `"PROVEN"` on its own. Otherwise (no column reads `"RED"`) the
+        literal string `"NOT_PROVEN"` followed by a parenthesized
+        `dose_label=detected` listing for every RED-proof column, so
+        acceptance 5's own undischarged state is legible directly off this
+        one string, never buried in a JSON field alone.
+    """
+    red_proof = [
+        {
+            "dose_label": col["dose_label"],
+            "patch_sha256": col["patch_sha256"],
+            "detected": col["detected"],
+            "n_pos": col["n_pos"],
+            "n_neg": col["n_neg"],
+            "mean_d": col["mean_d"],
+            "p_value": col["p_value"],
+            "clean_pair_count": col["clean_pair_count"],
+        }
+        for col in red_proof_dose_columns
+    ]
+    if any(col["detected"] == "RED" for col in red_proof_dose_columns):
+        red_proof_verdict = "PROVEN"
+    else:
+        listing = ", ".join(f"{col['dose_label']}={col['detected']}" for col in red_proof_dose_columns)
+        red_proof_verdict = f"NOT_PROVEN ({listing})"
+    return red_proof, red_proof_verdict
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
 
@@ -3498,17 +3653,33 @@ def main(argv=None):
             # here and folded into the exit code like every other
             # correctness-of-measurement problem this merge gates on.
             sensitivity_error = None
+            eps_dose_columns = dose_columns
+            red_proof_dose_columns = []
+            red_proof = []
+            red_proof_verdict = None
             try:
+                # unit 63, RED-proof label class (RED_PROOF_LABEL_PREFIX):
+                # partitioned OUT of the eps-family set BEFORE any of the
+                # scans below ever see it -- a RED-proof label can never
+                # parse as a signed eps and must never be fed through a
+                # widened `_dose_label_eps`. Raises `RedProofLabelError` for
+                # a bare-prefix label, folded into the same refusal path as
+                # `MutantDoseLadderSensitivityError` below.
+                eps_dose_columns, red_proof_dose_columns = partition_red_proof_dose_columns(dose_columns)
                 # unit-63 round-10 audit F1 -- refused BEFORE the straddle/
                 # falsification/anomaly scans ever see the (possibly
-                # aliased) set, over the FULL assembled `dose_columns`, at
-                # the same input edge every other dose-ladder guard lives
-                # at (see this function's own doc).
-                mutant_dose_ladder_reject_duplicate_doses(dose_columns)
-                sensitivity = mutant_dose_ladder_sensitivity(dose_columns)
-                two_sided_falsification = mutant_dose_ladder_two_sided_falsification(dose_columns)
-                dose_anomalies = mutant_dose_ladder_anomalies(dose_columns)
-            except MutantDoseLadderSensitivityError as exc:
+                # aliased) set, over the FULL assembled `dose_columns` for
+                # the duplicate-LABEL/PATCH_SHA arms (a RED-proof column is
+                # subject to both, exactly like any eps-family column), and
+                # over `eps_dose_columns` only for the duplicate-EPS arm
+                # (see this function's own doc).
+                mutant_dose_ladder_reject_duplicate_doses(dose_columns, eps_dose_columns)
+                sensitivity = mutant_dose_ladder_sensitivity(eps_dose_columns)
+                two_sided_falsification = mutant_dose_ladder_two_sided_falsification(eps_dose_columns)
+                dose_anomalies = mutant_dose_ladder_anomalies(eps_dose_columns)
+                if red_proof_dose_columns:
+                    red_proof, red_proof_verdict = build_red_proof_summary(red_proof_dose_columns)
+            except (MutantDoseLadderSensitivityError, RedProofLabelError) as exc:
                 sensitivity = None
                 two_sided_falsification = []
                 dose_anomalies = []
@@ -3519,6 +3690,8 @@ def main(argv=None):
                 "sensitivity_error": sensitivity_error,
                 "two_sided_falsification": two_sided_falsification,
                 "dose_anomalies": dose_anomalies,
+                "red_proof": red_proof,
+                "red_proof_verdict": red_proof_verdict,
                 "note": (
                     "CONTRACT amendment 2026-08-29b item 3, signed per addendum 2026-08-29c: each "
                     "dose column merges the mutant, substituted into the fused arm, against the "
@@ -3540,7 +3713,17 @@ def main(argv=None):
                     "family's own domain, or a duplicate identity across two columns (the same "
                     "literal dose_label, the same parsed eps under two different labels, or the "
                     "same patch_sha256 under two different labels, unit-63 round-11 audit block) "
-                    "-- never silently ignored."
+                    "-- never silently ignored. 'red_proof'/'red_proof_verdict' (unit 63, the "
+                    "RED-proof label class, RED_PROOF_LABEL_PREFIX='redproof-') report every dose "
+                    "column whose label carries that prefix -- OUTSIDE the (1+eps) lr-scale family "
+                    "and excluded from 'sensitivity'/'two_sided_falsification'/'dose_anomalies' and "
+                    "the duplicate-EPS arm above (still subject to the duplicate-LABEL/PATCH_SHA "
+                    "arms), but computed in 'doses' exactly like any other column. "
+                    "'red_proof_verdict' is 'PROVEN' iff at least one RED-proof column's own "
+                    "'detected' reads 'RED' (acceptance 5's own discharge condition); otherwise "
+                    "'NOT_PROVEN' naming each RED-proof column's own 'detected' -- a RED-proof "
+                    "column reading RED_FOR_INVESTIGATION is recorded as-is (an anomaly for a "
+                    "mutant EXPECTED to degrade), never a second way to discharge PROVEN."
                 ),
             }
             dose_lines = ["", "# mutant dose ladder (amendment 2026-08-29b item 3; addendum 2026-08-29c signs it)"]
@@ -3558,6 +3741,9 @@ def main(argv=None):
                 dose_lines.append(f"  two_sided_falsification: {two_sided_falsification}")
             if dose_anomalies:
                 dose_lines.append(f"  dose_anomalies: {dose_anomalies}")
+            if red_proof_dose_columns:
+                dose_lines.append(f"  red_proof: {red_proof}")
+                dose_lines.append(f"  red_proof_verdict: {red_proof_verdict}")
             fr_table = fr_table + "\n" + "\n".join(dose_lines)
             if sensitivity_error is not None:
                 print(
@@ -3585,6 +3771,22 @@ def main(argv=None):
                     "read RED_FOR_INVESTIGATION at a NEGATIVE eps (anomalous improvement under "
                     "deflation, see 'dose_anomalies' above) -- investigated, never silently "
                     "celebrated",
+                    file=sys.stderr,
+                )
+                exit_code = 1
+            if red_proof_verdict is not None and red_proof_verdict.startswith("NOT_PROVEN"):
+                # unit 63: NOT_PROVEN is a failure of THIS run's own purpose
+                # (a RED-proof column exists precisely to discharge
+                # acceptance 5's "mutant column proven RED" outside the
+                # (1+eps) family) -- named here exactly as it is recorded in
+                # the artifact's own 'red_proof_verdict', never silently
+                # passed through as green. PROVEN contributes nothing to
+                # `exit_code` here -- it is the EXPECTED outcome, unlike
+                # 'dose_anomalies' above.
+                print(
+                    f"finetune_run_ab mutant-dose-ladder: FAIL — red_proof_verdict={red_proof_verdict!r} "
+                    "-- acceptance 5's 'mutant column proven RED' is undischarged by every scheduled "
+                    "RED-proof column",
                     file=sys.stderr,
                 )
                 exit_code = 1

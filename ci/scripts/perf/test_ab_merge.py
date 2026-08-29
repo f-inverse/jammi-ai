@@ -3241,6 +3241,64 @@ class FinetuneRunLr0ControlTests(unittest.TestCase):
             _finetune_run_tier(arm=arm, seed=seed, learning_happened_delta=learning_happened_delta, **overrides),
         )
 
+    # unit-63 round-4 audit F-2: `finetune_run_lr0_control_seed_violations`'s
+    # own new positive fact -- an OK lr0-control leg's reported `lr` must
+    # equal `0.0` EXACTLY. Exercised directly (never only end-to-end) so a
+    # divergence from `learning_happened_delta`'s own, independent check is
+    # unambiguous.
+
+    def test_control_leg_at_lr_0_001_is_a_violation(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_lr0_leg(raw_dir, 101, "fused", 0.0, lr=0.001)
+            self._write_lr0_leg(raw_dir, 101, "alloff", 0.0)
+            violations, per_arm, _identities = ab_merge.finetune_run_lr0_control_seed_violations(raw_dir, 101)
+        self.assertTrue(
+            any("reported lr=0.001" in v and "not exactly 0.0" in v for v in violations), violations
+        )
+        self.assertEqual(per_arm["fused"]["lr"], 0.001)
+
+    def test_control_leg_at_lr_0_777_with_clean_delta_is_still_a_violation(self):
+        # The `lr` fact and the `learning_happened_delta` fact are
+        # INDEPENDENT -- a control leg can pass the (unrelated)
+        # learning-happened calibration check while still failing the
+        # 'did this leg actually run at lr=0' fact this round adds.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_lr0_leg(raw_dir, 101, "fused", 0.0, lr=0.777)
+            self._write_lr0_leg(raw_dir, 101, "alloff", 0.0)
+            violations, per_arm, _identities = ab_merge.finetune_run_lr0_control_seed_violations(raw_dir, 101)
+        self.assertTrue(
+            any("reported lr=0.777" in v and "not exactly 0.0" in v for v in violations), violations
+        )
+        # The learning-happened check itself stays clean for this leg --
+        # proving the two checks are independent, not one masking the other.
+        self.assertFalse(any("unexpectedly CLEARS the floor" in v for v in violations), violations)
+        self.assertEqual(per_arm["fused"]["learning_happened_delta"], 0.0)
+
+    def test_control_leg_at_lr_0_0_is_clean_on_the_lr_fact(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_lr0_leg(raw_dir, 101, "fused", 0.0)
+            self._write_lr0_leg(raw_dir, 101, "alloff", 0.0)
+            violations, per_arm, _identities = ab_merge.finetune_run_lr0_control_seed_violations(raw_dir, 101)
+        self.assertEqual(violations, [])
+        self.assertEqual(per_arm["fused"]["lr"], 0.0)
+        self.assertEqual(per_arm["alloff"]["lr"], 0.0)
+
+    def test_control_leg_diverging_on_lr_end_to_end_invalidates(self):
+        # The end-to-end path (`build_finetune_run_report`, the REAL merge
+        # stage `finetune_run_ab.sh` drives) -- a control leg's own lr
+        # divergence must collapse `status` to INVALID exactly like every
+        # other lr0_control violation does, never silently absorbed.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_ab_seeds(raw_dir)
+            self._write_lr0_leg(raw_dir, 101, "fused", 0.0, lr=0.001)
+            self._write_lr0_leg(raw_dir, 101, "alloff", 0.0)
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, list(range(1, 13)), lr0_seeds=[101])
+        self.assertTrue(
+            any("not exactly 0.0" in v for v in merged["lr0_control"]["violations"]),
+            merged["lr0_control"]["violations"],
+        )
+        self.assertEqual(merged["status"], "INVALID")
+
     def test_clean_lr0_control_fails_learning_happened_and_is_green(self):
         with tempfile.TemporaryDirectory() as raw_dir:
             self._write_ab_seeds(raw_dir)

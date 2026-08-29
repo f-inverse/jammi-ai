@@ -1927,20 +1927,38 @@ def finetune_run_lr0_control_seed_violations(raw_dir, seed):
     (b)): reads BOTH arms' `FINETUNE_RUN_LR0_REPEAT`-tagged leg for `seed`
     (never `r1`/`r2` -- these never enter `load_finetune_run_leg`'s normal
     `FINETUNE_RUN_REPEATS` iteration, so they can never leak into the A/B
-    set's own `d_values`/sign test) and asserts each OK leg's
-    `learning_happened_delta` does NOT clear `FINETUNE_RUN_LEARNING_HAPPENED_FLOOR`
-    -- the calibration bite for the FLOOR=0.0 ruling: a passing lr=0 leg
-    (learning "happened" with no possible parameter update) is a finding
-    against the floor itself, not a training result. A leg that is
-    `MISSING`/`FAIL` (never ran, or ran and errored) is ALSO recorded as a
-    violation -- an absent control leaves the floor unvalidated, which this
-    calibration check exists specifically to never pass over silently; a
-    `DRY_RUN` leg is the one carve-out (never itself a finding, same
-    doctrine every other `*_DRY_RUN` leg in this module already gets).
+    set's own `d_values`/sign test) and asserts:
+
+      1. (unit-63 round-4 audit F-2) THE CONTROL'S OWN DEFINING FACT: each
+         OK leg's reported `lr` field must equal `0.0` EXACTLY. The lr
+         exception in `finetune_run_cross_seed_homogeneity_violations`
+         (unit-63 round-3 audit block 3) removed the CROSS-GROUP `lr`
+         comparison between the main pool and the lr0-control pool -- by
+         design, that is the control's own defining premise, never itself
+         a divergence to flag -- but nothing UNTIL this check asserted the
+         POSITIVE fact the whole control depends on: that the leg tagged as
+         an lr0-control leg actually ran at `lr == 0.0`. A control whose
+         own `--lr` flag silently reverted to the CLI default (or was
+         mis-plumbed to some other nonzero value) would validate the
+         FLOOR=0.0 ruling against a leg that never tested it at all --
+         "a control that never ran at lr=0 validates the floor silently".
+      2. `learning_happened_delta` does NOT clear
+         `FINETUNE_RUN_LEARNING_HAPPENED_FLOOR` -- the calibration bite for
+         the FLOOR=0.0 ruling: a passing lr=0 leg (learning "happened" with
+         no possible parameter update) is a finding against the floor
+         itself, not a training result.
+
+    Both checks are independent and conjunctive -- a leg can fail either,
+    both, or neither. A leg that is `MISSING`/`FAIL` (never ran, or ran and
+    errored) is ALSO recorded as a violation -- an absent control leaves the
+    floor unvalidated, which this calibration check exists specifically to
+    never pass over silently; a `DRY_RUN` leg is the one carve-out (never
+    itself a finding, same doctrine every other `*_DRY_RUN` leg in this
+    module already gets).
 
     Returns `(violations, per_arm, identities)` where `per_arm` records each
-    arm's raw outcome and (when OK) its `learning_happened_delta`, for the
-    merged artifact -- never silently dropped even when clean -- and
+    arm's raw outcome and (when OK) its `learning_happened_delta`/`lr`, for
+    the merged artifact -- never silently dropped even when clean -- and
     `identities` is `[(label, fields), ...]` (unit-63 audit finding 3) for
     every OK leg here, in the exact shape
     `finetune_run_cross_seed_homogeneity_violations` consumes, so the
@@ -1955,10 +1973,10 @@ def finetune_run_lr0_control_seed_violations(raw_dir, seed):
         leg = load_finetune_run_leg(raw_dir, seed, arm, FINETUNE_RUN_LR0_REPEAT)
         outcome = leg["outcome"]
         if outcome == "DRY_RUN":
-            per_arm[arm] = {"outcome": outcome, "learning_happened_delta": None}
+            per_arm[arm] = {"outcome": outcome, "learning_happened_delta": None, "lr": None}
             continue
         if outcome != "OK":
-            per_arm[arm] = {"outcome": outcome, "learning_happened_delta": None}
+            per_arm[arm] = {"outcome": outcome, "learning_happened_delta": None, "lr": None}
             violations.append(
                 f"lr0 control seed {seed} {arm}: leg outcome={outcome!r} (not OK) -- an "
                 "absent/failed lr=0 control leg leaves the FLOOR=0.0 premise unvalidated "
@@ -1967,8 +1985,17 @@ def finetune_run_lr0_control_seed_violations(raw_dir, seed):
             continue
         tier = finetune_run_block(leg["report"])
         delta = tier.get("learning_happened_delta")
-        per_arm[arm] = {"outcome": outcome, "learning_happened_delta": delta}
+        lr = tier.get("lr")
+        per_arm[arm] = {"outcome": outcome, "learning_happened_delta": delta, "lr": lr}
         identities.append((f"lr0 seed {seed} {arm}", finetune_run_leg_identity(tier)))
+        # unit-63 round-4 audit F-2: the control's own defining fact -- see
+        # this function's own doc, point 1.
+        if not (isinstance(lr, (int, float)) and not isinstance(lr, bool) and lr == 0.0):
+            violations.append(
+                f"lr0 control seed {seed} {arm}: reported lr={lr!r}, not exactly 0.0 -- a "
+                "control that never ran at lr=0 validates the floor silently (unit-63 round-4 "
+                "audit F-2; CONTRACT H4 advisory (b)'s own 'lr=0 arm x2 seeds' precondition)"
+            )
         if isinstance(delta, (int, float)) and not isinstance(delta, bool) and delta > FINETUNE_RUN_LEARNING_HAPPENED_FLOOR:
             violations.append(
                 f"lr0 control seed {seed} {arm}: learning_happened_delta={delta!r} "

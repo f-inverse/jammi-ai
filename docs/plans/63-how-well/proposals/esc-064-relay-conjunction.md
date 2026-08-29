@@ -1,9 +1,11 @@
 # PROPOSAL (human-merge): tighten(lead-gate) — the relay's requirements are a conjunction, not a two-arm disjunction (esc-064)
 
-Status: PROPOSED — retrospective-drafted 2026-08-29, unit-63 session. Gate-definition
-change: `.claude/hooks/**` is `permissions.deny` for agents and `SWARM_GATE_TOUCHED`
-means admin-merge — the retrospective proposes, the OPERATOR applies and merges.
-Nothing here has been applied.
+Status: PROPOSED v2 — retrospective-drafted 2026-08-29, then PRESSURE-TESTED the same
+day (verdict REFINE: design upheld, change set incomplete — the v2 amendments at the
+bottom of this file are MANDATORY parts of the change, found by execution). Gate-
+definition change: `.claude/hooks/**` is `permissions.deny` for agents and
+`SWARM_GATE_TOUCHED` means admin-merge — agents propose, the OPERATOR applies and
+merges. Nothing here has been applied.
 
 ## The escape and its three unlogged siblings (all live-reproduced against the real hooks)
 
@@ -131,3 +133,84 @@ esc-064 stays `open` until G16-G19 land citing the id (→ `eval_added`), `close
 when the self-test is green on main with the lib change merged. Named-but-not-
 proposed (own row later): `sweep_method`/`exhaustive` are parsed and recorded but
 armed on no branch — the degenerate case of this class.
+
+---
+
+# v2 amendments — pressure-test REFINE (2026-08-29, executed against real hooks in scratch roots)
+
+The pressure-test upheld the core design (arm-from-data, R2-always, predicate-not-
+caller, reason-returning refactor; every error path traced exits 2 through the
+fail-closed boundary; in-flight sites-only relays are recoverable IN PLACE by adding
+a probe array — no re-audit, no state reset). The following are MANDATORY additions,
+each found by execution, most blocking:
+
+## B1 (BLOCKING) — `.claude/agents/lead.md:30-36` + `:40` join the change set, SAME commit
+The lead's card carries the pre-change relay template (no `probe` key) and says probe
+is written "instead" only when class_enumeration is absent. After the change, a lead
+following its own card produces a DENIED relay on EVERY enumerated BLOCK — and the
+realistic failure is not the junk probe but the honest lead facing an uninterpretable
+deny and reaching for `rm .jammi/gate-state/<slug>.*`, which deletes the BLOCK row
+outright (that is how R2-always becomes WEAKER than the status quo). Update the
+template (add `probe`), the prose (R2 is always required; the degenerate-case
+instruction: ">=2 sites you EXAMINED and found clean — not 2 more bugs"), and the
+residual list at `:40` (add residual (4), matching README's). `.claude/agents/**` is
+not deny-listed, but this edit must ride the SAME operator commit as the hook change
+— splitting the behavior change by file leaves the workspace inconsistent between
+merges. Also add the "examined and found clean" phrasing to the R2 rejection string.
+
+## B2 (BLOCKING) — `docs/plans/53-agentic-swarm/ARCHITECTURE.md:236-237` joins the change set
+It defines an accepted relay as sites-superset-only; stale on merge, and doc-parity
+runs against exactly this text.
+
+## B3 (BLOCKING) — G18 gains roots 6 and 7 (the specified matrix was NOT mutation-adequate)
+Executed 5-mutant x 14-fixture matrix: a mutant that dedups by EXACT set while
+testing collision by `.strip()` survives ALL of G16-G19 — killed only by
+`probe=[" x.py:1", "x.py:1 "]` (strip-identical pair → 1 adjacent site): G18 root 6.
+A mutant that strips only the PROBE side (exact on the reactive side) survives
+everything including root 6 — killed only by a verifier-emitted PADDED finding
+location (`finding_locations: ["foo.py:10 "]` is reachable; `parse_verdict_fields`
+records locations verbatim) with a probe restating it unpadded: G18 root 7.
+
+## B4 (BLOCKING) — G19 buildability caveat, stated in the fixture docstring
+`handle_stop` ALWAYS writes `enumeration_missing` (lead-gate-lib.py:822), so
+`_write_block_row` cannot produce the key-absent row — G19 must post-edit the state
+JSONL to delete the key, and its docstring must say so. G19 is the only fixture that
+kills the bolt-on mutant; silently weakening it to a hook-emittable row evaporates
+the mutation-adequacy claim.
+
+## A1 — honesty corrections to this proposal's own claims
+- Mutant B is a DOCTRINE fix against legacy/hand-edited rows, not a live escape: the
+  hook's own writer makes `enumeration_missing == (not class_enum)` (`:306`) and
+  `:513` already ORs the data — B required hand-deleting the key.
+- The `:420` "second caller" corollary is decorative: `any_unit_has_open_block:463`
+  has no caller and `:622` filters same-type, so the `:420` call has no observable
+  effect in any reachable state (matches the existing G13 note). Fixing the
+  predicate is still right; it does not close a second live surface.
+- Latency: measured NO lib delta (suite 2.75s→2.74s; N7 0.027s→0.028s); the
+  "+0.3-0.5s" is fixture subprocess cost and lands nearer +0.8s. Immaterial; framed
+  honestly now.
+- R2-always applies to fix-verifier and acceptance-verifier relays too (reproduced
+  both ways); the README and merge commit must state the full blast radius.
+
+## A2 — the zero-width residual: choose one, explicitly
+`.strip()` does not remove U+200B/U+FEFF: `probe=["foo.py:10​", "foo.py:10​​"]`
+against finding `foo.py:10` is ACCEPTED under the v1 predicate — the mutant-C CLASS
+survives its instance fix. Either (recommended) drop Unicode Cf/Cc-category
+characters before stripping (one `unicodedata` line, monotone-toward-deny), adding a
+G18 root for it, or list invisible-character collision in BOTH residual lists. The
+proposal may not claim "closes all four by construction" without one of the two.
+
+## A3 — document the normalization asymmetry (it is defensible, but only if stated)
+Probe-side strip-both-sides is provably monotone-toward-DENY (it can only shrink the
+adjacent set), which is why it is NOT the normalization the sites doctrine bans —
+that ban exists because normalizing `sites` would make acceptance EASIER. Ruled
+against pure exact-string for the probe side (it re-allows `"foo.py:10 "` outright).
+State this in the README's relay paragraph or the next audit reads it as
+normalization creep.
+
+## A4 — ledger class_id reconciliation
+esc-064's row carries `gate-vacuous-by-construction` (with esc-063) while
+esc-053/054 carry `guard-state-collapse`; the retrospective asserted a third name
+spanning both. The 053/054 kinship (an arm keyed on a proxy rather than the data) is
+the stronger and correct framing — reconcile the `class_id` or record the
+cross-cluster relation in the row when promoting esc-064.

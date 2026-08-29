@@ -106,6 +106,11 @@ echo "::group::device"; nvidia-smi --query-gpu=name,compute_cap,driver_version -
 cd /root && rm -rf jammi-ai
 git clone --depth 1 -b "${GIT_REF}" "${GIT_REPO}" jammi-ai 2>&1 | tail -1
 cd jammi-ai
+# the depth-1 clone above carries no submodule content; jammi-kernels/build.rs:605
+# panics loudly ("CUTLASS submodule is not checked out") the moment a
+# jammi-encoders/flash-attn build reaches it, so init it explicitly before
+# any build step runs (empirically hit on both campaign pods).
+git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
 
 # --- python provisioning (unit-63 audit finding 4): a bare pod has no pip
 # on PATH and finetune_run_ab.sh's own cargo build/jammi-bench run never

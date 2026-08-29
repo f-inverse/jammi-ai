@@ -219,6 +219,60 @@ no-op. `git checkout -- crates/jammi-kernels/src/ops/adamw_step.rs` restores
 the clean tree afterward; neither the patch nor the temporary test is part
 of any commit on this branch.
 
+## Dose ladder (CONTRACT amendment 2026-08-29b item 3) — merger interface
+
+M1 above is recorded as a NON-DETECTION (a sign-flipping early transient,
+never a sensitivity bound — see the campaign-v1 finding this amendment
+corrects). The corrected design is a one-parameter, monotone, SUSTAINED
+dose family — the fused AdamW update scaled by `(1+eps)`,
+`eps in {0.02, 0.10, 0.50}` — each dose run as its own scratch-worktree
+mutant (the SAME on-pod procedure above: patched `jammi-kernels`, the SAME
+`run_leg` vector, torn down after). This section documents ONLY the
+merger's own consuming interface (`ci/scripts/perf/ab_merge.py`); the
+per-dose PREDICTED effect (held-out example-mean units, stated BEFORE the
+spend, per the amendment's own falsifiability requirement) is a separate,
+not-yet-authored record this section does not substitute for.
+
+- **Leg naming**: a dose's legs are recorded under the SAME `raw_dir` a
+  campaign already uses, tagged `seed{seed}__fused__mutant-{dose_label}`
+  (`ab_merge.mutant_leg_repeat_tag(dose_label)`) — a `repeat` value that can
+  never collide with `r1`/`r2` (the main A/B pool) or `lr0` (the RED
+  control), the SAME file-naming isolation the lr0 control already relies
+  on. `dose_label` is an operator-chosen string (e.g. `"eps0.02"`), never
+  reinterpreted by the merger.
+- **Per-leg recorded fields**: every field a clean `fused` leg already
+  carries, PLUS this section's own three (`mutant_id`, `base_sha`,
+  `patch_sha256`, step 5 above) — a mutant leg missing any of the three, or
+  whose own `patch_sha256` disagrees with the dose column it is merged
+  under, is refused (`ab_merge.finetune_run_mutant_column_violations`).
+- **Merger CLI**: `ab_merge.py finetune-run RAW_DIR OUT_DIR SEEDS
+  [LR0_SEEDS] [--allow-missing-lr0-control] [--mutant-legs
+  DOSE_LABEL:PATCH_SHA256:SEED1,SEED2,...]` — `--mutant-legs` is repeatable,
+  once per dose column; `finetune_run_ab.sh`'s own
+  `FINETUNE_RUN_AB_MUTANT_LEGS` env var (`;`-separated specs) is a pure
+  pass-through into the same flag, never a second leg-running mechanism.
+- **Per-dose output** (`mutant_dose_ladder.doses[i]` in the merged
+  artifact): `{dose_label, patch_sha256, detected, n_pos, n_neg, mean_d,
+  p_value, clean_pair_count, violations, ...}` — `detected` is `"RED"` iff
+  the SAME `>=11/12` threshold the primary decision uses is met in the
+  DEGRADATION direction (mutant worse than alloff); `"not-detected"` if the
+  threshold is not met, or is met in the opposite (anomalous-improvement)
+  direction (M1's own sign-flipping-transient shape); `"INVALID"` if the
+  premise-clean pair count is not exactly the pre-registered 12, or the
+  sign test itself refuses — a correctness-of-measurement carve-out beyond
+  the amendment's own literal `RED`/`not-detected` pair, added so a
+  malformed dose column is never silently read as "not-detected" (a
+  substantive finding) when it is really "this column could not be
+  evaluated at all".
+- **Sensitivity statement**: `mutant_dose_ladder.sensitivity` — the first
+  adjacent `(not-detected, RED)` pair in the CALLER-SUPPLIED dose order
+  (`ab_merge.mutant_dose_ladder_sensitivity`), or `null` if no such
+  transition exists in that order.
+- **Mutant legs never enter the primary A/B set**: proven structurally (the
+  `mutant-<dose_label>` repeat tag can never equal `r1`/`r2`/`lr0`) and
+  empirically (`MutantDoseLadderTests.test_mutant_leg_never_leaks_into_the_ab_set`,
+  `ci/scripts/perf/test_ab_merge.py`).
+
 ## Files
 
 - `M1.patch` — the committed unified diff (patch-file-only; never applied to

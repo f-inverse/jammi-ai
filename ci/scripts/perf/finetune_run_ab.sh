@@ -105,6 +105,21 @@
 #                              opt-out in the merged artifact
 #                              (lr0_control.allow_missing_lr0_control) rather
 #                              than an unstated default.
+#   FINETUNE_RUN_AB_MUTANT_LEGS
+#                              amendment 2026-08-29b item 3 -- OPTIONAL,
+#                              ';'-separated list of
+#                              'DOSE_LABEL:PATCH_SHA256:SEED1,SEED2,...'
+#                              specs, forwarded verbatim as one
+#                              '--mutant-legs SPEC' per entry to ab_merge.py.
+#                              PURE pass-through: this script never runs a
+#                              mutant leg itself (docs/plans/63-how-well/
+#                              mutants/README.md's own scratch-worktree
+#                              on-pod procedure does that, against a
+#                              patched jammi-kernels build); this variable
+#                              only tells the merge step where to find
+#                              already-produced 'mutant-<dose_label>'-tagged
+#                              legs under THIS run's own $RAW_DIR. Default
+#                              empty = no dose ladder in this merge.
 #   FINETUNE_RUN_AB_CUDA       CUDA ordinal (default: 0). Unset
 #                              FINETUNE_RUN_AB_CPU=1 to omit --cuda entirely
 #                              (the CPU-hermetic smoke path finetune-run's
@@ -449,6 +464,25 @@ FINETUNE_RUN_AB_ALLOW_NO_LR0="${FINETUNE_RUN_AB_ALLOW_NO_LR0:-0}"
 MERGE_ARGS=(finetune-run "$RAW_DIR" "$OUT_DIR" "$FINETUNE_RUN_AB_SEEDS" "$FINETUNE_RUN_AB_LR0_SEEDS")
 if [ "$FINETUNE_RUN_AB_ALLOW_NO_LR0" = "1" ]; then
   MERGE_ARGS+=(--allow-missing-lr0-control)
+fi
+# amendment 2026-08-29b item 3 -- the mutant dose ladder's own legs are
+# produced OUTSIDE this script entirely (docs/plans/63-how-well/mutants/
+# README.md's own scratch-worktree on-pod procedure: a patched
+# jammi-kernels build, never this script's own checkout). This is a PURE
+# pass-through, no leg-running logic added here: when the operator has
+# already produced `mutant-<dose_label>`-tagged legs under THIS run's own
+# $RAW_DIR (`ab_merge.py`'s own `mutant_leg_repeat_tag` naming), setting
+# FINETUNE_RUN_AB_MUTANT_LEGS to a ';'-separated list of
+# 'DOSE_LABEL:PATCH_SHA256:SEED1,SEED2,...' specs folds them into the SAME
+# merge invocation/artifact -- never a second, separately-discoverable
+# merge. Default empty = no dose ladder in this merge (the common case: a
+# dose ladder is a deliberate, lead-run H5 step, not part of every sweep).
+FINETUNE_RUN_AB_MUTANT_LEGS="${FINETUNE_RUN_AB_MUTANT_LEGS:-}"
+if [ -n "$FINETUNE_RUN_AB_MUTANT_LEGS" ]; then
+  IFS=';' read -r -a MUTANT_LEG_SPECS <<< "$FINETUNE_RUN_AB_MUTANT_LEGS"
+  for spec in "${MUTANT_LEG_SPECS[@]}"; do
+    [ -n "$spec" ] && MERGE_ARGS+=(--mutant-legs "$spec")
+  done
 fi
 python3 "$DIR/ab_merge.py" "${MERGE_ARGS[@]}"
 PY_RC=$?

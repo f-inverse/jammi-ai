@@ -2623,6 +2623,238 @@ def build_finetune_run_report(raw_dir, seeds, lr0_seeds=(), allow_missing_lr0_co
     return merged, table
 
 
+# ============================================================================
+# unit 63 amendment 2026-08-29b item 3 -- mutant dose-ladder merge mode.
+#
+# CONTRACT amendment 2026-08-29b item 3 pre-registers a one-parameter,
+# monotone, SUSTAINED mutant dose family (the fused AdamW update scaled by
+# `(1+eps)`, `eps in {0.02, 0.10, 0.50}`; see `docs/plans/63-how-well/
+# mutants/README.md` for the mutant's own patch/hash/on-pod-procedure
+# doc), replacing M1's "sensitivity bound" claim (mutants/README.md's own
+# post-hoc finding: M1 is a sign-flipping early transient, a NON-DETECTION,
+# never a bound). Each dose is run as its OWN column of `fused`-arm legs
+# (the mutant substituted INTO the fused arm, mutants/README.md's own
+# on-pod procedure step 4/6) and merged, HERE, against the campaign's
+# ALREADY-RUN `alloff` r1 legs -- the SAME alloff legs the main A/B decision
+# consumed, never a second, independently-run alloff pool -- under the
+# EXACT SAME `>=11/12` threshold and mean-sign rule the primary decision
+# rule uses (`FINETUNE_RUN_DECISION_THRESHOLD`/`FINETUNE_RUN_GATE_SEED_COUNT`
+# -- reused by reference below, never re-declared, so the two rules cannot
+# independently drift). Mutant legs NEVER enter the primary A/B set: this
+# entire mechanism reads its own `mutant-<dose_label>`-tagged leg files
+# (`mutant_leg_repeat_tag`), a `repeat` value that can never collide with
+# `r1`/`r2` (the main pool) or `FINETUNE_RUN_LR0_REPEAT` (the lr=0 control)
+# by construction -- the SAME file-naming isolation `FINETUNE_RUN_LR0_REPEAT`
+# already gives the lr0 control, not a second bespoke mechanism.
+# ============================================================================
+
+# Reused BY REFERENCE from the primary decision rule -- see that rule's own
+# doc (`FINETUNE_RUN_DECISION_RULE_TEXT`). A dose column is judged under the
+# IDENTICAL numeric cell the main campaign is (CONTRACT amendment
+# 2026-08-29b item 3: "under the SAME >=11/12+mean rule").
+MUTANT_DECISION_THRESHOLD = FINETUNE_RUN_DECISION_THRESHOLD
+MUTANT_GATE_SEED_COUNT = FINETUNE_RUN_GATE_SEED_COUNT
+
+
+def mutant_leg_repeat_tag(dose_label):
+    """The `repeat` slot a mutant leg's `.exit`/`.json`/`.stderr` triple is
+    filed under (`load_finetune_run_leg(raw_dir, seed, "fused",
+    mutant_leg_repeat_tag(dose_label))`) -- always `"mutant-" + dose_label`,
+    which can NEVER equal `"r1"`/`"r2"` (`FINETUNE_RUN_REPEATS`) or
+    `FINETUNE_RUN_LR0_REPEAT` (`"lr0"`) for ANY `dose_label` string,
+    including an empty one (`"mutant-"` itself is still distinct from all
+    three). This is the SAME structural leakage guard
+    `FINETUNE_RUN_LR0_REPEAT` already gives the lr=0 control -- a mutant leg
+    literally cannot be read by the main pool's or the lr0 control's own
+    loaders, which only ever request `"r1"`/`"r2"`/`"lr0"` verbatim.
+    """
+    return f"mutant-{dose_label}"
+
+
+def finetune_run_mutant_column_violations(dose_label, patch_sha256, tier):
+    """A mutant leg's own premise (amendment 2026-08-29b item 3): it claims
+    to be a fused-arm leg with the mutant patch substituted in, so it is
+    held to EXACTLY the checks a clean `fused` leg already is
+    (`finetune_run_dispatch_proof_violations`'s `arm == "fused"` branch,
+    `finetune_run_named_arm_premise_violations`) -- mutants/README.md's own
+    "What M1 does NOT touch" section is precisely the claim that a mutant
+    leg's premise/dispatch fields read IDENTICAL to a clean fused leg; only
+    the DECISION statistic (held-out loss) is supposed to differ. PLUS the
+    mutant's own recorded provenance (mutants/README.md's own fields,
+    `mutant_id`/`base_sha`/`patch_sha256`) must be present, and this leg's
+    own `patch_sha256` must equal the dose column's caller-supplied one --
+    a leg claiming a different patch than the dose it was invoked under is
+    a labeling error, never silently trusted.
+    """
+    violations = list(finetune_run_dispatch_proof_violations("fused", tier))
+    violations += finetune_run_arm_premise_violations("fused", tier)
+    for field in ("mutant_id", "base_sha", "patch_sha256"):
+        if not tier.get(field):
+            violations.append(
+                f"mutant leg's own {field!r} is missing/empty -- mutants/README.md's own "
+                "recorded fields (mutant_id, base_sha, patch_sha256) must be present so this "
+                "leg is attributable to a specific, auditable mutant patch"
+            )
+    leg_patch_sha256 = tier.get("patch_sha256")
+    if leg_patch_sha256 is not None and leg_patch_sha256 != patch_sha256:
+        violations.append(
+            f"leg's own patch_sha256={leg_patch_sha256!r} does not match this dose column's "
+            f"caller-supplied patch_sha256={patch_sha256!r} -- a labeling error, never silently "
+            "trusted"
+        )
+    return violations
+
+
+def build_mutant_dose_column(raw_dir, dose_label, patch_sha256, mutant_seeds):
+    """One dose column (amendment 2026-08-29b item 3): reads each of
+    `mutant_seeds`' own `mutant_leg_repeat_tag(dose_label)`-tagged `fused`
+    leg, checks it via `finetune_run_mutant_column_violations`, cross-checks
+    it against the SAME-SEED campaign `alloff` `r1` leg (loaded fresh from
+    `raw_dir` here -- the campaign's ALREADY-RUN leg, never re-run, never a
+    second alloff pool) via `generic_leg_premise_violations` over
+    `FINETUNE_RUN_IDENTITY_FIELDS` (mirrors the main decision's own
+    fused-vs-alloff identity check), and, for every premise-clean pair,
+    computes `d_i = mutant.held_out_example_mean - alloff.held_out_example_mean`
+    -- mutant vs alloff is THE GATE'S OWN STATISTIC (amendment 2026-08-29b
+    item 3: "mutant-vs-fused is explicitly NOT the sensitivity claim").
+
+    `detected` is `"RED"` iff the SAME `>=11/12` threshold
+    (`MUTANT_DECISION_THRESHOLD`/`MUTANT_GATE_SEED_COUNT`) is met in the
+    DEGRADATION direction specifically (mutant worse than alloff, `d_i > 0`
+    dominant, `mean_d > 0`) -- a dose meeting the threshold in the OPPOSITE
+    (anomalous-improvement) direction, or not meeting it at all
+    (mutants/README.md's own M1 finding: a sign-flipping early transient
+    reads 8/12, well under 11), is `"not-detected"`; a dose whose
+    premise-clean pair count is not exactly `MUTANT_GATE_SEED_COUNT`, or
+    whose sign test itself refuses (all-tie / empty), is `"INVALID"` -- the
+    SAME correctness-of-measurement carve-out every other verdict in this
+    module gets, never silently rescaled to whatever count happened to run
+    clean.
+
+    Returns a dict: `{dose_label, patch_sha256, mutant_seeds, per_seed,
+    clean_pair_count, gate_seed_count, threshold, n_pos, n_neg, ties,
+    mean_d, p_value, sign_test_error, detected, violations}` -- `violations`
+    a flat list covering EVERY per-leg/labeling problem found (never
+    silently dropped), `per_seed` recording each mutant seed's own
+    outcome/d_i/violations even when excluded from the sign test.
+    """
+    per_seed = {}
+    violations = []
+    d_values = {}
+    for seed in mutant_seeds:
+        leg = load_finetune_run_leg(raw_dir, seed, "fused", mutant_leg_repeat_tag(dose_label))
+        outcome = leg["outcome"]
+        if outcome != "OK":
+            per_seed[seed] = {"outcome": outcome, "d_i": None, "violations": []}
+            if outcome != "DRY_RUN":
+                violations.append(f"{dose_label} seed {seed}: mutant leg outcome={outcome!r} (not OK)")
+            continue
+        alloff_leg = load_finetune_run_leg(raw_dir, seed, "alloff", "r1")
+        if alloff_leg["outcome"] != "OK":
+            per_seed[seed] = {"outcome": outcome, "d_i": None, "violations": []}
+            violations.append(
+                f"{dose_label} seed {seed}: no OK campaign alloff r1 leg for this seed to merge "
+                "against -- the dose column reuses the SAME alloff legs the main campaign already "
+                "ran, never a second alloff run"
+            )
+            continue
+        tier = finetune_run_block(leg["report"])
+        alloff_tier = finetune_run_block(alloff_leg["report"])
+        leg_violations = finetune_run_mutant_column_violations(dose_label, patch_sha256, tier)
+        leg_violations += generic_leg_premise_violations(
+            FINETUNE_RUN_IDENTITY_FIELDS,
+            finetune_run_leg_identity(tier),
+            finetune_run_leg_identity(alloff_tier),
+            "mutant",
+            "alloff",
+        )
+        d_i = None
+        mutant_mean = tier.get("held_out_example_mean")
+        alloff_mean = alloff_tier.get("held_out_example_mean")
+        if (
+            not leg_violations
+            and isinstance(mutant_mean, (int, float))
+            and not isinstance(mutant_mean, bool)
+            and isinstance(alloff_mean, (int, float))
+            and not isinstance(alloff_mean, bool)
+        ):
+            d_i = mutant_mean - alloff_mean
+            d_values[seed] = d_i
+        per_seed[seed] = {"outcome": outcome, "d_i": d_i, "violations": leg_violations}
+        violations += [f"{dose_label} seed {seed}: {v}" for v in leg_violations]
+
+    sign_result = None
+    sign_error = None
+    if d_values:
+        try:
+            sign_result = sign_test(list(d_values.values()))
+        except SignTestError as exc:
+            sign_error = str(exc)
+
+    clean_pair_count = len(d_values)
+    n_pos = n_neg = ties = 0
+    mean_d = None
+    p_value = None
+    detected = "not-detected"
+    if sign_error is not None:
+        detected = "INVALID"
+        violations.append(f"{dose_label}: sign test refused -- {sign_error}")
+    elif clean_pair_count != MUTANT_GATE_SEED_COUNT:
+        detected = "INVALID"
+        violations.append(
+            f"{dose_label}: {clean_pair_count} premise-clean mutant/alloff pair(s), expected "
+            f"exactly {MUTANT_GATE_SEED_COUNT} -- never silently rescaled to whatever count ran "
+            "clean"
+        )
+    if sign_result is not None:
+        n_pos, n_neg, ties, p_value = (
+            sign_result["n_pos"],
+            sign_result["n_neg"],
+            sign_result["ties"],
+            sign_result["p_value"],
+        )
+        mean_d = statistics.mean(d_values.values())
+        if detected != "INVALID" and n_pos >= MUTANT_DECISION_THRESHOLD and mean_d > 0.0:
+            detected = "RED"
+
+    return {
+        "dose_label": dose_label,
+        "patch_sha256": patch_sha256,
+        "mutant_seeds": list(mutant_seeds),
+        "per_seed": {str(s): v for s, v in per_seed.items()},
+        "clean_pair_count": clean_pair_count,
+        "gate_seed_count": MUTANT_GATE_SEED_COUNT,
+        "threshold": MUTANT_DECISION_THRESHOLD,
+        "n_pos": n_pos,
+        "n_neg": n_neg,
+        "ties": ties,
+        "mean_d": mean_d,
+        "p_value": p_value,
+        "sign_test_error": sign_error,
+        "detected": detected,
+        "violations": violations,
+    }
+
+
+def mutant_dose_ladder_sensitivity(dose_columns):
+    """The reported sensitivity statement (amendment 2026-08-29b item 3):
+    "the adjacent-dose pair straddling detection" -- the first adjacent
+    (not-detected, RED) transition in the CALLER-SUPPLIED dose order (never
+    re-sorted here: an operator's own monotone-eps ordering, e.g. `["0.02",
+    "0.10", "0.50"]`, is the ordering this straddles over). Returns
+    `{"lower": lower_dose_label, "higher": higher_dose_label}` naming that
+    transition, or `None` if none exists in the supplied order (every dose
+    RED, every dose not-detected/INVALID, or the transition runs the OTHER
+    way -- a higher dose reading LESS detected than a lower one is itself a
+    finding against the family's own claimed monotonicity, never silently
+    reported as a straddle).
+    """
+    for lower, higher in zip(dose_columns, dose_columns[1:]):
+        if lower["detected"] == "not-detected" and higher["detected"] == "RED":
+            return {"lower": lower["dose_label"], "higher": higher["dose_label"]}
+    return None
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
 
@@ -2634,6 +2866,31 @@ def main(argv=None):
     # directory path is spelled exactly that way).
     if argv and argv[0] == "finetune-run":
         rest = argv[1:]
+        # amendment 2026-08-29b item 3 -- REPEATABLE flag (like lr0's own
+        # positional, but a dose ladder is N columns, not one list), scanned
+        # out of `rest` BEFORE the positional contract below so its own
+        # placement never shifts SEEDS/LR0_SEEDS/--allow-missing-lr0-control.
+        # Each occurrence: `--mutant-legs DOSE_LABEL:PATCH_SHA256:SEED1,SEED2,...`
+        # (mutants/README.md's own per-leg recorded fields -- the dose label
+        # + the mutant patch sha256 the leg's producer recorded).
+        mutant_leg_specs = []
+        filtered = []
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--mutant-legs":
+                if i + 1 >= len(rest):
+                    print(
+                        "usage: ab_merge.py finetune-run ... --mutant-legs "
+                        "DOSE_LABEL:PATCH_SHA256:SEED1,SEED2,...",
+                        file=sys.stderr,
+                    )
+                    return 2
+                mutant_leg_specs.append(rest[i + 1])
+                i += 2
+                continue
+            filtered.append(rest[i])
+            i += 1
+        rest = filtered
         # unit-63 round-3 audit block 5: a flag, not a positional -- scanned
         # out of `rest` wherever it appears so it never shifts the existing
         # positional contract (`finetune_run_ab.sh` appends it, if at all,
@@ -2643,7 +2900,8 @@ def main(argv=None):
         if len(rest) < 3:
             print(
                 "usage: ab_merge.py finetune-run RAW_DIR OUT_DIR SEED1,SEED2,... "
-                "[LR0_SEED1,LR0_SEED2,...] [--allow-missing-lr0-control]",
+                "[LR0_SEED1,LR0_SEED2,...] [--allow-missing-lr0-control] "
+                "[--mutant-legs DOSE_LABEL:PATCH_SHA256:SEED1,SEED2,... ...]",
                 file=sys.stderr,
             )
             return 2
@@ -2664,6 +2922,55 @@ def main(argv=None):
         if fr_merged is None:
             print(f"finetune_run_ab: FAIL — no leg output found under {fr_raw_dir}", file=sys.stderr)
             return 1
+
+        # amendment 2026-08-29b item 3 -- the dose ladder, computed BEFORE
+        # the artifact is written so it lands in the SAME
+        # `finetune_run_ab_report.json`/`.._table.txt` pair as the primary
+        # decision, never a second, separately-discoverable file.
+        exit_code = 0
+        if mutant_leg_specs:
+            dose_columns = []
+            for spec in mutant_leg_specs:
+                parts = spec.split(":", 2)
+                if len(parts) != 3:
+                    print(
+                        f"usage: --mutant-legs DOSE_LABEL:PATCH_SHA256:SEED1,SEED2,... (got {spec!r})",
+                        file=sys.stderr,
+                    )
+                    return 2
+                dose_label, patch_sha256, mutant_seeds_s = parts
+                mutant_seeds = [s for s in mutant_seeds_s.split(",") if s]
+                dose_columns.append(build_mutant_dose_column(fr_raw_dir, dose_label, patch_sha256, mutant_seeds))
+            fr_merged["mutant_dose_ladder"] = {
+                "doses": dose_columns,
+                "sensitivity": mutant_dose_ladder_sensitivity(dose_columns),
+                "note": (
+                    "CONTRACT amendment 2026-08-29b item 3: each dose column merges the mutant, "
+                    "substituted into the fused arm, against the SAME campaign alloff legs (never "
+                    "re-run) under the SAME >=11/12+mean rule the primary decision uses. Mutant "
+                    "legs never enter the primary A/B set (mutant_leg_repeat_tag's own file-naming "
+                    "isolation). 'sensitivity' names the adjacent-dose pair straddling detection, "
+                    "or null when no such transition exists in the supplied dose order."
+                ),
+            }
+            dose_lines = ["", "# mutant dose ladder (amendment 2026-08-29b item 3)"]
+            for col in dose_columns:
+                dose_lines.append(
+                    f"  dose={col['dose_label']:<12} detected={col['detected']:<12} "
+                    f"n_pos={col['n_pos']} n_neg={col['n_neg']} mean_d={col['mean_d']} "
+                    f"p_value={col['p_value']} clean_pairs={col['clean_pair_count']}/{col['gate_seed_count']}"
+                )
+            sensitivity = fr_merged["mutant_dose_ladder"]["sensitivity"]
+            dose_lines.append(f"  sensitivity: {sensitivity}")
+            fr_table = fr_table + "\n" + "\n".join(dose_lines)
+            invalid_doses = [c["dose_label"] for c in dose_columns if c["detected"] == "INVALID"]
+            if invalid_doses:
+                print(
+                    f"finetune_run_ab mutant-dose-ladder: FAIL — dose column(s) {invalid_doses} are "
+                    "INVALID (correctness-of-measurement problem, see the table above)",
+                    file=sys.stderr,
+                )
+                exit_code = 1
 
         os.makedirs(fr_out_dir, exist_ok=True)
         with open(os.path.join(fr_out_dir, "finetune_run_ab_report.json"), "w") as fh:
@@ -2692,8 +2999,8 @@ def main(argv=None):
                 "decision rule, never silently passed through as green)",
                 file=sys.stderr,
             )
-            return 1
-        return 0
+            exit_code = 1
+        return exit_code
 
     if len(argv) < 5:
         print(

@@ -4053,8 +4053,10 @@ class MutantDoseLadderTests(unittest.TestCase):
         # unit-63 round-9 audit finding 2: the domain is ASYMMETRIC --
         # `eps <= -1.0` (multiplier sign bound, exclusive of -1.0 itself)
         # and `eps > 1.0` (the family-sanity cap) are refused on the high
-        # end, and `0 < abs(eps) < 0.01` (below the smallest ever-scheduled
-        # dose) is refused on the low end. A single symmetric
+        # end, and `0 < abs(eps) < 0.01` (below the 0.01 sanity floor,
+        # itself set deliberately BELOW the smallest ever-SCHEDULED dose of
+        # `|eps| = 0.10` -- unit-63 round-10 audit advisory (a)) is refused
+        # on the low end. A single symmetric
         # `abs(eps) > 1.0` check would have wrongly ACCEPTED eps=-1.0 (a
         # zero-update leg) as though it were a real degradation dose.
         refused = ("eps-1.0", "eps1.01", "eps0.009")
@@ -4182,6 +4184,12 @@ class MutantDoseLadderTests(unittest.TestCase):
             with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
                 merged = json.load(fh)
         self.assertEqual(rc, 0)  # GREEN main decision + a RED (successfully-detecting) dose is not itself a script FAIL
+        # unit-63 round-10 audit advisory (c): pin the main decision's own
+        # status, per this file's own convention -- this test's isolation
+        # claim (the dose ladder alone drives `rc`/the dose_anomalies etc.)
+        # depends on the main decision actually being GREEN, not merely
+        # "whatever it happened to compute" from the 6-vs-6 fixture above.
+        self.assertEqual(merged["status"], "GREEN")
         self.assertIn("mutant_dose_ladder", merged)
         self.assertEqual(len(merged["mutant_dose_ladder"]["doses"]), 1)
         self.assertEqual(merged["mutant_dose_ladder"]["doses"][0]["detected"], "RED")
@@ -4214,7 +4222,14 @@ class MutantDoseLadderTests(unittest.TestCase):
                     mutant_spec,
                 ]
             )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
         self.assertEqual(rc, 1)
+        # unit-63 round-10 audit advisory (c): pin the main decision's own
+        # status, per this file's own convention -- this test's isolation
+        # claim (an INVALID dose column ALONE fails the exit code) depends
+        # on the main decision actually being GREEN.
+        self.assertEqual(merged["status"], "GREEN")
 
     def test_cli_wiring_fails_on_a_negative_eps_red_for_investigation_dose(self):
         # unit-63 round-9 audit finding 3: a negative-eps (deflation) dose
@@ -4256,6 +4271,11 @@ class MutantDoseLadderTests(unittest.TestCase):
             with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
                 merged = json.load(fh)
         self.assertEqual(rc, 1)
+        # unit-63 round-10 audit advisory (c): pin the main decision's own
+        # status, per this file's own convention -- this test's isolation
+        # claim (a negative-eps dose_anomaly ALONE fails the exit code)
+        # depends on the main decision actually being GREEN.
+        self.assertEqual(merged["status"], "GREEN")
         self.assertEqual(merged["mutant_dose_ladder"]["doses"][0]["detected"], "RED_FOR_INVESTIGATION")
         self.assertIsNone(merged["mutant_dose_ladder"]["sensitivity"])
         self.assertEqual(

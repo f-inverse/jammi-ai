@@ -1,4 +1,4 @@
-use jammi_numerics::stats::{bootstrap_ci, mann_whitney_u, welch_t_test};
+use jammi_numerics::stats::{bootstrap_ci, mann_whitney_u, sign_test, welch_t_test};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
@@ -244,4 +244,195 @@ fn bootstrap_ci_is_invariant_to_input_order() {
         b.upper.to_bits(),
         "ci_upper must be byte-identical across input orders"
     );
+}
+
+// --- sign_test -------------------------------------------------------------
+
+#[test]
+fn sign_test_golden_n12_k11_pinned_cell() {
+    // Pre-registered decision cell (CONTRACT H2 / PLAN v2 delta 3): n=12,
+    // k=11 positives (1 negative, 0 ties). Hand computation:
+    //   t = max(11, 1) = 11
+    //   tail = C(12,11) + C(12,12) = 12 + 1 = 13
+    //   p = 2 * tail / 2^12 = 2 * 13 / 4096 = 26 / 4096 = 13 / 2048
+    //     = 0.00634765625
+    // which rounds to the pre-registered alpha2 = 0.0064 (2 s.f.) /
+    // 0.006348 (6 d.p.). The exact value returned here is the unrounded
+    // rational 13/2048, pinned bit-exactly.
+    let mut diffs = vec![1.0; 11];
+    diffs.push(-1.0);
+    let r = sign_test(&diffs).unwrap();
+    assert_eq!(r.n, 12);
+    assert_eq!(r.n_pos, 11);
+    assert_eq!(r.n_neg, 1);
+    assert_eq!(r.ties, 0);
+    let expected = 13.0_f64 / 2048.0_f64;
+    assert_eq!(
+        r.p_value.to_bits(),
+        expected.to_bits(),
+        "golden cell (n=12, k=11) must equal the exact rational 13/2048 = {expected} bit-for-bit, got {}",
+        r.p_value
+    );
+    assert!(
+        (r.p_value - 0.0064).abs() < 0.0005,
+        "sanity: exact p_value {} should round to the pre-registered alpha2=0.0064",
+        r.p_value
+    );
+}
+
+#[test]
+fn sign_test_exact_small_n_all_same_sign() {
+    // n=5, k=5 (unanimous): t = max(5,0) = 5.
+    //   tail = C(5,5) = 1
+    //   p = 2 * 1 / 2^5 = 2/32 = 0.0625
+    let diffs = vec![2.0, 3.0, 1.0, 0.5, 7.0];
+    let r = sign_test(&diffs).unwrap();
+    assert_eq!((r.n, r.n_pos, r.n_neg, r.ties), (5, 5, 0, 0));
+    assert_eq!(r.p_value.to_bits(), (2.0_f64 / 32.0_f64).to_bits());
+}
+
+#[test]
+fn sign_test_exact_small_n_one_dissent() {
+    // n=5, k=4: t = max(4,1) = 4.
+    //   tail = C(5,4) + C(5,5) = 5 + 1 = 6
+    //   p = 2 * 6 / 32 = 12/32 = 0.375
+    let diffs = vec![2.0, 3.0, 1.0, 0.5, -7.0];
+    let r = sign_test(&diffs).unwrap();
+    assert_eq!((r.n, r.n_pos, r.n_neg, r.ties), (5, 4, 1, 0));
+    assert_eq!(r.p_value.to_bits(), (12.0_f64 / 32.0_f64).to_bits());
+}
+
+#[test]
+fn sign_test_exact_small_n_balanced_saturates_at_one() {
+    // n=4, k=2 (perfectly balanced): t = max(2,2) = 2.
+    //   tail = C(4,2) + C(4,3) + C(4,4) = 6 + 4 + 1 = 11
+    //   2 * 11 = 22 > 2^4 = 16, so p is capped at the honest ceiling of 1.0
+    //   (not 22/16 = 1.375, which would not be a probability).
+    let diffs = vec![1.0, 1.0, -1.0, -1.0];
+    let r = sign_test(&diffs).unwrap();
+    assert_eq!((r.n, r.n_pos, r.n_neg, r.ties), (4, 2, 2, 0));
+    assert_eq!(r.p_value, 1.0);
+}
+
+#[test]
+fn sign_test_two_sided_symmetry_k_and_n_minus_k() {
+    // Flipping every sign swaps n_pos <-> n_neg but must not change the
+    // two-sided p-value: t = max(k, n-k) = max(n-k, k) is symmetric by
+    // construction. Asserted bit-exactly since both paths compute the same
+    // exact-integer ratio.
+    let diffs = vec![
+        3.0, 1.5, -2.0, 4.0, 0.2, -0.1, 5.0, -6.0, 0.9, 2.2, -1.1, 8.0,
+    ];
+    let flipped: Vec<f64> = diffs.iter().map(|d| -d).collect();
+
+    let r = sign_test(&diffs).unwrap();
+    let r_flipped = sign_test(&flipped).unwrap();
+
+    assert_eq!(r.n, r_flipped.n);
+    assert_eq!(r.n_pos, r_flipped.n_neg);
+    assert_eq!(r.n_neg, r_flipped.n_pos);
+    assert_eq!(
+        r.p_value.to_bits(),
+        r_flipped.p_value.to_bits(),
+        "p_value must be symmetric under a full sign flip: {} vs {}",
+        r.p_value,
+        r_flipped.p_value
+    );
+}
+
+#[test]
+fn sign_test_reports_ties_without_dropping_them() {
+    // diffs = [1,1,1,0,0,-1]: n_pos=3, n_neg=1, ties=2, n=4.
+    //   t = max(3,1) = 3
+    //   tail = C(4,3) + C(4,4) = 4 + 1 = 5
+    //   p = 2 * 5 / 16 = 10/16 = 0.625
+    let diffs = vec![1.0, 1.0, 1.0, 0.0, 0.0, -1.0];
+    let r = sign_test(&diffs).unwrap();
+    assert_eq!(r.n, 4, "ties must be excluded from n, not folded in");
+    assert_eq!(r.n_pos, 3);
+    assert_eq!(r.n_neg, 1);
+    assert_eq!(r.ties, 2, "the tie count must be reported, not dropped");
+    assert_eq!(r.p_value.to_bits(), (10.0_f64 / 16.0_f64).to_bits());
+}
+
+#[test]
+fn sign_test_refuses_empty_input() {
+    let err = sign_test(&[]).unwrap_err();
+    assert!(format!("{err}").contains("n=0"));
+}
+
+#[test]
+fn sign_test_refuses_all_ties() {
+    // Non-empty input, but every element resolves to a tie: n=0 is reached
+    // via a distinct path from the empty-input case, and the two must not be
+    // conflated in the error text.
+    let diffs = vec![0.0, 0.0, 0.0];
+    let err = sign_test(&diffs).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("tie") || msg.contains("tied"),
+        "all-tie refusal should name ties specifically, got: {msg}"
+    );
+}
+
+#[test]
+fn sign_test_refuses_nan() {
+    // NaN has no sign (NaN > 0.0, NaN < 0.0, and NaN == 0.0 are all false),
+    // so it must be refused rather than silently routed into positive,
+    // negative, or tie.
+    let diffs = vec![1.0, f64::NAN, -1.0];
+    assert!(sign_test(&diffs).is_err());
+}
+
+#[test]
+fn sign_test_admits_infinite_as_a_well_defined_sign() {
+    // Unlike a tie, `±inf` has a well-defined, non-zero sign and must
+    // classify like any other non-zero finite value, not be refused and not
+    // be counted as a tie.
+    let diffs = vec![f64::INFINITY, f64::NEG_INFINITY, 1.0, 2.0, 3.0];
+    let r = sign_test(&diffs).unwrap();
+    assert_eq!(r.n, 5);
+    assert_eq!(r.n_pos, 4);
+    assert_eq!(r.n_neg, 1);
+    assert_eq!(r.ties, 0);
+    assert!(r.p_value.is_finite());
+}
+
+#[test]
+fn sign_test_negative_control_balanced_is_not_significant() {
+    // Non-vacuous negative control: 6 positive / 6 negative out of n=12
+    // (perfectly balanced) must NOT report significance under any
+    // conventional alpha — a naive or buggy implementation that always
+    // reports a small p-value would fail this.
+    let mut diffs = vec![1.0; 6];
+    diffs.extend(vec![-1.0; 6]);
+    let r = sign_test(&diffs).unwrap();
+    assert_eq!(r.n, 12);
+    assert!(
+        r.p_value > 0.5,
+        "a perfectly balanced 6/6 split at n=12 must not look significant, got p={}",
+        r.p_value
+    );
+}
+
+#[test]
+fn sign_test_is_invariant_to_input_order() {
+    // The sign test is a property of the multiset of signs, not the order
+    // paired differences arrive in. A permutation must produce a
+    // bit-identical result.
+    let ordered = vec![
+        1.0, -1.0, 1.0, 1.0, 0.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, 1.0,
+    ];
+    let mut shuffled = ordered.clone();
+    shuffled.reverse();
+    shuffled.rotate_left(3);
+    assert_ne!(ordered, shuffled, "the two orders must actually differ");
+
+    let a = sign_test(&ordered).unwrap();
+    let b = sign_test(&shuffled).unwrap();
+    assert_eq!(a.n, b.n);
+    assert_eq!(a.n_pos, b.n_pos);
+    assert_eq!(a.n_neg, b.n_neg);
+    assert_eq!(a.ties, b.ties);
+    assert_eq!(a.p_value.to_bits(), b.p_value.to_bits());
 }

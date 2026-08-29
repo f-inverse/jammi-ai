@@ -396,18 +396,25 @@ ALL_BASES = (
     | LORA_SITE_EXCLUSIVE_GROUP
     | CASCADE_BASES
 )
-assert (
+# Unit-63 round-16 audit advisory 1: an explicit `if`/`raise`, never a bare
+# `assert` -- `assert` is stripped entirely under `python -O`, which would
+# silently disable this load-bearing pairwise-disjointness guard (every
+# other classification in this module assumes exactly-one-class-per-base)
+# in exactly the deployment shape that removes the safety net without
+# removing the code path it protects.
+if (
     len(REQUIRED_PAIRS)
     + len(ABSORBABLE_BY_ATTENTION_BLOCK)
     + len(ABSORBABLE_BY_ATTENTION_BLOCK_FLASH)
     + len(LORA_SITE_EXCLUSIVE_GROUP)
     + len(CASCADE_BASES)
-    == len(ALL_BASES)
-), (
-    "REQUIRED_PAIRS / ABSORBABLE_BY_ATTENTION_BLOCK / "
-    "ABSORBABLE_BY_ATTENTION_BLOCK_FLASH / LORA_SITE_EXCLUSIVE_GROUP / "
-    "CASCADE_BASES must be pairwise disjoint -- every base gets exactly ONE class"
-)
+    != len(ALL_BASES)
+):
+    raise AssertionError(
+        "REQUIRED_PAIRS / ABSORBABLE_BY_ATTENTION_BLOCK / "
+        "ABSORBABLE_BY_ATTENTION_BLOCK_FLASH / LORA_SITE_EXCLUSIVE_GROUP / "
+        "CASCADE_BASES must be pairwise disjoint -- every base gets exactly ONE class"
+    )
 
 # B5 — bf16's ULP near a loss value around 0.30: 7 explicit mantissa bits,
 # exponent bucket [0.25, 0.5) => 2^-9. Every real sweep leg runs
@@ -1393,32 +1400,63 @@ FINETUNE_RUN_DECISION_RULE_TEXT = (
     "seeds; never rescaled silently)."
 )
 
-# Unit-63 round-15 audit (docs-ci preemptive sweep, round-14 F6 sibling class):
-# the finetune-run merger's own COMPLETE `status` vocabulary -- every value
-# `build_finetune_run_report`'s own status fold (immediately below) can set --
-# named ONCE here, verified by reading that fold, rather than hand-copied
-# into `runpod_gpu_howwell.sh`'s own `case "$STATUS"` arms AND (independently,
-# before this fix) into this module's own exit fold's gating check
-# (`main()`'s `finetune-run` branch, ~line 4066) and that branch's own prose
-# comment. Partitioned the way BOTH consumers actually split it:
-# `FINETUNE_RUN_GATING_STATUSES` is the exit-code-forcing subset (a
-# correctness-of-measurement problem, INVALID, or a fired decision rule, RED
-# / RED_FOR_INVESTIGATION -- this module's own exit fold below asserts
-# against this exact tuple, never a re-typed literal), `"GREEN"` is the
-# single ordinary-pass value, and `FINETUNE_RUN_RECORD_ONLY_STATUSES` is the
-# never-gates subset (a leg that never ran, or a dry run -- never itself a
-# merge failure). `ShellStatusCaseArmsBoundToFinetuneRunStatusesTests`
+# Unit-63 round-16 audit (docs-ci, correcting round-15's own overclaim): the
+# finetune-run merger's own COMPLETE `status` vocabulary -- every value
+# `build_finetune_run_report`'s own status fold (immediately below) can set.
+# Round-15 named this tuple ONCE but the fold itself kept RE-TYPING the six
+# literal strings rather than reading from these names, so a producer-only
+# seventh status (a new fold branch assigning some new literal never added
+# here) would drift SILENTLY -- the fold would happily set it, nothing here
+# would notice, and only `runpod_gpu_howwell.sh`'s own case block's `*)`
+# catch-all (a warning, not a gate) would ever see it. Two independent fixes,
+# mirroring the `DOSE_LADDER_EXIT_CAUSE_NAMES` pattern below (constant +
+# runtime equality check, never a "verified by reading" comment alone):
+#   1. the fold now ASSIGNS `status` FROM the single-value constants below
+#      (`FINETUNE_RUN_STATUS_INVALID` etc.), never a re-typed literal --
+#      behavior-identical (same strings), but a fold edit that doesn't touch
+#      this module is now structurally impossible without a NameError.
+#   2. the fold's own runtime guard (immediately after `status` is set,
+#      below) raises `AssertionError` if the computed `status` is not a
+#      member of `FINETUNE_RUN_STATUSES` -- the producer-side belt this
+#      class needs: a NEW status value assigned via any future fold branch,
+#      even one that (bug) hand-types a literal instead of using a named
+#      constant, is caught immediately, at the point of production, never
+#      silently forwarded into the artifact.
+# Partitioned the way both consumers actually split it: `FINETUNE_RUN_GATING_
+# STATUSES` is the exit-code-forcing subset (a correctness-of-measurement
+# problem, INVALID, or a fired decision rule, RED / RED_FOR_INVESTIGATION --
+# this module's own exit fold below asserts against this exact tuple, never a
+# re-typed literal), `FINETUNE_RUN_GREEN_STATUS` is the single ordinary-pass
+# value, and `FINETUNE_RUN_RECORD_ONLY_STATUSES` is the never-gates subset (a
+# leg that never ran, or a dry run -- never itself a merge failure).
+# `ShellStatusCaseArmsBoundToFinetuneRunStatusesTests`
 # (`test_howwell_dose_ladder_cause.py`) parses `runpod_gpu_howwell.sh`'s own
 # case-arm patterns for `$STATUS` and asserts they exactly cover
-# `FINETUNE_RUN_STATUSES` with no extras and no gaps -- a sixth status added
-# to this fold without a matching shell arm (or vice versa) is a RED test,
-# never silent drift (the round-14 F6 shape this fix closes: "one capability
-# enumerated by hand in two modules with no mechanical oracle"). That test's
-# own docstring names what this binding does NOT cover: `$STATUS` consumed
-# by anything OTHER than that one case block.
-FINETUNE_RUN_GATING_STATUSES = ("INVALID", "RED", "RED_FOR_INVESTIGATION")
-FINETUNE_RUN_GREEN_STATUS = "GREEN"
-FINETUNE_RUN_RECORD_ONLY_STATUSES = ("DRY_RUN", "INCOMPLETE")
+# `FINETUNE_RUN_STATUSES` with no extras and no gaps -- a status added to
+# `FINETUNE_RUN_STATUSES` (correctly, via the constants below) without a
+# matching shell arm (or vice versa) is a RED test there. Combined with the
+# fold's own runtime guard, BOTH drift directions are now caught: a status
+# added to the constants without a shell arm (shell-side test, above) AND a
+# status the fold assigns without adding it to the constants (this fold's own
+# runtime guard, immediately below) -- never silent drift, never merely "one
+# capability enumerated by hand in two modules with no mechanical oracle".
+# That shell-side test's own docstring names what ITS OWN binding does NOT
+# cover: `$STATUS` consumed by anything OTHER than that one case block; the
+# producer-side runtime guard below is the separate mechanism that covers the
+# fold's own literal-drift direction, not that test.
+FINETUNE_RUN_STATUS_INVALID = "INVALID"
+FINETUNE_RUN_STATUS_RED = "RED"
+FINETUNE_RUN_STATUS_RED_FOR_INVESTIGATION = "RED_FOR_INVESTIGATION"
+FINETUNE_RUN_STATUS_GREEN = "GREEN"
+FINETUNE_RUN_STATUS_DRY_RUN = "DRY_RUN"
+FINETUNE_RUN_STATUS_INCOMPLETE = "INCOMPLETE"
+FINETUNE_RUN_GATING_STATUSES = (
+    FINETUNE_RUN_STATUS_INVALID,
+    FINETUNE_RUN_STATUS_RED,
+    FINETUNE_RUN_STATUS_RED_FOR_INVESTIGATION,
+)
+FINETUNE_RUN_GREEN_STATUS = FINETUNE_RUN_STATUS_GREEN
+FINETUNE_RUN_RECORD_ONLY_STATUSES = (FINETUNE_RUN_STATUS_DRY_RUN, FINETUNE_RUN_STATUS_INCOMPLETE)
 FINETUNE_RUN_STATUSES = (
     FINETUNE_RUN_GATING_STATUSES + (FINETUNE_RUN_GREEN_STATUS,) + FINETUNE_RUN_RECORD_ONLY_STATUSES
 )
@@ -2644,7 +2682,7 @@ def build_finetune_run_report(raw_dir, seeds, lr0_seeds=(), allow_missing_lr0_co
         or wrong_seed_count
         or cross_seed_violations
     ):
-        status = "INVALID"
+        status = FINETUNE_RUN_STATUS_INVALID
     elif sign_result is None:
         # `any_dry_run_leg` (never a premise violation, see the DRY_RUN
         # branch above) is distinguished from a genuine INCOMPLETE (a real
@@ -2653,13 +2691,33 @@ def build_finetune_run_report(raw_dir, seeds, lr0_seeds=(), allow_missing_lr0_co
         # exit code (finetune_ab.sh's own `any_dry_run` -> "N/A (dry-run)"
         # carve-out, never INVALID/FAIL), while a genuinely incomplete real
         # sweep still reads INCOMPLETE.
-        status = "DRY_RUN" if any_dry_run_leg else "INCOMPLETE"
+        status = FINETUNE_RUN_STATUS_DRY_RUN if any_dry_run_leg else FINETUNE_RUN_STATUS_INCOMPLETE
     elif decision["concordant_direction"] == "degradation":
-        status = "RED"
+        status = FINETUNE_RUN_STATUS_RED
     elif decision["concordant_direction"] == "improvement":
-        status = "RED_FOR_INVESTIGATION"
+        status = FINETUNE_RUN_STATUS_RED_FOR_INVESTIGATION
     else:
-        status = "GREEN"
+        status = FINETUNE_RUN_STATUS_GREEN
+
+    # Unit-63 round-16 audit (identity-completeness): the producer-side
+    # runtime belt -- `status` above is now always assigned FROM the named
+    # `FINETUNE_RUN_STATUS_*` constants (never a re-typed literal), but this
+    # explicit membership check is what actually MAKES a future fold branch
+    # that reintroduces a hand-typed literal (or a genuinely new status not
+    # yet added to `FINETUNE_RUN_STATUSES`) fail LOUDLY, at the point of
+    # production, rather than silently flowing into the artifact and only
+    # ever being caught downstream by `runpod_gpu_howwell.sh`'s own
+    # catch-all `*)` warning arm (which does not gate). Mirrors
+    # `DOSE_LADDER_EXIT_CAUSE_NAMES`'s own runtime equality check in `main()`
+    # below: an explicit `if`/`raise`, never a bare `assert` (stripped under
+    # `python -O`).
+    if status not in FINETUNE_RUN_STATUSES:
+        raise AssertionError(
+            f"build_finetune_run_report computed status={status!r}, not a member of the "
+            f"committed FINETUNE_RUN_STATUSES={FINETUNE_RUN_STATUSES} -- a new status must be "
+            "added to that tuple (and to runpod_gpu_howwell.sh's own case arms) in the SAME "
+            "change that introduces it here, never assigned as a bare literal"
+        )
 
     # amendment 2026-08-29b item 1(c): `premise_failure_diagnostic` is
     # ALWAYS present in the merged artifact (even when `premise_failure_entries`
@@ -2811,6 +2869,43 @@ def build_finetune_run_report(raw_dir, seeds, lr0_seeds=(), allow_missing_lr0_co
 # 2026-08-29b item 3: "under the SAME >=11/12+mean rule").
 MUTANT_DECISION_THRESHOLD = FINETUNE_RUN_DECISION_THRESHOLD
 MUTANT_GATE_SEED_COUNT = FINETUNE_RUN_GATE_SEED_COUNT
+
+# Unit-63 round-16 audit (identity-completeness, sibling of the
+# FINETUNE_RUN_STATUS_* fix above): the dose-column `detected` vocabulary --
+# every value `build_mutant_dose_column` (below) can set -- was hand-typed at
+# every production AND consumption site (this module's own assignment and
+# comparison sites, PLUS `howwell_dose_ladder_cause.py`'s own re-typed
+# `"INVALID"` literal) with no named source. Named ONCE here; every site in
+# THIS module that assigns or compares a dose column's `detected` field reads
+# these constants, never a re-typed literal, and `howwell_dose_ladder_cause.py`
+# imports `MUTANT_DOSE_DETECTED_INVALID` from here directly (exactly as it
+# already imports `DOSE_LADDER_EXIT_CAUSE_NAMES`), so the two can never
+# independently drift on what `"INVALID"` (or any other member) means. This
+# does NOT carry a runtime membership guard the way `FINETUNE_RUN_STATUS_*`
+# does above -- `build_mutant_dose_column`'s own fold is a strict linear
+# INVALID -> RED/RED_FOR_INVESTIGATION -> not-detected precedence (each
+# branch's own `detected != MUTANT_DOSE_DETECTED_INVALID` guard already makes
+# the four-way exclusivity structural, not merely conventional the way the
+# six-way `FINETUNE_RUN_STATUS_*` if/elif chain was) -- stated only that far,
+# not further.
+MUTANT_DOSE_DETECTED_NOT_DETECTED = "not-detected"
+MUTANT_DOSE_DETECTED_INVALID = "INVALID"
+MUTANT_DOSE_DETECTED_RED = "RED"
+MUTANT_DOSE_DETECTED_RED_FOR_INVESTIGATION = "RED_FOR_INVESTIGATION"
+MUTANT_DOSE_DETECTED_VALUES = (
+    MUTANT_DOSE_DETECTED_NOT_DETECTED,
+    MUTANT_DOSE_DETECTED_INVALID,
+    MUTANT_DOSE_DETECTED_RED,
+    MUTANT_DOSE_DETECTED_RED_FOR_INVESTIGATION,
+)
+
+# Unit-63 round-16 audit (identity-completeness, same sibling class): the
+# RED-proof verdict's own `"NOT_PROVEN"` prefix (`build_red_proof_summary`,
+# below) is re-typed at `howwell_dose_ladder_cause.py`'s own
+# `red_proof_verdict.startswith("NOT_PROVEN")` check -- named ONCE here,
+# imported there directly.
+RED_PROOF_VERDICT_PROVEN = "PROVEN"
+RED_PROOF_VERDICT_NOT_PROVEN_PREFIX = "NOT_PROVEN"
 
 # unit-63 round-8 audit finding 3 (round-9 audit finding 2 makes the
 # domain ASYMMETRIC -- a single `abs(eps) > MAX` check is not this
@@ -3217,12 +3312,12 @@ def build_mutant_dose_column(raw_dir, dose_label, patch_sha256, mutant_seeds):
     n_pos = n_neg = ties = 0
     mean_d = None
     p_value = None
-    detected = "not-detected"
+    detected = MUTANT_DOSE_DETECTED_NOT_DETECTED
     if sign_error is not None:
-        detected = "INVALID"
+        detected = MUTANT_DOSE_DETECTED_INVALID
         violations.append(f"{dose_label}: sign test refused -- {sign_error}")
     elif clean_pair_count != MUTANT_GATE_SEED_COUNT:
-        detected = "INVALID"
+        detected = MUTANT_DOSE_DETECTED_INVALID
         violations.append(
             f"{dose_label}: {clean_pair_count} premise-clean mutant/alloff pair(s), expected "
             f"exactly {MUTANT_GATE_SEED_COUNT} -- never silently rescaled to whatever count ran "
@@ -3236,14 +3331,14 @@ def build_mutant_dose_column(raw_dir, dose_label, patch_sha256, mutant_seeds):
             sign_result["p_value"],
         )
         mean_d = statistics.mean(d_values.values())
-        if detected != "INVALID" and n_pos >= MUTANT_DECISION_THRESHOLD and mean_d > 0.0:
-            detected = "RED"
-        elif detected != "INVALID" and n_neg >= MUTANT_DECISION_THRESHOLD and mean_d < 0.0:
+        if detected != MUTANT_DOSE_DETECTED_INVALID and n_pos >= MUTANT_DECISION_THRESHOLD and mean_d > 0.0:
+            detected = MUTANT_DOSE_DETECTED_RED
+        elif detected != MUTANT_DOSE_DETECTED_INVALID and n_neg >= MUTANT_DECISION_THRESHOLD and mean_d < 0.0:
             # unit-63 round-8 audit finding 2: the improvement-concordant
             # arm the two-sided-falsification cell needs to be able to
             # report -- mirrors the main decision's own
             # `concordant_direction == "improvement"` branch (:2565).
-            detected = "RED_FOR_INVESTIGATION"
+            detected = MUTANT_DOSE_DETECTED_RED_FOR_INVESTIGATION
 
     return {
         "dose_label": dose_label,
@@ -3573,7 +3668,7 @@ def mutant_dose_ladder_sensitivity(dose_columns):
         key=lambda col: abs(_dose_label_eps(col["dose_label"])),
     )
     for lower, higher in zip(negative, negative[1:]):
-        if lower["detected"] == "not-detected" and higher["detected"] == "RED":
+        if lower["detected"] == MUTANT_DOSE_DETECTED_NOT_DETECTED and higher["detected"] == MUTANT_DOSE_DETECTED_RED:
             return {"lower": lower["dose_label"], "higher": higher["dose_label"]}
     return None
 
@@ -3609,7 +3704,7 @@ def mutant_dose_ladder_anomalies(dose_columns):
     out = []
     for col in dose_columns:
         eps = _dose_label_eps(col["dose_label"])
-        if eps < 0.0 and col["detected"] == "RED_FOR_INVESTIGATION":
+        if eps < 0.0 and col["detected"] == MUTANT_DOSE_DETECTED_RED_FOR_INVESTIGATION:
             out.append({
                 "dose_label": col["dose_label"],
                 "eps": eps,
@@ -3663,14 +3758,14 @@ def mutant_dose_ladder_two_sided_falsification(dose_columns):
     out = []
     for col in dose_columns:
         eps = _dose_label_eps(col["dose_label"])
-        if eps > 0.0 and col["detected"] == "RED":
+        if eps > 0.0 and col["detected"] == MUTANT_DOSE_DETECTED_RED:
             out.append({
                 "dose_label": col["dose_label"],
                 "eps": eps,
                 "detected": col["detected"],
                 "finding": "secant refuted (degradation at +eps)",
             })
-        elif eps > 0.0 and col["detected"] == "RED_FOR_INVESTIGATION":
+        elif eps > 0.0 and col["detected"] == MUTANT_DOSE_DETECTED_RED_FOR_INVESTIGATION:
             out.append({
                 "dose_label": col["dose_label"],
                 "eps": eps,
@@ -3773,11 +3868,11 @@ def build_red_proof_summary(red_proof_dose_columns):
         }
         for col in red_proof_dose_columns
     ]
-    if any(col["detected"] == "RED" for col in red_proof_dose_columns):
-        red_proof_verdict = "PROVEN"
+    if any(col["detected"] == MUTANT_DOSE_DETECTED_RED for col in red_proof_dose_columns):
+        red_proof_verdict = RED_PROOF_VERDICT_PROVEN
     else:
         listing = ", ".join(f"{col['dose_label']}={col['detected']}" for col in red_proof_dose_columns)
-        red_proof_verdict = f"NOT_PROVEN ({listing})"
+        red_proof_verdict = f"{RED_PROOF_VERDICT_NOT_PROVEN_PREFIX} ({listing})"
     return red_proof, red_proof_verdict
 
 
@@ -3955,7 +4050,10 @@ def main(argv=None):
                 # ever scheduled, `red_proof_verdict` stays `None` exactly
                 # as before -- nothing to report.
                 if any(is_red_proof_dose_label(col["dose_label"]) for col in dose_columns):
-                    red_proof_verdict = f"NOT_PROVEN (dose set refused before RED-proof evaluation: {exc})"
+                    red_proof_verdict = (
+                        f"{RED_PROOF_VERDICT_NOT_PROVEN_PREFIX} (dose set refused before "
+                        f"RED-proof evaluation: {exc})"
+                    )
             fr_merged["mutant_dose_ladder"] = {
                 "doses": dose_columns,
                 "sensitivity": sensitivity,
@@ -4023,7 +4121,9 @@ def main(argv=None):
                 dose_lines.append(f"  red_proof: {red_proof}")
                 dose_lines.append(f"  red_proof_verdict: {red_proof_verdict}")
             fr_table = fr_table + "\n" + "\n".join(dose_lines)
-            invalid_doses = [c["dose_label"] for c in dose_columns if c["detected"] == "INVALID"]
+            invalid_doses = [
+                c["dose_label"] for c in dose_columns if c["detected"] == MUTANT_DOSE_DETECTED_INVALID
+            ]
             anomalous_doses = [a["dose_label"] for a in dose_anomalies]
             # unit-63 round-14 audit F6: the dose-ladder exit fold is DATA,
             # never four independently-hand-maintained `if` blocks -- each
@@ -4074,7 +4174,8 @@ def main(argv=None):
                     # -- it is the EXPECTED outcome, unlike 'dose_anomalies'
                     # above.
                     "red_proof_verdict",
-                    red_proof_verdict is not None and red_proof_verdict.startswith("NOT_PROVEN"),
+                    red_proof_verdict is not None
+                    and red_proof_verdict.startswith(RED_PROOF_VERDICT_NOT_PROVEN_PREFIX),
                     f"finetune_run_ab mutant-dose-ladder: FAIL — red_proof_verdict={red_proof_verdict!r} "
                     "-- acceptance 5's 'mutant column proven RED' is undischarged by every scheduled "
                     "RED-proof column",

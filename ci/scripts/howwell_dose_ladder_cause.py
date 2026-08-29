@@ -101,6 +101,18 @@ except Exception as _exc:  # pragma: no cover - exercised via subprocess in test
 # cause short-circuits first).
 _ALL_CAUSE_NAMES = list(ab_merge.DOSE_LADDER_EXIT_CAUSE_NAMES) if ab_merge is not None else []
 
+# Unit-63 round-16 audit (identity-completeness, sibling class): the dose
+# column `detected` vocabulary and the `red_proof_verdict` NOT_PROVEN prefix
+# are `ab_merge.py`'s own producer-side constants, imported directly here --
+# never a re-typed literal -- exactly as `DOSE_LADDER_EXIT_CAUSE_NAMES` is
+# above. When the import above failed, there is nothing to read; the
+# import-failure cause short-circuits `dose_ladder_cause` before either
+# constant is ever consulted (same discipline as `_ALL_CAUSE_NAMES` above).
+_MUTANT_DOSE_DETECTED_INVALID = ab_merge.MUTANT_DOSE_DETECTED_INVALID if ab_merge is not None else None
+_RED_PROOF_VERDICT_NOT_PROVEN_PREFIX = (
+    ab_merge.RED_PROOF_VERDICT_NOT_PROVEN_PREFIX if ab_merge is not None else None
+)
+
 
 def _inspect_doses(ladder: dict) -> tuple[list, str | None]:
     """Unit-63 round-14 audit A4: `ladder["doses"]` is a producer/merger
@@ -162,11 +174,16 @@ def dose_ladder_cause(report: dict) -> str:
 
     Unit-63 round-15 audit advisory 3: if the module-level `import ab_merge`
     itself failed, `_AB_MERGE_IMPORT_ERROR` is non-`None` and this function
-    returns that failure as its own named cause immediately, BEFORE touching
-    `report` at all -- same discipline as `_inspect_doses`, degrading a
-    crash surface into legible text rather than letting it propagate to an
-    uncaught exception that `runpod_gpu_howwell.sh`'s own wrapper would
-    collapse into the opaque "unknown (could not inspect ...)" text.
+    returns that failure as its own named cause immediately, before touching
+    the ALREADY-PARSED `report` dict passed in here at all -- same discipline
+    as `_inspect_doses`, degrading a crash surface into legible text rather
+    than letting it propagate to an uncaught exception that
+    `runpod_gpu_howwell.sh`'s own wrapper would collapse into the opaque
+    "unknown (could not inspect ...)" text. This function's own contract
+    starts AFTER `report` has already been read and `json.loads`-parsed by
+    the caller -- reading/parsing the report FILE is `main()`'s own job (see
+    that function's own doc, unit-63 round-16 audit advisory 3, for the
+    file-read hardening this function does not itself provide).
     """
     if _AB_MERGE_IMPORT_ERROR is not None:
         return f"ab_merge_import_failed({_AB_MERGE_IMPORT_ERROR})"
@@ -177,13 +194,13 @@ def dose_ladder_cause(report: dict) -> str:
     doses, doses_malformation = _inspect_doses(ladder)
     if doses_malformation is not None:
         causes.append(doses_malformation)
-    invalid_doses = [c.get("dose_label") for c in doses if c.get("detected") == "INVALID"]
+    invalid_doses = [c.get("dose_label") for c in doses if c.get("detected") == _MUTANT_DOSE_DETECTED_INVALID]
     if invalid_doses:
         causes.append("invalid_doses=" + ",".join(str(d) for d in invalid_doses))
     if ladder.get("dose_anomalies"):
         causes.append("dose_anomalies")
     red_proof_verdict = ladder.get("red_proof_verdict")
-    if isinstance(red_proof_verdict, str) and red_proof_verdict.startswith("NOT_PROVEN"):
+    if isinstance(red_proof_verdict, str) and red_proof_verdict.startswith(_RED_PROOF_VERDICT_NOT_PROVEN_PREFIX):
         causes.append(f"red_proof_verdict={red_proof_verdict}")
     if causes:
         return ",".join(causes)
@@ -192,12 +209,41 @@ def dose_ladder_cause(report: dict) -> str:
 
 
 def main(argv=None) -> int:
+    """Unit-63 round-16 audit advisory 3 (correcting `dose_ladder_cause`'s
+    own docstring, which was read as claiming MORE than it does): opening
+    and `json.loads`-parsing `REPORT_JSON_PATH` is THIS function's own job,
+    not `dose_ladder_cause`'s -- and it used to happen entirely OUTSIDE the
+    named-degradation discipline that function provides, an unreadable file
+    (missing, permission-denied, a directory, ...) or malformed JSON crashed
+    straight into `runpod_gpu_howwell.sh`'s own
+    `2>/dev/null || echo "unknown (could not inspect ...)"` wrapper -- the
+    exact opaque-collapse shape `_AB_MERGE_IMPORT_ERROR`/`_inspect_doses`
+    exist to prevent one layer down, recurring one layer up, and reachable
+    even when `ab_merge` itself imported cleanly (a broken `ab_merge` and an
+    unreadable report are independent failure axes; this hardening covers
+    the report-read axis regardless of the other). The read+parse is now
+    INSIDE the same discipline: a read failure or a JSON parse failure
+    degrades to its own NAMED cause on stdout, exit 0 -- never an uncaught
+    exception, and never silently folded into the generic
+    "unknown (could not inspect ...)" text a genuinely-no-cause-found run
+    also produces.
+    """
     argv = sys.argv[1:] if argv is None else argv
     if len(argv) != 1:
         print("usage: howwell_dose_ladder_cause.py REPORT_JSON_PATH", file=sys.stderr)
         return 2
-    with open(argv[0]) as fh:
-        report = json.load(fh)
+    report_path = argv[0]
+    try:
+        with open(report_path) as fh:
+            report_text = fh.read()
+    except OSError as exc:
+        print(f"report_unreadable({type(exc).__name__}: {exc})")
+        return 0
+    try:
+        report = json.loads(report_text)
+    except json.JSONDecodeError as exc:
+        print(f"report_malformed_json({exc})")
+        return 0
     print(dose_ladder_cause(report))
     return 0
 

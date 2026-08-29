@@ -68,10 +68,17 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 # fail on the very first line of `main()`/`self_test()` that touches
 # `REPO_ROOT`, not silently downstream as an empty findings list that looks
 # identical to "everything is fine".
-assert (REPO_ROOT / "Cargo.toml").is_file(), (
-    f"REPO_ROOT resolved to {REPO_ROOT}, which has no Cargo.toml -- "
-    "parents[N] is wrong for this file's depth under the repo root"
-)
+# Unit-63 round-16 audit advisory 1: an explicit `if`/`raise`, never a bare
+# `assert` -- `assert` is stripped entirely under `python -O`, which would
+# silently disable this exact anti-vacuity guard (the one thing standing
+# between a wrong `parents[N]` and a scan-zero-silently PASS) in exactly the
+# deployment shape that removes the safety net without removing the code
+# path it protects.
+if not (REPO_ROOT / "Cargo.toml").is_file():
+    raise AssertionError(
+        f"REPO_ROOT resolved to {REPO_ROOT}, which has no Cargo.toml -- "
+        "parents[N] is wrong for this file's depth under the repo root"
+    )
 PERF_DIR = REPO_ROOT / "ci" / "scripts" / "perf"
 
 FAKE_VAR_RE = re.compile(r"\b([A-Z][A-Z0-9_]*FAKE[A-Z0-9_]*)\b")

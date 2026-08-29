@@ -94,12 +94,15 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use arrow::array::{Array, StringArray};
+use arrow::compute::cast;
 use arrow::record_batch::RecordBatch;
+use arrow_schema::DataType;
 use jammi_ai::session::InferenceSession;
 use jammi_ai::{Modality, QueryInput, Session};
 use jammi_client::DataClient;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
-use jammi_db::store::vectors::extend_with_keyed_fixed_size_list_f32;
+use jammi_db::store::vectors::extend_with_fixed_size_list_f32;
 use jammi_server::grpc::session::SessionStore;
 use jammi_test_utils::{cookbook_fixture, fixture, test_config};
 use tempfile::TempDir;
@@ -212,14 +215,50 @@ fn local(server: &GpuEngineServer) -> Session {
 
 /// Materialise the `(_row_id, vector)` rows of a `SELECT _row_id, vector FROM
 /// "jammi.<table>" ORDER BY _row_id` result into one flat, row-ordered vector,
-/// keyed by `_row_id`. Shared by both read paths so the same typed downcast
-/// (`extend_with_keyed_fixed_size_list_f32`, the engine's one sanctioned
+/// keyed by `_row_id`. Shared by both read paths so the same typed vector
+/// downcast (`extend_with_fixed_size_list_f32`, the engine's one sanctioned
 /// `FixedSizeList<Float32>` reader) backs the comparison on both sides.
+///
+/// The `_row_id` key column is read Utf8/Utf8View-agnostically: **pod evidence
+/// (K4, a100, tree `48ed4495`)** showed the remote Flight SQL read
+/// materialising `_row_id` as `Utf8View` while the local `Session::sql`
+/// read-back of the same persisted artifact yields plain `Utf8` — DataFusion's
+/// `schema_force_view_types` parquet-reader default applies independently on
+/// each side of the transport. That is a transport/read-path representation
+/// difference, not a logical divergence (both encode the identical row-key
+/// string), so it is normalized here rather than gated: the column is cast to
+/// `Utf8` before the `StringArray` downcast, the same cast-then-downcast
+/// convention `jammi_db::index::exact::exact_vector_search` already uses to
+/// make its `_row_id` read agnostic to `Utf8`/`Utf8View`/`LargeUtf8`. Only the
+/// key's logical string value is compared between read paths; the
+/// `FixedSizeList<Float32>` vector column keeps its unmodified bitwise,
+/// zero-tolerance assertion.
 fn keyed_vectors(table_name: &str, batches: &[RecordBatch]) -> Vec<(String, Vec<f32>)> {
     let mut out = Vec::new();
     for batch in batches {
-        extend_with_keyed_fixed_size_list_f32(batch, table_name, "_row_id", "vector", &mut out)
-            .expect("batch carries _row_id + vector columns");
+        let row_id_col = batch
+            .column_by_name("_row_id")
+            .unwrap_or_else(|| panic!("batch for '{table_name}' carries a _row_id column"));
+        let row_ids = cast(row_id_col, &DataType::Utf8).unwrap_or_else(|err| {
+            panic!("'{table_name}'._row_id could not be cast to Utf8: {err}")
+        });
+        let row_ids = row_ids
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap_or_else(|| panic!("'{table_name}'._row_id is not a Utf8-castable string type"));
+
+        let mut vectors = Vec::with_capacity(row_ids.len());
+        extend_with_fixed_size_list_f32(batch, table_name, "vector", &mut vectors)
+            .expect("batch carries a FixedSizeList<Float32> vector column");
+        assert_eq!(
+            row_ids.len(),
+            vectors.len(),
+            "'{table_name}': one _row_id per vector row"
+        );
+
+        for (row, vector) in vectors.into_iter().enumerate() {
+            out.push((row_ids.value(row).to_string(), vector));
+        }
     }
     out
 }

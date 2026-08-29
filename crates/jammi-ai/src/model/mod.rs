@@ -335,6 +335,99 @@ impl LoadedModel {
         }
     }
 
+    /// The pooling strategy the loaded text-embedding forward path ACTUALLY
+    /// resolved to and applies — the SAME strategy
+    /// `backend::candle::CandleTextForward::forward_pooled` pools with, read
+    /// via `CandleModel::resolved_pooling` (unit-62 F-5': a bench/report
+    /// consumer must read this off the loaded model, never transcribe a
+    /// fixture-declared constant that could silently drift from what actually
+    /// served). `None` when this loaded model has no pooling concept at all
+    /// (a CLAP audio tower, an OpenCLIP text tower whose output is already
+    /// pooled-and-projected, a classification head) or for the ORT backend
+    /// (which does not yet resolve a text-embedding pooling wrapper).
+    pub fn resolved_pooling(&self) -> Option<jammi_encoders::Pooling> {
+        match self {
+            LoadedModel::Candle(m) => m.resolved_pooling(),
+            LoadedModel::Ort(_) => None,
+        }
+    }
+
+    /// The model's content digest (esc-057, K7): a SHA-256 fold of the
+    /// resolved model directory's config / `1_Pooling/config.json` /
+    /// tokenizer / weights bytes, computed once at load time by
+    /// `backend::candle::compute_model_content_digest`. Output-affecting
+    /// (two directories that share one `model_id` but differ in any of those
+    /// bytes must never collide on one `DefinitionHash`), so the
+    /// materialization contract folds it into `ModelIdentity.content_digest`
+    /// alongside `backend_kind` / `compute_precision`.
+    ///
+    /// The ORT backend never actually reaches a loaded state today
+    /// (`OrtBackend::load` unconditionally errors — see `forward`'s identical
+    /// stance below) — there is no local-directory digest to report for it,
+    /// and `ModelContentDigest::Unavailable` is reserved for the
+    /// external-producer import path (a categorically different "no local
+    /// files at all" case), so this returns a typed refusal rather than
+    /// misusing that reason.
+    pub fn content_digest(&self) -> Result<jammi_db::store::manifest::ModelContentDigest> {
+        match self {
+            LoadedModel::Candle(m) => Ok(m.content_digest.clone()),
+            LoadedModel::Ort(_) => Err(JammiError::Inference(
+                "ORT content digest not available in this build".into(),
+            )),
+        }
+    }
+
+    /// Stat-only warm-cache staleness probe (esc-058). `ModelCache::get_or_load`'s
+    /// fast path calls this before handing out the cached `Arc<LoadedModel>` —
+    /// re-`stat`ing (never re-reading) the same file set `content_digest` was
+    /// hashed from at load time and comparing `(len, mtime)` against the
+    /// load-time snapshot.
+    ///
+    /// - `Ok(true)` — unchanged (or nothing local to check — see below):
+    ///   serve from cache.
+    /// - `Ok(false)` — at least one fingerprinted file diverged: the caller
+    ///   must evict the entry and reload rather than serve.
+    /// - `Err` — a fingerprinted file vanished or became unreadable between
+    ///   load and this probe: a typed refusal (K2), never a silent "treat as
+    ///   fresh".
+    ///
+    /// **Honest residual** (see `backend::candle::ModelFingerprint`'s own
+    /// doc): `(len, mtime)` is a staleness TRIPWIRE, not a cryptographic
+    /// guarantee — a same-length, same-mtime content swap is invisible to
+    /// it. `content_digest`, recomputed fresh on every actual reload, remains
+    /// the sole authoritative attestation of the bytes that were hashed;
+    /// this probe only decides WHEN a reload is triggered.
+    ///
+    /// **The guarantee this provides is BOUNDED STALENESS, never per-hit
+    /// freshness (unit-62 design pressure-test, corrected framing).** A call
+    /// that reports `Ok(true)` proves this file set was unchanged AT THE
+    /// INSTANT this probe ran — not that the `Arc<LoadedModel>` the caller
+    /// then goes on to use stays fresh for the duration of that use.
+    /// `ModelCache::get_or_load`'s returned [`ModelGuard`] is never
+    /// revalidated again after this call returns: a mutation landing between
+    /// this probe and the guard's actual forward pass (or landing during a
+    /// long-held guard) is a TOCTOU window this type does not — and
+    /// structurally cannot, being `stat`-only and synchronous with a single
+    /// call — close. Treat every guard as "fresh as of load or last warm-hit
+    /// probe", never "fresh for as long as I hold it." See
+    /// `backend::candle::ModelFingerprint`'s doc for the narrow-contract
+    /// scope this bound additionally sits within (unit 65's classes are
+    /// entirely outside even this bounded guarantee).
+    ///
+    /// The ORT backend never actually reaches a loaded state today (see
+    /// `content_digest`'s doc), and more generally a backend whose
+    /// `content_digest` is `ModelContentDigest::Unavailable` (an
+    /// external-producer model with no local directory at all) has nothing
+    /// on disk that could go stale — for either, this vacuously reports
+    /// fresh rather than refusing, since "no local files to check" is not a
+    /// staleness condition.
+    pub(crate) fn probe_freshness(&self) -> Result<bool> {
+        match self {
+            LoadedModel::Candle(m) => m.fingerprint.probe(),
+            LoadedModel::Ort(_) => Ok(true),
+        }
+    }
+
     /// Estimate GPU memory for one inference batch.
     pub fn estimate_batch_memory(&self, batch_size: usize, seq_len: usize) -> usize {
         match self {
@@ -417,11 +510,105 @@ pub struct ModelGuard {
     /// Shared handle to the loaded model.
     pub model: Arc<LoadedModel>,
     ref_count: Arc<AtomicUsize>,
+    /// Audit round 62, F-3 (reshaped by F-A in round 4): a clone of the SAME
+    /// `Arc<GpuPermit>` the owning `CacheEntry` holds. A `GpuPermit` releases
+    /// its reservation (`GpuScheduler::reserved_memory -= bytes`) only when
+    /// its LAST `Arc` clone drops (`GpuPermit`'s own `Drop`, via `Arc`'s
+    /// refcounting) — so evicting/removing the `CacheEntry` (e.g.
+    /// `ModelCache::get_or_load`'s stale-fingerprint path, or `evict_one`)
+    /// can never decrement `reserved_memory` while a `ModelGuard` still holds
+    /// this model's device tensors resident across a forward pass. The
+    /// pre-F-3 `GpuPermit` was owned solely by `CacheEntry`, so removing the
+    /// entry released the permit unconditionally regardless of any
+    /// outstanding guard — freeing budget for memory that was, in fact,
+    /// still occupied (double-booking).
+    ///
+    /// `Option`-wrapped (F-A, round 4) so `Drop::drop` can release this
+    /// clone — via [`Option::take`] — strictly BEFORE the `ref_count`
+    /// decrement below, rather than relying on Rust's field-declaration-order
+    /// drop (which runs field drops only AFTER the `Drop` impl's body
+    /// returns). Without this reordering, the body's `fetch_sub` could make
+    /// `ref_count == 0` visible to a concurrent `evict_one` while this
+    /// guard's permit clone was still outstanding (the struct field hadn't
+    /// dropped yet) — `evict_one` would then remove the `CacheEntry`, drop
+    /// only ITS clone, and claim `true` (progress) even though the
+    /// reservation was NOT actually released (this clone was still alive).
+    /// Releasing the permit first makes "permit released" happen-before
+    /// "ref_count == 0 is observable", so any `evict_one` that observes
+    /// `ref_count == 0` for this entry is guaranteed the permit clone
+    /// backing this guard is already gone.
+    _gpu_permit: Option<Arc<crate::concurrency::GpuPermit>>,
+    /// Unit 62, closure-audit BLOCK 1 (admission-wake liveness hole): a
+    /// clone of `ModelCache`'s cache-level admission [`tokio::sync::Notify`].
+    ///
+    /// **Why this cannot simply reuse `GpuScheduler`'s own release notify**
+    /// (`GpuPermit::drop`'s `scheduler.notify.notify_waiters()`): that fires
+    /// only when a `GpuPermit`'s LAST `Arc` clone actually drops. But this
+    /// guard's `_gpu_permit` clone is never the last one while its
+    /// `CacheEntry` is still present in the cache — the `CacheEntry` always
+    /// retains its own clone (see `_gpu_permit`'s doc) until something
+    /// explicitly removes the entry. So `ref_count` reaching zero for a
+    /// STILL-CACHED entry — the transition that makes `evict_one` newly
+    /// eligible to reclaim it — is invisible to `GpuScheduler`'s notify: no
+    /// `Arc<GpuPermit>` clone drop event happens at all, only an atomic
+    /// `ref_count` decrement. A waiter parked purely on
+    /// `GpuScheduler::acquire`'s internal wait (or its notify directly) is
+    /// then a permanent liveness hole: budget sized to one resident copy, A
+    /// holds M1's guard, B's `do_load` fails to admit M2, evicts nothing (M1
+    /// has `ref_count == 1`), and parks; A drops its guard, `ref_count` hits
+    /// zero, M1 becomes evictable — but no `GpuPermit` clone ever dropped
+    /// (the `CacheEntry`'s own clone is still live), so `notify_waiters()`
+    /// is never called and B hangs forever.
+    ///
+    /// This field closes that hole: `Drop` notifies it, unconditionally,
+    /// AFTER the `ref_count` decrement below. `ModelCache::do_load`'s
+    /// admission loop registers a `Notified` future on this notify (plus the
+    /// `GpuScheduler`-level one) BEFORE each `try_acquire`/`evict_one` pass,
+    /// so it wakes and re-runs the full admission loop on either transition.
+    /// See `ModelCache::do_load`'s admission loop for the full wake-set
+    /// enumeration.
+    admission_notify: Arc<tokio::sync::Notify>,
+}
+
+impl ModelGuard {
+    /// Construct a guard from its shared handles. Centralised so every
+    /// caller gets the `Some(..)`-wrapped permit uniformly (see
+    /// `_gpu_permit`'s doc for why the wrapping exists).
+    pub(crate) fn new(
+        model: Arc<LoadedModel>,
+        ref_count: Arc<AtomicUsize>,
+        gpu_permit: Arc<crate::concurrency::GpuPermit>,
+        admission_notify: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        Self {
+            model,
+            ref_count,
+            _gpu_permit: Some(gpu_permit),
+            admission_notify,
+        }
+    }
 }
 
 impl Drop for ModelGuard {
     fn drop(&mut self) {
+        // Release the permit clone BEFORE the ref_count decrement becomes
+        // visible (see `_gpu_permit`'s doc) — this ordering is the actual
+        // fix for F-A: it is not merely presentational, it establishes a
+        // happens-before between "this guard's permit clone is gone" and
+        // "ref_count == 0 may be observed by a concurrent evict_one".
+        drop(self._gpu_permit.take());
         self.ref_count.fetch_sub(1, Ordering::Release);
+        // Unit 62, closure-audit BLOCK 1: signal the admission-wake notify
+        // AFTER `ref_count` is visibly decremented, so any admission loop
+        // this wakes observes the up-to-date `ref_count` when it re-checks
+        // `evict_one`'s eligibility condition. Unconditional (every guard
+        // drop signals, not just the one that happens to reach zero) —
+        // spurious wakes only cost a cheap re-check of `try_acquire` +
+        // `evict_one`'s idle scan, never a correctness problem, and a
+        // conditional signal here would have to re-derive the same
+        // "is this really the transition that matters" answer `evict_one`
+        // already computes authoritatively.
+        self.admission_notify.notify_waiters();
     }
 }
 

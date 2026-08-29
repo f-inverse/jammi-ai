@@ -171,6 +171,62 @@ FINETUNE_IDENTITY_FIELDS = (
     "row_lengths",
 )
 
+# THE encode-step identity set (unit-62 E6, docs-ci domain) — mirrors
+# `crates/jammi-bench/src/report.rs`'s `EncodeStepTier::IDENTITY_FIELDS`
+# EXACTLY (that const's own doc names this file's `ENCODE_IDENTITY_FIELDS`
+# as its pinned mirror; `test_identity_fields_subset.py` pins the cardinality
+# on BOTH sides and REDs on a drift on either one). Grown 13 -> 15 (round-3
+# audit F-5'/lead ruling): `checkpoint_pooling_sha256` (NullMeans — "no
+# 1_Pooling/config.json in this model dir") and `device_requested` appended
+# after the original 13, position-stable rather than re-ordered, mirroring
+# the Rust const's own append order exactly.
+#
+# UNLIKE `FINETUNE_IDENTITY_FIELDS` above, this tuple is NOT a subset of a
+# larger Rust const that also folds in provenance/dispatch facts —
+# `EncodeStepTier` keeps its provenance (`device_name`,
+# `kernels_disabled_requested`, `kernels_disabled_fired`, `flash_compiled`,
+# `build_features`, `chunk_size`, `attention_arm`) in its OWN, entirely
+# DISJOINT `PROVENANCE_FIELDS` const (unit-62 CONTRACT.md §E3 — a deliberate
+# design choice, not the `FinetuneStepTier`/`REPORT_IDENTITY_FIELDS`
+# superset-folding shape carried above). `ENCODE_IDENTITY_FIELDS` is
+# therefore compared for SET EQUALITY against
+# `EncodeStepTier::IDENTITY_FIELDS`, never a subset check — see
+# `test_identity_fields_subset.py`'s own `EncodeStepIdentityFieldsTests` for
+# the mechanical assertion.
+#
+# `attention_arm` is FORBIDDEN here (v2 reshape 3 of the unit-62 plan): a
+# dispatched arm is a POST-HOC fact, never knowable before compute, so it can
+# never be a memoization key (K7's own `definition_of`); it is also constant
+# on this eval-only surface by construction (fused attention arms are
+# training-only), which would make it a false determinant even if it were
+# admitted. This module carries no `ENCODE_PROVENANCE_FIELDS` tuple — unlike
+# the Rust side, this file's own existing convention has never declared a
+# standalone provenance tuple for the finetune tier either (provenance is
+# documented prose in `ab_merge.py`'s determinant table, never a
+# machine-compared Python list here), so the encode mirror follows that same
+# convention rather than inventing a new one.
+ENCODE_IDENTITY_FIELDS = (
+    "seed",
+    "batch",
+    "seq",
+    "row_lengths",
+    "compute_precision",
+    "checkpoint_config_sha256",
+    "checkpoint_weights_sha256",
+    "checkpoint_weights_size_bytes",
+    "checkpoint_tokenizer_sha256",
+    "pooling",
+    "normalize",
+    "warmup",
+    "iters_measured",
+    # Round-3 audit additions (F-5'(b)/lead ruling), appended
+    # position-stable rather than re-ordered into the original 13 — mirrors
+    # `EncodeStepTier::IDENTITY_FIELDS`'s own append order exactly.
+    "checkpoint_pooling_sha256",
+    "device_requested",
+)
+
+
 # Identity fields for which a JSON `null` is a legitimate VALUE (compared as
 # such, `null == null` matches) rather than the "present-but-unverifiable"
 # state `ab_merge.leg_identity_fields` otherwise folds into MISSING (the

@@ -3,10 +3,11 @@ use std::collections::HashMap;
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use jammi_db::error::{JammiError, Result};
-use jammi_db::store::manifest::ComputeDevice;
+use jammi_db::store::manifest::{ComputeDevice, ModelContentDigest};
 use jammi_encoders::{
     Bert, BertConfig, DistilBert, DistilBertConfig, ModernBert, ModernBertConfig, Pooling,
 };
+use sha2::Digest;
 
 use jammi_encoders::{
     ClipText, ClipTextConfig, HtsatAudio, HtsatAudioConfig, OpenClipVisionConfig,
@@ -60,6 +61,39 @@ pub(crate) trait CandleTextForward: Send + Sync {
     /// L2-normalizes it; encoders that need a different or model-declared
     /// strategy (the BERT family) or whose `forward_hidden` is already
     /// pooled (e.g. OpenCLIP text) override this directly.
+    ///
+    /// **Pairing rule with [`Self::resolved_pooling`] (audit round 62
+    /// advisory A1, folded round 4)**: this default performs REAL mean
+    /// pooling — a caller that reads [`Self::resolved_pooling`]'s default
+    /// (`None`) after calling this default would wrongly conclude no
+    /// pooling occurred. If you override ONE of these two methods, override
+    /// BOTH, so `resolved_pooling()` always reports the SAME strategy this
+    /// method actually applies.
+    ///
+    /// **A2 correction (audit round 62, adversarial round 6, R5-F2)**: this
+    /// doc previously claimed the three classification wrappers below
+    /// (`*ClassificationForward`) were safe inheriting BOTH trait defaults
+    /// together because `LoadedModel::forward` "never routes
+    /// `ModelTask::TextEmbedding` to a classification-loaded model" — that
+    /// was an ASSUMED invariant, not an ENFORCED one, and it does not hold:
+    /// [`super::super::cache::ModelCache`] keys its warm cache purely on
+    /// [`crate::model::ModelId`] (no [`ModelTask`] on a `CacheEntry`), and neither
+    /// `ModelCache::get_or_load`'s warm-hit path nor `EmbeddingPipeline`
+    /// compares the requesting task against the task the entry was
+    /// originally loaded for. A model loaded once for `Classification` and
+    /// then requested again for `TextEmbedding` against the SAME id
+    /// genuinely reaches this trait's default `forward_pooled` over a
+    /// classification wrapper's softmax-logit `forward_hidden` output —
+    /// mean-pooling class probabilities into a shape/width that has nothing
+    /// to do with an embedding. The three classification wrappers now
+    /// override BOTH this method (a typed refusal —
+    /// `classification_pooling_refusal`) and [`Self::resolved_pooling`]
+    /// (`classification_resolved_pooling`, honestly `None`), so the
+    /// mismatch is refused AT THE SURFACE the moment it is reached, rather
+    /// than assumed unreachable by a routing invariant nothing enforced.
+    /// The cache's id-only key is a separate, known, pre-existing design
+    /// point (whether to rekey on task too) — this refusal closes the
+    /// SAFETY hole without touching that key.
     fn forward_pooled(
         &self,
         input_ids: &Tensor,
@@ -70,6 +104,66 @@ pub(crate) trait CandleTextForward: Send + Sync {
         let hidden = self.forward_hidden(input_ids, attention_mask, encoding, device)?;
         let pooled = mean_pool(&hidden, attention_mask)?;
         l2_normalize(&pooled)
+    }
+
+    /// The pooling strategy [`Self::forward_pooled`] ACTUALLY applies, if
+    /// pooling is a meaningful concept for this encoder at all — `None` for
+    /// a wrapper whose `forward_pooled` bypasses pooling entirely (e.g. the
+    /// OpenCLIP text tower, already-pooled-and-projected) or that doesn't
+    /// pool at all (a classification head). The three BERT-family wrappers
+    /// (`BertForward`/`ModernBertForward`/`DistilBertForward`) override this
+    /// to report the SAME `pooling: Pooling` field `forward_pooled` reads —
+    /// never a second, independently-resolved value (unit-62 F-5': the
+    /// accessor a caller reads must be wired to the value that actually
+    /// determined the served output, the same discipline
+    /// `LoadedModel::compute_precision` already follows). Trait-default
+    /// `None` so a future wrapper doesn't silently claim a pooling strategy
+    /// it doesn't have.
+    ///
+    /// **Pairing rule with [`Self::forward_pooled`] (audit round 62 advisory
+    /// A1, folded round 4)**: `forward_pooled`'s own default is NOT a no-op
+    /// — it mean-pools for real — so this method's `None` default is
+    /// truthful ONLY for a wrapper that never actually reaches
+    /// `forward_pooled`'s default at runtime. A wrapper that inherits
+    /// `forward_pooled`'s default AND is reachable via
+    /// `ModelTask::TextEmbedding` must override THIS method to return
+    /// `Some(Pooling::Mean)` — inheriting both defaults together for a
+    /// wrapper that pooling actually applies to is the exact silent
+    /// mismatch this note exists to prevent. The three classification
+    /// wrappers instead override BOTH methods to refuse the mismatch
+    /// outright rather than inherit either default — see
+    /// [`Self::forward_pooled`]'s A2 correction (R5-F2) for why the
+    /// underlying routing invariant this pairing rule warned about is not
+    /// merely theoretical.
+    fn resolved_pooling(&self) -> Option<Pooling> {
+        None
+    }
+
+    /// Whether [`Self::forward_hidden`] returns classification logits
+    /// (`[batch, num_classes]`, softmax already applied — see the three
+    /// `*ClassificationForward` wrappers below) rather than raw per-token
+    /// hidden states (`[batch, seq_len, hidden_size]`). Trait-default
+    /// `false`: every text-embedding/NER wrapper's `forward_hidden` is the
+    /// raw-hidden-states shape.
+    ///
+    /// **R7-F2 (audit round 62, adversarial round 8 advisory fold)**: the
+    /// mirror of R5-F2's `forward_pooled` refusal, in the OTHER mismatch
+    /// direction. [`super::super::cache::ModelCache`]'s warm cache is keyed
+    /// purely on [`crate::model::ModelId`] (no [`ModelTask`]), so a model
+    /// loaded once for `TextEmbedding` or `Ner` and then requested again for
+    /// `Classification` against the SAME id reaches this same warm entry's
+    /// `forward_hidden` — but many BERT-family checkpoints carry an
+    /// `id2label` map in `config.json` (often the architecture's default
+    /// 2-label declaration) even when loaded for a non-classification task,
+    /// so `CandleModel::forward_classification`'s `id2label.is_some()` guard
+    /// alone does not catch this mismatch. Without this signal,
+    /// `forward_classification` reaches `to_vec2::<f32>()` over a 3-D
+    /// `[batch, seq_len, hidden_size]` tensor it expects to be the 2-D
+    /// `[batch, num_classes]` softmax output, and dies with an opaque candle
+    /// rank error instead of a legible typed refusal — see
+    /// `classification_kind_mismatch_refusal`.
+    fn is_classification_head(&self) -> bool {
+        false
     }
 }
 
@@ -130,6 +224,63 @@ fn pool_via(hidden: &Tensor, attention_mask: &Tensor, strategy: Pooling) -> Resu
         .map_err(|e| JammiError::Inference(format!("pooling failed: {e}")))
 }
 
+/// The typed refusal every classification wrapper's [`CandleTextForward::forward_pooled`]
+/// override returns (audit round 62, adversarial round 6, R5-F2). `forward_pooled`
+/// is [`ModelTask::TextEmbedding`]'s sole entry point — pooling is not a
+/// meaningful operation over a classification head's softmax-logit
+/// `forward_hidden` output, so this refuses rather than silently running
+/// `CandleTextForward::forward_pooled`'s trait-default mean-pool over it
+/// (which either shape-errors, or — worse — mean-pools softmax
+/// probabilities into a confident-wrong "embedding" of the WRONG width).
+///
+/// This closes the gap the pre-fix A1 doc's routing invariant assumed away:
+/// [`super::super::cache::ModelCache`] keys its cache purely on
+/// [`crate::model::ModelId`], carrying no [`ModelTask`] on a warm entry — a caller requesting
+/// `TextEmbedding` against a model id that was actually loaded (by an
+/// earlier caller, or a different task on the same process) for
+/// `Classification` reaches this same warm entry and this same
+/// `forward_pooled` call. The mismatch must be refused HERE, at the one
+/// seam every such call passes through, rather than assumed unreachable by
+/// a doc comment nothing enforces.
+fn classification_pooling_refusal() -> JammiError {
+    JammiError::Inference(
+        "model was loaded for classification; text-embedding pooling is not defined for it".into(),
+    )
+}
+
+/// The [`CandleTextForward::resolved_pooling`] every classification
+/// wrapper overrides to alongside [`classification_pooling_refusal`]
+/// (audit round 62, adversarial round 6, R5-F2): `None` is honest here —
+/// pooling is not merely "unresolved," it is refused outright by
+/// `forward_pooled` above, so there is no strategy to report. Overriding
+/// this explicitly (rather than relying on the trait's `None` default)
+/// keeps the two methods' pairing visible at each classification wrapper's
+/// own `impl` block, matching the discipline the A1 pairing-rule doc
+/// requires of every wrapper that overrides one of this pair.
+fn classification_resolved_pooling() -> Option<Pooling> {
+    None
+}
+
+/// The typed refusal `CandleModel::forward_classification` returns when the
+/// warm text wrapper it is dispatched to is NOT one of the three
+/// `*ClassificationForward` wrappers (`CandleTextForward::is_classification_head`
+/// is `false`) — audit round 62, adversarial round 8 advisory fold (R7-F2),
+/// the mirror of [`classification_pooling_refusal`] in the OTHER direction.
+/// Without this, a `Classification` call against a warm entry that was
+/// actually loaded for `TextEmbedding`/`Ner` (reachable whenever that
+/// checkpoint's `config.json` happens to carry an `id2label` map, which
+/// `forward_classification`'s own presence guard alone does not catch —
+/// see `CandleTextForward::is_classification_head`'s doc) would instead
+/// reach `to_vec2::<f32>()` over a raw `[batch, seq_len, hidden_size]`
+/// hidden-states tensor and die with an opaque candle rank error.
+fn classification_kind_mismatch_refusal() -> JammiError {
+    JammiError::Inference(
+        "model was not loaded for classification; this warm entry's text forward pass does not \
+         produce classification logits"
+            .into(),
+    )
+}
+
 /// BERT-family forward pass (bert, roberta, camembert, xlm-roberta). Carries
 /// the pooling strategy the model's `1_Pooling/config.json` declares (mean
 /// fallback if the file is absent) and pools+normalizes with it.
@@ -164,6 +315,10 @@ impl CandleTextForward for BertForward {
     ) -> Result<Tensor> {
         let hidden = self.forward_hidden(input_ids, attention_mask, encoding, device)?;
         pool_via(&hidden, attention_mask, self.pooling)
+    }
+
+    fn resolved_pooling(&self) -> Option<Pooling> {
+        Some(self.pooling)
     }
 }
 
@@ -202,6 +357,10 @@ impl CandleTextForward for ModernBertForward {
         let hidden = self.forward_hidden(input_ids, attention_mask, encoding, device)?;
         pool_via(&hidden, attention_mask, self.pooling)
     }
+
+    fn resolved_pooling(&self) -> Option<Pooling> {
+        Some(self.pooling)
+    }
 }
 
 /// DistilBERT forward pass (no token_type_ids, different architecture from
@@ -239,6 +398,10 @@ impl CandleTextForward for DistilBertForward {
     ) -> Result<Tensor> {
         let hidden = self.forward_hidden(input_ids, attention_mask, encoding, device)?;
         pool_via(&hidden, attention_mask, self.pooling)
+    }
+
+    fn resolved_pooling(&self) -> Option<Pooling> {
+        Some(self.pooling)
     }
 }
 
@@ -283,6 +446,24 @@ impl CandleTextForward for DistilBertClassificationForward {
         candle_nn::ops::softmax(&logits, candle_core::D::Minus1)
             .map_err(|e| JammiError::Inference(format!("Softmax failed: {e}")))
     }
+
+    fn forward_pooled(
+        &self,
+        _input_ids: &Tensor,
+        _attention_mask: &Tensor,
+        _encoding: &BatchEncoding,
+        _device: &Device,
+    ) -> Result<Tensor> {
+        Err(classification_pooling_refusal())
+    }
+
+    fn resolved_pooling(&self) -> Option<Pooling> {
+        classification_resolved_pooling()
+    }
+
+    fn is_classification_head(&self) -> bool {
+        true
+    }
 }
 
 /// ModernBERT sequence classification forward pass.
@@ -306,6 +487,24 @@ impl CandleTextForward for ModernBertClassificationForward {
         })?;
         candle_nn::ops::softmax(&logits, candle_core::D::Minus1)
             .map_err(|e| JammiError::Inference(format!("Softmax failed: {e}")))
+    }
+
+    fn forward_pooled(
+        &self,
+        _input_ids: &Tensor,
+        _attention_mask: &Tensor,
+        _encoding: &BatchEncoding,
+        _device: &Device,
+    ) -> Result<Tensor> {
+        Err(classification_pooling_refusal())
+    }
+
+    fn resolved_pooling(&self) -> Option<Pooling> {
+        classification_resolved_pooling()
+    }
+
+    fn is_classification_head(&self) -> bool {
+        true
     }
 }
 
@@ -345,6 +544,24 @@ impl CandleTextForward for BertClassificationForward {
             .map_err(|e| JammiError::Inference(format!("Classifier forward failed: {e}")))?;
         candle_nn::ops::softmax(&logits, candle_core::D::Minus1)
             .map_err(|e| JammiError::Inference(format!("Softmax failed: {e}")))
+    }
+
+    fn forward_pooled(
+        &self,
+        _input_ids: &Tensor,
+        _attention_mask: &Tensor,
+        _encoding: &BatchEncoding,
+        _device: &Device,
+    ) -> Result<Tensor> {
+        Err(classification_pooling_refusal())
+    }
+
+    fn resolved_pooling(&self) -> Option<Pooling> {
+        classification_resolved_pooling()
+    }
+
+    fn is_classification_head(&self) -> bool {
+        true
     }
 }
 
@@ -400,6 +617,23 @@ pub struct CandleModel {
     /// `effective_precision` in `CandleBackend::load`). Output-affecting, so
     /// the materialization contract folds it into `ModelIdentity`.
     pub(crate) compute_precision: jammi_numerics::ComputePrecision,
+    /// The model's content digest (esc-057, K7): a SHA-256 fold of the
+    /// resolved model directory's `config.json` / `1_Pooling/config.json` /
+    /// tokenizer / weights bytes, computed once here by
+    /// [`compute_model_content_digest`] and carried through unchanged. See
+    /// that function for the exact input set and ordering. Output-affecting
+    /// (two directories that share one `model_id` but differ in any of those
+    /// bytes must never collide on one `DefinitionHash`), so the
+    /// materialization contract folds it into `ModelIdentity.content_digest`.
+    pub(crate) content_digest: ModelContentDigest,
+    /// The load-time `stat`-only staleness fingerprint (esc-058) over the
+    /// same input set `content_digest` was hashed from, computed once here
+    /// by [`compute_model_fingerprint`] and re-probed on every warm
+    /// `ModelCache::get_or_load` hit via [`ModelFingerprint::probe`]. See
+    /// that type's doc for the exact guarantee (a tripwire, not a
+    /// cryptographic one) and [`compute_model_fingerprint`] for the input
+    /// set.
+    pub(crate) fingerprint: ModelFingerprint,
 }
 
 /// Mean-pool the `[batch, seq, hidden]` tensor along seq using
@@ -540,6 +774,947 @@ fn pooling_from_config(cfg: Option<&serde_json::Value>, model_id: &str) -> Resul
     Ok(distinct[0])
 }
 
+/// Streaming SHA-256 (hex-encoded) of `path`'s raw bytes, plus the byte
+/// length — a bounded-size buffer, never `std::fs::read`'s whole-file `Vec`:
+/// a real checkpoint's `model.safetensors` can be several GB, and loading it
+/// entirely into memory just to hash it would roughly double this call's
+/// peak RSS for no reason — the hasher only ever needs the current chunk.
+///
+/// This is the SOLE hashing routine [`compute_model_content_digest`] calls
+/// for every input file (config, `1_Pooling/config.json`, tokenizer,
+/// weights) — never a second, independently-drifting implementation.
+/// `jammi-bench` carries an function-identical streaming pattern
+/// (`crates/jammi-bench/src/finetune_step.rs::sha256_and_len`) for its own
+/// checkpoint-identity hashing, but `jammi-bench` depends on `jammi-ai` (not
+/// the reverse), so that implementation cannot be imported here — this is an
+/// independent copy of the same technique, not a divergent one.
+fn sha256_and_len(path: &std::path::Path) -> Result<(String, u64)> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path).map_err(|e| JammiError::Model {
+        model_id: path.display().to_string(),
+        message: format!("failed to open {path:?} for content-digest hashing: {e}"),
+    })?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut hasher = sha2::Sha256::new();
+    // 64 KiB: large enough to amortize per-read syscall overhead, small
+    // enough that this function's own peak RSS contribution stays negligible
+    // regardless of the file's total size.
+    let mut buf = [0u8; 65536];
+    let mut total_len: u64 = 0;
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| JammiError::Model {
+            model_id: path.display().to_string(),
+            message: format!("failed to read {path:?} for content-digest hashing: {e}"),
+        })?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total_len += n as u64;
+    }
+    Ok((hex::encode(hasher.finalize()), total_len))
+}
+
+/// Compute a resolved model's content digest (esc-057, K7): the
+/// [`ModelIdentity`](jammi_db::store::manifest::ModelIdentity) determinant
+/// that closes the defect where `model_id` alone did not change when the
+/// referenced directory's `1_Pooling/config.json`, tokenizer, or weights
+/// bytes changed. Called ONCE per model load, from
+/// [`compute_model_identity_facets`] — see that function's doc for the
+/// ordering invariant (audit round 62, F-4''): this MUST run AFTER
+/// [`compute_model_fingerprint`], never before, and never independently
+/// from a production call site. A future edit that reorders the two calls
+/// (or adds a second call site to either) breaks the invariant silently
+/// unless it also edits `compute_model_identity_facets`'s doc — review
+/// should treat any diff touching that ordering as load-bearing.
+///
+/// **Input set** — every file whose bytes are output-affecting relative to
+/// the bare `model_id` string: `resolved.config_path` (`config.json` or
+/// `open_clip_config.json`), `1_Pooling/config.json` when
+/// `resolved.pooling_config` is `Some` (mirrors exactly the presence check
+/// `pooling_from_config` itself gates on, so the digest never hashes a file
+/// the loader did not actually read), `preprocessor_config.json` when
+/// `resolved.preprocessor_config` is `Some` (audit round 62, F-2: the CLAP
+/// audio tower reads its whole feature-extractor geometry from it — the
+/// identical reconstruction pattern as `1_Pooling/config.json`),
+/// `resolved.tokenizer`'s file when present, every path in
+/// `resolved.weights_paths`, and — when `resolved.adapter_path` is `Some`
+/// — the fine-tune adapter's own `adapter_config.json` /
+/// `adapter.safetensors` pair (audit round 62, F-1), gated by the IDENTICAL
+/// presence check [`CandleBackend::load`] itself applies before reading them
+/// (`adapter_config.json` and `adapter.safetensors` both exist under
+/// `adapter_path`) — never hashing a file the loader did not actually read,
+/// and never silently omitting one it did.
+///
+/// **Ordering** — entries are sorted by their RELATIVE path, lexicographically
+/// by UTF-8 bytes. NOT filesystem/readdir order (unspecified across platforms
+/// and mtimes) and NOT construction order — so the digest is reproducible
+/// across hosts and process runs regardless of how the resolver assembled
+/// `resolved.weights_paths`. Every entry is expressed relative to ONE of two
+/// fixed anchor directories: the resolved model directory
+/// (`resolved.config_path`'s parent) for config/pooling/preprocessor/
+/// tokenizer/weights, or `resolved.adapter_path` (prefixed `adapter/`, so it
+/// can never collide with a model-dir-anchored relpath of the same name) for
+/// the adapter pair — never an absolute, host-specific path. A candidate that
+/// cannot be expressed relative to its own anchor (every path this engine
+/// resolves today is always a child of one of the two anchors, so this is
+/// unreachable in production) is a typed refusal rather than a silent
+/// absolute-path fallback: folding an absolute path into a digest documented
+/// to be reproducible across hosts would make that claim false the moment two
+/// hosts mounted the SAME model content under different paths.
+///
+/// **Combination** — each sorted entry is hashed once via [`sha256_and_len`]
+/// (the same streaming routine for every input, never duplicated), then
+/// folds its relative-path string, its own hex digest, and its byte length
+/// into one outer SHA-256 as a canonical `"{relpath}\0{hex}\0{len}\n"`
+/// record. The NUL/newline framing makes the combined digest unambiguous — a
+/// path cannot silently absorb bytes from an adjacent record.
+///
+/// **Errors are typed refusals (K2)** — an IO failure while hashing (a file
+/// vanishing between resolve and load, a permission error, a truncated read)
+/// propagates as a `JammiError`, never silently collapsing into
+/// [`ModelContentDigest::Unavailable`]. `Unavailable` is reserved for the
+/// external-producer import path (`pipeline::import`), which has no local
+/// model directory to hash at all — a categorically different case from "the
+/// loader tried to hash local files and failed."
+fn content_digest_entries(resolved: &ResolvedModel) -> Result<Vec<(String, std::path::PathBuf)>> {
+    let mut gated: Vec<(String, std::path::PathBuf)> = all_candidate_paths(resolved)?
+        .into_iter()
+        .flat_map(|slot| slot.arms.into_iter())
+        .filter(|arm| arm.gated)
+        .map(|arm| (arm.rel, arm.path))
+        .collect();
+    gated.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(gated)
+}
+
+/// One arm within a [`DigestSlot`] — a single candidate filename the
+/// resolver's own preference chain considers for that slot, anchored the
+/// same way every other candidate is (see [`all_candidate_paths`]'s
+/// rel/anchor machinery). `gated` mirrors the pre-reshape `DigestCandidate`'s
+/// per-file flag: whether the resolver actually SELECTED this specific arm
+/// for the CURRENT load — i.e. whether [`content_digest_entries`] hashes it.
+/// At most one arm is EVER gated within any given [`DigestSlot`] — every
+/// slot models mutually SUBSTITUTABLE alternates only (the config/tokenizer
+/// slots' resolver chain picks exactly one filename; the weights slot's
+/// three named arms — `model.safetensors` / `open_clip_model.safetensors` /
+/// `model.onnx` — are likewise alternates, never a set the loader needs
+/// jointly). A sharded HF download's shard files are each their OWN
+/// single-arm, always-gated, `absence_tolerated: false` slot (audit round
+/// 62, adversarial round 12) — never additional arms folded into the
+/// weights slot above, because a shard is CONJUNCTIVELY required (every
+/// shard must be present for `VarBuilder::from_mmaped_safetensors` to
+/// succeed) rather than a disjunctive alternate a cold resolve could pick
+/// one of. See [`all_candidate_paths`]'s weights-slot construction for the
+/// full reasoning and the primary-file edge this closes.
+struct SlotArm {
+    rel: String,
+    path: std::path::PathBuf,
+    gated: bool,
+}
+
+/// A resolver preference-chain SLOT (audit round 62, adversarial round 10 —
+/// "the terminal class closure", exhaustively enumerated over
+/// `all_candidate_paths` and all four resolver paths): every arm the
+/// resolver's OWN chain considers for one logical file, grouped together —
+/// replacing the earlier flat `DigestCandidate` list, whose per-file
+/// `optional: bool` could only describe ONE file in isolation. Two blind
+/// spots this closes, both real for the config slot (`config.json` /
+/// `open_clip_config.json`) and the weights slot (`model.safetensors` /
+/// `open_clip_model.safetensors` / `model.onnx`):
+///
+/// 1. **An unselected arm's appearance was untracked.** The pre-reshape flat
+///    list fingerprinted only the ONE arm the resolver actually selected for
+///    THIS load — so a NEW file appearing in a currently-unselected arm
+///    (`open_clip_config.json` appearing next to an existing `config.json`;
+///    `model.onnx` appearing next to `model.safetensors`, which ALSO flips
+///    the backend a COLD resolve would pick — `resolve_local` prefers ORT
+///    the instant `model.onnx` exists) never touched any tracked
+///    `(len, mtime)`, and `probe` reported fresh forever even though a cold
+///    reload might now pick a different arm, or a different backend
+///    entirely. (The tokenizer slot already closed its own version of this
+///    hole in round 8, via ad-hoc dual candidates — folded into this same
+///    slot shape here for uniformity, see [`all_candidate_paths`].)
+/// 2. **A flat `optional: bool` cannot express "required unless an
+///    alternate exists".** The selected arm's OWN deletion, with an
+///    alternate arm already present on disk, is not a hard failure — a cold
+///    resolve would simply pick the alternate — but the old binary
+///    optional/required flag could only ever mark the whole candidate
+///    always-stale or always-refuse, never "refuse only once every arm is
+///    gone."
+///
+/// [`ModelFingerprint::probe`] tracks EVERY arm of every slot (present ->
+/// `(len, mtime)`, absent -> a marker) and treats ANY arm's snapshot
+/// changing — in EITHER direction — as staleness for that slot, refusing
+/// (arm c) only when the slot as a whole cannot satisfy a cold resolve; see
+/// [`Self::absence_tolerated`] and [`ModelFingerprint::probe`]'s own doc for
+/// the full per-slot lattice.
+struct DigestSlot {
+    arms: Vec<SlotArm>,
+    /// `true` when the loader accepts EVERY arm of this slot being absent —
+    /// today, only the tokenizer: every resolver path already re-derives
+    /// `None` on total absence and `CandleBackend::load`'s `.transpose()?`
+    /// accepts it, so [`ModelFingerprint::probe`] never refuses for this
+    /// slot, only ever reports stale. `false` for a slot the loader has NO
+    /// fallback for once every arm is gone (config, weights, the adapter
+    /// pair, and — per-class — `preprocessor_config.json` on an HF-CLAP
+    /// audio model, via [`preprocessor_config_is_required`]): `probe`
+    /// refuses (arm c) ONLY in that all-arms-absent case, never merely
+    /// because the arm THIS load happened to select vanished while a
+    /// still-present alternate arm would let a cold resolve succeed.
+    absence_tolerated: bool,
+}
+
+/// Enumerate the FULL candidate SLOT set both [`content_digest_entries`]
+/// (hashes the bytes of each slot's `gated` arm(s) only) and
+/// [`compute_model_fingerprint`] (esc-058 F-4b, `stat`s every arm of every
+/// slot, including absent ones, so a later APPEARANCE on ANY arm is
+/// detectable) walk — the SAME set, computed by this ONE function, so the
+/// two can never drift from each other. See [`compute_model_content_digest`]
+/// for exactly which files this is, why, and the ordering/anchoring
+/// guarantee; see [`DigestSlot`]'s doc for why candidates are grouped into
+/// slots-with-alternates rather than a flat per-file list.
+fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestSlot>> {
+    struct RawArm {
+        path: std::path::PathBuf,
+        anchor: std::path::PathBuf,
+        gated: bool,
+    }
+    struct RawSlot {
+        arms: Vec<RawArm>,
+        absence_tolerated: bool,
+    }
+
+    let model_dir = resolved
+        .config_path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    let mut slots: Vec<RawSlot> = Vec::new();
+
+    // Config slot (audit round 62, adversarial round 10): the resolver's OWN
+    // `config.json` / `open_clip_config.json` preference chain
+    // (`try_catalog_lookup`, `resolve_local`, `resolve_hf_hub` — every path
+    // checks `config.json` first, `open_clip_config.json` second;
+    // resolver.rs:135-137/223-225/327). `resolved.config_path` names
+    // whichever arm was actually selected for THIS load; the OTHER arm is
+    // still a tracked candidate so its appearance is detectable and a cold
+    // resolve preferring it is never silently masked. Required unless an
+    // alternate exists: a reload can only succeed while AT LEAST ONE of the
+    // two is present.
+    slots.push(RawSlot {
+        arms: ["config.json", "open_clip_config.json"]
+            .into_iter()
+            .map(|name| {
+                let path = model_dir.join(name);
+                RawArm {
+                    gated: path == resolved.config_path,
+                    path,
+                    anchor: model_dir.clone(),
+                }
+            })
+            .collect(),
+        absence_tolerated: false,
+    });
+
+    // `1_Pooling/config.json`: gated for the digest by whether the resolver
+    // actually read one — the identical presence test `pooling_from_config`
+    // gates its mean-fallback on — but always a CANDIDATE for the
+    // fingerprint (F-4b: appearance must be detectable). Absence is always
+    // tolerated (F-4'): a load-time-present, now-deleted config file here
+    // means a reload legitimately succeeds via the mean-pooling fallback.
+    slots.push(RawSlot {
+        arms: vec![RawArm {
+            path: model_dir.join("1_Pooling/config.json"),
+            anchor: model_dir.clone(),
+            gated: resolved.pooling_config.is_some(),
+        }],
+        absence_tolerated: true,
+    });
+
+    // `preprocessor_config.json` (F-2): same CANDIDATE pattern as
+    // `1_Pooling/config.json` above, but its absence-tolerance is PER-CLASS,
+    // not fixed (audit round 62, F-B) — see
+    // [`preprocessor_config_is_required`]'s doc.
+    slots.push(RawSlot {
+        arms: vec![RawArm {
+            path: model_dir.join("preprocessor_config.json"),
+            anchor: model_dir.clone(),
+            gated: resolved.preprocessor_config.is_some(),
+        }],
+        absence_tolerated: !preprocessor_config_is_required(resolved),
+    });
+
+    // The tokenizer slot (audit round 62, adversarial round 6, R5-F1; round
+    // 8, R7-F1; migrated into this uniform [`DigestSlot`] shape in round
+    // 10): NOT required, despite the pre-R5-F1 comment's claim that "the
+    // loader has no fallback" — every resolver path (`discover_local_tokenizer`
+    // locally, resolver.rs:504-514; the HF Hub `tokenizer.json` /
+    // `bpe_simple_vocab_16e6.txt.gz` fallback chain remotely, resolver.rs:379-387)
+    // already re-derives `tokenizer: None` when NEITHER file is present
+    // instead of erroring, and `CandleBackend::load`'s `.transpose()?` over
+    // that `Option` accepts `None`: the reload succeeds with
+    // `self.tokenizer == None`, matching cold-process semantics exactly. A
+    // text-encoding call fails LATER with that path's own typed error ("No
+    // tokenizer loaded for ... model") at USE time, not at load time; a CLAP
+    // audio model's `forward_audio_embedding` never reads `self.tokenizer`
+    // at all, so it serves unaffected. `absence_tolerated: true` — the ONLY
+    // slot for which this holds unconditionally, regardless of how many
+    // arms are gone.
+    //
+    // R7-F1: both filenames the resolver's preference chain considers —
+    // `tokenizer.json` (checked first) and `bpe_simple_vocab_16e6.txt.gz`
+    // (the OpenCLIP fallback) — are UNCONDITIONAL arms of this ONE slot,
+    // anchored under `model_dir`, exactly mirroring the `1_Pooling`/
+    // `preprocessor` pattern above. `gated` is true for whichever arm
+    // `resolved.tokenizer` actually names (using its own path, so the
+    // anchor-mismatch refusal below still fires if that path is ever outside
+    // `model_dir`) and the digest keeps hashing only the file the loader
+    // actually read; the OTHER arm — and BOTH arms when `resolved.tokenizer`
+    // is `None` — carries an absent-marker path (`model_dir.join(name)`),
+    // `gated: false`, so `compute_model_fingerprint` still records its
+    // `None` snapshot and a later appearance of either file trips `probe`.
+    let tokenizer_json_default = model_dir.join("tokenizer.json");
+    let tokenizer_bpe_default = model_dir.join("bpe_simple_vocab_16e6.txt.gz");
+    let (json_path, json_gated, bpe_path, bpe_gated) = match &resolved.tokenizer {
+        Some(TokenizerSource::HuggingFaceJson(p)) => {
+            (p.clone(), true, tokenizer_bpe_default, false)
+        }
+        Some(TokenizerSource::OpenClipBpe(p)) => (tokenizer_json_default, false, p.clone(), true),
+        None => (tokenizer_json_default, false, tokenizer_bpe_default, false),
+    };
+    slots.push(RawSlot {
+        arms: vec![
+            RawArm {
+                path: json_path,
+                anchor: model_dir.clone(),
+                gated: json_gated,
+            },
+            RawArm {
+                path: bpe_path,
+                anchor: model_dir.clone(),
+                gated: bpe_gated,
+            },
+        ],
+        absence_tolerated: true,
+    });
+
+    // Weights ALTERNATES slot (audit round 62, adversarial round 10; reshaped
+    // in round 12 — F-1): the resolver's OWN `model.safetensors` /
+    // `open_clip_model.safetensors` / `model.onnx` preference chain
+    // (`try_catalog_lookup`, resolver.rs:160-162; `resolve_local`'s
+    // `has_onnx`/`has_safetensors` backend auto-selection,
+    // resolver.rs:240/251-255/261-263/273-274; `download_safetensors`'s two
+    // single-name tries, resolver.rs:426-431). Every known filename is a
+    // tracked arm regardless of which one THIS load actually selected —
+    // `model.onnx` APPEARING next to a currently-loaded `model.safetensors`
+    // is exactly the case that flips the backend a cold resolve would choose
+    // (`resolve_local` prefers ORT the instant `has_onnx` is true), so its
+    // appearance must be just as detectable as its own disappearance. This
+    // slot models ONLY these three mutually SUBSTITUTABLE named alternates —
+    // a cold resolve picks exactly one of them — never a sharded download's
+    // extra files (see the per-shard slots pushed separately, immediately
+    // below, and F-1's fix for why folding them in here was wrong).
+    //
+    // **Primary-file edge (round 12)**: `download_safetensors` returns as
+    // soon as EITHER single-name `repo.get` succeeds (resolver.rs:426-431),
+    // WITHOUT ever enumerating shards — so whenever `resolved.weights_paths`
+    // has a single entry matching one of the three names below, that is the
+    // gated arm of THIS slot, exactly as before. The shard-enumeration
+    // branch (resolver.rs:432-442) is reached only once BOTH single-name
+    // tries fail, and HF's sharded convention names shards
+    // `model-NNNNN-of-MMMMM.safetensors` — never literally `model.safetensors`
+    // — so in that state `resolved.weights_paths` names NO known primary at
+    // all: every arm of this slot is honestly `gated: false` (and, on disk,
+    // absent), and every entry becomes its own per-shard slot below instead.
+    // Both states are handled uniformly by the same per-entry name check
+    // (never keyed on the entry's ORDER within `weights_paths`), so a
+    // hypothetical future mixed shape (a named primary alongside extra
+    // shard-like entries) would still be classified honestly rather than by
+    // accident.
+    //
+    // **Honest residual (round 12) — this slot is `backend_hint`-blind.**
+    // `DigestSlot`/`probe` decide arm (b) "stale, a cold resolve would
+    // succeed via the alternate" purely from which named files exist on
+    // disk — they never see the `backend_hint` the ORIGINAL `get_or_load`
+    // call was made with. `resolve_local` (resolver.rs:251-270), when
+    // `backend_hint == Some(Candle)`, pins `backend` to `Candle`
+    // UNCONDITIONALLY and never falls back to `model.onnx` even if it
+    // exists (`resolve_local`'s ORT auto-pick, resolver.rs:251-255, applies
+    // ONLY when `backend_hint` is `None`) — so `model.safetensors` deleted
+    // while an ungated `model.onnx` sits alongside it, under a Candle-pinned
+    // load, is a case where THIS slot still reports arm (b) `Ok(false)`
+    // stale (an arm — `model.onnx` — is present now), even though a cold
+    // `resolve_local` call carrying that SAME `backend_hint` would hit the
+    // typed refusal at resolver.rs:266-270 ("No safetensors weights found
+    // for Candle backend"), not succeed via a different backend. The probe
+    // therefore does not itself refuse here, contrary to arm (c)'s contract
+    // doc above ("no arm can satisfy a cold resolve" -> `Err`) — this is
+    // arm (b) by the slot's own on-disk-only view, whether or not the
+    // RECORDED hint would actually doom the reload.
+    //
+    // This is deliberately left undetected rather than plumbing
+    // `backend_hint` into `ResolvedModel`/`ModelFingerprint` (a
+    // shared-declaration change out of this fix's scope): the reported
+    // "stale" verdict is not a silent wrong-answer — `ModelCache::get_or_load`
+    // (cache.rs) evicts on `Ok(false)` and falls through to `do_load`, which
+    // calls `self.resolver.resolve(source, task, backend_hint)` with the
+    // SAME `backend_hint` this `get_or_load` invocation was itself called
+    // with (the hint is a parameter of the whole retry loop, not something
+    // `probe` re-derives) — so the reload immediately hits the identical
+    // typed refusal a direct probe-time `Err` would have produced, one hop
+    // later, surfaced to the SAME caller as the SAME typed `JammiError`.
+    // The only externally observable difference from a hypothetical
+    // hint-aware `Err` here is that the stale `CacheEntry` is evicted before
+    // the reload's refusal — strictly conservative (never serves the
+    // now-incomplete entry again) and not a correctness gap. A caller that
+    // varies `backend_hint` across calls for the SAME model id (not done by
+    // any call site in this codebase today) could observe a DIFFERENT
+    // backend's reload attempt than the one that built this fingerprint —
+    // that cross-hint interaction predates this fix and is a property of
+    // `get_or_load`'s per-call `backend_hint` parameter, not of this slot.
+    let known_weight_names = [
+        "model.safetensors",
+        "open_clip_model.safetensors",
+        "model.onnx",
+    ];
+    let weight_arms: Vec<RawArm> = known_weight_names
+        .into_iter()
+        .map(|name| {
+            let path = model_dir.join(name);
+            let gated = resolved.weights_paths.iter().any(|w| w == &path);
+            RawArm {
+                gated,
+                path,
+                anchor: model_dir.clone(),
+            }
+        })
+        .collect();
+    slots.push(RawSlot {
+        arms: weight_arms,
+        absence_tolerated: false,
+    });
+
+    // Per-shard weights slots (audit round 62, adversarial round 12 — F-1,
+    // the fix for the round-10 reshape's own bug): a sharded HF download
+    // (`download_safetensors`'s shard fallback, resolver.rs:432-442) names
+    // files OUTSIDE the fixed three-name set entirely, and — unlike the
+    // three named arms above, which are mutually substitutable — every
+    // shard is CONJUNCTIVELY required: `VarBuilder::from_mmaped_safetensors`
+    // (candle.rs:2382) needs ALL of them, and a cold resolve always
+    // re-fetches the SAME shard set (resolver.rs:432-442 collects every
+    // `.safetensors` sibling deterministically), so any ONE shard's own
+    // loss makes a cold resolve fail regardless of the other shards' — or
+    // the three named arms' — state. Folding a shard into the alternates
+    // slot above (the pre-round-12 shape) modeled it as just another
+    // DISJUNCTIVE arm: deleting one shard while a sibling shard (or a named
+    // arm) happened to still exist made `probe` report merely STALE
+    // (`Ok(false)`) instead of the typed refusal a cold resolve of the SAME
+    // now-incomplete shard set would actually hit. Each shard therefore gets
+    // its OWN single-arm, always-gated, `absence_tolerated: false` slot —
+    // losing it reaches the typed refusal (arm c) exactly the way losing the
+    // sole `model.safetensors` does, never the alternates slot's
+    // (b)-stale/(c)-refuse decision, which is keyed on the WRONG set of
+    // arms for a conjunctive requirement.
+    for weights in &resolved.weights_paths {
+        if known_weight_names
+            .iter()
+            .all(|name| weights != &model_dir.join(name))
+        {
+            slots.push(RawSlot {
+                arms: vec![RawArm {
+                    path: weights.clone(),
+                    anchor: model_dir.clone(),
+                    gated: true,
+                }],
+                absence_tolerated: false,
+            });
+        }
+    }
+
+    // The fine-tune adapter's own pair (F-1): two independent required
+    // files that are never alternates of each other, so each is its own
+    // degenerate single-arm slot — anchored at `adapter_path` itself, NOT
+    // the base model's directory, which the adapter's files never live
+    // under (the resolver fetches them from the artifact store into their
+    // own directory) — gated by the SAME presence check `CandleBackend::load`
+    // applies (its `saved_adapter` read block, below) before reading them,
+    // so this candidate set can never drift from what the loader actually
+    // reads. `absence_tolerated: false` — once `adapter_path` is `Some`,
+    // the loader has no unadapted-fallback and refuses outright on either
+    // file's absence (see
+    // `candle_backend_load_refuses_some_adapter_path_missing_files` below),
+    // so a reload after either file vanishes fails identically.
+    if let Some(adapter_dir) = &resolved.adapter_path {
+        let cfg_path = adapter_dir.join("adapter_config.json");
+        let weights_path = adapter_dir.join("adapter.safetensors");
+        let gated = cfg_path.exists() && weights_path.exists();
+        slots.push(RawSlot {
+            arms: vec![RawArm {
+                path: cfg_path,
+                anchor: adapter_dir.clone(),
+                gated,
+            }],
+            absence_tolerated: false,
+        });
+        slots.push(RawSlot {
+            arms: vec![RawArm {
+                path: weights_path,
+                anchor: adapter_dir.clone(),
+                gated,
+            }],
+            absence_tolerated: false,
+        });
+    }
+
+    let mut result: Vec<DigestSlot> = Vec::with_capacity(slots.len());
+    for slot in slots {
+        let mut arms = Vec::with_capacity(slot.arms.len());
+        for arm in slot.arms {
+            let rel = arm
+                .path
+                .strip_prefix(&arm.anchor)
+                .map_err(|_| JammiError::Model {
+                    model_id: resolved.model_id.0.clone(),
+                    message: format!(
+                        "content-digest enumeration: {:?} is not nested under its expected \
+                         anchor directory {:?} — every path this engine resolves today is \
+                         always a child of its own anchor (the model directory, or the \
+                         adapter directory), so this is a genuinely unexpected resolved-model \
+                         shape; refusing rather than silently folding an ABSOLUTE, \
+                         host-specific path into a digest documented to be reproducible \
+                         across hosts",
+                        arm.path, arm.anchor
+                    ),
+                })?;
+            let rel_string = if arm.anchor == model_dir {
+                rel.to_string_lossy().into_owned()
+            } else {
+                format!("adapter/{}", rel.to_string_lossy())
+            };
+            arms.push(SlotArm {
+                rel: rel_string,
+                path: arm.path,
+                gated: arm.gated,
+            });
+        }
+        result.push(DigestSlot {
+            arms,
+            absence_tolerated: slot.absence_tolerated,
+        });
+    }
+    Ok(result)
+}
+
+fn compute_model_content_digest(resolved: &ResolvedModel) -> Result<ModelContentDigest> {
+    let entries = content_digest_entries(resolved)?;
+
+    let mut combined = sha2::Sha256::new();
+    for (rel, path) in &entries {
+        let (hex_digest, len) = sha256_and_len(path)?;
+        combined.update(rel.as_bytes());
+        combined.update([0u8]);
+        combined.update(hex_digest.as_bytes());
+        combined.update([0u8]);
+        combined.update(len.to_string().as_bytes());
+        combined.update([b'\n']);
+    }
+
+    Ok(ModelContentDigest::Sha256(hex::encode(combined.finalize())))
+}
+
+/// A `stat`-only on-disk staleness fingerprint (esc-058) of the SAME input
+/// file set [`compute_model_content_digest`] hashes: `(relpath, len, mtime)`
+/// per file, captured once at load time by [`compute_model_fingerprint`] and
+/// carried on [`CandleModel::fingerprint`]. [`ModelCache::get_or_load`]'s
+/// warm fast path calls [`ModelFingerprint::probe`] before serving the cached
+/// `Arc<LoadedModel>` — `stat`, never a re-hash — so an in-place model-dir
+/// mutation (e.g. rewriting `1_Pooling/config.json`) between two calls in the
+/// same warm process is detected and forces a fresh load instead of silently
+/// replaying pre-mutation weights while attesting the pre-mutation digest.
+///
+/// **Honest residual**: `(len, mtime)` is a staleness TRIPWIRE, not a
+/// cryptographic guarantee. A content swap that lands on the exact same byte
+/// length at the exact same modification time (a crafted rewrite, or a
+/// same-second overwrite on a filesystem with coarse mtime resolution) is
+/// invisible to this probe and will keep serving the stale in-memory model.
+/// The [`ModelContentDigest`] recomputed on every actual reload remains the
+/// sole authoritative attestation of what bytes were hashed; this type only
+/// decides WHEN a reload is triggered, and does not strengthen the digest's
+/// own guarantee.
+///
+/// `(relpath, absolute_path, snapshot)` for one arm within a
+/// [`FingerprintSlot`]. `snapshot` is `Some((len, mtime))` when the arm
+/// existed at load time, or `None` when it did not (see [`ModelFingerprint`]'s
+/// doc, F-4b).
+type FingerprintArm = (
+    String,
+    std::path::PathBuf,
+    Option<(u64, std::time::SystemTime)>,
+);
+
+/// One fingerprinted SLOT — every arm of one [`DigestSlot`], captured at
+/// load time, plus that slot's [`DigestSlot::absence_tolerated`] flag
+/// carried through unchanged. See [`DigestSlot`]'s doc for why the
+/// fingerprint is grouped this way (audit round 62, adversarial round 10)
+/// rather than as a flat per-file list with an isolated `optional: bool`.
+#[derive(Debug, Clone)]
+struct FingerprintSlot {
+    arms: Vec<FingerprintArm>,
+    absence_tolerated: bool,
+}
+
+/// **Contract (unit-62 design pressure-test, PINNED).** This fingerprint
+/// enforces the NARROW staleness contract esc-058 specified: detect
+/// in-place mutation — content change, deletion, or appearance — of the
+/// FILES the resolver selected (and their preference-chain alternates)
+/// under the resolve inputs recorded at load (`source`, `task`,
+/// `backend_hint`, catalog state). It deliberately does NOT re-verify
+/// non-file resolve inputs:
+///
+/// - catalog `artifact_path`/`backend` rewrites — a retrained fine-tuned
+///   model whose adapter dir is content-addressed and immutable will probe
+///   fresh until process restart: `fetch_artifact` never touches bytes this
+///   type is already watching, and the catalog ROW pointing at a NEW dir is
+///   invisible to this type entirely (esc-057's mutable-pointer defect
+///   recurring one layer up);
+/// - catalog-vs-local precedence (`ModelResolver::try_catalog_lookup`'s
+///   catalog-first ordering vs. a shadowed `ModelSource::Local` fallthrough
+///   that could resolve differently on a cold path);
+/// - task/backend_hint cache keying — cache entries are keyed by `ModelId`
+///   alone, narrower than the `(source, task, backend_hint)` resolve key;
+/// - HF `refs/<rev>` revision moves — the mutable pointer hf-hub resolves
+///   through (`refs/<rev> -> snapshots/<sha>`) sits outside this type's
+///   file-set anchor entirely and is structurally inexpressible as an arm;
+///   the snapshot blobs themselves ARE immutable, so this subsystem is
+///   honestly a no-op for HF sources today;
+/// - remote sibling listings — a shard set derived from a remote glob
+///   listing, not a finite local arm list this type could enumerate.
+///
+/// Those classes are unit 65's scope (`docs/plans/65-resolve-witness`), not
+/// this type's — see that plan for the resolver-emitted-witness direction
+/// that would widen the contract. `ModelCache::get_or_load`'s own doc
+/// carries a one-line summary of this same boundary.
+///
+/// [`ModelCache::get_or_load`]: super::super::cache::ModelCache::get_or_load
+#[derive(Debug, Clone)]
+pub(crate) struct ModelFingerprint {
+    /// One entry per [`DigestSlot`], in [`all_candidate_paths`]'s push
+    /// order. A fixed *present-only* snapshot cannot detect a later-appearing
+    /// output-affecting file (F-4b) because appearance never touches any
+    /// `(len, mtime)` already being tracked — recording the ABSENCE
+    /// explicitly closes that blind spot, for EVERY arm of every slot, not
+    /// just the arm a given load happened to select (audit round 62,
+    /// adversarial round 10). Empty for a synthetic (non-disk-backed)
+    /// fixture, in which case [`ModelFingerprint::probe`] is vacuously
+    /// fresh.
+    slots: Vec<FingerprintSlot>,
+}
+
+impl ModelFingerprint {
+    /// A fingerprint with no files to check — `probe` always reports fresh.
+    /// Used only by in-process test fixtures that synthesize a `CandleModel`
+    /// with no backing model directory; every real load goes through
+    /// [`compute_model_fingerprint`] instead.
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self {
+        Self { slots: vec![] }
+    }
+
+    /// Re-`stat` every arm of every candidate SLOT and compare against the
+    /// load-time snapshot, evaluated one slot at a time.
+    ///
+    /// - `Ok(true)` — every slot's every arm's current on-disk state matches
+    ///   load time (present arms have an unchanged `(len, mtime)`; absent
+    ///   arms are still absent): serve the cached model.
+    /// - `Ok(false)` — at least one slot has at least one arm diverged
+    ///   (a present arm's `len`/`mtime` changed, an absent-at-load arm now
+    ///   EXISTS — F-4b, on ANY arm, not only the selected one — or a
+    ///   present-at-load arm is now `NotFound`), AND the slot as a whole can
+    ///   still satisfy a cold resolve (some arm is present now, whether or
+    ///   not it is the one THIS load selected, or the slot tolerates total
+    ///   absence): the caller must evict and reload, never serve.
+    /// - `Err` — a slot whose divergence leaves EVERY arm absent, on a slot
+    ///   that does not tolerate that (config, weights, the adapter pair, or
+    ///   a per-class-required preprocessor slot) — no arm, selected or
+    ///   alternate, can satisfy a cold resolve, so a reload would fail
+    ///   identically — or ANY arm is unreadable for a reason OTHER than
+    ///   `NotFound` (e.g. a permission error, for which slot tolerance
+    ///   carries no meaning): a typed refusal (K2), never silently treated
+    ///   as fresh (would replay stale weights) or as stale (would mask a
+    ///   real IO failure as an ordinary reload, which would then hit the
+    ///   identical error inside `compute_model_content_digest` anyway —
+    ///   surfacing it here is strictly more informative, naming the probe
+    ///   as the cause).
+    ///
+    /// **The per-slot lattice (audit round 62, adversarial round 10 —
+    /// reshaped from F-4''s flat, per-candidate `optional: bool`, which
+    /// could only express one file in isolation)** — evaluated per SLOT,
+    /// over "did any arm change" × "is any arm present now":
+    ///
+    /// (a) no arm of this slot changed: unchanged — continue to the next
+    ///     slot.
+    /// (b) some arm changed, AND at least one arm of this slot is present
+    ///     now — whether or not it is the SAME arm the resolver originally
+    ///     selected (e.g. `model.safetensors` deleted while
+    ///     `open_clip_model.safetensors` still exists; `1_Pooling/config.json`
+    ///     deleted from a live model directory; the tokenizer deleted from
+    ///     ANY live model directory — audit round 62, adversarial round 6,
+    ///     R5-F1): the slot can still satisfy a cold resolve, either via the
+    ///     surviving alternate arm or via a documented per-class fallback
+    ///     (mean pooling / no preprocessor geometry / `tokenizer: None`,
+    ///     with any text-encoding call refused at USE time by its own typed
+    ///     error instead of at load time — see `all_candidate_paths`'
+    ///     tokenizer slot doc) — a fresh reload legitimately SUCCEEDS, with
+    ///     a NEW digest reflecting whichever arm/fallback a cold resolve
+    ///     now takes. Reported as STALE (`Ok(false)`), never `Err`: the
+    ///     pre-round-10 per-file model collapsed the alternate-exists case
+    ///     into the SAME arm (c) `Err` as total absence, permanently
+    ///     wedging `ModelCache::get_or_load` on a model a cold reload would
+    ///     serve just fine via the alternate.
+    /// (c) some arm changed, AND every arm of this slot is now absent, on a
+    ///     slot that does NOT tolerate total absence (`absence_tolerated ==
+    ///     false` — config, weights, the adapter pair, and — per-class, see
+    ///     [`preprocessor_config_is_required`] — `preprocessor_config.json`
+    ///     on an HF-CLAP audio model): no arm can satisfy a cold resolve, so
+    ///     this remains the typed refusal (`Err`), unchanged from before the
+    ///     round-10 reshape. The tokenizer slot's `absence_tolerated == true`
+    ///     means it NEVER reaches this arm, for any number of vanished arms.
+    ///
+    /// **Evict-on-`Err` (unit-62 design pressure-test, item 3 — wedge
+    /// elimination).** `ModelCache::get_or_load`'s `Err` arm now evicts this
+    /// `CacheEntry` before returning, exactly like its `Ok(false)` arm does.
+    /// Under the narrow staleness contract (see [`ModelFingerprint`]'s own
+    /// doc), the honest behavior here is cold-equivalence, not a silent
+    /// recovery: the entry is gone, so the NEXT `get_or_load` call takes a
+    /// full cold resolve + reload instead of re-probing this identical dead
+    /// entry. If the cause that produced this `Err` is still present, that
+    /// cold reload fails too — with the LOADER's own typed error (a
+    /// different message than this probe's), the identical observable
+    /// outcome (refusal), never a wedge into a different failure mode. If
+    /// the cause was transient (e.g. the catalog-vs-local precedence class
+    /// unit 65 scopes), the cold reload succeeds and the system self-heals
+    /// instead of staying wedged on a dead in-memory entry forever.
+    ///
+    /// **Honest residual (round 12) — arm (b) is `backend_hint`-blind for the
+    /// weights slot.** "Some arm of this slot present now" is an on-disk-only
+    /// check; it does not know whether the ORIGINAL `get_or_load` call's
+    /// `backend_hint` would make a cold resolve reject that surviving arm
+    /// anyway (e.g. `model.safetensors` deleted while an ungated
+    /// `model.onnx` survives, under a Candle-pinned `backend_hint`:
+    /// `resolve_local` never auto-falls-back to ORT when the hint is `Some`,
+    /// resolver.rs:251-270). Such a load reports arm (b) `Ok(false)` here
+    /// even though a cold resolve carrying that SAME hint would in fact hit
+    /// arm (c)'s typed refusal. This is NOT a silent wrong answer:
+    /// `ModelCache::get_or_load` evicts on `Ok(false)` and immediately
+    /// re-resolves with the SAME `backend_hint` this call was made with, so
+    /// the caller gets the identical typed `JammiError` one hop later
+    /// instead of directly from `probe`. See [`all_candidate_paths`]'s
+    /// weights-alternates-slot doc for the full accounting of why this is
+    /// left undetected rather than plumbing `backend_hint` into this type.
+    ///
+    /// **Slot evaluation is per-slot-local and first-change-wins (unit-62
+    /// design pressure-test, item 4b — stated, not changed; widening this is
+    /// unit 65's witness work).** The loop below walks `self.slots` in
+    /// [`all_candidate_paths`]'s push order and returns as soon as ONE slot
+    /// reports arm (b) or arm (c) — it never scans the remaining slots to
+    /// see whether a LATER slot would also have changed, and never
+    /// aggregates across slots. So whether a caller of this probe observes
+    /// a stale-reload (arm b) or a typed refusal (arm c) on a given call is
+    /// PUSH-ORDER dependent whenever more than one slot has actually
+    /// diverged since load: if the weights slot (pushed first) has an arm
+    /// (b) alternate-exists divergence and, say, the required config slot
+    /// (pushed after it) independently has an arm (c) total-absence
+    /// divergence, this call reports `Ok(false)` and never even inspects
+    /// the config slot — the caller reloads, and only discovers the
+    /// config-slot refusal on THAT reload's own resolve. A different push
+    /// order (config first) would report the `Err` directly, on this same
+    /// call. Both are typed, neither is silently wrong — but the SPECIFIC
+    /// arm a caller sees for a multi-slot-divergence input is an artifact of
+    /// `all_candidate_paths`'s enumeration order, not a property of the
+    /// underlying divergence itself.
+    pub(crate) fn probe(&self) -> Result<bool> {
+        for slot in &self.slots {
+            let mut changed = false;
+            let mut any_arm_present_now = false;
+            let mut vanished_arm_error: Option<JammiError> = None;
+
+            for (rel, path, snapshot) in &slot.arms {
+                match std::fs::metadata(path) {
+                    Ok(meta) => {
+                        any_arm_present_now = true;
+                        let current_mtime = meta.modified().map_err(|e| JammiError::Model {
+                            model_id: path.display().to_string(),
+                            message: format!(
+                                "esc-058 staleness probe: {path:?} has no mtime available on \
+                                 this platform/filesystem: {e}"
+                            ),
+                        })?;
+                        match snapshot {
+                            Some((len, mtime)) => {
+                                if meta.len() != *len || current_mtime != *mtime {
+                                    changed = true;
+                                }
+                            }
+                            // Absent at load time, present now: an
+                            // output-affecting file APPEARED (F-4b) — even
+                            // one this load did NOT select (audit round 62,
+                            // adversarial round 10: a cold resolve may pick
+                            // it instead, and for the weights slot may pick
+                            // a different BACKEND entirely).
+                            None => changed = true,
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound && snapshot.is_none() => {
+                        // Still absent, exactly as at load time — fine.
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // This arm existed at load time and is now gone.
+                        // Whether the SLOT as a whole is arm (b) or arm (c)
+                        // depends on the OTHER arms — decided once the whole
+                        // slot has been scanned, below.
+                        changed = true;
+                        if vanished_arm_error.is_none() {
+                            vanished_arm_error = Some(JammiError::Model {
+                                model_id: path.display().to_string(),
+                                message: format!(
+                                    "esc-058 staleness probe: {path:?} (fingerprinted as \
+                                     {rel:?} at load time) is no longer readable: {e}"
+                                ),
+                            });
+                        }
+                    }
+                    // Any arm unreadable for a reason OTHER than NotFound
+                    // (e.g. a permission error): slot tolerance carries no
+                    // meaning here — the failure is not "this file doesn't
+                    // exist", it is "this file couldn't be inspected". A
+                    // typed refusal (K2), immediately.
+                    Err(e) => {
+                        return Err(JammiError::Model {
+                            model_id: path.display().to_string(),
+                            message: format!(
+                                "esc-058 staleness probe: {path:?} (fingerprinted as {rel:?} \
+                                 at load time) is no longer readable: {e}"
+                            ),
+                        });
+                    }
+                }
+            }
+
+            if !changed {
+                continue;
+            }
+            if !slot.absence_tolerated && !any_arm_present_now {
+                return Err(vanished_arm_error.expect(
+                    "a required slot (`absence_tolerated == false`) with every arm absent \
+                     and `changed == true` must have had at least one arm transition from \
+                     present-at-load to absent-now",
+                ));
+            }
+            return Ok(false);
+        }
+        Ok(true)
+    }
+}
+
+/// Compute the load-time staleness fingerprint (esc-058) over the FULL
+/// candidate slot set [`all_candidate_paths`] returns
+/// ([`content_digest_entries`]'s present-only input set is a filtered VIEW of
+/// this same enumeration, so the two can never drift). `stat`s every arm of
+/// every slot (never reads its bytes, unlike the digest); an arm absent at
+/// load time is recorded as such (F-4b) rather than omitted. Errors are
+/// typed refusals (K2) for anything other than "does not exist", the
+/// identical stance [`compute_model_content_digest`] takes.
+///
+/// **Ordering invariant (audit round 62, F-4'')**: called ONCE per model
+/// load, from [`compute_model_identity_facets`], and MUST run BEFORE
+/// [`compute_model_content_digest`] there — never after, and never from any
+/// other production call site. See that function's doc for why the order
+/// matters (a mutation landing between the two calls must be caught by a
+/// re-hash, never silently stamped as "fresh" against a stale digest
+/// forever).
+fn compute_model_fingerprint(resolved: &ResolvedModel) -> Result<ModelFingerprint> {
+    let raw_slots = all_candidate_paths(resolved)?;
+    let mut slots = Vec::with_capacity(raw_slots.len());
+    for slot in raw_slots {
+        let mut arms = Vec::with_capacity(slot.arms.len());
+        for arm in slot.arms {
+            let SlotArm {
+                rel,
+                path,
+                gated: _gated,
+            } = arm;
+            match std::fs::metadata(&path) {
+                Ok(meta) => {
+                    let mtime = meta.modified().map_err(|e| JammiError::Model {
+                        model_id: resolved.model_id.0.clone(),
+                        message: format!(
+                            "{path:?} has no mtime available for esc-058 load-time \
+                             fingerprinting: {e}"
+                        ),
+                    })?;
+                    arms.push((rel, path, Some((meta.len(), mtime))));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    arms.push((rel, path, None));
+                }
+                Err(e) => {
+                    return Err(JammiError::Model {
+                        model_id: resolved.model_id.0.clone(),
+                        message: format!(
+                            "failed to stat {path:?} for esc-058 load-time fingerprinting: {e}"
+                        ),
+                    });
+                }
+            }
+        }
+        slots.push(FingerprintSlot {
+            arms,
+            absence_tolerated: slot.absence_tolerated,
+        });
+    }
+    Ok(ModelFingerprint { slots })
+}
+
+/// Compute BOTH per-load staleness facets — [`ModelFingerprint`] (stat) and
+/// [`ModelContentDigest`] (hash) — in the ONLY safe order: fingerprint
+/// FIRST, digest SECOND. This is the sole caller of either function; every
+/// other call site (the `digest_fingerprint_audit62_tests` / `content_digest`
+/// unit tests below) calls the two directly and independently, which is
+/// exactly what makes those tests order-agnostic — production code must
+/// route through here.
+///
+/// **Ordering invariant (audit round 62, F-4'')**: stamping the fingerprint
+/// AFTER hashing the digest (the pre-fix order) leaves a window, between
+/// the hash read and the stat, in which a concurrent in-place mutation of
+/// the model directory stamps a POST-mutation `(len, mtime)` fingerprint
+/// against a PRE-mutation digest. The warm-path probe
+/// ([`ModelFingerprint::probe`]) then reports "fresh" FOREVER — its stat
+/// matches the fingerprint it was given, even though that fingerprint was
+/// never the one the digest was actually hashed from — so the process keeps
+/// serving the POST-mutation weights under the STALE, PRE-mutation digest
+/// folded into `ModelIdentity`. Stat-then-hash instead: a mutation landing
+/// in the (now much narrower, and in the opposite direction) window between
+/// the two calls is caught by the immediate re-hash the fingerprint no
+/// longer precedes — worst case, one extra reload converges on the correct
+/// digest; the fingerprint can never be silently wrong forever. Composing
+/// both calls in this ONE function (rather than two independent call sites
+/// in [`CandleBackend::load`]) pins the order STRUCTURALLY: a future edit
+/// cannot silently swap the two calls back without editing this function's
+/// two-line body, which review can see and require justification for. Do
+/// not call [`compute_model_fingerprint`] and [`compute_model_content_digest`]
+/// separately from any production path — only from this function, or from a
+/// unit test that is deliberately probing one facet in isolation.
+fn compute_model_identity_facets(
+    resolved: &ResolvedModel,
+) -> Result<(ModelFingerprint, ModelContentDigest)> {
+    let fingerprint = compute_model_fingerprint(resolved)?;
+    let content_digest = compute_model_content_digest(resolved)?;
+    Ok((fingerprint, content_digest))
+}
+
 impl CandleModel {
     /// L2-normalize each vector in a [batch, hidden_size] tensor.
     pub(crate) fn l2_normalize(&self, tensor: &Tensor) -> Result<Tensor> {
@@ -549,6 +1724,18 @@ impl CandleModel {
     /// Convert token ID vectors into a candle Tensor on this model's device.
     pub(crate) fn tokens_to_tensor(&self, vecs: &[Vec<u32>]) -> Result<Tensor> {
         tokens_to_tensor(vecs, &self.device)
+    }
+
+    /// The pooling strategy the text-embedding forward path ACTUALLY resolved
+    /// to (unit-62 F-5'): delegates to [`CandleTextForward::resolved_pooling`]
+    /// on the loaded text wrapper — the SAME `Pooling` value `forward_pooled`
+    /// applies, never a re-derivation from `resolved.pooling_config` (which
+    /// would drift the moment `pooling_from_config`'s own resolution logic
+    /// changed without this accessor changing in lockstep). `None` for a
+    /// model with no text wrapper at all (CLAP audio) or whose text wrapper
+    /// doesn't pool (OpenCLIP text, DistilBERT classification).
+    pub(crate) fn resolved_pooling(&self) -> Option<Pooling> {
+        self.text.as_ref().and_then(|t| t.resolved_pooling())
     }
 
     /// The persisted predictive-distribution form of a reloaded regression head,
@@ -1047,6 +2234,22 @@ impl CandleModel {
             JammiError::Inference("No id2label mapping for classification model".into())
         })?;
 
+        // R7-F2 (audit round 62, adversarial round 8 advisory fold): the
+        // `id2label` presence check above does NOT prove this warm entry was
+        // actually loaded for `Classification` — many BERT-family
+        // checkpoints carry an `id2label` map in `config.json` even when
+        // loaded for `TextEmbedding`/`Ner` (see
+        // `CandleTextForward::is_classification_head`'s doc), and
+        // `ModelCache`'s id-only warm-cache key makes that mismatch
+        // reachable at runtime. A cheap, typed kind-mismatch refusal here —
+        // BEFORE tokenizing anything — mirrors R5-F2's `forward_pooled`
+        // refusal in the other direction, so this call fails legibly instead
+        // of reaching `to_vec2::<f32>()` over the wrong-rank hidden-states
+        // tensor and dying with an opaque candle rank error.
+        if !self.text_forward()?.is_classification_head() {
+            return Err(classification_kind_mismatch_refusal());
+        }
+
         let texts = arrow_to_texts(content)?;
         let num_rows = texts.len();
 
@@ -1276,6 +2479,16 @@ impl ModelBackend for CandleBackend {
     fn load(&self, resolved: &ResolvedModel, device_config: &DeviceConfig) -> Result<LoadedModel> {
         let device = select_device(device_config)?;
 
+        // Computed ONCE per model load, before the (potentially expensive)
+        // weight loading below, so a hashing/stat IO failure (K2: a typed
+        // refusal, never a silent `Unavailable`) surfaces fast rather than
+        // after mmapping several GB of safetensors. Routed through the ONE
+        // composed function — never the two independently — so the
+        // fingerprint-before-digest order (audit round 62, F-4'') is pinned
+        // structurally. See `compute_model_identity_facets`'s doc for the
+        // exact input set, ordering invariant, and why it matters.
+        let (fingerprint, content_digest) = compute_model_identity_facets(resolved)?;
+
         let model_type = resolved
             .model_config
             .get("model_type")
@@ -1390,18 +2603,54 @@ impl ModelBackend for CandleBackend {
         // variant is the type-level switch that decides whether to wire
         // LoRA inside the encoder or leave it as an external projection
         // head applied post-pool.
+        //
+        // `resolved.adapter_path` is `Some` only via the fine-tuned-model
+        // catalog-lookup path (`ModelResolver::try_catalog_lookup`), which
+        // sets it exactly when a fine-tuned model record's `artifact_path`
+        // was fetched from the artifact store into a local directory — i.e.
+        // the resolver has already asserted "this model IS fine-tuned and
+        // its adapter bundle lives here". A missing `adapter_config.json` /
+        // `adapter.safetensors` under that directory therefore signals a
+        // genuinely broken artifact (a partial fetch, corruption, an
+        // artifact-store/catalog inconsistency) — not "no adapter". The
+        // pre-fix code (`.and_then` + `.ok()?`) silently collapsed BOTH a
+        // missing-file condition AND a read/parse failure into "serve the
+        // unadapted base model", which would drop the fine-tuning entirely
+        // with no signal to the caller (K2/K7: an output-affecting file that
+        // is expected to be present must fail loudly when it is not, never
+        // silently degrade to a different, unrequested model). Audit round
+        // 62, F-1's ruling: both conditions are now typed refusals.
         let saved_adapter: Option<(crate::fine_tune::target::SavedAdapter, std::path::PathBuf)> =
-            resolved.adapter_path.as_ref().and_then(|p| {
-                let cfg_path = p.join("adapter_config.json");
-                let weights_path = p.join("adapter.safetensors");
-                if !cfg_path.exists() || !weights_path.exists() {
-                    return None;
+            match resolved.adapter_path.as_ref() {
+                None => None,
+                Some(p) => {
+                    let cfg_path = p.join("adapter_config.json");
+                    let weights_path = p.join("adapter.safetensors");
+                    if !cfg_path.exists() || !weights_path.exists() {
+                        return Err(JammiError::Model {
+                            model_id: resolved.model_id.0.clone(),
+                            message: format!(
+                                "resolved adapter_path {p:?} is missing adapter_config.json \
+                                 and/or adapter.safetensors — a fine-tuned model's adapter \
+                                 directory must carry both files; refusing to silently fall \
+                                 back to serving the unadapted base model, which would drop \
+                                 the fine-tuning with no signal"
+                            ),
+                        });
+                    }
+                    let cfg_str =
+                        std::fs::read_to_string(&cfg_path).map_err(|e| JammiError::Model {
+                            model_id: resolved.model_id.0.clone(),
+                            message: format!("failed to read {cfg_path:?}: {e}"),
+                        })?;
+                    let saved: crate::fine_tune::target::SavedAdapter =
+                        serde_json::from_str(&cfg_str).map_err(|e| JammiError::Model {
+                            model_id: resolved.model_id.0.clone(),
+                            message: format!("failed to parse {cfg_path:?}: {e}"),
+                        })?;
+                    Some((saved, weights_path))
                 }
-                let cfg_str = std::fs::read_to_string(&cfg_path).ok()?;
-                let saved: crate::fine_tune::target::SavedAdapter =
-                    serde_json::from_str(&cfg_str).ok()?;
-                Some((saved, weights_path))
-            });
+            };
 
         let encoder_adapter = saved_adapter.as_ref().and_then(|(saved, weights)| {
             if let crate::fine_tune::target::SavedAdapter::EncoderAdapters(cfg) = saved {
@@ -1796,6 +3045,8 @@ impl ModelBackend for CandleBackend {
             id2label,
             ner_classifier,
             compute_precision: effective_precision,
+            content_digest,
+            fingerprint,
         })))
     }
 
@@ -1834,6 +3085,34 @@ fn is_hf_clap_config(config: &serde_json::Value) -> bool {
                 )
             })
         })
+}
+
+/// Whether `preprocessor_config.json` is a REQUIRED digest candidate for
+/// `resolved`, or an OPTIONAL one with a correctness-preserving fallback
+/// (audit round 62, F-B).
+///
+/// `all_candidate_paths` previously marked this slot `optional: true`
+/// unconditionally, but [`CandleBackend::load`]'s audio branch
+/// (`audio_frontend`'s construction, gated on `audio.is_some()`) hard-refuses
+/// an HF-CLAP audio model with no `preprocessor_config.json` — there is no
+/// fallback on that path. A deleted `preprocessor_config.json` on a live
+/// CLAP model therefore mis-labels [`ModelFingerprint::probe`]'s arm (c)
+/// ("required candidate vanished — typed refusal, no fallback exists") as
+/// arm (b) ("optional candidate vanished — stale, a reload legitimately
+/// succeeds via the fallback"): the probe reports `Ok(false)` (stale), the
+/// cache evicts and reloads, and the reload hits `CandleBackend::load`'s
+/// hard error instead of the honest typed refusal `probe` should have
+/// produced directly.
+///
+/// The fix: derive `optional` from the candidate's OWN loader predicate —
+/// the resolved model's CLASS, using the identical structural signal
+/// [`CandleBackend::load`] itself branches the audio path on
+/// ([`is_hf_clap_config`] on `resolved.model_config`), not a hardcoded
+/// model-name match. Every non-CLAP-audio class (BERT-family text towers,
+/// OpenCLIP, classification/NER heads) keeps the pre-existing
+/// mean/absent-geometry fallback and stays optional.
+fn preprocessor_config_is_required(resolved: &ResolvedModel) -> bool {
+    is_hf_clap_config(&resolved.model_config)
 }
 
 /// Build the CLAP fusion front-end geometry from a HuggingFace
@@ -2613,6 +3892,20 @@ mod ner_nonfinite_logit_tests {
     /// shape `forward_ner` receives from a genuinely diverged model (a NaN
     /// hidden state feeds through the token classifier's linear layer to a
     /// non-finite logit row, since `NaN * weight + bias` is NaN).
+    ///
+    /// **Pairing-discipline exemption (audit round 62, adversarial round 10
+    /// advisory fold)**: this stub overrides neither `forward_pooled` nor
+    /// `resolved_pooling`, so it inherits BOTH trait defaults together — the
+    /// exact combination [`CandleTextForward::forward_pooled`]'s own pairing
+    /// rule (audit round 62 advisory A1) warns never to inherit silently for
+    /// a wrapper reachable via `ModelTask::TextEmbedding`, since the default
+    /// `forward_pooled` performs REAL mean pooling while the default
+    /// `resolved_pooling` dishonestly reports `None`. This module below only
+    /// ever drives this stub through `ModelTask::Ner`
+    /// (`model.forward(&content, ModelTask::Ner)`, both tests) — `forward_pooled`
+    /// is never called, and the mismatch this stub's inherited defaults would
+    /// otherwise create is unreachable dead weight, not a silent exception to
+    /// the pairing rule.
     struct FixedHiddenForward {
         max_seq_len: usize,
         hidden_size: usize,
@@ -2688,6 +3981,13 @@ mod ner_nonfinite_logit_tests {
             id2label: Some(id2label),
             ner_classifier: Some(ner_classifier),
             compute_precision: jammi_numerics::ComputePrecision::F32,
+            // No real model directory backs this synthetic fixture, so there
+            // is nothing to hash — an arbitrary fixed placeholder is fine
+            // here (no test in this module asserts on the digest value).
+            content_digest: ModelContentDigest::Sha256("test-fixture-digest".into()),
+            // No real model directory backs this fixture either, so there is
+            // nothing to fingerprint — `empty()` probes vacuously fresh.
+            fingerprint: ModelFingerprint::empty(),
         }
     }
 
@@ -2758,5 +4058,1435 @@ mod ner_nonfinite_logit_tests {
             "expected every row to decode successfully, got row_status {:?}",
             output.row_status
         );
+    }
+}
+
+/// Audit round 62 (F-1, F-4b, and the strip-prefix-refusal advisory):
+/// unit-level proofs for mechanisms a full `ModelCache` /
+/// `InferenceSession` round-trip cannot reach directly.
+///
+/// The adapter-appearance (F-4b) and missing-adapter-files (F-1 ruling)
+/// scenarios specifically CANNOT be exercised through the public
+/// `ModelCache` today: `ModelResolver` only ever sets `adapter_path: Some`
+/// via the fine-tuned-model catalog-lookup path (a full fine-tune
+/// round-trip), and — after this round's F-1 fix — `CandleBackend::load`
+/// now hard-errors the instant `adapter_path` is `Some` with either file
+/// missing, so no cached/served `CandleModel` can ever exist in an
+/// "adapter_path Some, files absent" state to probe appearance against.
+/// Testing `compute_model_fingerprint` / `ModelFingerprint::probe` directly
+/// proves the mechanism is correct and general (the honest, function-level
+/// proof) rather than forcing an end-to-end scenario the production wiring
+/// no longer permits.
+#[cfg(test)]
+mod digest_fingerprint_audit62_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Copy the hermetic `tiny_bert` fixture's config/weights/tokenizer into
+    /// `dst` (no `1_Pooling/`, no `preprocessor_config.json`) and return a
+    /// `ResolvedModel` pointing at it, with `adapter_path` set to whatever
+    /// the caller passes. Hand-built rather than routed through
+    /// `ModelResolver` — every `ResolvedModel` field is `pub`, and this is
+    /// the same "resolved, not yet loaded" contract `ModelResolver::resolve`
+    /// itself fulfills; the resolver's OWN local-source path never produces
+    /// `adapter_path: Some` (only the fine-tuned-model catalog-lookup path
+    /// does), so constructing one directly is the only way to unit-test the
+    /// adapter-anchored candidates in isolation.
+    fn tiny_bert_resolved(
+        dst: &std::path::Path,
+        adapter_path: Option<std::path::PathBuf>,
+    ) -> ResolvedModel {
+        std::fs::create_dir_all(dst).unwrap();
+        let fixture = jammi_test_utils::cookbook_fixture("tiny_bert");
+        for name in ["config.json", "model.safetensors", "tokenizer.json"] {
+            std::fs::copy(fixture.join(name), dst.join(name)).unwrap();
+        }
+        let model_config: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(dst.join("config.json")).unwrap()).unwrap();
+        ResolvedModel {
+            model_id: crate::model::ModelId(format!("local:{}", dst.display())),
+            backend: crate::model::BackendType::Candle,
+            task: ModelTask::TextEmbedding,
+            config_path: dst.join("config.json"),
+            weights_paths: vec![dst.join("model.safetensors")],
+            tokenizer: Some(TokenizerSource::HuggingFaceJson(dst.join("tokenizer.json"))),
+            model_config,
+            preprocessor_config: None,
+            pooling_config: None,
+            base_model_id: None,
+            adapter_path,
+            estimated_memory: 0,
+        }
+    }
+
+    /// Write a valid `ProjectionHead`-flavoured `adapter_config.json` +
+    /// `adapter.safetensors` pair at `dir`. The weights carry a single
+    /// `marker` tensor — neither `projection.lora_a`/`lora_b` nor
+    /// `distribution.lora_a`/`lora_b`, so `load_projection_head` /
+    /// `load_distribution_head` both return `Ok(None)` and
+    /// `CandleBackend::load` succeeds as an ordinary (adapter-inert) load —
+    /// the adapter's FILES are still digested/fingerprinted, which is all
+    /// F-1/F-4b need; a `ProjectionHead` adapter with no matching keys
+    /// needs no `target_modules`/LoRA-shape knowledge of `tiny_bert` at all.
+    fn write_projection_adapter(dir: &std::path::Path, marker_value: f32) {
+        std::fs::create_dir_all(dir).unwrap();
+        let cfg_json = serde_json::json!({
+            "adapter_type": "projection_head",
+            "lora_rank": 4,
+            "lora_alpha": 8.0,
+            "use_rslora": false,
+            "head_layers": []
+        });
+        std::fs::write(
+            dir.join("adapter_config.json"),
+            serde_json::to_string(&cfg_json).unwrap(),
+        )
+        .unwrap();
+
+        let device = Device::Cpu;
+        let mut weights: HashMap<String, Tensor> = HashMap::new();
+        weights.insert(
+            "marker".to_string(),
+            Tensor::new(&[marker_value], &device).unwrap(),
+        );
+        candle_core::safetensors::save(&weights, dir.join("adapter.safetensors")).unwrap();
+    }
+
+    fn device_config() -> DeviceConfig {
+        DeviceConfig {
+            gpu_device: -1,
+            memory_fraction: 1.0,
+            require_gpu: false,
+            compute_precision: jammi_numerics::ComputePrecision::F32,
+        }
+    }
+
+    /// F-1 core: mutating `adapter.safetensors` bytes in place, under a
+    /// constant `resolved.model_id` / `adapter_path`, must change
+    /// `compute_model_content_digest`'s output — the peer of
+    /// `content_digest.rs`'s weights/tokenizer/pooling mutation tests, for
+    /// the adapter pair specifically. RED before F-1: `content_digest_entries`
+    /// never enumerated the adapter files at all, so this mutation was
+    /// invisible to the digest.
+    #[test]
+    fn adapter_weights_byte_mutation_changes_content_digest() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let adapter_tmp = tempfile::tempdir().unwrap();
+        write_projection_adapter(adapter_tmp.path(), 1.0);
+        let resolved = tiny_bert_resolved(
+            &model_tmp.path().join("model"),
+            Some(adapter_tmp.path().to_path_buf()),
+        );
+
+        let digest_before = compute_model_content_digest(&resolved).unwrap();
+
+        let weights_path = adapter_tmp.path().join("adapter.safetensors");
+        let mut bytes = std::fs::read(&weights_path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&weights_path, &bytes).unwrap();
+
+        let digest_after = compute_model_content_digest(&resolved).unwrap();
+
+        assert_ne!(
+            digest_before, digest_after,
+            "mutating adapter.safetensors bytes in place, under a constant \
+             adapter_path, must change the content digest (F-1)"
+        );
+    }
+
+    /// F-1 peer: the same mutation on `adapter_config.json` itself.
+    #[test]
+    fn adapter_config_byte_mutation_changes_content_digest() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let adapter_tmp = tempfile::tempdir().unwrap();
+        write_projection_adapter(adapter_tmp.path(), 1.0);
+        let resolved = tiny_bert_resolved(
+            &model_tmp.path().join("model"),
+            Some(adapter_tmp.path().to_path_buf()),
+        );
+
+        let digest_before = compute_model_content_digest(&resolved).unwrap();
+
+        let cfg_path = adapter_tmp.path().join("adapter_config.json");
+        let mut bytes = std::fs::read(&cfg_path).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(&cfg_path, &bytes).unwrap();
+
+        let digest_after = compute_model_content_digest(&resolved).unwrap();
+
+        assert_ne!(
+            digest_before, digest_after,
+            "mutating adapter_config.json bytes in place must change the content \
+             digest (F-1)"
+        );
+    }
+
+    /// Non-vacuous control: an `adapter_path` that is `Some` but whose two
+    /// files do not (yet) exist is NOT an error for the DIGEST — the digest
+    /// mirrors the loader's own presence gate and simply omits the adapter
+    /// pair — even though (per the ruling below) `CandleBackend::load`
+    /// itself refuses to load such a model. The two concerns are decoupled
+    /// on purpose: enumerating candidates never fails just because a
+    /// candidate happens to be absent.
+    #[test]
+    fn missing_adapter_files_does_not_fail_digest_computation() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let adapter_tmp = tempfile::tempdir().unwrap(); // no adapter files written
+        let resolved = tiny_bert_resolved(
+            &model_tmp.path().join("model"),
+            Some(adapter_tmp.path().to_path_buf()),
+        );
+
+        let digest = compute_model_content_digest(&resolved);
+        assert!(
+            digest.is_ok(),
+            "an adapter_path with no adapter files yet must not fail digest \
+             computation: {digest:?}"
+        );
+    }
+
+    /// F-1 ruling: `resolved.adapter_path` is `Some` only via the
+    /// fine-tuned-model catalog-lookup path, which asserts "this model IS
+    /// fine-tuned, its adapter lives here" — so a missing
+    /// `adapter_config.json` / `adapter.safetensors` under that directory is
+    /// a typed refusal (K2/K7), never a silent fall-back to the unadapted
+    /// base model. Both files missing, and each file missing individually,
+    /// must all refuse.
+    #[test]
+    fn candle_backend_load_refuses_some_adapter_path_missing_files() {
+        let cases: [&str; 3] = ["neither", "config_only", "weights_only"];
+        for case in cases {
+            let model_tmp = tempfile::tempdir().unwrap();
+            let adapter_tmp = tempfile::tempdir().unwrap();
+            match case {
+                "config_only" => {
+                    write_projection_adapter(adapter_tmp.path(), 1.0);
+                    std::fs::remove_file(adapter_tmp.path().join("adapter.safetensors")).unwrap();
+                }
+                "weights_only" => {
+                    write_projection_adapter(adapter_tmp.path(), 1.0);
+                    std::fs::remove_file(adapter_tmp.path().join("adapter_config.json")).unwrap();
+                }
+                _ => {}
+            }
+            let resolved = tiny_bert_resolved(
+                &model_tmp.path().join("model"),
+                Some(adapter_tmp.path().to_path_buf()),
+            );
+            let backend = CandleBackend;
+            let result = backend.load(&resolved, &device_config());
+            assert!(
+                result.is_err(),
+                "case {case:?}: adapter_path Some with a missing adapter file must \
+                 refuse to load, never silently serve the unadapted base model"
+            );
+        }
+    }
+
+    /// Positive control for the refusal above: BOTH adapter files present
+    /// loads successfully — proves the refusal fires on absence
+    /// specifically, not on some incidental fixture/setup issue.
+    #[test]
+    fn candle_backend_load_succeeds_when_both_adapter_files_present() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let adapter_tmp = tempfile::tempdir().unwrap();
+        write_projection_adapter(adapter_tmp.path(), 1.0);
+        let resolved = tiny_bert_resolved(
+            &model_tmp.path().join("model"),
+            Some(adapter_tmp.path().to_path_buf()),
+        );
+        let backend = CandleBackend;
+        let result = backend.load(&resolved, &device_config());
+        assert!(
+            result.is_ok(),
+            "both adapter files present must load successfully: {:?}",
+            result.err()
+        );
+    }
+
+    /// F-4b: an adapter pair that did not exist when
+    /// `compute_model_fingerprint` ran, but exists by the time `probe` is
+    /// called, must flip the probe to stale (`Ok(false)`) — the mechanism a
+    /// production warm-hit reload depends on to detect a newly-appearing
+    /// output-affecting file. Contrasted with a no-op probe (nothing
+    /// changed) staying fresh, so this isn't vacuously always-stale.
+    #[test]
+    fn adapter_files_appearing_after_fingerprint_trips_the_probe() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let adapter_tmp = tempfile::tempdir().unwrap(); // absent at fingerprint time
+        let resolved = tiny_bert_resolved(
+            &model_tmp.path().join("model"),
+            Some(adapter_tmp.path().to_path_buf()),
+        );
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        assert!(
+            fingerprint.probe().unwrap(),
+            "nothing changed yet: probe must report fresh"
+        );
+
+        write_projection_adapter(adapter_tmp.path(), 1.0);
+
+        assert!(
+            !fingerprint.probe().unwrap(),
+            "an adapter pair that appeared after the fingerprint was captured must \
+             trip the probe to stale (F-4b)"
+        );
+    }
+
+    /// F-4b peer: `1_Pooling/config.json` appearing after the fingerprint
+    /// was captured also trips the probe — proven at the same unit level as
+    /// the adapter case above (the end-to-end `ModelCache` peer of this test
+    /// lives in `cache_staleness.rs`).
+    #[test]
+    fn pooling_config_appearing_after_fingerprint_trips_the_probe() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = tiny_bert_resolved(&dst, None);
+        assert!(resolved.pooling_config.is_none());
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        assert!(fingerprint.probe().unwrap());
+
+        let pooling_dir = dst.join("1_Pooling");
+        std::fs::create_dir_all(&pooling_dir).unwrap();
+        std::fs::write(
+            pooling_dir.join("config.json"),
+            r#"{"pooling_mode_cls_token": true}"#,
+        )
+        .unwrap();
+
+        assert!(
+            !fingerprint.probe().unwrap(),
+            "1_Pooling/config.json appearing after the fingerprint was captured \
+             must trip the probe to stale (F-4b)"
+        );
+    }
+
+    /// F-4b peer: `preprocessor_config.json` appearing after the fingerprint
+    /// was captured also trips the probe.
+    #[test]
+    fn preprocessor_config_appearing_after_fingerprint_trips_the_probe() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = tiny_bert_resolved(&dst, None);
+        assert!(resolved.preprocessor_config.is_none());
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        assert!(fingerprint.probe().unwrap());
+
+        std::fs::write(
+            dst.join("preprocessor_config.json"),
+            r#"{"sample_rate": 48000}"#,
+        )
+        .unwrap();
+
+        assert!(
+            !fingerprint.probe().unwrap(),
+            "preprocessor_config.json appearing after the fingerprint was captured \
+             must trip the probe to stale (F-4b)"
+        );
+    }
+
+    /// Advisory: a candidate path that cannot be expressed relative to its
+    /// own anchor directory (every path this engine resolves today is
+    /// always a child of one) is a typed refusal, never a silent fold of an
+    /// absolute, host-specific path into a digest documented to be
+    /// reproducible across hosts. Simulated with a tokenizer path deliberately
+    /// OUTSIDE the model directory — a shape `ModelResolver` never produces
+    /// today, proving the refusal is reachable and correctly wired even
+    /// though production cannot trigger it.
+    #[test]
+    fn candidate_outside_its_anchor_is_a_typed_refusal() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let outside_tmp = tempfile::tempdir().unwrap();
+        let mut resolved = tiny_bert_resolved(&model_tmp.path().join("model"), None);
+        // A tokenizer file that exists, but lives OUTSIDE the model
+        // directory (`config_path`'s parent) — the unreachable-in-production
+        // shape the refusal exists to reject.
+        let outside_tokenizer = outside_tmp.path().join("tokenizer.json");
+        std::fs::copy(
+            jammi_test_utils::cookbook_fixture("tiny_bert").join("tokenizer.json"),
+            &outside_tokenizer,
+        )
+        .unwrap();
+        resolved.tokenizer = Some(TokenizerSource::HuggingFaceJson(outside_tokenizer));
+
+        let result = compute_model_content_digest(&resolved);
+        assert!(
+            result.is_err(),
+            "a candidate outside its anchor directory must be a typed refusal, \
+             never a silent absolute-path fallback: {result:?}"
+        );
+    }
+
+    /// Positive control for the refusal above: the SAME resolved model with
+    /// its tokenizer back under the model directory succeeds — proves the
+    /// refusal fires on the anchor mismatch specifically.
+    #[test]
+    fn candidate_inside_its_anchor_succeeds() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let resolved = tiny_bert_resolved(&model_tmp.path().join("model"), None);
+        let result = compute_model_content_digest(&resolved);
+        assert!(result.is_ok(), "expected success, got {result:?}");
+    }
+
+    // ── F-4' (audit round 62, adversarial round 3): the optional/required \
+    //    lattice at the `ModelFingerprint::probe` level ──
+
+    /// F-4' core, unit level (the peer of `cache_staleness.rs`'s integration
+    /// test): an OPTIONAL candidate (`1_Pooling/config.json`) present at
+    /// fingerprint-capture time and `NotFound` at probe time must report
+    /// STALE (`Ok(false)`), never `Err`. RED pre-F-4': `probe()` collapsed
+    /// this into `Err` regardless of `optional`.
+    #[test]
+    fn probe_optional_candidate_deleted_after_capture_is_stale_not_a_refusal() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let mut resolved = tiny_bert_resolved(&dst, None);
+        std::fs::create_dir_all(dst.join("1_Pooling")).unwrap();
+        let pooling_json = serde_json::json!({"pooling_mode_cls_token": true});
+        std::fs::write(
+            dst.join("1_Pooling/config.json"),
+            serde_json::to_string(&pooling_json).unwrap(),
+        )
+        .unwrap();
+        resolved.pooling_config = Some(pooling_json);
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        assert!(
+            fingerprint.probe().unwrap(),
+            "sanity: fresh immediately after capture"
+        );
+
+        std::fs::remove_file(dst.join("1_Pooling/config.json")).unwrap();
+
+        let result = fingerprint.probe();
+        assert!(
+            matches!(result, Ok(false)),
+            "an OPTIONAL candidate deleted after the fingerprint was captured \
+             must report STALE (Ok(false)) — a reload legitimately succeeds \
+             via the mean-pooling fallback — never Err (F-4'), got {result:?}"
+        );
+    }
+
+    /// F-4' control, unit level: a REQUIRED candidate (`model.safetensors`)
+    /// present at capture time and `NotFound` at probe time must remain the
+    /// typed refusal (`Err`) — unchanged from before F-4', since no fallback
+    /// exists and a reload would fail identically.
+    #[test]
+    fn probe_required_candidate_deleted_after_capture_stays_a_typed_refusal() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = tiny_bert_resolved(&dst, None);
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        std::fs::remove_file(dst.join("model.safetensors")).unwrap();
+
+        let result = fingerprint.probe();
+        assert!(
+            result.is_err(),
+            "a REQUIRED candidate (model.safetensors) deleted after the \
+             fingerprint was captured must remain a typed refusal (F-4') — \
+             a reload would fail identically — got {result:?}"
+        );
+    }
+
+    // ── F-B (audit round 62, adversarial round 4): `preprocessor_config.json` \
+    //    is optional PER MODEL CLASS, not per slot ──
+
+    /// [`preprocessor_config_is_required`] unit level: a text-tower class
+    /// (a plain BERT `config.json`, the identical shape `tiny_bert_resolved`
+    /// produces) has no `model_type`/`architectures` signal that
+    /// [`is_hf_clap_config`] recognises, so the slot stays optional — the
+    /// pre-existing mean/absent-geometry fallback still applies.
+    #[test]
+    fn preprocessor_config_is_required_false_for_a_text_tower_class() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let resolved = tiny_bert_resolved(&model_tmp.path().join("model"), None);
+        assert!(
+            !preprocessor_config_is_required(&resolved),
+            "a BERT-family text-tower model_config must classify as \
+             NOT requiring preprocessor_config.json"
+        );
+    }
+
+    /// [`preprocessor_config_is_required`] unit level, the other class: an
+    /// HF-CLAP audio `model_config` (`model_type == \"clap_audio_model\"`,
+    /// the SAME structural signal [`CandleBackend::load`]'s own `is_clap`
+    /// branches the audio path on) has no fallback for a missing
+    /// `preprocessor_config.json` — the slot must classify as required.
+    #[test]
+    fn preprocessor_config_is_required_true_for_a_clap_audio_class() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let mut resolved = tiny_bert_resolved(&model_tmp.path().join("model"), None);
+        resolved.model_config = serde_json::json!({ "model_type": "clap_audio_model" });
+        assert!(
+            preprocessor_config_is_required(&resolved),
+            "an HF-CLAP audio model_config must classify as REQUIRING \
+             preprocessor_config.json — CandleBackend::load's audio branch \
+             hard-refuses without it, with no fallback"
+        );
+
+        // The nested-`audio_config` shape (top-level `ClapConfig`) is the
+        // SAME class by the SAME signal `is_hf_clap_config` recognises.
+        resolved.model_config = serde_json::json!({
+            "audio_config": { "model_type": "clap_audio_model" }
+        });
+        assert!(
+            preprocessor_config_is_required(&resolved),
+            "the nested audio_config CLAP shape must also classify as \
+             requiring preprocessor_config.json"
+        );
+    }
+
+    /// End-to-end (F-B, block): reproduces the auditor's exact scenario at
+    /// the [`ModelFingerprint::probe`] level, not just the classifier
+    /// function in isolation. A CLAP-shaped resolved model has a
+    /// `preprocessor_config.json` present at fingerprint-capture time; it is
+    /// then deleted from the live model directory (as if a caller pruned
+    /// stale artifacts, or the file was overwritten by an in-place update
+    /// that failed partway).
+    ///
+    /// RED pre-fix: `preprocessor_config.json`'s `optional` was fixed
+    /// `true` unconditionally, so this candidate always fell into arm (b)
+    /// — `probe()` returns `Ok(false)` (stale, "a reload will succeed via
+    /// the fallback"). `ModelCache::get_or_load` would evict and reload,
+    /// and the reload hits `CandleBackend::load`'s hard error ("CLAP audio
+    /// model is missing preprocessor_config.json") instead of the honest
+    /// typed refusal `probe` should have surfaced directly.
+    ///
+    /// GREEN post-fix: `preprocessor_config_is_required` classifies this
+    /// resolved model as CLAP audio, so the candidate is `optional: false`
+    /// — arm (c) applies and `probe()` returns `Err` directly, matching
+    /// what a reload would do anyway, without first pretending the model is
+    /// merely stale.
+    #[test]
+    fn probe_clap_preprocessor_config_deleted_after_capture_is_a_typed_refusal_not_stale() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let mut resolved = tiny_bert_resolved(&dst, None);
+        resolved.model_config = serde_json::json!({ "model_type": "clap_audio_model" });
+        let preprocessor_json = serde_json::json!({
+            "sampling_rate": 48000,
+            "hop_length": 480,
+            "max_length_s": 10,
+        });
+        std::fs::write(
+            dst.join("preprocessor_config.json"),
+            serde_json::to_string(&preprocessor_json).unwrap(),
+        )
+        .unwrap();
+        resolved.preprocessor_config = Some(preprocessor_json);
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        assert!(
+            fingerprint.probe().unwrap(),
+            "sanity: fresh immediately after capture"
+        );
+
+        std::fs::remove_file(dst.join("preprocessor_config.json")).unwrap();
+
+        let result = fingerprint.probe();
+        assert!(
+            result.is_err(),
+            "preprocessor_config.json deleted from a live CLAP model must \
+             be a typed refusal (F-B): CandleBackend::load has no fallback \
+             for a CLAP audio tower missing this file, so a reload would \
+             fail identically — reporting STALE (Ok(false)) here would \
+             mis-route the caller into an eviction+reload that cannot \
+             succeed. Got {result:?}"
+        );
+    }
+
+    // ── R5-F1 (audit round 62, adversarial round 6): the tokenizer \
+    //    candidate is unconditionally OPTIONAL, not over-required ──
+
+    /// R5-F1 (block): reproduces the auditor's exact scenario. `tokenizer.json`
+    /// is present at fingerprint-capture time (`tiny_bert_resolved` always
+    /// ships one), then deleted from the live model directory — as if a
+    /// caller pruned stale artifacts.
+    ///
+    /// RED pre-fix: the tokenizer candidate's `optional` was fixed `false`
+    /// unconditionally ("the loader has no fallback"), which is false for
+    /// this slot — every resolver path re-derives `tokenizer: None` on
+    /// absence instead of erroring, and `CandleBackend::load`'s
+    /// `.transpose()?` accepts `None` outright. `probe()` nonetheless fell
+    /// into arm (c) and returned `Err`, and because `ModelCache::get_or_load`
+    /// retains the `CacheEntry` on an `Err` probe (never evicts it), every
+    /// SUBSEQUENT `get_or_load` on the same id would re-probe the same
+    /// vanished file and re-`Err` — permanently wedging a model a cold
+    /// process would serve just fine.
+    ///
+    /// GREEN post-fix: the tokenizer candidate classifies as `optional:
+    /// true` — arm (b) applies, `probe()` reports `Ok(false)` (stale), and
+    /// the caller evicts + reloads instead of wedging forever.
+    #[test]
+    fn probe_tokenizer_deleted_after_capture_is_stale_not_a_refusal() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = tiny_bert_resolved(&dst, None);
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        assert!(
+            fingerprint.probe().unwrap(),
+            "sanity: fresh immediately after capture"
+        );
+
+        std::fs::remove_file(dst.join("tokenizer.json")).unwrap();
+
+        let result = fingerprint.probe();
+        assert!(
+            matches!(result, Ok(false)),
+            "tokenizer.json deleted from a live model directory must report \
+             STALE (Ok(false)) — every resolver path re-derives \
+             `tokenizer: None` on absence and `CandleBackend::load` accepts \
+             it, so a reload legitimately succeeds mirroring cold-process \
+             semantics (R5-F1) — never Err, which would permanently wedge \
+             `ModelCache::get_or_load` on this id. Got {result:?}"
+        );
+    }
+
+    /// R5-F1 peer: two consecutive `probe()` calls after the SAME deletion
+    /// must both report stale (never wedge on the second call either) — the
+    /// exact "permanently wedges" failure mode the auditor named, expressed
+    /// at the fingerprint level (the fingerprint itself is immutable once
+    /// captured, so "two consecutive calls" is "the same fingerprint probed
+    /// twice"; `ModelCache::get_or_load`'s own two-consecutive-calls
+    /// behavior is covered end-to-end in `cache.rs`).
+    #[test]
+    fn probe_tokenizer_deleted_never_wedges_on_repeated_probes() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = tiny_bert_resolved(&dst, None);
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        std::fs::remove_file(dst.join("tokenizer.json")).unwrap();
+
+        for attempt in 0..2 {
+            let result = fingerprint.probe();
+            assert!(
+                matches!(result, Ok(false)),
+                "repeated probe #{attempt} against the same deleted-tokenizer \
+                 fingerprint must keep reporting stale, never wedge into a \
+                 permanent Err — got {result:?}"
+            );
+        }
+    }
+
+    /// R5-F1 (digest side): once `tokenizer.json` is gone and the model is
+    /// reloaded (simulated here by re-resolving with `tokenizer: None`, the
+    /// same shape `discover_local_tokenizer` returns for a tokenizer-less
+    /// directory), the content digest must no longer include a tokenizer
+    /// record — `content_digest_entries` gates each candidate on the
+    /// resolver's own presence signal, so the tokenizer entry leaves the
+    /// fold entirely rather than hashing a vanished path.
+    #[test]
+    fn content_digest_drops_tokenizer_entry_once_resolver_reports_it_absent() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved_with_tokenizer = tiny_bert_resolved(&dst, None);
+        let digest_with_tokenizer = compute_model_content_digest(&resolved_with_tokenizer).unwrap();
+
+        std::fs::remove_file(dst.join("tokenizer.json")).unwrap();
+        let mut resolved_without_tokenizer = resolved_with_tokenizer;
+        resolved_without_tokenizer.tokenizer = None;
+        let digest_without_tokenizer =
+            compute_model_content_digest(&resolved_without_tokenizer).unwrap();
+
+        assert_ne!(
+            digest_with_tokenizer, digest_without_tokenizer,
+            "the content digest must change once the resolver stops \
+             reporting a tokenizer candidate (R5-F1) — the tokenizer record \
+             must leave the fold, not silently keep hashing a path that no \
+             longer exists"
+        );
+    }
+
+    // ── F-4'' (audit round 62, adversarial round 3): fingerprint-before- \
+    //    digest ordering ──
+    //
+    // A literal concurrent-mutation test racing `compute_model_identity_facets`'s
+    // own two internal calls is not deterministically constructible: that
+    // function is synchronous with no `.await` point to pause at, and is
+    // deliberately NOT parameterised with a `#[cfg(test)]` instrumentation
+    // seam (adding one would itself be a second, harder-to-review place the
+    // order could drift from). Instead, the two tests below reproduce the
+    // auditor's exact defect and its fix directly on the two primitives
+    // `compute_model_identity_facets` composes, called in each order — the
+    // observable CONSEQUENCE of the ordering, which is what actually matters
+    // — while `compute_model_identity_facets`'s doc comment pins WHICH order
+    // production takes, structurally (see that function for why a future
+    // reorder cannot happen silently).
+
+    /// The pre-fix (broken) order: hash first, stat second. A mutation
+    /// racing in the window between the two calls makes the fingerprint
+    /// attest the POST-mutation state while the digest attests the
+    /// PRE-mutation bytes — so `probe()` reports fresh FOREVER (nothing
+    /// changes after the fingerprint was captured) despite the digest being
+    /// stale. This is the F-4'' defect itself, reproduced directly.
+    #[test]
+    fn hash_before_stat_would_mask_a_racing_mutation_forever() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = tiny_bert_resolved(&dst, None);
+
+        // Pre-fix order: hash FIRST.
+        let digest_before = compute_model_content_digest(&resolved).unwrap();
+
+        // A mutation races in the window between the hash and the stat.
+        let weights_path = dst.join("model.safetensors");
+        let mut bytes = std::fs::read(&weights_path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&weights_path, &bytes).unwrap();
+
+        // Fingerprint stamped AFTER the mutation: its (len, mtime) matches
+        // the POST-mutation file exactly.
+        let fingerprint_after = compute_model_fingerprint(&resolved).unwrap();
+        let digest_after_mutation = compute_model_content_digest(&resolved).unwrap();
+        assert_ne!(
+            digest_before, digest_after_mutation,
+            "the mutation must actually change the digest — otherwise this \
+             test cannot distinguish stale from fresh"
+        );
+
+        // THE defect: probe reports fresh forever (nothing changes on disk
+        // after this point), even though a process holding `digest_before`
+        // would keep attesting a digest that no longer matches the bytes on
+        // disk — the "confident wrong number" F-4'' names.
+        assert!(
+            fingerprint_after.probe().unwrap(),
+            "hash-before-stat: the fingerprint captured AFTER the mutation \
+             reports fresh — the exact defect a fingerprint-before-digest \
+             ordering closes"
+        );
+    }
+
+    /// The fixed order — what `compute_model_identity_facets` actually does:
+    /// stat first, hash second. The identical mutation, raced into the
+    /// identical window, is now caught by the VERY NEXT probe: the
+    /// fingerprint captured BEFORE the mutation correctly reports stale,
+    /// converging on a reload rather than silently attesting a digest the
+    /// bytes no longer match.
+    #[test]
+    fn stat_before_hash_converges_after_a_racing_mutation() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = tiny_bert_resolved(&dst, None);
+
+        // Fixed order: stat FIRST.
+        let fingerprint_before = compute_model_fingerprint(&resolved).unwrap();
+        assert!(
+            fingerprint_before.probe().unwrap(),
+            "sanity: fresh immediately after capture"
+        );
+
+        let weights_path = dst.join("model.safetensors");
+        let mut bytes = std::fs::read(&weights_path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&weights_path, &bytes).unwrap();
+
+        let _digest_after = compute_model_content_digest(&resolved).unwrap();
+
+        assert!(
+            !fingerprint_before.probe().unwrap(),
+            "stat-before-hash: a mutation landing after the fingerprint was \
+             captured (but before the digest was hashed) must be caught by \
+             the NEXT probe — this order can never leave a fingerprint \
+             permanently attesting a stale digest (F-4'')"
+        );
+    }
+
+    /// Pins the composed function's OUTPUT correctness — its digest matches
+    /// an independent manual `compute_model_content_digest` call, and its
+    /// fingerprint reports fresh — and its return shape,
+    /// `(ModelFingerprint, ModelContentDigest)`.
+    ///
+    /// **What this test does NOT prove (audit round 62 advisory A1, folded
+    /// round 4)**: over an UNMUTATED directory (the only case exercised
+    /// here), fingerprint-then-digest and digest-then-fingerprint produce
+    /// byte-identical results — there is no racing mutation in this test to
+    /// make the two internal calls' ORDER observable, so this assertion
+    /// stays green even if `compute_model_identity_facets`'s two-line body
+    /// silently swapped `compute_model_fingerprint` and
+    /// `compute_model_content_digest`. This test is NOT what pins that
+    /// order. Making the order itself observable would require racing a
+    /// real mutation into the window between the two internal calls, which
+    /// needs a `#[cfg(test)]` pause seam INSIDE
+    /// `compute_model_identity_facets` — deliberately not added (see that
+    /// function's doc: a second instrumentation seam is itself a second,
+    /// harder-to-review place the order could drift from). The actual
+    /// guarantees against a silent reorder are: (1) STRUCTURAL —
+    /// `compute_model_identity_facets` is the sole production call site
+    /// (this file's only other callers of the two primitives are tests),
+    /// its doc comment calls out the ordering invariant explicitly, and a
+    /// diff touching its two-line body is exactly the size a reviewer can
+    /// actually read and hold to that doc; and (2) BEHAVIORAL —
+    /// `stat_before_hash_converges_after_a_racing_mutation` (above) proves
+    /// WHY stat-first is the safe order, using the two primitives called
+    /// manually with a real racing mutation in between, even though it does
+    /// not call the composed function itself.
+    #[test]
+    fn compute_model_identity_facets_matches_manual_stat_then_hash_calls() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = tiny_bert_resolved(&dst, None);
+
+        let (fingerprint, digest) = compute_model_identity_facets(&resolved).unwrap();
+        let manual_digest = compute_model_content_digest(&resolved).unwrap();
+        assert_eq!(
+            digest, manual_digest,
+            "compute_model_identity_facets's digest must match a manual, \
+             independent compute_model_content_digest call over the same \
+             (unmutated) directory"
+        );
+        assert!(
+            fingerprint.probe().unwrap(),
+            "compute_model_identity_facets's fingerprint must report fresh \
+             over the same (unmutated) directory it was captured from"
+        );
+    }
+
+    // ── Round 10 (audit round 62, adversarial round 10 — "the terminal \
+    //    class closure"): the config and weights slots gain the SAME \
+    //    appearance / deletion-with-alternate / all-arms-gone lattice the \
+    //    tokenizer slot already had since round 8, via the `DigestSlot` \
+    //    reshape ──
+
+    /// Build a `ResolvedModel` whose CONFIG SLOT is selected via
+    /// `selected_name` (`"config.json"` or `"open_clip_config.json"`) —
+    /// writing ONLY that one file initially, so these tests can add or
+    /// remove the alternate arm independently. Reuses `tiny_bert`'s
+    /// weights/tokenizer files unmodified; only the config slot is under
+    /// test here.
+    fn resolved_with_config_arm(dst: &std::path::Path, selected_name: &str) -> ResolvedModel {
+        std::fs::create_dir_all(dst).unwrap();
+        let fixture = jammi_test_utils::cookbook_fixture("tiny_bert");
+        for name in ["model.safetensors", "tokenizer.json"] {
+            std::fs::copy(fixture.join(name), dst.join(name)).unwrap();
+        }
+        let config_path = dst.join(selected_name);
+        std::fs::copy(fixture.join("config.json"), &config_path).unwrap();
+        let model_config: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(&config_path).unwrap()).unwrap();
+        ResolvedModel {
+            model_id: crate::model::ModelId(format!("local:{}", dst.display())),
+            backend: crate::model::BackendType::Candle,
+            task: ModelTask::TextEmbedding,
+            config_path,
+            weights_paths: vec![dst.join("model.safetensors")],
+            tokenizer: Some(TokenizerSource::HuggingFaceJson(dst.join("tokenizer.json"))),
+            model_config,
+            preprocessor_config: None,
+            pooling_config: None,
+            base_model_id: None,
+            adapter_path: None,
+            estimated_memory: 0,
+        }
+    }
+
+    /// (a) appearance: load with ONLY the alternate arm
+    /// (`open_clip_config.json`) present; `config.json` — the arm the
+    /// resolver's chain checks FIRST — then appears. RED pre-round-10: the
+    /// config slot only ever fingerprinted the ONE arm the resolver
+    /// selected for this load, so `config.json` appearing was invisible to
+    /// `probe`, which reported fresh forever even though a cold resolve
+    /// would now prefer it over `open_clip_config.json`.
+    #[test]
+    fn config_slot_alternate_arm_appearing_trips_the_probe() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = resolved_with_config_arm(&dst, "open_clip_config.json");
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        assert!(
+            fingerprint.probe().unwrap(),
+            "sanity: fresh immediately after capture"
+        );
+
+        // config.json — the UNSELECTED arm, never read by this load — APPEARS.
+        std::fs::copy(
+            jammi_test_utils::cookbook_fixture("tiny_bert").join("config.json"),
+            dst.join("config.json"),
+        )
+        .unwrap();
+
+        assert!(
+            !fingerprint.probe().unwrap(),
+            "config.json appearing alongside a load selected via its alternate arm \
+             (open_clip_config.json) must trip the probe to stale — a cold resolve \
+             checks config.json FIRST and would now pick it instead (audit round 62, \
+             adversarial round 10)"
+        );
+    }
+
+    /// (b) deletion-with-alternate: BOTH arms exist on disk; the SELECTED
+    /// arm (`config.json`) is deleted while the alternate
+    /// (`open_clip_config.json`) survives. A cold resolve would succeed via
+    /// the alternate, so this must be STALE, never a refusal.
+    #[test]
+    fn config_slot_selected_arm_deleted_with_alternate_present_is_stale_not_a_refusal() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = resolved_with_config_arm(&dst, "config.json");
+        // The alternate arm ALSO exists on disk — untracked by the
+        // pre-round-10 fingerprint, since only the selected arm was ever a
+        // candidate.
+        std::fs::copy(
+            jammi_test_utils::cookbook_fixture("tiny_bert").join("config.json"),
+            dst.join("open_clip_config.json"),
+        )
+        .unwrap();
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        assert!(fingerprint.probe().unwrap());
+
+        std::fs::remove_file(dst.join("config.json")).unwrap();
+
+        let result = fingerprint.probe();
+        assert!(
+            matches!(result, Ok(false)),
+            "deleting the SELECTED config.json while open_clip_config.json (an \
+             alternate arm) still exists must report STALE, never a refusal — a \
+             cold resolve would succeed via the alternate (audit round 62, \
+             adversarial round 10). Got {result:?}"
+        );
+    }
+
+    /// (c) all-arms-gone on a required slot: NO alternate exists at all —
+    /// unchanged from before the round-10 reshape, since a cold resolve
+    /// cannot succeed either.
+    #[test]
+    fn config_slot_all_arms_gone_stays_a_typed_refusal() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = resolved_with_config_arm(&dst, "config.json");
+        // No open_clip_config.json exists at all.
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        std::fs::remove_file(dst.join("config.json")).unwrap();
+
+        let result = fingerprint.probe();
+        assert!(
+            result.is_err(),
+            "deleting config.json with NO alternate (open_clip_config.json) present \
+             must remain a typed refusal — no arm of the config slot can satisfy a \
+             cold resolve — unchanged from before the round-10 reshape. Got {result:?}"
+        );
+    }
+
+    /// Build a `ResolvedModel` whose WEIGHTS SLOT is selected via
+    /// `selected_name` (one of the three well-known weight filenames) —
+    /// writing ONLY that one file initially. `backend` is set to match
+    /// (`Ort` for `"model.onnx"`, `Candle` otherwise), mirroring what
+    /// `resolve_local`'s own `has_onnx` branch would have picked, even
+    /// though this fixture is hand-built rather than routed through the
+    /// resolver.
+    fn resolved_with_weights_arm(dst: &std::path::Path, selected_name: &str) -> ResolvedModel {
+        std::fs::create_dir_all(dst).unwrap();
+        let fixture = jammi_test_utils::cookbook_fixture("tiny_bert");
+        for name in ["config.json", "tokenizer.json"] {
+            std::fs::copy(fixture.join(name), dst.join(name)).unwrap();
+        }
+        let weights_path = dst.join(selected_name);
+        std::fs::copy(fixture.join("model.safetensors"), &weights_path).unwrap();
+        let model_config: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(dst.join("config.json")).unwrap()).unwrap();
+        let backend = if selected_name == "model.onnx" {
+            crate::model::BackendType::Ort
+        } else {
+            crate::model::BackendType::Candle
+        };
+        ResolvedModel {
+            model_id: crate::model::ModelId(format!("local:{}", dst.display())),
+            backend,
+            task: ModelTask::TextEmbedding,
+            config_path: dst.join("config.json"),
+            weights_paths: vec![weights_path],
+            tokenizer: Some(TokenizerSource::HuggingFaceJson(dst.join("tokenizer.json"))),
+            model_config,
+            preprocessor_config: None,
+            pooling_config: None,
+            base_model_id: None,
+            adapter_path: None,
+            estimated_memory: 0,
+        }
+    }
+
+    /// (a) appearance: load with ONLY `model.safetensors` selected;
+    /// `model.onnx` — an arm this load did NOT select — then appears. RED
+    /// pre-round-10: the weights slot only ever fingerprinted the resolved
+    /// `weights_paths` entries themselves, never the OTHER well-known
+    /// filenames, so `model.onnx` appearing was invisible to `probe` —
+    /// silently masking the fact that a cold resolve (`resolve_local`'s
+    /// `has_onnx` branch) would now pick the ORT backend instead. The
+    /// backend flip itself is a COLD-side property, verified independently
+    /// at the resolver level by `models.rs`'s
+    /// `resolve_local_prefers_onnx_once_it_appears_alongside_existing_safetensors`
+    /// — this test asserts what the warm probe can honestly assert:
+    /// staleness was detected.
+    #[test]
+    fn weights_slot_alternate_arm_appearing_trips_the_probe() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = resolved_with_weights_arm(&dst, "model.safetensors");
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        assert!(
+            fingerprint.probe().unwrap(),
+            "sanity: fresh immediately after capture"
+        );
+
+        // model.onnx — the UNSELECTED arm — APPEARS.
+        std::fs::write(dst.join("model.onnx"), b"fake-onnx-bytes").unwrap();
+
+        assert!(
+            !fingerprint.probe().unwrap(),
+            "model.onnx appearing alongside a load resolved via model.safetensors must \
+             trip the probe to stale (audit round 62, adversarial round 10) — it is not \
+             a candle-side-irrelevant file: resolve_local prefers ORT the instant \
+             model.onnx exists"
+        );
+    }
+
+    /// (b) deletion-with-alternate: BOTH `model.safetensors` (selected) and
+    /// `open_clip_model.safetensors` (alternate, untracked pre-round-10)
+    /// exist; the selected arm is deleted. A cold resolve's own
+    /// standard/open_clip fallback chain would succeed via the alternate, so
+    /// this must be STALE, never a refusal.
+    #[test]
+    fn weights_slot_selected_arm_deleted_with_alternate_present_is_stale_not_a_refusal() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = resolved_with_weights_arm(&dst, "model.safetensors");
+        std::fs::copy(
+            dst.join("model.safetensors"),
+            dst.join("open_clip_model.safetensors"),
+        )
+        .unwrap();
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        assert!(fingerprint.probe().unwrap());
+
+        std::fs::remove_file(dst.join("model.safetensors")).unwrap();
+
+        let result = fingerprint.probe();
+        assert!(
+            matches!(result, Ok(false)),
+            "deleting the SELECTED model.safetensors while open_clip_model.safetensors \
+             (an alternate arm) still exists must report STALE, never a refusal — a cold \
+             resolve would succeed via the alternate (audit round 62, adversarial round \
+             10). Got {result:?}"
+        );
+    }
+
+    /// (c) all-arms-gone on a required slot: NO alternate exists at all —
+    /// unchanged from before the round-10 reshape (the peer of
+    /// `probe_required_candidate_deleted_after_capture_stays_a_typed_refusal`
+    /// above, expressed explicitly against the round-10 slot model with its
+    /// own dedicated fixture).
+    #[test]
+    fn weights_slot_all_arms_gone_stays_a_typed_refusal() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = resolved_with_weights_arm(&dst, "model.safetensors");
+        // No open_clip_model.safetensors or model.onnx exists at all.
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        std::fs::remove_file(dst.join("model.safetensors")).unwrap();
+
+        let result = fingerprint.probe();
+        assert!(
+            result.is_err(),
+            "deleting model.safetensors with NO alternate weights file present must \
+             remain a typed refusal — no arm of the weights slot can satisfy a cold \
+             resolve — unchanged from before the round-10 reshape. Got {result:?}"
+        );
+    }
+
+    /// Build a `ResolvedModel` whose weights slot has a PRIMARY arm
+    /// (`model.safetensors`, matching one of the three known names — the
+    /// "primary-file edge" from `all_candidate_paths`' weights-alternates
+    /// doc) PLUS `extra_shard_count` additional CONJUNCTIVELY-required
+    /// shard-named files (`model-NNNNN-of-MMMMM.safetensors`, mirroring HF's
+    /// own sharded naming, resolver.rs:432-442) — every one of them present
+    /// in `weights_paths`, i.e. "all gated". Each shard's bytes are distinct
+    /// (`marker` byte written first) so a per-shard mutation test can target
+    /// exactly one shard unambiguously. Real `download_safetensors` never
+    /// actually produces a named-primary-plus-shards mix (it returns a
+    /// single named file OR the full shard set, never both — see the
+    /// primary-file-edge doc) — this fixture exercises the code path
+    /// generically regardless, since nothing in `all_candidate_paths`'
+    /// per-entry classification depends on that never happening.
+    fn resolved_with_primary_and_shards(
+        dst: &std::path::Path,
+        extra_shard_count: usize,
+    ) -> ResolvedModel {
+        std::fs::create_dir_all(dst).unwrap();
+        let fixture = jammi_test_utils::cookbook_fixture("tiny_bert");
+        for name in ["config.json", "tokenizer.json", "model.safetensors"] {
+            std::fs::copy(fixture.join(name), dst.join(name)).unwrap();
+        }
+        let mut weights_paths = vec![dst.join("model.safetensors")];
+        for i in 0..extra_shard_count {
+            let shard_name = format!("model-{:05}-of-{:05}.safetensors", i + 1, extra_shard_count);
+            let shard_path = dst.join(&shard_name);
+            std::fs::write(&shard_path, [i as u8, 0xAB, 0xCD, 0xEF]).unwrap();
+            weights_paths.push(shard_path);
+        }
+        let model_config: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(dst.join("config.json")).unwrap()).unwrap();
+        ResolvedModel {
+            model_id: crate::model::ModelId(format!("local:{}", dst.display())),
+            backend: crate::model::BackendType::Candle,
+            task: ModelTask::TextEmbedding,
+            config_path: dst.join("config.json"),
+            weights_paths,
+            tokenizer: Some(TokenizerSource::HuggingFaceJson(dst.join("tokenizer.json"))),
+            model_config,
+            preprocessor_config: None,
+            pooling_config: None,
+            base_model_id: None,
+            adapter_path: None,
+            estimated_memory: 0,
+        }
+    }
+
+    /// (a) F-1 core, round 12: deleting ONE shard of a multi-shard weights
+    /// download must be a typed REFUSAL, never merely stale — a shard is
+    /// CONJUNCTIVELY required (`VarBuilder::from_mmaped_safetensors` needs
+    /// ALL of them), so no sibling shard's continued presence can rescue a
+    /// cold resolve of the now-incomplete set.
+    ///
+    /// RED pre-fix (round-10 folded-slot shape, reproduced via the stash
+    /// methodology: reverting `all_candidate_paths`' weights-slot
+    /// construction to append every shard as an extra ALWAYS-GATED arm of
+    /// the SAME disjunctive alternates slot): the deleted shard was just
+    /// one more arm of that slot, and the slot's OTHER arms (the still-intact
+    /// second shard, or the primary) satisfy `any_arm_present_now`, so
+    /// `probe` fell into arm (b) and wrongly reported `Ok(false)` (stale)
+    /// instead of the typed refusal a cold resolve of the now-incomplete
+    /// shard set would actually hit. GREEN post-fix: each shard is its own
+    /// single-arm, `absence_tolerated: false` slot, so losing it is arm (c)
+    /// unconditionally.
+    #[test]
+    fn shard_slot_one_shard_deleted_is_a_typed_refusal_never_stale() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = resolved_with_primary_and_shards(&dst, 2);
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        assert!(
+            fingerprint.probe().unwrap(),
+            "sanity: fresh immediately after capture"
+        );
+
+        // Delete exactly one shard (the second extra shard); the primary
+        // and the OTHER shard remain untouched.
+        std::fs::remove_file(dst.join("model-00002-of-00002.safetensors")).unwrap();
+
+        let result = fingerprint.probe();
+        assert!(
+            result.is_err(),
+            "deleting one shard of a multi-shard weights download must be a typed \
+             refusal (audit round 62, adversarial round 12, F-1) — a shard is \
+             CONJUNCTIVELY required, so the primary file and the OTHER shard still \
+             being present must NOT rescue this into merely stale. Got {result:?}"
+        );
+    }
+
+    /// (b) slot independence: the weights ALTERNATES slot's own arm-(c)
+    /// contract (all three named arms gone -> typed refusal) must still hold
+    /// even when this fixture ALSO has healthy, untouched per-shard slots —
+    /// proving the round-12 reshape did not accidentally let a healthy shard
+    /// slot mask a genuine alternates-slot refusal (each slot is evaluated,
+    /// and can independently refuse, on its own).
+    #[test]
+    fn alternates_slot_all_arms_gone_is_a_typed_refusal_even_with_shards_intact() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = resolved_with_primary_and_shards(&dst, 2);
+        // No open_clip_model.safetensors or model.onnx exists at all, so
+        // deleting the primary leaves EVERY arm of the alternates slot gone.
+
+        let fingerprint = compute_model_fingerprint(&resolved).unwrap();
+        std::fs::remove_file(dst.join("model.safetensors")).unwrap();
+        // The two shard files are left completely untouched.
+
+        let result = fingerprint.probe();
+        assert!(
+            result.is_err(),
+            "deleting the sole named primary, with no open_clip_model.safetensors or \
+             model.onnx alternate present, must remain a typed refusal for the \
+             ALTERNATES slot regardless of the per-shard slots being entirely \
+             untouched and healthy — each slot refuses independently. Got {result:?}"
+        );
+    }
+
+    /// (d) the shard-append reshape must still digest-gate every shard: a
+    /// byte mutation to any ONE shard file must change
+    /// `compute_model_content_digest`'s output, under a constant
+    /// `resolved.weights_paths` — the multi-shard peer of the existing
+    /// single-file `weights_slot_*` digest coverage (the adapter/config/
+    /// tokenizer/pooling mutation family in this module), extended to the
+    /// per-shard-slot shape (round 12).
+    #[test]
+    fn shard_byte_mutation_changes_content_digest() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = resolved_with_primary_and_shards(&dst, 2);
+
+        let digest_before = compute_model_content_digest(&resolved).unwrap();
+
+        let shard_path = dst.join("model-00001-of-00002.safetensors");
+        let mut bytes = std::fs::read(&shard_path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&shard_path, &bytes).unwrap();
+
+        let digest_after = compute_model_content_digest(&resolved).unwrap();
+
+        assert_ne!(
+            digest_before, digest_after,
+            "mutating ONE shard's bytes in place, under a constant `weights_paths`, must \
+             change the content digest — every shard remains its own always-gated slot \
+             after the round-12 reshape, exactly like the pre-reshape flat per-file model"
+        );
+    }
+}
+
+// ── R5-F2 (audit round 62, adversarial round 6): a classification-loaded \
+//    model must refuse a TextEmbedding request, not silently mean-pool \
+//    softmax logits ──
+
+#[cfg(test)]
+mod r5_f2_classification_pooling_tests {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, StringArray};
+
+    use super::*;
+
+    fn device_config() -> DeviceConfig {
+        DeviceConfig {
+            gpu_device: -1,
+            memory_fraction: 1.0,
+            require_gpu: false,
+            compute_precision: jammi_numerics::ComputePrecision::F32,
+        }
+    }
+
+    fn two_row_content() -> Vec<ArrayRef> {
+        vec![Arc::new(StringArray::from(vec!["fine row", "another row"])) as ArrayRef]
+    }
+
+    /// A `ResolvedModel` for the `tiny_modernbert_classifier` cookbook
+    /// fixture (`model_type: "modernbert"`, `id2label` present — the exact
+    /// shape `CandleBackend::load`'s `is_classification` gate requires),
+    /// resolved for `ModelTask::Classification` — the SAME construction a
+    /// real `ModelResolver::resolve` + `ModelCache::get_or_load` call would
+    /// produce for a caller that loaded this model to classify.
+    fn tiny_modernbert_classifier_resolved(dst: &std::path::Path) -> ResolvedModel {
+        std::fs::create_dir_all(dst).unwrap();
+        let fixture = jammi_test_utils::cookbook_fixture("tiny_modernbert_classifier");
+        for name in ["config.json", "model.safetensors", "tokenizer.json"] {
+            std::fs::copy(fixture.join(name), dst.join(name)).unwrap();
+        }
+        let model_config: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(dst.join("config.json")).unwrap()).unwrap();
+        ResolvedModel {
+            model_id: crate::model::ModelId(format!("local:{}", dst.display())),
+            backend: crate::model::BackendType::Candle,
+            task: ModelTask::Classification,
+            config_path: dst.join("config.json"),
+            weights_paths: vec![dst.join("model.safetensors")],
+            tokenizer: Some(TokenizerSource::HuggingFaceJson(dst.join("tokenizer.json"))),
+            model_config,
+            preprocessor_config: None,
+            pooling_config: None,
+            base_model_id: None,
+            adapter_path: None,
+            estimated_memory: 0,
+        }
+    }
+
+    /// R5-F2 (block): reproduces the auditor's exact mismatch at the
+    /// closest constructible seam — `CandleBackend::load` a genuine
+    /// classification-shaped checkpoint (the SAME construction a
+    /// `ModelCache` warm entry loaded for `ModelTask::Classification` would
+    /// hold), then request `ModelTask::TextEmbedding` against that SAME
+    /// `LoadedModel` — exactly what a second caller reaches through
+    /// `ModelCache::get_or_load` today, since the cache keys purely on
+    /// `ModelId` and never compares the originally-loaded task against a
+    /// new request's task.
+    ///
+    /// RED pre-fix: none of the three classification wrappers overrode
+    /// `forward_pooled`, so `LoadedModel::forward(.., TextEmbedding)` →
+    /// `CandleModel::forward_embedding` → `self.text_forward()?.forward_pooled(..)`
+    /// silently fell through to `CandleTextForward`'s trait-default —
+    /// REAL mean-pooling over the classification wrapper's softmax-logit
+    /// `forward_hidden` output (a `[batch, num_classes]` probability
+    /// distribution, not a per-token hidden state sequence) — producing
+    /// either a shape error deep inside candle (opaque, not a typed
+    /// refusal) or, worse, a confident-wrong tensor of the wrong width.
+    ///
+    /// GREEN post-fix: the classification wrapper's `forward_pooled`
+    /// override refuses immediately with a named, typed
+    /// `JammiError::Inference`, never reaching `mean_pool`/`l2_normalize`
+    /// at all.
+    #[test]
+    fn classification_loaded_model_refuses_text_embedding_request() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = tiny_modernbert_classifier_resolved(&dst);
+
+        let backend = CandleBackend;
+        let loaded = backend
+            .load(&resolved, &device_config())
+            .expect("a genuinely classification-shaped checkpoint must load successfully");
+
+        let content = two_row_content();
+        let result = loaded.forward(&content, ModelTask::TextEmbedding);
+
+        match result {
+            Ok(_) => panic!(
+                "a classification-loaded model must REFUSE a TextEmbedding \
+                 request with a typed error (R5-F2) — never silently produce \
+                 a tensor by falling through to forward_pooled's mean-pool \
+                 default over softmax-logit output"
+            ),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("classification") && msg.contains("pooling"),
+                    "expected the classification-pooling-mismatch typed \
+                     refusal (from `classification_pooling_refusal`), got: {msg}"
+                );
+            }
+        }
+    }
+
+    /// Control (F family: non-vacuous negative control): the IDENTICAL
+    /// classification-loaded model must still serve its OWN task
+    /// (`Classification`) successfully — the fix must refuse the MISMATCH
+    /// specifically, not classification serving in general.
+    #[test]
+    fn classification_loaded_model_still_serves_classification_request() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = tiny_modernbert_classifier_resolved(&dst);
+
+        let backend = CandleBackend;
+        let loaded = backend
+            .load(&resolved, &device_config())
+            .expect("a genuinely classification-shaped checkpoint must load successfully");
+
+        let content = two_row_content();
+        let result = loaded.forward(&content, ModelTask::Classification);
+        match result {
+            Ok(_) => {}
+            Err(e) => panic!(
+                "the classification wrapper's OWN task must still serve \
+                 successfully — the fix refuses the TextEmbedding MISMATCH, \
+                 not classification itself. Got Err({e})"
+            ),
+        }
+    }
+
+    /// A `ResolvedModel` for the SAME `tiny_modernbert_classifier` cookbook
+    /// fixture as above (its `config.json` carries `id2label` — a real
+    /// checkpoint's default classification-head declaration), but resolved
+    /// for `ModelTask::TextEmbedding` instead of `Classification` — the
+    /// SAME construction a caller who loads this checkpoint to embed, not
+    /// classify, would produce. `CandleBackend::load`'s `is_classification`
+    /// gate (`resolved.task == ModelTask::Classification && id2label.is_some()`)
+    /// is `false` here, so a plain `ModernBertForward` (not
+    /// `ModernBertClassificationForward`) is built — but `CandleModel::id2label`
+    /// is still populated, since that parse reads `config.json` unconditionally,
+    /// independent of `is_classification`.
+    fn tiny_modernbert_classifier_resolved_for_embedding(dst: &std::path::Path) -> ResolvedModel {
+        let mut resolved = tiny_modernbert_classifier_resolved(dst);
+        resolved.task = ModelTask::TextEmbedding;
+        resolved
+    }
+
+    /// R7-F2 (audit round 62, adversarial round 8 advisory fold): the mirror
+    /// of `classification_loaded_model_refuses_text_embedding_request`
+    /// above, in the OTHER mismatch direction — an embedding-loaded warm
+    /// entry (`ModelTask::TextEmbedding`, `id2label` present in
+    /// `config.json` regardless) requested for `ModelTask::Classification`.
+    ///
+    /// RED pre-fix: `forward_classification`'s only guard was
+    /// `self.id2label.is_some()`, which this scenario satisfies — so the
+    /// call proceeded to `self.text_forward()?.forward_hidden(..)` (the
+    /// PLAIN `ModernBertForward`'s raw per-token hidden states,
+    /// `[batch, seq_len, hidden_size]`) and then `to_vec2::<f32>()` over
+    /// that 3-D tensor, dying with an opaque candle rank error instead of a
+    /// legible typed refusal.
+    ///
+    /// GREEN post-fix: `is_classification_head()` is `false` for the plain
+    /// `ModernBertForward` wrapper, so `forward_classification` refuses
+    /// immediately with `classification_kind_mismatch_refusal`, never
+    /// reaching `to_vec2` at all.
+    #[test]
+    fn embedding_loaded_model_with_id2label_refuses_classification_request() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = tiny_modernbert_classifier_resolved_for_embedding(&dst);
+
+        let backend = CandleBackend;
+        let loaded = backend
+            .load(&resolved, &device_config())
+            .expect("an id2label-bearing checkpoint loaded for TextEmbedding must still succeed");
+
+        let content = two_row_content();
+        let result = loaded.forward(&content, ModelTask::Classification);
+
+        match result {
+            Ok(_) => panic!(
+                "an embedding-loaded model must REFUSE a Classification \
+                 request with a typed error (R7-F2) — never reach \
+                 to_vec2::<f32> over the raw hidden-states tensor and fail \
+                 with an opaque candle rank error"
+            ),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("not loaded for classification"),
+                    "expected the classification-kind-mismatch typed refusal \
+                     (from `classification_kind_mismatch_refusal`), got: {msg}"
+                );
+            }
+        }
+    }
+
+    /// Control (F family: non-vacuous negative control) for R7-F2: the
+    /// IDENTICAL embedding-loaded, `id2label`-bearing model must still serve
+    /// its OWN task (`TextEmbedding`) successfully — the fix refuses the
+    /// MISMATCH specifically, not embedding serving in general.
+    #[test]
+    fn embedding_loaded_model_with_id2label_still_serves_text_embedding_request() {
+        let model_tmp = tempfile::tempdir().unwrap();
+        let dst = model_tmp.path().join("model");
+        let resolved = tiny_modernbert_classifier_resolved_for_embedding(&dst);
+
+        let backend = CandleBackend;
+        let loaded = backend
+            .load(&resolved, &device_config())
+            .expect("an id2label-bearing checkpoint loaded for TextEmbedding must still succeed");
+
+        let content = two_row_content();
+        let result = loaded.forward(&content, ModelTask::TextEmbedding);
+        match result {
+            Ok(_) => {}
+            Err(e) => panic!(
+                "the embedding wrapper's OWN task must still serve \
+                 successfully — the fix refuses the Classification \
+                 MISMATCH, not text-embedding itself. Got Err({e})"
+            ),
+        }
     }
 }

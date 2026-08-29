@@ -475,6 +475,35 @@ pub fn probe_cuda_compute_capability(device: &candle_core::Device) -> Option<Com
     }
 }
 
+/// Probes the driver-reported name of a candle [`candle_core::Device`]'s
+/// underlying CUDA device (e.g. `"NVIDIA L40S"`), if it is a CUDA device
+/// this build can query.
+///
+/// Mirrors [`probe_cuda_compute_capability`] exactly: same
+/// `CudaDevice::cuda_stream().context()` handle (no fresh
+/// `CudaContext::new(ordinal)`, so no extra thread-binding side effect —
+/// see that function's doc for why), same `None`-on-non-CUDA /
+/// `None`-without-the-`cuda`-feature / `None`-on-query-failure collapse.
+/// This is identification metadata for a print/log header, not an
+/// admission predicate: no call site should branch dispatch on it (unlike
+/// [`ComputeCapability`], which several call sites gate on).
+pub fn probe_cuda_device_name(device: &candle_core::Device) -> Option<String> {
+    #[cfg(feature = "cuda")]
+    {
+        if let candle_core::Device::Cuda(cuda_device) = device {
+            if let Ok(name) = cuda_device.cuda_stream().context().name() {
+                return Some(name);
+            }
+        }
+        None
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = device;
+        None
+    }
+}
+
 /// Whether a fused-op call site falls back to the eager composition when
 /// its domain check fails, or treats the failure as a hard error.
 ///
@@ -1397,6 +1426,14 @@ mod tests {
             probe_cuda_compute_capability(&candle_core::Device::Cpu),
             None
         );
+    }
+
+    #[test]
+    fn device_name_probe_on_cpu_device_is_not_applicable() {
+        // Same boundary oracle as `probe_on_cpu_device_is_not_applicable`,
+        // for the sibling name probe: a non-CUDA device is "not
+        // applicable", never a probe failure masquerading as a name.
+        assert_eq!(probe_cuda_device_name(&candle_core::Device::Cpu), None);
     }
 
     #[test]

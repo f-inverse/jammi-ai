@@ -77,6 +77,84 @@ from identity_fields import (  # noqa: E402
 
 LEGS = ["jammi-eager", "jammi-fused", "torch-eager", "torch-sdpa"]
 
+# --------------------------------------------------------------------------- #
+# Generic leg-premise-refusal core (unit-62 E6) — `leg_identity_fields`/
+# `leg_premise_violations` below are the finetune-step-SPECIFIC callers
+# (report shape, torch args-level field placement, `_MISSING`-folding
+# doctrine); `generic_leg_identity_fields`/`generic_leg_premise_violations`
+# are the SAME two-step shape (fold ABSENT-or-null into `_MISSING`, then
+# compare after `canonicalize_identity_field`) factored out over an
+# arbitrary `fields` tuple and two ALREADY-FLATTENED `{field: value}` dicts,
+# so a NEW producer (`encode_ab.sh`, this unit) reuses the identical
+# premise-refusal logic against `identity_fields.ENCODE_IDENTITY_FIELDS`
+# rather than hand-rolling a second, independently-drifting comparator.
+# `leg_identity_fields`/`leg_premise_violations` are UNCHANGED by this
+# addition (no weakening of the finetune-step check either function backs) —
+# this is purely additive shared machinery a new caller can build on.
+# --------------------------------------------------------------------------- #
+def generic_leg_identity_fields(block, fields, null_is_value_fields=frozenset()):
+    """Read `fields` off `block` (a FLAT dict — the caller resolves WHERE
+    each field actually lives on its own report shape before calling this;
+    `encode_ab.sh`'s merge step reads directly off `report["tiers"]
+    ["encode_step"]`, which already carries every `ENCODE_IDENTITY_FIELDS`
+    entry at one level, so no per-field placement map is needed there).
+
+    Returns `{field: value_or_MISSING}` — `_MISSING` (never `None`) marks a
+    field genuinely ABSENT from `block` OR present with a JSON `null` value,
+    UNLESS `field` is a `null_is_value_fields` member (mirrors
+    `identity_fields.FINETUNE_NULL_IS_A_VALUE_FIELDS`'s own doctrine: for
+    those fields a present `null` IS the stated premise, not an inability to
+    state one). No `ENCODE_IDENTITY_FIELDS` entry is a `null_is_value_fields`
+    member today (every one is `Nullable::NonNull` on `EncodeStepTier`), so
+    encode callers pass the default empty set.
+    """
+    fields_out = {}
+    for field in fields:
+        if field not in block:
+            fields_out[field] = _MISSING
+            continue
+        value = block[field]
+        if value is None and field not in null_is_value_fields:
+            value = _MISSING
+        fields_out[field] = value
+    return fields_out
+
+
+def generic_leg_premise_violations(fields, fields_a, fields_b, label_a="a", label_b="b"):
+    """The SAME leg-premise-refusal shape `leg_premise_violations` applies to
+    finetune-step's `FINETUNE_IDENTITY_FIELDS`, generalized over an
+    arbitrary `fields` tuple and two `generic_leg_identity_fields`-shaped
+    `{field: value_or_MISSING}` dicts: a field missing (or present-but-null,
+    already folded to `_MISSING` by the caller) from EITHER side is a
+    refusal (cannot verify the two legs share a premise); a field present
+    on both but differing after `canonicalize_identity_field` (the SAME
+    shared canonicalizer table `leg_premise_violations`/
+    `compare_grad_oracle.py` both already use) is also a refusal. Returns a
+    list of strings, empty when the two legs' premises agree on every
+    named field.
+    """
+    violations = []
+    for field in fields:
+        va = fields_a.get(field, _MISSING)
+        vb = fields_b.get(field, _MISSING)
+        missing_sides = []
+        if va is _MISSING:
+            missing_sides.append(label_a)
+        if vb is _MISSING:
+            missing_sides.append(label_b)
+        if missing_sides:
+            violations.append(
+                f"leg-identity field {field!r} missing from {missing_sides} leg's record -- cannot "
+                "verify the two legs of this config ran under the same premise"
+            )
+            continue
+        ca = canonicalize_identity_field(field, va)
+        cb = canonicalize_identity_field(field, vb)
+        if ca != cb:
+            violations.append(f"leg-identity field {field!r} differs: {label_a}={ca!r} {label_b}={cb!r}")
+    return violations
+
+
 # The premise-identity check (fold-in, this round: the adjacent probe found
 # this module carried NO premise-identity check at all -- identity was
 # "by construction" of `finetune_ab.sh`'s own matched CLI flags across its

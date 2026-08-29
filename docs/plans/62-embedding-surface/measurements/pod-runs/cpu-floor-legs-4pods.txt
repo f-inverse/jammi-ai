@@ -1,0 +1,40 @@
+=== job(a100:62int): polling every 20s, up to 1200s (pod 154.54.102.51:13437) ===
+test batch_composition_invariance::pooled_embedding_alone_matches_padded_batch_real_row_f32_cpu ... ok
+test batch_composition_invariance::pooled_embedding_red_control_row_length_off_by_one_f32_cpu ... ok
+test batch_composition_invariance::pooled_embedding_red_control_window_radius_off_by_one_f32_cpu ... ok
+test modernbert::padded_training_loss_and_lora_grads_match_unpadded_rows_run_individually_f32_cpu ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 38 filtered out; finished in 3.54s
+CPU-FLOOR-LEG-RC:0
+=== job(a100:62int): SUCCESS ===
+=== job(h100:62int): polling every 20s, up to 1200s (pod 87.120.211.211:18472) ===
+test batch_composition_invariance::pooled_embedding_alone_matches_padded_batch_real_row_f32_cpu ... ok
+test batch_composition_invariance::pooled_embedding_red_control_row_length_off_by_one_f32_cpu ... ok
+test batch_composition_invariance::pooled_embedding_red_control_window_radius_off_by_one_f32_cpu ... ok
+test modernbert::padded_training_loss_and_lora_grads_match_unpadded_rows_run_individually_f32_cpu ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 38 filtered out; finished in 1.71s
+CPU-FLOOR-LEG-RC:0
+=== job(h100:62int): SUCCESS ===
+=== job(l40s:62int): polling every 20s, up to 1200s (pod 103.196.86.41:35204) ===
+test batch_composition_invariance::pooled_embedding_alone_matches_padded_batch_real_row_f32_cpu ... ok
+test batch_composition_invariance::pooled_embedding_red_control_row_length_off_by_one_f32_cpu ... ok
+test batch_composition_invariance::pooled_embedding_red_control_window_radius_off_by_one_f32_cpu ... ok
+test modernbert::padded_training_loss_and_lora_grads_match_unpadded_rows_run_individually_f32_cpu ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 38 filtered out; finished in 4.15s
+CPU-FLOOR-LEG-RC:0
+=== job(l40s:62int): SUCCESS ===
+=== job(a40:62int): polling every 20s, up to 1200s (pod 69.30.85.96:22041) ===
+test batch_composition_invariance::pooled_embedding_alone_matches_padded_batch_real_row_f32_cpu ... ok
+test batch_composition_invariance::pooled_embedding_red_control_row_length_off_by_one_f32_cpu ... ok
+test batch_composition_invariance::pooled_embedding_red_control_window_radius_off_by_one_f32_cpu ... ok
+test modernbert::padded_training_loss_and_lora_grads_match_unpadded_rows_run_individually_f32_cpu ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 38 filtered out; finished in 2.93s
+CPU-FLOOR-LEG-RC:0
+=== job(a40:62int): SUCCESS ===
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 38 filtered out; finished in 3.54s
+CPU-FLOOR-LEG-RC:0
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 38 filtered out; finished in 1.71s
+CPU-FLOOR-LEG-RC:0
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 38 filtered out; finished in 4.15s
+CPU-FLOOR-LEG-RC:0
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 38 filtered out; finished in 2.93s
+CPU-FLOOR-LEG-RC:0

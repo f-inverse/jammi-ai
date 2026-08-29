@@ -64,6 +64,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ab_merge  # noqa: E402
 import compare_grad_oracle  # noqa: E402
+import identity_fields  # noqa: E402
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 REPORT_RS = os.path.join(REPO_ROOT, "crates", "jammi-bench", "src", "report.rs")
@@ -103,6 +104,51 @@ def _extract_rust_identity_fields(path: str) -> list[str]:
     fields = _FIELD_NAME_RE.findall(match.group(1))
     if not fields:
         raise SystemExit(f"FAIL-CLOSED: IDENTITY_FIELDS block in {path} matched but named zero fields")
+    return fields
+
+
+# `EncodeStepTier` and `FinetuneStepTier` BOTH declare a const literally
+# named `IDENTITY_FIELDS` in the SAME file (`report.rs`) — `_IDENTITY_FIELDS_
+# BLOCK_RE.search(text)` alone would always find `FinetuneStepTier`'s block
+# first (it sits earlier in the file) and never `EncodeStepTier`'s own.
+# `_scoped_to_impl` narrows the search text to everything from a given
+# struct's OWN `impl <Struct> {` marker onward, so the SAME "first matching
+# block" regex then unambiguously finds THAT struct's const — never the
+# unscoped file-wide first match. Mirrors `check_cuda_run_artifacts.py`'s own
+# restructure of `build_identity_tuples()` (unit-62 E6 gate-restructure
+# commit) — the SAME struct-scoping idea, applied independently here since
+# this checker never imports that gate module.
+_PROVENANCE_FIELDS_BLOCK_RE = re.compile(
+    r"pub const PROVENANCE_FIELDS:\s*&'static \[\(&'static str,\s*"
+    r"[\w:]*Nullable\)\]\s*=\s*&\[(.*?)\n    \];",
+    re.DOTALL,
+)
+
+
+def _scoped_to_impl(text: str, struct: str) -> str:
+    anchor = f"impl {struct} {{"
+    idx = text.find(anchor)
+    if idx == -1:
+        raise SystemExit(f"FAIL-CLOSED: no `{anchor}` block found — cannot scope extraction to struct {struct!r}")
+    return text[idx:]
+
+
+def _extract_rust_fields_block(path: str, block_re: re.Pattern, struct: str) -> list[str]:
+    if not os.path.isfile(path):
+        raise SystemExit(f"FAIL-CLOSED: {path} does not exist")
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    scoped = _scoped_to_impl(text, struct)
+    match = block_re.search(scoped)
+    if match is None:
+        raise SystemExit(
+            f"FAIL-CLOSED: no matching const block found in {path}, scoped to `impl {struct} {{` — "
+            f"either the const was never added (RED at base) or this regex needs updating for a "
+            f"genuine reformat"
+        )
+    fields = _FIELD_NAME_RE.findall(match.group(1))
+    if not fields:
+        raise SystemExit(f"FAIL-CLOSED: matched const block in {path} (struct {struct!r}) named zero fields")
     return fields
 
 
@@ -195,6 +241,89 @@ class GradOracleIdentityFieldsSubsetTests(unittest.TestCase):
             "completeness field beyond compare_grad_oracle.py's own comparison "
             "tuple (lora_init / device_name)",
         )
+
+
+class EncodeStepIdentityFieldsSubsetTests(unittest.TestCase):
+    """Unit-62 E6 mirror: `identity_fields.ENCODE_IDENTITY_FIELDS` (Python)
+    against `EncodeStepTier::IDENTITY_FIELDS`/`::PROVENANCE_FIELDS` (Rust,
+    `report.rs`). UNLIKE `FinetuneStepIdentityFieldsSubsetTests` above, this
+    is an EQUALITY check, not a subset check — `EncodeStepTier` keeps its
+    provenance fields in an entirely DISJOINT const (never folded into
+    `IDENTITY_FIELDS`, unlike `FinetuneStepTier`'s own superset-folding
+    shape), so there is no larger Rust identity const for the Python tuple
+    to be a strict subset of — the two sets must be the SAME set. A drift on
+    EITHER side (a name added/removed from either the Python tuple or the
+    Rust const, or a field crossing from one const to the other) REDs here.
+    """
+
+    def setUp(self):
+        self.rust_identity_fields = set(
+            _extract_rust_fields_block(REPORT_RS, _IDENTITY_FIELDS_BLOCK_RE, "EncodeStepTier")
+        )
+        self.rust_provenance_fields = set(
+            _extract_rust_fields_block(REPORT_RS, _PROVENANCE_FIELDS_BLOCK_RE, "EncodeStepTier")
+        )
+
+    def test_encode_identity_fields_has_exactly_15_entries(self):
+        self.assertEqual(
+            len(identity_fields.ENCODE_IDENTITY_FIELDS),
+            15,
+            "identity_fields.py::ENCODE_IDENTITY_FIELDS must have EXACTLY 15 entries "
+            "(unit-62 CONTRACT.md §E3/E6's pinned list, grown from 13 by the round-3 "
+            "audit F-5'/lead ruling's checkpoint_pooling_sha256 + device_requested "
+            "addition) — a count other than 15 means either this const drifted from "
+            "EncodeStepTier::IDENTITY_FIELDS or the Rust side itself grew/shrank; "
+            "re-derive from source, never bump to make this test pass.",
+        )
+        self.assertEqual(
+            len(set(identity_fields.ENCODE_IDENTITY_FIELDS)),
+            15,
+            "ENCODE_IDENTITY_FIELDS contains a duplicate entry",
+        )
+
+    def test_rust_provenance_fields_has_exactly_7_entries(self):
+        self.assertEqual(
+            len(self.rust_provenance_fields),
+            7,
+            f"EncodeStepTier::PROVENANCE_FIELDS ({REPORT_RS}) must have EXACTLY 7 "
+            "entries (unit-62 CONTRACT.md §E3's pinned provenance list) — a count "
+            f"other than 7 means the Rust const drifted: {sorted(self.rust_provenance_fields)}",
+        )
+
+    def test_encode_identity_fields_equals_the_rust_const(self):
+        python_fields = set(identity_fields.ENCODE_IDENTITY_FIELDS)
+        self.assertEqual(
+            python_fields,
+            self.rust_identity_fields,
+            f"identity_fields.py::ENCODE_IDENTITY_FIELDS ({sorted(python_fields)}) must equal "
+            f"EncodeStepTier::IDENTITY_FIELDS ({sorted(self.rust_identity_fields)}) EXACTLY — "
+            "this tier's identity/provenance split is disjoint, not superset-folded, so the "
+            "Python mirror is the WHOLE identity set, never merely a subset of it",
+        )
+
+    def test_identity_and_provenance_are_disjoint(self):
+        overlap = self.rust_identity_fields & self.rust_provenance_fields
+        self.assertFalse(
+            overlap,
+            f"EncodeStepTier::IDENTITY_FIELDS and ::PROVENANCE_FIELDS share field(s) {sorted(overlap)} — "
+            "unit-62's E3 design keeps these two sets DISJOINT (never a field in both)",
+        )
+        overlap_py = set(identity_fields.ENCODE_IDENTITY_FIELDS) & self.rust_provenance_fields
+        self.assertFalse(
+            overlap_py,
+            f"identity_fields.py::ENCODE_IDENTITY_FIELDS names provenance-only field(s) "
+            f"{sorted(overlap_py)} — provenance must never be admitted to the Python comparison "
+            "tuple either",
+        )
+
+    def test_attention_arm_is_not_an_identity_field(self):
+        # Negative control (v2 reshape 3 of the unit-62 plan): a dispatched
+        # arm is post-hoc, never knowable before compute, so it can never be
+        # a memoization key — mirrors EncodeStepTier's own Rust-side
+        # negative-control test in encode_step.rs.
+        self.assertNotIn("attention_arm", identity_fields.ENCODE_IDENTITY_FIELDS)
+        self.assertNotIn("attention_arm", self.rust_identity_fields)
+        self.assertIn("attention_arm", self.rust_provenance_fields)
 
 
 if __name__ == "__main__":

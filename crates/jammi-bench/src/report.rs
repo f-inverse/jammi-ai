@@ -368,6 +368,16 @@ pub struct Tiers {
     /// `live-gpu-tests` lane).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu_inference: Option<GpuInferenceTier>,
+    /// The identity-audited encode-step tier (unit 62, K7/E3): drives the
+    /// engine's real `generate_text_embeddings` serving path over a small
+    /// deterministic corpus and a fixture model dir with an EXPLICIT
+    /// `1_Pooling/config.json`, folding the complete output-affecting
+    /// parameter set into `EncodeStepTier::IDENTITY_FIELDS` so two legs are
+    /// comparable only when every one of those fields agrees. See
+    /// `EncodeStepTier`'s own doc for the full K7/esc-057 rationale.
+    /// Populated by `encode-step`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encode_step: Option<EncodeStepTier>,
     /// The CPU-hermetic cache-hit SLO tier: the engine's opt-in producer
     /// memoization (`CachePolicy::Use`) on a cacheable producer (the
     /// neighbour-graph, anchored on an immutable `ResultDigest`). A cold `Use`
@@ -1846,6 +1856,360 @@ pub struct GpuInferenceTier {
     pub embed: GpuLane,
     /// The classification (`infer`) verb's lane.
     pub infer: GpuLane,
+}
+
+/// The identity-audited encode-step tier (unit 62, K7/E3): drives the
+/// engine's real text-embedding serving surface —
+/// [`generate_text_embeddings`](jammi_ai::session::InferenceSession::generate_text_embeddings),
+/// the SAME `resolve -> tokenize -> forward -> pool -> normalize` path a
+/// serving request walks — over a small deterministic corpus and a
+/// committed-shape fixture model directory, so a step's report is a real
+/// measurement of the shipped path, never a synthetic loop that bypasses the
+/// engine's own resolve/tokenize/pool/normalize sequence.
+///
+/// ## Why this tier exists: K7 completeness at the bench-comparison seam
+///
+/// esc-057 (closed at the `ModelIdentity` layer by this unit's E1/E2) was a
+/// silent-identity defect: pooling/tokenizer/weights could mutate under a
+/// constant `model_id` with no `DefinitionHash` change. This tier closes the
+/// analogous gap one layer up, at BENCH comparison: two `encode-step` legs
+/// are "the same measurement" only if every field in
+/// [`EncodeStepTier::IDENTITY_FIELDS`] agrees — the complete
+/// output-affecting parameter set for this surface (seed, batch shape, the
+/// resolved sequence/row lengths, the compute precision, the checkpoint's
+/// content identity (config/weights/tokenizer/pooling-config bytes), the
+/// pooling strategy actually applied, whether the output is normalized, the
+/// requested device, and the warmup/measured-iteration counts that bound
+/// what was actually timed).
+///
+/// ## `pooling` is READ OFF THE LOADED MODEL, never transcribed (unit-62 F-5')
+///
+/// The fixture model directory this tier builds carries an EXPLICIT
+/// `1_Pooling/config.json` (mean pooling) rather than the bare `tiny_bert`
+/// fixture, which ships with no `1_Pooling/` folder at all and would
+/// silently resolve through `candle.rs`'s own mean-pooling fallback
+/// (`pooling_from_config`'s documented default for a repo that ships no
+/// pooling config) — the exact ambiguity esc-057 is about. [`Self::pooling`]
+/// itself is read straight off
+/// [`jammi_ai::model::LoadedModel::resolved_pooling`] (the SAME accessor
+/// pattern [`Self::compute_precision`]'s own fix already established) —
+/// the pooling strategy the LOADED model's text-embedding wrapper actually
+/// pools with, never a constant mirroring the fixture-writer function. A
+/// round-3 audit (F-5') found the prior constant `"mean"` literal
+/// byte-identical across a flip of the fixture to `Cls` while every other
+/// identity field (including the config/weights/tokenizer checksums) stayed
+/// put — reading the LOADED model closes that gap: [`Self::checkpoint_pooling_sha256`]
+/// closes the companion gap of the pooling-CONFIG BYTES never entering any
+/// identity field at all.
+///
+/// ## `attention_arm` and the memeff `chunk_size` are PROVENANCE, never identity
+///
+/// [`Self::attention_arm`]/[`Self::chunk_size`]/[`Self::device_name`]/
+/// [`Self::kernels_disabled_requested`]/[`Self::kernels_disabled_fired`]/
+/// [`Self::flash_compiled`]/[`Self::build_features`] are recorded on this
+/// tier but deliberately excluded from [`Self::IDENTITY_FIELDS`] — see
+/// [`Self::PROVENANCE_FIELDS`]'s own doc for the full per-field rationale.
+/// `attention_arm` in particular is FORBIDDEN from identity (v2 reshape 3 of
+/// the unit-62 plan): a dispatched arm is a POST-HOC fact about what ran,
+/// and K7's own `definition_of` requires an identity hash be computable
+/// BEFORE compute (memoization soundness) — a field only knowable after the
+/// forward completed can never be a memoization key. It is also constant on
+/// this surface by construction (fused attention arms are training-only,
+/// `modernbert.rs`'s `if self.training` gate — eval/serving stays eager),
+/// which independently makes it a false determinant were it ever admitted:
+/// two legs would always "agree" on it regardless of what else differed.
+///
+/// ## `device_requested` is identity; `device_name` stays provenance (round-3 audit ruling)
+///
+/// The original E3 "device is provenance" ruling rested on this tier being
+/// CPU-only by construction — every leg necessarily agreed on device, so
+/// admitting it into identity would have been a vacuous no-op determinant.
+/// `--cuda` (`EncodeStepParams::gpu_device`) retired that premise: two real
+/// legs can now genuinely differ on device. [`Self::device_requested`] — the
+/// REQUESTED device, declared by the caller BEFORE compute (`"cpu"` or
+/// `"cuda:<ordinal>"`) — is therefore identity field 15: it satisfies K7's
+/// identity-computable-before-compute rule and two legs that asked for
+/// different devices must never compare as the same measurement.
+/// [`Self::device_name`] (the POST-HOC hardware string a real CUDA leg
+/// queries off the driver, e.g. `"NVIDIA A100-SXM4-80GB"`, or the constant
+/// `"cpu"` label for the CI-hermetic default) stays provenance: it is only
+/// knowable AFTER the device resolved (never before compute), and two legs
+/// that both requested `"cuda:0"` on two different physical GPUs are still
+/// the "same measurement" for identity purposes provided every
+/// [`Self::IDENTITY_FIELDS`] entry (including `device_requested`) agrees.
+#[derive(Debug, Serialize)]
+pub struct EncodeStepTier {
+    // ── Comparison identity: [`Self::IDENTITY_FIELDS`] ──────────────────
+    /// The corpus-generation seed — rotates which committed sentence each
+    /// row draws (mirrors `ModelInferenceSpec::corpus_seed`'s own rotation),
+    /// so a fixed seed is a fixed, reviewable input set.
+    pub seed: u64,
+    /// The number of rows one `generate_text_embeddings` call served —
+    /// the corpus row count.
+    pub batch: usize,
+    /// The padded sequence length (columns) the real tokenizer produced for
+    /// this batch (`BatchEncoding::seq_len`, batch-longest padding) — the
+    /// widest row's real token count, MEASURED off the model's own
+    /// `tokenizer.json` via the same [`jammi_ai::model::tokenizer::TokenizerWrapper`]
+    /// the candle backend loads, never assumed.
+    pub seq: usize,
+    /// Each row's REAL (unpadded) token count — the sum of that row's
+    /// attention-mask ones, off the same real tokenization [`Self::seq`]
+    /// is measured from. Never a knob: the corpus sentences have genuinely
+    /// different lengths, so this vector legitimately varies row to row
+    /// (never `[seq; batch]` unless every row happens to tie the widest).
+    pub row_lengths: Vec<usize>,
+    /// The compute precision (`f32`/`f16`/`bf16`,
+    /// [`jammi_numerics::ComputePrecision`]'s `Display`) the LOADED model
+    /// actually resolved to before the serve — read straight off
+    /// [`jammi_ai::model::LoadedModel::compute_precision`] via the tier's
+    /// own session/model cache (the SAME accessor `InferenceSession::infer`
+    /// reads before folding it into `ModelIdentity.compute_precision`,
+    /// `compute_precision.rs`'s own materialization-identity contract),
+    /// never a derived/default constant — this field previously recorded
+    /// `ComputePrecision::default()` regardless of what the tier's own
+    /// `GpuConfig`/per-model `config.json` override actually resolved,
+    /// which is the exact false-determinant shape this struct's own doc
+    /// forbids (unit-62 F-5). Output-affecting because a lower-precision
+    /// forward is a different computation, not merely a faster one.
+    pub compute_precision: String,
+    /// sha256 (hex) of the fixture model dir's `config.json` bytes — a
+    /// third of the checkpoint's content identity, the SAME `sha256_and_len`
+    /// helper [`crate::finetune_step`]/[`crate::grad_oracle`] already use
+    /// (never a second, independently-drifting hashing implementation).
+    pub checkpoint_config_sha256: String,
+    /// sha256 (hex) of the fixture model dir's `model.safetensors` bytes —
+    /// another third of the checkpoint's content identity.
+    pub checkpoint_weights_sha256: String,
+    /// `model.safetensors`' byte length — a cheap, redundant cross-check
+    /// alongside the sha256 above.
+    pub checkpoint_weights_size_bytes: u64,
+    /// sha256 (hex) of the fixture model dir's `tokenizer.json` bytes — the
+    /// final third of the checkpoint's content identity. Output-affecting:
+    /// this same unit's own E1/E2 legs prove tokenizer bytes move the
+    /// encode surface's served output (a different vocabulary/merge table
+    /// tokenizes the identical text to different token ids), so a
+    /// tokenizer-bytes change with `checkpoint_config_sha256`/
+    /// `checkpoint_weights_sha256` held fixed must never read as "the same
+    /// leg" (unit-62 F-5). The SAME `sha256_and_len` helper the other two
+    /// checkpoint hashes above use.
+    pub checkpoint_tokenizer_sha256: String,
+    /// The pooling strategy the LOADED model's text-embedding wrapper
+    /// ACTUALLY pools with (unit-62 F-5') — read via
+    /// [`jammi_ai::model::LoadedModel::resolved_pooling`] off the same
+    /// session/model cache [`Self::compute_precision`] reads, then rendered
+    /// through [`jammi_encoders::Pooling`]'s own `Display` (`"mean"`/
+    /// `"cls"`/`"max"`/`"weighted_mean"`). Never a constant mirroring
+    /// `encode_step::mean_pooling_flags` — see this struct's own
+    /// doc for the F-5' finding this closes: flipping the fixture's
+    /// `1_Pooling/config.json` to CLS must move this field.
+    pub pooling: String,
+    /// sha256 (hex) of the fixture model dir's `1_Pooling/config.json` bytes,
+    /// `None` when the model dir carries no `1_Pooling/` folder at all
+    /// (unit-62 F-5'(b)) — the SAME presence gate
+    /// `backend::candle::all_candidate_paths` applies before hashing this
+    /// file into the engine's own `content_digest` (`resolved.pooling_config
+    /// .is_some()`), never a second, independently-drifting presence check.
+    /// `NullMeans("no 1_Pooling/config.json in this model dir")`: `None`
+    /// here means exactly that absence, never "this producer predates the
+    /// field". This tier's own `build_encode_model_dir` always writes an
+    /// explicit `1_Pooling/config.json` (see this struct's own doc), so a
+    /// real run of THIS tier always reports `Some`; the `Option` exists so
+    /// the schema honestly represents the presence-gated engine reality
+    /// rather than assuming every model dir this surface could ever measure
+    /// carries one. Output-affecting alongside [`Self::pooling`]: a
+    /// differently-worded-but-equivalent pooling declaration (e.g. the
+    /// `pooling_mode_mean_sqrt_len_tokens` alias `pooling_from_config` also
+    /// maps to `Mean`) would report the same `pooling` string but a
+    /// DIFFERENT `checkpoint_pooling_sha256`, correctly distinguishing the
+    /// two source files as different measurements at the checkpoint-content
+    /// layer even though they serve byte-identical output.
+    pub checkpoint_pooling_sha256: Option<String>,
+    /// Whether the served vector is L2-normalized. `jammi_encoders::pool_and_normalize`
+    /// mandatorily normalizes on every reachable path today (there is no
+    /// exposed toggle), so this reads `true` on every run — recorded
+    /// honestly as the pipeline's current invariant, not a knob this tier
+    /// can flip, so a future normalize-optional path has an identity slot
+    /// already reserved rather than a silent addition. Pinned code-invariant
+    /// (round-3 audit advisory, folded rather than deferred): the enforcing
+    /// code is `jammi_encoders::pooling::pool_and_normalize`, whose `Result`
+    /// signature has no toggle parameter at all — there is no code path in
+    /// this crate's dependency graph that reaches a pooled embedding without
+    /// going through it. `encode_step::tests::pool_and_normalize_is_mandatory_with_no_toggle`
+    /// asserts this invariant directly (a hand-built, deliberately
+    /// non-unit-norm hidden tensor still comes out unit-L2-norm), so a
+    /// future normalize-optional signature change trips that test rather
+    /// than silently leaving this field a stale, unmeasured constant.
+    pub normalize: bool,
+    /// Warmup serves (discarded, not folded into any measurement) before
+    /// the measured iterations — pays the one-time model-load cost so it
+    /// does not land in a measured wall-time.
+    pub warmup: usize,
+    /// The number of `generate_text_embeddings` calls actually folded into
+    /// this tier's measured wall-time/throughput.
+    pub iters_measured: usize,
+    /// The REQUESTED device (identity field 15, round-3 audit lead ruling)
+    /// — `"cpu"` for the CI-hermetic default, `"cuda:<ordinal>"` for the pod
+    /// producer's `--cuda <ordinal>` — declared straight from
+    /// [`crate::encode_step::EncodeStepParams::gpu_device`] BEFORE any
+    /// compute runs (satisfies K7's identity-computable-before-compute
+    /// rule), via `encode_step::requested_device_label` — the SAME cheap
+    /// ordinal-derived `"cpu"`/`"cuda:<ordinal>"` label [`Self::device_name`]
+    /// rendered unconditionally before this fix (see this struct's own doc
+    /// for why the requested value is identity while the post-hoc hardware
+    /// string stays provenance). Two legs that asked for different devices
+    /// must never compare as the same measurement.
+    pub device_requested: String,
+
+    // ── Provenance: [`Self::PROVENANCE_FIELDS`], NEVER identity ─────────
+    /// The device this run ACTUALLY served on, as a post-hoc hardware fact —
+    /// the constant `"cpu"` label for the CI-hermetic default, or the real
+    /// CUDA device sub-class name queried off the driver for a `--cuda` leg
+    /// (e.g. `"NVIDIA A100-SXM4-80GB"`, the SAME in-process `cudarc` query
+    /// `gpu_inference::cuda_device_name` already performs — never a second,
+    /// independently-drifting hardware-name lookup). PROVENANCE (round-3
+    /// audit lead ruling): only knowable AFTER the device resolved, so it
+    /// can never be a memoization key; two legs that both requested
+    /// `"cuda:0"` on two different physical GPUs are still the "same"
+    /// measurement for identity purposes provided every
+    /// [`Self::IDENTITY_FIELDS`] entry (including [`Self::device_requested`])
+    /// agrees. See this struct's own doc for the full identity-vs-provenance
+    /// split this field and `device_requested` now form.
+    ///
+    /// This value is trustworthy — never a hardware string attested for a
+    /// run that actually executed on CPU — BECAUSE the silent-CPU-fallback
+    /// state is structurally unrepresentable by the time it is computed
+    /// (unit-62 audit round-4 F-C): `encode_step::run` threads `gpu_device`
+    /// through `model_inference::corpus_session_on_device`, which sets
+    /// `gpu.require_gpu = gpu_device >= 0` on the session's `GpuConfig` — the
+    /// SAME convention `jammi-ai`'s `gpu_capability` harness pins
+    /// (`config_for`: `require_gpu: device >= 0`). A `--cuda N` leg whose
+    /// ordinal the box cannot actually satisfy therefore fails the FIRST
+    /// model load (`CandleBackend::load`'s `select_device(device_config)?`,
+    /// `backend/candle.rs`'s `gpu_unavailable` returning a typed
+    /// `JammiError::Gpu`) inside `run()`'s warmup loop, well before this
+    /// field is ever populated — `run()` returns `Err` and no
+    /// `EncodeStepTier` (hence no report) is produced at all. So on every
+    /// path that reaches this field, the requested ordinal and the actually-
+    /// resolved device are the same device by construction.
+    ///
+    /// **Qualification (audit round 62, adversarial round 6, folded
+    /// advisory)**: on a build compiled with `feature = "metal"` but not
+    /// `"cuda"`, `select_device` can genuinely succeed for a `gpu_device >=
+    /// 0` request via its metal branch, so the "first model load fails"
+    /// argument above does not apply there — the guarantee holds on that
+    /// build for a DIFFERENT reason instead: `encode_step::resolved_device_name`'s
+    /// `cuda_device_name` call unconditionally errors on any
+    /// `not(feature = "cuda")` build, aborting the run before a mismatched,
+    /// Metal-resolved device name could ever reach this field. See that
+    /// function's own doc for the full two-mechanism picture.
+    pub device_name: String,
+    /// The `JAMMI_KERNELS_DISABLE` op keys this process REQUESTED (sorted;
+    /// empty when unset) — `jammi_kernels::admission::disabled_ops_requested`.
+    /// PROVENANCE (mirrors `FinetuneStepTier::kernels_disabled_requested`).
+    pub kernels_disabled_requested: Vec<String>,
+    /// The `JAMMI_KERNELS_DISABLE` op keys that actually FIRED this run
+    /// (sorted) — `jammi_kernels::admission::disabled_ops_fired`.
+    /// PROVENANCE.
+    pub kernels_disabled_fired: Vec<String>,
+    /// Whether THIS BUILD compiled the vendored FlashAttention-2 kernels
+    /// (`jammi_kernels::admission::FLASH_COMPILED`). PROVENANCE — the
+    /// encode/eval path never dispatches flash regardless (fused arms are
+    /// training-only), so this records a build fact, not a per-leg
+    /// determinant.
+    pub flash_compiled: bool,
+    /// This tier's own echo of [`Provenance::build_features`]
+    /// (`crate::report::build_features`, the SAME function
+    /// `Provenance::baked` calls). PROVENANCE.
+    pub build_features: Vec<&'static str>,
+    /// The mem-efficient-attention op's chunk size, always `None` on this
+    /// tier — the encode/eval path has no chunked-attention arm at all
+    /// (`mem_efficient_attention.rs`'s own "`chunk_size` is provenance, not
+    /// shared identity" doctrine: memeff is training-only, unreferenced
+    /// outside `jammi-kernels`'s training call sites). `NullMeans` per
+    /// [`Self::PROVENANCE_FIELDS`]'s `chunk_size` entry: `null` here means
+    /// "this arm has no chunk size on this surface", never "this producer
+    /// predates the field".
+    pub chunk_size: Option<u64>,
+    /// The attention reference class this leg ran — constant `"eager"` on
+    /// this surface (fused arms are training-only), recorded as a
+    /// provenance fact rather than a comparison key. See this struct's own
+    /// doc for the full identity-forbidden rationale.
+    pub attention_arm: String,
+
+    // ── Measurements: recorded references, never gated ──────────────────
+    /// Embed serving throughput at the mean measured serve, rows/s. A
+    /// machine-dependent reference, mirrors `ModelInferenceTier::embed_rows_per_s`'s
+    /// own "coarse code-path net, not the scaling SLO" framing.
+    pub embed_rows_per_s: Measurement,
+    /// The mean wall-clock of the `iters_measured` measured
+    /// `generate_text_embeddings` calls, milliseconds.
+    pub embed_serve_ms: Measurement,
+}
+
+impl EncodeStepTier {
+    /// K7-completeness comparison tuple: the COMPLETE output-affecting
+    /// parameter set for the encode surface (unit-62 CONTRACT.md §E3). This
+    /// is the WHOLE identity set for this tier (unlike
+    /// [`FinetuneStepTier::IDENTITY_FIELDS`]/
+    /// [`crate::grad_oracle::GradOracleReport::IDENTITY_FIELDS`], which fold
+    /// their own provenance fields in as "K7-completeness additions beyond
+    /// the comparison tuple" — CONTRACT.md's E3 deliberately keeps this
+    /// tier's provenance OUT of identity entirely; see
+    /// [`Self::PROVENANCE_FIELDS`]). `ci/scripts/perf/identity_fields.py`'s
+    /// future `ENCODE_IDENTITY_FIELDS` mirrors this list EXACTLY (unit-62
+    /// E6, docs-ci domain) — the cardinality (15, round-3 audit F-5'/lead
+    /// ruling: `checkpoint_pooling_sha256` + `device_requested` appended
+    /// after the original 13, a position-stable addition rather than a
+    /// re-order) and every name here is the pinned contract that mirror
+    /// parses against.
+    ///
+    /// `attention_arm` is NOT a member (see this struct's own doc) — a
+    /// negative-control test in `encode_step.rs` asserts this mechanically.
+    pub const IDENTITY_FIELDS: &'static [(&'static str, Nullable)] = &[
+        ("seed", Nullable::NonNull),
+        ("batch", Nullable::NonNull),
+        ("seq", Nullable::NonNull),
+        ("row_lengths", Nullable::NonNull),
+        ("compute_precision", Nullable::NonNull),
+        ("checkpoint_config_sha256", Nullable::NonNull),
+        ("checkpoint_weights_sha256", Nullable::NonNull),
+        ("checkpoint_weights_size_bytes", Nullable::NonNull),
+        ("checkpoint_tokenizer_sha256", Nullable::NonNull),
+        ("pooling", Nullable::NonNull),
+        ("normalize", Nullable::NonNull),
+        ("warmup", Nullable::NonNull),
+        ("iters_measured", Nullable::NonNull),
+        // Round-3 audit additions (F-5'(b)/lead ruling), appended
+        // position-stable rather than re-ordered into the original 13.
+        (
+            "checkpoint_pooling_sha256",
+            Nullable::NullMeans("no 1_Pooling/config.json in this model dir"),
+        ),
+        ("device_requested", Nullable::NonNull),
+    ];
+
+    /// The provenance fields this tier records but NEVER admits to
+    /// [`Self::IDENTITY_FIELDS`] — recorded (with a `NullMeans` reason where
+    /// a field can legitimately read `null`) so a downstream reader has the
+    /// SAME `assert_identity_fields_present` presence/non-null guarantee on
+    /// these fields without them ever being eligible as a cross-leg
+    /// comparison key. `chunk_size` is the one `NullMeans` entry (see its
+    /// own field doc); every other entry here is `NonNull` (always
+    /// populated, even when the value it carries is the empty/constant
+    /// case — e.g. `kernels_disabled_requested: []` on an ordinary run).
+    pub const PROVENANCE_FIELDS: &'static [(&'static str, Nullable)] = &[
+        ("device_name", Nullable::NonNull),
+        ("kernels_disabled_requested", Nullable::NonNull),
+        ("kernels_disabled_fired", Nullable::NonNull),
+        ("flash_compiled", Nullable::NonNull),
+        ("build_features", Nullable::NonNull),
+        (
+            "chunk_size",
+            Nullable::NullMeans("this arm has no chunk size on the encode/eval surface"),
+        ),
+        ("attention_arm", Nullable::NonNull),
+    ];
 }
 
 /// The CPU-hermetic cache-hit SLO tier: the engine's opt-in producer memoization

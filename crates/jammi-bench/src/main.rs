@@ -16,9 +16,11 @@
 //! (split-conformal coverage floor), `eval-scale` (retrieval/classification metric
 //! goldens + bootstrap order-invariance), `propagate-scale` (propagation determinism
 //! digest + latency ref), `graph-train-scale` (graph-finetune sampler throughput),
-//! `context-predictor-scale` (predictor train throughput + predict digest), and
+//! `context-predictor-scale` (predictor train throughput + predict digest),
 //! `model-inference-scale` (`generate_embeddings` + `infer` output digests + coarse
-//! serving throughput). Every committed number is a real re-derivable fold (a
+//! serving throughput), and `encode-step` (unit 62, K7-identity-audited
+//! `generate_text_embeddings` leg over a fixture with an explicit
+//! `1_Pooling/config.json`). Every committed number is a real re-derivable fold (a
 //! `rebuild-*` subcommand reproduces it); an un-measured slot serializes as `null`,
 //! never a faked zero.
 //!
@@ -58,6 +60,7 @@ mod cache_slo;
 mod conformal;
 mod context_predictor;
 mod corpus;
+mod encode_step;
 mod eval;
 mod finetune_step;
 mod fixture;
@@ -360,6 +363,23 @@ enum Command {
     /// `gpu_inference` tier set and exits non-zero on a missing CUDA device, a
     /// serve error, or a classification lane that dropped a row.
     GpuInferenceScale,
+    /// The identity-audited encode-step tier (unit 62, K7/E3): drives the
+    /// engine's real `generate_text_embeddings` serving path — the SAME
+    /// `resolve -> tokenize -> forward -> pool -> normalize` path serving
+    /// uses, never a synthetic loop — over a small deterministic corpus and
+    /// a fixture model dir carrying an EXPLICIT `1_Pooling/config.json`
+    /// (never the silent mean-pooling fallback esc-057 is about). Emits the
+    /// JSON report with the `encode_step` tier set; see
+    /// `report::EncodeStepTier`'s own doc for the declared
+    /// `IDENTITY_FIELDS`/`PROVENANCE_FIELDS` split. CPU-hermetic by default
+    /// (`Device::Cpu`); `--cuda` parameterizes the GPU device for the pod
+    /// producer, the SAME `--cuda: Option<usize>` convention `finetune-step`/
+    /// `grad-oracle` already take.
+    EncodeStep {
+        /// CUDA ordinal; omit for CPU.
+        #[arg(long)]
+        cuda: Option<usize>,
+    },
     /// The encoder fine-tune step tier: time one real LoRA training step —
     /// three encoder forwards live on the tape at once, a cosine-margin triplet
     /// loss, one backward into the adapter tensors, an optional PRODUCTION
@@ -564,6 +584,7 @@ async fn main() -> std::process::ExitCode {
         Command::ModelInferenceScale => run_model_inference_scale().await,
         Command::RebuildModelInferenceSpec => run_rebuild_model_inference_spec().await,
         Command::GpuInferenceScale => run_gpu_inference_scale().await,
+        Command::EncodeStep { cuda } => run_encode_step(cuda).await,
         Command::FinetuneStep {
             model_dir,
             batch,
@@ -808,6 +829,7 @@ async fn run_cache_slo_scale() -> std::process::ExitCode {
             context_predictor: None,
             model_inference: None,
             gpu_inference: None,
+            encode_step: None,
             cache_slo: Some(tier),
             recompute: None,
         },
@@ -859,6 +881,7 @@ async fn run_recompute_scale() -> std::process::ExitCode {
             context_predictor: None,
             model_inference: None,
             gpu_inference: None,
+            encode_step: None,
             cache_slo: None,
             recompute: Some(tier),
         },
@@ -961,6 +984,7 @@ async fn run_train_scale() -> std::process::ExitCode {
             context_predictor: None,
             model_inference: None,
             gpu_inference: None,
+            encode_step: None,
             cache_slo: None,
             recompute: None,
         },
@@ -1022,6 +1046,7 @@ fn run_conformal_scale() -> std::process::ExitCode {
             context_predictor: None,
             model_inference: None,
             gpu_inference: None,
+            encode_step: None,
             cache_slo: None,
             recompute: None,
         },
@@ -1073,6 +1098,7 @@ fn run_eval_scale() -> std::process::ExitCode {
             context_predictor: None,
             model_inference: None,
             gpu_inference: None,
+            encode_step: None,
             cache_slo: None,
             recompute: None,
         },
@@ -1125,6 +1151,7 @@ async fn run_propagate_scale() -> std::process::ExitCode {
             context_predictor: None,
             model_inference: None,
             gpu_inference: None,
+            encode_step: None,
             cache_slo: None,
             recompute: None,
         },
@@ -1333,6 +1360,7 @@ fn run_graph_train_scale() -> std::process::ExitCode {
             context_predictor: None,
             model_inference: None,
             gpu_inference: None,
+            encode_step: None,
             cache_slo: None,
             recompute: None,
         },
@@ -1432,6 +1460,7 @@ async fn run_context_predictor_scale() -> std::process::ExitCode {
             context_predictor: Some(tier),
             model_inference: None,
             gpu_inference: None,
+            encode_step: None,
             cache_slo: None,
             recompute: None,
         },
@@ -1538,6 +1567,7 @@ async fn run_model_inference_scale() -> std::process::ExitCode {
             context_predictor: None,
             model_inference: Some(tier),
             gpu_inference: None,
+            encode_step: None,
             cache_slo: None,
             recompute: None,
         },
@@ -1626,6 +1656,54 @@ async fn run_gpu_inference_scale() -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
+/// The encode-step corpus/measurement shape: a small, deterministic corpus —
+/// enough rows for the real tokenizer to produce a genuinely varied
+/// `row_lengths` (see `encode_step`'s own teeth test) without making the
+/// CI-hermetic default slow. `gpu_device` here is the CI-hermetic default;
+/// `run_encode_step` overrides it from `--cuda` when the caller supplied one.
+const ENCODE_STEP_PARAMS: encode_step::EncodeStepParams = encode_step::EncodeStepParams {
+    row_count: 8,
+    seed: 0,
+    warmup: 2,
+    iters: 3,
+    gpu_device: encode_step::CPU_HERMETIC_DEVICE,
+};
+
+/// Run the encode-step tier, emit the report, and exit non-zero only when the
+/// real serve itself failed (real tokenization, real checksums, a real
+/// `generate_text_embeddings` call) — there is no perf pass/fail here; the
+/// identity-completeness self-check (`assert_identity_fields_present`) is
+/// enforced INSIDE `encode_step::run` on every invocation.
+///
+/// `cuda` is `--cuda`'s ordinal (the SAME `Option<usize>` convention
+/// `finetune-step`/`grad-oracle` already take) — `Some(ordinal)` flows into
+/// `EncodeStepParams::gpu_device` as `ordinal as i32`, `None` keeps
+/// [`encode_step::CPU_HERMETIC_DEVICE`], the CI-hermetic default.
+async fn run_encode_step(cuda: Option<usize>) -> std::process::ExitCode {
+    let params = encode_step::EncodeStepParams {
+        gpu_device: cuda
+            .map(|ordinal| ordinal as i32)
+            .unwrap_or(encode_step::CPU_HERMETIC_DEVICE),
+        ..ENCODE_STEP_PARAMS
+    };
+    let tier = match encode_step::run(params).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("encode-step run failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let report = Report::new(
+        "encode-step",
+        Tiers {
+            encode_step: Some(tier),
+            ..Default::default()
+        },
+    );
+    emit(&report);
+    std::process::ExitCode::SUCCESS
+}
+
 /// The `measure-once` child: run one variant over the pre-materialized corpus,
 /// print its peak RSS and result digest, and exit. The parent reads the single
 /// stdout line; a failure exits non-zero so the parent surfaces it.
@@ -1683,6 +1761,7 @@ async fn run_search_rss() -> std::process::ExitCode {
             context_predictor: None,
             model_inference: None,
             gpu_inference: None,
+            encode_step: None,
             cache_slo: None,
             recompute: None,
         },
@@ -1736,6 +1815,7 @@ async fn run_arxiv() -> std::process::ExitCode {
             context_predictor: None,
             model_inference: None,
             gpu_inference: None,
+            encode_step: None,
             cache_slo: None,
             recompute: None,
         },
@@ -1795,6 +1875,7 @@ async fn run_recall_sweep(
             context_predictor: None,
             model_inference: None,
             gpu_inference: None,
+            encode_step: None,
             cache_slo: None,
             recompute: None,
         },

@@ -23,14 +23,20 @@ use jammi_db::catalog::Catalog;
 use jammi_encoders::{Bert, BertConfig, Pooling};
 use tempfile::tempdir;
 
-const TINY_BERT_FILES: [&str; 3] = ["config.json", "model.safetensors", "tokenizer.json"];
+// `pub(crate)`: `tests/it/content_digest.rs` (esc-057's fix test, `closes_escape:
+// esc-057`) reuses this exact fixture-copy helper to build/mutate model dirs
+// through the identical live resolve→load path this file already exercises,
+// rather than a second, independently-drifting copy of the same fixture-
+// staging logic.
+pub(crate) const TINY_BERT_FILES: [&str; 3] =
+    ["config.json", "model.safetensors", "tokenizer.json"];
 const TEXT: &str = "the quick brown fox jumps over the lazy dog";
 
 /// Copy the hermetic `tiny_bert` fixture's weights/config/tokenizer into
 /// `dst`, then optionally write a `1_Pooling/config.json` declaring
 /// `pooling_flags`. `None` reproduces a bare BERT repo that ships no
 /// `1_Pooling/` subfolder at all.
-fn build_local_model_dir(dst: &Path, pooling_flags: Option<&serde_json::Value>) {
+pub(crate) fn build_local_model_dir(dst: &Path, pooling_flags: Option<&serde_json::Value>) {
     std::fs::create_dir_all(dst).unwrap();
     let fixture = jammi_test_utils::cookbook_fixture("tiny_bert");
     for name in TINY_BERT_FILES {
@@ -47,7 +53,33 @@ fn build_local_model_dir(dst: &Path, pooling_flags: Option<&serde_json::Value>) 
     }
 }
 
-fn cls_pooling_config() -> serde_json::Value {
+/// Write `dst/preprocessor_config.json` (F-2, `closes_escape`-adjacent audit
+/// round 62 finding): a bare BERT repo's `tiny_bert` fixture ships no such
+/// file, so a `1_Pooling`-style presence/absence test needs a helper to add
+/// one. `pub(crate)`: shared with `content_digest.rs` (the digest-fold
+/// mutation test) and `cache_staleness.rs` (the appearance-tripwire test).
+pub(crate) fn write_preprocessor_config(dst: &Path, cfg: &serde_json::Value) {
+    std::fs::write(
+        dst.join("preprocessor_config.json"),
+        serde_json::to_string(cfg).unwrap(),
+    )
+    .unwrap();
+}
+
+/// A harmless, syntactically-valid `preprocessor_config.json` body — its
+/// content doesn't need to be a real CLAP feature-extractor geometry for
+/// F-2's digest-fold / appearance tests (`tiny_bert` is a plain BERT
+/// text-embedding model, never routed through the CLAP audio front-end that
+/// actually interprets these keys), only present-and-parseable-as-JSON.
+pub(crate) fn sample_preprocessor_config() -> serde_json::Value {
+    serde_json::json!({
+        "feature_extractor_type": "ClapFeatureExtractor",
+        "sampling_rate": 48000,
+    })
+}
+
+// `pub(crate)`: shared with `tests/it/content_digest.rs` — see `TINY_BERT_FILES`'s doc.
+pub(crate) fn cls_pooling_config() -> serde_json::Value {
     serde_json::json!({
         "pooling_mode_cls_token": true,
         "pooling_mode_mean_tokens": false,
@@ -58,7 +90,8 @@ fn cls_pooling_config() -> serde_json::Value {
     })
 }
 
-fn mean_pooling_config() -> serde_json::Value {
+// `pub(crate)`: shared with `tests/it/content_digest.rs` — see `TINY_BERT_FILES`'s doc.
+pub(crate) fn mean_pooling_config() -> serde_json::Value {
     serde_json::json!({
         "pooling_mode_cls_token": false,
         "pooling_mode_mean_tokens": true,
@@ -69,9 +102,35 @@ fn mean_pooling_config() -> serde_json::Value {
     })
 }
 
+/// Add an inert marker key to a pooling declaration so its serialized byte
+/// LENGTH deliberately differs from an equivalent config without the marker
+/// — audit round 62, F-4a: a straight `cls_pooling_config()` ⇄
+/// `mean_pooling_config()` swap (each has exactly one `true`/4 chars and
+/// five `false`/5 chars, just at different keys) is byte-length-IDENTICAL
+/// when both are serialized the same way, so a staleness-tripwire test built
+/// on that swap alone would rest entirely on sub-second mtime resolution to
+/// detect the mutation — never asserted, and not portable to a coarser
+/// filesystem clock. `pooling_from_config` only inspects keys prefixed
+/// `pooling_mode_`, so this key is invisible to production pooling-selection
+/// logic; it exists purely to make the on-disk byte length change,
+/// independent of which flags are true/false or of `to_string` vs
+/// `to_string_pretty` formatting (a second, ACCIDENTAL source of length
+/// difference this helper deliberately does not rely on either).
+pub(crate) fn with_length_marker(mut cfg: serde_json::Value) -> serde_json::Value {
+    cfg.as_object_mut()
+        .expect("pooling config fixtures are always JSON objects")
+        .insert(
+            "_test_length_marker".to_string(),
+            serde_json::Value::String("x".to_string()),
+        );
+    cfg
+}
+
 /// Resolve + load `dir` through the live engine path: `ModelResolver::resolve`
-/// (local) → `CandleBackend::load`.
-async fn resolve_and_load(dir: &Path) -> LoadedModel {
+/// (local) → `CandleBackend::load`. `pub(crate)`: shared with
+/// `tests/it/content_digest.rs` (esc-057's fix test) — see `TINY_BERT_FILES`'s
+/// doc.
+pub(crate) async fn resolve_and_load(dir: &Path) -> LoadedModel {
     let catalog_dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
     let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();

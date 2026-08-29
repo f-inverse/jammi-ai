@@ -158,6 +158,26 @@ impl GpuScheduler {
             .saturating_sub(self.reserved_memory.load(Ordering::Acquire))
     }
 
+    /// The total usable GPU budget in bytes — `Self::usable` made public,
+    /// or `usize::MAX` for an unlimited scheduler. Lets a caller distinguish
+    /// "this request can never be admitted, no matter how much frees up"
+    /// (`bytes > usable_capacity()`) from "temporarily contended, and
+    /// waiting for an outstanding release will eventually satisfy it"
+    /// (`bytes <= usable_capacity()`, just not available right now). Used by
+    /// `ModelCache::do_load`'s admission loop to decide between a hard error
+    /// and continuing to wait on its own dual-notify admission loop (a
+    /// permit-release notify plus a guard-idle notify, registered together
+    /// before each `try_acquire`/`evict_one` pass) once `evict_one` has
+    /// nothing left to evict — see `ModelCache::do_load`'s admission loop
+    /// for the full wake-set enumeration and why `Self::acquire`'s
+    /// single-notify wait is not enough on its own.
+    pub fn usable_capacity(&self) -> usize {
+        if self.unlimited {
+            return usize::MAX;
+        }
+        self.usable()
+    }
+
     /// Non-blocking acquisition attempt. Returns `None` if insufficient memory.
     ///
     /// CAS loop with `spin_loop()` hint on contention — the retry window is

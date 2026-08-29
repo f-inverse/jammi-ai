@@ -62,6 +62,18 @@ tempfile = { version = "3", optional = true }
 # `Bytes` for handing trained-artifact files to the object-store `put_artifact`
 # API; only the `local` engine's fine-tune worker uses it.
 bytes = { version = "1", optional = true }
+# The model-content digest (esc-057, K7): a streaming SHA-256 over the local
+# model directory's config / `1_Pooling/config.json` / tokenizer / weights
+# bytes, computed once per model load in `model::backend::candle` and folded
+# into `ModelIdentity.content_digest`. `jammi-db` and `jammi-bench` already
+# depend on the identical pair for their own checkpoint-identity hashing
+# (`crates/jammi-bench/src/finetune_step.rs::sha256_and_len`); `jammi-bench`
+# depends on `jammi-ai` (not the reverse), so that implementation cannot be
+# imported here — this crate carries its own copy of the same streaming
+# pattern rather than a bespoke one. Only the embedded engine loads local
+# model directories, so this rides `local` like the other model-loading deps.
+sha2 = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
 
 datafusion.workspace = true
 arrow.workspace = true
@@ -136,6 +148,8 @@ local = [
     "dep:bytes",
     "dep:tonic",
     "dep:prost",
+    "dep:sha2",
+    "dep:hex",
     "jammi-lora/candle",
 ]
 live-hub-tests = []

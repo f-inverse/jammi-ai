@@ -32,3 +32,7 @@
 # fatigue); the gate itself now excludes pure documentation (`*.md`) from
 # Rule 2's trigger instead, so no waiver was ever needed for that class of
 # change. See the gate's own module doc for the full reasoning.
+80	6e8d95130c1f33dc2eda90a238952185c97c5e22	admission.rs change is the additive read-only probe_cuda_device_name identity probe (unit 62 measurement provenance); no admission/dispatch/fence logic touched — reviewed non-semantic for the per-arch parity evidence
+86	6e8d95130c1f33dc2eda90a238952185c97c5e22	admission.rs change is the additive read-only probe_cuda_device_name identity probe (unit 62 measurement provenance); no admission/dispatch/fence logic touched — reviewed non-semantic for the per-arch parity evidence
+89	6e8d95130c1f33dc2eda90a238952185c97c5e22	admission.rs change is the additive read-only probe_cuda_device_name identity probe (unit 62 measurement provenance); no admission/dispatch/fence logic touched — reviewed non-semantic for the per-arch parity evidence
+90	6e8d95130c1f33dc2eda90a238952185c97c5e22	admission.rs change is the additive read-only probe_cuda_device_name identity probe (unit 62 measurement provenance); no admission/dispatch/fence logic touched — reviewed non-semantic for the per-arch parity evidence

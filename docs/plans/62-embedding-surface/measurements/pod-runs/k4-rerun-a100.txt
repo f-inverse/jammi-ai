@@ -1,0 +1,12 @@
+=== K4 RERUN ===
+   Compiling jammi-server v0.47.0 (/root/trees/62int/crates/jammi-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.25s
+     Running tests/it/main.rs (/root/target-62int/debug/deps/it-415badb5ea76eedb)
+
+running 2 tests
+test grpc_remote_session_gpu::encode_query_two_compute_gpu_repeat_determinism_is_recorded_not_gated ... ok
+test grpc_remote_session_gpu::remote_flight_read_matches_local_readback_bitwise_on_gpu ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 127 filtered out; finished in 1.39s
+
+K4B-RC:0

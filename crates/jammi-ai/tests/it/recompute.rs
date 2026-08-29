@@ -723,6 +723,148 @@ async fn a_pre_contract_table_is_not_recomputable() {
     );
 }
 
+// ── esc-057: replay under a mutated model dir mismatches, never silently
+//    yields different vectors under an identical hash ──
+
+/// The recompute peer of `content_digest.rs`'s esc-057 fix tests: an
+/// `Embedding` descriptor's replay (`replay_descriptor`,
+/// `pipeline/recompute.rs`) re-invokes `EmbeddingPipeline::run`, which
+/// re-loads the model and recomputes its content digest fresh from the
+/// model directory's CURRENT bytes (`session.rs`/`pipeline/embedding.rs`
+/// thread `LoadedModel::content_digest()` into every `ModelIdentity` they
+/// build — there is no separate digest-threading code path inside
+/// `recompute.rs` itself to break). So a recompute run **after** the model
+/// directory was mutated in place must record a DIFFERENT `definition_hash`
+/// than the original run — the fold reaches replay, closing esc-057's "false
+/// replay" harm (recompute.rs replaying a descriptor to different vectors
+/// under the SAME hash) at its actual call site, not just at the point the
+/// digest is first computed.
+///
+/// Uses TWO INDEPENDENT sessions rooted at the SAME catalog/storage
+/// directory — the first materializes the table and is dropped, the second
+/// (with its own, cold `ModelCache`) performs the recompute — simulating the
+/// realistic cross-process/cross-restart shape a recompute normally runs
+/// under.
+///
+/// A single long-lived session's in-memory `ModelCache` is no longer a warm
+/// LRU with NO on-disk staleness check: esc-058 added a `stat`-only
+/// fingerprint tripwire (`ModelCache::get_or_load`'s `probe_freshness` call,
+/// `cache_staleness.rs`) that would ALSO detect this exact
+/// `model.safetensors` byte-length-changing mutation and force a warm-hit
+/// reload — reusing one session today would likely still turn this
+/// assertion green. Two independent sessions remain the right shape anyway,
+/// for two reasons that survive esc-058: (1) it is the realistic
+/// cross-process/cross-restart deployment recompute normally runs under,
+/// not merely a workaround for a cache that used to have no freshness
+/// check at all; (2) it keeps THIS test's guarantee decoupled from
+/// esc-058's own documented residual (a same-length, same-mtime content
+/// swap is invisible to the fingerprint tripwire) — a definitely-cold
+/// reload proves the digest fold reaches replay regardless of whether the
+/// tripwire would have caught this particular mutation.
+#[tokio::test]
+async fn recompute_after_model_dir_mutation_changes_the_definition_hash() {
+    let session_dir = TempDir::new().unwrap();
+
+    // A local model dir the test controls and mutates in place — never the
+    // checked-in `tiny_bert` fixture other tests share.
+    let model_dir_root = TempDir::new().unwrap();
+    let model_dir = model_dir_root.path().join("model");
+    crate::pooling_config::build_local_model_dir(
+        &model_dir,
+        Some(&crate::pooling_config::mean_pooling_config()),
+    );
+    let model_id = model_dir.display().to_string();
+
+    let original_record = {
+        let session = InferenceSession::new(common::test_config(session_dir.path()))
+            .await
+            .unwrap();
+        session
+            .add_source(
+                "patents",
+                jammi_db::source::SourceType::File,
+                jammi_db::source::SourceConnection {
+                    url: Some(common::fixture_url("patents.parquet")),
+                    format: Some(jammi_db::source::FileFormat::Parquet),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (record, _outcome) = session
+            .generate_text_embeddings(
+                "patents",
+                &model_id,
+                &["abstract".to_string()],
+                "id",
+                CachePolicy::Bypass,
+            )
+            .await
+            .unwrap();
+        let hash = read_definition_hash(&session, &record).await;
+        (record, hash)
+    };
+    let (original_record, original_hash) = original_record;
+
+    // Mutate the model directory IN PLACE — same path, same `model_id` —
+    // flipping the last byte of the weights file (see `content_digest.rs`'s
+    // `weights_bytes_mutation_changes_the_definition_hash` doc for why this
+    // stays a structurally valid safetensors file).
+    let weights_path = model_dir.join("model.safetensors");
+    let mut bytes = std::fs::read(&weights_path).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xFF;
+    std::fs::write(&weights_path, &bytes).unwrap();
+
+    // A fresh session over the SAME catalog/storage dir: its `ModelCache`
+    // starts cold, so `recompute`'s replay genuinely reloads the (now
+    // mutated) model directory from disk.
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(session_dir.path()))
+            .await
+            .unwrap(),
+    );
+    let report = session
+        .recompute(&original_record, Cascade::ReportOnly)
+        .await
+        .unwrap();
+    assert_eq!(report.recomputed.len(), 1);
+    let recomputed_table = &report.recomputed[0].recomputed;
+    let recomputed_record = session
+        .catalog()
+        .get_result_table(recomputed_table)
+        .await
+        .unwrap()
+        .expect("the replay must have materialized the recomputed table");
+    let recomputed_hash = read_definition_hash(&session, &recomputed_record).await;
+
+    assert_ne!(
+        original_hash, recomputed_hash,
+        "a recompute replayed (in a fresh session, cold model cache) after \
+         the model directory was mutated in place (same model_id) must \
+         record a different definition_hash than the original run — a \
+         matching hash here would be esc-057's false-replay harm: different \
+         vectors materialized under an identical hash"
+    );
+}
+
+/// Read back a materialized table's persisted `.materialization.json`
+/// sidecar `definition_hash` — the real production artifact, not a
+/// recomputed-in-the-test stand-in.
+async fn read_definition_hash(
+    session: &InferenceSession,
+    record: &ResultTableRecord,
+) -> jammi_db::store::manifest::DefinitionHash {
+    let parquet_url = StorageUrl::parse(&record.parquet_path).unwrap();
+    session
+        .result_store()
+        .read_materialization_manifest(&parquet_url)
+        .await
+        .unwrap()
+        .expect("a freshly finalized table must carry a materialization manifest")
+        .definition_hash
+}
+
 // ── helpers ──
 
 /// Register the `points` source the synthetic embedding table records its

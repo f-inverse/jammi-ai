@@ -1,0 +1,136 @@
+{
+  "schema_version": 1,
+  "git_sha": "a4fad082f895394b4bf7176bb11606945b5ac3d4",
+  "box": "81782a9c17e2",
+  "producer": {
+    "path": "ci/scripts/perf/encode_ab.sh",
+    "kind": "script",
+    "invocation": "ci/scripts/perf/encode_ab.sh",
+    "gating": "none"
+  },
+  "status": "GREEN",
+  "identity_fields": [
+    "seed",
+    "batch",
+    "seq",
+    "row_lengths",
+    "compute_precision",
+    "checkpoint_config_sha256",
+    "checkpoint_weights_sha256",
+    "checkpoint_weights_size_bytes",
+    "checkpoint_tokenizer_sha256",
+    "pooling",
+    "normalize",
+    "warmup",
+    "iters_measured",
+    "checkpoint_pooling_sha256",
+    "device_requested"
+  ],
+  "leg_premise_violations": [],
+  "legs": {
+    "r1": {
+      "outcome": "OK",
+      "identity": {
+        "seed": 0,
+        "batch": 8,
+        "seq": 9,
+        "row_lengths": [
+          8,
+          7,
+          8,
+          9,
+          8,
+          7,
+          7,
+          7
+        ],
+        "compute_precision": "f32",
+        "checkpoint_config_sha256": "e24733455956ab8d84ce74c77b1b6327325a8127090f9b1a76d3265927dbbfdc",
+        "checkpoint_weights_sha256": "f108a730c5be905e38ff73e7cb6670694a3ee3393dee12d1c1511cdbccdb2919",
+        "checkpoint_weights_size_bytes": 102608,
+        "checkpoint_tokenizer_sha256": "c8200a17f2b3fd7321316769a221a770495ac8a6d6206bf3d803870ad354e5e3",
+        "pooling": "mean",
+        "normalize": true,
+        "warmup": 2,
+        "iters_measured": 3,
+        "checkpoint_pooling_sha256": "b10b4ebd4e595307d709a0b61fd29b80e9974b5694d882765bc7ffcf698afce1",
+        "device_requested": "cuda:0"
+      },
+      "provenance": {
+        "device_name": "NVIDIA A100-SXM4-80GB",
+        "kernels_disabled_requested": [],
+        "kernels_disabled_fired": [],
+        "flash_compiled": false,
+        "build_features": [
+          "bench-cuda",
+          "cuda"
+        ],
+        "chunk_size": null,
+        "attention_arm": "eager",
+        "build_sha": "a4fad082f895394b4bf7176bb11606945b5ac3d4"
+      },
+      "measurements": {
+        "embed_rows_per_s": {
+          "value": 1951.1819162508818,
+          "unit": "rows_per_s"
+        },
+        "embed_serve_ms": {
+          "value": 4.100079,
+          "unit": "ms"
+        }
+      }
+    },
+    "r2": {
+      "outcome": "OK",
+      "identity": {
+        "seed": 0,
+        "batch": 8,
+        "seq": 9,
+        "row_lengths": [
+          8,
+          7,
+          8,
+          9,
+          8,
+          7,
+          7,
+          7
+        ],
+        "compute_precision": "f32",
+        "checkpoint_config_sha256": "e24733455956ab8d84ce74c77b1b6327325a8127090f9b1a76d3265927dbbfdc",
+        "checkpoint_weights_sha256": "f108a730c5be905e38ff73e7cb6670694a3ee3393dee12d1c1511cdbccdb2919",
+        "checkpoint_weights_size_bytes": 102608,
+        "checkpoint_tokenizer_sha256": "c8200a17f2b3fd7321316769a221a770495ac8a6d6206bf3d803870ad354e5e3",
+        "pooling": "mean",
+        "normalize": true,
+        "warmup": 2,
+        "iters_measured": 3,
+        "checkpoint_pooling_sha256": "b10b4ebd4e595307d709a0b61fd29b80e9974b5694d882765bc7ffcf698afce1",
+        "device_requested": "cuda:0"
+      },
+      "provenance": {
+        "device_name": "NVIDIA A100-SXM4-80GB",
+        "kernels_disabled_requested": [],
+        "kernels_disabled_fired": [],
+        "flash_compiled": false,
+        "build_features": [
+          "bench-cuda",
+          "cuda"
+        ],
+        "chunk_size": null,
+        "attention_arm": "eager",
+        "build_sha": "a4fad082f895394b4bf7176bb11606945b5ac3d4"
+      },
+      "measurements": {
+        "embed_rows_per_s": {
+          "value": 1912.264812343478,
+          "unit": "rows_per_s"
+        },
+        "embed_serve_ms": {
+          "value": 4.183521,
+          "unit": "ms"
+        }
+      }
+    }
+  }
+}

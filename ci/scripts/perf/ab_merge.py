@@ -1296,6 +1296,19 @@ FINETUNE_RUN_DECISION_RULE_TEXT = (
     "seeds; never rescaled silently)."
 )
 
+# The lr=0 RED control (CONTRACT Frame: "RED control: lr=0 arm x2 seeds fails
+# learning-happened", unit-63 audit advisory (b)): a SEPARATE leg set, run at
+# `--lr 0` for both arms at a small, fixed number of control seeds, tagged
+# with this `repeat` label (never `r1`/`r2`) so `load_finetune_run_leg` can
+# read them without ever being mistaken for -- or counted into -- the A/B
+# set's own d_values/sign test. The calibration bite this exists to catch:
+# `FINETUNE_RUN_LEARNING_HAPPENED_FLOOR = 0.0` is only a meaningful premise
+# leg if a genuinely-non-learning run (lr=0, no parameter update possible)
+# actually FAILS it -- a control leg that PASSES (its own
+# `learning_happened_delta` clears the floor despite lr=0) is a finding
+# against the floor's own validity, not a training result.
+FINETUNE_RUN_LR0_REPEAT = "lr0"
+
 
 class SignTestError(ValueError):
     """Raised by `sign_test` for the three typed refusals its Rust twin
@@ -1472,7 +1485,57 @@ def load_finetune_run_leg(raw_dir, seed, arm, repeat):
     return {"outcome": "OK", "err_tail": "", "report": report}
 
 
-def build_finetune_run_report(raw_dir, seeds):
+def finetune_run_lr0_control_seed_violations(raw_dir, seed):
+    """The lr=0 RED control's own per-seed check (unit-63 audit advisory
+    (b)): reads BOTH arms' `FINETUNE_RUN_LR0_REPEAT`-tagged leg for `seed`
+    (never `r1`/`r2` -- these never enter `load_finetune_run_leg`'s normal
+    `FINETUNE_RUN_REPEATS` iteration, so they can never leak into the A/B
+    set's own `d_values`/sign test) and asserts each OK leg's
+    `learning_happened_delta` does NOT clear `FINETUNE_RUN_LEARNING_HAPPENED_FLOOR`
+    -- the calibration bite for the FLOOR=0.0 ruling: a passing lr=0 leg
+    (learning "happened" with no possible parameter update) is a finding
+    against the floor itself, not a training result. A leg that is
+    `MISSING`/`FAIL` (never ran, or ran and errored) is ALSO recorded as a
+    violation -- an absent control leaves the floor unvalidated, which this
+    calibration check exists specifically to never pass over silently; a
+    `DRY_RUN` leg is the one carve-out (never itself a finding, same
+    doctrine every other `*_DRY_RUN` leg in this module already gets).
+
+    Returns `(violations, per_arm)` where `per_arm` records each arm's raw
+    outcome and (when OK) its `learning_happened_delta`, for the merged
+    artifact -- never silently dropped even when clean.
+    """
+    violations = []
+    per_arm = {}
+    for arm in FINETUNE_RUN_ARMS:
+        leg = load_finetune_run_leg(raw_dir, seed, arm, FINETUNE_RUN_LR0_REPEAT)
+        outcome = leg["outcome"]
+        if outcome == "DRY_RUN":
+            per_arm[arm] = {"outcome": outcome, "learning_happened_delta": None}
+            continue
+        if outcome != "OK":
+            per_arm[arm] = {"outcome": outcome, "learning_happened_delta": None}
+            violations.append(
+                f"lr0 control seed {seed} {arm}: leg outcome={outcome!r} (not OK) -- an "
+                "absent/failed lr=0 control leg leaves the FLOOR=0.0 premise unvalidated "
+                "(CONTRACT H4 advisory (b))"
+            )
+            continue
+        tier = finetune_run_block(leg["report"])
+        delta = tier.get("learning_happened_delta")
+        per_arm[arm] = {"outcome": outcome, "learning_happened_delta": delta}
+        if isinstance(delta, (int, float)) and not isinstance(delta, bool) and delta > FINETUNE_RUN_LEARNING_HAPPENED_FLOOR:
+            violations.append(
+                f"lr0 control seed {seed} {arm}: learning_happened_delta={delta!r} "
+                f"unexpectedly CLEARS the floor ({FINETUNE_RUN_LEARNING_HAPPENED_FLOOR}) under "
+                "lr=0 -- a passing lr=0 control leg is a finding against the "
+                "FLOOR=0.0 premise-leg ruling itself, not a training result "
+                "(CONTRACT H4 advisory (b))"
+            )
+    return violations, per_arm
+
+
+def build_finetune_run_report(raw_dir, seeds, lr0_seeds=()):
     """The finetune-run merge stage (unit 63 H4b): reads every
     `(seed, arm, repeat)` leg `finetune_run_ab.sh` wrote under `raw_dir`,
     computes the exact sign test over `d_i = fused.held_out_example_mean -
@@ -1496,6 +1559,14 @@ def build_finetune_run_report(raw_dir, seeds):
     problem REPLACES, never merely annotates, the verdict" carve-out
     `build_report`'s own `INVALID` branch already establishes for
     `finetune_ab.sh`).
+
+    `lr0_seeds` (unit-63 audit advisory (b), optional, default empty) names
+    the lr=0 RED control's own seeds -- read via
+    `finetune_run_lr0_control_seed_violations`, NEVER folded into `seeds`,
+    `d_values`, or the sign test; a violation there (a missing/failed
+    control leg, or one that passes learning-happened under lr=0) also
+    collapses `status` to `INVALID`, alongside the premise/determinism-floor
+    carve-outs above.
 
     The DECISION RULE itself (unit-63 audit finding 1 --
     `FINETUNE_RUN_DECISION_RULE_TEXT`'s own doc has the exact predicate) is
@@ -1585,6 +1656,17 @@ def build_finetune_run_report(raw_dir, seeds):
     if not any_leg_found:
         return None, None
 
+    # The lr=0 RED control (unit-63 audit advisory (b)): a SEPARATE seed
+    # axis, read via `FINETUNE_RUN_LR0_REPEAT`-tagged legs only, never folded
+    # into `seeds`/`d_values`/the sign test above.
+    lr0_seeds = list(lr0_seeds)
+    lr0_control_violations = []
+    lr0_control_per_seed = {}
+    for lr0_seed in lr0_seeds:
+        seed_violations, per_arm = finetune_run_lr0_control_seed_violations(raw_dir, lr0_seed)
+        lr0_control_violations += seed_violations
+        lr0_control_per_seed[lr0_seed] = {"per_arm": per_arm, "violations": seed_violations}
+
     # Cross-seed spread: population stdev of every seed's `d_i` that could
     # be COMPUTED at all (even one from a premise-violating seed -- the
     # spread describes how much seeds naturally disagree, which is a fact
@@ -1657,7 +1739,7 @@ def build_finetune_run_report(raw_dir, seeds):
         }
         wrong_seed_count = clean_seed_count != FINETUNE_RUN_GATE_SEED_COUNT
 
-    if any_premise_violation or determinism_floor_findings or sign_error or wrong_seed_count:
+    if any_premise_violation or determinism_floor_findings or sign_error or lr0_control_violations or wrong_seed_count:
         status = "INVALID"
     elif sign_result is None:
         # `any_dry_run_leg` (never a premise violation, see the DRY_RUN
@@ -1697,6 +1779,18 @@ def build_finetune_run_report(raw_dir, seeds):
         "sign_test_error": sign_error,
         "decision": decision,
         "wrong_seed_count": wrong_seed_count,
+        "lr0_control": {
+            "seeds": lr0_seeds,
+            "per_seed": {str(s): v for s, v in lr0_control_per_seed.items()},
+            "violations": lr0_control_violations,
+            "note": (
+                "lr=0 RED control (CONTRACT Frame / audit advisory (b)): separate seeds, "
+                "never counted into the A/B set's own d_values/sign test above. A clean "
+                "control leg FAILS learning-happened (its own learning_happened_delta does "
+                "not clear FINETUNE_RUN_LEARNING_HAPPENED_FLOOR); a passing leg is recorded "
+                "as a violation against the FLOOR=0.0 premise-leg ruling itself."
+            ),
+        },
         "status": status,
     }
 
@@ -1734,6 +1828,10 @@ def build_finetune_run_report(raw_dir, seeds):
         )
     else:
         lines.append("decision: n/a -- no sign_test result to decide over")
+    if lr0_seeds:
+        lines.append(
+            f"lr0_control: seeds={lr0_seeds} violations={len(lr0_control_violations)}"
+        )
     lines.append(f"status: {status}")
     table = "\n".join(lines)
     return merged, table
@@ -1752,14 +1850,20 @@ def main(argv=None):
         rest = argv[1:]
         if len(rest) < 3:
             print(
-                "usage: ab_merge.py finetune-run RAW_DIR OUT_DIR SEED1,SEED2,...",
+                "usage: ab_merge.py finetune-run RAW_DIR OUT_DIR SEED1,SEED2,... "
+                "[LR0_SEED1,LR0_SEED2,...]",
                 file=sys.stderr,
             )
             return 2
         fr_raw_dir, fr_out_dir, seeds_s = rest[:3]
         seeds = [s for s in seeds_s.split(",") if s]
+        # unit-63 audit advisory (b): the lr=0 RED control's own seed list --
+        # OPTIONAL, and, unlike `seeds` above, never itself entering the A/B
+        # set's own d_values/sign test (see `finetune_run_lr0_control_seed_violations`).
+        lr0_seeds_s = rest[3] if len(rest) > 3 else ""
+        lr0_seeds = [s for s in lr0_seeds_s.split(",") if s]
 
-        fr_merged, fr_table = build_finetune_run_report(fr_raw_dir, seeds)
+        fr_merged, fr_table = build_finetune_run_report(fr_raw_dir, seeds, lr0_seeds=lr0_seeds)
         if fr_merged is None:
             print(f"finetune_run_ab: FAIL — no leg output found under {fr_raw_dir}", file=sys.stderr)
             return 1

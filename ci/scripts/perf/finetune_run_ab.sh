@@ -73,6 +73,25 @@
 #   FINETUNE_RUN_AB_EPOCHS     epochs per leg (default: 3).
 #   FINETUNE_RUN_AB_BATCH      batch size (default: 32 -- see "Batch size"
 #                              above).
+#   FINETUNE_RUN_AB_LR         --lr passthrough for the main A/B legs
+#                              (default: unset, so the CLI's own default
+#                              (2e-4, main.rs's `FinetuneRunArgs::lr`) is
+#                              used -- this script previously exposed no
+#                              --lr passthrough at all, unit-63 audit
+#                              advisory (b)).
+#   FINETUNE_RUN_AB_LR0_SEEDS  comma-separated seed list for the lr=0 RED
+#                              control (CONTRACT Frame: "RED control: lr=0
+#                              arm x2 seeds fails learning-happened"; default
+#                              empty = skipped). Each seed here runs BOTH
+#                              arms at --lr 0, tagged with ab_merge.py's own
+#                              `FINETUNE_RUN_LR0_REPEAT` label -- NEVER
+#                              folded into FINETUNE_RUN_AB_SEEDS/the A/B set
+#                              (ab_merge.py's `finetune-run` mode reads these
+#                              via a separate positional arg and checks each
+#                              one FAILS learning-happened; a control seed
+#                              value need not, and by default does not,
+#                              collide with the gate/off-sample seed
+#                              namespaces).
 #   FINETUNE_RUN_AB_CUDA       CUDA ordinal (default: 0). Unset
 #                              FINETUNE_RUN_AB_CPU=1 to omit --cuda entirely
 #                              (the CPU-hermetic smoke path finetune-run's
@@ -124,6 +143,17 @@ case "$FINETUNE_RUN_AB_OBJECTIVE" in
 esac
 FINETUNE_RUN_AB_EPOCHS="${FINETUNE_RUN_AB_EPOCHS:-3}"
 FINETUNE_RUN_AB_BATCH="${FINETUNE_RUN_AB_BATCH:-32}"
+# --lr passthrough (unit-63 audit advisory (b): the CLI has always had this
+# flag, main.rs:141 -- this script simply never forwarded it). Unset means
+# "omit --lr entirely", i.e. the CLI's own default (2e-4) -- never fabricate
+# a value here that main.rs's own `#[arg(long, default_value_t = 2e-4)]`
+# already owns.
+FINETUNE_RUN_AB_LR="${FINETUNE_RUN_AB_LR:-}"
+# lr=0 RED control seeds (CONTRACT Frame; advisory (b)) -- comma-separated,
+# default empty (skipped). NEVER added to FINETUNE_RUN_AB_SEEDS/the main
+# sweep loop below; run through their own dedicated loop, tagged with
+# ab_merge.py's own FINETUNE_RUN_LR0_REPEAT label.
+FINETUNE_RUN_AB_LR0_SEEDS="${FINETUNE_RUN_AB_LR0_SEEDS:-}"
 FINETUNE_RUN_AB_CUDA="${FINETUNE_RUN_AB_CUDA:-0}"
 FINETUNE_RUN_AB_CPU="${FINETUNE_RUN_AB_CPU:-0}"
 
@@ -221,8 +251,13 @@ fi
 # JAMMI_KERNELS_DISABLE=attention_block_flash,adamw_step_fused itself
 # before invoking this binary for the alloff arm" -- main.rs's own
 # `FinetuneRunArgs::arm` doc).
+#
+# `lr_override` (5th, optional): when non-empty, forwarded as `--lr`
+# (main.rs:141's own CLI flag) -- the lr=0 RED control loop below passes
+# `"0"` explicitly; the main A/B loop passes `$FINETUNE_RUN_AB_LR`, which is
+# empty by default (omit --lr entirely, i.e. the CLI's own 2e-4 default).
 run_leg() {
-  local seed="$1" arm="$2" repeat="$3" work_dir="$4"
+  local seed="$1" arm="$2" repeat="$3" work_dir="$4" lr_override="${5:-}"
   local out_file="$RAW_DIR/seed${seed}__${arm}__${repeat}.json"
   local err_file="$RAW_DIR/seed${seed}__${arm}__${repeat}.stderr"
   local exit_file="$RAW_DIR/seed${seed}__${arm}__${repeat}.exit"
@@ -245,6 +280,9 @@ run_leg() {
     --early-stopping-patience 10000
     --work-dir "$work_dir"
   )
+  if [ -n "$lr_override" ]; then
+    cmd+=(--lr "$lr_override")
+  fi
   if [ "$FINETUNE_RUN_AB_CPU" != "1" ]; then
     cmd+=(--cuda "$FINETUNE_RUN_AB_CUDA")
   fi
@@ -282,17 +320,35 @@ for seed in "${SEEDS[@]}"; do
     for repeat in r1 r2; do
       work_dir="$OUT_DIR/work/seed${seed}__${arm}__${repeat}"
       mkdir -p "$work_dir"
-      run_leg "$seed" "$arm" "$repeat" "$work_dir"
+      run_leg "$seed" "$arm" "$repeat" "$work_dir" "$FINETUNE_RUN_AB_LR"
     done
   done
 done
 
+# --- lr=0 RED control legs (CONTRACT Frame; unit-63 audit advisory (b)):
+# both arms, at --lr 0, tagged with ab_merge.py's own FINETUNE_RUN_LR0_REPEAT
+# label ("lr0") -- a DISTINCT repeat token from r1/r2, so these legs are
+# never picked up by the main sweep's own r1/r2 loader and never enter the
+# A/B set. Skipped entirely (no legs, no wiring cost) when
+# FINETUNE_RUN_AB_LR0_SEEDS is unset -- an operator opts in explicitly per
+# H5 campaign step 3.
+if [ -n "$FINETUNE_RUN_AB_LR0_SEEDS" ]; then
+  IFS=',' read -r -a LR0_SEEDS <<< "$FINETUNE_RUN_AB_LR0_SEEDS"
+  for seed in "${LR0_SEEDS[@]}"; do
+    for arm in fused alloff; do
+      work_dir="$OUT_DIR/work/seed${seed}__${arm}__lr0"
+      mkdir -p "$work_dir"
+      run_leg "$seed" "$arm" "lr0" "$work_dir" "0"
+    done
+  done
+fi
+
 # --- merge: sign test + conjunctive leg-premise refusal + determinism-
-# floor reporting, computed INTO the merged artifact by
-# ab_merge.py's own `finetune-run` mode (unit 63 H4b) -- reusing the same
-# generic leg-premise-refusal core `encode_ab.sh`'s merge step already
-# builds on, never a second, hand-rolled comparator.
-python3 "$DIR/ab_merge.py" finetune-run "$RAW_DIR" "$OUT_DIR" "$FINETUNE_RUN_AB_SEEDS"
+# floor reporting + the lr=0 control's own learning-happened check, computed
+# INTO the merged artifact by ab_merge.py's own `finetune-run` mode (unit 63
+# H4b) -- reusing the same generic leg-premise-refusal core `encode_ab.sh`'s
+# merge step already builds on, never a second, hand-rolled comparator.
+python3 "$DIR/ab_merge.py" finetune-run "$RAW_DIR" "$OUT_DIR" "$FINETUNE_RUN_AB_SEEDS" "$FINETUNE_RUN_AB_LR0_SEEDS"
 PY_RC=$?
 
 echo

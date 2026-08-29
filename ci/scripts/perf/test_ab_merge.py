@@ -2278,5 +2278,90 @@ class FinetuneRunDecisionRuleMutantTests(unittest.TestCase):
         self.assertIn("status: INVALID", table)
 
 
+class FinetuneRunLr0ControlTests(unittest.TestCase):
+    """The lr=0 RED control (unit-63 audit advisory (b)):
+    `finetune_run_lr0_control_seed_violations` / its wiring into
+    `build_finetune_run_report`'s own `lr0_control` section -- a clean
+    control leg FAILS learning-happened and is never counted into the A/B
+    set; a control leg that PASSES (or never ran) is a violation that
+    collapses `status` to `INVALID`.
+    """
+
+    def _write_ab_seeds(self, raw_dir, n=12):
+        # A clean, GREEN-shaped 12-seed A/B set (6-vs-6, under the decision
+        # threshold) so any INVALID seen in these tests is attributable to
+        # the lr0 control alone, never the A/B set itself.
+        for seed in range(1, n // 2 + 1):
+            for arm, mean in (("fused", 0.30), ("alloff", 0.50)):
+                _write_finetune_run_leg(
+                    raw_dir, seed, arm, "r1", _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                )
+        for seed in range(n // 2 + 1, n + 1):
+            for arm, mean in (("fused", 0.55), ("alloff", 0.40)):
+                _write_finetune_run_leg(
+                    raw_dir, seed, arm, "r1", _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                )
+
+    def _write_lr0_leg(self, raw_dir, seed, arm, learning_happened_delta):
+        _write_finetune_run_leg(
+            raw_dir,
+            seed,
+            arm,
+            ab_merge.FINETUNE_RUN_LR0_REPEAT,
+            _finetune_run_tier(arm=arm, seed=seed, learning_happened_delta=learning_happened_delta),
+        )
+
+    def test_clean_lr0_control_fails_learning_happened_and_is_green(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_ab_seeds(raw_dir)
+            for seed in (101, 102):
+                for arm in ("fused", "alloff"):
+                    self._write_lr0_leg(raw_dir, seed, arm, 0.0)  # no learning under lr=0 -- clean
+            merged, table = ab_merge.build_finetune_run_report(
+                raw_dir, list(range(1, 13)), lr0_seeds=[101, 102]
+            )
+        self.assertEqual(merged["lr0_control"]["violations"], [])
+        self.assertEqual(merged["status"], "GREEN")
+        self.assertIn("lr0_control: seeds=", table)
+        # NEVER counted into the A/B set.
+        self.assertNotIn("101", merged["d_values"])
+        self.assertNotIn("102", merged["d_values"])
+
+    def test_passing_lr0_control_leg_is_a_violation_and_invalidates(self):
+        # A "passing" control (learning_happened_delta clears the floor
+        # despite lr=0) is a finding against the FLOOR=0.0 premise-leg
+        # ruling itself -- never silently passed through.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_ab_seeds(raw_dir)
+            self._write_lr0_leg(raw_dir, 101, "fused", 0.0)
+            self._write_lr0_leg(raw_dir, 101, "alloff", 0.05)  # unexpectedly clears the floor
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, list(range(1, 13)), lr0_seeds=[101])
+        self.assertTrue(
+            any("unexpectedly CLEARS the floor" in v for v in merged["lr0_control"]["violations"]),
+            merged["lr0_control"]["violations"],
+        )
+        self.assertEqual(merged["status"], "INVALID")
+
+    def test_missing_lr0_control_leg_is_a_violation_and_invalidates(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_ab_seeds(raw_dir)
+            self._write_lr0_leg(raw_dir, 101, "fused", 0.0)
+            # alloff's own lr0 leg for seed 101 never written -- MISSING.
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, list(range(1, 13)), lr0_seeds=[101])
+        self.assertTrue(
+            any("not OK" in v for v in merged["lr0_control"]["violations"]), merged["lr0_control"]["violations"]
+        )
+        self.assertEqual(merged["status"], "INVALID")
+
+    def test_no_lr0_seeds_is_a_no_op(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_ab_seeds(raw_dir)
+            merged, table = ab_merge.build_finetune_run_report(raw_dir, list(range(1, 13)))
+        self.assertEqual(merged["lr0_control"]["seeds"], [])
+        self.assertEqual(merged["lr0_control"]["violations"], [])
+        self.assertEqual(merged["status"], "GREEN")
+        self.assertNotIn("lr0_control: seeds=", table)
+
+
 if __name__ == "__main__":
     unittest.main()

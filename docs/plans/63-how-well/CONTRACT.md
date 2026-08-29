@@ -355,3 +355,88 @@ RED-proof column was scheduled", never "one was scheduled but its own evaluation
 This lets both the existing NOT_PROVEN exit fold (`main()`'s own dose-ladder exit-code branch)
 and `runpod_gpu_howwell.sh`'s own GREEN-but-nonzero cause namer (`howwell_dose_ladder_cause.py`)
 fire on this state instead of falling through to an unexplained-contradiction "unknown" cause.
+
+## Amendment 2026-08-29e (lead, post-RED-proof measurement): the learning-happened premise
+decomposed for RED-proof mutant legs — pressure-tested design D*, data-contingent
+
+Basis (committed FIRST, auditable): docs/plans/63-how-well/measurements/red-proof/ at
+dc1cfc3b — 36 raw legs + the gated merge artifact whose `red_proof_verdict` reads
+`NOT_PROVEN (redproof-nobc=INVALID, redproof-signflip-v2=INVALID)`. Measured structural
+finding: `M_signflip_v2` is dispatch-effective (train probe climbs, e.g. seed 1
+3.3237→20.25) and 12/12 degradation-concordant in held-out raw data, yet every mutant leg
+fails the learning-happened premise because gradient ascent makes
+`train_probe_series[0] - train_probe_series[-1]` negative BY DESIGN — the premise (built
+for the primary C16 attribution question) refuses exactly the strongest true positives of
+the RED-proof detection question. Resolution pressure-tested this session (verdict REFINE,
+design D* adopted; candidates "blanket carve-out" / "weaker still-learning mutant as the
+discharge route" / "raw concordance outside the gated column" / "INVALID-as-stronger-than-
+RED" all killed, the second surviving only as an optional fully-pre-registered secondary
+column).
+
+THE RULE (D*). `learning_happened` is decomposed into two premises; with
+`FINETUNE_RUN_LEARNING_HAPPENED_FLOOR = 0.0`, `d > f ⟺ (|d| > f ∧ d > f)` for any
+`f ≥ 0`, so the decomposition is behavior-identical on every existing call site (lr0
+control, primary A/B both arms, alloff partner) — the round-12-audited primary path is
+unchanged:
+- `training_effective`: `|series[0] - series[-1]| > floor` — the optimizer demonstrably
+  moved the model. Retained on EVERY leg including RED-proof mutant legs, alongside all
+  five typed probe-series refusals (shape, length, init anchoring, finiteness), which are
+  retained unchanged.
+- `train_direction`: `sign(series[0] - series[-1])` must match the leg's declared
+  direction. For every non-RED-proof leg the declared direction is `descent` (exactly
+  today's behavior). For a RED-proof mutant leg it is read from
+  `RED_PROOF_EXPECTED_TRAIN_DIRECTION`, a merger-side committed constant keyed on
+  `patch_sha256` (NEVER the operator-supplied `dose_label`; the sha is doubly anchored —
+  CLI spec and producer stamp must already agree): `c81d0ed5… → ascent`,
+  `9b3c824d… → descent`. Values `{descent, ascent}` only; a RED-proof column whose
+  patch_sha256 is absent from the table is REFUSED (INVALID), never defaulted. No CLI
+  surface exists for the table — no operator-override channel.
+- `init_anchor_equality` (new, compensating): a RED-proof mutant leg's `series[0]` must
+  equal its alloff partner's `series[0]` exactly — a measured same-starting-model
+  guarantee (bit-identical 3.3236749470233917 across all 60 previously committed legs and
+  all 12 signflip_v2 legs).
+- The alloff PARTNER leg keeps every premise unchanged, including descent-direction
+  learning-happened. Column arithmetic unchanged: exactly 12 clean pairs, ≥11/12
+  concordance + mean sign, RED only in the degradation direction.
+
+Falsifiers (the rule can fail): an `ascent`-declared column whose probe descends on any
+leg → INVALID → NOT_PROVEN → non-zero exit (this WOULD have fired on inert M_signflip v1
+— 12/12 bit-identical legs have delta 0, failing `training_effective`'s strict floor —
+a real committed case the pre-D* merger passed silently); the held-out sign test can
+still read not-detected (M_nobc's own measured shape); any retained premise failing on
+any leg → INVALID.
+
+Ascent declaration provenance (pre-spend, quoted): the `c81d0ed5…` entry transcribes the
+prediction committed at 8f06a42c BEFORE the legs ran — "Predicted direction: DEGRADATION,
+with CERTAINTY … gradient ASCENT on `adjusted_grad`'s direction, every step, compounding
+for the length of the run" (mutants/README.md at 8f06a42c). The `9b3c824d…` (M_nobc)
+`descent` entry transcribes its own committed uncertain-but-still-learning prediction.
+
+RECONCILIATION (pressure-test blocking condition 2): mutants/README.md's M_nobc
+"Measured" record (n_pos=5/12, mean_d=-0.018) is the RAW 12-pair concordance, and stands
+as such in measurements/red-proof/README.md; the GATED column reads INVALID (2 of 12
+mutant legs — seeds 9 and 12 — show ascending probes against M_nobc's declared descent,
+so `clean_pair_count=10 ≠ 12`). Both readings are current truth at their own layers;
+mutants/README.md must cite the committed artifact and name the gated reading wherever it
+reports the raw one. Under D* the M_nobc column remains INVALID — recorded, not rescued.
+
+FINAL SCHEDULING + PRE-REGISTERED PREDICTIONS (published before the D* re-merge runs):
+the acceptance-5 discharge merge schedules `redproof-signflip-v2` ONLY (M_nobc's committed
+INVALID record stands as evidence; scheduling a column known-INVALID under its own
+declared direction would only re-manufacture an invalid_doses exit). Predictions:
+(i) all 12 signflip_v2 legs clear the D* premise set (all 12 ascend, matching `ascent`;
+init anchors bit-identical); (ii) the column reads n_pos=12, n_neg=0, two-sided
+p = 2/4096 = 1/2048 ≈ 0.000488 (NEVER 1/4096 — the sign test is exact two-sided),
+detected RED; (iii) `red_proof_verdict` = PROVEN; (iv) merge exit 0 (primary GREEN
+unchanged; PROVEN contributes nothing). Deviation from any prediction voids this
+amendment's basis and is a finding to investigate before any verdict claim.
+
+HONESTY RIDER (pressure-test blocking condition 3): D* discharges acceptance 5 at
+M = M_signflip_v2, a CATASTROPHIC mutant (held-out ~3.3 → ~20) — the detector's
+sensitivity CEILING, not a bound near the operating point. The corridor between M_nobc
+(undetected at |mean_d| ~0.02-0.06 raw) and M_signflip_v2 is UNRESOLVED and this unit
+does not claim otherwise: "detects a regression ≥ mutant M" is discharged with
+M = M_signflip_v2 named explicitly. The lr0-control polarity observation
+(a RISING probe at lr=0 is an instrument finding, today recorded as an ordinary
+learning-happened failure) is a SEPARATE decision, deliberately not folded into this
+amendment — the primary path stays byte-identical.

@@ -36,8 +36,9 @@ this corpus's claims live in paragraphs and table rows both):
   <!-- claims63: default=<path>; c1=<expr>; c2=<expr>; ... -->
 
 `default=<path>` (optional) sets the artifact JSON a bare `#/pointer` (no
-`<path>` prefix) resolves against for every `cK` on this one tag. Every
-non-excluded numeric token in CLAIM-ZONE lines (see CLAIM_ZONES) must have a
+`<path>` prefix) resolves against for every `cK` on this one tag. EVERY
+non-excluded numeric token on EVERY line of an in-scope file (there is no
+covered-region allowlist — see "INVERTED COVERAGE MODEL" below) must have a
 `cK` entry, left to right — a token with no entry, or an entry the closed
 grammar below cannot parse, is a FINDING, never a silent pass (rule 9: this
 gate fails closed on its OWN errors too — an unresolvable path, a JSON parse
@@ -226,22 +227,26 @@ while being representation-independent).
 
 ANTI-VACUITY (two legs, reusing rule (h)'s own two-leg discipline —
 `EXPECTED_DENOMINATOR`/`--sweep`, generalized):
-  (a) COVERAGE. Every file's CLAIM ZONE (a pinned, documented line range —
-      see CLAIM_ZONES below) is scanned with the SAME tokenizer used to
-      award tag entries; the resulting count is compared against a PINNED
-      per-file denominator (CLAIM_ZONE_DENOMINATOR) — any drift (a token
-      entering or leaving scope without updating the pin) is itself a
-      FINDING, never silently absorbed. HONEST LIMIT (stated, not hidden):
-      CLAIM ZONES cover the measurement-claim paragraphs/tables this
-      module's own reading identified — run/checkpoint PROVENANCE prose
-      (timestamps, config hashes, hyperparameter settings) is out of scope
-      by construction (excluded via a closed, documented lexical class,
-      same discipline as rule (h)'s own shape-label/date/version-string
-      exclusions, extended with a FEW classes this corpus's provenance
-      prose needs: hex/sha prefixes, ISO-8601 timestamps, GB/MB sizes,
-      epoch/step/t axis labels, named-hyperparameter assignments, and
-      section/item cross-references) — never silently narrowed past that
-      documented boundary.
+  (a) COVERAGE. There is no covered-region allowlist (see "INVERTED
+      COVERAGE MODEL" above) — the WHOLE file, every line except a fenced
+      ``` block, is scanned with the SAME tokenizer used to award tag
+      entries; the resulting count is compared against a PINNED per-file
+      denominator (FILE_TOKEN_DENOMINATOR) — any drift (a token entering
+      or leaving scope: an edit, or an exclusion-class/fence change,
+      without updating the pin) is itself a FINDING, never silently
+      absorbed. Run/checkpoint PROVENANCE prose (timestamps, config
+      hashes, hyperparameter settings) is out of scope not because it
+      sits outside a hand-picked region, but because it is excluded via a
+      closed, documented lexical class (same discipline as rule (h)'s own
+      shape-label/date/version-string exclusions, extended with the
+      classes this corpus's provenance prose needs: hex/sha prefixes,
+      ISO-8601 timestamps, GB/MB sizes, epoch/step/t axis labels,
+      named-hyperparameter assignments, and section/item/round/unit
+      cross-references) — every class is enumerated at its definition
+      site (`_EXTRA_EXCLUSIONS` below) with a one-line reason and a
+      self-test fixture proving it excludes ONLY its own shape; there is
+      no per-file/per-line carve-out that could silently narrow past that
+      documented boundary the way a zone allowlist could.
   (b) AMBIGUITY. For every DIRECT pointer binding (not `hist`/`ledger`/a
       derived aggregate), an INDEPENDENT scan (`_check_ambiguity`, walking
       `_iter_leaf_paths` — a traversal never used by the production
@@ -272,14 +277,15 @@ truth-value for a qualitative characterization is exactly the kind of
 inference this module's design explicitly refuses to attempt.
 
 SCOPE NOTE. `docs/plans/63-how-well/CONTRACT.md` (25 field=value-shaped
-tokens) and `PLAN.md` (7) are NOT covered here — named follow-up, not a
-silent gap: both are living design documents (amendment-by-amendment) far
-larger in scope than a measurement record's own citation surface, and
-folding them in cheaply would mean either a much coarser claim zone (most
-of two multi-thousand-word documents) or hand-picking sub-paragraphs with
-the same judgment calls this module's own CLAIM_ZONES already required —
-better done as its own follow-up unit than smuggled into this one's already
-large surface.
+tokens) and `PLAN.md` (7) are NOT in `MEASUREMENT_FILES` — named
+follow-up, not a silent gap: both are living design documents
+(amendment-by-amendment) far larger in scope than a measurement record's
+own citation surface, and under the inverted (allowlist-free) coverage
+model this module now uses, adding either would mean the WHOLE of two
+multi-thousand-word documents entering scope by default (never a
+hand-picked subset — that judgment call is exactly what the inversion
+removed) — better done as its own follow-up unit, with its own tag/binding
+sweep, than smuggled into this one's already large surface.
 
 WIRED (see `.github/workflows/ci.yml`, `Guard` matrix): a real run, a
 `--self-test` run (RED fixtures from the actual `82253c1b`/`56989368`
@@ -328,61 +334,74 @@ MEASUREMENT_FILES = [
     "docs/plans/63-how-well/mutants/README.md",
 ]
 
-# CLAIM ZONES (pinned, documented; see module doc, anti-vacuity leg (a)).
-# `(start_line, end_line)` inclusive, 1-indexed, against the file AS
-# COMMITTED at the introduction of this gate. A file edit that shifts these
-# ranges must update this table in the SAME diff — the coverage leg's own
-# per-file token count (CLAIM_ZONE_DENOMINATOR) is what catches a forgotten
-# update (a real claim silently leaving the zone still changes the count).
-CLAIM_ZONES: dict[str, list[tuple[int, int]]] = {
-    "docs/plans/63-how-well/measurements/campaign-v1/README.md": [(7, 82)],
-    "docs/plans/63-how-well/measurements/campaign-v2/README.md": [(7, 31)],
-    "docs/plans/63-how-well/measurements/dose-ladder/README.md": [(3, 36)],
-    "docs/plans/63-how-well/measurements/red-proof/README.md": [(3, 84)],
-    "docs/plans/63-how-well/measurements/red-proof/dstar/README.md": [(3, 48)],
-    "docs/plans/63-how-well/mutants/README.md": [
-        (13, 39),  # M1 measured-record
-        (227, 258),  # Step 3: predicted-detection benchmarks + prediction
-        # table (round-20 audit finding: previously a zone HOLE despite
-        # being claim-bearing — the "Committed benchmarks" bullets cite
-        # real artifact fields; the prediction-table body is PRE-REGISTERED
-        # FORECAST content, `const`-shaped, not a fresh measurement).
-        (447, 467),  # CPU-verifiable demonstration: ratio/absdiff claims
-        # (a fenced ``` block a few lines above this one, and two more
-        # inside the ranges below, are the committed artifacts `code()`
-        # resolves against — never themselves claim-bearing; excluded by
-        # construction since a zone boundary here never spans a fence).
-        (682, 721),  # M_nobc measured + gated
-        (724, 769),  # M_signflip v1 inert record
-        (831, 869),  # M_signflip_v2 prediction bounds
-        # (the CPU-demo preamble + its own fenced ``` block immediately
-        # after this range is not itself claim-bearing, same reasoning as
-        # the eps-family one).
-        (882, 915),  # M_signflip_v2 CPU comparison + measured
-        (1006, 1038),  # merged-artifact-field citations + D* discharge summary
-        (1101, 1101),  # Files: M_nobc.patch Measured-record citation
-        (1111, 1111),  # Files: M_signflip.patch Measured-record citation
-        (1125, 1125),  # Files: M_signflip_v2.patch Measured-record citation
-        # (round-20 audit finding: these three "Files" section bullets cite
-        # the SAME Measured-record numbers as the sections above by name,
-        # but were themselves outside every prior zone — a stray edit to
-        # just this restatement, without touching the section it restates,
-        # previously went uncaught).
-    ],
-}
+# INVERTED COVERAGE MODEL (round-21 finding: an ALLOWLIST of covered zones
+# is structurally blind to its own incompleteness — a token OUTSIDE every
+# zone was silently never scanned at all, not even a candidate for a
+# finding; `mutants/README.md`'s committed-benchmark table and a fourth
+# sibling of the exact class the prior zone list had already special-cased
+# both sat outside every zone, undetected until adversarial perturbation).
+# There is no allowlist of covered regions any more. Every claim token in
+# every file in MEASUREMENT_FILES is IN SCOPE BY DEFAULT; a token escapes
+# checking ONLY via one of three closed, enumerable mechanisms:
+#   (a) a fenced ``` block (`_fenced_line_numbers` below) — the block's own
+#       content is either a non-claim artifact (a diff/shell snippet) or,
+#       for `mutants/README.md`'s CPU-demo tables, the doc-internal
+#       artifact `code()` reads directly (parsed by `parse_code_blocks`,
+#       which walks the SAME raw lines independently of token scanning —
+#       excluding a fence from claim-token scanning and reading it as the
+#       `code()` artifact are two different traversals over the same text,
+#       never in tension).
+#   (b) a CLOSED lexical exclusion class (`rule_h.excluded_spans` +
+#       `_EXTRA_EXCLUSIONS` below, plus the heading-line and
+#       `claims63:`-tag-line skips in `find_claim_tokens`) — every class is
+#       named with a one-line reason at its definition site, and every
+#       class has a self-test fixture proving it excludes ONLY its own
+#       shape (`self_test`'s "exclusion class" fixtures below).
+#   (c) the `ledger`/`const` ratchets (ci/measurement_claims_allowlist.txt,
+#       shrink-only) — for a token that IS in scope but this grammar's own
+#       recipe/pointer machinery genuinely cannot reach.
+# A measured claim appended or edited ANYWHERE in an in-scope file is a
+# claim token under this default; it REDs unless one of the three
+# mechanisms above already covers it — there is no fourth way to leave
+# scope, and in particular no per-file/per-line allowlist to silently miss
+# updating.
 
-# Pinned per-file token counts inside CLAIM_ZONES, using THIS module's own
-# tokenizer/exclusions (recount after any CLAIM_ZONES or exclusion-class
-# edit — anti-vacuity leg (a) fails the bare run on a mismatch, naming both
-# numbers, exactly `check_perf_claims.py`'s own `EXPECTED_DENOMINATOR`
-# discipline).
-CLAIM_ZONE_DENOMINATOR: dict[str, int] = {
+
+def _fenced_line_numbers(lines: list[str]) -> set[int]:
+    """Every 1-indexed line number that is a ``` fence delimiter OR strictly
+    between a matched pair — mechanism (a) above. Reuses the exact
+    delimiter-toggle rule `parse_code_blocks` already uses for its own,
+    separate traversal (fenced content is read as the `code()` artifact
+    there; it is EXCLUDED from claim-token scanning here — two different
+    passes over identical fence boundaries, kept in sync by construction
+    since both key off the same `stripped.startswith("```")` toggle)."""
+    fenced: set[int] = set()
+    in_block = False
+    for i, line in enumerate(lines, start=1):
+        if line.strip().startswith("```"):
+            fenced.add(i)  # the delimiter itself is not claim-bearing text
+            in_block = not in_block
+            continue
+        if in_block:
+            fenced.add(i)
+    return fenced
+
+
+# Pinned per-file TOTAL in-scope token counts (mechanism (a)/(b) applied,
+# whole file — no zone allowlist), using THIS module's own
+# tokenizer/exclusions. This is what now catches silent scope shrink: since
+# every line is a candidate, a token entering OR leaving scope (an edit, an
+# exclusion-class change, a fence added/removed) changes this count and
+# fails the bare run, naming both numbers — exactly
+# `check_perf_claims.py`'s own `EXPECTED_DENOMINATOR` discipline, now
+# applied to the WHOLE file instead of a hand-picked subset of it.
+FILE_TOKEN_DENOMINATOR: dict[str, int] = {
     "docs/plans/63-how-well/measurements/campaign-v1/README.md": 39,
     "docs/plans/63-how-well/measurements/campaign-v2/README.md": 17,
     "docs/plans/63-how-well/measurements/dose-ladder/README.md": 22,
-    "docs/plans/63-how-well/measurements/red-proof/README.md": 47,
-    "docs/plans/63-how-well/measurements/red-proof/dstar/README.md": 32,
-    "docs/plans/63-how-well/mutants/README.md": 158,
+    "docs/plans/63-how-well/measurements/red-proof/README.md": 46,
+    "docs/plans/63-how-well/measurements/red-proof/dstar/README.md": 31,
+    "docs/plans/63-how-well/mutants/README.md": 320,
 }
 
 LEDGER_PATH = REPO_ROOT / "ci" / "measurement_claims_allowlist.txt"
@@ -430,21 +449,60 @@ _EXTRA_EXCLUSIONS = [
     re.compile(r"^\s*\d+\.(?=\s)"),
     # the `lr` hyperparameter in parenthetical-mention form (`lr (2e-4)`).
     re.compile(r"\blr\s*\(\s*[\d.eE+-]+\s*\)"),
-    # the `(1+eps)`/`|1+eps|` dose-family name (a formula/family label,
-    # same class as rule (h)'s own `1/√d`-style formula-fragment
-    # exclusion).
-    re.compile(r"[(|]1\+eps[)|]"),
-    # an "Acceptance N" / "finding N" cross-reference (a CONTRACT.md item
-    # number / this doc's own numbered findings list).
-    re.compile(r"\b(?:Acceptance|finding)\s+\d+\b", re.IGNORECASE),
+    # the `(1+eps)`/`|1+eps|` dose-family name, and its negative-branch
+    # sibling `(1-eps)` (a formula/family label, same class as rule (h)'s
+    # own `1/√d`-style formula-fragment exclusion).
+    re.compile(r"[(|]1[+-]eps[)|]"),
+    # an "Acceptance N" / "finding N" / "Step N" / "Step N-M" / "Step N/M"
+    # cross-reference (a CONTRACT.md item number / this doc's own numbered
+    # findings list / this doc's own numbered "Step" sections).
+    re.compile(r"\b(?:Acceptance|finding|Step)\s+\d+(?:[-/]\d+)?\b", re.IGNORECASE),
     # this repo's own `docs/plans/<N>-<slug>` directory-numbering
     # convention (`63-how-well`, `61-perf-unification`) — a path segment,
     # never a measurement.
     re.compile(r"\b\d+-how-well\b"),
+    # this unit's own `CONTRACT N` / `unit N` / `unit-N` / `PLAN v2 delta N`
+    # self-reference (the doc's own contract/unit/plan-delta number, never
+    # a measurement) — same class as the `item N`/`Acceptance N` cross-refs
+    # above, widened to this file's own additional numbered-reference
+    # vocabulary.
+    re.compile(r"\bCONTRACT\s+\d+\b"),
+    re.compile(r"\bunit[\s-]+\d+\b", re.IGNORECASE),
+    re.compile(r"\bdelta\s+\d+\b"),
+    # an `H<n>(<m>)` requirement/heading cross-reference (`H5(1)`).
+    re.compile(r"\bH\d+\(\d+\)"),
+    # a `*.patch` filename (`M_eps_-0.10.patch`, `M_nobc.patch`) — the
+    # patch's OWN identifier, never a measurement; the leading `M_` +
+    # trailing `.patch` bracket the whole filename so an embedded dose
+    # value (`M_eps_-0.10.patch`) is excluded as part of the name, not
+    # read as a bare decimal.
+    re.compile(r"\bM_[A-Za-z0-9_.+-]*\.patch\b"),
+    # this section's own `s: 0 -> 1` / `s=0` / `s=1` interpolation-parameter
+    # axis notation (the untrained/trained operating-point labels for the
+    # secant slope) — same class as the epoch/step/t axis-label exclusion
+    # above, for the one additional axis variable this section names.
+    re.compile(r"\bs\s*[:=]\s*\d+(?:\s*->\s*\d+)?\b"),
+    # an `eps < 0` / `eps > 0` sign-domain condition (which branch of the
+    # signed dose family a column belongs to) — a formula/domain
+    # description, same class as the named-hyperparameter-assignment
+    # exclusion above, not a measurement of any particular eps value.
+    re.compile(r"\beps\s*[<>]\s*0\b"),
+    # a shell/CLI process exit-code label (`exit 0`) — never a stored
+    # measurement, same class as the existing `RC:\d+` exit-code
+    # exclusion, for this corpus's prose form of the same idiom.
+    re.compile(r"\bexit\s+\d+\b"),
+    # a `seed{N,M}` brace-set notation — the same "seed list" idiom the
+    # `seeds? \d+(?:,|and)...` exclusion above covers for space-separated
+    # lists, widened to this corpus's brace-delimited form.
+    re.compile(r"\bseeds?\{[\d,]+\}"),
     # a bracketed numeric-literal test FIXTURE (`[0.5,-1.25,3.0,0.0]`) — the
     # CPU-demo's fixed input, a design constant never a measurement.
     re.compile(r"\[[-0-9.,\s]+\]"),
     # an "N-element"/"N-leg"/"N consecutive" descriptive count label.
+    # (deliberately NOT "N-seed": that shape also carries a real,
+    # bindable measurement — the campaign's own `12-seed gate` restating
+    # `gate_seed_count` — so it is handled per-occurrence via a binding,
+    # never excluded wholesale.)
     re.compile(r"\b\d+-(?:element|leg)\b"),
     re.compile(r"\b\d+\s+consecutive\b"),
     # a seed-number LIST (`seeds 9 and 12`, `seeds 9, 12`) — reused idiom,
@@ -1033,13 +1091,14 @@ class Finding:
     message: str
 
 
-def _lines_in_zones(rel_path: str, total_lines: int) -> set[int]:
-    zones = CLAIM_ZONES.get(rel_path, [])
-    out: set[int] = set()
-    for lo, hi in zones:
-        for i in range(lo, min(hi, total_lines) + 1):
-            out.add(i)
-    return out
+def _in_scope_lines(lines: list[str]) -> set[int]:
+    """Every 1-indexed line number in the file EXCEPT fenced lines — mechanism
+    (a). This is the WHOLE file, replacing the old CLAIM_ZONES allowlist: a
+    token escapes scanning from here only via mechanism (b) (a lexical
+    exclusion class, applied per-token inside `find_claim_tokens`) or (c)
+    (a `ledger`/`const` tag entry, applied per-token inside `scan_file`)."""
+    fenced = _fenced_line_numbers(lines)
+    return {i for i in range(1, len(lines) + 1) if i not in fenced}
 
 
 # the binding-breakdown categories the gate's headline prints (B4: "print
@@ -1082,14 +1141,14 @@ def scan_file(
     text = abspath.read_text()
     lines = text.splitlines()
     code_blocks = parse_code_blocks(lines) if "mutants" in rel_path else {}
-    zone_lines = _lines_in_zones(rel_path, len(lines))
+    scope_lines = _in_scope_lines(lines)
     findings: list[Finding] = []
     tokens_in_zone = 0
     tokens_bound = 0
     breakdown: dict[str, int] = {k: 0 for k in _BREAKDOWN_KINDS}
 
     for line_no, line in enumerate(lines, start=1):
-        if line_no not in zone_lines:
+        if line_no not in scope_lines:
             continue
         toks = find_claim_tokens(line, line_no)
         if not toks:
@@ -1350,17 +1409,15 @@ def check_coverage() -> list[str]:
     for rel_path in MEASUREMENT_FILES:
         abspath = REPO_ROOT / rel_path
         lines = abspath.read_text().splitlines()
-        zone_lines = _lines_in_zones(rel_path, len(lines))
+        scope_lines = _in_scope_lines(lines)
         total = 0
-        for line_no in sorted(zone_lines):
-            if line_no > len(lines):
-                continue
+        for line_no in sorted(scope_lines):
             total += len(find_claim_tokens(lines[line_no - 1], line_no))
-        expected = CLAIM_ZONE_DENOMINATOR.get(rel_path)
+        expected = FILE_TOKEN_DENOMINATOR.get(rel_path)
         if expected is None:
-            problems.append(f"{rel_path}: no CLAIM_ZONE_DENOMINATOR pinned")
+            problems.append(f"{rel_path}: no FILE_TOKEN_DENOMINATOR pinned")
         elif total != expected:
-            problems.append(f"{rel_path}: claim-zone token count drifted: pinned {expected}, counted {total}")
+            problems.append(f"{rel_path}: file token count drifted: pinned {expected}, counted {total}")
     return problems
 
 
@@ -1401,7 +1458,7 @@ def gate() -> int:
     # never a flat "N/N bound" that launders an escape as though it were a
     # recompute.
     print(
-        f"claim-zone tokens: {in_zone}, bound OK: {bound}, findings: {len(findings)} "
+        f"in-scope tokens: {in_zone}, bound OK: {bound}, findings: {len(findings)} "
         f"[ptr={breakdown['ptr']} recipe={breakdown['recipe']} "
         f"ledger={breakdown['ledger']} const={breakdown['const']} hist={breakdown['hist']}]"
     )
@@ -1680,6 +1737,37 @@ def self_test() -> int:
             within_false_raised = True
         check("within() synthetic: |1.0005 - 1.0| > 0.0001 correctly raises ResolutionError", within_false_raised)
 
+        # mind(): unused by the real corpus today (its sibling `maxd()` IS
+        # used, e.g. mutants/README.md's own `redproof-signflip-v2` maxd
+        # binding), same "no member ships without an exercising fixture"
+        # discipline as `within()` above -- driven end-to-end through the
+        # REAL tree's own `signflip_v2` vs `alloff` raw legs (the same pair
+        # `maxd()` is bound against elsewhere), not a synthetic dict, so the
+        # fixture doubles as a real-tree recompute cross-check.
+        mind_ev = Evaluator(loader, {}, None)
+        mind_binding = mind_ev.eval(
+            parse_expr(
+                "mind('docs/plans/63-how-well/measurements/red-proof/raw/signflip_v2__seed*.json', "
+                "'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', "
+                "'held_out_example_mean')"
+            )
+        )
+        maxd_binding = mind_ev.eval(
+            parse_expr(
+                "maxd('docs/plans/63-how-well/measurements/red-proof/raw/signflip_v2__seed*.json', "
+                "'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', "
+                "'held_out_example_mean')"
+            )
+        )
+        check(
+            "mind() end-to-end: signflip_v2-vs-alloff smallest signed delta rounds to 0.17900",
+            compare_token("0.17900", mind_binding.value)[0],  # type: ignore[arg-type]
+        )
+        check(
+            "mind() correctly the SMALLER endpoint, maxd() the LARGER, over the SAME pair",
+            mind_binding.value < maxd_binding.value,  # type: ignore[operator]
+        )
+
         # wrong-file binding: dstar's n_pos=12 must NOT validate against
         # red-proof's own (pre-D*) report — `mutant_dose_ladder.red_proof[0]`
         # there (the `redproof-nobc` column) reads n_pos=3.
@@ -1715,8 +1803,63 @@ def self_test() -> int:
             len(toks) >= 1 and entries is None,
         )
 
+    # --- new (round-21) closed lexical exclusion classes: each excludes
+    # ONLY its own shape -- a measured token dressed up in the SAME
+    # syntactic neighborhood (adversarial fixture per class) must still be
+    # found. -----------------------------------------------------------
+    def toks_of(line: str) -> list[str]:
+        return [t.text for t in find_claim_tokens(line, 1)]
+
+    check("exclusion(Step N): 'Step 2 predicted the effect' excludes cleanly", toks_of("Step 2 predicted the effect") == [])
     check(
-        "self-test: real tree tokenizer matches pinned CLAIM_ZONE_DENOMINATOR",
+        "exclusion(Step N) adversarial: a measured value beside 'Step 2' is still found",
+        toks_of("the measured value was 2.5 in Step 2") == ["2.5"],
+    )
+    check("exclusion(CONTRACT/unit/delta N): all three excluded", toks_of("CONTRACT 63 unit 63 delta 7") == [])
+    check(
+        "exclusion(CONTRACT N) adversarial: a measured value beside 'CONTRACT 63' is still found",
+        toks_of("measured 63.5 in CONTRACT 63") == ["63.5"],
+    )
+    check("exclusion(H\\d+(\\d+)): \"per H5(1)'s own rule\" excludes cleanly", toks_of("per H5(1)'s own rule") == [])
+    check(
+        "exclusion(H\\d+(\\d+)) adversarial: a measured value beside 'H5(1)' is still found",
+        toks_of("measured 5.5 per H5(1)") == ["5.5"],
+    )
+    check(
+        "exclusion(*.patch filename): a dose value embedded in a patch filename excludes cleanly",
+        toks_of("see `M_eps_-0.10.patch` for the patch") == [],
+    )
+    check(
+        "exclusion(*.patch filename) adversarial: a standalone measured value beside the SAME filename is still found",
+        toks_of("measured -0.10 as recorded in `M_eps_-0.10.patch`") == ["-0.10"],
+    )
+    check("exclusion(s-scale): 's: 0 -> 1' and 's=1' exclude cleanly", toks_of("the operating point `s: 0 -> 1`, `s=1` was reached") == [])
+    check(
+        "exclusion(s-scale) adversarial: a measured value beside 's=1' is still found",
+        toks_of("measured 1.5 at `s=1`") == ["1.5"],
+    )
+    check("exclusion(eps sign condition): 'eps < 0' and 'eps > 0' exclude cleanly", toks_of("for eps < 0 dose, unlike eps > 0") == [])
+    check(
+        "exclusion(eps sign condition) adversarial: a measured value beside 'eps < 0' is still found",
+        toks_of("measured 0.5 when eps < 0") == ["0.5"],
+    )
+    check("exclusion(exit N): 'cargo build (exit 0)' excludes cleanly", toks_of("cargo build (exit 0)") == [])
+    check(
+        "exclusion(exit N) adversarial: a measured value beside 'exit 0' is still found",
+        toks_of("measured 0.5 at (exit 0)") == ["0.5"],
+    )
+    check("exclusion(seed{N,M}): 'seed{1,2} committed' excludes cleanly", toks_of("seed{1,2} committed") == [])
+    check(
+        "exclusion(seed{N,M}) adversarial: a measured value beside 'seed{1,2}' is still found",
+        toks_of("measured 1.5 for seed{1,2}") == ["1.5"],
+    )
+    check(
+        "exclusion((1-eps) formula fragment): both '(1+eps)' and '(1-eps)' exclude cleanly",
+        toks_of("the `(1+eps)`/`(1-eps)` dose-family shape") == [],
+    )
+
+    check(
+        "self-test: real tree tokenizer matches pinned FILE_TOKEN_DENOMINATOR",
         len(check_coverage()) == 0,
     )
 
@@ -1730,9 +1873,10 @@ def self_test() -> int:
     # a tautology that could never fail). `Path(REPO_ROOT) / <absolute path>`
     # returns the absolute path unchanged (stdlib `pathlib` semantics), so a
     # tempfile path works as `scan_file`'s `rel_path` without touching the
-    # real tree; `CLAIM_ZONES` is temporarily extended for that one throwaway
-    # path (restored in `finally`) since the zone anti-vacuity leg is keyed
-    # on `rel_path` by design and a fixture path is never pre-pinned.
+    # real tree; under the inverted (allowlist-free) coverage model,
+    # `scan_file` derives its scope purely from the fixture file's OWN
+    # lines (`_in_scope_lines`) — no separate zone registration for a
+    # throwaway fixture path is needed any more.
     import tempfile as _tempfile
 
     with _tempfile.TemporaryDirectory() as _td:
@@ -1743,20 +1887,87 @@ def self_test() -> int:
         fixture_line = fixture_content.splitlines()[1]
         fixture_tok = find_claim_tokens(fixture_line, 2)[0]
         real_key = f"{fixture_rel}:{fixture_tok.text}:{line_hash(fixture_line)}:{fixture_tok.col}"
-        CLAIM_ZONES[fixture_rel] = [(1, 2)]
-        try:
-            findings_absent, _, _, _ = scan_file(fixture_rel, Loader(), ledger=set())
-            check(
-                "ledger synthetic RED: scan_file FINDS an unregistered ledger key (driven end-to-end)",
-                any("ledger-escaped" in f.message for f in findings_absent),
-            )
-            findings_present, _, bound_present, _ = scan_file(fixture_rel, Loader(), ledger={real_key})
-            check(
-                "ledger synthetic GREEN: scan_file BINDS the SAME key once registered (driven end-to-end)",
-                not findings_present and bound_present == 1,
-            )
-        finally:
-            del CLAIM_ZONES[fixture_rel]
+        findings_absent, _, _, _ = scan_file(fixture_rel, Loader(), ledger=set())
+        check(
+            "ledger synthetic RED: scan_file FINDS an unregistered ledger key (driven end-to-end)",
+            any("ledger-escaped" in f.message for f in findings_absent),
+        )
+        findings_present, _, bound_present, _ = scan_file(fixture_rel, Loader(), ledger={real_key})
+        check(
+            "ledger synthetic GREEN: scan_file BINDS the SAME key once registered (driven end-to-end)",
+            not findings_present and bound_present == 1,
+        )
+
+    # --- round-21 perturbation probes, reproduced as regression fixtures --
+    # (INVERTED-MODEL mutation-adequacy: the auditor perturbed four sites in
+    # the real, committed `mutants/README.md` and found :1111 correctly
+    # REDded while :929/:153/:551 sat OUTSIDE every CLAIM_ZONES range and
+    # were silently never scanned at all. Under the inverted, allowlist-free
+    # model every one of these MUST RED, driven end-to-end through the REAL
+    # `scan_file` entry point on a MUTATED COPY of the real committed file —
+    # never a synthetic 2-line fixture, so a regression in the inversion
+    # itself (a zone/scope narrowing creeping back in) cannot hide behind a
+    # too-small fixture the way the pre-inversion CLAIM_ZONES bug did.)
+    real_mutants_path = REPO_ROOT / "docs/plans/63-how-well/mutants/README.md"
+    real_mutants_text = real_mutants_path.read_text()
+    real_ledger = load_ledger()
+
+    def _mutate_and_scan(old: str, new: str) -> list[Finding]:
+        assert old in real_mutants_text, f"probe anchor text not found: {old!r}"
+        mutated = real_mutants_text.replace(old, new, 1)
+        with _tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "README.md"
+            p.write_text(mutated)
+            findings, _, _, _ = scan_file(str(p), Loader(), ledger=real_ledger)
+            return findings
+
+    # probe 1 (round-21 :929 analog): M_signflip v1's own "RETIRED, measured
+    # INERT on GPU (12/12 bit-identical)" perturbed to a near-miss 11/12 --
+    # was silently OUTSIDE every CLAIM_ZONES range before the inversion.
+    f929 = _mutate_and_scan(
+        "RETIRED, measured INERT on GPU (12/12 bit-identical)",
+        "RETIRED, measured INERT on GPU (11/12 bit-identical)",
+    )
+    check("round-21 probe :929 (M_signflip v1 12/12->11/12) REDs under the inverted model", bool(f929))
+
+    # probe 2 (round-21 :153 analog): Step 1's own committed-benchmark table,
+    # one full-precision `held_out_example_mean` value perturbed in its last
+    # digit -- was silently OUTSIDE every CLAIM_ZONES range before the
+    # inversion (the "committed-benchmark table" round-21 itself named).
+    f153 = _mutate_and_scan("`3.218041628599167`", "`3.218041628599168`")
+    check("round-21 probe :153 (Step-1 table full-precision value, last digit) REDs under the inverted model", bool(f153))
+
+    # probe 3 (round-21 :551 analog): M1's own "8/12, well under either
+    # threshold" restatement perturbed to a near-miss 9/12 -- was silently
+    # OUTSIDE every CLAIM_ZONES range before the inversion.
+    f551 = _mutate_and_scan(
+        "sign-flipping-transient shape: 8/12, well under either threshold);",
+        "sign-flipping-transient shape: 9/12, well under either threshold);",
+    )
+    check("round-21 probe :551 (M1 8/12->9/12 restatement) REDs under the inverted model", bool(f551))
+
+    # probe 4 (round-21 "EOF-append"): a brand-new, untagged measured-shaped
+    # claim appended past the end of the file -- the exact shape a
+    # covered-region ALLOWLIST is structurally blind to (nothing further
+    # than the last zone was ever scanned); under the inverted (default-in-
+    # scope) model this REDs exactly like any other untagged line.
+    f_eof = _mutate_and_scan(
+        real_mutants_text[-40:],
+        real_mutants_text[-40:] + "\nA freshly appended, untagged measured claim: 42.42.\n",
+    )
+    check("round-21 probe (EOF-append, untagged) REDs under the inverted model", bool(f_eof))
+
+    # negative control (round-21 :1111 analog): the "Files" section's own
+    # `M_signflip_v2.patch` restatement of "measured RED, 12/12" was ALREADY
+    # inside a CLAIM_ZONES range pre-inversion and already REDded correctly
+    # -- perturbing it must STILL RED post-inversion (a continuity check:
+    # the inversion must never silently narrow what a prior, working zone
+    # already covered).
+    f1111 = _mutate_and_scan(
+        "member of this pair, **measured RED, 12/12, `red_proof_verdict=PROVEN`",
+        "member of this pair, **measured RED, 11/12, `red_proof_verdict=PROVEN`",
+    )
+    check("round-21 probe :1111 analog (Files-section 12/12 restatement) STILL REDs post-inversion", bool(f1111))
 
     findings, in_zone, bound, breakdown = run_real_tree()
     check(

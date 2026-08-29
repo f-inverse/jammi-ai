@@ -1,6 +1,6 @@
 # RED-proof mutant columns (unit 63, acceptance 5 "mutant column proven RED")
 
-<!-- claims63: c1=ledger; c2=ledger; c3=ledger -->
+<!-- claims63: c1=ledger; c2=ledger; c3=paircount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean') -->
 36 raw legs (3 mutants x 12 seeds, mutant-in-fused-arm, a100), merged against
 campaign-v2's alloff legs by the round-13-audited gate (`ab_merge.py` at f2265452,
 <!-- claims63: c1=ledger; c2=ledger -->
@@ -73,7 +73,7 @@ committed at `dstar/` (`dstar/README.md`, artifact at 82253c1b): all four
 pre-registered predictions confirmed to the bit, `redproof-signflip-v2`
 <!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/dstar/finetune_run_ab_report.json; c1=#/mutant_dose_ladder/red_proof/0/n_pos; c2=#/mutant_dose_ladder/red_proof/0/clean_pair_count; c3=#/mutant_dose_ladder/red_proof/0/n_neg -->
 reads `detected=RED` (`n_pos=12/12`, `n_neg=0`, two-sided
-<!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/dstar/finetune_run_ab_report.json; c1=numer(4096, #/mutant_dose_ladder/red_proof/0/p_value); c2=denom(2, #/mutant_dose_ladder/red_proof/0/p_value); c3=numer(2048, #/mutant_dose_ladder/red_proof/0/p_value); c4=denom(1, #/mutant_dose_ladder/red_proof/0/p_value); c5=ledger -->
+<!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/dstar/finetune_run_ab_report.json; c1=numer(4096, #/mutant_dose_ladder/red_proof/0/p_value); c2=denom(2, #/mutant_dose_ladder/red_proof/0/p_value); c3=numer(2048, #/mutant_dose_ladder/red_proof/0/p_value); c4=denom(1, #/mutant_dose_ladder/red_proof/0/p_value) -->
 `p=2/4096=1/2048` exact), `red_proof_verdict=PROVEN`, merge exit 0.
 Acceptance 5's "mutant column proven RED" is DISCHARGED at
 `M = M_signflip_v2`, per the amendment's honesty rider (M is a catastrophic

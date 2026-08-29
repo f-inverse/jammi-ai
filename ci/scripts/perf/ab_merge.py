@@ -3024,6 +3024,17 @@ def _dose_label_eps(dose_label):
     refused here, loudly, by the SAME exception every other unparseable
     label raises -- never a silent pass-through to a partition predicate
     that was never designed to reject them.
+
+    Unit-63 round-9 audit advisory (a): `dose_label` is parsed EXACTLY as
+    it will be used for raw leg file lookup (`mutant_leg_repeat_tag`
+    tags the leg file with the literal `dose_label` string, byte-for-byte)
+    -- `float()` is more permissive than that file name ever is, silently
+    accepting leading/trailing/embedded whitespace (`float(" 0.5")`) and
+    an explicit `+` sign (`float("+0.5")`) that a raw file name lookup
+    would never see the same way (e.g. a `+` sitting at a shell/URL
+    boundary where it is conventionally decoded as a space). A `dose_label`
+    whose eps substring contains either shape is refused here rather than
+    silently parsed to a value that could diverge from the on-disk name.
     """
     prefix = "eps"
     if not dose_label.startswith(prefix):
@@ -3033,6 +3044,14 @@ def _dose_label_eps(dose_label):
             "float literal, e.g. 'eps-0.50' / 'eps0.50')"
         )
     rest = dose_label[len(prefix):]
+    if any(c.isspace() for c in rest) or "+" in rest:
+        raise MutantDoseLadderSensitivityError(
+            f"dose_label {dose_label!r}'s eps substring {rest!r} contains whitespace or an "
+            "explicit '+' sign -- refused rather than parsed by a more permissive float(), since "
+            "this label is used VERBATIM for raw leg file lookup (mutant_leg_repeat_tag) and "
+            "either shape could silently diverge from the on-disk file name (e.g. a URL-encoding "
+            "boundary treating '+' as a space)"
+        )
     try:
         value = float(rest)
     except ValueError as exc:

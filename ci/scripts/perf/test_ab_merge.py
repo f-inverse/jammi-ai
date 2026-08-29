@@ -3980,6 +3980,17 @@ class MutantDoseLadderTests(unittest.TestCase):
                 with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
                     ab_merge._dose_label_eps(dose_label)
 
+    def test_whitespace_or_explicit_plus_in_eps_substring_is_refused(self):
+        # unit-63 round-9 audit advisory (a): float() is more permissive
+        # than the raw leg file name lookup this label is used VERBATIM
+        # for -- a whitespace-padded or explicit-plus-signed eps substring
+        # parses fine but could silently diverge from the on-disk file
+        # name, so it is refused here rather than accepted.
+        for dose_label in ("eps 0.50", "eps0.50 ", "eps +0.50", "eps+0.50", "eps0.5\t0"):
+            with self.subTest(dose_label=dose_label):
+                with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+                    ab_merge._dose_label_eps(dose_label)
+
     def test_epsnan_is_refused_not_silently_dropped_from_both_findings(self):
         columns = [{"dose_label": "epsnan", "detected": "RED"}]
         with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):

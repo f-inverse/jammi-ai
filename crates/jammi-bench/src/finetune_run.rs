@@ -683,18 +683,26 @@ fn run_impl(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    // unit-63 round-9 audit advisory (b): lowercased AFTER trim, not
+    // merely `to_string`'d -- a sha is case-insensitive hex, but the
+    // merger's own downstream comparison (ab_merge.py's
+    // `finetune_run_mutant_column_violations`) is exact string equality
+    // against the caller-supplied `--mutant-legs` spec, so an
+    // uppercase-hex-emitting producer must normalize case here, at the
+    // SAME point every other producer-stamped-field trim already happens,
+    // rather than let the two sides silently disagree only on letter case.
     let mutant_base_sha = params
         .mutant_base_sha
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string);
+        .map(str::to_lowercase);
     let mutant_patch_sha256 = params
         .mutant_patch_sha256
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string);
+        .map(str::to_lowercase);
     let never_touched = params.mutant_id.is_none()
         && params.mutant_base_sha.is_none()
         && params.mutant_patch_sha256.is_none();

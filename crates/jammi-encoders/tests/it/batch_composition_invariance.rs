@@ -52,13 +52,12 @@
 //! f32-truth-anchored comparison, with nothing further to subtract. The
 //! CUDA legs additionally compute an `f32`-CPU truth for the SAME
 //! composition and ASSERT each `bf16` arm -- alone and batch,
-//! independently -- tracks it within `PROVISIONAL_GPU_TRUTH_DRIFT_BOUND`,
-//! so a real dtype-rounding regression cannot hide inside an
-//! alone-vs-batch agreement that happens to cancel (both arms drifting
-//! IDENTICALLY away from truth would still fail these two asserts even
-//! though the alone-vs-batch `PROVISIONAL_GPU_FLOOR_PLACEHOLDER` check
-//! would pass) -- the truth ratios are not merely printed, they gate the
-//! test.
+//! independently -- tracks it within [`GPU_TRUTH_DRIFT_BOUND`], so a real
+//! dtype-rounding regression cannot hide inside an alone-vs-batch
+//! agreement that happens to cancel (both arms drifting IDENTICALLY away
+//! from truth would still fail these two asserts even though the
+//! alone-vs-batch [`gpu_composition_floor`] check would pass) -- the
+//! truth ratios are not merely printed, they gate the test.
 //!
 //! **Floor discipline (guide checklist rule 8 / esc-045's own null-band
 //! control (a)): a bound must never be invented, only measured.** The
@@ -74,12 +73,19 @@
 //! this constant can be treated as final -- it may need tightening or
 //! (if Linux shows a materially larger floor) loosening, but never by
 //! guesswork; only by a fresh measurement replacing this one. The `bf16`
-//! CUDA bound is UNMEASURED by this agent (no CUDA device in this
-//! environment) and is marked PROVISIONAL with an explicit placeholder;
-//! the pod train (Step 5) MUST replace it with a measured value before
-//! this leg gates anything, exactly as `FLASH_ORACLE_PADDED_BOUND`
-//! (`src/modernbert.rs`) was derived from a real 8-seed pod harvest
-//! rather than invented.
+//! CUDA bounds ([`gpu_composition_floor`], [`GPU_TRUTH_DRIFT_BOUND`])
+//! were MEASURED on the unit 62 landing round (`measure_gpu_floors_print_only`,
+//! tree `67ba2394`, `JAMMI_REQUIRE_CUDA=1`, 8 compositions x 88
+//! row-measurements per arch, one pod run per arch -- a100
+//! `cjjh6oaqehvpwi`, h100 `gufh54wmqox1rw`, a40 `qlc5z76zh98v6c`, l40s
+//! `kccwbawx92pou1`) and folded into per-arch bounds with documented
+//! margin arithmetic -- see [`gpu_composition_floor`]'s and
+//! [`GPU_TRUTH_DRIFT_BOUND`]'s own docs for the full measured values,
+//! margins, and admissibility scoping. Exactly as `FLASH_ORACLE_PADDED_BOUND`
+//! (`src/modernbert.rs`) was derived from a real 8-seed pod harvest rather
+//! than invented, these two are derived from real pod measurements, never
+//! guessed -- reshaped (arch-conditional / control admissibility scoped),
+//! never tuned to pass.
 //!
 //! **Conjunctive red controls.** Two independent mutants -- a
 //! `row_lengths` off-by-one (a batch construction bug: one row's real
@@ -392,12 +398,15 @@ fn pooled_embedding_red_control_window_radius_off_by_one_f32_cpu() {
 // ─────────────────────────────────────────────────────────────────────────
 // GPU-gated legs (`bf16`, CUDA eager arm) -- capability-gated the same way
 // the M1b family gates (`Device::new_cuda(0)`, `JAMMI_REQUIRE_CUDA`
-// opt-in-panic, silent skip otherwise). PROVISIONAL bounds below are
-// PLACEHOLDERS this agent could not measure (no CUDA device in this
-// environment) -- the pod train (contract E4, Step 5) MUST replace them
-// with a measured same-composition floor before this leg gates anything,
-// the same way `FLASH_ORACLE_PADDED_BOUND` (`src/modernbert.rs`) was
-// replaced by a real 8-seed pod harvest before it gated anything.
+// opt-in-panic, silent skip otherwise). Bounds below (`gpu_composition_floor`,
+// `GPU_TRUTH_DRIFT_BOUND`) are MEASURED (unit 62 landing round, tree
+// `67ba2394`, four-arch pod run) and folded in with documented margin
+// arithmetic -- see each constant/function's own doc -- the same way
+// `FLASH_ORACLE_PADDED_BOUND` (`src/modernbert.rs`) was replaced by a real
+// 8-seed pod harvest before it gated anything. An arch outside the
+// measured set still fails LOUD (`f64::NAN` -> `require_pod_measured_floor`
+// panic), never silently guesses a floor -- see `gpu_composition_floor`'s
+// own doc.
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Mirrors `src/modernbert.rs`'s own `growth_oracle_cuda_device` /
@@ -443,57 +452,180 @@ fn relative_l1_error(a: &[f32], b: &[f32]) -> f64 {
     num / den
 }
 
-/// PROVISIONAL PLACEHOLDER -- UNMEASURED. Bounds the `bf16`-CUDA
-/// alone-vs-padded-batch [`relative_l1_error`] on real rows -- a
-/// COMPOSITION-INVARIANCE floor (does the SAME dtype/device arm agree
-/// with itself across the alone vs padded-batch composition). This value
-/// is NOT derived from any measurement (no CUDA device was available to
-/// this agent); it exists only so the CPU-hermetic gate can typecheck
-/// this file's structure while feature-gated out. The pod train
-/// (contract E4, Step 5) MUST measure this oracle's real `relative_l1_error`
-/// on hardware (the same discipline `FLASH_ORACLE_PADDED_BOUND` used: an
-/// 8-seed-class harvest, mean asserted, per-seed ratios printed) and
-/// replace this constant before this leg is allowed to gate anything.
+/// PER-ARCH, MEASURED composition-invariance floor for the `bf16`-CUDA
+/// alone-vs-padded-batch [`relative_l1_error`] on real rows (does the SAME
+/// dtype/device arm agree with itself across the alone vs padded-batch
+/// composition). Measured by `measure_gpu_floors_print_only` (unit 62
+/// landing round, tree `67ba2394`, `JAMMI_REQUIRE_CUDA=1`, 8 compositions
+/// x 88 row-measurements per arch, one pod run per arch, push-stamps
+/// verified):
+///
+/// | arch (compute cap) | pod              | alone_vs_batch mean      | alone_vs_batch max        |
+/// |---------------------|-------------------|---------------------------|-----------------------------|
+/// | a100 sm80 (8,0)      | `cjjh6oaqehvpwi`   | `0e0`                     | `0e0` (EXACT)               |
+/// | h100 sm90 (9,0)      | `gufh54wmqox1rw`   | `0e0`                     | `0e0` (EXACT)               |
+/// | a40  sm86 (8,6)      | `qlc5z76zh98v6c`   | `0e0`                     | `0e0` (EXACT)               |
+/// | l40s sm89 (8,9)      | `kccwbawx92pou1`   | `1.1805235731113235e-3`   | `4.118649354617619e-3`      |
+///
+/// **Exact-arches class (sm80/sm86/sm90, [`EXACT_ARCH_COMPOSITION_FLOOR`]).**
+/// 264 row-measurements (3 arches x 88 each) came back EXACTLY `0.0`,
+/// zero flakiness -- the same bit-exact-zero this file's own module doc
+/// predicts from `MASKED_LOGIT` underflow (a pad weight's contribution to
+/// the value-weighted sum is `0.0 * finite == 0.0` exactly). The floor is
+/// set to `1e-5`: `75x` BELOW the weakest red control separation measured
+/// on this class (the window-radius control's own min,
+/// `7.508231757090548e-4`; `7.508231757090548e-4 / 1e-5 ~= 75.1x`), and
+/// infinitely above the measured `0.0` -- a `0.0` floor itself would admit
+/// no float slop at all, including benign FMA/ordering differences on a
+/// future, architecturally-identical but as-yet-unmeasured exact-arch SKU.
+///
+/// **sm89 (L40S, [`SM89_COMPOSITION_FLOOR`]) genuinely diverges** --
+/// consistent with the M1b campaign's own A40-pass/L40S-fail finding for
+/// this exact "Ada-class is not one behavior" pattern
+/// (`lora_linear_dx_abs_floor`, `crates/jammi-kernels/tests/cuda_parity.rs`):
+/// a different cuBLAS/cuDNN kernel selection on this SKU, not flakiness.
+/// Derivation (M1b-style measure-then-margin-then-round-clean discipline):
+/// ```text
+/// measured max (l40s, kccwbawx92pou1, tree 67ba2394):
+///   4.118649354617619e-3
+/// margin (~2% headroom over the measured max -- kept modest rather than
+/// `lora_linear_dx_abs_floor`'s 1.5x precedent, because a larger margin
+/// here would erode the row-length red control's own measured separation
+/// below the ~16x this derivation documents below; see the admissibility
+/// note):
+///   4.118649354617619e-3 * 1.02 = 4.2010263...e-3
+/// rounded UP to a clean value (never round down past the margin):
+///   4.2e-3
+/// ```
+///
+/// **Admissibility scoping (reshape, never tune).** The window-radius red
+/// control's own measured minimum separation on sm89,
+/// `1.139471768897301e-3`, is SMALLER than [`SM89_COMPOSITION_FLOOR`]
+/// (`4.2e-3`) -- the control cannot separate above the floor on this arch
+/// at all, so it is INADMISSIBLE there and SKIPPED WITH A LOUD DOCUMENTED
+/// REASON in
+/// [`pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda`]
+/// (never silently green). The row-length control stays universal and
+/// conjunctive: its measured range across every arch and composition this
+/// run, `~1.0e-2..6.881763611768685e-2`, clears
+/// [`SM89_COMPOSITION_FLOOR`] by `>=16x`
+/// (`6.881763611768685e-2 / 4.2e-3 ~= 16.4x`) even at this arch's wider
+/// floor -- comfortably admissible on every arch with no per-arch scoping
+/// needed. On the exact-arches class the same row-length range clears
+/// [`EXACT_ARCH_COMPOSITION_FLOOR`] (`1e-5`) by `>=1000x`.
+///
+/// Detected at runtime via
+/// `jammi_kernels::admission::probe_cuda_compute_capability` /
+/// `ComputeCapability`, the SAME per-arch idiom
+/// `crates/jammi-kernels/tests/cuda_parity.rs`'s `lora_linear_dx_abs_floor`
+/// uses (`ComputeCapability::new(major, minor)` equality match). An arch
+/// this table has not measured (including a probe failure or a non-CUDA
+/// device) returns `f64::NAN` deliberately -- [`require_pod_measured_floor`]
+/// turns that into a loud, named panic rather than a silent guess (family
+/// D: an untested arch must fail loud, never silently borrow a floor it
+/// was never shown to need).
 #[cfg(feature = "cuda")]
-const PROVISIONAL_GPU_FLOOR_PLACEHOLDER: f64 = f64::NAN;
+const EXACT_ARCH_COMPOSITION_FLOOR: f64 = 1e-5;
 
-/// PROVISIONAL PLACEHOLDER -- UNMEASURED. Bounds each `bf16`-CUDA leg's
-/// [`relative_l1_error`] against the independently computed `f32`-CPU
-/// truth (`ratio_alone_vs_truth`, `ratio_batch_vs_truth`) -- a
-/// DTYPE-ROUNDING DRIFT bound, a DIFFERENT quantity from
-/// [`PROVISIONAL_GPU_FLOOR_PLACEHOLDER`]'s composition-invariance floor:
-/// "does bf16 agree with itself across compositions" and "does bf16
-/// agree with f32 truth" can diverge independently -- two bf16 arms can
-/// drift IDENTICALLY away from truth (a real dtype-rounding regression)
-/// while still agreeing with EACH OTHER, which would pass a
-/// composition-invariance-only check vacuously (finding F-6). Both
-/// constants are named separately and BOTH are pod-measured-then-
-/// finalized (contract E4, Step 5) rather than one constant serving both
-/// roles, because a regression that inflates drift-from-truth need not
-/// inflate alone-vs-batch disagreement by the same margin (they are
-/// governed by different noise sources: dtype rounding vs GEMM
-/// reduction-order), so a single shared bound would either be too loose
-/// for one quantity or too tight for the other. This value is NOT
-/// derived from any measurement (no CUDA device was available to this
-/// agent); it exists only so the CPU-hermetic gate can typecheck this
-/// file's structure while feature-gated out. The pod train (contract E4,
-/// Step 5) MUST measure this oracle's real per-row `relative_l1_error`
-/// against f32 truth on hardware and replace this constant before this
-/// leg is allowed to gate anything.
+/// See [`gpu_composition_floor`]'s doc for the full sm89 derivation
+/// (measured max `4.118649354617619e-3`, `1.02x` margin, rounded to a
+/// clean `4.2e-3`).
 #[cfg(feature = "cuda")]
-const PROVISIONAL_GPU_TRUTH_DRIFT_BOUND: f64 = f64::NAN;
+const SM89_COMPOSITION_FLOOR: f64 = 4.2e-3;
 
-/// Refuses to let an unmeasured PROVISIONAL floor constant (identified by
-/// `floor_name`) silently gate a real assertion: `NaN` fails every
-/// ordered comparison (`esc-005`'s own "`NaN > c` is `false`" trap,
-/// applied deliberately here in the OTHER direction), so any CUDA-gated
-/// test that reaches an unmeasured placeholder panics loudly identifying
-/// itself and the specific constant, instead of a `NaN` bound vacuously
-/// admitting an unmeasured leg. Shared by both
-/// [`PROVISIONAL_GPU_FLOOR_PLACEHOLDER`] (composition-invariance) and
-/// [`PROVISIONAL_GPU_TRUTH_DRIFT_BOUND`] (dtype-rounding drift) so
-/// neither can be reached vacuously pre-measurement. NOT `cuda`-gated
-/// (pure control-flow logic, no device dependency) so
+/// Arch-conditional lookup for [`EXACT_ARCH_COMPOSITION_FLOOR`] /
+/// [`SM89_COMPOSITION_FLOOR`] -- see [`EXACT_ARCH_COMPOSITION_FLOOR`]'s own
+/// doc for the full measured values, margin arithmetic, and admissibility
+/// scoping this landed from. Mirrors
+/// `crates/jammi-kernels/tests/cuda_parity.rs`'s `lora_linear_dx_abs_floor`
+/// arch-detection idiom exactly (`probe_cuda_compute_capability` +
+/// `ComputeCapability::new(major, minor)` equality match), except an
+/// UNRECOGNISED capability here returns `f64::NAN` rather than a
+/// tight-but-untested default: this oracle already has a dedicated
+/// NaN-panic guard ([`require_pod_measured_floor`]) built for exactly this
+/// "arch outside the measured set" case, so the lookup fails loud through
+/// that mechanism instead of silently reusing a bound derived from
+/// different hardware.
+#[cfg(feature = "cuda")]
+fn gpu_composition_floor(device: &Device) -> f64 {
+    use jammi_kernels::admission::{probe_cuda_compute_capability, ComputeCapability};
+    match probe_cuda_compute_capability(device) {
+        Some(cap) if cap == ComputeCapability::new(8, 9) => SM89_COMPOSITION_FLOOR,
+        Some(cap)
+            if cap == ComputeCapability::new(8, 0)
+                || cap == ComputeCapability::new(8, 6)
+                || cap == ComputeCapability::new(9, 0) =>
+        {
+            EXACT_ARCH_COMPOSITION_FLOOR
+        }
+        // Every other probed capability (including a probe failure or
+        // non-CUDA device) is outside the measured set: fail loud via
+        // `require_pod_measured_floor`, never guess (family D).
+        _ => f64::NAN,
+    }
+}
+
+/// Arch-CONSISTENT, MEASURED dtype-rounding drift bound for each
+/// `bf16`-CUDA arm's [`relative_l1_error`] against the independently
+/// computed `f32`-CPU truth (`ratio_alone_vs_truth`, `ratio_batch_vs_truth`)
+/// -- a DIFFERENT quantity from [`gpu_composition_floor`]'s
+/// composition-invariance floor: "does bf16 agree with itself across
+/// compositions" and "does bf16 agree with f32 truth" can diverge
+/// independently -- two bf16 arms can drift IDENTICALLY away from truth (a
+/// real dtype-rounding regression) while still agreeing with EACH OTHER,
+/// which would pass a composition-invariance-only check vacuously
+/// (finding F-6). Measured (unit 62 landing round,
+/// `measure_gpu_floors_print_only`, tree `67ba2394`, `JAMMI_REQUIRE_CUDA=1`):
+/// a100 (`cjjh6oaqehvpwi`), h100 (`gufh54wmqox1rw`), a40 (`qlc5z76zh98v6c`)
+/// all reported IDENTICAL values, `alone_vs_truth mean=3.5208168455960124e-3`
+/// `max=4.222114077112533e-3` (`batch_vs_truth` identical to
+/// `alone_vs_truth`); l40s (`kccwbawx92pou1`) measured
+/// `alone_vs_truth mean=3.597633555417087e-3` `max=4.233727028564512e-3` --
+/// the cross-arch worst max across all four pods.
+///
+/// ONE bound serves every arch here (unlike [`gpu_composition_floor`],
+/// which splits arch-conditionally): the dtype-rounding noise this bound
+/// governs (`bf16` round-to-nearest storage error) is a property of the
+/// dtype/kernel choice, not the GEMM reduction-order divergence that made
+/// the composition floor arch-split -- measured evidence bears this out
+/// (all four arches landed within `~1.3%` of each other on this quantity,
+/// unlike the composition floor's `0` vs `4.1e-3` split).
+///
+/// Derivation (M1b margin convention -- `crates/jammi-kernels/tests/cuda_parity.rs`'s
+/// `lora_linear_dx_abs_floor` sibling comment: "`dx_bound_margin`'s sibling
+/// comment used `2.0x` against a measured `1.34x` need"; `2.0x` chosen over
+/// this file's own tighter `1.02x` composition-floor margin because this
+/// bound has no red-control separation ceiling pushing back against a
+/// generous margin):
+/// ```text
+/// cross-arch max (l40s, kccwbawx92pou1, tree 67ba2394):
+///   4.233727028564512e-3
+/// margin (2.0x):
+///   4.233727028564512e-3 * 2.0 = 8.467454057129024e-3
+/// rounded UP to a clean value (never round down past the margin):
+///   1e-2
+/// ```
+/// giving `~2.36x` headroom over the measured cross-arch worst case
+/// (`1e-2 / 4.233727028564512e-3 ~= 2.362x`).
+#[cfg(feature = "cuda")]
+const GPU_TRUTH_DRIFT_BOUND: f64 = 1e-2;
+
+/// Refuses to let an unmeasured floor value (identified by `floor_name`)
+/// silently gate a real assertion: `NaN` fails every ordered comparison
+/// (`esc-005`'s own "`NaN > c` is `false`" trap, applied deliberately here
+/// in the OTHER direction), so any CUDA-gated test that reaches an
+/// unmeasured floor panics loudly identifying itself and the specific
+/// constant, instead of a `NaN` bound vacuously admitting an unmeasured
+/// leg. [`gpu_composition_floor`]'s arch-conditional lookup is the value
+/// this guard actually protects: an arch outside its measured set
+/// (`EXACT_ARCH_COMPOSITION_FLOOR`'s sm80/sm86/sm90 class,
+/// `SM89_COMPOSITION_FLOOR`'s sm89) returns `f64::NAN`, and this call
+/// turns that into a named panic rather than a silent pass.
+/// [`GPU_TRUTH_DRIFT_BOUND`] is now a fixed, arch-consistent, always-real
+/// constant (never `NaN` for any arch), so passing it through this guard
+/// is defensive-only here (never expected to fire) -- kept for uniformity
+/// with the composition-floor call rather than special-cased away. NOT
+/// `cuda`-gated (pure control-flow logic, no device dependency) so
 /// [`require_pod_measured_floor_panics_on_unmeasured_nan`] below can
 /// exercise this exact function on CPU.
 fn require_pod_measured_floor(test_name: &str, floor_name: &str, floor: f64) {
@@ -514,16 +646,9 @@ fn pooled_embedding_alone_matches_padded_batch_real_row_bf16_cuda() {
     let Some(device) = cuda_device_or_skip(test_name) else {
         return;
     };
-    require_pod_measured_floor(
-        test_name,
-        "PROVISIONAL_GPU_FLOOR_PLACEHOLDER",
-        PROVISIONAL_GPU_FLOOR_PLACEHOLDER,
-    );
-    require_pod_measured_floor(
-        test_name,
-        "PROVISIONAL_GPU_TRUTH_DRIFT_BOUND",
-        PROVISIONAL_GPU_TRUTH_DRIFT_BOUND,
-    );
+    let composition_floor = gpu_composition_floor(&device);
+    require_pod_measured_floor(test_name, "gpu_composition_floor", composition_floor);
+    require_pod_measured_floor(test_name, "GPU_TRUTH_DRIFT_BOUND", GPU_TRUTH_DRIFT_BOUND);
     let config = load_config();
     let encoder = build_encoder(&device, DType::BF16, &config);
     let fixture = build_fixture(&device);
@@ -549,33 +674,30 @@ fn pooled_embedding_alone_matches_padded_batch_real_row_bf16_cuda() {
         eprintln!(
             "row={b} alone_vs_truth={ratio_alone_vs_truth:e} batch_vs_truth={ratio_batch_vs_truth:e} \
              alone_vs_batch={ratio_alone_vs_batch:e} (composition floor \
-             {PROVISIONAL_GPU_FLOOR_PLACEHOLDER:e}, drift bound {PROVISIONAL_GPU_TRUTH_DRIFT_BOUND:e})"
+             {composition_floor:e}, drift bound {GPU_TRUTH_DRIFT_BOUND:e})"
         );
         // Truth-tracking control (finding F-6): each bf16 arm -- alone AND
         // batch, independently -- must itself stay within
-        // `PROVISIONAL_GPU_TRUTH_DRIFT_BOUND` of the f32-CPU truth. Without
-        // these two asserts, two bf16 arms that drift IDENTICALLY away from
-        // truth would still agree with each other and pass the
-        // alone-vs-batch assertion below, hiding a real dtype-rounding
-        // regression inside a cancelling agreement -- exactly the gap this
-        // file's module doc claims does not exist.
+        // `GPU_TRUTH_DRIFT_BOUND` of the f32-CPU truth. Without these two
+        // asserts, two bf16 arms that drift IDENTICALLY away from truth
+        // would still agree with each other and pass the alone-vs-batch
+        // assertion below, hiding a real dtype-rounding regression inside a
+        // cancelling agreement -- exactly the gap this file's module doc
+        // claims does not exist.
         assert!(
-            ratio_alone_vs_truth.is_finite()
-                && ratio_alone_vs_truth < PROVISIONAL_GPU_TRUTH_DRIFT_BOUND,
+            ratio_alone_vs_truth.is_finite() && ratio_alone_vs_truth < GPU_TRUTH_DRIFT_BOUND,
             "row {b}: bf16 alone-vs-f32-truth relative_l1_error {ratio_alone_vs_truth:e} exceeds \
-             the PROVISIONAL dtype-rounding drift bound {PROVISIONAL_GPU_TRUTH_DRIFT_BOUND:e}"
+             the measured dtype-rounding drift bound {GPU_TRUTH_DRIFT_BOUND:e}"
         );
         assert!(
-            ratio_batch_vs_truth.is_finite()
-                && ratio_batch_vs_truth < PROVISIONAL_GPU_TRUTH_DRIFT_BOUND,
+            ratio_batch_vs_truth.is_finite() && ratio_batch_vs_truth < GPU_TRUTH_DRIFT_BOUND,
             "row {b}: bf16 batch-vs-f32-truth relative_l1_error {ratio_batch_vs_truth:e} exceeds \
-             the PROVISIONAL dtype-rounding drift bound {PROVISIONAL_GPU_TRUTH_DRIFT_BOUND:e}"
+             the measured dtype-rounding drift bound {GPU_TRUTH_DRIFT_BOUND:e}"
         );
         assert!(
-            ratio_alone_vs_batch.is_finite()
-                && ratio_alone_vs_batch < PROVISIONAL_GPU_FLOOR_PLACEHOLDER,
+            ratio_alone_vs_batch.is_finite() && ratio_alone_vs_batch < composition_floor,
             "row {b}: bf16 alone-vs-batch relative_l1_error {ratio_alone_vs_batch:e} exceeds the \
-             PROVISIONAL bound {PROVISIONAL_GPU_FLOOR_PLACEHOLDER:e}"
+             measured per-arch composition floor {composition_floor:e}"
         );
     }
 }
@@ -587,11 +709,8 @@ fn pooled_embedding_red_control_row_length_off_by_one_bf16_cuda() {
     let Some(device) = cuda_device_or_skip(test_name) else {
         return;
     };
-    require_pod_measured_floor(
-        test_name,
-        "PROVISIONAL_GPU_FLOOR_PLACEHOLDER",
-        PROVISIONAL_GPU_FLOOR_PLACEHOLDER,
-    );
+    let composition_floor = gpu_composition_floor(&device);
+    require_pod_measured_floor(test_name, "gpu_composition_floor", composition_floor);
     let config = load_config();
     let encoder = build_encoder(&device, DType::BF16, &config);
     let fixture = build_fixture(&device);
@@ -615,11 +734,16 @@ fn pooled_embedding_red_control_row_length_off_by_one_bf16_cuda() {
 
     let alone0 = pooled_alone(&encoder, &device, &fixture.rows[0]);
     let ratio = relative_l1_error(&alone0, &pooled_batch_mut[0]);
+    // Row-length control stays UNIVERSAL and conjunctive on every arch --
+    // its measured range this landing round (`~1.0e-2..6.881763611768685e-2`
+    // across all arches/compositions) clears even SM89_COMPOSITION_FLOOR
+    // (the wider of the two per-arch floors) by `>=16x` -- see
+    // `gpu_composition_floor`'s own doc for the full derivation.
     assert!(
-        ratio.is_finite() && ratio > PROVISIONAL_GPU_FLOOR_PLACEHOLDER * 5.0,
-        "row_lengths off-by-one control failed to separate above the PROVISIONAL bf16 floor \
+        ratio.is_finite() && ratio > composition_floor * 5.0,
+        "row_lengths off-by-one control failed to separate above the measured bf16 floor \
          (ratio={ratio:e}, required > {:e})",
-        PROVISIONAL_GPU_FLOOR_PLACEHOLDER * 5.0,
+        composition_floor * 5.0,
     );
 }
 
@@ -630,11 +754,32 @@ fn pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda() {
     let Some(device) = cuda_device_or_skip(test_name) else {
         return;
     };
-    require_pod_measured_floor(
-        test_name,
-        "PROVISIONAL_GPU_FLOOR_PLACEHOLDER",
-        PROVISIONAL_GPU_FLOOR_PLACEHOLDER,
-    );
+    // Admissibility scoping (reshape, never tune -- see
+    // `gpu_composition_floor`'s own doc for the full measured numbers this
+    // scoping cites): on sm89 (L40S) the window-radius control's own
+    // measured minimum separation (`1.139471768897301e-3`, unit 62 landing
+    // round, pod `kccwbawx92pou1`, tree `67ba2394`) is SMALLER than
+    // `SM89_COMPOSITION_FLOOR` (`4.2e-3`) -- the control cannot separate
+    // above the floor on this arch at all, so it is INADMISSIBLE there and
+    // SKIPPED, loudly, rather than asserted (which would either be vacuous
+    // or reject a passing arch on control noise, not a real defect). The
+    // row-length control above stays universal and is NOT skipped on any
+    // arch.
+    use jammi_kernels::admission::{probe_cuda_compute_capability, ComputeCapability};
+    if probe_cuda_compute_capability(&device) == Some(ComputeCapability::new(8, 9)) {
+        eprintln!(
+            "{test_name}: SKIPPED on sm89 (L40S) -- the window-radius red control is \
+             INADMISSIBLE on this arch (measured min separation 1.139471768897301e-3 < \
+             SM89_COMPOSITION_FLOOR 4.2e-3; unit 62 landing round, pod kccwbawx92pou1, \
+             tree 67ba2394). Per contract E4, an inadmissible control is scoped out with a \
+             loud documented reason, never silently tuned to pass -- see \
+             gpu_composition_floor's own doc for the full derivation and the row-length \
+             control's universal admissibility on this same arch."
+        );
+        return;
+    }
+    let composition_floor = gpu_composition_floor(&device);
+    require_pod_measured_floor(test_name, "gpu_composition_floor", composition_floor);
     let config = load_config();
     let fixture = build_fixture(&device);
 
@@ -667,11 +812,15 @@ fn pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda() {
         .unwrap();
 
     let ratio = relative_l1_error(&alone_long, &pooled_batch_mut[long_idx]);
+    // Only reachable on the exact-arches class (sm89 returns above): this
+    // control's own measured min separation there (`7.508231757090548e-4`)
+    // clears `EXACT_ARCH_COMPOSITION_FLOOR * 5.0` (`5e-5`) by `~15x` -- see
+    // `gpu_composition_floor`'s own doc.
     assert!(
-        ratio.is_finite() && ratio > PROVISIONAL_GPU_FLOOR_PLACEHOLDER * 5.0,
-        "window radius off-by-one control failed to separate above the PROVISIONAL bf16 floor \
+        ratio.is_finite() && ratio > composition_floor * 5.0,
+        "window radius off-by-one control failed to separate above the measured bf16 floor \
          (ratio={ratio:e}, required > {:e})",
-        PROVISIONAL_GPU_FLOOR_PLACEHOLDER * 5.0,
+        composition_floor * 5.0,
     );
 }
 
@@ -699,8 +848,10 @@ fn pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda() {
 /// `ratio_batch_vs_truth` each `< ILLUSTRATIVE_DRIFT_BOUND` -- correctly
 /// FAIL it, using the identical [`relative_l1_error`] function the real
 /// CUDA legs call (`ILLUSTRATIVE_DRIFT_BOUND` is a demonstration-only
-/// value, not [`PROVISIONAL_GPU_TRUTH_DRIFT_BOUND`] itself, since that
-/// production constant is still unmeasured (`NaN`) pending the pod train).
+/// value, deliberately kept separate from [`GPU_TRUTH_DRIFT_BOUND`] itself
+/// -- this test's job is to prove the MECHANISM catches this mutant class
+/// on synthetic data, independent of whatever the production constant's
+/// own measured value happens to be).
 #[test]
 fn identical_bf16_drift_from_truth_passes_composition_check_but_fails_truth_tracking() {
     const ILLUSTRATIVE_COMPOSITION_FLOOR: f64 = 1e-6;
@@ -751,9 +902,9 @@ fn identical_bf16_drift_from_truth_passes_composition_check_but_fails_truth_trac
 /// [`require_pod_measured_floor`] must panic BEFORE any numeric compare
 /// runs whenever its floor argument is unmeasured (`NaN`) -- the same
 /// panic-before-compare discipline the pre-existing
-/// `PROVISIONAL_GPU_FLOOR_PLACEHOLDER` gate had, now shared by the new
-/// `PROVISIONAL_GPU_TRUTH_DRIFT_BOUND` truth-tracking checks too (finding
-/// F-6's fix requirement: "the NaN placeholder must make these
+/// [`gpu_composition_floor`] unknown-arch case relies on, now shared by
+/// the [`GPU_TRUTH_DRIFT_BOUND`] truth-tracking checks too (finding F-6's
+/// fix requirement: "the NaN placeholder must make these
 /// panic-before-compare exactly like the main assertion"). This test
 /// calls the exact function the CUDA legs call, with a bare `f64::NAN`,
 /// so it needs no CUDA device to prove the mechanism.
@@ -766,23 +917,28 @@ fn require_pod_measured_floor_panics_on_unmeasured_nan() {
 // ─────────────────────────────────────────────────────────────────────────
 // Unit 62 gap fix: the MEASUREMENT path (PRINT ONLY -- gates nothing).
 //
-// The gap this section closes: every CUDA leg above calls
+// The gap this section originally closed: every CUDA leg above called
 // `require_pod_measured_floor` FIRST -- before the row-loop `eprintln!`
-// that prints the very ratios `PROVISIONAL_GPU_FLOOR_PLACEHOLDER` /
-// `PROVISIONAL_GPU_TRUTH_DRIFT_BOUND` need -- so a pod run of THOSE tests
-// today panics on the still-unmeasured (`f64::NAN`) placeholders before a
-// single ratio is ever computed: there is currently no path to obtain the
-// numbers those two constants need. This section adds that path: an
+// that prints the very ratios the floor constants needed -- so a pod run
+// of THOSE tests panicked on the then-unmeasured (`f64::NAN`) placeholders
+// before a single ratio was ever computed: there was no path to obtain the
+// numbers those constants needed. This section added that path: an
 // `#[ignore]`d, print-only test that computes and prints the SAME
 // quantities the gating tests assert (`ratio_alone_vs_truth`,
 // `ratio_batch_vs_truth`, `ratio_alone_vs_batch`) plus the two red
 // controls' own separations, over an 8-way sweep, asserting ONLY
-// finiteness -- NEVER a numeric bound. It is a measurement tool, not a
-// gate: the derivation commit that folds these numbers into
-// `PROVISIONAL_GPU_FLOOR_PLACEHOLDER` / `PROVISIONAL_GPU_TRUTH_DRIFT_BOUND`
-// (with safety-margin arithmetic documented at that time, per contract E4
-// Step 5) is a SEPARATE change; this file's constants and gating asserts
-// are untouched by this section.
+// finiteness -- NEVER a numeric bound.
+//
+// Unit 62 bound-derivation round: this section's four-arch pod run (tree
+// `67ba2394`, pods `cjjh6oaqehvpwi`/`gufh54wmqox1rw`/`qlc5z76zh98v6c`/
+// `kccwbawx92pou1`) produced the measurements folded into
+// [`EXACT_ARCH_COMPOSITION_FLOOR`], [`SM89_COMPOSITION_FLOOR`], and
+// [`GPU_TRUTH_DRIFT_BOUND`] above (see each constant's own doc for the
+// margin arithmetic). This test remains a measurement tool, not a gate --
+// it stays in the tree, `#[ignore]`d, for the NEXT re-derivation (a new
+// unmeasured arch, a fixture change, or a build change that could move the
+// worst element the way `lora_linear_dx_abs_floor`'s own precedent
+// documents) rather than being deleted now that one round has landed.
 //
 // **Composition sweep, not a seed sweep -- this fixture is
 // content-deterministic.** `src/modernbert.rs`'s own multi-seed convention
@@ -1107,8 +1263,8 @@ fn measure_gpu_floors_print_only() {
         "{test_name}: OVERALL OVER {} COMPOSITIONS / {} ROW-MEASUREMENTS: \
          alone_vs_truth mean={mean_a2t:e} max={max_a2t:e} | batch_vs_truth mean={mean_b2t:e} \
          max={max_b2t:e} | alone_vs_batch mean={mean_a2b:e} max={max_a2b:e} \
-         (these bound PROVISIONAL_GPU_TRUTH_DRIFT_BOUND [alone_vs_truth/batch_vs_truth] and \
-         PROVISIONAL_GPU_FLOOR_PLACEHOLDER [alone_vs_batch] respectively)",
+         (these bound GPU_TRUTH_DRIFT_BOUND [alone_vs_truth/batch_vs_truth] and \
+         gpu_composition_floor [alone_vs_batch] respectively)",
         MEASUREMENT_COMPOSITION_SWEEP.len(),
         all_alone_vs_truth.len(),
     );
@@ -1138,9 +1294,10 @@ fn measure_gpu_floors_print_only() {
 
     eprintln!(
         "{test_name}: measurement complete -- these numbers are the pod-derivation input for \
-         PROVISIONAL_GPU_FLOOR_PLACEHOLDER and PROVISIONAL_GPU_TRUTH_DRIFT_BOUND; folding them \
-         into those constants (with safety-margin arithmetic documented then) is a SEPARATE \
-         derivation commit (contract docs/plans/62-embedding-surface/CONTRACT.md E4, Step 5), \
-         not this test -- this test asserts finiteness only and gates nothing"
+         gpu_composition_floor's EXACT_ARCH_COMPOSITION_FLOOR / SM89_COMPOSITION_FLOOR and \
+         GPU_TRUTH_DRIFT_BOUND; folding them into those constants (with safety-margin \
+         arithmetic documented there) is a SEPARATE derivation commit \
+         (contract docs/plans/62-embedding-surface/CONTRACT.md E4, Step 5), not this test -- \
+         this test asserts finiteness only and gates nothing"
     );
 }

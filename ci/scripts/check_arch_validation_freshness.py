@@ -282,7 +282,26 @@ class ArtifactError(Exception):
     """Uncomputable input (parse failure, missing dir) — fails closed."""
 
 
+# CI incident (run 33230050451, main, "Guard (arch validation freshness
+# self-test)"): `shutil.rmtree` during a `tempfile.TemporaryDirectory`'s
+# teardown hit `OSError: [Errno 39] Directory not empty: '.git'` — a race
+# between the tempdir cleanup and a background `git maintenance`/`gc --auto`
+# process THIS SELF-TEST's own scratch-repo `git init`/`add`/`commit` calls
+# below can spawn (modern git auto-registers a repo for scheduled background
+# maintenance on ordinary write operations). The self-test's own assertions
+# had already all passed by the time this fired — a pure cleanup race, not a
+# logic failure (reproduced NOT to reproduce locally at the same commit).
+# `-c gc.auto=0 -c gc.autoDetach=false -c maintenance.auto=false` kills the
+# background writer AT THE SOURCE, for every git invocation this file makes
+# (both the scratch fixture repos below and the real-repo queries above —
+# harmless there too: they are read-only and never wanted opportunistic gc
+# triggered on their behalf either).
+_GIT_NO_BACKGROUND_MAINTENANCE = ("-c", "gc.auto=0", "-c", "gc.autoDetach=false", "-c", "maintenance.auto=false")
+
+
 def _run(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess:
+    if cmd and cmd[0] == "git":
+        cmd = ["git", *_GIT_NO_BACKGROUND_MAINTENANCE, *cmd[1:]]
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
 
 
@@ -700,7 +719,7 @@ def self_test() -> int:
         )
 
     # --- control: fresh single-arch fixture, artifact sha == HEAD ---------
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         repo_root = _init_fixture_repo(Path(td), ["80"])
         head = _git(repo_root, "rev-parse", "HEAD").stdout.strip()
         _write_artifact(repo_root, "good.json", _good_artifact(head, "8.0"))
@@ -712,7 +731,7 @@ def self_test() -> int:
         check("control (fresh single-arch fixture) is clean", not got, f"{got}")
 
     # --- Rule 1: zero evidence at all (no artifact identifies the arch) ---
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         repo_root = _init_fixture_repo(Path(td), ["80"])
         build_rs, cuda_runs, allowlist = paths(repo_root)
         got = run_gate(build_rs, cuda_runs, allowlist, repo_root)
@@ -723,7 +742,7 @@ def self_test() -> int:
         )
 
     # --- Rule 1: artifact exists but status != GREEN -----------------------
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         repo_root = _init_fixture_repo(Path(td), ["80"])
         head = _git(repo_root, "rev-parse", "HEAD").stdout.strip()
         _write_artifact(repo_root, "yellow.json", _good_artifact(head, "8.0", status="YELLOW"))
@@ -737,7 +756,7 @@ def self_test() -> int:
         )
 
     # --- Rule 1: artifact exists, GREEN, but git_sha is a REAL non-ancestor
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         repo_root = _init_fixture_repo(Path(td), ["80"])
         _git(repo_root, "checkout", "-q", "-b", "side")
         (repo_root / "side.txt").write_text("side\n", encoding="utf-8")
@@ -754,7 +773,7 @@ def self_test() -> int:
         )
 
     # --- Rule 1: an artifact for a DIFFERENT arch does not satisfy this one
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         repo_root = _init_fixture_repo(Path(td), ["80", "86"])
         head = _git(repo_root, "rev-parse", "HEAD").stdout.strip()
         _write_artifact(repo_root, "only80.json", _good_artifact(head, "8.0"))
@@ -769,7 +788,7 @@ def self_test() -> int:
         )
 
     # --- Rule 2: STALE — a surface file changes AFTER the artifact's sha ---
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         repo_root = _init_fixture_repo(Path(td), ["80"])
         head = _git(repo_root, "rev-parse", "HEAD").stdout.strip()
         _write_artifact(repo_root, "good.json", _good_artifact(head, "8.0"))
@@ -796,7 +815,7 @@ def self_test() -> int:
         )
 
     # --- Rule 2 positive control: a non-surface change does NOT go stale ---
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         repo_root = _init_fixture_repo(Path(td), ["80"])
         head = _git(repo_root, "rev-parse", "HEAD").stdout.strip()
         _write_artifact(repo_root, "good.json", _good_artifact(head, "8.0"))
@@ -821,7 +840,7 @@ def self_test() -> int:
     # revision). Both legs touch third_party/flash-attention/ specifically,
     # so this is not merely re-testing "an excluded path stays fresh" — it
     # proves the DISCRIMINATION is by file extension, not by directory.
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         repo_root = _init_fixture_repo(Path(td), ["80"])
         head = _git(repo_root, "rev-parse", "HEAD").stdout.strip()
         _write_artifact(repo_root, "good.json", _good_artifact(head, "8.0"))
@@ -854,7 +873,7 @@ def self_test() -> int:
         )
 
     # --- Rule 3: valid waiver suppresses a genuine STALE finding -----------
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         repo_root = _init_fixture_repo(Path(td), ["80"])
         head = _git(repo_root, "rev-parse", "HEAD").stdout.strip()
         _write_artifact(repo_root, "good.json", _good_artifact(head, "8.0"))
@@ -869,7 +888,7 @@ def self_test() -> int:
         check("Rule 3: a valid, current waiver suppresses the STALE finding", not got, f"{got}")
 
     # --- Rule 3: waiver's arch is not in VALIDATED_SMS (rot) ---------------
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         repo_root = _init_fixture_repo(Path(td), ["80"])
         head = _git(repo_root, "rev-parse", "HEAD").stdout.strip()
         _write_allowlist(repo_root, [f"99\t{head}\tarch 99 was never in VALIDATED_SMS"])
@@ -883,7 +902,7 @@ def self_test() -> int:
         )
 
     # --- Rule 3: dead waiver (arch not actually stale) ---------------------
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         repo_root = _init_fixture_repo(Path(td), ["80"])
         head = _git(repo_root, "rev-parse", "HEAD").stdout.strip()
         _write_artifact(repo_root, "good.json", _good_artifact(head, "8.0"))
@@ -899,7 +918,7 @@ def self_test() -> int:
         )
 
     # --- Rule 3: waiver range no longer covers HEAD (surface moved again) -
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         repo_root = _init_fixture_repo(Path(td), ["80"])
         head = _git(repo_root, "rev-parse", "HEAD").stdout.strip()
         _write_artifact(repo_root, "good.json", _good_artifact(head, "8.0"))
@@ -923,7 +942,7 @@ def self_test() -> int:
         )
 
     # --- Rule 3: malformed reviewed_up_to_sha (not 40-hex) -----------------
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         repo_root = _init_fixture_repo(Path(td), ["80"])
         head = _git(repo_root, "rev-parse", "HEAD").stdout.strip()
         _write_artifact(repo_root, "good.json", _good_artifact(head, "8.0"))
@@ -939,7 +958,7 @@ def self_test() -> int:
         )
 
     # --- malformed allowlist row (wrong field count) ------------------------
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         repo_root = _init_fixture_repo(Path(td), ["80"])
         head = _git(repo_root, "rev-parse", "HEAD").stdout.strip()
         _write_artifact(repo_root, "good.json", _good_artifact(head, "8.0"))
@@ -955,7 +974,7 @@ def self_test() -> int:
         )
 
     # --- VALIDATED_SMS literal not found ------------------------------------
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         repo_root = _init_fixture_repo(Path(td), ["80"])
         (repo_root / "crates" / "jammi-kernels" / "build.rs").write_text(
             "// no VALIDATED_SMS const here at all\n", encoding="utf-8"
@@ -969,7 +988,7 @@ def self_test() -> int:
             check("VALIDATED_SMS literal missing raises a named ArtifactError", "VALIDATED_SMS" in str(exc))
 
     # --- unparsable artifact JSON is a named finding, never a crash --------
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         repo_root = _init_fixture_repo(Path(td), ["80"])
         (
             repo_root / "crates" / "jammi-kernels" / "artifacts" / "cuda-runs" / "bad.json"
@@ -984,12 +1003,12 @@ def self_test() -> int:
         )
 
     # --- shallow-checkout guard ---------------------------------------------
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         repo_root = _init_fixture_repo(Path(td), ["80"])
         head = _git(repo_root, "rev-parse", "HEAD").stdout.strip()
         _write_artifact(repo_root, "good.json", _good_artifact(head, "8.0"))
         _commit_all(repo_root, "add good artifact")
-        with tempfile.TemporaryDirectory() as td2:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td2:
             clone_dir = Path(td2) / "shallow-clone"
             clone_proc = _run(
                 ["git", "clone", "-q", "--depth", "1", "file://" + str(repo_root), str(clone_dir)],

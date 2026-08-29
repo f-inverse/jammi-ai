@@ -343,6 +343,49 @@ jobs:
       - name: Self-test the flash-attn closure guard
         run: python3 ci/scripts/check_flash_attn_closure.py --self-test
 
+  lint-surface-closure:
+    name: Guard (lint-surface closure)
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust-ci
+
+      # esc-059 (class `enforcement-surface-gap`): four
+      # `clippy::doc_lazy_continuation` lints landed in
+      # `jammi-kernels/tests/cuda_parity.rs` (required-features = ["cuda"])
+      # with every required merge-path check green, because no merge-path
+      # lane ran `clippy` (only `check`) over that feature surface, and
+      # `--tests`/`--all-targets` were never passed even for the `check` it
+      # did run — the escape first surfaced when all four pods' fresh-seed
+      # runs went red on the same commit. This gate is the property, not the
+      # one-off fix: it derives every workspace target with a non-empty
+      # `required-features` list from `cargo metadata` and asserts EACH is
+      # compiled under some genuinely merge-path `cargo clippy -D warnings`
+      # lane (reusing `check_execution_surface_reachability.py`'s own
+      # vetted `on:`-trigger / `if:` / `continue-on-error:` honesty rather
+      # than re-deriving a second notion of "merge path" — see that
+      # module's own doc for why `gpu-prove.yml`'s label/dispatch/schedule
+      # triggers do not count). A future feature-gated target lands covered
+      # by construction only if some required lane's `--features`/target
+      # selection reaches it — silence is a FAIL here, not a pass.
+      - name: Assert every feature-gated target is clippy-covered on the merge path
+        run: python3 ci/scripts/check_lint_surface_closure.py
+
+      # Self-test, same required-not-continue-on-error discipline as the
+      # flash-attn closure guard's own sibling leg above: proves against
+      # the REAL (vetted) workflow corpus that the checker discriminates —
+      # a target shaped like the real, currently-covered jammi-kernels/
+      # cuda_parity reads COVERED, a target requiring a feature no real
+      # lane ever activates reads UNCOVERED, and a lane missing
+      # `--all-targets`/`--tests` does not cover a test-kind target even
+      # with the right features. A checker that always answers one way
+      # cannot pass both halves.
+      - name: Self-test the lint-surface closure guard
+        run: python3 ci/scripts/check_lint_surface_closure.py --self-test
+
   # This is a COMPILE lane, not a correctness lane: it proves the vendored
   # FlashAttention-2 tree, the torch-free C wrapper, the shim headers, and
   # `build.rs::build_flash_attn` still produce a valid `nvcc` build (a
@@ -402,7 +445,7 @@ jobs:
   # worse than no filter (it looks like coverage and isn't) — left to the
   # maintainer to decide, not applied unilaterally here.
   flash-attn-compile:
-    name: Compile-check (flash-attn / CUTLASS, nvcc — no GPU)
+    name: Clippy (flash-attn / CUTLASS, nvcc — no GPU)
     runs-on: ubuntu-latest
     container:
       image: ${{ vars.JAMMI_CI_IMAGE_CUDA || 'ghcr.io/f-inverse/jammi-ai-ci-cuda:latest' }}
@@ -440,8 +483,24 @@ jobs:
       # lane gets wall-time visibility without needing RSS measurement at
       # all) -- a future maintainer who adds `time` to the CI image can
       # flip this env var on here for real peak-RSS numbers.
-      - name: Compile-check jammi-kernels --features flash-attn (nvcc, no GPU)
-        run: cargo check -p jammi-kernels --features flash-attn
+      # esc-059: this step used to be a bare `cargo check` (no `--tests`/
+      # `--all-targets`, so it never even reached `jammi-kernels`'s own
+      # `cuda`-required `tests/cuda_parity.rs`) and `check` never runs
+      # clippy's lints at all. `flash-attn` forwards to `cuda`
+      # (crates/jammi-kernels/Cargo.toml), so `--features flash-attn
+      # --all-targets` is the SAME feature surface this crate's
+      # `runpod_gpu_prove.sh:56` GPU-pod clippy line already exercises
+      # (`cargo clippy -p jammi-kernels --all-targets --features cuda --
+      # -D warnings`) — but THAT lane is `gpu-prove.yml`'s
+      # `workflow_dispatch`/`pull_request: types: [labeled]`/nightly-cron
+      # trigger, never a lane that fires on every PR. This step is the
+      # hermetic, always-required twin: clippy is type-check-only (no GPU
+      # needed, same nvcc/CUTLASS toolchain this job's image already has),
+      # so it closes the class without renting hardware. `ci/scripts/
+      # check_lint_surface_closure.py` asserts this coverage holds
+      # mechanically, not just by this comment's say-so.
+      - name: Clippy jammi-kernels --features flash-attn --all-targets (nvcc, no GPU)
+        run: cargo clippy -p jammi-kernels --features flash-attn --all-targets -- -D warnings
 
       # The encoders `forward_flash_dense_attention` call site (P6 Stage B
       # B3-dense) is otherwise compiled by no CI job at all — this crate's
@@ -467,8 +526,13 @@ jobs:
       # compiles `#[cfg(test)] mod tests` content at all, feature-gated or
       # not, so without it this step would stay silently green even with
       # `cuda` enabled.
-      - name: Compile-check jammi-encoders --features cuda,flash-attn (nvcc, no GPU)
-        run: cargo check -p jammi-encoders --features cuda,flash-attn --tests
+      # esc-059: `cargo check` never runs clippy's lints; swapped for
+      # `cargo clippy -- -D warnings` over the identical feature/target
+      # surface (`--tests`, unchanged) so a lint regression in this
+      # call-site's `#[cfg(feature = "cuda")]` test harness cannot land on
+      # main invisibly again.
+      - name: Clippy jammi-encoders --features cuda,flash-attn (nvcc, no GPU)
+        run: cargo clippy -p jammi-encoders --features cuda,flash-attn --tests -- -D warnings
 
       # round-5 audit NF-2 (kernel-oracle-standard): the step immediately
       # above is the ONLY CI lane that compiles jammi-encoders' `#[cfg(feature
@@ -489,8 +553,9 @@ jobs:
       # commit): `cargo test -p jammi-encoders --features cuda --no-run --list`
       # includes `flash_compiled_or_skip_panics_under_require_flash_when_not_compiled`
       # under this exact feature set, confirming this lane compiles it.
-      - name: Compile-check jammi-encoders --features cuda (nvcc, no GPU) — covers the NOT(flash-attn) meta-test
-        run: cargo check -p jammi-encoders --features cuda --tests
+      # esc-059: same swap, same reasoning as the two steps above.
+      - name: Clippy jammi-encoders --features cuda (nvcc, no GPU) — covers the NOT(flash-attn) meta-test
+        run: cargo clippy -p jammi-encoders --features cuda --tests -- -D warnings
 
   oss-only-build:
     name: Guard (OSS-only build)
@@ -1219,6 +1284,7 @@ jobs:
       - guard
       - dep-direction
       - flash-attn-closure
+      - lint-surface-closure
       - flash-attn-compile
       - oss-only-build
       - dep-audit

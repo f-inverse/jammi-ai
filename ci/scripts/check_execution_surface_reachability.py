@@ -1551,15 +1551,30 @@ def main() -> int:
 # self-test — RED mutants for every rule, ephemeral `git init`'d fixtures,
 # never the real checkout.
 # --------------------------------------------------------------------------- #
+# CI incident (run 33230050451, main, "Guard (arch validation freshness
+# self-test)"): `shutil.rmtree` during a `tempfile.TemporaryDirectory`'s
+# teardown hit `OSError: [Errno 39] Directory not empty: '.git'` — a race
+# between tempdir cleanup and a background `git maintenance`/`gc --auto`
+# process a scratch repo's own `git init`/`add` calls can spawn. Same
+# exposure here: `_write_repo` below builds one such scratch repo per
+# self-test fixture. `-c gc.auto=0 -c gc.autoDetach=false
+# -c maintenance.auto=false` kills the background writer AT THE SOURCE.
+_GIT_NO_BACKGROUND_MAINTENANCE = ("-c", "gc.auto=0", "-c", "gc.autoDetach=false", "-c", "maintenance.auto=false")
+
+
+def _scratch_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *_GIT_NO_BACKGROUND_MAINTENANCE, *args], cwd=cwd, check=True)
+
+
 def _write_repo(tmp: Path, files: dict[str, str]) -> None:
     for rel, content in files.items():
         p = tmp / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
-    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=tmp, check=True)
-    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp, check=True)
-    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp, check=True)
-    subprocess.run(["git", "add", "-A"], cwd=tmp, check=True)
+    _scratch_git(["init", "-q", "-b", "main"], tmp)
+    _scratch_git(["config", "user.email", "test@example.com"], tmp)
+    _scratch_git(["config", "user.name", "Test"], tmp)
+    _scratch_git(["add", "-A"], tmp)
 
 
 GATED_TUPLE_TEXT = "cargo clippy -p demo --all-targets --features cuda -- -D warnings"
@@ -2077,7 +2092,7 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
     failures: list[str] = []
 
     def check(label: str, tmp_files: dict[str, str], allowlist_text: str | None, expect_fail_substr: str | None) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             tmp = Path(td)
             _write_repo(tmp, tmp_files)
             got, _info = _run_gate_in(tmp, allowlist_text=allowlist_text)
@@ -2090,7 +2105,7 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
 
     # --- Rule 2: registry completeness — nested-dir recursion, doc-comment
     # exclusion, non-gated exclusion. -----------------------------------
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         tmp = Path(td)
         _write_repo(
             tmp,
@@ -2159,7 +2174,7 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
     # --- B1: a workflow-side `|| true`-style tail swallows the real exit
     # status and must not credit; the registry side is unaffected. ---------
     check("workflow-side `|| true` swallow does not credit", {"ci/scripts/pod_seed_target.sh": GATED_SCRIPT, ".github/workflows/fixture-swallow.yml": SWALLOWING_FALLBACK_WORKFLOW}, None, "UNREACHABLE gated tuple")
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         tmp = Path(td)
         _write_repo(tmp, {"ci/scripts/swallow.sh": SWALLOWING_FALLBACK_SCRIPT})
         gated = gated_tuples(discover_all_tuples(tmp))
@@ -2194,7 +2209,7 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
         None,
         "uses syntax this gate does not evaluate",
     )
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         tmp = Path(td)
         _write_repo(
             tmp,
@@ -2266,7 +2281,7 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
     )
 
     # --- Rule 2 (F3): env-var-prefixed invocation is discovered + gated ----
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         tmp = Path(td)
         _write_repo(tmp, {"ci/scripts/env_prefixed.sh": ENV_PREFIXED_SCRIPT})
         gated = gated_tuples(discover_all_tuples(tmp))
@@ -2275,7 +2290,7 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
             failures.append(f"self-test FAILED: env-var-prefixed invocation not discovered/gated: {sorted(gated)}")
 
     # --- Rule 2 (F3): wrapper-prefixed (run_cmd) + backslash continuation --
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         tmp = Path(td)
         _write_repo(tmp, {"ci/scripts/wrapper_prefixed.sh": WRAPPER_PREFIXED_SCRIPT})
         gated = gated_tuples(discover_all_tuples(tmp))
@@ -2284,7 +2299,7 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
             failures.append(f"self-test FAILED: run_cmd-wrapped invocation not discovered/gated: {sorted(gated)}")
 
     # --- Rule 2 (F3): `;`-chained invocation is discovered -----------------
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         tmp = Path(td)
         _write_repo(tmp, {"ci/scripts/semicolon_chain.sh": SEMICOLON_CHAIN_SCRIPT})
         gated = gated_tuples(discover_all_tuples(tmp))
@@ -2294,7 +2309,7 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
 
     # --- Rule 2 (F3): --features landing on a CONTINUATION line is still
     # visible to gating (env-prefixed + wrapper-prefixed + continuation) ----
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         tmp = Path(td)
         _write_repo(tmp, {"ci/scripts/continuation_features.sh": CONTINUATION_FEATURES_SCRIPT})
         registry = discover_all_tuples(tmp)
@@ -2332,7 +2347,7 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
 
     # --- Rule 2 (F5): prose that merely STARTS with "cargo build" is never
     # registered, even without a comment/assignment context -----------------
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         tmp = Path(td)
         _write_repo(tmp, {"ci/scripts/prose.sh": PROSE_SCRIPT})
         registry = discover_all_tuples(tmp)

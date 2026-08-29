@@ -224,7 +224,20 @@ class ArtifactError(Exception):
     """Uncomputable input (parse failure, missing dir) — fails closed."""
 
 
+# Same class as the CI incident that hit `check_arch_validation_freshness.py`
+# (run 33230050451, main, "Guard (arch validation freshness self-test)"):
+# `shutil.rmtree` during a `tempfile.TemporaryDirectory`'s teardown can hit
+# `OSError: [Errno 39] Directory not empty: '.git'` — a race between tempdir
+# cleanup and a background `git maintenance`/`gc --auto` process this file's
+# own scratch-repo `git init`/`add`/`commit`/`clone` calls below can spawn.
+# `-c gc.auto=0 -c gc.autoDetach=false -c maintenance.auto=false` kills the
+# background writer AT THE SOURCE for every git invocation this file makes.
+_GIT_NO_BACKGROUND_MAINTENANCE = ("-c", "gc.auto=0", "-c", "gc.autoDetach=false", "-c", "maintenance.auto=false")
+
+
 def _run(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess:
+    if cmd and cmd[0] == "git":
+        cmd = ["git", *_GIT_NO_BACKGROUND_MAINTENANCE, *cmd[1:]]
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
 
 
@@ -1529,7 +1542,7 @@ def run_census() -> int:
 def self_test() -> int:
     failures: list[str] = []
 
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         repo = Path(tmp)
         _run(["git", "init", "-q"], repo)
         _run(["git", "config", "user.email", "test@example.com"], repo)
@@ -1996,7 +2009,7 @@ def self_test() -> int:
     # (iv)/(v) sha cross-check: mismatch, and unknown/-dirty on an
     # otherwise-GREEN leg — exercised end to end via run_gate so the
     # parent-artifact git_sha comparison (not just field presence) fires.
-    with tempfile.TemporaryDirectory() as tmp_iv:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_iv:
         cr, root = _rule_g_fixture(Path(tmp_iv))
         parent = {
             "schema_version": 1, "git_sha": root, "box": "a100-fixture",
@@ -2015,7 +2028,7 @@ def self_test() -> int:
         if not any("does not match the parent artifact's git_sha" in g for g in got):
             failures.append(f"self-test FAILED: rule (i) iv: build_sha/git_sha mismatch not caught: {got}")
 
-    with tempfile.TemporaryDirectory() as tmp_v:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_v:
         cr, root = _rule_g_fixture(Path(tmp_v))
         parent = {
             "schema_version": 1, "git_sha": root, "box": "a100-fixture",
@@ -2035,7 +2048,7 @@ def self_test() -> int:
             failures.append(f"self-test FAILED: rule (i) v: a '-dirty'-suffixed build_sha on a GREEN leg was not caught: {got}")
 
     # (vi) folded leg carrying identity fields of its own -> RED
-    with tempfile.TemporaryDirectory() as tmp_vi:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_vi:
         cr, root = _rule_g_fixture(Path(tmp_vi))
         raw_dir = cr / "rg-vi-parent-raw-runs"
         raw_dir.mkdir()
@@ -2067,7 +2080,7 @@ def self_test() -> int:
     # own leg_schema_version (both contract acceptance bullets (i) and (ii)
     # land on this SAME finding under this gate's design: the rename bypass
     # is caught before content is ever inspected).
-    with tempfile.TemporaryDirectory() as tmp_ii:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_ii:
         cr, root = _rule_g_fixture(Path(tmp_ii))
         parent = {
             "schema_version": 2, "git_sha": root, "box": "a100-fixture",
@@ -2094,7 +2107,7 @@ def self_test() -> int:
     # further down (`.../subdir/leg.json.raw`, any depth) — both must be
     # caught; a rule that only derives ONE candidate sibling path per
     # artifact stem sees neither.
-    with tempfile.TemporaryDirectory() as tmp_ix:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_ix:
         cr, root = _rule_g_fixture(Path(tmp_ix))
         owner = {
             "schema_version": 1, "git_sha": root, "box": "a100-fixture",
@@ -2123,7 +2136,7 @@ def self_test() -> int:
     # (`<...>-raw-runs/<box>/leg.json`, the shape stacked_sweep.sh's
     # `stamp_leg()` actually writes for every committed leg) must still be
     # caught -> RED. A compliant v2 leg at the SAME depth must stay clean.
-    with tempfile.TemporaryDirectory() as tmp_x:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_x:
         cr, root = _rule_g_fixture(Path(tmp_x))
         parent = {
             "schema_version": 2, "git_sha": root, "box": "a100-fixture",
@@ -2161,7 +2174,7 @@ def self_test() -> int:
     # (vii) a v1 leg (no `leg_schema_version` at all) under a schema_version:
     # 1 parent -> unchanged behaviour: rule (i) finds nothing, only rules
     # (a)-(f) apply, exactly as before this rule existed.
-    with tempfile.TemporaryDirectory() as tmp_vii:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_vii:
         cr, root = _rule_g_fixture(Path(tmp_vii))
         parent = {
             "schema_version": 1, "git_sha": root, "box": "a100-fixture",
@@ -2183,7 +2196,7 @@ def self_test() -> int:
     # (viii) allowlisted `kind: none` relpath whose first-introduction commit
     # is AFTER the (fixture) gate-introduction sha -> RED. A GREEN control
     # (introduced BEFORE) must pass.
-    with tempfile.TemporaryDirectory() as tmp_viii:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_viii:
         cr, gate_sha = _rule_g_fixture(Path(tmp_viii))
         # `git log --follow`'s rename detection is CONTENT-similarity based
         # (needed for real `git mv`-tracked baselines, contract C8.2/C8.3).
@@ -2254,7 +2267,7 @@ def self_test() -> int:
     # false-failing every artifact's ancestry check. This is the regression
     # a real CI run hit: `p1`'s TRUE-ancestor git_sha FAILED under the
     # default `actions/checkout` (fetch-depth 1) shallow clone.
-    with tempfile.TemporaryDirectory() as shallow_src_dir, tempfile.TemporaryDirectory() as shallow_dst_dir:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as shallow_src_dir, tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as shallow_dst_dir:
         shallow_src = Path(shallow_src_dir)
         _run(["git", "init", "-q"], shallow_src)
         _run(["git", "config", "user.email", "test@example.com"], shallow_src)

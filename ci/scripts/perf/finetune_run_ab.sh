@@ -6,15 +6,18 @@
 # repeats — against the SAME committed fixture and objective every leg of a
 # run shares.
 #
-# NOT `stacked_sweep.sh`-shaped: no cookbook book stack, no server, no
-# network. Every input this script reads is a committed repo path (the
-# fixture under `cookbook/fixtures/finetune_heldout/`, a local `--model-dir`
-# checkpoint the operator already has on-box); it never builds the cookbook
-# corpus, never starts a `jammi-server`, and never fetches anything over the
-# network itself (the book-side `cookbook/book/scripts/
-# derive_heldout_fixture.py` that PRODUCES this fixture is a SEPARATE,
-# off-box, operator-run tool — this script only ever READS its committed
-# output; see the fixture's own README.md "Where this fixture comes from").
+# NOT `stacked_sweep.sh`-shaped for its measured legs: no cookbook book
+# stack, no server. Every input a MEASURED leg reads is a committed repo
+# path (the fixture under `cookbook/fixtures/finetune_heldout/`, a local
+# `--model-dir` checkpoint the operator already has on-box); no leg itself
+# builds the cookbook corpus, starts a `jammi-server`, or touches the
+# network. The ONE exception is the PRE-RUN provisioning step below
+# (CONTRACT amendment 2026-08-28b), which runs strictly BEFORE any measured
+# leg and is never counted as one: it may invoke the book-side
+# `cookbook/book/scripts/derive_heldout_fixture.py --emit-train-pairs`
+# (network-backed, checksum-gated) to (re)populate `train_pairs.jsonl`, then
+# ALWAYS byte-verifies it against the committed `train_ids_sha256.json`
+# before letting any leg proceed.
 #
 # HELD-OUT FIXTURE LAYOUT (cookbook/fixtures/finetune_heldout/, CONTRACT H3):
 #   heldout_ids.txt      the committed held-out id list -- what
@@ -25,27 +28,25 @@
 #                         discipline, that directory's own README.md "Why
 #                         train text isn't committed" section). This means
 #                         `--train-jsonl` (a required `jammi-bench
-#                         finetune-run` flag) has no committed source in
-#                         this checkout: producing it requires re-deriving
-#                         the train-side text via the book-side
-#                         `cookbook/book/scripts/derive_heldout_fixture.py`
-#                         (a network-backed, checksum-gated regeneration, run
-#                         OFF-BOX by an operator) or an equivalent. This
-#                         script's own
-#                         `--train-jsonl` default therefore points at a path
-#                         this checkout does NOT populate
-#                         (`$REPO_ROOT/cookbook/fixtures/finetune_heldout/
-#                         train_pairs.jsonl`); a REAL (non-dry-run)
-#                         invocation refuses loudly if that file is absent
-#                         (see the guard below) rather than silently
-#                         skipping or fabricating train data. It is
-#                         acceptable, and expected, that this producer
-#                         cannot EXECUTE for real in an ordinary CI/guard
-#                         checkout — its wiring (flags, fixture paths, the
-#                         merge stage) is what `gpu-howwell.yml` and this
-#                         directory's own tests exercise; a real GPU run
-#                         happens on an operator-provisioned pod that has
-#                         first re-derived `train_pairs.jsonl`.
+#                         finetune-run` flag) has no committed source of its
+#                         own text in this checkout.
+#
+# PRE-RUN PROVISIONING (CONTRACT amendment 2026-08-28b): before any measured
+# leg, if `$TRAIN_JSONL` (default `$REPO_ROOT/cookbook/fixtures/
+# finetune_heldout/train_pairs.jsonl`, gitignored -- never committed) is
+# absent, this script invokes the book-side producer's own
+# `--emit-train-pairs` mode (network-backed, checksum-gated; reuses the
+# exact `mine_pairs()`/`_text()` code path `--check` already re-derives
+# against) to write it. Then -- REGARDLESS of whether the file was just
+# emitted or was already present on this pod from a prior run -- this
+# script ALWAYS byte-verifies every pair against the committed
+# `train_ids_sha256.json` via the standalone
+# `ci/scripts/perf/verify_train_pairs.py` (sha256 per pair id, exact count
+# 1372, no extras/duplicates), refusing loudly with the first mismatching
+# id on any divergence, before a single leg runs. A pre-existing
+# `train_pairs.jsonl` is never trusted on name alone: a stale or
+# hand-edited file left over from an earlier checkout fails this exactly
+# like a corrupted fresh fetch would.
 #
 # Batch size: 32 (`cookbook/fixtures/finetune_heldout/README.md`'s own
 # "this agent's pick, pending lead confirmation" -- the chapter-config value
@@ -99,9 +100,10 @@
 #                              own CLI doc names) -- never both.
 #   TRAIN_JSONL / HELDOUT_IDS / HELDOUT_JSONL
 #                              override the committed-fixture paths (see
-#                              "HELD-OUT FIXTURE LAYOUT" above for the
-#                              defaults and why TRAIN_JSONL's default is not
-#                              actually populated in this checkout).
+#                              "HELD-OUT FIXTURE LAYOUT" / "PRE-RUN
+#                              PROVISIONING" above -- TRAIN_JSONL's default
+#                              is auto-provisioned + byte-verified before any
+#                              leg runs, never committed itself).
 #   FINETUNE_RUN_AB_OUT_DIR    where the raw legs + merged report land
 #                              (default "<repo>/.finetune-run-ab-report/
 #                              <UTC timestamp>").
@@ -177,10 +179,7 @@ fi
 # Refuse loudly, before any leg runs, if the fixture's real held-out files
 # are absent -- a real run over a missing/renamed fixture must not silently
 # produce a stub-shaped FAIL row indistinguishable from a real training
-# failure. TRAIN_JSONL is deliberately NOT checked here (see the module doc
-# above: its committed source does not exist in this checkout by design;
-# the per-leg refusal below is the honest place for that check, since only
-# a REAL leg actually needs the file to exist).
+# failure.
 if [ "$FINETUNE_RUN_AB_DRY_RUN" != "1" ]; then
   for f in "$HELDOUT_IDS" "$HELDOUT_JSONL"; do
     if [ ! -f "$f" ]; then
@@ -188,10 +187,23 @@ if [ "$FINETUNE_RUN_AB_DRY_RUN" != "1" ]; then
       exit 1
     fi
   done
+
+  # --- PRE-RUN provisioning (CONTRACT amendment 2026-08-28b) -- see module
+  # doc "PRE-RUN PROVISIONING" above. Outside every measured leg: this runs
+  # once, before the sweep loop, never inside run_leg.
   if [ ! -f "$TRAIN_JSONL" ]; then
-    echo "::error::--train-jsonl source not found: $TRAIN_JSONL — train-side text is NOT committed (repo-size discipline, cookbook/fixtures/finetune_heldout/README.md's own 'Why train text isn't committed' section); re-derive it via cookbook/book/scripts/derive_heldout_fixture.py (network-backed, checksum-gated) or point TRAIN_JSONL at an equivalent file before running for real." >&2
-    exit 1
+    echo "::notice::$TRAIN_JSONL not found -- provisioning via 'derive_heldout_fixture.py --emit-train-pairs' (network-backed, checksum-gated fetch of train text; outside measured legs)."
+    python3 "$REPO_ROOT/cookbook/book/scripts/derive_heldout_fixture.py" --emit-train-pairs \
+      || { echo "::error::train-pairs provisioning failed (cookbook/book/scripts/derive_heldout_fixture.py --emit-train-pairs) — refusing before any leg runs." >&2; exit 1; }
   fi
+  # ALWAYS byte-verify -- whether train_pairs.jsonl was just emitted above or
+  # was already present on this pod from a prior run. A stale/hand-edited
+  # file must fail exactly like a corrupted fresh fetch would; this is the
+  # ONE reviewable unit both this producer and any other caller share
+  # (ci/scripts/perf/verify_train_pairs.py), never a second hand-rolled
+  # comparator.
+  python3 "$DIR/verify_train_pairs.py" --pairs "$TRAIN_JSONL" \
+    || { echo "::error::$TRAIN_JSONL failed byte-verification against cookbook/fixtures/finetune_heldout/train_ids_sha256.json — refusing before any leg runs." >&2; exit 1; }
 fi
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"

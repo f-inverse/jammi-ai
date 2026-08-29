@@ -52,6 +52,28 @@ Usage (from ``cookbook/book/``)::
                                                           # network-backed — re-downloads the
                                                           # pinned, checksum-gated ogbn-arxiv
                                                           # sources via jammi_cookbook.datasets)
+    python scripts/derive_heldout_fixture.py --emit-train-pairs
+                                                          # write FIXTURE_DIR/train_pairs.jsonl
+                                                          # (the FULL text for the 1372 TRAIN-side
+                                                          # pairs) -- network-backed like the
+                                                          # default mode above, reusing the exact
+                                                          # same mine_pairs()/_text() code paths so
+                                                          # the bytes it writes are the same bytes
+                                                          # every per-pair hash in the committed
+                                                          # train_ids_sha256.json was computed
+                                                          # from. NEVER committed (repo-size
+                                                          # discipline, see FIXTURE_DIR/README.md
+                                                          # "Why train text isn't committed" and
+                                                          # this repo's root .gitignore) -- this is
+                                                          # the CONTRACT amendment 2026-08-28b
+                                                          # PRE-RUN provisioning step
+                                                          # ``ci/scripts/perf/finetune_run_ab.sh``
+                                                          # invokes automatically when
+                                                          # train_pairs.jsonl is absent, followed
+                                                          # ALWAYS by a byte-verification against
+                                                          # train_ids_sha256.json
+                                                          # (``ci/scripts/perf/verify_train_pairs.py``)
+                                                          # before any measured leg runs.
 """
 
 from __future__ import annotations
@@ -220,6 +242,28 @@ def _write_heldout_pairs(heldout_pairs: list[dict]) -> None:
             f.write(json.dumps(p, sort_keys=True) + "\n")
 
 
+def _write_train_pairs(train_pairs: list[dict]) -> Path:
+    """Write the FULL text of the 1372 TRAIN-side pairs to
+    ``FIXTURE_DIR/train_pairs.jsonl`` — same JSONL shape/line order as
+    ``_write_heldout_pairs`` (one ``json.dumps(pair, sort_keys=True))`` per
+    line, in mining order) — so a byte-verifier can hash each line exactly
+    the way ``_pair_sha256``/``_write_train_hashes`` already did when
+    ``train_ids_sha256.json`` was committed. This is the PRE-RUN
+    provisioning artifact CONTRACT amendment 2026-08-28b names: reproducible
+    (same mining/clipping code path as ``generate()``), never committed
+    (repo-size discipline — see FIXTURE_DIR/README.md "Why train text isn't
+    committed" and the root ``.gitignore``), and always byte-verified against
+    the committed ``train_ids_sha256.json`` by
+    ``ci/scripts/perf/verify_train_pairs.py`` before any measured leg reads
+    it.
+    """
+    path = FIXTURE_DIR / "train_pairs.jsonl"
+    with path.open("w") as f:
+        for p in train_pairs:
+            f.write(json.dumps(p, sort_keys=True) + "\n")
+    return path
+
+
 def _write_vendored_subset_ids() -> Path:
     """Vendor a byte-identical copy of the committed 4000-id subset into the
     fixture directory (F-1 (b)): the fixture's own provenance must be
@@ -351,13 +395,30 @@ def check() -> int:
     return 0 if ok else 1
 
 
+def emit_train_pairs() -> Path:
+    """Re-derive and write ``FIXTURE_DIR/train_pairs.jsonl`` only (the
+    committed held-out files, manifest, and vendored subset ids are left
+    untouched — this mode never mutates any of the three committed fixture
+    data files ``check()`` diffs against)."""
+    derived = derive()
+    path = _write_train_pairs(derived["train_pairs"])
+    print(f"wrote {path} ({len(derived['train_pairs'])} pairs)")
+    return path
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true",
                      help="verify the committed fixture against a fresh re-derivation")
+    ap.add_argument("--emit-train-pairs", action="store_true",
+                     help="write FIXTURE_DIR/train_pairs.jsonl for the committed 1372-pair "
+                          "train split (network-backed; never committed) and exit")
     args = ap.parse_args()
     if args.check:
         return check()
+    if args.emit_train_pairs:
+        emit_train_pairs()
+        return 0
     generate()
     return 0
 

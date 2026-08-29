@@ -292,3 +292,31 @@ statement: n_pos=3, n_neg=8 of 11; mean_d=-0.0238, p=0.2266, both also over the 
 2(ii)'s own prose is left exactly as originally recorded (append-only); this postscript is
 the correction of record. measurements/campaign-v1/README.md carries the identical fix in
 place, with its own dated correction note.
+
+**Postscript, 2026-08-29 (docs-ci, unit-63 "RED-proof column"):** the signed `(1+eps)`
+ladder above DEMONSTRATED the detector (11/12 concordance, `p=0.00635 < alpha2`) but landed
+every scheduled dose in the IMPROVEMENT direction — no member of this family can discharge
+acceptance 5's "mutant column proven RED (degradation)" (see
+`measurements/dose-ladder/README.md`'s own finding 3). `ab_merge.py` therefore gains a
+**RED-proof label class**: a `dose_label` carrying the literal prefix `redproof-` (e.g.
+`redproof-nobc`, `redproof-signflip`, mutants/README.md's own `M_nobc`/`M_signflip` pair,
+both outside the `(1+eps)` lr-scale family by construction) participates fully in
+`build_mutant_dose_column` (premises, partner premises, identity, `detected` computation —
+unchanged) but is partitioned OUT of the eps-family scans (`sensitivity`,
+`two_sided_falsification`, `dose_anomalies`, and the duplicate-EPS arm of
+`mutant_dose_ladder_reject_duplicate_doses`) BEFORE those scans ever run — a partition on
+the label prefix, never a widening of `_dose_label_eps`'s own strict eps-only domain; the
+duplicate-LABEL and duplicate-PATCH_SHA arms still apply across the full set, so a
+RED-proof column remains subject to the same same-patch-measured-twice refusal any eps
+column is. The merged artifact gains `red_proof` (one
+`{dose_label, patch_sha256, detected, n_pos, n_neg, mean_d, p_value, clean_pair_count}` entry
+per RED-proof column) and `red_proof_verdict` — `"PROVEN"` iff at least one RED-proof column
+reads `detected == "RED"`, otherwise `"NOT_PROVEN"` naming every column's own `detected` (a
+column reading `RED_FOR_INVESTIGATION` is recorded as-is, an anomaly for a mutant expected to
+degrade, never a second way to reach `"PROVEN"`). `red_proof_verdict == "PROVEN"` contributes
+exit 0 (the expected outcome); `"NOT_PROVEN"` contributes non-zero, named in the merge's own
+stderr and artifact. This retires the prior "run `redproof-nobc`/`redproof-signflip` in
+their own, separate invocation and treat its exit 1 as expected" convention
+(mutants/README.md's own former "Minimal labeling convention" section) — reinterpreting a
+failure exit as success was never acceptable; the RED-proof verdict is now read directly off
+this merge's own first-class field, in the SAME artifact the primary decision lands in.

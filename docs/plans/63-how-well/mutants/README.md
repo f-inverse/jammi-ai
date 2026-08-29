@@ -730,72 +730,79 @@ SAME campaign `alloff` legs, stamp `--mutant-id`/`--mutant-base-sha`/
 `--mutant-patch-sha256`, tear down after) — with dose labels `nobc` and
 `signflip` in place of an `epsNN` label.
 
-**Merger-label finding (REQUIRED before scheduling either mutant to
-run): `ab_merge.py`'s `--mutant-legs` path does NOT provide a "stays out
-of the sensitivity/falsification scans" carve-out for a non-eps label —
-it hard-refuses the WHOLE dose-ladder computation instead.** Traced
-through `ci/scripts/perf/ab_merge.py`:
+**RED-proof label class (`ci/scripts/perf/ab_merge.py`, unit 63, CONTRACT.md
+addendum 2026-08-29c's own dated postscript): the RED-proof verdict is a
+first-class merger output in the SAME invocation and the SAME artifact as
+the primary decision and the eps-family dose ladder — never a separate,
+exit-1-expected invocation.** A `dose_label` carrying the literal prefix
+`redproof-` (e.g. `redproof-nobc`, `redproof-signflip`) is a RED-PROOF
+column:
 
-- `build_mutant_dose_column` (the function that actually reads the mutant's
-  legs and computes `detected`/`n_pos`/`n_neg`/`mean_d`/`p_value`/
-  `clean_pair_count`) never calls `_dose_label_eps` — `dose_label` is used
-  there only as an opaque string (`mutant_leg_repeat_tag(dose_label)` for
-  leg file lookup, and in violation messages). A `nobc`/`signflip` column's
-  own measured verdict IS therefore computed correctly and lands in
-  `mutant_dose_ladder.doses[]` regardless of whether the label parses as a
-  signed eps.
-- But `mutant_dose_ladder_sensitivity`, `mutant_dose_ladder_two_sided_
-  falsification`, `mutant_dose_ladder_anomalies`, and
-  `mutant_dose_ladder_reject_duplicate_doses` each call `_dose_label_eps`
-  UNCONDITIONALLY over EVERY column in the full `dose_columns` list passed
-  to them (e.g. `mutant_dose_ladder_sensitivity`'s
-  `(col for col in dose_columns if _dose_label_eps(col["dose_label"]) < 0.0)`
-  evaluates the parse for every column to decide inclusion; `_anomalies`
-  loops `for col in dose_columns: eps = _dose_label_eps(...)` before ever
-  checking sign or `detected`). `_dose_label_eps` requires the label to
-  start with the literal prefix `"eps"` (`ab_merge.py`'s own
-  `_dose_label_eps` docstring/body) and raises
-  `MutantDoseLadderSensitivityError` otherwise.
-- `main()`'s `finetune-run` handler wraps ALL FOUR of those calls in ONE
-  `try/except MutantDoseLadderSensitivityError` block, over the FULL
-  `dose_columns` assembled from every `--mutant-legs` spec passed to that
-  single invocation. So: a non-eps label (`nobc`, `signflip`) supplied in
-  the SAME `--mutant-legs` set as any eps-labeled dose (e.g. alongside
-  `eps-0.50`) makes the exception propagate and blanks `sensitivity`,
-  `two_sided_falsification`, and `dose_anomalies` to `None`/`[]`/`[]` for
-  **every** column in that invocation — including the co-scheduled eps
-  doses — and sets `sensitivity_error` plus `exit_code=1` for the whole
-  merge. This is collateral damage, not a scoped carve-out: it is not that
-  the merger quietly drops the non-eps column from the scans while still
-  reporting the eps doses' own sensitivity finding; it refuses the ENTIRE
-  ladder's derived findings for that merge invocation.
-- Running `nobc`/`signflip` in their OWN, separate `ab_merge.py
-  finetune-run ... --mutant-legs nobc:<sha>:<seeds> --mutant-legs
-  signflip:<sha>:<seeds>` invocation (never combined with any eps-labeled
-  `--mutant-legs` entry) isolates the blast radius to that invocation's own
-  JSON artifact — it does NOT retroactively corrupt the already-recorded
-  dose-ladder merge (a separate invocation, a separate
-  `finetune_run_ab_report.json`). But even alone, that separate invocation
-  will STILL raise `MutantDoseLadderSensitivityError` (since `nobc`/
-  `signflip` never start with `"eps"`), so its OWN `sensitivity`/
-  `two_sided_falsification`/`dose_anomalies` come back `None`/`[]`/`[]`
-  with `sensitivity_error` set and `exit_code=1`. This is the CORRECT
-  designed behavior for a label genuinely outside the signed-eps family —
-  not a bug to route around — and per this task's own scope, no merger
-  code change is proposed here.
+- It participates fully in `build_mutant_dose_column` exactly like any
+  eps-labeled column (premises, partner premises, identity, and the
+  `detected`/`n_pos`/`n_neg`/`mean_d`/`p_value`/`clean_pair_count`
+  computation) — unchanged.
+- It is partitioned OUT of the eps-family scans
+  (`mutant_dose_ladder_sensitivity`, `mutant_dose_ladder_two_sided_
+  falsification`, `mutant_dose_ladder_anomalies`, and the duplicate-EPS arm
+  of `mutant_dose_ladder_reject_duplicate_doses`) by
+  `partition_red_proof_dose_columns`, called BEFORE those scans ever see
+  the assembled `dose_columns` list — a partition on the label PREFIX,
+  never a widening of `_dose_label_eps`'s own strict eps-only domain (an
+  eps-labeled column keeps its existing strict validation untouched; a
+  RED-proof label is never asked to satisfy it, and never silently
+  admitted as though it could).
+- It remains fully subject to the duplicate-LABEL and duplicate-PATCH_SHA
+  arms of `mutant_dose_ladder_reject_duplicate_doses`, which run over the
+  FULL `dose_columns` set (a RED-proof column citing the same
+  `patch_sha256` as a co-scheduled eps column, or repeating a literal
+  label, is refused exactly like any two eps columns would be).
+- A `dose_label` that is exactly the bare prefix (`"redproof-"`, no mutant
+  name after it) is refused loudly by `partition_red_proof_dose_columns`
+  (`RedProofLabelError`), never silently accepted as an anonymous
+  RED-proof column.
 
-**Minimal labeling convention (no merger change, per task scope):**
-schedule `M_nobc`/`M_signflip` as a run in their own, separate
-`ab_merge.py finetune-run` invocation, disjoint from any `--mutant-legs
-epsNN:...` set. Read the RED-proof verdict directly off that invocation's
-`mutant_dose_ladder.doses[i].detected` (and `n_pos`/`n_neg`/`mean_d`/
-`p_value`) — the fields `build_mutant_dose_column` computes independently
-of `_dose_label_eps` — never off `sensitivity`/`two_sided_falsification`/
-`dose_anomalies`, which are expected (by design) to read `sensitivity_error`
-with `exit_code=1` for this invocation. Treat that non-zero exit code as
-"expected, informational: this column is outside the signed-eps family by
-construction" for a `nobc`/`signflip` merge, not as a run failure, and cite
-`doses[].detected` in the acceptance-5 writeup as the actual RED evidence.
+**Merged artifact fields:** `mutant_dose_ladder.red_proof` — one
+`{dose_label, patch_sha256, detected, n_pos, n_neg, mean_d, p_value,
+clean_pair_count}` entry per RED-proof column supplied to that invocation
+(`build_red_proof_summary`), in the SAME `finetune_run_ab_report.json` the
+primary decision and any co-scheduled eps dose ladder land in. And
+`mutant_dose_ladder.red_proof_verdict`: the literal string `"PROVEN"` iff
+at least one RED-proof column's own `detected` reads the literal string
+`"RED"` (degradation-concordant — acceptance 5's own discharge condition);
+otherwise `"NOT_PROVEN"` followed by every RED-proof column's own
+`dose_label=detected` pair. A RED-proof column reading
+`"RED_FOR_INVESTIGATION"` is recorded AS-IS in its own `detected` field (an
+anomaly: this mutant is EXPECTED to degrade per this file's own prediction
+above, so an improvement-concordant detection here is itself a finding to
+investigate, never a second way to reach `"PROVEN"`).
+
+**Exit-code semantics:** `red_proof_verdict == "PROVEN"` contributes
+nothing to the merge's own exit code — it is the EXPECTED outcome for a
+RED-proof column, unlike `dose_anomalies`. `red_proof_verdict` starting
+with `"NOT_PROVEN"` contributes a non-zero exit code, named in the merge's
+own stderr and in the artifact itself — acceptance 5's own "mutant column
+proven RED" undischarged by every scheduled RED-proof column is a failure
+of this run's own purpose, never silently passed through as green. An
+`INVALID` RED-proof column (a correctness-of-measurement problem — the
+same carve-out every dose column gets) is caught by the SAME
+`invalid_doses` check every column in `doses[]` already goes through,
+non-zero exit exactly as everywhere else in this module.
+
+**Scheduling `M_nobc`/`M_signflip`:** pass `--mutant-legs
+redproof-nobc:<M_nobc sha256>:<seeds>` and `--mutant-legs
+redproof-signflip:<M_signflip sha256>:<seeds>` to the SAME `ab_merge.py
+finetune-run` invocation the campaign's primary decision (and, if
+co-scheduled, the eps-family dose ladder) already runs — the legs
+themselves are stamped exactly per the on-pod procedure above
+(`--mutant-id`/`--mutant-base-sha`/`--mutant-patch-sha256`, `dose_label =
+redproof-nobc` / `redproof-signflip`, matching this section's own already-
+stamped legs). Read the RED-proof verdict directly off
+`mutant_dose_ladder.red_proof_verdict` and `.red_proof[]` in that
+invocation's own artifact — never off a separate invocation's exit code,
+and never off `sensitivity`/`two_sided_falsification`/`dose_anomalies`,
+which remain scoped to the eps family only and are unaffected by a
+co-scheduled RED-proof column (and vice versa).
 
 ## Files
 

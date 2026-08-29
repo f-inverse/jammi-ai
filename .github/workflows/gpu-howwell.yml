@@ -108,17 +108,27 @@ jobs:
           # passed, which this workflow does not yet forward, so clearing
           # this field on a dispatch run currently makes the merge INVALID
           # by design rather than silently skipping the control). A
-          # run-howwell PR-label trigger carries NO workflow_dispatch inputs
-          # at all — the SAME limitation model_dir/objective already refuse
-          # loudly on above, rather than silently collapsing (via the OLD
-          # `github.event.inputs.lr0_seeds || ''` coalesce this step
-          # replaces) to the same untagged "" a deliberate dispatch opt-out
-          # would also produce, which dropped the pre-registered lr0 RED
-          # control on EVERY label-triggered run with no visible signal.
+          #
+          # unit-63 round-4 audit advisory (A2), CURRENT TRUTH (an earlier
+          # draft of this comment claimed the ELSE branch below closed a gap
+          # where a run-howwell PR-label trigger silently dropped the
+          # control on EVERY run "with no visible signal" — that describes
+          # a run that could never start in the first place): a
+          # `pull_request: types: [labeled]` trigger carries NO
+          # workflow_dispatch inputs at all, so `model_dir` (and
+          # `objective`) above ALREADY refuse loudly before this step ever
+          # reaches the `lr0_seeds` branch below — the ELSE branch here is
+          # therefore dead code on every real trigger this workflow's own
+          # `on:` block admits today (`workflow_dispatch` always takes the
+          # `if`; `pull_request: labeled` never reaches this line at all).
+          # It is kept anyway, belt-and-braces, in case a FUTURE trigger is
+          # added to the `on:` block above without this step being
+          # revisited — a defensive refusal, not a fix for a reachable gap
+          # today.
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             LR0_SEEDS="${{ github.event.inputs.lr0_seeds }}"
           else
-            echo "::error::lr0_seeds has no source on a run-howwell PR-label trigger (it carries no workflow_dispatch inputs and cannot supply one) — use workflow_dispatch instead so the pre-registered lr=0 RED control (or a deliberate, visible opt-out) can actually be selected."
+            echo "::error::lr0_seeds has no source on this trigger (belt-and-braces — every trigger this workflow's own on: block currently admits either takes the workflow_dispatch branch above, or has already refused on the missing model_dir/objective inputs before reaching this line) — use workflow_dispatch so the pre-registered lr=0 RED control (or a deliberate, visible opt-out) can actually be selected."
             exit 1
           fi
           echo "lr0_seeds=$LR0_SEEDS" >> "$GITHUB_OUTPUT"

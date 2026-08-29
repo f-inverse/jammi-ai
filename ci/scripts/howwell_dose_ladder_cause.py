@@ -80,38 +80,48 @@ import sys
 # `sys.path` -- the risk is the opposite direction, an `ab_merge` module a
 # caller intended to be picked up from elsewhere on `sys.path` being silently
 # shadowed by this repo's own `perf/ab_merge.py`, never the reverse.
+#
+# Unit-63 round-17 audit shapes (d)/(e): a module named `ab_merge` that
+# IMPORTS cleanly but is stale/shadowed -- lacking one of the three names
+# this file reads off it (`DOSE_LADDER_EXIT_CAUSE_NAMES`,
+# `MUTANT_DOSE_DETECTED_INVALID`, `RED_PROOF_VERDICT_NOT_PROVEN_PREFIX`) --
+# is the SAME failure class as an outright import failure from this file's
+# own point of view: both mean "the `ab_merge` this process actually loaded
+# does not have the contract this namer depends on". The three attribute
+# reads therefore live INSIDE this same `try`, not as separate module-level
+# statements after it -- an `AttributeError` raised while reading any one of
+# them is caught by the same `except Exception` below and folds into
+# `_AB_MERGE_IMPORT_ERROR`, exactly like a failed `import ab_merge` itself.
+# Pre-fix, each read was a separate top-level statement guarded only by
+# `if ab_merge is not None`, so an `AttributeError` raised while reading one
+# of them propagated straight out of module load, uncaught, regardless of
+# whether `import ab_merge` itself had succeeded.
 _PERF_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "perf")
 sys.path.insert(0, _PERF_DIR)
 try:
     import ab_merge  # noqa: E402
 
+    # Unit-63 round-14 audit F6 / round-16 audit (identity-completeness
+    # sibling class): all three read directly off `ab_merge.py`'s own
+    # producer-side constants, never a hand-duplicated literal -- see this
+    # module's own "Binding to ab_merge.py's own exit fold" doc above for
+    # exactly what this import makes impossible (a fifth cause silently
+    # added to one side alone) versus what it does not (an exit-fold branch
+    # written outside the shared data structure).
+    _ALL_CAUSE_NAMES = list(ab_merge.DOSE_LADDER_EXIT_CAUSE_NAMES)
+    _MUTANT_DOSE_DETECTED_INVALID = ab_merge.MUTANT_DOSE_DETECTED_INVALID
+    _RED_PROOF_VERDICT_NOT_PROVEN_PREFIX = ab_merge.RED_PROOF_VERDICT_NOT_PROVEN_PREFIX
     _AB_MERGE_IMPORT_ERROR: str | None = None
 except Exception as _exc:  # pragma: no cover - exercised via subprocess in test_howwell_dose_ladder_cause.py
     ab_merge = None  # type: ignore[assignment]
+    # When the import (or one of the three attribute reads above) failed,
+    # there is nothing to read; the import-failure cause short-circuits
+    # `dose_ladder_cause` before any of these three are ever consulted (see
+    # that function's own doc).
+    _ALL_CAUSE_NAMES = []
+    _MUTANT_DOSE_DETECTED_INVALID = None
+    _RED_PROOF_VERDICT_NOT_PROVEN_PREFIX = None
     _AB_MERGE_IMPORT_ERROR = f"{type(_exc).__name__}: {_exc}"
-
-# Unit-63 round-14 audit F6: imported directly from `ab_merge.py`, never a
-# hand-duplicated literal -- see this module's own "Binding to ab_merge.py's
-# own exit fold" doc above for exactly what this import makes impossible
-# (a fifth cause silently added to one side alone) versus what it does not
-# (an exit-fold branch written outside the shared data structure). When the
-# import above failed, there is no `ab_merge.DOSE_LADDER_EXIT_CAUSE_NAMES` to
-# read -- `_ALL_CAUSE_NAMES` is left empty; `dose_ladder_cause` below never
-# reaches the code that would consult it in that state (the import-failure
-# cause short-circuits first).
-_ALL_CAUSE_NAMES = list(ab_merge.DOSE_LADDER_EXIT_CAUSE_NAMES) if ab_merge is not None else []
-
-# Unit-63 round-16 audit (identity-completeness, sibling class): the dose
-# column `detected` vocabulary and the `red_proof_verdict` NOT_PROVEN prefix
-# are `ab_merge.py`'s own producer-side constants, imported directly here --
-# never a re-typed literal -- exactly as `DOSE_LADDER_EXIT_CAUSE_NAMES` is
-# above. When the import above failed, there is nothing to read; the
-# import-failure cause short-circuits `dose_ladder_cause` before either
-# constant is ever consulted (same discipline as `_ALL_CAUSE_NAMES` above).
-_MUTANT_DOSE_DETECTED_INVALID = ab_merge.MUTANT_DOSE_DETECTED_INVALID if ab_merge is not None else None
-_RED_PROOF_VERDICT_NOT_PROVEN_PREFIX = (
-    ab_merge.RED_PROOF_VERDICT_NOT_PROVEN_PREFIX if ab_merge is not None else None
-)
 
 
 def _inspect_doses(ladder: dict) -> tuple[list, str | None]:
@@ -184,10 +194,29 @@ def dose_ladder_cause(report: dict) -> str:
     the caller -- reading/parsing the report FILE is `main()`'s own job (see
     that function's own doc, unit-63 round-16 audit advisory 3, for the
     file-read hardening this function does not itself provide).
+
+    Unit-63 round-17 audit shapes (a)/(b): `json.loads` succeeding proves
+    nothing about the SHAPE of what it returned -- valid JSON can decode to
+    `null`, a list, a string, or a number just as easily as an object, and
+    a `report["mutant_dose_ladder"]` value can independently be any JSON
+    value a hand-edited or corrupted report happens to carry (e.g. a list).
+    Both are now type-checked -- a non-dict `report` returns a
+    `report_is_not_an_object(type=...)` cause before `.get` is ever called
+    on it, and a present-but-non-dict `mutant_dose_ladder` (truthy, since a
+    falsy one -- `None`, `{}`, `[]`, ... -- degrades to the empty-ladder
+    case exactly as before) returns a `mutant_dose_ladder_is_not_an_object(
+    type=...)` cause -- same "named cause, never an `AttributeError`" style
+    as `_inspect_doses`'s own `doses`-field checks below.
     """
     if _AB_MERGE_IMPORT_ERROR is not None:
         return f"ab_merge_import_failed({_AB_MERGE_IMPORT_ERROR})"
-    ladder = report.get("mutant_dose_ladder") or {}
+    if not isinstance(report, dict):
+        return f"report_is_not_an_object(type={type(report).__name__})"
+    ladder = report.get("mutant_dose_ladder")
+    if not ladder:
+        ladder = {}
+    elif not isinstance(ladder, dict):
+        return f"mutant_dose_ladder_is_not_an_object(type={type(ladder).__name__})"
     causes = []
     if ladder.get("sensitivity_error"):
         causes.append("sensitivity_error")
@@ -221,12 +250,24 @@ def main(argv=None) -> int:
     exist to prevent one layer down, recurring one layer up, and reachable
     even when `ab_merge` itself imported cleanly (a broken `ab_merge` and an
     unreadable report are independent failure axes; this hardening covers
-    the report-read axis regardless of the other). The read+parse is now
-    INSIDE the same discipline: a read failure or a JSON parse failure
-    degrades to its own NAMED cause on stdout, exit 0 -- never an uncaught
-    exception, and never silently folded into the generic
-    "unknown (could not inspect ...)" text a genuinely-no-cause-found run
-    also produces.
+    the report-read axis regardless of the other).
+
+    Unit-63 round-17 audit shape (c): a non-UTF-8 report file raised
+    `UnicodeDecodeError` from INSIDE `fh.read()` -- a `ValueError` subclass,
+    not an `OSError` subclass, so the `except OSError` arm alone did not
+    catch it and it propagated uncaught. A second `except ValueError` arm
+    (which also catches `UnicodeDecodeError`, its subclass) now degrades
+    that shape to its own NAMED `report_undecodable(...)` cause on stdout,
+    exit 0.
+
+    What is proven, by the shapes this file's own test suite drives through
+    the real CLI: an unreadable path (`OSError`), a non-UTF-8 file
+    (`UnicodeDecodeError`), and malformed JSON (`json.JSONDecodeError`) each
+    degrade to their own named cause, exit 0, rather than an uncaught
+    exception. What is NOT claimed: any exception type `open()`/`.read()`/
+    `json.loads()` might raise outside these three named classes is still
+    uncaught here -- this function guards exactly the shapes named above,
+    never an unbounded "any exception" claim.
     """
     argv = sys.argv[1:] if argv is None else argv
     if len(argv) != 1:
@@ -238,6 +279,11 @@ def main(argv=None) -> int:
             report_text = fh.read()
     except OSError as exc:
         print(f"report_unreadable({type(exc).__name__}: {exc})")
+        return 0
+    except ValueError as exc:
+        # `UnicodeDecodeError` (round-17 audit shape (c)) is a `ValueError`
+        # subclass, not an `OSError` subclass, so it needs this separate arm.
+        print(f"report_undecodable({type(exc).__name__}: {exc})")
         return 0
     try:
         report = json.loads(report_text)

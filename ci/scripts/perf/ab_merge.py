@@ -1153,9 +1153,9 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
                 else "checked and FAILED — see fused_proof column for the classification"
             )
             verdict = (
-                f"INVALID (fused-dispatch proof {reason} — this leg's PASS/FAIL classification "
-                f"cannot be trusted; the ratio-based verdict this would otherwise have been is "
-                f"discarded, not merely annotated)"
+                f"{FINETUNE_AB_VERDICT_INVALID_PREFIX} (fused-dispatch proof {reason} — this leg's "
+                f"PASS/FAIL classification cannot be trusted; the ratio-based verdict this would "
+                f"otherwise have been is discarded, not merely annotated)"
             )
 
         # Same carve-out `proof is False`'s own INVALID branch above takes
@@ -1169,9 +1169,10 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
         # invalidate this config's verdict.
         if leg_premise_violations_list:
             verdict = (
-                f"INVALID (leg premise mismatch: {'; '.join(leg_premise_violations_list)} — the "
-                f"{jammi_premise_leg}/{torch_premise_leg} legs of this config did not run under the "
-                "same seed/batch/seq/dtype/dropout/lora premise; the ratio-based verdict this would "
+                f"{FINETUNE_AB_VERDICT_INVALID_PREFIX} (leg premise mismatch: "
+                f"{'; '.join(leg_premise_violations_list)} — the {jammi_premise_leg}/"
+                f"{torch_premise_leg} legs of this config did not run under the same "
+                "seed/batch/seq/dtype/dropout/lora premise; the ratio-based verdict this would "
                 "otherwise have been is discarded, not merely annotated)"
             )
 
@@ -2907,6 +2908,15 @@ MUTANT_DOSE_DETECTED_VALUES = (
 RED_PROOF_VERDICT_PROVEN = "PROVEN"
 RED_PROOF_VERDICT_NOT_PROVEN_PREFIX = "NOT_PROVEN"
 
+# Unit-63 round-17 audit advisory (class sibling of the two named-constant
+# fixes above): `build_report`'s own per-config `verdict` string's
+# `"INVALID"` prefix (the fused-dispatch-proof-failed / leg-premise-mismatch
+# carve-out from this crate's record-don't-gate doctrine -- see that
+# function's own comment) was hand-typed at both places that produce it and
+# re-typed at `main()`'s own `.startswith("INVALID")` consumption of it.
+# Named ONCE here; both sites read this constant, never a re-typed literal.
+FINETUNE_AB_VERDICT_INVALID_PREFIX = "INVALID"
+
 # unit-63 round-8 audit finding 3 (round-9 audit finding 2 makes the
 # domain ASYMMETRIC -- a single `abs(eps) > MAX` check is not this
 # family's real shape): the sane domain for this family's own SIGNED
@@ -4269,7 +4279,9 @@ def main(argv=None):
     # DOES gate on. An ordinary ratio-based `FAIL` row remains
     # record-only, unchanged.
     invalid_slugs = [
-        slug for slug, cfg in merged["configs"].items() if str(cfg.get("verdict", "")).startswith("INVALID")
+        slug
+        for slug, cfg in merged["configs"].items()
+        if str(cfg.get("verdict", "")).startswith(FINETUNE_AB_VERDICT_INVALID_PREFIX)
     ]
     if invalid_slugs:
         print(

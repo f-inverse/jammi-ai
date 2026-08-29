@@ -5583,14 +5583,50 @@ class FinetuneRunStatusRuntimeGuardTests(unittest.TestCase):
             ab_merge.FINETUNE_RUN_STATUSES = original
 
     def test_guard_restored_after_perturbation_is_silent_again(self):
-        # Belt-and-suspenders: the monkeypatch above must not leak between
-        # tests -- the SAME fixture is GREEN again once the constant is
-        # restored (proves the `finally` restore actually ran and this
-        # suite's own test isolation is real, not accidental ordering).
+        # Belt-and-suspenders: `unittest`'s default loader sorts test
+        # methods alphabetically by name within a `TestCase`, so this test
+        # (`test_guard_restored_after_perturbation_is_silent_again`) runs
+        # AFTER the perturbing test above
+        # (`test_a_status_outside_the_committed_set_raises_immediately`,
+        # which sorts first alphabetically -- "a_status" < "guard_restored")
+        # -- the SAME fixture is GREEN again once the constant is restored,
+        # so a `finally` restore that failed to run (leaking the monkeypatch
+        # into this later test) would fail this assertion.
         with tempfile.TemporaryDirectory() as raw_dir:
             seeds = self._write_green_fixture(raw_dir)
             merged, _table = ab_merge.build_finetune_run_report(raw_dir, seeds, allow_missing_lr0_control=True)
         self.assertEqual(merged["status"], "GREEN")
+
+
+class FinetuneAbVerdictInvalidPrefixNamedConstantTests(unittest.TestCase):
+    """Unit-63 round-17 audit advisory (class sibling of the
+    `MUTANT_DOSE_DETECTED_*`/`RED_PROOF_VERDICT_*` fixes): `build_report`'s
+    own `verdict` INVALID prefix (both production sites -- the
+    fused-dispatch-proof branch and the leg-premise-mismatch branch) and
+    `main()`'s own `.startswith(...)` consumption of it now all read
+    `ab_merge.FINETUNE_AB_VERDICT_INVALID_PREFIX`, never a re-typed
+    `"INVALID"` literal. Pinned end-to-end through the real
+    `ab_merge.main` entry point (the same fixture
+    `FusedProofFixtureTests.test_all_zero_no` already exercises), proving
+    the constant's OWN value is what both the producer and the consumer
+    agree on, not merely that the constant equals the string `"INVALID"`
+    in isolation.
+    """
+
+    def test_constant_is_the_literal_invalid(self):
+        self.assertEqual(ab_merge.FINETUNE_AB_VERDICT_INVALID_PREFIX, "INVALID")
+
+    def test_build_report_invalid_verdict_and_mains_own_exit_gate_agree_with_the_constant(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(raw_dir, "b8-s128-d0", {})  # all-(0, 0) -> INVALID, see test_all_zero_no
+            out_dir = tempfile.mkdtemp()
+            rc = ab_merge.main([raw_dir, out_dir, "20", "5", "0.9"])
+            with open(os.path.join(out_dir, "finetune_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertTrue(
+            merged["configs"]["b8-s128-d0"]["verdict"].startswith(ab_merge.FINETUNE_AB_VERDICT_INVALID_PREFIX)
+        )
+        self.assertEqual(rc, 1, "main()'s own exit-code gate must agree with the same named prefix")
 
 
 if __name__ == "__main__":

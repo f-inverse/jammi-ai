@@ -12,10 +12,15 @@
 # ONLY by that workflow's workflow_dispatch / `run-howwell` PR-label triggers,
 # never a schedule (CONTRACT H4: "NO schedule in v1").
 #
-# Exit 0 = the merge's own status was not INVALID (see
-# finetune_run_ab.sh/ab_merge.py's own record-don't-gate doctrine — a plain
-# FAIL/INCOMPLETE leg is recorded, never fatal; only INVALID is); 75 = no A100
-# capacity (neutral skip, the SAME convention runpod_gpu_prove.sh uses).
+# Exit 0 = the merge's own status was GREEN (a plain FAIL/INCOMPLETE/DRY_RUN
+# leg is recorded, never fatal, per finetune_run_ab.sh/ab_merge.py's own
+# record-don't-gate doctrine); non-zero = status is RED, RED_FOR_INVESTIGATION,
+# or INVALID (unit-63 audit finding 1: the pre-registered decision rule fired,
+# or a correctness-of-measurement problem was found — see the "merged status"
+# log line below for WHICH one, named explicitly rather than left as a bare
+# exit code an operator has to cross-reference against the pulled artifact);
+# 75 = no A100 capacity (neutral skip, the SAME convention runpod_gpu_prove.sh
+# uses).
 #
 # Env vars (forwarded verbatim into the remote leg — see
 # finetune_run_ab.sh's own doc for each one's meaning/default):
@@ -31,10 +36,29 @@
 #   HOWWELL_SEEDS                forwarded as FINETUNE_RUN_AB_SEEDS
 #                                (default: the pre-registered 12-seed gate
 #                                set, finetune_run_ab.sh's own default).
-#   HOWWELL_OBJECTIVE             forwarded as FINETUNE_RUN_AB_OBJECTIVE
-#                                (default: mnrl).
+#   HOWWELL_OBJECTIVE             forwarded as FINETUNE_RUN_AB_OBJECTIVE.
+#                                REQUIRED -- no default (CONTRACT amendment
+#                                2026-08-28: the choice must be made
+#                                deliberately on every dispatch); this
+#                                script refuses loudly if unset.
+#   HOWWELL_LR0_SEEDS             forwarded as FINETUNE_RUN_AB_LR0_SEEDS
+#                                (default: empty — the lr=0 RED control is
+#                                opt-in per H5 campaign step 3).
+#   HOWWELL_ARTIFACT_DIR          where the merged report/table is pulled
+#                                back to once the remote run finishes
+#                                (default: "<repo>/.gpu-pull/how-well" —
+#                                unit-63 audit advisory (c): the artifact
+#                                previously never left the pod; this mirrors
+#                                gpu-dev.sh's own `pull` subcommand's rsync
+#                                invocation rather than inventing a second
+#                                retrieval mechanism. `.gpu-pull/` is
+#                                already gitignored — a human commits the
+#                                specific run(s) that matter for the
+#                                campaign's own evidence record, this driver
+#                                only makes them retrievable).
 set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$DIR/../.." && pwd)"
 RP_TTL_HOURS="${RP_TTL_HOURS:-3}"
 # shellcheck source=ci/scripts/runpod_lib.sh
 source "$DIR/runpod_lib.sh"
@@ -48,7 +72,20 @@ if [ -z "$HOWWELL_MODEL_DIR" ]; then
   exit 2
 fi
 HOWWELL_SEEDS="${HOWWELL_SEEDS:-1,2,3,4,5,6,7,8,9,10,11,12}"
-HOWWELL_OBJECTIVE="${HOWWELL_OBJECTIVE:-mnrl}"
+# No silent default (CONTRACT amendment 2026-08-28: "objective stays
+# required-no-default" -- gpu-howwell.yml's own workflow_dispatch `objective`
+# input is REQUIRED for exactly this reason, refusing before this script is
+# even invoked; a `mnrl` fallback here would only be reachable via a DIRECT
+# invocation of this script that bypasses that workflow, silently choosing
+# an objective on the caller's behalf rather than making the choice
+# deliberate on every dispatch).
+HOWWELL_OBJECTIVE="${HOWWELL_OBJECTIVE:-}"
+if [ -z "$HOWWELL_OBJECTIVE" ]; then
+  echo "::error::HOWWELL_OBJECTIVE must be set to 'mnrl' or 'triplet' -- no default (CONTRACT amendment 2026-08-28's own required-no-default rule); gpu-howwell.yml's workflow_dispatch 'objective' input already enforces this on the merge path, but a direct invocation of this script must refuse just as loudly." >&2
+  exit 2
+fi
+HOWWELL_LR0_SEEDS="${HOWWELL_LR0_SEEDS:-}"
+HOWWELL_ARTIFACT_DIR="${HOWWELL_ARTIFACT_DIR:-${REPO_ROOT}/.gpu-pull/how-well}"
 
 # Sweep before renting anything — same orphan-bounding reasoning
 # runpod_gpu_prove.sh's own header states (this workflow ALSO sets
@@ -73,6 +110,7 @@ echo "::group::how-well A/B (finetune_run_ab.sh)"
 MODEL_DIR="${HOWWELL_MODEL_DIR}" \
   FINETUNE_RUN_AB_SEEDS="${HOWWELL_SEEDS}" \
   FINETUNE_RUN_AB_OBJECTIVE="${HOWWELL_OBJECTIVE}" \
+  FINETUNE_RUN_AB_LR0_SEEDS="${HOWWELL_LR0_SEEDS}" \
   bash ci/scripts/perf/finetune_run_ab.sh
 rc=\$?
 echo "::endgroup::"
@@ -80,4 +118,48 @@ echo "HOWWELL_EXIT=\${rc}"; exit \$rc
 REMOTE
 rc=$?
 echo "=== how-well A/B exit=${rc} ==="
+
+# --- merged-artifact retrieval (unit-63 audit advisory (c): the artifact
+# never otherwise left the pod — this driver is the ONE place still able to
+# reach it, since the EXIT trap (rp_cleanup, installed by rp_init) tears the
+# pod down once THIS script itself exits). Mirrors gpu-dev.sh's own `pull`
+# subcommand's rsync invocation verbatim rather than inventing a second
+# retrieval mechanism. Best-effort and unconditional (pulled regardless of
+# ${rc} — a RED/RED_FOR_INVESTIGATION/INVALID run's own artifact is exactly
+# the evidence this campaign needs to keep, not less so than a GREEN one's).
+mkdir -p "$HOWWELL_ARTIFACT_DIR"
+if [ -n "${RP_HOST:-}" ] && [ -n "${RP_PORT:-}" ]; then
+  rsync -az -e "ssh ${RP_SSHO[*]} -p ${RP_PORT}" \
+    "root@${RP_HOST}:/root/jammi-ai/.finetune-run-ab-report/" "${HOWWELL_ARTIFACT_DIR}/" \
+    && echo "=== pulled merged how-well artifact -> ${HOWWELL_ARTIFACT_DIR} ===" \
+    || echo "::warning::merged how-well artifact pull failed -- ${rc} above is still authoritative; the pod is torn down on this script's own exit, so this evidence is now unrecoverable for this invocation."
+else
+  echo "::warning::no live pod (RP_HOST/RP_PORT unset) -- skipping artifact pull."
+fi
+
+# --- surface the merged status by NAME (unit-63 audit finding 1: "must exit
+# non-zero with the status named", not a bare exit code an operator has to
+# cross-reference against the pulled artifact to identify). Defensive: if
+# the remote's own exit code somehow read 0 despite a non-GREEN status (it
+# should not, per ab_merge.py's own finetune-run exit-code branch), force
+# non-zero here rather than let a mismatch pass silently.
+REPORT_JSON="$(find "$HOWWELL_ARTIFACT_DIR" -name finetune_run_ab_report.json 2>/dev/null | sort | tail -1)"
+if [ -n "$REPORT_JSON" ] && [ -f "$REPORT_JSON" ]; then
+  STATUS="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$REPORT_JSON" 2>/dev/null || echo "UNKNOWN")"
+  echo "=== merged status: ${STATUS} (${REPORT_JSON}) ==="
+  case "$STATUS" in
+    RED|RED_FOR_INVESTIGATION|INVALID)
+      echo "::error::how-well status=${STATUS} -- non-GREEN (CONTRACT 63 Frame's pre-registered decision rule, or a correctness-of-measurement problem)."
+      if [ "$rc" -eq 0 ]; then
+        echo "::error::remote exit was 0 but merged status=${STATUS} is non-GREEN -- forcing a non-zero exit."
+        rc=1
+      fi
+      ;;
+    GREEN|DRY_RUN|INCOMPLETE) : ;;
+    *) echo "::warning::how-well status=${STATUS} unrecognised." ;;
+  esac
+else
+  echo "::warning::no finetune_run_ab_report.json found under ${HOWWELL_ARTIFACT_DIR} -- cannot name the merged status."
+fi
+
 exit "$rc"

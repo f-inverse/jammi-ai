@@ -2370,6 +2370,11 @@ def self_test() -> int:
         "exclusion((1-eps) formula fragment): both '(1+eps)' and '(1-eps)' exclude cleanly",
         toks_of("the `(1+eps)`/`(1-eps)` dose-family shape") == [],
     )
+    check(
+        "exclusion((1-eps) formula fragment) adversarial: a measured value beside "
+        "'(1+eps)' is still found",
+        toks_of("measured 1.5 near (1+eps)") == ["1.5"],
+    )
 
     # --- round-23 audit F3: the remaining 20 of 31 `_EXTRA_EXCLUSIONS`
     # classes had NO self-test fixture at all, contradicting this module's

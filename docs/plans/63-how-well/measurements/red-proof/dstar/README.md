@@ -20,14 +20,15 @@ Acceptance 5's "mutant column proven RED (degradation)" is DISCHARGED at
 M = M_signflip_v2, per the amendment's honesty rider: M is a catastrophic
 mutant (held-out ~3.3 -> ~20 on 11 of 12 seeds), the detector's sensitivity
 ceiling; the corridor between M_nobc (undetected) and M_signflip_v2 remains
-unresolved and is not claimed. Stated honestly, per-seed: the committed
-artifact's own `mutant_dose_ladder.doses[0].per_seed` reads d_i from
-+0.179 (seed 2) to +20.087 (seed 9) — 11/12 seeds land in the +11.2..+20.1
-catastrophic range. Seed 2's +0.179 is the SMALLEST of the 12 mutant d_i
-values and is of the same ORDER as the primary A/B's own noise band
-(`d_values`, |d_i| up to 0.152, `cross_seed_spread` 0.0826) but sits OUTSIDE
-it (0.179 > 0.152, ~2.2 cross_seed_spread units) — degradation-concordant by
-sign, and by a margin the primary noise band cannot itself explain away, but
-not one of the catastrophic-range seeds. It is still counted RED (positive
-`d_i`, `n_pos` requires only the sign) and the sign-test verdict does not
-depend on magnitude, so the verdict above is unaffected.
+unresolved and is not claimed. Per-seed record, every number read from the
+committed artifact (round-17 discipline: mechanical facts only, no
+inferential characterization): `mutant_dose_ladder.doses[0].per_seed` d_i,
+sorted: +0.17900 (seed 2), then +11.19540 .. +20.08700 (the other 11
+seeds). The primary A/B's own `d_values` read max |d_i| = 0.15239 and
+`cross_seed_spread` = 0.08265. The only comparisons this record asserts:
+0.17900 > 0.15239, and 0.17900 is the smallest of the 12 mutant values.
+Seed 2 is degradation-concordant by SIGN — the only property the
+pre-registered rule counts (`n_pos` requires the sign; the sign test does
+not read magnitude) — so the verdict above is unaffected. Whether seed 2's
+magnitude exceeds what the primary noise band could produce is NOT
+adjudicated by this record and no claim about it is made.

@@ -28,6 +28,19 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import check_ci_guard_wiring as cgw  # noqa: E402
 
+# CI incident (run 33230050451, main, "Guard (arch validation freshness
+# self-test)"): `shutil.rmtree` during a `tempfile.TemporaryDirectory`'s
+# teardown can hit `OSError: [Errno 39] Directory not empty: '.git'` — a
+# race between tempdir cleanup and a background `git maintenance`/
+# `gc --auto` process the scratch repo below (`GuardWiringFixture.setUp`)
+# can spawn. `-c gc.auto=0 -c gc.autoDetach=false -c maintenance.auto=false`
+# kills the background writer AT THE SOURCE.
+_GIT_NO_BACKGROUND_MAINTENANCE = ("-c", "gc.auto=0", "-c", "gc.autoDetach=false", "-c", "maintenance.auto=false")
+
+
+def _scratch_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *_GIT_NO_BACKGROUND_MAINTENANCE, *args], cwd=cwd, check=True)
+
 
 class GuardWiringFixture(unittest.TestCase):
     """Base class: builds an isolated throwaway repo per test and patches
@@ -37,15 +50,13 @@ class GuardWiringFixture(unittest.TestCase):
     """
 
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name)
 
-        subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
-        subprocess.run(
-            ["git", "config", "user.email", "test@example.com"], cwd=self.root, check=True
-        )
-        subprocess.run(["git", "config", "user.name", "test"], cwd=self.root, check=True)
+        _scratch_git(["init", "-q"], self.root)
+        _scratch_git(["config", "user.email", "test@example.com"], self.root)
+        _scratch_git(["config", "user.name", "test"], self.root)
 
         self._orig = {
             "REPO_ROOT": cgw.REPO_ROOT,
@@ -70,7 +81,7 @@ class GuardWiringFixture(unittest.TestCase):
         return path
 
     def _git_add_all(self):
-        subprocess.run(["git", "add", "-A"], cwd=self.root, check=True)
+        _scratch_git(["add", "-A"], self.root)
 
     def _run_main(self):
         out, err = io.StringIO(), io.StringIO()

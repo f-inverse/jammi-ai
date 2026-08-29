@@ -195,6 +195,20 @@ def check_producer_parity(path: Path) -> list[str]:
     return []
 
 
+# CI incident (run 33230050451, main, "Guard (arch validation freshness
+# self-test)"), same class here: `shutil.rmtree` during a `tempfile.
+# TemporaryDirectory`'s teardown can hit `OSError: [Errno 39] Directory not
+# empty: '.git'` — a race between tempdir cleanup and a background `git
+# maintenance`/`gc --auto` process the scratch repo `self_test` builds below
+# can spawn. `-c gc.auto=0 -c gc.autoDetach=false -c maintenance.auto=false`
+# kills the background writer AT THE SOURCE.
+_GIT_NO_BACKGROUND_MAINTENANCE = ("-c", "gc.auto=0", "-c", "gc.autoDetach=false", "-c", "maintenance.auto=false")
+
+
+def _scratch_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *_GIT_NO_BACKGROUND_MAINTENANCE, *args], cwd=cwd, check=True)
+
+
 def run_gate(perf_dir: Path, repo_root: Path) -> list[str]:
     findings: list[str] = []
     for path in _tracked_sh_under(repo_root, "ci/scripts/"):
@@ -207,11 +221,11 @@ def run_gate(perf_dir: Path, repo_root: Path) -> list[str]:
 def self_test() -> int:
     failures: list[str] = []
 
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         repo = Path(tmp)
-        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
-        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        _scratch_git(["init", "-q"], repo)
+        _scratch_git(["config", "user.email", "test@example.com"], repo)
+        _scratch_git(["config", "user.name", "Test"], repo)
         perf = repo / "ci" / "scripts" / "perf"
         perf.mkdir(parents=True)
 
@@ -219,8 +233,8 @@ def self_test() -> int:
             p = repo / rel
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(text)
-            subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
-            subprocess.run(["git", "commit", "-q", "-m", rel], cwd=repo, check=True)
+            _scratch_git(["add", "-A"], repo)
+            _scratch_git(["commit", "-q", "-m", rel], repo)
             got = check_fn(p)
             if expect_hit is None:
                 if got:

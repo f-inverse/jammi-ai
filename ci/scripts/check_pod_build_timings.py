@@ -111,7 +111,20 @@ class ArtifactError(Exception):
     """Uncomputable input (parse failure, missing dir) — fails closed."""
 
 
+# Same class as the CI incident that hit `check_arch_validation_freshness.py`
+# (run 33230050451, main, "Guard (arch validation freshness self-test)"):
+# `shutil.rmtree` during a `tempfile.TemporaryDirectory`'s teardown can hit
+# `OSError: [Errno 39] Directory not empty: '.git'` — a race between tempdir
+# cleanup and a background `git maintenance`/`gc --auto` process this file's
+# own scratch-repo `git init`/`add`/`commit`/`clone` calls below can spawn.
+# `-c gc.auto=0 -c gc.autoDetach=false -c maintenance.auto=false` kills the
+# background writer AT THE SOURCE for every git invocation this file makes.
+_GIT_NO_BACKGROUND_MAINTENANCE = ("-c", "gc.auto=0", "-c", "gc.autoDetach=false", "-c", "maintenance.auto=false")
+
+
 def _run(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess:
+    if cmd and cmd[0] == "git":
+        cmd = ["git", *_GIT_NO_BACKGROUND_MAINTENANCE, *cmd[1:]]
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
 
 
@@ -389,7 +402,7 @@ def _write_ancestry_fixture_repo(tmp: Path) -> dict[str, str]:
 def self_test() -> int:
     failures: list[str] = []
 
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         repo_root = Path(td)
         shas = _write_ancestry_fixture_repo(repo_root)
         timings_dir = repo_root / "ci" / "artifacts" / "pod-build-timings"
@@ -595,7 +608,7 @@ def self_test() -> int:
         write("good2.json", good())
         _run(["git", "add", "ci/artifacts/pod-build-timings/good2.json"], repo_root)
         _run(["git", "commit", "-q", "-m", "shallow-guard fixture"], repo_root)
-        with tempfile.TemporaryDirectory() as td2:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td2:
             clone_dir = Path(td2) / "shallow-clone"
             # `file://` is REQUIRED to force a genuine shallow clone: a bare
             # local filesystem path silently IGNORES --depth ("--depth is

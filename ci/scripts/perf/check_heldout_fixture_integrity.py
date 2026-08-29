@@ -41,11 +41,13 @@ Checks:
    SHA-256 for the vendored subset ids file anywhere (a
    `arxiv_subset_ids_sha256` key at the top level or nested under
    `provenance`), it must match a fresh SHA-256 of the committed
-   `arxiv_subset_ids.txt` bytes. Today's committed `manifest.json` records
-   no such key (only the file's PATH, as a provenance citation) -- this
-   check is a no-op until a future manifest adds one, never a silent
-   skip-without-a-reason (the finding names exactly which key it looked
-   for).
+   `arxiv_subset_ids.txt` bytes. The committed `manifest.json` records this
+   key under `provenance.arxiv_subset_ids_sha256` (unit-63 audit advisory
+   (c) -- previously it recorded only the file's PATH, as a provenance
+   citation, with no content check at all), so this check is now ACTIVE on
+   the real fixture, not merely a no-op standing by for a future manifest --
+   a producer that vendors a stale/tampered subset-ids file now fails this
+   gate loudly rather than silently.
 
 Run: `python3 ci/scripts/perf/check_heldout_fixture_integrity.py`
 Self-test: `python3 ci/scripts/perf/check_heldout_fixture_integrity.py --self-test`
@@ -308,14 +310,27 @@ def self_test() -> int:
         if not any("arxiv_subset_ids_sha256" in f and "does not match" in f for f in findings5):
             failures.append(f"RED(5) subset-sha case expected a mismatch finding, got {findings5}")
 
-        # GREEN control (5): manifest records NO arxiv_subset_ids_sha256 key
-        # at all (today's real committed manifest.json's own shape) -- must
-        # be a no-op, never a finding.
+        # GREEN control (5a): manifest records NO arxiv_subset_ids_sha256 key
+        # at all (a legacy manifest shape, predating unit-63 audit advisory
+        # (c)) -- must be a no-op, never a finding.
         green5 = _write_fixture(
             tmp / "green_no_subset_pointer", heldout_pairs=_SYNTH_HELDOUT, train_rows=_SYNTH_TRAIN_ROWS)
         findings_green5 = run_gate(green5)
         if findings_green5:
-            failures.append(f"GREEN(5) no-pointer-recorded case unexpectedly RED: {findings_green5}")
+            failures.append(f"GREEN(5a) no-pointer-recorded case unexpectedly RED: {findings_green5}")
+
+        # GREEN control (5b): manifest records a MATCHING arxiv_subset_ids_sha256
+        # -- today's real committed manifest.json's own shape (unit-63 audit
+        # advisory (c)) -- must clear the check, never a false finding.
+        green5b = _write_fixture(
+            tmp / "green_matching_subset_pointer", heldout_pairs=_SYNTH_HELDOUT, train_rows=_SYNTH_TRAIN_ROWS,
+            write_subset_ids=True)
+        manifest_5b = json.loads((green5b / "manifest.json").read_text())
+        manifest_5b["arxiv_subset_ids_sha256"] = _file_sha256(green5b / "arxiv_subset_ids.txt")
+        (green5b / "manifest.json").write_text(json.dumps(manifest_5b, indent=2, sort_keys=True))
+        findings_green5b = run_gate(green5b)
+        if findings_green5b:
+            failures.append(f"GREEN(5b) matching-pointer case unexpectedly RED: {findings_green5b}")
 
     # End-to-end: the REAL committed fixture must be clean today.
     real_findings = run_gate(FIXTURE_DIR)
@@ -330,8 +345,9 @@ def self_test() -> int:
     print(
         "check-heldout-fixture-integrity self-test: OK -- id-order equality, "
         "heldout_ids_sha256 recomputation, dataset_sha256 recomputation, NOTICE presence, and "
-        "the (currently-unrecorded) arxiv_subset_ids_sha256 pointer all bite on throwaway "
-        "fixtures; the real committed fixture is clean."
+        "the arxiv_subset_ids_sha256 pointer (now recorded under manifest.json's own "
+        "provenance, unit-63 audit advisory (c)) all bite on throwaway fixtures; the real "
+        "committed fixture is clean."
     )
     return 0
 

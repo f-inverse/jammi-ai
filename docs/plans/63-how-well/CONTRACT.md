@@ -150,3 +150,38 @@ the committed hashes are the trust surface, the network is not); any mismatch is
 refusal before any leg runs. "No network" is thereby narrowed to: no network during
 measured legs, and no unverified content ever. dataset_sha256 remains reconstructable from
 checkout + verified content. The H5 campaign runs the provisioning step once per pod.
+
+## Amendment 2026-08-29 (docs-ci, unit-63 re-audit round-2, finding 5): FinetuneRunTier
+## identity reshape — 32 fields, not H4's original 35
+
+H4's own `FinetuneRunTier::IDENTITY_FIELDS` list above ("superset of the existing 18 +
+epochs, lr, schedule, warmup_steps, weight_decay, grad-accum, validation_fraction,
+split_rule+seed, dataset_sha256, heldout_ids_sha256, heldout_batch_partition_sha256,
+embedding_loss+temp, matryoshka_dims, early_stopping patience+metric, eval_cadence") is
+WRONG-WHEN-WRITTEN as of this amendment — kept verbatim above, superseded here. The
+unit-63 adversarial-audit's finding 5 (identity-completeness) reshaped the actual set from
+35 entries to 32 (`ci/scripts/perf/identity_fields.py::FINETUNE_RUN_IDENTITY_FIELDS`,
+mirroring `crates/jammi-bench/src/report.rs`'s `FinetuneRunTier::IDENTITY_FIELDS` exactly):
+
+- ADDED: `heldout_pairs_sha256` — sha256 of the `--heldout-jsonl` file's own bytes, measured
+  at load; the held-out fixture's TEXT is a total determinant of every per-example loss
+  `d_i` and was hashed nowhere before this fix (only the id ORDER, via `heldout_ids_sha256`,
+  was anchored).
+- RENAMED: `dataset_sha256` → `train_pairs_file_sha256` — the old name collided with the
+  committed fixture manifest's OWN `dataset_sha256` (a Merkle digest over per-pair content
+  hashes, built off-process), a DIFFERENT quantity under the SAME spelling, so neither
+  anchored the other. The new name states exactly what it hashes: the `--train-jsonl`
+  file's own raw bytes, measured off the file this run actually read.
+- MOVED TO PROVENANCE: `split_rule`, `batched_forward`, `steps_measured` — none could vary
+  independently of an already-admitted field or a build-time constant (`split_rule` is a
+  hardcoded literal, `batched_forward` is always `true`, `steps_measured` is a MEASURED
+  outcome of running, not a premise the run was configured under).
+- DROPPED: `split_seed` — a pure, literal duplicate of `seed` (the split function takes no
+  separate seed parameter).
+- KEPT despite also being a pure function of already-identity inputs:
+  `heldout_batch_partition_sha256` (a genuine cross-arm equality guard against the
+  partitioning ALGORITHM diverging, not a redundant echo of inputs).
+
+Net: 35 − 4 (`split_rule`, `split_seed`, `batched_forward`, `steps_measured`) + 1
+(`heldout_pairs_sha256`) = 32. Contract and code now agree; this amendment is the record of
+that reconciliation, never a further code change.

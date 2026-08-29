@@ -3052,6 +3052,16 @@ impl ModernBert {
         self.final_norm.set_training(training);
     }
 
+    /// Read-only accessor for the aggregate training-mode flag
+    /// [`Self::set_training`] propagates to every layer (audit round 63,
+    /// re-audit finding 1 — added so `jammi-ai`'s trainer can assert the
+    /// encoder body's REAL state at a call site, rather than trusting a
+    /// same-crate mirror it derived from an assumption about how this type
+    /// gets constructed).
+    pub fn is_training(&self) -> bool {
+        self.training
+    }
+
     /// Restore LoRA `A`/`B` tensors from a `named_trainable_weights`-shaped map.
     /// Missing keys are silently skipped — see
     /// [`MaybeLoraLinear::load_weights`].

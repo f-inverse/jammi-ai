@@ -312,15 +312,29 @@ comparison.
    ALLOFF-reuse rule) using the gate's own merger and its own
    `>=11/12+mean` sign-test statistic — the same code path the real A/B
    verdict uses, not a bespoke mutant-vs-fused comparison.
-6. Record, per dose leg, in the column artifact:
-   - `base_sha` = the scratch checkout's base sha (`ca559b4f16cd1129a2f95ccdd82288b3418e0d0a` or `cba0b835`)
-   - `patch_sha256` = the dose's recorded sha256 above
+6. Record each dose leg's own provenance via the **three producer-stamped
+   CLI flags**, passed to that leg's `run_leg` invocation itself — this is
+   the ONLY mechanism by which a mutant leg's provenance is recorded; no
+   artifact is ever hand-edited to add or correct these fields, ever:
+   - `--mutant-id <M_eps_...>` — this dose's own patch identifier.
+   - `--mutant-base-sha <base sha>` — the scratch checkout's base sha
+     (`ca559b4f16cd1129a2f95ccdd82288b3418e0d0a` or `cba0b835`).
+   - `--mutant-patch-sha256 <sha256>` — the dose's recorded sha256 above.
+
+   These stamp the leg's own `FinetuneRunTier` report with
+   `mutant_id`/`mutant_base_sha`/`mutant_patch_sha256` (serde-skipped when
+   absent — a non-mutant leg carries none of the three), which
+   `ab_merge.finetune_run_mutant_column_violations` then checks are present
+   and that `mutant_patch_sha256` agrees with the dose column's own
+   caller-supplied `patch_sha256`. Separately, choose:
    - `dose_label = eps-0.50` / `eps-0.10` / `eps0.50` (operator-chosen
      string per the merger's `--mutant-legs DOSE_LABEL:PATCH_SHA256:SEEDS`
      convention — never `eps0.02`/`eps0.10`, which are not scheduled)
-   - the same held-out-loss / step-count / dispatch-counter fields the
-     clean fused legs record, so each dose column is diff-able against the
-     `alloff`/fused columns field-for-field.
+
+   Every other field a clean fused leg already records (held-out-loss /
+   step-count / dispatch-counter fields) is recorded exactly as it always
+   is, so each dose column is diff-able against the `alloff`/fused columns
+   field-for-field.
 7. The reported sensitivity is the pair of ADJACENT doses straddling
    detection (per amendment item 3 and addendum 2026-08-29c) — run the
    scheduled ladder in ascending `eps` order (`-0.50`, `-0.10`, `+0.50`) and
@@ -449,10 +463,13 @@ separate record.
   on. `dose_label` is an operator-chosen string (e.g. `"eps0.02"`), never
   reinterpreted by the merger.
 - **Per-leg recorded fields**: every field a clean `fused` leg already
-  carries, PLUS this section's own three (`mutant_id`, `base_sha`,
-  `patch_sha256`, step 5 above) — a mutant leg missing any of the three, or
-  whose own `patch_sha256` disagrees with the dose column it is merged
-  under, is refused (`ab_merge.finetune_run_mutant_column_violations`).
+  carries, PLUS this section's own three producer-stamped fields
+  (`mutant_id`/`mutant_base_sha`/`mutant_patch_sha256`, serde-skipped when
+  absent — the on-pod procedure's own step 6 `--mutant-id`/
+  `--mutant-base-sha`/`--mutant-patch-sha256` CLI flags, never hand-edited
+  into the artifact) — a mutant leg missing any of the three, or whose own
+  `mutant_patch_sha256` disagrees with the dose column it is merged under,
+  is refused (`ab_merge.finetune_run_mutant_column_violations`).
 - **Merger CLI**: `ab_merge.py finetune-run RAW_DIR OUT_DIR SEEDS
   [LR0_SEEDS] [--allow-missing-lr0-control] [--mutant-legs
   DOSE_LABEL:PATCH_SHA256:SEED1,SEED2,...]` — `--mutant-legs` is repeatable,

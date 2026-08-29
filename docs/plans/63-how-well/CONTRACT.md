@@ -256,3 +256,28 @@ Pressure-tested (rule 9) before this amendment; the findings it encodes:
    decaying LR schedules stay disabled for this tier until the resume-cycle LR-horizon
    defect (total_steps recomputed per cycle) is fixed — the campaign's constant/0-warmup
    setting is unaffected.
+
+## Addendum 2026-08-29c (lead): signed dose family — the prediction table falsified the positive-eps direction pre-spend
+
+Amendment 2026-08-29b item 3 named eps in {0.02, 0.10, 0.50} (update scale 1+eps). The
+REQUIRED pre-spend prediction table (mutants/README.md, derived solely from the committed
+campaign-v1 measurements) predicts the (1+eps) direction as held-out IMPROVEMENT, not
+degradation — the lr0-vs-trained secant slope is positive for both measured seeds, so more
+effective lr lowers held-out loss over this range. A positive-eps dose therefore cannot
+discharge "mutant column proven RED (degradation)". This is the prediction discipline
+working: the design is falsified BEFORE the spend, on committed data, not after it.
+
+Resolution (still pre-spend, still one monotone one-parameter family — update scaled by
+(1+eps), eps now SIGNED): the ladder becomes eps in {-0.50, -0.10, +0.50}.
+- Negative doses (silent lr DEFLATION — the undertrained-regression class) carry the
+  predicted degradation direction (secant symmetric: predicted per-seed shift
+  +|eps|*slope_seed, sign-consistent across both measured seeds).
+- +0.50 is retained deliberately as the two-sided falsification cell for the improvement
+  prediction itself (if it reads RED_FOR_INVESTIGATION-shaped improvement, the prediction
+  is confirmed; if it degrades, the secant extrapolation is refuted and the README must
+  record that).
+- Acceptance 5's "mutant column proven RED" is discharged by the smallest detected
+  DEGRADATION dose (expected among the negative eps values); the reported sensitivity is
+  the adjacent-dose pair straddling detection within the negative branch.
+Patches M_eps_-0.10 / M_eps_-0.50 are cut from the same single-constant template; the
+prediction table gains their rows (same arithmetic, committed data only) before any leg runs.

@@ -236,6 +236,105 @@ default reports TRAIN loss as `final_loss`), a non-hinge objective or a measured
 bench's hinge saturates to `loss_last == 0.0` on both arms at the shapes tried), and a calibration run
 before any acceptance gate may be built.
 
+## C16 — Supersession record (docs-ci, 2026-08-29): preconditions discharged by unit 63
+
+C16's own text above is unedited and stays the standing record of the design study. This
+entry is an append-dated supersession: it discharges each of C16's stated preconditions
+against unit 63's shipped, committed artifacts, citing artifact-backed, ancestry-true shas
+(`git merge-base --is-ancestor <sha> 82253c1b` verified for every sha cited below, `82253c1b`
+itself being `feat/63-how-well`'s tip).
+
+**Precondition 0 — `recall@10` has no dynamic range.** RESTATED, not overturned, with its
+producer: `method_recall_spread = 0.009` (`graph_declared` 0.5485 best, `triplet` 0.5395
+worst, `base_recall_at_10 = 0.538`, all `tol = 0.03`) measured across six fine-tune loss
+methods (`cosent`, `mnrl_t0.05`, `mnrl_t0.20`, `triplet`, `matryoshka`, `graph_declared`) —
+producer `cookbook/book/scripts/build_finetune_cache.py` (the `spread = best - worst` on
+`recall_at_10` block), writing `cookbook/book/artifacts/finetune/methods.json` +
+`cookbook/book/artifacts/finetune/golden_metrics.json` (`method_recall_spread` key),
+cross-checked by `cookbook/book/tests/test_finetune_cache.py` and surfaced in
+`cookbook/book/chapters/08-finetune-methods/finetune-methods.qmd`
+(`rails.measure("finetune.method_recall_spread", ...)`). `recall@10` remains a dead-range
+instrument today; unit 63 never rehabilitated it — it built the held-out-loss statistic C16
+called for instead (preconditions 1–4 below).
+
+**Precondition 1 — "a new public per-pair evaluation seam (`Trainer::evaluate` is private
+today)".** DISCHARGED: `Trainer::evaluate_held_out` is `pub fn` at
+`crates/jammi-ai/src/fine_tune/trainer.rs:2636`; the per-pair/per-example wire types
+`ExampleLoss` (`crates/jammi-wire/src/fine_tune.rs:585`) and `HeldOutLoss`
+(`crates/jammi-wire/src/fine_tune.rs:640`, carrying `tie_fraction`,
+`batch_partition_sha256`, `in_batch_negatives_per_example`) exist and are exercised by every
+artifact cited under precondition 4 below. Ancestry: `82253c1b` (the branch tip itself).
+
+**Precondition 2 — "a non-default early-stopping metric (the default reports TRAIN loss as
+`final_loss`)".** DISCHARGED, but the parenthetical is recorded WRONG-WHEN-WRITTEN: `ValLoss`
+has been `EarlyStoppingMetric`'s `Default` since `7deadd4b79e86489bc104c10feb407db484a39ad`
+(author date 2026-04-30 — `impl Default for EarlyStoppingMetric { fn default() -> Self {
+Self::ValLoss } }`, and `FineTuneConfig::default()` sets
+`early_stopping_metric: EarlyStoppingMetric::ValLoss`, in
+`crates/jammi-ai/src/fine_tune/mod.rs`); `3b8c0978d36386c212d5d63dee76b880fb735ced`
+(2026-06-10) only RELOCATED that already-defaulted enum verbatim from
+`crates/jammi-ai/src/fine_tune/mod.rs` to `crates/jammi-wire/src/fine_tune.rs` (byte-identical
+`ValLoss`-default impl, moved crates, never touched) as part of the candle-free wire-crate
+split; C16 itself landed `9b7a39824188d946a847d910172b9f8964ace14c` (2026-08-26). The default
+early-stopping metric therefore never reported TRAIN loss as `final_loss` at any point C16
+could have observed. Unit 63 sidesteps the question regardless of the parenthetical's error:
+the pre-registered decision rule disables early stopping entirely
+(`early_stopping_patience: 10_000` both arms, `docs/plans/63-how-well/CONTRACT.md`'s own
+Frame) and `evaluate_held_out` computes a NEW final-epoch example-mean quantity that never
+reads `early_stopping_metric` at all.
+
+**Precondition 3 — "a non-hinge objective or a measured tie fraction (the bench's hinge
+saturates to `loss_last == 0.0` on both arms at the shapes tried)".** DISCHARGED: the
+pre-registered step-0 probe (`docs/plans/63-how-well/measurements/campaign-v1/README.md`,
+`probe/`) ruled triplet INADMISSIBLE (`tie_fraction 0.65625 > the 0.5 cap`) and selected MNRL
+— a non-hinge, in-batch-negative contrastive objective — as the tier's default. Every
+campaign-v2 leg's measured `held_out_tie_fraction` is `0.0` (well under the cap), e.g.
+`docs/plans/63-how-well/measurements/campaign-v2/finetune_run_ab_report.json`,
+`per_seed."1".trajectory.fused[*].held_out_tie_fraction`.
+
+**Precondition 4 — "a calibration run before any acceptance gate may be built".**
+DISCHARGED: `docs/plans/63-how-well/measurements/campaign-v2/` at `494fb3e3e7c6903fd94096332a89e4e6109a1a6f`
+is the committed calibration/floor + A/B artifact — `status: GREEN`, `clean_seed_count`
+12/12, determinism floor exactly `0.0` (every r1/r2 pair bit-identical), cross-seed spread
+`0.08264997071681932`, two-sided sign test `n_pos=4, n_neg=8, p=0.3876953125` (exact
+`1588/4096`) — both amendment-2026-08-29b predictions confirmed bit-identically before the
+run was interpreted (`campaign-v2/README.md`). C16's lift condition is measured, GREEN,
+under this pre-registered rule.
+
+**Detector demonstration (beyond C16's own preconditions, in support of the decision
+rule's sensitivity claim):** the signed dose ladder at
+`e340391c0612227b04c534b7d0c115b3121b46a5`
+(`docs/plans/63-how-well/measurements/dose-ladder/`) shows 11/12 sign-concordance at
+`p = 13/2048 = 0.00635 < alpha2 (0.0064)` on a real `|mean_d| ~ 0.04-0.07` effect — the
+instrument detects sign-consistent shifts at this magnitude (in the improvement direction;
+the secant's predicted degradation direction was refuted by the same run, recorded as
+`dose_anomalies`, out of scope for the fused-vs-alloff question).
+
+**RED-proof mutant column (acceptance-5's "mutant column proven RED"):** discharged at
+`82253c1b5091a3cc1a32b808f5d81a2c6b012969` (this branch's own tip; artifact
+`docs/plans/63-how-well/measurements/red-proof/dstar/`) — `redproof-signflip-v2` reads
+`detected: RED`, 12/12 concordant, two-sided `p = 2/4096 = 1/2048 (0.00048828125)`,
+`red_proof_verdict: PROVEN`, merge exit 0. HONESTY RIDER, carried forward and never
+overclaimed: this discharges acceptance 5 at `M = M_signflip_v2`, a CATASTROPHIC mutant
+(held-out ~3.3 → ~20) — the detector's SENSITIVITY CEILING, not a bound near the operating
+point; the corridor between `M_nobc` (undetected) and `M_signflip_v2` remains UNRESOLVED and
+is not claimed by this record (`docs/plans/63-how-well/CONTRACT.md`, Amendment 2026-08-29e).
+
+**True residuals (not discharged, current locations at `82253c1b`):**
+- `TrainingResult::final_loss` still equals `best_val_loss`, a min-over-epochs order
+  statistic — the running minimum is assigned at
+  `crates/jammi-ai/src/fine_tune/trainer.rs:1016-1017` (`if monitor_loss < best_val_loss {
+  best_val_loss = monitor_loss; ... }`) and read into the result at
+  `crates/jammi-ai/src/fine_tune/trainer.rs:1087` (JSON) and `:1097` (struct field). The H1
+  seam sidesteps this by computing `evaluate_held_out`'s example-mean as a NEW quantity
+  (never derived from `final_loss`); `final_loss` itself was never changed to report a true
+  final-epoch value.
+- The multi-device parallel-training path never touches the held-out seam at all:
+  `crates/jammi-ai/src/pipeline/parallel_train.rs:166` (`final_loss: last_epoch_loss,`)
+  unconditionally reports the last epoch's TRAIN-loss average, regardless of
+  `early_stopping_metric`. This path does not call `evaluate_held_out`, has no
+  `tie_fraction`, and is not gated by any acceptance rule H1–H5 established.
+
 ## §6 — F1, the bind-rate floor (amended; lead decision, audit round 2 / A4)
 
 The original phase-3 acceptance text ("≥ 50 V cells and ≥ 3 fully-bound tables") is NOT met by the

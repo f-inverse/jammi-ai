@@ -22,13 +22,13 @@ All four pre-registered predictions confirmed to the bit:
 
 Acceptance 5's "mutant column proven RED (degradation)" is DISCHARGED at
 M = M_signflip_v2, per the amendment's honesty rider: M is a catastrophic
-<!-- claims63: c1=ledger; c2=ledger; c3=ledger; c4=ledger -->
+<!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/dstar/finetune_run_ab_report.json; c1=ledger; c2=ledger; c3=absdiff(#/mutant_dose_ladder/doses/0/gate_seed_count, 1); c4=#/mutant_dose_ladder/doses/0/gate_seed_count -->
 mutant (held-out ~3.3 -> ~20 on 11 of 12 seeds), the detector's sensitivity
 ceiling; the corridor between M_nobc (undetected) and M_signflip_v2 remains
 unresolved and is not claimed. Per-seed record, every number read from the
 committed artifact (round-17 discipline: mechanical facts only, no
 inferential characterization): `mutant_dose_ladder.doses[0].per_seed` d_i,
-<!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/dstar/finetune_run_ab_report.json; c1=#/mutant_dose_ladder/doses/0/per_seed/2/d_i; c2=min(#/mutant_dose_ladder/doses/0/per_seed, '2'); c3=max(#/mutant_dose_ladder/doses/0/per_seed, '2'); c4=ledger -->
+<!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/dstar/finetune_run_ab_report.json; c1=#/mutant_dose_ladder/doses/0/per_seed/2/d_i; c2=min(#/mutant_dose_ladder/doses/0/per_seed, '2'); c3=max(#/mutant_dose_ladder/doses/0/per_seed, '2'); c4=absdiff(#/mutant_dose_ladder/doses/0/gate_seed_count, 1) -->
 sorted: +0.17900 (seed 2), then +11.19540 .. +20.08700 (the other 11
 <!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/dstar/finetune_run_ab_report.json; c1=max(#/d_values) -->
 seeds). The primary A/B's own `d_values` read max |d_i| = 0.15239 and

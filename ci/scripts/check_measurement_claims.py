@@ -44,7 +44,7 @@ gate fails closed on its OWN errors too — an unresolvable path, a JSON parse
 error, a missing artifact, or an ambiguous binding is a FINDING, never
 skipped).
 
-EXPR GRAMMAR (closed; six forms + `hist` + `ledger`; anything else is a
+EXPR GRAMMAR (closed, FULL enumeration below; anything else is a
 `ClaimParseError`, never a silent pass):
   <path>#/<rfc6901-pointer>        a JSON pointer (path relative to repo
                                     root, or bare `#/...` under `default=`).
@@ -52,10 +52,20 @@ EXPR GRAMMAR (closed; six forms + `hist` + `ledger`; anything else is a
                                     E resolves to a dict/list of JSON
                                     numbers (e.g. a `per_seed` map or a
                                     `d_values` map); the aggregate is taken
-                                    over every numeric LEAF under E.
+                                    over every numeric LEAF under E (`max`/
+                                    `min` take the leaf's ABSOLUTE value —
+                                    a magnitude claim over a committed
+                                    artifact's own leaves; contrast
+                                    `maxd`/`mind` below, which are SIGNED
+                                    and operate over raw-recipe deltas, not
+                                    artifact leaves). An optional second arg
+                                    (a quoted top-level key) is excluded
+                                    from the aggregate before it runs — the
+                                    "the OTHER N seeds" idiom.
   count(E, '>0' | '<0' | 'len')     count of leaves satisfying the sign
                                     predicate, or the leaf/list count.
-  poscount(globA, globB, field) / negcount(...) / meand(globA, globB, field)
+  poscount(globA, globB, field) / negcount(...) / meand(...) / maxd(...) /
+  mind(...) / zerocount(...) / paircount(globA, globB, field)
                                     THE RAW-CONCORDANCE RECIPE: pairs every
                                     file matching globA with the file in
                                     globB sharing the SAME embedded seed
@@ -69,20 +79,58 @@ EXPR GRAMMAR (closed; six forms + `hist` + `ledger`; anything else is a
                                     free value independently, compare"
                                     discipline rule (h)'s P3/precedence
                                     checks apply, just over raw legs instead
-                                    of a merged field), then reports the
-                                    positive/negative sign count or the
-                                    mean over all pairs.
+                                    of a merged field), then reports:
+                                    `poscount`/`negcount` the positive/
+                                    negative sign count; `zerocount` the
+                                    EXACT-zero count (a "N/M bit-identical"
+                                    claim — neither positive nor negative,
+                                    so deliberately its own function, not a
+                                    derived complement of the other two);
+                                    `meand` the SIGNED mean; `maxd`/`mind`
+                                    the SIGNED max/min over all pairs (a raw
+                                    d-column's own stated endpoint, e.g.
+                                    "effects to +X" — signed, unlike the
+                                    unrelated `max(E)`/`min(E)` pointer
+                                    aggregates above); `paircount` the
+                                    number of matched pairs itself (the
+                                    denominator every other member of this
+                                    family shares).
   code(label, step)                 a pointer into THIS FILE's OWN nearest
                                     preceding fenced ``` code block, parsed
-                                    as `<label>:` sections of
-                                    `step=N l2_divergence=X` lines — the
-                                    doc-internal, self-referential artifact
-                                    the CPU-verifiable-demonstration table
-                                    cites (never committed as a separate
+                                    as `<label>:` or `eps=<label> (...):`
+                                    sections of `step=N l2_divergence=X`
+                                    lines — the doc-internal,
+                                    self-referential artifact the
+                                    CPU-verifiable-demonstration tables
+                                    cite (never committed as a separate
                                     JSON; the fenced block IS the committed
                                     artifact for these numbers).
-  rel(A, OP, B)                     OP in {'>','<','>=','<=','=='}; A/B are
-                                    themselves exprs from this grammar,
+  numer(D, E) / denom(N, E)         an exact rational restatement of an
+                                    already-resolved E (e.g. doc prose
+                                    "p = 2/4096 = 0.00048828125"): `numer`
+                                    derives the numerator `round(E*D)`,
+                                    `denom` the denominator `round(N/E)` —
+                                    both exact integer arithmetic, so a
+                                    wrong numerator/denominator FAILS at
+                                    0-decimal-place precision, never
+                                    silently rounds away. E is itself any
+                                    expr from this grammar (a pointer, or a
+                                    literal-only `ratio(...)`, letting a
+                                    doc-internal fraction like "2/4096 =
+                                    1/2048" be cross-checked without an
+                                    artifact pointer at all).
+  ratio(A, B) / absdiff(A, B)       A/B and |A-B|, full precision; A and B
+                                    are each EITHER an expr from this
+                                    grammar OR a bare Decimal literal (a
+                                    rule PARAMETER/design constant, e.g.
+                                    verifying a stated ratio like
+                                    "0.10 / 0.02 = 5" against the literal
+                                    inputs themselves, or deriving an exact
+                                    count like "N total legs minus M clean
+                                    legs" from two independently-bound
+                                    pointers/recipes).
+  rel(A, OP, B)                     OP in {'>','<','>=','<=','==','!='}; A/B
+                                    are themselves exprs from this grammar,
                                     compared at FULL PRECISION (the
                                     resolved Decimal, never the printed
                                     rounding) — B MAY be a bare numeric
@@ -104,25 +152,61 @@ EXPR GRAMMAR (closed; six forms + `hist` + `ledger`; anything else is a
                                     red-proof/README.md's pre-amendment
                                     stands-as-is note, and mutants/
                                     README.md's M1/M_signflip-v1 retirement
-                                    notes all rely on) — punishing a
-                                    quotation as though it were a live claim
-                                    would make the correction discipline
-                                    itself un-writable.
+                                    notes all rely on — including a value
+                                    quoted ONLY to be explicitly rejected,
+                                    e.g. "the exact two-sided tail — NEVER
+                                    1/4096": the rejected fraction is a
+                                    quotation for contrast, not a claim)
+                                    — punishing a quotation as though it
+                                    were a live claim would make the
+                                    correction discipline itself
+                                    un-writable.
+  const                             RULE-PARAMETER/PREDICTION marker —
+                                    binds to NOTHING, same "consumes a tag
+                                    slot, no binding attempted" treatment
+                                    as `hist`, but semantically distinct: a
+                                    stated design constant (a formula
+                                    coefficient, a dose LABEL, an
+                                    Adam-bias-correction multiplier
+                                    evaluated by hand at a fixed step —
+                                    values this closed grammar has no
+                                    exponentiation/formula-evaluation
+                                    primitive to recompute) or a
+                                    PRE-REGISTERED PREDICTION (a value
+                                    explicitly labeled "predicted", stated
+                                    BEFORE the run it forecasts, from a
+                                    hand-fit secant/linear-extrapolation
+                                    model over already-bound operating-point
+                                    data — never itself a fresh measurement
+                                    to reconcile against a committed
+                                    artifact). Under the SAME shrink-only
+                                    ratchet as `ledger`
+                                    (`--check-allowlist-only-shrinks`
+                                    covers both), so a doc author cannot
+                                    silently reclassify a real measurement
+                                    as `const` to dodge binding.
   ledger                            ESCAPE — cross-checked against
                                     `ci/measurement_claims_allowlist.txt`
                                     (own shrink-only ratchet,
                                     `--check-allowlist-only-shrinks`,
                                     exact `check_allowlist_only_shrinks`
-                                    shape reused). The raw pre-gate
-                                    sign-test numbers this module's OWN
-                                    `poscount`/`meand` recipe cannot reach
-                                    (mutants/README.md's deliberately
-                                    non-committed CPU-demo eps=0.02 leg
-                                    numbers already live in the fenced
-                                    block and ARE covered by `code()`; the
-                                    handful of genuinely uncomputable
-                                    figures are ledgered, never silently
-                                    dropped).
+                                    shape reused). Reserved for figures this
+                                    module's OWN recipe/pointer machinery
+                                    genuinely cannot reach — a CLI/shell
+                                    exit code (never written to any
+                                    committed JSON), a product of two
+                                    independently-bound factors (no
+                                    multiplication primitive in this
+                                    grammar), or a sum of two independent
+                                    `paircount` legs (no addition
+                                    primitive) — each ledger entry's
+                                    trailing `# <note>` (see the allowlist
+                                    file's own header) states WHICH of
+                                    these classes applies; a token that IS
+                                    reachable by an existing pointer or
+                                    recipe function is never ledgered — see
+                                    the allowlist file for the full,
+                                    per-entry disposition.
 
 EQUALITY (reused idiom, generalized for scientific notation). The doc token
 is parsed as `Decimal` (native to both plain and `1.23e-4` scientific
@@ -258,18 +342,32 @@ CLAIM_ZONES: dict[str, list[tuple[int, int]]] = {
     "docs/plans/63-how-well/measurements/red-proof/dstar/README.md": [(3, 48)],
     "docs/plans/63-how-well/mutants/README.md": [
         (13, 39),  # M1 measured-record
-        (435, 455),  # CPU-verifiable demonstration: ratio/absdiff claims
+        (227, 258),  # Step 3: predicted-detection benchmarks + prediction
+        # table (round-20 audit finding: previously a zone HOLE despite
+        # being claim-bearing — the "Committed benchmarks" bullets cite
+        # real artifact fields; the prediction-table body is PRE-REGISTERED
+        # FORECAST content, `const`-shaped, not a fresh measurement).
+        (447, 467),  # CPU-verifiable demonstration: ratio/absdiff claims
         # (a fenced ``` block a few lines above this one, and two more
         # inside the ranges below, are the committed artifacts `code()`
         # resolves against — never themselves claim-bearing; excluded by
         # construction since a zone boundary here never spans a fence).
-        (670, 709),  # M_nobc measured + gated
-        (712, 757),  # M_signflip v1 inert record
-        (819, 857),  # M_signflip_v2 prediction bounds
-        # (858-869 is the CPU-demo preamble + its own fenced ``` block —
-        # not itself claim-bearing, same reasoning as the eps-family one).
-        (870, 903),  # M_signflip_v2 CPU comparison + measured
-        (994, 1026),  # merged-artifact-field citations + D* discharge summary
+        (682, 721),  # M_nobc measured + gated
+        (724, 769),  # M_signflip v1 inert record
+        (831, 869),  # M_signflip_v2 prediction bounds
+        # (the CPU-demo preamble + its own fenced ``` block immediately
+        # after this range is not itself claim-bearing, same reasoning as
+        # the eps-family one).
+        (882, 915),  # M_signflip_v2 CPU comparison + measured
+        (1006, 1038),  # merged-artifact-field citations + D* discharge summary
+        (1101, 1101),  # Files: M_nobc.patch Measured-record citation
+        (1111, 1111),  # Files: M_signflip.patch Measured-record citation
+        (1125, 1125),  # Files: M_signflip_v2.patch Measured-record citation
+        # (round-20 audit finding: these three "Files" section bullets cite
+        # the SAME Measured-record numbers as the sections above by name,
+        # but were themselves outside every prior zone — a stray edit to
+        # just this restatement, without touching the section it restates,
+        # previously went uncaught).
     ],
 }
 
@@ -284,7 +382,7 @@ CLAIM_ZONE_DENOMINATOR: dict[str, int] = {
     "docs/plans/63-how-well/measurements/dose-ladder/README.md": 22,
     "docs/plans/63-how-well/measurements/red-proof/README.md": 47,
     "docs/plans/63-how-well/measurements/red-proof/dstar/README.md": 32,
-    "docs/plans/63-how-well/mutants/README.md": 90,
+    "docs/plans/63-how-well/mutants/README.md": 158,
 }
 
 LEDGER_PATH = REPO_ROOT / "ci" / "measurement_claims_allowlist.txt"
@@ -547,14 +645,20 @@ def _iter_leaf_paths(node, prefix: str = "") -> list[tuple[str, Decimal]]:
 # --- fenced-code-block self-referential artifact (mutants/README.md) ------
 
 _CODE_BLOCK_HEADER_RE = re.compile(r"^eps=([+-]?[\d.]+)\s*\(")
+# a bare `<Label>:` header (no `eps=`/parenthetical) — the M1-family
+# demonstration blocks (`M_nobc:` / `M_signflip:` / `M_signflip_v2:`) use
+# this simpler shape since they are not part of the signed-`eps` family and
+# have no ratio-scaling claim attached to their own label.
+_CODE_BLOCK_LABEL_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*):\s*$")
 _CODE_BLOCK_STEP_RE = re.compile(r"^step=(\d+)\s+l2_divergence=([0-9.eE+-]+)\s*$")
 
 
 def parse_code_blocks(lines: list[str]) -> dict[str, dict[int, Decimal]]:
     """Parse EVERY fenced ``` block in `lines` for `eps=<label> (...):` /
-    `step=N l2_divergence=X` lines — this doc-internal table IS the
-    committed artifact for the CPU-verifiable-demonstration numbers (never
-    a separate JSON; `git log` on this file is this data's own history)."""
+    `<Label>:` / `step=N l2_divergence=X` lines — this doc-internal table IS
+    the committed artifact for the CPU-verifiable-demonstration numbers
+    (never a separate JSON; `git log` on this file is this data's own
+    history)."""
     out: dict[str, dict[int, Decimal]] = {}
     in_block = False
     current: str | None = None
@@ -567,6 +671,11 @@ def parse_code_blocks(lines: list[str]) -> dict[str, dict[int, Decimal]]:
         if not in_block:
             continue
         m = _CODE_BLOCK_HEADER_RE.match(stripped)
+        if m:
+            current = m.group(1)
+            out.setdefault(current, {})
+            continue
+        m = _CODE_BLOCK_LABEL_RE.match(stripped)
         if m:
             current = m.group(1)
             out.setdefault(current, {})
@@ -686,6 +795,9 @@ _FUNCS = {
     "poscount",
     "negcount",
     "meand",
+    "maxd",
+    "mind",
+    "zerocount",
     "paircount",
     "code",
     "rel",
@@ -780,13 +892,29 @@ class Evaluator:
             else:
                 raise ClaimParseError(f"unknown count predicate {pred!r}")
             return Binding(v, source_pointer=ptr, source_path=path)
-        if expr.kind in ("poscount", "negcount", "meand"):
+        if expr.kind in ("poscount", "negcount", "meand", "maxd", "mind", "zerocount"):
             glob_a, glob_b, field_name = (a.strip().strip("'") for a in expr.args)
             deltas = _paired_deltas(glob_a, glob_b, field_name)
             if expr.kind == "poscount":
                 v = Decimal(sum(1 for d in deltas if d > 0))
             elif expr.kind == "negcount":
                 v = Decimal(sum(1 for d in deltas if d < 0))
+            elif expr.kind == "zerocount":
+                # a "N/M bit-identical" claim: the count of EXACT-zero
+                # paired deltas — deliberately distinct from
+                # poscount/negcount (a bit-identical leg is neither
+                # positive nor negative), reusing the identical
+                # `_paired_deltas` recompute discipline.
+                v = Decimal(sum(1 for d in deltas if d == 0))
+            elif expr.kind == "maxd":
+                # the SIGNED max (not abs — a "sits inside/effects to +X"
+                # endpoint claim over a raw d-column states the actual
+                # signed extreme, not a magnitude; distinct from the
+                # existing `max(E)` pointer-aggregate, which DOES take abs
+                # by design for its own, unrelated corpus of claims).
+                v = max(deltas)
+            elif expr.kind == "mind":
+                v = min(deltas)
             else:
                 v = sum(deltas) / Decimal(len(deltas))
             return Binding(v)
@@ -914,8 +1042,41 @@ def _lines_in_zones(rel_path: str, total_lines: int) -> set[int]:
     return out
 
 
-def scan_file(rel_path: str, loader: Loader, ledger: set[str] | None = None) -> tuple[list[Finding], int, int]:
-    """Returns `(findings, tokens_in_zone, tokens_bound)`."""
+# the binding-breakdown categories the gate's headline prints (B4: "print
+# the binding breakdown ... in the gate's output line" — never a flat
+# bound-vs-findings count that hides how much of "bound" is a real
+# pointer/recipe recompute vs an allowlisted escape).
+_BREAKDOWN_KINDS = ("ptr", "recipe", "hist", "const", "ledger")
+_RECIPE_KINDS = {
+    "abs",
+    "max",
+    "min",
+    "mean",
+    "count",
+    "poscount",
+    "negcount",
+    "meand",
+    "maxd",
+    "mind",
+    "zerocount",
+    "paircount",
+    "code",
+    "rel",
+    "within",
+    "interval",
+    "numer",
+    "denom",
+    "ratio",
+    "absdiff",
+}
+
+
+def scan_file(
+    rel_path: str, loader: Loader, ledger: set[str] | None = None
+) -> tuple[list[Finding], int, int, dict[str, int]]:
+    """Returns `(findings, tokens_in_zone, tokens_bound, breakdown)` —
+    `breakdown` counts successfully-bound tokens per `_BREAKDOWN_KINDS`
+    category (a finding is never counted in any category)."""
     ledger = ledger if ledger is not None else set()
     abspath = REPO_ROOT / rel_path
     text = abspath.read_text()
@@ -925,6 +1086,7 @@ def scan_file(rel_path: str, loader: Loader, ledger: set[str] | None = None) -> 
     findings: list[Finding] = []
     tokens_in_zone = 0
     tokens_bound = 0
+    breakdown: dict[str, int] = {k: 0 for k in _BREAKDOWN_KINDS}
 
     for line_no, line in enumerate(lines, start=1):
         if line_no not in zone_lines:
@@ -958,23 +1120,31 @@ def scan_file(rel_path: str, loader: Loader, ledger: set[str] | None = None) -> 
             except ClaimParseError as exc:
                 findings.append(Finding(rel_path, line_no, tok.col, f"token {tok.text!r}: parse error: {exc}"))
                 continue
-            if expr.kind in ("hist", "const"):
+            if expr.kind == "hist":
                 tokens_bound += 1
+                breakdown["hist"] += 1
                 continue
-            if expr.kind == "ledger":
-                key = f"{rel_path}:{tok.text}:{line_hash(line)}:{tok.col}"
+            if expr.kind in ("ledger", "const"):
+                # `const` is under the SAME shrink-only ratchet as `ledger`
+                # (round-20 audit finding B4) -- a `const:`-prefixed key in
+                # the SAME file, so a doc author cannot silently reclassify
+                # a real measurement as `const` to dodge both the pointer/
+                # recipe binding AND the ledger's own review gate.
+                prefix = "const:" if expr.kind == "const" else ""
+                key = f"{prefix}{rel_path}:{tok.text}:{line_hash(line)}:{tok.col}"
                 if key not in ledger:
                     findings.append(
                         Finding(
                             rel_path,
                             line_no,
                             tok.col,
-                            f"token {tok.text!r}: ledger-escaped but key {key!r} not in "
+                            f"token {tok.text!r}: {expr.kind}-escaped but key {key!r} not in "
                             f"{LEDGER_PATH.name} (grows ONLY via a human-reviewed PR)",
                         )
                     )
                 else:
                     tokens_bound += 1
+                    breakdown[expr.kind] += 1
                 continue
             try:
                 binding = evaluator.eval(expr)
@@ -994,6 +1164,7 @@ def scan_file(rel_path: str, loader: Loader, ledger: set[str] | None = None) -> 
                     )
                 else:
                     tokens_bound += 1
+                    breakdown["ptr"] += 1
                 continue
             ok, got = compare_token(tok.text, binding.value)  # type: ignore[arg-type]
             if not ok:
@@ -1007,6 +1178,7 @@ def scan_file(rel_path: str, loader: Loader, ledger: set[str] | None = None) -> 
                 )
                 continue
             tokens_bound += 1
+            breakdown["ptr" if expr.kind == "ptr" else "recipe"] += 1
             # anti-vacuity leg (b) applies only to DIRECT pointer bindings
             # (`expr.kind == "ptr"`) — an aggregate (`max`/`min`/`mean`)
             # binding's `source_pointer` names the CONTAINER it aggregated
@@ -1018,7 +1190,7 @@ def scan_file(rel_path: str, loader: Loader, ledger: set[str] | None = None) -> 
                 amb = _check_ambiguity(loader, binding.source_path, binding.source_pointer, tok.text, binding.value)
                 if amb:
                     findings.append(Finding(rel_path, line_no, tok.col, amb))
-    return findings, tokens_in_zone, tokens_bound
+    return findings, tokens_in_zone, tokens_bound, breakdown
 
 
 def _check_ambiguity(loader: Loader, path: str, pointer: str, token_text: str, value: Decimal) -> str | None:
@@ -1078,6 +1250,11 @@ def line_hash(text: str) -> str:
 
 
 def load_ledger() -> set[str]:
+    """Every entry line is `key` or `key  # <note>` — the note (required for
+    every surviving entry as of the round-20 sweep: WHY this specific token
+    is genuinely unreachable by any pointer/recipe binding, never a bare
+    unexplained escape) is split off before membership-checking; it is
+    documentation only and never part of the key itself."""
     if not LEDGER_PATH.is_file():
         return set()
     out = set()
@@ -1085,15 +1262,22 @@ def load_ledger() -> set[str]:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        out.add(line)
+        key = line.split(" #", 1)[0].strip()
+        if key:
+            out.add(key)
     return out
 
 
 def check_allowlist_only_shrinks() -> int:
     """Exact `check_perf_claims.py --check-allowlist-only-shrinks` shape,
     reused idiom: fetch `origin/main`'s copy, fail CLOSED on a failed fetch
-    or unresolvable ref, fail on any entry THIS branch adds relative to
-    it."""
+    or unresolvable ref, an explicit `git cat-file -e` bootstrap arm (this
+    branch's entries establish the baseline when `origin/main` has no
+    ledger file yet — never a silent `old_text = ""` fallthrough, which
+    would let `check` swallow a `git show` failure that is NOT actually a
+    missing-file bootstrap, e.g. a detached/shallow fetch that resolved the
+    ref but not the blob), then fail on any entry THIS branch adds relative
+    to it."""
     try:
         subprocess.run(
             ["git", "fetch", "origin", "main"],
@@ -1105,18 +1289,49 @@ def check_allowlist_only_shrinks() -> int:
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         print(f"FAIL: could not fetch origin/main: {exc}", file=sys.stderr)
         return 1
-    try:
-        old_text = subprocess.run(
-            ["git", "show", "origin/main:ci/measurement_claims_allowlist.txt"],
+
+    rev = subprocess.run(
+        ["git", "rev-parse", "--verify", "origin/main"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if rev.returncode != 0:
+        print(f"FAIL: origin/main does not resolve: {rev.stderr.strip()}", file=sys.stderr)
+        return 1
+
+    rel = LEDGER_PATH.relative_to(REPO_ROOT).as_posix()
+    file_exists = (
+        subprocess.run(
+            ["git", "cat-file", "-e", f"origin/main:{rel}"],
             cwd=REPO_ROOT,
-            check=True,
             capture_output=True,
-            text=True,
-        ).stdout
-    except subprocess.CalledProcessError:
-        old_text = ""  # bootstrap: file does not exist on main yet
-    old = {ln.strip() for ln in old_text.splitlines() if ln.strip() and not ln.strip().startswith("#")}
+        ).returncode
+        == 0
+    )
     new = load_ledger()
+
+    if not file_exists:
+        print(
+            "measurement-claims-allowlist-only-shrinks: OK (bootstrap) — origin/main "
+            f"resolves ({rev.stdout.strip()}) but has no {rel} yet: this branch's "
+            f"{len(new)} entries establish the baseline."
+        )
+        return 0
+
+    old_text = subprocess.run(
+        ["git", "show", f"origin/main:{rel}"],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    old = {
+        ln.strip().split(" #", 1)[0].strip()
+        for ln in old_text.splitlines()
+        if ln.strip() and not ln.strip().startswith("#")
+    }
+    old.discard("")
     added = new - old
     if added:
         print("FAIL: ledger grew relative to origin/main:", file=sys.stderr)
@@ -1152,23 +1367,26 @@ def check_coverage() -> list[str]:
 # --- report / gate -----------------------------------------------------------
 
 
-def run_real_tree() -> tuple[list[Finding], int, int]:
+def run_real_tree() -> tuple[list[Finding], int, int, dict[str, int]]:
     ledger = load_ledger()
     loader = Loader()
     all_findings: list[Finding] = []
     total_zone = 0
     total_bound = 0
+    total_breakdown: dict[str, int] = {k: 0 for k in _BREAKDOWN_KINDS}
     for rel_path in MEASUREMENT_FILES:
-        findings, in_zone, bound = scan_file(rel_path, loader, ledger)
+        findings, in_zone, bound, breakdown = scan_file(rel_path, loader, ledger)
         all_findings.extend(findings)
         total_zone += in_zone
         total_bound += bound
-    return all_findings, total_zone, total_bound
+        for k, v in breakdown.items():
+            total_breakdown[k] += v
+    return all_findings, total_zone, total_bound, total_breakdown
 
 
 def gate() -> int:
     problems = check_coverage()
-    findings, in_zone, bound = run_real_tree()
+    findings, in_zone, bound, breakdown = run_real_tree()
     ok = True
     for p in problems:
         print(f"FAIL (coverage): {p}", file=sys.stderr)
@@ -1176,7 +1394,17 @@ def gate() -> int:
     for f in findings:
         print(f"FAIL: {f.file}:{f.line}:{f.col}: {f.message}", file=sys.stderr)
         ok = False
-    print(f"claim-zone tokens: {in_zone}, bound OK: {bound}, findings: {len(findings)}")
+    # B4 (round-20 audit): the headline breakdown -- how much of "bound" is
+    # a real pointer/recipe recompute vs an allowlisted escape (`ledger`),
+    # a design constant/prediction (`const`, SAME ratchet as `ledger`), or a
+    # deliberately-quoted historical value (`hist`, binds to nothing) --
+    # never a flat "N/N bound" that launders an escape as though it were a
+    # recompute.
+    print(
+        f"claim-zone tokens: {in_zone}, bound OK: {bound}, findings: {len(findings)} "
+        f"[ptr={breakdown['ptr']} recipe={breakdown['recipe']} "
+        f"ledger={breakdown['ledger']} const={breakdown['const']} hist={breakdown['hist']}]"
+    )
     if ok:
         print("PASS")
         return 0
@@ -1371,22 +1599,86 @@ def self_test() -> int:
             "rule2 synthetic#3: dropped-sign mean_d=0.0183 (vs true -0.0183) is FALSE",
             not compare_token("0.0183", Decimal("-0.01830683834850788"))[0],
         )
-        # rule 2, synthetic #4: denominator swap n_pos=5/11 (true is 5/12)
+        # rule 2, synthetic #4: denominator swap n_pos=5/11 (true gate_seed_count=12)
+        # -- driven end-to-end through Loader.resolve (a pre-seeded cache
+        # entry, never a bare dict compare) + the REAL compare_token, not a
+        # tautological `Decimal("11") == Decimal("12")` (round-20 audit
+        # advisory: the prior form here would pass unconditionally, proving
+        # nothing about the module's own resolution/equality code).
+        fixture_loader = Loader()
+        fixture_loader._cache["fixture-denom.json"] = {"decision": {"gate_seed_count": 12}}
+        denom_binding = Evaluator(fixture_loader, {}, None).eval(parse_expr("fixture-denom.json#/decision/gate_seed_count"))
         check(
             "rule2 synthetic#4: denominator swap 5/11 (true gate_seed_count=12) is FALSE",
-            not (Decimal("11") == Decimal("12")),
+            not compare_token("11", denom_binding.value)[0],  # type: ignore[arg-type]
+        )
+        check(
+            "rule2 synthetic#4 fixed: 5/12 matches the resolved gate_seed_count",
+            compare_token("12", denom_binding.value)[0],  # type: ignore[arg-type]
         )
 
-        # rule 3, synthetic #1: false relation 0.08265 > 0.15239 (spread > noise band)
+        # rule 3, synthetic #1 (rel()): false relation 0.08265 > 0.15239 --
+        # driven end-to-end through `rel()`'s OWN `Evaluator.eval` (never a
+        # bare `Decimal(...) > Decimal(...)` — round-20 audit advisory: the
+        # prior form never called `rel()` at all, so a bug INSIDE `rel()`
+        # itself could not have failed this check).
+        fixture_loader._cache["fixture-rel.json"] = {"spread": 0.08265, "noise_band": 0.15239}
+        rel_ev = Evaluator(fixture_loader, {}, "fixture-rel.json")
+        rel_false_raised = False
+        try:
+            rel_ev.eval(parse_expr("rel(#/spread, '>', #/noise_band)"))
+        except ResolutionError:
+            rel_false_raised = True
+        check("rule3 synthetic#1 (rel()): 0.08265 > 0.15239 correctly raises ResolutionError", rel_false_raised)
+        rel_true_ok = True
+        try:
+            rel_ev.eval(parse_expr("rel(#/noise_band, '>', #/spread)"))
+        except ResolutionError:
+            rel_true_ok = False
+        check("rule3 synthetic#1 fixed (rel()): 0.15239 > 0.08265 resolves cleanly", rel_true_ok)
+
+        # rule 3, synthetic #2 (interval()): false containment (11.1954
+        # outside [11.2, 20.1]) -- driven end-to-end through `interval()`'s
+        # OWN `Evaluator.eval`, same discipline as the `rel()` fixture above.
+        fixture_loader._cache["fixture-interval.json"] = {"d_i": 11.1954}
+        interval_ev = Evaluator(fixture_loader, {}, "fixture-interval.json")
+        interval_false_raised = False
+        try:
+            interval_ev.eval(parse_expr("interval(#/d_i, 11.2, 20.1)"))
+        except ResolutionError:
+            interval_false_raised = True
         check(
-            "rule3 synthetic#1: false relation 0.08265 > 0.15239 correctly FALSE",
-            not (Decimal("0.08265") > Decimal("0.15239")),
+            "rule3 synthetic#2 (interval()): 11.1954 correctly NOT contained in [11.2, 20.1]",
+            interval_false_raised,
         )
-        # rule 3, synthetic #2: false interval containment (11.1954 outside [11.2, 20.1])
+        interval_true_ok = True
+        try:
+            interval_ev.eval(parse_expr("interval(#/d_i, 11.19, 20.1)"))
+        except ResolutionError:
+            interval_true_ok = False
         check(
-            "rule3 synthetic#2 (interval): 11.1954 is NOT contained in [11.2, 20.1]",
-            not (Decimal("11.2") <= Decimal("11.1954") <= Decimal("20.1")),
+            "rule3 synthetic#2 fixed (interval()): 11.1954 IS contained in [11.19, 20.1]",
+            interval_true_ok,
         )
+
+        # within(): unused by the real corpus today, but part of the closed
+        # grammar (module doc) -- driven end-to-end through its OWN
+        # `Evaluator.eval` so a bug in it cannot ship silently for lack of
+        # ANY exercising fixture (round-20 audit advisory).
+        fixture_loader._cache["fixture-within.json"] = {"a": 1.0005, "b": 1.0}
+        within_ev = Evaluator(fixture_loader, {}, "fixture-within.json")
+        within_true_ok = True
+        try:
+            within_ev.eval(parse_expr("within(#/a, #/b, 0.001)"))
+        except ResolutionError:
+            within_true_ok = False
+        check("within() synthetic: |1.0005 - 1.0| <= 0.001 resolves cleanly", within_true_ok)
+        within_false_raised = False
+        try:
+            within_ev.eval(parse_expr("within(#/a, #/b, 0.0001)"))
+        except ResolutionError:
+            within_false_raised = True
+        check("within() synthetic: |1.0005 - 1.0| > 0.0001 correctly raises ResolutionError", within_false_raised)
 
         # wrong-file binding: dstar's n_pos=12 must NOT validate against
         # red-proof's own (pre-D*) report — `mutant_dose_ladder.red_proof[0]`
@@ -1431,24 +1723,48 @@ def self_test() -> int:
     # ledger cross-check: mutation-adequacy — a `ledger` tag whose key is
     # NOT registered in the committed allowlist must FAIL, never silently
     # pass (the escape must be human-reviewed-and-committed, not merely
-    # self-declared inline). Exercises the SAME key construction and
-    # membership check `scan_file` uses, without needing a real CLAIM_ZONES
-    # entry for a throwaway fixture path.
-    fake_line = "unregistered 42 claim"
-    fake_rel = "docs/plans/63-how-well/measurements/fixture/README.md"
-    fake_tok = find_claim_tokens(fake_line, 2)[0]
-    real_key = f"{fake_rel}:{fake_tok.text}:{line_hash(fake_line)}:{fake_tok.col}"
-    check(
-        "ledger synthetic RED: an unregistered key is absent from the real allowlist",
-        real_key not in load_ledger(),
-    )
-    check(
-        "ledger synthetic GREEN: the SAME key, once added, would be present",
-        f"{real_key}" in (load_ledger() | {real_key}),
-    )
+    # self-declared inline) — driven end-to-end through the REAL `scan_file`
+    # entry point (round-20 audit advisory: the prior GREEN form here was
+    # `real_key in (load_ledger() | {real_key})`, which is true by set-union
+    # construction REGARDLESS of `scan_file`'s own ledger-membership logic —
+    # a tautology that could never fail). `Path(REPO_ROOT) / <absolute path>`
+    # returns the absolute path unchanged (stdlib `pathlib` semantics), so a
+    # tempfile path works as `scan_file`'s `rel_path` without touching the
+    # real tree; `CLAIM_ZONES` is temporarily extended for that one throwaway
+    # path (restored in `finally`) since the zone anti-vacuity leg is keyed
+    # on `rel_path` by design and a fixture path is never pre-pinned.
+    import tempfile as _tempfile
 
-    findings, in_zone, bound = run_real_tree()
-    check(f"self-test: real tree run is clean ({in_zone} tokens, {bound} bound, {len(findings)} findings)", not findings)
+    with _tempfile.TemporaryDirectory() as _td:
+        fixture_md = Path(_td) / "fixture-ledger.md"
+        fixture_content = "<!-- claims63: c1=ledger -->\nunregistered 42 claim\n"
+        fixture_md.write_text(fixture_content)
+        fixture_rel = str(fixture_md)  # absolute -- see comment above
+        fixture_line = fixture_content.splitlines()[1]
+        fixture_tok = find_claim_tokens(fixture_line, 2)[0]
+        real_key = f"{fixture_rel}:{fixture_tok.text}:{line_hash(fixture_line)}:{fixture_tok.col}"
+        CLAIM_ZONES[fixture_rel] = [(1, 2)]
+        try:
+            findings_absent, _, _, _ = scan_file(fixture_rel, Loader(), ledger=set())
+            check(
+                "ledger synthetic RED: scan_file FINDS an unregistered ledger key (driven end-to-end)",
+                any("ledger-escaped" in f.message for f in findings_absent),
+            )
+            findings_present, _, bound_present, _ = scan_file(fixture_rel, Loader(), ledger={real_key})
+            check(
+                "ledger synthetic GREEN: scan_file BINDS the SAME key once registered (driven end-to-end)",
+                not findings_present and bound_present == 1,
+            )
+        finally:
+            del CLAIM_ZONES[fixture_rel]
+
+    findings, in_zone, bound, breakdown = run_real_tree()
+    check(
+        f"self-test: real tree run is clean ({in_zone} tokens, {bound} bound "
+        f"[ptr={breakdown['ptr']} recipe={breakdown['recipe']} ledger={breakdown['ledger']} "
+        f"const={breakdown['const']} hist={breakdown['hist']}], {len(findings)} findings)",
+        not findings,
+    )
 
     print(f"\n{len(failures)} failing check(s)" if failures else "\nall checks GREEN")
     return 1 if failures else 0

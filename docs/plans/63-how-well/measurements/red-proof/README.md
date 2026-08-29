@@ -12,21 +12,21 @@ evidence only, not scheduled — its label is retired, see below). Merge exit co
 
 | column | base sha | patch sha256 (prefix) | raw d-concordance vs alloff | gated column reads |
 |---|---|---|---|---|
-<!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/finetune_run_ab_report.json; c1=ledger; c2=ledger; c3=ledger; c4=ledger; c5=#/mutant_dose_ladder/red_proof/0/clean_pair_count; c6=#/mutant_dose_ladder/red_proof/0/n_pos; c7=#/mutant_dose_ladder/red_proof/0/n_neg; c8=#/mutant_dose_ladder/red_proof/0/p_value -->
+<!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/finetune_run_ab_report.json; c1=poscount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c2=paircount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c3=meand('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c4=absdiff(paircount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'), #/mutant_dose_ladder/red_proof/0/clean_pair_count); c5=#/mutant_dose_ladder/red_proof/0/clean_pair_count; c6=#/mutant_dose_ladder/red_proof/0/n_pos; c7=#/mutant_dose_ladder/red_proof/0/n_neg; c8=#/mutant_dose_ladder/red_proof/0/p_value -->
 | `redproof-nobc` (v1 legs) | 4d1398a0 | 9b3c824d | n_pos=5/12, mean_d=-0.0183 | INVALID (2 premise-failing pairs; 10 clean: n_pos=3, n_neg=7, p=0.34) |
-<!-- claims63: c1=ledger; c2=ledger -->
+<!-- claims63: c1=zerocount('docs/plans/63-how-well/measurements/red-proof/raw/signflip__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__fused__r1.json', 'held_out_example_mean'); c2=paircount('docs/plans/63-how-well/measurements/red-proof/raw/signflip__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__fused__r1.json', 'held_out_example_mean') -->
 | `signflip` (v1, RETIRED, never scheduled) | 4d1398a0 | (see mutants/README.md) | 12/12 held-out values bit-identical to clean fused r1 | n/a — inert, retired |
-<!-- claims63: c1=ledger; c2=ledger; c3=ledger; c4=ledger; c5=ledger; c6=ledger; c7=ledger; c8=ledger; c9=ledger; c10=ledger; c11=ledger -->
-| `redproof-signflip-v2` | 8f06a42c | c81d0ed5 | 12/12 degradation-concordant, effects to +19.2 (sign test would read p = 2/4096 = 1/2048, the exact two-sided tail — NEVER 1/4096) | INVALID (12/12 legs fail the learning-happened premise) |
+<!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/finetune_run_ab_report.json; c1=poscount('docs/plans/63-how-well/measurements/red-proof/raw/signflip_v2__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c2=paircount('docs/plans/63-how-well/measurements/red-proof/raw/signflip_v2__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c3=maxd('docs/plans/63-how-well/measurements/red-proof/raw/signflip_v2__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c4=ledger; c5=ledger; c6=numer(2048, ratio(2, 4096)); c7=denom(1, ratio(2, 4096)); c8=hist; c9=hist; c10=absdiff(paircount('docs/plans/63-how-well/measurements/red-proof/raw/signflip_v2__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'), #/mutant_dose_ladder/red_proof/1/clean_pair_count); c11=paircount('docs/plans/63-how-well/measurements/red-proof/raw/signflip_v2__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean') -->
+| `redproof-signflip-v2` | 8f06a42c | c81d0ed5 | 12/12 degradation-concordant, effects to +20.08700 (sign test would read p = 2/4096 = 1/2048, the exact two-sided tail — NEVER 1/4096) | INVALID (12/12 legs fail the learning-happened premise) |
 
 Findings, honestly stated:
 
-<!-- claims63: c1=ledger; c2=ledger -->
+<!-- claims63: c1=zerocount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__fused__r1.json', 'held_out_example_mean'); c2=paircount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__fused__r1.json', 'held_out_example_mean') -->
 1. `M_nobc` (no bias correction) genuinely perturbs (0/12 legs bit-identical to
    clean fused) but is NOT DETECTED at this operating point: raw concordance
 <!-- claims63: c1=poscount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c2=paircount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c3=meand('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean') -->
    5/12 positive, mean_d=-0.0183 — the uncertain prediction's neutral outcome.
-<!-- claims63: c1=ledger; c2=ledger -->
+<!-- claims63: c1=zerocount('docs/plans/63-how-well/measurements/red-proof/raw/signflip__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__fused__r1.json', 'held_out_example_mean'); c2=paircount('docs/plans/63-how-well/measurements/red-proof/raw/signflip__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__fused__r1.json', 'held_out_example_mean') -->
 2. `M_signflip` v1 was INERT ON GPU: 12/12 legs' `held_out_example_mean`
    bit-identical to the clean fused column (`campaign-v2/raw/seedN__fused__r1.json`)
    — the patch edited `AdamThetaUpdate::cpu_fwd`, which the a100 legs never
@@ -37,7 +37,7 @@ Findings, honestly stated:
 3. `M_signflip_v2` IS dispatch-effective (train_probe_series climbs, e.g. seed 1:
 <!-- claims63: c1=docs/plans/63-how-well/measurements/red-proof/raw/signflip_v2__seed1.json#/tiers/finetune_run/train_probe_series/0; c2=docs/plans/63-how-well/measurements/red-proof/raw/signflip_v2__seed1.json#/tiers/finetune_run/train_probe_series/3 -->
    3.32 -> 20.25 — gradient ascent operating on GPU) and maximally detected in
-<!-- claims63: c1=ledger; c2=ledger -->
+<!-- claims63: c1=poscount('docs/plans/63-how-well/measurements/red-proof/raw/signflip_v2__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c2=paircount('docs/plans/63-how-well/measurements/red-proof/raw/signflip_v2__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean') -->
    the raw data (12/12 degradation-concordant), BUT every mutant leg fails the
 <!-- claims63: c1=const -->
    learning-happened premise (`series[0] - series[-1]` must clear floor 0.0;

@@ -18,6 +18,14 @@ All four pre-registered predictions confirmed to the bit:
 
 Acceptance 5's "mutant column proven RED (degradation)" is DISCHARGED at
 M = M_signflip_v2, per the amendment's honesty rider: M is a catastrophic
-mutant (held-out ~3.3 -> ~20), the detector's sensitivity ceiling; the
-corridor between M_nobc (undetected) and M_signflip_v2 remains unresolved
-and is not claimed.
+mutant (held-out ~3.3 -> ~20 on 11 of 12 seeds), the detector's sensitivity
+ceiling; the corridor between M_nobc (undetected) and M_signflip_v2 remains
+unresolved and is not claimed. Stated honestly, per-seed: the committed
+artifact's own `mutant_dose_ladder.red_proof[0].per_seed` reads d_i from
++0.179 (seed 2) to +20.087 (seed 9) — 11/12 seeds land in the +11.2..+20.1
+catastrophic range, but seed 2's +0.179 sits inside the primary A/B's own
+noise band (`d_values`, |d_i| up to 0.152, `cross_seed_spread` 0.0826) and
+is degradation-concordant only by sign, not by magnitude; it is still
+counted RED (positive `d_i`, `n_pos` requires only the sign) and the
+sign-test verdict does not depend on magnitude, so the verdict above is
+unaffected.

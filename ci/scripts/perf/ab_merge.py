@@ -2932,8 +2932,16 @@ def red_proof_expected_train_direction(dose_label, patch_sha256):
     key = str(patch_sha256 or "").strip().lower()
     direction = RED_PROOF_EXPECTED_TRAIN_DIRECTION.get(key)
     if direction is None:
+        # unit-63 round-15 audit advisory 5: unprefixed here, matching every
+        # pre-existing leg-violation message in this module (e.g. the
+        # `mutant_id`/`mutant_patch_sha256` messages just below this
+        # function's own call site) -- `build_mutant_dose_column` prefixes
+        # every entry in `leg_violations` with `f"{dose_label} seed {seed}:
+        # "` exactly once; a self-prefixed message here would be prefixed
+        # AGAIN there, doubling `dose_label` in the committed artifact.
         return None, (
-            f"{dose_label}: RED-proof column's own patch_sha256={patch_sha256!r} is not present "
+            "RED-proof column's own patch_sha256="
+            f"{patch_sha256!r} is not present "
             "in the committed RED_PROOF_EXPECTED_TRAIN_DIRECTION table -- CONTRACT amendment "
             "2026-08-29e (D*): a RED-proof column's declared train_direction is looked up from "
             "this merger-side table keyed on the FULL patch sha, never defaulted to either "
@@ -3168,8 +3176,15 @@ def build_mutant_dose_column(raw_dir, dose_label, patch_sha256, mutant_seeds):
             mutant_init = mutant_series[0] if isinstance(mutant_series, list) and mutant_series else None
             alloff_init = alloff_series[0] if isinstance(alloff_series, list) and alloff_series else None
             if mutant_init is None or alloff_init is None or mutant_init != alloff_init:
+                # unit-63 round-15 audit advisory 5: unprefixed here (no
+                # `dose_label`/`seed` self-prefix) -- this list feeds
+                # `leg_violations`, which the caller below (`violations +=
+                # [f"{dose_label} seed {seed}: {v}" for v in
+                # leg_violations]`) prefixes with `dose_label`/`seed`
+                # exactly once; a self-prefixed message here doubled both in
+                # the committed artifact pre-fix.
                 leg_violations.append(
-                    f"{dose_label} seed {seed}: RED-proof mutant leg's train_probe_series[0]="
+                    "RED-proof mutant leg's train_probe_series[0]="
                     f"{mutant_init!r} does not exactly equal its alloff partner's "
                     f"train_probe_series[0]={alloff_init!r} -- CONTRACT amendment 2026-08-29e "
                     "(D*) init_anchor_equality: a RED-proof mutant leg must start from the SAME "
@@ -4065,9 +4080,24 @@ def main(argv=None):
                     "RED-proof column",
                 ),
             ]
-            assert {name for name, _triggered, _message in dose_ladder_causes} == set(
-                DOSE_LADDER_EXIT_CAUSE_NAMES
-            ), "dose_ladder_causes drifted from the committed DOSE_LADDER_EXIT_CAUSE_NAMES set"
+            # unit-63 round-15 audit advisory 4: an explicit `if`/`raise`,
+            # never a bare `assert` -- `assert` is stripped entirely under
+            # `python -O`, which would silently disable this runtime binding
+            # to `DOSE_LADDER_EXIT_CAUSE_NAMES` in exactly the deployment
+            # shape (`-O`) that removes the safety net without removing the
+            # code path it protects. `howwell_dose_ladder_cause.py`'s own
+            # test-side binding (`DoseLadderCauseNamesBoundToAbMergeExitFoldTests`
+            # in `test_howwell_dose_ladder_cause.py`) remains the PRIMARY
+            # enforcement (it runs on every commit, `-O` or not); this
+            # runtime check is the defense-in-depth belt for the one process
+            # that actually folds `dose_ladder_causes` at merge time.
+            _dose_ladder_cause_names = {name for name, _triggered, _message in dose_ladder_causes}
+            if _dose_ladder_cause_names != set(DOSE_LADDER_EXIT_CAUSE_NAMES):
+                raise AssertionError(
+                    "dose_ladder_causes drifted from the committed DOSE_LADDER_EXIT_CAUSE_NAMES set "
+                    f"(dose_ladder_causes names={sorted(_dose_ladder_cause_names)}, "
+                    f"DOSE_LADDER_EXIT_CAUSE_NAMES={sorted(DOSE_LADDER_EXIT_CAUSE_NAMES)})"
+                )
             for _cause_name, triggered, message in dose_ladder_causes:
                 if triggered:
                     print(message, file=sys.stderr)

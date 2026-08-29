@@ -29,24 +29,30 @@ that looks like this namer forgot a cause.
 
 `ab_merge.py`'s `main()` no longer hand-maintains four independent `if`
 blocks for its `finetune-run` dose-ladder exit code -- it folds a DATA list
-of `(cause_name, triggered, message)` tuples, asserted at runtime to name
-exactly `ab_merge.DOSE_LADDER_EXIT_CAUSE_NAMES`. `_ALL_CAUSE_NAMES` below is
-that SAME constant, imported directly (never a hand-duplicated literal) --
+of `(cause_name, triggered, message)` tuples, checked at runtime (an
+explicit `if`/`raise AssertionError` -- unit-63 round-15 audit advisory 4:
+never a bare `assert`, which `python -O` strips entirely) to name exactly
+`ab_merge.DOSE_LADDER_EXIT_CAUSE_NAMES`. `_ALL_CAUSE_NAMES` below is that
+SAME constant, imported directly (never a hand-duplicated literal) --
 `DoseLadderCauseNamesBoundToAbMergeExitFoldTests`
 (`test_howwell_dose_ladder_cause.py`) imports both this module and
 `ab_merge` and asserts `set(namer._ALL_CAUSE_NAMES) ==
 set(ab_merge.DOSE_LADDER_EXIT_CAUSE_NAMES)` as an explicit, executable
-cross-module pin. What this GUARANTEES: a fifth cause added to `ab_merge.
-py`'s own exit fold without a matching entry in `DOSE_LADDER_EXIT_CAUSE_
-NAMES` fails `ab_merge.py`'s own internal assertion (`main()`'s dose-ladder
-branch) the first time that code path runs, AND (since this module imports
-that same constant) this namer's own fallback text grows to match
-automatically -- there is no third, independently-drifting copy of the
-cause-name set left anywhere in this pairing. What it does NOT guarantee: a
-literal fifth `if`/branch written OUTSIDE that data-driven fold (bypassing
-`dose_ladder_causes` entirely) would still need its own review to be
-caught -- this binding covers the one fold both sides already commit to,
-never arbitrary future code shape.
+cross-module pin -- this test-side binding is the PRIMARY enforcement (it
+runs on every commit regardless of `-O`); `ab_merge.py`'s own runtime check
+is defense-in-depth for the one process that actually folds
+`dose_ladder_causes` at merge time. What this GUARANTEES: a fifth cause
+added to `ab_merge.py`'s own exit fold without a matching entry in
+`DOSE_LADDER_EXIT_CAUSE_NAMES` fails `ab_merge.py`'s own internal runtime
+check (`main()`'s dose-ladder branch) the first time that code path runs
+(under `-O` or not), AND (since this module imports that same constant)
+this namer's own fallback text grows to match automatically -- there is no
+third, independently-drifting copy of the cause-name set left anywhere in
+this pairing. What it does NOT guarantee: a literal fifth `if`/branch
+written OUTSIDE that data-driven fold (bypassing `dose_ladder_causes`
+entirely) would still need its own review to be caught -- this binding
+covers the one fold both sides already commit to, never arbitrary future
+code shape.
 """
 
 from __future__ import annotations
@@ -55,15 +61,45 @@ import json
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "perf"))
-import ab_merge  # noqa: E402
+# Unit-63 round-15 audit advisory 3: this insert+import is itself a crash
+# surface upstream of `_inspect_doses`'s own A4 hardening -- an import-time
+# failure here (a syntax error introduced into `perf/ab_merge.py`, a missing
+# `perf/` directory, or -- the shadowing risk -- some OTHER `ab_merge` module
+# earlier on `sys.path` that this `insert(0, ...)` does NOT protect against
+# if this file is ever copied/executed from a location where `os.path.
+# dirname(__file__)` no longer resolves to `ci/scripts`) must degrade to a
+# NAMED cause here, never an uncaught `ImportError`/`SyntaxError` that
+# propagates out of module load. Left uncaught, `runpod_gpu_howwell.sh`'s own
+# `2>/dev/null || echo "unknown (could not inspect ...)"` wrapper (this
+# module's own doc above) swallows the SPECIFIC failure into the same opaque
+# "unknown" text a truly-no-cause-found run also produces -- the exact
+# unexplained-contradiction shape `_inspect_doses` exists to prevent one
+# layer down, now recurring one layer up. Note on the shadowing risk named
+# above: `sys.path.insert(0, ...)` puts THIS `perf/` directory first, so it
+# always wins over anything a caller's `PYTHONPATH` places earlier in
+# `sys.path` -- the risk is the opposite direction, an `ab_merge` module a
+# caller intended to be picked up from elsewhere on `sys.path` being silently
+# shadowed by this repo's own `perf/ab_merge.py`, never the reverse.
+_PERF_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "perf")
+sys.path.insert(0, _PERF_DIR)
+try:
+    import ab_merge  # noqa: E402
+
+    _AB_MERGE_IMPORT_ERROR: str | None = None
+except Exception as _exc:  # pragma: no cover - exercised via subprocess in test_howwell_dose_ladder_cause.py
+    ab_merge = None  # type: ignore[assignment]
+    _AB_MERGE_IMPORT_ERROR = f"{type(_exc).__name__}: {_exc}"
 
 # Unit-63 round-14 audit F6: imported directly from `ab_merge.py`, never a
 # hand-duplicated literal -- see this module's own "Binding to ab_merge.py's
 # own exit fold" doc above for exactly what this import makes impossible
 # (a fifth cause silently added to one side alone) versus what it does not
-# (an exit-fold branch written outside the shared data structure).
-_ALL_CAUSE_NAMES = list(ab_merge.DOSE_LADDER_EXIT_CAUSE_NAMES)
+# (an exit-fold branch written outside the shared data structure). When the
+# import above failed, there is no `ab_merge.DOSE_LADDER_EXIT_CAUSE_NAMES` to
+# read -- `_ALL_CAUSE_NAMES` is left empty; `dose_ladder_cause` below never
+# reaches the code that would consult it in that state (the import-failure
+# cause short-circuits first).
+_ALL_CAUSE_NAMES = list(ab_merge.DOSE_LADDER_EXIT_CAUSE_NAMES) if ab_merge is not None else []
 
 
 def _inspect_doses(ladder: dict) -> tuple[list, str | None]:
@@ -123,7 +159,17 @@ def dose_ladder_cause(report: dict) -> str:
     non-dict element) is named as its own cause rather than crashing this
     function outright (see that helper's own doc for why a crash here is
     strictly worse than a named "unknown").
+
+    Unit-63 round-15 audit advisory 3: if the module-level `import ab_merge`
+    itself failed, `_AB_MERGE_IMPORT_ERROR` is non-`None` and this function
+    returns that failure as its own named cause immediately, BEFORE touching
+    `report` at all -- same discipline as `_inspect_doses`, degrading a
+    crash surface into legible text rather than letting it propagate to an
+    uncaught exception that `runpod_gpu_howwell.sh`'s own wrapper would
+    collapse into the opaque "unknown (could not inspect ...)" text.
     """
+    if _AB_MERGE_IMPORT_ERROR is not None:
+        return f"ab_merge_import_failed({_AB_MERGE_IMPORT_ERROR})"
     ladder = report.get("mutant_dose_ladder") or {}
     causes = []
     if ladder.get("sensitivity_error"):

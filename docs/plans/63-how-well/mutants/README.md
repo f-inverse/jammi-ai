@@ -849,6 +849,22 @@ also reaches the CUDA arm (per the `(1+eps)` family's own hardware
 precedent), not a claim that the CPU numbers themselves are new evidence
 beyond v1's.
 
+**Measured (12-leg GPU, a100, `redproof-signflip-v2`, D*-gated): RED —
+12/12.** Committed artifact:
+`docs/plans/63-how-well/measurements/red-proof/dstar/` at 82253c1b (the
+D*-gated re-merge CONTRACT.md amendment 2026-08-29e pre-registered, run
+against the SAME committed raw legs already cited above — nothing
+re-run). All four pre-registered predictions confirmed to the bit: 12/12
+clean pairs (all 12 legs ascend against `RED_PROOF_EXPECTED_TRAIN_
+DIRECTION`'s own entry, init anchors bit-identical); `n_pos=12, n_neg=0`,
+`detected=RED`, two-sided `p = 2/4096 = 1/2048 = 0.00048828125` exact;
+`red_proof_verdict = PROVEN`; merge exit 0 (PROVEN contributes nothing to
+the exit code). Acceptance 5's "mutant column proven RED" is DISCHARGED
+at `M = M_signflip_v2`, per the amendment's honesty rider: this mutant is
+a catastrophic degradation (the detector's sensitivity ceiling, not a
+finding about the corridor between it and `M_nobc`'s own undetected
+result above, which remains unresolved and is not claimed).
+
 **Patch sha256s** (both against base `e340391c`, verified `git apply
 --check` clean at that sha, verified apply -> `cargo build -p jammi-kernels`
 (exit 0) -> `git checkout --` revert, independently, one mutant at a time;
@@ -954,7 +970,17 @@ learning-happened premise on this committed artifact, the SAME 2 legs D*'s
 own `train_direction` premise names explicitly; see `M_nobc`'s own "GATED
 reading" note above). Neither column discharged acceptance 5 (the committed
 artifact's own `red_proof_verdict` reads `NOT_PROVEN (redproof-nobc=INVALID,
-redproof-signflip-v2=INVALID)`).
+redproof-signflip-v2=INVALID)`). This record STANDS as-is, PRE-amendment,
+measured before the learning-happened premise was decomposed into
+`training_effective`/`train_direction` — it is not relabeled or overwritten
+by the D*-gated re-merge below. The D*-gated re-merge of `redproof-
+signflip-v2` ONLY (CONTRACT.md amendment 2026-08-29e, `M_nobc`'s own
+committed INVALID record above stands as evidence, not as a second column
+to re-run) is a SEPARATE, later-committed artifact
+(`measurements/red-proof/dstar/` at 82253c1b) that supersedes this one
+column's `NOT_PROVEN (..., redproof-signflip-v2=INVALID)` reading with
+`RED`/`PROVEN` — see the "Measured" record in the `M_signflip_v2` section
+below for the full current-truth discharge.
 
 **Scheduling `M_signflip_v2` (replaces `redproof-signflip`):** pass
 `--mutant-legs redproof-signflip-v2:<M_signflip_v2 sha256>:<seeds>` (never
@@ -986,9 +1012,13 @@ empty `.red_proof[]` as "nothing scheduled" without first checking whether
 `red_proof_verdict` is non-null). Given `M_signflip_v2`'s dispatch-invariant
 site (proven on
 hardware by the `(1+eps)` family) and its certainty prediction, this run
-is expected to read `redproof-signflip-v2: RED` and discharge acceptance
-5's "mutant column proven RED" — but that expectation is a prediction to
-be measured, not assumed, per this file's own family F/K discipline.
+was PREDICTED to read `redproof-signflip-v2: RED` and discharge acceptance
+5's "mutant column proven RED" — per this file's own family F/K discipline,
+that was reported as a prediction to be measured, not assumed, and it now
+HAS been measured: `redproof-signflip-v2: RED`, `red_proof_verdict =
+PROVEN`, discharging acceptance 5 at `M = M_signflip_v2` (see the
+"Measured" record above and `docs/plans/63-how-well/measurements/red-proof/
+dstar/` at 82253c1b).
 
 ## Files
 
@@ -1035,5 +1065,7 @@ be measured, not assumed, per this file's own family F/K discipline.
   sha256 `c81d0ed59d45761bbd6487dbb23c5aaae22f30739c0e2e613d96c4901ad9b202`;
   patch-file-only; predicted DEGRADATION with certainty on BOTH CPU and
   CUDA arms (see "RED-proof mutants" above) — the guaranteed RED-proof
-  member of this pair, **scheduled**.
+  member of this pair, **measured RED, 12/12, `red_proof_verdict=PROVEN`
+  (D*-gated, `measurements/red-proof/dstar/` at 82253c1b) — discharges
+  acceptance 5**.
 - `README.md` — this file.

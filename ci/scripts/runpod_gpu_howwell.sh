@@ -36,8 +36,11 @@
 #   HOWWELL_SEEDS                forwarded as FINETUNE_RUN_AB_SEEDS
 #                                (default: the pre-registered 12-seed gate
 #                                set, finetune_run_ab.sh's own default).
-#   HOWWELL_OBJECTIVE             forwarded as FINETUNE_RUN_AB_OBJECTIVE
-#                                (default: mnrl).
+#   HOWWELL_OBJECTIVE             forwarded as FINETUNE_RUN_AB_OBJECTIVE.
+#                                REQUIRED -- no default (CONTRACT amendment
+#                                2026-08-28: the choice must be made
+#                                deliberately on every dispatch); this
+#                                script refuses loudly if unset.
 #   HOWWELL_LR0_SEEDS             forwarded as FINETUNE_RUN_AB_LR0_SEEDS
 #                                (default: empty — the lr=0 RED control is
 #                                opt-in per H5 campaign step 3).
@@ -69,7 +72,18 @@ if [ -z "$HOWWELL_MODEL_DIR" ]; then
   exit 2
 fi
 HOWWELL_SEEDS="${HOWWELL_SEEDS:-1,2,3,4,5,6,7,8,9,10,11,12}"
-HOWWELL_OBJECTIVE="${HOWWELL_OBJECTIVE:-mnrl}"
+# No silent default (CONTRACT amendment 2026-08-28: "objective stays
+# required-no-default" -- gpu-howwell.yml's own workflow_dispatch `objective`
+# input is REQUIRED for exactly this reason, refusing before this script is
+# even invoked; a `mnrl` fallback here would only be reachable via a DIRECT
+# invocation of this script that bypasses that workflow, silently choosing
+# an objective on the caller's behalf rather than making the choice
+# deliberate on every dispatch).
+HOWWELL_OBJECTIVE="${HOWWELL_OBJECTIVE:-}"
+if [ -z "$HOWWELL_OBJECTIVE" ]; then
+  echo "::error::HOWWELL_OBJECTIVE must be set to 'mnrl' or 'triplet' -- no default (CONTRACT amendment 2026-08-28's own required-no-default rule); gpu-howwell.yml's workflow_dispatch 'objective' input already enforces this on the merge path, but a direct invocation of this script must refuse just as loudly." >&2
+  exit 2
+fi
 HOWWELL_LR0_SEEDS="${HOWWELL_LR0_SEEDS:-}"
 HOWWELL_ARTIFACT_DIR="${HOWWELL_ARTIFACT_DIR:-${REPO_ROOT}/.gpu-pull/how-well}"
 

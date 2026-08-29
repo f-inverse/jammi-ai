@@ -2760,18 +2760,34 @@ def finetune_run_mutant_column_violations(dose_label, patch_sha256, tier):
     column's caller-supplied `patch_sha256` -- a leg claiming a different
     patch than the dose it was invoked under is a labeling error, never
     silently trusted.
+
+    Unit-63 round-8 audit finding 4 (merger half): each of the three fields
+    above, and the caller-supplied `patch_sha256`, is stripped before the
+    emptiness/equality checks -- a whitespace-only value (`" "`) is exactly
+    as absent as `""`/`None` (`:2759`'s pre-fix bare `if not tier.get(field)`
+    passed it straight through), and the sha comparison itself is done on
+    the STRIPPED values on both sides so a leg or caller value that differs
+    only by incidental leading/trailing whitespace is never reported as a
+    labeling-error mismatch. The producer side stamps already-trimmed
+    values (a concurrent bench-dispatch fix); this check does not rely on
+    that and re-trims independently, on both sides, every time.
     """
     violations = list(finetune_run_dispatch_proof_violations("fused", tier))
     violations += finetune_run_arm_premise_violations("fused", tier)
     for field in ("mutant_id", "mutant_base_sha", "mutant_patch_sha256"):
-        if not tier.get(field):
+        value = tier.get(field)
+        if not value or not str(value).strip():
             violations.append(
                 f"mutant leg's own {field!r} is missing/empty -- mutants/README.md's own "
                 "recorded fields (mutant_id, mutant_base_sha, mutant_patch_sha256) must be "
                 "present so this leg is attributable to a specific, auditable mutant patch"
             )
     leg_patch_sha256 = tier.get("mutant_patch_sha256")
-    if leg_patch_sha256 is not None and leg_patch_sha256 != patch_sha256:
+    if (
+        leg_patch_sha256 is not None
+        and str(leg_patch_sha256).strip()
+        and str(leg_patch_sha256).strip() != str(patch_sha256).strip()
+    ):
         violations.append(
             f"leg's own mutant_patch_sha256={leg_patch_sha256!r} does not match this dose "
             f"column's caller-supplied patch_sha256={patch_sha256!r} -- a labeling error, never "
@@ -3167,6 +3183,12 @@ def main(argv=None):
                     )
                     return 2
                 dose_label, patch_sha256, mutant_seeds_s = parts
+                # unit-63 round-8 audit finding 4 (merger half): the
+                # caller-supplied sha is stripped here too, at the SAME
+                # point every other producer-stamped-field trim happens --
+                # a whitespace-only `--mutant-legs` sha must compare as
+                # empty, never as some never-matching opaque string.
+                patch_sha256 = patch_sha256.strip()
                 mutant_seeds = [s for s in mutant_seeds_s.split(",") if s]
                 dose_columns.append(build_mutant_dose_column(fr_raw_dir, dose_label, patch_sha256, mutant_seeds))
             # unit-63 round-7 audit finding 4 / CONTRACT.md addendum

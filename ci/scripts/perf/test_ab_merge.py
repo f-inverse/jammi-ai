@@ -3690,6 +3690,53 @@ class MutantDoseLadderTests(unittest.TestCase):
         self.assertTrue(any("mutant_id" in v for v in col["violations"]), col["violations"])
         self.assertIsNone(col["per_seed"]["1"]["d_i"])
 
+    def test_whitespace_only_provenance_fields_are_treated_as_empty(self):
+        # unit-63 round-8 audit finding 4 (merger half): a whitespace-only
+        # value (" ") for any of the three producer-stamped fields is
+        # exactly as absent as "" or None -- the pre-fix bare
+        # `if not tier.get(field)` check passed it straight through as
+        # though it were present.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_alloff(raw_dir, 1, mean=0.50)
+            _write_mutant_leg(
+                raw_dir,
+                1,
+                "eps0.50",
+                _mutant_tier(
+                    seed=1,
+                    held_out_example_mean=0.70,
+                    mutant_id=" ",
+                    mutant_base_sha="\t",
+                    mutant_patch_sha256="  ",
+                ),
+            )
+            col = ab_merge.build_mutant_dose_column(raw_dir, "eps0.50", self.PATCH_SHA, [1])
+        for field in ("mutant_id", "mutant_base_sha", "mutant_patch_sha256"):
+            self.assertTrue(
+                any(f"{field!r}" in v and "missing/empty" in v for v in col["violations"]),
+                col["violations"],
+            )
+        self.assertIsNone(col["per_seed"]["1"]["d_i"])
+
+    def test_sha_comparison_uses_stripped_values(self):
+        # unit-63 round-8 audit finding 4 (merger half): incidental
+        # leading/trailing whitespace on either side of the sha comparison
+        # must never be reported as a labeling-error mismatch.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_alloff(raw_dir, 1, mean=0.50)
+            _write_mutant_leg(
+                raw_dir,
+                1,
+                "eps0.50",
+                _mutant_tier(seed=1, held_out_example_mean=0.70, mutant_patch_sha256=f"  {self.PATCH_SHA}\t"),
+            )
+            col = ab_merge.build_mutant_dose_column(raw_dir, "eps0.50", f" {self.PATCH_SHA} ", [1])
+        # per-leg violations only -- the column-level "expected exactly 12"
+        # count violation (this test only runs 1 seed) is orthogonal to the
+        # sha-comparison claim under test here.
+        self.assertEqual(col["per_seed"]["1"]["violations"], [])
+        self.assertIsNotNone(col["per_seed"]["1"]["d_i"])
+
     def test_patch_sha256_mismatch_is_refused(self):
         with tempfile.TemporaryDirectory() as raw_dir:
             self._write_alloff(raw_dir, 1, mean=0.50)
@@ -3963,6 +4010,43 @@ class MutantDoseLadderTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIsNone(merged["mutant_dose_ladder"]["sensitivity"])
         self.assertIsNotNone(merged["mutant_dose_ladder"]["sensitivity_error"])
+
+    def test_cli_wiring_strips_the_mutant_legs_sha_before_comparison(self):
+        # unit-63 round-8 audit finding 4 (merger half): the CLI's own
+        # `--mutant-legs DOSE_LABEL:PATCH_SHA256:SEEDS` sha is stripped
+        # before it is used, so a whitespace-padded sha on the command line
+        # is not silently reported as a labeling-error mismatch against a
+        # leg's own (clean) recorded sha, and is recorded stripped in the
+        # merged artifact.
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                _write_mutant_leg(raw_dir, seed, "eps0.50", _mutant_tier(seed=seed, held_out_example_mean=0.70))
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            mutant_spec = f"eps0.50: {self.PATCH_SHA} :{seeds_s}"
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    mutant_spec,
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        dose = merged["mutant_dose_ladder"]["doses"][0]
+        self.assertEqual(dose["patch_sha256"], self.PATCH_SHA)
+        self.assertEqual(dose["violations"], [])
+        self.assertEqual(rc, 0)
 
 
 if __name__ == "__main__":

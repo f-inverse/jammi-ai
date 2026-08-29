@@ -2788,6 +2788,18 @@ def finetune_run_mutant_column_violations(dose_label, patch_sha256, tier):
     labeling-error mismatch. The producer side stamps already-trimmed
     values (a concurrent bench-dispatch fix); this check does not rely on
     that and re-trims independently, on both sides, every time.
+
+    Unit-63 round-10 audit F2: the sha comparison is also done CASE-FOLDED
+    on both sides -- sha hex is case-insensitive by domain, and the
+    producer now lowercases its own stamped `mutant_patch_sha256`
+    (finetune_run.rs's own round-9 advisory (b) fix) while the CLI's own
+    `--mutant-legs` spec is only ever stripped, never case-normalized,
+    before it reaches here. A case-sensitive compare of a canonicalized-
+    lowercase leg value against an uppercase-hex caller spec would report a
+    factually false "labeling error" for a pair that names the exact same
+    patch -- refused here by folding case at the ONE place this comparison
+    is actually made, so it holds regardless of which side (if either)
+    happens to have normalized its own case beforehand.
     """
     violations = list(finetune_run_dispatch_proof_violations("fused", tier))
     violations += finetune_run_arm_premise_violations("fused", tier)
@@ -2803,7 +2815,7 @@ def finetune_run_mutant_column_violations(dose_label, patch_sha256, tier):
     if (
         leg_patch_sha256 is not None
         and str(leg_patch_sha256).strip()
-        and str(leg_patch_sha256).strip() != str(patch_sha256).strip()
+        and str(leg_patch_sha256).strip().lower() != str(patch_sha256).strip().lower()
     ):
         violations.append(
             f"leg's own mutant_patch_sha256={leg_patch_sha256!r} does not match this dose "
@@ -3405,7 +3417,14 @@ def main(argv=None):
                 # point every other producer-stamped-field trim happens --
                 # a whitespace-only `--mutant-legs` sha must compare as
                 # empty, never as some never-matching opaque string.
-                patch_sha256 = patch_sha256.strip()
+                # unit-63 round-10 audit F2: also lowercased here -- sha hex
+                # is case-insensitive by domain, and the producer now
+                # canonicalizes its own stamped sha to lowercase, so the
+                # caller-supplied spec is folded to the SAME case rather
+                # than relying solely on the comparison site
+                # (finetune_run_mutant_column_violations, which case-folds
+                # independently too, so this holds either way).
+                patch_sha256 = patch_sha256.strip().lower()
                 mutant_seeds = [s for s in mutant_seeds_s.split(",") if s]
                 dose_columns.append(build_mutant_dose_column(fr_raw_dir, dose_label, patch_sha256, mutant_seeds))
             # unit-63 round-7 audit finding 4 / CONTRACT.md addendum

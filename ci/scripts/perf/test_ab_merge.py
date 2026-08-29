@@ -3757,6 +3757,34 @@ class MutantDoseLadderTests(unittest.TestCase):
         self.assertEqual(col["per_seed"]["1"]["violations"], [])
         self.assertIsNotNone(col["per_seed"]["1"]["d_i"])
 
+    def test_sha_comparison_is_case_insensitive_in_every_case_combination(self):
+        # unit-63 round-10 audit F2: sha hex is case-insensitive by domain.
+        # The producer now canonicalizes its own stamped mutant_patch_sha256
+        # to lowercase (round-9 advisory (b)) -- an upper/upper pair that
+        # matched before that change must still match, and every other
+        # (leg-case, caller-case) combination must match too, since the
+        # comparison itself now folds case on both sides.
+        base_sha = self.PATCH_SHA  # already all-lowercase
+        case_cells = [
+            ("lower", "lower", base_sha, base_sha),
+            ("lower", "upper", base_sha, base_sha.upper()),
+            ("upper", "lower", base_sha.upper(), base_sha),
+            ("upper", "upper", base_sha.upper(), base_sha.upper()),
+        ]
+        for leg_case, caller_case, leg_sha, caller_sha in case_cells:
+            with self.subTest(leg_case=leg_case, caller_case=caller_case):
+                with tempfile.TemporaryDirectory() as raw_dir:
+                    self._write_alloff(raw_dir, 1, mean=0.50)
+                    _write_mutant_leg(
+                        raw_dir,
+                        1,
+                        "eps0.50",
+                        _mutant_tier(seed=1, held_out_example_mean=0.70, mutant_patch_sha256=leg_sha),
+                    )
+                    col = ab_merge.build_mutant_dose_column(raw_dir, "eps0.50", caller_sha, [1])
+                self.assertEqual(col["per_seed"]["1"]["violations"], [])
+                self.assertIsNotNone(col["per_seed"]["1"]["d_i"])
+
     def test_patch_sha256_mismatch_is_refused(self):
         with tempfile.TemporaryDirectory() as raw_dir:
             self._write_alloff(raw_dir, 1, mean=0.50)

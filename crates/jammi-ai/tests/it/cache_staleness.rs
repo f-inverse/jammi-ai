@@ -522,8 +522,9 @@ async fn warm_hit_after_preprocessor_config_appearing_reloads_fresh() {
 /// post-mutation model must be able to be resident AT THE SAME TIME for the
 /// `available() == 0` assertion below to mean anything, so `do_load`'s
 /// admission loop here always succeeds on its very first `try_acquire` and
-/// never calls `evict_one` or falls back to `GpuScheduler::acquire`'s async
-/// wait at all. See
+/// never calls `evict_one` or reaches the loop's own dual-notify admission
+/// wait at all (see `ModelCache::do_load`'s admission loop doc for the
+/// wake-set enumeration). See
 /// `stale_reload_while_guard_live_waits_for_release_under_a_realistic_budget`
 /// below for the item-2-specific coverage: a budget sized to exactly ONE
 /// resident copy (not two), where the SAME "guard held across a stale
@@ -654,8 +655,11 @@ async fn stale_eviction_never_double_books_gpu_memory_while_guard_held() {
 /// assertion below fails (the task has already completed), and the final
 /// join fails too (`Err`, never `Ok`).
 ///
-/// GREEN post-fix: `do_load` falls back to `GpuScheduler::acquire`'s async
-/// wait once `evict_one` finds nothing AND the request is within the
+/// GREEN post-fix: `do_load` continues waiting in its own dual-notify
+/// admission loop (a permit-release notify plus a guard-idle notify,
+/// registered before each `try_acquire`/`evict_one` pass — see
+/// `ModelCache::do_load`'s admission loop doc for the full wake-set
+/// enumeration) once `evict_one` finds nothing AND the request is within the
 /// scheduler's total usable budget (`memory_bytes <= usable_capacity()` —
 /// here `memory_bytes == weights_len == usable_capacity()`, so this is NOT
 /// the genuinely-over-budget case) — the reload genuinely blocks until
@@ -763,9 +767,10 @@ async fn stale_reload_while_guard_live_waits_for_release_under_a_realistic_budge
         Ok(joined) => joined.unwrap(),
         Err(_) => panic!(
             "the reload never completed within 10s after warm_guard's release — \
-             a hang would mean GpuScheduler::acquire's wait never woke, which \
-             would itself be a distinct regression from the hard-error bug this \
-             test targets"
+             a hang would mean do_load's own dual-notify admission loop (see \
+             ModelCache::do_load's admission loop doc for the wake-set \
+             enumeration) never woke, which would itself be a distinct \
+             regression from the hard-error bug this test targets"
         ),
     };
     match result {

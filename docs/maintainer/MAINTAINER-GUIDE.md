@@ -2108,7 +2108,13 @@ note below.
   from under it.
 - **`ModelCache`** — `crates/jammi-ai/src/model/cache.rs` (the `ModelCache` struct): LRU
   + single-flight + ref-counted entries + GPU-permit-gated admission. The `GpuPermit` is
-  *moved into* the `CacheEntry` (`_gpu_permit`), so **permit lifetime == entry lifetime**.
+  `Arc`-shared, not moved: `CacheEntry` holds its own clone (`gpu_permit`) and every live
+  `ModelGuard` holds another (`_gpu_permit`), so permit lifetime is **not** entry lifetime
+  — the reservation is released only when the *last* `Arc<GpuPermit>` clone drops.
+  `evict_one` therefore gates real progress on `ref_count == 0` **and**
+  `Arc::strong_count(&entry.gpu_permit) == 1` (the entry's own clone is the only one
+  left); an entry that is idle by ref-count but still has an outstanding guard-held clone
+  is skipped, not removed.
   `ModelCache::preload` is a thin `get_or_load`-then-`drop` warmer taking an *explicit*
   `(source, task, backend_hint)` — it does **not** read any config list, and it is called
   only from a test (`crates/jammi-ai/tests/it/models.rs`). `config.preload_models`

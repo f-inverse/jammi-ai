@@ -233,8 +233,11 @@ manifest, not a prose sketch.
   path under it), `head_sha` (full or a >=7-char prefix), or `unit_branch` of the SAME
   `agent_type`, AND no **accepted relay artifact**
   (`.jammi/gate-state/<slug>.relay.<agent_type>.<block_ts>.json`, written by the
-  lead directly — never scanned from message prose — whose `sites` keys are an
-  exact-string superset of the verifier's `class_enumeration`) exists for that
+  lead directly — never scanned from message prose — satisfying a CONJUNCTION,
+  esc-064: `sites` keys an exact-string superset of the verifier's
+  `class_enumeration` whenever that enumeration is non-empty, AND — always — a
+  `probe` array of ≥2 distinct sites outside the enumeration and every finding
+  location, the lead's adjacent sweep on the record) exists for that
   `(unit, agent_type, block_ts)`. A first dispatch of any type is structurally
   never gated. `SendMessage` gating, implementer-dispatch binding, and the Bash
   backstop are DROPPED ENTIRELY (not log-only): round 1 and round 2 both proved

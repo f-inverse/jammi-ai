@@ -21,7 +21,11 @@ why the remaining design still closes the expensive loop, F10):
   match). The relay artifact (`.jammi/gate-state/<slug>.relay.<agent_type>.
   <block_ts>.json`) is written by the LEAD directly (Write is not gated);
   the hook only ever READS it fresh, every time — never appends an
-  "accepted" row itself, so there is no phantom-acceptance state to corrupt.
+  "accepted" row itself, so there is no phantom-acceptance state to corrupt. The
+  relay's requirements are a CONJUNCTION (esc-064): coverage (`sites`) is
+  armed by a non-empty `class_enumeration` — the data, never the recorded
+  `enumeration_missing` flag — and adjacent probing (`probe`, >=2 distinct
+  sites outside enumeration+findings) is armed ALWAYS.
 
 Explicitly OUT OF SCOPE by this cut (dropped entirely, not log-only):
 `SendMessage` gating and all message-prose parsing; implementer-dispatch
@@ -303,6 +307,9 @@ def parse_verdict_fields(data: dict | None) -> dict:
         class_enum = []
     sweep_method = data.get("sweep_method") if data else None
     exhaustive = bool(data.get("exhaustive", False)) if data else False
+    # DIAGNOSTIC ONLY — no gate decision reads this field (esc-064: a flag
+    # with a weak-arm default once selected the weaker relay requirement;
+    # `_relay_rejection` derives its arms from the DATA instead).
     enumeration_missing = (not data) or ("class_enumeration" not in data) or (len(class_enum) == 0)
     unit_branch_raw = data.get("unit_branch") if data else None
     unit_branch, unit_branch_note = _normalize_unit_branch(unit_branch_raw)
@@ -416,7 +423,10 @@ def _adversarial_audit_cleared_by_verifier_pass(sdir: Path, unit_slug: str, aa_r
                                                   aa_idx: int, by_type: dict) -> bool:
     """A fix-verifier/acceptance-verifier PASS ALSO clears an older
     adversarial-audit BLOCK on the same unit IF an accepted relay artifact
-    for that BLOCK exists (the normal workflow's resolution path)."""
+    for that BLOCK exists (the normal workflow's resolution path).
+    Inherits the esc-064 conjunction via `_relay_accepted` — deliberately
+    the predicate, not this caller (though per the G13 note this arm has
+    no independently observable effect in any reachable state)."""
     if not _relay_accepted(sdir, unit_slug, aa_row):
         return False
     for t in ("fix-verifier", "acceptance-verifier"):
@@ -487,49 +497,84 @@ def relay_artifact_path(sdir: Path, unit_slug: str, agent_type: str, block_ts: s
     return sdir / f"{unit_slug}.relay.{_fs_safe(agent_type)}.{_fs_safe(block_ts)}.json"
 
 
-def _relay_accepted(sdir: Path, unit_slug: str, row: dict) -> bool:
+def _probe_normalize(s: str) -> str:
+    """Zero-width/control characters (Unicode categories Cf/Cc) dropped, then
+    surrounding whitespace stripped — applied to BOTH sides of the
+    probe/reactive comparison. This is NOT the normalization the `sites`
+    doctrine bans: normalizing `sites` would make acceptance EASIER, while
+    this normalization is provably monotone-toward-DENY — it can only shrink
+    the adjacent set (a padded or invisible-char entry either collapses onto
+    a reactive site or onto its own duplicate). esc-064 mutant C and its
+    zero-width sibling class."""
+    import unicodedata
+    cleaned = "".join(ch for ch in s if unicodedata.category(ch) not in ("Cf", "Cc"))
+    return cleaned.strip()
+
+
+def _relay_rejection(sdir: Path, unit_slug: str, row: dict) -> str | None:
+    """`None` == accepted; otherwise the operator-facing REASON the relay is
+    missing or insufficient.
+
+    The relay's requirements are a CONJUNCTION, never a two-arm disjunction
+    (esc-064): R1 (coverage) is armed by the DATA — a non-empty
+    `class_enumeration` — and R2 (adjacent probing) is armed ALWAYS, for
+    every gated verifier type's relay. The recorded `enumeration_missing`
+    flag is diagnostic only and is never read here: a flag with a weak-arm
+    default let a legacy/hand-edited row take the fallback arm and drop a
+    requirement entirely."""
     agent_type = row.get("agent_type") or ""
     block_ts = row.get("ts") or ""
     unit_branch = row.get("unit_branch")
     if not block_ts or not agent_type:
-        return False
+        return "BLOCK row carries no ts/agent_type to match a relay against"
     path = relay_artifact_path(sdir, unit_slug, agent_type, block_ts)
     if not path.exists():
-        return False
+        return "no relay artifact exists"
     try:
         data = json.loads(path.read_text())
     except Exception:
-        return False
+        return "relay artifact is not valid JSON"
     if not isinstance(data, dict):
-        return False
+        return "relay artifact is not a JSON object"
     if data.get("unit_branch") != unit_branch:
-        return False
+        return "relay `unit_branch` does not match the BLOCK row's"
     if data.get("agent_type") != agent_type:
-        return False
+        return "relay `agent_type` does not match the BLOCK row's"
     if data.get("block_ts") != block_ts:
-        return False
+        return "relay `block_ts` does not match the BLOCK row's own ts"
 
-    class_enum = row.get("class_enumeration") or []
-    enum_missing = bool(row.get("enumeration_missing", True)) or not class_enum
+    class_enum = [s for s in (row.get("class_enumeration") or []) if isinstance(s, str)]
+    finding_locs = [s for s in (row.get("finding_locations") or []) if isinstance(s, str)]
 
-    if not enum_missing:
+    # R1 COVERAGE — content supplied by the enumeration; never gates R2.
+    if class_enum:
         sites = data.get("sites")
         if not isinstance(sites, dict):
-            return False
+            return "relay has no `sites` object, but the BLOCK enumerated a class"
         if not all(isinstance(v, str) and v.strip() for v in sites.values()):
-            return False
-        return set(class_enum) <= set(sites.keys())
+            return "relay `sites` has an empty/non-string disposition value"
+        missing = [s for s in class_enum if s not in sites]
+        if missing:
+            return f"relay `sites` omits {len(missing)} enumerated site(s), e.g. {missing[:3]}"
 
+    # R2 PROACTIVITY — ARMED UNCONDITIONALLY (the esc-064 fix).
     probe = data.get("probe")
     if not isinstance(probe, list):
-        return False
-    probe_strs = [p for p in probe if isinstance(p, str) and p.strip()]
-    if len(probe_strs) < 2:
-        return False
-    finding_locs = set(row.get("finding_locations") or [])
-    if any(p in finding_locs for p in probe_strs):
-        return False
-    return True
+        return ("relay carries no `probe` array — on a BLOCK the lead must probe "
+                "ADJACENT to the class and name >=2 sites it EXAMINED and found "
+                "clean (outside the enumeration/findings) before re-dispatching")
+    reactive = {_probe_normalize(s) for s in class_enum} | {_probe_normalize(s) for s in finding_locs}
+    adjacent = {_probe_normalize(p) for p in probe if isinstance(p, str) and _probe_normalize(p)} - reactive
+    if len(adjacent) < 2:
+        return (f"relay `probe` names {len(adjacent)} distinct site(s) outside the verifier's "
+                "own class_enumeration/findings (>=2 required) — restating the enumeration "
+                "is reactive acknowledgment, not adjacent probing; name >=2 sites you "
+                "EXAMINED and found clean (esc-064)")
+    return None
+
+
+def _relay_accepted(sdir: Path, unit_slug: str, row: dict) -> bool:
+    return _relay_rejection(sdir, unit_slug, row) is None
 
 
 def _diagnose_row(row: dict) -> str:
@@ -628,12 +673,14 @@ def _decide_verifier_dispatch(subtype: str, prompt: str, sdir: Path) -> tuple[bo
             "dispatch — a first dispatch of this type, or an unlabeled re-dispatch "
             "(the documented visible residual)"
         )
-    unresolved = [(u, r) for u, r in targeted if not _relay_accepted(sdir, u, r)]
+    unresolved = [(u, r, why) for u, r in targeted
+                  for why in [_relay_rejection(sdir, u, r)] if why is not None]
     if unresolved:
-        names = ", ".join(f"{u}/{r.get('agent_type')}{_diagnose_row(r)}" for u, r in unresolved)
+        names = "; ".join(f"{u}/{r.get('agent_type')}{_diagnose_row(r)}: {why}"
+                           for u, r, why in unresolved)
         return False, (
-            f"a second {subtype} dispatch naming {names} is denied — no accepted relay "
-            "artifact exists for that (unit, agent_type, block_ts)"
+            f"a second {subtype} dispatch naming {names} is denied — the relay artifact "
+            "for that (unit, agent_type, block_ts) is missing or insufficient"
         )
     return True, f"every named {subtype} BLOCK has an accepted relay artifact — allowed"
 

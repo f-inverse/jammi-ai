@@ -177,12 +177,29 @@ fn build_fixture(device: &Device) -> Fixture {
     }
 }
 
+/// Extracts the pooled row as `Vec<f32>` for the alone-encode leg, dtype-robust
+/// to the encoder's backbone dtype: on CPU the encoder runs (and emits) `F32`,
+/// so `to_dtype(F32)` is a no-op; on CUDA the encoder emits `BF16` (pod
+/// evidence, unit 62: `measure_gpu_floors_print_only` panicked here with
+/// `unexpected dtype, expected: F32, got: BF16` before this fix), so the
+/// explicit cast converts the OUTPUT for extraction only -- the computation
+/// itself stays at the encoder's own dtype (`bf16` on CUDA); this function
+/// never widens the arithmetic, only the value it hands back for comparison.
+/// Mirrors `src/modernbert.rs`'s own CUDA test idiom (e.g.
+/// `forward_hidden_dispatches_attention_block_flash_fused_on_a_dense_cuda_bf16_checkpoint`):
+/// `.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap()`.
 fn pooled_alone(encoder: &ModernBert, device: &Device, row: &[u32]) -> Vec<f32> {
     let len = row.len();
     let ids = Tensor::from_vec(row.to_vec(), (1, len), device).unwrap();
     let mask = Tensor::from_vec(vec![1u32; len], (1, len), device).unwrap();
     let pooled = encoder.forward(&ids, &mask).expect("alone forward");
-    pooled.flatten_all().unwrap().to_vec1().unwrap()
+    pooled
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap()
 }
 
 fn assert_all_finite(v: &[f32], what: &str) {

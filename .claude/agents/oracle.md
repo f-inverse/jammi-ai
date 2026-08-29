@@ -44,7 +44,7 @@ Emit exactly one fenced ```json block as the LAST fenced block of your final mes
   "kind": "verdict",
   "agent": "oracle",
   "diff_range": "<base>...<head>",
-  "unit_branch": "<the branch you read, from git or the lead's unit: line — say which>",
+  "unit_branch": "<bare branch name>", "unit_branch_source": "<git or the lead's unit_branch line — say which>",
   "head_sha": "<sha you read>",
   "worktree": "<the absolute path you read the diff from — the SubagentStop hook records this as a second-round-rule anchor (worktree/head_sha/unit_branch, matched as whole tokens, never raw substrings), the lead-proactivity gate v3>",
   "verdict": "PASS | HARD_BLOCK",

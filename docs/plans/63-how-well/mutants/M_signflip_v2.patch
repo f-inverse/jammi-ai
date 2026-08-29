@@ -1,0 +1,31 @@
+diff --git a/crates/jammi-kernels/src/ops/adamw_step.rs b/crates/jammi-kernels/src/ops/adamw_step.rs
+index 58a1418c..beb14df9 100644
+--- a/crates/jammi-kernels/src/ops/adamw_step.rs
++++ b/crates/jammi-kernels/src/ops/adamw_step.rs
+@@ -637,11 +637,25 @@ pub fn adamw_step_fused_t(
+         grad,
+         AdamMomentUpdate::new(params.beta2, true),
+     )?;
++    // MUTANT M_signflip_v2 (Unit 63 RED-proof pair, docs/plans/63-how-well/
++    // mutants/M_signflip_v2.patch): negates the update at a
++    // DISPATCH-INVARIANT site -- the Rust-side `lr` scalar threaded into
++    // `AdamThetaUpdate::new` -- instead of `AdamThetaUpdate::cpu_fwd`'s
++    // CPU-only arithmetic (v1's mistake: `cuda_fwd` reads its own compiled
++    // `.cu` kernel, never `cpu_fwd`'s Rust body, so a CPU-only edit is
++    // inert on the CUDA arm). `AdamThetaUpdate::new` bakes `lr` into BOTH
++    // `one_minus_lr_lambda` (`1.0 - lr*weight_decay`) and its own stored
++    // `lr` field, and BOTH `cpu_fwd` and `cuda_fwd` read those same struct
++    // fields -- exactly the site the `(1+eps)` lr-scale family already
++    // proved reaches the CUDA arm on hardware. Predicted degradation with
++    // CERTAINTY on both arms: gradient ascent, same mechanism as v1.
++    // NEVER MERGE: production must pass `params.lr` unnegated.
++    let lr_signflip = -params.lr;
+     super::apply_inplace3(
+         theta,
+         first_moment,
+         second_moment,
+-        AdamThetaUpdate::new(params.lr, params.weight_decay, scale_m, scale_v, params.eps),
++        AdamThetaUpdate::new(lr_signflip, params.weight_decay, scale_m, scale_v, params.eps),
+     )
+ }
+ 

@@ -607,9 +607,13 @@ member of the `(1+eps)` family (however far `eps` is pushed within its
 shape — a defect that is not merely "the same update, rescaled" but a
 qualitatively different corruption of the fused update.
 
-Two such mutants are pinned here, both against base `e340391c`, both
-patch-file-only (never applied to tree state on this branch), both
-touching ONLY `adamw_step_fused_t`'s fused path inside
+Two mutants were originally pinned here (`M_nobc`, `M_signflip`); a third
+(`M_signflip_v2`) supersedes `M_signflip` after its own GPU measurement
+(see that section's "Measured"/lesson notes below). All three are against
+base `e340391c` (`M_signflip_v2.patch` is cut against `74fd69ef` — same
+byte-identical `adamw_step.rs`, blob `58a1418c`), all patch-file-only
+(never applied to tree state on this branch), all touching ONLY
+`adamw_step_fused_t`'s fused path inside
 `crates/jammi-kernels/src/ops/adamw_step.rs` (no dispatch/identity surface
 touched — `InplaceOp2::name()`/`InplaceOp3::name()`, `validate_step_domain`,
 and every `DispatchCounters`/`admission` field read identical to a clean
@@ -650,7 +654,24 @@ transient (m/v are zero-initialized, so v_hat's `eps` floor and the
 did. No claim of degradation is made for `M_nobc` before it is actually
 run; this is the honest complement to `M_signflip` below.
 
-### `M_signflip` — inverted-sign update (gradient ascent)
+**Measured (12-leg GPU, a100, `redproof-nobc`): NOT DETECTED.** `M_nobc`
+IS a genuine perturbation on hardware — 0/12 legs bit-identical to the
+clean fused column (unlike `M_signflip` v1 below, this mutant fires on the
+CUDA arm exactly as designed, since it changes a Rust-side scalar
+(`scale_m`/`scale_v`) fed into `AdamThetaUpdate`, a struct field both
+`cpu_fwd` and `cuda_fwd` read identically — see `M_signflip_v2`'s own
+"dispatch-invariant site" framing below, which this mutant already
+satisfied by construction). But the sign test read `n_pos=5/12`,
+`mean_d=-0.018` — **not-detected** under the `>=11/12+mean` rule (the
+uncertain prediction above is BORNE OUT as the neutral/mixed outcome, not
+the degradation one): the no-bias-correction shape does not degrade
+held-out loss at this operating point. This is an honest, real,
+non-vacuous non-detection (genuinely perturbed hardware legs, correctly
+measured, correctly failing to reach the threshold) — never suppressed or
+silently retried with a larger dose, per this file's own "Pass criterion"
+section above.
+
+### `M_signflip` — inverted-sign update (gradient ascent) — SUPERSEDED, honest inert-on-GPU record
 
 **Definition:** `AdamThetaUpdate::cpu_fwd`'s final line is changed from
 `theta[it] = theta_scaled - adj_scaled` to
@@ -674,6 +695,43 @@ independent of this fixture's particular loss-surface geometry near
 this pair: if `M_nobc` reads neutral-or-improving (plausible per its own
 uncertain prediction above), `M_signflip` still discharges acceptance 5's
 "mutant column proven RED" on its own.
+
+**Measured (12-leg GPU, a100, `redproof-signflip`): INERT — 12/12 legs
+bit-identical to the clean fused column. This patch is retired; see
+`M_signflip_v2` below.** The lead's own bit-identity check on the raw legs
+caught this before a false "gradient ascent doesn't degrade" conclusion
+could form from an apparent not-detected/neutral sign-test result. Root
+cause: this patch edits `AdamThetaUpdate::cpu_fwd`'s Rust body only, but
+the campaign's fused arm dispatches the CUDA kernel on a100 —
+`AdamThetaUpdate::cuda_fwd` calls `crate::cuda::adamw_step::
+theta_update_cuda_fwd`, which runs its own compiled `cuda/adamw_step.cu`
+PTX, never `cpu_fwd`'s Rust body. The CPU-side demonstration above
+(`3.464057e-3`..`1.7320165e-2` L2 divergence) is real and correctly shows
+`cpu_fwd` diverging from the oracle — the demonstration procedure itself
+worked exactly as designed — but it demonstrates a perturbation that never
+reaches the arm the 12-leg GPU gate actually exercises. This is the
+opposite failure mode from a premise violation (the legs were premise-CLEAN
+— dispatch/admission fields read identical to a clean fused leg, exactly as
+"no dispatch/identity surface touched" promised above) — the arithmetic
+perturbation itself simply never executed on the measured arm.
+
+**The lesson, stated plainly (current-truth discipline): a kernel mutant
+patch must perturb a DISPATCH-INVARIANT site, or be verified per-arm
+before scheduling.** `AdamThetaUpdate`'s two forward methods
+(`cpu_fwd`/`cuda_fwd`) are separate implementations behind one trait, each
+compiled into its own arm's code path — editing one never touches the
+other. The `(1+eps)` lr-scale family (and `M_nobc`, which edits
+`scale_m`/`scale_v` in `adamw_step_fused_t` itself, upstream of BOTH
+`cpu_fwd`/`cuda_fwd`) already proved the SAFE pattern on hardware: perturb
+a plain Rust scalar/struct field constructed in `adamw_step_fused_t`
+BEFORE the `InplaceOp3::cpu_fwd`/`cuda_fwd` split, so both arms read the
+SAME already-perturbed value — never a per-backend `cpu_fwd`/`cuda_fwd`
+body edit without an explicit, separate check (or, absent CUDA hardware to
+check against, a same-shape design note citing the precedent) that the
+CUDA arm's own independent implementation carries the equivalent change.
+`M_signflip_v2` (below) applies this lesson: it moves the sign flip to
+`adamw_step_fused_t`'s own `lr` scalar, the exact site the `(1+eps)`
+family already proved reaches CUDA on a100.
 
 **CPU demonstration (not committed, per the dose ladder's own procedure
 above):** the same temporary
@@ -713,22 +771,92 @@ divergence from the correct trajectory grows every step regardless of
 one-parameter family, so no such linear relationship is predicted or
 claimed here.
 
+### `M_signflip_v2` — inverted-sign update at a dispatch-invariant site (replaces `M_signflip`)
+
+**Definition:** `adamw_step_fused_t` negates its own local `lr` scalar
+(`let lr_signflip = -params.lr;`) and passes `lr_signflip` — not
+`params.lr` — into `AdamThetaUpdate::new(...)`. `AdamThetaUpdate::new`
+bakes this value into BOTH `one_minus_lr_lambda` (`1.0 - lr*weight_decay`,
+computed once at construction) and its own stored `lr` field, and BOTH
+`AdamThetaUpdate::cpu_fwd` and `AdamThetaUpdate::cuda_fwd` read those SAME
+struct fields — this is the identical shape (a plain Rust scalar perturbed
+in `adamw_step_fused_t`, upstream of the CPU/CUDA fork) the `(1+eps)`
+lr-scale family already used, and that family's own scheduled doses
+(`eps-0.50`/`eps-0.10`) were measured firing on the a100 GPU legs (11/12
+concordance, `p=0.00635`) — i.e. this exact site is PROVEN dispatch-
+invariant on hardware, not merely argued from source structure. Unlike
+`M_signflip` v1, this patch touches ZERO lines inside either `cpu_fwd` or
+`cuda_fwd` — the sign flip happens entirely in `adamw_step_fused_t`,
+before the `InplaceOp3` call.
+
+**Predicted direction: DEGRADATION, with CERTAINTY — same mechanism as
+`M_signflip` v1.** Negating `lr` negates the update the SAME way `-=`
+becoming `+=` did (`adj_scaled = adjusted_grad * lr_signflip + 0.0f32`
+inside `cpu_fwd`/the CUDA kernel is now the correct term with the WRONG
+sign folded in upstream, rather than the sign flipped at the final
+combine) — gradient ASCENT on `adjusted_grad`'s direction, every step,
+compounding for the length of the run. This mutant ALSO flips the sign of
+the `weight_decay` contribution (`one_minus_lr_lambda = 1.0 -
+lr_signflip*weight_decay = 1.0 + params.lr*weight_decay`, since
+`lr_signflip` is negative) — theta's own magnitude grows slightly from the
+decay term too, rather than shrinking; this is a strictly ADDITIONAL
+degradation pressure in the same direction (more, not less, certain to
+degrade), not a competing effect, so the CERTAINTY prediction is
+unaffected. This prediction, like v1's, requires no secant extrapolation —
+it follows directly from what a gradient step IS.
+
+**CPU demonstration** (same fixed 4-element input, `mutant_dose_
+demonstration_diverges_from_the_correct_oracle`, patch applied, test added,
+run, both reverted):
+
+```
+M_signflip_v2:
+step=1 l2_divergence=3.519166e-3
+step=2 l2_divergence=7.038332e-3
+step=3 l2_divergence=1.0557481e-2
+step=4 l2_divergence=1.4076664e-2
+step=5 l2_divergence=1.7595848e-2
+```
+
+Close to (not identical to) `M_signflip` v1's own CPU numbers
+(`3.464057e-3`..`1.7320165e-2`) — the small difference is exactly the
+additional weight-decay-sign effect described above (v1 only flipped the
+`adjusted_grad` combine; v2 flips `lr` itself, which ALSO flips
+`one_minus_lr_lambda`'s sign contribution) — both real, growing, non-trivial
+divergences confirming a genuine gradient-ascent perturbation on the CPU
+arm; the fix over v1 is that this same Rust-level scalar change is what
+also reaches the CUDA arm (per the `(1+eps)` family's own hardware
+precedent), not a claim that the CPU numbers themselves are new evidence
+beyond v1's.
+
 **Patch sha256s** (both against base `e340391c`, verified `git apply
 --check` clean at that sha, verified apply -> `cargo build -p jammi-kernels`
-(exit 0) -> `git checkout --` revert, independently, one mutant at a time):
+(exit 0) -> `git checkout --` revert, independently, one mutant at a time;
+`M_signflip_v2.patch` against base `74fd69ef` — `adamw_step.rs` is
+byte-identical to `e340391c`'s copy, same blob `58a1418c`):
 
 - `M_nobc.patch` — sha256
   `9b3c824dc041899c12c0e2d44d12a3ac8c7b86076ffc778638108925ba51bf4e`
-- `M_signflip.patch` — sha256
-  `fb2bd11935e9a08e8a1197aa3a84535660119823aabb421105e389a388f6e5e4`
+  — measured NOT-DETECTED (see "Measured" above); still a candidate for
+  re-dosing at a larger magnitude if a stronger RED-proof degradation
+  demonstration is later needed, but that is not scheduled here.
+- `M_signflip.patch` — sha256 `fb2bd11935e9a08e8a1197aa3a84535660119823aabb421105e389a388f6e5e4`
+  — **RETIRED, measured INERT on GPU (12/12 bit-identical)**; kept
+  patch-file-only for the record, never scheduled to run again.
+- `M_signflip_v2.patch` — sha256
+  `c81d0ed59d45761bbd6487dbb23c5aaae22f30739c0e2e613d96c4901ad9b202` —
+  **scheduled** (replaces `M_signflip` as the guaranteed RED-proof
+  degradation candidate).
 
 **Run procedure:** identical to the dose ladder's own on-pod procedure
 above (scratch worktree at the recorded base sha, `git apply --check` then
 `git apply`, build with the campaign's exact feature list, run the SAME
 12-seed `run_leg` vector substituted into the fused arm, merge against the
 SAME campaign `alloff` legs, stamp `--mutant-id`/`--mutant-base-sha`/
-`--mutant-patch-sha256`, tear down after) — with dose labels `nobc` and
-`signflip` in place of an `epsNN` label.
+`--mutant-patch-sha256`, tear down after) — with dose labels
+`redproof-nobc` and `redproof-signflip-v2` (NOT `redproof-signflip`, which
+names the retired, measured-inert v1 patch) in place of an `epsNN` label,
+per the RED-proof label class below.
 
 **RED-proof label class (`ci/scripts/perf/ab_merge.py`, unit 63, CONTRACT.md
 addendum 2026-08-29c's own dated postscript): the RED-proof verdict is a
@@ -789,20 +917,41 @@ same carve-out every dose column gets) is caught by the SAME
 `invalid_doses` check every column in `doses[]` already goes through,
 non-zero exit exactly as everywhere else in this module.
 
-**Scheduling `M_nobc`/`M_signflip`:** pass `--mutant-legs
-redproof-nobc:<M_nobc sha256>:<seeds>` and `--mutant-legs
-redproof-signflip:<M_signflip sha256>:<seeds>` to the SAME `ab_merge.py
-finetune-run` invocation the campaign's primary decision (and, if
-co-scheduled, the eps-family dose ladder) already runs — the legs
-themselves are stamped exactly per the on-pod procedure above
-(`--mutant-id`/`--mutant-base-sha`/`--mutant-patch-sha256`, `dose_label =
-redproof-nobc` / `redproof-signflip`, matching this section's own already-
-stamped legs). Read the RED-proof verdict directly off
-`mutant_dose_ladder.red_proof_verdict` and `.red_proof[]` in that
-invocation's own artifact — never off a separate invocation's exit code,
-and never off `sensitivity`/`two_sided_falsification`/`dose_anomalies`,
-which remain scoped to the eps family only and are unaffected by a
-co-scheduled RED-proof column (and vice versa).
+**Measured record (12-leg GPU, a100), current-truth discipline:**
+`--mutant-legs redproof-nobc:<M_nobc sha256>:<seeds>` and `--mutant-legs
+redproof-signflip:<M_signflip v1 sha256>:<seeds>` were run against the
+SAME `ab_merge.py finetune-run` invocation the campaign's primary decision
+uses. `redproof-nobc` read `detected=not-detected` (`n_pos=5/12`,
+`mean_d=-0.018`, see `M_nobc`'s own "Measured" note above); `redproof-
+signflip` read 12/12 legs bit-identical to the clean fused column (see
+`M_signflip` v1's own "Measured"/"lesson" notes above) — the lead's own
+bit-identity check on the raw legs, not the sign-test verdict itself,
+caught this before any conclusion was drawn from it. Neither column
+discharged acceptance 5 (`red_proof_verdict` was `NOT_PROVEN`, correctly,
+since `redproof-nobc` was a genuine not-detection and `redproof-signflip`
+never measured the mutant it claimed to on this arm).
+
+**Scheduling `M_signflip_v2` (replaces `redproof-signflip`):** pass
+`--mutant-legs redproof-signflip-v2:<M_signflip_v2 sha256>:<seeds>` (never
+reuse the retired `redproof-signflip` label — a repeated literal label is
+refused by `mutant_dose_ladder_reject_duplicate_doses` if it were ever
+supplied twice, and reusing it for a DIFFERENT patch would violate "one
+dose, one label" even if the merger's own sha check did not already catch
+it) to the SAME `ab_merge.py finetune-run` invocation the campaign's
+primary decision (and, if co-scheduled, the eps-family dose ladder and
+`redproof-nobc`) already runs — the legs themselves stamped exactly per the
+on-pod procedure above (`--mutant-id`/`--mutant-base-sha`/
+`--mutant-patch-sha256`, `dose_label = redproof-signflip-v2`). Read the
+RED-proof verdict directly off `mutant_dose_ladder.red_proof_verdict` and
+`.red_proof[]` in that invocation's own artifact — never off a separate
+invocation's exit code, and never off `sensitivity`/`two_sided_
+falsification`/`dose_anomalies`, which remain scoped to the eps family
+only and are unaffected by a co-scheduled RED-proof column (and vice
+versa). Given `M_signflip_v2`'s dispatch-invariant site (proven on
+hardware by the `(1+eps)` family) and its certainty prediction, this run
+is expected to read `redproof-signflip-v2: RED` and discharge acceptance
+5's "mutant column proven RED" — but that expectation is a prediction to
+be measured, not assumed, per this file's own family F/K discipline.
 
 ## Files
 
@@ -826,11 +975,25 @@ co-scheduled RED-proof column (and vice versa).
 - `M_nobc.patch` — bias correction removed entirely (RED-proof pair,
   outside the lr-scale family); committed unified diff against `e340391c`;
   sha256 `9b3c824dc041899c12c0e2d44d12a3ac8c7b86076ffc778638108925ba51bf4e`;
-  patch-file-only; predicted direction UNCERTAIN (see "RED-proof mutants"
-  above).
-- `M_signflip.patch` — inverted-sign fused update (RED-proof pair, outside
-  the lr-scale family); committed unified diff against `e340391c`; sha256
+  patch-file-only; **measured NOT-DETECTED** on 12-leg GPU
+  (`redproof-nobc`, `n_pos=5/12`, `mean_d=-0.018` — see "RED-proof mutants"
+  above for the full record).
+- `M_signflip.patch` — inverted-sign update inside `AdamThetaUpdate::
+  cpu_fwd` only (RED-proof pair, outside the lr-scale family); committed
+  unified diff against `e340391c`; sha256
   `fb2bd11935e9a08e8a1197aa3a84535660119823aabb421105e389a388f6e5e4`;
-  patch-file-only; predicted DEGRADATION with certainty (see "RED-proof
-  mutants" above) — the guaranteed RED-proof member of this pair.
+  patch-file-only; **RETIRED — measured INERT on 12-leg GPU**
+  (`redproof-signflip`, 12/12 legs bit-identical to the clean fused column:
+  the campaign's fused arm dispatches CUDA on a100, and this patch only
+  edits the CPU-only `cpu_fwd` body — see "RED-proof mutants" above for the
+  full record and the dispatch-invariant-site lesson). Kept, patch-file-only,
+  for the record; never scheduled to run again.
+- `M_signflip_v2.patch` — inverted-sign update at the dispatch-invariant
+  `adamw_step_fused_t` `lr` scalar (replaces `M_signflip`; RED-proof pair,
+  outside the lr-scale family); committed unified diff against `74fd69ef`
+  (`adamw_step.rs` byte-identical to its `e340391c` copy, blob `58a1418c`);
+  sha256 `c81d0ed59d45761bbd6487dbb23c5aaae22f30739c0e2e613d96c4901ad9b202`;
+  patch-file-only; predicted DEGRADATION with certainty on BOTH CPU and
+  CUDA arms (see "RED-proof mutants" above) — the guaranteed RED-proof
+  member of this pair, **scheduled**.
 - `README.md` — this file.

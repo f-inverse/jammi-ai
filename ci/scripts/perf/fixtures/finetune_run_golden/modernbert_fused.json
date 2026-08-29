@@ -85,7 +85,11 @@
       "attention_block_flash_fused_dispatches": 840,
       "attention_block_flash_declined_dispatches": 0,
       "admission_is_dense": false,
-      "learning_happened_delta": 0.0004811286926269531,
+      "train_probe_series": [
+        1.0,
+        0.9997,
+        0.999518871307373
+      ],
       "tie_fraction": 0.0,
       "final_epoch": 1,
       "held_out_example_mean": 0.6931476593017578,

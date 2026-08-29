@@ -366,3 +366,33 @@ No skip, no `xfail`, and no `TODO` marker gates on this — the STAGED
 CLOSURE is recorded here in prose and, append-only, in
 `docs/plans/63-how-well/CONTRACT.md`'s 2026-08-29 note, not as a
 pinned-but-disabled test.
+
+## Schema update, 2026-08-29b (docs-ci): `learning_happened_delta` -> `train_probe_series`
+
+CONTRACT amendment 2026-08-29b (probe bug fix) removes the producer's
+pre-derived `learning_happened_delta` scalar entirely and replaces it with a
+RAW per-epoch `train_probe_series: Vec<f64>` (index 0 the untrained-init
+probe, one entry per epoch, the last entry the final probe); the MERGER
+(`ab_merge.finetune_run_probe_series_delta`), not the producer, now derives
+`series[0] - series[-1]` and checks it against the floor. All three goldens
+here are patched to carry `train_probe_series` in place of
+`learning_happened_delta`, with each series' own `series[0] - series[-1]`
+set EQUAL to the file's own previously-recorded `learning_happened_delta`
+value (a schema-shape update, never a re-run against the corrected
+instrument -- no CUDA device/patched producer exists in this environment to
+regenerate a real one). This is the SAME "schema-shaped, not necessarily
+producer-emittable" honesty class the "Emittability status" section above
+already applies to the two `modernbert_*` composites; `bert_fused.json` was
+previously "copied byte-for-byte, never a field added/removed/edited" from
+a real CPU-hermetic run (see this file's own opening section) -- that
+claim is NOW SUPERSEDED for this one field only, since regenerating it
+requires a producer build that already carries the amendment's own Rust-side
+fix, which does not exist in this checkout. The three-entry shape
+(`[init, epoch0, epoch1]`) mirrors each golden's own `epochs: 2` (index 0 =
+untrained-init, one entry per epoch thereafter, CONTRACT amendment
+2026-08-29b's own index semantics) -- never a two-entry shortcut that would
+silently under-represent a multi-epoch run's own series length. The
+Supersession plan above (a real ModernBERT-large probe leg replacing
+`modernbert_fused.json`/`modernbert_alloff.json` verbatim) subsumes this
+note the moment it executes -- that real leg's own producer will already
+emit `train_probe_series` natively, with no further patching needed.

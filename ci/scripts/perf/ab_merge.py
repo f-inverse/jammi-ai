@@ -65,6 +65,7 @@ producer-emit pins read.
 from __future__ import annotations
 
 import json
+import math
 import os
 import statistics
 import sys
@@ -1287,6 +1288,25 @@ FINETUNE_RUN_REPEATS = ("r1", "r2")
 #     happened") is the falsification target this floor exists to catch --
 #     a leg whose train-side probe shows no observed learning cannot have
 #     its held-out movement attributed to training at all.
+#
+#     CONTRACT amendment 2026-08-29b (probe bug fix): this is no longer a
+#     pre-derived scalar the producer computes -- `finetune_run.rs`'s old
+#     `learning_happened_delta` took its baseline AFTER the first
+#     resume-cycle had already trained epoch 0 (measuring epoch-1..final,
+#     excluding the largest learning epoch), and its endpoint choice was
+#     never pre-registered. The producer now emits a RAW per-epoch
+#     `train_probe_series: Vec<f64>` -- index 0 the UNTRAINED-init probe
+#     (LoRA init is ZerosB, so an lr=0 leg still reads exactly 0.0 there),
+#     one entry per epoch thereafter, the last entry the final probe -- and
+#     THIS MERGER derives the premise: `series[0] - series[-1] > floor`
+#     (strict; "the rule lives where rules live", never in the producer).
+#     See `finetune_run_probe_series_delta` for the derivation and its three
+#     typed refusals (missing, too-short, non-finite), and the v1-era
+#     scalar-only carve-out (a leg carrying the OLD `learning_happened_delta`
+#     field with no `train_probe_series` is a producer-version mismatch,
+#     INVALID outright -- historical v1 artifacts, including the committed
+#     campaign-v1 evidence, are never silently re-adjudicated under this
+#     corrected rule).
 #   * tie_fraction — must stay under a cap: C16's own hinge-saturation
 #     finding ("the bench's hinge saturates to loss_last == 0.0 on both
 #     arms at the shapes tried") is exactly a saturated-ties failure mode;
@@ -1298,6 +1318,11 @@ FINETUNE_RUN_REPEATS = ("r1", "r2")
 #     deliberately tight enough to catch the C16 saturation shape
 #     (tie_fraction -> 1.0) long before it reaches that ceiling.
 FINETUNE_RUN_EXPECTED_ADMISSION_IS_DENSE = False
+# esc-045 (the "metric is the defect" saga, docs/maintainer/fine-tune-
+# performance-guide.md section 6): a floor is a PRE-REGISTERED number, never
+# retroactively adjusted to make a measured run pass. 0.0 stays exactly
+# 0.0 -- amendment 2026-08-29b fixes the INSTRUMENT feeding this floor
+# (the probe's own baseline), never the floor value itself.
 FINETUNE_RUN_LEARNING_HAPPENED_FLOOR = 0.0
 FINETUNE_RUN_TIE_FRACTION_CAP = 0.5
 
@@ -1444,47 +1469,142 @@ def finetune_run_leg_identity(tier):
     return generic_leg_identity_fields(tier, FINETUNE_RUN_IDENTITY_FIELDS, FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS)
 
 
-def finetune_run_arm_premise_violations(arm, tier):
-    """Per-arm conjunctive premise legs (CONTRACT Frame / H4 -- see this
-    module section's own doc for each leg's rationale): `admission_is_dense`
-    matches the pre-registered `False`, `learning_happened_delta` clears its
-    floor, `tie_fraction` stays under its cap. Independent of, and IN
-    ADDITION TO, the cross-arm identity check
-    (`generic_leg_premise_violations` over `FINETUNE_RUN_IDENTITY_FIELDS`)
-    -- this checks facts about ONE leg's own report, never a comparison
-    between two legs. Returns a list of strings, empty when every leg
-    clears.
+def finetune_run_probe_series_delta(label, tier):
+    """Derive the learning-happened premise's delta from the producer's RAW
+    `train_probe_series` (CONTRACT amendment 2026-08-29b) -- never trust a
+    pre-derived scalar; the rule (`series[0] - series[-1]`) lives HERE, in
+    the merger, never in the producer. `label` prefixes every returned
+    message (a seed/arm/pool-qualified string the caller already has, e.g.
+    `"seed 4 alloff"` or `"lr0 seed 101 fused"`).
+
+    Returns `(violations, delta, series)`:
+      * `violations` non-empty, `delta is None` -- one of four typed
+        refusals fired (a leg is NEVER assumed-good on any of these):
+          1. V1-ERA SCALAR-ONLY: `tier` carries the OLD
+             `learning_happened_delta` field (non-null) but no
+             `train_probe_series` at all -- a producer-version mismatch.
+             This leg was emitted by the pre-fix instrument (whose baseline
+             excluded epoch 0's own learning, see the module-level premise
+             doc above) and is NEVER silently re-adjudicated under the
+             corrected rule -- historical v1 artifacts (including the
+             committed campaign-v1 evidence) stay exactly as measured and
+             exactly as INVALID as they were recorded.
+          2. MISSING: no `train_probe_series` (and no v1 scalar either) --
+             an even older producer, or a malformed report.
+          3. SHORT: fewer than 2 entries -- the rule needs both the
+             untrained-init probe (index 0) and at least one epoch's own
+             probe to subtract.
+          4. NON-FINITE: any entry is not a finite real number (NaN, +-inf,
+             or a non-numeric JSON value) -- `series[0] - series[-1]` has no
+             well-defined premise verdict over a series that is not
+             entirely real-valued.
+      * `violations` empty, `delta` the float `series[0] - series[-1]`,
+        `series` the raw list itself (recorded by the caller into
+        `premise_failure_diagnostic`/`per_arm` regardless of whether the
+        floor check that consumes `delta` passes or fails).
     """
-    violations = []
+    v1_scalar = tier.get("learning_happened_delta")
+    series = tier.get("train_probe_series")
+    if series is None or not isinstance(series, list):
+        if v1_scalar is not None:
+            return (
+                [
+                    f"{label}: carries the v1-era scalar 'learning_happened_delta'={v1_scalar!r} "
+                    "with no 'train_probe_series' -- producer-version mismatch (CONTRACT amendment "
+                    "2026-08-29b): this leg was emitted by a pre-fix producer whose probe baseline "
+                    "excluded epoch 0's own learning; it is INVALID outright, never silently "
+                    "re-adjudicated under the corrected series-derived rule"
+                ],
+                None,
+                None,
+            )
+        return (
+            [
+                f"{label}: 'train_probe_series' is missing (or not a list) -- the learning-happened "
+                "premise is derived from this raw per-epoch series (CONTRACT amendment 2026-08-29b), "
+                "never assumed present"
+            ],
+            None,
+            None,
+        )
+    if len(series) < 2:
+        return (
+            [
+                f"{label}: train_probe_series has {len(series)} "
+                f"entr{'y' if len(series) == 1 else 'ies'}, need at least 2 (index 0 = the "
+                "untrained-init probe, one entry per epoch, the last entry the final probe)"
+            ],
+            None,
+            series,
+        )
+    for entry in series:
+        if isinstance(entry, bool) or not isinstance(entry, (int, float)) or entry != entry or math.isinf(entry):
+            return (
+                [f"{label}: train_probe_series contains a non-finite or non-numeric entry ({entry!r})"],
+                None,
+                series,
+            )
+    return [], series[0] - series[-1], series
+
+
+def finetune_run_named_arm_premise_violations(arm, tier):
+    """`finetune_run_arm_premise_violations`'s own STRUCTURED core -- returns
+    `[(premise_name, message), ...]` for the CONTRACT Frame's three
+    conjunctive premise legs (`admission_is_dense`, `learning_happened`,
+    `tie_fraction`), so a caller building `premise_failure_diagnostic`
+    (amendment 2026-08-29b item 1(c)) can name WHICH premise leg(s) failed on
+    a given leg, not merely that leg's flattened message strings.
+    `finetune_run_arm_premise_violations` below is a thin wrapper over this
+    for the existing flat `leg_premise_violations` field every other check
+    in this module already appends to.
+    """
+    named = []
     is_dense = tier.get("admission_is_dense")
     if is_dense != FINETUNE_RUN_EXPECTED_ADMISSION_IS_DENSE:
-        violations.append(
+        named.append((
+            "admission_is_dense",
             f"{arm}: admission_is_dense={is_dense!r}, expected "
             f"{FINETUNE_RUN_EXPECTED_ADMISSION_IS_DENSE!r} -- CONTRACT H4/v2 delta 8 "
             "pre-registers the PADDED transport for the committed arxiv fixture "
-            "(variable-length pairs); a dense leg falls outside the scoped verdict"
-        )
-    delta = tier.get("learning_happened_delta")
-    if (
-        not isinstance(delta, (int, float))
-        or isinstance(delta, bool)
-        or not (delta > FINETUNE_RUN_LEARNING_HAPPENED_FLOOR)
-    ):
-        violations.append(
-            f"{arm}: learning_happened_delta={delta!r} does not clear the floor "
+            "(variable-length pairs); a dense leg falls outside the scoped verdict",
+        ))
+    series_violations, delta, _series = finetune_run_probe_series_delta(arm, tier)
+    for msg in series_violations:
+        named.append(("learning_happened", msg))
+    if not series_violations and not (delta > FINETUNE_RUN_LEARNING_HAPPENED_FLOOR):
+        named.append((
+            "learning_happened",
+            f"{arm}: learning_happened_delta={delta!r} (derived: train_probe_series[0] - "
+            f"train_probe_series[-1]) does not clear the floor "
             f"({FINETUNE_RUN_LEARNING_HAPPENED_FLOOR}) -- the train-side probe shows no "
             "observed learning, so this leg's held-out movement cannot be attributed to "
             "training (the CONTRACT's own RED-control precedent: an lr=0 arm fails exactly "
-            "this leg)"
-        )
+            "this leg)",
+        ))
     tie = tier.get("tie_fraction")
     if not isinstance(tie, (int, float)) or isinstance(tie, bool) or not (tie < FINETUNE_RUN_TIE_FRACTION_CAP):
-        violations.append(
+        named.append((
+            "tie_fraction",
             f"{arm}: tie_fraction={tie!r} is not below the cap ({FINETUNE_RUN_TIE_FRACTION_CAP}) -- "
             "C16's own hinge-saturation warning (a near-saturated tie fraction means the "
-            "held-out loss is not discriminating between examples)"
-        )
-    return violations
+            "held-out loss is not discriminating between examples)",
+        ))
+    return named
+
+
+def finetune_run_arm_premise_violations(arm, tier):
+    """Per-arm conjunctive premise legs (CONTRACT Frame / H4 -- see this
+    module section's own doc for each leg's rationale): `admission_is_dense`
+    matches the pre-registered `False`, `learning_happened_delta` (derived
+    from `train_probe_series`, amendment 2026-08-29b) clears its floor,
+    `tie_fraction` stays under its cap. Independent of, and IN ADDITION TO,
+    the cross-arm identity check (`generic_leg_premise_violations` over
+    `FINETUNE_RUN_IDENTITY_FIELDS`) -- this checks facts about ONE leg's own
+    report, never a comparison between two legs. Returns a list of strings,
+    empty when every leg clears -- `finetune_run_named_arm_premise_violations`
+    is the structured (premise-name-tagged) form this wraps.
+    """
+    return [msg for _name, msg in finetune_run_named_arm_premise_violations(arm, tier)]
 
 
 # ALLOFF_DISABLED_OP_BASES (unit-63 round-3 audit, class-fix discovery,
@@ -1942,29 +2062,35 @@ def finetune_run_lr0_control_seed_violations(raw_dir, seed):
          mis-plumbed to some other nonzero value) would validate the
          FLOOR=0.0 ruling against a leg that never tested it at all --
          "a control that never ran at lr=0 validates the floor silently".
-      2. `learning_happened_delta` does NOT clear
+      2. `learning_happened_delta` (amendment 2026-08-29b: DERIVED from the
+         leg's own raw `train_probe_series`, via `finetune_run_probe_series_delta`
+         -- never a pre-derived scalar, never assumed-good) does NOT clear
          `FINETUNE_RUN_LEARNING_HAPPENED_FLOOR` -- the calibration bite for
          the FLOOR=0.0 ruling: a passing lr=0 leg (learning "happened" with
          no possible parameter update) is a finding against the floor
-         itself, not a training result.
+         itself, not a training result. A leg whose series is missing,
+         too-short, non-finite, or v1-scalar-only (see that function's own
+         doc) is ALSO a violation here -- an unresolvable premise leaves the
+         floor just as unvalidated as a leg that outright passed it.
 
-    Both checks are independent and conjunctive -- a leg can fail either,
-    both, or neither. A leg that is `MISSING`/`FAIL` (never ran, or ran and
-    errored) is ALSO recorded as a violation -- an absent control leaves the
-    floor unvalidated, which this calibration check exists specifically to
-    never pass over silently; a `DRY_RUN` leg is the one carve-out (never
-    itself a finding, same doctrine every other `*_DRY_RUN` leg in this
-    module already gets).
+    All checks are independent and conjunctive -- a leg can fail any subset
+    of them. A leg that is `MISSING`/`FAIL` (never ran, or ran and errored)
+    is ALSO recorded as a violation -- an absent control leaves the floor
+    unvalidated, which this calibration check exists specifically to never
+    pass over silently; a `DRY_RUN` leg is the one carve-out (never itself a
+    finding, same doctrine every other `*_DRY_RUN` leg in this module
+    already gets).
 
     Returns `(violations, per_arm, identities)` where `per_arm` records each
-    arm's raw outcome and (when OK) its `learning_happened_delta`/`lr`, for
-    the merged artifact -- never silently dropped even when clean -- and
-    `identities` is `[(label, fields), ...]` (unit-63 audit finding 3) for
-    every OK leg here, in the exact shape
-    `finetune_run_cross_seed_homogeneity_violations` consumes, so the
-    caller can fold the lr0 control's own legs into that check alongside
-    the main A/B seeds without a second, independently-drifting loading
-    path.
+    arm's raw outcome and (when OK) its derived `learning_happened_delta`,
+    `lr`, raw `train_probe_series`, and `failing_premises` (the structured
+    names `premise_failure_diagnostic` reads, amendment 2026-08-29b item
+    1(c)) -- never silently dropped even when clean -- and `identities` is
+    `[(label, fields), ...]` (unit-63 audit finding 3) for every OK leg
+    here, in the exact shape `finetune_run_cross_seed_homogeneity_violations`
+    consumes, so the caller can fold the lr0 control's own legs into that
+    check alongside the main A/B seeds without a second,
+    independently-drifting loading path.
     """
     violations = []
     per_arm = {}
@@ -1973,10 +2099,22 @@ def finetune_run_lr0_control_seed_violations(raw_dir, seed):
         leg = load_finetune_run_leg(raw_dir, seed, arm, FINETUNE_RUN_LR0_REPEAT)
         outcome = leg["outcome"]
         if outcome == "DRY_RUN":
-            per_arm[arm] = {"outcome": outcome, "learning_happened_delta": None, "lr": None}
+            per_arm[arm] = {
+                "outcome": outcome,
+                "learning_happened_delta": None,
+                "lr": None,
+                "train_probe_series": None,
+                "failing_premises": [],
+            }
             continue
         if outcome != "OK":
-            per_arm[arm] = {"outcome": outcome, "learning_happened_delta": None, "lr": None}
+            per_arm[arm] = {
+                "outcome": outcome,
+                "learning_happened_delta": None,
+                "lr": None,
+                "train_probe_series": None,
+                "failing_premises": ["leg_outcome"],
+            }
             violations.append(
                 f"lr0 control seed {seed} {arm}: leg outcome={outcome!r} (not OK) -- an "
                 "absent/failed lr=0 control leg leaves the FLOOR=0.0 premise unvalidated "
@@ -1984,19 +2122,25 @@ def finetune_run_lr0_control_seed_violations(raw_dir, seed):
             )
             continue
         tier = finetune_run_block(leg["report"])
-        delta = tier.get("learning_happened_delta")
         lr = tier.get("lr")
-        per_arm[arm] = {"outcome": outcome, "learning_happened_delta": delta, "lr": lr}
-        identities.append((f"lr0 seed {seed} {arm}", finetune_run_leg_identity(tier)))
+        label = f"lr0 seed {seed} {arm}"
+        series_violations, delta, series = finetune_run_probe_series_delta(label, tier)
+        failing_premises = []
+        identities.append((label, finetune_run_leg_identity(tier)))
         # unit-63 round-4 audit F-2: the control's own defining fact -- see
         # this function's own doc, point 1.
         if not (isinstance(lr, (int, float)) and not isinstance(lr, bool) and lr == 0.0):
+            failing_premises.append("lr_nonzero")
             violations.append(
                 f"lr0 control seed {seed} {arm}: reported lr={lr!r}, not exactly 0.0 -- a "
                 "control that never ran at lr=0 validates the floor silently (unit-63 round-4 "
                 "audit F-2; CONTRACT H4 advisory (b)'s own 'lr=0 arm x2 seeds' precondition)"
             )
-        if isinstance(delta, (int, float)) and not isinstance(delta, bool) and delta > FINETUNE_RUN_LEARNING_HAPPENED_FLOOR:
+        if series_violations:
+            failing_premises.append("learning_happened")
+            violations += series_violations  # already labeled ("lr0 seed {seed} {arm}: ...")
+        elif delta > FINETUNE_RUN_LEARNING_HAPPENED_FLOOR:
+            failing_premises.append("learning_happened")
             violations.append(
                 f"lr0 control seed {seed} {arm}: learning_happened_delta={delta!r} "
                 f"unexpectedly CLEARS the floor ({FINETUNE_RUN_LEARNING_HAPPENED_FLOOR}) under "
@@ -2004,6 +2148,13 @@ def finetune_run_lr0_control_seed_violations(raw_dir, seed):
                 "FLOOR=0.0 premise-leg ruling itself, not a training result "
                 "(CONTRACT H4 advisory (b))"
             )
+        per_arm[arm] = {
+            "outcome": outcome,
+            "learning_happened_delta": delta,
+            "lr": lr,
+            "train_probe_series": series,
+            "failing_premises": failing_premises,
+        }
     return violations, per_arm, identities
 
 
@@ -2096,6 +2247,12 @@ def build_finetune_run_report(raw_dir, seeds, lr0_seeds=(), allow_missing_lr0_co
     # lr0-control legs below, then fed to
     # `finetune_run_cross_seed_homogeneity_violations` as one flat pool.
     cross_seed_leg_identities = []
+    # amendment 2026-08-29b item 1(c) -- `premise_failure_diagnostic`'s own
+    # accumulator: one entry per (seed, arm) leg that failed ANY CONTRACT
+    # Frame premise leg (`admission_is_dense`/`learning_happened`/
+    # `tie_fraction`), main-pool and lr0-control legs alike. ALWAYS present
+    # in the merged artifact, even empty -- never conditionally omitted.
+    premise_failure_entries = []
 
     for seed in seeds:
         entries = {
@@ -2147,8 +2304,26 @@ def build_finetune_run_report(raw_dir, seeds, lr0_seeds=(), allow_missing_lr0_co
             violations += generic_leg_premise_violations(
                 FINETUNE_RUN_IDENTITY_FIELDS, fused_id, alloff_id, "fused", "alloff"
             )
-            violations += finetune_run_arm_premise_violations("fused", fused_tier)
-            violations += finetune_run_arm_premise_violations("alloff", alloff_tier)
+            fused_named_violations = finetune_run_named_arm_premise_violations("fused", fused_tier)
+            alloff_named_violations = finetune_run_named_arm_premise_violations("alloff", alloff_tier)
+            violations += [msg for _name, msg in fused_named_violations]
+            violations += [msg for _name, msg in alloff_named_violations]
+            # amendment 2026-08-29b item 1(c) -- see `premise_failure_entries`'s
+            # own doc above: recorded per (seed, arm) leg, never per-seed
+            # only, so the diagnostic can distinguish WHICH arm's premise
+            # failed.
+            for arm_label, arm_tier, named_violations in (
+                ("fused", fused_tier, fused_named_violations),
+                ("alloff", alloff_tier, alloff_named_violations),
+            ):
+                if named_violations:
+                    premise_failure_entries.append({
+                        "label": f"seed {seed} {arm_label} r1",
+                        "pool": "main",
+                        "seed": seed,
+                        "failing_premises": sorted({name for name, _msg in named_violations}),
+                        "train_probe_series": arm_tier.get("train_probe_series"),
+                    })
 
             d_i = fused_tier["held_out_example_mean"] - alloff_tier["held_out_example_mean"]
             trajectory = {
@@ -2216,6 +2391,18 @@ def build_finetune_run_report(raw_dir, seeds, lr0_seeds=(), allow_missing_lr0_co
         lr0_control_per_seed[lr0_seed] = {"per_arm": per_arm, "violations": seed_violations}
         cross_seed_leg_identities += identities
         lr0_labels.update(label for label, _fields in identities)
+        # amendment 2026-08-29b item 1(c) -- lr0-control legs feed the SAME
+        # diagnostic accumulator as the main pool (tagged pool="lr0-control"),
+        # never a second, separately-shaped block.
+        for arm_label, arm_rec in per_arm.items():
+            if arm_rec.get("failing_premises"):
+                premise_failure_entries.append({
+                    "label": f"lr0 seed {lr0_seed} {arm_label}",
+                    "pool": "lr0-control",
+                    "seed": lr0_seed,
+                    "failing_premises": list(arm_rec["failing_premises"]),
+                    "train_probe_series": arm_rec.get("train_probe_series"),
+                })
 
     # unit-63 audit finding 3 -- see this function's own doc; every OK leg
     # gathered above (main A/B seeds' r1/r2, plus the lr0 control's own
@@ -2322,11 +2509,32 @@ def build_finetune_run_report(raw_dir, seeds, lr0_seeds=(), allow_missing_lr0_co
     else:
         status = "GREEN"
 
+    # amendment 2026-08-29b item 1(c): `premise_failure_diagnostic` is
+    # ALWAYS present in the merged artifact (even when `premise_failure_entries`
+    # is empty) -- non-parameterised (no threshold this block itself takes),
+    # explicitly non-decisional (it can never promote an INVALID verdict to
+    # GREEN; `status` above is computed entirely without reading this
+    # block), and carries NO operator override anywhere: no
+    # `--allow-premise-failure` flag, no waived-seed list, no rescale switch.
+    premise_failure_diagnostic = {
+        "failed_seeds": sorted({entry["seed"] for entry in premise_failure_entries}, key=str),
+        "failing_legs": premise_failure_entries,
+        "note": (
+            "Non-parameterised, explicitly non-decisional (CONTRACT amendment 2026-08-29b item "
+            "1(c)): names which CONTRACT Frame premise leg(s) failed on which leg, with that "
+            "leg's raw train_probe_series, for investigation only. This block can NEVER promote "
+            "an INVALID verdict to GREEN -- the 'status' field above is computed independently "
+            "of it -- and the merger accepts NO operator override for a premise failure anywhere "
+            "(no --allow-premise-failure, no waived-seed list, no rescale switch)."
+        ),
+    }
+
     merged = {
         "seeds": seeds,
         "arms": list(FINETUNE_RUN_ARMS),
         "per_seed": {str(s): v for s, v in per_seed.items()},
         "d_values": {str(s): d for s, d in d_values.items()},
+        "premise_failure_diagnostic": premise_failure_diagnostic,
         "cross_seed_spread": cross_seed_spread,
         "determinism_floor": {
             "deltas": [{"seed": s, "arm": a, "delta": d} for s, a, d in determinism_deltas],

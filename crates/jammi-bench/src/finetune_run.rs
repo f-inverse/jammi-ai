@@ -362,22 +362,34 @@ pub struct FinetuneRunParams {
     // recorded fields).
     //
     // All three are OPTIONAL and all-or-none: [`run`] refuses (typed error,
-    // not a panic) if any subset of the three is present but incomplete —
-    // see [`run_impl`]'s own leading validation block. A normal (non-mutant)
-    // leg supplies `None` for all three, and the emitted JSON omits all
-    // three keys entirely (`#[serde(skip_serializing_if =
+    // not a panic) unless EITHER all three were never touched (`None`) OR
+    // all three are non-empty after trimming — round-8 finding 4 tightened
+    // this from a mere `is_some()` presence count to a non-emptiness count,
+    // since the CLI happily parses `--mutant-base-sha ""` (and any
+    // whitespace-only value) into `Some(_)`; a trio that is explicitly
+    // supplied but empty/whitespace in every position is refused too, not
+    // silently treated as the ordinary non-mutant case — see [`run_impl`]'s
+    // own leading validation block, which also shape-checks
+    // `mutant_base_sha` (7-40 hex chars) and `mutant_patch_sha256` (exactly
+    // 64 hex chars) once the trio clears the emptiness gate. A normal
+    // (non-mutant) leg supplies `None` for all three, and the emitted JSON
+    // omits all three keys entirely (`#[serde(skip_serializing_if =
     // "Option::is_none")]` on [`crate::report::FinetuneRunTier`]'s mirror
     // fields), so a normal leg's report bytes are unchanged by this finding
     // (committed goldens unaffected).
     /// `--mutant-id`: the mutant's own label (e.g. `"eps-0.10"` — see
     /// `docs/plans/63-how-well/mutants/README.md`'s dose-family naming).
+    /// Trimmed and checked for non-emptiness by `run_impl`; the STAMPED
+    /// value (in the returned tier) is the trimmed string.
     pub mutant_id: Option<String>,
     /// `--mutant-base-sha`: the git commit sha this mutant's patch was cut
-    /// against.
+    /// against. Trimmed and shape-checked (7-40 hex chars) by `run_impl`;
+    /// the STAMPED value is the trimmed string.
     pub mutant_base_sha: Option<String>,
     /// `--mutant-patch-sha256`: sha256 (hex) of the mutant patch's own
     /// content — the "auditable" half of "attributable to a specific,
-    /// auditable mutant patch".
+    /// auditable mutant patch". Trimmed and shape-checked (exactly 64 hex
+    /// chars) by `run_impl`; the STAMPED value is the trimmed string.
     pub mutant_patch_sha256: Option<String>,
 }
 
@@ -643,27 +655,99 @@ fn run_impl(
     if params.epochs == 0 {
         return Err("finetune-run: --epochs 0 has no final epoch to measure".into());
     }
-    // Mutant provenance is all-or-none (unit 63 round-7 audit, finding 1):
-    // a subset of the three flags present but incomplete is a labeling
-    // error the merger could not attribute to a specific patch either way
-    // (`finetune_run_mutant_column_violations`'s per-field emptiness
-    // check), so this producer refuses it up front rather than emitting a
-    // half-labeled leg a downstream reader might mistake for either a clean
-    // leg or a fully-attributed mutant one.
-    let mutant_fields_present = [
-        params.mutant_id.is_some(),
-        params.mutant_base_sha.is_some(),
-        params.mutant_patch_sha256.is_some(),
-    ];
-    let mutant_fields_present_count = mutant_fields_present.iter().filter(|p| **p).count();
-    if mutant_fields_present_count != 0 && mutant_fields_present_count != 3 {
+    // Mutant provenance is all-or-none (unit 63 round-7 audit, finding 1;
+    // tightened round-8, finding 4): a subset of the three flags present but
+    // incomplete is a labeling error the merger could not attribute to a
+    // specific patch either way (`finetune_run_mutant_column_violations`'s
+    // per-field emptiness check), so this producer refuses it up front
+    // rather than emitting a half-labeled leg a downstream reader might
+    // mistake for either a clean leg or a fully-attributed mutant one.
+    //
+    // The invariant is NON-EMPTINESS, not presence: the CLI parses
+    // `--mutant-base-sha ""` as `Some(String::new())`, and a
+    // whitespace-only value is just as un-attributable as an empty one, so
+    // each supplied value is trimmed FIRST. Two, and only two, states clear
+    // this gate: (a) NONE of the three flags was ever touched (`None` all
+    // the way — the ordinary non-mutant leg), or (b) all three were
+    // supplied AND are non-empty-after-trim (a fully, honestly labeled
+    // mutant leg). Every other state is refused, INCLUDING a trio that was
+    // explicitly supplied but is empty or whitespace-only in every
+    // position — that is not the same thing as never touching the flags at
+    // all, and stamping it as a clean leg would silently launder a caller
+    // mistake into the same bytes an ordinary leg produces. The stamped
+    // values (below, and in the JSON `tier` this function returns) are the
+    // trimmed strings, never the raw, possibly-padded CLI input.
+    let mutant_id = params
+        .mutant_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let mutant_base_sha = params
+        .mutant_base_sha
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let mutant_patch_sha256 = params
+        .mutant_patch_sha256
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let never_touched = params.mutant_id.is_none()
+        && params.mutant_base_sha.is_none()
+        && params.mutant_patch_sha256.is_none();
+    let fully_labeled =
+        mutant_id.is_some() && mutant_base_sha.is_some() && mutant_patch_sha256.is_some();
+    if !never_touched && !fully_labeled {
+        // Names each flag's actual state — `None` (never touched), a
+        // trimmed value, or "supplied but empty/whitespace-only" (the
+        // finding-4 case the old `is_some()` count silently accepted) —
+        // rather than the raw `Option<String>` `Debug` output, so a
+        // whitespace-only value doesn't render as an indistinguishable
+        // `Some("")`-shaped string in the refusal.
+        let describe = |raw: &Option<String>, trimmed: &Option<String>| match (raw, trimmed) {
+            (None, _) => "absent".to_string(),
+            (Some(_), None) => "supplied but empty-or-whitespace-only".to_string(),
+            (Some(_), Some(v)) => format!("{v:?}"),
+        };
         return Err(format!(
             "finetune-run: --mutant-id/--mutant-base-sha/--mutant-patch-sha256 are all-or-none \
-             — got mutant_id={:?}, mutant_base_sha={:?}, mutant_patch_sha256={:?} (a partial \
+             (a value that is empty or whitespace-only after trimming is not a real label, but \
+             supplying one is also not the same as never touching the flag) — got \
+             mutant_id={}, mutant_base_sha={}, mutant_patch_sha256={} (a partial or blank \
              mutant label cannot be attributed to a specific, auditable mutant patch)",
-            params.mutant_id, params.mutant_base_sha, params.mutant_patch_sha256
+            describe(&params.mutant_id, &mutant_id),
+            describe(&params.mutant_base_sha, &mutant_base_sha),
+            describe(&params.mutant_patch_sha256, &mutant_patch_sha256),
         )
         .into());
+    }
+    // Shape validation, only reachable once all three cleared the
+    // non-emptiness gate above: a trio that is non-empty but malformed
+    // (not a real sha) is just as un-attributable as a partial trio, so it
+    // gets the same typed refusal, each naming the offending flag.
+    if let (Some(mutant_base_sha), Some(mutant_patch_sha256)) =
+        (mutant_base_sha.as_deref(), mutant_patch_sha256.as_deref())
+    {
+        let is_hex = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit());
+        if !(7..=40).contains(&mutant_base_sha.len()) || !is_hex(mutant_base_sha) {
+            return Err(format!(
+                "finetune-run: --mutant-base-sha {mutant_base_sha:?} must be 7-40 hex chars (a \
+                 git commit sha), got length {} after trim",
+                mutant_base_sha.len()
+            )
+            .into());
+        }
+        if mutant_patch_sha256.len() != 64 || !is_hex(mutant_patch_sha256) {
+            return Err(format!(
+                "finetune-run: --mutant-patch-sha256 {mutant_patch_sha256:?} must be exactly 64 \
+                 hex chars (a sha256 hex digest), got length {} after trim",
+                mutant_patch_sha256.len()
+            )
+            .into());
+        }
     }
     // The `alloff` arm's declared intent must actually be what THIS process's
     // `JAMMI_KERNELS_DISABLE` resolved to — the same "declared vs resolved"
@@ -1238,9 +1322,9 @@ fn run_impl(
         final_loss_diagnostic: last_final_loss,
         trajectory: trajectory.points,
         train_probe_series,
-        mutant_id: params.mutant_id.clone(),
-        mutant_base_sha: params.mutant_base_sha.clone(),
-        mutant_patch_sha256: params.mutant_patch_sha256.clone(),
+        mutant_id,
+        mutant_base_sha,
+        mutant_patch_sha256,
     };
 
     let value = serde_json::to_value(&tier).expect("serialize FinetuneRunTier for self-check");
@@ -1705,31 +1789,231 @@ mod tests {
         }
     }
 
-    /// The positive control for the check above: all three ABSENT (the
-    /// ordinary non-mutant case) must not be refused BY THIS CHECK — a
-    /// non-finite/vacuous negative control would let every input through,
-    /// so this pins that the all-empty case actually clears the gate (the
-    /// function proceeds past it; whether the rest of `run_impl` succeeds is
-    /// covered by the non-perturbation test elsewhere in this module).
+    /// `run_impl`'s `Ok` payload carries a `VarMap`, which has no `Debug`
+    /// impl, so the stdlib `Result::expect_err` (which formats the `Ok`
+    /// value on failure) cannot be used against it directly — this is the
+    /// same shape as the `match result { Ok(_) => panic!(...), Err(e) => e
+    /// }` pattern `mutant_provenance_flags_are_refused_when_partially_supplied`
+    /// already uses above, pulled out so the round-8 tests below don't each
+    /// repeat it.
+    fn expect_refused(
+        result: Result<(FinetuneRunTier, VarMap), Box<dyn std::error::Error + Send + Sync>>,
+        context: &str,
+    ) -> Box<dyn std::error::Error + Send + Sync> {
+        match result {
+            Ok(_) => panic!("{context}"),
+            Err(e) => e,
+        }
+    }
+
+    /// Round-8 audit, finding 4: the all-or-none gate counts PRESENCE
+    /// (`is_some()`), not NON-EMPTINESS, so `--mutant-base-sha ""` (which
+    /// the CLI happily parses into `Some(String::new())`) sailed through as
+    /// "present" and produced a half-labeled leg. All three explicitly
+    /// supplied as the empty string must be refused — NOT silently treated
+    /// as the ordinary non-mutant (`None`-trio) case, which is a distinct
+    /// state (see [`mutant_provenance_all_absent_is_not_the_same_state_as_an_empty_trio`]).
     #[test]
-    fn mutant_provenance_all_absent_clears_the_all_or_none_gate() {
-        let params = non_perturbation_test_params(std::env::temp_dir());
-        assert!(params.mutant_id.is_none());
-        assert!(params.mutant_base_sha.is_none());
-        assert!(params.mutant_patch_sha256.is_none());
-        // Re-implement the gate's own predicate directly (rather than
-        // driving the full, expensive `run_impl`) to assert it does NOT
-        // fire for the all-absent case, independent of anything else
-        // `run_impl` might refuse on for unrelated reasons.
-        let present = [
-            params.mutant_id.is_some(),
-            params.mutant_base_sha.is_some(),
-            params.mutant_patch_sha256.is_some(),
+    fn mutant_provenance_empty_string_trio_is_refused() {
+        let mut params = non_perturbation_test_params(std::env::temp_dir());
+        params.mutant_id = Some(String::new());
+        params.mutant_base_sha = Some(String::new());
+        params.mutant_patch_sha256 = Some(String::new());
+        let err = expect_refused(
+            run_impl(&params, true),
+            "an explicitly-empty trio must be refused, not treated as absent",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("all-or-none"),
+            "refusal message must name the all-or-none rule: {msg}"
+        );
+        assert!(
+            msg.contains("empty-or-whitespace-only"),
+            "refusal message must name the empty-or-whitespace-only state: {msg}"
+        );
+    }
+
+    /// Round-8 audit, finding 4: a whitespace-only trio is exactly as
+    /// un-attributable as an empty-string one — `trim()` must run BEFORE the
+    /// emptiness check, not after (or not at all), so a padded value can't
+    /// slip past as "present".
+    #[test]
+    fn mutant_provenance_whitespace_trio_is_refused() {
+        let mut params = non_perturbation_test_params(std::env::temp_dir());
+        params.mutant_id = Some("   ".to_string());
+        params.mutant_base_sha = Some("\t\n".to_string());
+        params.mutant_patch_sha256 = Some(" ".to_string());
+        let err = expect_refused(
+            run_impl(&params, true),
+            "an explicitly-whitespace trio must be refused, not treated as absent",
+        );
+        assert!(
+            err.to_string().contains("all-or-none"),
+            "refusal message must name the all-or-none rule: {}",
+            err
+        );
+    }
+
+    /// Round-8 audit, finding 4: exactly one of the three empty/whitespace
+    /// (with the other two genuinely valid) must be refused just like the
+    /// classic `None`-mixed-with-`Some` partial subsets above — this is the
+    /// specific "half-labeled leg" shape the auditor found the old
+    /// `is_some()` count let through (all three `is_some()`, so the OLD
+    /// check saw "3 present" and did not refuse it). Exercised in all three
+    /// flag positions.
+    #[test]
+    fn mutant_provenance_one_empty_among_three_is_refused() {
+        let valid_id = || Some("eps-0.10".to_string());
+        let valid_base = || Some("f".repeat(40));
+        let valid_patch = || Some("a".repeat(64));
+        let combinations: [(Option<String>, Option<String>, Option<String>); 3] = [
+            (Some("  ".to_string()), valid_base(), valid_patch()),
+            (valid_id(), Some(String::new()), valid_patch()),
+            (valid_id(), valid_base(), Some("\t".to_string())),
         ];
-        let count = present.iter().filter(|p| **p).count();
-        assert_eq!(
-            count, 0,
-            "the ordinary non-mutant case supplies none of the three"
+        for (mutant_id, mutant_base_sha, mutant_patch_sha256) in combinations {
+            let mut params = non_perturbation_test_params(std::env::temp_dir());
+            params.mutant_id = mutant_id.clone();
+            params.mutant_base_sha = mutant_base_sha.clone();
+            params.mutant_patch_sha256 = mutant_patch_sha256.clone();
+            let err = expect_refused(
+                run_impl(&params, true),
+                &format!(
+                    "one empty/whitespace among three (otherwise valid) values must be \
+                     refused: mutant_id={mutant_id:?}, mutant_base_sha={mutant_base_sha:?}, \
+                     mutant_patch_sha256={mutant_patch_sha256:?}"
+                ),
+            );
+            assert!(
+                err.to_string().contains("all-or-none"),
+                "refusal message must name the all-or-none rule: {err}"
+            );
+        }
+    }
+
+    /// Round-8 audit, finding 4: malformed (non-hex or wrong-length) shas in
+    /// an otherwise-complete, non-empty trio get their own typed, flag-named
+    /// refusal — a "3 present" trio is necessary but not sufficient; the
+    /// content must actually be a plausible sha. Fires before any
+    /// device/catalog/filesystem setup, same as the emptiness gate, so a
+    /// plain `#[test]` suffices.
+    #[test]
+    fn mutant_provenance_malformed_shas_are_refused() {
+        let mut too_short_base = non_perturbation_test_params(std::env::temp_dir());
+        too_short_base.mutant_id = Some("eps-0.10".to_string());
+        too_short_base.mutant_base_sha = Some("abc123".to_string()); // 6 hex chars, below the 7 floor
+        too_short_base.mutant_patch_sha256 = Some("a".repeat(64));
+        let err = expect_refused(
+            run_impl(&too_short_base, true),
+            "a too-short mutant-base-sha must be refused",
+        );
+        assert!(
+            err.to_string().contains("--mutant-base-sha"),
+            "refusal must name the offending flag: {err}"
+        );
+
+        let mut non_hex_base = non_perturbation_test_params(std::env::temp_dir());
+        non_hex_base.mutant_id = Some("eps-0.10".to_string());
+        non_hex_base.mutant_base_sha = Some("not-a-hex-sha!!".to_string());
+        non_hex_base.mutant_patch_sha256 = Some("a".repeat(64));
+        let err = expect_refused(
+            run_impl(&non_hex_base, true),
+            "a non-hex mutant-base-sha must be refused",
+        );
+        assert!(
+            err.to_string().contains("--mutant-base-sha"),
+            "refusal must name the offending flag: {err}"
+        );
+
+        let mut wrong_len_patch = non_perturbation_test_params(std::env::temp_dir());
+        wrong_len_patch.mutant_id = Some("eps-0.10".to_string());
+        wrong_len_patch.mutant_base_sha = Some("f".repeat(40));
+        wrong_len_patch.mutant_patch_sha256 = Some("a".repeat(63)); // one short of 64
+        let err = expect_refused(
+            run_impl(&wrong_len_patch, true),
+            "a wrong-length mutant-patch-sha256 must be refused",
+        );
+        assert!(
+            err.to_string().contains("--mutant-patch-sha256"),
+            "refusal must name the offending flag: {err}"
+        );
+
+        let mut non_hex_patch = non_perturbation_test_params(std::env::temp_dir());
+        non_hex_patch.mutant_id = Some("eps-0.10".to_string());
+        non_hex_patch.mutant_base_sha = Some("f".repeat(40));
+        non_hex_patch.mutant_patch_sha256 = Some("z".repeat(64)); // right length, not hex
+        let err = expect_refused(
+            run_impl(&non_hex_patch, true),
+            "a non-hex mutant-patch-sha256 must be refused",
+        );
+        assert!(
+            err.to_string().contains("--mutant-patch-sha256"),
+            "refusal must name the offending flag: {err}"
+        );
+    }
+
+    /// Round-8 audit, finding 4: a fully-supplied, non-empty trio clears the
+    /// gate and the STAMPED values (in the returned tier) are the TRIMMED
+    /// strings, never the raw, whitespace-padded CLI input — driven through
+    /// the REAL `run_impl` end to end (not merely the leading validation
+    /// block) over the tiny, CPU-hermetic `tiny_bert` fixture, so this also
+    /// re-covers the "all three genuinely present" arm of the gate itself.
+    #[tokio::test]
+    async fn mutant_provenance_valid_trio_is_stamped_trimmed() {
+        let work_dir = tempfile::tempdir().expect("tempdir");
+        let mut params = non_perturbation_test_params(work_dir.path().to_path_buf());
+        params.mutant_id = Some("  eps-0.10  ".to_string());
+        params.mutant_base_sha = Some(format!("  {}  ", "f".repeat(40)));
+        params.mutant_patch_sha256 = Some(format!("\t{}\n", "a".repeat(64)));
+
+        let (tier, _varmap) = tokio::task::spawn_blocking(move || run_impl(&params, true))
+            .await
+            .expect("join run_impl task")
+            .expect("a fully-supplied, non-empty (once trimmed) trio must be accepted");
+
+        assert_eq!(tier.mutant_id, Some("eps-0.10".to_string()));
+        assert_eq!(tier.mutant_base_sha, Some("f".repeat(40)));
+        assert_eq!(tier.mutant_patch_sha256, Some("a".repeat(64)));
+    }
+
+    /// Advisory 6 (round-8): this module previously carried
+    /// `mutant_provenance_all_absent_clears_the_all_or_none_gate`, which
+    /// re-implemented the gate's own `is_some()`-counting predicate INLINE
+    /// and asserted it against itself — tautological, since it never called
+    /// `run_impl` and so could not observe whether the gate the production
+    /// code actually runs lets the all-absent case through. It has been
+    /// deleted rather than "fixed", because a real positive control for
+    /// "all-absent clears the gate" already exists and is exercised on
+    /// every test run:
+    ///
+    /// - In-process: `init_probe_does_not_perturb_the_training_trajectory_bitwise`
+    ///   (this module) drives the REAL `run_impl` end to end, twice, via
+    ///   `non_perturbation_test_params` — whose `mutant_id`/`mutant_base_sha`/
+    ///   `mutant_patch_sha256` are all `None` — and `.expect()`s `Ok(_)` both
+    ///   times. If the all-or-none gate ever wrongly fired on the all-absent
+    ///   case, that test would fail immediately with a panic, not silently
+    ///   pass.
+    /// - End to end via the compiled CLI: every case in
+    ///   `finetune_run_smoke.rs` (`finetune_run_smoke_end_to_end_cpu_hermetic`,
+    ///   `finetune_run_smoke_mnrl_end_to_end_cpu_hermetic`) invokes the real
+    ///   `finetune-run` binary WITHOUT any `--mutant-*` flag and asserts a
+    ///   zero exit — the same "never touched" state this module's gate must
+    ///   pass.
+    #[test]
+    fn mutant_provenance_all_absent_is_not_the_same_state_as_an_empty_trio() {
+        // Deliberately not a re-implementation of the gate: this pins the
+        // TYPE-level distinction the gate itself relies on (never-supplied
+        // vs. explicitly-supplied-but-empty) without repeating the gate's
+        // own logic. The genuine behavioral proof lives in the tests named
+        // in this test's doc comment above.
+        let never_touched: Option<String> = None;
+        let explicitly_empty: Option<String> = Some(String::new());
+        assert_ne!(
+            never_touched, explicitly_empty,
+            "a caller who never touches a `--mutant-*` flag and a caller who supplies it as an \
+             empty string are observably different `Option<String>` values, even though both \
+             trim to no content"
         );
     }
 }

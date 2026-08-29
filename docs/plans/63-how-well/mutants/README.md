@@ -654,22 +654,38 @@ transient (m/v are zero-initialized, so v_hat's `eps` floor and the
 did. No claim of degradation is made for `M_nobc` before it is actually
 run; this is the honest complement to `M_signflip` below.
 
-**Measured (12-leg GPU, a100, `redproof-nobc`): NOT DETECTED.** `M_nobc`
+**Measured (12-leg GPU, a100, `redproof-nobc`): NOT DETECTED (raw).**
+Committed artifact: `docs/plans/63-how-well/measurements/red-proof/` at
+dc1cfc3b (36 raw legs + the gated merge artifact). `M_nobc`
 IS a genuine perturbation on hardware — 0/12 legs bit-identical to the
 clean fused column (unlike `M_signflip` v1 below, this mutant fires on the
 CUDA arm exactly as designed, since it changes a Rust-side scalar
 (`scale_m`/`scale_v`) fed into `AdamThetaUpdate`, a struct field both
 `cpu_fwd` and `cuda_fwd` read identically — see `M_signflip_v2`'s own
 "dispatch-invariant site" framing below, which this mutant already
-satisfied by construction). But the sign test read `n_pos=5/12`,
-`mean_d=-0.018` — **not-detected** under the `>=11/12+mean` rule (the
-uncertain prediction above is BORNE OUT as the neutral/mixed outcome, not
-the degradation one): the no-bias-correction shape does not degrade
-held-out loss at this operating point. This is an honest, real,
-non-vacuous non-detection (genuinely perturbed hardware legs, correctly
-measured, correctly failing to reach the threshold) — never suppressed or
-silently retried with a larger dose, per this file's own "Pass criterion"
-section above.
+satisfied by construction). The RAW 12-pair concordance (all 12 mutant/alloff
+pairs, premise violations included) reads `n_pos=5/12`, `mean_d=-0.018` —
+**not-detected** under the `>=11/12+mean` rule (the uncertain prediction
+above is BORNE OUT as the neutral/mixed outcome, not the degradation one):
+the no-bias-correction shape does not degrade held-out loss at this
+operating point. This is an honest, real, non-vacuous non-detection
+(genuinely perturbed hardware legs, correctly measured, correctly failing to
+reach the threshold) — never suppressed or silently retried with a larger
+dose, per this file's own "Pass criterion" section above.
+
+**GATED reading (CONTRACT.md amendment 2026-08-29e, D*): INVALID.** Under
+the D*-decomposed learning-happened premise, 2 of `M_nobc`'s 12 mutant legs
+— seeds 9 and 12 — show ASCENDING probes against `M_nobc`'s own declared
+DESCENT direction (`RED_PROOF_EXPECTED_TRAIN_DIRECTION`'s own `9b3c824d…`
+entry), so `clean_pair_count=10 ≠ 12` and the gated column reads INVALID
+(10/12 clean pairs, correctness-of-measurement problem, never silently
+rescaled to whatever count ran clean). This is a SEPARATE reading from the
+RAW not-detected number above, at a different layer — both are current
+truth at their own layers (CONTRACT.md's own RECONCILIATION clause); under
+D* the `M_nobc` column remains INVALID — recorded, not rescued. Acceptance
+5's discharge schedules `redproof-signflip-v2` only (see "Scheduling
+`M_signflip_v2`" below); `M_nobc`'s own committed INVALID record stands as
+evidence, not as a second column to re-run.
 
 ### `M_signflip` — inverted-sign update (gradient ascent) — SUPERSEDED, honest inert-on-GPU record
 
@@ -698,7 +714,11 @@ uncertain prediction above), `M_signflip` still discharges acceptance 5's
 
 **Measured (12-leg GPU, a100, `redproof-signflip`): INERT — 12/12 legs
 bit-identical to the clean fused column. This patch is retired; see
-`M_signflip_v2` below.** The lead's own bit-identity check on the raw legs
+`M_signflip_v2` below.** Committed artifact:
+`docs/plans/63-how-well/measurements/red-proof/` at dc1cfc3b (the same
+36-raw-leg + gated-merge artifact `M_nobc`'s own "Measured" record above
+cites; these v1 `signflip` legs are committed there as evidence only, never
+scheduled through the merger). The lead's own bit-identity check on the raw legs
 caught this before a false "gradient ascent doesn't degrade" conclusion
 could form from an apparent not-detected/neutral sign-test result. Root
 cause: this patch edits `AdamThetaUpdate::cpu_fwd`'s Rust body only, but
@@ -917,19 +937,24 @@ same carve-out every dose column gets) is caught by the SAME
 `invalid_doses` check every column in `doses[]` already goes through,
 non-zero exit exactly as everywhere else in this module.
 
-**Measured record (12-leg GPU, a100), current-truth discipline:**
-`--mutant-legs redproof-nobc:<M_nobc sha256>:<seeds>` and `--mutant-legs
-redproof-signflip:<M_signflip v1 sha256>:<seeds>` were run against the
+**Measured record (12-leg GPU, a100), current-truth discipline:** committed
+artifact `docs/plans/63-how-well/measurements/red-proof/` at dc1cfc3b (36
+raw legs + the gated merge artifact). `--mutant-legs
+redproof-nobc:<M_nobc sha256>:<seeds>` and `--mutant-legs
+redproof-signflip-v2:<M_signflip_v2 sha256>:<seeds>` were run against the
 SAME `ab_merge.py finetune-run` invocation the campaign's primary decision
-uses. `redproof-nobc` read `detected=not-detected` (`n_pos=5/12`,
-`mean_d=-0.018`, see `M_nobc`'s own "Measured" note above); `redproof-
-signflip` read 12/12 legs bit-identical to the clean fused column (see
-`M_signflip` v1's own "Measured"/"lesson" notes above) — the lead's own
-bit-identity check on the raw legs, not the sign-test verdict itself,
-caught this before any conclusion was drawn from it. Neither column
-discharged acceptance 5 (`red_proof_verdict` was `NOT_PROVEN`, correctly,
-since `redproof-nobc` was a genuine not-detection and `redproof-signflip`
-never measured the mutant it claimed to on this arm).
+uses (v1's `redproof-signflip` legs are committed in this same artifact as
+evidence only — see `M_signflip` v1's own "Measured"/"lesson" notes above —
+never scheduled through the merger; its label is retired). `redproof-nobc`'s
+RAW 12-pair concordance reads `n_pos=5/12`, `mean_d=-0.018` (see `M_nobc`'s
+own "Measured" note above) — but the GATED column's own `detected` field
+reads `INVALID` (10/12 clean pairs, `n_pos=3`, `n_neg=7`, `mean_d=-0.058`,
+`p=0.34`; 2 legs — seeds 9 and 12 — already failed the (pre-D*)
+learning-happened premise on this committed artifact, the SAME 2 legs D*'s
+own `train_direction` premise names explicitly; see `M_nobc`'s own "GATED
+reading" note above). Neither column discharged acceptance 5 (the committed
+artifact's own `red_proof_verdict` reads `NOT_PROVEN (redproof-nobc=INVALID,
+redproof-signflip-v2=INVALID)`).
 
 **Scheduling `M_signflip_v2` (replaces `redproof-signflip`):** pass
 `--mutant-legs redproof-signflip-v2:<M_signflip_v2 sha256>:<seeds>` (never
@@ -942,12 +967,24 @@ primary decision (and, if co-scheduled, the eps-family dose ladder and
 `redproof-nobc`) already runs — the legs themselves stamped exactly per the
 on-pod procedure above (`--mutant-id`/`--mutant-base-sha`/
 `--mutant-patch-sha256`, `dose_label = redproof-signflip-v2`). Read the
-RED-proof verdict directly off `mutant_dose_ladder.red_proof_verdict` and
-`.red_proof[]` in that invocation's own artifact — never off a separate
-invocation's exit code, and never off `sensitivity`/`two_sided_
-falsification`/`dose_anomalies`, which remain scoped to the eps family
-only and are unaffected by a co-scheduled RED-proof column (and vice
-versa). Given `M_signflip_v2`'s dispatch-invariant site (proven on
+RED-proof verdict directly off `mutant_dose_ladder.red_proof_verdict`
+(authoritative in EVERY state) and `.red_proof[]` (the per-column detail,
+populated whenever RED-proof evaluation actually ran) in that invocation's
+own artifact — never off a separate invocation's exit code, and never off
+`sensitivity`/`two_sided_falsification`/`dose_anomalies`, which remain
+scoped to the eps family only and are unaffected by a co-scheduled
+RED-proof column (and vice versa). CONTRACT.md postscript 2026-08-29d's own
+REFUSED-BUT-SCHEDULED state (a RED-proof-labeled column WAS supplied but the
+dose set was refused before RED-proof evaluation ever ran, e.g. a
+duplicate-patch_sha256 refusal) is the ONE case where `.red_proof[]` stays
+`[]` while `red_proof_verdict` already carries an explicit
+`"NOT_PROVEN (dose set refused before RED-proof evaluation: ...)"` string —
+`red_proof_verdict` is read FIRST and is sufficient on its own to know
+acceptance 5 is undischarged; `.red_proof[]` being empty in this one state
+is never itself a second, independently-checked signal (never treat an
+empty `.red_proof[]` as "nothing scheduled" without first checking whether
+`red_proof_verdict` is non-null). Given `M_signflip_v2`'s dispatch-invariant
+site (proven on
 hardware by the `(1+eps)` family) and its certainty prediction, this run
 is expected to read `redproof-signflip-v2: RED` and discharge acceptance
 5's "mutant column proven RED" — but that expectation is a prediction to
@@ -975,9 +1012,11 @@ be measured, not assumed, per this file's own family F/K discipline.
 - `M_nobc.patch` — bias correction removed entirely (RED-proof pair,
   outside the lr-scale family); committed unified diff against `e340391c`;
   sha256 `9b3c824dc041899c12c0e2d44d12a3ac8c7b86076ffc778638108925ba51bf4e`;
-  patch-file-only; **measured NOT-DETECTED** on 12-leg GPU
-  (`redproof-nobc`, `n_pos=5/12`, `mean_d=-0.018` — see "RED-proof mutants"
-  above for the full record).
+  patch-file-only; **measured NOT-DETECTED (raw)** on 12-leg GPU
+  (`redproof-nobc`, `n_pos=5/12`, `mean_d=-0.018`; GATED column reads
+  INVALID under CONTRACT amendment 2026-08-29e's own D* premise — see
+  "RED-proof mutants" above for the full record, and the committed artifact
+  at `docs/plans/63-how-well/measurements/red-proof/` (dc1cfc3b)).
 - `M_signflip.patch` — inverted-sign update inside `AdamThetaUpdate::
   cpu_fwd` only (RED-proof pair, outside the lr-scale family); committed
   unified diff against `e340391c`; sha256
@@ -986,8 +1025,9 @@ be measured, not assumed, per this file's own family F/K discipline.
   (`redproof-signflip`, 12/12 legs bit-identical to the clean fused column:
   the campaign's fused arm dispatches CUDA on a100, and this patch only
   edits the CPU-only `cpu_fwd` body — see "RED-proof mutants" above for the
-  full record and the dispatch-invariant-site lesson). Kept, patch-file-only,
-  for the record; never scheduled to run again.
+  full record and the dispatch-invariant-site lesson; committed artifact
+  `docs/plans/63-how-well/measurements/red-proof/` at dc1cfc3b). Kept,
+  patch-file-only, for the record; never scheduled to run again.
 - `M_signflip_v2.patch` — inverted-sign update at the dispatch-invariant
   `adamw_step_fused_t` `lr` scalar (replaces `M_signflip`; RED-proof pair,
   outside the lr-scale family); committed unified diff against `74fd69ef`

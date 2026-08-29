@@ -11,7 +11,7 @@ evidence only, not scheduled — its label is retired, see below). Merge exit co
 |---|---|---|---|---|
 | `redproof-nobc` (v1 legs) | 4d1398a0 | 9b3c824d | n_pos=5/12, mean_d=-0.0183 | INVALID (2 premise-failing pairs; 10 clean: n_pos=3, n_neg=7, p=0.34) |
 | `signflip` (v1, RETIRED, never scheduled) | 4d1398a0 | (see mutants/README.md) | 12/12 held-out values bit-identical to clean fused r1 | n/a — inert, retired |
-| `redproof-signflip-v2` | 8f06a42c | c81d0ed5 | 12/12 degradation-concordant, effects to +19.2 (sign test would read p=1/4096) | INVALID (12/12 legs fail the learning-happened premise) |
+| `redproof-signflip-v2` | 8f06a42c | c81d0ed5 | 12/12 degradation-concordant, effects to +19.2 (sign test would read p = 2/4096 = 1/2048, the exact two-sided tail — NEVER 1/4096) | INVALID (12/12 legs fail the learning-happened premise) |
 
 Findings, honestly stated:
 
@@ -44,3 +44,14 @@ The raw-concordance numbers above are derived from the committed legs in `raw/`
 paired with `../campaign-v2/raw/seedN__alloff__{r1,r2}.json` exactly as the
 merger pairs them; the gated readings are the committed
 `finetune_run_ab_report.json`'s own `mutant_dose_ladder.red_proof[]` entries.
+
+**Pending D* re-merge (CONTRACT.md amendment 2026-08-29e):** finding 3's own
+INVALID gated reading above is the PRE-amendment record, measured before the
+learning-happened premise was decomposed into `training_effective`/
+`train_direction`. The amendment schedules a re-merge of `redproof-signflip-v2`
+ONLY (`M_nobc`'s own committed INVALID record above stands as evidence; see
+CONTRACT.md's own "FINAL SCHEDULING + PRE-REGISTERED PREDICTIONS" for the
+full, pre-registered prediction set) — none of the raw numbers or gated
+readings recorded in this file are altered by that amendment; a NEW
+committed artifact records the D*-gated re-merge separately, per this file's
+own append-only, current-truth discipline.

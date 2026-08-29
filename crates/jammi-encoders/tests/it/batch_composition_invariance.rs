@@ -485,12 +485,14 @@ fn relative_l1_error(a: &[f32], b: &[f32]) -> f64 {
 /// zero flakiness -- the same bit-exact-zero this file's own module doc
 /// predicts from `MASKED_LOGIT` underflow (a pad weight's contribution to
 /// the value-weighted sum is `0.0 * finite == 0.0` exactly). The floor is
-/// set to `1e-5`: `75x` BELOW the weakest red control separation measured
-/// on this class (the window-radius control's own min,
-/// `7.508231757090548e-4`; `7.508231757090548e-4 / 1e-5 ~= 75.1x`), and
-/// infinitely above the measured `0.0` -- a `0.0` floor itself would admit
-/// no float slop at all, including benign FMA/ordering differences on a
-/// future, architecturally-identical but as-yet-unmeasured exact-arch SKU.
+/// set to `1e-5`: the weakest red control separation measured on this
+/// class (the window-radius control's own min, `7.508231757090548e-4`)
+/// clears the ASSERTED THRESHOLD (`floor * RED_CONTROL_SEPARATION_MULTIPLE`
+/// = `1e-5 * 5.0 = 5e-5`), never the bare floor, by `~15.0x`
+/// (`7.508231757090548e-4 / 5e-5 ~= 15.0x`), and the floor is infinitely
+/// above the measured `0.0` -- a `0.0` floor itself would admit no float
+/// slop at all, including benign FMA/ordering differences on a future,
+/// architecturally-identical but as-yet-unmeasured exact-arch SKU.
 ///
 /// **sm89 (L40S, [`SM89_COMPOSITION_FLOOR`]) genuinely diverges** --
 /// consistent with the M1b campaign's own A40-pass/L40S-fail finding for
@@ -1161,6 +1163,18 @@ fn measurement_mean_max(values: &[f64]) -> (f64, f64) {
 /// `cuda_device_or_skip` idiom: silent skip with no device unless
 /// `JAMMI_REQUIRE_CUDA` is set, in which case device-acquisition failure
 /// panics).
+///
+/// **Producer self-identification.** Before any per-row line, this test
+/// prints ONE `HEADER` line carrying `compute_capability` (via
+/// `jammi_kernels::admission::probe_cuda_compute_capability`, the same
+/// probe [`gpu_composition_floor`] gates dispatch on), `device_name` (via
+/// the sibling `probe_cuda_device_name`, the CUDA driver's own device-name
+/// string when this build/arch can query it), and
+/// `jammi_encoders_version` (`env!("CARGO_PKG_VERSION")`) -- so a captured
+/// log substantiates, from the file alone, which arch/build produced it,
+/// rather than relying on an out-of-band pod label. Every per-row/
+/// per-composition line after it keeps the pre-existing byte-stable
+/// format unchanged (downstream tooling greps those lines).
 #[test]
 #[cfg(feature = "cuda")]
 #[ignore = "measurement-only: prints ratios for pod floor derivation, asserts nothing beyond finiteness"]
@@ -1169,6 +1183,33 @@ fn measure_gpu_floors_print_only() {
     let Some(device) = cuda_device_or_skip(test_name) else {
         return;
     };
+
+    // Producer self-identification (unit 62 final audit, BLOCK 1): printed
+    // ONCE, before any per-row line, so a captured log substantiates which
+    // arch/build produced it rather than relying on the invoking human to
+    // remember which pod they ran on. Uses the SAME probes
+    // `gpu_composition_floor` gates dispatch on
+    // (`probe_cuda_compute_capability`) plus its new sibling
+    // (`probe_cuda_device_name`) -- see both functions' docs in
+    // `jammi_kernels::admission` for the "reads the CONTEXT candle already
+    // holds, never binds a fresh one" rationale shared by both probes, and
+    // for why a probe failure collapses to `"unknown"` here rather than a
+    // panic (this line is identification metadata for a measurement run,
+    // not an admission predicate -- family D: report reality, never guess
+    // a wrong device). Every subsequent per-row/per-composition line below
+    // keeps its existing byte-stable format unchanged.
+    {
+        use jammi_kernels::admission::{probe_cuda_compute_capability, probe_cuda_device_name};
+        let compute_capability = probe_cuda_compute_capability(&device)
+            .map(|cap| format!("{}.{}", cap.major, cap.minor))
+            .unwrap_or_else(|| "unknown".to_string());
+        let device_name = probe_cuda_device_name(&device).unwrap_or_else(|| "unknown".to_string());
+        eprintln!(
+            "{test_name}: HEADER compute_capability={compute_capability} \
+             device_name={device_name} jammi_encoders_version={}",
+            env!("CARGO_PKG_VERSION"),
+        );
+    }
 
     let config = load_config();
     let encoder = build_encoder(&device, DType::BF16, &config);

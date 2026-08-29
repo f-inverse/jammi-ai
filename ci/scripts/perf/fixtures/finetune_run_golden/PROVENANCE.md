@@ -135,13 +135,24 @@ FIELDS for both `modernbert_fused.json` (new) and `modernbert_alloff.json`
 committed, REAL `jammi-bench finetune-step` artifacts below — the same
 attention-block/flash/AdamW call sites `finetune_run.rs`'s own
 `FinetuneRunTier` mirrors field-for-field from `FinetuneStepTier` (see
-`report.rs`'s own doc) — never hand-invented. Every OTHER field (identity,
-provenance, premise, measurement) in both files is UNCHANGED from the
-original CPU-hermetic `modernbert_alloff.json` run documented above (a real
-`finetune-run` execution's own real values for those fields; only the
+`report.rs`'s own doc) — never hand-invented. AT THE TIME OF THIS ROUND-3
+correction, every OTHER field (identity, provenance, premise, measurement)
+in both files was UNCHANGED from the original CPU-hermetic
+`modernbert_alloff.json` run documented above; only the
 dispatch-counter/`flash_compiled`/`kernels_disabled_*`/`arm`/`attention_arm`
-fields are overridden with the cited real counts below) — this is a
-DOCUMENTED COMPOSITE, not a second hand-rolled fixture.
+fields were overridden with the cited real counts below. CURRENT TRUTH
+(corrected in round-4/round-5, superseding the sentence above): four of
+those "unchanged" fields — `backbone_dtype`, `device_name`,
+`provenance.target`, and `provenance.build_features`/tier `build_features`
+— were subsequently re-sourced away from the CPU-hermetic run's own values
+(see "Per-field consistency" below); the remainder, including `batch`,
+`seq`, `lora_rank`, `lora_dropout`, and `steps_measured`, are STILL the
+original CPU-hermetic run's own literal values, and those values now
+contradict the batch/seq/lora_rank/lora_dropout the dispatch-counter source
+artifacts were actually run at (see "Emittability status" below). This file
+is a DOCUMENTED COMPOSITE, but "composite" is not a synonym for
+"producer-emittable" — see "Emittability status" for the precise, current
+list of what is and is not real about it.
 
 ### `modernbert_fused.json` — real counts from
 `crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-p6-b3-dense-raw-runs/s128_flash_on_1.json`
@@ -216,15 +227,28 @@ invocation could ever produce, exactly the class of "fused premise
 unsatisfiable by the producer's own invocation" defect `finetune_run_ab.sh`
 itself had (never having passed `--backbone-dtype bf16`) before this round.
 
-Both goldens are now corrected to a SELF-CONSISTENT, producer-emittable
-state -- every identity/provenance field taken from the SAME committed
-2026-08-25 source artifacts the dispatch counters above already cite, never
-mixed with the superseded CPU run's own identity:
+Both goldens have had FOUR identity/provenance fields — `backbone_dtype`,
+`device_name`, `provenance.target`, and `provenance.build_features`/tier
+`build_features` — re-sourced to the SAME committed 2026-08-25 source
+artifacts the dispatch counters above already cite (table below), closing
+the specific contradiction those four fields created (an
+`aarch64-apple-darwin`/`f32`/`cpu` leg cannot emit
+`attention_block_flash_fused_dispatches: 840`). This does NOT make either
+golden fully SELF-CONSISTENT or producer-emittable: `batch`, `seq`,
+`lora_rank`, `lora_dropout`, `steps_measured`, and
+`checkpoint_config_sha256` were left at the original CPU-hermetic run's own
+values and were never re-sourced from the same artifacts as the four
+fields below. Of the identity fields NOT in the table below, only
+`target_modules` (`["Wqkv","Wo","Wi"]`) happens to already agree with every
+source artifact; `batch`, `seq`, `lora_rank`, and `lora_dropout` all
+contradict them — see "Emittability status" (unit-63 round-5 audit) below
+for the exact values and the two concrete, currently-unresolved
+contradictions this leaves:
 
 | field | corrected value | source |
 |---|---|---|
 | `backbone_dtype` | `"bf16"` | `s128_flash_on_1.json`/`s128_flash_off_1.json`/both `b8_s512_*.r2.json.raw` artifacts -- every one of the four source artifacts agrees |
-| `device_name` | `"NVIDIA A100-SXM4-80GB"` | `host`/`device_name` fields of the same four source artifacts |
+| `device_name` | `"NVIDIA A100-SXM4-80GB"` | the `finetune_step` tier's own `device_name` field of the same four source artifacts (NOT the `host` block — that block carries only `logical_cpus`/`total_ram_mib` in this schema, no `device_name` field at all) |
 | `provenance.target` | `"x86_64-unknown-linux-gnu"` | no committed source artifact carries a Rust target triple (the `finetune-step` raw-run schema has no `provenance` block at all) -- this repo's own documented CUDA release target (`.github/workflows/release-binaries.yml`'s `x86_64-unknown-linux-gnu` matrix leg) is the only target triple this repo ships CUDA builds for, and is in any case the only possibility consistent with `flash_compiled: true` (`aarch64-apple-darwin`, the superseded value, has no CUDA toolchain at all -- not merely undocumented, but impossible) |
 | `provenance.build_features` / tier `build_features` | `["cuda", "jammi-encoders/flash-attn"]` | `finetune_run_ab.sh`'s own build invocation (`cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn`) -- the feature list a leg MUST have been built with to produce `flash_compiled: true` at all; no committed source artifact carries this field either (same schema gap as `target`), so it is cited from the one build invocation capable of producing the counters, never invented independently of it |
 
@@ -237,15 +261,108 @@ un-composited is not a repeat of this same defect class.
 
 `GoldenProducerAnchoredFieldSetTests::test_golden_dispatch_pair_bases_equal_all_bases`
 (field-set pin) and its own
-`test_golden_modernbert_legs_clear_the_full_dispatch_proof_gate` (both
-corrected goldens, run DIRECTLY off the committed JSON, must clear
-`finetune_run_dispatch_proof_violations` cleanly -- including the new
-arm-agnostic counters-vs-`backbone_dtype` consistency premise and the
-`fused` arm's own bf16 premise) both pass against these corrected files --
-the fix closes the contradiction without changing which dispatch-counter
-SET either golden carries. `_finetune_run_tier`'s own hand-overridden
+`test_golden_modernbert_composites_clear_the_dispatch_proof_gate` (renamed
+in round-5 audit -- see below; both corrected goldens, run DIRECTLY off the
+committed JSON, must clear `finetune_run_dispatch_proof_violations` cleanly
+-- including the new arm-agnostic counters-vs-`backbone_dtype` consistency
+premise and the `fused` arm's own bf16 premise) both pass against these
+corrected files -- the fix closes the `backbone_dtype`/`flash_compiled`
+class of contradiction (the ONLY class `finetune_run_dispatch_proof_
+violations` mechanically checks) without changing which dispatch-counter
+SET either golden carries. It does NOT close, and was never claimed by this
+gate to close, the checkpoint-`head_dim` or `batch`/`seq`/`steps_measured`
+contradictions named in "Emittability status" below -- that gate has no
+premise checking either one. `_finetune_run_tier`'s own hand-overridden
 `backbone_dtype` literal (`test_ab_merge.py`) is separately updated to
 `"bf16"` for the same reason -- its default `arm="fused"` shape folds in
 `modernbert_fused.json`'s own dispatch counters (a positive
 `attention_block_flash_fused_dispatches`), so it is equally subject to this
 premise.
+
+## Emittability status (unit-63 round-5 audit)
+
+The round-4 correction above re-sourced exactly four fields —
+`backbone_dtype`, `device_name`, `provenance.target`, and
+`provenance.build_features`/tier `build_features` — to the same
+2026-08-25 GPU artifacts the dispatch counters cite. Checking the REST of
+the tier's identity fields against those same four artifacts shows only
+one of them already agreed by coincidence (`target_modules:
+["Wqkv","Wo","Wi"]`, matching all four); `batch`, `seq`, `lora_rank`, and
+`lora_dropout` were never re-sourced and still carry the original
+CPU-hermetic run's own literal values (`batch: 2`, `seq: 16`,
+`lora_rank: 2`, `lora_dropout: 0.0`), which contradict every one of the
+four source artifacts' own values for those same fields (`batch: 8` on all
+four; `seq: 128` on `s128_flash_on_1.json`/`s128_flash_off_1.json`,
+`seq: 512` on both `b8_s512_*.r2.json.raw` artifacts; `lora_rank: 8` on the
+`s128_flash_*` pair, `16` on the `b8_s512_*` pair; `lora_dropout: 0.05` on
+the `s128_flash_*` pair, `0.0` on the `b8_s512_*` pair). The round-4 text's
+own claim that "every identity/provenance field [is] taken from the SAME
+committed source artifacts" was never true of these four fields, and is
+not true today.
+
+This composite is therefore SCHEMA-SHAPED — every field name a real
+`FinetuneRunTier` serializes is present, with a real value copied from some
+real producer invocation — but it is NOT PRODUCER-EMITTABLE: no single real
+`jammi-bench finetune-run` invocation could emit this exact combination of
+field values. Two independent, currently-unresolved contradictions prove
+this:
+
+1. **Checkpoint vs. flash/attention-block counters.**
+   `checkpoint_config_sha256` (`64d378211a6e8787f34228ae6f6aa8046aa4f3e41026184e6fd0060dbceb7f1f`)
+   is the committed `cookbook/fixtures/tiny_modernbert_ner/config.json`'s
+   own hash — `hidden_size: 32`, `num_attention_heads: 2` ⇒ `head_dim: 16`.
+   Both goldens report nonzero flash/attention-block activity on that
+   checkpoint (`attention_block_flash_fused_dispatches: 840` for
+   `modernbert_fused`; `attention_block_fused_dispatches: 840` for
+   `modernbert_alloff`), but `flash_capability_gates`
+   (`jammi-encoders/src/modernbert.rs:2362`) returns a `DomainMiss` on
+   `head_dim != FLASH_HEAD_DIM`, and `FLASH_HEAD_DIM == 64`
+   (`modernbert.rs:1949`) — a real invocation against this checkpoint can
+   never reach either counter. This file's own round-3 text ("How to
+   regenerate" above, lines 100-102) already documented the HONEST shape
+   for this checkpoint (`attention_block_fused_dispatches: 0`,
+   `..._eager_dispatches: 4`, the real tiny-fixture leg's own counts); the
+   round-3/round-4 corrections swapped in the GPU dispatch counters without
+   ever swapping in the GPU checkpoint's own hash to match.
+2. **`batch`/`seq`/`steps_measured` arithmetic.** The golden's own tier
+   reports `batch: 2`, `seq: 16`, `steps_measured: 6` — no real
+   `finetune-run` invocation at that shape produces dispatch counts of
+   `840`/`1710`/`3360`/`6720`; those counts are the literal, unscaled
+   values copied from the `batch: 8`/`seq: 128`/`steps_measured: 25`
+   source artifacts (`s128_flash_on_1.json`/`s128_flash_off_1.json`) or the
+   `batch: 8`/`seq: 512` source artifacts (`b8_s512_*.r2.json.raw`, whose
+   own `steps_measured` is also `25`), each of which ran at a different
+   batch/seq/step shape than the golden claims for itself.
+
+Closing either contradiction with a fabricated, arithmetically-adjusted
+composite would trade one class of unemittable golden for another
+(invented numbers standing in for a real leg — the exact defect class this
+file exists to close). See "Supersession plan" below for the actual close.
+
+## Supersession plan
+
+Both `modernbert_fused.json` and `modernbert_alloff.json` remain a STAGED
+CLOSURE, not a final state: the campaign's first real ModernBERT-large
+(`head_dim == 64`) `finetune-run` probe leg — run at the checkpoint,
+batch, and seq shape `finetune_run_ab.sh` actually invokes, for both the
+`fused` and `alloff` arms — REPLACES both files VERBATIM (identity,
+provenance, premise, measurement, and dispatch-counter fields all sourced
+from that one real leg's own report, no further compositing) the moment it
+exists, with that leg's own report replacing this section's "Coordinator
+correction"/"Per-field consistency"/"Emittability status" history as the
+current truth. At that point:
+
+  * The "Emittability status" contradictions above are resolved by
+    construction (a real leg run against the real checkpoint at the real
+    shape cannot disagree with itself).
+  * `GoldenProducerAnchoredFieldSetTests::test_golden_dispatch_pair_bases_equal_all_bases`
+    re-verifies unchanged (it pins the FIELD-NAME set, which a real leg at
+    any shape still satisfies).
+  * `test_golden_modernbert_composites_clear_the_dispatch_proof_gate`
+    re-verifies unchanged for the same reason (it only ever pinned the
+    schema-shape gate, never emittability — see its own docstring).
+
+No skip, no `xfail`, and no `TODO` marker gates on this — the STAGED
+CLOSURE is recorded here in prose and, append-only, in
+`docs/plans/63-how-well/CONTRACT.md`'s 2026-08-29 note, not as a
+pinned-but-disabled test.

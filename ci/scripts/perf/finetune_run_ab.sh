@@ -179,7 +179,7 @@ esac
 FINETUNE_RUN_AB_EPOCHS="${FINETUNE_RUN_AB_EPOCHS:-3}"
 FINETUNE_RUN_AB_BATCH="${FINETUNE_RUN_AB_BATCH:-32}"
 # --lr passthrough (unit-63 audit advisory (b): the CLI has always had this
-# flag, main.rs:141 -- this script simply never forwarded it). Unset means
+# flag, main.rs:145-146 -- this script simply never forwarded it). Unset means
 # "omit --lr entirely", i.e. the CLI's own default (2e-4) -- never fabricate
 # a value here that main.rs's own `#[arg(long, default_value_t = 2e-4)]`
 # already owns.
@@ -325,7 +325,7 @@ fi
 # `FinetuneRunArgs::arm` doc).
 #
 # `lr_override` (5th, optional): when non-empty, forwarded as `--lr`
-# (main.rs:141's own CLI flag) -- the lr=0 RED control loop below passes
+# (main.rs:145-146's own CLI flag) -- the lr=0 RED control loop below passes
 # `"0"` explicitly; the main A/B loop passes `$FINETUNE_RUN_AB_LR`, which is
 # empty by default (omit --lr entirely, i.e. the CLI's own 2e-4 default).
 run_leg() {

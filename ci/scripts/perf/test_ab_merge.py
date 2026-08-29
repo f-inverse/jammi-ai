@@ -2167,20 +2167,31 @@ class GoldenProducerAnchoredFieldSetTests(unittest.TestCase):
             pairs = ab_merge.dispatch_pairs(tier)  # must not raise
             self.assertEqual({base for base, _fused, _fallback in pairs}, ab_merge.ALL_BASES)
 
-    def test_golden_modernbert_legs_clear_the_full_dispatch_proof_gate(self):
-        """Unit-63 round-4 audit F-1: `modernbert_fused.json`/
-        `modernbert_alloff.json` are the REAL, committed legs a genuine
-        producer invocation (`--backbone-dtype bf16`, CONTRACT 63 Frame's
-        own flash cascade) can emit -- run each one, DIRECTLY off the
+    def test_golden_modernbert_composites_clear_the_dispatch_proof_gate(self):
+        """Unit-63 round-5 audit (H5), renaming/re-scoping round-4's
+        `test_golden_modernbert_legs_clear_the_full_dispatch_proof_gate`:
+        `modernbert_fused.json`/`modernbert_alloff.json` are STAGED-CLOSURE
+        composites, NOT real, producer-emittable legs (see
+        `PROVENANCE.md`'s "Emittability status" section -- their
+        `checkpoint_config_sha256` names a `head_dim=16` checkpoint that
+        cannot arithmetically produce their own nonzero flash/
+        attention-block counters, and their `batch`/`seq`/`steps_measured`
+        cannot arithmetically produce those counters either). This test
+        pins only that the FIELD-NAME SET these composites carry clears
+        `finetune_run_dispatch_proof_violations` -- the merger's
+        schema-shape acceptance gate -- run each one DIRECTLY off the
         committed JSON (never `_finetune_run_tier`'s own hand-overridden
-        literal), through the exact merger gate a real leg is held to,
-        including the new arm-agnostic counters-vs-`backbone_dtype`
-        consistency premise and the fused arm's own bf16 premise. `bert_fused.json`
-        is deliberately excluded here -- a real CPU-hermetic BERT leg with
-        no fused attention-block kernel at all (`flash_compiled: false`)
-        was never claimed to clear the flash-cascade-arm's own premise; it
-        is this suite's structural field-set base (`_finetune_run_tier`),
-        not a leg exercising this gate.
+        literal), including the arm-agnostic counters-vs-`backbone_dtype`
+        consistency premise and the fused arm's own bf16 premise. It does
+        NOT, and never did, certify that a real invocation could emit
+        either file; `PROVENANCE.md`'s "Supersession plan" names the one
+        thing that will (a real head_dim-64 probe leg), which also replaces
+        these two committed files verbatim. `bert_fused.json` is
+        deliberately excluded here -- a real CPU-hermetic BERT leg with no
+        fused attention-block kernel at all (`flash_compiled: false`) was
+        never claimed to clear the flash-cascade-arm's own premise; it is
+        this suite's structural field-set base (`_finetune_run_tier`), not
+        a leg exercising this gate.
         """
         fused_tier = load_golden("modernbert_fused")["tiers"]["finetune_run"]
         self.assertEqual(ab_merge.finetune_run_dispatch_proof_violations("fused", fused_tier), [])

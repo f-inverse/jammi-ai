@@ -185,3 +185,24 @@ mirroring `crates/jammi-bench/src/report.rs`'s `FinetuneRunTier::IDENTITY_FIELDS
 Net: 35 − 4 (`split_rule`, `split_seed`, `batched_forward`, `steps_measured`) + 1
 (`heldout_pairs_sha256`) = 32. Contract and code now agree; this amendment is the record of
 that reconciliation, never a further code change.
+
+### Appended note, 2026-08-29 (docs-ci, unit-63 round-5 audit): golden supersession plan
+
+`ci/scripts/perf/fixtures/finetune_run_golden/modernbert_fused.json` and
+`modernbert_alloff.json` are, as of this note, a STAGED CLOSURE: their
+`checkpoint_config_sha256` names the CPU-hermetic `tiny_modernbert_ner`
+fixture (`head_dim=16`) while their dispatch counters are composited from
+real `head_dim=64` GPU legs — a combination no real producer invocation can
+emit (see the fixture's own `PROVENANCE.md`, "Emittability status" section,
+for the two precise arithmetic contradictions this leaves open). The
+campaign's first real ModernBERT-large (`head_dim == 64`) `finetune-run`
+probe leg — run at `finetune_run_ab.sh`'s own checkpoint/batch/seq shape,
+for both the `fused` and `alloff` arms — REPLACES both committed golden
+files VERBATIM (identity, provenance, premise, measurement, and
+dispatch-counter fields all sourced from that one real leg's own report),
+at which point the emittability claim becomes true and
+`GoldenProducerAnchoredFieldSetTests`'s field-set pin re-verifies against
+the replacement without modification. No skip, `xfail`, or `TODO` marker
+gates this — the plan is this prose record plus the fixture's own
+`PROVENANCE.md` "Supersession plan" section, not a pinned-but-disabled
+test.

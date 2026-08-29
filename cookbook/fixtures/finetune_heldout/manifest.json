@@ -12,6 +12,7 @@
   "n_pairs": 1500,
   "n_train": 1372,
   "provenance": {
+    "arxiv_subset_ids_sha256": "6d158e5f5f9284189ca8e9a3fcbc0169ffa1cd907c531e89d1155a4b251d7ec4",
     "committed_subset_ids_file": "cookbook/fixtures/finetune_heldout/arxiv_subset_ids.txt",
     "committed_subset_ids_file_vendored_from": "cookbook/book/data/ids/arxiv.txt",
     "license": "ODC-BY 1.0 (Open Graph Benchmark); see cookbook/fixtures/finetune_heldout/NOTICE.",

@@ -1723,16 +1723,65 @@ class TorchIdentityFieldsAgainstADryRunDumpTests(unittest.TestCase):
 # ============================================================================
 
 
+# Unit-63 adversarial-audit finding 2 (merger half): the finetune-run tier
+# now ALSO emits finetune-step's exact `*_fused_dispatches`/
+# `*_eager_dispatches` counter pairs, verbatim field names, `attention_block`
+# included -- a CLEAN "fused" leg (REQUIRED_PAIRS ln/geglu fused, rope/softmax
+# absorbed at (0, 0) by attention_block's own fused>0, attention_block
+# itself fused, lora_linear fused with lora_epilogue permanently (0, 0), the
+# SAME real shape `jammi_fs`'s own default in this file already documents
+# for the finetune-step tier) or a CLEAN "alloff" leg (every pair reads
+# fused=0, eager>0 -- kernels genuinely disabled, nothing fused dispatched at
+# all). `attention_block_flash`/`CASCADE_BASES` are deliberately absent (not
+# yet on `main`, see `ab_merge.py`'s own module doc) -- every fixture here
+# stays on the 7-base non-flash shape.
+_FINETUNE_RUN_DISPATCH_COUNTERS = {
+    "fused": {
+        "ln_fused_dispatches": 9,
+        "ln_eager_dispatches": 0,
+        "geglu_fused_dispatches": 9,
+        "geglu_eager_dispatches": 0,
+        "rope_fused_dispatches": 0,
+        "rope_eager_dispatches": 0,
+        "softmax_fused_dispatches": 0,
+        "softmax_eager_dispatches": 0,
+        "attention_block_fused_dispatches": 9,
+        "attention_block_eager_dispatches": 0,
+        "lora_epilogue_fused_dispatches": 0,
+        "lora_epilogue_eager_dispatches": 0,
+        "lora_linear_fused_dispatches": 9,
+        "lora_linear_eager_dispatches": 0,
+    },
+    "alloff": {
+        "ln_fused_dispatches": 0,
+        "ln_eager_dispatches": 9,
+        "geglu_fused_dispatches": 0,
+        "geglu_eager_dispatches": 9,
+        "rope_fused_dispatches": 0,
+        "rope_eager_dispatches": 9,
+        "softmax_fused_dispatches": 0,
+        "softmax_eager_dispatches": 9,
+        "attention_block_fused_dispatches": 0,
+        "attention_block_eager_dispatches": 9,
+        "lora_epilogue_fused_dispatches": 0,
+        "lora_epilogue_eager_dispatches": 0,
+        "lora_linear_fused_dispatches": 0,
+        "lora_linear_eager_dispatches": 9,
+    },
+}
+
+
 def _finetune_run_tier(arm="fused", **overrides):
     """A minimal, fully-populated `FinetuneRunTier`-shaped dict — every
     `FINETUNE_RUN_IDENTITY_FIELDS` entry, every `PROVENANCE_FIELDS` entry
     (report.rs), the three premise legs (`admission_is_dense`,
-    `learning_happened_delta`, `tie_fraction`), and the measurement fields
+    `learning_happened_delta`, `tie_fraction`), the measurement fields
     (`final_epoch`, `held_out_example_mean`, `held_out_count`,
-    `final_loss_diagnostic`, `trajectory`). Defaults to MNRL (`margin=None`,
-    `temperature=20.0`) and a CLEAN premise (padded transport, learning
-    happened, no ties) — every mutant test below overrides exactly the one
-    field it means to break.
+    `final_loss_diagnostic`, `trajectory`), and (unit-63 audit finding 2) a
+    CLEAN `_FINETUNE_RUN_DISPATCH_COUNTERS` set matching `arm`. Defaults to
+    MNRL (`margin=None`, `temperature=20.0`) and a CLEAN premise (padded
+    transport, learning happened, no ties) — every mutant test below
+    overrides exactly the one field it means to break.
     """
     tier = {
         "seed": 42,
@@ -1796,6 +1845,7 @@ def _finetune_run_tier(arm="fused", **overrides):
             }
         ],
     }
+    tier.update(_FINETUNE_RUN_DISPATCH_COUNTERS.get(arm, _FINETUNE_RUN_DISPATCH_COUNTERS["fused"]))
     tier.update(overrides)
     return tier
 
@@ -1934,6 +1984,142 @@ class FinetuneRunArmPremiseMutantTests(unittest.TestCase):
     def test_tie_fraction_just_under_cap_is_clean(self):
         tier = _finetune_run_tier(tie_fraction=ab_merge.FINETUNE_RUN_TIE_FRACTION_CAP - 0.01)
         self.assertEqual(ab_merge.finetune_run_arm_premise_violations("fused", tier), [])
+
+
+class FinetuneRunDispatchProofMutantTests(unittest.TestCase):
+    """`finetune_run_dispatch_proof_violations` (unit-63 audit finding 2's
+    merger half) — one mutant per arm, plus the "missing entirely" and
+    "malformed pair" carve-outs.
+    """
+
+    def test_clean_fused_tier_has_no_violations(self):
+        self.assertEqual(
+            ab_merge.finetune_run_dispatch_proof_violations("fused", _finetune_run_tier(arm="fused")), []
+        )
+
+    def test_clean_alloff_tier_has_no_violations(self):
+        self.assertEqual(
+            ab_merge.finetune_run_dispatch_proof_violations("alloff", _finetune_run_tier(arm="alloff")), []
+        )
+
+    def test_fused_arm_failing_required_pair_is_a_violation(self):
+        # ln reads (0, 0) -- REQUIRED_PAIRS demands fused > 0.
+        tier = _finetune_run_tier(arm="fused", ln_fused_dispatches=0)
+        v = ab_merge.finetune_run_dispatch_proof_violations("fused", tier)
+        self.assertTrue(any("fused-dispatch proof" in m for m in v), v)
+
+    def test_fused_arm_with_a_real_eager_fallback_is_a_violation(self):
+        # Rule 1: ANY pair with a nonzero fallback count is a hard fail.
+        tier = _finetune_run_tier(arm="fused", ln_eager_dispatches=3)
+        v = ab_merge.finetune_run_dispatch_proof_violations("fused", tier)
+        self.assertTrue(any("fused-dispatch proof" in m for m in v), v)
+
+    def test_alloff_arm_with_all_zero_fused_is_clean(self):
+        self.assertEqual(
+            ab_merge.finetune_run_dispatch_proof_violations("alloff", _finetune_run_tier(arm="alloff")), []
+        )
+
+    def test_alloff_arm_with_a_nonzero_fused_pair_is_a_violation(self):
+        tier = _finetune_run_tier(arm="alloff", attention_block_fused_dispatches=4)
+        v = ab_merge.finetune_run_dispatch_proof_violations("alloff", tier)
+        self.assertTrue(any("nonzero fused count" in m and "attention_block" in m for m in v), v)
+
+    def test_alloff_arm_with_several_nonzero_fused_pairs_names_all_of_them(self):
+        tier = _finetune_run_tier(arm="alloff", ln_fused_dispatches=2, geglu_fused_dispatches=5)
+        v = ab_merge.finetune_run_dispatch_proof_violations("alloff", tier)
+        self.assertEqual(len(v), 1)
+        self.assertIn("ln", v[0])
+        self.assertIn("geglu", v[0])
+
+    def test_missing_dispatch_counters_entirely_is_a_violation_never_assumed_good(self):
+        # An older-producer leg predating this emission: strip every
+        # counter field -- `dispatch_pairs` then discovers nothing at all,
+        # which must NOT be silently treated as "ran the claimed arm
+        # cleanly" for either arm.
+        base_tier = _finetune_run_tier(arm="fused")
+        stripped = {k: v for k, v in base_tier.items() if not k.endswith(("_fused_dispatches", "_eager_dispatches"))}
+        v_fused = ab_merge.finetune_run_dispatch_proof_violations("fused", stripped)
+        self.assertTrue(any("no *_fused_dispatches" in m for m in v_fused), v_fused)
+
+        alloff_tier = _finetune_run_tier(arm="alloff")
+        stripped_alloff = {
+            k: v for k, v in alloff_tier.items() if not k.endswith(("_fused_dispatches", "_eager_dispatches"))
+        }
+        v_alloff = ab_merge.finetune_run_dispatch_proof_violations("alloff", stripped_alloff)
+        self.assertTrue(any("no *_fused_dispatches" in m for m in v_alloff), v_alloff)
+
+    def test_solo_counter_schema_error_is_caught_not_propagated(self):
+        tier = _finetune_run_tier(arm="fused")
+        del tier["ln_eager_dispatches"]  # a fused key with no fallback sibling
+        v = ab_merge.finetune_run_dispatch_proof_violations("fused", tier)
+        self.assertTrue(any("dispatch-pair schema error" in m for m in v), v)
+
+
+class FinetuneRunCrossSeedHomogeneityTests(unittest.TestCase):
+    """`finetune_run_cross_seed_homogeneity_violations` (unit-63 audit
+    finding 3): every OTHER identity check in this section compares
+    fused-vs-alloff WITHIN one seed only; this one compares every leg
+    entering the decision against every OTHER leg, `seed` itself excepted.
+    """
+
+    def _identity(self, seed, arm, **overrides):
+        return (
+            f"seed {seed} {arm} r1",
+            ab_merge.finetune_run_leg_identity(_finetune_run_tier(arm=arm, seed=seed, **overrides)),
+        )
+
+    def test_fewer_than_two_legs_is_clean(self):
+        self.assertEqual(ab_merge.finetune_run_cross_seed_homogeneity_violations([]), [])
+        self.assertEqual(
+            ab_merge.finetune_run_cross_seed_homogeneity_violations([self._identity(1, "fused")]), []
+        )
+
+    def test_homogeneous_twelve_seeds_is_clean(self):
+        legs = [self._identity(seed, arm) for seed in range(1, 13) for arm in ("fused", "alloff")]
+        self.assertEqual(ab_merge.finetune_run_cross_seed_homogeneity_violations(legs), [])
+
+    def test_two_fixture_split_is_a_violation(self):
+        # Empirical reproduction: 6 seeds run against one held-out text, 6
+        # against a different one -- each seed's own fused/alloff pair
+        # internally agrees (heldout_pairs_sha256 matches within a seed), so
+        # the existing per-seed check alone would see nothing wrong.
+        legs = []
+        for seed in range(1, 7):
+            for arm in ("fused", "alloff"):
+                legs.append(self._identity(seed, arm, heldout_pairs_sha256="fixture-a"))
+        for seed in range(7, 13):
+            for arm in ("fused", "alloff"):
+                legs.append(self._identity(seed, arm, heldout_pairs_sha256="fixture-b"))
+        v = ab_merge.finetune_run_cross_seed_homogeneity_violations(legs)
+        self.assertTrue(any("heldout_pairs_sha256" in m for m in v), v)
+
+    def test_single_divergent_field_on_one_seed_names_it(self):
+        legs = [self._identity(seed, arm) for seed in range(1, 13) for arm in ("fused", "alloff")]
+        # Seed 7's own two legs both agree with EACH OTHER (so the existing
+        # cross-arm check is clean) but diverge from every other seed.
+        legs = [
+            leg
+            if not leg[0].startswith("seed 7 ")
+            else self._identity(7, leg[0].split(" ")[2], checkpoint_weights_sha256="different-checkpoint")
+            for leg in legs
+        ]
+        v = ab_merge.finetune_run_cross_seed_homogeneity_violations(legs)
+        self.assertEqual(len(v), 1)
+        self.assertIn("checkpoint_weights_sha256", v[0])
+        self.assertIn("seed 7", v[0])
+
+    def test_seed_field_itself_is_never_compared(self):
+        legs = [self._identity(seed, arm) for seed in range(1, 5) for arm in ("fused", "alloff")]
+        self.assertEqual(ab_merge.finetune_run_cross_seed_homogeneity_violations(legs), [])
+
+    def test_missing_field_on_one_leg_is_its_own_divergent_group(self):
+        clean = [self._identity(seed, arm) for seed in (1, 2, 3) for arm in ("fused", "alloff")]
+        missing_field_tier = _finetune_run_tier(arm="fused", seed=4)
+        del missing_field_tier["lora_dropout"]
+        clean.append((f"seed 4 fused r1", ab_merge.finetune_run_leg_identity(missing_field_tier)))
+        clean.append((f"seed 4 alloff r1", ab_merge.finetune_run_leg_identity(_finetune_run_tier(arm="alloff", seed=4))))
+        v = ab_merge.finetune_run_cross_seed_homogeneity_violations(clean)
+        self.assertTrue(any("lora_dropout" in m for m in v), v)
 
 
 class FinetuneRunCrossArmIdentityTests(unittest.TestCase):
@@ -2169,6 +2355,143 @@ class BuildFinetuneRunReportEndToEndTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
             rc = ab_merge.main(["finetune-run", raw_dir, out_dir, "1,2,3"])
         self.assertEqual(rc, 1)
+
+
+class BuildFinetuneRunReportDispatchProofEndToEndTests(unittest.TestCase):
+    """`finetune_run_dispatch_proof_violations` wired into
+    `build_finetune_run_report` (unit-63 audit finding 2's merger half) —
+    driven through the REAL merge entry point, never the bare function
+    alone.
+    """
+
+    def test_fused_leg_failing_dispatch_proof_invalidates_its_seed(self):
+        seeds = [1, 2, 3]
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in seeds:
+                fused_overrides = {"ln_fused_dispatches": 0} if seed == 2 else {}
+                for repeat in ("r1", "r2"):
+                    _write_finetune_run_leg(
+                        raw_dir, seed, "fused", repeat, _finetune_run_tier(arm="fused", seed=seed, **fused_overrides)
+                    )
+                    _write_finetune_run_leg(raw_dir, seed, "alloff", repeat, _finetune_run_tier(arm="alloff", seed=seed))
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, seeds)
+        self.assertEqual(merged["status"], "INVALID")
+        self.assertTrue(
+            any("fused-dispatch proof" in v for v in merged["per_seed"]["2"]["leg_premise_violations"]),
+            merged["per_seed"]["2"]["leg_premise_violations"],
+        )
+        # seeds 1/3 stay dispatch-proof clean.
+        self.assertEqual(merged["per_seed"]["1"]["leg_premise_violations"], [])
+        self.assertEqual(merged["per_seed"]["3"]["leg_premise_violations"], [])
+
+    def test_alloff_leg_with_nonzero_fused_invalidates_its_seed(self):
+        seeds = [1, 2]
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in seeds:
+                alloff_overrides = {"attention_block_fused_dispatches": 5} if seed == 1 else {}
+                for repeat in ("r1", "r2"):
+                    _write_finetune_run_leg(raw_dir, seed, "fused", repeat, _finetune_run_tier(arm="fused", seed=seed))
+                    _write_finetune_run_leg(
+                        raw_dir, seed, "alloff", repeat, _finetune_run_tier(arm="alloff", seed=seed, **alloff_overrides)
+                    )
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, seeds)
+        self.assertEqual(merged["status"], "INVALID")
+        self.assertTrue(
+            any("nonzero fused count" in v for v in merged["per_seed"]["1"]["leg_premise_violations"]),
+            merged["per_seed"]["1"]["leg_premise_violations"],
+        )
+        self.assertEqual(merged["per_seed"]["2"]["leg_premise_violations"], [])
+
+
+class BuildFinetuneRunReportCrossSeedHomogeneityEndToEndTests(unittest.TestCase):
+    """`finetune_run_cross_seed_homogeneity_violations` wired into
+    `build_finetune_run_report` (unit-63 audit finding 3) — driven through
+    the REAL merge entry point.
+    """
+
+    _MEANS = {
+        1: (0.30, 0.50),
+        2: (0.32, 0.48),
+        3: (0.29, 0.55),
+        4: (0.31, 0.47),
+        5: (0.28, 0.52),
+        6: (0.33, 0.49),
+        7: (0.27, 0.53),
+        8: (0.55, 0.40),
+        9: (0.52, 0.38),
+        10: (0.58, 0.42),
+        11: (0.50, 0.35),
+        12: (0.54, 0.39),
+    }
+
+    def test_two_fixture_split_end_to_end_is_invalid(self):
+        # Empirical reproduction this finding fixes: 6 seeds against
+        # `heldout_pairs_sha256="fixture-a"`, 6 against `"fixture-b"` --
+        # each seed's own fused/alloff pair internally agrees, and the
+        # 7-vs-5 sign-test shape used to read GREEN (see
+        # `test_end_to_end_green_matches_direct_sign_test`, the SAME means).
+        # This must now be INVALID, naming the diverging field.
+        seeds = list(range(1, 13))
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in seeds:
+                fixture = "fixture-a" if seed <= 6 else "fixture-b"
+                fused_mean, alloff_mean = self._MEANS[seed]
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir,
+                            seed,
+                            arm,
+                            repeat,
+                            _finetune_run_tier(
+                                arm=arm, seed=seed, held_out_example_mean=mean, heldout_pairs_sha256=fixture
+                            ),
+                        )
+            merged, table = ab_merge.build_finetune_run_report(raw_dir, seeds)
+        self.assertEqual(merged["status"], "INVALID")
+        self.assertTrue(
+            any("heldout_pairs_sha256" in v for v in merged["cross_seed_identity_violations"]),
+            merged["cross_seed_identity_violations"],
+        )
+        self.assertIn("cross_seed_identity_violations", table)
+
+    def test_homogeneous_twelve_end_to_end_is_unaffected(self):
+        # Same fixture as `test_end_to_end_green_matches_direct_sign_test` --
+        # a genuinely homogeneous 12-seed sweep must stay exactly as before
+        # this fix.
+        seeds = list(range(1, 13))
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in seeds:
+                fused_mean, alloff_mean = self._MEANS[seed]
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, seeds)
+        self.assertEqual(merged["status"], "GREEN")
+        self.assertEqual(merged["cross_seed_identity_violations"], [])
+
+    def test_single_divergent_seed_end_to_end_is_invalid_naming_the_field(self):
+        seeds = list(range(1, 13))
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in seeds:
+                fused_mean, alloff_mean = self._MEANS[seed]
+                overrides = {"checkpoint_weights_sha256": "different-checkpoint"} if seed == 5 else {}
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir,
+                            seed,
+                            arm,
+                            repeat,
+                            _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean, **overrides),
+                        )
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, seeds)
+        self.assertEqual(merged["status"], "INVALID")
+        self.assertEqual(len(merged["cross_seed_identity_violations"]), 1)
+        self.assertIn("checkpoint_weights_sha256", merged["cross_seed_identity_violations"][0])
+        self.assertIn("seed 5", merged["cross_seed_identity_violations"][0])
 
 
 class FinetuneRunDecisionRuleMutantTests(unittest.TestCase):

@@ -27,7 +27,8 @@ Run: ``python3 ci/scripts/perf/verify_train_pairs.py``
      ``cookbook/fixtures/finetune_heldout/``)
 Self-test: ``python3 ci/scripts/perf/verify_train_pairs.py --self-test``
      (a synthetic 2-pair fixture, GREEN on committed-shaped hashes, RED on
-     a flipped byte / a missing id / an extra pair / a wrong count)
+     a flipped byte / a missing id / an extra pair / a wrong count / a
+     reordered-but-otherwise-identical row sequence)
 Hermetic: reads only the two files named on the command line (or the
 committed fixture defaults); no network, no build, no GPU.
 """
@@ -143,6 +144,21 @@ def verify(pairs_path: Path, hashes_path: Path, expected_count: int = EXPECTED_T
             f"{pairs_path.name} has {len(actual_pairs)} pairs, expected exactly "
             f"{expected_count}")
 
+    # Unit-63 audit advisory (b): row ORDER is load-bearing too -- ab_merge.py's
+    # own `row_lengths` identity field carries the exact same "per-row order
+    # is load-bearing, never canonicalized" doctrine (identity_fields.py's
+    # own doc). A re-derivation that silently reordered rows (e.g. a
+    # non-deterministic iteration order on the producer side) would pass
+    # every per-pair/structural check above yet still hand a DIFFERENT
+    # actual row sequence to any downstream consumer that reads this file
+    # positionally -- so the actual key sequence must equal the committed
+    # order exactly, not just as a set.
+    actual_keys_ordered = [_key(p) for p in actual_pairs]
+    if actual_keys_ordered != expected_keys_ordered:
+        structural.append(
+            f"{pairs_path.name}'s row order does not match {hashes_path.name}'s committed "
+            "order (same pair ids, different sequence)")
+
     return per_pair + structural
 
 
@@ -238,6 +254,22 @@ def self_test() -> int:
         if not any("expected exactly 1372" in x for x in findings_d):
             failures.append(f"(d) wrong-count case expected an 'expected exactly 1372' finding, got {findings_d}")
 
+        # (e) RED (unit-63 audit advisory (b)): same two pair ids, same
+        # per-pair content -- just written in the OPPOSITE order. Every
+        # per-pair/structural check above stays clean (no missing/extra/
+        # duplicate/mismatched id, exact count) -- only the row-order check
+        # catches this.
+        e_dir = tmp / "e_reordered"
+        e_dir.mkdir()
+        _, hashes_path_e = _fixture(e_dir, _SYNTH_PAIRS)
+        pairs_path_e = e_dir / "train_pairs.jsonl"
+        with pairs_path_e.open("w") as f:
+            for p in reversed(_SYNTH_PAIRS):
+                f.write(json.dumps(p, sort_keys=True) + "\n")
+        findings_e = verify(pairs_path_e, hashes_path_e, expected_count=2)
+        if not any("row order does not match" in x for x in findings_e):
+            failures.append(f"(e) reordered-rows case expected a 'row order does not match' finding, got {findings_e}")
+
         # GREEN control: missing pairs_path entirely is a clean, single finding.
         missing_dir = tmp / "missing"
         missing_dir.mkdir()
@@ -254,7 +286,8 @@ def self_test() -> int:
     print(
         "verify-train-pairs self-test: OK -- GREEN on a synthetic 2-pair fixture matching "
         "committed-shaped hashes; RED on (a) one flipped byte, (b) a missing id, (c) an "
-        "extra pair, and (d) a wrong count."
+        "extra pair, (d) a wrong count, and (e) a reordered-but-otherwise-identical row "
+        "sequence."
     )
     return 0
 

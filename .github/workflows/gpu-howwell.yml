@@ -41,10 +41,10 @@ on:
         required: true
         type: string
       lr0_seeds:
-        description: "Comma-separated lr=0 RED control seeds (default: empty, skipped — CONTRACT Frame 'RED control: lr=0 arm x2 seeds fails learning-happened', unit-63 audit advisory (b))."
+        description: "Comma-separated lr=0 RED control seeds (default: '1,2' — the first two of the pre-registered 12-seed gate set, CONTRACT H5 step 3's own 'x2 seeds' control; CONTRACT Frame 'RED control: lr=0 arm x2 seeds fails learning-happened'. Set to an empty string to EXPLICITLY opt out — the merged artifact then records lr0_control.seeds:[] for auditability, distinguishing a deliberate skip from an unset input.)"
         required: false
         type: string
-        default: ""
+        default: "1,2"
   pull_request:
     types: [labeled]
 

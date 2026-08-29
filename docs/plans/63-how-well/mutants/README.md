@@ -748,7 +748,7 @@ transient (m/v are zero-initialized, so v_hat's `eps` floor and the
 did. No claim of degradation is made for `M_nobc` before it is actually
 run; this is the honest complement to `M_signflip` below.
 
-<!-- claims63: c1=ledger -->
+<!-- claims63: c1=docs/plans/63-how-well/measurements/red-proof/finetune_run_ab_report.json#/mutant_dose_ladder/doses/0/gate_seed_count -->
 **Measured (12-leg GPU, a100, `redproof-nobc`): NOT DETECTED (raw).**
 Committed artifact: `docs/plans/63-how-well/measurements/red-proof/` at
 <!-- claims63: c1=ledger -->
@@ -836,6 +836,7 @@ PTX, never `cpu_fwd`'s Rust body. The CPU-side demonstration above
 (`3.464057e-3`..`1.7320165e-2` L2 divergence) is real and correctly shows
 `cpu_fwd` diverging from the oracle — the demonstration procedure itself
 worked exactly as designed — but it demonstrates a perturbation that never
+<!-- claims63: c1=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json#/decision/gate_seed_count -->
 reaches the arm the 12-leg GPU gate actually exercises. This is the
 opposite failure mode from a premise violation (the legs were premise-CLEAN
 — dispatch/admission fields read identical to a clean fused leg, exactly as
@@ -962,6 +963,7 @@ also reaches the CUDA arm (per the `(1+eps)` family's own hardware
 precedent), not a claim that the CPU numbers themselves are new evidence
 beyond v1's.
 
+<!-- claims63: c1=docs/plans/63-how-well/measurements/red-proof/dstar/finetune_run_ab_report.json#/mutant_dose_ladder/doses/0/gate_seed_count -->
 **Measured (12-leg GPU, a100, `redproof-signflip-v2`, D*-gated): RED —
 <!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/dstar/finetune_run_ab_report.json; c1=#/mutant_dose_ladder/red_proof/0/n_pos; c2=#/mutant_dose_ladder/red_proof/0/clean_pair_count -->
 12/12.** Committed artifact:
@@ -976,7 +978,6 @@ clean pairs (all 12 legs ascend against `RED_PROOF_EXPECTED_TRAIN_
 DIRECTION`'s own entry, init anchors bit-identical); `n_pos=12, n_neg=0`,
 <!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/dstar/finetune_run_ab_report.json; c1=numer(4096, #/mutant_dose_ladder/red_proof/0/p_value); c2=denom(2, #/mutant_dose_ladder/red_proof/0/p_value); c3=numer(2048, #/mutant_dose_ladder/red_proof/0/p_value); c4=denom(1, #/mutant_dose_ladder/red_proof/0/p_value); c5=#/mutant_dose_ladder/red_proof/0/p_value -->
 `detected=RED`, two-sided `p = 2/4096 = 1/2048 = 0.00048828125` exact;
-<!-- claims63: c1=ledger -->
 `red_proof_verdict = PROVEN`; merge exit 0 (PROVEN contributes nothing to
 the exit code). Acceptance 5's "mutant column proven RED" is DISCHARGED
 at `M = M_signflip_v2`, per the amendment's honesty rider: this mutant is
@@ -1074,6 +1075,7 @@ same carve-out every dose column gets) is caught by the SAME
 `invalid_doses` check every column in `doses[]` already goes through,
 non-zero exit exactly as everywhere else in this module.
 
+<!-- claims63: c1=docs/plans/63-how-well/measurements/red-proof/finetune_run_ab_report.json#/mutant_dose_ladder/doses/0/gate_seed_count -->
 **Measured record (12-leg GPU, a100), current-truth discipline:** committed
 <!-- claims63: c1=ledger -->
 artifact `docs/plans/63-how-well/measurements/red-proof/` at dc1cfc3b (36
@@ -1169,6 +1171,7 @@ dstar/` at 82253c1b).
 - `M_nobc.patch` — bias correction removed entirely (RED-proof pair,
   outside the lr-scale family); committed unified diff against `e340391c`;
   sha256 `9b3c824dc041899c12c0e2d44d12a3ac8c7b86076ffc778638108925ba51bf4e`;
+<!-- claims63: c1=docs/plans/63-how-well/measurements/red-proof/finetune_run_ab_report.json#/mutant_dose_ladder/doses/0/gate_seed_count -->
   patch-file-only; **measured NOT-DETECTED (raw)** on 12-leg GPU
 <!-- claims63: c1=poscount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c2=paircount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c3=meand('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean') -->
   (`redproof-nobc`, `n_pos=5/12`, `mean_d=-0.018`; GATED column reads
@@ -1179,6 +1182,7 @@ dstar/` at 82253c1b).
   cpu_fwd` only (RED-proof pair, outside the lr-scale family); committed
   unified diff against `e340391c`; sha256
   `fb2bd11935e9a08e8a1197aa3a84535660119823aabb421105e389a388f6e5e4`;
+<!-- claims63: c1=paircount('docs/plans/63-how-well/measurements/red-proof/raw/signflip__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__fused__r1.json', 'held_out_example_mean') -->
   patch-file-only; **RETIRED — measured INERT on 12-leg GPU**
 <!-- claims63: c1=zerocount('docs/plans/63-how-well/measurements/red-proof/raw/signflip__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__fused__r1.json', 'held_out_example_mean'); c2=paircount('docs/plans/63-how-well/measurements/red-proof/raw/signflip__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__fused__r1.json', 'held_out_example_mean') -->
   (`redproof-signflip`, 12/12 legs bit-identical to the clean fused column:

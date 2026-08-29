@@ -537,7 +537,13 @@ def _diagnose_row(row: dict) -> str:
         reason = row.get("unparseable_reason") or "no valid verdict block found"
         return f" [UNPARSEABLE: {reason}]"
     raw = row.get("verdict_raw")
-    if raw is not None and raw not in _PASS_LIKE:
+    # `raw == "BLOCK"` is the RECOGNIZED literal spelling for every card
+    # whose vocabulary is `BLOCK | PASS` (adversarial-audit,
+    # citation-checker, discipline-test-auditor) — it must never be
+    # reported as "unrecognized ... defaulted to BLOCK"; that label is for
+    # a raw value outside a card's own vocabulary, not the vocabulary's own
+    # BLOCK spelling normalizing to the BLOCK verdict by construction.
+    if raw is not None and raw != "BLOCK" and raw not in _PASS_LIKE:
         return f" [unrecognized verdict value {raw!r} defaulted to BLOCK]"
     if row.get("_corrupted"):
         return " [state row corrupted — treated as BLOCK]"
@@ -728,12 +734,64 @@ def handle_start(payload: dict, sdir: Path) -> None:
 
 
 # --------------------------------------------------------------------------
-# SubagentStop — write exactly one validated row per stop.
+# SubagentStop — write exactly one validated row per stop, and ONLY for a
+# verifier-typed stop (STOP_MATCH_TYPES) — the settings.json SubagentStop
+# `matcher` is meant to restrict invocation to this same set already, but
+# the closed-world check is re-asserted HERE, inside the handler, as
+# defense in depth: a matcher that does not filter as intended (e.g. because
+# the payload's agent-type field travels under a spelling the matcher
+# pattern doesn't anticipate) must not turn every non-verifier Stop event
+# into an UNBOUND-bucket write. This is a closed-world MEMBERSHIP check
+# only — never a free-text predicate — and it only ever SUPPRESSES a write;
+# it can never deny anything (`stop` remains exit-0 always).
 # --------------------------------------------------------------------------
 
+# `all_open_blocks` re-reads and JSON-parses the WHOLE contents of every
+# `<unit>.jsonl` file on every dispatch. An UNBOUND.jsonl that has
+# accumulated to megabytes (every stop whose unit could not be resolved —
+# most commonly, historically, a non-verifier stop that reached this
+# handler before the STOP_MATCH_TYPES filter above existed — lands here)
+# turns every future dispatch into a multi-megabyte parse. The cap is
+# generous (2 MiB — comfortably past any single session's worth of
+# legitimately-UNBOUND verifier rows, so it never fires on ordinary
+# traffic) purely to bound the READ cost of a state directory that
+# accumulated before this fix landed.
+_UNBOUND_ROTATE_CAP_BYTES = 2 * 1024 * 1024
+
+
+def _rotate_unbound_if_oversized(sdir: Path) -> None:
+    """One-time migration, safe to call on every `stop` invocation: if the
+    live `UNBOUND.jsonl` has grown past the cap, move it out of the LIVE
+    `.jsonl` glob to a `.jsonl.1` sibling — `all_open_blocks`'s `entry.
+    suffix != ".jsonl"` check already skips any file whose suffix is not
+    exactly `.jsonl`, so the rotated sibling is invisible to it without any
+    further change. This is a no-op for gate correctness: UNBOUND rows were
+    never load-bearing for any gate decision (advisory-only), only for
+    per-invocation read cost. Runs BEFORE the STOP_MATCH_TYPES filter below
+    so a session that already carries an oversized file is rotated on its
+    very first post-deploy `stop`, not stuck re-parsing it until its NEXT
+    growth past the cap."""
+    path = unit_file(sdir, "UNBOUND")
+    try:
+        if path.exists() and path.stat().st_size > _UNBOUND_ROTATE_CAP_BYTES:
+            path.replace(path.parent / (path.name + ".1"))
+    except OSError:
+        pass
+
+
 def handle_stop(payload: dict, sdir: Path) -> None:
-    agent_id = _first_str(payload, ("agent_id", "id", "subagent_id")) or "UNKNOWN"
+    _rotate_unbound_if_oversized(sdir)
+
     agent_type = _first_str(payload, ("agent_type", "subagent_type")) or ""
+    if agent_type not in STOP_MATCH_TYPES:
+        # Closed-world membership, never a free-text RED: a non-verifier
+        # stop writes NOTHING (no unit row, no UNBOUND append) — early
+        # return before any parsing or binding-lookup work. A session
+        # carries roughly 2700 non-subagent Stop-shaped events; a RED arm
+        # here (rather than a silent skip) would jam nearly all of them.
+        return
+
+    agent_id = _first_str(payload, ("agent_id", "id", "subagent_id")) or "UNKNOWN"
     last_msg = _first_str(payload, ("last_assistant_message", "last_assistant_message_text")) or ""
 
     data, invalid_reason = extract_verdict_json(last_msg)

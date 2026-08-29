@@ -65,8 +65,8 @@ SWARM_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "swarm.yml"
 ANCHOR_RE = re.compile(r"(rust_symbol|gate_script|doc_heading|discipline):([^\s;|`]+)")
 
 # A constitution invariant row: a Markdown table row whose first bold cell is an
-# invariant id (B* = boundary, K* = correctness).
-ROW_ID_RE = re.compile(r"\*\*([BK]\d+)\*\*")
+# invariant id (B* = boundary, K* = correctness, T* = termination).
+ROW_ID_RE = re.compile(r"\*\*([BKT]\d+)\*\*")
 
 UNENFORCED = "UNENFORCED"
 

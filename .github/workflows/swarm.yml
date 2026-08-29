@@ -70,6 +70,21 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 ci/scripts/test_check_lead_gate.py
 
+      # Constitution T1: an audit-round sequence terminates only in operator
+      # acceptance of an assurance-deficit register. G1-G8 + the escapes-status-
+      # move trigger, always-run, fail-closed, REPO_ROOT marker-file assertion.
+      - name: Assert every assurance-deficit register is internally consistent (G1-G8)
+        if: ${{ !cancelled() }}
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+        run: python3 ci/scripts/check_ship_register.py
+
+      - name: Run check_ship_register.py's own self-test + test suite
+        if: ${{ !cancelled() }}
+        run: |
+          python3 ci/scripts/check_ship_register.py --self-test
+          python3 ci/scripts/test_check_ship_register.py
+
       # --- Human-amend-only guards (git-diff-scoped; PRs only) ----------------
       # Each detects its touched set inside the job and exits green when untouched,
       # red (admin-merge required) when touched. Every constitution/gate edit —
@@ -113,3 +128,42 @@ jobs:
             exit 1
           fi
           echo "SWARM_GATE_TOUCHED: clean — no swarm gate definition changed."
+
+      - name: Guard — swarm governance docs are human-amend-only (GOVERNANCE_TOUCHED)
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        run: |
+          git fetch --quiet origin "${{ github.base_ref }}"
+          base="origin/${{ github.base_ref }}"
+          changed="$(git diff --name-only "$base"...HEAD -- \
+            docs/swarm/SELF-FAILURE-MODES.md \
+            docs/plans/53-agentic-swarm/ARCHITECTURE.md)"
+          if [ -n "$changed" ]; then
+            echo "::error::GOVERNANCE_TOUCHED: a swarm governance document changed in this PR:"
+            echo "$changed" | sed 's/^/    /'
+            echo "SELF-FAILURE-MODES.md and ARCHITECTURE.md carry the swarm's failure catalog,"
+            echo "enforcement inventory, and stopping rule; they are human-amend-only for the same"
+            echo "anti-Goodhart reason as CONSTITUTION_TOUCHED / SWARM_GATE_TOUCHED (ARCHITECTURE §2.7/§7)."
+            echo "Measured incremental friction: zero — every historical commit to these files also"
+            echo "touched a SWARM_GATE_TOUCHED path and was already admin-merged."
+            echo "This PR must be human-reviewed and admin-merged."
+            exit 1
+          fi
+          echo "GOVERNANCE_TOUCHED: clean — no governance document changed."
+
+      - name: Guard — assurance-deficit registers are operator-accepted (REGISTER_TOUCHED)
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        run: |
+          git fetch --quiet origin "${{ github.base_ref }}"
+          base="origin/${{ github.base_ref }}"
+          changed="$(git diff --name-only "$base"...HEAD -- ':(glob).jammi/registers/**')"
+          if [ -n "$changed" ]; then
+            echo "::error::REGISTER_TOUCHED: an assurance-deficit register changed in this PR:"
+            echo "$changed" | sed 's/^/    /'
+            echo "A register is a ship-with-residuals acceptance; accepting it is the OPERATOR's"
+            echo "decision (constitution T1). On a conformant register, check_ship_register.py is"
+            echo "GREEN and this tripwire is the SOLE red: the operator's admin-merge over it is the"
+            echo "recorded acceptance, and the ONLY act that makes an operator_accepted_live residual"
+            echo "effective. This PR must be admin-merged by the operator."
+            exit 1
+          fi
+          echo "REGISTER_TOUCHED: clean — no register changed."

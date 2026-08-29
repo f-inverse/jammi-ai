@@ -38,6 +38,13 @@ Report `unit_branch` (`git -C <worktree> rev-parse --abbrev-ref HEAD` if resolva
 
 Emit exactly one fenced ```json block as the LAST fenced block of your final message, with `"kind": "verdict"` as its first field (a `<verdict>...</verdict>`-tag-wrapped block is also an accepted, older form) — exactly the shape the SubagentStop hook parses: the LAST fenced ```json block, `"kind": "verdict"` required, the tag form accepted only when no fenced block exists. `verdict` is `verified` only when the test went RED-then-GREEN, the control is non-vacuous, and a resolving `closes_escape` id is present. Otherwise `tautological` or `not-symptom-faithful` — both are BLOCK states.
 
+Every finding also carries a `liveness`:
+
+> ```
+> "liveness": "live | latent"
+> ```
+> — **live**: the defect is expressed by the tree as it ships. For an **artifact** finding: a wrong number, a false claim, a reachable crash — false or failing today. For a **verification-mechanism** finding (a gate, oracle, fixture, or checker): live iff a state of the CURRENT tree exists for which the mechanism's verdict would differ from its specified verdict — unsound now, whether or not any artifact is currently wrong. A gate that reports PASS having examined nothing is live (esc-063: the specified scan over the same tree yields FAIL). A fixture that stays green on the defect state it claims to pin is live (the defect state is constructible from current tracked files and the mechanism's verdict differs from spec on it). A carve-out that diverges from spec only on inputs the current tree cannot express is **latent**. You own this classification; the lead and the implementer never set, amend, or re-argue it — nothing is self-classified by the party it gates (F7 discipline; same anti-Goodhart direction as SELF-FAILURE-MODES F10 / ARCHITECTURE §2.7). A block-severity finding with no `liveness` field is read as **live** (fail-closed, the default-BLOCK posture of the consensus rules).
+
 ```json
 {
   "kind": "verdict",
@@ -52,7 +59,7 @@ Emit exactly one fenced ```json block as the LAST fenced block of your final mes
   "closes_escape": "esc-NNN-... | none",
   "escape_resolves": true,
   "findings": [
-    { "issue": "why the test does not bite / control is vacuous / not symptom-faithful", "location": "path:line" }
+    { "issue": "why the test does not bite / control is vacuous / not symptom-faithful", "location": "path:line", "severity": "block", "stands": true, "liveness": "live | latent" }
   ],
   "class_enumeration": ["path:line", "…sibling sites carrying the same tautological/vacuous shape, if any"],
   "sweep_method": "how you enumerated the class — 'none' if you did not sweep",

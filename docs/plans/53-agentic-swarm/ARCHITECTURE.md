@@ -214,6 +214,19 @@ manifest, not a prose sketch.
   crate/repo names + governance-verb-stem tripwire + philosophy leak-smells — the
   mechanical half of the discipline test); `CONSTITUTION_TOUCHED` /
   `SWARM_GATE_TOUCHED` (in `swarm.yml`).
+- New: `check_ship_register.py` (constitution T1 — register internal consistency
+  G1–G8 plus the escapes-status-move trigger: any PR moving an escape's `status`
+  must carry a register listing the moved ids; always-run, fail-closed,
+  marker-file `REPO_ROOT`); `GOVERNANCE_TOUCHED` (SELF-FAILURE-MODES.md + this
+  file — whole-file, same construction mandate; measured incremental friction
+  zero: every historical commit to either file also touched a
+  `SWARM_GATE_TOUCHED` path); `REGISTER_TOUCHED` (`.jammi/registers/**` — by
+  design the SOLE red on a conformant register; the operator's admin-merge over
+  it is the recorded acceptance and the only act enabling `operator_accepted_live`).
+  Register-embedded closing-row **authenticity** is NOT CI-checked (gate-state is
+  gitignored): it is verified by the lead's mandatory `check_ship_register.py
+  --local` byte-diff and remains a disclosed visible-only residual with a
+  runtime tell, the same mechanical-vs-visible-only split as the lead gate.
 - **Construction mandate (from the #245 trap):** every gate workflow — especially
   the TOUCHED guards — **always runs** (no `paths:` filter) and detects its touched
   path set *inside* the job via `git diff <base>...<head>`, exiting green when
@@ -314,6 +327,24 @@ turning the anchor check into a completeness check over the enforcement surface.
   checks it and no runner executes `.claude/evals/golden/*`. A mechanical
   `check_escape_citations.py` grep gate is a **candidate tightening** (§12, G-e). Not "every
   test cites an escape."
+- **Assurance-deficit registers** — `.jammi/registers/<unit_slug>.register.json`,
+  **tracked** (unlike gate-state): the ship artifact the operator's admin-merge
+  accepts (constitution T1). Per-lane closing rows copied verbatim from
+  gate-state (max-ts per agent_type; earlier-row standing findings not
+  re-enumerated go to `residuals`), auditor-owned `liveness` never reclassified
+  (G4), `unit_surface` = the PR's diff paths. Post-ship, acceptance is metered:
+  the retrospective's hygiene pass rules whether a later escape inside
+  `unit_surface` falls in a registered residual's cluster and records
+  `registered_class_hit: "<register path>"` on the escape row (a lifecycle
+  action the lead applies); exact-string count over that field ≥
+  `reopen_budget` re-opens hardening for the unit. Registered-latent
+  classifications are bets the ledger settles. Known, deliberate residuals of
+  this mechanism (registered in its own register): a unit that seeds no escape
+  trips no register-existence trigger; mid-sequence REFINE-delta conformance
+  remains the lead's per-delta disposition discipline (the row-140 interim
+  rule) — the terminus catches only what the closing auditor re-finds (row 131
+  vs 134–140), and mechanizing a per-wave gate fails the T2 disproportion test
+  today.
 
 ## 9a. Evals — the swarm's held-out test set
 

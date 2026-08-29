@@ -212,12 +212,50 @@ cannot (`AGENTIC-PLAYBOOK.md` §1). Everything below is a specific way that spin
 
 ---
 
+## F11 · Sequence non-termination / mechanism regress
+
+- **Trigger.** An audit-round sequence keeps finding defects — increasingly *inside the
+  verification mechanisms the sequence itself built* — and no party owns a criterion for
+  stopping; or an anti-escape mechanism ships and its own defects seed the next escapes.
+- **Symptom.** Rounds continue past the point where marginal findings are latent-only; or a
+  sequence is declared closed on prose ("chain closes") and the next rounds refute it; or ship
+  happens by exhaustion rather than decision. The record: round-19 PASS "the chain closes"
+  (ledger row 131), followed by three rounds of defects entirely inside the newly built claims
+  oracle (rows 134–140) — the closed chain had not audited its own mechanism.
+- **Root cause.** The regress is irreducible (Knight–Leveson correlated checker failures;
+  equivalent-mutant undecidability; the obfuscated-arguments non-convergence result): every
+  mechanism joins the set of artifacts needing verification, so "keep going until clean" never
+  terminates, and "stop when green" ships latent mechanism defects. Termination is not
+  discoverable from the data; it is a human-owned acceptance of enumerated residuals — the
+  consensus terminal move of every mature assurance field (ALARP, GSN assurance-deficit
+  registers, UL 4600, seL4/CompCert trusted-assumption lists, SRE error budgets).
+- **Prevention.** Constitution T1/T2. The sequence terminates only in operator acceptance of an
+  assurance-deficit register (`.jammi/registers/`, `check_ship_register.py` G1–G8,
+  `REGISTER_TOUCHED` admin-merge); liveness is auditor-owned, fail-closed default-live,
+  mechanism findings classified by the UNSOUND-NOW test; acceptance is metered by a reopen
+  budget the retrospective settles via `registered_class_hit`. The portfolio grows only through
+  the ALARP table + decorrelation fixtures (T2). Honest limit, on the record: mid-sequence
+  build-vs-design conformance is covered ONLY by the lead's per-delta disposition discipline
+  (row 140) — the terminus catches only what the closing auditor independently re-finds; the
+  un-mechanized per-wave gate is a registered residual standing on ALARP grounds, and its
+  absence is exactly esc-066.
+- **Incident.** Unit 63: 8 of the first 9 mechanical adversarial-audit rounds BLOCKed (the sole
+  PASS, mech round 6, carried 2 advisories); the defect stream migrated from live artifact
+  defects to latent mechanism-model defects (row 138: "ZERO live false numbers anywhere … both
+  blocks are the coverage MODEL itself"); the first liveness-classified round (mech round 10,
+  row 145) still found 3 live blocks in fresh wave code. esc-066 (`open` at seeding): REFINE
+  deltas had no merge-time conformance check — the lead merged greenness, not spec-conformance,
+  and rounds 20–21 were the one-round-late catches.
+
+---
+
 ## Using this catalog
 
-At phase 0 the lead names which of F1–F10 the brief is exposed to and pins the gate that
+At phase 0 the lead names which of F1–F11 the brief is exposed to and pins the gate that
 catches each (F1→phase 1, F2→phase 4, F3/F4→phase 7, F5→build-env hook, F6→citation-checker,
 F7→fix-verifier, F8→pressure-test, F9→audit + honesty gate, F10→`hooks/lead-gate-pre.sh`, the
-fail-closed dispatch/relay gate). A defect that slips every gate and is caught later is logged
-to the escape ledger (`.jammi/escapes.jsonl`) and clustered by the retrospective loop into a
-new gate — so each failure mode compounds into infrastructure instead of re-teaching itself
-every session.
+fail-closed dispatch/relay gate, F11→constitution T1/T2, `check_ship_register.py`, the
+operator-accepted assurance-deficit register). A defect that slips every gate and is caught
+later is logged to the escape ledger (`.jammi/escapes.jsonl`) and clustered by the retrospective
+loop into a new gate — so each failure mode compounds into infrastructure instead of
+re-teaching itself every session.

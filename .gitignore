@@ -87,6 +87,7 @@ docs/plans/*
 !docs/plans/63-how-well/
 !docs/plans/64-torch-training-twin/
 !docs/plans/65-resolve-witness/
+!docs/plans/66-loop-termination/
 docs/superpowers/
 docs/IMPLEMENTATION.md
 docs/specs/

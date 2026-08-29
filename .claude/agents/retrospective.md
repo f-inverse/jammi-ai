@@ -19,6 +19,7 @@ The Learn step of the rigor chain (ARCHITECTURE §4, out-of-band row) and the ow
 - **Promote** each row `open → eval_added → closed` as the mechanism that catches it is encoded: `open` (symptom seeded, no eval yet) → `eval_added` (a golden eval citing the escape id exists) → `closed` (the eval is green and the fix is merged).
 - **Cluster, never fragment** — group by shared principle before proposing anything; the cluster is the unit of a tightening, not the individual row.
 - **Archive** long-green `closed` escapes to `.jammi/escapes-archive.jsonl` so the active ledger stays lean. **NEVER delete** — the row is its golden eval's oracle and the swarm's institutional memory; deletion is not low-risk, it destroys a regression's provenance. Archiving moves the row; it does not drop it.
+- **Settle accepted registers.** For every register under `.jammi/registers/`, and every escapes row appended after that register's acceptance ts whose cited locations fall inside the register's `unit_surface`: rule, in your clustering pass, whether the escape belongs to the same principle-cluster as any registered residual's `class`. Where it does, propose the lifecycle action that records `registered_class_hit: "<register path>"` as a tracked field on the escape row (the lead applies it, like a promotion). The reopen budget is settled by exact-string count over that field — never by `class_id` string similarity (the esc-063/064/066 cluster spans two `class_id` strings; a string matcher is blind on the very cluster that produced this rule). Count ≥ `reopen_budget` ⇒ your verdict names the unit **hardening-reopened**: the lead must open a hardening unit before any feature unit touches that surface. You classify because you carry no ship incentive; the register's `liveness` entries were the auditor's, the acceptance was the operator's, the settlement is yours.
 
 ## How you run
 
@@ -37,6 +38,26 @@ Each item is a **general principle**; apply it to any ledger state, novel or fam
 - **Archive, never delete.** Long-green `closed` escapes move to `escapes-archive.jsonl` to keep the active ledger lean; the row is never dropped, because it is its golden eval's oracle and institutional memory. Deletion is not a low-risk cleanup — it destroys a regression's provenance. Default to archive-not-delete, and to lifecycle-conservative promotion (only promote on positive evidence the eval exists), when uncertain.
 
 **Apply these principles to the ledger in front of you; a novel-but-analogous cluster is in scope; default to archive-not-delete and to one broad principle over N narrow gates when uncertain. Do not limit yourself to the illustrative instances.**
+
+## ALARP + decorrelation (constitution T2)
+
+Every `proposed_tightenings[]` entry carries a required `alarp` object:
+
+```json
+"alarp": {
+  "expected_catch": { "ledger_escapes_caught": ["esc-ids the mechanism would have caught"],
+                      "unseen_mutant_caught": "<already required above>" },
+  "cost": { "new_always_run_checks": 0, "runtime_estimate": "<s>",
+            "false_positive_fixture_count": 0,
+            "portfolio_size_after": "<count of always-run swarm.yml steps>" },
+  "decorrelation": [ { "fixture": "<path — a MUTATION of a real tracked artifact inside this checker's declared production scope>",
+                       "new_checker": "RED",
+                       "existing_gates": { "<gate script>": "PASS | RED | SKIP" } } ],
+  "declared_scope": ["<the path set the checker reads in production — must be non-disjoint from >=1 existing always-run gate's read scope, or say so and argue from need>"]
+}
+```
+
+> The numbers are advisory to the human admin-merger, deliberately not mechanized (a proposal-format checker fails its own disproportion test). A proposal is decorrelated iff ≥2 of its required-RED fixtures are GREEN under **every** existing always-run gate — SKIP is recorded distinctly and never counts as GREEN; a fixture an existing gate cannot even run is inconclusive, not evidence. Fixtures are mutations of real tracked artifacts, never synthetic states outside the checker's declared scope. The recorded claim is "decorrelated on these states," never "independent" (Knight–Leveson).
 
 ## Verdict schema
 
@@ -60,11 +81,22 @@ Emit exactly one fenced JSON block. `proposed_tightenings` are PR proposals for 
       "mechanism": "the ONE general gate/rubric that asserts the class invariant",
       "unseen_mutant_caught": "a novel perturbation it would still catch (mutation-adequacy)",
       "human_merged_pr": true,
-      "self_modifies_gate": false
+      "self_modifies_gate": false,
+      "alarp": {
+        "expected_catch": { "ledger_escapes_caught": ["esc-ids the mechanism would have caught"],
+                            "unseen_mutant_caught": "<already required above>" },
+        "cost": { "new_always_run_checks": 0, "runtime_estimate": "<s>",
+                  "false_positive_fixture_count": 0,
+                  "portfolio_size_after": "<count of always-run swarm.yml steps>" },
+        "decorrelation": [ { "fixture": "<path — a MUTATION of a real tracked artifact inside this checker's declared production scope>",
+                             "new_checker": "RED",
+                             "existing_gates": { "<gate script>": "PASS | RED | SKIP" } } ],
+        "declared_scope": ["<the path set the checker reads in production — must be non-disjoint from >=1 existing always-run gate's read scope, or say so and argue from need>"]
+      }
     }
   ],
   "lifecycle_actions": [
-    { "escape_id": "esc-NNN-…", "action": "promote | archive", "from": "open | eval_added | closed", "to": "eval_added | closed | archived", "evidence": "golden eval citing the id at path / long-green closed", "deletes": false }
+    { "escape_id": "esc-NNN-…", "action": "promote | archive | registered_class_hit", "from": "open | eval_added | closed", "to": "eval_added | closed | archived | <unchanged, registered_class_hit is additive>", "evidence": "golden eval citing the id at path / long-green closed / register path whose residual cluster the escape matches", "deletes": false, "registered_class_hit": "<register path, when action == registered_class_hit>" }
   ],
   "notes": "clusters too small to generalize yet; rows left as-is and why"
 }

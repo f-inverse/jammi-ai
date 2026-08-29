@@ -52,7 +52,6 @@ docs/plans/63-how-well/mutants/README.md:0.744:6090c25e058c18b1754dcc8b5a80d0f73
 docs/plans/63-how-well/mutants/README.md:1.009:bc6a451cb87f5df9a88526c99f2f4c7e9dc9cf96:2  # [formula] Adam bias-correction net-update multiplier at t=50
 docs/plans/63-how-well/mutants/README.md:36:053369780f560b99194aae220e8335ecdfe915fa:10  # [product] 3 mutants x 12 seeds, restated
 docs/plans/63-how-well/mutants/README.md:36:68547f09f534153037710f0fea26a704453e1fce:0  # [product] 3 mutants x 12 seeds, restated
-docs/plans/63-how-well/mutants/README.md:0:8d73deb37661a6a2632765bd8e8c7d16f67cbbc7:41  # [exit-code] merger CLI exit code
 docs/plans/63-how-well/mutants/README.md:36:9b0b3555c8e1cf3b252c464065c9bf1394fba4d6:71  # [product] 3 mutants x 12 seeds, restated
 #
 # const: entries below (round-20 audit B4: const put under the SAME
@@ -65,8 +64,14 @@ docs/plans/63-how-well/mutants/README.md:36:9b0b3555c8e1cf3b252c464065c9bf1394fb
 #   [rule-param]  a pre-registered threshold/baseline/significance level.
 #   [xref]        a cross-reference number (e.g. "Acceptance 5"), never a
 #                measurement.
+#   [count]       a small, stated count of committed setup artifacts (e.g.
+#                "4 legs" naming a probe/ directory's own file count) -- an
+#                experiment-design fact, never itself a measured outcome;
+#                no glob-length/file-count primitive in this grammar to
+#                recompute it from the committed files directly.
 const:docs/plans/63-how-well/measurements/campaign-v1/README.md:0.5:4de452db6ea4aaa689c1a635fb6e369bf2521bd3:71  # [rule-param] pre-registered admissibility threshold
 const:docs/plans/63-how-well/measurements/campaign-v1/README.md:0.5:b5b5b76f2daa808dbad027c4fe78c472536510e0:10  # [rule-param] pre-registered admissibility threshold
+const:docs/plans/63-how-well/measurements/campaign-v1/README.md:4:7ea42c75bdf5c993dd1af100ffc62beaf14049df:23  # [count] round-22 A1 (heading lines now in scope): "## probe/ -- H5 step-0 (4 legs, a100)" heading's own leg count -- p1/p2/p3/p4 are the four committed probe legs named individually in this section's own prose below, but this grammar has no glob-length primitive to recompute "4" directly
 const:docs/plans/63-how-well/measurements/dose-ladder/README.md:0.0064:20c646536fa8e10201a2e512a52b0f6f70904c1f:4  # [rule-param] pre-registered alpha2 significance level
 const:docs/plans/63-how-well/measurements/red-proof/README.md:0.0:ab50ac0a7fa0f518663742eb3222c09301ea45d1:72  # [rule-param] pre-registered learning-happened-premise floor
 const:docs/plans/63-how-well/measurements/red-proof/dstar/README.md:0:285088310179a9d9b9288567da844e478436e4f1:69  # [rule-param] pre-registered sign-test threshold/baseline

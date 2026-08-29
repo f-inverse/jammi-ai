@@ -1393,6 +1393,36 @@ FINETUNE_RUN_DECISION_RULE_TEXT = (
     "seeds; never rescaled silently)."
 )
 
+# Unit-63 round-15 audit (docs-ci preemptive sweep, round-14 F6 sibling class):
+# the finetune-run merger's own COMPLETE `status` vocabulary -- every value
+# `build_finetune_run_report`'s own status fold (immediately below) can set --
+# named ONCE here, verified by reading that fold, rather than hand-copied
+# into `runpod_gpu_howwell.sh`'s own `case "$STATUS"` arms AND (independently,
+# before this fix) into this module's own exit fold's gating check
+# (`main()`'s `finetune-run` branch, ~line 4066) and that branch's own prose
+# comment. Partitioned the way BOTH consumers actually split it:
+# `FINETUNE_RUN_GATING_STATUSES` is the exit-code-forcing subset (a
+# correctness-of-measurement problem, INVALID, or a fired decision rule, RED
+# / RED_FOR_INVESTIGATION -- this module's own exit fold below asserts
+# against this exact tuple, never a re-typed literal), `"GREEN"` is the
+# single ordinary-pass value, and `FINETUNE_RUN_RECORD_ONLY_STATUSES` is the
+# never-gates subset (a leg that never ran, or a dry run -- never itself a
+# merge failure). `ShellStatusCaseArmsBoundToFinetuneRunStatusesTests`
+# (`test_howwell_dose_ladder_cause.py`) parses `runpod_gpu_howwell.sh`'s own
+# case-arm patterns for `$STATUS` and asserts they exactly cover
+# `FINETUNE_RUN_STATUSES` with no extras and no gaps -- a sixth status added
+# to this fold without a matching shell arm (or vice versa) is a RED test,
+# never silent drift (the round-14 F6 shape this fix closes: "one capability
+# enumerated by hand in two modules with no mechanical oracle"). That test's
+# own docstring names what this binding does NOT cover: `$STATUS` consumed
+# by anything OTHER than that one case block.
+FINETUNE_RUN_GATING_STATUSES = ("INVALID", "RED", "RED_FOR_INVESTIGATION")
+FINETUNE_RUN_GREEN_STATUS = "GREEN"
+FINETUNE_RUN_RECORD_ONLY_STATUSES = ("DRY_RUN", "INCOMPLETE")
+FINETUNE_RUN_STATUSES = (
+    FINETUNE_RUN_GATING_STATUSES + (FINETUNE_RUN_GREEN_STATUS,) + FINETUNE_RUN_RECORD_ONLY_STATUSES
+)
+
 # The lr=0 RED control (CONTRACT Frame: "RED control: lr=0 arm x2 seeds fails
 # learning-happened", unit-63 audit advisory (b)): a SEPARATE leg set, run at
 # `--lr 0` for both arms at a small, fixed number of control seeds, tagged
@@ -3546,9 +3576,8 @@ def mutant_dose_ladder_anomalies(dose_columns):
     `None`, and the merge's own exit code stayed 0 -- exactly the class of
     silent pass-through the primary decision rule's own
     `RED_FOR_INVESTIGATION` gate exists to prevent (`main`'s own
-    `fr_merged["status"] in ("INVALID", "RED", "RED_FOR_INVESTIGATION")`
-    check): "anomalous improvement is investigated, never silently
-    celebrated".
+    `fr_merged["status"] in FINETUNE_RUN_GATING_STATUSES` check): "anomalous
+    improvement is investigated, never silently celebrated".
 
     Returns the list of `{"dose_label", "eps", "detected", "finding"}`
     entries for every NEGATIVE-eps (`eps < 0.0`) dose column whose
@@ -4062,8 +4091,12 @@ def main(argv=None):
         # improvement, investigated, never silently celebrated) -- are ALL
         # the things this merge's own exit code gates on now; only a plain
         # `FAIL`/`INCOMPLETE`/`DRY_RUN` leg (never ran, or a dry run) stays
-        # record-only.
-        if fr_merged["status"] in ("INVALID", "RED", "RED_FOR_INVESTIGATION"):
+        # record-only. Unit-63 round-15 audit: this gating check reads
+        # `FINETUNE_RUN_GATING_STATUSES` (the module-level constant, see its
+        # own doc above) rather than a re-typed literal tuple, so this fold
+        # and `runpod_gpu_howwell.sh`'s own `case "$STATUS"` arms can never
+        # independently drift from the same committed status vocabulary.
+        if fr_merged["status"] in FINETUNE_RUN_GATING_STATUSES:
             print(
                 f"finetune_run_ab: FAIL — status={fr_merged['status']} — see the table above "
                 "(CONTRACT 63 Frame: the pre-registered decision rule; INVALID names a "

@@ -234,26 +234,38 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
-/// PROVISIONAL, MEASURED (macOS dev box, this file's `build_fixture`,
-/// `f32` CPU): the observed per-row max-abs pooled-embedding delta
-/// between the alone and padded-batch legs peaked at `4.4703484e-8`
-/// (`0.375 * f32::EPSILON`) across all 16 rows (row 12's per-element
-/// RELATIVE error spiked to `1.54e-4` only because that specific element
-/// is itself near-cancelling; the ABSOLUTE delta there was `1.86e-8`,
-/// still tiny -- this bound is stated in absolute terms because the
-/// compared quantity is a pooled-and-L2-normalised embedding, bounded to
-/// `[-1, 1]` per element by construction, so an absolute bound is
-/// meaningful and a relative one is not, near cancellation). `8.0 *
-/// f32::EPSILON` (`9.5367432e-7`) gives ~21x headroom over the measured
-/// worst case -- enough to absorb this file's own CPU-vs-CPU
-/// architecture caveat (`tests/it/modernbert.rs`'s documented finding
-/// that Linux CPU BLAS blocking-by-total-M can differ from macOS's) --
-/// while still separating comfortably below both red controls' measured
-/// margins (row-length off-by-one: `1.6e-2`, ~17,000x above this bound;
-/// window radius off-by-one: `9.5e-6`, ~10x above this bound). NOT YET
-/// measured on the CI-representative Linux runner or the pod train
-/// (contract E4, Step 5) -- that measurement must replace this one, not
-/// merely confirm it, before this bound is treated as final.
+/// MEASURED (macOS dev box, this file's `build_fixture`, `f32` CPU): the
+/// observed per-row max-abs pooled-embedding delta between the alone and
+/// padded-batch legs peaked at `4.4703484e-8` (`0.375 * f32::EPSILON`)
+/// across all 16 rows (row 12's per-element RELATIVE error spiked to
+/// `1.54e-4` only because that specific element is itself
+/// near-cancelling; the ABSOLUTE delta there was `1.86e-8`, still tiny --
+/// this bound is stated in absolute terms because the compared quantity
+/// is a pooled-and-L2-normalised embedding, bounded to `[-1, 1]` per
+/// element by construction, so an absolute bound is meaningful and a
+/// relative one is not, near cancellation). `8.0 * f32::EPSILON`
+/// (`9.5367432e-7`) gives ~21x headroom over the measured worst case --
+/// enough to absorb this file's own CPU-vs-CPU architecture caveat
+/// (`tests/it/modernbert.rs`'s documented finding that Linux CPU BLAS
+/// blocking-by-total-M can differ from macOS's) -- while still
+/// separating comfortably below both red controls' measured margins
+/// (row-length off-by-one: `1.6e-2`, ~17,000x above this bound; window
+/// radius off-by-one: `9.5e-6`, ~10x above this bound).
+///
+/// CONFIRMED on Linux (contract E4, Step 5): this exact bound was
+/// re-measured on the CI-representative pod train across all four
+/// Linux pod architectures (a100, h100, l40s, a40) -- the f32 invariance
+/// leg, both red controls, and the padded-training-parity sibling
+/// (`modernbert::padded_training_loss_and_lora_grads_match_unpadded_rows_run_individually_f32_cpu`)
+/// each reported `4 passed; 0 failed` on every pod, with no admission
+/// flips. Evidence:
+/// `docs/plans/62-embedding-surface/measurements/pod-runs/cpu-floor-legs-4pods.txt`.
+/// The value is retained as-is, not replaced -- the Linux re-measurement
+/// confirmed the macOS-derived bound rather than requiring a tighter or
+/// looser one. The constant's `PROVISIONAL` name prefix is now
+/// historical (it predates the Linux confirmation); it is kept unchanged
+/// here to avoid a repo-wide rename of every call site for zero semantic
+/// gain.
 const PROVISIONAL_CPU_FLOOR: f32 = 8.0 * f32::EPSILON;
 
 /// Separation multiple a red control must clear over

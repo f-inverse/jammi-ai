@@ -267,10 +267,28 @@ pub struct TrainingLoop {
     /// [`Self::with_dropout_disabled`] can capture the pre-call state and
     /// restore THAT — rather than hard-coding a restore-to-`true` — because
     /// `TrainingTarget` itself exposes no getter (its training flag lives
-    /// distributed across per-layer `LoraLinear`/encoder state). Always `true`
-    /// at [`TrainingLoopBuilder::build`] (every `TrainingTarget` this crate
-    /// constructs for training starts in training mode) and updated in
-    /// lockstep with every production `set_training` call this loop makes.
+    /// distributed across per-layer `LoraLinear`/encoder state).
+    ///
+    /// `true` at [`TrainingLoopBuilder::build`] is ENFORCED, not assumed
+    /// (audit round 63, re-audit finding 1): the prior doc here claimed
+    /// "every `TrainingTarget` this crate constructs for training starts in
+    /// training mode" and hard-coded the field to `true` at construction —
+    /// false for `TrainingTarget::EncoderAdapters`, whose `ModernBert` body
+    /// is built with `training: false` (only the injected `LoraLinear`
+    /// adapters start `true`), so the target's real state was heterogeneous
+    /// and this mirror was a fabricated claim about it. `build` now calls
+    /// [`TrainingLoop::set_training`]`(true)` on the freshly assembled loop
+    /// before returning it, which recurses through the WHOLE target —
+    /// encoder body included — so every layer this loop owns is actually in
+    /// training mode and this field is correct BY CONSTRUCTION regardless of
+    /// which `TrainingTarget` variant, or how it was itself constructed,
+    /// `build` was handed. This also closes the latent bug where an
+    /// `EncoderAdapters` production run (`worker::run_fine_tune_blocking`)
+    /// trained with its encoder body never switched into training mode (only
+    /// its LoRA adapters' dropout gate ever flipped).
+    ///
+    /// Updated in lockstep with every production `set_training` call this
+    /// loop makes after that.
     training_mode: bool,
     divergence_count: usize,
     /// Fixed, dataset-level target standardiser for the regression path, derived
@@ -437,7 +455,7 @@ impl TrainingLoopBuilder {
         // collision is a hard, typed refusal at construction time, never
         // a silent correlated-dropout defect discovered later.
         self.target.assert_dropout_layer_ids_are_collision_free()?;
-        Ok(TrainingLoop {
+        let mut training_loop = TrainingLoop {
             target: self.target,
             base_model: self.base_model,
             varmap: self.varmap,
@@ -446,7 +464,9 @@ impl TrainingLoopBuilder {
             worker_id,
             catalog,
             artifact_dir,
-            training_mode: true,
+            // Placeholder — `set_training(true)` below overwrites this
+            // immediately and is the ONLY thing that makes it meaningful.
+            training_mode: false,
             divergence_count: 0,
             target_scaler: None,
             device: self.device,
@@ -455,7 +475,16 @@ impl TrainingLoopBuilder {
             resume: self.resume,
             #[cfg(test)]
             after_backward: None,
-        })
+        };
+        // Enforce, not assume, that a freshly built loop starts in training
+        // mode (audit round 63, re-audit finding 1 — see `training_mode`'s
+        // own doc). This recurses through the WHOLE target via
+        // `TrainingTarget::set_training`, so an `EncoderAdapters` target's
+        // encoder body (constructed `training: false` — only its injected
+        // LoRA adapters start `true`) is switched into training mode here
+        // too, not just the mirror.
+        training_loop.set_training(true);
+        Ok(training_loop)
     }
 }
 
@@ -9553,6 +9582,237 @@ mod held_out_eval_tests {
     }
 }
 
+/// Re-audit round 63, re-audit finding 1 (RED-proof / regression tests): the
+/// `training_mode` mirror doc claimed "every `TrainingTarget` this crate
+/// constructs for training starts in training mode" and hard-coded
+/// `training_mode: true` at [`TrainingLoopBuilder::build`] on the strength of
+/// that claim. It was false for `TrainingTarget::EncoderAdapters`: its
+/// `ModernBert` body is constructed `training: false` (only the injected
+/// `LoraLinear` adapters start `true`), so the target's real state was
+/// heterogeneous and every restore path (`with_dropout_disabled`, the mining
+/// and GradCache brackets) read a fabricated `true`.
+///
+/// These tests build a REAL `EncoderAdapters` target — the smallest
+/// constructible one, the checked-in `tests/fixtures/tiny_modernbert` config +
+/// weights also used by `tests/it/encoder_adapters.rs` — and read the
+/// encoder's own [`jammi_encoders::ModernBert::is_training`] getter directly,
+/// never trusting `TrainingLoop::training_mode` as ground truth (that mirror
+/// is exactly the thing under test).
+///
+/// RED-proof (performed manually against this diff, not committed):
+/// hard-coding `training_mode: true` and dropping the `set_training(true)`
+/// call from `build` (the exact pre-fix shape) reddens THREE of the four
+/// tests below: `build_puts_the_encoder_body_into_training_mode` fails
+/// directly (`mb.is_training()` reads `false` right after `build`), and both
+/// `with_dropout_disabled_restores_real_encoder_state_on_{ok,err}` fail their
+/// own setup assertion (`real_encoder_is_training(&loop_)` before the seam
+/// call is already `false`, since the loop never entered training to begin
+/// with) — not because `with_dropout_disabled`'s restore logic is wrong (it
+/// was already fixed correctly in the prior round), but because it never ran
+/// against a target whose real initial state disagreed with the mirror's
+/// claim. `refusal_path_leaves_a_non_training_encoder_non_training` stays
+/// green even pre-fix: it calls `set_training(false)` explicitly before
+/// exercising the refusal path, which forces the real encoder state
+/// regardless of what `build` left it at — that test guards a different
+/// (already-correct) behaviour, not this finding.
+#[cfg(test)]
+mod encoder_adapters_training_state_tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use candle_core::Device;
+    use candle_nn::VarMap;
+    use jammi_db::error::JammiError;
+    use jammi_encoders::{AnyEncoder, ModernBert, ModernBertConfig, Pooling};
+    use jammi_lora::{AdapterConfig, LoraBuildConfig, LoraInitMode};
+
+    use super::super::data::TrainingDataLoader;
+    use super::super::target::{EncoderAdaptersTarget, TrainingTarget};
+    use super::super::FineTuneConfig;
+    use super::{TrainingLoop, TrainingLoopBuilder};
+
+    /// The repo-root `tests/fixtures/tiny_modernbert` dir — the same
+    /// smallest-constructible ModernBERT config + weights
+    /// `tests/it/encoder_adapters.rs` fine-tunes end-to-end. `CARGO_MANIFEST_DIR`
+    /// is `crates/jammi-ai`; `tests/fixtures` sits two levels up, at the
+    /// workspace root (mirrors `tests/gpu_capability/harness.rs::fixture`).
+    fn tiny_modernbert_fixture_dir() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("tests")
+            .join("fixtures")
+            .join("tiny_modernbert")
+    }
+
+    /// Build a real `TrainingTarget::EncoderAdapters` over the tiny-ModernBERT
+    /// fixture, with LoRA injected into `Wqkv`/`Wo` (ModernBERT's fused
+    /// attention linears — the same pair `tests/it/encoder_adapters.rs` uses)
+    /// and dropout ON, so a real `LoraLinear` dropout gate is exercised
+    /// alongside the encoder body's own `training` flag.
+    fn build_encoder_adapters_target(device: &Device, varmap: &VarMap) -> TrainingTarget {
+        let dir = tiny_modernbert_fixture_dir();
+        let config_raw = std::fs::read_to_string(dir.join("config.json"))
+            .expect("tiny_modernbert fixture config.json must be readable");
+        let model_config: ModernBertConfig =
+            serde_json::from_str(&config_raw).expect("tiny_modernbert config.json must parse");
+        let weights = dir.join("model.safetensors");
+
+        let target_modules = vec!["Wqkv".to_string(), "Wo".to_string()];
+        let empty_ranks = std::collections::HashMap::new();
+        let lora = LoraBuildConfig {
+            target_modules: &target_modules,
+            layers_to_transform: &None,
+            lora_rank: 4,
+            lora_alpha: 8.0,
+            use_rslora: false,
+            lora_dropout: Some(0.3),
+            rank_pattern: &empty_ranks,
+            init_mode: LoraInitMode::ZerosB,
+            seed: 7,
+        };
+        let adapter_cfg = AdapterConfig::from_build(
+            "modernbert",
+            &lora,
+            jammi_numerics::ComputePrecision::default(),
+        );
+        let encoder: ModernBert = ModernBert::builder()
+            .pooling(Pooling::Mean)
+            .lora(lora)
+            .build(&[weights.as_path()], &model_config, device, varmap)
+            .expect("tiny_modernbert fixture must build");
+
+        TrainingTarget::EncoderAdapters(Box::new(EncoderAdaptersTarget {
+            encoder: AnyEncoder::ModernBert(encoder),
+            adapter_cfg,
+        }))
+    }
+
+    /// A minimal real `TrainingLoop` over the `EncoderAdapters` target above.
+    async fn minimal_encoder_adapters_loop(device: &Device) -> TrainingLoop {
+        let varmap = VarMap::new();
+        let target = build_encoder_adapters_target(device, &varmap);
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.keep();
+        let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
+        TrainingLoopBuilder::new(target, varmap, FineTuneConfig::default())
+            .device(device.clone())
+            .job_id("encoder-adapters-training-state-job".into())
+            .worker_id("encoder-adapters-training-state-worker".into())
+            .catalog(catalog)
+            .artifact_dir(dir_path)
+            .build()
+            .unwrap()
+    }
+
+    /// Read the encoder body's OWN training flag — never `loop_.training_mode`
+    /// (the mirror under test) — by reaching through the real `AnyEncoder`.
+    fn real_encoder_is_training(loop_: &TrainingLoop) -> bool {
+        match &loop_.target {
+            TrainingTarget::EncoderAdapters(state) => match &state.encoder {
+                AnyEncoder::ModernBert(mb) => mb.is_training(),
+                _ => panic!("fixture must build an AnyEncoder::ModernBert"),
+            },
+            TrainingTarget::ProjectionHead { .. } => {
+                panic!("fixture must build an EncoderAdapters target")
+            }
+        }
+    }
+
+    /// (a) RED-PROOF: post-`build`, the encoder BODY (not just its injected
+    /// `LoraLinear` adapters) must genuinely be in training mode. Pre-fix,
+    /// `build` never called `set_training` on the assembled loop — it just
+    /// wrote the literal `training_mode: true` into the mirror — so
+    /// `ModernBert`'s own `training: false` at construction stood unchanged
+    /// and this assertion reads `false`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_puts_the_encoder_body_into_training_mode() {
+        let device = Device::Cpu;
+        let loop_ = minimal_encoder_adapters_loop(&device).await;
+        assert!(
+            real_encoder_is_training(&loop_),
+            "TrainingLoopBuilder::build must switch an EncoderAdapters target's \
+             encoder body into training mode, not just its injected LoRA adapters"
+        );
+        assert!(
+            loop_.training_mode,
+            "the training_mode mirror must agree with the real encoder state"
+        );
+    }
+
+    /// (b) `with_dropout_disabled` restores the TRUE pre-call state on the
+    /// `Ok` arm, verified against the encoder's own flag (not the mirror).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn with_dropout_disabled_restores_real_encoder_state_on_ok() {
+        let device = Device::Cpu;
+        let mut loop_ = minimal_encoder_adapters_loop(&device).await;
+        assert!(real_encoder_is_training(&loop_), "must start training");
+
+        let result = loop_.with_dropout_disabled(|_| Ok(42));
+        assert_eq!(result.unwrap(), 42);
+        assert!(
+            real_encoder_is_training(&loop_),
+            "with_dropout_disabled must restore the encoder body to its true \
+             pre-call training state on the Ok arm"
+        );
+        assert!(loop_.training_mode, "mirror must agree with real state");
+    }
+
+    /// (b) `with_dropout_disabled` restores the TRUE pre-call state on the
+    /// `Err` arm too — the restore must run before the error propagates.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn with_dropout_disabled_restores_real_encoder_state_on_err() {
+        let device = Device::Cpu;
+        let mut loop_ = minimal_encoder_adapters_loop(&device).await;
+        assert!(real_encoder_is_training(&loop_), "must start training");
+
+        let result: Result<(), JammiError> =
+            loop_.with_dropout_disabled(|_| Err(JammiError::FineTune("probe refusal".into())));
+        assert!(result.is_err());
+        assert!(
+            real_encoder_is_training(&loop_),
+            "with_dropout_disabled must restore the encoder body to its true \
+             pre-call training state on the Err arm too, before the error \
+             propagates"
+        );
+        assert!(loop_.training_mode, "mirror must agree with real state");
+    }
+
+    /// (c) The non-fabricated analog of the prior round's
+    /// `seam_on_a_non_training_trainer_leaves_it_non_training`: on an
+    /// `EncoderAdapters` target explicitly placed in eval mode, a REFUSED
+    /// `evaluate_held_out` call (the leading "empty held-out set" check, fired
+    /// before any forward) must not flip the encoder body back into training
+    /// mode as a side effect.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refusal_path_leaves_a_non_training_encoder_non_training() {
+        let device = Device::Cpu;
+        let mut loop_ = minimal_encoder_adapters_loop(&device).await;
+
+        loop_.set_training(false);
+        assert!(
+            !real_encoder_is_training(&loop_),
+            "test setup: encoder body must start non-training"
+        );
+
+        let empty_loader = TrainingDataLoader::from_precomputed(vec![]);
+        let err = loop_.evaluate_held_out(&empty_loader, &[]).unwrap_err();
+        assert!(
+            matches!(err, JammiError::FineTune(ref m) if m.contains("empty")),
+            "expected an 'empty held-out set' refusal, got {err:?}"
+        );
+
+        assert!(
+            !real_encoder_is_training(&loop_),
+            "a refused evaluate_held_out call must not flip a non-training \
+             encoder body INTO training mode as a side effect"
+        );
+        assert!(!loop_.training_mode, "mirror must agree with real state");
+    }
+}
+
 /// Finding 7 (audit round 63): a per-objective decomposition ORACLE for every
 /// objective [`TrainingLoop::compute_loss_per_example`] supports.
 ///
@@ -9785,5 +10045,81 @@ mod decomposition_oracle_tests {
             scores: Tensor::new(&[0.5f32, 0.9, -0.2], &device).unwrap(),
         };
         assert_decomposition_matches(&loop_, &batch, "Contrastive/CosineMse");
+    }
+
+    /// Hidden width for the matryoshka oracle only: two non-degenerate prefix
+    /// dims (`[4, 2]`) need an embedding wider than [`HIDDEN`] (2) to narrow
+    /// into.
+    const MATRYOSHKA_HIDDEN: usize = 4;
+
+    /// A minimal real [`TrainingLoop`] over a `ProjectionHead` target sized
+    /// for the matryoshka oracle ([`MATRYOSHKA_HIDDEN`]-wide embeddings)
+    /// rather than [`minimal_loop`]'s fixed [`HIDDEN`].
+    async fn minimal_matryoshka_loop(device: &Device, config: FineTuneConfig) -> TrainingLoop {
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
+        let head = build_projection_head(MATRYOSHKA_HIDDEN, &config, &varmap, &vb).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.keep();
+        let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
+        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+            .device(device.clone())
+            .job_id("decomp-oracle-matryoshka-job".into())
+            .worker_id("decomp-oracle-matryoshka-worker".into())
+            .catalog(catalog)
+            .artifact_dir(dir_path)
+            .build()
+            .unwrap()
+    }
+
+    /// Objective 6 (re-audit round-2 advisory): MNRL over a `Pairs` batch with
+    /// `matryoshka_dims = [4, 2]` — TWO prefix dims, so the wrap genuinely
+    /// sums more than one term on both the `compute_loss` (tensor,
+    /// [`TrainingLoop::matryoshka_wrap`]) and `compute_loss_per_example`
+    /// (host `Vec<f64>`, [`TrainingLoop::matryoshka_wrap_per_example`]) sides.
+    ///
+    /// The five oracles above all run with `matryoshka_dims` empty (the
+    /// wrapper's `dims.is_empty()` short-circuit, which calls the objective
+    /// exactly once on the full embedding and neither narrows nor sums) —
+    /// none of them exercises the actual narrow-then-sum loop in either
+    /// wrapper. This oracle is the one place `mean(compute_loss_per_example)
+    /// ≈ compute_loss` is checked WITH that loop live on both sides, so a
+    /// per-dim narrow or an accumulation-order defect in
+    /// `matryoshka_sum_per_example` that happened to still match
+    /// `matryoshka_sum`'s SUM (e.g. narrowing the wrong dim count, or folding
+    /// dims in the wrong order under two dims where order cannot yet be
+    /// distinguished) has a real chance of being caught here — where the
+    /// prior five oracles could not have caught it at all, since they never
+    /// entered the loop body.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn matryoshka_mnrl_pairs_decomposition_matches_compute_loss() {
+        let device = Device::Cpu;
+        let config = FineTuneConfig {
+            embedding_loss: Some(EmbeddingLoss::MultipleNegativesRanking { temperature: 20.0 }),
+            matryoshka_dims: vec![4, 2],
+            ..Default::default()
+        };
+        let loop_ = minimal_matryoshka_loop(&device, config).await;
+        let batch = TrainingBatch::Pairs {
+            anchors: Tensor::new(
+                &[
+                    [1.0f32, 0.0, 0.2, 0.1],
+                    [0.0, 1.0, -0.3, 0.4],
+                    [0.6, 0.8, 0.1, -0.2],
+                ],
+                &device,
+            )
+            .unwrap(),
+            positives: Tensor::new(
+                &[
+                    [0.8f32, 0.6, 0.05, 0.15],
+                    [0.6, 0.8, -0.1, 0.05],
+                    [1.0, 0.0, 0.2, -0.1],
+                ],
+                &device,
+            )
+            .unwrap(),
+        };
+        assert_decomposition_matches(&loop_, &batch, "Matryoshka MNRL/Pairs (dims=[4, 2])");
     }
 }

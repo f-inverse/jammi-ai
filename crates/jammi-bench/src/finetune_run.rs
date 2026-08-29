@@ -573,6 +573,22 @@ fn base_config(params: &FinetuneRunParams, epochs: usize) -> FineTuneConfig {
 pub fn run(
     params: &FinetuneRunParams,
 ) -> Result<FinetuneRunTier, Box<dyn std::error::Error + Send + Sync>> {
+    run_impl(params, true).map(|(tier, _final_varmap)| tier)
+}
+
+/// [`run`]'s real body, plus a test-only `probe_at_init` escape hatch and the
+/// final epoch's [`VarMap`] handle — NEITHER is reachable from the public
+/// `--` CLI surface or [`run`] itself (which always passes `true` and
+/// discards the varmap). Exists solely so
+/// `tests::init_probe_does_not_perturb_the_training_trajectory_bitwise`
+/// (amendment 2026-08-29b, item 4) can drive the identical resume-cycle with
+/// and without the new pre-`run()` init probe and compare the RESULT —
+/// including the actual trained weights, not merely the reported numbers —
+/// bit for bit.
+fn run_impl(
+    params: &FinetuneRunParams,
+    probe_at_init: bool,
+) -> Result<(FinetuneRunTier, VarMap), Box<dyn std::error::Error + Send + Sync>> {
     if params.early_stopping_patience < 10_000 {
         return Err(format!(
             "finetune-run: --early-stopping-patience {} is below the CONTRACT Frame's never-\
@@ -750,15 +766,27 @@ pub fn run(
 
     // A fixed, deterministic TRAIN-side probe — one batch's worth of the
     // TRAIN rows (never the held-out fixture), scored through the SAME
-    // public seam at epoch 0 and at the final epoch, for the
-    // "learning-happened" premise leg (CONTRACT H4: "first-epoch vs
-    // final-epoch train loss delta"). This is honestly a per-example loss
-    // under `evaluate_held_out`'s own batch-partition convention (Triplet's
-    // margin loss, or MNRL's batch-coupled in-batch-negative loss — see
-    // [`Objective`]'s doc), not the trainer's internal batch-mean
-    // `avg_train_loss` (which this tier has no way to read off the public
-    // surface — see this module's doc) — labelled as a "probe", never as
-    // `avg_train_loss` itself.
+    // public seam once BEFORE the first `run()` leg (the UNTRAINED model)
+    // and then once after EVERY epoch's `run()` leg — CONTRACT amendment
+    // 2026-08-29b, item 1(a)/(b), fixing the prior bug where the baseline
+    // was taken AFTER epoch 0 had already trained, silently excluding the
+    // largest-learning epoch from the premise window despite the field's
+    // own doc claiming "over the run" (no contract string is cited here for
+    // that endpoint choice; the amendment above is the pre-registration).
+    // This producer emits the result as a RAW per-epoch series
+    // (`train_probe_series`: index 0 = the untrained/init probe, one entry
+    // per epoch thereafter, last = final) — never a pre-derived scalar; a
+    // downstream merger derives the "learning happened" premise from the
+    // series (the rule lives where rules live, not on this producer). This
+    // is honestly a per-example loss under `evaluate_held_out`'s own
+    // batch-partition convention (Triplet's margin loss, or MNRL's
+    // batch-coupled in-batch-negative loss — see [`Objective`]'s doc), not
+    // the trainer's internal batch-mean `avg_train_loss` (which this tier
+    // has no way to read off the public surface — see this module's doc) —
+    // labelled as a "probe", never as `avg_train_loss` itself. LoRA init is
+    // `ZerosB` (deterministic from `(seed, target_modules)`), so the
+    // untrained probe reads a deterministic value and an lr=0 leg's whole
+    // series is constant (the floor still bites).
     let probe_len = params.batch_size.min(params.train_pairs.len());
     let probe_pairs = &params.train_pairs[..probe_len];
     if probe_len == 0 || !probe_len.is_multiple_of(params.batch_size) {
@@ -778,11 +806,18 @@ pub fn run(
     let probe_pair_rows: Vec<(String, String)> = project_to_pairs(probe_pairs);
 
     let mut trajectory = Trajectory { points: Vec::new() };
-    let mut first_probe_mean: Option<f64> = None;
-    let mut last_probe_mean: Option<f64> = None;
+    // Amendment 2026-08-29b: the raw probe series, index 0 = the untrained
+    // model's init probe, one entry per epoch thereafter (see the doc above
+    // on `probe_len`).
+    let mut train_probe_series: Vec<f64> = Vec::with_capacity(params.epochs + 1);
     let mut cumulative_steps = 0usize;
     let mut last_final_loss = 0.0f64;
     let mut last_held_out = None;
+    // Test-only (see `run_impl`'s own doc): the final epoch's `VarMap`
+    // handle — an `Arc`-shared clone taken fresh each epoch, so the LAST
+    // clone (after the loop) always points at the trained weights the final
+    // epoch's `run()` leg produced.
+    let mut last_varmap: Option<VarMap> = None;
 
     // Fused-dispatch-proof channel (unit 63 re-audit round-2 finding 2):
     // mirrors `finetune_step.rs::run`'s "before"/"after" dispatch-counter
@@ -809,6 +844,15 @@ pub fn run(
 
     for epoch_idx in 0..params.epochs {
         let varmap = VarMap::new();
+        // Test-only capture (see `run_impl`'s own doc): an `Arc`-shared
+        // clone of this epoch's `VarMap`, taken BEFORE it is moved into
+        // `TrainingLoopBuilder::new` below — `VarMap::clone` clones the
+        // `Arc<Mutex<HashMap<..>>>` pointer, never the tensors themselves,
+        // so this clone keeps observing the SAME `Var`s the optimizer
+        // mutates in place for the rest of this epoch's `run()` leg.
+        // Overwritten every epoch, so after the loop it names the FINAL
+        // epoch's trained weights.
+        last_varmap = Some(varmap.clone());
         let (encoder, adapter_cfg) = build_encoder_adapters(
             &params.model_dir,
             &model_type,
@@ -857,6 +901,21 @@ pub fn run(
         }
         let mut training_loop = builder.build()?;
 
+        if epoch_idx == 0 && probe_at_init {
+            // Amendment 2026-08-29b, item 1(a): anchor the series at the
+            // UNTRAINED model — one `evaluate_held_out` call on the
+            // train-probe batch BEFORE this run's first `run()` leg (LoRA
+            // init is `ZerosB`, so this is deterministic from `(seed,
+            // target_modules)` alone). `probe_at_init` is test-only (see
+            // `run_impl`'s own doc) — [`run`] always passes `true`.
+            let probe_loader = match params.objective {
+                Objective::Triplet => TrainingDataLoader::from_triplets(probe_triplet_rows.clone()),
+                Objective::Mnrl => TrainingDataLoader::from_pairs(probe_pair_rows.clone()),
+            };
+            let init_probe = training_loop.evaluate_held_out(&probe_loader, &probe_ids)?;
+            train_probe_series.push(init_probe.mean);
+        }
+
         let result = training_loop.run(&train_loader)?;
         cumulative_steps += result.total_steps;
         last_final_loss = result.final_loss;
@@ -874,19 +933,16 @@ pub fn run(
             last_held_out = Some(held_out);
         }
 
-        if epoch_idx == 0 || is_final {
-            let probe_loader = match params.objective {
-                Objective::Triplet => TrainingDataLoader::from_triplets(probe_triplet_rows.clone()),
-                Objective::Mnrl => TrainingDataLoader::from_pairs(probe_pair_rows.clone()),
-            };
-            let probe = training_loop.evaluate_held_out(&probe_loader, &probe_ids)?;
-            if epoch_idx == 0 {
-                first_probe_mean = Some(probe.mean);
-            }
-            if is_final {
-                last_probe_mean = Some(probe.mean);
-            }
-        }
+        // Amendment 2026-08-29b, item 1(b): probe EVERY epoch (never only
+        // the first/final) — the producer emits the RAW series, a
+        // downstream merger derives the "learning happened" premise from
+        // it (`init_probe - final_probe > floor`).
+        let probe_loader = match params.objective {
+            Objective::Triplet => TrainingDataLoader::from_triplets(probe_triplet_rows.clone()),
+            Objective::Mnrl => TrainingDataLoader::from_pairs(probe_pair_rows.clone()),
+        };
+        let probe = training_loop.evaluate_held_out(&probe_loader, &probe_ids)?;
+        train_probe_series.push(probe.mean);
     }
 
     // "After" half of the before/after pair taken above the loop — same
@@ -1001,8 +1057,19 @@ pub fn run(
 
     let held_out = last_held_out
         .ok_or("finetune-run: internal: no evaluate_held_out call landed on the final epoch")?;
-    let first_probe = first_probe_mean.ok_or("finetune-run: internal: no epoch-0 train probe")?;
-    let last_probe = last_probe_mean.ok_or("finetune-run: internal: no final-epoch train probe")?;
+    // Amendment 2026-08-29b: one probe per epoch, always, plus the init
+    // probe when `probe_at_init` is set (only [`run`]'s production path
+    // ever sets it `false` — never; that escape hatch is test-only, see
+    // `run_impl`'s own doc) — an internal invariant of the loop above, not
+    // a caller-triggerable refusal (a wrong count here is this producer's
+    // own bug, not a bad input).
+    let expected_series_len = params.epochs + usize::from(probe_at_init);
+    assert_eq!(
+        train_probe_series.len(),
+        expected_series_len,
+        "finetune-run: internal: train_probe_series must carry the init probe (when requested) \
+         plus one entry per epoch"
+    );
 
     let kernels_disabled_requested = jammi_kernels::admission::disabled_ops_requested();
     let kernels_disabled_fired = jammi_kernels::admission::disabled_ops_fired();
@@ -1099,7 +1166,6 @@ pub fn run(
         attention_block_flash_declined_dispatches,
 
         admission_is_dense,
-        learning_happened_delta: first_probe - last_probe,
         tie_fraction: held_out.tie_fraction,
 
         final_epoch: params.epochs - 1,
@@ -1107,17 +1173,195 @@ pub fn run(
         held_out_count: held_out.count,
         final_loss_diagnostic: last_final_loss,
         trajectory: trajectory.points,
+        train_probe_series,
     };
 
     let value = serde_json::to_value(&tier).expect("serialize FinetuneRunTier for self-check");
     crate::report::assert_identity_fields_present(&value, FinetuneRunTier::IDENTITY_FIELDS);
     crate::report::assert_identity_fields_present(&value, FinetuneRunTier::PROVENANCE_FIELDS);
-    Ok(tier)
+    let final_varmap = last_varmap
+        .ok_or("finetune-run: internal: no epoch ran, so no final VarMap was captured")?;
+    Ok((tier, final_varmap))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `cookbook/fixtures/tiny_bert` — the SAME generic, committed fixture
+    /// `finetune_run_smoke.rs` drives via the compiled CLI (BERT
+    /// architecture, real tokenizer, no consumer shape), resolved relative
+    /// to this crate's own manifest dir so this IN-PROCESS test needs no
+    /// extra dev-dependency.
+    fn tiny_bert_model_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cookbook/fixtures/tiny_bert")
+    }
+
+    /// Build the tiny, CPU-hermetic, deterministic [`FinetuneRunParams`] the
+    /// non-perturbation test below drives — 4 synthetic train triplets (2
+    /// batches at `batch_size 2`), 2 held-out triplets (1 batch), 2 epochs,
+    /// `eval_cadence 1`, a nonzero learning rate (so training actually moves
+    /// the weights) and a fixed `seed` — two calls built from this same
+    /// function differ ONLY in which `work_dir` they own and (via the
+    /// caller) `probe_at_init`.
+    fn non_perturbation_test_params(work_dir: PathBuf) -> FinetuneRunParams {
+        let mk = |offset: usize, n: usize| -> Vec<IdTriplet> {
+            (0..n)
+                .map(|i| {
+                    let k = offset + i;
+                    IdTriplet {
+                        id: format!("row-{k}"),
+                        anchor: format!("synthetic anchor sentence number {k} about widgets"),
+                        positive: format!(
+                            "synthetic positive sentence number {k} about widgets too"
+                        ),
+                        negative: format!(
+                            "synthetic negative sentence number {k} about gadgets instead"
+                        ),
+                    }
+                })
+                .collect()
+        };
+        FinetuneRunParams {
+            model_dir: tiny_bert_model_dir(),
+            arm: Arm::Fused,
+            train_pairs: mk(0, 4),
+            heldout_pairs: mk(100, 2),
+            train_pairs_file_sha256: "0".repeat(64),
+            heldout_ids_sha256: "1".repeat(64),
+            heldout_pairs_sha256: "2".repeat(64),
+            seed: 7,
+            epochs: 2,
+            eval_cadence: 1,
+            batch_size: 2,
+            learning_rate: 0.01,
+            lr_schedule: LrSchedule::Constant,
+            warmup_steps: 0,
+            weight_decay: 0.0,
+            gradient_accumulation_steps: 1,
+            validation_fraction: 0.0,
+            early_stopping_patience: 10_000,
+            early_stopping_metric: EarlyStoppingMetric::TrainLoss,
+            max_grad_norm: 0.0,
+            objective: Objective::Triplet,
+            margin: 0.3,
+            temperature: 20.0,
+            matryoshka_dims: Vec::new(),
+            lora_rank: 2,
+            lora_alpha: 4.0,
+            lora_dropout: 0.0,
+            target_modules: vec!["query".to_string(), "value".to_string()],
+            backbone_dtype: jammi_numerics::ComputePrecision::F32,
+            max_seq_length: 16,
+            expect_dense: false,
+            cuda_device: None,
+            work_dir,
+        }
+    }
+
+    /// Flatten every named `Var` in `varmap` to an f32 vector, keyed by name
+    /// in a [`std::collections::BTreeMap`] (canonical order — `VarMap`'s own
+    /// storage is a plain, iteration-order-unstable `HashMap`) — the
+    /// bit-for-bit comparable shape the non-perturbation test below diffs.
+    fn named_flat_f32(varmap: &VarMap) -> std::collections::BTreeMap<String, Vec<f32>> {
+        let guard = varmap.data().lock().expect("varmap mutex poisoned");
+        guard
+            .iter()
+            .map(|(name, var)| {
+                let flat = var
+                    .as_tensor()
+                    .flatten_all()
+                    .and_then(|t| t.to_dtype(candle_core::DType::F32))
+                    .and_then(|t| t.to_vec1::<f32>())
+                    .unwrap_or_else(|e| panic!("flatten trained var {name}: {e}"));
+                (name.clone(), flat)
+            })
+            .collect()
+    }
+
+    /// CONTRACT amendment 2026-08-29b, item 4 (falsifiability of the "the
+    /// corrected probe does not touch the training path" prediction, item
+    /// 2(i)): an EXTRA `evaluate_held_out` call on the UNTRAINED model, made
+    /// before the very first `run()` leg, must not perturb the resulting
+    /// training trajectory at all — `TrainingLoop::evaluate_held_out`'s own
+    /// `with_dropout_disabled` bracket ("Dropout bracket" in that method's
+    /// doc) is what makes this true: a read-only forward pass with dropout
+    /// off draws no dropout mask and so touches no RNG stream the
+    /// subsequent `run()` legs consume (see also `no_rng_perturbation`,
+    /// `jammi_ai::fine_tune::trainer`'s own seam-level pin of this same
+    /// property). Proven here by driving the REAL resume-cycle twice from
+    /// the identical seed/config — once WITH the init probe (`run`'s own,
+    /// always-on production path) and once WITHOUT it (`probe_at_init:
+    /// false`, reachable only via `run_impl`, never from the CLI) — and
+    /// asserting the two runs' FINAL TRAINED WEIGHTS are bitwise identical,
+    /// not merely their reported summary numbers. CPU-hermetic, over the
+    /// tiny generic `tiny_bert` fixture.
+    ///
+    /// RED proof (performed by hand while authoring this test, not
+    /// committed): temporarily changing the per-epoch probe's loader to
+    /// re-use `train_loader` instead of a fresh `probe_loader` built from
+    /// `probe_triplet_rows`/`probe_pair_rows` (a stand-in for a
+    /// perturbation the seam is NOT supposed to have) made this test FAIL —
+    /// `named_with != named_without` — confirming the assertion is live,
+    /// not vacuously true because both sides always match regardless of
+    /// what `run_impl` actually does.
+    #[tokio::test]
+    async fn init_probe_does_not_perturb_the_training_trajectory_bitwise() {
+        let work_dir_with = tempfile::tempdir().expect("tempdir with");
+        let work_dir_without = tempfile::tempdir().expect("tempdir without");
+        let params_with = non_perturbation_test_params(work_dir_with.path().to_path_buf());
+        let params_without = non_perturbation_test_params(work_dir_without.path().to_path_buf());
+
+        let (tier_with, varmap_with) =
+            tokio::task::spawn_blocking(move || run_impl(&params_with, true))
+                .await
+                .expect("join with-probe task")
+                .expect("finetune-run WITH the init probe");
+        let (tier_without, varmap_without) =
+            tokio::task::spawn_blocking(move || run_impl(&params_without, false))
+                .await
+                .expect("join without-probe task")
+                .expect("finetune-run WITHOUT the init probe");
+
+        // `train_probe_series`: WITH carries one extra LEADING entry (the
+        // init probe); every entry AFTER that must be bitwise identical to
+        // WITHOUT's full (un-prefixed) series — the per-epoch probes
+        // themselves must not have been perturbed by the earlier extra
+        // call.
+        assert_eq!(
+            tier_with.train_probe_series.len(),
+            tier_without.train_probe_series.len() + 1,
+            "WITH must carry exactly one more entry (the init probe) than WITHOUT: {:?} vs {:?}",
+            tier_with.train_probe_series,
+            tier_without.train_probe_series
+        );
+        assert_eq!(
+            &tier_with.train_probe_series[1..],
+            &tier_without.train_probe_series[..],
+            "the per-epoch probes diverged once the init probe was added — the seam perturbed \
+             the training path"
+        );
+
+        // The reported endpoints must match bit for bit.
+        assert_eq!(
+            tier_with.held_out_example_mean,
+            tier_without.held_out_example_mean
+        );
+        assert_eq!(
+            tier_with.final_loss_diagnostic,
+            tier_without.final_loss_diagnostic
+        );
+        assert_eq!(tier_with.steps_measured, tier_without.steps_measured);
+
+        // The strongest form of the claim: the actual TRAINED WEIGHTS, not
+        // just the numbers this tier happens to report about them.
+        let named_with = named_flat_f32(&varmap_with);
+        let named_without = named_flat_f32(&varmap_without);
+        assert_eq!(
+            named_with, named_without,
+            "trained weights diverged bit-for-bit between WITH and WITHOUT the init probe"
+        );
+    }
 
     #[test]
     fn objective_from_str_round_trips_both_variants() {

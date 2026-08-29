@@ -2183,15 +2183,6 @@ pub struct FinetuneRunTier {
     /// why this tier's real-text path never reaches `forward_with_lengths`'s
     /// dense/padded fork at all.
     pub admission_is_dense: bool,
-    /// `first_epoch_train_probe_mean - final_epoch_train_probe_mean` — the
-    /// "learning-happened" floor leg (CONTRACT H4), measured via the SAME
-    /// public seam over a fixed TRAIN-side probe batch (never the held-out
-    /// fixture) at epoch 0 and at the final epoch. Positive means the
-    /// probe's loss went DOWN over the run (learning happened); see
-    /// [`crate::finetune_run::run`]'s doc for why this is a probe under
-    /// the seam's own per-example convention, not the trainer's internal
-    /// `avg_train_loss`.
-    pub learning_happened_delta: f64,
     /// `HeldOutLoss::tie_fraction` at the final epoch — the "tie cap"
     /// premise leg.
     pub tie_fraction: f64,
@@ -2210,6 +2201,25 @@ pub struct FinetuneRunTier {
     /// one point per epoch this run actually evaluated (every
     /// `eval_cadence`th epoch, plus the final epoch unconditionally).
     pub trajectory: Vec<EpochHeldOut>,
+    /// The RAW "learning-happened" train-side probe series (CONTRACT
+    /// amendment 2026-08-29b, replacing the removed, producer-derived
+    /// `learning_happened_delta` scalar): index 0 is the UNTRAINED model's
+    /// probe — one `evaluate_held_out` call over the fixed train-probe
+    /// batch, taken BEFORE the first epoch's `run()` leg (LoRA init is
+    /// `ZerosB`, so this is a deterministic function of `(seed,
+    /// target_modules)` alone) — then one entry per epoch thereafter, in
+    /// epoch order, with the LAST entry the final epoch's probe. Always
+    /// `params.epochs + 1` entries long. This producer never derives the
+    /// "learning happened" premise itself: a downstream merger computes it
+    /// from this series (`series[0] - series[series.len() - 1] > floor`) —
+    /// the prior bug was exactly this producer pre-deriving that scalar
+    /// from a baseline taken AFTER epoch 0 had already trained, silently
+    /// excluding the largest-learning epoch from the window this field's
+    /// old doc claimed ("over the run"); see
+    /// [`crate::finetune_run::run`]'s own doc, amendment 2026-08-29b, for
+    /// the full correction and the (deliberately absent) contract citation
+    /// this replaces.
+    pub train_probe_series: Vec<f64>,
 }
 
 impl FinetuneRunTier {
@@ -3103,7 +3113,6 @@ mod tests {
             attention_block_flash_fused_dispatches: 0,
             attention_block_flash_declined_dispatches: 0,
             admission_is_dense: false,
-            learning_happened_delta: 0.1,
             tie_fraction: 0.0,
             final_epoch: 1,
             held_out_example_mean: 0.5,
@@ -3115,6 +3124,7 @@ mod tests {
                 held_out_tie_fraction: 0.0,
                 held_out_batch_partition_sha256: "e".repeat(64),
             }],
+            train_probe_series: vec![0.6, 0.55, 0.5],
         }
     }
 

@@ -2816,15 +2816,29 @@ def build_mutant_dose_column(raw_dir, dose_label, patch_sha256, mutant_seeds):
     `detected` is `"RED"` iff the SAME `>=11/12` threshold
     (`MUTANT_DECISION_THRESHOLD`/`MUTANT_GATE_SEED_COUNT`) is met in the
     DEGRADATION direction specifically (mutant worse than alloff, `d_i > 0`
-    dominant, `mean_d > 0`) -- a dose meeting the threshold in the OPPOSITE
-    (anomalous-improvement) direction, or not meeting it at all
-    (mutants/README.md's own M1 finding: a sign-flipping early transient
-    reads 8/12, well under 11), is `"not-detected"`; a dose whose
-    premise-clean pair count is not exactly `MUTANT_GATE_SEED_COUNT`, or
-    whose sign test itself refuses (all-tie / empty), is `"INVALID"` -- the
-    SAME correctness-of-measurement carve-out every other verdict in this
-    module gets, never silently rescaled to whatever count happened to run
-    clean.
+    dominant, `mean_d > 0`); `"RED_FOR_INVESTIGATION"` iff the SAME
+    threshold is met in the OPPOSITE, IMPROVEMENT-concordant direction
+    instead (`d_i < 0` dominant, `n_neg >= MUTANT_DECISION_THRESHOLD`,
+    `mean_d < 0`) -- unit-63 round-8 audit finding 2: this mirrors
+    `build_finetune_run_report`'s own main-path `concordant_direction ==
+    "improvement"` -> `status = "RED_FOR_INVESTIGATION"` branch; a
+    two-sided (falsification-cell) POSITIVE-eps dose that lands here has
+    CONFIRMED its own held-out-improvement prediction (see
+    `mutant_dose_ladder_two_sided_falsification`'s own doc), never
+    collapsed into `"not-detected"` the way it silently used to be before
+    this fix (a column with no state for this arm cannot report the
+    confirming outcome CONTRACT.md addendum 2026-08-29c's own +0.50 cell
+    requires). A dose meeting NEITHER threshold at all (mutants/README.md's
+    own M1 finding: a sign-flipping early transient reads 8/12, well under
+    11) is `"not-detected"`; a dose whose premise-clean pair count is not
+    exactly `MUTANT_GATE_SEED_COUNT`, or whose sign test itself refuses
+    (all-tie / empty), is `"INVALID"` -- the SAME correctness-of-measurement
+    carve-out every other verdict in this module gets, never silently
+    rescaled to whatever count happened to run clean. `n_pos`/`n_neg` can
+    never both dominate at once (`2 * MUTANT_DECISION_THRESHOLD` (22)
+    exceeds `MUTANT_GATE_SEED_COUNT` (12), mirroring the main decision's own
+    `pos_dominant`/`neg_dominant` mutual-exclusion comment), so the two
+    branches below are never ambiguous about which direction fired.
 
     Returns a dict: `{dose_label, patch_sha256, mutant_seeds, per_seed,
     clean_pair_count, gate_seed_count, threshold, n_pos, n_neg, ties,
@@ -2928,6 +2942,12 @@ def build_mutant_dose_column(raw_dir, dose_label, patch_sha256, mutant_seeds):
         mean_d = statistics.mean(d_values.values())
         if detected != "INVALID" and n_pos >= MUTANT_DECISION_THRESHOLD and mean_d > 0.0:
             detected = "RED"
+        elif detected != "INVALID" and n_neg >= MUTANT_DECISION_THRESHOLD and mean_d < 0.0:
+            # unit-63 round-8 audit finding 2: the improvement-concordant
+            # arm the two-sided-falsification cell needs to be able to
+            # report -- mirrors the main decision's own
+            # `concordant_direction == "improvement"` branch (:2565).
+            detected = "RED_FOR_INVESTIGATION"
 
     return {
         "dose_label": dose_label,
@@ -3077,25 +3097,59 @@ def mutant_dose_ladder_two_sided_falsification(dose_columns):
     names for a POSITIVE-eps ("improvement-direction") dose: `+0.50` is
     "retained deliberately as the two-sided falsification cell for the
     improvement prediction itself" (mutants/README.md's own "signed dose
-    family" section) -- if it reads RED, that is a cross-sign detection
-    (the naive linear-extrapolation prediction, Step 2/3 of that same
-    README, is CONFIRMED: a positive dose detected as RED is expected to be
-    RED_FOR_INVESTIGATION-shaped improvement, not degradation), never a
-    degradation-direction sensitivity finding -- see
-    `mutant_dose_ladder_sensitivity`'s own doc for why folding a cross-sign
-    detection into that statistic would misrepresent it.
+    family" section). The prediction under test (Step 2/3 of that same
+    README) is HELD-OUT IMPROVEMENT at positive eps; `build_mutant_dose_column`'s
+    own `detected` names which arm a positive-eps dose actually landed in --
+    unit-63 round-8 audit finding 1 corrects this function's own prior
+    (inverted) polarity claim:
+
+    - `detected == "RED"` is the DEGRADATION-concordant arm (mutant worse
+      than alloff, `mean_d > 0.0`). A positive-eps dose reading `"RED"`
+      REFUTES the improvement prediction -- the secant extrapolation was
+      wrong over this range, since more effective lr made held-out loss
+      WORSE, not better. This is never a "confirmation".
+    - `detected == "RED_FOR_INVESTIGATION"` is the IMPROVEMENT-concordant
+      arm (`mean_d < 0.0`, unit-63 round-8 audit finding 2's new state on
+      this column, mirroring the main decision's own
+      `concordant_direction == "improvement"` branch). A positive-eps dose
+      reading `"RED_FOR_INVESTIGATION"` CONFIRMS the improvement
+      prediction -- a real, gate-detectable improvement in the predicted
+      direction.
+
+    Neither arm is folded into `mutant_dose_ladder_sensitivity` (the
+    degradation-direction, negative-eps-only statistic) -- see that
+    function's own doc for why a cross-sign or cross-arm detection there
+    would misrepresent it.
 
     Each dose's SIGNED eps is parsed via `_dose_label_eps` (same refusal
     behaviour as `mutant_dose_ladder_sensitivity`). Returns the list of
-    `{"dose_label", "eps", "detected"}` entries for every positive-eps
-    (`eps > 0.0`) dose column that read `"RED"`, in `dose_columns`' own
-    order, empty when none did (the ordinary, unconfirmed case).
+    `{"dose_label", "eps", "detected", "finding"}` entries for every
+    positive-eps (`eps > 0.0`) dose column whose `detected` is `"RED"` or
+    `"RED_FOR_INVESTIGATION"`, in `dose_columns`' own order, with `finding`
+    set to the literal string `"secant refuted (degradation at +eps)"` for
+    the `"RED"` arm and `"secant confirmed (improvement at +eps)"` for the
+    `"RED_FOR_INVESTIGATION"` arm; empty when neither arm fired at any
+    positive-eps dose -- the ORDINARY, not-yet-refuted case (the prediction
+    surviving is not itself a "confirmation": that only happens when the
+    `RED_FOR_INVESTIGATION` arm actually fires).
     """
     out = []
     for col in dose_columns:
         eps = _dose_label_eps(col["dose_label"])
         if eps > 0.0 and col["detected"] == "RED":
-            out.append({"dose_label": col["dose_label"], "eps": eps, "detected": col["detected"]})
+            out.append({
+                "dose_label": col["dose_label"],
+                "eps": eps,
+                "detected": col["detected"],
+                "finding": "secant refuted (degradation at +eps)",
+            })
+        elif eps > 0.0 and col["detected"] == "RED_FOR_INVESTIGATION":
+            out.append({
+                "dose_label": col["dose_label"],
+                "eps": eps,
+                "detected": col["detected"],
+                "finding": "secant confirmed (improvement at +eps)",
+            })
     return out
 
 

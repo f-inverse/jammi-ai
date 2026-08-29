@@ -3656,6 +3656,26 @@ class MutantDoseLadderTests(unittest.TestCase):
         self.assertEqual(col["clean_pair_count"], 12)
         self.assertEqual(col["violations"], [])
 
+    def test_detected_red_for_investigation_when_threshold_and_direction_are_improvement(self):
+        # unit-63 round-8 audit finding 2: 11 of 12 mutant legs read BETTER
+        # (lower held-out loss) than their SAME-SEED alloff leg -- the
+        # improvement-concordant shape the two-sided-falsification cell
+        # (+0.50) needs a real, reportable state for. Before this fix, this
+        # exact shape collapsed into "not-detected" and the confirming
+        # outcome could never be reported.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in range(1, 13):
+                self._write_alloff(raw_dir, seed, mean=0.50)
+                mutant_mean = 0.30 if seed != 12 else 0.70  # seed 12 dissents
+                _write_mutant_leg(raw_dir, seed, "eps0.50", _mutant_tier(seed=seed, held_out_example_mean=mutant_mean))
+            col = ab_merge.build_mutant_dose_column(raw_dir, "eps0.50", self.PATCH_SHA, list(range(1, 13)))
+        self.assertEqual(col["detected"], "RED_FOR_INVESTIGATION")
+        self.assertEqual(col["n_pos"], 1)
+        self.assertEqual(col["n_neg"], 11)
+        self.assertLess(col["mean_d"], 0.0)
+        self.assertEqual(col["clean_pair_count"], 12)
+        self.assertEqual(col["violations"], [])
+
     def test_sign_flipping_transient_is_not_detected(self):
         # mutants/README.md's own M1 finding, reproduced generically: an
         # 8/12 split (well under the 11/12 threshold) reads not-detected,
@@ -3854,7 +3874,49 @@ class MutantDoseLadderTests(unittest.TestCase):
         columns = [neg50, neg10, pos50]
         self.assertIsNone(ab_merge.mutant_dose_ladder_sensitivity(columns))
         falsification = ab_merge.mutant_dose_ladder_two_sided_falsification(columns)
-        self.assertEqual(falsification, [{"dose_label": "eps0.50", "eps": 0.50, "detected": "RED"}])
+        self.assertEqual(
+            falsification,
+            [
+                {
+                    "dose_label": "eps0.50",
+                    "eps": 0.50,
+                    "detected": "RED",
+                    "finding": "secant refuted (degradation at +eps)",
+                }
+            ],
+        )
+
+    def test_positive_eps_red_for_investigation_is_the_confirming_falsification_arm(self):
+        # unit-63 round-8 audit finding 1/2: a positive-eps dose reading
+        # RED_FOR_INVESTIGATION (improvement-concordant) is the CONFIRMING
+        # outcome for the held-out-improvement prediction -- never described
+        # as a "refutation" (that word belongs to the RED/degradation arm
+        # instead, the exact polarity inversion round-8 finding 1 corrects).
+        columns = [{"dose_label": "eps0.50", "detected": "RED_FOR_INVESTIGATION"}]
+        falsification = ab_merge.mutant_dose_ladder_two_sided_falsification(columns)
+        self.assertEqual(
+            falsification,
+            [
+                {
+                    "dose_label": "eps0.50",
+                    "eps": 0.50,
+                    "detected": "RED_FOR_INVESTIGATION",
+                    "finding": "secant confirmed (improvement at +eps)",
+                }
+            ],
+        )
+
+    def test_red_for_investigation_never_enters_the_sensitivity_branch(self):
+        # RED_FOR_INVESTIGATION is an improvement-concordant reading; it must
+        # never be treated as a degradation-direction detection even for a
+        # negative-eps dose_label (a negative dose reading RED_FOR_INVESTIGATION
+        # would be an anomalous improvement under DEFLATION, still not the
+        # DEGRADATION `sensitivity` statistic is scoped to).
+        columns = [
+            {"dose_label": "eps-0.50", "detected": "not-detected"},
+            {"dose_label": "eps-0.10", "detected": "RED_FOR_INVESTIGATION"},
+        ]
+        self.assertIsNone(ab_merge.mutant_dose_ladder_sensitivity(columns))
 
     def test_positive_eps_not_detected_is_not_a_falsification_finding(self):
         columns = [{"dose_label": "eps0.50", "detected": "not-detected"}]

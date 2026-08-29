@@ -488,15 +488,21 @@ separate record.
   artifact): `{dose_label, patch_sha256, detected, n_pos, n_neg, mean_d,
   p_value, clean_pair_count, violations, ...}` — `detected` is `"RED"` iff
   the SAME `>=11/12` threshold the primary decision uses is met in the
-  DEGRADATION direction (mutant worse than alloff); `"not-detected"` if the
-  threshold is not met, or is met in the opposite (anomalous-improvement)
-  direction (M1's own sign-flipping-transient shape); `"INVALID"` if the
-  premise-clean pair count is not exactly the pre-registered 12, or the
-  sign test itself refuses — a correctness-of-measurement carve-out beyond
-  the amendment's own literal `RED`/`not-detected` pair, added so a
-  malformed dose column is never silently read as "not-detected" (a
-  substantive finding) when it is really "this column could not be
-  evaluated at all".
+  DEGRADATION direction (mutant worse than alloff); `"RED_FOR_INVESTIGATION"`
+  (unit-63 round-8 audit finding 2) iff the SAME threshold is met in the
+  OPPOSITE, IMPROVEMENT-concordant direction instead (mirrors the primary
+  decision's own `RED_FOR_INVESTIGATION` state) — this is the confirming
+  outcome the `+0.50` two-sided-falsification cell needs to be able to
+  report; before this fix the column had no state for this arm and it
+  collapsed into `"not-detected"`, so the confirming outcome could never be
+  reported. `"not-detected"` if NEITHER threshold is met at all (M1's own
+  sign-flipping-transient shape: 8/12, well under either threshold);
+  `"INVALID"` if the premise-clean pair count is not exactly the
+  pre-registered 12, or the sign test itself refuses — a
+  correctness-of-measurement carve-out beyond the amendment's own literal
+  `RED`/`not-detected` pair, added so a malformed dose column is never
+  silently read as "not-detected" (a substantive finding) when it is really
+  "this column could not be evaluated at all".
 - **Sensitivity statement** (unit-63 round-7 audit finding 4, addendum
   2026-08-29c): `mutant_dose_ladder.sensitivity` — the first adjacent
   `(not-detected, RED)` pair WITHIN THE DEGRADATION-DIRECTION (`eps < 0`)
@@ -505,9 +511,19 @@ separate record.
   is a merge-level refusal, `mutant_dose_ladder.sensitivity_error`, never a
   silent skip) — never the caller-supplied/run order, and never a
   cross-sign pair. Returns `null` if no such transition exists in that
-  branch. A positive-eps (`eps > 0`) dose reading `"RED"` is reported
-  separately, under `mutant_dose_ladder.two_sided_falsification`, never
-  folded into `sensitivity` (`ab_merge.mutant_dose_ladder_sensitivity` /
+  branch. `sensitivity` is scoped to the degradation branch ONLY —
+  `"RED_FOR_INVESTIGATION"` never enters it, by construction (it can only
+  occur among positive-eps or otherwise improvement-concordant doses, and
+  the branch here is `eps < 0` doses' own `detected` value regardless).
+  A positive-eps (`eps > 0`) dose reading `"RED"` OR `"RED_FOR_INVESTIGATION"`
+  is reported separately, under `mutant_dose_ladder.two_sided_falsification`
+  (unit-63 round-8 audit finding 2: BOTH arms are reported there, with the
+  correct polarity — `"RED"` is `"secant refuted (degradation at +eps)"`,
+  `"RED_FOR_INVESTIGATION"` is `"secant confirmed (improvement at +eps)"` —
+  never a positive-eps `"RED"` described as "confirming" the improvement
+  prediction; that inverted-polarity phrasing was unit-63 round-8 audit
+  finding 1, now corrected everywhere it appeared), never folded into
+  `sensitivity` (`ab_merge.mutant_dose_ladder_sensitivity` /
   `ab_merge.mutant_dose_ladder_two_sided_falsification`).
 - **Mutant legs never enter the primary A/B set**: proven structurally (the
   `mutant-<dose_label>` repeat tag can never equal `r1`/`r2`/`lr0`) and

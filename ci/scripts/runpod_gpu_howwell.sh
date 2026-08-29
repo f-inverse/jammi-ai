@@ -162,15 +162,29 @@ echo "=== how-well A/B exit=${rc} ==="
 # never otherwise left the pod — this driver is the ONE place still able to
 # reach it, since the EXIT trap (rp_cleanup, installed by rp_init) tears the
 # pod down once THIS script itself exits). Mirrors gpu-dev.sh's own `pull`
-# subcommand's rsync invocation verbatim rather than inventing a second
-# retrieval mechanism. Best-effort and unconditional (pulled regardless of
+# subcommand's rsync invocation, EXCEPT for the exclusion below (unit-63
+# audit finding 5) — never a second, independently-drifting retrieval
+# mechanism otherwise. Best-effort and unconditional (pulled regardless of
 # ${rc} — a RED/RED_FOR_INVESTIGATION/INVALID run's own artifact is exactly
 # the evidence this campaign needs to keep, not less so than a GREEN one's).
+#
+# Unit-63 audit finding 5: `finetune_run_ab.sh`'s own `$OUT_DIR` layout is
+# `finetune_run_ab_report.json` + `finetune_run_ab_table.txt` (the merged
+# sign-test decision — the ACTUAL payload this campaign needs), `raw/` (one
+# small `.json`/`.exit`/`.stderr` triple per leg — useful debugging context,
+# cheap), and `work/` (one `--work-dir` per leg, 12 seeds x 2 arms x 2
+# repeats = 48+ dirs, EACH holding that leg's own LoRA checkpoint/optimizer
+# state — the multi-GB bulk this rsync used to pull in full). `--exclude
+# 'work/'` keeps the pull to the two decision files plus `raw/`; a human who
+# needs a specific leg's own checkpoint still has it on record via that
+# leg's own seed/arm/repeat in the pulled report, and can re-run that one
+# leg or reach the (torn-down-on-exit) pod directly if needed.
 mkdir -p "$HOWWELL_ARTIFACT_DIR"
 if [ -n "${RP_HOST:-}" ] && [ -n "${RP_PORT:-}" ]; then
   rsync -az -e "ssh ${RP_SSHO[*]} -p ${RP_PORT}" \
+    --exclude 'work/' \
     "root@${RP_HOST}:/root/jammi-ai/.finetune-run-ab-report/" "${HOWWELL_ARTIFACT_DIR}/" \
-    && echo "=== pulled merged how-well artifact -> ${HOWWELL_ARTIFACT_DIR} ===" \
+    && echo "=== pulled merged how-well artifact (report json + table + raw/ logs, work/ excluded) -> ${HOWWELL_ARTIFACT_DIR} ===" \
     || echo "::warning::merged how-well artifact pull failed -- ${rc} above is still authoritative; the pod is torn down on this script's own exit, so this evidence is now unrecoverable for this invocation."
 else
   echo "::warning::no live pod (RP_HOST/RP_PORT unset) -- skipping artifact pull."

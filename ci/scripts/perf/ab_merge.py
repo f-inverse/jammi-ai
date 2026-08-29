@@ -1478,7 +1478,7 @@ def finetune_run_probe_series_delta(label, tier):
     `"seed 4 alloff"` or `"lr0 seed 101 fused"`).
 
     Returns `(violations, delta, series)`:
-      * `violations` non-empty, `delta is None` -- one of four typed
+      * `violations` non-empty, `delta is None` -- one of five typed
         refusals fired (a leg is NEVER assumed-good on any of these):
           1. V1-ERA SCALAR-ONLY: `tier` carries the OLD
              `learning_happened_delta` field (non-null) but no
@@ -1498,6 +1498,21 @@ def finetune_run_probe_series_delta(label, tier):
              or a non-numeric JSON value) -- `series[0] - series[-1]` has no
              well-defined premise verdict over a series that is not
              entirely real-valued.
+          5. LENGTH-VS-EPOCHS MISMATCH (unit-63 round-7 audit finding 3):
+             `len(series) != tier["epochs"] + 1` -- index 0 is the
+             untrained-init probe PLUS one entry per epoch, so a
+             premise-clean series must carry exactly `epochs + 1` entries.
+             The SHORT check above (refusal 3) only catches a series with
+             fewer than 2 entries; a series whose length equals `epochs`
+             itself (never `epochs + 1`) is the v1 probe bug's EXACT shape
+             (the pre-fix producer's baseline excluded the init point) and
+             can still clear refusal 3 whenever `epochs >= 2` -- e.g.
+             `epochs=3` with a 3-entry (not 4-entry) series is not
+             "SHORT" (it has more than 2 entries) but is not
+             init-anchored either, and was previously silently
+             adjudicated as though it were. A series that is instead too
+             LONG (`len(series) > epochs + 1`, a truncation/duplication
+             producer bug in the other direction) is refused identically.
       * `violations` empty, `delta` the float `series[0] - series[-1]`,
         `series` the raw list itself (recorded by the caller into
         `premise_failure_diagnostic`/`per_arm` regardless of whether the
@@ -1541,6 +1556,27 @@ def finetune_run_probe_series_delta(label, tier):
         if isinstance(entry, bool) or not isinstance(entry, (int, float)) or entry != entry or math.isinf(entry):
             return (
                 [f"{label}: train_probe_series contains a non-finite or non-numeric entry ({entry!r})"],
+                None,
+                series,
+            )
+    # unit-63 round-7 audit finding 3 -- see refusal 5 in this function's
+    # own doc: a leg's length-`epochs`-shaped (never `epochs+1`-shaped)
+    # series is silently adjudicated by refusals 1-4 alone whenever
+    # `epochs >= 2`, which is exactly the v1 probe bug's own shape (the
+    # baseline excluded the init point). `epochs` is only checked when it
+    # is itself a genuine (non-bool) int -- a leg missing `epochs` entirely
+    # is an even older producer, caught elsewhere (`FINETUNE_RUN_IDENTITY_FIELDS`
+    # already requires it), never fabricated here.
+    epochs = tier.get("epochs")
+    if isinstance(epochs, int) and not isinstance(epochs, bool):
+        expected_len = epochs + 1
+        if len(series) != expected_len:
+            return (
+                [
+                    f"{label}: train_probe_series has {len(series)} entries but this leg's own "
+                    f"epochs={epochs} (expected exactly epochs+1={expected_len}) -- series is not "
+                    "init-anchored or is truncated -- a producer-version mismatch"
+                ],
                 None,
                 series,
             )

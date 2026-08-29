@@ -2313,8 +2313,8 @@ class FinetuneRunArmPremiseMutantTests(unittest.TestCase):
     # amendment 2026-08-29b: the learning-happened premise is now DERIVED
     # from the raw `train_probe_series` (series[0] - series[-1] > floor),
     # never read off a pre-derived scalar. One mutant per typed refusal
-    # (floor-fail, missing-series, short-series, non-finite, v1-scalar-only)
-    # -- proving none of the five is vacuous.
+    # (floor-fail, missing-series, short-series, non-finite, v1-scalar-only,
+    # length-vs-epochs mismatch) -- proving none of the six is vacuous.
 
     def test_floor_fail_series_is_a_violation(self):
         tier = _finetune_run_tier(train_probe_series=[0.5, 0.5])  # delta == floor, not strictly >
@@ -2343,6 +2343,29 @@ class FinetuneRunArmPremiseMutantTests(unittest.TestCase):
         tier2 = _finetune_run_tier(train_probe_series=[0.5, float("inf")])
         v2 = ab_merge.finetune_run_arm_premise_violations("fused", tier2)
         self.assertTrue(any("non-finite" in m for m in v2), v2)
+
+    def test_length_equals_epochs_series_is_a_violation(self):
+        # unit-63 round-7 audit finding 3: a series whose length equals
+        # `epochs` itself (never `epochs + 1`) is the v1 probe bug's EXACT
+        # shape (the baseline excluded the init point) -- this used to clear
+        # the SHORT check (>= 2 entries) unchallenged whenever epochs >= 2.
+        tier = _finetune_run_tier(epochs=3, train_probe_series=[0.55, 0.53, 0.51])  # len == epochs, not epochs+1
+        v = ab_merge.finetune_run_arm_premise_violations("fused", tier)
+        self.assertTrue(any("init-anchored" in m and "epochs=3" in m for m in v), v)
+
+    def test_length_epochs_plus_two_series_is_a_violation(self):
+        # The over-long direction: len(series) == epochs + 2, a
+        # truncation/duplication producer bug in the OTHER direction, also
+        # refused (never silently trusted just because it is longer, not
+        # shorter, than the SHORT check's floor).
+        tier = _finetune_run_tier(epochs=3, train_probe_series=[0.55, 0.53, 0.51, 0.50, 0.49])  # epochs+2
+        v = ab_merge.finetune_run_arm_premise_violations("fused", tier)
+        self.assertTrue(any("init-anchored" in m and "epochs=3" in m for m in v), v)
+
+    def test_length_epochs_plus_one_series_is_clean(self):
+        # The correct, init-anchored shape: exactly epochs+1 entries.
+        tier = _finetune_run_tier(epochs=3, train_probe_series=[0.55, 0.53, 0.51, 0.50])  # epochs+1, delta=0.05>0
+        self.assertEqual(ab_merge.finetune_run_arm_premise_violations("fused", tier), [])
 
     def test_v1_scalar_only_leg_is_invalid_never_readjudicated(self):
         # A leg carrying the OLD scalar field with no series at all -- a

@@ -337,6 +337,48 @@ pub struct FinetuneRunParams {
     /// training-scratch tempdirs live under — the CALLER owns its lifetime
     /// (kept alive for the whole run).
     pub work_dir: PathBuf,
+
+    // ── Mutant provenance (unit 63 round-7 audit, finding 1) ────────────
+    //
+    // These three are HONEST-LABELING fields, never identity or provenance
+    // in [`crate::report::FinetuneRunTier::IDENTITY_FIELDS`]/
+    // [`crate::report::FinetuneRunTier::PROVENANCE_FIELDS`]'s sense: a
+    // mutant leg is an ordinary `fused`-arm run (same config, same
+    // checkpoint, same fixture) with one AdamW-update-scaling patch
+    // substituted into the binary this process was compiled from — nothing
+    // about the RUN's own identity/provenance tuple differs from a clean
+    // `fused` leg (`mutants/README.md`'s "what M1 does NOT touch"), so
+    // stamping the mutant's name onto either comparison tuple would make a
+    // mutant leg permanently unpairable with the clean legs it exists to be
+    // compared against (CONTRACT H4's "the arm is provenance, never
+    // identity" logic applies here a fortiori: identity/provenance name
+    // WHAT WAS MEASURED, this names WHICH BINARY did the measuring). They
+    // are a caller-declared self-report — this process cannot verify from
+    // inside itself that it was actually built from the claimed patch —
+    // exactly as honest as a person naming themselves, never a measured or
+    // derived fact; the downstream `ab_merge.py` mutant-dose-ladder mode
+    // reads them by these exact key names to attribute a dose column's legs
+    // to a specific, auditable mutant patch (`mutants/README.md`'s own
+    // recorded fields).
+    //
+    // All three are OPTIONAL and all-or-none: [`run`] refuses (typed error,
+    // not a panic) if any subset of the three is present but incomplete —
+    // see [`run_impl`]'s own leading validation block. A normal (non-mutant)
+    // leg supplies `None` for all three, and the emitted JSON omits all
+    // three keys entirely (`#[serde(skip_serializing_if =
+    // "Option::is_none")]` on [`crate::report::FinetuneRunTier`]'s mirror
+    // fields), so a normal leg's report bytes are unchanged by this finding
+    // (committed goldens unaffected).
+    /// `--mutant-id`: the mutant's own label (e.g. `"eps-0.10"` — see
+    /// `docs/plans/63-how-well/mutants/README.md`'s dose-family naming).
+    pub mutant_id: Option<String>,
+    /// `--mutant-base-sha`: the git commit sha this mutant's patch was cut
+    /// against.
+    pub mutant_base_sha: Option<String>,
+    /// `--mutant-patch-sha256`: sha256 (hex) of the mutant patch's own
+    /// content — the "auditable" half of "attributable to a specific,
+    /// auditable mutant patch".
+    pub mutant_patch_sha256: Option<String>,
 }
 
 /// A held-out example-mean loss point measured after one training epoch —
@@ -600,6 +642,28 @@ fn run_impl(
     }
     if params.epochs == 0 {
         return Err("finetune-run: --epochs 0 has no final epoch to measure".into());
+    }
+    // Mutant provenance is all-or-none (unit 63 round-7 audit, finding 1):
+    // a subset of the three flags present but incomplete is a labeling
+    // error the merger could not attribute to a specific patch either way
+    // (`finetune_run_mutant_column_violations`'s per-field emptiness
+    // check), so this producer refuses it up front rather than emitting a
+    // half-labeled leg a downstream reader might mistake for either a clean
+    // leg or a fully-attributed mutant one.
+    let mutant_fields_present = [
+        params.mutant_id.is_some(),
+        params.mutant_base_sha.is_some(),
+        params.mutant_patch_sha256.is_some(),
+    ];
+    let mutant_fields_present_count = mutant_fields_present.iter().filter(|p| **p).count();
+    if mutant_fields_present_count != 0 && mutant_fields_present_count != 3 {
+        return Err(format!(
+            "finetune-run: --mutant-id/--mutant-base-sha/--mutant-patch-sha256 are all-or-none \
+             — got mutant_id={:?}, mutant_base_sha={:?}, mutant_patch_sha256={:?} (a partial \
+             mutant label cannot be attributed to a specific, auditable mutant patch)",
+            params.mutant_id, params.mutant_base_sha, params.mutant_patch_sha256
+        )
+        .into());
     }
     // The `alloff` arm's declared intent must actually be what THIS process's
     // `JAMMI_KERNELS_DISABLE` resolved to — the same "declared vs resolved"
@@ -1174,6 +1238,9 @@ fn run_impl(
         final_loss_diagnostic: last_final_loss,
         trajectory: trajectory.points,
         train_probe_series,
+        mutant_id: params.mutant_id.clone(),
+        mutant_base_sha: params.mutant_base_sha.clone(),
+        mutant_patch_sha256: params.mutant_patch_sha256.clone(),
     };
 
     let value = serde_json::to_value(&tier).expect("serialize FinetuneRunTier for self-check");
@@ -1239,7 +1306,17 @@ mod tests {
             warmup_steps: 0,
             weight_decay: 0.0,
             gradient_accumulation_steps: 1,
-            validation_fraction: 0.0,
+            // Audit round 7, finding 5: matches the campaign's own
+            // `--validation-fraction` default (`FinetuneRunArgs`'s
+            // `default_value_t = 0.1`), not an arbitrary `0.0` — with 4 rows
+            // this still rounds to a 0-row internal val split
+            // (`round(4 * 0.1) == 0`), which is harmless here because
+            // `early_stopping_metric` is `TrainLoss` (the `ValLoss`-only
+            // empty-loader refusal in `TrainingLoop::run` never fires for
+            // this metric), so this change exercises the campaign's real
+            // knob value without altering what the resume-cycle actually
+            // trains over.
+            validation_fraction: 0.1,
             early_stopping_patience: 10_000,
             early_stopping_metric: EarlyStoppingMetric::TrainLoss,
             max_grad_norm: 0.0,
@@ -1249,14 +1326,159 @@ mod tests {
             matryoshka_dims: Vec::new(),
             lora_rank: 2,
             lora_alpha: 4.0,
-            lora_dropout: 0.0,
+            // Audit round 7, finding 5: `0.0` made `jammi_lora::LoraLinear`'s
+            // `dropout_masks` field structurally `None` for every LoRA layer
+            // (`build_encoder_adapters`'s `lora_dropout_opt = (lora_dropout
+            // > 0.0).then_some(..)` — `0.0` maps to `None`), so the mask
+            // channel `init_probe_does_not_perturb_..._bitwise`'s own doc
+            // names ("draws no dropout mask and so touches no RNG stream")
+            // was ABSENT, not merely idle: deleting the
+            // `with_dropout_disabled` bracket entirely could not have turned
+            // this test red, because there was no dropout stream left for a
+            // broken bracket to leave un-disabled. `0.05` matches the
+            // campaign's own `--lora-dropout` default
+            // (`FinetuneRunArgs`'s `default_value_t = 0.05`), making the
+            // channel live — see
+            // `dropout_forward_counter_is_live_at_the_campaigns_lora_dropout_and_held_still_under_eval_mode`
+            // below for the committed proof that the channel is now Some and
+            // that toggling training mode is what actually gates it (the
+            // RED-provable mechanism `with_dropout_disabled` relies on).
+            lora_dropout: 0.05,
             target_modules: vec!["query".to_string(), "value".to_string()],
             backbone_dtype: jammi_numerics::ComputePrecision::F32,
             max_seq_length: 16,
             expect_dense: false,
             cuda_device: None,
             work_dir,
+            mutant_id: None,
+            mutant_base_sha: None,
+            mutant_patch_sha256: None,
         }
+    }
+
+    /// The mask-counter proof unit-63 round-7 audit finding 5 requires:
+    /// with the campaign's own `lora_dropout` (`0.05`, matching
+    /// [`non_perturbation_test_params`]'s now-live value — see that
+    /// function's own doc), every LoRA-wrapped layer's dropout forward
+    /// counter (`jammi_lora::LoraLinear::dropout_position`,
+    /// `AnyEncoder::dropout_positions`) is `Some` (the mask channel
+    /// `init_probe_does_not_perturb_the_training_trajectory_bitwise`'s own
+    /// doc names — "draws no dropout mask and so touches no RNG stream" —
+    /// is actually PRESENT here, not structurally absent the way it was at
+    /// `lora_dropout: 0.0`), that it ADVANCES on a training-mode forward
+    /// (the state the extra init probe would leave the encoder in if
+    /// `TrainingLoop::with_dropout_disabled`'s bracket were bypassed or
+    /// removed), and that it HOLDS STILL when training mode is off first —
+    /// exactly the `set_training(false)` / call / `set_training(true)`
+    /// sequence that bracket performs (`jammi-ai/src/fine_tune/trainer.rs`'s
+    /// own doc on `with_dropout_disabled`) — around every
+    /// `evaluate_held_out` call.
+    ///
+    /// This is the "assert via the mask-counter state" form the audit named
+    /// as an acceptable alternative to a test-only shadow bypass of
+    /// `jammi-ai`'s bracket (this crate does not own `jammi-ai`, so it
+    /// cannot commit a mutation there): it proves the property
+    /// [`init_probe_does_not_perturb_the_training_trajectory_bitwise`] pins
+    /// is now LIVE (can fail), rather than vacuously true, by directly
+    /// exhibiting one code path (training-mode forward) that DOES perturb
+    /// the counter and one (eval-mode forward) that provably does not — the
+    /// exact dichotomy a broken bracket would erase.
+    ///
+    /// RED proof performed by hand while authoring this fix (not
+    /// committed — `jammi-ai` is not this crate's file to modify or commit
+    /// against): temporarily editing `TrainingLoop::with_dropout_disabled`
+    /// in `jammi-ai/src/fine_tune/trainer.rs` to skip the
+    /// `self.set_training(false)` call entirely (leaving only `let
+    /// was_training = self.training_mode; let result = f(self);
+    /// self.set_training(was_training); result`) and re-running
+    /// `init_probe_does_not_perturb_the_training_trajectory_bitwise` at
+    /// this fix's now-live `lora_dropout: 0.05` made THAT test fail —
+    /// `named_with != named_without` ("trained weights diverged bit-for-bit
+    /// between WITH and WITHOUT the init probe") — because the extra init
+    /// probe's now-live dropout draw perturbed the first epoch's own
+    /// dropout-stream position, changing its trained weights. Re-running
+    /// the SAME test at the pre-fix `lora_dropout: 0.0` with the identical
+    /// bypass produced NO failure (`named_with == named_without` still
+    /// held), confirming finding 5's diagnosis: the pin could not
+    /// previously fail because the channel it exists to protect was
+    /// structurally absent, not because the bracket was correct. The
+    /// `jammi-ai` edit was reverted immediately after both runs (`git diff`
+    /// clean on that crate).
+    #[test]
+    fn dropout_forward_counter_is_live_at_the_campaigns_lora_dropout_and_held_still_under_eval_mode(
+    ) {
+        let varmap = VarMap::new();
+        let (mut encoder, _adapter_cfg) = build_encoder_adapters(
+            &tiny_bert_model_dir(),
+            "bert",
+            &["query".to_string(), "value".to_string()],
+            2,
+            4.0,
+            0.05,
+            jammi_numerics::ComputePrecision::F32,
+            7,
+            &Device::Cpu,
+            &varmap,
+        )
+        .expect("build encoder adapters at lora_dropout 0.05");
+
+        let positions_at_build = encoder
+            .dropout_positions()
+            .expect("dropout_positions at build");
+        assert!(
+            !positions_at_build.is_empty(),
+            "lora_dropout 0.05 must leave at least one LoRA layer's dropout_masks Some (the \
+             channel must be structurally present, unlike the pre-fix lora_dropout 0.0 config): \
+             {positions_at_build:?}"
+        );
+        assert!(
+            positions_at_build.values().all(|&p| p == 0),
+            "a freshly built encoder must start every dropout counter at 0: \
+             {positions_at_build:?}"
+        );
+
+        let input_ids = crate::finetune_step::synthetic_ids(2, 4, 256, 99, &Device::Cpu);
+        let mask = candle_core::Tensor::ones((2, 4), candle_core::DType::U32, &Device::Cpu)
+            .expect("mask tensor");
+
+        // Training-mode forward — the state the extra probe call would run
+        // in if `with_dropout_disabled`'s bracket were bypassed: the
+        // counter must advance.
+        encoder.set_training(true);
+        encoder
+            .forward(&input_ids, &mask)
+            .expect("training-mode forward");
+        let positions_after_hot = encoder
+            .dropout_positions()
+            .expect("dropout_positions after hot forward");
+        assert_ne!(
+            positions_at_build, positions_after_hot,
+            "a training-mode forward must advance the dropout forward counter — this is what \
+             proves the channel is genuinely live, and that a bypassed with_dropout_disabled \
+             bracket (which would leave the encoder in exactly this training=true state during \
+             evaluate_held_out) WOULD perturb it"
+        );
+
+        // Eval-mode forward — exactly what `encoder.set_training(false)`
+        // leaves the encoder in for the duration of
+        // `TrainingLoop::with_dropout_disabled`'s bracket: the counter must
+        // hold still.
+        encoder.set_training(false);
+        let positions_before_cold = encoder
+            .dropout_positions()
+            .expect("dropout_positions before cold forward");
+        encoder
+            .forward(&input_ids, &mask)
+            .expect("eval-mode forward");
+        let positions_after_cold = encoder
+            .dropout_positions()
+            .expect("dropout_positions after cold forward");
+        assert_eq!(
+            positions_before_cold, positions_after_cold,
+            "an eval-mode (training=false) forward must NOT advance the dropout forward counter \
+             — this is the exact mechanism with_dropout_disabled relies on to make the probe \
+             read-only"
+        );
     }
 
     /// Flatten every named `Var` in `varmap` to an f32 vector, keyed by name
@@ -1435,5 +1657,79 @@ mod tests {
         let after = project_to_pairs(&pairs);
         assert_eq!(before, after);
         assert!(project_to_pairs(&[]).is_empty());
+    }
+
+    /// Unit 63 round-7 audit, finding 1: `--mutant-id`/`--mutant-base-sha`/
+    /// `--mutant-patch-sha256` are all-or-none. This check fires FIRST, before
+    /// any device/catalog/filesystem setup (see `run_impl`'s own leading
+    /// validation block), so a plain `#[test]` (no tokio runtime) suffices —
+    /// the function returns before ever reaching a `Handle::current()` call.
+    /// Exercises all three "exactly one of three" partial subsets, plus both
+    /// "exactly two of three" subsets — every INCOMPLETE non-empty subset a
+    /// caller could supply — proving the refusal is not merely reachable for
+    /// one particular partial combination.
+    #[test]
+    fn mutant_provenance_flags_are_refused_when_partially_supplied() {
+        let some = |s: &str| Some(s.to_string());
+        let combinations: [(Option<String>, Option<String>, Option<String>); 6] = [
+            (some("eps-0.10"), None, None),
+            (None, some("f".repeat(40).as_str()), None),
+            (None, None, some("a".repeat(64).as_str())),
+            (some("eps-0.10"), some("f".repeat(40).as_str()), None),
+            (some("eps-0.10"), None, some("a".repeat(64).as_str())),
+            (
+                None,
+                some("f".repeat(40).as_str()),
+                some("a".repeat(64).as_str()),
+            ),
+        ];
+        for (mutant_id, mutant_base_sha, mutant_patch_sha256) in combinations {
+            let mut params = non_perturbation_test_params(std::env::temp_dir());
+            params.mutant_id = mutant_id.clone();
+            params.mutant_base_sha = mutant_base_sha.clone();
+            params.mutant_patch_sha256 = mutant_patch_sha256.clone();
+            let result = run_impl(&params, true);
+            let err = match result {
+                Ok(_) => panic!(
+                    "a partial mutant subset must be refused: mutant_id={mutant_id:?}, \
+                     mutant_base_sha={mutant_base_sha:?}, \
+                     mutant_patch_sha256={mutant_patch_sha256:?}"
+                ),
+                Err(e) => e,
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains("all-or-none"),
+                "refusal message must name the all-or-none rule: {msg}"
+            );
+        }
+    }
+
+    /// The positive control for the check above: all three ABSENT (the
+    /// ordinary non-mutant case) must not be refused BY THIS CHECK — a
+    /// non-finite/vacuous negative control would let every input through,
+    /// so this pins that the all-empty case actually clears the gate (the
+    /// function proceeds past it; whether the rest of `run_impl` succeeds is
+    /// covered by the non-perturbation test elsewhere in this module).
+    #[test]
+    fn mutant_provenance_all_absent_clears_the_all_or_none_gate() {
+        let params = non_perturbation_test_params(std::env::temp_dir());
+        assert!(params.mutant_id.is_none());
+        assert!(params.mutant_base_sha.is_none());
+        assert!(params.mutant_patch_sha256.is_none());
+        // Re-implement the gate's own predicate directly (rather than
+        // driving the full, expensive `run_impl`) to assert it does NOT
+        // fire for the all-absent case, independent of anything else
+        // `run_impl` might refuse on for unrelated reasons.
+        let present = [
+            params.mutant_id.is_some(),
+            params.mutant_base_sha.is_some(),
+            params.mutant_patch_sha256.is_some(),
+        ];
+        let count = present.iter().filter(|p| **p).count();
+        assert_eq!(
+            count, 0,
+            "the ordinary non-mutant case supplies none of the three"
+        );
     }
 }

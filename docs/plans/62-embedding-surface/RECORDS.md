@@ -4,6 +4,94 @@ Carries the hand-off notes CONTRACT.md's E6 item requires: what this unit delibe
 NOT ship, what its follow-ups inherit, the esc-058 discovery this unit's own work surfaced, and
 the KO-7 follow-up pointer. States current fact, not the unit's history.
 
+## Hardware evidence — current state
+
+This section records what pod/hardware evidence actually backs the CPU-hermetic half's
+provisional bounds and the K4/E5 leg, as landed at this branch's head. It is a current-state
+snapshot, not a narrative: each claim below cites the artifact or code that verifies it,
+and any claim this unit does NOT yet have committed evidence for is stated as open, not
+asserted.
+
+**1. Invariance gating proofs — 8/8 batch compositions, four arches, tree `48ed4495`+.**
+`crates/jammi-encoders/tests/it/batch_composition_invariance.rs`'s
+`gpu_composition_floor`/`GPU_TRUTH_DRIFT_BOUND` constants (`:585`, `:591`, `:691`) are derived
+from the committed four-arch archival captures under
+`docs/plans/62-embedding-surface/measurements/`, one self-identifying file per arch (first
+line is a `HEADER` carrying the probed compute capability, driver device name, and crate
+version):
+
+- `measurements/gpu-floors-a100.txt:1` — `compute_capability=8.0 device_name=NVIDIA A100-SXM4-80GB`
+- `measurements/gpu-floors-h100.txt:1` — `compute_capability=9.0 device_name=NVIDIA H100 80GB HBM3`
+- `measurements/gpu-floors-a40.txt:1` — `compute_capability=8.6 device_name=NVIDIA A40`
+- `measurements/gpu-floors-l40s.txt:1` — `compute_capability=8.9 device_name=NVIDIA L40S`
+
+Each file's `OVERALL OVER 8 COMPOSITIONS / 88 ROW-MEASUREMENTS` line (e.g.
+`gpu-floors-a100.txt:114`) confirms all 8 fixture compositions read back clean on every arch:
+bit-exact `0.0` alone-vs-batch on sm80/sm86/sm90 (`EXACT_ARCH_COMPOSITION_FLOOR`,
+`batch_composition_invariance.rs:585`), within `SM89_COMPOSITION_FLOOR` (`:591`, `4.2e-3`) on
+sm89 (L40S). The sm89 window-radius red control is loudly SKIPPED, not silently passed: it is
+inadmissible on this arch by construction (its own measured minimum separation,
+`1.139471768897301e-3`, is below `SM89_COMPOSITION_FLOOR`) —
+`pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda` (`:836-865`) probes
+`ComputeCapability::new(8, 9)` at runtime and returns early with a named `eprintln!` reason
+before any assertion, which fires by construction on exactly the L40S capability the HEADER
+line above records; the row-length control stays universal and is never skipped
+(`gpu_composition_floor`'s own doc, `:525-563`, names the composition-scoped sm89
+admissibility explicitly). Tree `48ed4495` (`Merge bound derivation: per-arch composition
+floors + drift bound from four-arch measurements, sm89 admissibility scoping, fail-loud
+unknown arch`) is an ancestor of this branch's head; the constants above are unchanged since.
+
+**2. K4 transport leg — fix landed, post-fix pod re-confirmation not yet a committed artifact.**
+The Utf8/Utf8View keying defect pod evidence surfaced (K4, a100, tree `48ed4495`:
+`remote_flight_read_matches_local_readback_bitwise_on_gpu` panicking at
+`grpc_remote_session_gpu.rs:222` on a `Utf8` vs `Utf8View` schema mismatch) is fixed on this
+branch by commit `0e5f777d` (merged `0fcc8317`): `keyed_vectors`
+(`crates/jammi-server/tests/it/grpc_remote_session_gpu.rs:236-264`) now casts `_row_id` to
+`Utf8` before the `StringArray` downcast on both read paths, and the module doc
+(`:216-235`) records the Utf8-vs-Utf8View difference as a transport/read-path representation
+observation (DataFusion's `schema_force_view_types` parquet-reader default applying
+independently per side), not a logical divergence — the `FixedSizeList<Float32>` vector
+column keeps its unmodified bitwise, zero-tolerance comparison. `JAMMI_REQUIRE_CUDA`
+fail-loud coverage of every skip path in this module (F-7, ancestor of `48ed4495`) is already
+landed, so a pod job run under it cannot read green having executed zero assertions. OPEN:
+no committed artifact in this repo (this module is an ordinary `it`-suite test, not a
+`crates/jammi-kernels/artifacts/cuda-runs/*.json` producer) records an actual post-fix
+`JAMMI_REQUIRE_CUDA=1` pod run of `remote_flight_read_matches_local_readback_bitwise_on_gpu`
+and `encode_query_two_compute_gpu_repeat_determinism_is_recorded_not_gated`
+(`grpc_remote_session_gpu.rs:274`, `:371`) on the a100 — the fix is landed and addresses the
+exact failure the tree-`48ed4495` pod run hit, but a "2/2 green post-fix" pod re-run is not
+independently verifiable from repo state alone.
+
+**3. Encode identity artifact — GREEN, verified.**
+`crates/jammi-kernels/artifacts/cuda-runs/2026-08-29-encode-ab-a4fad082-a100-sxm4.json`:
+`"status": "GREEN"`, `"leg_premise_violations": []`, `"git_sha":
+"a4fad082f895394b4bf7176bb11606945b5ac3d4"` (an ancestor of this branch's head, confirmed via
+`git merge-base --is-ancestor`), legs `r1`/`r2` both `"outcome": "OK"` on
+`NVIDIA A100-SXM4-80GB`, produced by `ci/scripts/perf/encode_ab.sh` (`"kind": "script"`) per
+the stacked_sweep git-pinned-worktree convention. `python3 ci/scripts/check_cuda_run_artifacts.py`
+passes over the full `cuda-runs/` directory including this file (exit 0).
+
+**4. Linux CPU-floor confirmation — OPEN, not yet done.**
+`PROVISIONAL_CPU_FLOOR` (`batch_composition_invariance.rs:257`) and its doc (`:237-256`)
+state plainly, at this branch's head, that the `f32`-CPU alone-vs-padded-batch bound was
+measured ONLY on a macOS dev box and is "NOT YET measured on the CI-representative Linux
+runner or the pod train (contract E4, Step 5) -- that measurement must replace this one, not
+merely confirm it, before this bound is treated as final" (`:253-256`). No committed artifact,
+measurement file, or commit in this branch's history records an actual run of
+`pooled_embedding_alone_matches_padded_batch_real_row_f32_cpu` or its two red controls
+(`:319`, `:359`) on any of the four Linux pods used for the CUDA sweep above (or any other
+Linux host) — the four `measurements/gpu-floors-*.txt` captures are all `measure_gpu_floors_print_only`
+output, a CUDA-gated ignored test that does not exercise the `f32_cpu` tests at all. The
+macOS-measured provisional floor's caveat is therefore still OPEN, not answered, as of this
+branch's head; this record states that plainly rather than asserting a confirmation this repo
+does not evidence.
+
+**5. Oracle-advisory release-note paragraph.** Verified present and unedited: "## esc-057 fix
+— the required release-note advisory (content_digest joins identity)" below, with its
+**REQUIRED RELEASE-NOTE content** paragraph intact. Section ordering already reads
+chronologically by discovery (C15 hand-off, C16 inheritance, esc-058, esc-057, K4 advisory,
+KO-7 follow-up); left as-is.
+
 ## C15 hand-off — no ServerInfo change, no counters on the wire
 
 This unit ships NO `ServerInfo` change and NO dispatch counter of any kind on any wire surface.

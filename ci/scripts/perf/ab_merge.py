@@ -3534,8 +3534,13 @@ def main(argv=None):
                     "improvement detected under deflation, unit-63 round-9 audit finding 3) is "
                     "reported under 'dose_anomalies' instead and gates this merge's own exit code "
                     "exactly as the primary decision's own RED_FOR_INVESTIGATION state does -- "
-                    "investigated, never silently celebrated; 'sensitivity_error' names a "
-                    "dose_label that failed to parse as a signed eps value, never silently ignored."
+                    "investigated, never silently celebrated; 'sensitivity_error' names ANY of "
+                    "this family's own refusal classes over the supplied dose set -- a dose_label "
+                    "that failed to parse as a signed eps value, a parsed eps outside this "
+                    "family's own domain, or a duplicate identity across two columns (the same "
+                    "literal dose_label, the same parsed eps under two different labels, or the "
+                    "same patch_sha256 under two different labels, unit-63 round-11 audit block) "
+                    "-- never silently ignored."
                 ),
             }
             dose_lines = ["", "# mutant dose ladder (amendment 2026-08-29b item 3; addendum 2026-08-29c signs it)"]

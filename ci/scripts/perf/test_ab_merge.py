@@ -4457,6 +4457,59 @@ class MutantDoseLadderTests(unittest.TestCase):
                 _mutant_tier(seed=seed, held_out_example_mean=pos50_mean, mutant_patch_sha256=pos50_sha),
             )
 
+    def test_cli_wiring_scheduled_three_dose_ladder_happy_path(self):
+        # unit-63 round-11 audit advisory (c): the missing end-to-end
+        # happy-path pin -- one CLI `main()` call driving the SCHEDULED
+        # 3-dose ladder with DISTINCT patch shas (per dose, matching
+        # mutants/README.md's own convention) all the way to a GREEN,
+        # rc=0 merge with a correct straddle and a populated
+        # `two_sided_falsification` -- the exact shape the paid run will
+        # exercise.
+        neg50_sha, neg10_sha, pos50_sha = "sha-neg-0-50", "sha-neg-0-10", "sha-pos-0-50"
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            self._write_scheduled_three_dose_ladder(raw_dir, neg50_sha=neg50_sha, neg10_sha=neg10_sha, pos50_sha=pos50_sha)
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    f"eps-0.50:{neg50_sha}:{seeds_s}",
+                    "--mutant-legs",
+                    f"eps-0.10:{neg10_sha}:{seeds_s}",
+                    "--mutant-legs",
+                    f"eps0.50:{pos50_sha}:{seeds_s}",
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 0)
+        self.assertEqual(merged["status"], "GREEN")
+        ladder = merged["mutant_dose_ladder"]
+        self.assertIsNone(ladder["sensitivity_error"])
+        self.assertEqual(ladder["sensitivity"], {"lower": "eps-0.10", "higher": "eps-0.50"})
+        self.assertEqual(
+            ladder["two_sided_falsification"],
+            [
+                {
+                    "dose_label": "eps0.50",
+                    "eps": 0.5,
+                    "detected": "RED",
+                    "finding": "secant refuted (degradation at +eps)",
+                }
+            ],
+        )
+        self.assertEqual(ladder["dose_anomalies"], [])
+        detected_by_label = {d["dose_label"]: d["detected"] for d in ladder["doses"]}
+        self.assertEqual(
+            detected_by_label,
+            {"eps-0.50": "RED", "eps-0.10": "not-detected", "eps0.50": "RED"},
+        )
+
     def test_cli_wiring_refuses_the_auditors_three_same_sha_probe(self):
         # unit-63 round-11 audit block: the auditor's own probe -- the
         # exact SCHEDULED 3-dose ladder shape above, but with all three

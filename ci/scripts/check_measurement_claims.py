@@ -1389,16 +1389,25 @@ def self_test() -> int:
         )
 
         # wrong-file binding: dstar's n_pos=12 must NOT validate against
-        # red-proof's own (pre-D*) report, where the corresponding entry
-        # reads n_pos=0 (red_proof[1], INVALID, unscheduled).
+        # red-proof's own (pre-D*) report — `mutant_dose_ladder.red_proof[0]`
+        # there (the `redproof-nobc` column) reads n_pos=3.
         red_proof_doc = loader.load(
             "docs/plans/63-how-well/measurements/red-proof/finetune_run_ab_report.json"
         )
-        wrong_file_n_pos = red_proof_doc["mutant_dose_ladder"]["red_proof"][1]["n_pos"]  # type: ignore[index]
+        wrong_file_n_pos_0 = red_proof_doc["mutant_dose_ladder"]["red_proof"][0]["n_pos"]  # type: ignore[index]
         check(
-            "wrong-file-binding fixture: dstar n_pos=12 != red-proof's own red_proof[1].n_pos "
-            f"({wrong_file_n_pos})",
-            Decimal(str(wrong_file_n_pos)) != Decimal("12"),
+            "wrong-file-binding fixture: dstar n_pos=12 != red-proof's own red_proof[0].n_pos "
+            f"({wrong_file_n_pos_0})",
+            Decimal(str(wrong_file_n_pos_0)) == Decimal("3") and Decimal(str(wrong_file_n_pos_0)) != Decimal("12"),
+        )
+        # ...and red_proof[1] there (the co-scheduled `redproof-signflip-v2`
+        # column, pre-D*) is INVALID with n_pos=0 — a second independent
+        # wrong-file mismatch in the SAME artifact.
+        wrong_file_n_pos_1 = red_proof_doc["mutant_dose_ladder"]["red_proof"][1]["n_pos"]  # type: ignore[index]
+        check(
+            "wrong-file-binding fixture #2: dstar n_pos=12 != red-proof's own red_proof[1].n_pos "
+            f"({wrong_file_n_pos_1})",
+            Decimal(str(wrong_file_n_pos_1)) != Decimal("12"),
         )
 
     # --- a deleted tag REDs the coverage leg (mutation-adequacy: the

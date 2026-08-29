@@ -35,23 +35,36 @@ Findings, honestly stated:
    cause) rather than as an unexplained contradiction. STRUCTURAL FINDING,
    recorded before any amendment: the learning-happened premise (built for the
    primary C16 attribution question) refuses exactly the strongest true
-   positives of the RED-proof detection question. Resolution is
-   pressure-tested, not hand-decided; until it lands, acceptance 5's "mutant
-   column proven RED" is UNDISCHARGED and this artifact is the honest record
-   of why.
+   positives of the RED-proof detection question. Resolution was
+   pressure-tested, not hand-decided, and now landed: CONTRACT.md amendment
+   2026-08-29e decomposed the premise into `training_effective` +
+   `train_direction`, and the D*-gated re-merge (`dstar/`) DISCHARGES
+   acceptance 5's "mutant column proven RED" at `M = M_signflip_v2` — see
+   `dstar/README.md`. This PRE-amendment gated reading (`INVALID`) still
+   stands as-is below, current truth at the layer it was measured at; it is
+   not relabeled.
 
 The raw-concordance numbers above are derived from the committed legs in `raw/`
 paired with `../campaign-v2/raw/seedN__alloff__{r1,r2}.json` exactly as the
 merger pairs them; the gated readings are the committed
 `finetune_run_ab_report.json`'s own `mutant_dose_ladder.red_proof[]` entries.
 
-**Pending D* re-merge (CONTRACT.md amendment 2026-08-29e):** finding 3's own
-INVALID gated reading above is the PRE-amendment record, measured before the
-learning-happened premise was decomposed into `training_effective`/
-`train_direction`. The amendment schedules a re-merge of `redproof-signflip-v2`
-ONLY (`M_nobc`'s own committed INVALID record above stands as evidence; see
-CONTRACT.md's own "FINAL SCHEDULING + PRE-REGISTERED PREDICTIONS" for the
-full, pre-registered prediction set) — none of the raw numbers or gated
-readings recorded in this file are altered by that amendment; a NEW
-committed artifact records the D*-gated re-merge separately, per this file's
-own append-only, current-truth discipline.
+**D* re-merge DISCHARGED (CONTRACT.md amendment 2026-08-29e):** finding 3's
+own INVALID gated reading above is the PRE-amendment record, measured before
+the learning-happened premise was decomposed into `training_effective`/
+`train_direction`; it STANDS as-is, never relabeled. The amendment's
+pre-registered re-merge of `redproof-signflip-v2` ONLY (`M_nobc`'s own
+committed INVALID record above stands as evidence, not as a second column
+to re-run; see CONTRACT.md's own "FINAL SCHEDULING + PRE-REGISTERED
+PREDICTIONS" for the full, pre-registered prediction set) has now run and is
+committed at `dstar/` (`dstar/README.md`, artifact at 82253c1b): all four
+pre-registered predictions confirmed to the bit, `redproof-signflip-v2`
+reads `detected=RED` (`n_pos=12/12`, `n_neg=0`, two-sided
+`p=2/4096=1/2048` exact), `red_proof_verdict=PROVEN`, merge exit 0.
+Acceptance 5's "mutant column proven RED" is DISCHARGED at
+`M = M_signflip_v2`, per the amendment's honesty rider (M is a catastrophic
+mutant, the detector's sensitivity ceiling — the corridor between
+`M_nobc` and `M_signflip_v2` remains unresolved and is not claimed). None
+of the raw numbers or gated readings recorded in THIS file are altered by
+the discharge — the D*-gated re-merge is a separate, later-committed
+artifact, per this file's own append-only, current-truth discipline.

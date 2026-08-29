@@ -35,6 +35,7 @@ import itertools
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -4760,10 +4761,19 @@ class RedProofColumnTests(unittest.TestCase):
                             raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
                         )
                 mutant_mean = 0.99 if seed != 12 else 0.10  # 11/12 degradation-concordant
+                # unit-63 round-15 audit advisory 6: `redproof-nobc`, stamped
+                # with M_nobc's own real sha (`REDPROOF_DESCENT_SHA`) --
+                # pre-fix this fixture used the "redproof-signflip" label
+                # with M_nobc's sha, a semantically inverted pairing (a
+                # signflip-labeled column stamped with nobc's sha); this is
+                # a synthetic CLI-wiring fixture (not a re-measurement of
+                # either mutant), so only the LABEL needed to change to make
+                # the label/sha pairing read true -- no assertion below
+                # (RED/PROVEN/rc/clean_pair_count) is weakened.
                 _write_mutant_leg(
                     raw_dir,
                     seed,
-                    "redproof-signflip",
+                    "redproof-nobc",
                     _mutant_tier(
                         seed=seed, held_out_example_mean=mutant_mean, mutant_patch_sha256=self.REDPROOF_DESCENT_SHA
                     ),
@@ -4778,7 +4788,7 @@ class RedProofColumnTests(unittest.TestCase):
                     "",
                     "--allow-missing-lr0-control",
                     "--mutant-legs",
-                    f"redproof-signflip:{self.REDPROOF_DESCENT_SHA}:{seeds_s}",
+                    f"redproof-nobc:{self.REDPROOF_DESCENT_SHA}:{seeds_s}",
                 ]
             )
             with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
@@ -4790,7 +4800,7 @@ class RedProofColumnTests(unittest.TestCase):
         self.assertEqual(ladder["doses"][0]["detected"], "RED")
         self.assertEqual(ladder["red_proof"], [
             {
-                "dose_label": "redproof-signflip",
+                "dose_label": "redproof-nobc",
                 "patch_sha256": self.REDPROOF_DESCENT_SHA,
                 "detected": "RED",
                 "n_pos": ladder["doses"][0]["n_pos"],
@@ -4871,12 +4881,20 @@ class RedProofColumnTests(unittest.TestCase):
                 _write_mutant_leg(
                     raw_dir, seed, "eps-0.50", _mutant_tier(seed=seed, held_out_example_mean=eps_mean, mutant_patch_sha256="sha-eps-neg50")
                 )
-                # redproof-signflip: guaranteed-degradation shape -> RED.
+                # redproof-nobc, stamped with M_nobc's own real sha
+                # (`REDPROOF_DESCENT_SHA`) -- unit-63 round-15 audit
+                # advisory 6: pre-fix this fixture used the "redproof-
+                # signflip" label with M_nobc's sha, a semantically
+                # inverted pairing; this is a synthetic CLI-wiring fixture
+                # (co-scheduling isolation, not a re-measurement of either
+                # mutant), so only the LABEL needed to change to make the
+                # label/sha pairing read true -- guaranteed-degradation
+                # shape -> RED, unchanged.
                 redproof_mean = 0.99 if seed != 12 else 0.10
                 _write_mutant_leg(
                     raw_dir,
                     seed,
-                    "redproof-signflip",
+                    "redproof-nobc",
                     _mutant_tier(
                         seed=seed, held_out_example_mean=redproof_mean, mutant_patch_sha256=self.REDPROOF_DESCENT_SHA
                     ),
@@ -4893,7 +4911,7 @@ class RedProofColumnTests(unittest.TestCase):
                     "--mutant-legs",
                     f"eps-0.50:sha-eps-neg50:{seeds_s}",
                     "--mutant-legs",
-                    f"redproof-signflip:{self.REDPROOF_DESCENT_SHA}:{seeds_s}",
+                    f"redproof-nobc:{self.REDPROOF_DESCENT_SHA}:{seeds_s}",
                 ]
             )
             with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
@@ -4910,11 +4928,11 @@ class RedProofColumnTests(unittest.TestCase):
         # redproof summary sees only the redproof column, unaffected by the
         # co-scheduled eps column.
         self.assertEqual(len(ladder["red_proof"]), 1)
-        self.assertEqual(ladder["red_proof"][0]["dose_label"], "redproof-signflip")
+        self.assertEqual(ladder["red_proof"][0]["dose_label"], "redproof-nobc")
         self.assertEqual(ladder["red_proof_verdict"], "PROVEN")
         # both columns still appear, in full, in 'doses'.
         detected_by_label = {d["dose_label"]: d["detected"] for d in ladder["doses"]}
-        self.assertEqual(detected_by_label, {"eps-0.50": "RED", "redproof-signflip": "RED"})
+        self.assertEqual(detected_by_label, {"eps-0.50": "RED", "redproof-nobc": "RED"})
 
     def test_cli_wiring_redproof_column_still_subject_to_duplicate_sha_refusal(self):
         # a redproof-labeled column is still subject to the duplicate-PATCH_SHA
@@ -5207,6 +5225,28 @@ class RedProofDStarPremiseTests(unittest.TestCase):
         self.assertEqual(column["clean_pair_count"], 0)
         self.assertTrue(any("RED_PROOF_EXPECTED_TRAIN_DIRECTION" in v for v in column["violations"]))
 
+    def test_missing_table_sha_violation_is_prefixed_exactly_once(self):
+        # unit-63 round-15 audit advisory 5: `red_proof_expected_train_
+        # direction`'s own missing-sha message self-prefixed with
+        # `dose_label` and got prefixed AGAIN by `build_mutant_dose_column`
+        # (`f"{dose_label} seed {seed}: {v}"`) -- doubled `dose_label` in
+        # the committed artifact pre-fix. Every OTHER leg-violation message
+        # in this module (e.g. the `mutant_id`/`mutant_patch_sha256`
+        # messages) is unprefixed at its own site and prefixed exactly once
+        # by the builder; this message must match that shape.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            unlisted_sha = "deadbeef" * 8
+            for seed in (1, 2):
+                self._write_alloff(raw_dir, seed)
+                _write_mutant_leg(
+                    raw_dir, seed, "redproof-unknown", _mutant_tier(seed=seed, mutant_patch_sha256=unlisted_sha)
+                )
+            column = ab_merge.build_mutant_dose_column(raw_dir, "redproof-unknown", unlisted_sha, [1, 2])
+        for v in column["violations"]:
+            if "RED_PROOF_EXPECTED_TRAIN_DIRECTION" in v:
+                self.assertEqual(v.count("redproof-unknown"), 1, v)
+                self.assertTrue(v.startswith("redproof-unknown seed "), v)
+
     def test_init_anchor_equality_mismatch_is_a_violation(self):
         with tempfile.TemporaryDirectory() as raw_dir:
             seed = 1
@@ -5224,6 +5264,32 @@ class RedProofDStarPremiseTests(unittest.TestCase):
             column = ab_merge.build_mutant_dose_column(raw_dir, "redproof-nobc", self.DESCENT_SHA, [seed])
         self.assertTrue(any("init_anchor_equality" in v for v in column["violations"]), column["violations"])
         self.assertIsNone(column["per_seed"]["1"]["d_i"])
+
+    def test_init_anchor_equality_violation_is_prefixed_exactly_once(self):
+        # unit-63 round-15 audit advisory 5: the `init_anchor_equality`
+        # violation self-prefixed with `f"{dose_label} seed {seed}: "` and
+        # got prefixed AGAIN by `build_mutant_dose_column` -- doubled BOTH
+        # `dose_label` and `seed` in the committed artifact pre-fix.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            seed = 1
+            self._write_alloff(raw_dir, seed)  # default train_probe_series[0] == 0.55
+            _write_mutant_leg(
+                raw_dir,
+                seed,
+                "redproof-nobc",
+                _mutant_tier(
+                    seed=seed,
+                    mutant_patch_sha256=self.DESCENT_SHA,
+                    train_probe_series=[0.60, 0.50],  # series[0]=0.60 != alloff's 0.55
+                ),
+            )
+            column = ab_merge.build_mutant_dose_column(raw_dir, "redproof-nobc", self.DESCENT_SHA, [seed])
+        for v in column["violations"]:
+            if "init_anchor_equality" in v:
+                self.assertEqual(v.count("redproof-nobc"), 1, v)
+                self.assertEqual(v.count("seed 1"), 1, v)
+                self.assertEqual(v, f"redproof-nobc seed {seed}: " + v.split(": ", 1)[1])
+                self.assertTrue(v.startswith(f"redproof-nobc seed {seed}: RED-proof mutant leg's"), v)
 
     def test_init_anchor_equality_holds_when_series_zero_matches(self):
         with tempfile.TemporaryDirectory() as raw_dir:
@@ -5338,6 +5404,111 @@ class RedProofDStarPremiseTests(unittest.TestCase):
         self.assertEqual(ladder["doses"][0]["detected"], "RED")
         self.assertEqual(ladder["red_proof_verdict"], "PROVEN")
         self.assertEqual(rc, 0)
+
+
+class DoseLadderCausesRuntimeCheckSurvivesDashOTests(unittest.TestCase):
+    """Unit-63 round-15 audit advisory 4: `main()`'s own runtime binding of
+    `dose_ladder_causes` to the committed `DOSE_LADDER_EXIT_CAUSE_NAMES` set
+    used to be a bare `assert`, which `python -O` strips entirely -- the
+    exact deployment shape (`-O`) that removes the safety net without
+    removing the code path it protects. It is now an explicit `if`/`raise
+    AssertionError`. Proven here by running the REAL `ab_merge.py` as a
+    subprocess (under `python -O`, the shape this fix specifically targets)
+    against a real fixture directory, with `DOSE_LADDER_EXIT_CAUSE_NAMES`
+    monkeypatched to a deliberately drifted set from a tiny runner script --
+    the check still fires and the process exits non-zero with the named
+    message on stderr, exactly as it would without `-O`.
+    """
+
+    def _write_fixture(self, raw_dir):
+        # Minimal real fixture: one clean 12-seed primary A/B plus one
+        # `redproof-nobc` mutant dose column -- enough for `main()`'s own
+        # dose-ladder fold (the code path under test) to actually run.
+        redproof_sha = "9b3c824dc041899c12c0e2d44d12a3ac8c7b86076ffc778638108925ba51bf4e"
+        for seed in range(1, 13):
+            fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+            for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                for repeat in ("r1", "r2"):
+                    _write_finetune_run_leg(
+                        raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                    )
+            mutant_mean = 0.99 if seed != 12 else 0.10
+            _write_mutant_leg(
+                raw_dir,
+                seed,
+                "redproof-nobc",
+                _mutant_tier(seed=seed, held_out_example_mean=mutant_mean, mutant_patch_sha256=redproof_sha),
+            )
+        return redproof_sha
+
+    def test_drifted_cause_names_still_raises_under_dash_o(self):
+        perf_dir = os.path.dirname(os.path.abspath(ab_merge.__file__))
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            redproof_sha = self._write_fixture(raw_dir)
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            runner = os.path.join(raw_dir, "_runner.py")
+            with open(runner, "w") as fh:
+                fh.write(
+                    "import sys\n"
+                    f"sys.path.insert(0, {perf_dir!r})\n"
+                    "import ab_merge\n"
+                    "# deliberately drift the committed constant, simulating a fifth\n"
+                    "# cause added to dose_ladder_causes without updating this set.\n"
+                    "ab_merge.DOSE_LADDER_EXIT_CAUSE_NAMES = ('bogus_drifted_cause',)\n"
+                    "ab_merge.main([\n"
+                    "    'finetune-run',\n"
+                    f"    {raw_dir!r},\n"
+                    f"    {out_dir!r},\n"
+                    f"    {seeds_s!r},\n"
+                    "    '',\n"
+                    "    '--allow-missing-lr0-control',\n"
+                    "    '--mutant-legs',\n"
+                    f"    'redproof-nobc:{redproof_sha}:{seeds_s}',\n"
+                    "])\n"
+                )
+            proc = subprocess.run(
+                [sys.executable, "-O", runner],
+                capture_output=True,
+                text=True,
+            )
+        self.assertNotEqual(proc.returncode, 0, msg=f"stdout={proc.stdout!r} stderr={proc.stderr!r}")
+        self.assertIn("AssertionError", proc.stderr)
+        self.assertIn("dose_ladder_causes drifted from the committed DOSE_LADDER_EXIT_CAUSE_NAMES set", proc.stderr)
+
+    def test_drifted_cause_names_raises_identically_without_dash_o(self):
+        # negative control: same behaviour with or without -O, proving the
+        # fix (an explicit if/raise) is not itself sensitive to the flag --
+        # only a bare `assert` would have differed between the two runs.
+        perf_dir = os.path.dirname(os.path.abspath(ab_merge.__file__))
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            redproof_sha = self._write_fixture(raw_dir)
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            runner = os.path.join(raw_dir, "_runner.py")
+            with open(runner, "w") as fh:
+                fh.write(
+                    "import sys\n"
+                    f"sys.path.insert(0, {perf_dir!r})\n"
+                    "import ab_merge\n"
+                    "ab_merge.DOSE_LADDER_EXIT_CAUSE_NAMES = ('bogus_drifted_cause',)\n"
+                    "ab_merge.main([\n"
+                    "    'finetune-run',\n"
+                    f"    {raw_dir!r},\n"
+                    f"    {out_dir!r},\n"
+                    f"    {seeds_s!r},\n"
+                    "    '',\n"
+                    "    '--allow-missing-lr0-control',\n"
+                    "    '--mutant-legs',\n"
+                    f"    'redproof-nobc:{redproof_sha}:{seeds_s}',\n"
+                    "])\n"
+                )
+            proc = subprocess.run(
+                [sys.executable, runner],
+                capture_output=True,
+                text=True,
+            )
+        self.assertNotEqual(proc.returncode, 0, msg=f"stdout={proc.stdout!r} stderr={proc.stderr!r}")
+        self.assertIn("AssertionError", proc.stderr)
+        self.assertIn("dose_ladder_causes drifted from the committed DOSE_LADDER_EXIT_CAUSE_NAMES set", proc.stderr)
 
 
 if __name__ == "__main__":

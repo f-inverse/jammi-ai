@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -341,6 +342,75 @@ class MainEntryPointTests(unittest.TestCase):
             Path(path).unlink()
         self.assertEqual(rc, 0)
         self.assertEqual(buf.getvalue().strip(), namer.dose_ladder_cause(report))
+
+
+class AbMergeImportFailureHardeningTests(unittest.TestCase):
+    """Unit-63 round-15 audit advisory 3: `howwell_dose_ladder_cause.py`'s
+    own module-level `sys.path.insert(0, .../perf); import ab_merge` is a
+    crash surface upstream of `_inspect_doses`'s own A4 hardening -- an
+    import-time failure (a broken `perf/ab_merge.py`, or the module simply
+    missing) must degrade to a NAMED cause on stdout, exit 0, never an
+    uncaught exception that `runpod_gpu_howwell.sh`'s own
+    `2>/dev/null || echo "unknown (could not inspect ...)"` wrapper would
+    collapse into the opaque "unknown" text. Proven here by copying the real
+    `howwell_dose_ladder_cause.py` into a throwaway directory alongside a
+    deliberately broken `perf/ab_merge.py` stub and invoking it as a real
+    subprocess -- the exact shape `runpod_gpu_howwell.sh` uses, with the
+    ONE variable under test (whether `import ab_merge` succeeds) swapped
+    out, never the real `ci/scripts/perf/ab_merge.py` touched.
+
+    Pre-fix (803ae6c7), this same setup crashed with an uncaught
+    `ImportError`, non-zero exit, and empty stdout -- captured RED before
+    this test's own fix landed.
+    """
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp(prefix="howwell-dose-ladder-cause-import-fail-")
+        self.addCleanup(shutil.rmtree, self._tmpdir, ignore_errors=True)
+        shutil.copy(_SCRIPT, Path(self._tmpdir) / "howwell_dose_ladder_cause.py")
+        perf_dir = Path(self._tmpdir) / "perf"
+        perf_dir.mkdir()
+        (perf_dir / "ab_merge.py").write_text(
+            'raise ImportError("simulated broken ab_merge -- round-15 audit advisory 3 RED-proof")\n'
+        )
+        self._script = str(Path(self._tmpdir) / "howwell_dose_ladder_cause.py")
+
+    def _run(self, report: dict):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, dir=self._tmpdir) as fh:
+            json.dump(report, fh)
+            path = fh.name
+        return subprocess.run([sys.executable, self._script, path], capture_output=True, text=True)
+
+    def test_broken_ab_merge_degrades_to_a_named_cause_not_a_crash(self):
+        report = {"status": "GREEN", "mutant_dose_ladder": {"sensitivity_error": None, "dose_anomalies": []}}
+        proc = self._run(report)
+        self.assertEqual(proc.returncode, 0, msg=f"stderr={proc.stderr!r}")
+        self.assertIn("ab_merge_import_failed(", proc.stdout)
+        self.assertIn("simulated broken ab_merge", proc.stdout)
+        self.assertNotEqual(proc.stdout.strip(), "")
+
+    def test_broken_ab_merge_never_produces_bare_unknown(self):
+        # The whole point: a real crash here must not collapse into the
+        # SAME opaque text a genuinely-no-cause-found run produces.
+        report = {"status": "GREEN", "mutant_dose_ladder": {}}
+        proc = self._run(report)
+        self.assertEqual(proc.returncode, 0, msg=f"stderr={proc.stderr!r}")
+        self.assertNotIn("unknown (no", proc.stdout)
+        self.assertIn("ab_merge_import_failed(", proc.stdout)
+
+    def test_broken_ab_merge_named_cause_is_stable_regardless_of_report_shape(self):
+        # The import failure fires before `report` is even inspected --
+        # same named cause whether the report is well-formed, malformed, or
+        # would otherwise have hit the four-cause fallback text.
+        for report in (
+            {"status": "GREEN", "mutant_dose_ladder": {"doses": None}},
+            {"status": "GREEN"},
+            {},
+        ):
+            with self.subTest(report=report):
+                proc = self._run(report)
+                self.assertEqual(proc.returncode, 0, msg=f"stderr={proc.stderr!r}")
+                self.assertTrue(proc.stdout.startswith("ab_merge_import_failed("), msg=proc.stdout)
 
 
 if __name__ == "__main__":

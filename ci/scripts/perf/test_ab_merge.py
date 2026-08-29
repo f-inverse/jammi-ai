@@ -2038,7 +2038,16 @@ def _finetune_run_tier(arm="fused", **overrides):
         "lora_dropout": 0.05,
         "margin": None,
         "target_modules": ["Wqkv", "Wo", "Wi"],
-        "backbone_dtype": "f32",
+        # unit-63 round-4 audit F-1: the fused arm's own dispatch counters
+        # (`_FINETUNE_RUN_DISPATCH_COUNTERS["fused"]`, folded in below)
+        # claim a positive `attention_block_flash_fused_dispatches` --
+        # `flash_capability_gates` admits BF16 only, so `bf16` is the ONLY
+        # dtype this tier's own counters can be self-consistent under
+        # (`finetune_run_dispatch_proof_violations`'s new arm-agnostic
+        # consistency premise). `finetune_run_ab.sh` now passes
+        # `--backbone-dtype bf16` unconditionally on every real leg for
+        # exactly this reason.
+        "backbone_dtype": "bf16",
         "checkpoint_config_sha256": "cfg-sha",
         "checkpoint_weights_sha256": "weights-sha",
         "checkpoint_weights_size_bytes": 12345,
@@ -2157,6 +2166,26 @@ class GoldenProducerAnchoredFieldSetTests(unittest.TestCase):
             tier = load_golden(name)["tiers"]["finetune_run"]
             pairs = ab_merge.dispatch_pairs(tier)  # must not raise
             self.assertEqual({base for base, _fused, _fallback in pairs}, ab_merge.ALL_BASES)
+
+    def test_golden_modernbert_legs_clear_the_full_dispatch_proof_gate(self):
+        """Unit-63 round-4 audit F-1: `modernbert_fused.json`/
+        `modernbert_alloff.json` are the REAL, committed legs a genuine
+        producer invocation (`--backbone-dtype bf16`, CONTRACT 63 Frame's
+        own flash cascade) can emit -- run each one, DIRECTLY off the
+        committed JSON (never `_finetune_run_tier`'s own hand-overridden
+        literal), through the exact merger gate a real leg is held to,
+        including the new arm-agnostic counters-vs-`backbone_dtype`
+        consistency premise and the fused arm's own bf16 premise. `bert_fused.json`
+        is deliberately excluded here -- a real CPU-hermetic BERT leg with
+        no fused attention-block kernel at all (`flash_compiled: false`)
+        was never claimed to clear the flash-cascade-arm's own premise; it
+        is this suite's structural field-set base (`_finetune_run_tier`),
+        not a leg exercising this gate.
+        """
+        fused_tier = load_golden("modernbert_fused")["tiers"]["finetune_run"]
+        self.assertEqual(ab_merge.finetune_run_dispatch_proof_violations("fused", fused_tier), [])
+        alloff_tier = load_golden("modernbert_alloff")["tiers"]["finetune_run"]
+        self.assertEqual(ab_merge.finetune_run_dispatch_proof_violations("alloff", alloff_tier), [])
 
 
 class SignTestMirrorTests(unittest.TestCase):
@@ -2322,6 +2351,54 @@ class FinetuneRunDispatchProofMutantTests(unittest.TestCase):
         tier = _finetune_run_tier(arm="fused", flash_compiled=False)
         v = ab_merge.finetune_run_dispatch_proof_violations("fused", tier)
         self.assertTrue(any("flash_compiled=False" in m for m in v), v)
+
+    def test_fused_arm_with_non_bf16_dtype_and_positive_flash_counter_is_a_contradiction(self):
+        # unit-63 round-4 audit F-1, check 0 (arm-agnostic): the DEFAULT
+        # fused tier's own dispatch counters already claim
+        # `attention_block_flash_fused_dispatches=840` -- overriding only
+        # `backbone_dtype` (never the counters) exercises the
+        # counters-vs-declared-premise contradiction directly, before the
+        # fused arm's own (separate) dtype premise check below is ever
+        # reached.
+        tier = _finetune_run_tier(arm="fused", backbone_dtype="f32")
+        v = ab_merge.finetune_run_dispatch_proof_violations("fused", tier)
+        self.assertTrue(
+            any("counters claim a dispatch the declared dtype forbids" in m for m in v), v
+        )
+
+    def test_alloff_arm_with_non_bf16_dtype_and_positive_flash_counter_is_a_contradiction(self):
+        # Same check 0, exercised on the OTHER arm -- arm-agnostic means
+        # arm-agnostic: an `alloff` leg whose own counters somehow claim a
+        # positive flash-fused dispatch is caught here, before ever
+        # reaching the alloff-specific disabled-op proof below (which would
+        # ALSO flag this leg, for a different reason -- 'disabled but
+        # fired' -- but this check fires first and is the one actually
+        # exercised, since it is unconditional on arm).
+        tier = _finetune_run_tier(arm="alloff", backbone_dtype="f32", attention_block_flash_fused_dispatches=5)
+        v = ab_merge.finetune_run_dispatch_proof_violations("alloff", tier)
+        self.assertTrue(
+            any("counters claim a dispatch the declared dtype forbids" in m for m in v), v
+        )
+
+    def test_fused_arm_with_non_bf16_dtype_is_an_invalid_premise_even_with_clean_counters(self):
+        # unit-63 round-4 audit F-1, the FUSED arm's own defining premise
+        # (independent of check 0 above): force `attention_block_flash_
+        # fused_dispatches` to 0 (the block arm's own absorption picking up
+        # the slack instead, same shape as
+        # `test_fused_arm_with_flash_never_dispatched_is_a_violation`) so
+        # check 0 does NOT fire, isolating the fused-specific dtype premise
+        # check that DOES fire regardless of the (otherwise clean-looking)
+        # counters.
+        tier = _finetune_run_tier(
+            arm="fused",
+            backbone_dtype="f32",
+            attention_block_flash_fused_dispatches=0,
+            attention_block_flash_declined_dispatches=0,
+            attention_block_fused_dispatches=840,
+        )
+        v = ab_merge.finetune_run_dispatch_proof_violations("fused", tier)
+        self.assertTrue(any("fused: backbone_dtype='f32'" in m for m in v), v)
+        self.assertTrue(any("INVALID premise" in m for m in v), v)
 
     def test_fused_arm_with_flash_never_dispatched_is_a_violation(self):
         # `fused_proof`'s own absorption rule tolerates EITHER the flash

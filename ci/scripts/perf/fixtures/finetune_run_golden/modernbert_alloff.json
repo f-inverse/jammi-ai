@@ -7,9 +7,12 @@
   "subcommand": "finetune-run",
   "provenance": {
     "build_sha": "1962891cede8b3beb73289f22de08dd4b47a99b3",
-    "target": "aarch64-apple-darwin",
+    "target": "x86_64-unknown-linux-gnu",
     "profile": "release",
-    "build_features": [],
+    "build_features": [
+      "cuda",
+      "jammi-encoders/flash-attn"
+    ],
     "report_schema_version": 2
   },
   "tiers": {
@@ -26,7 +29,7 @@
         "Wo",
         "Wi"
       ],
-      "backbone_dtype": "f32",
+      "backbone_dtype": "bf16",
       "checkpoint_config_sha256": "64d378211a6e8787f34228ae6f6aa8046aa4f3e41026184e6fd0060dbceb7f1f",
       "checkpoint_weights_sha256": "2fc79747c5b140f766c629420ece0439cb4a5d8259227f31571fc07e4b918ccf",
       "checkpoint_weights_size_bytes": 75884,
@@ -51,7 +54,7 @@
       "early_stopping_metric": "train_loss",
       "eval_cadence": 1,
       "arm": "alloff",
-      "device_name": "cpu",
+      "device_name": "NVIDIA A100-SXM4-80GB",
       "kernels_disabled_requested": [
         "adamw_step_fused",
         "attention_block_flash"
@@ -61,7 +64,10 @@
         "attention_block_flash"
       ],
       "flash_compiled": true,
-      "build_features": [],
+      "build_features": [
+        "cuda",
+        "jammi-encoders/flash-attn"
+      ],
       "attention_arm": "eager",
       "split_rule": "positional_fraction_split",
       "batched_forward": true,

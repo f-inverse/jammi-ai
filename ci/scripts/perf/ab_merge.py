@@ -1538,8 +1538,35 @@ def finetune_run_dispatch_proof_violations(arm, tier):
     `clip_fact_violations`'s own "a claim with no counted fact behind it is
     refused" shape, applied to dispatches instead of the clip counter:
 
+      0. ARM-AGNOSTIC MERGER CONSISTENCY PREMISE (unit-63 round-4 audit
+         F-1, checked on EVERY leg before either arm's own branch below):
+         `flash_capability_gates` DomainMisses the flash cascade whenever
+         `dtype != DType::BF16` (`jammi-encoders/src/modernbert.rs`'s own
+         `dtype_is_bf16` gate) -- a leg reporting
+         `attention_block_flash_fused_dispatches > 0` while its own
+         `backbone_dtype` is not `bf16` is claiming a dispatch its own
+         declared premise forbids; the report is internally contradictory
+         and untrusted outright, never resolved by trusting one of the two
+         fields over the other. This makes the unemittable state (nonzero
+         flash-fused counters at a non-bf16 dtype) unrepresentable at the
+         merger, on top of `finetune_run_ab.sh` now always passing
+         `--backbone-dtype bf16` at the producer (belt-and-braces: a
+         hand-run leg that skips the script, or a future producer
+         regression, still cannot pass this check).
       * `arm == "fused"`:
-          1. PREMISE: `flash_compiled` must be `True`. CONTRACT 63 Frame
+          1. PREMISE: `backbone_dtype` must canonicalize to `bf16`
+             (unit-63 round-4 audit F-1) -- independent of check 0 above,
+             which only fires when the counters HAPPEN to claim a positive
+             flash dispatch. CONTRACT 63 Frame pre-registers the flash
+             cascade, itself BF16-only, as this arm's own admitted branch;
+             a `fused` leg declared at any other dtype cannot exercise the
+             pre-registered differential at all, regardless of what its
+             OTHER counters read (e.g. the block arm's own absorption
+             silently picking up the slack while flash itself never
+             fires) -- an INVALID premise, checked before `flash_compiled`
+             so a runtime dtype mismatch is never misreported as a
+             compile-time one.
+          2. PREMISE: `flash_compiled` must be `True`. CONTRACT 63 Frame
              pre-registers the flash cascade as this arm's own admitted
              branch; a build that never compiled it in cannot possibly
              exercise the pre-registered differential, regardless of what
@@ -1547,16 +1574,16 @@ def finetune_run_dispatch_proof_violations(arm, tier):
              leg whose classification can be trusted at all
              (`finetune_run_ab.sh` builds `--features
              cuda,jammi-encoders/flash-attn` for exactly this reason).
-          2. `fused_proof` (the SAME gate a finetune-step `jammi-fused` leg
+          3. `fused_proof` (the SAME gate a finetune-step `jammi-fused` leg
              is held to, UNCHANGED -- see that function's own doc) must
              return `True`: every ordinary `REQUIRED_PAIRS` base (`ln`,
              `geglu`, `adamw`) independently clears `fused > 0`/`eager == 0`,
              and the CASCADE absorption chain (`attention_block_flash`
              absorbing `attention_block`, which in turn absorbs
              `rope`/`softmax`) is internally consistent.
-          3. THE PRE-REGISTERED BRANCH ITSELF:
+          4. THE PRE-REGISTERED BRANCH ITSELF:
              `attention_block_flash_fused_dispatches > 0`. `fused_proof`'s
-             own absorption rule (2.5) is satisfied whenever EITHER the
+             own absorption rule (3.5) is satisfied whenever EITHER the
              flash cascade OR the block arm independently fires -- correct
              for `finetune-step`'s own flash-vs-block A/B, where either arm
              is a legitimate leg -- but THIS arm specifically claims to be
@@ -1614,7 +1641,51 @@ def finetune_run_dispatch_proof_violations(arm, tier):
         ]
     by_base = {base: (fused, fallback) for base, fused, fallback in pairs}
 
+    # unit-63 round-4 audit F-1 (merger consistency premise, arm-agnostic --
+    # checked before either arm's own branch): `flash_capability_gates`
+    # DomainMisses the whole flash cascade whenever `dtype != DType::BF16`
+    # (`jammi-encoders/src/modernbert.rs`'s own `dtype_is_bf16` gate) -- a
+    # leg cannot have counted a positive `attention_block_flash_fused_
+    # dispatches` unless the backbone it ran actually admitted BF16. A
+    # report claiming BOTH a positive flash-fused count AND a non-bf16
+    # `backbone_dtype` is not a leg whose classification can be trusted at
+    # all -- the counters and the declared premise cannot both be true, so
+    # this makes the unemittable-state class itself unrepresentable, rather
+    # than trusting whichever one of the two a downstream check happens to
+    # read first.
+    flash_fused_claimed, _flash_declined_claimed = by_base.get("attention_block_flash", (0, 0))
+    declared_dtype = canonicalize_identity_field("backbone_dtype", tier.get("backbone_dtype"))
+    if flash_fused_claimed > 0 and declared_dtype != "bf16":
+        return [
+            f"{arm}: attention_block_flash_fused_dispatches={flash_fused_claimed!r} but "
+            f"backbone_dtype={tier.get('backbone_dtype')!r} -- counters claim a dispatch the "
+            "declared dtype forbids (flash_capability_gates admits only BF16, "
+            "modernbert.rs's own dtype_is_bf16 gate); this leg's own report is internally "
+            "contradictory, not merely unclassifiable"
+        ]
+
     if arm == "fused":
+        # A FUSED leg's own defining premise (unit-63 round-4 audit F-1,
+        # independent of the counter-vs-dtype contradiction check above,
+        # which only fires when the counters HAPPEN to claim a positive
+        # dispatch): CONTRACT 63 Frame pre-registers the flash cascade as
+        # this arm's own admitted branch, and that branch is BF16-only
+        # (`flash_capability_gates`'s `dtype_is_bf16` gate) -- a `fused`
+        # leg declaring any OTHER `backbone_dtype` cannot possibly exercise
+        # the pre-registered differential, regardless of what its counters
+        # happen to read (e.g. the block arm's own absorption silently
+        # picking up the slack while flash itself never fires) -- an
+        # INVALID premise outright, checked before `flash_compiled` so a
+        # build/runtime mismatch is never misreported as a compile-time one.
+        if declared_dtype != "bf16":
+            return [
+                f"fused: backbone_dtype={tier.get('backbone_dtype')!r} -- CONTRACT 63 Frame "
+                "pre-registers the flash cascade as this arm's own admitted branch, and "
+                "flash_capability_gates admits BF16 only (modernbert.rs's own dtype_is_bf16 "
+                "gate); a 'fused' leg run at any other dtype cannot exercise the pre-registered "
+                "differential at all -- an INVALID premise, not a leg whose classification can "
+                "be trusted"
+            ]
         flash_compiled = tier.get("flash_compiled")
         if flash_compiled is not True:
             return [

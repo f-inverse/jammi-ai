@@ -350,6 +350,23 @@ run_leg() {
     # trajectory is never truncated by an early-stopping decision the sign
     # test would then have to account for.
     --early-stopping-patience 10000
+    # unit-63 round-4 audit F-1: `main.rs`'s own `--backbone-dtype` default
+    # is `f32` (`FinetuneRunArgs::backbone_dtype`'s own `#[arg(long,
+    # default_value = "f32")]`), and `flash_capability_gates` DomainMisses
+    # the whole flash cascade whenever `dtype != DType::BF16`
+    # (`jammi-encoders/src/modernbert.rs`'s own `dtype_is_bf16` gate). CONTRACT
+    # 63 Frame pre-registers the flash cascade as the `fused` arm's own
+    # admitted branch, so an unset `--backbone-dtype` (silently f32) makes
+    # `attention_block_flash` unable to fire on EITHER arm's real leg --
+    # the exact same null-differential class the coordinator correction
+    # above already fixed for the build feature list. `backbone_dtype` is
+    # also IDENTITY FIELD #9 on `FINETUNE_RUN_IDENTITY_FIELDS`
+    # (`identity_fields.py`) -- cross-arm AND cross-seed homogeneity
+    # requires every leg (both arms, every seed, INCLUDING the lr=0
+    # control below) to report the SAME value, so this is passed
+    # unconditionally here in the one `run_leg` both loops share, never
+    # only on the `fused` arm.
+    --backbone-dtype bf16
     --work-dir "$work_dir"
   )
   if [ -n "$lr_override" ]; then

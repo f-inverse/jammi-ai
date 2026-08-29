@@ -41,6 +41,11 @@ on:
         required: false
         type: string
         default: "mnrl"
+      lr0_seeds:
+        description: "Comma-separated lr=0 RED control seeds (default: empty, skipped — CONTRACT Frame 'RED control: lr=0 arm x2 seeds fails learning-happened', unit-63 audit advisory (b))."
+        required: false
+        type: string
+        default: ""
   pull_request:
     types: [labeled]
 
@@ -95,6 +100,7 @@ jobs:
           HOWWELL_MODEL_DIR: ${{ steps.resolve.outputs.model_dir }}
           HOWWELL_SEEDS: ${{ github.event.inputs.seeds || '1,2,3,4,5,6,7,8,9,10,11,12' }}
           HOWWELL_OBJECTIVE: ${{ github.event.inputs.objective || 'mnrl' }}
+          HOWWELL_LR0_SEEDS: ${{ github.event.inputs.lr0_seeds || '' }}
         run: |
           set +e
           bash ci/scripts/runpod_gpu_howwell.sh
@@ -105,3 +111,19 @@ jobs:
       - name: Annotate a capacity failure
         if: always() && steps.howwell.outputs.rc == '75'
         run: echo "::warning::how-well A/B FAILED for capacity — no A100 on RunPod (SUPPLY_CONSTRAINT), not a code/statistical regression. The run stays red (nothing was proven); re-run once capacity returns."
+
+      # unit-63 audit advisory (c): the merged artifact previously never left
+      # the pod at all. runpod_gpu_howwell.sh itself rsyncs it to
+      # .gpu-pull/how-well/ before the pod is torn down; this step makes
+      # that local pull retrievable from the CI run too (the campaign's own
+      # committed-evidence path — a human still decides which run(s) get
+      # committed under a crate's own artifacts/ tree, this just keeps the
+      # bytes from being lost once the runner itself is recycled).
+      - name: Upload merged how-well artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: how-well-artifact-${{ github.run_id }}
+          path: .gpu-pull/how-well/
+          if-no-files-found: warn
+          retention-days: 14

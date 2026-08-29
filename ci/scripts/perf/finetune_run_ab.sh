@@ -107,6 +107,27 @@
 #   FINETUNE_RUN_AB_OUT_DIR    where the raw legs + merged report land
 #                              (default "<repo>/.finetune-run-ab-report/
 #                              <UTC timestamp>").
+#   FINETUNE_RUN_AB_PROVISION_PYTHON
+#                              the python interpreter invoked for the ONE
+#                              provisioning step above (`derive_heldout_
+#                              fixture.py --emit-train-pairs`) -- default
+#                              "python3" (a bare checkout's system
+#                              interpreter, which is enough when
+#                              `train_pairs.jsonl` is already pre-staged, so
+#                              this step never actually runs). A pod driver
+#                              (e.g. `ci/scripts/runpod_gpu_howwell.sh`) that
+#                              provisions a dedicated venv for
+#                              `jammi_cookbook`/numpy/pyarrow/requests (unit
+#                              63 audit finding 4 -- a bare pod has no pip on
+#                              PATH and this script's own producer binary
+#                              build/run never needs any of those packages)
+#                              points this at that venv's own interpreter
+#                              instead; every OTHER step in this script
+#                              (verification, the cargo build, every measured
+#                              leg) stays on plain "python3"/the system
+#                              toolchain -- MEASURED legs are deliberately
+#                              venv-free, only this one pre-run provisioning
+#                              call is not.
 #   FINETUNE_RUN_AB_DRY_RUN=1  print every command this script would run
 #                              instead of executing it, and write a
 #                              `{"tool":"dry-run",...}` stub per leg so the
@@ -159,6 +180,8 @@ FINETUNE_RUN_AB_LR="${FINETUNE_RUN_AB_LR:-}"
 FINETUNE_RUN_AB_LR0_SEEDS="${FINETUNE_RUN_AB_LR0_SEEDS:-}"
 FINETUNE_RUN_AB_CUDA="${FINETUNE_RUN_AB_CUDA:-0}"
 FINETUNE_RUN_AB_CPU="${FINETUNE_RUN_AB_CPU:-0}"
+# unit-63 audit finding 4 -- see this script's own env-var doc above.
+FINETUNE_RUN_AB_PROVISION_PYTHON="${FINETUNE_RUN_AB_PROVISION_PYTHON:-python3}"
 
 FIXTURE_DIR="$REPO_ROOT/cookbook/fixtures/finetune_heldout"
 TRAIN_JSONL="${TRAIN_JSONL:-$FIXTURE_DIR/train_pairs.jsonl}"
@@ -190,11 +213,27 @@ if [ "$FINETUNE_RUN_AB_DRY_RUN" != "1" ]; then
 
   # --- PRE-RUN provisioning (CONTRACT amendment 2026-08-28b) -- see module
   # doc "PRE-RUN PROVISIONING" above. Outside every measured leg: this runs
-  # once, before the sweep loop, never inside run_leg.
+  # once, before the sweep loop, never inside run_leg. Emit is SKIPPED
+  # whenever `$TRAIN_JSONL` is already present (an operator/pod driver may
+  # pre-stage it) -- byte-verification below still ALWAYS runs regardless.
+  #
+  # Unit-63 audit finding 4: invoked from `cookbook/book` as cwd, per that
+  # directory's own fixture README ("cd cookbook/book && python scripts/
+  # derive_heldout_fixture.py ...") -- `derive_heldout_fixture.py` itself
+  # resolves every path it reads/writes off `__file__`, never cwd, so this
+  # is the DOCUMENTED invocation convention, not a functional requirement of
+  # that script; `$FINETUNE_RUN_AB_PROVISION_PYTHON` (default "python3") is
+  # this call's own interpreter knob -- a bare checkout's system Python
+  # cannot `import jammi_cookbook`/numpy (no sys.path hack exists any more,
+  # see that script's own move-history), so a pod driver that provisions a
+  # dedicated venv for this ONE step points this env var at that venv's
+  # interpreter instead (see the env-var's own doc above).
   if [ ! -f "$TRAIN_JSONL" ]; then
     echo "::notice::$TRAIN_JSONL not found -- provisioning via 'derive_heldout_fixture.py --emit-train-pairs' (network-backed, checksum-gated fetch of train text; outside measured legs)."
-    python3 "$REPO_ROOT/cookbook/book/scripts/derive_heldout_fixture.py" --emit-train-pairs \
-      || { echo "::error::train-pairs provisioning failed (cookbook/book/scripts/derive_heldout_fixture.py --emit-train-pairs) — refusing before any leg runs." >&2; exit 1; }
+    (cd "$REPO_ROOT/cookbook/book" && "$FINETUNE_RUN_AB_PROVISION_PYTHON" scripts/derive_heldout_fixture.py --emit-train-pairs) \
+      || { echo "::error::train-pairs provisioning failed (cookbook/book/scripts/derive_heldout_fixture.py --emit-train-pairs, invoked from cookbook/book via \$FINETUNE_RUN_AB_PROVISION_PYTHON='$FINETUNE_RUN_AB_PROVISION_PYTHON') — refusing before any leg runs." >&2; exit 1; }
+  else
+    echo "::notice::$TRAIN_JSONL already present -- skipping the emit step (pre-staged); byte-verification below still always runs."
   fi
   # ALWAYS byte-verify -- whether train_pairs.jsonl was just emitted above or
   # was already present on this pod from a prior run. A stale/hand-edited

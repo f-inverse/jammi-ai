@@ -126,7 +126,12 @@ struct FinetuneRunArgs {
     heldout_ids: PathBuf,
     /// The held-out fixture's text content — same JSONL shape as
     /// `--train-jsonl`, joined to `--heldout-ids`' rows BY id (row order
-    /// need not match; `--heldout-ids` alone decides scoring order).
+    /// need not match; `--heldout-ids` alone decides scoring order). This
+    /// file's own bytes (the whole file, as read — not any per-row
+    /// re-derivation) are what `heldout_pairs_sha256` hashes (unit-63
+    /// adversarial-audit finding 5(a): the held-out TEXT is a total
+    /// determinant of every per-example loss `d_i`, so it must be
+    /// content-anchored exactly as `--heldout-ids` already is).
     #[arg(long)]
     heldout_jsonl: PathBuf,
     #[arg(long, default_value_t = 42)]
@@ -842,14 +847,14 @@ async fn main() -> std::process::ExitCode {
                     return std::process::ExitCode::FAILURE;
                 }
             };
-            let (train_pairs, dataset_sha256) = match load_train_jsonl(&train_jsonl) {
+            let (train_pairs, train_pairs_file_sha256) = match load_train_jsonl(&train_jsonl) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("finetune-run: --train-jsonl {train_jsonl:?}: {e}");
                     return std::process::ExitCode::FAILURE;
                 }
             };
-            let (heldout_pairs, heldout_ids_sha256) =
+            let (heldout_pairs, heldout_ids_sha256, heldout_pairs_sha256) =
                 match load_heldout_fixture(&heldout_ids, &heldout_jsonl) {
                     Ok(v) => v,
                     Err(e) => {
@@ -888,8 +893,9 @@ async fn main() -> std::process::ExitCode {
                 arm,
                 train_pairs,
                 heldout_pairs,
-                dataset_sha256,
+                train_pairs_file_sha256,
                 heldout_ids_sha256,
+                heldout_pairs_sha256,
                 seed,
                 epochs,
                 eval_cadence,
@@ -1088,8 +1094,21 @@ struct TripletRow {
 /// Load a JSONL file of [`TripletRow`]s, in file order, into
 /// [`finetune_run::IdTriplet`]s keyed by `anchor_id` — the shape
 /// `--train-jsonl` supplies. Returns the rows plus the sha256 (hex) of the
-/// file's own bytes (this run's `dataset_sha256` — MEASURED off the file
-/// this run actually read, never a caller-transcribed digest).
+/// file's own bytes (this run's `train_pairs_file_sha256` — MEASURED off the
+/// file this run actually read, never a caller-transcribed digest).
+///
+/// This is the RAW BYTES of one file this tier read directly, distinct in
+/// KIND from the committed fixture manifest's own `dataset_sha256` (a
+/// Merkle digest over PER-PAIR content hashes, built by a producer script
+/// off-process — see `ci/scripts/perf/finetune_run_ab.sh`'s
+/// `train_ids_sha256.json`): the two are different quantities computed by
+/// different mechanisms over overlapping-but-not-identical inputs, so this
+/// field earns its own name rather than colliding with that one under a
+/// shared spelling (unit-63 adversarial-audit finding 5(b)). Content-
+/// anchoring this run's train file against the committed
+/// `train_ids_sha256.json` manifest is the PRODUCER's pre-run provisioning
+/// check, not something this tier verifies for itself — it only records the
+/// digest of the bytes it actually read.
 fn load_train_jsonl(
     path: &std::path::Path,
 ) -> Result<(Vec<finetune_run::IdTriplet>, String), Box<dyn std::error::Error>> {
@@ -1121,11 +1140,18 @@ fn load_train_jsonl(
 /// Load the held-out fixture: `heldout_ids` names the COMMITTED order
 /// (`anchor_id\tpositive_id\tnegative_id` per line — this file's bytes are
 /// what `heldout_ids_sha256` hashes, MEASURED here, never transcribed);
-/// `heldout_jsonl` supplies the TEXT, joined to each id row BY `anchor_id`.
+/// `heldout_jsonl` supplies the TEXT, joined to each id row BY `anchor_id` —
+/// its own bytes are what `heldout_pairs_sha256` hashes, likewise MEASURED
+/// here off the file this run actually read (unit-63 adversarial-audit
+/// finding 5(a): the held-out TEXT is a total determinant of every per-
+/// example loss `d_i`, and until this fix it was hashed nowhere at all —
+/// only the id ORDER was anchored, never the anchor/positive/negative TEXT
+/// content a caller could swap under a constant id list without changing
+/// either committed digest).
 fn load_heldout_fixture(
     heldout_ids: &std::path::Path,
     heldout_jsonl: &std::path::Path,
-) -> Result<(Vec<finetune_run::IdTriplet>, String), Box<dyn std::error::Error>> {
+) -> Result<(Vec<finetune_run::IdTriplet>, String, String), Box<dyn std::error::Error>> {
     let ids_bytes = std::fs::read(heldout_ids)?;
     let heldout_ids_sha256 = {
         use sha2::{Digest, Sha256};
@@ -1135,7 +1161,14 @@ fn load_heldout_fixture(
     };
     let ids_text = String::from_utf8(ids_bytes)?;
 
-    let jsonl_text = std::fs::read_to_string(heldout_jsonl)?;
+    let jsonl_bytes = std::fs::read(heldout_jsonl)?;
+    let heldout_pairs_sha256 = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&jsonl_bytes);
+        hex::encode(hasher.finalize())
+    };
+    let jsonl_text = String::from_utf8(jsonl_bytes)?;
     let mut by_anchor: std::collections::HashMap<String, (String, String, String)> =
         std::collections::HashMap::new();
     for (i, line) in jsonl_text.lines().enumerate() {
@@ -1175,7 +1208,7 @@ fn load_heldout_fixture(
             negative: negative_text,
         });
     }
-    Ok((rows, heldout_ids_sha256))
+    Ok((rows, heldout_ids_sha256, heldout_pairs_sha256))
 }
 
 /// The `finetune-run` subcommand: run the tier (a resume-cycled multi-epoch

@@ -259,17 +259,25 @@ pub struct FinetuneRunParams {
     /// order is scoring identity (CONTRACT H1: "the batch partition IS
     /// identity"), never re-sorted or shuffled by this tier.
     pub heldout_pairs: Vec<IdTriplet>,
-    /// sha256 (hex) of the training-set content this run actually read —
-    /// computed by the CALLER off the committed fixture bytes (docs-ci/
-    /// cookbook owns the fixture; this tier only records the digest it was
-    /// told, exactly as `checkpoint_config_sha256`/`checkpoint_weights_sha256`
-    /// are computed off bytes this tier reads directly, but `dataset_sha256`
-    /// is over TEXT ROWS the caller assembled, not a single file this tier
-    /// can re-hash on its own).
-    pub dataset_sha256: String,
+    /// sha256 (hex) of the `--train-jsonl` FILE's own raw bytes, MEASURED by
+    /// `main.rs::load_train_jsonl` off the file this run actually opened —
+    /// never a caller-transcribed digest, and NOT the same quantity as the
+    /// committed fixture manifest's own `dataset_sha256` (a Merkle over
+    /// per-pair digests, built off-process); see
+    /// [`crate::report::FinetuneRunTier::train_pairs_file_sha256`]'s own doc
+    /// for why this field carries a distinct name (unit-63 adversarial-audit
+    /// finding 5(b)).
+    pub train_pairs_file_sha256: String,
     /// sha256 (hex) of the held-out id list's committed content — likewise
     /// caller-supplied (the fixture manifest's own `heldout_ids_sha256`).
     pub heldout_ids_sha256: String,
+    /// sha256 (hex) of the `--heldout-jsonl` FILE's own raw bytes, MEASURED
+    /// by `main.rs::load_heldout_fixture` off the file this run actually
+    /// opened — the held-out TEXT is a total determinant of every per-
+    /// example loss `d_i`, so (like `heldout_ids_sha256`) it must be
+    /// content-anchored, never merely trusted by filename (unit-63
+    /// adversarial-audit finding 5(a)).
+    pub heldout_pairs_sha256: String,
     pub seed: u64,
     /// Optimizer/schedule/objective knobs. `early_stopping_patience` MUST be
     /// `10_000` (CONTRACT Frame's never-stops idiom) — [`run`] refuses a
@@ -874,9 +882,7 @@ pub fn run(
             Objective::Mnrl => None,
         },
         target_modules: params.target_modules.clone(),
-        batched_forward: true,
         backbone_dtype: format!("{:?}", params.backbone_dtype).to_lowercase(),
-        steps_measured: cumulative_steps,
         checkpoint_config_sha256,
         checkpoint_weights_sha256,
         checkpoint_weights_size_bytes,
@@ -890,10 +896,9 @@ pub fn run(
         weight_decay: params.weight_decay,
         grad_accum: params.gradient_accumulation_steps,
         validation_fraction: params.validation_fraction,
-        split_rule: "positional_fraction_split".to_string(),
-        split_seed: params.seed,
-        dataset_sha256: params.dataset_sha256.clone(),
+        train_pairs_file_sha256: params.train_pairs_file_sha256.clone(),
         heldout_ids_sha256: params.heldout_ids_sha256.clone(),
+        heldout_pairs_sha256: params.heldout_pairs_sha256.clone(),
         heldout_batch_partition_sha256: held_out.batch_partition_sha256.clone(),
         embedding_loss: params.objective.as_str().to_string(),
         temperature: match params.objective {
@@ -915,6 +920,9 @@ pub fn run(
         flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
         build_features: crate::report::build_features(),
         attention_arm: resolved_attention_arm,
+        split_rule: "positional_fraction_split".to_string(),
+        batched_forward: true,
+        steps_measured: cumulative_steps,
 
         admission_is_dense,
         learning_happened_delta: first_probe - last_probe,

@@ -1876,7 +1876,87 @@ pub struct EpochHeldOut {
 /// and `row_lengths` read a DIFFERENT `NullMeans` reason here than there,
 /// because a full multi-epoch real-text run has no per-tier
 /// "discard-before-timing" convention and no single fixed row-lengths vector
-/// over variable-length real text).
+/// over variable-length real text) — EXCEPT `batched_forward` and
+/// `steps_measured`, reclassified below.
+///
+/// ## Unit-63 adversarial-audit finding 5: identity-completeness fixes
+///
+/// A round-5 audit found this set incomplete in two ways and non-honest in
+/// two others. Fixed here:
+///
+/// (a) The held-out fixture's TEXT — a total determinant of every per-
+/// example loss `d_i`, since `evaluate_held_out` scores the actual
+/// anchor/positive/negative strings, not merely their ids — was hashed
+/// NOWHERE: only [`Self::heldout_ids_sha256`] (the id ORDER) was anchored. A
+/// caller could swap every row's text under a constant id list and neither
+/// committed digest would move. [`Self::heldout_pairs_sha256`] closes this:
+/// sha256 of the `--heldout-jsonl` file's own bytes, measured at load
+/// (`main.rs::load_heldout_fixture`), never transcribed.
+///
+/// (b) [`Self::train_pairs_file_sha256`] (formerly spelled `dataset_sha256`
+/// on this struct) is the RAW BYTES of the `--train-jsonl` file this run
+/// read — a DIFFERENT quantity from the committed fixture manifest's own
+/// `dataset_sha256` (a Merkle digest over PER-PAIR content hashes, built
+/// off-process by a producer script), which happened to share the same
+/// name. Two different quantities under one name meant neither anchored the
+/// other — renamed to `train_pairs_file_sha256` so the field states exactly
+/// what it hashes, and documents that content-anchoring this run's train
+/// file against the committed `train_ids_sha256.json` manifest is the
+/// PRODUCER's pre-run provisioning check (docs-ci/cookbook domain, landing
+/// separately), not something this tier verifies for itself.
+///
+/// (c) Four identity slots could not vary independently of an already-
+/// admitted field or a build-time constant, so their presence in the
+/// COMPARISON set implied a discriminating power they never had:
+///   * `split_rule` — a hardcoded literal (`"positional_fraction_split"`),
+///     the same string on every run this binary can ever produce. Moved to
+///     [`Self::PROVENANCE_FIELDS`]: recorded for legibility, never compared
+///     (a constant cannot fail to match).
+///   * `split_seed` — DROPPED entirely. It was defined as `params.seed`
+///     verbatim (`TrainingDataLoader::split` takes no separate seed
+///     parameter), so it was a pure, unconditional duplicate of the
+///     already-identity [`Self::seed`] field — not merely constant-valued
+///     like `split_rule`, but LITERALLY the same number under a second
+///     name. Keeping it would have implied a "split seed" knob distinct
+///     from the run seed that does not exist; two legs agreeing on `seed`
+///     always agreed on `split_seed` too, so it added a slot to the count
+///     without adding an independent check.
+///   * `batched_forward` — always `true` (see this tier's own doc comment
+///     on the field: "production has no un-batched arm for this tier to
+///     record `false` for"). A structural fact about what this binary's
+///     `encode_chunk` call always does, not a per-run knob — moved to
+///     [`Self::PROVENANCE_FIELDS`] alongside `flash_compiled`/
+///     `build_features` (other always-same-shape build facts already
+///     recorded there rather than compared).
+///   * `heldout_batch_partition_sha256` — KEPT in [`Self::IDENTITY_FIELDS`],
+///     unlike the three above, despite ALSO being a pure function of two
+///     already-identity inputs (the held-out id order — now doubly anchored
+///     by [`Self::heldout_ids_sha256`] + [`Self::heldout_pairs_sha256`] —
+///     and [`Self::batch`]). The distinction: `split_rule`/`split_seed`/
+///     `batched_forward` are constants or literal echoes with NO algorithm
+///     in between input and value, so comparing them can never catch
+///     anything a raw-input comparison would miss. `heldout_batch_partition_sha256`
+///     is instead the output of a real CODE PATH — the trainer's own
+///     partitioning algorithm inside `evaluate_held_out` — applied to those
+///     inputs; CONTRACT H1 names this "the batch partition IS identity"
+///     precisely because a future implementation (this producer's own code
+///     changing, or a second cross-producer implementation under the same
+///     CONTRACT) could partition the SAME inputs differently and silently
+///     score a different comparison than the one `heldout_ids`/`batch`
+///     alone would lead a reader to expect. Comparing the REALIZED
+///     partition hash directly is therefore a genuine cross-arm equality
+///     guard against that algorithmic divergence, not a redundant echo of
+///     inputs already in the set.
+///
+/// (d) Advisory: [`Self::steps_measured`] is a MEASURED OUTCOME of running
+/// (`TrainingResult::total_steps` summed across the resume-cycle) — not a
+/// premise the run was configured under — so it does not belong in the
+/// comparison-identity set at all (contrast `FinetuneStepTier`'s own
+/// `steps_measured`, which genuinely is identity there because two
+/// `finetune-step` legs at a different measured step count computed a
+/// different amount of work by definition of that tier's design). Moved to
+/// [`Self::PROVENANCE_FIELDS`]: still recorded on every run, never a
+/// comparison key here.
 ///
 /// ## `margin`/`temperature`: objective-selected nullness (H4a-delta, CONTRACT
 /// amendment 2026-08-28)
@@ -1915,16 +1995,7 @@ pub struct FinetuneRunTier {
     /// [`Self::temperature`]'s doc for MNRL's own scale knob.
     pub margin: Option<f64>,
     pub target_modules: Vec<String>,
-    /// Always `true`: `TrainingLoop::encode_chunk`'s `Pairs`/`Triplet` arms
-    /// always encode anchor+positive(+negative) in ONE joined forward via
-    /// `encode_groups` — production has no un-batched arm for this tier to
-    /// record `false` for (unlike `finetune-step`, which offers both as a
-    /// within-run A/B).
-    pub batched_forward: bool,
     pub backbone_dtype: String,
-    /// Cumulative optimizer steps (`TrainingResult::total_steps` summed)
-    /// across every resume-cycled epoch leg this run took.
-    pub steps_measured: usize,
     pub checkpoint_config_sha256: String,
     pub checkpoint_weights_sha256: String,
     pub checkpoint_weights_size_bytes: u64,
@@ -1950,20 +2021,27 @@ pub struct FinetuneRunTier {
     pub weight_decay: f64,
     pub grad_accum: usize,
     pub validation_fraction: f64,
-    /// How `run()`'s internal early-stopping validation slice was carved
-    /// out of the TRAIN rows this tier fed it — `TrainingDataLoader::split`
-    /// is a plain positional (unshuffled) fraction split, never RNG-based,
-    /// so this is a fixed constant across every leg this tier can produce.
-    pub split_rule: String,
-    /// The run's overall seed also governs (indirectly, via how the caller
-    /// assembled `train_pairs`' row order) the split point — `split()`
-    /// itself takes no separate seed parameter.
-    pub split_seed: u64,
-    pub dataset_sha256: String,
+    /// sha256 (hex) of the `--train-jsonl` file's own raw bytes — see this
+    /// struct's own doc, finding 5(b), for why this is named distinctly
+    /// from the committed fixture manifest's `dataset_sha256` (a different
+    /// quantity: a Merkle over per-pair digests, not this file's bytes).
+    pub train_pairs_file_sha256: String,
     pub heldout_ids_sha256: String,
+    /// sha256 (hex) of the `--heldout-jsonl` file's own raw bytes — see this
+    /// struct's own doc, finding 5(a): the held-out TEXT is a total
+    /// determinant of every per-example loss `d_i`, so (like
+    /// [`Self::heldout_ids_sha256`]'s id-order anchor) it must be content-
+    /// anchored, never merely trusted by filename.
+    pub heldout_pairs_sha256: String,
     /// `HeldOutLoss::batch_partition_sha256` at the FINAL epoch — the
     /// partition the reported [`Self::held_out_example_mean`] was scored
     /// under (CONTRACT H1 v2 delta 9: a property of `(model, partition)`).
+    /// KEPT in identity despite being derivable from
+    /// `(heldout_ids_sha256, heldout_pairs_sha256, batch)` — see this
+    /// struct's own doc, finding 5(c), for why this one (unlike
+    /// `split_rule`/`split_seed`/`batched_forward`) earns its own
+    /// comparison slot: it is the REALIZED OUTPUT of a partitioning
+    /// algorithm, not a constant or a literal echo of another field.
     pub heldout_batch_partition_sha256: String,
     /// `"triplet"` or `"mnrl"` — [`crate::finetune_run::Objective::as_str`],
     /// selected by the run's `--objective` flag (CONTRACT amendment
@@ -2002,6 +2080,29 @@ pub struct FinetuneRunTier {
     /// `FinetuneStepTier::attention_arm`'s own semantics), but PROVENANCE
     /// here (not identity) for the same reason `arm` is.
     pub attention_arm: String,
+    /// How `run()`'s internal early-stopping validation slice was carved
+    /// out of the TRAIN rows this tier fed it — `TrainingDataLoader::split`
+    /// is a plain positional (unshuffled) fraction split, never RNG-based,
+    /// so this is a fixed constant across every leg this tier can ever
+    /// produce. PROVENANCE, not identity (struct doc, finding 5(c)): a
+    /// hardcoded literal has no discriminating power, so comparing it can
+    /// never catch anything.
+    pub split_rule: String,
+    /// Always `true`: `TrainingLoop::encode_chunk`'s `Pairs`/`Triplet` arms
+    /// always encode anchor+positive(+negative) in ONE joined forward via
+    /// `encode_groups` — production has no un-batched arm for this tier to
+    /// record `false` for (unlike `finetune-step`, which offers both as a
+    /// within-run A/B). PROVENANCE, not identity (struct doc, finding
+    /// 5(c)): a build-time structural constant, never a per-run knob.
+    pub batched_forward: bool,
+    /// Cumulative optimizer steps (`TrainingResult::total_steps` summed)
+    /// across every resume-cycled epoch leg this run took. PROVENANCE, not
+    /// identity (struct doc, advisory (d)): a MEASURED OUTCOME of running,
+    /// not a premise the run was configured under — unlike
+    /// `FinetuneStepTier::steps_measured`, where two legs at a different
+    /// measured step count computed a different amount of work by that
+    /// tier's own design.
+    pub steps_measured: usize,
 
     // ── Premise legs (CONTRACT H4: "recorded per run, conjunctive, for
     //    the merger to refuse on") ───────────────────────────────────────
@@ -2052,12 +2153,20 @@ pub struct FinetuneRunTier {
 impl FinetuneRunTier {
     /// The comparison identity: `FinetuneStepTier`'s 18 (minus
     /// `attention_arm`, moved to provenance — see struct doc) plus the 18
-    /// new fields PLAN (d) / CONTRACT H4 name. 17 + 18 = 35.
+    /// new fields PLAN (d) / CONTRACT H4 name, THEN the unit-63 adversarial-
+    /// audit finding-5 fixes applied: `split_rule`, `split_seed`,
+    /// `batched_forward`, and `steps_measured` removed (`split_seed` dropped
+    /// entirely; the other three reclassified to [`Self::PROVENANCE_FIELDS`]
+    /// — see struct doc for the full per-field rationale), `dataset_sha256`
+    /// renamed to `train_pairs_file_sha256`, and `heldout_pairs_sha256`
+    /// added. 17 + 18 − 4 + 1 = 32.
     ///
     /// DISJOINT from [`Self::PROVENANCE_FIELDS`] (E3's convention, not
     /// `FinetuneStepTier`'s superset one) — see struct doc.
     pub const IDENTITY_FIELDS: &'static [(&'static str, Nullable)] = &[
-        // FinetuneStepTier's 18, minus attention_arm (17 entries).
+        // FinetuneStepTier's 18, minus attention_arm (17 entries), minus
+        // `batched_forward`/`steps_measured` (finding 5(c)/advisory (d) —
+        // both reclassified to PROVENANCE_FIELDS below).
         ("seed", Nullable::NonNull),
         ("batch", Nullable::NonNull),
         ("seq", Nullable::NonNull),
@@ -2071,9 +2180,7 @@ impl FinetuneRunTier {
         // section.
         ("margin", Nullable::NullMeans("objective is mnrl")),
         ("target_modules", Nullable::NonNull),
-        ("batched_forward", Nullable::NonNull),
         ("backbone_dtype", Nullable::NonNull),
-        ("steps_measured", Nullable::NonNull),
         ("checkpoint_config_sha256", Nullable::NonNull),
         ("checkpoint_weights_sha256", Nullable::NonNull),
         ("checkpoint_weights_size_bytes", Nullable::NonNull),
@@ -2091,7 +2198,12 @@ impl FinetuneRunTier {
                  whole multi-epoch run",
             ),
         ),
-        // New (18 entries).
+        // New, minus `split_rule`/`split_seed` (finding 5(c): a constant and
+        // a literal duplicate of `seed`, neither a genuine determinant),
+        // `dataset_sha256` renamed to `train_pairs_file_sha256` (finding
+        // 5(b): distinct from the fixture manifest's own `dataset_sha256`),
+        // plus `heldout_pairs_sha256` added (finding 5(a): the held-out
+        // TEXT was hashed nowhere before this fix).
         ("epochs", Nullable::NonNull),
         ("lr", Nullable::NonNull),
         ("schedule", Nullable::NonNull),
@@ -2099,10 +2211,9 @@ impl FinetuneRunTier {
         ("weight_decay", Nullable::NonNull),
         ("grad_accum", Nullable::NonNull),
         ("validation_fraction", Nullable::NonNull),
-        ("split_rule", Nullable::NonNull),
-        ("split_seed", Nullable::NonNull),
-        ("dataset_sha256", Nullable::NonNull),
+        ("train_pairs_file_sha256", Nullable::NonNull),
         ("heldout_ids_sha256", Nullable::NonNull),
+        ("heldout_pairs_sha256", Nullable::NonNull),
         ("heldout_batch_partition_sha256", Nullable::NonNull),
         ("embedding_loss", Nullable::NonNull),
         ("temperature", Nullable::NullMeans("objective is triplet")),
@@ -2114,7 +2225,12 @@ impl FinetuneRunTier {
 
     /// Provenance — recorded, present on every run, but NEVER a comparison
     /// key (see struct doc for why `arm`/`attention_arm` live here rather
-    /// than in [`Self::IDENTITY_FIELDS`]).
+    /// than in [`Self::IDENTITY_FIELDS`]). Grew 7 -> 10 with the unit-63
+    /// adversarial-audit finding-5(c)/advisory-(d) reclassifications:
+    /// `split_rule` (a hardcoded constant), `batched_forward` (a build-time
+    /// structural fact), and `steps_measured` (a measured outcome, not a
+    /// premise) — none of the three is a genuine comparison determinant;
+    /// see struct doc for the full per-field rationale.
     pub const PROVENANCE_FIELDS: &'static [(&'static str, Nullable)] = &[
         ("arm", Nullable::NonNull),
         ("device_name", Nullable::NonNull),
@@ -2123,6 +2239,9 @@ impl FinetuneRunTier {
         ("flash_compiled", Nullable::NonNull),
         ("build_features", Nullable::NonNull),
         ("attention_arm", Nullable::NonNull),
+        ("split_rule", Nullable::NonNull),
+        ("batched_forward", Nullable::NonNull),
+        ("steps_measured", Nullable::NonNull),
     ];
 }
 
@@ -2869,9 +2988,7 @@ mod tests {
             lora_dropout: 0.05,
             margin: Some(0.3),
             target_modules: vec!["Wqkv".to_string()],
-            batched_forward: true,
             backbone_dtype: "f32".to_string(),
-            steps_measured: 3,
             checkpoint_config_sha256: "a".repeat(64),
             checkpoint_weights_sha256: "b".repeat(64),
             checkpoint_weights_size_bytes: 1024,
@@ -2885,10 +3002,9 @@ mod tests {
             weight_decay: 0.01,
             grad_accum: 1,
             validation_fraction: 0.1,
-            split_rule: "positional_fraction_split".to_string(),
-            split_seed: 42,
-            dataset_sha256: "c".repeat(64),
+            train_pairs_file_sha256: "c".repeat(64),
             heldout_ids_sha256: "d".repeat(64),
+            heldout_pairs_sha256: "f".repeat(64),
             heldout_batch_partition_sha256: "e".repeat(64),
             embedding_loss: "triplet".to_string(),
             temperature: None,
@@ -2903,6 +3019,9 @@ mod tests {
             flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
             build_features: build_features(),
             attention_arm: "fused".to_string(),
+            split_rule: "positional_fraction_split".to_string(),
+            batched_forward: true,
+            steps_measured: 3,
             admission_is_dense: false,
             learning_happened_delta: 0.1,
             tie_fraction: 0.0,
@@ -2979,19 +3098,24 @@ mod tests {
     }
 
     /// Cardinality pin: `FinetuneStepTier`'s 18 minus `attention_arm` (17)
-    /// plus the 18 new CONTRACT H4 fields = 35.
+    /// plus the 18 new CONTRACT H4 fields, minus the unit-63 adversarial-
+    /// audit finding-5(c)/advisory-(d) reclassifications (`split_rule`,
+    /// `split_seed`, `batched_forward`, `steps_measured` — 4 removed), plus
+    /// `heldout_pairs_sha256` (finding 5(a), 1 added) = 17 + 18 − 4 + 1 = 32.
     #[test]
-    fn finetune_run_tier_identity_fields_cardinality_is_35() {
-        assert_eq!(FinetuneRunTier::IDENTITY_FIELDS.len(), 35);
+    fn finetune_run_tier_identity_fields_cardinality_is_32() {
+        assert_eq!(FinetuneRunTier::IDENTITY_FIELDS.len(), 32);
     }
 
     /// `PROVENANCE_FIELDS` carries `arm` + `attention_arm` (moved out of
     /// identity — see struct doc) plus the four fields every other tier's
     /// provenance carries (`device_name`, `kernels_disabled_requested`,
-    /// `kernels_disabled_fired`, `flash_compiled`, `build_features`) = 7.
+    /// `kernels_disabled_fired`, `flash_compiled`, `build_features`), plus
+    /// the three unit-63 finding-5(c)/advisory-(d) reclassifications
+    /// (`split_rule`, `batched_forward`, `steps_measured`) = 10.
     #[test]
-    fn finetune_run_tier_provenance_fields_cardinality_is_7() {
-        assert_eq!(FinetuneRunTier::PROVENANCE_FIELDS.len(), 7);
+    fn finetune_run_tier_provenance_fields_cardinality_is_10() {
+        assert_eq!(FinetuneRunTier::PROVENANCE_FIELDS.len(), 10);
     }
 
     /// DISJOINTNESS: `IDENTITY_FIELDS` and `PROVENANCE_FIELDS` share no

@@ -347,31 +347,33 @@ class FinetuneRunIdentityFieldsSubsetTests(unittest.TestCase):
             _extract_rust_fields_block(REPORT_RS, _PROVENANCE_FIELDS_BLOCK_RE, "FinetuneRunTier")
         )
 
-    def test_finetune_run_identity_fields_has_exactly_35_entries(self):
+    def test_finetune_run_identity_fields_has_exactly_32_entries(self):
         self.assertEqual(
             len(identity_fields.FINETUNE_RUN_IDENTITY_FIELDS),
-            35,
-            "identity_fields.py::FINETUNE_RUN_IDENTITY_FIELDS must have EXACTLY 35 entries "
-            "(CONTRACT H4's pinned count: FinetuneStepTier's 18 minus attention_arm, plus 18 "
-            "new fields -- 17 + 18 = 35, the SAME count FinetuneRunTier's own Rust-side test "
-            "pins). A count other than 35 means either this mirror drifted from "
-            "FinetuneRunTier::IDENTITY_FIELDS or the Rust side itself grew/shrank; re-derive "
-            "from source, never bump to make this test pass.",
+            32,
+            "identity_fields.py::FINETUNE_RUN_IDENTITY_FIELDS must have EXACTLY 32 entries "
+            "(unit-63 adversarial-audit finding 5's pinned count: the original CONTRACT H4 35 "
+            "minus split_rule/split_seed/batched_forward/steps_measured (4 reclassified out of "
+            "identity), plus heldout_pairs_sha256 (1 added) -- 35 - 4 + 1 = 32, the SAME count "
+            "FinetuneRunTier's own Rust-side test pins). A count other than 32 means either this "
+            "mirror drifted from FinetuneRunTier::IDENTITY_FIELDS or the Rust side itself "
+            "grew/shrank; re-derive from source, never bump to make this test pass.",
         )
         self.assertEqual(
             len(set(identity_fields.FINETUNE_RUN_IDENTITY_FIELDS)),
-            35,
+            32,
             "FINETUNE_RUN_IDENTITY_FIELDS contains a duplicate entry",
         )
 
-    def test_rust_provenance_fields_has_exactly_7_entries(self):
+    def test_rust_provenance_fields_has_exactly_10_entries(self):
         self.assertEqual(
             len(self.rust_provenance_fields),
-            7,
-            f"FinetuneRunTier::PROVENANCE_FIELDS ({REPORT_RS}) must have EXACTLY 7 entries "
-            "(CONTRACT H4's pinned provenance list: arm, device_name, "
-            "kernels_disabled_requested, kernels_disabled_fired, flash_compiled, "
-            f"build_features, attention_arm) — got: {sorted(self.rust_provenance_fields)}",
+            10,
+            f"FinetuneRunTier::PROVENANCE_FIELDS ({REPORT_RS}) must have EXACTLY 10 entries "
+            "(CONTRACT H4's original 7 -- arm, device_name, kernels_disabled_requested, "
+            "kernels_disabled_fired, flash_compiled, build_features, attention_arm -- plus the "
+            "unit-63 adversarial-audit finding-5(c)/advisory-(d) reclassifications split_rule, "
+            f"batched_forward, steps_measured) — got: {sorted(self.rust_provenance_fields)}",
         )
 
     def test_finetune_run_identity_fields_equals_the_rust_const(self):

@@ -48,7 +48,7 @@ jammi-vs-torch comparator this repo carries:
 | `attn_requested` / `attn_implementation` | provenance — the RAW torch attention string (`--attn` as requested, and what HF resolved it to); the CLASS it implies is compared via `attention_arm` above, the raw string itself is recorded in `leg_provenance`, never compared (see `grad_oracle.rs`'s own table for the fuller rationale) | n/a | `"attn_requested": args.attn,` (`torch_finetune_step.py:1258`) in the `args` block; `attn_implementation` is the sibling `"attn_implementation": resolved_attn_implementation` field further down in the `finetune_step` block |
 | `kernels_disabled_requested` / `kernels_disabled_fired` | provenance (K-aux, landed on `main` at `c0f0e98`) — torch has no equivalent env var; recorded in `leg_provenance`, never compared | `let kernels_disabled_fired = jammi_kernels::admission::disabled_ops_fired();` (`finetune_step.rs:921`) | n/a |
 | `ln`/`rope`/`softmax`/`geglu`/`lora_epilogue`/`lora_linear`/`attention_block` `_fused_dispatches`/`_eager_dispatches` (14 fields) | measurement — this IS the fused-dispatch proof `fused_proof`/`dispatch_pairs` gate on, and `leg_provenance` additionally records the raw counters per config | `finetune_step.rs`'s own `*_fused_dispatches`/`*_eager_dispatches` fields | n/a |
-| `attention_block_flash_fused_dispatches` / `attention_block_flash_declined_dispatches` (P6 Stage B FA2 fold-in — a docs-ci co-sign of `origin/perf/p6-fa2-dense` @ `5886c6b`, NOT on `main` as of this table) | measurement — a CASCADE-shaped pair (`CASCADE_BASES`): no `_eager_dispatches` sibling, its fallback counter is named `_declined_dispatches` instead; absorbs `attention_block` (`ABSORBABLE_BY_ATTENTION_BLOCK_FLASH`), which in turn already absorbs `rope`/`softmax` — one chain, not a second mechanism. A report from `main`'s own binary today carries neither key at all; `dispatch_pairs`/`fused_proof` behave byte-for-byte as before such a report | `report.rs`'s `FinetuneStepTier::attention_block_flash_fused_dispatches`/`::attention_block_flash_declined_dispatches` fields on that branch (not yet in this crate's own `finetune_step.rs`) | n/a |
+| `attention_block_flash_fused_dispatches` / `attention_block_flash_declined_dispatches` (P6 Stage B FA2 fold-in, since merged to `main` — `pub attention_block_flash_fused_dispatches: u64,` (`report.rs:1670`), `pub attention_block_flash_declined_dispatches: u64,` (`report.rs:1678`)) | measurement — a CASCADE-shaped pair (`CASCADE_BASES`): no `_eager_dispatches` sibling, its fallback counter is named `_declined_dispatches` instead; absorbs `attention_block` (`ABSORBABLE_BY_ATTENTION_BLOCK_FLASH`), which in turn already absorbs `rope`/`softmax` — one chain, not a second mechanism. Every current `finetune-step`/`finetune-run` leg carries both keys; a pre-fold-in fixture predating this pair (carrying neither key) still works — `dispatch_pairs`/`fused_proof` never discover this base on such a report | `report.rs`'s `FinetuneStepTier::attention_block_flash_fused_dispatches`/`::attention_block_flash_declined_dispatches` fields | n/a |
 | `flash_compiled` | provenance — recorded in `leg_provenance` as `jammi_flash_compiled`, never compared; distinguishes "this build cannot run flash at all" from "flash was compiled in but declined/disabled this run", and backs `fused_proof`'s own flash-disable-consistency check (see that function's doc) | `report.rs`'s `FinetuneStepTier::flash_compiled` field, same branch as above | n/a |
 | `losses` / `loss_first` / `loss_last` | measurement — `loss_final_ratio` is printed for visibility, never gated (see that field's own note in `build_report`) | `finetune_step.rs`'s own fields | `torch_finetune_step.py`'s own fields |
 | `s_per_step_p50` / `triplets_per_s` / VRAM fields | measurement — the actual perf numbers this sweep exists to produce | `finetune_step.rs`'s own fields | `torch_finetune_step.py`'s own fields |
@@ -263,6 +263,26 @@ _TORCH_ARGS_LEVEL_FIELDS = frozenset({"seed", "lora_alpha", "margin", "warmup"})
 #         `rope`/`softmax`. This closes F4/F5's own reproduction (a
 #         "deleted/feature-gated-off fused MLP" reading `geglu = (0, 0)`
 #         used to still print `fused_proof YES`).
+#       - `adamw` (unit-63 round-3 audit, block 1): `AdamW::step`'s
+#         per-`Var` dispatch to `adamw_step_fused_t`
+#         (`report.rs`'s `adamw_fused_dispatches` field doc,
+#         `adamw_fused_dispatches: adamw_dispatch_after` (`finetune_step.rs:1018`))
+#         — same reasoning class as `ln`/
+#         `geglu` again: its admission domain is device/dtype/contiguity/
+#         shape agreement across `theta`/`m`/`v`/`grad`, which holds
+#         unconditionally for every real training run (all four are the
+#         SAME `Var`'s own state, so they always already agree on device,
+#         dtype, contiguity, and shape) — nothing legitimately absorbs or
+#         exempts it, and no fused block in this crate folds it into a
+#         wider kernel the way `attention_block` folds `rope`/`softmax`.
+#         `dispatch_pairs` raised `KeyError('adamw')` on EVERY real leg of
+#         both the `finetune-step` and `finetune-run` tiers before this
+#         fix (`adamw` was never added to `ALL_BASES` when the multi-
+#         tensor AdamW commit landed) — reproduced against the committed
+#         real artifact
+#         `crates/jammi-kernels/artifacts/cuda-runs/2026-08-25-adamw-d959805-a100-sxm4-raw-runs/
+#         a100b/b8_s512_fused.r2.json.raw` (`TestRealAdamwArtifactFixtures`
+#         in `test_ab_merge.py`).
 #       - `attention_block` used to live in this set too. P6 Stage B FA2
 #         fold-in (below): moved OUT, since a third training-attention arm
 #         now gives it a legitimate absorption path of its own, the same
@@ -328,7 +348,7 @@ _TORCH_ARGS_LEVEL_FIELDS = frozenset({"seed", "lora_alpha", "margin", "warmup"})
 #     available for rule 1 (the declined-count hard-fail-unless-requested
 #     check) and for `ABSORBABLE_BY_ATTENTION_BLOCK_FLASH`/
 #     `ABSORBABLE_BY_ATTENTION_BLOCK`'s absorption conditions above.
-REQUIRED_PAIRS = frozenset({"ln", "geglu"})
+REQUIRED_PAIRS = frozenset({"ln", "geglu", "adamw"})
 ABSORBABLE_BY_ATTENTION_BLOCK = frozenset({"rope", "softmax"})
 ABSORBABLE_BY_ATTENTION_BLOCK_FLASH = frozenset({"attention_block"})
 LORA_SITE_EXCLUSIVE_GROUP = frozenset({"lora_epilogue", "lora_linear"})
@@ -351,13 +371,21 @@ LORA_SITE_EXCLUSIVE_GROUP = frozenset({"lora_epilogue", "lora_linear"})
 # A/B this tool exists to judge, not merely failing loudly on the one
 # genuinely new pair kind.
 #
-# `attention_block_flash` is NOT on `main` yet (this table's own `main` at
-# the time of writing has zero `flash` references anywhere in
-# `crates/jammi-bench/src/`) — a report from `main`'s own binary carries
-# NEITHER `attention_block_flash_fused_dispatches` NOR
-# `..._declined_dispatches` at all, so `dispatch_pairs` never discovers this
-# base on such a report and every fixture in `test_ab_merge.py` that
-# predates this change stays green, unmodified, byte-for-byte.
+# STALE PREMISE, corrected (unit-63 round-3 audit advisory): the P6 Stage B
+# FA2 fold-in landed on `main`.
+#   * `pub attention_block_flash_fused_dispatches: u64,` (`report.rs:1670`)
+#   * `pub attention_block_flash_declined_dispatches: u64,` (`report.rs:1678`)
+#   * `attention_block_flash_fused_dispatches: attention_block_flash_dispatch_after` (`finetune_step.rs:1031`)
+#   * `attention_block_flash_declined_dispatches: attention_block_flash_dispatch_after` (`finetune_step.rs:1034`)
+# All four populate on every real `finetune-step` (and, via
+# `FinetuneRunTier`'s own mirror of the same pair, `finetune-run`) leg —
+# this is no longer a "not yet on main" base a fresh
+# report might lack; every current leg carries it. `CASCADE_BASES` stays
+# `{"attention_block_flash"}` for the reason below (a genuinely OPTIONAL
+# proof participant, not a doubt about whether the FIELD is present), and a
+# pre-fold-in fixture predating this pair (still absent the two keys
+# entirely) remains equally well-handled — `dispatch_pairs` simply never
+# discovers this base on such a report, same as always.
 CASCADE_BASES = frozenset({"attention_block_flash"})
 
 ALL_BASES = (
@@ -758,22 +786,43 @@ def fused_proof(m):
       1. ANY pair with a fallback count (`eager`, or a `CASCADE_BASES`
          member's `declined`) `> 0` is a hard, unconditional fail — an
          admitted call site that actually fell back, on ANY pair, in ANY
-         group — UNLESS that pair is a `CASCADE_BASES` member AND its base
-         appears in BOTH `kernels_disabled_requested` AND
-         `kernels_disabled_fired` on this SAME leg: a DELIBERATE,
-         self-describing disable request (the reference/block-arm leg of a
-         flash-vs-block A/B, `JAMMI_KERNELS_DISABLE=attention_block_flash`)
-         is not a silent fallback — it is the transparently-requested and
-         transparently-recorded way this crate forces the non-flash arm,
-         and the reference leg's OWN `attention_block` pair still has to
-         independently clear rule 2.5 below on its own `fused > 0`, so
-         nothing here grants it a free pass on the thing that actually
-         matters. An UNREQUESTED decline (a genuine domain/capability
-         miss — real padding, wrong arch, `flash-attn` not compiled) stays
-         a hard fail exactly like an ordinary silent eager fallback always
+         group — UNLESS that pair is a `CASCADE_BASES` member AND EITHER:
+           (a) `flash_compiled is False` on this SAME leg (unit-63 round-3
+               audit block 2): a build that never compiled the vendored
+               FlashAttention-2 kernels in AT ALL cannot dispatch `Fused`
+               for this base under any circumstance, so `declined > 0` here
+               is the EXPECTED capability-miss shape (a domain/capability
+               decline this build could never have avoided), never a
+               silent fallback needing an explicit disable request to
+               excuse it — the how-well campaign's own `--features cuda`
+               (no `flash-attn`) build is exactly this leg
+               (`finetune_run_ab.sh:270`). The fused arm's real proof on
+               such a build is `attention_block`'s OWN `fused > 0` — rule
+               2.5 below already requires exactly that (its absorption
+               condition, `attention_block_flash`'s `fused > 0`, reads `0`
+               on a build that cannot compile flash at all, so 2.5 reduces
+               to "must independently clear `fused > 0`" there — no
+               separate carve-out needed once rule 1 stops rejecting the
+               leg outright); or
+           (b) its base appears in BOTH `kernels_disabled_requested` AND
+               `kernels_disabled_fired` on this SAME leg: a DELIBERATE,
+               self-describing disable request (the reference/block-arm leg
+               of a flash-vs-block A/B,
+               `JAMMI_KERNELS_DISABLE=attention_block_flash`) is not a
+               silent fallback — it is the transparently-requested and
+               transparently-recorded way this crate forces the non-flash
+               arm, and the reference leg's OWN `attention_block` pair
+               still has to independently clear rule 2.5 below on its own
+               `fused > 0`, so nothing here grants it a free pass on the
+               thing that actually matters.
+         An UNREQUESTED decline on a build that DID compile flash in (a
+         genuine domain/capability miss — real padding, wrong arch) stays a
+         hard fail exactly like an ordinary silent eager fallback always
          has (`report.rs`'s own `attention_block_flash_declined_dispatches`
          field doc, contract v5 §3.8: "`declined > 0` on any bench leg ->
-         INVALID").
+         INVALID") — (a) is scoped to the BUILD fact (`flash_compiled`),
+         never weakened to cover a build that COULD have run flash but
+         happened not to.
       2. Every `REQUIRED_PAIRS` base must be PRESENT in this report's pairs
          (a required pair vanishing from the JSON entirely — the field
          renamed, deleted, or feature-gated off — is exactly the schema
@@ -830,11 +879,17 @@ def fused_proof(m):
 
     kernels_disabled_requested = set(m.get("kernels_disabled_requested") or [])
     kernels_disabled_fired = set(m.get("kernels_disabled_fired") or [])
+    flash_compiled = m.get("flash_compiled")
     for base, (_fused, fallback) in by_base.items():
         if fallback <= 0:
             continue
-        if base in CASCADE_BASES and base in kernels_disabled_requested and base in kernels_disabled_fired:
-            continue  # rule 1: deliberate, self-describing disable request — not a silent fallback
+        if base in CASCADE_BASES:
+            if flash_compiled is False:
+                continue  # rule 1(a): capability miss -- this build never compiled flash in at
+                # all, so a decline here is the EXPECTED shape, not a silent fallback; the fused
+                # arm's real proof shifts to attention_block's own fused > 0 (rule 2.5 below).
+            if base in kernels_disabled_requested and base in kernels_disabled_fired:
+                continue  # rule 1(b): deliberate, self-describing disable request -- not a silent fallback
         return False
 
     for base in REQUIRED_PAIRS:
@@ -1449,6 +1504,32 @@ def finetune_run_arm_premise_violations(arm, tier):
     return violations
 
 
+# ALLOFF_DISABLED_OP_BASES (unit-63 round-3 audit, class-fix discovery,
+# docs-ci): `finetune_run_ab.sh`'s own documented `alloff` convention
+# (`JAMMI_KERNELS_DISABLE=attention_block_flash,adamw_step_fused` -- see
+# that script's own comment and `main.rs`'s `FinetuneRunArgs::arm` doc, "the
+# caller is responsible for setting [this] itself before invoking this
+# binary for the alloff arm") disables EXACTLY these two ops -- `alloff`
+# names the flash-cascade/multi-tensor-AdamW reference arm, never a blanket
+# "every fused kernel off" run. `fixtures/finetune_run_golden/
+# modernbert_alloff.json` (a REAL, producer-anchored alloff leg) reads
+# `ln`/`rope`/`softmax`/`geglu`/`lora_linear` all FUSED (nonzero) on this
+# arm -- the class-defect this table replaces (`finetune_run_dispatch_proof_violations`
+# used to require EVERY dispatch pair to read `fused == 0` for `alloff`,
+# which that real leg would have failed on every field above, marking every
+# real campaign `alloff` leg INVALID the day this producer went live; caught
+# only once this suite's own fixtures were derived from that real leg
+# instead of a hand-typed "everything is eager" assumption). Maps the
+# `JAMMI_KERNELS_DISABLE` op key to the `dispatch_pairs` base name it
+# governs -- `"attention_block_flash"` names itself (a `CASCADE_BASES`
+# member, so its own fallback is `declined`, not `eager`); `"adamw_step_fused"`
+# governs the ordinary `"adamw"` pair.
+ALLOFF_DISABLED_OP_BASES = {
+    "attention_block_flash": "attention_block_flash",
+    "adamw_step_fused": "adamw",
+}
+
+
 def finetune_run_dispatch_proof_violations(arm, tier):
     """Unit-63 adversarial-audit finding 2's merger half: the finetune-run
     tier now ALSO emits finetune-step's exact `*_fused_dispatches`/
@@ -1465,10 +1546,34 @@ def finetune_run_dispatch_proof_violations(arm, tier):
     refused" shape, applied to dispatches instead of the clip counter:
       * `arm == "fused"`: `fused_proof` -- the SAME gate a finetune-step
         `jammi-fused` leg is held to -- must return `True`.
-      * `arm == "alloff"`: EVERY dispatch pair `dispatch_pairs` discovers
-        must show `fused == 0` -- an alloff leg that dispatched even one
-        fused op did not actually run with kernels disabled, so its `d_i`
-        is not a fact about the ALLOFF reference at all.
+      * `arm == "alloff"` (unit-63 round-3 audit, block 4 + the class-fix
+        discovery above): this leg's OWN `kernels_disabled_requested` names
+        the op(s) it actually claims to have disabled -- ONLY the
+        `ALLOFF_DISABLED_OP_BASES` members it names must show `fused == 0`
+        AND a POSITIVE counted fallback (`eager`/`declined` `> 0` -- the
+        mirror-image of the "fused == 0 alone" check the pre-fix code ran:
+        an all-zero pair reading is no counted fact behind the "disabled"
+        classification, only a claim, exactly like `clip_fact_violations`'s
+        own "a clip claim with no counted fact behind it" refusal). Every
+        OTHER dispatch pair is UNCHECKED here -- `alloff` never claimed
+        anything about them, so a real leg's own `ln`/`rope`/`softmax`/
+        `geglu`/`lora_linear` staying fused is not this arm's business.
+        SEPARATELY (block 4's own positive proof, scoped to a
+        modernbert-shaped leg): `attention_block` must show `fused == 0`
+        AND `eager > 0` -- the training-mode attention path reached via the
+        disabled-kernel fallback. This tier carries no `model_type` field to
+        read directly, so "modernbert-shaped" is read off the SAME four
+        counters `finetune_run.rs`'s own belt-and-braces refusal reads
+        (`attention_block_{fused,eager}_dispatches`,
+        `attention_block_flash_{fused,declined}_dispatches`): that producer-
+        side check already REFUSES TO EMIT a report at all for a modernbert
+        leg where every one of those four reads `0` (`cumulative_steps > 0`
+        implied by a real leg reaching this merger at all) -- so an OK
+        report with all four at `0` is definitionally a BERT-arch leg (no
+        attention-block kernel exists to prove anything about, tolerated
+        exactly like the absent/zero case elsewhere in this proof), while
+        ANY of the four being nonzero is definitionally a modernbert-shaped
+        leg.
 
     A leg with NO dispatch-counter fields at all (an older producer build
     predating this emission) is ALSO a violation -- `dispatch_pairs`
@@ -1509,19 +1614,62 @@ def finetune_run_dispatch_proof_violations(arm, tier):
             ]
         return []
     if arm == "alloff":
-        nonzero = sorted((base, fused) for base, fused, _fallback in pairs if fused > 0)
-        if nonzero:
-            return [
-                f"alloff: {len(nonzero)} dispatch pair(s) show a nonzero fused count "
-                f"{nonzero!r} -- an alloff leg must dispatch zero fused ops on every pair; "
-                "this leg's 'alloff' classification is untrusted, discarded, not merely "
-                "annotated"
-            ]
-        return []
+        by_base = {base: (fused, fallback) for base, fused, fallback in pairs}
+        violations = []
+
+        # The disabled-op positive proof (class-fix discovery, see
+        # `ALLOFF_DISABLED_OP_BASES`'s own doc): scoped to exactly the ops
+        # THIS leg's own `kernels_disabled_requested` names, never a blanket
+        # "every pair must be zero" claim.
+        requested = set(tier.get("kernels_disabled_requested") or [])
+        disabled_bases = {base for op, base in ALLOFF_DISABLED_OP_BASES.items() if op in requested}
+        if not disabled_bases:
+            violations.append(
+                f"alloff: kernels_disabled_requested={sorted(requested)!r} names none of this "
+                f"tier's known disable-op keys {sorted(ALLOFF_DISABLED_OP_BASES)!r} -- an alloff "
+                "leg that disabled nothing recognizable cannot prove anything about the ALLOFF "
+                "reference"
+            )
+        for base in sorted(disabled_bases):
+            if base not in by_base:
+                violations.append(
+                    f"alloff: {base!r} (named in kernels_disabled_requested) has no dispatch-pair "
+                    "counters on this leg's report at all"
+                )
+                continue
+            fused, fallback = by_base[base]
+            if fused > 0:
+                violations.append(
+                    f"alloff: {base} shows {fused} fused dispatch(es) despite its disabling op "
+                    "being named in kernels_disabled_requested -- this leg did not actually run "
+                    "with it disabled; this leg's 'alloff' classification is untrusted, discarded, "
+                    "not merely annotated"
+                )
+            elif fallback <= 0:
+                violations.append(
+                    f"alloff: {base} shows fused=0 but its own fallback counter is also 0 -- no "
+                    "counted fact behind the 'disabled' classification, only a claim"
+                )
+
+        # Block 4's own positive proof, scoped to a modernbert-shaped leg --
+        # see this function's own doc for the four-counter discriminator
+        # (this tier carries no model_type field to read directly).
+        ab_fused, ab_eager = by_base.get("attention_block", (0, 0))
+        abf_fused, abf_declined = by_base.get("attention_block_flash", (0, 0))
+        is_modernbert_shaped = (ab_fused + ab_eager + abf_fused + abf_declined) > 0
+        if is_modernbert_shaped and not (ab_fused == 0 and ab_eager > 0):
+            violations.append(
+                f"alloff: attention_block_fused_dispatches={ab_fused!r} "
+                f"attention_block_eager_dispatches={ab_eager!r} -- a modernbert-arch alloff leg "
+                "must show fused == 0 and eager > 0 (the training-mode attention path reached via "
+                "the disabled-kernel fallback); an all-zero (or a leaked fused > 0) reading is no "
+                "counted fact behind the 'alloff' classification, only a claim"
+            )
+        return violations
     return [f"{arm}: unrecognized finetune-run arm -- cannot apply the dispatch-proof gate to it"]
 
 
-def finetune_run_cross_seed_homogeneity_violations(leg_identities):
+def finetune_run_cross_seed_homogeneity_violations(leg_identities, lr0_labels=frozenset()):
     """Cross-seed leg-premise check (unit-63 adversarial-audit finding 3):
     every OTHER identity check in this section compares WITHIN one seed
     only -- `generic_leg_premise_violations` over `FINETUNE_RUN_IDENTITY_FIELDS`
@@ -1552,11 +1700,34 @@ def finetune_run_cross_seed_homogeneity_violations(leg_identities):
     with a present value, nor with a DIFFERENT absent leg's own reason for
     being absent.
 
-    Returns a list of violation strings, one per divergent field, each
-    naming the field and, for every distinct value found, the labels of the
-    legs that reported it -- never a silent drop of which legs disagreed.
-    Homogeneous input (including fewer than two legs, which cannot
-    disagree) returns `[]`.
+    `lr0_labels` (unit-63 round-3 audit block 3, optional, default empty --
+    the labels in `leg_identities` naming an lr0-control leg; see
+    `build_finetune_run_report`'s own wiring) is the SECOND field-level
+    exception this function carries, alongside `seed` itself: `lr` is
+    IDENTITY FIELD #17 on `FINETUNE_RUN_IDENTITY_FIELDS`, and the lr=0 RED
+    control's own defining premise (CONTRACT H4 advisory (b)) is that its
+    legs run at `--lr 0` BY CONSTRUCTION, while every main A/B leg runs at
+    the sweep's real (nonzero) `--lr`. Comparing `lr` across the FULL
+    combined pool the way every OTHER field is compared would make ANY
+    nonempty `lr0_seeds` list unconditionally INVALID (the control's own
+    legs always diverge from the main legs' `lr`), silently defeating the
+    very control CONTRACT Frame's RED-control precedent asks this project to
+    run. The exception is narrow and NAMED here (never a blanket "skip lr
+    checking"): `lr` is compared WITHIN the main pool (every main leg must
+    still agree with every other main leg) and WITHIN the lr0-control pool
+    (every lr0-control leg must still agree with every other lr0-control
+    leg) SEPARATELY -- only the CROSS-group comparison is dropped, and ONLY
+    for `lr`. Every other `FINETUNE_RUN_IDENTITY_FIELDS` entry (including
+    the checkpoint/target_modules/schedule/... fields an lr0-control leg is
+    still required to match on) is compared across the FULL combined pool
+    exactly as before -- an lr0-control leg diverging on any NON-`lr` field
+    still collapses this check.
+
+    Returns a list of violation strings, one per divergent field (or, for
+    `lr`, one per divergent pool), each naming the field and, for every
+    distinct value found, the labels of the legs that reported it -- never a
+    silent drop of which legs disagreed. Homogeneous input (including fewer
+    than two legs, which cannot disagree) returns `[]`.
     """
     violations = []
     if len(leg_identities) < 2:
@@ -1564,6 +1735,35 @@ def finetune_run_cross_seed_homogeneity_violations(leg_identities):
     for field in FINETUNE_RUN_IDENTITY_FIELDS:
         if field == "seed":
             continue  # the swept axis -- expected to differ, never compared
+        if field == "lr":
+            # The lr0-control exception -- see this function's own doc.
+            # Checked within each pool SEPARATELY; the cross-group
+            # divergence this control's own premise REQUIRES is never
+            # itself flagged.
+            pools = (
+                ("main", [(l, f) for l, f in leg_identities if l not in lr0_labels]),
+                ("lr0-control", [(l, f) for l, f in leg_identities if l in lr0_labels]),
+            )
+            for pool_name, pool in pools:
+                if len(pool) < 2:
+                    continue
+                groups = {}
+                for label, fields in pool:
+                    value = fields.get(field, _MISSING)
+                    display = "<absent-or-null>" if value is _MISSING else canonicalize_identity_field(field, value)
+                    key = repr(display)
+                    entry = groups.setdefault(key, (display, []))
+                    entry[1].append(label)
+                if len(groups) > 1:
+                    parts = "; ".join(f"{display!r} on {labels}" for display, labels in groups.values())
+                    violations.append(
+                        f"cross-seed leg-identity field 'lr' diverges within the {pool_name} pool "
+                        "(unit-63 round-3 audit block 3: an lr0-control-vs-main divergence in "
+                        "'lr' is that control's own defining premise and is never compared across "
+                        f"that boundary, but every leg WITHIN the {pool_name} pool must still "
+                        f"agree): {parts}"
+                    )
+            continue
         groups = {}  # repr(display_value) -> (display_value, [labels])
         for label, fields in leg_identities:
             value = fields.get(field, _MISSING)
@@ -1675,7 +1875,7 @@ def finetune_run_lr0_control_seed_violations(raw_dir, seed):
     return violations, per_arm, identities
 
 
-def build_finetune_run_report(raw_dir, seeds, lr0_seeds=()):
+def build_finetune_run_report(raw_dir, seeds, lr0_seeds=(), allow_missing_lr0_control=False):
     """The finetune-run merge stage (unit 63 H4b): reads every
     `(seed, arm, repeat)` leg `finetune_run_ab.sh` wrote under `raw_dir`,
     computes the exact sign test over `d_i = fused.held_out_example_mean -
@@ -1707,6 +1907,22 @@ def build_finetune_run_report(raw_dir, seeds, lr0_seeds=()):
     control leg, or one that passes learning-happened under lr=0) also
     collapses `status` to `INVALID`, alongside the premise/determinism-floor
     carve-outs above.
+
+    `allow_missing_lr0_control` (unit-63 round-3 audit block 5, default
+    `False`): CONTRACT Frame's own RED control ("lr=0 arm x2 seeds fails
+    learning-happened") is PRE-REGISTERED, not optional -- an empty
+    `lr0_seeds` used to be silently treated as a no-op (`gpu-howwell.yml`'s
+    own `|| ''` collapsed "no input exists" and "an operator explicitly
+    opted out" to the same untagged empty string, and the label-triggered
+    workflow path dropped the control on EVERY run with no visible signal
+    at all). This function now REFUSES (`status` collapses to `INVALID`,
+    naming the reason in `lr0_control.violations`) when `lr0_seeds` is
+    empty UNLESS the caller passes `allow_missing_lr0_control=True`
+    (`main`'s own `--allow-missing-lr0-control` CLI flag;
+    `finetune_run_ab.sh` passes it only when
+    `FINETUNE_RUN_AB_ALLOW_NO_LR0=1`) -- the skip is then a VISIBLE, RECORDED
+    act (`lr0_control.allow_missing_lr0_control: true` in the merged
+    artifact), never an unstated default.
 
     The DECISION RULE itself (unit-63 audit finding 1 --
     `FINETUNE_RUN_DECISION_RULE_TEXT`'s own doc has the exact predicate) is
@@ -1835,17 +2051,41 @@ def build_finetune_run_report(raw_dir, seeds, lr0_seeds=()):
     lr0_seeds = list(lr0_seeds)
     lr0_control_violations = []
     lr0_control_per_seed = {}
+    # unit-63 round-3 audit block 5 -- see this function's own doc: an empty
+    # `lr0_seeds` is a REFUSAL (INVALID) unless the caller explicitly opted
+    # out. Recorded here, in `lr0_control_violations`, so it collapses
+    # `status` the SAME way every other lr0-control finding does (this
+    # function's status computation already ORs `lr0_control_violations`
+    # into the INVALID branch -- no separate flag needed there).
+    if not lr0_seeds and not allow_missing_lr0_control:
+        lr0_control_violations.append(
+            "lr0_seeds is empty and allow_missing_lr0_control was not set -- CONTRACT Frame's own "
+            "RED control ('lr=0 arm x2 seeds fails learning-happened') is pre-registered, not "
+            "optional; skipping it silently would leave the learning-happened floor "
+            "(FINETUNE_RUN_LEARNING_HAPPENED_FLOOR=0.0) unvalidated on this run. Pass "
+            "--allow-missing-lr0-control (finetune_run_ab.sh's own FINETUNE_RUN_AB_ALLOW_NO_LR0=1) "
+            "to record a deliberate, visible opt-out instead."
+        )
+    # unit-63 round-3 audit block 3 -- labels (from `identities` below)
+    # naming an lr0-control leg, threaded into
+    # `finetune_run_cross_seed_homogeneity_violations` so its own `lr`
+    # exception (see that function's own doc) knows which legs in the
+    # combined pool are the control's, never inferred from label spelling.
+    lr0_labels = set()
     for lr0_seed in lr0_seeds:
         seed_violations, per_arm, identities = finetune_run_lr0_control_seed_violations(raw_dir, lr0_seed)
         lr0_control_violations += seed_violations
         lr0_control_per_seed[lr0_seed] = {"per_arm": per_arm, "violations": seed_violations}
         cross_seed_leg_identities += identities
+        lr0_labels.update(label for label, _fields in identities)
 
     # unit-63 audit finding 3 -- see this function's own doc; every OK leg
     # gathered above (main A/B seeds' r1/r2, plus the lr0 control's own
     # legs) must agree on every FINETUNE_RUN_IDENTITY_FIELDS entry except
-    # `seed` itself.
-    cross_seed_violations = finetune_run_cross_seed_homogeneity_violations(cross_seed_leg_identities)
+    # `seed` itself (and, per block 3's own `lr` exception, `lr` is compared
+    # within each of the main/lr0-control pools separately, never across
+    # that boundary).
+    cross_seed_violations = finetune_run_cross_seed_homogeneity_violations(cross_seed_leg_identities, lr0_labels=lr0_labels)
 
     # Cross-seed spread: population stdev of every seed's `d_i` that could
     # be COMPUTED at all (even one from a premise-violating seed -- the
@@ -1973,12 +2213,18 @@ def build_finetune_run_report(raw_dir, seeds, lr0_seeds=()):
             "seeds": lr0_seeds,
             "per_seed": {str(s): v for s, v in lr0_control_per_seed.items()},
             "violations": lr0_control_violations,
+            # unit-63 round-3 audit block 5: the skip is now a VISIBLE,
+            # RECORDED act, never an unstated default -- see this function's
+            # own doc.
+            "allow_missing_lr0_control": allow_missing_lr0_control,
             "note": (
                 "lr=0 RED control (CONTRACT Frame / audit advisory (b)): separate seeds, "
                 "never counted into the A/B set's own d_values/sign test above. A clean "
                 "control leg FAILS learning-happened (its own learning_happened_delta does "
                 "not clear FINETUNE_RUN_LEARNING_HAPPENED_FLOOR); a passing leg is recorded "
-                "as a violation against the FLOOR=0.0 premise-leg ruling itself."
+                "as a violation against the FLOOR=0.0 premise-leg ruling itself. An empty "
+                "'seeds' list is itself a refusal (INVALID) unless 'allow_missing_lr0_control' "
+                "is true (block 5) -- the pre-registered control is not silently optional."
             ),
         },
         "status": status,
@@ -2042,10 +2288,16 @@ def main(argv=None):
     # directory path is spelled exactly that way).
     if argv and argv[0] == "finetune-run":
         rest = argv[1:]
+        # unit-63 round-3 audit block 5: a flag, not a positional -- scanned
+        # out of `rest` wherever it appears so it never shifts the existing
+        # positional contract (`finetune_run_ab.sh` appends it, if at all,
+        # after LR0_SEEDS, but this does not depend on that ordering).
+        allow_missing_lr0_control = "--allow-missing-lr0-control" in rest
+        rest = [a for a in rest if a != "--allow-missing-lr0-control"]
         if len(rest) < 3:
             print(
                 "usage: ab_merge.py finetune-run RAW_DIR OUT_DIR SEED1,SEED2,... "
-                "[LR0_SEED1,LR0_SEED2,...]",
+                "[LR0_SEED1,LR0_SEED2,...] [--allow-missing-lr0-control]",
                 file=sys.stderr,
             )
             return 2
@@ -2054,10 +2306,15 @@ def main(argv=None):
         # unit-63 audit advisory (b): the lr=0 RED control's own seed list --
         # OPTIONAL, and, unlike `seeds` above, never itself entering the A/B
         # set's own d_values/sign test (see `finetune_run_lr0_control_seed_violations`).
+        # unit-63 round-3 audit block 5: an EMPTY list here is now itself a
+        # refusal (INVALID) unless `allow_missing_lr0_control` above was
+        # passed -- see `build_finetune_run_report`'s own doc.
         lr0_seeds_s = rest[3] if len(rest) > 3 else ""
         lr0_seeds = [s for s in lr0_seeds_s.split(",") if s]
 
-        fr_merged, fr_table = build_finetune_run_report(fr_raw_dir, seeds, lr0_seeds=lr0_seeds)
+        fr_merged, fr_table = build_finetune_run_report(
+            fr_raw_dir, seeds, lr0_seeds=lr0_seeds, allow_missing_lr0_control=allow_missing_lr0_control
+        )
         if fr_merged is None:
             print(f"finetune_run_ab: FAIL — no leg output found under {fr_raw_dir}", file=sys.stderr)
             return 1

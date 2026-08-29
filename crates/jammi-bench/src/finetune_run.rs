@@ -706,10 +706,14 @@ fn run_impl(
     // regressed an all-uppercase leg/spec pair (previously an exact-string
     // match) into a false "labeling error" the moment this side started
     // normalizing and the caller side did not. Round-10 audit F2 fixed the
-    // comparison ITSELF (ab_merge.py:2823/:3434) to case-fold both sides at
-    // the comparison site, so this producer-side lowercasing is back to
-    // being canonicalization of the artifact, never something the
-    // comparison's correctness depends on.
+    // comparison ITSELF -- ab_merge.py's `finetune_run_mutant_column_violations`
+    // (the per-leg comparison) and the `--mutant-legs` CLI fold (the spec
+    // parse) -- to case-fold both sides at the comparison site, so this
+    // producer-side lowercasing is back to being canonicalization of the
+    // artifact, never something the comparison's correctness depends on.
+    // Cited by FUNCTION NAME, never by line number: ab_merge.py's own
+    // line numbers have already rotted past this comment once (unit-63
+    // round-11 audit advisory (b)).
     let mutant_patch_sha256 = params
         .mutant_patch_sha256
         .as_deref()

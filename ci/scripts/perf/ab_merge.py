@@ -3161,7 +3161,22 @@ def mutant_dose_ladder_reject_duplicate_doses(dose_columns):
         under two DIFFERENT literal labels -- named in the refusal by BOTH
         labels and the shared eps: one dose, one label; a same-dose
         disagreement between two legs is a determinism question, never a
-        sensitivity interval.
+        sensitivity interval, or
+      - two entries carry the SAME (case-folded, stripped) `patch_sha256`
+        under two DIFFERENT literal labels -- unit-63 round-11 audit block:
+        the strongest identity key of all, since `mutants/README.md` records
+        one DISTINCT patch sha PER dose (the eps is baked into the patch
+        itself, never a caller-supplied overlay on a shared patch), so two
+        columns citing the same patch are the same mutant measured twice
+        regardless of what eps their labels claim. Checked LAST (after the
+        label/eps arms above, which already catch a literal- or
+        eps-aliased pair without needing to consult the sha at all), and
+        skipped for any column whose own `patch_sha256` is missing or
+        empty after stripping -- an unset sha is never treated as though it
+        aliased another unset sha. Named in the refusal by BOTH labels and
+        the shared sha: one patch, one dose; two columns citing the same
+        patch are the same mutant measured twice, and their disagreement is
+        a determinism question, never a sensitivity interval.
 
     Called once, over the whole supplied set, at the CLI's own
     `--mutant-legs` assembly -- the same input edge every other dose-ladder
@@ -3191,6 +3206,30 @@ def mutant_dose_ladder_reject_duplicate_doses(dose_columns):
                 "disagreement is a determinism question, never a sensitivity interval"
             )
         seen_eps[eps] = label
+    # unit-63 round-11 audit block: the strongest identity key of all --
+    # mutants/README.md records one DISTINCT patch sha PER dose (the eps is
+    # baked into the patch itself), so two columns naming the same
+    # (case-folded, stripped) patch_sha256 are the same mutant measured
+    # twice no matter what their labels/parsed epsilons claim. Checked LAST
+    # (the label/eps arms above already catch a literal- or eps-aliased
+    # pair without ever consulting the sha), and skipped for a column whose
+    # own patch_sha256 is missing or empty after stripping -- an unset sha
+    # is never treated as though it aliased another unset sha.
+    seen_patch_shas = {}
+    for col in dose_columns:
+        label = col["dose_label"]
+        patch_sha256 = str(col.get("patch_sha256") or "").strip().lower()
+        if not patch_sha256:
+            continue
+        if patch_sha256 in seen_patch_shas:
+            other_label = seen_patch_shas[patch_sha256]
+            raise MutantDoseLadderSensitivityError(
+                f"dose labels {other_label!r} and {label!r} both cite the same "
+                f"patch_sha256={patch_sha256!r} -- one patch, one dose: two columns citing the "
+                "same patch are the same mutant measured twice; their disagreement is a "
+                "determinism question, never a sensitivity interval"
+            )
+        seen_patch_shas[patch_sha256] = label
 
 
 def mutant_dose_ladder_sensitivity(dose_columns):
@@ -3495,8 +3534,13 @@ def main(argv=None):
                     "improvement detected under deflation, unit-63 round-9 audit finding 3) is "
                     "reported under 'dose_anomalies' instead and gates this merge's own exit code "
                     "exactly as the primary decision's own RED_FOR_INVESTIGATION state does -- "
-                    "investigated, never silently celebrated; 'sensitivity_error' names a "
-                    "dose_label that failed to parse as a signed eps value, never silently ignored."
+                    "investigated, never silently celebrated; 'sensitivity_error' names ANY of "
+                    "this family's own refusal classes over the supplied dose set -- a dose_label "
+                    "that failed to parse as a signed eps value, a parsed eps outside this "
+                    "family's own domain, or a duplicate identity across two columns (the same "
+                    "literal dose_label, the same parsed eps under two different labels, or the "
+                    "same patch_sha256 under two different labels, unit-63 round-11 audit block) "
+                    "-- never silently ignored."
                 ),
             }
             dose_lines = ["", "# mutant dose ladder (amendment 2026-08-29b item 3; addendum 2026-08-29c signs it)"]

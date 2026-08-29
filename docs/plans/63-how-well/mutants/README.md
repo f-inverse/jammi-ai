@@ -350,8 +350,14 @@ comparison.
    shape a straddle needs) or, worse, misreport a cross-sign
    `(-0.10 not-detected, +0.50 RED)` run-order-adjacent pair as though it
    were a degradation-direction finding. `+0.50` reading RED is instead the
-   two-sided-falsification finding (confirming the Step-2 improvement
-   prediction), reported separately, never folded into sensitivity.
+   two-sided-falsification finding — and it REFUTES, not confirms, the
+   Step-2 improvement prediction (`"RED"` is always the DEGRADATION-
+   concordant arm; more effective lr made held-out loss worse, so the
+   secant extrapolation was wrong). Only a `+0.50` dose reading
+   `RED_FOR_INVESTIGATION`-shaped improvement CONFIRMS the prediction
+   (unit-63 round-9 audit finding 1, correcting round-8 finding 1's own
+   inverted-polarity phrasing, which survived here). Either outcome is
+   reported separately, never folded into sensitivity.
 8. Tear down the scratch worktree and its build artifacts after the legs
    complete; do not leave a patched binary or scratch checkout on the pod
    past the dose-leg run. Each patch is committed to this repo as a FILE
@@ -471,9 +477,16 @@ separate record.
   on. `dose_label` is an operator-chosen string from the scheduled set
   (e.g. `"eps-0.50"`), but it IS reinterpreted by the merger — parsed as a
   signed `eps` float (`ab_merge._dose_label_eps`) to place the column in
-  the degradation/improvement branch and (unit-63 round-8 audit finding 3)
-  validated finite, non-zero, and within this family's own sane domain
-  (`|eps| <= MUTANT_DOSE_LADDER_MAX_ABS_EPS`); an unparseable, non-finite,
+  the degradation/improvement branch and (unit-63 round-8 audit finding 3;
+  round-9 audit finding 2 makes the domain ASYMMETRIC) validated finite,
+  non-zero, and within this family's own sane domain — `eps in
+  (-1.0, -MUTANT_DOSE_LADDER_MIN_ABS_EPS] union
+  [MUTANT_DOSE_LADDER_MIN_ABS_EPS, MUTANT_DOSE_LADDER_MAX_ABS_EPS]`
+  (`eps == -1.0` itself is refused, EXCLUSIVE: the update-scale multiplier
+  `(1+eps)` is zero there, a zero-update leg, not a member of this
+  family — a single symmetric `|eps| <= MAX` check would have let it
+  through; a magnitude below `MUTANT_DOSE_LADDER_MIN_ABS_EPS` is refused
+  as below the smallest ever-scheduled dose); an unparseable, non-finite,
   zero, or out-of-domain label is refused loudly, never silently
   passed through as an opaque tag.
 - **Per-leg recorded fields**: every field a clean `fused` leg already
@@ -518,9 +531,29 @@ separate record.
   silent skip) — never the caller-supplied/run order, and never a
   cross-sign pair. Returns `null` if no such transition exists in that
   branch. `sensitivity` is scoped to the degradation branch ONLY —
-  `"RED_FOR_INVESTIGATION"` never enters it, by construction (it can only
-  occur among positive-eps or otherwise improvement-concordant doses, and
-  the branch here is `eps < 0` doses' own `detected` value regardless).
+  `"RED_FOR_INVESTIGATION"` never enters it, by construction (the straddle
+  predicate matches the literal string `"RED"` only). This is true
+  REGARDLESS of eps sign — `"RED_FOR_INVESTIGATION"` is NOT restricted to
+  positive-eps doses (unit-63 round-9 audit finding 3 corrects that prior
+  claim here): a NEGATIVE-eps dose can read `"RED_FOR_INVESTIGATION"` too
+  (an anomalous improvement detected under DEFLATION, the opposite of that
+  branch's own predicted degradation direction) — never folded into
+  `sensitivity` either way, but reported separately under
+  `mutant_dose_ladder.dose_anomalies` (see below) rather than silently
+  dropped.
+- **Dose anomalies** (unit-63 round-9 audit finding 3):
+  `mutant_dose_ladder.dose_anomalies` — every NEGATIVE-eps (`eps < 0`) dose
+  column whose `detected` is `"RED_FOR_INVESTIGATION"`
+  (`ab_merge.mutant_dose_ladder_anomalies`), each recorded as
+  `{dose_label, eps, detected, finding: "anomalous improvement under
+  deflation (eps < 0)"}`. A NON-EMPTY list gates this merge's own exit
+  code exactly as the primary decision's own `RED_FOR_INVESTIGATION`
+  state does (`ab_merge.main`'s own three-outcome gate) — "investigated,
+  never silently celebrated" applies here too, not just to the primary
+  decision.
+  A POSITIVE-eps dose reading `"RED_FOR_INVESTIGATION"` is NEVER a member
+  of this list; that is the ORDINARY, PREDICTED two-sided-falsification
+  confirming arm instead (see below), not an anomaly.
   A positive-eps (`eps > 0`) dose reading `"RED"` OR `"RED_FOR_INVESTIGATION"`
   is reported separately, under `mutant_dose_ladder.two_sided_falsification`
   (unit-63 round-8 audit finding 2: BOTH arms are reported there, with the
@@ -528,7 +561,14 @@ separate record.
   `"RED_FOR_INVESTIGATION"` is `"secant confirmed (improvement at +eps)"` —
   never a positive-eps `"RED"` described as "confirming" the improvement
   prediction; that inverted-polarity phrasing was unit-63 round-8 audit
-  finding 1, now corrected everywhere it appeared), never folded into
+  finding 1 — round-8 itself missed two survivors (this file's own on-pod
+  procedure step 7, and `ab_merge.mutant_dose_ladder_sensitivity`'s own
+  docstring), corrected by unit-63 round-9 audit finding 1, confirmed
+  corrected everywhere it appears by that round's own
+  `grep -rn -i 'confirm|refut'` / `'reading RED|reads RED|\+0.50'` sweep over
+  `ab_merge.py`, `test_ab_merge.py`, this file, and `CONTRACT.md` — a
+  completeness claim re-established by sweep each round it is touched,
+  never merely asserted), never folded into
   `sensitivity` (`ab_merge.mutant_dose_ladder_sensitivity` /
   `ab_merge.mutant_dose_ladder_two_sided_falsification`).
 - **Mutant legs never enter the primary A/B set**: proven structurally (the

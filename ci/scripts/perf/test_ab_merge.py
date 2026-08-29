@@ -3918,6 +3918,43 @@ class MutantDoseLadderTests(unittest.TestCase):
         ]
         self.assertIsNone(ab_merge.mutant_dose_ladder_sensitivity(columns))
 
+    def test_negative_red_for_investigation_is_a_dose_anomaly(self):
+        # unit-63 round-9 audit finding 3: a negative-eps dose reading
+        # RED_FOR_INVESTIGATION is an anomalous improvement under
+        # deflation -- it must never silently vanish from sensitivity AND
+        # anomalies both; sensitivity correctly returns None (unchanged
+        # test above), and this is the entry that names the anomaly.
+        columns = [
+            {"dose_label": "eps-0.50", "detected": "not-detected"},
+            {"dose_label": "eps-0.10", "detected": "RED_FOR_INVESTIGATION"},
+        ]
+        anomalies = ab_merge.mutant_dose_ladder_anomalies(columns)
+        self.assertEqual(
+            anomalies,
+            [
+                {
+                    "dose_label": "eps-0.10",
+                    "eps": -0.10,
+                    "detected": "RED_FOR_INVESTIGATION",
+                    "finding": "anomalous improvement under deflation (eps < 0)",
+                }
+            ],
+        )
+
+    def test_positive_red_for_investigation_is_never_a_dose_anomaly(self):
+        # The ORDINARY, predicted two-sided-falsification confirming arm
+        # (a positive-eps dose reading RED_FOR_INVESTIGATION) must never be
+        # misclassified as an anomaly.
+        columns = [{"dose_label": "eps0.50", "detected": "RED_FOR_INVESTIGATION"}]
+        self.assertEqual(ab_merge.mutant_dose_ladder_anomalies(columns), [])
+
+    def test_negative_red_and_not_detected_are_never_dose_anomalies(self):
+        columns = [
+            {"dose_label": "eps-0.50", "detected": "RED"},
+            {"dose_label": "eps-0.10", "detected": "not-detected"},
+        ]
+        self.assertEqual(ab_merge.mutant_dose_ladder_anomalies(columns), [])
+
     def test_positive_eps_not_detected_is_not_a_falsification_finding(self):
         columns = [{"dose_label": "eps0.50", "detected": "not-detected"}]
         self.assertEqual(ab_merge.mutant_dose_ladder_two_sided_falsification(columns), [])
@@ -3939,6 +3976,17 @@ class MutantDoseLadderTests(unittest.TestCase):
         # they must never vanish from BOTH findings with a clean exit, so
         # each one is refused loudly at parse time instead.
         for dose_label in ("epsnan", "eps0.0", "eps-0.0", "epsinf", "eps-inf", "eps10.0"):
+            with self.subTest(dose_label=dose_label):
+                with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+                    ab_merge._dose_label_eps(dose_label)
+
+    def test_whitespace_or_explicit_plus_in_eps_substring_is_refused(self):
+        # unit-63 round-9 audit advisory (a): float() is more permissive
+        # than the raw leg file name lookup this label is used VERBATIM
+        # for -- a whitespace-padded or explicit-plus-signed eps substring
+        # parses fine but could silently diverge from the on-disk file
+        # name, so it is refused here rather than accepted.
+        for dose_label in ("eps 0.50", "eps0.50 ", "eps +0.50", "eps+0.50", "eps0.5\t0"):
             with self.subTest(dose_label=dose_label):
                 with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
                     ab_merge._dose_label_eps(dose_label)
@@ -3972,6 +4020,24 @@ class MutantDoseLadderTests(unittest.TestCase):
         columns = [{"dose_label": "eps10.0", "detected": "RED"}]
         with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
             ab_merge.mutant_dose_ladder_sensitivity(columns)
+
+    def test_eps_domain_boundary_oracle(self):
+        # unit-63 round-9 audit finding 2: the domain is ASYMMETRIC --
+        # `eps <= -1.0` (multiplier sign bound, exclusive of -1.0 itself)
+        # and `eps > 1.0` (the family-sanity cap) are refused on the high
+        # end, and `0 < abs(eps) < 0.01` (below the smallest ever-scheduled
+        # dose) is refused on the low end. A single symmetric
+        # `abs(eps) > 1.0` check would have wrongly ACCEPTED eps=-1.0 (a
+        # zero-update leg) as though it were a real degradation dose.
+        refused = ("eps-1.0", "eps1.01", "eps0.009")
+        accepted = {"eps-0.99": -0.99, "eps1.0": 1.0, "eps-0.01": -0.01}
+        for dose_label in refused:
+            with self.subTest(dose_label=dose_label, expect="refused"):
+                with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+                    ab_merge._dose_label_eps(dose_label)
+        for dose_label, expected_value in accepted.items():
+            with self.subTest(dose_label=dose_label, expect="accepted"):
+                self.assertAlmostEqual(ab_merge._dose_label_eps(dose_label), expected_value)
 
     def test_cli_wiring_folds_the_dose_ladder_into_the_same_artifact(self):
         with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
@@ -4037,6 +4103,60 @@ class MutantDoseLadderTests(unittest.TestCase):
                 ]
             )
         self.assertEqual(rc, 1)
+
+    def test_cli_wiring_fails_on_a_negative_eps_red_for_investigation_dose(self):
+        # unit-63 round-9 audit finding 3: a negative-eps (deflation) dose
+        # reading RED_FOR_INVESTIGATION (11/12 seeds read BETTER than
+        # alloff, an anomalous improvement under deflation) must non-zero
+        # the merge's own exit code -- before this fix it silently yielded
+        # sensitivity=null, sensitivity_error=null, exit 0.
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                # 6-vs-6 (mixed sign) -- a GREEN main decision, isolating
+                # this test's own claim (a negative-eps dose_anomaly alone
+                # fails the merge's exit code) from the main decision rule.
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                # mutant mean below BOTH branches' own alloff_mean (0.50 /
+                # 0.40) so every non-dissenting seed reads improvement;
+                # seed 12 dissents (above its own 0.40 alloff_mean) for
+                # 11/12, mirroring the RED-detecting test's own shape.
+                mutant_mean = 0.30 if seed != 12 else 0.70
+                _write_mutant_leg(raw_dir, seed, "eps-0.10", _mutant_tier(seed=seed, held_out_example_mean=mutant_mean))
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            mutant_spec = f"eps-0.10:{self.PATCH_SHA}:{seeds_s}"
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    mutant_spec,
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 1)
+        self.assertEqual(merged["mutant_dose_ladder"]["doses"][0]["detected"], "RED_FOR_INVESTIGATION")
+        self.assertIsNone(merged["mutant_dose_ladder"]["sensitivity"])
+        self.assertEqual(
+            merged["mutant_dose_ladder"]["dose_anomalies"],
+            [
+                {
+                    "dose_label": "eps-0.10",
+                    "eps": -0.10,
+                    "detected": "RED_FOR_INVESTIGATION",
+                    "finding": "anomalous improvement under deflation (eps < 0)",
+                }
+            ],
+        )
 
     def test_cli_wiring_fails_on_an_unparseable_dose_label(self):
         # unit-63 round-7 audit finding 4: an operator-typo'd dose_label

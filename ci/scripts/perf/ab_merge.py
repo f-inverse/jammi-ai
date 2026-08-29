@@ -2717,13 +2717,30 @@ def build_finetune_run_report(raw_dir, seeds, lr0_seeds=(), allow_missing_lr0_co
 MUTANT_DECISION_THRESHOLD = FINETUNE_RUN_DECISION_THRESHOLD
 MUTANT_GATE_SEED_COUNT = FINETUNE_RUN_GATE_SEED_COUNT
 
-# unit-63 round-8 audit finding 3: the sane domain for this family's own
-# SIGNED `eps` (CONTRACT.md addendum 2026-08-29c: the update-scale
-# multiplier is `(1+eps)`) -- the scheduled ladder never exceeds `|eps| =
-# 0.50`; a magnitude past `1.0` is no longer a "silent lr (in/de)flation"
-# dose (at `eps <= -1.0` the update-scale multiplier is non-positive, a
-# different failure shape entirely, not a member of this monotone family).
+# unit-63 round-8 audit finding 3 (round-9 audit finding 2 makes the
+# domain ASYMMETRIC -- a single `abs(eps) > MAX` check is not this
+# family's real shape): the sane domain for this family's own SIGNED
+# `eps` (CONTRACT.md addendum 2026-08-29c: the update-scale multiplier is
+# `(1+eps)`) is `eps in (-1.0, -MUTANT_DOSE_LADDER_MIN_ABS_EPS] union
+# [MUTANT_DOSE_LADDER_MIN_ABS_EPS, MUTANT_DOSE_LADDER_MAX_ABS_EPS]`:
+#   - `eps <= -1.0` is refused, EXCLUSIVE of the bound itself: at
+#     `eps == -1.0` the update-scale multiplier `(1+eps)` is exactly
+#     zero (a zero-update leg -- this constant's own prior doc already
+#     named it "not a member of this monotone family"), and past it the
+#     multiplier is NEGATIVE (a sign flip, a different failure shape
+#     entirely). A single symmetric `abs(eps) > MUTANT_DOSE_LADDER_MAX_ABS_EPS`
+#     check let `eps == -1.0` through (`abs(-1.0) == 1.0`, not `> 1.0`) --
+#     the round-9 audit demonstrated it reported as the Acceptance-5-
+#     discharging degradation bound for a zero-update leg.
+#   - `eps > 1.0` is refused as the family-sanity cap: the scheduled
+#     ladder never exceeds `|eps| = 0.50`; nothing past `1.0` has ever
+#     been a scheduled dose.
+#   - `0.0 < abs(eps) < MUTANT_DOSE_LADDER_MIN_ABS_EPS` is refused as
+#     below the smallest ever-scheduled dose (`|eps| = 0.10`) -- a
+#     manufactured `eps=1e-9` sitting at the bottom of a straddle is
+#     refused rather than silently accepted as a real, schedulable dose.
 MUTANT_DOSE_LADDER_MAX_ABS_EPS = 1.0
+MUTANT_DOSE_LADDER_MIN_ABS_EPS = 0.01
 
 
 def mutant_leg_repeat_tag(dose_label):
@@ -3000,11 +3017,24 @@ def _dose_label_eps(dose_label):
     dropped" this module's own doc promises, and never delivers, for that
     one shape. The same applies to a non-finite magnitude (`inf`/`-inf`,
     which trivially satisfies `> 0.0`/`< 0.0` but is not a real dose at
-    all) and to a magnitude outside this family's own sane domain (`|eps|
-    > MUTANT_DOSE_LADDER_MAX_ABS_EPS`, see that constant's own doc). Every
-    one of these is refused here, loudly, by the SAME exception every
-    other unparseable label raises -- never a silent pass-through to a
-    partition predicate that was never designed to reject them.
+    all) and to a value outside this family's own sane, ASYMMETRIC domain
+    (`eps <= -1.0`, `eps > MUTANT_DOSE_LADDER_MAX_ABS_EPS`, or `0.0 <
+    abs(eps) < MUTANT_DOSE_LADDER_MIN_ABS_EPS` -- unit-63 round-9 audit
+    finding 2, see those constants' own doc). Every one of these is
+    refused here, loudly, by the SAME exception every other unparseable
+    label raises -- never a silent pass-through to a partition predicate
+    that was never designed to reject them.
+
+    Unit-63 round-9 audit advisory (a): `dose_label` is parsed EXACTLY as
+    it will be used for raw leg file lookup (`mutant_leg_repeat_tag`
+    tags the leg file with the literal `dose_label` string, byte-for-byte)
+    -- `float()` is more permissive than that file name ever is, silently
+    accepting leading/trailing/embedded whitespace (`float(" 0.5")`) and
+    an explicit `+` sign (`float("+0.5")`) that a raw file name lookup
+    would never see the same way (e.g. a `+` sitting at a shell/URL
+    boundary where it is conventionally decoded as a space). A `dose_label`
+    whose eps substring contains either shape is refused here rather than
+    silently parsed to a value that could diverge from the on-disk name.
     """
     prefix = "eps"
     if not dose_label.startswith(prefix):
@@ -3014,6 +3044,14 @@ def _dose_label_eps(dose_label):
             "float literal, e.g. 'eps-0.50' / 'eps0.50')"
         )
     rest = dose_label[len(prefix):]
+    if any(c.isspace() for c in rest) or "+" in rest:
+        raise MutantDoseLadderSensitivityError(
+            f"dose_label {dose_label!r}'s eps substring {rest!r} contains whitespace or an "
+            "explicit '+' sign -- refused rather than parsed by a more permissive float(), since "
+            "this label is used VERBATIM for raw leg file lookup (mutant_leg_repeat_tag) and "
+            "either shape could silently diverge from the on-disk file name (e.g. a URL-encoding "
+            "boundary treating '+' as a space)"
+        )
     try:
         value = float(rest)
     except ValueError as exc:
@@ -3034,11 +3072,30 @@ def _dose_label_eps(dose_label):
             "or improvement (eps > 0.0) branch and must never be silently dropped from both "
             "findings"
         )
-    if abs(value) > MUTANT_DOSE_LADDER_MAX_ABS_EPS:
+    # unit-63 round-9 audit finding 2: the domain is ASYMMETRIC, never a
+    # single `abs(value) > MAX` check -- that check alone would let
+    # `eps == -1.0` through (`abs(-1.0) == MUTANT_DOSE_LADDER_MAX_ABS_EPS`,
+    # not `>`), a zero-update leg (multiplier `(1+eps) == 0`) this
+    # family's own doc already declares out of family. Refused EXCLUSIVE
+    # of the bound itself: `eps == -1.0` is refused, `eps == -0.99` is not.
+    if value <= -1.0:
         raise MutantDoseLadderSensitivityError(
-            f"dose_label {dose_label!r} parses to eps={value!r}, whose magnitude exceeds this "
-            f"family's own sane domain (|eps| <= {MUTANT_DOSE_LADDER_MAX_ABS_EPS}) -- never "
-            "silently accepted as though it were a scheduled dose"
+            f"dose_label {dose_label!r} parses to eps={value!r} (<= -1.0) -- at this magnitude "
+            "the update-scale multiplier (1+eps) is zero or negative, a different failure shape "
+            "entirely and never a member of this monotone silent-(in/de)flation family, even "
+            "though a single symmetric |eps| cap would have let it through"
+        )
+    if value > MUTANT_DOSE_LADDER_MAX_ABS_EPS:
+        raise MutantDoseLadderSensitivityError(
+            f"dose_label {dose_label!r} parses to eps={value!r}, which exceeds this family's own "
+            f"sane domain (eps <= {MUTANT_DOSE_LADDER_MAX_ABS_EPS}) -- never silently accepted as "
+            "though it were a scheduled dose"
+        )
+    if abs(value) < MUTANT_DOSE_LADDER_MIN_ABS_EPS:
+        raise MutantDoseLadderSensitivityError(
+            f"dose_label {dose_label!r} parses to eps={value!r}, whose magnitude is below this "
+            f"family's own smallest ever-scheduled dose (|eps| >= {MUTANT_DOSE_LADDER_MIN_ABS_EPS}) "
+            "-- never silently accepted as though it were a real, schedulable dose"
         )
     return value
 
@@ -3066,8 +3123,12 @@ def mutant_dose_ladder_sensitivity(dose_columns):
     pair in caller order is NOT a degradation-direction straddle at all --
     `+0.50` reading RED is the two-sided-falsification finding (see
     `mutant_dose_ladder_two_sided_falsification`), and reporting it as
-    "sensitivity" would misrepresent an improvement-direction detection as a
-    degradation bound.
+    "sensitivity" would misrepresent a POSITIVE-eps (inflation-direction)
+    degradation detection (unit-63 round-9 audit finding 1: `"RED"` is
+    ALWAYS the degradation-concordant arm, never an "improvement-direction
+    detection" regardless of eps sign) as though it belonged to the
+    NEGATIVE-eps (deflation-direction) degradation-bound family this
+    statistic actually measures.
 
     Each dose's SIGNED eps is parsed from its own `dose_label` via
     `_dose_label_eps` (raises `MutantDoseLadderSensitivityError`, never
@@ -3077,10 +3138,13 @@ def mutant_dose_ladder_sensitivity(dose_columns):
     (`eps < 0.0`) subset of `dose_columns` is sorted by `abs(eps)` ascending,
     or `None` if no such transition exists in that degradation-only,
     magnitude-ordered subset (every negative dose RED, every negative dose
-    not-detected/INVALID, the transition runs the OTHER way, or there are
-    fewer than two negative-eps doses to straddle at all). A positive-eps
-    dose is NEVER a member of this subset, regardless of its own `detected`
-    value.
+    not-detected/INVALID, the transition runs the OTHER way, a negative
+    dose reads `RED_FOR_INVESTIGATION` -- unit-63 round-9 audit finding 3:
+    an ANOMALY, an improvement detected under deflation, reported
+    separately by `mutant_dose_ladder_anomalies` and never a `"RED"`
+    straddle member here -- or there are fewer than two negative-eps doses
+    to straddle at all). A positive-eps dose is NEVER a member of this
+    subset, regardless of its own `detected` value.
     """
     negative = sorted(
         (col for col in dose_columns if _dose_label_eps(col["dose_label"]) < 0.0),
@@ -3090,6 +3154,48 @@ def mutant_dose_ladder_sensitivity(dose_columns):
         if lower["detected"] == "not-detected" and higher["detected"] == "RED":
             return {"lower": lower["dose_label"], "higher": higher["dose_label"]}
     return None
+
+
+def mutant_dose_ladder_anomalies(dose_columns):
+    """Unit-63 round-9 audit finding 3: a NEGATIVE-eps dose (silent lr
+    DEFLATION, this family's DEGRADATION-PREDICTED branch) reading
+    `"RED_FOR_INVESTIGATION"` is itself an ANOMALY -- a real, gate-detected
+    IMPROVEMENT under deflation, the opposite of that branch's own
+    predicted direction. `mutant_dose_ladder_sensitivity` correctly never
+    treats it as a `"RED"` straddle member (see that function's own doc),
+    but "never a straddle member" is not the same as "reported somewhere":
+    before this fix, a negative-eps `RED_FOR_INVESTIGATION` column silently
+    vanished -- `sensitivity` reads `None`, `sensitivity_error` reads
+    `None`, and the merge's own exit code stayed 0 -- exactly the class of
+    silent pass-through the primary decision rule's own
+    `RED_FOR_INVESTIGATION` gate exists to prevent (`main`'s own
+    `fr_merged["status"] in ("INVALID", "RED", "RED_FOR_INVESTIGATION")`
+    check): "anomalous improvement is investigated, never silently
+    celebrated".
+
+    Returns the list of `{"dose_label", "eps", "detected", "finding"}`
+    entries for every NEGATIVE-eps (`eps < 0.0`) dose column whose
+    `detected` is `"RED_FOR_INVESTIGATION"`, in `dose_columns`' own order,
+    with `finding` set to the literal string `"anomalous improvement under
+    deflation (eps < 0)"`. A POSITIVE-eps dose reading `RED_FOR_INVESTIGATION`
+    is NEVER a member of this list -- that is the ORDINARY, PREDICTED
+    two-sided-falsification confirming arm (see
+    `mutant_dose_ladder_two_sided_falsification`), not an anomaly. Empty
+    when no negative-eps dose reads `RED_FOR_INVESTIGATION`. Each dose's
+    SIGNED eps is parsed via `_dose_label_eps` (same refusal behaviour as
+    the other two dose-ladder findings).
+    """
+    out = []
+    for col in dose_columns:
+        eps = _dose_label_eps(col["dose_label"])
+        if eps < 0.0 and col["detected"] == "RED_FOR_INVESTIGATION":
+            out.append({
+                "dose_label": col["dose_label"],
+                "eps": eps,
+                "detected": col["detected"],
+                "finding": "anomalous improvement under deflation (eps < 0)",
+            })
+    return out
 
 
 def mutant_dose_ladder_two_sided_falsification(dose_columns):
@@ -3256,15 +3362,18 @@ def main(argv=None):
             try:
                 sensitivity = mutant_dose_ladder_sensitivity(dose_columns)
                 two_sided_falsification = mutant_dose_ladder_two_sided_falsification(dose_columns)
+                dose_anomalies = mutant_dose_ladder_anomalies(dose_columns)
             except MutantDoseLadderSensitivityError as exc:
                 sensitivity = None
                 two_sided_falsification = []
+                dose_anomalies = []
                 sensitivity_error = str(exc)
             fr_merged["mutant_dose_ladder"] = {
                 "doses": dose_columns,
                 "sensitivity": sensitivity,
                 "sensitivity_error": sensitivity_error,
                 "two_sided_falsification": two_sided_falsification,
+                "dose_anomalies": dose_anomalies,
                 "note": (
                     "CONTRACT amendment 2026-08-29b item 3, signed per addendum 2026-08-29c: each "
                     "dose column merges the mutant, substituted into the fused arm, against the "
@@ -3273,10 +3382,15 @@ def main(argv=None):
                     "(mutant_leg_repeat_tag's own file-naming isolation). 'sensitivity' names the "
                     "adjacent-dose pair straddling detection WITHIN the degradation-direction "
                     "(negative-eps) branch only, magnitude-ordered, or null when no such transition "
-                    "exists there; a positive-eps dose reading RED is reported separately under "
-                    "'two_sided_falsification', never folded into 'sensitivity'; "
-                    "'sensitivity_error' names a dose_label that failed to parse as a signed eps "
-                    "value, never silently ignored."
+                    "exists there; a positive-eps dose reading RED or RED_FOR_INVESTIGATION is "
+                    "reported separately under 'two_sided_falsification' (RED refutes the held-out-"
+                    "improvement prediction, RED_FOR_INVESTIGATION confirms it), never folded into "
+                    "'sensitivity'; a NEGATIVE-eps dose reading RED_FOR_INVESTIGATION (an anomalous "
+                    "improvement detected under deflation, unit-63 round-9 audit finding 3) is "
+                    "reported under 'dose_anomalies' instead and gates this merge's own exit code "
+                    "exactly as the primary decision's own RED_FOR_INVESTIGATION state does -- "
+                    "investigated, never silently celebrated; 'sensitivity_error' names a "
+                    "dose_label that failed to parse as a signed eps value, never silently ignored."
                 ),
             }
             dose_lines = ["", "# mutant dose ladder (amendment 2026-08-29b item 3; addendum 2026-08-29c signs it)"]
@@ -3292,6 +3406,8 @@ def main(argv=None):
                 dose_lines.append(f"  sensitivity: {sensitivity}")
             if two_sided_falsification:
                 dose_lines.append(f"  two_sided_falsification: {two_sided_falsification}")
+            if dose_anomalies:
+                dose_lines.append(f"  dose_anomalies: {dose_anomalies}")
             fr_table = fr_table + "\n" + "\n".join(dose_lines)
             if sensitivity_error is not None:
                 print(
@@ -3304,6 +3420,21 @@ def main(argv=None):
                 print(
                     f"finetune_run_ab mutant-dose-ladder: FAIL — dose column(s) {invalid_doses} are "
                     "INVALID (correctness-of-measurement problem, see the table above)",
+                    file=sys.stderr,
+                )
+                exit_code = 1
+            if dose_anomalies:
+                # unit-63 round-9 audit finding 3: mirrors the primary
+                # decision rule's own RED_FOR_INVESTIGATION gate (below) --
+                # an anomalous improvement under deflation is investigated,
+                # never silently celebrated, even though it can never be a
+                # 'sensitivity' straddle member.
+                anomalous_doses = [a["dose_label"] for a in dose_anomalies]
+                print(
+                    f"finetune_run_ab mutant-dose-ladder: FAIL — dose column(s) {anomalous_doses} "
+                    "read RED_FOR_INVESTIGATION at a NEGATIVE eps (anomalous improvement under "
+                    "deflation, see 'dose_anomalies' above) -- investigated, never silently "
+                    "celebrated",
                     file=sys.stderr,
                 )
                 exit_code = 1

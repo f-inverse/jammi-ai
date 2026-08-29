@@ -243,14 +243,28 @@ original two-leg discipline, `EXPECTED_DENOMINATOR`/`--sweep`, generalized):
       ISO-8601 timestamps, GB/MB sizes, epoch/step/t axis labels,
       named-hyperparameter assignments, and section/item/round/unit
       cross-references) — every class is enumerated at its definition
-      site (`_EXTRA_EXCLUSIONS` below) with a one-line reason and (round-23
-      audit F3: true of all 31 classes as of this fix, not just a subset)
-      a self-test fixture proving it excludes ONLY its own shape — a
-      positive "excludes cleanly" case AND an adversarial "a measured
-      value in the SAME syntactic neighborhood is still found" case, both
-      driven through `find_claim_tokens` in `self_test` below; there is
-      no per-file/per-line carve-out that could silently narrow past that
-      documented boundary the way a zone allowlist could. A SUBSET of
+      site (`_EXTRA_EXCLUSIONS` below), with a one-line reason, and has
+      EXACTLY one row in the `_EXCLUSION_FIXTURES` registry immediately
+      below `find_claim_tokens` — a positive "excludes cleanly" case AND
+      an adversarial "a measured value in the SAME syntactic neighborhood
+      is still found" case, both driven through `find_claim_tokens`.
+      `len(_EXCLUSION_FIXTURES) == len(_EXTRA_EXCLUSIONS)` is an `assert`
+      that runs at IMPORT time (round-25: not deferred to `--self-test`,
+      and not a recount by hand each round) — so "every one of the 31
+      classes has a fixture proving it excludes ONLY its own shape" is
+      true BY CONSTRUCTION: a class with a missing, empty, or misindexed
+      row fails to even import, and `self_test` additionally runs a BITE
+      sweep (`_worst_case_span_extension`) that monkeypatches EVERY
+      class's own pattern into its worst-case span-extending widening and
+      confirms the SAME adversarial fixture goes RED — proving each row
+      is load-bearing against a future widening, not merely a decorative
+      pass on the pattern as currently written (round-25's own live
+      finding: two classes, `unit 63` and `PLAN v2 delta N`, had an
+      anchoring/"different-N" fixture but no adjacency fixture at all, so
+      a widening of either was FULLY SILENT — closed by registration, not
+      by patching those two instances alone). There is no per-file/
+      per-line carve-out that could silently narrow past that documented
+      boundary the way a zone allowlist could. A SUBSET of
       classes are additionally ANCHORED to the specific literal idiom/
       digit they name (round-22 audit B4, round-23 F1:
       `Step`/`Acceptance`/`finding`/`unit 63`/`CONTRACT 63`/
@@ -417,11 +431,18 @@ MEASUREMENT_FILES = [
 #       `_EXTRA_EXCLUSIONS` below, plus the `claims63:`-tag-line skip in
 #       `find_claim_tokens` — a directive line, never claim-bearing content)
 #       — every class is named with a one-line reason at its definition
-#       site, and every class has a self-test fixture proving it excludes
-#       ONLY its own shape (`self_test`'s "exclusion class" fixtures
-#       below — round-23 audit F3: true of every one of the 31 classes as
-#       of this fix; 19 previously had no such fixture at all, a gap this
-#       leg itself exists to prevent). A1 (round-22 audit): a heading line
+#       site, and every class has exactly one row in the
+#       `_EXCLUSION_FIXTURES` registry (next to `find_claim_tokens`)
+#       proving it excludes ONLY its own shape — a STRUCTURAL guarantee
+#       (round-25: `assert len(_EXCLUSION_FIXTURES) ==
+#       len(_EXTRA_EXCLUSIONS)` runs at import time, plus a BITE sweep in
+#       `self_test` that widens every class's own pattern into its
+#       worst-case span-extension and confirms its fixture goes RED),
+#       superseding round-23 F3's hand-maintained one-`check()`-per-class
+#       relay (round-24's own commit message named this shape "F10"; two
+#       classes, `unit 63` and `PLAN v2 delta N`, still had no adjacency
+#       fixture under that relay — closed by the registry, not by a third
+#       instance patch). A1 (round-22 audit): a heading line
 #       (`^#`) is NOT its own
 #       mechanism — there used to be a whole-line heading skip here, but it
 #       swallowed a live threshold flip AND an injected false claim written
@@ -735,6 +756,14 @@ def _all_excluded_spans(text: str) -> list[tuple[int, int]]:
     return rule_h.excluded_spans(text) + _extra_excluded_spans(text)
 
 
+# moved above `find_claim_tokens` (round-25): the exclusion-class self-test
+# registry below calls `find_claim_tokens` at IMPORT time (structural
+# registration, not deferred to `--self-test`), which needs `_TAG_RE`
+# already bound -- same regex, same claims63-tag-line skip, just defined
+# earlier so the eager registry check can resolve it.
+_TAG_RE = re.compile(r"^\s*<!--\s*claims63:\s*(?P<body>.*?)\s*-->\s*$")
+
+
 def find_claim_tokens(line: str, line_no: int) -> list[rule_h.Token]:
     """Same shape as `rule_h.find_tokens_in_row`, over `SCI_NUMBER_RE` and
     the UNION of rule (h)'s own exclusions plus this corpus's additions.
@@ -764,9 +793,224 @@ def find_claim_tokens(line: str, line_no: int) -> list[rule_h.Token]:
     return out
 
 
-# --- claim tag parsing (rule (h)'s own comment-above-line idiom) ----------
+# --- exclusion-class self-test REGISTRY (round-25 audit: class-terminal fix)
+# Round-23 F3 gave every `_EXTRA_EXCLUSIONS` class a positive/adversarial
+# fixture pair, but as 62 individual hand-written `check()` calls in
+# `self_test` — a RELAY shape (round-24's own commit message: "the
+# one-instance-at-a-time relay shape (F10)"), never checked for completeness
+# against `_EXTRA_EXCLUSIONS` ITSELF. Round-25's live finding: two classes
+# (`unit[\s-]+63` and `PLAN v2 delta N`) had an anchoring/"different-N"
+# fixture but NO adjacency fixture at all — a measured value written right
+# beside the idiom was never even a candidate check, so a monkeypatch sweep
+# that widened either pattern was FULLY SILENT (`self_test` stayed green).
+# This registry closes that CLASS, not just the two instances: every row of
+# `_EXTRA_EXCLUSIONS` has EXACTLY one row here, at the SAME index, and
+# `self_test` below ITERATES this table rather than listing one `check()`
+# per class by hand. A class with a missing, empty, or misindexed
+# positive/adversarial pair fails STRUCTURALLY at import time (the asserts
+# immediately below the table), never merely at self-test-review time — so
+# the module docstring's ":247" claim ("every one of the 31 classes has a
+# fixture") is true BY CONSTRUCTION: `len(_EXCLUSION_FIXTURES) ==
+# len(_EXTRA_EXCLUSIONS)` is asserted, not recounted by hand each round.
+@dataclass(frozen=True)
+class _ExclusionFixture:
+    """One row: binds `_EXTRA_EXCLUSIONS[index]` to its own `name` (used in
+    `self_test`'s PASS/FAIL print lines, matching the pre-registry wording),
+    a `positive` probe line that must exclude CLEANLY (`positive_expected`,
+    always `()` for this corpus — every class's whole purpose is to produce
+    zero claim tokens on its own idiom), and an `adversarial` probe line — a
+    REAL measured value in the SAME syntactic neighborhood as the idiom —
+    that must still be FOUND (`adversarial_expected`, always non-empty:
+    round-25's own registration assert below enforces this, since an empty
+    adversarial_expected would make the row untestable-by-construction, the
+    exact silent-pass shape this registry exists to close)."""
 
-_TAG_RE = re.compile(r"^\s*<!--\s*claims63:\s*(?P<body>.*?)\s*-->\s*$")
+    index: int
+    name: str
+    positive: str
+    positive_expected: tuple[str, ...]
+    adversarial: str
+    adversarial_expected: tuple[str, ...]
+
+
+_EXCLUSION_FIXTURES: tuple[_ExclusionFixture, ...] = (
+    _ExclusionFixture(0, "hex/sha run",
+        "checkpoint dc1cfc3b committed", (),
+        "the run recorded 42 alongside checkpoint dc1cfc3b", ("42",)),
+    _ExclusionFixture(1, "date+revision-letter",
+        "recorded on 2026-08-29c after the fix", (),
+        "measured 2.5 on 2026-08-29c", ("2.5",)),
+    _ExclusionFixture(2, "compact ISO-8601 timestamp",
+        "output dir 20260829T055912Z", (),
+        "measured 2.5 at 20260829T055912Z", ("2.5",)),
+    _ExclusionFixture(3, "GB/MB size",
+        "A100-SXM4-80GB", (),
+        "measured 2.5 on the 80GB A100", ("2.5",)),
+    _ExclusionFixture(4, "epoch/step/t axis index",
+        "detected at epoch 1", (),
+        "measured 2.5 at epoch 1", ("2.5",)),
+    _ExclusionFixture(5, "hyperparameter setting",
+        "lr=2e-4, eps=1e-8, alpha2=0.0064, beta1=0.9", (),
+        "measured 2.5 at lr=2e-4", ("2.5",)),
+    _ExclusionFixture(6, "item N cross-ref",
+        "see item 2(ii) above", (),
+        "measured 2.5 near item 2(ii)", ("2.5",)),
+    _ExclusionFixture(7, "RC:N exit code",
+        "RC:0", (),
+        "measured 2.5 at RC:0", ("2.5",)),
+    _ExclusionFixture(8, "eps-N dose label",
+        "eps-0.50 dose", (),
+        "measured -0.50 near eps-0.50", ("-0.50",)),
+    _ExclusionFixture(9, "ordered-list marker",
+        "3. another line", (),
+        "2. the measured value is 3.5", ("3.5",)),
+    _ExclusionFixture(10, "lr parenthetical mention",
+        "the lr (2e-4) setting", (),
+        "measured 2.5 near lr (2e-4)", ("2.5",)),
+    _ExclusionFixture(11, "(1+eps)/(1-eps) formula fragment",
+        "the `(1+eps)`/`(1-eps)` dose-family shape", (),
+        "measured 1.5 near (1+eps)", ("1.5",)),
+    _ExclusionFixture(12, "Step N",
+        "Step 2 predicted the effect", (),
+        "the measured value was 2.5 in Step 2", ("2.5",)),
+    _ExclusionFixture(13, "Acceptance N",
+        "Acceptance 5 discharged", (),
+        "measured 5.5 near Acceptance 5", ("5.5",)),
+    _ExclusionFixture(14, "finding N",
+        "finding 4 resolved", (),
+        "measured 4.4 near finding 4", ("4.4",)),
+    _ExclusionFixture(15, "63-how-well dir segment",
+        "docs/plans/63-how-well/x", (),
+        "measured 63.5 in 63-how-well context", ("63.5",)),
+    _ExclusionFixture(16, "CONTRACT 63",
+        "CONTRACT 63", (),
+        "measured 63.5 in CONTRACT 63", ("63.5",)),
+    _ExclusionFixture(17, "unit 63",
+        "unit 63", (),
+        # round-25 audit: this row's adversarial half DID NOT EXIST before
+        # this fix -- only a "different unit number" differential (below,
+        # `unit 12`) existed, never an ADJACENT real value beside the SAME
+        # `unit 63` idiom. A monkeypatch sweep that widened the exclusion
+        # span leftward (e.g. a stray `.*` prefix) was therefore fully
+        # silent; this line closes exactly that gap.
+        "measured 2.5 in unit 63", ("2.5",)),
+    _ExclusionFixture(18, "PLAN v2 delta N",
+        "PLAN v2 delta 7", (),
+        # round-25 audit: same gap as class 17 above -- only the "bare delta
+        # N" differential (below) existed, never an adjacent-value probe.
+        "shift 0.7 per PLAN v2 delta 7", ("0.7",)),
+    _ExclusionFixture(19, r"H\d+(\d+)",
+        "per H5(1)'s own rule", (),
+        "measured 5.5 per H5(1)", ("5.5",)),
+    _ExclusionFixture(20, "*.patch filename",
+        "see `M_eps_-0.10.patch` for the patch", (),
+        "measured -0.10 as recorded in `M_eps_-0.10.patch`", ("-0.10",)),
+    _ExclusionFixture(21, "s-scale",
+        "the operating point `s: 0 -> 1`, `s=1` was reached", (),
+        "measured 1.5 at `s=1`", ("1.5",)),
+    _ExclusionFixture(22, "[0, 1] axis-domain bracket",
+        "the axis range is [0, 1] here", (),
+        "measured 0.5 alongside the [0, 1] axis range", ("0.5",)),
+    _ExclusionFixture(23, "eps sign condition",
+        "for eps < 0 dose, unlike eps > 0", (),
+        "measured 0.5 when eps < 0", ("0.5",)),
+    _ExclusionFixture(24, "exit N",
+        "cargo build (exit 0)", (),
+        "measured 0.5 at (exit 0)", ("0.5",)),
+    _ExclusionFixture(25, "seed{N,M}",
+        "seed{1,2} committed", (),
+        "measured 1.5 for seed{1,2}", ("1.5",)),
+    _ExclusionFixture(26, "theta=/g= bracket array",
+        "theta=[0.5,-1.25,3.0,0.0] fixed input", (),
+        "measured 0.5 near theta=[0.5,-1.25,3.0,0.0]", ("0.5",)),
+    _ExclusionFixture(27, "4-element CPU-demo input",
+        "the same fixed 4-element input", (),
+        "measured 4.5 near the 4-element input", ("4.5",)),
+    _ExclusionFixture(28, "5-consecutive CPU-demo steps",
+        "for 5 consecutive steps", (),
+        "measured 5.5 over 5 consecutive steps", ("5.5",)),
+    _ExclusionFixture(29, "seed-number list",
+        "seeds 9 and 12 committed", (),
+        "measured 9.5 near seeds 9 and 12", ("9.5",)),
+    _ExclusionFixture(30, "zero/negative array-index bracket",
+        "series[0] and series[-1]", (),
+        "measured 2.5 near series[0]", ("2.5",)),
+)
+
+# STRUCTURAL registration checks (round-25: not deferred to `--self-test` --
+# these run on EVERY import, including a plain `gate()` invocation, so a
+# regressed row is a FINDING before any CI job even reaches `--self-test`).
+# (1) the table is index-complete against `_EXTRA_EXCLUSIONS` itself -- the
+#     :247 "all 31 classes" universal is this assert, not a comment.
+assert len(_EXCLUSION_FIXTURES) == len(_EXTRA_EXCLUSIONS), (
+    f"_EXCLUSION_FIXTURES has {len(_EXCLUSION_FIXTURES)} rows but "
+    f"_EXTRA_EXCLUSIONS has {len(_EXTRA_EXCLUSIONS)} classes -- every "
+    "class must have exactly one registry row (round-25: this assert IS "
+    "the :247 universal, not a recount)."
+)
+assert tuple(fx.index for fx in _EXCLUSION_FIXTURES) == tuple(range(len(_EXTRA_EXCLUSIONS))), (
+    "_EXCLUSION_FIXTURES must be index-ordered 1:1 with _EXTRA_EXCLUSIONS "
+    "(a reordered or skipped index binds the wrong pattern to the wrong "
+    "fixture, silently)."
+)
+for _fx in _EXCLUSION_FIXTURES:
+    # (2) both halves non-empty -- an empty positive/adversarial string, or
+    #     an adversarial fixture that asserts NO surviving token, is
+    #     untestable by construction (exactly the silent-pass shape this
+    #     registry exists to forbid).
+    assert _fx.positive.strip(), f"class {_fx.index} ({_fx.name}): empty positive fixture"
+    assert _fx.adversarial.strip(), f"class {_fx.index} ({_fx.name}): empty adversarial fixture"
+    assert _fx.adversarial_expected, (
+        f"class {_fx.index} ({_fx.name}): adversarial fixture must assert "
+        ">=1 surviving token, or it proves nothing"
+    )
+    # (3) both halves EXECUTE with the asserted results, at import time --
+    #     never merely typed into the table and trusted.
+    _got_pos = tuple(t.text for t in find_claim_tokens(_fx.positive, 1))
+    assert _got_pos == _fx.positive_expected, (
+        f"class {_fx.index} ({_fx.name}): positive fixture {_fx.positive!r} "
+        f"produced {_got_pos}, expected {_fx.positive_expected}"
+    )
+    _got_adv = tuple(t.text for t in find_claim_tokens(_fx.adversarial, 1))
+    assert _got_adv == _fx.adversarial_expected, (
+        f"class {_fx.index} ({_fx.name}): adversarial fixture {_fx.adversarial!r} "
+        f"produced {_got_adv}, expected {_fx.adversarial_expected}"
+    )
+del _fx
+
+
+def _worst_case_span_extension(
+    pattern: re.Pattern, adversarial: str, expected: tuple[str, ...]
+) -> tuple[str | None, str]:
+    """Round-25 BITE sweep helper: construct the WORST-CASE span-extending
+    widening of `pattern` -- a `.*` consuming everything between the
+    idiom's own match and the line boundary -- on WHICHEVER SIDE of that
+    match the adversarial fixture's real value sits (auto-detected by
+    string position, never hand-coded per class, so a future 32nd class
+    needs no new wiring here to be swept). Returns `(widened_source,
+    "leading"|"trailing")`, or `(None, reason)` if that side is
+    structurally forbidden (a `^` line-start anchor forbids ANY leftward
+    extension -- class 9, the ordered-list marker, is the one class in
+    this corpus where this fires; every other class's own adversarial
+    value sits on a side its own pattern can, in principle, be widened
+    into, which is exactly the vulnerability this sweep exists to close)."""
+    src = pattern.pattern
+    m = pattern.search(adversarial)
+    assert m is not None, "adversarial fixture must itself contain the idiom"
+    value_pos = adversarial.find(expected[0])
+    assert value_pos != -1, "adversarial fixture must itself contain its own expected value"
+    if value_pos < m.start():
+        if src.startswith("^"):
+            return None, "IMPOSSIBLE: '^' line-start anchor forbids leftward span-extension"
+        core = src[2:] if src.startswith(r"\b") else src
+        return ".*" + core, "leading"
+    core = src[:-2] if src.endswith(r"\b") else src
+    return core + ".*", "trailing"
+
+
+# --- claim tag parsing (rule (h)'s own comment-above-line idiom) ----------
+# (`_TAG_RE` itself now lives above, next to `find_claim_tokens` -- see the
+# round-25 comment there.)
 
 
 def _entries_for_line(lines: list[str], line_no: int) -> tuple[str | None, list[str] | None]:
@@ -2262,25 +2506,84 @@ def self_test() -> int:
             not any("dead" in f.message or "only" in f.message for f in findings_balanced),
         )
 
-    # --- new (round-21) closed lexical exclusion classes: each excludes
-    # ONLY its own shape -- a measured token dressed up in the SAME
-    # syntactic neighborhood (adversarial fixture per class) must still be
-    # found. -----------------------------------------------------------
+    # --- exclusion-class coverage (round-21 origin; round-25 STRUCTURAL
+    # rewrite): each of the 31 `_EXTRA_EXCLUSIONS` classes excludes ONLY its
+    # own shape -- a measured token dressed up in the SAME syntactic
+    # neighborhood (adversarial fixture) must still be found. This is no
+    # longer 62 hand-written `check()` calls (round-24's own commit message:
+    # "the one-instance-at-a-time relay shape (F10)") -- it is a single
+    # loop over `_EXCLUSION_FIXTURES` (defined next to `find_claim_tokens`
+    # above), which was ALREADY asserted structurally at import time; this
+    # loop re-runs the SAME table through `check()` purely so the existing
+    # PASS/FAIL print-line audit trail (one line per class, matching every
+    # prior round's convention) is preserved for a human `--self-test` read.
+    # -----------------------------------------------------------------
     def toks_of(line: str) -> list[str]:
         return [t.text for t in find_claim_tokens(line, 1)]
 
-    check("exclusion(Step N): 'Step 2 predicted the effect' excludes cleanly", toks_of("Step 2 predicted the effect") == [])
     check(
-        "exclusion(Step N) adversarial: a measured value beside 'Step 2' is still found",
-        toks_of("the measured value was 2.5 in Step 2") == ["2.5"],
+        f"F-registry: _EXCLUSION_FIXTURES is index-complete against "
+        f"_EXTRA_EXCLUSIONS ({len(_EXCLUSION_FIXTURES)} of {len(_EXTRA_EXCLUSIONS)}) "
+        "-- the :247 'all 31 classes' universal, true by construction",
+        len(_EXCLUSION_FIXTURES) == len(_EXTRA_EXCLUSIONS),
     )
+    for _fx in _EXCLUSION_FIXTURES:
+        check(
+            f"exclusion({_fx.name}): {_fx.positive!r} excludes cleanly",
+            tuple(toks_of(_fx.positive)) == _fx.positive_expected,
+        )
+        check(
+            f"exclusion({_fx.name}) adversarial: a measured value beside "
+            f"{_fx.positive!r} is still found",
+            tuple(toks_of(_fx.adversarial)) == _fx.adversarial_expected,
+        )
+
+    # --- round-25 BITE sweep, WIRED (not left as an external one-off audit
+    # script): for every one of the 31 classes, construct the WORST-CASE
+    # (`.*`) span-extension on whichever side of the idiom the adversarial
+    # value sits (auto-detected, `_worst_case_span_extension` above -- never
+    # hand-coded per class) and confirm the widened pattern is CAUGHT (the
+    # SAME adversarial fixture goes RED under it), proving each fixture is
+    # load-bearing against the exact failure mode the round-25 audit found
+    # (":637"/":651" silently surviving an unbounded widening) -- not just
+    # a decorative pass on the CURRENT pattern. Measured cost: ~31 monkey-
+    # patch-and-rescan probes, <10ms wall time on this corpus (round-25
+    # audit measurement) -- cheap enough to run on every `--self-test`
+    # rather than staying an external, human-rerun sweep.
+    for _fx in _EXCLUSION_FIXTURES:
+        _orig_pat = _EXTRA_EXCLUSIONS[_fx.index]
+        _wsrc, _dir = _worst_case_span_extension(_orig_pat, _fx.adversarial, _fx.adversarial_expected)
+        if _wsrc is None:
+            check(f"BITE sweep({_fx.name}): the relevant widening direction is {_dir}", True)
+            continue
+        _wpat = re.compile(_wsrc, _orig_pat.flags)
+        _EXTRA_EXCLUSIONS[_fx.index] = _wpat
+        try:
+            _widened_got = tuple(t.text for t in find_claim_tokens(_fx.adversarial, 1))
+        finally:
+            _EXTRA_EXCLUSIONS[_fx.index] = _orig_pat
+        check(
+            f"BITE sweep({_fx.name}): a worst-case {_dir} span-extension of this "
+            "class's own pattern is CAUGHT -- the adversarial fixture goes RED",
+            _widened_got != _fx.adversarial_expected,
+        )
+
+    # supplementary shape coverage beyond the registry's one canonical
+    # positive per class (kept from round-22/23; not migrated into the
+    # registry since each row there is exactly ONE positive + ONE
+    # adversarial by design -- these probe additional REAL surface forms
+    # of the SAME class, a strictly additive check).
     check(
-        "exclusion(CONTRACT/unit/PLAN-v2-delta N): all three excluded (unit/delta ANCHORED, round-22 B4)",
+        "exclusion(CONTRACT/unit/PLAN-v2-delta N): all three compose cleanly on one line",
         toks_of("CONTRACT 63 unit 63 PLAN v2 delta 7") == [],
     )
     check(
-        "exclusion(CONTRACT N) adversarial: a measured value beside 'CONTRACT 63' is still found",
-        toks_of("measured 63.5 in CONTRACT 63") == ["63.5"],
+        "exclusion(theta=/g= bracket array): the 'g=' alternation form also excludes cleanly",
+        toks_of("g=[0.1,-0.2,0.05,0.0] fixed input") == [],
+    )
+    check(
+        "exclusion(seed-number list): the comma-separated form also excludes cleanly",
+        toks_of("seeds 9, 12 committed") == [],
     )
 
     # B4 (round-22 audit): old-vs-new differential probes — the auditor's
@@ -2333,234 +2636,6 @@ def self_test() -> int:
         "code) is now found, not silently swallowed",
         toks_of("cargo build (exit 0)") == [] and toks_of("cargo build (exit 1)") == ["1"],
     )
-    check("exclusion(H\\d+(\\d+)): \"per H5(1)'s own rule\" excludes cleanly", toks_of("per H5(1)'s own rule") == [])
-    check(
-        "exclusion(H\\d+(\\d+)) adversarial: a measured value beside 'H5(1)' is still found",
-        toks_of("measured 5.5 per H5(1)") == ["5.5"],
-    )
-    check(
-        "exclusion(*.patch filename): a dose value embedded in a patch filename excludes cleanly",
-        toks_of("see `M_eps_-0.10.patch` for the patch") == [],
-    )
-    check(
-        "exclusion(*.patch filename) adversarial: a standalone measured value beside the SAME filename is still found",
-        toks_of("measured -0.10 as recorded in `M_eps_-0.10.patch`") == ["-0.10"],
-    )
-    check("exclusion(s-scale): 's: 0 -> 1' and 's=1' exclude cleanly", toks_of("the operating point `s: 0 -> 1`, `s=1` was reached") == [])
-    check(
-        "exclusion(s-scale) adversarial: a measured value beside 's=1' is still found",
-        toks_of("measured 1.5 at `s=1`") == ["1.5"],
-    )
-    check("exclusion(eps sign condition): 'eps < 0' and 'eps > 0' exclude cleanly", toks_of("for eps < 0 dose, unlike eps > 0") == [])
-    check(
-        "exclusion(eps sign condition) adversarial: a measured value beside 'eps < 0' is still found",
-        toks_of("measured 0.5 when eps < 0") == ["0.5"],
-    )
-    check("exclusion(exit N): 'cargo build (exit 0)' excludes cleanly", toks_of("cargo build (exit 0)") == [])
-    check(
-        "exclusion(exit N) adversarial: a measured value beside 'exit 0' is still found",
-        toks_of("measured 0.5 at (exit 0)") == ["0.5"],
-    )
-    check("exclusion(seed{N,M}): 'seed{1,2} committed' excludes cleanly", toks_of("seed{1,2} committed") == [])
-    check(
-        "exclusion(seed{N,M}) adversarial: a measured value beside 'seed{1,2}' is still found",
-        toks_of("measured 1.5 for seed{1,2}") == ["1.5"],
-    )
-    check(
-        "exclusion((1-eps) formula fragment): both '(1+eps)' and '(1-eps)' exclude cleanly",
-        toks_of("the `(1+eps)`/`(1-eps)` dose-family shape") == [],
-    )
-    check(
-        "exclusion((1-eps) formula fragment) adversarial: a measured value beside "
-        "'(1+eps)' is still found",
-        toks_of("measured 1.5 near (1+eps)") == ["1.5"],
-    )
-
-    # --- round-23 audit F3: the remaining 20 of 31 `_EXTRA_EXCLUSIONS`
-    # classes had NO self-test fixture at all, contradicting this module's
-    # own docstring claim (":386", "every class has a self-test fixture
-    # proving it excludes ONLY its own shape") — each gets the SAME
-    # positive/adversarial pair discipline as the classes above: a clean
-    # exclusion of its own idiom, and a measured value in the SAME
-    # syntactic neighborhood that must still be found.
-    check(
-        "exclusion(hex/sha run): 'checkpoint dc1cfc3b committed' excludes cleanly",
-        toks_of("checkpoint dc1cfc3b committed") == [],
-    )
-    check(
-        "exclusion(hex/sha run) adversarial: a measured value beside a hex/sha run is still found",
-        toks_of("the run recorded 42 alongside checkpoint dc1cfc3b") == ["42"],
-    )
-    check(
-        "exclusion(date+revision-letter): 'recorded on 2026-08-29c' excludes cleanly",
-        toks_of("recorded on 2026-08-29c after the fix") == [],
-    )
-    check(
-        "exclusion(date+revision-letter) adversarial: a measured value beside a "
-        "same-day-revision date is still found",
-        toks_of("measured 2.5 on 2026-08-29c") == ["2.5"],
-    )
-    check(
-        "exclusion(compact ISO-8601 timestamp): 'output dir 20260829T055912Z' excludes cleanly",
-        toks_of("output dir 20260829T055912Z") == [],
-    )
-    check(
-        "exclusion(compact ISO-8601 timestamp) adversarial: a measured value beside "
-        "a compact timestamp is still found",
-        toks_of("measured 2.5 at 20260829T055912Z") == ["2.5"],
-    )
-    check(
-        "exclusion(GB/MB size): 'A100-SXM4-80GB' excludes cleanly",
-        toks_of("A100-SXM4-80GB") == [],
-    )
-    check(
-        "exclusion(GB/MB size) adversarial: a measured value beside a size label is still found",
-        toks_of("measured 2.5 on the 80GB A100") == ["2.5"],
-    )
-    check(
-        "exclusion(epoch/step/t axis index): 'detected at epoch 1' excludes cleanly",
-        toks_of("detected at epoch 1") == [],
-    )
-    check(
-        "exclusion(epoch/step/t axis index) adversarial: a measured value beside "
-        "an epoch index is still found",
-        toks_of("measured 2.5 at epoch 1") == ["2.5"],
-    )
-    check(
-        "exclusion(hyperparameter setting): 'lr=2e-4, eps=1e-8, alpha2=0.0064, "
-        "beta1=0.9' excludes cleanly",
-        toks_of("lr=2e-4, eps=1e-8, alpha2=0.0064, beta1=0.9") == [],
-    )
-    check(
-        "exclusion(hyperparameter setting) adversarial: a measured value beside "
-        "an 'lr=' setting is still found",
-        toks_of("measured 2.5 at lr=2e-4") == ["2.5"],
-    )
-    check(
-        "exclusion(item N cross-ref): 'see item 2(ii) above' excludes cleanly",
-        toks_of("see item 2(ii) above") == [],
-    )
-    check(
-        "exclusion(item N cross-ref) adversarial: a measured value beside 'item 2(ii)' is still found",
-        toks_of("measured 2.5 near item 2(ii)") == ["2.5"],
-    )
-    check(
-        "exclusion(RC:N exit code): 'RC:0' excludes cleanly",
-        toks_of("RC:0") == [],
-    )
-    check(
-        "exclusion(RC:N exit code) adversarial: a measured value beside 'RC:0' is still found",
-        toks_of("measured 2.5 at RC:0") == ["2.5"],
-    )
-    check(
-        "exclusion(eps-N dose label): 'eps-0.50 dose' excludes cleanly",
-        toks_of("eps-0.50 dose") == [],
-    )
-    check(
-        "exclusion(eps-N dose label) adversarial: a measured value beside 'eps-0.50' is still found",
-        toks_of("measured -0.50 near eps-0.50") == ["-0.50"],
-    )
-    check(
-        "exclusion(ordered-list marker): '3. another line' excludes cleanly",
-        toks_of("3. another line") == [],
-    )
-    check(
-        "exclusion(ordered-list marker) adversarial: a measured value on the SAME "
-        "numbered-list line is still found",
-        toks_of("2. the measured value is 3.5") == ["3.5"],
-    )
-    check(
-        "exclusion(lr parenthetical mention): 'the lr (2e-4) setting' excludes cleanly",
-        toks_of("the lr (2e-4) setting") == [],
-    )
-    check(
-        "exclusion(lr parenthetical mention) adversarial: a measured value beside "
-        "'lr (2e-4)' is still found",
-        toks_of("measured 2.5 near lr (2e-4)") == ["2.5"],
-    )
-    check(
-        "exclusion(Acceptance N): 'Acceptance 5 discharged' excludes cleanly",
-        toks_of("Acceptance 5 discharged") == [],
-    )
-    check(
-        "exclusion(Acceptance N) adversarial: a measured value beside 'Acceptance 5' is still found",
-        toks_of("measured 5.5 near Acceptance 5") == ["5.5"],
-    )
-    check(
-        "exclusion(finding N): 'finding 4 resolved' excludes cleanly",
-        toks_of("finding 4 resolved") == [],
-    )
-    check(
-        "exclusion(finding N) adversarial: a measured value beside 'finding 4' is still found",
-        toks_of("measured 4.4 near finding 4") == ["4.4"],
-    )
-    check(
-        "exclusion(63-how-well dir segment): 'docs/plans/63-how-well/x' excludes cleanly",
-        toks_of("docs/plans/63-how-well/x") == [],
-    )
-    check(
-        "exclusion(63-how-well dir segment) adversarial: a measured value beside "
-        "'63-how-well' is still found",
-        toks_of("measured 63.5 in 63-how-well context") == ["63.5"],
-    )
-    check(
-        "exclusion([0, 1] axis-domain bracket): 'the axis range is [0, 1] here' excludes cleanly",
-        toks_of("the axis range is [0, 1] here") == [],
-    )
-    check(
-        "exclusion([0, 1] axis-domain bracket) adversarial: a measured value beside "
-        "'[0, 1]' is still found",
-        toks_of("measured 0.5 alongside the [0, 1] axis range") == ["0.5"],
-    )
-    check(
-        "exclusion(theta=/g= bracket array): both 'theta=[0.5,-1.25,3.0,0.0]' and "
-        "'g=[0.1,-0.2,0.05,0.0]' exclude cleanly",
-        toks_of("theta=[0.5,-1.25,3.0,0.0] fixed input") == []
-        and toks_of("g=[0.1,-0.2,0.05,0.0] fixed input") == [],
-    )
-    check(
-        "exclusion(theta=/g= bracket array) adversarial: a measured value beside "
-        "'theta=[...]' is still found",
-        toks_of("measured 0.5 near theta=[0.5,-1.25,3.0,0.0]") == ["0.5"],
-    )
-    check(
-        "exclusion(4-element CPU-demo input): 'the same fixed 4-element input' excludes cleanly",
-        toks_of("the same fixed 4-element input") == [],
-    )
-    check(
-        "exclusion(4-element CPU-demo input) adversarial: a measured value beside "
-        "'4-element' is still found",
-        toks_of("measured 4.5 near the 4-element input") == ["4.5"],
-    )
-    check(
-        "exclusion(5-consecutive CPU-demo steps): 'for 5 consecutive steps' excludes cleanly",
-        toks_of("for 5 consecutive steps") == [],
-    )
-    check(
-        "exclusion(5-consecutive CPU-demo steps) adversarial: a measured value beside "
-        "'5 consecutive' is still found",
-        toks_of("measured 5.5 over 5 consecutive steps") == ["5.5"],
-    )
-    check(
-        "exclusion(seed-number list): both 'seeds 9 and 12 committed' and "
-        "'seeds 9, 12 committed' exclude cleanly",
-        toks_of("seeds 9 and 12 committed") == [] and toks_of("seeds 9, 12 committed") == [],
-    )
-    check(
-        "exclusion(seed-number list) adversarial: a measured value beside a seed list "
-        "is still found",
-        toks_of("measured 9.5 near seeds 9 and 12") == ["9.5"],
-    )
-    check(
-        "exclusion(zero/negative array-index bracket): 'series[0] and series[-1]' excludes cleanly",
-        toks_of("series[0] and series[-1]") == [],
-    )
-    check(
-        "exclusion(zero/negative array-index bracket) adversarial: a measured value "
-        "beside 'series[0]' is still found",
-        toks_of("measured 2.5 near series[0]") == ["2.5"],
-    )
-
     check(
         "self-test: real tree tokenizer matches pinned FILE_TOKEN_DENOMINATOR",
         len(check_coverage()) == 0,

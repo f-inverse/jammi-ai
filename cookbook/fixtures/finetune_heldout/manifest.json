@@ -12,9 +12,10 @@
   "n_pairs": 1500,
   "n_train": 1372,
   "provenance": {
-    "committed_subset_ids_file": "cookbook/book/data/ids/arxiv.txt",
-    "license": "ODC-BY 1.0 (Open Graph Benchmark); see NOTICE.",
-    "mining_algorithm": "cookbook/book/scripts/build_finetune_cache.py::mine_supervision (ported without db/parquet side effects, see mine_pairs() above)",
+    "committed_subset_ids_file": "cookbook/fixtures/finetune_heldout/arxiv_subset_ids.txt",
+    "committed_subset_ids_file_vendored_from": "cookbook/book/data/ids/arxiv.txt",
+    "license": "ODC-BY 1.0 (Open Graph Benchmark); see cookbook/fixtures/finetune_heldout/NOTICE.",
+    "produced_by": "cookbook/book/scripts/derive_heldout_fixture.py (book-side producer of this engine-owned fixture, mirroring cookbook/book/scripts/build_finetune_cache.py::mine_supervision without the db/parquet side effects)",
     "source_titleabs": {
       "sha256": "7bce99ab3e1604277f12dd49f6e17a0d89867b29ea152f072c0e709ae0bc8ed7",
       "url": "https://snap.stanford.edu/ogb/data/misc/ogbn_arxiv/titleabs.tsv.gz"

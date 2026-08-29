@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
-"""Derive the committed how-well held-out fixture (63-how-well H3).
+"""Produce the committed how-well held-out fixture (63-how-well H3).
+
+This is a BOOK-side script (one-way rule: the book consumes the engine and
+freely imports its own ``jammi_cookbook``; the engine-owned fixture it
+PRODUCES — ``cookbook/fixtures/finetune_heldout/`` — must never import or
+otherwise depend back on the book. See ``ci/scripts/
+check_cookbook_one_way.sh`` and the fixture's own README "Where this fixture
+comes from" section.)
 
 Re-derives the SAME 1500 (anchor, positive, negative) same-subject supervised
-pairs the arxiv fine-tune chapter mines (``cookbook/book/scripts/
-build_finetune_cache.py::mine_supervision``), over the SAME committed 4000-paper
-ogbn-arxiv subset (``cookbook/book/data/ids/arxiv.txt``), then carves off a
-held-out tail sized to an explicit multiple of the fine-tune protocol's
-``batch_size`` (see README.md — flagged for lead pre-registration) and commits:
+pairs the arxiv fine-tune chapter mines (``build_finetune_cache.py::
+mine_supervision``, alongside this script under ``cookbook/book/scripts/``),
+over the SAME committed 4000-paper ogbn-arxiv subset (``cookbook/book/data/
+ids/arxiv.txt``), then carves off a held-out tail sized to an explicit
+multiple of the fine-tune protocol's ``batch_size`` (see the fixture's
+README.md — flagged for lead pre-registration) and writes into the fixture
+directory:
 
 * ``heldout_ids.txt`` — the explicit id list (anchor_id, positive_id,
   negative_id per line, tab-separated) for the held-out pairs. This is the file
@@ -18,6 +27,11 @@ held-out tail sized to an explicit multiple of the fine-tune protocol's
   identity is checkable against committed content without committing every
   train pair's text (keeps the repo artifact text-pairs-sized, not a full
   corpus dump — CONTRACT H3 item 5).
+* ``arxiv_subset_ids.txt`` — a VENDORED byte-identical copy of the committed
+  4000-id subset (``cookbook/book/data/ids/arxiv.txt``) written into the
+  fixture directory, so the fixture's own provenance is checkout-self-
+  contained: a consumer of the engine-owned fixture never has to reach into
+  the book subtree to know exactly which paper ids it was mined from.
 * ``manifest.json`` — dataset_sha256 (a Merkle-style hash over all 1500
   per-pair hashes, itself reconstructable from committed content only),
   heldout_ids_sha256, provenance (source URLs + pinned checksums, snapshot
@@ -29,12 +43,15 @@ minus the ``db.add_source``/parquet side effects — this script produces the
 same 1500 pairs an actual chapter emit run mines, from the same committed
 subset, the same pinned checksum-gated downloads, and the same seed.
 
-Usage::
+Usage (from ``cookbook/book/``)::
 
-    python derive_heldout_fixture.py            # (re)generate the committed fixture
-    python derive_heldout_fixture.py --check     # verify committed content still
-                                                  # matches a fresh re-derivation
-                                                  # (exit 1 on any divergence)
+    python scripts/derive_heldout_fixture.py           # (re)produce the committed fixture
+    python scripts/derive_heldout_fixture.py --check    # verify committed content still
+                                                          # matches a fresh re-derivation
+                                                          # (exit 1 on any divergence;
+                                                          # network-backed — re-downloads the
+                                                          # pinned, checksum-gated ogbn-arxiv
+                                                          # sources via jammi_cookbook.datasets)
 """
 
 from __future__ import annotations
@@ -42,16 +59,22 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import shutil
 import sys
 from pathlib import Path
 
-FIXTURE_DIR = Path(__file__).resolve().parent
-_BOOK_ROOT = FIXTURE_DIR.parent.parent / "book"
-sys.path.insert(0, str(_BOOK_ROOT))
+import numpy as np
 
-import numpy as np  # noqa: E402
+from jammi_cookbook import datasets, determinism
 
-from jammi_cookbook import datasets, determinism  # noqa: E402
+# This script lives at cookbook/book/scripts/derive_heldout_fixture.py; the
+# fixture it PRODUCES is the sibling engine-owned directory
+# cookbook/fixtures/finetune_heldout/ (book/scripts -> book -> cookbook ->
+# fixtures/finetune_heldout). Writing into it is a book->fixture PRODUCER
+# edge, not the reverse fixture->book dependency the one-way rule forbids.
+_BOOK_ROOT = Path(__file__).resolve().parent.parent
+FIXTURE_DIR = _BOOK_ROOT.parent / "fixtures" / "finetune_heldout"
+_COMMITTED_ARXIV_IDS = _BOOK_ROOT / "data" / "ids" / "arxiv.txt"
 
 # --------------------------------------------------------------------------- #
 # Pinned identity — mirrors build_finetune_cache.py exactly (cited in README).
@@ -197,6 +220,18 @@ def _write_heldout_pairs(heldout_pairs: list[dict]) -> None:
             f.write(json.dumps(p, sort_keys=True) + "\n")
 
 
+def _write_vendored_subset_ids() -> Path:
+    """Vendor a byte-identical copy of the committed 4000-id subset into the
+    fixture directory (F-1 (b)): the fixture's own provenance must be
+    checkout-self-contained, so a consumer never has to reach into the book
+    subtree (``cookbook/book/data/ids/arxiv.txt``) to know which ids this
+    fixture was mined from.
+    """
+    dest = FIXTURE_DIR / "arxiv_subset_ids.txt"
+    shutil.copyfile(_COMMITTED_ARXIV_IDS, dest)
+    return dest
+
+
 def _write_train_hashes(train_pairs: list[dict]) -> None:
     rows = [
         {
@@ -225,7 +260,12 @@ def _write_manifest(derived: dict, heldout_ids_sha256: str) -> None:
         "batch_size_flagged_for_lead_confirmation": True,
         "n_heldout_is_multiple_of_all_candidates": True,
         "provenance": {
-            "committed_subset_ids_file": "cookbook/book/data/ids/arxiv.txt",
+            # Checkout-self-contained (F-1 (b)/(c)): the vendored copy lives IN
+            # the fixture directory. The book path is cited for provenance only
+            # (this script — the PRODUCER — writes both from the same source);
+            # no reader of the fixture needs to resolve it.
+            "committed_subset_ids_file": "cookbook/fixtures/finetune_heldout/arxiv_subset_ids.txt",
+            "committed_subset_ids_file_vendored_from": "cookbook/book/data/ids/arxiv.txt",
             "source_zip": {
                 "url": datasets._ARXIV_ZIP[0],
                 "sha256": datasets._ARXIV_ZIP[1],
@@ -234,10 +274,13 @@ def _write_manifest(derived: dict, heldout_ids_sha256: str) -> None:
                 "url": datasets._ARXIV_TITLEABS[0],
                 "sha256": datasets._ARXIV_TITLEABS[1],
             },
-            "license": datasets.LICENSES["ogbn_arxiv"],
-            "mining_algorithm": (
+            "license": "ODC-BY 1.0 (Open Graph Benchmark); see "
+                       "cookbook/fixtures/finetune_heldout/NOTICE.",
+            "produced_by": (
+                "cookbook/book/scripts/derive_heldout_fixture.py (this script; "
+                "a book-side producer of this engine-owned fixture, mirroring "
                 "cookbook/book/scripts/build_finetune_cache.py::mine_supervision "
-                "(ported without db/parquet side effects, see mine_pairs() above)"),
+                "without the db/parquet side effects, see mine_pairs() above)"),
         },
     }
     (FIXTURE_DIR / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
@@ -248,6 +291,7 @@ def generate() -> None:
     heldout_path = _write_heldout_ids(derived["heldout_pairs"])
     _write_heldout_pairs(derived["heldout_pairs"])
     _write_train_hashes(derived["train_pairs"])
+    _write_vendored_subset_ids()
     heldout_ids_sha256 = _file_sha256(heldout_path)
     _write_manifest(derived, heldout_ids_sha256)
     print(f"wrote fixture: {FIXTURE_DIR}")
@@ -267,6 +311,14 @@ def check() -> int:
         for p in derived["heldout_pairs"]) + "\n"
     if committed_heldout_ids != fresh_heldout_ids:
         print("MISMATCH: heldout_ids.txt diverges from a fresh re-derivation", file=sys.stderr)
+        ok = False
+
+    committed_vendored_ids = (FIXTURE_DIR / "arxiv_subset_ids.txt").read_bytes()
+    fresh_vendored_ids = _COMMITTED_ARXIV_IDS.read_bytes()
+    if committed_vendored_ids != fresh_vendored_ids:
+        print(
+            "MISMATCH: arxiv_subset_ids.txt (vendored) diverges from the book's "
+            "committed cookbook/book/data/ids/arxiv.txt", file=sys.stderr)
         ok = False
 
     committed_manifest = json.loads((FIXTURE_DIR / "manifest.json").read_text())

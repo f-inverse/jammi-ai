@@ -1,0 +1,70 @@
+finetune_heldout fixture (cookbook/fixtures/finetune_heldout/)
+
+This directory redistributes derived text from the Open Graph Benchmark
+"ogbn-arxiv" dataset: `heldout_pairs.jsonl` and `train_ids_sha256.json`
+carry title+abstract-derived text (clipped to 1500 characters) for a
+128+1372-pair same-subject supervision split mined from the committed
+4000-paper ogbn-arxiv subset (see `arxiv_subset_ids.txt`, `manifest.json`).
+
+--------------------------------------------------------------------------------
+License
+
+ODC-BY 1.0 (Open Data Commons Attribution License v1.0):
+https://opendatacommons.org/licenses/by/1-0/
+
+--------------------------------------------------------------------------------
+Attribution
+
+Source dataset: ogbn-arxiv, part of the Open Graph Benchmark (OGB)
+  https://ogb.stanford.edu/docs/nodeprop/#ogbn-arxiv
+
+Cite as:
+
+  Weihua Hu, Matthias Fey, Marinka Zitnik, Yuxiao Dong, Hongyu Ren,
+  Bowen Liu, Michele Catasta, and Jure Leskovec. "Open Graph Benchmark:
+  Datasets for Machine Learning on Graphs." NeurIPS 2020.
+
+ogbn-arxiv is itself built on the Microsoft Academic Graph (MAG); OGB's own
+attribution for this dataset additionally cites:
+
+  Kuansan Wang, Zhihong Shen, Chiyuan Huang, Chieh-Han Wu, Yuxiao Dong, and
+  Anshul Kanakia. "Microsoft Academic Graph: When experts are not enough."
+  Quantitative Science Studies, 1(1):396-413, 2020.
+
+The node feature embeddings OGB derives from titles/abstracts use the
+skip-gram model of:
+
+  Tomas Mikolov, Ilya Sutskever, Kai Chen, Greg S. Corrado, and Jeff Dean.
+  "Distributed Representations of Words and Phrases and their
+  Compositionality." NeurIPS 2013.
+
+(This fixture does not use OGB's precomputed feature embeddings — it mines
+its own supervised pairs from the raw title/abstract text — but the citation
+is reproduced here because it is part of OGB's own required attribution for
+ogbn-arxiv, per the references above.)
+
+--------------------------------------------------------------------------------
+Changes made to the original data
+
+This fixture is a derived, DOWNSAMPLED excerpt, not the full dataset:
+
+* Restricted to a committed 4000-paper subset of ogbn-arxiv (see
+  `arxiv_subset_ids.txt`, a vendored copy of the subset id list; the subset
+  is otherwise unmodified from the OGB release).
+* Same-subject (anchor, positive, negative) supervised pairs mined
+  deterministically from that subset (seeded, sorted-id traversal; see
+  `manifest.json.split_rule` and `README.md`).
+  Title+abstract text is clipped to 1500 characters per field.
+  1500 pairs total mined; only the 128 held-out pairs' full text is
+  redistributed here (`heldout_pairs.jsonl`) — the 1372 train-side pairs are
+  represented as ids + a SHA-256 digest of their text, not the text itself
+  (`train_ids_sha256.json`).
+
+--------------------------------------------------------------------------------
+Provenance / how this fixture was produced
+
+Produced by `cookbook/book/scripts/derive_heldout_fixture.py` (a book-side
+script in this repository) from the pinned, checksum-gated OGB source files
+recorded in `manifest.json.provenance` (`source_zip`, `source_titleabs`).
+See `README.md` in this directory for the full derivation and
+re-verification (`--check`) instructions.

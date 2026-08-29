@@ -194,3 +194,58 @@ CPU-hermetic environment can produce a real leg for it:
 | `flash_compiled` | `true` | both source artifacts |
 | `kernels_disabled_requested` / `kernels_disabled_fired` | `["adamw_step_fused", "attention_block_flash"]` / same | composited (each source artifact independently confirms ITS OWN op firing as disabled; `finetune_run_ab.sh`'s own real invocation requests both at once) |
 | `attention_arm` | `"eager"` | an attention base (`attention_block_flash`) is in `kernels_disabled_requested` ⇒ `"eager"` (`attention_arm`'s own field doc) |
+
+## Per-field consistency (unit-63 round-4 audit F-1)
+
+Round-3's "Coordinator correction" composite above was itself INTERNALLY
+CONTRADICTORY: `modernbert_fused.json`/`modernbert_alloff.json` composited
+GPU dispatch counters (`flash_compiled: true`,
+`attention_block_flash_fused_dispatches: 840` for the fused golden) with
+identity/provenance fields still carried over UNCHANGED from the ORIGINAL
+CPU-hermetic `modernbert_alloff.json` run ("How to regenerate" above) --
+`backbone_dtype: "f32"`, `device_name: "cpu"`, `provenance.target:
+"aarch64-apple-darwin"`, `build_features: []` (both the top-level
+`provenance` block and the `finetune_run` tier's own field). This is not
+merely stale metadata: `flash_capability_gates` DomainMisses the flash
+cascade whenever `dtype != DType::BF16`
+(`jammi-encoders/src/modernbert.rs`'s own `dtype_is_bf16` gate), and no CUDA
+device exists on `aarch64-apple-darwin` at all -- a `fused` golden
+reporting `attention_block_flash_fused_dispatches: 840` while ALSO claiming
+`f32`/`cpu`/`aarch64-apple-darwin` was an UNEMITTABLE state no real producer
+invocation could ever produce, exactly the class of "fused premise
+unsatisfiable by the producer's own invocation" defect `finetune_run_ab.sh`
+itself had (never having passed `--backbone-dtype bf16`) before this round.
+
+Both goldens are now corrected to a SELF-CONSISTENT, producer-emittable
+state -- every identity/provenance field taken from the SAME committed
+2026-08-25 source artifacts the dispatch counters above already cite, never
+mixed with the superseded CPU run's own identity:
+
+| field | corrected value | source |
+|---|---|---|
+| `backbone_dtype` | `"bf16"` | `s128_flash_on_1.json`/`s128_flash_off_1.json`/both `b8_s512_*.r2.json.raw` artifacts -- every one of the four source artifacts agrees |
+| `device_name` | `"NVIDIA A100-SXM4-80GB"` | `host`/`device_name` fields of the same four source artifacts |
+| `provenance.target` | `"x86_64-unknown-linux-gnu"` | no committed source artifact carries a Rust target triple (the `finetune-step` raw-run schema has no `provenance` block at all) -- this repo's own documented CUDA release target (`.github/workflows/release-binaries.yml`'s `x86_64-unknown-linux-gnu` matrix leg) is the only target triple this repo ships CUDA builds for, and is in any case the only possibility consistent with `flash_compiled: true` (`aarch64-apple-darwin`, the superseded value, has no CUDA toolchain at all -- not merely undocumented, but impossible) |
+| `provenance.build_features` / tier `build_features` | `["cuda", "jammi-encoders/flash-attn"]` | `finetune_run_ab.sh`'s own build invocation (`cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn`) -- the feature list a leg MUST have been built with to produce `flash_compiled: true` at all; no committed source artifact carries this field either (same schema gap as `target`), so it is cited from the one build invocation capable of producing the counters, never invented independently of it |
+
+`host.logical_cpus`/`host.total_ram_mib` are left as the original
+CPU-hermetic run's own values -- informational only, never a
+`FINETUNE_RUN_IDENTITY_FIELDS`/`PROVENANCE_FIELDS` member the merger reads
+at all (`report.rs`'s `Host::detect()` is a property of the MACHINE that
+ran `jammi-bench`, not of the training leg itself), so leaving them
+un-composited is not a repeat of this same defect class.
+
+`GoldenProducerAnchoredFieldSetTests::test_golden_dispatch_pair_bases_equal_all_bases`
+(field-set pin) and its own
+`test_golden_modernbert_legs_clear_the_full_dispatch_proof_gate` (both
+corrected goldens, run DIRECTLY off the committed JSON, must clear
+`finetune_run_dispatch_proof_violations` cleanly -- including the new
+arm-agnostic counters-vs-`backbone_dtype` consistency premise and the
+`fused` arm's own bf16 premise) both pass against these corrected files --
+the fix closes the contradiction without changing which dispatch-counter
+SET either golden carries. `_finetune_run_tier`'s own hand-overridden
+`backbone_dtype` literal (`test_ab_merge.py`) is separately updated to
+`"bf16"` for the same reason -- its default `arm="fused"` shape folds in
+`modernbert_fused.json`'s own dispatch counters (a positive
+`attention_block_flash_fused_dispatches`), so it is equally subject to this
+premise.

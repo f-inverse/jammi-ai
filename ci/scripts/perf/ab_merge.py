@@ -48,7 +48,7 @@ jammi-vs-torch comparator this repo carries:
 | `attn_requested` / `attn_implementation` | provenance — the RAW torch attention string (`--attn` as requested, and what HF resolved it to); the CLASS it implies is compared via `attention_arm` above, the raw string itself is recorded in `leg_provenance`, never compared (see `grad_oracle.rs`'s own table for the fuller rationale) | n/a | `"attn_requested": args.attn,` (`torch_finetune_step.py:1258`) in the `args` block; `attn_implementation` is the sibling `"attn_implementation": resolved_attn_implementation` field further down in the `finetune_step` block |
 | `kernels_disabled_requested` / `kernels_disabled_fired` | provenance (K-aux, landed on `main` at `c0f0e98`) — torch has no equivalent env var; recorded in `leg_provenance`, never compared | `let kernels_disabled_fired = jammi_kernels::admission::disabled_ops_fired();` (`finetune_step.rs:921`) | n/a |
 | `ln`/`rope`/`softmax`/`geglu`/`lora_epilogue`/`lora_linear`/`attention_block` `_fused_dispatches`/`_eager_dispatches` (14 fields) | measurement — this IS the fused-dispatch proof `fused_proof`/`dispatch_pairs` gate on, and `leg_provenance` additionally records the raw counters per config | `finetune_step.rs`'s own `*_fused_dispatches`/`*_eager_dispatches` fields | n/a |
-| `attention_block_flash_fused_dispatches` / `attention_block_flash_declined_dispatches` (P6 Stage B FA2 fold-in, since merged to `main` — `pub attention_block_flash_fused_dispatches: u64,` (`report.rs:1670`), `pub attention_block_flash_declined_dispatches: u64,` (`report.rs:1678`)) | measurement — a CASCADE-shaped pair (`CASCADE_BASES`): no `_eager_dispatches` sibling, its fallback counter is named `_declined_dispatches` instead; absorbs `attention_block` (`ABSORBABLE_BY_ATTENTION_BLOCK_FLASH`), which in turn already absorbs `rope`/`softmax` — one chain, not a second mechanism. Every current `finetune-step`/`finetune-run` leg carries both keys; a pre-fold-in fixture predating this pair (carrying neither key) still works — `dispatch_pairs`/`fused_proof` never discover this base on such a report | `report.rs`'s `FinetuneStepTier::attention_block_flash_fused_dispatches`/`::attention_block_flash_declined_dispatches` fields | n/a |
+| `attention_block_flash_fused_dispatches` / `attention_block_flash_declined_dispatches` (P6 Stage B FA2 fold-in, since merged to `main` — `pub attention_block_flash_fused_dispatches: u64,` (`report.rs:1670`), `pub attention_block_flash_declined_dispatches: u64,` (`report.rs:1678`)) | measurement — a CASCADE-shaped pair (`CASCADE_BASES`): no `_eager_dispatches` sibling, its fallback counter is named `_declined_dispatches` instead; absorbs `attention_block` (`ABSORBABLE_BY_ATTENTION_BLOCK_FLASH`), which in turn already absorbs `rope`/`softmax` — one chain, not a second mechanism. Every current `finetune-step`/`finetune-run` leg carries both keys. unit-63 round-4 audit advisory (A1), CURRENT TRUTH (this row's own earlier "a pre-fold-in fixture predating this pair still works" claim was false on the `adamw` axis for the two committed P6 fixtures, `fixtures/p6_fa2_dense_raw_runs/s128_flash_{on,off}_1.json`): `adamw` is a `REQUIRED_PAIRS` member, and `REQUIRED_PAIRS`'s own absent-base rule is a hard fail for the WHOLE leg, not merely for the missing base's own classification — a pre-fold-in fixture predating the multi-tensor AdamW commit (carrying no `adamw_{fused,eager}_dispatches` keys at all, the SAME schema gap the cascade pair itself has for an even older fixture) therefore fails `fused_proof` outright, INVALID, never "still works". `CascadePairFixtureTests::test_real_flash_{on,off}_fixture_no_longer_keyerrors_but_predates_adamw` (`test_ab_merge.py`) are the honest, pinned record of this — both fixtures correctly read INVALID, not "clean, this base merely undiscovered" | `report.rs`'s `FinetuneStepTier::attention_block_flash_fused_dispatches`/`::attention_block_flash_declined_dispatches` fields | n/a |
 | `flash_compiled` | provenance — recorded in `leg_provenance` as `jammi_flash_compiled`, never compared; distinguishes "this build cannot run flash at all" from "flash was compiled in but declined/disabled this run", and backs `fused_proof`'s own flash-disable-consistency check (see that function's doc) | `report.rs`'s `FinetuneStepTier::flash_compiled` field, same branch as above | n/a |
 | `losses` / `loss_first` / `loss_last` | measurement — `loss_final_ratio` is printed for visibility, never gated (see that field's own note in `build_report`) | `finetune_step.rs`'s own fields | `torch_finetune_step.py`'s own fields |
 | `s_per_step_p50` / `triplets_per_s` / VRAM fields | measurement — the actual perf numbers this sweep exists to produce | `finetune_step.rs`'s own fields | `torch_finetune_step.py`'s own fields |
@@ -1538,8 +1538,35 @@ def finetune_run_dispatch_proof_violations(arm, tier):
     `clip_fact_violations`'s own "a claim with no counted fact behind it is
     refused" shape, applied to dispatches instead of the clip counter:
 
+      0. ARM-AGNOSTIC MERGER CONSISTENCY PREMISE (unit-63 round-4 audit
+         F-1, checked on EVERY leg before either arm's own branch below):
+         `flash_capability_gates` DomainMisses the flash cascade whenever
+         `dtype != DType::BF16` (`jammi-encoders/src/modernbert.rs`'s own
+         `dtype_is_bf16` gate) -- a leg reporting
+         `attention_block_flash_fused_dispatches > 0` while its own
+         `backbone_dtype` is not `bf16` is claiming a dispatch its own
+         declared premise forbids; the report is internally contradictory
+         and untrusted outright, never resolved by trusting one of the two
+         fields over the other. This makes the unemittable state (nonzero
+         flash-fused counters at a non-bf16 dtype) unrepresentable at the
+         merger, on top of `finetune_run_ab.sh` now always passing
+         `--backbone-dtype bf16` at the producer (belt-and-braces: a
+         hand-run leg that skips the script, or a future producer
+         regression, still cannot pass this check).
       * `arm == "fused"`:
-          1. PREMISE: `flash_compiled` must be `True`. CONTRACT 63 Frame
+          1. PREMISE: `backbone_dtype` must canonicalize to `bf16`
+             (unit-63 round-4 audit F-1) -- independent of check 0 above,
+             which only fires when the counters HAPPEN to claim a positive
+             flash dispatch. CONTRACT 63 Frame pre-registers the flash
+             cascade, itself BF16-only, as this arm's own admitted branch;
+             a `fused` leg declared at any other dtype cannot exercise the
+             pre-registered differential at all, regardless of what its
+             OTHER counters read (e.g. the block arm's own absorption
+             silently picking up the slack while flash itself never
+             fires) -- an INVALID premise, checked before `flash_compiled`
+             so a runtime dtype mismatch is never misreported as a
+             compile-time one.
+          2. PREMISE: `flash_compiled` must be `True`. CONTRACT 63 Frame
              pre-registers the flash cascade as this arm's own admitted
              branch; a build that never compiled it in cannot possibly
              exercise the pre-registered differential, regardless of what
@@ -1547,16 +1574,16 @@ def finetune_run_dispatch_proof_violations(arm, tier):
              leg whose classification can be trusted at all
              (`finetune_run_ab.sh` builds `--features
              cuda,jammi-encoders/flash-attn` for exactly this reason).
-          2. `fused_proof` (the SAME gate a finetune-step `jammi-fused` leg
+          3. `fused_proof` (the SAME gate a finetune-step `jammi-fused` leg
              is held to, UNCHANGED -- see that function's own doc) must
              return `True`: every ordinary `REQUIRED_PAIRS` base (`ln`,
              `geglu`, `adamw`) independently clears `fused > 0`/`eager == 0`,
              and the CASCADE absorption chain (`attention_block_flash`
              absorbing `attention_block`, which in turn absorbs
              `rope`/`softmax`) is internally consistent.
-          3. THE PRE-REGISTERED BRANCH ITSELF:
+          4. THE PRE-REGISTERED BRANCH ITSELF:
              `attention_block_flash_fused_dispatches > 0`. `fused_proof`'s
-             own absorption rule (2.5) is satisfied whenever EITHER the
+             own absorption rule (3.5) is satisfied whenever EITHER the
              flash cascade OR the block arm independently fires -- correct
              for `finetune-step`'s own flash-vs-block A/B, where either arm
              is a legitimate leg -- but THIS arm specifically claims to be
@@ -1614,7 +1641,51 @@ def finetune_run_dispatch_proof_violations(arm, tier):
         ]
     by_base = {base: (fused, fallback) for base, fused, fallback in pairs}
 
+    # unit-63 round-4 audit F-1 (merger consistency premise, arm-agnostic --
+    # checked before either arm's own branch): `flash_capability_gates`
+    # DomainMisses the whole flash cascade whenever `dtype != DType::BF16`
+    # (`jammi-encoders/src/modernbert.rs`'s own `dtype_is_bf16` gate) -- a
+    # leg cannot have counted a positive `attention_block_flash_fused_
+    # dispatches` unless the backbone it ran actually admitted BF16. A
+    # report claiming BOTH a positive flash-fused count AND a non-bf16
+    # `backbone_dtype` is not a leg whose classification can be trusted at
+    # all -- the counters and the declared premise cannot both be true, so
+    # this makes the unemittable-state class itself unrepresentable, rather
+    # than trusting whichever one of the two a downstream check happens to
+    # read first.
+    flash_fused_claimed, _flash_declined_claimed = by_base.get("attention_block_flash", (0, 0))
+    declared_dtype = canonicalize_identity_field("backbone_dtype", tier.get("backbone_dtype"))
+    if flash_fused_claimed > 0 and declared_dtype != "bf16":
+        return [
+            f"{arm}: attention_block_flash_fused_dispatches={flash_fused_claimed!r} but "
+            f"backbone_dtype={tier.get('backbone_dtype')!r} -- counters claim a dispatch the "
+            "declared dtype forbids (flash_capability_gates admits only BF16, "
+            "modernbert.rs's own dtype_is_bf16 gate); this leg's own report is internally "
+            "contradictory, not merely unclassifiable"
+        ]
+
     if arm == "fused":
+        # A FUSED leg's own defining premise (unit-63 round-4 audit F-1,
+        # independent of the counter-vs-dtype contradiction check above,
+        # which only fires when the counters HAPPEN to claim a positive
+        # dispatch): CONTRACT 63 Frame pre-registers the flash cascade as
+        # this arm's own admitted branch, and that branch is BF16-only
+        # (`flash_capability_gates`'s `dtype_is_bf16` gate) -- a `fused`
+        # leg declaring any OTHER `backbone_dtype` cannot possibly exercise
+        # the pre-registered differential, regardless of what its counters
+        # happen to read (e.g. the block arm's own absorption silently
+        # picking up the slack while flash itself never fires) -- an
+        # INVALID premise outright, checked before `flash_compiled` so a
+        # build/runtime mismatch is never misreported as a compile-time one.
+        if declared_dtype != "bf16":
+            return [
+                f"fused: backbone_dtype={tier.get('backbone_dtype')!r} -- CONTRACT 63 Frame "
+                "pre-registers the flash cascade as this arm's own admitted branch, and "
+                "flash_capability_gates admits BF16 only (modernbert.rs's own dtype_is_bf16 "
+                "gate); a 'fused' leg run at any other dtype cannot exercise the pre-registered "
+                "differential at all -- an INVALID premise, not a leg whose classification can "
+                "be trusted"
+            ]
         flash_compiled = tier.get("flash_compiled")
         if flash_compiled is not True:
             return [
@@ -1856,20 +1927,38 @@ def finetune_run_lr0_control_seed_violations(raw_dir, seed):
     (b)): reads BOTH arms' `FINETUNE_RUN_LR0_REPEAT`-tagged leg for `seed`
     (never `r1`/`r2` -- these never enter `load_finetune_run_leg`'s normal
     `FINETUNE_RUN_REPEATS` iteration, so they can never leak into the A/B
-    set's own `d_values`/sign test) and asserts each OK leg's
-    `learning_happened_delta` does NOT clear `FINETUNE_RUN_LEARNING_HAPPENED_FLOOR`
-    -- the calibration bite for the FLOOR=0.0 ruling: a passing lr=0 leg
-    (learning "happened" with no possible parameter update) is a finding
-    against the floor itself, not a training result. A leg that is
-    `MISSING`/`FAIL` (never ran, or ran and errored) is ALSO recorded as a
-    violation -- an absent control leaves the floor unvalidated, which this
-    calibration check exists specifically to never pass over silently; a
-    `DRY_RUN` leg is the one carve-out (never itself a finding, same
-    doctrine every other `*_DRY_RUN` leg in this module already gets).
+    set's own `d_values`/sign test) and asserts:
+
+      1. (unit-63 round-4 audit F-2) THE CONTROL'S OWN DEFINING FACT: each
+         OK leg's reported `lr` field must equal `0.0` EXACTLY. The lr
+         exception in `finetune_run_cross_seed_homogeneity_violations`
+         (unit-63 round-3 audit block 3) removed the CROSS-GROUP `lr`
+         comparison between the main pool and the lr0-control pool -- by
+         design, that is the control's own defining premise, never itself
+         a divergence to flag -- but nothing UNTIL this check asserted the
+         POSITIVE fact the whole control depends on: that the leg tagged as
+         an lr0-control leg actually ran at `lr == 0.0`. A control whose
+         own `--lr` flag silently reverted to the CLI default (or was
+         mis-plumbed to some other nonzero value) would validate the
+         FLOOR=0.0 ruling against a leg that never tested it at all --
+         "a control that never ran at lr=0 validates the floor silently".
+      2. `learning_happened_delta` does NOT clear
+         `FINETUNE_RUN_LEARNING_HAPPENED_FLOOR` -- the calibration bite for
+         the FLOOR=0.0 ruling: a passing lr=0 leg (learning "happened" with
+         no possible parameter update) is a finding against the floor
+         itself, not a training result.
+
+    Both checks are independent and conjunctive -- a leg can fail either,
+    both, or neither. A leg that is `MISSING`/`FAIL` (never ran, or ran and
+    errored) is ALSO recorded as a violation -- an absent control leaves the
+    floor unvalidated, which this calibration check exists specifically to
+    never pass over silently; a `DRY_RUN` leg is the one carve-out (never
+    itself a finding, same doctrine every other `*_DRY_RUN` leg in this
+    module already gets).
 
     Returns `(violations, per_arm, identities)` where `per_arm` records each
-    arm's raw outcome and (when OK) its `learning_happened_delta`, for the
-    merged artifact -- never silently dropped even when clean -- and
+    arm's raw outcome and (when OK) its `learning_happened_delta`/`lr`, for
+    the merged artifact -- never silently dropped even when clean -- and
     `identities` is `[(label, fields), ...]` (unit-63 audit finding 3) for
     every OK leg here, in the exact shape
     `finetune_run_cross_seed_homogeneity_violations` consumes, so the
@@ -1884,10 +1973,10 @@ def finetune_run_lr0_control_seed_violations(raw_dir, seed):
         leg = load_finetune_run_leg(raw_dir, seed, arm, FINETUNE_RUN_LR0_REPEAT)
         outcome = leg["outcome"]
         if outcome == "DRY_RUN":
-            per_arm[arm] = {"outcome": outcome, "learning_happened_delta": None}
+            per_arm[arm] = {"outcome": outcome, "learning_happened_delta": None, "lr": None}
             continue
         if outcome != "OK":
-            per_arm[arm] = {"outcome": outcome, "learning_happened_delta": None}
+            per_arm[arm] = {"outcome": outcome, "learning_happened_delta": None, "lr": None}
             violations.append(
                 f"lr0 control seed {seed} {arm}: leg outcome={outcome!r} (not OK) -- an "
                 "absent/failed lr=0 control leg leaves the FLOOR=0.0 premise unvalidated "
@@ -1896,8 +1985,17 @@ def finetune_run_lr0_control_seed_violations(raw_dir, seed):
             continue
         tier = finetune_run_block(leg["report"])
         delta = tier.get("learning_happened_delta")
-        per_arm[arm] = {"outcome": outcome, "learning_happened_delta": delta}
+        lr = tier.get("lr")
+        per_arm[arm] = {"outcome": outcome, "learning_happened_delta": delta, "lr": lr}
         identities.append((f"lr0 seed {seed} {arm}", finetune_run_leg_identity(tier)))
+        # unit-63 round-4 audit F-2: the control's own defining fact -- see
+        # this function's own doc, point 1.
+        if not (isinstance(lr, (int, float)) and not isinstance(lr, bool) and lr == 0.0):
+            violations.append(
+                f"lr0 control seed {seed} {arm}: reported lr={lr!r}, not exactly 0.0 -- a "
+                "control that never ran at lr=0 validates the floor silently (unit-63 round-4 "
+                "audit F-2; CONTRACT H4 advisory (b)'s own 'lr=0 arm x2 seeds' precondition)"
+            )
         if isinstance(delta, (int, float)) and not isinstance(delta, bool) and delta > FINETUNE_RUN_LEARNING_HAPPENED_FLOOR:
             violations.append(
                 f"lr0 control seed {seed} {arm}: learning_happened_delta={delta!r} "
@@ -1947,9 +2045,15 @@ def build_finetune_run_report(raw_dir, seeds, lr0_seeds=(), allow_missing_lr0_co
     learning-happened") is PRE-REGISTERED, not optional -- an empty
     `lr0_seeds` used to be silently treated as a no-op (`gpu-howwell.yml`'s
     own `|| ''` collapsed "no input exists" and "an operator explicitly
-    opted out" to the same untagged empty string, and the label-triggered
-    workflow path dropped the control on EVERY run with no visible signal
-    at all). This function now REFUSES (`status` collapses to `INVALID`,
+    opted out" to the same untagged empty string on a `workflow_dispatch`
+    run where the operator cleared the field -- unit-63 round-4 audit
+    advisory (A2) corrects an earlier draft of this comment, which claimed
+    this ALSO dropped the control on every label-triggered run: a
+    `pull_request: types: [labeled]` trigger carries no workflow_dispatch
+    inputs at all, so that path already refused loudly on the (also
+    unset) `model_dir` input before ever reaching the `lr0_seeds` coalesce
+    -- a run that could never start in the first place, not a silent
+    drop). This function now REFUSES (`status` collapses to `INVALID`,
     naming the reason in `lr0_control.violations`) when `lr0_seeds` is
     empty UNLESS the caller passes `allow_missing_lr0_control=True`
     (`main`'s own `--allow-missing-lr0-control` CLI flag;

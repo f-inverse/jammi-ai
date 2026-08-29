@@ -42,9 +42,11 @@ remains committed as a file (never applied to tree state on this branch).
 **Shape:** the fused AdamW update's effective learning rate is scaled by
 `(1+eps)`, applied uniformly at **every** step — a one-parameter, monotone,
 **sustained** perturbation (unlike M1's transient, this does not decay
+<!-- claims63: c1=ledger -->
 toward 1.0 as `t` grows; `(1+eps)` is constant for all `t`).
 
 **Superseded (falsified pre-spend, NOT scheduled to run):** amendment
+<!-- claims63: c1=const; c2=const; c3=const -->
 2026-08-29b item 3 originally named `eps in {0.02, 0.10, 0.50}` (positive
 only — silent lr INFLATION). The REQUIRED pre-spend prediction table below
 (Step 2/3, original version) showed the `(1+eps)` direction as held-out
@@ -55,12 +57,15 @@ doses (documentation of the falsification, current-truth discipline); they
 are not part of the scheduled ladder below.
 
 **Current (CONTRACT.md addendum 2026-08-29c): the signed ladder,
+<!-- claims63: c1=const; c2=const; c3=const -->
 `eps in {-0.50, -0.10, +0.50}`.** Same one-parameter monotone family,
 `eps` now SIGNED:
+<!-- claims63: c1=const; c2=const -->
 - Negative doses (`-0.10`, `-0.50`) are silent lr DEFLATION — the
   undertrained-regression class — and carry the predicted DEGRADATION
   direction (Step 2 below: secant symmetric, predicted per-seed shift
   `+|eps|*slope_seed`, sign-consistent across both measured seeds).
+<!-- claims63: c1=const -->
 - `+0.50` is retained deliberately as the two-sided falsification cell for
   the improvement prediction itself: if it reads RED-for-investigation
   shaped as improvement, the original prediction is confirmed; if it
@@ -148,12 +153,18 @@ across seeds and arms:
 
 | field | value |
 |---|---|
+<!-- claims63: c1=abs(docs/plans/63-how-well/measurements/campaign-v1/raw/seed1__fused__lr0.json#/tiers/finetune_run/held_out_example_mean) -->
 | `held_out_example_mean`, lr=0 (seed1, fused) | `3.422172799706459` |
+<!-- claims63: c1=abs(docs/plans/63-how-well/measurements/campaign-v1/raw/seed2__fused__lr0.json#/tiers/finetune_run/held_out_example_mean) -->
 | `held_out_example_mean`, lr=0 (seed2, fused) | `3.422172799706459` |
+<!-- claims63: c1=abs(docs/plans/63-how-well/measurements/campaign-v1/raw/seed1__fused__r1.json#/tiers/finetune_run/held_out_example_mean) -->
 | `held_out_example_mean`, lr=2e-4 (seed1, fused, r1) | `3.218041628599167` |
+<!-- claims63: c1=abs(docs/plans/63-how-well/measurements/campaign-v1/raw/seed2__fused__r1.json#/tiers/finetune_run/held_out_example_mean) -->
 | `held_out_example_mean`, lr=2e-4 (seed2, fused, r1) | `3.4061567336320877` |
 
+<!-- claims63: c1=paircount('docs/plans/63-how-well/measurements/campaign-v1/raw/seed*__fused__lr0.json', 'docs/plans/63-how-well/measurements/campaign-v1/raw/seed*__fused__r1.json', 'held_out_example_mean'); c2=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json#/decision/gate_seed_count -->
 Only 2 of the 12 gate seeds have a committed `lr0` leg — this derivative
+<!-- claims63: c1=paircount('docs/plans/63-how-well/measurements/campaign-v1/raw/seed*__fused__lr0.json', 'docs/plans/63-how-well/measurements/campaign-v1/raw/seed*__fused__r1.json', 'held_out_example_mean') -->
 estimate is therefore an **n=2** estimate with no error bars available from
 committed data.
 
@@ -171,10 +182,13 @@ avg_slope    = (0.204131171107292 + 0.016016066074371) / 2 = 0.110073618590832
 ```
 
 **Caveat (family K — diagnose the structure, don't over-trust a small-n
+<!-- claims63: c1=ratio(absdiff(docs/plans/63-how-well/measurements/campaign-v1/raw/seed1__fused__lr0.json#/tiers/finetune_run/held_out_example_mean, docs/plans/63-how-well/measurements/campaign-v1/raw/seed1__fused__r1.json#/tiers/finetune_run/held_out_example_mean), absdiff(docs/plans/63-how-well/measurements/campaign-v1/raw/seed2__fused__lr0.json#/tiers/finetune_run/held_out_example_mean, docs/plans/63-how-well/measurements/campaign-v1/raw/seed2__fused__r1.json#/tiers/finetune_run/held_out_example_mean)) -->
 extrapolation):** the two available seeds disagree by **12.75x**
+<!-- claims63: c1=absdiff(docs/plans/63-how-well/measurements/campaign-v1/raw/seed1__fused__lr0.json#/tiers/finetune_run/held_out_example_mean, docs/plans/63-how-well/measurements/campaign-v1/raw/seed1__fused__r1.json#/tiers/finetune_run/held_out_example_mean); c2=absdiff(docs/plans/63-how-well/measurements/campaign-v1/raw/seed2__fused__lr0.json#/tiers/finetune_run/held_out_example_mean, docs/plans/63-how-well/measurements/campaign-v1/raw/seed2__fused__r1.json#/tiers/finetune_run/held_out_example_mean) -->
 (`0.204 / 0.016`) on this slope. This is itself the headline finding of
 this section: committed data does NOT tightly constrain
 `d(held-out-mean)/d(effective-lr-scale)`; any point estimate below is a
+<!-- claims63: c1=paircount('docs/plans/63-how-well/measurements/campaign-v1/raw/seed*__fused__lr0.json', 'docs/plans/63-how-well/measurements/campaign-v1/raw/seed*__fused__r1.json', 'held_out_example_mean') -->
 weak central tendency over `n=2`, and the true range spans the two
 per-seed slopes. Separately, this secant is measured over the **entire**
 `[0, 1]` range (untrained -> trained) — using it as a stand-in for the
@@ -182,6 +196,7 @@ LOCAL derivative at the operating point `s=1` (where the doses actually
 perturb) assumes the held-out-mean-vs-lr-scale response is linear over a
 much larger interval than any dose probes; this is an assumption, not a
 measured fact, and is progressively less trustworthy as `eps` grows
+<!-- claims63: c1=ratio(0.50, 0.01) -->
 (worst at `eps=0.50`, a 50% relative lr perturbation, well outside any
 region this secant can vouch for).
 
@@ -191,26 +206,36 @@ region this secant can vouch for).
 negative sign because the measured secant direction is DECREASING
 held-out-mean as scale increases):
 
+<!-- claims63: c1=absdiff(docs/plans/63-how-well/measurements/campaign-v1/raw/seed2__fused__lr0.json#/tiers/finetune_run/held_out_example_mean, docs/plans/63-how-well/measurements/campaign-v1/raw/seed2__fused__r1.json#/tiers/finetune_run/held_out_example_mean); c2=ledger; c3=absdiff(docs/plans/63-how-well/measurements/campaign-v1/raw/seed1__fused__lr0.json#/tiers/finetune_run/held_out_example_mean, docs/plans/63-how-well/measurements/campaign-v1/raw/seed1__fused__r1.json#/tiers/finetune_run/held_out_example_mean) -->
 | eps | using slope(seed2)=0.016016 (weak end) | using avg_slope=0.110074 | using slope(seed1)=0.204131 (strong end) |
 |---|---|---|---|
+<!-- claims63: c1=const; c2=const; c3=const; c4=const; c5=const; c6=const; c7=const; c8=const; c9=const; c10=const -->
 | 0.02 | `-0.016016 * 0.02 = -0.00032032` | `-0.110074 * 0.02 = -0.00220147` | `-0.204131 * 0.02 = -0.00408262` |
+<!-- claims63: c1=const; c2=const; c3=const; c4=const; c5=const; c6=const; c7=const; c8=const; c9=const; c10=const -->
 | 0.10 | `-0.016016 * 0.10 = -0.00160161` | `-0.110074 * 0.10 = -0.01100736` | `-0.204131 * 0.10 = -0.02041312` |
+<!-- claims63: c1=const; c2=const; c3=const; c4=const; c5=const; c6=const; c7=const; c8=const; c9=const; c10=const -->
 | 0.50 | `-0.016016 * 0.50 = -0.00800803` | `-0.110074 * 0.50 = -0.05503681` | `-0.204131 * 0.50 = -0.10206559` |
+<!-- claims63: c1=const; c2=const; c3=const; c4=const; c5=const; c6=const; c7=const; c8=const; c9=const; c10=const -->
 | -0.10 (addendum 2026-08-29c) | `-0.016016 * -0.10 = +0.00160161` | `-0.110074 * -0.10 = +0.01100736` | `-0.204131 * -0.10 = +0.02041312` |
+<!-- claims63: c1=const; c2=const; c3=const; c4=const; c5=const; c6=const; c7=const; c8=const; c9=const; c10=const -->
 | -0.50 (addendum 2026-08-29c) | `-0.016016 * -0.50 = +0.00800803` | `-0.110074 * -0.50 = +0.05503681` | `-0.204131 * -0.50 = +0.10206559` |
 
 **Signed-family cross-check:** the same linear-secant formula
 (`Δmean(eps) = -slope*eps`) applied to negative `eps` predicts POSITIVE
 `Δmean` (held-out mean INCREASES) with IDENTICAL magnitude to the
 corresponding positive dose — `eps=-0.10` mirrors `eps=+0.10`'s magnitude
+<!-- claims63: c1=const -->
 exactly (`0.01100736` either way, sign flipped), and `eps=-0.50` mirrors
+<!-- claims63: c1=const -->
 `eps=+0.50`'s magnitude exactly (`0.05503681`). Both measured seed slopes
+<!-- claims63: c1=absdiff(docs/plans/63-how-well/measurements/campaign-v1/raw/seed2__fused__lr0.json#/tiers/finetune_run/held_out_example_mean, docs/plans/63-how-well/measurements/campaign-v1/raw/seed2__fused__r1.json#/tiers/finetune_run/held_out_example_mean); c2=absdiff(docs/plans/63-how-well/measurements/campaign-v1/raw/seed1__fused__lr0.json#/tiers/finetune_run/held_out_example_mean, docs/plans/63-how-well/measurements/campaign-v1/raw/seed1__fused__r1.json#/tiers/finetune_run/held_out_example_mean) -->
 are positive (`0.016016`, `0.204131`), so this sign flip is
 **sign-consistent across both seeds** — a negative dose is predicted to
 DEGRADE held-out loss regardless of which of the two seed slopes turns out
 to be closer to the true local derivative. This is the "undertrained-
 regression" direction addendum 2026-08-29c names: less effective lr moves
 the model back toward its untrained (`s=0`) state, which is measured
+<!-- claims63: c1=abs(docs/plans/63-how-well/measurements/campaign-v1/raw/seed1__fused__lr0.json#/tiers/finetune_run/held_out_example_mean) -->
 WORSE (`3.422173`) than the trained (`s=1`) state at both seeds.
 
 **Predicted DIRECTION (all doses, both ends of the range): IMPROVEMENT
@@ -250,24 +275,28 @@ Committed benchmarks to compare the predicted shift against:
 | 0.02 (falsified, not scheduled) | 0.00220 | 2.7% of spread | 9.2% of the effect that already failed to reach 11/12 | **predicted NOT detected** (very high confidence — an order of magnitude below both benchmarks) |
 <!-- claims63: default=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json; c1=const; c2=const; c3=const; c4=const; c5=#/decision/threshold; c6=#/decision/gate_seed_count -->
 | 0.10 (falsified, not scheduled) | 0.01101 | 13.3% of spread | 46.3% of the effect that already failed to reach 11/12 | **predicted NOT detected** (high confidence — still smaller than an effect that already failed) |
-<!-- claims63: default=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json; c1=const; c2=const; c3=const; c4=const; c5=#/decision/threshold; c6=#/decision/gate_seed_count; c7=const; c8=const; c9=#/decision/threshold; c10=#/decision/gate_seed_count; c11=const; c12=const -->
+<!-- claims63: default=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json; c1=const; c2=const; c3=ratio(ratio(0.05504, #/determinism_floor/cross_seed_spread), 0.01); c4=ratio(0.05504, abs(#/decision/mean_d)); c5=#/decision/threshold; c6=#/decision/gate_seed_count; c7=rel(ratio(0.05504, abs(#/decision/mean_d)), '>', 2); c8=rel(ratio(0.05504, #/determinism_floor/cross_seed_spread), '<', 1); c9=#/decision/threshold; c10=#/decision/gate_seed_count; c11=const; c12=const -->
 | +0.50 (scheduled — two-sided falsification cell) | 0.05504 | 66.6% of spread | 2.31x the effect that already failed to reach 11/12 | **predicted NOT reliably detected**, but this is the closest call: the shift exceeds the already-non-detected effect by >2x, yet stays below 1 full cross-seed-spread-unit, so >=11/12 concordance is not confidently predicted either way. Using the strong-end per-seed slope (`0.204131`) instead of the average, eps=+0.50's predicted shift (`-0.10207`) would EXCEED the cross-seed spread — the two available seeds disagree sharply on whether this dose is detectable at all. If a sign test DOES fire here, the predicted DIRECTION is still improvement (RED-for-investigation, not RED-for-degradation) — that is what makes this the falsification cell for the Step-2 direction prediction, not a degradation candidate. |
 <!-- claims63: default=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json; c1=const; c2=const; c3=const; c4=const; c5=#/decision/threshold; c6=#/decision/gate_seed_count; c7=const; c8=#/decision/threshold; c9=#/decision/gate_seed_count -->
 | -0.10 (scheduled — addendum 2026-08-29c) | 0.01101 | 13.3% of spread | 46.3% of the effect that already failed to reach 11/12 | **predicted NOT detected** (same magnitude reasoning as `+0.10`, direction now DEGRADATION — the correct sign for the acceptance-5 claim, but the predicted magnitude is still smaller than an effect that already failed to reach 11/12 on this same gate) |
-<!-- claims63: default=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json; c1=const; c2=const; c3=const; c4=const; c5=#/decision/threshold; c6=#/decision/gate_seed_count; c7=const; c8=const; c9=const; c10=const; c11=const; c12=const -->
+<!-- claims63: default=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json; c1=const; c2=const; c3=ratio(ratio(0.05504, #/determinism_floor/cross_seed_spread), 0.01); c4=ratio(0.05504, abs(#/decision/mean_d)); c5=#/decision/threshold; c6=#/decision/gate_seed_count; c7=const; c8=const; c9=const; c10=const; c11=const; c12=const -->
 | -0.50 (scheduled — addendum 2026-08-29c) | 0.05504 | 66.6% of spread | 2.31x the effect that already failed to reach 11/12 | **predicted NOT reliably detected, but the best DEGRADATION-direction candidate of the three scheduled doses** — same magnitude/confidence caveats as `+0.50` (strong-end seed slope would push it to `0.10207`, above the cross-seed spread), but now in the direction that could actually discharge acceptance 5's "mutant column proven RED (degradation)" if the true local derivative tracks closer to the strong-end (seed1) slope than the weak-end (seed2) one. **This is the dose most likely, among the three scheduled, to produce the pair straddling detection that amendment 2026-08-29c's "reported sensitivity" clause asks for** — though the adjacent pair straddling detection, if one exists, is expected between `-0.50` and `-0.10` within the negative branch, per the addendum's own framing, not between `-0.50` and `+0.50`. |
 
 **Design-level flag, resolved by addendum 2026-08-29c:** the original
 positive-only ladder's predicted direction (Step 2) was IMPROVEMENT under
 the naive linear-extrapolation model, so even a dose that DID reach
+<!-- claims63: c1=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json#/decision/threshold; c2=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json#/decision/gate_seed_count -->
 `>=11/12+mean` would have read RED-for-improvement under the Frame's
 two-sided rule, not RED-for-degradation — unable to discharge amendment
 2026-08-29b item 3's acceptance criterion, which is scoped to the
 DEGRADATION direction (mirroring M1's pass criterion). This is exactly the
 `(1-eps)`-shaped revisit flagged in the prior revision of this section:
+<!-- claims63: c1=const; c2=const -->
 CONTRACT.md addendum 2026-08-29c signs the family (`eps in {-0.50, -0.10,
+<!-- claims63: c1=const -->
 +0.50}`) so the negative doses carry the predicted DEGRADATION direction
 (same secant, sign-consistent across both measured seeds — see the
+<!-- claims63: c1=const -->
 signed-family cross-check above), while `+0.50` is RETAINED, not dropped,
 as the two-sided falsification cell for the original improvement
 prediction itself. No family redesign beyond signing `eps` was needed; the
@@ -281,7 +310,9 @@ what is actually committed.
 
 ## On-pod procedure (dose legs only — substituted INTO the fused arm)
 
+<!-- claims63: c1=const -->
 **Scheduled ladder (CONTRACT.md addendum 2026-08-29c): `eps in {-0.50,
+<!-- claims63: c1=const; c2=const; c3=const; c4=const -->
 -0.10, +0.50}`.** `eps in {0.02, 0.10}` are falsified pre-spend (Step 2/3
 above) and are NOT run on the pod; their patches stay committed as the
 falsification record only.
@@ -290,6 +321,7 @@ The mutant-vs-fused pairing used by M1 is explicitly RETIRED. Per amendment
 2026-08-29b item 3 (merge procedure) and addendum 2026-08-29c (signed
 ladder), each dose column is produced by substituting the mutant into the
 fused arm itself and merging against the SAME v2 `alloff` legs under the
+<!-- claims63: c1=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json#/decision/threshold; c2=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json#/decision/gate_seed_count -->
 SAME `>=11/12+mean` rule — the gate's own statistic, not a separate ad hoc
 comparison.
 
@@ -316,6 +348,7 @@ comparison.
    cargo build --release -p jammi-kernels --features cuda
    cargo build --release -p jammi-ai --features <campaign's exact feature list>
    ```
+<!-- claims63: c1=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json#/decision/gate_seed_count -->
 4. Run the dose's 12 legs through the same `run_leg` vector the campaign's
    fused arm uses (same shapes, same seeds, same step count, same
    `attention_block_flash` + `adamw_step_fused` dispatch wiring) — the ONLY
@@ -323,9 +356,11 @@ comparison.
    build's `jammi-kernels` binary was compiled from the patched source. This
    dose leg SUBSTITUTES for the fused arm's leg at that seed — it is not a
    third, separately-merged column.
+<!-- claims63: c1=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json#/decision/gate_seed_count -->
 5. Merge each dose's 12 substituted-fused legs against the SAME campaign
    `alloff` legs already on record (identity permitting, per H5(1)'s
    ALLOFF-reuse rule) using the gate's own merger and its own
+<!-- claims63: c1=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json#/decision/threshold; c2=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json#/decision/gate_seed_count -->
    `>=11/12+mean` sign-test statistic — the same code path the real A/B
    verdict uses, not a bespoke mutant-vs-fused comparison.
 6. Record each dose leg's own provenance via the **three producer-stamped
@@ -355,20 +390,28 @@ comparison.
    detection WITHIN THE DEGRADATION-DIRECTION (negative-`eps`) BRANCH ONLY,
    ordered by `abs(eps)` (per amendment item 3 and addendum 2026-08-29c,
    unit-63 round-7 audit finding 4) — run the scheduled ladder in ascending
+<!-- claims63: c1=const; c2=const; c3=const -->
    SIGNED `eps` order (`-0.50`, `-0.10`, `+0.50`) and stop describing the
    sweep as "complete" only once a straddling pair is found or all three
    have been run without one. The merger's own `abs(eps)`-ordered scan of
+<!-- claims63: c1=const; c2=const; c3=const; c4=const -->
    the negative branch (`-0.10` -> `-0.50`, since `|{-0.10}| < |{-0.50}|`)
+<!-- claims63: c1=const -->
    is deliberately NOT the same order the legs are RUN in (`-0.50` run
+<!-- claims63: c1=const -->
    before `-0.10`) — reporting the straddle in run order would either miss
+<!-- claims63: c1=const -->
    a real straddle (a detection at the larger-magnitude `-0.50`, run first,
    reads `(RED, not-detected)` in run order, not the `(not-detected, RED)`
    shape a straddle needs) or, worse, misreport a cross-sign
+<!-- claims63: c1=const; c2=const -->
    `(-0.10 not-detected, +0.50 RED)` run-order-adjacent pair as though it
+<!-- claims63: c1=const -->
    were a degradation-direction finding. `+0.50` reading RED is instead the
    two-sided-falsification finding — and it REFUTES, not confirms, the
    Step-2 improvement prediction (`"RED"` is always the DEGRADATION-
    concordant arm; more effective lr made held-out loss worse, so the
+<!-- claims63: c1=const -->
    secant extrapolation was wrong). Only a `+0.50` dose reading
    `RED_FOR_INVESTIGATION`-shaped improvement CONFIRMS the prediction
    (unit-63 round-9 audit finding 1, correcting round-8 finding 1's own
@@ -385,6 +428,7 @@ comparison.
 Exactly as M1's, restated for the retired-pairing correction: **a sign test
 over the dose's substituted-fused column's held-out loss vs. the campaign's
 `alloff` legs' held-out loss reads RED (degradation) at the campaign's
+<!-- claims63: c1=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json#/decision/threshold; c2=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json#/decision/gate_seed_count -->
 pre-registered significance threshold (`alpha2=0.0064`, `>=11/12` +
 mean-agrees-in-sign).** If a dose's sign test does NOT read RED, that is a
 finding about the gate's sensitivity floor at that dose and must be reported
@@ -400,6 +444,7 @@ locally to `crates/jammi-kernels/src/ops/adamw_step.rs`, once per dose (one
 dose patch applied at a time, test added, run, then BOTH the test and the
 patch reverted via `git checkout --` before moving to the next dose — never
 committed). It runs the dose-patched `adamw_step_fused_t` against the
+<!-- claims63: c1=const -->
 file's own correct `eager_step` oracle (unpatched formula) for 5
 consecutive steps on the same fixed 4-element input M1 used
 (`beta1=0.9, beta2=0.999, lr=1e-3, weight_decay=0.01, eps=1e-8`), printing
@@ -477,12 +522,15 @@ M1 above is recorded as a NON-DETECTION (a sign-flipping early transient,
 never a sensitivity bound — see the campaign-v1 finding this amendment
 corrects). The corrected design is a one-parameter, monotone, SUSTAINED
 dose family — the fused AdamW update scaled by `(1+eps)`. Amendment
+<!-- claims63: c1=const; c2=const; c3=const -->
 2026-08-29b item 3 originally named `eps in {0.02, 0.10, 0.50}`
 (positive-only); this README's own required pre-spend prediction table
 falsified that direction before any spend (Step 2/3 above: predicted
 IMPROVEMENT, not degradation, on both measured seeds). CONTRACT.md
 addendum 2026-08-29c resolves this by SIGNING the family:
+<!-- claims63: c1=const; c2=const; c3=const -->
 **the scheduled ladder is now `eps in {-0.50, -0.10, +0.50}`** —
+<!-- claims63: c1=const; c2=const -->
 `eps in {0.02, 0.10}` remain committed as the falsified-but-recorded
 doses, not scheduled to run. Each scheduled dose runs as its own
 scratch-worktree mutant (the SAME on-pod procedure above: patched
@@ -507,6 +555,7 @@ separate record.
   (MUTANT_DOSE_LADDER_NEG_EPS_EXCLUSIVE_BOUND, -MUTANT_DOSE_LADDER_MIN_ABS_EPS]
   union [MUTANT_DOSE_LADDER_MIN_ABS_EPS, MUTANT_DOSE_LADDER_MAX_EPS]`
   (unit-63 round-10 audit advisory (b): `MUTANT_DOSE_LADDER_NEG_EPS_EXCLUSIVE_BOUND`
+<!-- claims63: c1=const; c2=const -->
   is `-1.0`, named rather than a bare literal so the `(1+eps)==0` rationale
   below has one place to live; `MUTANT_DOSE_LADDER_MAX_EPS` was renamed
   from `..._MAX_ABS_EPS` since every call site compares the SIGNED value
@@ -517,6 +566,7 @@ separate record.
   family — a single symmetric `|eps| <= MAX` check would have let it
   through; a magnitude below `MUTANT_DOSE_LADDER_MIN_ABS_EPS` is refused
   as below this family's own sanity floor, set deliberately BELOW the
+<!-- claims63: c1=const -->
   smallest ever-SCHEDULED dose (`|eps| = 0.10`) so a genuine sub-schedule
   diagnostic dose (e.g. `eps=0.02` above) is still admitted while a
   manufactured near-zero eps is refused); an unparseable, non-finite,
@@ -539,17 +589,21 @@ separate record.
 - **Per-dose output** (`mutant_dose_ladder.doses[i]` in the merged
   artifact): `{dose_label, patch_sha256, detected, n_pos, n_neg, mean_d,
   p_value, clean_pair_count, violations, ...}` — `detected` is `"RED"` iff
+<!-- claims63: c1=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json#/decision/threshold; c2=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json#/decision/gate_seed_count -->
   the SAME `>=11/12` threshold the primary decision uses is met in the
   DEGRADATION direction (mutant worse than alloff); `"RED_FOR_INVESTIGATION"`
   (unit-63 round-8 audit finding 2) iff the SAME threshold is met in the
   OPPOSITE, IMPROVEMENT-concordant direction instead (mirrors the primary
   decision's own `RED_FOR_INVESTIGATION` state) — this is the confirming
+<!-- claims63: c1=const -->
   outcome the `+0.50` two-sided-falsification cell needs to be able to
   report; before this fix the column had no state for this arm and it
   collapsed into `"not-detected"`, so the confirming outcome could never be
   reported. `"not-detected"` if NEITHER threshold is met at all (M1's own
+<!-- claims63: c1=poscount('docs/plans/63-how-well/measurements/campaign-v1/mutant-m1/mutant-seed*.json', 'docs/plans/63-how-well/measurements/campaign-v1/raw/seed*__fused__r1.json', 'held_out_example_mean'); c2=paircount('docs/plans/63-how-well/measurements/campaign-v1/mutant-m1/mutant-seed*.json', 'docs/plans/63-how-well/measurements/campaign-v1/raw/seed*__fused__r1.json', 'held_out_example_mean') -->
   sign-flipping-transient shape: 8/12, well under either threshold);
   `"INVALID"` if the premise-clean pair count is not exactly the
+<!-- claims63: c1=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json#/decision/gate_seed_count -->
   pre-registered 12, or the sign test itself refuses — a
   correctness-of-measurement carve-out beyond the amendment's own literal
   `RED`/`not-detected` pair, added so a malformed dose column is never
@@ -598,6 +652,7 @@ separate record.
   procedure step 7, and `ab_merge.mutant_dose_ladder_sensitivity`'s own
   docstring), corrected by unit-63 round-9 audit finding 1, confirmed
   corrected everywhere it appears by that round's own
+<!-- claims63: c1=ledger -->
   `grep -rn -i 'confirm|refut'` / `'reading RED|reads RED|\+0.50'` sweep over
   `ab_merge.py`, `test_ab_merge.py`, this file, and `CONTRACT.md` — a
   completeness claim re-established by sweep each round it is touched,
@@ -613,8 +668,11 @@ separate record.
 
 **Why the `(1+eps)` lr-scale family cannot supply acceptance 5's RED.** The
 signed dose ladder (`measurements/dose-ladder/README.md`, unit 63 addendum
+<!-- claims63: c1=docs/plans/63-how-well/measurements/dose-ladder/finetune_run_ab_report.json#/mutant_dose_ladder/doses/0/n_neg; c2=docs/plans/63-how-well/measurements/dose-ladder/finetune_run_ab_report.json#/mutant_dose_ladder/doses/0/gate_seed_count -->
 2026-08-29c, run at base `494fb3e3`) DEMONSTRATED the detector — 11/12
+<!-- claims63: c1=docs/plans/63-how-well/measurements/dose-ladder/finetune_run_ab_report.json#/mutant_dose_ladder/doses/0/p_value -->
 sign-concordance at `p=0.00635 < alpha2` on a real effect — but landed every
+<!-- claims63: c1=const; c2=const; c3=const -->
 scheduled dose (`eps in {-0.50, -0.10, +0.50}`) in the IMPROVEMENT direction:
 `eps-0.50` and `eps-0.10` both read `RED_FOR_INVESTIGATION` (anomalous
 improvement under deflation, `mean_d` negative both times), and `eps0.50`
@@ -622,6 +680,7 @@ read not-detected. Per that README's own finding 3: "no degradation-RED
 among the (1+eps) family: the lr-scale knob cannot produce a degradation
 demonstration near this operating point." The lr surface near the
 campaign's `lr=2e-4` operating point is favorable in every tested
+<!-- claims63: c1=ratio(0.50, 0.01) -->
 direction (inflating OR deflating effective lr by up to 50% improves or is
 neutral to held-out loss) — this is a genuine measured property of THIS
 fixture's loss surface near THIS lr, not a detector-sensitivity gap, and no
@@ -646,28 +705,38 @@ requires):
 
 ### `M_nobc` — bias correction removed entirely
 
+<!-- claims63: c1=const; c2=const -->
 **Definition:** `adamw_step_fused_t` pins `scale_m = 1.0`, `scale_v = 1.0`
+<!-- claims63: c1=const; c2=const; c3=const; c4=const -->
 instead of deriving them from `t` (`1/(1-beta1^t)`, `1/(1-beta2^t)`) — the
 fused update runs on RAW (uncorrected) `m`/`v` moment estimates. Models a
 realistic silent regression: a kernel that skips bias correction while
 still computing the right EMA moments and the right theta-update
 arithmetic otherwise. This is a SUSTAINED family-outside perturbation —
 unlike M1's `t+1` off-by-one (a sign-flipping early transient that decays
+<!-- claims63: c1=ledger -->
 toward a `~1.009` multiplier by `t=50`, `measurements/campaign-v1/`'s own
+<!-- claims63: c1=ledger -->
 finding), the uncorrected-scale multiplier is monotone-decaying-toward-1.0
+<!-- claims63: c1=const; c2=const -->
 from a LARGE start (`scale_m` ratio to the correct value is `1/(1-beta1^t)`,
+<!-- claims63: c1=ledger; c2=ledger -->
 `~10x` at `t=1` for `beta1=0.9`; `scale_v`'s ratio is `~1000x` at `t=1` for
 `beta2=0.999`) — a one-directional (never sign-flipping) effective-lr
+<!-- claims63: c1=ledger; c2=ledger -->
 blowup, matching the "sustained 3.2-6.5x effective-lr blowup" the earlier
 pressure-test (CONTRACT.md amendment 2026-08-29b item 3's own root-cause
 analysis of M1) computed over a realistic step range.
 
 **Predicted direction: UNCERTAIN, stated honestly.** The measured
 `(1+eps)` lr-scale data gives no clean extrapolation to this mutant's
+<!-- claims63: c1=const; c2=const -->
 magnitude: `eps=+-0.10` (a 1.10x/0.90x effective-lr multiplier) read
+<!-- claims63: c1=ledger; c2=ledger -->
 neutral-to-improving on this fixture, but `M_nobc`'s blowup is 3-6x LARGER
 than anything the ladder measured — well outside the range the ladder's own
 secant (measurements/dose-ladder's own README, and the earlier prediction
+<!-- claims63: c1=ledger; c2=ledger -->
 table above) can vouch for. A 3-6x effective-lr blowup at early steps
 plausibly destabilizes training (the "too-large-lr degradation regime" the
 prediction table above names as the mechanism that could reverse the
@@ -926,6 +995,7 @@ byte-identical to `e340391c`'s copy, same blob `58a1418c`):
   re-dosing at a larger magnitude if a stronger RED-proof degradation
   demonstration is later needed, but that is not scheduled here.
 - `M_signflip.patch` — sha256 `fb2bd11935e9a08e8a1197aa3a84535660119823aabb421105e389a388f6e5e4`
+<!-- claims63: c1=zerocount('docs/plans/63-how-well/measurements/red-proof/raw/signflip__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__fused__r1.json', 'held_out_example_mean'); c2=paircount('docs/plans/63-how-well/measurements/red-proof/raw/signflip__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__fused__r1.json', 'held_out_example_mean') -->
   — **RETIRED, measured INERT on GPU (12/12 bit-identical)**; kept
   patch-file-only for the record, never scheduled to run again.
 - `M_signflip_v2.patch` — sha256
@@ -936,6 +1006,7 @@ byte-identical to `e340391c`'s copy, same blob `58a1418c`):
 **Run procedure:** identical to the dose ladder's own on-pod procedure
 above (scratch worktree at the recorded base sha, `git apply --check` then
 `git apply`, build with the campaign's exact feature list, run the SAME
+<!-- claims63: c1=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json#/decision/gate_seed_count -->
 12-seed `run_leg` vector substituted into the fused arm, merge against the
 SAME campaign `alloff` legs, stamp `--mutant-id`/`--mutant-base-sha`/
 `--mutant-patch-sha256`, tear down after) — with dose labels
@@ -1067,6 +1138,7 @@ empty `.red_proof[]` as "nothing scheduled" without first checking whether
 site (proven on
 hardware by the `(1+eps)` family) and its certainty prediction, this run
 was PREDICTED to read `redproof-signflip-v2: RED` and discharge acceptance
+<!-- claims63: c1=const -->
 5's "mutant column proven RED" — per this file's own family F/K discipline,
 that was reported as a prediction to be measured, not assumed, and it now
 HAS been measured: `redproof-signflip-v2: RED`, `red_proof_verdict =

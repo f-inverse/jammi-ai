@@ -16,7 +16,6 @@ All four pre-registered predictions confirmed to the bit:
 <!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/dstar/finetune_run_ab_report.json; c1=#/mutant_dose_ladder/red_proof/0/p_value -->
      = 0.00048828125 exactly;
 (iii) `red_proof_verdict` = PROVEN;
-<!-- claims63: c1=ledger -->
 (iv) merge exit 0 (primary decision GREEN unchanged; PROVEN contributes
      nothing to the exit code).
 

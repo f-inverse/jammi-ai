@@ -1366,6 +1366,38 @@ struct FingerprintSlot {
     absence_tolerated: bool,
 }
 
+/// **Contract (unit-62 design pressure-test, PINNED).** This fingerprint
+/// enforces the NARROW staleness contract esc-058 specified: detect
+/// in-place mutation — content change, deletion, or appearance — of the
+/// FILES the resolver selected (and their preference-chain alternates)
+/// under the resolve inputs recorded at load (`source`, `task`,
+/// `backend_hint`, catalog state). It deliberately does NOT re-verify
+/// non-file resolve inputs:
+///
+/// - catalog `artifact_path`/`backend` rewrites — a retrained fine-tuned
+///   model whose adapter dir is content-addressed and immutable will probe
+///   fresh until process restart: `fetch_artifact` never touches bytes this
+///   type is already watching, and the catalog ROW pointing at a NEW dir is
+///   invisible to this type entirely (esc-057's mutable-pointer defect
+///   recurring one layer up);
+/// - catalog-vs-local precedence (`ModelResolver::try_catalog_lookup`'s
+///   catalog-first ordering vs. a shadowed `ModelSource::Local` fallthrough
+///   that could resolve differently on a cold path);
+/// - task/backend_hint cache keying — cache entries are keyed by `ModelId`
+///   alone, narrower than the `(source, task, backend_hint)` resolve key;
+/// - HF `refs/<rev>` revision moves — the mutable pointer hf-hub resolves
+///   through (`refs/<rev> -> snapshots/<sha>`) sits outside this type's
+///   file-set anchor entirely and is structurally inexpressible as an arm;
+///   the snapshot blobs themselves ARE immutable, so this subsystem is
+///   honestly a no-op for HF sources today;
+/// - remote sibling listings — a shard set derived from a remote glob
+///   listing, not a finite local arm list this type could enumerate.
+///
+/// Those classes are unit 65's scope (`docs/plans/65-resolve-witness`), not
+/// this type's — see that plan for the resolver-emitted-witness direction
+/// that would widen the contract. `ModelCache::get_or_load`'s own doc
+/// carries a one-line summary of this same boundary.
+///
 /// [`ModelCache::get_or_load`]: super::super::cache::ModelCache::get_or_load
 #[derive(Debug, Clone)]
 pub(crate) struct ModelFingerprint {
@@ -1451,6 +1483,21 @@ impl ModelFingerprint {
     ///     round-10 reshape. The tokenizer slot's `absence_tolerated == true`
     ///     means it NEVER reaches this arm, for any number of vanished arms.
     ///
+    /// **Evict-on-`Err` (unit-62 design pressure-test, item 3 — wedge
+    /// elimination).** `ModelCache::get_or_load`'s `Err` arm now evicts this
+    /// `CacheEntry` before returning, exactly like its `Ok(false)` arm does.
+    /// Under the narrow staleness contract (see [`ModelFingerprint`]'s own
+    /// doc), the honest behavior here is cold-equivalence, not a silent
+    /// recovery: the entry is gone, so the NEXT `get_or_load` call takes a
+    /// full cold resolve + reload instead of re-probing this identical dead
+    /// entry. If the cause that produced this `Err` is still present, that
+    /// cold reload fails too — with the LOADER's own typed error (a
+    /// different message than this probe's), the identical observable
+    /// outcome (refusal), never a wedge into a different failure mode. If
+    /// the cause was transient (e.g. the catalog-vs-local precedence class
+    /// unit 65 scopes), the cold reload succeeds and the system self-heals
+    /// instead of staying wedged on a dead in-memory entry forever.
+    ///
     /// **Honest residual (round 12) — arm (b) is `backend_hint`-blind for the
     /// weights slot.** "Some arm of this slot present now" is an on-disk-only
     /// check; it does not know whether the ORIGINAL `get_or_load` call's
@@ -1467,6 +1514,27 @@ impl ModelFingerprint {
     /// instead of directly from `probe`. See [`all_candidate_paths`]'s
     /// weights-alternates-slot doc for the full accounting of why this is
     /// left undetected rather than plumbing `backend_hint` into this type.
+    ///
+    /// **Slot evaluation is per-slot-local and first-change-wins (unit-62
+    /// design pressure-test, item 4b — stated, not changed; widening this is
+    /// unit 65's witness work).** The loop below walks `self.slots` in
+    /// [`all_candidate_paths`]'s push order and returns as soon as ONE slot
+    /// reports arm (b) or arm (c) — it never scans the remaining slots to
+    /// see whether a LATER slot would also have changed, and never
+    /// aggregates across slots. So whether a caller of this probe observes
+    /// a stale-reload (arm b) or a typed refusal (arm c) on a given call is
+    /// PUSH-ORDER dependent whenever more than one slot has actually
+    /// diverged since load: if the weights slot (pushed first) has an arm
+    /// (b) alternate-exists divergence and, say, the required config slot
+    /// (pushed after it) independently has an arm (c) total-absence
+    /// divergence, this call reports `Ok(false)` and never even inspects
+    /// the config slot — the caller reloads, and only discovers the
+    /// config-slot refusal on THAT reload's own resolve. A different push
+    /// order (config first) would report the `Err` directly, on this same
+    /// call. Both are typed, neither is silently wrong — but the SPECIFIC
+    /// arm a caller sees for a multi-slot-divergence input is an artifact of
+    /// `all_candidate_paths`'s enumeration order, not a property of the
+    /// underlying divergence itself.
     pub(crate) fn probe(&self) -> Result<bool> {
         for slot in &self.slots {
             let mut changed = false;

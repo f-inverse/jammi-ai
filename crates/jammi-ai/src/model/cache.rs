@@ -11,7 +11,7 @@ use super::backend::ort::OrtBackend;
 use super::backend::{DeviceConfig, ModelBackend};
 use super::resolver::ModelResolver;
 use super::{BackendType, LoadedModel, ModelGuard, ModelId, ModelSource, ModelTask};
-use crate::concurrency::{GpuPermit, GpuScheduler};
+use crate::concurrency::{GpuPermit, GpuPriority, GpuScheduler};
 
 /// Where a cached model currently resides.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -168,7 +168,44 @@ impl ModelCache {
         }
     }
 
+    /// Remove `id`'s `CacheEntry` if — and only if — it still holds the SAME
+    /// `Arc<LoadedModel>` this call's snapshot probed (`Arc::ptr_eq`); a
+    /// concurrent task may have already evicted/reloaded it, in which case
+    /// this is a no-op and whatever is there now is left alone. Shared by
+    /// `get_or_load`'s `Ok(false)` (stale) and `Err` (unit-62 design
+    /// pressure-test, item 3: wedge elimination) arms — the same removal
+    /// discipline applies to both: serving stale bytes, or re-probing a
+    /// permanently dead entry forever, are both correctness bugs the
+    /// idle-only `evict_one` (memory-pressure eviction) does not address.
+    async fn evict_if_current(&self, id: &ModelId, model: &Arc<LoadedModel>) {
+        let mut cache = self.inner.write().await;
+        if cache
+            .entries
+            .get(id)
+            .is_some_and(|e| Arc::ptr_eq(&e.model, model))
+        {
+            cache.entries.remove(id);
+            cache.lru_order.retain(|x| x != id);
+        }
+    }
+
     /// Get or load a model. Returns a guard that keeps the model alive.
+    ///
+    /// **Staleness contract (unit-62 design pressure-test, PINNED — see
+    /// `backend::candle::ModelFingerprint`'s doc for the full accounting):
+    /// this cache's warm-hit staleness detection (esc-058) is NARROW.** It
+    /// re-`stat`s the FILES the resolver selected at load time and reloads
+    /// on in-place mutation, deletion, or appearance among them; it does
+    /// NOT re-verify catalog `artifact_path`/`backend` rewrites (a
+    /// fine-tuned retrain's new adapter goes unnoticed by a warm entry until
+    /// process restart), catalog-vs-local precedence, `task`/`backend_hint`
+    /// cache keying (entries are keyed by `ModelId` alone), HF revision
+    /// moves, or remote sibling listings — those are unit 65's scope
+    /// (`docs/plans/65-resolve-witness`). The guarantee this DOES provide is
+    /// BOUNDED STALENESS, never per-hit freshness: the returned
+    /// [`ModelGuard`] was fresh at some instant before this call began, but
+    /// is never revalidated again — a TOCTOU window between that instant and
+    /// the guard's actual use is inherent, not a defect.
     pub async fn get_or_load(
         &self,
         source: &ModelSource,
@@ -300,24 +337,35 @@ impl ModelCache {
                         // snapshot itself never held a permit clone (F-3'
                         // above): it never incremented `ref_count`, so
                         // there is nothing of ITS OWN to release here.
-                        let mut cache = self.inner.write().await;
-                        if cache
-                            .entries
-                            .get(&id)
-                            .is_some_and(|e| Arc::ptr_eq(&e.model, &model))
-                        {
-                            cache.entries.remove(&id);
-                            cache.lru_order.retain(|x| x != &id);
-                        }
-                        drop(cache);
+                        self.evict_if_current(&id, &model).await;
                         // Fall through to single-flight/load below, which
                         // re-resolves and re-hashes the CURRENT bytes.
                     }
                     Err(e) => {
-                        // A fingerprinted candidate vanished or became
-                        // unreadable between load and this probe: a typed
-                        // refusal (K2), never a silent "treat as fresh" or
-                        // "treat as stale".
+                        // Unit-62 design pressure-test, item 3 (wedge
+                        // elimination): a fingerprinted candidate vanished
+                        // or became unreadable between load and this probe —
+                        // still a typed refusal (K2), never a silent "treat
+                        // as fresh". But leaving the stale `CacheEntry`
+                        // cached here (the pre-fix behavior) meant every
+                        // LATER call re-probed the identical dead entry and
+                        // re-`Err`ed forever — a permanent wedge, even for a
+                        // cause that was only transient (the catalog-shadow
+                        // fallthrough case unit 65 scopes) or that a
+                        // subsequent cold resolve would in fact route around
+                        // via an alternate the probe's OWN slot didn't see
+                        // fail. Evict here too, exactly like the `Ok(false)`
+                        // arm above, so the entry is gone before we return:
+                        // the NEXT call takes the full cold path instead of
+                        // the identical stale entry. Under the narrow
+                        // staleness contract (see `ModelFingerprint`'s doc)
+                        // this is cold-equivalence, not a silent recovery —
+                        // if the cause is still present, the next call hits
+                        // the loader's own typed error (a different message
+                        // than this probe's, but the identical OBSERVABLE
+                        // outcome: refusal), never a wedge; if the cause was
+                        // transient, the system self-heals instead.
+                        self.evict_if_current(&id, &model).await;
                         return Err(e);
                     }
                 }
@@ -451,17 +499,58 @@ impl ModelCache {
         };
         let memory_bytes = backend.estimate_memory(&resolved);
 
+        // Unit-62 design pressure-test, item 2 (block): a stale-fingerprint
+        // reload can transiently need this model's budget TWICE — the
+        // caller in `get_or_load`'s `Ok(false)` arm already removed the
+        // stale `CacheEntry` from `cache.entries` (so `evict_one` here can
+        // never find it again), but its `Arc<GpuPermit>` clone stays
+        // outstanding for as long as ANY live `ModelGuard` from before the
+        // mutation is still held — the reservation is not released until
+        // that guard drops (F-3's Arc-shared-permit accounting, unchanged).
+        // Under a budget realistically sized to one resident copy of this
+        // model, `evict_one` therefore finds nothing evictable even though
+        // the request is perfectly satisfiable — just not yet. Distinguish
+        // that from a genuinely unsatisfiable request (more bytes than the
+        // scheduler could EVER admit, evictions or waiting or not) via
+        // `GpuScheduler::usable_capacity` — the one case a hard error is
+        // still honest, since no amount of waiting would ever succeed.
+        // Otherwise, fall back to `GpuScheduler::acquire`'s async wait: it
+        // registers its `Notify` waiter (via `enable()`) before its own
+        // `try_acquire` check, so it never misses the outgoing guard's
+        // `GpuPermit::drop` -> `notify_waiters()` (or a later `evict_one`
+        // finding a newly-idle entry) — wakes on ANY permit release, in
+        // arbitrary order among waiters (v1 priority is a label only, see
+        // `GpuScheduler::acquire`'s doc), and never returns `Err` itself
+        // (its loop only ever resolves via a successful `try_acquire`), so
+        // this reload waits rather than hard-failing "nothing to evict" on
+        // a load that would otherwise have succeeded once the outgoing
+        // guard released.
         let gpu_permit = loop {
             if let Some(permit) = self.gpu_scheduler.try_acquire(memory_bytes) {
                 break permit;
             }
-            let mut cache = self.inner.write().await;
-            if !cache.evict_one() {
+            let evicted = {
+                let mut cache = self.inner.write().await;
+                cache.evict_one()
+            };
+            if evicted {
+                continue;
+            }
+            if memory_bytes > self.gpu_scheduler.usable_capacity() {
                 return Err(JammiError::Model {
                     model_id: source_str,
-                    message: "Cannot acquire GPU memory: nothing to evict".into(),
+                    message: format!(
+                        "Cannot acquire GPU memory: {memory_bytes} bytes requested exceeds \
+                         the total usable GPU budget of {} bytes — no amount of eviction or \
+                         waiting could ever satisfy this request",
+                        self.gpu_scheduler.usable_capacity()
+                    ),
                 });
             }
+            break self
+                .gpu_scheduler
+                .acquire(memory_bytes, GpuPriority::Interactive)
+                .await?;
         };
 
         let loaded = backend.load(&resolved, &self.device_config)?;

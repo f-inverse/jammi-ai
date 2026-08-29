@@ -398,6 +398,22 @@ impl LoadedModel {
     /// the sole authoritative attestation of the bytes that were hashed;
     /// this probe only decides WHEN a reload is triggered.
     ///
+    /// **The guarantee this provides is BOUNDED STALENESS, never per-hit
+    /// freshness (unit-62 design pressure-test, corrected framing).** A call
+    /// that reports `Ok(true)` proves this file set was unchanged AT THE
+    /// INSTANT this probe ran — not that the `Arc<LoadedModel>` the caller
+    /// then goes on to use stays fresh for the duration of that use.
+    /// `ModelCache::get_or_load`'s returned [`ModelGuard`] is never
+    /// revalidated again after this call returns: a mutation landing between
+    /// this probe and the guard's actual forward pass (or landing during a
+    /// long-held guard) is a TOCTOU window this type does not — and
+    /// structurally cannot, being `stat`-only and synchronous with a single
+    /// call — close. Treat every guard as "fresh as of load or last warm-hit
+    /// probe", never "fresh for as long as I hold it." See
+    /// `backend::candle::ModelFingerprint`'s doc for the narrow-contract
+    /// scope this bound additionally sits within (unit 65's classes are
+    /// entirely outside even this bounded guarantee).
+    ///
     /// The ORT backend never actually reaches a loaded state today (see
     /// `content_digest`'s doc), and more generally a backend whose
     /// `content_digest` is `ModelContentDigest::Unavailable` (an

@@ -3656,6 +3656,26 @@ class MutantDoseLadderTests(unittest.TestCase):
         self.assertEqual(col["clean_pair_count"], 12)
         self.assertEqual(col["violations"], [])
 
+    def test_detected_red_for_investigation_when_threshold_and_direction_are_improvement(self):
+        # unit-63 round-8 audit finding 2: 11 of 12 mutant legs read BETTER
+        # (lower held-out loss) than their SAME-SEED alloff leg -- the
+        # improvement-concordant shape the two-sided-falsification cell
+        # (+0.50) needs a real, reportable state for. Before this fix, this
+        # exact shape collapsed into "not-detected" and the confirming
+        # outcome could never be reported.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in range(1, 13):
+                self._write_alloff(raw_dir, seed, mean=0.50)
+                mutant_mean = 0.30 if seed != 12 else 0.70  # seed 12 dissents
+                _write_mutant_leg(raw_dir, seed, "eps0.50", _mutant_tier(seed=seed, held_out_example_mean=mutant_mean))
+            col = ab_merge.build_mutant_dose_column(raw_dir, "eps0.50", self.PATCH_SHA, list(range(1, 13)))
+        self.assertEqual(col["detected"], "RED_FOR_INVESTIGATION")
+        self.assertEqual(col["n_pos"], 1)
+        self.assertEqual(col["n_neg"], 11)
+        self.assertLess(col["mean_d"], 0.0)
+        self.assertEqual(col["clean_pair_count"], 12)
+        self.assertEqual(col["violations"], [])
+
     def test_sign_flipping_transient_is_not_detected(self):
         # mutants/README.md's own M1 finding, reproduced generically: an
         # 8/12 split (well under the 11/12 threshold) reads not-detected,
@@ -3689,6 +3709,53 @@ class MutantDoseLadderTests(unittest.TestCase):
             col = ab_merge.build_mutant_dose_column(raw_dir, "eps0.50", self.PATCH_SHA, [1])
         self.assertTrue(any("mutant_id" in v for v in col["violations"]), col["violations"])
         self.assertIsNone(col["per_seed"]["1"]["d_i"])
+
+    def test_whitespace_only_provenance_fields_are_treated_as_empty(self):
+        # unit-63 round-8 audit finding 4 (merger half): a whitespace-only
+        # value (" ") for any of the three producer-stamped fields is
+        # exactly as absent as "" or None -- the pre-fix bare
+        # `if not tier.get(field)` check passed it straight through as
+        # though it were present.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_alloff(raw_dir, 1, mean=0.50)
+            _write_mutant_leg(
+                raw_dir,
+                1,
+                "eps0.50",
+                _mutant_tier(
+                    seed=1,
+                    held_out_example_mean=0.70,
+                    mutant_id=" ",
+                    mutant_base_sha="\t",
+                    mutant_patch_sha256="  ",
+                ),
+            )
+            col = ab_merge.build_mutant_dose_column(raw_dir, "eps0.50", self.PATCH_SHA, [1])
+        for field in ("mutant_id", "mutant_base_sha", "mutant_patch_sha256"):
+            self.assertTrue(
+                any(f"{field!r}" in v and "missing/empty" in v for v in col["violations"]),
+                col["violations"],
+            )
+        self.assertIsNone(col["per_seed"]["1"]["d_i"])
+
+    def test_sha_comparison_uses_stripped_values(self):
+        # unit-63 round-8 audit finding 4 (merger half): incidental
+        # leading/trailing whitespace on either side of the sha comparison
+        # must never be reported as a labeling-error mismatch.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_alloff(raw_dir, 1, mean=0.50)
+            _write_mutant_leg(
+                raw_dir,
+                1,
+                "eps0.50",
+                _mutant_tier(seed=1, held_out_example_mean=0.70, mutant_patch_sha256=f"  {self.PATCH_SHA}\t"),
+            )
+            col = ab_merge.build_mutant_dose_column(raw_dir, "eps0.50", f" {self.PATCH_SHA} ", [1])
+        # per-leg violations only -- the column-level "expected exactly 12"
+        # count violation (this test only runs 1 seed) is orthogonal to the
+        # sha-comparison claim under test here.
+        self.assertEqual(col["per_seed"]["1"]["violations"], [])
+        self.assertIsNotNone(col["per_seed"]["1"]["d_i"])
 
     def test_patch_sha256_mismatch_is_refused(self):
         with tempfile.TemporaryDirectory() as raw_dir:
@@ -3807,7 +3874,49 @@ class MutantDoseLadderTests(unittest.TestCase):
         columns = [neg50, neg10, pos50]
         self.assertIsNone(ab_merge.mutant_dose_ladder_sensitivity(columns))
         falsification = ab_merge.mutant_dose_ladder_two_sided_falsification(columns)
-        self.assertEqual(falsification, [{"dose_label": "eps0.50", "eps": 0.50, "detected": "RED"}])
+        self.assertEqual(
+            falsification,
+            [
+                {
+                    "dose_label": "eps0.50",
+                    "eps": 0.50,
+                    "detected": "RED",
+                    "finding": "secant refuted (degradation at +eps)",
+                }
+            ],
+        )
+
+    def test_positive_eps_red_for_investigation_is_the_confirming_falsification_arm(self):
+        # unit-63 round-8 audit finding 1/2: a positive-eps dose reading
+        # RED_FOR_INVESTIGATION (improvement-concordant) is the CONFIRMING
+        # outcome for the held-out-improvement prediction -- never described
+        # as a "refutation" (that word belongs to the RED/degradation arm
+        # instead, the exact polarity inversion round-8 finding 1 corrects).
+        columns = [{"dose_label": "eps0.50", "detected": "RED_FOR_INVESTIGATION"}]
+        falsification = ab_merge.mutant_dose_ladder_two_sided_falsification(columns)
+        self.assertEqual(
+            falsification,
+            [
+                {
+                    "dose_label": "eps0.50",
+                    "eps": 0.50,
+                    "detected": "RED_FOR_INVESTIGATION",
+                    "finding": "secant confirmed (improvement at +eps)",
+                }
+            ],
+        )
+
+    def test_red_for_investigation_never_enters_the_sensitivity_branch(self):
+        # RED_FOR_INVESTIGATION is an improvement-concordant reading; it must
+        # never be treated as a degradation-direction detection even for a
+        # negative-eps dose_label (a negative dose reading RED_FOR_INVESTIGATION
+        # would be an anomalous improvement under DEFLATION, still not the
+        # DEGRADATION `sensitivity` statistic is scoped to).
+        columns = [
+            {"dose_label": "eps-0.50", "detected": "not-detected"},
+            {"dose_label": "eps-0.10", "detected": "RED_FOR_INVESTIGATION"},
+        ]
+        self.assertIsNone(ab_merge.mutant_dose_ladder_sensitivity(columns))
 
     def test_positive_eps_not_detected_is_not_a_falsification_finding(self):
         columns = [{"dose_label": "eps0.50", "detected": "not-detected"}]
@@ -3822,6 +3931,47 @@ class MutantDoseLadderTests(unittest.TestCase):
             ab_merge.mutant_dose_ladder_sensitivity(columns)
         with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
             ab_merge.mutant_dose_ladder_two_sided_falsification(columns)
+
+    def test_non_finite_zero_and_out_of_domain_eps_labels_are_refused(self):
+        # unit-63 round-8 audit finding 3: `_dose_label_eps` parses
+        # successfully for nan/0.0/-0.0/inf/an out-of-domain magnitude, but
+        # `eps < 0.0`/`eps > 0.0` both silently reject each of these --
+        # they must never vanish from BOTH findings with a clean exit, so
+        # each one is refused loudly at parse time instead.
+        for dose_label in ("epsnan", "eps0.0", "eps-0.0", "epsinf", "eps-inf", "eps10.0"):
+            with self.subTest(dose_label=dose_label):
+                with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+                    ab_merge._dose_label_eps(dose_label)
+
+    def test_epsnan_is_refused_not_silently_dropped_from_both_findings(self):
+        columns = [{"dose_label": "epsnan", "detected": "RED"}]
+        with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+            ab_merge.mutant_dose_ladder_sensitivity(columns)
+        with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+            ab_merge.mutant_dose_ladder_two_sided_falsification(columns)
+
+    def test_eps0_0_is_refused(self):
+        columns = [{"dose_label": "eps0.0", "detected": "RED"}]
+        with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+            ab_merge.mutant_dose_ladder_sensitivity(columns)
+
+    def test_eps_negative_zero_is_refused(self):
+        columns = [{"dose_label": "eps-0.0", "detected": "RED"}]
+        with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+            ab_merge.mutant_dose_ladder_sensitivity(columns)
+
+    def test_epsinf_is_refused(self):
+        columns = [{"dose_label": "epsinf", "detected": "RED"}]
+        with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+            ab_merge.mutant_dose_ladder_two_sided_falsification(columns)
+
+    def test_eps_magnitude_over_the_family_domain_is_refused(self):
+        # eps=10.0 parses as a float fine, but its magnitude vastly exceeds
+        # the scheduled ladder's own domain (|eps| <= 1.0) -- refused, never
+        # silently accepted as though it were a real dose.
+        columns = [{"dose_label": "eps10.0", "detected": "RED"}]
+        with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+            ab_merge.mutant_dose_ladder_sensitivity(columns)
 
     def test_cli_wiring_folds_the_dose_ladder_into_the_same_artifact(self):
         with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
@@ -3922,6 +4072,43 @@ class MutantDoseLadderTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIsNone(merged["mutant_dose_ladder"]["sensitivity"])
         self.assertIsNotNone(merged["mutant_dose_ladder"]["sensitivity_error"])
+
+    def test_cli_wiring_strips_the_mutant_legs_sha_before_comparison(self):
+        # unit-63 round-8 audit finding 4 (merger half): the CLI's own
+        # `--mutant-legs DOSE_LABEL:PATCH_SHA256:SEEDS` sha is stripped
+        # before it is used, so a whitespace-padded sha on the command line
+        # is not silently reported as a labeling-error mismatch against a
+        # leg's own (clean) recorded sha, and is recorded stripped in the
+        # merged artifact.
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                _write_mutant_leg(raw_dir, seed, "eps0.50", _mutant_tier(seed=seed, held_out_example_mean=0.70))
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            mutant_spec = f"eps0.50: {self.PATCH_SHA} :{seeds_s}"
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    mutant_spec,
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        dose = merged["mutant_dose_ladder"]["doses"][0]
+        self.assertEqual(dose["patch_sha256"], self.PATCH_SHA)
+        self.assertEqual(dose["violations"], [])
+        self.assertEqual(rc, 0)
 
 
 if __name__ == "__main__":

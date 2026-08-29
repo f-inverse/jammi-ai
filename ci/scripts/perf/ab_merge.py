@@ -2717,6 +2717,14 @@ def build_finetune_run_report(raw_dir, seeds, lr0_seeds=(), allow_missing_lr0_co
 MUTANT_DECISION_THRESHOLD = FINETUNE_RUN_DECISION_THRESHOLD
 MUTANT_GATE_SEED_COUNT = FINETUNE_RUN_GATE_SEED_COUNT
 
+# unit-63 round-8 audit finding 3: the sane domain for this family's own
+# SIGNED `eps` (CONTRACT.md addendum 2026-08-29c: the update-scale
+# multiplier is `(1+eps)`) -- the scheduled ladder never exceeds `|eps| =
+# 0.50`; a magnitude past `1.0` is no longer a "silent lr (in/de)flation"
+# dose (at `eps <= -1.0` the update-scale multiplier is non-positive, a
+# different failure shape entirely, not a member of this monotone family).
+MUTANT_DOSE_LADDER_MAX_ABS_EPS = 1.0
+
 
 def mutant_leg_repeat_tag(dose_label):
     """The `repeat` slot a mutant leg's `.exit`/`.json`/`.stderr` triple is
@@ -2752,18 +2760,34 @@ def finetune_run_mutant_column_violations(dose_label, patch_sha256, tier):
     column's caller-supplied `patch_sha256` -- a leg claiming a different
     patch than the dose it was invoked under is a labeling error, never
     silently trusted.
+
+    Unit-63 round-8 audit finding 4 (merger half): each of the three fields
+    above, and the caller-supplied `patch_sha256`, is stripped before the
+    emptiness/equality checks -- a whitespace-only value (`" "`) is exactly
+    as absent as `""`/`None` (`:2759`'s pre-fix bare `if not tier.get(field)`
+    passed it straight through), and the sha comparison itself is done on
+    the STRIPPED values on both sides so a leg or caller value that differs
+    only by incidental leading/trailing whitespace is never reported as a
+    labeling-error mismatch. The producer side stamps already-trimmed
+    values (a concurrent bench-dispatch fix); this check does not rely on
+    that and re-trims independently, on both sides, every time.
     """
     violations = list(finetune_run_dispatch_proof_violations("fused", tier))
     violations += finetune_run_arm_premise_violations("fused", tier)
     for field in ("mutant_id", "mutant_base_sha", "mutant_patch_sha256"):
-        if not tier.get(field):
+        value = tier.get(field)
+        if not value or not str(value).strip():
             violations.append(
                 f"mutant leg's own {field!r} is missing/empty -- mutants/README.md's own "
                 "recorded fields (mutant_id, mutant_base_sha, mutant_patch_sha256) must be "
                 "present so this leg is attributable to a specific, auditable mutant patch"
             )
     leg_patch_sha256 = tier.get("mutant_patch_sha256")
-    if leg_patch_sha256 is not None and leg_patch_sha256 != patch_sha256:
+    if (
+        leg_patch_sha256 is not None
+        and str(leg_patch_sha256).strip()
+        and str(leg_patch_sha256).strip() != str(patch_sha256).strip()
+    ):
         violations.append(
             f"leg's own mutant_patch_sha256={leg_patch_sha256!r} does not match this dose "
             f"column's caller-supplied patch_sha256={patch_sha256!r} -- a labeling error, never "
@@ -2792,15 +2816,29 @@ def build_mutant_dose_column(raw_dir, dose_label, patch_sha256, mutant_seeds):
     `detected` is `"RED"` iff the SAME `>=11/12` threshold
     (`MUTANT_DECISION_THRESHOLD`/`MUTANT_GATE_SEED_COUNT`) is met in the
     DEGRADATION direction specifically (mutant worse than alloff, `d_i > 0`
-    dominant, `mean_d > 0`) -- a dose meeting the threshold in the OPPOSITE
-    (anomalous-improvement) direction, or not meeting it at all
-    (mutants/README.md's own M1 finding: a sign-flipping early transient
-    reads 8/12, well under 11), is `"not-detected"`; a dose whose
-    premise-clean pair count is not exactly `MUTANT_GATE_SEED_COUNT`, or
-    whose sign test itself refuses (all-tie / empty), is `"INVALID"` -- the
-    SAME correctness-of-measurement carve-out every other verdict in this
-    module gets, never silently rescaled to whatever count happened to run
-    clean.
+    dominant, `mean_d > 0`); `"RED_FOR_INVESTIGATION"` iff the SAME
+    threshold is met in the OPPOSITE, IMPROVEMENT-concordant direction
+    instead (`d_i < 0` dominant, `n_neg >= MUTANT_DECISION_THRESHOLD`,
+    `mean_d < 0`) -- unit-63 round-8 audit finding 2: this mirrors
+    `build_finetune_run_report`'s own main-path `concordant_direction ==
+    "improvement"` -> `status = "RED_FOR_INVESTIGATION"` branch; a
+    two-sided (falsification-cell) POSITIVE-eps dose that lands here has
+    CONFIRMED its own held-out-improvement prediction (see
+    `mutant_dose_ladder_two_sided_falsification`'s own doc), never
+    collapsed into `"not-detected"` the way it silently used to be before
+    this fix (a column with no state for this arm cannot report the
+    confirming outcome CONTRACT.md addendum 2026-08-29c's own +0.50 cell
+    requires). A dose meeting NEITHER threshold at all (mutants/README.md's
+    own M1 finding: a sign-flipping early transient reads 8/12, well under
+    11) is `"not-detected"`; a dose whose premise-clean pair count is not
+    exactly `MUTANT_GATE_SEED_COUNT`, or whose sign test itself refuses
+    (all-tie / empty), is `"INVALID"` -- the SAME correctness-of-measurement
+    carve-out every other verdict in this module gets, never silently
+    rescaled to whatever count happened to run clean. `n_pos`/`n_neg` can
+    never both dominate at once (`2 * MUTANT_DECISION_THRESHOLD` (22)
+    exceeds `MUTANT_GATE_SEED_COUNT` (12), mirroring the main decision's own
+    `pos_dominant`/`neg_dominant` mutual-exclusion comment), so the two
+    branches below are never ambiguous about which direction fired.
 
     Returns a dict: `{dose_label, patch_sha256, mutant_seeds, per_seed,
     clean_pair_count, gate_seed_count, threshold, n_pos, n_neg, ties,
@@ -2904,6 +2942,12 @@ def build_mutant_dose_column(raw_dir, dose_label, patch_sha256, mutant_seeds):
         mean_d = statistics.mean(d_values.values())
         if detected != "INVALID" and n_pos >= MUTANT_DECISION_THRESHOLD and mean_d > 0.0:
             detected = "RED"
+        elif detected != "INVALID" and n_neg >= MUTANT_DECISION_THRESHOLD and mean_d < 0.0:
+            # unit-63 round-8 audit finding 2: the improvement-concordant
+            # arm the two-sided-falsification cell needs to be able to
+            # report -- mirrors the main decision's own
+            # `concordant_direction == "improvement"` branch (:2565).
+            detected = "RED_FOR_INVESTIGATION"
 
     return {
         "dose_label": dose_label,
@@ -2946,6 +2990,21 @@ def _dose_label_eps(dose_label):
     `MutantDoseLadderSensitivityError` (never silently returns a sentinel or
     guesses a sign) when `dose_label` does not start with `"eps"`, or the
     remainder does not parse as a float.
+
+    Unit-63 round-8 audit finding 3: parsing successfully is not enough --
+    the consumers (`mutant_dose_ladder_sensitivity`,
+    `mutant_dose_ladder_two_sided_falsification`) partition purely on
+    `eps < 0.0`/`eps > 0.0`, so a value that is neither (`nan`, `0.0`,
+    `-0.0`) silently agrees with BOTH predicates' negation and vanishes
+    from EVERY finding with a clean exit -- exactly the "never silently
+    dropped" this module's own doc promises, and never delivers, for that
+    one shape. The same applies to a non-finite magnitude (`inf`/`-inf`,
+    which trivially satisfies `> 0.0`/`< 0.0` but is not a real dose at
+    all) and to a magnitude outside this family's own sane domain (`|eps|
+    > MUTANT_DOSE_LADDER_MAX_ABS_EPS`, see that constant's own doc). Every
+    one of these is refused here, loudly, by the SAME exception every
+    other unparseable label raises -- never a silent pass-through to a
+    partition predicate that was never designed to reject them.
     """
     prefix = "eps"
     if not dose_label.startswith(prefix):
@@ -2956,12 +3015,32 @@ def _dose_label_eps(dose_label):
         )
     rest = dose_label[len(prefix):]
     try:
-        return float(rest)
+        value = float(rest)
     except ValueError as exc:
         raise MutantDoseLadderSensitivityError(
             f"dose_label {dose_label!r}'s remainder {rest!r} (after stripping the 'eps' prefix) "
             "does not parse as a float -- cannot derive this dose's signed eps value"
         ) from exc
+    if not math.isfinite(value):
+        raise MutantDoseLadderSensitivityError(
+            f"dose_label {dose_label!r} parses to a non-finite eps value ({value!r}) -- nan/inf "
+            "is not a member of either the degradation (eps < 0.0) or improvement (eps > 0.0) "
+            "branch and must never be silently dropped from both findings"
+        )
+    if value == 0.0:
+        raise MutantDoseLadderSensitivityError(
+            f"dose_label {dose_label!r} parses to a zero eps value ({value!r}, positive or "
+            "negative zero) -- a zero dose is not a member of either the degradation (eps < 0.0) "
+            "or improvement (eps > 0.0) branch and must never be silently dropped from both "
+            "findings"
+        )
+    if abs(value) > MUTANT_DOSE_LADDER_MAX_ABS_EPS:
+        raise MutantDoseLadderSensitivityError(
+            f"dose_label {dose_label!r} parses to eps={value!r}, whose magnitude exceeds this "
+            f"family's own sane domain (|eps| <= {MUTANT_DOSE_LADDER_MAX_ABS_EPS}) -- never "
+            "silently accepted as though it were a scheduled dose"
+        )
+    return value
 
 
 def mutant_dose_ladder_sensitivity(dose_columns):
@@ -3018,25 +3097,59 @@ def mutant_dose_ladder_two_sided_falsification(dose_columns):
     names for a POSITIVE-eps ("improvement-direction") dose: `+0.50` is
     "retained deliberately as the two-sided falsification cell for the
     improvement prediction itself" (mutants/README.md's own "signed dose
-    family" section) -- if it reads RED, that is a cross-sign detection
-    (the naive linear-extrapolation prediction, Step 2/3 of that same
-    README, is CONFIRMED: a positive dose detected as RED is expected to be
-    RED_FOR_INVESTIGATION-shaped improvement, not degradation), never a
-    degradation-direction sensitivity finding -- see
-    `mutant_dose_ladder_sensitivity`'s own doc for why folding a cross-sign
-    detection into that statistic would misrepresent it.
+    family" section). The prediction under test (Step 2/3 of that same
+    README) is HELD-OUT IMPROVEMENT at positive eps; `build_mutant_dose_column`'s
+    own `detected` names which arm a positive-eps dose actually landed in --
+    unit-63 round-8 audit finding 1 corrects this function's own prior
+    (inverted) polarity claim:
+
+    - `detected == "RED"` is the DEGRADATION-concordant arm (mutant worse
+      than alloff, `mean_d > 0.0`). A positive-eps dose reading `"RED"`
+      REFUTES the improvement prediction -- the secant extrapolation was
+      wrong over this range, since more effective lr made held-out loss
+      WORSE, not better. This is never a "confirmation".
+    - `detected == "RED_FOR_INVESTIGATION"` is the IMPROVEMENT-concordant
+      arm (`mean_d < 0.0`, unit-63 round-8 audit finding 2's new state on
+      this column, mirroring the main decision's own
+      `concordant_direction == "improvement"` branch). A positive-eps dose
+      reading `"RED_FOR_INVESTIGATION"` CONFIRMS the improvement
+      prediction -- a real, gate-detectable improvement in the predicted
+      direction.
+
+    Neither arm is folded into `mutant_dose_ladder_sensitivity` (the
+    degradation-direction, negative-eps-only statistic) -- see that
+    function's own doc for why a cross-sign or cross-arm detection there
+    would misrepresent it.
 
     Each dose's SIGNED eps is parsed via `_dose_label_eps` (same refusal
     behaviour as `mutant_dose_ladder_sensitivity`). Returns the list of
-    `{"dose_label", "eps", "detected"}` entries for every positive-eps
-    (`eps > 0.0`) dose column that read `"RED"`, in `dose_columns`' own
-    order, empty when none did (the ordinary, unconfirmed case).
+    `{"dose_label", "eps", "detected", "finding"}` entries for every
+    positive-eps (`eps > 0.0`) dose column whose `detected` is `"RED"` or
+    `"RED_FOR_INVESTIGATION"`, in `dose_columns`' own order, with `finding`
+    set to the literal string `"secant refuted (degradation at +eps)"` for
+    the `"RED"` arm and `"secant confirmed (improvement at +eps)"` for the
+    `"RED_FOR_INVESTIGATION"` arm; empty when neither arm fired at any
+    positive-eps dose -- the ORDINARY, not-yet-refuted case (the prediction
+    surviving is not itself a "confirmation": that only happens when the
+    `RED_FOR_INVESTIGATION` arm actually fires).
     """
     out = []
     for col in dose_columns:
         eps = _dose_label_eps(col["dose_label"])
         if eps > 0.0 and col["detected"] == "RED":
-            out.append({"dose_label": col["dose_label"], "eps": eps, "detected": col["detected"]})
+            out.append({
+                "dose_label": col["dose_label"],
+                "eps": eps,
+                "detected": col["detected"],
+                "finding": "secant refuted (degradation at +eps)",
+            })
+        elif eps > 0.0 and col["detected"] == "RED_FOR_INVESTIGATION":
+            out.append({
+                "dose_label": col["dose_label"],
+                "eps": eps,
+                "detected": col["detected"],
+                "finding": "secant confirmed (improvement at +eps)",
+            })
     return out
 
 
@@ -3124,6 +3237,12 @@ def main(argv=None):
                     )
                     return 2
                 dose_label, patch_sha256, mutant_seeds_s = parts
+                # unit-63 round-8 audit finding 4 (merger half): the
+                # caller-supplied sha is stripped here too, at the SAME
+                # point every other producer-stamped-field trim happens --
+                # a whitespace-only `--mutant-legs` sha must compare as
+                # empty, never as some never-matching opaque string.
+                patch_sha256 = patch_sha256.strip()
                 mutant_seeds = [s for s in mutant_seeds_s.split(",") if s]
                 dose_columns.append(build_mutant_dose_column(fr_raw_dir, dose_label, patch_sha256, mutant_seeds))
             # unit-63 round-7 audit finding 4 / CONTRACT.md addendum

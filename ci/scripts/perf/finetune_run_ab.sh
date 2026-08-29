@@ -11,9 +11,10 @@
 # fixture under `cookbook/fixtures/finetune_heldout/`, a local `--model-dir`
 # checkpoint the operator already has on-box); it never builds the cookbook
 # corpus, never starts a `jammi-server`, and never fetches anything over the
-# network itself (the fixture's own `derive_heldout_fixture.py` is a
-# SEPARATE, off-box, operator-run tool — this script only ever READS its
-# committed output).
+# network itself (the book-side `cookbook/book/scripts/
+# derive_heldout_fixture.py` that PRODUCES this fixture is a SEPARATE,
+# off-box, operator-run tool — this script only ever READS its committed
+# output; see the fixture's own README.md "Where this fixture comes from").
 #
 # HELD-OUT FIXTURE LAYOUT (cookbook/fixtures/finetune_heldout/, CONTRACT H3):
 #   heldout_ids.txt      the committed held-out id list -- what
@@ -26,11 +27,11 @@
 #                         `--train-jsonl` (a required `jammi-bench
 #                         finetune-run` flag) has no committed source in
 #                         this checkout: producing it requires re-deriving
-#                         the train-side text via
-#                         `cookbook/fixtures/finetune_heldout/
-#                         derive_heldout_fixture.py` (a network-backed,
-#                         checksum-gated regeneration, run OFF-BOX by an
-#                         operator) or an equivalent. This script's own
+#                         the train-side text via the book-side
+#                         `cookbook/book/scripts/derive_heldout_fixture.py`
+#                         (a network-backed, checksum-gated regeneration, run
+#                         OFF-BOX by an operator) or an equivalent. This
+#                         script's own
 #                         `--train-jsonl` default therefore points at a path
 #                         this checkout does NOT populate
 #                         (`$REPO_ROOT/cookbook/fixtures/finetune_heldout/
@@ -158,7 +159,7 @@ if [ "$FINETUNE_RUN_AB_DRY_RUN" != "1" ]; then
     fi
   done
   if [ ! -f "$TRAIN_JSONL" ]; then
-    echo "::error::--train-jsonl source not found: $TRAIN_JSONL — train-side text is NOT committed (repo-size discipline, cookbook/fixtures/finetune_heldout/README.md's own 'Why train text isn't committed' section); re-derive it via that directory's derive_heldout_fixture.py (network-backed, checksum-gated) or point TRAIN_JSONL at an equivalent file before running for real." >&2
+    echo "::error::--train-jsonl source not found: $TRAIN_JSONL — train-side text is NOT committed (repo-size discipline, cookbook/fixtures/finetune_heldout/README.md's own 'Why train text isn't committed' section); re-derive it via cookbook/book/scripts/derive_heldout_fixture.py (network-backed, checksum-gated) or point TRAIN_JSONL at an equivalent file before running for real." >&2
     exit 1
   fi
 fi

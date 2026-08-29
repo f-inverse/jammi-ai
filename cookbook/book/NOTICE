@@ -11,7 +11,8 @@ Dataset attributions are recorded by the loaders that fetch them, in
 jammi_cookbook/datasets.py and below.
 
 --------------------------------------------------------------------------------
-Datasets (fetched on demand, checksum-gated; not redistributed in this repo)
+Datasets (fetched on demand, checksum-gated; not redistributed in this repo,
+EXCEPT the ogbn-arxiv held-out fixture excerpt noted below)
 
 Air Routes
   Source: https://github.com/krlawrence/graph (sample-data), pinned to commit
@@ -25,4 +26,13 @@ ogbn-arxiv
   License: ODC-BY 1.0 (Open Data Commons Attribution License). Built on the
     Microsoft Academic Graph. Citation: Hu et al., "Open Graph Benchmark:
     Datasets for Machine Learning on Graphs," NeurIPS 2020.
+  This book's own pipelines (build_arxiv_cache.py, build_finetune_cache.py,
+    etc.) fetch ogbn-arxiv on demand at emit time and never commit it — the
+    "not redistributed in this repo" posture above holds for those.
+  CARVE-OUT: a small (~740 KB) derived excerpt of ogbn-arxiv title/abstract
+    text IS committed and redistributed under
+    cookbook/fixtures/finetune_heldout/ (the "how-well" held-out fixture,
+    unit 63 / CONTRACT H3) — an engine-owned fixture produced by this book's
+    cookbook/book/scripts/derive_heldout_fixture.py. Its full ODC-BY 1.0
+    attribution lives in cookbook/fixtures/finetune_heldout/NOTICE.
 

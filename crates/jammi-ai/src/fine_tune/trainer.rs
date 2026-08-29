@@ -262,6 +262,16 @@ pub struct TrainingLoop {
     /// share a training-time path; the worker publishes the final files from
     /// there to the artifact store under a unique per-attempt prefix.
     artifact_dir: PathBuf,
+    /// Mirrors `self.target`'s current dropout/training mode, updated ONLY
+    /// through [`Self::set_training`] (audit round 63, finding 2). Exists so
+    /// [`Self::with_dropout_disabled`] can capture the pre-call state and
+    /// restore THAT — rather than hard-coding a restore-to-`true` — because
+    /// `TrainingTarget` itself exposes no getter (its training flag lives
+    /// distributed across per-layer `LoraLinear`/encoder state). Always `true`
+    /// at [`TrainingLoopBuilder::build`] (every `TrainingTarget` this crate
+    /// constructs for training starts in training mode) and updated in
+    /// lockstep with every production `set_training` call this loop makes.
+    training_mode: bool,
     divergence_count: usize,
     /// Fixed, dataset-level target standardiser for the regression path, derived
     /// once from all training targets at the start of [`Self::run`]. `None` until
@@ -436,6 +446,7 @@ impl TrainingLoopBuilder {
             worker_id,
             catalog,
             artifact_dir,
+            training_mode: true,
             divergence_count: 0,
             target_scaler: None,
             device: self.device,
@@ -1100,8 +1111,11 @@ impl TrainingLoop {
 
         // Embed with dropout off — the model state the negatives are mined
         // against. Returns owned per-row vectors, consumed into the index or the
-        // per-batch anchor queries below.
-        self.target.set_training(false);
+        // per-batch anchor queries below. Routed through `Self::set_training` (not
+        // `self.target.set_training` directly) so `self.training_mode` — the state
+        // `with_dropout_disabled` restores from — never drifts from the target's
+        // real mode (audit round 63, finding 2).
+        self.set_training(false);
         let embed = |this: &Self, texts: &[String]| -> Result<Vec<Vec<f32>>> {
             let t = this.encode_texts(texts)?;
             let t = if t.dtype() == DType::F32 {
@@ -1156,7 +1170,7 @@ impl TrainingLoop {
             }
             Ok::<_, JammiError>(rows)
         })();
-        self.target.set_training(true);
+        self.set_training(true);
         let rows = result?;
 
         if rows.is_empty() {
@@ -1250,8 +1264,10 @@ impl TrainingLoop {
         // dropout OFF — a behavior difference from the per-batch training
         // path that is deliberate: the two-pass gradient equals the
         // single-pass one only when both passes see the same activations,
-        // and dropout off is what makes them agree.
-        self.target.set_training(false);
+        // and dropout off is what makes them agree. Routed through
+        // `Self::set_training` (audit round 63, finding 2) so `self.training_mode`
+        // never drifts from the target's real mode.
+        self.set_training(false);
 
         // Immutable-borrow region: the encode closures borrow `self`, so no
         // `&mut self` call may appear until they are dropped at the block end.
@@ -1317,7 +1333,7 @@ impl TrainingLoop {
             Ok((grads, loss_val))
         })();
 
-        self.target.set_training(true);
+        self.set_training(true);
         let (grads, loss_val) = outcome?;
         #[cfg(test)]
         let grads = self.poke_after_backward(global_step + 1, grads, trainable_vars)?;
@@ -2422,7 +2438,18 @@ impl TrainingLoop {
         Ok(host.into_iter().map(|v| v.max(0.0) as f64).collect())
     }
 
-    /// Bracket `f` with dropout disabled, mirroring the exact
+    /// Set `self.target`'s training/dropout mode AND `self.training_mode` in
+    /// lockstep — the single place these two are allowed to diverge is
+    /// nowhere; every production call that toggles the target's training
+    /// flag must go through here (audit round 63, finding 2) so
+    /// [`Self::with_dropout_disabled`] can trust `self.training_mode` as an
+    /// accurate mirror of the target's actual state at any call site.
+    fn set_training(&mut self, training: bool) {
+        self.target.set_training(training);
+        self.training_mode = training;
+    }
+
+    /// Bracket `f` with dropout disabled, mirroring the
     /// `set_training(false)` / call / `set_training(true)` sequence
     /// [`Self::run`] wraps its [`Self::evaluate`] call in (R3). Shared by
     /// `run` and [`Self::evaluate_held_out`] (H1, unit 63) so the held-out
@@ -2430,16 +2457,32 @@ impl TrainingLoop {
     /// the existing validation pass uses, rather than a second copy of it,
     /// so there is exactly one place that can get this wrong.
     ///
-    /// On `Err` from `f`, `?` propagates BEFORE `set_training(true)` runs —
-    /// this mirrors `run`'s pre-existing call site exactly (an `evaluate()`
-    /// error there already aborts the whole training loop, so the dropout
-    /// flag never observably matters again), not a new bug: refactoring the
-    /// bracket into this helper changes nothing about that control flow.
+    /// Audit round 63, finding 2 (fixed): the pre-fix version propagated `?`
+    /// on `f`'s `Err` BEFORE the restore ran, and always restored to `true`
+    /// rather than whatever mode the trainer was actually in beforehand. On
+    /// the public, typed-refusal-bearing [`Self::evaluate_held_out`] seam,
+    /// both halves of that were live bugs: a refusal (e.g. the "not a
+    /// multiple of batch_size" or "non-finite loss" checks) left the trainer
+    /// permanently eval-mode — every subsequent training step silently
+    /// trained with dropout OFF — and calling this seam on a trainer that
+    /// was not in training mode to begin with (e.g. an inference-only /
+    /// held-out-only handle) would flip it INTO training mode as a side
+    /// effect of a read-only evaluation call.
+    ///
+    /// Fixed per the repo's own restore-on-both-arms idiom (the
+    /// `mine_hard_negative_loader` / `run_gradcache_epoch` brackets): `f`'s
+    /// result is captured into a local binding — never `?`-propagated
+    /// directly — so the restore always runs before the function returns,
+    /// on EITHER arm. The restore target is `was_training`, captured from
+    /// `self.training_mode` before dropout is disabled, not a hard-coded
+    /// `true` — so this bracket is now a strict save/disable/restore, never
+    /// an implicit "and also force training on."
     fn with_dropout_disabled<T>(&mut self, f: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
-        self.target.set_training(false);
-        let result = f(self)?;
-        self.target.set_training(true);
-        Ok(result)
+        let was_training = self.training_mode;
+        self.set_training(false);
+        let result = f(self);
+        self.set_training(was_training);
+        result
     }
 
     /// Run forward pass over validation set without gradient updates.
@@ -2515,8 +2558,11 @@ impl TrainingLoop {
     /// the EXACT order the loader will yield rows, and that count MUST be a
     /// multiple of `self.config.batch_size` (v2 delta 2) — the committed
     /// held-out fixture is sized this way so every batch is FULL (no ragged
-    /// final batch) and every example sees exactly `batch_size - 1` in-batch
-    /// negatives. The partition rule is: walk `example_ids` (and the
+    /// final batch) and, for an MNRL objective, every example sees exactly
+    /// `batch_size - 1` in-batch negatives (see
+    /// [`jammi_wire::fine_tune::HeldOutLoss::in_batch_negatives_per_example`]
+    /// for the non-MNRL objectives, which have none). The partition rule is:
+    /// walk `example_ids` (and the
     /// loader's rows) in the given fixed order and group every consecutive
     /// `batch_size` of them into one batch — no shuffling, no re-ordering,
     /// no random split. Two calls over the same `(val_loader, example_ids,
@@ -2572,6 +2618,47 @@ impl TrainingLoop {
     /// `&self`, exactly like `evaluate`) stay separate — mirroring how
     /// `evaluate` itself takes `&self` and its caller in `run` owns the
     /// surrounding `&mut self` bracket.
+    /// The true in-batch-negative count [`Self::compute_loss_per_example`]
+    /// scored this batch's rows against — objective-aware (audit round 63,
+    /// finding 6: the pre-fix version reported `batch_size - 1`
+    /// UNCONDITIONALLY, which is only correct for the MNRL objectives, and
+    /// silently mis-described every Triplet-margin / CosineMse /
+    /// Classification held-out evaluation as having `batch_size - 1`
+    /// negatives it never actually scored against).
+    ///
+    /// MNRL scores every row against every OTHER row's positive sharing the
+    /// batch — `Pairs` (the only objective that shape trains, per
+    /// [`Self::compute_loss_per_example`]'s own doc), always; `Triplet` only
+    /// when `MultipleNegativesRanking` is configured (mirroring
+    /// `compute_loss_per_example`'s own dispatch on `self.config.embedding_loss`
+    /// for that batch kind) — `batch_size - 1` negatives either way. Every
+    /// other batch kind this seam supports (`Triplet` margin,
+    /// `Contrastive`/`CosineMse`, `Classification`) scores each row
+    /// independently of every other row in the batch: genuinely ZERO
+    /// in-batch negatives, not an approximation of MNRL's count. `Ner` and
+    /// `Regression` are typed refusals earlier in
+    /// `compute_loss_per_example` and never reach here in a successful call;
+    /// they fold to `0` for an exhaustive match rather than a wildcard.
+    fn in_batch_negatives_for(
+        &self,
+        batch: &super::data::TrainingBatch,
+        batch_size: usize,
+    ) -> usize {
+        match batch {
+            super::data::TrainingBatch::Pairs { .. } => batch_size.saturating_sub(1),
+            super::data::TrainingBatch::Triplet { .. } => match self.config.embedding_loss {
+                Some(super::EmbeddingLoss::MultipleNegativesRanking { .. }) => {
+                    batch_size.saturating_sub(1)
+                }
+                _ => 0,
+            },
+            super::data::TrainingBatch::Contrastive { .. }
+            | super::data::TrainingBatch::Classification { .. }
+            | super::data::TrainingBatch::Ner { .. }
+            | super::data::TrainingBatch::Regression { .. } => 0,
+        }
+    }
+
     fn evaluate_held_out_inner(
         &self,
         val_loader: &TrainingDataLoader,
@@ -2589,7 +2676,8 @@ impl TrainingLoop {
             return Err(JammiError::FineTune(format!(
                 "evaluate_held_out: {} held-out examples is not a multiple of batch_size {} \
                  (v2 delta 2) — the committed held-out fixture must be sized so every batch \
-                 is full, fixing every example at the same batch_size - 1 in-batch negatives",
+                 is full, fixing every example at the same in-batch-negative count (for an \
+                 MNRL objective, batch_size - 1; see HeldOutLoss::in_batch_negatives_per_example)",
                 example_ids.len(),
                 batch_size
             )));
@@ -2598,6 +2686,13 @@ impl TrainingLoop {
         let mut per_example: Vec<super::ExampleLoss> = Vec::with_capacity(example_ids.len());
         let mut id_batches: Vec<Vec<String>> = Vec::new();
         let mut offset = 0usize;
+        // Objective-aware in-batch-negative count (finding 6), pinned once from
+        // the first batch and cross-checked against every subsequent one — a
+        // held-out set is scored under a single, homogeneous objective, so a
+        // second batch reporting a different count would mean the loader mixed
+        // batch kinds mid-split, which this refuses rather than silently
+        // reporting whichever count happened to be seen last.
+        let mut in_batch_negatives: Option<usize> = None;
 
         let mut consume = |batch: super::data::TrainingBatch| -> Result<()> {
             let n = batch_row_count(&batch)?;
@@ -2626,6 +2721,18 @@ impl TrainingLoop {
                     "evaluate_held_out: internal: {} per-example losses for a {n}-row batch",
                     losses.len()
                 )));
+            }
+            let this_negatives = self.in_batch_negatives_for(&batch, batch_size);
+            match in_batch_negatives {
+                None => in_batch_negatives = Some(this_negatives),
+                Some(prev) if prev != this_negatives => {
+                    return Err(JammiError::FineTune(format!(
+                        "evaluate_held_out: internal: in-batch-negative count changed mid \
+                         held-out set ({prev} then {this_negatives}) — the held-out split must \
+                         be scored under one homogeneous objective/batch kind"
+                    )));
+                }
+                _ => {}
             }
             let mut batch_ids = Vec::with_capacity(n);
             for (id, loss) in ids.iter().zip(losses) {
@@ -2688,7 +2795,14 @@ impl TrainingLoop {
             count,
             tie_fraction,
             batch_partition_sha256,
-            in_batch_negatives_per_example: batch_size - 1,
+            // `unwrap_or(0)` is unreachable in practice: the `offset !=
+            // example_ids.len()` refusal above already guarantees at least one
+            // batch was consumed successfully whenever this line runs, which is
+            // exactly when `in_batch_negatives` was set. Kept as a default
+            // rather than an `.expect()` so a future refactor of the loop above
+            // fails safe (reports "no in-batch negatives" for an empty pass)
+            // rather than panicking.
+            in_batch_negatives_per_example: in_batch_negatives.unwrap_or(0),
         })
     }
 
@@ -9283,5 +9397,393 @@ mod held_out_eval_tests {
              stream — the post-seam training steps must be byte-identical to the same \
              steps without it"
         );
+    }
+
+    /// Audit round 63, finding 2 (RED-proof / regression test): a TYPED
+    /// REFUSAL from `evaluate_held_out` mid-training must not leave the
+    /// trainer stuck in eval mode. Pre-fix, `with_dropout_disabled`
+    /// propagated `f`'s `Err` via `?` BEFORE the `set_training(true)` restore
+    /// ran, so a refusal here (the leading "empty held-out set" check, which
+    /// fires before any forward pass) left `self.target`'s dropout
+    /// permanently OFF for the rest of the run — every subsequent training
+    /// step would silently train with dropout disabled, with no error
+    /// surfaced anywhere.
+    ///
+    /// Three loops, same seed/config prefix:
+    /// - REF: 4 plain training steps, dropout on throughout.
+    /// - TEST: 2 training steps, a REFUSED `evaluate_held_out` call, then 2
+    ///   more training steps.
+    /// - CONTROL: the SAME 2 training steps as TEST (identical trajectory,
+    ///   identical dropout-stream position afterward), then dropout is
+    ///   forced off DIRECTLY (`control_loop.target.set_training(false)`,
+    ///   bypassing the seam) — reproducing exactly what finding 2's bug left
+    ///   behind — before its own 2 more training steps.
+    ///
+    /// `TEST == REF` shows the refused call perturbs neither the RNG stream
+    /// nor the training mode. `TEST != CONTROL` shows dropout genuinely still
+    /// perturbs the tail two steps: CONTROL's tail is byte-for-byte what
+    /// TEST's tail would be if finding 2's bug were still present (same
+    /// prefix, same seed, dropout forced off for the tail), so if the fix
+    /// regressed, `TEST != CONTROL` would fail because `TEST == CONTROL`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refusal_mid_training_leaves_dropout_enabled() {
+        let device = Device::Cpu;
+        let config = FineTuneConfig {
+            lora_dropout: 0.3,
+            seed: 11,
+            batch_size: 2,
+            ..Default::default()
+        };
+        let opt_params = || ParamsAdamW {
+            lr: 1e-2,
+            ..Default::default()
+        };
+
+        // REF: 4 plain training steps, dropout on throughout.
+        let (ref_loop, ref_varmap) = minimal_classification_loop(&device, config.clone()).await;
+        let mut ref_opt = AdamW::new(ref_varmap.all_vars(), opt_params()).unwrap();
+        for _ in 0..4 {
+            train_step(&ref_loop, &mut ref_opt, &device);
+        }
+        let w_ref = ref_loop.target.named_trainable_weights().unwrap();
+
+        // TEST: 2 steps, a refused evaluate_held_out call, 2 more steps.
+        let (mut test_loop, test_varmap) =
+            minimal_classification_loop(&device, config.clone()).await;
+        let mut test_opt = AdamW::new(test_varmap.all_vars(), opt_params()).unwrap();
+        train_step(&test_loop, &mut test_opt, &device);
+        train_step(&test_loop, &mut test_opt, &device);
+
+        let empty_loader = TrainingDataLoader::from_precomputed(vec![]);
+        let err = test_loop.evaluate_held_out(&empty_loader, &[]).unwrap_err();
+        assert!(
+            matches!(err, JammiError::FineTune(ref m) if m.contains("empty")),
+            "expected an 'empty held-out set' refusal, got {err:?}"
+        );
+
+        train_step(&test_loop, &mut test_opt, &device);
+        train_step(&test_loop, &mut test_opt, &device);
+        let w_test = test_loop.target.named_trainable_weights().unwrap();
+
+        // CONTROL: the identical 2-step prefix, then dropout forced off
+        // directly (bypassing the seam) — the observable shape of finding
+        // 2's bug — before 2 more (now dropout-off) training steps.
+        let (mut control_loop, control_varmap) =
+            minimal_classification_loop(&device, config.clone()).await;
+        let mut control_opt = AdamW::new(control_varmap.all_vars(), opt_params()).unwrap();
+        train_step(&control_loop, &mut control_opt, &device);
+        train_step(&control_loop, &mut control_opt, &device);
+        control_loop.target.set_training(false);
+        train_step(&control_loop, &mut control_opt, &device);
+        train_step(&control_loop, &mut control_opt, &device);
+        let w_control = control_loop.target.named_trainable_weights().unwrap();
+
+        assert_eq!(
+            weight_bytes(&w_test),
+            weight_bytes(&w_ref),
+            "a refused evaluate_held_out call mid-training must not perturb the seeded \
+             dropout stream or leave the trainer eval-mode — the post-refusal training \
+             steps must be byte-identical to the same steps in a run that never called \
+             the seam"
+        );
+        assert_ne!(
+            weight_bytes(&w_test),
+            weight_bytes(&w_control),
+            "TEST's post-refusal tail must diverge from CONTROL's forced-eval-mode tail \
+             — if finding 2's bug were still present, TEST's tail would ALSO train with \
+             dropout off (matching CONTROL exactly) and this assertion would fail because \
+             TEST == CONTROL"
+        );
+    }
+
+    /// Audit round 63, finding 2 (regression test): calling the held-out seam
+    /// on a trainer that was NOT in training mode to begin with must not flip
+    /// it INTO training mode as a side effect. Pre-fix,
+    /// `with_dropout_disabled` unconditionally restored `training = true`
+    /// regardless of the trainer's actual pre-call state, so a trainer
+    /// explicitly placed in eval mode (e.g. an inference-only handle) would
+    /// come OUT of a read-only `evaluate_held_out` call silently back in
+    /// training mode.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn seam_on_a_non_training_trainer_leaves_it_non_training() {
+        let device = Device::Cpu;
+        let mut loop_ = minimal_pairs_loop(&device, mnrl_config(2)).await;
+
+        // Explicitly place the trainer in eval mode BEFORE the seam call —
+        // the scenario the pre-fix hard-coded `set_training(true)` restore
+        // ignored.
+        loop_.set_training(false);
+        assert!(
+            !loop_.training_mode,
+            "test setup: trainer must start non-training"
+        );
+
+        let (loader, example_ids) = mixed_pairs_fixture(&device);
+        let held_out = loop_.evaluate_held_out(&loader, &example_ids).unwrap();
+        assert_eq!(held_out.count, 4);
+
+        assert!(
+            !loop_.training_mode,
+            "evaluate_held_out must restore the CAPTURED pre-call training mode \
+             (false here), not unconditionally force training back on"
+        );
+    }
+
+    /// Typed refusal: `example_ids.len()` is not a multiple of `batch_size`
+    /// (the v2-delta-2 leading guard) — untested before this unit;
+    /// `refuses_a_batch_whose_row_count_mismatches_batch_size` above covers
+    /// only the DIFFERENT per-batch row-count check further down.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refuses_a_held_out_set_not_a_multiple_of_batch_size() {
+        let device = Device::Cpu;
+        // batch_size = 2, but 3 example ids — 3 is not a multiple of 2.
+        let mut loop_ = minimal_pairs_loop(&device, mnrl_config(2)).await;
+        let batch = TrainingBatch::Pairs {
+            anchors: Tensor::new(&[[1.0f32, 0.0], [0.0, 1.0], [1.0, 1.0]], &device).unwrap(),
+            positives: Tensor::new(&[[1.0f32, 0.0], [0.0, 1.0], [1.0, 1.0]], &device).unwrap(),
+        };
+        let loader = TrainingDataLoader::from_precomputed(vec![batch]);
+        let example_ids = ids(&["ex-0", "ex-1", "ex-2"]);
+
+        let err = loop_.evaluate_held_out(&loader, &example_ids).unwrap_err();
+        assert!(
+            matches!(err, JammiError::FineTune(ref m) if m.contains("is not a multiple of batch_size")),
+            "expected a 'not a multiple of batch_size' refusal, got {err:?}"
+        );
+    }
+}
+
+/// Finding 7 (audit round 63): a per-objective decomposition ORACLE for every
+/// objective [`TrainingLoop::compute_loss_per_example`] supports.
+///
+/// The pre-existing oracle
+/// (`held_out_eval_tests::sum_of_per_example_equals_mean_times_count`) only
+/// checks the per-example seam against ITSELF — `sum(per_example) == mean *
+/// count` — which is trivially true BY CONSTRUCTION of how `evaluate_held_out`
+/// computes `mean` (`sum / count`, from the very same `per_example` array). It
+/// would pass unchanged even if `compute_loss_per_example` scored every row
+/// under a completely different (or wrong) formula, as long as it summed and
+/// averaged internally consistently — it cannot catch a per-example function
+/// that has drifted from the real, production objective.
+///
+/// These tests instead compare `mean(compute_loss_per_example(batch))` — an
+/// INDEPENDENT computation — against `compute_loss(batch)`, the batch-mean
+/// tensor path every real training step and `Trainer::evaluate` actually
+/// takes. This bites: it is only true if the per-example decomposition
+/// genuinely reduces to the same objective the tensor path computes, for
+/// every objective this seam supports (MNRL over `Pairs`, MNRL over a
+/// `Triplet` batch, Triplet-margin, Classification, Contrastive/CosineMse —
+/// the same five arms [`TrainingLoop::compute_loss_per_example`]'s own doc
+/// enumerates as supported; `CoSENT`/`AnglE`/`Ner`/`Regression` are typed
+/// refusals there, not decompositions, so they have no oracle here).
+///
+/// RED-proof (performed manually against this diff, not committed): stashing
+/// a one-line perturbation into `mnrl_loss_per_example` (adding a constant to
+/// each returned row) reddened `mnrl_pairs_decomposition_matches_compute_loss`
+/// and `mnrl_triplet_consumed_decomposition_matches_compute_loss` while every
+/// other oracle in this module stayed green — confirming the oracle actually
+/// exercises the code path it claims to, not a vacuous pass.
+#[cfg(test)]
+mod decomposition_oracle_tests {
+    use std::sync::Arc;
+
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::{VarBuilder, VarMap};
+
+    use super::super::data::TrainingBatch;
+    use super::super::lora::{build_classification_head, build_projection_head};
+    use super::super::target::TrainingTarget;
+    use super::super::{EmbeddingLoss, FineTuneConfig};
+    use super::{TrainingLoop, TrainingLoopBuilder};
+
+    const HIDDEN: usize = 2;
+    const NUM_CLASSES: usize = 3;
+
+    /// Relative tolerance for comparing the tensor-path `compute_loss` (an f32
+    /// device computation, cast to f32 then read back as f64) against
+    /// `mean(compute_loss_per_example(...))` (an f64 host reduction over
+    /// per-row f32 device reads). Both paths run the SAME arithmetic
+    /// (`cosine_similarity` / `contiguous_matmul` / softmax / log-sum-exp) on
+    /// f32 tensors, so they can only diverge in floating-point SUMMATION
+    /// ORDER — one batched on-device `mean_all()` vs. an f64 host sum over
+    /// per-row f32 reads, not in the underlying math. f32 carries ~7
+    /// significant decimal digits (mantissa epsilon ≈1.2e-7); a handful of
+    /// unfused ops (matmul, exp, log, division) each contribute a few ULPs of
+    /// rounding, so `1e-5` relative is roughly two orders of magnitude of
+    /// headroom above the expected accumulated f32 error on these small
+    /// (2–3 row) fixtures — tight enough that a genuine per-example defect
+    /// (which perturbs the VALUE, not merely its last few bits) still trips
+    /// it, while legitimate summation-order noise does not flake it.
+    const REL_TOL: f64 = 1e-5;
+
+    /// A minimal real [`TrainingLoop`] over a `ProjectionHead` target, for the
+    /// four objectives whose loss functions never touch `self.target` (they
+    /// operate directly on the batch's already-embedded tensors): MNRL/Pairs,
+    /// MNRL/Triplet, Triplet-margin, Contrastive/CosineMse.
+    async fn minimal_loop(device: &Device, config: FineTuneConfig) -> TrainingLoop {
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
+        let head = build_projection_head(HIDDEN, &config, &varmap, &vb).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.keep();
+        let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
+        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+            .device(device.clone())
+            .job_id("decomp-oracle-job".into())
+            .worker_id("decomp-oracle-worker".into())
+            .catalog(catalog)
+            .artifact_dir(dir_path)
+            .build()
+            .unwrap()
+    }
+
+    /// A minimal real [`TrainingLoop`] over a classification-shaped
+    /// `ProjectionHead` (projection + classifier layers) — Classification's
+    /// loss DOES route through `self.target` (`Self::classify`).
+    async fn minimal_classification_loop(device: &Device, config: FineTuneConfig) -> TrainingLoop {
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
+        let head = build_classification_head(HIDDEN, NUM_CLASSES, &config, &varmap, &vb).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.keep();
+        let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
+        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+            .device(device.clone())
+            .job_id("decomp-oracle-cls-job".into())
+            .worker_id("decomp-oracle-cls-worker".into())
+            .catalog(catalog)
+            .artifact_dir(dir_path)
+            .build()
+            .unwrap()
+    }
+
+    /// Read a scalar device loss back to host as `f64`, exactly how
+    /// `Trainer::evaluate` and the training step read `compute_loss`'s output.
+    fn loss_scalar(loss: &Tensor) -> f64 {
+        loss.to_dtype(DType::F32)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap() as f64
+    }
+
+    /// The oracle itself: `mean(compute_loss_per_example(batch))` must match
+    /// `compute_loss(batch)` within [`REL_TOL`]. `label` is folded into the
+    /// panic message so a failing objective is identifiable at a glance.
+    fn assert_decomposition_matches(loop_: &TrainingLoop, batch: &TrainingBatch, label: &str) {
+        let batch_loss = loss_scalar(&loop_.compute_loss(batch).unwrap());
+        let per_example = loop_.compute_loss_per_example(batch).unwrap();
+        assert!(
+            !per_example.is_empty(),
+            "{label}: empty per-example decomposition"
+        );
+        let mean: f64 = per_example.iter().sum::<f64>() / per_example.len() as f64;
+        let tol = REL_TOL * batch_loss.abs().max(1.0);
+        assert!(
+            (mean - batch_loss).abs() <= tol,
+            "{label}: mean(per_example) = {mean} must match compute_loss = {batch_loss} \
+             within relative tolerance {REL_TOL} (abs tol {tol}); per_example = {per_example:?}"
+        );
+    }
+
+    /// Non-degenerate 3-row `(anchor, positive)` fixture: varied cosine
+    /// similarities (not uniformly saturated to 0 or 1), so the oracle
+    /// exercises the general (non-floor) case.
+    fn mnrl_pairs_batch(device: &Device) -> TrainingBatch {
+        TrainingBatch::Pairs {
+            anchors: Tensor::new(&[[1.0f32, 0.0], [0.0, 1.0], [0.6, 0.8]], device).unwrap(),
+            positives: Tensor::new(&[[0.8f32, 0.6], [0.6, 0.8], [1.0, 0.0]], device).unwrap(),
+        }
+    }
+
+    /// Objective 1: MNRL over a `Pairs` batch — "the only objective this
+    /// shape trains" per [`TrainingLoop::compute_loss_per_example`]'s doc.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mnrl_pairs_decomposition_matches_compute_loss() {
+        let device = Device::Cpu;
+        let config = FineTuneConfig {
+            embedding_loss: Some(EmbeddingLoss::MultipleNegativesRanking { temperature: 20.0 }),
+            ..Default::default()
+        };
+        let loop_ = minimal_loop(&device, config).await;
+        assert_decomposition_matches(&loop_, &mnrl_pairs_batch(&device), "MNRL/Pairs");
+    }
+
+    /// Non-degenerate 3-row `(anchor, positive, negative)` fixture shared by
+    /// the MNRL-triplet-consumed and Triplet-margin objectives.
+    fn triplet_batch(device: &Device) -> TrainingBatch {
+        TrainingBatch::Triplet {
+            anchor: Tensor::new(&[[1.0f32, 0.0], [0.0, 1.0], [0.6, 0.8]], device).unwrap(),
+            positive: Tensor::new(&[[0.8f32, 0.6], [0.6, 0.8], [1.0, 0.0]], device).unwrap(),
+            negative: Tensor::new(&[[0.0f32, 1.0], [1.0, 0.0], [0.8, 0.6]], device).unwrap(),
+        }
+    }
+
+    /// Objective 2: MNRL over a `Triplet` batch — consumed as MNRL's row NLL
+    /// with the explicit negative appended as an extra similarity column, when
+    /// `MultipleNegativesRanking` is configured (`compute_loss`'s `Triplet`
+    /// arm's `Some(MultipleNegativesRanking { .. })` branch).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mnrl_triplet_consumed_decomposition_matches_compute_loss() {
+        let device = Device::Cpu;
+        let config = FineTuneConfig {
+            embedding_loss: Some(EmbeddingLoss::MultipleNegativesRanking { temperature: 20.0 }),
+            ..Default::default()
+        };
+        let loop_ = minimal_loop(&device, config).await;
+        assert_decomposition_matches(&loop_, &triplet_batch(&device), "MNRL/Triplet-consumed");
+    }
+
+    /// Objective 3: Triplet margin (`max(0, cos(a,n) - cos(a,p) + margin)`) —
+    /// `compute_loss`'s `Triplet` arm's row-independent `_` (non-MNRL) branch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn triplet_margin_decomposition_matches_compute_loss() {
+        let device = Device::Cpu;
+        let config = FineTuneConfig {
+            embedding_loss: Some(EmbeddingLoss::Triplet { margin: 0.3 }),
+            ..Default::default()
+        };
+        let loop_ = minimal_loop(&device, config).await;
+        assert_decomposition_matches(&loop_, &triplet_batch(&device), "Triplet margin");
+    }
+
+    /// Objective 4: Classification cross-entropy. `lora_dropout: 0.0` is
+    /// load-bearing here, not incidental: `compute_loss` and
+    /// `compute_loss_per_example` each independently call
+    /// `Self::classify(embeddings)`, which draws a FRESH seeded dropout mask
+    /// per call when dropout is on — with dropout on, the two calls would
+    /// score two DIFFERENT forward passes and the oracle would be comparing
+    /// unlike quantities, not testing the decomposition. Zero dropout keeps
+    /// both calls' forward pass identical.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn classification_decomposition_matches_compute_loss() {
+        let device = Device::Cpu;
+        let config = FineTuneConfig {
+            lora_dropout: 0.0,
+            ..Default::default()
+        };
+        let loop_ = minimal_classification_loop(&device, config).await;
+        let batch = TrainingBatch::Classification {
+            embeddings: Tensor::new(&[[1.0f32, 0.2], [0.1, -0.4], [-0.3, 0.9]], &device).unwrap(),
+            labels: Tensor::new(&[0u32, 1u32, 2u32], &device).unwrap(),
+        };
+        assert_decomposition_matches(&loop_, &batch, "Classification");
+    }
+
+    /// Objective 5: Contrastive/CosineMse — `scale·cos(a,b)` regressed onto a
+    /// graded target score, a row-independent squared residual.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cosine_mse_decomposition_matches_compute_loss() {
+        let device = Device::Cpu;
+        let config = FineTuneConfig {
+            embedding_loss: Some(EmbeddingLoss::CosineMse),
+            ..Default::default()
+        };
+        let loop_ = minimal_loop(&device, config).await;
+        let batch = TrainingBatch::Contrastive {
+            embeddings_a: Tensor::new(&[[1.0f32, 0.0], [0.0, 1.0], [0.6, 0.8]], &device).unwrap(),
+            embeddings_b: Tensor::new(&[[0.8f32, 0.6], [0.6, 0.8], [1.0, 0.0]], &device).unwrap(),
+            scores: Tensor::new(&[0.5f32, 0.9, -0.2], &device).unwrap(),
+        };
+        assert_decomposition_matches(&loop_, &batch, "Contrastive/CosineMse");
     }
 }

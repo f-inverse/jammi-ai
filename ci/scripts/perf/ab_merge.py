@@ -2718,7 +2718,11 @@ def build_mutant_dose_column(raw_dir, dose_label, patch_sha256, mutant_seeds):
     `raw_dir` here -- the campaign's ALREADY-RUN leg, never re-run, never a
     second alloff pool) via `generic_leg_premise_violations` over
     `FINETUNE_RUN_IDENTITY_FIELDS` (mirrors the main decision's own
-    fused-vs-alloff identity check), and, for every premise-clean pair,
+    fused-vs-alloff identity check) AND `finetune_run_named_arm_premise_violations`
+    (unit-63 round-7 audit finding 2: the alloff PARTNER's own conjunctive
+    premise legs -- `admission_is_dense`/`learning_happened`/`tie_fraction`
+    -- are checked here too, not just the mutant side; a premise-failing
+    alloff partner excludes the PAIR), and, for every premise-clean pair,
     computes `d_i = mutant.held_out_example_mean - alloff.held_out_example_mean`
     -- mutant vs alloff is THE GATE'S OWN STATISTIC (amendment 2026-08-29b
     item 3: "mutant-vs-fused is explicitly NOT the sensitivity claim").
@@ -2773,6 +2777,23 @@ def build_mutant_dose_column(raw_dir, dose_label, patch_sha256, mutant_seeds):
             "mutant",
             "alloff",
         )
+        # unit-63 round-7 audit finding 2: `finetune_run_mutant_column_violations`
+        # (above) already premise-checks the mutant (fused-shaped) side via
+        # `finetune_run_arm_premise_violations("fused", tier)` -- but the
+        # REUSED alloff PARTNER never got the same check here, unlike the
+        # main pool (`build_finetune_run_report` premise-checks BOTH
+        # `fused_tier` and `alloff_tier` via `finetune_run_named_arm_premise_violations`).
+        # A premise-failing alloff leg (live-demonstrated by the real
+        # campaign-v1 seed-4 alloff leg, `learning_happened_delta=-0.1125` --
+        # see measurements/campaign-v1/README.md) is EXCLUDED from the main
+        # gate's own clean-pair count, yet used to silently count as a clean
+        # partner in every dose column that reused it. Checking the SAME
+        # named premise here, and excluding the PAIR (never merely the
+        # fused/mutant side) on a partner failure, makes "the SAME alloff
+        # legs under the SAME rule" (amendment 2026-08-29b item 3) literally
+        # true.
+        alloff_named_violations = finetune_run_named_arm_premise_violations("alloff", alloff_tier)
+        leg_violations += [msg for _name, msg in alloff_named_violations]
         d_i = None
         mutant_mean = tier.get("held_out_example_mean")
         alloff_mean = alloff_tier.get("held_out_example_mean")

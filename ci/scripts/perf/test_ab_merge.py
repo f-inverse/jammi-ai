@@ -3670,6 +3670,39 @@ class MutantDoseLadderTests(unittest.TestCase):
         self.assertTrue(any("does not match this dose column" in v for v in col["violations"]), col["violations"])
         self.assertIsNone(col["per_seed"]["1"]["d_i"])
 
+    def test_premise_failing_alloff_partner_excludes_the_pair(self):
+        # unit-63 round-7 audit finding 2: the main pool premise-checks BOTH
+        # arms, but this column used to premise-check only the mutant
+        # (fused-shaped) leg -- the REUSED alloff partner never got the same
+        # check. A v1-seed-4-shaped alloff partner (train_probe_series
+        # giving a negative learning_happened_delta, mirroring the REAL
+        # campaign-v1 seed-4 alloff leg's own -0.1125 floor breach --
+        # measurements/campaign-v1/README.md) must exclude the PAIR from
+        # this dose column, never silently count as a clean partner.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in range(1, 13):
+                if seed == 4:
+                    _write_finetune_run_leg(
+                        raw_dir,
+                        seed,
+                        "alloff",
+                        "r1",
+                        _finetune_run_tier(
+                            arm="alloff", seed=seed, held_out_example_mean=0.50, train_probe_series=[0.5, 0.6]
+                        ),
+                    )
+                else:
+                    self._write_alloff(raw_dir, seed, mean=0.50)
+                _write_mutant_leg(raw_dir, seed, "eps0.50", _mutant_tier(seed=seed, held_out_example_mean=0.70))
+            col = ab_merge.build_mutant_dose_column(raw_dir, "eps0.50", self.PATCH_SHA, list(range(1, 13)))
+        self.assertEqual(col["detected"], "INVALID")
+        self.assertEqual(col["clean_pair_count"], 11)
+        self.assertIsNone(col["per_seed"]["4"]["d_i"])
+        self.assertTrue(
+            any("learning_happened_delta" in v and "seed 4" in v for v in col["violations"]),
+            col["violations"],
+        )
+
     def test_mutant_leg_never_leaks_into_the_ab_set(self):
         # A mutant leg is written under the SAME raw_dir, SAME seeds, as a
         # clean 12-seed main A/B sweep -- the merger's own decision must be

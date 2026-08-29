@@ -997,6 +997,28 @@ jobs:
           # mechanism (rounds 2-3).
           - name: perf claims sweep
             cmd: python3 ci/scripts/check_perf_claims.py --sweep
+          # esc-065's write-time oracle — COVERAGE EXTENSION of rule (h) to
+          # a record shape rule (h) never scoped: prose/table claims under
+          # docs/plans/63-how-well/measurements/**/README.md and the
+          # mutants/README.md "Measured" records. Reuses rule (h)'s
+          # resolution core by IMPORT (pointer walk, exclusion-span
+          # tokenizer, Decimal/ROUND_HALF_EVEN equality generalized for
+          # scientific notation); new grammar (derived aggregates, the
+          # cross-file raw-concordance recipe, relational/interval claims,
+          # a `hist` quote marker) covers what rule (h)'s own grammar has
+          # no equivalent for. Same two-leg anti-vacuity discipline: a
+          # pinned per-file CLAIM_ZONE_DENOMINATOR (coverage) and an
+          # independent-leaf ambiguity scan.
+          - name: measurement claims
+            cmd: python3 ci/scripts/check_measurement_claims.py
+          - name: measurement claims self-test
+            cmd: python3 ci/scripts/check_measurement_claims.py --self-test
+          # ci/measurement_claims_allowlist.txt is only-shrinks, the exact
+          # ci/perf_claims_allowlist.txt ratchet shape reused verbatim.
+          # Bootstrap (no allowlist file on origin/main yet) is the one PR
+          # introducing it.
+          - name: measurement claims allowlist only shrinks
+            cmd: python3 ci/scripts/check_measurement_claims.py --check-allowlist-only-shrinks
           # Mocks-only, no-network regression suite for the 2026-08-25
           # gpu-dev pod-lifecycle incident (ledger rows 279-289) and the
           # mechanism defects three follow-up audit rounds found in this

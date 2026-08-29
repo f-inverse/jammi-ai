@@ -17,14 +17,18 @@ the active design and replace it with the pre-registered dose family.
 `4257cde6d51184475b3e798f5d7e9c3885a763ca`) is an off-by-one bias-correction
 defect (`t+1` instead of `t` in `adamw_step_fused_t`'s `scale_m`/`scale_v`
 derivation). It ran as the campaign-v1 mutant column: mutant-vs-fused
+<!-- claims63: c1=poscount('docs/plans/63-how-well/measurements/campaign-v1/mutant-m1/mutant-seed*.json', 'docs/plans/63-how-well/measurements/campaign-v1/raw/seed*__fused__r1.json', 'held_out_example_mean'); c2=paircount('docs/plans/63-how-well/measurements/campaign-v1/mutant-m1/mutant-seed*.json', 'docs/plans/63-how-well/measurements/campaign-v1/raw/seed*__fused__r1.json', 'held_out_example_mean'); c3=meand('docs/plans/63-how-well/measurements/campaign-v1/mutant-m1/mutant-seed*.json', 'docs/plans/63-how-well/measurements/campaign-v1/raw/seed*__fused__r1.json', 'held_out_example_mean'); c4=negcount('docs/plans/63-how-well/measurements/campaign-v1/mutant-m1/mutant-seed*.json', 'docs/plans/63-how-well/measurements/campaign-v1/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c5=paircount('docs/plans/63-how-well/measurements/campaign-v1/mutant-m1/mutant-seed*.json', 'docs/plans/63-how-well/measurements/campaign-v1/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c6=meand('docs/plans/63-how-well/measurements/campaign-v1/mutant-m1/mutant-seed*.json', 'docs/plans/63-how-well/measurements/campaign-v1/raw/seed*__alloff__r1.json', 'held_out_example_mean') -->
 n_pos=8/12 mean -0.0035; mutant-vs-alloff n_neg=8/12 mean -0.0236 — **NOT
 RED**. Full measured record: `measurements/campaign-v1/mutant-m1/` (per-seed
 JSONs + `mutant63.log`) and `measurements/campaign-v1/README.md`'s
 `mutant-m1/` section.
 
 Root cause (pressure-tested, CONTRACT.md amendment 2026-08-29b item 3): M1's
+<!-- claims63: c1=const; c2=const; c3=const; c4=const -->
 net update multiplier `[(1-beta1^t)/(1-beta1^(t+1))]*sqrt[(1-beta2^(t+1))/(1-beta2^t)]`
+<!-- claims63: c1=ledger -->
 is a **sign-flipping early transient** — `0.744` at `t=1`, converging to
+<!-- claims63: c1=ledger -->
 `~1.009` by `t=50` — not a sustained one-direction dose. The reasoning that
 picked M1 was in the wrong space (per-step magnitude of the bias-correction
 scalar) instead of the space the gate actually measures (a fixed-sign,
@@ -428,18 +432,26 @@ step=5 l2_divergence=4.39925e-3
 ```
 
 The step-5 divergence scales linearly with `|eps|` as the design intends
-(sustained, monotone family): `8.801983e-4 / 1.7542565e-4 = 5.017` (expected
-`5x`, since `0.10 / 0.02 = 5`); `4.3986836e-3 / 1.7542565e-4 = 25.076`
+<!-- claims63: c1=code('0.10', 5); c2=code('0.02', 5); c3=ratio(code('0.10', 5), code('0.02', 5)) -->
+(sustained, monotone family): `8.801983e-4 / 1.7542565e-4 = 5.018` (expected
+<!-- claims63: c1=ratio(0.10, 0.02); c2=const; c3=const; c4=const; c5=code('0.50', 5); c6=code('0.02', 5); c7=ratio(code('0.50', 5), code('0.02', 5)) -->
+`5x`, since `0.10 / 0.02 = 5`); `4.3986836e-3 / 1.7542565e-4 = 25.074`
+<!-- claims63: c1=ratio(0.50, 0.02); c2=const; c3=const; c4=const -->
 (expected `25x`, since `0.50 / 0.02 = 25`) — both within floating-point
 accumulation tolerance of the exact ratio, confirming each dose is a real,
 proportionally-scaled numeric perturbation on this crate's own oracle, not
 a no-op and not a copy-paste of a different dose's constant. The two new
 signed doses confirm the same magnitude relationship holds for negative
+<!-- claims63: c1=code('-0.10', 5) -->
 `eps`: `eps=-0.10`'s step-5 divergence (`8.799804e-4`) matches `eps=+0.10`'s
+<!-- claims63: c1=code('0.10', 5); c2=absdiff(code('-0.10', 5), code('0.10', 5)) -->
 (`8.801983e-4`) to within `~2.2e-7` (a floating-point accumulation-order
+<!-- claims63: c1=const; c2=const -->
 difference between `1.10*lr` and `0.90*lr`, not a design defect), and
+<!-- claims63: c1=code('-0.50', 5); c2=code('0.50', 5) -->
 `eps=-0.50`'s (`4.39925e-3`) matches `eps=+0.50`'s (`4.3986836e-3`) to
-within `~6e-6` — confirming `|1+eps|`-driven magnitude symmetry of the
+<!-- claims63: c1=absdiff(code('-0.50', 5), code('0.50', 5)) -->
+within `~6e-7` — confirming `|1+eps|`-driven magnitude symmetry of the
 perturbation at the kernel level, independent of sign.
 
 `git checkout -- crates/jammi-kernels/src/ops/adamw_step.rs` restored the
@@ -654,17 +666,23 @@ transient (m/v are zero-initialized, so v_hat's `eps` floor and the
 did. No claim of degradation is made for `M_nobc` before it is actually
 run; this is the honest complement to `M_signflip` below.
 
+<!-- claims63: c1=ledger -->
 **Measured (12-leg GPU, a100, `redproof-nobc`): NOT DETECTED (raw).**
 Committed artifact: `docs/plans/63-how-well/measurements/red-proof/` at
+<!-- claims63: c1=ledger -->
 dc1cfc3b (36 raw legs + the gated merge artifact). `M_nobc`
+<!-- claims63: c1=ledger; c2=ledger -->
 IS a genuine perturbation on hardware — 0/12 legs bit-identical to the
 clean fused column (unlike `M_signflip` v1 below, this mutant fires on the
 CUDA arm exactly as designed, since it changes a Rust-side scalar
 (`scale_m`/`scale_v`) fed into `AdamThetaUpdate`, a struct field both
 `cpu_fwd` and `cuda_fwd` read identically — see `M_signflip_v2`'s own
 "dispatch-invariant site" framing below, which this mutant already
+<!-- claims63: c1=ledger; c2=ledger -->
 satisfied by construction). The RAW 12-pair concordance (all 12 mutant/alloff
+<!-- claims63: c1=poscount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c2=paircount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c3=meand('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean') -->
 pairs, premise violations included) reads `n_pos=5/12`, `mean_d=-0.018` —
+<!-- claims63: c1=const; c2=const -->
 **not-detected** under the `>=11/12+mean` rule (the uncertain prediction
 above is BORNE OUT as the neutral/mixed outcome, not the degradation one):
 the no-bias-correction shape does not degrade held-out loss at this
@@ -674,15 +692,19 @@ reach the threshold) — never suppressed or silently retried with a larger
 dose, per this file's own "Pass criterion" section above.
 
 **GATED reading (CONTRACT.md amendment 2026-08-29e, D*): INVALID.** Under
+<!-- claims63: c1=ledger; c2=ledger -->
 the D*-decomposed learning-happened premise, 2 of `M_nobc`'s 12 mutant legs
 — seeds 9 and 12 — show ASCENDING probes against `M_nobc`'s own declared
 DESCENT direction (`RED_PROOF_EXPECTED_TRAIN_DIRECTION`'s own `9b3c824d…`
+<!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/finetune_run_ab_report.json; c1=#/mutant_dose_ladder/red_proof/0/clean_pair_count; c2=ledger -->
 entry), so `clean_pair_count=10 ≠ 12` and the gated column reads INVALID
+<!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/finetune_run_ab_report.json; c1=#/mutant_dose_ladder/red_proof/0/clean_pair_count; c2=ledger -->
 (10/12 clean pairs, correctness-of-measurement problem, never silently
 rescaled to whatever count ran clean). This is a SEPARATE reading from the
 RAW not-detected number above, at a different layer — both are current
 truth at their own layers (CONTRACT.md's own RECONCILIATION clause); under
 D* the `M_nobc` column remains INVALID — recorded, not rescued. Acceptance
+<!-- claims63: c1=const -->
 5's discharge schedules `redproof-signflip-v2` only (see "Scheduling
 `M_signflip_v2`" below); `M_nobc`'s own committed INVALID record stands as
 evidence, not as a second column to re-run.
@@ -712,10 +734,12 @@ this pair: if `M_nobc` reads neutral-or-improving (plausible per its own
 uncertain prediction above), `M_signflip` still discharges acceptance 5's
 "mutant column proven RED" on its own.
 
+<!-- claims63: c1=ledger; c2=ledger; c3=ledger -->
 **Measured (12-leg GPU, a100, `redproof-signflip`): INERT — 12/12 legs
 bit-identical to the clean fused column. This patch is retired; see
 `M_signflip_v2` below.** Committed artifact:
 `docs/plans/63-how-well/measurements/red-proof/` at dc1cfc3b (the same
+<!-- claims63: c1=ledger -->
 36-raw-leg + gated-merge artifact `M_nobc`'s own "Measured" record above
 cites; these v1 `signflip` legs are committed there as evidence only, never
 scheduled through the merger). The lead's own bit-identity check on the raw legs
@@ -726,6 +750,7 @@ the campaign's fused arm dispatches the CUDA kernel on a100 —
 `AdamThetaUpdate::cuda_fwd` calls `crate::cuda::adamw_step::
 theta_update_cuda_fwd`, which runs its own compiled `cuda/adamw_step.cu`
 PTX, never `cpu_fwd`'s Rust body. The CPU-side demonstration above
+<!-- claims63: c1=ledger; c2=ledger -->
 (`3.464057e-3`..`1.7320165e-2` L2 divergence) is real and correctly shows
 `cpu_fwd` diverging from the oracle — the demonstration procedure itself
 worked exactly as designed — but it demonstrates a perturbation that never
@@ -796,13 +821,16 @@ claimed here.
 **Definition:** `adamw_step_fused_t` negates its own local `lr` scalar
 (`let lr_signflip = -params.lr;`) and passes `lr_signflip` — not
 `params.lr` — into `AdamThetaUpdate::new(...)`. `AdamThetaUpdate::new`
+<!-- claims63: c1=const -->
 bakes this value into BOTH `one_minus_lr_lambda` (`1.0 - lr*weight_decay`,
 computed once at construction) and its own stored `lr` field, and BOTH
 `AdamThetaUpdate::cpu_fwd` and `AdamThetaUpdate::cuda_fwd` read those SAME
 struct fields — this is the identical shape (a plain Rust scalar perturbed
 in `adamw_step_fused_t`, upstream of the CPU/CUDA fork) the `(1+eps)`
 lr-scale family already used, and that family's own scheduled doses
+<!-- claims63: default=docs/plans/63-how-well/measurements/dose-ladder/finetune_run_ab_report.json; c1=#/mutant_dose_ladder/doses/0/n_neg; c2=#/mutant_dose_ladder/doses/0/gate_seed_count -->
 (`eps-0.50`/`eps-0.10`) were measured firing on the a100 GPU legs (11/12
+<!-- claims63: default=docs/plans/63-how-well/measurements/dose-ladder/finetune_run_ab_report.json; c1=#/mutant_dose_ladder/doses/0/p_value -->
 concordance, `p=0.00635`) — i.e. this exact site is PROVEN dispatch-
 invariant on hardware, not merely argued from source structure. Unlike
 `M_signflip` v1, this patch touches ZERO lines inside either `cpu_fwd` or
@@ -811,11 +839,13 @@ before the `InplaceOp3` call.
 
 **Predicted direction: DEGRADATION, with CERTAINTY — same mechanism as
 `M_signflip` v1.** Negating `lr` negates the update the SAME way `-=`
+<!-- claims63: c1=const -->
 becoming `+=` did (`adj_scaled = adjusted_grad * lr_signflip + 0.0f32`
 inside `cpu_fwd`/the CUDA kernel is now the correct term with the WRONG
 sign folded in upstream, rather than the sign flipped at the final
 combine) — gradient ASCENT on `adjusted_grad`'s direction, every step,
 compounding for the length of the run. This mutant ALSO flips the sign of
+<!-- claims63: c1=const -->
 the `weight_decay` contribution (`one_minus_lr_lambda = 1.0 -
 lr_signflip*weight_decay = 1.0 + params.lr*weight_decay`, since
 `lr_signflip` is negative) — theta's own magnitude grows slightly from the
@@ -839,6 +869,7 @@ step=5 l2_divergence=1.7595848e-2
 ```
 
 Close to (not identical to) `M_signflip` v1's own CPU numbers
+<!-- claims63: c1=ledger; c2=ledger -->
 (`3.464057e-3`..`1.7320165e-2`) — the small difference is exactly the
 additional weight-decay-sign effect described above (v1 only flipped the
 `adjusted_grad` combine; v2 flips `lr` itself, which ALSO flips
@@ -850,14 +881,20 @@ precedent), not a claim that the CPU numbers themselves are new evidence
 beyond v1's.
 
 **Measured (12-leg GPU, a100, `redproof-signflip-v2`, D*-gated): RED —
+<!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/dstar/finetune_run_ab_report.json; c1=#/mutant_dose_ladder/red_proof/0/n_pos; c2=#/mutant_dose_ladder/red_proof/0/clean_pair_count -->
 12/12.** Committed artifact:
 `docs/plans/63-how-well/measurements/red-proof/dstar/` at 82253c1b (the
 D*-gated re-merge CONTRACT.md amendment 2026-08-29e pre-registered, run
 against the SAME committed raw legs already cited above — nothing
+<!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/dstar/finetune_run_ab_report.json; c1=#/mutant_dose_ladder/red_proof/0/clean_pair_count; c2=#/mutant_dose_ladder/red_proof/0/n_pos -->
 re-run). All four pre-registered predictions confirmed to the bit: 12/12
+<!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/dstar/finetune_run_ab_report.json; c1=count(#/mutant_dose_ladder/doses/0/mutant_seeds, 'len') -->
 clean pairs (all 12 legs ascend against `RED_PROOF_EXPECTED_TRAIN_
+<!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/dstar/finetune_run_ab_report.json; c1=#/mutant_dose_ladder/red_proof/0/n_pos; c2=#/mutant_dose_ladder/red_proof/0/n_neg -->
 DIRECTION`'s own entry, init anchors bit-identical); `n_pos=12, n_neg=0`,
+<!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/dstar/finetune_run_ab_report.json; c1=numer(4096, #/mutant_dose_ladder/red_proof/0/p_value); c2=denom(2, #/mutant_dose_ladder/red_proof/0/p_value); c3=numer(2048, #/mutant_dose_ladder/red_proof/0/p_value); c4=denom(1, #/mutant_dose_ladder/red_proof/0/p_value); c5=#/mutant_dose_ladder/red_proof/0/p_value -->
 `detected=RED`, two-sided `p = 2/4096 = 1/2048 = 0.00048828125` exact;
+<!-- claims63: c1=ledger -->
 `red_proof_verdict = PROVEN`; merge exit 0 (PROVEN contributes nothing to
 the exit code). Acceptance 5's "mutant column proven RED" is DISCHARGED
 at `M = M_signflip_v2`, per the amendment's honesty rider: this mutant is
@@ -954,6 +991,7 @@ same carve-out every dose column gets) is caught by the SAME
 non-zero exit exactly as everywhere else in this module.
 
 **Measured record (12-leg GPU, a100), current-truth discipline:** committed
+<!-- claims63: c1=ledger -->
 artifact `docs/plans/63-how-well/measurements/red-proof/` at dc1cfc3b (36
 raw legs + the gated merge artifact). `--mutant-legs
 redproof-nobc:<M_nobc sha256>:<seeds>` and `--mutant-legs
@@ -962,10 +1000,14 @@ SAME `ab_merge.py finetune-run` invocation the campaign's primary decision
 uses (v1's `redproof-signflip` legs are committed in this same artifact as
 evidence only — see `M_signflip` v1's own "Measured"/"lesson" notes above —
 never scheduled through the merger; its label is retired). `redproof-nobc`'s
+<!-- claims63: c1=ledger; c2=poscount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c3=paircount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c4=meand('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean') -->
 RAW 12-pair concordance reads `n_pos=5/12`, `mean_d=-0.018` (see `M_nobc`'s
 own "Measured" note above) — but the GATED column's own `detected` field
+<!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/finetune_run_ab_report.json; c1=#/mutant_dose_ladder/red_proof/0/clean_pair_count; c2=ledger; c3=#/mutant_dose_ladder/red_proof/0/n_pos; c4=#/mutant_dose_ladder/red_proof/0/n_neg; c5=#/mutant_dose_ladder/red_proof/0/mean_d -->
 reads `INVALID` (10/12 clean pairs, `n_pos=3`, `n_neg=7`, `mean_d=-0.058`,
+<!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/finetune_run_ab_report.json; c1=#/mutant_dose_ladder/red_proof/0/p_value; c2=ledger -->
 `p=0.34`; 2 legs — seeds 9 and 12 — already failed the (pre-D*)
+<!-- claims63: c1=ledger -->
 learning-happened premise on this committed artifact, the SAME 2 legs D*'s
 own `train_direction` premise names explicitly; see `M_nobc`'s own "GATED
 reading" note above). Neither column discharged acceptance 5 (the committed

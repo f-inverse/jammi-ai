@@ -623,8 +623,19 @@ pub struct ExampleLoss {
 /// This is also why the held-out split is sized to a MULTIPLE of
 /// `batch_size` via an explicit committed id list (v2 delta 2) rather than
 /// `validation_fraction` rounding: it fixes every example at the same
-/// `batch_size - 1` in-batch negatives, so `in_batch_negatives_per_example`
-/// is one number, not a per-example distribution with a ragged final batch.
+/// in-batch-negative count for objectives that have one, so
+/// `in_batch_negatives_per_example` is one number, not a per-example
+/// distribution with a ragged final batch.
+///
+/// **`in_batch_negatives_per_example` is objective-aware** (audit round 63,
+/// finding 6): `batch_size - 1` for the MNRL objectives (`Pairs`, always;
+/// `Triplet` when `MultipleNegativesRanking` is configured), which score each
+/// row against every OTHER row's positive sharing the batch. It is `0` for
+/// every other objective this seam supports (`Triplet` margin,
+/// `Contrastive`/`CosineMse`, `Classification`) — genuinely zero, not a
+/// placeholder: those objectives score each row independently of every other
+/// row in the batch, so there is no in-batch-negative pool to size. See the
+/// field's own doc.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HeldOutLoss {
     /// Per-example losses, in the held-out split's fixed (committed) id order.
@@ -662,12 +673,24 @@ pub struct HeldOutLoss {
     /// when this hash (and [`Self::in_batch_negatives_per_example`]) match.
     pub batch_partition_sha256: String,
     /// The number of in-batch negatives every held-out example was scored
-    /// against — fixed at `batch_size - 1` because the held-out split is
-    /// sized to a multiple of `batch_size` (v2 delta 2), so no batch is
-    /// short and every example has the same negative-pool size. A single
-    /// scalar (not a per-example distribution) precisely because that sizing
-    /// rule holds; a held-out split that violated it would need a
-    /// per-example count instead, which this shape does not carry.
+    /// against — **objective-aware** (audit round 63, finding 6; the field
+    /// used to be `batch_size - 1` unconditionally, which was only correct
+    /// for the MNRL objectives and silently mis-described every other one):
+    ///
+    /// - MNRL objectives (`Pairs`, always; `Triplet` when
+    ///   `MultipleNegativesRanking` is configured): `batch_size - 1`, because
+    ///   the held-out split is sized to a multiple of `batch_size` (v2 delta
+    ///   2), so no batch is short and every example has the same
+    ///   negative-pool size.
+    /// - Every other objective this seam supports (`Triplet` margin,
+    ///   `Contrastive`/`CosineMse`, `Classification`): `0`. These score each
+    ///   row independently of every other row in the batch — `0` is their
+    ///   TRUE in-batch-negative count, not a sentinel or a fallback.
+    ///
+    /// A single scalar (not a per-example distribution) precisely because
+    /// the held-out split is scored under one homogeneous objective/batch
+    /// kind throughout, so this count cannot vary example-to-example within
+    /// one `HeldOutLoss`.
     pub in_batch_negatives_per_example: usize,
 }
 

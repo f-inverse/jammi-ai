@@ -1147,6 +1147,7 @@ async fn warm_hit_after_selected_weights_arm_deleted_with_alternate_present_relo
         .get_or_load(&source, ModelTask::TextEmbedding, None)
         .await
         .unwrap();
+    let model1 = Arc::clone(&guard1.model);
     drop(guard1);
 
     // DELETE the selected arm — the alternate survives.
@@ -1155,12 +1156,32 @@ async fn warm_hit_after_selected_weights_arm_deleted_with_alternate_present_relo
     // Two consecutive warm calls must both succeed, never wedge and never
     // refuse — a cold resolve of this SAME directory would happily pick up
     // open_clip_model.safetensors via resolve_local's own fallback chain.
+    //
+    // esc-058 fix-verifier fold-in: `Ok(_)` alone is satisfiable by a bug
+    // that silently keeps serving the pre-deletion `Arc` without ever
+    // actually reloading (the staleness probe never tripping would look
+    // identical to an observer that only checks `Ok`/`Err`) — pin the FIRST
+    // post-deletion call to a genuinely NEW `Arc<LoadedModel>` via
+    // `Arc::ptr_eq` inequality, proving a real reload occurred rather than
+    // the assertion being vacuously satisfied by an untouched warm hit.
     for attempt in 0..2 {
         let result = cache
             .get_or_load(&source, ModelTask::TextEmbedding, None)
             .await;
         match result {
-            Ok(guard) => drop(guard),
+            Ok(guard) => {
+                if attempt == 0 {
+                    assert!(
+                        !Arc::ptr_eq(&model1, &guard.model),
+                        "the first post-deletion get_or_load must genuinely reload \
+                         via the alternate arm, not silently keep serving the \
+                         pre-deletion Arc — Arc::ptr_eq == true would mean the \
+                         staleness probe never actually tripped, making the \
+                         surrounding Ok/Err check vacuous"
+                    );
+                }
+                drop(guard);
+            }
             Err(e) => panic!(
                 "attempt #{attempt}: deleting the SELECTED weights arm \
                  (model.safetensors) while an alternate (open_clip_model.safetensors) \

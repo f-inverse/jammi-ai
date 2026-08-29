@@ -2,7 +2,7 @@
 
 Producer: `measure_gpu_floors_print_only` (crates/jammi-encoders/tests/it/batch_composition_invariance.rs),
 invoked as `JAMMI_REQUIRE_CUDA=1 cargo test -p jammi-encoders --features cuda --test it
-measure_gpu_floors -- --ignored --nocapture --test-threads=1`, tree `bcd274c18bdb` for the archival capture (producer body byte-identical to `67ba2394`, the tree whose values the derived constants cite; a device-identity-printing re-capture at the final head supersedes these files), one archival run per
+measure_gpu_floors -- --ignored --nocapture --test-threads=1`, tree `a4fad082` for the archival capture (self-identifying: each file's first line is a HEADER carrying the probed compute capability, driver-reported device name, and crate version; measured values byte-identical to the `67ba2394` runs the derived constants cite), one archival run per
 arch, full stdout lines extracted verbatim per pod:
 
 - `gpu-floors-a100.txt` — NVIDIA A100-SXM4-80GB (sm80), pod cjjh6oaqehvpwi

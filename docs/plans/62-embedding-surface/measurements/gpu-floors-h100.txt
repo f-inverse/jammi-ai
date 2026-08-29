@@ -1,4 +1,5 @@
-test batch_composition_invariance::measure_gpu_floors_print_only ... measure_gpu_floors_print_only: composition=0 row_slot=0 len=3 alone_vs_truth=3.6012270259502413e-3 batch_vs_truth=3.6012270259502413e-3 alone_vs_batch=0e0
+test batch_composition_invariance::measure_gpu_floors_print_only ... measure_gpu_floors_print_only: HEADER compute_capability=9.0 device_name=NVIDIA H100 80GB HBM3 jammi_encoders_version=0.47.0
+measure_gpu_floors_print_only: composition=0 row_slot=0 len=3 alone_vs_truth=3.6012270259502413e-3 batch_vs_truth=3.6012270259502413e-3 alone_vs_batch=0e0
 measure_gpu_floors_print_only: composition=0 row_slot=1 len=7 alone_vs_truth=4.222114077112533e-3 batch_vs_truth=4.222114077112533e-3 alone_vs_batch=0e0
 measure_gpu_floors_print_only: composition=0 row_slot=2 len=11 alone_vs_truth=3.8022147502275267e-3 batch_vs_truth=3.8022147502275267e-3 alone_vs_batch=0e0
 measure_gpu_floors_print_only: composition=0 row_slot=3 len=15 alone_vs_truth=3.004721541292128e-3 batch_vs_truth=3.004721541292128e-3 alone_vs_batch=0e0

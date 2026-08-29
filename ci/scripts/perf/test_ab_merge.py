@@ -1981,28 +1981,26 @@ def _golden_dispatch_counters(name):
 
 
 _FINETUNE_RUN_DISPATCH_COUNTERS = {
-    # `modernbert_fused.json` -- CONTRACT 63 Frame pre-registers the flash
-    # cascade as the `fused` arm's own admitted branch (coordinator
-    # correction, unit-63 round-3 audit): `attention_block_flash=840/0`
+    # `modernbert_fused.json` -- unit-63 round-6 audit (docs-ci): this
+    # golden is now ONE real, producer-emitted `jammi-bench finetune-run`
+    # leg (campaign-v2, seed 1, `head_dim == 64` ModernBERT-large, see the
+    # golden's own `PROVENANCE.md` "Supersession executed" section), never
+    # a composite. CONTRACT 63 Frame pre-registers the flash cascade as the
+    # `fused` arm's own admitted branch: `attention_block_flash=3276/0`
     # fires, `attention_block=0/0` is ABSORBED (its own `admit` call is
     # never reached -- `report.rs`'s own field doc), `ln`/`geglu`/
-    # `lora_linear` independently fused, `adamw=6720/0`. Real counts
-    # composited from the committed CUDA artifacts named in this golden's
-    # own `PROVENANCE.md` ("Coordinator correction" section) -- no CUDA
-    # device exists in this environment to run a genuine `flash_compiled:
-    # true` leg against, so the counter fields are cited, never
-    # hand-invented.
+    # `lora_linear` independently fused, `adamw=26208/0` -- all read
+    # DIRECTLY off that one leg's own emission, no compositing.
     "fused": _golden_dispatch_counters("modernbert_fused"),
-    # `modernbert_alloff.json` (corrected, same PROVENANCE.md section) --
-    # `ln=1710/0`, `rope=0/0`, `softmax=0/0`, `geglu=840/0`,
-    # `lora_linear=3360/0` (all unaffected by either disable -- the
+    # `modernbert_alloff.json` (unit-63 round-6 audit, same supersession --
+    # ONE real leg, same campaign/seed, the sibling `alloff` arm) --
+    # `ln=6669/0`, `rope=0/0`, `softmax=0/0`, `geglu=3276/0`,
+    # `lora_linear=13104/0` (all unaffected by either disable -- the
     # class-fix discovery `ALLOFF_DISABLED_OP_BASES`'s own doc explains);
-    # `attention_block=840/0` -- the disabled flash cascade falls through
+    # `attention_block=3276/0` -- the disabled flash cascade falls through
     # to the block arm's own, still-ACTIVE fused kernel (the positive
-    # training-path proof for this arm, per the coordinator's cascade-
-    # absorption correction -- NOT the eager shape an earlier, tiny
-    # head_dim=16 fixture produced); `attention_block_flash=0/840` and
-    # `adamw=0/6720` are the real disabled-kernel fallback counts.
+    # training-path proof for this arm); `attention_block_flash=0/3276`
+    # and `adamw=0/26208` are the real disabled-kernel fallback counts.
     "alloff": _golden_dispatch_counters("modernbert_alloff"),
 }
 
@@ -2133,9 +2131,11 @@ class GoldenProducerAnchoredFieldSetTests(unittest.TestCase):
     `dispatch_pairs`'s own `KeyError` in a live sweep.
 
     All three committed goldens are read (`bert_fused`, `modernbert_fused`,
-    `modernbert_alloff` — see the latter two's own `PROVENANCE.md` section
-    for why their dispatch-counter fields are a documented composite of
-    real committed CUDA artifacts rather than a fresh CPU-hermetic run) —
+    `modernbert_alloff` — unit-63 round-6 audit: all three are now real,
+    single, producer-emitted `jammi-bench finetune-run` reports, never a
+    composite; see the latter two's own `PROVENANCE.md` "Supersession
+    executed" section for the campaign/seed/git_sha this class fix now
+    reads them from) —
     a single golden would still catch a MISSING field (every
     `FinetuneRunTier` field is unconditionally serialized regardless of
     architecture, see `report.rs`), but reading all three is a stronger,
@@ -2173,31 +2173,28 @@ class GoldenProducerAnchoredFieldSetTests(unittest.TestCase):
             pairs = ab_merge.dispatch_pairs(tier)  # must not raise
             self.assertEqual({base for base, _fused, _fallback in pairs}, ab_merge.ALL_BASES)
 
-    def test_golden_modernbert_composites_clear_the_dispatch_proof_gate(self):
-        """Unit-63 round-5 audit (H5), renaming/re-scoping round-4's
-        `test_golden_modernbert_legs_clear_the_full_dispatch_proof_gate`:
-        `modernbert_fused.json`/`modernbert_alloff.json` are STAGED-CLOSURE
-        composites, NOT real, producer-emittable legs (see
-        `PROVENANCE.md`'s "Emittability status" section -- their
-        `checkpoint_config_sha256` names a `head_dim=16` checkpoint that
-        cannot arithmetically produce their own nonzero flash/
-        attention-block counters, and their `batch`/`seq`/`steps_measured`
-        cannot arithmetically produce those counters either). This test
-        pins only that the FIELD-NAME SET these composites carry clears
-        `finetune_run_dispatch_proof_violations` -- the merger's
-        schema-shape acceptance gate -- run each one DIRECTLY off the
-        committed JSON (never `_finetune_run_tier`'s own hand-overridden
-        literal), including the arm-agnostic counters-vs-`backbone_dtype`
-        consistency premise and the fused arm's own bf16 premise. It does
-        NOT, and never did, certify that a real invocation could emit
-        either file; `PROVENANCE.md`'s "Supersession plan" names the one
-        thing that will (a real head_dim-64 probe leg), which also replaces
-        these two committed files verbatim. `bert_fused.json` is
-        deliberately excluded here -- a real CPU-hermetic BERT leg with no
-        fused attention-block kernel at all (`flash_compiled: false`) was
-        never claimed to clear the flash-cascade-arm's own premise; it is
-        this suite's structural field-set base (`_finetune_run_tier`), not
-        a leg exercising this gate.
+    def test_golden_modernbert_real_legs_clear_the_dispatch_proof_gate(self):
+        """Unit-63 round-6 audit, renaming/re-scoping round-5's
+        `test_golden_modernbert_composites_clear_the_dispatch_proof_gate`:
+        `modernbert_fused.json`/`modernbert_alloff.json` are no longer
+        STAGED-CLOSURE composites -- the supersession plan round-5 recorded
+        has EXECUTED (see `PROVENANCE.md`'s "Supersession executed"
+        section): each is now ONE real, producer-emitted `jammi-bench
+        finetune-run` leg (campaign-v2, seed 1, real `head_dim == 64`
+        ModernBERT-large checkpoint) copied byte-for-byte, so this test's
+        own pin is now stronger than its round-5 predecessor's: it
+        certifies that a REAL leg (not merely a schema-shaped
+        stand-in) clears `finetune_run_dispatch_proof_violations` -- the
+        merger's schema-shape/premise acceptance gate -- run each one
+        DIRECTLY off the committed JSON (never `_finetune_run_tier`'s own
+        hand-overridden literal), including the arm-agnostic
+        counters-vs-`backbone_dtype` consistency premise and the fused
+        arm's own bf16 premise. `bert_fused.json` is deliberately excluded
+        here -- a real CPU-hermetic BERT leg with no fused attention-block
+        kernel at all (`flash_compiled: false`) was never claimed to clear
+        the flash-cascade-arm's own premise; it is this suite's structural
+        field-set base (`_finetune_run_tier`), not a leg exercising this
+        gate.
         """
         fused_tier = load_golden("modernbert_fused")["tiers"]["finetune_run"]
         self.assertEqual(ab_merge.finetune_run_dispatch_proof_violations("fused", fused_tier), [])
@@ -2440,7 +2437,9 @@ class FinetuneRunDispatchProofMutantTests(unittest.TestCase):
     def test_fused_arm_with_non_bf16_dtype_and_positive_flash_counter_is_a_contradiction(self):
         # unit-63 round-4 audit F-1, check 0 (arm-agnostic): the DEFAULT
         # fused tier's own dispatch counters already claim
-        # `attention_block_flash_fused_dispatches=840` -- overriding only
+        # `attention_block_flash_fused_dispatches=3276` (unit-63 round-6:
+        # the real campaign-v2 seed-1 leg's own count, since the
+        # supersession) -- overriding only
         # `backbone_dtype` (never the counters) exercises the
         # counters-vs-declared-premise contradiction directly, before the
         # fused arm's own (separate) dtype premise check below is ever

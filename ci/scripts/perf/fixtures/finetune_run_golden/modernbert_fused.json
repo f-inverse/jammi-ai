@@ -1,28 +1,29 @@
 {
   "engine_version": "0.47.0",
   "host": {
-    "logical_cpus": 18,
-    "total_ram_mib": 0
+    "logical_cpus": 13,
+    "total_ram_mib": 2051942
   },
   "subcommand": "finetune-run",
   "provenance": {
-    "build_sha": "1962891cede8b3beb73289f22de08dd4b47a99b3",
+    "build_sha": "6f5874d49ba07db0b99eb4947f855c0e2c464219",
     "target": "x86_64-unknown-linux-gnu",
     "profile": "release",
     "build_features": [
+      "bench-cuda",
       "cuda",
-      "jammi-encoders/flash-attn"
+      "flash-attn"
     ],
     "report_schema_version": 2
   },
   "tiers": {
     "finetune_run": {
-      "seed": 7,
-      "batch": 2,
-      "seq": 16,
-      "lora_rank": 2,
-      "lora_alpha": 4.0,
-      "lora_dropout": 0.0,
+      "seed": 1,
+      "batch": 32,
+      "seq": 64,
+      "lora_rank": 8,
+      "lora_alpha": 16.0,
+      "lora_dropout": 0.05,
       "margin": null,
       "target_modules": [
         "Wqkv",
@@ -30,28 +31,28 @@
         "Wi"
       ],
       "backbone_dtype": "bf16",
-      "checkpoint_config_sha256": "64d378211a6e8787f34228ae6f6aa8046aa4f3e41026184e6fd0060dbceb7f1f",
-      "checkpoint_weights_sha256": "2fc79747c5b140f766c629420ece0439cb4a5d8259227f31571fc07e4b918ccf",
-      "checkpoint_weights_size_bytes": 75884,
-      "max_grad_norm": null,
+      "checkpoint_config_sha256": "55dca68059e98f0debf8eb63ab355c451c65b1f5d90fdca4754113fdaadd2cca",
+      "checkpoint_weights_sha256": "44510fec5d3a81a1877f225637b869495f18e55f6f23a09abb9be0acc030295f",
+      "checkpoint_weights_size_bytes": 1583544840,
+      "max_grad_norm": 1.0,
       "warmup": null,
       "row_lengths": null,
-      "epochs": 2,
-      "lr": 0.001,
+      "epochs": 3,
+      "lr": 0.0002,
       "schedule": "constant",
       "warmup_steps": 0,
-      "weight_decay": 0.0,
+      "weight_decay": 0.01,
       "grad_accum": 1,
-      "validation_fraction": 0.0,
-      "train_pairs_file_sha256": "6dd85f1682c5663493448a3c12eb0f385e7bc29bcd1ca61398e2993f2a7c2f52",
-      "heldout_ids_sha256": "be8063f8e4c1ab11fc0da9ac48541e8053aeeac14572c1a66e16c215ebc4548e",
-      "heldout_pairs_sha256": "bd110a57974fb11aa727e9ca0be99d3d259281e4ef4a9c078951d25f846959fa",
-      "heldout_batch_partition_sha256": "08fc5b466295898a0d182f131d50a6f49b6644f8606b3fb27e58ba6c45d2cd37",
+      "validation_fraction": 0.1,
+      "train_pairs_file_sha256": "5e19b1407125b051a98f357eb1d55db90359fe68b4932ddd5afa4d75e86f615c",
+      "heldout_ids_sha256": "8b6bf66fda0bb2e1a7061666b0396a748449610cc0567b011d408d69f7a3d55a",
+      "heldout_pairs_sha256": "476eb7bd696cca773f6c21638c77eabbb04d8c12a219ff710caf4d39aafbed5b",
+      "heldout_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061",
       "embedding_loss": "mnrl",
       "temperature": 20.0,
       "matryoshka_dims": [],
       "early_stopping_patience": 10000,
-      "early_stopping_metric": "train_loss",
+      "early_stopping_metric": "val_loss",
       "eval_cadence": 1,
       "arm": "fused",
       "device_name": "NVIDIA A100-SXM4-80GB",
@@ -59,55 +60,63 @@
       "kernels_disabled_fired": [],
       "flash_compiled": true,
       "build_features": [
+        "bench-cuda",
         "cuda",
-        "jammi-encoders/flash-attn"
+        "flash-attn"
       ],
       "attention_arm": "fused",
       "split_rule": "positional_fraction_split",
       "batched_forward": true,
-      "steps_measured": 6,
-      "ln_fused_dispatches": 1710,
+      "steps_measured": 234,
+      "ln_fused_dispatches": 6669,
       "ln_eager_dispatches": 0,
       "rope_fused_dispatches": 0,
       "rope_eager_dispatches": 0,
       "softmax_fused_dispatches": 0,
       "softmax_eager_dispatches": 0,
-      "geglu_fused_dispatches": 840,
+      "geglu_fused_dispatches": 3276,
       "geglu_eager_dispatches": 0,
       "lora_epilogue_fused_dispatches": 0,
       "lora_epilogue_eager_dispatches": 0,
-      "lora_linear_fused_dispatches": 3360,
+      "lora_linear_fused_dispatches": 13104,
       "lora_linear_eager_dispatches": 0,
       "attention_block_fused_dispatches": 0,
       "attention_block_eager_dispatches": 0,
-      "adamw_fused_dispatches": 6720,
+      "adamw_fused_dispatches": 26208,
       "adamw_eager_dispatches": 0,
-      "attention_block_flash_fused_dispatches": 840,
+      "attention_block_flash_fused_dispatches": 3276,
       "attention_block_flash_declined_dispatches": 0,
       "admission_is_dense": false,
-      "train_probe_series": [
-        1.0,
-        0.9997,
-        0.999518871307373
-      ],
       "tie_fraction": 0.0,
-      "final_epoch": 1,
-      "held_out_example_mean": 0.6931476593017578,
-      "held_out_count": 2,
-      "final_loss_diagnostic": 0.45491814613342285,
+      "final_epoch": 2,
+      "held_out_example_mean": 3.218041628599167,
+      "held_out_count": 128,
+      "final_loss_diagnostic": 2.8375,
       "trajectory": [
         {
           "epoch": 0,
-          "held_out_mean": 0.6931476593017578,
+          "held_out_mean": 3.1766814962029457,
           "held_out_tie_fraction": 0.0,
-          "held_out_batch_partition_sha256": "08fc5b466295898a0d182f131d50a6f49b6644f8606b3fb27e58ba6c45d2cd37"
+          "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
         },
         {
           "epoch": 1,
-          "held_out_mean": 0.6931476593017578,
+          "held_out_mean": 3.2259930223226547,
           "held_out_tie_fraction": 0.0,
-          "held_out_batch_partition_sha256": "08fc5b466295898a0d182f131d50a6f49b6644f8606b3fb27e58ba6c45d2cd37"
+          "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+        },
+        {
+          "epoch": 2,
+          "held_out_mean": 3.218041628599167,
+          "held_out_tie_fraction": 0.0,
+          "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
         }
+      ],
+      "train_probe_series": [
+        3.3236749470233917,
+        2.883917957544327,
+        2.741353064775467,
+        2.528276890516281
       ]
     }
   }

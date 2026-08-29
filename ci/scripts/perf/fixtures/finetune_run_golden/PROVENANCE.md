@@ -15,13 +15,20 @@ jammi-bench`, no `cuda` feature — CPU-hermetic, aarch64-apple-darwin) wrote
 to stdout, copied byte-for-byte (reformatted with `python3 -m json.tool`
 equivalent 2-space indent only — no field added, removed, or edited), never
 a second hand-typed field list standing in for the compiled binary's own
-`FinetuneRunTier` serde output. `modernbert_fused.json`/`modernbert_alloff.json`
-are a DOCUMENTED COMPOSITE of a real CPU-hermetic `finetune-run` execution's
-own identity/provenance/measurement fields with real dispatch-counter
-fields copied from the committed CUDA artifacts named in "Coordinator
-correction" below (no CUDA device or ModernBERT-large checkpoint exists in
-this environment to run a genuine `flash_compiled: true` leg against) —
-never hand-invented counts.
+`FinetuneRunTier` serde output. `modernbert_fused.json`/`modernbert_alloff.json` WERE a DOCUMENTED COMPOSITE
+of a real CPU-hermetic `finetune-run` execution's own identity/provenance/
+measurement fields with real dispatch-counter fields copied from the
+committed CUDA artifacts named in "Coordinator correction" below (no CUDA
+device or ModernBERT-large checkpoint existed in this environment to run a
+genuine `flash_compiled: true` leg against) — never hand-invented counts.
+THIS IS NOW HISTORICAL: unit-63 round-6 audit (docs-ci) SUPERSEDED both
+files with a real, single, producer-emitted `head_dim == 64` leg apiece —
+see "Supersession executed (unit-63 round-6 audit)" at the end of this file
+for the current, non-composite truth; the "Coordinator correction"/
+"Per-field consistency"/"Emittability status"/"Supersession plan" sections
+below are the DISCHARGED historical record of the composite this replaced,
+kept verbatim (append-only), never a description of the files' current
+content.
 
 `test_ab_merge.py`'s `_finetune_run_tier` loads `bert_fused.json`'s
 `tiers.finetune_run` block as its STRUCTURAL base (every field the real
@@ -104,7 +111,11 @@ positive training-path proof this arm needs, and the tiny fixture's
 `flash_compiled: false` is the WRONG shape for the `fused` arm's own
 premise entirely — see "Coordinator correction" below.
 
-## Coordinator correction (unit-63 round-3 audit)
+## Coordinator correction (unit-63 round-3 audit) — HISTORICAL, DISCHARGED
+
+Kept verbatim (append-only) as the record of the composite defect the
+"Supersession executed" section at the end of this file closed; describes
+the pre-round-6 composite files, NOT the files' current content.
 
 CONTRACT 63 Frame pre-registers the arms as "fused cascade vs
 ALLOFF=attention_block_flash,adamw_step_fused" — the A/B's own differential
@@ -206,7 +217,11 @@ CPU-hermetic environment can produce a real leg for it:
 | `kernels_disabled_requested` / `kernels_disabled_fired` | `["adamw_step_fused", "attention_block_flash"]` / same | composited (each source artifact independently confirms ITS OWN op firing as disabled; `finetune_run_ab.sh`'s own real invocation requests both at once) |
 | `attention_arm` | `"eager"` | an attention base (`attention_block_flash`) is in `kernels_disabled_requested` ⇒ `"eager"` (`attention_arm`'s own field doc) |
 
-## Per-field consistency (unit-63 round-4 audit F-1)
+## Per-field consistency (unit-63 round-4 audit F-1) — HISTORICAL, DISCHARGED
+
+Kept verbatim (append-only) as the record of the composite defect the
+"Supersession executed" section at the end of this file closed; describes
+the pre-round-6 composite files, NOT the files' current content.
 
 Round-3's "Coordinator correction" composite above was itself INTERNALLY
 CONTRADICTORY: `modernbert_fused.json`/`modernbert_alloff.json` composited
@@ -279,7 +294,11 @@ premise checking either one. `_finetune_run_tier`'s own hand-overridden
 `attention_block_flash_fused_dispatches`), so it is equally subject to this
 premise.
 
-## Emittability status (unit-63 round-5 audit)
+## Emittability status (unit-63 round-5 audit) — HISTORICAL, DISCHARGED
+
+Kept verbatim (append-only) as the record of the composite defect the
+"Supersession executed" section at the end of this file closed; describes
+the pre-round-6 composite files, NOT the files' current content.
 
 The round-4 correction above re-sourced exactly four fields —
 `backbone_dtype`, `device_name`, `provenance.target`, and
@@ -339,9 +358,11 @@ composite would trade one class of unemittable golden for another
 (invented numbers standing in for a real leg — the exact defect class this
 file exists to close). See "Supersession plan" below for the actual close.
 
-## Supersession plan
+## Supersession plan — HISTORICAL, DISCHARGED (see "Supersession executed" below)
 
-Both `modernbert_fused.json` and `modernbert_alloff.json` remain a STAGED
+Kept verbatim (append-only): this section PREDICTED the close this file's
+final section now RECORDS as executed. Both `modernbert_fused.json` and
+`modernbert_alloff.json` remained a STAGED
 CLOSURE, not a final state: the campaign's first real ModernBERT-large
 (`head_dim == 64`) `finetune-run` probe leg — run at the checkpoint,
 batch, and seq shape `finetune_run_ab.sh` actually invokes, for both the
@@ -396,3 +417,119 @@ Supersession plan above (a real ModernBERT-large probe leg replacing
 `modernbert_fused.json`/`modernbert_alloff.json` verbatim) subsumes this
 note the moment it executes -- that real leg's own producer will already
 emit `train_probe_series` natively, with no further patching needed.
+
+**Subsumed, unit-63 round-6 audit (docs-ci):** for `modernbert_fused.json`/
+`modernbert_alloff.json` this note is now HISTORICAL -- see "Supersession
+executed" below; both files' `train_probe_series` is now the real producer's
+own native emission (a 4-entry series, `epochs: 3` -> `[init, epoch0,
+epoch1, epoch2]`), never a patched-in value. This paragraph's own claim
+about `bert_fused.json` (a THIRD, separate golden, untouched by round-6) is
+unaffected and remains current.
+
+## Supersession executed (unit-63 round-6 audit, docs-ci)
+
+The "Supersession plan" above is DISCHARGED. `modernbert_fused.json` and
+`modernbert_alloff.json` are no longer a composite of anything: each is now
+ONE real `jammi-bench finetune-run` report, copied byte-for-byte (identity,
+provenance, premise, measurement, and dispatch-counter fields all sourced
+from that ONE leg's own emission — no field added, removed, edited, or
+cross-sourced from a second artifact), exactly the same "never a second
+hand-typed field list standing in for the compiled binary's own output"
+guarantee `bert_fused.json` has always carried, now extended to these two.
+
+Source (campaign, seed, git_sha, box):
+
+  * Campaign: `docs/plans/63-how-well/measurements/campaign-v2/` (v2; see
+    that directory's own `README.md` — status GREEN, `clean_seed_count`
+    12/12, no premise failures anywhere in the campaign).
+  * Seed: `1` — the first documented seed, chosen because its own
+    `finetune_run_ab_report.json::per_seed["1"]` entry reads
+    `legs: {fused_r1: OK, alloff_r1: OK, fused_r2: OK, alloff_r2: OK}`,
+    `leg_premise_violations: []`, `r1_r2_delta: {fused: 0.0, alloff: 0.0}`
+    — no anomaly on this seed's legs, and the campaign's own
+    `premise_failure_diagnostic.failed_seeds` is empty (no seed in the
+    whole campaign failed a premise, so seed 1 is not a special-cased
+    choice among clean seeds).
+  * `git_sha` the legs were run at (each leg's own `provenance.build_sha`):
+    `6f5874d49ba07db0b99eb4947f855c0e2c464219`.
+  * Box: `a100` (campaign-v2 `README.md`'s own descriptor); each leg's own
+    `tiers.finetune_run.device_name` independently confirms
+    `"NVIDIA A100-SXM4-80GB"`.
+  * Evidence path (the exact files copied verbatim):
+    `docs/plans/63-how-well/measurements/campaign-v2/raw/seed1__fused__r1.json`
+    -> `modernbert_fused.json`;
+    `docs/plans/63-how-well/measurements/campaign-v2/raw/seed1__alloff__r1.json`
+    -> `modernbert_alloff.json`. (`r1`, not `r2` — the FIRST repeat; the
+    campaign's own determinism-floor check already establishes `r1`/`r2`
+    are bit-identical for this seed, `r1_r2_delta: 0.0` both arms, so
+    either repeat is an equally valid representative leg.)
+
+Verbatim-copy proof (sha256 of the golden file == sha256 of the source
+evidence-path file, byte-for-byte, no reformatting needed — the campaign's
+own raw legs are already `json.dumps(..., indent=2)`-shaped, the same
+convention this fixture directory already uses):
+
+| golden file | sha256 | source file (same sha256) |
+|---|---|---|
+| `modernbert_fused.json` | `2586dfda89eaa9d5252e160b087c153d77f87c9bb32de9d6cfe61565ceccba51` | `campaign-v2/raw/seed1__fused__r1.json` |
+| `modernbert_alloff.json` | `fe690973eb55abbd9b4f3dbbc28f123f1291ec5eef4e854e2215228e7bfee5ed` | `campaign-v2/raw/seed1__alloff__r1.json` |
+
+Current, real premise/identity facts (both closing the two "Emittability
+status" contradictions above BY CONSTRUCTION, since a single real leg
+cannot disagree with itself):
+
+  * `checkpoint_config_sha256` now names the REAL ModernBERT-large
+    checkpoint (`hidden_size` implying `head_dim == 64`, the flash cascade's
+    own admitted domain — `jammi-encoders/src/modernbert.rs::FLASH_HEAD_DIM`),
+    never the CPU-hermetic `tiny_modernbert_ner` fixture's `head_dim == 16`
+    hash. Contradiction 1 (checkpoint vs. flash/attention-block counters) no
+    longer exists — this checkpoint is exactly the domain the nonzero
+    counters below require.
+  * `batch: 32`, `seq: 64`, `steps_measured: 234`, `epochs: 3` are this
+    ONE leg's own real, self-consistent shape — the dispatch counts below
+    are this leg's own measured output at this shape, never a literal
+    copied from a DIFFERENT shape's run. Contradiction 2 (batch/seq/
+    steps_measured arithmetic) no longer exists.
+  * `backbone_dtype: "bf16"`, `flash_compiled: true`, `device_name: "NVIDIA
+    A100-SXM4-80GB"`, `provenance.target: "x86_64-unknown-linux-gnu"`,
+    `provenance.build_features` / tier `build_features`:
+    `["bench-cuda", "cuda", "flash-attn"]` — all this leg's own emitted
+    values, not re-sourced from a second artifact.
+  * `train_probe_series` is this leg's own native 4-entry emission
+    (`epochs: 3` -> `[init, epoch0, epoch1, epoch2]`), never patched in
+    (see the "Subsumed" note above).
+
+Real dispatch counters (both legs, read directly off the committed files —
+no compositing, one source per field):
+
+| base | `modernbert_fused.json` (fused/declined-or-eager) | `modernbert_alloff.json` (fused/declined-or-eager) |
+|---|---|---|
+| `ln` | 6669 / 0 | 6669 / 0 |
+| `rope` | 0 / 0 (absorbed) | 0 / 0 (absorbed) |
+| `softmax` | 0 / 0 (absorbed) | 0 / 0 (absorbed) |
+| `geglu` | 3276 / 0 | 3276 / 0 |
+| `lora_epilogue` | 0 / 0 (superseded by `lora_linear`) | 0 / 0 |
+| `lora_linear` | 13104 / 0 | 13104 / 0 |
+| `attention_block` | 0 / 0 (absorbed by the flash cascade) | 3276 / 0 (the disabled flash cascade's own fallthrough — this arm's positive training-path proof) |
+| `attention_block_flash` (fused/declined) | 3276 / 0 (the admitted branch) | 0 / 3276 (`kernels_disabled_requested == kernels_disabled_fired == ["attention_block_flash"]`) |
+| `adamw` (fused/eager) | 26208 / 0 | 0 / 26208 (`kernels_disabled_requested` also names `"adamw_step_fused"`) |
+
+Both legs clear `ab_merge.finetune_run_dispatch_proof_violations` for their
+own arm cleanly (`[]` for `("fused", modernbert_fused)` and
+`("alloff", modernbert_alloff)`) — verified by execution,
+`python3 ci/scripts/perf/test_ab_merge.py`, `GoldenProducerAnchoredFieldSetTests`
+(all three tests) and the full suite (222 tests) both green. Per this
+file's own "Supersession plan" prediction: `GoldenProducerAnchoredFieldSetTests
+::test_golden_dispatch_pair_bases_equal_all_bases` re-verifies UNCHANGED
+against the replacement, exactly as predicted; the sibling test that used
+to be named `test_golden_modernbert_composites_clear_the_dispatch_proof_gate`
+also re-verifies its own assertions unchanged, and is renamed
+`test_golden_modernbert_real_legs_clear_the_dispatch_proof_gate` in the
+same round-6 change (its old name was a misnomer the moment the
+supersession executed -- "composites" no longer describes either golden).
+
+`docs/plans/63-how-well/CONTRACT.md`'s 2026-08-29 "Appended note" section
+(golden supersession plan) is DISCHARGED by this section; that note's own
+text is left exactly as originally recorded (append-only), with a dated
+postscript there recording this close, per this file's own established
+style for prior rounds.

@@ -207,6 +207,21 @@ gates this — the plan is this prose record plus the fixture's own
 `PROVENANCE.md` "Supersession plan" section, not a pinned-but-disabled
 test.
 
+**Postscript, 2026-08-29 (docs-ci, unit-63 round-6 audit): plan discharged.**
+The supersession above has EXECUTED: `modernbert_fused.json` and
+`modernbert_alloff.json` are each now ONE real, producer-emitted
+`jammi-bench finetune-run` leg — `docs/plans/63-how-well/measurements/campaign-v2/`
+(campaign v2, GREEN, `clean_seed_count` 12/12), seed 1 (chosen as the first
+documented seed; its own `per_seed["1"]` entry carries no premise
+violation), `git_sha 6f5874d49ba07db0b99eb4947f855c0e2c464219`, box `a100`
+— copied byte-for-byte from `campaign-v2/raw/seed1__fused__r1.json` /
+`seed1__alloff__r1.json` (sha256-verified equal to the committed golden
+files; see the fixture's own `PROVENANCE.md`, "Supersession executed"
+section, for the full field table and the two "Emittability status"
+contradictions this closes by construction). This note's own text above is
+left exactly as originally recorded (append-only); this postscript is the
+close of record.
+
 ## Amendment 2026-08-29b (lead, post-campaign-v1): probe bug fix + premise-failure handling + mutant dose ladder
 
 Basis (committed FIRST, auditable): docs/plans/63-how-well/measurements/campaign-v1/ at

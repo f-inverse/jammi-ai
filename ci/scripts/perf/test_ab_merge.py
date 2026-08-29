@@ -5511,5 +5511,87 @@ class DoseLadderCausesRuntimeCheckSurvivesDashOTests(unittest.TestCase):
         self.assertIn("dose_ladder_causes drifted from the committed DOSE_LADDER_EXIT_CAUSE_NAMES set", proc.stderr)
 
 
+class FinetuneRunStatusRuntimeGuardTests(unittest.TestCase):
+    """Unit-63 round-16 audit (identity-completeness): `build_finetune_run_
+    report`'s own status fold now assigns FROM the named `FINETUNE_RUN_
+    STATUS_*` constants (never a re-typed literal, see `ab_merge.py`'s own
+    doc above `FINETUNE_RUN_STATUSES`) AND carries a runtime membership
+    guard -- `status not in FINETUNE_RUN_STATUSES` raises `AssertionError`
+    immediately, at the point of production.
+
+    This is the producer-side belt the round-16 audit's exact falsifier
+    named: a status value the fold computes that is not a member of the
+    committed `FINETUNE_RUN_STATUSES` set must fail LOUDLY, never flow
+    silently into the artifact. Proven here WITHOUT hand-editing the fold's
+    own branches (which would require reverting a source edit between test
+    runs) by monkeypatching the module-level `FINETUNE_RUN_STATUSES` tuple
+    itself to a set that no longer contains the status a real, unmodified
+    fixture drives the fold to compute -- from the guard's own point of
+    view this is indistinguishable from "a fold branch assigns a status
+    outside the committed set", which is exactly the invariant under test.
+    """
+
+    def _write_clean_green_seed(self, raw_dir, seed, fused_mean, alloff_mean):
+        for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+            for repeat in ("r1", "r2"):
+                _write_finetune_run_leg(
+                    raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                )
+
+    def _write_green_fixture(self, raw_dir):
+        means = {
+            1: (0.30, 0.50),
+            2: (0.32, 0.48),
+            3: (0.29, 0.55),
+            4: (0.31, 0.47),
+            5: (0.28, 0.52),
+            6: (0.33, 0.49),
+            7: (0.27, 0.53),
+            8: (0.55, 0.40),
+            9: (0.52, 0.38),
+            10: (0.58, 0.42),
+            11: (0.50, 0.35),
+            12: (0.54, 0.39),
+        }
+        for seed, (fused_mean, alloff_mean) in means.items():
+            self._write_clean_green_seed(raw_dir, seed, fused_mean, alloff_mean)
+        return list(means.keys())
+
+    def test_guard_is_silent_on_the_real_unperturbed_vocabulary(self):
+        # Control: an ordinary GREEN merge, guard untouched, must not raise.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            seeds = self._write_green_fixture(raw_dir)
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, seeds, allow_missing_lr0_control=True)
+        self.assertEqual(merged["status"], "GREEN")
+
+    def test_a_status_outside_the_committed_set_raises_immediately(self):
+        # The falsifier: from the guard's perspective, a status value the
+        # fold computes that is missing from `FINETUNE_RUN_STATUSES` (here
+        # simulated by shrinking the committed set out from under a real
+        # GREEN-producing fixture, rather than hand-editing the fold's own
+        # branches) must raise AssertionError, never flow silently through.
+        original = ab_merge.FINETUNE_RUN_STATUSES
+        ab_merge.FINETUNE_RUN_STATUSES = tuple(s for s in original if s != "GREEN")
+        try:
+            with tempfile.TemporaryDirectory() as raw_dir:
+                seeds = self._write_green_fixture(raw_dir)
+                with self.assertRaises(AssertionError) as ctx:
+                    ab_merge.build_finetune_run_report(raw_dir, seeds, allow_missing_lr0_control=True)
+            self.assertIn("not a member of the committed FINETUNE_RUN_STATUSES", str(ctx.exception))
+            self.assertIn("'GREEN'", str(ctx.exception))
+        finally:
+            ab_merge.FINETUNE_RUN_STATUSES = original
+
+    def test_guard_restored_after_perturbation_is_silent_again(self):
+        # Belt-and-suspenders: the monkeypatch above must not leak between
+        # tests -- the SAME fixture is GREEN again once the constant is
+        # restored (proves the `finally` restore actually ran and this
+        # suite's own test isolation is real, not accidental ordering).
+        with tempfile.TemporaryDirectory() as raw_dir:
+            seeds = self._write_green_fixture(raw_dir)
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, seeds, allow_missing_lr0_control=True)
+        self.assertEqual(merged["status"], "GREEN")
+
+
 if __name__ == "__main__":
     unittest.main()

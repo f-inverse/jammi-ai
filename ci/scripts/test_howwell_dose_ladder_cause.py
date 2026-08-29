@@ -30,6 +30,20 @@ _SCRIPT = str(Path(__file__).resolve().parent / "howwell_dose_ladder_cause.py")
 _HOWWELL_SH = Path(__file__).resolve().parent / "runpod_gpu_howwell.sh"
 
 
+def _call_main_capturing_stdout(argv: list[str]) -> tuple[int, str]:
+    """Drives the real `namer.main(argv)` in-process, capturing its own
+    stdout -- used by `ReportReadHardeningTests` so the file-read hardening
+    is exercised through the REAL entry point (not a re-implementation of
+    its open/parse logic here)."""
+    import io
+    from contextlib import redirect_stdout
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = namer.main(argv)
+    return rc, buf.getvalue().strip()
+
+
 def _extract_status_case_arm_groups(script_text: str) -> list[frozenset[str]]:
     """Mechanically extracts `runpod_gpu_howwell.sh`'s own
     `case "$STATUS" in ... esac` arm patterns -- never a hand-copied literal
@@ -43,6 +57,14 @@ def _extract_status_case_arm_groups(script_text: str) -> list[frozenset[str]]:
     single-member set. Raises `AssertionError` if no `case "$STATUS"` block
     is found at all (a moved/renamed case statement must fail this test
     loudly, never silently report an empty, vacuously-passing set).
+
+    The catch-all `*)` arm is excluded by the arm-pattern regex's own
+    character class (`[A-Za-z0-9_|]+`, which does not include `*`) failing
+    to match that line at all -- `arm` is `None` for it and the `continue`
+    above already skips it; there is deliberately no SEPARATE `pattern ==
+    "*"` check below, since the regex itself already excludes it structurally
+    (a bare `*` line can never reach the point where `pattern` is bound to
+    the literal string `"*"` in the first place).
     """
     block = re.search(r'case\s+"\$STATUS"\s+in\n(.*?\n)\s*esac\b', script_text, re.DOTALL)
     if block is None:
@@ -52,10 +74,7 @@ def _extract_status_case_arm_groups(script_text: str) -> list[frozenset[str]]:
         arm = re.match(r"^\s*([A-Za-z0-9_|]+)\)", line)
         if arm is None:
             continue
-        pattern = arm.group(1)
-        if pattern == "*":
-            continue
-        groups.append(frozenset(pattern.split("|")))
+        groups.append(frozenset(arm.group(1).split("|")))
     return groups
 
 
@@ -192,7 +211,14 @@ class ShellStatusCaseArmsBoundToFinetuneRunStatusesTests(unittest.TestCase):
     ANYWHERE ELSE outside this one case block -- e.g. embedded in some other
     script's own log/error text, or read by a different consumer entirely.
     Only THIS case block's own named arms are bound to
-    `ab_merge.FINETUNE_RUN_STATUSES` here.
+    `ab_merge.FINETUNE_RUN_STATUSES` here. In particular, this suite does NOT
+    cover the OTHER drift direction (a `build_finetune_run_report` fold
+    branch that assigns a status never added to `FINETUNE_RUN_STATUSES` in
+    the first place) -- that is `ab_merge.py`'s own producer-side runtime
+    guard's job (the `status not in FINETUNE_RUN_STATUSES` check immediately
+    after the fold, unit-63 round-16 audit), a SEPARATE mechanism from this
+    shell-arm binding, exercised by `test_ab_merge.py`'s own
+    `FinetuneRunStatusRuntimeGuardTests`, not by anything here.
     """
 
     def test_shell_case_arms_exactly_cover_finetune_run_statuses(self):
@@ -201,6 +227,24 @@ class ShellStatusCaseArmsBoundToFinetuneRunStatusesTests(unittest.TestCase):
         self.assertEqual(shell_names, frozenset(ab_merge.FINETUNE_RUN_STATUSES))
 
     def test_shell_arm_grouping_matches_the_gating_green_record_only_partition(self):
+        # unit-63 round-16 audit advisory 2: this asserts the LITERAL
+        # `|`-joined arm grouping (e.g. `DRY_RUN|INCOMPLETE)` as ONE arm),
+        # never merely "these statuses end up handled the same way" in some
+        # looser, body-comparing sense. Deliberate, not an accidental gap: a
+        # shell rewrite that split `DRY_RUN|INCOMPLETE)` into two SEPARATE
+        # arms (`DRY_RUN) : ;;` and `INCOMPLETE) : ;;`) with byte-identical
+        # bodies is semantically a no-op today, but this test would (and
+        # should) still fail it -- verifying "same arm" is a simple,
+        # mechanical frozenset-membership check on the arm PATTERN alone;
+        # verifying "same arm OR two arms with textually-identical bodies"
+        # would require this helper to also parse and diff arm BODIES, a
+        # meaningfully more complex parser for a rewrite this codebase has
+        # never made and has no reason to prefer over just re-joining the
+        # pattern. The minimal honest choice is to keep the simple check and
+        # state the limitation here, not to grow the parser speculatively:
+        # if a real future edit legitimately wants two separately-bodied
+        # arms per status, that is a real code-shape change this test is
+        # right to force a look at, not a false positive to silently absorb.
         groups = _extract_status_case_arm_groups(_HOWWELL_SH.read_text())
         self.assertIn(frozenset(ab_merge.FINETUNE_RUN_GATING_STATUSES), groups)
         self.assertIn(frozenset({ab_merge.FINETUNE_RUN_GREEN_STATUS}), groups)
@@ -290,13 +334,21 @@ class MainEntryPointTests(unittest.TestCase):
         self.assertEqual(namer.main([]), 2)
         self.assertEqual(namer.main(["a", "b"]), 2)
 
-    def test_missing_file_subprocess_exits_nonzero(self):
+    def test_missing_file_subprocess_degrades_to_a_named_cause_rc_zero(self):
+        # unit-63 round-16 audit advisory 3: a missing REPORT_JSON_PATH used
+        # to crash with an uncaught FileNotFoundError (non-zero exit, empty
+        # stdout) -- exactly the opaque-collapse shape this repo's own
+        # "unknown (could not inspect ...)" wrapper text warns about one
+        # layer up. It now degrades to a NAMED cause on stdout, exit 0, same
+        # discipline as `_inspect_doses`/`_AB_MERGE_IMPORT_ERROR`.
         proc = subprocess.run(
             [sys.executable, _SCRIPT, "/nonexistent/path/does-not-exist.json"],
             capture_output=True,
             text=True,
         )
-        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(proc.returncode, 0, msg=f"stderr={proc.stderr!r}")
+        self.assertIn("report_unreadable(", proc.stdout)
+        self.assertIn("does-not-exist.json", proc.stdout)
 
     def test_valid_file_subprocess_prints_cause_and_exits_zero(self):
         report = {
@@ -342,6 +394,60 @@ class MainEntryPointTests(unittest.TestCase):
             Path(path).unlink()
         self.assertEqual(rc, 0)
         self.assertEqual(buf.getvalue().strip(), namer.dose_ladder_cause(report))
+
+
+class ReportReadHardeningTests(unittest.TestCase):
+    """Unit-63 round-16 audit advisory 3: `main()`'s own file open + JSON
+    parse used to sit entirely OUTSIDE the named-degradation discipline
+    `dose_ladder_cause`/`_inspect_doses`/`_AB_MERGE_IMPORT_ERROR` provide --
+    a missing/unreadable/malformed REPORT_JSON_PATH crashed straight into
+    `runpod_gpu_howwell.sh`'s own opaque wrapper, reachable regardless of
+    whether `ab_merge` itself imported cleanly (an independent failure
+    axis from `AbMergeImportFailureHardeningTests`, below). Both a missing
+    file and malformed JSON now degrade to a NAMED cause on stdout, exit 0,
+    driven through the REAL `main()` entry point directly (not merely
+    `dose_ladder_cause`, which never sees the raw file at all).
+    """
+
+    def test_missing_file_through_main_degrades_to_a_named_cause_rc_zero(self):
+        rc, stdout = _call_main_capturing_stdout(["/nonexistent/path/does-not-exist.json"])
+        self.assertEqual(rc, 0)
+        self.assertIn("report_unreadable(", stdout)
+        self.assertIn("does-not-exist.json", stdout)
+
+    def test_malformed_json_through_main_degrades_to_a_named_cause_rc_zero(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
+            fh.write("{not valid json at all")
+            path = fh.name
+        try:
+            rc, stdout = _call_main_capturing_stdout([path])
+        finally:
+            Path(path).unlink()
+        self.assertEqual(rc, 0)
+        self.assertIn("report_malformed_json(", stdout)
+
+    def test_a_directory_path_is_unreadable_not_a_crash(self):
+        # `open()` on a directory raises `IsADirectoryError` (an `OSError`
+        # subclass) -- the SAME `report_unreadable(...)` path a missing file
+        # takes, never a distinct uncaught exception shape.
+        with tempfile.TemporaryDirectory() as dir_path:
+            rc, stdout = _call_main_capturing_stdout([dir_path])
+        self.assertEqual(rc, 0)
+        self.assertIn("report_unreadable(", stdout)
+
+    def test_missing_file_subprocess_matches_direct_call(self):
+        # Cross-checks the subprocess-level assertion in
+        # `MainEntryPointTests.test_missing_file_subprocess_degrades_to_a_named_cause_rc_zero`
+        # against a direct in-process `main()` call -- proves the subprocess
+        # shape is not accidentally exercising a different code path.
+        rc, stdout = _call_main_capturing_stdout(["/nonexistent/path/does-not-exist.json"])
+        proc = subprocess.run(
+            [sys.executable, _SCRIPT, "/nonexistent/path/does-not-exist.json"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(rc, proc.returncode)
+        self.assertEqual(stdout, proc.stdout.strip())
 
 
 class AbMergeImportFailureHardeningTests(unittest.TestCase):

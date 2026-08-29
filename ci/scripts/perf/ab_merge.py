@@ -3066,8 +3066,12 @@ def mutant_dose_ladder_sensitivity(dose_columns):
     pair in caller order is NOT a degradation-direction straddle at all --
     `+0.50` reading RED is the two-sided-falsification finding (see
     `mutant_dose_ladder_two_sided_falsification`), and reporting it as
-    "sensitivity" would misrepresent an improvement-direction detection as a
-    degradation bound.
+    "sensitivity" would misrepresent a POSITIVE-eps (inflation-direction)
+    degradation detection (unit-63 round-9 audit finding 1: `"RED"` is
+    ALWAYS the degradation-concordant arm, never an "improvement-direction
+    detection" regardless of eps sign) as though it belonged to the
+    NEGATIVE-eps (deflation-direction) degradation-bound family this
+    statistic actually measures.
 
     Each dose's SIGNED eps is parsed from its own `dose_label` via
     `_dose_label_eps` (raises `MutantDoseLadderSensitivityError`, never

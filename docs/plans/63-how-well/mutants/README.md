@@ -350,8 +350,14 @@ comparison.
    shape a straddle needs) or, worse, misreport a cross-sign
    `(-0.10 not-detected, +0.50 RED)` run-order-adjacent pair as though it
    were a degradation-direction finding. `+0.50` reading RED is instead the
-   two-sided-falsification finding (confirming the Step-2 improvement
-   prediction), reported separately, never folded into sensitivity.
+   two-sided-falsification finding — and it REFUTES, not confirms, the
+   Step-2 improvement prediction (`"RED"` is always the DEGRADATION-
+   concordant arm; more effective lr made held-out loss worse, so the
+   secant extrapolation was wrong). Only a `+0.50` dose reading
+   `RED_FOR_INVESTIGATION`-shaped improvement CONFIRMS the prediction
+   (unit-63 round-9 audit finding 1, correcting round-8 finding 1's own
+   inverted-polarity phrasing, which survived here). Either outcome is
+   reported separately, never folded into sensitivity.
 8. Tear down the scratch worktree and its build artifacts after the legs
    complete; do not leave a patched binary or scratch checkout on the pod
    past the dose-leg run. Each patch is committed to this repo as a FILE
@@ -528,7 +534,14 @@ separate record.
   `"RED_FOR_INVESTIGATION"` is `"secant confirmed (improvement at +eps)"` —
   never a positive-eps `"RED"` described as "confirming" the improvement
   prediction; that inverted-polarity phrasing was unit-63 round-8 audit
-  finding 1, now corrected everywhere it appeared), never folded into
+  finding 1 — round-8 itself missed two survivors (this file's own on-pod
+  procedure step 7, and `ab_merge.mutant_dose_ladder_sensitivity`'s own
+  docstring), corrected by unit-63 round-9 audit finding 1, confirmed
+  corrected everywhere it appears by that round's own
+  `grep -rn -i 'confirm|refut'` / `'reading RED|reads RED|\+0.50'` sweep over
+  `ab_merge.py`, `test_ab_merge.py`, this file, and `CONTRACT.md` — a
+  completeness claim re-established by sweep each round it is touched,
+  never merely asserted), never folded into
   `sensitivity` (`ab_merge.mutant_dose_ladder_sensitivity` /
   `ab_merge.mutant_dose_ladder_two_sided_falsification`).
 - **Mutant legs never enter the primary A/B set**: proven structurally (the

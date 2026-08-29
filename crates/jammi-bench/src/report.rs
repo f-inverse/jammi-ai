@@ -2074,11 +2074,26 @@ pub struct FinetuneRunTier {
     pub kernels_disabled_fired: Vec<String>,
     pub flash_compiled: bool,
     pub build_features: Vec<&'static str>,
-    /// The PROCESS-resolved attention reference class
-    /// ([`crate::finetune_step::attention_arm`]) — what actually ran,
-    /// distinct from the caller's declared `arm` (mirrors
-    /// `FinetuneStepTier::attention_arm`'s own semantics), but PROVENANCE
-    /// here (not identity) for the same reason `arm` is.
+    /// The attention REFERENCE CLASS this process's `JAMMI_KERNELS_DISABLE`
+    /// resolved to ASK for ([`crate::finetune_step::attention_arm`]) —
+    /// `"eager"` iff an attention base (`attention_block`,
+    /// `attention_block_flash`, or the `"all"` wildcard) is in
+    /// `kernels_disabled_requested`, else `"fused"`. Deliberately NOT a
+    /// claim about what actually dispatched (unit 63 re-audit round-2
+    /// finding 2: this field's doc previously read "what actually ran",
+    /// which was false — it is derived purely from the REQUESTED env var,
+    /// the same as `FinetuneStepTier::attention_arm`'s own doc states of
+    /// itself). Distinct from the caller's declared `arm`
+    /// (`--arm`/[`Self::arm`], the higher-level fused-vs-alloff intent);
+    /// PROVENANCE here (not identity) for the same reason `arm` is — see
+    /// this struct's own doc. Whether the fused arm actually dispatched is
+    /// the `*_fused_dispatches`/`*_eager_dispatches` counter fields' and a
+    /// downstream merger's fused-proof job, exactly as
+    /// `FinetuneStepTier::attention_arm`'s own doc states of that tier
+    /// (mirrored here verbatim): "Deliberately NOT derived from the
+    /// `attention_block_*_dispatches` deltas ... whether the fused arm
+    /// actually ran stays where it already lives: `fused_proof` and the
+    /// counters themselves."
     pub attention_arm: String,
     /// How `run()`'s internal early-stopping validation slice was carved
     /// out of the TRAIN rows this tier fed it — `TrainingDataLoader::split`
@@ -2103,6 +2118,53 @@ pub struct FinetuneRunTier {
     /// measured step count computed a different amount of work by that
     /// tier's own design.
     pub steps_measured: usize,
+
+    // ── Fused-dispatch proof (unit 63 re-audit round-2 finding 2) ───────
+    //
+    // The SAME positive-proof channel `FinetuneStepTier` carries (identical
+    // field names, identical semantics, identical read APIs — see each
+    // sibling field's own doc there for the full rationale this block does
+    // not repeat) — a before/after delta over the process-wide dispatch
+    // counters taken around this run's WHOLE resume-cycled epoch loop (see
+    // `finetune_run::run`'s own comment on where the snapshots are taken).
+    // Like the counters on `FinetuneStepTier`, these are RECORDED
+    // measurements, never identity or provenance (not in
+    // `Self::IDENTITY_FIELDS` or `Self::PROVENANCE_FIELDS` — mirrors that
+    // struct's own convention of leaving its counters out of
+    // `FinetuneStepTier::IDENTITY_FIELDS` too): a downstream merger's
+    // fused-proof gate reads these directly, by name, rather than through
+    // either comparison tuple.
+    pub ln_fused_dispatches: u64,
+    pub ln_eager_dispatches: u64,
+    pub rope_fused_dispatches: u64,
+    pub rope_eager_dispatches: u64,
+    pub softmax_fused_dispatches: u64,
+    pub softmax_eager_dispatches: u64,
+    pub geglu_fused_dispatches: u64,
+    pub geglu_eager_dispatches: u64,
+    pub lora_epilogue_fused_dispatches: u64,
+    pub lora_epilogue_eager_dispatches: u64,
+    pub lora_linear_fused_dispatches: u64,
+    pub lora_linear_eager_dispatches: u64,
+    /// The positive-proof channel for THIS finding: how many times
+    /// ModernBERT's training-mode fused whole-attention-block kernel
+    /// actually dispatched across this run's whole resume-cycle. On a
+    /// `bert`-arch leg (this tier's generic CPU smoke fixture; ModernBert
+    /// is the C16 gate's real checkpoint family — see
+    /// `finetune_run::build_encoder_adapters`'s error message) this is
+    /// legitimately `0` forever: classic BERT has no fused
+    /// whole-attention-block kernel at all. On a `modernbert` leg that took
+    /// at least one optimizer step, this and the three sibling counters
+    /// below reading all-zero-at-once is the exact failure mode this
+    /// finding fixed — see `finetune_run::run`'s own belt-and-braces typed
+    /// refusal, which reads these same four counters before ever
+    /// constructing this tier.
+    pub attention_block_fused_dispatches: u64,
+    pub attention_block_eager_dispatches: u64,
+    pub adamw_fused_dispatches: u64,
+    pub adamw_eager_dispatches: u64,
+    pub attention_block_flash_fused_dispatches: u64,
+    pub attention_block_flash_declined_dispatches: u64,
 
     // ── Premise legs (CONTRACT H4: "recorded per run, conjunctive, for
     //    the merger to refuse on") ───────────────────────────────────────
@@ -3022,6 +3084,24 @@ mod tests {
             split_rule: "positional_fraction_split".to_string(),
             batched_forward: true,
             steps_measured: 3,
+            ln_fused_dispatches: 0,
+            ln_eager_dispatches: 0,
+            rope_fused_dispatches: 0,
+            rope_eager_dispatches: 0,
+            softmax_fused_dispatches: 0,
+            softmax_eager_dispatches: 0,
+            geglu_fused_dispatches: 0,
+            geglu_eager_dispatches: 0,
+            lora_epilogue_fused_dispatches: 0,
+            lora_epilogue_eager_dispatches: 0,
+            lora_linear_fused_dispatches: 0,
+            lora_linear_eager_dispatches: 0,
+            attention_block_fused_dispatches: 3,
+            attention_block_eager_dispatches: 0,
+            adamw_fused_dispatches: 3,
+            adamw_eager_dispatches: 0,
+            attention_block_flash_fused_dispatches: 0,
+            attention_block_flash_declined_dispatches: 0,
             admission_is_dense: false,
             learning_happened_delta: 0.1,
             tie_fraction: 0.0,

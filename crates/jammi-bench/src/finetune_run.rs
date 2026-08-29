@@ -454,7 +454,7 @@ fn build_encoder_adapters(
         init_mode: LoraInitMode::ZerosB,
         seed,
     };
-    let encoder = match model_type {
+    let mut encoder = match model_type {
         "modernbert" => {
             let cfg: jammi_encoders::ModernBertConfig = serde_json::from_str(&config_raw)?;
             let m = jammi_encoders::ModernBert::builder()
@@ -482,6 +482,28 @@ fn build_encoder_adapters(
             .into())
         }
     };
+    // Re-audit round-2 fix (unit 63 finding 2): `ModernBert::builder().build(..)` /
+    // `Bert::builder().build(..)` construct a FRESH encoder in EVAL mode
+    // (`training: false` at construction — see each builder's own `build`)
+    // — a plain `TrainingTarget::EncoderAdapters(..)` wrap of that fresh
+    // encoder therefore drives every forward through the EVAL attention
+    // path, and `ModernBertAttention::forward`'s `self.training` gate never
+    // reaches `forward_training_attention` at all, so the fused
+    // whole-attention-block kernel (the C16 A/B's entire measurand) cannot
+    // dispatch in EITHER arm — the fused leg is silently indistinguishable
+    // from a bug that always runs eval. `TrainingLoop::run()` itself never
+    // calls `set_training(true)` for the ordinary (non-GradCache)
+    // per-batch path either (only `mine_hard_negatives`/`run_gradcache_epoch`
+    // do, and neither applies to `EncoderAdapters`), so this call is NOT
+    // redundant with anything the trainer does today — mirrors
+    // `finetune_step.rs`'s own `build_fixture`'s `encoder.set_training(true)`
+    // call EXACTLY, so this tier's fresh-per-epoch build starts from the
+    // same training-mode precondition that tier's fixture always has. This
+    // is belt-and-braces alongside `run`'s own dispatch-counter proof below
+    // (`attention_block_fused_dispatches`/`attention_block_eager_dispatches`/
+    // `attention_block_flash_*`): a caller must not depend on either fix in
+    // isolation to catch a future regression in the other.
+    encoder.set_training(true);
     // A SECOND `LoraBuildConfig` (identical values) — `lora_build_1` above
     // was already MOVED into `.lora(...)`, and `AdapterConfig::from_build`
     // needs its own borrow; the type is a plain, cheap struct of scalars and
@@ -762,6 +784,29 @@ pub fn run(
     let mut last_final_loss = 0.0f64;
     let mut last_held_out = None;
 
+    // Fused-dispatch-proof channel (unit 63 re-audit round-2 finding 2):
+    // mirrors `finetune_step.rs::run`'s "before"/"after" dispatch-counter
+    // snapshot convention EXACTLY (same functions, same field names on the
+    // emitted tier — see `FinetuneRunTier`'s own field docs). Taken once
+    // around the WHOLE `epochs`-long resume-cycle below (not per epoch):
+    // this tier's counters describe "one full (seed, arm) fine-tune run",
+    // the same scope every other field on this tier is reported over, and
+    // every `training_loop.run(..)`/`evaluate_held_out(..)` call in the
+    // loop below (train steps, held-out eval, and the train-side probe)
+    // shares the SAME process-wide counters, so a single before/after pair
+    // here already covers all of them without double-counting or gaps.
+    let ln_dispatch_before = jammi_encoders::ln_dispatch_snapshot();
+    let rope_dispatch_before = jammi_encoders::rope_dispatch_snapshot();
+    let softmax_dispatch_before = jammi_encoders::softmax_dispatch_snapshot();
+    let geglu_dispatch_before = jammi_encoders::geglu_dispatch_snapshot();
+    let lora_epilogue_dispatch_before = jammi_lora::lora_epilogue_dispatch_snapshot();
+    let lora_linear_fused_dispatch_before = jammi_lora::lora_linear_fused_dispatch_snapshot();
+    let attention_block_dispatch_before = jammi_encoders::attention_block_dispatch_snapshot();
+    let adamw_dispatch_before =
+        jammi_kernels::admission::counters_for("adamw_step_fused").snapshot();
+    let attention_block_flash_dispatch_before =
+        jammi_encoders::attention_block_flash_dispatch_snapshot();
+
     for epoch_idx in 0..params.epochs {
         let varmap = VarMap::new();
         let (encoder, adapter_cfg) = build_encoder_adapters(
@@ -844,6 +889,116 @@ pub fn run(
         }
     }
 
+    // "After" half of the before/after pair taken above the loop — same
+    // mechanism, same field names `finetune_step.rs::run` emits.
+    let ln_dispatch_after = jammi_encoders::ln_dispatch_snapshot();
+    let rope_dispatch_after = jammi_encoders::rope_dispatch_snapshot();
+    let softmax_dispatch_after = jammi_encoders::softmax_dispatch_snapshot();
+    let geglu_dispatch_after = jammi_encoders::geglu_dispatch_snapshot();
+    let lora_epilogue_dispatch_after = jammi_lora::lora_epilogue_dispatch_snapshot();
+    let lora_linear_fused_dispatch_after = jammi_lora::lora_linear_fused_dispatch_snapshot();
+    let attention_block_dispatch_after = jammi_encoders::attention_block_dispatch_snapshot();
+    let adamw_dispatch_after =
+        jammi_kernels::admission::counters_for("adamw_step_fused").snapshot();
+    let attention_block_flash_dispatch_after =
+        jammi_encoders::attention_block_flash_dispatch_snapshot();
+
+    let ln_fused_dispatches = ln_dispatch_after
+        .fused
+        .saturating_sub(ln_dispatch_before.fused);
+    let ln_eager_dispatches = ln_dispatch_after
+        .eager
+        .saturating_sub(ln_dispatch_before.eager);
+    let rope_fused_dispatches = rope_dispatch_after
+        .fused
+        .saturating_sub(rope_dispatch_before.fused);
+    let rope_eager_dispatches = rope_dispatch_after
+        .eager
+        .saturating_sub(rope_dispatch_before.eager);
+    let softmax_fused_dispatches = softmax_dispatch_after
+        .fused
+        .saturating_sub(softmax_dispatch_before.fused);
+    let softmax_eager_dispatches = softmax_dispatch_after
+        .eager
+        .saturating_sub(softmax_dispatch_before.eager);
+    let geglu_fused_dispatches = geglu_dispatch_after
+        .fused
+        .saturating_sub(geglu_dispatch_before.fused);
+    let geglu_eager_dispatches = geglu_dispatch_after
+        .eager
+        .saturating_sub(geglu_dispatch_before.eager);
+    let lora_epilogue_fused_dispatches = lora_epilogue_dispatch_after
+        .fused
+        .saturating_sub(lora_epilogue_dispatch_before.fused);
+    let lora_epilogue_eager_dispatches = lora_epilogue_dispatch_after
+        .eager
+        .saturating_sub(lora_epilogue_dispatch_before.eager);
+    let lora_linear_fused_dispatches = lora_linear_fused_dispatch_after
+        .fused
+        .saturating_sub(lora_linear_fused_dispatch_before.fused);
+    let lora_linear_eager_dispatches = lora_linear_fused_dispatch_after
+        .eager
+        .saturating_sub(lora_linear_fused_dispatch_before.eager);
+    let attention_block_fused_dispatches = attention_block_dispatch_after
+        .fused
+        .saturating_sub(attention_block_dispatch_before.fused);
+    let attention_block_eager_dispatches = attention_block_dispatch_after
+        .eager
+        .saturating_sub(attention_block_dispatch_before.eager);
+    let adamw_fused_dispatches = adamw_dispatch_after
+        .fused
+        .saturating_sub(adamw_dispatch_before.fused);
+    let adamw_eager_dispatches = adamw_dispatch_after
+        .eager
+        .saturating_sub(adamw_dispatch_before.eager);
+    let attention_block_flash_fused_dispatches = attention_block_flash_dispatch_after
+        .fused
+        .saturating_sub(attention_block_flash_dispatch_before.fused);
+    let attention_block_flash_declined_dispatches = attention_block_flash_dispatch_after
+        .declined
+        .saturating_sub(attention_block_flash_dispatch_before.declined);
+
+    // Belt-and-braces typed refusal (unit 63 re-audit round-2 finding 2):
+    // ModernBert is the ONLY architecture with a fused whole-attention-block
+    // kernel at all (`bert.rs`'s own `set_training` never touches an
+    // attention-block admission path — see that module's doc; a `bert`-arch
+    // leg legitimately reads all four counters below as `0` forever, which
+    // is why this gate is scoped to `model_type == "modernbert"` and never
+    // fires for this crate's generic CPU smoke fixture). For a ModernBert
+    // leg that took at least one optimizer step, EVERY training-mode
+    // attention forward calls `admit` on exactly one of the block or flash
+    // cascade (`ModernBertAttention::forward`'s `self.training` branch,
+    // `forward_training_attention`'s doc) — so all four dispatch counters
+    // reading zero at once is not a legitimate "declined by domain" outcome
+    // (that reads `N eager / 0 fused`, never `0/0/0/0`), it is proof the
+    // encoder never entered training mode at all (this finding's root
+    // cause: a fresh `ModernBert::builder().build(..)` starts `training:
+    // false`, and neither `build_encoder_adapters` above nor
+    // `TrainingLoop::run`'s ordinary per-batch path used to flip it).
+    // Refusing loudly here beats silently emitting a plausible-looking
+    // report for a run that measured the eval path — this check does NOT
+    // depend on `encoder.set_training(true)` above (or any trainer-side
+    // fix) being correct: it reads the same counters a downstream merger's
+    // fused-proof gate reads, independent of how this process got there.
+    if model_type == "modernbert"
+        && cumulative_steps > 0
+        && attention_block_fused_dispatches == 0
+        && attention_block_eager_dispatches == 0
+        && attention_block_flash_fused_dispatches == 0
+        && attention_block_flash_declined_dispatches == 0
+    {
+        return Err(format!(
+            "finetune-run: fused-dispatch-proof failure — this ModernBert run took \
+             {cumulative_steps} optimizer step(s) but the training-mode attention path never \
+             dispatched in either arm (attention_block_fused_dispatches, \
+             attention_block_eager_dispatches, attention_block_flash_fused_dispatches, and \
+             attention_block_flash_declined_dispatches are all 0). The encoder was never in \
+             training mode, so this run measured the eval path, not the fine-tune step this \
+             tier claims to measure — INVALID run, not a datum."
+        )
+        .into());
+    }
+
     let held_out = last_held_out
         .ok_or("finetune-run: internal: no evaluate_held_out call landed on the final epoch")?;
     let first_probe = first_probe_mean.ok_or("finetune-run: internal: no epoch-0 train probe")?;
@@ -923,6 +1078,25 @@ pub fn run(
         split_rule: "positional_fraction_split".to_string(),
         batched_forward: true,
         steps_measured: cumulative_steps,
+
+        ln_fused_dispatches,
+        ln_eager_dispatches,
+        rope_fused_dispatches,
+        rope_eager_dispatches,
+        softmax_fused_dispatches,
+        softmax_eager_dispatches,
+        geglu_fused_dispatches,
+        geglu_eager_dispatches,
+        lora_epilogue_fused_dispatches,
+        lora_epilogue_eager_dispatches,
+        lora_linear_fused_dispatches,
+        lora_linear_eager_dispatches,
+        attention_block_fused_dispatches,
+        attention_block_eager_dispatches,
+        adamw_fused_dispatches,
+        adamw_eager_dispatches,
+        attention_block_flash_fused_dispatches,
+        attention_block_flash_declined_dispatches,
 
         admission_is_dense,
         learning_happened_delta: first_probe - last_probe,

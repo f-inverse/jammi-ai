@@ -309,6 +309,20 @@ pub struct FinetuneRunParams {
     pub target_modules: Vec<String>,
     pub backbone_dtype: jammi_numerics::ComputePrecision,
     pub max_seq_length: usize,
+    /// CALLER-declared premise for the `admission_is_dense` report field
+    /// (`--expect-dense`, default `false`, matching the committed fixture's
+    /// padded transport) — mirrors `arm`'s declared-vs-resolved posture, not
+    /// `expect_kernels_disabled`'s: this tier's real-text path drives
+    /// `encode_chunk`'s plain `encoder.forward`, which never reaches
+    /// `jammi_encoders::ModernBert::forward_with_lengths`'s dense-vs-padded
+    /// fork at all (see [`run`]'s own doc), so there is no live,
+    /// process-resolved signal on this tier's admission path to validate the
+    /// claim against the way `disabled_ops_requested()` validates
+    /// `expect_kernels_disabled`. The value is therefore recorded exactly as
+    /// stated, never measured — a downstream merger checks it against the
+    /// fixture's own known shape, the same way it checks any other
+    /// caller-declared premise leg.
+    pub expect_dense: bool,
     /// CUDA ordinal, or `None` for CPU (the CPU-hermetic smoke path).
     pub cuda_device: Option<usize>,
     /// Scratch directory this run's catalog sqlite file, artifact store, and
@@ -568,9 +582,8 @@ pub fn run(
         || !params.heldout_pairs.len().is_multiple_of(params.batch_size)
     {
         return Err(format!(
-            "finetune-run: {} held-out pairs is not a nonzero multiple of --batch {} (CONTRACT \
-             H1 v2 delta 2 — the seam refuses this too, but failing here names the fixture, not \
-             an opaque trainer error)",
+            "finetune-run: {} held-out pairs is not a nonzero multiple of --batch {} (the seam \
+             refuses this too, but failing here names the fixture, not an opaque trainer error)",
             params.heldout_pairs.len(),
             params.batch_size
         )
@@ -656,7 +669,7 @@ pub fn run(
         CreateTrainingJobParams {
             job_id: &job_id,
             base_model_id: &model_catalog_pk,
-            training_source: "jammi-bench finetune-run (unit 63 H4)",
+            training_source: "jammi-bench finetune-run",
             loss_type: match params.objective {
                 Objective::Triplet => "triplet",
                 Objective::Mnrl => "multiple_negatives_ranking",
@@ -832,15 +845,20 @@ pub fn run(
     let kernels_disabled_fired = jammi_kernels::admission::disabled_ops_fired();
     let resolved_attention_arm = attention_arm(&kernels_disabled_requested).to_string();
 
-    // v2 delta 8: the fixture's variable-length text pairs take the PADDED
-    // transport (never `admission.is_dense`) — pre-registered here rather
-    // than measured, because this tier's real-text path never calls
-    // `forward_with_lengths` at all (`encode_chunk`'s plain
+    // A DECLARED premise, not a measurement: this tier's real-text path
+    // never calls `forward_with_lengths` at all (`encode_chunk`'s plain
     // `encoder.forward` never routes through the dense-vs-padded fork
-    // `finetune_step.rs`'s `--row-lengths` leg exercises); recorded FALSE
-    // unconditionally so a downstream merger's conjunctive premise leg has
-    // a concrete, honestly-scoped fact to check rather than an inferred one.
-    let admission_is_dense = false;
+    // `finetune_step.rs`'s `--row-lengths` leg exercises), so there is no
+    // live `jammi_kernels::admission`/`jammi_encoders::CompactedBatch`
+    // signal on THIS tier's forward path to read back and check the caller
+    // against — unlike `kernels_disabled_requested`, which reads a real
+    // process-resolved env-var state. `params.expect_dense` is therefore
+    // recorded verbatim (CALLER-declared, default `false` matching the
+    // committed fixture's padded transport) so a downstream merger's
+    // conjunctive premise leg has a concrete, honestly-scoped, checkable
+    // fact rather than an inferred one — see `FinetuneRunParams::expect_dense`'s
+    // own doc.
+    let admission_is_dense = params.expect_dense;
 
     let max_grad_norm = (params.max_grad_norm > 0.0).then_some(params.max_grad_norm);
 

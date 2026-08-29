@@ -37,10 +37,9 @@ on:
         type: string
         default: "1,2,3,4,5,6,7,8,9,10,11,12"
       objective:
-        description: "mnrl or triplet (default: mnrl, CONTRACT amendment 2026-08-28's default-on-ties rule)."
-        required: false
+        description: "mnrl or triplet — the probe's objective selection. REQUIRED, no default: the choice must be made deliberately on every dispatch, never silently assumed (CONTRACT amendment 2026-08-28's default-on-ties rule governs how the MERGE step reads a tie, not this workflow's own selection)."
+        required: true
         type: string
-        default: "mnrl"
   pull_request:
     types: [labeled]
 
@@ -70,13 +69,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # workflow_dispatch's own `model_dir` input is required at the
-      # trigger level; the `pull_request: types: [labeled]` path carries no
-      # inputs at all, so a label-triggered run needs HOWWELL_MODEL_DIR set
-      # some other way (a repo variable, or dispatch is used instead) — this
-      # step refuses loudly rather than silently defaulting to a
-      # placeholder path a real pod would never have.
-      - name: Resolve HOWWELL_MODEL_DIR
+      # workflow_dispatch's own `model_dir`/`objective` inputs are required
+      # at the trigger level; the `pull_request: types: [labeled]` path
+      # carries no inputs at all, so a label-triggered run needs
+      # HOWWELL_MODEL_DIR/HOWWELL_OBJECTIVE set some other way (a repo
+      # variable, or dispatch is used instead) — this step refuses loudly
+      # rather than silently defaulting either one (a placeholder path a
+      # real pod would never have, or an unstated mnrl-vs-triplet choice the
+      # probe's selection must always be deliberate about).
+      - name: Resolve HOWWELL_MODEL_DIR / HOWWELL_OBJECTIVE
         id: resolve
         run: |
           MODEL_DIR="${{ github.event.inputs.model_dir }}"
@@ -86,6 +87,13 @@ jobs:
           fi
           echo "model_dir=$MODEL_DIR" >> "$GITHUB_OUTPUT"
 
+          OBJECTIVE="${{ github.event.inputs.objective }}"
+          if [ -z "$OBJECTIVE" ]; then
+            echo "::error::objective is required — set it via workflow_dispatch's own input (a run-howwell PR-label trigger carries no inputs and cannot supply one)."
+            exit 1
+          fi
+          echo "objective=$OBJECTIVE" >> "$GITHUB_OUTPUT"
+
       - name: Run the how-well A/B on a real A100
         id: howwell
         env:
@@ -94,7 +102,7 @@ jobs:
           GIT_REF: ${{ github.head_ref || github.ref_name }}
           HOWWELL_MODEL_DIR: ${{ steps.resolve.outputs.model_dir }}
           HOWWELL_SEEDS: ${{ github.event.inputs.seeds || '1,2,3,4,5,6,7,8,9,10,11,12' }}
-          HOWWELL_OBJECTIVE: ${{ github.event.inputs.objective || 'mnrl' }}
+          HOWWELL_OBJECTIVE: ${{ steps.resolve.outputs.objective }}
         run: |
           set +e
           bash ci/scripts/runpod_gpu_howwell.sh

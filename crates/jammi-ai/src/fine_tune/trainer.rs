@@ -2588,8 +2588,8 @@ impl TrainingLoop {
         if batch_size == 0 || !example_ids.len().is_multiple_of(batch_size) {
             return Err(JammiError::FineTune(format!(
                 "evaluate_held_out: {} held-out examples is not a multiple of batch_size {} \
-                 (v2 delta 2) — the committed held-out fixture must be sized so every batch \
-                 is full, fixing every example at the same batch_size - 1 in-batch negatives",
+                 — the committed held-out fixture must be sized so every batch is full, \
+                 fixing every example at the same batch_size - 1 in-batch negatives",
                 example_ids.len(),
                 batch_size
             )));

@@ -2010,7 +2010,9 @@ def _finetune_run_tier(arm="fused", **overrides):
     """A fully-populated `FinetuneRunTier`-shaped dict — every
     `FINETUNE_RUN_IDENTITY_FIELDS` entry, every `PROVENANCE_FIELDS` entry
     (report.rs), the three premise legs (`admission_is_dense`,
-    `learning_happened_delta`, `tie_fraction`), the measurement fields
+    `train_probe_series` -- amendment 2026-08-29b: the MERGER derives
+    `learning_happened_delta` from this raw series, never a pre-derived
+    scalar -- `tie_fraction`), the measurement fields
     (`final_epoch`, `held_out_example_mean`, `held_out_count`,
     `final_loss_diagnostic`, `trajectory`), and (unit-63 audit finding 2) a
     CLEAN `_FINETUNE_RUN_DISPATCH_COUNTERS` set matching `arm`. Defaults to
@@ -2082,9 +2084,12 @@ def _finetune_run_tier(arm="fused", **overrides):
         "split_rule": "positional_fraction_split",
         "batched_forward": True,
         "steps_measured": 100,
-        # premise legs
+        # premise legs (amendment 2026-08-29b: train_probe_series, index 0
+        # the untrained-init probe, one entry per epoch -- this tier's own
+        # default "epochs": 1 means 2 entries; the merger derives
+        # learning_happened_delta = series[0] - series[-1] = 0.05)
         "admission_is_dense": False,
-        "learning_happened_delta": 0.05,
+        "train_probe_series": [0.55, 0.5],
         "tie_fraction": 0.0,
         # measurements
         "final_epoch": 0,
@@ -2305,14 +2310,49 @@ class FinetuneRunArmPremiseMutantTests(unittest.TestCase):
         v = ab_merge.finetune_run_arm_premise_violations("fused", tier)
         self.assertTrue(any("admission_is_dense" in m for m in v), v)
 
-    def test_no_learning_happened_is_a_violation(self):
-        tier = _finetune_run_tier(learning_happened_delta=0.0)
-        v = ab_merge.finetune_run_arm_premise_violations("fused", tier)
-        self.assertTrue(any("learning_happened_delta" in m for m in v), v)
+    # amendment 2026-08-29b: the learning-happened premise is now DERIVED
+    # from the raw `train_probe_series` (series[0] - series[-1] > floor),
+    # never read off a pre-derived scalar. One mutant per typed refusal
+    # (floor-fail, missing-series, short-series, non-finite, v1-scalar-only)
+    # -- proving none of the five is vacuous.
 
-        tier2 = _finetune_run_tier(learning_happened_delta=-0.01)
+    def test_floor_fail_series_is_a_violation(self):
+        tier = _finetune_run_tier(train_probe_series=[0.5, 0.5])  # delta == floor, not strictly >
+        v = ab_merge.finetune_run_arm_premise_violations("fused", tier)
+        self.assertTrue(any("does not clear the floor" in m for m in v), v)
+
+        tier2 = _finetune_run_tier(train_probe_series=[0.5, 0.51])  # delta negative (got WORSE)
         v2 = ab_merge.finetune_run_arm_premise_violations("fused", tier2)
-        self.assertTrue(any("learning_happened_delta" in m for m in v2), v2)
+        self.assertTrue(any("does not clear the floor" in m for m in v2), v2)
+
+    def test_missing_series_is_a_violation(self):
+        tier = _finetune_run_tier(train_probe_series=None)
+        v = ab_merge.finetune_run_arm_premise_violations("fused", tier)
+        self.assertTrue(any("missing" in m for m in v), v)
+
+    def test_short_series_is_a_violation(self):
+        tier = _finetune_run_tier(train_probe_series=[0.5])
+        v = ab_merge.finetune_run_arm_premise_violations("fused", tier)
+        self.assertTrue(any("need at least 2" in m for m in v), v)
+
+    def test_non_finite_series_entry_is_a_violation(self):
+        tier = _finetune_run_tier(train_probe_series=[0.5, float("nan")])
+        v = ab_merge.finetune_run_arm_premise_violations("fused", tier)
+        self.assertTrue(any("non-finite" in m for m in v), v)
+
+        tier2 = _finetune_run_tier(train_probe_series=[0.5, float("inf")])
+        v2 = ab_merge.finetune_run_arm_premise_violations("fused", tier2)
+        self.assertTrue(any("non-finite" in m for m in v2), v2)
+
+    def test_v1_scalar_only_leg_is_invalid_never_readjudicated(self):
+        # A leg carrying the OLD scalar field with no series at all -- a
+        # producer-version mismatch (a v1-era report, e.g. the committed
+        # campaign-v1 evidence), never silently re-adjudicated under the
+        # corrected series-derived rule even though the OLD scalar itself
+        # would have cleared the floor.
+        tier = _finetune_run_tier(learning_happened_delta=0.05, train_probe_series=None)
+        v = ab_merge.finetune_run_arm_premise_violations("fused", tier)
+        self.assertTrue(any("producer-version mismatch" in m for m in v), v)
 
     def test_saturated_tie_fraction_is_a_violation(self):
         # C16's own hinge-saturation shape: tie_fraction -> 1.0.
@@ -3044,7 +3084,7 @@ class BuildFinetuneRunReportCrossSeedHomogeneityEndToEndTests(unittest.TestCase)
                 seed,
                 arm,
                 ab_merge.FINETUNE_RUN_LR0_REPEAT,
-                _finetune_run_tier(arm=arm, seed=seed, lr=0.0, learning_happened_delta=0.0),
+                _finetune_run_tier(arm=arm, seed=seed, lr=0.0, train_probe_series=[0.0, 0.0]),
             )
 
     def test_lr0_seeds_1_and_2_end_to_end_is_not_invalid(self):
@@ -3092,7 +3132,7 @@ class BuildFinetuneRunReportCrossSeedHomogeneityEndToEndTests(unittest.TestCase)
                     2,
                     arm,
                     ab_merge.FINETUNE_RUN_LR0_REPEAT,
-                    _finetune_run_tier(arm=arm, seed=2, lr=0.0, learning_happened_delta=0.0, schedule="cosine"),
+                    _finetune_run_tier(arm=arm, seed=2, lr=0.0, train_probe_series=[0.0, 0.0], schedule="cosine"),
                 )
             merged, _table = ab_merge.build_finetune_run_report(raw_dir, seeds, lr0_seeds=[1, 2])
         self.assertEqual(merged["status"], "INVALID")
@@ -3243,13 +3283,21 @@ class FinetuneRunLr0ControlTests(unittest.TestCase):
         # previously left `lr` at the SAME default the main A/B seeds use,
         # which never genuinely exercised the divergence this control's own
         # premise creates.
+        #
+        # amendment 2026-08-29b: `learning_happened_delta` (the caller's own
+        # desired DERIVED value, for readability at every call site below)
+        # is realized as a 2-entry `train_probe_series` -- `[delta, 0.0]` --
+        # so the merger's own `series[0] - series[-1]` derivation reproduces
+        # exactly the delta this test asks for, unless the caller already
+        # supplies its own `train_probe_series` override.
         overrides.setdefault("lr", 0.0)
+        overrides.setdefault("train_probe_series", [learning_happened_delta, 0.0])
         _write_finetune_run_leg(
             raw_dir,
             seed,
             arm,
             ab_merge.FINETUNE_RUN_LR0_REPEAT,
-            _finetune_run_tier(arm=arm, seed=seed, learning_happened_delta=learning_happened_delta, **overrides),
+            _finetune_run_tier(arm=arm, seed=seed, **overrides),
         )
 
     # unit-63 round-4 audit F-2: `finetune_run_lr0_control_seed_violations`'s
@@ -3406,6 +3454,319 @@ class FinetuneRunLr0ControlTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertEqual(merged["status"], "INVALID")
         self.assertIs(merged["lr0_control"]["allow_missing_lr0_control"], False)
+
+
+class PremiseFailureDiagnosticTests(unittest.TestCase):
+    """`premise_failure_diagnostic` (amendment 2026-08-29b item 1(c)):
+    ALWAYS present in the merged artifact, non-parameterised, and never
+    itself decisional -- it can only ever RECORD which premise leg(s) failed
+    on which leg, with that leg's raw `train_probe_series`, never promote an
+    INVALID verdict to GREEN.
+    """
+
+    def _write_clean_seed(self, raw_dir, seed, fused_mean=0.30, alloff_mean=0.50):
+        for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+            for repeat in ("r1", "r2"):
+                _write_finetune_run_leg(
+                    raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                )
+
+    def test_diagnostic_key_always_present_and_empty_on_a_clean_run(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_clean_seed(raw_dir, 1)
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, [1], allow_missing_lr0_control=True)
+        self.assertIn("premise_failure_diagnostic", merged)
+        self.assertEqual(merged["premise_failure_diagnostic"]["failed_seeds"], [])
+        self.assertEqual(merged["premise_failure_diagnostic"]["failing_legs"], [])
+
+    def test_campaign_v1_shaped_floor_fail_is_recorded_with_its_raw_series(self):
+        # Mirrors the committed campaign-v1 evidence's own root cause
+        # (docs/plans/63-how-well/measurements/campaign-v1/README.md): one
+        # seed's alloff leg fails the learning-happened premise while every
+        # other seed stays clean -- the diagnostic must name exactly that
+        # leg, exactly that premise, and carry its raw series.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_clean_seed(raw_dir, 1)
+            self._write_clean_seed(raw_dir, 2)
+            # seed 3's alloff leg: the series goes UP (spiked, never
+            # recovered net) -- a real floor-fail shape, not a contrived one.
+            for repeat in ("r1", "r2"):
+                _write_finetune_run_leg(
+                    raw_dir,
+                    3,
+                    "alloff",
+                    repeat,
+                    _finetune_run_tier(arm="alloff", seed=3, train_probe_series=[3.2276, 3.4211, 3.2447]),
+                )
+                _write_finetune_run_leg(raw_dir, 3, "fused", repeat, _finetune_run_tier(arm="fused", seed=3))
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, [1, 2, 3], allow_missing_lr0_control=True)
+
+        self.assertEqual(merged["status"], "INVALID")
+        diag = merged["premise_failure_diagnostic"]
+        self.assertEqual(diag["failed_seeds"], [3])
+        self.assertEqual(len(diag["failing_legs"]), 1)
+        entry = diag["failing_legs"][0]
+        self.assertEqual(entry["label"], "seed 3 alloff r1")
+        self.assertEqual(entry["pool"], "main")
+        self.assertEqual(entry["failing_premises"], ["learning_happened"])
+        self.assertEqual(entry["train_probe_series"], [3.2276, 3.4211, 3.2447])
+        # never decisional -- the diagnostic's own presence changes nothing
+        # about the (independently computed) status above.
+        self.assertIn("NEVER promote", diag["note"])
+        self.assertIn("NO operator override", diag["note"])
+
+    def test_v1_scalar_only_seed_is_invalid_and_recorded_in_diagnostic(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_clean_seed(raw_dir, 1)
+            for repeat in ("r1", "r2"):
+                _write_finetune_run_leg(
+                    raw_dir,
+                    2,
+                    "fused",
+                    repeat,
+                    _finetune_run_tier(arm="fused", seed=2, learning_happened_delta=0.05, train_probe_series=None),
+                )
+                _write_finetune_run_leg(raw_dir, 2, "alloff", repeat, _finetune_run_tier(arm="alloff", seed=2))
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, [1, 2], allow_missing_lr0_control=True)
+
+        self.assertEqual(merged["status"], "INVALID")
+        diag = merged["premise_failure_diagnostic"]
+        self.assertEqual(diag["failed_seeds"], [2])
+        entry = diag["failing_legs"][0]
+        self.assertEqual(entry["label"], "seed 2 fused r1")
+        self.assertEqual(entry["failing_premises"], ["learning_happened"])
+        self.assertIsNone(entry["train_probe_series"])
+        self.assertTrue(
+            any("producer-version mismatch" in v for v in merged["per_seed"]["2"]["leg_premise_violations"])
+        )
+
+    def test_lr0_control_learning_happened_failure_is_recorded_as_its_own_pool(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_clean_seed(raw_dir, 1)
+            for arm, series in (("fused", [0.0, 0.0]), ("alloff", [0.05, 0.0])):
+                _write_finetune_run_leg(
+                    raw_dir,
+                    101,
+                    arm,
+                    ab_merge.FINETUNE_RUN_LR0_REPEAT,
+                    _finetune_run_tier(arm=arm, seed=101, lr=0.0, train_probe_series=series),
+                )
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, [1], lr0_seeds=[101])
+
+        self.assertEqual(merged["status"], "INVALID")
+        diag = merged["premise_failure_diagnostic"]
+        self.assertIn(101, diag["failed_seeds"])
+        entry = next(e for e in diag["failing_legs"] if e["pool"] == "lr0-control")
+        self.assertEqual(entry["label"], "lr0 seed 101 alloff")
+        self.assertEqual(entry["failing_premises"], ["learning_happened"])
+        self.assertEqual(entry["train_probe_series"], [0.05, 0.0])
+
+
+def _mutant_tier(arm="fused", **overrides):
+    """A mutant leg's own tier -- a normal, premise-clean `fused` leg
+    (`_finetune_run_tier`) plus the three fields mutants/README.md's own
+    on-pod procedure records per leg (`mutant_id`, `base_sha`,
+    `patch_sha256`)."""
+    tier = _finetune_run_tier(arm=arm)
+    tier.update({
+        "mutant_id": "M2",
+        "base_sha": "4257cde6d51184475b3e798f5d7e9c3885a763ca",
+        "patch_sha256": "eps0-02-patch-sha",
+    })
+    tier.update(overrides)
+    return tier
+
+
+def _write_mutant_leg(raw_dir, seed, dose_label, tier):
+    _write_finetune_run_leg(raw_dir, seed, "fused", ab_merge.mutant_leg_repeat_tag(dose_label), tier)
+
+
+class MutantDoseLadderTests(unittest.TestCase):
+    """`build_mutant_dose_column`/`mutant_dose_ladder_sensitivity` (amendment
+    2026-08-29b item 3): each dose column merges the mutant-substituted
+    fused arm against the SAME campaign alloff legs under the SAME
+    `>=11/12`+mean-sign rule the primary decision uses; mutant legs never
+    enter the primary A/B set.
+    """
+
+    PATCH_SHA = "eps0-02-patch-sha"
+
+    def _write_alloff(self, raw_dir, seed, mean=0.50):
+        _write_finetune_run_leg(
+            raw_dir, seed, "alloff", "r1", _finetune_run_tier(arm="alloff", seed=seed, held_out_example_mean=mean)
+        )
+
+    def test_repeat_tag_never_collides_with_r1_r2_or_lr0(self):
+        for label in ("eps0.02", "", "r1", "r2", "lr0"):
+            tag = ab_merge.mutant_leg_repeat_tag(label)
+            self.assertNotIn(tag, ab_merge.FINETUNE_RUN_REPEATS)
+            self.assertNotEqual(tag, ab_merge.FINETUNE_RUN_LR0_REPEAT)
+
+    def test_detected_red_when_threshold_and_direction_match(self):
+        # 11 of 12 mutant legs read WORSE (higher held-out loss) than their
+        # SAME-SEED alloff leg -- the pre-registered degradation-concordant
+        # shape.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in range(1, 13):
+                self._write_alloff(raw_dir, seed, mean=0.50)
+                mutant_mean = 0.70 if seed != 12 else 0.30  # seed 12 dissents
+                _write_mutant_leg(raw_dir, seed, "eps0.50", _mutant_tier(seed=seed, held_out_example_mean=mutant_mean))
+            col = ab_merge.build_mutant_dose_column(raw_dir, "eps0.50", self.PATCH_SHA, list(range(1, 13)))
+        self.assertEqual(col["detected"], "RED")
+        self.assertEqual(col["n_pos"], 11)
+        self.assertEqual(col["n_neg"], 1)
+        self.assertGreater(col["mean_d"], 0.0)
+        self.assertEqual(col["clean_pair_count"], 12)
+        self.assertEqual(col["violations"], [])
+
+    def test_sign_flipping_transient_is_not_detected(self):
+        # mutants/README.md's own M1 finding, reproduced generically: an
+        # 8/12 split (well under the 11/12 threshold) reads not-detected,
+        # never RED -- "detects movement" is explicitly not this gate's claim.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in range(1, 13):
+                self._write_alloff(raw_dir, seed, mean=0.50)
+                mutant_mean = 0.55 if seed <= 8 else 0.45
+                _write_mutant_leg(raw_dir, seed, "m1-shaped", _mutant_tier(seed=seed, held_out_example_mean=mutant_mean))
+            col = ab_merge.build_mutant_dose_column(raw_dir, "m1-shaped", self.PATCH_SHA, list(range(1, 13)))
+        self.assertEqual(col["detected"], "not-detected")
+        self.assertEqual(col["n_pos"], 8)
+        self.assertEqual(col["n_neg"], 4)
+
+    def test_wrong_clean_pair_count_is_invalid(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in range(1, 12):  # only 11, not the pre-registered 12
+                self._write_alloff(raw_dir, seed, mean=0.50)
+                _write_mutant_leg(raw_dir, seed, "eps0.50", _mutant_tier(seed=seed, held_out_example_mean=0.70))
+            col = ab_merge.build_mutant_dose_column(raw_dir, "eps0.50", self.PATCH_SHA, list(range(1, 13)))
+        self.assertEqual(col["detected"], "INVALID")
+        self.assertEqual(col["clean_pair_count"], 11)
+        self.assertTrue(any("expected exactly" in v for v in col["violations"]), col["violations"])
+
+    def test_missing_provenance_field_is_a_violation(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_alloff(raw_dir, 1, mean=0.50)
+            _write_mutant_leg(
+                raw_dir, 1, "eps0.50", _mutant_tier(seed=1, held_out_example_mean=0.70, mutant_id=None)
+            )
+            col = ab_merge.build_mutant_dose_column(raw_dir, "eps0.50", self.PATCH_SHA, [1])
+        self.assertTrue(any("mutant_id" in v for v in col["violations"]), col["violations"])
+        self.assertIsNone(col["per_seed"]["1"]["d_i"])
+
+    def test_patch_sha256_mismatch_is_refused(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_alloff(raw_dir, 1, mean=0.50)
+            _write_mutant_leg(
+                raw_dir,
+                1,
+                "eps0.50",
+                _mutant_tier(seed=1, held_out_example_mean=0.70, patch_sha256="some-other-sha"),
+            )
+            col = ab_merge.build_mutant_dose_column(raw_dir, "eps0.50", self.PATCH_SHA, [1])
+        self.assertTrue(any("does not match this dose column" in v for v in col["violations"]), col["violations"])
+        self.assertIsNone(col["per_seed"]["1"]["d_i"])
+
+    def test_mutant_leg_never_leaks_into_the_ab_set(self):
+        # A mutant leg is written under the SAME raw_dir, SAME seeds, as a
+        # clean 12-seed main A/B sweep -- the merger's own decision must be
+        # bit-for-bit identical to a run with NO mutant legs present at all.
+        # 6-vs-6 (mixed sign) keeps the decision GREEN, isolating this test's
+        # own claim (no leakage) from the unrelated decision-rule mutants.
+        means = {s: (0.30, 0.50) for s in range(1, 7)}
+        means.update({s: (0.55, 0.40) for s in range(7, 13)})
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed, (fused_mean, alloff_mean) in means.items():
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                # a mutant leg for this SAME seed, wildly different mean --
+                # if it ever leaked into the A/B loader, this would change
+                # d_values/the decision.
+                _write_mutant_leg(raw_dir, seed, "eps0.50", _mutant_tier(seed=seed, held_out_example_mean=9.99))
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, list(range(1, 13)), allow_missing_lr0_control=True)
+        self.assertEqual(merged["status"], "GREEN")
+        for seed in range(1, 7):
+            self.assertAlmostEqual(merged["d_values"][str(seed)], -0.20)
+        for seed in range(7, 13):
+            self.assertAlmostEqual(merged["d_values"][str(seed)], 0.15)
+
+    def test_sensitivity_finds_the_straddling_pair(self):
+        low = {"dose_label": "eps0.02", "detected": "not-detected"}
+        mid = {"dose_label": "eps0.10", "detected": "not-detected"}
+        high = {"dose_label": "eps0.50", "detected": "RED"}
+        sensitivity = ab_merge.mutant_dose_ladder_sensitivity([low, mid, high])
+        self.assertEqual(sensitivity, {"lower": "eps0.10", "higher": "eps0.50"})
+
+    def test_sensitivity_is_none_when_no_dose_is_detected(self):
+        columns = [{"dose_label": f"eps{i}", "detected": "not-detected"} for i in range(3)]
+        self.assertIsNone(ab_merge.mutant_dose_ladder_sensitivity(columns))
+
+    def test_cli_wiring_folds_the_dose_ladder_into_the_same_artifact(self):
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                # 6-vs-6 (mixed sign) -- a GREEN main decision, isolating
+                # this test's own claim (the dose ladder folds into the
+                # SAME artifact, exit 0) from the decision-rule mutants.
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                mutant_mean = 0.70 if seed != 12 else 0.30
+                _write_mutant_leg(raw_dir, seed, "eps0.50", _mutant_tier(seed=seed, held_out_example_mean=mutant_mean))
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            mutant_spec = f"eps0.50:{self.PATCH_SHA}:{seeds_s}"
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    mutant_spec,
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 0)  # GREEN main decision + a RED (successfully-detecting) dose is not itself a script FAIL
+        self.assertIn("mutant_dose_ladder", merged)
+        self.assertEqual(len(merged["mutant_dose_ladder"]["doses"]), 1)
+        self.assertEqual(merged["mutant_dose_ladder"]["doses"][0]["detected"], "RED")
+
+    def test_cli_wiring_fails_on_an_invalid_dose_column(self):
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                # 6-vs-6 (mixed sign) -- a GREEN main decision, isolating
+                # this test's own claim (an INVALID dose column alone fails
+                # the merge's exit code) from the main decision rule.
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                if seed <= 11:  # only 11 mutant legs -- wrong clean pair count
+                    _write_mutant_leg(raw_dir, seed, "eps0.50", _mutant_tier(seed=seed, held_out_example_mean=0.70))
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            mutant_spec = f"eps0.50:{self.PATCH_SHA}:{seeds_s}"
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    mutant_spec,
+                ]
+            )
+        self.assertEqual(rc, 1)
 
 
 if __name__ == "__main__":

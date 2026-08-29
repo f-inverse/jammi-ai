@@ -125,7 +125,15 @@ _TEMPLATE_UNIT_BRANCH = "_branch_"
 # every object it parses (via the same brace walker) before looking again.
 _FENCE_JSON_RE = re.compile(r"```json\s*", re.IGNORECASE)
 _VERDICT_TAG_RE = re.compile(r"\\?<verdict\\?>")
+# The lead's dispatch prompt names the unit under one of several shapes.
+# `^[ \t]*unit:` (line-anchored) is tried first; `unit_branch:` / bare
+# `unit_branch ` occurring ANYWHERE in the prompt (not line-anchored) are
+# tried next, in that order — these are the shapes an audit of real
+# dispatch prompts found the lead actually writing (the line-anchored form
+# alone bound 0/126 real Starts; 12/625 prompts carried `^unit:` at all).
 _UNIT_LINE_RE = re.compile(r"^[ \t]*unit:[ \t]*(\S+)", re.MULTILINE)
+_UNIT_BRANCH_COLON_RE = re.compile(r"unit_branch:\s*(\S+)")
+_UNIT_BRANCH_BARE_RE = re.compile(r"unit_branch\s+(\S+)")
 
 
 def _last_marker_end_string_aware(pattern: re.Pattern, text: str) -> int | None:
@@ -192,13 +200,42 @@ def _extract_first_json_object(s: str, start: int = 0) -> dict | None:
     return _extract_json_object_span(s, start)[0]
 
 
+def _normalize_unit_branch(raw: str | None) -> tuple[str | None, str | None]:
+    """Normalize a reported `unit_branch` to its LEADING (first
+    whitespace-delimited) token — BEFORE template-checking and BEFORE
+    binding. Every verifier card's own schema line instructs "say which"
+    (a provenance parenthetical after the branch, e.g. `"feat/x (from
+    git)"`), and the annotated shape is exactly what real verifiers
+    produce; the bare `" " in ub` template check used to reject it
+    outright. The annotation — everything after the first whitespace run —
+    is preserved separately as a note, never folded into the anchor a
+    second-round dispatch is matched against (`_block_named_in_text`
+    whole-token-matches on the BARE token only). A raw value that is only
+    whitespace normalizes to `(None, None)` exactly like an absent field."""
+    if not isinstance(raw, str):
+        return None, None
+    parts = raw.strip().split(None, 1)
+    if not parts:
+        return None, None
+    token = parts[0]
+    note = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
+    return token, note
+
+
 def _looks_like_template(data: dict) -> bool:
     """A parsed object that is the verifier CARD'S OWN SCHEMA TEMPLATE
     (echoed after — or instead of — a real verdict) is not a real verdict,
-    even though it parses as valid JSON."""
+    even though it parses as valid JSON. `unit_branch` is checked on its
+    LEADING TOKEN (see `_normalize_unit_branch`) so a real, annotated
+    branch — `"feat/x (from git)"` — is never mistaken for the literal
+    `"<...>"` schema placeholder merely because it, too, contains a space;
+    a leading token that still carries `<`/`>` (the literal placeholder
+    itself always does — it opens with `<`) remains template."""
     ub = data.get("unit_branch")
-    if isinstance(ub, str) and (ub == _TEMPLATE_UNIT_BRANCH or "<" in ub or ">" in ub or " " in ub):
-        return True
+    if isinstance(ub, str):
+        token, _note = _normalize_unit_branch(ub)
+        if token is not None and (token == _TEMPLATE_UNIT_BRANCH or "<" in token or ">" in token):
+            return True
     ce = data.get("class_enumeration")
     if isinstance(ce, list) and any(isinstance(x, str) and x.strip() == "path:line" for x in ce):
         return True
@@ -267,7 +304,8 @@ def parse_verdict_fields(data: dict | None) -> dict:
     sweep_method = data.get("sweep_method") if data else None
     exhaustive = bool(data.get("exhaustive", False)) if data else False
     enumeration_missing = (not data) or ("class_enumeration" not in data) or (len(class_enum) == 0)
-    unit_branch = data.get("unit_branch") if data else None
+    unit_branch_raw = data.get("unit_branch") if data else None
+    unit_branch, unit_branch_note = _normalize_unit_branch(unit_branch_raw)
     head_sha = data.get("head_sha") if data else None
     worktree = data.get("worktree") if data else None
 
@@ -285,7 +323,8 @@ def parse_verdict_fields(data: dict | None) -> dict:
         "sweep_method": sweep_method,
         "exhaustive": exhaustive,
         "enumeration_missing": enumeration_missing,
-        "unit_branch": unit_branch if isinstance(unit_branch, str) else None,
+        "unit_branch": unit_branch,
+        "unit_branch_note": unit_branch_note,
         "head_sha": head_sha if isinstance(head_sha, str) else None,
         "worktree": worktree if isinstance(worktree, str) else None,
         "finding_locations": finding_locations,
@@ -498,7 +537,13 @@ def _diagnose_row(row: dict) -> str:
         reason = row.get("unparseable_reason") or "no valid verdict block found"
         return f" [UNPARSEABLE: {reason}]"
     raw = row.get("verdict_raw")
-    if raw is not None and raw not in _PASS_LIKE:
+    # `raw == "BLOCK"` is the RECOGNIZED literal spelling for every card
+    # whose vocabulary is `BLOCK | PASS` (adversarial-audit,
+    # citation-checker, discipline-test-auditor) — it must never be
+    # reported as "unrecognized ... defaulted to BLOCK"; that label is for
+    # a raw value outside a card's own vocabulary, not the vocabulary's own
+    # BLOCK spelling normalizing to the BLOCK verdict by construction.
+    if raw is not None and raw != "BLOCK" and raw not in _PASS_LIKE:
         return f" [unrecognized verdict value {raw!r} defaulted to BLOCK]"
     if row.get("_corrupted"):
         return " [state row corrupted — treated as BLOCK]"
@@ -671,6 +716,14 @@ def handle_start(payload: dict, sdir: Path) -> None:
         m = _UNIT_LINE_RE.search(prompt)
         if m:
             unit_branch = m.group(1)
+        else:
+            for pat in (_UNIT_BRANCH_COLON_RE, _UNIT_BRANCH_BARE_RE):
+                m = pat.search(prompt)
+                if m:
+                    unit_branch = m.group(1)
+                    break
+    if unit_branch:
+        unit_branch, _note = _normalize_unit_branch(unit_branch)
     if not unit_branch:
         unit_branch = "UNBOUND"
 
@@ -681,12 +734,64 @@ def handle_start(payload: dict, sdir: Path) -> None:
 
 
 # --------------------------------------------------------------------------
-# SubagentStop — write exactly one validated row per stop.
+# SubagentStop — write exactly one validated row per stop, and ONLY for a
+# verifier-typed stop (STOP_MATCH_TYPES) — the settings.json SubagentStop
+# `matcher` is meant to restrict invocation to this same set already, but
+# the closed-world check is re-asserted HERE, inside the handler, as
+# defense in depth: a matcher that does not filter as intended (e.g. because
+# the payload's agent-type field travels under a spelling the matcher
+# pattern doesn't anticipate) must not turn every non-verifier Stop event
+# into an UNBOUND-bucket write. This is a closed-world MEMBERSHIP check
+# only — never a free-text predicate — and it only ever SUPPRESSES a write;
+# it can never deny anything (`stop` remains exit-0 always).
 # --------------------------------------------------------------------------
 
+# `all_open_blocks` re-reads and JSON-parses the WHOLE contents of every
+# `<unit>.jsonl` file on every dispatch. An UNBOUND.jsonl that has
+# accumulated to megabytes (every stop whose unit could not be resolved —
+# most commonly, historically, a non-verifier stop that reached this
+# handler before the STOP_MATCH_TYPES filter above existed — lands here)
+# turns every future dispatch into a multi-megabyte parse. The cap is
+# generous (2 MiB — comfortably past any single session's worth of
+# legitimately-UNBOUND verifier rows, so it never fires on ordinary
+# traffic) purely to bound the READ cost of a state directory that
+# accumulated before this fix landed.
+_UNBOUND_ROTATE_CAP_BYTES = 2 * 1024 * 1024
+
+
+def _rotate_unbound_if_oversized(sdir: Path) -> None:
+    """One-time migration, safe to call on every `stop` invocation: if the
+    live `UNBOUND.jsonl` has grown past the cap, move it out of the LIVE
+    `.jsonl` glob to a `.jsonl.1` sibling — `all_open_blocks`'s `entry.
+    suffix != ".jsonl"` check already skips any file whose suffix is not
+    exactly `.jsonl`, so the rotated sibling is invisible to it without any
+    further change. This is a no-op for gate correctness: UNBOUND rows were
+    never load-bearing for any gate decision (advisory-only), only for
+    per-invocation read cost. Runs BEFORE the STOP_MATCH_TYPES filter below
+    so a session that already carries an oversized file is rotated on its
+    very first post-deploy `stop`, not stuck re-parsing it until its NEXT
+    growth past the cap."""
+    path = unit_file(sdir, "UNBOUND")
+    try:
+        if path.exists() and path.stat().st_size > _UNBOUND_ROTATE_CAP_BYTES:
+            path.replace(path.parent / (path.name + ".1"))
+    except OSError:
+        pass
+
+
 def handle_stop(payload: dict, sdir: Path) -> None:
-    agent_id = _first_str(payload, ("agent_id", "id", "subagent_id")) or "UNKNOWN"
+    _rotate_unbound_if_oversized(sdir)
+
     agent_type = _first_str(payload, ("agent_type", "subagent_type")) or ""
+    if agent_type not in STOP_MATCH_TYPES:
+        # Closed-world membership, never a free-text RED: a non-verifier
+        # stop writes NOTHING (no unit row, no UNBOUND append) — early
+        # return before any parsing or binding-lookup work. A session
+        # carries roughly 2700 non-subagent Stop-shaped events; a RED arm
+        # here (rather than a silent skip) would jam nearly all of them.
+        return
+
+    agent_id = _first_str(payload, ("agent_id", "id", "subagent_id")) or "UNKNOWN"
     last_msg = _first_str(payload, ("last_assistant_message", "last_assistant_message_text")) or ""
 
     data, invalid_reason = extract_verdict_json(last_msg)
@@ -707,7 +812,8 @@ def handle_stop(payload: dict, sdir: Path) -> None:
 
     append_jsonl(unit_file(sdir, unit_branch), {
         "ts": now_iso(), "agent_id": agent_id, "agent_type": agent_type,
-        "unit_branch": unit_branch, "head_sha": fields["head_sha"],
+        "unit_branch": unit_branch, "unit_branch_note": fields["unit_branch_note"],
+        "head_sha": fields["head_sha"],
         "worktree": fields["worktree"],
         "verdict": verdict, "verdict_raw": verdict_raw,
         "unparseable_reason": invalid_reason if verdict == "UNPARSEABLE" else None,

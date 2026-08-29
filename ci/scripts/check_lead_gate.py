@@ -416,6 +416,136 @@ def fixture_g15_whole_token_anchors_never_raw_substrings() -> None:
 
 
 # ==========================================================================
+# T1-T4 — "a compliant verdict binds to its unit" (capability commit 1).
+# ==========================================================================
+
+_CARD_NAMES = (
+    "adversarial-audit", "acceptance-verifier", "citation-checker",
+    "discipline-test-auditor", "fix-verifier", "oracle", "pressure-tester",
+)
+_VERIFIER_SECOND_ROUND = {"adversarial-audit", "fix-verifier", "acceptance-verifier"}
+
+# The literal shape every card's own schema line now instructs (a BARE
+# `unit_branch` token plus a separate `unit_branch_source` provenance
+# note) — matched against the REAL card text, never hand-typed, so this
+# fixture tracks whatever the card's CURRENT wording is rather than a
+# hand-typed guess (the failure mode that let the original bug — the
+# annotated "say which" shape being rejected as a template — ship
+# unnoticed: the pre-existing V1 fixture used a synthetic `"<branch>"`
+# stand-in that never matched what a real verifier actually produces).
+_CARD_UNIT_BRANCH_LINE_RE = re.compile(
+    r'^[ \t]*"unit_branch":\s*"[^"]*",\s*"unit_branch_source":\s*"[^"]*",?[ \t]*$',
+    re.MULTILINE,
+)
+
+
+def fixture_t1_card_schema_line_substituted_binds() -> None:
+    """For EACH of the 7 verifier cards: scrape the card's OWN literal
+    schema line, substitute a real branch/source into it exactly as a
+    verifier filling in the template would, and confirm the resulting
+    verdict BINDS — files under the real branch, never UNPARSEABLE
+    (template), never UNBOUND. For the 3 cards the PreToolUse gate actually
+    re-dispatches on (`_VERIFIER_SECOND_ROUND`), also confirm a second
+    dispatch naming that exact branch is denied — proof this is a REAL
+    bind, not merely a stored string."""
+    for name in _CARD_NAMES:
+        text = (AGENTS_DIR / f"{name}.md").read_text()
+        m = _CARD_UNIT_BRANCH_LINE_RE.search(text)
+        _assert(m is not None, "T1",
+                f"{name}.md must carry the bare-branch unit_branch schema line "
+                "(\"unit_branch\": \"...\", \"unit_branch_source\": \"...\",)")
+        real_branch = f"feat/tcard-{name}"
+        line = m.group(0)
+        substituted = re.sub(r'"unit_branch":\s*"[^"]*"', f'"unit_branch": "{real_branch}"', line)
+        substituted = re.sub(r'"unit_branch_source":\s*"[^"]*"', '"unit_branch_source": "git"', substituted)
+        substituted = substituted.strip()
+        if substituted.endswith(","):
+            substituted = substituted[:-1]
+        msg = ("```json\n{\"kind\": \"verdict\", \"verdict\": \"BLOCK\", "
+               + substituted + ", \"findings\": []}\n```")
+        root = _fresh_root()
+        row = _stop_and_read(root, msg, agent_type=name)
+        _assert(row is not None, "T1", f"[{name}] expected a row")
+        _assert(row["verdict"] != "UNPARSEABLE", "T1",
+                f"[{name}] a schema-line-substituted real branch must NOT be treated as a "
+                f"template, got verdict={row['verdict']!r} reason={row.get('unparseable_reason')!r}")
+        _assert(row.get("unit_branch") == real_branch, "T1",
+                f"[{name}] unit_branch must bind to the bare branch, got {row.get('unit_branch')!r}")
+        if name in _VERIFIER_SECOND_ROUND:
+            p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+                "subagent_type": name, "prompt": f"re-check unit: {real_branch}"}}, root)
+            _assert(p.returncode == 2, "T1",
+                    f"[{name}] a second dispatch naming the bound unit_branch must be denied, "
+                    f"got {p.returncode}: {p.stderr}")
+
+
+def fixture_t2_annotated_legacy_unit_branch_binds() -> None:
+    """Backward compatibility with in-flight transcripts: an annotated
+    legacy-shape `unit_branch` — `"<branch> (from git)"`, the pre-fix
+    producer output every card's OLD "say which" wording actually elicited
+    — must ALSO bind via leading-token normalization, with the parenthetical
+    preserved as `unit_branch_note`, never dropped silently and never
+    causing a template misclassification."""
+    root = _fresh_root()
+    real_branch = "feat/t2-legacy"
+    v = {"kind": "verdict", "verdict": "BLOCK", "unit_branch": f"{real_branch} (from git)", "findings": []}
+    msg = "```json\n" + json.dumps(v) + "\n```"
+    row = _stop_and_read(root, msg, agent_type="adversarial-audit")
+    _assert(row is not None, "T2", "expected a row")
+    _assert(row["verdict"] != "UNPARSEABLE", "T2",
+            f"an annotated-but-real unit_branch must NOT be treated as a template, got "
+            f"{row['verdict']!r} ({row.get('unparseable_reason')!r})")
+    _assert(row.get("unit_branch") == real_branch, "T2",
+            f"leading-token normalization must strip the parenthetical, got {row.get('unit_branch')!r}")
+    _assert(row.get("unit_branch_note") == "(from git)", "T2",
+            f"the annotation must be preserved as a note, got {row.get('unit_branch_note')!r}")
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": f"re-audit unit: {real_branch}"}}, root)
+    _assert(p.returncode == 2, "T2",
+            f"the normalized branch must gate a second dispatch, got {p.returncode}: {p.stderr}")
+
+
+def fixture_t3_start_binds_unit_branch_colon_form() -> None:
+    """`_UNIT_LINE_RE` (`^unit:`) bound 0/126 real Starts — the lead's real
+    dispatch prompts carry `unit_branch:` instead. This is the SubagentStart
+    advisory binding (used only to file an UNPARSEABLE verdict under the
+    right unit), not a gate decision."""
+    root = _fresh_root()
+    p = _run("lead-gate-start.sh", {"agent_id": "t3", "agent_type": "adversarial-audit",
+                                     "prompt": "Dispatch details.\nunit_branch: feat/t3-colon\nGo audit it."}, root)
+    _assert(p.returncode == 0, "T3 setup", "start must exit 0")
+    p = _run("lead-gate-stop.sh", {"agent_id": "t3", "agent_type": "adversarial-audit",
+                                    "last_assistant_message": "ran out of context, no verdict"}, root)
+    _assert(p.returncode == 0, "T3 setup", "stop must exit 0")
+    f = root / ".jammi" / "gate-state" / "feat_t3-colon.jsonl"
+    present = sorted(p.name for p in (root / ".jammi" / "gate-state").iterdir()) if (root / ".jammi" / "gate-state").exists() else []
+    _assert(f.exists(), "T3",
+            f"expected the UNPARSEABLE row filed under feat_t3-colon (the 'unit_branch:' colon-form "
+            f"binding), files present: {present}")
+    row = json.loads(f.read_text().splitlines()[-1])
+    _assert(row["verdict"] == "UNPARSEABLE", "T3", f"expected UNPARSEABLE, got {row['verdict']!r}")
+
+
+def fixture_t4_start_binds_unit_branch_bare_form() -> None:
+    """The bare (no-colon) `unit_branch <value>` shape — the second real
+    dispatch shape the lead writes — also binds the SubagentStart."""
+    root = _fresh_root()
+    p = _run("lead-gate-start.sh", {"agent_id": "t4", "agent_type": "adversarial-audit",
+                                     "prompt": "Dispatch details.\nunit_branch feat/t4-bare\nGo audit it."}, root)
+    _assert(p.returncode == 0, "T4 setup", "start must exit 0")
+    p = _run("lead-gate-stop.sh", {"agent_id": "t4", "agent_type": "adversarial-audit",
+                                    "last_assistant_message": "ran out of context, no verdict"}, root)
+    _assert(p.returncode == 0, "T4 setup", "stop must exit 0")
+    f = root / ".jammi" / "gate-state" / "feat_t4-bare.jsonl"
+    present = sorted(p.name for p in (root / ".jammi" / "gate-state").iterdir()) if (root / ".jammi" / "gate-state").exists() else []
+    _assert(f.exists(), "T4",
+            f"expected the UNPARSEABLE row filed under feat_t4-bare (the bare 'unit_branch <value>' "
+            f"binding), files present: {present}")
+    row = json.loads(f.read_text().splitlines()[-1])
+    _assert(row["verdict"] == "UNPARSEABLE", "T4", f"expected UNPARSEABLE, got {row['verdict']!r}")
+
+
+# ==========================================================================
 # L1 / L2 — the closed-world agent-type lattice
 # ==========================================================================
 
@@ -668,6 +798,108 @@ def fixture_e3_broken_python3_on_path() -> None:
 
 
 # ==========================================================================
+# S1-S3 / D1 — "only verifier stops write rows" (capability commit 2).
+# ==========================================================================
+
+def fixture_s1_non_verifier_stop_writes_nothing() -> None:
+    """`STOP_MATCH_TYPES` wired into `handle_stop`: a stop payload whose
+    agent_type is NOT a verifier type (here, an empty string — the settings.
+    json matcher's own defense-in-depth backstop) writes NO `.jsonl` row —
+    no unit row, no UNBOUND append — even though `stop` still exits 0
+    (never denies)."""
+    root = _fresh_root()
+    msg = "```json\n" + json.dumps(
+        {"kind": "verdict", "verdict": "BLOCK", "unit_branch": "feat/s1", "findings": []}
+    ) + "\n```"
+    p = _run("lead-gate-stop.sh", {"agent_id": "s1", "agent_type": "",
+                                    "last_assistant_message": msg}, root)
+    _assert(p.returncode == 0, "S1", f"stop must still exit 0, got {p.returncode}")
+    gate_dir = root / ".jammi" / "gate-state"
+    jsonl_files = list(gate_dir.glob("*.jsonl")) if gate_dir.exists() else []
+    _assert(not jsonl_files, "S1",
+            f"a non-verifier stop must write NO .jsonl row (no UNBOUND append either), "
+            f"found: {[f.name for f in jsonl_files]}")
+
+
+def fixture_s2_verifier_stop_still_writes() -> None:
+    """A verifier-typed stop (drawn from STOP_MATCH_TYPES, exercised here
+    with `oracle` — the member least covered by the other write-path
+    fixtures) still writes its row."""
+    root = _fresh_root()
+    msg = "```json\n" + json.dumps(
+        {"kind": "verdict", "verdict": "HARD_BLOCK", "unit_branch": "feat/s2", "findings": []}
+    ) + "\n```"
+    p = _run("lead-gate-stop.sh", {"agent_id": "s2", "agent_type": "oracle",
+                                    "last_assistant_message": msg}, root)
+    _assert(p.returncode == 0, "S2", f"stop must exit 0, got {p.returncode}")
+    f = root / ".jammi" / "gate-state" / "feat_s2.jsonl"
+    _assert(f.exists(), "S2", "a verifier-typed stop (oracle) must still write its row")
+
+
+def fixture_s3_unbound_rotation_at_cap() -> None:
+    """A pre-existing oversized UNBOUND.jsonl (carrying an open BLOCK row)
+    is rotated to `UNBOUND.jsonl.1` on the next `stop` invocation — BEFORE
+    the STOP_MATCH_TYPES filter runs (a verifier-typed stop triggers
+    rotation just like any other). `all_open_blocks` must no longer see
+    the rotated content (its `entry.suffix != ".jsonl"` check already
+    excludes it — no further gate-side change needed)."""
+    root = _fresh_root()
+    sdir = root / ".jammi" / "gate-state"
+    sdir.mkdir(parents=True, exist_ok=True)
+    mod = _lib_module()
+    cap = mod._UNBOUND_ROTATE_CAP_BYTES
+    unbound = sdir / "UNBOUND.jsonl"
+    row_line = json.dumps({
+        "ts": "2020-01-01T00:00:00Z", "agent_id": "x", "agent_type": "adversarial-audit",
+        "unit_branch": "UNBOUND", "unit_branch_note": None, "head_sha": None, "worktree": None,
+        "verdict": "BLOCK", "verdict_raw": "BLOCK", "unparseable_reason": None,
+        "round": 1, "class_enumeration": [], "enumeration_missing": True,
+        "sweep_method": None, "exhaustive": False, "finding_locations": [],
+        "pad": "x" * 2000,
+    }) + "\n"
+    with unbound.open("wb") as f:
+        while f.tell() <= cap:
+            f.write(row_line.encode("utf-8"))
+    original_size = unbound.stat().st_size
+    _assert(original_size > cap, "S3 setup", f"pre-seeded file must exceed the cap ({cap}), got {original_size}")
+
+    msg = "```json\n" + json.dumps(
+        {"kind": "verdict", "verdict": "PASS", "unit_branch": "feat/s3", "findings": []}
+    ) + "\n```"
+    p = _run("lead-gate-stop.sh", {"agent_id": "s3", "agent_type": "adversarial-audit",
+                                    "last_assistant_message": msg}, root)
+    _assert(p.returncode == 0, "S3", f"stop must exit 0, got {p.returncode}")
+
+    rotated = sdir / "UNBOUND.jsonl.1"
+    _assert(rotated.exists(), "S3", "the oversized UNBOUND.jsonl must be rotated to UNBOUND.jsonl.1")
+    _assert(rotated.stat().st_size == original_size, "S3",
+            "the rotated sibling must carry the pre-rotation content byte-for-byte")
+    _assert(not unbound.exists() or unbound.stat().st_size < cap, "S3",
+            "the live UNBOUND.jsonl must not still carry the oversized content after rotation")
+
+    opens = mod.all_open_blocks(sdir)
+    _assert(not any(u == "UNBOUND" for u, _t, _r, _i in opens), "S3",
+            f"all_open_blocks must not re-parse the rotated UNBOUND.jsonl.1, got: {opens}")
+
+
+def fixture_d1_recognized_block_not_mislabeled_unrecognized() -> None:
+    """Cosmetic `_diagnose_row` fix: the RECOGNIZED literal `"BLOCK"` value
+    (the `BLOCK | PASS` vocabulary's own spelling — adversarial-audit,
+    citation-checker, discipline-test-auditor) must never be reported as
+    "unrecognized verdict value ... defaulted to BLOCK" in a second-round
+    deny reason; a genuinely unrecognized value (exercised elsewhere, V3)
+    still is."""
+    root = _fresh_root()
+    row = _write_block_row(root, "feat/d1", "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    _assert(row.get("verdict_raw") == "BLOCK", "D1 setup", f"expected verdict_raw 'BLOCK', got {row.get('verdict_raw')!r}")
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": f"re-audit at {row['worktree']}"}}, root)
+    _assert(p.returncode == 2, "D1", f"expected a deny, got {p.returncode}")
+    _assert("unrecognized verdict value" not in p.stderr, "D1",
+            f"the recognized 'BLOCK' spelling must not be mislabeled 'unrecognized': {p.stderr!r}")
+
+
+# ==========================================================================
 # N6 / N7 — must-still-count
 # ==========================================================================
 
@@ -727,6 +959,10 @@ FIXTURES = [
     ("G13", fixture_g13_verifier_pass_clears_audited_block_only_with_relay),
     ("G14", fixture_g14_unparseable_row_gates_like_block),
     ("G15", fixture_g15_whole_token_anchors_never_raw_substrings),
+    ("T1", fixture_t1_card_schema_line_substituted_binds),
+    ("T2", fixture_t2_annotated_legacy_unit_branch_binds),
+    ("T3", fixture_t3_start_binds_unit_branch_colon_form),
+    ("T4", fixture_t4_start_binds_unit_branch_bare_form),
     ("L1", fixture_l1_unknown_type_denied),
     ("L2", fixture_l2_agent_card_lattice_cross_check),
     ("L3", fixture_l3_subtype_key_spellings_and_distinct_absent_arm),
@@ -742,6 +978,10 @@ FIXTURES = [
     ("E2", fixture_e2_missing_python3),
     ("E3", fixture_e3_broken_python3_on_path),
     ("E4", fixture_e4_json_invalid_payload_fails_closed),
+    ("S1", fixture_s1_non_verifier_stop_writes_nothing),
+    ("S2", fixture_s2_verifier_stop_still_writes),
+    ("S3", fixture_s3_unbound_rotation_at_cap),
+    ("D1", fixture_d1_recognized_block_not_mislabeled_unrecognized),
     ("N6", fixture_n6_nothing_gated_when_no_block_anywhere),
     ("R10", fixture_r10_wiring),
 ]

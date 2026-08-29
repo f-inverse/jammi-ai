@@ -745,3 +745,385 @@ fn identical_bf16_drift_from_truth_passes_composition_check_but_fails_truth_trac
 fn require_pod_measured_floor_panics_on_unmeasured_nan() {
     require_pod_measured_floor("demo_test", "DEMO_BOUND", f64::NAN);
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Unit 62 gap fix: the MEASUREMENT path (PRINT ONLY -- gates nothing).
+//
+// The gap this section closes: every CUDA leg above calls
+// `require_pod_measured_floor` FIRST -- before the row-loop `eprintln!`
+// that prints the very ratios `PROVISIONAL_GPU_FLOOR_PLACEHOLDER` /
+// `PROVISIONAL_GPU_TRUTH_DRIFT_BOUND` need -- so a pod run of THOSE tests
+// today panics on the still-unmeasured (`f64::NAN`) placeholders before a
+// single ratio is ever computed: there is currently no path to obtain the
+// numbers those two constants need. This section adds that path: an
+// `#[ignore]`d, print-only test that computes and prints the SAME
+// quantities the gating tests assert (`ratio_alone_vs_truth`,
+// `ratio_batch_vs_truth`, `ratio_alone_vs_batch`) plus the two red
+// controls' own separations, over an 8-way sweep, asserting ONLY
+// finiteness -- NEVER a numeric bound. It is a measurement tool, not a
+// gate: the derivation commit that folds these numbers into
+// `PROVISIONAL_GPU_FLOOR_PLACEHOLDER` / `PROVISIONAL_GPU_TRUTH_DRIFT_BOUND`
+// (with safety-margin arithmetic documented at that time, per contract E4
+// Step 5) is a SEPARATE change; this file's constants and gating asserts
+// are untouched by this section.
+//
+// **Composition sweep, not a seed sweep -- this fixture is
+// content-deterministic.** `src/modernbert.rs`'s own multi-seed convention
+// (`FLASH_ORACLE_SWEEP_SEEDS`, 8 seeds `201..=208`, re-drawing token
+// content per seed via a SplitMix64 stream in `flash_oracle_synthetic_ids`)
+// varies RANDOM token content per seed because that oracle's fixture has no
+// other axis of variation. THIS file's fixture (`build_fixture`, see this
+// file's own module doc) is explicitly content-deterministic -- "no RNG --
+// this is an eager, non-random encode path" -- so there is no token content
+// to re-seed. Per this unit's own plan (`docs/plans/62-embedding-surface/PLAN.md`,
+// PR-C: "truth-relative mean ratio over the 8-seed convention"), the axis
+// this oracle actually varies is BATCH COMPOSITION: the SAME 16-row pool
+// `build_fixture` already builds (same content, same lengths), composed
+// into 8 DIFFERENT padded batches (different subsets, different orders,
+// different total batch sizes) -- directly exercising the mechanism this
+// file's own module doc names as the source of any real divergence ("the
+// underlying GEMMs...pick their blocking/accumulation order from the
+// OPERAND SHAPE (total batch, total sequence length)"). `composition_id`
+// (`0..8`) plays the structural role `seed` plays in the M1b family's
+// sweep: an index this print-only test iterates and reports per-index,
+// mean/max included -- the same reduction discipline (`total_cmp`-folded
+// max, explicit mean) `mean_max` in `src/modernbert.rs` uses.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The 8 batch compositions this measurement sweeps, all built from the
+/// SAME 16-row pool [`build_fixture`] returns (same token content, same
+/// per-row lengths) -- only which rows participate and in what order/total
+/// batch size varies, so any divergence measured here traces to composition
+/// (operand shape), never to content drift between compositions.
+#[cfg(feature = "cuda")]
+const MEASUREMENT_COMPOSITION_SWEEP: [usize; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+
+/// Maps a `composition_id` (`0..8`, [`MEASUREMENT_COMPOSITION_SWEEP`]) to
+/// the row indices (into [`build_fixture`]'s 16-row pool) that compose that
+/// batch: full set, both halves, even/odd interleave, full-reversed-order,
+/// and two overlapping three-quarter windows -- eight structurally distinct
+/// `(batch, seq)` operand shapes and orderings from one fixed content pool.
+#[cfg(feature = "cuda")]
+fn composition_row_indices(composition_id: usize, n: usize) -> Vec<usize> {
+    match composition_id {
+        0 => (0..n).collect(),
+        1 => (0..n / 2).collect(),
+        2 => (n / 2..n).collect(),
+        3 => (0..n).step_by(2).collect(),
+        4 => (1..n).step_by(2).collect(),
+        5 => (0..n).rev().collect(),
+        6 => (0..(n * 3 / 4)).collect(),
+        7 => (n / 4..n).collect(),
+        other => panic!("composition_row_indices: unknown composition_id {other} (expected 0..8)"),
+    }
+}
+
+/// Builds one composed padded batch (rows/lengths + device tensors) from a
+/// subset of `base`'s row pool, in the given order -- reuses
+/// [`build_fixture`]'s row content/lengths verbatim (no re-derivation) so
+/// every composition draws from the identical content this file's gating
+/// tests already exercise.
+#[cfg(feature = "cuda")]
+fn build_composition(
+    device: &Device,
+    base: &Fixture,
+    row_indices: &[usize],
+) -> (Vec<Vec<u32>>, Vec<usize>, Tensor, Tensor) {
+    let seq = base.seq;
+    let batch = row_indices.len();
+    assert!(batch > 0, "build_composition: empty composition");
+    let mut ids_padded = vec![0u32; batch * seq];
+    let mut mask_padded = vec![0u32; batch * seq];
+    let mut rows = Vec::with_capacity(batch);
+    let mut lengths = Vec::with_capacity(batch);
+    for (slot, &idx) in row_indices.iter().enumerate() {
+        let row = &base.rows[idx];
+        for (i, &t) in row.iter().enumerate() {
+            ids_padded[slot * seq + i] = t;
+            mask_padded[slot * seq + i] = 1;
+        }
+        rows.push(row.clone());
+        lengths.push(base.lengths[idx]);
+    }
+    let ids = Tensor::from_vec(ids_padded, (batch, seq), device).unwrap();
+    let mask = Tensor::from_vec(mask_padded, (batch, seq), device).unwrap();
+    (rows, lengths, ids, mask)
+}
+
+/// `total_cmp`-folded max over `values` -- the same fixed fold-order/tie-break
+/// discipline (family J) `mean_max` in `src/modernbert.rs` uses, re-derived
+/// here since this file does not import that module's private helper (see
+/// this file's own module doc on why it re-derives its small helpers).
+#[cfg(feature = "cuda")]
+fn measurement_max(values: &[f64]) -> f64 {
+    values.iter().copied().fold(f64::NEG_INFINITY, |a, b| {
+        if b.total_cmp(&a).is_gt() {
+            b
+        } else {
+            a
+        }
+    })
+}
+
+/// `(mean, total_cmp-folded max)` over `values`. Panics on an empty slice --
+/// a measurement sweep that produced zero data points is itself a defect in
+/// this test, not a `0.0`/`NaN` result to silently propagate.
+#[cfg(feature = "cuda")]
+fn measurement_mean_max(values: &[f64]) -> (f64, f64) {
+    assert!(!values.is_empty(), "measurement_mean_max: empty slice");
+    let sum: f64 = values.iter().sum();
+    let mean = sum / values.len() as f64;
+    (mean, measurement_max(values))
+}
+
+/// MEASUREMENT-ONLY, print-only, `#[ignore]`d by default (see this test's
+/// own attribute for the exact rationale) -- computes and prints, for every
+/// row of every composition in [`MEASUREMENT_COMPOSITION_SWEEP`], the exact
+/// three ratios the gating `bf16`-CUDA tests above assert
+/// (`ratio_alone_vs_truth`, `ratio_batch_vs_truth`, `ratio_alone_vs_batch`,
+/// via the identical [`relative_l1_error`] function those tests call), plus
+/// each composition's own red-control separations
+/// (row_lengths off-by-one, window radius off-by-one), so the
+/// conjunctive-control admissibility check the module doc requires can be
+/// derived from THIS SAME run rather than a second pod invocation. Asserts
+/// ONLY finiteness on every printed ratio: a `NaN`/`inf` measurement is
+/// itself a RED finding here (this test's job is to report reality, not
+/// pass), never silently dropped or averaged away.
+///
+/// Two independent, structural reasons this cannot run inside the
+/// CI-hermetic gate: (1) `#[cfg(feature = "cuda")]` means the function does
+/// not even exist in a plain `cargo test -p jammi-encoders` build (CI's
+/// default, no `--features cuda`); (2) even a `--features cuda` build
+/// compiles it but `cargo test`'s documented default behavior skips
+/// `#[ignore]`-annotated tests unless `--ignored` (or `--include-ignored`)
+/// is passed explicitly -- this test relies on neither a hand-rolled skip
+/// check nor a meta-test to enforce that; it is cargo's own, standard
+/// semantics.
+///
+/// Invocation: `cargo test -p jammi-encoders --features cuda --test it \
+/// measure_gpu_floors -- --ignored --nocapture` (matches this unit's
+/// `cuda_device_or_skip` idiom: silent skip with no device unless
+/// `JAMMI_REQUIRE_CUDA` is set, in which case device-acquisition failure
+/// panics).
+#[test]
+#[cfg(feature = "cuda")]
+#[ignore = "measurement-only: prints ratios for pod floor derivation, asserts nothing beyond finiteness"]
+fn measure_gpu_floors_print_only() {
+    let test_name = "measure_gpu_floors_print_only";
+    let Some(device) = cuda_device_or_skip(test_name) else {
+        return;
+    };
+
+    let config = load_config();
+    let encoder = build_encoder(&device, DType::BF16, &config);
+    let truth_encoder = build_encoder(&Device::Cpu, DType::F32, &config);
+    let base = build_fixture(&device);
+
+    let mut all_alone_vs_truth: Vec<f64> = Vec::new();
+    let mut all_batch_vs_truth: Vec<f64> = Vec::new();
+    let mut all_alone_vs_batch: Vec<f64> = Vec::new();
+    let mut all_row_len_control: Vec<f64> = Vec::new();
+    let mut all_window_control: Vec<f64> = Vec::new();
+
+    for &composition_id in MEASUREMENT_COMPOSITION_SWEEP.iter() {
+        let indices = composition_row_indices(composition_id, base.rows.len());
+        let (rows, lengths, ids, mask) = build_composition(&device, &base, &indices);
+        let pooled_batch = encoder
+            .forward(&ids, &mask)
+            .expect("measurement composition forward (bf16 cuda)");
+        let pooled_batch: Vec<Vec<f32>> = pooled_batch
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec2()
+            .unwrap();
+
+        let mut comp_alone_vs_truth = Vec::with_capacity(rows.len());
+        let mut comp_batch_vs_truth = Vec::with_capacity(rows.len());
+        let mut comp_alone_vs_batch = Vec::with_capacity(rows.len());
+
+        for (slot, row) in rows.iter().enumerate() {
+            let alone_bf16 = pooled_alone(&encoder, &device, row);
+            let truth = pooled_alone(&truth_encoder, &Device::Cpu, row);
+            let ratio_alone_vs_truth = relative_l1_error(&alone_bf16, &truth);
+            let ratio_batch_vs_truth = relative_l1_error(&pooled_batch[slot], &truth);
+            let ratio_alone_vs_batch = relative_l1_error(&alone_bf16, &pooled_batch[slot]);
+            eprintln!(
+                "{test_name}: composition={composition_id} row_slot={slot} len={} \
+                 alone_vs_truth={ratio_alone_vs_truth:e} batch_vs_truth={ratio_batch_vs_truth:e} \
+                 alone_vs_batch={ratio_alone_vs_batch:e}",
+                lengths[slot],
+            );
+            assert!(
+                ratio_alone_vs_truth.is_finite(),
+                "{test_name}: composition={composition_id} row_slot={slot} ratio_alone_vs_truth \
+                 is non-finite ({ratio_alone_vs_truth}) -- a NaN/inf measurement is a RED \
+                 finding, not usable data"
+            );
+            assert!(
+                ratio_batch_vs_truth.is_finite(),
+                "{test_name}: composition={composition_id} row_slot={slot} ratio_batch_vs_truth \
+                 is non-finite ({ratio_batch_vs_truth}) -- a NaN/inf measurement is a RED \
+                 finding, not usable data"
+            );
+            assert!(
+                ratio_alone_vs_batch.is_finite(),
+                "{test_name}: composition={composition_id} row_slot={slot} ratio_alone_vs_batch \
+                 is non-finite ({ratio_alone_vs_batch}) -- a NaN/inf measurement is a RED \
+                 finding, not usable data"
+            );
+            comp_alone_vs_truth.push(ratio_alone_vs_truth);
+            comp_batch_vs_truth.push(ratio_batch_vs_truth);
+            comp_alone_vs_batch.push(ratio_alone_vs_batch);
+        }
+
+        let comp_max_alone_vs_truth = measurement_max(&comp_alone_vs_truth);
+        let comp_max_batch_vs_truth = measurement_max(&comp_batch_vs_truth);
+        let comp_max_alone_vs_batch = measurement_max(&comp_alone_vs_batch);
+        eprintln!(
+            "{test_name}: composition={composition_id} MAX OVER {} ROWS: \
+             max_alone_vs_truth={comp_max_alone_vs_truth:e} \
+             max_batch_vs_truth={comp_max_batch_vs_truth:e} \
+             max_alone_vs_batch={comp_max_alone_vs_batch:e}",
+            rows.len(),
+        );
+
+        all_alone_vs_truth.extend_from_slice(&comp_alone_vs_truth);
+        all_batch_vs_truth.extend_from_slice(&comp_batch_vs_truth);
+        all_alone_vs_batch.extend_from_slice(&comp_alone_vs_batch);
+
+        // Red control 1 (row_lengths off-by-one), THIS composition's own
+        // slot 0: same construction as
+        // `pooled_embedding_red_control_row_length_off_by_one_bf16_cuda`
+        // above, scoped to this composition's batch.
+        let mut mask_mut = vec![0u32; lengths.len() * base.seq];
+        let mut ids_mut = vec![0u32; lengths.len() * base.seq];
+        for (slot, (row, &len)) in rows.iter().zip(lengths.iter()).enumerate() {
+            let take = if slot == 0 {
+                len.saturating_sub(1)
+            } else {
+                len
+            };
+            for (i, &t) in row.iter().enumerate() {
+                ids_mut[slot * base.seq + i] = t;
+            }
+            for i in 0..take {
+                mask_mut[slot * base.seq + i] = 1;
+            }
+        }
+        let ids_mut_t = Tensor::from_vec(ids_mut, (lengths.len(), base.seq), &device).unwrap();
+        let mask_mut_t = Tensor::from_vec(mask_mut, (lengths.len(), base.seq), &device).unwrap();
+        let pooled_batch_mut = encoder
+            .forward(&ids_mut_t, &mask_mut_t)
+            .expect("row-length control forward (bf16 cuda)");
+        let pooled_batch_mut: Vec<Vec<f32>> = pooled_batch_mut
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec2()
+            .unwrap();
+        let alone0 = pooled_alone(&encoder, &device, &rows[0]);
+        let row_len_ratio = relative_l1_error(&alone0, &pooled_batch_mut[0]);
+        eprintln!(
+            "{test_name}: composition={composition_id} RED_CONTROL row_length_off_by_one \
+             ratio={row_len_ratio:e}"
+        );
+        assert!(
+            row_len_ratio.is_finite(),
+            "{test_name}: composition={composition_id} row_length_off_by_one control ratio is \
+             non-finite ({row_len_ratio}) -- a RED finding, not usable data"
+        );
+        all_row_len_control.push(row_len_ratio);
+
+        // Red control 2 (window radius off-by-one), THIS composition's
+        // longest row -- checked premise mirrors the gating control's own
+        // (a composition whose longest row cannot bind the window under
+        // BOTH configs is SKIPPED here, printed as such, rather than
+        // silently counted as a pass).
+        let mut mutant_config = config.clone();
+        mutant_config.local_attention = config.local_attention + 2;
+        assert_eq!(
+            mutant_config.half_window(),
+            config.half_window() + 1,
+            "checked premise: the mutant config must actually change half_window by exactly 1"
+        );
+        let (long_slot, &long_len) = lengths
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, &len)| len)
+            .expect("composition is non-empty");
+        if long_len >= mutant_config.half_window() + 2 && long_len >= config.half_window() + 2 {
+            let encoder_mut = build_encoder(&device, DType::BF16, &mutant_config);
+            let alone_long = pooled_alone(&encoder, &device, &rows[long_slot]);
+            let pooled_batch_mut_window = encoder_mut
+                .forward(&ids, &mask)
+                .expect("window control forward (bf16 cuda)");
+            let pooled_batch_mut_window: Vec<Vec<f32>> = pooled_batch_mut_window
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_vec2()
+                .unwrap();
+            let window_ratio = relative_l1_error(&alone_long, &pooled_batch_mut_window[long_slot]);
+            eprintln!(
+                "{test_name}: composition={composition_id} RED_CONTROL window_radius_off_by_one \
+                 row_slot={long_slot} len={long_len} ratio={window_ratio:e}"
+            );
+            assert!(
+                window_ratio.is_finite(),
+                "{test_name}: composition={composition_id} window_radius_off_by_one control \
+                 ratio is non-finite ({window_ratio}) -- a RED finding, not usable data"
+            );
+            all_window_control.push(window_ratio);
+        } else {
+            eprintln!(
+                "{test_name}: composition={composition_id} RED_CONTROL window_radius_off_by_one \
+                 SKIPPED -- longest row (len={long_len}) does not clear half_window+2 for both \
+                 configs in this composition (window_threshold original={}, mutant={})",
+                config.half_window() + 2,
+                mutant_config.half_window() + 2,
+            );
+        }
+    }
+
+    let (mean_a2t, max_a2t) = measurement_mean_max(&all_alone_vs_truth);
+    let (mean_b2t, max_b2t) = measurement_mean_max(&all_batch_vs_truth);
+    let (mean_a2b, max_a2b) = measurement_mean_max(&all_alone_vs_batch);
+    eprintln!(
+        "{test_name}: OVERALL OVER {} COMPOSITIONS / {} ROW-MEASUREMENTS: \
+         alone_vs_truth mean={mean_a2t:e} max={max_a2t:e} | batch_vs_truth mean={mean_b2t:e} \
+         max={max_b2t:e} | alone_vs_batch mean={mean_a2b:e} max={max_a2b:e} \
+         (these bound PROVISIONAL_GPU_TRUTH_DRIFT_BOUND [alone_vs_truth/batch_vs_truth] and \
+         PROVISIONAL_GPU_FLOOR_PLACEHOLDER [alone_vs_batch] respectively)",
+        MEASUREMENT_COMPOSITION_SWEEP.len(),
+        all_alone_vs_truth.len(),
+    );
+    if all_row_len_control.is_empty() {
+        eprintln!("{test_name}: row_length_off_by_one control produced ZERO measurements");
+    } else {
+        let (mean_rl, max_rl) = measurement_mean_max(&all_row_len_control);
+        eprintln!(
+            "{test_name}: OVERALL row_length_off_by_one control OVER {} COMPOSITIONS: \
+             mean={mean_rl:e} max={max_rl:e}",
+            all_row_len_control.len(),
+        );
+    }
+    if all_window_control.is_empty() {
+        eprintln!(
+            "{test_name}: window_radius_off_by_one control had ZERO admissible compositions -- \
+             see per-composition SKIPPED lines above"
+        );
+    } else {
+        let (mean_w, max_w) = measurement_mean_max(&all_window_control);
+        eprintln!(
+            "{test_name}: OVERALL window_radius_off_by_one control OVER {} COMPOSITIONS: \
+             mean={mean_w:e} max={max_w:e}",
+            all_window_control.len(),
+        );
+    }
+
+    eprintln!(
+        "{test_name}: measurement complete -- these numbers are the pod-derivation input for \
+         PROVISIONAL_GPU_FLOOR_PLACEHOLDER and PROVISIONAL_GPU_TRUTH_DRIFT_BOUND; folding them \
+         into those constants (with safety-margin arithmetic documented then) is a SEPARATE \
+         derivation commit (contract docs/plans/62-embedding-surface/CONTRACT.md E4, Step 5), \
+         not this test -- this test asserts finiteness only and gates nothing"
+    );
+}

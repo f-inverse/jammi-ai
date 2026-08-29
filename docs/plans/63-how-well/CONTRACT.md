@@ -206,3 +206,53 @@ the replacement without modification. No skip, `xfail`, or `TODO` marker
 gates this — the plan is this prose record plus the fixture's own
 `PROVENANCE.md` "Supersession plan" section, not a pinned-but-disabled
 test.
+
+## Amendment 2026-08-29b (lead, post-campaign-v1): probe bug fix + premise-failure handling + mutant dose ladder
+
+Basis (committed FIRST, auditable): docs/plans/63-how-well/measurements/campaign-v1/ at
+04ceb25c — the v1 run is INVALID (seed-4 alloff premise) and mutant M1 measured UNDETECTED.
+Pressure-tested (rule 9) before this amendment; the findings it encodes:
+
+1. NOT a rule amendment — an instrument bug fix. `learning_happened_delta`'s baseline is
+   taken after the first resume-cycle has already trained epoch 0 (finetune_run.rs's probe
+   ordering), so the premise measures epoch-1..final — excluding the largest learning
+   epoch — while its field doc claims "over the run"; and its endpoint choice was never
+   pre-registered (the "CONTRACT H4" citation at the definition site names a string this
+   contract never contained — a fabricated citation, corrected herewith). The fix is
+   statable with zero reference to seed 4:
+   (a) the probe anchors at the UNTRAINED model (one evaluate_held_out on the train-probe
+       batch before the first run(); LoRA init is ZerosB, so an lr=0 leg still reads
+       exactly 0.0 and the strict-> floor still bites);
+   (b) the producer emits the probe as a RAW per-epoch series INCLUDING the init point —
+       never a pre-derived scalar — and the MERGER derives the premise from the series
+       (rule: init_probe - final_probe > floor; the rule lives where rules live);
+   (c) premise-failure handling is now pre-registered: the primary verdict keeps the
+       strict 12-clean-or-INVALID rule unchanged; the merged artifact ALWAYS also emits a
+       non-parameterised, explicitly non-decisional `premise_failure_diagnostic` block
+       (failed seeds, failing legs, their raw series) — it can never promote
+       INVALID->GREEN and the merger accepts NO operator override for premise failures.
+2. Pre-published predictions (falsifiable, recorded BEFORE the v2 run):
+   (i) the corrected probe does not touch the training path (the no-RNG-perturbation seam
+       property is pinned by test), so v2's d-column is predicted to reproduce v1's
+       BIT-IDENTICALLY, with dispatch counters legitimately shifted by exactly one eval's
+       worth per leg;
+   (ii) conditional on (i), the v2 verdict is predicted now: GREEN — v1's diagnostic
+       d-column reads n_neg=8/12, mean_d=-0.0238, p=0.2266 (no concordant degradation;
+       the fused arm trends BETTER). An amendment that publishes its own outcome in
+       advance cannot be shopping for one. If (i) fails, the amendment's basis is void
+       and the discrepancy is a finding to investigate before any verdict is claimed.
+3. Mutant column, corrected design: M1 is recorded as a NON-DETECTION (a sign-flipping
+   early transient — wrong space of reasoning; see campaign-v1/README.md), not a bound.
+   v2 pre-registers a one-parameter, monotone, SUSTAINED dose family: the fused AdamW
+   update scaled by (1+eps), eps in {0.02, 0.10, 0.50}, each dose's predicted per-seed
+   effect stated in held-out example-mean units in mutants/README.md BEFORE the spend;
+   each dose column is produced by substituting the mutant INTO THE FUSED ARM and merged
+   against the SAME v2 alloff legs under the SAME >=11/12+mean rule (the gate's own
+   statistic — mutant-vs-fused is explicitly NOT the sensitivity claim); the reported
+   sensitivity is the pair of adjacent doses straddling detection. Acceptance 5's
+   "mutant column proven RED" is discharged by the smallest detected dose.
+4. Boundary constraints: no --allow-premise-failure, no waived-seed list, no rescale
+   switch anywhere in the merger; the off-sample reserve stays reserved for step 4;
+   decaying LR schedules stay disabled for this tier until the resume-cycle LR-horizon
+   defect (total_steps recomputed per cycle) is fixed — the campaign's constant/0-warmup
+   setting is unaffected.

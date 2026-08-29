@@ -49,12 +49,25 @@ hook at all — they pass straight through.
 
 **The relay artifact** (`.jammi/gate-state/<slug>.relay.<agent_type>.<block_ts>.json`)
 is written by the LEAD directly (`Write` is not gated) — never scanned from message
-prose. It names `unit_branch`/`agent_type`/`block_ts` (the verdict row's own `ts`) and
-a `sites` object whose keys must be an EXACT-STRING SUPERSET of the verifier's
-`class_enumeration` (no path parsing, no normalization — the lead copies the
-verifier's own strings verbatim, so `Makefile:12`, `src/a.rs`, `a.rs:10-12` are all
-fine). When `class_enumeration` is empty (`enumeration_missing`), a `probe` array of
-≥ 2 entries disjoint from every `findings[].location` string is the weaker fallback.
+prose. It names `unit_branch`/`agent_type`/`block_ts` (the verdict row's own `ts`) and must
+satisfy BOTH requirements — a CONJUNCTION, never a choice of arms (esc-064).
+**(1) Coverage** — whenever the BLOCK's `class_enumeration` is non-empty: a `sites`
+object whose keys are an EXACT-STRING SUPERSET of it (no path parsing, no
+normalization — the lead copies the verifier's own strings verbatim, so
+`Makefile:12`, `src/a.rs`, `a.rs:10-12` are all fine), every disposition non-empty.
+**(2) Proactivity — ALWAYS**, on every BLOCK relay of every gated verifier type: a
+`probe` array naming ≥ 2 DISTINCT sites outside BOTH the `class_enumeration` and
+every `findings[].location` — the lead's adjacent sweep on the record. Probe entries
+are compared with Unicode Cf/Cc (zero-width/control) characters dropped and
+surrounding whitespace stripped, on BOTH sides: this is monotone-toward-DENY (it can
+only shrink the adjacent set) and is therefore NOT the acceptance-easing
+normalization the `sites` rule bans. The `enumeration_missing` field on a verdict
+row is diagnostic only — no gate decision reads it; which requirement has content is
+derived from the enumeration itself. HONEST LIMIT: the hook enforces that adjacent
+probing is ASSERTED with named, citation-checkable sites — never that it occurred,
+nor that the sites are semantically adjacent; it converts silent omission into an
+explicit after-the-fact-checkable claim (citation-checker and the retrospective
+judge the probes, not this hook).
 The hook only ever READS this file, fresh, on every gate call — it never writes an
 "accepted" row itself, so a DENY can never leave a phantom acceptance behind.
 
@@ -108,7 +121,9 @@ artifact files present): (1) relaying to a running agent BY MESSAGE — `SendMes
 is out of scope by design, not merely undetected; (2) an "unlabeled" verifier
 re-dispatch naming neither the recorded worktree, head_sha, nor unit_branch (DODGE-5);
 (3) `disableAllHooks` in local settings (a verifier verdict in the transcript with no
-hook-written state row is the tell).
+hook-written state row is the tell); (4) a relay whose `probe` sites are
+asserted but never examined — mechanically indistinguishable here; the tell is a
+probe site the next round's citation-checker cannot corroborate.
 
 ### `build-env-guard.sh` — `PreToolUse(Bash)`, opt-in, fail-open
 Warns (stderr only, **always exit 0**) when a Bash command carries a build-env hazard

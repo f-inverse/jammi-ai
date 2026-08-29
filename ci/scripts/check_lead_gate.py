@@ -38,6 +38,18 @@ Required fixtures (RED when the corresponding hook arm is removed):
       1): an open BLOCK on `ci/gpu` does NOT gate `ci/gpu-dev`, `<worktree>2`
       and a 7-char-lookalike hex token do NOT gate; a path UNDER the
       recorded worktree and a TRUE >=7-char sha prefix still DO
+  G16 esc-064 RED: a BLOCK with a NON-EMPTY class_enumeration whose relay
+      restates it as `sites` with NO `probe` is NOT accepted -> deny(2),
+      and the deny reason NAMES the missing probe evidence
+  G17 GREEN: the same relay plus >=2 disjoint probe sites IS accepted
+  G18 probe boundaries (each root isolates ONE axis, all deny): collision
+      with an ENUMERATED-not-merely-found site; count 1; empty/whitespace
+      entries; duplicates; whitespace-padded collision; strip-identical
+      pair counting as one; a VERIFIER-emitted padded finding location
+      restated unpadded; zero-width (Cf) invisible-character collision
+  G19 the coverage arm is selected by the DATA: a row with a non-empty
+      class_enumeration but NO `enumeration_missing` key still requires
+      `sites` (the flag is diagnostic, never a discriminator)
   L1  closed-world agent-type lattice: unrecognized type -> deny
   L2  every `.claude/agents/*.md` card (+ harness built-ins) is classified;
       NEVER_GATED members carry no Edit/Write/MultiEdit in `tools:`
@@ -261,10 +273,14 @@ def fixture_g5_second_round_denied_unit_branch() -> None:
 
 
 def fixture_g6_second_round_allowed_with_accepted_relay() -> None:
+    """esc-064: a full-coverage relay is no longer sufficient by itself —
+    R2 (adjacent probing) is armed on this arm too, so the accepted relay
+    now carries a probe array alongside full site coverage."""
     root = _fresh_root()
     row = _write_block_row(root, "feat/g6", "a1", "adversarial-audit",
                             ["a.py:1", "b.py:2"], ["a.py:1"])
-    _write_relay_exact(root, row, sites={"a.py:1": "fixed", "b.py:2": "fixed"})
+    _write_relay_exact(root, row, sites={"a.py:1": "fixed", "b.py:2": "fixed"},
+                        probe=["c.py:9", "d.py:4"])
     p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
         "subagent_type": "adversarial-audit", "prompt": f"re-audit unit: feat/g6"}}, root)
     _assert(p.returncode == 0, "G6", f"expected allow, got {p.returncode}: {p.stderr}")
@@ -347,7 +363,8 @@ def fixture_g13_verifier_pass_clears_audited_block_only_with_relay() -> None:
 
     root2 = _fresh_root()
     aa_row2 = _write_block_row(root2, "feat/g13b", "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
-    _write_relay_exact(root2, aa_row2, sites={"a.py:1": "fixed"})
+    # esc-064: the accepted relay needs the always-armed probe here too.
+    _write_relay_exact(root2, aa_row2, sites={"a.py:1": "fixed"}, probe=["c.py:9", "d.py:4"])
     _write_block_row(root2, "feat/g13b", "f1", "fix-verifier", [], [], verdict="PASS")
     p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
         "subagent_type": "adversarial-audit", "prompt": f"re-audit at {aa_row2['worktree']}"}}, root2)
@@ -943,6 +960,96 @@ def fixture_r10_wiring() -> None:
     _assert(".claude/settings.json" in deny_text, "R10", f"permissions.deny must cover .claude/settings.json: {deny}")
 
 
+def fixture_g16_reactive_relay_rejected_when_enumeration_present() -> None:
+    """esc-064 RED case: a BLOCK with a NON-EMPTY class_enumeration whose
+    relay restates it as `sites` with NO `probe` array is NOT accepted.
+    R2 (adjacent probing) is armed UNCONDITIONALLY — a reactive relay that
+    only acknowledges the verifier's own enumeration is insufficient, and
+    the deny reason must NAME the missing probe evidence so the lead's
+    remedy is legible (not an uninterpretable deny that invites the rm
+    escape hatch)."""
+    root = _fresh_root()
+    row = _write_block_row(root, "feat/g16", "a1", "adversarial-audit",
+                            ["a.py:1", "b.py:2"], ["a.py:1"])
+    _write_relay_exact(root, row, sites={"a.py:1": "noted", "b.py:2": "noted"})
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/g16"}}, root)
+    _assert(p.returncode == 2, "G16", f"reactive relay must deny(2), got {p.returncode}")
+    _assert("probe" in p.stderr, "G16",
+            f"the deny reason must name the missing probe evidence: {p.stderr!r}")
+
+
+def fixture_g17_probed_relay_accepted_when_enumeration_present() -> None:
+    """esc-064 GREEN counterpart (non-vacuity for G16/G18): the SAME
+    full-coverage relay plus >=2 probe sites disjoint from the enumeration
+    and every finding location IS accepted."""
+    root = _fresh_root()
+    row = _write_block_row(root, "feat/g17", "a1", "adversarial-audit",
+                            ["a.py:1", "b.py:2"], ["a.py:1"])
+    _write_relay_exact(root, row, sites={"a.py:1": "noted", "b.py:2": "noted"},
+                        probe=["c.py:9", "d.py:4"])
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/g17"}}, root)
+    _assert(p.returncode == 0, "G17", f"probed relay must accept, got {p.returncode}: {p.stderr}")
+
+
+def fixture_g18_probe_boundary_cases() -> None:
+    """esc-064 boundary matrix — each root isolates ONE axis and must deny.
+    Roots (vi)/(vii)/(viii) are the mutation-adequacy additions from the
+    proposal's pressure test: (vi) kills the exact-dedup/strip-collision
+    mutant, (vii) kills the strip-probe-side-only mutant (a verifier-emitted
+    PADDED finding location is reachable — locations are recorded verbatim),
+    (viii) kills the plain-.strip() mutant (zero-width Cf characters are not
+    whitespace)."""
+    cases = [
+        # (label, class_enum, finding_locs, probe)
+        ("i-enumerated-collision", ["a.py:1", "b.py:2"], ["a.py:1"], ["b.py:2", "z.py:9"]),
+        ("ii-count-1", ["a.py:1", "b.py:2"], ["a.py:1"], ["z.py:9"]),
+        ("iii-empty-entries", ["a.py:1", "b.py:2"], ["a.py:1"], ["", "   ", "z.py:9"]),
+        ("iv-duplicates", ["a.py:1", "b.py:2"], ["a.py:1"], ["z.py:9", "z.py:9"]),
+        ("v-padded-collision", ["a.py:1", "b.py:2"], ["a.py:1"], ["a.py:1 ", "b.py:2"]),
+        ("vi-strip-identical-pair", ["a.py:1", "b.py:2"], ["a.py:1"], [" x.py:1", "x.py:1 "]),
+        ("vii-verifier-padded-finding", ["a.py:1"], ["foo.py:10 "], ["foo.py:10", "z.py:9"]),
+        ("viii-zero-width-collision", ["a.py:1"], ["z.py:9"], ["z.py:9\u200b", "z.py:9\u200b\u200b"]),
+    ]
+    for label, enum, locs, probe in cases:
+        root = _fresh_root()
+        row = _write_block_row(root, "feat/g18", "a1", "adversarial-audit", enum, locs)
+        _write_relay_exact(root, row, sites={s: "noted" for s in enum}, probe=probe)
+        p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+            "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/g18"}}, root)
+        _assert(p.returncode == 2, "G18",
+                f"case {label}: must deny (fewer than 2 ADJACENT sites), got {p.returncode}: {p.stderr}")
+
+
+def fixture_g19_coverage_arm_selected_by_data_not_flag() -> None:
+    """esc-064 mutation-adequacy fixture: R1 (coverage) is armed by the DATA
+    (a non-empty class_enumeration), never by the recorded
+    `enumeration_missing` flag — a row MISSING that key entirely (a
+    legacy/hand-edited row shape) with a relay carrying `probe` but NO
+    `sites` must still deny. A fix that merely bolts `and probe_ok` onto
+    the old flag-selected arm leaves this fixture red; only removing the
+    flag as a discriminator satisfies it.
+
+    BUILDABILITY CAVEAT (stated, per the proposal's pressure test):
+    `handle_stop` ALWAYS writes `enumeration_missing`, so `_write_block_row`
+    cannot emit the key-absent row — this fixture post-edits the state
+    JSONL to DELETE the key. Do NOT weaken it into a hook-emittable row."""
+    root = _fresh_root()
+    _write_block_row(root, "feat/g19", "a1", "adversarial-audit", ["a.py:1"], ["a.py:1"])
+    state = root / ".jammi" / "gate-state" / (_slug("feat/g19") + ".jsonl")
+    rows = [json.loads(line) for line in state.read_text().splitlines() if line.strip()]
+    for r in rows:
+        r.pop("enumeration_missing", None)
+    state.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    row = rows[-1]
+    _write_relay_exact(root, row, probe=["z.py:9", "y.py:8"])  # probe, but NO sites
+    p = _run("lead-gate-pre.sh", {"tool_name": "Agent", "tool_input": {
+        "subagent_type": "adversarial-audit", "prompt": "re-audit unit: feat/g19"}}, root)
+    _assert(p.returncode == 2, "G19",
+            f"data-armed coverage must deny a probe-only relay, got {p.returncode}: {p.stderr}")
+
+
 FIXTURES = [
     ("G1", fixture_g1_first_round_never_gated),
     ("G2", fixture_g2_second_round_denied_worktree),
@@ -959,6 +1066,10 @@ FIXTURES = [
     ("G13", fixture_g13_verifier_pass_clears_audited_block_only_with_relay),
     ("G14", fixture_g14_unparseable_row_gates_like_block),
     ("G15", fixture_g15_whole_token_anchors_never_raw_substrings),
+    ("G16", fixture_g16_reactive_relay_rejected_when_enumeration_present),
+    ("G17", fixture_g17_probed_relay_accepted_when_enumeration_present),
+    ("G18", fixture_g18_probe_boundary_cases),
+    ("G19", fixture_g19_coverage_arm_selected_by_data_not_flag),
     ("T1", fixture_t1_card_schema_line_substituted_binds),
     ("T2", fixture_t2_annotated_legacy_unit_branch_binds),
     ("T3", fixture_t3_start_binds_unit_branch_colon_form),

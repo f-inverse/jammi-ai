@@ -1,0 +1,24 @@
+diff --git a/crates/jammi-kernels/src/ops/adamw_step.rs b/crates/jammi-kernels/src/ops/adamw_step.rs
+index 58a1418c..ffb2fff1 100644
+--- a/crates/jammi-kernels/src/ops/adamw_step.rs
++++ b/crates/jammi-kernels/src/ops/adamw_step.rs
+@@ -343,7 +343,18 @@ impl InplaceOp3 for AdamThetaUpdate {
+                     // standalone `Tensor - Tensor` sub.
+                     let theta_scaled = theta[it] * one_minus_lr_lambda + 0.0f32;
+                     let adj_scaled = adjusted_grad * lr + 0.0f32;
+-                    theta[it] = theta_scaled - adj_scaled;
++                    // MUTANT M_signflip (Unit 63 RED-proof pair, docs/plans/
++                    // 63-how-well/mutants/M_signflip.patch): the fused
++                    // update applied with an inverted sign -- `theta[it] +=
++                    // adj_scaled` instead of `-=` -- models the sign-error
++                    // regression class (a kernel that adds instead of
++                    // subtracts the adjusted-gradient term). This is
++                    // gradient ASCENT on the adjusted gradient: predicted
++                    // degradation with CERTAINTY, since every step now moves
++                    // theta to INCREASE loss along the gradient direction
++                    // rather than decrease it. NEVER MERGE: production must
++                    // subtract, `theta[it] = theta_scaled - adj_scaled`.
++                    theta[it] = theta_scaled + adj_scaled;
+                 }
+                 Ok(())
+             }

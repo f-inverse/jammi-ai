@@ -1,0 +1,32 @@
+diff --git a/crates/jammi-kernels/src/ops/adamw_step.rs b/crates/jammi-kernels/src/ops/adamw_step.rs
+index 58a1418c..b126aada 100644
+--- a/crates/jammi-kernels/src/ops/adamw_step.rs
++++ b/crates/jammi-kernels/src/ops/adamw_step.rs
+@@ -625,8 +625,25 @@ pub fn adamw_step_fused_t(
+             "adamw_step_fused_t: t={t} overflows i32::powi's exponent"
+         ))
+     })?;
+-    let scale_m = 1f64 / (1f64 - params.beta1.powi(t_i32));
+-    let scale_v = 1f64 / (1f64 - params.beta2.powi(t_i32));
++    // MUTANT M_nobc (Unit 63 RED-proof pair, docs/plans/63-how-well/
++    // mutants/M_nobc.patch): bias correction removed entirely -- the
++    // fused AdamW update uses RAW m/v (no `1/(1-beta^t)` correction),
++    // matching a kernel that silently skips bias correction. `t_i32`
++    // above is still computed (kept unused downstream by this mutant) so
++    // the diff stays isolated to these two scale constants. This is a
++    // SUSTAINED perturbation (unlike M1's early-transient bug): the
++    // multiplier is largest at small t (scale_m/scale_v ratio 1/(1-
++    // beta1) ~ 10x, 1/(1-beta2) ~ 1000x at t=1) and decays toward 1.0 as
++    // t grows -- the pressure-tested sustained 3.2-6.5x effective-lr
++    // blowup over a realistic step range this mutant models. Predicted
++    // direction is UNCERTAIN from the measured (1+eps) lr-scale data (see
++    // mutants/README.md): the ladder found eps=+/-0.10 (1.10x/0.90x
++    // effective lr) neutral-to-improving, but this mutant's blowup is
++    // 3-6x larger than anything the ladder measured, well outside the
++    // range the ladder's secant can vouch for. NEVER MERGE: production
++    // bias correction must remain `1/(1-beta^t)`.
++    let scale_m = 1f64;
++    let scale_v = 1f64;
+     super::apply_inplace2(
+         first_moment,
+         grad,

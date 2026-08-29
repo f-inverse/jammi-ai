@@ -585,6 +585,218 @@ separate record.
   empirically (`MutantDoseLadderTests.test_mutant_leg_never_leaks_into_the_ab_set`,
   `ci/scripts/perf/test_ab_merge.py`).
 
+## RED-proof mutants (outside the lr-scale family)
+
+**Why the `(1+eps)` lr-scale family cannot supply acceptance 5's RED.** The
+signed dose ladder (`measurements/dose-ladder/README.md`, unit 63 addendum
+2026-08-29c, run at base `494fb3e3`) DEMONSTRATED the detector — 11/12
+sign-concordance at `p=0.00635 < alpha2` on a real effect — but landed every
+scheduled dose (`eps in {-0.50, -0.10, +0.50}`) in the IMPROVEMENT direction:
+`eps-0.50` and `eps-0.10` both read `RED_FOR_INVESTIGATION` (anomalous
+improvement under deflation, `mean_d` negative both times), and `eps0.50`
+read not-detected. Per that README's own finding 3: "no degradation-RED
+among the (1+eps) family: the lr-scale knob cannot produce a degradation
+demonstration near this operating point." The lr surface near the
+campaign's `lr=2e-4` operating point is favorable in every tested
+direction (inflating OR deflating effective lr by up to 50% improves or is
+neutral to held-out loss) — this is a genuine measured property of THIS
+fixture's loss surface near THIS lr, not a detector-sensitivity gap, and no
+member of the `(1+eps)` family (however far `eps` is pushed within its
+`ab_merge.py`-validated domain) is going to flip that. Acceptance 5's
+"mutant column proven RED" therefore needs a mutant OUTSIDE the lr-scale
+shape — a defect that is not merely "the same update, rescaled" but a
+qualitatively different corruption of the fused update.
+
+Two such mutants are pinned here, both against base `e340391c`, both
+patch-file-only (never applied to tree state on this branch), both
+touching ONLY `adamw_step_fused_t`'s fused path inside
+`crates/jammi-kernels/src/ops/adamw_step.rs` (no dispatch/identity surface
+touched — `InplaceOp2::name()`/`InplaceOp3::name()`, `validate_step_domain`,
+and every `DispatchCounters`/`admission` field read identical to a clean
+fused leg, exactly as the `(1+eps)` family's own isolation note above
+requires):
+
+### `M_nobc` — bias correction removed entirely
+
+**Definition:** `adamw_step_fused_t` pins `scale_m = 1.0`, `scale_v = 1.0`
+instead of deriving them from `t` (`1/(1-beta1^t)`, `1/(1-beta2^t)`) — the
+fused update runs on RAW (uncorrected) `m`/`v` moment estimates. Models a
+realistic silent regression: a kernel that skips bias correction while
+still computing the right EMA moments and the right theta-update
+arithmetic otherwise. This is a SUSTAINED family-outside perturbation —
+unlike M1's `t+1` off-by-one (a sign-flipping early transient that decays
+toward a `~1.009` multiplier by `t=50`, `measurements/campaign-v1/`'s own
+finding), the uncorrected-scale multiplier is monotone-decaying-toward-1.0
+from a LARGE start (`scale_m` ratio to the correct value is `1/(1-beta1^t)`,
+`~10x` at `t=1` for `beta1=0.9`; `scale_v`'s ratio is `~1000x` at `t=1` for
+`beta2=0.999`) — a one-directional (never sign-flipping) effective-lr
+blowup, matching the "sustained 3.2-6.5x effective-lr blowup" the earlier
+pressure-test (CONTRACT.md amendment 2026-08-29b item 3's own root-cause
+analysis of M1) computed over a realistic step range.
+
+**Predicted direction: UNCERTAIN, stated honestly.** The measured
+`(1+eps)` lr-scale data gives no clean extrapolation to this mutant's
+magnitude: `eps=+-0.10` (a 1.10x/0.90x effective-lr multiplier) read
+neutral-to-improving on this fixture, but `M_nobc`'s blowup is 3-6x LARGER
+than anything the ladder measured — well outside the range the ladder's own
+secant (measurements/dose-ladder's own README, and the earlier prediction
+table above) can vouch for. A 3-6x effective-lr blowup at early steps
+plausibly destabilizes training (the "too-large-lr degradation regime" the
+prediction table above names as the mechanism that could reverse the
+secant's sign) — but it is equally plausible that a large early-step
+transient (m/v are zero-initialized, so v_hat's `eps` floor and the
+`sqrt(v_hat)` denominator both damp the blowup's practical effect on
+`adjusted_grad`) washes out over a full training run the way M1's transient
+did. No claim of degradation is made for `M_nobc` before it is actually
+run; this is the honest complement to `M_signflip` below.
+
+### `M_signflip` — inverted-sign update (gradient ascent)
+
+**Definition:** `AdamThetaUpdate::cpu_fwd`'s final line is changed from
+`theta[it] = theta_scaled - adj_scaled` to
+`theta[it] = theta_scaled + adj_scaled` — the fused update applied with the
+sign of the adjusted-gradient term inverted. Every other computation
+(moment EMAs, bias correction, `denom`, `adjusted_grad`) is byte-identical
+to the correct kernel; only the final combine's sign flips. Models the
+sign-error regression class: a kernel that adds instead of subtracts the
+update (e.g. a `-=`/`+=` typo, or a sign lost in a refactor of the
+theta-update expression).
+
+**Predicted direction: DEGRADATION, with CERTAINTY.** Mechanism: for any
+nonzero gradient, `adjusted_grad` points in the direction that DECREASES
+loss (that is what a gradient step is); adding it instead of subtracting it
+is gradient ASCENT on that same direction — theta is driven to INCREASE
+loss every single step, compounding for the length of the run. This
+prediction requires no secant extrapolation from the measured lr data at
+all (unlike `M_nobc`) — it follows directly from what a gradient step IS,
+independent of this fixture's particular loss-surface geometry near
+`lr=2e-4`. `M_signflip` is therefore the guaranteed RED-proof member of
+this pair: if `M_nobc` reads neutral-or-improving (plausible per its own
+uncertain prediction above), `M_signflip` still discharges acceptance 5's
+"mutant column proven RED" on its own.
+
+**CPU demonstration (not committed, per the dose ladder's own procedure
+above):** the same temporary
+`mutant_dose_demonstration_diverges_from_the_correct_oracle` test, run once
+per mutant (patch applied, test added, `cargo test -p jammi-kernels --lib
+mutant_dose_demonstration -- --nocapture`, both patch and test reverted via
+`git checkout --` before moving to the next mutant), on the SAME fixed
+4-element input the dose ladder used (`theta=[0.5,-1.25,3.0,0.0]`,
+`g=[0.1,-0.2,0.05,0.0]`, `beta1=0.9, beta2=0.999, lr=1e-3,
+weight_decay=0.01, eps=1e-8`), 5 consecutive steps:
+
+```
+M_nobc:
+step=1 l2_divergence=3.7451058e-3
+step=2 l2_divergence=9.373536e-3
+step=3 l2_divergence=1.6215533e-2
+step=4 l2_divergence=2.3908453e-2
+step=5 l2_divergence=3.221707e-2
+
+M_signflip:
+step=1 l2_divergence=3.464057e-3
+step=2 l2_divergence=6.928114e-3
+step=3 l2_divergence=1.0392154e-2
+step=4 l2_divergence=1.38561595e-2
+step=5 l2_divergence=1.7320165e-2
+```
+
+Both mutants are real, non-trivial, growing perturbations against the
+file's own `eager_step` oracle (neither a no-op nor a copy of the other's
+constant) — `M_nobc`'s divergence is dominated by the early-step bias-
+correction blowup (largest relative effect at small `t`, per its own
+definition above); `M_signflip`'s divergence is dominated by the
+compounding sign error (every step moves theta the wrong way, so the
+divergence from the correct trajectory grows every step regardless of
+`t`). Neither ratio is claimed to `x`-scale linearly the way the signed
+`(1+eps)` family's dose-to-dose ratios do — these are NOT members of that
+one-parameter family, so no such linear relationship is predicted or
+claimed here.
+
+**Patch sha256s** (both against base `e340391c`, verified `git apply
+--check` clean at that sha, verified apply -> `cargo build -p jammi-kernels`
+(exit 0) -> `git checkout --` revert, independently, one mutant at a time):
+
+- `M_nobc.patch` — sha256
+  `9b3c824dc041899c12c0e2d44d12a3ac8c7b86076ffc778638108925ba51bf4e`
+- `M_signflip.patch` — sha256
+  `fb2bd11935e9a08e8a1197aa3a84535660119823aabb421105e389a388f6e5e4`
+
+**Run procedure:** identical to the dose ladder's own on-pod procedure
+above (scratch worktree at the recorded base sha, `git apply --check` then
+`git apply`, build with the campaign's exact feature list, run the SAME
+12-seed `run_leg` vector substituted into the fused arm, merge against the
+SAME campaign `alloff` legs, stamp `--mutant-id`/`--mutant-base-sha`/
+`--mutant-patch-sha256`, tear down after) — with dose labels `nobc` and
+`signflip` in place of an `epsNN` label.
+
+**Merger-label finding (REQUIRED before scheduling either mutant to
+run): `ab_merge.py`'s `--mutant-legs` path does NOT provide a "stays out
+of the sensitivity/falsification scans" carve-out for a non-eps label —
+it hard-refuses the WHOLE dose-ladder computation instead.** Traced
+through `ci/scripts/perf/ab_merge.py`:
+
+- `build_mutant_dose_column` (the function that actually reads the mutant's
+  legs and computes `detected`/`n_pos`/`n_neg`/`mean_d`/`p_value`/
+  `clean_pair_count`) never calls `_dose_label_eps` — `dose_label` is used
+  there only as an opaque string (`mutant_leg_repeat_tag(dose_label)` for
+  leg file lookup, and in violation messages). A `nobc`/`signflip` column's
+  own measured verdict IS therefore computed correctly and lands in
+  `mutant_dose_ladder.doses[]` regardless of whether the label parses as a
+  signed eps.
+- But `mutant_dose_ladder_sensitivity`, `mutant_dose_ladder_two_sided_
+  falsification`, `mutant_dose_ladder_anomalies`, and
+  `mutant_dose_ladder_reject_duplicate_doses` each call `_dose_label_eps`
+  UNCONDITIONALLY over EVERY column in the full `dose_columns` list passed
+  to them (e.g. `mutant_dose_ladder_sensitivity`'s
+  `(col for col in dose_columns if _dose_label_eps(col["dose_label"]) < 0.0)`
+  evaluates the parse for every column to decide inclusion; `_anomalies`
+  loops `for col in dose_columns: eps = _dose_label_eps(...)` before ever
+  checking sign or `detected`). `_dose_label_eps` requires the label to
+  start with the literal prefix `"eps"` (`ab_merge.py`'s own
+  `_dose_label_eps` docstring/body) and raises
+  `MutantDoseLadderSensitivityError` otherwise.
+- `main()`'s `finetune-run` handler wraps ALL FOUR of those calls in ONE
+  `try/except MutantDoseLadderSensitivityError` block, over the FULL
+  `dose_columns` assembled from every `--mutant-legs` spec passed to that
+  single invocation. So: a non-eps label (`nobc`, `signflip`) supplied in
+  the SAME `--mutant-legs` set as any eps-labeled dose (e.g. alongside
+  `eps-0.50`) makes the exception propagate and blanks `sensitivity`,
+  `two_sided_falsification`, and `dose_anomalies` to `None`/`[]`/`[]` for
+  **every** column in that invocation — including the co-scheduled eps
+  doses — and sets `sensitivity_error` plus `exit_code=1` for the whole
+  merge. This is collateral damage, not a scoped carve-out: it is not that
+  the merger quietly drops the non-eps column from the scans while still
+  reporting the eps doses' own sensitivity finding; it refuses the ENTIRE
+  ladder's derived findings for that merge invocation.
+- Running `nobc`/`signflip` in their OWN, separate `ab_merge.py
+  finetune-run ... --mutant-legs nobc:<sha>:<seeds> --mutant-legs
+  signflip:<sha>:<seeds>` invocation (never combined with any eps-labeled
+  `--mutant-legs` entry) isolates the blast radius to that invocation's own
+  JSON artifact — it does NOT retroactively corrupt the already-recorded
+  dose-ladder merge (a separate invocation, a separate
+  `finetune_run_ab_report.json`). But even alone, that separate invocation
+  will STILL raise `MutantDoseLadderSensitivityError` (since `nobc`/
+  `signflip` never start with `"eps"`), so its OWN `sensitivity`/
+  `two_sided_falsification`/`dose_anomalies` come back `None`/`[]`/`[]`
+  with `sensitivity_error` set and `exit_code=1`. This is the CORRECT
+  designed behavior for a label genuinely outside the signed-eps family —
+  not a bug to route around — and per this task's own scope, no merger
+  code change is proposed here.
+
+**Minimal labeling convention (no merger change, per task scope):**
+schedule `M_nobc`/`M_signflip` as a run in their own, separate
+`ab_merge.py finetune-run` invocation, disjoint from any `--mutant-legs
+epsNN:...` set. Read the RED-proof verdict directly off that invocation's
+`mutant_dose_ladder.doses[i].detected` (and `n_pos`/`n_neg`/`mean_d`/
+`p_value`) — the fields `build_mutant_dose_column` computes independently
+of `_dose_label_eps` — never off `sensitivity`/`two_sided_falsification`/
+`dose_anomalies`, which are expected (by design) to read `sensitivity_error`
+with `exit_code=1` for this invocation. Treat that non-zero exit code as
+"expected, informational: this column is outside the signed-eps family by
+construction" for a `nobc`/`signflip` merge, not as a run failure, and cite
+`doses[].detected` in the acceptance-5 writeup as the actual RED evidence.
+
 ## Files
 
 - `M1.patch` — the retired mutant's committed unified diff (patch-file-only;
@@ -604,4 +816,14 @@ separate record.
   **scheduled**.
 - All five `M_eps_*.patch` files are patch-file-only — never applied to
   tree state on this branch.
+- `M_nobc.patch` — bias correction removed entirely (RED-proof pair,
+  outside the lr-scale family); committed unified diff against `e340391c`;
+  sha256 `9b3c824dc041899c12c0e2d44d12a3ac8c7b86076ffc778638108925ba51bf4e`;
+  patch-file-only; predicted direction UNCERTAIN (see "RED-proof mutants"
+  above).
+- `M_signflip.patch` — inverted-sign fused update (RED-proof pair, outside
+  the lr-scale family); committed unified diff against `e340391c`; sha256
+  `fb2bd11935e9a08e8a1197aa3a84535660119823aabb421105e389a388f6e5e4`;
+  patch-file-only; predicted DEGRADATION with certainty (see "RED-proof
+  mutants" above) — the guaranteed RED-proof member of this pair.
 - `README.md` — this file.

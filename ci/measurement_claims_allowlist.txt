@@ -1,0 +1,77 @@
+# ci/measurement_claims_allowlist.txt -- shrink-only ledger for
+# check_measurement_claims.py's `ledger` escape (esc-065, reused
+# idiom from ci/perf_claims_allowlist.txt). One `file:token:sha1(line):col`
+# key per line, grows ONLY via a human-reviewed PR --
+# --check-allowlist-only-shrinks fails on any entry the current branch
+# adds relative to origin/main.
+docs/plans/63-how-well/measurements/campaign-v1/README.md:12:c4c26c1beccaf535248683f61ff835cf221c7baf:36
+docs/plans/63-how-well/measurements/campaign-v1/README.md:0.744:398dcce6d67e89aeb3c17d8640ecac35fea08fe2:17
+docs/plans/63-how-well/measurements/campaign-v1/README.md:1.009:398dcce6d67e89aeb3c17d8640ecac35fea08fe2:33
+docs/plans/63-how-well/measurements/campaign-v1/README.md:0:dabab96e1de40c14ef270385303eee04c0822372:71
+docs/plans/63-how-well/measurements/campaign-v2/README.md:24:01b6d5ecc31d8564c8a2696ef2fca4f140a28879:68
+docs/plans/63-how-well/measurements/campaign-v2/README.md:24:ecd60f16e2796bae83676546416f31d36d082111:12
+docs/plans/63-how-well/measurements/campaign-v2/README.md:0:ecd60f16e2796bae83676546416f31d36d082111:26
+docs/plans/63-how-well/measurements/dose-ladder/README.md:36:4035e0c176943513b0e10358204265135eb3d119:0
+docs/plans/63-how-well/measurements/dose-ladder/README.md:1:b6c9a1b5e39a0aa64fbbbc5e5a8c261ece86600e:22
+docs/plans/63-how-well/measurements/dose-ladder/README.md:0.04:20c646536fa8e10201a2e512a52b0f6f70904c1f:31
+docs/plans/63-how-well/measurements/dose-ladder/README.md:0.07:20c646536fa8e10201a2e512a52b0f6f70904c1f:36
+docs/plans/63-how-well/measurements/red-proof/README.md:36:4e07d2bd68214896bb13f35e63c527029bf5ba05:0
+docs/plans/63-how-well/measurements/red-proof/README.md:3:4e07d2bd68214896bb13f35e63c527029bf5ba05:13
+docs/plans/63-how-well/measurements/red-proof/README.md:12:4e07d2bd68214896bb13f35e63c527029bf5ba05:25
+docs/plans/63-how-well/measurements/red-proof/README.md:1:7b4cf6bc08dbdd026922f57ee862d553f4265e15:36
+docs/plans/63-how-well/measurements/red-proof/README.md:1,2:7b4cf6bc08dbdd026922f57ee862d553f4265e15:42
+docs/plans/63-how-well/measurements/red-proof/README.md:1:0bf85580361cc97e858637a0439a07138ba7121e:81
+docs/plans/63-how-well/measurements/red-proof/README.md:5:aa82159426971718df74bb65ade11c84e9ce93d3:58
+docs/plans/63-how-well/measurements/red-proof/README.md:12:aa82159426971718df74bb65ade11c84e9ce93d3:60
+docs/plans/63-how-well/measurements/red-proof/README.md:-0.0183:aa82159426971718df74bb65ade11c84e9ce93d3:71
+docs/plans/63-how-well/measurements/red-proof/README.md:2:aa82159426971718df74bb65ade11c84e9ce93d3:90
+docs/plans/63-how-well/measurements/red-proof/README.md:12:47434c6ba0c7f83889a814800d24714bd957df91:83
+docs/plans/63-how-well/measurements/red-proof/README.md:12:47434c6ba0c7f83889a814800d24714bd957df91:86
+docs/plans/63-how-well/measurements/red-proof/README.md:12:b87cbef036bf31e0ba11624b3a3a7df392d86bfc:49
+docs/plans/63-how-well/measurements/red-proof/README.md:12:b87cbef036bf31e0ba11624b3a3a7df392d86bfc:52
+docs/plans/63-how-well/measurements/red-proof/README.md:+19.2:b87cbef036bf31e0ba11624b3a3a7df392d86bfc:90
+docs/plans/63-how-well/measurements/red-proof/README.md:2:b87cbef036bf31e0ba11624b3a3a7df392d86bfc:122
+docs/plans/63-how-well/measurements/red-proof/README.md:4096:b87cbef036bf31e0ba11624b3a3a7df392d86bfc:124
+docs/plans/63-how-well/measurements/red-proof/README.md:1:b87cbef036bf31e0ba11624b3a3a7df392d86bfc:131
+docs/plans/63-how-well/measurements/red-proof/README.md:2048:b87cbef036bf31e0ba11624b3a3a7df392d86bfc:133
+docs/plans/63-how-well/measurements/red-proof/README.md:1:b87cbef036bf31e0ba11624b3a3a7df392d86bfc:172
+docs/plans/63-how-well/measurements/red-proof/README.md:4096:b87cbef036bf31e0ba11624b3a3a7df392d86bfc:174
+docs/plans/63-how-well/measurements/red-proof/README.md:12:b87cbef036bf31e0ba11624b3a3a7df392d86bfc:191
+docs/plans/63-how-well/measurements/red-proof/README.md:12:b87cbef036bf31e0ba11624b3a3a7df392d86bfc:194
+docs/plans/63-how-well/measurements/red-proof/README.md:0:70fde9311ef7fbaa92d0e1153cf596b89baa2291:53
+docs/plans/63-how-well/measurements/red-proof/README.md:12:70fde9311ef7fbaa92d0e1153cf596b89baa2291:55
+docs/plans/63-how-well/measurements/red-proof/README.md:12:2d7e4a425009979dc99fa75597bfd0d4517a7da9:37
+docs/plans/63-how-well/measurements/red-proof/README.md:12:2d7e4a425009979dc99fa75597bfd0d4517a7da9:40
+docs/plans/63-how-well/measurements/red-proof/README.md:12:73f9d5b7a4259152b5980a58729016804bd5fe80:17
+docs/plans/63-how-well/measurements/red-proof/README.md:12:73f9d5b7a4259152b5980a58729016804bd5fe80:20
+docs/plans/63-how-well/measurements/red-proof/README.md:0:b0876c5b7d18e2a1b5644f74cf69daded6c81bc8:65
+docs/plans/63-how-well/measurements/red-proof/dstar/README.md:0:6120220e79239262d9cf45ad7cd952a68d3e0b7c:16
+docs/plans/63-how-well/measurements/red-proof/dstar/README.md:3.3:e1b2fea1c887abdca215d39dac8a8b7ff7655a06:18
+docs/plans/63-how-well/measurements/red-proof/dstar/README.md:20:e1b2fea1c887abdca215d39dac8a8b7ff7655a06:26
+docs/plans/63-how-well/measurements/red-proof/dstar/README.md:11:e1b2fea1c887abdca215d39dac8a8b7ff7655a06:32
+docs/plans/63-how-well/measurements/red-proof/dstar/README.md:12:e1b2fea1c887abdca215d39dac8a8b7ff7655a06:38
+docs/plans/63-how-well/measurements/red-proof/dstar/README.md:11:8b92112933a273307b1eaa740877e7533aa7ecc0:66
+docs/plans/63-how-well/mutants/README.md:0.744:6090c25e058c18b1754dcc8b5a80d0f732ffc092:42
+docs/plans/63-how-well/mutants/README.md:1.009:bc6a451cb87f5df9a88526c99f2f4c7e9dc9cf96:2
+docs/plans/63-how-well/mutants/README.md:36:053369780f560b99194aae220e8335ecdfe915fa:10
+docs/plans/63-how-well/mutants/README.md:0:44af957d109581ce82164aa6042dc258bacdf68c:40
+docs/plans/63-how-well/mutants/README.md:12:44af957d109581ce82164aa6042dc258bacdf68c:42
+docs/plans/63-how-well/mutants/README.md:12:de0b78e1da73bfa6684eb959e009d05d383c8518:36
+docs/plans/63-how-well/mutants/README.md:12:de0b78e1da73bfa6684eb959e009d05d383c8518:61
+docs/plans/63-how-well/mutants/README.md:2:c599432bc6f32ea4ea2e09b980c77e65180e3253:45
+docs/plans/63-how-well/mutants/README.md:12:c599432bc6f32ea4ea2e09b980c77e65180e3253:61
+docs/plans/63-how-well/mutants/README.md:12:edb8411d2ebea113a077b0c6ddcb4d56d6119e9d:34
+docs/plans/63-how-well/mutants/README.md:12:fa76498ce08b9232f3047e543ecfaeb295df33bf:4
+docs/plans/63-how-well/mutants/README.md:12:b6780985521b334af23b9b1b913bd8995d3adc7c:60
+docs/plans/63-how-well/mutants/README.md:12:b6780985521b334af23b9b1b913bd8995d3adc7c:63
+docs/plans/63-how-well/mutants/README.md:36:68547f09f534153037710f0fea26a704453e1fce:0
+docs/plans/63-how-well/mutants/README.md:3.464057e-3:1582bdd5b415f180f26cc97881eeb5964c7633e4:2
+docs/plans/63-how-well/mutants/README.md:1.7320165e-2:1582bdd5b415f180f26cc97881eeb5964c7633e4:17
+docs/plans/63-how-well/mutants/README.md:3.464057e-3:8092b41cfdaa08d2d71710200daabbd28cbf38c7:2
+docs/plans/63-how-well/mutants/README.md:1.7320165e-2:8092b41cfdaa08d2d71710200daabbd28cbf38c7:17
+docs/plans/63-how-well/mutants/README.md:0:8d73deb37661a6a2632765bd8e8c7d16f67cbbc7:41
+docs/plans/63-how-well/mutants/README.md:36:9b0b3555c8e1cf3b252c464065c9bf1394fba4d6:71
+docs/plans/63-how-well/mutants/README.md:12:d9a8fb0f5bb88dc764699c1bc3011083791b359b:4
+docs/plans/63-how-well/mutants/README.md:12:613f7819a1617b55939ca359a0a083a92592f649:20
+docs/plans/63-how-well/mutants/README.md:2:101f18c412edd4fc86e3f369c78cfb9237cfd2d1:10
+docs/plans/63-how-well/mutants/README.md:2:332ea19113e8c5887861363981319ef2204c7c92:63

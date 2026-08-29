@@ -20,6 +20,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::array::{ArrayRef, StringArray};
 use jammi_ai::concurrency::GpuScheduler;
@@ -513,6 +514,21 @@ async fn warm_hit_after_preprocessor_config_appearing_reloads_fresh() {
 /// `weights_len` bytes back to the scheduler immediately — `available()`
 /// would read `weights_len` (nonzero) instead of `0`, silently reporting
 /// room that does not physically exist (double-booking).
+///
+/// **Deliberately NOT a test of item 2's admission-wait fallback (unit-62
+/// design pressure-test).** `2 * weights_len` is the genuine MINIMUM budget
+/// this test's own scenario requires — both the pre-mutation model (via
+/// `warm_guard`, held open on purpose) and the freshly-reloaded
+/// post-mutation model must be able to be resident AT THE SAME TIME for the
+/// `available() == 0` assertion below to mean anything, so `do_load`'s
+/// admission loop here always succeeds on its very first `try_acquire` and
+/// never calls `evict_one` or falls back to `GpuScheduler::acquire`'s async
+/// wait at all. See
+/// `stale_reload_while_guard_live_waits_for_release_under_a_realistic_budget`
+/// below for the item-2-specific coverage: a budget sized to exactly ONE
+/// resident copy (not two), where the SAME "guard held across a stale
+/// reload" shape must WAIT for the guard's release instead of either
+/// double-booking (impossible at 1x) or hard-erroring (item 2's fix).
 #[tokio::test]
 async fn stale_eviction_never_double_books_gpu_memory_while_guard_held() {
     let tmp = tempdir().unwrap();
@@ -609,6 +625,158 @@ async fn stale_eviction_never_double_books_gpu_memory_while_guard_held() {
         "dropping the cache (its entry's last permit clone) must return the \
          scheduler to its full budget — the permit is never permanently leaked"
     );
+}
+
+// ── Unit-62 design pressure-test, item 2 (block): double-reservation \
+//    liveness — a stale reload while a guard is live must WAIT, never \
+//    hard-error, under a realistically-sized budget ──
+
+/// Item 2: the stale path (`get_or_load`'s `Ok(false)` arm) evicts the
+/// `CacheEntry` while `warm_guard` still holds a live clone of its
+/// `Arc<GpuPermit>` — the reload that follows transiently needs this
+/// model's budget TWICE (the still-reserved pre-mutation bytes, held open
+/// by `warm_guard`, plus the freshly-resolved post-mutation bytes) before
+/// `warm_guard` is ever dropped. Budget here is sized to exactly ONE
+/// resident copy (`weights_len`, NOT `2 * weights_len` —
+/// [`stale_eviction_never_double_books_gpu_memory_while_guard_held`]'s
+/// budget is deliberately generous for a DIFFERENT scenario; see its own
+/// doc for why that test cannot exercise this path at all): a realistic
+/// production sizing, exactly what a single resident copy of this model
+/// needs and no more.
+///
+/// RED pre-fix (`do_load`'s admission loop hard-errors as soon as
+/// `evict_one` finds nothing — the stale entry is already gone by the time
+/// admission runs, so there is nothing left to evict even though the
+/// request is perfectly satisfiable once `warm_guard` releases): the
+/// spawned reload task resolves almost immediately with
+/// `Err("Cannot acquire GPU memory: nothing to evict")`, regardless of
+/// whether `warm_guard` has been dropped yet — the "must still be pending"
+/// assertion below fails (the task has already completed), and the final
+/// join fails too (`Err`, never `Ok`).
+///
+/// GREEN post-fix: `do_load` falls back to `GpuScheduler::acquire`'s async
+/// wait once `evict_one` finds nothing AND the request is within the
+/// scheduler's total usable budget (`memory_bytes <= usable_capacity()` —
+/// here `memory_bytes == weights_len == usable_capacity()`, so this is NOT
+/// the genuinely-over-budget case) — the reload genuinely blocks until
+/// `warm_guard`'s `Drop` releases its permit clone and calls
+/// `notify_waiters`, then succeeds.
+#[tokio::test]
+async fn stale_reload_while_guard_live_waits_for_release_under_a_realistic_budget() {
+    let tmp = tempdir().unwrap();
+    let catalog_dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
+
+    let dir = tiny_bert_dir(
+        tmp.path(),
+        "realistic_budget_wait_model",
+        &cls_pooling_config(),
+    );
+    let weights_len = std::fs::metadata(dir.join("model.safetensors"))
+        .unwrap()
+        .len() as usize;
+
+    // Realistic budget: exactly ONE resident copy, no slack for a second,
+    // transient one.
+    let scheduler = Arc::new(GpuScheduler::new(weights_len, 0.0));
+    let resolver =
+        ModelResolver::new(Arc::clone(&catalog), crate::common::test_artifact_store()).unwrap();
+    let device_config = DeviceConfig {
+        gpu_device: -1,
+        memory_fraction: 1.0,
+        require_gpu: false,
+        compute_precision: jammi_numerics::ComputePrecision::F32,
+    };
+    let cache = Arc::new(ModelCache::new(
+        resolver,
+        device_config,
+        Arc::clone(&scheduler),
+    ));
+    let source = ModelSource::local(&dir);
+
+    // (1) Warm the cache and KEEP THE GUARD — the budget is now fully
+    // reserved by `warm_guard` alone.
+    let warm_guard = cache
+        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        scheduler.available(),
+        0,
+        "the realistic 1x budget is fully reserved by warm_guard alone"
+    );
+
+    // (2) Length-changing in-place mutation (F-4a discipline) — trips the
+    // staleness probe on the next call.
+    let pooling_config_path = dir.join("1_Pooling/config.json");
+    let mutated = serde_json::to_string(&with_length_marker(mean_pooling_config())).unwrap();
+    std::fs::write(&pooling_config_path, &mutated).unwrap();
+
+    // (3) Spawn the reload WHILE `warm_guard` is still held — this is the
+    // exact shape that needs the model's budget TWICE, transiently.
+    let cache_for_reload = Arc::clone(&cache);
+    let source_for_reload = source.clone();
+    let mut reload_task = tokio::spawn(async move {
+        cache_for_reload
+            .get_or_load(&source_for_reload, ModelTask::TextEmbedding, None)
+            .await
+    });
+
+    // (4) The reload must NOT complete yet: `warm_guard` is still held, the
+    // budget cannot admit a second resident copy, and the fixed behavior
+    // waits rather than erroring. A generous 500ms bound — far more than a
+    // hermetic tiny_bert resolve+load needs, but nowhere near long enough
+    // to look like a hang — turns a REGRESSION (the pre-fix hard error,
+    // which returns almost immediately) into a fast, clear assertion
+    // failure instead of relying on indefinite blocking to "prove" a wait.
+    let still_pending = tokio::time::timeout(Duration::from_millis(500), &mut reload_task).await;
+    match still_pending {
+        Err(_elapsed) => {
+            // Timed out waiting for completion — genuinely still pending,
+            // exactly what a WAIT (not a hard error) looks like.
+        }
+        Ok(joined) => match joined.unwrap() {
+            Ok(_guard) => panic!(
+                "the reload completed (Ok) BEFORE warm_guard was dropped, while \
+                 the realistic 1x budget could not possibly admit a second \
+                 resident copy — this should be structurally impossible either \
+                 way, fixed or not"
+            ),
+            Err(e) => panic!(
+                "the reload completed BEFORE warm_guard was dropped, while the \
+                 realistic 1x budget could not possibly admit a second resident \
+                 copy — this can only mean the pre-fix hard error path ran \
+                 instead of waiting (item 2's regression): got Err({e})"
+            ),
+        },
+    }
+
+    // (5) Release the budget: dropping `warm_guard` frees its reservation
+    // and wakes the waiting reload via `GpuPermit::drop`'s
+    // `notify_waiters()`.
+    drop(warm_guard);
+
+    // (6) The reload must now complete successfully, within a generous
+    // bound.
+    let joined = tokio::time::timeout(Duration::from_secs(10), reload_task).await;
+    let result = match joined {
+        Ok(joined) => joined.unwrap(),
+        Err(_) => panic!(
+            "the reload never completed within 10s after warm_guard's release — \
+             a hang would mean GpuScheduler::acquire's wait never woke, which \
+             would itself be a distinct regression from the hard-error bug this \
+             test targets"
+        ),
+    };
+    match result {
+        Ok(guard) => drop(guard),
+        Err(e) => panic!(
+            "the reload must succeed once warm_guard's reservation is released \
+             — never a hard error on a request that is perfectly satisfiable \
+             once the outgoing guard's memory is actually freed (item 2) — got \
+             Err({e})"
+        ),
+    }
 }
 
 // ── F-4' (audit round 62, adversarial round 3): a deleted OPTIONAL \
@@ -752,16 +920,30 @@ async fn warm_hit_after_optional_pooling_config_deleted_reloads_fresh_never_wedg
     );
 }
 
-/// F-4' control: `model.safetensors` is a REQUIRED candidate — the loader
-/// has no fallback for missing weights. Deleting it must keep the EXISTING
-/// typed refusal (K2) behaviour, unchanged from before F-4' — a reload would
-/// fail identically, so there is nothing to gain by evicting. Calling
-/// `get_or_load` TWICE after the deletion must refuse BOTH times,
-/// deterministically (never "errors once, then something else happens" —
-/// the auditor's own split (c), verified: this is the REQUIRED-candidate
-/// arm that stays a refusal on purpose, not a regression).
+/// F-4' control, UPDATED for unit-62 design pressure-test item 3
+/// (evict-on-`Err`, wedge elimination): `model.safetensors` is a REQUIRED
+/// candidate — the loader has no fallback for missing weights. Deleting it
+/// must keep the EXISTING typed refusal (K2) behavior on the FIRST
+/// post-deletion call — the probe's own "no longer readable" message.
+/// Calling `get_or_load` TWICE after the deletion must refuse BOTH times
+/// (never silently start succeeding), but the two refusals are no longer
+/// required — nor expected — to be byte-identical: `probe`'s `Err` arm now
+/// evicts the `CacheEntry` before returning (see `ModelFingerprint::probe`'s
+/// arm-(c) doc), so the SECOND call is cold-equivalent — it takes the full
+/// resolve + load path instead of re-probing the identical dead entry, and
+/// hits `ModelResolver::resolve_local`'s OWN typed "no weights found" error
+/// instead of the probe's "no longer readable" one. Same observable
+/// contract (refusal, deterministically, both times), different message —
+/// proving there is no permanent wedge on this identical stale entry.
+///
+/// RED pre-fix (revert item 3's `evict_if_current` call in the `Err` arm):
+/// the entry stays cached after the first `Err`, so the SECOND call
+/// re-probes the SAME entry and re-hits the identical "no longer readable"
+/// message — `msg_2` would equal `msg_1` and `msg_2` would still contain
+/// "no longer readable", both assertions below inverted from what this test
+/// now asserts.
 #[tokio::test]
-async fn warm_hit_after_required_weights_deleted_stays_a_typed_refusal_both_calls() {
+async fn warm_hit_after_required_weights_deleted_evicts_and_second_call_hits_the_load_path() {
     let tmp = tempdir().unwrap();
     let catalog_dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
@@ -791,25 +973,43 @@ async fn warm_hit_after_required_weights_deleted_stays_a_typed_refusal_both_call
     };
     assert!(
         msg_1.contains("no longer readable"),
-        "expected the esc-058 staleness-probe typed refusal message, got: {msg_1}"
+        "expected the esc-058 staleness-probe's typed refusal message on the \
+         FIRST post-deletion call (the probe itself is what detects the \
+         deletion), got: {msg_1}"
     );
 
+    // SECOND, CONSECUTIVE call: the wedge check. Pre-fix, this would hit
+    // the identical still-cached, still-dead entry and re-`Err` with the
+    // SAME probe message forever. Post-fix (item 3), the first call's `Err`
+    // arm evicted the entry, so this call is cold-equivalent — it must
+    // still refuse (the weights file is still gone), but via the LOADER's
+    // own typed error, never the probe's.
     let result_2 = cache
         .get_or_load(&source, ModelTask::TextEmbedding, None)
         .await;
     let msg_2 = match result_2 {
         Err(e) => e.to_string(),
         Ok(_) => panic!(
-            "a SECOND get_or_load after the first typed refusal must refuse \
-             identically — never silently start succeeding with a corrupted \
-             or half-loaded state"
+            "a SECOND get_or_load after the first typed refusal must ALSO \
+             refuse — the weights file is still missing, so a cold reload \
+             cannot possibly succeed either — never silently start \
+             succeeding with a corrupted or half-loaded state"
         ),
     };
-    assert_eq!(
+    assert!(
+        msg_2.contains("No model weights found"),
+        "expected the SECOND call's refusal to come from \
+         `ModelResolver::resolve_local`'s own typed error (proving the \
+         entry was evicted and this call took the cold path), not the \
+         probe's — got: {msg_2}"
+    );
+    assert_ne!(
         msg_1, msg_2,
-        "two consecutive calls against the same unrecoverable REQUIRED-file \
-         deletion must produce the IDENTICAL typed refusal — deterministic, \
-         not a wedge into some other failure mode"
+        "the two refusals must come from DIFFERENT code paths (probe vs. \
+         cold resolve) — evict-on-Err (item 3) means the second call never \
+         re-probes the same dead entry, so it never reproduces the FIRST \
+         call's exact message; a wedge would keep serving byte-identical \
+         messages here forever"
     );
 }
 
@@ -839,6 +1039,26 @@ async fn warm_hit_after_required_weights_deleted_stays_a_typed_refusal_both_call
 /// handles, the direct, non-vacuous signal that a real evict+reload cycle
 /// ran rather than the fast path short-circuiting on a stale-but-undetected
 /// probe.
+///
+/// **Framing correction (unit-62 design pressure-test, item 4a).** The
+/// "persisted record" language above must not be read as the catalog row
+/// being some fixed, identity-pinned fact once written. `Catalog::register_model`
+/// (`model_repo.rs:159-167`) is an UNCONDITIONAL UPSERT on every load:
+/// `backend`, `task`, and `model_type` are overwritten with
+/// `excluded.<col>` on every `ON CONFLICT`, last-writer-wins — only
+/// `artifact_path` gets the `COALESCE(excluded, existing)` set-but-never-
+/// clear treatment. So this test's observed pinning (the reload keeps
+/// resolving Candle/`model.safetensors` rather than flipping to ORT/
+/// `model.onnx`) is NOT a guarantee that the catalog row is immutable or
+/// that re-registration is a no-op; it is a consequence of
+/// `try_catalog_lookup`'s catalog-FIRST precedence over `resolve_local`'s
+/// on-disk heuristic, for THIS specific model's second load — a different
+/// sequence (e.g. a load with a different `backend_hint`, which
+/// `try_catalog_lookup` honors over the persisted `backend`) can and does
+/// re-derive a different backend on the very next call. Cache-key
+/// narrower-than-resolve-key (backend_hint mismatch specifically) is one of
+/// unit 65's classes, not something this test's pinning observation
+/// contradicts or resolves.
 ///
 /// RED pre-round-10: the weights slot's fingerprint only ever tracked the
 /// SELECTED arm (`model.safetensors`) — `model.onnx` appearing was invisible

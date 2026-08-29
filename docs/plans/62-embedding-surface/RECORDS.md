@@ -216,3 +216,17 @@ either is invisible to the rule. This is a reviewed, deliberate scope decision (
 true-but-deliberate), not an oversight this unit corrects — OQ7's ruling is that widening KO-7's
 scan roots is its own human-merged tightening PR, never folded into a feature unit's diff. No
 such PR exists yet; the scope gap stands as recorded.
+
+
+### Evidence supersession for the two items recorded OPEN above (lead packaging, 2026-08-29)
+
+Both events occurred during this unit's pod campaign and their run logs are now COMMITTED:
+
+- K4 post-fix re-run: `measurements/pod-runs/k4-rerun-a100.txt` — `grpc_remote_session_gpu`
+  2 passed / 0 failed under `JAMMI_REQUIRE_CUDA=1` on pod cjjh6oaqehvpwi (A100-SXM4-80GB),
+  tree `15311303` (the Utf8View keying fix's head; the fix commit is `0e5f777d`).
+- Linux CPU-floor confirmation: `measurements/pod-runs/cpu-floor-legs-4pods.txt` — the four
+  f32 invariance legs (oracle + both red controls + padded-training parity) 4-passed/0-failed
+  on ALL FOUR Linux pods (job verdict lines per pod, `CPU-FLOOR-LEG-RC:0` x4), tree `8e88a32c`
+  — CONFIRMING the macOS-measured `PROVISIONAL_CPU_FLOOR` on Linux rather than replacing it;
+  the constant's doc-comment update citing this evidence lands beside this record.

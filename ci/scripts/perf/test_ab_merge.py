@@ -31,6 +31,7 @@ Run directly: `python3 ci/scripts/perf/test_ab_merge.py`
 from __future__ import annotations
 
 import copy
+import itertools
 import json
 import os
 import re
@@ -4093,12 +4094,59 @@ class MutantDoseLadderTests(unittest.TestCase):
                     self.assertIn("-0.1", message)
 
     def test_distinct_eps_dose_set_is_unaffected_by_the_duplicate_guard(self):
+        # unit-63 round-11 audit block: the SCHEDULED ladder's own shape --
+        # distinct labels, distinct parsed eps, AND (per mutants/README.md's
+        # own one-sha-per-dose convention) distinct patch_sha256 -- must
+        # sail through all three identity arms unaffected.
         columns = [
-            {"dose_label": "eps-0.50", "detected": "RED"},
-            {"dose_label": "eps-0.10", "detected": "not-detected"},
-            {"dose_label": "eps0.50", "detected": "RED_FOR_INVESTIGATION"},
+            {"dose_label": "eps-0.50", "detected": "RED", "patch_sha256": "sha-neg-0-50"},
+            {"dose_label": "eps-0.10", "detected": "not-detected", "patch_sha256": "sha-neg-0-10"},
+            {"dose_label": "eps0.50", "detected": "RED_FOR_INVESTIGATION", "patch_sha256": "sha-pos-0-50"},
         ]
         ab_merge.mutant_dose_ladder_reject_duplicate_doses(columns)  # must not raise
+
+    def test_missing_or_empty_patch_sha256_is_never_treated_as_a_duplicate(self):
+        # unit-63 round-11 audit block: an unset (missing key, None, or
+        # empty-after-strip) patch_sha256 is never compared against another
+        # unset patch_sha256 as though both aliased the same patch -- this
+        # keeps every pre-existing synthetic-column test (which never set
+        # this field) unaffected by the new arm.
+        columns = [
+            {"dose_label": "eps-0.50", "detected": "RED"},
+            {"dose_label": "eps-0.10", "detected": "not-detected", "patch_sha256": None},
+            {"dose_label": "eps0.50", "detected": "RED_FOR_INVESTIGATION", "patch_sha256": "  "},
+        ]
+        ab_merge.mutant_dose_ladder_reject_duplicate_doses(columns)  # must not raise
+
+    def test_duplicate_patch_sha256_across_distinct_labels_is_refused_every_order(self):
+        # unit-63 round-11 audit block: the auditor demonstrated a
+        # plausible-looking false sensitivity interval between three
+        # SAME-SHA columns (rc=0) -- three DISTINCT, non-aliased labels
+        # (each parsing to a distinct eps, so neither the label nor the eps
+        # arm above ever fires) that all cite the SAME patch_sha256 must be
+        # refused regardless of the caller-supplied order, since
+        # mutants/README.md records one DISTINCT sha per dose: two columns
+        # sharing a sha are the same mutant measured twice, never a real
+        # adjacent-dose pair.
+        shared_sha = "  DEADBEEF  "  # case/whitespace must be folded before comparison
+        base_columns = {
+            "eps-0.50": {"dose_label": "eps-0.50", "detected": "RED", "patch_sha256": shared_sha},
+            "eps-0.10": {"dose_label": "eps-0.10", "detected": "not-detected", "patch_sha256": shared_sha},
+            "eps0.50": {"dose_label": "eps0.50", "detected": "RED_FOR_INVESTIGATION", "patch_sha256": shared_sha},
+        }
+        for order in itertools.permutations(base_columns):
+            with self.subTest(order=order):
+                columns = [base_columns[label] for label in order]
+                with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError) as ctx:
+                    ab_merge.mutant_dose_ladder_reject_duplicate_doses(columns)
+                message = str(ctx.exception)
+                # the first collision found names the first two labels in
+                # this order, never the third -- but every order collides.
+                self.assertIn(order[0], message)
+                self.assertIn(order[1], message)
+                self.assertIn("deadbeef", message)
+                self.assertIn("same mutant measured twice", message)
+                self.assertIn("determinism question", message)
 
     def test_duplicate_literal_dose_label_is_refused_even_if_unparseable(self):
         # a literal-label duplicate is refused BEFORE eps parsing is ever
@@ -4361,6 +4409,93 @@ class MutantDoseLadderTests(unittest.TestCase):
         self.assertEqual(dose["patch_sha256"], self.PATCH_SHA)
         self.assertEqual(dose["violations"], [])
         self.assertEqual(rc, 0)
+
+    def _write_scheduled_three_dose_ladder(self, raw_dir, *, neg50_sha, neg10_sha, pos50_sha):
+        """The SCHEDULED `eps in {-0.50, -0.10, +0.50}` ladder
+        (`docs/plans/63-how-well/mutants/README.md`'s own "signed dose
+        family" section): a GREEN 6-vs-6 (mixed sign) main decision, plus
+        three mutant legs shaped so `-0.10` reads not-detected, `-0.50`
+        reads RED (the degradation-direction straddle), and `+0.50` reads
+        RED too (the two-sided-falsification cell: the held-out-improvement
+        prediction is refuted here, not confirmed -- either outcome is a
+        legitimate member of that cell, this fixture just picks one).
+        """
+        for seed in range(1, 13):
+            fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+            for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                for repeat in ("r1", "r2"):
+                    _write_finetune_run_leg(
+                        raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                    )
+            # eps-0.10: 8/12 split (seeds 1-8 positive, 9-12 negative) --
+            # under the 11/12 threshold, reads not-detected.
+            neg10_mean = 0.55 if seed <= 8 else 0.30
+            _write_mutant_leg(
+                raw_dir,
+                seed,
+                "eps-0.10",
+                _mutant_tier(seed=seed, held_out_example_mean=neg10_mean, mutant_patch_sha256=neg10_sha),
+            )
+            # eps-0.50: 11/12 positive (seed 12 dissents) -- reads RED, the
+            # same shape this suite's own single-dose RED test already
+            # pins.
+            neg50_mean = 0.70 if seed != 12 else 0.30
+            _write_mutant_leg(
+                raw_dir,
+                seed,
+                "eps-0.50",
+                _mutant_tier(seed=seed, held_out_example_mean=neg50_mean, mutant_patch_sha256=neg50_sha),
+            )
+            # eps0.50 (the two-sided falsification cell): same shape as
+            # eps-0.50 -- reads RED, refuting the held-out-improvement
+            # prediction at this positive-eps dose.
+            pos50_mean = 0.70 if seed != 12 else 0.30
+            _write_mutant_leg(
+                raw_dir,
+                seed,
+                "eps0.50",
+                _mutant_tier(seed=seed, held_out_example_mean=pos50_mean, mutant_patch_sha256=pos50_sha),
+            )
+
+    def test_cli_wiring_refuses_the_auditors_three_same_sha_probe(self):
+        # unit-63 round-11 audit block: the auditor's own probe -- the
+        # exact SCHEDULED 3-dose ladder shape above, but with all three
+        # `--mutant-legs` specs citing the SAME patch_sha256 -- previously
+        # merged clean (rc=0) with a plausible-looking straddle between
+        # three columns that were, by this module's own strongest identity
+        # key, the SAME mutant measured three times. Now a merge-level
+        # refusal (exit 1, named in 'sensitivity_error'), never a silently
+        # accepted sensitivity interval.
+        shared_sha = "sha-shared-across-all-three-doses"
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            self._write_scheduled_three_dose_ladder(raw_dir, neg50_sha=shared_sha, neg10_sha=shared_sha, pos50_sha=shared_sha)
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    f"eps-0.50:{shared_sha}:{seeds_s}",
+                    "--mutant-legs",
+                    f"eps-0.10:{shared_sha}:{seeds_s}",
+                    "--mutant-legs",
+                    f"eps0.50:{shared_sha}:{seeds_s}",
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 1)
+        ladder = merged["mutant_dose_ladder"]
+        self.assertIsNone(ladder["sensitivity"])
+        self.assertIsNotNone(ladder["sensitivity_error"])
+        self.assertIn("eps-0.50", ladder["sensitivity_error"])
+        self.assertIn("eps-0.10", ladder["sensitivity_error"])
+        self.assertIn(shared_sha, ladder["sensitivity_error"])
+        self.assertIn("same mutant measured twice", ladder["sensitivity_error"])
 
 
 if __name__ == "__main__":

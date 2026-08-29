@@ -468,8 +468,14 @@ separate record.
   (`ab_merge.mutant_leg_repeat_tag(dose_label)`) — a `repeat` value that can
   never collide with `r1`/`r2` (the main A/B pool) or `lr0` (the RED
   control), the SAME file-naming isolation the lr0 control already relies
-  on. `dose_label` is an operator-chosen string (e.g. `"eps0.02"`), never
-  reinterpreted by the merger.
+  on. `dose_label` is an operator-chosen string from the scheduled set
+  (e.g. `"eps-0.50"`), but it IS reinterpreted by the merger — parsed as a
+  signed `eps` float (`ab_merge._dose_label_eps`) to place the column in
+  the degradation/improvement branch and (unit-63 round-8 audit finding 3)
+  validated finite, non-zero, and within this family's own sane domain
+  (`|eps| <= MUTANT_DOSE_LADDER_MAX_ABS_EPS`); an unparseable, non-finite,
+  zero, or out-of-domain label is refused loudly, never silently
+  passed through as an opaque tag.
 - **Per-leg recorded fields**: every field a clean `fused` leg already
   carries, PLUS this section's own three producer-stamped fields
   (`mutant_id`/`mutant_base_sha`/`mutant_patch_sha256`, serde-skipped when

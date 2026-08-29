@@ -1263,6 +1263,39 @@ FINETUNE_RUN_EXPECTED_ADMISSION_IS_DENSE = False
 FINETUNE_RUN_LEARNING_HAPPENED_FLOOR = 0.0
 FINETUNE_RUN_TIE_FRACTION_CAP = 0.5
 
+# The pre-registered decision rule (CONTRACT Frame / PLAN.md v2 delta 3/4,
+# unit-63 audit finding 1 -- `build_finetune_run_report` used to compute the
+# sign test and then hardcode `status = "GREEN"`, never actually applying
+# this rule): N=12 seeds x 2 arms is the ONE cell this rule is pre-registered
+# for; a premise-clean seed count other than exactly
+# `FINETUNE_RUN_GATE_SEED_COUNT` is never rescaled to fit -- it is INVALID,
+# full stop. `FINETUNE_RUN_DECISION_THRESHOLD` (11 of 12) is compared
+# directly against `sign_test`'s own `n_pos`/`n_neg` (NOT its `n`, which
+# excludes ties -- the threshold is "how many of the 12 shared this sign",
+# not "how many of the non-tied pairs did"). `FINETUNE_RUN_ALPHA2` is the
+# pre-registered significance level for the (12, 11) exact-tail cell
+# (`SignTestMirrorTests.test_golden_n12_k11_pinned_cell` pins the exact
+# p_value, 13/2048; alpha2=0.0064 is the rounded pre-registered level
+# recorded BESIDE that computed p_value, never substituted for it -- the
+# concordance-threshold count is the operative rule, not a p < alpha2 gate).
+FINETUNE_RUN_GATE_SEED_COUNT = 12
+FINETUNE_RUN_DECISION_THRESHOLD = 11
+FINETUNE_RUN_ALPHA2 = 0.0064
+FINETUNE_RUN_DECISION_RULE_TEXT = (
+    "Pre-registered decision rule (CONTRACT 63 Frame / PLAN.md v2 delta 3-4): over "
+    "N=12 premise-clean seeds' d_i = fused.held_out_example_mean - "
+    "alloff.held_out_example_mean, RED iff (n_pos >= 11 of 12 OR n_neg >= 11 of 12) AND "
+    "sign(mean(d_i)) agrees with that concordant direction (two-sided; alpha2=0.0064 is "
+    "the pre-registered level for the (12, 11) cell, recorded beside the computed exact-tail "
+    "p_value, never substituted for it). d_i > 0 dominant (fused worse) is "
+    "degradation-concordant -> status RED; d_i < 0 dominant (fused better) is "
+    "improvement-concordant -> status RED_FOR_INVESTIGATION (anomalous improvement is "
+    "investigated, never silently celebrated); neither threshold met, or the threshold is "
+    "met but the mean's sign disagrees, -> status GREEN. A premise-clean seed count other "
+    "than exactly 12 -> status INVALID naming the count (the rule is pre-registered FOR 12 "
+    "seeds; never rescaled silently)."
+)
+
 
 class SignTestError(ValueError):
     """Raised by `sign_test` for the three typed refusals its Rust twin
@@ -1464,6 +1497,14 @@ def build_finetune_run_report(raw_dir, seeds):
     `build_report`'s own `INVALID` branch already establishes for
     `finetune_ab.sh`).
 
+    The DECISION RULE itself (unit-63 audit finding 1 --
+    `FINETUNE_RUN_DECISION_RULE_TEXT`'s own doc has the exact predicate) is
+    applied here, never left as a computed-but-unused `sign_test` result:
+    a premise-clean seed count other than `FINETUNE_RUN_GATE_SEED_COUNT`
+    (12) is INVALID; otherwise RED (degradation-concordant, fused worse),
+    RED_FOR_INVESTIGATION (improvement-concordant, fused better -- anomalous
+    improvement is investigated, never silently celebrated), or GREEN.
+
     Returns `(merged, table)`, or `(None, None)` if not one `seed` produced
     any leg output at all (an empty sweep).
     """
@@ -1576,7 +1617,47 @@ def build_finetune_run_report(raw_dir, seeds):
 
     any_premise_violation = any(per_seed[s]["leg_premise_violations"] for s in per_seed)
 
-    if any_premise_violation or determinism_floor_findings or sign_error:
+    # The decision rule itself (unit-63 audit finding 1): applied here, on
+    # top of the sign test `sign_result` already computed above, never left
+    # as a computed-but-unused diagnostic. `clean_seed_count` is the count
+    # the pre-registered rule is actually FOR -- every seed contributing a
+    # premise-clean `d_i` to `d_values` -- deliberately distinct from
+    # `sign_result["n"]` (which excludes exact ties).
+    clean_seed_count = len(d_values)
+    decision = None
+    wrong_seed_count = False
+    if sign_result is not None:
+        n_pos, n_neg = sign_result["n_pos"], sign_result["n_neg"]
+        mean_d = statistics.mean(d_values.values())
+        pos_dominant = n_pos >= FINETUNE_RUN_DECISION_THRESHOLD
+        neg_dominant = n_neg >= FINETUNE_RUN_DECISION_THRESHOLD
+        # `pos_dominant`/`neg_dominant` can never BOTH hold at once here:
+        # n_pos + n_neg <= clean_seed_count, and 2 * FINETUNE_RUN_DECISION_THRESHOLD
+        # (22) exceeds FINETUNE_RUN_GATE_SEED_COUNT (12) -- the AND below is
+        # therefore never ambiguous about WHICH direction it is checking.
+        if pos_dominant and mean_d > 0.0:
+            concordant_direction = "degradation"  # d_i > 0 dominant: fused WORSE than alloff
+        elif neg_dominant and mean_d < 0.0:
+            concordant_direction = "improvement"  # d_i < 0 dominant: fused BETTER than alloff
+        else:
+            concordant_direction = "none"
+        decision = {
+            "d_i": list(d_values.values()),
+            "clean_seed_count": clean_seed_count,
+            "gate_seed_count": FINETUNE_RUN_GATE_SEED_COUNT,
+            "n_pos": n_pos,
+            "n_neg": n_neg,
+            "ties": sign_result["ties"],
+            "mean_d": mean_d,
+            "threshold": FINETUNE_RUN_DECISION_THRESHOLD,
+            "concordant_direction": concordant_direction,
+            "alpha2": FINETUNE_RUN_ALPHA2,
+            "p_value": sign_result["p_value"],
+            "rule": FINETUNE_RUN_DECISION_RULE_TEXT,
+        }
+        wrong_seed_count = clean_seed_count != FINETUNE_RUN_GATE_SEED_COUNT
+
+    if any_premise_violation or determinism_floor_findings or sign_error or wrong_seed_count:
         status = "INVALID"
     elif sign_result is None:
         # `any_dry_run_leg` (never a premise violation, see the DRY_RUN
@@ -1587,6 +1668,10 @@ def build_finetune_run_report(raw_dir, seeds):
         # carve-out, never INVALID/FAIL), while a genuinely incomplete real
         # sweep still reads INCOMPLETE.
         status = "DRY_RUN" if any_dry_run_leg else "INCOMPLETE"
+    elif decision["concordant_direction"] == "degradation":
+        status = "RED"
+    elif decision["concordant_direction"] == "improvement":
+        status = "RED_FOR_INVESTIGATION"
     else:
         status = "GREEN"
 
@@ -1610,6 +1695,8 @@ def build_finetune_run_report(raw_dir, seeds):
         },
         "sign_test": sign_result,
         "sign_test_error": sign_error,
+        "decision": decision,
+        "wrong_seed_count": wrong_seed_count,
         "status": status,
     }
 
@@ -1639,6 +1726,14 @@ def build_finetune_run_report(raw_dir, seeds):
         f"determinism_floor: max_r1_r2_delta={max_determinism_delta} "
         f"cross_seed_spread={cross_seed_spread} findings={len(determinism_floor_findings)}"
     )
+    if decision is not None:
+        lines.append(
+            f"decision: clean_seed_count={decision['clean_seed_count']}/{decision['gate_seed_count']} "
+            f"threshold={decision['threshold']} concordant_direction={decision['concordant_direction']} "
+            f"mean_d={decision['mean_d']:.6f} alpha2={decision['alpha2']} p_value={decision['p_value']}"
+        )
+    else:
+        lines.append("decision: n/a -- no sign_test result to decide over")
     lines.append(f"status: {status}")
     table = "\n".join(lines)
     return merged, table
@@ -1676,16 +1771,24 @@ def main(argv=None):
         with open(os.path.join(fr_out_dir, "finetune_run_ab_table.txt"), "w") as fh:
             fh.write(fr_table + "\n")
 
-        # The SAME carve-out `build_report`'s own `INVALID` branch already
-        # makes for `finetune_ab.sh`: a correctness-of-measurement problem
-        # (a premise violation, a determinism-floor breach, or a sign-test
-        # refusal) is the one thing this merge's own exit code gates on;
-        # `FAIL`/`INCOMPLETE` legs (a leg that did not run at all, e.g. a
-        # dry run) are recorded, not fatal here -- only `INVALID` is.
-        if fr_merged["status"] == "INVALID":
+        # unit-63 audit finding 1: the decision rule's own three non-GREEN
+        # outcomes -- INVALID (a correctness-of-measurement problem: a leg
+        # premise violation, a determinism-floor breach, a sign-test
+        # refusal, a wrong premise-clean seed count, or an lr=0 control
+        # violation -- the SAME carve-out `build_report`'s own `INVALID`
+        # branch already makes for `finetune_ab.sh`), RED (degradation-
+        # concordant: the pre-registered rule fired against fused), and
+        # RED_FOR_INVESTIGATION (improvement-concordant: anomalous
+        # improvement, investigated, never silently celebrated) -- are ALL
+        # the things this merge's own exit code gates on now; only a plain
+        # `FAIL`/`INCOMPLETE`/`DRY_RUN` leg (never ran, or a dry run) stays
+        # record-only.
+        if fr_merged["status"] in ("INVALID", "RED", "RED_FOR_INVESTIGATION"):
             print(
-                "finetune_run_ab: FAIL — status=INVALID (a leg-premise violation, a "
-                "determinism-floor breach, or a sign-test refusal — see the table above)",
+                f"finetune_run_ab: FAIL — status={fr_merged['status']} — see the table above "
+                "(CONTRACT 63 Frame: the pre-registered decision rule; INVALID names a "
+                "correctness-of-measurement problem, RED/RED_FOR_INVESTIGATION name a fired "
+                "decision rule, never silently passed through as green)",
                 file=sys.stderr,
             )
             return 1

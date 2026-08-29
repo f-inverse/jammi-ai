@@ -2015,13 +2015,20 @@ class FinetuneRunDeterminismFloorTests(unittest.TestCase):
         )
 
     def test_identical_r1_r2_never_reds(self):
+        # unit-63 audit finding 1: the decision rule now requires exactly
+        # the pre-registered 12 premise-clean seeds (else INVALID) --
+        # 6-vs-6 keeps both n_pos/n_neg well under the 11-of-12 threshold,
+        # so GREEN is still the right read regardless of mean sign.
         with tempfile.TemporaryDirectory() as raw_dir:
-            self._write_seed(raw_dir, 1, 0.40, 0.50)
-            self._write_seed(raw_dir, 2, 0.35, 0.52)
-            self._write_seed(raw_dir, 3, 0.42, 0.48)
-            merged, _table = ab_merge.build_finetune_run_report(raw_dir, [1, 2, 3])
+            for seed in range(1, 7):
+                self._write_seed(raw_dir, seed, 0.30, 0.50)  # fused better: d = -0.20
+            for seed in range(7, 13):
+                self._write_seed(raw_dir, seed, 0.55, 0.45)  # alloff better: d = +0.10
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, list(range(1, 13)))
         self.assertEqual(merged["determinism_floor"]["findings"], [])
         self.assertEqual(merged["determinism_floor"]["max_delta"], 0.0)
+        self.assertEqual(merged["decision"]["clean_seed_count"], 12)
+        self.assertEqual(merged["decision"]["concordant_direction"], "none")
         self.assertEqual(merged["status"], "GREEN")
 
     def test_delta_exceeding_cross_seed_spread_reds(self):
@@ -2061,16 +2068,37 @@ class BuildFinetuneRunReportEndToEndTests(unittest.TestCase):
                 )
 
     def test_end_to_end_green_matches_direct_sign_test(self):
-        seeds = [1, 2, 3, 4, 5]
-        # fused strictly beats alloff (lower held-out loss) on every seed --
-        # unanimous sign, mirrors the golden (12, 11) shape at n=5, k=5.
-        means = {1: (0.30, 0.50), 2: (0.32, 0.48), 3: (0.29, 0.55), 4: (0.31, 0.47), 5: (0.28, 0.52)}
+        # unit-63 audit finding 1: the decision rule is pre-registered FOR
+        # exactly 12 premise-clean seeds (else INVALID) -- 7-vs-5 (fused
+        # wins 7, alloff wins 5) keeps both n_pos/n_neg under the 11-of-12
+        # threshold, so this stays GREEN regardless of the mean's sign
+        # (the SAME shape `sign_test` itself is exercised over, just with
+        # a real premise-clean seed count this time).
+        seeds = list(range(1, 13))
+        means = {
+            1: (0.30, 0.50),
+            2: (0.32, 0.48),
+            3: (0.29, 0.55),
+            4: (0.31, 0.47),
+            5: (0.28, 0.52),
+            6: (0.33, 0.49),
+            7: (0.27, 0.53),
+            8: (0.55, 0.40),
+            9: (0.52, 0.38),
+            10: (0.58, 0.42),
+            11: (0.50, 0.35),
+            12: (0.54, 0.39),
+        }
         with tempfile.TemporaryDirectory() as raw_dir:
             for seed in seeds:
                 self._write_clean_seed(raw_dir, seed, *means[seed])
             merged, table = ab_merge.build_finetune_run_report(raw_dir, seeds)
 
         self.assertEqual(merged["status"], "GREEN")
+        self.assertEqual(merged["decision"]["clean_seed_count"], 12)
+        self.assertEqual(merged["decision"]["n_pos"], 5)
+        self.assertEqual(merged["decision"]["n_neg"], 7)
+        self.assertEqual(merged["decision"]["concordant_direction"], "none")
         expected_d = [means[s][0] - means[s][1] for s in seeds]
         expected = ab_merge.sign_test(expected_d)
         self.assertEqual(merged["sign_test"]["n"], expected["n"])
@@ -2110,11 +2138,16 @@ class BuildFinetuneRunReportEndToEndTests(unittest.TestCase):
         self.assertNotIn("3", merged["d_values"])
 
     def test_main_finetune_run_dispatch_writes_report_and_exits_0_on_green(self):
-        seeds = [1, 2, 3]
+        # unit-63 audit finding 1: needs exactly the pre-registered 12
+        # premise-clean seeds (else INVALID) -- 6-vs-6 stays under the
+        # 11-of-12 threshold, so GREEN/exit-0 is still the right read.
+        seeds = list(range(1, 13))
+        means = [(0.30, 0.50), (0.32, 0.48), (0.29, 0.55), (0.31, 0.47), (0.28, 0.52), (0.33, 0.49)]
+        means += [(0.55, 0.40), (0.52, 0.38), (0.58, 0.42), (0.50, 0.35), (0.54, 0.39), (0.56, 0.41)]
         with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
-            for seed, (fm, am) in zip(seeds, [(0.30, 0.50), (0.32, 0.48), (0.29, 0.55)]):
+            for seed, (fm, am) in zip(seeds, means):
                 self._write_clean_seed(raw_dir, seed, fm, am)
-            rc = ab_merge.main(["finetune-run", raw_dir, out_dir, "1,2,3"])
+            rc = ab_merge.main(["finetune-run", raw_dir, out_dir, ",".join(str(s) for s in seeds)])
             self.assertEqual(rc, 0)
             report_path = os.path.join(out_dir, "finetune_run_ab_report.json")
             self.assertTrue(os.path.exists(report_path))
@@ -2136,6 +2169,113 @@ class BuildFinetuneRunReportEndToEndTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
             rc = ab_merge.main(["finetune-run", raw_dir, out_dir, "1,2,3"])
         self.assertEqual(rc, 1)
+
+
+class FinetuneRunDecisionRuleMutantTests(unittest.TestCase):
+    """The pre-registered decision rule itself (unit-63 audit finding 1):
+    `build_finetune_run_report` used to compute the sign test and then
+    hardcode `status = "GREEN"` regardless of what it found -- EVERY mutant
+    below would have read GREEN under that pre-fix code (any premise-clean,
+    non-tied, non-empty `d_values` produced a `sign_result`, and a
+    `sign_result` alone was sufficient for GREEN); the fixed rule reads each
+    one correctly instead. One mutant per arm of `FINETUNE_RUN_DECISION_RULE_TEXT`'s
+    own predicate -- `n_pos`/`n_neg` >= `FINETUNE_RUN_DECISION_THRESHOLD` (11
+    of `FINETUNE_RUN_GATE_SEED_COUNT`, 12) AND the mean's sign agreeing with
+    that concordant direction, plus the `clean_seed_count != 12` -> INVALID
+    carve-out -- proves none of the rule's own conjuncts is vacuous.
+    """
+
+    def _write_r1(self, raw_dir, seed, fused_mean, alloff_mean):
+        # r1-only (no r2): the decision rule only ever reads r1 -- see
+        # `build_finetune_run_report`'s own doc -- and omitting r2 keeps
+        # every mutant here from ever touching the (separately tested)
+        # determinism floor.
+        for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+            _write_finetune_run_leg(
+                raw_dir, seed, arm, "r1", _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+            )
+
+    def test_11_of_12_degradation_is_red(self):
+        # 11 seeds with fused WORSE than alloff (d_i > 0, degradation-
+        # concordant), 1 dissenting seed -- exactly the golden (12, 11)
+        # sign-test shape, mean necessarily > 0 since the dissent is the
+        # SAME magnitude as the majority. Under the pre-fix code this read
+        # GREEN (a sign_result existed); the fixed rule reads RED.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in range(1, 12):
+                self._write_r1(raw_dir, seed, 0.60, 0.50)  # fused worse: d = +0.10
+            self._write_r1(raw_dir, 12, 0.50, 0.60)  # dissent: d = -0.10
+            merged, table = ab_merge.build_finetune_run_report(raw_dir, list(range(1, 13)))
+        self.assertEqual(merged["decision"]["n_pos"], 11)
+        self.assertEqual(merged["decision"]["n_neg"], 1)
+        self.assertGreater(merged["decision"]["mean_d"], 0.0)
+        self.assertEqual(merged["decision"]["concordant_direction"], "degradation")
+        self.assertEqual(merged["status"], "RED")
+        self.assertIn("status: RED", table)
+
+    def test_11_of_12_improvement_is_red_for_investigation(self):
+        # Mirror image: fused BEATS alloff on 11 of 12 (d_i < 0,
+        # improvement-concordant) -- anomalous improvement is investigated,
+        # never silently celebrated as GREEN.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in range(1, 12):
+                self._write_r1(raw_dir, seed, 0.50, 0.60)  # fused better: d = -0.10
+            self._write_r1(raw_dir, 12, 0.60, 0.50)  # dissent: d = +0.10
+            merged, table = ab_merge.build_finetune_run_report(raw_dir, list(range(1, 13)))
+        self.assertEqual(merged["decision"]["n_pos"], 1)
+        self.assertEqual(merged["decision"]["n_neg"], 11)
+        self.assertLess(merged["decision"]["mean_d"], 0.0)
+        self.assertEqual(merged["decision"]["concordant_direction"], "improvement")
+        self.assertEqual(merged["status"], "RED_FOR_INVESTIGATION")
+        self.assertIn("status: RED_FOR_INVESTIGATION", table)
+
+    def test_10_of_12_is_green(self):
+        # Below the 11-of-12 threshold on EITHER side -- the rule is
+        # pre-registered for >=11, never a bare majority.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in range(1, 11):
+                self._write_r1(raw_dir, seed, 0.60, 0.50)  # fused worse: d = +0.10
+            for seed in (11, 12):
+                self._write_r1(raw_dir, seed, 0.50, 0.60)  # dissent: d = -0.10
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, list(range(1, 13)))
+        self.assertEqual(merged["decision"]["n_pos"], 10)
+        self.assertEqual(merged["decision"]["n_neg"], 2)
+        self.assertEqual(merged["decision"]["concordant_direction"], "none")
+        self.assertEqual(merged["status"], "GREEN")
+
+    def test_mean_sign_disagreement_at_11_is_green(self):
+        # The AND bites: n_pos=11 (degradation-concordant by COUNT) but one
+        # huge dissenting seed pulls mean(d_i) negative -- the count
+        # threshold alone is NOT sufficient; the mean's sign must also
+        # agree, or the rule falls through to GREEN rather than RED.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in range(1, 12):
+                self._write_r1(raw_dir, seed, 0.51, 0.50)  # small positive: d = +0.01 each
+            self._write_r1(raw_dir, 12, 0.10, 1.10)  # huge dissent: d = -1.00
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, list(range(1, 13)))
+        self.assertEqual(merged["decision"]["n_pos"], 11)
+        self.assertEqual(merged["decision"]["n_neg"], 1)
+        # 11 * 0.01 - 1.00 = -0.89 < 0 -- disagrees with the "degradation"
+        # direction n_pos=11 alone would otherwise indicate.
+        self.assertLess(merged["decision"]["mean_d"], 0.0)
+        self.assertEqual(merged["decision"]["concordant_direction"], "none")
+        self.assertEqual(merged["status"], "GREEN")
+
+    def test_11_seeds_is_invalid_never_rescaled(self):
+        # Only 11 seeds were ever passed to the merger (a real short sweep,
+        # e.g. one seed simply never dispatched) -- ALL 11 are premise-clean
+        # and unanimous in sign, exactly the shape that would have read
+        # GREEN (indeed, the pre-fix code's own hardcoded GREEN) at n=11.
+        # The rule is pre-registered FOR 12; a different count is INVALID,
+        # never silently rescaled to fit whatever n happened to show up.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in range(1, 12):
+                self._write_r1(raw_dir, seed, 0.60, 0.50)  # unanimous: d = +0.10
+            merged, table = ab_merge.build_finetune_run_report(raw_dir, list(range(1, 12)))
+        self.assertEqual(merged["decision"]["clean_seed_count"], 11)
+        self.assertEqual(merged["wrong_seed_count"], True)
+        self.assertEqual(merged["status"], "INVALID")
+        self.assertIn("status: INVALID", table)
 
 
 if __name__ == "__main__":

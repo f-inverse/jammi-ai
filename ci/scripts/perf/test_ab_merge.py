@@ -3823,6 +3823,47 @@ class MutantDoseLadderTests(unittest.TestCase):
         with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
             ab_merge.mutant_dose_ladder_two_sided_falsification(columns)
 
+    def test_non_finite_zero_and_out_of_domain_eps_labels_are_refused(self):
+        # unit-63 round-8 audit finding 3: `_dose_label_eps` parses
+        # successfully for nan/0.0/-0.0/inf/an out-of-domain magnitude, but
+        # `eps < 0.0`/`eps > 0.0` both silently reject each of these --
+        # they must never vanish from BOTH findings with a clean exit, so
+        # each one is refused loudly at parse time instead.
+        for dose_label in ("epsnan", "eps0.0", "eps-0.0", "epsinf", "eps-inf", "eps10.0"):
+            with self.subTest(dose_label=dose_label):
+                with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+                    ab_merge._dose_label_eps(dose_label)
+
+    def test_epsnan_is_refused_not_silently_dropped_from_both_findings(self):
+        columns = [{"dose_label": "epsnan", "detected": "RED"}]
+        with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+            ab_merge.mutant_dose_ladder_sensitivity(columns)
+        with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+            ab_merge.mutant_dose_ladder_two_sided_falsification(columns)
+
+    def test_eps0_0_is_refused(self):
+        columns = [{"dose_label": "eps0.0", "detected": "RED"}]
+        with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+            ab_merge.mutant_dose_ladder_sensitivity(columns)
+
+    def test_eps_negative_zero_is_refused(self):
+        columns = [{"dose_label": "eps-0.0", "detected": "RED"}]
+        with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+            ab_merge.mutant_dose_ladder_sensitivity(columns)
+
+    def test_epsinf_is_refused(self):
+        columns = [{"dose_label": "epsinf", "detected": "RED"}]
+        with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+            ab_merge.mutant_dose_ladder_two_sided_falsification(columns)
+
+    def test_eps_magnitude_over_the_family_domain_is_refused(self):
+        # eps=10.0 parses as a float fine, but its magnitude vastly exceeds
+        # the scheduled ladder's own domain (|eps| <= 1.0) -- refused, never
+        # silently accepted as though it were a real dose.
+        columns = [{"dose_label": "eps10.0", "detected": "RED"}]
+        with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+            ab_merge.mutant_dose_ladder_sensitivity(columns)
+
     def test_cli_wiring_folds_the_dose_ladder_into_the_same_artifact(self):
         with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
             for seed in range(1, 13):

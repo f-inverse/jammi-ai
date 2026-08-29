@@ -2717,6 +2717,14 @@ def build_finetune_run_report(raw_dir, seeds, lr0_seeds=(), allow_missing_lr0_co
 MUTANT_DECISION_THRESHOLD = FINETUNE_RUN_DECISION_THRESHOLD
 MUTANT_GATE_SEED_COUNT = FINETUNE_RUN_GATE_SEED_COUNT
 
+# unit-63 round-8 audit finding 3: the sane domain for this family's own
+# SIGNED `eps` (CONTRACT.md addendum 2026-08-29c: the update-scale
+# multiplier is `(1+eps)`) -- the scheduled ladder never exceeds `|eps| =
+# 0.50`; a magnitude past `1.0` is no longer a "silent lr (in/de)flation"
+# dose (at `eps <= -1.0` the update-scale multiplier is non-positive, a
+# different failure shape entirely, not a member of this monotone family).
+MUTANT_DOSE_LADDER_MAX_ABS_EPS = 1.0
+
 
 def mutant_leg_repeat_tag(dose_label):
     """The `repeat` slot a mutant leg's `.exit`/`.json`/`.stderr` triple is
@@ -2946,6 +2954,21 @@ def _dose_label_eps(dose_label):
     `MutantDoseLadderSensitivityError` (never silently returns a sentinel or
     guesses a sign) when `dose_label` does not start with `"eps"`, or the
     remainder does not parse as a float.
+
+    Unit-63 round-8 audit finding 3: parsing successfully is not enough --
+    the consumers (`mutant_dose_ladder_sensitivity`,
+    `mutant_dose_ladder_two_sided_falsification`) partition purely on
+    `eps < 0.0`/`eps > 0.0`, so a value that is neither (`nan`, `0.0`,
+    `-0.0`) silently agrees with BOTH predicates' negation and vanishes
+    from EVERY finding with a clean exit -- exactly the "never silently
+    dropped" this module's own doc promises, and never delivers, for that
+    one shape. The same applies to a non-finite magnitude (`inf`/`-inf`,
+    which trivially satisfies `> 0.0`/`< 0.0` but is not a real dose at
+    all) and to a magnitude outside this family's own sane domain (`|eps|
+    > MUTANT_DOSE_LADDER_MAX_ABS_EPS`, see that constant's own doc). Every
+    one of these is refused here, loudly, by the SAME exception every
+    other unparseable label raises -- never a silent pass-through to a
+    partition predicate that was never designed to reject them.
     """
     prefix = "eps"
     if not dose_label.startswith(prefix):
@@ -2956,12 +2979,32 @@ def _dose_label_eps(dose_label):
         )
     rest = dose_label[len(prefix):]
     try:
-        return float(rest)
+        value = float(rest)
     except ValueError as exc:
         raise MutantDoseLadderSensitivityError(
             f"dose_label {dose_label!r}'s remainder {rest!r} (after stripping the 'eps' prefix) "
             "does not parse as a float -- cannot derive this dose's signed eps value"
         ) from exc
+    if not math.isfinite(value):
+        raise MutantDoseLadderSensitivityError(
+            f"dose_label {dose_label!r} parses to a non-finite eps value ({value!r}) -- nan/inf "
+            "is not a member of either the degradation (eps < 0.0) or improvement (eps > 0.0) "
+            "branch and must never be silently dropped from both findings"
+        )
+    if value == 0.0:
+        raise MutantDoseLadderSensitivityError(
+            f"dose_label {dose_label!r} parses to a zero eps value ({value!r}, positive or "
+            "negative zero) -- a zero dose is not a member of either the degradation (eps < 0.0) "
+            "or improvement (eps > 0.0) branch and must never be silently dropped from both "
+            "findings"
+        )
+    if abs(value) > MUTANT_DOSE_LADDER_MAX_ABS_EPS:
+        raise MutantDoseLadderSensitivityError(
+            f"dose_label {dose_label!r} parses to eps={value!r}, whose magnitude exceeds this "
+            f"family's own sane domain (|eps| <= {MUTANT_DOSE_LADDER_MAX_ABS_EPS}) -- never "
+            "silently accepted as though it were a scheduled dose"
+        )
+    return value
 
 
 def mutant_dose_ladder_sensitivity(dose_columns):

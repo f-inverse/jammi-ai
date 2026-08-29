@@ -91,6 +91,18 @@ jobs:
       - name: Build the bench harness (release)
         # The committed baselines are release-profile numbers; the rate gate
         # only means anything against a release build.
+        #
+        # JAMMI_BUILD_SHA is pre-set here because this build runs inside the
+        # container job: build.rs's compile-time `git rev-parse HEAD` fallback
+        # hits git's "dubious ownership" refusal in a container, so without an
+        # override it bakes build_sha="unknown" — which run_scale_tiers.sh's
+        # C5.1 provenance cross-check then correctly refuses to run tiers
+        # against. `github.sha` is exactly 40 lowercase hex, the one shape
+        # build.rs's own input-edge validation accepts verbatim (see the doc
+        # comment at the top of crates/jammi-bench/build.rs) — never a
+        # `-dirty` suffix.
+        env:
+          JAMMI_BUILD_SHA: ${{ github.sha }}
         run: cargo build -p jammi-bench --release
 
       # The tier list is stated once, in the shared script (also the nightly

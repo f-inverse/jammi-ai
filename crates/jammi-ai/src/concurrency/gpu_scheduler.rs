@@ -165,8 +165,12 @@ impl GpuScheduler {
     /// waiting for an outstanding release will eventually satisfy it"
     /// (`bytes <= usable_capacity()`, just not available right now). Used by
     /// `ModelCache::do_load`'s admission loop to decide between a hard error
-    /// and falling back to [`Self::acquire`]'s async wait once `evict_one`
-    /// has nothing left to evict.
+    /// and continuing to wait on its own dual-notify admission loop (a
+    /// permit-release notify plus a guard-idle notify, registered together
+    /// before each `try_acquire`/`evict_one` pass) once `evict_one` has
+    /// nothing left to evict — see `ModelCache::do_load`'s admission loop
+    /// for the full wake-set enumeration and why `Self::acquire`'s
+    /// single-notify wait is not enough on its own.
     pub fn usable_capacity(&self) -> usize {
         if self.unlimited {
             return usize::MAX;

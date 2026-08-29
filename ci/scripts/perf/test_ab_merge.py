@@ -4039,6 +4039,90 @@ class MutantDoseLadderTests(unittest.TestCase):
             with self.subTest(dose_label=dose_label, expect="accepted"):
                 self.assertAlmostEqual(ab_merge._dose_label_eps(dose_label), expected_value)
 
+    def test_aliased_eps_labels_are_refused_regardless_of_order(self):
+        # unit-63 round-10 audit F1: `eps-0.1` / `eps-0.100` / `eps-.10` /
+        # `eps-1e-1` all parse to the identical eps=-0.1 float while filing
+        # FOUR distinct leg files -- a stable abs(eps)-sort would otherwise
+        # break the tie by caller order, silently emitting a zero-width
+        # straddle between two aliases of the SAME dose. Both orderings of
+        # each aliased pair must refuse -- never just one.
+        aliased_pairs = [
+            ("eps-0.1", "eps-0.100"),
+            ("eps-0.1", "eps-.10"),
+            ("eps-0.1", "eps-1e-1"),
+        ]
+        for label_a, label_b in aliased_pairs:
+            for ordered in ((label_a, label_b), (label_b, label_a)):
+                with self.subTest(order=ordered):
+                    columns = [{"dose_label": lbl, "detected": "not-detected"} for lbl in ordered]
+                    with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError) as ctx:
+                        ab_merge.mutant_dose_ladder_reject_duplicate_doses(columns)
+                    message = str(ctx.exception)
+                    self.assertIn(ordered[0], message)
+                    self.assertIn(ordered[1], message)
+                    self.assertIn("-0.1", message)
+
+    def test_distinct_eps_dose_set_is_unaffected_by_the_duplicate_guard(self):
+        columns = [
+            {"dose_label": "eps-0.50", "detected": "RED"},
+            {"dose_label": "eps-0.10", "detected": "not-detected"},
+            {"dose_label": "eps0.50", "detected": "RED_FOR_INVESTIGATION"},
+        ]
+        ab_merge.mutant_dose_ladder_reject_duplicate_doses(columns)  # must not raise
+
+    def test_duplicate_literal_dose_label_is_refused_even_if_unparseable(self):
+        # a literal-label duplicate is refused BEFORE eps parsing is ever
+        # attempted -- two identically-spelled labels are refused even when
+        # that label itself would fail to parse as a signed eps value.
+        columns = [
+            {"dose_label": "bogus", "detected": "RED"},
+            {"dose_label": "bogus", "detected": "not-detected"},
+        ]
+        with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError) as ctx:
+            ab_merge.mutant_dose_ladder_reject_duplicate_doses(columns)
+        self.assertIn("bogus", str(ctx.exception))
+        self.assertIn("more than once", str(ctx.exception))
+
+    def test_cli_wiring_refuses_aliased_dose_labels(self):
+        # unit-63 round-10 audit F1 (CLI wiring): `--mutant-legs` supplied
+        # twice with two aliased labels (eps-0.1 / eps-0.100) is a
+        # merge-level refusal (exit 1, recorded in 'sensitivity_error'),
+        # never a script crash and never a silently order-dependent
+        # straddle.
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                _write_mutant_leg(raw_dir, seed, "eps-0.1", _mutant_tier(seed=seed, held_out_example_mean=0.70))
+                _write_mutant_leg(raw_dir, seed, "eps-0.100", _mutant_tier(seed=seed, held_out_example_mean=0.70))
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    f"eps-0.1:{self.PATCH_SHA}:{seeds_s}",
+                    "--mutant-legs",
+                    f"eps-0.100:{self.PATCH_SHA}:{seeds_s}",
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 1)
+        self.assertEqual(merged["status"], "GREEN")
+        self.assertIsNone(merged["mutant_dose_ladder"]["sensitivity"])
+        self.assertIsNotNone(merged["mutant_dose_ladder"]["sensitivity_error"])
+        self.assertIn("eps-0.1", merged["mutant_dose_ladder"]["sensitivity_error"])
+        self.assertIn("eps-0.100", merged["mutant_dose_ladder"]["sensitivity_error"])
+
     def test_cli_wiring_folds_the_dose_ladder_into_the_same_artifact(self):
         with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
             for seed in range(1, 13):

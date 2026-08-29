@@ -3100,6 +3100,63 @@ def _dose_label_eps(dose_label):
     return value
 
 
+def mutant_dose_ladder_reject_duplicate_doses(dose_columns):
+    """Unit-63 round-10 audit F1: numeric label aliasing defeats
+    `mutant_dose_ladder_sensitivity`'s own injectivity assumption (see that
+    function's own doc -- dose columns are sorted by `abs(eps)`, and Python's
+    STABLE sort then breaks a tie between two equal-magnitude entries by the
+    caller-supplied order, "never the caller-supplied order" is a lie the
+    moment two distinct literal labels parse to the SAME eps). `eps-0.1` /
+    `eps-0.100` / `eps-.10` / `eps-1e-1` all parse to the identical
+    `eps=-0.1` float while each filing a DISTINCT leg file
+    (`mutant_leg_repeat_tag` tags a leg by the literal `dose_label` string,
+    byte-for-byte) -- a stable sort tiebreak on caller order can then emit a
+    zero-width "straddle" between two doses that are, by every measurement
+    this module makes, THE SAME DOSE, not an adjacent pair.
+
+    Refuses (raises `MutantDoseLadderSensitivityError`, never silently picks
+    one of the aliases and drops the rest) over the FULL, already-assembled
+    `dose_columns` list when:
+      - two entries share the exact same literal `dose_label` string
+        (checked FIRST, independent of parseability -- two identically-
+        spelled labels are refused even if that label fails to parse as an
+        eps value at all), or
+      - two entries parse (via `_dose_label_eps`) to the SAME eps value
+        under two DIFFERENT literal labels -- named in the refusal by BOTH
+        labels and the shared eps: one dose, one label; a same-dose
+        disagreement between two legs is a determinism question, never a
+        sensitivity interval.
+
+    Called once, over the whole supplied set, at the CLI's own
+    `--mutant-legs` assembly -- the same input edge every other dose-ladder
+    guard in this module already lives at, and BEFORE
+    `mutant_dose_ladder_sensitivity`/`_two_sided_falsification`/`_anomalies`
+    ever see the list, so a straddle/anomaly finding can never be computed
+    over an aliased set in the first place.
+    """
+    seen_labels = set()
+    for col in dose_columns:
+        label = col["dose_label"]
+        if label in seen_labels:
+            raise MutantDoseLadderSensitivityError(
+                f"dose_label {label!r} is supplied more than once in --mutant-legs -- one dose, "
+                "one label; a repeated literal label can never name two distinct doses"
+            )
+        seen_labels.add(label)
+    seen_eps = {}
+    for col in dose_columns:
+        label = col["dose_label"]
+        eps = _dose_label_eps(label)
+        if eps in seen_eps:
+            other_label = seen_eps[eps]
+            raise MutantDoseLadderSensitivityError(
+                f"dose labels {other_label!r} and {label!r} both parse to the same eps={eps!r} "
+                "-- two dose labels resolve to the same eps: one dose, one label; a same-dose "
+                "disagreement is a determinism question, never a sensitivity interval"
+            )
+        seen_eps[eps] = label
+
+
 def mutant_dose_ladder_sensitivity(dose_columns):
     """The reported sensitivity statement (CONTRACT.md addendum 2026-08-29c:
     the signed ladder, `eps in {-0.50, -0.10, +0.50}` -- see
@@ -3360,6 +3417,12 @@ def main(argv=None):
             # correctness-of-measurement problem this merge gates on.
             sensitivity_error = None
             try:
+                # unit-63 round-10 audit F1 -- refused BEFORE the straddle/
+                # falsification/anomaly scans ever see the (possibly
+                # aliased) set, over the FULL assembled `dose_columns`, at
+                # the same input edge every other dose-ladder guard lives
+                # at (see this function's own doc).
+                mutant_dose_ladder_reject_duplicate_doses(dose_columns)
                 sensitivity = mutant_dose_ladder_sensitivity(dose_columns)
                 two_sided_falsification = mutant_dose_ladder_two_sided_falsification(dose_columns)
                 dose_anomalies = mutant_dose_ladder_anomalies(dose_columns)

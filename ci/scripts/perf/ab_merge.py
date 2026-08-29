@@ -3467,9 +3467,14 @@ def partition_red_proof_dose_columns(dose_columns):
 
     Raises `RedProofLabelError` for a bare-prefix label (`dose_label ==
     RED_PROOF_LABEL_PREFIX`, i.e. `"redproof-"` with an empty mutant name
-    after it) -- refused loudly here, at the same input edge every other
-    dose-ladder label guard in this module already lives at, never silently
-    accepted as an anonymous RED-proof column.
+    after it) OR a whitespace-only mutant name after the prefix (unit-63
+    round-13 audit advisory (c): `"redproof- "` / `"redproof-  "` reads as
+    non-empty by `==`, so it passed this same edge undetected under the
+    bare-prefix check alone and only failed loudly downstream, once some
+    later consumer treated the whitespace as an opaque mutant name) --
+    refused loudly here, at the same input edge every other dose-ladder
+    label guard in this module already lives at, never silently accepted as
+    an anonymous RED-proof column.
 
     `eps_dose_columns`/`red_proof_dose_columns` each preserve `dose_columns`'
     own relative order.
@@ -3479,11 +3484,12 @@ def partition_red_proof_dose_columns(dose_columns):
     for col in dose_columns:
         label = col["dose_label"]
         if is_red_proof_dose_label(label):
-            if label == RED_PROOF_LABEL_PREFIX:
+            if label == RED_PROOF_LABEL_PREFIX or label[len(RED_PROOF_LABEL_PREFIX):].strip() == "":
                 raise RedProofLabelError(
                     f"dose_label {label!r} is the bare RED-PROOF prefix ({RED_PROOF_LABEL_PREFIX!r}) "
-                    "with no mutant name after it -- a RED-proof column must name a specific mutant "
-                    "(e.g. 'redproof-nobc', 'redproof-signflip'), never an anonymous prefix"
+                    "or a whitespace-only mutant name after it, with no mutant name after it -- a "
+                    "RED-proof column must name a specific mutant (e.g. 'redproof-nobc', "
+                    "'redproof-signflip'), never an anonymous prefix or a whitespace-only name"
                 )
             red_proof_dose_columns.append(col)
         else:
@@ -3684,6 +3690,22 @@ def main(argv=None):
                 two_sided_falsification = []
                 dose_anomalies = []
                 sensitivity_error = str(exc)
+                # unit-63 round-13 audit F2: a refusal here must not leave
+                # `red_proof_verdict` byte-identical to "no RED-proof column
+                # was ever scheduled" (the None it was initialized to above)
+                # when a RED-proof-labeled column WAS actually present in
+                # the supplied dose set -- CONTRACT acceptance 5's own field
+                # is read directly off this string. Test the RAW
+                # `dose_columns` labels here, never `red_proof_dose_columns`
+                # alone: `partition_red_proof_dose_columns` itself may be
+                # the raiser (a bare-prefix or whitespace-only mutant name),
+                # in which case `red_proof_dose_columns` never got assigned
+                # and stays the pre-try `[]` even though a RED-proof label
+                # was present in `dose_columns`. When no RED-proof label was
+                # ever scheduled, `red_proof_verdict` stays `None` exactly
+                # as before -- nothing to report.
+                if any(is_red_proof_dose_label(col["dose_label"]) for col in dose_columns):
+                    red_proof_verdict = f"NOT_PROVEN (dose set refused before RED-proof evaluation: {exc})"
             fr_merged["mutant_dose_ladder"] = {
                 "doses": dose_columns,
                 "sensitivity": sensitivity,
@@ -3741,7 +3763,13 @@ def main(argv=None):
                 dose_lines.append(f"  two_sided_falsification: {two_sided_falsification}")
             if dose_anomalies:
                 dose_lines.append(f"  dose_anomalies: {dose_anomalies}")
-            if red_proof_dose_columns:
+            if red_proof_dose_columns or red_proof_verdict is not None:
+                # unit-63 round-13 audit F2: `red_proof_verdict` can be set
+                # (the refused-but-scheduled state) even when
+                # `red_proof_dose_columns` itself stayed empty (the raiser
+                # was `partition_red_proof_dose_columns` itself) -- the
+                # human-readable table line must stay in sync with the
+                # artifact's own field rather than silently omitting it.
                 dose_lines.append(f"  red_proof: {red_proof}")
                 dose_lines.append(f"  red_proof_verdict: {red_proof_verdict}")
             fr_table = fr_table + "\n" + "\n".join(dose_lines)

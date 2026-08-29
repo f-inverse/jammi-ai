@@ -314,9 +314,29 @@ per RED-proof column) and `red_proof_verdict` — `"PROVEN"` iff at least one RE
 reads `detected == "RED"`, otherwise `"NOT_PROVEN"` naming every column's own `detected` (a
 column reading `RED_FOR_INVESTIGATION` is recorded as-is, an anomaly for a mutant expected to
 degrade, never a second way to reach `"PROVEN"`). `red_proof_verdict == "PROVEN"` contributes
-exit 0 (the expected outcome); `"NOT_PROVEN"` contributes non-zero, named in the merge's own
-stderr and artifact. This retires the prior "run `redproof-nobc`/`redproof-signflip` in
+NOTHING to the exit code — it is the expected outcome and never masks another dose-ladder
+failure cause (a PROVEN merge can still exit non-zero on `sensitivity_error`, an `INVALID`
+dose column, `dose_anomalies`, or a non-GREEN primary status); `"NOT_PROVEN"` contributes
+non-zero, named in the merge's own stderr and artifact. This retires the prior "run
+`redproof-nobc`/`redproof-signflip` in
 their own, separate invocation and treat its exit 1 as expected" convention
 (mutants/README.md's own former "Minimal labeling convention" section) — reinterpreting a
 failure exit as success was never acceptable; the RED-proof verdict is now read directly off
 this merge's own first-class field, in the SAME artifact the primary decision lands in.
+
+**Postscript, 2026-08-29d** (docs-ci, unit-63 round-13 audit finding 2): the postscript above
+underspecified `red_proof_verdict`'s own null state. `ab_merge.py`'s `except
+(MutantDoseLadderSensitivityError, RedProofLabelError)` handler resets `sensitivity`/
+`two_sided_falsification`/`dose_anomalies` (+ `sensitivity_error`) on ANY dose-ladder refusal,
+but `red_proof_verdict` must distinguish two different refused states, never collapse them to
+the same `null`: no RED-proof label was ever present in the supplied dose set (kept `null`,
+exactly as before — nothing to report), versus at least one RED-proof-labeled column WAS
+scheduled but the refusal fired before RED-proof evaluation ever ran (`partition_red_proof_
+dose_columns` itself, or any eps-family scan downstream of it, raising before `build_red_
+proof_summary` is reached). The second state is now recorded as an explicit `NOT_PROVEN`-class
+verdict naming the refusal (`"NOT_PROVEN (dose set refused before RED-proof evaluation: <exc>)"`),
+never left `null` byte-identical to the first — a `null` `red_proof_verdict` means only "no
+RED-proof column was scheduled", never "one was scheduled but its own evaluation never ran".
+This lets both the existing NOT_PROVEN exit fold (`main()`'s own dose-ladder exit-code branch)
+and `runpod_gpu_howwell.sh`'s own GREEN-but-nonzero cause namer (`howwell_dose_ladder_cause.py`)
+fire on this state instead of falling through to an unexplained-contradiction "unknown" cause.

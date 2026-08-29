@@ -1163,6 +1163,16 @@ jobs:
           # zero-execution gap as `compare_grad_oracle`'s suite above.
           - name: perf ab_merge suite
             cmd: python3 ci/scripts/perf/test_ab_merge.py
+          # `runpod_gpu_howwell.sh`'s GREEN-but-nonzero cause namer (unit-63
+          # round-13 audit F1), extracted out of that script's own inline
+          # python heredoc into a real, testable module
+          # (`howwell_dose_ladder_cause.py`) -- drives `dose_ladder_cause`
+          # against synthetic report dicts covering every one of `ab_merge.
+          # py`'s own four dose-ladder exit-code causes plus the all-clear
+          # fallback, same "zero-execution is RED, not a skip" reasoning as
+          # the two suites above.
+          - name: howwell dose ladder cause namer suite
+            cmd: python3 ci/scripts/test_howwell_dose_ladder_cause.py
           # Unification contract C4.2 (unit 61 phase 1): `ab_merge.py`'s
           # `FINETUNE_IDENTITY_FIELDS` and `compare_grad_oracle.py`'s
           # `RUN_IDENTITY_FIELDS` — the two jammi-vs-torch COMPARISON tuples,

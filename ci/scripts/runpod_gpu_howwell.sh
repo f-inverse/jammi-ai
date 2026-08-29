@@ -215,29 +215,23 @@ if [ -n "$REPORT_JSON" ] && [ -f "$REPORT_JSON" ]; then
       ;;
     GREEN)
       if [ "$rc" -ne 0 ]; then
-        # unit-63 round-10 audit advisory (d): a GREEN main decision does
-        # NOT itself force rc=0 -- the mutant dose ladder (an INVALID dose
-        # column, a negative-eps dose_anomaly, or a sensitivity_error, all
-        # folded into main()'s own exit code in ab_merge.py) can still fail
-        # the merge while the primary A/B decision itself reads GREEN.
-        # Name the actual cause here BY NAME, mirroring this script's own
-        # loud-naming idiom above, so a GREEN-but-nonzero run is legible
-        # outside the collapsed log group instead of looking like an
-        # unexplained contradiction.
-        CAUSE="$(python3 -c '
-import json, sys
-d = json.load(open(sys.argv[1]))
-ladder = d.get("mutant_dose_ladder") or {}
-causes = []
-if ladder.get("sensitivity_error"):
-    causes.append("sensitivity_error")
-if ladder.get("dose_anomalies"):
-    causes.append("dose_anomalies")
-invalid_doses = [c.get("dose_label") for c in ladder.get("doses", []) if c.get("detected") == "INVALID"]
-if invalid_doses:
-    causes.append("invalid_doses=" + ",".join(invalid_doses))
-print(",".join(causes) if causes else "unknown (no dose_anomalies/sensitivity_error/invalid dose column found)")
-' "$REPORT_JSON" 2>/dev/null || echo "unknown (could not inspect ${REPORT_JSON})")"
+        # unit-63 round-10 audit advisory (d) / round-13 audit F1: a GREEN
+        # main decision does NOT itself force rc=0 -- the mutant dose ladder
+        # (an INVALID dose column, a negative-eps dose_anomaly, a
+        # sensitivity_error, or an undischarged RED-proof column --
+        # red_proof_verdict starting with "NOT_PROVEN", ab_merge.py:3777's
+        # own exit fold -- all folded into main()'s own exit code in
+        # ab_merge.py) can still fail the merge while the primary A/B
+        # decision itself reads GREEN. Name the actual cause here BY NAME,
+        # mirroring this script's own loud-naming idiom above, so a
+        # GREEN-but-nonzero run is legible outside the collapsed log group
+        # instead of looking like an unexplained contradiction -- this
+        # unit's own most likely failure shape is exactly this one
+        # (primary decision GREEN, RED-proof undischarged), so the namer
+        # must enumerate that cause too, never just the eps-family three.
+        # Extracted into howwell_dose_ladder_cause.py (a real, testable
+        # module) rather than staying an untestable inline heredoc.
+        CAUSE="$(python3 "$DIR/howwell_dose_ladder_cause.py" "$REPORT_JSON" 2>/dev/null || echo "unknown (could not inspect ${REPORT_JSON})")"
         echo "::error::how-well status=GREEN but exit=${rc} -- the mutant dose ladder failed the merge's own exit code (${CAUSE}), not the primary A/B decision."
       fi
       ;;

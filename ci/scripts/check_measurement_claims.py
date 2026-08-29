@@ -243,14 +243,33 @@ original two-leg discipline, `EXPECTED_DENOMINATOR`/`--sweep`, generalized):
       ISO-8601 timestamps, GB/MB sizes, epoch/step/t axis labels,
       named-hyperparameter assignments, and section/item/round/unit
       cross-references) — every class is enumerated at its definition
-      site (`_EXTRA_EXCLUSIONS` below) with a one-line reason and a
-      self-test fixture proving it excludes ONLY its own shape; there is
+      site (`_EXTRA_EXCLUSIONS` below) with a one-line reason and (round-23
+      audit F3: true of all 31 classes as of this fix, not just a subset)
+      a self-test fixture proving it excludes ONLY its own shape — a
+      positive "excludes cleanly" case AND an adversarial "a measured
+      value in the SAME syntactic neighborhood is still found" case, both
+      driven through `find_claim_tokens` in `self_test` below; there is
       no per-file/per-line carve-out that could silently narrow past that
-      documented boundary the way a zone allowlist could. Every class is
-      ANCHORED to the literal idiom it names (round-22 audit B4) — never a
-      bare `\bWORD\s+\d+\b` wide enough to also swallow an adjacent real
-      measured claim sharing the same word (e.g. "Step" as a doc-internal
-      section cross-reference vs "step" as a training-step count).
+      documented boundary the way a zone allowlist could. A SUBSET of
+      classes are additionally ANCHORED to the specific literal idiom/
+      digit they name (round-22 audit B4, round-23 F1:
+      `Step`/`Acceptance`/`finding`/`unit 63`/`CONTRACT 63`/
+      `PLAN v2 delta`/`exit 0`/the `s`-axis `{0,1}` domain/the CPU-demo's
+      `4-element`/`5 consecutive` shape) — never a bare `\bWORD\s+\d+\b`
+      wide enough to also swallow an adjacent real measured claim sharing
+      the same word (e.g. "Step" as a doc-internal section cross-reference
+      vs "step" as a training-step count; round-23 F1: "N-leg" as a
+      doc-internal CPU-demo design constant vs "N-leg" as this corpus's
+      OWN gate-seed-count measurement — the exact shape that escaped
+      round-22's own sweep). The remaining classes — the `epoch|step|t`
+      axis-index label, `item N`, and the seed-number LIST — are
+      DELIBERATELY left unbounded in N: each is a citation/axis-position
+      SHAPE (not itself a measured outcome) that this corpus uses at
+      genuinely many different, real N (`epoch 1`, `step=1`..`step=7`,
+      `item 2`/`item 3`/`item 4`, `seed 1`/`seed 2`/`seed 4`/
+      `seeds 9 and 12`); bounding any of these to one literal value would
+      only forbid a future genuine occurrence at a different N, never
+      close a real collision the way the round-22 B4 fixes above did.
   (b) AMBIGUITY. For every DIRECT pointer binding (not `hist`/`ledger`/a
       derived aggregate — round-22 B3: an `abs(E)`-wrapped scalar pointer
       is UNWRAPPED to a bare pointer wherever the doc token is not itself
@@ -284,13 +303,28 @@ original two-leg discipline, `EXPECTED_DENOMINATOR`/`--sweep`, generalized):
       parallel to `FILE_TOKEN_DENOMINATOR`), so a line appended INSIDE an
       already-closed fence — which moves no token count, since fenced
       content is never tokenized — still drifts a pinned number.
-  (d) UNUSED LEDGER ENTRIES (round-22 audit A2). `check_unused_ledger_entries`
-      diffs every `ledger`/`const` key an actual scan of the real tree
-      consumed against the full committed allowlist — an entry consumed by
-      NOTHING (e.g. left behind after a lexical exclusion class widened to
-      cover what it used to escape) is a FINDING; a shrink-only ratchet
-      with no liveness check on its own rows can otherwise accumulate dead
-      escapes forever.
+  (d) UNUSED ENTRIES (round-22 audit A2, round-23 audit F2). TWO
+      complementary checks, both catching "an entry that claims to bind a
+      token but is consumed by NOTHING":
+        - the ALLOWLIST FILE side: `check_unused_ledger_entries` diffs
+          every `ledger`/`const` key an actual scan of the real tree
+          consumed against the full committed allowlist — an entry
+          consumed by NOTHING (e.g. left behind after a lexical exclusion
+          class widened to cover what it used to escape) is a FINDING; a
+          shrink-only ratchet with no liveness check on its own rows can
+          otherwise accumulate dead escapes forever.
+        - the IN-DOC `claims63:` TAG side (round-23 F2): `scan_file`
+          itself now checks `len(entries)` against `len(toks)` in BOTH
+          directions, not just `entries < toks` (a token with no entry).
+          `entries > toks` — a tag entry bound to NOTHING, including the
+          degenerate case where the line below has ZERO claim tokens at
+          all (every numeral on it excluded by a lexical class) — is
+          symmetrically a FINDING; the prior one-sided form's `if not
+          toks: continue` made this second shape structurally invisible,
+          not merely under-counted (three committed instances: a lexical
+          exclusion class widening out from under a `ledger` tag, twice,
+          and once resolving naturally once F1's own exclusion-class fix
+          restored the token it was already correctly written to bind).
 
 RELATIONAL CLAIMS ARE IN SCOPE (this module's own reading of esc-065,
 correcting an earlier narrower draft): a comparison/interval-containment
@@ -385,7 +419,10 @@ MEASUREMENT_FILES = [
 #       — every class is named with a one-line reason at its definition
 #       site, and every class has a self-test fixture proving it excludes
 #       ONLY its own shape (`self_test`'s "exclusion class" fixtures
-#       below). A1 (round-22 audit): a heading line (`^#`) is NOT its own
+#       below — round-23 audit F3: true of every one of the 31 classes as
+#       of this fix; 19 previously had no such fixture at all, a gap this
+#       leg itself exists to prevent). A1 (round-22 audit): a heading line
+#       (`^#`) is NOT its own
 #       mechanism — there used to be a whole-line heading skip here, but it
 #       swallowed a live threshold flip AND an injected false claim written
 #       directly into a heading (nothing under a heading was ever even a
@@ -463,7 +500,13 @@ FILE_TOKEN_DENOMINATOR: dict[str, int] = {
     "docs/plans/63-how-well/measurements/red-proof/dstar/README.md": 31,
     # +2 (round-22 A1): heading lines are now in scope — the "### Step 3 —
     # ... >=11/12+mean rule" heading's own "11"/"12" tokens.
-    "docs/plans/63-how-well/mutants/README.md": 322,
+    # +7 (round-23 F1): the "N-leg" exclusion class was removed (a real,
+    # bindable sample-size measurement, same discipline as "N-seed" — see
+    # `_EXTRA_EXCLUSIONS` above); the "12" in "12-leg GPU" at all 7
+    # committed Measured-record sites now tokenizes and is bound
+    # per-occurrence (322 round-22 baseline + 7 round-23 F1 "12-leg"
+    # tokens = 329).
+    "docs/plans/63-how-well/mutants/README.md": 329,
 }
 
 # B1 (round-22 audit): a SECOND, INDEPENDENT pin — the total count of fenced
@@ -476,6 +519,18 @@ FILE_TOKEN_DENOMINATOR: dict[str, int] = {
 # to 0 (still checked: a 0 -> nonzero drift, e.g. a first fence appearing in
 # a file that previously had none, is exactly the kind of scope-shrink this
 # leg exists to catch).
+#
+# DISCLOSED LIMIT (round-23 audit A2, count-only compensating edit): this
+# pin is a single scalar TOTAL, not a per-fence-block or per-line-position
+# record — it catches any net change in the total fenced-line count, but a
+# COMPENSATING edit (one fenced line deleted from one block, a DIFFERENT
+# fenced line added to a DIFFERENT block, net delta zero) leaves the total
+# unchanged and is NOT caught by this leg. This is a known, accepted
+# narrowing of what "the pin" verifies (a total, not a shape), not a bug —
+# closing it would need a per-block or line-content pin, which this leg
+# does not attempt; `self_test`'s "A2 known-negative" fixture asserts this
+# CURRENT behavior explicitly, as the disclosed limit it is, never as a
+# fake RED.
 FENCE_LINE_DENOMINATOR: dict[str, int] = {
     "docs/plans/63-how-well/measurements/campaign-v1/README.md": 0,
     "docs/plans/63-how-well/measurements/campaign-v2/README.md": 0,
@@ -521,8 +576,6 @@ _EXTRA_EXCLUSIONS = [
     re.compile(r"\bitem\s+\d+(?:\([ivx]+\))?\b"),
     # an exit-code label (`RC:0`).
     re.compile(r"\bRC:\d+\b"),
-    # a repeat-count descriptor (`x2 seeds`).
-    re.compile(r"\bx\d+\b"),
     # a dose-eps LABEL (`eps-0.50`, `eps0.02`) — a shape label, same class
     # as rule (h)'s own `b8s512`-style exclusions, never a measurement.
     re.compile(r"\beps[+-]?\d+(?:\.\d+)?\b"),
@@ -567,8 +620,13 @@ _EXTRA_EXCLUSIONS = [
     # self-reference (the doc's own contract/unit/plan-delta number, never
     # a measurement) — same class as the `item N`/`Acceptance N` cross-refs
     # above, widened to this file's own additional numbered-reference
-    # vocabulary.
-    re.compile(r"\bCONTRACT\s+\d+\b"),
+    # vocabulary. round-23 audit F3: bounded to the literal "63" (this
+    # doc's own, only, `CONTRACT` number in every in-scope file today) —
+    # same discipline as `unit 63` below, so a bare "CONTRACT 12" (a
+    # genuinely different number) would surface as a real claim rather
+    # than being silently swallowed as though it were this doc's own
+    # self-reference.
+    re.compile(r"\bCONTRACT\s+63\b"),
     # B4 (round-22 audit): "unit N" — this repo's own unit-numbering
     # cross-reference is ALWAYS this unit's own number, "63" (`unit 63`,
     # `unit-63`, `Unit 63`) in every in-scope file today — bounded to that
@@ -607,6 +665,12 @@ _EXTRA_EXCLUSIONS = [
     # than an unbounded `\d+`, so an adjacent real measured claim written
     # as `s=<value>` for any OTHER value is never silently swallowed.
     re.compile(r"\bs\s*[:=]\s*[01](?:\s*->\s*[01])?\b"),
+    # round-23 audit F1: the SAME `{0, 1}` interpolation-parameter axis
+    # domain, restated in bracket-range prose instead of `s:`/`s=` notation
+    # (`the secant is measured over the entire [0, 1] range`) — the exact
+    # literal endpoints only, never a bare `\[\d+,\s*\d+\]`, so an unrelated
+    # bracketed pair naming two OTHER numbers is never silently swallowed.
+    re.compile(r"\[0,\s*1\]"),
     # an `eps < 0` / `eps > 0` sign-domain condition (which branch of the
     # signed dose family a column belongs to) — a formula/domain
     # description, same class as the named-hyperparameter-assignment
@@ -623,16 +687,31 @@ _EXTRA_EXCLUSIONS = [
     # `seeds? \d+(?:,|and)...` exclusion above covers for space-separated
     # lists, widened to this corpus's brace-delimited form.
     re.compile(r"\bseeds?\{[\d,]+\}"),
-    # a bracketed numeric-literal test FIXTURE (`[0.5,-1.25,3.0,0.0]`) — the
-    # CPU-demo's fixed input, a design constant never a measurement.
-    re.compile(r"\[[-0-9.,\s]+\]"),
-    # an "N-element"/"N-leg"/"N consecutive" descriptive count label.
-    # (deliberately NOT "N-seed": that shape also carries a real,
-    # bindable measurement — the campaign's own `12-seed gate` restating
-    # `gate_seed_count` — so it is handled per-occurrence via a binding,
-    # never excluded wholesale.)
-    re.compile(r"\b\d+-(?:element|leg)\b"),
-    re.compile(r"\b\d+\s+consecutive\b"),
+    # a bracketed numeric-literal test FIXTURE (`theta=[0.5,-1.25,3.0,0.0]`,
+    # `g=[0.1,-0.2,0.05,0.0]`) — the CPU-demo's fixed input, a design
+    # constant never a measurement. round-23 audit F1: ANCHORED to its own
+    # `theta=`/`g=` prefix (this corpus's only two bracketed-literal-array
+    # occurrences) rather than a bare `\[[-0-9.,\s]+\]`, which also matched
+    # an UNPREFIXED bracket pair naming a real value (e.g. an axis-domain
+    # `[0, 1]` restatement, now its own anchored class above) — never a
+    # measurement dressed up in brackets next to an unrelated word.
+    re.compile(r"\b(?:theta|g)=\[[-0-9.,\s]+\]"),
+    # round-23 audit F1 (LIVE false-pass): "N-element"/"N consecutive" are a
+    # genuinely fixed CPU-demo design constant in this corpus (always the
+    # SAME 4-element theta/g input, always 5 consecutive steps) — bounded to
+    # those literal digits, exactly like `Acceptance N`/`exit N` above,
+    # rather than an unbounded `\d+`. "N-leg" was REMOVED from this class
+    # entirely (round-22's own comment already reasoned "N-seed" needed the
+    # same per-occurrence-binding treatment for exactly this reason but
+    # missed that "N-leg" is the SAME shape: the auditor's own perturbation
+    # probe, `12-leg GPU` -> `9-leg GPU` at all 7 committed sites, proved
+    # "N-leg" carries a real, bindable sample-size measurement identical to
+    # `gate_seed_count`/`clean_pair_count` — it is never blanket-excluded
+    # any more; every "N-leg" occurrence in this corpus is bound
+    # per-occurrence via its own `claims63` tag entry, same discipline as
+    # "N-seed").
+    re.compile(r"\b4-element\b"),
+    re.compile(r"\b5\s+consecutive\b"),
     # a seed-number LIST (`seeds 9 and 12`, `seeds 9, 12`) — reused idiom,
     # generalizing rule (h)'s own single-seed `seeds? \d+` exclusion to a
     # conjunction/comma list (the exact widening its own `rows?` pattern
@@ -1278,7 +1357,22 @@ def scan_file(
     the unused-entry leg (`check_unused_ledger_entries` below) diffs this
     set against `load_ledger()`'s full contents to find an entry the doc no
     longer cites at all (an orphan, e.g. left behind after a lexical
-    exclusion class widened to cover what the entry used to escape)."""
+    exclusion class widened to cover what the entry used to escape).
+
+    round-23 audit F2: the entries-vs-tokens relation was audited
+    ONE-SIDED — `len(entries) < len(toks)` (a token with no matching
+    entry) was always a finding, but `len(entries) > len(toks)` (a tag
+    entry with no matching token — a DEAD directive, e.g. left behind
+    after a lexical exclusion class widened to swallow the token it used
+    to bind, the exact class `check_unused_ledger_entries` already polices
+    for ledger/const ROWS in the allowlist FILE, but never for an ordinary
+    tag entry inside the doc itself) was silently absorbed by `zip()`
+    truncating to the shorter sequence, never even inspected. This is now
+    checked on BOTH sides, including the degenerate `toks == []` case (a
+    tag sits above a line with ZERO claim tokens at all — the prior
+    control flow `continue`d on an empty `toks` BEFORE ever looking at the
+    tag above it, so a tag whose token was fully excluded out from under
+    it was invisible by construction, not merely under-counted)."""
     ledger = ledger if ledger is not None else set()
     abspath = REPO_ROOT / rel_path
     text = abspath.read_text()
@@ -1295,6 +1389,23 @@ def scan_file(
             continue
         toks = find_claim_tokens(line, line_no)
         if not toks:
+            # round-23 F2: even with ZERO claim tokens on this line, a
+            # `claims63` tag directly above it may still declare entries —
+            # every one of those is DEAD (bound to nothing) and must be a
+            # finding, never silently skipped just because there is no
+            # token to anchor the finding's own column to.
+            _, dead_entries = _entries_for_line(lines, line_no)
+            if dead_entries:
+                findings.append(
+                    Finding(
+                        rel_path,
+                        line_no - 1,
+                        0,
+                        f"claims63 tag above has {len(dead_entries)} entr"
+                        f"{'y' if len(dead_entries) == 1 else 'ies'} but this line has 0 "
+                        "claim token(s) -- dead directive",
+                    )
+                )
             continue
         tokens_in_zone += len(toks)
         default_path, entries = _entries_for_line(lines, line_no)
@@ -1310,6 +1421,17 @@ def scan_file(
                     line_no,
                     toks[0].col,
                     f"{len(toks)} claim token(s) but only {len(entries)} tag entries",
+                )
+            )
+        elif len(entries) > len(toks):
+            findings.append(
+                Finding(
+                    rel_path,
+                    line_no,
+                    toks[0].col,
+                    f"{len(toks)} claim token(s) but {len(entries)} tag entries "
+                    f"-- {len(entries) - len(toks)} dead (unconsumed) entr"
+                    f"{'y' if len(entries) - len(toks) == 1 else 'ies'}",
                 )
             )
         evaluator = Evaluator(loader, code_blocks, default_path)
@@ -1602,7 +1724,11 @@ def check_fence_integrity() -> list[str]:
     from `FILE_TOKEN_DENOMINATOR` (`FENCE_LINE_DENOMINATOR`), so a line
     appended INSIDE an already-closed fence — which changes NO token count,
     since fenced content is never tokenized — still drifts a pinned number
-    and is caught."""
+    and is caught. DISCLOSED LIMIT (round-23 audit A2): the SPAN leg pins a
+    single scalar TOTAL per file, not a per-block shape, so a COMPENSATING
+    edit (a fenced line removed from one block, a different fenced line
+    added to another, net delta zero) is NOT caught — see
+    `FENCE_LINE_DENOMINATOR`'s own comment for the full disclosure."""
     problems = []
     for rel_path in MEASUREMENT_FILES:
         abspath = REPO_ROOT / rel_path
@@ -2090,6 +2216,52 @@ def self_test() -> int:
             len(toks) >= 1 and entries is None,
         )
 
+    # --- round-23 audit F2: the entries-vs-tokens relation was audited
+    # ONE-SIDED (entries < toks reported; entries > toks, a DEAD tag
+    # directive, never did) -- driven end-to-end through the REAL
+    # `scan_file` entry point, both shapes: (i) a tag with excess entries
+    # above a line that STILL has some real tokens (partial dead entry),
+    # and (ii) a tag with entries above a line with ZERO real tokens at
+    # all (fully dead directive -- the exact shape the pre-fix `if not
+    # toks: continue` made structurally invisible).
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        # (i) partial: one real token, two tag entries.
+        content_partial = "<!-- claims63: c1=const; c2=const -->\na claim of 7 here\n"
+        p_partial = _write_tmp(tmp, "dead-partial.md", content_partial)
+        rel_partial = str(p_partial)
+        findings_partial, _, _, _ = scan_file(rel_partial, Loader(), ledger=set())
+        check(
+            "F2 fixture (i): a tag with MORE entries than real tokens on the line "
+            "below (1 token, 2 entries) REDs with a 'dead (unconsumed) entry' finding",
+            any("dead (unconsumed) entry" in f.message for f in findings_partial),
+        )
+        # (ii) fully dead: a tag directive sits above a line with ZERO real
+        # claim tokens (e.g. every numeral on the line is excluded by a
+        # lexical class) -- the exact shape of the pre-fix mutants/README.md
+        # :751/:819/:979 orphans.
+        content_dead = "<!-- claims63: c1=const -->\nmerge exit 0 (nothing measured here)\n"
+        p_dead = _write_tmp(tmp, "dead-full.md", content_dead)
+        rel_dead = str(p_dead)
+        findings_dead, in_zone_dead, _, _ = scan_file(rel_dead, Loader(), ledger=set())
+        check(
+            "F2 fixture (ii): a tag directive above a line with ZERO real claim "
+            "tokens (every numeral lexically excluded) REDs with a 'dead directive' "
+            "finding, not silently skipped",
+            in_zone_dead == 0 and any("dead directive" in f.message for f in findings_dead),
+        )
+        # negative control: a tag whose entry count matches its line's real
+        # token count exactly must NOT fire either leg.
+        content_balanced = "<!-- claims63: c1=const -->\na claim of 7 here\n"
+        p_balanced = _write_tmp(tmp, "balanced.md", content_balanced)
+        rel_balanced = str(p_balanced)
+        findings_balanced, _, _, _ = scan_file(rel_balanced, Loader(), ledger={f"const:{rel_balanced}:7:{line_hash('a claim of 7 here')}:12"})
+        check(
+            "F2 negative control: a tag whose entry count matches its real token "
+            "count exactly fires NEITHER the dead-entry NOR the missing-entry leg",
+            not any("dead" in f.message or "only" in f.message for f in findings_balanced),
+        )
+
     # --- new (round-21) closed lexical exclusion classes: each excludes
     # ONLY its own shape -- a measured token dressed up in the SAME
     # syntactic neighborhood (adversarial fixture per class) must still be
@@ -2142,6 +2314,11 @@ def self_test() -> int:
         toks_of("unit 63") == [] and toks_of("unit-63 round-7") == [] and toks_of("unit 12") == ["12"],
     )
     check(
+        "round-23 F3: 'CONTRACT 63' still excludes cleanly, but a DIFFERENT CONTRACT "
+        "number is now found, not silently swallowed (same discipline as 'unit 63')",
+        toks_of("CONTRACT 63") == [] and toks_of("CONTRACT 12") == ["12"],
+    )
+    check(
         "B4: 'PLAN v2 delta 7' still excludes cleanly, but a bare 'delta 3' "
         "(e.g. CONTRACT.md's own per-item idiom) is now found, not silently swallowed",
         toks_of("PLAN v2 delta 7") == [] and toks_of("delta 3") == ["3"],
@@ -2192,6 +2369,191 @@ def self_test() -> int:
     check(
         "exclusion((1-eps) formula fragment): both '(1+eps)' and '(1-eps)' exclude cleanly",
         toks_of("the `(1+eps)`/`(1-eps)` dose-family shape") == [],
+    )
+
+    # --- round-23 audit F3: the remaining 20 of 31 `_EXTRA_EXCLUSIONS`
+    # classes had NO self-test fixture at all, contradicting this module's
+    # own docstring claim (":386", "every class has a self-test fixture
+    # proving it excludes ONLY its own shape") — each gets the SAME
+    # positive/adversarial pair discipline as the classes above: a clean
+    # exclusion of its own idiom, and a measured value in the SAME
+    # syntactic neighborhood that must still be found.
+    check(
+        "exclusion(hex/sha run): 'checkpoint dc1cfc3b committed' excludes cleanly",
+        toks_of("checkpoint dc1cfc3b committed") == [],
+    )
+    check(
+        "exclusion(hex/sha run) adversarial: a measured value beside a hex/sha run is still found",
+        toks_of("the run recorded 42 alongside checkpoint dc1cfc3b") == ["42"],
+    )
+    check(
+        "exclusion(date+revision-letter): 'recorded on 2026-08-29c' excludes cleanly",
+        toks_of("recorded on 2026-08-29c after the fix") == [],
+    )
+    check(
+        "exclusion(date+revision-letter) adversarial: a measured value beside a "
+        "same-day-revision date is still found",
+        toks_of("measured 2.5 on 2026-08-29c") == ["2.5"],
+    )
+    check(
+        "exclusion(compact ISO-8601 timestamp): 'output dir 20260829T055912Z' excludes cleanly",
+        toks_of("output dir 20260829T055912Z") == [],
+    )
+    check(
+        "exclusion(compact ISO-8601 timestamp) adversarial: a measured value beside "
+        "a compact timestamp is still found",
+        toks_of("measured 2.5 at 20260829T055912Z") == ["2.5"],
+    )
+    check(
+        "exclusion(GB/MB size): 'A100-SXM4-80GB' excludes cleanly",
+        toks_of("A100-SXM4-80GB") == [],
+    )
+    check(
+        "exclusion(GB/MB size) adversarial: a measured value beside a size label is still found",
+        toks_of("measured 2.5 on the 80GB A100") == ["2.5"],
+    )
+    check(
+        "exclusion(epoch/step/t axis index): 'detected at epoch 1' excludes cleanly",
+        toks_of("detected at epoch 1") == [],
+    )
+    check(
+        "exclusion(epoch/step/t axis index) adversarial: a measured value beside "
+        "an epoch index is still found",
+        toks_of("measured 2.5 at epoch 1") == ["2.5"],
+    )
+    check(
+        "exclusion(hyperparameter setting): 'lr=2e-4, eps=1e-8, alpha2=0.0064, "
+        "beta1=0.9' excludes cleanly",
+        toks_of("lr=2e-4, eps=1e-8, alpha2=0.0064, beta1=0.9") == [],
+    )
+    check(
+        "exclusion(hyperparameter setting) adversarial: a measured value beside "
+        "an 'lr=' setting is still found",
+        toks_of("measured 2.5 at lr=2e-4") == ["2.5"],
+    )
+    check(
+        "exclusion(item N cross-ref): 'see item 2(ii) above' excludes cleanly",
+        toks_of("see item 2(ii) above") == [],
+    )
+    check(
+        "exclusion(item N cross-ref) adversarial: a measured value beside 'item 2(ii)' is still found",
+        toks_of("measured 2.5 near item 2(ii)") == ["2.5"],
+    )
+    check(
+        "exclusion(RC:N exit code): 'RC:0' excludes cleanly",
+        toks_of("RC:0") == [],
+    )
+    check(
+        "exclusion(RC:N exit code) adversarial: a measured value beside 'RC:0' is still found",
+        toks_of("measured 2.5 at RC:0") == ["2.5"],
+    )
+    check(
+        "exclusion(eps-N dose label): 'eps-0.50 dose' excludes cleanly",
+        toks_of("eps-0.50 dose") == [],
+    )
+    check(
+        "exclusion(eps-N dose label) adversarial: a measured value beside 'eps-0.50' is still found",
+        toks_of("measured -0.50 near eps-0.50") == ["-0.50"],
+    )
+    check(
+        "exclusion(ordered-list marker): '3. another line' excludes cleanly",
+        toks_of("3. another line") == [],
+    )
+    check(
+        "exclusion(ordered-list marker) adversarial: a measured value on the SAME "
+        "numbered-list line is still found",
+        toks_of("2. the measured value is 3.5") == ["3.5"],
+    )
+    check(
+        "exclusion(lr parenthetical mention): 'the lr (2e-4) setting' excludes cleanly",
+        toks_of("the lr (2e-4) setting") == [],
+    )
+    check(
+        "exclusion(lr parenthetical mention) adversarial: a measured value beside "
+        "'lr (2e-4)' is still found",
+        toks_of("measured 2.5 near lr (2e-4)") == ["2.5"],
+    )
+    check(
+        "exclusion(Acceptance N): 'Acceptance 5 discharged' excludes cleanly",
+        toks_of("Acceptance 5 discharged") == [],
+    )
+    check(
+        "exclusion(Acceptance N) adversarial: a measured value beside 'Acceptance 5' is still found",
+        toks_of("measured 5.5 near Acceptance 5") == ["5.5"],
+    )
+    check(
+        "exclusion(finding N): 'finding 4 resolved' excludes cleanly",
+        toks_of("finding 4 resolved") == [],
+    )
+    check(
+        "exclusion(finding N) adversarial: a measured value beside 'finding 4' is still found",
+        toks_of("measured 4.4 near finding 4") == ["4.4"],
+    )
+    check(
+        "exclusion(63-how-well dir segment): 'docs/plans/63-how-well/x' excludes cleanly",
+        toks_of("docs/plans/63-how-well/x") == [],
+    )
+    check(
+        "exclusion(63-how-well dir segment) adversarial: a measured value beside "
+        "'63-how-well' is still found",
+        toks_of("measured 63.5 in 63-how-well context") == ["63.5"],
+    )
+    check(
+        "exclusion([0, 1] axis-domain bracket): 'the axis range is [0, 1] here' excludes cleanly",
+        toks_of("the axis range is [0, 1] here") == [],
+    )
+    check(
+        "exclusion([0, 1] axis-domain bracket) adversarial: a measured value beside "
+        "'[0, 1]' is still found",
+        toks_of("measured 0.5 alongside the [0, 1] axis range") == ["0.5"],
+    )
+    check(
+        "exclusion(theta=/g= bracket array): both 'theta=[0.5,-1.25,3.0,0.0]' and "
+        "'g=[0.1,-0.2,0.05,0.0]' exclude cleanly",
+        toks_of("theta=[0.5,-1.25,3.0,0.0] fixed input") == []
+        and toks_of("g=[0.1,-0.2,0.05,0.0] fixed input") == [],
+    )
+    check(
+        "exclusion(theta=/g= bracket array) adversarial: a measured value beside "
+        "'theta=[...]' is still found",
+        toks_of("measured 0.5 near theta=[0.5,-1.25,3.0,0.0]") == ["0.5"],
+    )
+    check(
+        "exclusion(4-element CPU-demo input): 'the same fixed 4-element input' excludes cleanly",
+        toks_of("the same fixed 4-element input") == [],
+    )
+    check(
+        "exclusion(4-element CPU-demo input) adversarial: a measured value beside "
+        "'4-element' is still found",
+        toks_of("measured 4.5 near the 4-element input") == ["4.5"],
+    )
+    check(
+        "exclusion(5-consecutive CPU-demo steps): 'for 5 consecutive steps' excludes cleanly",
+        toks_of("for 5 consecutive steps") == [],
+    )
+    check(
+        "exclusion(5-consecutive CPU-demo steps) adversarial: a measured value beside "
+        "'5 consecutive' is still found",
+        toks_of("measured 5.5 over 5 consecutive steps") == ["5.5"],
+    )
+    check(
+        "exclusion(seed-number list): both 'seeds 9 and 12 committed' and "
+        "'seeds 9, 12 committed' exclude cleanly",
+        toks_of("seeds 9 and 12 committed") == [] and toks_of("seeds 9, 12 committed") == [],
+    )
+    check(
+        "exclusion(seed-number list) adversarial: a measured value beside a seed list "
+        "is still found",
+        toks_of("measured 9.5 near seeds 9 and 12") == ["9.5"],
+    )
+    check(
+        "exclusion(zero/negative array-index bracket): 'series[0] and series[-1]' excludes cleanly",
+        toks_of("series[0] and series[-1]") == [],
+    )
+    check(
+        "exclusion(zero/negative array-index bracket) adversarial: a measured value "
+        "beside 'series[0]' is still found",
+        toks_of("measured 2.5 near series[0]") == ["2.5"],
     )
 
     check(
@@ -2271,6 +2633,43 @@ def self_test() -> int:
         "B1 restore: an unmutated copy of the real file is clean under the same "
         "per-text fence check",
         _fence_problems_for(real_mutants_rel_for_fence, real_mutants_text_for_fence) == [],
+    )
+
+    # A2 (round-23 audit): the DISCLOSED count-only compensating-edit limit
+    # (see `FENCE_LINE_DENOMINATOR`'s own comment), demonstrated end-to-end
+    # as a KNOWN-NEGATIVE fixture — asserting the CURRENT, disclosed
+    # behavior (no finding), never a fake RED. A line is removed from ONE
+    # fenced block and a DIFFERENT line is added to a DIFFERENT fenced
+    # block, net fenced-line delta zero: parity stays even (no block was
+    # un/re-closed) and the SPAN total is unchanged, so neither B1 leg
+    # fires, even though the file's fenced CONTENT genuinely changed. If a
+    # future fix closes this gap (a per-block or line-content pin), this
+    # fixture's own expectation must flip from "not caught" to "caught" in
+    # the SAME change — never left silently asserting a since-fixed limit.
+    compensating_text = real_mutants_text_for_fence.replace(
+        "+    const LR_INFLATION_FACTOR: f64 = 1.02_f64;  // 1.10 / 1.50 for the other doses\n",
+        "",
+        1,
+    ).replace(
+        "slope(seed) = held_out_mean(s=0) - held_out_mean(s=1)\n",
+        "slope(seed) = held_out_mean(s=0) - held_out_mean(s=1)\n"
+        "A laundered line added to a DIFFERENT fenced block, compensating the deletion above\n",
+        1,
+    )
+    _, compensating_delim = _fence_scan(compensating_text.splitlines())
+    _compensating_total = len(_fence_scan(compensating_text.splitlines())[0])
+    _real_total = len(_fence_scan(real_mutants_text_for_fence.splitlines())[0])
+    check(
+        "A2 known-negative setup: the compensating edit removes one fenced line and "
+        f"adds a different one elsewhere, net delta zero ({_real_total} -> {_compensating_total}), "
+        f"parity stays even ({compensating_delim})",
+        _compensating_total == _real_total and compensating_delim % 2 == 0,
+    )
+    check(
+        "A2 known-negative (DISCLOSED LIMIT): a compensating edit across two "
+        "DIFFERENT fenced blocks is NOT caught by either B1 leg — this is the "
+        "documented count-only narrowing, asserted as CURRENT behavior, not a bug",
+        _fence_problems_for(real_mutants_rel_for_fence, compensating_text) == [],
     )
 
     # ledger cross-check: mutation-adequacy — a `ledger` tag whose key is
@@ -2468,6 +2867,101 @@ def self_test() -> int:
         "round-21 probe :1111 analog (Files-section 12/12 restatement) STILL REDs "
         f"post-inversion with EXACTLY ONE new finding ({len(f1111)})",
         len(f1111) == 1,
+    )
+
+    # --- round-23 audit F1 (LIVE false-pass): the auditor's EXACT
+    # perturbation — `12-leg GPU` -> `9-leg GPU` — reproduced at all 7
+    # committed sites the exclusion-class fix now exposes (before the fix,
+    # the "N-leg" wholesale exclusion silently swallowed this numeral at
+    # every one of the 7 sites, so this same probe left the gate at
+    # 478/478 PASS; the class no longer exists, and every site is bound
+    # per-occurrence to its own artifact's `gate_seed_count`/`paircount`,
+    # so each must now RED with exactly one new finding).
+    f_leg_1 = _mutate_and_scan(
+        "**Measured (12-leg GPU, a100, `redproof-nobc`): NOT DETECTED (raw).**",
+        "**Measured (9-leg GPU, a100, `redproof-nobc`): NOT DETECTED (raw).**",
+    )
+    check(
+        f"F1 probe 1/7 (mutants/README.md:752, M_nobc raw): 12-leg -> 9-leg REDs "
+        f"with EXACTLY ONE new finding ({len(f_leg_1)})",
+        len(f_leg_1) == 1,
+    )
+    f_leg_2 = _mutate_and_scan(
+        "**Measured (12-leg GPU, a100, `redproof-signflip`): INERT — 12/12 legs",
+        "**Measured (9-leg GPU, a100, `redproof-signflip`): INERT — 12/12 legs",
+    )
+    check(
+        f"F1 probe 2/7 (mutants/README.md:820, M_signflip v1 INERT): 12-leg -> 9-leg "
+        f"REDs with EXACTLY ONE new finding ({len(f_leg_2)})",
+        len(f_leg_2) == 1,
+    )
+    f_leg_3 = _mutate_and_scan(
+        "reaches the arm the 12-leg GPU gate actually exercises. This is the",
+        "reaches the arm the 9-leg GPU gate actually exercises. This is the",
+    )
+    check(
+        f"F1 probe 3/7 (mutants/README.md:839, dispatch-invariant lesson): 12-leg -> "
+        f"9-leg REDs with EXACTLY ONE new finding ({len(f_leg_3)})",
+        len(f_leg_3) == 1,
+    )
+    f_leg_4 = _mutate_and_scan(
+        "**Measured (12-leg GPU, a100, `redproof-signflip-v2`, D*-gated): RED —",
+        "**Measured (9-leg GPU, a100, `redproof-signflip-v2`, D*-gated): RED —",
+    )
+    check(
+        f"F1 probe 4/7 (mutants/README.md:966, M_signflip_v2 D*-gated RED): 12-leg -> "
+        f"9-leg REDs with EXACTLY ONE new finding ({len(f_leg_4)})",
+        len(f_leg_4) == 1,
+    )
+    f_leg_5 = _mutate_and_scan(
+        "**Measured record (12-leg GPU, a100), current-truth discipline:** committed",
+        "**Measured record (9-leg GPU, a100), current-truth discipline:** committed",
+    )
+    check(
+        f"F1 probe 5/7 (mutants/README.md:1079, RED-proof mutants summary): 12-leg -> "
+        f"9-leg REDs with EXACTLY ONE new finding ({len(f_leg_5)})",
+        len(f_leg_5) == 1,
+    )
+    f_leg_6 = _mutate_and_scan(
+        "patch-file-only; **measured NOT-DETECTED (raw)** on 12-leg GPU",
+        "patch-file-only; **measured NOT-DETECTED (raw)** on 9-leg GPU",
+    )
+    check(
+        f"F1 probe 6/7 (mutants/README.md:1175, Files: M_nobc.patch): 12-leg -> 9-leg "
+        f"REDs with EXACTLY ONE new finding ({len(f_leg_6)})",
+        len(f_leg_6) == 1,
+    )
+    f_leg_7 = _mutate_and_scan(
+        "patch-file-only; **RETIRED — measured INERT on 12-leg GPU**",
+        "patch-file-only; **RETIRED — measured INERT on 9-leg GPU**",
+    )
+    check(
+        f"F1 probe 7/7 (mutants/README.md:1185, Files: M_signflip.patch): 12-leg -> "
+        f"9-leg REDs with EXACTLY ONE new finding ({len(f_leg_7)})",
+        len(f_leg_7) == 1,
+    )
+
+    # --- round-23 audit F2 regression: reproducing the auditor's exact
+    # finding on the real, committed tree -- mutants/README.md:979 (pre-fix)
+    # carried a `c1=ledger` tag directly above a line whose only numeral
+    # ("exit 0") is lexically excluded, so the directive bound to NOTHING
+    # and was invisible to the one-sided pre-fix check (now removed as
+    # dead -- see the markdown itself). Driven end-to-end on a mutated
+    # COPY that reintroduces the exact orphan, through the real `scan_file`
+    # entry point (never a synthetic-only fixture, so a regression of the
+    # fix itself on the real file is caught).
+    f_dead_directive_regression = _mutate_and_scan(
+        "`detected=RED`, two-sided `p = 2/4096 = 1/2048 = 0.00048828125` exact;\n"
+        "`red_proof_verdict = PROVEN`;",
+        "`detected=RED`, two-sided `p = 2/4096 = 1/2048 = 0.00048828125` exact;\n"
+        "<!-- claims63: c1=ledger -->\n"
+        "`red_proof_verdict = PROVEN`;",
+    )
+    check(
+        "F2 regression probe (mutants/README.md, the pre-fix dead-directive shape "
+        f"reintroduced): a dead directive above 'exit 0' REDs with EXACTLY "
+        f"ONE new finding ({len(f_dead_directive_regression)})",
+        len(f_dead_directive_regression) == 1,
     )
 
     # --- A1 (round-22 audit): heading lines are now IN SCOPE. Unit-level:

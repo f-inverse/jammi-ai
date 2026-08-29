@@ -4,74 +4,121 @@
 # key per line, grows ONLY via a human-reviewed PR --
 # --check-allowlist-only-shrinks fails on any entry the current branch
 # adds relative to origin/main.
-docs/plans/63-how-well/measurements/campaign-v1/README.md:12:c4c26c1beccaf535248683f61ff835cf221c7baf:36
-docs/plans/63-how-well/measurements/campaign-v1/README.md:0.744:398dcce6d67e89aeb3c17d8640ecac35fea08fe2:17
-docs/plans/63-how-well/measurements/campaign-v1/README.md:1.009:398dcce6d67e89aeb3c17d8640ecac35fea08fe2:33
-docs/plans/63-how-well/measurements/campaign-v1/README.md:0:dabab96e1de40c14ef270385303eee04c0822372:71
-docs/plans/63-how-well/measurements/campaign-v2/README.md:24:01b6d5ecc31d8564c8a2696ef2fca4f140a28879:68
-docs/plans/63-how-well/measurements/campaign-v2/README.md:24:ecd60f16e2796bae83676546416f31d36d082111:12
-docs/plans/63-how-well/measurements/campaign-v2/README.md:0:ecd60f16e2796bae83676546416f31d36d082111:26
-docs/plans/63-how-well/measurements/dose-ladder/README.md:36:4035e0c176943513b0e10358204265135eb3d119:0
-docs/plans/63-how-well/measurements/dose-ladder/README.md:1:b6c9a1b5e39a0aa64fbbbc5e5a8c261ece86600e:22
-docs/plans/63-how-well/measurements/dose-ladder/README.md:0.04:20c646536fa8e10201a2e512a52b0f6f70904c1f:31
-docs/plans/63-how-well/measurements/dose-ladder/README.md:0.07:20c646536fa8e10201a2e512a52b0f6f70904c1f:36
-docs/plans/63-how-well/measurements/red-proof/README.md:36:4e07d2bd68214896bb13f35e63c527029bf5ba05:0
-docs/plans/63-how-well/measurements/red-proof/README.md:3:4e07d2bd68214896bb13f35e63c527029bf5ba05:13
-docs/plans/63-how-well/measurements/red-proof/README.md:12:4e07d2bd68214896bb13f35e63c527029bf5ba05:25
-docs/plans/63-how-well/measurements/red-proof/README.md:1:7b4cf6bc08dbdd026922f57ee862d553f4265e15:36
-docs/plans/63-how-well/measurements/red-proof/README.md:1,2:7b4cf6bc08dbdd026922f57ee862d553f4265e15:42
-docs/plans/63-how-well/measurements/red-proof/README.md:1:0bf85580361cc97e858637a0439a07138ba7121e:81
-docs/plans/63-how-well/measurements/red-proof/README.md:5:aa82159426971718df74bb65ade11c84e9ce93d3:58
-docs/plans/63-how-well/measurements/red-proof/README.md:12:aa82159426971718df74bb65ade11c84e9ce93d3:60
-docs/plans/63-how-well/measurements/red-proof/README.md:-0.0183:aa82159426971718df74bb65ade11c84e9ce93d3:71
-docs/plans/63-how-well/measurements/red-proof/README.md:2:aa82159426971718df74bb65ade11c84e9ce93d3:90
-docs/plans/63-how-well/measurements/red-proof/README.md:12:47434c6ba0c7f83889a814800d24714bd957df91:83
-docs/plans/63-how-well/measurements/red-proof/README.md:12:47434c6ba0c7f83889a814800d24714bd957df91:86
-docs/plans/63-how-well/measurements/red-proof/README.md:12:b87cbef036bf31e0ba11624b3a3a7df392d86bfc:49
-docs/plans/63-how-well/measurements/red-proof/README.md:12:b87cbef036bf31e0ba11624b3a3a7df392d86bfc:52
-docs/plans/63-how-well/measurements/red-proof/README.md:+19.2:b87cbef036bf31e0ba11624b3a3a7df392d86bfc:90
-docs/plans/63-how-well/measurements/red-proof/README.md:2:b87cbef036bf31e0ba11624b3a3a7df392d86bfc:122
-docs/plans/63-how-well/measurements/red-proof/README.md:4096:b87cbef036bf31e0ba11624b3a3a7df392d86bfc:124
-docs/plans/63-how-well/measurements/red-proof/README.md:1:b87cbef036bf31e0ba11624b3a3a7df392d86bfc:131
-docs/plans/63-how-well/measurements/red-proof/README.md:2048:b87cbef036bf31e0ba11624b3a3a7df392d86bfc:133
-docs/plans/63-how-well/measurements/red-proof/README.md:1:b87cbef036bf31e0ba11624b3a3a7df392d86bfc:172
-docs/plans/63-how-well/measurements/red-proof/README.md:4096:b87cbef036bf31e0ba11624b3a3a7df392d86bfc:174
-docs/plans/63-how-well/measurements/red-proof/README.md:12:b87cbef036bf31e0ba11624b3a3a7df392d86bfc:191
-docs/plans/63-how-well/measurements/red-proof/README.md:12:b87cbef036bf31e0ba11624b3a3a7df392d86bfc:194
-docs/plans/63-how-well/measurements/red-proof/README.md:0:70fde9311ef7fbaa92d0e1153cf596b89baa2291:53
-docs/plans/63-how-well/measurements/red-proof/README.md:12:70fde9311ef7fbaa92d0e1153cf596b89baa2291:55
-docs/plans/63-how-well/measurements/red-proof/README.md:12:2d7e4a425009979dc99fa75597bfd0d4517a7da9:37
-docs/plans/63-how-well/measurements/red-proof/README.md:12:2d7e4a425009979dc99fa75597bfd0d4517a7da9:40
-docs/plans/63-how-well/measurements/red-proof/README.md:12:73f9d5b7a4259152b5980a58729016804bd5fe80:17
-docs/plans/63-how-well/measurements/red-proof/README.md:12:73f9d5b7a4259152b5980a58729016804bd5fe80:20
-docs/plans/63-how-well/measurements/red-proof/README.md:0:b0876c5b7d18e2a1b5644f74cf69daded6c81bc8:65
-docs/plans/63-how-well/measurements/red-proof/dstar/README.md:0:6120220e79239262d9cf45ad7cd952a68d3e0b7c:16
-docs/plans/63-how-well/measurements/red-proof/dstar/README.md:3.3:e1b2fea1c887abdca215d39dac8a8b7ff7655a06:18
-docs/plans/63-how-well/measurements/red-proof/dstar/README.md:20:e1b2fea1c887abdca215d39dac8a8b7ff7655a06:26
-docs/plans/63-how-well/measurements/red-proof/dstar/README.md:11:e1b2fea1c887abdca215d39dac8a8b7ff7655a06:32
-docs/plans/63-how-well/measurements/red-proof/dstar/README.md:12:e1b2fea1c887abdca215d39dac8a8b7ff7655a06:38
-docs/plans/63-how-well/measurements/red-proof/dstar/README.md:11:8b92112933a273307b1eaa740877e7533aa7ecc0:66
-docs/plans/63-how-well/mutants/README.md:0.744:6090c25e058c18b1754dcc8b5a80d0f732ffc092:42
-docs/plans/63-how-well/mutants/README.md:1.009:bc6a451cb87f5df9a88526c99f2f4c7e9dc9cf96:2
-docs/plans/63-how-well/mutants/README.md:36:053369780f560b99194aae220e8335ecdfe915fa:10
-docs/plans/63-how-well/mutants/README.md:0:44af957d109581ce82164aa6042dc258bacdf68c:40
-docs/plans/63-how-well/mutants/README.md:12:44af957d109581ce82164aa6042dc258bacdf68c:42
-docs/plans/63-how-well/mutants/README.md:12:de0b78e1da73bfa6684eb959e009d05d383c8518:36
-docs/plans/63-how-well/mutants/README.md:12:de0b78e1da73bfa6684eb959e009d05d383c8518:61
-docs/plans/63-how-well/mutants/README.md:2:c599432bc6f32ea4ea2e09b980c77e65180e3253:45
-docs/plans/63-how-well/mutants/README.md:12:c599432bc6f32ea4ea2e09b980c77e65180e3253:61
-docs/plans/63-how-well/mutants/README.md:12:edb8411d2ebea113a077b0c6ddcb4d56d6119e9d:34
-docs/plans/63-how-well/mutants/README.md:12:fa76498ce08b9232f3047e543ecfaeb295df33bf:4
-docs/plans/63-how-well/mutants/README.md:12:b6780985521b334af23b9b1b913bd8995d3adc7c:60
-docs/plans/63-how-well/mutants/README.md:12:b6780985521b334af23b9b1b913bd8995d3adc7c:63
-docs/plans/63-how-well/mutants/README.md:36:68547f09f534153037710f0fea26a704453e1fce:0
-docs/plans/63-how-well/mutants/README.md:3.464057e-3:1582bdd5b415f180f26cc97881eeb5964c7633e4:2
-docs/plans/63-how-well/mutants/README.md:1.7320165e-2:1582bdd5b415f180f26cc97881eeb5964c7633e4:17
-docs/plans/63-how-well/mutants/README.md:3.464057e-3:8092b41cfdaa08d2d71710200daabbd28cbf38c7:2
-docs/plans/63-how-well/mutants/README.md:1.7320165e-2:8092b41cfdaa08d2d71710200daabbd28cbf38c7:17
-docs/plans/63-how-well/mutants/README.md:0:8d73deb37661a6a2632765bd8e8c7d16f67cbbc7:41
-docs/plans/63-how-well/mutants/README.md:36:9b0b3555c8e1cf3b252c464065c9bf1394fba4d6:71
-docs/plans/63-how-well/mutants/README.md:12:d9a8fb0f5bb88dc764699c1bc3011083791b359b:4
-docs/plans/63-how-well/mutants/README.md:12:613f7819a1617b55939ca359a0a083a92592f649:20
-docs/plans/63-how-well/mutants/README.md:2:101f18c412edd4fc86e3f369c78cfb9237cfd2d1:10
-docs/plans/63-how-well/mutants/README.md:2:332ea19113e8c5887861363981319ef2204c7c92:63
+#
+# round-20 audit disposition: every entry below is a GENUINE recipe/pointer
+# hole (never a token that IS reachable by an existing pointer or `poscount`/
+# `negcount`/`meand`/`maxd`/`mind`/`zerocount`/`paircount`/`abs`/`code`
+# binding -- those were converted to real bindings in the same sweep that
+# produced this file, shrinking it from 71 to 25 entries). Every surviving
+# entry's trailing `# <note>` states which of five closed, documented
+# unreachability classes it belongs to:
+#   [formula]  a hand-evaluated formula (e.g. the Adam bias-correction net-
+#              update multiplier, or 2*0.5^n for a sign-test tail) -- no
+#              artifact stores it and this grammar has no exponentiation/
+#              formula-evaluation primitive.
+#   [product]  the product of two INDEPENDENTLY pointer/recipe-bound factors
+#              (e.g. "3 doses x 12 seeds = 36 legs") -- no multiplication
+#              primitive in this grammar; the factors themselves are bound
+#              elsewhere on the same line where the grammar allows it.
+#   [sum]      the sum of two independent `paircount` legs (e.g. 12 fused-arm
+#              + 12 alloff-arm cross-campaign legs = 24) -- no addition
+#              primitive.
+#   [exit-code] a shell/CLI merge exit code -- never written to any committed
+#              JSON artifact; only observable by re-running the merger.
+#   [cli-syntax] digits that are CLI invocation syntax quoted verbatim (a
+#              seed range, a round-number list), not a measurement.
+#   [approx]   an explicitly approximate (`~`) qualitative range statement
+#              spanning MULTIPLE seeds' full per-step trajectories -- would
+#              require a new cross-file trajectory-aggregate this grammar
+#              does not have; the single-seed exact form of the same claim
+#              (red-proof/README.md's `3.32 -> 20.25`) IS pointer-bound.
+docs/plans/63-how-well/measurements/campaign-v1/README.md:0.744:398dcce6d67e89aeb3c17d8640ecac35fea08fe2:17  # [formula] Adam bias-correction net-update multiplier at t=1
+docs/plans/63-how-well/measurements/campaign-v1/README.md:1.009:398dcce6d67e89aeb3c17d8640ecac35fea08fe2:33  # [formula] Adam bias-correction net-update multiplier at t=50
+docs/plans/63-how-well/measurements/campaign-v2/README.md:24:01b6d5ecc31d8564c8a2696ef2fca4f140a28879:68  # [sum] 12 fused + 12 alloff v1-vs-v2 cross-check legs
+docs/plans/63-how-well/measurements/campaign-v2/README.md:24:ecd60f16e2796bae83676546416f31d36d082111:12  # [sum] same 24-leg cross-check, "checked=24"
+docs/plans/63-how-well/measurements/campaign-v2/README.md:0:ecd60f16e2796bae83676546416f31d36d082111:26  # [sum] same cross-check, "mismatches=0" (bit-identical count across both 12-leg arms, no zerocount-over-two-globs primitive)
+docs/plans/63-how-well/measurements/dose-ladder/README.md:36:4035e0c176943513b0e10358204265135eb3d119:0  # [product] 3 doses x 12 seeds
+docs/plans/63-how-well/measurements/dose-ladder/README.md:1:b6c9a1b5e39a0aa64fbbbc5e5a8c261ece86600e:22  # [exit-code] merger CLI exit code
+docs/plans/63-how-well/measurements/red-proof/README.md:36:4e07d2bd68214896bb13f35e63c527029bf5ba05:0  # [product] 3 mutants x 12 seeds
+docs/plans/63-how-well/measurements/red-proof/README.md:3:4e07d2bd68214896bb13f35e63c527029bf5ba05:13  # [product] mutant-family count factor of the same 36
+docs/plans/63-how-well/measurements/red-proof/README.md:12:4e07d2bd68214896bb13f35e63c527029bf5ba05:25  # [product] seeds-per-mutant factor of the same 36
+docs/plans/63-how-well/measurements/red-proof/README.md:1:7b4cf6bc08dbdd026922f57ee862d553f4265e15:36  # [cli-syntax] "1..12" seed-range argument
+docs/plans/63-how-well/measurements/red-proof/README.md:1,2:7b4cf6bc08dbdd026922f57ee862d553f4265e15:42  # [cli-syntax] "1,2" round-number argument
+docs/plans/63-how-well/measurements/red-proof/README.md:1:0bf85580361cc97e858637a0439a07138ba7121e:81  # [exit-code] merger CLI exit code
+docs/plans/63-how-well/measurements/red-proof/README.md:2:e1e31033ce2ece0170ae4e1a0261946a1e078f90:126  # [formula] sign-test tail numerator 2*0.5^12 = 2/4096 (n_pos/n_neg/paircount are recipe-bound on the same tag; the exponentiation itself has no primitive)
+docs/plans/63-how-well/measurements/red-proof/README.md:4096:e1e31033ce2ece0170ae4e1a0261946a1e078f90:128  # [formula] sign-test tail denominator 2^12 = 4096
+docs/plans/63-how-well/measurements/red-proof/README.md:0:b0876c5b7d18e2a1b5644f74cf69daded6c81bc8:65  # [exit-code] merger CLI exit code
+docs/plans/63-how-well/measurements/red-proof/dstar/README.md:0:6120220e79239262d9cf45ad7cd952a68d3e0b7c:16  # [exit-code] merger CLI exit code
+docs/plans/63-how-well/measurements/red-proof/dstar/README.md:3.3:e1b2fea1c887abdca215d39dac8a8b7ff7655a06:18  # [approx] "~3.3" multi-seed train_probe_series start, rounded
+docs/plans/63-how-well/measurements/red-proof/dstar/README.md:20:e1b2fea1c887abdca215d39dac8a8b7ff7655a06:26  # [approx] "~20" multi-seed train_probe_series end, rounded
+docs/plans/63-how-well/mutants/README.md:0.744:6090c25e058c18b1754dcc8b5a80d0f732ffc092:42  # [formula] Adam bias-correction net-update multiplier at t=1
+docs/plans/63-how-well/mutants/README.md:1.009:bc6a451cb87f5df9a88526c99f2f4c7e9dc9cf96:2  # [formula] Adam bias-correction net-update multiplier at t=50
+docs/plans/63-how-well/mutants/README.md:36:053369780f560b99194aae220e8335ecdfe915fa:10  # [product] 3 mutants x 12 seeds, restated
+docs/plans/63-how-well/mutants/README.md:36:68547f09f534153037710f0fea26a704453e1fce:0  # [product] 3 mutants x 12 seeds, restated
+docs/plans/63-how-well/mutants/README.md:0:8d73deb37661a6a2632765bd8e8c7d16f67cbbc7:41  # [exit-code] merger CLI exit code
+docs/plans/63-how-well/mutants/README.md:36:9b0b3555c8e1cf3b252c464065c9bf1394fba4d6:71  # [product] 3 mutants x 12 seeds, restated
+#
+# const: entries below (round-20 audit B4: const put under the SAME
+# shrink-only ratchet as ledger -- a doc author cannot silently reclassify
+# a real measurement as const to dodge both the pointer/recipe binding AND
+# the ledger review gate). Classes:
+#   [formula]     a formula fragment/design constant, never a measurement.
+#   [prediction]  a pre-registered secant/linear-extrapolation forecast or a
+#                dose LABEL, stated BEFORE the run it forecasts.
+#   [rule-param]  a pre-registered threshold/baseline/significance level.
+#   [xref]        a cross-reference number (e.g. "Acceptance 5"), never a
+#                measurement.
+const:docs/plans/63-how-well/measurements/campaign-v1/README.md:0.5:4de452db6ea4aaa689c1a635fb6e369bf2521bd3:71  # [rule-param] pre-registered admissibility threshold
+const:docs/plans/63-how-well/measurements/campaign-v1/README.md:0.5:b5b5b76f2daa808dbad027c4fe78c472536510e0:10  # [rule-param] pre-registered admissibility threshold
+const:docs/plans/63-how-well/measurements/dose-ladder/README.md:0.0064:20c646536fa8e10201a2e512a52b0f6f70904c1f:4  # [rule-param] pre-registered alpha2 significance level
+const:docs/plans/63-how-well/measurements/red-proof/README.md:0.0:ab50ac0a7fa0f518663742eb3222c09301ea45d1:72  # [rule-param] pre-registered learning-happened-premise floor
+const:docs/plans/63-how-well/measurements/red-proof/dstar/README.md:0:285088310179a9d9b9288567da844e478436e4f1:69  # [rule-param] pre-registered sign-test threshold/baseline
+const:docs/plans/63-how-well/mutants/README.md:1:115e6338d543de8edff40e8b57119062465bb2b2:25  # [formula] Adam bias-correction formula fragment (exponent/step label)
+const:docs/plans/63-how-well/mutants/README.md:1:115e6338d543de8edff40e8b57119062465bb2b2:37  # [formula] Adam bias-correction formula fragment (exponent/step label)
+const:docs/plans/63-how-well/mutants/README.md:1:115e6338d543de8edff40e8b57119062465bb2b2:59  # [formula] Adam bias-correction formula fragment (exponent/step label)
+const:docs/plans/63-how-well/mutants/README.md:1:115e6338d543de8edff40e8b57119062465bb2b2:75  # [formula] Adam bias-correction formula fragment (exponent/step label)
+const:docs/plans/63-how-well/mutants/README.md:0.02:1111fa3973583eddd0563a4f4d2c744e48922d35:2  # [prediction] pre-registered secant/linear-extrapolation forecast value or dose label, stated before the run it forecasts
+const:docs/plans/63-how-well/mutants/README.md:0.00220:1111fa3973583eddd0563a4f4d2c744e48922d35:36  # [prediction] pre-registered secant/linear-extrapolation forecast value or dose label, stated before the run it forecasts
+const:docs/plans/63-how-well/mutants/README.md:2.7:1111fa3973583eddd0563a4f4d2c744e48922d35:46  # [prediction] pre-registered secant/linear-extrapolation forecast value or dose label, stated before the run it forecasts
+const:docs/plans/63-how-well/mutants/README.md:9.2:1111fa3973583eddd0563a4f4d2c744e48922d35:63  # [prediction] pre-registered secant/linear-extrapolation forecast value or dose label, stated before the run it forecasts
+const:docs/plans/63-how-well/mutants/README.md:0.10:8dd048e21e890da1ee88d9edae8674dfa5432ba8:2  # [prediction] pre-registered secant/linear-extrapolation forecast value or dose label, stated before the run it forecasts
+const:docs/plans/63-how-well/mutants/README.md:0.01101:8dd048e21e890da1ee88d9edae8674dfa5432ba8:36  # [prediction] pre-registered secant/linear-extrapolation forecast value or dose label, stated before the run it forecasts
+const:docs/plans/63-how-well/mutants/README.md:13.3:8dd048e21e890da1ee88d9edae8674dfa5432ba8:46  # [prediction] pre-registered secant/linear-extrapolation forecast value or dose label, stated before the run it forecasts
+const:docs/plans/63-how-well/mutants/README.md:46.3:8dd048e21e890da1ee88d9edae8674dfa5432ba8:64  # [prediction] pre-registered secant/linear-extrapolation forecast value or dose label, stated before the run it forecasts
+const:docs/plans/63-how-well/mutants/README.md:+0.50:85cfa5e9a7c74a25faf70a40ac99844a58c6fb2a:2  # [rule-param] pre-registered sign-test threshold restated
+const:docs/plans/63-how-well/mutants/README.md:0.05504:85cfa5e9a7c74a25faf70a40ac99844a58c6fb2a:53  # [rule-param] pre-registered sign-test threshold restated
+const:docs/plans/63-how-well/mutants/README.md:66.6:85cfa5e9a7c74a25faf70a40ac99844a58c6fb2a:63  # [rule-param] pre-registered sign-test threshold restated
+const:docs/plans/63-how-well/mutants/README.md:2.31:85cfa5e9a7c74a25faf70a40ac99844a58c6fb2a:81  # [rule-param] pre-registered sign-test threshold restated
+const:docs/plans/63-how-well/mutants/README.md:2:85cfa5e9a7c74a25faf70a40ac99844a58c6fb2a:256  # [rule-param] pre-registered sign-test threshold restated
+const:docs/plans/63-how-well/mutants/README.md:1:85cfa5e9a7c74a25faf70a40ac99844a58c6fb2a:276  # [rule-param] pre-registered sign-test threshold restated
+const:docs/plans/63-how-well/mutants/README.md:0.204131:85cfa5e9a7c74a25faf70a40ac99844a58c6fb2a:409  # [rule-param] pre-registered sign-test threshold restated
+const:docs/plans/63-how-well/mutants/README.md:-0.10207:85cfa5e9a7c74a25faf70a40ac99844a58c6fb2a:474  # [rule-param] pre-registered sign-test threshold restated
+const:docs/plans/63-how-well/mutants/README.md:-0.10:3b2b64b7fd394802c5e546a333713da54cd80230:2  # [prediction] pre-registered secant/linear-extrapolation forecast value or dose label, stated before the run it forecasts
+const:docs/plans/63-how-well/mutants/README.md:0.01101:3b2b64b7fd394802c5e546a333713da54cd80230:45  # [prediction] pre-registered secant/linear-extrapolation forecast value or dose label, stated before the run it forecasts
+const:docs/plans/63-how-well/mutants/README.md:13.3:3b2b64b7fd394802c5e546a333713da54cd80230:55  # [prediction] pre-registered secant/linear-extrapolation forecast value or dose label, stated before the run it forecasts
+const:docs/plans/63-how-well/mutants/README.md:46.3:3b2b64b7fd394802c5e546a333713da54cd80230:73  # [prediction] pre-registered secant/linear-extrapolation forecast value or dose label, stated before the run it forecasts
+const:docs/plans/63-how-well/mutants/README.md:+0.10:3b2b64b7fd394802c5e546a333713da54cd80230:187  # [prediction] pre-registered secant/linear-extrapolation forecast value or dose label, stated before the run it forecasts
+const:docs/plans/63-how-well/mutants/README.md:-0.50:858eb5bbbabf4fabf21c2968257ab86eb8a3d767:2  # [prediction] pre-registered secant/linear-extrapolation forecast value or dose label, stated before the run it forecasts
+const:docs/plans/63-how-well/mutants/README.md:0.05504:858eb5bbbabf4fabf21c2968257ab86eb8a3d767:45  # [prediction] pre-registered secant/linear-extrapolation forecast value or dose label, stated before the run it forecasts
+const:docs/plans/63-how-well/mutants/README.md:66.6:858eb5bbbabf4fabf21c2968257ab86eb8a3d767:55  # [prediction] pre-registered secant/linear-extrapolation forecast value or dose label, stated before the run it forecasts
+const:docs/plans/63-how-well/mutants/README.md:2.31:858eb5bbbabf4fabf21c2968257ab86eb8a3d767:73  # [prediction] pre-registered secant/linear-extrapolation forecast value or dose label, stated before the run it forecasts
+const:docs/plans/63-how-well/mutants/README.md:+0.50:858eb5bbbabf4fabf21c2968257ab86eb8a3d767:278  # [prediction] pre-registered secant/linear-extrapolation forecast value or dose label, stated before the run it forecasts
+const:docs/plans/63-how-well/mutants/README.md:0.10207:858eb5bbbabf4fabf21c2968257ab86eb8a3d767:326  # [prediction] pre-registered secant/linear-extrapolation forecast value or dose label, stated before the run it forecasts
+const:docs/plans/63-how-well/mutants/README.md:-0.50:858eb5bbbabf4fabf21c2968257ab86eb8a3d767:838  # [prediction] pre-registered secant/linear-extrapolation forecast value or dose label, stated before the run it forecasts
+const:docs/plans/63-how-well/mutants/README.md:-0.10:858eb5bbbabf4fabf21c2968257ab86eb8a3d767:850  # [prediction] pre-registered secant/linear-extrapolation forecast value or dose label, stated before the run it forecasts
+const:docs/plans/63-how-well/mutants/README.md:-0.50:858eb5bbbabf4fabf21c2968257ab86eb8a3d767:930  # [prediction] pre-registered secant/linear-extrapolation forecast value or dose label, stated before the run it forecasts
+const:docs/plans/63-how-well/mutants/README.md:+0.50:858eb5bbbabf4fabf21c2968257ab86eb8a3d767:942  # [prediction] pre-registered secant/linear-extrapolation forecast value or dose label, stated before the run it forecasts
+const:docs/plans/63-how-well/mutants/README.md:0.10:0f19c0d8e2a752af2cd9fd2da25654bcfc24af7d:13  # [formula] doc-stated ratio-identity operand/result (the adjacent token on the same tag is already ratio()-bound)
+const:docs/plans/63-how-well/mutants/README.md:0.02:0f19c0d8e2a752af2cd9fd2da25654bcfc24af7d:20  # [formula] doc-stated ratio-identity operand/result (the adjacent token on the same tag is already ratio()-bound)
+const:docs/plans/63-how-well/mutants/README.md:5:0f19c0d8e2a752af2cd9fd2da25654bcfc24af7d:27  # [formula] doc-stated ratio-identity operand/result (the adjacent token on the same tag is already ratio()-bound)
+const:docs/plans/63-how-well/mutants/README.md:0.50:a85f2696630b3d0134b8404d83bc776f39e218d4:24  # [formula] doc-stated ratio-identity operand/result (the adjacent token on the same tag is already ratio()-bound)
+const:docs/plans/63-how-well/mutants/README.md:0.02:a85f2696630b3d0134b8404d83bc776f39e218d4:31  # [formula] doc-stated ratio-identity operand/result (the adjacent token on the same tag is already ratio()-bound)
+const:docs/plans/63-how-well/mutants/README.md:25:a85f2696630b3d0134b8404d83bc776f39e218d4:38  # [formula] doc-stated ratio-identity operand/result (the adjacent token on the same tag is already ratio()-bound)
+const:docs/plans/63-how-well/mutants/README.md:1.10:6eb7b249a03d50361d8d1a8f8bf2fb132ed49d31:20  # [formula] kernel-source formula fragment (design constant, not a measurement)
+const:docs/plans/63-how-well/mutants/README.md:0.90:6eb7b249a03d50361d8d1a8f8bf2fb132ed49d31:34  # [formula] kernel-source formula fragment (design constant, not a measurement)
+const:docs/plans/63-how-well/mutants/README.md:11:0245fa172131205d7abbf085cfb25c6bdab121d8:30  # [rule-param] pre-registered sign-test threshold restated
+const:docs/plans/63-how-well/mutants/README.md:12:0245fa172131205d7abbf085cfb25c6bdab121d8:33  # [rule-param] pre-registered sign-test threshold restated
+const:docs/plans/63-how-well/mutants/README.md:5:0e8a50ac2ad1011a1f71f835e934af7fc70a72e7:0  # [xref] cross-reference number (wrapped from a previous line, "Acceptance N")
+const:docs/plans/63-how-well/mutants/README.md:1.0:66a47d13a4301b6780c9ddc37fd8b8a72bc849d7:51  # [formula] kernel-source formula fragment (design constant, not a measurement)
+const:docs/plans/63-how-well/mutants/README.md:0.0:cea85b682c2548d3cc1132bd10547d9915bec8ee:63  # [formula] kernel-source formula fragment (design constant, not a measurement)
+const:docs/plans/63-how-well/mutants/README.md:1.0:06adff9250639d3cbc6c2ee7ae9edc8b8241bdca:56  # [formula] kernel-source formula fragment (design constant, not a measurement)

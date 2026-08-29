@@ -20,7 +20,7 @@ gate. Merge exit code 1 (dose_anomalies non-empty — by design).
 Findings, honestly stated:
 <!-- claims63: default=docs/plans/63-how-well/measurements/dose-ladder/finetune_run_ab_report.json; c1=#/mutant_dose_ladder/doses/0/n_neg; c2=#/mutant_dose_ladder/doses/0/gate_seed_count; c3=numer(2048, #/mutant_dose_ladder/doses/0/p_value); c4=denom(13, #/mutant_dose_ladder/doses/0/p_value); c5=#/mutant_dose_ladder/doses/0/p_value -->
 1. THE DETECTOR WORKS: 11/12 sign-concordance fired at p = 13/2048 = 0.00635 < alpha2
-<!-- claims63: c1=const; c2=ledger; c3=ledger -->
+<!-- claims63: default=docs/plans/63-how-well/measurements/dose-ladder/finetune_run_ab_report.json; c1=const; c2=abs(#/mutant_dose_ladder/doses/1/mean_d); c3=abs(#/mutant_dose_ladder/doses/0/mean_d) -->
    (0.0064) on a real |mean| ~ 0.04-0.07 effect — the instrument detects sign-consistent
    shifts at this magnitude. The demonstration landed in the IMPROVEMENT direction.
 2. THE SECANT PREDICTION IS REFUTED (the two-sided falsification cell working): lr

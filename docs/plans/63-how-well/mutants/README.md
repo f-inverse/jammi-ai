@@ -227,22 +227,34 @@ reported as a prediction to be measured, not assumed.
 ### Step 3 — predicted detection verdict under the >=11/12+mean rule
 
 Committed benchmarks to compare the predicted shift against:
+<!-- claims63: default=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json; c1=#/determinism_floor/cross_seed_spread -->
 - `determinism_floor.cross_seed_spread = 0.08264997071681932` (measured
   cross-seed spread; zero repeat noise — r1/r2 bit-identical, `max_delta =
+<!-- claims63: default=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json; c1=#/determinism_floor/max_delta -->
   0.0`, so this spread is the only noise source relevant to whether a fixed
+<!-- claims63: default=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json; c1=#/decision/threshold; c2=#/decision/gate_seed_count -->
   per-seed shift can flip >=11/12 seeds concordantly).
-- `decision.mean_d = -0.023799017749049446`, `sign_test.n_neg = 8/12` (the
+<!-- claims63: default=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json; c1=#/decision/mean_d; c2=#/sign_test/n_neg; c3=#/sign_test/n -->
+- `decision.mean_d = -0.023799017749049446`, `sign_test.n_neg = 8/11` (the
   campaign's own REAL, measured fused-vs-alloff effect — and it did NOT
+<!-- claims63: default=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json; c1=#/decision/threshold; c2=#/decision/gate_seed_count -->
   reach the 11/12 threshold). This is an empirical calibration point: an
-  effect of this magnitude, on this same 12-seed gate, produced only 8/12
+<!-- claims63: default=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json; c1=#/decision/gate_seed_count; c2=#/sign_test/n_neg; c3=#/sign_test/n -->
+  effect of this magnitude, on this same 12-seed gate, produced only 8/11
   concordance, not RED.
 
-| eps | predicted abs(Δmean) (avg_slope) | vs. cross_seed_spread (0.0826) | vs. already-non-detected effect (0.0238, 8/12) | predicted verdict |
+<!-- claims63: default=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json; c1=#/determinism_floor/cross_seed_spread; c2=abs(#/decision/mean_d); c3=#/sign_test/n_neg; c4=#/sign_test/n -->
+| eps | predicted abs(Δmean) (avg_slope) | vs. cross_seed_spread (0.0826) | vs. already-non-detected effect (0.0238, 8/11) | predicted verdict |
 |---|---|---|---|---|
+<!-- claims63: default=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json; c1=const; c2=const; c3=const; c4=const; c5=#/decision/threshold; c6=#/decision/gate_seed_count -->
 | 0.02 (falsified, not scheduled) | 0.00220 | 2.7% of spread | 9.2% of the effect that already failed to reach 11/12 | **predicted NOT detected** (very high confidence — an order of magnitude below both benchmarks) |
+<!-- claims63: default=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json; c1=const; c2=const; c3=const; c4=const; c5=#/decision/threshold; c6=#/decision/gate_seed_count -->
 | 0.10 (falsified, not scheduled) | 0.01101 | 13.3% of spread | 46.3% of the effect that already failed to reach 11/12 | **predicted NOT detected** (high confidence — still smaller than an effect that already failed) |
+<!-- claims63: default=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json; c1=const; c2=const; c3=const; c4=const; c5=#/decision/threshold; c6=#/decision/gate_seed_count; c7=const; c8=const; c9=#/decision/threshold; c10=#/decision/gate_seed_count; c11=const; c12=const -->
 | +0.50 (scheduled — two-sided falsification cell) | 0.05504 | 66.6% of spread | 2.31x the effect that already failed to reach 11/12 | **predicted NOT reliably detected**, but this is the closest call: the shift exceeds the already-non-detected effect by >2x, yet stays below 1 full cross-seed-spread-unit, so >=11/12 concordance is not confidently predicted either way. Using the strong-end per-seed slope (`0.204131`) instead of the average, eps=+0.50's predicted shift (`-0.10207`) would EXCEED the cross-seed spread — the two available seeds disagree sharply on whether this dose is detectable at all. If a sign test DOES fire here, the predicted DIRECTION is still improvement (RED-for-investigation, not RED-for-degradation) — that is what makes this the falsification cell for the Step-2 direction prediction, not a degradation candidate. |
+<!-- claims63: default=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json; c1=const; c2=const; c3=const; c4=const; c5=#/decision/threshold; c6=#/decision/gate_seed_count; c7=const; c8=#/decision/threshold; c9=#/decision/gate_seed_count -->
 | -0.10 (scheduled — addendum 2026-08-29c) | 0.01101 | 13.3% of spread | 46.3% of the effect that already failed to reach 11/12 | **predicted NOT detected** (same magnitude reasoning as `+0.10`, direction now DEGRADATION — the correct sign for the acceptance-5 claim, but the predicted magnitude is still smaller than an effect that already failed to reach 11/12 on this same gate) |
+<!-- claims63: default=docs/plans/63-how-well/measurements/campaign-v1/finetune_run_ab_report.json; c1=const; c2=const; c3=const; c4=const; c5=#/decision/threshold; c6=#/decision/gate_seed_count; c7=const; c8=const; c9=const; c10=const; c11=const; c12=const -->
 | -0.50 (scheduled — addendum 2026-08-29c) | 0.05504 | 66.6% of spread | 2.31x the effect that already failed to reach 11/12 | **predicted NOT reliably detected, but the best DEGRADATION-direction candidate of the three scheduled doses** — same magnitude/confidence caveats as `+0.50` (strong-end seed slope would push it to `0.10207`, above the cross-seed spread), but now in the direction that could actually discharge acceptance 5's "mutant column proven RED (degradation)" if the true local derivative tracks closer to the strong-end (seed1) slope than the weak-end (seed2) one. **This is the dose most likely, among the three scheduled, to produce the pair straddling detection that amendment 2026-08-29c's "reported sensitivity" clause asks for** — though the adjacent pair straddling detection, if one exists, is expected between `-0.50` and `-0.10` within the negative branch, per the addendum's own framing, not between `-0.50` and `+0.50`. |
 
 **Design-level flag, resolved by addendum 2026-08-29c:** the original
@@ -671,14 +683,14 @@ run; this is the honest complement to `M_signflip` below.
 Committed artifact: `docs/plans/63-how-well/measurements/red-proof/` at
 <!-- claims63: c1=ledger -->
 dc1cfc3b (36 raw legs + the gated merge artifact). `M_nobc`
-<!-- claims63: c1=ledger; c2=ledger -->
+<!-- claims63: c1=zerocount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__fused__r1.json', 'held_out_example_mean'); c2=paircount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__fused__r1.json', 'held_out_example_mean') -->
 IS a genuine perturbation on hardware — 0/12 legs bit-identical to the
 clean fused column (unlike `M_signflip` v1 below, this mutant fires on the
 CUDA arm exactly as designed, since it changes a Rust-side scalar
 (`scale_m`/`scale_v`) fed into `AdamThetaUpdate`, a struct field both
 `cpu_fwd` and `cuda_fwd` read identically — see `M_signflip_v2`'s own
 "dispatch-invariant site" framing below, which this mutant already
-<!-- claims63: c1=ledger; c2=ledger -->
+<!-- claims63: c1=paircount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c2=paircount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean') -->
 satisfied by construction). The RAW 12-pair concordance (all 12 mutant/alloff
 <!-- claims63: c1=poscount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c2=paircount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c3=meand('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean') -->
 pairs, premise violations included) reads `n_pos=5/12`, `mean_d=-0.018` —
@@ -692,13 +704,13 @@ reach the threshold) — never suppressed or silently retried with a larger
 dose, per this file's own "Pass criterion" section above.
 
 **GATED reading (CONTRACT.md amendment 2026-08-29e, D*): INVALID.** Under
-<!-- claims63: c1=ledger; c2=ledger -->
+<!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/finetune_run_ab_report.json; c1=absdiff(paircount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'), #/mutant_dose_ladder/red_proof/0/clean_pair_count); c2=paircount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean') -->
 the D*-decomposed learning-happened premise, 2 of `M_nobc`'s 12 mutant legs
 — seeds 9 and 12 — show ASCENDING probes against `M_nobc`'s own declared
 DESCENT direction (`RED_PROOF_EXPECTED_TRAIN_DIRECTION`'s own `9b3c824d…`
-<!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/finetune_run_ab_report.json; c1=#/mutant_dose_ladder/red_proof/0/clean_pair_count; c2=ledger -->
+<!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/finetune_run_ab_report.json; c1=#/mutant_dose_ladder/red_proof/0/clean_pair_count; c2=paircount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean') -->
 entry), so `clean_pair_count=10 ≠ 12` and the gated column reads INVALID
-<!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/finetune_run_ab_report.json; c1=#/mutant_dose_ladder/red_proof/0/clean_pair_count; c2=ledger -->
+<!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/finetune_run_ab_report.json; c1=#/mutant_dose_ladder/red_proof/0/clean_pair_count; c2=paircount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean') -->
 (10/12 clean pairs, correctness-of-measurement problem, never silently
 rescaled to whatever count ran clean). This is a SEPARATE reading from the
 RAW not-detected number above, at a different layer — both are current
@@ -734,7 +746,7 @@ this pair: if `M_nobc` reads neutral-or-improving (plausible per its own
 uncertain prediction above), `M_signflip` still discharges acceptance 5's
 "mutant column proven RED" on its own.
 
-<!-- claims63: c1=ledger; c2=ledger; c3=ledger -->
+<!-- claims63: c1=paircount('docs/plans/63-how-well/measurements/red-proof/raw/signflip__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__fused__r1.json', 'held_out_example_mean'); c2=zerocount('docs/plans/63-how-well/measurements/red-proof/raw/signflip__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__fused__r1.json', 'held_out_example_mean'); c3=paircount('docs/plans/63-how-well/measurements/red-proof/raw/signflip__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__fused__r1.json', 'held_out_example_mean') -->
 **Measured (12-leg GPU, a100, `redproof-signflip`): INERT — 12/12 legs
 bit-identical to the clean fused column. This patch is retired; see
 `M_signflip_v2` below.** Committed artifact:
@@ -750,7 +762,7 @@ the campaign's fused arm dispatches the CUDA kernel on a100 —
 `AdamThetaUpdate::cuda_fwd` calls `crate::cuda::adamw_step::
 theta_update_cuda_fwd`, which runs its own compiled `cuda/adamw_step.cu`
 PTX, never `cpu_fwd`'s Rust body. The CPU-side demonstration above
-<!-- claims63: c1=ledger; c2=ledger -->
+<!-- claims63: c1=code('M_signflip', 1); c2=code('M_signflip', 5) -->
 (`3.464057e-3`..`1.7320165e-2` L2 divergence) is real and correctly shows
 `cpu_fwd` diverging from the oracle — the demonstration procedure itself
 worked exactly as designed — but it demonstrates a perturbation that never
@@ -869,7 +881,7 @@ step=5 l2_divergence=1.7595848e-2
 ```
 
 Close to (not identical to) `M_signflip` v1's own CPU numbers
-<!-- claims63: c1=ledger; c2=ledger -->
+<!-- claims63: c1=code('M_signflip', 1); c2=code('M_signflip', 5) -->
 (`3.464057e-3`..`1.7320165e-2`) — the small difference is exactly the
 additional weight-decay-sign effect described above (v1 only flipped the
 `adjusted_grad` combine; v2 flips `lr` itself, which ALSO flips
@@ -1000,14 +1012,14 @@ SAME `ab_merge.py finetune-run` invocation the campaign's primary decision
 uses (v1's `redproof-signflip` legs are committed in this same artifact as
 evidence only — see `M_signflip` v1's own "Measured"/"lesson" notes above —
 never scheduled through the merger; its label is retired). `redproof-nobc`'s
-<!-- claims63: c1=ledger; c2=poscount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c3=paircount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c4=meand('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean') -->
+<!-- claims63: c1=paircount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c2=poscount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c3=paircount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c4=meand('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean') -->
 RAW 12-pair concordance reads `n_pos=5/12`, `mean_d=-0.018` (see `M_nobc`'s
 own "Measured" note above) — but the GATED column's own `detected` field
-<!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/finetune_run_ab_report.json; c1=#/mutant_dose_ladder/red_proof/0/clean_pair_count; c2=ledger; c3=#/mutant_dose_ladder/red_proof/0/n_pos; c4=#/mutant_dose_ladder/red_proof/0/n_neg; c5=#/mutant_dose_ladder/red_proof/0/mean_d -->
+<!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/finetune_run_ab_report.json; c1=#/mutant_dose_ladder/red_proof/0/clean_pair_count; c2=paircount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c3=#/mutant_dose_ladder/red_proof/0/n_pos; c4=#/mutant_dose_ladder/red_proof/0/n_neg; c5=#/mutant_dose_ladder/red_proof/0/mean_d -->
 reads `INVALID` (10/12 clean pairs, `n_pos=3`, `n_neg=7`, `mean_d=-0.058`,
-<!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/finetune_run_ab_report.json; c1=#/mutant_dose_ladder/red_proof/0/p_value; c2=ledger -->
+<!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/finetune_run_ab_report.json; c1=#/mutant_dose_ladder/red_proof/0/p_value; c2=absdiff(paircount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'), #/mutant_dose_ladder/red_proof/0/clean_pair_count) -->
 `p=0.34`; 2 legs — seeds 9 and 12 — already failed the (pre-D*)
-<!-- claims63: c1=ledger -->
+<!-- claims63: default=docs/plans/63-how-well/measurements/red-proof/finetune_run_ab_report.json; c1=absdiff(paircount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'), #/mutant_dose_ladder/red_proof/0/clean_pair_count) -->
 learning-happened premise on this committed artifact, the SAME 2 legs D*'s
 own `train_direction` premise names explicitly; see `M_nobc`'s own "GATED
 reading" note above). Neither column discharged acceptance 5 (the committed
@@ -1085,6 +1097,7 @@ dstar/` at 82253c1b).
   outside the lr-scale family); committed unified diff against `e340391c`;
   sha256 `9b3c824dc041899c12c0e2d44d12a3ac8c7b86076ffc778638108925ba51bf4e`;
   patch-file-only; **measured NOT-DETECTED (raw)** on 12-leg GPU
+<!-- claims63: c1=poscount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c2=paircount('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c3=meand('docs/plans/63-how-well/measurements/red-proof/raw/nobc__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean') -->
   (`redproof-nobc`, `n_pos=5/12`, `mean_d=-0.018`; GATED column reads
   INVALID under CONTRACT amendment 2026-08-29e's own D* premise — see
   "RED-proof mutants" above for the full record, and the committed artifact
@@ -1094,6 +1107,7 @@ dstar/` at 82253c1b).
   unified diff against `e340391c`; sha256
   `fb2bd11935e9a08e8a1197aa3a84535660119823aabb421105e389a388f6e5e4`;
   patch-file-only; **RETIRED — measured INERT on 12-leg GPU**
+<!-- claims63: c1=zerocount('docs/plans/63-how-well/measurements/red-proof/raw/signflip__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__fused__r1.json', 'held_out_example_mean'); c2=paircount('docs/plans/63-how-well/measurements/red-proof/raw/signflip__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__fused__r1.json', 'held_out_example_mean') -->
   (`redproof-signflip`, 12/12 legs bit-identical to the clean fused column:
   the campaign's fused arm dispatches CUDA on a100, and this patch only
   edits the CPU-only `cpu_fwd` body — see "RED-proof mutants" above for the
@@ -1107,6 +1121,7 @@ dstar/` at 82253c1b).
   sha256 `c81d0ed59d45761bbd6487dbb23c5aaae22f30739c0e2e613d96c4901ad9b202`;
   patch-file-only; predicted DEGRADATION with certainty on BOTH CPU and
   CUDA arms (see "RED-proof mutants" above) — the guaranteed RED-proof
+<!-- claims63: c1=poscount('docs/plans/63-how-well/measurements/red-proof/raw/signflip_v2__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c2=paircount('docs/plans/63-how-well/measurements/red-proof/raw/signflip_v2__seed*.json', 'docs/plans/63-how-well/measurements/campaign-v2/raw/seed*__alloff__r1.json', 'held_out_example_mean') -->
   member of this pair, **measured RED, 12/12, `red_proof_verdict=PROVEN`
   (D*-gated, `measurements/red-proof/dstar/` at 82253c1b) — discharges
   acceptance 5**.

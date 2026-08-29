@@ -60,7 +60,7 @@ amendment 2026-08-29b for the correction plan and the pre-published predictions.
 ## mutant-m1/ — sensitivity column, measured UNDETECTED
 
 Mutant M1 (adamw bias-correction off-by-one; patch sha `68d2023b…`, base
-<!-- claims63: c1=ledger -->
+<!-- claims63: c1=paircount('docs/plans/63-how-well/measurements/campaign-v1/mutant-m1/mutant-seed*.json', 'docs/plans/63-how-well/measurements/campaign-v1/raw/seed*__fused__r1.json', 'held_out_example_mean') -->
 `fc6bd655`, applied+built RC:0) ran 12 fused-arm legs. Result: mutant-vs-fused
 <!-- claims63: c1=poscount('docs/plans/63-how-well/measurements/campaign-v1/mutant-m1/mutant-seed*.json', 'docs/plans/63-how-well/measurements/campaign-v1/raw/seed*__fused__r1.json', 'held_out_example_mean'); c2=paircount('docs/plans/63-how-well/measurements/campaign-v1/mutant-m1/mutant-seed*.json', 'docs/plans/63-how-well/measurements/campaign-v1/raw/seed*__fused__r1.json', 'held_out_example_mean'); c3=meand('docs/plans/63-how-well/measurements/campaign-v1/mutant-m1/mutant-seed*.json', 'docs/plans/63-how-well/measurements/campaign-v1/raw/seed*__fused__r1.json', 'held_out_example_mean'); c4=negcount('docs/plans/63-how-well/measurements/campaign-v1/mutant-m1/mutant-seed*.json', 'docs/plans/63-how-well/measurements/campaign-v1/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c5=paircount('docs/plans/63-how-well/measurements/campaign-v1/mutant-m1/mutant-seed*.json', 'docs/plans/63-how-well/measurements/campaign-v1/raw/seed*__alloff__r1.json', 'held_out_example_mean'); c6=meand('docs/plans/63-how-well/measurements/campaign-v1/mutant-m1/mutant-seed*.json', 'docs/plans/63-how-well/measurements/campaign-v1/raw/seed*__alloff__r1.json', 'held_out_example_mean') -->
 n_pos=8/12 mean -0.0035; mutant-vs-alloff n_neg=8/12 mean -0.0236 — NOT RED.
@@ -73,7 +73,7 @@ corrected dose-ladder design is in amendment 2026-08-29b.
 
 ## probe/ — H5 step-0 (4 legs, a100)
 
-<!-- claims63: c1=ledger -->
+<!-- claims63: default=docs/plans/63-how-well/measurements/campaign-v1/probe/p1-alloff-mnrl-r1.json; c1=absdiff(#/tiers/finetune_run/held_out_example_mean, docs/plans/63-how-well/measurements/campaign-v1/probe/p2-alloff-mnrl-r2.json#/tiers/finetune_run/held_out_example_mean) -->
 p1/p2: alloff-mnrl same-seed repeat — bit-identical (determinism floor 0).
 <!-- claims63: default=docs/plans/63-how-well/measurements/campaign-v1/probe/p3-fused-mnrl.json; c1=#/tiers/finetune_run/attention_block_flash_fused_dispatches; c2=#/tiers/finetune_run/attention_block_flash_declined_dispatches; c3=#/tiers/finetune_run/adamw_fused_dispatches -->
 p3: fused-mnrl — flash fused 3276 / declined 0 / adamw fused 26208: the measurand

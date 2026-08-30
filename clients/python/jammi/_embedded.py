@@ -490,6 +490,7 @@ class EmbeddedBackend:
         lora_rank: Optional[int] = None,
         matryoshka_dims: Optional[List[int]] = None,
         seed: Optional[int] = None,
+        keep_last_n_checkpoints: Optional[int] = None,
     ):
         """Submit a graph-supervised fine-tune (S11) to the in-process engine.
 
@@ -526,6 +527,7 @@ class EmbeddedBackend:
             lora_rank=lora_rank,
             matryoshka_dims=matryoshka_dims,
             seed=seed,
+            keep_last_n_checkpoints=keep_last_n_checkpoints,
         )
         return self._native._start_training_proto(request.SerializeToString())
 

@@ -1455,6 +1455,7 @@ class RemoteDatabase:
         lora_rank: Optional[int] = None,
         matryoshka_dims: Optional[List[int]] = None,
         seed: Optional[int] = None,
+        keep_last_n_checkpoints: Optional[int] = None,
     ) -> RemoteTrainingJob:
         """Submit a graph-supervised fine-tune (S11) to the remote engine.
 
@@ -1489,6 +1490,7 @@ class RemoteDatabase:
             lora_rank=lora_rank,
             matryoshka_dims=matryoshka_dims,
             seed=seed,
+            keep_last_n_checkpoints=keep_last_n_checkpoints,
         )
         return self._start_training(request)
 

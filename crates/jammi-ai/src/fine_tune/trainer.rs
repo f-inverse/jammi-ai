@@ -3123,26 +3123,41 @@ impl TrainingLoop {
     /// loop epoch index — consistent with resume semantics, where a resumed
     /// attempt continues from `last_completed_epoch + 1`.
     ///
-    /// A `None` store is a no-op, mirroring [`Self::save_resume_checkpoint`].
+    /// DISABLED by default (unit 348 F3): a `None`
+    /// `config.keep_last_n_checkpoints` — absent on the wire, and every
+    /// pre-unit-348 caller's config — is a no-op BEFORE touching the store
+    /// or the artifact directory at all. This is the load-bearing
+    /// no-regression property: a job that never opts in writes exactly the
+    /// bytes and catalog rows it always did, byte-for-byte. `Some(_)` (any
+    /// caller that explicitly sets the field, refused at `0` by
+    /// `FineTuneConfig::validate`) enables the whole mechanism below,
+    /// including a `None` `artifact_store` still being a no-op, mirroring
+    /// [`Self::save_resume_checkpoint`] (a trainer-internal test with no
+    /// store configured).
+    ///
     /// On success, appends `(epoch, artifact_prefix)` to
     /// [`Self::epoch_checkpoints`] and then enforces
     /// `config.keep_last_n_checkpoints`: once the retained count exceeds the
-    /// cap, the OLDEST surviving entries' bytes are best-effort deleted from
-    /// the store right here — safe, because no catalog row exists for them
-    /// yet (the worker's finalize only registers rows for whatever remains
-    /// in [`Self::epoch_checkpoints`] when [`Self::run`] returns) — and
-    /// dropped from the vector, so a pruned epoch never reaches the finalize
-    /// step. The delete is `.ok()`-swallowed, matching every other GC in
-    /// this codebase (`TrainingWorker::publish_and_finalize`'s prefix
-    /// deletes): a transient storage failure pruning an old, already-
-    /// superseded checkpoint must never abort the run — that would fail a
-    /// job over a housekeeping op unrelated to whether training itself
-    /// succeeded. The delete is attempted BEFORE the entry is popped
-    /// (delete-then-remove, not remove-then-delete), so tracking never
-    /// claims an entry is gone ahead of the store actually being asked to
-    /// reclaim it. The caller has already confirmed the lease is held
-    /// (`!cancel`), the same gate [`Self::save_resume_checkpoint`] runs
-    /// under.
+    /// cap, the OLDEST surviving entry's bytes are best-effort deleted from
+    /// the store right here — safe, because no catalog row exists for it yet
+    /// (the worker's finalize registers rows only for the trailing retention
+    /// window, unit 348 F2) — and dropped from the vector ONLY on a
+    /// SUCCESSFUL delete. The delete is `.ok()`-inspected (not `?`),
+    /// matching every other GC in this codebase (`TrainingWorker::
+    /// publish_and_finalize`'s prefix deletes): a transient storage failure
+    /// pruning an old, already-superseded checkpoint must never abort the
+    /// run — that would fail a job over a housekeeping op unrelated to
+    /// whether training itself succeeded. On a FAILED delete the entry is
+    /// deliberately LEFT in the vector (not removed) and the retry loop
+    /// BREAKS rather than hot-looping on the same failing delete: the next
+    /// epoch boundary's call re-enters this same loop and retries the
+    /// identical oldest entry first (FIFO order is unchanged by a failed
+    /// attempt). A `tracing::warn!` fires on every failed prune, naming the
+    /// job/attempt/epoch, so a persistently broken store is never silent —
+    /// and `TrainingWorker::publish_and_finalize`'s winner arm is the
+    /// backstop that reclaims a persistently-failed prune's bytes at
+    /// termination (unit 348 F2) rather than letting it leak forever if this
+    /// attempt's retries never succeed before the run ends.
     ///
     /// Uses [`Self::EPOCH_CHECKPOINT_SCRATCH`], ONE scratch subdirectory
     /// reused across every epoch this attempt saves (the `_resume_scratch`
@@ -3151,7 +3166,12 @@ impl TrainingLoop {
     /// overwrites both files there before the immediate upload reads them
     /// back, so nothing from a prior epoch survives into the next upload,
     /// and the run's scratch disk footprint does not grow with epoch count.
+    /// The caller has already confirmed the lease is held (`!cancel`), the
+    /// same gate [`Self::save_resume_checkpoint`] runs under.
     fn save_epoch_checkpoint(&mut self, checkpoint_dir: &Path, epoch: usize) -> Result<()> {
+        if self.config.keep_last_n_checkpoints.is_none() {
+            return Ok(());
+        }
         let Some(store) = self.artifact_store.clone() else {
             return Ok(());
         };
@@ -3173,17 +3193,28 @@ impl TrainingLoop {
                 // Retention is FIFO over this attempt's own epoch order: the
                 // vector is always epoch-ascending (each save appends), so
                 // index 0 is the oldest surviving entry. Peek it (do not pop
-                // yet) so the delete attempt below still has the epoch index
-                // to hand.
+                // yet) so a failed delete leaves it exactly where a retry
+                // will find it again.
                 let (oldest_epoch, _) = self.epoch_checkpoints[0];
-                tokio::runtime::Handle::current()
+                let deleted = tokio::runtime::Handle::current()
                     .block_on(store.delete_epoch_checkpoint(
                         &self.job_id,
                         &self.worker_id,
                         &self.attempt,
                         oldest_epoch,
                     ))
-                    .ok();
+                    .is_ok();
+                if !deleted {
+                    tracing::warn!(
+                        job_id = %self.job_id,
+                        attempt = %self.attempt,
+                        epoch = oldest_epoch,
+                        "epoch-checkpoint retention prune failed; retrying at the next epoch \
+                         boundary (the finalize-winner's sweep reclaims it if retries never \
+                         succeed before the run ends)"
+                    );
+                    break;
+                }
                 self.epoch_checkpoints.remove(0);
             }
         }
@@ -9169,6 +9200,174 @@ mod resume_invariant {
         let path = dir.path().join(name);
         candle_core::safetensors::save(&map, &path).unwrap();
         (name.to_string(), Bytes::from(std::fs::read(&path).unwrap()))
+    }
+}
+
+/// Unit 348 F2 (round-2 audit): a failed mid-run retention-prune delete must
+/// KEEP its entry in `TrainingLoop::epoch_checkpoints` (never drop it just
+/// because the delete failed) so the next epoch boundary retries the
+/// identical oldest entry, and eventual success (once the failure clears)
+/// catches the vector back up to the configured retention window.
+///
+/// Unix-only, real fault injection via `chmod` — deleting a file requires
+/// write permission on its CONTAINING directory (POSIX), so removing write
+/// permission from `checkpoints/epoch_0/` makes every delete attempt inside
+/// it genuinely fail, the same class of failure a flaky object-store backend
+/// would produce, without needing a pluggable `ArtifactStore` fault-injection
+/// seam (`ArtifactStore` is a concrete struct wrapping the shared
+/// `StorageRegistry`; no such seam is reachable from this crate's tests
+/// today, hence pinning this at the unit level with real `file://` I/O
+/// rather than attempting a live end-to-end worker/finalize harness for the
+/// mid-run retry half specifically — the `Ok(true)` winner-arm reclaim half
+/// is exercised separately by `crates/jammi-ai/tests/it/fine_tune.rs`'s
+/// `finalize_reclaims_a_persistently_failed_prune_and_warns`, which uses the
+/// SAME chmod technique against the real worker/finalize path).
+#[cfg(all(test, unix))]
+mod epoch_checkpoint_retention_failure {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+
+    use candle_core::{DType, Device};
+    use candle_nn::{VarBuilder, VarMap};
+
+    use super::super::lora::build_distribution_head;
+    use super::super::target::TrainingTarget;
+    use super::super::FineTuneConfig;
+    use super::{TrainingLoop, TrainingLoopBuilder};
+    use jammi_db::storage::{StorageRegistry, StorageUrl};
+    use jammi_db::store::ArtifactStore;
+
+    const HIDDEN: usize = 4;
+
+    /// Build the loop synchronously from an already-open `Arc<Catalog>` — the
+    /// catalog open is the only genuinely async step, done by the caller
+    /// BEFORE this runs, so the whole sequence of `save_epoch_checkpoint`
+    /// calls (each internally `Handle::current().block_on(..)`, valid only
+    /// off the async runtime — production always calls them from
+    /// `spawn_blocking`) can run together inside ONE `spawn_blocking`
+    /// closure, matching the real shape rather than fighting Tokio's
+    /// "runtime within a runtime" panic.
+    fn minimal_loop_with_store(
+        device: &Device,
+        keep: u32,
+        artifact_dir: &std::path::Path,
+        store: Arc<ArtifactStore>,
+        catalog: Arc<jammi_db::catalog::Catalog>,
+    ) -> TrainingLoop {
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
+        let config = FineTuneConfig {
+            keep_last_n_checkpoints: Some(keep),
+            ..Default::default()
+        };
+        let head = build_distribution_head(HIDDEN, 2, &config, &varmap, &vb).unwrap();
+        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+            .device(device.clone())
+            .job_id("f2-retry-job".into())
+            .worker_id("f2-retry-worker".into())
+            .attempt("0".into())
+            .catalog(catalog)
+            .artifact_dir(artifact_dir.to_path_buf())
+            .artifact_store(store)
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn failed_prune_stays_tracked_and_catches_up_once_unblocked() {
+        let root_dir = tempfile::tempdir().unwrap().keep();
+        let cache_dir = tempfile::tempdir().unwrap().keep();
+        let root = StorageUrl::parse(root_dir.to_str().unwrap()).unwrap();
+        let store =
+            Arc::new(ArtifactStore::with_root(root, StorageRegistry::new(), cache_dir).unwrap());
+        let artifact_dir = tempfile::tempdir().unwrap().keep();
+        let checkpoint_dir = tempfile::tempdir().unwrap().keep();
+        // The only async step — done here, before the blocking closure.
+        let catalog = Arc::new(
+            jammi_db::catalog::Catalog::open(&artifact_dir)
+                .await
+                .unwrap(),
+        );
+
+        let root_dir_for_blocking = root_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let device = Device::Cpu;
+            let mut loop_ =
+                minimal_loop_with_store(&device, 1, &artifact_dir, Arc::clone(&store), catalog);
+
+            // Epoch 0: writes, no pruning yet (len 1 <= keep 1).
+            loop_.save_epoch_checkpoint(&checkpoint_dir, 0).unwrap();
+            assert_eq!(epoch_indices(&loop_), vec![0]);
+
+            // Block epoch_0's own on-disk directory from further deletions —
+            // removing write permission on the directory blocks removing
+            // files INSIDE it (POSIX), the real failure mode a flaky store
+            // backend would also produce.
+            let epoch0_dir = epoch0_local_dir(&root_dir_for_blocking);
+            assert!(
+                epoch0_dir.join("manifest.json").exists(),
+                "epoch_0 must be on disk"
+            );
+            std::fs::set_permissions(&epoch0_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+            // Epoch 1: writes (len 2 > keep 1), retention tries to prune
+            // epoch_0 — FAILS (chmod'd). The entry must stay tracked, not be
+            // dropped.
+            loop_.save_epoch_checkpoint(&checkpoint_dir, 1).unwrap();
+            assert_eq!(
+                epoch_indices(&loop_),
+                vec![0, 1],
+                "a failed prune must keep its entry in the tracked vector, not drop it"
+            );
+            assert!(
+                epoch0_dir.join("manifest.json").exists(),
+                "epoch_0's bytes must still be on disk — the delete genuinely failed"
+            );
+
+            // Epoch 2: writes (len 3 > keep 1); retention retries epoch_0
+            // first (still chmod'd) — STILL fails, still tracked, still no
+            // progress.
+            loop_.save_epoch_checkpoint(&checkpoint_dir, 2).unwrap();
+            assert_eq!(
+                epoch_indices(&loop_).len(),
+                3,
+                "the persistently-failing oldest entry blocks FIFO progress on the newer ones \
+                 too (retention always retries the oldest first) — a residual this test pins, \
+                 not a bug"
+            );
+
+            // Clear the failure (storage "recovers") and drive one more
+            // epoch boundary's worth of retries — this time every prune the
+            // over-the-cap loop attempts succeeds, catching the vector back
+            // up to the configured window.
+            std::fs::set_permissions(&epoch0_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            loop_.save_epoch_checkpoint(&checkpoint_dir, 3).unwrap();
+            assert_eq!(
+                epoch_indices(&loop_),
+                vec![3],
+                "once the failure clears, retention catches back up to exactly the retained \
+                 window"
+            );
+            assert!(
+                !epoch0_dir.join("manifest.json").exists(),
+                "epoch_0's bytes are gone once its retry finally succeeds"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    fn epoch_indices(loop_: &TrainingLoop) -> Vec<usize> {
+        loop_.epoch_checkpoints.iter().map(|(e, _)| *e).collect()
+    }
+
+    fn epoch0_local_dir(root_dir: &std::path::Path) -> std::path::PathBuf {
+        root_dir
+            .join("f2-retry-job")
+            .join("f2-retry-worker")
+            .join("0")
+            .join("checkpoints")
+            .join("epoch_0")
     }
 }
 

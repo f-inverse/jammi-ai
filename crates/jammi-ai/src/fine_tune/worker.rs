@@ -93,19 +93,30 @@ fn resolve_worker_id() -> String {
     }
 }
 
-/// The epoch bound a spec's trainer will checkpoint against (unit 348, F1/F2):
-/// the SAME `FineTuneConfig.epochs` the trainer itself reads, read here from
-/// the durable spec BEFORE it moves into the run — never a count of epochs
-/// actually completed, which is not observable from outside a run that may
-/// never even reach its first epoch boundary. `ContextPredictor` has no
-/// per-epoch checkpointing at all (v1 out of scope), so it reports `0` — every
-/// derived-sweep call site treats that as an unconditional no-op range.
-fn epoch_checkpoint_bound(spec: &TrainingSpec) -> usize {
+/// Whether epoch checkpointing is enabled for this spec, and if so, its
+/// epoch bound (`FineTuneConfig.epochs`) and retention cap
+/// (`FineTuneConfig.keep_last_n_checkpoints`) — unit 348, F1/F2/F3.
+///
+/// `None` = DISABLED, the default: `keep_last_n_checkpoints` absent. Every
+/// existing (pre-unit-348) caller and every default-configured job carries
+/// no such field, so this is `None` for them — zero epoch-checkpoint bytes
+/// ever written, zero catalog rows ever registered, and every derived-sweep
+/// GC call site below is a bound-`0` no-op that returns immediately without
+/// issuing a single store request (F1: opt-in blast radius, not a tax on
+/// every legacy job). `Some((epochs, keep))` = ENABLED — read here from the
+/// durable spec BEFORE it moves into the run, never a count of epochs
+/// actually completed (not observable from outside a run that may never
+/// reach its first epoch boundary). `ContextPredictor` has no per-epoch
+/// checkpointing at all (v1 out of scope), so it is always disabled.
+fn epoch_checkpointing(spec: &TrainingSpec) -> Option<(usize, u32)> {
     match spec {
         TrainingSpec::FineTune { common, .. } | TrainingSpec::GraphFineTune { common, .. } => {
-            common.config.epochs
+            common
+                .config
+                .keep_last_n_checkpoints
+                .map(|keep| (common.config.epochs, keep))
         }
-        TrainingSpec::ContextPredictor { .. } => 0,
+        TrainingSpec::ContextPredictor { .. } => None,
     }
 }
 
@@ -282,15 +293,18 @@ impl TrainingWorker {
                 return;
             }
         };
-        // The epoch bound THIS run's trainer will checkpoint against — read
-        // from the spec's own `FineTuneConfig.epochs` before `spec` moves
-        // into `run_spec` below, never a count of epochs actually completed
-        // (which the outer scope cannot see and does not need to: sweeping
-        // the full configured range is what makes the GC below correct BY
-        // CONSTRUCTION, independent of how far training got or whether it
-        // ever built a `TrainedArtifact` at all — see
-        // `Self::gc_epoch_checkpoints`'s doc, unit 348 F1/F2).
-        let epoch_checkpoint_bound = epoch_checkpoint_bound(&spec);
+        // Whether epoch checkpointing is enabled for THIS run, and if so its
+        // epoch bound and retention cap — read from the spec's own
+        // `FineTuneConfig` before `spec` moves into `run_spec` below, never
+        // a count of epochs actually completed (which the outer scope
+        // cannot see and does not need to: sweeping the full configured
+        // range is what makes the GC below correct BY CONSTRUCTION,
+        // independent of how far training got or whether it ever built a
+        // `TrainedArtifact` at all — see `Self::gc_epoch_checkpoints`'s doc,
+        // unit 348 F1/F2/F3). `None` (the default — no `keep_last_n_
+        // checkpoints`) makes every GC call below a bound-`0` no-op.
+        let epoch_checkpointing = epoch_checkpointing(&spec);
+        let epoch_checkpoint_bound = epoch_checkpointing.map(|(b, _)| b).unwrap_or(0);
 
         // The heartbeat renews the lease while training runs and sets `cancel`
         // when the lease is lost. The cancel flag threads into both training
@@ -338,7 +352,7 @@ impl TrainingWorker {
                     &catalog,
                     &job_id,
                     attempt,
-                    epoch_checkpoint_bound,
+                    epoch_checkpointing,
                     artifact,
                 )
                 .await;
@@ -414,15 +428,16 @@ impl TrainingWorker {
         catalog: &Arc<Catalog>,
         job_id: &str,
         attempt: u32,
-        epoch_checkpoint_bound: usize,
+        epoch_checkpointing: Option<(usize, u32)>,
         artifact: TrainedArtifact,
     ) {
         let store = session.artifact_store();
+        let epoch_checkpoint_bound = epoch_checkpointing.map(|(b, _)| b).unwrap_or(0);
         let TrainedArtifact {
             dir,
             register,
             metrics,
-            epoch_checkpoints,
+            mut epoch_checkpoints,
         } = artifact;
         let model_id = register.model_id.clone();
 
@@ -471,29 +486,53 @@ impl TrainingWorker {
             return;
         }
 
-        // Distinct-name catalog rows for every retained epoch checkpoint the
-        // trainer already published (unit 348, CONTRACT item 4): never an
-        // additional VERSION of the output model's name. Built here (owned
-        // `String`s outliving the `finalize_training_job` call) so the
-        // `EpochCheckpointRow` borrows are valid for the whole call.
-        let epoch_model_ids: Vec<String> = epoch_checkpoints
+        // Unit 348 F2: TRIM to the trailing retention window before
+        // registering. `epoch_checkpoints` can hold MORE than `keep` entries
+        // when a mid-run prune delete kept failing (`TrainingLoop::
+        // save_epoch_checkpoint`'s retention loop leaves a failed entry in
+        // place rather than dropping track of it) — a persistently-failed
+        // delete must never let more than `keep` rows register just because
+        // its bytes could not be deleted yet. `split_off` leaves the OLDER,
+        // over-the-cap entries (if any) in `epoch_checkpoints` — exactly the
+        // "non-retained" set the winner-arm sweep below reclaims — and
+        // returns the trailing `keep` as `retained`, the set that actually
+        // registers.
+        let retained: Vec<(usize, String)> = match epoch_checkpointing {
+            Some((_, keep)) => {
+                let keep = keep as usize;
+                if epoch_checkpoints.len() > keep {
+                    epoch_checkpoints.split_off(epoch_checkpoints.len() - keep)
+                } else {
+                    std::mem::take(&mut epoch_checkpoints)
+                }
+            }
+            None => Vec::new(),
+        };
+        // From here, `epoch_checkpoints` holds only the STALE entries (if
+        // any) whose mid-run prune kept failing — never the retained set.
+
+        // Distinct-name catalog rows for every RETAINED epoch checkpoint
+        // (unit 348, CONTRACT item 4): never an additional VERSION of the
+        // output model's name. Built here (owned `String`s outliving the
+        // `finalize_training_job` call) so the `EpochCheckpointRow` borrows
+        // are valid for the whole call.
+        let epoch_model_ids: Vec<String> = retained
             .iter()
             .map(|(epoch, _)| format!("{model_id}:epoch_{epoch}"))
             .collect();
-        let epoch_rows: Vec<jammi_db::catalog::training_repo::EpochCheckpointRow<'_>> =
-            epoch_checkpoints
-                .iter()
-                .zip(epoch_model_ids.iter())
-                .map(|((_epoch, path), epoch_model_id)| {
-                    jammi_db::catalog::training_repo::EpochCheckpointRow {
-                        model_id: epoch_model_id,
-                        model_type: register.model_type,
-                        task: register.task,
-                        base_model_id: register.base_model_id.as_deref(),
-                        artifact_path: path,
-                    }
-                })
-                .collect();
+        let epoch_rows: Vec<jammi_db::catalog::training_repo::EpochCheckpointRow<'_>> = retained
+            .iter()
+            .zip(epoch_model_ids.iter())
+            .map(|((_epoch, path), epoch_model_id)| {
+                jammi_db::catalog::training_repo::EpochCheckpointRow {
+                    model_id: epoch_model_id,
+                    model_type: register.model_type,
+                    task: register.task,
+                    base_model_id: register.base_model_id.as_deref(),
+                    artifact_path: path,
+                }
+            })
+            .collect();
 
         match catalog
             .finalize_training_job(
@@ -515,6 +554,25 @@ impl TrainingWorker {
                 // resume prefix is harmless, never on the serving path, but the
                 // winner is the single point that reclaims it).
                 store.delete_resume_checkpoint(job_id).await.ok();
+                // Unit 348 F2: the winner is also the single point that
+                // reclaims any STALE (over-the-cap, failed-to-prune-mid-run)
+                // epoch checkpoints — bytes a repeatedly-failing delete left
+                // durable but excluded from `retained` above. Without this,
+                // a persistently-failed prune would leak forever (never
+                // registered, never swept). Targets exactly the known stale
+                // indices (equivalent to sweeping `[0, bound) \ retained`,
+                // computed directly rather than as a broad range since the
+                // stale list is already in hand).
+                if !epoch_checkpoints.is_empty() {
+                    Self::gc_epoch_checkpoints_by_index(
+                        &store,
+                        job_id,
+                        &self.worker_id,
+                        attempt,
+                        epoch_checkpoints.into_iter().map(|(epoch, _)| epoch),
+                    )
+                    .await;
+                }
             }
             Ok(false) => {
                 // Lost the lease before finalizing: our CAS matched zero rows, so
@@ -554,29 +612,43 @@ impl TrainingWorker {
 
     /// Best-effort GC of THIS attempt's epoch-checkpoint bytes on any
     /// terminating path that is not the finalize-CAS winner (unit 348,
-    /// F1/F2). Derives every candidate prefix directly from the attempt's
+    /// F1/F2/F3). Derives every candidate prefix directly from the attempt's
     /// identity (`job_id`/`worker_id`/`attempt`) and the run's CONFIGURED
     /// epoch bound — by construction, never from the in-memory
     /// `TrainedArtifact::epoch_checkpoints` vec, which simply does not exist
-    /// on most of the paths that call this: a panic, a `spawn_blocking` join
-    /// error, a typed training failure, a lease-lost cancel, a final-artifact
-    /// publish failure, or a `register_model` failure all return (or bail)
-    /// before ever building a `TrainedArtifact`. The one arm that DOES have
-    /// the vec (a completed run whose finalize CAS then loses) still goes
-    /// through this same derived sweep — there is exactly ONE reclaim
-    /// mechanism, called from every terminating arm, not a vec-based
-    /// mechanism for the lucky case and a derived one for the rest.
+    /// on most of the paths that call this: a lease-lost cancel, a typed
+    /// training failure, a final-artifact publish failure, or a
+    /// `register_model` failure all return (or bail) before ever building a
+    /// `TrainedArtifact`. The one arm that DOES have the vec (a completed run
+    /// whose finalize CAS then loses) still goes through this same derived
+    /// sweep — there is exactly ONE reclaim mechanism, called from every
+    /// terminating arm, not a vec-based mechanism for the lucky case and a
+    /// derived one for the rest.
     ///
-    /// [`ArtifactStore::delete_epoch_checkpoint`] is already a no-op for any
-    /// index that was never written (an absent manifest is "nothing durable
-    /// to reclaim", not an error — the same rule
+    /// A panic or `spawn_blocking` join error inside
+    /// [`Self::train_fine_tune`] does NOT call this directly — both of those
+    /// arms return `WorkerJobError::Failed`, which propagates unchanged to
+    /// [`Self::run_claimed_job`]'s exhaustive `Cancelled`/`Failed` match,
+    /// which DOES call this. Sweeping there too would be a harmless-but-
+    /// wasteful DOUBLE sweep of the identical range for the identical
+    /// attempt — one call site per termination, not two.
+    ///
+    /// `epoch_checkpoint_bound` is `0` whenever epoch checkpointing was never
+    /// enabled for this spec (`FineTuneConfig.keep_last_n_checkpoints`
+    /// absent — the default, and every pre-unit-348 caller) — this returns
+    /// immediately, before even the trivial `attempt.to_string()` allocation,
+    /// so a legacy/default job's terminating arm issues ZERO store requests
+    /// (F1: an opt-in blast radius, not a tax on every job). For an ENABLED
+    /// job, [`ArtifactStore::delete_epoch_checkpoint`] is already a no-op for
+    /// any index that was never written (an absent manifest is "nothing
+    /// durable to reclaim", not an error — the same rule
     /// [`ArtifactStore::delete_artifact_prefix`] applies), so sweeping the
     /// full `[0, epochs)` configured range costs at most `epochs` no-op reads
     /// beyond whatever indices actually existed — correct regardless of how
-    /// far training got, or whether it ever ran a single epoch boundary.
-    /// `epoch_checkpoint_bound` is `0` for a kind with no per-epoch
-    /// checkpointing (the context-predictor path; v1 out of scope), making
-    /// the sweep itself a no-op there.
+    /// far training got, or whether it ever ran a single epoch boundary. This
+    /// O(epochs) failure-path reclaim cost is the accepted price of "opt-in,
+    /// bounded, and never silent" — see [`Self::gc_epoch_checkpoints_by_index`]
+    /// for the one-warning-per-sweep diagnostic.
     ///
     /// This is the ONE reclaim path (family E, the term that grows — every
     /// reclaimed/failed attempt's per-epoch storage — must be bounded, not
@@ -593,12 +665,58 @@ impl TrainingWorker {
         attempt: u32,
         epoch_checkpoint_bound: usize,
     ) {
-        let attempt = attempt.to_string();
-        for epoch in 0..epoch_checkpoint_bound {
-            store
-                .delete_epoch_checkpoint(job_id, worker_id, &attempt, epoch)
+        if epoch_checkpoint_bound == 0 {
+            return;
+        }
+        Self::gc_epoch_checkpoints_by_index(
+            store,
+            job_id,
+            worker_id,
+            attempt,
+            0..epoch_checkpoint_bound,
+        )
+        .await;
+    }
+
+    /// The shared epoch-index sweep both [`Self::gc_epoch_checkpoints`] (a
+    /// full `[0, bound)` range) and `publish_and_finalize`'s winner arm (the
+    /// specific stale indices a persistently-failed mid-run prune left
+    /// behind, unit 348 F2) drive. Attempts a best-effort delete of every
+    /// index in `epochs`; if ANY fail, emits exactly ONE `tracing::warn!`
+    /// naming the job/worker/attempt and the failed-vs-attempted count —
+    /// never zero (a silently-swallowed sweep failure) and never one warning
+    /// per failed delete (a warning storm when the whole store is down for
+    /// this attempt).
+    async fn gc_epoch_checkpoints_by_index(
+        store: &ArtifactStore,
+        job_id: &str,
+        worker_id: &str,
+        attempt: u32,
+        epochs: impl Iterator<Item = usize>,
+    ) {
+        let attempt_str = attempt.to_string();
+        let mut attempted = 0usize;
+        let mut failed = 0usize;
+        for epoch in epochs {
+            attempted += 1;
+            if store
+                .delete_epoch_checkpoint(job_id, worker_id, &attempt_str, epoch)
                 .await
-                .ok();
+                .is_err()
+            {
+                failed += 1;
+            }
+        }
+        if failed > 0 {
+            tracing::warn!(
+                job_id = %job_id,
+                worker_id = %worker_id,
+                attempt,
+                failed,
+                attempted,
+                "epoch-checkpoint GC sweep: {failed} of {attempted} delete(s) failed — those \
+                 bytes remain durable but unreachable by this sweep"
+            );
         }
     }
 
@@ -849,11 +967,6 @@ impl TrainingWorker {
             common,
             loader,
         } = run;
-        // Captured BEFORE `common.config` moves into `params` below (unit
-        // 348, F1/F2): the epoch bound the panic/join-error arms need to
-        // derive-and-sweep this attempt's epoch checkpoints, since neither
-        // arm ever builds a `TrainedArtifact` to read a count from.
-        let epoch_checkpoint_bound = common.config.epochs;
         let output_model_id = format!("jammi:fine-tuned:{job_id}");
         let model_source = ModelSource::parse(&common.base_model);
 
@@ -906,19 +1019,12 @@ impl TrainingWorker {
             Ok(Ok(Err(e))) => return Err(classify(&cancel_for_classify, e)),
             Ok(Err(payload)) => {
                 // A panic on the blocking thread — no `TrainedArtifact` was
-                // ever built, but the panic could have happened after
-                // several epoch boundaries each already wrote a durable
-                // checkpoint. Derive-and-sweep every candidate index (unit
-                // 348, F1/F2) rather than leaving them reachable only via a
-                // vec this path never had.
-                Self::gc_epoch_checkpoints(
-                    &session.artifact_store(),
-                    job_id,
-                    &self.worker_id,
-                    attempt,
-                    epoch_checkpoint_bound,
-                )
-                .await;
+                // ever built. This does NOT sweep here (unit 348 F1): it
+                // returns `WorkerJobError::Failed`, which propagates
+                // unchanged to `run_claimed_job`'s exhaustive `Failed` arm,
+                // which sweeps this exact (job_id, worker_id, attempt) range
+                // — sweeping here too would be a wasted double sweep of the
+                // identical range, not a second reclaim mechanism.
                 return Err(WorkerJobError::Failed(format!(
                     "Panic: {}",
                     panic_message(payload.as_ref())
@@ -926,17 +1032,9 @@ impl TrainingWorker {
             }
             Err(join_err) => {
                 // Same reasoning as the panic arm immediately above: the
-                // blocking task never returned at all, so any epoch
-                // checkpoints it wrote before the join failed are reachable
-                // only through the derived sweep.
-                Self::gc_epoch_checkpoints(
-                    &session.artifact_store(),
-                    job_id,
-                    &self.worker_id,
-                    attempt,
-                    epoch_checkpoint_bound,
-                )
-                .await;
+                // blocking task never returned at all, but the resulting
+                // `Failed` still funnels through `run_claimed_job`'s single
+                // sweep — no sweep call belongs here.
                 return Err(WorkerJobError::Failed(format!(
                     "training task join error: {join_err}"
                 )));

@@ -376,22 +376,46 @@ pub struct FineTuneConfig {
     #[serde(default = "default_fine_tune_seed")]
     pub seed: u64,
 
-    /// Cap the number of per-epoch adapter checkpoints the trainer retains
-    /// under its own attempt prefix (unit 348). At each epoch boundary the
-    /// trainer publishes a full loadable adapter for that epoch; when this is
-    /// `Some(n)`, it deletes the bytes of its own attempt's epochs older than
-    /// the last `n` as soon as a newer one lands, and only the retained set
-    /// gains a catalog row at finalize. `None` (default) keeps every epoch's
-    /// checkpoint. `Some(0)` is refused by [`Self::validate`] — an ambiguous
-    /// "keep nothing" the caller almost certainly meant "omit the field"
-    /// instead of, so it is a typed validation error rather than a silent
-    /// zero-retention run. This is a pure deployment/storage knob: it changes
-    /// which checkpoint BYTES persist, never a byte the trained adapter itself
-    /// produces, so it enters no identity/config hash (there is none over
-    /// `FineTuneConfig` in this crate today; the K7 "oversample" precedent
-    /// this mirrors is the same "does not perturb the trained artifact" shape)
-    /// and never affects the final/best artifact, which publishes and is
-    /// retained exactly as before, unconditionally.
+    /// Enable per-epoch adapter checkpointing under the trainer's own attempt
+    /// prefix, and cap how many it retains (unit 348).
+    ///
+    /// **DISABLED by default** (round-2 reshape): `None` — absent on the
+    /// wire, and every config built before this field existed — means the
+    /// mechanism is OFF entirely. Not one epoch-checkpoint byte is written,
+    /// not one catalog row is ever considered, and every terminating-arm GC
+    /// sweep (`TrainingWorker::gc_epoch_checkpoints`) returns immediately
+    /// without issuing a single store request. This is the load-bearing
+    /// no-regression property: every caller that predates this field, and
+    /// every caller that never sets it, gets byte-for-byte the SAME storage
+    /// and catalog behavior as before this feature existed — never a default
+    /// that silently changes what an unrelated caller's job writes.
+    ///
+    /// `Some(n)` with `n >= 1` OPTS IN: at each epoch boundary the trainer
+    /// publishes a full loadable adapter for that epoch, deletes the bytes
+    /// of its own attempt's epochs older than the last `n` as soon as a
+    /// newer one lands, and only the retained set gains a catalog row at
+    /// finalize. `n >= epochs` naturally retains every epoch — there is no
+    /// separate "keep all" sentinel; ask for a cap at least as large as the
+    /// configured epoch count. `Some(0)` is refused by [`Self::validate`] —
+    /// an ambiguous "keep nothing" the caller almost certainly meant "omit
+    /// the field" instead of, so it is a typed validation error rather than
+    /// a silent zero-retention run.
+    ///
+    /// This is a pure deployment/storage knob: it changes which checkpoint
+    /// BYTES persist, never a byte the trained adapter itself produces, so
+    /// it enters no identity/config hash (there is none over `FineTuneConfig`
+    /// in this crate today; the K7 "oversample" precedent this mirrors is
+    /// the same "does not perturb the trained artifact" shape) and never
+    /// affects the final/best artifact, which publishes and is retained
+    /// exactly as before, unconditionally, whether or not this field is set.
+    ///
+    /// **Cost when enabled**: a terminating arm that is not the finalize-CAS
+    /// winner sweeps the FULL configured `[0, epochs)` range to reclaim this
+    /// attempt's epoch-checkpoint bytes (each index a tolerant no-op if it
+    /// was never written) — an O(epochs) request cost on the failure path
+    /// only, paid solely by jobs that opted in. A sweep that hits any delete
+    /// failure emits exactly one `tracing::warn!` naming the job/attempt and
+    /// the failed-vs-attempted count, never silently.
     ///
     /// Two retention semantics worth stating precisely rather than assuming:
     ///
@@ -614,8 +638,9 @@ impl FineTuneConfig {
         // than silently reinterpret it.
         if self.keep_last_n_checkpoints == Some(0) {
             return Err(JammiError::FineTune(
-                "keep_last_n_checkpoints=0 is ambiguous; omit the field to keep every epoch's \
-                 checkpoint, or set it to a value >= 1 to retain a rolling window"
+                "keep_last_n_checkpoints=0 is ambiguous; omit the field to disable per-epoch \
+                 checkpointing entirely (the default), or set it to a value >= 1 to enable it \
+                 and retain a rolling window (>= epochs retains every epoch)"
                     .into(),
             ));
         }
@@ -970,7 +995,7 @@ mod validation_tests {
     fn keep_last_n_checkpoints_nonzero_or_absent_validates() {
         FineTuneConfig::default()
             .validate()
-            .expect("absent keep_last_n_checkpoints (keep every epoch) validates");
+            .expect("absent keep_last_n_checkpoints (checkpointing disabled) validates");
         FineTuneConfig {
             keep_last_n_checkpoints: Some(1),
             ..Default::default()

@@ -480,9 +480,13 @@ def build_fine_tune_config(
     # field unset for the parametric Gaussian objectives.
     if quantile_levels is not None:
         config.quantile_levels.extend(quantile_levels)
-    # Per-epoch checkpoint retention cap (unit 348, field 30). Unset (`None`,
-    # the default) keeps every epoch's checkpoint; the server's typed
-    # `FineTuneConfig::validate` refuses an explicit `0` as ambiguous.
+    # Per-epoch checkpointing enable + retention cap (unit 348, field 30).
+    # Unset (`None`, the default) DISABLES per-epoch checkpointing entirely
+    # — no checkpoint bytes, no catalog rows, byte-for-byte the same
+    # behavior as before this field existed. `n >= 1` enables it and
+    # retains the last `n` (`n >= epochs` retains every epoch). The
+    # server's typed `FineTuneConfig::validate` refuses an explicit `0` as
+    # ambiguous.
     if keep_last_n_checkpoints is not None:
         config.keep_last_n_checkpoints = keep_last_n_checkpoints
     return config
@@ -611,6 +615,7 @@ def build_fine_tune_graph_request(
     lora_rank: Optional[int] = None,
     matryoshka_dims: Optional[List[int]] = None,
     seed: Optional[int] = None,
+    keep_last_n_checkpoints: Optional[int] = None,
 ) -> training_pb2.StartTrainingRequest:
     """Assemble the `StartTrainingRequest` for a graph-supervised fine-tune (S11,
     the `GraphFineTuneSpec` arm) from the embed binding's flat kwargs.
@@ -675,6 +680,11 @@ def build_fine_tune_graph_request(
     # seeds the node2vec walk, the other the adapter init / dropout.
     if seed is not None:
         config.seed = seed
+    # Per-epoch checkpointing enable + retention cap (unit 348, field 30),
+    # cross-surface parity with `build_fine_tune_config`. Unset (`None`, the
+    # default) DISABLES it entirely on this surface too — absent stays off.
+    if keep_last_n_checkpoints is not None:
+        config.keep_last_n_checkpoints = keep_last_n_checkpoints
 
     return training_pb2.StartTrainingRequest(
         graph_fine_tune=training_pb2.GraphFineTuneSpec(

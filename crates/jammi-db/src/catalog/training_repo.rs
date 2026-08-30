@@ -151,18 +151,21 @@ pub struct CreateTrainingJobParams<'a> {
 /// contract. Every retained epoch's bytes are durable on the object store
 /// under its own attempt-unique prefix (K7) regardless of who wins.
 ///
-/// Two distinct "no catalog row" cases, with different GC reach — this is a
-/// residual, not a solved problem, so it is documented precisely rather than
-/// glossed as one case:
-///   - A **live loser**: the worker's PROCESS survives to reach any
-///     terminating arm — `TrainingWorker::run_claimed_job`'s `Cancelled` and
-///     `Failed` arms, `TrainingWorker::train_fine_tune`'s caught-panic and
-///     `spawn_blocking` join-error arms, and
-///     `TrainingWorker::publish_and_finalize`'s publish-failure,
+/// The now-true residual lattice (round-2 audit, F1/F2) — a residual, not a
+/// solved problem, so it is documented precisely rather than glossed as one
+/// case:
+///   - A **live loser**: the worker's PROCESS survives to reach exactly ONE
+///     terminating arm per attempt — `TrainingWorker::run_claimed_job`'s
+///     `Cancelled` and `Failed` arms (which also catch a caught-panic or
+///     `spawn_blocking` join-error from `TrainingWorker::train_fine_tune`;
+///     those do NOT sweep themselves, to avoid a double sweep of the
+///     identical range — see `TrainingWorker::gc_epoch_checkpoints`'s doc),
+///     and `TrainingWorker::publish_and_finalize`'s publish-failure,
 ///     `register_model`-failure, `Ok(false)`, and `Err` arms — EVERY one of
-///     which calls the same `TrainingWorker::gc_epoch_checkpoints` derived
-///     sweep (one reclaim mechanism, not a vec-based one for the lucky arm
-///     and something else for the rest). The sweep DERIVES each candidate
+///     which calls
+///     the same `TrainingWorker::gc_epoch_checkpoints` derived sweep (one
+///     reclaim mechanism, not a vec-based one for the lucky arm and
+///     something else for the rest). The sweep DERIVES each candidate
 ///     prefix from the attempt's identity and the run's configured epoch
 ///     bound rather than reading an in-memory vec — most of these arms never
 ///     built a `TrainedArtifact` at all, so no such vec exists to read (this
@@ -170,15 +173,29 @@ pub struct CreateTrainingJobParams<'a> {
 ///     construction). It runs alongside the top-level artifact prefix's own
 ///     best-effort delete — the nested `checkpoints/epoch_{N}/` prefixes
 ///     carry their OWN separate manifests, so the top-level prefix's delete
-///     alone never reaches them.
+///     alone never reaches them. `keep_last_n_checkpoints` absent (the
+///     default) makes this sweep a bound-`0` no-op for every legacy job —
+///     zero store requests, not merely zero registered rows.
+///   - A **winning attempt with a persistently-failed mid-run prune**: no
+///     longer a leak (round-2 F2's fix). `TrainingLoop::save_epoch_checkpoint`'s
+///     retention loop leaves a checkpoint whose delete failed in its tracked
+///     vector (retrying at each subsequent epoch boundary) rather than
+///     losing track of it; `TrainingWorker::publish_and_finalize`'s `Ok(true)`
+///     (winner) arm trims the FINAL vector to the true trailing retention
+///     window before registering (so a straggler entry never inflates the
+///     registered row count past the configured cap) and then sweeps exactly
+///     those excluded, still-durable stale entries — reclaiming a
+///     persistently-failed prune at termination even if every mid-run retry
+///     failed.
 ///   - A **truly crashed** attempt (the process dies before ever reaching
-///     ANY of the terminating arms above): nothing reclaims either its
-///     top-level artifact prefix OR its epoch-checkpoint prefixes — the
-///     existing top-level GC is exactly as unreachable in this case as the
-///     epoch-checkpoint one, a pre-existing limitation of the "GC on the
-///     losing branch of a LIVE process" design this unit does not change.
-///     These bytes are durable-but-permanently-unregistered, the expected
-///     residual.
+///     ANY of the terminating arms above, including the winner arm): nothing
+///     reclaims either its top-level artifact prefix OR its epoch-checkpoint
+///     prefixes — the existing top-level GC is exactly as unreachable in
+///     this case as the epoch-checkpoint one, a pre-existing limitation of
+///     the "GC on the losing branch of a LIVE process" design this unit does
+///     not change. These bytes are durable-but-permanently-unregistered, the
+///     expected residual — the ONE case genuinely left, now that F2 closed
+///     the winner-path leak.
 #[derive(Debug, Clone)]
 pub struct EpochCheckpointRow<'a> {
     /// Distinct catalog name: `jammi:fine-tuned:{job_id}:epoch_{N}` — never
@@ -450,6 +467,26 @@ impl Catalog {
                             // included) even though its row exists in the
                             // table. Checking by name catches both: the
                             // exact-PK collision AND the version-shadow.
+                            //
+                            // TOCTOU residual: this SELECT and the INSERT
+                            // below are not atomic against a register_model
+                            // call EXTERNAL to this transaction landing in
+                            // between — with two DIFFERENT outcomes worth
+                            // naming rather than assuming away. A race
+                            // landing at the SAME (tenant, name, version=1)
+                            // this checkpoint would occupy is BOUNDED: the
+                            // table's own primary-key uniqueness fails the
+                            // INSERT loudly, failing this finalize
+                            // transaction (a retried finalize, not a silent
+                            // double-write). A race landing at a DIFFERENT
+                            // version of the same NAME is the one case this
+                            // check cannot close: the INSERT has a distinct
+                            // PK, so it succeeds SILENTLY, and the
+                            // version-shadow this whole mechanism exists to
+                            // prevent can reappear for that one narrow
+                            // window — an accepted residual (external
+                            // registration racing a finalize CAS in the
+                            // sub-transaction interval), not a designed arm.
                             let occupied = tx
                                 .query_opt(
                                     "SELECT COUNT(*) AS n FROM models \

@@ -414,6 +414,7 @@ class EmbeddedBackend:
         regression_loss: Optional[str] = None,
         regression_beta: Optional[float] = None,
         quantile_levels: Optional[List[float]] = None,
+        keep_last_n_checkpoints: Optional[int] = None,
     ):
         """Submit a LoRA fine-tuning job to the in-process engine; poll the handle.
 
@@ -458,6 +459,7 @@ class EmbeddedBackend:
             regression_loss=regression_loss,
             regression_beta=regression_beta,
             quantile_levels=quantile_levels,
+            keep_last_n_checkpoints=keep_last_n_checkpoints,
         )
         return self._native._start_training_proto(request.SerializeToString())
 

@@ -72,6 +72,13 @@ pub struct TrainingResult {
     pub total_steps: usize,
     /// The run metrics JSON the worker writes alongside the terminal status.
     pub metrics_json: String,
+    /// The RETAINED per-epoch checkpoints this attempt published (unit 348):
+    /// `(epoch_index, artifact_prefix)` in ascending epoch order — already
+    /// pruned to `config.keep_last_n_checkpoints` (or every epoch, when
+    /// unset) by `TrainingLoop::save_epoch_checkpoint`. Empty when
+    /// checkpointing was disabled (`artifact_store` unset on the builder).
+    /// The worker's finalize CAS registers one catalog row per entry.
+    pub epoch_checkpoints: Vec<(usize, String)>,
 }
 
 /// Compute the learning rate for a given step.
@@ -255,6 +262,15 @@ pub struct TrainingLoop {
     /// whose lease was reclaimed mid-run cannot stamp `running` metrics over a
     /// job the winner already finalized.
     worker_id: String,
+    /// This claim's attempt counter, as a string segment (`record.attempts`
+    /// in the worker) — the third segment of the attempt-unique publish
+    /// prefix per-epoch checkpoints are written under
+    /// (`{job_id}/{worker_id}/{attempt}/checkpoints/epoch_{N}/`, unit 348,
+    /// K7). Defaults to `"0"` when unset ([`TrainingLoopBuilder::new`]) so a
+    /// trainer-internal test that never calls
+    /// [`TrainingLoopBuilder::attempt`] still gets a valid (if not
+    /// production-meaningful) prefix.
+    attempt: String,
     catalog: Arc<Catalog>,
     /// The local directory training scratch (the per-run tempdir holding
     /// checkpoints and the final adapter) is created under. The run owns a
@@ -314,6 +330,15 @@ pub struct TrainingLoop {
     /// `state.last_completed_epoch + 1` with weights, optimizer moments, scaler,
     /// and dropout positions restored.
     resume: Option<RestoredCheckpoint>,
+    /// Retained per-epoch checkpoints this attempt has published so far
+    /// (unit 348): `(epoch_index, artifact_prefix)` in ascending epoch order.
+    /// Appended at every epoch boundary by [`Self::save_epoch_checkpoint`],
+    /// which also enforces `config.keep_last_n_checkpoints` by deleting and
+    /// dropping the oldest entries once the cap is exceeded — so at any point
+    /// this vector holds exactly the RETAINED set, never a stale entry whose
+    /// bytes were already reclaimed. Threaded into [`TrainingResult`] at the
+    /// end of [`Self::run`] for the worker's finalize to register.
+    epoch_checkpoints: Vec<(usize, String)>,
     /// Test seam: runs on the gradients every optimizer step is about to
     /// consume, right after `backward` (and, on the GradCache arm, after the
     /// two-pass `gradcache_backward`), keyed by the 1-based index of that
@@ -340,6 +365,9 @@ pub struct TrainingLoopBuilder {
     config: FineTuneConfig,
     job_id: Option<String>,
     worker_id: Option<String>,
+    /// See [`TrainingLoop::attempt`]. Defaults to `"0"` — set explicitly
+    /// (via [`Self::attempt`]) only by the production worker path.
+    attempt: String,
     catalog: Option<Arc<Catalog>>,
     artifact_dir: Option<PathBuf>,
     device: Device,
@@ -362,6 +390,7 @@ impl TrainingLoopBuilder {
             config,
             job_id: None,
             worker_id: None,
+            attempt: "0".to_string(),
             catalog: None,
             artifact_dir: None,
             device: Device::Cpu,
@@ -422,6 +451,15 @@ impl TrainingLoopBuilder {
         self
     }
 
+    /// Set this claim's attempt counter — the third segment of the
+    /// attempt-unique prefix per-epoch checkpoints publish under (unit 348).
+    /// Omit it only for a trainer-internal test (defaults to `"0"`); the
+    /// production worker path always sets it to `record.attempts`.
+    pub fn attempt(mut self, attempt: String) -> Self {
+        self.attempt = attempt;
+        self
+    }
+
     /// Set the catalog for status persistence.
     pub fn catalog(mut self, catalog: Arc<Catalog>) -> Self {
         self.catalog = Some(catalog);
@@ -462,6 +500,7 @@ impl TrainingLoopBuilder {
             config: self.config,
             job_id,
             worker_id,
+            attempt: self.attempt,
             catalog,
             artifact_dir,
             // Placeholder — `set_training(true)` below overwrites this
@@ -473,6 +512,7 @@ impl TrainingLoopBuilder {
             cancel: self.cancel,
             artifact_store: self.artifact_store,
             resume: self.resume,
+            epoch_checkpoints: Vec::new(),
             #[cfg(test)]
             after_backward: None,
         };
@@ -1048,6 +1088,14 @@ impl TrainingLoop {
                     &optimizer,
                     &optim_param_names,
                 )?;
+
+                // Per-epoch adapter checkpoint (unit 348) — a full loadable
+                // adapter under this attempt's own publish prefix. Same
+                // lease gate as the resume checkpoint immediately above: a
+                // zombie attempt must not keep publishing (or pruning)
+                // checkpoints once its lease is gone, since the worker's
+                // finalize CAS will never see them.
+                self.save_epoch_checkpoint(&checkpoint_dir, epoch)?;
             }
         }
 
@@ -1097,6 +1145,7 @@ impl TrainingLoop {
             final_loss: best_val_loss,
             total_steps: global_step,
             metrics_json,
+            epoch_checkpoints: std::mem::take(&mut self.epoch_checkpoints),
         })
     }
 
@@ -3020,6 +3069,96 @@ impl TrainingLoop {
             self.capture_resume_bundle(&scratch, epoch, global_step, optimizer, optim_param_names)?;
         tokio::runtime::Handle::current()
             .block_on(store.put_resume_checkpoint(&self.job_id, &bundle))?;
+        Ok(())
+    }
+
+    /// Build a FULL LOADABLE adapter's `(name, bytes)` files at the current
+    /// weights — `jammi_lora::save_adapter`'s weights + `SavedAdapter`
+    /// metadata output (never the weights-only `save_checkpoint` format) —
+    /// via a scratch directory, then read the written files back as bytes for
+    /// a `put_artifact` publish. The SAME construction [`Self::run`]'s final
+    /// save uses (`named_trainable_weights` + the scaler-gated
+    /// `regression_form` + `TrainingTarget::saved_adapter`), so an epoch
+    /// checkpoint and the final artifact are loadable through the identical
+    /// path — this is what makes a checkpoint row resolvable by
+    /// `jammi models describe` and loadable for inference (unit 348,
+    /// CONTRACT item 2).
+    fn checkpoint_adapter_files(&self, scratch_dir: &Path) -> Result<Vec<(String, bytes::Bytes)>> {
+        let weights = self.target.named_trainable_weights()?;
+        let regression_form = self.target_scaler.map(|_| self.regression_form());
+        let saved = self
+            .target
+            .saved_adapter(&self.config, self.target_scaler, regression_form);
+        jammi_lora::save_adapter(scratch_dir, &weights, &saved)
+            .map_err(|e| JammiError::FineTune(format!("Save epoch checkpoint adapter: {e}")))?;
+
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(scratch_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let file_bytes = std::fs::read(entry.path())?;
+            files.push((name, bytes::Bytes::from(file_bytes)));
+        }
+        Ok(files)
+    }
+
+    /// Publish a full loadable adapter checkpoint for the just-completed
+    /// `epoch` under the attempt-unique prefix
+    /// `{job_id}/{worker_id}/{attempt}/checkpoints/epoch_{N}/` (unit 348,
+    /// K7) — the same manifest-last `put_artifact` publish protocol the
+    /// worker's own final artifact uses, extended with the `checkpoints/
+    /// epoch_{N}` segment rather than a bare job-keyed prefix, so a resumed
+    /// attempt (which writes its OWN attempt segment) can never collide with
+    /// or overwrite a prior attempt's epoch checkpoints. `N` is the 0-based
+    /// loop epoch index — consistent with resume semantics, where a resumed
+    /// attempt continues from `last_completed_epoch + 1`.
+    ///
+    /// A `None` store is a no-op, mirroring [`Self::save_resume_checkpoint`].
+    /// On success, appends `(epoch, artifact_prefix)` to
+    /// [`Self::epoch_checkpoints`] and then enforces
+    /// `config.keep_last_n_checkpoints`: once the retained count exceeds the
+    /// cap, the OLDEST surviving entries' bytes are deleted from the store
+    /// right here — safe, because no catalog row exists for them yet (the
+    /// worker's finalize only registers rows for whatever remains in
+    /// [`Self::epoch_checkpoints`] when [`Self::run`] returns) — and dropped
+    /// from the vector, so a pruned epoch never reaches the finalize step.
+    /// The caller has already confirmed the lease is held (`!cancel`), the
+    /// same gate [`Self::save_resume_checkpoint`] runs under.
+    fn save_epoch_checkpoint(&mut self, checkpoint_dir: &Path, epoch: usize) -> Result<()> {
+        let Some(store) = self.artifact_store.clone() else {
+            return Ok(());
+        };
+        let scratch = checkpoint_dir.join(format!("_epoch_checkpoint_scratch_{epoch}"));
+        let files = self.checkpoint_adapter_files(&scratch)?;
+        let segment = format!("epoch_{epoch}");
+        let prefix = tokio::runtime::Handle::current().block_on(store.put_artifact(
+            &[
+                self.job_id.as_str(),
+                self.worker_id.as_str(),
+                self.attempt.as_str(),
+                "checkpoints",
+                segment.as_str(),
+            ],
+            &files,
+        ))?;
+        self.epoch_checkpoints
+            .push((epoch, prefix.as_str().to_string()));
+
+        if let Some(keep) = self.config.keep_last_n_checkpoints {
+            let keep = keep as usize;
+            while self.epoch_checkpoints.len() > keep {
+                // Retention is FIFO over this attempt's own epoch order: the
+                // vector is always epoch-ascending (each save appends), so
+                // index 0 is the oldest surviving entry.
+                let (_, oldest_prefix) = self.epoch_checkpoints.remove(0);
+                let oldest_url = jammi_db::storage::StorageUrl::parse(&oldest_prefix)?;
+                tokio::runtime::Handle::current()
+                    .block_on(store.delete_artifact_prefix(&oldest_url))?;
+            }
+        }
         Ok(())
     }
 

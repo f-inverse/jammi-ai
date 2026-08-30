@@ -375,6 +375,25 @@ pub struct FineTuneConfig {
     /// [`DEFAULT_FINE_TUNE_SEED`] is used when a caller does not specify one.
     #[serde(default = "default_fine_tune_seed")]
     pub seed: u64,
+
+    /// Cap the number of per-epoch adapter checkpoints the trainer retains
+    /// under its own attempt prefix (unit 348). At each epoch boundary the
+    /// trainer publishes a full loadable adapter for that epoch; when this is
+    /// `Some(n)`, it deletes the bytes of its own attempt's epochs older than
+    /// the last `n` as soon as a newer one lands, and only the retained set
+    /// gains a catalog row at finalize. `None` (default) keeps every epoch's
+    /// checkpoint. `Some(0)` is refused by [`Self::validate`] — an ambiguous
+    /// "keep nothing" the caller almost certainly meant "omit the field"
+    /// instead of, so it is a typed validation error rather than a silent
+    /// zero-retention run. This is a pure deployment/storage knob: it changes
+    /// which checkpoint BYTES persist, never a byte the trained adapter itself
+    /// produces, so it enters no identity/config hash (there is none over
+    /// `FineTuneConfig` in this crate today; the K7 "oversample" precedent
+    /// this mirrors is the same "does not perturb the trained artifact" shape)
+    /// and never affects the final/best artifact, which publishes and is
+    /// retained exactly as before, unconditionally.
+    #[serde(default)]
+    pub keep_last_n_checkpoints: Option<u32>,
 }
 
 /// The fixed default fine-tune seed. A constant (not entropy) so a job that
@@ -448,6 +467,7 @@ impl Default for FineTuneConfig {
             hard_negatives: HardNegativeConfig::default(),
             matryoshka_dims: Vec::new(),
             seed: DEFAULT_FINE_TUNE_SEED,
+            keep_last_n_checkpoints: None,
         }
     }
 }
@@ -563,6 +583,17 @@ impl FineTuneConfig {
                     "quantile_levels must be strictly ascending".into(),
                 ));
             }
+        }
+        // 0 is ambiguous; omit the field to keep all. A caller that means "no
+        // epoch checkpoints at all" is not what this knob does (the FINAL/BEST
+        // artifact is unconditional and unaffected either way) — refuse rather
+        // than silently reinterpret it.
+        if self.keep_last_n_checkpoints == Some(0) {
+            return Err(JammiError::FineTune(
+                "keep_last_n_checkpoints=0 is ambiguous; omit the field to keep every epoch's \
+                 checkpoint, or set it to a value >= 1 to retain a rolling window"
+                    .into(),
+            ));
         }
         Ok(())
     }
@@ -884,6 +915,50 @@ mod validation_tests {
         FineTuneConfig::default()
             .validate()
             .expect("the shipped default must remain valid");
+    }
+
+    /// Unit 348: `keep_last_n_checkpoints = 0` is ambiguous ("keep nothing"
+    /// vs "the caller meant to omit the field") and is refused, not
+    /// silently coerced to `None`.
+    #[test]
+    fn keep_last_n_checkpoints_zero_is_refused() {
+        let cfg = FineTuneConfig {
+            keep_last_n_checkpoints: Some(0),
+            ..Default::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("keep_last_n_checkpoints=0 must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("keep_last_n_checkpoints"),
+            "the error must name the field: {msg}"
+        );
+        assert!(
+            msg.contains("ambiguous"),
+            "the error must explain the ambiguity: {msg}"
+        );
+    }
+
+    /// Positive control: `None` (the default) and any `Some(n >= 1)` are
+    /// legal — only the literal `0` is refused.
+    #[test]
+    fn keep_last_n_checkpoints_nonzero_or_absent_validates() {
+        FineTuneConfig::default()
+            .validate()
+            .expect("absent keep_last_n_checkpoints (keep every epoch) validates");
+        FineTuneConfig {
+            keep_last_n_checkpoints: Some(1),
+            ..Default::default()
+        }
+        .validate()
+        .expect("keep_last_n_checkpoints=1 validates");
+        FineTuneConfig {
+            keep_last_n_checkpoints: Some(5),
+            ..Default::default()
+        }
+        .validate()
+        .expect("keep_last_n_checkpoints=5 validates");
     }
 
     /// A non-finite `max_grad_norm` is refused at BOTH edges — `validate`

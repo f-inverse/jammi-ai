@@ -22,7 +22,7 @@ use std::time::Duration;
 use jammi_db::catalog::backend::{BackendKind, SqlValue, TxOptions};
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::status::TrainingJobStatus;
-use jammi_db::catalog::training_repo::CreateTrainingJobParams;
+use jammi_db::catalog::training_repo::{CreateTrainingJobParams, FinalizeTrainingJobParams};
 use jammi_db::catalog::Catalog;
 use jammi_db::model_task::ModelTask;
 use jammi_test_utils::make_test_session;
@@ -582,13 +582,15 @@ async fn finalize_is_a_lease_guarded_compare_and_set(backend: BackendKind) {
     // worker-a (the stale owner) tries to finalize: zero rows match, so it does
     // not finalize and the job is untouched.
     let a_finalized = catalog
-        .finalize_training_job(
-            "fz",
-            "worker-a",
-            "jammi:fine-tuned:fz",
-            "file:///artifacts/fz/worker-a/2",
-            Some(r#"{"k":1}"#),
-        )
+        .finalize_training_job(FinalizeTrainingJobParams {
+            job_id: "fz",
+            worker_id: "worker-a",
+            output_model_id: "jammi:fine-tuned:fz",
+            output_model_version: 1,
+            artifact_path: "file:///artifacts/fz/worker-a/2",
+            metrics: Some(r#"{"k":1}"#),
+            epoch_checkpoints: &[],
+        })
         .await
         .unwrap();
     assert!(
@@ -620,13 +622,15 @@ async fn finalize_is_a_lease_guarded_compare_and_set(backend: BackendKind) {
     // worker-b (the live owner) finalizes: one row matches, the job completes
     // with the output model and the metrics recorded.
     let b_finalized = catalog
-        .finalize_training_job(
-            "fz",
-            "worker-b",
-            "jammi:fine-tuned:fz",
-            "file:///artifacts/fz/worker-b/3",
-            Some(r#"{"completed_at":"2026-01-01T00:00:00Z"}"#),
-        )
+        .finalize_training_job(FinalizeTrainingJobParams {
+            job_id: "fz",
+            worker_id: "worker-b",
+            output_model_id: "jammi:fine-tuned:fz",
+            output_model_version: 1,
+            artifact_path: "file:///artifacts/fz/worker-b/3",
+            metrics: Some(r#"{"completed_at":"2026-01-01T00:00:00Z"}"#),
+            epoch_checkpoints: &[],
+        })
         .await
         .unwrap();
     assert!(b_finalized, "the lease owner finalizes the job");
@@ -656,16 +660,163 @@ async fn finalize_is_a_lease_guarded_compare_and_set(backend: BackendKind) {
     // A second finalize by the same owner is now a no-op (status is no longer
     // running), so finalize is not re-runnable once terminal.
     let again = catalog
-        .finalize_training_job(
-            "fz",
-            "worker-b",
-            "jammi:fine-tuned:fz",
-            "file:///artifacts/fz/worker-b/3",
-            None,
-        )
+        .finalize_training_job(FinalizeTrainingJobParams {
+            job_id: "fz",
+            worker_id: "worker-b",
+            output_model_id: "jammi:fine-tuned:fz",
+            output_model_version: 1,
+            artifact_path: "file:///artifacts/fz/worker-b/3",
+            metrics: None,
+            epoch_checkpoints: &[],
+        })
         .await
         .unwrap();
     assert!(!again, "a completed job cannot be finalized again");
+}
+
+/// B5 hardening regression (unit 348): before this contract item, the finalize
+/// CAS's model-row `UPDATE` matched `WHERE name = $output_model_id` alone — no
+/// `version`, no tenant predicate. Two rows sharing that bare NAME (a second
+/// VERSION of the same tenant's model, or a DIFFERENT TENANT's row that happens
+/// to carry the same name) would BOTH have been clobbered by one worker's
+/// `artifact_path`. This pins the fix: three rows share the name "acme/tuned" —
+/// (tenant-a, v1), (tenant-a, v2), (tenant-b, v1) — and a tenant-a finalize
+/// naming version 1 touches EXACTLY that row.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn finalize_model_update_is_scoped_by_version_and_tenant(backend: BackendKind) {
+    use std::str::FromStr;
+
+    use jammi_db::TenantId;
+
+    let dir = tempdir().unwrap();
+    let session = skip_if_no_backend!(backend, dir.path());
+    let base = Arc::clone(session.catalog());
+    reset_queue(&base).await;
+
+    let tenant_a = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a").unwrap();
+    let tenant_b = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9b").unwrap();
+    let cat_a = base.pinned_to_tenant(Some(tenant_a));
+    let cat_b = base.pinned_to_tenant(Some(tenant_b));
+
+    // Three rows sharing the name "acme/tuned": tenant-a v1, tenant-a v2,
+    // tenant-b v1. None carries an artifact_path yet.
+    for version in [1, 2] {
+        cat_a
+            .register_model(RegisterModelParams {
+                model_id: "acme/tuned",
+                version,
+                model_type: "fine-tuned",
+                backend: "candle",
+                task: ModelTask::TextEmbedding,
+                base_model_id: None,
+                artifact_path: None,
+                config_json: None,
+            })
+            .await
+            .unwrap();
+    }
+    cat_b
+        .register_model(RegisterModelParams {
+            model_id: "acme/tuned",
+            version: 1,
+            model_type: "fine-tuned",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: None,
+            artifact_path: None,
+            config_json: None,
+        })
+        .await
+        .unwrap();
+
+    // A base model + a queued job under tenant-a, whose output_model_id names
+    // the shared "acme/tuned" name.
+    cat_a
+        .register_model(RegisterModelParams {
+            model_id: "acme/base",
+            version: 1,
+            model_type: "embedding",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: None,
+            artifact_path: None,
+            config_json: None,
+        })
+        .await
+        .unwrap();
+    let base_pk = cat_a
+        .get_model("acme/base")
+        .await
+        .unwrap()
+        .expect("the base model row exists")
+        .catalog_pk;
+    cat_a
+        .create_training_job(CreateTrainingJobParams {
+            job_id: "vt-1",
+            base_model_id: &base_pk,
+            training_source: "src.csv",
+            loss_type: "contrastive",
+            hyperparams: "{}",
+            kind: "fine_tune",
+            training_spec: "{}",
+        })
+        .await
+        .unwrap();
+    cat_a
+        .claim_next_training_job("worker-a", Duration::from_secs(30))
+        .await
+        .unwrap()
+        .expect("the queued job is claimable");
+
+    let finalized = cat_a
+        .finalize_training_job(FinalizeTrainingJobParams {
+            job_id: "vt-1",
+            worker_id: "worker-a",
+            output_model_id: "acme/tuned",
+            output_model_version: 1,
+            artifact_path: "file:///artifacts/vt-1/worker-a/0",
+            metrics: None,
+            epoch_checkpoints: &[],
+        })
+        .await
+        .unwrap();
+    assert!(finalized, "tenant-a's lease holder finalizes the job");
+
+    let a_v1 = cat_a
+        .get_model_version("acme/tuned", 1)
+        .await
+        .unwrap()
+        .expect("tenant-a v1 exists");
+    assert_eq!(
+        a_v1.artifact_path.as_deref(),
+        Some("file:///artifacts/vt-1/worker-a/0"),
+        "the finalize's OWN (tenant, version) row is the one touched"
+    );
+
+    let a_v2 = cat_a
+        .get_model_version("acme/tuned", 2)
+        .await
+        .unwrap()
+        .expect("tenant-a v2 exists");
+    assert!(
+        a_v2.artifact_path.is_none(),
+        "a DIFFERENT version sharing the same name must not be clobbered"
+    );
+
+    let b_v1 = cat_b
+        .get_model_version("acme/tuned", 1)
+        .await
+        .unwrap()
+        .expect("tenant-b v1 exists");
+    assert!(
+        b_v1.artifact_path.is_none(),
+        "a DIFFERENT tenant's row sharing the same name must not be clobbered"
+    );
 }
 
 /// The terminal failure write is lease-guarded the same way as finalize: only

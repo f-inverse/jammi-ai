@@ -137,6 +137,87 @@ pub struct CreateTrainingJobParams<'a> {
     pub training_spec: &'a str,
 }
 
+/// One retained epoch checkpoint's catalog row, inserted inside the same
+/// lease-guarded finalize transaction that commits the output model's
+/// served path (unit 348, CONTRACT item 3/4).
+///
+/// Lifecycle: a row is inserted **only** when the finalize CAS this call
+/// rides on actually wins — the insert sits inside the same `if job_updated
+/// == 1` guard as the output model's `artifact_path` write. A zombie or
+/// lease-lost worker's `finalize_training_job` therefore matches zero job
+/// rows and never reaches this insert at all, so it can never register an
+/// epoch-checkpoint row for an attempt that lost the race — mirroring the
+/// output model's own "served path is written by exactly one writer"
+/// contract. Every retained epoch's bytes are durable on the object store
+/// under its own attempt-unique prefix (K7) regardless of who wins.
+///
+/// Two distinct "no catalog row" cases, with different GC reach — this is a
+/// residual, not a solved problem, so it is documented precisely rather than
+/// glossed as one case:
+///   - A **live loser**: the worker's process survives to reach
+///     `TrainingWorker::publish_and_finalize`'s `Ok(false)`/`Err` arms, whose
+///     dedicated `gc_orphaned_epoch_checkpoints` sweep deletes every one of
+///     ITS OWN retained epoch-checkpoint prefixes there (alongside that same
+///     arm's existing best-effort delete of the top-level artifact prefix —
+///     the nested `checkpoints/epoch_{N}/` prefixes carry their OWN separate
+///     manifests, so the top-level prefix's delete alone never reaches them).
+///   - A **truly crashed** attempt (the process dies before ever reaching
+///     `publish_and_finalize`): nothing reclaims either its top-level
+///     artifact prefix OR its epoch-checkpoint prefixes — the existing
+///     top-level GC is exactly as unreachable in this case as the new
+///     epoch-checkpoint one, a pre-existing limitation of the "GC on the
+///     losing branch of a live process" design this unit does not change.
+///     These bytes are durable-but-permanently-unregistered, the expected
+///     residual.
+#[derive(Debug, Clone)]
+pub struct EpochCheckpointRow<'a> {
+    /// Distinct catalog name: `jammi:fine-tuned:{job_id}:epoch_{N}` — never
+    /// an additional VERSION of the output model's name (that would let a
+    /// later finalize's version-scoped CAS clobber a different row's path;
+    /// see [`Catalog::finalize_training_job`]'s version predicate).
+    pub model_id: &'a str,
+    /// Catalog `model_type`, mirroring the output model row's convention
+    /// (e.g. `"fine-tuned"`).
+    pub model_type: &'a str,
+    /// Same task the output model row carries.
+    pub task: crate::model_task::ModelTask,
+    /// Same base-model lineage the output model row carries.
+    pub base_model_id: Option<&'a str>,
+    /// The attempt-unique object-store prefix these bytes were published
+    /// under (`{job_id}/{worker_id}/{attempt}/checkpoints/epoch_{N}/`) — the
+    /// bytes are already complete (manifest-last) by the time this row is
+    /// built, unlike the output model row, which registers with no path and
+    /// gains it only from the CAS below.
+    pub artifact_path: &'a str,
+}
+
+/// Input parameters for [`Catalog::finalize_training_job`] — grouped (the
+/// `RegisterModelParams`/`CreateTrainingJobParams` pattern) so the lease-CAS
+/// call site names each field, and so a future addition to the finalize
+/// surface grows this struct rather than clippy's `too_many_arguments` limit.
+pub struct FinalizeTrainingJobParams<'a> {
+    /// The job id to finalize.
+    pub job_id: &'a str,
+    /// The lease holder's id (`claimed_by`) — the CAS matches only while this
+    /// worker still holds the lease.
+    pub worker_id: &'a str,
+    /// The output model's catalog NAME (`training_jobs.output_model_id`).
+    pub output_model_id: &'a str,
+    /// The output model's catalog VERSION — together with `output_model_id`
+    /// and the tenant, the exact row the served-path `UPDATE` must touch and
+    /// no other (B5, unit 348).
+    pub output_model_version: i32,
+    /// The object-store prefix this worker published the output artifact
+    /// under — committed as the model row's `artifact_path`.
+    pub artifact_path: &'a str,
+    /// Run-metrics JSON to record on the job row, or `None`.
+    pub metrics: Option<&'a str>,
+    /// Every RETAINED epoch checkpoint to register alongside the output
+    /// model (unit 348) — empty for a training kind with no per-epoch
+    /// checkpointing.
+    pub epoch_checkpoints: &'a [EpochCheckpointRow<'a>],
+}
+
 impl Catalog {
     /// Create a new training job record with status = 'queued'. Tenant
     /// bound + asserted (SPEC-03 §7).
@@ -214,15 +295,16 @@ impl Catalog {
     }
 
     /// Finalize a training job the caller still owns, as a single lease-guarded
-    /// compare-and-set that also commits the output model's served artifact path.
-    /// In one transaction it flips the job row to `completed`, writes
-    /// `output_model_id`, records the run metrics (when `metrics` is `Some`), and
-    /// — only if that job-row CAS matched — records `artifact_path` on the output
-    /// model's row. The job-row CAS lands **only** while the row is still
-    /// `running` and `claimed_by == worker_id`. Returns `true` when the caller
-    /// held the lease and is the sole finalizer, `false` when it was not (the
-    /// lease was lost — the row is no longer `running`, or another worker
-    /// reclaimed it).
+    /// compare-and-set that also commits the output model's served artifact path
+    /// and registers every surviving epoch-checkpoint row (unit 348). In one
+    /// transaction it flips the job row to `completed`, writes
+    /// `output_model_id`, records the run metrics (when `metrics` is `Some`),
+    /// and — only if that job-row CAS matched — records `artifact_path` on the
+    /// output model's row and inserts one row per `epoch_checkpoints` entry. The
+    /// job-row CAS lands **only** while the row is still `running` and
+    /// `claimed_by == worker_id`. Returns `true` when the caller held the lease
+    /// and is the sole finalizer, `false` when it was not (the lease was lost —
+    /// the row is no longer `running`, or another worker reclaimed it).
     ///
     /// `artifact_path` is the object-store prefix this worker published its
     /// artifact under. The model-row update is gated on the job-row CAS matching
@@ -234,39 +316,69 @@ impl Catalog {
     /// finalizer; the job is left for [`Self::reclaim_expired_training_jobs`] and
     /// the worker that re-claims it.
     ///
-    /// The model row is matched by `name = output_model_id` — the same key a
-    /// reload resolves a fine-tuned/predictor model by (its bare model id, a
-    /// single registered version). Recording the path on the model row (rather
-    /// than only the job row) keeps the reload path reading the served pointer
-    /// straight from `models`, unchanged.
+    /// The model row is matched by `name = output_model_id AND version =
+    /// output_model_version`, tenant-scoped with the same STRICT predicate
+    /// [`Catalog::delete_model`] uses (`tenant_id = $t OR (tenant_id IS NULL AND
+    /// $t IS NULL)`) — never the relaxed `OR tenant_id IS NULL` a *read*
+    /// resolver uses to also see a global row. Before this predicate the update
+    /// matched on `name` alone: any row anywhere sharing that bare name — a
+    /// different VERSION, or a DIFFERENT TENANT's row that happens to carry the
+    /// same name — would also be clobbered by this worker's `artifact_path`.
+    /// Recording the path on the model row (rather than only the job row) keeps
+    /// the reload path reading the served pointer straight from `models`,
+    /// unchanged.
     ///
-    /// Not tenant-scoped, matching [`Self::claim_next_training_job`] and
-    /// [`Self::heartbeat_training_job`]: the lease identity (`claimed_by`) is the
-    /// authority, not the session tenant. The single `UPDATE … WHERE claimed_by
-    /// AND status = 'running'` is the same lease guard the heartbeat uses, so a
-    /// worker whose lease was reclaimed mid-run matches zero rows here and the
-    /// worker that now owns the job is the only one whose CAS succeeds.
+    /// The `training_jobs` CAS itself stays NOT tenant-scoped, matching
+    /// [`Self::claim_next_training_job`] and [`Self::heartbeat_training_job`]:
+    /// the lease identity (`claimed_by`) is the authority there, not the session
+    /// tenant, and `job_id` is a global unique PK so no cross-tenant collision is
+    /// possible on that row. The `models` predicate above is the one that needed
+    /// tenant scoping, because `models.name` is NOT globally unique the way
+    /// `job_id` is.
     pub async fn finalize_training_job(
         &self,
-        job_id: &str,
-        worker_id: &str,
-        output_model_id: &str,
-        artifact_path: &str,
-        metrics: Option<&str>,
+        params: FinalizeTrainingJobParams<'_>,
     ) -> Result<bool> {
+        let FinalizeTrainingJobParams {
+            job_id,
+            worker_id,
+            output_model_id,
+            output_model_version,
+            artifact_path,
+            metrics,
+            epoch_checkpoints,
+        } = params;
         let completed = TrainingJobStatus::Completed.to_string();
         let running = TrainingJobStatus::Running.to_string();
         let job_id = job_id.to_string();
         let worker_id = worker_id.to_string();
         let output_model_id = output_model_id.to_string();
+        let output_model_version = output_model_version as i64;
         let artifact_path = artifact_path.to_string();
         let metrics = metrics.map(str::to_string);
         let now = lease_now();
+        let tenant = self.current_tenant();
+        // Owned, 'static-lifetime copies of the epoch rows so the transaction
+        // closure (which must be `'static` — see `TxOptions`/`transaction`'s
+        // signature) can move them without borrowing `epoch_checkpoints`.
+        let epoch_rows: Vec<(String, String, String, Option<String>, String)> = epoch_checkpoints
+            .iter()
+            .map(|r| {
+                (
+                    r.model_id.to_string(),
+                    r.model_type.to_string(),
+                    r.task.as_db_str().to_string(),
+                    r.base_model_id.map(str::to_string),
+                    r.artifact_path.to_string(),
+                )
+            })
+            .collect();
 
         let updated = self
             .backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
+                    tx.set_tenant(tenant);
                     let job_updated = tx
                         .execute(
                             "UPDATE training_jobs \
@@ -284,23 +396,57 @@ impl Catalog {
                             ],
                         )
                         .await?;
-                    // Commit the served path on the output model's row only when
-                    // this worker won the job-row CAS — in the same transaction,
-                    // so the served pointer is committed atomically with (and
+                    // Commit the served path on the output model's row, and
+                    // register every retained epoch-checkpoint row, only when
+                    // this worker won the job-row CAS — in the same
+                    // transaction, so both are committed atomically with (and
                     // never without) the job's terminal flip. A loser's CAS
-                    // matched zero rows and skips this entirely.
+                    // matched zero rows and skips this entirely, so it can
+                    // neither clobber the served path nor register a row for
+                    // bytes a zombie attempt wrote.
                     if job_updated == 1 {
+                        tx.assert_tenant_matches(tenant, "models")?;
+                        let tenant_val = SqlValue::from(tenant.map(|t| t.to_string()));
                         tx.execute(
                             "UPDATE models SET artifact_path = $1, \
                                  updated_at = $2 \
-                             WHERE name = $3",
+                             WHERE name = $3 AND version = $4 \
+                               AND (tenant_id = $5 OR (tenant_id IS NULL AND $5 IS NULL))",
                             &[
                                 SqlValue::TextOwned(artifact_path),
-                                SqlValue::TextOwned(now),
+                                SqlValue::TextOwned(now.clone()),
                                 SqlValue::TextOwned(output_model_id),
+                                SqlValue::Int(output_model_version),
+                                tenant_val.clone(),
                             ],
                         )
                         .await?;
+
+                        for (model_id, model_type, task_db_str, base_model_id, path) in epoch_rows {
+                            let pk = super::model_repo::model_pk(tenant, &model_id, 1);
+                            let metadata = serde_json::json!({
+                                "base_model_id": base_model_id,
+                                "config_json": serde_json::Value::Null,
+                            })
+                            .to_string();
+                            tx.execute(
+                                "INSERT INTO models \
+                                 (model_id, name, model_type, task, backend, version, \
+                                  status, metadata, artifact_path, tenant_id) \
+                                 VALUES ($1, $2, $3, $4, 'candle', 1, 'checkpoint', $5, $6, $7) \
+                                 ON CONFLICT(model_id) DO NOTHING",
+                                &[
+                                    SqlValue::TextOwned(pk),
+                                    SqlValue::TextOwned(model_id),
+                                    SqlValue::TextOwned(model_type),
+                                    SqlValue::TextOwned(task_db_str),
+                                    SqlValue::TextOwned(metadata),
+                                    SqlValue::TextOwned(path),
+                                    tenant_val.clone(),
+                                ],
+                            )
+                            .await?;
+                        }
                     }
                     Ok(job_updated)
                 })

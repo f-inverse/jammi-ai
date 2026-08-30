@@ -1380,6 +1380,7 @@ class RemoteDatabase:
         regression_loss: Optional[str] = None,
         regression_beta: Optional[float] = None,
         quantile_levels: Optional[List[float]] = None,
+        keep_last_n_checkpoints: Optional[int] = None,
     ) -> RemoteTrainingJob:
         """Submit a LoRA fine-tuning job to the remote engine; poll the handle.
 
@@ -1423,6 +1424,7 @@ class RemoteDatabase:
             regression_loss=regression_loss,
             regression_beta=regression_beta,
             quantile_levels=quantile_levels,
+            keep_last_n_checkpoints=keep_last_n_checkpoints,
         )
         return self._start_training(request)
 

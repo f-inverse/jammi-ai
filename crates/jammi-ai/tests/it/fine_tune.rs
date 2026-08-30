@@ -364,6 +364,233 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
     );
 }
 
+// ─── Per-epoch adapter checkpoints (unit 348) ──────────────────────────────
+//
+// A tiny 3-epoch fine-tune with `keep_last_n_checkpoints` absent must register
+// a catalog row for EVERY epoch (`epoch_0`..`epoch_2`), each a full loadable
+// adapter — the SAME `jammi_lora::save_adapter` bundle shape the served final
+// model uses, not the weights-only resume format. The final/best model's own
+// name is unchanged and still resolves.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn epoch_checkpoints_registered_and_loadable_keep_all() {
+    let (session, _dir) = session_with_training_data().await;
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+    let model = tiny_bert_model();
+
+    let job = session
+        .fine_tune(
+            "training",
+            &model,
+            &[
+                "text_a".to_string(),
+                "text_b".to_string(),
+                "score".to_string(),
+            ],
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(FineTuneConfig {
+                epochs: 3,
+                batch_size: 8,
+                lora_rank: 4,
+                warmup_steps: 0,
+                // absent: keep every epoch's checkpoint.
+                keep_last_n_checkpoints: None,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let output_name = job.model_id().to_string();
+    job.wait().await.unwrap();
+
+    // Every epoch (0, 1, 2) got its own DISTINCT-NAME catalog row, never an
+    // additional VERSION of the output model's name.
+    for epoch in 0..3 {
+        let epoch_name = format!("{output_name}:epoch_{epoch}");
+        let record = session
+            .catalog()
+            .get_model(&epoch_name)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("epoch {epoch} checkpoint row must be registered"));
+        assert_eq!(
+            record.status, "checkpoint",
+            "an epoch checkpoint row's status must distinguish it from a served model row"
+        );
+        assert_ne!(
+            record.status, "registered",
+            "an epoch checkpoint row must not carry the served-model status"
+        );
+        let artifact_prefix = record
+            .artifact_path
+            .as_deref()
+            .unwrap_or_else(|| panic!("epoch {epoch} checkpoint row must carry an artifact_path"));
+
+        // Loadable: the published bundle fetches, verifies, and contains a
+        // full adapter (weights + config), not the resume format's files.
+        let prefix_url = jammi_db::storage::StorageUrl::parse(artifact_prefix).unwrap();
+        let local = session
+            .artifact_store()
+            .fetch_artifact(&prefix_url)
+            .await
+            .unwrap_or_else(|e| panic!("epoch {epoch} checkpoint fetches and verifies: {e}"));
+        assert!(
+            local.dir().join("adapter.safetensors").exists(),
+            "epoch {epoch} checkpoint must be a full loadable adapter (adapter.safetensors)"
+        );
+        assert!(
+            local.dir().join("adapter_config.json").exists(),
+            "epoch {epoch} checkpoint must carry adapter_config.json (SavedAdapter metadata)"
+        );
+
+        // Actually loadable for inference by that id.
+        let embedding = session
+            .encode_text_query(&epoch_name, "quantum computing")
+            .await
+            .unwrap_or_else(|e| panic!("epoch {epoch} checkpoint must load for inference: {e}"));
+        assert_eq!(embedding.len(), 32);
+    }
+
+    // The final/best artifact is unaffected: still registered under its own
+    // (unchanged) name and still describe-resolvable / loadable.
+    let final_record = session
+        .catalog()
+        .get_model(&output_name)
+        .await
+        .unwrap()
+        .expect("the final output model row still exists under its own name");
+    assert_eq!(final_record.status, "registered");
+    assert!(final_record.artifact_path.is_some());
+    let final_embedding = session
+        .encode_text_query(&output_name, "quantum computing")
+        .await
+        .unwrap();
+    assert_eq!(final_embedding.len(), 32);
+}
+
+/// `keep_last_n_checkpoints = 2` over a 3-epoch run retains only the LAST two
+/// epochs: epoch_1 and epoch_2 are registered; epoch_0's bytes are pruned from
+/// the store (never registered — no catalog row exists mid-run to race) and
+/// its checkpoint row never appears.
+#[tokio::test(flavor = "multi_thread")]
+async fn epoch_checkpoints_retention_prunes_oldest() {
+    let (session, _dir) = session_with_training_data().await;
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+    let model = tiny_bert_model();
+
+    let job = session
+        .fine_tune(
+            "training",
+            &model,
+            &[
+                "text_a".to_string(),
+                "text_b".to_string(),
+                "score".to_string(),
+            ],
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(FineTuneConfig {
+                epochs: 3,
+                batch_size: 8,
+                lora_rank: 4,
+                warmup_steps: 0,
+                keep_last_n_checkpoints: Some(2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let output_name = job.model_id().to_string();
+    job.wait().await.unwrap();
+
+    // epoch_1 and epoch_2 are registered and loadable.
+    for epoch in [1, 2] {
+        let epoch_name = format!("{output_name}:epoch_{epoch}");
+        let record = session
+            .catalog()
+            .get_model(&epoch_name)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("retained epoch {epoch} must be registered"));
+        let prefix_url =
+            jammi_db::storage::StorageUrl::parse(record.artifact_path.as_deref().unwrap()).unwrap();
+        session
+            .artifact_store()
+            .fetch_artifact(&prefix_url)
+            .await
+            .unwrap_or_else(|e| panic!("retained epoch {epoch} bytes must fetch: {e}"));
+    }
+
+    // epoch_0 was pruned: no catalog row, and — the load-bearing assertion —
+    // its bytes are gone from the store, not merely unregistered.
+    let epoch_0_name = format!("{output_name}:epoch_0");
+    assert!(
+        session
+            .catalog()
+            .get_model(&epoch_0_name)
+            .await
+            .unwrap()
+            .is_none(),
+        "a pruned epoch must never be registered"
+    );
+    // Discover the retained epoch_1 prefix and derive epoch_0's sibling prefix
+    // from it (`.../checkpoints/epoch_1` -> `.../checkpoints/epoch_0`) rather
+    // than assuming worker-id/attempt values.
+    let epoch_1_record = session
+        .catalog()
+        .get_model(&format!("{output_name}:epoch_1"))
+        .await
+        .unwrap()
+        .expect("epoch_1 is retained");
+    let epoch_1_prefix = epoch_1_record.artifact_path.unwrap();
+    let epoch_0_prefix = epoch_1_prefix.replace("epoch_1", "epoch_0");
+    let epoch_0_url = jammi_db::storage::StorageUrl::parse(&epoch_0_prefix).unwrap();
+    assert!(
+        session
+            .artifact_store()
+            .fetch_artifact(&epoch_0_url)
+            .await
+            .is_err(),
+        "epoch_0's bytes must be absent from the store after pruning, got a successful fetch"
+    );
+}
+
+/// `keep_last_n_checkpoints = 0` is a typed validation refusal at submission —
+/// never a silent zero-retention run.
+#[tokio::test(flavor = "multi_thread")]
+async fn keep_last_n_checkpoints_zero_is_refused() {
+    let (session, _dir) = session_with_training_data().await;
+    let model = tiny_bert_model();
+
+    let err = session
+        .fine_tune(
+            "training",
+            &model,
+            &[
+                "text_a".to_string(),
+                "text_b".to_string(),
+                "score".to_string(),
+            ],
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(FineTuneConfig {
+                epochs: 1,
+                keep_last_n_checkpoints: Some(0),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("keep_last_n_checkpoints=0 must be refused at submission");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("keep_last_n_checkpoints") && msg.contains("ambiguous"),
+        "the typed error must name the field and explain the ambiguity: {msg}"
+    );
+}
+
 // ─── Audio projection-head fine-tune: tuned audio embeddings differ from base ─
 //
 // JA2. The contrastive fine-tune path accepts JA1's audio encoder family via a
@@ -801,11 +1028,15 @@ async fn fine_tune_job_catalog_crud() {
     // model + flips to completed + records the run metrics.
     let finalized = catalog
         .finalize_training_job(
-            "job-1",
-            "worker-x",
-            "jammi:fine-tuned:job-1",
-            "file:///artifacts/job-1/worker-x/1",
-            Some(r#"{"completed_at": "2026-01-01T01:00:00Z"}"#),
+            jammi_db::catalog::training_repo::FinalizeTrainingJobParams {
+                job_id: "job-1",
+                worker_id: "worker-x",
+                output_model_id: "jammi:fine-tuned:job-1",
+                output_model_version: 1,
+                artifact_path: "file:///artifacts/job-1/worker-x/1",
+                metrics: Some(r#"{"completed_at": "2026-01-01T01:00:00Z"}"#),
+                epoch_checkpoints: &[],
+            },
         )
         .await
         .unwrap();
@@ -1974,6 +2205,126 @@ async fn loser_prefix_is_never_the_committed_artifact() {
     assert!(
         !loaded.is_empty(),
         "the committed adapter is a well-formed safetensors tensor map"
+    );
+}
+
+// ─── Loser's epoch-checkpoint bytes are reclaimed too, not just its top-level
+//     artifact prefix (unit 348) ──────────────────────────────────────────────
+//
+// The top-level artifact prefix's `delete_artifact_prefix` reads and deletes
+// only ITS OWN `manifest.json`'s files — it never reaches into the nested
+// `checkpoints/epoch_{N}/` prefixes underneath, each carrying its own separate
+// manifest. Without an explicit GC for those, a losing attempt's epoch
+// checkpoints would be orphaned forever (unbounded storage growth across every
+// reclaimed/failed attempt — family E). This pins that the loser's OWN
+// epoch-checkpoint bytes are gone after its failed finalize, exercising the
+// same race `loser_prefix_is_never_the_committed_artifact` drives.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn loser_epoch_checkpoint_bytes_are_reclaimed_too() {
+    use jammi_ai::fine_tune::worker::TrainingWorker;
+    use std::time::Duration;
+
+    let (session, _dir) = session_with_training_data().await;
+    let model = tiny_bert_model();
+
+    let job = session
+        .fine_tune(
+            "training",
+            &model,
+            &[
+                "text_a".to_string(),
+                "text_b".to_string(),
+                "score".to_string(),
+            ],
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(FineTuneConfig {
+                epochs: 1,
+                batch_size: 8,
+                lora_rank: 4,
+                warmup_steps: 0,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    let worker_a = TrainingWorker::new(&session).expect("default worker intervals are valid");
+    let worker_b = TrainingWorker::new(&session).expect("default worker intervals are valid");
+
+    let stale_claim = session
+        .catalog()
+        .claim_next_training_job(worker_a.worker_id(), Duration::ZERO)
+        .await
+        .unwrap()
+        .expect("worker-a claims the queued job");
+    let attempt = stale_claim.attempts;
+    session
+        .catalog()
+        .reclaim_expired_training_jobs(5)
+        .await
+        .unwrap();
+    let owned = session
+        .catalog()
+        .claim_next_training_job(worker_b.worker_id(), Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("worker-b re-claims the requeued job");
+    let attempt_b = owned.attempts;
+
+    worker_a.run_claimed_job(&session, stale_claim).await;
+    let after_loser = session
+        .catalog()
+        .get_training_job(&job.job_id)
+        .await
+        .unwrap();
+    assert_ne!(
+        after_loser.status, "completed",
+        "the loser's finalize CAS fails"
+    );
+
+    worker_b.run_claimed_job(&session, owned).await;
+    job.wait().await.unwrap();
+
+    // Derive the store root from the WINNER's committed artifact_path (a full
+    // URL of the documented shape `{root}/{job_id}/{worker_id}/{attempt}`) by
+    // stripping its own known job_id/worker_id/attempt suffix — then rebuild
+    // the LOSER's epoch-0 checkpoint prefix
+    // (`{job_id}/{worker_id}/{attempt}/checkpoints/epoch_0`) under that same
+    // root, and confirm those orphaned bytes are gone, not merely
+    // unregistered.
+    let winner = session
+        .catalog()
+        .get_model(&job.model_id)
+        .await
+        .unwrap()
+        .expect("the winner registered the output model");
+    let winner_path = winner
+        .artifact_path
+        .expect("the winner's finalize CAS committed a served path");
+    let winner_suffix = format!(
+        "/{job_id}/{worker_id}/{attempt_b}",
+        job_id = job.job_id,
+        worker_id = worker_b.worker_id(),
+    );
+    let root = winner_path
+        .strip_suffix(&winner_suffix)
+        .expect("the winner's artifact_path carries the documented job/worker/attempt suffix");
+    let epoch0_prefix = format!(
+        "{job_id}/{worker_id}/{attempt}/checkpoints/epoch_0",
+        job_id = job.job_id,
+        worker_id = worker_a.worker_id(),
+    );
+    let epoch0_url =
+        jammi_db::storage::StorageUrl::parse(&format!("{root}/{epoch0_prefix}")).unwrap();
+    assert!(
+        session
+            .artifact_store()
+            .fetch_artifact(&epoch0_url)
+            .await
+            .is_err(),
+        "the loser's epoch-0 checkpoint bytes must be reclaimed, not orphaned forever"
     );
 }
 

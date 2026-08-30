@@ -293,12 +293,12 @@ impl TrainingWorker {
             Some(tenant) => {
                 session
                     .with_tenant_scoped(tenant, |_scope| {
-                        self.run_spec(session, &catalog, &job_id, spec, &cancel)
+                        self.run_spec(session, &catalog, &job_id, spec, &cancel, attempt)
                     })
                     .await
             }
             None => {
-                self.run_spec(session, &catalog, &job_id, spec, &cancel)
+                self.run_spec(session, &catalog, &job_id, spec, &cancel, attempt)
                     .await
             }
         };
@@ -366,6 +366,7 @@ impl TrainingWorker {
             dir,
             register,
             metrics,
+            epoch_checkpoints,
         } = artifact;
         let model_id = register.model_id.clone();
 
@@ -392,13 +393,41 @@ impl TrainingWorker {
             return;
         }
 
+        // Distinct-name catalog rows for every retained epoch checkpoint the
+        // trainer already published (unit 348, CONTRACT item 4): never an
+        // additional VERSION of the output model's name. Built here (owned
+        // `String`s outliving the `finalize_training_job` call) so the
+        // `EpochCheckpointRow` borrows are valid for the whole call.
+        let epoch_model_ids: Vec<String> = epoch_checkpoints
+            .iter()
+            .map(|(epoch, _)| format!("{model_id}:epoch_{epoch}"))
+            .collect();
+        let epoch_rows: Vec<jammi_db::catalog::training_repo::EpochCheckpointRow<'_>> =
+            epoch_checkpoints
+                .iter()
+                .zip(epoch_model_ids.iter())
+                .map(|((_epoch, path), epoch_model_id)| {
+                    jammi_db::catalog::training_repo::EpochCheckpointRow {
+                        model_id: epoch_model_id,
+                        model_type: register.model_type,
+                        task: register.task,
+                        base_model_id: register.base_model_id.as_deref(),
+                        artifact_path: path,
+                    }
+                })
+                .collect();
+
         match catalog
             .finalize_training_job(
-                job_id,
-                &self.worker_id,
-                &model_id,
-                prefix.as_str(),
-                metrics.as_deref(),
+                jammi_db::catalog::training_repo::FinalizeTrainingJobParams {
+                    job_id,
+                    worker_id: &self.worker_id,
+                    output_model_id: &model_id,
+                    output_model_version: register.version,
+                    artifact_path: prefix.as_str(),
+                    metrics: metrics.as_deref(),
+                    epoch_checkpoints: &epoch_rows,
+                },
             )
             .await
         {
@@ -416,6 +445,7 @@ impl TrainingWorker {
                 // leave the job for reclaim (the re-claiming worker writes its own
                 // prefix and its CAS commits it).
                 store.delete_artifact_prefix(&prefix).await.ok();
+                Self::gc_orphaned_epoch_checkpoints(&store, &epoch_checkpoints).await;
                 tracing::debug!(
                     job_id = %job_id,
                     worker = %self.worker_id,
@@ -424,7 +454,36 @@ impl TrainingWorker {
             }
             Err(e) => {
                 store.delete_artifact_prefix(&prefix).await.ok();
+                Self::gc_orphaned_epoch_checkpoints(&store, &epoch_checkpoints).await;
                 tracing::error!(job_id = %job_id, error = %e, "finalize_training_job failed");
+            }
+        }
+    }
+
+    /// Best-effort GC of THIS attempt's epoch-checkpoint bytes on a finalize
+    /// that did NOT win (lease lost, or a hard error): the top-level artifact
+    /// prefix's own [`ArtifactStore::delete_artifact_prefix`] call reads and
+    /// deletes only ITS OWN `manifest.json`'s files — it does not reach into
+    /// the nested `checkpoints/epoch_{N}/` prefixes, each of which carries its
+    /// own separate manifest (unit 348). Without this, a losing/crashed
+    /// attempt's epoch-checkpoint bytes would be orphaned forever, unreachable
+    /// by ANY existing GC path (family E: the term that grows — per-attempt
+    /// storage across every reclaimed/failed attempt — must be bounded, not
+    /// left to accumulate). No catalog row exists for these bytes at this
+    /// point (finalize did not win, so [`Catalog::finalize_training_job`]
+    /// never reached its epoch-row inserts), so deleting them here is safe by
+    /// the same reasoning [`TrainingLoop::save_epoch_checkpoint`]'s own
+    /// mid-run retention prune uses.
+    ///
+    /// [`Catalog::finalize_training_job`]: jammi_db::catalog::Catalog::finalize_training_job
+    /// [`TrainingLoop::save_epoch_checkpoint`]: crate::fine_tune::trainer::TrainingLoop
+    async fn gc_orphaned_epoch_checkpoints(
+        store: &ArtifactStore,
+        epoch_checkpoints: &[(usize, String)],
+    ) {
+        for (_, path) in epoch_checkpoints {
+            if let Ok(url) = jammi_db::storage::StorageUrl::parse(path) {
+                store.delete_artifact_prefix(&url).await.ok();
             }
         }
     }
@@ -477,6 +536,7 @@ impl TrainingWorker {
         job_id: &str,
         spec: TrainingSpec,
         cancel: &Arc<AtomicBool>,
+        attempt: u32,
     ) -> std::result::Result<TrainedArtifact, WorkerJobError> {
         match spec {
             TrainingSpec::FineTune {
@@ -500,7 +560,7 @@ impl TrainingWorker {
                     common,
                     loader,
                 };
-                self.train_fine_tune(session, catalog, job_id, run, cancel)
+                self.train_fine_tune(session, catalog, job_id, run, cancel, attempt)
                     .await
             }
             TrainingSpec::GraphFineTune {
@@ -519,7 +579,7 @@ impl TrainingWorker {
                     common,
                     loader,
                 };
-                self.train_fine_tune(session, catalog, job_id, run, cancel)
+                self.train_fine_tune(session, catalog, job_id, run, cancel, attempt)
                     .await
             }
             TrainingSpec::ContextPredictor {
@@ -668,6 +728,7 @@ impl TrainingWorker {
         job_id: &str,
         run: FineTuneRun,
         cancel: &Arc<AtomicBool>,
+        attempt: u32,
     ) -> std::result::Result<TrainedArtifact, WorkerJobError> {
         let FineTuneRun {
             task,
@@ -699,6 +760,7 @@ impl TrainingWorker {
             artifact_dir: session.inner_config().artifact_dir.clone(),
             job_id: job_id.to_string(),
             worker_id: self.worker_id.clone(),
+            attempt,
             base_model: base_model.clone(),
             task,
             config: common.config,
@@ -748,12 +810,14 @@ impl TrainingWorker {
             dir: training.artifact_dir,
             register: ModelRegistration {
                 model_id: output_model_id,
+                version: 1,
                 model_type: "fine-tuned",
                 task,
                 base_model_id: Some(base_model),
                 config_json: None,
             },
             metrics: Some(training.metrics_json),
+            epoch_checkpoints: training.epoch_checkpoints,
         })
     }
 }
@@ -834,6 +898,16 @@ pub struct TrainedArtifact {
     pub register: ModelRegistration,
     /// Run-metrics JSON recorded in the finalize CAS, or `None`.
     pub metrics: Option<String>,
+    /// The training loop's retained per-epoch checkpoints (unit 348): each
+    /// entry is `(epoch_index, artifact_path)`, where `artifact_path` is the
+    /// attempt-unique publish prefix the TRAINER already uploaded that
+    /// epoch's full loadable adapter to
+    /// (`{job_id}/{worker_id}/{attempt}/checkpoints/epoch_{N}/`). Empty for a
+    /// kind that does not checkpoint per epoch (the context-predictor path;
+    /// v1 out of scope there). The worker's finalize CAS registers a catalog
+    /// row for each entry — never a separate publish step, since the bytes
+    /// are already complete by the time this reaches `publish_and_finalize`.
+    pub epoch_checkpoints: Vec<(usize, String)>,
 }
 
 /// The catalog model-row descriptor a training kind hands the worker's finalize.
@@ -849,6 +923,13 @@ pub struct ModelRegistration {
     /// configured id) — the catalog upserts on it, so re-registration is
     /// idempotent.
     pub model_id: String,
+    /// Catalog version this row registers under. Every training kind
+    /// registers its output at `1` today — carried as a field (rather than
+    /// hardcoded in [`Self::as_params`]) so `TrainingWorker::publish_and_finalize`
+    /// can pass the SAME version into `finalize_training_job`'s version
+    /// predicate that `register_model` used to create the row, closing the
+    /// bare-`name` CAS-clobber gap (B5, unit 348).
+    pub version: i32,
     /// `"fine-tuned"` or `"context-predictor"`.
     pub model_type: &'static str,
     /// The model's task.
@@ -866,7 +947,7 @@ impl ModelRegistration {
     pub fn as_params(&self) -> jammi_db::catalog::model_repo::RegisterModelParams<'_> {
         jammi_db::catalog::model_repo::RegisterModelParams {
             model_id: &self.model_id,
-            version: 1,
+            version: self.version,
             model_type: self.model_type,
             backend: "candle",
             task: self.task,
@@ -1426,6 +1507,11 @@ struct RunFineTuneParams {
     artifact_dir: std::path::PathBuf,
     job_id: String,
     worker_id: String,
+    /// This claim's attempt counter (`record.attempts`) — the third segment of
+    /// the attempt-unique publish prefix the trainer writes per-epoch
+    /// checkpoints under (`{job_id}/{worker_id}/{attempt}/checkpoints/…`,
+    /// unit 348).
+    attempt: u32,
     base_model: String,
     task: ModelTask,
     config: FineTuneConfig,
@@ -1455,6 +1541,7 @@ fn run_fine_tune_blocking(
         artifact_dir,
         job_id,
         worker_id,
+        attempt,
         base_model,
         task,
         config,
@@ -1533,6 +1620,7 @@ fn run_fine_tune_blocking(
         .base_model(base_model_arc)
         .job_id(job_id)
         .worker_id(worker_id)
+        .attempt(attempt.to_string())
         .catalog(Arc::clone(&catalog))
         .artifact_dir(artifact_dir)
         .device(device.clone())

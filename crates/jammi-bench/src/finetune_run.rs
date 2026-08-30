@@ -2237,14 +2237,23 @@ mod tests {
     /// reaching its own assertion, inside `run_impl`'s own
     /// `assert_identity_fields_present` self-check (`IDENTITY_FIELDS names
     /// "layers_to_transform", absent on this report`) — so a second,
-    /// independent mechanism already guards it. (2) `train_run_wall_s`'s
-    /// `> 0.0` assertion below is that field's ONLY coverage: temporarily
-    /// hardcoding `train_run_wall_s: 0.0` at [`run_impl`]'s tier
-    /// construction site made ONLY this test's own `wall_s > 0.0` assertion
-    /// fail (`tiers.finetune_run.train_run_wall_s must carry a real,
-    /// measured, nonzero value in the emitted JSON, got 0`) — no other
-    /// test and no producer-side self-check caught it, confirming this is
-    /// the field's sole RED-provable guard.
+    /// independent mechanism already guards it. (2) Temporarily hardcoding
+    /// `train_run_wall_s: 0.0` at [`run_impl`]'s tier construction site made
+    /// this test's own `wall_s > 0.0` assertion fail
+    /// (`tiers.finetune_run.train_run_wall_s must carry a real, measured,
+    /// nonzero value in the emitted JSON, got 0`) — round-3 audit
+    /// correction: the SAME mutation ALSO fails
+    /// [`train_run_wall_s_is_measured_and_strictly_less_than_the_outer_wall_clock`]
+    /// above (its `tier.train_run_wall_s > 0.0` assertion), so this test is
+    /// NOT that field's sole guard. The two tests cover DIFFERENT things:
+    /// that one guards the plain in-struct Rust value
+    /// (`tier.train_run_wall_s`, never serialized); this one's unique
+    /// contribution is proving the value actually survives
+    /// `serde_json::to_value` NESTED under the real `tiers.finetune_run`
+    /// JSON path (the "unproven-as-emitted" gap this test exists to close)
+    /// — a producer that computed the field correctly but wired it to the
+    /// wrong JSON key, or dropped it via a stray `skip_serializing_if`,
+    /// would still pass the other test while failing this one.
     #[tokio::test]
     async fn finetune_run_tier_json_actually_emits_layers_to_transform_and_train_run_wall_s() {
         let work_dir = tempfile::tempdir().expect("tempdir");

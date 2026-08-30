@@ -26,9 +26,28 @@
 # (`--filter=blob:none` — the SAME pod-clone idiom runpod_lib.sh:1505
 # already uses: this workload only ever needs ONE checked-out tree's file
 # contents plus the full commit graph for `git merge-base`, never every
-# historical blob), checks out <git_ref>, and leaves the caller's shell
-# `cd`'d into <dest> on success (matching the caller's own prior inline
-# `cd jammi-ai` step, so no caller-side `cd` is needed after calling this).
+# historical blob), then sets `uploadpack.allowFilter=true` ON THAT CLONE
+# (round-3 adversarial audit B1, the auditor's own reproduction of a fatal
+# clone-composition bug): `gpu_inference_ab.sh`'s own inner clones
+# (`clone_and_checkout`) clone AGAIN, also `--filter=blob:none`, FROM
+# <dest> once this driver hands off to it. A git repo's DEFAULT
+# `uploadpack.allowFilter=false` means <dest>, acting as that inner
+# clone's SOURCE, cannot honor a partial-clone request -- and, being
+# partial itself, cannot silently degrade to serving a FULL one either (it
+# does not have every blob to serve): the inner clone would FAIL HARD
+# (fatal, exit 128), not gracefully fall back. This one `git config` call,
+# made ONCE here, is what makes every later inner clone against <dest>
+# sound; the inner clone call sites do not re-set it themselves.
+# `test_gpu_inference_ab_git_shape.py`'s own
+# `ClonePartialCompositionTests` drives the REAL two-stage composition
+# (this function's outer clone, then `gpu_inference_ab.sh`'s own inner
+# clone command verbatim) against a scratch repo, including the RED
+# control (allowFilter left unset → the inner clone fails, empirically
+# rc=128).
+#
+# Checks out <git_ref>, and leaves the caller's shell `cd`'d into <dest> on
+# success (matching the caller's own prior inline `cd jammi-ai` step, so no
+# caller-side `cd` is needed after calling this).
 #
 # WRONG-TREE refusal (round-2 adversarial audit F1): when <git_ref> is NOT
 # literally <default_branch>, this REFUSES (return 2) if the checked-out
@@ -48,6 +67,21 @@ runpod_perf_ab_clone_and_checkout() {
 
   git clone --quiet --filter=blob:none "$repo_url" "$dest" \
     || { echo "::error::cloning $repo_url -> $dest failed"; return 2; }
+
+  # round-3 adversarial audit B1 (fatal clone composition, the auditor's own
+  # reproduction): this clone is now ITSELF a partial (blobless) clone --
+  # `gpu_inference_ab.sh`'s own inner clones (`clone_and_checkout`) clone
+  # AGAIN, `--filter=blob:none`, FROM this dir (`file://$REPO_ROOT`) once
+  # this driver hands off to it. A git repo's default
+  # `uploadpack.allowFilter=false` means IT, acting as the source for that
+  # inner clone, cannot honor a partial-clone request -- and, being partial
+  # itself, cannot silently degrade to serving a FULL one either (it does
+  # not have every blob to serve): the inner clone FAILS HARD (fatal, exit
+  # 128), not a graceful no-op fallback. Setting this here, once, on the
+  # outer clone, is what makes every later inner clone against it sound --
+  # the inner clone sites themselves do not re-set it.
+  git -C "$dest" config uploadpack.allowFilter true \
+    || { echo "::error::setting uploadpack.allowFilter on $dest failed -- inner clones against this dir would fail hard"; return 2; }
 
   cd "$dest" || { echo "::error::cd $dest failed"; return 2; }
 

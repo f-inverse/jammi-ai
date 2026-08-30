@@ -68,6 +68,17 @@ def gpu_inference_tier(embed_p50_ms=8.0, infer_p50_ms=6.0, **identity_overrides)
     return tier
 
 
+def write_mode(raw_dir, mode):
+    """Writes the `mode` marker (round-3 adversarial audit B2) the REAL
+    producer writes into `raw_dir` before any leg runs. A test that wants
+    `--aa-null` (or an unconfirmed/absent-mode) routing behavior calls this
+    EXPLICITLY, BEFORE its own `write_leg` calls (see that function's own
+    default-mode note).
+    """
+    with open(os.path.join(raw_dir, "mode"), "w", encoding="utf-8") as fh:
+        fh.write(mode)
+
+
 def write_leg(raw_dir, name, tier=None, exit_code="0", build_sha=None, started_at=None):
     """Writes the SAME `.exit`/`.json`/`.started_at` file triple
     `gpu_inference_ab.sh`'s own `run_leg` writes (round-2 adversarial audit
@@ -76,7 +87,17 @@ def write_leg(raw_dir, name, tier=None, exit_code="0", build_sha=None, started_a
     call site (which never mentions `started_at`) keeps producing a
     verifiably-ordered fixture without being rewritten; a test that wants
     to construct an out-of-order fixture passes an explicit override.
+
+    Also writes the `mode` marker (round-3 adversarial audit B2), defaulted
+    to `"ab"`, the ONE time no `mode` file exists yet in `raw_dir` — every
+    EXISTING call site (which never mentions mode) keeps implicitly
+    exercising the normal `ab`-mode routing without being rewritten; a test
+    that wants a DIFFERENT mode calls [`write_mode`] explicitly first (this
+    function then leaves that pre-written file alone).
     """
+    if not os.path.isfile(os.path.join(raw_dir, "mode")):
+        write_mode(raw_dir, "ab")
+
     if started_at is None:
         started_at = 1000 + gpu_inference_ab.LEG_ORDER.index(name)
     with open(os.path.join(raw_dir, f"{name}.started_at"), "w", encoding="utf-8") as fh:
@@ -335,22 +356,66 @@ class MissingLegTests(unittest.TestCase):
         self.assertEqual(merged["missing_legs"], ["b1"])
         self.assertIn("b1", merged["invalid_reason"])
 
-    def test_empty_raw_dir_is_invalid_exit_1_because_b_role_legs_are_among_the_missing(self):
-        """round-2 adversarial audit F5: `missing_legs`' own ROLE decides
-        the outcome, even for the degenerate "nothing ran at all" case —
-        `b1`/`b2` are among the four missing legs here, so this routes to
-        INVALID/1 exactly like any other b-role absence, never a special-
-        cased "everything is neutral because everything is missing"
-        exception this instruction does not carve out.
+    def test_empty_raw_dir_is_incomplete_exit_75_nothing_ran_at_all(self):
+        """round-3 adversarial audit B2 correction (the auditor's own
+        reproduction): round-2's own fix collapsed EVERY b-role ABSENCE --
+        including a leg that never even ran at all (`MISSING`, no `.exit`
+        file whatsoever) -- into the SAME "PR's own problem" bucket a
+        genuine RUNTIME failure earns. "Nothing ran" carries NO runtime
+        signal about a PR binary at all: `b1`/`b2` being among the four
+        MISSING legs here (nothing wrote ANY file, no `mode` marker either)
+        must be the neutral INCOMPLETE/75 "nothing to compare" case, never
+        INVALID/1.
         """
         with tempfile.TemporaryDirectory() as raw_dir:
             merged, exit_code = gpu_inference_ab.build_report(raw_dir)
 
-        self.assertEqual(exit_code, 1)
-        self.assertEqual(merged["status"], "INVALID")
+        self.assertEqual(exit_code, 75, f"merged={merged}")
+        self.assertEqual(merged["status"], "INCOMPLETE")
         self.assertEqual(set(merged["missing_legs"]), set(gpu_inference_ab.LEG_ORDER))
-        self.assertIn("b1", merged["invalid_reason"])
-        self.assertIn("b2", merged["invalid_reason"])
+        self.assertIsNone(merged["mode"])
+        self.assertIn("nothing ran", merged["incomplete_reason"])
+
+    def test_a_b_role_fail_under_aa_null_mode_is_incomplete_exit_75_no_pr_to_blame(self):
+        """round-3 adversarial audit B2: under `--aa-null`, `b`-role legs
+        are ALSO parent-sha clones -- a `b`-role RUNTIME failure there
+        carries no "the PR's own problem" signal at all (there is no PR
+        leg in play), matching the SAME routing the shell producer's own
+        `--aa-null` BUILD-failure classification already gives (neutral,
+        the parent-shaped bucket).
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_mode(raw_dir, "aa-null")
+            write_leg(raw_dir, "a1", gpu_inference_tier(embed_p50_ms=8.0))
+            write_leg(raw_dir, "b1", tier=None, exit_code="1")  # FAIL leg, b-role, but aa-null mode
+            write_leg(raw_dir, "b2", gpu_inference_tier(embed_p50_ms=8.0))
+            write_leg(raw_dir, "a2", gpu_inference_tier(embed_p50_ms=8.0))
+
+            merged, exit_code = gpu_inference_ab.build_report(raw_dir)
+
+        self.assertEqual(exit_code, 75, f"merged={merged}")
+        self.assertEqual(merged["status"], "INCOMPLETE")
+        self.assertEqual(merged["mode"], "aa-null")
+        self.assertEqual(merged["missing_legs"], ["b1"])
+
+    def test_a_b_role_fail_with_unconfirmed_mode_never_escalates_to_invalid(self):
+        """An OLDER producer that predates the `mode` marker (round-3
+        adversarial audit B2): a `b`-role FAIL with NO `mode` file present
+        at all must NOT escalate to INVALID/1 either -- this module cannot
+        CONFIRM `ab` mode, so it never claims the signal is real.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_leg(raw_dir, "a1", gpu_inference_tier(embed_p50_ms=8.0))
+            write_leg(raw_dir, "b1", tier=None, exit_code="1")  # FAIL leg, b-role
+            write_leg(raw_dir, "b2", gpu_inference_tier(embed_p50_ms=8.0))
+            write_leg(raw_dir, "a2", gpu_inference_tier(embed_p50_ms=8.0))
+            os.remove(os.path.join(raw_dir, "mode"))  # simulate an older producer
+
+            merged, exit_code = gpu_inference_ab.build_report(raw_dir)
+
+        self.assertEqual(exit_code, 75, f"merged={merged}")
+        self.assertEqual(merged["status"], "INCOMPLETE")
+        self.assertIsNone(merged["mode"])
 
 
 class InvalidMeasurementTests(unittest.TestCase):
@@ -468,9 +533,18 @@ class OrderBindingTests(unittest.TestCase):
         self.assertEqual(merged["status"], "GREEN")
         # The default write_leg started_at values (1000, 1001, 1002, 1003)
         # are non-decreasing in LEG_ORDER's own a1,b1,b2,a2 sequence.
+        # round-3 adversarial audit B3: recorded_order's own schema is now
+        # {name: {"value": ..., "unavailable_reason": ...}}, never a bare
+        # int -- honestly distinguishing "parsed value" from "why
+        # unavailable" for a committed report's own reader.
         self.assertEqual(
             merged["recorded_order"],
-            {"a1": 1000, "b1": 1001, "b2": 1002, "a2": 1003},
+            {
+                "a1": {"value": 1000, "unavailable_reason": None},
+                "b1": {"value": 1001, "unavailable_reason": None},
+                "b2": {"value": 1002, "unavailable_reason": None},
+                "a2": {"value": 1003, "unavailable_reason": None},
+            },
         )
 
     def test_an_out_of_order_recorded_timestamp_refuses_invalid_exit_1(self):
@@ -478,7 +552,10 @@ class OrderBindingTests(unittest.TestCase):
         A,B,B,A-labeled raw dir whose ACTUAL recorded run order was not
         A,B,B,A at all) must refuse — the drift-cancellation rationale the
         primary endpoint depends on was never actually observed for this
-        run.
+        run. A GENUINE (parsed) order violation is a real signal -- this
+        stays INVALID/1, never the neutral bucket
+        [`test_a_leg_with_an_unparseable_timestamp_is_incomplete_order_exit_75`]
+        below covers.
         """
         with tempfile.TemporaryDirectory() as raw_dir:
             write_leg(raw_dir, "a1", gpu_inference_tier(embed_p50_ms=8.0), started_at=2000)
@@ -493,12 +570,15 @@ class OrderBindingTests(unittest.TestCase):
         self.assertTrue(
             any("run-order violation" in v and "'b1'" in v for v in merged["leg_premise_violations"])
         )
-        self.assertEqual(merged["recorded_order"]["b1"], 1000)
+        self.assertEqual(merged["recorded_order"]["b1"]["value"], 1000)
 
-    def test_a_leg_with_no_recorded_timestamp_at_all_refuses_invalid_exit_1(self):
-        """An OLDER producer that predates F3 (or a hand-crafted fixture)
-        writes no `.started_at` file at all for a leg — this must ALSO
-        refuse (never silently skip the order check for that leg).
+    def test_a_leg_with_no_started_at_file_is_incomplete_order_exit_75(self):
+        """round-3 adversarial audit B3 correction: an OLDER producer that
+        predates F3 (or a hand-crafted fixture) writing no `.started_at`
+        file at all for a leg is NOT itself proof the A,B,B,A order was
+        violated -- an environment/producer-version gap, the neutral
+        INCOMPLETE_ORDER/75, never the PR-blame INVALID/1 bucket a genuine
+        PARSED out-of-order timestamp earns.
         """
         with tempfile.TemporaryDirectory() as raw_dir:
             write_all_ok_legs(raw_dir, {"a1": 8.0, "b1": 8.0, "b2": 8.0, "a2": 8.0})
@@ -506,23 +586,75 @@ class OrderBindingTests(unittest.TestCase):
 
             merged, exit_code = gpu_inference_ab.build_report(raw_dir)
 
-        self.assertEqual(exit_code, 1)
-        self.assertEqual(merged["status"], "INVALID")
-        self.assertTrue(any("no recorded start timestamp" in v and "'b1'" in v for v in merged["leg_premise_violations"]))
+        self.assertEqual(exit_code, 75, f"merged={merged}")
+        self.assertEqual(merged["status"], "INCOMPLETE_ORDER")
+        self.assertTrue(any("missing" in v and "'b1'" in v for v in merged["leg_premise_violations"]))
+
+    def test_a_leg_with_an_unparseable_timestamp_is_incomplete_order_exit_75(self):
+        """round-3 adversarial audit B3 (the auditor's own scenario: a
+        non-GNU `date` binary emitting a different format than `%s%N`): a
+        `.started_at` file that EXISTS but does not parse as a plain
+        integer must ALSO land in the neutral INCOMPLETE_ORDER/75 bucket,
+        never INVALID/1 -- an unparseable timestamp is not evidence the
+        order was violated, only that this comparator could not read it.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_all_ok_legs(raw_dir, {"a1": 8.0, "b1": 8.0, "b2": 8.0, "a2": 8.0})
+            with open(os.path.join(raw_dir, "b1.started_at"), "w", encoding="utf-8") as fh:
+                fh.write("Sun Aug 30 01:23:45 UTC 2026")  # a non-GNU `date` output shape
+
+            merged, exit_code = gpu_inference_ab.build_report(raw_dir)
+
+        self.assertEqual(exit_code, 75, f"merged={merged}")
+        self.assertEqual(merged["status"], "INCOMPLETE_ORDER")
+        self.assertTrue(
+            any("timestamp unparseable" in v and "'b1'" in v for v in merged["leg_premise_violations"])
+        )
+        self.assertIn("timestamp unparseable", merged["recorded_order"]["b1"]["unavailable_reason"])
+
+    def test_load_leg_started_at_distinguishes_missing_from_unparseable(self):
+        """[`gpu_inference_ab.load_leg_started_at`] driven directly (the
+        real production function): a genuinely absent file reports
+        `"missing"`; a present-but-garbled file reports a DIFFERENT,
+        descriptive reason -- never the same string for both.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            value, reason = gpu_inference_ab.load_leg_started_at(raw_dir, "a1")
+            self.assertIsNone(value)
+            self.assertEqual(reason, "missing")
+
+            with open(os.path.join(raw_dir, "a1.started_at"), "w", encoding="utf-8") as fh:
+                fh.write("not-a-number")
+            value, reason = gpu_inference_ab.load_leg_started_at(raw_dir, "a1")
+            self.assertIsNone(value)
+            self.assertNotEqual(reason, "missing")
+            self.assertIn("timestamp unparseable", reason)
+
+            with open(os.path.join(raw_dir, "a1.started_at"), "w", encoding="utf-8") as fh:
+                fh.write("12345")
+            value, reason = gpu_inference_ab.load_leg_started_at(raw_dir, "a1")
+            self.assertEqual(value, 12345)
+            self.assertIsNone(reason)
 
     def test_verify_recorded_order_directly_on_a_clean_and_a_dirty_series(self):
         """[`gpu_inference_ab.verify_recorded_order`] driven directly (the
         real production function, not a re-implementation): empty on a
-        clean non-decreasing series, non-empty the instant one entry goes
-        backward.
+        clean non-decreasing series, an `"order"`-kind finding the instant
+        one entry goes backward, and an `"unavailable"`-kind finding
+        (never `"order"`) for a missing/unparseable timestamp.
         """
-        clean = {"a1": 1, "b1": 2, "b2": 2, "a2": 3}  # ties are fine, non-decreasing
+        clean = {"a1": (1, None), "b1": (2, None), "b2": (2, None), "a2": (3, None)}  # ties are fine
         self.assertEqual(gpu_inference_ab.verify_recorded_order(clean), [])
 
-        dirty = {"a1": 1, "b1": 2, "b2": 1, "a2": 3}  # b2 < b1
-        violations = gpu_inference_ab.verify_recorded_order(dirty)
-        self.assertTrue(violations)
-        self.assertTrue(any("'b2'" in v for v in violations))
+        dirty = {"a1": (1, None), "b1": (2, None), "b2": (1, None), "a2": (3, None)}  # b2 < b1
+        findings = gpu_inference_ab.verify_recorded_order(dirty)
+        self.assertTrue(findings)
+        self.assertTrue(any(kind == "order" and "'b2'" in msg for kind, msg in findings))
+
+        unavailable = {"a1": (1, None), "b1": (None, "missing"), "b2": (2, None), "a2": (3, None)}
+        findings = gpu_inference_ab.verify_recorded_order(unavailable)
+        self.assertTrue(findings)
+        self.assertTrue(all(kind == "unavailable" for kind, _msg in findings))
 
 
 def multiplicative_drift(true_value, k, t):

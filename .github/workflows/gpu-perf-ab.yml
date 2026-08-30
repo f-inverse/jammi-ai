@@ -86,7 +86,7 @@ jobs:
 
       - name: Annotate a premise refusal
         if: always() && steps.perfab.outputs.rc == '1'
-        run: echo "::error::gpu-perf-ab refused (exit 1) — a real correctness-of-measurement problem, always the PR's own (an identity mismatch between legs, an INVALID_MEASUREMENT defect, a recorded-run-order violation, a binary whose own provenance did not match the clone it was built from, the PR-side clone's build itself failing, or a PR-side leg that ran but did not produce an OK report). Never a perf regression, and never the parent's fault. See the merged report artifact for the named violation(s)."
+        run: echo "::error::gpu-perf-ab refused (exit 1) — a real correctness-of-measurement problem, CONFIRMED real before being raised (an identity mismatch between legs, an INVALID_MEASUREMENT defect, a genuine parsed recorded-order violation, a binary whose own provenance did not match the clone it was built from, the PR-side clone's build itself failing, or a b-role leg that ran but did not produce an OK report with the producer's own mode marker confirming ab). Never a perf regression. See the merged report artifact for the named violation(s) and its own mode field."
 
       - name: Annotate a usage/infra error
         if: always() && steps.perfab.outputs.rc == '2'

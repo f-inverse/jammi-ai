@@ -41,6 +41,15 @@ Round-2 adversarial audit additions:
    driven against a scratch repo with a real ref, a nonexistent ref, and a
    ref that resolves to the default branch's own tip.
 
+Round-3 adversarial audit addition:
+7. `ClonePartialCompositionTests` (B1) — the REAL two-stage clone
+   composition (`runpod_perf_ab_clone_and_checkout`'s outer partial clone,
+   then `gpu_inference_ab.sh`'s own real, extracted inner clone command)
+   against a scratch origin that itself honors `--filter` (mirroring a
+   real GitHub remote): GREEN with `uploadpack.allowFilter=true` set on
+   the outer clone (the fix), RED (empirically `rc=128`) with it reverted
+   — the auditor's own reproduction of a fatal clone-composition bug.
+
 Run: `python3 ci/scripts/perf/test_gpu_inference_ab_git_shape.py`
 """
 
@@ -53,6 +62,7 @@ import unittest
 
 PERF_DIR = os.path.dirname(os.path.abspath(__file__))
 GIT_LIB = os.path.join(PERF_DIR, "gpu_inference_ab_git.sh")
+GPU_INFERENCE_AB_SH = os.path.join(PERF_DIR, "gpu_inference_ab.sh")
 
 # Mirrors test_check_ci_guard_wiring.py's own `_scratch_git` convention:
 # never let a scratch repo's `git` invocation kick off a background
@@ -397,6 +407,179 @@ class RunpodCloneCheckoutTests(unittest.TestCase):
         rc, out, err = run_runpod_clone_and_checkout(dest, origin, "main", "main")
         self.assertEqual(rc, 0, f"stdout={out}\nstderr={err}")
         self.assertEqual(_rev_parse(dest, "HEAD"), main_tip_sha)
+
+
+def extract_inner_clone_command(gpu_inference_ab_sh_path):
+    """Reads `gpu_inference_ab.sh`'s own `clone_and_checkout` function and
+    returns its REAL `git clone ...` line, VERBATIM (round-3 adversarial
+    audit B1's own citation), with the `run_cmd ` wrapper stripped and the
+    trailing line-continuation backslash removed — never a hand-copied,
+    independently-drifting duplicate of that command. Raises if the
+    expected line is not found (fail-closed: a future edit to that
+    function's own clone command must be caught here, not silently
+    unexercised).
+    """
+    with open(gpu_inference_ab_sh_path, encoding="utf-8") as fh:
+        text = fh.read()
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("run_cmd git clone --no-hardlinks"):
+            return stripped[len("run_cmd ") :].rstrip("\\").strip()
+    raise AssertionError(
+        f"could not find clone_and_checkout's own 'run_cmd git clone --no-hardlinks ...' line in "
+        f"{gpu_inference_ab_sh_path} -- this test must be updated if that line's own shape changed"
+    )
+
+
+class ClonePartialCompositionTests(unittest.TestCase):
+    """Round-3 adversarial audit B1 (fatal clone composition, the auditor's
+    own reproduction): `runpod_clone_checkout.sh`'s OUTER clone
+    (`runpod_perf_ab_clone_and_checkout`) is itself a PARTIAL
+    (`--filter=blob:none`) clone by the time `gpu_inference_ab.sh`'s own
+    INNER clones (`clone_and_checkout`) clone AGAIN, also
+    `--filter=blob:none`, FROM it. A git repo's default
+    `uploadpack.allowFilter=false` means that outer clone, acting as the
+    inner clone's SOURCE, cannot honor a partial-clone request -- and,
+    being partial itself, cannot silently degrade to serving a FULL one
+    either (it does not have every historical blob to serve): the inner
+    clone FAILS HARD (fatal, empirically `rc=128`), never a graceful
+    no-op fallback. This class drives the REAL two-stage composition (the
+    real `runpod_perf_ab_clone_and_checkout` function, then
+    `gpu_inference_ab.sh`'s own REAL, VERBATIM inner clone command) against
+    a scratch repo whose default branch's ORIGIN itself honors
+    `--filter` (mirroring a real GitHub remote, which does) -- a scratch
+    origin that itself declines filtering (this suite's OTHER fixtures)
+    would never expose this bug, since its own outer clone would just
+    silently fall back to a full one.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.root = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _build_filter_capable_origin_with_missing_historical_blob(self):
+        """A scratch origin with `uploadpack.allowFilter=true` set on
+        ITSELF (mirroring a real GitHub remote, which honors partial
+        clone) so cloning it `--filter=blob:none` produces a GENUINELY
+        partial outer clone -- and two commits that OVERWRITE the same
+        file with different content, so the older commit's own blob is
+        NOT part of the newer commit's tree (a scratch origin whose commits
+        never touch the same path would never expose a genuinely missing
+        historical blob at all).
+        """
+        origin = os.path.join(self.root, "origin")
+        os.makedirs(origin)
+        _git(["init", "-q"], origin)
+        _git(["config", "user.email", "test@example.com"], origin)
+        _git(["config", "user.name", "test"], origin)
+        _git(["config", "uploadpack.allowFilter", "true"], origin)
+        _git(["symbolic-ref", "HEAD", "refs/heads/main"], origin)
+
+        with open(os.path.join(origin, "a.txt"), "w", encoding="utf-8") as fh:
+            fh.write("version-1-content\n")
+        _git(["add", "a.txt"], origin)
+        _git(["commit", "-q", "-m", "c1"], origin)
+
+        with open(os.path.join(origin, "a.txt"), "w", encoding="utf-8") as fh:
+            fh.write("version-2-content-totally-different\n")
+        _git(["add", "a.txt"], origin)
+        _git(["commit", "-q", "-m", "c2"], origin)
+
+        return origin
+
+    def _run_inner_clone(self, outer_dest, inner_dest):
+        """Runs `gpu_inference_ab.sh`'s own REAL, extracted `clone_and_checkout`
+        command (never a hand-copied duplicate) with `REPO_ROOT`/`clone`
+        bound to `outer_dest`/`inner_dest` -- the SAME two local variable
+        names that function's own body references.
+        """
+        command = extract_inner_clone_command(GPU_INFERENCE_AB_SH)
+        env = dict(os.environ)
+        env["REPO_ROOT"] = outer_dest
+        env["clone"] = inner_dest
+        result = subprocess.run(["bash", "-c", command], capture_output=True, text=True, env=env)
+        return result.returncode, result.stdout, result.stderr
+
+    def _assert_outer_clone_is_genuinely_partial(self, outer_dest):
+        """Self-verifying fixture premise (controls-are-non-vacuous
+        discipline): the outer clone must ACTUALLY be a partial
+        (`--filter=blob:none`) clone, never merely requested-and-silently-
+        ignored (the bare-local-path quirk `run_runpod_clone_and_checkout`'s
+        OWN callers must pass a `file://`-prefixed URL to avoid — see this
+        class's own `origin` fixture, always passed as `file://...` for
+        exactly this reason). A test whose "outer clone" secretly ended up
+        FULL would pass both the GREEN and RED cases VACUOUSLY (a full
+        clone has every blob locally; the inner clone would never need a
+        promisor fetch at all, succeeding regardless of `allowFilter`).
+        """
+        result = _git(["config", "--get", "remote.origin.partialclonefilter"], outer_dest, check=False)
+        self.assertEqual(
+            result.stdout.strip(),
+            "blob:none",
+            f"the outer clone fixture must be a GENUINELY partial clone (remote.origin."
+            f"partialclonefilter=blob:none) or this whole test is vacuous -- got {result.stdout!r}",
+        )
+
+    def test_the_real_composition_succeeds_with_the_fix(self):
+        """GREEN: the real `runpod_perf_ab_clone_and_checkout` (which now
+        sets `uploadpack.allowFilter=true` on its own outer clone) followed
+        by `gpu_inference_ab.sh`'s own real inner clone command succeeds.
+        """
+        origin = self._build_filter_capable_origin_with_missing_historical_blob()
+        outer_dest = os.path.join(self.root, "outer")
+        inner_dest = os.path.join(self.root, "inner")
+
+        outer_rc, outer_out, outer_err = run_runpod_clone_and_checkout(
+            outer_dest, f"file://{origin}", "main", "main"
+        )
+        self.assertEqual(outer_rc, 0, f"outer clone setup failed\nstdout={outer_out}\nstderr={outer_err}")
+        self._assert_outer_clone_is_genuinely_partial(outer_dest)
+        self.assertEqual(
+            _git(["config", "--get", "uploadpack.allowFilter"], outer_dest).stdout.strip(),
+            "true",
+            "the outer clone must have uploadpack.allowFilter=true set on it",
+        )
+
+        inner_rc, inner_out, inner_err = self._run_inner_clone(outer_dest, inner_dest)
+        self.assertEqual(
+            inner_rc,
+            0,
+            f"the inner clone must succeed once the outer clone honors uploadpack.allowFilter\n"
+            f"stdout={inner_out}\nstderr={inner_err}",
+        )
+
+    def test_the_real_composition_fails_rc_128_without_the_fix_the_red_control(self):
+        """RED (the negative control, RC1: an assertion must be able to
+        fail): the SAME composition, with `uploadpack.allowFilter` reverted
+        to unset on the outer clone (simulating the pre-fix state) — proves
+        the bug this fix closes is REAL, empirically `rc=128`, not merely
+        asserted in prose.
+        """
+        origin = self._build_filter_capable_origin_with_missing_historical_blob()
+        outer_dest = os.path.join(self.root, "outer")
+        inner_dest = os.path.join(self.root, "inner")
+
+        outer_rc, outer_out, outer_err = run_runpod_clone_and_checkout(
+            outer_dest, f"file://{origin}", "main", "main"
+        )
+        self.assertEqual(outer_rc, 0, f"outer clone setup failed\nstdout={outer_out}\nstderr={outer_err}")
+        self._assert_outer_clone_is_genuinely_partial(outer_dest)
+        # Revert exactly the one fix line -- the RED control's own premise.
+        _git(["config", "--unset", "uploadpack.allowFilter"], outer_dest)
+
+        inner_rc, inner_out, inner_err = self._run_inner_clone(outer_dest, inner_dest)
+        self.assertEqual(
+            inner_rc,
+            128,
+            f"the inner clone was expected to FAIL FATALLY (rc=128, the auditor's own empirical "
+            f"finding) once uploadpack.allowFilter is unset on a genuinely partial outer clone -- "
+            f"if this assertion fails, either git's own behavior changed underneath this test, or "
+            f"the bug this fix closes no longer reproduces the way the audit found it\n"
+            f"stdout={inner_out}\nstderr={inner_err}",
+        )
 
 
 if __name__ == "__main__":

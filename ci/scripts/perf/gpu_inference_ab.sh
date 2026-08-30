@@ -81,7 +81,7 @@
 # `ci/artifacts/gpu-perf-aa-null/` as the campaign's own committed evidence,
 # the same convention `runpod_gpu_howwell.sh`'s own artifact pull follows.
 #
-# ## Exit codes (round-2 adversarial audit F5's final reconciled lattice —
+# ## Exit codes (round-3 adversarial audit B2/B3's reconciled lattice —
 # this table, the code sites below, `gpu_inference_ab.py`'s own exit-code
 # doc, and gpu-perf-ab.yml's own step annotations must all agree; every
 # exit site in this script cites which arm of this table it lands on)
@@ -89,21 +89,27 @@
 #   0  -- a report was written and the merge's own status is GREEN (see
 #         `gpu_inference_ab.py`'s own exit-code doc: recorded regardless of
 #         the ratio's own value — v1 never gates on the number).
-#   1  -- a REAL correctness-of-measurement refusal, always the PR's own
-#         problem or a genuine measurement-validity defect, never the
-#         parent's: an identity mismatch between two otherwise-comparable
-#         legs (`gpu_inference_ab.py` status INVALID), a malformed
-#         measurement on an otherwise identity-clean leg set (status
-#         INVALID_MEASUREMENT), the four legs' RECORDED start order not
-#         verifying as A,B,B,A (round-2 adversarial audit F3, also status
-#         INVALID — `verify_recorded_order`), a PR-side (`b`-role) leg
-#         (`b1`/`b2`) that ran but did not produce an `OK` report (round-2
-#         adversarial audit F5: a RUNTIME failure on an already-built PR
-#         binary is a stronger signal than a non-compiling one), a binary
-#         whose own `provenance` does not match the clone it was supposedly
-#         built from, or the PR/comparison clone's build FAILING (outside
-#         `--aa-null` mode — see that mode's own exception below). A report
-#         is still WRITTEN on every one of these, never an uncaught crash.
+#   1  -- a REAL correctness-of-measurement refusal, ONLY ever raised once
+#         `gpu_inference_ab.py` can CONFIRM the signal is real (round-3
+#         adversarial audit B2/B3 correction: an earlier version of this
+#         table claimed this arm was "always the PR's own problem, never
+#         the parent's" -- that overclaimed a confirmation this script does
+#         not always have): an identity mismatch between two otherwise-
+#         comparable legs (status INVALID), a malformed measurement on an
+#         otherwise identity-clean leg set (status INVALID_MEASUREMENT), the
+#         four legs' RECORDED start order not verifying as A,B,B,A with
+#         every timestamp actually PARSED (status INVALID --
+#         `verify_recorded_order`; an UNPARSEABLE timestamp is a SEPARATE,
+#         neutral 75 case, never this one), a `b`-role leg (`b1`/`b2`) that
+#         RAN but did not produce an `OK` report AND the producer's own
+#         `mode` marker (see below) confirms `ab` (a `b`-role leg is ALSO
+#         parent-sha under `--aa-null` -- no PR exists to blame there), a
+#         binary whose own `provenance` does not match the clone it was
+#         supposedly built from, or the PR/comparison clone's build FAILING
+#         (outside `--aa-null` mode — see that mode's own exception below,
+#         where the SAME build-failure classification already correctly
+#         attributes it to the parent-shaped bucket instead). A report is
+#         still WRITTEN on every one of these, never an uncaught crash.
 #   2  -- a usage/infra error: bad arguments, `nvidia-smi` itself failing to
 #         run, a `git clone`/`checkout`/submodule-init failure, an
 #         unshallow-fetch failure, HEAD or the computed merge-base not
@@ -120,10 +126,45 @@
 #         merge-base (no PR-side commits at all), both binaries report the
 #         SAME `build_sha` outside `--aa-null` mode, a parent leg is missing
 #         one or more declared identity fields entirely (predates issue
-#         #335's own identity contract — status INCOMPLETE_IDENTITY), or
-#         fewer than all four legs produced an `OK` report AND NONE of the
-#         missing/failed ones are `b`-role (status INCOMPLETE — a `b`-role
-#         absence is `1` above, not `75`).
+#         #335's own identity contract — status INCOMPLETE_IDENTITY), one or
+#         more legs' RECORDED start timestamps could not be read or did not
+#         parse (status INCOMPLETE_ORDER, round-3 adversarial audit B3 — a
+#         missing/unparseable timestamp is NOT itself proof the order was
+#         violated), or fewer than all four legs produced an `OK` report and
+#         the CONFIRMED-real b-role-FAIL-in-`ab`-mode precondition above
+#         does not hold (status INCOMPLETE — a `MISSING`/`DRY_RUN` leg of
+#         EITHER role, a `b`-role FAIL under `--aa-null`, or an unconfirmed
+#         `mode`: round-3 adversarial audit B2).
+#
+# ## RESIDUALS (round-3 adversarial audit freeze rule: this wave is EXACTLY
+# three fixes, B1/B2/B3 above; every OTHER advisory the audit raised is
+# acknowledged here, verbatim by name, and DELIBERATELY left untouched)
+#
+#   - wall-clock ties: `verify_recorded_order` treats an EQUAL recorded
+#     timestamp between adjacent legs as non-decreasing (not a violation)
+#     -- never investigated whether two legs finishing within the SAME
+#     nanosecond-epoch tick is itself a signal worth its own check.
+#   - df fail-open: the driver's own pre-flight disk-space check
+#     (`runpod_gpu_perf_ab.sh`) logs a warning and CONTINUES when `df -BG /`
+#     produces unparseable output, rather than refusing -- a broken `df`
+#     parse silently skips the safety check instead of failing closed.
+#   - RP_DISK_GB prose: sized from `docs/maintainer/dev-gpu.md`'s own
+#     "3+ trees -> RP_DISK_GB=70+" guidance, an approximation for a
+#     DIFFERENT (seed-and-clone) build substrate this producer does not
+#     actually use, never a bespoke measurement of THIS workload's own
+#     footprint.
+#   - sourced-guard latency: the `[[ "${BASH_SOURCE[0]}" == "${0}" ]]`
+#     "am I sourced or executed" idiom (`gpu_inference_ab_git.sh`,
+#     `runpod_clone_checkout.sh`) was verified empirically for the ONE
+#     invocation shape this repo actually uses (`bash -s` reading from
+#     stdin) -- not exhaustively re-verified against every other way bash
+#     can source vs. execute a file.
+#   - caller's 75-continue branch: `gpu_inference_ab_ensure_history_for_merge_base`
+#     returning 75 makes THIS script log a warning and continue to the real
+#     gate (the `git merge-base` call, round-2 adversarial audit F2) rather
+#     than exit immediately -- no further hardening of that continuation
+#     path (e.g. re-verifying `origin/main`'s own freshness before the
+#     merge-base call) was attempted beyond the F2 fix itself.
 #
 # Env vars:
 #   GPU_INFERENCE_AB_WORK_DIR       where clone-a/clone-b + their own
@@ -173,6 +214,25 @@ WORK_DIR="${GPU_INFERENCE_AB_WORK_DIR:-$(dirname "$REPO_ROOT")/gpu-perf-ab-$TS}"
 OUT_DIR="${GPU_INFERENCE_AB_OUT_DIR:-$REPO_ROOT/.gpu-inference-ab-report/$TS}"
 RAW_DIR="$OUT_DIR/raw"
 mkdir -p "$RAW_DIR"
+
+# round-3 adversarial audit B2: the comparator has NO other way to know
+# whether this run is the normal parent-vs-PR A/B or the --aa-null
+# empirical-null instrument (both b-role legs are ALSO parent-sha clones
+# under aa-null -- a b-role RUNTIME failure there carries no "the PR's own
+# problem" signal at all, since there is no PR leg in play) -- write it
+# ONE time, here, before any leg runs, so `gpu_inference_ab.py`'s own
+# `build_report` can route a b-role leg failure correctly instead of
+# blaming a nonexistent PR. DRY_RUN takes precedence over AA_NULL in this
+# marker (a dry run's own aa_null flag changes no real measurement; every
+# leg is a DRY_RUN stub either way, so the comparator's MISSING/DRY_RUN
+# routing already handles it regardless of which value is recorded here).
+if [ "$GPU_INFERENCE_AB_DRY_RUN" = "1" ]; then
+  printf 'dry-run' > "$RAW_DIR/mode"
+elif [ "$GPU_INFERENCE_AB_AA_NULL" = "1" ]; then
+  printf 'aa-null' > "$RAW_DIR/mode"
+else
+  printf 'ab' > "$RAW_DIR/mode"
+fi
 
 CLONE_A="$WORK_DIR/clone-a"
 CLONE_B="$WORK_DIR/clone-b"
@@ -279,21 +339,31 @@ mkdir -p "$WORK_DIR"
 # --- TWO SIMULTANEOUSLY-RESIDENT clones, checked out BEFORE any build ---
 clone_and_checkout() {
   local clone="$1" sha="$2" label="$3"
-  # round-2 adversarial audit F6: `--filter=blob:none` -- the SAME pod-clone
-  # idiom runpod_lib.sh:1505 already uses -- skips every HISTORICAL blob
-  # this workload never touches (no git log -p, no diffing against
-  # history; only the ONE checked-out tree's own files are ever read), a
-  # real disk-footprint saving for two full source trees WHEN the local
-  # git server honors it. Git SILENTLY IGNORES `--filter` outright for a
-  # bare-local-path clone ("--filter is ignored in local clones; use
-  # file:// instead", discovered empirically); `file://$REPO_ROOT` is
-  # REQUIRED for the filter to even be ATTEMPTED. Whether it then actually
-  # takes effect depends on the local git-upload-pack's own filter support
-  # (also observed empirically: a local `file://` transport can itself
-  # decline with "filtering not recognized by server, ignoring" and fall
-  # back to a full clone) -- either way this is a harmless, forward-looking
-  # request: a real saving when honored, a silent no-op warning when not,
-  # never a hard failure.
+  # round-2 adversarial audit F6 (round-3 adversarial audit B1 correction):
+  # `--filter=blob:none` -- the SAME pod-clone idiom runpod_lib.sh:1505
+  # already uses -- skips every HISTORICAL blob this workload never touches
+  # (no git log -p, no diffing against history; only the ONE checked-out
+  # tree's own files are ever read), a real disk-footprint saving for two
+  # full source trees. `file://$REPO_ROOT` is REQUIRED for the filter to
+  # even be ATTEMPTED (a bare local path silently ignores `--filter`
+  # outright, discovered empirically). This clone's SOURCE, `$REPO_ROOT`,
+  # is ITSELF a partial (blobless) clone by the time this runs
+  # (`runpod_gpu_perf_ab.sh`'s own outer clone, made via
+  # `runpod_clone_checkout.sh`) -- an earlier version of this comment
+  # claimed an unsupported filter request "never a hard failure" (silent
+  # fallback to a full clone); that claim was FALSE for exactly this
+  # composition (round-3 adversarial audit B1, the auditor's own
+  # reproduction): a source that is ITSELF partial cannot silently
+  # fall back to serving a FULL clone (it does not have every blob to
+  # serve), so an inner filtered clone against an unfiltered-serving
+  # source FAILS hard (fatal, exit 128) rather than degrading gracefully.
+  # The REAL contract this depends on: the source repo's own
+  # `uploadpack.allowFilter` must be `true` so it can actually SERVE a
+  # partial-clone request rather than attempt (and fail) a full one --
+  # `runpod_clone_checkout.sh`'s own outer clone sets this immediately
+  # after cloning, which is what makes THIS inner clone sound. This
+  # function does not set it again (the outer lib's own responsibility,
+  # asserted once, not re-asserted at every inner clone site).
   run_cmd git clone --no-hardlinks --quiet --filter=blob:none "file://$REPO_ROOT" "$clone" \
     || { echo "::error::cloning $label ($REPO_ROOT -> $clone) failed" >&2; return 1; }
   run_cmd git -C "$clone" checkout --quiet --detach "$sha" \

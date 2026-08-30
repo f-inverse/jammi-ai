@@ -16,13 +16,21 @@
 # RECORDING-ONLY (v1): `gpu_inference_ab.py`'s own exit codes (see that
 # module's doc) are the SAME ones this script propagates — 0 = report
 # written, merge status GREEN; 1 = a real correctness-of-measurement
-# refusal (an identity/order/provenance mismatch, an INVALID_MEASUREMENT,
-# or a PR-side build/runtime failure — the PR's own problem, never the
-# parent's); 2 = a usage/infra error (bad args, a clone/checkout/
-# wrong-tree/fetch failure); 75 = neutral "nothing to compare safely right
-# now" (no RunPod capacity, insufficient free disk on the pod — this
-# driver's own pre-flight `df` check, round-2 adversarial audit F6 — a
-# GPU-busy pod, a PARENT-side build failure, an `origin/main` refresh-fetch
+# refusal (an identity/provenance mismatch, an INVALID_MEASUREMENT, a
+# GENUINE (parsed) recorded-order violation, or a `b`-role runtime failure
+# with the producer's own `mode` marker CONFIRMING `ab` — round-3
+# adversarial audit B2 correction: an earlier version of this doc claimed
+# this arm was always "the PR's own problem, never the parent's", which
+# overclaimed a confirmation this driver does not always have -- under
+# `--aa-null` there is no PR to blame at all, and an unconfirmed `mode`
+# never escalates either); 2 = a usage/infra error (bad args, a
+# clone/checkout/wrong-tree/fetch failure); 75 = neutral "nothing to
+# compare safely right now" (no RunPod capacity, insufficient free disk on
+# the pod — this driver's own pre-flight `df` check, round-2 adversarial
+# audit F6 — a GPU-busy pod, a PARENT-side build failure, a `MISSING`/
+# `DRY_RUN` leg of either role, a `b`-role runtime failure under
+# `--aa-null`/an unconfirmed mode, an unreadable/unparseable recorded
+# timestamp (round-3 adversarial audit B3), an `origin/main` refresh-fetch
 # failure, `merge-base == HEAD`, or fewer than four `OK` legs) — see
 # `gpu_inference_ab.sh`'s own header for the full, reconciled table this
 # driver's exit code is drawn from verbatim. This driver treats RunPod

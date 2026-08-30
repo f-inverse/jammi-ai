@@ -26,11 +26,15 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 
 PERF_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(PERF_DIR, "gpu_inference_ab.sh")
+
+sys.path.insert(0, PERF_DIR)
+import gpu_inference_ab  # noqa: E402 -- round-3 adversarial audit B3: the producer-to-comparator round trip needs the REAL parser, never a re-implementation.
 
 
 def run_dry(out_dir, work_dir, extra_env=None):
@@ -58,18 +62,21 @@ class DryRunSmokeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as out_dir, tempfile.TemporaryDirectory() as work_dir:
             result = run_dry(out_dir, work_dir)
 
-            # Every real leg is a stub under GPU_INFERENCE_AB_DRY_RUN=1 (see
-            # gpu_inference_ab.py's own MISSING/INCOMPLETE doctrine), so all
-            # four legs are missing -- b1/b2 (b-role) are among them, so
-            # (round-2 adversarial audit F5) the merge status is
-            # deterministically INVALID and the exit code is 1, proven here
-            # against the REAL process exit code, not assumed.
+            # round-3 adversarial audit B2 (the auditor's own reproduction):
+            # every real leg is a `DRY_RUN`-outcome stub under
+            # GPU_INFERENCE_AB_DRY_RUN=1, NEVER `FAIL` -- "nothing ran"
+            # carries no runtime signal about a PR binary at all, so the
+            # merge status must be the NEUTRAL INCOMPLETE/75, never the
+            # PR-blame INVALID/1 an earlier (round-2) version of this
+            # routing incorrectly produced. Proven here against the REAL
+            # process exit code, not assumed.
             self.assertEqual(
                 result.returncode,
-                1,
-                f"dry-run's own four stub legs are never 'OK' (dry-run reports), and b1/b2 are among "
-                f"the missing (b-role), so the merge status must be INVALID/exit 1 deterministically "
-                f"(round-2 adversarial audit F5)\nstdout={result.stdout}\nstderr={result.stderr}",
+                75,
+                f"dry-run's own four stub legs are never 'OK' NOR 'FAIL' (outcome is 'DRY_RUN' -- "
+                f"nothing ran), so the merge status must be the neutral INCOMPLETE/exit 75 "
+                f"deterministically (round-3 adversarial audit B2 correction)\n"
+                f"stdout={result.stdout}\nstderr={result.stderr}",
             )
 
             # The printed command trace shows the commands run_cmd WOULD
@@ -84,8 +91,10 @@ class DryRunSmokeTests(unittest.TestCase):
             self.assertTrue(os.path.isfile(report_path), f"no report written under {out_dir}\nstdout={result.stdout}")
             with open(report_path, encoding="utf-8") as fh:
                 report = json.load(fh)
-            self.assertEqual(report["status"], "INVALID")
+            self.assertEqual(report["status"], "INCOMPLETE")
             self.assertEqual(sorted(report["missing_legs"]), ["a1", "a2", "b1", "b2"])
+            self.assertEqual(report["mode"], "dry-run")
+            self.assertIn("nothing ran", report["incomplete_reason"])
 
     def test_dry_run_never_creates_a_real_cargo_target_dir(self):
         """The strongest available proof this run touched no real build:
@@ -96,7 +105,7 @@ class DryRunSmokeTests(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as out_dir, tempfile.TemporaryDirectory() as work_dir:
             result = run_dry(out_dir, work_dir)
-            self.assertEqual(result.returncode, 1, f"stdout={result.stdout}\nstderr={result.stderr}")
+            self.assertEqual(result.returncode, 75, f"stdout={result.stdout}\nstderr={result.stderr}")
 
             for sub in ("target-a", "target-b", "clone-a", "clone-b"):
                 self.assertFalse(
@@ -114,7 +123,7 @@ class DryRunSmokeTests(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as out_dir, tempfile.TemporaryDirectory() as work_dir:
             result = run_dry(out_dir, work_dir)
-            self.assertEqual(result.returncode, 1, f"stdout={result.stdout}\nstderr={result.stderr}")
+            self.assertEqual(result.returncode, 75, f"stdout={result.stdout}\nstderr={result.stderr}")
             self.assertNotIn("nvidia-smi", result.stderr)
 
     def test_dry_run_prints_the_four_legs_in_the_a1_b1_b2_a2_order(self):
@@ -123,11 +132,12 @@ class DryRunSmokeTests(unittest.TestCase):
         EXACTLY that order in stdout -- the visible, human-readable half of
         the order binding (the MACHINE-CHECKED half lives in
         `gpu_inference_ab.py::verify_recorded_order`, driven against the
-        `.started_at` files this same run writes).
+        `.started_at` files this same run writes -- see the NEXT test for
+        the actual producer-to-comparator round trip over those files).
         """
         with tempfile.TemporaryDirectory() as out_dir, tempfile.TemporaryDirectory() as work_dir:
             result = run_dry(out_dir, work_dir)
-            self.assertEqual(result.returncode, 1, f"stdout={result.stdout}\nstderr={result.stderr}")
+            self.assertEqual(result.returncode, 75, f"stdout={result.stdout}\nstderr={result.stderr}")
 
             markers = ["--- a1: ", "--- b1: ", "--- b2: ", "--- a2: "]
             indices = [result.stdout.index(m) for m in markers]
@@ -136,6 +146,46 @@ class DryRunSmokeTests(unittest.TestCase):
                 sorted(indices),
                 f"the four leg-trace markers must appear in a1,b1,b2,a2 order in stdout; got indices "
                 f"{indices} for {markers}\nstdout={result.stdout}",
+            )
+
+    def test_the_real_started_at_files_round_trip_through_the_comparators_own_parser(self):
+        """round-3 adversarial audit B3: the producer-to-comparator round
+        trip, pinned WITHOUT a GPU -- reads the FOUR REAL `.started_at`
+        files `gpu_inference_ab.sh`'s own `run_leg` wrote (real `date
+        +%s%N` output, not a Python-constructed fixture), parses EACH one
+        through `gpu_inference_ab.py`'s OWN
+        `load_leg_started_at`/`verify_recorded_order` functions (imported
+        directly, never re-implemented), and asserts they parse as ints in
+        non-decreasing a1,b1,b2,a2 order -- proving the two halves of this
+        system (what the shell writes, what the Python reads) actually
+        agree on the file's own format, not merely on paper.
+        """
+        with tempfile.TemporaryDirectory() as out_dir, tempfile.TemporaryDirectory() as work_dir:
+            result = run_dry(out_dir, work_dir)
+            self.assertEqual(result.returncode, 75, f"stdout={result.stdout}\nstderr={result.stderr}")
+
+            raw_dir = os.path.join(out_dir, "raw")
+            started_at_by_leg = {}
+            for name in gpu_inference_ab.LEG_ORDER:
+                path = os.path.join(raw_dir, f"{name}.started_at")
+                self.assertTrue(os.path.isfile(path), f"the real producer must write {path}")
+                value, reason = gpu_inference_ab.load_leg_started_at(raw_dir, name)
+                self.assertIsNone(reason, f"leg {name!r}'s real .started_at file failed to parse: {reason}")
+                self.assertIsInstance(value, int)
+                started_at_by_leg[name] = (value, reason)
+
+            values = [started_at_by_leg[name][0] for name in gpu_inference_ab.LEG_ORDER]
+            self.assertEqual(
+                values,
+                sorted(values),
+                f"the four REAL .started_at files must parse into a non-decreasing a1,b1,b2,a2 "
+                f"sequence; got {dict(zip(gpu_inference_ab.LEG_ORDER, values))}",
+            )
+            self.assertEqual(
+                gpu_inference_ab.verify_recorded_order(started_at_by_leg),
+                [],
+                "the real producer's own timestamps, read through the comparator's own parser, must "
+                "verify as a clean A,B,B,A order with no findings at all",
             )
 
 

@@ -113,7 +113,7 @@ module's exit code, and a future unit that wires this endpoint into an
 actual gate must replace [`PLACEHOLDER_ADVISORY_BAND`] with a band derived
 from that artifact, never keep this placeholder as the real threshold.
 
-## Exit codes (round-2 adversarial audit F5's final reconciled lattice —
+## Exit codes (round-3 adversarial audit B2/B3's reconciled lattice —
 ## matches `gpu_inference_ab.sh`'s own header table and `gpu-perf-ab.yml`'s
 ## own step annotations verbatim)
 
@@ -122,35 +122,38 @@ from that artifact, never keep this placeholder as the real threshold.
            [`identity_fields.GPU_INFERENCE_IDENTITY_FIELDS`]. The ratio is
            computed and printed regardless of its own value (recording-only
            — see above).
-  * `1`  — a real correctness-of-measurement refusal, always the PR's own
-           problem or a genuine measurement-validity defect, never the
-           parent's, in FOUR shapes: (a) INVALID (identity) — at least two
-           `OK` legs DIFFER on a declared identity field's actual VALUE;
-           (b) INVALID_MEASUREMENT — the legs' premises agree, but
-           computing the primary endpoint's ratio itself raised (a
-           malformed lane/metric, a zero baseline —
+  * `1`  — a real correctness-of-measurement refusal, ONLY ever raised once
+           this module can CONFIRM the signal is real, in FOUR shapes: (a)
+           INVALID (identity) — at least two `OK` legs DIFFER on a declared
+           identity field's actual VALUE; (b) INVALID_MEASUREMENT — the
+           legs' premises agree, but computing the primary endpoint's ratio
+           itself raised (a malformed lane/metric, a zero baseline —
            [`_measurement_value`]/[`adjacent_pair_ratio`] deliberately
            raise rather than silently substitute a placeholder); (c) a
-           PR-side (`b`-role) leg (`b1`/`b2`) did not produce an `OK`
-           report (round-2 adversarial audit F5: a RUNTIME failure on an
-           already-built PR binary is a stronger signal than a
-           non-compiling one — the shell producer's own build-failure exit
-           is a SEPARATE, earlier gate; this is the comparator's own
-           classification of a leg that ran but errored/crashed); (d) the
-           four legs' RECORDED start order does not verify as A,B,B,A
-           ([`verify_recorded_order`]) — the drift-cancellation rationale
-           this comparator's own primary endpoint depends on was never
-           actually observed. All four refuse loudly (never silently drop
+           `b`-role leg (`b1`/`b2`) RAN but did not produce an `OK` report
+           (`outcome == "FAIL"`, never `MISSING`/`DRY_RUN` — "nothing ran"
+           carries no runtime signal at all) **AND** the producer's own
+           `mode` marker confirms `"ab"` (round-3 adversarial audit B2:
+           under `--aa-null`, `b`-role legs are ALSO parent-sha clones — no
+           PR exists to blame; an UNKNOWN mode, an older producer, never
+           escalates here either — this module cannot claim a signal it
+           cannot confirm); (d) the four legs' RECORDED start order does
+           not verify as A,B,B,A AND every timestamp actually PARSED
+           (round-3 adversarial audit B3: a missing/unparseable timestamp
+           is a SEPARATE, neutral case — `INCOMPLETE_ORDER`/`75` below,
+           never this bucket). All four refuse loudly (never silently drop
            the offending leg/field and compute a ratio anyway), and all
            four still WRITE a report (never an uncaught traceback with
            nothing recorded at all).
   * `75` — neutral "nothing to compare safely", never a sign of a code
-           problem, in TWO distinct shapes:
+           problem, in THREE distinct shapes:
              - `INCOMPLETE`: fewer than all four legs produced an `OK`
-               report, and NONE of the missing/failed ones are `b`-role
-               (a PARENT-side (`a`-role) build/runtime failure, a capacity
-               miss, a `DRY_RUN` stub — see (c) above for the `b`-role
-               case, which is `1`, not `75`).
+               report, and the CONFIRMED-real b-role-FAIL-in-ab-mode
+               precondition in (c) above does not hold — a `MISSING`/
+               `DRY_RUN` leg of EITHER role ("nothing ran" — round-3
+               adversarial audit B2), a PARENT-side (`a`-role) build/
+               runtime failure, or a `b`-role FAIL under `--aa-null`/an
+               unconfirmed `mode` (no PR to blame, or nothing confirmed).
              - `INCOMPLETE_IDENTITY` (round-1 adversarial audit B3): every
                `OK` leg's identity DISAGREEMENT is a field MISSING entirely
                from one side's record OR present but explicit JSON `null`
@@ -165,6 +168,15 @@ from that artifact, never keep this placeholder as the real threshold.
                differing-VALUE violation among the same set immediately
                promotes the WHOLE refusal to `1` — a genuine divergence is
                never masked by an ALSO-missing field elsewhere.
+             - `INCOMPLETE_ORDER` (round-3 adversarial audit B3): one or
+               more legs' `.started_at` files could not be read at all
+               (missing) or did not parse as a plain integer (e.g. a
+               non-GNU `date` binary emitting a different format than
+               `%s%N`) — this is an environment/producer-version gap, NOT
+               itself proof the A,B,B,A order was violated, so it must
+               never land in the SAME bucket a genuine, PARSED
+               out-of-order timestamp earns (that stays `1`, case (d)
+               above).
 """
 
 from __future__ import annotations
@@ -222,24 +234,48 @@ def load_leg(raw_dir, name):
     return {"outcome": "OK", "report": report}
 
 
+def load_mode(raw_dir):
+    """Read the `mode` marker (round-3 adversarial audit B2) the producer
+    writes into `raw_dir` before any leg runs: `"ab"` (the normal
+    parent-vs-PR A/B), `"aa-null"` (the D6 empirical-null instrument —
+    BOTH `b`-role legs are ALSO parent-sha clones, no PR exists), or
+    `"dry-run"`. `None` when absent (an older producer that predates this
+    marker) — [`build_report`] treats an unknown mode conservatively:
+    never claims a `b`-role runtime failure is "the PR's own problem"
+    without CONFIRMED `ab` mode.
+    """
+    path = os.path.join(raw_dir, "mode")
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as fh:
+        value = fh.read().strip()
+    return value if value in ("ab", "aa-null", "dry-run") else None
+
+
 def load_leg_started_at(raw_dir, name):
     """Read `<name>.started_at` (a plain-text nanosecond-epoch timestamp,
     `date +%s%N` — round-2 adversarial audit F3's order-binding evidence)
-    out of `raw_dir`. `None` when absent or unparsable — the producer
-    (`gpu_inference_ab.sh`'s own `run_leg`) writes this file BEFORE
-    invoking each leg's binary, in EVERY mode including `--dry-run`, so a
-    genuinely absent file means an OLDER producer that predates this
-    feature, never a normal outcome for a leg this comparator otherwise
-    reads as `OK`.
+    out of `raw_dir`. Returns `(value, unavailable_reason)`: `value` is an
+    `int` on success, else `None`; `unavailable_reason` is `None` on
+    success, `"missing"` when the file does not exist at all, or a short
+    parse-failure string (round-3 adversarial audit B3) when the file
+    EXISTS but its content did not parse as a plain integer — e.g. a
+    non-GNU `date` binary emitting a different format than `%s%N`
+    produces. The producer (`gpu_inference_ab.sh`'s own `run_leg`) writes
+    this file BEFORE invoking each leg's binary, in EVERY mode including
+    `--dry-run`, so `"missing"` at this call site (only ever reached once
+    a leg's OWN outcome is confirmed `OK` — see [`build_report`]) means an
+    OLDER producer that predates this feature, never a normal outcome.
     """
     path = os.path.join(raw_dir, f"{name}.started_at")
     if not os.path.isfile(path):
-        return None
+        return None, "missing"
     try:
         with open(path, encoding="utf-8") as fh:
-            return int(fh.read().strip())
-    except (OSError, ValueError):
-        return None
+            raw = fh.read().strip()
+        return int(raw), None
+    except (OSError, ValueError) as exc:
+        return None, f"timestamp unparseable (non-GNU date?): {exc}"
 
 
 def verify_recorded_order(started_at_by_leg):
@@ -253,25 +289,33 @@ def verify_recorded_order(started_at_by_leg):
     FOUR legs' own RECORDED start timestamps ([`load_leg_started_at`]) are
     non-decreasing in [`LEG_ORDER`]'s declared `a1, b1, b2, a2` sequence.
 
-    Returns a list of violation strings (empty when the recorded order is
-    clean) — a leg with NO recorded timestamp is itself a violation (an
-    older producer, or a hand-crafted fixture, that cannot state this
-    premise at all).
+    `started_at_by_leg` is `{name: (value, unavailable_reason)}` —
+    [`load_leg_started_at`]'s own return shape. Returns a list of
+    `(kind, message)` tuples (empty when the recorded order is clean AND
+    every timestamp parsed): `kind` is `"order"` for a GENUINE order
+    violation (a real signal the A,B,B,A premise was not observed — round-3
+    adversarial audit B3's own `"differs:"`-shaped precedent: this is a
+    real divergence, never neutral) or `"unavailable"` for a missing/
+    unparseable timestamp (round-3 adversarial audit B3: this is an
+    environment/producer-version gap, NOT itself proof the order was
+    violated, so [`build_report`] must never fold it into the SAME
+    PR-blame bucket a genuine `"order"` violation earns).
     """
-    violations = []
+    findings = []
     prev_name, prev_ts = None, None
     for name in LEG_ORDER:
-        ts = started_at_by_leg.get(name)
-        if ts is None:
-            violations.append(f"leg {name!r} has no recorded start timestamp -- cannot verify run order")
+        ts, unavailable_reason = started_at_by_leg.get(name, (None, "missing"))
+        if unavailable_reason is not None:
+            findings.append(("unavailable", f"leg {name!r}: {unavailable_reason} -- cannot verify run order"))
             continue
         if prev_ts is not None and ts < prev_ts:
-            violations.append(
+            findings.append((
+                "order",
                 f"recorded run-order violation: {name!r} started at {ts} BEFORE {prev_name!r} started at "
-                f"{prev_ts} -- the required A,B,B,A order (a1,b1,b2,a2) was not observed"
-            )
+                f"{prev_ts} -- the required A,B,B,A order (a1,b1,b2,a2) was not observed",
+            ))
         prev_name, prev_ts = name, ts
-    return violations
+    return findings
 
 
 def gpu_inference_tier(report):
@@ -423,6 +467,7 @@ def build_report(raw_dir, a_sha=None, b_sha=None):
     legs_raw = {name: load_leg(raw_dir, name) for name in LEG_ORDER}
     ok_legs = {name: entry for name, entry in legs_raw.items() if entry["outcome"] == "OK"}
     started_at_by_leg = {name: load_leg_started_at(raw_dir, name) for name in LEG_ORDER}
+    mode = load_mode(raw_dir)
 
     legs_out = {name: {"outcome": entry["outcome"]} for name, entry in legs_raw.items()}
     tiers = {}
@@ -456,48 +501,85 @@ def build_report(raw_dir, a_sha=None, b_sha=None):
         "identity_fields": list(GPU_INFERENCE_IDENTITY_FIELDS),
         "leg_order": list(LEG_ORDER),
         "legs": legs_out,
-        # round-2 adversarial audit F3: the RAW recorded evidence the order
-        # binding is checked against, folded into the merged JSON
-        # regardless of outcome -- an auditor reading a committed report
-        # can see the actual timestamps, not just this module's own verdict
-        # about them.
-        "recorded_order": {name: started_at_by_leg.get(name) for name in LEG_ORDER},
+        # round-2 adversarial audit F3 (round-3 adversarial audit B3 schema
+        # fix): the RAW recorded evidence the order binding is checked
+        # against, folded into the merged JSON regardless of outcome -- an
+        # auditor reading a committed report can see the actual
+        # timestamps AND, honestly, why one was unavailable when it was,
+        # not just this module's own verdict about them.
+        "mode": mode,
+        "recorded_order": {
+            name: {"value": value, "unavailable_reason": reason}
+            for name, (value, reason) in started_at_by_leg.items()
+        },
     }
 
     missing = [name for name in LEG_ORDER if name not in ok_legs]
     if missing:
-        # round-2 adversarial audit F5: a PR-side (`b`-role) leg that ran
-        # but did not produce an OK report is a STRONGER signal than a
-        # non-compiling one (the binary built fine; something in the
-        # MEASURED serve itself crashed/errored) -- the PR's own problem, a
-        # real correctness-of-measurement refusal (1), never the neutral
-        # "nothing to compare" bucket a PARENT-side (`a`-role) runtime
-        # failure still falls into (75, the SAME bucket a parent BUILD
-        # failure already occupies -- see gpu_inference_ab.sh's own exit
-        # table). A single b-role failure dominates even alongside an
-        # ALSO-missing a-role leg, the same "a stronger signal wins"
-        # precedent B3's identity-violation classification already sets.
-        missing_b = [name for name in missing if ROLE_OF_LEG[name] == "b"]
-        if missing_b:
+        # round-3 adversarial audit B2 (correcting round-2's own F5, which
+        # collapsed EVERY b-role absence -- MISSING, DRY_RUN, or a genuine
+        # FAIL -- into the SAME "PR's own problem" bucket regardless of
+        # whether the PR binary ever even ran, and regardless of whether a
+        # PR exists at all under --aa-null): a b-role leg only carries a
+        # real "the PR's own problem" SIGNAL when (a) it actually RAN and
+        # errored (outcome FAIL, never MISSING/DRY_RUN -- "nothing ran" is
+        # not a runtime signal about the PR binary at all) and (b) this run
+        # is CONFIRMED `ab` mode (under --aa-null, b-role legs are ALSO
+        # parent-sha clones -- no PR exists to blame, matching the
+        # PRODUCER's own build-failure routing, which already treats an
+        # --aa-null b-role BUILD failure the same as a parent's). An
+        # unknown `mode` (an older producer) never escalates to INVALID --
+        # this module cannot confirm the ab-mode precondition, so it stays
+        # in the neutral bucket.
+        failed_b_in_ab_mode = [
+            name
+            for name in missing
+            if ROLE_OF_LEG[name] == "b" and legs_raw[name]["outcome"] == "FAIL" and mode == "ab"
+        ]
+        if failed_b_in_ab_mode:
             base["status"] = "INVALID"
             base["leg_premise_violations"] = []
             base["missing_legs"] = missing
             base["invalid_reason"] = (
-                f"PR-side leg(s) {missing_b} did not produce an OK report -- a runtime failure on an "
-                f"already-built PR binary is a stronger signal than a non-compiling one; a real "
-                f"correctness-of-measurement refusal, never neutral"
+                f"PR-side leg(s) {failed_b_in_ab_mode} RAN but did not produce an OK report (mode=ab, "
+                f"confirmed a real PR exists) -- a runtime failure on an already-built PR binary is a "
+                f"stronger signal than a non-compiling one; a real correctness-of-measurement refusal, "
+                f"never neutral"
             )
             return base, 1
         base["status"] = "INCOMPLETE"
         base["leg_premise_violations"] = []
         base["missing_legs"] = missing
+        base["incomplete_reason"] = (
+            f"leg(s) {missing} did not produce an OK report -- nothing ran for at least one leg "
+            f"(a MISSING/DRY_RUN outcome), or the leg that failed is parent-side or this run has no "
+            f"confirmed PR to blame (mode={mode!r}); neutral, never a proven runtime signal about a PR"
+        )
         return base, 75
 
-    order_violations = verify_recorded_order(started_at_by_leg)
-    if order_violations:
-        base["status"] = "INVALID"
-        base["leg_premise_violations"] = order_violations
-        return base, 1
+    order_findings = verify_recorded_order(started_at_by_leg)
+    if order_findings:
+        # round-3 adversarial audit B3: a GENUINE order violation ("order")
+        # is a real signal and wins outright (the SAME "a stronger signal
+        # dominates" precedent the identity-violation classification below
+        # already sets) -- but an "unavailable" (missing/unparseable)
+        # timestamp is an environment/producer-version gap, NEVER itself
+        # proof the order was violated, so it must land in the SAME neutral
+        # bucket a "nothing to compare" leg does, not the PR-blame one.
+        order_violations = [msg for kind, msg in order_findings if kind == "order"]
+        if order_violations:
+            base["status"] = "INVALID"
+            base["leg_premise_violations"] = order_violations
+            return base, 1
+        unavailable = [msg for kind, msg in order_findings if kind == "unavailable"]
+        base["status"] = "INCOMPLETE_ORDER"
+        base["leg_premise_violations"] = unavailable
+        base["incomplete_order_reason"] = (
+            "one or more legs' recorded start timestamps could not be read (missing file or "
+            "unparseable content, e.g. a non-GNU `date` binary) -- cannot verify the A,B,B,A order "
+            "was observed, but this is not itself proof it was not; neutral, never blamed on the PR"
+        )
+        return base, 75
 
     violations = identity_violations_across_legs(identity_by_leg)
     if violations:
@@ -595,7 +677,8 @@ def render_table(merged):
             f"observability only, never a gate verdict)"
         )
     elif merged["status"] == "INVALID":
-        # round-2 adversarial audit F5: the b-role-missing-leg and
+        # round-2 adversarial audit F5 (round-3 adversarial audit B2/B3
+        # refinement): the b-role-FAIL-in-confirmed-ab-mode and genuine
         # order-violation refusals both fold their evidence into this SAME
         # status; `invalid_reason` (the b-role case) is a single-string
         # summary, `leg_premise_violations` (the identity-mismatch and
@@ -610,10 +693,17 @@ def render_table(merged):
             for v in merged["leg_premise_violations"]:
                 lines.append(f"  - {v}")
     elif merged["status"] == "INCOMPLETE":
-        lines.append(f"missing_legs={merged['missing_legs']}")
+        lines.append(f"missing_legs={merged['missing_legs']} mode={merged.get('mode')!r}")
+        if merged.get("incomplete_reason"):
+            lines.append(f"reason={merged['incomplete_reason']}")
     elif merged["status"] == "INCOMPLETE_IDENTITY":
         lines.append(f"reason={merged['incomplete_identity_reason']}")
         lines.append("leg_premise_violations (all missing-field, no genuine value divergence):")
+        for v in merged["leg_premise_violations"]:
+            lines.append(f"  - {v}")
+    elif merged["status"] == "INCOMPLETE_ORDER":
+        lines.append(f"reason={merged['incomplete_order_reason']}")
+        lines.append("leg_premise_violations (timestamp unavailable, not a proven order violation):")
         for v in merged["leg_premise_violations"]:
             lines.append(f"  - {v}")
     elif merged["status"] == "INVALID_MEASUREMENT":

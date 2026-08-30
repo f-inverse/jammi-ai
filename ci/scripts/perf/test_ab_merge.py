@@ -287,6 +287,29 @@ def write_ok_config(raw_dir, slug, dispatches, jammi_overrides=None, torch_overr
     write_leg(raw_dir, slug, "torch-sdpa", report=torch_fs(**(torch_overrides or {})))
 
 
+def write_two_run_marker(raw_dir):
+    """`finetune_ab.sh`'s own `TWO_RUN_PROTOCOL_MARKER` file — see
+    `ab_merge.TWO_RUN_PROTOCOL_MARKER`'s own doc. Written the SAME way the
+    real script does (`touch`, empty file, presence-only signal).
+    """
+    open(os.path.join(raw_dir, ab_merge.TWO_RUN_PROTOCOL_MARKER), "w").close()
+
+
+def write_second_run(raw_dir, slug, jammi_tps=750.0, torch_tps=700.0, jammi_overrides=None, torch_overrides=None):
+    """The A,B,B,A protocol's SECOND run of the bar pair
+    (`jammi-fused-2`/`torch-sdpa-2`) — `_CLEAN_YES_DISPATCHES`-shaped by
+    default so `metrics()`'s own `dispatch_pairs()` call on the second
+    jammi-fused leg never raises unless a caller deliberately overrides
+    the dispatch counters.
+    """
+    jammi_overrides = dict(jammi_overrides or {})
+    jammi_overrides.setdefault("triplets_per_s", {"value": jammi_tps, "unit": "triplets/s"})
+    torch_overrides = dict(torch_overrides or {})
+    torch_overrides.setdefault("triplets_per_s", {"value": torch_tps, "unit": "triplets/s"})
+    write_leg(raw_dir, slug, "jammi-fused-2", report=jammi_fs(_CLEAN_YES_DISPATCHES, **jammi_overrides))
+    write_leg(raw_dir, slug, "torch-sdpa-2", report=torch_fs(**torch_overrides))
+
+
 class FusedProofFixtureTests(unittest.TestCase):
     """Drives `ab_merge.main` (the real `finetune_ab.sh` entry point)
     against a fixture RAW_DIR, then reads back `jammi_fused_dispatch_proof`
@@ -5627,6 +5650,655 @@ class FinetuneAbVerdictInvalidPrefixNamedConstantTests(unittest.TestCase):
             merged["configs"]["b8-s128-d0"]["verdict"].startswith(ab_merge.FINETUNE_AB_VERDICT_INVALID_PREFIX)
         )
         self.assertEqual(rc, 1, "main()'s own exit-code gate must agree with the same named prefix")
+
+
+class OrderBalancedBarLegsTests(unittest.TestCase):
+    """finetune_ab.sh's own A,B,B,A order-balanced bar-leg protocol
+    (`jammi-fused`/`torch-sdpa` run twice per config) — drives
+    `ab_merge.main` (the real entry point) against fixture `raw_dir`s that
+    additionally carry `jammi-fused-2`/`torch-sdpa-2` legs
+    (`ab_merge.BAR_SECOND_RUN_LEGS`). A config using `write_ok_config`
+    ALONE (no `-2` legs at all — every OTHER test class in this file) is
+    the regression guard for backward compatibility: `bar_ratio ==
+    ratio_jammi_fused_over_torch_sdpa` and `bar_ratio_indeterminate is
+    False` whenever the second run never ran, which is exactly what the
+    244 pre-existing fixtures in this file already assert implicitly by
+    continuing to pass unchanged.
+    """
+
+    def run_merge(self, raw_dir):
+        out_dir = tempfile.mkdtemp()
+        rc = ab_merge.main([raw_dir, out_dir, "20", "5", "0.9"])
+        with open(os.path.join(out_dir, "finetune_ab_report.json")) as fh:
+            merged = json.load(fh)
+        with open(os.path.join(out_dir, "finetune_ab_table.txt")) as fh:
+            table = fh.read()
+        return rc, merged, table
+
+    def write_second_run(self, raw_dir, slug, jammi_tps, torch_tps):
+        """Writes the A,B,B,A protocol's SECOND run of the bar pair
+        (`jammi-fused-2`/`torch-sdpa-2`) — `_CLEAN_YES_DISPATCHES`-shaped
+        so `metrics()`'s own `dispatch_pairs()` call on the second
+        jammi-fused leg never raises (this class is not exercising
+        `fused_proof`, which stays keyed to the FIRST run only).
+        """
+        write_leg(
+            raw_dir,
+            slug,
+            "jammi-fused-2",
+            report=jammi_fs(_CLEAN_YES_DISPATCHES, triplets_per_s={"value": jammi_tps, "unit": "triplets/s"}),
+        )
+        write_leg(
+            raw_dir,
+            slug,
+            "torch-sdpa-2",
+            report=torch_fs(triplets_per_s={"value": torch_tps, "unit": "triplets/s"}),
+        )
+
+    def test_no_second_run_legs_falls_back_to_the_single_pair_ratio_unchanged(self):
+        """Backward compatibility: an older `raw_dir` (this file's own
+        244 pre-existing fixtures) carries no `-2` legs at all — `bar_ratio`
+        must equal the ORIGINAL single-pair `ratio_jammi_fused_over_torch_sdpa`
+        exactly, `bar_ratio_indeterminate` must be `False`, and `pair2_ratio`
+        must be `None`.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES)
+            rc, merged, table = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertIsNone(cfg["bar_pair_ratios"]["pair2_jammi_fused_2_over_torch_sdpa_2"])
+        self.assertFalse(cfg["bar_ratio_indeterminate"])
+        self.assertEqual(
+            cfg["bar_ratio_min_of_two_least_favourable_to_jammi"],
+            cfg["ratio_jammi_fused_over_torch_sdpa"],
+        )
+        self.assertTrue(cfg["verdict"].startswith("PASS"), cfg["verdict"])
+        self.assertEqual(rc, 0)
+
+    def test_both_pairs_clear_the_bar_is_pass_using_the_min_of_the_two(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES)  # pair1: 800/727 ~= 1.100
+            self.write_second_run(raw_dir, "b8-s128-d0", jammi_tps=750.0, torch_tps=700.0)  # pair2 ~= 1.071
+            rc, merged, table = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        pair1 = cfg["bar_pair_ratios"]["pair1_jammi_fused_over_torch_sdpa"]
+        pair2 = cfg["bar_pair_ratios"]["pair2_jammi_fused_2_over_torch_sdpa_2"]
+        self.assertAlmostEqual(pair1, 800.0 / 727.0, places=6)
+        self.assertAlmostEqual(pair2, 750.0 / 700.0, places=6)
+        self.assertFalse(cfg["bar_ratio_indeterminate"])
+        self.assertAlmostEqual(cfg["bar_ratio_min_of_two_least_favourable_to_jammi"], min(pair1, pair2), places=6)
+        self.assertTrue(cfg["verdict"].startswith("PASS"), cfg["verdict"])
+        self.assertIn("PASS", table)
+        self.assertEqual(rc, 0)
+
+    def test_both_pairs_miss_the_bar_is_fail_using_the_min_of_the_two(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(
+                raw_dir,
+                "b8-s128-d0",
+                _CLEAN_YES_DISPATCHES,
+                jammi_overrides={"triplets_per_s": {"value": 600.0, "unit": "triplets/s"}},
+            )  # pair1: 600/727 ~= 0.825
+            self.write_second_run(raw_dir, "b8-s128-d0", jammi_tps=610.0, torch_tps=730.0)  # pair2 ~= 0.836
+            rc, merged, table = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertFalse(cfg["bar_ratio_indeterminate"])
+        self.assertLess(cfg["bar_ratio_min_of_two_least_favourable_to_jammi"], 0.9)
+        self.assertTrue(cfg["verdict"].startswith("FAIL"), cfg["verdict"])
+        self.assertIn("FAIL", table)
+        # record-don't-gate: an ordinary ratio-based FAIL never gates exit code.
+        self.assertEqual(rc, 0)
+
+    def test_straddling_pair_ratios_are_indeterminate_never_pass_or_fail(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(
+                raw_dir,
+                "b8-s128-d0",
+                _CLEAN_YES_DISPATCHES,
+                jammi_overrides={"triplets_per_s": {"value": 950.0, "unit": "triplets/s"}},
+                torch_overrides={"triplets_per_s": {"value": 1000.0, "unit": "triplets/s"}},
+            )  # pair1 = 0.95 (>= 0.9)
+            self.write_second_run(raw_dir, "b8-s128-d0", jammi_tps=800.0, torch_tps=1000.0)  # pair2 = 0.80 (< 0.9)
+            rc, merged, table = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertTrue(cfg["bar_ratio_indeterminate"])
+        self.assertEqual(cfg["verdict"][: len(ab_merge.FINETUNE_AB_VERDICT_INDETERMINATE)], "INDETERMINATE")
+        self.assertFalse(cfg["verdict"].startswith("PASS"))
+        self.assertFalse(str(cfg["verdict"]).startswith("FAIL"))
+        self.assertFalse(str(cfg["verdict"]).startswith("INVALID"))
+        self.assertIn("INDETERMINATE", table)
+        self.assertIn("pair1(jammi-fused/torch-sdpa)=0.950", cfg["verdict"])
+        self.assertIn("pair2(jammi-fused-2/torch-sdpa-2)=0.800", cfg["verdict"])
+        # record-don't-gate: INDETERMINATE never gates exit code either.
+        self.assertEqual(rc, 0)
+
+    def test_wide_spread_same_side_of_the_bar_is_also_indeterminate(self):
+        """Both pair ratios clear 0.9 (no straddle) but disagree by far more
+        than the combined estimate's own distance from the bar -- still
+        INDETERMINATE, never a confident PASS.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(
+                raw_dir,
+                "b8-s128-d0",
+                _CLEAN_YES_DISPATCHES,
+                jammi_overrides={"triplets_per_s": {"value": 950.0, "unit": "triplets/s"}},
+                torch_overrides={"triplets_per_s": {"value": 1000.0, "unit": "triplets/s"}},
+            )  # pair1 = 0.95
+            self.write_second_run(raw_dir, "b8-s128-d0", jammi_tps=2000.0, torch_tps=1000.0)  # pair2 = 2.0
+            rc, merged, table = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        pair1 = cfg["bar_pair_ratios"]["pair1_jammi_fused_over_torch_sdpa"]
+        pair2 = cfg["bar_pair_ratios"]["pair2_jammi_fused_2_over_torch_sdpa_2"]
+        # No straddle: both ratios are >= 0.9.
+        self.assertGreaterEqual(pair1, 0.9)
+        self.assertGreaterEqual(pair2, 0.9)
+        self.assertTrue(cfg["bar_ratio_indeterminate"])
+        self.assertTrue(cfg["verdict"].startswith("INDETERMINATE"), cfg["verdict"])
+        self.assertEqual(rc, 0)
+
+    def test_fused_proof_failure_still_invalidates_even_with_a_clean_second_pair(self):
+        """The INVALID carve-out (fused_proof) still takes precedence over
+        INDETERMINATE/PASS/FAIL — checked on the FIRST run only, unchanged.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(raw_dir, "b8-s128-d0", {})  # all-(0,0) fused_proof -> False -> INVALID
+            self.write_second_run(raw_dir, "b8-s128-d0", jammi_tps=750.0, torch_tps=700.0)
+            rc, merged, table = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertTrue(cfg["verdict"].startswith(ab_merge.FINETUNE_AB_VERDICT_INVALID_PREFIX))
+        self.assertEqual(rc, 1)
+
+    def test_second_run_table_rows_appear_only_when_the_second_run_ran(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES)
+            rc, merged, table_no_second = self.run_merge(raw_dir)
+        self.assertNotIn("jammi-fused-2", table_no_second)
+        self.assertNotIn("torch-sdpa-2", table_no_second)
+
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES)
+            self.write_second_run(raw_dir, "b8-s128-d0", jammi_tps=750.0, torch_tps=700.0)
+            rc, merged, table_with_second = self.run_merge(raw_dir)
+        self.assertIn("jammi-fused-2", table_with_second)
+        self.assertIn("torch-sdpa-2", table_with_second)
+
+    def test_jammi_eager_row_surfaces_kernels_disabled_requested_and_fired(self):
+        """A: the negative control's own provenance surfaced on the
+        jammi-eager row of the printed table.
+        """
+        disable_keys = [
+            "layer_norm_fused",
+            "geglu_fused",
+            "attention_block_flash",
+            "attention_block_fused",
+            "rope_fused",
+            "softmax_last_dim_fused",
+            "lora_linear_fused",
+            "adamw_step_fused",
+        ]
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_leg(
+                raw_dir,
+                "b8-s128-d0",
+                "jammi-eager",
+                report=jammi_fs(
+                    {},
+                    attention_arm="eager",
+                    kernels_disabled_requested=list(disable_keys),
+                    kernels_disabled_fired=list(disable_keys),
+                ),
+            )
+            write_leg(raw_dir, "b8-s128-d0", "jammi-fused", report=jammi_fs(_CLEAN_YES_DISPATCHES))
+            write_leg(raw_dir, "b8-s128-d0", "torch-eager", report=torch_fs(attn_implementation="eager"))
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa", report=torch_fs())
+            rc, merged, table = self.run_merge(raw_dir)
+        self.assertIn("kernels_disabled_requested=", table)
+        self.assertIn("kernels_disabled_fired=", table)
+        for key in disable_keys:
+            self.assertIn(key, table)
+
+    def test_second_run_fused_leg_with_undeclared_flash_decline_invalidates_the_config(self):
+        """Identity-completeness: the bar ratio consumes BOTH pair legs, so
+        `jammi-fused-2` must clear `fused_proof` exactly like `jammi-fused`
+        does. An UNDECLARED (`kernels_disabled_requested`/`_fired` both
+        empty) `attention_block_flash_declined_dispatches > 0` on the
+        SECOND run alone must refuse the whole config -- before this fix
+        it silently fed `pair2_ratio`/the bar ratio with no proof check at
+        all.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES)  # first run: clean
+            write_leg(
+                raw_dir,
+                "b8-s128-d0",
+                "jammi-fused-2",
+                report=jammi_fs(_CLEAN_YES_DISPATCHES, **flash_overrides(fused=0, declined=5)),
+            )
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa-2", report=torch_fs())
+            rc, merged, table = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertFalse(cfg["jammi_fused_dispatch_proof_second_run"])
+        self.assertTrue(cfg["verdict"].startswith(ab_merge.FINETUNE_AB_VERDICT_INVALID_PREFIX), cfg["verdict"])
+        self.assertIn("second-run", cfg["verdict"])
+        self.assertIn("jammi-fused-2", cfg["verdict"])
+        self.assertIn("INVALID", table)
+        self.assertEqual(rc, 1)
+
+    def test_second_run_leg_premise_mismatch_invalidates_the_config(self):
+        """Identity-completeness: `jammi-fused-2`/`torch-sdpa-2` must run
+        under the SAME premise, exactly like `jammi-fused`/`torch-sdpa` —
+        a mismatched `batch` on the second run alone must refuse the whole
+        config, never silently feed a ratio computed off two different
+        configurations.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES)  # first run: clean, batch=8
+            write_leg(raw_dir, "b8-s128-d0", "jammi-fused-2", report=jammi_fs(_CLEAN_YES_DISPATCHES))  # batch=8
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa-2", report=torch_fs(batch=16))  # mismatched
+            rc, merged, table = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertTrue(cfg["leg_premise_violations_second_run"])
+        self.assertTrue(any("batch" in v for v in cfg["leg_premise_violations_second_run"]))
+        self.assertTrue(cfg["verdict"].startswith(ab_merge.FINETUNE_AB_VERDICT_INVALID_PREFIX), cfg["verdict"])
+        # F3 fold-in: a batch mismatch confined to ONE second-run leg is
+        # mathematically inseparable from ALSO tripping the F3 cross-run
+        # check on that same leg's own run-1/run-2 pair (a 4-cycle of
+        # equality constraints — jammi run1/run2, torch run1/run2,
+        # run1-same, run2-same — cannot have exactly one dirty edge), so
+        # whichever override runs LAST (`cross-run`, in this module's own
+        # ordering) determines the exact final string; both are checked
+        # via the STRUCTURED field above, and the verdict is asserted only
+        # to actually name a premise mismatch, not a specific one.
+        self.assertIn("premise mismatch", cfg["verdict"])
+        self.assertEqual(rc, 1)
+
+    def test_second_run_absent_never_triggers_the_second_run_carve_outs(self):
+        """Backward compatibility, restated for the NEW carve-outs
+        specifically: no `-2` legs at all -> both second-run checks read
+        `None` (not checked), never a spurious INVALID.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES)
+            rc, merged, table = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertIsNone(cfg["jammi_fused_dispatch_proof_second_run"])
+        self.assertIsNone(cfg["leg_premise_violations_second_run"])
+        self.assertTrue(cfg["verdict"].startswith("PASS"), cfg["verdict"])
+        self.assertEqual(rc, 0)
+
+
+class AdversarialAuditFoldInTests(unittest.TestCase):
+    """F1 (min-over-None crash), F2 (the two_run marker + mandatory legs),
+    F3 (cross-run premise) — the adversarial-audit BLOCK fold-in on the
+    A,B,B,A order-balanced bar-leg protocol.
+    """
+
+    def run_merge(self, raw_dir):
+        out_dir = tempfile.mkdtemp()
+        rc = ab_merge.main([raw_dir, out_dir, "20", "5", "0.9"])
+        with open(os.path.join(out_dir, "finetune_ab_report.json")) as fh:
+            merged = json.load(fh)
+        with open(os.path.join(out_dir, "finetune_ab_table.txt")) as fh:
+            table = fh.read()
+        return rc, merged, table
+
+    # ---- F1: bar_ratio_classification must never crash the merge -------
+
+    def test_first_run_torch_sdpa_oom_with_clean_second_run_never_crashes(self):
+        """The audit's own repro: `pair1_ratio` (torch-sdpa OOM'd on the
+        FIRST run) is `None`; `pair2_ratio` (a clean second run) is a real
+        float. An earlier `bar_ratio_classification` guarded only
+        `pair2_ratio is None` and crashed `min(None, float)` -- taking
+        down the ENTIRE merge, not just this one config's row. Proven
+        here against a raw_dir with a SECOND, healthy config too, so a
+        crash-turned-refusal (never a crash) is distinguished from "this
+        one bad config poisoned every other row".
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_leg(raw_dir, "b8-s128-oom", "jammi-eager", report=jammi_fs({}))
+            write_leg(raw_dir, "b8-s128-oom", "jammi-fused", report=jammi_fs(_CLEAN_YES_DISPATCHES))
+            write_leg(raw_dir, "b8-s128-oom", "torch-eager", report=torch_fs(attn_implementation="eager"))
+            write_leg(
+                raw_dir, "b8-s128-oom", "torch-sdpa",
+                exit_code=1, stderr="RuntimeError: CUDA error: out of memory",
+            )
+            write_second_run(raw_dir, "b8-s128-oom")  # clean second run
+
+            write_ok_config(raw_dir, "b8-s128-healthy", _CLEAN_YES_DISPATCHES)
+            write_second_run(raw_dir, "b8-s128-healthy")
+
+            rc, merged, table = self.run_merge(raw_dir)
+
+        oom_cfg = merged["configs"]["b8-s128-oom"]
+        self.assertEqual(oom_cfg["legs"]["torch-sdpa"]["outcome"], "OOM")
+        # Config-level refusal (a well-defined, non-crashing verdict),
+        # never a Python exception surfacing all the way to main().
+        self.assertIn("torch-sdpa itself did not fit", oom_cfg["verdict"])
+        self.assertFalse(oom_cfg["verdict"].startswith("PASS"))
+
+        # The OTHER config in the SAME raw_dir must be entirely unaffected
+        # by the crash this fix removes -- proving the bug (before this
+        # fix) was a WHOLE-MERGE crash, not merely a bad row.
+        healthy_cfg = merged["configs"]["b8-s128-healthy"]
+        self.assertTrue(healthy_cfg["verdict"].startswith("PASS"), healthy_cfg["verdict"])
+        self.assertEqual(rc, 0)
+
+    def test_bar_ratio_classification_never_raises_for_any_none_combination(self):
+        """Direct unit coverage of the fixed function itself, every
+        combination of `None`s explicitly."""
+        self.assertEqual(ab_merge.bar_ratio_classification(None, None, 0.9), (None, False, None))
+        self.assertEqual(ab_merge.bar_ratio_classification(None, 1.0, 0.9), (1.0, False, None))
+        self.assertEqual(ab_merge.bar_ratio_classification(1.0, None, 0.9), (1.0, False, None))
+        bar, indeterminate, detail = ab_merge.bar_ratio_classification(1.0, 1.0, 0.9)
+        self.assertEqual(bar, 1.0)
+        self.assertFalse(indeterminate)
+
+    # ---- F2: the two_run marker makes the header's promise real --------
+
+    def test_two_run_marker_present_missing_second_run_leg_is_invalid(self):
+        """The marker promises all four bar legs; a genuinely MISSING
+        second-run leg (never attempted at all, not merely OOM/FAIL) is
+        an INCOMPLETE sweep -- INVALID, with a named reason -- never
+        silently degraded to the single-pair estimator the way an absent
+        MARKER still legitimately is.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_two_run_marker(raw_dir)
+            write_ok_config(raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES)
+            # No write_second_run() call at all -- both -2 legs MISSING.
+            rc, merged, table = self.run_merge(raw_dir)
+        self.assertTrue(merged["two_run_protocol"])
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertIsNotNone(cfg["two_run_missing_leg_reason"])
+        self.assertIn("MISSING", cfg["two_run_missing_leg_reason"])
+        self.assertTrue(cfg["verdict"].startswith(ab_merge.FINETUNE_AB_VERDICT_INVALID_PREFIX), cfg["verdict"])
+        self.assertEqual(rc, 1)
+
+    def test_two_run_marker_present_second_run_jammi_fused_oom_never_silently_passes(self):
+        """The audit's exact repro: `jammi-fused-2` OOM's (a REAL,
+        attempted measurement outcome, not MISSING) under the two_run
+        marker -- must FAIL (OOM where torch fits), never silently
+        degrade to the single-pair PASS the first run's own clean ratio
+        would otherwise have produced.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_two_run_marker(raw_dir)
+            write_ok_config(raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES)  # run1: clean, would PASS alone
+            write_leg(
+                raw_dir, "b8-s128-d0", "jammi-fused-2",
+                exit_code=1, stderr="RuntimeError: CUDA error: out of memory",
+            )
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa-2", report=torch_fs())
+            rc, merged, table = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertEqual(cfg["bar_second_run_legs"]["jammi-fused-2"]["outcome"], "OOM")
+        self.assertFalse(cfg["verdict"].startswith("PASS"), cfg["verdict"])
+        self.assertIn("FAIL", cfg["verdict"])
+        self.assertIn("jammi-fused-2", cfg["verdict"])
+        self.assertIn("OOM", cfg["verdict"])
+        # record-don't-gate: an ordinary OOM'd-where-torch-fits FAIL never
+        # gates exit code, same as the primary-run carve-out already does.
+        self.assertEqual(rc, 0)
+
+    def test_legacy_raw_dir_without_the_marker_regresses_to_single_run_mode(self):
+        """No marker at all (a genuinely legacy `raw_dir`, or a hand-built
+        fixture) -- `two_run_protocol` reads `False`, and a MISSING
+        second run degrades to the ORIGINAL single-pair estimator exactly
+        as before this fold-in, never an INVALID.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES)
+            rc, merged, table = self.run_merge(raw_dir)
+        self.assertFalse(merged["two_run_protocol"])
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertIsNone(cfg["two_run_missing_leg_reason"])
+        self.assertTrue(cfg["verdict"].startswith("PASS"), cfg["verdict"])
+        self.assertEqual(rc, 0)
+
+    # ---- F3: cross-RUN premise (jammi-fused vs jammi-fused-2, etc.) ----
+
+    def test_cross_run_seed_and_seq_mismatch_invalidates_the_config(self):
+        """The audit's own repro shape: run 1 at seed=42/seq=128 (the
+        fixtures' own defaults), run 2 at seed=7/seq=1024 -- internally
+        CONSISTENT on each side (so neither SAME-run premise check fires
+        at all), but the seed/seq drifted ACROSS the two runs, which only
+        the F3 cross-run check catches.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES)  # run1: seed=42, seq=128
+            write_leg(
+                raw_dir, "b8-s128-d0", "jammi-fused-2",
+                report=jammi_fs(_CLEAN_YES_DISPATCHES, seed=7, seq=1024),
+            )
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa-2", report=torch_fs(seed=7, seq=1024))
+            rc, merged, table = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        # Neither same-run check fires -- both are CHECKED and CLEAN
+        # (an empty list, not None -- None would mean "not checked", the
+        # SAME sentinel-vs-empty-list distinction `leg_premise_violations`
+        # itself documents), isolating the cross-run signal.
+        self.assertEqual(cfg["leg_premise_violations"], [])
+        self.assertEqual(cfg["leg_premise_violations_second_run"], [])
+        self.assertTrue(cfg["leg_premise_violations_cross_run"])
+        self.assertTrue(any("seed" in v for v in cfg["leg_premise_violations_cross_run"]))
+        self.assertTrue(any("seq" in v for v in cfg["leg_premise_violations_cross_run"]))
+        self.assertTrue(cfg["verdict"].startswith(ab_merge.FINETUNE_AB_VERDICT_INVALID_PREFIX), cfg["verdict"])
+        self.assertIn("cross-run leg premise mismatch", cfg["verdict"])
+        self.assertEqual(rc, 1)
+
+    def test_cross_run_premise_absent_when_second_run_absent(self):
+        """Backward compatibility: no second run at all -> the cross-run
+        check has nothing to compare, `None`, never a spurious INVALID.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES)
+            rc, merged, table = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertIsNone(cfg["leg_premise_violations_cross_run"])
+        self.assertTrue(cfg["verdict"].startswith("PASS"), cfg["verdict"])
+        self.assertEqual(rc, 0)
+
+    # ---- Advisory: {leg:<14} column separator ---------------------------
+
+    def test_second_run_row_has_a_separator_after_the_leg_name(self):
+        """`jammi-fused-2`/`torch-sdpa-2` (13/12 characters) must never
+        run directly into the `outcome` column with zero separating
+        whitespace.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES)
+            write_second_run(raw_dir, "b8-s128-d0")
+            rc, merged, table = self.run_merge(raw_dir)
+        for line in table.splitlines():
+            if line.startswith("b8-s128-d0") and ("jammi-fused-2" in line or "torch-sdpa-2" in line):
+                # The leg name must be followed by at least one space
+                # before the outcome column starts.
+                self.assertRegex(
+                    line, r"(jammi-fused-2|torch-sdpa-2)\s+(OK|FAIL|OOM|MISSING|DRY_RUN)",
+                    f"no separator after the leg name in row: {line!r}",
+                )
+
+
+class Round2AuditFoldInTests(unittest.TestCase):
+    """B1 (round-2 adversarial audit — "silent single-pair PASS under the
+    marker"): under `two_run_mode`, an `OK`-outcome leg whose own report
+    still carries a falsy/missing `triplets_per_s` must refuse the WHOLE
+    config, never silently hand the verdict back to the OTHER (still
+    valid) pair. The audit's own two probes, verbatim.
+    """
+
+    def run_merge(self, raw_dir):
+        out_dir = tempfile.mkdtemp()
+        rc = ab_merge.main([raw_dir, out_dir, "20", "5", "0.9"])
+        with open(os.path.join(out_dir, "finetune_ab_report.json")) as fh:
+            merged = json.load(fh)
+        with open(os.path.join(out_dir, "finetune_ab_table.txt")) as fh:
+            table = fh.read()
+        return rc, merged, table
+
+    def test_marker_present_zero_tps_on_first_run_torch_sdpa_refuses(self):
+        """`torch-sdpa` (first run) reads `OK` but `triplets_per_s ==
+        0.0` -- `ratio` (pair 1) is `None`; `pair2_ratio` (a clean second
+        run) is a real float. Before this fix, `bar_ratio_classification`
+        gracefully handed back `pair2_ratio` as `bar_ratio`, and the
+        config silently PASSED off exactly one of the two pairs the
+        marker promised both of.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_two_run_marker(raw_dir)
+            write_ok_config(
+                raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES,
+                torch_overrides={"triplets_per_s": {"value": 0.0, "unit": "triplets/s"}},
+            )
+            write_second_run(raw_dir, "b8-s128-d0")  # clean second run
+            rc, merged, table = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertIsNone(cfg["ratio_jammi_fused_over_torch_sdpa"])
+        self.assertIsNotNone(cfg["bar_pair_ratios"]["pair2_jammi_fused_2_over_torch_sdpa_2"])
+        self.assertFalse(cfg["verdict"].startswith("PASS"), cfg["verdict"])
+        self.assertIn("no ratio: triplets_per_s missing on an OK leg", cfg["verdict"])
+        self.assertIn("no ratio: triplets_per_s missing on an OK leg", table)
+        self.assertEqual(rc, 0)  # record-don't-gate: this FAIL never gates exit code.
+
+    def test_marker_present_zero_tps_on_second_run_torch_sdpa_2_refuses(self):
+        """The MIRROR probe: `torch-sdpa` (first run) is clean, but
+        `torch-sdpa-2` (second run) reads `OK` with `triplets_per_s ==
+        0.0` -- `pair2_ratio` is `None`, `ratio` (pair 1) is a real float.
+        Before this fix, `bar_ratio_classification` handed back `ratio`
+        as `bar_ratio` and the config silently PASSED off pair 1 alone.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_two_run_marker(raw_dir)
+            write_ok_config(raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES)  # clean first run
+            write_second_run(
+                raw_dir, "b8-s128-d0",
+                torch_overrides={"triplets_per_s": {"value": 0.0, "unit": "triplets/s"}},
+            )
+            rc, merged, table = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertIsNotNone(cfg["ratio_jammi_fused_over_torch_sdpa"])
+        self.assertIsNone(cfg["bar_pair_ratios"]["pair2_jammi_fused_2_over_torch_sdpa_2"])
+        self.assertFalse(cfg["verdict"].startswith("PASS"), cfg["verdict"])
+        self.assertIn("no ratio: triplets_per_s missing on an OK leg", cfg["verdict"])
+        self.assertEqual(rc, 0)
+
+    def test_legacy_no_marker_mode_keeps_the_single_pair_fallback_unchanged(self):
+        """Backward compatibility, restated for B1 specifically: WITHOUT
+        the marker, a zero-tps first-run torch-sdpa with no second run at
+        all keeps the ORIGINAL single-pair "no ratio" classification --
+        this fix widens the condition only for `two_run_mode`, never the
+        legacy path.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(
+                raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES,
+                torch_overrides={"triplets_per_s": {"value": 0.0, "unit": "triplets/s"}},
+            )
+            rc, merged, table = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertFalse(merged["two_run_protocol"])
+        self.assertIn("no ratio: triplets_per_s missing on an OK leg", cfg["verdict"])
+        self.assertEqual(rc, 0)
+
+    def test_marker_present_both_pairs_clean_still_passes(self):
+        """Positive control: the widened condition must not false-positive
+        when both pairs genuinely produced a usable ratio.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_two_run_marker(raw_dir)
+            write_ok_config(raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES)
+            write_second_run(raw_dir, "b8-s128-d0")
+            rc, merged, table = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertTrue(cfg["verdict"].startswith("PASS"), cfg["verdict"])
+        self.assertEqual(rc, 0)
+
+
+class CrossRunPremiseTriStateTests(unittest.TestCase):
+    """Adversarial audit fix: `leg_premise_violations_cross_run` (F3) must
+    be able to state a POSITIVE "checked and clean" fact (`[]`), never
+    collapse "checked, clean" and "never checked" onto the SAME `None`
+    value the way an earlier version of `cross_run_premise_violations_list`
+    did (reproduced live against `ci/artifacts/finetune-ab-runs/
+    2026-08-30-full-sweep-acce7b3d-a100-pcie/finetune_ab_report.json`,
+    which reads `null` there on every config despite every relevant leg
+    being `OK` throughout that run -- that artifact predates this fix, see
+    its own README).
+    """
+
+    def run_merge(self, raw_dir):
+        out_dir = tempfile.mkdtemp()
+        rc = ab_merge.main([raw_dir, out_dir, "20", "5", "0.9"])
+        with open(os.path.join(out_dir, "finetune_ab_report.json")) as fh:
+            merged = json.load(fh)
+        return rc, merged
+
+    def test_all_ok_two_run_config_reads_checked_clean_not_none(self):
+        """Every bar leg OK, both runs, no drift -- the cross-run check
+        RAN (both sub-comparisons had two OK legs to compare) and found
+        nothing, so the field must read `[]` (checked, clean), never
+        `None` (which would mean "never checked" -- FALSE here).
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES)
+            write_second_run(raw_dir, "b8-s128-d0")
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertEqual(cfg["leg_premise_violations_cross_run"], [])
+        self.assertIsNotNone(cfg["leg_premise_violations_cross_run"])
+        self.assertTrue(cfg["verdict"].startswith("PASS"), cfg["verdict"])
+        self.assertEqual(rc, 0)
+
+    def test_legacy_single_run_config_still_reads_none(self):
+        """No second run at all -- neither sub-comparison ever had two OK
+        legs to compare, so the field must stay `None` (genuinely
+        unchecked), never collapse to `[]` just because nothing went
+        wrong elsewhere.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES)
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertIsNone(cfg["leg_premise_violations_cross_run"])
+        self.assertTrue(cfg["verdict"].startswith("PASS"), cfg["verdict"])
+        self.assertEqual(rc, 0)
+
+    def test_one_side_checked_clean_other_side_unavailable_still_reads_checked(self):
+        """Only the jammi-vs-jammi-2 sub-comparison has two OK legs (e.g.
+        torch-sdpa-2 OOM'd) -- the field must still flip to `[]` (checked
+        via that ONE sub-comparison), not stay `None` just because the
+        OTHER sub-comparison never ran.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES)
+            write_leg(raw_dir, "b8-s128-d0", "jammi-fused-2", report=jammi_fs(_CLEAN_YES_DISPATCHES))
+            write_leg(
+                raw_dir, "b8-s128-d0", "torch-sdpa-2",
+                exit_code=1, stderr="RuntimeError: CUDA error: out of memory",
+            )
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertEqual(cfg["leg_premise_violations_cross_run"], [])
+
+    def test_a_real_cross_run_violation_still_reports_the_drift(self):
+        """Non-vacuity: the tri-state fix must not have accidentally
+        weakened the VIOLATION-reporting arm -- a genuine cross-run drift
+        still populates the list with the actual violation.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES)  # run1: seed=42, seq=128
+            write_leg(
+                raw_dir, "b8-s128-d0", "jammi-fused-2",
+                report=jammi_fs(_CLEAN_YES_DISPATCHES, seed=7, seq=1024),
+            )
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa-2", report=torch_fs(seed=7, seq=1024))
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertTrue(cfg["leg_premise_violations_cross_run"])
+        self.assertTrue(any("seed" in v for v in cfg["leg_premise_violations_cross_run"]))
+        self.assertTrue(cfg["verdict"].startswith(ab_merge.FINETUNE_AB_VERDICT_INVALID_PREFIX), cfg["verdict"])
+        self.assertEqual(rc, 1)
 
 
 if __name__ == "__main__":

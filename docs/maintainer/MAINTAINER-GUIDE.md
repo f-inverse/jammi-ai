@@ -2071,20 +2071,40 @@ disclosed choice against a named upstream reference, not this crate's own
 **How to run the A/B.**
 `ci/scripts/gpu-dev.sh run <session> bash ci/scripts/perf/finetune_ab.sh`
 (or directly over ssh once the checkout is on the pod) —
-never a CI job (no GPU on the CI image, and the script switches git refs in
-place). It sweeps `{b8 s128, b8 s512, b16 s128} x {dropout 0, dropout 0.05}`
-across jammi-eager / jammi-fused (`JAMMI_KERNELS_STRICT=1`) / torch-eager /
-torch-sdpa legs, emitting one table (s/step, triplets/s, peak VRAM, the fused
-dispatch counters, the ratio vs torch-sdpa, PASS/FAIL against the throughput
-bar) — see the script's own header for the full env-var surface
-(`MODEL_DIR`, `AB_STEPS`/`AB_WARMUP`, `AB_DRY_RUN`, …). **The stale-build
-guard:** every git-ref switch inside the script is followed by `cargo clean -p
-jammi-kernels --release` *then* a full release rebuild
-(`checkout_and_build()`) — `jammi-kernels`' own build artifacts are the one
-thing that can silently persist across a `git checkout` (a stale `.rlib` built
-from the *previous* ref would make an A/B compare a cached binary against
-itself, not eager against fused), so the clean is unconditional, not an
-optimization to skip on a trusted CI runner. **`JAMMI_REQUIRE_CUDA`** governs
+never a CI job (no GPU on the CI image). It sweeps `{b8 s128, b8 s512, b16
+s128} x {dropout 0, dropout 0.05}` across jammi-eager / jammi-fused
+(`JAMMI_KERNELS_STRICT=1`) / torch-eager / torch-sdpa legs, emitting one
+table (s/step, triplets/s, peak VRAM, the fused dispatch counters, the ratio
+vs torch-sdpa, PASS/FAIL/INDETERMINATE against the throughput bar) — see the
+script's own header for the full env-var surface (`MODEL_DIR`,
+`AB_STEPS`/`AB_WARMUP`, `AB_DRY_RUN`, …). **One binary, no ref-switching:**
+every leg — jammi-eager INCLUDED — runs off the SAME tip binary, built ONCE
+at the start (`build_binary()`, `--features cuda,jammi-encoders/flash-attn`).
+jammi-eager is the tip binary with every fused op forced eager via
+`JAMMI_KERNELS_DISABLE=$JAMMI_EAGER_DISABLE_OP_KEYS` (NINE op keys — F4
+adversarial-audit fold-in added `mem_efficient_attention`, a live per-layer
+`admit_cascade`/once-per-forward `op_disabled` site
+`ci/scripts/perf/test_finetune_ab_disable_op_keys.py` sweeps for
+mechanically against the real call graph, catching a tenth addition the
+same way) under `JAMMI_KERNELS_STRICT=1` (disable wins over Strict) plus
+`--expect-kernels-disabled` as a negative control — never "the pre-fusion
+commit", and never a second build. Both `jammi-fused` legs ALSO pass
+`--expect-kernels-disabled ""` (F5) — an empty expectation, hard-failing on
+any ambient `JAMMI_KERNELS_DISABLE` leaking into the process. **Order-balanced
+bar legs:** the two legs the #352 throughput bar gates on (jammi-fused,
+torch-sdpa) each run TWICE per config in a fixed A,B,B,A interleaving
+(mirrors `gpu_inference_ab.sh`'s own documented drift rationale), gated by a
+`TWO_RUN_PROTOCOL_MARKER` file the script writes before any leg runs (F2) —
+when present, `ab_merge.py` requires all four bar legs and refuses
+(`INVALID`) a genuinely MISSING one, rather than silently degrading to the
+single-pair estimator an absent marker (a legacy `raw_dir`) still does.
+`ab_merge.py` computes the MIN of the two resulting pair ratios (the
+estimator least favourable to jammi) as the bar ratio, reports
+`INDETERMINATE` — never PASS/FAIL — when the two pair ratios disagree too
+much relative to the 0.9 bar, and separately cross-checks `jammi-fused` vs
+`jammi-fused-2` (and the torch-sdpa pair) for premise drift ACROSS the two
+runs (F3), independent of the same-run premise checks each pair already
+gets. **`JAMMI_REQUIRE_CUDA`** governs
 the separate `cuda_parity` suite (`crates/jammi-kernels/tests/cuda_parity.rs`,
 `required-features = ["cuda"]`): unset, a CUDA-acquisition failure on a
 GPU-less build reads as skip; set (the pod session's actual landing proof), it

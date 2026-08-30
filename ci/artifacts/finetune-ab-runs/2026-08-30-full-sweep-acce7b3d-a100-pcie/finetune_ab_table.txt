@@ -1,0 +1,58 @@
+# finetune A/B -- jammi eager vs jammi fused vs torch eager vs torch sdpa
+# steps=20 warmup=5 pass_bar=0.9x torch-sdpa triplets/s, no OOM where torch fits
+# torch --lora-init=jammi; jammi always uses its own ZerosB init -- loss_final_ratio is only a loss-TRAJECTORY-equivalence signal when torch_lora_init == 'jammi'.
+# loss-trajectory equivalence (jammi-fused vs jammi-eager, real trainer, >=5 seeds) is a SEPARATE check -- not measured here.
+# loss_first->loss_last and loss_final_ratio below: SAME DATA, COST FIXTURE -- NOT A QUALITY RESULT. Values are bf16-sourced (ULP ~0.00195 near 0.30) -- printed to 3 decimals, never gated.
+config          leg           outcome  s/step_p50  triplets/s  vram_delta(comparable)  vram_absolute(torch only)  fused_proof                 loss_first->last        
+b16-s128-d0     jammi-eager   OOM      n/a         n/a         n/a                     n/a                        n/a                         n/a                     
+    -> finetune-step failed: DriverError(CUDA_ERROR_OUT_OF_MEMORY, "out of memory")
+b16-s128-d0     jammi-fused   OK       0.2181      73.3525     8,977,907,712           n/a                        YES                         0.234->0.000            
+b16-s128-d0     torch-eager   OK       0.2459      65.0706     10,733,519,872          11,655,336,960             n/a                         0.293->0.155            
+b16-s128-d0     torch-sdpa    OK       0.2235      71.5944     9,704,352,768           10,626,169,856             n/a                         0.293->0.155            
+b16-s128-d0     jammi-fused-2 OK       0.2174      73.6000     7,837,057,024           n/a                        YES                         0.234->0.000            
+b16-s128-d0     torch-sdpa-2  OK       0.2235      71.5902     9,704,352,768           10,626,169,856             n/a                         0.293->0.155            
+b16-s128-d0p05  jammi-eager   OOM      n/a         n/a         n/a                     n/a                        n/a                         n/a                     
+    -> finetune-step failed: DriverError(CUDA_ERROR_OUT_OF_MEMORY, "out of memory")
+b16-s128-d0p05  jammi-fused   OK       0.2401      66.6273     8,843,689,984           n/a                        YES                         0.266->0.062            
+b16-s128-d0p05  torch-eager   OK       0.2579      62.0400     11,717,084,160          12,639,425,536             n/a                         0.242->0.154            
+b16-s128-d0p05  torch-sdpa    OK       0.2341      68.3455     10,687,654,912          11,609,865,216             n/a                         0.233->0.245            
+b16-s128-d0p05  jammi-fused-2 OK       0.2404      66.5564     8,474,591,232           n/a                        YES                         0.266->0.062            
+b16-s128-d0p05  torch-sdpa-2  OK       0.2360      67.7984     10,687,654,912          11,609,865,216             n/a                         0.233->0.245            
+b8-s128-d0      jammi-eager   OK       0.6144      13.0216     57,329,844,224          n/a                        n/a                         0.071->0.013            
+    -> kernels_disabled_requested=['adamw_step_fused', 'attention_block_flash', 'attention_block_fused', 'geglu_fused', 'layer_norm_fused', 'lora_linear_fused', 'mem_efficient_attention', 'rope_fused', 'softmax_last_dim_fused']
+    -> kernels_disabled_fired=['adamw_step_fused', 'attention_block_flash', 'attention_block_fused', 'geglu_fused', 'layer_norm_fused', 'lora_linear_fused', 'mem_efficient_attention', 'rope_fused', 'softmax_last_dim_fused']
+b8-s128-d0      jammi-fused   OK       0.1295      61.7833     3,877,634,048           n/a                        YES                         0.081->0.000            
+b8-s128-d0      torch-eager   OK       0.1530      52.2793     5,350,237,184           6,272,021,504              n/a                         0.170->0.037            
+b8-s128-d0      torch-sdpa    OK       0.1366      58.5512     4,835,265,536           5,757,049,856              n/a                         0.161->0.000            
+b8-s128-d0      jammi-fused-2 OK       0.1298      61.6396     3,776,970,752           n/a                        YES                         0.081->0.000            
+b8-s128-d0      torch-sdpa-2  OK       0.1257      63.6351     4,835,265,536           5,757,049,856              n/a                         0.161->0.000            
+b8-s128-d0p05   jammi-eager   OK       0.6264      12.7709     59,577,991,168          n/a                        n/a                         0.146->0.000            
+    -> kernels_disabled_requested=['adamw_step_fused', 'attention_block_flash', 'attention_block_fused', 'geglu_fused', 'layer_norm_fused', 'lora_linear_fused', 'mem_efficient_attention', 'rope_fused', 'softmax_last_dim_fused']
+    -> kernels_disabled_fired=['adamw_step_fused', 'attention_block_flash', 'attention_block_fused', 'geglu_fused', 'layer_norm_fused', 'lora_linear_fused', 'mem_efficient_attention', 'rope_fused', 'softmax_last_dim_fused']
+b8-s128-d0p05   jammi-fused   OK       0.1412      56.6598     3,844,079,616           n/a                        YES                         0.111->0.000            
+b8-s128-d0p05   torch-eager   OK       0.1536      52.0790     5,859,714,048           6,781,498,368              n/a                         0.064->0.000            
+b8-s128-d0p05   torch-sdpa    OK       0.1305      61.2940     5,349,133,312           6,270,917,632              n/a                         0.063->0.000            
+b8-s128-d0p05   jammi-fused-2 OK       0.1419      56.3841     4,347,396,096           n/a                        YES                         0.111->0.000            
+b8-s128-d0p05   torch-sdpa-2  OK       0.1443      55.4247     5,349,133,312           6,270,917,632              n/a                         0.063->0.000            
+b8-s512-d0      jammi-eager   OOM      n/a         n/a         n/a                     n/a                        n/a                         n/a                     
+    -> finetune-step failed: LoRA: LoRA tensor: DriverError(CUDA_ERROR_OUT_OF_MEMORY, "out of memory")
+b8-s512-d0      jammi-fused   OK       0.4179      19.1443     16,091,447,296          n/a                        YES                         0.262->0.032            
+b8-s512-d0      torch-eager   OK       0.5790      13.8180     34,337,797,120          35,259,679,744             n/a                         0.235->0.000            
+b8-s512-d0      torch-sdpa    OK       0.4499      17.7801     19,586,250,752          20,508,133,376             n/a                         0.220->0.000            
+b8-s512-d0      jammi-fused-2 OK       0.4188      19.1014     15,890,120,704          n/a                        YES                         0.262->0.032            
+b8-s512-d0      torch-sdpa-2  OK       0.4550      17.5834     19,586,250,752          20,508,133,376             n/a                         0.305->0.283            
+b8-s512-d0p05   jammi-eager   OOM      n/a         n/a         n/a                     n/a                        n/a                         n/a                     
+    -> finetune-step failed: Tensor: DriverError(CUDA_ERROR_OUT_OF_MEMORY, "out of memory")
+b8-s512-d0p05   jammi-fused   OK       0.4625      17.2968     16,695,427,072          n/a                        YES                         0.236->0.000            
+b8-s512-d0p05   torch-eager   OK       0.6012      13.3059     36,227,593,216          37,149,606,912             n/a                         0.273->0.000            
+b8-s512-d0p05   torch-sdpa    OK       0.4728      16.9211     21,550,495,744          22,472,509,440             n/a                         0.191->0.000            
+b8-s512-d0p05   jammi-fused-2 OK       0.4617      17.3264     16,594,763,776          n/a                        YES                         0.236->0.000            
+b8-s512-d0p05   torch-sdpa-2  OK       0.4778      16.7434     21,550,495,744          22,472,509,440             n/a                         0.295->0.030            
+
+config          pair1(fused/sdpa)  pair2(fused2/sdpa2)  bar_ratio(min)  loss_final_ratio(fused/sdpa,NOT-quality)  verdict                                                     
+b16-s128-d0     1.025              1.028                1.025           0.0000                                    PASS (ratio 1.025)                                          
+b16-s128-d0p05  0.975              0.982                0.975           0.2530                                    PASS (ratio 0.975)                                          
+b8-s128-d0      1.055              0.969                0.969           n/a                                       INDETERMINATE (pair1(jammi-fused/torch-sdpa)=1.055 pair2(jammi-fused-2/torch-sdpa-2)=0.969 spread=0.087 bar-distance-from-0.9=0.069)
+b8-s128-d0p05   0.924              1.017                0.924           n/a                                       INDETERMINATE (pair1(jammi-fused/torch-sdpa)=0.924 pair2(jammi-fused-2/torch-sdpa-2)=1.017 spread=0.093 bar-distance-from-0.9=0.024)
+b8-s512-d0      1.077              1.086                1.077           n/a                                       PASS (ratio 1.077)                                          
+b8-s512-d0p05   1.022              1.035                1.022           n/a                                       PASS (ratio 1.022)                                          

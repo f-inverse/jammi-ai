@@ -3,21 +3,66 @@
 # runs ON THE POD, invoked either via
 #   ci/scripts/gpu-dev.sh run <session> bash ci/scripts/perf/finetune_ab.sh
 # or directly over ssh once the checkout is on the pod. NOT a CI job (no
-# GPU on the CI image, and this script switches git refs in place — never
-# run it against a checkout you care about keeping put).
+# GPU on the CI image).
+#
+# `closes_escape: esc-067-committed-producer-never-executed-end-to-end`
+# (the eval side, hermetically, lives in `test_finetune_ab_sh_dry_run.py`'s
+# `DryRunSmokeTests` and `test_identity_fields_subset.py`'s
+# `F32StoredFieldCanonicalizerTests` — a REAL pod run is the residual that
+# closes this row fully, not claimed by CI alone).
+#
+# #352 has two clauses, and this producer discharges only the FIRST:
+#   * throughput + no-OOM (the ratio/PASS/FAIL/INDETERMINATE bar this
+#     script's own table computes, against a synthetic cost-fixture step —
+#     see "Honesty about what is measured" below).
+#   * loss-TRAJECTORY equivalence (jammi-fused vs jammi-eager, a REAL
+#     trainer, >= 5 seeds) is discharged SEPARATELY, by the pre-registered
+#     real-trainer instrument at `docs/plans/63-how-well/measurements/
+#     campaign-v2` (`finetune_run_ab.sh` + `ab_merge.py`'s
+#     `finetune-run` mode) — never by this script, which never runs a real
+#     trainer or a held-out eval.
+#
+# ## ONE binary, no git-ref switching (this script no longer switches refs)
+#
+# Every leg below — jammi-eager INCLUDED — runs off the SAME tip binary,
+# built ONCE at the start (`build_binary`). jammi-eager is NOT "the
+# pre-fusion commit": there is no separate build, no separate ref, and no
+# `cargo clean -p jammi-kernels` between legs. It is the tip binary with
+# every fused op named in `JAMMI_EAGER_DISABLE_OP_KEYS` (below) forced
+# eager via `JAMMI_KERNELS_DISABLE`, under `JAMMI_KERNELS_STRICT=1` as a
+# negative control (disable wins over Strict — see that constant's own
+# doc). A prior version of this script resolved a separate "eager base"
+# commit by grepping commit subjects and rebuilt jammi-kernels between two
+# checkouts; that design is gone. Report/table prose calls this leg
+# "tip binary, fused ops forced eager" — NEVER "the pre-fusion commit".
 #
 # What it does, for each of {b8 s128, b8 s512, b16 s128} x {dropout 0,
-# dropout 0.05} (6 configs):
-#   1. jammi eager   — the pre-fusion commit, JAMMI_KERNELS_STRICT unset.
-#   2. jammi fused   — HEAD, JAMMI_KERNELS_STRICT=1 (an admission failure on
-#      any fused op ERRORS instead of silently falling back — see
+# dropout 0.05} (6 configs), SIX legs total:
+#   1. jammi eager   — tip binary, fused ops forced eager (see above).
+#      `JAMMI_KERNELS_STRICT=1` PLUS `--expect-kernels-disabled
+#      $JAMMI_EAGER_DISABLE_OP_KEYS` — the negative control: disable wins
+#      over Strict (`crates/jammi-kernels/src/admission.rs:60-62`), and
+#      `--expect-kernels-disabled` hard-errors before a single step runs if
+#      `JAMMI_KERNELS_DISABLE` was dropped, mistyped, or not forwarded to
+#      this process — `params.expect_kernels_disabled` (`finetune_step.rs:692-699`)
+#      checks it FIRST, before any device/checkpoint/tensor work — so a
+#      silently-clean env var can never masquerade as a real eager leg.
+#      `kernels_disabled_requested`/`kernels_disabled_fired` are surfaced on
+#      this leg's own row in `ab_merge.py`'s printed table.
+#   2. jammi fused   — tip binary, JAMMI_KERNELS_STRICT=1, no
+#      JAMMI_KERNELS_DISABLE (an admission failure on any fused op ERRORS
+#      instead of silently falling back — see
 #      jammi-encoders/src/layer_norm.rs's `admission_mode`), so the run
-#      cannot pass on a silent eager fallback.
+#      cannot pass on a silent eager fallback. Run TWICE per config, in an
+#      order-balanced A,B,B,A interleaving with torch-sdpa — see
+#      "ORDER-BALANCED BAR LEGS" below.
 #   3. torch eager   — crates/jammi-bench/reference/torch_finetune_step.py
 #      --attn eager --lora-init peft --dtype bf16 (jammi eager's semantic
-#      twin: no fused attention kernel).
+#      twin: no fused attention kernel). Single leg (a context leg, not
+#      part of the bar ratio).
 #   4. torch sdpa    — the same script --attn sdpa (torch's best-case
-#      number; what the #352 throughput ratio is measured against).
+#      number; what the #352 throughput ratio is measured against). Run
+#      TWICE per config, order-balanced against jammi-fused — see below.
 # Emits one merged JSON report + a printed table: s/step p50, triplets/s,
 # peak VRAM (delta, comparable across stacks, and absolute where torch has
 # it — see "VRAM columns" below), EVERY fused-kernel dispatch counter PAIR
@@ -28,7 +73,7 @@
 # `LORA_SITE_EXCLUSIVE_GROUP` (their union, `ALL_BASES`) declares and that
 # module's own doc is the authority on — restated here only for a reader of
 # THIS script, not duplicated logic:
-#     * ln, geglu, attention_block   — each MUST independently show fused > 0.
+#     * ln, geglu, adamw            — each MUST independently show fused > 0.
 #     * rope, softmax                — MUST be present; may read (0, 0) ONLY
 #                                       when attention_block's OWN fused count
 #                                       is > 0 this run (its fused arm folds
@@ -41,28 +86,25 @@
 #                                       adapted forward, so only their SUM
 #                                       needs fused > 0 — either one alone may
 #                                       legitimately read (0, 0).
-#     * attention_block_flash (P6 Stage B FA2 fold-in — not wired into THIS
-#                                       script's own leg orchestration yet,
-#                                       CASCADE-shaped: its fallback counter
-#                                       is `_declined_dispatches`, not
-#                                       `_eager_dispatches`) — OPTIONAL
-#                                       (may be entirely absent from the
-#                                       report's schema, unlike every base
-#                                       above); when present, `attention_block`
-#                                       may ALSO read (0, 0) if THIS base's
+#     * attention_block (P6 Stage B FA2 fold-in) — MUST be present; may read
+#                                       (0, 0) ONLY when attention_block_flash's
 #                                       own fused count is > 0 this run (the
-#                                       flash arm subsumes the fused
-#                                       attention block, which subsumes
-#                                       rope/softmax — the SAME absorption
-#                                       chain above, extended, never a
-#                                       parallel rule), and a nonzero
+#                                       flash arm subsumes the fused attention
+#                                       block, which subsumes rope/softmax —
+#                                       the SAME absorption chain above,
+#                                       extended, never a parallel rule);
+#                                       otherwise it must independently clear
+#                                       fused > 0.
+#     * attention_block_flash        — CASCADE-shaped: OPTIONAL (may be
+#                                       entirely absent from the report's
+#                                       schema, unlike every base above); its
+#                                       fallback counter is
+#                                       `_declined_dispatches`, not
+#                                       `_eager_dispatches`; a nonzero
 #                                       `declined` count is a hard fail
 #                                       UNLESS `kernels_disabled_requested`
 #                                       AND `kernels_disabled_fired` BOTH
-#                                       name it (a deliberate, self-
-#                                       describing `JAMMI_KERNELS_DISABLE=
-#                                       attention_block_flash` reference
-#                                       leg) — see `ab_merge.py`'s own
+#                                       name it — see `ab_merge.py`'s own
 #                                       `CASCADE_BASES`/
 #                                       `ABSORBABLE_BY_ATTENTION_BLOCK_FLASH`
 #                                       doc for the full rule table.
@@ -78,29 +120,84 @@
 # loss_final_ratio jammi-fused/torch-sdpa column (SAME DATA, COST FIXTURE —
 # NOT A QUALITY RESULT, printed only so a large divergence is visible — see
 # "loss_final_ratio" below), the ratio jammi-fused/torch-sdpa, and a
-# PASS/FAIL against #352's bar (>= 0.9x torch-sdpa throughput at matched
-# batch/seq, no OOM on a config torch itself completed). Like every
-# jammi-bench tier, this RECORDS — it does not gate the process exit code
-# on a config missing the bar; a FAIL row is data for a human to read, not
-# an infrastructure failure (see finetune_step.rs's own module doc). The
-# script's own exit code reflects whether the sweep RAN, not whether every
-# config passed — WITH ONE CARVE-OUT (advisory iv, round-2 audit fix on
-# PR #372): a config whose `fused_proof` check FAILED or ERRORED reads
-# `INVALID`, not `FAIL`/`PASS`, and `ab_merge.py`'s own exit code DOES go
-# non-zero on an `INVALID` config — a failed proof means the fused kernels
-# may not have actually dispatched at all, so the ratio-based PASS/FAIL
-# classification above it is not trustworthy; that is a correctness-of-
-# measurement question, not a machine-dependent performance number, and is
-# the one thing this doctrine gates on.
+# PASS/FAIL/INDETERMINATE against #352's bar (>= 0.9x torch-sdpa throughput
+# at matched batch/seq, no OOM on a config torch itself completed). Like
+# every jammi-bench tier, this RECORDS — it does not gate the process exit
+# code on a config missing the bar; a FAIL or INDETERMINATE row is data for
+# a human to read, not an infrastructure failure (see finetune_step.rs's own
+# module doc). The script's own exit code reflects whether the sweep RAN,
+# not whether every config passed — WITH ONE CARVE-OUT (advisory iv,
+# round-2 audit fix on PR #372): a config whose `fused_proof` check FAILED
+# or ERRORED reads `INVALID`, not `FAIL`/`PASS`/`INDETERMINATE`, and
+# `ab_merge.py`'s own exit code DOES go non-zero on an `INVALID` config — a
+# failed proof means the fused kernels may not have actually dispatched at
+# all, so the ratio-based classification above it is not trustworthy; that
+# is a correctness-of-measurement question, not a machine-dependent
+# performance number, and is the one thing this doctrine gates on.
+#
+# ## ORDER-BALANCED BAR LEGS: A, B, B, A (jammi-fused, torch-sdpa,
+# ## torch-sdpa, jammi-fused — never A, A, B, B)
+#
+# Only the two legs the #352 throughput bar actually gates on
+# (jammi-fused == "A", torch-sdpa == "B") run this way — torch-eager and
+# jammi-eager stay single legs (context, never part of the bar ratio).
+# Mirrors `gpu_inference_ab.sh`'s own documented drift rationale (that
+# script's module doc's "What actually cancels, and what does not"
+# section): placing the two B-role legs symmetrically between the two
+# A-role legs cancels a first-order MULTIPLICATIVE clock/thermal drift
+# trend's first-order term under EITHER adjacent-pair averaging or a naive
+# mean(B)/mean(A) estimator, under this exact order.
+#
+# `ab_merge.py` computes TWO adjacent-pair ratios — pair 1 =
+# jammi-fused(A1)/torch-sdpa(B1), pair 2 = torch-sdpa-2(B2)/jammi-fused-2(A2)
+# read as jammi-fused-2/torch-sdpa-2 — and the BAR ratio is the MIN of the
+# two: the estimator LEAST FAVOURABLE to jammi (the same "ratio uses the
+# min of two torch runs" convention `docs/maintainer/
+# fine-tune-performance-guide.md`'s own stacked-sweep artifact caveat
+# already names — this producer applies the identical discipline to its
+# own two torch-sdpa runs). When the two pair ratios straddle the 0.9 bar
+# (one at-or-above, one below) — or their spread exceeds the bar ratio's
+# own distance from 0.9 — the config reports `INDETERMINATE`, never
+# `PASS`/`FAIL`: the two repeats disagree too much, relative to how close
+# the combined estimate sits to the bar, to trust either classification.
+# Both pair ratios are always printed so a human can see why.
+#
+# IDENTITY-COMPLETENESS: the bar ratio consumes BOTH pair legs, so BOTH
+# must carry the SAME measurement discipline. `jammi-fused-2` clears
+# `fused_proof` exactly like `jammi-fused` does (an unproven leg feeding
+# the pre-registered throughput endpoint is exactly the class `fused_proof`
+# exists to catch, regardless of which run it is); `jammi-fused-2`/
+# `torch-sdpa-2` are leg-premise-checked against each other exactly like
+# `jammi-fused`/`torch-sdpa` are. A failure on EITHER pair — first run or
+# second — invalidates the WHOLE config (`INVALID`, `ab_merge.py`'s own
+# exit-code carve-out), never silently discarded from just the ratio that
+# happened to notice it. Both `jammi-fused` legs additionally pass
+# `--expect-kernels-disabled ""` (F5, adversarial audit): an EMPTY
+# expectation, checked via the SAME exact-SET-equality
+# `params.expect_kernels_disabled` (`finetune_step.rs:692-699`) machinery
+# the eager leg's own nonempty list uses —
+# `parse_disable_list` (`crates/jammi-kernels/src/admission.rs:684-693`)
+# is the empty set for `Some("")`, so
+# this hard-fails the run if `JAMMI_KERNELS_DISABLE` carries ANYTHING at
+# all when this process starts, catching an AMBIENT/leaked env var (a
+# stale export in the calling shell, an inherited CI runner variable) that
+# would otherwise silently force part of a "fused" leg eager with no
+# counter-based signal of it at all (a decline that domain-misses for an
+# unrelated reason reads identically to one that was disabled). This is
+# in ADDITION to, never a replacement for, `fused_proof`'s own positive-
+# proof channel above — the two catch different failure classes (an
+# ambient env leak vs. a genuine admission-domain regression).
 #
 # NOT covered here: loss-TRAJECTORY equivalence between jammi-fused and
 # jammi-eager (the #352 quality constraint) is a REAL-TRAINER check over
 # >= 5 seeds reusing C0's distributional oracle machinery — a different,
-# slower harness than this one-step-timing sweep. Run it separately. The
-# loss_first/loss_last/loss_final_ratio columns THIS script prints are a
-# different, weaker thing: one synthetic-data cost-fixture step count from
-# `finetune-step`/`torch_finetune_step.py` itself, printed for visibility,
-# never a substitute for that real-trainer check.
+# slower harness than this one-step-timing sweep (see the top of this
+# header — `docs/plans/63-how-well/measurements/campaign-v2`). Run it
+# separately. The loss_first/loss_last/loss_final_ratio columns THIS
+# script prints are a different, weaker thing: one synthetic-data
+# cost-fixture step count from `finetune-step`/`torch_finetune_step.py`
+# itself, printed for visibility, never a substitute for that real-trainer
+# check.
 #
 # loss_final_ratio (jammi-fused loss_last / torch-sdpa loss_last): SAME
 # DATA (both stacks feed the identical synthetic token ids — the two
@@ -113,18 +210,44 @@
 # were not met, which is exactly why this rides as a printed reference, not
 # a gated bar.
 #
-# Leg resolution is BY COMMIT SUBJECT, never by position in history or a
-# hardcoded SHA (the stale-build lesson generalized: a script that names a
-# SHA goes stale the moment someone rebases; a script that greps a subject
-# survives every commit after it). "eager base" is the commit whose subject
-# contains BASE_SUBJECT_MATCH below (the last commit before any fused
-# kernel landed); "fused tip" is always HEAD at invocation time.
+# ## Build: --features cuda,jammi-encoders/flash-attn (sm_80/86/89/90-only)
 #
-# Stale-build guard: every git-ref switch is followed by
-# `cargo clean -p jammi-kernels --release` THEN a full release rebuild —
-# see checkout_and_build()'s comment for why this is not optional. A run
-# that skips it risks comparing a cached binary against itself, not eager
-# against fused.
+# `--features cuda` ALONE cannot produce even one VALID config: this
+# checkpoint shape's own fused-attention path prefers the FlashAttention-2
+# dense cascade (`attention_block_flash`), and with `flash-attn` not
+# compiled in, EVERY jammi-fused leg's `attention_block_flash` admit call
+# DECLINES — a genuine domain/capability miss recorded as
+# `attention_block_flash_declined_dispatches > 0`, which `ab_merge.py`'s
+# `fused_proof` rule 1 hard-fails on (an unaccounted-for, unrequested
+# decline on ANY pair, in ANY group, is a hard fail) — every jammi-fused
+# row in the sweep reads `INVALID`, never PASS/FAIL, until the flash
+# feature is compiled in. This build therefore always turns on
+# `--features cuda,jammi-encoders/flash-attn` — the SAME convention
+# `finetune_run_ab.sh:305`/`fa2_ab.sh:7`/`clip_artifact_producer.sh`'s own
+# flash build already use, never a second, independently-drifting
+# feature-list spelling.
+#
+# On THIS script's own path, that refusal is `fused_proof` rule 1's own
+# hard fail via `attention_block_flash_declined_dispatches > 0`
+# (`report.rs`'s field doc: "declined > 0 on any bench leg -> INVALID") —
+# a CapabilityMiss from `flash_capability_gates`
+# (`crates/jammi-encoders/src/modernbert.rs`'s `PredicateOutcome::
+# CapabilityMiss`) surfacing as a declined dispatch, NOT the SEPARATE
+# `flash_compiled` guard `finetune_run_ab.sh`'s own campaign premise check
+# (`finetune_run_dispatch_proof_violations`'s `arm == "fused"` branch)
+# gates on — the two paths reach a related conclusion (a flash-less build
+# cannot certify this sweep) through genuinely different mechanisms; never
+# conflate them.
+#
+# This build is `sm_80`/`sm_86`/`sm_89`/`sm_90`-ONLY by construction — the
+# compiled `-gencode` arch set `jammi-kernels/build.rs`'s own
+# `GENCODE_ARCHES` const fixes at compile time. An unlisted arch (anything
+# outside Ampere/Ada/Hopper's `sm_80/86/89/90`) is a CapabilityMiss the
+# SAME way an uncompiled `flash-attn` feature is — declined counters, then
+# an `INVALID` `fused_proof` verdict — the correct failure mode: this
+# sweep refuses to CLAIM a fused-throughput number on hardware it was
+# never validated against, rather than silently falling back to a
+# comparison that never exercised the code path it claims to measure.
 #
 # Torch env: `uv venv "$TORCH_VENV"` (default crates/jammi-bench/reference/
 # README.md's own `.venv-torch-ref` convention, resolved under the repo
@@ -185,27 +308,104 @@
 #   AB_OUT_DIR            where the merged report + table land (default
 #                         "<repo>/.ab-report/<UTC timestamp>").
 #   TORCH_VENV            torch venv path (default "<repo>/.venv-torch-ref").
-#   BASE_SUBJECT_MATCH    override the eager-base commit-subject substring
-#                         (default below — the lead names the real one).
-#   AB_DRY_RUN=1          print every command this script would run (git,
-#                         cargo, uv, the bench binary, the torch script)
-#                         instead of executing it, and write a
-#                         `{"tool":"dry-run",...}` stub per leg so the
-#                         merge/table stage still runs end-to-end against
-#                         real (if fabricated-empty) files. Never mutates
-#                         the checkout, never touches the network, never
-#                         claims a real number — every dry-run row prints
-#                         outcome DRY_RUN, never OK/FAIL/OOM.
+#   AB_DRY_RUN=1          print every command this script would run (cargo,
+#                         uv, the bench binary, the torch script) instead of
+#                         executing it, and write a `{"tool":"dry-run",...}`
+#                         stub per leg so the merge/table stage still runs
+#                         end-to-end against real (if fabricated-empty)
+#                         files. Never mutates the checkout, never touches
+#                         the network, never claims a real number — every
+#                         dry-run row prints outcome DRY_RUN, never OK/FAIL/
+#                         OOM.
 set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 
-# The eager-base commit's subject substring — NOT its SHA. A SHA in this
-# script would go stale the first time this branch is rebased or the base
-# commit is cherry-picked elsewhere; a subject substring survives that
-# because it names WHAT the commit is, not WHERE it sits in history.
-BASE_SUBJECT_MATCH="${BASE_SUBJECT_MATCH:-make the K3 standardization oracles distributional}"
+# The named constant this script's jammi-eager leg disables — EXACTLY the
+# nine LIVE, STANDALONE `admit()`/`admit_cascade()`/`op_disabled()` op keys
+# this crate's fused finetune-step call graph actually reaches on a real
+# training step (confirmed at this contract's tip: `layer_norm_fused`
+# `crates/jammi-encoders/src/layer_norm.rs:197`, `geglu_fused`
+# `crates/jammi-encoders/src/modernbert.rs:1862`, `attention_block_flash`
+# `crates/jammi-encoders/src/modernbert.rs:2523` (`op_disabled`, the
+# cascade's own capability gate), `attention_block_fused`
+# `crates/jammi-encoders/src/modernbert.rs:1270`, `rope_fused`
+# `crates/jammi-encoders/src/modernbert.rs:566`, `softmax_last_dim_fused`
+# `crates/jammi-encoders/src/modernbert.rs:1791`, `lora_linear_fused`
+# `crates/jammi-lora/src/lora_linear.rs:722`, `adamw_step_fused`
+# `crates/jammi-ai/src/fine_tune/adamw.rs:257`, `mem_efficient_attention`
+# `crates/jammi-encoders/src/modernbert.rs:1233` (`admit_cascade`, the
+# per-layer memeff cascade — consulted on EVERY training-mode attention
+# layer once the flash cascade has declined, BEFORE the block arm's own
+# `admit()`) and `:2872` (`op_disabled`, the once-per-forward gate that
+# suppresses the block/eager mask bundle when memeff is going to fire).
+# `mem_efficient_attention` is the NINTH key, added by adversarial-audit
+# fold-in F4: an EARLIER 8-key version of this constant went undetected
+# because every `finetune_ab.sh` sweep config (`CONFIGS` below) has
+# `seq <= 512`, and `mem_efficient_attention_predicate` DomainMisses
+# UNCONDITIONALLY for any `seq <= ATTENTION_BLOCK_MAX_SEQ` (4096,
+# `crates/jammi-kernels/src/ops/attention_block.rs`'s own `MAX_SEQ`) —
+# so on THIS script's own configs the op never dispatches regardless of
+# whether it is named here, a domain-miss coincidence that hid the gap
+# from every real sweep this script has ever run, not a proof the key was
+# unneeded.
+#
+# SWEEP METHOD (so a TENTH addition gets caught, not merely this ninth):
+# every entry above was found by grepping `crates/jammi-encoders/src/`,
+# `crates/jammi-lora/src/`, and `crates/jammi-ai/src/fine_tune/` for a
+# direct `admit(`/`admit_cascade(`/`op_disabled(` call and reading off its
+# literal `op`/`&'static str` argument — `ci/scripts/perf/
+# test_finetune_ab_disable_op_keys.py` runs EXACTLY this sweep
+# mechanically (a balanced-paren scan over those three crates, never a
+# hand-kept list) and asserts the discovered set equals this constant
+# byte-for-byte; run it after touching any of those crates' attention/
+# LoRA/optimizer call graphs, and it REDs on both a missing and a stale
+# entry. That test's own scope is deliberately NOT `crates/jammi-kernels/
+# src/` (the SUBSUMED `cast_scale_bf16_f32`/`cast_add_bf16` keys live
+# there behind `ops/low_rank_residual_linear.rs`'s `admit_cast_boundary`
+# wrapper, called with a *variable* `op` argument, not a literal — a
+# grep-based scan cannot resolve it, and it must not be named directly
+# here regardless, see the `NOT lora_epilogue/...` bullet below) — that
+# one exclusion is verified MANUALLY against `admission.rs`'s own module
+# doc (the authoritative classification of every op key's reachability)
+# each time this constant changes, the documented manual-sweep protocol
+# the mechanical test's own doc names as its complement.
+#
+#   * NOT `all` — `crates/jammi-kernels/src/admission.rs:169-177`
+#     disclaims it as whole-registry evidence: `unmatched_disables()`
+#     coming back empty for `JAMMI_KERNELS_DISABLE=all` proves only that AT
+#     LEAST ONE op reached `admit` and was forced eager, never that EVERY
+#     registered op was — exactly the wrong guarantee for a leg whose whole
+#     job is to certify every fused op ran eager.
+#   * NOT the report's `..._fused_dispatches`/`..._eager_dispatches`
+#     COUNTER base-names (`ln`, `rope`, `softmax`, `geglu`,
+#     `attention_block`, `lora_epilogue`, `lora_linear`, `adamw`) — a
+#     DIFFERENT vocabulary from the `admit`/`op_disabled` OP KEYS this
+#     env var actually consumes (e.g. the counter base is `ln`, the admit
+#     op key is `layer_norm_fused`; the counter base is `attention_block`,
+#     the admit op key for its own site is `attention_block_fused`).
+#     Naming a counter base directly in `JAMMI_KERNELS_DISABLE` is a
+#     silent no-op — it never matches any real `admit`/`op_disabled` call,
+#     so `unmatched_disables()` (or, on this leg,
+#     `--expect-kernels-disabled`'s own hard check) refuses the run rather
+#     than accepting a name that never fired.
+#   * NOT `lora_epilogue`/`lora_dropout`/`cast_scale_bf16_f32`/
+#     `cast_add_bf16` — `crates/jammi-kernels/src/admission.rs:99-126`:
+#     `lora_epilogue`/`lora_dropout` are REGISTERED but PERMANENTLY DEAD
+#     (their stand-alone call sites were superseded by the fused LoRA
+#     site's single `CustomOp3`, which never calls `admit` for either name
+#     — always reads `{fused: 0, eager: 0}`); `cast_scale_bf16_f32`/
+#     `cast_add_bf16` are reachable ONLY as a SUBSUMED op inside
+#     `lora_linear_fused`'s own admitted branch, never named directly by a
+#     caller that wants the whole LoRA site eager. Naming any of the four
+#     directly ABORTS the run — a real, present-in-the-registry op name
+#     that nonetheless never reaches `admit`/`op_disabled` is exactly as
+#     unmatched as a typo
+#     (`crates/jammi-bench/tests/finetune_step_kernel_disable.rs:113`'s
+#     `kernel_disable_of_a_registered_but_dead_op_name_invalidates_the_run`
+#     proves this against the real CLI).
+JAMMI_EAGER_DISABLE_OP_KEYS="layer_norm_fused,geglu_fused,attention_block_flash,attention_block_fused,rope_fused,softmax_last_dim_fused,lora_linear_fused,adamw_step_fused,mem_efficient_attention"
 
 AB_DRY_RUN="${AB_DRY_RUN:-0}"
 AB_CUDA_ORDINAL="${AB_CUDA_ORDINAL:-0}"
@@ -243,6 +443,38 @@ OUT_DIR="${AB_OUT_DIR:-$REPO_ROOT/.ab-report/$TS}"
 RAW_DIR="$OUT_DIR/raw"
 mkdir -p "$RAW_DIR"
 
+# F2 (adversarial audit): this script ALWAYS runs the order-balanced
+# A,B,B,A protocol (see "ORDER-BALANCED BAR LEGS" above) — every
+# invocation writes both runs of the bar pair, never just one. Without a
+# machine-readable signal of that promise, `ab_merge.py` had no way to
+# tell "this raw_dir's second-run legs are absent because the protocol
+# does not apply here" (an old, genuinely single-run `raw_dir`, predating
+# this fold-in) apart from "absent because something silently failed to
+# run them" — the two cases read identically on disk otherwise, and the
+# merge stage used to collapse them into the SAME graceful degrade. This
+# marker, written BEFORE any leg runs (so even a sweep that dies on its
+# very first leg still leaves it behind), makes the promise explicit and
+# checkable: `ab_merge.py`'s own `TWO_RUN_PROTOCOL_MARKER` constant names
+# the SAME filename, and its presence makes all four bar legs
+# (`jammi-fused`, `torch-sdpa`, `jammi-fused-2`, `torch-sdpa-2`) REQUIRED
+# for that config — a genuinely MISSING second-run leg (the file never
+# written at all) under this marker is an INVALID config (an incomplete
+# sweep, not a legacy raw_dir), never a silent fallback to the single-pair
+# estimator. Every OTHER pair-ratio gap (an OK leg whose own report still
+# carries a falsy/missing `triplets_per_s` — B1, round-2 adversarial
+# audit) is ALSO required-and-refused under this marker, via the SAME
+# "both pairs, not just one" discipline, one level below outcome. A
+# DRY_RUN second-run leg (advisory i — picked, prose now matches code
+# rather than the other way around: DRY_RUN is a deliberate, ANNOUNCED
+# "nothing ran for real" mode this script's own `AB_DRY_RUN=1` writes
+# uniformly across all six legs, never an incompleteness signal — making
+# it INVALID here would make every dry-run smoke-test invocation of this
+# script read INVALID unconditionally, defeating the whole point of
+# `AB_DRY_RUN` as a safe control) reads `N/A (dry-run)`, checked BEFORE
+# this marker's own MISSING/no-ratio checks in `ab_merge.py`'s own verdict
+# chain — never INVALID.
+touch "$RAW_DIR/TWO_RUN_PROTOCOL_MARKER"
+
 CONFIGS=("8:128" "8:512" "16:128")
 DROPOUTS=("0" "0.05")
 
@@ -250,7 +482,7 @@ DROPOUTS=("0" "0.05")
 # helpers
 # ---------------------------------------------------------------------- #
 
-# A state-changing command (git/cargo/uv). Always echoes what it would run;
+# A state-changing command (cargo/uv). Always echoes what it would run;
 # under AB_DRY_RUN it never executes. Returns the real exit status otherwise.
 run_cmd() {
   printf '+'
@@ -306,8 +538,24 @@ slug_for() {
   printf 'b%s-s%s-%s' "$batch" "$seq" "$dslug"
 }
 
+# One jammi leg. `disable_ops` (optional, arg 8): when non-empty, names the
+# `JAMMI_KERNELS_DISABLE` op-key list — the jammi-eager leg's own call
+# shape. `--expect-kernels-disabled "$disable_ops"` is ALWAYS passed (F5,
+# adversarial audit), even when `disable_ops` is empty: an empty
+# expectation on a "fused" leg (`jammi-fused`/`jammi-fused-2`) is a hard,
+# exact-set-equality guard against an AMBIENT `JAMMI_KERNELS_DISABLE`
+# leaking into this process from the calling shell/CI runner — see the
+# "IDENTITY-COMPLETENESS" section above for the full rationale. Every
+# jammi leg runs `JAMMI_KERNELS_STRICT=1`: an eligible-but-failed fused op
+# ERRORS instead of falling back, so no leg can silently "pass" on eager
+# numbers wearing a fused label
+# (jammi-encoders/src/layer_norm.rs::admission_mode) — disable wins over
+# Strict (admission.rs:60-62), which is exactly the deliberate,
+# self-describing negative control `disable_ops` exists to run, never a
+# silent Strict-mode bypass.
 run_jammi_leg() {
-  local strict="$1" leg="$2" binary="$3" model_dir="$4" batch="$5" seq="$6" dropout="$7" config_slug="$8"
+  local leg="$1" binary="$2" model_dir="$3" batch="$4" seq="$5" dropout="$6" config_slug="$7"
+  local disable_ops="${8:-}"
   local -a cmd=(
     "$binary" finetune-step
     --model-dir "$model_dir"
@@ -318,14 +566,12 @@ run_jammi_leg() {
     --backbone-dtype bf16
     --cuda "$AB_CUDA_ORDINAL" --seed "$AB_SEED"
     --batched-forward true
+    --expect-kernels-disabled "$disable_ops"
   )
-  if [ "$strict" = "1" ]; then
-    # Strict admission: an eligible-but-failed fused op ERRORS instead of
-    # falling back, so this leg cannot silently "pass" on eager numbers
-    # wearing a fused label (jammi-encoders/src/layer_norm.rs::admission_mode).
-    JAMMI_KERNELS_STRICT=1 run_leg "$config_slug" "$leg" "${cmd[@]}"
+  if [ -n "$disable_ops" ]; then
+    JAMMI_KERNELS_STRICT=1 JAMMI_KERNELS_DISABLE="$disable_ops" run_leg "$config_slug" "$leg" "${cmd[@]}"
   else
-    run_leg "$config_slug" "$leg" "${cmd[@]}"
+    JAMMI_KERNELS_STRICT=1 run_leg "$config_slug" "$leg" "${cmd[@]}"
   fi
 }
 
@@ -361,51 +607,26 @@ setup_torch_venv() {
     || { echo "::error::uv pip install (torch/transformers/peft) failed"; exit 1; }
 }
 
-# Switch the checkout to $1 and force a full jammi-kernels rebuild.
-#
-# STALE-BUILD GUARD, and why it is not optional: `cargo build` decides
-# whether to recompile jammi-kernels off its own fingerprint (source hashes,
-# env vars, build.rs's recorded outputs) — NOT off "did `git checkout` just
-# run". jammi-kernels' build.rs drives a feature-gated CUDA compile, and a
-# checkout switch between two refs that both already have a jammi-kernels
-# build.rs (eager base and fused tip both do — jammi-kernels' scaffolding
-# predates the fused ops) can leave cargo's fingerprint satisfied by the
-# PREVIOUS ref's compiled artifact, because nothing about that artifact's
-# recorded inputs necessarily changed shape across the switch. A run that
-# skipped this step measured exactly that failure: two "different" legs
-# (eager and fused) whose reported numbers were bit-identical across a
-# checkout that changed jammi-kernels' own admission logic — i.e. the sweep
-# was silently comparing one stale kernels binary against itself, not eager
-# against fused. `cargo clean -p jammi-kernels --release` forces every
-# checkout switch to pay a full jammi-kernels rebuild, which is the only way
-# to be sure the binary under test was actually built FROM the ref that is
-# checked out, not carried over from whichever ref built last.
-checkout_and_build() {
-  local ref="$1"
-  echo "=== checking out ${ref} ==="
-  run_cmd git -C "$REPO_ROOT" checkout --quiet "$ref" \
-    || { echo "::error::git checkout ${ref} failed"; exit 1; }
-  run_cmd cargo clean -p jammi-kernels --release --manifest-path "$REPO_ROOT/Cargo.toml" \
-    || { echo "::error::cargo clean -p jammi-kernels failed"; exit 1; }
-  run_cmd cargo build --release -p jammi-bench --features cuda --manifest-path "$REPO_ROOT/Cargo.toml" \
-    || { echo "::error::cargo build -p jammi-bench --features cuda failed"; exit 1; }
+# Build ONCE, at the very start — no ref-switching, no in-script checkout,
+# no jammi-kernels clean-on-switch (A/C: this script no longer has more
+# than one build). `--features cuda,jammi-encoders/flash-attn` — see
+# header for why `cuda` alone cannot produce even one VALID config.
+build_binary() {
+  echo "=== building jammi-bench (--features cuda,jammi-encoders/flash-attn) ==="
+  run_cmd cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn --manifest-path "$REPO_ROOT/Cargo.toml" \
+    || { echo "::error::cargo build -p jammi-bench --features cuda,jammi-encoders/flash-attn failed"; exit 1; }
   check_bin_provenance "$JAMMI_BIN"
 }
 
 # --- provenance cross-check (unification contract C5.1), same shape as
-# stacked_sweep.sh/clip_artifact_producer.sh/fa2_ab.sh: called from
-# checkout_and_build() AFTER EACH rebuild (this script switches git refs
-# mid-run -- phase A's fused-tip checkout, phase B's eager-base checkout,
-# phase C's restore -- three rebuilds, three calls), BEFORE any leg that
-# follows runs. Refuses if the jammi-bench binary's own baked identity does
-# not match the sha ACTUALLY checked out -- resolved fresh via `git rev-
-# parse HEAD` right after this checkout, never the caller's `ref` argument
-# literally (that can be a branch name, e.g. phase C's ORIGINAL_REF, not a
-# 40-hex sha). `unknown`/a `-dirty` suffix can never equal a resolved
-# 40-hex sha, so a single string-equality check catches mismatch/unknown/
-# dirty uniformly; an empty reading is ALSO a refusal, never silently
-# skipped -- never a leg silently marked GREEN off a binary that was not
-# rebuilt cleanly at the ref this phase just switched to.
+# stacked_sweep.sh/clip_artifact_producer.sh/fa2_ab.sh: called immediately
+# after the one build above, BEFORE any leg runs. Refuses if the
+# jammi-bench binary's own baked identity does not match the sha ACTUALLY
+# checked out (`git rev-parse HEAD`). `unknown`/a `-dirty` suffix can
+# never equal a resolved 40-hex sha, so a single string-equality check
+# catches mismatch/unknown/dirty uniformly; an empty reading is ALSO a
+# refusal, never silently skipped -- never a leg silently marked GREEN off
+# a binary that was not built cleanly at HEAD.
 check_bin_provenance() {
   local bin="$1"
   if [ "$AB_DRY_RUN" = "1" ]; then
@@ -414,7 +635,7 @@ check_bin_provenance() {
   local sha sha_re='^[0-9a-fA-F]{40}$'
   sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"
   if ! [[ "$sha" =~ $sha_re ]]; then
-    echo "::error::post-checkout HEAD did not resolve to a 40-hex commit ('$sha') -- refusing" >&2
+    echo "::error::HEAD did not resolve to a 40-hex commit ('$sha') -- refusing" >&2
     exit 1
   fi
   local bin_prov_json bin_prov_sha
@@ -428,76 +649,36 @@ check_bin_provenance() {
 }
 
 # ---------------------------------------------------------------------- #
-# resolve legs (by commit SUBJECT, never position — see header)
+# build + sweep (ONE binary, no ref-switching)
 # ---------------------------------------------------------------------- #
-
-if [ -n "$(git -C "$REPO_ROOT" status --porcelain)" ] && [ "$AB_DRY_RUN" != "1" ]; then
-  echo "::error::working tree at $REPO_ROOT is not clean — this script switches git refs in place; commit or stash first."
-  exit 1
-fi
-
-ORIGINAL_REF="$(git -C "$REPO_ROOT" symbolic-ref -q --short HEAD || git -C "$REPO_ROOT" rev-parse HEAD)"
-FUSED_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
-
-if [ "$AB_DRY_RUN" != "1" ] && [ "$(git -C "$REPO_ROOT" rev-parse --is-shallow-repository)" = "true" ]; then
-  git -C "$REPO_ROOT" fetch --unshallow --quiet 2>/dev/null || true
-fi
-
-BASE_MATCHES="$(git -C "$REPO_ROOT" log --all --format='%H%x09%s' | grep -F -- "$BASE_SUBJECT_MATCH" || true)"
-if [ -z "$BASE_MATCHES" ]; then
-  echo "::error::no commit subject contains BASE_SUBJECT_MATCH='${BASE_SUBJECT_MATCH}' — set BASE_SUBJECT_MATCH to the real eager-base commit's subject substring."
-  exit 1
-fi
-BASE_MATCH_COUNT="$(printf '%s\n' "$BASE_MATCHES" | grep -c .)"
-if [ "$BASE_MATCH_COUNT" -gt 1 ]; then
-  echo "::error::BASE_SUBJECT_MATCH='${BASE_SUBJECT_MATCH}' matches ${BASE_MATCH_COUNT} commits — ambiguous, refusing to guess:"
-  printf '%s\n' "$BASE_MATCHES"
-  exit 1
-fi
-BASE_SHA="$(printf '%s\n' "$BASE_MATCHES" | cut -f1)"
-
-echo "=== eager base:  ${BASE_SHA}  (subject contains '${BASE_SUBJECT_MATCH}') ==="
-echo "=== fused tip:    ${FUSED_SHA}  (HEAD at invocation) ==="
-echo "=== restoring to: ${ORIGINAL_REF} when the sweep finishes ==="
 
 TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
 JAMMI_BIN="$TARGET_DIR/release/jammi-bench"
 REF_SCRIPT="$REPO_ROOT/crates/jammi-bench/reference/torch_finetune_step.py"
 TORCH_PY="$TORCH_VENV/bin/python3"
 
-# ---------------------------------------------------------------------- #
-# phase A — fused tip: jammi-fused legs + both torch legs
-# ---------------------------------------------------------------------- #
-checkout_and_build "$FUSED_SHA"
+echo "=== tip binary: $(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown) ==="
+
+build_binary
 setup_torch_venv
 
 for cfg in "${CONFIGS[@]}"; do
   BATCH="${cfg%%:*}"; SEQ="${cfg##*:}"
   for DROPOUT in "${DROPOUTS[@]}"; do
     SLUG="$(slug_for "$BATCH" "$SEQ" "$DROPOUT")"
-    run_jammi_leg 1 jammi-fused "$JAMMI_BIN" "$JAMMI_MODEL_DIR" "$BATCH" "$SEQ" "$DROPOUT" "$SLUG"
+
+    # Context legs (single, never part of the bar ratio).
+    run_jammi_leg jammi-eager "$JAMMI_BIN" "$JAMMI_MODEL_DIR" "$BATCH" "$SEQ" "$DROPOUT" "$SLUG" "$JAMMI_EAGER_DISABLE_OP_KEYS"
     run_torch_leg eager torch-eager "$TORCH_PY" "$REF_SCRIPT" "$TORCH_MODEL_DIR" "$BATCH" "$SEQ" "$DROPOUT" "$SLUG"
-    run_torch_leg sdpa  torch-sdpa  "$TORCH_PY" "$REF_SCRIPT" "$TORCH_MODEL_DIR" "$BATCH" "$SEQ" "$DROPOUT" "$SLUG"
+
+    # Order-balanced bar legs: A, B, B, A (jammi-fused, torch-sdpa,
+    # torch-sdpa, jammi-fused) — see header's "ORDER-BALANCED BAR LEGS".
+    run_jammi_leg jammi-fused "$JAMMI_BIN" "$JAMMI_MODEL_DIR" "$BATCH" "$SEQ" "$DROPOUT" "$SLUG" ""
+    run_torch_leg sdpa torch-sdpa "$TORCH_PY" "$REF_SCRIPT" "$TORCH_MODEL_DIR" "$BATCH" "$SEQ" "$DROPOUT" "$SLUG"
+    run_torch_leg sdpa torch-sdpa-2 "$TORCH_PY" "$REF_SCRIPT" "$TORCH_MODEL_DIR" "$BATCH" "$SEQ" "$DROPOUT" "$SLUG"
+    run_jammi_leg jammi-fused-2 "$JAMMI_BIN" "$JAMMI_MODEL_DIR" "$BATCH" "$SEQ" "$DROPOUT" "$SLUG" ""
   done
 done
-
-# ---------------------------------------------------------------------- #
-# phase B — eager base: jammi-eager legs only
-# ---------------------------------------------------------------------- #
-checkout_and_build "$BASE_SHA"
-
-for cfg in "${CONFIGS[@]}"; do
-  BATCH="${cfg%%:*}"; SEQ="${cfg##*:}"
-  for DROPOUT in "${DROPOUTS[@]}"; do
-    SLUG="$(slug_for "$BATCH" "$SEQ" "$DROPOUT")"
-    run_jammi_leg 0 jammi-eager "$JAMMI_BIN" "$JAMMI_MODEL_DIR" "$BATCH" "$SEQ" "$DROPOUT" "$SLUG"
-  done
-done
-
-# ---------------------------------------------------------------------- #
-# phase C — leave the pod on the ref it started on
-# ---------------------------------------------------------------------- #
-checkout_and_build "$ORIGINAL_REF"
 
 # ---------------------------------------------------------------------- #
 # merge + table
@@ -513,4 +694,3 @@ PY_RC=$?
 echo
 echo "=== merged report + table: ${OUT_DIR} ==="
 exit "$PY_RC"
-

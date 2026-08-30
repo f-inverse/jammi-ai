@@ -30,9 +30,12 @@
 # `ENCODE_AB_CUDA_ORDINAL` (below): UNSET keeps the CPU-hermetic default
 # path byte-for-byte unchanged (no `--cuda` flag, no `cuda` cargo feature);
 # SET threads `--cuda "$ENCODE_AB_CUDA_ORDINAL"` into both legs and builds
-# jammi-bench with `--features cuda` (the SAME feature `finetune_ab.sh`'s
-# own `checkout_and_build` always turns on for its GPU-only legs) so the
-# engine's CUDA backend is actually compiled in.
+# jammi-bench with `--features cuda` -- the SAME `cuda` cargo feature
+# `finetune_ab.sh`'s own `build_binary` always turns on for its GPU legs
+# (that script's build additionally turns on `jammi-encoders/flash-attn`,
+# which this CPU/encode-only surface has no use for -- `cuda` alone is
+# already everything `--cuda` needs here) -- so the engine's CUDA backend
+# is actually compiled in.
 #
 # Not a CI job (no GPU strictly required -- `encode-step` is CPU-hermetic by
 # default -- but this DOES build+run a real jammi-bench release binary, the
@@ -86,8 +89,8 @@ run_cmd() {
 if [ "$ENCODE_AB_DRY_RUN" != "1" ]; then
   if [ -n "$ENCODE_AB_CUDA_ORDINAL" ]; then
     # A CUDA ordinal was requested: pull in the engine's CUDA backend, the
-    # SAME `cuda` cargo feature `finetune_ab.sh`'s own `checkout_and_build`
-    # always turns on for its GPU-only legs -- without it `--cuda` has no
+    # SAME `cuda` cargo feature `finetune_ab.sh`'s own `build_binary`
+    # always turns on for its GPU legs -- without it `--cuda` has no
     # device to select.
     run_cmd cargo build --release -p jammi-bench --features cuda --manifest-path "$REPO_ROOT/Cargo.toml" \
       || { echo "::error::cargo build -p jammi-bench --features cuda failed" >&2; exit 1; }

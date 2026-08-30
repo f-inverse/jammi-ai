@@ -514,5 +514,166 @@ class FinetuneRunIdentityFieldsSubsetTests(unittest.TestCase):
         )
 
 
+class F32StoredFieldCanonicalizerTests(unittest.TestCase):
+    """`identity_fields.normalize_f32_stored_field` (`lora_dropout`/
+    `max_grad_norm` — the ONLY two `IDENTITY_FIELD_CANONICALIZERS` members
+    beyond `backbone_dtype`/`target_modules`) — TRUE literals throughout
+    (never two values FABRICATED from the same Python literal on both
+    sides, which is exactly why this representational gap went uncaught
+    before this canonicalizer existed): `0.05000000074505806` is the REAL
+    `f64` a Python/JSON round-trip produces for the IEEE-754 `f32` nearest
+    `0.05`; `0.30000001192092896` is the same for `0.3`.
+
+    `closes_escape: esc-067-committed-producer-never-executed-end-to-end`
+    — before this canonicalizer, a real pod run of `finetune_ab.sh`
+    rejected every `dropout != 0` cross-stack row (jammi's own f32-stored
+    `0.05000000074505806` vs torch's f64 literal `0.05`) as a leg-premise
+    mismatch, one of three defects a real end-to-end run found that no
+    hermetic suite had ever exercised. This class is the hermetic,
+    RED-then-GREEN half of that fix's own eval.
+    """
+
+    def test_lora_dropout_f32_vs_f64_literal_matches(self):
+        jammi_side = 0.05000000074505806  # a real f32(0.05) read back as f64
+        torch_side = 0.05  # the operator's literal, torch's own f64 argparse value
+        self.assertEqual(
+            identity_fields.canonicalize_identity_field("lora_dropout", jammi_side),
+            identity_fields.canonicalize_identity_field("lora_dropout", torch_side),
+        )
+
+    def test_max_grad_norm_f32_vs_f64_literal_matches(self):
+        jammi_side = 0.30000001192092896  # a real f32(0.3) read back as f64
+        torch_side = 0.3
+        self.assertEqual(
+            identity_fields.canonicalize_identity_field("max_grad_norm", jammi_side),
+            identity_fields.canonicalize_identity_field("max_grad_norm", torch_side),
+        )
+
+    def test_lora_dropout_genuine_divergence_still_refuses(self):
+        self.assertNotEqual(
+            identity_fields.canonicalize_identity_field("lora_dropout", 0.05),
+            identity_fields.canonicalize_identity_field("lora_dropout", 0.06),
+        )
+
+    def test_max_grad_norm_none_matches_none(self):
+        self.assertIsNone(identity_fields.canonicalize_identity_field("max_grad_norm", None))
+        self.assertEqual(
+            identity_fields.canonicalize_identity_field("max_grad_norm", None),
+            identity_fields.canonicalize_identity_field("max_grad_norm", None),
+        )
+
+    def test_max_grad_norm_none_vs_value_still_refuses(self):
+        self.assertNotEqual(
+            identity_fields.canonicalize_identity_field("max_grad_norm", None),
+            identity_fields.canonicalize_identity_field("max_grad_norm", 0.3),
+        )
+
+    def test_lora_alpha_and_margin_have_no_canonicalizer(self):
+        # Negative control: lora_alpha/margin are f64 end-to-end on both
+        # producers -- widening them onto the f32 round-trip would be
+        # exactly the "never widens what counts as a match" violation this
+        # module's own doc forbids.
+        self.assertNotIn("lora_alpha", identity_fields.IDENTITY_FIELD_CANONICALIZERS)
+        self.assertNotIn("margin", identity_fields.IDENTITY_FIELD_CANONICALIZERS)
+
+    def test_lora_dropout_and_max_grad_norm_are_registered(self):
+        self.assertIn("lora_dropout", identity_fields.IDENTITY_FIELD_CANONICALIZERS)
+        self.assertIn("max_grad_norm", identity_fields.IDENTITY_FIELD_CANONICALIZERS)
+        self.assertIs(
+            identity_fields.IDENTITY_FIELD_CANONICALIZERS["lora_dropout"],
+            identity_fields.normalize_f32_stored_field,
+        )
+        self.assertIs(
+            identity_fields.IDENTITY_FIELD_CANONICALIZERS["max_grad_norm"],
+            identity_fields.normalize_f32_stored_field,
+        )
+
+
+class F32DomainGuardTests(unittest.TestCase):
+    """Advisory (adversarial audit): `_round_trip_f32`'s domain guard —
+    out-of-`f32`-range/non-finite input becomes a REFUSAL
+    (`_NotRepresentableAsF32`), never an uncaught `OverflowError` crash.
+    """
+
+    def test_out_of_f32_range_finite_value_refuses_never_crashes(self):
+        # 1e40 exceeds f32's max finite magnitude (~3.4028235e38) --
+        # struct.pack('<f', 1e40) itself raises OverflowError; this must
+        # never propagate out of the comparator.
+        result = identity_fields.canonicalize_identity_field("lora_dropout", 1e40)
+        self.assertIsInstance(result, identity_fields._NotRepresentableAsF32)
+        self.assertIn("not representable", repr(result))
+
+    def test_positive_infinity_refuses(self):
+        result = identity_fields.canonicalize_identity_field("max_grad_norm", float("inf"))
+        self.assertIsInstance(result, identity_fields._NotRepresentableAsF32)
+
+    def test_negative_infinity_refuses(self):
+        result = identity_fields.canonicalize_identity_field("lora_dropout", float("-inf"))
+        self.assertIsInstance(result, identity_fields._NotRepresentableAsF32)
+
+    def test_nan_refuses(self):
+        result = identity_fields.canonicalize_identity_field("lora_dropout", float("nan"))
+        self.assertIsInstance(result, identity_fields._NotRepresentableAsF32)
+
+    def test_negative_zero_is_not_refused_and_matches_positive_zero(self):
+        # Negative control: -0.0 is finite, in-range, and round-trips
+        # cleanly -- must NOT be swept into the domain-guard refusal, and
+        # must still compare equal to 0.0 (Python's own -0.0 == 0.0).
+        neg_zero = identity_fields.canonicalize_identity_field("lora_dropout", -0.0)
+        pos_zero = identity_fields.canonicalize_identity_field("lora_dropout", 0.0)
+        self.assertNotIsInstance(neg_zero, identity_fields._NotRepresentableAsF32)
+        self.assertEqual(neg_zero, pos_zero)
+
+    def test_two_unrepresentable_values_never_accidentally_match(self):
+        # Even the IDENTICAL raw value, refused twice, must never compare
+        # equal to itself -- two malformed inputs must not "cancel out".
+        a = identity_fields.canonicalize_identity_field("lora_dropout", 1e40)
+        b = identity_fields.canonicalize_identity_field("lora_dropout", 1e40)
+        self.assertNotEqual(a, b)
+
+    def test_a_refused_value_never_matches_a_real_float(self):
+        a = identity_fields.canonicalize_identity_field("lora_dropout", float("nan"))
+        b = identity_fields.canonicalize_identity_field("lora_dropout", 0.05)
+        self.assertNotEqual(a, b)
+
+    def test_normal_values_are_unaffected_by_the_domain_guard(self):
+        # Positive control: the ordinary f32-round-trip match still works
+        # exactly as before this guard was added.
+        self.assertEqual(
+            identity_fields.canonicalize_identity_field("lora_dropout", 0.05000000074505806),
+            identity_fields.canonicalize_identity_field("lora_dropout", 0.05),
+        )
+
+    def test_repr_is_instance_unique_even_for_the_identical_raw_value(self):
+        """Advisory (ii), round-2 adversarial audit: `finetune_run_leg_
+        identity_violations` (`ab_merge.py`) groups displayed values by
+        `repr(display)` -- a plain dict KEY, never by `==`. A `raw`-only
+        `__repr__` would let two DIFFERENT `_NotRepresentableAsF32`
+        instances wrapping the SAME raw value (e.g. two legs both reading
+        `1e40`) collapse into ONE dict bucket, silently "agreeing" by
+        string coincidence -- the same class of accidental match `__eq__`
+        already forbids, reached through a different mechanism.
+        """
+        a = identity_fields.canonicalize_identity_field("lora_dropout", 1e40)
+        b = identity_fields.canonicalize_identity_field("lora_dropout", 1e40)
+        self.assertIsInstance(a, identity_fields._NotRepresentableAsF32)
+        self.assertIsInstance(b, identity_fields._NotRepresentableAsF32)
+        self.assertNotEqual(repr(a), repr(b))
+        # The `dict`-grouping shape `ab_merge.py`'s cross-seed identity
+        # check actually uses, driven directly against the real class.
+        groups = {}
+        for label, display in (("leg1", a), ("leg2", b)):
+            key = repr(display)
+            entry = groups.setdefault(key, (display, []))
+            entry[1].append(label)
+        self.assertEqual(len(groups), 2, f"two distinct malformed values collapsed into one bucket: {groups}")
+
+    def test_repr_still_names_the_raw_value_for_a_human_reader(self):
+        # The instance-unique sequence number must not obscure the actual
+        # underlying raw value a human debugging a violation needs to see.
+        result = identity_fields.canonicalize_identity_field("max_grad_norm", 1e40)
+        self.assertIn("1e+40", repr(result))
+
+
 if __name__ == "__main__":
     unittest.main()

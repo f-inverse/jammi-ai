@@ -116,6 +116,7 @@ fn file_format_to_proto(format: Option<FileFormat>) -> pb::FileFormat {
         Some(FileFormat::Parquet) => pb::FileFormat::Parquet,
         Some(FileFormat::Csv) => pb::FileFormat::Csv,
         Some(FileFormat::Json) => pb::FileFormat::Json,
+        Some(FileFormat::JsonLines) => pb::FileFormat::Jsonl,
         Some(FileFormat::Avro) => pb::FileFormat::Avro,
         None => pb::FileFormat::Unspecified,
     }
@@ -128,6 +129,7 @@ fn file_format_from_proto(format: i32) -> Result<Option<FileFormat>, Status> {
         Ok(pb::FileFormat::Parquet) => Ok(Some(FileFormat::Parquet)),
         Ok(pb::FileFormat::Csv) => Ok(Some(FileFormat::Csv)),
         Ok(pb::FileFormat::Json) => Ok(Some(FileFormat::Json)),
+        Ok(pb::FileFormat::Jsonl) => Ok(Some(FileFormat::JsonLines)),
         Ok(pb::FileFormat::Avro) => Ok(Some(FileFormat::Avro)),
         Ok(pb::FileFormat::Unspecified) | Err(_) => Ok(None),
     }
@@ -453,4 +455,47 @@ pub fn derives_from_edge_from_proto(
         derived: edge.derived,
         kind: anchor_kind_from_proto(edge.kind)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every engine `FileFormat` variant round-trips through the proto
+    /// `FileFormat` enum — the wire encode/decode pair must be total and
+    /// lossless for each concrete format, not just the ones exercised
+    /// elsewhere. A newly added variant with no matching arm here would
+    /// silently decode back to `None` ("let the engine infer") instead of
+    /// the format the caller actually asked for.
+    #[test]
+    fn every_file_format_round_trips_through_the_wire_encode_and_decode() {
+        for format in [
+            FileFormat::Parquet,
+            FileFormat::Csv,
+            FileFormat::Json,
+            FileFormat::JsonLines,
+            FileFormat::Avro,
+        ] {
+            let encoded = file_format_to_proto(Some(format.clone()));
+            let decoded = file_format_from_proto(encoded as i32)
+                .expect("a concrete format always decodes")
+                .expect("a concrete format never decodes to None");
+            assert_eq!(
+                decoded, format,
+                "round-trip must be identity for {format:?}"
+            );
+        }
+    }
+
+    /// The unset/unspecified case on both directions of the same seam: `None`
+    /// encodes to `FILE_FORMAT_UNSPECIFIED`, and decoding it back reads as
+    /// "let the engine infer" (`None`), matching the `SourceConnection`
+    /// encode/decode doc contract above.
+    #[test]
+    fn unset_format_round_trips_through_unspecified() {
+        let encoded = file_format_to_proto(None);
+        assert_eq!(encoded, pb::FileFormat::Unspecified);
+        let decoded = file_format_from_proto(encoded as i32).unwrap();
+        assert_eq!(decoded, None);
+    }
 }

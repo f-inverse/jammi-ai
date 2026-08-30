@@ -286,6 +286,93 @@ async fn session_respects_config_batch_size(backend: BackendKind) {
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
+async fn register_and_query_jsonl_file_source(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let session = session_or_skip!(backend, dir);
+
+    // A 2-row newline-delimited JSON fixture, written directly into the
+    // test's tempdir (this format has no shared fixture under
+    // `tests/fixtures/`, unlike parquet/csv above).
+    let fixture_path = dir.path().join("events.jsonl");
+    std::fs::write(
+        &fixture_path,
+        "{\"id\": 1, \"name\": \"alpha\"}\n{\"id\": 2, \"name\": \"beta\"}\n",
+    )
+    .unwrap();
+
+    let events_id = format!("events_{}", unique_suffix());
+    session
+        .add_source(
+            &events_id,
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", fixture_path.display())),
+                format: Some(FileFormat::JsonLines),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let results = session
+        .sql(&format!(
+            "SELECT id, name FROM {events_id}.public.events ORDER BY id"
+        ))
+        .await
+        .unwrap();
+    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2);
+    assert!(results[0].schema().field_with_name("id").is_ok());
+    assert!(results[0].schema().field_with_name("name").is_ok());
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn directory_source_with_jsonl_format_excludes_json_named_file(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let session = session_or_skip!(backend, dir);
+
+    // A directory holding both a `.jsonl` file (2 rows) and a `.json`-named
+    // file (3 rows, same schema) — the jsonl-format directory listing must
+    // glob-match only the `.jsonl` file, not the `.json` sibling.
+    let listing_dir = dir.path().join("events_dir");
+    std::fs::create_dir_all(&listing_dir).unwrap();
+    std::fs::write(listing_dir.join("a.jsonl"), "{\"id\": 1}\n{\"id\": 2}\n").unwrap();
+    std::fs::write(
+        listing_dir.join("b.json"),
+        "{\"id\": 3}\n{\"id\": 4}\n{\"id\": 5}\n",
+    )
+    .unwrap();
+
+    let events_id = format!("events_dir_{}", unique_suffix());
+    session
+        .add_source(
+            &events_id,
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", listing_dir.display())),
+                format: Some(FileFormat::JsonLines),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let results = session
+        .sql(&format!("SELECT id FROM {events_id}.public.events_dir"))
+        .await
+        .unwrap();
+    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 2,
+        "jsonl-format directory listing must match only the .jsonl file, not the .json sibling"
+    );
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
 async fn session_tenant_defaults_to_none_and_with_tenant_sets_it(backend: BackendKind) {
     use jammi_db::TenantId;
     use std::str::FromStr;

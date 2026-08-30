@@ -57,6 +57,13 @@ pub async fn create_listing_table(
             Arc::new(datafusion::datasource::file_format::json::JsonFormat::default()),
             ".json",
         ),
+        FileFormat::JsonLines => (
+            // DataFusion's `JsonFormat` is already line-delimited, so this
+            // shares the same reader as `FileFormat::Json` — only the default
+            // directory-listing extension differs.
+            Arc::new(datafusion::datasource::file_format::json::JsonFormat::default()),
+            ".jsonl",
+        ),
         FileFormat::Avro => return Err(JammiError::Config("Avro not yet supported".into())),
     };
 

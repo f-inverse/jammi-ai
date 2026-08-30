@@ -40,6 +40,12 @@ pub enum FileFormat {
     Csv,
     /// Newline-delimited JSON.
     Json,
+    /// Newline-delimited JSON, spelled `jsonl`/`ndjson` and defaulting to a
+    /// `.jsonl` extension during directory listing. Functionally identical to
+    /// [`Self::Json`] (both use DataFusion's line-delimited `JsonFormat`); the
+    /// distinct variant exists so a `.jsonl` corpus is neither rejected as an
+    /// unknown format nor silently excluded by the `.json` directory glob.
+    JsonLines,
     /// Apache Avro binary format.
     Avro,
 }
@@ -50,6 +56,7 @@ impl std::fmt::Display for FileFormat {
             Self::Parquet => write!(f, "parquet"),
             Self::Csv => write!(f, "csv"),
             Self::Json => write!(f, "json"),
+            Self::JsonLines => write!(f, "jsonl"),
             Self::Avro => write!(f, "avro"),
         }
     }
@@ -62,9 +69,10 @@ impl std::str::FromStr for FileFormat {
             "parquet" => Ok(Self::Parquet),
             "csv" => Ok(Self::Csv),
             "json" => Ok(Self::Json),
+            "jsonl" | "ndjson" => Ok(Self::JsonLines),
             "avro" => Ok(Self::Avro),
             other => Err(crate::error::JammiError::Other(format!(
-                "Unknown file format '{other}'. Expected: parquet, csv, json, avro"
+                "Unknown file format '{other}'. Expected: parquet, csv, json, jsonl, avro"
             ))),
         }
     }
@@ -144,4 +152,51 @@ impl SourceConnection {
 pub(crate) fn table_name_from_url(url: &str) -> String {
     let path = url.rsplit(['/', '\\']).next().unwrap_or(url);
     path.split('.').next().unwrap_or(path).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn file_format_round_trips_through_display_and_from_str() {
+        for format in [
+            FileFormat::Parquet,
+            FileFormat::Csv,
+            FileFormat::Json,
+            FileFormat::JsonLines,
+            FileFormat::Avro,
+        ] {
+            let rendered = format.to_string();
+            let parsed = FileFormat::from_str(&rendered).expect("canonical format parses");
+            assert_eq!(parsed, format, "round-trip must be identity for {format:?}");
+        }
+        assert_eq!(FileFormat::JsonLines.to_string(), "jsonl");
+    }
+
+    #[test]
+    fn jsonl_and_ndjson_both_parse_to_json_lines() {
+        assert_eq!(
+            FileFormat::from_str("jsonl").unwrap(),
+            FileFormat::JsonLines
+        );
+        assert_eq!(
+            FileFormat::from_str("ndjson").unwrap(),
+            FileFormat::JsonLines
+        );
+    }
+
+    #[test]
+    fn unknown_file_format_error_names_every_accepted_token() {
+        let err = FileFormat::from_str("bogus").unwrap_err().to_string();
+        assert!(
+            err.contains("jsonl"),
+            "error must name jsonl as an accepted format: {err}"
+        );
+        assert!(err.contains("parquet"));
+        assert!(err.contains("csv"));
+        assert!(err.contains("json"));
+        assert!(err.contains("avro"));
+    }
 }

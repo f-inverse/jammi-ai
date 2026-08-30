@@ -34,12 +34,15 @@ for its own sake:
     same-workload pair is defined by "measure M steps, measure N steps,
     subtract"; M<=N is not a valid differencing pair at all (a zero or
     negative step delta divides by a non-positive quantity below).
-  - refuses (exit nonzero, no report) if any per-key raw count/time delta
-    is NEGATIVE beyond a tiny tolerance -- for a genuine same-workload N<M
-    pair, every kernel/memcpy/memset a training step launches should only
-    ACCUMULATE going from the N-step export to the M-step export (the
-    contract's pinned flags make the two runs' non-training-step work
-    identical, so it cancels to exactly zero, never negative); a
+  - refuses (exit nonzero, no report) if any per-key raw COUNT delta (every
+    kernel bucket's, and memcpy/memset's own aggregate) -- or a kernel
+    bucket's raw TIME delta specifically (see the paragraphs below for
+    exactly why memcpy/memset TIME is deliberately excluded from this) --
+    is NEGATIVE beyond a tiny tolerance: for a genuine same-workload N<M
+    pair, every kernel/memcpy/memset launch COUNT a training step causes
+    should only ACCUMULATE going from the N-step export to the M-step
+    export (the contract's pinned flags make the two runs' non-training-
+    step work identical, so it cancels to exactly zero, never negative); a
     meaningfully negative delta is the mechanical signature of "the two
     exports were not actually the declared same-workload (N, M) pair" --
     e.g. a stale/mismatched sqlite file, a build/config drift between the
@@ -81,39 +84,81 @@ for its own sake:
     calibration, including the round-4 pod-run LIVE FINDING's honest
     relative jitter (0.9998, not "many multiples of 100%" -- a ratio of an
     absolute-value numerator to a same-sign-or-larger denominator cannot
-    exceed 1.0). A fixed-cost bucket whose jitter exceeds the hybrid bound
-    refuses exactly like every other per-key violation above (folded into
-    the same `NonComparablePairError`). Every fixed-cost bucket (whether
-    it passed or would have failed the bound -- the informational tally
-    always runs before the bound is checked) is summarized as
-    `fixed_cost_buckets` (a count), `fixed_cost_time_us` (the sum of their
-    `|time delta|`), and `fixed_cost_jitter_max_rel` (the largest single
-    bucket's relative jitter observed) so the cancellation -- and how much
-    headroom it used -- stays visible rather than silently vanishing. A
+    exceed 1.0). A fixed-cost KERNEL bucket whose jitter exceeds the
+    hybrid bound refuses exactly like every other per-key violation above
+    (folded into the same `NonComparablePairError`). Every fixed-cost
+    KERNEL bucket (whether it passed or would have failed the bound -- the
+    informational tally always runs before the bound is checked) is
+    summarized as `fixed_cost_buckets` (a count), `fixed_cost_time_us`
+    (the sum of their `|time delta|`), and `fixed_cost_jitter_max_rel`
+    (the largest single bucket's relative jitter observed) so the
+    cancellation -- and how much headroom it used -- stays visible rather
+    than silently vanishing. These three fields are KERNEL-BUCKET-ONLY
+    (phase-4 audit round-3 re-audit, correcting an earlier universal
+    overstatement in this same paragraph) -- see the memcpy/memset
+    paragraph below for why they are deliberately excluded. A kernel
     bucket whose count delta is negative BEYOND `--launch-tolerance`, or
     positive with a negative time delta, is NOT fixed-cost -- both remain
-    refused exactly as before this round. The SAME classification and
-    hybrid bound apply to the memcpy/memset aggregate deltas too (phase-4
-    audit round-2 re-audit advisory 2): a cancelling (dn<=0 within
-    `--launch-tolerance`) memcpy/memset delta is fixed-cost, checked
-    against the hybrid bound, never the flat `--time-tolerance-us`
-    (whose default of 0.0 would otherwise refuse on a single nanosecond
-    of negative memcpy/memset jitter -- the driver passes neither flag).
+    refused exactly as before this round.
 
-    `--launch-tolerance`, `--time-tolerance-us`, and
-    `--fixed-cost-jitter-rel-tolerance` are themselves validated
-    (phase-4 audit round-2 re-audit BLOCK 2): `launch_tolerance` and
-    `time_tolerance_us` must be finite and >= 0 (a negative
-    `launch_tolerance` would silently EMPTY the fixed-cost range
+    memcpy/memset aggregate deltas are DELIBERATELY NOT part of any of
+    the above (phase-4 audit round-3 re-audit -- a narrow rebuild of an
+    earlier round's attempt to unify them with the per-kernel fixed-cost
+    classification, deleted rather than recalibrated further): their
+    COUNT delta still refuses exactly like a kernel bucket's count would
+    (`_check_non_negative` against `--launch-tolerance` -- counts are
+    exact integers under the contract's pinned flags, so a negative
+    aggregate count beyond tolerance is still a genuine
+    not-same-workload signal), but their TIME delta is PURELY
+    INFORMATIONAL: reported SIGNED and jitter-inclusive in
+    `memcpy_per_step`/`memset_per_step`'s own `"us"` field, exactly as
+    measured, NEVER checked against any tolerance or bound, NEVER
+    refused on, and NEVER part of `gpu_kernel_us_per_step` or any other
+    decision field (it already was not). Times and counts diverge here
+    on purpose: memcpy/memset activity is not attributable to any single
+    kernel bucket, so there is no principled per-bucket scale to bound a
+    "nanosecond-scale jitter" claim against the way the kernel-bucket
+    hybrid bound above can; treating the aggregate time delta as a
+    decision input (whether via a flat tolerance or a hybrid bound) risks
+    a leg refusing on host<->device timing noise this module has no
+    meaningful way to distinguish from a real signal at the AGGREGATE
+    level, so it is surfaced for a human/downstream reader to look at,
+    never used to gate anything itself.
+
+    EVERY numeric knob `build_report`/`main()` accepts is itself
+    validated (phase-4 audit round-2 re-audit BLOCK 2, swept to EVERY
+    remaining knob round-3 re-audit BLOCK 1 -- the auditor's own method:
+    a fail-open/fail-silent mode exists for each one, so each one is
+    closed the same way, in one pass, rather than one knob at a time):
+    `launch_tolerance` and `time_tolerance_us` must be finite and >= 0 (a
+    negative `launch_tolerance` would silently EMPTY the fixed-cost range
     `[-launch_tolerance, 0]` and invert the negative-count-delta
-    refusal); `fixed_cost_jitter_rel_tolerance` must be finite and in
-    `[0, 1)` (NaN/inf/>=1.0 would fail OPEN -- silently never refusing a
-    fixed-cost bucket's jitter, reopening the exact gap round-1's fix
-    closed -- and a negative value inverts the guard the same way a
-    negative `launch_tolerance` does). A caller passing an out-of-domain
-    value for any of the three gets a usage-error refusal (`ValueError`,
-    `main()` exit 2) naming the knob and its valid domain, never a
-    silently-degraded or silently-inverted guard.
+    refusal); `fixed_cost_jitter_floor_ns` must be finite and >= 0 (an
+    infinite or absurdly large floor -- e.g. `1e12` -- silently DISABLES
+    the hybrid bound entirely, since `max(floor, rel*denom)` then never
+    refuses regardless of how large the actual jitter is; a NaN floor
+    makes every `>` comparison against it `False` in Python, the SAME
+    silent "never refuses" failure mode by a different route -- both
+    closed the same way this sweep closes every other knob);
+    `fixed_cost_jitter_rel_tolerance` must be
+    finite and in `[0, 1)` (NaN/inf/>=1.0 would fail OPEN -- silently
+    never refusing a fixed-cost bucket's jitter, reopening the exact gap
+    round-1's fix closed -- and a negative value inverts the guard the
+    same way a negative `launch_tolerance` does). A caller passing an
+    out-of-domain value for any of these FOUR tolerance knobs gets a
+    usage-error refusal (`ValueError`, `main()` exit 2) naming the knob
+    and its valid domain, never a silently-degraded or silently-inverted
+    guard. `wall_a`/`wall_b` (when either is given) must ALSO each be
+    finite -- an infinite `--wall-b` would otherwise pass the
+    `wall_b > wall_a > 0` ordering check trivially and write a literal
+    `Infinity` into `wall_s_per_step` in the persisted JSON report (not
+    valid JSON per RFC 8259, and not a value any downstream reader
+    dividing by it could use) -- but this is folded into the SAME
+    `WallPairInvalidError`/exit 7 the ordering check already raises (see
+    the wall-pair bullet below), not `ValueError`/exit 2: a non-finite
+    wall value is a wall-PAIR-validity failure, not a bare argument-shape
+    usage error, the same distinction `main()`'s own dedicated
+    one-sided-`--wall-*` check already draws.
 
     A SECOND, independent guard closes the "every bucket happened to be
     fixed-cost" degenerate case (phase-4 audit BLOCK 1): if ZERO buckets
@@ -127,14 +172,20 @@ for its own sake:
     violation above (a more specific bound violation is reported first)
     and refuses with `EmptyDifferencedCensusError` -- a report is never
     silently returned with zero kernel-level differencing signal in it.
-  - refuses (exit nonzero, no report) unless `wall_b > wall_a > 0` whenever
-    `--wall-a`/`--wall-b` are both given -- the SAME non-negativity/
-    ordering domain check the per-key kernel/memcpy/memset deltas already
-    get above, applied to the one delta this module cannot derive from the
-    sqlite exports themselves (a caller-supplied `train_run_wall_s` pair
-    that is non-positive, equal, or inverted is not a valid same-workload
-    M>N wall-clock pair either, and dividing by `steps_b - steps_a` would
-    otherwise silently emit a negative or infinite `wall_s_per_step`).
+  - refuses (exit nonzero, no report) unless `wall_a`/`wall_b` (whichever
+    is given) are each FINITE, and unless `wall_b > wall_a > 0` whenever
+    BOTH are given -- the SAME non-negativity/ordering domain check the
+    per-key kernel/memcpy/memset COUNT deltas already get above, applied
+    to the one delta this module cannot derive from the sqlite exports
+    themselves (a caller-supplied `train_run_wall_s` pair that is
+    non-finite, non-positive, equal, or inverted is not a valid
+    same-workload M>N wall-clock pair either, and dividing by
+    `steps_b - steps_a` would otherwise silently emit a negative or
+    infinite `wall_s_per_step` -- the finiteness check closes the
+    specific live gap `--wall-b inf` left: `inf > wall_a > 0` is a TRUE
+    ordering check that would have written a literal `Infinity` into the
+    persisted report, not valid JSON, phase-4 audit round-3 re-audit
+    BLOCK 1's own sibling finding).
   - cross-checks the CALLER-declared `steps_a`/`steps_b` against the
     report's own MEASURED `steps_measured` (`FinetuneRunTier`), when the
     caller supplies `--steps-measured-a`/`--steps-measured-b` -- refuses
@@ -156,9 +207,14 @@ Output JSON: the ancestor's shape (`steps_diff`, `gpu_kernel_us_per_step`,
 `launches_per_step`, `memcpy_per_step`, `memset_per_step`,
 `by_kernel_name`, `by_kernel_and_grid`) plus `nsys_sqlite_schema_ok`,
 `steps_a`, `steps_b` (CONTRACT P4's own field list), plus
-`fixed_cost_buckets`/`fixed_cost_time_us`/`fixed_cost_jitter_max_rel`
-(round-4 pod-run fix -- see the fixed-cost exception in the guard list
-above).
+`fixed_cost_buckets`/`fixed_cost_time_us`/`fixed_cost_jitter_max_rel` --
+KERNEL-BUCKET-ONLY (round-1 pod-run fix -- see the fixed-cost exception
+in the guard list above; NOT memcpy/memset, see that paragraph's own
+"DELIBERATELY NOT" wording). `memcpy_per_step`/`memset_per_step`'s own
+`"us"` field is PURELY INFORMATIONAL and SIGNED (jitter-inclusive, never
+clamped, never checked against any tolerance) -- excluded from
+`gpu_kernel_us_per_step` and every other decision field in this report,
+exactly as it already was before this round's memcpy/memset rebuild.
 
 Wall denominator (round-3 pressure-test, contract v4 -- `### Wall
 denominator`): `--wall-a`/`--wall-b` (seconds, each run's OWN
@@ -198,19 +254,25 @@ Usage: kernel_census.py A.sqlite B.sqlite STEPS_A STEPS_B out.json
 
 Hermetic: reads only the two sqlite files named on the command line (plus
 stdlib `sqlite3`); no network, no build, no GPU. Exit codes: 0 = report
-written; 2 = usage error (including M<=N, a one-sided --wall-*, or any of
-`--launch-tolerance`/`--time-tolerance-us`/
-`--fixed-cost-jitter-rel-tolerance` outside its validated domain -- see
-the module doc's "EXCEPTION" paragraph above); 3 = a kernel table is missing on one or both
-exports (leg INVALID -- instrument failure); 4 = a per-key delta is
-negative beyond tolerance, OR a fixed-cost bucket's (kernel or
-memcpy/memset) time jitter exceeds the HYBRID
-`--fixed-cost-jitter-floor-ns`/`--fixed-cost-jitter-rel-tolerance` bound
+written; 2 = usage error (including M<=N, a one-sided --wall-*, or the
+four TOLERANCE knobs -- `--launch-tolerance`/`--time-tolerance-us`/
+`--fixed-cost-jitter-floor-ns`/`--fixed-cost-jitter-rel-tolerance` --
+outside their validated finite/domain range, see the "knob validation"
+paragraph below; `--wall-a`/`--wall-b` non-finiteness is exit 7 instead,
+below -- it is a WALL-PAIR-validity failure, the same class as the
+ordering check, not a bare argument-shape usage error); 3 = a kernel
+table is missing on one or both exports (leg INVALID -- instrument
+failure); 4 = a per-key KERNEL BUCKET delta is negative beyond
+tolerance, its time jitter exceeds the HYBRID
+`--fixed-cost-jitter-floor-ns`/`--fixed-cost-jitter-rel-tolerance`
+bound, or a memcpy/memset aggregate COUNT (never time -- see the
+memcpy/memset paragraph above) is negative beyond `--launch-tolerance`
 (leg INVALID -- non-comparable pair, not a genuine negative measurement);
 5 = declared steps disagree with the report's own steps_measured (leg
 INVALID); 6 = a kernel table is present but EMPTY on one or both exports
 (leg INVALID -- same instrument failure as exit 3); 7 = the wall pair
-fails `wall_b > wall_a > 0` (leg INVALID); 8 = a sqlite export is
+fails finiteness (either `wall_a`/`wall_b`, when given) or
+`wall_b > wall_a > 0` (leg INVALID); 8 = a sqlite export is
 corrupt/unreadable (`sqlite3.DatabaseError`); 9 = the differenced census
 is EMPTY -- zero kernel buckets carried a positive launch-count delta
 (leg INVALID -- not a genuine declared M>N same-workload pair).
@@ -415,16 +477,17 @@ def _check_non_negative(
 
 
 def _classify_delta(dn: float, launch_tolerance: float) -> str:
-    """Classifies a bucket's launch-count delta into exactly one of three
-    buckets this module's guards treat differently (see module doc's
-    "EXCEPTION" paragraph): `"fixed_cost"` (`dn` in
+    """Classifies a per-KERNEL-bucket launch-count delta into exactly one
+    of three classes this module's guards treat differently (see module
+    doc's "EXCEPTION" paragraph): `"fixed_cost"` (`dn` in
     `[-launch_tolerance, 0]` -- includes the exact `dn==0` case),
     `"positive"` (`dn > 0`, real added work), or `"negative_regression"`
-    (`dn < -launch_tolerance`, always refused). Shared by the per-key
-    kernel-bucket loop and the memcpy/memset aggregate deltas (phase-4
-    audit round-2 re-audit advisory 2) so both apply the IDENTICAL
-    classification, not two hand-maintained copies of the same three-way
-    split."""
+    (`dn < -launch_tolerance`, always refused). KERNEL-BUCKET-ONLY (phase-4
+    audit round-3 re-audit -- a prior round applied this same
+    classification to the memcpy/memset aggregate deltas too; that
+    unification was DELETED, not recalibrated, since memcpy/memset
+    activity is not attributable to any single bucket -- see the module
+    doc's memcpy/memset paragraph)."""
     if -launch_tolerance <= dn <= 0:
         return "fixed_cost"
     if dn > 0:
@@ -491,11 +554,12 @@ def build_report(
             "a census difference needs a genuine M>N same-workload pair"
         )
     # Tolerance-knob domain validation (phase-4 audit round-2 re-audit
-    # BLOCK 2): an out-of-domain value for any of these three would
-    # silently DEGRADE or INVERT a guard rather than raise -- caught here,
-    # once, before any of the per-key classification below ever reads
-    # them, rather than three separate ad-hoc checks scattered through the
-    # loop. `ValueError` (the same usage-error family `steps_b <= steps_a`
+    # BLOCK 2, swept to EVERY remaining numeric knob round-3 re-audit
+    # BLOCK 1): an out-of-domain value for any of these FOUR would
+    # silently DEGRADE or DISABLE a guard rather than raise -- caught
+    # here, once, before any of the per-key classification below ever
+    # reads them, rather than ad-hoc checks scattered through the loop.
+    # `ValueError` (the same usage-error family `steps_b <= steps_a`
     # above already uses -> `main()`'s existing `except ValueError`
     # handler -> exit 2) -- these are CALLER-supplied argument domain
     # errors, not a leg-INVALID measurement outcome.
@@ -509,6 +573,13 @@ def build_report(
         raise ValueError(
             f"time_tolerance_us must be finite and >= 0, got {time_tolerance_us!r}"
         )
+    if not (math.isfinite(fixed_cost_jitter_floor_ns) and fixed_cost_jitter_floor_ns >= 0):
+        raise ValueError(
+            f"fixed_cost_jitter_floor_ns must be finite and >= 0, got "
+            f"{fixed_cost_jitter_floor_ns!r} -- an infinite or absurdly large floor would "
+            "silently DISABLE the hybrid bound entirely (max(floor, rel*denom) never refuses), "
+            "and a NaN floor makes every comparison against it False the same way"
+        )
     if not (
         math.isfinite(fixed_cost_jitter_rel_tolerance)
         and 0.0 <= fixed_cost_jitter_rel_tolerance < 1.0
@@ -519,6 +590,18 @@ def build_report(
             "(silently never refusing a fixed-cost bucket's time jitter), and a negative value "
             "inverts the guard"
         )
+    # Wall-pair validity (folded into WallPairInvalidError/exit 7, NOT
+    # ValueError/exit 2 -- see module doc): non-finite is checked FIRST so
+    # a caller gets "not finite" rather than a misleading "does not
+    # satisfy wall_b > wall_a > 0" for e.g. `--wall-b inf`, which
+    # trivially SATISFIES that ordering comparison (phase-4 audit round-3
+    # re-audit BLOCK 1's own sibling finding: `inf > wall_a > 0` is `True`,
+    # so without this check `wall_s_per_step` would silently become a
+    # literal `Infinity` in the persisted JSON report).
+    if wall_a is not None and not math.isfinite(wall_a):
+        raise WallPairInvalidError(f"--wall-a={wall_a} must be finite")
+    if wall_b is not None and not math.isfinite(wall_b):
+        raise WallPairInvalidError(f"--wall-b={wall_b} must be finite")
     if wall_a is not None and wall_b is not None and not (wall_a > 0 and wall_b > wall_a):
         raise WallPairInvalidError(
             f"--wall-a={wall_a} --wall-b={wall_b} do not satisfy wall_b > wall_a > 0 -- not a "
@@ -608,37 +691,24 @@ def build_report(
             f"kernel {name}{key[1:]} launch count", dn, launch_tolerance, violations
         )
 
-    # memcpy/memset aggregate deltas take the SAME three-way classification
-    # (phase-4 audit round-2 re-audit advisory 2): a cancelling
-    # (dn<=0-within-tolerance) delta is fixed-cost, checked against the
-    # HYBRID bound, never the flat --time-tolerance-us (whose default of
-    # 0.0 would otherwise refuse on a single nanosecond of negative
-    # memcpy/memset jitter -- the driver passes neither flag).
+    # memcpy/memset COUNT deltas still refuse exactly like a kernel
+    # bucket's count would (phase-4 audit round-3 re-audit -- a narrow
+    # rebuild, by DELETION, of an earlier round's attempt to unify these
+    # with the per-kernel fixed-cost classification): counts are exact
+    # integers under the contract's pinned flags, so a negative aggregate
+    # count beyond --launch-tolerance is still a genuine
+    # not-same-workload signal. TIME deltas are DELIBERATELY never
+    # classified, never bounded, never refused on -- see the module doc's
+    # memcpy/memset paragraph for why (not attributable to any single
+    # bucket, so there is no principled scale to bound a "jitter" claim
+    # against); they are reported below as PURELY INFORMATIONAL, SIGNED,
+    # jitter-inclusive values.
     memcpy_dn = mb["memcpy"][0] - ma["memcpy"][0]
     memcpy_dns = mb["memcpy"][1] - ma["memcpy"][1]
     memset_dn = mb["memset"][0] - ma["memset"][0]
     memset_dns = mb["memset"][1] - ma["memset"][1]
-    for label, dn, dns, ns_a, ns_b in (
-        ("memcpy", memcpy_dn, memcpy_dns, ma["memcpy"][1], mb["memcpy"][1]),
-        ("memset", memset_dn, memset_dns, ma["memset"][1], mb["memset"][1]),
-    ):
-        cls = _classify_delta(dn, launch_tolerance)
-        if cls == "fixed_cost":
-            _, msg = _fixed_cost_violation(
-                label,
-                dn,
-                dns,
-                ns_a,
-                ns_b,
-                fixed_cost_jitter_floor_ns,
-                fixed_cost_jitter_rel_tolerance,
-            )
-            if msg:
-                violations.append(msg)
-        elif cls == "positive":
-            _check_non_negative(f"{label} time (ns)", dns, time_tolerance_ns, violations)
-        else:
-            _check_non_negative(f"{label} count", dn, launch_tolerance, violations)
+    _check_non_negative("memcpy count", memcpy_dn, launch_tolerance, violations)
+    _check_non_negative("memset count", memset_dn, launch_tolerance, violations)
 
     if violations:
         raise NonComparablePairError(

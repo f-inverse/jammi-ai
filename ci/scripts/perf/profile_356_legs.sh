@@ -959,6 +959,7 @@ run_leg() {
 
   local census_ok="false"
   local census_json="$leg_dir/census.json"
+  local census_stdout="$leg_dir/census.stdout"
   local census_stderr="$leg_dir/census.stderr"
   # Persisted so exit 9 (empty differenced census) vs exit 4 (a
   # negative/fixed-cost-jitter violation) -- and WHICH rule fired -- is
@@ -976,33 +977,54 @@ run_leg() {
     case "$leg_id" in
       *-E1) census_cmd+=(--excluded-from-chain-attribution) ;;
     esac
-    # `run_cmd`'s own echoed "+ ..." trace line and (on a real, non-DRY_RUN
-    # invocation) kernel_census.py's own stderr are captured into a shell
-    # variable first (`2>&1 1>/dev/null` -- the same "capture only stderr"
-    # idiom, never a live pipe/process-substitution race) so BOTH the
-    # exit code (`$?`, immediately after the command substitution) and the
-    # text are available -- then re-emitted live (`>&2`, so this leg's
-    # trace/error visibility on the real console/CI log is unchanged) AND
-    # persisted to `$census_stderr` (so `leg_reason`'s own pointer below
-    # resolves to a real file, the same convention `run_traced`'s
-    # `run_n.stderr`/`run_m.stderr` already use).
+    # BOTH streams redirected to their own persisted files (the SAME
+    # convention `run_traced`'s own `run_n.stderr`/`run_m.stderr` already
+    # use) -- `_print_cmd`'s own echoed "+ ..." trace line and any real,
+    # non-DRY_RUN kernel_census.py stderr land in `$census_stderr`;
+    # kernel_census.py's own success-summary line (printed to stdout) in
+    # `$census_stdout`. Both are `cat`'d back out live AFTER the command
+    # exits (phase-4 audit round-3 re-audit advisory 2 -- an earlier
+    # round's own comment here CLAIMED unchanged console visibility while
+    # actually discarding stdout to `/dev/null`; this restores it).
     # `&&`/`||` here, never a bare assignment (phase-4 round-2 audit
     # BLOCK 2's own "every risky command is explicitly guarded" doctrine)
-    # -- a bare `x="$(cmd)"` assignment is a PLAIN command under
-    # `set -euo pipefail`; if `cmd` (kernel_census.py refusing) exits
-    # nonzero, that would abort the WHOLE SCRIPT immediately, before
-    # `census_exit=$?` ever ran, exactly the class of live regression
-    # this doctrine already exists to catch.
-    local census_err
-    census_err="$(run_cmd "${census_cmd[@]}" 2>&1 1>/dev/null)" && census_exit=0 || census_exit=$?
-    printf '%s\n' "$census_err" >&2
-    printf '%s\n' "$census_err" > "$census_stderr"
+    # -- a plain `run_cmd ...` (or a bare `x="$(cmd)"` assignment) is a
+    # PLAIN command under `set -euo pipefail`; if `cmd` (kernel_census.py
+    # refusing) exits nonzero, that would abort the WHOLE SCRIPT
+    # immediately, before `census_exit=$?` ever ran, exactly the class of
+    # live regression this doctrine already exists to catch. The two
+    # `cat`s below are `|| true`-guarded the SAME way (round-3 re-audit
+    # advisory 4) even though a `cat` of a file this same command just
+    # wrote is near-infallible -- consistency with the block's own
+    # doctrine, not a load-bearing guard.
+    run_cmd "${census_cmd[@]}" >"$census_stdout" 2>"$census_stderr" && census_exit=0 || census_exit=$?
+    cat "$census_stdout" || true
+    cat "$census_stderr" >&2 || true
     if [ "$census_exit" -eq 0 ]; then
       census_ok="true"
     else
       leg_status="invalid"
+      # The FIRST indented per-rule violation line (phase-4 audit round-3
+      # re-audit advisory 1) -- kernel_census.py's own umbrella
+      # `::error::`-prefixed line ("one or more per-key deltas were
+      # negative beyond tolerance...") never names WHICH rule/bucket
+      # fired; the line immediately after it (2-space indented, part of
+      # the SAME underlying exception's multi-line message) does (e.g.
+      # "kernel k1(...) launch count: raw delta -45 is negative..." or
+      # "memcpy count: ..."). For a single-line message (no indented
+      # follow-up -- most of this module's OTHER exceptions), `-A1`'s
+      # single line of output IS the umbrella line itself, so this falls
+      # back cleanly to the prior behavior.
+      # `|| census_first_violation=""` guards the pipeline the SAME way
+      # (round-3 re-audit advisory 4's own consistency ask, applied here
+      # too): under `set -o pipefail`, `grep` finding ZERO `::error::`
+      # lines (a genuinely unhandled Python traceback with no named
+      # prefix at all -- rare, but real) makes the WHOLE pipeline exit
+      # nonzero even though `tail` itself succeeds; a bare assignment
+      # would abort the script via errexit right here.
       local census_first_violation
-      census_first_violation="$(printf '%s\n' "$census_err" | grep -m1 '^::error::' || true)"
+      census_first_violation="$(grep -A1 -m1 '^::error::' "$census_stderr" | tail -n1)" ||
+        census_first_violation=""
       if [ -n "$census_first_violation" ]; then
         leg_reason="kernel_census.py refused (exit $census_exit): $census_first_violation -- see $census_stderr"
       else

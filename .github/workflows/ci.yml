@@ -1348,8 +1348,16 @@ jobs:
           # still exercised separately via a real subprocess with the
           # package hidden, the SAME `tokenizers`-dependent-half precedent
           # `test_fixture_width_report.py` already established.
+          # `JAMMI_CI_SAFETENSORS_EXPECTED=1` (phase-4 audit round-3
+          # re-audit advisory 3, this repo's own zero-execution-is-RED
+          # doctrine): if the "Install safetensors" step below silently
+          # fails (a PyPI hiccup, a wrong interpreter), every
+          # `skipUnless`-gated test above would just quietly re-skip,
+          # indistinguishable from "the install step was never added" --
+          # this env var makes the test suite's own always-running
+          # assertion turn that into a RED leg instead.
           - name: perf convert_legacy_bert_checkpoint suite
-            cmd: python3 ci/scripts/perf/test_convert_legacy_bert_checkpoint.py
+            cmd: JAMMI_CI_SAFETENSORS_EXPECTED=1 python3 ci/scripts/perf/test_convert_legacy_bert_checkpoint.py
           # `gen_fixed_width_corpus.py`'s own suite (#356 P4): determinism
           # (same (rows, min_wordpieces, seed) -> byte-identical output),
           # the emitted JSONL schema (the exact six TripletRow keys

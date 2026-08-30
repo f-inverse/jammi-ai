@@ -37,6 +37,16 @@ of the file-level tests above, and the same trade-off
 `test_fixture_width_report.py` already accepts for `tokenizers` (never
 installed there at all).
 
+`CiExecutionAssertionTests` (phase-4 audit round-3 re-audit advisory 3,
+this repo's own zero-execution-is-RED doctrine): NEVER `skipUnless`-gated
+-- it always runs, and only decides whether to assert or
+`self.skipTest()` from INSIDE the method body based on
+`JAMMI_CI_SAFETENSORS_EXPECTED` (set only by `ci.yml`'s own matrix entry
+for this leg). If the "Install safetensors" Guard job step ever silently
+fails, every `skipUnless`-gated test above would just quietly re-skip --
+indistinguishable from "the install step was never added at all" -- this
+test turns that into a RED leg instead.
+
 Run: `python3 ci/scripts/perf/test_convert_legacy_bert_checkpoint.py`
 """
 
@@ -347,6 +357,36 @@ class NotImportableRefusalTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1, result.stderr)
             self.assertIn("::error::convert_legacy_bert_checkpoint", result.stderr)
             self.assertFalse(out_path.exists())
+
+
+class CiExecutionAssertionTests(unittest.TestCase):
+    """Phase-4 audit round-3 re-audit advisory 3 -- this repo's own
+    zero-execution-is-RED doctrine, applied to the `skipUnless`-gated
+    arms above: NEVER decorator-gated (no `@unittest.skipUnless`), so
+    this test method ALWAYS runs. `ci.yml`'s own matrix entry for this
+    suite sets `JAMMI_CI_SAFETENSORS_EXPECTED=1`; when that is present,
+    this asserts `safetensors` IS importable, turning a silently-failed
+    "Install safetensors" Guard job step into a RED leg instead of every
+    `ConvertFileLevelTests` arm quietly re-skipping (indistinguishable
+    from "the install step was never added at all"). Absent the env var
+    (a local dev checkout, or any other CI leg), this is a no-op skip --
+    it is not this test's job to demand `safetensors` be installed
+    everywhere, only to catch a REGRESSION in the one place that
+    declares it should be."""
+
+    def test_safetensors_importable_when_ci_expects_it(self):
+        if os.environ.get("JAMMI_CI_SAFETENSORS_EXPECTED") != "1":
+            self.skipTest(
+                "JAMMI_CI_SAFETENSORS_EXPECTED is not set -- not the CI leg that installs "
+                "safetensors (ci.yml's own matrix entry for this suite sets it; a local dev "
+                "checkout without the package is not this test's concern)"
+            )
+        self.assertTrue(
+            _SAFETENSORS_AVAILABLE,
+            "JAMMI_CI_SAFETENSORS_EXPECTED=1 but safetensors is NOT importable -- the "
+            "'Install safetensors (perf convert_legacy_bert_checkpoint suite only)' Guard job "
+            "step silently failed",
+        )
 
 
 if __name__ == "__main__":

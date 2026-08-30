@@ -514,5 +514,72 @@ class FinetuneRunIdentityFieldsSubsetTests(unittest.TestCase):
         )
 
 
+class F32StoredFieldCanonicalizerTests(unittest.TestCase):
+    """`identity_fields.normalize_f32_stored_field` (`lora_dropout`/
+    `max_grad_norm` — the ONLY two `IDENTITY_FIELD_CANONICALIZERS` members
+    beyond `backbone_dtype`/`target_modules`) — TRUE literals throughout
+    (never two values FABRICATED from the same Python literal on both
+    sides, which is exactly why this representational gap went uncaught
+    before this canonicalizer existed): `0.05000000074505806` is the REAL
+    `f64` a Python/JSON round-trip produces for the IEEE-754 `f32` nearest
+    `0.05`; `0.30000001192092896` is the same for `0.3`.
+    """
+
+    def test_lora_dropout_f32_vs_f64_literal_matches(self):
+        jammi_side = 0.05000000074505806  # a real f32(0.05) read back as f64
+        torch_side = 0.05  # the operator's literal, torch's own f64 argparse value
+        self.assertEqual(
+            identity_fields.canonicalize_identity_field("lora_dropout", jammi_side),
+            identity_fields.canonicalize_identity_field("lora_dropout", torch_side),
+        )
+
+    def test_max_grad_norm_f32_vs_f64_literal_matches(self):
+        jammi_side = 0.30000001192092896  # a real f32(0.3) read back as f64
+        torch_side = 0.3
+        self.assertEqual(
+            identity_fields.canonicalize_identity_field("max_grad_norm", jammi_side),
+            identity_fields.canonicalize_identity_field("max_grad_norm", torch_side),
+        )
+
+    def test_lora_dropout_genuine_divergence_still_refuses(self):
+        self.assertNotEqual(
+            identity_fields.canonicalize_identity_field("lora_dropout", 0.05),
+            identity_fields.canonicalize_identity_field("lora_dropout", 0.06),
+        )
+
+    def test_max_grad_norm_none_matches_none(self):
+        self.assertIsNone(identity_fields.canonicalize_identity_field("max_grad_norm", None))
+        self.assertEqual(
+            identity_fields.canonicalize_identity_field("max_grad_norm", None),
+            identity_fields.canonicalize_identity_field("max_grad_norm", None),
+        )
+
+    def test_max_grad_norm_none_vs_value_still_refuses(self):
+        self.assertNotEqual(
+            identity_fields.canonicalize_identity_field("max_grad_norm", None),
+            identity_fields.canonicalize_identity_field("max_grad_norm", 0.3),
+        )
+
+    def test_lora_alpha_and_margin_have_no_canonicalizer(self):
+        # Negative control: lora_alpha/margin are f64 end-to-end on both
+        # producers -- widening them onto the f32 round-trip would be
+        # exactly the "never widens what counts as a match" violation this
+        # module's own doc forbids.
+        self.assertNotIn("lora_alpha", identity_fields.IDENTITY_FIELD_CANONICALIZERS)
+        self.assertNotIn("margin", identity_fields.IDENTITY_FIELD_CANONICALIZERS)
+
+    def test_lora_dropout_and_max_grad_norm_are_registered(self):
+        self.assertIn("lora_dropout", identity_fields.IDENTITY_FIELD_CANONICALIZERS)
+        self.assertIn("max_grad_norm", identity_fields.IDENTITY_FIELD_CANONICALIZERS)
+        self.assertIs(
+            identity_fields.IDENTITY_FIELD_CANONICALIZERS["lora_dropout"],
+            identity_fields.normalize_f32_stored_field,
+        )
+        self.assertIs(
+            identity_fields.IDENTITY_FIELD_CANONICALIZERS["max_grad_norm"],
+            identity_fields.normalize_f32_stored_field,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

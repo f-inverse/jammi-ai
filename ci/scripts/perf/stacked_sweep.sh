@@ -78,18 +78,20 @@
 #                           into env.json. Required unless SWEEP_DRY_RUN=1
 #                           (then defaults to a `dry-run-box` placeholder).
 #
-# Stale-build note: unlike finetune_ab.sh (which switches git refs WITHIN
-# its own run and therefore must force a `cargo clean -p jammi-kernels`
-# between switches), this script only ever measures the ONE <sha> the
-# caller already checked out before invoking it -- there is no in-script
-# ref switch for cargo's fingerprint to get confused by. It still forces a
-# `cargo clean -p jammi-kernels --release` before the one build this script
-# performs (skippable via SWEEP_SKIP_BUILD=1), because <worktree>'s
-# $CARGO_TARGET_DIR is typically warm from a PREVIOUS invocation at a
-# DIFFERENT sha -- exactly the fingerprint hazard finetune_ab.sh's own
-# header describes (jammi-kernels' CUDA build.rs can leave cargo's
-# fingerprint satisfied by a PREVIOUS ref's compiled artifact even though
-# HEAD moved).
+# Stale-build note: this script, like finetune_ab.sh (which no longer
+# switches git refs within its own run either -- every leg there runs off
+# ONE binary, built once, see that script's own header), only ever measures
+# the ONE <sha> the caller already checked out before invoking it -- there
+# is no in-script ref switch for cargo's fingerprint to get confused by. It
+# still forces a `cargo clean -p jammi-kernels --release` before the one
+# build this script performs (skippable via SWEEP_SKIP_BUILD=1), because
+# <worktree>'s $CARGO_TARGET_DIR is typically warm from a PREVIOUS
+# invocation at a DIFFERENT sha -- the SAME cargo-fingerprint hazard class
+# (jammi-kernels' CUDA build.rs can leave cargo's fingerprint satisfied by
+# a PREVIOUS invocation's compiled artifact even though the caller's own
+# checkout moved since), just triggered by a different cause here
+# (a warm, cross-invocation $CARGO_TARGET_DIR) than the in-script
+# git-checkout switch this hazard was originally documented against.
 #
 # Shapes (batch, seq), FIXED, in this order: 8x512 8x128 1x128 1x512 16x128
 # 8x256 16x512 8x1024. Fixed hyperparameters (not CLI-configurable -- this

@@ -81,6 +81,28 @@ from identity_fields import (  # noqa: E402
 
 LEGS = ["jammi-eager", "jammi-fused", "torch-eager", "torch-sdpa"]
 
+# ORDER-BALANCED BAR LEGS (finetune_ab.sh's own A,B,B,A protocol — see that
+# script's header's "ORDER-BALANCED BAR LEGS" section): the two legs the
+# #352 throughput bar actually gates on, `jammi-fused` (A) and `torch-sdpa`
+# (B), run TWICE per config in the fixed order A,B,B,A — the SAME
+# drift-cancellation shape `gpu_inference_ab.py`'s own `LEG_ORDER`/
+# `ADJACENT_PAIRS` document ("What actually cancels, and what does not").
+# `jammi-fused`/`torch-sdpa` (already in `LEGS` above) ARE the first ("1")
+# run of each; `BAR_SECOND_RUN_LEGS` names the SECOND ("2") run's own raw
+# leg files — additive, deliberately NOT folded into `LEGS` itself: every
+# OTHER function keyed off `LEGS` (`leg_premise_violations`,
+# `leg_provenance`, `fused_proof`'s own caller, the primary per-leg table
+# rows) stays byte-for-byte unchanged, so a `raw_dir` from BEFORE this
+# fold-in (carrying only the original four legs) still merges exactly as
+# it always did — `load_leg` reads `MISSING` for an absent
+# `<slug>__jammi-fused-2`/`<slug>__torch-sdpa-2` pair, which
+# `bar_pair_ratio`/`build_report` below already treat as "second run not
+# available", falling back to the single-pair ratio this module has always
+# computed. `BAR_SECOND_RUN_LEGS` is keyed by the FIRST run's own leg name
+# (the natural "which pair is this the repeat of" lookup both call sites
+# below need).
+BAR_SECOND_RUN_LEGS = {"jammi-fused": "jammi-fused-2", "torch-sdpa": "torch-sdpa-2"}
+
 # --------------------------------------------------------------------------- #
 # Generic leg-premise-refusal core (unit-62 E6) — `leg_identity_fields`/
 # `leg_premise_violations` below are the finetune-step-SPECIFIC callers
@@ -935,6 +957,100 @@ def fmt_bytes(v):
     return "n/a" if v is None else f"{int(v):,}"
 
 
+def bar_second_run_metrics(raw_dir, slug):
+    """Load + extract metrics for the order-balanced bar legs' SECOND run
+    (`BAR_SECOND_RUN_LEGS`: `"jammi-fused-2"`/`"torch-sdpa-2"`) — returns
+    `(entries, metrics_by_leg, merge_errors_by_leg)`, mirroring the SAME
+    load/try-except shape `build_report`'s own primary per-leg loop already
+    uses for `LEGS` (never a second, differently-shaped error-handling
+    path — B6's "LOUD, per-leg, never fatal to the rest of the merge"
+    discipline applies here identically). A leg entirely ABSENT from
+    `raw_dir` (an older sweep predating this fold-in, or `AB_DRY_RUN`'s own
+    DRY_RUN outcome) reads `outcome="MISSING"`/`"DRY_RUN"` — `metrics()`
+    then returns `None` for it, and the CALLER (`build_report`) falls back
+    to the single-pair ratio this module has always computed, exactly as
+    if this function's own second-run legs did not exist. This is what
+    makes the A,B,B,A fold-in additive: a `raw_dir` from before it exists
+    merges byte-for-byte as it always did.
+    """
+    entries = {}
+    metrics_by_leg = {}
+    errors_by_leg = {}
+    for leg in BAR_SECOND_RUN_LEGS.values():
+        entry = load_leg(raw_dir, slug, leg)
+        entries[leg] = entry
+        try:
+            metrics_by_leg[leg] = metrics(entry, leg)
+            errors_by_leg[leg] = None
+        except Exception as exc:  # noqa: BLE001 -- B6: LOUD, per-leg,
+            # never silent, never fatal to the rest of the merge.
+            metrics_by_leg[leg] = None
+            errors_by_leg[leg] = f"{type(exc).__name__}: {exc}"
+    return entries, metrics_by_leg, errors_by_leg
+
+
+def bar_pair_ratio(fused_m, sdpa_m):
+    """`triplets_per_s` ratio for ONE bar pair (jammi-fused-shaped metrics
+    over torch-sdpa-shaped metrics) — the SAME expression `build_report`'s
+    own pair-1 `ratio` has always used, factored out so pair 1 and pair 2
+    (the A,B,B,A protocol's second run) compute it identically rather than
+    two independently-drifting copies of the same division. `None` when
+    either leg did not produce usable metrics, or torch's own throughput
+    read a falsy (zero/`None`) value — never a `ZeroDivisionError`.
+    """
+    return (
+        fused_m["triplets_per_s"] / sdpa_m["triplets_per_s"]
+        if (fused_m and sdpa_m and sdpa_m["triplets_per_s"])
+        else None
+    )
+
+
+def bar_ratio_classification(pair1_ratio, pair2_ratio, pass_ratio):
+    """The order-balanced A,B,B,A bar-ratio classification (finetune_ab.sh
+    header's "ORDER-BALANCED BAR LEGS"): given the two adjacent-pair
+    ratios (pair 1 = jammi-fused/torch-sdpa, pair 2 =
+    jammi-fused-2/torch-sdpa-2 — both `jammi-fused-shaped/torch-sdpa-shaped`,
+    see `bar_pair_ratio`), returns `(bar_ratio, indeterminate, detail)`:
+
+      * `pair2_ratio is None` (the second run did not produce a usable
+        pair — an older `raw_dir`, a MISSING/FAILED/OOM leg, or
+        `AB_DRY_RUN`): `bar_ratio = pair1_ratio`, `indeterminate = False`
+        — the single-pair behaviour this module has always had, unchanged.
+      * Otherwise: `bar_ratio = min(pair1_ratio, pair2_ratio)` — the
+        estimator LEAST FAVOURABLE to jammi (the SAME "ratio uses the min
+        of two torch runs" convention `docs/maintainer/
+        fine-tune-performance-guide.md`'s own stacked-sweep artifact
+        caveat already names for its own two-torch-run campaign, applied
+        here to this producer's own two torch-sdpa repeats). `indeterminate`
+        is `True` when the two pair ratios STRADDLE `pass_ratio` (one at
+        or above, one below — genuinely conflicting classifications) OR
+        their spread exceeds `bar_ratio`'s own distance from `pass_ratio`
+        (`|pair1_ratio - pair2_ratio| > |bar_ratio - pass_ratio|` — even
+        when both land on the same side, a spread that large means the
+        combined estimate is not resolved with enough confidence relative
+        to how close it sits to the bar to trust either classification).
+        Straddling always implies the spread condition too (if one ratio
+        is `>= pass_ratio` and the other, which equals `bar_ratio` since
+        it is the smaller, is `< pass_ratio`, then `spread >= pass_ratio -
+        bar_ratio == margin`) — both are checked explicitly anyway, for
+        the boundary-equality edge case and for readability at the call
+        site.
+    """
+    if pair2_ratio is None:
+        return pair1_ratio, False, None
+    bar = min(pair1_ratio, pair2_ratio)
+    margin = abs(bar - pass_ratio)
+    spread = abs(pair1_ratio - pair2_ratio)
+    straddle = (pair1_ratio >= pass_ratio) != (pair2_ratio >= pass_ratio)
+    indeterminate = straddle or spread > margin
+    detail = (
+        f"pair1(jammi-fused/torch-sdpa)={pair1_ratio:.3f} "
+        f"pair2(jammi-fused-2/torch-sdpa-2)={pair2_ratio:.3f} "
+        f"spread={spread:.3f} bar-distance-from-{pass_ratio}={margin:.3f}"
+    )
+    return bar, indeterminate, detail
+
+
 def config_slugs(raw_dir):
     slugs = set()
     if os.path.isdir(raw_dir):
@@ -997,10 +1113,35 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
                 leg_metrics[leg] = None
                 leg_merge_errors[leg] = f"{type(exc).__name__}: {exc}"
 
+        # ORDER-BALANCED A,B,B,A bar legs (finetune_ab.sh header) — the
+        # SECOND run of the bar pair, additive (see `bar_second_run_metrics`'s
+        # own doc for why an older `raw_dir` without these two legs merges
+        # unchanged).
+        second_run_entries, second_run_metrics, second_run_errors = bar_second_run_metrics(raw_dir, slug)
+
         if leg_merge_errors["jammi-fused"] is not None:
             proof = f"ERROR: {leg_merge_errors['jammi-fused']}"
         else:
             proof = fused_proof(leg_metrics["jammi-fused"])
+
+        # ORDER-BALANCED A,B,B,A bar legs' SECOND run: the bar ratio
+        # consumes BOTH pair legs (`bar_pair_ratio`'s pair-2 half below), so
+        # `jammi-fused-2` must clear the SAME `fused_proof` positive-proof
+        # channel `jammi-fused` does — an unproven leg feeding the
+        # pre-registered throughput endpoint is exactly the class
+        # `fused_proof` exists to catch, and it does not stop mattering
+        # because the leg happens to be the SECOND run rather than the
+        # first. `fused_proof(None)` is `None` (never `False`/`str`), so
+        # this is safe to compute unconditionally: a MISSING (no second
+        # run at all — backward compat), FAILED, or OOM'd `jammi-fused-2`
+        # never spuriously invalidates the config through this channel —
+        # only a REPORT that was actually produced (`OK`, or a merge-stage
+        # schema error on one that tried to be) can.
+        jammi_fused_2_leg = BAR_SECOND_RUN_LEGS["jammi-fused"]
+        if second_run_errors[jammi_fused_2_leg] is not None:
+            proof2 = f"ERROR: {second_run_errors[jammi_fused_2_leg]}"
+        else:
+            proof2 = fused_proof(second_run_metrics[jammi_fused_2_leg])
 
         # LEG-PREMISE CHECK (fold-in, this round): compares the jammi-fused
         # leg's record (the one this sweep's own ratio/proof are computed
@@ -1059,10 +1200,63 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
                 for leg in (jammi_premise_leg, torch_premise_leg):
                     leg_premise_violations_list.extend(clip_fact_violations(entries[leg]["report"], leg))
 
+        # SECOND-RUN leg-premise + provenance — the SAME two checks the
+        # primary pair gets, reused verbatim (`leg_identity_fields`/
+        # `leg_premise_violations`/`clip_fact_violations`/`leg_provenance`
+        # are already leg-name-generic, see their own docs), applied to
+        # `jammi-fused-2`/`torch-sdpa-2` WHEN PRESENT. Unlike the primary
+        # pair, there is no eager-leg FALLBACK to fall back to here
+        # (`jammi-eager`/`torch-eager` are single, non-repeated context
+        # legs — see `finetune_ab.sh`'s header): the second-run premise
+        # check is therefore only MEANINGFUL (and only run) when BOTH
+        # `jammi-fused-2` AND `torch-sdpa-2` themselves read `OK` — an
+        # older `raw_dir` (both `MISSING`) or a second-run OOM/FAIL on
+        # either side degrades to "not checked" (`None`, never an empty
+        # "checked, clean" list), the SAME shape `leg_premise_violations_list`
+        # itself uses when there is nothing to compare — `bar_pair_ratio`'s
+        # own `pair2_ratio` already reads `None` in that case too, so the
+        # verdict already degrades to the single-pair estimator without
+        # this check's help; this check's OWN job is only to refuse when a
+        # SECOND-RUN report was actually produced and disagrees.
+        torch_sdpa_2_leg = BAR_SECOND_RUN_LEGS["torch-sdpa"]
+        second_run_premise_violations_list = None
+        second_run_provenance = {jammi_fused_2_leg: None, torch_sdpa_2_leg: None}
+        if second_run_entries[jammi_fused_2_leg]["outcome"] == "OK":
+            second_run_provenance[jammi_fused_2_leg] = leg_provenance(
+                second_run_entries[jammi_fused_2_leg]["report"], jammi_fused_2_leg
+            )
+        if second_run_entries[torch_sdpa_2_leg]["outcome"] == "OK":
+            second_run_provenance[torch_sdpa_2_leg] = leg_provenance(
+                second_run_entries[torch_sdpa_2_leg]["report"], torch_sdpa_2_leg
+            )
+        if (
+            second_run_entries[jammi_fused_2_leg]["outcome"] == "OK"
+            and second_run_entries[torch_sdpa_2_leg]["outcome"] == "OK"
+        ):
+            jammi_id_fields2 = leg_identity_fields(second_run_entries[jammi_fused_2_leg]["report"], jammi_fused_2_leg)
+            torch_id_fields2 = leg_identity_fields(second_run_entries[torch_sdpa_2_leg]["report"], torch_sdpa_2_leg)
+            second_run_premise_violations_list = leg_premise_violations(jammi_id_fields2, torch_id_fields2)
+            for leg in (jammi_fused_2_leg, torch_sdpa_2_leg):
+                second_run_premise_violations_list.extend(
+                    clip_fact_violations(second_run_entries[leg]["report"], leg)
+                )
+
         for leg in LEGS:
             err_tail = entries[leg]["err_tail"]
             if leg_merge_errors[leg] is not None:
                 err_tail = (err_tail + "\n" if err_tail else "") + f"[merge-stage] {leg_merge_errors[leg]}"
+            # A: the negative control's own two provenance facts, surfaced
+            # on the jammi-eager row specifically (never every row — these
+            # two fields are `None` on every other leg, see `leg_provenance`)
+            # so a human reading the table sees, next to the row it
+            # describes, whether the requested disable list actually fired.
+            if leg == "jammi-eager" and entries[leg]["outcome"] == "OK" and leg_merge_errors[leg] is None:
+                prov = leg_provenance(entries[leg]["report"], leg)
+                kd_lines = (
+                    f"kernels_disabled_requested={prov['jammi_kernels_disabled_requested']}\n"
+                    f"kernels_disabled_fired={prov['jammi_kernels_disabled_fired']}"
+                )
+                err_tail = (err_tail + "\n" if err_tail else "") + kd_lines
             table_rows.append(
                 (
                     slug,
@@ -1074,11 +1268,42 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
                 )
             )
 
+        # ORDER-BALANCED A,B,B,A bar legs' own SECOND run — supplementary
+        # table rows. `jammi-fused-2`'s OWN `fused_proof` (`proof2`, above)
+        # now surfaces in the SAME `fused_proof` column the primary
+        # `jammi-fused` row uses — this pair leg carries the SAME positive-
+        # proof discipline, so its own column reads the same way. Omitted
+        # when the second run never ran at all (`MISSING` — an older
+        # `raw_dir`/`AB_DRY_RUN`'s own placeholder legs), so an old
+        # fixture's table renders exactly as it always did, with no new
+        # "MISSING" clutter rows.
+        for leg in BAR_SECOND_RUN_LEGS.values():
+            if second_run_entries[leg]["outcome"] == "MISSING":
+                continue
+            err_tail = second_run_entries[leg]["err_tail"]
+            if second_run_errors[leg] is not None:
+                err_tail = (err_tail + "\n" if err_tail else "") + f"[merge-stage] {second_run_errors[leg]}"
+            table_rows.append(
+                (
+                    slug,
+                    leg,
+                    second_run_entries[leg]["outcome"],
+                    second_run_metrics[leg],
+                    proof2 if leg == jammi_fused_2_leg else None,
+                    err_tail,
+                )
+            )
+
         fused_m, sdpa_m = leg_metrics["jammi-fused"], leg_metrics["torch-sdpa"]
-        ratio = (
-            fused_m["triplets_per_s"] / sdpa_m["triplets_per_s"]
-            if (fused_m and sdpa_m and sdpa_m["triplets_per_s"])
-            else None
+        ratio = bar_pair_ratio(fused_m, sdpa_m)
+
+        # `pair2_ratio` feeds `bar_ratio_classification` below.
+        pair2_ratio = bar_pair_ratio(
+            second_run_metrics[BAR_SECOND_RUN_LEGS["jammi-fused"]],
+            second_run_metrics[BAR_SECOND_RUN_LEGS["torch-sdpa"]],
+        )
+        bar_ratio, bar_indeterminate, bar_indeterminate_detail = bar_ratio_classification(
+            ratio, pair2_ratio, pass_ratio
         )
 
         # loss_final_ratio: jammi-fused's loss_last over torch-sdpa's
@@ -1117,12 +1342,17 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
             verdict = f"N/A (torch-sdpa itself did not fit: {entries['torch-sdpa']['outcome']} — bar does not apply)"
         elif not jammi_fused_fits:
             verdict = f"FAIL (OOM where torch fits: jammi-fused {entries['jammi-fused']['outcome']})"
-        elif ratio is None:
+        elif bar_ratio is None:
             verdict = "FAIL (no ratio: triplets_per_s missing on an OK leg — investigate)"
-        elif ratio < pass_ratio:
-            verdict = f"FAIL (ratio {ratio:.3f} < {pass_ratio})"
+        elif bar_indeterminate:
+            # See `bar_ratio_classification`'s own doc: the two A,B,B,A pair
+            # ratios straddle `pass_ratio`, or their spread exceeds the
+            # combined estimate's own distance from it — never PASS/FAIL.
+            verdict = f"{FINETUNE_AB_VERDICT_INDETERMINATE} ({bar_indeterminate_detail})"
+        elif bar_ratio < pass_ratio:
+            verdict = f"FAIL (ratio {bar_ratio:.3f} < {pass_ratio})"
         else:
-            verdict = f"PASS (ratio {ratio:.3f})"
+            verdict = f"PASS (ratio {bar_ratio:.3f})"
 
         # Advisory (iv), round-2 audit fix on PR #372: a failed/errored
         # `fused_proof` used to only APPEND a cosmetic "[WARN: ...]" suffix
@@ -1176,10 +1406,60 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
                 "otherwise have been is discarded, not merely annotated)"
             )
 
-        summary_rows.append((slug, ratio, loss_ratio, verdict))
+        # SECOND-RUN carve-outs — the SAME two "identity-completeness"
+        # refusals the primary pair gets, applied to `jammi-fused-2`/
+        # `torch-sdpa-2` (see the block above these were computed in for
+        # the full rationale: the bar ratio consumes BOTH pair legs, so an
+        # unproven or premise-mismatched SECOND run is exactly as
+        # untrustworthy as an unproven or premise-mismatched FIRST one).
+        # Checked independently of, and in addition to, the primary-pair
+        # carve-outs above — any ONE of the four can invalidate this
+        # config; `None`/`False`-shaped "second run absent or not
+        # attempted" never does (see `proof2`'s and
+        # `second_run_premise_violations_list`'s own docs).
+        if proof2 is False or isinstance(proof2, str):
+            reason2 = (
+                f"errored: {proof2}" if isinstance(proof2, str)
+                else "checked and FAILED — see fused_proof column for the classification"
+            )
+            verdict = (
+                f"{FINETUNE_AB_VERDICT_INVALID_PREFIX} (second-run ({jammi_fused_2_leg}) fused-dispatch "
+                f"proof {reason2} — this leg's PASS/FAIL classification cannot be trusted; the "
+                f"ratio-based verdict this would otherwise have been is discarded, not merely annotated)"
+            )
+
+        if second_run_premise_violations_list:
+            verdict = (
+                f"{FINETUNE_AB_VERDICT_INVALID_PREFIX} (second-run leg premise mismatch: "
+                f"{'; '.join(second_run_premise_violations_list)} — the {jammi_fused_2_leg}/"
+                f"{torch_sdpa_2_leg} legs of this config did not run under the same "
+                "seed/batch/seq/dtype/dropout/lora premise; the ratio-based verdict this would "
+                "otherwise have been is discarded, not merely annotated)"
+            )
+
+        summary_rows.append((slug, ratio, pair2_ratio, bar_ratio, loss_ratio, verdict))
         merged["configs"][slug] = {
             "legs": {leg: {"outcome": entries[leg]["outcome"], "metrics": leg_metrics[leg]} for leg in LEGS},
+            # Order-balanced A,B,B,A bar legs' own SECOND run — additive,
+            # keyed by the raw leg name (`"jammi-fused-2"`/`"torch-sdpa-2"`),
+            # never folded into `"legs"` above (which stays keyed by `LEGS`
+            # only, so nothing reading `merged["configs"][slug]["legs"]`
+            # against `LEGS`'s own four names needs to change).
+            "bar_second_run_legs": {
+                leg: {
+                    "outcome": second_run_entries[leg]["outcome"],
+                    "metrics": second_run_metrics[leg],
+                    "provenance": second_run_provenance[leg],
+                }
+                for leg in BAR_SECOND_RUN_LEGS.values()
+            },
             "jammi_fused_dispatch_proof": proof,
+            # `jammi-fused-2`'s OWN `fused_proof` result — identity-
+            # completeness (the bar ratio consumes both pair legs, so both
+            # must carry the same positive-proof discipline). `None` when
+            # the second run never ran/never produced a report (see
+            # `proof2`'s own doc).
+            "jammi_fused_dispatch_proof_second_run": proof2,
             "leg_premise_violations": leg_premise_violations_list,
             "leg_premise_checked_legs": (
                 {"jammi": jammi_premise_leg, "torch": torch_premise_leg}
@@ -1187,8 +1467,31 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
                 else None
             ),
             "leg_premise_not_comparable": leg_premise_not_comparable,
+            # SECOND-RUN leg-premise check — `None` (never an empty
+            # "checked, clean" list) when the second run's own two legs
+            # did not BOTH read `OK` (see `second_run_premise_violations_list`'s
+            # own doc).
+            "leg_premise_violations_second_run": second_run_premise_violations_list,
+            "leg_premise_checked_legs_second_run": (
+                {"jammi": jammi_fused_2_leg, "torch": torch_sdpa_2_leg}
+                if second_run_premise_violations_list is not None
+                else None
+            ),
             "provenance": {"jammi": jammi_provenance, "torch": torch_provenance},
             "ratio_jammi_fused_over_torch_sdpa": ratio,
+            # The A,B,B,A protocol's own two pair ratios + the MIN-of-two,
+            # least-favourable-to-jammi bar ratio the verdict above is
+            # actually classified against — see `bar_ratio_classification`'s
+            # own doc. `pair2_ratio`/`bar_indeterminate*` are `None`/`False`
+            # when the second run is unavailable (an older `raw_dir`), in
+            # which case `bar_ratio == ratio_jammi_fused_over_torch_sdpa`
+            # (the single-pair behaviour this module has always had).
+            "bar_pair_ratios": {
+                "pair1_jammi_fused_over_torch_sdpa": ratio,
+                "pair2_jammi_fused_2_over_torch_sdpa_2": pair2_ratio,
+            },
+            "bar_ratio_min_of_two_least_favourable_to_jammi": bar_ratio,
+            "bar_ratio_indeterminate": bar_indeterminate,
             "loss_final_ratio_jammi_fused_over_torch_sdpa": loss_ratio,
             "loss_final_ratio_note": "same data, cost fixture -- NOT a quality result "
             "(see finetune_step.rs's module doc / torch_finetune_step.py's LOSS "
@@ -1234,18 +1537,31 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
         if outcome not in ("OK", "DRY_RUN") and err_tail:
             last = err_tail.splitlines()[-1][:120] if err_tail.splitlines() else ""
             lines.append(f"    -> {last}")
+        elif err_tail and "kernels_disabled_requested=" in err_tail:
+            # A's negative control: the jammi-eager row's own
+            # kernels_disabled_requested/_fired lines (appended to
+            # `err_tail` above even on an OK outcome) — printed IN FULL
+            # (both lines, no truncation): a fixed, small, non-adversarial
+            # op-key list, never user-controlled arbitrary-length text the
+            # way a stderr tail is.
+            for kd_line in err_tail.splitlines():
+                if kd_line.startswith("kernels_disabled_"):
+                    lines.append(f"    -> {kd_line}")
         elif err_tail and "[merge-stage]" in err_tail:
             last = err_tail.splitlines()[-1][:120]
             lines.append(f"    -> {last}")
 
     lines.append("")
     lines.append(
-        f"{'config':<16}{'ratio(fused/sdpa)':<20}{'loss_final_ratio(fused/sdpa,NOT-quality)':<42}{'verdict':<60}"
+        f"{'config':<16}{'pair1(fused/sdpa)':<19}{'pair2(fused2/sdpa2)':<21}{'bar_ratio(min)':<16}"
+        f"{'loss_final_ratio(fused/sdpa,NOT-quality)':<42}{'verdict':<60}"
     )
-    for slug, ratio, loss_ratio, verdict in summary_rows:
+    for slug, ratio, pair2_ratio, bar_ratio, loss_ratio, verdict in summary_rows:
         ratio_s = "n/a" if ratio is None else f"{ratio:.3f}"
+        pair2_s = "n/a" if pair2_ratio is None else f"{pair2_ratio:.3f}"
+        bar_s = "n/a" if bar_ratio is None else f"{bar_ratio:.3f}"
         loss_ratio_s = "n/a" if loss_ratio is None else f"{loss_ratio:.4f}"
-        lines.append(f"{slug:<16}{ratio_s:<20}{loss_ratio_s:<42}{verdict:<60}")
+        lines.append(f"{slug:<16}{ratio_s:<19}{pair2_s:<21}{bar_s:<16}{loss_ratio_s:<42}{verdict:<60}")
 
     table = "\n".join(lines)
     return merged, table
@@ -2916,6 +3232,20 @@ RED_PROOF_VERDICT_NOT_PROVEN_PREFIX = "NOT_PROVEN"
 # re-typed at `main()`'s own `.startswith("INVALID")` consumption of it.
 # Named ONCE here; both sites read this constant, never a re-typed literal.
 FINETUNE_AB_VERDICT_INVALID_PREFIX = "INVALID"
+
+# The order-balanced A,B,B,A bar legs' own THIRD classification (finetune_ab.sh's
+# header, "ORDER-BALANCED BAR LEGS") -- deliberately NOT a `FINETUNE_AB_VERDICT_
+# INVALID_PREFIX`-shaped carve-out: an INDETERMINATE config is not a
+# correctness-of-MEASUREMENT problem (both bar-pair ratios are real,
+# individually trustworthy numbers -- `fused_proof`/`leg_premise_violations`
+# already gate that separately and still take precedence, see `build_report`'s
+# own verdict-computation comment), it is a genuine "this repeat pair disagrees
+# with itself too much, relative to how close the combined estimate sits to the
+# bar, to trust a PASS or FAIL classification" recording -- `main()` does NOT
+# gate its exit code on this string the way it does on `FINETUNE_AB_VERDICT_
+# INVALID_PREFIX` (it does not start with "INVALID"), matching the
+# record-don't-gate doctrine every OTHER ratio-based verdict here follows.
+FINETUNE_AB_VERDICT_INDETERMINATE = "INDETERMINATE"
 
 # unit-63 round-8 audit finding 3 (round-9 audit finding 2 makes the
 # domain ASYMMETRIC -- a single `abs(eps) > MAX` check is not this

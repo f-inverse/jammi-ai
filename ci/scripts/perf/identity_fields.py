@@ -24,6 +24,8 @@ test.
 
 from __future__ import annotations
 
+import struct
+
 # B1 audit finding on PR #372: jammi's OWN CLI/interchange vocabulary
 # (`crates/jammi-bench/src/main.rs`'s `--backbone-dtype` choices,
 # `grad_oracle.rs`'s `format!("{:?}", ComputePrecision::F32).to_lowercase()`)
@@ -79,6 +81,57 @@ def normalize_target_modules(value):
     if not isinstance(value, list):
         return value
     return tuple(sorted(value))
+
+
+def _round_trip_f32(value):
+    """Round-trip a numeric `value` through IEEE-754 binary32 (the hardware
+    default round-half-to-even), stdlib-only (`struct`, no numpy
+    dependency — this module's own "Stdlib-only" doc stays true). Returns
+    `value` UNCHANGED for anything that is not a real number (`None`, a
+    `bool` -- `isinstance(True, int)` is `True` in Python, so `bool` is
+    excluded explicitly -- a string, a list): this function only ever
+    narrows the SAME numeric value's own two representations together,
+    never widens what counts as a match for a non-numeric input it was
+    never meant to touch.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return value
+    return struct.unpack("<f", struct.pack("<f", float(value)))[0]
+
+
+def normalize_f32_stored_field(value):
+    """Canonicalize `lora_dropout`/`max_grad_norm` — the TWO knobs jammi's
+    own CLI stores at `f32` (`FinetuneStepParams::lora_dropout: f32`,
+    `FinetuneStepParams::max_grad_norm: Option<f32>`), while torch's
+    argparse/JSON round-trip for the SAME two `--lora-dropout`/
+    `--max-grad-norm` flags carries the operator's literal at full `f64`
+    precision. Null-safe: `None` (max_grad_norm's own "clip OFF" value,
+    `identity_fields.FINETUNE_NULL_IS_A_VALUE_FIELDS`) passes through
+    UNCHANGED, never coerced to a number.
+
+    WHY ONLY THESE TWO, never "all floats": `lora_alpha` and `margin` are
+    `f64` end-to-end on BOTH producers (jammi's `FinetuneStepParams::
+    lora_alpha: f64`; torch's own `--lora-alpha`/`--margin` floats,
+    unmodified before reaching the report) -- there is no representational
+    gap between the two sides to narrow for either field, and adding a
+    canonicalizer for them would WIDEN what counts as a match (silently
+    accepting an f32-rounded value on ONE side against a genuine f64 value
+    on the other, when today neither producer ever produces that gap) --
+    exactly the "narrows only the representational gap, never widens what
+    counts as a match" discipline this module's own doc states.
+
+    Round-trip, not a tolerance check: `0.05` stored as `f32` and read back
+    as `f64` is `0.05000000074505806`, not `0.05` -- comparing the two raw
+    `f64` values directly would refuse a config the operator asked for
+    IDENTICALLY on both sides, purely because one producer's storage type
+    rounds the input on the way in. Rounding BOTH sides through the SAME
+    `f32` boundary (struct-packed here; a real jammi process does the
+    identical rounding in hardware when the CLI float is stored into the
+    `f32` field) makes the two values compare equal again without loosening
+    the comparison for a genuine divergence (`0.05` vs `0.06` still
+    differs after the SAME round-trip is applied to both).
+    """
+    return _round_trip_f32(value)
 
 
 # THE finetune-step identity set — the ONE declaration every consumer
@@ -247,15 +300,21 @@ FINETUNE_NULL_IS_A_VALUE_FIELDS = frozenset({"max_grad_norm"})
 # `compare_grad_oracle.py`'s `RUN_IDENTITY_FIELDS` doc and
 # `FINETUNE_IDENTITY_FIELDS` above for the full field-by-field determinant
 # table each comparator maintains for ITS OWN field set (this table is
-# shared machinery, not a duplicate of either). `max_grad_norm` and
-# `attention_arm` deliberately have NO canonicalizer: both producers emit
-# the same vocabulary directly (a JSON number-or-null; `"eager"`/`"fused"`),
-# and a canonicalizer that mapped torch's raw `"sdpa"` onto jammi's
-# `"fused"` here would be WIDENING what counts as a match inside the
-# comparator rather than each producer stating its own class honestly.
+# shared machinery, not a duplicate of either). `lora_alpha`/`margin`
+# deliberately have NO canonicalizer despite being numeric siblings of
+# `lora_dropout`/`max_grad_norm`: both are `f64` end-to-end on BOTH
+# producers (see `normalize_f32_stored_field`'s own doc for why exactly
+# these two, never "all floats"). `attention_arm` also deliberately has NO
+# canonicalizer: both producers emit the same vocabulary directly
+# (`"eager"`/`"fused"`), and a canonicalizer that mapped torch's raw
+# `"sdpa"` onto jammi's `"fused"` here would be WIDENING what counts as a
+# match inside the comparator rather than each producer stating its own
+# class honestly.
 IDENTITY_FIELD_CANONICALIZERS = {
     "backbone_dtype": normalize_backbone_dtype,
     "target_modules": normalize_target_modules,
+    "lora_dropout": normalize_f32_stored_field,
+    "max_grad_norm": normalize_f32_stored_field,
 }
 
 

@@ -64,27 +64,56 @@ for its own sake:
     headline, which round-4's phase-4 audit reproduced as a live finding).
     A fixed-cost bucket's time delta is NEVER checked against the flat
     `--time-tolerance-us` the real added-work buckets use -- but it is NOT
-    unconditionally waved through either (phase-4 audit BLOCK 2, same
-    pass): the justifying premise is "nanosecond-scale jitter", so this is
-    ENFORCED as a bound RELATIVE TO THE BUCKET'S OWN MAGNITUDE --
-    `|time delta| <= --fixed-cost-jitter-rel-tolerance * max(time_a,
-    time_b)` -- a fixed-cost bucket runs the identical workload in both
-    legs, so a real divergence shows up as a large FRACTION of its own
-    duration (a multi-millisecond swing in a bucket that itself only ever
-    takes microseconds is never "jitter"), not as an absolute nanosecond
-    floor the way the real added-work buckets' flat tolerance already
-    covers. A fixed-cost bucket whose relative jitter exceeds the bound
+    unconditionally waved through either (phase-4 audit BLOCK 2 round-1,
+    tightened again round-2 re-audit BLOCK 1): the justifying premise is
+    "nanosecond-scale jitter", so this is ENFORCED as a HYBRID bound --
+    `|time delta| > max(--fixed-cost-jitter-floor-ns,
+    --fixed-cost-jitter-rel-tolerance * max(time_a, time_b))` refuses,
+    otherwise it is jitter. Never a RELATIVE bound alone: a relative-only
+    bound has zero margin at any single calibrated value (a same-workload
+    pair's own "must never refuse" fixture can measure exactly AT a
+    relative bound with no headroom) and no floor at all lets a tiny
+    absolute duration (a single-launch eval-probe kernel a few hundred
+    nanoseconds long) trip a large RELATIVE jitter off a few-hundred-
+    nanosecond absolute swing that is obviously still noise -- see
+    `DEFAULT_FIXED_COST_JITTER_FLOOR_NS`/
+    `DEFAULT_FIXED_COST_JITTER_REL_TOLERANCE`'s own comment for the full
+    calibration, including the round-4 pod-run LIVE FINDING's honest
+    relative jitter (0.9998, not "many multiples of 100%" -- a ratio of an
+    absolute-value numerator to a same-sign-or-larger denominator cannot
+    exceed 1.0). A fixed-cost bucket whose jitter exceeds the hybrid bound
     refuses exactly like every other per-key violation above (folded into
     the same `NonComparablePairError`). Every fixed-cost bucket (whether
-    it passed or would have failed the relative bound -- the informational
-    tally always runs before the bound is checked) is summarized as
+    it passed or would have failed the bound -- the informational tally
+    always runs before the bound is checked) is summarized as
     `fixed_cost_buckets` (a count), `fixed_cost_time_us` (the sum of their
     `|time delta|`), and `fixed_cost_jitter_max_rel` (the largest single
     bucket's relative jitter observed) so the cancellation -- and how much
     headroom it used -- stays visible rather than silently vanishing. A
     bucket whose count delta is negative BEYOND `--launch-tolerance`, or
     positive with a negative time delta, is NOT fixed-cost -- both remain
-    refused exactly as before this round.
+    refused exactly as before this round. The SAME classification and
+    hybrid bound apply to the memcpy/memset aggregate deltas too (phase-4
+    audit round-2 re-audit advisory 2): a cancelling (dn<=0 within
+    `--launch-tolerance`) memcpy/memset delta is fixed-cost, checked
+    against the hybrid bound, never the flat `--time-tolerance-us`
+    (whose default of 0.0 would otherwise refuse on a single nanosecond
+    of negative memcpy/memset jitter -- the driver passes neither flag).
+
+    `--launch-tolerance`, `--time-tolerance-us`, and
+    `--fixed-cost-jitter-rel-tolerance` are themselves validated
+    (phase-4 audit round-2 re-audit BLOCK 2): `launch_tolerance` and
+    `time_tolerance_us` must be finite and >= 0 (a negative
+    `launch_tolerance` would silently EMPTY the fixed-cost range
+    `[-launch_tolerance, 0]` and invert the negative-count-delta
+    refusal); `fixed_cost_jitter_rel_tolerance` must be finite and in
+    `[0, 1)` (NaN/inf/>=1.0 would fail OPEN -- silently never refusing a
+    fixed-cost bucket's jitter, reopening the exact gap round-1's fix
+    closed -- and a negative value inverts the guard the same way a
+    negative `launch_tolerance` does). A caller passing an out-of-domain
+    value for any of the three gets a usage-error refusal (`ValueError`,
+    `main()` exit 2) naming the knob and its valid domain, never a
+    silently-degraded or silently-inverted guard.
 
     A SECOND, independent guard closes the "every bucket happened to be
     fixed-cost" degenerate case (phase-4 audit BLOCK 1): if ZERO buckets
@@ -163,25 +192,28 @@ Omitted (the default) stamps `false`.
 
 Usage: kernel_census.py A.sqlite B.sqlite STEPS_A STEPS_B out.json
        [--launch-tolerance N] [--time-tolerance-us F]
-       [--fixed-cost-jitter-rel-tolerance F]
+       [--fixed-cost-jitter-floor-ns N] [--fixed-cost-jitter-rel-tolerance F]
        [--wall-a SECONDS --wall-b SECONDS] [--excluded-from-chain-attribution]
        [--steps-measured-a N --steps-measured-b M]
 
 Hermetic: reads only the two sqlite files named on the command line (plus
 stdlib `sqlite3`); no network, no build, no GPU. Exit codes: 0 = report
-written; 2 = usage error (including M<=N, a one-sided --wall-*); 3 = a
-kernel table is missing on one or both exports (leg INVALID -- instrument
-failure); 4 = a per-key delta is negative beyond tolerance, OR a
-fixed-cost bucket's relative time jitter exceeds
-`--fixed-cost-jitter-rel-tolerance` (leg INVALID -- non-comparable pair,
-not a genuine negative measurement); 5 = declared steps disagree with the
-report's own steps_measured (leg INVALID); 6 = a kernel table is present
-but EMPTY on one or both exports (leg INVALID -- same instrument failure
-as exit 3); 7 = the wall pair fails `wall_b > wall_a > 0` (leg INVALID);
-8 = a sqlite export is corrupt/unreadable (`sqlite3.DatabaseError`); 9 =
-the differenced census is EMPTY -- zero buckets carried a positive
-launch-count delta (leg INVALID -- not a genuine declared M>N
-same-workload pair).
+written; 2 = usage error (including M<=N, a one-sided --wall-*, or any of
+`--launch-tolerance`/`--time-tolerance-us`/
+`--fixed-cost-jitter-rel-tolerance` outside its validated domain -- see
+the module doc's "EXCEPTION" paragraph above); 3 = a kernel table is missing on one or both
+exports (leg INVALID -- instrument failure); 4 = a per-key delta is
+negative beyond tolerance, OR a fixed-cost bucket's (kernel or
+memcpy/memset) time jitter exceeds the HYBRID
+`--fixed-cost-jitter-floor-ns`/`--fixed-cost-jitter-rel-tolerance` bound
+(leg INVALID -- non-comparable pair, not a genuine negative measurement);
+5 = declared steps disagree with the report's own steps_measured (leg
+INVALID); 6 = a kernel table is present but EMPTY on one or both exports
+(leg INVALID -- same instrument failure as exit 3); 7 = the wall pair
+fails `wall_b > wall_a > 0` (leg INVALID); 8 = a sqlite export is
+corrupt/unreadable (`sqlite3.DatabaseError`); 9 = the differenced census
+is EMPTY -- zero kernel buckets carried a positive launch-count delta
+(leg INVALID -- not a genuine declared M>N same-workload pair).
 """
 
 from __future__ import annotations
@@ -189,6 +221,7 @@ from __future__ import annotations
 import argparse
 import collections
 import json
+import math
 import sqlite3
 import sys
 
@@ -202,18 +235,47 @@ import sys
 DEFAULT_LAUNCH_TOLERANCE = 0
 DEFAULT_TIME_TOLERANCE_US = 0.0
 
-# The bound a FIXED-COST bucket's (see module doc) time delta is checked
-# against, RELATIVE TO ITS OWN max(time_a, time_b) -- never the flat
-# `--time-tolerance-us` a real added-work bucket uses. A fixed-cost bucket
-# runs identical work in both legs, so its own duration is the only
-# meaningful scale to bound "nanosecond-scale jitter" against; 0.10 (10%)
-# is deliberately generous (scheduler noise/clock granularity on a shared
-# GPU can plausibly swing a few percent) while still catching the
-# round-4 pod-run live finding (a ~50ms delta in a bucket that itself
-# barely reaches 10us -- many multiples of 100% of its own magnitude). A
-# caller with box/nsys-version-specific evidence for a different bound
-# overrides via `--fixed-cost-jitter-rel-tolerance`.
-DEFAULT_FIXED_COST_JITTER_REL_TOLERANCE = 0.10
+# The HYBRID bound a FIXED-COST bucket's (see module doc) time delta is
+# checked against (round-2 re-audit BLOCK 1 on the round-1 fix's own
+# single relative bound): a fixed-cost bucket refuses only if
+# `|time delta| > max(FIXED_COST_JITTER_FLOOR_NS, rel_tolerance *
+# max(time_a, time_b))` -- the LARGER of an ABSOLUTE floor and a RELATIVE
+# bound, never a relative bound alone. A relative-only bound has two
+# failure modes a pod-run adversarial pass actually found: (1) ZERO
+# margin at any calibrated rel value (the round-4 fix's own "must never
+# refuse" in-tree fixture measured rel == 0.100000 EXACTLY against a
+# 0.10 bound -- a single extra nanosecond of jitter per launch flips it
+# to a false refusal), and (2) no floor at all means a bucket with a TINY
+# absolute duration (a single-launch eval-probe kernel a few hundred
+# nanoseconds long) can trip a large RELATIVE jitter from a few-hundred-
+# nanosecond absolute swing that is obviously still noise, and because
+# ANY single bucket's violation is leg-fatal, this false-refusal rate
+# compounds over the K buckets a real census differences.
+#
+# `FIXED_COST_JITTER_FLOOR_NS` = 1,000,000ns (1ms): comfortably above any
+# real per-bucket scheduler/clock-granularity jitter (which lands in the
+# tens-to-hundreds of nanoseconds, not milliseconds), and three orders of
+# magnitude below the round-4 pod-run LIVE FINDING this whole guard exists
+# to catch -- that finding's own numbers are a fixed-cost bucket whose
+# time delta was ~49.99ms against a bucket whose own max(time_a, time_b)
+# was ~50.01ms, i.e. a RELATIVE jitter of 0.9998 (49_990_000 / 50_010_000)
+# -- NOT "many multiples of 100%", which is arithmetically impossible for
+# a ratio of an absolute-value numerator to a same-sign-or-larger
+# denominator (phase-4 audit advisory 1, correcting an earlier overstated
+# claim in this same comment).
+#
+# `DEFAULT_FIXED_COST_JITTER_REL_TOLERANCE` = 0.5 (50%): the auditor's own
+# note is that ANY bound in [0.3, 0.9] catches the live finding's 0.9998
+# with margin; 0.5 sits in the middle of that range, comfortably clear of
+# both the live finding (0.9998) and genuine calibration fixtures well
+# under it, while still being loose enough that legitimate cross-run
+# scheduling variance on a shared GPU (which can plausibly swing a bucket
+# by tens of percent, not just single-digit percent) does not false-
+# refuse. A caller with box/nsys-version-specific evidence for a
+# different pair overrides via `--fixed-cost-jitter-floor-ns`/
+# `--fixed-cost-jitter-rel-tolerance`.
+DEFAULT_FIXED_COST_JITTER_FLOOR_NS = 1_000_000
+DEFAULT_FIXED_COST_JITTER_REL_TOLERANCE = 0.5
 
 
 class KernelTableMissingError(RuntimeError):
@@ -352,6 +414,58 @@ def _check_non_negative(
         violations.append(f"{label}: raw delta {delta} is negative beyond tolerance {tolerance}")
 
 
+def _classify_delta(dn: float, launch_tolerance: float) -> str:
+    """Classifies a bucket's launch-count delta into exactly one of three
+    buckets this module's guards treat differently (see module doc's
+    "EXCEPTION" paragraph): `"fixed_cost"` (`dn` in
+    `[-launch_tolerance, 0]` -- includes the exact `dn==0` case),
+    `"positive"` (`dn > 0`, real added work), or `"negative_regression"`
+    (`dn < -launch_tolerance`, always refused). Shared by the per-key
+    kernel-bucket loop and the memcpy/memset aggregate deltas (phase-4
+    audit round-2 re-audit advisory 2) so both apply the IDENTICAL
+    classification, not two hand-maintained copies of the same three-way
+    split."""
+    if -launch_tolerance <= dn <= 0:
+        return "fixed_cost"
+    if dn > 0:
+        return "positive"
+    return "negative_regression"
+
+
+def _fixed_cost_violation(
+    label: str,
+    dn: float,
+    dns: float,
+    ns_a: float,
+    ns_b: float,
+    jitter_floor_ns: float,
+    jitter_rel_tolerance: float,
+) -> tuple[float, str | None]:
+    """For a bucket `_classify_delta` already called `"fixed_cost"`,
+    returns `(relative jitter observed, violation message or None)` --
+    the HYBRID bound (phase-4 audit round-2 re-audit BLOCK 1, see
+    `DEFAULT_FIXED_COST_JITTER_FLOOR_NS`'s own comment for the full
+    calibration): refuses only if `|dns|` exceeds BOTH an absolute floor
+    and a bound relative to the bucket's own `max(ns_a, ns_b)` -- i.e.
+    `|dns| > max(jitter_floor_ns, jitter_rel_tolerance * max(ns_a, ns_b))`
+    -- never a relative bound alone (zero margin at any single calibrated
+    value) and never an absolute floor alone (a genuinely huge bucket's
+    proportionally-tiny-but-absolutely-large jitter would still need
+    catching)."""
+    denom = max(ns_a, ns_b, 1)
+    rel = abs(dns) / denom
+    bound_ns = max(jitter_floor_ns, jitter_rel_tolerance * denom)
+    if abs(dns) <= bound_ns:
+        return rel, None
+    return rel, (
+        f"{label} fixed-cost (launch count delta {dn}) time (ns) jitter {dns} "
+        f"(|delta|={abs(dns)}ns, rel={rel:.4f}x max(time_a={ns_a}, time_b={ns_b})={denom}) "
+        f"exceeds max(fixed_cost_jitter_floor_ns={jitter_floor_ns}, "
+        f"fixed_cost_jitter_rel_tolerance={jitter_rel_tolerance}*{denom}="
+        f"{jitter_rel_tolerance * denom:.1f})={bound_ns:.1f} -- not nanosecond-scale jitter"
+    )
+
+
 def build_report(
     path_a: str,
     path_b: str,
@@ -359,6 +473,7 @@ def build_report(
     steps_b: int,
     launch_tolerance: int = DEFAULT_LAUNCH_TOLERANCE,
     time_tolerance_us: float = DEFAULT_TIME_TOLERANCE_US,
+    fixed_cost_jitter_floor_ns: float = DEFAULT_FIXED_COST_JITTER_FLOOR_NS,
     fixed_cost_jitter_rel_tolerance: float = DEFAULT_FIXED_COST_JITTER_REL_TOLERANCE,
     wall_a: float | None = None,
     wall_b: float | None = None,
@@ -374,6 +489,35 @@ def build_report(
         raise ValueError(
             f"steps_b ({steps_b}) must be strictly greater than steps_a ({steps_a}) -- "
             "a census difference needs a genuine M>N same-workload pair"
+        )
+    # Tolerance-knob domain validation (phase-4 audit round-2 re-audit
+    # BLOCK 2): an out-of-domain value for any of these three would
+    # silently DEGRADE or INVERT a guard rather than raise -- caught here,
+    # once, before any of the per-key classification below ever reads
+    # them, rather than three separate ad-hoc checks scattered through the
+    # loop. `ValueError` (the same usage-error family `steps_b <= steps_a`
+    # above already uses -> `main()`'s existing `except ValueError`
+    # handler -> exit 2) -- these are CALLER-supplied argument domain
+    # errors, not a leg-INVALID measurement outcome.
+    if not (math.isfinite(launch_tolerance) and launch_tolerance >= 0):
+        raise ValueError(
+            f"launch_tolerance must be finite and >= 0, got {launch_tolerance!r} -- a negative "
+            "value would silently EMPTY the fixed-cost range ([-launch_tolerance, 0]) and invert "
+            "the negative-count-delta refusal"
+        )
+    if not (math.isfinite(time_tolerance_us) and time_tolerance_us >= 0):
+        raise ValueError(
+            f"time_tolerance_us must be finite and >= 0, got {time_tolerance_us!r}"
+        )
+    if not (
+        math.isfinite(fixed_cost_jitter_rel_tolerance)
+        and 0.0 <= fixed_cost_jitter_rel_tolerance < 1.0
+    ):
+        raise ValueError(
+            f"fixed_cost_jitter_rel_tolerance must be finite and in [0, 1), got "
+            f"{fixed_cost_jitter_rel_tolerance!r} -- a NaN/inf/>=1.0 value would fail OPEN "
+            "(silently never refusing a fixed-cost bucket's time jitter), and a negative value "
+            "inverts the guard"
         )
     if wall_a is not None and wall_b is not None and not (wall_a > 0 and wall_b > wall_a):
         raise WallPairInvalidError(
@@ -411,7 +555,9 @@ def build_report(
         dn, dns = nb - na, nsb - nsa
         name = key[0]
 
-        if -launch_tolerance <= dn <= 0:
+        cls = _classify_delta(dn, launch_tolerance)
+
+        if cls == "fixed_cost":
             # FIXED-COST bucket (see module doc's "EXCEPTION" paragraph):
             # either an exact dn==0 cancellation, or a launch-count jitter
             # the caller's own --launch-tolerance already treats as noise
@@ -419,27 +565,26 @@ def build_report(
             # differencing-relevant work, so it is excluded from the
             # per-step rows entirely (never checked against the FLAT
             # --time-tolerance-us the real added-work buckets use below).
-            # Its own time delta is instead bounded RELATIVE TO ITS OWN
-            # magnitude (phase-4 audit BLOCK 2) -- a fixed-cost bucket
-            # runs identical work in both legs, so a real divergence shows
-            # up as a large FRACTION of its own duration, never as an
-            # absolute floor.
+            # Its own time delta is instead bounded by the HYBRID
+            # floor/relative bound (phase-4 audit round-2 re-audit
+            # BLOCK 1) -- see `_fixed_cost_violation`'s own doc.
             fixed_cost_buckets += 1
             fixed_cost_time_ns += abs(dns)
-            denom = max(nsa, nsb, 1)
-            rel = abs(dns) / denom
+            rel, msg = _fixed_cost_violation(
+                f"kernel {name}{key[1:]}",
+                dn,
+                dns,
+                nsa,
+                nsb,
+                fixed_cost_jitter_floor_ns,
+                fixed_cost_jitter_rel_tolerance,
+            )
             fixed_cost_jitter_max_rel = max(fixed_cost_jitter_max_rel, rel)
-            if rel > fixed_cost_jitter_rel_tolerance:
-                violations.append(
-                    f"kernel {name}{key[1:]} fixed-cost (launch count delta {dn}) time (ns) "
-                    f"jitter {dns} is {rel:.4f}x its own max(time_a={nsa}, time_b={nsb})="
-                    f"{denom} -- exceeds "
-                    f"fixed_cost_jitter_rel_tolerance={fixed_cost_jitter_rel_tolerance}, not "
-                    "nanosecond-scale jitter"
-                )
+            if msg:
+                violations.append(msg)
             continue
 
-        if dn > 0:
+        if cls == "positive":
             positive_count_buckets += 1
             _check_non_negative(
                 f"kernel {name}{key[1:]} time (ns)", dns, time_tolerance_ns, violations
@@ -456,28 +601,51 @@ def build_report(
             )
             continue
 
-        # dn < -launch_tolerance: a real negative launch-count regression
-        # -- always refuses (the fixed-cost range above already claimed
-        # every dn in [-launch_tolerance, 0]).
+        # "negative_regression" (dn < -launch_tolerance): a real negative
+        # launch-count regression -- always refuses (the fixed-cost range
+        # above already claimed every dn in [-launch_tolerance, 0]).
         _check_non_negative(
             f"kernel {name}{key[1:]} launch count", dn, launch_tolerance, violations
         )
 
+    # memcpy/memset aggregate deltas take the SAME three-way classification
+    # (phase-4 audit round-2 re-audit advisory 2): a cancelling
+    # (dn<=0-within-tolerance) delta is fixed-cost, checked against the
+    # HYBRID bound, never the flat --time-tolerance-us (whose default of
+    # 0.0 would otherwise refuse on a single nanosecond of negative
+    # memcpy/memset jitter -- the driver passes neither flag).
     memcpy_dn = mb["memcpy"][0] - ma["memcpy"][0]
     memcpy_dns = mb["memcpy"][1] - ma["memcpy"][1]
     memset_dn = mb["memset"][0] - ma["memset"][0]
     memset_dns = mb["memset"][1] - ma["memset"][1]
-    _check_non_negative("memcpy count", memcpy_dn, launch_tolerance, violations)
-    _check_non_negative("memcpy time (ns)", memcpy_dns, time_tolerance_ns, violations)
-    _check_non_negative("memset count", memset_dn, launch_tolerance, violations)
-    _check_non_negative("memset time (ns)", memset_dns, time_tolerance_ns, violations)
+    for label, dn, dns, ns_a, ns_b in (
+        ("memcpy", memcpy_dn, memcpy_dns, ma["memcpy"][1], mb["memcpy"][1]),
+        ("memset", memset_dn, memset_dns, ma["memset"][1], mb["memset"][1]),
+    ):
+        cls = _classify_delta(dn, launch_tolerance)
+        if cls == "fixed_cost":
+            _, msg = _fixed_cost_violation(
+                label,
+                dn,
+                dns,
+                ns_a,
+                ns_b,
+                fixed_cost_jitter_floor_ns,
+                fixed_cost_jitter_rel_tolerance,
+            )
+            if msg:
+                violations.append(msg)
+        elif cls == "positive":
+            _check_non_negative(f"{label} time (ns)", dns, time_tolerance_ns, violations)
+        else:
+            _check_non_negative(f"{label} count", dn, launch_tolerance, violations)
 
     if violations:
         raise NonComparablePairError(
             "one or more per-key deltas were negative beyond tolerance (or a fixed-cost "
-            "bucket's relative time jitter exceeded fixed_cost_jitter_rel_tolerance) -- the "
-            "two exports do not look like the declared same-workload (steps_a, steps_b) "
-            "pair:\n  " + "\n  ".join(violations)
+            "bucket's time jitter exceeded the hybrid floor/relative bound) -- the two exports "
+            "do not look like the declared same-workload (steps_a, steps_b) pair:\n  "
+            + "\n  ".join(violations)
         )
 
     if positive_count_buckets == 0:
@@ -539,7 +707,7 @@ def main(argv: list[str] | None = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         usage="%(prog)s A.sqlite B.sqlite STEPS_A STEPS_B out.json "
         "[--launch-tolerance N] [--time-tolerance-us F] "
-        "[--fixed-cost-jitter-rel-tolerance F] "
+        "[--fixed-cost-jitter-floor-ns N] [--fixed-cost-jitter-rel-tolerance F] "
         "[--wall-a SECONDS --wall-b SECONDS] [--excluded-from-chain-attribution] "
         "[--steps-measured-a N --steps-measured-b M]",
     )
@@ -564,6 +732,16 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "raw negative time delta (microseconds) allowed before refusing "
             f"(default: {DEFAULT_TIME_TOLERANCE_US})"
+        ),
+    )
+    ap.add_argument(
+        "--fixed-cost-jitter-floor-ns",
+        type=float,
+        default=DEFAULT_FIXED_COST_JITTER_FLOOR_NS,
+        help=(
+            "absolute floor (nanoseconds) below the relative bound a FIXED-COST bucket's own "
+            f"time jitter must ALSO stay under before refusing (default: "
+            f"{DEFAULT_FIXED_COST_JITTER_FLOOR_NS})"
         ),
     )
     ap.add_argument(
@@ -631,6 +809,7 @@ def main(argv: list[str] | None = None) -> int:
             args.steps_b,
             launch_tolerance=args.launch_tolerance,
             time_tolerance_us=args.time_tolerance_us,
+            fixed_cost_jitter_floor_ns=args.fixed_cost_jitter_floor_ns,
             fixed_cost_jitter_rel_tolerance=args.fixed_cost_jitter_rel_tolerance,
             wall_a=args.wall_a,
             wall_b=args.wall_b,

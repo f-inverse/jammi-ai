@@ -1335,15 +1335,19 @@ jobs:
           # `convert_legacy_bert_checkpoint.py`'s own suite (#356 census
           # execution fix, defect 2): the `renamed_name` suffix-anchored
           # string logic is covered unconditionally; `convert`'s
-          # file-level behavior (renames, byte-identical values, collision
-          # refusal, zero-rename refusal, in-place refusal) is covered
-          # against a TINY synthetic safetensors fixture built in-test via
-          # the real `safetensors` package -- exercised only when
-          # `safetensors` is importable in this runner, skipped (never
-          # silently treated as passing) otherwise, the SAME
-          # `tokenizers`-dependent-half precedent
-          # `test_fixture_width_report.py` already established for this
-          # bare, no-toolchain Guard job.
+          # file-level behavior (renames, byte-identical values including
+          # a non-f32 dtype, an unsupported-dtype refusal,
+          # `__metadata__` carried through, collision refusal, zero-rename
+          # refusal, in-place refusal) needs the real `safetensors`
+          # package, installed for THIS ONE leg only (phase-4 audit
+          # round-2 re-audit advisory 4 -- see the "Install safetensors"
+          # step below, gated the same `if:` way the "pod build substrate"
+          # leg's own Rust-toolchain exception already is) so this
+          # production code path is actually CI-executed, not merely
+          # venv-proven-but-CI-skipped; the ImportError-refusal path is
+          # still exercised separately via a real subprocess with the
+          # package hidden, the SAME `tokenizers`-dependent-half precedent
+          # `test_fixture_width_report.py` already established.
           - name: perf convert_legacy_bert_checkpoint suite
             cmd: python3 ci/scripts/perf/test_convert_legacy_bert_checkpoint.py
           # `gen_fixed_width_corpus.py`'s own suite (#356 P4): determinism
@@ -1404,6 +1408,15 @@ jobs:
       - name: Fetch the registry (pod build substrate only)
         if: matrix.name == 'pod build substrate'
         run: cargo fetch --locked
+      # `convert_legacy_bert_checkpoint.py`'s file-level suite needs the
+      # real `safetensors` package (see that matrix entry's own comment,
+      # phase-4 audit round-2 re-audit advisory 4) -- installed for THIS
+      # ONE leg only, the same `if:`-gated exception the "pod build
+      # substrate" leg's own Rust toolchain above already establishes, so
+      # every OTHER leg here stays a bare, instant, no-install runner.
+      - name: Install safetensors (perf convert_legacy_bert_checkpoint suite only)
+        if: matrix.name == 'perf convert_legacy_bert_checkpoint suite'
+        run: python3 -m pip install --user safetensors
       - name: Run guard
         # `continue_on_error` is unset ('') for every leg except "doc
         # numbers have producers" (matrix.continue_on_error: "true" there) —

@@ -15,15 +15,21 @@ when `--wall-a`/`--wall-b` given, `excluded_from_chain_attribution`
 stamping); the phase-4 audit's CLASS 4 census domain guards: a
 PRESENT-but-EMPTY kernel table, a corrupt/unreadable sqlite export, an
 invalid wall pair (`wall_b > wall_a > 0` violated), and a declared-vs-
-measured steps mismatch; the round-4 pod-run fix's FIXED-COST bucket
+measured steps mismatch; the round-1 pod-run fix's FIXED-COST bucket
 classification (a dn==0 or within-`--launch-tolerance` bucket is excluded
 from the per-step report, never refused on its time delta the way a real
-added-work bucket is); and the round-5 audit's two BLOCKING fixes on that
+added-work bucket is); the round-2 audit's two BLOCKING fixes on that
 same classification -- an ALL-fixed-cost differenced pair now REFUSES
 (`EmptyDifferencedCensusError`) rather than silently emitting an empty-
-but-clean report, and a fixed-cost bucket's own time jitter is bounded
-RELATIVE TO ITS OWN magnitude (`fixed_cost_jitter_rel_tolerance`), never
-unconditionally waved through.
+but-clean report, and a fixed-cost bucket's own time jitter was bounded
+(originally RELATIVE TO ITS OWN magnitude alone); and the round-2
+RE-audit's own three fixes on THAT bound's calibration -- a HYBRID
+floor/relative bound (`CensusFixedCostHybridBoundTests`, replacing the
+zero-margin, no-floor relative-only bound), tolerance-knob domain
+validation at `build_report`'s own entry (`CensusToleranceValidationTests`
+-- NaN/inf/negative/`>=1.0` refuses rather than silently degrading or
+inverting a guard), and the memcpy/memset aggregate deltas taking the
+SAME fixed-cost classification + hybrid bound as kernel buckets.
 
 Run: `python3 ci/scripts/perf/test_kernel_census.py`
 """
@@ -270,17 +276,18 @@ class CensusFixedCostGuardTests(unittest.TestCase):
 
 
 class CensusFixedCostBoundGuardTests(unittest.TestCase):
-    """Phase-4 audit, round-5 (both BLOCKs raised on commit 04d452dc, the
-    round-4 fix's own first landing): BLOCK 1 -- an ALL-fixed-cost
+    """Phase-4 audit, round-2 (both BLOCKs raised on commit 04d452dc, the
+    round-1 fix's own first landing): BLOCK 1 -- an ALL-fixed-cost
     differenced pair (every bucket's launch-count delta <= 0) must REFUSE
     (`EmptyDifferencedCensusError`), never silently emit a structurally
     empty but "clean-looking" report. BLOCK 2 -- a fixed-cost bucket's own
-    time jitter is bounded RELATIVE TO ITS OWN magnitude
-    (`fixed_cost_jitter_rel_tolerance`), never unconditionally waved
-    through regardless of size. Advisory 1 -- a dn-within-
-    `--launch-tolerance` bucket takes the SAME fixed-cost classification
-    (and the same relative bound) as an exact dn==0 bucket, and never
-    emits a negative rate into the by-kernel-and-grid headline."""
+    time jitter is bounded (originally a RELATIVE-only bound; see
+    `CensusFixedCostHybridBoundTests` below for the round-2 RE-audit that
+    replaced it with the HYBRID floor/relative bound), never
+    unconditionally waved through regardless of size. Advisory 1 -- a
+    dn-within-`--launch-tolerance` bucket takes the SAME fixed-cost
+    classification (and the same bound) as an exact dn==0 bucket, and
+    never emits a negative rate into the by-kernel-and-grid headline."""
 
     def test_all_fixed_cost_pair_refuses_empty_differenced_census(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -320,7 +327,13 @@ class CensusFixedCostBoundGuardTests(unittest.TestCase):
             _make_sqlite(b, rows_b)
             with self.assertRaises(kernel_census.NonComparablePairError) as ctx:
                 kernel_census.build_report(a, b, steps_a=10, steps_b=20)
+            # Honest calibration (phase-4 audit round-2 re-audit advisory
+            # 1): this fixture's own relative jitter is 50_000_000 /
+            # 50_010_000 == 0.9998... -- NOT "many multiples of 100%",
+            # which is arithmetically impossible for |delta|/max(a, b).
+            self.assertIn("fixed_cost_jitter_floor_ns", str(ctx.exception))
             self.assertIn("fixed_cost_jitter_rel_tolerance", str(ctx.exception))
+            self.assertIn("rel=0.9998", str(ctx.exception))
 
     def test_small_fixed_cost_jitter_excluded_cleanly(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -362,6 +375,253 @@ class CensusFixedCostBoundGuardTests(unittest.TestCase):
             self.assertTrue(all(r["launches_per_step"] >= 0 for r in report["by_kernel_and_grid"]))
             self.assertNotIn("k2", {r["kernel"] for r in report["by_kernel_and_grid"]})
             self.assertEqual(report["fixed_cost_buckets"], 1)
+
+
+class CensusFixedCostHybridBoundTests(unittest.TestCase):
+    """Phase-4 audit, round-2 RE-audit BLOCK 1 (on the round-2 fix's own
+    relative-only bound): a bound with zero margin at any single
+    calibrated value AND no absolute floor has two independently
+    reproducible false-refusal modes -- probes BOTH sides of BOTH the
+    absolute floor and the relative bound, plus the two exact live/
+    in-tree fixture numbers the auditor's own repro named."""
+
+    def test_round1_fixture_899ns_per_launch_no_longer_flips_to_refusal(self):
+        # The auditor's own repro: `CensusFixedCostGuardTests`'s "must
+        # never refuse" fixture (5 launches, 1000ns -> 900ns each) measured
+        # rel == 0.100000 EXACTLY against the round-2 fix's own 0.10
+        # relative-only bound -- zero margin. Perturbing B by a single
+        # nanosecond PER LAUNCH (900ns -> 899ns, 5 launches: 4500ns ->
+        # 4495ns) flips rel to 0.101 > 0.10, a false refusal an adversarial
+        # audit reproduced directly. Under the new hybrid bound (floor
+        # 1_000_000ns dwarfs this 505ns delta), it no longer matters.
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            rows_a = _k1(10) + [
+                ("k2", 1, 1, 1, 32, 1, 1, i * 1000, i * 1000 + 1000) for i in range(5)
+            ]
+            rows_b = _k1(20) + [
+                ("k2", 1, 1, 1, 32, 1, 1, i * 899, i * 899 + 899) for i in range(5)
+            ]
+            _make_sqlite(a, rows_a)
+            _make_sqlite(b, rows_b)
+            report = kernel_census.build_report(a, b, steps_a=10, steps_b=20)
+            self.assertEqual(report["fixed_cost_buckets"], 1)
+            self.assertAlmostEqual(report["fixed_cost_jitter_max_rel"], 505 / 5000)
+
+    def test_tiny_single_launch_bucket_high_relative_ratio_is_allowed(self):
+        # The auditor's own second repro: a single-launch eval-probe
+        # kernel with rel == 0.125 (100ns / 800ns) -- a relative-only
+        # bound (even a generous one) flags this as "12.5% jitter", but
+        # 100ns is obviously capture/scheduler noise on an 800ns-duration
+        # bucket. The absolute floor (1_000_000ns) makes this a clean
+        # pass regardless of the relative ratio.
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            rows_a = _k1(10) + [("k2", 1, 1, 1, 32, 1, 1, 0, 700)]  # 700ns
+            rows_b = _k1(20) + [("k2", 1, 1, 1, 32, 1, 1, 0, 800)]  # 800ns (+100ns)
+            _make_sqlite(a, rows_a)
+            _make_sqlite(b, rows_b)
+            report = kernel_census.build_report(a, b, steps_a=10, steps_b=20)
+            self.assertAlmostEqual(report["fixed_cost_jitter_max_rel"], 0.125)
+            self.assertNotIn("k2", {r["kernel"] for r in report["by_kernel_and_grid"]})
+
+    def test_relative_bound_just_below_is_allowed(self):
+        # denom=3,000,000ns (3ms) -- well above the floor's own crossover
+        # (floor / rel_tolerance == 2,000,000ns), so the RELATIVE term
+        # (1,500,000ns == 0.5 * 3,000,000) is the operative bound, not the
+        # floor. dns=1,499,000ns -> rel=0.49966... < 0.5 -- allowed.
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            rows_a = _k1(10) + [("k2", 1, 1, 1, 32, 1, 1, 0, 1_501_000)]
+            rows_b = _k1(20) + [("k2", 1, 1, 1, 32, 1, 1, 0, 3_000_000)]
+            _make_sqlite(a, rows_a)
+            _make_sqlite(b, rows_b)
+            report = kernel_census.build_report(a, b, steps_a=10, steps_b=20)
+            self.assertLess(report["fixed_cost_jitter_max_rel"], 0.5)
+            self.assertNotIn("k2", {r["kernel"] for r in report["by_kernel_and_grid"]})
+
+    def test_relative_bound_just_above_refuses(self):
+        # Same 3ms-scale bucket, dns=1,501,000ns -> rel=0.50033... > 0.5 --
+        # refuses via the RELATIVE term (floor is not the binding
+        # constraint at this magnitude).
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            rows_a = _k1(10) + [("k2", 1, 1, 1, 32, 1, 1, 0, 1_499_000)]
+            rows_b = _k1(20) + [("k2", 1, 1, 1, 32, 1, 1, 0, 3_000_000)]
+            _make_sqlite(a, rows_a)
+            _make_sqlite(b, rows_b)
+            with self.assertRaises(kernel_census.NonComparablePairError) as ctx:
+                kernel_census.build_report(a, b, steps_a=10, steps_b=20)
+            self.assertIn("fixed_cost_jitter_rel_tolerance", str(ctx.exception))
+
+    def test_floor_governed_bucket_just_below_is_allowed_despite_high_relative_ratio(self):
+        # a's k2 duration=1,200,000ns (denom, since it's the larger of the
+        # two) -- BELOW the floor/rel_tolerance crossover (2,000,000ns),
+        # so the FLOOR (1,000,000ns) is the operative bound, not the
+        # relative term (0.5 * 1,200,000 == 600,000ns). b's k2
+        # duration=201,000ns -> dns=-999,000ns, rel=999_000/1_200_000==
+        # 0.8325 (would refuse under ANY relative-only bound <= 0.83), but
+        # 999,000ns < the 1,000,000ns floor -- allowed.
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            rows_a = _k1(10) + [("k2", 1, 1, 1, 32, 1, 1, 0, 1_200_000)]
+            rows_b = _k1(20) + [("k2", 1, 1, 1, 32, 1, 1, 0, 201_000)]
+            _make_sqlite(a, rows_a)
+            _make_sqlite(b, rows_b)
+            report = kernel_census.build_report(a, b, steps_a=10, steps_b=20)
+            self.assertGreater(report["fixed_cost_jitter_max_rel"], 0.5)
+            self.assertNotIn("k2", {r["kernel"] for r in report["by_kernel_and_grid"]})
+
+    def test_floor_governed_bucket_just_above_refuses(self):
+        # Same ~1.2ms-scale bucket, dns crosses 1,000,000ns by a single
+        # nanosecond (a's k2 duration 1,200,001ns, b's 200,000ns ->
+        # dns=-1,000,001ns) -- refuses via the FLOOR (the relative term
+        # 600,000.5ns would not have refused this on its own).
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            rows_a = _k1(10) + [("k2", 1, 1, 1, 32, 1, 1, 0, 1_200_001)]
+            rows_b = _k1(20) + [("k2", 1, 1, 1, 32, 1, 1, 0, 200_000)]
+            _make_sqlite(a, rows_a)
+            _make_sqlite(b, rows_b)
+            with self.assertRaises(kernel_census.NonComparablePairError) as ctx:
+                kernel_census.build_report(a, b, steps_a=10, steps_b=20)
+            self.assertIn("fixed_cost_jitter_floor_ns", str(ctx.exception))
+
+
+class CensusToleranceValidationTests(unittest.TestCase):
+    """Phase-4 audit, round-2 RE-audit BLOCK 2: `launch_tolerance`,
+    `time_tolerance_us`, and `fixed_cost_jitter_rel_tolerance` are
+    validated at `build_report`'s own entry -- an out-of-domain value
+    (NaN, inf, negative, or `>= 1.0` for the relative tolerance) refuses
+    (`ValueError`, the same usage-error family `steps_b <= steps_a`
+    already uses) naming the knob and its domain, never silently
+    degrading or inverting the guard it feeds."""
+
+    @staticmethod
+    def _valid_fixture(tmp):
+        a = os.path.join(tmp, "a.sqlite")
+        b = os.path.join(tmp, "b.sqlite")
+        _make_sqlite(a, _k1(1))
+        _make_sqlite(b, _k1(2))
+        return a, b
+
+    def test_launch_tolerance_out_of_domain_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = self._valid_fixture(tmp)
+            for bad in (float("nan"), float("inf"), -5):
+                with self.subTest(launch_tolerance=bad):
+                    with self.assertRaises(ValueError) as ctx:
+                        kernel_census.build_report(
+                            a, b, steps_a=1, steps_b=2, launch_tolerance=bad
+                        )
+                    self.assertIn("launch_tolerance", str(ctx.exception))
+
+    def test_time_tolerance_us_out_of_domain_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = self._valid_fixture(tmp)
+            for bad in (float("nan"), float("inf"), -1.0):
+                with self.subTest(time_tolerance_us=bad):
+                    with self.assertRaises(ValueError) as ctx:
+                        kernel_census.build_report(
+                            a, b, steps_a=1, steps_b=2, time_tolerance_us=bad
+                        )
+                    self.assertIn("time_tolerance_us", str(ctx.exception))
+
+    def test_fixed_cost_jitter_rel_tolerance_out_of_domain_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = self._valid_fixture(tmp)
+            for bad in (float("nan"), float("inf"), 1.0, -0.1):
+                with self.subTest(fixed_cost_jitter_rel_tolerance=bad):
+                    with self.assertRaises(ValueError) as ctx:
+                        kernel_census.build_report(
+                            a, b, steps_a=1, steps_b=2, fixed_cost_jitter_rel_tolerance=bad
+                        )
+                    self.assertIn("fixed_cost_jitter_rel_tolerance", str(ctx.exception))
+
+    def test_valid_boundary_values_are_allowed(self):
+        # 0 is a valid lower bound for launch_tolerance/time_tolerance_us;
+        # fixed_cost_jitter_rel_tolerance excludes 1.0 itself (checked
+        # above) but a value just under 1.0 is fine.
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = self._valid_fixture(tmp)
+            report = kernel_census.build_report(
+                a,
+                b,
+                steps_a=1,
+                steps_b=2,
+                launch_tolerance=0,
+                time_tolerance_us=0.0,
+                fixed_cost_jitter_rel_tolerance=0.999999,
+            )
+            self.assertEqual(report["steps_diff"], 1)
+
+    def test_main_launch_tolerance_negative_exit_2_no_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = self._valid_fixture(tmp)
+            out = os.path.join(tmp, "out.json")
+            rc = kernel_census.main([a, b, "1", "2", out, "--launch-tolerance", "-5"])
+            self.assertEqual(rc, 2)
+            self.assertFalse(os.path.exists(out))
+
+    def test_main_fixed_cost_jitter_rel_tolerance_ge_one_exit_2_no_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = self._valid_fixture(tmp)
+            out = os.path.join(tmp, "out.json")
+            rc = kernel_census.main(
+                [a, b, "1", "2", out, "--fixed-cost-jitter-rel-tolerance", "1.0"]
+            )
+            self.assertEqual(rc, 2)
+            self.assertFalse(os.path.exists(out))
+
+
+class CensusMemcpyMemsetFixedCostTests(unittest.TestCase):
+    """Phase-4 audit, round-2 RE-audit advisory 2: the memcpy/memset
+    aggregate deltas take the SAME fixed-cost classification + hybrid
+    bound as kernel buckets, not the flat `--time-tolerance-us` (default
+    0.0 -- the driver passes neither `--time-tolerance-us` nor
+    `--launch-tolerance`, so a single nanosecond of negative memcpy/memset
+    jitter used to refuse a leg outright)."""
+
+    def test_negative_memcpy_jitter_within_hybrid_bound_is_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            # Same memcpy COUNT (2) in both exports (dn=0, fixed-cost) but
+            # B's summed memcpy time is 1ns LESS -- exactly the class of
+            # jitter the flat (default 0.0) --time-tolerance-us used to
+            # refuse on outright.
+            _make_sqlite(a, _k1(10), memcpy=(2, 2000))
+            _make_sqlite(b, _k1(20), memcpy=(2, 1999))
+            report = kernel_census.build_report(a, b, steps_a=10, steps_b=20)
+            self.assertEqual(report["steps_diff"], 10)
+
+    def test_oversized_memcpy_jitter_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            # Same memcpy count (2, fixed-cost) but a multi-millisecond
+            # swing that exceeds both the floor and the relative bound.
+            _make_sqlite(a, _k1(10), memcpy=(2, 10_000))
+            _make_sqlite(b, _k1(20), memcpy=(2, 50_010_000))
+            with self.assertRaises(kernel_census.NonComparablePairError) as ctx:
+                kernel_census.build_report(a, b, steps_a=10, steps_b=20)
+            self.assertIn("memcpy fixed-cost", str(ctx.exception))
+
+    def test_memcpy_count_regression_beyond_tolerance_still_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            _make_sqlite(a, _k1(10), memcpy=(10, 10_000))
+            _make_sqlite(b, _k1(20), memcpy=(2, 10_000))  # count delta -8, not within tolerance.
+            with self.assertRaises(kernel_census.NonComparablePairError) as ctx:
+                kernel_census.build_report(a, b, steps_a=10, steps_b=20)
+            self.assertIn("memcpy count", str(ctx.exception))
 
 
 class CensusClass4GuardTests(unittest.TestCase):
@@ -482,6 +742,20 @@ class MainCliTests(unittest.TestCase):
             rc = kernel_census.main([a, b, "1", "2", out])
             self.assertEqual(rc, 0)
             self.assertTrue(os.path.exists(out))
+
+    def test_main_negative_delta_beyond_tolerance_exit_4_no_report(self):
+        # Phase-4 audit round-2 re-audit advisory 3: exit 4
+        # (`NonComparablePairError`) had no `main()`-level (CLI) coverage
+        # at all -- every prior test drove `build_report` directly.
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            out = os.path.join(tmp, "out.json")
+            _make_sqlite(a, _k1(50))
+            _make_sqlite(b, _k1(5))
+            rc = kernel_census.main([a, b, "1", "2", out])
+            self.assertEqual(rc, 4)
+            self.assertFalse(os.path.exists(out))
 
     def test_main_missing_kernel_table_exit_3_no_report(self):
         with tempfile.TemporaryDirectory() as tmp:

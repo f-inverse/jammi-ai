@@ -664,21 +664,23 @@ print(json.dumps({k: tier[k] for k in required}))
 ' "$1"
 }
 
-# Reads `fixed_cost_buckets`/`fixed_cost_time_us` off a `census.json`
-# (kernel_census.py's own top-level report fields, round-4/5 fix -- see
-# that module's own doc) -- REFUSES (nonzero exit, no stdout) if either is
-# absent, the same "never degrade to a silent {}" posture `_lora_counters`
-# above uses: this is only ever called after `census_ok=true` (kernel_census.py
-# exited 0 and wrote a report), so an absent field here means a report shape
-# this script does not understand, not a legitimately-missing measurement.
-# Surfaced into the per-leg manifest (phase-4 audit BLOCK 2) so the
-# emitted-for-visibility claim in kernel_census.py's own doc has an actual
-# consumer, not just an informational field nothing ever reads.
+# Reads `fixed_cost_buckets`/`fixed_cost_time_us`/`fixed_cost_jitter_max_rel`
+# off a `census.json` (kernel_census.py's own top-level report fields,
+# round-1/2 fix -- see that module's own doc) -- REFUSES (nonzero exit, no
+# stdout) if any is absent, the same "never degrade to a silent {}" posture
+# `_lora_counters` above uses: this is only ever called after
+# `census_ok=true` (kernel_census.py exited 0 and wrote a report), so an
+# absent field here means a report shape this script does not understand,
+# not a legitimately-missing measurement. Surfaced into the per-leg
+# manifest (phase-4 audit BLOCK 2, widened round-2 re-audit BLOCK 3(a) to
+# include `fixed_cost_jitter_max_rel`) so the emitted-for-visibility claim
+# in kernel_census.py's own doc has an actual consumer, not just an
+# informational field nothing ever reads.
 _census_fixed_cost() {
   python3 -c '
 import json, sys
 d = json.load(open(sys.argv[1]))
-required = ("fixed_cost_buckets", "fixed_cost_time_us")
+required = ("fixed_cost_buckets", "fixed_cost_time_us", "fixed_cost_jitter_max_rel")
 missing = [k for k in required if k not in d]
 if missing:
     print("::error::_census_fixed_cost: missing field(s) " + repr(missing) +
@@ -703,10 +705,17 @@ print(json.dumps({k: d[k] for k in required}))
 # mistakes a hermetic fake-execution manifest for a real GPU-pod result --
 # `census_ok`/`status: ok` under DRY_RUN describe the FAKE pipeline
 # completing, never a real measurement. `fixed_cost_buckets`/
-# `fixed_cost_time_us` (phase-4 audit round-5 BLOCK 2) surface
-# `kernel_census.py`'s own informational fixed-cost tally into the
-# manifest -- both `null` unless `census_ok` (there is no fixed-cost tally
-# without a real census report to read it from).
+# `fixed_cost_time_us`/`fixed_cost_jitter_max_rel` (phase-4 audit round-2
+# BLOCK 2, widened round-2 re-audit BLOCK 3(a)) surface `kernel_census.py`'s
+# own informational fixed-cost tally into the manifest -- all three `null`
+# unless `census_ok` (there is no fixed-cost tally without a real census
+# report to read it from). `census_exit` (round-2 re-audit BLOCK 3(b))
+# persists the ACTUAL exit code `kernel_census.py` (or `run_cmd`'s own
+# DRY_RUN stand-in) returned -- `null` only when this section never even
+# attempted the invocation (an earlier leg-level failure) -- so exit 9
+# (empty differenced census) vs exit 4 (a per-key/fixed-cost violation) is
+# machine-readable in the persisted record even on refusal, alongside
+# `reason`'s own first `::error::` line from kernel_census.py's stderr.
 _write_manifest() {
   MANIFEST_LEG_ID="$1" MANIFEST_GIT_SHA="$2" MANIFEST_BOX="$3" MANIFEST_NSYS_VERSION="$4" \
   MANIFEST_DTYPE="$5" MANIFEST_WIDTH="$6" MANIFEST_TARGET_MODULES="$7" \
@@ -716,7 +725,8 @@ _write_manifest() {
   MANIFEST_STATUS="${14}" MANIFEST_REASON="${15}" MANIFEST_CENSUS_OK="${16}" \
   MANIFEST_LORA_N="${17}" MANIFEST_LORA_M="${18}" MANIFEST_DRY_RUN="${19}" \
   MANIFEST_FIXED_COST_BUCKETS="${20}" MANIFEST_FIXED_COST_TIME_US="${21}" \
-  MANIFEST_OUT="${22}" \
+  MANIFEST_FIXED_COST_JITTER_MAX_REL="${22}" MANIFEST_CENSUS_EXIT="${23}" \
+  MANIFEST_OUT="${24}" \
   python3 -c '
 import json, os
 
@@ -756,6 +766,8 @@ manifest = {
     "dry_run": os.environ["MANIFEST_DRY_RUN"] == "true",
     "fixed_cost_buckets": _int_or_none(os.environ["MANIFEST_FIXED_COST_BUCKETS"]),
     "fixed_cost_time_us": _float_or_none(os.environ["MANIFEST_FIXED_COST_TIME_US"]),
+    "fixed_cost_jitter_max_rel": _float_or_none(os.environ["MANIFEST_FIXED_COST_JITTER_MAX_REL"]),
+    "census_exit": _int_or_none(os.environ["MANIFEST_CENSUS_EXIT"]),
 }
 json.dump(manifest, open(os.environ["MANIFEST_OUT"], "w"), indent=1)
 '
@@ -824,7 +836,7 @@ run_leg() {
         "$leg_id" "$SHA" "$(hostname)" "$NSYS_VERSION" "$dtype" "$width" "$target_modules" \
         "$layers_to_transform" "$EVAL_CADENCE" "$n_steps" "$m_steps" \
         "" "" "invalid" "could not create leg directory $leg_dir" "false" \
-        "null" "null" "$dry_run_flag" "" "" "$OUT_DIR/${leg_id}.manifest.json"; then
+        "null" "null" "$dry_run_flag" "" "" "" "" "$OUT_DIR/${leg_id}.manifest.json"; then
       echo "::error::$leg_id: could not write even the fallback manifest.json -- this IS sweep-fatal (results cannot be recorded); aborting." >&2
       exit 1
     fi
@@ -947,6 +959,13 @@ run_leg() {
 
   local census_ok="false"
   local census_json="$leg_dir/census.json"
+  local census_stderr="$leg_dir/census.stderr"
+  # Persisted so exit 9 (empty differenced census) vs exit 4 (a
+  # negative/fixed-cost-jitter violation) -- and WHICH rule fired -- is
+  # machine-readable in the manifest even on refusal (phase-4 audit round-2
+  # re-audit BLOCK 3(b)). "" (-> null in the manifest) unless this section
+  # actually attempts the real invocation below.
+  local census_exit=""
   if [ "$leg_status" = "ok" ]; then
     local -a census_cmd=(
       python3 "$DIR/kernel_census.py" "$sqlite_n" "$sqlite_m" "$n_steps" "$m_steps" "$census_json"
@@ -957,34 +976,63 @@ run_leg() {
     case "$leg_id" in
       *-E1) census_cmd+=(--excluded-from-chain-attribution) ;;
     esac
-    if run_cmd "${census_cmd[@]}"; then
+    # `run_cmd`'s own echoed "+ ..." trace line and (on a real, non-DRY_RUN
+    # invocation) kernel_census.py's own stderr are captured into a shell
+    # variable first (`2>&1 1>/dev/null` -- the same "capture only stderr"
+    # idiom, never a live pipe/process-substitution race) so BOTH the
+    # exit code (`$?`, immediately after the command substitution) and the
+    # text are available -- then re-emitted live (`>&2`, so this leg's
+    # trace/error visibility on the real console/CI log is unchanged) AND
+    # persisted to `$census_stderr` (so `leg_reason`'s own pointer below
+    # resolves to a real file, the same convention `run_traced`'s
+    # `run_n.stderr`/`run_m.stderr` already use).
+    # `&&`/`||` here, never a bare assignment (phase-4 round-2 audit
+    # BLOCK 2's own "every risky command is explicitly guarded" doctrine)
+    # -- a bare `x="$(cmd)"` assignment is a PLAIN command under
+    # `set -euo pipefail`; if `cmd` (kernel_census.py refusing) exits
+    # nonzero, that would abort the WHOLE SCRIPT immediately, before
+    # `census_exit=$?` ever ran, exactly the class of live regression
+    # this doctrine already exists to catch.
+    local census_err
+    census_err="$(run_cmd "${census_cmd[@]}" 2>&1 1>/dev/null)" && census_exit=0 || census_exit=$?
+    printf '%s\n' "$census_err" >&2
+    printf '%s\n' "$census_err" > "$census_stderr"
+    if [ "$census_exit" -eq 0 ]; then
       census_ok="true"
     else
       leg_status="invalid"
-      leg_reason="kernel_census.py refused (leg INVALID -- see its own exit code/stderr; no census.json written)"
+      local census_first_violation
+      census_first_violation="$(printf '%s\n' "$census_err" | grep -m1 '^::error::' || true)"
+      if [ -n "$census_first_violation" ]; then
+        leg_reason="kernel_census.py refused (exit $census_exit): $census_first_violation -- see $census_stderr"
+      else
+        leg_reason="kernel_census.py refused (exit $census_exit, leg INVALID -- see $census_stderr; no census.json written)"
+      fi
     fi
   fi
 
   # Surfaces kernel_census.py's own informational fixed-cost tally into
-  # this leg's manifest (phase-4 audit round-5 BLOCK 2) so the
+  # this leg's manifest (phase-4 audit round-2 BLOCK 2, widened round-2
+  # re-audit BLOCK 3(a) to include `fixed_cost_jitter_max_rel`) so the
   # emitted-for-visibility claim in that module's doc has an actual
-  # consumer. Both stay "" (-> null in the manifest) unless census_ok AND
-  # NOT DRY_RUN -- census_cmd itself goes through `run_cmd`, which under
-  # DRY_RUN only ECHOES the command and never executes it (see `run_cmd`'s
-  # own doc), so `census_json` is never actually written in that mode;
-  # `census_ok=true` there is the FAKE pipeline-completed stand-in this
-  # producer's own doc already names, and reading a fixed-cost tally out
-  # of a file that was never written would be a read against a
-  # nonexistent report, not a genuinely-missing field.
-  local fixed_cost_buckets="" fixed_cost_time_us=""
+  # consumer. All three stay "" (-> null in the manifest) unless census_ok
+  # AND NOT DRY_RUN -- census_cmd itself goes through `run_cmd`, which
+  # under DRY_RUN only ECHOES the command and never executes it (see
+  # `run_cmd`'s own doc), so `census_json` is never actually written in
+  # that mode; `census_ok=true` there is the FAKE pipeline-completed
+  # stand-in this producer's own doc already names, and reading a
+  # fixed-cost tally out of a file that was never written would be a read
+  # against a nonexistent report, not a genuinely-missing field.
+  local fixed_cost_buckets="" fixed_cost_time_us="" fixed_cost_jitter_max_rel=""
   if [ "$census_ok" = "true" ] && [ "$PROFILE_356_LEGS_DRY_RUN" != "1" ]; then
     local census_fixed_cost_json
     if census_fixed_cost_json="$(_census_fixed_cost "$census_json")"; then
       fixed_cost_buckets="$(printf '%s' "$census_fixed_cost_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["fixed_cost_buckets"])')"
       fixed_cost_time_us="$(printf '%s' "$census_fixed_cost_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["fixed_cost_time_us"])')"
+      fixed_cost_jitter_max_rel="$(printf '%s' "$census_fixed_cost_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["fixed_cost_jitter_max_rel"])')"
     else
       leg_status="invalid"
-      leg_reason="_census_fixed_cost refused on $census_json (missing fixed_cost_buckets/fixed_cost_time_us field -- an unrecognized report shape)"
+      leg_reason="_census_fixed_cost refused on $census_json (missing fixed_cost_buckets/fixed_cost_time_us/fixed_cost_jitter_max_rel field -- an unrecognized report shape)"
     fi
   fi
 
@@ -1014,7 +1062,8 @@ run_leg() {
       "$layers_to_transform" "$EVAL_CADENCE" "$n_steps" "$m_steps" \
       "$steps_measured_n" "$steps_measured_m" "$leg_status" "$leg_reason" "$census_ok" \
       "$lora_n" "$lora_m" "$dry_run_flag" \
-      "$fixed_cost_buckets" "$fixed_cost_time_us" "$leg_dir/manifest.json"; then
+      "$fixed_cost_buckets" "$fixed_cost_time_us" "$fixed_cost_jitter_max_rel" "$census_exit" \
+      "$leg_dir/manifest.json"; then
     echo "::error::$leg_id: could not write $leg_dir/manifest.json -- this IS sweep-fatal (this leg's result cannot be recorded); aborting the sweep now rather than continuing silently unrecorded." >&2
     exit 1
   fi

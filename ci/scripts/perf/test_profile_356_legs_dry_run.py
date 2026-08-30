@@ -133,17 +133,26 @@ class DryRunSmokeTests(unittest.TestCase):
                     "status", "reason", "census_ok",
                     "lora_counters_n_run", "lora_counters_m_run", "dry_run",
                     "fixed_cost_buckets", "fixed_cost_time_us",
+                    "fixed_cost_jitter_max_rel", "census_exit",
                 ):
                     self.assertIn(key, manifest, f"{leg_id} manifest missing {key!r}: {manifest}")
                 # `run_cmd` (the wrapper `census_cmd` itself goes through)
                 # only ECHOES under DRY_RUN and never executes
                 # kernel_census.py -- census.json is never actually
                 # written in this mode, so the fixed-cost tally this
-                # producer surfaces from it (phase-4 audit round-5 BLOCK
-                # 2) must stay null here, never a fabricated stand-in the
-                # way `census_ok=true` already is for this whole mode.
+                # producer surfaces from it (phase-4 audit round-1/2 BLOCK
+                # 2, widened round-2 re-audit BLOCK 3(a)) must stay null
+                # here, never a fabricated stand-in the way `census_ok=true`
+                # already is for this whole mode.
                 self.assertIsNone(manifest["fixed_cost_buckets"])
                 self.assertIsNone(manifest["fixed_cost_time_us"])
+                self.assertIsNone(manifest["fixed_cost_jitter_max_rel"])
+                # `census_exit` IS populated under DRY_RUN (round-2
+                # re-audit BLOCK 3(b)) -- unlike the fixed-cost fields
+                # above, it is `run_cmd`'s own genuine return value (0,
+                # since `run_cmd` never fails under DRY_RUN), not a read
+                # against a file that was never written.
+                self.assertEqual(manifest["census_exit"], 0)
                 # Every leg in the hermetic dry-run sweep is a clean, fully
                 # recorded run (the real capture path against the fake
                 # nsys/bench stand-ins always succeeds) -- round-2 audit

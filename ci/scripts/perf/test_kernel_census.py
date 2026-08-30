@@ -183,6 +183,71 @@ class CensusRefusalTests(unittest.TestCase):
             self.assertEqual(report["steps_diff"], 1)
 
 
+class CensusFixedCostGuardTests(unittest.TestCase):
+    """Round-4 pod-run fix: the first real 14-leg census hit buckets like
+    `layernorm_f32(8192,1,1,32,1,1)` -- kernels the init probe / held-out
+    eval launch the SAME number of times in both exports (count delta
+    exactly 0) whose summed time still jitters by nanoseconds. See the
+    module doc's "EXCEPTION" paragraph. Covers all three of its named
+    cases: count-delta-zero jitter (allowed, excluded, tallied),
+    count-delta-negative (still refused), count-delta-positive with a
+    negative time delta (still refused)."""
+
+    def test_fixed_cost_bucket_negative_time_jitter_allowed_and_excluded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            # k1: the genuine training-step kernel, accumulates 10 -> 20
+            # launches (a real, differencing-relevant delta).
+            # k2: a FIXED-COST kernel (init probe / held-out eval) -- the
+            # SAME launch count (5) in both exports, but B's summed time is
+            # slightly SMALLER than A's -- nanosecond jitter, never a real
+            # regression, and must never refuse.
+            rows_a = _k1(10) + [
+                ("k2", 1, 1, 1, 32, 1, 1, i * 1000, i * 1000 + 1000) for i in range(5)
+            ]
+            rows_b = _k1(20) + [
+                ("k2", 1, 1, 1, 32, 1, 1, i * 1000, i * 1000 + 900) for i in range(5)
+            ]
+            _make_sqlite(a, rows_a)
+            _make_sqlite(b, rows_b)
+            report = kernel_census.build_report(a, b, steps_a=10, steps_b=20)
+            self.assertEqual(report["fixed_cost_buckets"], 1)
+            # 5 launches * (1000ns - 900ns) = 500ns total jitter -> 0.5us.
+            self.assertAlmostEqual(report["fixed_cost_time_us"], 0.5)
+            self.assertNotIn("k2", {r["kernel"] for r in report["by_kernel_and_grid"]})
+            self.assertNotIn("k2", {r["kernel"] for r in report["by_kernel_name"]})
+
+    def test_count_delta_negative_beyond_tolerance_still_refuses(self):
+        # Same class the pre-existing negative-delta test already covers,
+        # named explicitly per the round-4 fix's own three-way guard split:
+        # a NONZERO negative count delta (not exactly 0) is never fixed-cost
+        # and must still refuse.
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            _make_sqlite(a, _k1(10))
+            _make_sqlite(b, _k1(9))  # count delta -1, not 0 -- not fixed-cost.
+            with self.assertRaises(kernel_census.NonComparablePairError):
+                kernel_census.build_report(a, b, steps_a=1, steps_b=2)
+
+    def test_count_delta_positive_time_delta_negative_still_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            # a: 10 launches @ 1000ns each = 10000ns total.
+            _make_sqlite(a, _k1(10))
+            # b: 12 launches (count delta +2, real added work) but only
+            # 700ns each = 8400ns total (time delta -1600ns) -- more
+            # launches with LESS total time is impossible for real added
+            # work, and this bucket's count delta is nonzero so it is not
+            # fixed-cost either; must still refuse.
+            rows_b = [("k1", 1, 1, 1, 32, 1, 1, i * 700, i * 700 + 700) for i in range(12)]
+            _make_sqlite(b, rows_b)
+            with self.assertRaises(kernel_census.NonComparablePairError):
+                kernel_census.build_report(a, b, steps_a=1, steps_b=2)
+
+
 class CensusClass4GuardTests(unittest.TestCase):
     """Phase-4 adversarial audit, CLASS 4: census domain guards that
     `CensusRefusalTests` above did not yet cover."""

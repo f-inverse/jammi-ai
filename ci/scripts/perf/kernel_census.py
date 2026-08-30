@@ -45,6 +45,27 @@ for its own sake:
     e.g. a stale/mismatched sqlite file, a build/config drift between the
     two captures, or an export path bug -- and must not be silently folded
     into a report a reader could mistake for a clean measurement.
+    EXCEPTION, a per-key bucket whose LAUNCH COUNT delta is EXACTLY zero is
+    FIXED-COST, not part of the (M-N)-step differencing at all (round-4
+    pod-run fix, first real 14-leg census): the init probe / held-out eval
+    launch the SAME kernels the SAME number of times in the N-step export
+    as in the M-step export (the contract's fixed eval cadence means this
+    non-training-step work is IDENTICAL across the pair, so its LAUNCH
+    COUNT literally cancels), but its SUMMED time is a nanosecond-scale
+    accumulator that jitters either sign run to run (scheduler noise, clock
+    granularity) -- a bucket that never grew its count at all is not "the
+    two exports diverged", it is "this bucket did no differencing-relevant
+    work in either run", so its time delta is never checked against the
+    tolerance and never refuses. Such buckets are excluded from the
+    per-step report rows entirely (dividing a zero-count delta by
+    `steps_b - steps_a` would report a fixed-cost kernel as if it scaled
+    with the differenced step count, which it does not) and instead
+    summarized as `fixed_cost_buckets` (a count) and `fixed_cost_time_us`
+    (the sum of their |time delta|, informational only) so the
+    cancellation stays visible rather than silently vanishing. A bucket
+    whose count delta is negative (beyond tolerance) or positive with a
+    negative time delta is NOT fixed-cost -- both remain refused exactly as
+    before.
   - refuses (exit nonzero, no report) unless `wall_b > wall_a > 0` whenever
     `--wall-a`/`--wall-b` are both given -- the SAME non-negativity/
     ordering domain check the per-key kernel/memcpy/memset deltas already
@@ -73,7 +94,9 @@ for its own sake:
 Output JSON: the ancestor's shape (`steps_diff`, `gpu_kernel_us_per_step`,
 `launches_per_step`, `memcpy_per_step`, `memset_per_step`,
 `by_kernel_name`, `by_kernel_and_grid`) plus `nsys_sqlite_schema_ok`,
-`steps_a`, `steps_b` (CONTRACT P4's own field list).
+`steps_a`, `steps_b` (CONTRACT P4's own field list), plus
+`fixed_cost_buckets`/`fixed_cost_time_us` (round-4 pod-run fix -- see the
+count-delta-zero exception in the guard list above).
 
 Wall denominator (round-3 pressure-test, contract v4 -- `### Wall
 denominator`): `--wall-a`/`--wall-b` (seconds, each run's OWN
@@ -317,11 +340,27 @@ def build_report(
     violations: list[str] = []
 
     rows = []
+    fixed_cost_buckets = 0
+    fixed_cost_time_ns = 0
     for key in set(ca) | set(cb):
         na, nsa = ca.get(key, (0, 0))
         nb, nsb = cb.get(key, (0, 0))
         dn, dns = nb - na, nsb - nsa
         name = key[0]
+        if dn == 0:
+            # FIXED-COST bucket (see module doc): the launch count is
+            # IDENTICAL across the two exports (the init probe / held-out
+            # eval launching this kernel the same number of times in both
+            # runs), so it cancels out of the (M-N)-step differencing
+            # entirely -- its summed time is a nanosecond-scale jitter that
+            # can land on either sign and is never checked against the
+            # tolerance or refused on. Excluded from the per-step rows
+            # (there is no "per differenced step" rate for a bucket that
+            # did zero differencing-relevant work); tallied instead so the
+            # cancellation stays visible.
+            fixed_cost_buckets += 1
+            fixed_cost_time_ns += abs(dns)
+            continue
         _check_non_negative(
             f"kernel {name}{key[1:]} launch count", dn, launch_tolerance, violations
         )
@@ -392,6 +431,8 @@ def build_report(
         "by_kernel_name": summary,
         "by_kernel_and_grid": rows[:400],
         "excluded_from_chain_attribution": excluded_from_chain_attribution,
+        "fixed_cost_buckets": fixed_cost_buckets,
+        "fixed_cost_time_us": fixed_cost_time_ns / 1000.0,
     }
     if wall_a is not None and wall_b is not None:
         report["wall_s_per_step"] = (wall_b - wall_a) / d
@@ -527,7 +568,9 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"steps_diff={report['steps_diff']} gpu_kernel_ms_per_step={gpu_ms:.1f} "
         f"launches/step={report['launches_per_step']:.0f} "
-        f"memcpy/step={report['memcpy_per_step']['count']:.0f}{wall_note}"
+        f"memcpy/step={report['memcpy_per_step']['count']:.0f}{wall_note} "
+        f"fixed_cost_buckets={report['fixed_cost_buckets']} "
+        f"fixed_cost_time_us={report['fixed_cost_time_us']:.1f}"
     )
     for r in report["by_kernel_name"][:40]:
         print(

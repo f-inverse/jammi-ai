@@ -1332,6 +1332,20 @@ jobs:
           # not a skip" reasoning as the other `perf/test_*.py` suites above.
           - name: perf kernel_census suite
             cmd: python3 ci/scripts/perf/test_kernel_census.py
+          # `convert_legacy_bert_checkpoint.py`'s own suite (#356 census
+          # execution fix, defect 2): the `renamed_name` suffix-anchored
+          # string logic is covered unconditionally; `convert`'s
+          # file-level behavior (renames, byte-identical values, collision
+          # refusal, zero-rename refusal, in-place refusal) is covered
+          # against a TINY synthetic safetensors fixture built in-test via
+          # the real `safetensors` package -- exercised only when
+          # `safetensors` is importable in this runner, skipped (never
+          # silently treated as passing) otherwise, the SAME
+          # `tokenizers`-dependent-half precedent
+          # `test_fixture_width_report.py` already established for this
+          # bare, no-toolchain Guard job.
+          - name: perf convert_legacy_bert_checkpoint suite
+            cmd: python3 ci/scripts/perf/test_convert_legacy_bert_checkpoint.py
           # `gen_fixed_width_corpus.py`'s own suite (#356 P4): determinism
           # (same (rows, min_wordpieces, seed) -> byte-identical output),
           # the emitted JSONL schema (the exact six TripletRow keys

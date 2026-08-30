@@ -91,6 +91,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Instant;
 
 use candle_core::Device;
 use candle_nn::VarMap;
@@ -315,6 +316,15 @@ pub struct FinetuneRunParams {
     pub lora_alpha: f64,
     pub lora_dropout: f64,
     pub target_modules: Vec<String>,
+    /// Optional restriction of LoRA injection to specific layer indices
+    /// (`--layers-to-transform`; `jammi_lora::should_apply_lora`'s own doc:
+    /// `Some(ids)` requires `layer_idx` to appear in it). `None` means no
+    /// restriction — every layer matching `target_modules` gets a LoRA
+    /// adapter, the SAME behavior this tier had before this field existed
+    /// (both [`build_encoder_adapters`]'s `LoraBuildConfig`s and
+    /// [`base_config`]'s `FineTuneConfig::layers_to_transform` hardcoded
+    /// `None`).
+    pub layers_to_transform: Option<Vec<usize>>,
     pub backbone_dtype: jammi_numerics::ComputePrecision,
     pub max_seq_length: usize,
     /// CALLER-declared premise for the `admission_is_dense` report field
@@ -483,6 +493,7 @@ fn build_encoder_adapters(
     model_dir: &Path,
     model_type: &str,
     target_modules: &[String],
+    layers_to_transform: &Option<Vec<usize>>,
     lora_rank: usize,
     lora_alpha: f64,
     lora_dropout: f64,
@@ -495,11 +506,10 @@ fn build_encoder_adapters(
     let weights = model_dir.join("model.safetensors");
     let dtype = jammi_encoders::compute_precision_to_dtype(backbone_dtype);
     let empty_ranks: HashMap<String, usize> = HashMap::new();
-    let no_layers: Option<Vec<usize>> = None;
     let lora_dropout_opt = (lora_dropout > 0.0).then_some(lora_dropout as f32);
     let lora_build_1 = jammi_lora::LoraBuildConfig {
         target_modules,
-        layers_to_transform: &no_layers,
+        layers_to_transform,
         lora_rank,
         lora_alpha,
         use_rslora: false,
@@ -527,15 +537,54 @@ fn build_encoder_adapters(
                 .build(&[weights.as_path()], &cfg, device, varmap)?;
             AnyEncoder::Bert(m)
         }
+        "distilbert" => {
+            let cfg: jammi_encoders::DistilBertConfig = serde_json::from_str(&config_raw)?;
+            let m = jammi_encoders::DistilBert::builder()
+                .pooling(jammi_encoders::Pooling::Mean)
+                .backbone_dtype(dtype)
+                .lora(lora_build_1)
+                .build(&[weights.as_path()], &cfg, device, varmap)?;
+            AnyEncoder::DistilBert(m)
+        }
         other => {
             return Err(format!(
-                "finetune-run: unsupported model_type '{other}' — this tier supports 'bert' and \
-                 'modernbert' (the C16 gate's checkpoint family and this crate's generic CPU test \
-                 fixture)"
+                "finetune-run: unsupported model_type '{other}' — this tier supports 'bert', \
+                 'modernbert', and 'distilbert' (the C16 gate's checkpoint family and this \
+                 crate's generic CPU test fixture)"
             )
             .into())
         }
     };
+    // Contract v2 addition (round-2 pressure-test of the profile contract):
+    // ZERO trainable Vars on the just-built encoder must refuse loudly here
+    // — UNCONDITIONALLY, mirroring `finetune_step.rs`'s `build_fixture`
+    // precedent EXACTLY ("no trainable LoRA tensors — target_modules matched
+    // nothing"), never gated on whether `target_modules` itself was empty or
+    // merely matched nothing on this architecture. This tier is a TRAINING
+    // tier, not an inference load: with zero trainable `Var`s, candle-core's
+    // backward pass tracks gradients only through `is_variable()` nodes, so
+    // `loss.backward()` differentiates nothing, and the optimizer step
+    // silently no-ops over an empty var list rather than warning — a run
+    // configured this way would silently "train" nothing while reporting
+    // plausible-looking numbers. `jammi_lora::LoraBuildConfig::frozen`'s
+    // documented "no LoRA" convenience (an explicitly empty
+    // `target_modules`) REMAINS valid for non-training (inference-load)
+    // consumers of that crate — this refusal is scoped to this tier's
+    // `build_encoder_adapters` only; `jammi-lora` itself is untouched. This
+    // also covers the CLI's real failure mode: `main.rs`'s
+    // `--target-modules` default (`"Wqkv,Wo,Wi"`, ModernBERT selectors)
+    // matches nothing on `bert`'s or `distilbert`'s
+    // `query`/`key`/`value`/`dense`-style naming.
+    if encoder.trainable_params().is_empty() {
+        return Err(format!(
+            "finetune-run: target_modules {target_modules:?} yielded zero trainable LoRA \
+             tensors on model_type '{model_type}' — this training tier requires LoRA to \
+             actually train something. Correct the selectors for this architecture (the \
+             CLI's own default, 'Wqkv,Wo,Wi', is ModernBERT-only and matches nothing on \
+             bert/distilbert)"
+        )
+        .into());
+    }
     // Re-audit round-2 fix (unit 63 finding 2): `ModernBert::builder().build(..)` /
     // `Bert::builder().build(..)` construct a FRESH encoder in EVAL mode
     // (`training: false` at construction — see each builder's own `build`)
@@ -564,7 +613,7 @@ fn build_encoder_adapters(
     // borrowed slices, so building it twice is free.
     let lora_build_2 = jammi_lora::LoraBuildConfig {
         target_modules,
-        layers_to_transform: &no_layers,
+        layers_to_transform,
         lora_rank,
         lora_alpha,
         use_rslora: false,
@@ -610,7 +659,7 @@ fn base_config(params: &FinetuneRunParams, epochs: usize) -> FineTuneConfig {
         lr_schedule: params.lr_schedule,
         early_stopping_metric: params.early_stopping_metric,
         target_modules: params.target_modules.clone(),
-        layers_to_transform: None,
+        layers_to_transform: params.layers_to_transform.clone(),
         use_rslora: false,
         rank_pattern: HashMap::new(),
         init_lora_weights: LoraInitMode::ZerosB,
@@ -988,6 +1037,13 @@ fn run_impl(
     // on `probe_len`).
     let mut train_probe_series: Vec<f64> = Vec::with_capacity(params.epochs + 1);
     let mut cumulative_steps = 0usize;
+    // CONTRACT v2 addition (#356 P1, item 3): wall-clock seconds around
+    // this run's `training_loop.run()` invocation(s) ONLY, summed across
+    // every resume-cycled epoch leg — see `FinetuneRunTier::train_run_wall_s`'s
+    // own doc for the exact scope (excludes `build_encoder_adapters`, the
+    // resume-checkpoint fetch/restore, and every `evaluate_held_out` call,
+    // all of which are separate statements outside this timer's span below).
+    let mut train_run_wall_s = 0.0f64;
     let mut last_final_loss = 0.0f64;
     let mut last_held_out = None;
     // Test-only (see `run_impl`'s own doc): the final epoch's `VarMap`
@@ -1034,6 +1090,7 @@ fn run_impl(
             &params.model_dir,
             &model_type,
             &params.target_modules,
+            &params.layers_to_transform,
             params.lora_rank,
             params.lora_alpha,
             params.lora_dropout,
@@ -1093,7 +1150,9 @@ fn run_impl(
             train_probe_series.push(init_probe.mean);
         }
 
+        let train_run_t0 = Instant::now();
         let result = training_loop.run(&train_loader)?;
+        train_run_wall_s += train_run_t0.elapsed().as_secs_f64();
         cumulative_steps += result.total_steps;
         last_final_loss = result.final_loss;
 
@@ -1281,6 +1340,7 @@ fn run_impl(
             Objective::Mnrl => None,
         },
         target_modules: params.target_modules.clone(),
+        layers_to_transform: params.layers_to_transform.clone(),
         backbone_dtype: format!("{:?}", params.backbone_dtype).to_lowercase(),
         checkpoint_config_sha256,
         checkpoint_weights_sha256,
@@ -1351,6 +1411,7 @@ fn run_impl(
         final_loss_diagnostic: last_final_loss,
         trajectory: trajectory.points,
         train_probe_series,
+        train_run_wall_s,
         mutant_id,
         mutant_base_sha,
         mutant_patch_sha256,
@@ -1458,6 +1519,7 @@ mod tests {
             // RED-provable mechanism `with_dropout_disabled` relies on).
             lora_dropout: 0.05,
             target_modules: vec!["query".to_string(), "value".to_string()],
+            layers_to_transform: None,
             backbone_dtype: jammi_numerics::ComputePrecision::F32,
             max_seq_length: 16,
             expect_dense: false,
@@ -1525,6 +1587,7 @@ mod tests {
             &tiny_bert_model_dir(),
             "bert",
             &["query".to_string(), "value".to_string()],
+            &None,
             2,
             4.0,
             0.05,
@@ -1591,6 +1654,345 @@ mod tests {
             "an eval-mode (training=false) forward must NOT advance the dropout forward counter \
              — this is the exact mechanism with_dropout_disabled relies on to make the probe \
              read-only"
+        );
+    }
+
+    /// Write a synthetic, ephemeral DistilBERT `config.json` + random-weight
+    /// `model.safetensors` to a fresh tempdir and return it (dropped —
+    /// deleting the dir — once the caller's `TempDir` goes out of scope).
+    /// `layers` is the number of transformer blocks the synthetic config/
+    /// weights get (every existing call site passes `1`; the
+    /// `--layers-to-transform` restriction test below passes `2`, needing a
+    /// second layer to restrict AWAY from).
+    ///
+    /// No committed HF-shaped DistilBERT fixture exists under
+    /// `cookbook/fixtures` (unlike `tiny_bert`), and this crate does not
+    /// invent a new committed fixture family to get one — this mirrors
+    /// `jammi-encoders`' own `tests/it/distilbert.rs::write_synthetic_weights`
+    /// exactly (same tensor names/prefix, same generic random content,
+    /// generated fresh every run), just with the `config.json`/
+    /// `model.safetensors` pair laid out on disk the way `build_encoder_adapters`
+    /// reads them (that function takes a `model_dir`, not a config value +
+    /// weights slice).
+    fn write_synthetic_distilbert_model_dir(layers: usize) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let device = Device::Cpu;
+        let (hidden, heads, inter, vocab, max_pos) = (32usize, 2usize, 64usize, 100usize, 128usize);
+
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::json!({
+                "model_type": "distilbert",
+                "dim": hidden,
+                "n_layers": layers,
+                "n_heads": heads,
+                "hidden_dim": inter,
+                "vocab_size": vocab,
+                "max_position_embeddings": max_pos,
+            })
+            .to_string(),
+        )
+        .expect("write config.json");
+
+        let mut tensors: HashMap<String, candle_core::Tensor> = HashMap::new();
+        let randn = |shape: (usize, usize)| -> candle_core::Tensor {
+            candle_core::Tensor::randn(0f32, 0.02, shape, &device).expect("randn 2-D")
+        };
+        let randn_1d = |size: usize| -> candle_core::Tensor {
+            candle_core::Tensor::randn(0f32, 0.02, (size,), &device).expect("randn 1-D")
+        };
+        let ones_1d = |size: usize| -> candle_core::Tensor {
+            candle_core::Tensor::ones((size,), candle_core::DType::F32, &device).expect("ones 1-D")
+        };
+        let zeros_1d = |size: usize| -> candle_core::Tensor {
+            candle_core::Tensor::zeros((size,), candle_core::DType::F32, &device)
+                .expect("zeros 1-D")
+        };
+
+        tensors.insert(
+            "distilbert.embeddings.word_embeddings.weight".into(),
+            randn((vocab, hidden)),
+        );
+        tensors.insert(
+            "distilbert.embeddings.position_embeddings.weight".into(),
+            randn((max_pos, hidden)),
+        );
+        tensors.insert(
+            "distilbert.embeddings.LayerNorm.weight".into(),
+            ones_1d(hidden),
+        );
+        tensors.insert(
+            "distilbert.embeddings.LayerNorm.bias".into(),
+            zeros_1d(hidden),
+        );
+        for n in 0..layers {
+            let prefix = format!("distilbert.transformer.layer.{n}");
+            for lin in ["q_lin", "k_lin", "v_lin", "out_lin"] {
+                tensors.insert(
+                    format!("{prefix}.attention.{lin}.weight"),
+                    randn((hidden, hidden)),
+                );
+                tensors.insert(format!("{prefix}.attention.{lin}.bias"), randn_1d(hidden));
+            }
+            tensors.insert(format!("{prefix}.sa_layer_norm.weight"), ones_1d(hidden));
+            tensors.insert(format!("{prefix}.sa_layer_norm.bias"), zeros_1d(hidden));
+            tensors.insert(format!("{prefix}.ffn.lin1.weight"), randn((inter, hidden)));
+            tensors.insert(format!("{prefix}.ffn.lin1.bias"), randn_1d(inter));
+            tensors.insert(format!("{prefix}.ffn.lin2.weight"), randn((hidden, inter)));
+            tensors.insert(format!("{prefix}.ffn.lin2.bias"), randn_1d(hidden));
+            tensors.insert(
+                format!("{prefix}.output_layer_norm.weight"),
+                ones_1d(hidden),
+            );
+            tensors.insert(format!("{prefix}.output_layer_norm.bias"), zeros_1d(hidden));
+        }
+        // `heads` only feeds the config's own `n_heads` divisibility check
+        // inside `DistilBert::builder().build(..)` — no weight tensor is
+        // keyed by head count, so it is read here only to keep the tuple
+        // destructure honest about every field `tiny_config` (the
+        // `jammi-encoders` analogue) names.
+        let _ = heads;
+        candle_core::safetensors::save(&tensors, dir.path().join("model.safetensors"))
+            .expect("save synthetic model.safetensors");
+        dir
+    }
+
+    /// `model_type` `"distilbert"` must construct via
+    /// [`jammi_encoders::DistilBert::builder`] (mirroring the `"bert"`/
+    /// `"modernbert"` arms exactly) and the resulting encoder must genuinely
+    /// run this tier's step machinery: a training-mode forward over synthetic
+    /// ids, wired the same way `dropout_forward_counter_is_live_...` above
+    /// proves for `"bert"`.
+    #[test]
+    fn build_encoder_adapters_supports_distilbert() {
+        let model_dir = write_synthetic_distilbert_model_dir(1);
+        let varmap = VarMap::new();
+        let (mut encoder, adapter_cfg) = build_encoder_adapters(
+            model_dir.path(),
+            "distilbert",
+            &["q_lin".to_string(), "v_lin".to_string()],
+            &None,
+            2,
+            4.0,
+            0.0,
+            jammi_numerics::ComputePrecision::F32,
+            7,
+            &Device::Cpu,
+            &varmap,
+        )
+        .expect("build_encoder_adapters must support model_type \"distilbert\"");
+
+        assert!(
+            matches!(encoder, AnyEncoder::DistilBert(_)),
+            "model_type \"distilbert\" must build an AnyEncoder::DistilBert variant"
+        );
+        assert_eq!(adapter_cfg.model_type, "distilbert");
+        assert_eq!(encoder.hidden_size(), 32);
+
+        let input_ids = crate::finetune_step::synthetic_ids(2, 4, 100, 11, &Device::Cpu);
+        let mask = candle_core::Tensor::ones((2, 4), candle_core::DType::U32, &Device::Cpu)
+            .expect("mask tensor");
+        encoder.set_training(true);
+        let pooled = encoder
+            .forward(&input_ids, &mask)
+            .expect("training-mode forward over the synthetic distilbert encoder");
+        assert_eq!(pooled.dims(), &[2, 32]);
+        assert!(
+            !encoder.trainable_params().is_empty(),
+            "a LoRA-injected distilbert encoder must report trainable params"
+        );
+    }
+
+    /// CONTRACT v2 addition (#356 P1, item 5): `--layers-to-transform`
+    /// plumbing — `Some([0])` on a TWO-layer encoder must wrap ONLY layer
+    /// 0's matching linears, never layer 1's, so the trainable LoRA tensor
+    /// count under the restriction is EXACTLY HALF the unrestricted
+    /// (`None`) count for the identical `target_modules` (both layers are
+    /// structurally identical in this synthetic fixture, so "half" is exact,
+    /// not approximate).
+    #[test]
+    fn build_encoder_adapters_layers_to_transform_restricts_to_one_layer() {
+        let model_dir = write_synthetic_distilbert_model_dir(2);
+        let target_modules = ["q_lin".to_string(), "v_lin".to_string()];
+
+        let varmap_all = VarMap::new();
+        let (encoder_all, _cfg_all) = build_encoder_adapters(
+            model_dir.path(),
+            "distilbert",
+            &target_modules,
+            &None,
+            2,
+            4.0,
+            0.0,
+            jammi_numerics::ComputePrecision::F32,
+            7,
+            &Device::Cpu,
+            &varmap_all,
+        )
+        .expect("no layers_to_transform restriction: build must succeed over both layers");
+        let trainable_all = encoder_all.trainable_params().len();
+
+        let varmap_one = VarMap::new();
+        let (encoder_one, _cfg_one) = build_encoder_adapters(
+            model_dir.path(),
+            "distilbert",
+            &target_modules,
+            &Some(vec![0]),
+            2,
+            4.0,
+            0.0,
+            jammi_numerics::ComputePrecision::F32,
+            7,
+            &Device::Cpu,
+            &varmap_one,
+        )
+        .expect("layers_to_transform: Some([0]) must still build (layer 0 matches)");
+        let trainable_one = encoder_one.trainable_params().len();
+
+        assert!(
+            trainable_one > 0,
+            "layer 0 alone must still yield trainable LoRA tensors"
+        );
+        assert_eq!(
+            trainable_all,
+            2 * trainable_one,
+            "restricting to one of two structurally-identical layers must exactly halve the \
+             trainable LoRA tensor count: all={trainable_all}, one={trainable_one}"
+        );
+    }
+
+    /// Negative control: a `model_type` this tier does not know must still
+    /// error, and the error must honestly name every type this tier DOES
+    /// support (currently three: `"bert"`, `"modernbert"`, `"distilbert"`) —
+    /// not silently construct one of them, and not go stale as new arms are
+    /// added. Any committed `model_dir` works here (`tiny_bert`'s) because
+    /// the `other` arm never reads `config.json` at all.
+    #[test]
+    fn build_encoder_adapters_rejects_unknown_model_type_and_names_all_three() {
+        let varmap = VarMap::new();
+        // `AnyEncoder` (the `Ok` half of this `Result`) has no `Debug` impl,
+        // so `.expect_err(..)` (which requires `T: Debug` for its own panic
+        // message) does not typecheck here — match instead.
+        let result = build_encoder_adapters(
+            &tiny_bert_model_dir(),
+            "roberta",
+            &["query".to_string(), "value".to_string()],
+            &None,
+            2,
+            4.0,
+            0.0,
+            jammi_numerics::ComputePrecision::F32,
+            7,
+            &Device::Cpu,
+            &varmap,
+        );
+        let err = match result {
+            Ok(_) => panic!("an unsupported model_type must be refused, not silently accepted"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("roberta"),
+            "error must name the rejected type: {msg}"
+        );
+        for supported in ["bert", "modernbert", "distilbert"] {
+            assert!(
+                msg.contains(supported),
+                "error must honestly list every supported model_type, missing {supported:?}: {msg}"
+            );
+        }
+    }
+
+    /// Contract v2 addition (phase-1 pressure-test of the profile contract):
+    /// a NON-EMPTY `target_modules` that matches zero linear layers on the
+    /// built encoder must REFUSE loudly, mirroring
+    /// `finetune_step.rs`'s `build_fixture` precedent ("no trainable LoRA
+    /// tensors — target_modules matched nothing"). This is the CLI's real
+    /// failure mode: `main.rs`'s `--target-modules` default is
+    /// `"Wqkv,Wo,Wi"` (ModernBERT selectors), which matches nothing on
+    /// `tiny_bert`'s `query`/`key`/`value`/`dense` naming — today that
+    /// silently profiles a LoRA-free model instead of refusing.
+    #[test]
+    fn build_encoder_adapters_refuses_nonempty_target_modules_that_match_nothing() {
+        let varmap = VarMap::new();
+        let unmatched = ["Wqkv".to_string(), "Wo".to_string(), "Wi".to_string()];
+        let result = build_encoder_adapters(
+            &tiny_bert_model_dir(),
+            "bert",
+            &unmatched,
+            &None,
+            2,
+            4.0,
+            0.0,
+            jammi_numerics::ComputePrecision::F32,
+            7,
+            &Device::Cpu,
+            &varmap,
+        );
+        let err = match result {
+            Ok(_) => panic!(
+                "target_modules {unmatched:?} match nothing on a bert encoder's \
+                 query/key/value/dense naming — this must refuse, not silently build a \
+                 LoRA-free encoder"
+            ),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        for selector in &unmatched {
+            assert!(
+                msg.contains(selector.as_str()),
+                "error must name the unmatched selector {selector:?}: {msg}"
+            );
+        }
+        assert!(
+            msg.contains("bert"),
+            "error must name the model_type: {msg}"
+        );
+    }
+
+    /// CORRECTED (round-2 pressure-test): an explicitly EMPTY
+    /// `target_modules` must ALSO refuse in this TRAINING tier, mirroring
+    /// `finetune_step.rs`'s `build_fixture` precedent
+    /// (`trainable.is_empty()`) EXACTLY — that check is unconditional on
+    /// whether `target_modules` itself was empty or merely matched nothing.
+    /// Rationale: with zero trainable `Var`s, candle-core 0.11's
+    /// `backprop.rs` only tracks gradients through `is_variable()` nodes, so
+    /// `loss.backward()` emits nothing to differentiate, and
+    /// `candle_nn::optimizer`'s `AdamW::step` silently no-ops over an empty
+    /// var list rather than warning — a caller who passes an empty
+    /// `target_modules` to THIS tier would get a run that silently "trains"
+    /// nothing, indistinguishable in its reported numbers from a genuine
+    /// LoRA run. `jammi_lora::LoraBuildConfig::frozen`'s "no LoRA"
+    /// convenience remains valid for non-training (inference-load)
+    /// consumers — this refusal is scoped to this tier's `build_encoder_adapters`
+    /// only; `jammi-lora` itself is untouched.
+    #[test]
+    fn build_encoder_adapters_refuses_empty_target_modules_too() {
+        let varmap = VarMap::new();
+        let result = build_encoder_adapters(
+            &tiny_bert_model_dir(),
+            "bert",
+            &[],
+            &None,
+            2,
+            4.0,
+            0.0,
+            jammi_numerics::ComputePrecision::F32,
+            7,
+            &Device::Cpu,
+            &varmap,
+        );
+        let err = match result {
+            Ok(_) => panic!(
+                "an empty target_modules must ALSO refuse in this training tier — zero \
+                 trainable Vars means the run would silently train nothing"
+            ),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bert"),
+            "error must name the model_type: {msg}"
         );
     }
 
@@ -1695,6 +2097,42 @@ mod tests {
         assert_eq!(
             named_with, named_without,
             "trained weights diverged bit-for-bit between WITH and WITHOUT the init probe"
+        );
+    }
+
+    /// CONTRACT v2 addition (#356 P1, item 3): `train_run_wall_s` must be a
+    /// REAL, measured, nonzero wall-clock time (never a stub/hardcoded
+    /// value), and — because it times ONLY `training_loop.run()` calls,
+    /// excluding `build_encoder_adapters`, the resume-checkpoint fetch, and
+    /// every `evaluate_held_out` call (see that field's own doc) — it must
+    /// be STRICTLY LESS than the whole `run_impl` invocation's own outer
+    /// wall-clock, since this CPU-hermetic fixture's held-out/probe
+    /// evaluations and encoder builds each take real, nonzero time too.
+    #[tokio::test]
+    async fn train_run_wall_s_is_measured_and_strictly_less_than_the_outer_wall_clock() {
+        let work_dir = tempfile::tempdir().expect("tempdir");
+        let params = non_perturbation_test_params(work_dir.path().to_path_buf());
+        let outer_t0 = Instant::now();
+        let (tier, _varmap) = tokio::task::spawn_blocking(move || run_impl(&params, true))
+            .await
+            .expect("join run_impl task")
+            .expect("finetune-run");
+        let outer_wall_s = outer_t0.elapsed().as_secs_f64();
+
+        assert!(
+            tier.train_run_wall_s > 0.0,
+            "train_run_wall_s must be a real, measured, nonzero wall-clock time, got {}",
+            tier.train_run_wall_s
+        );
+        assert!(
+            tier.train_run_wall_s < outer_wall_s,
+            "train_run_wall_s ({}) must be STRICTLY LESS than run_impl's own outer wall-clock \
+             ({}) -- it excludes build_encoder_adapters, the resume-checkpoint fetch, and every \
+             evaluate_held_out call, all of which this fixture's real tokenizer/forward passes \
+             make take nonzero time too; train_run_wall_s >= outer_wall_s would mean this field \
+             is silently timing more than just training_loop.run()",
+            tier.train_run_wall_s,
+            outer_wall_s
         );
     }
 

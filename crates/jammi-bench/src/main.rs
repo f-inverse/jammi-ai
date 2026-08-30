@@ -193,6 +193,13 @@ struct FinetuneRunArgs {
     /// Comma-separated LoRA target selectors.
     #[arg(long, default_value = "Wqkv,Wo,Wi")]
     target_modules: String,
+    /// Optional comma-separated layer indices LoRA injection is restricted
+    /// to (`jammi_lora::should_apply_lora`'s own doc: a layer must appear
+    /// in this list to receive an adapter). Empty (the default) means no
+    /// restriction — every layer matching `--target-modules` gets a LoRA
+    /// adapter.
+    #[arg(long, default_value = "")]
+    layers_to_transform: String,
     /// Backbone precision: f32, f16, or bf16.
     #[arg(long, default_value = "f32")]
     backbone_dtype: String,
@@ -844,6 +851,7 @@ async fn main() -> std::process::ExitCode {
                 lora_alpha,
                 lora_dropout,
                 target_modules,
+                layers_to_transform,
                 backbone_dtype,
                 max_seq_length,
                 expect_dense,
@@ -951,6 +959,28 @@ async fn main() -> std::process::ExitCode {
                     .filter(|s| !s.is_empty())
                     .map(str::to_string)
                     .collect(),
+                layers_to_transform: {
+                    let selectors: Vec<&str> = layers_to_transform
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if selectors.is_empty() {
+                        None
+                    } else {
+                        match selectors
+                            .iter()
+                            .map(|s| s.parse::<usize>())
+                            .collect::<Result<Vec<usize>, _>>()
+                        {
+                            Ok(v) => Some(v),
+                            Err(e) => {
+                                eprintln!("finetune-run: --layers-to-transform is invalid: {e}");
+                                return std::process::ExitCode::FAILURE;
+                            }
+                        }
+                    }
+                },
                 backbone_dtype: match backbone_dtype.as_str() {
                     "f32" => jammi_numerics::ComputePrecision::F32,
                     "f16" => jammi_numerics::ComputePrecision::F16,

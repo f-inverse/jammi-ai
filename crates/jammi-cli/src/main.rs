@@ -66,6 +66,12 @@ enum Commands {
         #[command(subcommand)]
         action: commands::mutable::MutableAction,
     },
+    /// Observe training jobs (list, per-job status). Read-only — jobs are
+    /// submitted through the data-plane client / SDK.
+    Train {
+        #[command(subcommand)]
+        action: commands::train::TrainAction,
+    },
 }
 
 #[tokio::main]
@@ -121,6 +127,7 @@ async fn dispatch(
         Commands::Trigger { action } => commands::trigger::run(client, action).await,
         Commands::Channels { action } => commands::channels::run(client, action).await,
         Commands::Mutable { action } => commands::mutable::run(client, action).await,
+        Commands::Train { action } => commands::train::run(client, action).await,
     }
 }
 

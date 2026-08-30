@@ -35,6 +35,8 @@ use jammi_wire::proto::catalog::{
     ListTopicsRequest, RegisterChannelRequest, RegisterTopicRequest, RemoveSourceRequest,
     SetTenantRequest, Tenant,
 };
+use jammi_wire::proto::training::training_service_client::TrainingServiceClient;
+use jammi_wire::proto::training::{ListTrainingJobsRequest, TrainingStatusRequest};
 use jammi_wire::{
     channel_from_proto, columns_to_proto, definition_list_from_proto, definition_to_proto,
     encode_ipc_stream, error_from_status, model_from_proto, source_descriptor_from_proto,
@@ -222,6 +224,59 @@ impl CatalogClient {
             storage_backends: resp.storage_backends,
             services: resp.services,
         })
+    }
+
+    // --- training jobs (read-only) ----------------------------------------
+
+    /// Read one training job's lifecycle status by id: status, output model id
+    /// (empty until completed), and the failure message (non-empty exactly when
+    /// status is `"failed"`). The control-plane read peer of the data-plane
+    /// client's submit — there is no progress surface to read (the engine
+    /// persists run metrics only at job finalization).
+    pub async fn training_status(&self, job_id: &str) -> Result<TrainingStatusInfo> {
+        let resp = self
+            .training_client()
+            .training_status(TrainingStatusRequest {
+                job_id: job_id.to_string(),
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        Ok(TrainingStatusInfo {
+            status: resp.status,
+            model_id: resp.model_id,
+            error: resp.error,
+        })
+    }
+
+    /// List training jobs visible to the session tenant, most recent first —
+    /// each row the same lifecycle projection [`Self::training_status`] reads,
+    /// plus the submit-time identity (kind, base model, creation time).
+    pub async fn list_training_jobs(&self) -> Result<Vec<TrainingJobSummary>> {
+        let resp = self
+            .training_client()
+            .list_training_jobs(ListTrainingJobsRequest {})
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        Ok(resp
+            .jobs
+            .into_iter()
+            .map(|j| TrainingJobSummary {
+                job_id: j.job_id,
+                kind: j.kind,
+                status: j.status,
+                base_model_id: j.base_model_id,
+                output_model_id: j.output_model_id,
+                created_at: j.created_at,
+                error: j.error,
+            })
+            .collect())
+    }
+
+    fn training_client(&self) -> TrainingServiceClient<SessionChannel> {
+        self.transport
+            .service(TrainingServiceClient::with_interceptor)
     }
 
     // --- mutable tables --------------------------------------------------
@@ -413,4 +468,43 @@ impl CatalogClient {
             .map(Some)
             .map_err(|e| JammiError::Tenant(format!("invalid tenant id from server: {e}")))
     }
+}
+
+/// One training job's lifecycle status, as read by
+/// [`CatalogClient::training_status`].
+#[derive(Debug, Clone)]
+pub struct TrainingStatusInfo {
+    /// Current lifecycle status: `"queued"`, `"running"`, `"completed"`, or
+    /// `"failed"`.
+    pub status: String,
+    /// The output model id the trained artifact registers under; empty until
+    /// the job completes.
+    pub model_id: String,
+    /// The failure message; non-empty exactly when `status` is `"failed"`.
+    pub error: String,
+}
+
+/// One row of [`CatalogClient::list_training_jobs`]: the
+/// [`TrainingStatusInfo`] projection plus the job's submit-time identity.
+#[derive(Debug, Clone)]
+pub struct TrainingJobSummary {
+    /// Server-assigned job id — the `training_status` key.
+    pub job_id: String,
+    /// Training-job kind: `"fine_tune"`, `"graph_fine_tune"`, or
+    /// `"context_predictor"`.
+    pub kind: String,
+    /// Current lifecycle status: `"queued"`, `"running"`, `"completed"`, or
+    /// `"failed"`.
+    pub status: String,
+    /// The base model the job trains from — the catalog's registered model id
+    /// (a resolved, versioned id, not necessarily the submit-time reference
+    /// string).
+    pub base_model_id: String,
+    /// The output model id the trained artifact registers under; empty until
+    /// the job completes.
+    pub output_model_id: String,
+    /// Job creation time, as recorded by the catalog (UTC text timestamp).
+    pub created_at: String,
+    /// The failure message; non-empty exactly when `status` is `"failed"`.
+    pub error: String,
 }

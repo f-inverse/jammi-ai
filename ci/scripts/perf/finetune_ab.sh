@@ -165,11 +165,22 @@
 # `jammi-fused`/`torch-sdpa` are. A failure on EITHER pair — first run or
 # second — invalidates the WHOLE config (`INVALID`, `ab_merge.py`'s own
 # exit-code carve-out), never silently discarded from just the ratio that
-# happened to notice it. `--expect-kernels-disabled`'s SAME hard check
-# (see the jammi-eager leg above) also protects `jammi-fused`/
-# `jammi-fused-2` implicitly: neither ever sets `JAMMI_KERNELS_DISABLE` at
-# all, so `fused_proof` is the only channel that can catch a fused op
-# silently falling back on either run.
+# happened to notice it. Both `jammi-fused` legs additionally pass
+# `--expect-kernels-disabled ""` (F5, adversarial audit): an EMPTY
+# expectation, checked via the SAME exact-SET-equality
+# `params.expect_kernels_disabled` (`finetune_step.rs:692-699`) machinery
+# the eager leg's own nonempty list uses —
+# `parse_disable_list` (`crates/jammi-kernels/src/admission.rs:684-693`)
+# is the empty set for `Some("")`, so
+# this hard-fails the run if `JAMMI_KERNELS_DISABLE` carries ANYTHING at
+# all when this process starts, catching an AMBIENT/leaked env var (a
+# stale export in the calling shell, an inherited CI runner variable) that
+# would otherwise silently force part of a "fused" leg eager with no
+# counter-based signal of it at all (a decline that domain-misses for an
+# unrelated reason reads identically to one that was disabled). This is
+# in ADDITION to, never a replacement for, `fused_proof`'s own positive-
+# proof channel above — the two catch different failure classes (an
+# ambient env leak vs. a genuine admission-domain regression).
 #
 # NOT covered here: loss-TRAJECTORY equivalence between jammi-fused and
 # jammi-eager (the #352 quality constraint) is a REAL-TRAINER check over
@@ -306,9 +317,9 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 
 # The named constant this script's jammi-eager leg disables — EXACTLY the
-# eight LIVE, STANDALONE `admit()`/`op_disabled()` op keys this crate's
-# fused finetune-step call graph actually reaches on a real training step
-# (confirmed at this contract's tip: `layer_norm_fused`
+# nine LIVE, STANDALONE `admit()`/`admit_cascade()`/`op_disabled()` op keys
+# this crate's fused finetune-step call graph actually reaches on a real
+# training step (confirmed at this contract's tip: `layer_norm_fused`
 # `crates/jammi-encoders/src/layer_norm.rs:197`, `geglu_fused`
 # `crates/jammi-encoders/src/modernbert.rs:1862`, `attention_block_flash`
 # `crates/jammi-encoders/src/modernbert.rs:2523` (`op_disabled`, the
@@ -317,7 +328,43 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 # `crates/jammi-encoders/src/modernbert.rs:566`, `softmax_last_dim_fused`
 # `crates/jammi-encoders/src/modernbert.rs:1791`, `lora_linear_fused`
 # `crates/jammi-lora/src/lora_linear.rs:722`, `adamw_step_fused`
-# `crates/jammi-ai/src/fine_tune/adamw.rs:257`).
+# `crates/jammi-ai/src/fine_tune/adamw.rs:257`, `mem_efficient_attention`
+# `crates/jammi-encoders/src/modernbert.rs:1233` (`admit_cascade`, the
+# per-layer memeff cascade — consulted on EVERY training-mode attention
+# layer once the flash cascade has declined, BEFORE the block arm's own
+# `admit()`) and `:2872` (`op_disabled`, the once-per-forward gate that
+# suppresses the block/eager mask bundle when memeff is going to fire).
+# `mem_efficient_attention` is the NINTH key, added by adversarial-audit
+# fold-in F4: an EARLIER 8-key version of this constant went undetected
+# because every `finetune_ab.sh` sweep config (`CONFIGS` below) has
+# `seq <= 512`, and `mem_efficient_attention_predicate` DomainMisses
+# UNCONDITIONALLY for any `seq <= ATTENTION_BLOCK_MAX_SEQ` (4096,
+# `crates/jammi-kernels/src/ops/attention_block.rs`'s own `MAX_SEQ`) —
+# so on THIS script's own configs the op never dispatches regardless of
+# whether it is named here, a domain-miss coincidence that hid the gap
+# from every real sweep this script has ever run, not a proof the key was
+# unneeded.
+#
+# SWEEP METHOD (so a TENTH addition gets caught, not merely this ninth):
+# every entry above was found by grepping `crates/jammi-encoders/src/`,
+# `crates/jammi-lora/src/`, and `crates/jammi-ai/src/fine_tune/` for a
+# direct `admit(`/`admit_cascade(`/`op_disabled(` call and reading off its
+# literal `op`/`&'static str` argument — `ci/scripts/perf/
+# test_finetune_ab_disable_op_keys.py` runs EXACTLY this sweep
+# mechanically (a balanced-paren scan over those three crates, never a
+# hand-kept list) and asserts the discovered set equals this constant
+# byte-for-byte; run it after touching any of those crates' attention/
+# LoRA/optimizer call graphs, and it REDs on both a missing and a stale
+# entry. That test's own scope is deliberately NOT `crates/jammi-kernels/
+# src/` (the SUBSUMED `cast_scale_bf16_f32`/`cast_add_bf16` keys live
+# there behind `ops/low_rank_residual_linear.rs`'s `admit_cast_boundary`
+# wrapper, called with a *variable* `op` argument, not a literal — a
+# grep-based scan cannot resolve it, and it must not be named directly
+# here regardless, see the `NOT lora_epilogue/...` bullet below) — that
+# one exclusion is verified MANUALLY against `admission.rs`'s own module
+# doc (the authoritative classification of every op key's reachability)
+# each time this constant changes, the documented manual-sweep protocol
+# the mechanical test's own doc names as its complement.
 #
 #   * NOT `all` — `crates/jammi-kernels/src/admission.rs:169-177`
 #     disclaims it as whole-registry evidence: `unmatched_disables()`
@@ -352,7 +399,7 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 #     (`crates/jammi-bench/tests/finetune_step_kernel_disable.rs:113`'s
 #     `kernel_disable_of_a_registered_but_dead_op_name_invalidates_the_run`
 #     proves this against the real CLI).
-JAMMI_EAGER_DISABLE_OP_KEYS="layer_norm_fused,geglu_fused,attention_block_flash,attention_block_fused,rope_fused,softmax_last_dim_fused,lora_linear_fused,adamw_step_fused"
+JAMMI_EAGER_DISABLE_OP_KEYS="layer_norm_fused,geglu_fused,attention_block_flash,attention_block_fused,rope_fused,softmax_last_dim_fused,lora_linear_fused,adamw_step_fused,mem_efficient_attention"
 
 AB_DRY_RUN="${AB_DRY_RUN:-0}"
 AB_CUDA_ORDINAL="${AB_CUDA_ORDINAL:-0}"
@@ -389,6 +436,25 @@ TS="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT_DIR="${AB_OUT_DIR:-$REPO_ROOT/.ab-report/$TS}"
 RAW_DIR="$OUT_DIR/raw"
 mkdir -p "$RAW_DIR"
+
+# F2 (adversarial audit): this script ALWAYS runs the order-balanced
+# A,B,B,A protocol (see "ORDER-BALANCED BAR LEGS" above) — every
+# invocation writes both runs of the bar pair, never just one. Without a
+# machine-readable signal of that promise, `ab_merge.py` had no way to
+# tell "this raw_dir's second-run legs are absent because the protocol
+# does not apply here" (an old, genuinely single-run `raw_dir`, predating
+# this fold-in) apart from "absent because something silently failed to
+# run them" — the two cases read identically on disk otherwise, and the
+# merge stage used to collapse them into the SAME graceful degrade. This
+# marker, written BEFORE any leg runs (so even a sweep that dies on its
+# very first leg still leaves it behind), makes the promise explicit and
+# checkable: `ab_merge.py`'s own `TWO_RUN_PROTOCOL_MARKER` constant names
+# the SAME filename, and its presence makes all four bar legs
+# (`jammi-fused`, `torch-sdpa`, `jammi-fused-2`, `torch-sdpa-2`) REQUIRED
+# for that config — a MISSING/DRY_RUN second-run leg under this marker is
+# an INVALID config (an incomplete sweep, not a legacy raw_dir), never a
+# silent fallback to the single-pair estimator.
+touch "$RAW_DIR/TWO_RUN_PROTOCOL_MARKER"
 
 CONFIGS=("8:128" "8:512" "16:128")
 DROPOUTS=("0" "0.05")
@@ -454,8 +520,13 @@ slug_for() {
 }
 
 # One jammi leg. `disable_ops` (optional, arg 8): when non-empty, names the
-# `JAMMI_KERNELS_DISABLE` op-key list AND the `--expect-kernels-disabled`
-# hard check (see header) — the jammi-eager leg's own call shape. Every
+# `JAMMI_KERNELS_DISABLE` op-key list — the jammi-eager leg's own call
+# shape. `--expect-kernels-disabled "$disable_ops"` is ALWAYS passed (F5,
+# adversarial audit), even when `disable_ops` is empty: an empty
+# expectation on a "fused" leg (`jammi-fused`/`jammi-fused-2`) is a hard,
+# exact-set-equality guard against an AMBIENT `JAMMI_KERNELS_DISABLE`
+# leaking into this process from the calling shell/CI runner — see the
+# "IDENTITY-COMPLETENESS" section above for the full rationale. Every
 # jammi leg runs `JAMMI_KERNELS_STRICT=1`: an eligible-but-failed fused op
 # ERRORS instead of falling back, so no leg can silently "pass" on eager
 # numbers wearing a fused label
@@ -476,9 +547,9 @@ run_jammi_leg() {
     --backbone-dtype bf16
     --cuda "$AB_CUDA_ORDINAL" --seed "$AB_SEED"
     --batched-forward true
+    --expect-kernels-disabled "$disable_ops"
   )
   if [ -n "$disable_ops" ]; then
-    cmd+=(--expect-kernels-disabled "$disable_ops")
     JAMMI_KERNELS_STRICT=1 JAMMI_KERNELS_DISABLE="$disable_ops" run_leg "$config_slug" "$leg" "${cmd[@]}"
   else
     JAMMI_KERNELS_STRICT=1 run_leg "$config_slug" "$leg" "${cmd[@]}"

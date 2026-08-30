@@ -581,5 +581,61 @@ class F32StoredFieldCanonicalizerTests(unittest.TestCase):
         )
 
 
+class F32DomainGuardTests(unittest.TestCase):
+    """Advisory (adversarial audit): `_round_trip_f32`'s domain guard —
+    out-of-`f32`-range/non-finite input becomes a REFUSAL
+    (`_NotRepresentableAsF32`), never an uncaught `OverflowError` crash.
+    """
+
+    def test_out_of_f32_range_finite_value_refuses_never_crashes(self):
+        # 1e40 exceeds f32's max finite magnitude (~3.4028235e38) --
+        # struct.pack('<f', 1e40) itself raises OverflowError; this must
+        # never propagate out of the comparator.
+        result = identity_fields.canonicalize_identity_field("lora_dropout", 1e40)
+        self.assertIsInstance(result, identity_fields._NotRepresentableAsF32)
+        self.assertIn("not representable", repr(result))
+
+    def test_positive_infinity_refuses(self):
+        result = identity_fields.canonicalize_identity_field("max_grad_norm", float("inf"))
+        self.assertIsInstance(result, identity_fields._NotRepresentableAsF32)
+
+    def test_negative_infinity_refuses(self):
+        result = identity_fields.canonicalize_identity_field("lora_dropout", float("-inf"))
+        self.assertIsInstance(result, identity_fields._NotRepresentableAsF32)
+
+    def test_nan_refuses(self):
+        result = identity_fields.canonicalize_identity_field("lora_dropout", float("nan"))
+        self.assertIsInstance(result, identity_fields._NotRepresentableAsF32)
+
+    def test_negative_zero_is_not_refused_and_matches_positive_zero(self):
+        # Negative control: -0.0 is finite, in-range, and round-trips
+        # cleanly -- must NOT be swept into the domain-guard refusal, and
+        # must still compare equal to 0.0 (Python's own -0.0 == 0.0).
+        neg_zero = identity_fields.canonicalize_identity_field("lora_dropout", -0.0)
+        pos_zero = identity_fields.canonicalize_identity_field("lora_dropout", 0.0)
+        self.assertNotIsInstance(neg_zero, identity_fields._NotRepresentableAsF32)
+        self.assertEqual(neg_zero, pos_zero)
+
+    def test_two_unrepresentable_values_never_accidentally_match(self):
+        # Even the IDENTICAL raw value, refused twice, must never compare
+        # equal to itself -- two malformed inputs must not "cancel out".
+        a = identity_fields.canonicalize_identity_field("lora_dropout", 1e40)
+        b = identity_fields.canonicalize_identity_field("lora_dropout", 1e40)
+        self.assertNotEqual(a, b)
+
+    def test_a_refused_value_never_matches_a_real_float(self):
+        a = identity_fields.canonicalize_identity_field("lora_dropout", float("nan"))
+        b = identity_fields.canonicalize_identity_field("lora_dropout", 0.05)
+        self.assertNotEqual(a, b)
+
+    def test_normal_values_are_unaffected_by_the_domain_guard(self):
+        # Positive control: the ordinary f32-round-trip match still works
+        # exactly as before this guard was added.
+        self.assertEqual(
+            identity_fields.canonicalize_identity_field("lora_dropout", 0.05000000074505806),
+            identity_fields.canonicalize_identity_field("lora_dropout", 0.05),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

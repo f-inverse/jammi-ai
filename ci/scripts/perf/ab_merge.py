@@ -103,6 +103,30 @@ LEGS = ["jammi-eager", "jammi-fused", "torch-eager", "torch-sdpa"]
 # below need).
 BAR_SECOND_RUN_LEGS = {"jammi-fused": "jammi-fused-2", "torch-sdpa": "torch-sdpa-2"}
 
+# F2 (adversarial audit — "make the header's promise true"): the file
+# `finetune_ab.sh` `touch`es under `raw_dir`, BEFORE any leg runs, on
+# EVERY invocation (that script always runs the full A,B,B,A protocol —
+# see its own header). The SAME filename, read here. Presence means "this
+# raw_dir's operator promised all four bar legs" — a MISSING/DRY_RUN
+# second-run leg under this marker is therefore an INCOMPLETE SWEEP
+# (INVALID, a named reason), never silently degraded to the single-pair
+# estimator the way an absent marker (a genuinely legacy `raw_dir`,
+# predating this fold-in, or one hand-built without it) still is. Kept
+# unprefixed (no leading `.`) so `ls`/a human browsing `raw_dir` sees it;
+# `config_slugs()` below never matches it (it carries no `.exit` suffix
+# and no `__` separator).
+TWO_RUN_PROTOCOL_MARKER = "TWO_RUN_PROTOCOL_MARKER"
+
+
+def two_run_protocol_active(raw_dir):
+    """`True` iff `finetune_ab.sh`'s own `TWO_RUN_PROTOCOL_MARKER` file is
+    present under `raw_dir` — see that constant's own doc. A pure
+    filesystem check, read ONCE per `build_report` call (never per-config
+    — the marker is a property of the WHOLE sweep/raw_dir, not of any one
+    config within it).
+    """
+    return os.path.isfile(os.path.join(raw_dir, TWO_RUN_PROTOCOL_MARKER))
+
 # --------------------------------------------------------------------------- #
 # Generic leg-premise-refusal core (unit-62 E6) — `leg_identity_fields`/
 # `leg_premise_violations` below are the finetune-step-SPECIFIC callers
@@ -1010,13 +1034,33 @@ def bar_ratio_classification(pair1_ratio, pair2_ratio, pass_ratio):
     header's "ORDER-BALANCED BAR LEGS"): given the two adjacent-pair
     ratios (pair 1 = jammi-fused/torch-sdpa, pair 2 =
     jammi-fused-2/torch-sdpa-2 — both `jammi-fused-shaped/torch-sdpa-shaped`,
-    see `bar_pair_ratio`), returns `(bar_ratio, indeterminate, detail)`:
+    see `bar_pair_ratio`), returns `(bar_ratio, indeterminate, detail)`.
 
-      * `pair2_ratio is None` (the second run did not produce a usable
-        pair — an older `raw_dir`, a MISSING/FAILED/OOM leg, or
-        `AB_DRY_RUN`): `bar_ratio = pair1_ratio`, `indeterminate = False`
-        — the single-pair behaviour this module has always had, unchanged.
-      * Otherwise: `bar_ratio = min(pair1_ratio, pair2_ratio)` — the
+    F1 (adversarial audit): NEVER RAISES for ANY combination of `None`s —
+    `bar_pair_ratio` itself reads `None` for a leg that OOM'd/FAILED (not
+    just MISSING), so a bare `min(pair1_ratio, pair2_ratio)` guarded only
+    against `pair2_ratio is None` (an earlier version of this function)
+    crashed the ENTIRE merge — not just this one config's row — the
+    moment the FIRST run's own torch-sdpa OOM'd while a clean second run
+    existed (`pair1_ratio is None`, `pair2_ratio` a real float): the call
+    site in `build_report` is bare, never wrapped in the per-leg
+    try/except B6 already gives `metrics()`/`dispatch_pairs()`. This
+    function is the one place that guarantee is enforced instead:
+
+      * BOTH `None` (neither run produced a usable pair — no data at all):
+        `bar_ratio = None`, `indeterminate = False` — `build_report`'s own
+        `elif bar_ratio is None` branch already renders this as its
+        existing "no ratio" FAIL, unchanged.
+      * EXACTLY ONE `None` (the other run's own OOM/FAIL/MISSING legs are
+        ALREADY classified by `build_report`'s `torch_fits`/
+        `jammi_fused_fits` — see those variables' own doc, extended by F2
+        to cover both runs — before this value is ever consulted for a
+        verdict; this function's OWN job is only to return a well-defined,
+        non-crashing number here, never to re-derive that classification):
+        `bar_ratio` is whichever pair IS available, `indeterminate =
+        False` — the single-pair degrade this module has always had,
+        symmetric in EITHER direction now, not just "pair2 missing".
+      * BOTH present: `bar_ratio = min(pair1_ratio, pair2_ratio)` — the
         estimator LEAST FAVOURABLE to jammi (the SAME "ratio uses the min
         of two torch runs" convention `docs/maintainer/
         fine-tune-performance-guide.md`'s own stacked-sweep artifact
@@ -1036,6 +1080,10 @@ def bar_ratio_classification(pair1_ratio, pair2_ratio, pass_ratio):
         the boundary-equality edge case and for readability at the call
         site.
     """
+    if pair1_ratio is None and pair2_ratio is None:
+        return None, False, None
+    if pair1_ratio is None:
+        return pair2_ratio, False, None
     if pair2_ratio is None:
         return pair1_ratio, False, None
     bar = min(pair1_ratio, pair2_ratio)
@@ -1081,10 +1129,15 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
     if not slugs:
         return None, None
 
+    # F2 (adversarial audit): read ONCE, applies to every config in this
+    # `raw_dir` — see `TWO_RUN_PROTOCOL_MARKER`'s own doc.
+    two_run_mode = two_run_protocol_active(raw_dir)
+
     merged = {
         "steps": steps,
         "warmup": warmup,
         "pass_ratio_bar": pass_ratio,
+        "two_run_protocol": two_run_mode,
         "lora_init": {
             "torch": torch_lora_init,
             "jammi": "jammi (LoraInitMode::ZerosB; not configurable via finetune-step's CLI)",
@@ -1220,6 +1273,18 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
         # SECOND-RUN report was actually produced and disagrees.
         torch_sdpa_2_leg = BAR_SECOND_RUN_LEGS["torch-sdpa"]
         second_run_premise_violations_list = None
+        # NOTE (advisory, not a gate): when NEITHER second-run leg is `OK`
+        # (an older `raw_dir`, a fully-dry-run sweep, or both OOM'd/FAILED
+        # independently), BOTH entries below stay `None`/`None` in the
+        # rendered JSON — this is the ORDINARY "nothing to record"
+        # rendering `leg_provenance` already gives every OTHER absent leg
+        # (see that function's own doc), never itself a distinct signal a
+        # human reader or a future check should treat as meaningful beyond
+        # "the second run did not produce a report" — the actual
+        # measurement-completeness signal for THAT case lives in
+        # `bar_second_run_legs[<leg>]["outcome"]` (`MISSING`/`FAIL`/`OOM`)
+        # and, under `two_run_mode`, `two_run_missing_leg_reason` — never
+        # in this dict reading `None`.
         second_run_provenance = {jammi_fused_2_leg: None, torch_sdpa_2_leg: None}
         if second_run_entries[jammi_fused_2_leg]["outcome"] == "OK":
             second_run_provenance[jammi_fused_2_leg] = leg_provenance(
@@ -1240,6 +1305,45 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
                 second_run_premise_violations_list.extend(
                     clip_fact_violations(second_run_entries[leg]["report"], leg)
                 )
+
+        # F3 (adversarial audit — cross-RUN premise): the SAME-run checks
+        # above (`leg_premise_violations_list` for jammi-fused/torch-sdpa,
+        # `second_run_premise_violations_list` for jammi-fused-2/
+        # torch-sdpa-2) never compare ACROSS the two runs at all -- a
+        # config where run 1 used `seed=7` and run 2 used a DIFFERENT
+        # seed (or `seq`, or any other identity field) would pass BOTH
+        # same-run checks cleanly while the bar ratio silently averages
+        # two genuinely different measurements together. Checked
+        # independently: jammi-fused vs jammi-fused-2, and torch-sdpa vs
+        # torch-sdpa-2, each only when BOTH sides read `OK`. Reuses
+        # `leg_identity_fields` (already leg-name-generic, correctly
+        # resolving torch's own args-level field split for either torch
+        # leg name) to extract each leg's fields, then
+        # `generic_leg_premise_violations` (custom `label_a`/`label_b`,
+        # unlike `leg_premise_violations`'s own hardcoded "jammi="/
+        # "torch=" prose, which would mislabel a jammi-vs-jammi or
+        # torch-vs-torch pair) to diff them -- the SAME `_MISSING`
+        # sentinel and `canonicalize_identity_field` table both paths
+        # share, never a third, independently-drifting comparator.
+        cross_run_premise_violations_list = None
+        if entries["jammi-fused"]["outcome"] == "OK" and second_run_entries[jammi_fused_2_leg]["outcome"] == "OK":
+            jammi_run1_fields = leg_identity_fields(entries["jammi-fused"]["report"], "jammi-fused")
+            jammi_run2_fields = leg_identity_fields(second_run_entries[jammi_fused_2_leg]["report"], jammi_fused_2_leg)
+            v = generic_leg_premise_violations(
+                FINETUNE_IDENTITY_FIELDS, jammi_run1_fields, jammi_run2_fields,
+                label_a="jammi-fused", label_b=jammi_fused_2_leg,
+            )
+            if v:
+                cross_run_premise_violations_list = list(v)
+        if entries["torch-sdpa"]["outcome"] == "OK" and second_run_entries[torch_sdpa_2_leg]["outcome"] == "OK":
+            torch_run1_fields = leg_identity_fields(entries["torch-sdpa"]["report"], "torch-sdpa")
+            torch_run2_fields = leg_identity_fields(second_run_entries[torch_sdpa_2_leg]["report"], torch_sdpa_2_leg)
+            v = generic_leg_premise_violations(
+                FINETUNE_IDENTITY_FIELDS, torch_run1_fields, torch_run2_fields,
+                label_a="torch-sdpa", label_b=torch_sdpa_2_leg,
+            )
+            if v:
+                cross_run_premise_violations_list = (cross_run_premise_violations_list or []) + v
 
         for leg in LEGS:
             err_tail = entries[leg]["err_tail"]
@@ -1327,21 +1431,73 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
         ):
             loss_ratio = fused_m["loss_last"] / sdpa_m["loss_last"]
 
-        any_dry_run = any(entries[leg]["outcome"] == "DRY_RUN" for leg in LEGS)
+        # F2: a DRY_RUN outcome on EITHER run of EITHER bar leg (not just
+        # the primary `LEGS` four) is still the SAME benign "nothing ran
+        # for real" case -- extended here so `AB_DRY_RUN=1` reads
+        # `N/A (dry-run)` regardless of which run a stub leg happens to be.
+        any_dry_run = any(entries[leg]["outcome"] == "DRY_RUN" for leg in LEGS) or any(
+            second_run_entries[leg]["outcome"] == "DRY_RUN" for leg in BAR_SECOND_RUN_LEGS.values()
+        )
         torch_fits = entries["torch-sdpa"]["outcome"] == "OK"
         jammi_fused_fits = entries["jammi-fused"]["outcome"] == "OK"
 
+        # F2 (adversarial audit — "make the header's promise true"): under
+        # `two_run_mode`, `jammi-fused-2` gets the SAME OOM/no-OOM clause
+        # handling as `jammi-fused` (folded into `jammi_fused_fits`
+        # itself, never a parallel mechanism), and `torch-sdpa-2` is
+        # `torch_fits`'s own counterpart -- a bar leg that fit on ITS
+        # first run but not its second is treated exactly as "did not
+        # fit" for the whole config, the same conservative posture a
+        # single OOM'd run already takes. `two_run_missing_leg_reason`
+        # names the STRICTER failure this marker adds beyond that: a
+        # second-run leg that is not merely FAIL/OOM (a real, attempted
+        # measurement outcome) but genuinely `MISSING` (never attempted at
+        # all, despite the marker's own promise that it would be) is an
+        # INCOMPLETE SWEEP, not a legitimate "didn't fit" — surfaced as an
+        # INVALID override below, never silently folded into the ordinary
+        # "N/A (bar does not apply)"/"FAIL (OOM where torch fits)" prose
+        # those two booleans alone would otherwise produce.
+        two_run_missing_leg_reason = None
+        if two_run_mode:
+            if second_run_entries[torch_sdpa_2_leg]["outcome"] != "OK":
+                torch_fits = False
+            if second_run_entries[jammi_fused_2_leg]["outcome"] != "OK":
+                jammi_fused_fits = False
+            missing_legs = [
+                leg
+                for leg in BAR_SECOND_RUN_LEGS.values()
+                if second_run_entries[leg]["outcome"] == "MISSING"
+            ]
+            if missing_legs:
+                two_run_missing_leg_reason = (
+                    f"two_run protocol marker present ({TWO_RUN_PROTOCOL_MARKER}) but "
+                    f"{', '.join(missing_legs)} never ran (MISSING) -- the sweep is incomplete, "
+                    "not merely a config that did not fit"
+                )
+
         # The #352 bar is "no OOM where torch fits" -- it binds ONLY when
-        # torch-sdpa itself succeeded. If torch-sdpa didn't fit, there is
-        # no baseline to hold jammi-fused to and the bar does not apply --
-        # that is NOT the same thing as jammi failing, and must not print
-        # as FAIL.
+        # torch-sdpa itself succeeded (BOTH runs of it, under
+        # `two_run_mode`). If torch-sdpa didn't fit, there is no baseline
+        # to hold jammi-fused to and the bar does not apply -- that is NOT
+        # the same thing as jammi failing, and must not print as FAIL.
         if any_dry_run:
             verdict = "N/A (dry-run)"
         elif not torch_fits:
-            verdict = f"N/A (torch-sdpa itself did not fit: {entries['torch-sdpa']['outcome']} — bar does not apply)"
+            if two_run_mode:
+                verdict = (
+                    f"N/A (torch-sdpa itself did not fit -- torch-sdpa={entries['torch-sdpa']['outcome']} "
+                    f"torch-sdpa-2={second_run_entries[torch_sdpa_2_leg]['outcome']} -- bar does not apply)"
+                )
+            else:
+                verdict = f"N/A (torch-sdpa itself did not fit: {entries['torch-sdpa']['outcome']} — bar does not apply)"
         elif not jammi_fused_fits:
-            verdict = f"FAIL (OOM where torch fits: jammi-fused {entries['jammi-fused']['outcome']})"
+            if two_run_mode:
+                verdict = (
+                    f"FAIL (OOM where torch fits: jammi-fused={entries['jammi-fused']['outcome']} "
+                    f"jammi-fused-2={second_run_entries[jammi_fused_2_leg]['outcome']})"
+                )
+            else:
+                verdict = f"FAIL (OOM where torch fits: jammi-fused {entries['jammi-fused']['outcome']})"
         elif bar_ratio is None:
             verdict = "FAIL (no ratio: triplets_per_s missing on an OK leg — investigate)"
         elif bar_indeterminate:
@@ -1437,6 +1593,27 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
                 "otherwise have been is discarded, not merely annotated)"
             )
 
+        # F3 override — cross-run premise drift invalidates the config
+        # exactly like a same-run mismatch does (see the computation's own
+        # doc above for why this is a DIFFERENT check than either
+        # same-run one).
+        if cross_run_premise_violations_list:
+            verdict = (
+                f"{FINETUNE_AB_VERDICT_INVALID_PREFIX} (cross-run leg premise mismatch: "
+                f"{'; '.join(cross_run_premise_violations_list)} — the first and second runs of "
+                "the bar pair did not run under the same seed/batch/seq/dtype/dropout/lora "
+                "premise; the ratio-based verdict this would otherwise have been is discarded, "
+                "not merely annotated)"
+            )
+
+        # F2 override — the STRONGEST of the carve-outs above: a genuinely
+        # INCOMPLETE sweep (the marker promised all four bar legs, one
+        # never ran at all) is not even a "didn't fit"/"OOM" measurement,
+        # so it REPLACES whatever verdict any of the checks above produced
+        # (deliberately last, so it always wins when it fires).
+        if two_run_missing_leg_reason is not None:
+            verdict = f"{FINETUNE_AB_VERDICT_INVALID_PREFIX} ({two_run_missing_leg_reason})"
+
         summary_rows.append((slug, ratio, pair2_ratio, bar_ratio, loss_ratio, verdict))
         merged["configs"][slug] = {
             "legs": {leg: {"outcome": entries[leg]["outcome"], "metrics": leg_metrics[leg]} for leg in LEGS},
@@ -1477,6 +1654,16 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
                 if second_run_premise_violations_list is not None
                 else None
             ),
+            # F3 — cross-RUN premise (jammi-fused vs jammi-fused-2,
+            # torch-sdpa vs torch-sdpa-2), independent of the two SAME-run
+            # checks above. `None` (never an empty list) when neither
+            # cross-run pair had both sides `OK` to compare.
+            "leg_premise_violations_cross_run": cross_run_premise_violations_list,
+            # F2 — `None` unless `two_run_protocol` (top-level) is `True`
+            # AND at least one second-run bar leg genuinely never ran
+            # (`MISSING`, not merely FAIL/OOM) — see `TWO_RUN_PROTOCOL_MARKER`'s
+            # own doc.
+            "two_run_missing_leg_reason": two_run_missing_leg_reason,
             "provenance": {"jammi": jammi_provenance, "torch": torch_provenance},
             "ratio_jammi_fused_over_torch_sdpa": ratio,
             # The A,B,B,A protocol's own two pair ratios + the MIN-of-two,
@@ -1512,7 +1699,13 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
         "# loss-trajectory equivalence (jammi-fused vs jammi-eager, real trainer, >=5 seeds) is a SEPARATE check -- not measured here.",
         "# loss_first->loss_last and loss_final_ratio below: SAME DATA, COST FIXTURE -- NOT A QUALITY RESULT. "
         "Values are bf16-sourced (ULP ~0.00195 near 0.30) -- printed to 3 decimals, never gated.",
-        f"{'config':<16}{'leg':<13}{'outcome':<9}{'s/step_p50':<12}{'triplets/s':<12}"
+        # Advisory (adversarial audit): `<13` left ZERO trailing space
+        # after a 13-char leg name (`jammi-fused-2`, `jammi-fused-2` being
+        # exactly 13 characters), running the `outcome` column's text
+        # directly into it with no separator at all. `<14` guarantees at
+        # least one space after every leg name this module currently
+        # emits (`jammi-fused-2`/`torch-sdpa-2` are 13/12 characters).
+        f"{'config':<16}{'leg':<14}{'outcome':<9}{'s/step_p50':<12}{'triplets/s':<12}"
         f"{'vram_delta(comparable)':<24}{'vram_absolute(torch only)':<27}{'fused_proof':<28}{'loss_first->last':<24}",
     ]
     for slug, leg, outcome, m, proof_val, err_tail in table_rows:
@@ -1532,7 +1725,7 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
             else f"{fmt_loss(m['loss_first'])}->{fmt_loss(m['loss_last'])}"
         )
         lines.append(
-            f"{slug:<16}{leg:<13}{outcome:<9}{p50:<12}{tps:<12}{vd:<24}{va:<27}{proof_s:<28}{loss_s:<24}"
+            f"{slug:<16}{leg:<14}{outcome:<9}{p50:<12}{tps:<12}{vd:<24}{va:<27}{proof_s:<28}{loss_s:<24}"
         )
         if outcome not in ("OK", "DRY_RUN") and err_tail:
             last = err_tail.splitlines()[-1][:120] if err_tail.splitlines() else ""

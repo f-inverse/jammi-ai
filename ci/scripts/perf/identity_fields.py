@@ -24,6 +24,7 @@ test.
 
 from __future__ import annotations
 
+import math
 import struct
 
 # B1 audit finding on PR #372: jammi's OWN CLI/interchange vocabulary
@@ -83,6 +84,59 @@ def normalize_target_modules(value):
     return tuple(sorted(value))
 
 
+class _NotRepresentableAsF32:
+    """Sentinel `_round_trip_f32` returns instead of a canonicalized
+    `float` when the raw input cannot be trusted to describe a legitimate
+    premise value in the engine's own `f32` storage — advisory (adversarial
+    audit): an EARLIER version of this function let `struct.pack('<f',
+    ...)` raise a bare `OverflowError` straight out of the comparator for
+    any FINITE value outside `f32`'s representable range (e.g. `1e40`),
+    crashing the WHOLE merge over one malformed field the same class of
+    bug F1 fixed for `bar_ratio_classification` — never caught per-config,
+    never even a violation, just a hard crash. This sentinel turns that
+    into an ORDINARY, catchable REFUSAL instead: `canonicalize_identity_field`
+    returns it like any other value, `leg_premise_violations`/
+    `generic_leg_premise_violations` compare it exactly like a real float
+    (`va != vb`), and its own `__repr__` names the reason directly in the
+    printed violation ("field X differs: jammi=<not representable as the
+    engine's f32: 1e+40> torch=0.05").
+
+    Covers BOTH the finite-but-out-of-range case (`OverflowError`) and the
+    non-finite cases (`inf`/`-inf`/`nan`) — the latter pack into `f32`
+    WITHOUT raising (IEEE-754 represents all three natively), but neither
+    is a value EITHER real producer would ever validate a `lora_dropout`/
+    `max_grad_norm` CLI argument to (`validate_max_grad_norm`'s own "must
+    be finite and > 0.0" check, mirrored on torch's `parse_args`) — a
+    report carrying one is already describing a premise this comparator
+    cannot trust, not merely one it must round differently. `-0.0` is
+    deliberately NOT covered (it is finite, in-range, round-trips cleanly,
+    and Python's own `-0.0 == 0.0` already holds after the round-trip) —
+    see this class's own test suite's negative control.
+
+    `__eq__` ALWAYS returns `False` — including against another
+    `_NotRepresentableAsF32`, even one wrapping the IDENTICAL raw value:
+    neither side of a "cannot be represented" pair can be confirmed to
+    describe the SAME premise, so two malformed inputs must refuse each
+    other exactly as loudly as one malformed input against one clean
+    value — never let two garbage values silently "cancel out" into an
+    accidental match.
+    """
+
+    __slots__ = ("raw",)
+
+    def __init__(self, raw):
+        self.raw = raw
+
+    def __repr__(self):
+        return f"<not representable as the engine's f32: {self.raw!r}>"
+
+    def __eq__(self, other):
+        return False
+
+    def __hash__(self):
+        return id(self)
+
+
 def _round_trip_f32(value):
     """Round-trip a numeric `value` through IEEE-754 binary32 (the hardware
     default round-half-to-even), stdlib-only (`struct`, no numpy
@@ -92,11 +146,19 @@ def _round_trip_f32(value):
     excluded explicitly -- a string, a list): this function only ever
     narrows the SAME numeric value's own two representations together,
     never widens what counts as a match for a non-numeric input it was
-    never meant to touch.
+    never meant to touch. A non-finite or out-of-`f32`-range REAL number
+    returns a `_NotRepresentableAsF32` sentinel instead — see that class's
+    own doc for why (a REFUSAL, never a crash, never a silent pass-through).
     """
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         return value
-    return struct.unpack("<f", struct.pack("<f", float(value)))[0]
+    value = float(value)
+    if math.isnan(value) or math.isinf(value):
+        return _NotRepresentableAsF32(value)
+    try:
+        return struct.unpack("<f", struct.pack("<f", value))[0]
+    except OverflowError:
+        return _NotRepresentableAsF32(value)
 
 
 def normalize_f32_stored_field(value):

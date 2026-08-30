@@ -68,7 +68,20 @@ def gpu_inference_tier(embed_p50_ms=8.0, infer_p50_ms=6.0, **identity_overrides)
     return tier
 
 
-def write_leg(raw_dir, name, tier=None, exit_code="0", build_sha=None):
+def write_leg(raw_dir, name, tier=None, exit_code="0", build_sha=None, started_at=None):
+    """Writes the SAME `.exit`/`.json`/`.started_at` file triple
+    `gpu_inference_ab.sh`'s own `run_leg` writes (round-2 adversarial audit
+    F3). `started_at` defaults to `1000 + LEG_ORDER.index(name)` — a
+    non-decreasing A,B,B,A-ordered value by default, so every EXISTING
+    call site (which never mentions `started_at`) keeps producing a
+    verifiably-ordered fixture without being rewritten; a test that wants
+    to construct an out-of-order fixture passes an explicit override.
+    """
+    if started_at is None:
+        started_at = 1000 + gpu_inference_ab.LEG_ORDER.index(name)
+    with open(os.path.join(raw_dir, f"{name}.started_at"), "w", encoding="utf-8") as fh:
+        fh.write(str(started_at))
+
     if tier is None:
         # A FAIL leg: exit file present and nonzero, no valid report.
         with open(os.path.join(raw_dir, f"{name}.exit"), "w", encoding="utf-8") as fh:
@@ -280,16 +293,19 @@ class MissingLegTests(unittest.TestCase):
         self.assertEqual(merged["status"], "INCOMPLETE")
         self.assertEqual(merged["missing_legs"], ["a2"])
 
-    def test_one_failed_leg_is_also_neutral_exit_75(self):
-        """A leg that ran but exited nonzero (a real build/serve failure,
-        e.g. no CUDA device on this pod) is likewise INCOMPLETE/75, never a
-        distinct hard-FAIL exit code — a leg failure and a leg's total
-        absence are the same "could not compare" state from this merger's
-        own point of view.
+    def test_an_a_role_failed_leg_stays_neutral_exit_75(self):
+        """A PARENT-side (`a`-role) leg that ran but exited nonzero (a real
+        build/serve failure, e.g. no CUDA device on this pod) is
+        INCOMPLETE/75, never a distinct hard-FAIL exit code — a parent-side
+        leg failure and a parent-side leg's total absence are the same
+        "could not compare" state from this merger's own point of view.
+        See [`test_a_b_role_failed_leg_is_invalid_exit_1`] for why a
+        `b`-role failure is treated differently (round-2 adversarial audit
+        F5).
         """
         with tempfile.TemporaryDirectory() as raw_dir:
-            write_leg(raw_dir, "a1", gpu_inference_tier(embed_p50_ms=8.0))
-            write_leg(raw_dir, "b1", tier=None, exit_code="1")  # FAIL leg
+            write_leg(raw_dir, "a1", tier=None, exit_code="1")  # FAIL leg, a-role
+            write_leg(raw_dir, "b1", gpu_inference_tier(embed_p50_ms=8.0))
             write_leg(raw_dir, "b2", gpu_inference_tier(embed_p50_ms=8.0))
             write_leg(raw_dir, "a2", gpu_inference_tier(embed_p50_ms=8.0))
 
@@ -297,15 +313,44 @@ class MissingLegTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 75)
         self.assertEqual(merged["status"], "INCOMPLETE")
-        self.assertEqual(merged["missing_legs"], ["b1"])
+        self.assertEqual(merged["missing_legs"], ["a1"])
 
-    def test_empty_raw_dir_is_neutral_75_all_four_legs_missing(self):
+    def test_a_b_role_failed_leg_is_invalid_exit_1(self):
+        """round-2 adversarial audit F5: a PR-side (`b`-role) leg that ran
+        but exited nonzero is a STRONGER signal than a non-compiling one
+        (the binary built fine; the measured serve itself crashed/errored)
+        — a real correctness-of-measurement refusal (INVALID/1), never the
+        neutral bucket an `a`-role failure still falls into.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_leg(raw_dir, "a1", gpu_inference_tier(embed_p50_ms=8.0))
+            write_leg(raw_dir, "b1", tier=None, exit_code="1")  # FAIL leg, b-role
+            write_leg(raw_dir, "b2", gpu_inference_tier(embed_p50_ms=8.0))
+            write_leg(raw_dir, "a2", gpu_inference_tier(embed_p50_ms=8.0))
+
+            merged, exit_code = gpu_inference_ab.build_report(raw_dir)
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(merged["status"], "INVALID")
+        self.assertEqual(merged["missing_legs"], ["b1"])
+        self.assertIn("b1", merged["invalid_reason"])
+
+    def test_empty_raw_dir_is_invalid_exit_1_because_b_role_legs_are_among_the_missing(self):
+        """round-2 adversarial audit F5: `missing_legs`' own ROLE decides
+        the outcome, even for the degenerate "nothing ran at all" case —
+        `b1`/`b2` are among the four missing legs here, so this routes to
+        INVALID/1 exactly like any other b-role absence, never a special-
+        cased "everything is neutral because everything is missing"
+        exception this instruction does not carve out.
+        """
         with tempfile.TemporaryDirectory() as raw_dir:
             merged, exit_code = gpu_inference_ab.build_report(raw_dir)
 
-        self.assertEqual(exit_code, 75)
-        self.assertEqual(merged["status"], "INCOMPLETE")
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(merged["status"], "INVALID")
         self.assertEqual(set(merged["missing_legs"]), set(gpu_inference_ab.LEG_ORDER))
+        self.assertIn("b1", merged["invalid_reason"])
+        self.assertIn("b2", merged["invalid_reason"])
 
 
 class InvalidMeasurementTests(unittest.TestCase):
@@ -404,6 +449,80 @@ class IdentityFieldsSharedCoreTests(unittest.TestCase):
             set(gpu_inference_ab.leg_identity(gpu_inference_tier()).keys()),
             set(GPU_INFERENCE_IDENTITY_FIELDS),
         )
+
+
+class OrderBindingTests(unittest.TestCase):
+    """round-2 adversarial audit F3: the A, B, B, A leg order is now
+    MACHINE-CHECKED against each leg's own RECORDED start timestamp
+    (`gpu_inference_ab.sh`'s own `run_leg` writes `<name>.started_at`
+    BEFORE invoking that leg's binary), not merely trusted from reading
+    `gpu_inference_ab.sh`'s own source code.
+    """
+
+    def test_a_genuinely_ordered_fixture_is_green_and_folds_recorded_order(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_all_ok_legs(raw_dir, {"a1": 8.0, "b1": 8.0, "b2": 8.0, "a2": 8.0})
+            merged, exit_code = gpu_inference_ab.build_report(raw_dir)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(merged["status"], "GREEN")
+        # The default write_leg started_at values (1000, 1001, 1002, 1003)
+        # are non-decreasing in LEG_ORDER's own a1,b1,b2,a2 sequence.
+        self.assertEqual(
+            merged["recorded_order"],
+            {"a1": 1000, "b1": 1001, "b2": 1002, "a2": 1003},
+        )
+
+    def test_an_out_of_order_recorded_timestamp_refuses_invalid_exit_1(self):
+        """The teeth: b1 recorded as having started BEFORE a1 (an
+        A,B,B,A-labeled raw dir whose ACTUAL recorded run order was not
+        A,B,B,A at all) must refuse — the drift-cancellation rationale the
+        primary endpoint depends on was never actually observed for this
+        run.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_leg(raw_dir, "a1", gpu_inference_tier(embed_p50_ms=8.0), started_at=2000)
+            write_leg(raw_dir, "b1", gpu_inference_tier(embed_p50_ms=8.0), started_at=1000)  # BEFORE a1
+            write_leg(raw_dir, "b2", gpu_inference_tier(embed_p50_ms=8.0), started_at=3000)
+            write_leg(raw_dir, "a2", gpu_inference_tier(embed_p50_ms=8.0), started_at=4000)
+
+            merged, exit_code = gpu_inference_ab.build_report(raw_dir)
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(merged["status"], "INVALID")
+        self.assertTrue(
+            any("run-order violation" in v and "'b1'" in v for v in merged["leg_premise_violations"])
+        )
+        self.assertEqual(merged["recorded_order"]["b1"], 1000)
+
+    def test_a_leg_with_no_recorded_timestamp_at_all_refuses_invalid_exit_1(self):
+        """An OLDER producer that predates F3 (or a hand-crafted fixture)
+        writes no `.started_at` file at all for a leg — this must ALSO
+        refuse (never silently skip the order check for that leg).
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_all_ok_legs(raw_dir, {"a1": 8.0, "b1": 8.0, "b2": 8.0, "a2": 8.0})
+            os.remove(os.path.join(raw_dir, "b1.started_at"))
+
+            merged, exit_code = gpu_inference_ab.build_report(raw_dir)
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(merged["status"], "INVALID")
+        self.assertTrue(any("no recorded start timestamp" in v and "'b1'" in v for v in merged["leg_premise_violations"]))
+
+    def test_verify_recorded_order_directly_on_a_clean_and_a_dirty_series(self):
+        """[`gpu_inference_ab.verify_recorded_order`] driven directly (the
+        real production function, not a re-implementation): empty on a
+        clean non-decreasing series, non-empty the instant one entry goes
+        backward.
+        """
+        clean = {"a1": 1, "b1": 2, "b2": 2, "a2": 3}  # ties are fine, non-decreasing
+        self.assertEqual(gpu_inference_ab.verify_recorded_order(clean), [])
+
+        dirty = {"a1": 1, "b1": 2, "b2": 1, "a2": 3}  # b2 < b1
+        violations = gpu_inference_ab.verify_recorded_order(dirty)
+        self.assertTrue(violations)
+        self.assertTrue(any("'b2'" in v for v in violations))
 
 
 def multiplicative_drift(true_value, k, t):

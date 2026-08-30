@@ -198,37 +198,65 @@ pub(crate) struct Row {
     pub(crate) text: &'static str,
 }
 
-/// sha256 (hex) content hash of the corpus-generation PREMISE: every
-/// [`SENTENCES`] entry (in declared order), then `corpus_seed`, then
-/// `row_count` — so a reworded/added/removed/reordered committed sentence, a
-/// different seed, or a different row count all move this digest. Exists so
+/// sha256 (hex) content hash of the RESOLVED corpus this `(corpus_seed,
+/// row_count)` pair ACTUALLY produces — [`build_corpus`]'s own OUTPUT row
+/// texts (in row order), never the raw `(SENTENCES, corpus_seed, row_count)`
+/// INPUTS independently re-derived (round-2 adversarial audit F4: an earlier
+/// version of this function hashed the whole [`SENTENCES`] array plus the two
+/// scalar inputs directly, WITHOUT ever calling [`build_corpus`] itself — a
+/// bug that changed the SELECTION/ROTATION rule (e.g. the audit's own cited
+/// example: `% 4` in place of the real `% SENTENCES.len()`) would silently
+/// produce a DIFFERENT resolved corpus while this function kept reporting the
+/// SAME digest, since the digest never depended on the selection ALGORITHM at
+/// all, only on its raw inputs — structurally blind to exactly the class of
+/// bug this identity field exists to catch). Exists so
 /// `GpuInferenceTier::corpus_sha256` (issue #335's within-run A/B identity
 /// contract, round-1 adversarial audit B1) has a single content hash
-/// standing in for "the corpus this leg served came from the same
-/// generator" — the same belt-and-suspenders role `checkpoint_*_sha256`
-/// plays for a model bundle: `corpus_seed`/`row_count` alone are two
-/// SCALARS that can each independently be held fixed while [`SENTENCES`]
-/// itself is edited (a PR merely rewords a sentence's TEXT), which neither
-/// scalar would ever move.
+/// standing in for "the corpus this leg SERVED came from the same generator,
+/// via the same selection logic" — the same belt-and-suspenders role
+/// `checkpoint_*_sha256` plays for a model bundle: `corpus_seed`/`row_count`
+/// alone are two SCALARS that can each independently be held fixed while
+/// EITHER [`SENTENCES`]' own text OR `build_corpus`'s own selection rule is
+/// edited, which neither scalar would ever move on its own.
 ///
-/// The WHOLE [`SENTENCES`] array is folded in, not merely the subset a given
-/// `(corpus_seed, row_count)` pair happens to select — this is the
-/// conservative, honest choice: [`SENTENCES`] is one shared, committed
-/// generator definition, and treating a change ANYWHERE in it as
-/// premise-relevant (even to an entry this particular leg's rotation did not
-/// draw from) never under-catches a real content edit, at the cost of
-/// occasionally refusing a leg pair over an edit that happened not to affect
-/// what was actually served — the safe direction for an IDENTITY check to
-/// err in.
+/// Same-architecture evidence only: `row_count`'s own byte width is pinned to
+/// `u64` in [`corpus_sha256_of_rows`] below, but [`Row`]/[`build_corpus`]
+/// themselves are written in terms of `usize`-indexed Rust collections, so
+/// this function makes no cross-architecture (32-bit vs 64-bit) guarantee —
+/// not a live concern for the within-run A/B comparator this field backs
+/// (issue #335), which always compares two legs built/run on the SAME pod,
+/// but disclosed here honestly rather than silently assumed.
 pub(crate) fn corpus_sha256(corpus_seed: u64, row_count: usize) -> String {
+    let spec = ModelInferenceSpec {
+        row_count,
+        corpus_seed,
+        target_keys: Vec::new(),
+        embed_digest: String::new(),
+        infer_digest: String::new(),
+        baseline_embed_rows_per_s: 0.0,
+        baseline_infer_rows_per_s: 0.0,
+    };
+    let rows = build_corpus(&spec);
+    corpus_sha256_of_rows(&rows)
+}
+
+/// The core hashing primitive [`corpus_sha256`] wraps: sha256 over each
+/// row's TEXT (in order, null-byte separated — sentence text never contains
+/// a literal null byte, so this delimiter is unambiguous), then the row
+/// COUNT as a pinned-width `u64` (belt-and-suspenders alongside the
+/// delimiter scheme, which already makes the digest length-sensitive on its
+/// own). Split out from [`corpus_sha256`] (rather than folded inline) so a
+/// test can drive it against a DELIBERATELY alternative row selection — see
+/// `tests::corpus_sha256_reacts_to_a_changed_selection_rule_not_just_a_changed_byte_layout`
+/// for the teeth this split makes possible.
+fn corpus_sha256_of_rows(rows: &[Row]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    for sentence in SENTENCES {
-        hasher.update(sentence.as_bytes());
+    for row in rows {
+        hasher.update(row.text.as_bytes());
         hasher.update(b"\0");
     }
-    hasher.update(corpus_seed.to_le_bytes());
-    hasher.update(row_count.to_le_bytes());
+    hasher.update((rows.len() as u64).to_le_bytes());
     hex::encode(hasher.finalize())
 }
 
@@ -733,36 +761,63 @@ mod tests {
         );
     }
 
-    /// The teeth for the "reworded sentence" gap this function exists to
-    /// close: with `corpus_seed`/`row_count` held FIXED, a hand-computed
-    /// hash over a PERTURBED sentence set (one byte appended to a single
-    /// entry) must differ from the real [`SENTENCES`]-backed digest — proof
-    /// that the function actually folds the committed TEXT in, not just the
-    /// two scalars.
+    /// round-2 adversarial audit F4: the teeth this test replaces (a
+    /// hand-computed hash over a manually-perturbed sentence array,
+    /// entirely bypassing `corpus_sha256`'s own real selection logic) was
+    /// STRUCTURALLY BLIND to the class of bug this identity field actually
+    /// exists to catch — a changed SELECTION/ROTATION RULE, not merely a
+    /// changed byte layout at the same selected indices. This constructs
+    /// an ALTERNATIVE resolved corpus using a DELIBERATELY WRONG rotation
+    /// formula (`% 4` in place of the real `% SENTENCES.len()` == `% 8` —
+    /// the audit's own cited failure shape) and proves the REAL
+    /// `corpus_sha256_of_rows` primitive discriminates between the two: if
+    /// some FUTURE bug in `build_corpus`'s own selection formula silently
+    /// changed which sentence a row index draws, this digest would move
+    /// for the SAME `(corpus_seed, row_count)` input — no longer
+    /// structurally blind to it.
     #[test]
-    fn corpus_sha256_reacts_to_a_reworded_sentence_holding_seed_and_row_count_fixed() {
-        use sha2::{Digest, Sha256};
-        let real = corpus_sha256(0, 4);
+    fn corpus_sha256_reacts_to_a_changed_selection_rule_not_just_a_changed_byte_layout() {
+        let corpus_seed = 0u64;
+        let row_count = 8usize;
 
-        let mut hasher = Sha256::new();
-        for (i, sentence) in SENTENCES.iter().enumerate() {
-            if i == 0 {
-                hasher.update(sentence.as_bytes());
-                hasher.update(b" reworded");
-            } else {
-                hasher.update(sentence.as_bytes());
-            }
-            hasher.update(b"\0");
-        }
-        hasher.update(0u64.to_le_bytes());
-        hasher.update(4usize.to_le_bytes());
-        let perturbed = hex::encode(hasher.finalize());
+        let real_rows = build_corpus(&ModelInferenceSpec {
+            row_count,
+            corpus_seed,
+            target_keys: Vec::new(),
+            embed_digest: String::new(),
+            infer_digest: String::new(),
+            baseline_embed_rows_per_s: 0.0,
+            baseline_infer_rows_per_s: 0.0,
+        });
+        let real_digest = corpus_sha256_of_rows(&real_rows);
+        assert_eq!(
+            real_digest,
+            corpus_sha256(corpus_seed, row_count),
+            "corpus_sha256 must equal corpus_sha256_of_rows(build_corpus(..)) -- the public \
+             wrapper must actually call the real selection rule, never bypass it"
+        );
+
+        // The alternative selection rule: `% 4` in place of the real
+        // `% SENTENCES.len()` (== `% 8`) -- genuinely selects a DIFFERENT
+        // sentence starting at row index 4 (row 4 draws SENTENCES[0]
+        // under `% 4` vs SENTENCES[4] under the real `% 8`).
+        let alternative_rows: Vec<Row> = (0..row_count)
+            .map(|i| {
+                let idx = (corpus_seed as usize).wrapping_add(i) % 4;
+                Row {
+                    id: format!("row_{i}"),
+                    text: SENTENCES[idx],
+                }
+            })
+            .collect();
+        let alternative_digest = corpus_sha256_of_rows(&alternative_rows);
 
         assert_ne!(
-            real, perturbed,
-            "rewording a single committed sentence, holding corpus_seed/row_count fixed, must \
-             move corpus_sha256 -- otherwise a reworded corpus silently slips through as \
-             'the same corpus'"
+            real_digest, alternative_digest,
+            "corpus_sha256 must react to a changed SELECTION RULE (here: % 4 in place of the real \
+             % SENTENCES.len()), not merely to a changed byte layout at the same selected indices \
+             -- if this assertion fails, the digest is structurally blind to a rotation-rule \
+             regression"
         );
     }
 

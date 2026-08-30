@@ -56,10 +56,12 @@ jobs:
     concurrency:
       group: gpu-perf-ab-${{ github.ref }}
       cancel-in-progress: false
-    # Two full clone+build cycles (three under --aa-null) on the pod itself
-    # — generously bounded above gpu-howwell.yml's own 100m ceiling (that
-    # workflow builds+runs ONE arm's worth of legs per seed; this one builds
-    # TWO independent binaries up front before any leg runs at all).
+    # Two full clone+build cycles on the pod itself, in EITHER mode
+    # (--aa-null changes only which sha the second clone checks out, never
+    # the clone COUNT — see gpu_inference_ab.sh's own header) — generously
+    # bounded above gpu-howwell.yml's own 100m ceiling (that workflow
+    # builds+runs ONE arm's worth of legs per seed; this one builds TWO
+    # independent binaries up front before any leg runs at all).
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
@@ -84,7 +86,7 @@ jobs:
 
       - name: Annotate a premise refusal
         if: always() && steps.perfab.outputs.rc == '1'
-        run: echo "::error::gpu-perf-ab refused (exit 1) — a real correctness-of-measurement problem, always the PR's own (an identity mismatch between legs, a binary whose own provenance did not match the clone it was built from, or the PR-side clone's build itself failing). Never a perf regression, and never the parent's fault. See the merged report artifact for the named violation(s)."
+        run: echo "::error::gpu-perf-ab refused (exit 1) — a real correctness-of-measurement problem, always the PR's own (an identity mismatch between legs, an INVALID_MEASUREMENT defect, a recorded-run-order violation, a binary whose own provenance did not match the clone it was built from, the PR-side clone's build itself failing, or a PR-side leg that ran but did not produce an OK report). Never a perf regression, and never the parent's fault. See the merged report artifact for the named violation(s)."
 
       - name: Annotate a usage/infra error
         if: always() && steps.perfab.outputs.rc == '2'

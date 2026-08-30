@@ -2418,11 +2418,15 @@ impl FinetuneRunTier {
 ///     longer call), so a leg that silently served a different row count
 ///     would print a ratio that reflects nothing about the code under
 ///     comparison. `corpus_sha256` (`model_inference::corpus_sha256`) is a
-///     sha256 content hash over every committed sentence plus
-///     `corpus_seed`/`row_count` — the belt-and-suspenders closing move: a
-///     PR that merely REWORDS a sentence (holding `corpus_seed`/`row_count`
-///     fixed) moves NEITHER of those two scalars, so without a content hash
-///     that edit would silently slip through as "the same corpus".
+///     sha256 content hash over the RESOLVED corpus — the actual row texts
+///     `model_inference::build_corpus` selects for this `(corpus_seed,
+///     row_count)` pair, never the raw inputs independently re-derived
+///     (round-2 adversarial audit F4: hashing raw inputs was structurally
+///     blind to a changed SELECTION/ROTATION rule) — the belt-and-suspenders
+///     closing move: a PR that merely REWORDS a sentence, or changes WHICH
+///     sentence a given row index draws, moves neither `corpus_seed` nor
+///     `row_count`, so without a content hash of the RESOLVED text that edit
+///     would silently slip through as "the same corpus".
 ///   * `warmup`/`iters`: the discarded-vs-measured serve counts that bound
 ///     what the percentiles actually fold over. `iters` was already emitted
 ///     pre-#335 but never admitted to identity (round-1 adversarial audit
@@ -2491,15 +2495,18 @@ pub struct GpuInferenceTier {
     /// at a different `iters` (hence a differently-sized measured sample)
     /// could silently compare as "the same measurement".
     pub iters: usize,
-    /// sha256 (hex) content hash of the corpus-generation premise
-    /// ([`crate::model_inference::corpus_sha256`]): every committed sentence
-    /// this tier's corpus generator can draw from, plus `corpus_seed` and
-    /// `row_count`. The belt-and-suspenders closing move alongside
-    /// `corpus_seed`/`row_count` above: a PR that REWORDS a committed
-    /// sentence (holding the seed/row-count scalars fixed) moves neither of
-    /// those two fields, so without a content hash that edit would silently
-    /// slip through as "the same corpus" while actually serving different
-    /// text.
+    /// sha256 (hex) content hash of the RESOLVED corpus
+    /// ([`crate::model_inference::corpus_sha256`]): the actual row TEXTS
+    /// `model_inference::build_corpus` selects for this run's
+    /// `(corpus_seed, row_count)`, never the raw `(SENTENCES, corpus_seed,
+    /// row_count)` inputs independently re-derived (round-2 adversarial
+    /// audit F4 — hashing raw inputs was structurally blind to a changed
+    /// selection/rotation rule). The belt-and-suspenders closing move
+    /// alongside `corpus_seed`/`row_count` above: a PR that REWORDS a
+    /// committed sentence, or changes WHICH sentence a given row index
+    /// draws, moves neither of those two scalar fields, so without a
+    /// content hash of the RESOLVED text that edit would silently slip
+    /// through as "the same corpus" while actually serving different text.
     pub corpus_sha256: String,
     /// The compute precision (`f32`/`f16`/`bf16`) the LOADED embed model
     /// actually resolved to before the serve — read off

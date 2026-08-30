@@ -29,6 +29,18 @@ neither this suite's environment nor CI's hermetic runners carry).
 4. `dry_run=1` short-circuits before touching git at all (returns 0 even
    against a directory with no git repository whatsoever).
 
+Round-2 adversarial audit additions:
+5. `GitLibExitArmTests` — `gpu_inference_ab_ensure_history_for_merge_base`'s
+   OWN `2` (unshallow fetch failed) and `75` (advisory `origin/main`
+   refresh-fetch failed) exit arms, isolated against a shallow-vs-full
+   clone whose `origin` remote is repointed at a nonexistent path (F2;
+   only the `0` arm was exercised before this addition).
+6. `RunpodCloneCheckoutTests` — `runpod_clone_checkout.sh`'s own
+   clone+checkout+wrong-tree-verification function (F1), the SAME code
+   `runpod_gpu_perf_ab.sh` inlines verbatim into its remote heredoc,
+   driven against a scratch repo with a real ref, a nonexistent ref, and a
+   ref that resolves to the default branch's own tip.
+
 Run: `python3 ci/scripts/perf/test_gpu_inference_ab_git_shape.py`
 """
 
@@ -111,9 +123,15 @@ def clone_fixed_shape(origin, dest):
 
 def clone_old_buggy_shape(origin, dest):
     """The OLD, empirically-broken shape this fix replaces: a SHALLOW,
-    SINGLE-BRANCH clone straight onto the target ref via `-b`.
+    SINGLE-BRANCH clone straight onto the target ref via `-b`. `origin` is
+    passed as a `file://` URL so `--depth` genuinely takes effect (see
+    [`clone_shallow_with_broken_origin`]'s own doc for the local-clone
+    quirk this avoids) — this fixture's own bug reproduction does not
+    strictly NEED real shallowness (the single-branch restriction alone
+    already starves `origin/main` of any tracking ref), but stating the
+    shape honestly matters for a fixture whose own docstring claims it.
     """
-    _git(["clone", "--quiet", "--depth", "1", "-b", "feature", origin, dest], os.path.dirname(dest))
+    _git(["clone", "--quiet", "--depth", "1", "-b", "feature", f"file://{origin}", dest], os.path.dirname(dest))
 
 
 def run_ensure_function(repo_root, dry_run="0"):
@@ -123,6 +141,55 @@ def run_ensure_function(repo_root, dry_run="0"):
     Returns the function's own exit code (0 / 2 / 75).
     """
     script = f'source "{GIT_LIB}"; gpu_inference_ab_ensure_history_for_merge_base "{repo_root}" "{dry_run}"'
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    return result.returncode, result.stdout, result.stderr
+
+
+def clone_shallow_with_broken_origin(origin, dest):
+    """A SHALLOW clone whose `origin` remote is then repointed at a
+    nonexistent path — forces
+    `gpu_inference_ab_ensure_history_for_merge_base`'s OWN unshallow-fetch
+    step to fail (round-2 adversarial audit F2's `2` arm: the unshallow
+    fetch itself failed, a genuine infra problem).
+
+    `origin` is passed as a `file://` URL, never a bare local path: git
+    SILENTLY IGNORES `--depth` for a bare-local-path clone ("--depth is
+    ignored in local clones; use file:// instead", discovered empirically
+    while authoring this fixture) — the resulting clone would be a FULL
+    (non-shallow) one despite `--depth 1`, which would silently skip the
+    exact code path (`is-shallow-repository` → true → the unshallow-fetch
+    branch) this fixture exists to isolate.
+    """
+    _git(["clone", "--quiet", "--depth", "1", f"file://{origin}", dest], os.path.dirname(dest))
+    _git(["remote", "set-url", "origin", os.path.join(os.path.dirname(dest), "no-such-origin")], dest)
+
+
+def clone_full_with_broken_origin(origin, dest):
+    """A FULL (non-shallow) clone whose `origin` remote is then repointed
+    at a nonexistent path — the unshallow-fetch branch is SKIPPED entirely
+    (the clone is not shallow), isolating a failure of the
+    explicit-refspec `origin/main` fetch ALONE (round-2 adversarial audit
+    F2's `75` arm: advisory, never a hard refusal).
+    """
+    _git(["clone", "--quiet", origin, dest], os.path.dirname(dest))
+    _git(["remote", "set-url", "origin", os.path.join(os.path.dirname(dest), "no-such-origin")], dest)
+
+
+RUNPOD_SCRIPTS_DIR = os.path.dirname(PERF_DIR)
+CLONE_CHECKOUT_LIB = os.path.join(RUNPOD_SCRIPTS_DIR, "runpod_clone_checkout.sh")
+
+
+def run_runpod_clone_and_checkout(dest, repo_url, git_ref, default_branch):
+    """Sources `runpod_clone_checkout.sh` and calls
+    `runpod_perf_ab_clone_and_checkout` — a REAL bash subprocess driving the
+    EXACT function `runpod_gpu_perf_ab.sh` inlines verbatim into its own
+    remote heredoc (round-2 adversarial audit F1), never a Python
+    re-implementation of its clone/checkout/wrong-tree-verification logic.
+    """
+    script = (
+        f'source "{CLONE_CHECKOUT_LIB}"; '
+        f'runpod_perf_ab_clone_and_checkout "{dest}" "{repo_url}" "{git_ref}" "{default_branch}"'
+    )
     result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
     return result.returncode, result.stdout, result.stderr
 
@@ -230,6 +297,106 @@ class GitShapeTests(unittest.TestCase):
         result = subprocess.run(["bash", GIT_LIB], capture_output=True, text=True)
         self.assertEqual(result.returncode, 2)
         self.assertIn("source it", result.stderr)
+
+
+class GitLibExitArmTests(unittest.TestCase):
+    """round-2 adversarial audit F2: `gpu_inference_ab_ensure_history_for_merge_base`'s
+    OWN `2` (unshallow fetch failed) and `75` (advisory `origin/main`
+    refresh-fetch failed) exit arms — only the `0` arm was exercised
+    before this addition.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.root = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_unshallow_fetch_failure_returns_2(self):
+        origin, _merge_base_sha, _feature_tip = build_scratch_origin(self.root)
+        dest = os.path.join(self.root, "dest")
+        clone_shallow_with_broken_origin(origin, dest)
+
+        rc, out, err = run_ensure_function(dest)
+        self.assertEqual(
+            rc,
+            2,
+            f"a shallow clone whose origin cannot be reached must return 2 (the unshallow fetch "
+            f"itself failed, a genuine infra problem)\nstdout={out}\nstderr={err}",
+        )
+
+    def test_origin_main_refresh_fetch_failure_returns_75(self):
+        origin, _merge_base_sha, _feature_tip = build_scratch_origin(self.root)
+        dest = os.path.join(self.root, "dest")
+        clone_full_with_broken_origin(origin, dest)
+
+        rc, out, err = run_ensure_function(dest)
+        self.assertEqual(
+            rc,
+            75,
+            f"a non-shallow clone whose origin cannot be reached must return 75 (advisory "
+            f"origin/main refresh-fetch failure, never a hard refusal)\nstdout={out}\nstderr={err}",
+        )
+
+
+class RunpodCloneCheckoutTests(unittest.TestCase):
+    """round-2 adversarial audit F1: `runpod_clone_checkout.sh`'s own
+    clone+checkout+wrong-tree-verification function, driven against a
+    scratch repo — EXECUTES the driver's own logic (never merely asserted
+    from reading the source), including the wrong-tree refusal a bad or
+    silently-defaulted GIT_REF earns.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.root = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_a_real_diverging_ref_checks_out_cleanly(self):
+        origin, _merge_base_sha, feature_tip_sha = build_scratch_origin(self.root)
+        dest = os.path.join(self.root, "dest")
+
+        rc, out, err = run_runpod_clone_and_checkout(dest, origin, "feature", "main")
+        self.assertEqual(rc, 0, f"stdout={out}\nstderr={err}")
+        self.assertEqual(_rev_parse(dest, "HEAD"), feature_tip_sha)
+
+    def test_a_nonexistent_ref_refuses_with_exit_2(self):
+        origin, _merge_base_sha, _feature_tip = build_scratch_origin(self.root)
+        dest = os.path.join(self.root, "dest")
+
+        rc, out, err = run_runpod_clone_and_checkout(dest, origin, "does-not-exist", "main")
+        self.assertEqual(rc, 2, f"stdout={out}\nstderr={err}")
+
+    def test_a_wrong_tree_ref_that_resolves_to_the_default_branch_head_refuses_with_exit_2(self):
+        """The wrong-tree refusal itself (round-2 adversarial audit F1): a
+        NON-default ref that happens to resolve to the exact SAME commit
+        as origin/main's own CURRENT tip must refuse, even though the
+        checkout itself succeeded cleanly.
+        """
+        origin, _merge_base_sha, _feature_tip = build_scratch_origin(self.root)
+        main_tip_sha = _rev_parse(origin, "HEAD")  # build_scratch_origin leaves origin checked out on main
+        _git(["branch", "accidental-alias", "main"], origin)
+        dest = os.path.join(self.root, "dest")
+
+        rc, out, err = run_runpod_clone_and_checkout(dest, origin, "accidental-alias", "main")
+        self.assertEqual(rc, 2, f"stdout={out}\nstderr={err}")
+        self.assertIn("wrong-tree", err)
+        self.assertIn(main_tip_sha, err)
+
+    def test_deliberately_targeting_the_default_branch_is_exempt_from_the_wrong_tree_check(self):
+        """`git_ref == default_branch` is the ONE legitimate case where
+        landing on main's own tip is expected, not a bug — exempt.
+        """
+        origin, _merge_base_sha, _feature_tip = build_scratch_origin(self.root)
+        main_tip_sha = _rev_parse(origin, "HEAD")
+        dest = os.path.join(self.root, "dest")
+
+        rc, out, err = run_runpod_clone_and_checkout(dest, origin, "main", "main")
+        self.assertEqual(rc, 0, f"stdout={out}\nstderr={err}")
+        self.assertEqual(_rev_parse(dest, "HEAD"), main_tip_sha)
 
 
 if __name__ == "__main__":

@@ -33,10 +33,20 @@ PERF_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(PERF_DIR, "gpu_inference_ab.sh")
 
 
-def run_dry(out_dir, extra_env=None):
+def run_dry(out_dir, work_dir, extra_env=None):
+    """`work_dir` is REQUIRED (round-2 adversarial audit advisory): every
+    caller passes an explicit `GPU_INFERENCE_AB_WORK_DIR` (a tempdir the
+    caller owns and cleans up), never the script's own default (a sibling
+    directory of the checkout, `$(dirname "$REPO_ROOT")/gpu-perf-ab-<ts>`)
+    -- `mkdir -p "$WORK_DIR"` runs UNCONDITIONALLY in `gpu_inference_ab.sh`,
+    even under `--dry-run`, so a caller that omitted this would leave a
+    real, empty, timestamped directory behind next to this very checkout
+    on every single test run.
+    """
     env = dict(os.environ)
     env["GPU_INFERENCE_AB_DRY_RUN"] = "1"
     env["GPU_INFERENCE_AB_OUT_DIR"] = out_dir
+    env["GPU_INFERENCE_AB_WORK_DIR"] = work_dir
     if extra_env:
         env.update(extra_env)
     result = subprocess.run(["bash", SCRIPT], env=env, capture_output=True, text=True, timeout=60)
@@ -45,19 +55,21 @@ def run_dry(out_dir, extra_env=None):
 
 class DryRunSmokeTests(unittest.TestCase):
     def test_dry_run_runs_end_to_end_and_never_touches_the_network_or_a_real_build(self):
-        with tempfile.TemporaryDirectory() as out_dir:
-            result = run_dry(out_dir)
+        with tempfile.TemporaryDirectory() as out_dir, tempfile.TemporaryDirectory() as work_dir:
+            result = run_dry(out_dir, work_dir)
 
             # Every real leg is a stub under GPU_INFERENCE_AB_DRY_RUN=1 (see
-            # gpu_inference_ab.py's own MISSING/INCOMPLETE doctrine), so the
-            # merge status is deterministically INCOMPLETE and the exit
-            # code is the documented neutral 75 -- proven here against the
-            # REAL process exit code, not assumed.
+            # gpu_inference_ab.py's own MISSING/INCOMPLETE doctrine), so all
+            # four legs are missing -- b1/b2 (b-role) are among them, so
+            # (round-2 adversarial audit F5) the merge status is
+            # deterministically INVALID and the exit code is 1, proven here
+            # against the REAL process exit code, not assumed.
             self.assertEqual(
                 result.returncode,
-                75,
-                f"dry-run's own four stub legs are never 'OK' (dry-run reports), so the merge status "
-                f"must be INCOMPLETE/exit 75 deterministically\nstdout={result.stdout}\nstderr={result.stderr}",
+                1,
+                f"dry-run's own four stub legs are never 'OK' (dry-run reports), and b1/b2 are among "
+                f"the missing (b-role), so the merge status must be INVALID/exit 1 deterministically "
+                f"(round-2 adversarial audit F5)\nstdout={result.stdout}\nstderr={result.stderr}",
             )
 
             # The printed command trace shows the commands run_cmd WOULD
@@ -72,7 +84,7 @@ class DryRunSmokeTests(unittest.TestCase):
             self.assertTrue(os.path.isfile(report_path), f"no report written under {out_dir}\nstdout={result.stdout}")
             with open(report_path, encoding="utf-8") as fh:
                 report = json.load(fh)
-            self.assertEqual(report["status"], "INCOMPLETE")
+            self.assertEqual(report["status"], "INVALID")
             self.assertEqual(sorted(report["missing_legs"]), ["a1", "a2", "b1", "b2"])
 
     def test_dry_run_never_creates_a_real_cargo_target_dir(self):
@@ -83,8 +95,8 @@ class DryRunSmokeTests(unittest.TestCase):
         `GPU_INFERENCE_AB_WORK_DIR` afterward.
         """
         with tempfile.TemporaryDirectory() as out_dir, tempfile.TemporaryDirectory() as work_dir:
-            result = run_dry(out_dir, extra_env={"GPU_INFERENCE_AB_WORK_DIR": work_dir})
-            self.assertEqual(result.returncode, 75, f"stdout={result.stdout}\nstderr={result.stderr}")
+            result = run_dry(out_dir, work_dir)
+            self.assertEqual(result.returncode, 1, f"stdout={result.stdout}\nstderr={result.stderr}")
 
             for sub in ("target-a", "target-b", "clone-a", "clone-b"):
                 self.assertFalse(
@@ -100,10 +112,31 @@ class DryRunSmokeTests(unittest.TestCase):
         `GPU_INFERENCE_AB_SKIP_GPU_CHECK` and confirming the run still
         completes rather than erroring out looking for `nvidia-smi`.
         """
-        with tempfile.TemporaryDirectory() as out_dir:
-            result = run_dry(out_dir)
-            self.assertEqual(result.returncode, 75, f"stdout={result.stdout}\nstderr={result.stderr}")
+        with tempfile.TemporaryDirectory() as out_dir, tempfile.TemporaryDirectory() as work_dir:
+            result = run_dry(out_dir, work_dir)
+            self.assertEqual(result.returncode, 1, f"stdout={result.stdout}\nstderr={result.stderr}")
             self.assertNotIn("nvidia-smi", result.stderr)
+
+    def test_dry_run_prints_the_four_legs_in_the_a1_b1_b2_a2_order(self):
+        """round-2 adversarial audit F3: the printed leg-trace sequence
+        (`--- a1: `, `--- b1: `, `--- b2: `, `--- a2: `) must appear in
+        EXACTLY that order in stdout -- the visible, human-readable half of
+        the order binding (the MACHINE-CHECKED half lives in
+        `gpu_inference_ab.py::verify_recorded_order`, driven against the
+        `.started_at` files this same run writes).
+        """
+        with tempfile.TemporaryDirectory() as out_dir, tempfile.TemporaryDirectory() as work_dir:
+            result = run_dry(out_dir, work_dir)
+            self.assertEqual(result.returncode, 1, f"stdout={result.stdout}\nstderr={result.stderr}")
+
+            markers = ["--- a1: ", "--- b1: ", "--- b2: ", "--- a2: "]
+            indices = [result.stdout.index(m) for m in markers]
+            self.assertEqual(
+                indices,
+                sorted(indices),
+                f"the four leg-trace markers must appear in a1,b1,b2,a2 order in stdout; got indices "
+                f"{indices} for {markers}\nstdout={result.stdout}",
+            )
 
 
 if __name__ == "__main__":

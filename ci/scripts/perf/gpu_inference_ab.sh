@@ -81,10 +81,10 @@
 # `ci/artifacts/gpu-perf-aa-null/` as the campaign's own committed evidence,
 # the same convention `runpod_gpu_howwell.sh`'s own artifact pull follows.
 #
-# ## Exit codes (round-1 adversarial audit B3's reconciled lattice — this
-# table, the code sites below, and gpu-perf-ab.yml's own step annotations
-# must all agree; every exit site in this script cites which arm of this
-# table it lands on)
+# ## Exit codes (round-2 adversarial audit F5's final reconciled lattice —
+# this table, the code sites below, `gpu_inference_ab.py`'s own exit-code
+# doc, and gpu-perf-ab.yml's own step annotations must all agree; every
+# exit site in this script cites which arm of this table it lands on)
 #
 #   0  -- a report was written and the merge's own status is GREEN (see
 #         `gpu_inference_ab.py`'s own exit-code doc: recorded regardless of
@@ -93,12 +93,17 @@
 #         problem or a genuine measurement-validity defect, never the
 #         parent's: an identity mismatch between two otherwise-comparable
 #         legs (`gpu_inference_ab.py` status INVALID), a malformed
-#         measurement on an otherwise identity-clean leg set
-#         (`gpu_inference_ab.py` status INVALID_MEASUREMENT — a report is
-#         still WRITTEN, never an uncaught crash), a binary whose own
-#         `provenance` does not match the clone it was supposedly built
-#         from, or the PR/comparison clone's build FAILING (outside
-#         `--aa-null` mode — see that mode's own exception below).
+#         measurement on an otherwise identity-clean leg set (status
+#         INVALID_MEASUREMENT), the four legs' RECORDED start order not
+#         verifying as A,B,B,A (round-2 adversarial audit F3, also status
+#         INVALID — `verify_recorded_order`), a PR-side (`b`-role) leg
+#         (`b1`/`b2`) that ran but did not produce an `OK` report (round-2
+#         adversarial audit F5: a RUNTIME failure on an already-built PR
+#         binary is a stronger signal than a non-compiling one), a binary
+#         whose own `provenance` does not match the clone it was supposedly
+#         built from, or the PR/comparison clone's build FAILING (outside
+#         `--aa-null` mode — see that mode's own exception below). A report
+#         is still WRITTEN on every one of these, never an uncaught crash.
 #   2  -- a usage/infra error: bad arguments, `nvidia-smi` itself failing to
 #         run, a `git clone`/`checkout`/submodule-init failure, an
 #         unshallow-fetch failure, HEAD or the computed merge-base not
@@ -109,16 +114,19 @@
 #         attribute to the PR), the `--aa-null` COMPARISON clone's build
 #         failed (also parent-sha under that mode, same bucket as the
 #         parent), the `origin/main`-tracking-ref refresh fetch failed
-#         (`gpu_inference_ab_git.sh`'s own doc), HEAD already equals
-#         origin/main's merge-base (no PR-side commits at all), both
-#         binaries report the SAME `build_sha` outside `--aa-null` mode, a
-#         parent leg is missing one or more declared identity fields
-#         entirely (predates issue #335's own identity contract —
-#         `gpu_inference_ab.py`'s own `INCOMPLETE_IDENTITY` status), or
-#         fewer than all four legs produced an `OK` report.
+#         (`gpu_inference_ab_git.sh`'s own doc — ADVISORY, this script logs
+#         it and continues to the real gate, the merge-base call, per
+#         round-2 adversarial audit F2), HEAD already equals origin/main's
+#         merge-base (no PR-side commits at all), both binaries report the
+#         SAME `build_sha` outside `--aa-null` mode, a parent leg is missing
+#         one or more declared identity fields entirely (predates issue
+#         #335's own identity contract — status INCOMPLETE_IDENTITY), or
+#         fewer than all four legs produced an `OK` report AND NONE of the
+#         missing/failed ones are `b`-role (status INCOMPLETE — a `b`-role
+#         absence is `1` above, not `75`).
 #
 # Env vars:
-#   GPU_INFERENCE_AB_WORK_DIR       where the two/three clones + their own
+#   GPU_INFERENCE_AB_WORK_DIR       where clone-a/clone-b + their own
 #                                   CARGO_TARGET_DIRs live (default a
 #                                   sibling of this checkout,
 #                                   "../gpu-perf-ab-<UTC timestamp>").
@@ -209,13 +217,28 @@ fi
 # --- ensure this checkout carries enough history for a real merge-base
 # (round-1 adversarial audit B2) -- see gpu_inference_ab_git.sh's own doc
 # for the exact bug this closes and this function's own exit-code
-# contract (0 / 2 / 75), which this script propagates VERBATIM. ---
+# contract (0 / 2 / 75).
+#
+# round-2 adversarial audit F2 (the LIBRARY's own design is correct, the
+# CALLER was wrong): a `75` here is ADVISORY, not a gate -- it means "the
+# origin/main REFRESH fetch failed", which is meaningless on its own if a
+# PRIOR clone step already populated a usable origin/main (the normal case
+# after runpod_gpu_perf_ab.sh's own full, non-single-branch initial
+# clone). The REAL gate is the `git merge-base origin/main HEAD` call
+# below: log the `75` and CONTINUE to it, rather than exiting on the
+# history helper's own advisory result -- if origin/main is genuinely
+# unusable, THAT call surfaces its own real error (exit 2, see below). A
+# `2` here, in contrast, IS a hard stop: the unshallow fetch itself failed,
+# meaning this repo can never compute a real merge-base at all, with no
+# fallback for the merge-base call below to succeed through. ---
 # shellcheck source=ci/scripts/perf/gpu_inference_ab_git.sh
 source "$DIR/gpu_inference_ab_git.sh"
 gpu_inference_ab_ensure_history_for_merge_base "$REPO_ROOT" "$GPU_INFERENCE_AB_DRY_RUN"
 HISTORY_RC=$?
-if [ "$HISTORY_RC" -ne 0 ]; then
-  exit "$HISTORY_RC"
+if [ "$HISTORY_RC" -eq 2 ]; then
+  exit 2
+elif [ "$HISTORY_RC" -eq 75 ]; then
+  echo "::warning::gpu_inference_ab_ensure_history_for_merge_base returned 75 (advisory) -- continuing to the real gate, the merge-base call itself, which will surface its OWN error if origin/main is genuinely unusable." >&2
 fi
 
 SHA_RE='^[0-9a-fA-F]{40}$'
@@ -256,7 +279,22 @@ mkdir -p "$WORK_DIR"
 # --- TWO SIMULTANEOUSLY-RESIDENT clones, checked out BEFORE any build ---
 clone_and_checkout() {
   local clone="$1" sha="$2" label="$3"
-  run_cmd git clone --no-hardlinks --quiet "$REPO_ROOT" "$clone" \
+  # round-2 adversarial audit F6: `--filter=blob:none` -- the SAME pod-clone
+  # idiom runpod_lib.sh:1505 already uses -- skips every HISTORICAL blob
+  # this workload never touches (no git log -p, no diffing against
+  # history; only the ONE checked-out tree's own files are ever read), a
+  # real disk-footprint saving for two full source trees WHEN the local
+  # git server honors it. Git SILENTLY IGNORES `--filter` outright for a
+  # bare-local-path clone ("--filter is ignored in local clones; use
+  # file:// instead", discovered empirically); `file://$REPO_ROOT` is
+  # REQUIRED for the filter to even be ATTEMPTED. Whether it then actually
+  # takes effect depends on the local git-upload-pack's own filter support
+  # (also observed empirically: a local `file://` transport can itself
+  # decline with "filtering not recognized by server, ignoring" and fall
+  # back to a full clone) -- either way this is a harmless, forward-looking
+  # request: a real saving when honored, a silent no-op warning when not,
+  # never a hard failure.
+  run_cmd git clone --no-hardlinks --quiet --filter=blob:none "file://$REPO_ROOT" "$clone" \
     || { echo "::error::cloning $label ($REPO_ROOT -> $clone) failed" >&2; return 1; }
   run_cmd git -C "$clone" checkout --quiet --detach "$sha" \
     || { echo "::error::checking out $label sha $sha in $clone failed" >&2; return 1; }
@@ -339,6 +377,16 @@ run_leg() {
   local out_file="$RAW_DIR/${name}.json"
   local err_file="$RAW_DIR/${name}.stderr"
   local exit_file="$RAW_DIR/${name}.exit"
+  local started_at_file="$RAW_DIR/${name}.started_at"
+
+  # round-2 adversarial audit F3 (order binding): record a monotonic-for-
+  # practical-purposes start timestamp (nanosecond epoch) BEFORE invoking
+  # this leg's binary, in EVERY mode including --dry-run -- the ONE piece
+  # of evidence `gpu_inference_ab.py`'s own comparator uses to MACHINE-
+  # CHECK that the four legs actually ran in the A,B,B,A order the whole
+  # drift-cancellation rationale depends on, rather than merely trusting
+  # that this script's own source calls run_leg in that sequence.
+  date +%s%N > "$started_at_file"
 
   printf -- '--- %s: ' "$name"
   printf '%q ' "$bin" gpu-inference-scale

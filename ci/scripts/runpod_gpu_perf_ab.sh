@@ -16,16 +16,18 @@
 # RECORDING-ONLY (v1): `gpu_inference_ab.py`'s own exit codes (see that
 # module's doc) are the SAME ones this script propagates — 0 = report
 # written, merge status GREEN; 1 = a real correctness-of-measurement
-# refusal (identity/provenance mismatch, or a PR-side build failure — the
-# PR's own problem); 2 = a usage/infra error (bad args, a clone/checkout/
-# fetch failure); 75 = neutral "nothing to compare safely right now" (no
-# RunPod capacity, a GPU-busy pod, a PARENT-side build failure, an
-# `origin/main` refresh-fetch failure, `merge-base == HEAD`, or fewer than
-# four `OK` legs) — see `gpu_inference_ab.sh`'s own header for the full,
-# reconciled table this driver's exit code is drawn from verbatim. This
-# driver treats RunPod capacity misses (`rp_deploy_live_a100` failing) with
-# the SAME 75 convention runpod_gpu_prove.sh/runpod_gpu_howwell.sh already
-# use.
+# refusal (an identity/order/provenance mismatch, an INVALID_MEASUREMENT,
+# or a PR-side build/runtime failure — the PR's own problem, never the
+# parent's); 2 = a usage/infra error (bad args, a clone/checkout/
+# wrong-tree/fetch failure); 75 = neutral "nothing to compare safely right
+# now" (no RunPod capacity, insufficient free disk on the pod — this
+# driver's own pre-flight `df` check, round-2 adversarial audit F6 — a
+# GPU-busy pod, a PARENT-side build failure, an `origin/main` refresh-fetch
+# failure, `merge-base == HEAD`, or fewer than four `OK` legs) — see
+# `gpu_inference_ab.sh`'s own header for the full, reconciled table this
+# driver's exit code is drawn from verbatim. This driver treats RunPod
+# capacity misses (`rp_deploy_live_a100` failing) with the SAME 75
+# convention runpod_gpu_prove.sh/runpod_gpu_howwell.sh already use.
 #
 # Env vars:
 #   GIT_REPO   what to clone.
@@ -55,6 +57,19 @@ set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$DIR/.." && pwd)"
 RP_TTL_HOURS="${RP_TTL_HOURS:-3}"
+# round-2 adversarial audit F6: RP_DISK_GB, set BEFORE sourcing
+# runpod_lib.sh (its own `RP_DISK_GB="${RP_DISK_GB:-60}"` default runs at
+# SOURCE time, so this assignment must precede that line to take effect).
+# Sized per runpod_lib.sh's own rule of thumb (that file's lines 56-72):
+# `>= 25 (base) + S_src + S_seed + N*S_clone`. This pod hosts THREE full
+# source trees at once (the outer bootstrap checkout at /root/jammi-ai,
+# plus gpu_inference_ab.sh's own clone-a and clone-b) and TWO independent
+# release+cuda build trees (target-a, target-b) -- exactly the "3+ trees"
+# case docs/maintainer/dev-gpu.md's own citable measured numbers
+# (S_src ~= 3.6 GB, S_seed ~= 7.8 GB, S_clone ~= 8.1 GB) already name:
+# "a pod hosting 3+ trees sizes up (RP_DISK_GB=70+)". Using that
+# already-reviewed number directly rather than re-deriving a bespoke one.
+RP_DISK_GB="${RP_DISK_GB:-70}"
 # shellcheck source=ci/scripts/runpod_lib.sh
 source "$DIR/runpod_lib.sh"
 
@@ -91,25 +106,41 @@ export CARGO_TERM_COLOR=never
 export CARGO_BUILD_RUSTC_WRAPPER=
 export JAMMI_REQUIRE_CUDA=1
 echo "::group::device"; nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv; echo "::endgroup::"
+
+echo "::group::disk space pre-flight"
+# round-2 adversarial audit F6: this workload's OWN incremental need beyond
+# whatever the pod image already consumes -- TWO more full source trees
+# (gpu_inference_ab.sh's own clone-a, clone-b) plus TWO independent
+# release+cuda build trees (target-a, target-b), 2*(S_src + S_seed) ~=
+# 2*(3.6+7.8) GB ~= 22.8 GB per docs/maintainer/dev-gpu.md's own measured
+# numbers (see this driver's own RP_DISK_GB comment for the citation),
+# rounded up to 30 GB for headroom. A pre-flight refusal here is strictly
+# cheaper than discovering "no space left on device" partway through a
+# multi-GB clone or build.
+GPU_PERF_AB_MIN_FREE_GB=30
+AVAIL_GB="\$(df -BG / | awk 'NR==2 {gsub(/G/,"",\$4); print \$4}')"
+if [ -z "\$AVAIL_GB" ] || ! [[ "\$AVAIL_GB" =~ ^[0-9]+\$ ]]; then
+  echo "::warning::could not parse available disk space from 'df -BG /' (got '\$AVAIL_GB') -- skipping the pre-flight check (best-effort only)."
+elif [ "\$AVAIL_GB" -lt "\$GPU_PERF_AB_MIN_FREE_GB" ]; then
+  echo "::error::only \${AVAIL_GB}GB free on / but this workload needs an estimated \${GPU_PERF_AB_MIN_FREE_GB}GB (two more source trees + two build trees) -- refusing before any clone/build starts; neutral exit 75."
+  exit 75
+fi
+echo "\${AVAIL_GB}GB free, >= \${GPU_PERF_AB_MIN_FREE_GB}GB needed -- proceeding."
+echo "::endgroup::"
+
 cd /root && rm -rf jammi-ai
-# round-1 adversarial audit B2 (the empirically-proven bug: "merge-base
-# exits 128"): a FULL, non-single-branch clone, THEN an explicit checkout —
-# never \`git clone --depth 1 -b "\${GIT_REF}"\`. That old shape was BOTH
-# (a) a single-branch SHALLOW clone, whose own remote config scopes its
-# default fetch refspec to ONE branch alone, so \`origin/main\` never
-# existed as a local tracking ref at all once \`gpu_inference_ab.sh\` (run
-# next, against THIS checkout) tried \`git merge-base origin/main HEAD\`
-# against it -- empirically \`fatal: ... unknown revision\`, exit 128; and
-# (b) fed straight into \`-b\`, which REJECTS an arbitrary commit sha (only
-# accepts a branch/tag name) -- a GIT_REF that happened to be a raw sha
-# (the old \${GITHUB_SHA:-main} fallback's own shape) would have failed
-# this clone outright. A full clone + a separate \`checkout\` accepts
-# EITHER shape uniformly and always creates \`origin/main\` from the
-# initial clone onward (no single-branch restriction narrows the remote's
-# own default fetch refspec), fixing both (a) and (b) in one change.
-git clone --quiet "${GIT_REPO}" jammi-ai 2>&1 | tail -1
-cd jammi-ai
-git checkout --quiet "${GIT_REF}" 2>&1 | tail -1
+# round-2 adversarial audit F1: the clone+checkout+wrong-tree-verification
+# block lives in runpod_clone_checkout.sh (never embedded inline here) --
+# inlined VERBATIM below so this pod runs the EXACT same, independently
+# hermetic-tested code (see that file's own doc for the full rationale,
+# including round-1 adversarial audit B2's "merge-base exits 128" bug this
+# clone shape already fixes: a FULL, non-single-branch, blobless partial
+# clone, then a separate checkout -- never \`git clone --depth 1 -b
+# "\${GIT_REF}"\`).
+$(cat "$DIR/runpod_clone_checkout.sh")
+
+runpod_perf_ab_clone_and_checkout /root/jammi-ai "${GIT_REPO}" "${GIT_REF}" main \
+  || { echo "::error::clone/checkout/wrong-tree-verification failed -- see the log above"; exit 2; }
 # gpu_inference_ab.sh clones THIS checkout TWICE (clone-a, clone-b — the
 # SAME two clones every invocation makes, in either mode; --aa-null changes
 # only which sha clone-b checks out, never the clone COUNT — see that

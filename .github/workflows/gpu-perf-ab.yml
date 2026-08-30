@@ -4,14 +4,24 @@ name: GPU perf A/B (RunPod)
 # an ephemeral RunPod pod — `ci/scripts/perf/gpu_inference_ab.sh` driving
 # `jammi-bench gpu-inference-scale` across two simultaneously-resident
 # clones (parent-HEAD + PR, or parent-vs-parent under `--aa-null`), merged
-# (leg-premise refusal + primary-endpoint ratio + NOT-YET-pre-registered
-# advisory classification) by `ci/scripts/perf/gpu_inference_ab.py`.
+# (leg-premise refusal + primary-endpoint ratio + PRE-REGISTERED advisory
+# classification, derived from the committed `ci/artifacts/gpu-perf-aa-null/`
+# campaign) by `ci/scripts/perf/gpu_inference_ab.py`.
 #
-# RECORDING-ONLY (v1): this workflow NEVER fails the run over the measured
-# ratio — issue #335's own exit criterion forbids enforcement before
-# multi-pod/both-device-model validation. It uploads the merged report as an
-# artifact for a human to read; it is not itself a required merge-path
-# check, and grants no such status.
+# TWO MODES (issue #335's final unit — see `gpu_inference_ab.sh`'s own "TWO
+# MODES" doc for the full rationale): this workflow's `enforce`
+# `workflow_dispatch` input (default `false`) is the ONLY way a run of this
+# workflow ever gates on the measured ratio. Non-enforcing (the default,
+# EVERY label-triggered PR run, and any dispatch that leaves `enforce`
+# unset/`false`) stays recording-only, exactly as before — it uploads the
+# merged report as an artifact for a human to read, is not itself a required
+# merge-path check, and grants no such status. Enforcing
+# (`workflow_dispatch` with `enforce: true`, deliberately invoked, never a
+# label default) opts THAT ONE run into also refusing (exit 1,
+# `enforce_verdict=PERF_REGRESSION`) a GREEN-premise run whose ratio falls
+# outside the pre-registered band. The label-triggered PR path (`pull_request:
+# types: [labeled]`) NEVER sets `enforce` — this lane stays opt-in;
+# enforcement is invoked deliberately, never a PR-label side effect.
 #
 # Off the merge path, same discipline gpu-prove.yml/gpu-howwell.yml's own
 # headers state — GPU minutes cost money and A100 capacity is intermittent.
@@ -20,10 +30,10 @@ name: GPU perf A/B (RunPod)
 # standing nightly A/B is a later decision, not this workflow's own
 # default).
 #
-# Merge-path CI checks only ever validate COMMITTED artifacts (a future
-# `ci/artifacts/gpu-perf-aa-null/` schema gate, once the D6 empirical-null
-# evidence exists) — this workflow itself, and the RunPod run it drives,
-# never sit on that path.
+# Merge-path CI checks only ever validate COMMITTED artifacts (this
+# workflow itself, and the RunPod run it drives, never sit on that path,
+# EVEN under `enforce: true` — a workflow_dispatch run is never a required
+# check on any PR).
 
 on:
   workflow_dispatch:
@@ -33,6 +43,11 @@ on:
         required: false
         type: string
         default: "false"
+      enforce:
+        description: "Enforce the pre-registered advisory band (issue #335's final unit): a GREEN-premise run whose ratio falls outside ci/scripts/perf/gpu_inference_ab.py::PRE_REGISTERED_ADVISORY_BAND refuses (exit 1). 'true' or 'false' (default false: non-enforcing, recording-only — the SAME posture every label-triggered PR run always keeps, opted into deliberately here, never by default)."
+        required: false
+        type: boolean
+        default: false
   pull_request:
     types: [labeled]
 
@@ -73,6 +88,16 @@ jobs:
           GIT_REPO: https://github.com/${{ github.repository }}.git
           GIT_REF: ${{ github.head_ref || github.ref_name }}
           GPU_PERF_AB_AA_NULL: ${{ github.event.inputs.aa_null == 'true' && '1' || '0' }}
+          # issue #335's final unit: enforcement is opt-in and dispatch-only
+          # by construction — the `github.event_name == 'workflow_dispatch'`
+          # guard means a label-triggered `pull_request` event can NEVER
+          # produce '1' here even if `github.event.inputs.enforce` somehow
+          # carried a stray truthy value (workflow_dispatch inputs are only
+          # ever populated for that trigger to begin with, so this guard is
+          # belt-and-suspenders, stated explicitly rather than relied on
+          # implicitly) — the label-triggered PR path stays recording-only,
+          # always.
+          GPU_PERF_AB_ENFORCE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.enforce == 'true' && '1' || '0' }}
         run: |
           set +e
           bash ci/scripts/runpod_gpu_perf_ab.sh
@@ -84,9 +109,9 @@ jobs:
         if: always() && steps.perfab.outputs.rc == '75'
         run: echo "::warning::gpu-perf-ab FAILED for capacity/build/nothing-to-compare (see the run log for which) — not a code/statistical regression. Re-run once the underlying condition clears."
 
-      - name: Annotate a premise refusal
+      - name: Annotate a premise refusal or a perf regression
         if: always() && steps.perfab.outputs.rc == '1'
-        run: echo "::error::gpu-perf-ab refused (exit 1) — a real correctness-of-measurement problem, CONFIRMED real before being raised (an identity mismatch between legs, an INVALID_MEASUREMENT defect, a genuine parsed recorded-order violation, a binary whose own provenance did not match the clone it was built from, the PR-side clone's build itself failing, or a b-role leg that ran but did not produce an OK report with the producer's own mode marker confirming ab). Never a perf regression. See the merged report artifact for the named violation(s) and its own mode field."
+        run: echo "::error::gpu-perf-ab refused (exit 1) — EITHER a real correctness-of-measurement problem, CONFIRMED real before being raised (an identity mismatch between legs, an INVALID_MEASUREMENT defect, a genuine parsed recorded-order violation, a binary whose own provenance did not match the clone it was built from, the PR-side clone's build itself failing, or a b-role leg that ran but did not produce an OK report with the producer's own mode marker confirming ab) — status will read something other than GREEN — OR (issue 335's final unit, enforce=true dispatch runs ONLY) a real perf-magnitude regression — the four legs' premises were GREEN, but the measured ratio fell outside the pre-registered advisory band (status stays GREEN, enforce_verdict=PERF_REGRESSION). See the merged report artifact's own status/enforce_verdict fields to tell the two apart — never inferred from this bare exit code alone."
 
       - name: Annotate a usage/infra error
         if: always() && steps.perfab.outputs.rc == '2'

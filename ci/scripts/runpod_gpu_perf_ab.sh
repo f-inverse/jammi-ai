@@ -13,29 +13,39 @@
 # ONLY by that workflow's workflow_dispatch / `run-gpu-perf-ab` PR-label
 # triggers, never a schedule.
 #
-# RECORDING-ONLY (v1): `gpu_inference_ab.py`'s own exit codes (see that
-# module's doc) are the SAME ones this script propagates — 0 = report
-# written, merge status GREEN; 1 = a real correctness-of-measurement
-# refusal (an identity/provenance mismatch, an INVALID_MEASUREMENT, a
-# GENUINE (parsed) recorded-order violation, or a `b`-role runtime failure
-# with the producer's own `mode` marker CONFIRMING `ab` — round-3
-# adversarial audit B2 correction: an earlier version of this doc claimed
-# this arm was always "the PR's own problem, never the parent's", which
-# overclaimed a confirmation this driver does not always have -- under
-# `--aa-null` there is no PR to blame at all, and an unconfirmed `mode`
-# never escalates either); 2 = a usage/infra error (bad args, a
-# clone/checkout/wrong-tree/fetch failure); 75 = neutral "nothing to
-# compare safely right now" (no RunPod capacity, insufficient free disk on
-# the pod — this driver's own pre-flight `df` check, round-2 adversarial
-# audit F6 — a GPU-busy pod, a PARENT-side build failure, a `MISSING`/
-# `DRY_RUN` leg of either role, a `b`-role runtime failure under
-# `--aa-null`/an unconfirmed mode, an unreadable/unparseable recorded
-# timestamp (round-3 adversarial audit B3), an `origin/main` refresh-fetch
-# failure, `merge-base == HEAD`, or fewer than four `OK` legs) — see
-# `gpu_inference_ab.sh`'s own header for the full, reconciled table this
-# driver's exit code is drawn from verbatim. This driver treats RunPod
-# capacity misses (`rp_deploy_live_a100` failing) with the SAME 75
-# convention runpod_gpu_prove.sh/runpod_gpu_howwell.sh already use.
+# TWO MODES, propagated verbatim (issue #335's final unit — see
+# `gpu_inference_ab.sh`'s own "TWO MODES" doc for the full rationale):
+# non-enforcing (the default, `GPU_PERF_AB_ENFORCE` unset/`0`) stays
+# recording-only; enforcing (`GPU_PERF_AB_ENFORCE=1`) opts this run into
+# also refusing a GREEN-premise run whose ratio falls outside the
+# pre-registered advisory band. `gpu_inference_ab.py`'s own exit codes (see
+# that module's doc) are the SAME ones this script propagates — 0 = report
+# written, merge status GREEN (and, under enforcing mode, the ratio landed
+# inside the pre-registered band); 1 = EITHER a real correctness-of-
+# measurement refusal (an identity/provenance mismatch, an
+# INVALID_MEASUREMENT, a GENUINE (parsed) recorded-order violation, or a
+# `b`-role runtime failure with the producer's own `mode` marker CONFIRMING
+# `ab` — round-3 adversarial audit B2 correction: an earlier version of
+# this doc claimed this arm was always "the PR's own problem, never the
+# parent's", which overclaimed a confirmation this driver does not always
+# have -- under `--aa-null` there is no PR to blame at all, and an
+# unconfirmed `mode` never escalates either) OR, under enforcing mode ONLY,
+# a real perf-magnitude refusal (`status` stays GREEN,
+# `enforce_verdict=PERF_REGRESSION` — the merged report's own `status`
+# field is what distinguishes the two, never the bare exit code alone); 2 =
+# a usage/infra error (bad args, a clone/checkout/wrong-tree/fetch
+# failure); 75 = neutral "nothing to compare safely right now" (no RunPod
+# capacity, insufficient free disk on the pod — this driver's own
+# pre-flight `df` check, round-2 adversarial audit F6 — a GPU-busy pod, a
+# PARENT-side build failure, a `MISSING`/`DRY_RUN` leg of either role, a
+# `b`-role runtime failure under `--aa-null`/an unconfirmed mode, an
+# unreadable/unparseable recorded timestamp (round-3 adversarial audit B3),
+# an `origin/main` refresh-fetch failure, `merge-base == HEAD`, or fewer
+# than four `OK` legs) — see `gpu_inference_ab.sh`'s own header for the
+# full, reconciled table this driver's exit code is drawn from verbatim.
+# This driver treats RunPod capacity misses (`rp_deploy_live_a100` failing)
+# with the SAME 75 convention runpod_gpu_prove.sh/runpod_gpu_howwell.sh
+# already use.
 #
 # Env vars:
 #   GIT_REPO   what to clone.
@@ -56,6 +66,13 @@
 #                             empirical-null instrument (see
 #                             gpu_inference_ab.sh's own doc). Default unset
 #                             (0): the normal parent-vs-PR A/B.
+#   GPU_PERF_AB_ENFORCE=1     forwarded as GPU_INFERENCE_AB_ENFORCE — issue
+#                             #335's final unit, the enforcement flip (see
+#                             gpu_inference_ab.sh's own "TWO MODES" doc).
+#                             Default unset (0): non-enforcing, recording-
+#                             only — gpu-perf-ab.yml's own label-triggered
+#                             PR path never sets this; only an explicit
+#                             workflow_dispatch with enforce: true does.
 #   GPU_PERF_AB_ARTIFACT_DIR  where the merged report/table is pulled back
 #                             to once the remote run finishes (default:
 #                             "<repo>/.gpu-pull/gpu-perf-ab" — mirrors
@@ -93,6 +110,7 @@ if [ -z "$GIT_REF" ]; then
 fi
 
 GPU_PERF_AB_AA_NULL="${GPU_PERF_AB_AA_NULL:-0}"
+GPU_PERF_AB_ENFORCE="${GPU_PERF_AB_ENFORCE:-0}"
 GPU_PERF_AB_ARTIFACT_DIR="${GPU_PERF_AB_ARTIFACT_DIR:-${REPO_ROOT}/.gpu-pull/gpu-perf-ab}"
 
 # Sweep before renting anything — same orphan-bounding reasoning
@@ -108,7 +126,7 @@ if [ "$rc" -ne 0 ]; then
   exit 75
 fi
 
-echo "=== running gpu_inference_ab.sh on ${RP_HOST}:${RP_PORT} (GPU_PERF_AB_AA_NULL=${GPU_PERF_AB_AA_NULL}) ==="
+echo "=== running gpu_inference_ab.sh on ${RP_HOST}:${RP_PORT} (GPU_PERF_AB_AA_NULL=${GPU_PERF_AB_AA_NULL} GPU_PERF_AB_ENFORCE=${GPU_PERF_AB_ENFORCE}) ==="
 rp_run_remote <<REMOTE
 export CARGO_TERM_COLOR=never
 export CARGO_BUILD_RUSTC_WRAPPER=
@@ -160,6 +178,7 @@ runpod_perf_ab_clone_and_checkout /root/jammi-ai "${GIT_REPO}" "${GIT_REF}" main
 
 echo "::group::gpu-perf-ab A/B (gpu_inference_ab.sh)"
 GPU_INFERENCE_AB_AA_NULL="${GPU_PERF_AB_AA_NULL}" \
+GPU_INFERENCE_AB_ENFORCE="${GPU_PERF_AB_ENFORCE}" \
   bash ci/scripts/perf/gpu_inference_ab.sh
 rc=\$?
 echo "::endgroup::"
@@ -189,11 +208,15 @@ fi
 
 # --- surface the merged status BY NAME (mirrors runpod_gpu_howwell.sh's own
 # idiom: an operator reading the log should never have to cross-reference a
-# bare exit code against the pulled artifact). ---
+# bare exit code against the pulled artifact). Also surfaces
+# `enforce_verdict` (issue #335's final unit) -- with TWO modes now sharing
+# exit 1, printing `status` alone is no longer enough to tell "a correctness
+# refusal" apart from "a perf-magnitude refusal" without opening the JSON. ---
 REPORT_JSON="$(find "$GPU_PERF_AB_ARTIFACT_DIR" -name gpu_inference_ab_report.json 2>/dev/null | sort | tail -1)"
 if [ -n "$REPORT_JSON" ] && [ -f "$REPORT_JSON" ]; then
   STATUS="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$REPORT_JSON" 2>/dev/null || echo "UNKNOWN")"
-  echo "=== merged status: ${STATUS} (${REPORT_JSON}) ==="
+  ENFORCE_VERDICT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("enforce_verdict", "n/a"))' "$REPORT_JSON" 2>/dev/null || echo "UNKNOWN")"
+  echo "=== merged status: ${STATUS} enforce_verdict: ${ENFORCE_VERDICT} (${REPORT_JSON}) ==="
 else
   echo "::warning::no gpu_inference_ab_report.json found under ${GPU_PERF_AB_ARTIFACT_DIR} -- cannot name the merged status."
 fi

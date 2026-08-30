@@ -11,14 +11,23 @@ directories shaped like `gpu_inference_ab.sh`'s own `.exit`/`.json`/`.stderr`
 output, never a hand-rolled call with literal tuples standing in for a
 report.
 
-## v1 is RECORDING-ONLY — never a gate
+## Recording-only by default; enforcing only when explicitly opted into
 
-Issue #335's own exit criterion forbids enforcement before multi-pod/
-both-device-model validation. This module NEVER fails a run over the
-measured *ratio* — the only thing it refuses (nonzero exit, status
-`INVALID`) is a PREMISE mismatch (the two legs did not measure the same
-thing at all, so no ratio is even meaningful). A measured ratio, however
-large, is always recorded and printed, never gated.
+The multi-pod/both-device-model validation issue #335's own exit criterion
+required before any enforcement is now DONE — the `--aa-null` empirical-null
+campaign committed under `ci/artifacts/gpu-perf-aa-null/` — and this
+module's advisory band is now a real, PRE-REGISTERED one derived from that
+evidence (see this module's own "ADVISORY classification" doc below). That
+did not flip this module's DEFAULT posture: NON-enforcing (the default)
+NEVER fails a run over the measured *ratio* — the only thing it refuses
+(nonzero exit, status `INVALID`/`INVALID_MEASUREMENT`) is a PREMISE mismatch
+(the two legs did not measure the same thing at all, so no ratio is even
+meaningful) or a correctness-of-measurement defect. A measured ratio,
+however large, is still always recorded and printed. ENFORCING mode
+(`GPU_INFERENCE_AB_ENFORCE=1`, opt-in per invocation — see this module's own
+"Enforcement flip" doc below) is the one addition: a GREEN-premise run whose
+ratio falls outside the pre-registered band now also refuses, with its own
+NAMED verdict, distinct from every premise-mismatch refusal above.
 
 ## Refusal core: reused, never hand-rolled
 
@@ -98,30 +107,76 @@ part of any classification:
     "one endpoint, one identity field" framing (see that field's own doc in
     `report.rs`).
 
-## ADVISORY classification: a placeholder band, NOT YET PRE-REGISTERED
+## ADVISORY classification: a PRE-REGISTERED band, derived from the D6
+## empirical-null campaign (issue #335 final unit)
 
-[`PLACEHOLDER_ADVISORY_BAND`] below is what this module classifies
+[`PRE_REGISTERED_ADVISORY_BAND`] below is what this module classifies
 `combined_embed_p50_ratio` against for the `advisory` column in the printed
-table — but it is EXPLICITLY NOT a pre-registered decision rule (D6): no
-empirical A/A null distribution exists yet to derive a real band from. The
-`--aa-null` producer mode (`gpu_inference_ab.sh`) is the instrument that will
-produce one (comparing the SAME parent sha built twice, from two independent
-clones, against itself) — its output is shaped for committing under
-`ci/artifacts/gpu-perf-aa-null/`. Until that artifact exists and a real band
-is derived from it, `advisory` is observability only: it NEVER changes this
-module's exit code, and a future unit that wires this endpoint into an
-actual gate must replace [`PLACEHOLDER_ADVISORY_BAND`] with a band derived
-from that artifact, never keep this placeholder as the real threshold.
+table. It IS a pre-registered decision rule (D6): derived from the `--aa-null`
+empirical A/A null campaign committed under `ci/artifacts/gpu-perf-aa-null/`
+— four PRIMARY runs, two rented pods, spanning BOTH A100 device models
+(SXM4, PCIe), all measured 2026-08-30 against the same `main` tip, all
+`status=GREEN`. That directory's own `README.md` carries the full campaign
+protocol, per-run table, and the two characterization findings the band
+below is derived from (a binary-level build-to-build effect whose sign
+tracks device model, and a within-run adjacent-pair spread) — never
+re-copied here (a fact lives in exactly one place; this doc cites it).
 
-## Exit codes (round-3 adversarial audit B2/B3's reconciled lattice —
-## matches `gpu_inference_ab.sh`'s own header table and `gpu-perf-ab.yml`'s
-## own step annotations verbatim)
+**Derivation** (restated verbatim from `ci/artifacts/gpu-perf-aa-null/README.md`'s
+own "Band derivation" section): 1.5x the largest `|log deviation|` observed
+in the committed null campaign (worst pair ratio 0.832 -> `|log|` 0.184;
+1.5x -> 0.277; `exp(±0.277)` ≈ `[0.758, 1.319]`) rounded outward to
+`[0.75, 1.33]`; derived from `ci/artifacts/gpu-perf-aa-null/` (4 primary
+runs, 2 pods, both A100 device models, 2026-08-30); catches regressions
+≥25% on the embed p50 endpoint — tightening requires endpoint-precision
+work (more iters/rows or replicate medians), not band tuning.
+
+`advisory` classifying `"outside_band"` NEVER changes this module's exit
+code by itself — see [`GPU_INFERENCE_AB_ENFORCE`] / the `enforce` marker
+below for the ONE thing that does, and only when explicitly opted into.
+
+## Enforcement flip: `GPU_INFERENCE_AB_ENFORCE` (issue #335 final unit)
+
+Two modes, both driven by the `enforce` marker `gpu_inference_ab.sh` writes
+into `raw_dir` before any leg runs (the SAME file-based state-passing
+convention the `mode` marker already uses — see [`load_mode`] — never an
+env var threaded directly into this module):
+
+  * **non-enforcing (the default)** — `enforce_verdict` on a `GREEN` report
+    reads `"NOT_ENFORCED"`; a ratio outside [`PRE_REGISTERED_ADVISORY_BAND`]
+    is recorded and printed, exactly as before this unit, but NEVER changes
+    the exit code. This is still v1's own recording-only posture — pre-
+    registering a real band did not, by itself, turn this into a gate.
+  * **enforcing** (`GPU_INFERENCE_AB_ENFORCE=1`) — on a `GREEN` report (the
+    four legs' premises are confirmed to agree) whose
+    `combined_embed_p50_ratio` falls OUTSIDE the pre-registered band,
+    `enforce_verdict` reads `"PERF_REGRESSION"` and this module exits `1` —
+    a real, NAMED perf-magnitude refusal, deliberately carried on a
+    SEPARATE field (`enforce_verdict`, never folded into `status`, which
+    stays `"GREEN"`) from every correctness-refusal reason below, so a
+    report reader can always tell "the premises were wrong" (`status !=
+    GREEN`) apart from "the premises were fine but the measured ratio
+    itself regressed" (`status == GREEN`, `enforce_verdict ==
+    "PERF_REGRESSION"`) without parsing prose. A ratio INSIDE the band
+    under enforcing mode reads `enforce_verdict = "PASS"`, exit `0`.
+    Enforcement NEVER overrides a correctness refusal — every `status !=
+    "GREEN"` exit path below is entirely unaffected by the `enforce`
+    marker's value; this module only ever consults it once premises are
+    already confirmed clean.
+
+## Exit codes (round-3 adversarial audit B2/B3's reconciled lattice, extended
+## by issue #335's final unit's enforcement flip (e) below — matches
+## `gpu_inference_ab.sh`'s own header table and `gpu-perf-ab.yml`'s own step
+## annotations verbatim)
 
   * `0`  — GREEN: all four legs are `OK`, their RECORDED run order verifies
            as A,B,B,A ([`verify_recorded_order`]), and they agree on
            [`identity_fields.GPU_INFERENCE_IDENTITY_FIELDS`]. The ratio is
-           computed and printed regardless of its own value (recording-only
-           — see above).
+           computed and printed regardless of its own value; under
+           enforcing mode, `0` also requires the ratio landed INSIDE
+           [`PRE_REGISTERED_ADVISORY_BAND`] (`enforce_verdict="PASS"`) — see
+           (e) below for the one case that still exits `1` from this same
+           `GREEN` status.
   * `1`  — a real correctness-of-measurement refusal, ONLY ever raised once
            this module can CONFIRM the signal is real, in FOUR shapes: (a)
            INVALID (identity) — at least two `OK` legs DIFFER on a declared
@@ -144,7 +199,17 @@ from that artifact, never keep this placeholder as the real threshold.
            never this bucket). All four refuse loudly (never silently drop
            the offending leg/field and compute a ratio anyway), and all
            four still WRITE a report (never an uncaught traceback with
-           nothing recorded at all).
+           nothing recorded at all). PLUS, under ENFORCING mode only, a
+           FIFTH, entirely different shape never present when `enforce` is
+           unset: (e) PERF_REGRESSION — `status` stays `"GREEN"` (the four
+           legs' premises really did agree; this is NOT a correctness
+           refusal), but `combined_embed_p50_ratio` fell OUTSIDE
+           [`PRE_REGISTERED_ADVISORY_BAND`], so `enforce_verdict` reads
+           `"PERF_REGRESSION"` with its own `perf_regression_reason` — a
+           report reader distinguishes this arm from (a)-(d) by checking
+           `status` (stays `"GREEN"` here, is one of `INVALID`/
+           `INVALID_MEASUREMENT` for (a)/(b)/(d)) or `missing_legs`/
+           `invalid_reason` for (c), never by the bare exit code alone.
   * `75` — neutral "nothing to compare safely", never a sign of a code
            problem, in THREE distinct shapes:
              - `INCOMPLETE`: fewer than all four legs produced an `OK`
@@ -202,11 +267,22 @@ LEG_ORDER = ("a1", "b1", "b2", "a2")
 ROLE_OF_LEG = {"a1": "a", "b1": "b", "b2": "b", "a2": "a"}
 ADJACENT_PAIRS = (("a1", "b1"), ("b2", "a2"))
 
-# NOT PRE-REGISTERED (D6) — see this module's own "ADVISORY classification"
-# doc section above. A ratio inside this half-open-on-neither-side interval
-# classifies `advisory=pass`; outside it, `advisory=fail`. Neither outcome
-# ever changes this module's exit code in v1.
-PLACEHOLDER_ADVISORY_BAND = (0.90, 1.10)
+# PRE-REGISTERED (D6, issue #335 final unit) — see this module's own
+# "ADVISORY classification" doc section above for the full derivation,
+# restated verbatim from `ci/artifacts/gpu-perf-aa-null/README.md`'s own
+# "Band derivation" section. A ratio inside this closed interval classifies
+# `advisory="within_band"`; outside it, `advisory="outside_band"`. Neither
+# outcome changes this module's exit code UNLESS `enforce` is set (see
+# `load_enforce`/[`build_report`]'s own enforcement-flip doc above).
+PRE_REGISTERED_ADVISORY_BAND = (0.75, 1.33)
+
+# The committed evidence this band is derived from — cited verbatim on the
+# merged report's own `advisory.band_derivation` field and printed on the
+# GREEN table row, so a reader never has to trust the band's two numbers on
+# prose alone.
+BAND_DERIVATION_ARTIFACT_PATH = (
+    "ci/artifacts/gpu-perf-aa-null/ (4 primary runs, 2 pods, both A100 device models, 2026-08-30)"
+)
 
 
 def load_leg(raw_dir, name):
@@ -250,6 +326,28 @@ def load_mode(raw_dir):
     with open(path, encoding="utf-8") as fh:
         value = fh.read().strip()
     return value if value in ("ab", "aa-null", "dry-run") else None
+
+
+def load_enforce(raw_dir):
+    """Read the `enforce` marker (issue #335's final unit, the enforcement
+    flip) the producer writes into `raw_dir` before any leg runs — the SAME
+    file-based state-passing convention [`load_mode`] already uses, never an
+    env var read directly by this module. `True` only when the file exists
+    AND its stripped content is exactly `"1"`; ANY other content, or an
+    ABSENT file (an older producer that predates this flip, or a
+    hand-crafted fixture that never calls the equivalent of
+    `gpu_inference_ab.sh`'s own `printf '1' > "$RAW_DIR/enforce"`), reads
+    `False` — the SAFE default (v1's own recording-only posture): a
+    missing/garbled marker must never accidentally start gating a run that
+    never opted in. [`build_report`] consults this ONLY once a report's
+    `status` is already confirmed `"GREEN"` — enforcement never overrides a
+    correctness refusal (see this module's own "Enforcement flip" doc).
+    """
+    path = os.path.join(raw_dir, "enforce")
+    if not os.path.isfile(path):
+        return False
+    with open(path, encoding="utf-8") as fh:
+        return fh.read().strip() == "1"
 
 
 def load_leg_started_at(raw_dir, name):
@@ -423,18 +521,18 @@ def combined_embed_p50_ratio(legs):
 
 
 def classify_advisory(ratio):
-    """`"within_placeholder_band"` when `ratio` falls inside
-    [`PLACEHOLDER_ADVISORY_BAND`], `"outside_placeholder_band"` otherwise —
-    NEVER gates (see this module's own doc); purely a printed/recorded
-    classification. Deliberately NOT spelled `"pass"`/`"fail"` (round-1
-    adversarial audit advisory): those words read as a GATE verdict to a
-    human skimming the table, which this v1 recording-only instrument is
-    not — `"outside_placeholder_band"` states the FACT (the ratio fell
-    outside a band that is not even pre-registered yet) without implying
-    anything failed.
+    """`"within_band"` when `ratio` falls inside
+    [`PRE_REGISTERED_ADVISORY_BAND`], `"outside_band"` otherwise. Deliberately
+    NOT spelled `"pass"`/`"fail"` (round-1 adversarial audit advisory): those
+    words read as a GATE verdict to a human skimming the table — this
+    classification ALONE still never gates: it states the FACT the ratio
+    fell outside the pre-registered band, without implying anything was
+    refused. Whether that fact ALSO refuses the run is decided entirely by
+    `enforce_verdict` in [`build_report`] (the enforcement flip), a separate
+    field this function knows nothing about.
     """
-    lo, hi = PLACEHOLDER_ADVISORY_BAND
-    return "within_placeholder_band" if lo <= ratio <= hi else "outside_placeholder_band"
+    lo, hi = PRE_REGISTERED_ADVISORY_BAND
+    return "within_band" if lo <= ratio <= hi else "outside_band"
 
 
 def lane_measurements(tier, lane):
@@ -463,11 +561,19 @@ def build_report(raw_dir, a_sha=None, b_sha=None):
     `build_sha` matches its clone's `HEAD`, and that the two differ — see
     `gpu_inference_ab.sh`'s own header) — recorded on the merged report,
     never re-derived here.
+
+    Whether this run is ENFORCING (issue #335's final unit) is read from
+    `raw_dir`'s own `enforce` marker ([`load_enforce`]), the SAME
+    file-based convention `mode` already uses — never a second parameter
+    here, so every existing caller (this module's own `main`,
+    `gpu_inference_ab.sh`) keeps working unchanged the moment the producer
+    starts writing that file.
     """
     legs_raw = {name: load_leg(raw_dir, name) for name in LEG_ORDER}
     ok_legs = {name: entry for name, entry in legs_raw.items() if entry["outcome"] == "OK"}
     started_at_by_leg = {name: load_leg_started_at(raw_dir, name) for name in LEG_ORDER}
     mode = load_mode(raw_dir)
+    enforce = load_enforce(raw_dir)
 
     legs_out = {name: {"outcome": entry["outcome"]} for name, entry in legs_raw.items()}
     tiers = {}
@@ -508,6 +614,13 @@ def build_report(raw_dir, a_sha=None, b_sha=None):
         # timestamps AND, honestly, why one was unavailable when it was,
         # not just this module's own verdict about them.
         "mode": mode,
+        # issue #335's final unit: recorded on EVERY report regardless of
+        # status (mirrors `mode`'s own unconditional placement) -- an
+        # auditor reading a refused (INVALID/INCOMPLETE/...) report can see
+        # whether enforcement was even requested for this run, even though
+        # (per this module's own "Enforcement flip" doc) the marker's value
+        # never changes the outcome on any non-GREEN status.
+        "enforce": enforce,
         "recorded_order": {
             name: {"value": value, "unavailable_reason": reason}
             for name, (value, reason) in started_at_by_leg.items()
@@ -643,11 +756,36 @@ def build_report(raw_dir, a_sha=None, b_sha=None):
     base["combined_embed_p50_ratio"] = ratio
     base["adjacent_pair_ratios"] = {f"{a}/{b}": r for (a, b), r in zip(ADJACENT_PAIRS, pair_ratios)}
     base["advisory"] = {
-        "band_not_pre_registered": True,
-        "band": list(PLACEHOLDER_ADVISORY_BAND),
+        "band_not_pre_registered": False,
+        "band": list(PRE_REGISTERED_ADVISORY_BAND),
+        "band_derivation": BAND_DERIVATION_ARTIFACT_PATH,
         "classification": advisory,
     }
-    return base, 0
+
+    # issue #335's final unit: the ONE place `enforce` is ever consulted —
+    # only reached once `status` is already confirmed "GREEN" above, so
+    # enforcement can never override a correctness refusal (see this
+    # module's own "Enforcement flip" doc). `status` itself is NEVER
+    # changed by this branch (it stays "GREEN" -- the premises really did
+    # agree) -- the enforcement verdict lives entirely on its own
+    # `enforce_verdict`/`perf_regression_reason` fields, deliberately never
+    # folded into `status`, so a report reader can always distinguish a
+    # correctness refusal from a perf-magnitude one without parsing prose.
+    if not enforce:
+        base["enforce_verdict"] = "NOT_ENFORCED"
+        return base, 0
+    if advisory == "within_band":
+        base["enforce_verdict"] = "PASS"
+        return base, 0
+    base["enforce_verdict"] = "PERF_REGRESSION"
+    base["perf_regression_reason"] = (
+        f"ENFORCING mode (GPU_INFERENCE_AB_ENFORCE=1): the four legs' premises are GREEN, but "
+        f"combined_embed_p50_ratio={ratio:.6f} falls OUTSIDE the pre-registered advisory band "
+        f"{list(PRE_REGISTERED_ADVISORY_BAND)} (derived from {BAND_DERIVATION_ARTIFACT_PATH}) -- a real "
+        f"perf-magnitude regression on the embed p50 endpoint, refused separately from every "
+        f"correctness-refusal reason above; status stays GREEN because the premises themselves were fine"
+    )
+    return base, 1
 
 
 def render_table(merged):
@@ -666,16 +804,23 @@ def render_table(merged):
         # it actually certifies (the four legs' PREMISES agree) and what it
         # explicitly does NOT (anything about the measured ratio's own
         # magnitude, which is recorded below regardless of its value).
-        lines.append("premises=GREEN (validity only -- not a perf verdict; v1 is recording-only)")
+        lines.append("premises=GREEN (validity only -- a separate enforce_verdict line below states the perf verdict)")
         lines.append(f"combined_embed_p50_ratio={merged['combined_embed_p50_ratio']:.6f} (b/a, PR/parent)")
         for pair_label, r in merged["adjacent_pair_ratios"].items():
             lines.append(f"  pair {pair_label}: ratio={r:.6f}")
         adv = merged["advisory"]
         lines.append(
             f"advisory={adv['classification']} band={adv['band']} "
-            f"(NOT PRE-REGISTERED — placeholder until the --aa-null A/A artifact lands; "
-            f"observability only, never a gate verdict)"
+            f"(PRE-REGISTERED — derived from {adv['band_derivation']}, see that directory's own README.md)"
         )
+        enforce_verdict = merged.get("enforce_verdict")
+        if enforce_verdict == "NOT_ENFORCED":
+            lines.append("enforce_verdict=NOT_ENFORCED (recording-only; set GPU_INFERENCE_AB_ENFORCE=1 to gate on the band above)")
+        elif enforce_verdict == "PASS":
+            lines.append("enforce_verdict=PASS (enforcing mode; ratio landed inside the pre-registered band)")
+        elif enforce_verdict == "PERF_REGRESSION":
+            lines.append("enforce_verdict=PERF_REGRESSION (enforcing mode; a real perf-magnitude refusal, exit 1)")
+            lines.append(f"perf_regression_reason={merged['perf_regression_reason']}")
     elif merged["status"] == "INVALID":
         # round-2 adversarial audit F5 (round-3 adversarial audit B2/B3
         # refinement): the b-role-FAIL-in-confirmed-ab-mode and genuine

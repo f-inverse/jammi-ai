@@ -1,0 +1,312 @@
+{
+  "schema_version": 1,
+  "a_sha": "6980b8301b1bd104fbed2804af14115f2c0f3f2f",
+  "b_sha": "6980b8301b1bd104fbed2804af14115f2c0f3f2f",
+  "producer": {
+    "path": "ci/scripts/perf/gpu_inference_ab.sh",
+    "kind": "script",
+    "invocation": "ci/scripts/perf/gpu_inference_ab.sh",
+    "gating": "none"
+  },
+  "primary_endpoint": "embed.p50_ms ratio (b / a), mean of the two A,B,B,A adjacent-pair ratios",
+  "identity_fields": [
+    "corpus_seed",
+    "row_count",
+    "warmup",
+    "iters",
+    "corpus_sha256",
+    "compute_precision",
+    "embed_checkpoint_config_sha256",
+    "embed_checkpoint_weights_sha256",
+    "embed_checkpoint_tokenizer_sha256",
+    "infer_checkpoint_config_sha256",
+    "infer_checkpoint_weights_sha256",
+    "infer_checkpoint_tokenizer_sha256"
+  ],
+  "leg_order": [
+    "a1",
+    "b1",
+    "b2",
+    "a2"
+  ],
+  "legs": {
+    "a1": {
+      "outcome": "OK",
+      "identity": {
+        "corpus_seed": 0,
+        "row_count": 256,
+        "warmup": 2,
+        "iters": 20,
+        "corpus_sha256": "f049aeac4e541c2eb5874c08b104f59dd42920d7db51ec303d36ebf1abd6c0ee",
+        "compute_precision": "f32",
+        "embed_checkpoint_config_sha256": "e24733455956ab8d84ce74c77b1b6327325a8127090f9b1a76d3265927dbbfdc",
+        "embed_checkpoint_weights_sha256": "f108a730c5be905e38ff73e7cb6670694a3ee3393dee12d1c1511cdbccdb2919",
+        "embed_checkpoint_tokenizer_sha256": "c8200a17f2b3fd7321316769a221a770495ac8a6d6206bf3d803870ad354e5e3",
+        "infer_checkpoint_config_sha256": "31c5a73bcc024d9d57726e0ef8ee4293d74480bd07357d59560cc5627a4bfe47",
+        "infer_checkpoint_weights_sha256": "d85457204324f1daa060e59413e65f645663dca902c5af943899c3651df22761",
+        "infer_checkpoint_tokenizer_sha256": "c8200a17f2b3fd7321316769a221a770495ac8a6d6206bf3d803870ad354e5e3"
+      },
+      "provenance": {
+        "device_name": "NVIDIA A100 80GB PCIe",
+        "kernels_disabled_requested": [],
+        "flash_compiled": false,
+        "build_features": [
+          "bench-cuda",
+          "cuda"
+        ],
+        "build_sha": "6980b8301b1bd104fbed2804af14115f2c0f3f2f"
+      },
+      "measurements": {
+        "embed": {
+          "rows": 256,
+          "rows_per_s": {
+            "value": 7281.782748808135,
+            "unit": "rows_per_s"
+          },
+          "p50_ms": {
+            "value": 35.156226,
+            "unit": "ms"
+          },
+          "p99_ms": {
+            "value": 40.385554,
+            "unit": "ms"
+          },
+          "deterministic": true
+        },
+        "infer": {
+          "rows": 256,
+          "rows_per_s": {
+            "value": 9716.119653558091,
+            "unit": "rows_per_s"
+          },
+          "p50_ms": {
+            "value": 26.347967,
+            "unit": "ms"
+          },
+          "p99_ms": {
+            "value": 35.534199,
+            "unit": "ms"
+          },
+          "deterministic": true
+        }
+      }
+    },
+    "b1": {
+      "outcome": "OK",
+      "identity": {
+        "corpus_seed": 0,
+        "row_count": 256,
+        "warmup": 2,
+        "iters": 20,
+        "corpus_sha256": "f049aeac4e541c2eb5874c08b104f59dd42920d7db51ec303d36ebf1abd6c0ee",
+        "compute_precision": "f32",
+        "embed_checkpoint_config_sha256": "e24733455956ab8d84ce74c77b1b6327325a8127090f9b1a76d3265927dbbfdc",
+        "embed_checkpoint_weights_sha256": "f108a730c5be905e38ff73e7cb6670694a3ee3393dee12d1c1511cdbccdb2919",
+        "embed_checkpoint_tokenizer_sha256": "c8200a17f2b3fd7321316769a221a770495ac8a6d6206bf3d803870ad354e5e3",
+        "infer_checkpoint_config_sha256": "31c5a73bcc024d9d57726e0ef8ee4293d74480bd07357d59560cc5627a4bfe47",
+        "infer_checkpoint_weights_sha256": "d85457204324f1daa060e59413e65f645663dca902c5af943899c3651df22761",
+        "infer_checkpoint_tokenizer_sha256": "c8200a17f2b3fd7321316769a221a770495ac8a6d6206bf3d803870ad354e5e3"
+      },
+      "provenance": {
+        "device_name": "NVIDIA A100 80GB PCIe",
+        "kernels_disabled_requested": [],
+        "flash_compiled": false,
+        "build_features": [
+          "bench-cuda",
+          "cuda"
+        ],
+        "build_sha": "6980b8301b1bd104fbed2804af14115f2c0f3f2f"
+      },
+      "measurements": {
+        "embed": {
+          "rows": 256,
+          "rows_per_s": {
+            "value": 7017.729883355187,
+            "unit": "rows_per_s"
+          },
+          "p50_ms": {
+            "value": 36.479033,
+            "unit": "ms"
+          },
+          "p99_ms": {
+            "value": 53.593911,
+            "unit": "ms"
+          },
+          "deterministic": true
+        },
+        "infer": {
+          "rows": 256,
+          "rows_per_s": {
+            "value": 9818.002235206275,
+            "unit": "rows_per_s"
+          },
+          "p50_ms": {
+            "value": 26.074551,
+            "unit": "ms"
+          },
+          "p99_ms": {
+            "value": 31.992520000000003,
+            "unit": "ms"
+          },
+          "deterministic": true
+        }
+      }
+    },
+    "b2": {
+      "outcome": "OK",
+      "identity": {
+        "corpus_seed": 0,
+        "row_count": 256,
+        "warmup": 2,
+        "iters": 20,
+        "corpus_sha256": "f049aeac4e541c2eb5874c08b104f59dd42920d7db51ec303d36ebf1abd6c0ee",
+        "compute_precision": "f32",
+        "embed_checkpoint_config_sha256": "e24733455956ab8d84ce74c77b1b6327325a8127090f9b1a76d3265927dbbfdc",
+        "embed_checkpoint_weights_sha256": "f108a730c5be905e38ff73e7cb6670694a3ee3393dee12d1c1511cdbccdb2919",
+        "embed_checkpoint_tokenizer_sha256": "c8200a17f2b3fd7321316769a221a770495ac8a6d6206bf3d803870ad354e5e3",
+        "infer_checkpoint_config_sha256": "31c5a73bcc024d9d57726e0ef8ee4293d74480bd07357d59560cc5627a4bfe47",
+        "infer_checkpoint_weights_sha256": "d85457204324f1daa060e59413e65f645663dca902c5af943899c3651df22761",
+        "infer_checkpoint_tokenizer_sha256": "c8200a17f2b3fd7321316769a221a770495ac8a6d6206bf3d803870ad354e5e3"
+      },
+      "provenance": {
+        "device_name": "NVIDIA A100 80GB PCIe",
+        "kernels_disabled_requested": [],
+        "flash_compiled": false,
+        "build_features": [
+          "bench-cuda",
+          "cuda"
+        ],
+        "build_sha": "6980b8301b1bd104fbed2804af14115f2c0f3f2f"
+      },
+      "measurements": {
+        "embed": {
+          "rows": 256,
+          "rows_per_s": {
+            "value": 6715.2247365376015,
+            "unit": "rows_per_s"
+          },
+          "p50_ms": {
+            "value": 38.122327999999996,
+            "unit": "ms"
+          },
+          "p99_ms": {
+            "value": 49.542449000000005,
+            "unit": "ms"
+          },
+          "deterministic": true
+        },
+        "infer": {
+          "rows": 256,
+          "rows_per_s": {
+            "value": 9473.178416029063,
+            "unit": "rows_per_s"
+          },
+          "p50_ms": {
+            "value": 27.023664999999998,
+            "unit": "ms"
+          },
+          "p99_ms": {
+            "value": 35.160464000000005,
+            "unit": "ms"
+          },
+          "deterministic": true
+        }
+      }
+    },
+    "a2": {
+      "outcome": "OK",
+      "identity": {
+        "corpus_seed": 0,
+        "row_count": 256,
+        "warmup": 2,
+        "iters": 20,
+        "corpus_sha256": "f049aeac4e541c2eb5874c08b104f59dd42920d7db51ec303d36ebf1abd6c0ee",
+        "compute_precision": "f32",
+        "embed_checkpoint_config_sha256": "e24733455956ab8d84ce74c77b1b6327325a8127090f9b1a76d3265927dbbfdc",
+        "embed_checkpoint_weights_sha256": "f108a730c5be905e38ff73e7cb6670694a3ee3393dee12d1c1511cdbccdb2919",
+        "embed_checkpoint_tokenizer_sha256": "c8200a17f2b3fd7321316769a221a770495ac8a6d6206bf3d803870ad354e5e3",
+        "infer_checkpoint_config_sha256": "31c5a73bcc024d9d57726e0ef8ee4293d74480bd07357d59560cc5627a4bfe47",
+        "infer_checkpoint_weights_sha256": "d85457204324f1daa060e59413e65f645663dca902c5af943899c3651df22761",
+        "infer_checkpoint_tokenizer_sha256": "c8200a17f2b3fd7321316769a221a770495ac8a6d6206bf3d803870ad354e5e3"
+      },
+      "provenance": {
+        "device_name": "NVIDIA A100 80GB PCIe",
+        "kernels_disabled_requested": [],
+        "flash_compiled": false,
+        "build_features": [
+          "bench-cuda",
+          "cuda"
+        ],
+        "build_sha": "6980b8301b1bd104fbed2804af14115f2c0f3f2f"
+      },
+      "measurements": {
+        "embed": {
+          "rows": 256,
+          "rows_per_s": {
+            "value": 7121.863740552508,
+            "unit": "rows_per_s"
+          },
+          "p50_ms": {
+            "value": 35.945646999999994,
+            "unit": "ms"
+          },
+          "p99_ms": {
+            "value": 46.356761000000006,
+            "unit": "ms"
+          },
+          "deterministic": true
+        },
+        "infer": {
+          "rows": 256,
+          "rows_per_s": {
+            "value": 8884.985048583168,
+            "unit": "rows_per_s"
+          },
+          "p50_ms": {
+            "value": 28.812654,
+            "unit": "ms"
+          },
+          "p99_ms": {
+            "value": 34.623739,
+            "unit": "ms"
+          },
+          "deterministic": true
+        }
+      }
+    }
+  },
+  "mode": "aa-null",
+  "recorded_order": {
+    "a1": {
+      "value": 1788098697950373371,
+      "unavailable_reason": null
+    },
+    "b1": {
+      "value": 1788098710772285651,
+      "unavailable_reason": null
+    },
+    "b2": {
+      "value": 1788098713813852522,
+      "unavailable_reason": null
+    },
+    "a2": {
+      "value": 1788098716741380780,
+      "unavailable_reason": null
+    }
+  },
+  "status": "GREEN",
+  "leg_premise_violations": [],
+  "combined_embed_p50_ratio": 1.0490906614868207,
+  "adjacent_pair_ratios": {
+    "a1/b1": 1.037626535908604,
+    "b2/a2": 1.0605547870650374
+  },
+  "advisory": {
+    "band_not_pre_registered": true,
+    "band": [
+      0.9,
+      1.1
+    ],
+    "classification": "within_placeholder_band"
+  }
+}

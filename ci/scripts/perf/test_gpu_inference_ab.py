@@ -79,6 +79,19 @@ def write_mode(raw_dir, mode):
         fh.write(mode)
 
 
+def write_enforce(raw_dir, value="1"):
+    """Writes the `enforce` marker (issue #335's final unit, the
+    enforcement flip) the REAL producer writes into `raw_dir` before any leg
+    runs — the SAME file-based state-passing convention [`write_mode`]
+    already exercises. A test that wants ENFORCING mode calls this
+    EXPLICITLY (any call site that never mentions it stays non-enforcing,
+    [`gpu_inference_ab.load_enforce`]'s own safe default for an absent
+    file).
+    """
+    with open(os.path.join(raw_dir, "enforce"), "w", encoding="utf-8") as fh:
+        fh.write(value)
+
+
 def write_leg(raw_dir, name, tier=None, exit_code="0", build_sha=None, started_at=None):
     """Writes the SAME `.exit`/`.json`/`.started_at` file triple
     `gpu_inference_ab.sh`'s own `run_leg` writes (round-2 adversarial audit
@@ -138,7 +151,8 @@ class BuildReportGreenPathTests(unittest.TestCase):
         """An A/A-shaped fixture (every leg measures the SAME embed p50 —
         the shape `--aa-null` produces when nothing regressed) must merge
         GREEN with `combined_embed_p50_ratio` ~= 1.0 and
-        `advisory=within_placeholder_band`.
+        `advisory=within_band`. Non-enforcing (the default, no `enforce`
+        marker written) — `enforce_verdict` reads `NOT_ENFORCED`.
         """
         with tempfile.TemporaryDirectory() as raw_dir:
             write_all_ok_legs(
@@ -150,31 +164,37 @@ class BuildReportGreenPathTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(merged["status"], "GREEN")
         self.assertAlmostEqual(merged["combined_embed_p50_ratio"], 1.0, places=9)
-        self.assertEqual(merged["advisory"]["classification"], "within_placeholder_band")
-        self.assertTrue(merged["advisory"]["band_not_pre_registered"])
+        self.assertEqual(merged["advisory"]["classification"], "within_band")
+        self.assertFalse(merged["advisory"]["band_not_pre_registered"])
+        self.assertIn("ci/artifacts/gpu-perf-aa-null/", merged["advisory"]["band_derivation"])
+        self.assertEqual(merged["enforce_verdict"], "NOT_ENFORCED")
+        self.assertFalse(merged["enforce"])
 
-    def test_degraded_fixture_is_advisory_outside_band_but_still_exits_0(self):
+    def test_degraded_fixture_is_advisory_outside_band_but_still_exits_0_non_enforcing(self):
         """A leg set where the `b`-role legs are genuinely slower (a real
-        regression shape) classifies `advisory=outside_placeholder_band` in
-        the printed row — but v1 is recording-only, so the exit code stays
-        0 (GREEN): a premise-clean run with an unfavorable ratio is never
-        itself a refusal. `classify_advisory` deliberately never returns
-        "pass"/"fail" (round-1 adversarial audit advisory: those words read
-        as a gate verdict, which this v1 instrument is not).
+        regression shape) classifies `advisory=outside_band` in the printed
+        row — but NON-enforcing mode (no `enforce` marker written, the
+        default) is still recording-only, so the exit code stays 0 (GREEN):
+        a premise-clean run with an unfavorable ratio is never itself a
+        refusal unless enforcement was explicitly opted into (see
+        `EnforceModeTests` below). `classify_advisory` deliberately never
+        returns "pass"/"fail" (round-1 adversarial audit advisory: those
+        words read as a gate verdict).
         """
         with tempfile.TemporaryDirectory() as raw_dir:
             # b/a ratio = 16/8 = 2.0 for both pairs -- well outside the
-            # placeholder [0.90, 1.10] band.
+            # pre-registered [0.75, 1.33] band.
             write_all_ok_legs(
                 raw_dir,
                 {"a1": 8.0, "b1": 16.0, "b2": 16.0, "a2": 8.0},
             )
             merged, exit_code = gpu_inference_ab.build_report(raw_dir)
 
-        self.assertEqual(exit_code, 0, "a degraded ratio must never itself fail the merge (v1 recording-only)")
+        self.assertEqual(exit_code, 0, "a degraded ratio must never fail a non-enforcing merge")
         self.assertEqual(merged["status"], "GREEN")
         self.assertAlmostEqual(merged["combined_embed_p50_ratio"], 2.0, places=9)
-        self.assertEqual(merged["advisory"]["classification"], "outside_placeholder_band")
+        self.assertEqual(merged["advisory"]["classification"], "outside_band")
+        self.assertEqual(merged["enforce_verdict"], "NOT_ENFORCED")
 
     def test_adjacent_pair_ratios_are_computed_in_b_over_a_orientation_regardless_of_leg_name(self):
         """`adjacent_pair_ratio` must read `b/a` for BOTH pairs even though
@@ -198,6 +218,126 @@ class BuildReportGreenPathTests(unittest.TestCase):
             ((12.0 / 10.0) + (9.0 / 10.0)) / 2.0,
             places=9,
         )
+
+
+class EnforceModeTests(unittest.TestCase):
+    """issue #335's final unit — the enforcement flip. `GPU_INFERENCE_AB_ENFORCE`
+    is read off the `enforce` marker file the producer writes into `raw_dir`
+    ([`write_enforce`] here, [`gpu_inference_ab.load_enforce`] in
+    production) — never a direct env var read by `gpu_inference_ab.py`
+    itself. Every case here is GREEN-premise (a clean identity/order leg
+    set); [`test_enforce_does_not_override_a_correctness_refusal`] below is
+    the one case that proves enforcement is inert on a non-GREEN status.
+    """
+
+    def test_enforce_outside_band_green_premises_exits_1_named_perf_regression_verdict(self):
+        """RED-first case: ENFORCING mode, ratio OUTSIDE the pre-registered
+        band, premises GREEN -- must exit 1 with `enforce_verdict ==
+        "PERF_REGRESSION"`, `status` STAYING `"GREEN"` (the premises really
+        did agree; this is not a correctness refusal), and a
+        `perf_regression_reason` distinct in content from every
+        correctness-refusal reason (`invalid_reason`/
+        `invalid_measurement_reason`/`incomplete_*_reason`) this module
+        writes elsewhere.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_enforce(raw_dir, "1")
+            # b/a ratio = 16/8 = 2.0 for both pairs -- well outside [0.75, 1.33].
+            write_all_ok_legs(
+                raw_dir,
+                {"a1": 8.0, "b1": 16.0, "b2": 16.0, "a2": 8.0},
+            )
+            merged, exit_code = gpu_inference_ab.build_report(raw_dir)
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(merged["status"], "GREEN", "a perf-magnitude refusal must never masquerade as a correctness one")
+        self.assertTrue(merged["enforce"])
+        self.assertEqual(merged["enforce_verdict"], "PERF_REGRESSION")
+        self.assertEqual(merged["advisory"]["classification"], "outside_band")
+        self.assertIn("perf_regression_reason", merged)
+        self.assertIn("perf-magnitude regression", merged["perf_regression_reason"])
+        self.assertNotIn("invalid_reason", merged)
+        self.assertNotIn("invalid_measurement_reason", merged)
+
+    def test_enforce_inside_band_exits_0(self):
+        """ENFORCING mode, ratio INSIDE the pre-registered band -- must exit
+        0 with `enforce_verdict == "PASS"`.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_enforce(raw_dir, "1")
+            write_all_ok_legs(
+                raw_dir,
+                {"a1": 8.0, "b1": 8.0, "b2": 8.0, "a2": 8.0},
+            )
+            merged, exit_code = gpu_inference_ab.build_report(raw_dir)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(merged["status"], "GREEN")
+        self.assertEqual(merged["advisory"]["classification"], "within_band")
+        self.assertEqual(merged["enforce_verdict"], "PASS")
+        self.assertNotIn("perf_regression_reason", merged)
+
+    def test_non_enforce_outside_band_exits_0_advisory_only(self):
+        """NON-enforcing mode (the `enforce` marker written but set to
+        `"0"`) with a ratio OUTSIDE the band must still exit 0 -- a
+        regression is recorded/pinned in the advisory column, never
+        refused, unless enforcement was explicitly opted into.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_enforce(raw_dir, "0")
+            write_all_ok_legs(
+                raw_dir,
+                {"a1": 8.0, "b1": 16.0, "b2": 16.0, "a2": 8.0},
+            )
+            merged, exit_code = gpu_inference_ab.build_report(raw_dir)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(merged["status"], "GREEN")
+        self.assertEqual(merged["advisory"]["classification"], "outside_band")
+        self.assertEqual(merged["enforce_verdict"], "NOT_ENFORCED")
+        self.assertFalse(merged["enforce"])
+
+    def test_enforce_does_not_override_a_correctness_refusal(self):
+        """ENFORCING mode set on a run whose premises are NOT clean (an
+        identity mismatch) -- must stay INVALID/1 with its OWN reason,
+        completely unaffected by the `enforce` marker: enforcement is only
+        ever consulted once `status` is already confirmed GREEN.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_enforce(raw_dir, "1")
+            write_leg(raw_dir, "a1", gpu_inference_tier(embed_p50_ms=8.0))
+            write_leg(raw_dir, "b1", gpu_inference_tier(embed_p50_ms=8.0, compute_precision="bf16"))
+            write_leg(raw_dir, "b2", gpu_inference_tier(embed_p50_ms=8.0))
+            write_leg(raw_dir, "a2", gpu_inference_tier(embed_p50_ms=8.0))
+
+            merged, exit_code = gpu_inference_ab.build_report(raw_dir)
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(merged["status"], "INVALID")
+        self.assertTrue(merged["leg_premise_violations"])
+        self.assertTrue(any("compute_precision" in v for v in merged["leg_premise_violations"]))
+        self.assertTrue(merged["enforce"], "the marker was still written/read -- it simply never got consulted")
+        self.assertNotIn("enforce_verdict", merged)
+        self.assertNotIn("perf_regression_reason", merged)
+
+    def test_load_enforce_defaults_false_when_marker_file_is_absent(self):
+        """[`gpu_inference_ab.load_enforce`] driven directly: an absent
+        `enforce` file (an older producer, or a hand-crafted fixture that
+        never calls [`write_enforce`]) reads `False` -- the SAFE default, a
+        run never starts gating just because nothing said otherwise.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self.assertFalse(gpu_inference_ab.load_enforce(raw_dir))
+
+    def test_load_enforce_ignores_garbled_content(self):
+        """Any content other than the exact string `"1"` reads `False` --
+        never a truthy-string heuristic (`"true"`, `"yes"`) that could
+        silently start gating on an unexpected value.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            with open(os.path.join(raw_dir, "enforce"), "w", encoding="utf-8") as fh:
+                fh.write("true")
+            self.assertFalse(gpu_inference_ab.load_enforce(raw_dir))
 
 
 class IdentityMismatchTests(unittest.TestCase):
@@ -480,7 +620,9 @@ class MainEntryPointTests(unittest.TestCase):
             with open(table_path, encoding="utf-8") as fh:
                 table = fh.read()
             self.assertIn("status=GREEN", table)
-            self.assertIn("NOT PRE-REGISTERED", table)
+            self.assertIn("PRE-REGISTERED", table)
+            self.assertNotIn("NOT PRE-REGISTERED", table)
+            self.assertIn("enforce_verdict=NOT_ENFORCED", table)
 
     def test_main_usage_error_on_too_few_args(self):
         rc = gpu_inference_ab.main(["only-one-arg"])

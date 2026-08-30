@@ -95,6 +95,33 @@ class DryRunSmokeTests(unittest.TestCase):
             self.assertEqual(sorted(report["missing_legs"]), ["a1", "a2", "b1", "b2"])
             self.assertEqual(report["mode"], "dry-run")
             self.assertIn("nothing ran", report["incomplete_reason"])
+            # issue #335's final unit: GPU_INFERENCE_AB_ENFORCE defaults
+            # unset/0 -- the producer must still write a well-formed
+            # "enforce" marker (round-trip through the real
+            # gpu_inference_ab.py::load_enforce, not re-implemented here).
+            self.assertEqual(report["enforce"], False)
+            self.assertTrue(os.path.isfile(os.path.join(out_dir, "raw", "enforce")))
+
+    def test_dry_run_with_enforce_env_writes_a_true_enforce_marker(self):
+        """`GPU_INFERENCE_AB_ENFORCE=1` must round-trip through the real
+        producer-to-comparator boundary: the shell script writes
+        `$RAW_DIR/enforce` containing `"1"`, and `gpu_inference_ab.py`'s own
+        `load_enforce` (never re-implemented here) reads it back `True` --
+        even on a dry run, whose four MISSING legs keep this INCOMPLETE/75
+        regardless (enforcement is only ever consulted on a GREEN status).
+        """
+        with tempfile.TemporaryDirectory() as out_dir, tempfile.TemporaryDirectory() as work_dir:
+            result = run_dry(out_dir, work_dir, extra_env={"GPU_INFERENCE_AB_ENFORCE": "1"})
+            self.assertEqual(result.returncode, 75, f"stdout={result.stdout}\nstderr={result.stderr}")
+
+            raw_dir = os.path.join(out_dir, "raw")
+            self.assertTrue(gpu_inference_ab.load_enforce(raw_dir))
+
+            report_path = os.path.join(out_dir, "gpu_inference_ab_report.json")
+            with open(report_path, encoding="utf-8") as fh:
+                report = json.load(fh)
+            self.assertEqual(report["enforce"], True)
+            self.assertEqual(report["status"], "INCOMPLETE", "enforcement never fires on a non-GREEN status")
 
     def test_dry_run_never_creates_a_real_cargo_target_dir(self):
         """The strongest available proof this run touched no real build:

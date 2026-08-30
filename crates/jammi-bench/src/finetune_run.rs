@@ -576,12 +576,27 @@ fn build_encoder_adapters(
     // matches nothing on `bert`'s or `distilbert`'s
     // `query`/`key`/`value`/`dense`-style naming.
     if encoder.trainable_params().is_empty() {
+        // Phase-4 audit follow-up: TWO producers can land here —
+        // `target_modules` matching no linear at all, or a `layers_to_transform`
+        // restriction excluding every layer `target_modules` WOULD otherwise
+        // have matched (e.g. `Some([99])` on a fixture with fewer layers, or
+        // `Some([1])` when the matching selector only exists on layer 0). The
+        // message must name `layers_to_transform` whenever it is `Some` —
+        // never blame `target_modules`/"correct the selectors" alone on the
+        // exact N-twin path the profile contract mandates (one selector +
+        // `layers_to_transform: Some([0])`), where an off-by-one layer index
+        // is the likeliest operator error, not a bad selector string.
+        let restriction = match layers_to_transform {
+            Some(layers) => format!(" restricted to layers {layers:?}"),
+            None => String::new(),
+        };
         return Err(format!(
-            "finetune-run: target_modules {target_modules:?} yielded zero trainable LoRA \
-             tensors on model_type '{model_type}' — this training tier requires LoRA to \
-             actually train something. Correct the selectors for this architecture (the \
-             CLI's own default, 'Wqkv,Wo,Wi', is ModernBERT-only and matches nothing on \
-             bert/distilbert)"
+            "finetune-run: target_modules {target_modules:?}{restriction} yielded zero \
+             trainable LoRA tensors on model_type '{model_type}' — this training tier \
+             requires LoRA to actually train something. Correct the selectors for this \
+             architecture (the CLI's own default, 'Wqkv,Wo,Wi', is ModernBERT-only and \
+             matches nothing on bert/distilbert), or check layers_to_transform for an \
+             off-by-one layer index if it is set"
         )
         .into());
     }
@@ -1861,6 +1876,55 @@ mod tests {
         );
     }
 
+    /// Phase-4 audit follow-up: the zero-trainable refusal has TWO
+    /// producers — `target_modules` matching nothing, and a
+    /// `layers_to_transform` restriction excluding every site
+    /// `target_modules` would otherwise have matched (e.g. `Some([99])` on
+    /// a 2-layer fixture, or `Some([1])` when the matching selector only
+    /// exists on layer 0). This drives the SECOND producer — a real
+    /// selector (`q_lin`/`v_lin`, present on both layers) with
+    /// `layers_to_transform: Some([99])`, a layer index this 2-layer
+    /// fixture does not have — and asserts the refusal fires AND the
+    /// message NAMES `layers_to_transform` (including its value `[99]`),
+    /// not just `target_modules` (which, taken alone, would misdiagnose
+    /// this as a bad-selector problem).
+    #[test]
+    fn build_encoder_adapters_names_layers_to_transform_when_it_causes_the_zero_trainable_refusal()
+    {
+        let model_dir = write_synthetic_distilbert_model_dir(2);
+        let varmap = VarMap::new();
+        let result = build_encoder_adapters(
+            model_dir.path(),
+            "distilbert",
+            &["q_lin".to_string(), "v_lin".to_string()],
+            &Some(vec![99]),
+            2,
+            4.0,
+            0.0,
+            jammi_numerics::ComputePrecision::F32,
+            7,
+            &Device::Cpu,
+            &varmap,
+        );
+        let err = match result {
+            Ok(_) => panic!(
+                "layers_to_transform: Some([99]) on a 2-layer fixture must exclude every \
+                 site and refuse, not silently build a LoRA-free encoder"
+            ),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("layers_to_transform"),
+            "error must name layers_to_transform as a possible cause, not just \
+             target_modules: {msg}"
+        );
+        assert!(
+            msg.contains("99"),
+            "error must include the actual layers_to_transform value: {msg}"
+        );
+    }
+
     /// Negative control: a `model_type` this tier does not know must still
     /// error, and the error must honestly name every type this tier DOES
     /// support (currently three: `"bert"`, `"modernbert"`, `"distilbert"`) —
@@ -2133,6 +2197,60 @@ mod tests {
              is silently timing more than just training_loop.run()",
             tier.train_run_wall_s,
             outer_wall_s
+        );
+    }
+
+    /// Phase-4 audit follow-up ("unproven-as-emitted"): the committed
+    /// goldens predate `layers_to_transform`/`train_run_wall_s`, so nothing
+    /// previously bound the declared Rust consts
+    /// (`FinetuneRunTier::IDENTITY_FIELDS`'s `layers_to_transform` entry,
+    /// and `train_run_wall_s` itself) to the ACTUAL bytes a real run emits.
+    /// Runs the real CPU-fixture path (the same `run_impl` the smoke tests
+    /// drive), wraps the resulting [`crate::report::FinetuneRunTier`] in a
+    /// real [`crate::report::Report`], serializes THAT (not the bare tier),
+    /// and asserts at the `serde_json::Value` PATH level — never by reading
+    /// the Rust struct fields back — that `tiers.finetune_run` carries both
+    /// keys.
+    #[tokio::test]
+    async fn finetune_run_tier_json_actually_emits_layers_to_transform_and_train_run_wall_s() {
+        let work_dir = tempfile::tempdir().expect("tempdir");
+        let params = non_perturbation_test_params(work_dir.path().to_path_buf());
+        let (tier, _varmap) = tokio::task::spawn_blocking(move || run_impl(&params, true))
+            .await
+            .expect("join run_impl task")
+            .expect("finetune-run");
+
+        let report = crate::report::Report::new(
+            "finetune-run",
+            crate::report::Tiers {
+                finetune_run: Some(tier),
+                ..Default::default()
+            },
+        );
+        let value = serde_json::to_value(&report).expect("serialize Report for JSON-shape check");
+
+        let finetune_run_json = value
+            .get("tiers")
+            .and_then(|t| t.get("finetune_run"))
+            .expect("tiers.finetune_run must be present in the emitted JSON");
+
+        assert!(
+            finetune_run_json.get("layers_to_transform").is_some(),
+            "tiers.finetune_run.layers_to_transform must be a present key in the emitted \
+             JSON (Some(null) counts as present -- the KEY must exist, not merely the Rust \
+             field): {finetune_run_json}"
+        );
+        let wall_s = finetune_run_json
+            .get("train_run_wall_s")
+            .and_then(|v| v.as_f64())
+            .expect(
+                "tiers.finetune_run.train_run_wall_s must be a present JSON number key in the \
+                 emitted JSON",
+            );
+        assert!(
+            wall_s > 0.0,
+            "tiers.finetune_run.train_run_wall_s must carry a real, measured, nonzero value \
+             in the emitted JSON, got {wall_s}"
         );
     }
 

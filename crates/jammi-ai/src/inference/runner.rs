@@ -13,6 +13,7 @@ use super::observer::InferenceObserver;
 use super::schema::build_prefix_columns;
 use super::{extract_column, extract_columns, slice_columns};
 use crate::model::cache::ModelCache;
+use crate::model::oom::is_oom_message;
 use crate::model::{BackendType, ModelSource, ModelTask};
 
 /// Processes input RecordBatches through a model, handling batching and
@@ -240,19 +241,14 @@ impl InferenceRunner {
         Ok(())
     }
 
+    /// Only a genuine out-of-memory error gets the batch-halving retry — see
+    /// [`crate::model::oom`] for the shared spelling table and why this uses
+    /// the retry predicate [`is_oom_message`] (matches every table entry,
+    /// including the bare `oom` token) rather than the training classifier's
+    /// stricter, long-spellings-only predicate (#319's misroute risk, and
+    /// why a false positive here is bounded/self-correcting).
     fn is_oom_error(e: &JammiError) -> bool {
-        // Only a genuine out-of-memory error gets the batch-halving retry. A bare
-        // "cuda" substring is NOT OOM — it also matches kernel / loader failures
-        // such as `CUDA_ERROR_INVALID_PTX`, which halving the batch cannot fix
-        // and which must not be misrouted through the OOM path (#319). Match the
-        // OOM spellings across backends: `out of memory` (spaces), the CUDA
-        // `CUDA_ERROR_OUT_OF_MEMORY` (underscores), candle's `OutOfMemory`, and
-        // the bare `oom` token.
-        let msg = e.to_string().to_lowercase();
-        msg.contains("out of memory")
-            || msg.contains("out_of_memory")
-            || msg.contains("outofmemory")
-            || msg.contains("oom")
+        is_oom_message(&e.to_string().to_lowercase())
     }
 
     /// Build an output RecordBatch from a successful model forward pass.

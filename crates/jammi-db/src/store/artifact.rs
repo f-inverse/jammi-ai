@@ -61,6 +61,17 @@ const MANIFEST_NAME: &str = "manifest.json";
 /// attempt — and never collides with a published artifact prefix.
 const RESUME_SEGMENT: &str = "_resume";
 
+/// The nested segment under an attempt's own publish prefix that per-epoch
+/// checkpoints live under: `{job_id}/{worker_id}/{attempt}/checkpoints/epoch_{N}/`
+/// (unit 348, CONTRACT item 1 / K7). `N` is the 0-based loop epoch index. This
+/// is the ONE place the epoch-checkpoint key shape is spelled — both
+/// [`ArtifactStore::put_epoch_checkpoint`] (the trainer's write) and
+/// [`ArtifactStore::delete_epoch_checkpoint`] (any terminating path's GC sweep)
+/// build the prefix through it, so a GC sweep can never drift out of sync with
+/// where the writer actually publishes: reachability is a property of shared
+/// code, not of two call sites independently agreeing on a string shape.
+const CHECKPOINTS_SEGMENT: &str = "checkpoints";
+
 /// One file in an artifact bundle: its relative name (the candle loader joins
 /// this onto the fetched directory) and the sha256 of its bytes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -319,6 +330,52 @@ impl ArtifactStore {
         self.delete_artifact_prefix(&prefix).await
     }
 
+    /// Publish one epoch's full loadable adapter checkpoint under the
+    /// attempt-unique prefix `{job_id}/{worker_id}/{attempt}/checkpoints/
+    /// epoch_{epoch}/` (unit 348, K7) — the same manifest-last, no-overwrite
+    /// [`Self::put_artifact`] publish protocol every other bundle uses, with
+    /// the `checkpoints/epoch_{N}` segment appended. `epoch` is the 0-based
+    /// loop epoch index this checkpoint captures; a resumed attempt writes
+    /// its OWN `attempt` segment, so no cross-attempt overwrite is possible by
+    /// construction. `files` is the caller's full adapter bundle
+    /// (`adapter.safetensors` + `adapter_config.json`), never the weights-only
+    /// resume-bundle shape.
+    pub async fn put_epoch_checkpoint(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        attempt: &str,
+        epoch: usize,
+        files: &[(String, Bytes)],
+    ) -> Result<StorageUrl> {
+        let segment = epoch_segment(epoch);
+        self.put_artifact(
+            &[job_id, worker_id, attempt, CHECKPOINTS_SEGMENT, &segment],
+            files,
+        )
+        .await
+    }
+
+    /// Best-effort GC of ONE epoch-checkpoint prefix
+    /// (`{job_id}/{worker_id}/{attempt}/checkpoints/epoch_{epoch}/`), tolerant
+    /// of an epoch that was never actually written (no manifest — the same
+    /// no-op [`Self::delete_artifact_prefix`] already treats a never-completed
+    /// attempt as, not an error). This lets a caller derive and sweep a whole
+    /// `[0, epochs)` range without first knowing how far training actually
+    /// got: indices past the run's real progress are simply no-ops.
+    pub async fn delete_epoch_checkpoint(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        attempt: &str,
+        epoch: usize,
+    ) -> Result<()> {
+        let segment = epoch_segment(epoch);
+        let prefix =
+            self.prefix_url(&[job_id, worker_id, attempt, CHECKPOINTS_SEGMENT, &segment])?;
+        self.delete_artifact_prefix(&prefix).await
+    }
+
     /// Read and parse `manifest.json` under `prefix`. A missing or malformed
     /// manifest is a hard error — without it the bundle's completeness cannot be
     /// established.
@@ -405,6 +462,13 @@ fn verify_sha256(prefix: &StorageUrl, entry: &ManifestEntry, bytes: &[u8]) -> Re
         )));
     }
     Ok(())
+}
+
+/// The `checkpoints/` child segment naming one epoch's checkpoint: `epoch_{N}`.
+/// The single spelling both [`ArtifactStore::put_epoch_checkpoint`] and
+/// [`ArtifactStore::delete_epoch_checkpoint`] build their prefix from.
+fn epoch_segment(epoch: usize) -> String {
+    format!("epoch_{epoch}")
 }
 
 /// Sanitize one prefix segment: replace path-ambiguous characters so a segment

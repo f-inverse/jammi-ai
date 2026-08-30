@@ -580,7 +580,26 @@ async fn finalize_is_a_lease_guarded_compare_and_set(backend: BackendKind) {
     assert_eq!(owned_by_b.claimed_by.as_deref(), Some("worker-b"));
 
     // worker-a (the stale owner) tries to finalize: zero rows match, so it does
-    // not finalize and the job is untouched.
+    // not finalize and the job is untouched. F5(b): the doc's central claim —
+    // "a zombie/lease-lost worker can never register an epoch-checkpoint
+    // row" — is exercised here with a NON-EMPTY `epoch_checkpoints`, not the
+    // vacuous empty slice the rest of this test's finalize calls use.
+    let loser_epoch_rows = [
+        jammi_db::catalog::training_repo::EpochCheckpointRow {
+            model_id: "jammi:fine-tuned:fz:epoch_0",
+            model_type: "fine-tuned",
+            task: ModelTask::TextEmbedding,
+            base_model_id: Some("q-base"),
+            artifact_path: "file:///artifacts/fz/worker-a/2/checkpoints/epoch_0",
+        },
+        jammi_db::catalog::training_repo::EpochCheckpointRow {
+            model_id: "jammi:fine-tuned:fz:epoch_1",
+            model_type: "fine-tuned",
+            task: ModelTask::TextEmbedding,
+            base_model_id: Some("q-base"),
+            artifact_path: "file:///artifacts/fz/worker-a/2/checkpoints/epoch_1",
+        },
+    ];
     let a_finalized = catalog
         .finalize_training_job(FinalizeTrainingJobParams {
             job_id: "fz",
@@ -589,7 +608,7 @@ async fn finalize_is_a_lease_guarded_compare_and_set(backend: BackendKind) {
             output_model_version: 1,
             artifact_path: "file:///artifacts/fz/worker-a/2",
             metrics: Some(r#"{"k":1}"#),
-            epoch_checkpoints: &[],
+            epoch_checkpoints: &loser_epoch_rows,
         })
         .await
         .unwrap();
@@ -618,6 +637,16 @@ async fn finalize_is_a_lease_guarded_compare_and_set(backend: BackendKind) {
          got {:?}",
         model_after_a.artifact_path
     );
+    // ZERO epoch-checkpoint rows registered for the loser's attempt — the
+    // insert sits inside the SAME `if job_updated == 1` guard the served-path
+    // UPDATE does, so a CAS that matched zero job rows never reaches it.
+    for epoch_name in ["jammi:fine-tuned:fz:epoch_0", "jammi:fine-tuned:fz:epoch_1"] {
+        assert!(
+            catalog.get_model(epoch_name).await.unwrap().is_none(),
+            "a lease-lost worker must never register an epoch-checkpoint row \
+             ({epoch_name} must not exist)"
+        );
+    }
 
     // worker-b (the live owner) finalizes: one row matches, the job completes
     // with the output model and the metrics recorded.
@@ -816,6 +845,312 @@ async fn finalize_model_update_is_scoped_by_version_and_tenant(backend: BackendK
     assert!(
         b_v1.artifact_path.is_none(),
         "a DIFFERENT tenant's row sharing the same name must not be clobbered"
+    );
+}
+
+/// F5(a) (unit 348 audit): the finalize-CAS winner registers ALL retained
+/// epoch-checkpoint rows tenant-stamped to the job's own tenant, and those
+/// rows are invisible under a DIFFERENT tenant's scope — the same isolation
+/// every other tenant-scoped catalog row gets, exercised through both
+/// `get_model` (a single-row resolve) and `list_models` (the registry-wide
+/// projection).
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn finalize_registers_epoch_checkpoints_tenant_stamped_and_isolated(backend: BackendKind) {
+    use std::str::FromStr;
+
+    use jammi_db::TenantId;
+
+    let dir = tempdir().unwrap();
+    let session = skip_if_no_backend!(backend, dir.path());
+    let base = Arc::clone(session.catalog());
+    reset_queue(&base).await;
+
+    let tenant_a = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a").unwrap();
+    let tenant_b = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9b").unwrap();
+    let cat_a = base.pinned_to_tenant(Some(tenant_a));
+    let cat_b = base.pinned_to_tenant(Some(tenant_b));
+
+    cat_a
+        .register_model(RegisterModelParams {
+            model_id: "acme/base",
+            version: 1,
+            model_type: "embedding",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: None,
+            artifact_path: None,
+            config_json: None,
+        })
+        .await
+        .unwrap();
+    let base_pk = cat_a
+        .get_model("acme/base")
+        .await
+        .unwrap()
+        .expect("the base model row exists")
+        .catalog_pk;
+    cat_a
+        .create_training_job(CreateTrainingJobParams {
+            job_id: "ft-tenant-1",
+            base_model_id: &base_pk,
+            training_source: "src.csv",
+            loss_type: "contrastive",
+            hyperparams: "{}",
+            kind: "fine_tune",
+            training_spec: "{}",
+        })
+        .await
+        .unwrap();
+    cat_a
+        .claim_next_training_job("worker-a", Duration::from_secs(30))
+        .await
+        .unwrap()
+        .expect("the queued job is claimable");
+
+    let epoch_names: Vec<String> = (0..3)
+        .map(|n| format!("jammi:fine-tuned:ft-tenant-1:epoch_{n}"))
+        .collect();
+    let epoch_paths: Vec<String> = (0..3)
+        .map(|n| format!("file:///ft-tenant-1/worker-a/0/checkpoints/epoch_{n}"))
+        .collect();
+    let epoch_rows: Vec<jammi_db::catalog::training_repo::EpochCheckpointRow<'_>> = epoch_names
+        .iter()
+        .zip(epoch_paths.iter())
+        .map(
+            |(name, path)| jammi_db::catalog::training_repo::EpochCheckpointRow {
+                model_id: name,
+                model_type: "fine-tuned",
+                task: ModelTask::TextEmbedding,
+                base_model_id: Some("acme/base"),
+                artifact_path: path,
+            },
+        )
+        .collect();
+
+    let finalized = cat_a
+        .finalize_training_job(
+            jammi_db::catalog::training_repo::FinalizeTrainingJobParams {
+                job_id: "ft-tenant-1",
+                worker_id: "worker-a",
+                output_model_id: "jammi:fine-tuned:ft-tenant-1",
+                output_model_version: 1,
+                artifact_path: "file:///ft-tenant-1/worker-a/0",
+                metrics: None,
+                epoch_checkpoints: &epoch_rows,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(finalized, "tenant-a's lease holder finalizes the job");
+
+    // All N=3 rows are registered and resolve under tenant-a.
+    for name in &epoch_names {
+        let row = cat_a
+            .get_model(name)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{name} must be registered under tenant-a"));
+        assert_eq!(row.status, "checkpoint");
+    }
+
+    // NONE of them are visible under tenant-b's scope — `get_model` and
+    // `list_models` both.
+    for name in &epoch_names {
+        assert!(
+            cat_b.get_model(name).await.unwrap().is_none(),
+            "{name} must be invisible under a different tenant's scope"
+        );
+    }
+    let tenant_a_names: std::collections::HashSet<String> = cat_a
+        .list_models()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.model_id)
+        .collect();
+    for name in &epoch_names {
+        assert!(
+            tenant_a_names.contains(name),
+            "list_models under tenant-a must include {name}"
+        );
+    }
+    let tenant_b_names: std::collections::HashSet<String> = cat_b
+        .list_models()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.model_id)
+        .collect();
+    for name in &epoch_names {
+        assert!(
+            !tenant_b_names.contains(name),
+            "list_models under tenant-b must NOT include {name}"
+        );
+    }
+}
+
+/// F4 (unit 348 audit): a checkpoint row's catalog NAME can be occupied by an
+/// unrelated, pre-existing model row at ANY version — not just the
+/// checkpoint's own hardcoded version 1, which a bare `ON CONFLICT(model_id)`
+/// would only catch on an EXACT PK match and would otherwise silently no-op
+/// with no diagnostic. The finalize CAS must: skip registering that ONE
+/// checkpoint row (never clobber the occupying row, never insert a shadowed
+/// duplicate), `tracing::warn!` naming the occupied catalog name and the
+/// skipped artifact prefix, register every OTHER retained epoch row
+/// normally, and still finalize the job successfully — checkpoints are
+/// supplementary, never a reason to fail the job.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn finalize_skips_a_name_occupied_epoch_checkpoint_and_warns(backend: BackendKind) {
+    use std::sync::Mutex;
+
+    use tracing::subscriber::DefaultGuard;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone)]
+    struct BufferWriter(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for BufferWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'w> MakeWriter<'w> for BufferWriter {
+        type Writer = BufferWriter;
+        fn make_writer(&'w self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    catalog
+        .create_training_job(job_params("epc-1"))
+        .await
+        .unwrap();
+    catalog
+        .claim_next_training_job("worker-a", Duration::from_secs(30))
+        .await
+        .unwrap()
+        .expect("the queued job is claimable");
+
+    // A pre-existing, unrelated user model that happens to occupy the exact
+    // name the epoch_0 checkpoint would register under — at version 7, a
+    // DIFFERENT version than the checkpoint's hardcoded 1 (so a bare
+    // `ON CONFLICT(model_id)` — keyed on the FULL pk including version —
+    // would never even fire; the two rows would coexist as distinct PKs,
+    // and `get_model`'s `ORDER BY version DESC` would silently shadow
+    // whichever row has the lower version).
+    let occupied_name = "jammi:fine-tuned:epc-1:epoch_0";
+    catalog
+        .register_model(RegisterModelParams {
+            model_id: occupied_name,
+            version: 7,
+            model_type: "embedding",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: None,
+            artifact_path: Some("file:///pre-existing/user/artifact"),
+            config_json: None,
+        })
+        .await
+        .unwrap();
+
+    let epoch0_prefix = "file:///epc-1/worker-a/0/checkpoints/epoch_0";
+    let epoch1_prefix = "file:///epc-1/worker-a/0/checkpoints/epoch_1";
+    let epoch_rows = [
+        jammi_db::catalog::training_repo::EpochCheckpointRow {
+            model_id: occupied_name,
+            model_type: "fine-tuned",
+            task: ModelTask::TextEmbedding,
+            base_model_id: Some("q-base"),
+            artifact_path: epoch0_prefix,
+        },
+        jammi_db::catalog::training_repo::EpochCheckpointRow {
+            model_id: "jammi:fine-tuned:epc-1:epoch_1",
+            model_type: "fine-tuned",
+            task: ModelTask::TextEmbedding,
+            base_model_id: Some("q-base"),
+            artifact_path: epoch1_prefix,
+        },
+    ];
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(BufferWriter(buffer.clone()))
+        .with_ansi(false)
+        .finish();
+    let _guard: DefaultGuard = tracing::subscriber::set_default(subscriber);
+
+    let finalized = catalog
+        .finalize_training_job(
+            jammi_db::catalog::training_repo::FinalizeTrainingJobParams {
+                job_id: "epc-1",
+                worker_id: "worker-a",
+                output_model_id: "jammi:fine-tuned:epc-1",
+                output_model_version: 1,
+                artifact_path: "file:///epc-1/worker-a/0",
+                metrics: None,
+                epoch_checkpoints: &epoch_rows,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        finalized,
+        "finalize succeeds even though one checkpoint row's name is occupied — \
+         checkpoints are supplementary, never a reason to fail the job"
+    );
+
+    // The pre-existing user row is UNTOUCHED — same version, same
+    // artifact_path — and is still exactly what `get_model` (the mechanism
+    // `describe_model` resolves through) resolves for that name.
+    let resolved = catalog
+        .get_model(occupied_name)
+        .await
+        .unwrap()
+        .expect("the occupied name still resolves");
+    assert_eq!(
+        resolved.version, 7,
+        "the pre-existing row's version must be untouched"
+    );
+    assert_eq!(
+        resolved.artifact_path.as_deref(),
+        Some("file:///pre-existing/user/artifact"),
+        "the pre-existing row's artifact_path must be untouched — never clobbered by the \
+         checkpoint, and no shadowing duplicate inserted alongside it"
+    );
+
+    // The OTHER retained epoch row (no name collision) registered normally —
+    // one collision must not block the rest.
+    let epoch1_row = catalog
+        .get_model("jammi:fine-tuned:epc-1:epoch_1")
+        .await
+        .unwrap()
+        .expect("the non-colliding epoch row registers normally");
+    assert_eq!(epoch1_row.status, "checkpoint");
+    assert_eq!(epoch1_row.artifact_path.as_deref(), Some(epoch1_prefix));
+
+    // The warning names both the occupied catalog name and the skipped
+    // artifact prefix — never a silent no-op.
+    let logs = String::from_utf8(buffer.lock().unwrap().clone()).expect("utf-8 logs");
+    assert!(
+        logs.contains(occupied_name) && logs.contains(epoch0_prefix),
+        "the warning must name the occupied catalog name and the skipped artifact prefix; \
+         captured logs:\n{logs}"
     );
 }
 

@@ -154,19 +154,29 @@ pub struct CreateTrainingJobParams<'a> {
 /// Two distinct "no catalog row" cases, with different GC reach — this is a
 /// residual, not a solved problem, so it is documented precisely rather than
 /// glossed as one case:
-///   - A **live loser**: the worker's process survives to reach
-///     `TrainingWorker::publish_and_finalize`'s `Ok(false)`/`Err` arms, whose
-///     dedicated `gc_orphaned_epoch_checkpoints` sweep deletes every one of
-///     ITS OWN retained epoch-checkpoint prefixes there (alongside that same
-///     arm's existing best-effort delete of the top-level artifact prefix —
-///     the nested `checkpoints/epoch_{N}/` prefixes carry their OWN separate
-///     manifests, so the top-level prefix's delete alone never reaches them).
+///   - A **live loser**: the worker's PROCESS survives to reach any
+///     terminating arm — `TrainingWorker::run_claimed_job`'s `Cancelled` and
+///     `Failed` arms, `TrainingWorker::train_fine_tune`'s caught-panic and
+///     `spawn_blocking` join-error arms, and
+///     `TrainingWorker::publish_and_finalize`'s publish-failure,
+///     `register_model`-failure, `Ok(false)`, and `Err` arms — EVERY one of
+///     which calls the same `TrainingWorker::gc_epoch_checkpoints` derived
+///     sweep (one reclaim mechanism, not a vec-based one for the lucky arm
+///     and something else for the rest). The sweep DERIVES each candidate
+///     prefix from the attempt's identity and the run's configured epoch
+///     bound rather than reading an in-memory vec — most of these arms never
+///     built a `TrainedArtifact` at all, so no such vec exists to read (this
+///     is exactly the class of gap a vec-based reclaim could not close by
+///     construction). It runs alongside the top-level artifact prefix's own
+///     best-effort delete — the nested `checkpoints/epoch_{N}/` prefixes
+///     carry their OWN separate manifests, so the top-level prefix's delete
+///     alone never reaches them.
 ///   - A **truly crashed** attempt (the process dies before ever reaching
-///     `publish_and_finalize`): nothing reclaims either its top-level
-///     artifact prefix OR its epoch-checkpoint prefixes — the existing
-///     top-level GC is exactly as unreachable in this case as the new
+///     ANY of the terminating arms above): nothing reclaims either its
+///     top-level artifact prefix OR its epoch-checkpoint prefixes — the
+///     existing top-level GC is exactly as unreachable in this case as the
 ///     epoch-checkpoint one, a pre-existing limitation of the "GC on the
-///     losing branch of a live process" design this unit does not change.
+///     losing branch of a LIVE process" design this unit does not change.
 ///     These bytes are durable-but-permanently-unregistered, the expected
 ///     residual.
 #[derive(Debug, Clone)]
@@ -423,6 +433,54 @@ impl Catalog {
                         .await?;
 
                         for (model_id, model_type, task_db_str, base_model_id, path) in epoch_rows {
+                            // Pre-check by NAME ALONE (every version, the
+                            // SAME strict tenant predicate the row's own
+                            // insert and the output model's UPDATE use) —
+                            // never a bare `ON CONFLICT(model_id) DO
+                            // NOTHING`, which only catches an EXACT
+                            // `(tenant, name, version=1)` PK collision and
+                            // silently swallows it with no log. A row
+                            // already occupying this NAME at ANY OTHER
+                            // version is not a PK collision at all (a
+                            // different PK), so a bare INSERT would
+                            // SUCCEED — but `get_model`'s `ORDER BY version
+                            // DESC` resolves the occupying (higher- or
+                            // lower-numbered) row, silently SHADOWING the
+                            // checkpoint from every reader (`describe_model`
+                            // included) even though its row exists in the
+                            // table. Checking by name catches both: the
+                            // exact-PK collision AND the version-shadow.
+                            let occupied = tx
+                                .query_opt(
+                                    "SELECT COUNT(*) AS n FROM models \
+                                     WHERE name = $1 \
+                                       AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL))",
+                                    &[SqlValue::TextOwned(model_id.clone()), tenant_val.clone()],
+                                    |row| row.get::<i64>("n"),
+                                )
+                                .await?
+                                .unwrap_or(0)
+                                > 0;
+                            if occupied {
+                                // Checkpoints are supplementary — never fail
+                                // the job over one name collision. The
+                                // checkpoint's bytes stay durable on the
+                                // object store (K7) but permanently
+                                // unregistered — the SAME residual bucket a
+                                // truly-crashed attempt's bytes fall into
+                                // (see `EpochCheckpointRow`'s doc), just
+                                // reached by a name collision instead of a
+                                // dead process.
+                                tracing::warn!(
+                                    occupied_name = %model_id,
+                                    skipped_artifact_path = %path,
+                                    "epoch-checkpoint catalog name already occupied by another \
+                                     row; skipping registration — the checkpoint's bytes remain \
+                                     durable but unregistered"
+                                );
+                                continue;
+                            }
+
                             let pk = super::model_repo::model_pk(tenant, &model_id, 1);
                             let metadata = serde_json::json!({
                                 "base_model_id": base_model_id,
@@ -433,8 +491,7 @@ impl Catalog {
                                 "INSERT INTO models \
                                  (model_id, name, model_type, task, backend, version, \
                                   status, metadata, artifact_path, tenant_id) \
-                                 VALUES ($1, $2, $3, $4, 'candle', 1, 'checkpoint', $5, $6, $7) \
-                                 ON CONFLICT(model_id) DO NOTHING",
+                                 VALUES ($1, $2, $3, $4, 'candle', 1, 'checkpoint', $5, $6, $7)",
                                 &[
                                     SqlValue::TextOwned(pk),
                                     SqlValue::TextOwned(model_id),

@@ -392,6 +392,30 @@ pub struct FineTuneConfig {
     /// this mirrors is the same "does not perturb the trained artifact" shape)
     /// and never affects the final/best artifact, which publishes and is
     /// retained exactly as before, unconditionally.
+    ///
+    /// Two retention semantics worth stating precisely rather than assuming:
+    ///
+    /// - **Early stopping** can make the terminal/best epoch ABSENT from the
+    ///   retained checkpoint set: retention is a pure epoch-order FIFO over
+    ///   an attempt's own `save_epoch_checkpoint` calls (oldest dropped
+    ///   first as newer ones land), with no awareness of which epoch later
+    ///   turns out to be `checkpoint_best`. A best epoch older than the
+    ///   trailing `n` epochs is pruned like any other. This is harmless for
+    ///   the SERVED model: the best/final artifact is restored from its own
+    ///   `checkpoint_best.safetensors` and published through the worker's
+    ///   ordinary, unconditional final-artifact path — entirely independent
+    ///   of, and unaffected by, the epoch-checkpoint retention window.
+    /// - **Resume**: a resumed job's retained epoch-checkpoint SET is scoped
+    ///   to the RESUMING attempt only — the attempt-unique prefix
+    ///   (`{job_id}/{worker_id}/{attempt}/checkpoints/…`, K7) means a
+    ///   resumed run's own retention FIFO starts fresh under its own
+    ///   `attempt` suffix and never prunes (or even sees) a prior attempt's
+    ///   epoch checkpoints. So the catalog rows a resumed job's finalize
+    ///   registers are only the FINAL (resuming) attempt's own retained
+    ///   suffix — an earlier, superseded attempt's epoch checkpoints are
+    ///   never registered even if the bytes are still durable (the same
+    ///   "durable but unregistered" residual bucket documented on
+    ///   [`jammi_db::catalog::training_repo::EpochCheckpointRow`]).
     #[serde(default)]
     pub keep_last_n_checkpoints: Option<u32>,
 }

@@ -529,6 +529,13 @@ impl TrainingLoopBuilder {
 }
 
 impl TrainingLoop {
+    /// The single scratch subdirectory (under the run's `checkpoint_dir`)
+    /// every epoch's checkpoint save reuses — the `_resume_scratch` precedent
+    /// [`Self::save_resume_checkpoint`] already follows. Reused, not
+    /// per-epoch, so the run's scratch-disk footprint does not grow with
+    /// epoch count.
+    const EPOCH_CHECKPOINT_SCRATCH: &'static str = "_epoch_checkpoint_scratch";
+
     /// Run the training loop. Returns the path to the saved adapter.
     ///
     /// Dual-path:
@@ -3120,28 +3127,41 @@ impl TrainingLoop {
     /// On success, appends `(epoch, artifact_prefix)` to
     /// [`Self::epoch_checkpoints`] and then enforces
     /// `config.keep_last_n_checkpoints`: once the retained count exceeds the
-    /// cap, the OLDEST surviving entries' bytes are deleted from the store
-    /// right here — safe, because no catalog row exists for them yet (the
-    /// worker's finalize only registers rows for whatever remains in
-    /// [`Self::epoch_checkpoints`] when [`Self::run`] returns) — and dropped
-    /// from the vector, so a pruned epoch never reaches the finalize step.
-    /// The caller has already confirmed the lease is held (`!cancel`), the
-    /// same gate [`Self::save_resume_checkpoint`] runs under.
+    /// cap, the OLDEST surviving entries' bytes are best-effort deleted from
+    /// the store right here — safe, because no catalog row exists for them
+    /// yet (the worker's finalize only registers rows for whatever remains
+    /// in [`Self::epoch_checkpoints`] when [`Self::run`] returns) — and
+    /// dropped from the vector, so a pruned epoch never reaches the finalize
+    /// step. The delete is `.ok()`-swallowed, matching every other GC in
+    /// this codebase (`TrainingWorker::publish_and_finalize`'s prefix
+    /// deletes): a transient storage failure pruning an old, already-
+    /// superseded checkpoint must never abort the run — that would fail a
+    /// job over a housekeeping op unrelated to whether training itself
+    /// succeeded. The delete is attempted BEFORE the entry is popped
+    /// (delete-then-remove, not remove-then-delete), so tracking never
+    /// claims an entry is gone ahead of the store actually being asked to
+    /// reclaim it. The caller has already confirmed the lease is held
+    /// (`!cancel`), the same gate [`Self::save_resume_checkpoint`] runs
+    /// under.
+    ///
+    /// Uses [`Self::EPOCH_CHECKPOINT_SCRATCH`], ONE scratch subdirectory
+    /// reused across every epoch this attempt saves (the `_resume_scratch`
+    /// precedent in [`Self::save_resume_checkpoint`]), not a fresh
+    /// per-epoch directory: each call's `jammi_lora::save_adapter` fully
+    /// overwrites both files there before the immediate upload reads them
+    /// back, so nothing from a prior epoch survives into the next upload,
+    /// and the run's scratch disk footprint does not grow with epoch count.
     fn save_epoch_checkpoint(&mut self, checkpoint_dir: &Path, epoch: usize) -> Result<()> {
         let Some(store) = self.artifact_store.clone() else {
             return Ok(());
         };
-        let scratch = checkpoint_dir.join(format!("_epoch_checkpoint_scratch_{epoch}"));
+        let scratch = checkpoint_dir.join(Self::EPOCH_CHECKPOINT_SCRATCH);
         let files = self.checkpoint_adapter_files(&scratch)?;
-        let segment = format!("epoch_{epoch}");
-        let prefix = tokio::runtime::Handle::current().block_on(store.put_artifact(
-            &[
-                self.job_id.as_str(),
-                self.worker_id.as_str(),
-                self.attempt.as_str(),
-                "checkpoints",
-                segment.as_str(),
-            ],
+        let prefix = tokio::runtime::Handle::current().block_on(store.put_epoch_checkpoint(
+            &self.job_id,
+            &self.worker_id,
+            &self.attempt,
+            epoch,
             &files,
         ))?;
         self.epoch_checkpoints
@@ -3152,11 +3172,19 @@ impl TrainingLoop {
             while self.epoch_checkpoints.len() > keep {
                 // Retention is FIFO over this attempt's own epoch order: the
                 // vector is always epoch-ascending (each save appends), so
-                // index 0 is the oldest surviving entry.
-                let (_, oldest_prefix) = self.epoch_checkpoints.remove(0);
-                let oldest_url = jammi_db::storage::StorageUrl::parse(&oldest_prefix)?;
+                // index 0 is the oldest surviving entry. Peek it (do not pop
+                // yet) so the delete attempt below still has the epoch index
+                // to hand.
+                let (oldest_epoch, _) = self.epoch_checkpoints[0];
                 tokio::runtime::Handle::current()
-                    .block_on(store.delete_artifact_prefix(&oldest_url))?;
+                    .block_on(store.delete_epoch_checkpoint(
+                        &self.job_id,
+                        &self.worker_id,
+                        &self.attempt,
+                        oldest_epoch,
+                    ))
+                    .ok();
+                self.epoch_checkpoints.remove(0);
             }
         }
         Ok(())

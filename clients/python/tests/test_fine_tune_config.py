@@ -47,6 +47,7 @@ _UNSET = dict(
     regression_loss=None,
     regression_beta=None,
     quantile_levels=None,
+    keep_last_n_checkpoints=None,
 )
 
 

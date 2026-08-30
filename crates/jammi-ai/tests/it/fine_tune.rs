@@ -2208,24 +2208,57 @@ async fn loser_prefix_is_never_the_committed_artifact() {
     );
 }
 
-// ─── Loser's epoch-checkpoint bytes are reclaimed too, not just its top-level
-//     artifact prefix (unit 348) ──────────────────────────────────────────────
+// ─── A cancelled-mid-run attempt's already-written epoch checkpoints are
+//     reclaimed — existence proven BEFORE reclaim (unit 348, F1/F2) ─────────
 //
 // The top-level artifact prefix's `delete_artifact_prefix` reads and deletes
 // only ITS OWN `manifest.json`'s files — it never reaches into the nested
 // `checkpoints/epoch_{N}/` prefixes underneath, each carrying its own separate
-// manifest. Without an explicit GC for those, a losing attempt's epoch
-// checkpoints would be orphaned forever (unbounded storage growth across every
-// reclaimed/failed attempt — family E). This pins that the loser's OWN
-// epoch-checkpoint bytes are gone after its failed finalize, exercising the
-// same race `loser_prefix_is_never_the_committed_artifact` drives.
-
+// manifest. Without a dedicated, DERIVED sweep, a losing/cancelled attempt's
+// epoch checkpoints would be orphaned forever (unbounded storage growth
+// across every reclaimed/failed attempt — family E).
+//
+// This drives `TrainingWorker::run_claimed_job`'s `Cancelled` arm
+// specifically (a real heartbeat-detected lease loss, not a
+// finalize-CAS-loses-the-race scenario), and closes the vacuity a prior
+// version of this test had: that version asserted only ABSENCE after the
+// race, never proving the bytes existed in the first place — so it could not
+// distinguish "the GC worked" from "there was nothing to reclaim". Here the
+// existence check is load-bearing and comes FIRST: the test polls for
+// epoch_0's manifest to land on disk (a real write, not assumed), THEN forces
+// the lease stale (deterministic, not a wall-clock race against the
+// attempt's own healthy heartbeat), THEN waits for the cancelled run to
+// finish, THEN asserts the SAME bytes are gone.
 #[tokio::test(flavor = "multi_thread")]
-async fn loser_epoch_checkpoint_bytes_are_reclaimed_too() {
+async fn cancelled_run_reclaims_epoch_checkpoints_that_actually_existed() {
     use jammi_ai::fine_tune::worker::TrainingWorker;
+    use jammi_db::catalog::backend::{SqlValue, TxOptions};
     use std::time::Duration;
 
-    let (session, _dir) = session_with_training_data().await;
+    let dir = TempDir::new().unwrap();
+    let mut config = common::test_config(dir.path());
+    // The minimum legal heartbeat/lease/poll (heartbeat*2 < lease): fast
+    // enough that a real heartbeat tick reliably detects the forced lease
+    // loss within about a second, matching `configured_short_lease_drives_
+    // reclaim`'s precedent for exercising real timing quickly.
+    config.training = jammi_db::config::TrainingConfig {
+        lease_duration_secs: 3,
+        heartbeat_interval_secs: 1,
+        idle_poll_secs: 1,
+    };
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    session
+        .add_source(
+            "training",
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("training_pairs.csv")),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     let model = tiny_bert_model();
 
     let job = session
@@ -2240,7 +2273,14 @@ async fn loser_epoch_checkpoint_bytes_are_reclaimed_too() {
             FineTuneMethod::Lora,
             ModelTask::TextEmbedding,
             Some(FineTuneConfig {
-                epochs: 1,
+                // Deliberately large: a tiny real fine-tune epoch is fast
+                // (single-digit milliseconds on this fixture), so the count
+                // must be big enough that the run is CERTAINLY still mid-
+                // flight by the time the test forces the lease loss below —
+                // the sanity assertion right before that forcing step turns
+                // a wrong guess here into a loud, diagnosable failure rather
+                // than a silently-wrong-path pass.
+                epochs: 20_000,
                 batch_size: 8,
                 lora_rank: 4,
                 warmup_steps: 0,
@@ -2250,81 +2290,140 @@ async fn loser_epoch_checkpoint_bytes_are_reclaimed_too() {
         .await
         .unwrap();
 
-    let worker_a = TrainingWorker::new(&session).expect("default worker intervals are valid");
-    let worker_b = TrainingWorker::new(&session).expect("default worker intervals are valid");
-
-    let stale_claim = session
+    let worker_a = TrainingWorker::new(&session).expect("short timing clears the margin");
+    let lease = session
+        .inner_config()
+        .training
+        .worker_intervals()
+        .unwrap()
+        .lease;
+    let claimed = session
         .catalog()
-        .claim_next_training_job(worker_a.worker_id(), Duration::ZERO)
+        .claim_next_training_job(worker_a.worker_id(), lease)
         .await
         .unwrap()
-        .expect("worker-a claims the queued job");
-    let attempt = stale_claim.attempts;
+        .expect("the queued job is claimable");
+    let attempt = claimed.attempts;
+    let job_id = job.job_id.clone();
+    let worker_a_id = worker_a.worker_id().to_string();
+
+    // Run the claimed job concurrently (not awaited inline) so the real
+    // heartbeat task can actually tick while training is still in progress —
+    // the load-bearing difference from a synchronous "claim, then run to
+    // completion" drive, which can never observe an in-flight cancellation.
+    let session_for_task = Arc::clone(&session);
+    let handle = tokio::spawn(async move {
+        worker_a.run_claimed_job(&session_for_task, claimed).await;
+    });
+
+    // The local on-disk path this attempt's epoch-0 checkpoint manifest
+    // lands at — `file://` roots materialise real files at exactly this
+    // path (`ArtifactStore`'s in-place short-circuit), so checking it
+    // directly needs no `StorageUrl` round-trip.
+    let epoch0_manifest = dir
+        .path()
+        .join("jammi_db")
+        .join("models")
+        .join(&job_id)
+        .join(&worker_a_id)
+        .join(attempt.to_string())
+        .join("checkpoints")
+        .join("epoch_0")
+        .join("manifest.json");
+
+    // LOAD-BEARING: poll for the bytes to actually appear before doing
+    // anything else. A bounded wait, not a fixed sleep — the exact epoch-0
+    // wall time varies by machine.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if epoch0_manifest.exists() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "epoch_0's checkpoint manifest never appeared within 30s at {epoch0_manifest:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        epoch0_manifest.exists(),
+        "epoch_0's checkpoint bytes must exist BEFORE the reclaim — the load-bearing existence \
+         proof a vacuous version of this test skipped"
+    );
+
+    // Sanity gate: the spawned `run_claimed_job` task must NOT have returned
+    // yet, or the whole point of this test — forcing a lease loss WHILE
+    // training is still in flight — is moot (a task that already returned
+    // would instead have exercised `publish_and_finalize`'s own
+    // already-covered `Ok(false)` arm, a DIFFERENT code path, silently
+    // mis-testing the wrong one; `training_jobs.status` alone cannot
+    // distinguish the two — both leave it `running`). A large `epochs` is
+    // chosen so this should never fire; if it does, that is a loud,
+    // diagnosable failure demanding a bigger epoch count, not a silent
+    // false pass.
+    assert!(
+        !handle.is_finished(),
+        "the spawned run_claimed_job task already completed before the test could force the \
+         lease loss — raise `epochs` further so this genuinely races a live run"
+    );
+
+    // Force the lease stale RIGHT NOW — deterministic, not a race against
+    // worker-a's own healthy (actively-renewing) heartbeat, which would
+    // otherwise never organically expire while the attempt is alive.
+    let force_job_id = job_id.clone();
     session
+        .catalog()
+        .backend_arc()
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE training_jobs SET lease_expires_at = '2000-01-01T00:00:00Z' \
+                     WHERE job_id = $1",
+                    &[SqlValue::TextOwned(force_job_id)],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+    let reclaimed = session
         .catalog()
         .reclaim_expired_training_jobs(5)
         .await
         .unwrap();
-    let owned = session
+    assert_eq!(reclaimed, 1, "the forced-stale lease is reclaimed");
+    let worker_b = TrainingWorker::new(&session).expect("short timing clears the margin");
+    session
         .catalog()
         .claim_next_training_job(worker_b.worker_id(), Duration::from_secs(3600))
         .await
         .unwrap()
-        .expect("worker-b re-claims the requeued job");
-    let attempt_b = owned.attempts;
+        .expect("worker-b steals the requeued job");
 
-    worker_a.run_claimed_job(&session, stale_claim).await;
-    let after_loser = session
-        .catalog()
-        .get_training_job(&job.job_id)
+    // Worker-a's own heartbeat notices the loss within one interval and sets
+    // `cancel`; the training loop bails at its next epoch boundary via
+    // `WorkerJobError::Cancelled`. Bounded wait for the spawned task.
+    tokio::time::timeout(Duration::from_secs(30), handle)
         .await
+        .expect("worker-a's run_claimed_job must finish once its lease is lost")
         .unwrap();
-    assert_ne!(
-        after_loser.status, "completed",
-        "the loser's finalize CAS fails"
-    );
 
-    worker_b.run_claimed_job(&session, owned).await;
-    job.wait().await.unwrap();
-
-    // Derive the store root from the WINNER's committed artifact_path (a full
-    // URL of the documented shape `{root}/{job_id}/{worker_id}/{attempt}`) by
-    // stripping its own known job_id/worker_id/attempt suffix — then rebuild
-    // the LOSER's epoch-0 checkpoint prefix
-    // (`{job_id}/{worker_id}/{attempt}/checkpoints/epoch_0`) under that same
-    // root, and confirm those orphaned bytes are gone, not merely
-    // unregistered.
-    let winner = session
-        .catalog()
-        .get_model(&job.model_id)
-        .await
-        .unwrap()
-        .expect("the winner registered the output model");
-    let winner_path = winner
-        .artifact_path
-        .expect("the winner's finalize CAS committed a served path");
-    let winner_suffix = format!(
-        "/{job_id}/{worker_id}/{attempt_b}",
-        job_id = job.job_id,
-        worker_id = worker_b.worker_id(),
-    );
-    let root = winner_path
-        .strip_suffix(&winner_suffix)
-        .expect("the winner's artifact_path carries the documented job/worker/attempt suffix");
-    let epoch0_prefix = format!(
-        "{job_id}/{worker_id}/{attempt}/checkpoints/epoch_0",
-        job_id = job.job_id,
-        worker_id = worker_a.worker_id(),
-    );
-    let epoch0_url =
-        jammi_db::storage::StorageUrl::parse(&format!("{root}/{epoch0_prefix}")).unwrap();
+    // Worker-a never finalized (the `Cancelled` arm records no terminal
+    // status) — confirms this run really took the cancelled path, not a
+    // race where it happened to finish and win anyway.
+    let after = session.catalog().get_training_job(&job_id).await.unwrap();
     assert!(
-        session
-            .artifact_store()
-            .fetch_artifact(&epoch0_url)
-            .await
-            .is_err(),
-        "the loser's epoch-0 checkpoint bytes must be reclaimed, not orphaned forever"
+        after.output_model_id.is_none(),
+        "worker-a's cancelled run must not have finalized the job itself"
+    );
+
+    // THE reclaim assertion: the SAME bytes confirmed to exist above are now
+    // gone — reclaimed by `run_claimed_job`'s `Cancelled` arm calling the
+    // derived `TrainingWorker::gc_epoch_checkpoints` sweep.
+    assert!(
+        !epoch0_manifest.exists(),
+        "epoch_0's checkpoint bytes must be reclaimed once the Cancelled arm runs, not left \
+         durable forever"
     );
 }
 

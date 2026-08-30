@@ -93,6 +93,22 @@ fn resolve_worker_id() -> String {
     }
 }
 
+/// The epoch bound a spec's trainer will checkpoint against (unit 348, F1/F2):
+/// the SAME `FineTuneConfig.epochs` the trainer itself reads, read here from
+/// the durable spec BEFORE it moves into the run — never a count of epochs
+/// actually completed, which is not observable from outside a run that may
+/// never even reach its first epoch boundary. `ContextPredictor` has no
+/// per-epoch checkpointing at all (v1 out of scope), so it reports `0` — every
+/// derived-sweep call site treats that as an unconditional no-op range.
+fn epoch_checkpoint_bound(spec: &TrainingSpec) -> usize {
+    match spec {
+        TrainingSpec::FineTune { common, .. } | TrainingSpec::GraphFineTune { common, .. } => {
+            common.config.epochs
+        }
+        TrainingSpec::ContextPredictor { .. } => 0,
+    }
+}
+
 /// A training worker bound to a session. Claims and runs durable training jobs
 /// from the shared catalog under a lease. Construct one per process (or N for a
 /// pool); [`Self::run`] is the long-lived loop the embedded engine and the
@@ -266,6 +282,15 @@ impl TrainingWorker {
                 return;
             }
         };
+        // The epoch bound THIS run's trainer will checkpoint against — read
+        // from the spec's own `FineTuneConfig.epochs` before `spec` moves
+        // into `run_spec` below, never a count of epochs actually completed
+        // (which the outer scope cannot see and does not need to: sweeping
+        // the full configured range is what makes the GC below correct BY
+        // CONSTRUCTION, independent of how far training got or whether it
+        // ever built a `TrainedArtifact` at all — see
+        // `Self::gc_epoch_checkpoints`'s doc, unit 348 F1/F2).
+        let epoch_checkpoint_bound = epoch_checkpoint_bound(&spec);
 
         // The heartbeat renews the lease while training runs and sets `cancel`
         // when the lease is lost. The cancel flag threads into both training
@@ -308,18 +333,48 @@ impl TrainingWorker {
 
         match outcome {
             Ok(artifact) => {
-                self.publish_and_finalize(session, &catalog, &job_id, attempt, artifact)
-                    .await;
+                self.publish_and_finalize(
+                    session,
+                    &catalog,
+                    &job_id,
+                    attempt,
+                    epoch_checkpoint_bound,
+                    artifact,
+                )
+                .await;
             }
             Err(WorkerJobError::Cancelled) => {
                 // Lease lost: leave the job `running` for reclaim to re-queue.
                 // Do not record a terminal status — a different worker now owns,
-                // or will own, this job.
+                // or will own, this job. No `TrainedArtifact` was ever built on
+                // this path (the run bailed mid-training, or never even
+                // finished the blocking call), so any epoch checkpoints this
+                // attempt wrote are reachable only by DERIVING their prefixes
+                // — never from an in-memory vec that does not exist here.
+                Self::gc_epoch_checkpoints(
+                    &session.artifact_store(),
+                    &job_id,
+                    &self.worker_id,
+                    attempt,
+                    epoch_checkpoint_bound,
+                )
+                .await;
                 tracing::warn!(job_id = %job_id, worker = %self.worker_id, "training cancelled (lease lost); left for reclaim");
             }
             Err(WorkerJobError::Failed(msg)) => {
                 tracing::error!(job_id = %job_id, error = %msg, "training job failed");
                 record_failed(&catalog, &job_id, &self.worker_id, msg).await;
+                // Same reasoning as the `Cancelled` arm above: covers a panic,
+                // a `spawn_blocking` join error, and any typed training
+                // failure — none of which ever produced a `TrainedArtifact`.
+                Self::gc_epoch_checkpoints(
+                    &session.artifact_store(),
+                    &job_id,
+                    &self.worker_id,
+                    attempt,
+                    epoch_checkpoint_bound,
+                )
+                .await;
             }
         }
     }
@@ -359,6 +414,7 @@ impl TrainingWorker {
         catalog: &Arc<Catalog>,
         job_id: &str,
         attempt: u32,
+        epoch_checkpoint_bound: usize,
         artifact: TrainedArtifact,
     ) {
         let store = session.artifact_store();
@@ -381,6 +437,20 @@ impl TrainingWorker {
                 Ok(p) => p,
                 Err(e) => {
                     record_failed(catalog, job_id, &self.worker_id, e.to_string()).await;
+                    // The training loop DID complete and DID write epoch
+                    // checkpoints (we have a `TrainedArtifact`) — but the
+                    // FINAL artifact publish failed, so this attempt never
+                    // reaches finalize at all. Reclaim its epoch-checkpoint
+                    // bytes via the derived sweep (never the vec — one
+                    // reclaim path for every terminating arm, unit 348 F1/F2).
+                    Self::gc_epoch_checkpoints(
+                        &store,
+                        job_id,
+                        &self.worker_id,
+                        attempt,
+                        epoch_checkpoint_bound,
+                    )
+                    .await;
                     return;
                 }
             };
@@ -389,6 +459,14 @@ impl TrainingWorker {
             // The model row could not be registered; the prefix we wrote is
             // orphaned. Best-effort GC it and fail the job.
             store.delete_artifact_prefix(&prefix).await.ok();
+            Self::gc_epoch_checkpoints(
+                &store,
+                job_id,
+                &self.worker_id,
+                attempt,
+                epoch_checkpoint_bound,
+            )
+            .await;
             record_failed(catalog, job_id, &self.worker_id, e.to_string()).await;
             return;
         }
@@ -445,7 +523,14 @@ impl TrainingWorker {
                 // leave the job for reclaim (the re-claiming worker writes its own
                 // prefix and its CAS commits it).
                 store.delete_artifact_prefix(&prefix).await.ok();
-                Self::gc_orphaned_epoch_checkpoints(&store, &epoch_checkpoints).await;
+                Self::gc_epoch_checkpoints(
+                    &store,
+                    job_id,
+                    &self.worker_id,
+                    attempt,
+                    epoch_checkpoint_bound,
+                )
+                .await;
                 tracing::debug!(
                     job_id = %job_id,
                     worker = %self.worker_id,
@@ -454,37 +539,66 @@ impl TrainingWorker {
             }
             Err(e) => {
                 store.delete_artifact_prefix(&prefix).await.ok();
-                Self::gc_orphaned_epoch_checkpoints(&store, &epoch_checkpoints).await;
+                Self::gc_epoch_checkpoints(
+                    &store,
+                    job_id,
+                    &self.worker_id,
+                    attempt,
+                    epoch_checkpoint_bound,
+                )
+                .await;
                 tracing::error!(job_id = %job_id, error = %e, "finalize_training_job failed");
             }
         }
     }
 
-    /// Best-effort GC of THIS attempt's epoch-checkpoint bytes on a finalize
-    /// that did NOT win (lease lost, or a hard error): the top-level artifact
-    /// prefix's own [`ArtifactStore::delete_artifact_prefix`] call reads and
-    /// deletes only ITS OWN `manifest.json`'s files — it does not reach into
-    /// the nested `checkpoints/epoch_{N}/` prefixes, each of which carries its
-    /// own separate manifest (unit 348). Without this, a losing/crashed
-    /// attempt's epoch-checkpoint bytes would be orphaned forever, unreachable
-    /// by ANY existing GC path (family E: the term that grows — per-attempt
-    /// storage across every reclaimed/failed attempt — must be bounded, not
-    /// left to accumulate). No catalog row exists for these bytes at this
-    /// point (finalize did not win, so [`Catalog::finalize_training_job`]
-    /// never reached its epoch-row inserts), so deleting them here is safe by
-    /// the same reasoning [`TrainingLoop::save_epoch_checkpoint`]'s own
-    /// mid-run retention prune uses.
+    /// Best-effort GC of THIS attempt's epoch-checkpoint bytes on any
+    /// terminating path that is not the finalize-CAS winner (unit 348,
+    /// F1/F2). Derives every candidate prefix directly from the attempt's
+    /// identity (`job_id`/`worker_id`/`attempt`) and the run's CONFIGURED
+    /// epoch bound — by construction, never from the in-memory
+    /// `TrainedArtifact::epoch_checkpoints` vec, which simply does not exist
+    /// on most of the paths that call this: a panic, a `spawn_blocking` join
+    /// error, a typed training failure, a lease-lost cancel, a final-artifact
+    /// publish failure, or a `register_model` failure all return (or bail)
+    /// before ever building a `TrainedArtifact`. The one arm that DOES have
+    /// the vec (a completed run whose finalize CAS then loses) still goes
+    /// through this same derived sweep — there is exactly ONE reclaim
+    /// mechanism, called from every terminating arm, not a vec-based
+    /// mechanism for the lucky case and a derived one for the rest.
     ///
-    /// [`Catalog::finalize_training_job`]: jammi_db::catalog::Catalog::finalize_training_job
-    /// [`TrainingLoop::save_epoch_checkpoint`]: crate::fine_tune::trainer::TrainingLoop
-    async fn gc_orphaned_epoch_checkpoints(
+    /// [`ArtifactStore::delete_epoch_checkpoint`] is already a no-op for any
+    /// index that was never written (an absent manifest is "nothing durable
+    /// to reclaim", not an error — the same rule
+    /// [`ArtifactStore::delete_artifact_prefix`] applies), so sweeping the
+    /// full `[0, epochs)` configured range costs at most `epochs` no-op reads
+    /// beyond whatever indices actually existed — correct regardless of how
+    /// far training got, or whether it ever ran a single epoch boundary.
+    /// `epoch_checkpoint_bound` is `0` for a kind with no per-epoch
+    /// checkpointing (the context-predictor path; v1 out of scope), making
+    /// the sweep itself a no-op there.
+    ///
+    /// This is the ONE reclaim path (family E, the term that grows — every
+    /// reclaimed/failed attempt's per-epoch storage — must be bounded, not
+    /// left to accumulate). It reaches a LIVE process that survives to call
+    /// it; a process that crashes before reaching ANY of these call sites at
+    /// all is the one residual case nothing here (or the pre-existing
+    /// top-level artifact-prefix GC) reaches — durable-but-permanently-
+    /// unregistered, the expected residual (documented on
+    /// [`jammi_db::catalog::training_repo::EpochCheckpointRow`]).
+    async fn gc_epoch_checkpoints(
         store: &ArtifactStore,
-        epoch_checkpoints: &[(usize, String)],
+        job_id: &str,
+        worker_id: &str,
+        attempt: u32,
+        epoch_checkpoint_bound: usize,
     ) {
-        for (_, path) in epoch_checkpoints {
-            if let Ok(url) = jammi_db::storage::StorageUrl::parse(path) {
-                store.delete_artifact_prefix(&url).await.ok();
-            }
+        let attempt = attempt.to_string();
+        for epoch in 0..epoch_checkpoint_bound {
+            store
+                .delete_epoch_checkpoint(job_id, worker_id, &attempt, epoch)
+                .await
+                .ok();
         }
     }
 
@@ -735,6 +849,11 @@ impl TrainingWorker {
             common,
             loader,
         } = run;
+        // Captured BEFORE `common.config` moves into `params` below (unit
+        // 348, F1/F2): the epoch bound the panic/join-error arms need to
+        // derive-and-sweep this attempt's epoch checkpoints, since neither
+        // arm ever builds a `TrainedArtifact` to read a count from.
+        let epoch_checkpoint_bound = common.config.epochs;
         let output_model_id = format!("jammi:fine-tuned:{job_id}");
         let model_source = ModelSource::parse(&common.base_model);
 
@@ -786,15 +905,41 @@ impl TrainingWorker {
             Ok(Ok(Ok(training))) => training,
             Ok(Ok(Err(e))) => return Err(classify(&cancel_for_classify, e)),
             Ok(Err(payload)) => {
+                // A panic on the blocking thread — no `TrainedArtifact` was
+                // ever built, but the panic could have happened after
+                // several epoch boundaries each already wrote a durable
+                // checkpoint. Derive-and-sweep every candidate index (unit
+                // 348, F1/F2) rather than leaving them reachable only via a
+                // vec this path never had.
+                Self::gc_epoch_checkpoints(
+                    &session.artifact_store(),
+                    job_id,
+                    &self.worker_id,
+                    attempt,
+                    epoch_checkpoint_bound,
+                )
+                .await;
                 return Err(WorkerJobError::Failed(format!(
                     "Panic: {}",
                     panic_message(payload.as_ref())
-                )))
+                )));
             }
             Err(join_err) => {
+                // Same reasoning as the panic arm immediately above: the
+                // blocking task never returned at all, so any epoch
+                // checkpoints it wrote before the join failed are reachable
+                // only through the derived sweep.
+                Self::gc_epoch_checkpoints(
+                    &session.artifact_store(),
+                    job_id,
+                    &self.worker_id,
+                    attempt,
+                    epoch_checkpoint_bound,
+                )
+                .await;
                 return Err(WorkerJobError::Failed(format!(
                     "training task join error: {join_err}"
-                )))
+                )));
             }
         };
 

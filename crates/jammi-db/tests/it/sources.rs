@@ -599,6 +599,18 @@ async fn single_file_ndjson_url_with_no_override_falls_back_and_serves_rows(back
     );
 }
 
+/// Zero-match guard test group (`closes_escape: esc-036-directory-source-silently-lists-zero-files`).
+///
+/// esc-036 (`.jammi/escapes.jsonl`) named a directory/file source whose
+/// listing extension mismatches its actual files as silently resolving to a
+/// schema-less, row-less table with no diagnostic — no CLI-reachable
+/// override existed to rescue it, and no test exercised a mismatched
+/// extension at all. This function and its three siblings —
+/// [`single_zero_byte_jsonl_file_is_a_loud_error_not_a_silent_empty_table`],
+/// [`directory_of_only_zero_byte_jsonl_files_is_a_loud_error_not_a_silent_empty_table`],
+/// and [`zero_match_guard_also_fires_on_a_non_jsonl_format`] — are that
+/// missing coverage: every one asserts a typed error naming BOTH the
+/// applied extension and the url, never a silent empty success.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
@@ -645,122 +657,6 @@ async fn single_file_source_with_zero_extension_match_is_a_loud_error(backend: B
         !message.contains(".ndjson"),
         "an explicit override must disable the adaptive fallback, not just fail the same way \
          it would: {message}"
-    );
-}
-
-#[test_case(BackendKind::Sqlite ; "sqlite")]
-#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
-#[tokio::test]
-async fn explicit_extension_override_bypasses_the_adaptive_fallback_and_serves_only_that_extension(
-    backend: BackendKind,
-) {
-    let dir = tempdir().unwrap();
-    let session = session_or_skip!(backend, dir);
-
-    // A directory holding BOTH a `.jsonl` file (2 rows) and an `.ndjson` file
-    // (3 rows), with an EXPLICIT `.ndjson` override. The adaptive fallback
-    // (unset override) would resolve to `.jsonl` here (it always wins when
-    // both are present — see the mixed-directory test above); an
-    // implementation that ignored the override and ran the adaptive
-    // resolution anyway would therefore serve the WRONG row count (2, not
-    // 3) — a positive oracle stronger than merely "the override still
-    // errors on a mismatch".
-    let listing_dir = dir.path().join("override_mixed");
-    std::fs::create_dir_all(&listing_dir).unwrap();
-    std::fs::write(listing_dir.join("a.jsonl"), "{\"id\": 1}\n{\"id\": 2}\n").unwrap();
-    std::fs::write(
-        listing_dir.join("b.ndjson"),
-        "{\"id\": 3}\n{\"id\": 4}\n{\"id\": 5}\n",
-    )
-    .unwrap();
-
-    let events_id = format!("override_mixed_{}", unique_suffix());
-    session
-        .add_source(
-            &events_id,
-            SourceType::File,
-            SourceConnection {
-                url: Some(format!("file://{}", listing_dir.display())),
-                format: Some(FileFormat::JsonLines),
-                file_extension: Some(".ndjson".to_string()),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-
-    let results = session
-        .sql(&format!("SELECT id FROM {events_id}.public.override_mixed"))
-        .await
-        .unwrap();
-    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(
-        total_rows, 3,
-        "an explicit .ndjson override must serve the .ndjson rows even though .jsonl is present \
-         and would otherwise win the adaptive resolution"
-    );
-}
-
-#[test_case(BackendKind::Sqlite ; "sqlite")]
-#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
-#[tokio::test]
-async fn empty_file_extension_override_is_a_typed_refusal(backend: BackendKind) {
-    let dir = tempdir().unwrap();
-    let session = session_or_skip!(backend, dir);
-
-    let fixture_path = dir.path().join("events.jsonl");
-    std::fs::write(&fixture_path, "{\"id\": 1}\n{\"id\": 2}\n").unwrap();
-
-    let err = session
-        .add_source(
-            &format!("empty_ext_{}", unique_suffix()),
-            SourceType::File,
-            SourceConnection {
-                url: Some(format!("file://{}", fixture_path.display())),
-                format: Some(FileFormat::JsonLines),
-                file_extension: Some(String::new()),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("file_extension"),
-        "an empty file_extension override must be a typed refusal naming the field: {err}"
-    );
-}
-
-#[test_case(BackendKind::Sqlite ; "sqlite")]
-#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
-#[tokio::test]
-async fn file_extension_override_without_a_leading_dot_is_a_typed_refusal(backend: BackendKind) {
-    let dir = tempdir().unwrap();
-    let session = session_or_skip!(backend, dir);
-
-    let fixture_path = dir.path().join("events.jsonl");
-    std::fs::write(&fixture_path, "{\"id\": 1}\n{\"id\": 2}\n").unwrap();
-
-    // "jsonl" (no leading `.`) is the exact off-by-one a caller who forgot
-    // the dot would write — this must be a typed refusal at the edge, never
-    // a listing that silently matches nothing (or a broader glob than the
-    // caller intended).
-    let err = session
-        .add_source(
-            &format!("no_dot_ext_{}", unique_suffix()),
-            SourceType::File,
-            SourceConnection {
-                url: Some(format!("file://{}", fixture_path.display())),
-                format: Some(FileFormat::JsonLines),
-                file_extension: Some("jsonl".to_string()),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("file_extension"),
-        "a leading-dot-less file_extension override must be a typed refusal naming the field: \
-         {err}"
     );
 }
 
@@ -885,6 +781,122 @@ async fn zero_match_guard_also_fires_on_a_non_jsonl_format(backend: BackendKind)
     assert!(
         message.contains(&fixture_path.display().to_string()),
         "error must name the url that matched nothing: {message}"
+    );
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn explicit_extension_override_bypasses_the_adaptive_fallback_and_serves_only_that_extension(
+    backend: BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let session = session_or_skip!(backend, dir);
+
+    // A directory holding BOTH a `.jsonl` file (2 rows) and an `.ndjson` file
+    // (3 rows), with an EXPLICIT `.ndjson` override. The adaptive fallback
+    // (unset override) would resolve to `.jsonl` here (it always wins when
+    // both are present — see the mixed-directory test above); an
+    // implementation that ignored the override and ran the adaptive
+    // resolution anyway would therefore serve the WRONG row count (2, not
+    // 3) — a positive oracle stronger than merely "the override still
+    // errors on a mismatch".
+    let listing_dir = dir.path().join("override_mixed");
+    std::fs::create_dir_all(&listing_dir).unwrap();
+    std::fs::write(listing_dir.join("a.jsonl"), "{\"id\": 1}\n{\"id\": 2}\n").unwrap();
+    std::fs::write(
+        listing_dir.join("b.ndjson"),
+        "{\"id\": 3}\n{\"id\": 4}\n{\"id\": 5}\n",
+    )
+    .unwrap();
+
+    let events_id = format!("override_mixed_{}", unique_suffix());
+    session
+        .add_source(
+            &events_id,
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", listing_dir.display())),
+                format: Some(FileFormat::JsonLines),
+                file_extension: Some(".ndjson".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let results = session
+        .sql(&format!("SELECT id FROM {events_id}.public.override_mixed"))
+        .await
+        .unwrap();
+    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 3,
+        "an explicit .ndjson override must serve the .ndjson rows even though .jsonl is present \
+         and would otherwise win the adaptive resolution"
+    );
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn empty_file_extension_override_is_a_typed_refusal(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let session = session_or_skip!(backend, dir);
+
+    let fixture_path = dir.path().join("events.jsonl");
+    std::fs::write(&fixture_path, "{\"id\": 1}\n{\"id\": 2}\n").unwrap();
+
+    let err = session
+        .add_source(
+            &format!("empty_ext_{}", unique_suffix()),
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", fixture_path.display())),
+                format: Some(FileFormat::JsonLines),
+                file_extension: Some(String::new()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("file_extension"),
+        "an empty file_extension override must be a typed refusal naming the field: {err}"
+    );
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn file_extension_override_without_a_leading_dot_is_a_typed_refusal(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let session = session_or_skip!(backend, dir);
+
+    let fixture_path = dir.path().join("events.jsonl");
+    std::fs::write(&fixture_path, "{\"id\": 1}\n{\"id\": 2}\n").unwrap();
+
+    // "jsonl" (no leading `.`) is the exact off-by-one a caller who forgot
+    // the dot would write — this must be a typed refusal at the edge, never
+    // a listing that silently matches nothing (or a broader glob than the
+    // caller intended).
+    let err = session
+        .add_source(
+            &format!("no_dot_ext_{}", unique_suffix()),
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", fixture_path.display())),
+                format: Some(FileFormat::JsonLines),
+                file_extension: Some("jsonl".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("file_extension"),
+        "a leading-dot-less file_extension override must be a typed refusal naming the field: \
+         {err}"
     );
 }
 

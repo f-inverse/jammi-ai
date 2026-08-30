@@ -65,6 +65,9 @@ async fn list_matching_files(
 /// the url, never a silently registered column-less, row-less table
 /// (DataFusion's schema inference succeeds over an empty file list) — this
 /// applies to every format (parquet/csv/json/jsonl), not just one.
+/// `closes_escape: esc-036-directory-source-silently-lists-zero-files`
+/// (`.jammi/escapes.jsonl`) — this guard closes esc-036's silent-zero-files
+/// class.
 ///
 /// [`FileFormat::JsonLines`] additionally gets an ADAPTIVE default extension
 /// when the caller has not overridden `file_extension` explicitly: `.jsonl`

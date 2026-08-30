@@ -6215,5 +6215,91 @@ class Round2AuditFoldInTests(unittest.TestCase):
         self.assertEqual(rc, 0)
 
 
+class CrossRunPremiseTriStateTests(unittest.TestCase):
+    """Adversarial audit fix: `leg_premise_violations_cross_run` (F3) must
+    be able to state a POSITIVE "checked and clean" fact (`[]`), never
+    collapse "checked, clean" and "never checked" onto the SAME `None`
+    value the way an earlier version of `cross_run_premise_violations_list`
+    did (reproduced live against `ci/artifacts/finetune-ab-runs/
+    2026-08-30-full-sweep-acce7b3d-a100-pcie/finetune_ab_report.json`,
+    which reads `null` there on every config despite every relevant leg
+    being `OK` throughout that run -- that artifact predates this fix, see
+    its own README).
+    """
+
+    def run_merge(self, raw_dir):
+        out_dir = tempfile.mkdtemp()
+        rc = ab_merge.main([raw_dir, out_dir, "20", "5", "0.9"])
+        with open(os.path.join(out_dir, "finetune_ab_report.json")) as fh:
+            merged = json.load(fh)
+        return rc, merged
+
+    def test_all_ok_two_run_config_reads_checked_clean_not_none(self):
+        """Every bar leg OK, both runs, no drift -- the cross-run check
+        RAN (both sub-comparisons had two OK legs to compare) and found
+        nothing, so the field must read `[]` (checked, clean), never
+        `None` (which would mean "never checked" -- FALSE here).
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES)
+            write_second_run(raw_dir, "b8-s128-d0")
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertEqual(cfg["leg_premise_violations_cross_run"], [])
+        self.assertIsNotNone(cfg["leg_premise_violations_cross_run"])
+        self.assertTrue(cfg["verdict"].startswith("PASS"), cfg["verdict"])
+        self.assertEqual(rc, 0)
+
+    def test_legacy_single_run_config_still_reads_none(self):
+        """No second run at all -- neither sub-comparison ever had two OK
+        legs to compare, so the field must stay `None` (genuinely
+        unchecked), never collapse to `[]` just because nothing went
+        wrong elsewhere.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES)
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertIsNone(cfg["leg_premise_violations_cross_run"])
+        self.assertTrue(cfg["verdict"].startswith("PASS"), cfg["verdict"])
+        self.assertEqual(rc, 0)
+
+    def test_one_side_checked_clean_other_side_unavailable_still_reads_checked(self):
+        """Only the jammi-vs-jammi-2 sub-comparison has two OK legs (e.g.
+        torch-sdpa-2 OOM'd) -- the field must still flip to `[]` (checked
+        via that ONE sub-comparison), not stay `None` just because the
+        OTHER sub-comparison never ran.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES)
+            write_leg(raw_dir, "b8-s128-d0", "jammi-fused-2", report=jammi_fs(_CLEAN_YES_DISPATCHES))
+            write_leg(
+                raw_dir, "b8-s128-d0", "torch-sdpa-2",
+                exit_code=1, stderr="RuntimeError: CUDA error: out of memory",
+            )
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertEqual(cfg["leg_premise_violations_cross_run"], [])
+
+    def test_a_real_cross_run_violation_still_reports_the_drift(self):
+        """Non-vacuity: the tri-state fix must not have accidentally
+        weakened the VIOLATION-reporting arm -- a genuine cross-run drift
+        still populates the list with the actual violation.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES)  # run1: seed=42, seq=128
+            write_leg(
+                raw_dir, "b8-s128-d0", "jammi-fused-2",
+                report=jammi_fs(_CLEAN_YES_DISPATCHES, seed=7, seq=1024),
+            )
+            write_leg(raw_dir, "b8-s128-d0", "torch-sdpa-2", report=torch_fs(seed=7, seq=1024))
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertTrue(cfg["leg_premise_violations_cross_run"])
+        self.assertTrue(any("seed" in v for v in cfg["leg_premise_violations_cross_run"]))
+        self.assertTrue(cfg["verdict"].startswith(ab_merge.FINETUNE_AB_VERDICT_INVALID_PREFIX), cfg["verdict"])
+        self.assertEqual(rc, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

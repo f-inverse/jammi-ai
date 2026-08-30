@@ -1339,6 +1339,24 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
         # torch-vs-torch pair) to diff them -- the SAME `_MISSING`
         # sentinel and `canonicalize_identity_field` table both paths
         # share, never a third, independently-drifting comparator.
+        # Tri-state, fixed (adversarial audit, the None-vs-[] collapse this
+        # field used to have): `None` means "not checked at all" (neither
+        # sub-comparison below had both its legs `OK`); an empty `[]`
+        # means "checked -- at least one sub-comparison RAN -- and found
+        # NO drift"; a non-empty list means "checked and found drift".
+        # `(cross_run_premise_violations_list or []) + v` is the operative
+        # line in EACH branch below: the FIRST branch that actually runs
+        # flips the sentinel from `None` to a real (possibly empty) list
+        # UNCONDITIONALLY, not merely when `v` is truthy -- an earlier
+        # version of this code only ever assigned inside `if v:`, so
+        # "checked, clean" and "never checked" were BOTH `None`, making
+        # this field unable to state a positive "the cross-run premise
+        # was verified" fact at all (reproduced live: every config in
+        # `ci/artifacts/finetune-ab-runs/2026-08-30-full-sweep-acce7b3d-
+        # a100-pcie/finetune_ab_report.json` reads `null` here despite
+        # every relevant leg being `OK` throughout that run -- see that
+        # artifact's own README for the honest accounting, predating this
+        # fix).
         cross_run_premise_violations_list = None
         if entries["jammi-fused"]["outcome"] == "OK" and second_run_entries[jammi_fused_2_leg]["outcome"] == "OK":
             jammi_run1_fields = leg_identity_fields(entries["jammi-fused"]["report"], "jammi-fused")
@@ -1347,8 +1365,7 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
                 FINETUNE_IDENTITY_FIELDS, jammi_run1_fields, jammi_run2_fields,
                 label_a="jammi-fused", label_b=jammi_fused_2_leg,
             )
-            if v:
-                cross_run_premise_violations_list = list(v)
+            cross_run_premise_violations_list = (cross_run_premise_violations_list or []) + v
         if entries["torch-sdpa"]["outcome"] == "OK" and second_run_entries[torch_sdpa_2_leg]["outcome"] == "OK":
             torch_run1_fields = leg_identity_fields(entries["torch-sdpa"]["report"], "torch-sdpa")
             torch_run2_fields = leg_identity_fields(second_run_entries[torch_sdpa_2_leg]["report"], torch_sdpa_2_leg)
@@ -1356,8 +1373,7 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
                 FINETUNE_IDENTITY_FIELDS, torch_run1_fields, torch_run2_fields,
                 label_a="torch-sdpa", label_b=torch_sdpa_2_leg,
             )
-            if v:
-                cross_run_premise_violations_list = (cross_run_premise_violations_list or []) + v
+            cross_run_premise_violations_list = (cross_run_premise_violations_list or []) + v
 
         for leg in LEGS:
             err_tail = entries[leg]["err_tail"]
@@ -1687,8 +1703,22 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
             ),
             # F3 — cross-RUN premise (jammi-fused vs jammi-fused-2,
             # torch-sdpa vs torch-sdpa-2), independent of the two SAME-run
-            # checks above. `None` (never an empty list) when neither
-            # cross-run pair had both sides `OK` to compare.
+            # checks above. TRI-STATE (adversarial audit fix — an earlier
+            # version of this field could only ever read `None` or a
+            # non-empty violations list, never a POSITIVE "checked and
+            # clean" confirmation; see `cross_run_premise_violations_list`'s
+            # own doc, just above where this value is computed, for the
+            # full history):
+            #   * `None`  -- UNCHECKED: neither cross-run sub-comparison
+            #     (jammi-fused vs jammi-fused-2, torch-sdpa vs
+            #     torch-sdpa-2) had both its own legs read `OK` -- a
+            #     legacy single-run `raw_dir` (no second run at all) reads
+            #     this, always.
+            #   * `[]`    -- CHECKED, CLEAN: at least one sub-comparison
+            #     ran and found no drift.
+            #   * `[...]` -- CHECKED, VIOLATIONS: at least one
+            #     sub-comparison ran and found drift (the strings name the
+            #     field and the two legs' differing values).
             "leg_premise_violations_cross_run": cross_run_premise_violations_list,
             # F2 — `None` unless `two_run_protocol` (top-level) is `True`
             # AND at least one second-run bar leg genuinely never ran

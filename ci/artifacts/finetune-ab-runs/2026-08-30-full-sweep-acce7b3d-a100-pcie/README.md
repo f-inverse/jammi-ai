@@ -112,6 +112,21 @@ here — only that no violation is recorded. Flagged as a follow-up finding,
 not fixed in this commit (fixing it would break this README's own
 "zero functional delta since `acce7b3d`" claim above).
 
+**Update (post-artifact):** the None-vs-`[]` convention fix landed in a
+LATER commit than the one that produced this artifact (see `CrossRunPremiseTriStateTests`
+in `test_ab_merge.py`), so this run's own `null` above still reads as
+"unchecked" under the OLD convention this artifact predates — it is NOT
+retroactively a `[]` under the new one. What this artifact still proves,
+independent of that convention: every relevant leg (`jammi-fused`,
+`jammi-fused-2`, `torch-sdpa`, `torch-sdpa-2`) is `OK`, and the report
+carries no cross-run VIOLATION anywhere — checked-clean-in-substance is
+established by the report's own absence of a violation entry plus the
+fixed suite's `test_all_ok_two_run_config_reads_checked_clean_not_none`
+(an all-`OK` two-run fixture, the same shape this run's own six configs
+share, now reads `[]` under the current code), not by this artifact's own
+`null` field, which is honestly a relic of the convention it was measured
+under.
+
 ## jammi-eager (context leg) OOM — four configs, not one
 
 `jammi-eager` is a single, non-repeated context leg (never part of the bar

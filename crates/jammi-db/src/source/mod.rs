@@ -51,14 +51,18 @@ pub enum FileFormat {
     /// [`crate::source::file_format::create_listing_table`]) — `.jsonl`
     /// always wins when a directory holds both. This is the only reachable
     /// path onto an `.ndjson` corpus: no wire or CLI surface names `.ndjson`
-    /// directly. This resolution runs exactly ONCE, at registration, and is
-    /// then PINNED into the persisted [`SourceConnection::file_extension`] —
-    /// every later `reload_sources` replay passes that pinned value as an
-    /// explicit override, so a directory change after registration (a
-    /// `.jsonl` file added to a corpus that resolved to `.ndjson`, or vice
-    /// versa) can never silently flip which files a reload serves. An
-    /// explicit `file_extension` override supplied by the caller up front
-    /// disables the fallback from the start and is honoured literally.
+    /// directly. For a source registered through
+    /// [`crate::session::JammiSession::add_source`], this resolution runs
+    /// exactly ONCE, at registration, and is then PINNED into the persisted
+    /// [`SourceConnection::file_extension`] — every later `reload_sources`
+    /// replay of THAT source passes the pinned value as an explicit
+    /// override, so a directory change after registration (a `.jsonl` file
+    /// added to a corpus that resolved to `.ndjson`, or vice versa) can
+    /// never silently flip which files a reload serves. `reload_sources`
+    /// itself never backfills the pin, so a catalog row written some other
+    /// way carries no such guarantee. An explicit `file_extension` override
+    /// supplied by the caller up front disables the fallback from the start
+    /// and is honoured literally.
     JsonLines,
     /// Apache Avro binary format.
     Avro,

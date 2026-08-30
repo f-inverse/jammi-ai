@@ -704,6 +704,69 @@ async fn explicit_extension_override_bypasses_the_adaptive_fallback_and_serves_o
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
+async fn empty_file_extension_override_is_a_typed_refusal(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let session = session_or_skip!(backend, dir);
+
+    let fixture_path = dir.path().join("events.jsonl");
+    std::fs::write(&fixture_path, "{\"id\": 1}\n{\"id\": 2}\n").unwrap();
+
+    let err = session
+        .add_source(
+            &format!("empty_ext_{}", unique_suffix()),
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", fixture_path.display())),
+                format: Some(FileFormat::JsonLines),
+                file_extension: Some(String::new()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("file_extension"),
+        "an empty file_extension override must be a typed refusal naming the field: {err}"
+    );
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn file_extension_override_without_a_leading_dot_is_a_typed_refusal(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let session = session_or_skip!(backend, dir);
+
+    let fixture_path = dir.path().join("events.jsonl");
+    std::fs::write(&fixture_path, "{\"id\": 1}\n{\"id\": 2}\n").unwrap();
+
+    // "jsonl" (no leading `.`) is the exact off-by-one a caller who forgot
+    // the dot would write — this must be a typed refusal at the edge, never
+    // a listing that silently matches nothing (or a broader glob than the
+    // caller intended).
+    let err = session
+        .add_source(
+            &format!("no_dot_ext_{}", unique_suffix()),
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", fixture_path.display())),
+                format: Some(FileFormat::JsonLines),
+                file_extension: Some("jsonl".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("file_extension"),
+        "a leading-dot-less file_extension override must be a typed refusal naming the field: \
+         {err}"
+    );
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
 async fn single_zero_byte_jsonl_file_is_a_loud_error_not_a_silent_empty_table(
     backend: BackendKind,
 ) {
@@ -896,6 +959,79 @@ async fn adaptive_extension_is_pinned_at_registration_and_survives_a_later_exten
         record.connection.file_extension.as_deref(),
         Some(".ndjson"),
         "the resolved extension must be persisted as an explicit override"
+    );
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn jsonl_arm_pin_survives_a_files_swapped_to_ndjson_and_reload_fails_loudly(
+    backend: BackendKind,
+) {
+    // The mirror of `adaptive_extension_is_pinned_at_registration_and_
+    // survives_a_later_extension_flip` above, which only exercised the
+    // `.ndjson`-wins arm — a mutation that pins the `.jsonl`-wins arm's
+    // resolution as `None` (never persisting it) would pass that test but
+    // MUST be caught here.
+    let dir = tempdir().unwrap();
+    let source_id = format!("jsonl_pin_{}", unique_suffix());
+    let listing_dir = dir.path().join("jsonl_pin_corpus");
+
+    {
+        let session = session_or_skip!(backend, dir);
+        std::fs::create_dir_all(&listing_dir).unwrap();
+        // Only `.jsonl` present at registration: the adaptive fallback
+        // resolves to `.jsonl` — the FIRST-tried extension — and THAT must
+        // get pinned.
+        std::fs::write(listing_dir.join("a.jsonl"), "{\"id\": 1}\n{\"id\": 2}\n").unwrap();
+        session
+            .add_source(
+                &source_id,
+                SourceType::File,
+                SourceConnection {
+                    url: Some(format!("file://{}", listing_dir.display())),
+                    format: Some(FileFormat::JsonLines),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let sources = session.catalog().list_all_sources().await.unwrap();
+        let record = sources
+            .iter()
+            .find(|s| s.source_id == source_id)
+            .expect("source must be registered");
+        assert_eq!(
+            record.connection.file_extension.as_deref(),
+            Some(".jsonl"),
+            "the .jsonl arm (not just the .ndjson arm) must pin its resolved extension"
+        );
+    }
+
+    // Swap the corpus entirely: delete the `.jsonl` file, add an `.ndjson`
+    // file with DIFFERENT rows. Without the pin, a re-derived adaptive
+    // resolution on reload would find `.jsonl` empty and silently fall back
+    // to the new `.ndjson` file — serving DIFFERENT rows with no error, the
+    // same class of silent substitution `reload_survives_a_source_whose_
+    // files_vanished_after_registration` below already forbids for the
+    // simpler "files just vanish" case. WITH the pin, the reload passes the
+    // pinned `.jsonl` extension as an explicit override, finds zero
+    // matches, and the source must fail loudly and stay unqueryable —
+    // never silently substitute the `.ndjson` rows.
+    std::fs::remove_file(listing_dir.join("a.jsonl")).unwrap();
+    std::fs::write(listing_dir.join("b.ndjson"), "{\"id\": 99}\n").unwrap();
+
+    let session = session_or_skip!(backend, dir);
+    let result = session
+        .sql(&format!(
+            "SELECT id FROM {source_id}.public.jsonl_pin_corpus"
+        ))
+        .await;
+    assert!(
+        result.is_err(),
+        "a source pinned to .jsonl must fail loudly on reload when its .jsonl files vanish, not \
+         silently serve the newly-added .ndjson rows"
     );
 }
 

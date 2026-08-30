@@ -595,11 +595,14 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   `JsonLines` parses `"jsonl"`/`"ndjson"`, otherwise shares `Json`'s
   line-delimited reader). With no explicit `file_extension` override,
   `create_listing_table` tries `.jsonl` first and falls back to `.ndjson`
-  only when `.jsonl` has zero matches; the winning extension is RESOLVED
-  ONCE AT REGISTRATION and PINNED into the persisted `SourceConnection` (the
-  same persist-so-`reload_sources`-replays-it pattern `tenant_column` uses)
-  so a later directory change can never silently flip which files a reload
-  serves. `SourceConnection`
+  only when `.jsonl` has zero matches; for a source added through
+  [`JammiSession::add_source`], the winning extension is RESOLVED ONCE AT
+  REGISTRATION and PINNED into the persisted `SourceConnection` (the same
+  persist-so-`reload_sources`-replays-it pattern `tenant_column` uses) so a
+  later directory change can never silently flip which files a reload
+  serves — `reload_sources` itself never backfills the pin, so this
+  guarantee covers only a source `add_source` registered under this fix,
+  not a row written some other way. `SourceConnection`
   (`crates/jammi-db/src/source/mod.rs`) JSON-serializes into `sources.options`, so
   new fields round-trip automatically.
 - **`MutableBackend`** — `crates/jammi-db/src/store/mutable/mod.rs` (the

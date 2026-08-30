@@ -12,7 +12,7 @@ Three independent test surfaces:
   `DryRunSmokeTests` (`PROFILE_356_LEGS_DRY_RUN=1`): the whole 14-leg
   sweep, hermetically -- no GPU, no real `nsys`, no real checkpoint, no
   network. `$NSYS_BIN`/`$BENCH_BIN` are swapped for hermetic fake
-  stand-ins (`profile_356_legs.sh`'s own `$DRY_RUN_FAKE_DIR` mechanism)
+  stand-ins (`profile_356_legs.sh`'s own `$DRY_RUN_STUB_DIR` mechanism)
   and ACTUALLY EXECUTED through the real capture path (round-2 audit
   BLOCK 1's own "CRITICAL": a hand-shaped stub that bypassed the capture
   machinery entirely structurally could not catch a bug IN that
@@ -48,10 +48,16 @@ Three independent test surfaces:
   the auditor's own empirical reproduction (a failing `nsys --version`
   used to abort the WHOLE sweep mid-leg via an unguarded `set -e`-fatal
   command, with no manifest for the failing leg). Asserts the sweep still
-  completes for EVERY leg, each with a status="ok" manifest recording the
-  degraded `nsys_version` string -- proves the fix (moved to a ONCE,
-  guarded, start-of-script computation) eliminates the whole failure
-  class, not merely "the next leg still runs".
+  completes for EVERY leg, each with a manifest recording the degraded
+  `nsys_version` string -- proves the fix (moved to a ONCE, guarded,
+  start-of-script computation) eliminates the whole failure class, not
+  merely "the next leg still runs". Both legs ARE legitimately recorded
+  status="invalid" in this test (this bare fake nsys cannot produce a
+  real CUPTI-table sqlite export at all, so `kernel_census.py` refuses
+  each leg on its own, unrelated domain check) -- the assertion that
+  actually matters is that neither leg's recorded `reason` mentions the
+  version failure, proving the INVALID status has nothing to do with the
+  bug this test targets.
 
 Run: `python3 ci/scripts/perf/test_profile_356_legs_dry_run.py`
 """
@@ -288,6 +294,13 @@ _FAKE_BENCH_STUB = r"""#!/usr/bin/env bash
 #                          entirely -- no override needed to omit it).
 #   broken              -- --help is fine; the probe finetune-run FAILS with
 #                          an unrelated error.
+#   broken_envelope     -- --help is fine; finetune-run exits 0 but prints a
+#                          stray banner line BEFORE its JSON, corrupting the
+#                          report file the exec-wrapper captures (round-2
+#                          audit BLOCK 1(c)'s own _validate_report_envelope
+#                          failing path, driven for real through the actual
+#                          capture machinery, not just unit-tested in
+#                          isolation).
 set -euo pipefail
 
 if [ "$1" = "provenance" ]; then
@@ -317,6 +330,43 @@ if [ "$1" = "finetune-run" ]; then
     broken)
       echo "finetune-run failed: some completely unrelated catastrophic error" >&2
       exit 1
+      ;;
+    broken_envelope)
+      # The preflight probe ALWAYS targets $MODEL_DIR_DISTILBERT -- answer
+      # IT with a clean, pass-shaped envelope regardless, so this mode
+      # only corrupts a REAL leg's own finetune-run invocation (whichever
+      # model-dir that leg's own architecture actually uses), never the
+      # one-time probe call every real-mode run makes first.
+      is_probe=0
+      prev_arg=""
+      for a in "$@"; do
+        if [ "$prev_arg" = "--model-dir" ] && [ "$a" = "$MODEL_DIR_DISTILBERT" ]; then
+          is_probe=1
+        fi
+        prev_arg="$a"
+      done
+      if [ "$is_probe" = "1" ]; then
+        python3 -c '
+import copy, json, sys
+golden = json.load(open(sys.argv[1]))
+tier = copy.deepcopy(golden["tiers"]["finetune_run"])
+tier["train_run_wall_s"] = 1.23
+tier.pop("steps_measured", None)
+print(json.dumps({"tool": "finetune-run", "tiers": {"finetune_run": tier}}))
+' "$FAKE_BENCH_GOLDEN"
+        exit 0
+      fi
+      # A stray line on stdout BEFORE the JSON -- the exec-wrapper
+      # redirects THIS process's entire stdout to the report file, so this
+      # banner line lands in the report file too, breaking json.load.
+      echo "unexpected startup banner noise from a buggy bench binary"
+      python3 -c '
+import json, sys
+golden = json.load(open(sys.argv[1]))
+tier = golden["tiers"]["finetune_run"]
+print(json.dumps({"tool": "finetune-run", "tiers": {"finetune_run": tier}}))
+' "$FAKE_BENCH_GOLDEN"
+      exit 0
       ;;
     wall_missing)
       python3 -c '
@@ -555,6 +605,67 @@ class MidSweepNsysFailureTests(unittest.TestCase):
                 self.assertIn("nsys --version failed", manifest["nsys_version"], manifest)
                 self.assertNotIn("--version", manifest["reason"], manifest)
                 self.assertNotIn("nsys_version", manifest["reason"], manifest)
+
+
+class ReportEnvelopeValidationFailureTests(unittest.TestCase):
+    """Round-3 audit item 5: drives `_validate_report_envelope`'s own
+    FAILING path through the REAL (non-dry) capture machinery, not just
+    the pure function in isolation -- a fake bench that emits a stray
+    stdout banner line before its JSON, corrupting the exact file the
+    exec-wrapper writes. Also pins the fix for the "operator pointed at a
+    file that does not contain the cause" gap: `run_traced` tees the
+    validation error into `$run_prefix.stderr`, so the leg's own recorded
+    `reason` (which names that file) is no longer misleading."""
+
+    def test_stray_stdout_banner_corrupts_the_report_and_is_recorded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_bench = Path(tmp) / "fake_bench.sh"
+            fake_nsys = Path(tmp) / "fake_nsys.sh"
+            _write_fake_bench_stub(fake_bench)
+            _write_stub(fake_nsys, _FAKE_NSYS_VERSION_FAILING_STUB)
+            out_dir = Path(tmp) / "out"
+            out_dir.mkdir()
+            env = dict(os.environ)
+            env["PROFILE_356_LEGS_DRY_RUN"] = "0"
+            env["PROFILE_356_LEGS_PREFLIGHT_ONLY"] = "0"
+            env["BENCH_BIN"] = str(fake_bench)
+            env["NSYS_BIN"] = str(fake_nsys)
+            env["MODEL_DIR_BERT"] = "/fake/bert-checkpoint-dir"
+            env["MODEL_DIR_DISTILBERT"] = "/fake/distilbert-checkpoint-dir"
+            env["OUT_DIR"] = str(out_dir)
+            env["FAKE_BENCH_MODE"] = "broken_envelope"
+            env["FAKE_BENCH_BUILD_SHA"] = _real_head()
+            env["FAKE_BENCH_GOLDEN"] = GOLDEN_FIXTURE
+            env["PROFILE_356_LEGS_ONLY"] = "bert-N1"
+            result = subprocess.run(
+                ["bash", SCRIPT], env=env, capture_output=True, text=True, timeout=120
+            )
+            # The sweep itself still completes (one leg, recorded invalid,
+            # never a script-wide abort).
+            self.assertEqual(result.returncode, 0, _fail_msg(result))
+            manifest_path = out_dir / "bert-N1" / "manifest.json"
+            self.assertTrue(manifest_path.is_file(), _fail_msg(result))
+            manifest = json.loads(manifest_path.read_text())
+            self.assertEqual(manifest["status"], "invalid", manifest)
+            # The recorded reason names report-envelope validation as ONE
+            # of the possible causes (round-3 audit item 5's "distinguish
+            # envelope-validation failure from a run failure" -- satisfied
+            # here via the file it points at containing the real cause,
+            # asserted next, rather than a separate reason-per-cause code).
+            self.assertIn("report-envelope validation", manifest["reason"], manifest)
+            # And the file that reason POINTS AT must actually contain the
+            # real cause -- not merely a silent, unhelpful nsys/bench log.
+            stderr_path = out_dir / "bert-N1" / "run_n.stderr"
+            self.assertTrue(stderr_path.is_file(), f"no {stderr_path}: {_fail_msg(result)}")
+            stderr_text = stderr_path.read_text()
+            self.assertIn("does not parse as JSON", stderr_text, stderr_text)
+            # The report file itself is genuinely corrupted (the banner
+            # line really did reach it, via the real exec-wrapper).
+            report_path = out_dir / "bert-N1" / "run_n.json"
+            report_text = report_path.read_text()
+            self.assertIn("unexpected startup banner noise", report_text)
+            with self.assertRaises(json.JSONDecodeError):
+                json.loads(report_text)
 
 
 if __name__ == "__main__":

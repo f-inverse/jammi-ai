@@ -89,6 +89,19 @@
 # by EXPLICIT guards, not by relying on `set -e`'s errexit-suspension
 # quirk alone).
 #
+# MANIFEST PATH -- TWO SHAPES: the normal, expected one is
+# `$OUT_DIR/<leg_id>/manifest.json` (this leg's own subdirectory,
+# alongside its corpus/run/census files). If `mkdir -p` for that
+# subdirectory itself fails (round-2 audit BLOCK 2's own "write a minimal
+# manifest even there"), this producer falls back to a FLAT
+# `$OUT_DIR/<leg_id>.manifest.json` instead (no subdirectory, since one
+# could not be created) -- the body still carries `leg_id`, so a consumer
+# can always identify which leg a manifest belongs to either way, but a
+# future reader globbing `*/manifest.json` under `$OUT_DIR` alone would
+# silently miss this flat, fallback-shaped one; glob BOTH
+# `*/manifest.json` and `*.manifest.json` (or simply `**/*manifest.json`)
+# to see every leg's result.
+#
 # WALL DENOMINATOR (v4): each run's own `train_run_wall_s` is read from
 # `tiers.finetune_run` in its JSON report and passed to `kernel_census.py`
 # as `--wall-a`/`--wall-b`, which derives `wall_s_per_step =
@@ -132,8 +145,13 @@
 # pollution arm); its own preflight arm drives
 # `PROFILE_356_LEGS_PREFLIGHT_ONLY=1` against a fake `$BENCH_BIN` stub
 # covering the pass case and each of the four distinguishable failure
-# arms; a fifth arm drives a mid-sweep `nsys --version` failure, asserting
-# the failing leg alone is recorded invalid and the NEXT leg still runs.
+# arms; a fifth arm drives a REAL (non-dry, non-preflight-only) multi-leg
+# run against a fake `$NSYS_BIN` whose `--version` deliberately fails,
+# asserting the WHOLE sweep still completes (both legs recorded, neither
+# one's reason naming the version failure) -- `--version` is captured
+# ONCE, guarded, before any leg runs (`$NSYS_VERSION` below), so a failing
+# `--version` degrades that ONE recorded string for every leg and aborts
+# nothing; it is not a per-leg concept the way it was before this fix.
 
 set -euo pipefail
 
@@ -572,9 +590,18 @@ run_traced() {
       2>> "$run_prefix.stderr" || rc=$?
   fi
 
-  if [ "$rc" -eq 0 ] && ! _validate_report_envelope "$out_json"; then
-    echo "::error::run_traced: $out_json failed report-envelope validation -- see stderr above" >&2
-    rc=1
+  if [ "$rc" -eq 0 ]; then
+    local validate_err
+    if ! validate_err="$(_validate_report_envelope "$out_json" 2>&1)"; then
+      # Teed into "$run_prefix.stderr" too (phase-4 round-3 audit item 5):
+      # run_leg's own recorded reason points the operator at THIS file for
+      # every run_traced failure, including this one -- without the tee,
+      # that file would contain only the (silent, rc=0) nsys/bench
+      # streams, never the actual envelope-validation cause.
+      printf '%s\n' "$validate_err" | tee -a "$run_prefix.stderr" >&2
+      echo "::error::run_traced: $out_json failed report-envelope validation -- see $run_prefix.stderr" >&2
+      rc=1
+    fi
   fi
   return "$rc"
 }
@@ -698,25 +725,39 @@ json.dump(manifest, open(os.environ["MANIFEST_OUT"], "w"), indent=1)
 '
 }
 
-# One leg, start to finish. ALWAYS returns 0 -- a leg's own failure lives
-# in its `manifest.json` (`status`/`reason`), never in this function's own
-# exit code, so one leg's OOM/refusal never discards any other leg.
+# One leg, start to finish. Returns 0 for every OUTCOME this leg's own
+# workload can produce -- a leg's own failure (corpus/run_traced/census/
+# counter-read) lives in its `manifest.json` (`status`/`reason`), never in
+# this function's own exit code, so one leg's OOM/refusal never discards
+# any other leg. TWO EXCEPTIONS, both deliberate and both a genuine
+# `exit 1` OUT OF THE WHOLE SCRIPT, never a silent `return`: a
+# `manifest.json` write itself failing (the fallback-manifest branch's own
+# `exit 1`, and the main end-of-leg one below) -- a manifest write failing
+# means this leg's result is UNRECOVERABLE (there is nowhere else to
+# record it), which this script treats as sweep-fatal by deliberate
+# design, stated loudly, never silently swallowed the way every OTHER
+# leg-level failure is.
 #
-# EVERY RISKY COMMAND IS EXPLICITLY GUARDED (phase-4 round-2 audit
+# EVERY OTHER RISKY COMMAND IS EXPLICITLY GUARDED (phase-4 round-2 audit
 # BLOCK 2): round-1's fix relied in part on `set -e`'s own "errexit is
 # suspended for a command tested by if/||" behavior propagating through
 # nested calls -- true, but ONLY for commands reachable that way; a
 # handful of PLAIN, untested commands (the old per-leg `nsys --version`
-# capture, the corpus `head` redirects, the `manifest.json` write itself)
-# were still exposed, and a real pod run reproduced exactly that: a
-# failing `nsys --version` aborted the WHOLE 14-leg sweep mid-leg with NO
-# manifest for the failing leg. Every one of those is now an explicit
-# `if ... ; then ... ; else leg_status=invalid; fi` (or, for the manifest
-# write itself, a loud, intentional `exit 1` -- see below) -- this
-# function's own "never aborts" guarantee no longer depends on the
-# calling convention at its OWN call site (the bottom loop calls it
-# plainly, verified: a bug inside `run_leg` cannot escape `run_leg` at
-# all now, regardless of how it is invoked).
+# capture, the corpus `head` redirects) were still exposed, and a real pod
+# run reproduced exactly that: a failing `nsys --version` aborted the
+# WHOLE 14-leg sweep mid-leg with NO manifest for the failing leg. Every
+# one of those is now an explicit `if ... ; then ... ; else
+# leg_status=invalid; fi` -- this function's own "never aborts on a
+# WORKLOAD failure" guarantee no longer depends on the calling convention
+# at its OWN call site (the bottom loop calls it plainly: a workload bug
+# inside `run_leg` cannot escape `run_leg` at all now, regardless of how
+# it is invoked -- ONLY the two named manifest-write exceptions above
+# still can, by design). A small number of near-infallible commands
+# (`mktemp -d`/`rm -rf` cleanup, the `: > file` truncations) remain
+# unguarded as an ACCEPTED residual -- these fail only under
+# resource-exhaustion conditions (disk full, out of file descriptors) that
+# would make continuing the sweep meaningless regardless, and guarding
+# them would add verbosity without a plausible corresponding gain.
 run_leg() {
   local spec="$1"
   IFS='|' read -r leg_id model batch width dtype target_modules layers_to_transform corpus_mode n_steps m_steps <<< "$spec"
@@ -826,7 +867,12 @@ run_leg() {
         "$target_modules" "$layers_to_transform" "$width" "$n_steps" \
         "$leg_dir/work_n" "$leg_dir/run_n" "$out_n" "$sqlite_n"; then
       leg_status="invalid"
-      leg_reason="run_traced (N-step run) failed -- see $leg_dir/run_n.stderr"
+      # "nsys/bench execution or report-envelope validation" -- run_traced
+      # returns nonzero for either cause; $run_n.stderr now ACTUALLY
+      # contains whichever one it was (validate_report_envelope's own
+      # error text is teed there too, round-3 audit item 5), so this file
+      # reference is a genuine pointer at the cause, not a guess.
+      leg_reason="run_traced (N-step run) failed (nsys/bench execution or report-envelope validation) -- see $leg_dir/run_n.stderr for the specific cause"
     fi
   fi
   if [ "$leg_status" = "ok" ]; then
@@ -834,7 +880,7 @@ run_leg() {
         "$target_modules" "$layers_to_transform" "$width" "$m_steps" \
         "$leg_dir/work_m" "$leg_dir/run_m" "$out_m" "$sqlite_m"; then
       leg_status="invalid"
-      leg_reason="run_traced (M-step run) failed -- see $leg_dir/run_m.stderr"
+      leg_reason="run_traced (M-step run) failed (nsys/bench execution or report-envelope validation) -- see $leg_dir/run_m.stderr for the specific cause"
     fi
   fi
 

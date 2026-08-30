@@ -9309,6 +9309,23 @@ mod epoch_checkpoint_retention_failure {
                 "epoch_0 must be on disk"
             );
             std::fs::set_permissions(&epoch0_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            // PROBE the injection before relying on it: root (and
+            // mode-ignoring filesystems) can delete through a 0o555
+            // directory, in which case the failed-prune premise this test
+            // asserts never exists — skip loudly, mirroring the
+            // `skip_on_cuda_capable_host` convention in candle.rs's
+            // device_tests (the same environment-conditional-test class).
+            let probe = epoch0_dir.join(".root_probe");
+            if std::fs::write(&probe, b"x").is_ok() {
+                let _ = std::fs::remove_file(&probe);
+                let _ =
+                    std::fs::set_permissions(&epoch0_dir, std::fs::Permissions::from_mode(0o755));
+                eprintln!(
+                    "epoch_checkpoint_retention_failure: skipping — fault injection \
+                     unavailable: process can write despite chmod (root?)"
+                );
+                return;
+            }
 
             // Epoch 1: writes (len 2 > keep 1), retention tries to prune
             // epoch_0 — FAILS (chmod'd). The entry must stay tracked, not be

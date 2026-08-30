@@ -2692,6 +2692,23 @@ async fn finalize_reclaims_a_persistently_failed_prune_and_warns() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     std::fs::set_permissions(&epoch0_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // PROBE the injection before relying on it: root (and mode-ignoring
+    // filesystems) can delete through a 0o555 directory, so the failed-prune
+    // premise never exists there — skip loudly (the environment-conditional
+    // convention this batch applies in candle.rs's device_tests too). The
+    // run is aborted rather than awaited: nothing below is meaningful
+    // without the injected fault.
+    let probe = epoch0_dir.join(".root_probe");
+    if std::fs::write(&probe, b"x").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        let _ = std::fs::set_permissions(&epoch0_dir, std::fs::Permissions::from_mode(0o755));
+        handle.abort();
+        eprintln!(
+            "finalize_reclaims_a_persistently_failed_prune_and_warns: skipping — fault \
+             injection unavailable: process can write despite chmod (root?)"
+        );
+        return;
+    }
 
     // Let the run finish naturally (no cancellation this time — this is the
     // WINNER path). Bounded wait.

@@ -375,7 +375,9 @@ run_leg() {
     # `attention_block_flash` unable to fire on EITHER arm's real leg --
     # the exact same null-differential class the coordinator correction
     # above already fixed for the build feature list. `backbone_dtype` is
-    # also IDENTITY FIELD #9 on `FINETUNE_RUN_IDENTITY_FIELDS`
+    # also IDENTITY FIELD #10 on `FINETUNE_RUN_IDENTITY_FIELDS` (was #9
+    # before issue #356 P1 item 5's `layers_to_transform` addition shifted
+    # every field after `target_modules` by one)
     # (`identity_fields.py`) -- cross-arm AND cross-seed homogeneity
     # requires every leg (both arms, every seed, INCLUDING the lr=0
     # control below) to report the SAME value, so this is passed

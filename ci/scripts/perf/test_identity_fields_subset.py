@@ -419,21 +419,22 @@ class FinetuneRunIdentityFieldsSubsetTests(unittest.TestCase):
             _extract_rust_fields_block(REPORT_RS, _PROVENANCE_FIELDS_BLOCK_RE, "FinetuneRunTier")
         )
 
-    def test_finetune_run_identity_fields_has_exactly_32_entries(self):
+    def test_finetune_run_identity_fields_has_exactly_33_entries(self):
         self.assertEqual(
             len(identity_fields.FINETUNE_RUN_IDENTITY_FIELDS),
-            32,
-            "identity_fields.py::FINETUNE_RUN_IDENTITY_FIELDS must have EXACTLY 32 entries "
-            "(unit-63 adversarial-audit finding 5's pinned count: the original CONTRACT H4 35 "
-            "minus split_rule/split_seed/batched_forward/steps_measured (4 reclassified out of "
-            "identity), plus heldout_pairs_sha256 (1 added) -- 35 - 4 + 1 = 32, the SAME count "
-            "FinetuneRunTier's own Rust-side test pins). A count other than 32 means either this "
+            33,
+            "identity_fields.py::FINETUNE_RUN_IDENTITY_FIELDS must have EXACTLY 33 entries "
+            "(unit-63 adversarial-audit finding 5's pinned count of 32 -- the original CONTRACT "
+            "H4 35 minus split_rule/split_seed/batched_forward/steps_measured (4 reclassified "
+            "out of identity), plus heldout_pairs_sha256 (1 added), 35 - 4 + 1 = 32 -- PLUS issue "
+            "#356 P1 item 5's layers_to_transform (1 added), 32 + 1 = 33, the SAME count "
+            "FinetuneRunTier's own Rust-side test pins). A count other than 33 means either this "
             "mirror drifted from FinetuneRunTier::IDENTITY_FIELDS or the Rust side itself "
             "grew/shrank; re-derive from source, never bump to make this test pass.",
         )
         self.assertEqual(
             len(set(identity_fields.FINETUNE_RUN_IDENTITY_FIELDS)),
-            32,
+            33,
             "FINETUNE_RUN_IDENTITY_FIELDS contains a duplicate entry",
         )
 

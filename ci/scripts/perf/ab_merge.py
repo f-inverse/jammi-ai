@@ -2690,7 +2690,9 @@ def finetune_run_cross_seed_homogeneity_violations(leg_identities, lr0_labels=fr
     the labels in `leg_identities` naming an lr0-control leg; see
     `build_finetune_run_report`'s own wiring) is the SECOND field-level
     exception this function carries, alongside `seed` itself: `lr` is
-    IDENTITY FIELD #17 on `FINETUNE_RUN_IDENTITY_FIELDS`, and the lr=0 RED
+    IDENTITY FIELD #18 on `FINETUNE_RUN_IDENTITY_FIELDS` (was #17 before
+    issue #356 P1 item 5's `layers_to_transform` addition shifted every
+    field after `target_modules` by one), and the lr=0 RED
     control's own defining premise (CONTRACT H4 advisory (b)) is that its
     legs run at `--lr 0` BY CONSTRUCTION, while every main A/B leg runs at
     the sweep's real (nonzero) `--lr`. Comparing `lr` across the FULL

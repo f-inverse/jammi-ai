@@ -374,6 +374,55 @@ FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS = frozenset(
 )
 
 
+# THE gpu-inference identity set (issue #335, D4/K7-completeness) — mirrors
+# `crates/jammi-bench/src/report.rs`'s `GpuInferenceTier::IDENTITY_FIELDS`
+# EXACTLY, in the SAME order that const's own source lists them.
+# `test_identity_fields_subset.py`'s own `GpuInferenceIdentityFieldsSubsetTests`
+# pins the cardinality on BOTH sides and REDs on a drift on either one.
+#
+# Grown 9 -> 12 (round-1 adversarial audit B1, identity completeness):
+# `row_count` (closes the "manufactured-2x attack" -- `p50_ms` moves
+# LINEARLY with row_count, so two legs at a different row count are not
+# comparable regardless of anything else they agree on), `iters` (was
+# already EMITTED pre-#335 but never admitted to identity -- a differently-
+# sized measured sample is not the same measurement), and `corpus_sha256`
+# (a sha256 content hash over every committed sentence plus
+# `corpus_seed`/`row_count` -- closes the residual gap those two SCALARS
+# alone cannot: a PR that merely rewords a committed sentence, holding both
+# scalars fixed, moves neither one).
+#
+# UNLIKE `FINETUNE_IDENTITY_FIELDS`, and LIKE `ENCODE_IDENTITY_FIELDS`, this
+# tuple is NOT a subset of a larger Rust const that also folds in
+# provenance/dispatch facts -- `GpuInferenceTier` keeps its provenance
+# (`device_name`, `kernels_disabled_requested`, `flash_compiled`,
+# `build_features`) in its OWN, entirely DISJOINT `PROVENANCE_FIELDS` const
+# (the SAME E3 disjoint shape `ENCODE_IDENTITY_FIELDS` follows, never
+# `FINETUNE_IDENTITY_FIELDS`'s superset-folding one). `GPU_INFERENCE_IDENTITY_FIELDS`
+# is therefore compared for SET EQUALITY against `GpuInferenceTier::IDENTITY_FIELDS`,
+# never a subset check.
+#
+# `compute_precision` admits only the EMBED bundle's resolved precision to
+# identity (never a second field for the classifier bundle) -- this tier
+# states ONE pre-registered primary A/B endpoint (embed `p50_ms`, see
+# `gpu_inference_ab.py`'s own module doc), and an identity field for a
+# workload nothing gates would be a false determinant. `GpuInferenceTier`'s
+# own doc has the full rationale.
+GPU_INFERENCE_IDENTITY_FIELDS = (
+    "corpus_seed",
+    "row_count",
+    "warmup",
+    "iters",
+    "corpus_sha256",
+    "compute_precision",
+    "embed_checkpoint_config_sha256",
+    "embed_checkpoint_weights_sha256",
+    "embed_checkpoint_tokenizer_sha256",
+    "infer_checkpoint_config_sha256",
+    "infer_checkpoint_weights_sha256",
+    "infer_checkpoint_tokenizer_sha256",
+)
+
+
 def canonicalize_identity_field(field, value):
     """Apply `field`'s registered canonicalizer (see
     `IDENTITY_FIELD_CANONICALIZERS`'s own table), or return `value`

@@ -326,6 +326,78 @@ class EncodeStepIdentityFieldsSubsetTests(unittest.TestCase):
         self.assertIn("attention_arm", self.rust_provenance_fields)
 
 
+class GpuInferenceIdentityFieldsSubsetTests(unittest.TestCase):
+    """Issue #335 D4 mirror: `identity_fields.GPU_INFERENCE_IDENTITY_FIELDS`
+    (Python) against `GpuInferenceTier::IDENTITY_FIELDS`/`::PROVENANCE_FIELDS`
+    (Rust, `report.rs`). Mirrors `EncodeStepIdentityFieldsSubsetTests`'s own
+    EQUALITY (not subset) shape exactly — `GpuInferenceTier` also keeps its
+    provenance fields in an entirely DISJOINT const.
+    """
+
+    def setUp(self):
+        self.rust_identity_fields = set(
+            _extract_rust_fields_block(REPORT_RS, _IDENTITY_FIELDS_BLOCK_RE, "GpuInferenceTier")
+        )
+        self.rust_provenance_fields = set(
+            _extract_rust_fields_block(REPORT_RS, _PROVENANCE_FIELDS_BLOCK_RE, "GpuInferenceTier")
+        )
+
+    def test_gpu_inference_identity_fields_has_exactly_12_entries(self):
+        self.assertEqual(
+            len(identity_fields.GPU_INFERENCE_IDENTITY_FIELDS),
+            12,
+            "identity_fields.py::GPU_INFERENCE_IDENTITY_FIELDS must have EXACTLY 12 "
+            "entries (issue #335 D4's pinned list, grown 9 -> 12 by round-1 "
+            "adversarial audit B1: corpus_seed, row_count, warmup, iters, "
+            "corpus_sha256, compute_precision, and the embed/infer bundles' three "
+            "checkpoint hashes each) — a count other than 12 means either this const "
+            "drifted from GpuInferenceTier::IDENTITY_FIELDS or the Rust side itself "
+            "grew/shrank; re-derive from source, never bump to make this test pass.",
+        )
+        self.assertEqual(
+            len(set(identity_fields.GPU_INFERENCE_IDENTITY_FIELDS)),
+            12,
+            "GPU_INFERENCE_IDENTITY_FIELDS contains a duplicate entry",
+        )
+
+    def test_rust_provenance_fields_has_exactly_4_entries(self):
+        self.assertEqual(
+            len(self.rust_provenance_fields),
+            4,
+            f"GpuInferenceTier::PROVENANCE_FIELDS ({REPORT_RS}) must have EXACTLY 4 "
+            "entries (device_name, kernels_disabled_requested, flash_compiled, "
+            f"build_features) — a count other than 4 means the Rust const drifted: "
+            f"{sorted(self.rust_provenance_fields)}",
+        )
+
+    def test_gpu_inference_identity_fields_equals_the_rust_const(self):
+        python_fields = set(identity_fields.GPU_INFERENCE_IDENTITY_FIELDS)
+        self.assertEqual(
+            python_fields,
+            self.rust_identity_fields,
+            f"identity_fields.py::GPU_INFERENCE_IDENTITY_FIELDS ({sorted(python_fields)}) must "
+            f"equal GpuInferenceTier::IDENTITY_FIELDS ({sorted(self.rust_identity_fields)}) "
+            "EXACTLY — this tier's identity/provenance split is disjoint, not superset-folded, "
+            "so the Python mirror is the WHOLE identity set, never merely a subset of it",
+        )
+
+    def test_identity_and_provenance_are_disjoint(self):
+        overlap = self.rust_identity_fields & self.rust_provenance_fields
+        self.assertFalse(
+            overlap,
+            f"GpuInferenceTier::IDENTITY_FIELDS and ::PROVENANCE_FIELDS share field(s) "
+            f"{sorted(overlap)} — issue #335 D4 keeps these two sets DISJOINT (never a field "
+            "in both)",
+        )
+        overlap_py = set(identity_fields.GPU_INFERENCE_IDENTITY_FIELDS) & self.rust_provenance_fields
+        self.assertFalse(
+            overlap_py,
+            f"identity_fields.py::GPU_INFERENCE_IDENTITY_FIELDS names provenance-only field(s) "
+            f"{sorted(overlap_py)} — provenance must never be admitted to the Python comparison "
+            "tuple either",
+        )
+
+
 class FinetuneRunIdentityFieldsSubsetTests(unittest.TestCase):
     """Unit-63 H4b mirror: `identity_fields.FINETUNE_RUN_IDENTITY_FIELDS`
     (Python) against `FinetuneRunTier::IDENTITY_FIELDS`/`::PROVENANCE_FIELDS`

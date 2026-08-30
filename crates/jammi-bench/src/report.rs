@@ -2391,12 +2391,77 @@ impl FinetuneRunTier {
 /// the `gpu_capability` suite.
 ///
 /// The report is emitted as one stable JSON document (`Report` →
-/// `tiers.gpu_inference`, printed by `emit()`): `device`, `device_name`,
-/// `iters`, and one [`GpuLane`] per verb (`embed`, `infer`), each carrying
-/// `rows`, `rows_per_s`, `p50_ms`, `p99_ms`. Every key is present on every run
+/// `tiers.gpu_inference`, printed by `emit()`): `device`, `device_name`, and
+/// one [`GpuLane`] per verb (`embed`, `infer`), each carrying `rows`,
+/// `rows_per_s`, `p50_ms`, `p99_ms`, ALONGSIDE every declared
+/// [`Self::IDENTITY_FIELDS`]/[`Self::PROVENANCE_FIELDS`] entry (see the
+/// "Identity contract" section below — `iters` in particular is an IDENTITY
+/// field, not a bare observability count). Every key is present on every run
 /// (no field is conditionally omitted and no record carries a timestamp), so
-/// two runs' JSON diffs cleanly — the groundwork a future within-run A/B
-/// perf-comparison mechanism would read, though no such comparator exists yet.
+/// two runs' JSON diffs cleanly — the groundwork the issue-#335 within-run A/B
+/// perf comparator (`ci/scripts/perf/gpu_inference_ab.py`) reads.
+///
+/// ## Identity contract (issue #335, the esc-057/K7 class)
+///
+/// A within-run A/B ratio (parent-HEAD vs a PR change, measured back to back
+/// on the SAME pod) is only a comparison of the SAME MEASUREMENT if both legs
+/// agree on every output-affecting parameter — the exact esc-057/K7 gap
+/// [`EncodeStepTier`]/[`FinetuneStepTier`] already close one layer down, at
+/// the encode/finetune surfaces. This tier closes the analogous gap at the
+/// on-GPU serving surface: [`Self::IDENTITY_FIELDS`] names the complete
+/// comparison tuple —
+///
+///   * `corpus_seed`/`row_count`/`corpus_sha256`: the corpus-generation
+///     premise. `row_count` in particular closes the "manufactured-2x
+///     attack" (round-1 adversarial audit B1): `p50_ms` moves LINEARLY with
+///     `row_count` (more rows per `generate_text_embeddings` call is a
+///     longer call), so a leg that silently served a different row count
+///     would print a ratio that reflects nothing about the code under
+///     comparison. `corpus_sha256` (`model_inference::corpus_sha256`) is a
+///     sha256 content hash over the RESOLVED corpus — the actual row texts
+///     `model_inference::build_corpus` selects for this `(corpus_seed,
+///     row_count)` pair, never the raw inputs independently re-derived
+///     (round-2 adversarial audit F4: hashing raw inputs was structurally
+///     blind to a changed SELECTION/ROTATION rule) — the belt-and-suspenders
+///     closing move: a PR that merely REWORDS a sentence, or changes WHICH
+///     sentence a given row index draws, moves neither `corpus_seed` nor
+///     `row_count`, so without a content hash of the RESOLVED text that edit
+///     would silently slip through as "the same corpus".
+///   * `warmup`/`iters`: the discarded-vs-measured serve counts that bound
+///     what the percentiles actually fold over. `iters` was already emitted
+///     pre-#335 but never admitted to identity (round-1 adversarial audit
+///     B1) — a leg run with a different `iters` count computes a p50/p99
+///     over a differently-sized sample, which is not the same measurement.
+///   * `compute_precision` and BOTH served bundles' content identity — embed
+///     and classifier, each hashed independently since a two-verb tier has
+///     two checkpoints, not one.
+///
+/// [`Self::PROVENANCE_FIELDS`] names the recorded-but-never-compared facts
+/// (the resolved hardware name, the kernel-disable/flash-compiled build
+/// facts). `run()` asserts both sets present via
+/// [`assert_identity_fields_present`] on every real invocation — the SAME
+/// posture [`crate::encode_step::run`]/[`crate::finetune_step::run`] already
+/// enforce, following [`EncodeStepTier`]'s disjoint (never
+/// superset-folding) identity/provenance split (CONTRACT.md §E3's shape),
+/// not [`FinetuneStepTier`]'s.
+///
+/// `compute_precision` is read off the LOADED EMBED model
+/// ([`jammi_ai::model::LoadedModel::compute_precision`], the SAME accessor
+/// [`EncodeStepTier::compute_precision`] reads) — the precision the tier's
+/// pre-registered primary endpoint (embed `p50_ms`, see
+/// `ci/scripts/perf/gpu_inference_ab.py`'s own module doc) actually served
+/// at. The classifier bundle's own precision is not separately identity-
+/// admitted: this tier states ONE primary endpoint (embed), and a second
+/// identity field for a workload nothing gates would be a false
+/// determinant of the exact kind esc-057/K7 forbid (a field two legs could
+/// disagree on with no effect on what the endpoint measures).
+///
+/// `corpus_seed`/`row_count`/`warmup`/`corpus_sha256` were previously either
+/// compile-time constants ([`crate::main`]'s `GPU_INFERENCE_PARAMS` literal)
+/// or never computed at all, never emitted on the report — a within-run A/B
+/// comparator reading two JSON reports has no way to state "both legs used
+/// the same corpus/warmup convention" without them actually being on the
+/// report; this tier now emits all four.
 #[derive(Debug, Serialize)]
 pub struct GpuInferenceTier {
     /// The device the serve resolved to (e.g. `cuda:0`) — proof it was not a CPU
@@ -2405,13 +2470,126 @@ pub struct GpuInferenceTier {
     /// The concrete device sub-class the ordinal resolved to (e.g.
     /// `NVIDIA A100-SXM4-80GB`) — the provenance tag that makes the recorded
     /// throughput/latency interpretable across the heterogeneous fleet.
+    /// PROVENANCE (see [`Self::PROVENANCE_FIELDS`]): only knowable after the
+    /// device resolved.
     pub device_name: String,
-    /// Measured serves (after warmup) the percentiles folded over.
+
+    // ── Comparison identity: `Self::IDENTITY_FIELDS` ────────────────────
+    /// The corpus-generation seed (mirrors `ModelInferenceSpec::corpus_seed`'s
+    /// own rotation) — previously a compile-time-only constant, now emitted
+    /// so a within-run A/B comparator can state both legs drew the same
+    /// corpus.
+    pub corpus_seed: u64,
+    /// The synthetic corpus row count — identity (round-1 adversarial audit
+    /// B1, the "manufactured-2x attack"): `p50_ms` moves LINEARLY with this
+    /// value, so two legs at a different `row_count` are not comparable at
+    /// all, regardless of anything else they agree on.
+    pub row_count: usize,
+    /// Serves discarded before the measured iterations (pays the one-time
+    /// model-load/PTX-JIT cost so it does not land in a measured tail) —
+    /// changes what the measured percentiles actually bound.
+    pub warmup: usize,
+    /// Measured serves (after warmup) the percentiles folded over — identity
+    /// (round-1 adversarial audit B1): this field was already emitted
+    /// pre-#335 but never admitted to [`Self::IDENTITY_FIELDS`], so two legs
+    /// at a different `iters` (hence a differently-sized measured sample)
+    /// could silently compare as "the same measurement".
     pub iters: usize,
+    /// sha256 (hex) content hash of the RESOLVED corpus
+    /// ([`crate::model_inference::corpus_sha256`]): the actual row TEXTS
+    /// `model_inference::build_corpus` selects for this run's
+    /// `(corpus_seed, row_count)`, never the raw `(SENTENCES, corpus_seed,
+    /// row_count)` inputs independently re-derived (round-2 adversarial
+    /// audit F4 — hashing raw inputs was structurally blind to a changed
+    /// selection/rotation rule). The belt-and-suspenders closing move
+    /// alongside `corpus_seed`/`row_count` above: a PR that REWORDS a
+    /// committed sentence, or changes WHICH sentence a given row index
+    /// draws, moves neither of those two scalar fields, so without a
+    /// content hash of the RESOLVED text that edit would silently slip
+    /// through as "the same corpus" while actually serving different text.
+    pub corpus_sha256: String,
+    /// The compute precision (`f32`/`f16`/`bf16`) the LOADED embed model
+    /// actually resolved to before the serve — read off
+    /// [`jammi_ai::model::LoadedModel::compute_precision`], the SAME
+    /// accessor [`EncodeStepTier::compute_precision`] reads. See this
+    /// struct's own doc for why only the embed bundle's precision is
+    /// admitted to identity.
+    pub compute_precision: String,
+    /// sha256 (hex) of the embed bundle's `config.json` bytes — a third of
+    /// that checkpoint's content identity, the SAME `sha256_and_len` helper
+    /// [`EncodeStepTier::checkpoint_config_sha256`] uses.
+    pub embed_checkpoint_config_sha256: String,
+    /// sha256 (hex) of the embed bundle's `model.safetensors` bytes.
+    pub embed_checkpoint_weights_sha256: String,
+    /// sha256 (hex) of the embed bundle's `tokenizer.json` bytes.
+    pub embed_checkpoint_tokenizer_sha256: String,
+    /// sha256 (hex) of the classifier bundle's `config.json` bytes — the
+    /// SAME three-file content identity as the embed bundle above, hashed
+    /// independently: this tier serves two DIFFERENT checkpoints (embed +
+    /// classifier), so one hash triple cannot stand in for both.
+    pub infer_checkpoint_config_sha256: String,
+    /// sha256 (hex) of the classifier bundle's `model.safetensors` bytes.
+    pub infer_checkpoint_weights_sha256: String,
+    /// sha256 (hex) of the classifier bundle's `tokenizer.json` bytes.
+    pub infer_checkpoint_tokenizer_sha256: String,
+
+    // ── Provenance: `Self::PROVENANCE_FIELDS`, NEVER identity ───────────
+    /// The `JAMMI_KERNELS_DISABLE` op keys this process REQUESTED (sorted;
+    /// empty when unset) — `jammi_kernels::admission::disabled_ops_requested`.
+    /// Mirrors `EncodeStepTier::kernels_disabled_requested`.
+    pub kernels_disabled_requested: Vec<String>,
+    /// Whether THIS BUILD compiled the vendored FlashAttention-2 kernels
+    /// (`jammi_kernels::admission::FLASH_COMPILED`). The encode/infer serve
+    /// path never dispatches flash regardless (fused arms are
+    /// training-only), so this records a build fact, not a per-leg
+    /// determinant — mirrors `EncodeStepTier::flash_compiled`.
+    pub flash_compiled: bool,
+    /// This tier's own echo of [`Provenance::build_features`]
+    /// (`crate::report::build_features`, the SAME function every other
+    /// tier's own `build_features` field reads).
+    pub build_features: Vec<&'static str>,
+
     /// The embed verb's lane.
     pub embed: GpuLane,
     /// The classification (`infer`) verb's lane.
     pub infer: GpuLane,
+}
+
+impl GpuInferenceTier {
+    /// The comparison identity for a within-run A/B ratio (issue #335): the
+    /// complete output-affecting parameter set for the on-GPU embed/infer
+    /// serving surface. DISJOINT from [`Self::PROVENANCE_FIELDS`]
+    /// ([`EncodeStepTier`]'s own E3 convention, never
+    /// [`FinetuneStepTier`]'s superset-folding one — see this struct's own
+    /// doc). `ci/scripts/perf/identity_fields.py`'s
+    /// `GPU_INFERENCE_IDENTITY_FIELDS` mirrors this list EXACTLY.
+    pub const IDENTITY_FIELDS: &'static [(&'static str, Nullable)] = &[
+        ("corpus_seed", Nullable::NonNull),
+        ("row_count", Nullable::NonNull),
+        ("warmup", Nullable::NonNull),
+        ("iters", Nullable::NonNull),
+        ("corpus_sha256", Nullable::NonNull),
+        ("compute_precision", Nullable::NonNull),
+        ("embed_checkpoint_config_sha256", Nullable::NonNull),
+        ("embed_checkpoint_weights_sha256", Nullable::NonNull),
+        ("embed_checkpoint_tokenizer_sha256", Nullable::NonNull),
+        ("infer_checkpoint_config_sha256", Nullable::NonNull),
+        ("infer_checkpoint_weights_sha256", Nullable::NonNull),
+        ("infer_checkpoint_tokenizer_sha256", Nullable::NonNull),
+    ];
+
+    /// The provenance fields this tier records but NEVER admits to
+    /// [`Self::IDENTITY_FIELDS`] — recorded so a downstream reader has the
+    /// SAME `assert_identity_fields_present` presence/non-null guarantee on
+    /// these fields without them ever being eligible as a cross-leg
+    /// comparison key. Mirrors the corresponding entries of
+    /// [`EncodeStepTier::PROVENANCE_FIELDS`].
+    pub const PROVENANCE_FIELDS: &'static [(&'static str, Nullable)] = &[
+        ("device_name", Nullable::NonNull),
+        ("kernels_disabled_requested", Nullable::NonNull),
+        ("flash_compiled", Nullable::NonNull),
+        ("build_features", Nullable::NonNull),
+    ];
 }
 
 /// The identity-audited encode-step tier (unit 62, K7/E3): drives the

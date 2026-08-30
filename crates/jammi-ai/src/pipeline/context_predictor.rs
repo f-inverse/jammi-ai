@@ -908,12 +908,17 @@ impl InferenceSession {
             dir,
             register: crate::fine_tune::worker::ModelRegistration {
                 model_id: spec.model_id.clone(),
+                version: 1,
                 model_type: "context-predictor",
                 task: ModelTask::Regression,
                 base_model_id: Some(table.model_id.clone()),
                 config_json: Some(config_json),
             },
             metrics: None,
+            // The episodic in-context-predictor path has no per-epoch
+            // checkpointing (unit 348 is fine-tune-specific; v1 out of
+            // scope here) — nothing to register.
+            epoch_checkpoints: Vec::new(),
         })
     }
 }

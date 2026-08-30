@@ -375,6 +375,73 @@ pub struct FineTuneConfig {
     /// [`DEFAULT_FINE_TUNE_SEED`] is used when a caller does not specify one.
     #[serde(default = "default_fine_tune_seed")]
     pub seed: u64,
+
+    /// Enable per-epoch adapter checkpointing under the trainer's own attempt
+    /// prefix, and cap how many it retains (unit 348).
+    ///
+    /// **DISABLED by default** (round-2 reshape): `None` — absent on the
+    /// wire, and every config built before this field existed — means the
+    /// mechanism is OFF entirely. Not one epoch-checkpoint byte is written,
+    /// not one catalog row is ever considered, and every terminating-arm GC
+    /// sweep (`TrainingWorker::gc_epoch_checkpoints`) returns immediately
+    /// without issuing a single store request. This is the load-bearing
+    /// no-regression property: every caller that predates this field, and
+    /// every caller that never sets it, gets byte-for-byte the SAME storage
+    /// and catalog behavior as before this feature existed — never a default
+    /// that silently changes what an unrelated caller's job writes.
+    ///
+    /// `Some(n)` with `n >= 1` OPTS IN: at each epoch boundary the trainer
+    /// publishes a full loadable adapter for that epoch, deletes the bytes
+    /// of its own attempt's epochs older than the last `n` as soon as a
+    /// newer one lands, and only the retained set gains a catalog row at
+    /// finalize. `n >= epochs` naturally retains every epoch — there is no
+    /// separate "keep all" sentinel; ask for a cap at least as large as the
+    /// configured epoch count. `Some(0)` is refused by [`Self::validate`] —
+    /// an ambiguous "keep nothing" the caller almost certainly meant "omit
+    /// the field" instead of, so it is a typed validation error rather than
+    /// a silent zero-retention run.
+    ///
+    /// This is a pure deployment/storage knob: it changes which checkpoint
+    /// BYTES persist, never a byte the trained adapter itself produces, so
+    /// it enters no identity/config hash (there is none over `FineTuneConfig`
+    /// in this crate today; the K7 "oversample" precedent this mirrors is
+    /// the same "does not perturb the trained artifact" shape) and never
+    /// affects the final/best artifact, which publishes and is retained
+    /// exactly as before, unconditionally, whether or not this field is set.
+    ///
+    /// **Cost when enabled**: a terminating arm that is not the finalize-CAS
+    /// winner sweeps the FULL configured `[0, epochs)` range to reclaim this
+    /// attempt's epoch-checkpoint bytes (each index a tolerant no-op if it
+    /// was never written) — an O(epochs) request cost on the failure path
+    /// only, paid solely by jobs that opted in. A sweep that hits any delete
+    /// failure emits exactly one `tracing::warn!` naming the job/attempt and
+    /// the failed-vs-attempted count, never silently.
+    ///
+    /// Two retention semantics worth stating precisely rather than assuming:
+    ///
+    /// - **Early stopping** can make the terminal/best epoch ABSENT from the
+    ///   retained checkpoint set: retention is a pure epoch-order FIFO over
+    ///   an attempt's own `save_epoch_checkpoint` calls (oldest dropped
+    ///   first as newer ones land), with no awareness of which epoch later
+    ///   turns out to be `checkpoint_best`. A best epoch older than the
+    ///   trailing `n` epochs is pruned like any other. This is harmless for
+    ///   the SERVED model: the best/final artifact is restored from its own
+    ///   `checkpoint_best.safetensors` and published through the worker's
+    ///   ordinary, unconditional final-artifact path — entirely independent
+    ///   of, and unaffected by, the epoch-checkpoint retention window.
+    /// - **Resume**: a resumed job's retained epoch-checkpoint SET is scoped
+    ///   to the RESUMING attempt only — the attempt-unique prefix
+    ///   (`{job_id}/{worker_id}/{attempt}/checkpoints/…`, K7) means a
+    ///   resumed run's own retention FIFO starts fresh under its own
+    ///   `attempt` suffix and never prunes (or even sees) a prior attempt's
+    ///   epoch checkpoints. So the catalog rows a resumed job's finalize
+    ///   registers are only the FINAL (resuming) attempt's own retained
+    ///   suffix — an earlier, superseded attempt's epoch checkpoints are
+    ///   never registered even if the bytes are still durable (the same
+    ///   "durable but unregistered" residual bucket documented on
+    ///   [`jammi_db::catalog::training_repo::EpochCheckpointRow`]).
+    #[serde(default)]
+    pub keep_last_n_checkpoints: Option<u32>,
 }
 
 /// The fixed default fine-tune seed. A constant (not entropy) so a job that
@@ -448,6 +515,7 @@ impl Default for FineTuneConfig {
             hard_negatives: HardNegativeConfig::default(),
             matryoshka_dims: Vec::new(),
             seed: DEFAULT_FINE_TUNE_SEED,
+            keep_last_n_checkpoints: None,
         }
     }
 }
@@ -563,6 +631,18 @@ impl FineTuneConfig {
                     "quantile_levels must be strictly ascending".into(),
                 ));
             }
+        }
+        // 0 is ambiguous; omit the field to keep all. A caller that means "no
+        // epoch checkpoints at all" is not what this knob does (the FINAL/BEST
+        // artifact is unconditional and unaffected either way) — refuse rather
+        // than silently reinterpret it.
+        if self.keep_last_n_checkpoints == Some(0) {
+            return Err(JammiError::FineTune(
+                "keep_last_n_checkpoints=0 is ambiguous; omit the field to disable per-epoch \
+                 checkpointing entirely (the default), or set it to a value >= 1 to enable it \
+                 and retain a rolling window (>= epochs retains every epoch)"
+                    .into(),
+            ));
         }
         Ok(())
     }
@@ -884,6 +964,50 @@ mod validation_tests {
         FineTuneConfig::default()
             .validate()
             .expect("the shipped default must remain valid");
+    }
+
+    /// Unit 348: `keep_last_n_checkpoints = 0` is ambiguous ("keep nothing"
+    /// vs "the caller meant to omit the field") and is refused, not
+    /// silently coerced to `None`.
+    #[test]
+    fn keep_last_n_checkpoints_zero_is_refused() {
+        let cfg = FineTuneConfig {
+            keep_last_n_checkpoints: Some(0),
+            ..Default::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("keep_last_n_checkpoints=0 must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("keep_last_n_checkpoints"),
+            "the error must name the field: {msg}"
+        );
+        assert!(
+            msg.contains("ambiguous"),
+            "the error must explain the ambiguity: {msg}"
+        );
+    }
+
+    /// Positive control: `None` (the default) and any `Some(n >= 1)` are
+    /// legal — only the literal `0` is refused.
+    #[test]
+    fn keep_last_n_checkpoints_nonzero_or_absent_validates() {
+        FineTuneConfig::default()
+            .validate()
+            .expect("absent keep_last_n_checkpoints (checkpointing disabled) validates");
+        FineTuneConfig {
+            keep_last_n_checkpoints: Some(1),
+            ..Default::default()
+        }
+        .validate()
+        .expect("keep_last_n_checkpoints=1 validates");
+        FineTuneConfig {
+            keep_last_n_checkpoints: Some(5),
+            ..Default::default()
+        }
+        .validate()
+        .expect("keep_last_n_checkpoints=5 validates");
     }
 
     /// A non-finite `max_grad_norm` is refused at BOTH edges — `validate`

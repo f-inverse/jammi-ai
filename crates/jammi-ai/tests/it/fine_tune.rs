@@ -364,6 +364,343 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
     );
 }
 
+// ─── Per-epoch adapter checkpoints (unit 348) ──────────────────────────────
+//
+// Round-2 reshape (F3): `keep_last_n_checkpoints` is DISABLED BY DEFAULT.
+// `epoch_checkpoints_default_off_writes_nothing` below is the load-bearing
+// no-regression oracle every OTHER test in this file (and every caller that
+// predates this feature) implicitly relies on: a run that never sets the
+// field must write exactly zero epoch-checkpoint bytes and register exactly
+// zero epoch rows. `epoch_checkpoints_registered_and_loadable_when_enabled`
+// then drives the OPT-IN path with `Some(n)` where `n >= epochs`, pinning the
+// documented "no separate keep-all sentinel — ask for a cap at least as
+// large as the epoch count" equivalence.
+
+/// THE no-regression oracle (unit 348 F3): a DEFAULT run — `keep_last_n_
+/// checkpoints` never set — writes ZERO epoch-checkpoint bytes and registers
+/// ZERO epoch-checkpoint catalog rows. Every caller that predates this
+/// feature, and every caller that never opts in, gets exactly this behavior.
+#[tokio::test(flavor = "multi_thread")]
+async fn epoch_checkpoints_default_off_writes_nothing() {
+    let (session, dir) = session_with_training_data().await;
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+    let model = tiny_bert_model();
+
+    let job = session
+        .fine_tune(
+            "training",
+            &model,
+            &[
+                "text_a".to_string(),
+                "text_b".to_string(),
+                "score".to_string(),
+            ],
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(FineTuneConfig {
+                epochs: 3,
+                batch_size: 8,
+                lora_rank: 4,
+                warmup_steps: 0,
+                // Deliberately absent — the default this test pins.
+                keep_last_n_checkpoints: None,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let output_name = job.model_id().to_string();
+    job.wait().await.unwrap();
+
+    // Zero catalog rows for any epoch — not even epoch_0.
+    for epoch in 0..3 {
+        let epoch_name = format!("{output_name}:epoch_{epoch}");
+        assert!(
+            session
+                .catalog()
+                .get_model(&epoch_name)
+                .await
+                .unwrap()
+                .is_none(),
+            "a default (keep_last_n_checkpoints absent) run must register no epoch row, \
+             found {epoch_name}"
+        );
+    }
+
+    // Zero bytes on disk under this attempt's `checkpoints/` subtree —
+    // real filesystem existence, not merely "no catalog row" (the same
+    // "actually check the bytes" discipline the other epoch-checkpoint
+    // tests use). `file://` roots materialise real files at exactly the
+    // documented path shape.
+    let checkpoints_root = dir.path().join("jammi_db").join("models");
+    // Find this job's own attempt directory by walking
+    // `{root}/{job_id}/{worker_id}/{attempt}/checkpoints` — worker id and
+    // attempt are not independently known to this test, so search for ANY
+    // `checkpoints` directory under the job's own subtree.
+    let job_root = checkpoints_root.join(&job.job_id);
+    if job_root.is_dir() {
+        for worker_entry in std::fs::read_dir(&job_root).unwrap().flatten() {
+            if !worker_entry.file_type().unwrap().is_dir() {
+                continue;
+            }
+            for attempt_entry in std::fs::read_dir(worker_entry.path()).unwrap().flatten() {
+                if !attempt_entry.file_type().unwrap().is_dir() {
+                    continue;
+                }
+                let checkpoints_dir = attempt_entry.path().join("checkpoints");
+                assert!(
+                    !checkpoints_dir.exists(),
+                    "a default run must never create a checkpoints/ subtree at all, found \
+                     {checkpoints_dir:?}"
+                );
+            }
+        }
+    }
+
+    // The final/best artifact is entirely unaffected: still registered and
+    // loadable under its own unchanged name.
+    let final_record = session
+        .catalog()
+        .get_model(&output_name)
+        .await
+        .unwrap()
+        .expect("the final output model row still exists under its own name");
+    assert_eq!(final_record.status, "registered");
+    let final_embedding = session
+        .encode_text_query(&output_name, "quantum computing")
+        .await
+        .unwrap();
+    assert_eq!(final_embedding.len(), 32);
+}
+
+/// The opt-in path: `keep_last_n_checkpoints = Some(n)` with `n >= epochs`
+/// retains every epoch — there is no separate "keep all" sentinel, per the
+/// documented equivalence on the field. Registers a catalog row for EVERY
+/// epoch (`epoch_0`..`epoch_2`), each a full loadable adapter — the SAME
+/// `jammi_lora::save_adapter` bundle shape the served final model uses, not
+/// the weights-only resume format. The final/best model's own name is
+/// unchanged and still resolves.
+#[tokio::test(flavor = "multi_thread")]
+async fn epoch_checkpoints_registered_and_loadable_when_enabled() {
+    let (session, _dir) = session_with_training_data().await;
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+    let model = tiny_bert_model();
+
+    let job = session
+        .fine_tune(
+            "training",
+            &model,
+            &[
+                "text_a".to_string(),
+                "text_b".to_string(),
+                "score".to_string(),
+            ],
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(FineTuneConfig {
+                epochs: 3,
+                batch_size: 8,
+                lora_rank: 4,
+                warmup_steps: 0,
+                // n == epochs: the documented "n >= epochs retains every
+                // epoch" equivalence, no separate keep-all sentinel needed.
+                keep_last_n_checkpoints: Some(3),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let output_name = job.model_id().to_string();
+    job.wait().await.unwrap();
+
+    // Every epoch (0, 1, 2) got its own DISTINCT-NAME catalog row, never an
+    // additional VERSION of the output model's name.
+    for epoch in 0..3 {
+        let epoch_name = format!("{output_name}:epoch_{epoch}");
+        let record = session
+            .catalog()
+            .get_model(&epoch_name)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("epoch {epoch} checkpoint row must be registered"));
+        assert_eq!(
+            record.status, "checkpoint",
+            "an epoch checkpoint row's status must distinguish it from a served model row"
+        );
+        assert_ne!(
+            record.status, "registered",
+            "an epoch checkpoint row must not carry the served-model status"
+        );
+        let artifact_prefix = record
+            .artifact_path
+            .as_deref()
+            .unwrap_or_else(|| panic!("epoch {epoch} checkpoint row must carry an artifact_path"));
+
+        // Loadable: the published bundle fetches, verifies, and contains a
+        // full adapter (weights + config), not the resume format's files.
+        let prefix_url = jammi_db::storage::StorageUrl::parse(artifact_prefix).unwrap();
+        let local = session
+            .artifact_store()
+            .fetch_artifact(&prefix_url)
+            .await
+            .unwrap_or_else(|e| panic!("epoch {epoch} checkpoint fetches and verifies: {e}"));
+        assert!(
+            local.dir().join("adapter.safetensors").exists(),
+            "epoch {epoch} checkpoint must be a full loadable adapter (adapter.safetensors)"
+        );
+        assert!(
+            local.dir().join("adapter_config.json").exists(),
+            "epoch {epoch} checkpoint must carry adapter_config.json (SavedAdapter metadata)"
+        );
+
+        // Actually loadable for inference by that id.
+        let embedding = session
+            .encode_text_query(&epoch_name, "quantum computing")
+            .await
+            .unwrap_or_else(|e| panic!("epoch {epoch} checkpoint must load for inference: {e}"));
+        assert_eq!(embedding.len(), 32);
+    }
+
+    // The final/best artifact is unaffected: still registered under its own
+    // (unchanged) name and still describe-resolvable / loadable.
+    let final_record = session
+        .catalog()
+        .get_model(&output_name)
+        .await
+        .unwrap()
+        .expect("the final output model row still exists under its own name");
+    assert_eq!(final_record.status, "registered");
+    assert!(final_record.artifact_path.is_some());
+    let final_embedding = session
+        .encode_text_query(&output_name, "quantum computing")
+        .await
+        .unwrap();
+    assert_eq!(final_embedding.len(), 32);
+}
+
+/// `keep_last_n_checkpoints = 2` over a 3-epoch run retains only the LAST two
+/// epochs: epoch_1 and epoch_2 are registered; epoch_0's bytes are pruned from
+/// the store (never registered — no catalog row exists mid-run to race) and
+/// its checkpoint row never appears.
+#[tokio::test(flavor = "multi_thread")]
+async fn epoch_checkpoints_retention_prunes_oldest() {
+    let (session, _dir) = session_with_training_data().await;
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+    let model = tiny_bert_model();
+
+    let job = session
+        .fine_tune(
+            "training",
+            &model,
+            &[
+                "text_a".to_string(),
+                "text_b".to_string(),
+                "score".to_string(),
+            ],
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(FineTuneConfig {
+                epochs: 3,
+                batch_size: 8,
+                lora_rank: 4,
+                warmup_steps: 0,
+                keep_last_n_checkpoints: Some(2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let output_name = job.model_id().to_string();
+    job.wait().await.unwrap();
+
+    // epoch_1 and epoch_2 are registered and loadable.
+    for epoch in [1, 2] {
+        let epoch_name = format!("{output_name}:epoch_{epoch}");
+        let record = session
+            .catalog()
+            .get_model(&epoch_name)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("retained epoch {epoch} must be registered"));
+        let prefix_url =
+            jammi_db::storage::StorageUrl::parse(record.artifact_path.as_deref().unwrap()).unwrap();
+        session
+            .artifact_store()
+            .fetch_artifact(&prefix_url)
+            .await
+            .unwrap_or_else(|e| panic!("retained epoch {epoch} bytes must fetch: {e}"));
+    }
+
+    // epoch_0 was pruned: no catalog row, and — the load-bearing assertion —
+    // its bytes are gone from the store, not merely unregistered.
+    let epoch_0_name = format!("{output_name}:epoch_0");
+    assert!(
+        session
+            .catalog()
+            .get_model(&epoch_0_name)
+            .await
+            .unwrap()
+            .is_none(),
+        "a pruned epoch must never be registered"
+    );
+    // Discover the retained epoch_1 prefix and derive epoch_0's sibling prefix
+    // from it (`.../checkpoints/epoch_1` -> `.../checkpoints/epoch_0`) rather
+    // than assuming worker-id/attempt values.
+    let epoch_1_record = session
+        .catalog()
+        .get_model(&format!("{output_name}:epoch_1"))
+        .await
+        .unwrap()
+        .expect("epoch_1 is retained");
+    let epoch_1_prefix = epoch_1_record.artifact_path.unwrap();
+    let epoch_0_prefix = epoch_1_prefix.replace("epoch_1", "epoch_0");
+    let epoch_0_url = jammi_db::storage::StorageUrl::parse(&epoch_0_prefix).unwrap();
+    assert!(
+        session
+            .artifact_store()
+            .fetch_artifact(&epoch_0_url)
+            .await
+            .is_err(),
+        "epoch_0's bytes must be absent from the store after pruning, got a successful fetch"
+    );
+}
+
+/// `keep_last_n_checkpoints = 0` is a typed validation refusal at submission —
+/// never a silent zero-retention run.
+#[tokio::test(flavor = "multi_thread")]
+async fn keep_last_n_checkpoints_zero_is_refused() {
+    let (session, _dir) = session_with_training_data().await;
+    let model = tiny_bert_model();
+
+    let err = session
+        .fine_tune(
+            "training",
+            &model,
+            &[
+                "text_a".to_string(),
+                "text_b".to_string(),
+                "score".to_string(),
+            ],
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(FineTuneConfig {
+                epochs: 1,
+                keep_last_n_checkpoints: Some(0),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("keep_last_n_checkpoints=0 must be refused at submission");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("keep_last_n_checkpoints") && msg.contains("ambiguous"),
+        "the typed error must name the field and explain the ambiguity: {msg}"
+    );
+}
+
 // ─── Audio projection-head fine-tune: tuned audio embeddings differ from base ─
 //
 // JA2. The contrastive fine-tune path accepts JA1's audio encoder family via a
@@ -801,11 +1138,15 @@ async fn fine_tune_job_catalog_crud() {
     // model + flips to completed + records the run metrics.
     let finalized = catalog
         .finalize_training_job(
-            "job-1",
-            "worker-x",
-            "jammi:fine-tuned:job-1",
-            "file:///artifacts/job-1/worker-x/1",
-            Some(r#"{"completed_at": "2026-01-01T01:00:00Z"}"#),
+            jammi_db::catalog::training_repo::FinalizeTrainingJobParams {
+                job_id: "job-1",
+                worker_id: "worker-x",
+                output_model_id: "jammi:fine-tuned:job-1",
+                output_model_version: 1,
+                artifact_path: "file:///artifacts/job-1/worker-x/1",
+                metrics: Some(r#"{"completed_at": "2026-01-01T01:00:00Z"}"#),
+                epoch_checkpoints: &[],
+            },
         )
         .await
         .unwrap();
@@ -1974,6 +2315,461 @@ async fn loser_prefix_is_never_the_committed_artifact() {
     assert!(
         !loaded.is_empty(),
         "the committed adapter is a well-formed safetensors tensor map"
+    );
+}
+
+// ─── A cancelled-mid-run attempt's already-written epoch checkpoints are
+//     reclaimed — existence proven BEFORE reclaim (unit 348, F1/F2) ─────────
+//
+// The top-level artifact prefix's `delete_artifact_prefix` reads and deletes
+// only ITS OWN `manifest.json`'s files — it never reaches into the nested
+// `checkpoints/epoch_{N}/` prefixes underneath, each carrying its own separate
+// manifest. Without a dedicated, DERIVED sweep, a losing/cancelled attempt's
+// epoch checkpoints would be orphaned forever (unbounded storage growth
+// across every reclaimed/failed attempt — family E).
+//
+// This drives `TrainingWorker::run_claimed_job`'s `Cancelled` arm
+// specifically (a real heartbeat-detected lease loss, not a
+// finalize-CAS-loses-the-race scenario), and closes the vacuity a prior
+// version of this test had: that version asserted only ABSENCE after the
+// race, never proving the bytes existed in the first place — so it could not
+// distinguish "the GC worked" from "there was nothing to reclaim". Here the
+// existence check is load-bearing and comes FIRST: the test polls for
+// epoch_0's manifest to land on disk (a real write, not assumed), THEN forces
+// the lease stale (deterministic, not a wall-clock race against the
+// attempt's own healthy heartbeat), THEN waits for the cancelled run to
+// finish, THEN asserts the SAME bytes are gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_run_reclaims_epoch_checkpoints_that_actually_existed() {
+    use jammi_ai::fine_tune::worker::TrainingWorker;
+    use jammi_db::catalog::backend::{SqlValue, TxOptions};
+    use std::time::Duration;
+
+    let dir = TempDir::new().unwrap();
+    let mut config = common::test_config(dir.path());
+    // The minimum legal heartbeat/lease/poll (heartbeat*2 < lease): fast
+    // enough that a real heartbeat tick reliably detects the forced lease
+    // loss within about a second, matching `configured_short_lease_drives_
+    // reclaim`'s precedent for exercising real timing quickly.
+    config.training = jammi_db::config::TrainingConfig {
+        lease_duration_secs: 3,
+        heartbeat_interval_secs: 1,
+        idle_poll_secs: 1,
+    };
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    session
+        .add_source(
+            "training",
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("training_pairs.csv")),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let model = tiny_bert_model();
+
+    let job = session
+        .fine_tune(
+            "training",
+            &model,
+            &[
+                "text_a".to_string(),
+                "text_b".to_string(),
+                "score".to_string(),
+            ],
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(FineTuneConfig {
+                // Deliberately large: a tiny real fine-tune epoch is fast
+                // (single-digit milliseconds on this fixture), so the count
+                // must be big enough that the run is CERTAINLY still mid-
+                // flight by the time the test forces the lease loss below —
+                // the sanity assertion right before that forcing step turns
+                // a wrong guess here into a loud, diagnosable failure rather
+                // than a silently-wrong-path pass.
+                epochs: 20_000,
+                batch_size: 8,
+                lora_rank: 4,
+                warmup_steps: 0,
+                // Opt in (round-2 F3: disabled by default) — without this,
+                // no epoch checkpoint is ever written and the whole test is
+                // vacuous by construction. `n >= epochs` retains everything
+                // this run reaches before it is cancelled.
+                keep_last_n_checkpoints: Some(20_000),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    let worker_a = TrainingWorker::new(&session).expect("short timing clears the margin");
+    let lease = session
+        .inner_config()
+        .training
+        .worker_intervals()
+        .unwrap()
+        .lease;
+    let claimed = session
+        .catalog()
+        .claim_next_training_job(worker_a.worker_id(), lease)
+        .await
+        .unwrap()
+        .expect("the queued job is claimable");
+    let attempt = claimed.attempts;
+    let job_id = job.job_id.clone();
+    let worker_a_id = worker_a.worker_id().to_string();
+
+    // Run the claimed job concurrently (not awaited inline) so the real
+    // heartbeat task can actually tick while training is still in progress —
+    // the load-bearing difference from a synchronous "claim, then run to
+    // completion" drive, which can never observe an in-flight cancellation.
+    let session_for_task = Arc::clone(&session);
+    let handle = tokio::spawn(async move {
+        worker_a.run_claimed_job(&session_for_task, claimed).await;
+    });
+
+    // The local on-disk path this attempt's epoch-0 checkpoint manifest
+    // lands at — `file://` roots materialise real files at exactly this
+    // path (`ArtifactStore`'s in-place short-circuit), so checking it
+    // directly needs no `StorageUrl` round-trip.
+    let epoch0_manifest = dir
+        .path()
+        .join("jammi_db")
+        .join("models")
+        .join(&job_id)
+        .join(&worker_a_id)
+        .join(attempt.to_string())
+        .join("checkpoints")
+        .join("epoch_0")
+        .join("manifest.json");
+
+    // LOAD-BEARING: poll for the bytes to actually appear before doing
+    // anything else. A bounded wait, not a fixed sleep — the exact epoch-0
+    // wall time varies by machine.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if epoch0_manifest.exists() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "epoch_0's checkpoint manifest never appeared within 30s at {epoch0_manifest:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        epoch0_manifest.exists(),
+        "epoch_0's checkpoint bytes must exist BEFORE the reclaim — the load-bearing existence \
+         proof a vacuous version of this test skipped"
+    );
+
+    // Sanity gate: the spawned `run_claimed_job` task must NOT have returned
+    // yet, or the whole point of this test — forcing a lease loss WHILE
+    // training is still in flight — is moot (a task that already returned
+    // would instead have exercised `publish_and_finalize`'s own
+    // already-covered `Ok(false)` arm, a DIFFERENT code path, silently
+    // mis-testing the wrong one; `training_jobs.status` alone cannot
+    // distinguish the two — both leave it `running`). A large `epochs` is
+    // chosen so this should never fire; if it does, that is a loud,
+    // diagnosable failure demanding a bigger epoch count, not a silent
+    // false pass.
+    assert!(
+        !handle.is_finished(),
+        "the spawned run_claimed_job task already completed before the test could force the \
+         lease loss — raise `epochs` further so this genuinely races a live run"
+    );
+
+    // Force the lease stale RIGHT NOW — deterministic, not a race against
+    // worker-a's own healthy (actively-renewing) heartbeat, which would
+    // otherwise never organically expire while the attempt is alive.
+    let force_job_id = job_id.clone();
+    session
+        .catalog()
+        .backend_arc()
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE training_jobs SET lease_expires_at = '2000-01-01T00:00:00Z' \
+                     WHERE job_id = $1",
+                    &[SqlValue::TextOwned(force_job_id)],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+    let reclaimed = session
+        .catalog()
+        .reclaim_expired_training_jobs(5)
+        .await
+        .unwrap();
+    assert_eq!(reclaimed, 1, "the forced-stale lease is reclaimed");
+    let worker_b = TrainingWorker::new(&session).expect("short timing clears the margin");
+    session
+        .catalog()
+        .claim_next_training_job(worker_b.worker_id(), Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("worker-b steals the requeued job");
+
+    // Worker-a's own heartbeat notices the loss within one interval and sets
+    // `cancel`; the training loop bails at its next epoch boundary via
+    // `WorkerJobError::Cancelled`. Bounded wait for the spawned task.
+    tokio::time::timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("worker-a's run_claimed_job must finish once its lease is lost")
+        .unwrap();
+
+    // Worker-a never finalized (the `Cancelled` arm records no terminal
+    // status) — confirms this run really took the cancelled path, not a
+    // race where it happened to finish and win anyway.
+    let after = session.catalog().get_training_job(&job_id).await.unwrap();
+    assert!(
+        after.output_model_id.is_none(),
+        "worker-a's cancelled run must not have finalized the job itself"
+    );
+
+    // THE reclaim assertion: the SAME bytes confirmed to exist above are now
+    // gone — reclaimed by `run_claimed_job`'s `Cancelled` arm calling the
+    // derived `TrainingWorker::gc_epoch_checkpoints` sweep.
+    assert!(
+        !epoch0_manifest.exists(),
+        "epoch_0's checkpoint bytes must be reclaimed once the Cancelled arm runs, not left \
+         durable forever"
+    );
+}
+
+// ─── Winner-path prune leak: a persistently-failed mid-run prune is reclaimed
+//     at finalize, and the failure is never silent (unit 348 F2) ──────────────
+//
+// A REAL, non-cancelled winning run with `keep_last_n_checkpoints = Some(1)`
+// over 3 epochs: epoch_0's on-disk directory is made undeletable (real
+// `chmod`, Unix — see `crates/jammi-ai/src/fine_tune/trainer.rs`'s
+// `epoch_checkpoint_retention_failure` module for why this crate has no
+// pluggable `ArtifactStore` fault-injection seam and this is the closest
+// real integration-level fault injection reachable). Retention can therefore
+// never successfully prune anything: it always retries the OLDEST entry
+// first (epoch_0), which keeps failing, so epoch_1 is never even individually
+// attempted mid-run — both stay durable, over the retention cap, until the
+// run completes. `publish_and_finalize`'s winner arm then (a) trims to the
+// true trailing window (epoch_2 only) before registering, and (b) sweeps the
+// excluded stale entries: epoch_1's delete succeeds for the first time HERE
+// (proving "reclaimed at finalize" for an entry retention itself never got
+// to), while epoch_0's delete fails again (still chmod'd), which must emit
+// the one warning this test asserts on.
+// Deliberately the DEFAULT (`current_thread`) flavor, not `multi_thread`:
+// the tracing capture below installs a THREAD-LOCAL default subscriber,
+// which does not propagate across OS threads. On a `multi_thread` runtime
+// (even with `worker_threads = 1`), `Runtime::block_on`'s calling thread and
+// a `tokio::spawn`-ed task's thread are DIFFERENT — the runtime's own
+// worker pool executes spawned tasks, not the thread driving `block_on`. On
+// `current_thread`, there IS no separate worker pool: `block_on` and every
+// `tokio::spawn`-ed task share the exact same OS thread, cooperatively
+// interleaved at `.await` points, which keeps the subscriber visible to the
+// spawned `run_claimed_job` task's async continuation after `spawn_blocking`
+// resolves back onto it (the `spawn_blocking` closure ITSELF still runs on
+// tokio's separate blocking pool, but the warn under test fires from
+// `publish_and_finalize`, back on the single async thread, not from inside
+// that closure).
+#[cfg(unix)]
+#[tokio::test]
+async fn finalize_reclaims_a_persistently_failed_prune_and_warns() {
+    use std::io;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use jammi_ai::fine_tune::worker::TrainingWorker;
+    use tracing::subscriber::DefaultGuard;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone)]
+    struct BufferWriter(Arc<Mutex<Vec<u8>>>);
+    impl io::Write for BufferWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'w> MakeWriter<'w> for BufferWriter {
+        type Writer = BufferWriter;
+        fn make_writer(&'w self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let dir = TempDir::new().unwrap();
+    let config = common::test_config(dir.path());
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    session
+        .add_source(
+            "training",
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("training_pairs.csv")),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let model = tiny_bert_model();
+
+    let job = session
+        .fine_tune(
+            "training",
+            &model,
+            &[
+                "text_a".to_string(),
+                "text_b".to_string(),
+                "score".to_string(),
+            ],
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(FineTuneConfig {
+                epochs: 3,
+                batch_size: 8,
+                lora_rank: 4,
+                warmup_steps: 0,
+                keep_last_n_checkpoints: Some(1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    let worker = TrainingWorker::new(&session).expect("default worker intervals are valid");
+    let claimed = session
+        .catalog()
+        .claim_next_training_job(worker.worker_id(), std::time::Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("the queued job is claimable");
+    let attempt = claimed.attempts;
+    let job_id = job.job_id.clone();
+    let worker_id = worker.worker_id().to_string();
+    let output_name = job.model_id().to_string();
+
+    let epoch_local_dir = |epoch: usize| {
+        dir.path()
+            .join("jammi_db")
+            .join("models")
+            .join(&job_id)
+            .join(&worker_id)
+            .join(attempt.to_string())
+            .join("checkpoints")
+            .join(format!("epoch_{epoch}"))
+    };
+    let epoch0_dir = epoch_local_dir(0);
+    let epoch1_dir = epoch_local_dir(1);
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(BufferWriter(buffer.clone()))
+        .with_ansi(false)
+        .finish();
+    let _guard: DefaultGuard = tracing::subscriber::set_default(subscriber);
+
+    let session_for_task = Arc::clone(&session);
+    let handle = tokio::spawn(async move {
+        worker.run_claimed_job(&session_for_task, claimed).await;
+    });
+
+    // LOAD-BEARING: poll for epoch_0's manifest to actually appear before
+    // chmod'ing it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !epoch0_dir.join("manifest.json").exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "epoch_0's checkpoint manifest never appeared within 30s at {epoch0_dir:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    std::fs::set_permissions(&epoch0_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    // Let the run finish naturally (no cancellation this time — this is the
+    // WINNER path). Bounded wait.
+    tokio::time::timeout(Duration::from_secs(60), handle)
+        .await
+        .expect("the run must complete")
+        .unwrap();
+
+    // Un-chmod immediately so the tempdir's own cleanup (on drop) can
+    // recursively remove it regardless of what the assertions below find.
+    let restore_epoch0 = || {
+        std::fs::set_permissions(&epoch0_dir, std::fs::Permissions::from_mode(0o755)).ok();
+    };
+
+    let after = session.catalog().get_training_job(&job_id).await.unwrap();
+    if after.status != "completed" {
+        restore_epoch0();
+        panic!("the run must complete and finalize as the sole winner, got status {after:?}");
+    }
+
+    // Only epoch_2 (the trailing `keep=1` window) is registered.
+    let epoch2_row = session
+        .catalog()
+        .get_model(&format!("{output_name}:epoch_2"))
+        .await
+        .unwrap();
+    let epoch0_row = session
+        .catalog()
+        .get_model(&format!("{output_name}:epoch_0"))
+        .await
+        .unwrap();
+    let epoch1_row = session
+        .catalog()
+        .get_model(&format!("{output_name}:epoch_1"))
+        .await
+        .unwrap();
+
+    // epoch_1's bytes are gone — reclaimed by the winner's finalize-time
+    // sweep, even though mid-run retention never individually attempted it
+    // (FIFO always retries epoch_0 first). This is the "reclaimed at
+    // finalize" claim, made observable independent of epoch_0's own
+    // still-blocked state.
+    let epoch1_gone = !epoch1_dir.join("manifest.json").exists();
+    // epoch_0's bytes are STILL present — the chmod is still in effect, so
+    // even the finalize-time retry fails, which is exactly what must
+    // produce the warning this test asserts on below.
+    let epoch0_still_present = epoch0_dir.join("manifest.json").exists();
+
+    let logs = String::from_utf8(buffer.lock().unwrap().clone()).expect("utf-8 logs");
+    restore_epoch0();
+
+    assert!(
+        epoch2_row.is_some(),
+        "epoch_2 (the retained window) must register"
+    );
+    assert!(
+        epoch0_row.is_none(),
+        "epoch_0 must NOT register — trimmed out of the retained window"
+    );
+    assert!(
+        epoch1_row.is_none(),
+        "epoch_1 must NOT register — trimmed out of the retained window"
+    );
+    assert!(
+        epoch1_gone,
+        "epoch_1's bytes must be reclaimed by the winner-arm finalize sweep, even though \
+         mid-run retention never individually attempted it"
+    );
+    assert!(
+        epoch0_still_present,
+        "epoch_0's bytes must still be present — the chmod was never lifted before finalize, \
+         so even the finalize-time retry must fail (proving the sweep genuinely re-attempts it \
+         rather than silently succeeding)"
+    );
+    assert!(
+        logs.contains("epoch-checkpoint GC sweep") && logs.contains(&job_id),
+        "a failed finalize-time reclaim must emit exactly one warning naming the job; \
+         captured logs:\n{logs}"
     );
 }
 

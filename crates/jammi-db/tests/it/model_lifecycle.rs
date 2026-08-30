@@ -27,7 +27,7 @@ use jammi_db::catalog::backend::{BackendKind, TxOptions};
 use jammi_db::catalog::eval_repo::EvalRunRecord;
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::result_repo::{CreateResultTableParams, ResultTableKind};
-use jammi_db::catalog::training_repo::CreateTrainingJobParams;
+use jammi_db::catalog::training_repo::{CreateTrainingJobParams, FinalizeTrainingJobParams};
 use jammi_db::catalog::Catalog;
 use jammi_db::error::JammiError;
 use jammi_db::model_task::ModelTask;
@@ -238,7 +238,15 @@ async fn delete_blocked_by_training_output_name_edge(backend: BackendKind) {
         .expect("the queued job is claimable");
     // output_model_id is set to the output model NAME on finalize.
     let finalized = cat
-        .finalize_training_job("job-1", "worker-a", "acme/tuned", "/tmp/out", None)
+        .finalize_training_job(FinalizeTrainingJobParams {
+            job_id: "job-1",
+            worker_id: "worker-a",
+            output_model_id: "acme/tuned",
+            output_model_version: 1,
+            artifact_path: "/tmp/out",
+            metrics: None,
+            epoch_checkpoints: &[],
+        })
         .await
         .unwrap();
     assert!(finalized, "the lease holder finalizes the job");

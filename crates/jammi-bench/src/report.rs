@@ -2391,9 +2391,12 @@ impl FinetuneRunTier {
 /// the `gpu_capability` suite.
 ///
 /// The report is emitted as one stable JSON document (`Report` →
-/// `tiers.gpu_inference`, printed by `emit()`): `device`, `device_name`,
-/// `iters`, and one [`GpuLane`] per verb (`embed`, `infer`), each carrying
-/// `rows`, `rows_per_s`, `p50_ms`, `p99_ms`. Every key is present on every run
+/// `tiers.gpu_inference`, printed by `emit()`): `device`, `device_name`, and
+/// one [`GpuLane`] per verb (`embed`, `infer`), each carrying `rows`,
+/// `rows_per_s`, `p50_ms`, `p99_ms`, ALONGSIDE every declared
+/// [`Self::IDENTITY_FIELDS`]/[`Self::PROVENANCE_FIELDS`] entry (see the
+/// "Identity contract" section below — `iters` in particular is an IDENTITY
+/// field, not a bare observability count). Every key is present on every run
 /// (no field is conditionally omitted and no record carries a timestamp), so
 /// two runs' JSON diffs cleanly — the groundwork the issue-#335 within-run A/B
 /// perf comparator (`ci/scripts/perf/gpu_inference_ab.py`) reads.
@@ -2406,10 +2409,29 @@ impl FinetuneRunTier {
 /// [`EncodeStepTier`]/[`FinetuneStepTier`] already close one layer down, at
 /// the encode/finetune surfaces. This tier closes the analogous gap at the
 /// on-GPU serving surface: [`Self::IDENTITY_FIELDS`] names the complete
-/// comparison tuple (the corpus seed, the warmup/measured-iteration counts
-/// that bound what was actually timed, the compute precision, and BOTH
-/// served bundles' content identity — embed and classifier, each hashed
-/// independently since a two-verb tier has two checkpoints, not one), and
+/// comparison tuple —
+///
+///   * `corpus_seed`/`row_count`/`corpus_sha256`: the corpus-generation
+///     premise. `row_count` in particular closes the "manufactured-2x
+///     attack" (round-1 adversarial audit B1): `p50_ms` moves LINEARLY with
+///     `row_count` (more rows per `generate_text_embeddings` call is a
+///     longer call), so a leg that silently served a different row count
+///     would print a ratio that reflects nothing about the code under
+///     comparison. `corpus_sha256` (`model_inference::corpus_sha256`) is a
+///     sha256 content hash over every committed sentence plus
+///     `corpus_seed`/`row_count` — the belt-and-suspenders closing move: a
+///     PR that merely REWORDS a sentence (holding `corpus_seed`/`row_count`
+///     fixed) moves NEITHER of those two scalars, so without a content hash
+///     that edit would silently slip through as "the same corpus".
+///   * `warmup`/`iters`: the discarded-vs-measured serve counts that bound
+///     what the percentiles actually fold over. `iters` was already emitted
+///     pre-#335 but never admitted to identity (round-1 adversarial audit
+///     B1) — a leg run with a different `iters` count computes a p50/p99
+///     over a differently-sized sample, which is not the same measurement.
+///   * `compute_precision` and BOTH served bundles' content identity — embed
+///     and classifier, each hashed independently since a two-verb tier has
+///     two checkpoints, not one.
+///
 /// [`Self::PROVENANCE_FIELDS`] names the recorded-but-never-compared facts
 /// (the resolved hardware name, the kernel-disable/flash-compiled build
 /// facts). `run()` asserts both sets present via
@@ -2430,11 +2452,12 @@ impl FinetuneRunTier {
 /// determinant of the exact kind esc-057/K7 forbid (a field two legs could
 /// disagree on with no effect on what the endpoint measures).
 ///
-/// `corpus_seed`/`warmup` were previously compile-time constants
-/// ([`crate::main`]'s `GPU_INFERENCE_PARAMS` literal) never emitted on the
-/// report at all — a within-run A/B comparator reading two JSON reports has
-/// no way to state "both legs used the same corpus/warmup convention"
-/// without them actually being on the report; this tier now emits both.
+/// `corpus_seed`/`row_count`/`warmup`/`corpus_sha256` were previously either
+/// compile-time constants ([`crate::main`]'s `GPU_INFERENCE_PARAMS` literal)
+/// or never computed at all, never emitted on the report — a within-run A/B
+/// comparator reading two JSON reports has no way to state "both legs used
+/// the same corpus/warmup convention" without them actually being on the
+/// report; this tier now emits all four.
 #[derive(Debug, Serialize)]
 pub struct GpuInferenceTier {
     /// The device the serve resolved to (e.g. `cuda:0`) — proof it was not a CPU
@@ -2446,8 +2469,6 @@ pub struct GpuInferenceTier {
     /// PROVENANCE (see [`Self::PROVENANCE_FIELDS`]): only knowable after the
     /// device resolved.
     pub device_name: String,
-    /// Measured serves (after warmup) the percentiles folded over.
-    pub iters: usize,
 
     // ── Comparison identity: `Self::IDENTITY_FIELDS` ────────────────────
     /// The corpus-generation seed (mirrors `ModelInferenceSpec::corpus_seed`'s
@@ -2455,10 +2476,31 @@ pub struct GpuInferenceTier {
     /// so a within-run A/B comparator can state both legs drew the same
     /// corpus.
     pub corpus_seed: u64,
+    /// The synthetic corpus row count — identity (round-1 adversarial audit
+    /// B1, the "manufactured-2x attack"): `p50_ms` moves LINEARLY with this
+    /// value, so two legs at a different `row_count` are not comparable at
+    /// all, regardless of anything else they agree on.
+    pub row_count: usize,
     /// Serves discarded before the measured iterations (pays the one-time
     /// model-load/PTX-JIT cost so it does not land in a measured tail) —
     /// changes what the measured percentiles actually bound.
     pub warmup: usize,
+    /// Measured serves (after warmup) the percentiles folded over — identity
+    /// (round-1 adversarial audit B1): this field was already emitted
+    /// pre-#335 but never admitted to [`Self::IDENTITY_FIELDS`], so two legs
+    /// at a different `iters` (hence a differently-sized measured sample)
+    /// could silently compare as "the same measurement".
+    pub iters: usize,
+    /// sha256 (hex) content hash of the corpus-generation premise
+    /// ([`crate::model_inference::corpus_sha256`]): every committed sentence
+    /// this tier's corpus generator can draw from, plus `corpus_seed` and
+    /// `row_count`. The belt-and-suspenders closing move alongside
+    /// `corpus_seed`/`row_count` above: a PR that REWORDS a committed
+    /// sentence (holding the seed/row-count scalars fixed) moves neither of
+    /// those two fields, so without a content hash that edit would silently
+    /// slip through as "the same corpus" while actually serving different
+    /// text.
+    pub corpus_sha256: String,
     /// The compute precision (`f32`/`f16`/`bf16`) the LOADED embed model
     /// actually resolved to before the serve — read off
     /// [`jammi_ai::model::LoadedModel::compute_precision`], the SAME
@@ -2516,7 +2558,10 @@ impl GpuInferenceTier {
     /// `GPU_INFERENCE_IDENTITY_FIELDS` mirrors this list EXACTLY.
     pub const IDENTITY_FIELDS: &'static [(&'static str, Nullable)] = &[
         ("corpus_seed", Nullable::NonNull),
+        ("row_count", Nullable::NonNull),
         ("warmup", Nullable::NonNull),
+        ("iters", Nullable::NonNull),
+        ("corpus_sha256", Nullable::NonNull),
         ("compute_precision", Nullable::NonNull),
         ("embed_checkpoint_config_sha256", Nullable::NonNull),
         ("embed_checkpoint_weights_sha256", Nullable::NonNull),

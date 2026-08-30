@@ -198,6 +198,40 @@ pub(crate) struct Row {
     pub(crate) text: &'static str,
 }
 
+/// sha256 (hex) content hash of the corpus-generation PREMISE: every
+/// [`SENTENCES`] entry (in declared order), then `corpus_seed`, then
+/// `row_count` — so a reworded/added/removed/reordered committed sentence, a
+/// different seed, or a different row count all move this digest. Exists so
+/// `GpuInferenceTier::corpus_sha256` (issue #335's within-run A/B identity
+/// contract, round-1 adversarial audit B1) has a single content hash
+/// standing in for "the corpus this leg served came from the same
+/// generator" — the same belt-and-suspenders role `checkpoint_*_sha256`
+/// plays for a model bundle: `corpus_seed`/`row_count` alone are two
+/// SCALARS that can each independently be held fixed while [`SENTENCES`]
+/// itself is edited (a PR merely rewords a sentence's TEXT), which neither
+/// scalar would ever move.
+///
+/// The WHOLE [`SENTENCES`] array is folded in, not merely the subset a given
+/// `(corpus_seed, row_count)` pair happens to select — this is the
+/// conservative, honest choice: [`SENTENCES`] is one shared, committed
+/// generator definition, and treating a change ANYWHERE in it as
+/// premise-relevant (even to an entry this particular leg's rotation did not
+/// draw from) never under-catches a real content edit, at the cost of
+/// occasionally refusing a leg pair over an edit that happened not to affect
+/// what was actually served — the safe direction for an IDENTITY check to
+/// err in.
+pub(crate) fn corpus_sha256(corpus_seed: u64, row_count: usize) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for sentence in SENTENCES {
+        hasher.update(sentence.as_bytes());
+        hasher.update(b"\0");
+    }
+    hasher.update(corpus_seed.to_le_bytes());
+    hasher.update(row_count.to_le_bytes());
+    hex::encode(hasher.finalize())
+}
+
 /// Build the deterministic synthetic corpus: `row_count` rows, each drawing a
 /// fixed sentence by a seed-rotated index so the corpus is byte-stable from the
 /// committed seed.
@@ -673,6 +707,64 @@ pub struct ModelInferenceParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`corpus_sha256`] is a real content hash, not a constant: a different
+    /// seed OR a different row count each move the digest — the two scalar
+    /// inputs [`GpuInferenceTier::corpus_seed`]/`::row_count` already cover
+    /// as separate identity fields, folded into this one for the
+    /// belt-and-suspenders reason this function's own doc states.
+    #[test]
+    fn corpus_sha256_reacts_to_seed_and_row_count() {
+        let base = corpus_sha256(0, 4);
+        assert_ne!(
+            base,
+            corpus_sha256(1, 4),
+            "a different seed must move the digest"
+        );
+        assert_ne!(
+            base,
+            corpus_sha256(0, 8),
+            "a different row_count must move the digest"
+        );
+        assert_eq!(
+            base,
+            corpus_sha256(0, 4),
+            "the SAME (seed, row_count) must reproduce the SAME digest deterministically"
+        );
+    }
+
+    /// The teeth for the "reworded sentence" gap this function exists to
+    /// close: with `corpus_seed`/`row_count` held FIXED, a hand-computed
+    /// hash over a PERTURBED sentence set (one byte appended to a single
+    /// entry) must differ from the real [`SENTENCES`]-backed digest — proof
+    /// that the function actually folds the committed TEXT in, not just the
+    /// two scalars.
+    #[test]
+    fn corpus_sha256_reacts_to_a_reworded_sentence_holding_seed_and_row_count_fixed() {
+        use sha2::{Digest, Sha256};
+        let real = corpus_sha256(0, 4);
+
+        let mut hasher = Sha256::new();
+        for (i, sentence) in SENTENCES.iter().enumerate() {
+            if i == 0 {
+                hasher.update(sentence.as_bytes());
+                hasher.update(b" reworded");
+            } else {
+                hasher.update(sentence.as_bytes());
+            }
+            hasher.update(b"\0");
+        }
+        hasher.update(0u64.to_le_bytes());
+        hasher.update(4usize.to_le_bytes());
+        let perturbed = hex::encode(hasher.finalize());
+
+        assert_ne!(
+            real, perturbed,
+            "rewording a single committed sentence, holding corpus_seed/row_count fixed, must \
+             move corpus_sha256 -- otherwise a reworded corpus silently slips through as \
+             'the same corpus'"
+        );
+    }
 
     /// The committed spec is well-formed: a positive corpus, a non-empty target
     /// set within the corpus, both digests of the FNV width, and both baselines

@@ -84,7 +84,11 @@ jobs:
 
       - name: Annotate a premise refusal
         if: always() && steps.perfab.outputs.rc == '1'
-        run: echo "::error::gpu-perf-ab refused (exit 1) — a real correctness-of-measurement problem (an identity mismatch between legs, or a binary whose own provenance did not match the clone it was built from), never a perf regression itself. See the merged report artifact for the named violation(s)."
+        run: echo "::error::gpu-perf-ab refused (exit 1) — a real correctness-of-measurement problem, always the PR's own (an identity mismatch between legs, a binary whose own provenance did not match the clone it was built from, or the PR-side clone's build itself failing). Never a perf regression, and never the parent's fault. See the merged report artifact for the named violation(s)."
+
+      - name: Annotate a usage/infra error
+        if: always() && steps.perfab.outputs.rc == '2'
+        run: echo "::error::gpu-perf-ab hit a usage/infra error (exit 2) — bad arguments, a git clone/checkout/fetch failure, or an unresolved sha; see the run log above (not the merged artifact — a usage/infra error can occur before any report is written)."
 
       - name: Upload merged gpu-perf-ab artifact
         if: always()

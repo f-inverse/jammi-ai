@@ -329,10 +329,23 @@ pub async fn run(params: GpuInferenceParams) -> Result<GpuInferenceTier, Box<dyn
     )
     .await?;
 
-    // The embed bundle's actually-resolved precision — a cache HIT (already
-    // loaded by `measure_embed_lane` above), read off the real `LoadedModel`
-    // rather than a derived/default constant. Mirrors
-    // `encode_step::run`'s own read of the same accessor (unit-62 F-5).
+    // The embed bundle's actually-resolved precision, read off the real
+    // `LoadedModel` rather than a derived/default constant (mirrors
+    // `encode_step::run`'s own read of the same accessor, unit-62 F-5).
+    // This call resolves to the SAME cache key `measure_embed_lane` above
+    // already populated (`ModelSource::parse(&embed_id)` +
+    // `ModelTask::TextEmbedding` + `None` backend hint — the exact tuple
+    // `EmbeddingPipeline::run`'s own `get_or_load` call resolves
+    // `serve_embed`'s `generate_text_embeddings` through, `pipeline/
+    // embedding.rs`), so this is a cache HIT on any real invocation, not a
+    // second cold load — round-1 adversarial audit advisory: verified by
+    // reading both call sites' cache-key inputs, not merely asserted. The
+    // one theoretical exception (eviction under real memory pressure
+    // between the two calls) is not something this small, single-model
+    // tier is expected to hit in practice, but the call is correct either
+    // way — a cold `get_or_load` still returns the SAME real, resolved
+    // `LoadedModel`, just paying a reload cost this comment does not
+    // depend on for correctness.
     let model_source = ModelSource::parse(&embed_id);
     let model_guard = session
         .model_cache()
@@ -344,9 +357,11 @@ pub async fn run(params: GpuInferenceParams) -> Result<GpuInferenceTier, Box<dyn
     let tier = GpuInferenceTier {
         device: format!("cuda:{ordinal}"),
         device_name,
-        iters: params.iters,
         corpus_seed: params.corpus_seed,
+        row_count: params.row_count,
         warmup: params.warmup,
+        iters: params.iters,
+        corpus_sha256: crate::model_inference::corpus_sha256(params.corpus_seed, params.row_count),
         compute_precision,
         embed_checkpoint_config_sha256,
         embed_checkpoint_weights_sha256,
@@ -411,7 +426,10 @@ mod tests {
     fn identity_complete_fixture() -> serde_json::Value {
         serde_json::json!({
             "corpus_seed": 0,
+            "row_count": 256,
             "warmup": 2,
+            "iters": 20,
+            "corpus_sha256": "0".repeat(64),
             "compute_precision": "f32",
             "embed_checkpoint_config_sha256": "a".repeat(64),
             "embed_checkpoint_weights_sha256": "b".repeat(64),
@@ -430,7 +448,11 @@ mod tests {
     /// declares, in this exact order — `ci/scripts/perf/identity_fields.py`'s
     /// `GPU_INFERENCE_IDENTITY_FIELDS` mirrors this list EXACTLY. A field
     /// added, removed, or renamed here is a visible, reviewed diff against
-    /// this test.
+    /// this test. 12 entries (round-1 adversarial audit B1's completeness
+    /// fold-in: `row_count`/`iters`/`corpus_sha256` added to the original 9
+    /// — `row_count` closes the manufactured-2x attack, `iters` closes an
+    /// already-emitted-but-uncompared field, `corpus_sha256` closes the
+    /// "reworded sentence, same seed/row_count" gap).
     #[test]
     fn identity_fields_cardinality_is_pinned() {
         let names: Vec<&str> = GpuInferenceTier::IDENTITY_FIELDS
@@ -441,7 +463,10 @@ mod tests {
             names,
             vec![
                 "corpus_seed",
+                "row_count",
                 "warmup",
+                "iters",
+                "corpus_sha256",
                 "compute_precision",
                 "embed_checkpoint_config_sha256",
                 "embed_checkpoint_weights_sha256",

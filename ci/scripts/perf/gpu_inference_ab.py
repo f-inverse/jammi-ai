@@ -33,14 +33,45 @@ NO second identity comparator.
 ## Order-balanced legs: A, B, B, A
 
 `gpu_inference_ab.sh` runs FOUR legs in the fixed order A, B, B, A —
-`a1` (parent), `b1` (pr), `b2` (pr), `a2` (parent) — never A, A, B, B. This
-cancels a FIRST-ORDER linear clock/thermal drift trend across the run: pair
-`(a1, b1)` and pair `(b2, a2)` each straddle roughly the same time window in
-OPPOSITE physical order, so a monotonic drift moves both pairs' own
-`b/a` ratios in opposite directions, and the two pairs' ratios are averaged
-(never just the first pair alone, and never a naive "mean of all A" vs "mean
-of all B" — that would NOT cancel a linear drift the way adjacent-pair
-averaging does).
+`a1` (parent), `b1` (pr), `b2` (pr), `a2` (parent) — never A, A, B, B.
+
+### What actually cancels, and what does not (round-1 adversarial audit B4 correction)
+
+An EARLIER version of this doc claimed adjacent-pair averaging (below) was
+a SUPERIOR estimator to a naive mean-of-all-A-vs-mean-of-all-B one — that
+claim was FALSE, and is corrected here rather than quietly dropped.
+
+The FIRST-ORDER cancellation this design relies on is bought by the A, B,
+B, A ORDER ITSELF, under a MULTIPLICATIVE linear drift model — the
+physically relevant one for a clock/thermal effect (a GPU that throttles
+increasingly over a run scales EVERY measurement's wall-time by a growing
+FACTOR, not by a fixed absolute offset). Placing the two `b`-role legs
+symmetrically BETWEEN the two `a`-role legs makes the MEAN measurement TIME
+of the `a`-role legs equal the mean measurement time of the `b`-role legs,
+so a multiplicative drift trend's first-order term cancels under EITHER
+reasonable combining convention: BOTH adjacent-pair averaging
+([`combined_embed_p50_ratio`] below) AND a naive mean(all `b`) /
+mean(all `a`) estimator are unbiased to first order under THIS order.
+Adjacent-pairing is therefore a REPORTING convention, not a smaller-bias
+estimator — it additionally surfaces two per-pair ratios on the merged
+report (`adjacent_pair_ratios`) for diagnostic visibility, a genuine
+benefit, but not the source of the cancellation itself.
+`test_gpu_inference_ab.py::DriftCancellationTests` proves both halves of
+this mechanically: a synthetic multiplicative drift recovers the true
+ratio to first order under the REAL A, B, B, A order, and the SAME drift
+would NOT have cancelled under an A, A, B, B order (never this producer's
+actual order).
+
+Under an ADDITIVE linear drift model (a fixed absolute offset per unit
+time, rather than a percentage), NEITHER convention cancels the
+first-order term when `b_true != a_true` — the residual bias is of
+comparable magnitude and shape under both. This residual is an HONEST,
+DOCUMENTED limitation of v1, not silently closed: the `--aa-null`
+empirical-null instrument (D6, `gpu_inference_ab.sh`'s own header) measures
+the REAL combined drift-plus-noise distribution this residual (and every
+other source of run-to-run variance) actually produces on real hardware —
+the intended route to a real, evidence-derived tolerance band, never a
+closed-form correction applied here.
 
 ## ONE pre-registered primary endpoint: embed `p50_ms` ratio (PR / parent)
 
@@ -82,22 +113,44 @@ module's exit code, and a future unit that wires this endpoint into an
 actual gate must replace [`PLACEHOLDER_ADVISORY_BAND`] with a band derived
 from that artifact, never keep this placeholder as the real threshold.
 
-## Exit codes
+## Exit codes (round-1 adversarial audit B3's reconciled lattice — matches
+## `gpu_inference_ab.sh`'s own header table verbatim)
 
   * `0`  — GREEN: all four legs are `OK` and agree on
            [`identity_fields.GPU_INFERENCE_IDENTITY_FIELDS`]. The ratio is
            computed and printed regardless of its own value (recording-only
            — see above).
-  * `1`  — INVALID: at least two `OK` legs disagree on a declared identity
-           field — the two legs did not run the same premise, so no ratio
-           is meaningful. Refuses loudly (never silently drops the
-           mismatched leg and computes a ratio anyway).
-  * `75` — neutral "nothing to compare" (mirrors `gpu_inference_ab.sh`'s own
-           equal-sha / RunPod-capacity neutral-skip convention, and
-           `runpod_gpu_prove.sh`'s own `75` = no GPU capacity): fewer than
-           all four legs produced an `OK` report. NEVER treated as a FAIL —
-           a missing leg (a build failure, a capacity miss, a `DRY_RUN`
-           stub) is a "could not run", not a "ran and disagreed".
+  * `1`  — a real correctness-of-measurement refusal, in TWO shapes: (a)
+           INVALID — at least two `OK` legs DIFFER on a declared identity
+           field's actual VALUE, so no ratio is meaningful; (b)
+           INVALID_MEASUREMENT — the legs' PREMISES agree, but computing
+           the primary endpoint's ratio itself raised (a malformed
+           lane/metric, a zero baseline — [`_measurement_value`]/
+           [`adjacent_pair_ratio`] deliberately raise rather than
+           silently substitute a placeholder). Both refuse loudly (never
+           silently drop the offending leg/field and compute a ratio
+           anyway), and both still WRITE a report (never an uncaught
+           traceback with nothing recorded at all).
+  * `75` — neutral "nothing to compare safely" (mirrors `gpu_inference_ab.sh`'s
+           own equal-sha / RunPod-capacity neutral-skip convention, and
+           `runpod_gpu_prove.sh`'s own `75` = no GPU capacity), never a sign
+           of a code problem, in TWO distinct shapes:
+             - `INCOMPLETE`: fewer than all four legs produced an `OK`
+               report (a build failure, a capacity miss, a `DRY_RUN` stub).
+             - `INCOMPLETE_IDENTITY` (round-1 adversarial audit B3): every
+               `OK` leg's identity DISAGREEMENT is a field MISSING entirely
+               from one side's record (never a genuine differing VALUE) —
+               the honest shape a PARENT leg built before issue #335's own
+               identity contract landed produces (it simply cannot EMIT a
+               field this version of the tool never knew to record).
+               This is NOT the same claim as "the two legs proved they ran
+               a different premise" (that is [`1`] above) — it is "this
+               comparator cannot even ASK the question of one of the
+               fields", which is closer in kind to "could not run" than to
+               "ran and disagreed". A SINGLE differing-VALUE violation
+               among the same set immediately promotes the WHOLE refusal
+               to `1` — a genuine divergence is never masked by an
+               ALSO-missing field elsewhere.
 """
 
 from __future__ import annotations
@@ -200,6 +253,22 @@ def identity_violations_across_legs(identity_by_leg):
     return violations
 
 
+def is_missing_field_violation(violation_text):
+    """`True` iff `violation_text` (one entry of
+    `ab_merge.generic_leg_premise_violations`'s own return list) names a
+    field MISSING entirely from one side's record — that function's own
+    two, and ONLY two, violation shapes are `"...missing from [...] leg's
+    record -- cannot verify..."` and `"...differs: a=... b=..."` (see that
+    function's own source for both literal f-strings this substring test
+    matches against); `False` for the latter (a genuine VALUE divergence).
+    round-1 adversarial audit B3's own classifier: [`build_report`] uses
+    this to route an all-missing violation set to the neutral
+    `INCOMPLETE_IDENTITY`/75 outcome rather than the hard `INVALID`/1
+    refusal a real divergence earns.
+    """
+    return "missing from" in violation_text
+
+
 def _measurement_value(tier, lane, metric):
     """Read `tier[lane][metric]["value"]` (a `Measurement`'s own JSON shape,
     `report.rs::Measurement`) — raises `KeyError`/`TypeError` on a malformed
@@ -244,12 +313,18 @@ def combined_embed_p50_ratio(legs):
 
 
 def classify_advisory(ratio):
-    """`"pass"` when `ratio` falls inside [`PLACEHOLDER_ADVISORY_BAND`],
-    `"fail"` otherwise — NEVER gates (see this module's own doc); purely a
-    printed/recorded classification.
+    """`"within_placeholder_band"` when `ratio` falls inside
+    [`PLACEHOLDER_ADVISORY_BAND`], `"outside_placeholder_band"` otherwise —
+    NEVER gates (see this module's own doc); purely a printed/recorded
+    classification. Deliberately NOT spelled `"pass"`/`"fail"` (round-1
+    adversarial audit advisory): those words read as a GATE verdict to a
+    human skimming the table, which this v1 recording-only instrument is
+    not — `"outside_placeholder_band"` states the FACT (the ratio fell
+    outside a band that is not even pre-registered yet) without implying
+    anything failed.
     """
     lo, hi = PLACEHOLDER_ADVISORY_BAND
-    return "pass" if lo <= ratio <= hi else "fail"
+    return "within_placeholder_band" if lo <= ratio <= hi else "outside_placeholder_band"
 
 
 def lane_measurements(tier, lane):
@@ -325,11 +400,49 @@ def build_report(raw_dir, a_sha=None, b_sha=None):
 
     violations = identity_violations_across_legs(identity_by_leg)
     if violations:
+        # round-1 adversarial audit B3: a violation whose text names a field
+        # MISSING entirely from one side's record (never present-but-null on
+        # a leg that DOES emit it) is not the same claim as a proven
+        # premise MISMATCH -- it is "this comparator cannot even ask the
+        # question", the honest shape a parent leg built before issue
+        # #335's own identity contract landed produces. A single genuine
+        # VALUE divergence anywhere in the set still promotes the WHOLE
+        # refusal to INVALID/1 -- `all(...)` below is FALSE the instant one
+        # "differs:"-shaped violation exists among possibly-several
+        # "missing from"-shaped ones.
+        if all(is_missing_field_violation(v) for v in violations):
+            base["status"] = "INCOMPLETE_IDENTITY"
+            base["leg_premise_violations"] = violations
+            base["incomplete_identity_reason"] = (
+                "every identity disagreement among the OK legs is a field MISSING entirely from one "
+                "side's record, never a differing VALUE -- likely a parent leg built before issue #335's "
+                "own identity contract landed; neutral, not a proven premise mismatch"
+            )
+            return base, 75
         base["status"] = "INVALID"
         base["leg_premise_violations"] = violations
         return base, 1
 
-    ratio, pair_ratios = combined_embed_p50_ratio(tiers)
+    # round-1 adversarial audit advisory: an identity-clean leg set can
+    # STILL carry a malformed measurement (a lane/metric key genuinely
+    # absent, a non-numeric `p50_ms.value`, a zero baseline) --
+    # `_measurement_value`/`adjacent_pair_ratio` deliberately raise rather
+    # than silently substitute a placeholder (see their own doc), so this
+    # is the ONE place that catches those exceptions and turns them into a
+    # TYPED refusal with a report still WRITTEN (never an uncaught
+    # traceback that crashes this script with NO report at all).
+    try:
+        ratio, pair_ratios = combined_embed_p50_ratio(tiers)
+    except (KeyError, TypeError, ValueError, ZeroDivisionError) as exc:
+        base["status"] = "INVALID_MEASUREMENT"
+        base["leg_premise_violations"] = []
+        base["invalid_measurement_reason"] = (
+            f"the four legs' premises agree, but computing the primary endpoint's ratio raised "
+            f"{type(exc).__name__}: {exc} -- a real correctness-of-measurement defect (a malformed "
+            f"lane/metric, a zero baseline), never a perf regression itself"
+        )
+        return base, 1
+
     advisory = classify_advisory(ratio)
     base["status"] = "GREEN"
     base["leg_premise_violations"] = []
@@ -354,13 +467,20 @@ def render_table(merged):
         f"primary_endpoint={merged['primary_endpoint']}",
     ]
     if merged["status"] == "GREEN":
+        # round-1 adversarial audit advisory: "GREEN" alone reads as a
+        # gate-shaped verdict to a skimming human -- this line states what
+        # it actually certifies (the four legs' PREMISES agree) and what it
+        # explicitly does NOT (anything about the measured ratio's own
+        # magnitude, which is recorded below regardless of its value).
+        lines.append("premises=GREEN (validity only -- not a perf verdict; v1 is recording-only)")
         lines.append(f"combined_embed_p50_ratio={merged['combined_embed_p50_ratio']:.6f} (b/a, PR/parent)")
         for pair_label, r in merged["adjacent_pair_ratios"].items():
             lines.append(f"  pair {pair_label}: ratio={r:.6f}")
         adv = merged["advisory"]
         lines.append(
             f"advisory={adv['classification']} band={adv['band']} "
-            f"(NOT PRE-REGISTERED — placeholder until the --aa-null A/A artifact lands)"
+            f"(NOT PRE-REGISTERED — placeholder until the --aa-null A/A artifact lands; "
+            f"observability only, never a gate verdict)"
         )
     elif merged["status"] == "INVALID":
         lines.append("leg_premise_violations:")
@@ -368,6 +488,13 @@ def render_table(merged):
             lines.append(f"  - {v}")
     elif merged["status"] == "INCOMPLETE":
         lines.append(f"missing_legs={merged['missing_legs']}")
+    elif merged["status"] == "INCOMPLETE_IDENTITY":
+        lines.append(f"reason={merged['incomplete_identity_reason']}")
+        lines.append("leg_premise_violations (all missing-field, no genuine value divergence):")
+        for v in merged["leg_premise_violations"]:
+            lines.append(f"  - {v}")
+    elif merged["status"] == "INVALID_MEASUREMENT":
+        lines.append(f"reason={merged['invalid_measurement_reason']}")
     return "\n".join(lines)
 
 

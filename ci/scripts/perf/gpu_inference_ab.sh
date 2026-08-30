@@ -53,39 +53,69 @@
 #
 # ## Order-balanced legs: A, B, B, A (never A, A, B, B)
 #
-# See `gpu_inference_ab.py`'s own module doc for the full rationale (a
-# first-order linear clock/thermal drift trend cancels when the two
-# adjacent-pair ratios straddle the run in opposite physical order).
+# See `gpu_inference_ab.py`'s own module doc ("What actually cancels, and
+# what does not", round-1 adversarial audit B4) for the full, corrected
+# rationale — in short: the ORDER itself (never merely "pairing adjacent
+# legs together") cancels a first-order MULTIPLICATIVE clock/thermal drift
+# trend, by placing the two `b`-role legs symmetrically between the two
+# `a`-role legs.
 #
 # ## `--aa-null`: the D6 empirical-null instrument
 #
-# `GPU_INFERENCE_AB_AA_NULL=1` builds the PARENT sha TWICE, from TWO
-# independent clones (this script's normal clone-a, plus a THIRD clone
-# playing clone-b's role) -- comparing a sha against itself, built and run
-# independently, so the resulting ratio distribution is pure build+
-# measurement+pod noise, never a real code difference. This is the
-# instrument that will eventually populate
+# `GPU_INFERENCE_AB_AA_NULL=1` builds the PARENT sha TWICE, from the SAME
+# TWO independent clones (`clone-a`, `clone-b`) every invocation of this
+# script already makes -- this mode changes ONLY which sha `clone-b` checks
+# out (the parent sha, not the PR sha), never the clone COUNT (always
+# exactly two clones per invocation, in either mode). Comparing a sha
+# against itself, built and run independently, so the resulting ratio
+# distribution is pure build+measurement+pod noise, never a real code
+# difference. This is the instrument that will eventually populate
 # `gpu_inference_ab.py::PLACEHOLDER_ADVISORY_BAND` with a real,
 # derived-from-evidence band (D6) -- until that artifact exists and a real
 # band is derived from it, the placeholder band stays exactly that, a
-# placeholder. Output lands under `ci/artifacts/gpu-perf-aa-null/` (staged
-# here; a human still decides which run(s) get committed as the campaign's
-# own evidence, the same convention `runpod_gpu_howwell.sh`'s own artifact
-# pull follows).
+# placeholder. Output is staged as `$OUT_DIR/aa_null_report.json` (a second
+# copy of the merged report, INSIDE the pulled-back artifact directory --
+# never under `ci/artifacts/gpu-perf-aa-null/` directly on the pod's own
+# throwaway checkout, which `runpod_gpu_perf_ab.sh`'s own rsync step never
+# reaches); a human still decides which run(s) get promoted to
+# `ci/artifacts/gpu-perf-aa-null/` as the campaign's own committed evidence,
+# the same convention `runpod_gpu_howwell.sh`'s own artifact pull follows.
 #
-# ## Exit codes
-#   0  -- GREEN (see `gpu_inference_ab.py`'s own exit-code doc: recorded
-#         regardless of the ratio's own value).
-#   1  -- a REAL correctness-of-measurement refusal: an identity mismatch
-#         between legs (`gpu_inference_ab.py` status INVALID), the PR/
-#         comparison clone's build FAILED, or a binary's own `provenance`
-#         does not match the clone it was supposedly built from.
-#   75 -- neutral "nothing to compare": the PARENT clone's build failed (a
-#         broken baseline is not a code regression this A/B can attribute
-#         to the PR), HEAD already equals origin/main's merge-base (no
-#         PR-side commits at all), both binaries report the SAME
-#         `build_sha` outside `--aa-null` mode, the GPU was busy, or fewer
-#         than all four legs produced an `OK` report.
+# ## Exit codes (round-1 adversarial audit B3's reconciled lattice — this
+# table, the code sites below, and gpu-perf-ab.yml's own step annotations
+# must all agree; every exit site in this script cites which arm of this
+# table it lands on)
+#
+#   0  -- a report was written and the merge's own status is GREEN (see
+#         `gpu_inference_ab.py`'s own exit-code doc: recorded regardless of
+#         the ratio's own value — v1 never gates on the number).
+#   1  -- a REAL correctness-of-measurement refusal, always the PR's own
+#         problem or a genuine measurement-validity defect, never the
+#         parent's: an identity mismatch between two otherwise-comparable
+#         legs (`gpu_inference_ab.py` status INVALID), a malformed
+#         measurement on an otherwise identity-clean leg set
+#         (`gpu_inference_ab.py` status INVALID_MEASUREMENT — a report is
+#         still WRITTEN, never an uncaught crash), a binary whose own
+#         `provenance` does not match the clone it was supposedly built
+#         from, or the PR/comparison clone's build FAILING (outside
+#         `--aa-null` mode — see that mode's own exception below).
+#   2  -- a usage/infra error: bad arguments, `nvidia-smi` itself failing to
+#         run, a `git clone`/`checkout`/submodule-init failure, an
+#         unshallow-fetch failure, HEAD or the computed merge-base not
+#         resolving to a well-formed 40-hex sha.
+#   75 -- neutral "nothing to compare safely right now", never a sign of a
+#         code problem: the GPU was reported busy, the PARENT clone's build
+#         failed (a broken baseline is not a code regression this A/B can
+#         attribute to the PR), the `--aa-null` COMPARISON clone's build
+#         failed (also parent-sha under that mode, same bucket as the
+#         parent), the `origin/main`-tracking-ref refresh fetch failed
+#         (`gpu_inference_ab_git.sh`'s own doc), HEAD already equals
+#         origin/main's merge-base (no PR-side commits at all), both
+#         binaries report the SAME `build_sha` outside `--aa-null` mode, a
+#         parent leg is missing one or more declared identity fields
+#         entirely (predates issue #335's own identity contract —
+#         `gpu_inference_ab.py`'s own `INCOMPLETE_IDENTITY` status), or
+#         fewer than all four legs produced an `OK` report.
 #
 # Env vars:
 #   GPU_INFERENCE_AB_WORK_DIR       where the two/three clones + their own
@@ -115,6 +145,22 @@ GPU_INFERENCE_AB_DRY_RUN="${GPU_INFERENCE_AB_DRY_RUN:-0}"
 GPU_INFERENCE_AB_AA_NULL="${GPU_INFERENCE_AB_AA_NULL:-0}"
 GPU_INFERENCE_AB_SKIP_GPU_CHECK="${GPU_INFERENCE_AB_SKIP_GPU_CHECK:-0}"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
+# Retention (round-1 adversarial audit advisory, documented rather than
+# auto-cleaned): $WORK_DIR (two full clones + two `cargo build` target
+# dirs, easily multiple GB) is DELIBERATELY left on disk when this script
+# exits, success or failure alike -- a fresh, timestamped directory every
+# invocation (never overwritten), so a failed leg's own binary/clone stays
+# inspectable for post-mortem debugging without re-cloning/re-building. The
+# actual cleanup mechanism is the RENTED POD'S OWN teardown: this script
+# always runs inside `runpod_gpu_perf_ab.sh`'s ephemeral RunPod pod (torn
+# down by `runpod_lib.sh`'s own EXIT trap the moment that OUTER driver
+# exits), so $WORK_DIR's lifetime is bounded by the pod's, never by a
+# growing accumulation across runs on a long-lived host. A direct,
+# by-hand invocation of this script on a persistent box is the one case
+# this reasoning does not cover -- an operator running it that way is
+# expected to set GPU_INFERENCE_AB_WORK_DIR explicitly and clean up
+# afterward, the same "operator/perf-lane tool" posture stacked_sweep.sh's
+# own $CARGO_TARGET_DIR reuse already takes.
 WORK_DIR="${GPU_INFERENCE_AB_WORK_DIR:-$(dirname "$REPO_ROOT")/gpu-perf-ab-$TS}"
 OUT_DIR="${GPU_INFERENCE_AB_OUT_DIR:-$REPO_ROOT/.gpu-inference-ab-report/$TS}"
 RAW_DIR="$OUT_DIR/raw"
@@ -137,46 +183,64 @@ run_cmd() {
 
 # --- GPU must be idle before the first build even starts (stacked_sweep.sh
 # precedent) -- a busy GPU makes every timing this script would eventually
-# produce meaningless before a single clone is even made. ---
+# produce meaningless before a single clone is even made.
+#
+# Exit-lattice split (round-1 adversarial audit B3): `nvidia-smi` itself
+# FAILING to run (missing binary, driver problem) is an infra/usage error —
+# exit 2, this box cannot even be asked the question. The query SUCCEEDING
+# and reporting busy compute processes is NEUTRAL — exit 75, "nothing to
+# compare safely right now", the SAME bucket a parent build failure or a
+# merge-base==HEAD no-op falls into (never exit 1, which this script
+# reserves for a REAL correctness-of-measurement refusal). ---
 if [ "$GPU_INFERENCE_AB_SKIP_GPU_CHECK" != "1" ] && [ "$GPU_INFERENCE_AB_DRY_RUN" != "1" ]; then
   BUSY="$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>&1)"
   RC=$?
   if [ "$RC" -ne 0 ]; then
     echo "::error::'nvidia-smi --query-compute-apps' failed (rc=$RC): $BUSY -- refusing to proceed without a confirmed-idle GPU. Set GPU_INFERENCE_AB_SKIP_GPU_CHECK=1 only for a CPU/dry-run smoke test." >&2
-    exit 1
+    exit 2
   fi
   if [ -n "$BUSY" ]; then
-    echo "::error::GPU is not idle -- nvidia-smi reports compute processes:" >&2
+    echo "::warning::GPU is not idle -- nvidia-smi reports compute processes (neutral, nothing to compare safely right now):" >&2
     echo "$BUSY" >&2
-    exit 1
+    exit 75
   fi
 fi
 
-# --- ensure this checkout carries enough history for a real merge-base ---
-if [ "$GPU_INFERENCE_AB_DRY_RUN" != "1" ]; then
-  if [ "$(git -C "$REPO_ROOT" rev-parse --is-shallow-repository 2>&1)" = "true" ]; then
-    run_cmd git -C "$REPO_ROOT" fetch --unshallow --quiet origin \
-      || { echo "::error::'git fetch --unshallow' failed -- cannot compute a real merge-base off a shallow checkout." >&2; exit 2; }
-  fi
-  run_cmd git -C "$REPO_ROOT" fetch --quiet origin main \
-    || echo "::warning::'git fetch origin main' failed -- using whatever local origin/main ref this checkout already has." >&2
+# --- ensure this checkout carries enough history for a real merge-base
+# (round-1 adversarial audit B2) -- see gpu_inference_ab_git.sh's own doc
+# for the exact bug this closes and this function's own exit-code
+# contract (0 / 2 / 75), which this script propagates VERBATIM. ---
+# shellcheck source=ci/scripts/perf/gpu_inference_ab_git.sh
+source "$DIR/gpu_inference_ab_git.sh"
+gpu_inference_ab_ensure_history_for_merge_base "$REPO_ROOT" "$GPU_INFERENCE_AB_DRY_RUN"
+HISTORY_RC=$?
+if [ "$HISTORY_RC" -ne 0 ]; then
+  exit "$HISTORY_RC"
 fi
 
-PR_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD 2>&1)" || { echo "::error::'git rev-parse HEAD' failed: $PR_SHA" >&2; exit 2; }
 SHA_RE='^[0-9a-fA-F]{40}$'
+PR_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD 2>&1)" || { echo "::error::'git rev-parse HEAD' failed: $PR_SHA" >&2; exit 2; }
 if ! [[ "$PR_SHA" =~ $SHA_RE ]]; then
   echo "::error::HEAD did not resolve to a 40-hex commit ('$PR_SHA') -- refusing" >&2
   exit 2
 fi
 if [ "$GPU_INFERENCE_AB_DRY_RUN" = "1" ]; then
-  PARENT_SHA="0000000000000000000000000000000000000a"
+  # round-1 adversarial audit B2: a well-formed 40-hex PLACEHOLDER -- dry-run
+  # must walk the SAME validation PR_SHA/PARENT_SHA both go through below,
+  # never step over it with a value that would fail the real check.
+  PARENT_SHA="a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0"
 else
   PARENT_SHA="$(git -C "$REPO_ROOT" merge-base origin/main HEAD 2>&1)" \
     || { echo "::error::'git merge-base origin/main HEAD' failed: $PARENT_SHA -- is origin/main fetched?" >&2; exit 2; }
 fi
+if ! [[ "$PARENT_SHA" =~ $SHA_RE ]]; then
+  echo "::error::merge-base did not resolve to a 40-hex commit ('$PARENT_SHA') -- refusing" >&2
+  exit 2
+fi
 
 if [ "$GPU_INFERENCE_AB_AA_NULL" = "1" ]; then
-  # The D6 instrument: the "b" role is a THIRD clone of the SAME parent sha,
+  # The D6 instrument: clone-b (the SAME second clone every invocation
+  # makes, never an additional third one) checks out the SAME parent sha,
   # never the PR sha -- see this script's own header.
   B_SHA="$PARENT_SHA"
 else
@@ -219,8 +283,22 @@ if ! build_clone "$CLONE_A" "$TARGET_A"; then
   exit 75
 fi
 if ! build_clone "$CLONE_B" "$TARGET_B"; then
-  echo "::warning::comparison clone build FAILED -- treated the same as a parent build failure (this producer is recording-only in v1: a build that cannot even run is 'nothing to compare', never a perf FAIL); neutral exit 75." >&2
-  exit 75
+  if [ "$GPU_INFERENCE_AB_AA_NULL" = "1" ]; then
+    # --aa-null: clone-b is ALSO a parent-sha clone (see this script's own
+    # header) -- its build failing is the SAME "broken baseline" case as
+    # clone-a's, never a "PR's own problem" (there is no PR leg in play
+    # under this mode at all).
+    echo "::warning::--aa-null comparison clone (a second independent parent-sha build) FAILED -- same bucket as a parent build failure; neutral exit 75." >&2
+    exit 75
+  fi
+  # round-1 adversarial audit B3: a PR-side build failure is the PR's OWN
+  # problem -- a real correctness-of-measurement refusal (exit 1), distinct
+  # from the parent-broke-the-baseline case above (exit 75). The PR simply
+  # not compiling is itself a genuine signal this producer surfaces rather
+  # than swallowing into the same neutral bucket a pre-existing parent
+  # breakage falls into.
+  echo "::error::PR clone build FAILED -- this is the PR's own problem, not a neutral 'nothing to compare' state; exit 1." >&2
+  exit 1
 fi
 
 BIN_A="$TARGET_A/release/jammi-bench"
@@ -295,17 +373,26 @@ run_leg a2 "$BIN_A"
 python3 "$DIR/gpu_inference_ab.py" "$RAW_DIR" "$OUT_DIR" "$A_PROV_SHA" "$B_PROV_SHA"
 MERGE_RC=$?
 
-# --- --aa-null: stage the merged artifact for eventual commit under
-# ci/artifacts/gpu-perf-aa-null/ (D6's own evidence path) -- a human still
-# decides which run(s) get committed, the same convention
-# runpod_gpu_howwell.sh's own artifact pull follows. ---
-if [ "$GPU_INFERENCE_AB_AA_NULL" = "1" ]; then
-  AA_NULL_DIR="$REPO_ROOT/ci/artifacts/gpu-perf-aa-null"
-  mkdir -p "$AA_NULL_DIR"
-  if [ -f "$OUT_DIR/gpu_inference_ab_report.json" ]; then
-    cp "$OUT_DIR/gpu_inference_ab_report.json" "$AA_NULL_DIR/aa-null-$TS.json"
-    echo "=== --aa-null artifact staged (not committed): $AA_NULL_DIR/aa-null-$TS.json ===" >&2
-  fi
+# --- --aa-null: stage a second, clearly-named copy of the merged artifact
+# for eventual commit under ci/artifacts/gpu-perf-aa-null/ (D6's own
+# evidence path) -- a human still decides which run(s) get committed, the
+# same convention runpod_gpu_howwell.sh's own artifact pull follows.
+#
+# Staged INSIDE $OUT_DIR (round-1 adversarial audit advisory), never under
+# $REPO_ROOT/ci/artifacts/ directly: $REPO_ROOT here is the ON-POD checkout
+# (e.g. /root/jammi-ai) that invoked this script, NOT the caller's own
+# local repo -- a file written under $REPO_ROOT/ci/artifacts/ would sit
+# inside the pod's own throwaway clone, OUTSIDE the ONE directory
+# ($OUT_DIR, ".gpu-inference-ab-report/<ts>/") `runpod_gpu_perf_ab.sh`'s
+# own rsync step actually pulls back before the pod is torn down -- it
+# would silently never leave the pod at all. $OUT_DIR is exactly the tree
+# that DOES get pulled, so staging here is what actually makes this
+# artifact retrievable; an operator who wants to commit it under
+# ci/artifacts/gpu-perf-aa-null/ for real (once enough runs exist to derive
+# a real band, D6) copies it there from the pulled artifact directory. ---
+if [ "$GPU_INFERENCE_AB_AA_NULL" = "1" ] && [ -f "$OUT_DIR/gpu_inference_ab_report.json" ]; then
+  cp "$OUT_DIR/gpu_inference_ab_report.json" "$OUT_DIR/aa_null_report.json"
+  echo "=== --aa-null artifact staged inside the pulled report dir: $OUT_DIR/aa_null_report.json (promote to ci/artifacts/gpu-perf-aa-null/ by hand once it is real evidence) ===" >&2
 fi
 
 echo

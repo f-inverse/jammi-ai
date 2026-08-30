@@ -14,16 +14,34 @@
 # triggers, never a schedule.
 #
 # RECORDING-ONLY (v1): `gpu_inference_ab.py`'s own exit codes (see that
-# module's doc) are the SAME ones this script propagates — 0 = GREEN
-# (recorded regardless of the ratio), 1 = a real premise/provenance
-# refusal, 75 = neutral "nothing to compare" (no capacity, a build failure,
-# or fewer than four OK legs). This driver treats RunPod capacity misses
-# (rp_deploy_live_a100 failing) with the SAME 75 convention
-# runpod_gpu_prove.sh/runpod_gpu_howwell.sh already use.
+# module's doc) are the SAME ones this script propagates — 0 = report
+# written, merge status GREEN; 1 = a real correctness-of-measurement
+# refusal (identity/provenance mismatch, or a PR-side build failure — the
+# PR's own problem); 2 = a usage/infra error (bad args, a clone/checkout/
+# fetch failure); 75 = neutral "nothing to compare safely right now" (no
+# RunPod capacity, a GPU-busy pod, a PARENT-side build failure, an
+# `origin/main` refresh-fetch failure, `merge-base == HEAD`, or fewer than
+# four `OK` legs) — see `gpu_inference_ab.sh`'s own header for the full,
+# reconciled table this driver's exit code is drawn from verbatim. This
+# driver treats RunPod capacity misses (`rp_deploy_live_a100` failing) with
+# the SAME 75 convention runpod_gpu_prove.sh/runpod_gpu_howwell.sh already
+# use.
 #
 # Env vars:
-#   GIT_REPO / GIT_REF        what to clone (defaults mirror
-#                             runpod_gpu_howwell.sh's own).
+#   GIT_REPO   what to clone.
+#   GIT_REF    what to check out — a BRANCH NAME or a commit sha, REQUIRED
+#              (no silent default): `git clone` (below) never passes this
+#              to `-b` (which REJECTS an arbitrary sha, only accepting a
+#              branch/tag name — round-1 adversarial audit B2's own
+#              advisory), it clones the whole repo first and `git
+#              checkout`s this value afterward, which accepts either shape
+#              uniformly. Refuses loudly if unset rather than silently
+#              defaulting to a sha-shaped `GITHUB_SHA` value that would
+#              have been rejected under the OLD `clone -b` shape (the
+#              caller must state a real branch/sha deliberately;
+#              gpu-perf-ab.yml's own `GIT_REF` env always sets this
+#              explicitly to `github.head_ref || github.ref_name`, a
+#              branch name).
 #   GPU_PERF_AB_AA_NULL=1     forwarded as GPU_INFERENCE_AB_AA_NULL — the D6
 #                             empirical-null instrument (see
 #                             gpu_inference_ab.sh's own doc). Default unset
@@ -41,7 +59,15 @@ RP_TTL_HOURS="${RP_TTL_HOURS:-3}"
 source "$DIR/runpod_lib.sh"
 
 GIT_REPO="${GIT_REPO:-https://github.com/${GITHUB_REPOSITORY:-f-inverse/jammi-ai}.git}"
-GIT_REF="${GIT_REF:-${GITHUB_SHA:-main}}"
+# round-1 adversarial audit B2 advisory: no silent sha-shaped default (the
+# old `${GITHUB_SHA:-main}` fallback would have fed a raw commit sha into
+# `clone -b`, which REJECTS anything that is not a branch/tag name) — GIT_REF
+# is REQUIRED, and this script refuses loudly rather than guessing.
+GIT_REF="${GIT_REF:-}"
+if [ -z "$GIT_REF" ]; then
+  echo "::error::GIT_REF must be set explicitly (a branch name or a commit sha) — no silent default; gpu-perf-ab.yml's own driver always sets it." >&2
+  exit 2
+fi
 
 GPU_PERF_AB_AA_NULL="${GPU_PERF_AB_AA_NULL:-0}"
 GPU_PERF_AB_ARTIFACT_DIR="${GPU_PERF_AB_ARTIFACT_DIR:-${REPO_ROOT}/.gpu-pull/gpu-perf-ab}"
@@ -66,13 +92,32 @@ export CARGO_BUILD_RUSTC_WRAPPER=
 export JAMMI_REQUIRE_CUDA=1
 echo "::group::device"; nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv; echo "::endgroup::"
 cd /root && rm -rf jammi-ai
-git clone --depth 1 -b "${GIT_REF}" "${GIT_REPO}" jammi-ai 2>&1 | tail -1
+# round-1 adversarial audit B2 (the empirically-proven bug: "merge-base
+# exits 128"): a FULL, non-single-branch clone, THEN an explicit checkout —
+# never \`git clone --depth 1 -b "\${GIT_REF}"\`. That old shape was BOTH
+# (a) a single-branch SHALLOW clone, whose own remote config scopes its
+# default fetch refspec to ONE branch alone, so \`origin/main\` never
+# existed as a local tracking ref at all once \`gpu_inference_ab.sh\` (run
+# next, against THIS checkout) tried \`git merge-base origin/main HEAD\`
+# against it -- empirically \`fatal: ... unknown revision\`, exit 128; and
+# (b) fed straight into \`-b\`, which REJECTS an arbitrary commit sha (only
+# accepts a branch/tag name) -- a GIT_REF that happened to be a raw sha
+# (the old \${GITHUB_SHA:-main} fallback's own shape) would have failed
+# this clone outright. A full clone + a separate \`checkout\` accepts
+# EITHER shape uniformly and always creates \`origin/main\` from the
+# initial clone onward (no single-branch restriction narrows the remote's
+# own default fetch refspec), fixing both (a) and (b) in one change.
+git clone --quiet "${GIT_REPO}" jammi-ai 2>&1 | tail -1
 cd jammi-ai
-# gpu_inference_ab.sh clones THIS checkout twice (or three times under
-# --aa-null) into fresh sibling directories and builds each independently
-# (see that script's own doc for why single-repo checkout-phasing is
-# unsound here) — each of ITS OWN clones inits the CUTLASS submodule
-# itself, so this outer clone needs no submodule init of its own.
+git checkout --quiet "${GIT_REF}" 2>&1 | tail -1
+# gpu_inference_ab.sh clones THIS checkout TWICE (clone-a, clone-b — the
+# SAME two clones every invocation makes, in either mode; --aa-null changes
+# only which sha clone-b checks out, never the clone COUNT — see that
+# script's own doc) into fresh sibling directories and builds each
+# independently (see that script's own doc for why single-repo
+# checkout-phasing is unsound here) — each of ITS OWN clones inits the
+# CUTLASS submodule itself, so this outer clone needs no submodule init of
+# its own.
 
 echo "::group::gpu-perf-ab A/B (gpu_inference_ab.sh)"
 GPU_INFERENCE_AB_AA_NULL="${GPU_PERF_AB_AA_NULL}" \

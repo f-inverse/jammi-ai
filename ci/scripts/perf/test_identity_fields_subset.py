@@ -342,20 +342,21 @@ class GpuInferenceIdentityFieldsSubsetTests(unittest.TestCase):
             _extract_rust_fields_block(REPORT_RS, _PROVENANCE_FIELDS_BLOCK_RE, "GpuInferenceTier")
         )
 
-    def test_gpu_inference_identity_fields_has_exactly_9_entries(self):
+    def test_gpu_inference_identity_fields_has_exactly_12_entries(self):
         self.assertEqual(
             len(identity_fields.GPU_INFERENCE_IDENTITY_FIELDS),
-            9,
-            "identity_fields.py::GPU_INFERENCE_IDENTITY_FIELDS must have EXACTLY 9 "
-            "entries (issue #335 D4's pinned list: corpus_seed, warmup, "
-            "compute_precision, and the embed/infer bundles' three checkpoint "
-            "hashes each) — a count other than 9 means either this const drifted "
-            "from GpuInferenceTier::IDENTITY_FIELDS or the Rust side itself grew/"
-            "shrank; re-derive from source, never bump to make this test pass.",
+            12,
+            "identity_fields.py::GPU_INFERENCE_IDENTITY_FIELDS must have EXACTLY 12 "
+            "entries (issue #335 D4's pinned list, grown 9 -> 12 by round-1 "
+            "adversarial audit B1: corpus_seed, row_count, warmup, iters, "
+            "corpus_sha256, compute_precision, and the embed/infer bundles' three "
+            "checkpoint hashes each) — a count other than 12 means either this const "
+            "drifted from GpuInferenceTier::IDENTITY_FIELDS or the Rust side itself "
+            "grew/shrank; re-derive from source, never bump to make this test pass.",
         )
         self.assertEqual(
             len(set(identity_fields.GPU_INFERENCE_IDENTITY_FIELDS)),
-            9,
+            12,
             "GPU_INFERENCE_IDENTITY_FIELDS contains a duplicate entry",
         )
 

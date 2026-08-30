@@ -451,9 +451,22 @@ mkdir -p "$RAW_DIR"
 # checkable: `ab_merge.py`'s own `TWO_RUN_PROTOCOL_MARKER` constant names
 # the SAME filename, and its presence makes all four bar legs
 # (`jammi-fused`, `torch-sdpa`, `jammi-fused-2`, `torch-sdpa-2`) REQUIRED
-# for that config — a MISSING/DRY_RUN second-run leg under this marker is
-# an INVALID config (an incomplete sweep, not a legacy raw_dir), never a
-# silent fallback to the single-pair estimator.
+# for that config — a genuinely MISSING second-run leg (the file never
+# written at all) under this marker is an INVALID config (an incomplete
+# sweep, not a legacy raw_dir), never a silent fallback to the single-pair
+# estimator. Every OTHER pair-ratio gap (an OK leg whose own report still
+# carries a falsy/missing `triplets_per_s` — B1, round-2 adversarial
+# audit) is ALSO required-and-refused under this marker, via the SAME
+# "both pairs, not just one" discipline, one level below outcome. A
+# DRY_RUN second-run leg (advisory i — picked, prose now matches code
+# rather than the other way around: DRY_RUN is a deliberate, ANNOUNCED
+# "nothing ran for real" mode this script's own `AB_DRY_RUN=1` writes
+# uniformly across all six legs, never an incompleteness signal — making
+# it INVALID here would make every dry-run smoke-test invocation of this
+# script read INVALID unconditionally, defeating the whole point of
+# `AB_DRY_RUN` as a safe control) reads `N/A (dry-run)`, checked BEFORE
+# this marker's own MISSING/no-ratio checks in `ab_merge.py`'s own verdict
+# chain — never INVALID.
 touch "$RAW_DIR/TWO_RUN_PROTOCOL_MARKER"
 
 CONFIGS=("8:128" "8:512" "16:128")

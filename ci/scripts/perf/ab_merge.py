@@ -107,14 +107,28 @@ BAR_SECOND_RUN_LEGS = {"jammi-fused": "jammi-fused-2", "torch-sdpa": "torch-sdpa
 # `finetune_ab.sh` `touch`es under `raw_dir`, BEFORE any leg runs, on
 # EVERY invocation (that script always runs the full A,B,B,A protocol —
 # see its own header). The SAME filename, read here. Presence means "this
-# raw_dir's operator promised all four bar legs" — a MISSING/DRY_RUN
-# second-run leg under this marker is therefore an INCOMPLETE SWEEP
-# (INVALID, a named reason), never silently degraded to the single-pair
-# estimator the way an absent marker (a genuinely legacy `raw_dir`,
-# predating this fold-in, or one hand-built without it) still is. Kept
-# unprefixed (no leading `.`) so `ls`/a human browsing `raw_dir` sees it;
-# `config_slugs()` below never matches it (it carries no `.exit` suffix
-# and no `__` separator).
+# raw_dir's operator promised all four bar legs" — under this marker:
+#   * a genuinely MISSING second-run leg (the file never written at all)
+#     is an INCOMPLETE SWEEP (INVALID, a named reason via
+#     `two_run_missing_leg_reason`);
+#   * an OK-outcome leg whose own report still carries a falsy/missing
+#     `triplets_per_s` (B1, round-2 adversarial audit) is ALSO required
+#     and refused — BOTH pair ratios must resolve, never silently handed
+#     back from whichever ONE pair happened to produce a usable number
+#     (see `build_report`'s own `elif bar_ratio is None or (two_run_mode
+#     and ...)` branch);
+# neither is silently degraded to the single-pair estimator the way an
+# absent marker (a genuinely legacy `raw_dir`, predating this fold-in, or
+# one hand-built without it) still is. A DRY_RUN second-run leg (advisory
+# i — picked, prose now matches code: DRY_RUN is a deliberate, ANNOUNCED
+# "nothing ran for real" mode `finetune_ab.sh`'s own `AB_DRY_RUN=1` writes
+# uniformly across every leg, never an incompleteness signal — making it
+# INVALID here would make every dry-run smoke-test read INVALID
+# unconditionally) reads `N/A (dry-run)` instead — `any_dry_run` is
+# checked FIRST in `build_report`'s own verdict chain, before either of
+# the two checks above ever runs. Kept unprefixed (no leading `.`) so
+# `ls`/a human browsing `raw_dir` sees it; `config_slugs()` below never
+# matches it (it carries no `.exit` suffix and no `__` separator).
 TWO_RUN_PROTOCOL_MARKER = "TWO_RUN_PROTOCOL_MARKER"
 
 
@@ -1498,7 +1512,24 @@ def build_report(raw_dir, steps, warmup, pass_ratio, torch_lora_init="peft"):
                 )
             else:
                 verdict = f"FAIL (OOM where torch fits: jammi-fused {entries['jammi-fused']['outcome']})"
-        elif bar_ratio is None:
+        elif bar_ratio is None or (two_run_mode and (ratio is None or pair2_ratio is None)):
+            # B1 (round-2 adversarial audit): the OUTCOME-only
+            # `torch_fits`/`jammi_fused_fits` checks above cannot see a
+            # DATA-quality gap — a leg reading `OK` whose own report still
+            # carries a falsy/missing `triplets_per_s` (`bar_pair_ratio`
+            # then reads `None` for THAT pair specifically). Under
+            # `two_run_mode` the bar ratio consumes BOTH pair ratios (see
+            # `bar_ratio_classification`'s own doc), so EITHER one reading
+            # `None` here — even though `bar_ratio_classification` itself
+            # would gracefully hand back the OTHER, still-valid pair
+            # (correct behaviour for the single-run/legacy case, where
+            # there IS no other pair to cross-check against) — must
+            # refuse the WHOLE config instead of silently computing a
+            # verdict off exactly ONE of the two required measurements.
+            # Legacy (no marker) mode is UNCHANGED: `two_run_mode` is
+            # `False` there, so this widened condition collapses back to
+            # the original `bar_ratio is None` check (both pairs None, or
+            # no second run at all) exactly as before.
             verdict = "FAIL (no ratio: triplets_per_s missing on an OK leg — investigate)"
         elif bar_indeterminate:
             # See `bar_ratio_classification`'s own doc: the two A,B,B,A pair

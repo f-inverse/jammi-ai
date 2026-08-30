@@ -6120,5 +6120,100 @@ class AdversarialAuditFoldInTests(unittest.TestCase):
                 )
 
 
+class Round2AuditFoldInTests(unittest.TestCase):
+    """B1 (round-2 adversarial audit — "silent single-pair PASS under the
+    marker"): under `two_run_mode`, an `OK`-outcome leg whose own report
+    still carries a falsy/missing `triplets_per_s` must refuse the WHOLE
+    config, never silently hand the verdict back to the OTHER (still
+    valid) pair. The audit's own two probes, verbatim.
+    """
+
+    def run_merge(self, raw_dir):
+        out_dir = tempfile.mkdtemp()
+        rc = ab_merge.main([raw_dir, out_dir, "20", "5", "0.9"])
+        with open(os.path.join(out_dir, "finetune_ab_report.json")) as fh:
+            merged = json.load(fh)
+        with open(os.path.join(out_dir, "finetune_ab_table.txt")) as fh:
+            table = fh.read()
+        return rc, merged, table
+
+    def test_marker_present_zero_tps_on_first_run_torch_sdpa_refuses(self):
+        """`torch-sdpa` (first run) reads `OK` but `triplets_per_s ==
+        0.0` -- `ratio` (pair 1) is `None`; `pair2_ratio` (a clean second
+        run) is a real float. Before this fix, `bar_ratio_classification`
+        gracefully handed back `pair2_ratio` as `bar_ratio`, and the
+        config silently PASSED off exactly one of the two pairs the
+        marker promised both of.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_two_run_marker(raw_dir)
+            write_ok_config(
+                raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES,
+                torch_overrides={"triplets_per_s": {"value": 0.0, "unit": "triplets/s"}},
+            )
+            write_second_run(raw_dir, "b8-s128-d0")  # clean second run
+            rc, merged, table = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertIsNone(cfg["ratio_jammi_fused_over_torch_sdpa"])
+        self.assertIsNotNone(cfg["bar_pair_ratios"]["pair2_jammi_fused_2_over_torch_sdpa_2"])
+        self.assertFalse(cfg["verdict"].startswith("PASS"), cfg["verdict"])
+        self.assertIn("no ratio: triplets_per_s missing on an OK leg", cfg["verdict"])
+        self.assertIn("no ratio: triplets_per_s missing on an OK leg", table)
+        self.assertEqual(rc, 0)  # record-don't-gate: this FAIL never gates exit code.
+
+    def test_marker_present_zero_tps_on_second_run_torch_sdpa_2_refuses(self):
+        """The MIRROR probe: `torch-sdpa` (first run) is clean, but
+        `torch-sdpa-2` (second run) reads `OK` with `triplets_per_s ==
+        0.0` -- `pair2_ratio` is `None`, `ratio` (pair 1) is a real float.
+        Before this fix, `bar_ratio_classification` handed back `ratio`
+        as `bar_ratio` and the config silently PASSED off pair 1 alone.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_two_run_marker(raw_dir)
+            write_ok_config(raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES)  # clean first run
+            write_second_run(
+                raw_dir, "b8-s128-d0",
+                torch_overrides={"triplets_per_s": {"value": 0.0, "unit": "triplets/s"}},
+            )
+            rc, merged, table = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertIsNotNone(cfg["ratio_jammi_fused_over_torch_sdpa"])
+        self.assertIsNone(cfg["bar_pair_ratios"]["pair2_jammi_fused_2_over_torch_sdpa_2"])
+        self.assertFalse(cfg["verdict"].startswith("PASS"), cfg["verdict"])
+        self.assertIn("no ratio: triplets_per_s missing on an OK leg", cfg["verdict"])
+        self.assertEqual(rc, 0)
+
+    def test_legacy_no_marker_mode_keeps_the_single_pair_fallback_unchanged(self):
+        """Backward compatibility, restated for B1 specifically: WITHOUT
+        the marker, a zero-tps first-run torch-sdpa with no second run at
+        all keeps the ORIGINAL single-pair "no ratio" classification --
+        this fix widens the condition only for `two_run_mode`, never the
+        legacy path.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(
+                raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES,
+                torch_overrides={"triplets_per_s": {"value": 0.0, "unit": "triplets/s"}},
+            )
+            rc, merged, table = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertFalse(merged["two_run_protocol"])
+        self.assertIn("no ratio: triplets_per_s missing on an OK leg", cfg["verdict"])
+        self.assertEqual(rc, 0)
+
+    def test_marker_present_both_pairs_clean_still_passes(self):
+        """Positive control: the widened condition must not false-positive
+        when both pairs genuinely produced a usable ratio.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_two_run_marker(raw_dir)
+            write_ok_config(raw_dir, "b8-s128-d0", _CLEAN_YES_DISPATCHES)
+            write_second_run(raw_dir, "b8-s128-d0")
+            rc, merged, table = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-d0"]
+        self.assertTrue(cfg["verdict"].startswith("PASS"), cfg["verdict"])
+        self.assertEqual(rc, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

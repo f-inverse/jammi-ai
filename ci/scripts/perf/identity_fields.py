@@ -24,6 +24,7 @@ test.
 
 from __future__ import annotations
 
+import itertools
 import math
 import struct
 
@@ -120,15 +121,36 @@ class _NotRepresentableAsF32:
     other exactly as loudly as one malformed input against one clean
     value — never let two garbage values silently "cancel out" into an
     accidental match.
+
+    Advisory (ii), round-2 adversarial audit: `__repr__` is INSTANCE-UNIQUE
+    (a per-instance sequence number folded in), not merely a function of
+    `raw`. This is not cosmetic: `finetune_run_leg_identity_violations`
+    (`ab_merge.py`, the cross-seed identity check) groups displayed values
+    by `repr(display)` — a plain string KEY, never by `==` — precisely
+    because a `dict` needs a hashable key and `_NotRepresentableAsF32`
+    itself is deliberately not usefully hashable-by-value (see `__hash__`
+    below). Two DIFFERENT `_NotRepresentableAsF32` instances that happened
+    to wrap the SAME `raw` (e.g. two legs both reporting `1e40`, or both
+    `nan`) would, with a `raw`-only `__repr__`, produce the IDENTICAL
+    `repr()` string and collapse into ONE dict bucket — silently
+    "agreeing" by string coincidence, the exact same class of accidental
+    match `__eq__`'s own doc above forbids, just reached through a
+    different (repr-keyed, not eq-keyed) grouping mechanism a SECOND
+    caller happens to use. The sequence number makes that collision
+    structurally impossible: no two instances, constructed at different
+    times, can ever share a `repr()`.
     """
 
-    __slots__ = ("raw",)
+    __slots__ = ("raw", "_seq")
+
+    _next_seq = itertools.count()
 
     def __init__(self, raw):
         self.raw = raw
+        self._seq = next(_NotRepresentableAsF32._next_seq)
 
     def __repr__(self):
-        return f"<not representable as the engine's f32: {self.raw!r}>"
+        return f"<not representable as the engine's f32 (#{self._seq}): {self.raw!r}>"
 
     def __eq__(self, other):
         return False

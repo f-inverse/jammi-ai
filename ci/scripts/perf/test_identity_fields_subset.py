@@ -636,6 +636,36 @@ class F32DomainGuardTests(unittest.TestCase):
             identity_fields.canonicalize_identity_field("lora_dropout", 0.05),
         )
 
+    def test_repr_is_instance_unique_even_for_the_identical_raw_value(self):
+        """Advisory (ii), round-2 adversarial audit: `finetune_run_leg_
+        identity_violations` (`ab_merge.py`) groups displayed values by
+        `repr(display)` -- a plain dict KEY, never by `==`. A `raw`-only
+        `__repr__` would let two DIFFERENT `_NotRepresentableAsF32`
+        instances wrapping the SAME raw value (e.g. two legs both reading
+        `1e40`) collapse into ONE dict bucket, silently "agreeing" by
+        string coincidence -- the same class of accidental match `__eq__`
+        already forbids, reached through a different mechanism.
+        """
+        a = identity_fields.canonicalize_identity_field("lora_dropout", 1e40)
+        b = identity_fields.canonicalize_identity_field("lora_dropout", 1e40)
+        self.assertIsInstance(a, identity_fields._NotRepresentableAsF32)
+        self.assertIsInstance(b, identity_fields._NotRepresentableAsF32)
+        self.assertNotEqual(repr(a), repr(b))
+        # The `dict`-grouping shape `ab_merge.py`'s cross-seed identity
+        # check actually uses, driven directly against the real class.
+        groups = {}
+        for label, display in (("leg1", a), ("leg2", b)):
+            key = repr(display)
+            entry = groups.setdefault(key, (display, []))
+            entry[1].append(label)
+        self.assertEqual(len(groups), 2, f"two distinct malformed values collapsed into one bucket: {groups}")
+
+    def test_repr_still_names_the_raw_value_for_a_human_reader(self):
+        # The instance-unique sequence number must not obscure the actual
+        # underlying raw value a human debugging a violation needs to see.
+        result = identity_fields.canonicalize_identity_field("max_grad_norm", 1e40)
+        self.assertIn("1e+40", repr(result))
+
 
 if __name__ == "__main__":
     unittest.main()

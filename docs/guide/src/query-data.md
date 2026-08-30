@@ -41,6 +41,7 @@ jammi sources add patents --path /data/patents.parquet --format parquet
 | Parquet | `FileFormat::Parquet` | `"parquet"` | Columnar, compressed, recommended for large datasets |
 | CSV | `FileFormat::Csv` | `"csv"` | Auto-detected schema |
 | JSON | `FileFormat::Json` | `"json"` | Line-delimited JSON |
+| JSON Lines | `FileFormat::JsonLines` | `"jsonl"` or `"ndjson"` | Same line-delimited reader as JSON; defaults directory listing to the `.jsonl` extension |
 
 ## Run a SQL query
 

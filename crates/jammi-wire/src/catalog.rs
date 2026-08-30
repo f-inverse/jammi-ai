@@ -122,8 +122,17 @@ fn file_format_to_proto(format: Option<FileFormat>) -> pb::FileFormat {
     }
 }
 
-/// Map the proto [`FileFormat`] enum onto the engine's [`FileFormat`]; an
-/// unspecified/unknown format means "let the engine infer" → `None`.
+/// Map the proto [`FileFormat`] enum onto the engine's [`FileFormat`].
+///
+/// `FILE_FORMAT_UNSPECIFIED` is the deliberate "no format sent" wire value (see
+/// [`file_format_to_proto`]'s doc) and decodes to `None` — "let the engine
+/// infer". An out-of-range `i32` (a value no compiled `FileFormat` variant
+/// claims) is a DIFFERENT case: version skew, a newer client sending a format
+/// this server's older proto doesn't know. Collapsing that into `None` would
+/// silently reinterpret the caller's explicit format choice as "unset" —
+/// mirrors [`source_type_from_proto`]'s same distinction (there, unspecified
+/// and unknown are both rejected outright, because that discriminant has no
+/// "infer" fallback; here only the genuinely unknown i32 is rejected).
 fn file_format_from_proto(format: i32) -> Result<Option<FileFormat>, Status> {
     match pb::FileFormat::try_from(format) {
         Ok(pb::FileFormat::Parquet) => Ok(Some(FileFormat::Parquet)),
@@ -131,7 +140,11 @@ fn file_format_from_proto(format: i32) -> Result<Option<FileFormat>, Status> {
         Ok(pb::FileFormat::Json) => Ok(Some(FileFormat::Json)),
         Ok(pb::FileFormat::Jsonl) => Ok(Some(FileFormat::JsonLines)),
         Ok(pb::FileFormat::Avro) => Ok(Some(FileFormat::Avro)),
-        Ok(pb::FileFormat::Unspecified) | Err(_) => Ok(None),
+        Ok(pb::FileFormat::Unspecified) => Ok(None),
+        Err(_) => Err(Status::invalid_argument(format!(
+            "unknown FileFormat value {format} — this looks like version skew \
+             (a client sending a format this server's proto doesn't know)"
+        ))),
     }
 }
 
@@ -497,5 +510,27 @@ mod tests {
         assert_eq!(encoded, pb::FileFormat::Unspecified);
         let decoded = file_format_from_proto(encoded as i32).unwrap();
         assert_eq!(decoded, None);
+    }
+
+    /// An out-of-range `i32` (no compiled `FileFormat` variant claims it) is
+    /// version skew, NOT "unset" — it must be a loud `InvalidArgument` naming
+    /// the unknown value, never silently folded into `Ok(None)` alongside the
+    /// genuinely-unspecified case (which the previous test pins as `Ok(None)`).
+    /// Collapsing the two would let an explicit-but-unrecognised format choice
+    /// silently become "let the engine infer".
+    #[test]
+    fn unknown_format_i32_is_a_typed_error_not_silently_none() {
+        let unknown = 99;
+        assert!(
+            pb::FileFormat::try_from(unknown).is_err(),
+            "test fixture assumption: 99 must not be a valid FileFormat discriminant"
+        );
+        let err = file_format_from_proto(unknown).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains(&unknown.to_string()),
+            "error must name the unknown value: {}",
+            err.message()
+        );
     }
 }

@@ -590,8 +590,11 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   into a generated SQL string goes through here** (an unquoted hyphen parses as
   minus).
 - **Source types** — `crates/jammi-db/src/source/mod.rs`: `SourceType { File,
-  Postgres, Mysql }`; `FileFormat { Parquet, Csv, Json, Avro }` (Avro declared but
-  unsupported, `crates/jammi-db/src/source/file_format.rs`). `SourceConnection`
+  Postgres, Mysql }`; `FileFormat { Parquet, Csv, Json, JsonLines, Avro }` (Avro
+  declared but unsupported, `crates/jammi-db/src/source/file_format.rs`;
+  `JsonLines` parses `"jsonl"`/`"ndjson"`, defaults directory listing to the
+  `.jsonl` extension, and otherwise shares `Json`'s line-delimited reader).
+  `SourceConnection`
   (`crates/jammi-db/src/source/mod.rs`) JSON-serializes into `sources.options`, so
   new fields round-trip automatically.
 - **`MutableBackend`** — `crates/jammi-db/src/store/mutable/mod.rs` (the

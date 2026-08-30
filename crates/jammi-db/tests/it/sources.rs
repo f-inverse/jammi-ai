@@ -373,6 +373,147 @@ async fn directory_source_with_jsonl_format_excludes_json_named_file(backend: Ba
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
+async fn directory_source_with_only_ndjson_files_registered_as_jsonl_is_a_loud_error(
+    backend: BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let session = session_or_skip!(backend, dir);
+
+    // A directory holding ONLY `.ndjson`-named files: `jsonl`'s default
+    // listing extension is `.jsonl`, so this directory resolves zero matches
+    // and must surface as a typed, actionable error naming the extension and
+    // url — never a silently registered, column-less, row-less table
+    // (DataFusion's `infer_schema` succeeds over an empty file list).
+    let listing_dir = dir.path().join("ndjson_only");
+    std::fs::create_dir_all(&listing_dir).unwrap();
+    std::fs::write(listing_dir.join("a.ndjson"), "{\"id\": 1}\n{\"id\": 2}\n").unwrap();
+
+    let events_id = format!("ndjson_only_{}", unique_suffix());
+    let err = session
+        .add_source(
+            &events_id,
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", listing_dir.display())),
+                format: Some(FileFormat::JsonLines),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains(".jsonl"),
+        "error must name the applied extension filter: {message}"
+    );
+    assert!(
+        message.contains(&listing_dir.display().to_string()),
+        "error must name the url that matched nothing: {message}"
+    );
+
+    // No source was registered — the failed add_source must not leave a
+    // partially-registered, unqueryable catalog row behind.
+    let sources = session.catalog().list_sources().await.unwrap();
+    assert!(!sources.iter().any(|s| s.source_id == events_id));
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn single_file_source_with_zero_extension_match_is_a_loud_error(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let session = session_or_skip!(backend, dir);
+
+    // A `.json`-named file registered as `jsonl` (default `.jsonl` extension):
+    // the single-file listing path still applies the extension filter, so
+    // this resolves zero matches too and must error the same way the
+    // directory case does, never silently registering a schema-less table.
+    let fixture_path = dir.path().join("events.json");
+    std::fs::write(&fixture_path, "{\"id\": 1}\n{\"id\": 2}\n").unwrap();
+
+    let events_id = format!("single_mismatch_{}", unique_suffix());
+    let err = session
+        .add_source(
+            &events_id,
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", fixture_path.display())),
+                format: Some(FileFormat::JsonLines),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains(".jsonl"),
+        "error must name the applied extension filter: {message}"
+    );
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn reload_survives_a_source_whose_files_vanished_after_registration(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let source_id = format!("vanished_{}", unique_suffix());
+    let fixture_path = dir.path().join("events.jsonl");
+
+    {
+        let session = session_or_skip!(backend, dir);
+        std::fs::write(&fixture_path, "{\"id\": 1}\n{\"id\": 2}\n").unwrap();
+        session
+            .add_source(
+                &source_id,
+                SourceType::File,
+                SourceConnection {
+                    url: Some(format!("file://{}", fixture_path.display())),
+                    format: Some(FileFormat::JsonLines),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // Registration succeeded with the file present.
+        let results = session
+            .sql(&format!("SELECT id FROM {source_id}.public.events"))
+            .await
+            .unwrap();
+        assert_eq!(results[0].num_rows(), 2);
+    }
+
+    // Delete the backing file BEFORE the next session's `reload_sources`
+    // pass — a zero-match listing on reload.
+    std::fs::remove_file(&fixture_path).unwrap();
+
+    // `reload_sources` (called from session construction) must surface the
+    // SAME typed zero-match error loudly (a `tracing::warn!` per its existing
+    // per-source `if let Err(e) = ... { warn!; continue; }` guard) rather than
+    // failing the whole session open — one vanished source's files must not
+    // make every OTHER source, or the session itself, unreachable.
+    let session = session_or_skip!(backend, dir);
+
+    // The catalog row survives (reload only skips DataFusion registration on
+    // failure, it never deletes the persisted source) …
+    let sources = session.catalog().list_sources().await.unwrap();
+    assert!(
+        sources.iter().any(|s| s.source_id == source_id),
+        "a reload failure must not silently drop the source's catalog row"
+    );
+    // … but the table is unreachable for SQL, since reload never registered
+    // it in DataFusion — a loud, typed miss rather than a stale success.
+    let err = session
+        .sql(&format!("SELECT id FROM {source_id}.public.events"))
+        .await;
+    assert!(
+        err.is_err(),
+        "a source whose files vanished must not still be queryable after reload"
+    );
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
 async fn session_tenant_defaults_to_none_and_with_tenant_sets_it(backend: BackendKind) {
     use jammi_db::TenantId;
     use std::str::FromStr;

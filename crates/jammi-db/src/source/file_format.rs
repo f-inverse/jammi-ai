@@ -15,6 +15,7 @@ use datafusion::datasource::listing::{
 };
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
+use futures::TryStreamExt;
 
 use super::FileFormat;
 use crate::error::{JammiError, Result};
@@ -37,7 +38,7 @@ pub async fn create_listing_table(
     session: &dyn Session,
 ) -> Result<Arc<dyn TableProvider>> {
     let driver = registry.driver_for(url, cloud)?;
-    register_driver_for_url(ctx, url, driver)?;
+    register_driver_for_url(ctx, url, Arc::clone(&driver))?;
 
     let table_url = ListingTableUrl::parse(url.as_str())?;
 
@@ -68,6 +69,28 @@ pub async fn create_listing_table(
     };
 
     let ext = file_extension.unwrap_or(default_ext);
+
+    // A zero-match listing infers an empty (column-less, row-less) schema
+    // SILENTLY — DataFusion's `infer_schema` succeeds over an empty file list,
+    // registering a table nobody asked for. Fail loudly instead, naming the
+    // extension filter and the url, BEFORE schema inference runs: a `.jsonl`
+    // corpus registered as `json` (default `.json` glob), a `.json` corpus
+    // registered as `jsonl` (default `.jsonl` glob), an `.ndjson`-named corpus
+    // under either default extension, a `.JSONL` case mismatch, and a
+    // `.jsonl.gz` corpus all resolve to zero matches here and are rejected —
+    // this check runs for every format arm (parquet/csv/json/jsonl), not just
+    // one, since it sits above the per-format branch.
+    let mut matches = table_url
+        .list_all_files(session, driver.as_ref(), ext)
+        .await?;
+    if matches.try_next().await?.is_none() {
+        return Err(JammiError::Config(format!(
+            "no files matched extension '{ext}' under '{url}' — the source \
+             would register with no schema and no rows"
+        )));
+    }
+    drop(matches);
+
     let options = ListingOptions::new(df_format).with_file_extension(ext);
     let config = ListingTableConfig::new(table_url)
         .with_listing_options(options)

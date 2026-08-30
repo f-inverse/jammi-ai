@@ -65,12 +65,17 @@ _RESULT_TABLE_KIND_NAME = {
 }
 
 # File-format string → wire `FileFormat` enum. Mirrors the engine's `FileFormat`
-# parse so `add_source(format=...)` accepts the same vocabulary as the embed
-# wheel's local path.
+# parse (`jammi_db::source::FileFormat::from_str`) so `add_source(format=...)`
+# accepts the SAME vocabulary as the embed wheel's local path (which calls that
+# `FromStr` directly, unmediated by this dict) — "jsonl" and "ndjson" are two
+# tokens for the one `FILE_FORMAT_JSONL` wire value, exactly as the engine
+# accepts both spellings for its one `JsonLines` variant.
 _FILE_FORMAT = {
     "parquet": catalog_pb2.FileFormat.FILE_FORMAT_PARQUET,
     "csv": catalog_pb2.FileFormat.FILE_FORMAT_CSV,
     "json": catalog_pb2.FileFormat.FILE_FORMAT_JSON,
+    "jsonl": catalog_pb2.FileFormat.FILE_FORMAT_JSONL,
+    "ndjson": catalog_pb2.FileFormat.FILE_FORMAT_JSONL,
     "avro": catalog_pb2.FileFormat.FILE_FORMAT_AVRO,
 }
 

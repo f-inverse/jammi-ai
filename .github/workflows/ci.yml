@@ -1194,6 +1194,14 @@ jobs:
           # zero-execution gap as `compare_grad_oracle`'s suite above.
           - name: perf ab_merge suite
             cmd: python3 ci/scripts/perf/test_ab_merge.py
+          # issue #335's within-run GPU perf A/B comparator
+          # (`gpu_inference_ab.py`) own merge/table suite: stdlib-only,
+          # drives `build_report`/`main` (the real entry point
+          # `gpu_inference_ab.sh` invokes) against fixture leg directories —
+          # same "zero-execution is RED, not a skip" reasoning as the
+          # `ab_merge`/`compare_grad_oracle` suites above.
+          - name: perf gpu_inference_ab suite
+            cmd: python3 ci/scripts/perf/test_gpu_inference_ab.py
           # `runpod_gpu_howwell.sh`'s GREEN-but-nonzero cause namer (unit-63
           # round-13 audit F1), extracted out of that script's own inline
           # python heredoc into a real, testable module

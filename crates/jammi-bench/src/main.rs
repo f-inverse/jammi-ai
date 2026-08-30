@@ -2113,6 +2113,12 @@ async fn run_rebuild_model_inference_spec() -> std::process::ExitCode {
 const GPU_INFERENCE_PARAMS: gpu_inference::GpuInferenceParams = gpu_inference::GpuInferenceParams {
     row_count: 256,
     corpus_seed: 0,
+    // issue #335: previously an implicit, hardcoded 1 baked into
+    // `measure_embed_lane`/`measure_infer_lane`'s own "first serve" logic;
+    // now a real, caller-set, emitted identity field
+    // (`GpuInferenceTier::warmup`). 2 mirrors `ENCODE_STEP_PARAMS`'s own
+    // warmup count for the CPU-hermetic encode-step tier.
+    warmup: 2,
     iters: 20,
 };
 

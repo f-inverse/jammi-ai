@@ -65,9 +65,12 @@
 //! shape and the diffability contract (stable keys, no per-lane timestamps).
 
 use std::error::Error;
+use std::path::Path;
 
+use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_db::store::manifest::ComputeDevice;
 
+use crate::finetune_step::sha256_and_len;
 use crate::model_inference::{
     build_corpus, corpus_session_on_device, local_model_id, rows_per_s, serve_embed,
     serve_infer_all, ModelInferenceSpec, Row,
@@ -82,10 +85,33 @@ const GPU_DEVICE: i32 = 0;
 pub struct GpuInferenceParams {
     /// The synthetic corpus row count.
     pub row_count: usize,
-    /// The corpus generation seed.
+    /// The corpus generation seed — this run's [`GpuInferenceTier::corpus_seed`].
     pub corpus_seed: u64,
+    /// Serves discarded before the measured iterations — this run's
+    /// [`GpuInferenceTier::warmup`]. Previously an implicit, hardcoded 1 (the
+    /// single "first serve" call each lane used to establish its determinism
+    /// baseline); now a real, emitted identity field (issue #335) so a
+    /// within-run A/B comparator can state both legs discarded the same
+    /// number of serves before timing.
+    pub warmup: usize,
     /// Measured serves (after warmup).
     pub iters: usize,
+}
+
+/// sha256 (hex) of `dir`'s three checkpoint files, `(config, weights,
+/// tokenizer)` — the SAME `sha256_and_len` helper
+/// `finetune_step`/`encode_step`/`grad_oracle` already use, never a second,
+/// independently-drifting hashing implementation. The weights' byte length
+/// (this helper's second return value) is deliberately dropped here: unlike
+/// [`crate::report::EncodeStepTier::checkpoint_weights_size_bytes`], this
+/// tier admits only the three content hashes to identity (see
+/// [`GpuInferenceTier`]'s own doc) — a byte count is redundant with a sha256
+/// of the same file for detecting a content change.
+fn checkpoint_hashes(dir: &Path) -> Result<(String, String, String), Box<dyn Error>> {
+    let (config, _) = sha256_and_len(&dir.join("config.json"))?;
+    let (weights, _) = sha256_and_len(&dir.join("model.safetensors"))?;
+    let (tokenizer, _) = sha256_and_len(&dir.join("tokenizer.json"))?;
+    Ok((config, weights, tokenizer))
 }
 
 /// The p50 and p99 of a set of per-serve latencies (ms), by nearest-rank on the
@@ -104,21 +130,35 @@ fn percentiles_ms(mut latencies_ms: Vec<f64>) -> (f64, f64) {
 /// Serve the embed verb `warmup + iters` times on the GPU session, returning the
 /// measured lane (throughput + p50/p99 + the determinism verdict). Recorded
 /// observability only — no gate, per the module docs.
+///
+/// `warmup` serves are executed and their results entirely discarded (not
+/// folded into the determinism baseline or any latency sample) — issue #335
+/// made this an explicit, caller-controlled count (previously a hardcoded
+/// implicit 1, whose own digest doubled as the determinism baseline). The
+/// FIRST of the `iters` MEASURED serves is the determinism baseline instead;
+/// every measured serve, including that first one, is folded into
+/// `latencies_ms`.
 async fn measure_embed_lane(
     session: &std::sync::Arc<jammi_ai::session::InferenceSession>,
     model_id: &str,
+    warmup: usize,
     iters: usize,
 ) -> Result<GpuLane, Box<dyn Error>> {
-    // Warmup: pays the one-time model-load + PTX-JIT cost so it does not land in
-    // the measured tail.
-    let (first_digest, _warm_ms, rows) = serve_embed(session, model_id).await?;
+    for _ in 0..warmup {
+        serve_embed(session, model_id).await?;
+    }
 
     let mut latencies_ms = Vec::with_capacity(iters);
     let mut deterministic = true;
+    let mut first_digest: Option<String> = None;
+    let mut rows = 0usize;
     for _ in 0..iters {
-        let (digest, serve_ms, _rows) = serve_embed(session, model_id).await?;
-        if digest != first_digest {
-            deterministic = false;
+        let (digest, serve_ms, served_rows) = serve_embed(session, model_id).await?;
+        rows = served_rows;
+        match &first_digest {
+            None => first_digest = Some(digest),
+            Some(baseline) if *baseline != digest => deterministic = false,
+            Some(_) => {}
         }
         latencies_ms.push(serve_ms);
     }
@@ -155,7 +195,9 @@ fn assert_row_conservation(scored_rows: usize, expected_rows: usize) -> Result<(
 
 /// Serve the classification (`infer`) verb `warmup + iters` times on the GPU
 /// session, returning the measured lane. Mirrors [`measure_embed_lane`]'s
-/// throughput/latency/determinism measurement, plus one hard gate
+/// throughput/latency/determinism measurement (including its issue #335
+/// caller-controlled `warmup` count and "first MEASURED serve is the
+/// determinism baseline" convention), plus one hard gate
 /// [`measure_embed_lane`] has no need for: every serve, including warmup, must
 /// score exactly `expected_rows` ([`assert_row_conservation`]) — the same
 /// row-conservation invariant `classification_parity` checks CPU↔GPU, checked
@@ -164,30 +206,36 @@ async fn measure_infer_lane(
     session: &std::sync::Arc<jammi_ai::session::InferenceSession>,
     model_id: &str,
     expected_rows: usize,
+    warmup: usize,
     iters: usize,
 ) -> Result<GpuLane, Box<dyn Error>> {
-    // Warmup: pays the one-time model-load + PTX-JIT cost so it does not land in
-    // the measured tail.
-    let (first_digest, _warm_ms, warm_rows) = serve_infer_all(session, model_id).await?;
-    assert_row_conservation(warm_rows, expected_rows)?;
+    for _ in 0..warmup {
+        let (_digest, _serve_ms, warm_rows) = serve_infer_all(session, model_id).await?;
+        assert_row_conservation(warm_rows, expected_rows)?;
+    }
 
     let mut latencies_ms = Vec::with_capacity(iters);
     let mut deterministic = true;
+    let mut first_digest: Option<String> = None;
+    let mut rows = 0usize;
     for _ in 0..iters {
         let (digest, serve_ms, scored_rows) = serve_infer_all(session, model_id).await?;
         assert_row_conservation(scored_rows, expected_rows)?;
-        if digest != first_digest {
-            deterministic = false;
+        rows = scored_rows;
+        match &first_digest {
+            None => first_digest = Some(digest),
+            Some(baseline) if *baseline != digest => deterministic = false,
+            Some(_) => {}
         }
         latencies_ms.push(serve_ms);
     }
 
     let (p50_ms, p99_ms) = percentiles_ms(latencies_ms);
     // Throughput at the median serve — the representative steady-state rate.
-    let rate = rows_per_s(warm_rows, p50_ms);
+    let rate = rows_per_s(rows, p50_ms);
 
     Ok(GpuLane {
-        rows: warm_rows,
+        rows,
         rows_per_s: Measurement::measured(rate, "rows_per_s"),
         p50_ms: Measurement::measured(p50_ms, "ms"),
         p99_ms: Measurement::measured(p99_ms, "ms"),
@@ -243,25 +291,81 @@ pub(crate) fn cuda_device_name(_ordinal: u32) -> Result<String, Box<dyn Error>> 
 /// cross-repeat determinism for each, tagged with the concrete device that
 /// served them. The classification lane additionally hard-gates row
 /// conservation (see [`measure_infer_lane`]).
+///
+/// Every declared [`GpuInferenceTier::IDENTITY_FIELDS`]/
+/// [`GpuInferenceTier::PROVENANCE_FIELDS`] entry is asserted present on the
+/// assembled tier before it is returned (issue #335's D4/K7-completeness
+/// contract) — the SAME `assert_identity_fields_present` self-check
+/// [`crate::encode_step::run`]/[`crate::finetune_step::run`] already enforce
+/// on every real invocation.
 pub async fn run(params: GpuInferenceParams) -> Result<GpuInferenceTier, Box<dyn Error>> {
     let rows = build_corpus_from(params.row_count, params.corpus_seed);
     let (session, _dir) = corpus_session_on_device(&rows, GPU_DEVICE).await?;
     let ordinal = require_cuda(session.compute_device())?;
     let device_name = cuda_device_name(ordinal)?;
 
-    let embed_id = local_model_id(&ModelInferenceSpec::embed_model_dir())?;
-    let embed = measure_embed_lane(&session, &embed_id, params.iters).await?;
+    let embed_dir = ModelInferenceSpec::embed_model_dir();
+    let embed_id = local_model_id(&embed_dir)?;
+    let (
+        embed_checkpoint_config_sha256,
+        embed_checkpoint_weights_sha256,
+        embed_checkpoint_tokenizer_sha256,
+    ) = checkpoint_hashes(&embed_dir)?;
+    let embed = measure_embed_lane(&session, &embed_id, params.warmup, params.iters).await?;
 
-    let infer_id = local_model_id(&ModelInferenceSpec::classifier_model_dir())?;
-    let infer = measure_infer_lane(&session, &infer_id, params.row_count, params.iters).await?;
+    let infer_dir = ModelInferenceSpec::classifier_model_dir();
+    let infer_id = local_model_id(&infer_dir)?;
+    let (
+        infer_checkpoint_config_sha256,
+        infer_checkpoint_weights_sha256,
+        infer_checkpoint_tokenizer_sha256,
+    ) = checkpoint_hashes(&infer_dir)?;
+    let infer = measure_infer_lane(
+        &session,
+        &infer_id,
+        params.row_count,
+        params.warmup,
+        params.iters,
+    )
+    .await?;
 
-    Ok(GpuInferenceTier {
+    // The embed bundle's actually-resolved precision — a cache HIT (already
+    // loaded by `measure_embed_lane` above), read off the real `LoadedModel`
+    // rather than a derived/default constant. Mirrors
+    // `encode_step::run`'s own read of the same accessor (unit-62 F-5).
+    let model_source = ModelSource::parse(&embed_id);
+    let model_guard = session
+        .model_cache()
+        .get_or_load(&model_source, ModelTask::TextEmbedding, None)
+        .await?;
+    let compute_precision = model_guard.model.compute_precision().to_string();
+    drop(model_guard);
+
+    let tier = GpuInferenceTier {
         device: format!("cuda:{ordinal}"),
         device_name,
         iters: params.iters,
+        corpus_seed: params.corpus_seed,
+        warmup: params.warmup,
+        compute_precision,
+        embed_checkpoint_config_sha256,
+        embed_checkpoint_weights_sha256,
+        embed_checkpoint_tokenizer_sha256,
+        infer_checkpoint_config_sha256,
+        infer_checkpoint_weights_sha256,
+        infer_checkpoint_tokenizer_sha256,
+        kernels_disabled_requested: jammi_kernels::admission::disabled_ops_requested(),
+        flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
+        build_features: crate::report::build_features(),
         embed,
         infer,
-    })
+    };
+
+    let value = serde_json::to_value(&tier).expect("serialize GpuInferenceTier for self-check");
+    crate::report::assert_identity_fields_present(&value, GpuInferenceTier::IDENTITY_FIELDS);
+    crate::report::assert_identity_fields_present(&value, GpuInferenceTier::PROVENANCE_FIELDS);
+
+    Ok(tier)
 }
 
 /// Build the corpus for a `(row_count, seed)` without a full spec — the tier
@@ -297,5 +401,146 @@ mod tests {
         let (p50, p99) = percentiles_ms(vec![42.0]);
         assert_eq!(p50, 42.0);
         assert_eq!(p99, 42.0);
+    }
+
+    /// A JSON fixture carrying every [`GpuInferenceTier::IDENTITY_FIELDS`]/
+    /// [`GpuInferenceTier::PROVENANCE_FIELDS`] entry, correctly populated —
+    /// the flat `{field: value}` shape [`crate::report::assert_identity_fields_present`]
+    /// reads. Hermetic (no CUDA/GPU): this is a hand-built stand-in for a
+    /// real tier's serialized shape, not a live `run()`.
+    fn identity_complete_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "corpus_seed": 0,
+            "warmup": 2,
+            "compute_precision": "f32",
+            "embed_checkpoint_config_sha256": "a".repeat(64),
+            "embed_checkpoint_weights_sha256": "b".repeat(64),
+            "embed_checkpoint_tokenizer_sha256": "c".repeat(64),
+            "infer_checkpoint_config_sha256": "d".repeat(64),
+            "infer_checkpoint_weights_sha256": "e".repeat(64),
+            "infer_checkpoint_tokenizer_sha256": "f".repeat(64),
+            "device_name": "NVIDIA A100-SXM4-80GB",
+            "kernels_disabled_requested": Vec::<String>::new(),
+            "flash_compiled": true,
+            "build_features": ["cuda"],
+        })
+    }
+
+    /// Cardinality pin (issue #335 D4): the EXACT identity set this tier
+    /// declares, in this exact order — `ci/scripts/perf/identity_fields.py`'s
+    /// `GPU_INFERENCE_IDENTITY_FIELDS` mirrors this list EXACTLY. A field
+    /// added, removed, or renamed here is a visible, reviewed diff against
+    /// this test.
+    #[test]
+    fn identity_fields_cardinality_is_pinned() {
+        let names: Vec<&str> = GpuInferenceTier::IDENTITY_FIELDS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "corpus_seed",
+                "warmup",
+                "compute_precision",
+                "embed_checkpoint_config_sha256",
+                "embed_checkpoint_weights_sha256",
+                "embed_checkpoint_tokenizer_sha256",
+                "infer_checkpoint_config_sha256",
+                "infer_checkpoint_weights_sha256",
+                "infer_checkpoint_tokenizer_sha256",
+            ]
+        );
+    }
+
+    /// The disjointness negative control (mirrors
+    /// `encode_step::tests::provenance_fields_are_never_members_of_identity_fields`):
+    /// no [`GpuInferenceTier::PROVENANCE_FIELDS`] entry may ever also appear
+    /// in [`GpuInferenceTier::IDENTITY_FIELDS`] — a future "helpful" addition
+    /// that reintroduces a post-hoc/build-only fact as a comparison key trips
+    /// this test rather than silently reintroducing esc-057's class of false
+    /// determinant.
+    #[test]
+    fn provenance_fields_are_never_members_of_identity_fields() {
+        let identity_names: std::collections::HashSet<&str> = GpuInferenceTier::IDENTITY_FIELDS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        for (provenance_name, _) in GpuInferenceTier::PROVENANCE_FIELDS {
+            assert!(
+                !identity_names.contains(provenance_name),
+                "{provenance_name:?} is a declared PROVENANCE_FIELDS entry but also appears in \
+                 IDENTITY_FIELDS"
+            );
+        }
+    }
+
+    /// The positive control: a fixture carrying every declared identity AND
+    /// provenance field, correctly populated, passes
+    /// `assert_identity_fields_present` for both consts — proves
+    /// [`identity_complete_fixture`] itself is a faithful stand-in before the
+    /// RED teeth test below relies on it.
+    #[test]
+    fn identity_complete_fixture_passes_the_assertion() {
+        let value = identity_complete_fixture();
+        crate::report::assert_identity_fields_present(&value, GpuInferenceTier::IDENTITY_FIELDS);
+        crate::report::assert_identity_fields_present(&value, GpuInferenceTier::PROVENANCE_FIELDS);
+    }
+
+    /// THE TEETH (RED direction — an assertion must be able to fail): removing
+    /// ANY single declared [`GpuInferenceTier::IDENTITY_FIELDS`] entry from an
+    /// otherwise-complete fixture must panic `assert_identity_fields_present`
+    /// — proving the D4 identity-completeness self-check `run()` performs on
+    /// every real invocation actually bites, rather than vacuously passing
+    /// regardless of what the tier serializes. Swept over every declared
+    /// field, not just one, so a future field addition is automatically
+    /// covered by this same sweep.
+    #[test]
+    fn removing_any_identity_field_from_the_fixture_panics_the_assertion() {
+        for (field, _) in GpuInferenceTier::IDENTITY_FIELDS {
+            let mut value = identity_complete_fixture();
+            value
+                .as_object_mut()
+                .expect("fixture is a JSON object")
+                .remove(*field);
+            let result = std::panic::catch_unwind(|| {
+                crate::report::assert_identity_fields_present(
+                    &value,
+                    GpuInferenceTier::IDENTITY_FIELDS,
+                );
+            });
+            assert!(
+                result.is_err(),
+                "removing identity field {field:?} from the fixture must panic \
+                 assert_identity_fields_present — it did not"
+            );
+        }
+    }
+
+    /// The provenance twin of the identity teeth test above: removing ANY
+    /// declared [`GpuInferenceTier::PROVENANCE_FIELDS`] entry must also
+    /// panic — provenance fields carry the SAME presence/non-null guarantee
+    /// as identity fields (see that const's own doc), just never as a
+    /// comparison key.
+    #[test]
+    fn removing_any_provenance_field_from_the_fixture_panics_the_assertion() {
+        for (field, _) in GpuInferenceTier::PROVENANCE_FIELDS {
+            let mut value = identity_complete_fixture();
+            value
+                .as_object_mut()
+                .expect("fixture is a JSON object")
+                .remove(*field);
+            let result = std::panic::catch_unwind(|| {
+                crate::report::assert_identity_fields_present(
+                    &value,
+                    GpuInferenceTier::PROVENANCE_FIELDS,
+                );
+            });
+            assert!(
+                result.is_err(),
+                "removing provenance field {field:?} from the fixture must panic \
+                 assert_identity_fields_present — it did not"
+            );
+        }
     }
 }

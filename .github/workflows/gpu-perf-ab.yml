@@ -1,0 +1,96 @@
+name: GPU perf A/B (RunPod)
+
+# Runs issue #335's within-run GPU perf A/B on a real NVIDIA A100 (sm_80) via
+# an ephemeral RunPod pod — `ci/scripts/perf/gpu_inference_ab.sh` driving
+# `jammi-bench gpu-inference-scale` across two simultaneously-resident
+# clones (parent-HEAD + PR, or parent-vs-parent under `--aa-null`), merged
+# (leg-premise refusal + primary-endpoint ratio + NOT-YET-pre-registered
+# advisory classification) by `ci/scripts/perf/gpu_inference_ab.py`.
+#
+# RECORDING-ONLY (v1): this workflow NEVER fails the run over the measured
+# ratio — issue #335's own exit criterion forbids enforcement before
+# multi-pod/both-device-model validation. It uploads the merged report as an
+# artifact for a human to read; it is not itself a required merge-path
+# check, and grants no such status.
+#
+# Off the merge path, same discipline gpu-prove.yml/gpu-howwell.yml's own
+# headers state — GPU minutes cost money and A100 capacity is intermittent.
+# Fires on: the `run-gpu-perf-ab` PR label (opt-in per PR) and manual
+# dispatch ONLY — NO schedule (mirrors gpu-howwell.yml's own v1 posture: a
+# standing nightly A/B is a later decision, not this workflow's own
+# default).
+#
+# Merge-path CI checks only ever validate COMMITTED artifacts (a future
+# `ci/artifacts/gpu-perf-aa-null/` schema gate, once the D6 empirical-null
+# evidence exists) — this workflow itself, and the RunPod run it drives,
+# never sit on that path.
+
+on:
+  workflow_dispatch:
+    inputs:
+      aa_null:
+        description: "Run the --aa-null empirical-null instrument (build the PARENT sha twice, from two independent clones, instead of parent-vs-PR) — the D6 evidence-gathering mode. 'true' or 'false' (default false: the normal parent-vs-PR A/B)."
+        required: false
+        type: string
+        default: "false"
+  pull_request:
+    types: [labeled]
+
+# Least privilege: this lane only reads the checkout; the RunPod side is
+# driven by the RUNPOD_API_KEY secret, not the GitHub token.
+permissions:
+  contents: read
+
+jobs:
+  gpu-perf-ab:
+    name: within-run GPU perf A/B on RunPod A100 (sm_80)
+    # Label event only runs for the `run-gpu-perf-ab` label; dispatch always
+    # runs. Mirrors gpu-howwell.yml's own `run-howwell` gate exactly, one
+    # label name over.
+    if: github.event_name != 'pull_request' || github.event.label.name == 'run-gpu-perf-ab'
+    runs-on: ubuntu-latest
+    # Concurrency is on the JOB, not the workflow, and never cancels — the
+    # SAME $187-orphan lesson gpu-prove.yml/gpu-howwell.yml's own comments
+    # record: cancelling SIGKILLs the runner before its EXIT trap can
+    # terminate the rented pod.
+    concurrency:
+      group: gpu-perf-ab-${{ github.ref }}
+      cancel-in-progress: false
+    # Two full clone+build cycles (three under --aa-null) on the pod itself
+    # — generously bounded above gpu-howwell.yml's own 100m ceiling (that
+    # workflow builds+runs ONE arm's worth of legs per seed; this one builds
+    # TWO independent binaries up front before any leg runs at all).
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run the GPU perf A/B on a real A100
+        id: perfab
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          GIT_REPO: https://github.com/${{ github.repository }}.git
+          GIT_REF: ${{ github.head_ref || github.ref_name }}
+          GPU_PERF_AB_AA_NULL: ${{ github.event.inputs.aa_null == 'true' && '1' || '0' }}
+        run: |
+          set +e
+          bash ci/scripts/runpod_gpu_perf_ab.sh
+          rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit $rc
+
+      - name: Annotate a capacity failure
+        if: always() && steps.perfab.outputs.rc == '75'
+        run: echo "::warning::gpu-perf-ab FAILED for capacity/build/nothing-to-compare (see the run log for which) — not a code/statistical regression. Re-run once the underlying condition clears."
+
+      - name: Annotate a premise refusal
+        if: always() && steps.perfab.outputs.rc == '1'
+        run: echo "::error::gpu-perf-ab refused (exit 1) — a real correctness-of-measurement problem (an identity mismatch between legs, or a binary whose own provenance did not match the clone it was built from), never a perf regression itself. See the merged report artifact for the named violation(s)."
+
+      - name: Upload merged gpu-perf-ab artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-perf-ab-artifact-${{ github.run_id }}
+          path: .gpu-pull/gpu-perf-ab/
+          if-no-files-found: warn
+          retention-days: 14

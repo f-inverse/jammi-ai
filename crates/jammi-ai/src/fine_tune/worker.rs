@@ -986,6 +986,11 @@ impl TrainingWorker {
 
         let base_model = common.base_model.clone();
         let cancel_for_classify = Arc::clone(cancel);
+        // `common.config` moves into `params` for the blocking trainer; a clone
+        // survives here so a training failure can be classified against the
+        // config that produced it (`classify_training_oom` names
+        // `batch_size`/`max_seq_length`/`backbone_dtype` in the OOM guidance).
+        let config_for_error = common.config.clone();
         let params = RunFineTuneParams {
             catalog: Arc::clone(catalog),
             artifact_store: session.artifact_store(),
@@ -1016,7 +1021,13 @@ impl TrainingWorker {
 
         let training = match result {
             Ok(Ok(Ok(training))) => training,
-            Ok(Ok(Err(e))) => return Err(classify(&cancel_for_classify, e)),
+            Ok(Ok(Err(e))) => {
+                return Err(classify_training_error(
+                    &cancel_for_classify,
+                    &config_for_error,
+                    e,
+                ));
+            }
             Ok(Err(payload)) => {
                 // A panic on the blocking thread — no `TrainedArtifact` was
                 // ever built. This does NOT sweep here (unit 348 F1): it
@@ -1246,6 +1257,86 @@ impl From<JammiError> for WorkerJobError {
     }
 }
 
+/// Wrap a training failure that names an out-of-memory condition in
+/// actionable guidance, so `jammi train status` / a Python `job.status()`
+/// surface the config that OOM'd and what to try — instead of a raw driver
+/// string — via [`crate::model::oom::is_definite_oom_message`], the strict
+/// (long-spellings-only) predicate (its home explains why the training
+/// classifier needs a stricter match than the inference retry's predicate:
+/// this function's output is durable and caller-facing). A non-OOM error
+/// passes through byte-identical.
+///
+/// The echoed config and the remedies both differ by adapter shape, because
+/// `backbone_dtype` only takes effect on the encoder-adapters arm:
+/// `build_encoder_adapters` — reached only when `config.target_modules` is
+/// non-empty — is the sole caller of [`validate_backbone_precision`] and
+/// `compute_precision_to_dtype`. The projection-head arm (`target_modules`
+/// empty, the default) loads the frozen backbone but never re-dtypes it, so
+/// `backbone_dtype` is omitted from the echoed config entirely on that arm
+/// (never echoed and then disclaimed), and recommending `backbone_dtype:
+/// bf16` there would be dead advice.
+///
+/// - **Encoder adapters** (`target_modules` non-empty): config echo includes
+///   `backbone_dtype`; (1) `backbone_dtype: bf16` first — substantially
+///   reduces the frozen backbone's weight and activation residency; bf16
+///   requires CUDA, refused before training starts if unmet (see
+///   [`validate_backbone_precision`]); (2) a smaller `batch_size`, or trade
+///   batch size for `gradient_accumulation_steps`; (3) a smaller
+///   `max_seq_length`.
+/// - **Projection head** (`target_modules` empty): config echo omits
+///   `backbone_dtype`; the message states outright that it does not apply;
+///   (1) a smaller `batch_size`, or trade batch size for
+///   `gradient_accumulation_steps`; (2) a smaller `max_seq_length`.
+///
+/// The headline names the mechanism only as strongly as the matched text
+/// supports: this function never threads through which device the job
+/// actually ran on, so it says "CUDA out of memory" only when the error text
+/// itself mentions CUDA, and the more conservative "out of memory (device or
+/// host)" otherwise.
+fn classify_training_oom(config: &FineTuneConfig, e: JammiError) -> JammiError {
+    let msg = e.to_string();
+    let msg_lower = msg.to_lowercase();
+    if !crate::model::oom::is_definite_oom_message(&msg_lower) {
+        return e;
+    }
+    let headline = if msg_lower.contains("cuda") {
+        "CUDA out of memory"
+    } else {
+        "out of memory (device or host)"
+    };
+    // The echoed config is arm-appropriate, not echo-then-disclaim: the
+    // projection-head arm never reads `backbone_dtype` for anything, so it
+    // is simply absent from the echo rather than named and then immediately
+    // disclaimed.
+    let (config_echo, remedies) = if config.target_modules.is_empty() {
+        (
+            format!(
+                "batch_size={}, max_seq_length={}",
+                config.batch_size, config.max_seq_length
+            ),
+            "backbone_dtype does not apply to projection-head runs. Try, in order: \
+             (1) a smaller batch_size, or trade batch size for \
+             gradient_accumulation_steps; (2) a smaller max_seq_length."
+                .to_string(),
+        )
+    } else {
+        (
+            format!(
+                "batch_size={}, max_seq_length={}, backbone_dtype={}",
+                config.batch_size, config.max_seq_length, config.backbone_dtype
+            ),
+            "Try, in order: (1) backbone_dtype: bf16 — substantially reduces backbone \
+             + activation residency; bf16 requires CUDA (refused before training \
+             starts if unmet); (2) a smaller batch_size, or trade batch size for \
+             gradient_accumulation_steps; (3) a smaller max_seq_length."
+                .to_string(),
+        )
+    };
+    JammiError::FineTune(format!(
+        "{headline} while training ({config_echo}). {remedies} Underlying error: {msg}"
+    ))
+}
+
 /// Classify a training error: a cancellation (lease lost) maps to
 /// [`WorkerJobError::Cancelled`] so the job is left for reclaim; anything else is
 /// a genuine failure. The cancel flag is the authoritative signal; the error
@@ -1259,6 +1350,26 @@ fn classify(cancel: &AtomicBool, e: JammiError) -> WorkerJobError {
     } else {
         WorkerJobError::Failed(e.to_string())
     }
+}
+
+/// The error-arm lattice for a blocking training run's `Err(JammiError)`
+/// result: cancellation takes priority — a lease-lost job is left `running`
+/// for reclaim, never rewritten as an OOM failure even when the error text
+/// happens to look OOM-shaped — otherwise the failure is OOM-classified
+/// against the config that produced it ([`classify_training_oom`]), passed
+/// through byte-identical when it doesn't match.
+///
+/// Pulled out of `train_fine_tune`'s single call site so the full lattice —
+/// cancelled+oom-text, oom, non-oom — is unit-testable directly, not only
+/// exercised end-to-end through the blocking-trainer wiring. That single
+/// production call site remains wiring-by-inspection: nothing here re-checks
+/// that `train_fine_tune` actually calls this function on its `Err` arm.
+fn classify_training_error(
+    cancel: &AtomicBool,
+    config: &FineTuneConfig,
+    e: JammiError,
+) -> WorkerJobError {
+    classify(cancel, classify_training_oom(config, e))
 }
 
 // =========================================================================
@@ -2251,6 +2362,322 @@ mod tests {
                 .as_deref()
                 .is_some_and(|m| m.contains("simulated candle kernel fault")),
             "the panic cause is recorded on the job, got {:?}",
+            job.error_message
+        );
+    }
+
+    /// The encoder-adapters arm (`target_modules` non-empty): a CUDA
+    /// OOM-shaped failure is rewritten to name the config that OOM'd and the
+    /// remedies to try, in order — `backbone_dtype: bf16` first (bf16
+    /// actually takes effect here), then a smaller
+    /// `batch_size`/`gradient_accumulation_steps`, then a smaller
+    /// `max_seq_length`. The underlying driver text is preserved.
+    #[test]
+    fn classify_training_oom_encoder_adapters_arm_leads_with_bf16() {
+        let config = FineTuneConfig {
+            target_modules: vec!["query".into(), "value".into()],
+            ..FineTuneConfig::default() // batch_size=8, max_seq_length=512, backbone_dtype=f32
+        };
+        let raw = JammiError::FineTune(
+            "Encoder forward: cuda error: CUDA_ERROR_OUT_OF_MEMORY: out of memory".into(),
+        );
+        let classified = classify_training_oom(&config, raw);
+        let msg = classified.to_string();
+
+        assert!(
+            msg.contains("CUDA out of memory"),
+            "the matched text names CUDA, headline must say so: {msg}"
+        );
+        assert!(
+            msg.contains("batch_size=8"),
+            "must name the OOM'd batch_size, got: {msg}"
+        );
+        assert!(
+            msg.contains("max_seq_length=512"),
+            "must name the OOM'd max_seq_length, got: {msg}"
+        );
+        assert!(
+            msg.contains("backbone_dtype=f32"),
+            "must name the OOM'd backbone_dtype, got: {msg}"
+        );
+        assert!(
+            msg.contains("backbone_dtype: bf16"),
+            "first remedy on the encoder-adapters arm must be the bf16 backbone, got: {msg}"
+        );
+        assert!(
+            msg.contains("bf16 requires CUDA"),
+            "must state bf16's CUDA requirement, got: {msg}"
+        );
+        assert!(
+            msg.contains("batch_size") && msg.contains("gradient_accumulation_steps"),
+            "second remedy must name smaller batch_size / gradient_accumulation_steps, got: {msg}"
+        );
+        assert!(
+            msg.contains("max_seq_length"),
+            "third remedy must name a smaller max_seq_length, got: {msg}"
+        );
+        assert!(
+            msg.contains("CUDA_ERROR_OUT_OF_MEMORY"),
+            "underlying driver error text must survive, got: {msg}"
+        );
+    }
+
+    /// The projection-head arm (`target_modules` empty, the default):
+    /// `backbone_dtype` never takes effect there (only `build_encoder_adapters`
+    /// re-dtypes the backbone, and it is reached only for a non-empty
+    /// `target_modules`), so the remedy list must NOT suggest `backbone_dtype:
+    /// bf16` — that would be dead advice on this arm. The message says so
+    /// outright.
+    #[test]
+    fn classify_training_oom_projection_head_arm_omits_bf16() {
+        let config = FineTuneConfig::default(); // target_modules empty
+        let raw = JammiError::FineTune(
+            "Encoder forward: cuda error: CUDA_ERROR_OUT_OF_MEMORY: out of memory".into(),
+        );
+        let classified = classify_training_oom(&config, raw);
+        let msg = classified.to_string();
+
+        assert!(
+            msg.contains("batch_size=8") && msg.contains("max_seq_length=512"),
+            "must still name the OOM'd batch_size/max_seq_length, got: {msg}"
+        );
+        assert!(
+            !msg.contains("backbone_dtype="),
+            "the echoed config must be arm-appropriate — backbone_dtype is never echoed \
+             (and then disclaimed) on the projection-head arm, got: {msg}"
+        );
+        assert!(
+            !msg.contains("backbone_dtype: bf16"),
+            "bf16 is inert on the projection-head arm — must not be suggested, got: {msg}"
+        );
+        assert!(
+            msg.contains("backbone_dtype does not apply to projection-head runs"),
+            "must say outright why bf16 is absent, got: {msg}"
+        );
+        assert!(
+            msg.contains("smaller batch_size") || msg.contains("a smaller batch_size"),
+            "must still suggest a smaller batch_size, got: {msg}"
+        );
+        assert!(
+            msg.contains("gradient_accumulation_steps"),
+            "must still suggest gradient_accumulation_steps, got: {msg}"
+        );
+        assert!(
+            msg.contains("max_seq_length"),
+            "must still suggest a smaller max_seq_length, got: {msg}"
+        );
+    }
+
+    /// The headline names CUDA only as strongly as the matched text supports:
+    /// this function never threads through which device the job actually ran
+    /// on, so an OOM-shaped message that never mentions CUDA gets the more
+    /// conservative "out of memory (device or host)" headline, not an
+    /// asserted "CUDA out of memory".
+    #[test]
+    fn classify_training_oom_headline_is_conservative_without_cuda_in_the_text() {
+        let config = FineTuneConfig::default();
+        let raw = JammiError::FineTune("process was killed: out of memory".into());
+        let classified = classify_training_oom(&config, raw);
+        let msg = classified.to_string();
+        assert!(
+            msg.contains("out of memory (device or host) while training"),
+            "no CUDA evidence in the matched text — must not assert CUDA, got: {msg}"
+        );
+        assert!(
+            !msg.contains("CUDA out of memory"),
+            "must not upgrade to a CUDA claim the text doesn't support, got: {msg}"
+        );
+    }
+
+    /// Negative control: a genuine non-OOM CUDA failure (a kernel/PTX fault,
+    /// #319's exact misroute risk) must pass through completely unchanged —
+    /// the OOM guidance is never attached to a failure batch-halving or a
+    /// backbone-dtype change cannot fix.
+    #[test]
+    fn classify_training_oom_leaves_non_oom_errors_unchanged() {
+        let config = FineTuneConfig::default();
+        let raw = JammiError::FineTune("Encoder forward: CUDA_ERROR_INVALID_PTX".into());
+        let raw_msg = raw.to_string();
+        let classified = classify_training_oom(&config, raw);
+        assert_eq!(
+            classified.to_string(),
+            raw_msg,
+            "a non-OOM error must not be rewritten"
+        );
+    }
+
+    /// The full error-arm lattice `classify_training_error` runs: cancellation
+    /// wins over an OOM-shaped message (a lease-lost job is never rewritten as
+    /// an OOM failure), a genuine OOM is classified, and a non-OOM error
+    /// passes through byte-identical.
+    #[test]
+    fn classify_training_error_lattice_cancelled_oom_and_passthrough() {
+        let config = FineTuneConfig::default();
+
+        // cancelled (flag set) + OOM-shaped text: cancellation wins.
+        let cancel = AtomicBool::new(true);
+        let oom_err = JammiError::FineTune("cuda_error_out_of_memory".into());
+        assert!(
+            matches!(
+                classify_training_error(&cancel, &config, oom_err),
+                WorkerJobError::Cancelled
+            ),
+            "a lease-lost job must classify as Cancelled even over OOM-shaped text"
+        );
+
+        // not cancelled + OOM-shaped: classified with guidance.
+        let cancel = AtomicBool::new(false);
+        let oom_err = JammiError::FineTune("cuda_error_out_of_memory".into());
+        let WorkerJobError::Failed(msg) = classify_training_error(&cancel, &config, oom_err) else {
+            panic!("a genuine OOM must classify as Failed, not Cancelled");
+        };
+        assert!(
+            msg.contains("out of memory") && msg.contains("batch_size=8"),
+            "must carry the classified OOM guidance, got: {msg}"
+        );
+
+        // not cancelled + non-OOM: byte-identical passthrough.
+        let cancel = AtomicBool::new(false);
+        let raw = JammiError::FineTune("Encoder forward: CUDA_ERROR_INVALID_PTX".into());
+        let raw_msg = raw.to_string();
+        let WorkerJobError::Failed(msg) = classify_training_error(&cancel, &config, raw) else {
+            panic!("a non-OOM failure must classify as Failed, not Cancelled");
+        };
+        assert_eq!(msg, raw_msg, "a non-OOM error must pass through unchanged");
+    }
+
+    /// The lattice cell `classify`'s docstring claims but the composed test
+    /// above doesn't exercise directly: the cancel FLAG unset, but the
+    /// original message satisfies `classify`'s TEXT fallback
+    /// (`"training cancelled: lease lost"`) AND also matches an OOM
+    /// spelling. `classify_training_oom` runs first and rewrites the
+    /// message — but its rewrite always embeds the original message
+    /// verbatim as the trailing `Underlying error: {msg}` clause, so the
+    /// text fallback still finds `"training cancelled: lease lost"` inside
+    /// the rewritten string, and the result must still be `Cancelled`, not
+    /// a `Failed` OOM guidance message that has silently eaten the
+    /// cancellation.
+    #[test]
+    fn classify_training_error_text_fallback_survives_oom_rewrite() {
+        let config = FineTuneConfig::default();
+        let cancel = AtomicBool::new(false); // flag unset — only the text fallback can apply
+        let e = JammiError::FineTune(
+            "training cancelled: lease lost (cuda out of memory during unwind)".into(),
+        );
+        assert!(
+            matches!(
+                classify_training_error(&cancel, &config, e),
+                WorkerJobError::Cancelled
+            ),
+            "the cancellation text fallback must survive classify_training_oom's rewrite"
+        );
+    }
+
+    /// End-to-end: a CUDA-OOM-shaped failure from the blocking trainer, on the
+    /// default (projection-head) config, drives the job to a terminal
+    /// `failed` status whose `error_message` (what `jammi train status` /
+    /// Python `job.status()` read) carries the classified guidance — not the
+    /// raw driver string, and without the inert `backbone_dtype: bf16`
+    /// suggestion the default arm cannot act on. Mirrors
+    /// `panicking_training_job_lands_failed_with_recorded_error`'s pipeline,
+    /// substituting `classify_training_error` for the plain `classify` call
+    /// `train_fine_tune` makes on this arm.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn oom_training_job_lands_failed_with_classified_guidance() {
+        use jammi_db::catalog::status::TrainingJobStatus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(jammi_db::catalog::Catalog::open(dir.path()).await.unwrap());
+        catalog
+            .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
+                model_id: "oom-base",
+                version: 1,
+                model_type: "embedding",
+                backend: "candle",
+                task: ModelTask::TextEmbedding,
+                base_model_id: None,
+                artifact_path: None,
+                config_json: None,
+            })
+            .await
+            .unwrap();
+        catalog
+            .create_training_job(jammi_db::catalog::training_repo::CreateTrainingJobParams {
+                job_id: "oom-job",
+                base_model_id: "oom-base::1",
+                training_source: "src",
+                loss_type: "cosent",
+                hyperparams: "{}",
+                kind: "fine_tune",
+                training_spec: "{}",
+            })
+            .await
+            .unwrap();
+
+        // The worker claims the job (running, leased to it) before running it —
+        // the state in which a genuine failure is recorded under the lease guard.
+        catalog
+            .claim_next_training_job("worker-x", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("the queued job is claimable");
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        // The engine defaults (batch 8, seq 512, backbone F32, empty
+        // target_modules => projection-head arm) that OOM on an L4 24GB card
+        // at inference-side defaults — issue #345's remaining repro shape.
+        let config = FineTuneConfig::default();
+
+        // Run the worker's blocking wrapper over a trainer that raises a raw
+        // CUDA driver OOM, then take the same terminal-classification branch
+        // `train_fine_tune` does: `classify_training_error`.
+        let result = tokio::task::spawn_blocking(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                Err(JammiError::FineTune(
+                    "Encoder forward: cuda error: CUDA_ERROR_OUT_OF_MEMORY: out of memory".into(),
+                ))
+            }))
+        })
+        .await;
+        let outcome = match result {
+            Ok(Ok(Ok(()))) => panic!("the closure was supposed to return an OOM error"),
+            Ok(Ok(Err(e))) => classify_training_error(&cancel, &config, e),
+            Ok(Err(payload)) => {
+                WorkerJobError::Failed(format!("Panic: {}", panic_message(payload.as_ref())))
+            }
+            Err(join_err) => {
+                WorkerJobError::Failed(format!("training task join error: {join_err}"))
+            }
+        };
+
+        let WorkerJobError::Failed(msg) = outcome else {
+            panic!("a genuine OOM must classify as Failed, not Cancelled");
+        };
+        assert!(
+            msg.contains("batch_size=8")
+                && msg.contains("backbone_dtype does not apply to projection-head runs")
+                && !msg.contains("backbone_dtype: bf16"),
+            "the classified OOM guidance must reach the terminal message, without the \
+             inert bf16 remedy on the default (projection-head) arm, got: {msg}"
+        );
+
+        // The worker records the failure as the job's terminal status, under the
+        // lease guard (it still owns the job).
+        record_failed(&catalog, "oom-job", "worker-x", msg).await;
+
+        let job = catalog.get_training_job("oom-job").await.unwrap();
+        assert_eq!(
+            job.status,
+            TrainingJobStatus::Failed.to_string(),
+            "an OOM'd job lands `failed`, never wedged `running`"
+        );
+        assert!(
+            job.error_message
+                .as_deref()
+                .is_some_and(|m| m.contains("batch_size=8")
+                    && m.contains("backbone_dtype does not apply to projection-head runs")),
+            "`jammi train status` / job.status() must surface the classified OOM \
+             guidance from the catalog's error_message, got {:?}",
             job.error_message
         );
     }

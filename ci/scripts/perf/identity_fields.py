@@ -24,6 +24,10 @@ test.
 
 from __future__ import annotations
 
+import itertools
+import math
+import struct
+
 # B1 audit finding on PR #372: jammi's OWN CLI/interchange vocabulary
 # (`crates/jammi-bench/src/main.rs`'s `--backbone-dtype` choices,
 # `grad_oracle.rs`'s `format!("{:?}", ComputePrecision::F32).to_lowercase()`)
@@ -79,6 +83,139 @@ def normalize_target_modules(value):
     if not isinstance(value, list):
         return value
     return tuple(sorted(value))
+
+
+class _NotRepresentableAsF32:
+    """Sentinel `_round_trip_f32` returns instead of a canonicalized
+    `float` when the raw input cannot be trusted to describe a legitimate
+    premise value in the engine's own `f32` storage — advisory (adversarial
+    audit): an EARLIER version of this function let `struct.pack('<f',
+    ...)` raise a bare `OverflowError` straight out of the comparator for
+    any FINITE value outside `f32`'s representable range (e.g. `1e40`),
+    crashing the WHOLE merge over one malformed field the same class of
+    bug F1 fixed for `bar_ratio_classification` — never caught per-config,
+    never even a violation, just a hard crash. This sentinel turns that
+    into an ORDINARY, catchable REFUSAL instead: `canonicalize_identity_field`
+    returns it like any other value, `leg_premise_violations`/
+    `generic_leg_premise_violations` compare it exactly like a real float
+    (`va != vb`), and its own `__repr__` names the reason directly in the
+    printed violation ("field X differs: jammi=<not representable as the
+    engine's f32: 1e+40> torch=0.05").
+
+    Covers BOTH the finite-but-out-of-range case (`OverflowError`) and the
+    non-finite cases (`inf`/`-inf`/`nan`) — the latter pack into `f32`
+    WITHOUT raising (IEEE-754 represents all three natively), but neither
+    is a value EITHER real producer would ever validate a `lora_dropout`/
+    `max_grad_norm` CLI argument to (`validate_max_grad_norm`'s own "must
+    be finite and > 0.0" check, mirrored on torch's `parse_args`) — a
+    report carrying one is already describing a premise this comparator
+    cannot trust, not merely one it must round differently. `-0.0` is
+    deliberately NOT covered (it is finite, in-range, round-trips cleanly,
+    and Python's own `-0.0 == 0.0` already holds after the round-trip) —
+    see this class's own test suite's negative control.
+
+    `__eq__` ALWAYS returns `False` — including against another
+    `_NotRepresentableAsF32`, even one wrapping the IDENTICAL raw value:
+    neither side of a "cannot be represented" pair can be confirmed to
+    describe the SAME premise, so two malformed inputs must refuse each
+    other exactly as loudly as one malformed input against one clean
+    value — never let two garbage values silently "cancel out" into an
+    accidental match.
+
+    Advisory (ii), round-2 adversarial audit: `__repr__` is INSTANCE-UNIQUE
+    (a per-instance sequence number folded in), not merely a function of
+    `raw`. This is not cosmetic: `finetune_run_leg_identity_violations`
+    (`ab_merge.py`, the cross-seed identity check) groups displayed values
+    by `repr(display)` — a plain string KEY, never by `==` — precisely
+    because a `dict` needs a hashable key and `_NotRepresentableAsF32`
+    itself is deliberately not usefully hashable-by-value (see `__hash__`
+    below). Two DIFFERENT `_NotRepresentableAsF32` instances that happened
+    to wrap the SAME `raw` (e.g. two legs both reporting `1e40`, or both
+    `nan`) would, with a `raw`-only `__repr__`, produce the IDENTICAL
+    `repr()` string and collapse into ONE dict bucket — silently
+    "agreeing" by string coincidence, the exact same class of accidental
+    match `__eq__`'s own doc above forbids, just reached through a
+    different (repr-keyed, not eq-keyed) grouping mechanism a SECOND
+    caller happens to use. The sequence number makes that collision
+    structurally impossible: no two instances, constructed at different
+    times, can ever share a `repr()`.
+    """
+
+    __slots__ = ("raw", "_seq")
+
+    _next_seq = itertools.count()
+
+    def __init__(self, raw):
+        self.raw = raw
+        self._seq = next(_NotRepresentableAsF32._next_seq)
+
+    def __repr__(self):
+        return f"<not representable as the engine's f32 (#{self._seq}): {self.raw!r}>"
+
+    def __eq__(self, other):
+        return False
+
+    def __hash__(self):
+        return id(self)
+
+
+def _round_trip_f32(value):
+    """Round-trip a numeric `value` through IEEE-754 binary32 (the hardware
+    default round-half-to-even), stdlib-only (`struct`, no numpy
+    dependency — this module's own "Stdlib-only" doc stays true). Returns
+    `value` UNCHANGED for anything that is not a real number (`None`, a
+    `bool` -- `isinstance(True, int)` is `True` in Python, so `bool` is
+    excluded explicitly -- a string, a list): this function only ever
+    narrows the SAME numeric value's own two representations together,
+    never widens what counts as a match for a non-numeric input it was
+    never meant to touch. A non-finite or out-of-`f32`-range REAL number
+    returns a `_NotRepresentableAsF32` sentinel instead — see that class's
+    own doc for why (a REFUSAL, never a crash, never a silent pass-through).
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return value
+    value = float(value)
+    if math.isnan(value) or math.isinf(value):
+        return _NotRepresentableAsF32(value)
+    try:
+        return struct.unpack("<f", struct.pack("<f", value))[0]
+    except OverflowError:
+        return _NotRepresentableAsF32(value)
+
+
+def normalize_f32_stored_field(value):
+    """Canonicalize `lora_dropout`/`max_grad_norm` — the TWO knobs jammi's
+    own CLI stores at `f32` (`FinetuneStepParams::lora_dropout: f32`,
+    `FinetuneStepParams::max_grad_norm: Option<f32>`), while torch's
+    argparse/JSON round-trip for the SAME two `--lora-dropout`/
+    `--max-grad-norm` flags carries the operator's literal at full `f64`
+    precision. Null-safe: `None` (max_grad_norm's own "clip OFF" value,
+    `identity_fields.FINETUNE_NULL_IS_A_VALUE_FIELDS`) passes through
+    UNCHANGED, never coerced to a number.
+
+    WHY ONLY THESE TWO, never "all floats": `lora_alpha` and `margin` are
+    `f64` end-to-end on BOTH producers (jammi's `FinetuneStepParams::
+    lora_alpha: f64`; torch's own `--lora-alpha`/`--margin` floats,
+    unmodified before reaching the report) -- there is no representational
+    gap between the two sides to narrow for either field, and adding a
+    canonicalizer for them would WIDEN what counts as a match (silently
+    accepting an f32-rounded value on ONE side against a genuine f64 value
+    on the other, when today neither producer ever produces that gap) --
+    exactly the "narrows only the representational gap, never widens what
+    counts as a match" discipline this module's own doc states.
+
+    Round-trip, not a tolerance check: `0.05` stored as `f32` and read back
+    as `f64` is `0.05000000074505806`, not `0.05` -- comparing the two raw
+    `f64` values directly would refuse a config the operator asked for
+    IDENTICALLY on both sides, purely because one producer's storage type
+    rounds the input on the way in. Rounding BOTH sides through the SAME
+    `f32` boundary (struct-packed here; a real jammi process does the
+    identical rounding in hardware when the CLI float is stored into the
+    `f32` field) makes the two values compare equal again without loosening
+    the comparison for a genuine divergence (`0.05` vs `0.06` still
+    differs after the SAME round-trip is applied to both).
+    """
+    return _round_trip_f32(value)
 
 
 # THE finetune-step identity set — the ONE declaration every consumer
@@ -247,15 +384,21 @@ FINETUNE_NULL_IS_A_VALUE_FIELDS = frozenset({"max_grad_norm"})
 # `compare_grad_oracle.py`'s `RUN_IDENTITY_FIELDS` doc and
 # `FINETUNE_IDENTITY_FIELDS` above for the full field-by-field determinant
 # table each comparator maintains for ITS OWN field set (this table is
-# shared machinery, not a duplicate of either). `max_grad_norm` and
-# `attention_arm` deliberately have NO canonicalizer: both producers emit
-# the same vocabulary directly (a JSON number-or-null; `"eager"`/`"fused"`),
-# and a canonicalizer that mapped torch's raw `"sdpa"` onto jammi's
-# `"fused"` here would be WIDENING what counts as a match inside the
-# comparator rather than each producer stating its own class honestly.
+# shared machinery, not a duplicate of either). `lora_alpha`/`margin`
+# deliberately have NO canonicalizer despite being numeric siblings of
+# `lora_dropout`/`max_grad_norm`: both are `f64` end-to-end on BOTH
+# producers (see `normalize_f32_stored_field`'s own doc for why exactly
+# these two, never "all floats"). `attention_arm` also deliberately has NO
+# canonicalizer: both producers emit the same vocabulary directly
+# (`"eager"`/`"fused"`), and a canonicalizer that mapped torch's raw
+# `"sdpa"` onto jammi's `"fused"` here would be WIDENING what counts as a
+# match inside the comparator rather than each producer stating its own
+# class honestly.
 IDENTITY_FIELD_CANONICALIZERS = {
     "backbone_dtype": normalize_backbone_dtype,
     "target_modules": normalize_target_modules,
+    "lora_dropout": normalize_f32_stored_field,
+    "max_grad_norm": normalize_f32_stored_field,
 }
 
 

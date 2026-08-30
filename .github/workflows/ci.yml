@@ -1194,6 +1194,18 @@ jobs:
           # zero-execution gap as `compare_grad_oracle`'s suite above.
           - name: perf ab_merge suite
             cmd: python3 ci/scripts/perf/test_ab_merge.py
+          # `finetune_ab.sh`'s forced-eager disable-key enumeration (#352's
+          # harness redesign): mechanically enumerates every admit/
+          # op_disabled site and REDs on an unresolved one — stdlib-only,
+          # same zero-execution reasoning as the `ab_merge` suite above.
+          - name: perf finetune_ab disable-op-keys suite
+            cmd: python3 ci/scripts/perf/test_finetune_ab_disable_op_keys.py
+          # `finetune_ab.sh` ITSELF (the redesigned single-binary A/B
+          # producer, #352): dry-run smoke over the whole pipeline, the
+          # same hermetic discipline `gpu_inference_ab.sh`'s own dry-run
+          # leg below already follows.
+          - name: finetune_ab.sh dry-run smoke
+            cmd: python3 ci/scripts/perf/test_finetune_ab_sh_dry_run.py
           # issue #335's within-run GPU perf A/B comparator
           # (`gpu_inference_ab.py`) own merge/table suite: stdlib-only,
           # drives `build_report`/`main` (the real entry point
@@ -1202,6 +1214,19 @@ jobs:
           # `ab_merge`/`compare_grad_oracle` suites above.
           - name: perf gpu_inference_ab suite
             cmd: python3 ci/scripts/perf/test_gpu_inference_ab.py
+          # round-4 delta-audit F5: mechanically re-derives
+          # gpu_inference_ab.py's own PRE_REGISTERED_ADVISORY_BAND from the
+          # COMMITTED ci/artifacts/gpu-perf-aa-null/ evidence + its own
+          # manifest.json primary/aux classification, asserting equality --
+          # "never hand-tunes the two numbers" (gpu_inference_ab.sh's own
+          # doc) is now ENFORCED, not merely asserted in prose. Modeled on
+          # "pod build timings" (the sibling gate immediately below): a
+          # real-tree run plus a --self-test synthetic-fixture leg proving
+          # the re-derivation/aux-exclusion/schema-violation logic itself.
+          - name: aa-null band derivation
+            cmd: python3 ci/scripts/check_aa_null_band.py
+          - name: aa-null band derivation self-test
+            cmd: python3 ci/scripts/check_aa_null_band.py --self-test
           # Hermetic git-SHAPE regression suite for `gpu_inference_ab_git.sh`
           # (round-1 adversarial audit B2: the empirically-proven
           # "merge-base exits 128" bug in `runpod_gpu_perf_ab.sh`'s old

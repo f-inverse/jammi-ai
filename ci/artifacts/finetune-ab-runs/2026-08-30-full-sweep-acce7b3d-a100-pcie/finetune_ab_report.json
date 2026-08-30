@@ -1,0 +1,1787 @@
+{
+  "steps": "20",
+  "warmup": "5",
+  "pass_ratio_bar": 0.9,
+  "two_run_protocol": true,
+  "lora_init": {
+    "torch": "jammi",
+    "jammi": "jammi (LoraInitMode::ZerosB; not configurable via finetune-step's CLI)",
+    "note": "B4: a loss-trajectory-equivalence comparison additionally requires torch_lora_init == 'jammi' (torch_finetune_step.py's --lora-init jammi re-draws A from jammi's own bound) \u2014 a throughput-only sweep (this script's default, 'peft') does not need matched init at all. See torch_finetune_step.py's 'LoRA INIT IS NOT A MATCH BY DEFAULT' section."
+  },
+  "configs": {
+    "b16-s128-d0": {
+      "legs": {
+        "jammi-eager": {
+          "outcome": "OOM",
+          "metrics": null
+        },
+        "jammi-fused": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.218124847,
+            "triplets_per_s": 73.35248698191637,
+            "loss_first": 0.234375,
+            "loss_last": 0.0,
+            "vram_delta_bytes": 8977907712.0,
+            "vram_absolute_bytes": null,
+            "dispatch_pairs": [
+              [
+                "ln",
+                1425,
+                0
+              ],
+              [
+                "rope",
+                0,
+                0
+              ],
+              [
+                "softmax",
+                0,
+                0
+              ],
+              [
+                "geglu",
+                700,
+                0
+              ],
+              [
+                "lora_epilogue",
+                0,
+                0
+              ],
+              [
+                "lora_linear",
+                2800,
+                0
+              ],
+              [
+                "attention_block",
+                0,
+                0
+              ],
+              [
+                "adamw",
+                5600,
+                0
+              ],
+              [
+                "attention_block_flash",
+                700,
+                0
+              ]
+            ],
+            "flash_compiled": true,
+            "kernels_disabled_requested": [],
+            "kernels_disabled_fired": []
+          }
+        },
+        "torch-eager": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.2458869470283389,
+            "triplets_per_s": 65.07055455105541,
+            "loss_first": 0.29296875,
+            "loss_last": 0.1552734375,
+            "vram_delta_bytes": 10733519872.0,
+            "vram_absolute_bytes": 11655336960.0
+          }
+        },
+        "torch-sdpa": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.22348128352314234,
+            "triplets_per_s": 71.59436239027659,
+            "loss_first": 0.29296875,
+            "loss_last": 0.1552734375,
+            "vram_delta_bytes": 9704352768.0,
+            "vram_absolute_bytes": 10626169856.0
+          }
+        }
+      },
+      "bar_second_run_legs": {
+        "jammi-fused-2": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.217391432,
+            "triplets_per_s": 73.59995678210538,
+            "loss_first": 0.234375,
+            "loss_last": 0.0,
+            "vram_delta_bytes": 7837057024.0,
+            "vram_absolute_bytes": null,
+            "dispatch_pairs": [
+              [
+                "ln",
+                1425,
+                0
+              ],
+              [
+                "rope",
+                0,
+                0
+              ],
+              [
+                "softmax",
+                0,
+                0
+              ],
+              [
+                "geglu",
+                700,
+                0
+              ],
+              [
+                "lora_epilogue",
+                0,
+                0
+              ],
+              [
+                "lora_linear",
+                2800,
+                0
+              ],
+              [
+                "attention_block",
+                0,
+                0
+              ],
+              [
+                "adamw",
+                5600,
+                0
+              ],
+              [
+                "attention_block_flash",
+                700,
+                0
+              ]
+            ],
+            "flash_compiled": true,
+            "kernels_disabled_requested": [],
+            "kernels_disabled_fired": []
+          },
+          "provenance": {
+            "torch_attn_requested": null,
+            "torch_attn_implementation": null,
+            "jammi_dispatch_counters": {
+              "ln_fused_dispatches": 1425,
+              "ln_eager_dispatches": 0,
+              "rope_fused_dispatches": 0,
+              "rope_eager_dispatches": 0,
+              "softmax_fused_dispatches": 0,
+              "softmax_eager_dispatches": 0,
+              "geglu_fused_dispatches": 700,
+              "geglu_eager_dispatches": 0,
+              "lora_epilogue_fused_dispatches": 0,
+              "lora_epilogue_eager_dispatches": 0,
+              "lora_linear_fused_dispatches": 2800,
+              "lora_linear_eager_dispatches": 0,
+              "attention_block_fused_dispatches": 0,
+              "attention_block_eager_dispatches": 0,
+              "adamw_fused_dispatches": 5600,
+              "adamw_eager_dispatches": 0,
+              "attention_block_flash_fused_dispatches": 700,
+              "attention_block_flash_declined_dispatches": 0
+            },
+            "jammi_kernels_disabled_requested": [],
+            "jammi_kernels_disabled_fired": [],
+            "jammi_flash_compiled": true,
+            "jammi_clip_invocations": 0,
+            "torch_clip_invocations": null
+          }
+        },
+        "torch-sdpa-2": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.2234944198280573,
+            "triplets_per_s": 71.5901542969592,
+            "loss_first": 0.29296875,
+            "loss_last": 0.1552734375,
+            "vram_delta_bytes": 9704352768.0,
+            "vram_absolute_bytes": 10626169856.0
+          },
+          "provenance": {
+            "torch_attn_requested": "sdpa",
+            "torch_attn_implementation": "sdpa",
+            "jammi_dispatch_counters": null,
+            "jammi_kernels_disabled_requested": null,
+            "jammi_kernels_disabled_fired": null,
+            "jammi_flash_compiled": null,
+            "jammi_clip_invocations": null,
+            "torch_clip_invocations": 0
+          }
+        }
+      },
+      "jammi_fused_dispatch_proof": true,
+      "jammi_fused_dispatch_proof_second_run": true,
+      "leg_premise_violations": [],
+      "leg_premise_checked_legs": {
+        "jammi": "jammi-fused",
+        "torch": "torch-sdpa"
+      },
+      "leg_premise_not_comparable": null,
+      "leg_premise_violations_second_run": [],
+      "leg_premise_checked_legs_second_run": {
+        "jammi": "jammi-fused-2",
+        "torch": "torch-sdpa-2"
+      },
+      "leg_premise_violations_cross_run": null,
+      "two_run_missing_leg_reason": null,
+      "provenance": {
+        "jammi": {
+          "torch_attn_requested": null,
+          "torch_attn_implementation": null,
+          "jammi_dispatch_counters": {
+            "ln_fused_dispatches": 1425,
+            "ln_eager_dispatches": 0,
+            "rope_fused_dispatches": 0,
+            "rope_eager_dispatches": 0,
+            "softmax_fused_dispatches": 0,
+            "softmax_eager_dispatches": 0,
+            "geglu_fused_dispatches": 700,
+            "geglu_eager_dispatches": 0,
+            "lora_epilogue_fused_dispatches": 0,
+            "lora_epilogue_eager_dispatches": 0,
+            "lora_linear_fused_dispatches": 2800,
+            "lora_linear_eager_dispatches": 0,
+            "attention_block_fused_dispatches": 0,
+            "attention_block_eager_dispatches": 0,
+            "adamw_fused_dispatches": 5600,
+            "adamw_eager_dispatches": 0,
+            "attention_block_flash_fused_dispatches": 700,
+            "attention_block_flash_declined_dispatches": 0
+          },
+          "jammi_kernels_disabled_requested": [],
+          "jammi_kernels_disabled_fired": [],
+          "jammi_flash_compiled": true,
+          "jammi_clip_invocations": 0,
+          "torch_clip_invocations": null
+        },
+        "torch": {
+          "torch_attn_requested": "sdpa",
+          "torch_attn_implementation": "sdpa",
+          "jammi_dispatch_counters": null,
+          "jammi_kernels_disabled_requested": null,
+          "jammi_kernels_disabled_fired": null,
+          "jammi_flash_compiled": null,
+          "jammi_clip_invocations": null,
+          "torch_clip_invocations": 0
+        }
+      },
+      "ratio_jammi_fused_over_torch_sdpa": 1.0245567462708287,
+      "bar_pair_ratios": {
+        "pair1_jammi_fused_over_torch_sdpa": 1.0245567462708287,
+        "pair2_jammi_fused_2_over_torch_sdpa_2": 1.028073727524171
+      },
+      "bar_ratio_min_of_two_least_favourable_to_jammi": 1.0245567462708287,
+      "bar_ratio_indeterminate": false,
+      "loss_final_ratio_jammi_fused_over_torch_sdpa": 0.0,
+      "loss_final_ratio_note": "same data, cost fixture -- NOT a quality result (see finetune_step.rs's module doc / torch_finetune_step.py's LOSS TRAJECTORY section: different attention-kernel arithmetic and reduction order between the two stacks makes a loss VALUE comparison meaningless even given identical synthetic input ids, unless torch_lora_init == 'jammi'). Printed so a divergence is visible, never gated. loss values carry only bf16's ULP (~0.00195 near 0.30) of real precision -- see BF16_LOSS_ULP_NEAR_0P3.",
+      "verdict": "PASS (ratio 1.025)"
+    },
+    "b16-s128-d0p05": {
+      "legs": {
+        "jammi-eager": {
+          "outcome": "OOM",
+          "metrics": null
+        },
+        "jammi-fused": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.240141884,
+            "triplets_per_s": 66.62727773052701,
+            "loss_first": 0.265625,
+            "loss_last": 0.06201172,
+            "vram_delta_bytes": 8843689984.0,
+            "vram_absolute_bytes": null,
+            "dispatch_pairs": [
+              [
+                "ln",
+                1425,
+                0
+              ],
+              [
+                "rope",
+                0,
+                0
+              ],
+              [
+                "softmax",
+                0,
+                0
+              ],
+              [
+                "geglu",
+                700,
+                0
+              ],
+              [
+                "lora_epilogue",
+                0,
+                0
+              ],
+              [
+                "lora_linear",
+                2800,
+                0
+              ],
+              [
+                "attention_block",
+                0,
+                0
+              ],
+              [
+                "adamw",
+                5600,
+                0
+              ],
+              [
+                "attention_block_flash",
+                700,
+                0
+              ]
+            ],
+            "flash_compiled": true,
+            "kernels_disabled_requested": [],
+            "kernels_disabled_fired": []
+          }
+        },
+        "torch-eager": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.2578982738777995,
+            "triplets_per_s": 62.03996544614841,
+            "loss_first": 0.2421875,
+            "loss_last": 0.154296875,
+            "vram_delta_bytes": 11717084160.0,
+            "vram_absolute_bytes": 12639425536.0
+          }
+        },
+        "torch-sdpa": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.23410452995449305,
+            "triplets_per_s": 68.34553779506187,
+            "loss_first": 0.2333984375,
+            "loss_last": 0.2451171875,
+            "vram_delta_bytes": 10687654912.0,
+            "vram_absolute_bytes": 11609865216.0
+          }
+        }
+      },
+      "bar_second_run_legs": {
+        "jammi-fused-2": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.240397738,
+            "triplets_per_s": 66.55636668261829,
+            "loss_first": 0.265625,
+            "loss_last": 0.06201172,
+            "vram_delta_bytes": 8474591232.0,
+            "vram_absolute_bytes": null,
+            "dispatch_pairs": [
+              [
+                "ln",
+                1425,
+                0
+              ],
+              [
+                "rope",
+                0,
+                0
+              ],
+              [
+                "softmax",
+                0,
+                0
+              ],
+              [
+                "geglu",
+                700,
+                0
+              ],
+              [
+                "lora_epilogue",
+                0,
+                0
+              ],
+              [
+                "lora_linear",
+                2800,
+                0
+              ],
+              [
+                "attention_block",
+                0,
+                0
+              ],
+              [
+                "adamw",
+                5600,
+                0
+              ],
+              [
+                "attention_block_flash",
+                700,
+                0
+              ]
+            ],
+            "flash_compiled": true,
+            "kernels_disabled_requested": [],
+            "kernels_disabled_fired": []
+          },
+          "provenance": {
+            "torch_attn_requested": null,
+            "torch_attn_implementation": null,
+            "jammi_dispatch_counters": {
+              "ln_fused_dispatches": 1425,
+              "ln_eager_dispatches": 0,
+              "rope_fused_dispatches": 0,
+              "rope_eager_dispatches": 0,
+              "softmax_fused_dispatches": 0,
+              "softmax_eager_dispatches": 0,
+              "geglu_fused_dispatches": 700,
+              "geglu_eager_dispatches": 0,
+              "lora_epilogue_fused_dispatches": 0,
+              "lora_epilogue_eager_dispatches": 0,
+              "lora_linear_fused_dispatches": 2800,
+              "lora_linear_eager_dispatches": 0,
+              "attention_block_fused_dispatches": 0,
+              "attention_block_eager_dispatches": 0,
+              "adamw_fused_dispatches": 5600,
+              "adamw_eager_dispatches": 0,
+              "attention_block_flash_fused_dispatches": 700,
+              "attention_block_flash_declined_dispatches": 0
+            },
+            "jammi_kernels_disabled_requested": [],
+            "jammi_kernels_disabled_fired": [],
+            "jammi_flash_compiled": true,
+            "jammi_clip_invocations": 0,
+            "torch_clip_invocations": null
+          }
+        },
+        "torch-sdpa-2": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.23599368892610073,
+            "triplets_per_s": 67.79842322397975,
+            "loss_first": 0.2333984375,
+            "loss_last": 0.2451171875,
+            "vram_delta_bytes": 10687654912.0,
+            "vram_absolute_bytes": 11609865216.0
+          },
+          "provenance": {
+            "torch_attn_requested": "sdpa",
+            "torch_attn_implementation": "sdpa",
+            "jammi_dispatch_counters": null,
+            "jammi_kernels_disabled_requested": null,
+            "jammi_kernels_disabled_fired": null,
+            "jammi_flash_compiled": null,
+            "jammi_clip_invocations": null,
+            "torch_clip_invocations": 0
+          }
+        }
+      },
+      "jammi_fused_dispatch_proof": true,
+      "jammi_fused_dispatch_proof_second_run": true,
+      "leg_premise_violations": [],
+      "leg_premise_checked_legs": {
+        "jammi": "jammi-fused",
+        "torch": "torch-sdpa"
+      },
+      "leg_premise_not_comparable": null,
+      "leg_premise_violations_second_run": [],
+      "leg_premise_checked_legs_second_run": {
+        "jammi": "jammi-fused-2",
+        "torch": "torch-sdpa-2"
+      },
+      "leg_premise_violations_cross_run": null,
+      "two_run_missing_leg_reason": null,
+      "provenance": {
+        "jammi": {
+          "torch_attn_requested": null,
+          "torch_attn_implementation": null,
+          "jammi_dispatch_counters": {
+            "ln_fused_dispatches": 1425,
+            "ln_eager_dispatches": 0,
+            "rope_fused_dispatches": 0,
+            "rope_eager_dispatches": 0,
+            "softmax_fused_dispatches": 0,
+            "softmax_eager_dispatches": 0,
+            "geglu_fused_dispatches": 700,
+            "geglu_eager_dispatches": 0,
+            "lora_epilogue_fused_dispatches": 0,
+            "lora_epilogue_eager_dispatches": 0,
+            "lora_linear_fused_dispatches": 2800,
+            "lora_linear_eager_dispatches": 0,
+            "attention_block_fused_dispatches": 0,
+            "attention_block_eager_dispatches": 0,
+            "adamw_fused_dispatches": 5600,
+            "adamw_eager_dispatches": 0,
+            "attention_block_flash_fused_dispatches": 700,
+            "attention_block_flash_declined_dispatches": 0
+          },
+          "jammi_kernels_disabled_requested": [],
+          "jammi_kernels_disabled_fired": [],
+          "jammi_flash_compiled": true,
+          "jammi_clip_invocations": 0,
+          "torch_clip_invocations": null
+        },
+        "torch": {
+          "torch_attn_requested": "sdpa",
+          "torch_attn_implementation": "sdpa",
+          "jammi_dispatch_counters": null,
+          "jammi_kernels_disabled_requested": null,
+          "jammi_kernels_disabled_fired": null,
+          "jammi_flash_compiled": null,
+          "jammi_clip_invocations": null,
+          "torch_clip_invocations": 0
+        }
+      },
+      "ratio_jammi_fused_over_torch_sdpa": 0.9748592209532806,
+      "bar_pair_ratios": {
+        "pair1_jammi_fused_over_torch_sdpa": 0.9748592209532806,
+        "pair2_jammi_fused_2_over_torch_sdpa_2": 0.9816801559343321
+      },
+      "bar_ratio_min_of_two_least_favourable_to_jammi": 0.9748592209532806,
+      "bar_ratio_indeterminate": false,
+      "loss_final_ratio_jammi_fused_over_torch_sdpa": 0.2529880529083665,
+      "loss_final_ratio_note": "same data, cost fixture -- NOT a quality result (see finetune_step.rs's module doc / torch_finetune_step.py's LOSS TRAJECTORY section: different attention-kernel arithmetic and reduction order between the two stacks makes a loss VALUE comparison meaningless even given identical synthetic input ids, unless torch_lora_init == 'jammi'). Printed so a divergence is visible, never gated. loss values carry only bf16's ULP (~0.00195 near 0.30) of real precision -- see BF16_LOSS_ULP_NEAR_0P3.",
+      "verdict": "PASS (ratio 0.975)"
+    },
+    "b8-s128-d0": {
+      "legs": {
+        "jammi-eager": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.6143654,
+            "triplets_per_s": 13.021566644215316,
+            "loss_first": 0.07128906,
+            "loss_last": 0.0126953125,
+            "vram_delta_bytes": 57329844224.0,
+            "vram_absolute_bytes": null,
+            "dispatch_pairs": [
+              [
+                "ln",
+                0,
+                1425
+              ],
+              [
+                "rope",
+                0,
+                1400
+              ],
+              [
+                "softmax",
+                0,
+                700
+              ],
+              [
+                "geglu",
+                0,
+                700
+              ],
+              [
+                "lora_epilogue",
+                0,
+                0
+              ],
+              [
+                "lora_linear",
+                0,
+                2800
+              ],
+              [
+                "attention_block",
+                0,
+                700
+              ],
+              [
+                "adamw",
+                0,
+                5600
+              ],
+              [
+                "attention_block_flash",
+                0,
+                700
+              ]
+            ],
+            "flash_compiled": true,
+            "kernels_disabled_requested": [
+              "adamw_step_fused",
+              "attention_block_flash",
+              "attention_block_fused",
+              "geglu_fused",
+              "layer_norm_fused",
+              "lora_linear_fused",
+              "mem_efficient_attention",
+              "rope_fused",
+              "softmax_last_dim_fused"
+            ],
+            "kernels_disabled_fired": [
+              "adamw_step_fused",
+              "attention_block_flash",
+              "attention_block_fused",
+              "geglu_fused",
+              "layer_norm_fused",
+              "lora_linear_fused",
+              "mem_efficient_attention",
+              "rope_fused",
+              "softmax_last_dim_fused"
+            ]
+          }
+        },
+        "jammi-fused": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.129484769,
+            "triplets_per_s": 61.783328354240645,
+            "loss_first": 0.080566406,
+            "loss_last": 0.0,
+            "vram_delta_bytes": 3877634048.0,
+            "vram_absolute_bytes": null,
+            "dispatch_pairs": [
+              [
+                "ln",
+                1425,
+                0
+              ],
+              [
+                "rope",
+                0,
+                0
+              ],
+              [
+                "softmax",
+                0,
+                0
+              ],
+              [
+                "geglu",
+                700,
+                0
+              ],
+              [
+                "lora_epilogue",
+                0,
+                0
+              ],
+              [
+                "lora_linear",
+                2800,
+                0
+              ],
+              [
+                "attention_block",
+                0,
+                0
+              ],
+              [
+                "adamw",
+                5600,
+                0
+              ],
+              [
+                "attention_block_flash",
+                700,
+                0
+              ]
+            ],
+            "flash_compiled": true,
+            "kernels_disabled_requested": [],
+            "kernels_disabled_fired": []
+          }
+        },
+        "torch-eager": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.15302428044378757,
+            "triplets_per_s": 52.279285201009294,
+            "loss_first": 0.169921875,
+            "loss_last": 0.03662109375,
+            "vram_delta_bytes": 5350237184.0,
+            "vram_absolute_bytes": 6272021504.0
+          }
+        },
+        "torch-sdpa": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.13663262967020273,
+            "triplets_per_s": 58.551167604034376,
+            "loss_first": 0.1611328125,
+            "loss_last": 0.0,
+            "vram_delta_bytes": 4835265536.0,
+            "vram_absolute_bytes": 5757049856.0
+          }
+        }
+      },
+      "bar_second_run_legs": {
+        "jammi-fused-2": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.129786729,
+            "triplets_per_s": 61.639584121116116,
+            "loss_first": 0.080566406,
+            "loss_last": 0.0,
+            "vram_delta_bytes": 3776970752.0,
+            "vram_absolute_bytes": null,
+            "dispatch_pairs": [
+              [
+                "ln",
+                1425,
+                0
+              ],
+              [
+                "rope",
+                0,
+                0
+              ],
+              [
+                "softmax",
+                0,
+                0
+              ],
+              [
+                "geglu",
+                700,
+                0
+              ],
+              [
+                "lora_epilogue",
+                0,
+                0
+              ],
+              [
+                "lora_linear",
+                2800,
+                0
+              ],
+              [
+                "attention_block",
+                0,
+                0
+              ],
+              [
+                "adamw",
+                5600,
+                0
+              ],
+              [
+                "attention_block_flash",
+                700,
+                0
+              ]
+            ],
+            "flash_compiled": true,
+            "kernels_disabled_requested": [],
+            "kernels_disabled_fired": []
+          },
+          "provenance": {
+            "torch_attn_requested": null,
+            "torch_attn_implementation": null,
+            "jammi_dispatch_counters": {
+              "ln_fused_dispatches": 1425,
+              "ln_eager_dispatches": 0,
+              "rope_fused_dispatches": 0,
+              "rope_eager_dispatches": 0,
+              "softmax_fused_dispatches": 0,
+              "softmax_eager_dispatches": 0,
+              "geglu_fused_dispatches": 700,
+              "geglu_eager_dispatches": 0,
+              "lora_epilogue_fused_dispatches": 0,
+              "lora_epilogue_eager_dispatches": 0,
+              "lora_linear_fused_dispatches": 2800,
+              "lora_linear_eager_dispatches": 0,
+              "attention_block_fused_dispatches": 0,
+              "attention_block_eager_dispatches": 0,
+              "adamw_fused_dispatches": 5600,
+              "adamw_eager_dispatches": 0,
+              "attention_block_flash_fused_dispatches": 700,
+              "attention_block_flash_declined_dispatches": 0
+            },
+            "jammi_kernels_disabled_requested": [],
+            "jammi_kernels_disabled_fired": [],
+            "jammi_flash_compiled": true,
+            "jammi_clip_invocations": 0,
+            "torch_clip_invocations": null
+          }
+        },
+        "torch-sdpa-2": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.1257167709991336,
+            "triplets_per_s": 63.63510561415178,
+            "loss_first": 0.1611328125,
+            "loss_last": 0.0,
+            "vram_delta_bytes": 4835265536.0,
+            "vram_absolute_bytes": 5757049856.0
+          },
+          "provenance": {
+            "torch_attn_requested": "sdpa",
+            "torch_attn_implementation": "sdpa",
+            "jammi_dispatch_counters": null,
+            "jammi_kernels_disabled_requested": null,
+            "jammi_kernels_disabled_fired": null,
+            "jammi_flash_compiled": null,
+            "jammi_clip_invocations": null,
+            "torch_clip_invocations": 0
+          }
+        }
+      },
+      "jammi_fused_dispatch_proof": true,
+      "jammi_fused_dispatch_proof_second_run": true,
+      "leg_premise_violations": [],
+      "leg_premise_checked_legs": {
+        "jammi": "jammi-fused",
+        "torch": "torch-sdpa"
+      },
+      "leg_premise_not_comparable": null,
+      "leg_premise_violations_second_run": [],
+      "leg_premise_checked_legs_second_run": {
+        "jammi": "jammi-fused-2",
+        "torch": "torch-sdpa-2"
+      },
+      "leg_premise_violations_cross_run": null,
+      "two_run_missing_leg_reason": null,
+      "provenance": {
+        "jammi": {
+          "torch_attn_requested": null,
+          "torch_attn_implementation": null,
+          "jammi_dispatch_counters": {
+            "ln_fused_dispatches": 1425,
+            "ln_eager_dispatches": 0,
+            "rope_fused_dispatches": 0,
+            "rope_eager_dispatches": 0,
+            "softmax_fused_dispatches": 0,
+            "softmax_eager_dispatches": 0,
+            "geglu_fused_dispatches": 700,
+            "geglu_eager_dispatches": 0,
+            "lora_epilogue_fused_dispatches": 0,
+            "lora_epilogue_eager_dispatches": 0,
+            "lora_linear_fused_dispatches": 2800,
+            "lora_linear_eager_dispatches": 0,
+            "attention_block_fused_dispatches": 0,
+            "attention_block_eager_dispatches": 0,
+            "adamw_fused_dispatches": 5600,
+            "adamw_eager_dispatches": 0,
+            "attention_block_flash_fused_dispatches": 700,
+            "attention_block_flash_declined_dispatches": 0
+          },
+          "jammi_kernels_disabled_requested": [],
+          "jammi_kernels_disabled_fired": [],
+          "jammi_flash_compiled": true,
+          "jammi_clip_invocations": 0,
+          "torch_clip_invocations": null
+        },
+        "torch": {
+          "torch_attn_requested": "sdpa",
+          "torch_attn_implementation": "sdpa",
+          "jammi_dispatch_counters": null,
+          "jammi_kernels_disabled_requested": null,
+          "jammi_kernels_disabled_fired": null,
+          "jammi_flash_compiled": null,
+          "jammi_clip_invocations": null,
+          "torch_clip_invocations": 0
+        }
+      },
+      "ratio_jammi_fused_over_torch_sdpa": 1.0552023278521871,
+      "bar_pair_ratios": {
+        "pair1_jammi_fused_over_torch_sdpa": 1.0552023278521871,
+        "pair2_jammi_fused_2_over_torch_sdpa_2": 0.9686411851795232
+      },
+      "bar_ratio_min_of_two_least_favourable_to_jammi": 0.9686411851795232,
+      "bar_ratio_indeterminate": true,
+      "loss_final_ratio_jammi_fused_over_torch_sdpa": null,
+      "loss_final_ratio_note": "same data, cost fixture -- NOT a quality result (see finetune_step.rs's module doc / torch_finetune_step.py's LOSS TRAJECTORY section: different attention-kernel arithmetic and reduction order between the two stacks makes a loss VALUE comparison meaningless even given identical synthetic input ids, unless torch_lora_init == 'jammi'). Printed so a divergence is visible, never gated. loss values carry only bf16's ULP (~0.00195 near 0.30) of real precision -- see BF16_LOSS_ULP_NEAR_0P3.",
+      "verdict": "INDETERMINATE (pair1(jammi-fused/torch-sdpa)=1.055 pair2(jammi-fused-2/torch-sdpa-2)=0.969 spread=0.087 bar-distance-from-0.9=0.069)"
+    },
+    "b8-s128-d0p05": {
+      "legs": {
+        "jammi-eager": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.626425579,
+            "triplets_per_s": 12.770870584133666,
+            "loss_first": 0.14648438,
+            "loss_last": 0.0,
+            "vram_delta_bytes": 59577991168.0,
+            "vram_absolute_bytes": null,
+            "dispatch_pairs": [
+              [
+                "ln",
+                0,
+                1425
+              ],
+              [
+                "rope",
+                0,
+                1400
+              ],
+              [
+                "softmax",
+                0,
+                700
+              ],
+              [
+                "geglu",
+                0,
+                700
+              ],
+              [
+                "lora_epilogue",
+                0,
+                0
+              ],
+              [
+                "lora_linear",
+                0,
+                2800
+              ],
+              [
+                "attention_block",
+                0,
+                700
+              ],
+              [
+                "adamw",
+                0,
+                5600
+              ],
+              [
+                "attention_block_flash",
+                0,
+                700
+              ]
+            ],
+            "flash_compiled": true,
+            "kernels_disabled_requested": [
+              "adamw_step_fused",
+              "attention_block_flash",
+              "attention_block_fused",
+              "geglu_fused",
+              "layer_norm_fused",
+              "lora_linear_fused",
+              "mem_efficient_attention",
+              "rope_fused",
+              "softmax_last_dim_fused"
+            ],
+            "kernels_disabled_fired": [
+              "adamw_step_fused",
+              "attention_block_flash",
+              "attention_block_fused",
+              "geglu_fused",
+              "layer_norm_fused",
+              "lora_linear_fused",
+              "mem_efficient_attention",
+              "rope_fused",
+              "softmax_last_dim_fused"
+            ]
+          }
+        },
+        "jammi-fused": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.141193565,
+            "triplets_per_s": 56.65980599045006,
+            "loss_first": 0.110839844,
+            "loss_last": 0.0,
+            "vram_delta_bytes": 3844079616.0,
+            "vram_absolute_bytes": null,
+            "dispatch_pairs": [
+              [
+                "ln",
+                1425,
+                0
+              ],
+              [
+                "rope",
+                0,
+                0
+              ],
+              [
+                "softmax",
+                0,
+                0
+              ],
+              [
+                "geglu",
+                700,
+                0
+              ],
+              [
+                "lora_epilogue",
+                0,
+                0
+              ],
+              [
+                "lora_linear",
+                2800,
+                0
+              ],
+              [
+                "attention_block",
+                0,
+                0
+              ],
+              [
+                "adamw",
+                5600,
+                0
+              ],
+              [
+                "attention_block_flash",
+                700,
+                0
+              ]
+            ],
+            "flash_compiled": true,
+            "kernels_disabled_requested": [],
+            "kernels_disabled_fired": []
+          }
+        },
+        "torch-eager": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.15361275430768728,
+            "triplets_per_s": 52.079008908179276,
+            "loss_first": 0.064453125,
+            "loss_last": 0.0,
+            "vram_delta_bytes": 5859714048.0,
+            "vram_absolute_bytes": 6781498368.0
+          }
+        },
+        "torch-sdpa": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.13051843084394932,
+            "triplets_per_s": 61.2940252826436,
+            "loss_first": 0.06298828125,
+            "loss_last": 0.0,
+            "vram_delta_bytes": 5349133312.0,
+            "vram_absolute_bytes": 6270917632.0
+          }
+        }
+      },
+      "bar_second_run_legs": {
+        "jammi-fused-2": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.141884058,
+            "triplets_per_s": 56.38406536131071,
+            "loss_first": 0.110839844,
+            "loss_last": 0.0,
+            "vram_delta_bytes": 4347396096.0,
+            "vram_absolute_bytes": null,
+            "dispatch_pairs": [
+              [
+                "ln",
+                1425,
+                0
+              ],
+              [
+                "rope",
+                0,
+                0
+              ],
+              [
+                "softmax",
+                0,
+                0
+              ],
+              [
+                "geglu",
+                700,
+                0
+              ],
+              [
+                "lora_epilogue",
+                0,
+                0
+              ],
+              [
+                "lora_linear",
+                2800,
+                0
+              ],
+              [
+                "attention_block",
+                0,
+                0
+              ],
+              [
+                "adamw",
+                5600,
+                0
+              ],
+              [
+                "attention_block_flash",
+                700,
+                0
+              ]
+            ],
+            "flash_compiled": true,
+            "kernels_disabled_requested": [],
+            "kernels_disabled_fired": []
+          },
+          "provenance": {
+            "torch_attn_requested": null,
+            "torch_attn_implementation": null,
+            "jammi_dispatch_counters": {
+              "ln_fused_dispatches": 1425,
+              "ln_eager_dispatches": 0,
+              "rope_fused_dispatches": 0,
+              "rope_eager_dispatches": 0,
+              "softmax_fused_dispatches": 0,
+              "softmax_eager_dispatches": 0,
+              "geglu_fused_dispatches": 700,
+              "geglu_eager_dispatches": 0,
+              "lora_epilogue_fused_dispatches": 0,
+              "lora_epilogue_eager_dispatches": 0,
+              "lora_linear_fused_dispatches": 2800,
+              "lora_linear_eager_dispatches": 0,
+              "attention_block_fused_dispatches": 0,
+              "attention_block_eager_dispatches": 0,
+              "adamw_fused_dispatches": 5600,
+              "adamw_eager_dispatches": 0,
+              "attention_block_flash_fused_dispatches": 700,
+              "attention_block_flash_declined_dispatches": 0
+            },
+            "jammi_kernels_disabled_requested": [],
+            "jammi_kernels_disabled_fired": [],
+            "jammi_flash_compiled": true,
+            "jammi_clip_invocations": 0,
+            "torch_clip_invocations": null
+          }
+        },
+        "torch-sdpa-2": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.14433988835662603,
+            "triplets_per_s": 55.424734569796094,
+            "loss_first": 0.06298828125,
+            "loss_last": 0.0,
+            "vram_delta_bytes": 5349133312.0,
+            "vram_absolute_bytes": 6270917632.0
+          },
+          "provenance": {
+            "torch_attn_requested": "sdpa",
+            "torch_attn_implementation": "sdpa",
+            "jammi_dispatch_counters": null,
+            "jammi_kernels_disabled_requested": null,
+            "jammi_kernels_disabled_fired": null,
+            "jammi_flash_compiled": null,
+            "jammi_clip_invocations": null,
+            "torch_clip_invocations": 0
+          }
+        }
+      },
+      "jammi_fused_dispatch_proof": true,
+      "jammi_fused_dispatch_proof_second_run": true,
+      "leg_premise_violations": [],
+      "leg_premise_checked_legs": {
+        "jammi": "jammi-fused",
+        "torch": "torch-sdpa"
+      },
+      "leg_premise_not_comparable": null,
+      "leg_premise_violations_second_run": [],
+      "leg_premise_checked_legs_second_run": {
+        "jammi": "jammi-fused-2",
+        "torch": "torch-sdpa-2"
+      },
+      "leg_premise_violations_cross_run": null,
+      "two_run_missing_leg_reason": null,
+      "provenance": {
+        "jammi": {
+          "torch_attn_requested": null,
+          "torch_attn_implementation": null,
+          "jammi_dispatch_counters": {
+            "ln_fused_dispatches": 1425,
+            "ln_eager_dispatches": 0,
+            "rope_fused_dispatches": 0,
+            "rope_eager_dispatches": 0,
+            "softmax_fused_dispatches": 0,
+            "softmax_eager_dispatches": 0,
+            "geglu_fused_dispatches": 700,
+            "geglu_eager_dispatches": 0,
+            "lora_epilogue_fused_dispatches": 0,
+            "lora_epilogue_eager_dispatches": 0,
+            "lora_linear_fused_dispatches": 2800,
+            "lora_linear_eager_dispatches": 0,
+            "attention_block_fused_dispatches": 0,
+            "attention_block_eager_dispatches": 0,
+            "adamw_fused_dispatches": 5600,
+            "adamw_eager_dispatches": 0,
+            "attention_block_flash_fused_dispatches": 700,
+            "attention_block_flash_declined_dispatches": 0
+          },
+          "jammi_kernels_disabled_requested": [],
+          "jammi_kernels_disabled_fired": [],
+          "jammi_flash_compiled": true,
+          "jammi_clip_invocations": 0,
+          "torch_clip_invocations": null
+        },
+        "torch": {
+          "torch_attn_requested": "sdpa",
+          "torch_attn_implementation": "sdpa",
+          "jammi_dispatch_counters": null,
+          "jammi_kernels_disabled_requested": null,
+          "jammi_kernels_disabled_fired": null,
+          "jammi_flash_compiled": null,
+          "jammi_clip_invocations": null,
+          "torch_clip_invocations": 0
+        }
+      },
+      "ratio_jammi_fused_over_torch_sdpa": 0.9243936212245176,
+      "bar_pair_ratios": {
+        "pair1_jammi_fused_over_torch_sdpa": 0.9243936212245176,
+        "pair2_jammi_fused_2_over_torch_sdpa_2": 1.0173087124180367
+      },
+      "bar_ratio_min_of_two_least_favourable_to_jammi": 0.9243936212245176,
+      "bar_ratio_indeterminate": true,
+      "loss_final_ratio_jammi_fused_over_torch_sdpa": null,
+      "loss_final_ratio_note": "same data, cost fixture -- NOT a quality result (see finetune_step.rs's module doc / torch_finetune_step.py's LOSS TRAJECTORY section: different attention-kernel arithmetic and reduction order between the two stacks makes a loss VALUE comparison meaningless even given identical synthetic input ids, unless torch_lora_init == 'jammi'). Printed so a divergence is visible, never gated. loss values carry only bf16's ULP (~0.00195 near 0.30) of real precision -- see BF16_LOSS_ULP_NEAR_0P3.",
+      "verdict": "INDETERMINATE (pair1(jammi-fused/torch-sdpa)=0.924 pair2(jammi-fused-2/torch-sdpa-2)=1.017 spread=0.093 bar-distance-from-0.9=0.024)"
+    },
+    "b8-s512-d0": {
+      "legs": {
+        "jammi-eager": {
+          "outcome": "OOM",
+          "metrics": null
+        },
+        "jammi-fused": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.417878835,
+            "triplets_per_s": 19.144305310413724,
+            "loss_first": 0.26171875,
+            "loss_last": 0.032226562,
+            "vram_delta_bytes": 16091447296.0,
+            "vram_absolute_bytes": null,
+            "dispatch_pairs": [
+              [
+                "ln",
+                1425,
+                0
+              ],
+              [
+                "rope",
+                0,
+                0
+              ],
+              [
+                "softmax",
+                0,
+                0
+              ],
+              [
+                "geglu",
+                700,
+                0
+              ],
+              [
+                "lora_epilogue",
+                0,
+                0
+              ],
+              [
+                "lora_linear",
+                2800,
+                0
+              ],
+              [
+                "attention_block",
+                0,
+                0
+              ],
+              [
+                "adamw",
+                5600,
+                0
+              ],
+              [
+                "attention_block_flash",
+                700,
+                0
+              ]
+            ],
+            "flash_compiled": true,
+            "kernels_disabled_requested": [],
+            "kernels_disabled_fired": []
+          }
+        },
+        "torch-eager": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.5789547050371766,
+            "triplets_per_s": 13.818006711744909,
+            "loss_first": 0.2353515625,
+            "loss_last": 0.0,
+            "vram_delta_bytes": 34337797120.0,
+            "vram_absolute_bytes": 35259679744.0
+          }
+        },
+        "torch-sdpa": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.4499405650421977,
+            "triplets_per_s": 17.780126135659096,
+            "loss_first": 0.2197265625,
+            "loss_last": 0.0,
+            "vram_delta_bytes": 19586250752.0,
+            "vram_absolute_bytes": 20508133376.0
+          }
+        }
+      },
+      "bar_second_run_legs": {
+        "jammi-fused-2": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.418817017,
+            "triplets_per_s": 19.10142060918217,
+            "loss_first": 0.26171875,
+            "loss_last": 0.032226562,
+            "vram_delta_bytes": 15890120704.0,
+            "vram_absolute_bytes": null,
+            "dispatch_pairs": [
+              [
+                "ln",
+                1425,
+                0
+              ],
+              [
+                "rope",
+                0,
+                0
+              ],
+              [
+                "softmax",
+                0,
+                0
+              ],
+              [
+                "geglu",
+                700,
+                0
+              ],
+              [
+                "lora_epilogue",
+                0,
+                0
+              ],
+              [
+                "lora_linear",
+                2800,
+                0
+              ],
+              [
+                "attention_block",
+                0,
+                0
+              ],
+              [
+                "adamw",
+                5600,
+                0
+              ],
+              [
+                "attention_block_flash",
+                700,
+                0
+              ]
+            ],
+            "flash_compiled": true,
+            "kernels_disabled_requested": [],
+            "kernels_disabled_fired": []
+          },
+          "provenance": {
+            "torch_attn_requested": null,
+            "torch_attn_implementation": null,
+            "jammi_dispatch_counters": {
+              "ln_fused_dispatches": 1425,
+              "ln_eager_dispatches": 0,
+              "rope_fused_dispatches": 0,
+              "rope_eager_dispatches": 0,
+              "softmax_fused_dispatches": 0,
+              "softmax_eager_dispatches": 0,
+              "geglu_fused_dispatches": 700,
+              "geglu_eager_dispatches": 0,
+              "lora_epilogue_fused_dispatches": 0,
+              "lora_epilogue_eager_dispatches": 0,
+              "lora_linear_fused_dispatches": 2800,
+              "lora_linear_eager_dispatches": 0,
+              "attention_block_fused_dispatches": 0,
+              "attention_block_eager_dispatches": 0,
+              "adamw_fused_dispatches": 5600,
+              "adamw_eager_dispatches": 0,
+              "attention_block_flash_fused_dispatches": 700,
+              "attention_block_flash_declined_dispatches": 0
+            },
+            "jammi_kernels_disabled_requested": [],
+            "jammi_kernels_disabled_fired": [],
+            "jammi_flash_compiled": true,
+            "jammi_clip_invocations": 0,
+            "torch_clip_invocations": null
+          }
+        },
+        "torch-sdpa-2": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.4549751738086343,
+            "triplets_per_s": 17.583376985234924,
+            "loss_first": 0.3046875,
+            "loss_last": 0.283203125,
+            "vram_delta_bytes": 19586250752.0,
+            "vram_absolute_bytes": 20508133376.0
+          },
+          "provenance": {
+            "torch_attn_requested": "sdpa",
+            "torch_attn_implementation": "sdpa",
+            "jammi_dispatch_counters": null,
+            "jammi_kernels_disabled_requested": null,
+            "jammi_kernels_disabled_fired": null,
+            "jammi_flash_compiled": null,
+            "jammi_clip_invocations": null,
+            "torch_clip_invocations": 0
+          }
+        }
+      },
+      "jammi_fused_dispatch_proof": true,
+      "jammi_fused_dispatch_proof_second_run": true,
+      "leg_premise_violations": [],
+      "leg_premise_checked_legs": {
+        "jammi": "jammi-fused",
+        "torch": "torch-sdpa"
+      },
+      "leg_premise_not_comparable": null,
+      "leg_premise_violations_second_run": [],
+      "leg_premise_checked_legs_second_run": {
+        "jammi": "jammi-fused-2",
+        "torch": "torch-sdpa-2"
+      },
+      "leg_premise_violations_cross_run": null,
+      "two_run_missing_leg_reason": null,
+      "provenance": {
+        "jammi": {
+          "torch_attn_requested": null,
+          "torch_attn_implementation": null,
+          "jammi_dispatch_counters": {
+            "ln_fused_dispatches": 1425,
+            "ln_eager_dispatches": 0,
+            "rope_fused_dispatches": 0,
+            "rope_eager_dispatches": 0,
+            "softmax_fused_dispatches": 0,
+            "softmax_eager_dispatches": 0,
+            "geglu_fused_dispatches": 700,
+            "geglu_eager_dispatches": 0,
+            "lora_epilogue_fused_dispatches": 0,
+            "lora_epilogue_eager_dispatches": 0,
+            "lora_linear_fused_dispatches": 2800,
+            "lora_linear_eager_dispatches": 0,
+            "attention_block_fused_dispatches": 0,
+            "attention_block_eager_dispatches": 0,
+            "adamw_fused_dispatches": 5600,
+            "adamw_eager_dispatches": 0,
+            "attention_block_flash_fused_dispatches": 700,
+            "attention_block_flash_declined_dispatches": 0
+          },
+          "jammi_kernels_disabled_requested": [],
+          "jammi_kernels_disabled_fired": [],
+          "jammi_flash_compiled": true,
+          "jammi_clip_invocations": 0,
+          "torch_clip_invocations": null
+        },
+        "torch": {
+          "torch_attn_requested": "sdpa",
+          "torch_attn_implementation": "sdpa",
+          "jammi_dispatch_counters": null,
+          "jammi_kernels_disabled_requested": null,
+          "jammi_kernels_disabled_fired": null,
+          "jammi_flash_compiled": null,
+          "jammi_clip_invocations": null,
+          "torch_clip_invocations": 0
+        }
+      },
+      "ratio_jammi_fused_over_torch_sdpa": 1.0767249435884871,
+      "bar_pair_ratios": {
+        "pair1_jammi_fused_over_torch_sdpa": 1.0767249435884871,
+        "pair2_jammi_fused_2_over_torch_sdpa_2": 1.086334020206811
+      },
+      "bar_ratio_min_of_two_least_favourable_to_jammi": 1.0767249435884871,
+      "bar_ratio_indeterminate": false,
+      "loss_final_ratio_jammi_fused_over_torch_sdpa": null,
+      "loss_final_ratio_note": "same data, cost fixture -- NOT a quality result (see finetune_step.rs's module doc / torch_finetune_step.py's LOSS TRAJECTORY section: different attention-kernel arithmetic and reduction order between the two stacks makes a loss VALUE comparison meaningless even given identical synthetic input ids, unless torch_lora_init == 'jammi'). Printed so a divergence is visible, never gated. loss values carry only bf16's ULP (~0.00195 near 0.30) of real precision -- see BF16_LOSS_ULP_NEAR_0P3.",
+      "verdict": "PASS (ratio 1.077)"
+    },
+    "b8-s512-d0p05": {
+      "legs": {
+        "jammi-eager": {
+          "outcome": "OOM",
+          "metrics": null
+        },
+        "jammi-fused": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.462512231,
+            "triplets_per_s": 17.29683987535456,
+            "loss_first": 0.23632812,
+            "loss_last": 0.0,
+            "vram_delta_bytes": 16695427072.0,
+            "vram_absolute_bytes": null,
+            "dispatch_pairs": [
+              [
+                "ln",
+                1425,
+                0
+              ],
+              [
+                "rope",
+                0,
+                0
+              ],
+              [
+                "softmax",
+                0,
+                0
+              ],
+              [
+                "geglu",
+                700,
+                0
+              ],
+              [
+                "lora_epilogue",
+                0,
+                0
+              ],
+              [
+                "lora_linear",
+                2800,
+                0
+              ],
+              [
+                "attention_block",
+                0,
+                0
+              ],
+              [
+                "adamw",
+                5600,
+                0
+              ],
+              [
+                "attention_block_flash",
+                700,
+                0
+              ]
+            ],
+            "flash_compiled": true,
+            "kernels_disabled_requested": [],
+            "kernels_disabled_fired": []
+          }
+        },
+        "torch-eager": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.6012366320937872,
+            "triplets_per_s": 13.305909142861536,
+            "loss_first": 0.2734375,
+            "loss_last": 0.0,
+            "vram_delta_bytes": 36227593216.0,
+            "vram_absolute_bytes": 37149606912.0
+          }
+        },
+        "torch-sdpa": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.4727827589958906,
+            "triplets_per_s": 16.921090813443843,
+            "loss_first": 0.19140625,
+            "loss_last": 0.0,
+            "vram_delta_bytes": 21550495744.0,
+            "vram_absolute_bytes": 22472509440.0
+          }
+        }
+      },
+      "bar_second_run_legs": {
+        "jammi-fused-2": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.461724013,
+            "triplets_per_s": 17.326367645513816,
+            "loss_first": 0.23632812,
+            "loss_last": 0.0,
+            "vram_delta_bytes": 16594763776.0,
+            "vram_absolute_bytes": null,
+            "dispatch_pairs": [
+              [
+                "ln",
+                1425,
+                0
+              ],
+              [
+                "rope",
+                0,
+                0
+              ],
+              [
+                "softmax",
+                0,
+                0
+              ],
+              [
+                "geglu",
+                700,
+                0
+              ],
+              [
+                "lora_epilogue",
+                0,
+                0
+              ],
+              [
+                "lora_linear",
+                2800,
+                0
+              ],
+              [
+                "attention_block",
+                0,
+                0
+              ],
+              [
+                "adamw",
+                5600,
+                0
+              ],
+              [
+                "attention_block_flash",
+                700,
+                0
+              ]
+            ],
+            "flash_compiled": true,
+            "kernels_disabled_requested": [],
+            "kernels_disabled_fired": []
+          },
+          "provenance": {
+            "torch_attn_requested": null,
+            "torch_attn_implementation": null,
+            "jammi_dispatch_counters": {
+              "ln_fused_dispatches": 1425,
+              "ln_eager_dispatches": 0,
+              "rope_fused_dispatches": 0,
+              "rope_eager_dispatches": 0,
+              "softmax_fused_dispatches": 0,
+              "softmax_eager_dispatches": 0,
+              "geglu_fused_dispatches": 700,
+              "geglu_eager_dispatches": 0,
+              "lora_epilogue_fused_dispatches": 0,
+              "lora_epilogue_eager_dispatches": 0,
+              "lora_linear_fused_dispatches": 2800,
+              "lora_linear_eager_dispatches": 0,
+              "attention_block_fused_dispatches": 0,
+              "attention_block_eager_dispatches": 0,
+              "adamw_fused_dispatches": 5600,
+              "adamw_eager_dispatches": 0,
+              "attention_block_flash_fused_dispatches": 700,
+              "attention_block_flash_declined_dispatches": 0
+            },
+            "jammi_kernels_disabled_requested": [],
+            "jammi_kernels_disabled_fired": [],
+            "jammi_flash_compiled": true,
+            "jammi_clip_invocations": 0,
+            "torch_clip_invocations": null
+          }
+        },
+        "torch-sdpa-2": {
+          "outcome": "OK",
+          "metrics": {
+            "s_per_step_p50": 0.4778011692687869,
+            "triplets_per_s": 16.743366309134338,
+            "loss_first": 0.294921875,
+            "loss_last": 0.0303955078125,
+            "vram_delta_bytes": 21550495744.0,
+            "vram_absolute_bytes": 22472509440.0
+          },
+          "provenance": {
+            "torch_attn_requested": "sdpa",
+            "torch_attn_implementation": "sdpa",
+            "jammi_dispatch_counters": null,
+            "jammi_kernels_disabled_requested": null,
+            "jammi_kernels_disabled_fired": null,
+            "jammi_flash_compiled": null,
+            "jammi_clip_invocations": null,
+            "torch_clip_invocations": 0
+          }
+        }
+      },
+      "jammi_fused_dispatch_proof": true,
+      "jammi_fused_dispatch_proof_second_run": true,
+      "leg_premise_violations": [],
+      "leg_premise_checked_legs": {
+        "jammi": "jammi-fused",
+        "torch": "torch-sdpa"
+      },
+      "leg_premise_not_comparable": null,
+      "leg_premise_violations_second_run": [],
+      "leg_premise_checked_legs_second_run": {
+        "jammi": "jammi-fused-2",
+        "torch": "torch-sdpa-2"
+      },
+      "leg_premise_violations_cross_run": null,
+      "two_run_missing_leg_reason": null,
+      "provenance": {
+        "jammi": {
+          "torch_attn_requested": null,
+          "torch_attn_implementation": null,
+          "jammi_dispatch_counters": {
+            "ln_fused_dispatches": 1425,
+            "ln_eager_dispatches": 0,
+            "rope_fused_dispatches": 0,
+            "rope_eager_dispatches": 0,
+            "softmax_fused_dispatches": 0,
+            "softmax_eager_dispatches": 0,
+            "geglu_fused_dispatches": 700,
+            "geglu_eager_dispatches": 0,
+            "lora_epilogue_fused_dispatches": 0,
+            "lora_epilogue_eager_dispatches": 0,
+            "lora_linear_fused_dispatches": 2800,
+            "lora_linear_eager_dispatches": 0,
+            "attention_block_fused_dispatches": 0,
+            "attention_block_eager_dispatches": 0,
+            "adamw_fused_dispatches": 5600,
+            "adamw_eager_dispatches": 0,
+            "attention_block_flash_fused_dispatches": 700,
+            "attention_block_flash_declined_dispatches": 0
+          },
+          "jammi_kernels_disabled_requested": [],
+          "jammi_kernels_disabled_fired": [],
+          "jammi_flash_compiled": true,
+          "jammi_clip_invocations": 0,
+          "torch_clip_invocations": null
+        },
+        "torch": {
+          "torch_attn_requested": "sdpa",
+          "torch_attn_implementation": "sdpa",
+          "jammi_dispatch_counters": null,
+          "jammi_kernels_disabled_requested": null,
+          "jammi_kernels_disabled_fired": null,
+          "jammi_flash_compiled": null,
+          "jammi_clip_invocations": null,
+          "torch_clip_invocations": 0
+        }
+      },
+      "ratio_jammi_fused_over_torch_sdpa": 1.0222059597725333,
+      "bar_pair_ratios": {
+        "pair1_jammi_fused_over_torch_sdpa": 1.0222059597725333,
+        "pair2_jammi_fused_2_over_torch_sdpa_2": 1.0348198400259225
+      },
+      "bar_ratio_min_of_two_least_favourable_to_jammi": 1.0222059597725333,
+      "bar_ratio_indeterminate": false,
+      "loss_final_ratio_jammi_fused_over_torch_sdpa": null,
+      "loss_final_ratio_note": "same data, cost fixture -- NOT a quality result (see finetune_step.rs's module doc / torch_finetune_step.py's LOSS TRAJECTORY section: different attention-kernel arithmetic and reduction order between the two stacks makes a loss VALUE comparison meaningless even given identical synthetic input ids, unless torch_lora_init == 'jammi'). Printed so a divergence is visible, never gated. loss values carry only bf16's ULP (~0.00195 near 0.30) of real precision -- see BF16_LOSS_ULP_NEAR_0P3.",
+      "verdict": "PASS (ratio 1.022)"
+    }
+  }
+}

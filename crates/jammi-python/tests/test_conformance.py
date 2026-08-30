@@ -703,6 +703,52 @@ def test_bad_format_add_source_raises_invalid_argument_on_both_backends(tmp_path
         embed.add_source("s", url="/tmp/x.parquet", format="bogus")
 
 
+def test_jsonl_and_ndjson_add_source_are_accepted_on_both_backends(tmp_path):
+    """Cross-surface parity for #346: `"jsonl"`/`"ndjson"` must be accepted on
+    BOTH transports, not just one.
+
+    The embedded arm calls the engine's `FileFormat::from_str` directly
+    (`jammi.EmbeddedBackend.add_source` → `_native.add_source`), unmediated by
+    any Python dict — so a REAL 2-row jsonl fixture registers end-to-end here,
+    proving the whole embedded path, not just that no exception was raised.
+
+    The remote arm instead resolves `format=` through the hand-maintained
+    `jammi._assembly._FILE_FORMAT` dict BEFORE any channel I/O runs — a dict
+    that drifted out of sync with the engine's vocabulary is exactly how the
+    reported symptom reproduced (jsonl worked embedded, failed remote). `_call`
+    is mocked so the remote assertion is on the client-side validation seam
+    alone (hermetic, no server), and the mocked request is inspected to confirm
+    both spellings land on the SAME wire value, `FILE_FORMAT_JSONL`."""
+    from unittest.mock import patch
+
+    from jammi._generated.jammi.v1 import catalog_pb2
+
+    remote = jammi.connect("grpc://127.0.0.1:8081")
+    try:
+        for token in ("jsonl", "ndjson"):
+            with patch.object(remote, "_call", return_value=None) as mock_call:
+                remote.add_source("s", url="/tmp/x.jsonl", format=token)
+            sent_request = mock_call.call_args[0][1]
+            assert (
+                sent_request.connection.format
+                == catalog_pb2.FileFormat.FILE_FORMAT_JSONL
+            )
+    finally:
+        remote.close()
+
+    fixture = tmp_path / "events.jsonl"
+    fixture.write_text('{"id": 1}\n{"id": 2}\n')
+    embed = jammi.connect(f"file://{tmp_path}")
+    for i, token in enumerate(("jsonl", "ndjson")):
+        source_id = f"events_{i}"
+        embed.add_source(source_id, url=f"file://{fixture}", format=token)
+        table = embed.sql(f"SELECT id FROM {source_id}.public.events")
+        assert table.num_rows == 2, (
+            f"format={token!r} must register the fixture's 2 rows, not just "
+            "not raise"
+        )
+
+
 def test_failed_training_wait_raises_training_error_on_both_raise_sites():
     """Tier B (converter-level) — a failed training `wait()` maps to ONE class,
     `jammi.errors.TrainingError`, on both transports.

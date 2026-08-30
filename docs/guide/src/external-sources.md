@@ -87,7 +87,7 @@ These are enabled by default in published crates and pre-built binaries.
 
 | Type | Description | Status |
 |------|-------------|--------|
-| File (`file://`) | Parquet, CSV, JSON on local disk | Always available |
+| File (`file://`) | Parquet, CSV, JSON, JSONL on local disk | Always available |
 | File (`s3://` / `gs://` / `azure://`) | Same formats over cloud object stores | Feature-gated — see [Cloud Storage](./cloud-storage.md) |
 | PostgreSQL | Any PostgreSQL-compatible database | Available |
 | MySQL | MySQL / MariaDB | Available |

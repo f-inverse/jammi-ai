@@ -234,6 +234,7 @@ enum FileFormat {
   FILE_FORMAT_CSV = 2;
   FILE_FORMAT_JSON = 3;
   FILE_FORMAT_AVRO = 4;
+  FILE_FORMAT_JSONL = 5;
 }
 
 // Connection parameters for a source. Maps onto the engine's

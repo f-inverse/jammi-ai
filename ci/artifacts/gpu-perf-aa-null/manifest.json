@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "_comment": "Machine-readable primary|aux classification for every report in this directory -- the README's own 'Per-run table'/'Disclosure' classification, mirrored here so ci/scripts/check_aa_null_band.py can re-derive PRE_REGISTERED_ADVISORY_BAND mechanically instead of a human trusting the prose. Never edit a role/reason here without updating README.md's own Per-run table + Disclosure sections identically -- the two must always agree (check_aa_null_band.py checks the manifest only; a human diff review is what keeps README.md in sync).",
+  "runs": [
+    {
+      "file": "2026-08-30-sxm4-r1.json",
+      "role": "primary",
+      "reason": "Clean single-invocation run, no contention evidence, no anomaly."
+    },
+    {
+      "file": "2026-08-30-sxm4-r2.json",
+      "role": "primary",
+      "reason": "Clean single-invocation run, no contention evidence, no anomaly."
+    },
+    {
+      "file": "2026-08-30-pcie-p3.json",
+      "role": "primary",
+      "reason": "Clean single-invocation run, no contention evidence, no anomaly."
+    },
+    {
+      "file": "2026-08-30-pcie-p1.json",
+      "role": "aux",
+      "reason": "GPU contention: ran concurrently with pcie-p2 on the same rented PCIe pod (ezidhyckicgzpv) -- leg-start deltas ~0.5-1.5s throughout, overlapping windows (README.md's own Disclosure section). Report content itself is clean (identity/order checks pass); excluded solely for contention, not a producer defect."
+    },
+    {
+      "file": "2026-08-30-pcie-p2.json",
+      "role": "aux",
+      "reason": "GPU contention (concurrent with pcie-p1, same pod, see README.md's own Disclosure section) AND a separately-observed anomalous driver return code outside the producer's own recorded evidence. Report content itself is genuine (mode/recorded_order both verify clean)."
+    }
+  ]
+}

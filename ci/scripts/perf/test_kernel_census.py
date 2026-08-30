@@ -10,9 +10,12 @@ no network, no GPU, no `nsys` binary required.
 Covers: the happy-path (M-N)-step differencing arithmetic (launches/step,
 us/step, memcpy/memset/step); the missing-kernel-table refusal (leg
 INVALID, no report written); the M<=N usage refusal; the negative-delta
-"not a comparable pair" refusal; and the v4 additions (`wall_s_per_step`
+"not a comparable pair" refusal; the v4 additions (`wall_s_per_step`
 when `--wall-a`/`--wall-b` given, `excluded_from_chain_attribution`
-stamping).
+stamping); and the phase-4 audit's CLASS 4 census domain guards: a
+PRESENT-but-EMPTY kernel table, a corrupt/unreadable sqlite export, an
+invalid wall pair (`wall_b > wall_a > 0` violated), and a declared-vs-
+measured steps mismatch.
 
 Run: `python3 ci/scripts/perf/test_kernel_census.py`
 """
@@ -180,6 +183,113 @@ class CensusRefusalTests(unittest.TestCase):
             self.assertEqual(report["steps_diff"], 1)
 
 
+class CensusClass4GuardTests(unittest.TestCase):
+    """Phase-4 adversarial audit, CLASS 4: census domain guards that
+    `CensusRefusalTests` above did not yet cover."""
+
+    def test_present_but_empty_kernel_table_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            _make_sqlite(a, [])  # table created, zero rows -- NOT with_kernel_table=False.
+            _make_sqlite(b, _k1(1))
+            with self.assertRaises(kernel_census.KernelTableEmptyError):
+                kernel_census.build_report(a, b, steps_a=1, steps_b=2)
+
+    def test_present_but_empty_kernel_table_on_b_also_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            _make_sqlite(a, _k1(1))
+            _make_sqlite(b, [])
+            with self.assertRaises(kernel_census.KernelTableEmptyError):
+                kernel_census.build_report(a, b, steps_a=1, steps_b=2)
+
+    def test_corrupt_database_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            # Non-empty but NOT a sqlite file at all -- sqlite3 raises
+            # DatabaseError("file is not a database") the first time a real
+            # query runs against it (unlike a genuinely empty/0-byte file,
+            # which sqlite3 treats as a valid, table-less database).
+            with open(a, "wb") as f:
+                f.write(b"this is not a sqlite database, just garbage bytes\x00\x01\x02")
+            _make_sqlite(b, _k1(1))
+            with self.assertRaises(kernel_census.CensusDatabaseError):
+                kernel_census.build_report(a, b, steps_a=1, steps_b=2)
+
+    def test_wall_pair_zero_or_negative_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            _make_sqlite(a, _k1(1))
+            _make_sqlite(b, _k1(2))
+            with self.assertRaises(kernel_census.WallPairInvalidError):
+                kernel_census.build_report(a, b, steps_a=1, steps_b=2, wall_a=0.0, wall_b=1.0)
+            with self.assertRaises(kernel_census.WallPairInvalidError):
+                kernel_census.build_report(a, b, steps_a=1, steps_b=2, wall_a=-1.0, wall_b=1.0)
+
+    def test_wall_pair_inverted_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            _make_sqlite(a, _k1(1))
+            _make_sqlite(b, _k1(2))
+            with self.assertRaises(kernel_census.WallPairInvalidError):
+                kernel_census.build_report(a, b, steps_a=1, steps_b=2, wall_a=5.0, wall_b=5.0)
+            with self.assertRaises(kernel_census.WallPairInvalidError):
+                kernel_census.build_report(a, b, steps_a=1, steps_b=2, wall_a=5.0, wall_b=4.0)
+
+    def test_wall_pair_valid_is_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            _make_sqlite(a, _k1(1))
+            _make_sqlite(b, _k1(2))
+            report = kernel_census.build_report(
+                a, b, steps_a=1, steps_b=2, wall_a=1.0, wall_b=2.0
+            )
+            self.assertAlmostEqual(report["wall_s_per_step"], 1.0)
+
+    def test_steps_measured_mismatch_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            _make_sqlite(a, _k1(1))
+            _make_sqlite(b, _k1(2))
+            with self.assertRaises(kernel_census.StepsMismatchError):
+                kernel_census.build_report(
+                    a, b, steps_a=100, steps_b=600, steps_measured_a=97, steps_measured_b=600
+                )
+            with self.assertRaises(kernel_census.StepsMismatchError):
+                kernel_census.build_report(
+                    a, b, steps_a=100, steps_b=600, steps_measured_a=100, steps_measured_b=599
+                )
+
+    def test_steps_measured_matching_is_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            _make_sqlite(a, _k1(1))
+            _make_sqlite(b, _k1(2))
+            report = kernel_census.build_report(
+                a, b, steps_a=1, steps_b=2, steps_measured_a=1, steps_measured_b=2
+            )
+            self.assertEqual(report["steps_diff"], 1)
+
+    def test_steps_measured_omitted_is_not_checked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            _make_sqlite(a, _k1(1))
+            _make_sqlite(b, _k1(2))
+            # No --steps-measured-a/-b at all -- a build predating that
+            # field (or a caller who cannot supply it) is not refused.
+            report = kernel_census.build_report(a, b, steps_a=1, steps_b=2)
+            self.assertEqual(report["steps_diff"], 1)
+
+
 class MainCliTests(unittest.TestCase):
     def test_main_writes_report_and_returns_zero(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -223,6 +333,53 @@ class MainCliTests(unittest.TestCase):
             _make_sqlite(b, _k1(2))
             rc = kernel_census.main([a, b, "1", "2", out, "--wall-a", "1.0"])
             self.assertEqual(rc, 2)
+
+    def test_main_steps_mismatch_exit_5_no_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            out = os.path.join(tmp, "out.json")
+            _make_sqlite(a, _k1(1))
+            _make_sqlite(b, _k1(2))
+            rc = kernel_census.main(
+                [a, b, "100", "600", out, "--steps-measured-a", "97", "--steps-measured-b", "600"]
+            )
+            self.assertEqual(rc, 5)
+            self.assertFalse(os.path.exists(out))
+
+    def test_main_empty_kernel_table_exit_6_no_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            out = os.path.join(tmp, "out.json")
+            _make_sqlite(a, [])
+            _make_sqlite(b, _k1(1))
+            rc = kernel_census.main([a, b, "1", "2", out])
+            self.assertEqual(rc, 6)
+            self.assertFalse(os.path.exists(out))
+
+    def test_main_wall_pair_invalid_exit_7_no_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            out = os.path.join(tmp, "out.json")
+            _make_sqlite(a, _k1(1))
+            _make_sqlite(b, _k1(2))
+            rc = kernel_census.main([a, b, "1", "2", out, "--wall-a", "5.0", "--wall-b", "5.0"])
+            self.assertEqual(rc, 7)
+            self.assertFalse(os.path.exists(out))
+
+    def test_main_corrupt_database_exit_8_no_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            out = os.path.join(tmp, "out.json")
+            with open(a, "wb") as f:
+                f.write(b"garbage, not a sqlite file")
+            _make_sqlite(b, _k1(1))
+            rc = kernel_census.main([a, b, "1", "2", out])
+            self.assertEqual(rc, 8)
+            self.assertFalse(os.path.exists(out))
 
 
 if __name__ == "__main__":

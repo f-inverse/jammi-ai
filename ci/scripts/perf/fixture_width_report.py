@@ -41,6 +41,19 @@ tool never needs to replicate a specific batch order/shuffle to certify
 the claim; it only needs `k` (a property of the row set) and the batch
 size actually used (`--batch-size`).
 
+THE REMAINDER BATCH: a real corpus is rarely an exact multiple of
+`--batch-size` -- E1's own 1372 train pairs at batch 32 leave a remainder
+of `1372 % 32 = 28` (one LAST batch of only 28 rows, every other batch
+full-size at 32). The pigeonhole argument above is PARAMETERIZED BY THE
+BATCH'S OWN SIZE `r`, so a remainder batch of size `28 < 32` needs its
+OWN, stricter threshold check (`28 >= k+1`), independent of whether the
+full-size (32-row) batches clear theirs. This tool therefore never emits
+an unconditional "width uniform at W" when a nonzero remainder exists and
+`k` clears the full-batch threshold but not the remainder's: the verdict
+is QUALIFIED in that case ("uniform for full-size batches; the remainder
+batch is not provable"), reported alongside `remainder_batch_size` so a
+reader can see exactly which batch is exempted.
+
 Uses the `tokenizers` package; if it is not importable, this refuses
 LOUDLY (exit nonzero) and never writes a report -- a width claim silently
 computed some other (unstated, unverified) way would be worse than no
@@ -106,18 +119,48 @@ def derive_claim(reaches_cap: list[bool], batch_size: int) -> dict:
     """Pure function over the per-row `reaches_cap` booleans (see module
     doc's pigeonhole argument) -- takes no tokenizer/file dependency, so
     the verdict logic itself is testable on a synthetic length table
-    without `tokenizers` installed."""
+    without `tokenizers` installed.
+
+    Accounts for the REMAINDER BATCH (module doc): when `n_rows` is not an
+    exact multiple of `batch_size`, the last batch is smaller than every
+    other one and needs its OWN threshold check, independent of the
+    full-size batches' -- never an unconditional "uniform" verdict that
+    silently ignores it.
+    """
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
     n = len(reaches_cap)
     k = sum(1 for r in reaches_cap if not r)
     r_threshold = k + 1
-    verdict = "width uniform at W" if batch_size >= r_threshold else "not provable"
+    remainder = n % batch_size
+
+    full_batches_uniform = batch_size >= r_threshold
+    if not full_batches_uniform:
+        # Even the common, full-size batch shape is not provable -- the
+        # remainder (if any) cannot rescue this; nothing is provable.
+        verdict = "not provable"
+    elif remainder == 0:
+        # Every batch is full-size; the full-batch check alone decides.
+        verdict = "width uniform at W"
+    elif remainder >= r_threshold:
+        # The remainder batch clears its OWN (stricter, since
+        # remainder < batch_size) threshold too -- every batch, full-size
+        # or remainder, is uniform.
+        verdict = "width uniform at W"
+    else:
+        # Full-size batches are uniform; the one remainder batch, being
+        # smaller, is not -- a QUALIFIED verdict, never unconditional.
+        verdict = (
+            f"width uniform at W for full-size ({batch_size}-row) batches; "
+            f"the remainder batch ({remainder} rows) is not provable"
+        )
+
     return {
         "n_rows": n,
         "k_short_rows": k,
         "r_threshold": r_threshold,
         "batch_size": batch_size,
+        "remainder_batch_size": remainder,
         "verdict": verdict,
     }
 
@@ -190,7 +233,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"fixture_width_report: n_rows={claim['n_rows']} k_short_rows={claim['k_short_rows']} "
         f"r_threshold={claim['r_threshold']} batch_size={claim['batch_size']} "
-        f"verdict='{claim['verdict']}'"
+        f"remainder_batch_size={claim['remainder_batch_size']} verdict='{claim['verdict']}'"
     )
     return 0
 

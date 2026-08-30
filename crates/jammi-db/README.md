@@ -2,7 +2,7 @@
 
 Vector database, SQL federation, mutable companion tables, and trigger broker for [Jammi AI](https://github.com/f-inverse/jammi-ai).
 
-`jammi-db` provides the foundation for Jammi: SQL queries via DataFusion, source registration (Parquet, CSV, JSON, PostgreSQL, MySQL), Parquet storage with sidecar ANN indexes, mutable companion tables with crash-safe WAL, trigger broker for provenance channels, and configuration management.
+`jammi-db` provides the foundation for Jammi: SQL queries via DataFusion, source registration (Parquet, CSV, JSON, JSONL, PostgreSQL, MySQL), Parquet storage with sidecar ANN indexes, mutable companion tables with crash-safe WAL, trigger broker for provenance channels, and configuration management.
 
 ## Usage
 

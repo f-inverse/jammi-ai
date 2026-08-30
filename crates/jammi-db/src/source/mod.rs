@@ -21,7 +21,7 @@ use crate::storage::{CloudConfig, StorageUrl};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceType {
-    /// File-shaped source (Parquet / CSV / JSON) read through any
+    /// File-shaped source (Parquet / CSV / JSON / JSONL) read through any
     /// `StorageUrl`-addressable backend — local disk, S3, GCS, Azure.
     File,
     /// PostgreSQL database.
@@ -40,6 +40,30 @@ pub enum FileFormat {
     Csv,
     /// Newline-delimited JSON.
     Json,
+    /// Newline-delimited JSON, spelled `jsonl`/`ndjson`. Functionally
+    /// identical to [`Self::Json`] (both use DataFusion's line-delimited
+    /// `JsonFormat`); the distinct variant exists so a `.jsonl` corpus is
+    /// neither rejected as an unknown format nor silently excluded by the
+    /// `.json` directory glob.
+    ///
+    /// Directory listing tries `.jsonl` first; only when that has zero
+    /// matches does it fall back to `.ndjson` (see
+    /// [`crate::source::file_format::create_listing_table`]) — `.jsonl`
+    /// always wins when a directory holds both. This is the only reachable
+    /// path onto an `.ndjson` corpus: no wire or CLI surface names `.ndjson`
+    /// directly. For a source registered through
+    /// [`crate::session::JammiSession::add_source`], this resolution runs
+    /// exactly ONCE, at registration, and is then PINNED into the persisted
+    /// [`SourceConnection::file_extension`] — every later `reload_sources`
+    /// replay of THAT source passes the pinned value as an explicit
+    /// override, so a directory change after registration (a `.jsonl` file
+    /// added to a corpus that resolved to `.ndjson`, or vice versa) can
+    /// never silently flip which files a reload serves. `reload_sources`
+    /// itself never backfills the pin, so a catalog row written some other
+    /// way carries no such guarantee. An explicit `file_extension` override
+    /// supplied by the caller up front disables the fallback from the start
+    /// and is honoured literally.
+    JsonLines,
     /// Apache Avro binary format.
     Avro,
 }
@@ -50,6 +74,7 @@ impl std::fmt::Display for FileFormat {
             Self::Parquet => write!(f, "parquet"),
             Self::Csv => write!(f, "csv"),
             Self::Json => write!(f, "json"),
+            Self::JsonLines => write!(f, "jsonl"),
             Self::Avro => write!(f, "avro"),
         }
     }
@@ -62,9 +87,10 @@ impl std::str::FromStr for FileFormat {
             "parquet" => Ok(Self::Parquet),
             "csv" => Ok(Self::Csv),
             "json" => Ok(Self::Json),
+            "jsonl" | "ndjson" => Ok(Self::JsonLines),
             "avro" => Ok(Self::Avro),
             other => Err(crate::error::JammiError::Other(format!(
-                "Unknown file format '{other}'. Expected: parquet, csv, json, avro"
+                "Unknown file format '{other}'. Expected: parquet, csv, json, jsonl, avro"
             ))),
         }
     }
@@ -83,6 +109,12 @@ pub struct SourceConnection {
     pub format: Option<FileFormat>,
 
     /// Override the default file extension used during directory listing.
+    /// `None` on a fresh [`FileFormat::JsonLines`] registration (no caller
+    /// override) lets the engine adaptively choose `.jsonl` or `.ndjson`
+    /// once at registration; the engine writes the winner back here before
+    /// persisting, so every subsequent `reload_sources` replay sees an
+    /// explicit override and skips the adaptive resolution entirely — same
+    /// persist-once-replay-forever contract [`Self::tenant_column`] has.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_extension: Option<String>,
 
@@ -144,4 +176,51 @@ impl SourceConnection {
 pub(crate) fn table_name_from_url(url: &str) -> String {
     let path = url.rsplit(['/', '\\']).next().unwrap_or(url);
     path.split('.').next().unwrap_or(path).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn file_format_round_trips_through_display_and_from_str() {
+        for format in [
+            FileFormat::Parquet,
+            FileFormat::Csv,
+            FileFormat::Json,
+            FileFormat::JsonLines,
+            FileFormat::Avro,
+        ] {
+            let rendered = format.to_string();
+            let parsed = FileFormat::from_str(&rendered).expect("canonical format parses");
+            assert_eq!(parsed, format, "round-trip must be identity for {format:?}");
+        }
+        assert_eq!(FileFormat::JsonLines.to_string(), "jsonl");
+    }
+
+    #[test]
+    fn jsonl_and_ndjson_both_parse_to_json_lines() {
+        assert_eq!(
+            FileFormat::from_str("jsonl").unwrap(),
+            FileFormat::JsonLines
+        );
+        assert_eq!(
+            FileFormat::from_str("ndjson").unwrap(),
+            FileFormat::JsonLines
+        );
+    }
+
+    #[test]
+    fn unknown_file_format_error_names_every_accepted_token() {
+        let err = FileFormat::from_str("bogus").unwrap_err().to_string();
+        assert!(
+            err.contains("jsonl"),
+            "error must name jsonl as an accepted format: {err}"
+        );
+        assert!(err.contains("parquet"));
+        assert!(err.contains("csv"));
+        assert!(err.contains("json"));
+        assert!(err.contains("avro"));
+    }
 }

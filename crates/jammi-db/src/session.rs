@@ -23,6 +23,11 @@ use crate::tenant::{TenantContext, TenantId};
 use crate::tenant_scope::{SourceTenantColumns, TenantBinding, TenantScopeAnalyzerRule};
 use crate::trigger::{InMemoryBroker, Publisher, Subscriber, TriggerBroker};
 
+/// A source's DataFusion table providers, keyed by table name — the shape
+/// [`JammiSession::register_source_tables`] builds per source type and
+/// registers into that source's schema.
+type SourceTables = Vec<(String, Arc<dyn datafusion::catalog::TableProvider>)>;
+
 /// Primary entry point for the Jammi query engine.
 ///
 /// Wraps a DataFusion `SessionContext` with source registration,
@@ -464,7 +469,7 @@ impl JammiSession {
         &self,
         source_id: &str,
         source_type: SourceType,
-        connection: SourceConnection,
+        mut connection: SourceConnection,
     ) -> Result<()> {
         // Check for duplicate registration.
         if self.catalog.get_source(source_id).await?.is_some() {
@@ -475,8 +480,25 @@ impl JammiSession {
         }
 
         // Register tables in DataFusion.
-        self.register_source_tables(source_id, &source_type, &connection)
+        let resolved_extension = self
+            .register_source_tables(source_id, &source_type, &connection)
             .await?;
+
+        // Registration is the ONLY adaptive moment for a `FileFormat::JsonLines`
+        // source with no explicit `file_extension` override: pin whichever
+        // extension (`.jsonl` or `.ndjson`) actually won here into the
+        // connection BEFORE it is persisted below, mirroring how
+        // `tenant_column` is persisted so `reload_sources` replays it rather
+        // than re-deriving it. Without this pin, a directory change between
+        // registration and a later reload (e.g. a `.jsonl` file added to a
+        // corpus that resolved to `.ndjson` at registration) would silently
+        // flip which files — and therefore which rows — the source serves.
+        // Every reload from here on passes this explicit override and takes
+        // `create_listing_table`'s non-adaptive branch: resolved once,
+        // pinned forever.
+        if let Some(resolved) = resolved_extension {
+            connection.file_extension = Some(resolved);
+        }
 
         // Register the tenant discriminator live so the analyzer scopes this
         // source for the rest of this session, mirroring the value persisted in
@@ -493,13 +515,23 @@ impl JammiSession {
     }
 
     /// Create DataFusion table providers for a source and register them.
+    ///
+    /// Returns `Some(resolved_extension)` when [`file_format::create_listing_table`]
+    /// adaptively resolved a `FileFormat::JsonLines` source's directory-listing
+    /// extension (no explicit `file_extension` override was given) — `None`
+    /// for every other source shape, and for a `JsonLines` source whose
+    /// override was already explicit. [`Self::add_source`] persists a
+    /// `Some` value into the `SourceConnection` it writes to the catalog so
+    /// every future call — in particular a [`Self::reload_sources`] replay —
+    /// passes an explicit override and never re-runs the adaptive resolution
+    /// against (possibly changed) directory contents.
     async fn register_source_tables(
         &self,
         source_id: &str,
         source_type: &SourceType,
         connection: &SourceConnection,
-    ) -> Result<()> {
-        let tables: Vec<(String, Arc<dyn datafusion::catalog::TableProvider>)> = match source_type {
+    ) -> Result<Option<String>> {
+        let (tables, resolved_extension): (SourceTables, Option<String>) = match source_type {
             SourceType::File => {
                 let format = connection
                     .format
@@ -511,7 +543,7 @@ impl JammiSession {
                     .ok_or_else(|| JammiError::Config("File source requires a URL".into()))?;
                 let url = StorageUrl::parse(raw_url)?;
                 let state = self.ctx.state();
-                let table = file_format::create_listing_table(
+                let (table, resolved) = file_format::create_listing_table(
                     &self.ctx,
                     &self.storage_registry,
                     &url,
@@ -522,12 +554,13 @@ impl JammiSession {
                 )
                 .await?;
                 let name = table_name_from_url(url.as_str());
-                vec![(name, table)]
+                (vec![(name, table)], resolved)
             }
             #[cfg(feature = "postgres")]
-            SourceType::Postgres => {
-                crate::source::postgres::create_postgres_tables(source_id, connection).await?
-            }
+            SourceType::Postgres => (
+                crate::source::postgres::create_postgres_tables(source_id, connection).await?,
+                None,
+            ),
             #[cfg(not(feature = "postgres"))]
             SourceType::Postgres => {
                 return Err(JammiError::Config(
@@ -535,9 +568,10 @@ impl JammiSession {
                 ));
             }
             #[cfg(feature = "mysql")]
-            SourceType::Mysql => {
-                crate::source::mysql::create_mysql_tables(source_id, connection).await?
-            }
+            SourceType::Mysql => (
+                crate::source::mysql::create_mysql_tables(source_id, connection).await?,
+                None,
+            ),
             #[cfg(not(feature = "mysql"))]
             SourceType::Mysql => {
                 return Err(JammiError::Config(
@@ -559,7 +593,7 @@ impl JammiSession {
         let source_catalog = Arc::new(SourceCatalog::new(schema_provider));
         self.ctx.register_catalog(source_id, source_catalog);
 
-        Ok(())
+        Ok(resolved_extension)
     }
 
     /// Remove a source and all associated state: catalog entries, result tables,

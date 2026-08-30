@@ -47,6 +47,7 @@ _UNSET = dict(
     regression_loss=None,
     regression_beta=None,
     quantile_levels=None,
+    keep_last_n_checkpoints=None,
 )
 
 
@@ -95,6 +96,22 @@ def test_seed_set_crosses_the_wire() -> None:
     config = _build(seed=12345)
     assert config.HasField("seed")
     assert config.seed == 12345
+
+
+def test_keep_last_n_checkpoints_unset_by_default_lets_engine_default_apply() -> None:
+    """An omitted `keep_last_n_checkpoints` leaves the field UNSET on the wire,
+    so the server keeps every epoch's checkpoint (unit 348, the engine
+    default), never a literal `0` retention window."""
+    config = _build()
+    assert not config.HasField("keep_last_n_checkpoints")
+
+
+def test_keep_last_n_checkpoints_set_crosses_the_wire() -> None:
+    """A caller-supplied `keep_last_n_checkpoints` is sent with explicit
+    presence so the trainer prunes to that rolling window."""
+    config = _build(keep_last_n_checkpoints=2)
+    assert config.HasField("keep_last_n_checkpoints")
+    assert config.keep_last_n_checkpoints == 2
 
 
 def test_no_hard_negative_kwargs_omits_the_message() -> None:

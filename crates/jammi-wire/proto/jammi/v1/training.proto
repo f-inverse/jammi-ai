@@ -39,6 +39,15 @@ service TrainingService {
   // `TrainingJob` handle — the output model id and error are what let a remote
   // `wait()` retrieve the result and a failure reason.
   rpc TrainingStatus(TrainingStatusRequest) returns (TrainingStatusResponse);
+
+  // List training jobs visible to the session tenant, most recent first. Each
+  // row is the same lifecycle projection `TrainingStatus` reads (status,
+  // output model id, failure error) plus the submit-time identity (kind, base
+  // model, creation time) — a listing of `TrainingStatus` answers, not a
+  // progress surface. There is still no progress stream and no mid-run
+  // metric: the engine persists run metrics only at job finalization, so this
+  // verb exposes none.
+  rpc ListTrainingJobs(ListTrainingJobsRequest) returns (ListTrainingJobsResponse);
 }
 
 // Fine-tuning method. Mirrors the engine's `FineTuneMethod`; LoRA is the only
@@ -218,6 +227,17 @@ message FineTuneConfig {
   // (seed, rows, config) yields byte-identical adapters. Unset = the engine
   // default fixed seed (never entropy, so an unset job is still reproducible).
   optional uint64 seed = 29;
+  // Enable per-epoch adapter checkpointing and cap how many the trainer
+  // retains (unit 348). Unset = DISABLED (the engine default) — zero
+  // checkpoint bytes written, zero catalog rows registered, byte-for-byte
+  // the same behavior every caller had before this field existed. `n >= 1`
+  // enables it and retains the last `n` (`n >= epochs` retains every
+  // epoch — there is no separate "keep all" sentinel). `0` is refused by
+  // the engine's `FineTuneConfig::validate` — ambiguous; omit the field to
+  // disable, or set >= 1 to enable. A deployment/storage knob only: it
+  // never affects the final/best artifact, which publishes unconditionally
+  // either way.
+  optional uint32 keep_last_n_checkpoints = 30;
 }
 
 // Edge provenance for a graph fine-tune. Mirrors the engine's `EdgeProvenance`
@@ -414,4 +434,33 @@ message TrainingStatusResponse {
   string model_id = 2;
   // The failure message when `status` is "failed"; empty otherwise.
   string error = 3;
+}
+
+message ListTrainingJobsRequest {}
+
+message ListTrainingJobsResponse {
+  // Jobs visible to the session tenant, most recent first.
+  repeated TrainingJobSummary jobs = 1;
+}
+
+// One training job's lifecycle summary: the `TrainingStatus` projection plus
+// the submit-time identity fields a listing needs to tell jobs apart. No
+// mid-run progress fields exist to carry (see the service comment).
+message TrainingJobSummary {
+  // Server-assigned job id — the `TrainingStatus` key.
+  string job_id = 1;
+  // Training-job kind: "fine_tune", "graph_fine_tune", or "context_predictor".
+  string kind = 2;
+  // Current lifecycle status: "queued", "running", "completed", or "failed".
+  string status = 3;
+  // The base model the job trains from — the catalog's registered model id (a
+  // resolved, versioned id, not necessarily the submit-time reference string).
+  string base_model_id = 4;
+  // The output model id the trained artifact registers under; empty until the
+  // job completes.
+  string output_model_id = 5;
+  // Job creation time, as recorded by the catalog (UTC text timestamp).
+  string created_at = 6;
+  // The failure message when `status` is "failed"; empty otherwise.
+  string error = 7;
 }

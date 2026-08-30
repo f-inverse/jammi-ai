@@ -22,7 +22,7 @@ pub enum SourceAction {
         /// Storage URL or local path
         #[arg(long)]
         url: String,
-        /// File format (parquet, csv, json)
+        /// File format (parquet, csv, json, jsonl)
         #[arg(long)]
         format: String,
     },

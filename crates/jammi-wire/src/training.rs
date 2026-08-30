@@ -134,6 +134,9 @@ impl TryFrom<pb::FineTuneConfig> for FineTuneConfig {
         if let Some(v) = c.seed {
             cfg.seed = v;
         }
+        if let Some(v) = c.keep_last_n_checkpoints {
+            cfg.keep_last_n_checkpoints = Some(v);
+        }
 
         Ok(cfg)
     }
@@ -327,6 +330,7 @@ pub fn config_to_proto(config: &FineTuneConfig) -> pb::FineTuneConfig {
             .map(regression_loss_to_proto),
         quantile_levels: config.quantile_levels.clone(),
         seed: Some(config.seed),
+        keep_last_n_checkpoints: config.keep_last_n_checkpoints,
     }
 }
 
@@ -513,6 +517,36 @@ mod tests {
         assert_eq!(decoded.epochs, defaults.epochs);
         assert_eq!(decoded.batch_size, defaults.batch_size);
         assert_eq!(decoded.lora_dropout, defaults.lora_dropout);
+    }
+
+    /// Unit 348: `keep_last_n_checkpoints` overlays like every other optional
+    /// scalar — absent on the wire keeps the engine default (`None`, keep
+    /// every epoch), present overrides it — and a set value round-trips
+    /// through the send side unchanged.
+    #[test]
+    fn keep_last_n_checkpoints_overlays_and_round_trips() {
+        let proto = pb::FineTuneConfig {
+            keep_last_n_checkpoints: Some(3),
+            ..Default::default()
+        };
+        let decoded = FineTuneConfig::try_from(proto).expect("decodes");
+        assert_eq!(decoded.keep_last_n_checkpoints, Some(3));
+
+        let absent = pb::FineTuneConfig::default();
+        let decoded_absent = FineTuneConfig::try_from(absent).expect("decodes");
+        assert_eq!(
+            decoded_absent.keep_last_n_checkpoints,
+            FineTuneConfig::default().keep_last_n_checkpoints,
+            "an absent field must resolve to the engine default (None)"
+        );
+
+        let cfg = FineTuneConfig {
+            keep_last_n_checkpoints: Some(4),
+            ..FineTuneConfig::default()
+        };
+        let round_tripped =
+            FineTuneConfig::try_from(config_to_proto(&cfg)).expect("round-trip decodes");
+        assert_eq!(round_tripped.keep_last_n_checkpoints, Some(4));
     }
 
     /// The full-config send side round-trips: encoding the engine default and

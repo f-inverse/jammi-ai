@@ -31,7 +31,8 @@ use jammi_server::grpc::proto::training::training_service_client::TrainingServic
 use jammi_server::grpc::proto::training::{
     ContextArchitecture, ContextPredictorSpec, ContextPredictorTrainConfig, EdgeProvenance,
     FineTuneMethod, FineTuneSpec, GaussianObjective, GraphFineTuneSources, GraphFineTuneSpec,
-    GraphSampleConfig, PredictiveHead, StartTrainingRequest, TrainingStatusRequest,
+    GraphSampleConfig, ListTrainingJobsRequest, PredictiveHead, StartTrainingRequest,
+    TrainingStatusRequest,
 };
 use jammi_test_utils::{cookbook_fixture, fixture_url};
 use tonic::transport::Channel;
@@ -221,6 +222,118 @@ async fn training_under_a_tenant_scope_succeeds_over_the_wire() {
         resp.status, "completed",
         "tenant-scoped training should complete, got '{}'",
         resp.status
+    );
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// `ListTrainingJobs` returns the lifecycle projection for every job visible to
+/// the session tenant, and only those: an unscoped session lists unscoped jobs
+/// but never a tenant's, while a tenant-bound session lists its own jobs plus
+/// the unscoped ones — the same visibility predicate `TrainingStatus` reads
+/// with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_training_jobs_is_tenant_scoped_and_carries_the_status_projection() {
+    use jammi_server::grpc::proto::catalog::catalog_service_client::CatalogServiceClient;
+    use jammi_server::grpc::proto::catalog::{SetTenantRequest, Tenant};
+
+    let server = start_engine_server().await;
+
+    // Job 1 — unscoped session.
+    add_training_source(
+        channel(server.addr).await,
+        None::<fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>>,
+    )
+    .await;
+    let mut unscoped = TrainingServiceClient::new(channel(server.addr).await);
+    let unscoped_job = unscoped
+        .start_training(start_request())
+        .await
+        .expect("start_training unscoped")
+        .into_inner();
+    poll_until_terminal(&mut unscoped, &unscoped_job.job_id).await;
+
+    // Job 2 — a session bound to TENANT_A (its own source registration included,
+    // mirroring the tenant-scope test above).
+    let session_iface = with_session("training-list-tenant-a");
+    let mut session_client =
+        CatalogServiceClient::with_interceptor(channel(server.addr).await, session_iface.clone());
+    session_client
+        .set_tenant(SetTenantRequest {
+            tenant: Some(Tenant {
+                id: TENANT_A.into(),
+            }),
+        })
+        .await
+        .expect("set_tenant");
+    // The unscoped "training" source registered above is visible to the tenant
+    // session too (the same `tenant OR unscoped` visibility the job listing
+    // asserts below), so no second registration is needed — registering the
+    // same source id twice on one server is a conflict.
+    let mut scoped =
+        TrainingServiceClient::with_interceptor(channel(server.addr).await, session_iface);
+    let scoped_job = scoped
+        .start_training(start_request())
+        .await
+        .expect("start_training under tenant scope")
+        .into_inner();
+    poll_until_terminal(&mut scoped, &scoped_job.job_id).await;
+
+    // The unscoped listing carries the unscoped job — with the full status
+    // projection — and never the tenant's job.
+    let listed = unscoped
+        .list_training_jobs(ListTrainingJobsRequest {})
+        .await
+        .expect("list_training_jobs unscoped")
+        .into_inner()
+        .jobs;
+    let row = listed
+        .iter()
+        .find(|j| j.job_id == unscoped_job.job_id)
+        .expect("the unscoped listing carries the unscoped job");
+    assert_eq!(row.kind, "fine_tune");
+    assert_eq!(row.status, "completed");
+    // `base_model_id` is the catalog's registered model id — the resolved
+    // fixture path plus a version suffix — not the submit-time `local:` string.
+    assert!(
+        row.base_model_id
+            .starts_with(&cookbook_fixture("tiny_bert").display().to_string()),
+        "base_model_id is the catalog id of the submitted base model, got '{}'",
+        row.base_model_id
+    );
+    assert_eq!(
+        row.output_model_id, unscoped_job.model_id,
+        "a completed row carries the output model id StartTraining returned"
+    );
+    assert!(!row.created_at.is_empty(), "created_at is recorded");
+    assert!(row.error.is_empty(), "a completed row carries no error");
+    assert!(
+        listed.iter().all(|j| j.job_id != scoped_job.job_id),
+        "an unscoped listing must never carry a tenant's job"
+    );
+
+    // The tenant-bound listing carries its own job AND the unscoped one (the
+    // `tenant_id = $tenant OR tenant_id IS NULL` visibility), most recent first.
+    let listed_a = scoped
+        .list_training_jobs(ListTrainingJobsRequest {})
+        .await
+        .expect("list_training_jobs under tenant scope")
+        .into_inner()
+        .jobs;
+    assert!(
+        listed_a.iter().any(|j| j.job_id == scoped_job.job_id),
+        "the tenant listing carries the tenant's own job"
+    );
+    assert!(
+        listed_a.iter().any(|j| j.job_id == unscoped_job.job_id),
+        "the tenant listing carries unscoped jobs too"
+    );
+    assert!(
+        listed_a
+            .windows(2)
+            .all(|w| w[0].created_at >= w[1].created_at),
+        "rows are ordered most recent first (created_at descending)"
     );
 
     let _ = server.shutdown.send(());

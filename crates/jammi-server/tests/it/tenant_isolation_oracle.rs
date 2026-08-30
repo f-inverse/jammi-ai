@@ -1093,6 +1093,18 @@ fn cases() -> Vec<IsolationCase> {
                 assert_training_create_isolated().await;
             }
         ),
+        case!(
+            "TrainingService",
+            "ListTrainingJobs",
+            CaseKind::Hermetic,
+            None,
+            {
+                // ListTrainingJobs reads via the tenant-filtered
+                // `list_training_jobs` (`tenant_id = $t OR tenant_id IS NULL`)
+                // — a peer's listing never carries another tenant's job.
+                assert_training_list_isolated().await;
+            }
+        ),
         // --- Flight SQL (off-descriptor; explicit case) ----------------------
         case!(
             "arrow.flight.FlightService",
@@ -1932,6 +1944,39 @@ async fn assert_training_create_isolated() {
     assert!(
         cat_b.get_training_job("job_a").await.is_err(),
         "CROSS-TENANT READ LEAK: tenant B reads tenant A's training job"
+    );
+}
+
+/// ListTrainingJobs reads the tenant-filtered `list_training_jobs` listing:
+/// tenant A's job appears in A's own listing and never in a peer's.
+async fn assert_training_list_isolated() {
+    let (_dir, cat_a, cat_b, _g) = ab_catalogs().await;
+    cat_a
+        .register_model(register_params("m_a", "candle"))
+        .await
+        .unwrap();
+    let base_pk = cat_a.get_model("m_a").await.unwrap().unwrap().catalog_pk;
+    cat_a
+        .create_training_job(CreateTrainingJobParams {
+            job_id: "job_a",
+            base_model_id: &base_pk,
+            training_source: "src_a",
+            loss_type: "triplet",
+            hyperparams: "{}",
+            kind: "fine_tune",
+            training_spec: "{}",
+        })
+        .await
+        .unwrap();
+    let listed_a = cat_a.list_training_jobs().await.unwrap();
+    assert!(
+        listed_a.iter().any(|r| r.job_id == "job_a"),
+        "tenant A must list its own training job"
+    );
+    let listed_b = cat_b.list_training_jobs().await.unwrap();
+    assert!(
+        listed_b.iter().all(|r| r.job_id != "job_a"),
+        "CROSS-TENANT LIST LEAK: tenant B's listing carries tenant A's training job"
     );
 }
 

@@ -49,7 +49,7 @@ fine-tuning, Flight SQL — see [`cookbook/`](./cookbook/).
 
 ## Features
 
-- **SQL over local files** — query Parquet, CSV, and JSON via DataFusion
+- **SQL over local files** — query Parquet, CSV, JSON, and JSONL via DataFusion
 - **Federated queries** — join local files with PostgreSQL or MySQL
 - **Text embeddings** — load any BERT-family model from Hugging Face Hub (or local safetensors / ONNX) and persist results to Parquet with ANN indexes
 - **Image embeddings** — CLIP-style vision encoders

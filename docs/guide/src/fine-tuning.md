@@ -84,6 +84,10 @@ job.wait()
 print(f"Model: {job.model_id}")
 ```
 
+`base_model` accepts any model reference form, including a local checkpoint
+(`local:/path`, `file:///path`, or a bare filesystem path) — see [Use a Local
+Model Checkpoint](./local-models.md).
+
 ## Custom configuration
 
 ### Rust

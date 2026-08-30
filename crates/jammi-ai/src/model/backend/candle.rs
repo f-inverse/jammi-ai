@@ -3659,8 +3659,32 @@ mod device_tests {
         fn exit(&self, _: &tracing::span::Id) {}
     }
 
+    /// Both `*_without_device_*` tests below assert the NO-USABLE-GPU arm of
+    /// `select_device` (the typed `require_gpu` refusal; the loud CPU
+    /// fallback). On a host where CUDA device 0 is acquirable that arm is
+    /// unreachable — selection correctly serves the GPU — so they skip,
+    /// loudly, mirroring (inverted) the `cuda_device()` skip convention
+    /// elsewhere in this crate. Found by the full `--features cuda` lib run
+    /// on an A100 pod: both tests failed with "expected CPU fallback, got
+    /// Cuda(..)".
+    fn skip_on_cuda_capable_host(test: &str) -> bool {
+        match Device::new_cuda(0) {
+            Ok(_) => {
+                eprintln!(
+                    "{test}: skipping — this host can acquire CUDA device 0, so the \
+                     no-usable-GPU selection arm this test asserts is unreachable here"
+                );
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     #[test]
     fn require_gpu_without_device_fails_fast() {
+        if skip_on_cuda_capable_host("require_gpu_without_device_fails_fast") {
+            return;
+        }
         let config = DeviceConfig {
             gpu_device: 0,
             memory_fraction: 0.9,
@@ -3680,6 +3704,9 @@ mod device_tests {
 
     #[test]
     fn default_without_device_falls_back_to_cpu_with_warning() {
+        if skip_on_cuda_capable_host("default_without_device_falls_back_to_cpu_with_warning") {
+            return;
+        }
         let capture = WarnCapture::default();
         let flag = Arc::clone(&capture.saw_fallback_warning);
 

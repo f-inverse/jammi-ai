@@ -132,3 +132,14 @@ cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn -
 # grep over source, never an execution) — an operator/perf-lane tool, run
 # by hand on a rented, exclusively-reserved pod. ---
 cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn 2>&1 | tail -n 1	fa2_ab.sh's own one-shot flash-attn build (`;`-chained after the worktree checkout) — operator-run, invoked from no workflow; needs the CUDA toolchain + a provisioned CUTLASS submodule.
+
+# --- ci/scripts/perf/gpu_inference_ab.sh -- issue #335 within-run GPU perf
+# A/B producer (unification contract C5.1's `run_cmd` provenance-logging
+# wrapper). Its own gpu-perf-ab.yml (D1) is workflow_dispatch + PR-label
+# only (the same gpu-prove.yml/gpu-howwell.yml off-merge-path shape every
+# other row in this file cites) -- an operator/perf-lane tool, run on a
+# rented pod with two simultaneously-resident clones (parent + PR/aa-null),
+# never invoked from a merge-path workflow. RECORDING-ONLY in v1 (issue
+# #335's own exit criterion forbids enforcement before multi-pod/
+# both-device-model validation) -- see that script's own module doc. ---
+cargo build --release -p jammi-bench --features cuda --manifest-path "$clone/Cargo.toml"	gpu_inference_ab.sh's own per-clone build leg (`build_clone`, `CARGO_TARGET_DIR=\"$target\" run_cmd cargo build ...`) -- operator-run on a rented pod, invoked from no merge-path workflow (gpu-perf-ab.yml is dispatch/label-only); needs the CUDA toolchain. The SAME literal tuple covers BOTH the parent and comparison clone builds (`$clone` is a `build_clone` function parameter, called twice with different arguments -- one literal occurrence in the source).

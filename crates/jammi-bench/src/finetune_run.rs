@@ -598,6 +598,10 @@ fn base_config(params: &FinetuneRunParams, epochs: usize) -> FineTuneConfig {
         }),
         classification_loss: None,
         regression_loss: None,
+        // Cost fixture: per-epoch checkpointing stays off (the #348 default) —
+        // a checkpoint upload inside the timed epoch loop would be a
+        // measurement contaminant, not a feature.
+        keep_last_n_checkpoints: None,
         quantile_levels: Vec::new(),
         gradient_accumulation_steps: params.gradient_accumulation_steps,
         validation_fraction: params.validation_fraction,

@@ -141,7 +141,7 @@ distance from 1.0 (`1 − 0.75`), a different, asymmetric threshold that does
 not describe the slowdown-catching side at all. On a REAL pod, that nominal
 33% figure is itself optimistic: this campaign's own two primary SXM4
 combined ratios (`0.8706549652288303`, `0.8821655548443332`) show the
-binary-level build offset (finding (a) above) already suppresses the observed ratio by roughly 12–13% on that
+binary-level build offset (finding (a) above) already suppresses the observed ratio by ≈12.9% and ≈11.8% respectively on that
 device model, working AGAINST detection of a real slowdown (a slowdown and
 a favorable build offset partially cancel in the observed ratio). To still
 cross the `1.33` upper edge despite that offset, a real slowdown needs to
@@ -158,7 +158,10 @@ band tuning alone.
 THREE PRIMARY runs' six pair ratios (worst pair ratio `0.8315173238022384`
 -> `|log|` `0.18450314616782526`; 1.5x -> `0.27675471925173794`;
 `exp(∓0.27675471925173794)` ≈ `[0.7582404560899295, 1.3188428445994143]`)
-rounded outward via [`derive_advisory_band`]'s own reciprocal-floor rule
+rounded outward via [`derive_advisory_band`]'s own rule (floored lower
+edge; upper edge = the WIDER of the floored reciprocal and the per-edge
+ceiling — see that function's own PROVENANCE note for why, and for the
+disclosure that the rule was formalized after the constant)
 to `[0.75, 1.33]` — mechanically re-derived from the committed evidence and
 its `manifest.json` classification, and checked equal to
 [`PRE_REGISTERED_ADVISORY_BAND`], by `ci/scripts/check_aa_null_band.py`
@@ -211,8 +214,11 @@ env var threaded directly into this module):
         possibility explicitly and demands human adjudication, never
         auto-classifying either way.
     BOTH shapes exit `1` — fail CLOSED on any GREEN-premise ratio outside
-    the null band, regardless of direction; ONLY a ratio strictly inside
-    the band earns `enforce_verdict = "PASS"`, exit `0`. Both refusal
+    the null band, regardless of direction; only a ratio inside the band
+    (INCLUSIVE of both edges — `lo <= ratio <= hi`, exactly what
+    `classify_advisory` computes; a ratio landing exactly ON an edge is
+    within the pre-registered null) earns `enforce_verdict = "PASS"`,
+    exit `0`. Both refusal
     verdicts are deliberately carried on a SEPARATE field (`enforce_verdict`,
     never folded into `status`, which stays `"GREEN"`) from every
     correctness-refusal reason below, so a report reader can always tell
@@ -383,9 +389,7 @@ BAND_DERIVATION_ARTIFACT_PATH = (
 def derive_advisory_band(worst_abs_log_deviation, safety_factor=1.5):
     """Mechanically derive an advisory `(lo, hi)` band from
     `worst_abs_log_deviation` (the largest `|ln(ratio)|` observed over some
-    empirical-null evidence set) — the SAME algorithm
-    [`PRE_REGISTERED_ADVISORY_BAND`] was derived from (see this module's
-    own "ADVISORY classification" doc). Extracted here (never inlined only
+    empirical-null evidence set). Extracted here (never inlined only
     at the one call site that produced the committed constant) so
     `ci/scripts/check_aa_null_band.py` can RE-DERIVE the band from the
     `ci/artifacts/gpu-perf-aa-null/` committed evidence and assert equality
@@ -393,25 +397,53 @@ def derive_advisory_band(worst_abs_log_deviation, safety_factor=1.5):
     "never hand-tunes the two numbers" is ENFORCED via that gate, not
     merely asserted here.
 
-    Rounding rule (mechanical, reciprocal-symmetric — see
-    `ci/artifacts/gpu-perf-aa-null/README.md`'s own "Band derivation"
-    section for the full worked numeric example this reproduces exactly):
-    the raw lower edge `exp(-safety_factor * worst_abs_log_deviation)` is
-    FLOORED to 2 decimal places (rounding a lower bound DOWN is always the
-    conservative, band-widening direction for that edge). The upper edge is
-    then set to the EXACT reciprocal of that already-rounded lower edge
-    (keeping the band symmetric in ratio space, `lo * hi == 1`), itself
-    FLOORED to 2 decimal places for a clean literal — this is STILL outward
-    (band-widening) relative to the raw upper edge
-    `exp(+safety_factor * worst_abs_log_deviation)`, because the reciprocal
-    of a FLOORED (smaller) lower edge is always LARGER than the raw upper
-    edge would ceiling to independently: this is what makes `1.33` (never
-    the `1.32` an independent per-edge ceiling would give) the actual,
-    reproducible result for this campaign's own worst deviation.
+    PROVENANCE, disclosed plainly: [`PRE_REGISTERED_ADVISORY_BAND`] was
+    committed BEFORE this function existed, under prose that said only
+    "rounded outward" — which, applied per-edge, yields `(0.75, 1.32)`,
+    not the committed `(0.75, 1.33)`. The committed upper edge came from
+    flooring the reciprocal of the floored lower edge (`1/0.75 = 1.333…`).
+    This function was reverse-engineered AFTER the fact to state, as a
+    single checkable rule, a mechanism that (a) reproduces the committed
+    literals exactly and (b) is genuinely outward (band-widening) on BOTH
+    edges for every valid input. An earlier draft claimed the reciprocal
+    alone is always outward; that claim was FALSE (for small spreads the
+    floored reciprocal can land a hair INSIDE the raw upper edge), so the
+    upper edge is defined as the MAX of the two candidates below.
+
+    Rounding rule: the raw lower edge
+    `exp(-safety_factor * worst_abs_log_deviation)` is FLOORED to 2
+    decimal places (outward for a lower bound). The upper edge is
+    `max(floor2(1 / lo), ceil2(exp(+safety_factor * w)))` — the
+    reciprocal-symmetric candidate (which produced the committed `1.33`)
+    or the independent per-edge ceiling, whichever is WIDER, so the
+    outward guarantee holds by construction rather than by assertion.
+
+    Valid input domain: `worst_abs_log_deviation` must be a finite number
+    `> 0`, small enough that the floored lower edge stays positive
+    (`worst_abs_log_deviation < ln(100)/safety_factor`); anything else
+    raises `ValueError` by name rather than returning a degenerate,
+    inverted, or divide-by-zero band.
     """
-    lo_raw = math.exp(-safety_factor * worst_abs_log_deviation)
+    w = worst_abs_log_deviation
+    if not isinstance(w, (int, float)) or isinstance(w, bool) or not math.isfinite(w):
+        raise ValueError(
+            f"derive_advisory_band: worst_abs_log_deviation must be a finite number, got {w!r}"
+        )
+    if w <= 0:
+        raise ValueError(
+            "derive_advisory_band: worst_abs_log_deviation must be > 0 "
+            f"(a |ln(ratio)| spread), got {w!r} — a zero/negative spread has no band to derive"
+        )
+    lo_raw = math.exp(-safety_factor * w)
+    hi_raw = math.exp(safety_factor * w)
     lo = math.floor(lo_raw * 100) / 100
-    hi = math.floor((1.0 / lo) * 100) / 100
+    if lo <= 0:
+        raise ValueError(
+            f"derive_advisory_band: spread {w!r} (x{safety_factor}) floors the lower edge to 0 — "
+            "a deviation this large is not band material; it is the broken-leg shape the "
+            "OUTSIDE_BAND_FAST verdict exists for"
+        )
+    hi = max(math.floor((1.0 / lo) * 100) / 100, math.ceil(hi_raw * 100) / 100)
     return lo, hi
 
 
@@ -511,7 +543,16 @@ def load_pod_id(raw_dir):
     records the way that disclosure currently must. `None` when the file is
     absent (an older producer that predates this field — every report
     committed under `ci/artifacts/gpu-perf-aa-null/` today is exactly this
-    case) — [`build_report`] folds this `None` into every OK leg's own
+    case) AND when the file exists but is EMPTY (a host where
+    `RUNPOD_POD_ID` was unset and `hostname` itself failed under the
+    producer's `set -u`-no-`-e` shell): both fold to `None` here because a
+    fabricated or sentinel value would FALSE-MATCH across two broken hosts
+    in the exact same-pod-id contamination check this field exists to
+    enable. The two shapes stay distinguishable via
+    [`load_pod_id_marker_present`] (recorded on the report as
+    `pod_id_marker_present`, the same absent-vs-present split
+    [`load_enforce_marker_present`] carries for `enforce`) —
+    [`build_report`] folds this `None` into every OK leg's own
     `provenance.pod_id`, never raising or defaulting to a fabricated value.
     """
     path = os.path.join(raw_dir, "pod_id")
@@ -520,6 +561,21 @@ def load_pod_id(raw_dir):
     with open(path, encoding="utf-8") as fh:
         value = fh.read().strip()
     return value or None
+
+
+def load_pod_id_marker_present(raw_dir):
+    """`True` iff `raw_dir/pod_id` exists at all (regardless of content) —
+    the same auditability probe [`load_enforce_marker_present`] provides
+    for `enforce`, applied to `pod_id` (round-2 delta-audit B5): without
+    it, "an older producer that never wrote pod identity" and "a producer
+    that wrote the marker but whose capture came back EMPTY (no
+    `RUNPOD_POD_ID`, failing `hostname`)" both surface as the SAME
+    `provenance.pod_id = null`, and a campaign-wide contamination checker
+    cannot tell 'field predates the producer' from 'field failed on this
+    host' — the identical absent-vs-explicit collapse the `enforce` marker
+    already had fixed one field over.
+    """
+    return os.path.isfile(os.path.join(raw_dir, "pod_id"))
 
 
 def load_leg_started_at(raw_dir, name):
@@ -748,6 +804,7 @@ def build_report(raw_dir, a_sha=None, b_sha=None):
     enforce = load_enforce(raw_dir)
     enforce_marker_present = load_enforce_marker_present(raw_dir)
     pod_id = load_pod_id(raw_dir)
+    pod_id_marker_present = load_pod_id_marker_present(raw_dir)
 
     legs_out = {name: {"outcome": entry["outcome"]} for name, entry in legs_raw.items()}
     tiers = {}
@@ -812,6 +869,13 @@ def build_report(raw_dir, a_sha=None, b_sha=None):
         # own doc; `enforce` alone (a plain bool) cannot carry this
         # distinction, since both shapes fold to the SAME safe `False`.
         "enforce_marker_present": enforce_marker_present,
+        # round-2 delta-audit B5: the same absent-vs-explicit split for the
+        # pod identity marker — `provenance.pod_id = null` alone cannot
+        # distinguish "older producer, field never existed" (`False` here)
+        # from "producer wrote the marker but the capture came back empty"
+        # (`True` here, `pod_id` still `null`); see
+        # `load_pod_id_marker_present`'s own doc.
+        "pod_id_marker_present": pod_id_marker_present,
         "recorded_order": {
             name: {"value": value, "unavailable_reason": reason}
             for name, (value, reason) in started_at_by_leg.items()

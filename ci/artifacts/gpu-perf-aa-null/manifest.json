@@ -5,17 +5,17 @@
     {
       "file": "2026-08-30-sxm4-r1.json",
       "role": "primary",
-      "reason": "Clean single-invocation run, no contention evidence, no anomaly."
+      "reason": "Start-window disjoint from every other committed run's recorded_order window (machine-checked by ci/scripts/check_aa_null_band.py -- the same signature that demoted pcie-p1/p2), and operator session records show a single sequential invocation with no concurrent sibling task. Necessary-but-not-sufficient isolation evidence: this report predates the pod_id provenance field, so no artifact-borne pod identity exists to establish positive isolation; no anomaly observed."
     },
     {
       "file": "2026-08-30-sxm4-r2.json",
       "role": "primary",
-      "reason": "Clean single-invocation run, no contention evidence, no anomaly."
+      "reason": "Start-window disjoint from every other committed run's recorded_order window (machine-checked by ci/scripts/check_aa_null_band.py -- the same signature that demoted pcie-p1/p2), and operator session records show a single sequential invocation with no concurrent sibling task. Necessary-but-not-sufficient isolation evidence: this report predates the pod_id provenance field, so no artifact-borne pod identity exists to establish positive isolation; no anomaly observed."
     },
     {
       "file": "2026-08-30-pcie-p3.json",
       "role": "primary",
-      "reason": "Clean single-invocation run, no contention evidence, no anomaly."
+      "reason": "Start-window disjoint from every other committed run's recorded_order window (machine-checked by ci/scripts/check_aa_null_band.py -- the same signature that demoted pcie-p1/p2), and operator session records show a single sequential invocation with no concurrent sibling task. Necessary-but-not-sufficient isolation evidence: this report predates the pod_id provenance field, so no artifact-borne pod identity exists to establish positive isolation; no anomaly observed."
     },
     {
       "file": "2026-08-30-pcie-p1.json",

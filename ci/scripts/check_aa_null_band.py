@@ -41,9 +41,30 @@ an asserted one.
    with), and asserts the result equals
    `gpu_inference_ab.PRE_REGISTERED_ADVISORY_BAND` exactly.
 
+4. **Directory completeness** (round-2 delta-audit B4): every `*.json`
+   under `ci/artifacts/gpu-perf-aa-null/` except `manifest.json` itself
+   must be LISTED in the manifest — an unlisted report is invisible to the
+   re-derivation, which is exactly the escape hatch this check closes
+   (drop a report from the manifest and the gate would otherwise stay
+   green no matter what its ratios say).
+5. **Primary start-window disjointness** (round-2 delta-audit B6, the
+   mechanized form of the very evidence that demoted `pcie-p1`/`p2`):
+   every `"primary"`-role run's `recorded_order` start-window
+   (`[min, max]` over its four leg-start timestamps) must not overlap ANY
+   other listed run's window. Overlapping start-windows are POSITIVE
+   evidence of concurrent invocations (the `p1`/`p2` signature); disjoint
+   start-windows are NECESSARY but not SUFFICIENT for isolation (a run's
+   final leg extends past its start timestamp, and two clean runs on two
+   different pods also have disjoint windows) — which is why the
+   manifest's own `reason` strings claim only what this check plus the
+   operator's session records can actually establish, never a bare
+   "clean" assertion.
+
 `"aux"`-role files are loaded and schema-checked (so a bit-rotted aux
 artifact still fails loudly) but their `adjacent_pair_ratios` are EXCLUDED
-from the re-derivation — the whole point of the primary/aux split.
+from the re-derivation — the whole point of the primary/aux split. Two
+aux-role runs MAY overlap each other (that is precisely why `pcie-p1`/`p2`
+are aux); only a PRIMARY overlapping anything is a finding.
 
 Run: `python3 ci/scripts/check_aa_null_band.py` (real tree) or
 `python3 ci/scripts/check_aa_null_band.py --self-test` (synthetic fixtures,
@@ -131,7 +152,61 @@ def load_and_validate_report(aa_null_dir: Path, filename: str) -> dict:
         raise BandGateError(f"{path} is missing required key(s) {missing} -- not a well-formed aa-null report")
     if report["mode"] != "aa-null":
         raise BandGateError(f"{path}'s own mode is {report['mode']!r}, not 'aa-null' -- this gate only derives from empirical-null campaign reports")
+    pairs = report["adjacent_pair_ratios"]
+    if not isinstance(pairs, dict) or not pairs:
+        raise BandGateError(f"{path}'s own 'adjacent_pair_ratios' must be a non-empty object, got {pairs!r}")
+    for key, ratio in pairs.items():
+        if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not math.isfinite(ratio) or ratio <= 0:
+            raise BandGateError(
+                f"{path}'s own adjacent_pair_ratios[{key!r}] = {ratio!r} is not a positive finite "
+                f"number -- |ln(ratio)| is undefined for it, and silently skipping it would "
+                f"under-report the worst deviation"
+            )
     return report
+
+
+def run_start_window(aa_null_dir: Path, filename: str, report: dict) -> tuple[int, int]:
+    """`(min, max)` over the report's `recorded_order` leg-start timestamps
+    (nanosecond epoch) — the run's start-window, the same committed fields
+    the `pcie-p1`/`p2` concurrency finding was computed from. Raises
+    `BandGateError` when no usable timestamp exists (a committed aa-null
+    report with no recorded starts cannot be cleared against, or checked
+    for, concurrent siblings — fail loudly, never silently exempt it from
+    the disjointness check).
+    """
+    order = report.get("recorded_order")
+    if not isinstance(order, dict):
+        raise BandGateError(f"{aa_null_dir / filename}'s own 'recorded_order' must be an object, got {order!r}")
+    values = []
+    for leg, entry in order.items():
+        value = entry.get("value") if isinstance(entry, dict) else None
+        if isinstance(value, bool) or not isinstance(value, int):
+            continue
+        values.append(value)
+    if not values:
+        raise BandGateError(
+            f"{aa_null_dir / filename} carries no usable recorded_order timestamps -- its start-window "
+            f"cannot be checked for concurrent-sibling overlap (the pcie-p1/p2 contamination signature)"
+        )
+    return min(values), max(values)
+
+
+def check_directory_completeness(aa_null_dir: Path, runs: list[dict]) -> None:
+    """Every `*.json` in the directory except `manifest.json` must be listed
+    in the manifest (round-2 delta-audit B4): the re-derivation iterates
+    manifest entries, so an unlisted report would be INVISIBLE to it —
+    omission would otherwise be a silent escape hatch from the very
+    evidence-completeness this gate exists to enforce.
+    """
+    on_disk = {p.name for p in aa_null_dir.glob("*.json")} - {"manifest.json"}
+    listed = {entry["file"] for entry in runs}
+    unlisted = sorted(on_disk - listed)
+    if unlisted:
+        raise BandGateError(
+            f"{aa_null_dir} contains report file(s) not listed in manifest.json: {unlisted} -- "
+            f"every committed report must be classified primary or aux; an unlisted report is "
+            f"invisible to the re-derivation"
+        )
 
 
 def worst_abs_log_over_primary_pairs(aa_null_dir: Path) -> tuple[float, list[str]]:
@@ -147,10 +222,15 @@ def worst_abs_log_over_primary_pairs(aa_null_dir: Path) -> tuple[float, list[str
     uncomputable input, never a silent worst-deviation of `0.0`).
     """
     runs = load_manifest(aa_null_dir)
+    check_directory_completeness(aa_null_dir, runs)
     worst = None
     primary_files: list[str] = []
+    windows: dict[str, tuple[int, int]] = {}
+    roles: dict[str, str] = {}
     for entry in runs:
         report = load_and_validate_report(aa_null_dir, entry["file"])
+        windows[entry["file"]] = run_start_window(aa_null_dir, entry["file"], report)
+        roles[entry["file"]] = entry["role"]
         if entry["role"] != "primary":
             continue
         primary_files.append(entry["file"])
@@ -160,6 +240,23 @@ def worst_abs_log_over_primary_pairs(aa_null_dir: Path) -> tuple[float, list[str
                 worst = abs_log
     if worst is None:
         raise BandGateError("no 'primary'-role runs found in the manifest -- cannot derive a band from zero pairs")
+    # Round-2 delta-audit B6, mechanized: a PRIMARY run's start-window
+    # overlapping ANY other listed run's is the pcie-p1/p2 concurrency
+    # signature -- positive contamination evidence, so that run cannot be
+    # band evidence. Aux runs may overlap each other (that is why p1/p2
+    # are aux); only a primary overlapping anything is a finding.
+    for pf in primary_files:
+        p_lo, p_hi = windows[pf]
+        for other, (o_lo, o_hi) in windows.items():
+            if other == pf:
+                continue
+            if p_lo <= o_hi and o_lo <= p_hi:
+                raise BandGateError(
+                    f"primary run {pf!r} (start-window [{p_lo}, {p_hi}]) overlaps {other!r} "
+                    f"(role {roles[other]!r}, start-window [{o_lo}, {o_hi}]) -- the same concurrent-invocation "
+                    f"signature that demoted pcie-p1/p2; a primary run with an overlapping sibling is "
+                    f"contamination-suspect and cannot back the band"
+                )
     return worst, primary_files
 
 
@@ -201,12 +298,19 @@ def main() -> int:
 # itself, the same "prove the mechanism, not just today's committed data"
 # discipline check_pod_build_timings.py's own --self-test already follows.
 # --------------------------------------------------------------------------- #
-def _write_fixture_report(path: Path, *, mode="aa-null", pair_a=1.0, pair_b=1.0, extra_keys=True):
+def _write_fixture_report(path: Path, *, mode="aa-null", pair_a=1.0, pair_b=1.0, extra_keys=True, t0=1_000_000):
+    """`t0` spaces each fixture's recorded_order start-window (four leg
+    starts at `t0 .. t0+3`) — call sites give sibling fixtures disjoint
+    `t0`s except when a test deliberately constructs the overlap the
+    disjointness check must catch."""
     report = {
         "mode": mode,
         "legs": {"a1": {}, "b1": {}, "b2": {}, "a2": {}} if extra_keys else {},
         "adjacent_pair_ratios": {"a1/b1": pair_a, "b2/a2": pair_b},
-        "recorded_order": {} if extra_keys else {},
+        "recorded_order": {
+            leg: {"value": t0 + i, "unavailable_reason": None}
+            for i, leg in enumerate(("a1", "b1", "b2", "a2"))
+        },
     }
     if not extra_keys:
         del report["legs"]
@@ -236,8 +340,8 @@ def self_test() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         d = Path(tmp)
         worst_ratio = 0.9  # |ln(0.9)| ~= 0.10536
-        _write_fixture_report(d / "p1.json", pair_a=worst_ratio, pair_b=1.0)
-        _write_fixture_report(d / "p2.json", pair_a=1.0, pair_b=1.0)
+        _write_fixture_report(d / "p1.json", pair_a=worst_ratio, pair_b=1.0, t0=1_000_000)
+        _write_fixture_report(d / "p2.json", pair_a=1.0, pair_b=1.0, t0=2_000_000)
         _write_manifest(d, [
             {"file": "p1.json", "role": "primary", "reason": "clean"},
             {"file": "p2.json", "role": "primary", "reason": "clean"},
@@ -266,8 +370,8 @@ def self_test() -> int:
     # against the SAME fixture with that file re-labeled primary.
     with tempfile.TemporaryDirectory() as tmp:
         d = Path(tmp)
-        _write_fixture_report(d / "primary.json", pair_a=0.95, pair_b=1.0)
-        _write_fixture_report(d / "extreme.json", pair_a=0.1, pair_b=0.1)  # would dominate if counted
+        _write_fixture_report(d / "primary.json", pair_a=0.95, pair_b=1.0, t0=1_000_000)
+        _write_fixture_report(d / "extreme.json", pair_a=0.1, pair_b=0.1, t0=2_000_000)  # would dominate if counted
         _write_manifest(d, [
             {"file": "primary.json", "role": "primary", "reason": "clean"},
             {"file": "extreme.json", "role": "aux", "reason": "contention"},
@@ -326,6 +430,63 @@ def self_test() -> int:
         except BandGateError:
             pass
 
+    # (8) Directory completeness: an on-disk report ABSENT from the
+    # manifest fails loudly (round-2 delta-audit B4's own demonstrated
+    # escape: an unlisted extreme-ratio report was invisible to the gate).
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        _write_fixture_report(d / "listed.json", pair_a=0.95, pair_b=1.0, t0=1_000_000)
+        _write_fixture_report(d / "unlisted.json", pair_a=0.2, pair_b=0.2, t0=2_000_000)
+        _write_manifest(d, [{"file": "listed.json", "role": "primary", "reason": "clean"}])
+        try:
+            worst_abs_log_over_primary_pairs(d)
+            failures.append("self-test (8): an on-disk report missing from the manifest should have raised BandGateError")
+        except BandGateError:
+            pass
+
+    # (9) Primary start-window overlap fails loudly (round-2 delta-audit
+    # B6, mechanized: the pcie-p1/p2 concurrency signature must be a gate
+    # finding when a PRIMARY run carries it, whatever the sibling's role).
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        _write_fixture_report(d / "prim.json", pair_a=0.95, pair_b=1.0, t0=1_000_000)
+        _write_fixture_report(d / "nested.json", pair_a=1.0, pair_b=1.0, t0=1_000_001)  # nested inside prim's window
+        _write_manifest(d, [
+            {"file": "prim.json", "role": "primary", "reason": "clean"},
+            {"file": "nested.json", "role": "aux", "reason": "contention"},
+        ])
+        try:
+            worst_abs_log_over_primary_pairs(d)
+            failures.append("self-test (9): a primary whose start-window overlaps a sibling should have raised BandGateError")
+        except BandGateError:
+            pass
+        # ...while two AUX runs overlapping each other stays legal (that is
+        # exactly the committed pcie-p1/p2 shape).
+        _write_fixture_report(d / "solo.json", pair_a=0.95, pair_b=1.0, t0=9_000_000)
+        _write_manifest(d, [
+            {"file": "prim.json", "role": "aux", "reason": "contention"},
+            {"file": "nested.json", "role": "aux", "reason": "contention"},
+            {"file": "solo.json", "role": "primary", "reason": "clean"},
+        ])
+        try:
+            worst_abs_log_over_primary_pairs(d)
+        except BandGateError as exc:
+            failures.append(f"self-test (9): two overlapping AUX runs beside a disjoint primary should be legal, got: {exc}")
+
+    # (10) A non-positive / non-finite pair ratio fails loudly with the
+    # gate's own named error, never a bare math-domain traceback.
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        _write_fixture_report(d / "zero.json", pair_a=0.0, pair_b=1.0, t0=1_000_000)
+        _write_manifest(d, [{"file": "zero.json", "role": "primary", "reason": "clean"}])
+        try:
+            worst_abs_log_over_primary_pairs(d)
+            failures.append("self-test (10): a zero pair ratio should have raised BandGateError")
+        except BandGateError:
+            pass
+        except ValueError as exc:
+            failures.append(f"self-test (10): a zero pair ratio leaked a bare {type(exc).__name__} instead of BandGateError: {exc}")
+
     # (7) Non-vacuousness on the REAL tree: the real gate must find a
     # nonzero number of primary files under the real committed directory
     # (a --self-test that only ever exercises synthetic fixtures, and never
@@ -343,8 +504,9 @@ def self_test() -> int:
         for f in failures:
             print(f"  - {f}", file=sys.stderr)
         return 1
-    print("check-aa-null-band --self-test: PASS -- 8 fixture checks (re-derivation, mismatch detection, "
-          "aux-exclusion, 3 schema-violation shapes, absent-manifest, real-tree non-vacuity), all as expected.")
+    print("check-aa-null-band --self-test: PASS -- 12 fixture checks (re-derivation, mismatch detection, "
+          "aux-exclusion, 3 schema-violation shapes, absent-manifest, directory-completeness, "
+          "primary-window-overlap + legal-aux-overlap, bad-ratio-value, real-tree non-vacuity), all as expected.")
     return 0
 
 

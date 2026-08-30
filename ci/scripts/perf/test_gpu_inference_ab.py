@@ -496,6 +496,75 @@ class PodIdProvenanceTests(unittest.TestCase):
             write_pod_id(raw_dir, "some-pod-id")
             self.assertEqual(gpu_inference_ab.load_pod_id(raw_dir), "some-pod-id")
 
+    def test_empty_pod_id_marker_is_none_but_marker_present_distinguishes(self):
+        """round-2 delta-audit B5: an EMPTY marker (host with no
+        RUNPOD_POD_ID and a failing `hostname` under the producer's
+        `set -u`-no-`-e` shell) must stay `pod_id=None` (a sentinel value
+        would FALSE-MATCH across two broken hosts in the same-pod-id
+        contamination check), but `pod_id_marker_present=True` must
+        distinguish it from an older producer that never wrote the marker
+        at all — the same absent-vs-explicit split `enforce_marker_present`
+        already carries one field over.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_pod_id(raw_dir, "")
+            self.assertIsNone(gpu_inference_ab.load_pod_id(raw_dir))
+            self.assertTrue(gpu_inference_ab.load_pod_id_marker_present(raw_dir))
+            write_all_ok_legs(raw_dir, {"a1": 8.0, "b1": 8.0, "b2": 8.0, "a2": 8.0})
+            merged, exit_code = gpu_inference_ab.build_report(raw_dir)
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(merged["pod_id_marker_present"])
+        for name in gpu_inference_ab.LEG_ORDER:
+            self.assertIsNone(merged["legs"][name]["provenance"]["pod_id"])
+
+    def test_absent_pod_id_marker_reports_marker_not_present(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self.assertFalse(gpu_inference_ab.load_pod_id_marker_present(raw_dir))
+            write_all_ok_legs(raw_dir, {"a1": 8.0, "b1": 8.0, "b2": 8.0, "a2": 8.0})
+            merged, exit_code = gpu_inference_ab.build_report(raw_dir)
+        self.assertEqual(exit_code, 0)
+        self.assertFalse(merged["pod_id_marker_present"])
+
+
+class DeriveAdvisoryBandDomainTests(unittest.TestCase):
+    """round-2 delta-audit B2/B3: the derivation's valid input domain is
+    named and guarded (never a degenerate, inverted, or divide-by-zero
+    band), and the outward (band-widening) guarantee holds by construction
+    on BOTH edges — including the small-spread region where the
+    reciprocal-only formulation was proven inward.
+    """
+
+    def test_committed_input_reproduces_the_committed_band(self):
+        self.assertEqual(
+            gpu_inference_ab.derive_advisory_band(0.18450314616782526),
+            gpu_inference_ab.PRE_REGISTERED_ADVISORY_BAND,
+        )
+
+    def test_zero_negative_nonfinite_and_huge_spreads_raise_by_name(self):
+        for bad in (0.0, -0.2, float("nan"), float("inf"), 5.0, "0.1", None, True):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    gpu_inference_ab.derive_advisory_band(bad)
+
+    def test_band_is_outward_on_both_edges_across_the_domain(self):
+        """Sweeps the valid domain including the round-2 audit's own first
+        counterexample (w=0.00664, where floored-reciprocal alone landed
+        INSIDE the raw upper edge): the derived band must CONTAIN the raw
+        interval everywhere, and lo < hi always.
+        """
+        import math as _math
+        for i in range(1, 3000):
+            w = i / 1000.0  # (0.001 .. 2.999]
+            lo, hi = gpu_inference_ab.derive_advisory_band(w)
+            raw_lo = _math.exp(-1.5 * w)
+            raw_hi = _math.exp(1.5 * w)
+            self.assertLess(lo, hi, f"w={w}: inverted band ({lo}, {hi})")
+            self.assertLessEqual(lo, raw_lo, f"w={w}: lower edge {lo} inside raw {raw_lo}")
+            self.assertGreaterEqual(hi, raw_hi, f"w={w}: upper edge {hi} inside raw {raw_hi}")
+        # the audit's named counterexample, pinned exactly:
+        lo, hi = gpu_inference_ab.derive_advisory_band(0.00664)
+        self.assertGreaterEqual(hi, _math.exp(1.5 * 0.00664))
+
 
 class IdentityMismatchTests(unittest.TestCase):
     def test_identity_mismatch_between_legs_is_invalid_and_nonzero_exit(self):
@@ -1050,6 +1119,46 @@ class DriftCancellationTests(unittest.TestCase):
             "an A,A,B,B run order was expected to show a first-order (O(k)) bias under this SAME "
             "multiplicative drift -- if this assertion fails, the order-balancing rationale itself is "
             "wrong, not merely mis-stated in the module doc",
+        )
+
+
+class SensitivityMirrorTests(unittest.TestCase):
+    """round-2 delta-audit advisory: the module doc claims its sensitivity
+    paragraph is restated VERBATIM from the README's Band-derivation
+    section — this pins the claim mechanically so the two texts cannot
+    drift apart undetected (whitespace/wrapping normalized; every word
+    must match).
+    """
+
+    START = "On a REAL pod, that nominal 33% figure is itself optimistic:"
+    END = "certainly not 25%."
+
+    def _slice(self, text, where):
+        # normalize wrapping FIRST -- both texts hard-wrap at different
+        # columns, so the anchors themselves can span a line break.
+        flat = " ".join(text.split())
+        start = flat.find(self.START)
+        self.assertNotEqual(start, -1, f"sensitivity paragraph start anchor missing from {where}")
+        end = flat.find(self.END, start)
+        self.assertNotEqual(end, -1, f"sensitivity paragraph end anchor missing from {where}")
+        return flat[start : end + len(self.END)]
+
+    def test_readme_and_module_doc_sensitivity_paragraphs_match_verbatim(self):
+        module_path = os.path.join(os.path.dirname(gpu_inference_ab.__file__), "gpu_inference_ab.py")
+        readme_path = os.path.normpath(
+            os.path.join(
+                os.path.dirname(module_path), "..", "..", "artifacts", "gpu-perf-aa-null", "README.md"
+            )
+        )
+        with open(module_path, encoding="utf-8") as fh:
+            module_text = fh.read()
+        with open(readme_path, encoding="utf-8") as fh:
+            readme_text = fh.read()
+        self.assertEqual(
+            self._slice(module_text, "gpu_inference_ab.py"),
+            self._slice(readme_text, "README.md"),
+            "the sensitivity paragraph has drifted between gpu_inference_ab.py and the README "
+            "-- the module doc claims a VERBATIM restatement; edit both or neither",
         )
 
 

@@ -131,6 +131,19 @@ already committed here predate that field and carry no `pod_id` at all —
 this disclosure is the one-time, by-hand reconstruction that field is meant
 to make automatic for every future campaign.
 
+**What the retained primaries' isolation actually rests on** (stated
+plainly, since the demoted pair proves the assumption is falsifiable): the
+three `primary` runs have `recorded_order` start-windows disjoint from
+every other committed run's — machine-checked by
+`ci/scripts/check_aa_null_band.py` on every PR, the mechanized form of the
+very evidence that demoted `pcie-p1`/`p2` — and the operator's session
+records show each ran as a single sequential invocation with no concurrent
+sibling task. That is necessary-but-not-sufficient isolation evidence: the
+reports predate `pod_id`, so no artifact-borne pod identity exists to
+establish positive isolation, and disjoint start-windows alone cannot
+exclude every contention shape. The `manifest.json` `reason` strings claim
+exactly this much and no more.
+
 ## Per-run table
 
 | file | device model | role | combined `embed.p50_ms` ratio (b/a) | pair `a1/b1` | pair `b2/a2` | within-run pair spread |
@@ -197,7 +210,7 @@ does not describe the slowdown-catching side at all.
 On a REAL pod, that nominal 33% figure is itself optimistic: this
 campaign's own two primary SXM4 combined ratios (`0.8706549652288303`,
 `0.8821655548443332`) show the binary-level build offset (finding (a)
-above) already suppresses the observed ratio by roughly 12–13% on that
+above) already suppresses the observed ratio by ≈12.9% and ≈11.8% respectively on that
 device model, working AGAINST detection of a real slowdown (a slowdown and
 a favorable build offset partially cancel in the observed ratio). To still
 cross the `1.33` upper edge despite that offset, a real slowdown needs to
@@ -229,22 +242,27 @@ merely asserted in prose):
 - `1.5 * 0.18450314616782526 = 0.27675471925173794`.
 - Raw (unrounded) interval: `exp(∓0.27675471925173794)` =
   `[0.7582404560899295, 1.3188428445994143]`.
-- Outward rounding (mechanical, reciprocal-symmetric, matches
-  `check_aa_null_band.py`'s own `_round_band_outward` exactly): the LOWER
-  edge is the raw value FLOORED to 2 decimal places —
-  `floor(0.7582404560899295 * 100) / 100 = 0.75` (this direction is a
-  simple floor: rounding a lower bound DOWN is always the conservative,
-  band-widening direction). The UPPER edge is then set to the EXACT
-  reciprocal of that already-rounded lower edge (`1 / 0.75 =
-  1.3333333333333333` — keeping the band symmetric in ratio space,
-  `lo * hi == 1`), itself FLOORED to 2 decimal places for a clean literal:
-  `floor(1.3333333333333333 * 100) / 100 = 1.33`. `1.33 > 1.3188428445994143`
-  (the raw upper edge), so this reciprocal-then-floor step is STILL outward
-  (band-widening) on the upper side despite using floor, not ceiling,
-  arithmetic — the reciprocal-of-a-floored-lower-edge is always larger than
-  a direct ceiling of the raw upper edge would be, which is what makes this
-  the actual (not merely asserted) rounding rule that reproduces `1.33`
-  rather than the `1.32` a naive independent per-edge ceiling would give.
+- Outward rounding (mechanical — `gpu_inference_ab.derive_advisory_band`,
+  the single implementation `check_aa_null_band.py` imports rather than
+  re-implementing): the LOWER edge is the raw value FLOORED to 2 decimal
+  places — `floor(0.7582404560899295 * 100) / 100 = 0.75` (rounding a
+  lower bound DOWN is always the conservative, band-widening direction).
+  The UPPER edge is `max(floor2(1/lo), ceil2(raw_hi))` — here the
+  reciprocal candidate wins: `1 / 0.75 = 1.3333…`, floored to `1.33`,
+  versus the independent per-edge ceiling `ceil2(1.3188…) = 1.32`; so the
+  committed upper edge is `1.33`.
+- PROVENANCE, disclosed plainly: the band literals were committed FIRST,
+  under prose that said only "rounded outward" — which, applied per-edge,
+  gives `1.32`, not the committed `1.33` (that came from flooring the
+  reciprocal of the floored lower edge). The rule above was
+  reverse-engineered AFTER the fact to state, as one checkable
+  definition, a mechanism that reproduces the committed literals exactly.
+  An earlier statement of it claimed the reciprocal candidate alone is
+  ALWAYS outward; that claim was false (for small spreads the floored
+  reciprocal can land a hair inside the raw upper edge), so the rule
+  takes the MAX of the two candidates and the outward guarantee holds by
+  construction. For this campaign's committed input both formulations
+  give the identical `(0.75, 1.33)`.
 - Committed band: `[0.75, 1.33]`.
 
 See `gpu_inference_ab.py`'s own module doc (the "ADVISORY classification: a

@@ -254,9 +254,17 @@ if [ -n "$REPORT_JSON" ] && [ -f "$REPORT_JSON" ]; then
   fi
 else
   echo "::warning::no gpu_inference_ab_report.json found under ${GPU_PERF_AB_ARTIFACT_DIR} -- cannot name the merged status."
-  if [ "$GPU_PERF_AB_ENFORCE" = "1" ]; then
-    echo "::error::GPU_PERF_AB_ENFORCE=1 was requested for this run, but no merged report was even pulled -- cannot confirm enforcement was applied; forcing failure rather than trusting rc=${rc} alone." >&2
+  # Force failure ONLY over a would-be-GREEN exit (the silent-unearned-green
+  # case this guard exists for). A run that already failed keeps ITS OWN exit
+  # code -- the header's exit lattice (75 = capacity/pre-flight, 2 = usage or
+  # the aa_null+enforce guard) stays authoritative, never rewritten into a 1
+  # that gpu-perf-ab.yml would mis-annotate as an enforcement refusal
+  # (mirrors runpod_gpu_howwell.sh's own rc -eq 0 guard on its rewrite).
+  if [ "$GPU_PERF_AB_ENFORCE" = "1" ] && [ "$rc" -eq 0 ]; then
+    echo "::error::GPU_PERF_AB_ENFORCE=1 was requested and the run exited 0, but no merged report was pulled -- cannot confirm enforcement was applied; forcing failure rather than reporting an unconfirmable green." >&2
     rc=1
+  elif [ "$GPU_PERF_AB_ENFORCE" = "1" ]; then
+    echo "::warning::enforcement was requested but the run already failed (rc=${rc}) with no report to confirm against -- keeping the run's own exit code, which the header's exit lattice names." >&2
   fi
 fi
 

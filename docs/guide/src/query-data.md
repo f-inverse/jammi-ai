@@ -25,13 +25,13 @@ session.add_source("patents", SourceType::File, SourceConnection {
 ### Python
 
 ```python
-db.add_source("patents", path="/data/patents.parquet", format="parquet")
+db.add_source("patents", url="/data/patents.parquet", format="parquet")
 ```
 
 ### CLI
 
 ```bash
-jammi sources add patents --path /data/patents.parquet --format parquet
+jammi sources add patents --url /data/patents.parquet --format parquet
 ```
 
 ## Supported formats
@@ -41,7 +41,7 @@ jammi sources add patents --path /data/patents.parquet --format parquet
 | Parquet | `FileFormat::Parquet` | `"parquet"` | Columnar, compressed, recommended for large datasets |
 | CSV | `FileFormat::Csv` | `"csv"` | Auto-detected schema |
 | JSON | `FileFormat::Json` | `"json"` | Line-delimited JSON |
-| JSON Lines | `FileFormat::JsonLines` | `"jsonl"` or `"ndjson"` | Same line-delimited reader as JSON; defaults directory listing to the `.jsonl` extension |
+| JSON Lines | `FileFormat::JsonLines` | `"jsonl"` or `"ndjson"` | Same line-delimited reader as JSON; `.jsonl` preferred, `.ndjson` used when no `.jsonl` files match |
 
 ## Run a SQL query
 
@@ -118,7 +118,7 @@ let results = session.sql("
 ### Python
 
 ```python
-db.add_source("companies", path="/data/companies.csv", format="csv")
+db.add_source("companies", url="/data/companies.csv", format="csv")
 
 table = db.sql("""
     SELECT p.title, c.company_name

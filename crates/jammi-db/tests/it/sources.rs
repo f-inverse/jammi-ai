@@ -373,22 +373,64 @@ async fn directory_source_with_jsonl_format_excludes_json_named_file(backend: Ba
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn directory_source_with_only_ndjson_files_registered_as_jsonl_is_a_loud_error(
+async fn directory_source_with_only_ndjson_files_registered_as_jsonl_falls_back_and_serves_rows(
     backend: BackendKind,
 ) {
     let dir = tempdir().unwrap();
     let session = session_or_skip!(backend, dir);
 
-    // A directory holding ONLY `.ndjson`-named files: `jsonl`'s default
-    // listing extension is `.jsonl`, so this directory resolves zero matches
-    // and must surface as a typed, actionable error naming the extension and
-    // url — never a silently registered, column-less, row-less table
-    // (DataFusion's `infer_schema` succeeds over an empty file list).
+    // A directory holding ONLY `.ndjson`-named files: `.jsonl` (jsonl's
+    // default extension) has zero matches, so the adaptive fallback tries
+    // `.ndjson` next and finds this directory's 2 rows — `.ndjson` has no
+    // wire/CLI surface of its own, so this fallback is the only reachable
+    // path onto it. Registration SUCCEEDS and the rows are queryable, not an
+    // error (the enshrined "zero matches" test this replaces predates the
+    // adaptive fallback the lead specified).
     let listing_dir = dir.path().join("ndjson_only");
     std::fs::create_dir_all(&listing_dir).unwrap();
     std::fs::write(listing_dir.join("a.ndjson"), "{\"id\": 1}\n{\"id\": 2}\n").unwrap();
 
     let events_id = format!("ndjson_only_{}", unique_suffix());
+    session
+        .add_source(
+            &events_id,
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", listing_dir.display())),
+                format: Some(FileFormat::JsonLines),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let results = session
+        .sql(&format!("SELECT id FROM {events_id}.public.ndjson_only"))
+        .await
+        .unwrap();
+    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 2,
+        "an .ndjson-only directory registered as jsonl must fall back to .ndjson and serve rows"
+    );
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn directory_source_with_neither_jsonl_nor_ndjson_is_a_loud_error_naming_both_extensions(
+    backend: BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let session = session_or_skip!(backend, dir);
+
+    // Neither `.jsonl` nor its `.ndjson` fallback has any match — the typed
+    // error must name BOTH extensions tried, not just the first.
+    let listing_dir = dir.path().join("neither");
+    std::fs::create_dir_all(&listing_dir).unwrap();
+    std::fs::write(listing_dir.join("a.json"), "{\"id\": 1}\n{\"id\": 2}\n").unwrap();
+
+    let events_id = format!("neither_{}", unique_suffix());
     let err = session
         .add_source(
             &events_id,
@@ -404,17 +446,65 @@ async fn directory_source_with_only_ndjson_files_registered_as_jsonl_is_a_loud_e
     let message = err.to_string();
     assert!(
         message.contains(".jsonl"),
-        "error must name the applied extension filter: {message}"
+        "error must name the first extension tried: {message}"
     );
     assert!(
-        message.contains(&listing_dir.display().to_string()),
-        "error must name the url that matched nothing: {message}"
+        message.contains(".ndjson"),
+        "error must name the fallback extension tried: {message}"
     );
 
-    // No source was registered — the failed add_source must not leave a
-    // partially-registered, unqueryable catalog row behind.
     let sources = session.catalog().list_sources().await.unwrap();
     assert!(!sources.iter().any(|s| s.source_id == events_id));
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn directory_source_with_both_jsonl_and_ndjson_prefers_jsonl_and_ignores_ndjson(
+    backend: BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let session = session_or_skip!(backend, dir);
+
+    // A directory holding BOTH a `.jsonl` file (2 rows) and an `.ndjson` file
+    // (3 rows): `.jsonl` has a non-empty match, so the adaptive fallback never
+    // even lists `.ndjson` — deterministic, `.jsonl` always wins. The
+    // `.ndjson` rows are silently excluded, the ordinary "wrong extension"
+    // listing semantic every format already has (see
+    // `directory_source_with_jsonl_format_excludes_json_named_file`), not a
+    // new one this adaptive resolution introduces.
+    let listing_dir = dir.path().join("mixed");
+    std::fs::create_dir_all(&listing_dir).unwrap();
+    std::fs::write(listing_dir.join("a.jsonl"), "{\"id\": 1}\n{\"id\": 2}\n").unwrap();
+    std::fs::write(
+        listing_dir.join("b.ndjson"),
+        "{\"id\": 3}\n{\"id\": 4}\n{\"id\": 5}\n",
+    )
+    .unwrap();
+
+    let events_id = format!("mixed_{}", unique_suffix());
+    session
+        .add_source(
+            &events_id,
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", listing_dir.display())),
+                format: Some(FileFormat::JsonLines),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let results = session
+        .sql(&format!("SELECT id FROM {events_id}.public.mixed"))
+        .await
+        .unwrap();
+    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 2,
+        ".jsonl must win over .ndjson when a directory holds both — the .ndjson rows are excluded"
+    );
 }
 
 #[test_case(BackendKind::Sqlite ; "sqlite")]
@@ -424,14 +514,54 @@ async fn single_file_source_with_zero_extension_match_is_a_loud_error(backend: B
     let dir = tempdir().unwrap();
     let session = session_or_skip!(backend, dir);
 
-    // A `.json`-named file registered as `jsonl` (default `.jsonl` extension):
-    // the single-file listing path still applies the extension filter, so
-    // this resolves zero matches too and must error the same way the
-    // directory case does, never silently registering a schema-less table.
+    // A `.json`-named file registered as `jsonl` (default `.jsonl` extension,
+    // with an explicit `file_extension` override so the adaptive `.ndjson`
+    // fallback does not apply — this pins the plain single-extension guard,
+    // not the jsonl-only adaptive path covered by the tests above).
     let fixture_path = dir.path().join("events.json");
     std::fs::write(&fixture_path, "{\"id\": 1}\n{\"id\": 2}\n").unwrap();
 
     let events_id = format!("single_mismatch_{}", unique_suffix());
+    let err = session
+        .add_source(
+            &events_id,
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", fixture_path.display())),
+                format: Some(FileFormat::JsonLines),
+                file_extension: Some(".jsonl".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains(".jsonl"),
+        "error must name the applied extension filter: {message}"
+    );
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn single_zero_byte_jsonl_file_is_a_loud_error_not_a_silent_empty_table(
+    backend: BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let session = session_or_skip!(backend, dir);
+
+    // `touch events.jsonl` / an interrupted export: the file exists, its
+    // extension matches, but it carries 0 bytes and therefore no schema.
+    // DataFusion's own `infer_schema` already drops size-0 files before
+    // merging a schema; the zero-match GUARD must apply the identical
+    // predicate so it can't diverge from what schema inference actually
+    // sees — otherwise a 0-byte file passes the guard but still yields an
+    // empty, column-less table.
+    let fixture_path = dir.path().join("events.jsonl");
+    std::fs::write(&fixture_path, "").unwrap();
+
+    let events_id = format!("zero_byte_single_{}", unique_suffix());
     let err = session
         .add_source(
             &events_id,
@@ -444,10 +574,47 @@ async fn single_file_source_with_zero_extension_match_is_a_loud_error(backend: B
         )
         .await
         .unwrap_err();
-    let message = err.to_string();
     assert!(
-        message.contains(".jsonl"),
-        "error must name the applied extension filter: {message}"
+        err.to_string().contains(".jsonl"),
+        "error must name the applied extension filter: {err}"
+    );
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn directory_of_only_zero_byte_jsonl_files_is_a_loud_error_not_a_silent_empty_table(
+    backend: BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let session = session_or_skip!(backend, dir);
+
+    // Same as the single-file case above, but for the directory listing arm:
+    // a directory whose only `.jsonl`-extension file is 0 bytes must resolve
+    // to zero USABLE matches, not "one file matched the extension" — DataFusion
+    // still lists the 0-byte file before its own size filter drops it, so a
+    // guard that only checks the extension (not size) would register a
+    // column-less, row-less table here.
+    let listing_dir = dir.path().join("zero_byte_dir");
+    std::fs::create_dir_all(&listing_dir).unwrap();
+    std::fs::write(listing_dir.join("empty.jsonl"), "").unwrap();
+
+    let events_id = format!("zero_byte_dir_{}", unique_suffix());
+    let err = session
+        .add_source(
+            &events_id,
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", listing_dir.display())),
+                format: Some(FileFormat::JsonLines),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains(".jsonl"),
+        "error must name the applied extension filter: {err}"
     );
 }
 

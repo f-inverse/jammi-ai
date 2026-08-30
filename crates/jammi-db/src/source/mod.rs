@@ -21,7 +21,7 @@ use crate::storage::{CloudConfig, StorageUrl};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceType {
-    /// File-shaped source (Parquet / CSV / JSON) read through any
+    /// File-shaped source (Parquet / CSV / JSON / JSONL) read through any
     /// `StorageUrl`-addressable backend — local disk, S3, GCS, Azure.
     File,
     /// PostgreSQL database.
@@ -40,11 +40,19 @@ pub enum FileFormat {
     Csv,
     /// Newline-delimited JSON.
     Json,
-    /// Newline-delimited JSON, spelled `jsonl`/`ndjson` and defaulting to a
-    /// `.jsonl` extension during directory listing. Functionally identical to
-    /// [`Self::Json`] (both use DataFusion's line-delimited `JsonFormat`); the
-    /// distinct variant exists so a `.jsonl` corpus is neither rejected as an
-    /// unknown format nor silently excluded by the `.json` directory glob.
+    /// Newline-delimited JSON, spelled `jsonl`/`ndjson`. Functionally
+    /// identical to [`Self::Json`] (both use DataFusion's line-delimited
+    /// `JsonFormat`); the distinct variant exists so a `.jsonl` corpus is
+    /// neither rejected as an unknown format nor silently excluded by the
+    /// `.json` directory glob.
+    ///
+    /// Directory listing tries `.jsonl` first; only when that has zero
+    /// matches does it fall back to `.ndjson` (see
+    /// [`crate::source::file_format::create_listing_table`]) — deterministic,
+    /// `.jsonl` always wins when a directory holds both. This is the only
+    /// reachable path onto an `.ndjson` corpus: no wire or CLI surface names
+    /// `.ndjson` directly. An explicit `file_extension` override on
+    /// [`SourceConnection`] disables the fallback and is honoured literally.
     JsonLines,
     /// Apache Avro binary format.
     Avro,

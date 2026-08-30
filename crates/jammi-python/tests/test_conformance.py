@@ -740,7 +740,13 @@ def test_jsonl_and_ndjson_add_source_are_accepted_on_both_backends(tmp_path):
     fixture.write_text('{"id": 1}\n{"id": 2}\n')
     embed = jammi.connect(f"file://{tmp_path}")
     for i, token in enumerate(("jsonl", "ndjson")):
-        embed.add_source(f"events_{i}", url=f"file://{fixture}", format=token)
+        source_id = f"events_{i}"
+        embed.add_source(source_id, url=f"file://{fixture}", format=token)
+        table = embed.sql(f"SELECT id FROM {source_id}.public.events")
+        assert table.num_rows == 2, (
+            f"format={token!r} must register the fixture's 2 rows, not just "
+            "not raise"
+        )
 
 
 def test_failed_training_wait_raises_training_error_on_both_raise_sites():

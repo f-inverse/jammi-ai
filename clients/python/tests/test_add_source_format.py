@@ -39,8 +39,7 @@ def test_file_format_vocabulary_covers_every_wire_token_including_both_jsonl_spe
     missing = wire_values - mirrored_values
     assert not missing, (
         f"_FILE_FORMAT is missing a mirror for wire FileFormat value(s) "
-        f"{missing} — a client(format=...) token exists on the wire but no "
-        f"Python spelling reaches it"
+        f"{missing} — a new wire value exists but no Python spelling reaches it"
     )
 
     assert _FILE_FORMAT["jsonl"] == catalog_pb2.FileFormat.FILE_FORMAT_JSONL

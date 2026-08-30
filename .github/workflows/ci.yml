@@ -1194,6 +1194,18 @@ jobs:
           # zero-execution gap as `compare_grad_oracle`'s suite above.
           - name: perf ab_merge suite
             cmd: python3 ci/scripts/perf/test_ab_merge.py
+          # `finetune_ab.sh`'s forced-eager disable-key enumeration (#352's
+          # harness redesign): mechanically enumerates every admit/
+          # op_disabled site and REDs on an unresolved one — stdlib-only,
+          # same zero-execution reasoning as the `ab_merge` suite above.
+          - name: perf finetune_ab disable-op-keys suite
+            cmd: python3 ci/scripts/perf/test_finetune_ab_disable_op_keys.py
+          # `finetune_ab.sh` ITSELF (the redesigned single-binary A/B
+          # producer, #352): dry-run smoke over the whole pipeline, the
+          # same hermetic discipline `gpu_inference_ab.sh`'s own dry-run
+          # leg below already follows.
+          - name: finetune_ab.sh dry-run smoke
+            cmd: python3 ci/scripts/perf/test_finetune_ab_sh_dry_run.py
           # issue #335's within-run GPU perf A/B comparator
           # (`gpu_inference_ab.py`) own merge/table suite: stdlib-only,
           # drives `build_report`/`main` (the real entry point

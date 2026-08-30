@@ -138,6 +138,7 @@ let job = session.fine_tune(
 | `warmup_steps` | 100 | Linear warmup from 0 to base LR |
 | `lr_schedule` | CosineDecay | Decay after warmup: Constant, CosineDecay, LinearDecay |
 | `embedding_loss` | auto | CoSent (pairs+scores), Triplet, MultipleNegativesRanking |
+| `backbone_dtype` | f32 | Frozen-backbone dtype: f32, f16, or bf16 (bf16 requires CUDA). Applies only when `target_modules` is non-empty (encoder-adapters) — see [Memory](#memory) |
 
 ## Use the fine-tuned model
 
@@ -306,3 +307,45 @@ applied after pooling.
 - **Divergence detection:** if loss is NaN or >100 for 3 consecutive batches, the job fails with a clear error
 - **Early stopping:** training stops when validation loss doesn't improve for `patience` epochs, best checkpoint weights are restored
 - **Checkpoints:** saved at ~10% intervals for crash recovery
+
+## Memory
+
+Training memory is dominated by the frozen backbone's weights and
+activations, scaled by `batch_size` and `max_seq_length`. `backbone_dtype`
+defaults to `f32` for numerical conservatism — every job runs the backbone
+at full precision unless you opt into a lower-precision dtype; the trained
+LoRA A/B matrices always stay `f32` regardless of `backbone_dtype`, for
+numerical stability.
+
+`backbone_dtype` only takes effect on the **encoder-adapters** arm
+(`target_modules` non-empty) — the projection-head arm (the default, empty
+`target_modules`) never re-dtypes the frozen backbone, so `bf16` is not an
+available remedy there.
+
+This guidance applies to the **fine-tune training kinds** (embedding and
+classification training), and only when the failure's own error text carries
+a recognized out-of-memory spelling. Two cases it does NOT cover: a host
+OOM-kill that terminates the worker process outright leaves no error message
+at all to classify — the job is picked up by lease reclaim instead, not this
+guidance; and a `ContextPredictor` training run carries no OOM guidance at
+all (it doesn't route through this classifier).
+
+When it applies, the job's terminal error is rewritten to name the exact
+`batch_size`, `max_seq_length`, and (on the encoder-adapters arm)
+`backbone_dtype` it ran with, and suggests remedies in the order they're
+cheapest to try:
+
+- **Encoder adapters:** (1) `backbone_dtype: bf16` — substantially reduces
+  memory on this arm. Requires a CUDA device; a `bf16` backbone on a
+  non-CUDA device is refused before training starts, rather than silently
+  falling back to `f32`. (2) A smaller `batch_size`, or trade batch size for
+  `gradient_accumulation_steps` to hold the same effective batch size while
+  shrinking the per-step activation memory. (3) A smaller `max_seq_length`.
+- **Projection head (default):** `backbone_dtype` does not apply and is
+  omitted from the message — the message says so outright. (1) A smaller
+  `batch_size`, or trade batch size for `gradient_accumulation_steps`. (2) A
+  smaller `max_seq_length`.
+
+For a fine-tune job whose failure was classified this way, `jammi train
+status` (and the Python `job.status()`) surfaces the rewritten message
+directly, so you don't need to read raw driver output to find the fix.

@@ -452,6 +452,10 @@ async fn directory_source_with_neither_jsonl_nor_ndjson_is_a_loud_error_naming_b
         message.contains(".ndjson"),
         "error must name the fallback extension tried: {message}"
     );
+    assert!(
+        message.contains(&listing_dir.display().to_string()),
+        "error must name the url that matched nothing: {message}"
+    );
 
     let sources = session.catalog().list_sources().await.unwrap();
     assert!(!sources.iter().any(|s| s.source_id == events_id));
@@ -510,6 +514,94 @@ async fn directory_source_with_both_jsonl_and_ndjson_prefers_jsonl_and_ignores_n
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
+async fn directory_with_a_zero_byte_jsonl_and_a_real_ndjson_falls_back_and_serves_rows(
+    backend: BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let session = session_or_skip!(backend, dir);
+
+    // A directory holding a 0-byte `.jsonl` file (extension matches, but the
+    // size-`> 0` filter drops it — zero USABLE `.jsonl` matches) and a real
+    // `.ndjson` file: the adaptive fallback must fire here exactly as it
+    // would for a directory with NO `.jsonl` file at all — the size filter
+    // and the extension-presence check must compose, not just each work in
+    // isolation.
+    let listing_dir = dir.path().join("zero_byte_jsonl_real_ndjson");
+    std::fs::create_dir_all(&listing_dir).unwrap();
+    std::fs::write(listing_dir.join("empty.jsonl"), "").unwrap();
+    std::fs::write(listing_dir.join("a.ndjson"), "{\"id\": 1}\n{\"id\": 2}\n").unwrap();
+
+    let events_id = format!("zero_byte_fallback_{}", unique_suffix());
+    session
+        .add_source(
+            &events_id,
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", listing_dir.display())),
+                format: Some(FileFormat::JsonLines),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let results = session
+        .sql(&format!(
+            "SELECT id FROM {events_id}.public.zero_byte_jsonl_real_ndjson"
+        ))
+        .await
+        .unwrap();
+    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 2,
+        "a 0-byte .jsonl file must not block the .ndjson fallback from firing"
+    );
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn single_file_ndjson_url_with_no_override_falls_back_and_serves_rows(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let session = session_or_skip!(backend, dir);
+
+    // The adaptive fallback applies to a SINGLE-FILE url too, not only a
+    // directory listing: a lone `.ndjson` file, registered as `jsonl` with
+    // no override, has zero `.jsonl` matches (the single-file listing path
+    // still applies the extension filter — see
+    // `single_file_source_with_zero_extension_match_is_a_loud_error`) and
+    // must fall back to `.ndjson` and serve its rows.
+    let fixture_path = dir.path().join("events.ndjson");
+    std::fs::write(&fixture_path, "{\"id\": 1}\n{\"id\": 2}\n").unwrap();
+
+    let events_id = format!("single_ndjson_{}", unique_suffix());
+    session
+        .add_source(
+            &events_id,
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", fixture_path.display())),
+                format: Some(FileFormat::JsonLines),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let results = session
+        .sql(&format!("SELECT id FROM {events_id}.public.events"))
+        .await
+        .unwrap();
+    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 2,
+        "a single .ndjson file registered as jsonl with no override must fall back and serve rows"
+    );
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
 async fn single_file_source_with_zero_extension_match_is_a_loud_error(backend: BackendKind) {
     let dir = tempdir().unwrap();
     let session = session_or_skip!(backend, dir);
@@ -539,6 +631,73 @@ async fn single_file_source_with_zero_extension_match_is_a_loud_error(backend: B
     assert!(
         message.contains(".jsonl"),
         "error must name the applied extension filter: {message}"
+    );
+    assert!(
+        message.contains(&fixture_path.display().to_string()),
+        "error must name the url that matched nothing: {message}"
+    );
+    // The explicit override must disable the adaptive fallback entirely — an
+    // implementation that ignored the override and ran the `.jsonl`/`.ndjson`
+    // adaptive path anyway would ALSO name `.ndjson` in a both-empty error;
+    // this override path must name ONLY the one extension the caller asked
+    // for.
+    assert!(
+        !message.contains(".ndjson"),
+        "an explicit override must disable the adaptive fallback, not just fail the same way \
+         it would: {message}"
+    );
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn explicit_extension_override_bypasses_the_adaptive_fallback_and_serves_only_that_extension(
+    backend: BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let session = session_or_skip!(backend, dir);
+
+    // A directory holding BOTH a `.jsonl` file (2 rows) and an `.ndjson` file
+    // (3 rows), with an EXPLICIT `.ndjson` override. The adaptive fallback
+    // (unset override) would resolve to `.jsonl` here (it always wins when
+    // both are present — see the mixed-directory test above); an
+    // implementation that ignored the override and ran the adaptive
+    // resolution anyway would therefore serve the WRONG row count (2, not
+    // 3) — a positive oracle stronger than merely "the override still
+    // errors on a mismatch".
+    let listing_dir = dir.path().join("override_mixed");
+    std::fs::create_dir_all(&listing_dir).unwrap();
+    std::fs::write(listing_dir.join("a.jsonl"), "{\"id\": 1}\n{\"id\": 2}\n").unwrap();
+    std::fs::write(
+        listing_dir.join("b.ndjson"),
+        "{\"id\": 3}\n{\"id\": 4}\n{\"id\": 5}\n",
+    )
+    .unwrap();
+
+    let events_id = format!("override_mixed_{}", unique_suffix());
+    session
+        .add_source(
+            &events_id,
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", listing_dir.display())),
+                format: Some(FileFormat::JsonLines),
+                file_extension: Some(".ndjson".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let results = session
+        .sql(&format!("SELECT id FROM {events_id}.public.override_mixed"))
+        .await
+        .unwrap();
+    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 3,
+        "an explicit .ndjson override must serve the .ndjson rows even though .jsonl is present \
+         and would otherwise win the adaptive resolution"
     );
 }
 
@@ -574,9 +733,14 @@ async fn single_zero_byte_jsonl_file_is_a_loud_error_not_a_silent_empty_table(
         )
         .await
         .unwrap_err();
+    let message = err.to_string();
     assert!(
-        err.to_string().contains(".jsonl"),
-        "error must name the applied extension filter: {err}"
+        message.contains(".jsonl"),
+        "error must name the applied extension filter: {message}"
+    );
+    assert!(
+        message.contains(&fixture_path.display().to_string()),
+        "error must name the url that matched nothing: {message}"
     );
 }
 
@@ -612,9 +776,126 @@ async fn directory_of_only_zero_byte_jsonl_files_is_a_loud_error_not_a_silent_em
         )
         .await
         .unwrap_err();
+    let message = err.to_string();
     assert!(
-        err.to_string().contains(".jsonl"),
-        "error must name the applied extension filter: {err}"
+        message.contains(".jsonl"),
+        "error must name the applied extension filter: {message}"
+    );
+    assert!(
+        message.contains(&listing_dir.display().to_string()),
+        "error must name the url that matched nothing: {message}"
+    );
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn zero_match_guard_also_fires_on_a_non_jsonl_format(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let session = session_or_skip!(backend, dir);
+
+    // The zero-match guard sits ABOVE the per-format branch in
+    // `create_listing_table` and must fire for every format, not just
+    // `jsonl` — a `.csv`-named file registered as `parquet` resolves to
+    // zero matches under `parquet`'s default `.parquet` extension.
+    let fixture_path = dir.path().join("scores.csv");
+    std::fs::write(&fixture_path, "name,score\nalice,0.9\n").unwrap();
+
+    let source_id = format!("parquet_mismatch_{}", unique_suffix());
+    let err = session
+        .add_source(
+            &source_id,
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", fixture_path.display())),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains(".parquet"),
+        "error must name the applied extension filter: {message}"
+    );
+    assert!(
+        message.contains(&fixture_path.display().to_string()),
+        "error must name the url that matched nothing: {message}"
+    );
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn adaptive_extension_is_pinned_at_registration_and_survives_a_later_extension_flip(
+    backend: BackendKind,
+) {
+    let dir = tempdir().unwrap();
+    let source_id = format!("pinned_{}", unique_suffix());
+    let listing_dir = dir.path().join("flip_corpus");
+
+    {
+        let session = session_or_skip!(backend, dir);
+        std::fs::create_dir_all(&listing_dir).unwrap();
+        // Only `.ndjson` present at registration: the adaptive fallback
+        // resolves to `.ndjson`, and THAT is the extension that must get
+        // pinned into the persisted connection.
+        std::fs::write(listing_dir.join("a.ndjson"), "{\"id\": 1}\n{\"id\": 2}\n").unwrap();
+        session
+            .add_source(
+                &source_id,
+                SourceType::File,
+                SourceConnection {
+                    url: Some(format!("file://{}", listing_dir.display())),
+                    format: Some(FileFormat::JsonLines),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let results = session
+            .sql(&format!("SELECT id FROM {source_id}.public.flip_corpus"))
+            .await
+            .unwrap();
+        let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 2,
+            "registration must resolve to .ndjson and serve its 2 rows"
+        );
+    }
+
+    // The auditor's exact repro: AFTER registration, add a `.jsonl` file to
+    // the SAME directory. Without pinning, a re-derived adaptive resolution
+    // on the next reload would find `.jsonl` non-empty and silently switch
+    // to it — this reload would then serve only the NEW file's 1 row
+    // instead of the original 2, a served-corpus flip across a restart with
+    // no error and no signal anything changed.
+    std::fs::write(listing_dir.join("b.jsonl"), "{\"id\": 3}\n").unwrap();
+
+    let session = session_or_skip!(backend, dir);
+    let results = session
+        .sql(&format!("SELECT id FROM {source_id}.public.flip_corpus"))
+        .await
+        .unwrap();
+    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 2,
+        "the extension resolved at registration (.ndjson) must be PINNED and survive a later \
+         directory change that would otherwise flip the adaptive resolution to .jsonl on reload"
+    );
+
+    // The pin is observable in the persisted connection too, not just in
+    // the served row count.
+    let sources = session.catalog().list_all_sources().await.unwrap();
+    let record = sources
+        .iter()
+        .find(|s| s.source_id == source_id)
+        .expect("source must still be registered");
+    assert_eq!(
+        record.connection.file_extension.as_deref(),
+        Some(".ndjson"),
+        "the resolved extension must be persisted as an explicit override"
     );
 }
 

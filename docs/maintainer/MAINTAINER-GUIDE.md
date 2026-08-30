@@ -592,9 +592,14 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
 - **Source types** — `crates/jammi-db/src/source/mod.rs`: `SourceType { File,
   Postgres, Mysql }`; `FileFormat { Parquet, Csv, Json, JsonLines, Avro }` (Avro
   declared but unsupported, `crates/jammi-db/src/source/file_format.rs`;
-  `JsonLines` parses `"jsonl"`/`"ndjson"`, defaults directory listing to the
-  `.jsonl` extension, and otherwise shares `Json`'s line-delimited reader).
-  `SourceConnection`
+  `JsonLines` parses `"jsonl"`/`"ndjson"`, otherwise shares `Json`'s
+  line-delimited reader). With no explicit `file_extension` override,
+  `create_listing_table` tries `.jsonl` first and falls back to `.ndjson`
+  only when `.jsonl` has zero matches; the winning extension is RESOLVED
+  ONCE AT REGISTRATION and PINNED into the persisted `SourceConnection` (the
+  same persist-so-`reload_sources`-replays-it pattern `tenant_column` uses)
+  so a later directory change can never silently flip which files a reload
+  serves. `SourceConnection`
   (`crates/jammi-db/src/source/mod.rs`) JSON-serializes into `sources.options`, so
   new fields round-trip automatically.
 - **`MutableBackend`** — `crates/jammi-db/src/store/mutable/mod.rs` (the

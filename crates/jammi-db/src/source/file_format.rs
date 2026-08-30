@@ -69,15 +69,30 @@ async fn list_matching_files(
 /// [`FileFormat::JsonLines`] additionally gets an ADAPTIVE default extension
 /// when the caller has not overridden `file_extension` explicitly: `.jsonl`
 /// is tried first, and only when it has zero matches is `.ndjson` tried as a
-/// fallback — deterministic, `.jsonl` always wins over `.ndjson` when a
-/// directory holds both (the `.ndjson` files are then silently excluded, the
-/// ordinary "wrong extension" listing semantic every other format already
-/// has, not a new one). This is the only reachable path onto an `.ndjson`
-/// corpus: neither the wire `SourceConnection` message nor the CLI's
-/// `--format` flag exposes a `file_extension` override, so without this,
-/// `.ndjson`-named files could never be named by the format token alone. An
-/// explicit `file_extension` override (Rust-API-only today) is honoured
-/// literally, with no adaptive fallback.
+/// fallback — `.jsonl` always wins over `.ndjson` when a directory holds both
+/// (the `.ndjson` files are then silently excluded, the ordinary "wrong
+/// extension" listing semantic every other format already has, not a new
+/// one). This is the only reachable path onto an `.ndjson` corpus: neither
+/// the wire `SourceConnection` message nor the CLI's `--format` flag exposes
+/// a `file_extension` override, so without this, `.ndjson`-named files could
+/// never be named by the format token alone. An explicit `file_extension`
+/// override (Rust-API-only today) is honoured literally, with no adaptive
+/// fallback.
+///
+/// The adaptive resolution runs ONCE, here, at whatever moment the caller
+/// invokes this function — it is NOT re-derived from directory contents on
+/// every call, because directory contents can change between calls (a
+/// `.jsonl` file added to a corpus that previously resolved to `.ndjson`
+/// would otherwise flip which rows a reload serves). The returned
+/// `Option<String>` is `Some(resolved_ext)` exactly when the adaptive path
+/// ran (`FileFormat::JsonLines` with no `file_extension` override); the
+/// caller (`JammiSession::add_source`) persists it into the `SourceConnection`
+/// it writes to the catalog, so every subsequent call — in particular every
+/// `reload_sources` replay — passes an explicit `file_extension` and takes
+/// the non-adaptive branch below, resolved once and pinned forever
+/// (mirrors [`super::SourceConnection::tenant_column`]'s persist-so-reload-
+/// replays-it pattern). `None` for every other format, and for `JsonLines`
+/// with an explicit override already in force.
 pub async fn create_listing_table(
     ctx: &SessionContext,
     registry: &StorageRegistry,
@@ -86,7 +101,7 @@ pub async fn create_listing_table(
     file_extension: Option<&str>,
     cloud: Option<&CloudConfig>,
     session: &dyn Session,
-) -> Result<Arc<dyn TableProvider>> {
+) -> Result<(Arc<dyn TableProvider>, Option<String>)> {
     let driver = registry.driver_for(url, cloud)?;
     register_driver_for_url(ctx, url, Arc::clone(&driver))?;
 
@@ -119,33 +134,34 @@ pub async fn create_listing_table(
         FileFormat::Avro => return Err(JammiError::Config("Avro not yet supported".into())),
     };
 
-    let (ext, files) = if matches!(format, FileFormat::JsonLines) && file_extension.is_none() {
-        let jsonl_files =
-            list_matching_files(session, driver.as_ref(), &table_url, ".jsonl").await?;
-        if !jsonl_files.is_empty() {
-            (".jsonl", jsonl_files)
+    let (ext, files, resolved_for_persistence): (&str, Vec<ObjectMeta>, Option<String>) =
+        if matches!(format, FileFormat::JsonLines) && file_extension.is_none() {
+            let jsonl_files =
+                list_matching_files(session, driver.as_ref(), &table_url, ".jsonl").await?;
+            if !jsonl_files.is_empty() {
+                (".jsonl", jsonl_files, Some(".jsonl".to_string()))
+            } else {
+                let ndjson_files =
+                    list_matching_files(session, driver.as_ref(), &table_url, ".ndjson").await?;
+                if ndjson_files.is_empty() {
+                    return Err(JammiError::Config(format!(
+                        "no files matched extension '.jsonl' or '.ndjson' under '{url}' — the \
+                         source would register with no schema and no rows"
+                    )));
+                }
+                (".ndjson", ndjson_files, Some(".ndjson".to_string()))
+            }
         } else {
-            let ndjson_files =
-                list_matching_files(session, driver.as_ref(), &table_url, ".ndjson").await?;
-            if ndjson_files.is_empty() {
+            let ext = file_extension.unwrap_or(default_ext);
+            let files = list_matching_files(session, driver.as_ref(), &table_url, ext).await?;
+            if files.is_empty() {
                 return Err(JammiError::Config(format!(
-                    "no files matched extension '.jsonl' or '.ndjson' under '{url}' — the \
-                     source would register with no schema and no rows"
+                    "no files matched extension '{ext}' under '{url}' — the source would \
+                     register with no schema and no rows"
                 )));
             }
-            (".ndjson", ndjson_files)
-        }
-    } else {
-        let ext = file_extension.unwrap_or(default_ext);
-        let files = list_matching_files(session, driver.as_ref(), &table_url, ext).await?;
-        if files.is_empty() {
-            return Err(JammiError::Config(format!(
-                "no files matched extension '{ext}' under '{url}' — the source would register \
-                 with no schema and no rows"
-            )));
-        }
-        (ext, files)
-    };
+            (ext, files, None)
+        };
 
     let schema = df_format.infer_schema(session, &driver, &files).await?;
 
@@ -154,14 +170,18 @@ pub async fn create_listing_table(
         .with_listing_options(options)
         .with_schema(schema);
     let table = ListingTable::try_new(config)?;
-    Ok(Arc::new(table))
+    Ok((Arc::new(table), resolved_for_persistence))
 }
 
 /// Register the driver we built ourselves with DataFusion's runtime so its
 /// `ListingTableUrl` resolves the same backend on every read.
 ///
-/// `file://` and `memory://` are already known by DataFusion's defaults;
-/// only cloud schemes need explicit registration.
+/// `file://` is already known by DataFusion's own
+/// `DefaultObjectStoreRegistry` default (it pre-registers exactly that one
+/// scheme, nothing else); `memory://` is NOT, but is skipped here anyway —
+/// it is a test-only scheme (see [`crate::storage::Scheme::Memory`]) that no
+/// `File`-source registration path is driven through in practice.
+/// Only cloud schemes need the explicit registration below.
 fn register_driver_for_url(
     ctx: &SessionContext,
     url: &StorageUrl,

@@ -48,11 +48,17 @@ pub enum FileFormat {
     ///
     /// Directory listing tries `.jsonl` first; only when that has zero
     /// matches does it fall back to `.ndjson` (see
-    /// [`crate::source::file_format::create_listing_table`]) — deterministic,
-    /// `.jsonl` always wins when a directory holds both. This is the only
-    /// reachable path onto an `.ndjson` corpus: no wire or CLI surface names
-    /// `.ndjson` directly. An explicit `file_extension` override on
-    /// [`SourceConnection`] disables the fallback and is honoured literally.
+    /// [`crate::source::file_format::create_listing_table`]) — `.jsonl`
+    /// always wins when a directory holds both. This is the only reachable
+    /// path onto an `.ndjson` corpus: no wire or CLI surface names `.ndjson`
+    /// directly. This resolution runs exactly ONCE, at registration, and is
+    /// then PINNED into the persisted [`SourceConnection::file_extension`] —
+    /// every later `reload_sources` replay passes that pinned value as an
+    /// explicit override, so a directory change after registration (a
+    /// `.jsonl` file added to a corpus that resolved to `.ndjson`, or vice
+    /// versa) can never silently flip which files a reload serves. An
+    /// explicit `file_extension` override supplied by the caller up front
+    /// disables the fallback from the start and is honoured literally.
     JsonLines,
     /// Apache Avro binary format.
     Avro,
@@ -99,6 +105,12 @@ pub struct SourceConnection {
     pub format: Option<FileFormat>,
 
     /// Override the default file extension used during directory listing.
+    /// `None` on a fresh [`FileFormat::JsonLines`] registration (no caller
+    /// override) lets the engine adaptively choose `.jsonl` or `.ndjson`
+    /// once at registration; the engine writes the winner back here before
+    /// persisting, so every subsequent `reload_sources` replay sees an
+    /// explicit override and skips the adaptive resolution entirely — same
+    /// persist-once-replay-forever contract [`Self::tenant_column`] has.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_extension: Option<String>,
 

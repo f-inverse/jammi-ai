@@ -47,12 +47,16 @@ class DeriveClaimPigeonholeTests(unittest.TestCase):
         self.assertEqual(claim["verdict"], "not provable")
 
     def test_mixed_k_short_rows_threshold_is_k_plus_one(self):
-        # 10 rows, 3 short (reaches_cap=False) -- r_threshold = 4.
-        reaches_cap = [False, True, True, False, True, True, True, False, True, True]
-        claim = fwr.derive_claim(reaches_cap, batch_size=4)
-        self.assertEqual(claim["n_rows"], 10)
+        # 12 rows, 3 short (reaches_cap=False) -- r_threshold = 4.
+        # batch_size=6 is chosen so 12 % 6 == 0 (no remainder batch) --
+        # this test is about the base r_threshold=k+1 arithmetic, not the
+        # remainder-batch qualification (see RemainderBatchTests below).
+        reaches_cap = [False, True, True, False, True, True, True, False, True, True, True, True]
+        claim = fwr.derive_claim(reaches_cap, batch_size=6)
+        self.assertEqual(claim["n_rows"], 12)
         self.assertEqual(claim["k_short_rows"], 3)
         self.assertEqual(claim["r_threshold"], 4)
+        self.assertEqual(claim["remainder_batch_size"], 0)
         self.assertEqual(claim["verdict"], "width uniform at W")
 
     def test_batch_size_exactly_k_is_not_provable(self):
@@ -62,8 +66,12 @@ class DeriveClaimPigeonholeTests(unittest.TestCase):
         self.assertEqual(claim["verdict"], "not provable")
 
     def test_batch_size_one_more_than_k_is_uniform(self):
-        reaches_cap = [False, False, True, True, True]
+        # 6 rows (2 short), batch_size=3: 6 % 3 == 0 -- no remainder batch,
+        # so the base "batch_size == k+1" case gives an unconditional
+        # verdict (see RemainderBatchTests for the case where it does not).
+        reaches_cap = [False, False, True, True, True, True]
         claim = fwr.derive_claim(reaches_cap, batch_size=3)  # batch_size == k+1
+        self.assertEqual(claim["remainder_batch_size"], 0)
         self.assertEqual(claim["verdict"], "width uniform at W")
 
     def test_nonpositive_batch_size_refused(self):
@@ -77,6 +85,75 @@ class DeriveClaimPigeonholeTests(unittest.TestCase):
         self.assertEqual(claim["n_rows"], 0)
         self.assertEqual(claim["k_short_rows"], 0)
         self.assertEqual(claim["r_threshold"], 1)
+        self.assertEqual(claim["remainder_batch_size"], 0)
+        self.assertEqual(claim["verdict"], "width uniform at W")
+
+
+class RemainderBatchTests(unittest.TestCase):
+    """The remainder-batch qualification (module doc "THE REMAINDER
+    BATCH"): a corpus whose row count is not an exact multiple of
+    `batch_size` has one final batch SMALLER than the rest, which needs
+    its own, stricter threshold check -- never silently folded into an
+    unconditional "uniform" verdict."""
+
+    def test_remainder_smaller_than_threshold_qualifies_the_verdict(self):
+        # 10 rows, batch_size=4: 10 % 4 == 2 (remainder batch of size 2).
+        # k=3 -- full-size (4-row) batches clear r_threshold=4, but the
+        # 2-row remainder batch does NOT (2 < 4) -- QUALIFIED verdict,
+        # never unconditional "uniform".
+        reaches_cap = [False, True, True, False, True, True, True, False, True, True]
+        claim = fwr.derive_claim(reaches_cap, batch_size=4)
+        self.assertEqual(claim["n_rows"], 10)
+        self.assertEqual(claim["k_short_rows"], 3)
+        self.assertEqual(claim["r_threshold"], 4)
+        self.assertEqual(claim["remainder_batch_size"], 2)
+        self.assertNotEqual(claim["verdict"], "width uniform at W")
+        self.assertIn("full-size", claim["verdict"])
+        self.assertIn("remainder batch", claim["verdict"])
+        self.assertIn("not provable", claim["verdict"])
+
+    def test_remainder_at_least_threshold_is_still_unconditionally_uniform(self):
+        # 5 rows, batch_size=3: 5 % 3 == 2 (remainder batch of size 2).
+        # k=0 -- r_threshold=1, so BOTH the 3-row full batches AND the
+        # 2-row remainder batch clear it (2 >= 1) -- unconditional
+        # "width uniform at W", not qualified.
+        reaches_cap = [True, True, True, True, True]
+        claim = fwr.derive_claim(reaches_cap, batch_size=3)
+        self.assertEqual(claim["remainder_batch_size"], 2)
+        self.assertEqual(claim["verdict"], "width uniform at W")
+
+    def test_full_batches_not_uniform_remainder_cannot_rescue_it(self):
+        # batch_size itself fails the threshold (batch_size == k) -- the
+        # remainder cannot make this any more provable, whatever its size.
+        reaches_cap = [False, False, True, True, True, True, True]  # n=7, k=2
+        claim = fwr.derive_claim(reaches_cap, batch_size=2)  # 7 % 2 == 1
+        self.assertEqual(claim["remainder_batch_size"], 1)
+        self.assertEqual(claim["verdict"], "not provable")
+
+    def test_e1_like_1372_pairs_batch_32_remainder_28_qualifies(self):
+        # The contract's own real numbers (module doc): 1372 train pairs,
+        # batch 32, 1372 % 32 == 28. k=30 short rows -- full-size (32-row)
+        # batches clear r_threshold=31 (32 >= 31), but the 28-row remainder
+        # batch does not (28 < 31) -- QUALIFIED, the exact class this
+        # fixture-shaped test pins.
+        n, batch_size, k = 1372, 32, 30
+        self.assertEqual(n % batch_size, 28)
+        reaches_cap = [False] * k + [True] * (n - k)
+        claim = fwr.derive_claim(reaches_cap, batch_size=batch_size)
+        self.assertEqual(claim["remainder_batch_size"], 28)
+        self.assertEqual(claim["r_threshold"], 31)
+        self.assertNotEqual(claim["verdict"], "width uniform at W")
+        self.assertIn("not provable", claim["verdict"])
+
+    def test_e1_like_1372_pairs_batch_32_remainder_28_still_uniform_when_k_is_small(self):
+        # Same real shape, but few enough short rows (k=10) that even the
+        # 28-row remainder batch clears r_threshold=11 -- unconditional
+        # "width uniform at W", no qualification needed.
+        n, batch_size, k = 1372, 32, 10
+        reaches_cap = [False] * k + [True] * (n - k)
+        claim = fwr.derive_claim(reaches_cap, batch_size=batch_size)
+        self.assertEqual(claim["remainder_batch_size"], 28)
+        self.assertEqual(claim["r_threshold"], 11)
         self.assertEqual(claim["verdict"], "width uniform at W")
 
 

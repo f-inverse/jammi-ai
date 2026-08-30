@@ -80,10 +80,21 @@ _VOCAB = [
     "model", "paper", "study", "result", "method", "approach", "network",
 ]
 
-# Extra words beyond `min_wordpieces` drawn per text -- absorbs any single
-# `_VOCAB` entry that (in a real, unverified deployment) turns out not to
-# be a lone wordpiece, without needing the exact count to be provably
-# tight; see module doc's "Construction and its guarantee".
+# Extra words beyond `min_wordpieces` drawn per text. A `_VOCAB` entry that
+# turns out NOT to be a lone wordpiece under a real, unverified tokenizer
+# only ever HELPS this guarantee, never hurts it: a BERT-style pipeline
+# pre-splits on whitespace/punctuation BEFORE wordpiece matching, so every
+# whitespace-separated word independently produces AT LEAST one wordpiece
+# (worst case: a single `[UNK]`) -- a word that fragments into two or more
+# subword pieces only makes the true count HIGHER than the word count,
+# never lower. This buffer is therefore NOT protecting against that
+# failure mode (mathematically, `_BUFFER = 1` would already be sufficient
+# for `> min_wordpieces` to hold even under worst-case fragmentation). It
+# exists purely as a small, cheap defensive margin -- its exact size is
+# not load-bearing -- against any OTHER irregularity in a caller-supplied
+# vocab entry (e.g. one that normalizes/strips away to nothing under a
+# particular tokenizer's own pre-processing); see module doc's
+# "Construction and its guarantee".
 _BUFFER = 3
 
 

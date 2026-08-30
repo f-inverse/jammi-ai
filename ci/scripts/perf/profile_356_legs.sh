@@ -13,29 +13,44 @@
 # checkpoint directories (`$MODEL_DIR_BERT`/`$MODEL_DIR_DISTILBERT`).
 # `PROFILE_356_LEGS_DRY_RUN=1` makes the WHOLE pipeline safe to exercise
 # hermetically (every `nsys`/`$BENCH_BIN` invocation is printed via
-# `run_cmd`, never executed; each run's own JSON is a small stub carrying
-# just enough shape -- `train_run_wall_s` and the LoRA counter fields --
-# for the wall-denominator/counter-stamping arithmetic below to run
-# end-to-end against real, if fabricated, numbers).
+# `run_cmd`, never executed; each run's own JSON stub is DERIVED from the
+# committed `finetune_run_golden` fixture -- see `_dry_run_stub_report`'s
+# own doc -- so every reader below runs against the SAME envelope shape a
+# real `jammi-bench finetune-run` actually emits, never a hand-shaped
+# stand-in).
 #
 # PRECONDITION GUARD (round-3 contract pressure-test, v4): this script
 # REFUSES, before any leg runs, unless the bench binary carries THREE
-# things P1 (bench, in flight) lands separately:
-#   (a) the `finetune-run` DistilBERT dispatch arm (today: `finetune_run.rs`
-#       matches only `"modernbert"`/`"bert"`, refusing every other
-#       `model_type` with "unsupported model_type '<other>'" -- see this
-#       script's own `preflight_probe`).
-#   (b) `train_run_wall_s` on `FinetuneRunTier` (today: absent -- the
-#       WITHDRAWN `s_per_step_p50`/`s_per_step_mean` spec lived on
-#       `FinetuneStepTier` only, never this tier).
-#   (c) a `--layers-to-transform` CLI flag on `finetune-run` (today:
-#       absent -- `FinetuneRunParams` has no such field at all, and
+# things `bench/356-finetune-run-distilbert` lands in the SAME atomic PR
+# (B6) as this producer -- a docs-ci branch cannot itself carry crate
+# changes, so this preflight, not a doc claim, is the mechanical proof the
+# LANDED tree actually contains all three:
+#   (a) the `finetune-run` DistilBERT dispatch arm (`finetune_run.rs`'s
+#       `model_type` match previously admitted only `"modernbert"`/`"bert"`,
+#       refusing every other value with "unsupported model_type '<other>'").
+#   (b) `train_run_wall_s` on `FinetuneRunTier` (previously only
+#       `FinetuneStepTier` carried a wall-clock pair -- the WITHDRAWN
+#       `s_per_step_p50`/`s_per_step_mean` spec).
+#   (c) a `--layers-to-transform` CLI flag on `finetune-run` (previously
+#       absent entirely -- `FinetuneRunParams` had no such field, and
 #       `finetune_run.rs`'s own `LoraBuildConfig`/`FineTuneConfig`
-#       construction hardcodes `layers_to_transform: None` unconditionally,
-#       so even a caller that could pass the flag would have it silently
-#       dropped internally).
-# Each is probed CHEAPLY (CPU-hermetic dry finetune-run + a `--help` scan),
-# never requiring a GPU or a full training run just to check readiness.
+#       construction hardcoded `layers_to_transform: None` unconditionally).
+# Each is probed CHEAPLY (a CPU-hermetic dry finetune-run + a `--help`
+# scan), never requiring a GPU or a full training run just to check
+# readiness -- and never merely trusted because a sibling PR claims to
+# have landed it. The probe uses ARCHITECTURE-CORRECT LoRA selectors
+# (`$DISTIL_FULL`, the same selectors the real DistilBERT legs use) --
+# `finetune_run.rs`'s own unconditional zero-trainable-LoRA refusal fires
+# on ANY `target_modules` that matches nothing on the probed architecture
+# (the CLI's own default, `Wqkv,Wo,Wi`, is ModernBERT-only and matches
+# nothing on DistilBERT), so an unqualified probe would refuse on THAT
+# gap and never reach the distilbert-dispatch/wall-field checks it exists
+# to make. `PROFILE_356_LEGS_PREFLIGHT_ONLY=1` runs the preflight probe
+# and exits before the leg sweep -- the hook a hermetic test drives
+# against a fake `$BENCH_BIN` stub to exercise each of the four
+# distinguishable outcomes (pass; (a) distilbert-arm missing; (b)
+# wall-field missing; (c) flag missing; a genuinely-unrelated failure)
+# without a GPU or a real checkpoint.
 #
 # STEP-COUNT PIN (round-3 contract pressure-test, v4): N=100, M=600 for
 # every non-E1 leg -- both multiples of 50 (`trainer.rs`'s own norm-check
@@ -55,11 +70,29 @@
 # loss-dependent checkpoint_best divergence"). Overridable via
 # `PROFILE_356_E1_STEPS_N`/`PROFILE_356_E1_STEPS_M`.
 #
-# WALL DENOMINATOR (v4): each run's own `train_run_wall_s` (P1) is read
-# from its JSON report and passed to `kernel_census.py` as `--wall-a`/
-# `--wall-b`, which derives `wall_s_per_step = (wall_b-wall_a)/(M-N)` --
-# the same (M-N)-step differencing this script already applies to the
-# kernel trace, applied to the wall clock too.
+# EVERY DECLARED LEG PARAMETER REACHES THE BINARY AND IS RECORDED
+# (phase-4 audit CLASS 3): width (`--max-seq-length`), LoRA selectors
+# (`--target-modules`), `--layers-to-transform` (N legs only), the fixed
+# `--eval-cadence` (`$EVAL_CADENCE`, same value every leg -- "fixed eval
+# cadence" cancels in the N/M differencing the same way every other pinned
+# flag does), and `dtype` all appear literally in `run_traced`'s own `cmd`
+# array; steps N/M are what SIZE the corpus (there is no standalone
+# "--steps" flag -- steps are `rows/batch` at `--epochs 1`) and are
+# recorded, alongside every other column, in each leg's `manifest.json`
+# (`steps_declared`), cross-checked there against the report's own
+# MEASURED `steps_measured` (also passed to `kernel_census.py` as
+# `--steps-measured-a`/`-b`, its own domain check -- see that module's
+# doc). `manifest.json` also carries `status`/`reason`/`census_ok` per leg
+# -- "leg INVALID, recorded, sweep continues" is a RECORD, not just a
+# warning line: a leg-level failure anywhere in this script never aborts
+# the whole sweep (every risky step is individually guarded; `run_leg`
+# itself always returns 0), but IS captured in that leg's own manifest.
+#
+# WALL DENOMINATOR (v4): each run's own `train_run_wall_s` is read from
+# `tiers.finetune_run` in its JSON report and passed to `kernel_census.py`
+# as `--wall-a`/`--wall-b`, which derives `wall_s_per_step =
+# (wall_b-wall_a)/(M-N)` -- the same (M-N)-step differencing this script
+# already applies to the kernel trace, applied to the wall clock too.
 #
 # CHAIN-ATTRIBUTION EXCLUSION (v4): E1 is variable-width (`BatchLongest`
 # over the real fixture) -- `### Attribution`'s element-count/shape
@@ -80,14 +113,22 @@
 #                          (default: `$REPO_ROOT/.profile-356-legs/<ts>`)
 #   PROFILE_356_LEGS_DRY_RUN   "1" prints every command, executes nothing
 #                              (default "0")
+#   PROFILE_356_LEGS_PREFLIGHT_ONLY
+#                              "1" runs the preflight probe then exits
+#                              (before the leg sweep) -- the hook a
+#                              hermetic test drives against a fake
+#                              `$BENCH_BIN` (default "0")
 #   PROFILE_356_E1_STEPS_N/M   E1's own (N,M) pair (default 10/40 -- see
 #                              "STEP-COUNT PIN" above)
 #   PROFILE_356_LEGS_ONLY      optional comma-separated leg-id filter
 #                              (e.g. "bert-A1,distilbert-E1") -- default
 #                              empty means every one of the 14 legs.
 #
-# Hermetic self-test: `python3 ci/scripts/perf/test_profile_356_legs_dry_run.py`
-# drives this script under PROFILE_356_LEGS_DRY_RUN=1 end to end.
+# Hermetic self-tests: `python3 ci/scripts/perf/test_profile_356_legs_dry_run.py`
+# drives this script under PROFILE_356_LEGS_DRY_RUN=1 end to end (every
+# leg, every reader, the manifest schema); its own preflight arm drives
+# `PROFILE_356_LEGS_PREFLIGHT_ONLY=1` against a fake `$BENCH_BIN` stub
+# covering the pass case and each of the four distinguishable failure arms.
 
 set -euo pipefail
 
@@ -95,6 +136,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 
 PROFILE_356_LEGS_DRY_RUN="${PROFILE_356_LEGS_DRY_RUN:-0}"
+PROFILE_356_LEGS_PREFLIGHT_ONLY="${PROFILE_356_LEGS_PREFLIGHT_ONLY:-0}"
 NSYS_BIN="${NSYS_BIN:-/opt/nvidia/nsight-systems/2025.3.2/bin/nsys}"
 TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
 BENCH_BIN="${BENCH_BIN:-$TARGET_DIR/release/jammi-bench}"
@@ -105,6 +147,24 @@ OUT_DIR="${OUT_DIR:-$REPO_ROOT/.profile-356-legs/$TS}"
 PROFILE_356_E1_STEPS_N="${PROFILE_356_E1_STEPS_N:-10}"
 PROFILE_356_E1_STEPS_M="${PROFILE_356_E1_STEPS_M:-40}"
 PROFILE_356_LEGS_ONLY="${PROFILE_356_LEGS_ONLY:-}"
+
+# The one fixed eval cadence every leg shares (`## Declared workload`'s
+# "fixed eval cadence") -- a script-level constant, never a per-leg
+# column, referenced directly by `run_traced`/the manifest builder rather
+# than threaded through as yet another positional parameter.
+EVAL_CADENCE=1
+
+# CONTRACT legs table selector sets (verified: 72 BERT sites = 12x6 via
+# `ends_with` matching, 36 DistilBERT = 6x6) -- defined HERE, before
+# `preflight_probe`, so the probe itself can use `$DISTIL_FULL` (phase-4
+# audit CLASS 2: an unqualified probe -- CLI default `target_modules`,
+# ModernBERT-only -- matches nothing on DistilBERT and trips
+# `finetune_run.rs`'s own unconditional zero-trainable-LoRA refusal before
+# ever reaching the dispatch/wall-field checks the probe exists to make).
+BERT_FULL="query,key,value,dense"
+BERT_ONE="query"
+DISTIL_FULL="q_lin,k_lin,v_lin,out_lin,lin1,lin2"
+DISTIL_ONE="q_lin"
 
 mkdir -p "$OUT_DIR"
 
@@ -177,7 +237,10 @@ preflight_probe() {
   # (a)+(b): one minimal CPU-hermetic dry finetune-run against
   # MODEL_DIR_DISTILBERT -- cheap (1 pair, 1 epoch, no --cuda), reused to
   # probe BOTH the distilbert dispatch arm and the train_run_wall_s field
-  # in one shot.
+  # in one shot. `--target-modules "$DISTIL_FULL"` (phase-4 audit CLASS
+  # 2): an unqualified probe would fail on the unconditional
+  # zero-trainable-LoRA refusal instead of ever reaching the dispatch
+  # check.
   local probe_dir; probe_dir="$(mktemp -d)"
   local probe_corpus="$probe_dir/probe.jsonl"
   python3 "$DIR/gen_fixed_width_corpus.py" --rows 1 --min-wordpieces 4 --seed 1 --out "$probe_corpus" >/dev/null
@@ -197,6 +260,7 @@ preflight_probe() {
     --seed 42 --epochs 1 --batch 1 --objective mnrl \
     --validation-fraction 0 --early-stopping-metric train_loss --grad-accum 1 \
     --early-stopping-patience 10000 --backbone-dtype f32 \
+    --target-modules "$DISTIL_FULL" \
     --work-dir "$probe_work" \
     > "$probe_out" 2> "$probe_err" || probe_rc=$?
 
@@ -207,24 +271,34 @@ preflight_probe() {
       missing+=("(a)/(b) probe finetune-run FAILED for a reason other than the known distilbert gap (exit $probe_rc) -- cannot verify preconditions; see $probe_err")
     fi
   else
-    if ! python3 -c 'import json,sys; sys.exit(0 if "train_run_wall_s" in json.load(open(sys.argv[1])) else 1)' "$probe_out"; then
-      missing+=("(b) the probe finetune-run's own JSON report has no train_run_wall_s field")
+    if ! python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+tier = d.get("tiers", {}).get("finetune_run")
+sys.exit(0 if tier is not None and "train_run_wall_s" in tier else 1)
+' "$probe_out"; then
+      missing+=("(b) the probe finetune-run's own JSON report has no tiers.finetune_run.train_run_wall_s field")
     fi
   fi
   rm -rf "$probe_dir"
 
   if [ "${#missing[@]}" -gt 0 ]; then
-    echo "::error::profile_356_legs: refusing -- precondition(s) not yet landed (P1, in flight):" >&2
+    echo "::error::profile_356_legs: refusing -- precondition(s) not yet landed:" >&2
     local m
     for m in "${missing[@]}"; do
       echo "  - $m" >&2
     done
     exit 1
   fi
-  echo "::notice::profile_356_legs: preflight OK -- distilbert arm dispatches, train_run_wall_s present, --layers-to-transform available."
+  echo "::notice::profile_356_legs: preflight OK -- distilbert arm dispatches, tiers.finetune_run.train_run_wall_s present, --layers-to-transform available."
 }
 
 preflight_probe
+
+if [ "$PROFILE_356_LEGS_PREFLIGHT_ONLY" = "1" ]; then
+  echo "::notice::PROFILE_356_LEGS_PREFLIGHT_ONLY=1 -- preflight passed, exiting before the leg sweep."
+  exit 0
+fi
 
 # =====================================================================
 # Leg table (CONTRACT legs table, 7 legs x 2 models = 14) --
@@ -232,11 +306,6 @@ preflight_probe
 # corpus_mode: "synthetic" (gen_fixed_width_corpus.py) or "heldout" (E1
 # only -- the committed/provisioned real fixture).
 # =====================================================================
-BERT_FULL="query,key,value,dense"
-BERT_ONE="query"
-DISTIL_FULL="q_lin,k_lin,v_lin,out_lin,lin1,lin2"
-DISTIL_ONE="q_lin"
-
 LEGS=(
   "bert-A1|bert|8|512|f32|$BERT_FULL||synthetic|100|600"
   "bert-A2|bert|8|512|bf16|$BERT_FULL||synthetic|100|600"
@@ -258,15 +327,62 @@ FIXTURE_DIR="$REPO_ROOT/cookbook/fixtures/finetune_heldout"
 HELDOUT_IDS="$FIXTURE_DIR/heldout_ids.txt"
 HELDOUT_JSONL="$FIXTURE_DIR/heldout_pairs.jsonl"
 TRAIN_JSONL_REAL="${TRAIN_JSONL:-$FIXTURE_DIR/train_pairs.jsonl}"
+GOLDEN_FIXTURE="$REPO_ROOT/ci/scripts/perf/fixtures/finetune_run_golden/bert_fused.json"
+
+# Emits the REAL Report envelope shape (`{"tool":...,"tiers":
+# {"finetune_run":{...}}}` -- `main.rs::run_finetune_run`), DERIVED from
+# the committed golden fixture -- never hand-shaped -- so a DRY_RUN run
+# exercises the EXACT same JSON structure every real reader in this script
+# binds to (phase-4 audit CLASS 1: a hand-shaped `{"train_run_wall_s":
+# ...}` top-level stub let three real bugs -- the preflight field probe
+# always reading `false`, `_wall_s` KeyError-aborting the whole sweep
+# under `set -e`, `_lora_counters` silently yielding `{}` -- ship
+# undetected, because the stub never exercised the readers' real
+# `tiers.finetune_run` binding at all).
+_dry_run_stub_report() {
+  local out_json="$1" steps_measured="$2"
+  python3 -c '
+import copy, json, sys
+golden_path, out_path, steps_measured = sys.argv[1], sys.argv[2], int(sys.argv[3])
+golden = json.load(open(golden_path))
+tier = copy.deepcopy(golden["tiers"]["finetune_run"])
+# Proportional to steps_measured (never a flat constant): the M-step run
+# always declares more steps than the N-step run, so this keeps
+# wall_m > wall_a > 0 genuinely true across the stubbed pair, exercising
+# the wall-pair domain check in kernel_census.py the same way a real
+# same-workload N<M pair would satisfy it, rather than an equal (and
+# therefore WallPairInvalidError-triggering) constant. Bash single-quotes
+# this whole block -- NO apostrophes/contractions allowed in this comment.
+tier["train_run_wall_s"] = 0.01 * steps_measured
+tier["steps_measured"] = steps_measured
+tier["lora_linear_eager_dispatches"] = 1
+tier["lora_linear_fused_dispatches"] = 0
+tier["lora_epilogue_eager_dispatches"] = 1
+tier["lora_epilogue_fused_dispatches"] = 0
+report = {"tool": "dry-run", "profile_356_dry_run": True, "tiers": {"finetune_run": tier}}
+json.dump(report, open(out_path, "w"))
+' "$GOLDEN_FIXTURE" "$out_json" "$steps_measured"
+}
 
 # One nsys-traced finetune-run: writes "$out_json" (the run's own JSON
-# report) and "$out_sqlite" (the nsys sqlite export). Returns 0 always
-# (DRY_RUN or a real run) -- a leg's own run failure is a leg-level
-# refusal decided by the caller, not a script-wide abort.
+# report) and "$out_sqlite" (the nsys sqlite export). Returns the
+# underlying command's exit status (0 on success) -- `run_leg` decides
+# what a nonzero return means for this leg's own status; this function
+# itself never aborts the sweep (every command here is either `run_cmd`,
+# already-guarded, or the DRY_RUN stub path).
+#
+# EVERY declared leg parameter reaches this cmd array (phase-4 audit
+# CLASS 3): `--max-seq-length "$width"` (previously OMITTED entirely --
+# clap's own default of 64 silently ran every W=512 leg, including the
+# contract's mandatory A1/N1, at W=64) and `--eval-cadence "$EVAL_CADENCE"`
+# (previously relied on the CLI's own default; passed explicitly here so
+# the fixed value is self-documenting rather than an unstated default that
+# could silently change).
 run_traced() {
   local model_dir="$1" train_jsonl="$2" heldout_ids="$3" heldout_jsonl="$4" \
         seed="$5" batch="$6" dtype="$7" target_modules="$8" layers_to_transform="$9" \
-        work_dir="${10}" run_prefix="${11}" out_json="${12}" out_sqlite="${13}"
+        width="${10}" steps_this_run="${11}" \
+        work_dir="${12}" run_prefix="${13}" out_json="${14}" out_sqlite="${15}"
 
   mkdir -p "$work_dir"
   local -a cmd=(
@@ -278,6 +394,8 @@ run_traced() {
     --early-stopping-patience 10000 --backbone-dtype "$dtype"
     --lora-rank 8 --lora-alpha 16 --lora-dropout 0.05
     --target-modules "$target_modules"
+    --max-seq-length "$width"
+    --eval-cadence "$EVAL_CADENCE"
     --work-dir "$work_dir" --cuda 0
   )
   if [ -n "$layers_to_transform" ]; then
@@ -287,27 +405,149 @@ run_traced() {
   if [ "$PROFILE_356_LEGS_DRY_RUN" = "1" ]; then
     run_cmd "$NSYS_BIN" profile --trace=cuda -o "$run_prefix" --force-overwrite=true -- "${cmd[@]}"
     run_cmd "$NSYS_BIN" export --type=sqlite --output="$out_sqlite" --force-overwrite=true "$run_prefix.nsys-rep"
-    printf '{"tool":"dry-run","profile_356_dry_run":true,"train_run_wall_s":1.0,"lora_linear_eager_dispatches":1,"lora_linear_fused_dispatches":0,"lora_epilogue_eager_dispatches":1,"lora_epilogue_fused_dispatches":0}' > "$out_json"
+    _dry_run_stub_report "$out_json" "$steps_this_run"
     : > "$out_sqlite"
     return 0
   fi
 
-  run_cmd "$NSYS_BIN" profile --trace=cuda -o "$run_prefix" --force-overwrite=true -- "${cmd[@]}" > "$out_json" 2> "$run_prefix.stderr"
-  run_cmd "$NSYS_BIN" export --type=sqlite --output="$out_sqlite" --force-overwrite=true "$run_prefix.nsys-rep"
+  local rc=0
+  run_cmd "$NSYS_BIN" profile --trace=cuda -o "$run_prefix" --force-overwrite=true -- "${cmd[@]}" > "$out_json" 2> "$run_prefix.stderr" || rc=$?
+  run_cmd "$NSYS_BIN" export --type=sqlite --output="$out_sqlite" --force-overwrite=true "$run_prefix.nsys-rep" || rc=$?
+  return "$rc"
 }
 
+# Reads `tiers.finetune_run.train_run_wall_s` -- REFUSES (nonzero exit,
+# clear stderr message, no stray stdout) rather than KeyError-ing when
+# either the envelope or the field is absent (phase-4 audit CLASS 1: the
+# prior top-level `["train_run_wall_s"]` read KeyErrored, and as a plain
+# `var=$(...)` assignment under `set -e` this ABORTED THE WHOLE SWEEP --
+# `run_leg`'s own explicit `|| { leg_status=invalid; ...; }` guards at
+# every call site are what actually contain a refusal to this one leg now,
+# not this function's own exit code alone).
 _wall_s() {
-  python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["train_run_wall_s"])' "$1"
-}
-
-_lora_counters() {
-  python3 -c 'import json,sys
+  python3 -c '
+import json, sys
 d = json.load(open(sys.argv[1]))
-print(json.dumps({k: d[k] for k in (
-    "lora_linear_eager_dispatches", "lora_linear_fused_dispatches",
-    "lora_epilogue_eager_dispatches", "lora_epilogue_fused_dispatches") if k in d}))' "$1"
+tier = d.get("tiers", {}).get("finetune_run")
+if tier is None or "train_run_wall_s" not in tier:
+    print("::error::_wall_s: no tiers.finetune_run.train_run_wall_s in " + sys.argv[1], file=sys.stderr)
+    sys.exit(1)
+print(tier["train_run_wall_s"])
+' "$1"
 }
 
+# Reads `tiers.finetune_run.steps_measured` -- same REFUSE-don't-degrade
+# posture as `_wall_s`. Call sites tolerate absence explicitly (`||
+# steps_measured_x=""`) since this field is cross-checked "when available"
+# (CONTRACT/audit CLASS 4(c)), never required the way `train_run_wall_s`
+# is.
+_steps_measured() {
+  python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+tier = d.get("tiers", {}).get("finetune_run")
+if tier is None or "steps_measured" not in tier:
+    print("::error::_steps_measured: no tiers.finetune_run.steps_measured in " + sys.argv[1], file=sys.stderr)
+    sys.exit(1)
+print(tier["steps_measured"])
+' "$1"
+}
+
+# Reads the four LoRA dispatch counters off `tiers.finetune_run` --
+# REFUSES (nonzero exit, no stdout) when ANY of the four is absent, rather
+# than silently yielding `{}` (phase-4 audit CLASS 1: `{}` is the
+# contract's OWN positive-proof channel -- `### Positive proof`'s
+# `eager == site_count x batches` equation -- so silently emitting it
+# empty on a read failure would make a genuinely un-provable leg look
+# identical to a real, if trivially empty, measurement).
+_lora_counters() {
+  python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+tier = d.get("tiers", {}).get("finetune_run")
+required = ("lora_linear_eager_dispatches", "lora_linear_fused_dispatches",
+            "lora_epilogue_eager_dispatches", "lora_epilogue_fused_dispatches")
+if tier is None:
+    print("::error::_lora_counters: no tiers.finetune_run in " + sys.argv[1], file=sys.stderr)
+    sys.exit(1)
+missing = [k for k in required if k not in tier]
+if missing:
+    print("::error::_lora_counters: missing LoRA counter field(s) " + repr(missing) +
+          " in tiers.finetune_run of " + sys.argv[1], file=sys.stderr)
+    sys.exit(1)
+print(json.dumps({k: tier[k] for k in required}))
+' "$1"
+}
+
+# Writes leg_dir/manifest.json -- ALWAYS, regardless of whether this leg's
+# own status is "ok" or "invalid" (phase-4 audit CLASS 3: "leg INVALID,
+# recorded, sweep continues" must be an actual RECORD, not just a log
+# line). Every declared leg-table column (width, target_modules,
+# layers_to_transform, dtype, eval_cadence, steps_declared) plus the
+# report-measured steps_measured (when readable) and the census/LoRA-
+# counter outcome. `git_sha`/`box`/`driver`/`nsys_version` are this
+# producer's own per-leg elaboration of the contract's own legs-table
+# sentence, "one session, same box, one build, binary git-sha stamped per
+# leg" -- that sentence names the session-level invariant (same box, same
+# build, one git sha for the whole sweep); it does not itself enumerate
+# `driver`/`nsys_version` as separate fields, which this producer adds for
+# its own auditability.
+_write_manifest() {
+  MANIFEST_LEG_ID="$1" MANIFEST_GIT_SHA="$2" MANIFEST_BOX="$3" MANIFEST_NSYS_VERSION="$4" \
+  MANIFEST_DTYPE="$5" MANIFEST_WIDTH="$6" MANIFEST_TARGET_MODULES="$7" \
+  MANIFEST_LAYERS_TO_TRANSFORM="$8" MANIFEST_EVAL_CADENCE="$9" \
+  MANIFEST_STEPS_DECLARED_N="${10}" MANIFEST_STEPS_DECLARED_M="${11}" \
+  MANIFEST_STEPS_MEASURED_N="${12}" MANIFEST_STEPS_MEASURED_M="${13}" \
+  MANIFEST_STATUS="${14}" MANIFEST_REASON="${15}" MANIFEST_CENSUS_OK="${16}" \
+  MANIFEST_LORA_N="${17}" MANIFEST_LORA_M="${18}" MANIFEST_OUT="${19}" \
+  python3 -c '
+import json, os
+
+
+def _int_or_none(v):
+    return int(v) if v not in ("", None) else None
+
+
+manifest = {
+    "leg_id": os.environ["MANIFEST_LEG_ID"],
+    "git_sha": os.environ["MANIFEST_GIT_SHA"],
+    "box": os.environ["MANIFEST_BOX"],
+    "driver": "ci/scripts/perf/profile_356_legs.sh",
+    "nsys_version": os.environ["MANIFEST_NSYS_VERSION"],
+    "dtype": os.environ["MANIFEST_DTYPE"],
+    "width": int(os.environ["MANIFEST_WIDTH"]),
+    "target_modules": os.environ["MANIFEST_TARGET_MODULES"].split(","),
+    "layers_to_transform": os.environ["MANIFEST_LAYERS_TO_TRANSFORM"] or None,
+    "eval_cadence": int(os.environ["MANIFEST_EVAL_CADENCE"]),
+    "steps_declared": {
+        "n": int(os.environ["MANIFEST_STEPS_DECLARED_N"]),
+        "m": int(os.environ["MANIFEST_STEPS_DECLARED_M"]),
+    },
+    "steps_measured": {
+        "n": _int_or_none(os.environ["MANIFEST_STEPS_MEASURED_N"]),
+        "m": _int_or_none(os.environ["MANIFEST_STEPS_MEASURED_M"]),
+    },
+    "status": os.environ["MANIFEST_STATUS"],
+    "reason": os.environ["MANIFEST_REASON"],
+    "census_ok": os.environ["MANIFEST_CENSUS_OK"] == "true",
+    "lora_counters_n_run": json.loads(os.environ["MANIFEST_LORA_N"]),
+    "lora_counters_m_run": json.loads(os.environ["MANIFEST_LORA_M"]),
+}
+json.dump(manifest, open(os.environ["MANIFEST_OUT"], "w"), indent=1)
+'
+}
+
+# One leg, start to finish. ALWAYS returns 0 -- a leg's own failure lives
+# in its `manifest.json` (`status`/`reason`), never in this function's own
+# exit code, so one leg's OOM/refusal never discards any other leg (phase-4
+# audit CLASS 3: previously several risky reads here were plain,
+# `set -e`-fatal commands -- e.g. `wall_n="$(_wall_s "$out_n")"` -- so a
+# single leg's read failure silently ABORTED THE ENTIRE 14-LEG SWEEP,
+# directly contradicting this function's own "never aborts" doc. Every
+# risky step below is now an explicit `if leg_status = ok; then ... ||
+# {leg_status=invalid; ...}; fi` guard, so a failure partway through a leg
+# skips only that leg's REMAINING steps -- never the sweep, and never even
+# this function's own control flow via `set -e`).
 run_leg() {
   local spec="$1"
   IFS='|' read -r leg_id model batch width dtype target_modules layers_to_transform corpus_mode n_steps m_steps <<< "$spec"
@@ -325,95 +565,162 @@ run_leg() {
   if [ "$model" = "bert" ]; then model_dir="$MODEL_DIR_BERT"; else model_dir="$MODEL_DIR_DISTILBERT"; fi
 
   local leg_dir="$OUT_DIR/$leg_id"
-  mkdir -p "$leg_dir"
+  if ! mkdir -p "$leg_dir"; then
+    echo "::error::$leg_id: could not create $leg_dir -- nothing recorded for this leg." >&2
+    return 0
+  fi
 
-  local train_n train_m heldout_ids heldout_jsonl
+  local leg_status="ok"
+  local leg_reason=""
+
+  # --- corpus provisioning ---
+  local train_n="" train_m="" heldout_ids="$HELDOUT_IDS" heldout_jsonl="$HELDOUT_JSONL"
+  local verify_tok_args=()
+  if [ -f "$model_dir/tokenizer.json" ]; then
+    verify_tok_args=(--verify-tokenizer "$model_dir/tokenizer.json")
+  fi
+
   if [ "$corpus_mode" = "synthetic" ]; then
     local full_corpus="$leg_dir/corpus_m${m_steps}.jsonl"
     local rows_m=$(( batch * m_steps ))
     local rows_n=$(( batch * n_steps ))
     if [ "$PROFILE_356_LEGS_DRY_RUN" != "1" ]; then
-      python3 "$DIR/gen_fixed_width_corpus.py" --rows "$rows_m" --min-wordpieces "$width" --seed 42 --out "$full_corpus"
-      head -n "$rows_n" "$full_corpus" > "$leg_dir/corpus_n${n_steps}.jsonl"
+      if python3 "$DIR/gen_fixed_width_corpus.py" --rows "$rows_m" --min-wordpieces "$width" \
+          --seed 42 --out "$full_corpus" "${verify_tok_args[@]}"; then
+        head -n "$rows_n" "$full_corpus" > "$leg_dir/corpus_n${n_steps}.jsonl"
+        train_n="$leg_dir/corpus_n${n_steps}.jsonl"
+        train_m="$full_corpus"
+      else
+        leg_status="invalid"
+        leg_reason="gen_fixed_width_corpus.py failed (see leg dir for any partial output)"
+      fi
     else
-      run_cmd python3 "$DIR/gen_fixed_width_corpus.py" --rows "$rows_m" --min-wordpieces "$width" --seed 42 --out "$full_corpus"
+      run_cmd python3 "$DIR/gen_fixed_width_corpus.py" --rows "$rows_m" --min-wordpieces "$width" \
+        --seed 42 --out "$full_corpus" "${verify_tok_args[@]}"
       : > "$full_corpus"
       : > "$leg_dir/corpus_n${n_steps}.jsonl"
+      train_n="$leg_dir/corpus_n${n_steps}.jsonl"
+      train_m="$full_corpus"
     fi
-    train_n="$leg_dir/corpus_n${n_steps}.jsonl"
-    train_m="$full_corpus"
-    heldout_ids="$HELDOUT_IDS"
-    heldout_jsonl="$HELDOUT_JSONL"
   else
     # E1: the REAL, network-provisioned + byte-verified train_pairs.jsonl
     # (CONTRACT P2) -- pre-run provisioning is this script's caller's job
     # (mirrors finetune_run_ab.sh's own PRE-RUN PROVISIONING step); this
-    # driver only refuses if the file is absent/fails verification.
+    # driver only refuses (this leg only, never the sweep) if the file is
+    # absent/fails verification.
     if [ "$PROFILE_356_LEGS_DRY_RUN" != "1" ]; then
-      python3 "$DIR/verify_train_pairs.py" --pairs "$TRAIN_JSONL_REAL" \
-        || { echo "::error::$leg_id: $TRAIN_JSONL_REAL failed byte-verification -- refusing this leg." >&2; return 1; }
-      head -n "$(( batch * n_steps ))" "$TRAIN_JSONL_REAL" > "$leg_dir/corpus_n${n_steps}.jsonl"
-      head -n "$(( batch * m_steps ))" "$TRAIN_JSONL_REAL" > "$leg_dir/corpus_m${m_steps}.jsonl"
+      if python3 "$DIR/verify_train_pairs.py" --pairs "$TRAIN_JSONL_REAL"; then
+        head -n "$(( batch * n_steps ))" "$TRAIN_JSONL_REAL" > "$leg_dir/corpus_n${n_steps}.jsonl"
+        head -n "$(( batch * m_steps ))" "$TRAIN_JSONL_REAL" > "$leg_dir/corpus_m${m_steps}.jsonl"
+        train_n="$leg_dir/corpus_n${n_steps}.jsonl"
+        train_m="$leg_dir/corpus_m${m_steps}.jsonl"
+      else
+        leg_status="invalid"
+        leg_reason="$TRAIN_JSONL_REAL failed byte-verification against the committed train_ids_sha256.json"
+      fi
     else
       : > "$leg_dir/corpus_n${n_steps}.jsonl"
       : > "$leg_dir/corpus_m${m_steps}.jsonl"
+      train_n="$leg_dir/corpus_n${n_steps}.jsonl"
+      train_m="$leg_dir/corpus_m${m_steps}.jsonl"
     fi
-    train_n="$leg_dir/corpus_n${n_steps}.jsonl"
-    train_m="$leg_dir/corpus_m${m_steps}.jsonl"
-    heldout_ids="$HELDOUT_IDS"
-    heldout_jsonl="$HELDOUT_JSONL"
   fi
 
   local out_n="$leg_dir/run_n.json" out_m="$leg_dir/run_m.json"
   local sqlite_n="$leg_dir/run_n.sqlite" sqlite_m="$leg_dir/run_m.sqlite"
 
-  run_traced "$model_dir" "$train_n" "$heldout_ids" "$heldout_jsonl" 42 "$batch" "$dtype" \
-    "$target_modules" "$layers_to_transform" "$leg_dir/work_n" "$leg_dir/run_n" "$out_n" "$sqlite_n"
-  run_traced "$model_dir" "$train_m" "$heldout_ids" "$heldout_jsonl" 42 "$batch" "$dtype" \
-    "$target_modules" "$layers_to_transform" "$leg_dir/work_m" "$leg_dir/run_m" "$out_m" "$sqlite_m"
-
-  local census_json="$leg_dir/census.json"
-  local -a census_cmd=(
-    python3 "$DIR/kernel_census.py" "$sqlite_n" "$sqlite_m" "$n_steps" "$m_steps" "$census_json"
-  )
-  if [ "$PROFILE_356_LEGS_DRY_RUN" != "1" ]; then
-    local wall_n wall_m
-    wall_n="$(_wall_s "$out_n")"
-    wall_m="$(_wall_s "$out_m")"
-    census_cmd+=(--wall-a "$wall_n" --wall-b "$wall_m")
+  if [ "$leg_status" = "ok" ]; then
+    if ! run_traced "$model_dir" "$train_n" "$heldout_ids" "$heldout_jsonl" 42 "$batch" "$dtype" \
+        "$target_modules" "$layers_to_transform" "$width" "$n_steps" \
+        "$leg_dir/work_n" "$leg_dir/run_n" "$out_n" "$sqlite_n"; then
+      leg_status="invalid"
+      leg_reason="run_traced (N-step run) failed -- see $leg_dir/run_n.stderr"
+    fi
   fi
-  case "$leg_id" in
-    *-E1) census_cmd+=(--excluded-from-chain-attribution) ;;
-  esac
-  run_cmd "${census_cmd[@]}" || echo "::warning::$leg_id: kernel_census.py FAILED -- leg INVALID, recorded, sweep continues." >&2
+  if [ "$leg_status" = "ok" ]; then
+    if ! run_traced "$model_dir" "$train_m" "$heldout_ids" "$heldout_jsonl" 42 "$batch" "$dtype" \
+        "$target_modules" "$layers_to_transform" "$width" "$m_steps" \
+        "$leg_dir/work_m" "$leg_dir/run_m" "$out_m" "$sqlite_m"; then
+      leg_status="invalid"
+      leg_reason="run_traced (M-step run) failed -- see $leg_dir/run_m.stderr"
+    fi
+  fi
 
-  # Per-leg provenance/LoRA-counter stamp (CONTRACT: "Stamp per leg: git
-  # sha, box, driver, nsys version, dtype, leg id, LoRA counter fields
-  # pulled from the tier report").
+  local wall_n="" wall_m=""
+  if [ "$leg_status" = "ok" ]; then
+    if ! wall_n="$(_wall_s "$out_n")"; then
+      leg_status="invalid"
+      leg_reason="could not read tiers.finetune_run.train_run_wall_s from the N-step run"
+    fi
+  fi
+  if [ "$leg_status" = "ok" ]; then
+    if ! wall_m="$(_wall_s "$out_m")"; then
+      leg_status="invalid"
+      leg_reason="could not read tiers.finetune_run.train_run_wall_s from the M-step run"
+    fi
+  fi
+
+  # steps_measured: cross-checked "when available" -- absence alone is
+  # never a leg failure (a build predating that field, or a DRY_RUN stub
+  # that chose not to populate it, is not an error), only a DISAGREEMENT
+  # with the declared count is (kernel_census.py's own domain check, fed
+  # via --steps-measured-a/-b below).
+  local steps_measured_n="" steps_measured_m=""
+  if [ "$leg_status" = "ok" ]; then
+    steps_measured_n="$(_steps_measured "$out_n" 2>/dev/null)" || steps_measured_n=""
+    steps_measured_m="$(_steps_measured "$out_m" 2>/dev/null)" || steps_measured_m=""
+  fi
+
+  local census_ok="false"
+  local census_json="$leg_dir/census.json"
+  if [ "$leg_status" = "ok" ]; then
+    local -a census_cmd=(
+      python3 "$DIR/kernel_census.py" "$sqlite_n" "$sqlite_m" "$n_steps" "$m_steps" "$census_json"
+      --wall-a "$wall_n" --wall-b "$wall_m"
+    )
+    if [ -n "$steps_measured_n" ]; then census_cmd+=(--steps-measured-a "$steps_measured_n"); fi
+    if [ -n "$steps_measured_m" ]; then census_cmd+=(--steps-measured-b "$steps_measured_m"); fi
+    case "$leg_id" in
+      *-E1) census_cmd+=(--excluded-from-chain-attribution) ;;
+    esac
+    if run_cmd "${census_cmd[@]}"; then
+      census_ok="true"
+    else
+      leg_status="invalid"
+      leg_reason="kernel_census.py refused (leg INVALID -- see its own exit code/stderr; no census.json written)"
+    fi
+  fi
+
+  local lora_n="null" lora_m="null"
+  if [ "$leg_status" = "ok" ]; then
+    if ! lora_n="$(_lora_counters "$out_n")"; then
+      leg_status="invalid"
+      leg_reason="_lora_counters refused on the N-step run (missing LoRA counter field -- the contract's only positive-proof channel)"
+      lora_n="null"
+    fi
+  fi
+  if [ "$leg_status" = "ok" ]; then
+    if ! lora_m="$(_lora_counters "$out_m")"; then
+      leg_status="invalid"
+      leg_reason="_lora_counters refused on the M-step run (missing LoRA counter field -- the contract's only positive-proof channel)"
+      lora_m="null"
+    fi
+  fi
+
   local nsys_version="unknown"
   if [ "$PROFILE_356_LEGS_DRY_RUN" != "1" ]; then
     nsys_version="$("$NSYS_BIN" --version 2>&1 | head -1)"
   fi
-  local lora_n="{}" lora_m="{}"
-  if [ "$PROFILE_356_LEGS_DRY_RUN" != "1" ] && [ -s "$out_n" ] && [ -s "$out_m" ]; then
-    lora_n="$(_lora_counters "$out_n")"
-    lora_m="$(_lora_counters "$out_m")"
+
+  _write_manifest \
+    "$leg_id" "$SHA" "$(hostname)" "$nsys_version" "$dtype" "$width" "$target_modules" \
+    "$layers_to_transform" "$EVAL_CADENCE" "$n_steps" "$m_steps" \
+    "$steps_measured_n" "$steps_measured_m" "$leg_status" "$leg_reason" "$census_ok" \
+    "$lora_n" "$lora_m" "$leg_dir/manifest.json"
+
+  if [ "$leg_status" != "ok" ]; then
+    echo "::warning::$leg_id: INVALID -- $leg_reason (recorded in $leg_dir/manifest.json; sweep continues)." >&2
   fi
-  python3 -c '
-import json, sys
-leg_id, git_sha, box, nsys_version, dtype, lora_n, lora_m, out = sys.argv[1:]
-manifest = {
-    "leg_id": leg_id,
-    "git_sha": git_sha,
-    "box": box,
-    "driver": "ci/scripts/perf/profile_356_legs.sh",
-    "nsys_version": nsys_version,
-    "dtype": dtype,
-    "lora_counters_n_run": json.loads(lora_n),
-    "lora_counters_m_run": json.loads(lora_m),
-}
-json.dump(manifest, open(out, "w"), indent=1)
-' "$leg_id" "$SHA" "$(hostname)" "$nsys_version" "$dtype" "$lora_n" "$lora_m" "$leg_dir/manifest.json"
 
   # E1's own width evidence (Artifacts: "the E1 width histogram produced
   # OFFLINE by the tracked producer re-tokenizing the fixture in the same
@@ -421,7 +728,8 @@ json.dump(manifest, open(out, "w"), indent=1)
   # heldout_pairs.jsonl (never the synthetic corpus) regardless of model,
   # since the fixture text itself is model-independent -- only the
   # tokenizer differs, and the caller supplies model_dir's own
-  # tokenizer.json.
+  # tokenizer.json. Best-effort: never affects this leg's own status
+  # (E1's width evidence is a separate artifact, not a census input).
   case "$leg_id" in
     *-E1)
       if [ "$PROFILE_356_LEGS_DRY_RUN" != "1" ]; then
@@ -432,6 +740,7 @@ json.dump(manifest, open(out, "w"), indent=1)
       fi
       ;;
   esac
+  return 0
 }
 
 for spec in "${LEGS[@]}"; do

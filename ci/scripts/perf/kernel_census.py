@@ -12,7 +12,10 @@ is IDENTICAL across the two runs and cancels in the subtraction.
 Promoted from the throwaway `scratchpad/pod/kernel_census.py` ancestor
 (P4, contract's precondition table): same schema query (CUPTI_ACTIVITY_
 KIND_KERNEL joined to StringIds on `shortName`; memcpy/memset totals; GPU
-wall span), hardened per contract:
+wall span), hardened per contract. Every guard below is a DOMAIN check on
+whether the two sqlite exports actually describe the declared
+same-workload (N, M) pair -- none of them are generic exception handling
+for its own sake:
 
   - refuses (exit nonzero, no report) if EITHER export lacks a
     `CUPTI_ACTIVITY_KIND_KERNEL` table -- the contract's own "Per-leg
@@ -20,6 +23,13 @@ wall span), hardened per contract:
     A missing kernel table means the export never records the kernel-level
     trace this whole census depends on; there is no partial/degraded
     report to emit, only a loud refusal.
+  - refuses (exit nonzero, no report) if EITHER export's kernel table is
+    PRESENT but EMPTY (zero rows) -- a present-but-empty table is the SAME
+    instrument failure as a missing table (no kernel-level trace was
+    captured), not a legitimate "zero kernels dispatched" measurement; left
+    unchecked this would exit 0 with every share silently zero, which a
+    downstream reader could mistake for a genuine DECLINE-licensing
+    negative result rather than an unusable capture.
   - refuses (exit nonzero) unless `steps_b > steps_a` (M > N) -- a
     same-workload pair is defined by "measure M steps, measure N steps,
     subtract"; M<=N is not a valid differencing pair at all (a zero or
@@ -35,6 +45,30 @@ wall span), hardened per contract:
     e.g. a stale/mismatched sqlite file, a build/config drift between the
     two captures, or an export path bug -- and must not be silently folded
     into a report a reader could mistake for a clean measurement.
+  - refuses (exit nonzero, no report) unless `wall_b > wall_a > 0` whenever
+    `--wall-a`/`--wall-b` are both given -- the SAME non-negativity/
+    ordering domain check the per-key kernel/memcpy/memset deltas already
+    get above, applied to the one delta this module cannot derive from the
+    sqlite exports themselves (a caller-supplied `train_run_wall_s` pair
+    that is non-positive, equal, or inverted is not a valid same-workload
+    M>N wall-clock pair either, and dividing by `steps_b - steps_a` would
+    otherwise silently emit a negative or infinite `wall_s_per_step`).
+  - cross-checks the CALLER-declared `steps_a`/`steps_b` against the
+    report's own MEASURED `steps_measured` (`FinetuneRunTier`), when the
+    caller supplies `--steps-measured-a`/`--steps-measured-b` -- refuses
+    if either measured value disagrees with the declared one, since a
+    leg whose run did not actually execute the declared step count is not
+    the pair this differencing was supposed to isolate (a truncated run,
+    an early-stopping firing despite the never-stops idiom, or a caller
+    passing the wrong (N, M) pair to this tool by mistake). Optional
+    (omitted when the caller has no measured value to check against, e.g.
+    a build predating `train_run_wall_s`/`steps_measured` or a DRY_RUN
+    smoke stub that chooses not to populate it).
+  - a corrupt/truncated sqlite file (`sqlite3.DatabaseError`, e.g. a
+    0-byte-but-nonzero-length garbage file, or a file truncated mid-write)
+    is caught and re-raised as a NAMED, declared exit code -- never an
+    unhandled Python traceback, which is indistinguishable from a bug in
+    this tool itself to anything scraping this producer's exit status.
 
 Output JSON: the ancestor's shape (`steps_diff`, `gpu_kernel_us_per_step`,
 `launches_per_step`, `memcpy_per_step`, `memset_per_step`,
@@ -43,16 +77,20 @@ Output JSON: the ancestor's shape (`steps_diff`, `gpu_kernel_us_per_step`,
 
 Wall denominator (round-3 pressure-test, contract v4 -- `### Wall
 denominator`): `--wall-a`/`--wall-b` (seconds, each run's OWN
-`train_run_wall_s` -- `FinetuneRunTier`, P1) are OPTIONAL; when BOTH are
-given, the report also carries `wall_s_per_step = (wall_b - wall_a) /
-(steps_b - steps_a)` -- the same (M-N)-step differencing this module
-already applies to kernel/memcpy/memset counts, applied to the wall clock
-too, so `share_wall(C) = time(C)/wall_p50` (`### Wall denominator`) has a
+`train_run_wall_s` -- `FinetuneRunTier`) are OPTIONAL; when BOTH are
+given (and pass the `wall_b > wall_a > 0` domain check above), the report
+also carries `wall_s_per_step = (wall_b - wall_a) / (steps_b - steps_a)`
+-- the same (M-N)-step differencing this module already applies to
+kernel/memcpy/memset counts, applied to the wall clock too, so
+`share_wall(C) = time(C)/wall_p50` (`### Wall denominator`) has a
 same-footing per-step wall figure to divide into. Omitted (both flags
 absent) leaves `wall_s_per_step` out of the report entirely -- never a
-fabricated 0.0 -- since a leg driver that has not yet wired
-`train_run_wall_s` (P1, in flight) must not silently report a wall
-denominator it never measured.
+fabricated 0.0 -- since this differencer has no way to independently
+measure wall-clock time itself; a caller unable to supply two real,
+correctly-ordered `train_run_wall_s` values (whatever the reason -- a
+build that does not emit the field, a report shape it could not parse,
+or simply choosing not to wire it) must not have a wall denominator
+silently fabricated on its behalf.
 
 Chain-attribution exclusion (round-3 pressure-test, contract v4): E1 (the
 ecological, variable-width leg) is EXCLUDED from signature-based chain
@@ -70,13 +108,19 @@ Omitted (the default) stamps `false`.
 Usage: kernel_census.py A.sqlite B.sqlite STEPS_A STEPS_B out.json
        [--launch-tolerance N] [--time-tolerance-us F]
        [--wall-a SECONDS --wall-b SECONDS] [--excluded-from-chain-attribution]
+       [--steps-measured-a N --steps-measured-b M]
 
 Hermetic: reads only the two sqlite files named on the command line (plus
 stdlib `sqlite3`); no network, no build, no GPU. Exit codes: 0 = report
-written; 2 = usage error (including M<=N); 3 = a kernel table is missing
-on one or both exports (leg INVALID -- instrument failure); 4 = a
-per-key delta is negative beyond tolerance (leg INVALID -- non-comparable
-pair, not a genuine negative measurement).
+written; 2 = usage error (including M<=N, a one-sided --wall-*); 3 = a
+kernel table is missing on one or both exports (leg INVALID -- instrument
+failure); 4 = a per-key delta is negative beyond tolerance (leg INVALID --
+non-comparable pair, not a genuine negative measurement); 5 = declared
+steps disagree with the report's own steps_measured (leg INVALID); 6 = a
+kernel table is present but EMPTY on one or both exports (leg INVALID --
+same instrument failure as exit 3); 7 = the wall pair fails
+`wall_b > wall_a > 0` (leg INVALID); 8 = a sqlite export is corrupt/
+unreadable (`sqlite3.DatabaseError`).
 """
 
 from __future__ import annotations
@@ -105,9 +149,34 @@ class KernelTableMissingError(RuntimeError):
     generic sqlite/parse error."""
 
 
+class KernelTableEmptyError(RuntimeError):
+    """Named exception for the leg-INVALID "CUPTI_ACTIVITY_KIND_KERNEL table
+    is PRESENT but has zero rows" condition -- distinct from
+    `KernelTableMissingError` (the table exists, so the schema check alone
+    would pass) but the SAME underlying failure: no kernel-level trace was
+    actually captured. See module doc."""
+
+
 class NonComparablePairError(RuntimeError):
     """Named exception for the leg-INVALID "a per-key delta went negative
     beyond tolerance" condition -- see module doc."""
+
+
+class WallPairInvalidError(RuntimeError):
+    """Named exception for the leg-INVALID "`--wall-a`/`--wall-b` do not
+    satisfy `wall_b > wall_a > 0`" condition -- see module doc."""
+
+
+class StepsMismatchError(RuntimeError):
+    """Named exception for the leg-INVALID "declared steps_a/steps_b
+    disagree with the report's own measured steps_measured" condition --
+    see module doc."""
+
+
+class CensusDatabaseError(RuntimeError):
+    """Named exception wrapping a `sqlite3.DatabaseError` (corrupt/
+    truncated export) -- lets `main()` return a declared, distinguishable
+    exit code instead of an unhandled traceback. See module doc."""
 
 
 def _has_kernel_table(con: sqlite3.Connection) -> bool:
@@ -122,18 +191,42 @@ def census(path: str) -> tuple[dict, dict, tuple]:
     per-kind memcpy/memset {(count, ns)}, (min_start, max_end) wall span).
 
     Raises `KernelTableMissingError` if `path` has no
-    `CUPTI_ACTIVITY_KIND_KERNEL` table -- checked BEFORE any query runs
-    against it, so a missing table is never silently read as "zero rows".
+    `CUPTI_ACTIVITY_KIND_KERNEL` table, `KernelTableEmptyError` if that
+    table exists but has zero rows (checked BEFORE any further query runs
+    against it, so neither condition is ever silently read as "zero
+    kernels dispatched"), or `CensusDatabaseError` if `path` cannot be read
+    as a sqlite database at all (`sqlite3.DatabaseError` -- a corrupt or
+    truncated export).
     """
     con = sqlite3.connect(path)
     try:
-        if not _has_kernel_table(con):
+        try:
+            table_present = _has_kernel_table(con)
+        except sqlite3.DatabaseError as e:
+            raise CensusDatabaseError(
+                f"{path}: not a readable sqlite database ({e}) -- leg INVALID"
+            ) from e
+        if not table_present:
             raise KernelTableMissingError(
                 f"{path}: no CUPTI_ACTIVITY_KIND_KERNEL table in this nsys sqlite export -- "
                 "leg INVALID (instrument failure, not a genuine measurement; contract "
                 "`### Instrument`'s per-leg check)"
             )
         cur = con.cursor()
+        try:
+            (row_count,) = cur.execute("SELECT COUNT(*) FROM CUPTI_ACTIVITY_KIND_KERNEL").fetchone()
+        except sqlite3.DatabaseError as e:
+            raise CensusDatabaseError(
+                f"{path}: CUPTI_ACTIVITY_KIND_KERNEL exists but could not be read ({e}) -- "
+                "leg INVALID"
+            ) from e
+        if row_count == 0:
+            raise KernelTableEmptyError(
+                f"{path}: CUPTI_ACTIVITY_KIND_KERNEL table is PRESENT but has zero rows -- "
+                "leg INVALID (the same instrument failure as a missing table: no kernel-level "
+                "trace was actually captured; a genuine all-zero census cannot be distinguished "
+                "from a broken capture, so this refuses rather than emitting an all-zero report)"
+            )
         # nsys 2025.x schema: CUPTI_ACTIVITY_KIND_KERNEL joined to StringIds for names.
         q = """SELECT s.value, k.gridX, k.gridY, k.gridZ, k.blockX, k.blockY, k.blockZ,
                       COUNT(*), SUM(k.end - k.start)
@@ -186,16 +279,34 @@ def build_report(
     wall_a: float | None = None,
     wall_b: float | None = None,
     excluded_from_chain_attribution: bool = False,
+    steps_measured_a: int | None = None,
+    steps_measured_b: int | None = None,
 ) -> dict:
-    """Builds the census-difference report dict, or raises
-    `KernelTableMissingError` / `NonComparablePairError` (see module doc).
-    Never partially writes a report on either error path -- the caller
-    only serializes the return value once this function returns
-    successfully."""
+    """Builds the census-difference report dict, or raises one of this
+    module's named exceptions (see module doc). Never partially writes a
+    report on any error path -- the caller only serializes the return
+    value once this function returns successfully."""
     if steps_b <= steps_a:
         raise ValueError(
             f"steps_b ({steps_b}) must be strictly greater than steps_a ({steps_a}) -- "
             "a census difference needs a genuine M>N same-workload pair"
+        )
+    if wall_a is not None and wall_b is not None and not (wall_a > 0 and wall_b > wall_a):
+        raise WallPairInvalidError(
+            f"--wall-a={wall_a} --wall-b={wall_b} do not satisfy wall_b > wall_a > 0 -- not a "
+            "valid same-workload M>N wall-clock pair"
+        )
+    if steps_measured_a is not None and steps_measured_a != steps_a:
+        raise StepsMismatchError(
+            f"declared steps_a={steps_a} but the report's own steps_measured_a="
+            f"{steps_measured_a} -- the N-step run did not actually execute the declared step "
+            "count"
+        )
+    if steps_measured_b is not None and steps_measured_b != steps_b:
+        raise StepsMismatchError(
+            f"declared steps_b={steps_b} but the report's own steps_measured_b="
+            f"{steps_measured_b} -- the M-step run did not actually execute the declared step "
+            "count"
         )
 
     ca, ma, _ = census(path_a)
@@ -295,7 +406,8 @@ def main(argv: list[str] | None = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         usage="%(prog)s A.sqlite B.sqlite STEPS_A STEPS_B out.json "
         "[--launch-tolerance N] [--time-tolerance-us F] "
-        "[--wall-a SECONDS --wall-b SECONDS] [--excluded-from-chain-attribution]",
+        "[--wall-a SECONDS --wall-b SECONDS] [--excluded-from-chain-attribution] "
+        "[--steps-measured-a N --steps-measured-b M]",
     )
     ap.add_argument("sqlite_a", help="nsys sqlite export for the N-step run")
     ap.add_argument("sqlite_b", help="nsys sqlite export for the M-step run (M>N)")
@@ -337,6 +449,18 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="stamp excluded_from_chain_attribution=true (E1's variable-width leg; see module doc)",
     )
+    ap.add_argument(
+        "--steps-measured-a",
+        type=int,
+        default=None,
+        help="the N-step run's own report.steps_measured, cross-checked against steps_a",
+    )
+    ap.add_argument(
+        "--steps-measured-b",
+        type=int,
+        default=None,
+        help="the M-step run's own report.steps_measured, cross-checked against steps_b",
+    )
     args = ap.parse_args(argv)
 
     if (args.wall_a is None) != (args.wall_b is None):
@@ -366,6 +490,8 @@ def main(argv: list[str] | None = None) -> int:
             wall_a=args.wall_a,
             wall_b=args.wall_b,
             excluded_from_chain_attribution=args.excluded_from_chain_attribution,
+            steps_measured_a=args.steps_measured_a,
+            steps_measured_b=args.steps_measured_b,
         )
     except KernelTableMissingError as e:
         print(f"::error::kernel_census: {e}", file=sys.stderr)
@@ -373,6 +499,18 @@ def main(argv: list[str] | None = None) -> int:
     except NonComparablePairError as e:
         print(f"::error::kernel_census: {e}", file=sys.stderr)
         return 4
+    except StepsMismatchError as e:
+        print(f"::error::kernel_census: {e}", file=sys.stderr)
+        return 5
+    except KernelTableEmptyError as e:
+        print(f"::error::kernel_census: {e}", file=sys.stderr)
+        return 6
+    except WallPairInvalidError as e:
+        print(f"::error::kernel_census: {e}", file=sys.stderr)
+        return 7
+    except CensusDatabaseError as e:
+        print(f"::error::kernel_census: {e}", file=sys.stderr)
+        return 8
     except ValueError as e:
         print(f"::error::kernel_census: {e}", file=sys.stderr)
         return 2

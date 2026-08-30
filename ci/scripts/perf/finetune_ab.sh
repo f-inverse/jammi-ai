@@ -5,6 +5,12 @@
 # or directly over ssh once the checkout is on the pod. NOT a CI job (no
 # GPU on the CI image).
 #
+# `closes_escape: esc-067-committed-producer-never-executed-end-to-end`
+# (the eval side, hermetically, lives in `test_finetune_ab_sh_dry_run.py`'s
+# `DryRunSmokeTests` and `test_identity_fields_subset.py`'s
+# `F32StoredFieldCanonicalizerTests` — a REAL pod run is the residual that
+# closes this row fully, not claimed by CI alone).
+#
 # #352 has two clauses, and this producer discharges only the FIRST:
 #   * throughput + no-OOM (the ratio/PASS/FAIL/INDETERMINATE bar this
 #     script's own table computes, against a synthetic cost-fixture step —

@@ -523,6 +523,14 @@ class F32StoredFieldCanonicalizerTests(unittest.TestCase):
     before this canonicalizer existed): `0.05000000074505806` is the REAL
     `f64` a Python/JSON round-trip produces for the IEEE-754 `f32` nearest
     `0.05`; `0.30000001192092896` is the same for `0.3`.
+
+    `closes_escape: esc-067-committed-producer-never-executed-end-to-end`
+    — before this canonicalizer, a real pod run of `finetune_ab.sh`
+    rejected every `dropout != 0` cross-stack row (jammi's own f32-stored
+    `0.05000000074505806` vs torch's f64 literal `0.05`) as a leg-premise
+    mismatch, one of three defects a real end-to-end run found that no
+    hermetic suite had ever exercised. This class is the hermetic,
+    RED-then-GREEN half of that fix's own eval.
     """
 
     def test_lora_dropout_f32_vs_f64_literal_matches(self):

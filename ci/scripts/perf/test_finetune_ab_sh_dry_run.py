@@ -50,6 +50,22 @@ def run_dry(out_dir, extra_env=None):
 
 
 class DryRunSmokeTests(unittest.TestCase):
+    """`closes_escape: esc-067-committed-producer-never-executed-end-to-end`
+    — real pod runs of the committed `finetune_ab.sh` found three defects
+    (a provenance check ordered after a now-removed ref-switch, the
+    f32/f64 `lora_dropout` mismatch, and a build missing the flash
+    feature the acceptance artifact measures) that no hermetic suite had
+    ever exercised because nothing ever ran this script's own control
+    flow end-to-end before landing it. This class is the CI-safe,
+    hardware-free half of that fix's own eval: it drives the REAL
+    subprocess through its REAL argv construction, build-once ordering,
+    and `TWO_RUN_PROTOCOL_MARKER` write, under `AB_DRY_RUN=1` so it needs
+    no GPU/network/build. It proves the SCRIPT's control flow is correct;
+    it does NOT by itself prove the producer completes on real hardware —
+    see this escape row's own `symptom_spec.control` for the residual
+    (closes fully only once a real pod run joins a recurring lane).
+    """
+
     def test_dry_run_runs_end_to_end_and_exits_zero(self):
         with tempfile.TemporaryDirectory() as out_dir:
             result = run_dry(out_dir)

@@ -2012,6 +2012,24 @@ mod tests {
             msg.contains("bert"),
             "error must name the model_type: {msg}"
         );
+        // Round-2 audit advisory: `layers_to_transform` was `&None` here, so
+        // the message's " restricted to layers {layers:?}" clause must be
+        // ABSENT — this is the negative control for
+        // `build_encoder_adapters_names_layers_to_transform_when_it_causes_the_zero_trainable_refusal`'s
+        // positive case: an implementation that unconditionally emitted
+        // "restricted to layers []"/"restricted to layers None" regardless
+        // of the actual `layers_to_transform` value would make THAT test's
+        // `msg.contains("layers_to_transform")` pass vacuously off the
+        // message's own unconditional tail clause (which also contains the
+        // literal substring "layers_to_transform" via "check
+        // layers_to_transform for an off-by-one layer index if it is set")
+        // — this assertion is what actually binds the conditional
+        // interpolation to the real `None` case.
+        assert!(
+            !msg.contains("restricted to layers"),
+            "with layers_to_transform: None, the message must NOT claim a layer restriction \
+             caused the refusal: {msg}"
+        );
     }
 
     /// CORRECTED (round-2 pressure-test): an explicitly EMPTY
@@ -2211,6 +2229,22 @@ mod tests {
     /// and asserts at the `serde_json::Value` PATH level — never by reading
     /// the Rust struct fields back — that `tiers.finetune_run` carries both
     /// keys.
+    ///
+    /// RED evidence (round-2 audit, both performed by hand, reverted
+    /// immediately after): (1) the `layers_to_transform` half is doubly
+    /// covered — temporarily adding `#[serde(skip_serializing_if =
+    /// "Option::is_none")]` to that field made THIS test fail before even
+    /// reaching its own assertion, inside `run_impl`'s own
+    /// `assert_identity_fields_present` self-check (`IDENTITY_FIELDS names
+    /// "layers_to_transform", absent on this report`) — so a second,
+    /// independent mechanism already guards it. (2) `train_run_wall_s`'s
+    /// `> 0.0` assertion below is that field's ONLY coverage: temporarily
+    /// hardcoding `train_run_wall_s: 0.0` at [`run_impl`]'s tier
+    /// construction site made ONLY this test's own `wall_s > 0.0` assertion
+    /// fail (`tiers.finetune_run.train_run_wall_s must carry a real,
+    /// measured, nonzero value in the emitted JSON, got 0`) — no other
+    /// test and no producer-side self-check caught it, confirming this is
+    /// the field's sole RED-provable guard.
     #[tokio::test]
     async fn finetune_run_tier_json_actually_emits_layers_to_transform_and_train_run_wall_s() {
         let work_dir = tempfile::tempdir().expect("tempdir");

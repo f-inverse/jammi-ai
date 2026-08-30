@@ -1323,6 +1323,45 @@ jobs:
           - name: arch validation freshness self-test
             cmd: python3 ci/scripts/check_arch_validation_freshness.py --self-test
             fetch_depth: "0"
+          # `kernel_census.py`'s own suite (issue #356 close-out profile
+          # precondition P4): drives the real `build_report`/`census`
+          # functions against a TINY synthetic sqlite fixture built in-test
+          # (the same CUPTI_ACTIVITY_KIND_KERNEL/StringIds/MEMCPY/MEMSET
+          # schema shape a real nsys export carries) — never a real nsys
+          # capture, no GPU, no `nsys` binary. Same "zero-execution is RED,
+          # not a skip" reasoning as the other `perf/test_*.py` suites above.
+          - name: perf kernel_census suite
+            cmd: python3 ci/scripts/perf/test_kernel_census.py
+          # `gen_fixed_width_corpus.py`'s own suite (#356 P4): determinism
+          # (same (rows, min_wordpieces, seed) -> byte-identical output),
+          # the emitted JSONL schema (the exact six TripletRow keys
+          # `crates/jammi-bench/src/main.rs` expects), and the width-margin
+          # guarantee (every emitted text exceeds --min-wordpieces
+          # whitespace-separated words). Stdlib-only, no network, no
+          # `tokenizers` package required.
+          - name: perf gen_fixed_width_corpus suite
+            cmd: python3 ci/scripts/perf/test_gen_fixed_width_corpus.py
+          # `fixture_width_report.py`'s own suite (#356 P4 Artifacts/"Width
+          # pinning"): drives the real `derive_claim` pigeonhole-verdict
+          # logic against a synthetic reaches_cap length table — never a
+          # re-implementation of the math, and never requiring the
+          # `tokenizers` package (the verdict logic is a pure function of
+          # per-row booleans + batch size, exactly so it is testable
+          # without a real tokenizer).
+          - name: perf fixture_width_report suite
+            cmd: python3 ci/scripts/perf/test_fixture_width_report.py
+          # Hermetic `PROFILE_356_LEGS_DRY_RUN=1` smoke test for
+          # `profile_356_legs.sh` itself (#356 P4) — mirrors
+          # `finetune_ab.sh`'s/`gpu_inference_ab.sh`'s own dry-run smoke
+          # suites' "the shell PRODUCER itself must run in CI at least
+          # once" doctrine: drives the REAL subprocess end to end (leg
+          # table construction, per-leg corpus/work-dir setup, the
+          # provenance cross-check, per-leg manifest stamping), no GPU, no
+          # `nsys`, no real checkpoint, no network — every `nsys`/
+          # `$BENCH_BIN` invocation is printed via `run_cmd`, never
+          # executed.
+          - name: profile_356_legs.sh dry-run smoke
+            cmd: python3 ci/scripts/perf/test_profile_356_legs_dry_run.py
     steps:
       - uses: actions/checkout@v4
         with:

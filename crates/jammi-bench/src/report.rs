@@ -2012,6 +2012,17 @@ pub struct FinetuneRunTier {
     /// [`Self::temperature`]'s doc for MNRL's own scale knob.
     pub margin: Option<f64>,
     pub target_modules: Vec<String>,
+    /// `--layers-to-transform` (CONTRACT v2, #356 P1 item 5): the layer
+    /// indices LoRA injection was restricted to, or `null`
+    /// (`NullMeans`: "no restriction — every layer matching
+    /// `target_modules` gets a LoRA adapter") when the flag was omitted.
+    /// IDENTITY (not provenance): a `Some([0])` leg wraps a DIFFERENT set
+    /// of linears than a `None` leg at the identical `target_modules`, the
+    /// same discriminating-power reasoning `target_modules` itself already
+    /// carries. `ci/scripts/perf/identity_fields.py`'s
+    /// `FINETUNE_RUN_IDENTITY_FIELDS` must gain the mirror entry (set-
+    /// equality pin against [`Self::IDENTITY_FIELDS`], docs-ci domain).
+    pub layers_to_transform: Option<Vec<usize>>,
     pub backbone_dtype: String,
     pub checkpoint_config_sha256: String,
     pub checkpoint_weights_sha256: String,
@@ -2237,6 +2248,27 @@ pub struct FinetuneRunTier {
     /// the full correction and the (deliberately absent) contract citation
     /// this replaces.
     pub train_probe_series: Vec<f64>,
+    /// Wall-clock seconds this run's `training_loop.run()` invocation(s)
+    /// took, summed across every resume-cycled epoch leg (CONTRACT v2,
+    /// #356 P1) — CPU-hermetic, real timing, never a stub. Excludes
+    /// `build_encoder_adapters`, the resume-checkpoint fetch/restore, and
+    /// every `evaluate_held_out` call (the train-side probes and the
+    /// held-out eval both live OUTSIDE this timer's span in
+    /// `crate::finetune_run::run_impl`'s loop) — this is the training STEP
+    /// machinery's own wall time, not the whole resume-cycle's.
+    ///
+    /// This tier calls `TrainingLoop::run()` exactly once per epoch leg
+    /// (`trainer.rs`'s `TrainingResult` has no per-step seam to time
+    /// against directly — see [`crate::finetune_run`]'s own module doc on
+    /// why this crate cannot add one inside `jammi-ai`, ai-core domain, out
+    /// of scope), so this field is a coarse per-run TOTAL, not a per-step
+    /// rate: a downstream profile derives per-step wall by differencing two
+    /// runs at different step counts (`(wall_M - wall_N) / (M - N)`), which
+    /// cancels out any fixed per-epoch overhead `run()` bundles internally
+    /// (its own early-stopping validation-split evaluation and end-of-epoch
+    /// checkpoint save) rather than requiring this producer to isolate that
+    /// overhead itself.
+    pub train_run_wall_s: f64,
 
     // ── Mutant provenance (unit 63 round-7 audit, finding 1) — honest
     //    labeling, NOT identity or provenance ───────────────────────────
@@ -2283,7 +2315,8 @@ impl FinetuneRunTier {
     /// entirely; the other three reclassified to [`Self::PROVENANCE_FIELDS`]
     /// — see struct doc for the full per-field rationale), `dataset_sha256`
     /// renamed to `train_pairs_file_sha256`, and `heldout_pairs_sha256`
-    /// added. 17 + 18 − 4 + 1 = 32.
+    /// added. 17 + 18 − 4 + 1 = 32, THEN `layers_to_transform` added
+    /// (CONTRACT v2, #356 P1 item 5): 32 + 1 = 33.
     ///
     /// DISJOINT from [`Self::PROVENANCE_FIELDS`] (E3's convention, not
     /// `FinetuneStepTier`'s superset one) — see struct doc.
@@ -2304,6 +2337,19 @@ impl FinetuneRunTier {
         // section.
         ("margin", Nullable::NullMeans("objective is mnrl")),
         ("target_modules", Nullable::NonNull),
+        // CONTRACT v2 addition (#356 P1 item 5): mirrors `target_modules`'s
+        // own discriminating-power reasoning — a `Some([..])` leg wraps a
+        // DIFFERENT set of linears than a `None` leg at the identical
+        // `target_modules`. `ci/scripts/perf/identity_fields.py`'s
+        // `FINETUNE_RUN_IDENTITY_FIELDS` must gain the mirror entry
+        // (set-equality pin, docs-ci domain — not this crate's file to
+        // edit).
+        (
+            "layers_to_transform",
+            Nullable::NullMeans(
+                "no restriction — every layer matching target_modules gets a LoRA adapter",
+            ),
+        ),
         ("backbone_dtype", Nullable::NonNull),
         ("checkpoint_config_sha256", Nullable::NonNull),
         ("checkpoint_weights_sha256", Nullable::NonNull),
@@ -3290,6 +3336,7 @@ mod tests {
             lora_dropout: 0.05,
             margin: Some(0.3),
             target_modules: vec!["Wqkv".to_string()],
+            layers_to_transform: None,
             backbone_dtype: "f32".to_string(),
             checkpoint_config_sha256: "a".repeat(64),
             checkpoint_weights_sha256: "b".repeat(64),
@@ -3355,6 +3402,7 @@ mod tests {
                 held_out_batch_partition_sha256: "e".repeat(64),
             }],
             train_probe_series: vec![0.6, 0.55, 0.5],
+            train_run_wall_s: 1.5,
             mutant_id: None,
             mutant_base_sha: None,
             mutant_patch_sha256: None,
@@ -3424,10 +3472,12 @@ mod tests {
     /// plus the 18 new CONTRACT H4 fields, minus the unit-63 adversarial-
     /// audit finding-5(c)/advisory-(d) reclassifications (`split_rule`,
     /// `split_seed`, `batched_forward`, `steps_measured` — 4 removed), plus
-    /// `heldout_pairs_sha256` (finding 5(a), 1 added) = 17 + 18 − 4 + 1 = 32.
+    /// `heldout_pairs_sha256` (finding 5(a), 1 added) = 17 + 18 − 4 + 1 = 32,
+    /// plus `layers_to_transform` (CONTRACT v2, #356 P1 item 5, 1 added)
+    /// = 33.
     #[test]
-    fn finetune_run_tier_identity_fields_cardinality_is_32() {
-        assert_eq!(FinetuneRunTier::IDENTITY_FIELDS.len(), 32);
+    fn finetune_run_tier_identity_fields_cardinality_is_33() {
+        assert_eq!(FinetuneRunTier::IDENTITY_FIELDS.len(), 33);
     }
 
     /// `PROVENANCE_FIELDS` carries `arm` + `attention_arm` (moved out of

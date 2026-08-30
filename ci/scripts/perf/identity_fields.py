@@ -425,8 +425,23 @@ IDENTITY_FIELD_CANONICALIZERS = {
 # const is extracted directly by the test suite's regex scan rather than
 # duplicated into a second Python list nobody would keep in sync.
 #
+# Issue #356 P1 item 5 (bench, `bench/356-finetune-run-distilbert` @
+# e845bb1f): `FinetuneRunTier` grew `layers_to_transform: Option<Vec<usize>>`
+# -- `--layers-to-transform`'s own resolved value, IDENTITY (not
+# provenance) for the exact reason `target_modules` itself is: a
+# `Some([..])` leg wraps a DIFFERENT set of linears than a `None` leg at
+# the identical `target_modules`, so two legs agreeing on every other field
+# but disagreeing here are not comparable. `Nullable::NullMeans("no
+# restriction -- every layer matching target_modules gets a LoRA adapter")`
+# on the Rust const -- `None` IS a meaningful, distinct value (every layer),
+# never "unknown"/"not yet measured" -- so `layers_to_transform` is also a
+# `FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS` member, mirrored below. Grows this
+# set 32 -> 33; inserted at the SAME position the Rust const lists it
+# (immediately after `target_modules`) so the two stay a trivial
+# side-by-side diff.
+#
 # Unit-63 adversarial-audit finding 5 (identity-completeness) reshaped this
-# set from its original 35 entries to 32:
+# set from its original 35 entries to 32 (further grown to 33 above):
 #   (a) `heldout_pairs_sha256` ADDED — sha256 of the `--heldout-jsonl` file's
 #       own bytes, MEASURED at load; the held-out fixture's TEXT is a total
 #       determinant of every per-example loss `d_i` and was hashed nowhere
@@ -467,6 +482,9 @@ FINETUNE_RUN_IDENTITY_FIELDS = (
     "lora_dropout",
     "margin",
     "target_modules",
+    # #356 P1 item 5 addition (see module doc above) -- same position as
+    # the Rust const's own listing, immediately after `target_modules`.
+    "layers_to_transform",
     "backbone_dtype",
     "checkpoint_config_sha256",
     "checkpoint_weights_sha256",
@@ -508,12 +526,17 @@ FINETUNE_RUN_IDENTITY_FIELDS = (
 #   * `row_lengths`   — NullMeans("real text is variable-length; no single
 #                        fixed row_lengths applies across a whole
 #                        multi-epoch run")
+#   * `layers_to_transform` — NullMeans("no restriction -- every layer
+#                        matching target_modules gets a LoRA adapter") --
+#                        #356 P1 item 5 addition (see this module's own
+#                        FINETUNE_RUN_IDENTITY_FIELDS doc above); `None` is
+#                        the meaningful "all layers" value, never "unknown".
 # Every OTHER `FINETUNE_RUN_IDENTITY_FIELDS` member is `Nullable::NonNull`
 # on the Rust const, so a present `null` there still folds to MISSING (the
 # same "cannot verify this premise determinant" state `leg_identity_fields`
 # already applies to `FINETUNE_IDENTITY_FIELDS`).
 FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS = frozenset(
-    {"margin", "temperature", "max_grad_norm", "warmup", "row_lengths"}
+    {"margin", "temperature", "max_grad_norm", "warmup", "row_lengths", "layers_to_transform"}
 )
 
 

@@ -2063,6 +2063,46 @@ def _finetune_run_tier(arm="fused", **overrides):
         "lora_dropout": 0.05,
         "margin": None,
         "target_modules": ["Wqkv", "Wo", "Wi"],
+        # GOLDEN VINTAGE (phase-4 audit CLASS 5): `load_golden("bert_fused")`
+        # was frozen BEFORE issue #356 P1 item 5 (bench/356-finetune-run-
+        # distilbert @ e845bb1f) added `layers_to_transform` to
+        # `FinetuneRunTier` -- this `.update()` override therefore defeats
+        # `load_golden`'s own "present here by construction" guarantee for
+        # THIS ONE FIELD specifically: even after the committed golden is
+        # eventually regenerated from a real run, this override would keep
+        # forcibly setting the key regardless of what the regenerated
+        # golden actually carries, silently masking a wrong or absent value
+        # there. Kept anyway (the alternative -- every test in this file
+        # missing the key -- is worse), but on a narrower footing than
+        # `load_golden`'s own construction-by-real-fixture argument:
+        #   - `layers_to_transform` IS mechanically proven to serialize on
+        #     every REAL `finetune-run` invocation today, independent of
+        #     this synthetic override -- `finetune_run::run`'s own trailing
+        #     `assert_identity_fields_present(&value,
+        #     FinetuneRunTier::IDENTITY_FIELDS)` call
+        #     (`crates/jammi-bench/src/finetune_run.rs`) panics if any
+        #     `IDENTITY_FIELDS` member (which now includes
+        #     `layers_to_transform`) is absent from the serialized report,
+        #     on EVERY run, not merely a dedicated test.
+        #   - `train_run_wall_s` has NO equivalent live check -- it is a
+        #     plain measurement field, never an `IDENTITY_FIELDS`/
+        #     `PROVENANCE_FIELDS` member, so `assert_identity_fields_present`
+        #     says nothing about it. Closed by bench (phase-4 round-2 audit
+        #     advisory 2):
+        #     `finetune_run::tests::finetune_run_tier_json_actually_emits_
+        #     layers_to_transform_and_train_run_wall_s` (`crates/jammi-bench/
+        #     src/finetune_run.rs`) runs the real CPU-fixture path, wraps
+        #     the resulting tier in a real `Report`, serializes it, and
+        #     asserts at the `serde_json::Value` PATH level that
+        #     `tiers.finetune_run` carries BOTH `layers_to_transform` (any
+        #     presence, `Some(null)` counts) and a present, numeric
+        #     `train_run_wall_s` -- the dedicated live proof for the one
+        #     field `assert_identity_fields_present` does not itself cover.
+        # `None` (no restriction -- every layer matching `target_modules`
+        # gets a LoRA adapter) is this suite's own clean, predictable-for-
+        # testing default; individual tests override it exactly like any
+        # other identity field when they mean to break it.
+        "layers_to_transform": None,
         # unit-63 round-4 audit F-1: the fused arm's own dispatch counters
         # (`_FINETUNE_RUN_DISPATCH_COUNTERS["fused"]`, folded in below)
         # claim a positive `attention_block_flash_fused_dispatches` --
@@ -2674,7 +2714,9 @@ class FinetuneRunCrossSeedHomogeneityTests(unittest.TestCase):
         v = ab_merge.finetune_run_cross_seed_homogeneity_violations(clean)
         self.assertTrue(any("lora_dropout" in m for m in v), v)
 
-    # unit-63 round-3 audit block 3 -- `lr` is IDENTITY FIELD #17; the lr0
+    # unit-63 round-3 audit block 3 -- `lr` is IDENTITY FIELD #18 (was #17
+    # before issue #356 P1 item 5's `layers_to_transform` addition shifted
+    # every field after `target_modules` by one); the lr0
     # RED control's own legs run at `--lr 0` BY CONSTRUCTION, so comparing
     # `lr` across the FULL combined pool the way every other field is
     # compared would make ANY nonempty `lr0_labels` set unconditionally

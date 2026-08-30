@@ -54,6 +54,23 @@ is QUALIFIED in that case ("uniform for full-size batches; the remainder
 batch is not provable"), reported alongside `remainder_batch_size` so a
 reader can see exactly which batch is exempted.
 
+THE DEGENERATE ARM (`n_rows < batch_size`): when there are fewer rows
+than one whole batch needs, there is exactly ONE batch total (size
+`n_rows`) -- never "full-size batches plus a remainder" (that framing
+presupposes at least one full-size batch exists, which it does not here).
+Handled as its own case: the single batch's own size is checked directly
+against `r_threshold`, with `full_batches_exist: false` recorded so a
+reader is never told about "full-size batches" that were never real. The
+`n_rows == 0` case is vacuously uniform (there are no batches at all to
+violate the claim).
+
+STRUCTURED STATE (never substring-match `verdict`): alongside the
+free-form, human-readable `verdict` string, the report carries a `state`
+enum (`"uniform"`, `"qualified"`, or `"not_provable"`) and a
+`full_batches_exist` boolean -- a machine consumer checks `claim["state"]
+== "uniform"`, never greps `verdict` for a substring that could drift out
+of sync with the logic that actually produced it.
+
 Uses the `tokenizers` package; if it is not importable, this refuses
 LOUDLY (exit nonzero) and never writes a report -- a width claim silently
 computed some other (unstated, unverified) way would be worse than no
@@ -121,39 +138,60 @@ def derive_claim(reaches_cap: list[bool], batch_size: int) -> dict:
     the verdict logic itself is testable on a synthetic length table
     without `tokenizers` installed.
 
-    Accounts for the REMAINDER BATCH (module doc): when `n_rows` is not an
-    exact multiple of `batch_size`, the last batch is smaller than every
-    other one and needs its OWN threshold check, independent of the
-    full-size batches' -- never an unconditional "uniform" verdict that
-    silently ignores it.
+    Accounts for the REMAINDER BATCH and the DEGENERATE ARM (`n_rows <
+    batch_size`) -- see module doc for both. Returns `state` (one of
+    `"uniform"`/`"qualified"`/`"not_provable"`) and `full_batches_exist`
+    (bool) as STRUCTURED fields alongside the free-form `verdict` string,
+    so a consumer never has to substring-match the prose.
     """
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
     n = len(reaches_cap)
     k = sum(1 for r in reaches_cap if not r)
     r_threshold = k + 1
-    remainder = n % batch_size
 
-    full_batches_uniform = batch_size >= r_threshold
-    if not full_batches_uniform:
-        # Even the common, full-size batch shape is not provable -- the
-        # remainder (if any) cannot rescue this; nothing is provable.
-        verdict = "not provable"
-    elif remainder == 0:
-        # Every batch is full-size; the full-batch check alone decides.
+    if n == 0:
+        # Vacuous: no rows, no batches, nothing to violate the claim.
+        remainder = 0
+        full_batches_exist = False
+        state = "uniform"
         verdict = "width uniform at W"
-    elif remainder >= r_threshold:
-        # The remainder batch clears its OWN (stricter, since
-        # remainder < batch_size) threshold too -- every batch, full-size
-        # or remainder, is uniform.
-        verdict = "width uniform at W"
+    elif n < batch_size:
+        # Degenerate: fewer rows than one batch needs -- there is exactly
+        # ONE batch total (size n), never "full-size batches plus a
+        # remainder" (module doc's "THE DEGENERATE ARM").
+        remainder = n
+        full_batches_exist = False
+        if n >= r_threshold:
+            state = "uniform"
+            verdict = "width uniform at W"
+        else:
+            state = "not_provable"
+            verdict = "not provable"
     else:
-        # Full-size batches are uniform; the one remainder batch, being
-        # smaller, is not -- a QUALIFIED verdict, never unconditional.
-        verdict = (
-            f"width uniform at W for full-size ({batch_size}-row) batches; "
-            f"the remainder batch ({remainder} rows) is not provable"
-        )
+        remainder = n % batch_size
+        full_batches_exist = True
+        full_batches_uniform = batch_size >= r_threshold
+        if not full_batches_uniform:
+            # Even the common, full-size batch shape is not provable --
+            # the remainder (if any) cannot rescue this.
+            state = "not_provable"
+            verdict = "not provable"
+        elif remainder == 0 or remainder >= r_threshold:
+            # Either every batch is full-size, or the remainder batch
+            # clears its OWN (stricter, since remainder < batch_size)
+            # threshold too -- every batch is uniform.
+            state = "uniform"
+            verdict = "width uniform at W"
+        else:
+            # Full-size batches are uniform; the one remainder batch,
+            # being smaller, is not -- a QUALIFIED verdict, never
+            # unconditional.
+            state = "qualified"
+            verdict = (
+                f"width uniform at W for full-size ({batch_size}-row) batches; "
+                f"the remainder batch ({remainder} rows) is not provable"
+            )
 
     return {
         "n_rows": n,
@@ -161,6 +199,8 @@ def derive_claim(reaches_cap: list[bool], batch_size: int) -> dict:
         "r_threshold": r_threshold,
         "batch_size": batch_size,
         "remainder_batch_size": remainder,
+        "full_batches_exist": full_batches_exist,
+        "state": state,
         "verdict": verdict,
     }
 
@@ -233,7 +273,8 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"fixture_width_report: n_rows={claim['n_rows']} k_short_rows={claim['k_short_rows']} "
         f"r_threshold={claim['r_threshold']} batch_size={claim['batch_size']} "
-        f"remainder_batch_size={claim['remainder_batch_size']} verdict='{claim['verdict']}'"
+        f"remainder_batch_size={claim['remainder_batch_size']} state={claim['state']} "
+        f"verdict='{claim['verdict']}'"
     )
     return 0
 

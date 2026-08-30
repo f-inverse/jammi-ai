@@ -7,12 +7,32 @@
 # `generic_leg_identity_fields`/`generic_leg_premise_violations` refusal core
 # `encode_ab.sh` already builds on.
 #
-# RECORDING-ONLY (v1): this producer, and the comparator it drives, NEVER
-# fail a run over the measured ratio -- issue #335's own exit criterion
-# forbids enforcement before multi-pod/both-device-model validation. The
-# only hard (nonzero, non-75) refusal here is a CORRECTNESS-of-measurement
-# problem: an identity/premise mismatch between legs, or a binary whose own
-# `provenance` does not match the clone it was built from.
+# TWO MODES (issue #335's final unit): the multi-pod/both-device-model
+# validation this producer's own exit criterion required before any
+# enforcement is now DONE (the `--aa-null` empirical-null campaign committed
+# under `ci/artifacts/gpu-perf-aa-null/`), and `gpu_inference_ab.py`'s own
+# advisory band is now PRE-REGISTERED against that evidence (see that
+# module's own doc). This does NOT make enforcement the default:
+#   * non-enforcing (the DEFAULT — `GPU_INFERENCE_AB_ENFORCE` unset or `0`)
+#     — the SAME recording-only posture this producer has always had: the
+#     only hard (nonzero, non-75) refusal is a CORRECTNESS-of-measurement
+#     problem (an identity/premise mismatch between legs, or a binary whose
+#     own `provenance` does not match the clone it was built from). A
+#     measured ratio, however far outside the pre-registered band, is
+#     always recorded and printed, never gated.
+#   * enforcing (`GPU_INFERENCE_AB_ENFORCE=1`) — opts THIS invocation into
+#     also refusing (exit 1) a GREEN-premise run whose ratio falls OUTSIDE
+#     the pre-registered band, on EITHER side (this is a NULL band, not a
+#     "faster is always fine" one -- a ratio too far below 1.0 is refused
+#     just as loudly as one too far above, with its own distinct,
+#     direction-honest verdict; see `gpu_inference_ab.py`'s own
+#     "Enforcement flip" doc for the full exit-code lattice, including the
+#     `ENFORCE_INVALID_MODE` refusal below). Still OPT-IN, never this
+#     script's own default: `gpu-perf-ab.yml`'s label-triggered PR path
+#     never sets it, only an explicit `workflow_dispatch` with
+#     `enforce: true` does. ALSO mutually exclusive with `--aa-null` (see
+#     that section's own note below): this script refuses (exit 2) BEFORE
+#     renting/building anything if both are requested together.
 #
 # ## WHY TWO FULL CLONES, NOT ONE CHECKOUT SWITCHING REFS
 #
@@ -69,11 +89,27 @@
 # exactly two clones per invocation, in either mode). Comparing a sha
 # against itself, built and run independently, so the resulting ratio
 # distribution is pure build+measurement+pod noise, never a real code
-# difference. This is the instrument that will eventually populate
-# `gpu_inference_ab.py::PLACEHOLDER_ADVISORY_BAND` with a real,
-# derived-from-evidence band (D6) -- until that artifact exists and a real
-# band is derived from it, the placeholder band stays exactly that, a
-# placeholder. Output is staged as `$OUT_DIR/aa_null_report.json` (a second
+# difference. This is the instrument
+# `gpu_inference_ab.py::PRE_REGISTERED_ADVISORY_BAND` (D6) was derived from —
+# five runs, THREE primary (the other two, `pcie-p1`/`pcie-p2`, are
+# committed but AUXILIARY: they ran CONCURRENTLY on one shared PCIe pod, a
+# GPU-contention confound this instrument's own isolation assumption does
+# not cover -- `ci/artifacts/gpu-perf-aa-null/README.md`'s own "Disclosure"
+# section has the full evidence), committed under
+# `ci/artifacts/gpu-perf-aa-null/` (that directory's own README.md has the
+# full campaign protocol, per-run table, and characterization findings). A
+# FUTURE campaign that widens this evidence base (more pods, more device
+# models) re-derives the band from the WIDER committed set, never
+# hand-tunes the two numbers directly -- `ci/scripts/check_aa_null_band.py`
+# enforces this mechanically (see that module's own "ADVISORY
+# classification" doc). `--aa-null` is MUTUALLY EXCLUSIVE with
+# `GPU_INFERENCE_AB_ENFORCE=1` (checked below, before renting/building
+# anything): `gpu_inference_ab.py::build_report`'s own `ENFORCE_INVALID_MODE`
+# arm ALSO refuses this combination at the comparator level, but refusing
+# here, at the producer's own edge, is strictly cheaper -- no PR exists to
+# enforce against under `--aa-null`, and enforcing against ANOTHER null run
+# would misfire the very instrument the band was derived from. Output is
+# staged as `$OUT_DIR/aa_null_report.json` (a second
 # copy of the merged report, INSIDE the pulled-back artifact directory --
 # never under `ci/artifacts/gpu-perf-aa-null/` directly on the pod's own
 # throwaway checkout, which `runpod_gpu_perf_ab.sh`'s own rsync step never
@@ -88,7 +124,11 @@
 #
 #   0  -- a report was written and the merge's own status is GREEN (see
 #         `gpu_inference_ab.py`'s own exit-code doc: recorded regardless of
-#         the ratio's own value — v1 never gates on the number).
+#         the ratio's own value in NON-enforcing mode — under
+#         `GPU_INFERENCE_AB_ENFORCE=1`, `0` additionally requires `mode ==
+#         "ab"` AND the ratio landed INSIDE the pre-registered advisory
+#         band; see arm `1`'s own three enforcement shapes below for the
+#         cases that still exit `1` from this same GREEN status).
 #   1  -- a REAL correctness-of-measurement refusal, ONLY ever raised once
 #         `gpu_inference_ab.py` can CONFIRM the signal is real (round-3
 #         adversarial audit B2/B3 correction: an earlier version of this
@@ -109,10 +149,40 @@
 #         (outside `--aa-null` mode — see that mode's own exception below,
 #         where the SAME build-failure classification already correctly
 #         attributes it to the parent-shaped bucket instead). A report is
-#         still WRITTEN on every one of these, never an uncaught crash.
-#   2  -- a usage/infra error: bad arguments, `nvidia-smi` itself failing to
-#         run, a `git clone`/`checkout`/submodule-init failure, an
-#         unshallow-fetch failure, HEAD or the computed merge-base not
+#         still WRITTEN on every one of these, never an uncaught crash. PLUS
+#         (issue #335's final unit), under `GPU_INFERENCE_AB_ENFORCE=1` ONLY:
+#         THREE further, entirely different shapes — in every one, `status`
+#         stays GREEN (the four legs' premises really did agree; NONE of
+#         these are a correctness refusal), distinguishable from the four
+#         correctness shapes above by `status` alone (stays `GREEN`, never
+#         `INVALID`/`INVALID_MEASUREMENT`), never by the bare exit code:
+#           - `combined_embed_p50_ratio` ABOVE the band's upper edge --
+#             `enforce_verdict=PERF_REGRESSION` with its own
+#             `perf_regression_reason`: a real, unambiguous slowdown signal.
+#           - `combined_embed_p50_ratio` BELOW the band's lower edge --
+#             `enforce_verdict=OUTSIDE_BAND_FAST` (a DELIBERATELY DIFFERENT
+#             verdict, never folded into `PERF_REGRESSION` -- this band is a
+#             NULL band, not a "faster is always fine" one) with its own
+#             `outside_band_fast_reason`: AMBIGUOUS -- either a genuine
+#             large improvement, or a `b`-role leg that silently
+#             short-circuited/broke and finished suspiciously fast; this
+#             script's own comparator never guesses which, only refuses and
+#             names the ambiguity for a human to adjudicate.
+#           - enforcement was requested but `mode != "ab"` (`"aa-null"` or
+#             unconfirmed/`None`) -- `enforce_verdict=ENFORCE_INVALID_MODE`,
+#             checked BEFORE the band is even consulted; this script's own
+#             mutual-exclusion guard (below) already refuses the
+#             `--aa-null`-plus-`GPU_INFERENCE_AB_ENFORCE=1` combination at
+#             exit `2` before anything is even rented, so this arm fires
+#             only for an UNCONFIRMED (absent/older-producer) `mode`.
+#         NEVER raised when `GPU_INFERENCE_AB_ENFORCE` is unset/`0` (the
+#         default) — see the "TWO MODES" section above.
+#   2  -- a usage/infra error: bad arguments (INCLUDING
+#         `GPU_INFERENCE_AB_AA_NULL=1` together with
+#         `GPU_INFERENCE_AB_ENFORCE=1` — refused before any pod is
+#         rented/built, see that section's own note), `nvidia-smi` itself
+#         failing to run, a `git clone`/`checkout`/submodule-init failure,
+#         an unshallow-fetch failure, HEAD or the computed merge-base not
 #         resolving to a well-formed 40-hex sha.
 #   75 -- neutral "nothing to compare safely right now", never a sign of a
 #         code problem: the GPU was reported busy, the PARENT clone's build
@@ -175,6 +245,23 @@
 #                                   (default "<repo>/.gpu-inference-ab-report/
 #                                   <UTC timestamp>").
 #   GPU_INFERENCE_AB_AA_NULL=1      the D6 instrument (see above).
+#   GPU_INFERENCE_AB_ENFORCE=1      opt THIS invocation into the enforcement
+#                                   flip (issue #335's final unit, see the
+#                                   "TWO MODES" section above) -- REQUIRES
+#                                   `mode == "ab"` (mutually exclusive with
+#                                   `GPU_INFERENCE_AB_AA_NULL=1`, refused at
+#                                   exit 2 before anything is rented, see
+#                                   that env var's own note); a GREEN-premise
+#                                   run whose ratio falls outside the
+#                                   pre-registered advisory band on EITHER
+#                                   side refuses (exit 1, status stays GREEN,
+#                                   `enforce_verdict` is
+#                                   `PERF_REGRESSION` above the upper edge or
+#                                   `OUTSIDE_BAND_FAST` below the lower one
+#                                   -- direction-honest, never one name for
+#                                   both). Default unset (0): non-enforcing,
+#                                   recording-only, this producer's
+#                                   longstanding default posture.
 #   GPU_INFERENCE_AB_SKIP_GPU_CHECK=1  skip the nvidia-smi idle check
 #                                   (CPU/dry-run smoke test only).
 #   GPU_INFERENCE_AB_DRY_RUN=1      print every command this script would
@@ -185,6 +272,20 @@
 #                                   fabricated-empty) files. Never clones,
 #                                   never builds, never touches the GPU or
 #                                   the network; never claims a real number.
+#   RUNPOD_POD_ID                  (read, never set by this script) THIS
+#                                   pod's own identity, when the calling
+#                                   environment provides it (RunPod's own
+#                                   convention) -- recorded verbatim into
+#                                   every leg's own `provenance.pod_id`
+#                                   (falls back to `$(hostname)` when unset,
+#                                   e.g. a by-hand invocation off RunPod).
+#                                   The structural fix for the
+#                                   concurrent-invocations-sharing-one-pod
+#                                   contamination class
+#                                   `ci/artifacts/gpu-perf-aa-null/README.md`'s
+#                                   own "Disclosure" section reconstructs by
+#                                   hand today -- a future committed artifact
+#                                   carries this directly.
 set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -192,7 +293,22 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 
 GPU_INFERENCE_AB_DRY_RUN="${GPU_INFERENCE_AB_DRY_RUN:-0}"
 GPU_INFERENCE_AB_AA_NULL="${GPU_INFERENCE_AB_AA_NULL:-0}"
+GPU_INFERENCE_AB_ENFORCE="${GPU_INFERENCE_AB_ENFORCE:-0}"
 GPU_INFERENCE_AB_SKIP_GPU_CHECK="${GPU_INFERENCE_AB_SKIP_GPU_CHECK:-0}"
+
+# round-4 delta-audit F4: --aa-null and enforcement are mutually exclusive
+# -- refused HERE, before anything is rented/cloned/built (strictly cheaper
+# than discovering this at the comparator, `gpu_inference_ab.py::build_report`'s
+# own ENFORCE_INVALID_MODE arm, which ALSO refuses this combination as a
+# defense in depth, never relied on as the ONLY refusal site). No PR exists
+# under --aa-null (both b-role legs are ALSO parent-sha clones) -- enforcing
+# a null-vs-null run against the band would misfire the very instrument the
+# band was derived from.
+if [ "$GPU_INFERENCE_AB_AA_NULL" = "1" ] && [ "$GPU_INFERENCE_AB_ENFORCE" = "1" ]; then
+  echo "::error::GPU_INFERENCE_AB_AA_NULL=1 and GPU_INFERENCE_AB_ENFORCE=1 cannot both be set -- --aa-null measures a null (parent-vs-parent) run with no PR to enforce against; refusing before any pod is rented/built (exit 2, a usage error, never a correctness-of-measurement or capacity one)." >&2
+  exit 2
+fi
+
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 # Retention (round-1 adversarial audit advisory, documented rather than
 # auto-cleaned): $WORK_DIR (two full clones + two `cargo build` target
@@ -233,6 +349,28 @@ elif [ "$GPU_INFERENCE_AB_AA_NULL" = "1" ]; then
 else
   printf 'ab' > "$RAW_DIR/mode"
 fi
+
+# issue #335's final unit (the enforcement flip): the SAME file-based
+# state-passing convention as `mode` above, written ONE time, before any leg
+# runs, so `gpu_inference_ab.py::load_enforce` can read it -- never an env
+# var threaded directly into that module (see this module's own doc).
+if [ "$GPU_INFERENCE_AB_ENFORCE" = "1" ]; then
+  printf '1' > "$RAW_DIR/enforce"
+else
+  printf '0' > "$RAW_DIR/enforce"
+fi
+
+# round-4 delta-audit F3(d): pod identity, the structural fix for the
+# concurrent-invocations-sharing-one-pod contamination class
+# `ci/artifacts/gpu-perf-aa-null/README.md`'s own "Disclosure" section
+# reconstructs by hand today -- written ONE time, before any leg runs, the
+# SAME file-based state-passing convention `mode`/`enforce` above already
+# use, so `gpu_inference_ab.py::load_pod_id` can fold it into every OK
+# leg's own `provenance.pod_id`. `RUNPOD_POD_ID` is the identity RunPod's
+# own environment provides on a rented pod; `$(hostname)` is the fallback
+# for a by-hand invocation off RunPod (still a real, if less specific,
+# identity -- never a fabricated placeholder).
+printf '%s' "${RUNPOD_POD_ID:-$(hostname)}" > "$RAW_DIR/pod_id"
 
 CLONE_A="$WORK_DIR/clone-a"
 CLONE_B="$WORK_DIR/clone-b"

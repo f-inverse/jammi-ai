@@ -13,20 +13,40 @@
 # ONLY by that workflow's workflow_dispatch / `run-gpu-perf-ab` PR-label
 # triggers, never a schedule.
 #
-# RECORDING-ONLY (v1): `gpu_inference_ab.py`'s own exit codes (see that
-# module's doc) are the SAME ones this script propagates — 0 = report
-# written, merge status GREEN; 1 = a real correctness-of-measurement
-# refusal (an identity/provenance mismatch, an INVALID_MEASUREMENT, a
-# GENUINE (parsed) recorded-order violation, or a `b`-role runtime failure
-# with the producer's own `mode` marker CONFIRMING `ab` — round-3
-# adversarial audit B2 correction: an earlier version of this doc claimed
-# this arm was always "the PR's own problem, never the parent's", which
-# overclaimed a confirmation this driver does not always have -- under
-# `--aa-null` there is no PR to blame at all, and an unconfirmed `mode`
-# never escalates either); 2 = a usage/infra error (bad args, a
-# clone/checkout/wrong-tree/fetch failure); 75 = neutral "nothing to
-# compare safely right now" (no RunPod capacity, insufficient free disk on
-# the pod — this driver's own pre-flight `df` check, round-2 adversarial
+# TWO MODES, propagated verbatim (issue #335's final unit — see
+# `gpu_inference_ab.sh`'s own "TWO MODES" doc for the full rationale):
+# non-enforcing (the default, `GPU_PERF_AB_ENFORCE` unset/`0`) stays
+# recording-only; enforcing (`GPU_PERF_AB_ENFORCE=1`, mutually exclusive
+# with `GPU_PERF_AB_AA_NULL=1`) opts this run into also refusing a
+# GREEN-premise run whose ratio falls outside the pre-registered advisory
+# band, on EITHER side (a NULL band, never a "faster is always fine" one —
+# see `gpu_inference_ab.py`'s own doc for why a too-fast ratio is
+# AMBIGUOUS, not favorable by default). `gpu_inference_ab.py`'s own exit
+# codes (see that module's doc) are the SAME ones this script propagates —
+# 0 = report written, merge status GREEN (and, under enforcing mode, `mode
+# == "ab"` AND the ratio landed inside the pre-registered band); 1 = EITHER
+# a real correctness-of-measurement refusal (an identity/provenance
+# mismatch, an INVALID_MEASUREMENT, a GENUINE (parsed) recorded-order
+# violation, or a `b`-role runtime failure with the producer's own `mode`
+# marker CONFIRMING `ab` — round-3 adversarial audit B2 correction: an
+# earlier version of this doc claimed this arm was always "the PR's own
+# problem, never the parent's", which overclaimed a confirmation this
+# driver does not always have -- under `--aa-null` there is no PR to blame
+# at all, and an unconfirmed `mode` never escalates either) OR, under
+# enforcing mode ONLY, one of THREE direction-honest enforcement refusals
+# (`status` stays GREEN in every one): `enforce_verdict=PERF_REGRESSION`
+# (ratio above the upper edge, a real slowdown signal),
+# `enforce_verdict=OUTSIDE_BAND_FAST` (ratio below the lower edge, an
+# AMBIGUOUS signal — a genuine improvement or a broken/short-circuited leg,
+# never assumed favorable), or `enforce_verdict=ENFORCE_INVALID_MODE`
+# (enforcement requested but `mode != "ab"`) — the merged report's own
+# `status`/`enforce_verdict` fields are what distinguish all of these, never
+# the bare exit code alone; 2 = a usage/infra error (bad args, a
+# clone/checkout/wrong-tree/fetch failure, OR
+# `GPU_PERF_AB_AA_NULL=1`-together-with-`GPU_PERF_AB_ENFORCE=1`, refused at
+# the producer's own edge before anything is rented); 75 = neutral "nothing
+# to compare safely right now" (no RunPod capacity, insufficient free disk
+# on the pod — this driver's own pre-flight `df` check, round-2 adversarial
 # audit F6 — a GPU-busy pod, a PARENT-side build failure, a `MISSING`/
 # `DRY_RUN` leg of either role, a `b`-role runtime failure under
 # `--aa-null`/an unconfirmed mode, an unreadable/unparseable recorded
@@ -36,6 +56,16 @@
 # driver's exit code is drawn from verbatim. This driver treats RunPod
 # capacity misses (`rp_deploy_live_a100` failing) with the SAME 75
 # convention runpod_gpu_prove.sh/runpod_gpu_howwell.sh already use.
+#
+# GUARD (round-4 delta-audit advisory (3)): when `GPU_PERF_AB_ENFORCE=1`
+# was requested, this driver ALSO asserts the pulled report's own
+# `enforce_verdict` actually reflects that (a `GREEN`-status report reading
+# `NOT_ENFORCED`, or carrying no `enforce_verdict` at all, means the
+# `GPU_INFERENCE_AB_ENFORCE` env var was silently DROPPED somewhere between
+# this driver and the remote comparator — see the "surface the merged
+# status BY NAME" block below) — forcing a nonzero exit even if the
+# underlying `$rc` was `0`, so a dropped env var fails the workflow loudly
+# rather than reporting a silent, unearned green.
 #
 # Env vars:
 #   GIT_REPO   what to clone.
@@ -56,6 +86,13 @@
 #                             empirical-null instrument (see
 #                             gpu_inference_ab.sh's own doc). Default unset
 #                             (0): the normal parent-vs-PR A/B.
+#   GPU_PERF_AB_ENFORCE=1     forwarded as GPU_INFERENCE_AB_ENFORCE — issue
+#                             #335's final unit, the enforcement flip (see
+#                             gpu_inference_ab.sh's own "TWO MODES" doc).
+#                             Default unset (0): non-enforcing, recording-
+#                             only — gpu-perf-ab.yml's own label-triggered
+#                             PR path never sets this; only an explicit
+#                             workflow_dispatch with enforce: true does.
 #   GPU_PERF_AB_ARTIFACT_DIR  where the merged report/table is pulled back
 #                             to once the remote run finishes (default:
 #                             "<repo>/.gpu-pull/gpu-perf-ab" — mirrors
@@ -93,6 +130,7 @@ if [ -z "$GIT_REF" ]; then
 fi
 
 GPU_PERF_AB_AA_NULL="${GPU_PERF_AB_AA_NULL:-0}"
+GPU_PERF_AB_ENFORCE="${GPU_PERF_AB_ENFORCE:-0}"
 GPU_PERF_AB_ARTIFACT_DIR="${GPU_PERF_AB_ARTIFACT_DIR:-${REPO_ROOT}/.gpu-pull/gpu-perf-ab}"
 
 # Sweep before renting anything — same orphan-bounding reasoning
@@ -108,7 +146,7 @@ if [ "$rc" -ne 0 ]; then
   exit 75
 fi
 
-echo "=== running gpu_inference_ab.sh on ${RP_HOST}:${RP_PORT} (GPU_PERF_AB_AA_NULL=${GPU_PERF_AB_AA_NULL}) ==="
+echo "=== running gpu_inference_ab.sh on ${RP_HOST}:${RP_PORT} (GPU_PERF_AB_AA_NULL=${GPU_PERF_AB_AA_NULL} GPU_PERF_AB_ENFORCE=${GPU_PERF_AB_ENFORCE}) ==="
 rp_run_remote <<REMOTE
 export CARGO_TERM_COLOR=never
 export CARGO_BUILD_RUSTC_WRAPPER=
@@ -160,6 +198,7 @@ runpod_perf_ab_clone_and_checkout /root/jammi-ai "${GIT_REPO}" "${GIT_REF}" main
 
 echo "::group::gpu-perf-ab A/B (gpu_inference_ab.sh)"
 GPU_INFERENCE_AB_AA_NULL="${GPU_PERF_AB_AA_NULL}" \
+GPU_INFERENCE_AB_ENFORCE="${GPU_PERF_AB_ENFORCE}" \
   bash ci/scripts/perf/gpu_inference_ab.sh
 rc=\$?
 echo "::endgroup::"
@@ -189,13 +228,44 @@ fi
 
 # --- surface the merged status BY NAME (mirrors runpod_gpu_howwell.sh's own
 # idiom: an operator reading the log should never have to cross-reference a
-# bare exit code against the pulled artifact). ---
+# bare exit code against the pulled artifact). Also surfaces
+# `enforce_verdict` (issue #335's final unit) -- with TWO modes now sharing
+# exit 1, printing `status` alone is no longer enough to tell "a correctness
+# refusal" apart from "a perf-magnitude refusal" without opening the JSON. ---
 REPORT_JSON="$(find "$GPU_PERF_AB_ARTIFACT_DIR" -name gpu_inference_ab_report.json 2>/dev/null | sort | tail -1)"
 if [ -n "$REPORT_JSON" ] && [ -f "$REPORT_JSON" ]; then
   STATUS="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$REPORT_JSON" 2>/dev/null || echo "UNKNOWN")"
-  echo "=== merged status: ${STATUS} (${REPORT_JSON}) ==="
+  ENFORCE_VERDICT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("enforce_verdict", "n/a"))' "$REPORT_JSON" 2>/dev/null || echo "UNKNOWN")"
+  echo "=== merged status: ${STATUS} enforce_verdict: ${ENFORCE_VERDICT} (${REPORT_JSON}) ==="
+
+  # round-4 delta-audit advisory (3): enforcement was explicitly requested
+  # for THIS invocation but the pulled, GREEN-status report shows it was
+  # NOT applied (either no enforce_verdict field at all, or the
+  # NOT_ENFORCED value gpu_inference_ab.py::build_report only ever writes
+  # when its own `enforce` marker read False) -- the ONLY way that can
+  # happen on a GREEN report is a dropped GPU_INFERENCE_AB_ENFORCE env var
+  # somewhere between this driver and the remote comparator. A dropped
+  # request must fail the workflow, never silently pass as if
+  # non-enforcing had been asked for on purpose.
+  if [ "$GPU_PERF_AB_ENFORCE" = "1" ] && [ "$STATUS" = "GREEN" ] \
+     && { [ "$ENFORCE_VERDICT" = "NOT_ENFORCED" ] || [ "$ENFORCE_VERDICT" = "n/a" ] || [ "$ENFORCE_VERDICT" = "UNKNOWN" ]; }; then
+    echo "::error::GPU_PERF_AB_ENFORCE=1 was requested for this run, but the pulled report's own status=GREEN carries enforce_verdict='${ENFORCE_VERDICT}' -- enforcement was silently NOT applied (a dropped GPU_INFERENCE_AB_ENFORCE env var somewhere in the remote pipeline is the likely cause). Forcing failure rather than trusting rc=${rc} alone -- an operator's explicit enforcement request must never report a silent, unearned green." >&2
+    rc=1
+  fi
 else
   echo "::warning::no gpu_inference_ab_report.json found under ${GPU_PERF_AB_ARTIFACT_DIR} -- cannot name the merged status."
+  # Force failure ONLY over a would-be-GREEN exit (the silent-unearned-green
+  # case this guard exists for). A run that already failed keeps ITS OWN exit
+  # code -- the header's exit lattice (75 = capacity/pre-flight, 2 = usage or
+  # the aa_null+enforce guard) stays authoritative, never rewritten into a 1
+  # that gpu-perf-ab.yml would mis-annotate as an enforcement refusal
+  # (mirrors runpod_gpu_howwell.sh's own rc -eq 0 guard on its rewrite).
+  if [ "$GPU_PERF_AB_ENFORCE" = "1" ] && [ "$rc" -eq 0 ]; then
+    echo "::error::GPU_PERF_AB_ENFORCE=1 was requested and the run exited 0, but no merged report was pulled -- cannot confirm enforcement was applied; forcing failure rather than reporting an unconfirmable green." >&2
+    rc=1
+  elif [ "$GPU_PERF_AB_ENFORCE" = "1" ]; then
+    echo "::warning::enforcement was requested but the run already failed (rc=${rc}) with no report to confirm against -- keeping the run's own exit code, which the header's exit lattice names." >&2
+  fi
 fi
 
 exit "$rc"

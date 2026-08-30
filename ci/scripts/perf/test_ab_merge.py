@@ -2063,6 +2063,16 @@ def _finetune_run_tier(arm="fused", **overrides):
         "lora_dropout": 0.05,
         "margin": None,
         "target_modules": ["Wqkv", "Wo", "Wi"],
+        # issue #356 P1 item 5: `load_golden("bert_fused")` predates this
+        # field entirely (the committed golden fixture was frozen before
+        # `FinetuneRunTier` grew `layers_to_transform`), so it is set
+        # explicitly here — the SAME "missing field name" class
+        # `load_golden`'s own doc above already names as the risk this
+        # helper closes. `None` (no restriction — every layer matching
+        # `target_modules` gets a LoRA adapter) is this suite's own clean,
+        # predictable-for-testing default; individual tests override it
+        # exactly like any other identity field when they mean to break it.
+        "layers_to_transform": None,
         # unit-63 round-4 audit F-1: the fused arm's own dispatch counters
         # (`_FINETUNE_RUN_DISPATCH_COUNTERS["fused"]`, folded in below)
         # claim a positive `attention_block_flash_fused_dispatches` --
@@ -2674,7 +2684,9 @@ class FinetuneRunCrossSeedHomogeneityTests(unittest.TestCase):
         v = ab_merge.finetune_run_cross_seed_homogeneity_violations(clean)
         self.assertTrue(any("lora_dropout" in m for m in v), v)
 
-    # unit-63 round-3 audit block 3 -- `lr` is IDENTITY FIELD #17; the lr0
+    # unit-63 round-3 audit block 3 -- `lr` is IDENTITY FIELD #18 (was #17
+    # before issue #356 P1 item 5's `layers_to_transform` addition shifted
+    # every field after `target_modules` by one); the lr0
     # RED control's own legs run at `--lr 0` BY CONSTRUCTION, so comparing
     # `lr` across the FULL combined pool the way every other field is
     # compared would make ANY nonempty `lr0_labels` set unconditionally

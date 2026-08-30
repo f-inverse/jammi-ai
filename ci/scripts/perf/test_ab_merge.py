@@ -31,9 +31,11 @@ Run directly: `python3 ci/scripts/perf/test_ab_merge.py`
 from __future__ import annotations
 
 import copy
+import itertools
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -44,12 +46,17 @@ import ab_merge  # noqa: E402
 
 LEGS = ab_merge.LEGS
 FIXTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "p6_fa2_dense_raw_runs")
+GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "finetune_run_golden")
 
 # Every fused/eager pair `FinetuneStepTier` actually serializes today (see
 # `crates/jammi-bench/src/report.rs`'s `FinetuneStepTier` and this repo's
 # real `finetune-step` output — captured directly, not guessed at, while
-# building this fixture set).
-ALL_BASES = ("ln", "rope", "softmax", "geglu", "lora_epilogue", "lora_linear", "attention_block")
+# building this fixture set). `adamw` (unit-63 round-3 audit block 1): the
+# multi-tensor AdamW commit's own pair, hand-typed here for the SAME reason
+# `_FINETUNE_RUN_DISPATCH_COUNTERS` used to lack it -- see
+# `GoldenProducerAnchoredFieldSetTests`, which pins this tuple against a
+# REAL producer report rather than trusting this hand-kept list alone.
+ALL_BASES = ("ln", "rope", "softmax", "geglu", "lora_epilogue", "lora_linear", "attention_block", "adamw")
 
 
 def jammi_fs(dispatches, **overrides):
@@ -175,6 +182,22 @@ def load_fixture_finetune_step(name):
         return json.load(fh)
 
 
+def load_golden(name):
+    """Reads `fixtures/finetune_run_golden/<name>.json` — a REAL, committed
+    `jammi-bench finetune-run` report, run once by the actual compiled
+    binary (see that directory's own `PROVENANCE.md` for the exact CLI
+    invocation and git sha), never a hand-typed field list standing in for
+    what the producer actually serializes. The unit-63 round-3 audit class
+    fix: `_finetune_run_tier` below loads one of these as its STRUCTURAL
+    base so a field this suite's own hand-written literal dict forgets (the
+    way `adamw_{fused,eager}_dispatches` fell out of the old
+    `_FINETUNE_RUN_DISPATCH_COUNTERS`, block 1's own reproduction) is still
+    PRESENT with a real value, never silently absent.
+    """
+    with open(os.path.join(GOLDEN_DIR, f"{name}.json")) as fh:
+        return json.load(fh)
+
+
 def torch_fs(seed=42, attn_requested="sdpa", lora_alpha=32.0, margin=0.3, warmup=5, **overrides):
     """Builds the FULL top-level `torch_finetune_step.py` report shape, not
     just the `finetune_step` sub-block: `seed`/`attn_requested`/`lora_alpha`/
@@ -281,8 +304,8 @@ class FusedProofFixtureTests(unittest.TestCase):
         return rc, merged, table
 
     def test_exclusive_pair_yes(self):
-        """ln/geglu required+independent pairs fused; attention_block fused
-        (so rope/softmax legitimately (0, 0), absorbed); lora_epilogue
+        """ln/geglu/adamw required+independent pairs fused; attention_block
+        fused (so rope/softmax legitimately (0, 0), absorbed); lora_epilogue
         (0, 0) but lora_linear fused (the group's sum > 0). Every eager
         count 0. This is what a genuinely fully-fused run looks like.
         """
@@ -298,6 +321,7 @@ class FusedProofFixtureTests(unittest.TestCase):
                     "lora_epilogue": (0, 0),
                     "lora_linear": (3, 0),
                     "attention_block": (3, 0),
+                    "adamw": (6, 0),
                 },
             )
             rc, merged, _table = self.run_merge(raw_dir)
@@ -387,7 +411,7 @@ class FusedProofFixtureTests(unittest.TestCase):
             write_ok_config(
                 raw_dir,
                 "b8-s128-healthy",
-                {"ln": (9, 0), "geglu": (3, 0), "lora_linear": (3, 0), "attention_block": (3, 0)},
+                {"ln": (9, 0), "geglu": (3, 0), "lora_linear": (3, 0), "attention_block": (3, 0), "adamw": (6, 0)},
             )
 
             rc, merged, table = self.run_merge(raw_dir)
@@ -584,6 +608,7 @@ _CLEAN_YES_DISPATCHES = {
     "lora_epilogue": (0, 0),
     "lora_linear": (3, 0),
     "attention_block": (3, 0),
+    "adamw": (6, 0),
 }
 
 
@@ -599,12 +624,15 @@ class CascadePairFixtureTests(unittest.TestCase):
     of every config `INVALID` -- verified directly against the REAL
     fixtures below before this fix landed, never merely asserted.
 
-    `test_real_flash_on_fixture_is_valid_true` /
-    `test_real_flash_off_fixture_is_valid_reference_leg` drive the two
-    REAL, committed raw-run reports (`fixtures/p6_fa2_dense_raw_runs/`,
-    provenance in that directory's own `PROVENANCE.md`) through
-    `ab_merge.main` unmodified -- never a hand-rolled dict standing in for
-    what that branch's own binary actually emitted. Every other test here
+    `test_real_flash_on_fixture_no_longer_keyerrors_but_predates_adamw` /
+    `test_real_flash_off_fixture_no_longer_keyerrors_but_predates_adamw`
+    drive the two REAL, committed raw-run reports
+    (`fixtures/p6_fa2_dense_raw_runs/`, provenance in that directory's own
+    `PROVENANCE.md`) through `ab_merge.main` unmodified -- never a
+    hand-rolled dict standing in for what that branch's own binary actually
+    emitted (unit-63 round-3 audit block 1: both now correctly read
+    INVALID, not the original `KeyError` crash -- see each test's own doc).
+    Every other test here
     is a synthetic construction (there is no real recorded run of "nothing
     ran" or "flash_compiled=False but disabled" -- those are degenerate/
     contradictory shapes, not real outcomes), built by taking one of the
@@ -633,43 +661,71 @@ class CascadePairFixtureTests(unittest.TestCase):
         write_leg(raw_dir, slug, "jammi-eager", report=jammi_fs({}))
         write_leg(raw_dir, slug, "jammi-fused", report=report)
 
-    def test_real_flash_on_fixture_is_valid_true(self):
-        """THE BUG REPRODUCTION: before this fix, this raised `KeyError`
-        (via `dispatch_pairs`) on this exact fixture, caught per-leg by
-        `build_report` and surfaced as an `"ERROR: ..."` string, never
-        `True`. `s128_flash_on_1.json` reads `attention_block_flash_fused_
-        dispatches: 840`, `..._declined_dispatches: 0`,
-        `attention_block_fused_dispatches: 0` -- the flash-ON leg.
+    def test_real_flash_on_fixture_no_longer_keyerrors_but_predates_adamw(self):
+        """THE ORIGINAL BUG REPRODUCTION: before the cascade-pair fix, this
+        raised `KeyError` (via `dispatch_pairs`) on this exact fixture,
+        caught per-leg by `build_report` and surfaced as an `"ERROR: ..."`
+        string. That is fixed -- `dispatch_pairs` classifies
+        `attention_block_flash` cleanly, no raise, no `"ERROR"` string.
+
+        Unit-63 round-3 audit block 1 (docs-ci class fix): `s128_flash_on_1.json`
+        is copied byte-for-byte from `origin/perf/p6-fa2-dense` @ `5886c6b`
+        (see `fixtures/p6_fa2_dense_raw_runs/PROVENANCE.md`) -- a branch that
+        PREDATES the multi-tensor AdamW commit, so this report carries no
+        `adamw_{fused,eager}_dispatches` keys AT ALL. `adamw` is now a
+        `REQUIRED_PAIRS` member (block 1), and `REQUIRED_PAIRS`'s own
+        established doctrine (see `fused_proof`'s own doc, F5) is that an
+        ABSENT required base is a hard fail for EVERY classified base,
+        never a silently-granted exemption for an older schema -- the SAME
+        treatment `ln`'s own absence already got before this fold-in, now
+        correctly extended to `adamw` too. This is therefore no longer a
+        crash (the original bug), but a CORRECT, INVALID verdict naming a
+        real schema-staleness fact about this specific historical fixture
+        -- `RealAdamwArtifactFixtureTests` below drives the actual GREEN
+        (adamw-carrying) shape this proof exists to pass.
         """
         with tempfile.TemporaryDirectory() as raw_dir:
             self.write_jammi_fused_only(raw_dir, "b8-s128-flash-on", load_fixture_finetune_step("s128_flash_on_1"))
             rc, merged = self.run_merge(raw_dir)
         cfg = merged["configs"]["b8-s128-flash-on"]
-        self.assertIs(cfg["jammi_fused_dispatch_proof"], True, cfg["jammi_fused_dispatch_proof"])
-        self.assertFalse(str(cfg["verdict"]).startswith("INVALID"), cfg["verdict"])
-        self.assertEqual(rc, 0)
+        self.assertIsNot(cfg["jammi_fused_dispatch_proof"], None)
+        self.assertNotIsInstance(
+            cfg["jammi_fused_dispatch_proof"], str, cfg["jammi_fused_dispatch_proof"]
+        )  # never the pre-fix "ERROR: ..." KeyError string
+        self.assertIs(cfg["jammi_fused_dispatch_proof"], False, cfg["jammi_fused_dispatch_proof"])
+        self.assertTrue(str(cfg["verdict"]).startswith("INVALID"), cfg["verdict"])
+        self.assertEqual(rc, 1)
 
-    def test_real_flash_off_fixture_is_valid_reference_leg(self):
-        """THE BUG REPRODUCTION, the reference-leg side: before this fix,
-        this ALSO raised `KeyError` on the exact same missing-sibling shape
-        (`attention_block_flash_fused_dispatches` present,
-        `..._eager_dispatches` absent -- the fallback key is
-        `..._declined_dispatches` here too, just nonzero: `840`).
-        `s128_flash_off_1.json` reads `attention_block_flash_fused_
+    def test_real_flash_off_fixture_no_longer_keyerrors_but_predates_adamw(self):
+        """THE ORIGINAL BUG REPRODUCTION, the reference-leg side: before the
+        cascade-pair fix, this ALSO raised `KeyError` on the exact same
+        missing-sibling shape (`attention_block_flash_fused_dispatches`
+        present, `..._eager_dispatches` absent -- the fallback key is
+        `..._declined_dispatches` here too, just nonzero: `840`). That is
+        fixed. `s128_flash_off_1.json` reads `attention_block_flash_fused_
         dispatches: 0`, `..._declined_dispatches: 840`,
         `attention_block_fused_dispatches: 840`,
         `kernels_disabled_requested == kernels_disabled_fired ==
         ["attention_block_flash"]` -- the JAMMI_KERNELS_DISABLE=
-        attention_block_flash reference leg, and its `declined: 840` must
-        NOT be treated as a silent fallback (rule 1's exemption).
+        attention_block_flash reference leg, and its `declined: 840` is
+        correctly NOT treated as a silent fallback (rule 1's exemption) --
+        never the original `KeyError`.
+
+        Unit-63 round-3 audit block 1: this fixture is from the SAME
+        pre-AdamW branch as the flash-on sibling above -- see that test's
+        own doc for why `REQUIRED_PAIRS`'s absence rule now, correctly,
+        also fails this leg (never silently exempted for an older schema).
         """
         with tempfile.TemporaryDirectory() as raw_dir:
             self.write_jammi_fused_only(raw_dir, "b8-s128-flash-off", load_fixture_finetune_step("s128_flash_off_1"))
             rc, merged = self.run_merge(raw_dir)
         cfg = merged["configs"]["b8-s128-flash-off"]
-        self.assertIs(cfg["jammi_fused_dispatch_proof"], True, cfg["jammi_fused_dispatch_proof"])
-        self.assertFalse(str(cfg["verdict"]).startswith("INVALID"), cfg["verdict"])
-        self.assertEqual(rc, 0)
+        self.assertNotIsInstance(
+            cfg["jammi_fused_dispatch_proof"], str, cfg["jammi_fused_dispatch_proof"]
+        )  # never the pre-fix "ERROR: ..." KeyError string
+        self.assertIs(cfg["jammi_fused_dispatch_proof"], False, cfg["jammi_fused_dispatch_proof"])
+        self.assertTrue(str(cfg["verdict"]).startswith("INVALID"), cfg["verdict"])
+        self.assertEqual(rc, 1)
 
     def test_nothing_ran_in_attention_arm_is_invalid(self):
         """Truth-table case 3: `attention_block_flash` reads `(0, 0)` AND
@@ -716,6 +772,38 @@ class CascadePairFixtureTests(unittest.TestCase):
         self.assertTrue(str(cfg["verdict"]).startswith("INVALID"), cfg["verdict"])
         self.assertEqual(rc, 1)
 
+    def test_flash_compiled_false_capability_miss_is_still_a_hard_fail(self):
+        """Unit-63 round-3 audit, coordinator correction: an earlier draft
+        of this round exempted `flash_compiled is False` from rule 1 (a
+        capability-miss carve-out) -- REVERTED. `fused_proof` is SHARED by
+        `finetune-step`'s own campaigns; a whole-campaign premise fact
+        (CONTRACT 63 Frame pre-registers the flash cascade as the
+        finetune-run how-well A/B's own differential) belongs in THAT
+        campaign's own premise check
+        (`finetune_run_dispatch_proof_violations`'s `arm == "fused"`
+        branch), never a silent, generic exemption inside the shared
+        primitive. This is the regression pin: the exact capability-miss
+        shape (a real disable request CLEARED, so this is genuinely a
+        capability miss, not also a self-describing one, plus a synthetic
+        `adamw` pair -- this fixture predates the multi-tensor AdamW commit)
+        must still hard-fail, unconditionally, exactly like an ordinary
+        silent eager fallback always has.
+        """
+        report = copy.deepcopy(load_fixture_finetune_step("s128_flash_off_1"))
+        fs = report["tiers"]["finetune_step"]
+        fs["flash_compiled"] = False
+        fs["kernels_disabled_requested"] = []
+        fs["kernels_disabled_fired"] = []
+        fs["adamw_fused_dispatches"] = 6
+        fs["adamw_eager_dispatches"] = 0
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self.write_jammi_fused_only(raw_dir, "b8-s128-capability-miss", report)
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-capability-miss"]
+        self.assertIs(cfg["jammi_fused_dispatch_proof"], False, cfg["jammi_fused_dispatch_proof"])
+        self.assertTrue(str(cfg["verdict"]).startswith("INVALID"), cfg["verdict"])
+        self.assertEqual(rc, 1)
+
     def test_unrequested_decline_is_still_a_hard_fail_non_vacuous_control(self):
         """Negative control (non-vacuous): rule 1's exemption for a
         `CASCADE_BASES` decline is gated on `kernels_disabled_requested`
@@ -754,6 +842,7 @@ class CascadePairFixtureTests(unittest.TestCase):
                     "geglu": (3, 0),
                     "lora_linear": (3, 0),
                     "attention_block": (0, 0),
+                    "adamw": (6, 0),
                 },
                 **flash_overrides(fused=5, declined=0),
             )
@@ -792,7 +881,14 @@ class CascadePairFixtureTests(unittest.TestCase):
         `jammi_dispatch_counters` picking up a `_declined_dispatches`-
         suffixed key (not just `_fused_dispatches`/`_eager_dispatches`) --
         both recorded, never compared, same "provenance" row this fold-in
-        adds to the module docstring's determinant table.
+        adds to the module docstring's determinant table. `leg_provenance`
+        records the RAW counters unconditionally (it is never itself gated
+        by `fused_proof`), so this still holds even though this exact real
+        fixture predates the multi-tensor AdamW commit (unit-63 round-3
+        audit block 1: `rc`/`verdict` now read INVALID/1 for THIS config,
+        since `adamw` is a `REQUIRED_PAIRS` member this schema-older report
+        cannot supply -- see `RealAdamwArtifactFixtureTests` for the
+        GREEN, adamw-carrying leg this proof exists to pass).
         """
         with tempfile.TemporaryDirectory() as raw_dir:
             self.write_jammi_fused_only(
@@ -800,7 +896,7 @@ class CascadePairFixtureTests(unittest.TestCase):
             )
             out_dir = tempfile.mkdtemp()
             rc = ab_merge.main([raw_dir, out_dir, "25", "5", "0.9"])
-            self.assertEqual(rc, 0)
+            self.assertEqual(rc, 1)
             with open(os.path.join(out_dir, "finetune_ab_report.json")) as fh:
                 merged = json.load(fh)
         cfg = merged["configs"]["b8-s128-flash-on"]
@@ -831,6 +927,140 @@ class CascadePairFixtureTests(unittest.TestCase):
         self.assertIn("mystery_cascade_eager_dispatches", proof)
         self.assertTrue(merged["configs"]["b8-s128-mystery-cascade"]["verdict"].startswith("INVALID"))
         self.assertEqual(rc, 1)
+
+
+# The lead's own reproduction path (unit-63 round-3 audit block 1): the
+# committed real artifact, NOT copied into this crate's own `fixtures/`
+# directory (unlike `p6_fa2_dense_raw_runs/`/`finetune_run_golden/`) --
+# `crates/jammi-kernels/artifacts/cuda-runs/` is a DIFFERENT crate's own
+# tracked-input artifact tree, read here in place, verbatim, at its real
+# repo path.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+_REAL_ADAMW_ARTIFACT_DIR = os.path.join(
+    _REPO_ROOT,
+    "crates",
+    "jammi-kernels",
+    "artifacts",
+    "cuda-runs",
+    "2026-08-25-adamw-d959805-a100-sxm4-raw-runs",
+    "a100b",
+)
+
+
+def load_real_adamw_artifact(name):
+    """Reads `<name>.json.raw` from the committed real `a100b` adamw A/B
+    raw-run directory (see that directory's own `PROVENANCE.md`) — a
+    genuine `jammi-bench finetune-step` report, run by hand on real
+    hardware, never a hand-rolled dict. Renamed `.json.raw` (not `.json`)
+    by that directory's own convention (kept outside `check_cuda_run_
+    artifacts.py`'s `*.json` schema glob — see its own `PROVENANCE.md`),
+    but its CONTENTS are the exact JSON shape a real binary invocation
+    emits.
+    """
+    with open(os.path.join(_REAL_ADAMW_ARTIFACT_DIR, f"{name}.json.raw")) as fh:
+        return json.load(fh)
+
+
+class RealAdamwArtifactFixtureTests(unittest.TestCase):
+    """Unit-63 round-3 audit block 1's own reproduction: `dispatch_pairs`
+    raised `KeyError('adamw')` on EVERY real leg of this committed artifact
+    before `adamw` was added to `ALL_BASES`/`REQUIRED_PAIRS` — confirmed
+    directly against `b8_s512_fused.r2.json.raw` (the exact leg the lead's
+    audit named), never merely asserted. Every test here reads the REAL
+    file at its own repo path (`load_real_adamw_artifact`), never a
+    hand-rolled dict standing in for what this specific hardware run
+    actually emitted.
+    """
+
+    def run_merge(self, raw_dir):
+        out_dir = tempfile.mkdtemp()
+        rc = ab_merge.main([raw_dir, out_dir, "25", "5", "0.9"])
+        with open(os.path.join(out_dir, "finetune_ab_report.json")) as fh:
+            merged = json.load(fh)
+        return rc, merged
+
+    def write_jammi_fused_only(self, raw_dir, slug, report):
+        write_leg(raw_dir, slug, "jammi-eager", report=jammi_fs({}))
+        write_leg(raw_dir, slug, "jammi-fused", report=report)
+
+    def test_real_fused_leg_no_longer_keyerrors_and_is_green(self):
+        """THE BUG REPRODUCTION named directly by the audit: this leg's own
+        `kernels_disabled_requested`/`kernels_disabled_fired` are BOTH empty
+        (the fused arm, no disable request at all) and every `REQUIRED_PAIRS`/
+        `ABSORBABLE_BY_ATTENTION_BLOCK_FLASH`/`ABSORBABLE_BY_ATTENTION_BLOCK`/
+        `LORA_SITE_EXCLUSIVE_GROUP` member this leg's own schema carries
+        shows a real, positive fused count (`ln`, `geglu`, `adamw`,
+        `attention_block`, `lora_linear` all `> 0`; `rope`/`softmax`
+        legitimately absorbed at `(0, 0)` via `attention_block`'s own
+        `fused > 0`) — this is the GENUINE green shape `fused_proof` exists
+        to pass, once `dispatch_pairs` stops raising on `adamw`.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self.write_jammi_fused_only(
+                raw_dir, "b8-s512-fused", load_real_adamw_artifact("b8_s512_fused.r2")
+            )
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s512-fused"]
+        self.assertNotIsInstance(cfg["jammi_fused_dispatch_proof"], str, cfg["jammi_fused_dispatch_proof"])
+        self.assertIs(cfg["jammi_fused_dispatch_proof"], True, cfg["jammi_fused_dispatch_proof"])
+        self.assertFalse(str(cfg["verdict"]).startswith("INVALID"), cfg["verdict"])
+        self.assertEqual(rc, 0)
+
+    def test_real_fused_leg_s128_shape_is_also_green(self):
+        """The sibling shape at the OTHER committed seq length — same
+        finding, a second real leg."""
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self.write_jammi_fused_only(
+                raw_dir, "b8-s128-fused", load_real_adamw_artifact("b8_s128_fused.r1")
+            )
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-fused"]
+        self.assertIs(cfg["jammi_fused_dispatch_proof"], True, cfg["jammi_fused_dispatch_proof"])
+        self.assertEqual(rc, 0)
+
+    def test_real_disabled_leg_no_longer_keyerrors(self):
+        """The sibling `JAMMI_KERNELS_DISABLE=adamw_step_fused` reference
+        leg: `adamw_fused_dispatches: 0` / `adamw_eager_dispatches: 6720`,
+        `kernels_disabled_requested == kernels_disabled_fired ==
+        ["adamw_step_fused"]`. `adamw` is an ORDINARY `REQUIRED_PAIRS`
+        member (never a `CASCADE_BASES` one — see `ALL_BASES`'s own doc),
+        so rule 1's self-describing-disable-request exemption does NOT
+        apply to it (that exemption is scoped to `CASCADE_BASES` only) --
+        this leg correctly reads `fused_proof` `False` (a real, deliberate
+        eager fallback on a REQUIRED pair), never the pre-fix `KeyError`.
+        This leg is never itself passed through `fused_proof` by
+        `build_report` (only the `jammi-fused` leg is), so this test drives
+        `dispatch_pairs` directly — the exact function that raised.
+        """
+        report = load_real_adamw_artifact("b8_s512_disabled.r2")
+        fs = report["tiers"]["finetune_step"]
+        pairs = ab_merge.dispatch_pairs(fs)  # must not raise
+        by_base = dict((base, (fused, fallback)) for base, fused, fallback in pairs)
+        self.assertIn("adamw", by_base)
+        self.assertEqual(by_base["adamw"], (0, 6720))
+
+    def test_every_real_leg_in_the_artifact_directory_dispatch_pairs_cleanly(self):
+        """Broad, non-vacuous sweep: EVERY `.json.raw` file in the committed
+        real artifact directory (fused and disabled, both shapes, both
+        repeats) must classify through `dispatch_pairs` without raising —
+        the original bug raised on ALL EIGHT of these, unconditionally.
+        """
+        names = [
+            "b8_s128_disabled.r1",
+            "b8_s128_disabled.r2",
+            "b8_s128_fused.r1",
+            "b8_s128_fused.r2",
+            "b8_s512_disabled.r1",
+            "b8_s512_disabled.r2",
+            "b8_s512_fused.r1",
+            "b8_s512_fused.r2",
+        ]
+        for name in names:
+            report = load_real_adamw_artifact(name)
+            fs = report["tiers"]["finetune_step"]
+            pairs = ab_merge.dispatch_pairs(fs)  # must not raise for any of the eight
+            by_base = dict((base, (fused, fallback)) for base, fused, fallback in pairs)
+            self.assertIn("adamw", by_base, f"{name}: adamw pair not discovered")
 
 
 class LegPremiseCheckTests(unittest.TestCase):
@@ -1716,6 +1946,3687 @@ class TorchIdentityFieldsAgainstADryRunDumpTests(unittest.TestCase):
             f"per-block status (absent/null/present) across provenance/args/finetune_step: "
             f"{missing}",
         )
+
+
+# ============================================================================
+# unit 63 H4b — finetune-run A/B merger tests (docs-ci domain).
+# ============================================================================
+
+
+# Unit-63 adversarial-audit finding 2 (merger half): the finetune-run tier
+# now ALSO emits finetune-step's exact `*_fused_dispatches`/
+# `*_eager_dispatches` (and, for the one `CASCADE_BASES` member,
+# `*_declined_dispatches`) counter pairs, verbatim field names.
+#
+# Unit-63 round-3 audit, docs-ci class fix: this dict used to be
+# HAND-TYPED, and its own hand-typing is exactly how `adamw_{fused,eager}_
+# dispatches` fell out of coverage here (block 1's own reproduction) even
+# though `report.rs`/`finetune_step.rs` have emitted it for months, and how
+# the "alloff" shape below used to assert EVERY pair reads `fused == 0` --
+# a hand-rolled assumption `fixtures/finetune_run_golden/modernbert_alloff.json`
+# (a REAL alloff leg) directly contradicts: `finetune_run_ab.sh`'s own
+# documented convention disables ONLY `attention_block_flash` and
+# `adamw_step_fused`, so a real alloff leg's `ln`/`rope`/`softmax`/`geglu`/
+# `lora_linear` all stay FUSED. Both entries below are now read DIRECTLY off
+# the two committed goldens' own dispatch-counter fields (see
+# `_golden_dispatch_counters`) rather than hand-kept literals -- a producer
+# field addition changes these DERIVED dicts automatically the next time the
+# golden is regenerated, never silently leaving a NEW field uncovered again.
+def _golden_dispatch_counters(name):
+    """Every `*_fused_dispatches`/`*_eager_dispatches`/`*_declined_dispatches`
+    key golden `name`'s own `finetune_run` tier carries, read DIRECTLY off
+    that REAL, committed report -- see `load_golden`'s own doc.
+    """
+    tier = load_golden(name)["tiers"]["finetune_run"]
+    return {k: v for k, v in tier.items() if k.endswith(("_fused_dispatches", "_eager_dispatches", "_declined_dispatches"))}
+
+
+_FINETUNE_RUN_DISPATCH_COUNTERS = {
+    # `modernbert_fused.json` -- unit-63 round-6 audit (docs-ci): this
+    # golden is now ONE real, producer-emitted `jammi-bench finetune-run`
+    # leg (campaign-v2, seed 1, `head_dim == 64` ModernBERT-large, see the
+    # golden's own `PROVENANCE.md` "Supersession executed" section), never
+    # a composite. CONTRACT 63 Frame pre-registers the flash cascade as the
+    # `fused` arm's own admitted branch: `attention_block_flash=3276/0`
+    # fires, `attention_block=0/0` is ABSORBED (its own `admit` call is
+    # never reached -- `report.rs`'s own field doc), `ln`/`geglu`/
+    # `lora_linear` independently fused, `adamw=26208/0` -- all read
+    # DIRECTLY off that one leg's own emission, no compositing.
+    "fused": _golden_dispatch_counters("modernbert_fused"),
+    # `modernbert_alloff.json` (unit-63 round-6 audit, same supersession --
+    # ONE real leg, same campaign/seed, the sibling `alloff` arm) --
+    # `ln=6669/0`, `rope=0/0`, `softmax=0/0`, `geglu=3276/0`,
+    # `lora_linear=13104/0` (all unaffected by either disable -- the
+    # class-fix discovery `ALLOFF_DISABLED_OP_BASES`'s own doc explains);
+    # `attention_block=3276/0` -- the disabled flash cascade falls through
+    # to the block arm's own, still-ACTIVE fused kernel (the positive
+    # training-path proof for this arm); `attention_block_flash=0/3276`
+    # and `adamw=0/26208` are the real disabled-kernel fallback counts.
+    "alloff": _golden_dispatch_counters("modernbert_alloff"),
+}
+
+
+def _finetune_run_tier(arm="fused", **overrides):
+    """A fully-populated `FinetuneRunTier`-shaped dict — every
+    `FINETUNE_RUN_IDENTITY_FIELDS` entry, every `PROVENANCE_FIELDS` entry
+    (report.rs), the three premise legs (`admission_is_dense`,
+    `train_probe_series` -- amendment 2026-08-29b: the MERGER derives
+    `learning_happened_delta` from this raw series, never a pre-derived
+    scalar -- `tie_fraction`), the measurement fields
+    (`final_epoch`, `held_out_example_mean`, `held_out_count`,
+    `final_loss_diagnostic`, `trajectory`), and (unit-63 audit finding 2) a
+    CLEAN `_FINETUNE_RUN_DISPATCH_COUNTERS` set matching `arm`. Defaults to
+    MNRL (`margin=None`, `temperature=20.0`) and a CLEAN premise (padded
+    transport, learning happened, no ties) — every mutant test below
+    overrides exactly the one field it means to break.
+
+    Unit-63 round-3 audit, docs-ci class fix: the STRUCTURAL base is now
+    `load_golden("bert_fused")` -- a REAL, committed `jammi-bench
+    finetune-run` report — rather than a second hand-typed field list; every
+    field that report's own struct serializes is therefore present here by
+    construction (see `load_golden`'s own doc for the exact class of bug
+    this closes). The identity/provenance/premise/measurement literal below
+    then overrides every field to this suite's own predictable-for-testing
+    values, UNCHANGED from before this fix — the risk this golden closes is
+    a MISSING field name, never a specific numeric value.
+    """
+    tier = copy.deepcopy(load_golden("bert_fused")["tiers"]["finetune_run"])
+    tier.update({
+        "seed": 42,
+        "batch": 32,
+        "seq": 64,
+        "lora_rank": 8,
+        "lora_alpha": 16.0,
+        "lora_dropout": 0.05,
+        "margin": None,
+        "target_modules": ["Wqkv", "Wo", "Wi"],
+        # unit-63 round-4 audit F-1: the fused arm's own dispatch counters
+        # (`_FINETUNE_RUN_DISPATCH_COUNTERS["fused"]`, folded in below)
+        # claim a positive `attention_block_flash_fused_dispatches` --
+        # `flash_capability_gates` admits BF16 only, so `bf16` is the ONLY
+        # dtype this tier's own counters can be self-consistent under
+        # (`finetune_run_dispatch_proof_violations`'s new arm-agnostic
+        # consistency premise). `finetune_run_ab.sh` now passes
+        # `--backbone-dtype bf16` unconditionally on every real leg for
+        # exactly this reason.
+        "backbone_dtype": "bf16",
+        "checkpoint_config_sha256": "cfg-sha",
+        "checkpoint_weights_sha256": "weights-sha",
+        "checkpoint_weights_size_bytes": 12345,
+        "max_grad_norm": None,
+        "warmup": None,
+        "row_lengths": None,
+        "epochs": 1,
+        "lr": 0.0002,
+        "schedule": "constant",
+        "warmup_steps": 0,
+        "weight_decay": 0.01,
+        "grad_accum": 1,
+        "validation_fraction": 0.1,
+        "train_pairs_file_sha256": "train-pairs-file-sha",
+        "heldout_ids_sha256": "heldout-ids-sha",
+        "heldout_pairs_sha256": "heldout-pairs-sha",
+        "heldout_batch_partition_sha256": "partition-sha",
+        "embedding_loss": "mnrl",
+        "temperature": 20.0,
+        "matryoshka_dims": [],
+        "early_stopping_patience": 10000,
+        "early_stopping_metric": "val_loss",
+        "eval_cadence": 1,
+        # provenance (PROVENANCE_FIELDS)
+        "arm": arm,
+        "device_name": "cuda:0-fixture",
+        "kernels_disabled_requested": [] if arm == "fused" else ["attention_block_flash", "adamw_step_fused"],
+        "kernels_disabled_fired": [] if arm == "fused" else ["attention_block_flash", "adamw_step_fused"],
+        "flash_compiled": True,
+        "build_features": ["cuda"],
+        "attention_arm": "fused" if arm == "fused" else "eager",
+        "split_rule": "positional_fraction_split",
+        "batched_forward": True,
+        "steps_measured": 100,
+        # premise legs (amendment 2026-08-29b: train_probe_series, index 0
+        # the untrained-init probe, one entry per epoch -- this tier's own
+        # default "epochs": 1 means 2 entries; the merger derives
+        # learning_happened_delta = series[0] - series[-1] = 0.05)
+        "admission_is_dense": False,
+        "train_probe_series": [0.55, 0.5],
+        "tie_fraction": 0.0,
+        # measurements
+        "final_epoch": 0,
+        "held_out_example_mean": 0.5,
+        "held_out_count": 128,
+        "final_loss_diagnostic": 0.4,
+        "trajectory": [
+            {
+                "epoch": 0,
+                "held_out_mean": 0.5,
+                "held_out_tie_fraction": 0.0,
+                "held_out_batch_partition_sha256": "partition-sha",
+            }
+        ],
+    })
+    tier.update(_FINETUNE_RUN_DISPATCH_COUNTERS.get(arm, _FINETUNE_RUN_DISPATCH_COUNTERS["fused"]))
+    tier.update(overrides)
+    return tier
+
+
+def _write_finetune_run_leg(raw_dir, seed, arm, repeat, tier, exit_code="0"):
+    base = os.path.join(raw_dir, f"seed{seed}__{arm}__{repeat}")
+    with open(base + ".json", "w") as fh:
+        json.dump({"tiers": {"finetune_run": tier}}, fh)
+    with open(base + ".exit", "w") as fh:
+        fh.write(exit_code)
+    with open(base + ".stderr", "w") as fh:
+        fh.write("")
+
+
+class GoldenProducerAnchoredFieldSetTests(unittest.TestCase):
+    """The unit-63 round-3 audit's own class fix, pinned mechanically: the
+    SET of `*_fused_dispatches`/`*_eager_dispatches`/`*_declined_dispatches`
+    base names a REAL, committed `jammi-bench finetune-run` report carries
+    must equal exactly what `ab_merge.ALL_BASES` classifies -- neither side
+    a strict subset of the other. `adamw` fell out of `ALL_BASES` for
+    months despite every real report emitting it (block 1's own
+    reproduction); this test REDs the instant that gap reopens, for THIS
+    base or a future one, rather than waiting for a real leg to hit
+    `dispatch_pairs`'s own `KeyError` in a live sweep.
+
+    All three committed goldens are read (`bert_fused`, `modernbert_fused`,
+    `modernbert_alloff` — unit-63 round-6 audit: all three are now real,
+    single, producer-emitted `jammi-bench finetune-run` reports, never a
+    composite; see the latter two's own `PROVENANCE.md` "Supersession
+    executed" section for the campaign/seed/git_sha this class fix now
+    reads them from) —
+    a single golden would still catch a MISSING field (every
+    `FinetuneRunTier` field is unconditionally serialized regardless of
+    architecture, see `report.rs`), but reading all three is a stronger,
+    still entirely real-data pin: no ONE golden alone could silently drift
+    to "only ever has 8 of the 9 real bases" without another golden's own
+    set disagreeing with it.
+    """
+
+    def test_golden_dispatch_pair_bases_equal_all_bases(self):
+        for name in ("bert_fused", "modernbert_fused", "modernbert_alloff"):
+            tier = load_golden(name)["tiers"]["finetune_run"]
+            discovered = {
+                key[: -len("_fused_dispatches")]
+                for key in tier
+                if key.endswith("_fused_dispatches")
+            }
+            self.assertEqual(
+                discovered,
+                ab_merge.ALL_BASES,
+                f"{name}.json's own *_fused_dispatches base set no longer matches "
+                f"ab_merge.ALL_BASES -- a producer field addition/removal REDs here "
+                f"(regenerate the golden and update ALL_BASES together, never one alone): "
+                f"golden-only={discovered - ab_merge.ALL_BASES!r} "
+                f"ALL_BASES-only={ab_merge.ALL_BASES - discovered!r}",
+            )
+
+    def test_golden_dispatch_pairs_classify_cleanly_via_dispatch_pairs(self):
+        """Not just the base-name SET (above) -- `ab_merge.dispatch_pairs`
+        itself, the REAL function a merge calls, must not raise on either
+        golden's own `finetune_run` tier (the exact mechanism `KeyError`d on
+        `adamw` before block 1's fix).
+        """
+        for name in ("bert_fused", "modernbert_fused", "modernbert_alloff"):
+            tier = load_golden(name)["tiers"]["finetune_run"]
+            pairs = ab_merge.dispatch_pairs(tier)  # must not raise
+            self.assertEqual({base for base, _fused, _fallback in pairs}, ab_merge.ALL_BASES)
+
+    def test_golden_modernbert_real_legs_clear_the_dispatch_proof_gate(self):
+        """Unit-63 round-6 audit, renaming/re-scoping round-5's
+        `test_golden_modernbert_composites_clear_the_dispatch_proof_gate`:
+        `modernbert_fused.json`/`modernbert_alloff.json` are no longer
+        STAGED-CLOSURE composites -- the supersession plan round-5 recorded
+        has EXECUTED (see `PROVENANCE.md`'s "Supersession executed"
+        section): each is now ONE real, producer-emitted `jammi-bench
+        finetune-run` leg (campaign-v2, seed 1, real `head_dim == 64`
+        ModernBERT-large checkpoint) copied byte-for-byte, so this test's
+        own pin is now stronger than its round-5 predecessor's: it
+        certifies that a REAL leg (not merely a schema-shaped
+        stand-in) clears `finetune_run_dispatch_proof_violations` -- the
+        merger's schema-shape/premise acceptance gate -- run each one
+        DIRECTLY off the committed JSON (never `_finetune_run_tier`'s own
+        hand-overridden literal), including the arm-agnostic
+        counters-vs-`backbone_dtype` consistency premise and the fused
+        arm's own bf16 premise. `bert_fused.json` is deliberately excluded
+        here -- a real CPU-hermetic BERT leg with no fused attention-block
+        kernel at all (`flash_compiled: false`) was never claimed to clear
+        the flash-cascade-arm's own premise; it is this suite's structural
+        field-set base (`_finetune_run_tier`), not a leg exercising this
+        gate.
+        """
+        fused_tier = load_golden("modernbert_fused")["tiers"]["finetune_run"]
+        self.assertEqual(ab_merge.finetune_run_dispatch_proof_violations("fused", fused_tier), [])
+        alloff_tier = load_golden("modernbert_alloff")["tiers"]["finetune_run"]
+        self.assertEqual(ab_merge.finetune_run_dispatch_proof_violations("alloff", alloff_tier), [])
+
+
+class SignTestMirrorTests(unittest.TestCase):
+    """`ab_merge.sign_test` is a Python u128-equivalent mirror of
+    `jammi_numerics::stats::sign_test::sign_test` (branch
+    `numerics/63-sign-test`) — every case here is transcribed directly from
+    that module's own `tests/it/stats.rs` cases, hand-computation comments
+    included, so a divergence between the two implementations is caught by
+    literally re-running the SAME arithmetic this suite's Rust twin already
+    pins.
+    """
+
+    def test_golden_n12_k11_pinned_cell(self):
+        # CONTRACT H2 / PLAN v2 delta 3's pre-registered decision cell:
+        # t=11, tail=C(12,11)+C(12,12)=12+1=13, p=2*13/4096=13/2048.
+        diffs = [1.0] * 11 + [-1.0]
+        r = ab_merge.sign_test(diffs)
+        self.assertEqual((r["n"], r["n_pos"], r["n_neg"], r["ties"]), (12, 11, 1, 0))
+        expected = 13.0 / 2048.0
+        self.assertEqual(
+            r["p_value"].hex(),
+            expected.hex(),
+            f"golden cell (n=12, k=11) must equal 13/2048 bit-for-bit, got {r['p_value']}",
+        )
+        self.assertLess(abs(r["p_value"] - 0.0064), 0.0005)
+
+    def test_exact_small_n_all_same_sign(self):
+        r = ab_merge.sign_test([2.0, 3.0, 1.0, 0.5, 7.0])
+        self.assertEqual((r["n"], r["n_pos"], r["n_neg"], r["ties"]), (5, 5, 0, 0))
+        self.assertEqual(r["p_value"].hex(), (2.0 / 32.0).hex())
+
+    def test_exact_small_n_one_dissent(self):
+        r = ab_merge.sign_test([2.0, 3.0, 1.0, 0.5, -7.0])
+        self.assertEqual((r["n"], r["n_pos"], r["n_neg"], r["ties"]), (5, 4, 1, 0))
+        self.assertEqual(r["p_value"].hex(), (12.0 / 32.0).hex())
+
+    def test_exact_small_n_balanced_saturates_at_one(self):
+        r = ab_merge.sign_test([1.0, 1.0, -1.0, -1.0])
+        self.assertEqual((r["n"], r["n_pos"], r["n_neg"], r["ties"]), (4, 2, 2, 0))
+        self.assertEqual(r["p_value"], 1.0)
+
+    def test_two_sided_symmetry(self):
+        diffs = [3.0, 1.5, -2.0, 4.0, 0.2, -0.1, 5.0, -6.0, 0.9, 2.2, -1.1, 8.0]
+        flipped = [-d for d in diffs]
+        r = ab_merge.sign_test(diffs)
+        rf = ab_merge.sign_test(flipped)
+        self.assertEqual(r["n"], rf["n"])
+        self.assertEqual(r["n_pos"], rf["n_neg"])
+        self.assertEqual(r["n_neg"], rf["n_pos"])
+        self.assertEqual(r["p_value"].hex(), rf["p_value"].hex())
+
+    def test_reports_ties_without_dropping_them(self):
+        r = ab_merge.sign_test([1.0, 1.0, 1.0, 0.0, 0.0, -1.0])
+        self.assertEqual(r["n"], 4, "ties must be excluded from n, not folded in")
+        self.assertEqual((r["n_pos"], r["n_neg"], r["ties"]), (3, 1, 2))
+        self.assertEqual(r["p_value"].hex(), (10.0 / 16.0).hex())
+
+    def test_refuses_empty_input(self):
+        with self.assertRaises(ab_merge.SignTestError) as ctx:
+            ab_merge.sign_test([])
+        self.assertIn("n=0", str(ctx.exception))
+
+    def test_refuses_all_ties_with_a_distinct_message(self):
+        with self.assertRaises(ab_merge.SignTestError) as ctx:
+            ab_merge.sign_test([0.0, 0.0, 0.0])
+        msg = str(ctx.exception)
+        self.assertTrue("tie" in msg or "tied" in msg, msg)
+
+    def test_refuses_nan(self):
+        with self.assertRaises(ab_merge.SignTestError):
+            ab_merge.sign_test([1.0, float("nan"), -1.0])
+
+    def test_admits_infinite_as_a_well_defined_sign(self):
+        r = ab_merge.sign_test([float("inf"), float("-inf"), 1.0, 2.0, 3.0])
+        self.assertEqual((r["n"], r["n_pos"], r["n_neg"], r["ties"]), (5, 4, 1, 0))
+
+    def test_negative_control_balanced_is_not_significant(self):
+        diffs = [1.0] * 6 + [-1.0] * 6
+        r = ab_merge.sign_test(diffs)
+        self.assertEqual(r["n"], 12)
+        self.assertGreater(r["p_value"], 0.5)
+
+    def test_is_invariant_to_input_order(self):
+        ordered = [1.0, -1.0, 1.0, 1.0, 0.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, 1.0]
+        shuffled = list(reversed(ordered))
+        shuffled = shuffled[3:] + shuffled[:3]  # rotate_left(3)
+        self.assertNotEqual(ordered, shuffled)
+        a = ab_merge.sign_test(ordered)
+        b = ab_merge.sign_test(shuffled)
+        self.assertEqual((a["n"], a["n_pos"], a["n_neg"], a["ties"]), (b["n"], b["n_pos"], b["n_neg"], b["ties"]))
+        self.assertEqual(a["p_value"].hex(), b["p_value"].hex())
+
+
+class FinetuneRunArmPremiseMutantTests(unittest.TestCase):
+    """`finetune_run_arm_premise_violations` — one mutant per premise leg
+    (CONTRACT Frame / H4: admission_is_dense / learning-happened / tie cap /
+    schedule, conjunctive). A clean tier clears all four; each mutation
+    trips exactly the leg it targets, proving none of the four checks is
+    vacuous.
+    """
+
+    def test_clean_tier_has_no_violations(self):
+        self.assertEqual(ab_merge.finetune_run_arm_premise_violations("fused", _finetune_run_tier()), [])
+
+    def test_dense_leg_is_a_violation(self):
+        tier = _finetune_run_tier(admission_is_dense=True)
+        v = ab_merge.finetune_run_arm_premise_violations("fused", tier)
+        self.assertTrue(any("admission_is_dense" in m for m in v), v)
+
+    def test_decaying_schedule_is_a_violation(self):
+        # unit-63 round-7 audit advisory (d): amendment 2026-08-29b item 4's
+        # decaying-schedule ban had no mechanical enforcement -- `schedule`
+        # is already recorded on the tier, so a non-"constant" schedule must
+        # be refused here, citing that item.
+        tier = _finetune_run_tier(schedule="cosine")
+        v = ab_merge.finetune_run_arm_premise_violations("fused", tier)
+        self.assertTrue(any("schedule" in m and "item 4" in m for m in v), v)
+
+    # amendment 2026-08-29b: the learning-happened premise is now DERIVED
+    # from the raw `train_probe_series` (series[0] - series[-1] > floor),
+    # never read off a pre-derived scalar. One mutant per typed refusal
+    # (floor-fail, missing-series, short-series, non-finite, v1-scalar-only,
+    # length-vs-epochs mismatch) -- proving none of the six is vacuous.
+
+    def test_floor_fail_series_is_a_violation(self):
+        # CONTRACT amendment 2026-08-29e (D*): a ZERO delta fails
+        # `training_effective` itself (message text updated: no learning was
+        # observed at all -- see that function's own doc).
+        tier = _finetune_run_tier(train_probe_series=[0.5, 0.5])  # delta == floor, not strictly >
+        v = ab_merge.finetune_run_arm_premise_violations("fused", tier)
+        self.assertTrue(any("training_effective" in m and "floor" in m for m in v), v)
+
+        # A NEGATIVE delta (the probe got WORSE) clears `training_effective`
+        # (|delta| > 0) but fails `train_direction` (this leg's own declared
+        # direction stays DESCENT at this default call site) -- a DIFFERENT
+        # message than the zero-delta case above, though both still fail the
+        # single `"learning_happened"` premise name (behavior-identical: the
+        # leg is excluded from the decision exactly as it always was).
+        tier2 = _finetune_run_tier(train_probe_series=[0.5, 0.51])  # delta negative (got WORSE)
+        v2 = ab_merge.finetune_run_arm_premise_violations("fused", tier2)
+        self.assertTrue(any("train_direction" in m and "ascent" in m for m in v2), v2)
+
+    def test_missing_series_is_a_violation(self):
+        tier = _finetune_run_tier(train_probe_series=None)
+        v = ab_merge.finetune_run_arm_premise_violations("fused", tier)
+        self.assertTrue(any("missing" in m for m in v), v)
+
+    def test_short_series_is_a_violation(self):
+        tier = _finetune_run_tier(train_probe_series=[0.5])
+        v = ab_merge.finetune_run_arm_premise_violations("fused", tier)
+        self.assertTrue(any("need at least 2" in m for m in v), v)
+
+    def test_non_finite_series_entry_is_a_violation(self):
+        tier = _finetune_run_tier(train_probe_series=[0.5, float("nan")])
+        v = ab_merge.finetune_run_arm_premise_violations("fused", tier)
+        self.assertTrue(any("non-finite" in m for m in v), v)
+
+        tier2 = _finetune_run_tier(train_probe_series=[0.5, float("inf")])
+        v2 = ab_merge.finetune_run_arm_premise_violations("fused", tier2)
+        self.assertTrue(any("non-finite" in m for m in v2), v2)
+
+    def test_length_equals_epochs_series_is_a_violation(self):
+        # unit-63 round-7 audit finding 3: a series whose length equals
+        # `epochs` itself (never `epochs + 1`) is the v1 probe bug's EXACT
+        # shape (the baseline excluded the init point) -- this used to clear
+        # the SHORT check (>= 2 entries) unchallenged whenever epochs >= 2.
+        tier = _finetune_run_tier(epochs=3, train_probe_series=[0.55, 0.53, 0.51])  # len == epochs, not epochs+1
+        v = ab_merge.finetune_run_arm_premise_violations("fused", tier)
+        self.assertTrue(any("init-anchored" in m and "epochs=3" in m for m in v), v)
+
+    def test_length_epochs_plus_two_series_is_a_violation(self):
+        # The over-long direction: len(series) == epochs + 2, a
+        # truncation/duplication producer bug in the OTHER direction, also
+        # refused (never silently trusted just because it is longer, not
+        # shorter, than the SHORT check's floor).
+        tier = _finetune_run_tier(epochs=3, train_probe_series=[0.55, 0.53, 0.51, 0.50, 0.49])  # epochs+2
+        v = ab_merge.finetune_run_arm_premise_violations("fused", tier)
+        self.assertTrue(any("init-anchored" in m and "epochs=3" in m for m in v), v)
+
+    def test_length_epochs_plus_one_series_is_clean(self):
+        # The correct, init-anchored shape: exactly epochs+1 entries.
+        tier = _finetune_run_tier(epochs=3, train_probe_series=[0.55, 0.53, 0.51, 0.50])  # epochs+1, delta=0.05>0
+        self.assertEqual(ab_merge.finetune_run_arm_premise_violations("fused", tier), [])
+
+    def test_v1_scalar_only_leg_is_invalid_never_readjudicated(self):
+        # A leg carrying the OLD scalar field with no series at all -- a
+        # producer-version mismatch (a v1-era report, e.g. the committed
+        # campaign-v1 evidence), never silently re-adjudicated under the
+        # corrected series-derived rule even though the OLD scalar itself
+        # would have cleared the floor.
+        tier = _finetune_run_tier(learning_happened_delta=0.05, train_probe_series=None)
+        v = ab_merge.finetune_run_arm_premise_violations("fused", tier)
+        self.assertTrue(any("producer-version mismatch" in m for m in v), v)
+
+    def test_saturated_tie_fraction_is_a_violation(self):
+        # C16's own hinge-saturation shape: tie_fraction -> 1.0.
+        tier = _finetune_run_tier(tie_fraction=1.0)
+        v = ab_merge.finetune_run_arm_premise_violations("fused", tier)
+        self.assertTrue(any("tie_fraction" in m for m in v), v)
+
+    def test_tie_fraction_just_under_cap_is_clean(self):
+        tier = _finetune_run_tier(tie_fraction=ab_merge.FINETUNE_RUN_TIE_FRACTION_CAP - 0.01)
+        self.assertEqual(ab_merge.finetune_run_arm_premise_violations("fused", tier), [])
+
+
+class FinetuneRunDispatchProofMutantTests(unittest.TestCase):
+    """`finetune_run_dispatch_proof_violations` (unit-63 audit finding 2's
+    merger half) — one mutant per arm, plus the "missing entirely" and
+    "malformed pair" carve-outs.
+    """
+
+    def test_clean_fused_tier_has_no_violations(self):
+        self.assertEqual(
+            ab_merge.finetune_run_dispatch_proof_violations("fused", _finetune_run_tier(arm="fused")), []
+        )
+
+    def test_clean_alloff_tier_has_no_violations(self):
+        self.assertEqual(
+            ab_merge.finetune_run_dispatch_proof_violations("alloff", _finetune_run_tier(arm="alloff")), []
+        )
+
+    def test_fused_arm_failing_required_pair_is_a_violation(self):
+        # ln reads (0, 0) -- REQUIRED_PAIRS demands fused > 0.
+        tier = _finetune_run_tier(arm="fused", ln_fused_dispatches=0)
+        v = ab_merge.finetune_run_dispatch_proof_violations("fused", tier)
+        self.assertTrue(any("fused-dispatch proof" in m for m in v), v)
+
+    def test_fused_arm_with_a_real_eager_fallback_is_a_violation(self):
+        # Rule 1: ANY pair with a nonzero fallback count is a hard fail.
+        tier = _finetune_run_tier(arm="fused", ln_eager_dispatches=3)
+        v = ab_merge.finetune_run_dispatch_proof_violations("fused", tier)
+        self.assertTrue(any("fused-dispatch proof" in m for m in v), v)
+
+    def test_fused_arm_with_flash_compiled_false_is_an_invalid_premise(self):
+        # Unit-63 round-3 audit, coordinator correction: CONTRACT 63 Frame
+        # pre-registers the flash cascade as this arm's own admitted
+        # branch -- a build that cannot compile it in can never exercise
+        # the pre-registered differential, an INVALID premise regardless of
+        # what the (otherwise clean) dispatch counters read.
+        tier = _finetune_run_tier(arm="fused", flash_compiled=False)
+        v = ab_merge.finetune_run_dispatch_proof_violations("fused", tier)
+        self.assertTrue(any("flash_compiled=False" in m for m in v), v)
+
+    def test_fused_arm_with_non_bf16_dtype_and_positive_flash_counter_is_a_contradiction(self):
+        # unit-63 round-4 audit F-1, check 0 (arm-agnostic): the DEFAULT
+        # fused tier's own dispatch counters already claim
+        # `attention_block_flash_fused_dispatches=3276` (unit-63 round-6:
+        # the real campaign-v2 seed-1 leg's own count, since the
+        # supersession) -- overriding only
+        # `backbone_dtype` (never the counters) exercises the
+        # counters-vs-declared-premise contradiction directly, before the
+        # fused arm's own (separate) dtype premise check below is ever
+        # reached.
+        tier = _finetune_run_tier(arm="fused", backbone_dtype="f32")
+        v = ab_merge.finetune_run_dispatch_proof_violations("fused", tier)
+        self.assertTrue(
+            any("counters claim a dispatch the declared dtype forbids" in m for m in v), v
+        )
+
+    def test_alloff_arm_with_non_bf16_dtype_and_positive_flash_counter_is_a_contradiction(self):
+        # Same check 0, exercised on the OTHER arm -- arm-agnostic means
+        # arm-agnostic: an `alloff` leg whose own counters somehow claim a
+        # positive flash-fused dispatch is caught here, before ever
+        # reaching the alloff-specific disabled-op proof below (which would
+        # ALSO flag this leg, for a different reason -- 'disabled but
+        # fired' -- but this check fires first and is the one actually
+        # exercised, since it is unconditional on arm).
+        tier = _finetune_run_tier(arm="alloff", backbone_dtype="f32", attention_block_flash_fused_dispatches=5)
+        v = ab_merge.finetune_run_dispatch_proof_violations("alloff", tier)
+        self.assertTrue(
+            any("counters claim a dispatch the declared dtype forbids" in m for m in v), v
+        )
+
+    def test_fused_arm_with_non_bf16_dtype_is_an_invalid_premise_even_with_clean_counters(self):
+        # unit-63 round-4 audit F-1, the FUSED arm's own defining premise
+        # (independent of check 0 above): force `attention_block_flash_
+        # fused_dispatches` to 0 (the block arm's own absorption picking up
+        # the slack instead, same shape as
+        # `test_fused_arm_with_flash_never_dispatched_is_a_violation`) so
+        # check 0 does NOT fire, isolating the fused-specific dtype premise
+        # check that DOES fire regardless of the (otherwise clean-looking)
+        # counters.
+        tier = _finetune_run_tier(
+            arm="fused",
+            backbone_dtype="f32",
+            attention_block_flash_fused_dispatches=0,
+            attention_block_flash_declined_dispatches=0,
+            attention_block_fused_dispatches=840,
+        )
+        v = ab_merge.finetune_run_dispatch_proof_violations("fused", tier)
+        self.assertTrue(any("fused: backbone_dtype='f32'" in m for m in v), v)
+        self.assertTrue(any("INVALID premise" in m for m in v), v)
+
+    def test_fused_arm_with_flash_never_dispatched_is_a_violation(self):
+        # `fused_proof`'s own absorption rule tolerates EITHER the flash
+        # cascade or the block arm firing -- correct for finetune-step's
+        # own flash-vs-block A/B, but the finetune-run `fused` arm
+        # specifically claims to run the flash-cascade branch. A leg where
+        # the block arm picked up the slack instead (flash never fired,
+        # attention_block fired FUSED on its own) must still fail this
+        # arm's own, stricter proof.
+        tier = _finetune_run_tier(
+            arm="fused",
+            attention_block_flash_fused_dispatches=0,
+            attention_block_flash_declined_dispatches=0,
+            attention_block_fused_dispatches=840,
+        )
+        v = ab_merge.finetune_run_dispatch_proof_violations("fused", tier)
+        self.assertTrue(any("attention_block_flash_fused_dispatches=0" in m for m in v), v)
+
+    def test_alloff_arm_with_real_production_dispatch_shape_is_clean(self):
+        # unit-63 round-3 audit, class-fix discovery: the default alloff
+        # base is now the REAL `modernbert_alloff.json` golden's own
+        # dispatch shape (ln/rope/softmax/geglu/lora_linear all FUSED,
+        # attention_block/adamw/attention_block_flash all correctly
+        # disabled) -- no longer "all zero fused", but still clean.
+        self.assertEqual(
+            ab_merge.finetune_run_dispatch_proof_violations("alloff", _finetune_run_tier(arm="alloff")), []
+        )
+
+    def test_alloff_arm_with_attention_block_fused_zero_is_a_violation(self):
+        # unit-63 round-3 audit block 4, coordinator correction: the
+        # positive training-path proof for `alloff` is `attention_block`'s
+        # own FUSED count (it is NOT itself named in the disable list, only
+        # `attention_block_flash` is, so it must remain an ACTIVE,
+        # undisabled fused kernel on a real checkpoint) -- a leg where it
+        # reads `fused == 0` (the disabled flash cascade failing to fall
+        # through to a live fused kernel) is a violation, never tolerated
+        # as "maybe it fell back to eager instead" (an EARLIER, incorrect
+        # shape of this same proof).
+        tier = _finetune_run_tier(
+            arm="alloff", attention_block_fused_dispatches=0, attention_block_eager_dispatches=4
+        )
+        v = ab_merge.finetune_run_dispatch_proof_violations("alloff", tier)
+        self.assertTrue(any("attention_block_fused_dispatches=0" in m for m in v), v)
+
+    def test_alloff_arm_with_ln_and_geglu_fused_is_not_a_violation(self):
+        # unit-63 round-3 audit, class-fix discovery: `ln`/`geglu` are NOT
+        # among `ALLOFF_DISABLED_OP_BASES` -- `finetune_run_ab.sh`'s own
+        # documented `alloff` convention disables ONLY `attention_block_flash`
+        # and `adamw_step_fused` -- so a real alloff leg's `ln`/`geglu`
+        # staying fused (exactly what `fixtures/finetune_run_golden/
+        # modernbert_alloff.json`, a REAL leg, shows) is not this arm's
+        # business at all. The pre-fix blanket "every pair must be
+        # fused == 0" rule would have wrongly flagged this.
+        tier = _finetune_run_tier(arm="alloff", ln_fused_dispatches=2, geglu_fused_dispatches=5)
+        v = ab_merge.finetune_run_dispatch_proof_violations("alloff", tier)
+        self.assertEqual(v, [])
+
+    def test_alloff_arm_with_multiple_disabled_ops_leaking_fused_names_each(self):
+        # Both genuinely-disabled ops (`attention_block_flash`,
+        # `adamw_step_fused`) leaking a fused count at once must each be
+        # named, independently -- not merged into one opaque message.
+        tier = _finetune_run_tier(
+            arm="alloff", attention_block_flash_fused_dispatches=3, adamw_fused_dispatches=7
+        )
+        v = ab_merge.finetune_run_dispatch_proof_violations("alloff", tier)
+        self.assertTrue(any("attention_block_flash shows 3" in m for m in v), v)
+        self.assertTrue(any("adamw shows 7" in m for m in v), v)
+
+    def test_missing_dispatch_counters_entirely_is_a_violation_never_assumed_good(self):
+        # An older-producer leg predating this emission: strip every
+        # counter field -- `dispatch_pairs` then discovers nothing at all,
+        # which must NOT be silently treated as "ran the claimed arm
+        # cleanly" for either arm.
+        base_tier = _finetune_run_tier(arm="fused")
+        stripped = {k: v for k, v in base_tier.items() if not k.endswith(("_fused_dispatches", "_eager_dispatches"))}
+        v_fused = ab_merge.finetune_run_dispatch_proof_violations("fused", stripped)
+        self.assertTrue(any("no *_fused_dispatches" in m for m in v_fused), v_fused)
+
+        alloff_tier = _finetune_run_tier(arm="alloff")
+        stripped_alloff = {
+            k: v for k, v in alloff_tier.items() if not k.endswith(("_fused_dispatches", "_eager_dispatches"))
+        }
+        v_alloff = ab_merge.finetune_run_dispatch_proof_violations("alloff", stripped_alloff)
+        self.assertTrue(any("no *_fused_dispatches" in m for m in v_alloff), v_alloff)
+
+    def test_solo_counter_schema_error_is_caught_not_propagated(self):
+        tier = _finetune_run_tier(arm="fused")
+        del tier["ln_eager_dispatches"]  # a fused key with no fallback sibling
+        v = ab_merge.finetune_run_dispatch_proof_violations("fused", tier)
+        self.assertTrue(any("dispatch-pair schema error" in m for m in v), v)
+
+
+class FinetuneRunCrossSeedHomogeneityTests(unittest.TestCase):
+    """`finetune_run_cross_seed_homogeneity_violations` (unit-63 audit
+    finding 3): every OTHER identity check in this section compares
+    fused-vs-alloff WITHIN one seed only; this one compares every leg
+    entering the decision against every OTHER leg, `seed` itself excepted.
+    """
+
+    def _identity(self, seed, arm, **overrides):
+        return (
+            f"seed {seed} {arm} r1",
+            ab_merge.finetune_run_leg_identity(_finetune_run_tier(arm=arm, seed=seed, **overrides)),
+        )
+
+    def test_fewer_than_two_legs_is_clean(self):
+        self.assertEqual(ab_merge.finetune_run_cross_seed_homogeneity_violations([]), [])
+        self.assertEqual(
+            ab_merge.finetune_run_cross_seed_homogeneity_violations([self._identity(1, "fused")]), []
+        )
+
+    def test_homogeneous_twelve_seeds_is_clean(self):
+        legs = [self._identity(seed, arm) for seed in range(1, 13) for arm in ("fused", "alloff")]
+        self.assertEqual(ab_merge.finetune_run_cross_seed_homogeneity_violations(legs), [])
+
+    def test_two_fixture_split_is_a_violation(self):
+        # Empirical reproduction: 6 seeds run against one held-out text, 6
+        # against a different one -- each seed's own fused/alloff pair
+        # internally agrees (heldout_pairs_sha256 matches within a seed), so
+        # the existing per-seed check alone would see nothing wrong.
+        legs = []
+        for seed in range(1, 7):
+            for arm in ("fused", "alloff"):
+                legs.append(self._identity(seed, arm, heldout_pairs_sha256="fixture-a"))
+        for seed in range(7, 13):
+            for arm in ("fused", "alloff"):
+                legs.append(self._identity(seed, arm, heldout_pairs_sha256="fixture-b"))
+        v = ab_merge.finetune_run_cross_seed_homogeneity_violations(legs)
+        self.assertTrue(any("heldout_pairs_sha256" in m for m in v), v)
+
+    def test_single_divergent_field_on_one_seed_names_it(self):
+        legs = [self._identity(seed, arm) for seed in range(1, 13) for arm in ("fused", "alloff")]
+        # Seed 7's own two legs both agree with EACH OTHER (so the existing
+        # cross-arm check is clean) but diverge from every other seed.
+        legs = [
+            leg
+            if not leg[0].startswith("seed 7 ")
+            else self._identity(7, leg[0].split(" ")[2], checkpoint_weights_sha256="different-checkpoint")
+            for leg in legs
+        ]
+        v = ab_merge.finetune_run_cross_seed_homogeneity_violations(legs)
+        self.assertEqual(len(v), 1)
+        self.assertIn("checkpoint_weights_sha256", v[0])
+        self.assertIn("seed 7", v[0])
+
+    def test_seed_field_itself_is_never_compared(self):
+        legs = [self._identity(seed, arm) for seed in range(1, 5) for arm in ("fused", "alloff")]
+        self.assertEqual(ab_merge.finetune_run_cross_seed_homogeneity_violations(legs), [])
+
+    def test_missing_field_on_one_leg_is_its_own_divergent_group(self):
+        clean = [self._identity(seed, arm) for seed in (1, 2, 3) for arm in ("fused", "alloff")]
+        missing_field_tier = _finetune_run_tier(arm="fused", seed=4)
+        del missing_field_tier["lora_dropout"]
+        clean.append((f"seed 4 fused r1", ab_merge.finetune_run_leg_identity(missing_field_tier)))
+        clean.append((f"seed 4 alloff r1", ab_merge.finetune_run_leg_identity(_finetune_run_tier(arm="alloff", seed=4))))
+        v = ab_merge.finetune_run_cross_seed_homogeneity_violations(clean)
+        self.assertTrue(any("lora_dropout" in m for m in v), v)
+
+    # unit-63 round-3 audit block 3 -- `lr` is IDENTITY FIELD #17; the lr0
+    # RED control's own legs run at `--lr 0` BY CONSTRUCTION, so comparing
+    # `lr` across the FULL combined pool the way every other field is
+    # compared would make ANY nonempty `lr0_labels` set unconditionally
+    # INVALID. `lr0_labels` names which `leg_identities` entries are the
+    # control's own -- `lr` is then compared WITHIN each of the main/
+    # lr0-control pools separately, never across that boundary.
+
+    def _lr0_identity(self, seed, arm, **overrides):
+        overrides.setdefault("lr", 0.0)
+        return (
+            f"lr0 seed {seed} {arm}",
+            ab_merge.finetune_run_leg_identity(_finetune_run_tier(arm=arm, seed=seed, **overrides)),
+        )
+
+    def test_lr0_control_legs_diverging_on_lr_from_main_legs_is_not_a_violation(self):
+        main_legs = [self._identity(seed, arm) for seed in range(1, 3) for arm in ("fused", "alloff")]
+        lr0_legs = [self._lr0_identity(101, arm) for arm in ("fused", "alloff")]
+        lr0_labels = {label for label, _fields in lr0_legs}
+        v = ab_merge.finetune_run_cross_seed_homogeneity_violations(main_legs + lr0_legs, lr0_labels=lr0_labels)
+        self.assertEqual(v, [], v)
+
+    def test_lr0_control_leg_diverging_on_a_non_lr_field_is_still_a_violation(self):
+        # The `lr` exception is NARROW -- an lr0-control leg diverging on
+        # any OTHER field (its own defining premise aside) still collapses
+        # this check, exactly like a main leg would.
+        main_legs = [self._identity(seed, arm) for seed in range(1, 3) for arm in ("fused", "alloff")]
+        lr0_legs = [
+            self._lr0_identity(101, "fused"),
+            self._lr0_identity(101, "alloff", checkpoint_weights_sha256="different-checkpoint"),
+        ]
+        lr0_labels = {label for label, _fields in lr0_legs}
+        v = ab_merge.finetune_run_cross_seed_homogeneity_violations(main_legs + lr0_legs, lr0_labels=lr0_labels)
+        self.assertTrue(any("checkpoint_weights_sha256" in m for m in v), v)
+
+    def test_lr0_control_legs_diverging_on_lr_among_themselves_is_a_violation(self):
+        # The `lr` exception drops the CROSS-group comparison only -- two
+        # lr0-control legs must still agree with EACH OTHER on `lr`.
+        main_legs = [self._identity(seed, arm) for seed in range(1, 3) for arm in ("fused", "alloff")]
+        lr0_legs = [
+            self._lr0_identity(101, "fused"),
+            self._lr0_identity(101, "alloff", lr=0.5),  # a lr0-control leg NOT actually at lr=0
+        ]
+        lr0_labels = {label for label, _fields in lr0_legs}
+        v = ab_merge.finetune_run_cross_seed_homogeneity_violations(main_legs + lr0_legs, lr0_labels=lr0_labels)
+        self.assertTrue(any("'lr' diverges within the lr0-control pool" in m for m in v), v)
+
+    def test_main_legs_diverging_on_lr_among_themselves_is_still_a_violation(self):
+        # The `lr` exception is about the lr0-vs-main BOUNDARY only -- main
+        # legs must still all agree with each other on `lr`.
+        main_legs = [
+            self._identity(1, "fused"),
+            self._identity(1, "alloff"),
+            self._identity(2, "fused", lr=0.001),
+            self._identity(2, "alloff", lr=0.001),
+        ]
+        v = ab_merge.finetune_run_cross_seed_homogeneity_violations(main_legs)
+        self.assertTrue(any("'lr' diverges within the main pool" in m for m in v), v)
+
+
+class FinetuneRunCrossArmIdentityTests(unittest.TestCase):
+    """Cross-arm identity check (`generic_leg_premise_violations` over
+    `FINETUNE_RUN_IDENTITY_FIELDS`) — the fused/alloff legs of ONE seed must
+    share every identity field; `arm`/`attention_arm` (provenance) are
+    allowed, indeed expected, to differ.
+    """
+
+    def test_matching_identity_is_clean(self):
+        fused = ab_merge.finetune_run_leg_identity(_finetune_run_tier(arm="fused"))
+        alloff = ab_merge.finetune_run_leg_identity(_finetune_run_tier(arm="alloff"))
+        self.assertEqual(
+            ab_merge.generic_leg_premise_violations(
+                ab_merge.FINETUNE_RUN_IDENTITY_FIELDS, fused, alloff, "fused", "alloff"
+            ),
+            [],
+        )
+
+    def test_differing_heldout_ids_sha256_is_a_violation(self):
+        fused = ab_merge.finetune_run_leg_identity(_finetune_run_tier(arm="fused"))
+        alloff = ab_merge.finetune_run_leg_identity(
+            _finetune_run_tier(arm="alloff", heldout_ids_sha256="different-sha")
+        )
+        v = ab_merge.generic_leg_premise_violations(
+            ab_merge.FINETUNE_RUN_IDENTITY_FIELDS, fused, alloff, "fused", "alloff"
+        )
+        self.assertTrue(any("heldout_ids_sha256" in m for m in v), v)
+
+    def test_null_is_a_value_for_margin_and_temperature(self):
+        # Both arms MNRL (margin=None both sides) must match cleanly --
+        # a present null on BOTH sides is the stated premise, never MISSING.
+        fused = ab_merge.finetune_run_leg_identity(_finetune_run_tier(arm="fused"))
+        alloff = ab_merge.finetune_run_leg_identity(_finetune_run_tier(arm="alloff"))
+        self.assertIsNot(fused["margin"], ab_merge._MISSING)
+        self.assertIsNone(fused["margin"])
+        self.assertEqual(
+            ab_merge.generic_leg_premise_violations(
+                ab_merge.FINETUNE_RUN_IDENTITY_FIELDS, fused, alloff, "fused", "alloff"
+            ),
+            [],
+        )
+
+
+class FinetuneRunDeterminismFloorTests(unittest.TestCase):
+    """`build_finetune_run_report`'s r1/r2 determinism-floor reporting
+    (CONTRACT H4/PLAN.md v2 delta 6): the delta is ALWAYS measured and
+    reported; it is RED (a `determinism_floor.findings` entry, and the
+    overall `status` collapses to `INVALID`) only when it exceeds the
+    cross-seed spread of `d_i`.
+    """
+
+    def _write_seed(self, raw_dir, seed, fused_mean, alloff_mean, fused_r2_mean=None, alloff_r2_mean=None):
+        fused_r2_mean = fused_mean if fused_r2_mean is None else fused_r2_mean
+        alloff_r2_mean = alloff_mean if alloff_r2_mean is None else alloff_r2_mean
+        _write_finetune_run_leg(
+            raw_dir, seed, "fused", "r1", _finetune_run_tier(arm="fused", seed=seed, held_out_example_mean=fused_mean)
+        )
+        _write_finetune_run_leg(
+            raw_dir,
+            seed,
+            "fused",
+            "r2",
+            _finetune_run_tier(arm="fused", seed=seed, held_out_example_mean=fused_r2_mean),
+        )
+        _write_finetune_run_leg(
+            raw_dir,
+            seed,
+            "alloff",
+            "r1",
+            _finetune_run_tier(arm="alloff", seed=seed, held_out_example_mean=alloff_mean),
+        )
+        _write_finetune_run_leg(
+            raw_dir,
+            seed,
+            "alloff",
+            "r2",
+            _finetune_run_tier(arm="alloff", seed=seed, held_out_example_mean=alloff_r2_mean),
+        )
+
+    def test_identical_r1_r2_never_reds(self):
+        # unit-63 audit finding 1: the decision rule now requires exactly
+        # the pre-registered 12 premise-clean seeds (else INVALID) --
+        # 6-vs-6 keeps both n_pos/n_neg well under the 11-of-12 threshold,
+        # so GREEN is still the right read regardless of mean sign.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in range(1, 7):
+                self._write_seed(raw_dir, seed, 0.30, 0.50)  # fused better: d = -0.20
+            for seed in range(7, 13):
+                self._write_seed(raw_dir, seed, 0.55, 0.45)  # alloff better: d = +0.10
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, list(range(1, 13)), allow_missing_lr0_control=True)
+        self.assertEqual(merged["determinism_floor"]["findings"], [])
+        self.assertEqual(merged["determinism_floor"]["max_delta"], 0.0)
+        self.assertEqual(merged["decision"]["clean_seed_count"], 12)
+        self.assertEqual(merged["decision"]["concordant_direction"], "none")
+        self.assertEqual(merged["status"], "GREEN")
+
+    def test_delta_exceeding_cross_seed_spread_reds(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            # Three seeds whose d_i are tightly clustered (small cross-seed
+            # spread), then one seed's OWN r1/r2 repeat disagrees by far
+            # more than that spread -- the exact shape the floor exists to
+            # catch (a nondeterminism the seed spread would otherwise mask).
+            self._write_seed(raw_dir, 1, 0.400, 0.500)
+            self._write_seed(raw_dir, 2, 0.401, 0.501)
+            self._write_seed(raw_dir, 3, 0.399, 0.499, fused_r2_mean=0.700)
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, [1, 2, 3], allow_missing_lr0_control=True)
+        self.assertGreater(len(merged["determinism_floor"]["findings"]), 0)
+        self.assertTrue(any("seed 3" in f and "fused" in f for f in merged["determinism_floor"]["findings"]))
+        self.assertEqual(merged["status"], "INVALID")
+
+    def test_fewer_than_two_d_values_falls_back_to_zero_spread(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_seed(raw_dir, 1, 0.40, 0.50, fused_r2_mean=0.41)
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, [1], allow_missing_lr0_control=True)
+        self.assertEqual(merged["cross_seed_spread"], 0.0)
+        self.assertGreater(len(merged["determinism_floor"]["findings"]), 0)
+
+
+class BuildFinetuneRunReportEndToEndTests(unittest.TestCase):
+    """`build_finetune_run_report` / `ab_merge.main(["finetune-run", ...])`
+    — the REAL entry point `finetune_run_ab.sh` invokes, driven against
+    fixture leg directories (never a hand-rolled call to `sign_test` alone
+    standing in for the merge).
+    """
+
+    def _write_clean_seed(self, raw_dir, seed, fused_mean, alloff_mean):
+        for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+            for repeat in ("r1", "r2"):
+                _write_finetune_run_leg(
+                    raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                )
+
+    def test_end_to_end_green_matches_direct_sign_test(self):
+        # unit-63 audit finding 1: the decision rule is pre-registered FOR
+        # exactly 12 premise-clean seeds (else INVALID) -- 7-vs-5 (fused
+        # wins 7, alloff wins 5) keeps both n_pos/n_neg under the 11-of-12
+        # threshold, so this stays GREEN regardless of the mean's sign
+        # (the SAME shape `sign_test` itself is exercised over, just with
+        # a real premise-clean seed count this time).
+        seeds = list(range(1, 13))
+        means = {
+            1: (0.30, 0.50),
+            2: (0.32, 0.48),
+            3: (0.29, 0.55),
+            4: (0.31, 0.47),
+            5: (0.28, 0.52),
+            6: (0.33, 0.49),
+            7: (0.27, 0.53),
+            8: (0.55, 0.40),
+            9: (0.52, 0.38),
+            10: (0.58, 0.42),
+            11: (0.50, 0.35),
+            12: (0.54, 0.39),
+        }
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in seeds:
+                self._write_clean_seed(raw_dir, seed, *means[seed])
+            merged, table = ab_merge.build_finetune_run_report(raw_dir, seeds, allow_missing_lr0_control=True)
+
+        self.assertEqual(merged["status"], "GREEN")
+        self.assertEqual(merged["decision"]["clean_seed_count"], 12)
+        self.assertEqual(merged["decision"]["n_pos"], 5)
+        self.assertEqual(merged["decision"]["n_neg"], 7)
+        self.assertEqual(merged["decision"]["concordant_direction"], "none")
+        expected_d = [means[s][0] - means[s][1] for s in seeds]
+        expected = ab_merge.sign_test(expected_d)
+        self.assertEqual(merged["sign_test"]["n"], expected["n"])
+        self.assertEqual(merged["sign_test"]["n_pos"], expected["n_pos"])
+        self.assertEqual(merged["sign_test"]["n_neg"], expected["n_neg"])
+        self.assertEqual(merged["sign_test"]["p_value"].__class__, float)
+        self.assertEqual(merged["sign_test"]["p_value"], expected["p_value"])
+        self.assertIn("sign_test:", table)
+        self.assertEqual(len(merged["per_seed"]), len(seeds))
+        for seed in seeds:
+            self.assertIn("fused", merged["per_seed"][str(seed)]["trajectory"])
+            self.assertIn("alloff", merged["per_seed"][str(seed)]["trajectory"])
+
+    def test_a_single_seed_premise_violation_invalidates_the_whole_merge(self):
+        seeds = [1, 2, 3]
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_clean_seed(raw_dir, 1, 0.30, 0.50)
+            self._write_clean_seed(raw_dir, 2, 0.31, 0.49)
+            # seed 3's fused leg saturates its tie fraction -- a single
+            # tripped premise leg on ONE seed collapses the whole merge's
+            # status, mirroring build_report's own INVALID carve-out.
+            for repeat in ("r1", "r2"):
+                _write_finetune_run_leg(
+                    raw_dir, 3, "fused", repeat, _finetune_run_tier(arm="fused", seed=3, tie_fraction=1.0)
+                )
+                _write_finetune_run_leg(
+                    raw_dir, 3, "alloff", repeat, _finetune_run_tier(arm="alloff", seed=3)
+                )
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, seeds, allow_missing_lr0_control=True)
+
+        self.assertEqual(merged["status"], "INVALID")
+        self.assertTrue(merged["per_seed"]["3"]["leg_premise_violations"])
+        # seeds 1/2 stay premise-clean and still contribute their own d_i to
+        # the record, even though the OVERALL merge is INVALID.
+        self.assertIsNotNone(merged["per_seed"]["1"]["d_i"])
+        self.assertIsNotNone(merged["per_seed"]["2"]["d_i"])
+        self.assertNotIn("3", merged["d_values"])
+
+    def test_main_finetune_run_dispatch_writes_report_and_exits_0_on_green(self):
+        # unit-63 audit finding 1: needs exactly the pre-registered 12
+        # premise-clean seeds (else INVALID) -- 6-vs-6 stays under the
+        # 11-of-12 threshold, so GREEN/exit-0 is still the right read.
+        seeds = list(range(1, 13))
+        means = [(0.30, 0.50), (0.32, 0.48), (0.29, 0.55), (0.31, 0.47), (0.28, 0.52), (0.33, 0.49)]
+        means += [(0.55, 0.40), (0.52, 0.38), (0.58, 0.42), (0.50, 0.35), (0.54, 0.39), (0.56, 0.41)]
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed, (fm, am) in zip(seeds, means):
+                self._write_clean_seed(raw_dir, seed, fm, am)
+            rc = ab_merge.main(
+                ["finetune-run", raw_dir, out_dir, ",".join(str(s) for s in seeds), "", "--allow-missing-lr0-control"]
+            )
+            self.assertEqual(rc, 0)
+            report_path = os.path.join(out_dir, "finetune_run_ab_report.json")
+            self.assertTrue(os.path.exists(report_path))
+            with open(report_path) as fh:
+                merged = json.load(fh)
+            self.assertEqual(merged["status"], "GREEN")
+
+    def test_main_finetune_run_dispatch_exits_1_on_invalid(self):
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for repeat in ("r1", "r2"):
+                _write_finetune_run_leg(
+                    raw_dir, 1, "fused", repeat, _finetune_run_tier(arm="fused", seed=1, admission_is_dense=True)
+                )
+                _write_finetune_run_leg(raw_dir, 1, "alloff", repeat, _finetune_run_tier(arm="alloff", seed=1))
+            rc = ab_merge.main(["finetune-run", raw_dir, out_dir, "1"])
+            self.assertEqual(rc, 1)
+
+    def test_empty_raw_dir_is_a_hard_failure(self):
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            rc = ab_merge.main(["finetune-run", raw_dir, out_dir, "1,2,3"])
+        self.assertEqual(rc, 1)
+
+
+class BuildFinetuneRunReportDispatchProofEndToEndTests(unittest.TestCase):
+    """`finetune_run_dispatch_proof_violations` wired into
+    `build_finetune_run_report` (unit-63 audit finding 2's merger half) —
+    driven through the REAL merge entry point, never the bare function
+    alone.
+    """
+
+    def test_fused_leg_failing_dispatch_proof_invalidates_its_seed(self):
+        seeds = [1, 2, 3]
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in seeds:
+                fused_overrides = {"ln_fused_dispatches": 0} if seed == 2 else {}
+                for repeat in ("r1", "r2"):
+                    _write_finetune_run_leg(
+                        raw_dir, seed, "fused", repeat, _finetune_run_tier(arm="fused", seed=seed, **fused_overrides)
+                    )
+                    _write_finetune_run_leg(raw_dir, seed, "alloff", repeat, _finetune_run_tier(arm="alloff", seed=seed))
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, seeds, allow_missing_lr0_control=True)
+        self.assertEqual(merged["status"], "INVALID")
+        self.assertTrue(
+            any("fused-dispatch proof" in v for v in merged["per_seed"]["2"]["leg_premise_violations"]),
+            merged["per_seed"]["2"]["leg_premise_violations"],
+        )
+        # seeds 1/3 stay dispatch-proof clean.
+        self.assertEqual(merged["per_seed"]["1"]["leg_premise_violations"], [])
+        self.assertEqual(merged["per_seed"]["3"]["leg_premise_violations"], [])
+
+    def test_fused_leg_with_flash_compiled_false_invalidates_its_seed(self):
+        # Unit-63 round-3 audit, coordinator correction, end-to-end: a
+        # `fused` leg built without flash-attn compiled in is an INVALID
+        # premise the moment it reaches the real merge entry point, never
+        # merely a `fused_proof` warning buried in a table column.
+        seeds = [1, 2]
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in seeds:
+                fused_overrides = {"flash_compiled": False} if seed == 1 else {}
+                for repeat in ("r1", "r2"):
+                    _write_finetune_run_leg(
+                        raw_dir, seed, "fused", repeat, _finetune_run_tier(arm="fused", seed=seed, **fused_overrides)
+                    )
+                    _write_finetune_run_leg(raw_dir, seed, "alloff", repeat, _finetune_run_tier(arm="alloff", seed=seed))
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, seeds, allow_missing_lr0_control=True)
+        self.assertEqual(merged["status"], "INVALID")
+        self.assertTrue(
+            any("flash_compiled=False" in v for v in merged["per_seed"]["1"]["leg_premise_violations"]),
+            merged["per_seed"]["1"]["leg_premise_violations"],
+        )
+        self.assertEqual(merged["per_seed"]["2"]["leg_premise_violations"], [])
+
+    def test_alloff_leg_with_attention_block_fused_zero_invalidates_its_seed(self):
+        # unit-63 round-3 audit block 4, coordinator correction:
+        # `attention_block` reading `fused == 0` on an alloff leg (the
+        # disabled flash cascade failing to fall through to a live fused
+        # kernel) is caught by the positive training-path proof -- never
+        # the pre-fix blanket "every pair must be fused == 0" rule, which
+        # would have also flagged this golden's OWN real ln/rope/softmax/
+        # geglu/lora_linear fused counts as violations too.
+        seeds = [1, 2]
+        with tempfile.TemporaryDirectory() as raw_dir:
+            alloff_overrides = {"attention_block_fused_dispatches": 0, "attention_block_eager_dispatches": 4}
+            for seed in seeds:
+                overrides = alloff_overrides if seed == 1 else {}
+                for repeat in ("r1", "r2"):
+                    _write_finetune_run_leg(raw_dir, seed, "fused", repeat, _finetune_run_tier(arm="fused", seed=seed))
+                    _write_finetune_run_leg(
+                        raw_dir, seed, "alloff", repeat, _finetune_run_tier(arm="alloff", seed=seed, **overrides)
+                    )
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, seeds, allow_missing_lr0_control=True)
+        self.assertEqual(merged["status"], "INVALID")
+        self.assertTrue(
+            any(
+                "attention_block_fused_dispatches=0" in v
+                for v in merged["per_seed"]["1"]["leg_premise_violations"]
+            ),
+            merged["per_seed"]["1"]["leg_premise_violations"],
+        )
+        self.assertEqual(merged["per_seed"]["2"]["leg_premise_violations"], [])
+
+
+class BuildFinetuneRunReportCrossSeedHomogeneityEndToEndTests(unittest.TestCase):
+    """`finetune_run_cross_seed_homogeneity_violations` wired into
+    `build_finetune_run_report` (unit-63 audit finding 3) — driven through
+    the REAL merge entry point.
+    """
+
+    _MEANS = {
+        1: (0.30, 0.50),
+        2: (0.32, 0.48),
+        3: (0.29, 0.55),
+        4: (0.31, 0.47),
+        5: (0.28, 0.52),
+        6: (0.33, 0.49),
+        7: (0.27, 0.53),
+        8: (0.55, 0.40),
+        9: (0.52, 0.38),
+        10: (0.58, 0.42),
+        11: (0.50, 0.35),
+        12: (0.54, 0.39),
+    }
+
+    def test_two_fixture_split_end_to_end_is_invalid(self):
+        # Empirical reproduction this finding fixes: 6 seeds against
+        # `heldout_pairs_sha256="fixture-a"`, 6 against `"fixture-b"` --
+        # each seed's own fused/alloff pair internally agrees, and the
+        # 7-vs-5 sign-test shape used to read GREEN (see
+        # `test_end_to_end_green_matches_direct_sign_test`, the SAME means).
+        # This must now be INVALID, naming the diverging field.
+        seeds = list(range(1, 13))
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in seeds:
+                fixture = "fixture-a" if seed <= 6 else "fixture-b"
+                fused_mean, alloff_mean = self._MEANS[seed]
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir,
+                            seed,
+                            arm,
+                            repeat,
+                            _finetune_run_tier(
+                                arm=arm, seed=seed, held_out_example_mean=mean, heldout_pairs_sha256=fixture
+                            ),
+                        )
+            merged, table = ab_merge.build_finetune_run_report(raw_dir, seeds, allow_missing_lr0_control=True)
+        self.assertEqual(merged["status"], "INVALID")
+        self.assertTrue(
+            any("heldout_pairs_sha256" in v for v in merged["cross_seed_identity_violations"]),
+            merged["cross_seed_identity_violations"],
+        )
+        self.assertIn("cross_seed_identity_violations", table)
+
+    def test_homogeneous_twelve_end_to_end_is_unaffected(self):
+        # Same fixture as `test_end_to_end_green_matches_direct_sign_test` --
+        # a genuinely homogeneous 12-seed sweep must stay exactly as before
+        # this fix.
+        seeds = list(range(1, 13))
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in seeds:
+                fused_mean, alloff_mean = self._MEANS[seed]
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, seeds, allow_missing_lr0_control=True)
+        self.assertEqual(merged["status"], "GREEN")
+        self.assertEqual(merged["cross_seed_identity_violations"], [])
+
+    def test_single_divergent_seed_end_to_end_is_invalid_naming_the_field(self):
+        seeds = list(range(1, 13))
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in seeds:
+                fused_mean, alloff_mean = self._MEANS[seed]
+                overrides = {"checkpoint_weights_sha256": "different-checkpoint"} if seed == 5 else {}
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir,
+                            seed,
+                            arm,
+                            repeat,
+                            _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean, **overrides),
+                        )
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, seeds, allow_missing_lr0_control=True)
+        self.assertEqual(merged["status"], "INVALID")
+        self.assertEqual(len(merged["cross_seed_identity_violations"]), 1)
+        self.assertIn("checkpoint_weights_sha256", merged["cross_seed_identity_violations"][0])
+        self.assertIn("seed 5", merged["cross_seed_identity_violations"][0])
+
+    def _write_lr0_control_seed(self, raw_dir, seed):
+        # `--lr 0` BY CONSTRUCTION (block 3's own premise) -- every OTHER
+        # identity field left at `_finetune_run_tier`'s own default, so it
+        # matches the main A/B seeds on everything except `lr`/`seed`.
+        for arm in ("fused", "alloff"):
+            _write_finetune_run_leg(
+                raw_dir,
+                seed,
+                arm,
+                ab_merge.FINETUNE_RUN_LR0_REPEAT,
+                _finetune_run_tier(arm=arm, seed=seed, lr=0.0, train_probe_series=[0.0, 0.0]),
+            )
+
+    def test_lr0_seeds_1_and_2_end_to_end_is_not_invalid(self):
+        # unit-63 round-3 audit block 3's own end-to-end pin: 12 premise-
+        # clean, cross-seed-homogeneous main seeds PLUS a real lr0 control
+        # (seeds 1, 2) -- before block 3's fix, the lr0 legs' own `lr=0`
+        # (vs. the main seeds' real, nonzero `lr`) would have unconditionally
+        # collapsed `cross_seed_identity_violations`, making ANY nonempty
+        # `lr0_seeds` list INVALID no matter how clean everything else was.
+        seeds = list(range(1, 13))
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in seeds:
+                fused_mean, alloff_mean = self._MEANS[seed]
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+            self._write_lr0_control_seed(raw_dir, 1)
+            self._write_lr0_control_seed(raw_dir, 2)
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, seeds, lr0_seeds=[1, 2])
+        self.assertNotEqual(merged["status"], "INVALID", merged)
+        self.assertEqual(merged["cross_seed_identity_violations"], [])
+        self.assertEqual(merged["lr0_control"]["violations"], [])
+
+    def test_lr0_seed_diverging_on_a_non_lr_field_end_to_end_is_invalid(self):
+        # The mutant: an lr0-control leg diverging on a field OTHER than
+        # `lr` (its own defining premise) must still collapse the merge --
+        # the block 3 exception is narrow, never a blanket exemption for
+        # lr0-control legs.
+        seeds = list(range(1, 13))
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in seeds:
+                fused_mean, alloff_mean = self._MEANS[seed]
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+            self._write_lr0_control_seed(raw_dir, 1)
+            # seed 2's lr0-control legs diverge on `schedule` -- NOT `lr`.
+            for arm in ("fused", "alloff"):
+                _write_finetune_run_leg(
+                    raw_dir,
+                    2,
+                    arm,
+                    ab_merge.FINETUNE_RUN_LR0_REPEAT,
+                    _finetune_run_tier(arm=arm, seed=2, lr=0.0, train_probe_series=[0.0, 0.0], schedule="cosine"),
+                )
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, seeds, lr0_seeds=[1, 2])
+        self.assertEqual(merged["status"], "INVALID")
+        self.assertTrue(
+            any("schedule" in v for v in merged["cross_seed_identity_violations"]),
+            merged["cross_seed_identity_violations"],
+        )
+
+
+class FinetuneRunDecisionRuleMutantTests(unittest.TestCase):
+    """The pre-registered decision rule itself (unit-63 audit finding 1):
+    `build_finetune_run_report` used to compute the sign test and then
+    hardcode `status = "GREEN"` regardless of what it found -- EVERY mutant
+    below would have read GREEN under that pre-fix code (any premise-clean,
+    non-tied, non-empty `d_values` produced a `sign_result`, and a
+    `sign_result` alone was sufficient for GREEN); the fixed rule reads each
+    one correctly instead. One mutant per arm of `FINETUNE_RUN_DECISION_RULE_TEXT`'s
+    own predicate -- `n_pos`/`n_neg` >= `FINETUNE_RUN_DECISION_THRESHOLD` (11
+    of `FINETUNE_RUN_GATE_SEED_COUNT`, 12) AND the mean's sign agreeing with
+    that concordant direction, plus the `clean_seed_count != 12` -> INVALID
+    carve-out -- proves none of the rule's own conjuncts is vacuous.
+    """
+
+    def _write_r1(self, raw_dir, seed, fused_mean, alloff_mean):
+        # r1-only (no r2): the decision rule only ever reads r1 -- see
+        # `build_finetune_run_report`'s own doc -- and omitting r2 keeps
+        # every mutant here from ever touching the (separately tested)
+        # determinism floor.
+        for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+            _write_finetune_run_leg(
+                raw_dir, seed, arm, "r1", _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+            )
+
+    def test_11_of_12_degradation_is_red(self):
+        # 11 seeds with fused WORSE than alloff (d_i > 0, degradation-
+        # concordant), 1 dissenting seed -- exactly the golden (12, 11)
+        # sign-test shape, mean necessarily > 0 since the dissent is the
+        # SAME magnitude as the majority. Under the pre-fix code this read
+        # GREEN (a sign_result existed); the fixed rule reads RED.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in range(1, 12):
+                self._write_r1(raw_dir, seed, 0.60, 0.50)  # fused worse: d = +0.10
+            self._write_r1(raw_dir, 12, 0.50, 0.60)  # dissent: d = -0.10
+            merged, table = ab_merge.build_finetune_run_report(raw_dir, list(range(1, 13)), allow_missing_lr0_control=True)
+        self.assertEqual(merged["decision"]["n_pos"], 11)
+        self.assertEqual(merged["decision"]["n_neg"], 1)
+        self.assertGreater(merged["decision"]["mean_d"], 0.0)
+        self.assertEqual(merged["decision"]["concordant_direction"], "degradation")
+        self.assertEqual(merged["status"], "RED")
+        self.assertIn("status: RED", table)
+
+    def test_11_of_12_improvement_is_red_for_investigation(self):
+        # Mirror image: fused BEATS alloff on 11 of 12 (d_i < 0,
+        # improvement-concordant) -- anomalous improvement is investigated,
+        # never silently celebrated as GREEN.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in range(1, 12):
+                self._write_r1(raw_dir, seed, 0.50, 0.60)  # fused better: d = -0.10
+            self._write_r1(raw_dir, 12, 0.60, 0.50)  # dissent: d = +0.10
+            merged, table = ab_merge.build_finetune_run_report(raw_dir, list(range(1, 13)), allow_missing_lr0_control=True)
+        self.assertEqual(merged["decision"]["n_pos"], 1)
+        self.assertEqual(merged["decision"]["n_neg"], 11)
+        self.assertLess(merged["decision"]["mean_d"], 0.0)
+        self.assertEqual(merged["decision"]["concordant_direction"], "improvement")
+        self.assertEqual(merged["status"], "RED_FOR_INVESTIGATION")
+        self.assertIn("status: RED_FOR_INVESTIGATION", table)
+
+    def test_10_of_12_is_green(self):
+        # Below the 11-of-12 threshold on EITHER side -- the rule is
+        # pre-registered for >=11, never a bare majority.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in range(1, 11):
+                self._write_r1(raw_dir, seed, 0.60, 0.50)  # fused worse: d = +0.10
+            for seed in (11, 12):
+                self._write_r1(raw_dir, seed, 0.50, 0.60)  # dissent: d = -0.10
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, list(range(1, 13)), allow_missing_lr0_control=True)
+        self.assertEqual(merged["decision"]["n_pos"], 10)
+        self.assertEqual(merged["decision"]["n_neg"], 2)
+        self.assertEqual(merged["decision"]["concordant_direction"], "none")
+        self.assertEqual(merged["status"], "GREEN")
+
+    def test_mean_sign_disagreement_at_11_is_green(self):
+        # The AND bites: n_pos=11 (degradation-concordant by COUNT) but one
+        # huge dissenting seed pulls mean(d_i) negative -- the count
+        # threshold alone is NOT sufficient; the mean's sign must also
+        # agree, or the rule falls through to GREEN rather than RED.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in range(1, 12):
+                self._write_r1(raw_dir, seed, 0.51, 0.50)  # small positive: d = +0.01 each
+            self._write_r1(raw_dir, 12, 0.10, 1.10)  # huge dissent: d = -1.00
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, list(range(1, 13)), allow_missing_lr0_control=True)
+        self.assertEqual(merged["decision"]["n_pos"], 11)
+        self.assertEqual(merged["decision"]["n_neg"], 1)
+        # 11 * 0.01 - 1.00 = -0.89 < 0 -- disagrees with the "degradation"
+        # direction n_pos=11 alone would otherwise indicate.
+        self.assertLess(merged["decision"]["mean_d"], 0.0)
+        self.assertEqual(merged["decision"]["concordant_direction"], "none")
+        self.assertEqual(merged["status"], "GREEN")
+
+    def test_11_seeds_is_invalid_never_rescaled(self):
+        # Only 11 seeds were ever passed to the merger (a real short sweep,
+        # e.g. one seed simply never dispatched) -- ALL 11 are premise-clean
+        # and unanimous in sign, exactly the shape that would have read
+        # GREEN (indeed, the pre-fix code's own hardcoded GREEN) at n=11.
+        # The rule is pre-registered FOR 12; a different count is INVALID,
+        # never silently rescaled to fit whatever n happened to show up.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in range(1, 12):
+                self._write_r1(raw_dir, seed, 0.60, 0.50)  # unanimous: d = +0.10
+            merged, table = ab_merge.build_finetune_run_report(raw_dir, list(range(1, 12)), allow_missing_lr0_control=True)
+        self.assertEqual(merged["decision"]["clean_seed_count"], 11)
+        self.assertEqual(merged["wrong_seed_count"], True)
+        self.assertEqual(merged["status"], "INVALID")
+        self.assertIn("status: INVALID", table)
+
+
+class FinetuneRunLr0ControlTests(unittest.TestCase):
+    """The lr=0 RED control (unit-63 audit advisory (b)):
+    `finetune_run_lr0_control_seed_violations` / its wiring into
+    `build_finetune_run_report`'s own `lr0_control` section -- a clean
+    control leg FAILS learning-happened and is never counted into the A/B
+    set; a control leg that PASSES (or never ran) is a violation that
+    collapses `status` to `INVALID`.
+    """
+
+    def _write_ab_seeds(self, raw_dir, n=12):
+        # A clean, GREEN-shaped 12-seed A/B set (6-vs-6, under the decision
+        # threshold) so any INVALID seen in these tests is attributable to
+        # the lr0 control alone, never the A/B set itself.
+        for seed in range(1, n // 2 + 1):
+            for arm, mean in (("fused", 0.30), ("alloff", 0.50)):
+                _write_finetune_run_leg(
+                    raw_dir, seed, arm, "r1", _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                )
+        for seed in range(n // 2 + 1, n + 1):
+            for arm, mean in (("fused", 0.55), ("alloff", 0.40)):
+                _write_finetune_run_leg(
+                    raw_dir, seed, arm, "r1", _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                )
+
+    def _write_lr0_leg(self, raw_dir, seed, arm, learning_happened_delta, **overrides):
+        # unit-63 round-3 audit block 3: real lr0-control legs run at
+        # `--lr 0` BY CONSTRUCTION (`finetune_run_ab.sh`'s own lr=0 loop
+        # passes `"0"` explicitly) -- setting it here (rather than leaving
+        # it at `_finetune_run_tier`'s own main-A/B default) is what
+        # actually exercises `finetune_run_cross_seed_homogeneity_violations`'s
+        # own `lr` exception (block 3's fix); every test in this class
+        # previously left `lr` at the SAME default the main A/B seeds use,
+        # which never genuinely exercised the divergence this control's own
+        # premise creates.
+        #
+        # amendment 2026-08-29b: `learning_happened_delta` (the caller's own
+        # desired DERIVED value, for readability at every call site below)
+        # is realized as a 2-entry `train_probe_series` -- `[delta, 0.0]` --
+        # so the merger's own `series[0] - series[-1]` derivation reproduces
+        # exactly the delta this test asks for, unless the caller already
+        # supplies its own `train_probe_series` override.
+        overrides.setdefault("lr", 0.0)
+        overrides.setdefault("train_probe_series", [learning_happened_delta, 0.0])
+        _write_finetune_run_leg(
+            raw_dir,
+            seed,
+            arm,
+            ab_merge.FINETUNE_RUN_LR0_REPEAT,
+            _finetune_run_tier(arm=arm, seed=seed, **overrides),
+        )
+
+    # unit-63 round-4 audit F-2: `finetune_run_lr0_control_seed_violations`'s
+    # own new positive fact -- an OK lr0-control leg's reported `lr` must
+    # equal `0.0` EXACTLY. Exercised directly (never only end-to-end) so a
+    # divergence from `learning_happened_delta`'s own, independent check is
+    # unambiguous.
+
+    def test_control_leg_at_lr_0_001_is_a_violation(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_lr0_leg(raw_dir, 101, "fused", 0.0, lr=0.001)
+            self._write_lr0_leg(raw_dir, 101, "alloff", 0.0)
+            violations, per_arm, _identities = ab_merge.finetune_run_lr0_control_seed_violations(raw_dir, 101)
+        self.assertTrue(
+            any("reported lr=0.001" in v and "not exactly 0.0" in v for v in violations), violations
+        )
+        self.assertEqual(per_arm["fused"]["lr"], 0.001)
+
+    def test_control_leg_at_lr_0_777_with_clean_delta_is_still_a_violation(self):
+        # The `lr` fact and the `learning_happened_delta` fact are
+        # INDEPENDENT -- a control leg can pass the (unrelated)
+        # learning-happened calibration check while still failing the
+        # 'did this leg actually run at lr=0' fact this round adds.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_lr0_leg(raw_dir, 101, "fused", 0.0, lr=0.777)
+            self._write_lr0_leg(raw_dir, 101, "alloff", 0.0)
+            violations, per_arm, _identities = ab_merge.finetune_run_lr0_control_seed_violations(raw_dir, 101)
+        self.assertTrue(
+            any("reported lr=0.777" in v and "not exactly 0.0" in v for v in violations), violations
+        )
+        # The learning-happened check itself stays clean for this leg --
+        # proving the two checks are independent, not one masking the other.
+        self.assertFalse(any("unexpectedly CLEARS the floor" in v for v in violations), violations)
+        self.assertEqual(per_arm["fused"]["learning_happened_delta"], 0.0)
+
+    def test_control_leg_at_lr_0_0_is_clean_on_the_lr_fact(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_lr0_leg(raw_dir, 101, "fused", 0.0)
+            self._write_lr0_leg(raw_dir, 101, "alloff", 0.0)
+            violations, per_arm, _identities = ab_merge.finetune_run_lr0_control_seed_violations(raw_dir, 101)
+        self.assertEqual(violations, [])
+        self.assertEqual(per_arm["fused"]["lr"], 0.0)
+        self.assertEqual(per_arm["alloff"]["lr"], 0.0)
+
+    def test_control_leg_diverging_on_lr_end_to_end_invalidates(self):
+        # The end-to-end path (`build_finetune_run_report`, the REAL merge
+        # stage `finetune_run_ab.sh` drives) -- a control leg's own lr
+        # divergence must collapse `status` to INVALID exactly like every
+        # other lr0_control violation does, never silently absorbed.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_ab_seeds(raw_dir)
+            self._write_lr0_leg(raw_dir, 101, "fused", 0.0, lr=0.001)
+            self._write_lr0_leg(raw_dir, 101, "alloff", 0.0)
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, list(range(1, 13)), lr0_seeds=[101])
+        self.assertTrue(
+            any("not exactly 0.0" in v for v in merged["lr0_control"]["violations"]),
+            merged["lr0_control"]["violations"],
+        )
+        self.assertEqual(merged["status"], "INVALID")
+
+    def test_clean_lr0_control_fails_learning_happened_and_is_green(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_ab_seeds(raw_dir)
+            for seed in (101, 102):
+                for arm in ("fused", "alloff"):
+                    self._write_lr0_leg(raw_dir, seed, arm, 0.0)  # no learning under lr=0 -- clean
+            merged, table = ab_merge.build_finetune_run_report(
+                raw_dir, list(range(1, 13)), lr0_seeds=[101, 102]
+            )
+        self.assertEqual(merged["lr0_control"]["violations"], [])
+        self.assertEqual(merged["status"], "GREEN")
+        self.assertIn("lr0_control: seeds=", table)
+        # NEVER counted into the A/B set.
+        self.assertNotIn("101", merged["d_values"])
+        self.assertNotIn("102", merged["d_values"])
+
+    def test_passing_lr0_control_leg_is_a_violation_and_invalidates(self):
+        # A "passing" control (learning_happened_delta clears the floor
+        # despite lr=0) is a finding against the FLOOR=0.0 premise-leg
+        # ruling itself -- never silently passed through.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_ab_seeds(raw_dir)
+            self._write_lr0_leg(raw_dir, 101, "fused", 0.0)
+            self._write_lr0_leg(raw_dir, 101, "alloff", 0.05)  # unexpectedly clears the floor
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, list(range(1, 13)), lr0_seeds=[101])
+        self.assertTrue(
+            any("unexpectedly CLEARS the floor" in v for v in merged["lr0_control"]["violations"]),
+            merged["lr0_control"]["violations"],
+        )
+        self.assertEqual(merged["status"], "INVALID")
+
+    def test_missing_lr0_control_leg_is_a_violation_and_invalidates(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_ab_seeds(raw_dir)
+            self._write_lr0_leg(raw_dir, 101, "fused", 0.0)
+            # alloff's own lr0 leg for seed 101 never written -- MISSING.
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, list(range(1, 13)), lr0_seeds=[101])
+        self.assertTrue(
+            any("not OK" in v for v in merged["lr0_control"]["violations"]), merged["lr0_control"]["violations"]
+        )
+        self.assertEqual(merged["status"], "INVALID")
+
+    def test_no_lr0_seeds_with_allow_flag_is_a_deliberate_no_op(self):
+        # unit-63 round-3 audit block 5: an empty lr0_seeds list is a
+        # DELIBERATE, visible opt-out only when `allow_missing_lr0_control`
+        # is explicitly passed -- see the sibling refusal test below for the
+        # DEFAULT (no flag) behavior.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_ab_seeds(raw_dir)
+            merged, table = ab_merge.build_finetune_run_report(raw_dir, list(range(1, 13)), allow_missing_lr0_control=True)
+        self.assertEqual(merged["lr0_control"]["seeds"], [])
+        self.assertEqual(merged["lr0_control"]["violations"], [])
+        self.assertIs(merged["lr0_control"]["allow_missing_lr0_control"], True)
+        self.assertEqual(merged["status"], "GREEN")
+        self.assertNotIn("lr0_control: seeds=", table)
+
+    def test_no_lr0_seeds_without_allow_flag_is_invalid(self):
+        # unit-63 round-3 audit block 5: CONTRACT Frame's own RED control is
+        # pre-registered, not optional -- the DEFAULT (no
+        # `allow_missing_lr0_control`) refuses rather than silently skipping
+        # it, the class fix for `gpu-howwell.yml`'s own `|| ''` collapse
+        # (see that workflow's own "Resolve" step).
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_ab_seeds(raw_dir)
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, list(range(1, 13)))
+        self.assertIs(merged["lr0_control"]["allow_missing_lr0_control"], False)
+        self.assertTrue(
+            any("allow_missing_lr0_control was not set" in v for v in merged["lr0_control"]["violations"]),
+            merged["lr0_control"]["violations"],
+        )
+        self.assertEqual(merged["status"], "INVALID")
+
+    def test_main_finetune_run_dispatch_honours_allow_missing_lr0_control_flag(self):
+        # The REAL entry point `finetune_run_ab.sh` calls -- proves the CLI
+        # flag itself (never just the Python-level kwarg) round-trips into
+        # `build_finetune_run_report` and the merged artifact.
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            self._write_ab_seeds(raw_dir)
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            rc = ab_merge.main(["finetune-run", raw_dir, out_dir, seeds_s, "", "--allow-missing-lr0-control"])
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 0)
+        self.assertEqual(merged["status"], "GREEN")
+        self.assertIs(merged["lr0_control"]["allow_missing_lr0_control"], True)
+
+    def test_main_finetune_run_dispatch_without_flag_refuses(self):
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            self._write_ab_seeds(raw_dir)
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            rc = ab_merge.main(["finetune-run", raw_dir, out_dir, seeds_s])
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 1)
+        self.assertEqual(merged["status"], "INVALID")
+        self.assertIs(merged["lr0_control"]["allow_missing_lr0_control"], False)
+
+
+class PremiseFailureDiagnosticTests(unittest.TestCase):
+    """`premise_failure_diagnostic` (amendment 2026-08-29b item 1(c)):
+    ALWAYS present in the merged artifact, non-parameterised, and never
+    itself decisional -- it can only ever RECORD which premise leg(s) failed
+    on which leg, with that leg's raw `train_probe_series`, never promote an
+    INVALID verdict to GREEN.
+    """
+
+    def _write_clean_seed(self, raw_dir, seed, fused_mean=0.30, alloff_mean=0.50):
+        for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+            for repeat in ("r1", "r2"):
+                _write_finetune_run_leg(
+                    raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                )
+
+    def test_diagnostic_key_always_present_and_empty_on_a_clean_run(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_clean_seed(raw_dir, 1)
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, [1], allow_missing_lr0_control=True)
+        self.assertIn("premise_failure_diagnostic", merged)
+        self.assertEqual(merged["premise_failure_diagnostic"]["failed_seeds"], [])
+        self.assertEqual(merged["premise_failure_diagnostic"]["failing_legs"], [])
+
+    def test_campaign_v1_shaped_floor_fail_is_recorded_with_its_raw_series(self):
+        # Mirrors the committed campaign-v1 evidence's own root cause
+        # (docs/plans/63-how-well/measurements/campaign-v1/README.md): one
+        # seed's alloff leg fails the learning-happened premise while every
+        # other seed stays clean -- the diagnostic must name exactly that
+        # leg, exactly that premise, and carry its raw series.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_clean_seed(raw_dir, 1)
+            self._write_clean_seed(raw_dir, 2)
+            # seed 3's alloff leg: the series goes UP (spiked, never
+            # recovered net) -- a real floor-fail shape, not a contrived one.
+            for repeat in ("r1", "r2"):
+                _write_finetune_run_leg(
+                    raw_dir,
+                    3,
+                    "alloff",
+                    repeat,
+                    _finetune_run_tier(arm="alloff", seed=3, train_probe_series=[3.2276, 3.4211, 3.2447]),
+                )
+                _write_finetune_run_leg(raw_dir, 3, "fused", repeat, _finetune_run_tier(arm="fused", seed=3))
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, [1, 2, 3], allow_missing_lr0_control=True)
+
+        self.assertEqual(merged["status"], "INVALID")
+        diag = merged["premise_failure_diagnostic"]
+        self.assertEqual(diag["failed_seeds"], [3])
+        self.assertEqual(len(diag["failing_legs"]), 1)
+        entry = diag["failing_legs"][0]
+        self.assertEqual(entry["label"], "seed 3 alloff r1")
+        self.assertEqual(entry["pool"], "main")
+        self.assertEqual(entry["failing_premises"], ["learning_happened"])
+        self.assertEqual(entry["train_probe_series"], [3.2276, 3.4211, 3.2447])
+        # never decisional -- the diagnostic's own presence changes nothing
+        # about the (independently computed) status above.
+        self.assertIn("NEVER promote", diag["note"])
+        self.assertIn("NO operator override", diag["note"])
+
+    def test_v1_scalar_only_seed_is_invalid_and_recorded_in_diagnostic(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_clean_seed(raw_dir, 1)
+            for repeat in ("r1", "r2"):
+                _write_finetune_run_leg(
+                    raw_dir,
+                    2,
+                    "fused",
+                    repeat,
+                    _finetune_run_tier(arm="fused", seed=2, learning_happened_delta=0.05, train_probe_series=None),
+                )
+                _write_finetune_run_leg(raw_dir, 2, "alloff", repeat, _finetune_run_tier(arm="alloff", seed=2))
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, [1, 2], allow_missing_lr0_control=True)
+
+        self.assertEqual(merged["status"], "INVALID")
+        diag = merged["premise_failure_diagnostic"]
+        self.assertEqual(diag["failed_seeds"], [2])
+        entry = diag["failing_legs"][0]
+        self.assertEqual(entry["label"], "seed 2 fused r1")
+        self.assertEqual(entry["failing_premises"], ["learning_happened"])
+        self.assertIsNone(entry["train_probe_series"])
+        self.assertTrue(
+            any("producer-version mismatch" in v for v in merged["per_seed"]["2"]["leg_premise_violations"])
+        )
+
+    def test_lr0_control_learning_happened_failure_is_recorded_as_its_own_pool(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_clean_seed(raw_dir, 1)
+            for arm, series in (("fused", [0.0, 0.0]), ("alloff", [0.05, 0.0])):
+                _write_finetune_run_leg(
+                    raw_dir,
+                    101,
+                    arm,
+                    ab_merge.FINETUNE_RUN_LR0_REPEAT,
+                    _finetune_run_tier(arm=arm, seed=101, lr=0.0, train_probe_series=series),
+                )
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, [1], lr0_seeds=[101])
+
+        self.assertEqual(merged["status"], "INVALID")
+        diag = merged["premise_failure_diagnostic"]
+        self.assertIn(101, diag["failed_seeds"])
+        entry = next(e for e in diag["failing_legs"] if e["pool"] == "lr0-control")
+        self.assertEqual(entry["label"], "lr0 seed 101 alloff")
+        self.assertEqual(entry["failing_premises"], ["learning_happened"])
+        self.assertEqual(entry["train_probe_series"], [0.05, 0.0])
+
+
+def _mutant_tier(arm="fused", **overrides):
+    """A mutant leg's own tier -- a normal, premise-clean `fused` leg
+    (`_finetune_run_tier`) plus the three producer-stamped fields
+    mutants/README.md's own on-pod procedure records per leg (unit-63
+    round-7 audit finding 1: `mutant_id`/`mutant_base_sha`/
+    `mutant_patch_sha256`, the `FinetuneRunTier` field names the
+    `--mutant-id`/`--mutant-base-sha`/`--mutant-patch-sha256` CLI flags
+    stamp -- renamed from this suite's own earlier `base_sha`/`patch_sha256`
+    names to match the producer's real field names)."""
+    tier = _finetune_run_tier(arm=arm)
+    tier.update({
+        "mutant_id": "M2",
+        "mutant_base_sha": "4257cde6d51184475b3e798f5d7e9c3885a763ca",
+        "mutant_patch_sha256": "eps0-02-patch-sha",
+    })
+    tier.update(overrides)
+    return tier
+
+
+def _write_mutant_leg(raw_dir, seed, dose_label, tier):
+    _write_finetune_run_leg(raw_dir, seed, "fused", ab_merge.mutant_leg_repeat_tag(dose_label), tier)
+
+
+class MutantDoseLadderTests(unittest.TestCase):
+    """`build_mutant_dose_column`/`mutant_dose_ladder_sensitivity` (amendment
+    2026-08-29b item 3): each dose column merges the mutant-substituted
+    fused arm against the SAME campaign alloff legs under the SAME
+    `>=11/12`+mean-sign rule the primary decision uses; mutant legs never
+    enter the primary A/B set.
+    """
+
+    PATCH_SHA = "eps0-02-patch-sha"
+
+    def _write_alloff(self, raw_dir, seed, mean=0.50):
+        _write_finetune_run_leg(
+            raw_dir, seed, "alloff", "r1", _finetune_run_tier(arm="alloff", seed=seed, held_out_example_mean=mean)
+        )
+
+    def test_repeat_tag_never_collides_with_r1_r2_or_lr0(self):
+        for label in ("eps0.02", "", "r1", "r2", "lr0"):
+            tag = ab_merge.mutant_leg_repeat_tag(label)
+            self.assertNotIn(tag, ab_merge.FINETUNE_RUN_REPEATS)
+            self.assertNotEqual(tag, ab_merge.FINETUNE_RUN_LR0_REPEAT)
+
+    def test_detected_red_when_threshold_and_direction_match(self):
+        # 11 of 12 mutant legs read WORSE (higher held-out loss) than their
+        # SAME-SEED alloff leg -- the pre-registered degradation-concordant
+        # shape.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in range(1, 13):
+                self._write_alloff(raw_dir, seed, mean=0.50)
+                mutant_mean = 0.70 if seed != 12 else 0.30  # seed 12 dissents
+                _write_mutant_leg(raw_dir, seed, "eps0.50", _mutant_tier(seed=seed, held_out_example_mean=mutant_mean))
+            col = ab_merge.build_mutant_dose_column(raw_dir, "eps0.50", self.PATCH_SHA, list(range(1, 13)))
+        self.assertEqual(col["detected"], "RED")
+        self.assertEqual(col["n_pos"], 11)
+        self.assertEqual(col["n_neg"], 1)
+        self.assertGreater(col["mean_d"], 0.0)
+        self.assertEqual(col["clean_pair_count"], 12)
+        self.assertEqual(col["violations"], [])
+
+    def test_detected_red_for_investigation_when_threshold_and_direction_are_improvement(self):
+        # unit-63 round-8 audit finding 2: 11 of 12 mutant legs read BETTER
+        # (lower held-out loss) than their SAME-SEED alloff leg -- the
+        # improvement-concordant shape the two-sided-falsification cell
+        # (+0.50) needs a real, reportable state for. Before this fix, this
+        # exact shape collapsed into "not-detected" and the confirming
+        # outcome could never be reported.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in range(1, 13):
+                self._write_alloff(raw_dir, seed, mean=0.50)
+                mutant_mean = 0.30 if seed != 12 else 0.70  # seed 12 dissents
+                _write_mutant_leg(raw_dir, seed, "eps0.50", _mutant_tier(seed=seed, held_out_example_mean=mutant_mean))
+            col = ab_merge.build_mutant_dose_column(raw_dir, "eps0.50", self.PATCH_SHA, list(range(1, 13)))
+        self.assertEqual(col["detected"], "RED_FOR_INVESTIGATION")
+        self.assertEqual(col["n_pos"], 1)
+        self.assertEqual(col["n_neg"], 11)
+        self.assertLess(col["mean_d"], 0.0)
+        self.assertEqual(col["clean_pair_count"], 12)
+        self.assertEqual(col["violations"], [])
+
+    def test_sign_flipping_transient_is_not_detected(self):
+        # mutants/README.md's own M1 finding, reproduced generically: an
+        # 8/12 split (well under the 11/12 threshold) reads not-detected,
+        # never RED -- "detects movement" is explicitly not this gate's claim.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in range(1, 13):
+                self._write_alloff(raw_dir, seed, mean=0.50)
+                mutant_mean = 0.55 if seed <= 8 else 0.45
+                _write_mutant_leg(raw_dir, seed, "m1-shaped", _mutant_tier(seed=seed, held_out_example_mean=mutant_mean))
+            col = ab_merge.build_mutant_dose_column(raw_dir, "m1-shaped", self.PATCH_SHA, list(range(1, 13)))
+        self.assertEqual(col["detected"], "not-detected")
+        self.assertEqual(col["n_pos"], 8)
+        self.assertEqual(col["n_neg"], 4)
+
+    def test_wrong_clean_pair_count_is_invalid(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in range(1, 12):  # only 11, not the pre-registered 12
+                self._write_alloff(raw_dir, seed, mean=0.50)
+                _write_mutant_leg(raw_dir, seed, "eps0.50", _mutant_tier(seed=seed, held_out_example_mean=0.70))
+            col = ab_merge.build_mutant_dose_column(raw_dir, "eps0.50", self.PATCH_SHA, list(range(1, 13)))
+        self.assertEqual(col["detected"], "INVALID")
+        self.assertEqual(col["clean_pair_count"], 11)
+        self.assertTrue(any("expected exactly" in v for v in col["violations"]), col["violations"])
+
+    def test_missing_provenance_field_is_a_violation(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_alloff(raw_dir, 1, mean=0.50)
+            _write_mutant_leg(
+                raw_dir, 1, "eps0.50", _mutant_tier(seed=1, held_out_example_mean=0.70, mutant_id=None)
+            )
+            col = ab_merge.build_mutant_dose_column(raw_dir, "eps0.50", self.PATCH_SHA, [1])
+        self.assertTrue(any("mutant_id" in v for v in col["violations"]), col["violations"])
+        self.assertIsNone(col["per_seed"]["1"]["d_i"])
+
+    def test_whitespace_only_provenance_fields_are_treated_as_empty(self):
+        # unit-63 round-8 audit finding 4 (merger half): a whitespace-only
+        # value (" ") for any of the three producer-stamped fields is
+        # exactly as absent as "" or None -- the pre-fix bare
+        # `if not tier.get(field)` check passed it straight through as
+        # though it were present.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_alloff(raw_dir, 1, mean=0.50)
+            _write_mutant_leg(
+                raw_dir,
+                1,
+                "eps0.50",
+                _mutant_tier(
+                    seed=1,
+                    held_out_example_mean=0.70,
+                    mutant_id=" ",
+                    mutant_base_sha="\t",
+                    mutant_patch_sha256="  ",
+                ),
+            )
+            col = ab_merge.build_mutant_dose_column(raw_dir, "eps0.50", self.PATCH_SHA, [1])
+        for field in ("mutant_id", "mutant_base_sha", "mutant_patch_sha256"):
+            self.assertTrue(
+                any(f"{field!r}" in v and "missing/empty" in v for v in col["violations"]),
+                col["violations"],
+            )
+        self.assertIsNone(col["per_seed"]["1"]["d_i"])
+
+    def test_sha_comparison_uses_stripped_values(self):
+        # unit-63 round-8 audit finding 4 (merger half): incidental
+        # leading/trailing whitespace on either side of the sha comparison
+        # must never be reported as a labeling-error mismatch.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_alloff(raw_dir, 1, mean=0.50)
+            _write_mutant_leg(
+                raw_dir,
+                1,
+                "eps0.50",
+                _mutant_tier(seed=1, held_out_example_mean=0.70, mutant_patch_sha256=f"  {self.PATCH_SHA}\t"),
+            )
+            col = ab_merge.build_mutant_dose_column(raw_dir, "eps0.50", f" {self.PATCH_SHA} ", [1])
+        # per-leg violations only -- the column-level "expected exactly 12"
+        # count violation (this test only runs 1 seed) is orthogonal to the
+        # sha-comparison claim under test here.
+        self.assertEqual(col["per_seed"]["1"]["violations"], [])
+        self.assertIsNotNone(col["per_seed"]["1"]["d_i"])
+
+    def test_sha_comparison_is_case_insensitive_in_every_case_combination(self):
+        # unit-63 round-10 audit F2: sha hex is case-insensitive by domain.
+        # The producer now canonicalizes its own stamped mutant_patch_sha256
+        # to lowercase (round-9 advisory (b)) -- an upper/upper pair that
+        # matched before that change must still match, and every other
+        # (leg-case, caller-case) combination must match too, since the
+        # comparison itself now folds case on both sides.
+        base_sha = self.PATCH_SHA  # already all-lowercase
+        case_cells = [
+            ("lower", "lower", base_sha, base_sha),
+            ("lower", "upper", base_sha, base_sha.upper()),
+            ("upper", "lower", base_sha.upper(), base_sha),
+            ("upper", "upper", base_sha.upper(), base_sha.upper()),
+        ]
+        for leg_case, caller_case, leg_sha, caller_sha in case_cells:
+            with self.subTest(leg_case=leg_case, caller_case=caller_case):
+                with tempfile.TemporaryDirectory() as raw_dir:
+                    self._write_alloff(raw_dir, 1, mean=0.50)
+                    _write_mutant_leg(
+                        raw_dir,
+                        1,
+                        "eps0.50",
+                        _mutant_tier(seed=1, held_out_example_mean=0.70, mutant_patch_sha256=leg_sha),
+                    )
+                    col = ab_merge.build_mutant_dose_column(raw_dir, "eps0.50", caller_sha, [1])
+                self.assertEqual(col["per_seed"]["1"]["violations"], [])
+                self.assertIsNotNone(col["per_seed"]["1"]["d_i"])
+
+    def test_patch_sha256_mismatch_is_refused(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            self._write_alloff(raw_dir, 1, mean=0.50)
+            _write_mutant_leg(
+                raw_dir,
+                1,
+                "eps0.50",
+                _mutant_tier(seed=1, held_out_example_mean=0.70, mutant_patch_sha256="some-other-sha"),
+            )
+            col = ab_merge.build_mutant_dose_column(raw_dir, "eps0.50", self.PATCH_SHA, [1])
+        self.assertTrue(any("does not match this dose column" in v for v in col["violations"]), col["violations"])
+        self.assertIsNone(col["per_seed"]["1"]["d_i"])
+
+    def test_premise_failing_alloff_partner_excludes_the_pair(self):
+        # unit-63 round-7 audit finding 2: the main pool premise-checks BOTH
+        # arms, but this column used to premise-check only the mutant
+        # (fused-shaped) leg -- the REUSED alloff partner never got the same
+        # check. A v1-seed-4-shaped alloff partner (train_probe_series
+        # giving a negative learning_happened_delta, mirroring the REAL
+        # campaign-v1 seed-4 alloff leg's own -0.1125 floor breach --
+        # measurements/campaign-v1/README.md) must exclude the PAIR from
+        # this dose column, never silently count as a clean partner.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed in range(1, 13):
+                if seed == 4:
+                    _write_finetune_run_leg(
+                        raw_dir,
+                        seed,
+                        "alloff",
+                        "r1",
+                        _finetune_run_tier(
+                            arm="alloff", seed=seed, held_out_example_mean=0.50, train_probe_series=[0.5, 0.6]
+                        ),
+                    )
+                else:
+                    self._write_alloff(raw_dir, seed, mean=0.50)
+                _write_mutant_leg(raw_dir, seed, "eps0.50", _mutant_tier(seed=seed, held_out_example_mean=0.70))
+            col = ab_merge.build_mutant_dose_column(raw_dir, "eps0.50", self.PATCH_SHA, list(range(1, 13)))
+        self.assertEqual(col["detected"], "INVALID")
+        self.assertEqual(col["clean_pair_count"], 11)
+        self.assertIsNone(col["per_seed"]["4"]["d_i"])
+        self.assertTrue(
+            any("learning_happened_delta" in v and "seed 4" in v for v in col["violations"]),
+            col["violations"],
+        )
+
+    def test_mutant_leg_never_leaks_into_the_ab_set(self):
+        # A mutant leg is written under the SAME raw_dir, SAME seeds, as a
+        # clean 12-seed main A/B sweep -- the merger's own decision must be
+        # bit-for-bit identical to a run with NO mutant legs present at all.
+        # 6-vs-6 (mixed sign) keeps the decision GREEN, isolating this test's
+        # own claim (no leakage) from the unrelated decision-rule mutants.
+        means = {s: (0.30, 0.50) for s in range(1, 7)}
+        means.update({s: (0.55, 0.40) for s in range(7, 13)})
+        with tempfile.TemporaryDirectory() as raw_dir:
+            for seed, (fused_mean, alloff_mean) in means.items():
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                # a mutant leg for this SAME seed, wildly different mean --
+                # if it ever leaked into the A/B loader, this would change
+                # d_values/the decision.
+                _write_mutant_leg(raw_dir, seed, "eps0.50", _mutant_tier(seed=seed, held_out_example_mean=9.99))
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, list(range(1, 13)), allow_missing_lr0_control=True)
+        self.assertEqual(merged["status"], "GREEN")
+        for seed in range(1, 7):
+            self.assertAlmostEqual(merged["d_values"][str(seed)], -0.20)
+        for seed in range(7, 13):
+            self.assertAlmostEqual(merged["d_values"][str(seed)], 0.15)
+
+    def test_sensitivity_finds_the_straddling_pair_ordered_by_magnitude_not_caller_order(self):
+        # unit-63 round-7 audit finding 4 / addendum 2026-08-29c: the
+        # SCHEDULED ladder runs ascending eps (-0.50, -0.10, +0.50) -- the
+        # LARGER-magnitude degradation dose (-0.50) is passed to this
+        # function FIRST, in caller order. A signed ladder with -0.50 RED
+        # (only) and -0.10 not-detected must still report the straddle,
+        # magnitude-ordered within the negative branch (-0.10 -> -0.50), not
+        # `None` (what the pre-fix caller-order scan would have returned:
+        # neither adjacent caller-order pair reads (not-detected, RED)).
+        neg50 = {"dose_label": "eps-0.50", "detected": "RED"}
+        neg10 = {"dose_label": "eps-0.10", "detected": "not-detected"}
+        pos50 = {"dose_label": "eps0.50", "detected": "not-detected"}
+        sensitivity = ab_merge.mutant_dose_ladder_sensitivity([neg50, neg10, pos50])  # caller/scheduled order
+        self.assertEqual(sensitivity, {"lower": "eps-0.10", "higher": "eps-0.50"})
+
+    def test_sensitivity_is_none_when_no_negative_dose_is_detected(self):
+        columns = [
+            {"dose_label": "eps-0.50", "detected": "not-detected"},
+            {"dose_label": "eps-0.10", "detected": "not-detected"},
+            {"dose_label": "eps0.50", "detected": "not-detected"},
+        ]
+        self.assertIsNone(ab_merge.mutant_dose_ladder_sensitivity(columns))
+
+    def test_positive_eps_never_enters_the_negative_branch(self):
+        # A single negative dose can never straddle anything by itself; a
+        # positive-eps dose reading RED must not be borrowed to complete a
+        # pair, regardless of its own detected value.
+        columns = [
+            {"dose_label": "eps-0.10", "detected": "not-detected"},
+            {"dose_label": "eps0.50", "detected": "RED"},
+        ]
+        self.assertIsNone(ab_merge.mutant_dose_ladder_sensitivity(columns))
+
+    def test_cross_sign_detection_is_a_falsification_finding_not_sensitivity(self):
+        # unit-63 round-7 audit finding 4: a POSITIVE-eps dose reading RED
+        # (the two-sided falsification cell, addendum 2026-08-29c) must be
+        # reported separately, never folded into 'sensitivity' as though a
+        # cross-sign (-0.10 not-detected, +0.50 RED) pair were a degradation
+        # straddle.
+        neg50 = {"dose_label": "eps-0.50", "detected": "not-detected"}
+        neg10 = {"dose_label": "eps-0.10", "detected": "not-detected"}
+        pos50 = {"dose_label": "eps0.50", "detected": "RED"}
+        columns = [neg50, neg10, pos50]
+        self.assertIsNone(ab_merge.mutant_dose_ladder_sensitivity(columns))
+        falsification = ab_merge.mutant_dose_ladder_two_sided_falsification(columns)
+        self.assertEqual(
+            falsification,
+            [
+                {
+                    "dose_label": "eps0.50",
+                    "eps": 0.50,
+                    "detected": "RED",
+                    "finding": "secant refuted (degradation at +eps)",
+                }
+            ],
+        )
+
+    def test_positive_eps_red_for_investigation_is_the_confirming_falsification_arm(self):
+        # unit-63 round-8 audit finding 1/2: a positive-eps dose reading
+        # RED_FOR_INVESTIGATION (improvement-concordant) is the CONFIRMING
+        # outcome for the held-out-improvement prediction -- never described
+        # as a "refutation" (that word belongs to the RED/degradation arm
+        # instead, the exact polarity inversion round-8 finding 1 corrects).
+        columns = [{"dose_label": "eps0.50", "detected": "RED_FOR_INVESTIGATION"}]
+        falsification = ab_merge.mutant_dose_ladder_two_sided_falsification(columns)
+        self.assertEqual(
+            falsification,
+            [
+                {
+                    "dose_label": "eps0.50",
+                    "eps": 0.50,
+                    "detected": "RED_FOR_INVESTIGATION",
+                    "finding": "secant confirmed (improvement at +eps)",
+                }
+            ],
+        )
+
+    def test_red_for_investigation_never_enters_the_sensitivity_branch(self):
+        # RED_FOR_INVESTIGATION is an improvement-concordant reading; it must
+        # never be treated as a degradation-direction detection even for a
+        # negative-eps dose_label (a negative dose reading RED_FOR_INVESTIGATION
+        # would be an anomalous improvement under DEFLATION, still not the
+        # DEGRADATION `sensitivity` statistic is scoped to).
+        columns = [
+            {"dose_label": "eps-0.50", "detected": "not-detected"},
+            {"dose_label": "eps-0.10", "detected": "RED_FOR_INVESTIGATION"},
+        ]
+        self.assertIsNone(ab_merge.mutant_dose_ladder_sensitivity(columns))
+
+    def test_negative_red_for_investigation_is_a_dose_anomaly(self):
+        # unit-63 round-9 audit finding 3: a negative-eps dose reading
+        # RED_FOR_INVESTIGATION is an anomalous improvement under
+        # deflation -- it must never silently vanish from sensitivity AND
+        # anomalies both; sensitivity correctly returns None (unchanged
+        # test above), and this is the entry that names the anomaly.
+        columns = [
+            {"dose_label": "eps-0.50", "detected": "not-detected"},
+            {"dose_label": "eps-0.10", "detected": "RED_FOR_INVESTIGATION"},
+        ]
+        anomalies = ab_merge.mutant_dose_ladder_anomalies(columns)
+        self.assertEqual(
+            anomalies,
+            [
+                {
+                    "dose_label": "eps-0.10",
+                    "eps": -0.10,
+                    "detected": "RED_FOR_INVESTIGATION",
+                    "finding": "anomalous improvement under deflation (eps < 0)",
+                }
+            ],
+        )
+
+    def test_positive_red_for_investigation_is_never_a_dose_anomaly(self):
+        # The ORDINARY, predicted two-sided-falsification confirming arm
+        # (a positive-eps dose reading RED_FOR_INVESTIGATION) must never be
+        # misclassified as an anomaly.
+        columns = [{"dose_label": "eps0.50", "detected": "RED_FOR_INVESTIGATION"}]
+        self.assertEqual(ab_merge.mutant_dose_ladder_anomalies(columns), [])
+
+    def test_negative_red_and_not_detected_are_never_dose_anomalies(self):
+        columns = [
+            {"dose_label": "eps-0.50", "detected": "RED"},
+            {"dose_label": "eps-0.10", "detected": "not-detected"},
+        ]
+        self.assertEqual(ab_merge.mutant_dose_ladder_anomalies(columns), [])
+
+    def test_positive_eps_not_detected_is_not_a_falsification_finding(self):
+        columns = [{"dose_label": "eps0.50", "detected": "not-detected"}]
+        self.assertEqual(ab_merge.mutant_dose_ladder_two_sided_falsification(columns), [])
+
+    def test_unparseable_dose_label_is_refused(self):
+        # unit-63 round-7 audit finding 4: a dose_label that cannot be
+        # placed in either branch must be refused, never silently skipped
+        # or silently treated as a positive/negative default.
+        columns = [{"dose_label": "bogus", "detected": "RED"}]
+        with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+            ab_merge.mutant_dose_ladder_sensitivity(columns)
+        with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+            ab_merge.mutant_dose_ladder_two_sided_falsification(columns)
+
+    def test_non_finite_zero_and_out_of_domain_eps_labels_are_refused(self):
+        # unit-63 round-8 audit finding 3: `_dose_label_eps` parses
+        # successfully for nan/0.0/-0.0/inf/an out-of-domain magnitude, but
+        # `eps < 0.0`/`eps > 0.0` both silently reject each of these --
+        # they must never vanish from BOTH findings with a clean exit, so
+        # each one is refused loudly at parse time instead.
+        for dose_label in ("epsnan", "eps0.0", "eps-0.0", "epsinf", "eps-inf", "eps10.0"):
+            with self.subTest(dose_label=dose_label):
+                with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+                    ab_merge._dose_label_eps(dose_label)
+
+    def test_whitespace_or_explicit_plus_in_eps_substring_is_refused(self):
+        # unit-63 round-9 audit advisory (a): float() is more permissive
+        # than the raw leg file name lookup this label is used VERBATIM
+        # for -- a whitespace-padded or explicit-plus-signed eps substring
+        # parses fine but could silently diverge from the on-disk file
+        # name, so it is refused here rather than accepted.
+        for dose_label in ("eps 0.50", "eps0.50 ", "eps +0.50", "eps+0.50", "eps0.5\t0"):
+            with self.subTest(dose_label=dose_label):
+                with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+                    ab_merge._dose_label_eps(dose_label)
+
+    def test_epsnan_is_refused_not_silently_dropped_from_both_findings(self):
+        columns = [{"dose_label": "epsnan", "detected": "RED"}]
+        with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+            ab_merge.mutant_dose_ladder_sensitivity(columns)
+        with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+            ab_merge.mutant_dose_ladder_two_sided_falsification(columns)
+
+    def test_eps0_0_is_refused(self):
+        columns = [{"dose_label": "eps0.0", "detected": "RED"}]
+        with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+            ab_merge.mutant_dose_ladder_sensitivity(columns)
+
+    def test_eps_negative_zero_is_refused(self):
+        columns = [{"dose_label": "eps-0.0", "detected": "RED"}]
+        with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+            ab_merge.mutant_dose_ladder_sensitivity(columns)
+
+    def test_epsinf_is_refused(self):
+        columns = [{"dose_label": "epsinf", "detected": "RED"}]
+        with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+            ab_merge.mutant_dose_ladder_two_sided_falsification(columns)
+
+    def test_eps_magnitude_over_the_family_domain_is_refused(self):
+        # eps=10.0 parses as a float fine, but its magnitude vastly exceeds
+        # the scheduled ladder's own domain (|eps| <= 1.0) -- refused, never
+        # silently accepted as though it were a real dose.
+        columns = [{"dose_label": "eps10.0", "detected": "RED"}]
+        with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+            ab_merge.mutant_dose_ladder_sensitivity(columns)
+
+    def test_eps_domain_boundary_oracle(self):
+        # unit-63 round-9 audit finding 2: the domain is ASYMMETRIC --
+        # `eps <= -1.0` (multiplier sign bound, exclusive of -1.0 itself)
+        # and `eps > 1.0` (the family-sanity cap) are refused on the high
+        # end, and `0 < abs(eps) < 0.01` (below the 0.01 sanity floor,
+        # itself set deliberately BELOW the smallest ever-SCHEDULED dose of
+        # `|eps| = 0.10` -- unit-63 round-10 audit advisory (a)) is refused
+        # on the low end. A single symmetric
+        # `abs(eps) > 1.0` check would have wrongly ACCEPTED eps=-1.0 (a
+        # zero-update leg) as though it were a real degradation dose.
+        refused = ("eps-1.0", "eps1.01", "eps0.009")
+        accepted = {"eps-0.99": -0.99, "eps1.0": 1.0, "eps-0.01": -0.01}
+        for dose_label in refused:
+            with self.subTest(dose_label=dose_label, expect="refused"):
+                with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+                    ab_merge._dose_label_eps(dose_label)
+        for dose_label, expected_value in accepted.items():
+            with self.subTest(dose_label=dose_label, expect="accepted"):
+                self.assertAlmostEqual(ab_merge._dose_label_eps(dose_label), expected_value)
+
+    def test_aliased_eps_labels_are_refused_regardless_of_order(self):
+        # unit-63 round-10 audit F1: `eps-0.1` / `eps-0.100` / `eps-.10` /
+        # `eps-1e-1` all parse to the identical eps=-0.1 float while filing
+        # FOUR distinct leg files -- a stable abs(eps)-sort would otherwise
+        # break the tie by caller order, silently emitting a zero-width
+        # straddle between two aliases of the SAME dose. Both orderings of
+        # each aliased pair must refuse -- never just one.
+        aliased_pairs = [
+            ("eps-0.1", "eps-0.100"),
+            ("eps-0.1", "eps-.10"),
+            ("eps-0.1", "eps-1e-1"),
+        ]
+        for label_a, label_b in aliased_pairs:
+            for ordered in ((label_a, label_b), (label_b, label_a)):
+                with self.subTest(order=ordered):
+                    columns = [{"dose_label": lbl, "detected": "not-detected"} for lbl in ordered]
+                    with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError) as ctx:
+                        ab_merge.mutant_dose_ladder_reject_duplicate_doses(columns)
+                    message = str(ctx.exception)
+                    self.assertIn(ordered[0], message)
+                    self.assertIn(ordered[1], message)
+                    self.assertIn("-0.1", message)
+
+    def test_distinct_eps_dose_set_is_unaffected_by_the_duplicate_guard(self):
+        # unit-63 round-11 audit block: the SCHEDULED ladder's own shape --
+        # distinct labels, distinct parsed eps, AND (per mutants/README.md's
+        # own one-sha-per-dose convention) distinct patch_sha256 -- must
+        # sail through all three identity arms unaffected.
+        columns = [
+            {"dose_label": "eps-0.50", "detected": "RED", "patch_sha256": "sha-neg-0-50"},
+            {"dose_label": "eps-0.10", "detected": "not-detected", "patch_sha256": "sha-neg-0-10"},
+            {"dose_label": "eps0.50", "detected": "RED_FOR_INVESTIGATION", "patch_sha256": "sha-pos-0-50"},
+        ]
+        ab_merge.mutant_dose_ladder_reject_duplicate_doses(columns)  # must not raise
+
+    def test_missing_or_empty_patch_sha256_is_never_treated_as_a_duplicate(self):
+        # unit-63 round-11 audit block: an unset (missing key, None, or
+        # empty-after-strip) patch_sha256 is never compared against another
+        # unset patch_sha256 as though both aliased the same patch -- this
+        # keeps every pre-existing synthetic-column test (which never set
+        # this field) unaffected by the new arm.
+        columns = [
+            {"dose_label": "eps-0.50", "detected": "RED"},
+            {"dose_label": "eps-0.10", "detected": "not-detected", "patch_sha256": None},
+            {"dose_label": "eps0.50", "detected": "RED_FOR_INVESTIGATION", "patch_sha256": "  "},
+        ]
+        ab_merge.mutant_dose_ladder_reject_duplicate_doses(columns)  # must not raise
+
+    def test_duplicate_patch_sha256_across_distinct_labels_is_refused_every_order(self):
+        # unit-63 round-11 audit block: the auditor demonstrated a
+        # plausible-looking false sensitivity interval between three
+        # SAME-SHA columns (rc=0) -- three DISTINCT, non-aliased labels
+        # (each parsing to a distinct eps, so neither the label nor the eps
+        # arm above ever fires) that all cite the SAME patch_sha256 must be
+        # refused regardless of the caller-supplied order, since
+        # mutants/README.md records one DISTINCT sha per dose: two columns
+        # sharing a sha are the same mutant measured twice, never a real
+        # adjacent-dose pair.
+        shared_sha = "  DEADBEEF  "  # case/whitespace must be folded before comparison
+        base_columns = {
+            "eps-0.50": {"dose_label": "eps-0.50", "detected": "RED", "patch_sha256": shared_sha},
+            "eps-0.10": {"dose_label": "eps-0.10", "detected": "not-detected", "patch_sha256": shared_sha},
+            "eps0.50": {"dose_label": "eps0.50", "detected": "RED_FOR_INVESTIGATION", "patch_sha256": shared_sha},
+        }
+        for order in itertools.permutations(base_columns):
+            with self.subTest(order=order):
+                columns = [base_columns[label] for label in order]
+                with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError) as ctx:
+                    ab_merge.mutant_dose_ladder_reject_duplicate_doses(columns)
+                message = str(ctx.exception)
+                # the first collision found names the first two labels in
+                # this order, never the third -- but every order collides.
+                self.assertIn(order[0], message)
+                self.assertIn(order[1], message)
+                self.assertIn("deadbeef", message)
+                self.assertIn("same mutant measured twice", message)
+                self.assertIn("determinism question", message)
+
+    def test_duplicate_literal_dose_label_is_refused_even_if_unparseable(self):
+        # a literal-label duplicate is refused BEFORE eps parsing is ever
+        # attempted -- two identically-spelled labels are refused even when
+        # that label itself would fail to parse as a signed eps value.
+        columns = [
+            {"dose_label": "bogus", "detected": "RED"},
+            {"dose_label": "bogus", "detected": "not-detected"},
+        ]
+        with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError) as ctx:
+            ab_merge.mutant_dose_ladder_reject_duplicate_doses(columns)
+        self.assertIn("bogus", str(ctx.exception))
+        self.assertIn("more than once", str(ctx.exception))
+
+    def test_cli_wiring_refuses_aliased_dose_labels(self):
+        # unit-63 round-10 audit F1 (CLI wiring): `--mutant-legs` supplied
+        # twice with two aliased labels (eps-0.1 / eps-0.100) is a
+        # merge-level refusal (exit 1, recorded in 'sensitivity_error'),
+        # never a script crash and never a silently order-dependent
+        # straddle.
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                _write_mutant_leg(raw_dir, seed, "eps-0.1", _mutant_tier(seed=seed, held_out_example_mean=0.70))
+                _write_mutant_leg(raw_dir, seed, "eps-0.100", _mutant_tier(seed=seed, held_out_example_mean=0.70))
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    f"eps-0.1:{self.PATCH_SHA}:{seeds_s}",
+                    "--mutant-legs",
+                    f"eps-0.100:{self.PATCH_SHA}:{seeds_s}",
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 1)
+        self.assertEqual(merged["status"], "GREEN")
+        self.assertIsNone(merged["mutant_dose_ladder"]["sensitivity"])
+        self.assertIsNotNone(merged["mutant_dose_ladder"]["sensitivity_error"])
+        self.assertIn("eps-0.1", merged["mutant_dose_ladder"]["sensitivity_error"])
+        self.assertIn("eps-0.100", merged["mutant_dose_ladder"]["sensitivity_error"])
+
+    def test_cli_wiring_folds_the_dose_ladder_into_the_same_artifact(self):
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                # 6-vs-6 (mixed sign) -- a GREEN main decision, isolating
+                # this test's own claim (the dose ladder folds into the
+                # SAME artifact, exit 0) from the decision-rule mutants.
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                mutant_mean = 0.70 if seed != 12 else 0.30
+                _write_mutant_leg(raw_dir, seed, "eps0.50", _mutant_tier(seed=seed, held_out_example_mean=mutant_mean))
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            mutant_spec = f"eps0.50:{self.PATCH_SHA}:{seeds_s}"
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    mutant_spec,
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 0)  # GREEN main decision + a RED (successfully-detecting) dose is not itself a script FAIL
+        # unit-63 round-10 audit advisory (c): pin the main decision's own
+        # status, per this file's own convention -- this test's isolation
+        # claim (the dose ladder alone drives `rc`/the dose_anomalies etc.)
+        # depends on the main decision actually being GREEN, not merely
+        # "whatever it happened to compute" from the 6-vs-6 fixture above.
+        self.assertEqual(merged["status"], "GREEN")
+        self.assertIn("mutant_dose_ladder", merged)
+        self.assertEqual(len(merged["mutant_dose_ladder"]["doses"]), 1)
+        self.assertEqual(merged["mutant_dose_ladder"]["doses"][0]["detected"], "RED")
+
+    def test_cli_wiring_fails_on_an_invalid_dose_column(self):
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                # 6-vs-6 (mixed sign) -- a GREEN main decision, isolating
+                # this test's own claim (an INVALID dose column alone fails
+                # the merge's exit code) from the main decision rule.
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                if seed <= 11:  # only 11 mutant legs -- wrong clean pair count
+                    _write_mutant_leg(raw_dir, seed, "eps0.50", _mutant_tier(seed=seed, held_out_example_mean=0.70))
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            mutant_spec = f"eps0.50:{self.PATCH_SHA}:{seeds_s}"
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    mutant_spec,
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 1)
+        # unit-63 round-10 audit advisory (c): pin the main decision's own
+        # status, per this file's own convention -- this test's isolation
+        # claim (an INVALID dose column ALONE fails the exit code) depends
+        # on the main decision actually being GREEN.
+        self.assertEqual(merged["status"], "GREEN")
+
+    def test_cli_wiring_fails_on_a_negative_eps_red_for_investigation_dose(self):
+        # unit-63 round-9 audit finding 3: a negative-eps (deflation) dose
+        # reading RED_FOR_INVESTIGATION (11/12 seeds read BETTER than
+        # alloff, an anomalous improvement under deflation) must non-zero
+        # the merge's own exit code -- before this fix it silently yielded
+        # sensitivity=null, sensitivity_error=null, exit 0.
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                # 6-vs-6 (mixed sign) -- a GREEN main decision, isolating
+                # this test's own claim (a negative-eps dose_anomaly alone
+                # fails the merge's exit code) from the main decision rule.
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                # mutant mean below BOTH branches' own alloff_mean (0.50 /
+                # 0.40) so every non-dissenting seed reads improvement;
+                # seed 12 dissents (above its own 0.40 alloff_mean) for
+                # 11/12, mirroring the RED-detecting test's own shape.
+                mutant_mean = 0.30 if seed != 12 else 0.70
+                _write_mutant_leg(raw_dir, seed, "eps-0.10", _mutant_tier(seed=seed, held_out_example_mean=mutant_mean))
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            mutant_spec = f"eps-0.10:{self.PATCH_SHA}:{seeds_s}"
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    mutant_spec,
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 1)
+        # unit-63 round-10 audit advisory (c): pin the main decision's own
+        # status, per this file's own convention -- this test's isolation
+        # claim (a negative-eps dose_anomaly ALONE fails the exit code)
+        # depends on the main decision actually being GREEN.
+        self.assertEqual(merged["status"], "GREEN")
+        self.assertEqual(merged["mutant_dose_ladder"]["doses"][0]["detected"], "RED_FOR_INVESTIGATION")
+        self.assertIsNone(merged["mutant_dose_ladder"]["sensitivity"])
+        self.assertEqual(
+            merged["mutant_dose_ladder"]["dose_anomalies"],
+            [
+                {
+                    "dose_label": "eps-0.10",
+                    "eps": -0.10,
+                    "detected": "RED_FOR_INVESTIGATION",
+                    "finding": "anomalous improvement under deflation (eps < 0)",
+                }
+            ],
+        )
+
+    def test_cli_wiring_fails_on_an_unparseable_dose_label(self):
+        # unit-63 round-7 audit finding 4: an operator-typo'd dose_label
+        # that does not parse as a signed eps value is a merge-level
+        # refusal (exit 1, recorded in the artifact's own
+        # 'sensitivity_error'), never a script crash and never silently
+        # skipped.
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                _write_mutant_leg(raw_dir, seed, "bogus", _mutant_tier(seed=seed, held_out_example_mean=0.70))
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            mutant_spec = f"bogus:{self.PATCH_SHA}:{seeds_s}"
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    mutant_spec,
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 1)
+        self.assertIsNone(merged["mutant_dose_ladder"]["sensitivity"])
+        self.assertIsNotNone(merged["mutant_dose_ladder"]["sensitivity_error"])
+
+    def test_cli_wiring_strips_the_mutant_legs_sha_before_comparison(self):
+        # unit-63 round-8 audit finding 4 (merger half): the CLI's own
+        # `--mutant-legs DOSE_LABEL:PATCH_SHA256:SEEDS` sha is stripped
+        # before it is used, so a whitespace-padded sha on the command line
+        # is not silently reported as a labeling-error mismatch against a
+        # leg's own (clean) recorded sha, and is recorded stripped in the
+        # merged artifact.
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                _write_mutant_leg(raw_dir, seed, "eps0.50", _mutant_tier(seed=seed, held_out_example_mean=0.70))
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            mutant_spec = f"eps0.50: {self.PATCH_SHA} :{seeds_s}"
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    mutant_spec,
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        dose = merged["mutant_dose_ladder"]["doses"][0]
+        self.assertEqual(dose["patch_sha256"], self.PATCH_SHA)
+        self.assertEqual(dose["violations"], [])
+        self.assertEqual(rc, 0)
+
+    def _write_scheduled_three_dose_ladder(self, raw_dir, *, neg50_sha, neg10_sha, pos50_sha):
+        """The SCHEDULED `eps in {-0.50, -0.10, +0.50}` ladder
+        (`docs/plans/63-how-well/mutants/README.md`'s own "signed dose
+        family" section): a GREEN 6-vs-6 (mixed sign) main decision, plus
+        three mutant legs shaped so `-0.10` reads not-detected, `-0.50`
+        reads RED (the degradation-direction straddle), and `+0.50` reads
+        RED too (the two-sided-falsification cell: the held-out-improvement
+        prediction is refuted here, not confirmed -- either outcome is a
+        legitimate member of that cell, this fixture just picks one).
+        """
+        for seed in range(1, 13):
+            fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+            for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                for repeat in ("r1", "r2"):
+                    _write_finetune_run_leg(
+                        raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                    )
+            # eps-0.10: 8/12 split (seeds 1-8 positive, 9-12 negative) --
+            # under the 11/12 threshold, reads not-detected.
+            neg10_mean = 0.55 if seed <= 8 else 0.30
+            _write_mutant_leg(
+                raw_dir,
+                seed,
+                "eps-0.10",
+                _mutant_tier(seed=seed, held_out_example_mean=neg10_mean, mutant_patch_sha256=neg10_sha),
+            )
+            # eps-0.50: 11/12 positive (seed 12 dissents) -- reads RED, the
+            # same shape this suite's own single-dose RED test already
+            # pins.
+            neg50_mean = 0.70 if seed != 12 else 0.30
+            _write_mutant_leg(
+                raw_dir,
+                seed,
+                "eps-0.50",
+                _mutant_tier(seed=seed, held_out_example_mean=neg50_mean, mutant_patch_sha256=neg50_sha),
+            )
+            # eps0.50 (the two-sided falsification cell): same shape as
+            # eps-0.50 -- reads RED, refuting the held-out-improvement
+            # prediction at this positive-eps dose.
+            pos50_mean = 0.70 if seed != 12 else 0.30
+            _write_mutant_leg(
+                raw_dir,
+                seed,
+                "eps0.50",
+                _mutant_tier(seed=seed, held_out_example_mean=pos50_mean, mutant_patch_sha256=pos50_sha),
+            )
+
+    def test_cli_wiring_scheduled_three_dose_ladder_happy_path(self):
+        # unit-63 round-11 audit advisory (c): the missing end-to-end
+        # happy-path pin -- one CLI `main()` call driving the SCHEDULED
+        # 3-dose ladder with DISTINCT patch shas (per dose, matching
+        # mutants/README.md's own convention) all the way to a GREEN,
+        # rc=0 merge with a correct straddle and a populated
+        # `two_sided_falsification` -- the exact shape the paid run will
+        # exercise.
+        neg50_sha, neg10_sha, pos50_sha = "sha-neg-0-50", "sha-neg-0-10", "sha-pos-0-50"
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            self._write_scheduled_three_dose_ladder(raw_dir, neg50_sha=neg50_sha, neg10_sha=neg10_sha, pos50_sha=pos50_sha)
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    f"eps-0.50:{neg50_sha}:{seeds_s}",
+                    "--mutant-legs",
+                    f"eps-0.10:{neg10_sha}:{seeds_s}",
+                    "--mutant-legs",
+                    f"eps0.50:{pos50_sha}:{seeds_s}",
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 0)
+        self.assertEqual(merged["status"], "GREEN")
+        ladder = merged["mutant_dose_ladder"]
+        self.assertIsNone(ladder["sensitivity_error"])
+        self.assertEqual(ladder["sensitivity"], {"lower": "eps-0.10", "higher": "eps-0.50"})
+        self.assertEqual(
+            ladder["two_sided_falsification"],
+            [
+                {
+                    "dose_label": "eps0.50",
+                    "eps": 0.5,
+                    "detected": "RED",
+                    "finding": "secant refuted (degradation at +eps)",
+                }
+            ],
+        )
+        self.assertEqual(ladder["dose_anomalies"], [])
+        detected_by_label = {d["dose_label"]: d["detected"] for d in ladder["doses"]}
+        self.assertEqual(
+            detected_by_label,
+            {"eps-0.50": "RED", "eps-0.10": "not-detected", "eps0.50": "RED"},
+        )
+
+    def test_cli_wiring_refuses_the_auditors_three_same_sha_probe(self):
+        # unit-63 round-11 audit block: the auditor's own probe -- the
+        # exact SCHEDULED 3-dose ladder shape above, but with all three
+        # `--mutant-legs` specs citing the SAME patch_sha256 -- previously
+        # merged clean (rc=0) with a plausible-looking straddle between
+        # three columns that were, by this module's own strongest identity
+        # key, the SAME mutant measured three times. Now a merge-level
+        # refusal (exit 1, named in 'sensitivity_error'), never a silently
+        # accepted sensitivity interval.
+        shared_sha = "sha-shared-across-all-three-doses"
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            self._write_scheduled_three_dose_ladder(raw_dir, neg50_sha=shared_sha, neg10_sha=shared_sha, pos50_sha=shared_sha)
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    f"eps-0.50:{shared_sha}:{seeds_s}",
+                    "--mutant-legs",
+                    f"eps-0.10:{shared_sha}:{seeds_s}",
+                    "--mutant-legs",
+                    f"eps0.50:{shared_sha}:{seeds_s}",
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 1)
+        ladder = merged["mutant_dose_ladder"]
+        self.assertIsNone(ladder["sensitivity"])
+        self.assertIsNotNone(ladder["sensitivity_error"])
+        self.assertIn("eps-0.50", ladder["sensitivity_error"])
+        self.assertIn("eps-0.10", ladder["sensitivity_error"])
+        self.assertIn(shared_sha, ladder["sensitivity_error"])
+        self.assertIn("same mutant measured twice", ladder["sensitivity_error"])
+
+
+class RedProofColumnTests(unittest.TestCase):
+    """Unit 63 — the RED-proof column as a first-class merger output
+    (`RED_PROOF_LABEL_PREFIX`, `partition_red_proof_dose_columns`,
+    `build_red_proof_summary`): `redproof-nobc`/`redproof-signflip`
+    participate fully in `build_mutant_dose_column`, but are excluded from
+    the eps-family scans, and read out via `red_proof`/`red_proof_verdict`
+    in the SAME artifact -- the honest alternative to reading a verdict out
+    of a separate, exit-1-expected invocation.
+    """
+
+    PATCH_SHA = "eps0-02-patch-sha"
+
+    # CONTRACT amendment 2026-08-29e (D*): `RED_PROOF_EXPECTED_TRAIN_DIRECTION`
+    # is keyed on the FULL committed sha, never any arbitrary test string --
+    # a RED-proof-labeled column whose leg-building test wants a premise-CLEAN
+    # mutant leg (`_mutant_tier`'s own default `train_probe_series` reads
+    # DESCENT, `[0.55, 0.5]`) must cite the table's own DESCENT-mapped sha
+    # here, or every such leg fails the new `train_direction` premise
+    # (missing-from-table, in fact, since an arbitrary test sha is never a
+    # member of this table at all -- see `RedProofDStarPremiseTests` below
+    # for the dedicated missing-sha/ascent-path coverage).
+    REDPROOF_DESCENT_SHA = "9b3c824dc041899c12c0e2d44d12a3ac8c7b86076ffc778638108925ba51bf4e"
+    REDPROOF_ASCENT_SHA = "c81d0ed59d45761bbd6487dbb23c5aaae22f30739c0e2e613d96c4901ad9b202"
+
+    def _write_alloff(self, raw_dir, seed, mean=0.50):
+        _write_finetune_run_leg(
+            raw_dir, seed, "alloff", "r1", _finetune_run_tier(arm="alloff", seed=seed, held_out_example_mean=mean)
+        )
+
+    def test_is_red_proof_dose_label(self):
+        self.assertTrue(ab_merge.is_red_proof_dose_label("redproof-nobc"))
+        self.assertTrue(ab_merge.is_red_proof_dose_label("redproof-signflip"))
+        self.assertTrue(ab_merge.is_red_proof_dose_label("redproof-"))
+        self.assertFalse(ab_merge.is_red_proof_dose_label("eps0.50"))
+        self.assertFalse(ab_merge.is_red_proof_dose_label("eps-0.10"))
+        self.assertFalse(ab_merge.is_red_proof_dose_label("bogus"))
+
+    def test_partition_splits_by_prefix_preserving_order(self):
+        columns = [
+            {"dose_label": "eps-0.50"},
+            {"dose_label": "redproof-nobc"},
+            {"dose_label": "eps0.50"},
+            {"dose_label": "redproof-signflip"},
+        ]
+        eps_cols, red_proof_cols = ab_merge.partition_red_proof_dose_columns(columns)
+        self.assertEqual([c["dose_label"] for c in eps_cols], ["eps-0.50", "eps0.50"])
+        self.assertEqual([c["dose_label"] for c in red_proof_cols], ["redproof-nobc", "redproof-signflip"])
+
+    def test_bare_redproof_prefix_is_refused(self):
+        columns = [{"dose_label": "redproof-"}]
+        with self.assertRaises(ab_merge.RedProofLabelError) as ctx:
+            ab_merge.partition_red_proof_dose_columns(columns)
+        self.assertIn("redproof-", str(ctx.exception))
+        self.assertIn("no mutant name", str(ctx.exception))
+
+    def test_whitespace_only_redproof_name_is_refused(self):
+        # unit-63 round-13 audit advisory (c): "redproof- " / "redproof-  "
+        # reads as non-empty by `==` against the bare prefix, so it passed
+        # this edge undetected pre-fix and only failed loudly downstream --
+        # refused HERE, at the same edge, naming the whitespace-name class
+        # alongside the bare-prefix class.
+        for label in ("redproof- ", "redproof-  ", "redproof-\t"):
+            columns = [{"dose_label": label}]
+            with self.assertRaises(ab_merge.RedProofLabelError) as ctx:
+                ab_merge.partition_red_proof_dose_columns(columns)
+            self.assertIn("whitespace-only", str(ctx.exception))
+
+    def test_eps_family_scans_never_call_dose_label_eps_on_a_redproof_label(self):
+        # a RED-proof label would raise inside `_dose_label_eps` (it never
+        # starts with "eps") -- proving the eps-family scans are unaffected
+        # by a co-scheduled RED-proof column means calling them on the
+        # PARTITIONED eps-only subset never raises.
+        eps_cols = [
+            {"dose_label": "eps-0.10", "detected": "not-detected"},
+            {"dose_label": "eps-0.50", "detected": "RED"},
+        ]
+        # sanity: calling these on the full (unpartitioned) set WOULD raise.
+        mixed = eps_cols + [{"dose_label": "redproof-nobc", "detected": "not-detected", "patch_sha256": "x"}]
+        with self.assertRaises(ab_merge.MutantDoseLadderSensitivityError):
+            ab_merge.mutant_dose_ladder_sensitivity(mixed)
+        # the partitioned eps-only subset is unaffected.
+        self.assertEqual(
+            ab_merge.mutant_dose_ladder_sensitivity(eps_cols),
+            {"lower": "eps-0.10", "higher": "eps-0.50"},
+        )
+        self.assertEqual(ab_merge.mutant_dose_ladder_two_sided_falsification(eps_cols), [])
+        self.assertEqual(ab_merge.mutant_dose_ladder_anomalies(eps_cols), [])
+
+    def test_build_red_proof_summary_proven_when_any_column_reads_red(self):
+        # direct dict fixtures -- `build_red_proof_summary` only reads the
+        # fields `build_mutant_dose_column` already computed, never
+        # re-derives them.
+        columns = [
+            {
+                "dose_label": "redproof-nobc",
+                "patch_sha256": "sha-nobc",
+                "detected": "not-detected",
+                "n_pos": 6,
+                "n_neg": 6,
+                "mean_d": 0.01,
+                "p_value": 1.0,
+                "clean_pair_count": 12,
+            },
+            {
+                "dose_label": "redproof-signflip",
+                "patch_sha256": "sha-signflip",
+                "detected": "RED",
+                "n_pos": 12,
+                "n_neg": 0,
+                "mean_d": 0.55,
+                "p_value": 0.0002,
+                "clean_pair_count": 12,
+            },
+        ]
+        red_proof, verdict = ab_merge.build_red_proof_summary(columns)
+        self.assertEqual(verdict, "PROVEN")
+        self.assertEqual(len(red_proof), 2)
+        self.assertEqual(
+            red_proof[1],
+            {
+                "dose_label": "redproof-signflip",
+                "patch_sha256": "sha-signflip",
+                "detected": "RED",
+                "n_pos": 12,
+                "n_neg": 0,
+                "mean_d": 0.55,
+                "p_value": 0.0002,
+                "clean_pair_count": 12,
+            },
+        )
+
+    def test_build_red_proof_summary_not_proven_names_every_column(self):
+        columns = [
+            {
+                "dose_label": "redproof-nobc",
+                "patch_sha256": "sha-nobc",
+                "detected": "not-detected",
+                "n_pos": 6,
+                "n_neg": 6,
+                "mean_d": 0.01,
+                "p_value": 1.0,
+                "clean_pair_count": 12,
+            },
+            {
+                "dose_label": "redproof-signflip",
+                "patch_sha256": "sha-signflip",
+                "detected": "not-detected",
+                "n_pos": 7,
+                "n_neg": 5,
+                "mean_d": 0.02,
+                "p_value": 0.5,
+                "clean_pair_count": 12,
+            },
+        ]
+        _red_proof, verdict = ab_merge.build_red_proof_summary(columns)
+        self.assertTrue(verdict.startswith("NOT_PROVEN"))
+        self.assertIn("redproof-nobc=not-detected", verdict)
+        self.assertIn("redproof-signflip=not-detected", verdict)
+
+    def test_build_red_proof_summary_records_red_for_investigation_as_is(self):
+        # a RED-proof column reading RED_FOR_INVESTIGATION is an anomaly for
+        # a mutant EXPECTED to degrade -- recorded as-is (its own 'detected'
+        # field), never counted toward PROVEN.
+        columns = [
+            {
+                "dose_label": "redproof-nobc",
+                "patch_sha256": "sha-nobc",
+                "detected": "RED_FOR_INVESTIGATION",
+                "n_pos": 1,
+                "n_neg": 11,
+                "mean_d": -0.30,
+                "p_value": 0.00635,
+                "clean_pair_count": 12,
+            },
+        ]
+        red_proof, verdict = ab_merge.build_red_proof_summary(columns)
+        self.assertEqual(red_proof[0]["detected"], "RED_FOR_INVESTIGATION")
+        self.assertTrue(verdict.startswith("NOT_PROVEN"))
+        self.assertIn("redproof-nobc=RED_FOR_INVESTIGATION", verdict)
+
+    def _write_redproof_leg(self, raw_dir, seeds, dose_label, patch_sha256, seed_to_mean, alloff_mean=0.50):
+        for seed in seeds:
+            self._write_alloff(raw_dir, seed, mean=alloff_mean)
+            _write_mutant_leg(
+                raw_dir,
+                seed,
+                dose_label,
+                _mutant_tier(seed=seed, held_out_example_mean=seed_to_mean(seed), mutant_patch_sha256=patch_sha256),
+            )
+
+    def test_cli_wiring_redproof_red_is_proven_with_rc_zero_and_green_primary(self):
+        # redproof column RED -> PROVEN + rc 0 (with a GREEN primary decision).
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                mutant_mean = 0.99 if seed != 12 else 0.10  # 11/12 degradation-concordant
+                # unit-63 round-15 audit advisory 6: `redproof-nobc`, stamped
+                # with M_nobc's own real sha (`REDPROOF_DESCENT_SHA`) --
+                # pre-fix this fixture used the "redproof-signflip" label
+                # with M_nobc's sha, a semantically inverted pairing (a
+                # signflip-labeled column stamped with nobc's sha); this is
+                # a synthetic CLI-wiring fixture (not a re-measurement of
+                # either mutant), so only the LABEL needed to change to make
+                # the label/sha pairing read true -- no assertion below
+                # (RED/PROVEN/rc/clean_pair_count) is weakened.
+                _write_mutant_leg(
+                    raw_dir,
+                    seed,
+                    "redproof-nobc",
+                    _mutant_tier(
+                        seed=seed, held_out_example_mean=mutant_mean, mutant_patch_sha256=self.REDPROOF_DESCENT_SHA
+                    ),
+                )
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    f"redproof-nobc:{self.REDPROOF_DESCENT_SHA}:{seeds_s}",
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 0)
+        self.assertEqual(merged["status"], "GREEN")
+        ladder = merged["mutant_dose_ladder"]
+        self.assertIsNone(ladder["sensitivity_error"])
+        self.assertEqual(ladder["doses"][0]["detected"], "RED")
+        self.assertEqual(ladder["red_proof"], [
+            {
+                "dose_label": "redproof-nobc",
+                "patch_sha256": self.REDPROOF_DESCENT_SHA,
+                "detected": "RED",
+                "n_pos": ladder["doses"][0]["n_pos"],
+                "n_neg": ladder["doses"][0]["n_neg"],
+                "mean_d": ladder["doses"][0]["mean_d"],
+                "p_value": ladder["doses"][0]["p_value"],
+                "clean_pair_count": 12,
+            }
+        ])
+        self.assertEqual(ladder["red_proof_verdict"], "PROVEN")
+
+    def test_cli_wiring_redproof_not_detected_is_not_proven_with_nonzero_rc(self):
+        # redproof not-detected -> NOT_PROVEN + rc != 0.
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                # against this seed's own alloff mean (0.50 for seed<=6,
+                # 0.40 otherwise): 10/12 positive-concordant (seeds 1-10),
+                # 2/12 negative-concordant (seeds 11-12) -- well under the
+                # 11/12 threshold in either direction, so this column reads
+                # not-detected regardless of the alloff baseline shift by
+                # seed group.
+                if seed <= 6:
+                    mutant_mean = 0.55  # vs alloff 0.50: +0.05
+                elif seed <= 10:
+                    mutant_mean = 0.45  # vs alloff 0.40: +0.05
+                else:
+                    mutant_mean = 0.35  # vs alloff 0.40: -0.05
+                _write_mutant_leg(
+                    raw_dir,
+                    seed,
+                    "redproof-nobc",
+                    _mutant_tier(
+                        seed=seed, held_out_example_mean=mutant_mean, mutant_patch_sha256=self.REDPROOF_DESCENT_SHA
+                    ),
+                )
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    f"redproof-nobc:{self.REDPROOF_DESCENT_SHA}:{seeds_s}",
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 1)
+        self.assertEqual(merged["status"], "GREEN")  # isolation: primary decision alone is GREEN
+        ladder = merged["mutant_dose_ladder"]
+        self.assertEqual(ladder["doses"][0]["detected"], "not-detected")
+        self.assertTrue(ladder["red_proof_verdict"].startswith("NOT_PROVEN"))
+        self.assertIn("redproof-nobc=not-detected", ladder["red_proof_verdict"])
+
+    def test_cli_wiring_redproof_and_eps_doses_co_scheduled_are_mutually_unaffected(self):
+        # redproof + eps doses co-scheduled -> eps scans unaffected by the
+        # redproof column and vice versa.
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                # eps-0.50 alone: 11/12 degradation-concordant -> RED,
+                # exactly this suite's own single-dose RED shape.
+                eps_mean = 0.70 if seed != 12 else 0.30
+                _write_mutant_leg(
+                    raw_dir, seed, "eps-0.50", _mutant_tier(seed=seed, held_out_example_mean=eps_mean, mutant_patch_sha256="sha-eps-neg50")
+                )
+                # redproof-nobc, stamped with M_nobc's own real sha
+                # (`REDPROOF_DESCENT_SHA`) -- unit-63 round-15 audit
+                # advisory 6: pre-fix this fixture used the "redproof-
+                # signflip" label with M_nobc's sha, a semantically
+                # inverted pairing; this is a synthetic CLI-wiring fixture
+                # (co-scheduling isolation, not a re-measurement of either
+                # mutant), so only the LABEL needed to change to make the
+                # label/sha pairing read true -- guaranteed-degradation
+                # shape -> RED, unchanged.
+                redproof_mean = 0.99 if seed != 12 else 0.10
+                _write_mutant_leg(
+                    raw_dir,
+                    seed,
+                    "redproof-nobc",
+                    _mutant_tier(
+                        seed=seed, held_out_example_mean=redproof_mean, mutant_patch_sha256=self.REDPROOF_DESCENT_SHA
+                    ),
+                )
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    f"eps-0.50:sha-eps-neg50:{seeds_s}",
+                    "--mutant-legs",
+                    f"redproof-nobc:{self.REDPROOF_DESCENT_SHA}:{seeds_s}",
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 0)
+        ladder = merged["mutant_dose_ladder"]
+        self.assertIsNone(ladder["sensitivity_error"])
+        # eps scan sees only the eps column -- a single negative-eps dose
+        # can never form a straddle pair (needs >=2), so `sensitivity` is
+        # null, unaffected by the co-scheduled redproof column's presence.
+        self.assertIsNone(ladder["sensitivity"])
+        self.assertEqual(ladder["dose_anomalies"], [])
+        self.assertEqual(ladder["two_sided_falsification"], [])
+        # redproof summary sees only the redproof column, unaffected by the
+        # co-scheduled eps column.
+        self.assertEqual(len(ladder["red_proof"]), 1)
+        self.assertEqual(ladder["red_proof"][0]["dose_label"], "redproof-nobc")
+        self.assertEqual(ladder["red_proof_verdict"], "PROVEN")
+        # both columns still appear, in full, in 'doses'.
+        detected_by_label = {d["dose_label"]: d["detected"] for d in ladder["doses"]}
+        self.assertEqual(detected_by_label, {"eps-0.50": "RED", "redproof-nobc": "RED"})
+
+    def test_cli_wiring_redproof_column_still_subject_to_duplicate_sha_refusal(self):
+        # a redproof-labeled column is still subject to the duplicate-PATCH_SHA
+        # arm of `mutant_dose_ladder_reject_duplicate_doses`, run over the
+        # FULL dose_columns set (never skipped for a RED-proof label).
+        shared_sha = "sha-shared-redproof-and-eps"
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                _write_mutant_leg(
+                    raw_dir, seed, "eps-0.50", _mutant_tier(seed=seed, held_out_example_mean=0.70, mutant_patch_sha256=shared_sha)
+                )
+                _write_mutant_leg(
+                    raw_dir, seed, "redproof-signflip", _mutant_tier(seed=seed, held_out_example_mean=0.70, mutant_patch_sha256=shared_sha)
+                )
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    f"eps-0.50:{shared_sha}:{seeds_s}",
+                    "--mutant-legs",
+                    f"redproof-signflip:{shared_sha}:{seeds_s}",
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 1)
+        ladder = merged["mutant_dose_ladder"]
+        self.assertIsNone(ladder["sensitivity"])
+        self.assertIsNotNone(ladder["sensitivity_error"])
+        self.assertIn("eps-0.50", ladder["sensitivity_error"])
+        self.assertIn("redproof-signflip", ladder["sensitivity_error"])
+        self.assertIn(shared_sha, ladder["sensitivity_error"])
+        self.assertIn("same mutant measured twice", ladder["sensitivity_error"])
+        # unit-63 round-13 audit F2: a RED-proof-labeled column WAS
+        # scheduled (`redproof-signflip`) but the dose set was refused
+        # (the duplicate-PATCH_SHA arm, before RED-proof evaluation ever
+        # ran) -- `red_proof_verdict` must NOT stay `null` (byte-identical
+        # to "no RED-proof column was ever scheduled"); it must carry an
+        # explicit NOT_PROVEN-class verdict naming the refusal.
+        self.assertIsNotNone(ladder["red_proof_verdict"])
+        self.assertTrue(ladder["red_proof_verdict"].startswith("NOT_PROVEN"))
+        self.assertIn("refused before RED-proof evaluation", ladder["red_proof_verdict"])
+        self.assertIn("same mutant measured twice", ladder["red_proof_verdict"])
+
+    def test_cli_wiring_redproof_rfi_recorded_with_named_anomaly(self):
+        # a redproof column reading RED_FOR_INVESTIGATION is recorded as-is
+        # (an anomaly for a mutant EXPECTED to degrade) -- never folded into
+        # 'dose_anomalies' (that list is eps-only), and never counted toward
+        # PROVEN.
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                # 11/12 read BETTER than alloff -- improvement-concordant,
+                # the opposite of this mutant's own predicted direction.
+                mutant_mean = 0.10 if seed != 12 else 0.90
+                _write_mutant_leg(
+                    raw_dir,
+                    seed,
+                    "redproof-nobc",
+                    _mutant_tier(
+                        seed=seed, held_out_example_mean=mutant_mean, mutant_patch_sha256=self.REDPROOF_DESCENT_SHA
+                    ),
+                )
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    f"redproof-nobc:{self.REDPROOF_DESCENT_SHA}:{seeds_s}",
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 1)
+        ladder = merged["mutant_dose_ladder"]
+        self.assertEqual(ladder["doses"][0]["detected"], "RED_FOR_INVESTIGATION")
+        self.assertEqual(ladder["dose_anomalies"], [])  # eps-only list, never a redproof member
+        self.assertEqual(ladder["red_proof"][0]["detected"], "RED_FOR_INVESTIGATION")
+        self.assertTrue(ladder["red_proof_verdict"].startswith("NOT_PROVEN"))
+        self.assertIn("redproof-nobc=RED_FOR_INVESTIGATION", ladder["red_proof_verdict"])
+
+    def test_cli_wiring_bare_redproof_prefix_is_refused(self):
+        # label "redproof-" bare -> refused.
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                _write_mutant_leg(
+                    raw_dir, seed, "redproof-", _mutant_tier(seed=seed, held_out_example_mean=0.70, mutant_patch_sha256="sha-bare")
+                )
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    f"redproof-:sha-bare:{seeds_s}",
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 1)
+        ladder = merged["mutant_dose_ladder"]
+        self.assertIsNone(ladder["sensitivity"])
+        self.assertIsNotNone(ladder["sensitivity_error"])
+        self.assertIn("redproof-", ladder["sensitivity_error"])
+        self.assertIn("no mutant name", ladder["sensitivity_error"])
+        # unit-63 round-13 audit F2: `partition_red_proof_dose_columns`
+        # itself is the raiser here -- `red_proof_dose_columns` never got
+        # assigned inside the try (it stays the pre-try `[]`) even though
+        # the raw `dose_columns` DID carry a RED-proof-prefixed label. The
+        # handler must still detect this off the RAW label, never off
+        # `red_proof_dose_columns` alone, and record an explicit
+        # NOT_PROVEN-class verdict rather than leaving `red_proof_verdict`
+        # `null`.
+        self.assertIsNotNone(ladder["red_proof_verdict"])
+        self.assertTrue(ladder["red_proof_verdict"].startswith("NOT_PROVEN"))
+        self.assertIn("refused before RED-proof evaluation", ladder["red_proof_verdict"])
+
+    def test_cli_wiring_refused_dose_set_without_any_redproof_label_keeps_verdict_null(self):
+        # unit-63 round-13 audit F2, the paired case: an eps-only dose set
+        # that is refused (no RED-proof label present anywhere in
+        # dose_columns) must leave `red_proof_verdict` exactly `null`,
+        # unchanged from today -- nothing to report, never a spurious
+        # NOT_PROVEN-class verdict invented for a family that was never
+        # scheduled.
+        shared_sha = "sha-shared-eps-only"
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                _write_mutant_leg(
+                    raw_dir, seed, "eps-0.50", _mutant_tier(seed=seed, held_out_example_mean=0.70, mutant_patch_sha256=shared_sha)
+                )
+                _write_mutant_leg(
+                    raw_dir, seed, "eps-0.10", _mutant_tier(seed=seed, held_out_example_mean=0.70, mutant_patch_sha256=shared_sha)
+                )
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    f"eps-0.50:{shared_sha}:{seeds_s}",
+                    "--mutant-legs",
+                    f"eps-0.10:{shared_sha}:{seeds_s}",
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertEqual(rc, 1)
+        ladder = merged["mutant_dose_ladder"]
+        self.assertIsNotNone(ladder["sensitivity_error"])
+        self.assertIn("same mutant measured twice", ladder["sensitivity_error"])
+        self.assertIsNone(ladder["red_proof_verdict"])
+        self.assertEqual(ladder["red_proof"], [])
+
+
+class RedProofDStarPremiseTests(unittest.TestCase):
+    """CONTRACT amendment 2026-08-29e (D*): the learning-happened premise
+    decomposed into `training_effective`/`train_direction`, the committed
+    `RED_PROOF_EXPECTED_TRAIN_DIRECTION` table, and the new
+    `init_anchor_equality` premise for RED-proof mutant legs. The primary
+    A/B, lr0-control, and alloff-partner call sites are proven
+    behavior-identical by the (unmodified except message-text) 222 tests
+    this suite already carried before this class -- this class covers only
+    the NEW behavior D* adds.
+    """
+
+    ASCENT_SHA = "c81d0ed59d45761bbd6487dbb23c5aaae22f30739c0e2e613d96c4901ad9b202"
+    DESCENT_SHA = "9b3c824dc041899c12c0e2d44d12a3ac8c7b86076ffc778638108925ba51bf4e"
+
+    def _write_alloff(self, raw_dir, seed, mean=0.50, train_probe_series=None):
+        overrides = {"held_out_example_mean": mean}
+        if train_probe_series is not None:
+            overrides["train_probe_series"] = train_probe_series
+        _write_finetune_run_leg(
+            raw_dir, seed, "alloff", "r1", _finetune_run_tier(arm="alloff", seed=seed, **overrides)
+        )
+
+    def test_red_proof_expected_train_direction_table_pinned(self):
+        # The table itself, pinned exactly -- a change here is a change to
+        # this amendment's own committed basis, never an incidental refactor.
+        self.assertEqual(
+            ab_merge.RED_PROOF_EXPECTED_TRAIN_DIRECTION,
+            {
+                self.ASCENT_SHA: "ascent",
+                self.DESCENT_SHA: "descent",
+            },
+        )
+        self.assertEqual(ab_merge.FINETUNE_RUN_TRAIN_DIRECTION_ASCENT, "ascent")
+        self.assertEqual(ab_merge.FINETUNE_RUN_TRAIN_DIRECTION_DESCENT, "descent")
+
+    def test_expected_direction_defaults_descent_for_non_redproof_label(self):
+        direction, violation = ab_merge.red_proof_expected_train_direction("eps-0.50", "anything-at-all")
+        self.assertEqual(direction, ab_merge.FINETUNE_RUN_TRAIN_DIRECTION_DESCENT)
+        self.assertIsNone(violation)
+
+    def test_expected_direction_looks_up_case_folded_and_stripped(self):
+        direction, violation = ab_merge.red_proof_expected_train_direction(
+            "redproof-signflip-v2", f"  {self.ASCENT_SHA.upper()}  "
+        )
+        self.assertEqual(direction, "ascent")
+        self.assertIsNone(violation)
+
+    def test_expected_direction_missing_sha_is_refused_never_defaulted(self):
+        direction, violation = ab_merge.red_proof_expected_train_direction("redproof-bogus", "deadbeef" * 8)
+        self.assertIsNone(direction)
+        self.assertIsNotNone(violation)
+        self.assertIn("not present", violation)
+        self.assertIn("RED_PROOF_EXPECTED_TRAIN_DIRECTION", violation)
+
+    def test_ascent_redproof_mutant_leg_with_ascending_series_clears_learning_happened(self):
+        # The amendment's own core discharge: a RED-proof mutant whose
+        # train probe ASCENDS (gradient ascent, by design) must no longer be
+        # refused by a descent-only learning-happened check. series[0]
+        # matches `_finetune_run_tier`'s own default alloff init (0.55) so
+        # `init_anchor_equality` also clears.
+        tier = _mutant_tier(train_probe_series=[0.55, 20.25], mutant_patch_sha256=self.ASCENT_SHA)
+        violations = ab_merge.finetune_run_mutant_column_violations("redproof-signflip-v2", self.ASCENT_SHA, tier)
+        self.assertEqual(violations, [])
+
+    def test_same_ascending_series_fails_under_the_default_descent_direction(self):
+        # Negative control: WITHOUT the ascent-direction override (the
+        # pre-amendment shape, and still the correct behaviour for every
+        # non-RED-proof leg), an ascending series fails train_direction.
+        tier = _mutant_tier(train_probe_series=[0.55, 20.25])
+        violations = ab_merge.finetune_run_arm_premise_violations("fused", tier)
+        self.assertTrue(any("train_direction" in m and "descent" in m for m in violations), violations)
+
+    def test_missing_table_sha_is_a_named_violation_on_the_mutant_leg(self):
+        unlisted_sha = "deadbeef" * 8
+        tier = _mutant_tier(mutant_patch_sha256=unlisted_sha)
+        violations = ab_merge.finetune_run_mutant_column_violations("redproof-unknown", unlisted_sha, tier)
+        self.assertTrue(
+            any("RED_PROOF_EXPECTED_TRAIN_DIRECTION" in v and "not present" in v for v in violations), violations
+        )
+
+    def test_missing_table_sha_invalidates_the_whole_column_never_defaulted(self):
+        # Every seed shares the SAME (missing) patch_sha256, so every leg in
+        # the column fails -- clean_pair_count collapses to 0 -> INVALID,
+        # never silently defaulted to a descent (or any other) direction.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            unlisted_sha = "deadbeef" * 8
+            for seed in (1, 2):
+                self._write_alloff(raw_dir, seed)
+                _write_mutant_leg(
+                    raw_dir, seed, "redproof-unknown", _mutant_tier(seed=seed, mutant_patch_sha256=unlisted_sha)
+                )
+            column = ab_merge.build_mutant_dose_column(raw_dir, "redproof-unknown", unlisted_sha, [1, 2])
+        self.assertEqual(column["detected"], "INVALID")
+        self.assertEqual(column["clean_pair_count"], 0)
+        self.assertTrue(any("RED_PROOF_EXPECTED_TRAIN_DIRECTION" in v for v in column["violations"]))
+
+    def test_missing_table_sha_violation_is_prefixed_exactly_once(self):
+        # unit-63 round-15 audit advisory 5: `red_proof_expected_train_
+        # direction`'s own missing-sha message self-prefixed with
+        # `dose_label` and got prefixed AGAIN by `build_mutant_dose_column`
+        # (`f"{dose_label} seed {seed}: {v}"`) -- doubled `dose_label` in
+        # the committed artifact pre-fix. Every OTHER leg-violation message
+        # in this module (e.g. the `mutant_id`/`mutant_patch_sha256`
+        # messages) is unprefixed at its own site and prefixed exactly once
+        # by the builder; this message must match that shape.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            unlisted_sha = "deadbeef" * 8
+            for seed in (1, 2):
+                self._write_alloff(raw_dir, seed)
+                _write_mutant_leg(
+                    raw_dir, seed, "redproof-unknown", _mutant_tier(seed=seed, mutant_patch_sha256=unlisted_sha)
+                )
+            column = ab_merge.build_mutant_dose_column(raw_dir, "redproof-unknown", unlisted_sha, [1, 2])
+        for v in column["violations"]:
+            if "RED_PROOF_EXPECTED_TRAIN_DIRECTION" in v:
+                self.assertEqual(v.count("redproof-unknown"), 1, v)
+                self.assertTrue(v.startswith("redproof-unknown seed "), v)
+
+    def test_init_anchor_equality_mismatch_is_a_violation(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            seed = 1
+            self._write_alloff(raw_dir, seed)  # default train_probe_series[0] == 0.55
+            _write_mutant_leg(
+                raw_dir,
+                seed,
+                "redproof-nobc",
+                _mutant_tier(
+                    seed=seed,
+                    mutant_patch_sha256=self.DESCENT_SHA,
+                    train_probe_series=[0.60, 0.50],  # series[0]=0.60 != alloff's 0.55
+                ),
+            )
+            column = ab_merge.build_mutant_dose_column(raw_dir, "redproof-nobc", self.DESCENT_SHA, [seed])
+        self.assertTrue(any("init_anchor_equality" in v for v in column["violations"]), column["violations"])
+        self.assertIsNone(column["per_seed"]["1"]["d_i"])
+
+    def test_init_anchor_equality_violation_is_prefixed_exactly_once(self):
+        # unit-63 round-15 audit advisory 5: the `init_anchor_equality`
+        # violation self-prefixed with `f"{dose_label} seed {seed}: "` and
+        # got prefixed AGAIN by `build_mutant_dose_column` -- doubled BOTH
+        # `dose_label` and `seed` in the committed artifact pre-fix.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            seed = 1
+            self._write_alloff(raw_dir, seed)  # default train_probe_series[0] == 0.55
+            _write_mutant_leg(
+                raw_dir,
+                seed,
+                "redproof-nobc",
+                _mutant_tier(
+                    seed=seed,
+                    mutant_patch_sha256=self.DESCENT_SHA,
+                    train_probe_series=[0.60, 0.50],  # series[0]=0.60 != alloff's 0.55
+                ),
+            )
+            column = ab_merge.build_mutant_dose_column(raw_dir, "redproof-nobc", self.DESCENT_SHA, [seed])
+        for v in column["violations"]:
+            if "init_anchor_equality" in v:
+                self.assertEqual(v.count("redproof-nobc"), 1, v)
+                self.assertEqual(v.count("seed 1"), 1, v)
+                self.assertEqual(v, f"redproof-nobc seed {seed}: " + v.split(": ", 1)[1])
+                self.assertTrue(v.startswith(f"redproof-nobc seed {seed}: RED-proof mutant leg's"), v)
+
+    def test_init_anchor_equality_holds_when_series_zero_matches(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            seed = 1
+            self._write_alloff(raw_dir, seed)  # default train_probe_series[0] == 0.55
+            _write_mutant_leg(
+                raw_dir,
+                seed,
+                "redproof-nobc",
+                _mutant_tier(
+                    seed=seed,
+                    held_out_example_mean=0.30,  # != alloff's default 0.50 (a nonzero, non-tied d_i)
+                    mutant_patch_sha256=self.DESCENT_SHA,
+                    train_probe_series=[0.55, 0.40],
+                ),
+            )
+            column = ab_merge.build_mutant_dose_column(raw_dir, "redproof-nobc", self.DESCENT_SHA, [seed])
+        # single-seed column: `clean_pair_count != MUTANT_GATE_SEED_COUNT`
+        # (12) is its own, EXPECTED violation here -- this test's own point
+        # is that THIS seed's own leg-level violations stay empty (matching
+        # init anchors), never that the whole 1-seed column reads clean.
+        self.assertEqual(column["per_seed"]["1"]["violations"], [])
+
+    def test_init_anchor_equality_never_checked_for_eps_family_columns(self):
+        # eps-family (non-RED-proof) dose columns keep today's behaviour:
+        # mismatched init anchors are never checked (D* scopes
+        # `init_anchor_equality` to RED-proof-labeled columns only).
+        with tempfile.TemporaryDirectory() as raw_dir:
+            seed = 1
+            self._write_alloff(raw_dir, seed)  # default train_probe_series[0] == 0.55
+            _write_mutant_leg(
+                raw_dir,
+                seed,
+                "eps0.50",
+                _mutant_tier(
+                    seed=seed,
+                    held_out_example_mean=0.30,  # != alloff's default 0.50 (a nonzero, non-tied d_i)
+                    train_probe_series=[0.60, 0.50],  # mismatched vs alloff's 0.55 -- irrelevant here
+                ),
+            )
+            column = ab_merge.build_mutant_dose_column(raw_dir, "eps0.50", "eps0-02-patch-sha", [seed])
+        self.assertEqual(column["per_seed"]["1"]["violations"], [])
+
+    def test_alloff_partner_premises_stay_descent_even_on_a_redproof_column(self):
+        # "Alloff partner premises unchanged" (amendment 2026-08-29e): an
+        # alloff partner leg whose OWN probe reads ascent-shaped still fails
+        # -- the ascent allowance is scoped to the RED-proof MUTANT leg only,
+        # never propagated to its alloff partner.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            seed = 1
+            self._write_alloff(raw_dir, seed, train_probe_series=[0.55, 20.25])  # alloff itself ascends
+            _write_mutant_leg(
+                raw_dir,
+                seed,
+                "redproof-signflip-v2",
+                _mutant_tier(seed=seed, mutant_patch_sha256=self.ASCENT_SHA, train_probe_series=[0.55, 20.25]),
+            )
+            column = ab_merge.build_mutant_dose_column(raw_dir, "redproof-signflip-v2", self.ASCENT_SHA, [seed])
+        self.assertTrue(any("learning_happened" in v or "train_direction" in v for v in column["violations"]), column["violations"])
+
+    def test_end_to_end_ascent_redproof_column_reads_red_via_cli_main(self):
+        # The amendment's own pre-registered prediction shape (mutants/
+        # README.md's M_signflip_v2): 12/12 legs ascend, matching the
+        # table's own `ascent` declaration, init anchors bit-identical, held-
+        # out loss degrades on every seed but one -> RED.
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            for seed in range(1, 13):
+                # the primary A/B campaign's own fused/alloff r1/r2 legs --
+                # isolation: this test's own point is the RED-proof column,
+                # so the primary decision itself just needs to be premise-
+                # clean (its own status is asserted separately below).
+                fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+                for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                    for repeat in ("r1", "r2"):
+                        _write_finetune_run_leg(
+                            raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                        )
+                # the dose column's own reused alloff `r1` leg -- the SAME
+                # leg the primary campaign already wrote above (alloff_mean),
+                # re-anchored to `train_probe_series[0] == 0.55` (the
+                # `_finetune_run_tier` default every leg above already used).
+                mutant_mean = 0.99 if seed != 12 else 0.10  # 11/12 degradation-concordant
+                _write_mutant_leg(
+                    raw_dir,
+                    seed,
+                    "redproof-signflip-v2",
+                    _mutant_tier(
+                        seed=seed,
+                        held_out_example_mean=mutant_mean,
+                        mutant_patch_sha256=self.ASCENT_SHA,
+                        train_probe_series=[0.55, 20.25],  # ascends; init-anchored to alloff's own 0.55
+                    ),
+                )
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            rc = ab_merge.main(
+                [
+                    "finetune-run",
+                    raw_dir,
+                    out_dir,
+                    seeds_s,
+                    "",
+                    "--allow-missing-lr0-control",
+                    "--mutant-legs",
+                    f"redproof-signflip-v2:{self.ASCENT_SHA}:{seeds_s}",
+                ]
+            )
+            with open(os.path.join(out_dir, "finetune_run_ab_report.json")) as fh:
+                merged = json.load(fh)
+        ladder = merged["mutant_dose_ladder"]
+        self.assertEqual(ladder["doses"][0]["violations"], [])
+        self.assertEqual(ladder["doses"][0]["clean_pair_count"], 12)
+        self.assertEqual(ladder["doses"][0]["detected"], "RED")
+        self.assertEqual(ladder["red_proof_verdict"], "PROVEN")
+        self.assertEqual(rc, 0)
+
+
+class DoseLadderCausesRuntimeCheckSurvivesDashOTests(unittest.TestCase):
+    """Unit-63 round-15 audit advisory 4: `main()`'s own runtime binding of
+    `dose_ladder_causes` to the committed `DOSE_LADDER_EXIT_CAUSE_NAMES` set
+    used to be a bare `assert`, which `python -O` strips entirely -- the
+    exact deployment shape (`-O`) that removes the safety net without
+    removing the code path it protects. It is now an explicit `if`/`raise
+    AssertionError`. Proven here by running the REAL `ab_merge.py` as a
+    subprocess (under `python -O`, the shape this fix specifically targets)
+    against a real fixture directory, with `DOSE_LADDER_EXIT_CAUSE_NAMES`
+    monkeypatched to a deliberately drifted set from a tiny runner script --
+    the check still fires and the process exits non-zero with the named
+    message on stderr, exactly as it would without `-O`.
+    """
+
+    def _write_fixture(self, raw_dir):
+        # Minimal real fixture: one clean 12-seed primary A/B plus one
+        # `redproof-nobc` mutant dose column -- enough for `main()`'s own
+        # dose-ladder fold (the code path under test) to actually run.
+        redproof_sha = "9b3c824dc041899c12c0e2d44d12a3ac8c7b86076ffc778638108925ba51bf4e"
+        for seed in range(1, 13):
+            fused_mean, alloff_mean = (0.30, 0.50) if seed <= 6 else (0.55, 0.40)
+            for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+                for repeat in ("r1", "r2"):
+                    _write_finetune_run_leg(
+                        raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                    )
+            mutant_mean = 0.99 if seed != 12 else 0.10
+            _write_mutant_leg(
+                raw_dir,
+                seed,
+                "redproof-nobc",
+                _mutant_tier(seed=seed, held_out_example_mean=mutant_mean, mutant_patch_sha256=redproof_sha),
+            )
+        return redproof_sha
+
+    def test_drifted_cause_names_still_raises_under_dash_o(self):
+        perf_dir = os.path.dirname(os.path.abspath(ab_merge.__file__))
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            redproof_sha = self._write_fixture(raw_dir)
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            runner = os.path.join(raw_dir, "_runner.py")
+            with open(runner, "w") as fh:
+                fh.write(
+                    "import sys\n"
+                    f"sys.path.insert(0, {perf_dir!r})\n"
+                    "import ab_merge\n"
+                    "# deliberately drift the committed constant, simulating a fifth\n"
+                    "# cause added to dose_ladder_causes without updating this set.\n"
+                    "ab_merge.DOSE_LADDER_EXIT_CAUSE_NAMES = ('bogus_drifted_cause',)\n"
+                    "ab_merge.main([\n"
+                    "    'finetune-run',\n"
+                    f"    {raw_dir!r},\n"
+                    f"    {out_dir!r},\n"
+                    f"    {seeds_s!r},\n"
+                    "    '',\n"
+                    "    '--allow-missing-lr0-control',\n"
+                    "    '--mutant-legs',\n"
+                    f"    'redproof-nobc:{redproof_sha}:{seeds_s}',\n"
+                    "])\n"
+                )
+            proc = subprocess.run(
+                [sys.executable, "-O", runner],
+                capture_output=True,
+                text=True,
+            )
+        self.assertNotEqual(proc.returncode, 0, msg=f"stdout={proc.stdout!r} stderr={proc.stderr!r}")
+        self.assertIn("AssertionError", proc.stderr)
+        self.assertIn("dose_ladder_causes drifted from the committed DOSE_LADDER_EXIT_CAUSE_NAMES set", proc.stderr)
+
+    def test_drifted_cause_names_raises_identically_without_dash_o(self):
+        # negative control: same behaviour with or without -O, proving the
+        # fix (an explicit if/raise) is not itself sensitive to the flag --
+        # only a bare `assert` would have differed between the two runs.
+        perf_dir = os.path.dirname(os.path.abspath(ab_merge.__file__))
+        with tempfile.TemporaryDirectory() as raw_dir, tempfile.TemporaryDirectory() as out_dir:
+            redproof_sha = self._write_fixture(raw_dir)
+            seeds_s = ",".join(str(s) for s in range(1, 13))
+            runner = os.path.join(raw_dir, "_runner.py")
+            with open(runner, "w") as fh:
+                fh.write(
+                    "import sys\n"
+                    f"sys.path.insert(0, {perf_dir!r})\n"
+                    "import ab_merge\n"
+                    "ab_merge.DOSE_LADDER_EXIT_CAUSE_NAMES = ('bogus_drifted_cause',)\n"
+                    "ab_merge.main([\n"
+                    "    'finetune-run',\n"
+                    f"    {raw_dir!r},\n"
+                    f"    {out_dir!r},\n"
+                    f"    {seeds_s!r},\n"
+                    "    '',\n"
+                    "    '--allow-missing-lr0-control',\n"
+                    "    '--mutant-legs',\n"
+                    f"    'redproof-nobc:{redproof_sha}:{seeds_s}',\n"
+                    "])\n"
+                )
+            proc = subprocess.run(
+                [sys.executable, runner],
+                capture_output=True,
+                text=True,
+            )
+        self.assertNotEqual(proc.returncode, 0, msg=f"stdout={proc.stdout!r} stderr={proc.stderr!r}")
+        self.assertIn("AssertionError", proc.stderr)
+        self.assertIn("dose_ladder_causes drifted from the committed DOSE_LADDER_EXIT_CAUSE_NAMES set", proc.stderr)
+
+
+class FinetuneRunStatusRuntimeGuardTests(unittest.TestCase):
+    """Unit-63 round-16 audit (identity-completeness): `build_finetune_run_
+    report`'s own status fold now assigns FROM the named `FINETUNE_RUN_
+    STATUS_*` constants (never a re-typed literal, see `ab_merge.py`'s own
+    doc above `FINETUNE_RUN_STATUSES`) AND carries a runtime membership
+    guard -- `status not in FINETUNE_RUN_STATUSES` raises `AssertionError`
+    immediately, at the point of production.
+
+    This is the producer-side belt the round-16 audit's exact falsifier
+    named: a status value the fold computes that is not a member of the
+    committed `FINETUNE_RUN_STATUSES` set must fail LOUDLY, never flow
+    silently into the artifact. Proven here WITHOUT hand-editing the fold's
+    own branches (which would require reverting a source edit between test
+    runs) by monkeypatching the module-level `FINETUNE_RUN_STATUSES` tuple
+    itself to a set that no longer contains the status a real, unmodified
+    fixture drives the fold to compute -- from the guard's own point of
+    view this is indistinguishable from "a fold branch assigns a status
+    outside the committed set", which is exactly the invariant under test.
+    """
+
+    def _write_clean_green_seed(self, raw_dir, seed, fused_mean, alloff_mean):
+        for arm, mean in (("fused", fused_mean), ("alloff", alloff_mean)):
+            for repeat in ("r1", "r2"):
+                _write_finetune_run_leg(
+                    raw_dir, seed, arm, repeat, _finetune_run_tier(arm=arm, seed=seed, held_out_example_mean=mean)
+                )
+
+    def _write_green_fixture(self, raw_dir):
+        means = {
+            1: (0.30, 0.50),
+            2: (0.32, 0.48),
+            3: (0.29, 0.55),
+            4: (0.31, 0.47),
+            5: (0.28, 0.52),
+            6: (0.33, 0.49),
+            7: (0.27, 0.53),
+            8: (0.55, 0.40),
+            9: (0.52, 0.38),
+            10: (0.58, 0.42),
+            11: (0.50, 0.35),
+            12: (0.54, 0.39),
+        }
+        for seed, (fused_mean, alloff_mean) in means.items():
+            self._write_clean_green_seed(raw_dir, seed, fused_mean, alloff_mean)
+        return list(means.keys())
+
+    def test_guard_is_silent_on_the_real_unperturbed_vocabulary(self):
+        # Control: an ordinary GREEN merge, guard untouched, must not raise.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            seeds = self._write_green_fixture(raw_dir)
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, seeds, allow_missing_lr0_control=True)
+        self.assertEqual(merged["status"], "GREEN")
+
+    def test_a_status_outside_the_committed_set_raises_immediately(self):
+        # The falsifier: from the guard's perspective, a status value the
+        # fold computes that is missing from `FINETUNE_RUN_STATUSES` (here
+        # simulated by shrinking the committed set out from under a real
+        # GREEN-producing fixture, rather than hand-editing the fold's own
+        # branches) must raise AssertionError, never flow silently through.
+        original = ab_merge.FINETUNE_RUN_STATUSES
+        ab_merge.FINETUNE_RUN_STATUSES = tuple(s for s in original if s != "GREEN")
+        try:
+            with tempfile.TemporaryDirectory() as raw_dir:
+                seeds = self._write_green_fixture(raw_dir)
+                with self.assertRaises(AssertionError) as ctx:
+                    ab_merge.build_finetune_run_report(raw_dir, seeds, allow_missing_lr0_control=True)
+            self.assertIn("not a member of the committed FINETUNE_RUN_STATUSES", str(ctx.exception))
+            self.assertIn("'GREEN'", str(ctx.exception))
+        finally:
+            ab_merge.FINETUNE_RUN_STATUSES = original
+
+    def test_guard_restored_after_perturbation_is_silent_again(self):
+        # Belt-and-suspenders: `unittest`'s default loader sorts test
+        # methods alphabetically by name within a `TestCase`, so this test
+        # (`test_guard_restored_after_perturbation_is_silent_again`) runs
+        # AFTER the perturbing test above
+        # (`test_a_status_outside_the_committed_set_raises_immediately`,
+        # which sorts first alphabetically -- "a_status" < "guard_restored")
+        # -- the SAME fixture is GREEN again once the constant is restored,
+        # so a `finally` restore that failed to run (leaking the monkeypatch
+        # into this later test) would fail this assertion.
+        with tempfile.TemporaryDirectory() as raw_dir:
+            seeds = self._write_green_fixture(raw_dir)
+            merged, _table = ab_merge.build_finetune_run_report(raw_dir, seeds, allow_missing_lr0_control=True)
+        self.assertEqual(merged["status"], "GREEN")
+
+
+class FinetuneAbVerdictInvalidPrefixNamedConstantTests(unittest.TestCase):
+    """Unit-63 round-17 audit advisory (class sibling of the
+    `MUTANT_DOSE_DETECTED_*`/`RED_PROOF_VERDICT_*` fixes): `build_report`'s
+    own `verdict` INVALID prefix (both production sites -- the
+    fused-dispatch-proof branch and the leg-premise-mismatch branch) and
+    `main()`'s own `.startswith(...)` consumption of it now all read
+    `ab_merge.FINETUNE_AB_VERDICT_INVALID_PREFIX`, never a re-typed
+    `"INVALID"` literal. Pinned end-to-end through the real
+    `ab_merge.main` entry point (the same fixture
+    `FusedProofFixtureTests.test_all_zero_no` already exercises), proving
+    the constant's OWN value is what both the producer and the consumer
+    agree on, not merely that the constant equals the string `"INVALID"`
+    in isolation.
+    """
+
+    def test_constant_is_the_literal_invalid(self):
+        self.assertEqual(ab_merge.FINETUNE_AB_VERDICT_INVALID_PREFIX, "INVALID")
+
+    def test_build_report_invalid_verdict_and_mains_own_exit_gate_agree_with_the_constant(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            write_ok_config(raw_dir, "b8-s128-d0", {})  # all-(0, 0) -> INVALID, see test_all_zero_no
+            out_dir = tempfile.mkdtemp()
+            rc = ab_merge.main([raw_dir, out_dir, "20", "5", "0.9"])
+            with open(os.path.join(out_dir, "finetune_ab_report.json")) as fh:
+                merged = json.load(fh)
+        self.assertTrue(
+            merged["configs"]["b8-s128-d0"]["verdict"].startswith(ab_merge.FINETUNE_AB_VERDICT_INVALID_PREFIX)
+        )
+        self.assertEqual(rc, 1, "main()'s own exit-code gate must agree with the same named prefix")
 
 
 if __name__ == "__main__":

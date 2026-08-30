@@ -997,6 +997,37 @@ jobs:
           # mechanism (rounds 2-3).
           - name: perf claims sweep
             cmd: python3 ci/scripts/check_perf_claims.py --sweep
+          # esc-065's write-time oracle — COVERAGE EXTENSION of rule (h) to
+          # a record shape rule (h) never scoped: prose/table claims under
+          # docs/plans/63-how-well/measurements/**/README.md and the
+          # mutants/README.md "Measured" records. Reuses rule (h)'s
+          # resolution core by IMPORT (pointer walk, exclusion-span
+          # tokenizer, Decimal/ROUND_HALF_EVEN equality generalized for
+          # scientific notation); new grammar (derived aggregates, the
+          # cross-file raw-concordance recipe, relational/interval claims,
+          # a `hist` quote marker) covers what rule (h)'s own grammar has
+          # no equivalent for. INVERTED (allowlist-free) coverage model:
+          # every line of every in-scope file is a candidate by default: a
+          # pinned per-file FILE_TOKEN_DENOMINATOR (whole-file token
+          # coverage, replacing the old per-zone CLAIM_ZONE_DENOMINATOR
+          # this comment used to name — the zone allowlist itself was
+          # removed), a pinned per-file FENCE_LINE_DENOMINATOR plus a
+          # fence-delimiter PARITY check (an unclosed/widened ``` fence
+          # cannot silently carve out scanning), an unused-ledger-entry
+          # leg (an escape row consumed by nothing is itself a finding),
+          # and the independent-leaf ambiguity scan, with a closed
+          # MIRROR-EXEMPTION list for the one known legitimate
+          # same-artifact duplicate.
+          - name: measurement claims
+            cmd: python3 ci/scripts/check_measurement_claims.py
+          - name: measurement claims self-test
+            cmd: python3 ci/scripts/check_measurement_claims.py --self-test
+          # ci/measurement_claims_allowlist.txt is only-shrinks, the exact
+          # ci/perf_claims_allowlist.txt ratchet shape reused verbatim.
+          # Bootstrap (no allowlist file on origin/main yet) is the one PR
+          # introducing it.
+          - name: measurement claims allowlist only shrinks
+            cmd: python3 ci/scripts/check_measurement_claims.py --check-allowlist-only-shrinks
           # Mocks-only, no-network regression suite for the 2026-08-25
           # gpu-dev pod-lifecycle incident (ledger rows 279-289) and the
           # mechanism defects three follow-up audit rounds found in this
@@ -1131,6 +1162,21 @@ jobs:
             cmd: python3 ci/scripts/perf/check_producer_provenance_gates.py
           - name: producer provenance gates self-test
             cmd: python3 ci/scripts/perf/check_producer_provenance_gates.py --self-test
+          # Hermetic self-consistency guard for the committed how-well
+          # held-out fixture (unit 63, CONTRACT H3, audit finding 3 advisory
+          # (e)): no network, no re-mining -- proves heldout_pairs.jsonl's
+          # ids equal heldout_ids.txt's exactly and in order,
+          # manifest.json's heldout_ids_sha256/dataset_sha256 both recompute
+          # clean from committed content alone (the train side reuses its
+          # own already-committed per-pair hash from train_ids_sha256.json,
+          # never needing the uncommitted train text), and NOTICE exists.
+          # Strictly weaker than, and complementary to,
+          # derive_heldout_fixture.py --check's network-backed re-derivation
+          # -- this is the leg that can run on every PR.
+          - name: heldout fixture integrity
+            cmd: python3 ci/scripts/perf/check_heldout_fixture_integrity.py
+          - name: heldout fixture integrity self-test
+            cmd: python3 ci/scripts/perf/check_heldout_fixture_integrity.py --self-test
           # jammi-vs-torch gradient-oracle comparator's own math/refusal
           # suite (F6, PR #372 audit round): stdlib-only (`unittest`), no
           # torch/numpy required — `compare_grad_oracle.py`'s own module
@@ -1148,6 +1194,16 @@ jobs:
           # zero-execution gap as `compare_grad_oracle`'s suite above.
           - name: perf ab_merge suite
             cmd: python3 ci/scripts/perf/test_ab_merge.py
+          # `runpod_gpu_howwell.sh`'s GREEN-but-nonzero cause namer (unit-63
+          # round-13 audit F1), extracted out of that script's own inline
+          # python heredoc into a real, testable module
+          # (`howwell_dose_ladder_cause.py`) -- drives `dose_ladder_cause`
+          # against synthetic report dicts covering every one of `ab_merge.
+          # py`'s own four dose-ladder exit-code causes plus the all-clear
+          # fallback, same "zero-execution is RED, not a skip" reasoning as
+          # the two suites above.
+          - name: howwell dose ladder cause namer suite
+            cmd: python3 ci/scripts/test_howwell_dose_ladder_cause.py
           # Unification contract C4.2 (unit 61 phase 1): `ab_merge.py`'s
           # `FINETUNE_IDENTITY_FIELDS` and `compare_grad_oracle.py`'s
           # `RUN_IDENTITY_FIELDS` — the two jammi-vs-torch COMPARISON tuples,

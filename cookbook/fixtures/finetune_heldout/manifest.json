@@ -1,0 +1,33 @@
+{
+  "batch_size_candidates": {
+    "chapter_config_build_finetune_cache_py": 32,
+    "engine_default_FineTuneConfig": 8
+  },
+  "batch_size_flagged_for_lead_confirmation": true,
+  "contract_item": "H3",
+  "dataset_sha256": "9d9d9921f74c1d88ba2f2dd0b6d8859bfab16b3e6866b546b8b3ef53b8cd5907",
+  "heldout_ids_sha256": "8b6bf66fda0bb2e1a7061666b0396a748449610cc0567b011d408d69f7a3d55a",
+  "n_heldout": 128,
+  "n_heldout_is_multiple_of_all_candidates": true,
+  "n_pairs": 1500,
+  "n_train": 1372,
+  "provenance": {
+    "arxiv_subset_ids_sha256": "6d158e5f5f9284189ca8e9a3fcbc0169ffa1cd907c531e89d1155a4b251d7ec4",
+    "committed_subset_ids_file": "cookbook/fixtures/finetune_heldout/arxiv_subset_ids.txt",
+    "committed_subset_ids_file_vendored_from": "cookbook/book/data/ids/arxiv.txt",
+    "license": "ODC-BY 1.0 (Open Graph Benchmark); see cookbook/fixtures/finetune_heldout/NOTICE.",
+    "produced_by": "cookbook/book/scripts/derive_heldout_fixture.py (book-side producer of this engine-owned fixture, mirroring cookbook/book/scripts/build_finetune_cache.py::mine_supervision without the db/parquet side effects)",
+    "source_titleabs": {
+      "sha256": "7bce99ab3e1604277f12dd49f6e17a0d89867b29ea152f072c0e709ae0bc8ed7",
+      "url": "https://snap.stanford.edu/ogb/data/misc/ogbn_arxiv/titleabs.tsv.gz"
+    },
+    "source_zip": {
+      "sha256": "49f85c801589ecdcc52cfaca99693aaea7b8af16a9ac3f41dd85a5f3193fe276",
+      "url": "http://snap.stanford.edu/ogb/data/nodeproppred/arxiv.zip"
+    }
+  },
+  "seed": 0,
+  "split_rule": "last N_HELDOUT pairs (by the deterministic mining order \u2014 sorted paper_id traversal, seeded rng draws) become held-out; the leading N_PAIRS - N_HELDOUT pairs remain train-side.",
+  "subset_n": 4000,
+  "unit": "63-how-well"
+}

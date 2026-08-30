@@ -259,6 +259,121 @@ IDENTITY_FIELD_CANONICALIZERS = {
 }
 
 
+# THE finetune-run identity set (unit 63, H4/H4a docs-ci mirror) — mirrors
+# `crates/jammi-bench/src/report.rs`'s `FinetuneRunTier::IDENTITY_FIELDS`
+# EXACTLY, verbatim in the SAME order that const's own source lists them
+# (order is not semantically load-bearing for a set-equality check, but
+# keeping it identical makes a side-by-side diff against the Rust const
+# trivial for a human reviewer). Like `ENCODE_IDENTITY_FIELDS` above (unit
+# 62's E3/E6 shape) and UNLIKE `FINETUNE_IDENTITY_FIELDS`'s superset-folding
+# shape, `FinetuneRunTier` keeps its provenance (`arm`, `device_name`,
+# `kernels_disabled_requested`, `kernels_disabled_fired`, `flash_compiled`,
+# `build_features`, `attention_arm`, `split_rule`, `batched_forward`,
+# `steps_measured`) in its OWN, entirely DISJOINT `PROVENANCE_FIELDS` const —
+# see that struct's own doc for why `arm`/`attention_arm` are provenance here
+# rather than identity (the CALLER'S request / the process-resolved
+# reference class, neither a determinant of what the held-out loss itself
+# computes). `FINETUNE_RUN_IDENTITY_FIELDS` is therefore compared for SET
+# EQUALITY against `FinetuneRunTier::IDENTITY_FIELDS`, never a subset check
+# — see `test_identity_fields_subset.py`'s own
+# `FinetuneRunIdentityFieldsSubsetTests` for the mechanical assertion. This
+# module carries no `FINETUNE_RUN_PROVENANCE_FIELDS` tuple, following
+# `ENCODE_IDENTITY_FIELDS`'s own precedent: the Rust `PROVENANCE_FIELDS`
+# const is extracted directly by the test suite's regex scan rather than
+# duplicated into a second Python list nobody would keep in sync.
+#
+# Unit-63 adversarial-audit finding 5 (identity-completeness) reshaped this
+# set from its original 35 entries to 32:
+#   (a) `heldout_pairs_sha256` ADDED — sha256 of the `--heldout-jsonl` file's
+#       own bytes, MEASURED at load; the held-out fixture's TEXT is a total
+#       determinant of every per-example loss `d_i` and was hashed nowhere
+#       before this fix (only the id ORDER, via `heldout_ids_sha256`, was
+#       anchored).
+#   (b) `dataset_sha256` RENAMED to `train_pairs_file_sha256` — the old name
+#       collided with the committed fixture manifest's OWN `dataset_sha256`
+#       (a Merkle digest over per-pair content hashes, built off-process),
+#       a DIFFERENT quantity under the SAME spelling, so neither anchored
+#       the other. The new name states exactly what it hashes: the
+#       `--train-jsonl` file's own raw bytes, measured off the file this
+#       run actually read.
+#   (c) `split_rule`/`batched_forward` MOVED to provenance, `split_seed`
+#       DROPPED entirely — none of the three could vary independently of an
+#       already-admitted field or a build-time constant: `split_rule` is a
+#       hardcoded literal, `batched_forward` is always `true`, and
+#       `split_seed` was a pure, literal duplicate of `seed` (`split()`
+#       takes no separate seed parameter). `heldout_batch_partition_sha256`
+#       is KEPT despite also being a pure function of already-identity
+#       inputs (held-out ids + `batch`) — see `FinetuneRunTier`'s own doc
+#       for why it earns its slot (a genuine cross-arm equality guard
+#       against the partitioning ALGORITHM diverging, not a redundant echo
+#       of inputs).
+#   (d) `steps_measured` MOVED to provenance (advisory) — a MEASURED
+#       OUTCOME of running (cumulative optimizer steps), not a premise the
+#       run was configured under.
+# Net: 35 − 4 (split_rule, split_seed, batched_forward, steps_measured) + 1
+# (heldout_pairs_sha256) = 32.
+FINETUNE_RUN_IDENTITY_FIELDS = (
+    # FinetuneStepTier's 18, minus attention_arm and (finding 5(c))
+    # `batched_forward`/`steps_measured` (15 entries) — carried over by
+    # name, same order as the Rust const's own leading block.
+    "seed",
+    "batch",
+    "seq",
+    "lora_rank",
+    "lora_alpha",
+    "lora_dropout",
+    "margin",
+    "target_modules",
+    "backbone_dtype",
+    "checkpoint_config_sha256",
+    "checkpoint_weights_sha256",
+    "checkpoint_weights_size_bytes",
+    "max_grad_norm",
+    "warmup",
+    "row_lengths",
+    # New (18 entries in CONTRACT H4 v1/v2, minus `split_rule`/`split_seed`,
+    # `dataset_sha256` renamed to `train_pairs_file_sha256`, plus
+    # `heldout_pairs_sha256` added — finding 5(a)/(b)/(c)).
+    "epochs",
+    "lr",
+    "schedule",
+    "warmup_steps",
+    "weight_decay",
+    "grad_accum",
+    "validation_fraction",
+    "train_pairs_file_sha256",
+    "heldout_ids_sha256",
+    "heldout_pairs_sha256",
+    "heldout_batch_partition_sha256",
+    "embedding_loss",
+    "temperature",
+    "matryoshka_dims",
+    "early_stopping_patience",
+    "early_stopping_metric",
+    "eval_cadence",
+)
+
+# Identity fields for which a JSON `null` is a legitimate VALUE — mirrors
+# `FINETUNE_NULL_IS_A_VALUE_FIELDS`'s own doctrine, but for
+# `FinetuneRunTier::IDENTITY_FIELDS`'s own `Nullable::NullMeans` entries
+# (read verbatim off that const, see `report.rs`):
+#   * `margin`        — NullMeans("objective is mnrl")
+#   * `temperature`   — NullMeans("objective is triplet")
+#   * `max_grad_norm` — NullMeans("no clip")
+#   * `warmup`        — NullMeans("a full run has no discard-before-timing
+#                        convention; see warmup_steps")
+#   * `row_lengths`   — NullMeans("real text is variable-length; no single
+#                        fixed row_lengths applies across a whole
+#                        multi-epoch run")
+# Every OTHER `FINETUNE_RUN_IDENTITY_FIELDS` member is `Nullable::NonNull`
+# on the Rust const, so a present `null` there still folds to MISSING (the
+# same "cannot verify this premise determinant" state `leg_identity_fields`
+# already applies to `FINETUNE_IDENTITY_FIELDS`).
+FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS = frozenset(
+    {"margin", "temperature", "max_grad_norm", "warmup", "row_lengths"}
+)
+
+
 def canonicalize_identity_field(field, value):
     """Apply `field`'s registered canonicalizer (see
     `IDENTITY_FIELD_CANONICALIZERS`'s own table), or return `value`

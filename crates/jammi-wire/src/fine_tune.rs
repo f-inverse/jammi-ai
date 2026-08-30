@@ -5,6 +5,21 @@
 //! state, so they live on the wire substrate: the embedded engine reads them to
 //! build a training run, the gRPC converters encode/decode them, and a
 //! data-plane client builds a request from them without the candle stack.
+//!
+//! [`HeldOutLoss`] / [`ExampleLoss`] are the companion RESULT vocabulary — the
+//! public per-pair held-out evaluation seam (unit 63, CONTRACT H1). They are
+//! plain `serde` types, not proto-backed, mirroring how `jammi_wire::eval`'s
+//! report shapes (`EmbeddingEvalReport`, `PerQueryRecord`, …) cross the public
+//! API surface today: those results carry no `.proto` message of their own —
+//! they travel over the wire as an opaque JSON payload the caller decodes —
+//! rather than declaring a new RPC, so a plain struct is the shape a consumer
+//! actually deserializes. `HeldOutLoss` follows that precedent rather than the
+//! request-side `FineTuneConfig` pattern above (which IS proto-backed because
+//! it fills a structured field of the `StartTraining` request message). This
+//! module carries only the types; computing a `HeldOutLoss` from a trained
+//! model's held-out split is `jammi_ai::Trainer::evaluate_held_out` (H1,
+//! ai-core domain) — no computation lives here, and this commit adds no new
+//! RPC or wire endpoint.
 
 use std::collections::HashMap;
 
@@ -550,6 +565,258 @@ impl FineTuneConfig {
             }
         }
         Ok(())
+    }
+}
+
+// ─── Held-out evaluation seam (H1, unit 63) ────────────────────────────────
+//
+// `evaluate_held_out` (`jammi-ai`, ai-core domain) scores a trained model
+// against a committed held-out split and returns a `HeldOutLoss`. The
+// numbers here are the seam's public RESULT vocabulary; no computation lives
+// in this crate, and landing these types adds no new RPC or wire endpoint.
+
+/// One held-out example's stable id and the model's loss on it.
+///
+/// `example_id` is the STABLE id from the committed fixture (a string triple
+/// id, `cookbook/fixtures/finetune_heldout/heldout_ids.txt` — H3), never a
+/// row index: index-based ids would silently repoint at a different example
+/// if the fixture's row order ever changed, which a stable string id cannot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExampleLoss {
+    /// Stable id of the held-out example, from the committed fixture's id list.
+    pub example_id: String,
+    /// The model's loss on this example.
+    pub loss: f64,
+}
+
+/// Result of one `evaluate_held_out` call: per-example losses over a
+/// committed held-out split, plus the aggregate and partition metadata a
+/// paired significance test (C16/H2) consumes.
+///
+/// **`mean` is the EXAMPLE-mean** — the plain arithmetic mean of
+/// [`Self::per_example`]'s losses — and is a NEW quantity distinct from
+/// `Trainer::evaluate`'s existing (private, monitoring-only) BATCH-mean: the
+/// mean of per-BATCH losses, which weights a short final batch the same as a
+/// full one. That legacy batch-mean semantics stays UNTOUCHED by this seam
+/// (early stopping, `checkpoint_best`, and every pinned value that reads it
+/// keep reading exactly what they read today) — `evaluate_held_out`
+/// DELEGATES to the same forward pass but additionally captures each row's
+/// individual loss before it is reduced, and this struct's `mean` is computed
+/// over THAT per-example array, never re-derived from the batch-mean.
+///
+/// **Batch partition is part of the measurement's identity.** The
+/// Multiple-Negatives-Ranking objective's per-example loss is BATCH-COUPLED:
+/// for a batch of `(anchor, positive)` rows, every other row's positive in
+/// the SAME batch is scored as this row's in-batch negative, so a given
+/// example's loss depends on which other examples share its batch, not on
+/// the example alone. Re-partitioning the identical example set into
+/// different batches (a different `batch_size`, a different row order, a
+/// different shard) changes every `per_example` value even though nothing
+/// about the model or the examples changed. Because the batch partition is
+/// therefore a property of *(model, partition)* and not a property of the
+/// example set alone, [`Self::batch_partition_sha256`] and
+/// [`Self::in_batch_negatives_per_example`] are recorded ON THIS STRUCT
+/// (v2 delta 9) rather than left to be inferred from the held-out split
+/// alone — a `HeldOutLoss` from a re-partitioned run is NOT directly
+/// comparable to one from this run even over the identical example ids, and
+/// the two hashes make that non-comparability checkable rather than silent.
+/// This is also why the held-out split is sized to a MULTIPLE of
+/// `batch_size` via an explicit committed id list (v2 delta 2) rather than
+/// `validation_fraction` rounding: it fixes every example at the same
+/// in-batch-negative count for objectives that have one, so
+/// `in_batch_negatives_per_example` is one number, not a per-example
+/// distribution with a ragged final batch.
+///
+/// **`in_batch_negatives_per_example` is objective-aware** (audit round 63,
+/// finding 6): `batch_size - 1` for the MNRL objectives (`Pairs`, always;
+/// `Triplet` when `MultipleNegativesRanking` is configured), which score each
+/// row against every OTHER row's positive sharing the batch. It is `0` for
+/// every other objective this seam supports (`Triplet` margin,
+/// `Contrastive`/`CosineMse`, `Classification`) — genuinely zero, not a
+/// placeholder: those objectives score each row independently of every other
+/// row in the batch, so there is no in-batch-negative pool to size. See the
+/// field's own doc.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HeldOutLoss {
+    /// Per-example losses, in the held-out split's fixed (committed) id order.
+    pub per_example: Vec<ExampleLoss>,
+    /// The EXAMPLE-mean of [`Self::per_example`]'s losses — `sum(loss) /
+    /// count`, NOT `Trainer::evaluate`'s private batch-mean. See the struct
+    /// doc for why these are two distinct quantities.
+    pub mean: f64,
+    /// `per_example.len()`. Redundant with `per_example` BY CONSTRUCTION —
+    /// kept (rather than dropped) because the contract lists it as a field a
+    /// consumer reads directly (e.g. to size a sign-test cell) without first
+    /// counting `per_example`, mirroring `CalibrationAggregate::n` beside
+    /// `CalibrationEvalReport::per_record` in `jammi_wire::eval::report`. Any
+    /// constructor of this type MUST set `count == per_example.len()`; the
+    /// invariant is pinned by this module's tests, not enforced by a private
+    /// field (this crate's report types keep every field public, matching
+    /// [`FineTuneConfig`] and the `jammi_wire::eval::report` shapes).
+    pub count: usize,
+    /// Fraction of [`Self::per_example`] whose loss sits exactly at the
+    /// objective's hinge floor / tie value — the loss a perfectly-ranked (or
+    /// exactly-tied) row saturates to and cannot improve past. A
+    /// hinge-shaped objective (e.g. `Triplet`, or an MNRL batch with a
+    /// saturated in-batch ranking) can drive many rows to this floor well
+    /// before the model has converged elsewhere, so a high `tie_fraction`
+    /// flags that per-example loss is losing resolution on those rows — the
+    /// per-pair statistic (C16/H2) still pairs by example, but a saturated
+    /// tie fraction is a caveat on how much signal that pairing carries.
+    /// `1.0` when every held-out example is at the floor (the saturated-hinge
+    /// case).
+    pub tie_fraction: f64,
+    /// SHA-256 (hex) of the batch partition this result was scored under —
+    /// which examples shared a batch, and in what order. A property of
+    /// *(model, partition)*, not of the example set alone; see the struct
+    /// doc. Two `HeldOutLoss` values are only directly comparable per-example
+    /// when this hash (and [`Self::in_batch_negatives_per_example`]) match.
+    pub batch_partition_sha256: String,
+    /// The number of in-batch negatives every held-out example was scored
+    /// against — **objective-aware** (audit round 63, finding 6; the field
+    /// used to be `batch_size - 1` unconditionally, which was only correct
+    /// for the MNRL objectives and silently mis-described every other one):
+    ///
+    /// - MNRL objectives (`Pairs`, always; `Triplet` when
+    ///   `MultipleNegativesRanking` is configured): `batch_size - 1`, because
+    ///   the held-out split is sized to a multiple of `batch_size` (v2 delta
+    ///   2), so no batch is short and every example has the same
+    ///   negative-pool size.
+    /// - Every other objective this seam supports (`Triplet` margin,
+    ///   `Contrastive`/`CosineMse`, `Classification`): `0`. These score each
+    ///   row independently of every other row in the batch — `0` is their
+    ///   TRUE in-batch-negative count, not a sentinel or a fallback.
+    ///
+    /// A single scalar (not a per-example distribution) precisely because
+    /// the held-out split is scored under one homogeneous objective/batch
+    /// kind throughout, so this count cannot vary example-to-example within
+    /// one `HeldOutLoss`.
+    pub in_batch_negatives_per_example: usize,
+}
+
+#[cfg(test)]
+mod held_out_loss_tests {
+    use super::*;
+
+    fn example(id: &str, loss: f64) -> ExampleLoss {
+        ExampleLoss {
+            example_id: id.to_string(),
+            loss,
+        }
+    }
+
+    fn sample_held_out_loss() -> HeldOutLoss {
+        let per_example = vec![
+            example("arxiv:0001.0001v1#0", 0.10),
+            example("arxiv:0001.0002v1#0", 0.20),
+            example("arxiv:0001.0003v1#0", 0.30),
+            example("arxiv:0001.0004v1#0", 0.10),
+        ];
+        let count = per_example.len();
+        let mean = per_example.iter().map(|e| e.loss).sum::<f64>() / count as f64;
+        HeldOutLoss {
+            per_example,
+            mean,
+            count,
+            tie_fraction: 0.5,
+            batch_partition_sha256: "a".repeat(64),
+            in_batch_negatives_per_example: 7,
+        }
+    }
+
+    /// Construction + serde round-trip: the shape a consumer actually
+    /// deserializes off the wire matches what was constructed, field for
+    /// field — the same guarantee `FineTuneConfig`'s round-trip tests pin for
+    /// the request side.
+    #[test]
+    fn serde_round_trips() {
+        let original = sample_held_out_loss();
+        let json = serde_json::to_string(&original).expect("HeldOutLoss serializes");
+        let decoded: HeldOutLoss = serde_json::from_str(&json).expect("HeldOutLoss deserializes");
+        assert_eq!(decoded, original);
+
+        let example_json =
+            serde_json::to_string(&original.per_example[0]).expect("ExampleLoss serializes");
+        let decoded_example: ExampleLoss =
+            serde_json::from_str(&example_json).expect("ExampleLoss deserializes");
+        assert_eq!(decoded_example, original.per_example[0]);
+    }
+
+    /// `count` is redundant with `per_example.len()` by construction (the
+    /// field doc's stated invariant) — pinned here so a future edit that lets
+    /// the two drift apart is caught. This is the invariant note the field
+    /// doc promises, made checkable.
+    #[test]
+    fn count_matches_per_example_len_by_construction() {
+        let held_out = sample_held_out_loss();
+        assert_eq!(held_out.count, held_out.per_example.len());
+    }
+
+    /// `mean` is the EXAMPLE-mean over `per_example` — a plain arithmetic
+    /// mean of the per-example losses, independent of any batch grouping.
+    /// This is the "example-mean, not the legacy batch-mean" distinction the
+    /// struct doc documents, pinned as a computable check on the type's own
+    /// shape (the seam's actual computation is `jammi_ai`'s to test).
+    #[test]
+    fn mean_is_the_example_mean() {
+        let held_out = sample_held_out_loss();
+        let expected: f64 =
+            held_out.per_example.iter().map(|e| e.loss).sum::<f64>() / held_out.count as f64;
+        assert!(
+            (held_out.mean - expected).abs() < 1e-12,
+            "mean {} must equal the plain per-example mean {expected}",
+            held_out.mean
+        );
+    }
+
+    /// `tie_fraction == 1.0` is a legal, representable value — the saturated
+    /// case where every held-out example sits at the hinge floor. Pinned as a
+    /// positive control on the field's documented range, mirroring how
+    /// `FineTuneConfig`'s boundary tests pin legal edge values.
+    #[test]
+    fn tie_fraction_one_is_representable() {
+        let mut held_out = sample_held_out_loss();
+        held_out.tie_fraction = 1.0;
+        let json = serde_json::to_string(&held_out).unwrap();
+        let decoded: HeldOutLoss = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.tie_fraction, 1.0);
+    }
+
+    /// `batch_partition_sha256` and `in_batch_negatives_per_example` live ON
+    /// `HeldOutLoss` (v2 delta 9) and survive the wire round-trip alongside
+    /// the per-example data — the property-of-(model, partition) fields are
+    /// not dropped or defaulted away.
+    #[test]
+    fn partition_identity_fields_round_trip() {
+        let held_out = sample_held_out_loss();
+        let json = serde_json::to_string(&held_out).unwrap();
+        let decoded: HeldOutLoss = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            decoded.batch_partition_sha256,
+            held_out.batch_partition_sha256
+        );
+        assert_eq!(
+            decoded.in_batch_negatives_per_example,
+            held_out.in_batch_negatives_per_example
+        );
+    }
+
+    /// Two `HeldOutLoss` values over the identical example set but a
+    /// DIFFERENT batch partition carry different `batch_partition_sha256` —
+    /// the type does not collapse "same examples" into "same measurement".
+    /// This is a shape-level sanity check (construction only); the actual
+    /// per-example divergence under re-partitioning is MNRL's batch-coupling
+    /// behaviour, `jammi_ai`'s to test.
+    #[test]
+    fn differing_partitions_carry_differing_partition_hashes() {
+        let a = sample_held_out_loss();
+        let mut b = a.clone();
+        b.batch_partition_sha256 = "b".repeat(64);
+        assert_ne!(a.batch_partition_sha256, b.batch_partition_sha256);
+        assert_eq!(
+            a.per_example, b.per_example,
+            "same example ids/losses in this construction check"
+        );
     }
 }
 

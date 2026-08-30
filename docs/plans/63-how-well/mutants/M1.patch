@@ -1,0 +1,21 @@
+diff --git a/crates/jammi-kernels/src/ops/adamw_step.rs b/crates/jammi-kernels/src/ops/adamw_step.rs
+index 58a1418c..529e4953 100644
+--- a/crates/jammi-kernels/src/ops/adamw_step.rs
++++ b/crates/jammi-kernels/src/ops/adamw_step.rs
+@@ -625,8 +625,14 @@ pub fn adamw_step_fused_t(
+             "adamw_step_fused_t: t={t} overflows i32::powi's exponent"
+         ))
+     })?;
+-    let scale_m = 1f64 / (1f64 - params.beta1.powi(t_i32));
+-    let scale_v = 1f64 / (1f64 - params.beta2.powi(t_i32));
++    // MUTANT M1 (Unit 63 H5 kernel-mutant column, docs/plans/63-how-well/
++    // mutants/M1.patch): off-by-one bias correction — uses t+1 instead of
++    // the correct t. See mutants/README.md for the regression class this
++    // models. NEVER MERGE: this line must read `t_i32` on both sides on the
++    // production kernel.
++    let t_i32_biased = t_i32 + 1;
++    let scale_m = 1f64 / (1f64 - params.beta1.powi(t_i32_biased));
++    let scale_v = 1f64 / (1f64 - params.beta2.powi(t_i32_biased));
+     super::apply_inplace2(
+         first_moment,
+         grad,

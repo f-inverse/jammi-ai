@@ -93,6 +93,17 @@ docs/specs/
 # Artifacts pulled off a GPU pod by `ci/scripts/gpu-dev.sh pull`.
 .gpu-pull/
 
+# CONTRACT amendment 2026-08-28b PRE-RUN provisioning artifact: the full
+# TRAIN-side pair text `cookbook/book/scripts/derive_heldout_fixture.py
+# --emit-train-pairs` writes (invoked automatically by
+# `ci/scripts/perf/finetune_run_ab.sh` when absent). Deliberately never
+# committed (repo-size discipline, `cookbook/fixtures/finetune_heldout/
+# README.md` "Why train text isn't committed") -- its identity is checked
+# against the committed `train_ids_sha256.json` by
+# `ci/scripts/perf/verify_train_pairs.py`, never by committing the text
+# itself.
+cookbook/fixtures/finetune_heldout/train_pairs.jsonl
+
 # Lead-session scratch: working notes/drafts and throwaway git worktrees.
 # Session-local by design, never committed — tracked files that cite a
 # scratchpad/ path must label it session-local evidence.

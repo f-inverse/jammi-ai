@@ -326,5 +326,121 @@ class EncodeStepIdentityFieldsSubsetTests(unittest.TestCase):
         self.assertIn("attention_arm", self.rust_provenance_fields)
 
 
+class FinetuneRunIdentityFieldsSubsetTests(unittest.TestCase):
+    """Unit-63 H4b mirror: `identity_fields.FINETUNE_RUN_IDENTITY_FIELDS`
+    (Python) against `FinetuneRunTier::IDENTITY_FIELDS`/`::PROVENANCE_FIELDS`
+    (Rust, `report.rs`). Scoped to `impl FinetuneRunTier {` the same way
+    `EncodeStepIdentityFieldsSubsetTests` above scopes to `impl
+    EncodeStepTier {` -- `report.rs` declares THREE structs literally named
+    `IDENTITY_FIELDS` (`FinetuneStepTier`, `EncodeStepTier`,
+    `FinetuneRunTier`) in the same file, so an unscoped search would always
+    find whichever sits earliest. Like `EncodeStepIdentityFieldsSubsetTests`,
+    this is an EQUALITY check (`FinetuneRunTier` keeps identity/provenance
+    disjoint, never superset-folded) -- a drift on EITHER side REDs here.
+    """
+
+    def setUp(self):
+        self.rust_identity_fields = set(
+            _extract_rust_fields_block(REPORT_RS, _IDENTITY_FIELDS_BLOCK_RE, "FinetuneRunTier")
+        )
+        self.rust_provenance_fields = set(
+            _extract_rust_fields_block(REPORT_RS, _PROVENANCE_FIELDS_BLOCK_RE, "FinetuneRunTier")
+        )
+
+    def test_finetune_run_identity_fields_has_exactly_32_entries(self):
+        self.assertEqual(
+            len(identity_fields.FINETUNE_RUN_IDENTITY_FIELDS),
+            32,
+            "identity_fields.py::FINETUNE_RUN_IDENTITY_FIELDS must have EXACTLY 32 entries "
+            "(unit-63 adversarial-audit finding 5's pinned count: the original CONTRACT H4 35 "
+            "minus split_rule/split_seed/batched_forward/steps_measured (4 reclassified out of "
+            "identity), plus heldout_pairs_sha256 (1 added) -- 35 - 4 + 1 = 32, the SAME count "
+            "FinetuneRunTier's own Rust-side test pins). A count other than 32 means either this "
+            "mirror drifted from FinetuneRunTier::IDENTITY_FIELDS or the Rust side itself "
+            "grew/shrank; re-derive from source, never bump to make this test pass.",
+        )
+        self.assertEqual(
+            len(set(identity_fields.FINETUNE_RUN_IDENTITY_FIELDS)),
+            32,
+            "FINETUNE_RUN_IDENTITY_FIELDS contains a duplicate entry",
+        )
+
+    def test_rust_provenance_fields_has_exactly_10_entries(self):
+        self.assertEqual(
+            len(self.rust_provenance_fields),
+            10,
+            f"FinetuneRunTier::PROVENANCE_FIELDS ({REPORT_RS}) must have EXACTLY 10 entries "
+            "(CONTRACT H4's original 7 -- arm, device_name, kernels_disabled_requested, "
+            "kernels_disabled_fired, flash_compiled, build_features, attention_arm -- plus the "
+            "unit-63 adversarial-audit finding-5(c)/advisory-(d) reclassifications split_rule, "
+            f"batched_forward, steps_measured) — got: {sorted(self.rust_provenance_fields)}",
+        )
+
+    def test_finetune_run_identity_fields_equals_the_rust_const(self):
+        python_fields = set(identity_fields.FINETUNE_RUN_IDENTITY_FIELDS)
+        self.assertEqual(
+            python_fields,
+            self.rust_identity_fields,
+            f"identity_fields.py::FINETUNE_RUN_IDENTITY_FIELDS ({sorted(python_fields)}) must "
+            f"equal FinetuneRunTier::IDENTITY_FIELDS ({sorted(self.rust_identity_fields)}) "
+            "EXACTLY — this tier's identity/provenance split is disjoint, not superset-folded, "
+            "so the Python mirror is the WHOLE identity set, never merely a subset of it",
+        )
+
+    def test_identity_and_provenance_are_disjoint(self):
+        overlap = self.rust_identity_fields & self.rust_provenance_fields
+        self.assertFalse(
+            overlap,
+            f"FinetuneRunTier::IDENTITY_FIELDS and ::PROVENANCE_FIELDS share field(s) "
+            f"{sorted(overlap)} — CONTRACT H4's design keeps these two sets DISJOINT (never a "
+            "field in both)",
+        )
+        overlap_py = set(identity_fields.FINETUNE_RUN_IDENTITY_FIELDS) & self.rust_provenance_fields
+        self.assertFalse(
+            overlap_py,
+            f"identity_fields.py::FINETUNE_RUN_IDENTITY_FIELDS names provenance-only field(s) "
+            f"{sorted(overlap_py)} — provenance must never be admitted to the Python comparison "
+            "tuple either",
+        )
+
+    def test_arm_and_attention_arm_are_not_identity_fields(self):
+        # Negative control (struct doc: "the CALLER-declared arm ... see
+        # this struct's own doc for why this is provenance, never
+        # identity"): the requested/resolved attention arm describes WHICH
+        # leg ran, never a determinant of what the held-out loss computes,
+        # so admitting either to the comparison tuple would let two
+        # differently-armed legs merge as "the same measurement".
+        self.assertNotIn("arm", identity_fields.FINETUNE_RUN_IDENTITY_FIELDS)
+        self.assertNotIn("attention_arm", identity_fields.FINETUNE_RUN_IDENTITY_FIELDS)
+        self.assertNotIn("arm", self.rust_identity_fields)
+        self.assertNotIn("attention_arm", self.rust_identity_fields)
+        self.assertIn("arm", self.rust_provenance_fields)
+        self.assertIn("attention_arm", self.rust_provenance_fields)
+
+    def test_objective_selected_nullable_fields_match_rust_null_means(self):
+        # Non-vacuity anchor for FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS: the
+        # five fields it names must be EXACTLY the Rust const's own
+        # `Nullable::NullMeans(...)` entries — a set this suite derives from
+        # `report.rs` independently of the hand-written Python frozenset
+        # above (regex over the FULL `("field", Nullable::NullMeans...)`
+        # tuple, not just the field name), so a field silently moved between
+        # NonNull and NullMeans on either side is caught.
+        with open(REPORT_RS, encoding="utf-8") as fh:
+            text = fh.read()
+        scoped = _scoped_to_impl(text, "FinetuneRunTier")
+        match = _IDENTITY_FIELDS_BLOCK_RE.search(scoped)
+        self.assertIsNotNone(match, "FinetuneRunTier::IDENTITY_FIELDS block not found")
+        null_means_fields = set(
+            re.findall(r'\(\s*"([A-Za-z0-9_]+)"\s*,\s*Nullable::NullMeans', match.group(1))
+        )
+        self.assertEqual(
+            null_means_fields,
+            set(identity_fields.FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS),
+            f"identity_fields.py::FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS "
+            f"({sorted(identity_fields.FINETUNE_RUN_NULL_IS_A_VALUE_FIELDS)}) must equal the "
+            f"Rust const's own Nullable::NullMeans entries ({sorted(null_means_fields)}) exactly",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

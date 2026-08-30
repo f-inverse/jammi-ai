@@ -62,6 +62,7 @@ mod context_predictor;
 mod corpus;
 mod encode_step;
 mod eval;
+mod finetune_run;
 mod finetune_step;
 mod fixture;
 mod gpu_inference;
@@ -96,6 +97,141 @@ use train_scale::BackwardPath;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+/// `finetune-run`'s flags, flattened into a `Box<Self>` `Command::FinetuneRun`
+/// payload (`clippy::large_enum_variant`; see that variant's own doc).
+#[derive(clap::Args)]
+struct FinetuneRunArgs {
+    /// Directory holding `config.json` + `model.safetensors` +
+    /// `tokenizer.json`.
+    #[arg(long)]
+    model_dir: PathBuf,
+    /// `fused` or `alloff` — CALLER-declared (see `finetune_run::Arm`'s
+    /// doc); the caller is responsible for setting
+    /// `JAMMI_KERNELS_DISABLE=attention_block_flash,adamw_step_fused`
+    /// itself before invoking this binary for the `alloff` arm.
+    #[arg(long)]
+    arm: String,
+    /// Training triplets — JSONL, one object per line:
+    /// `{"anchor_id","anchor_text","positive_id","positive_text","negative_id","negative_text"}`,
+    /// in the committed train-split's fixed order.
+    #[arg(long)]
+    train_jsonl: PathBuf,
+    /// The held-out fixture's committed id list — TAB-separated
+    /// `anchor_id\tpositive_id\tnegative_id`, one row per line, in
+    /// COMMITTED order (this order is scoring identity — CONTRACT H1).
+    /// This file's bytes are what `heldout_ids_sha256` hashes.
+    #[arg(long)]
+    heldout_ids: PathBuf,
+    /// The held-out fixture's text content — same JSONL shape as
+    /// `--train-jsonl`, joined to `--heldout-ids`' rows BY id (row order
+    /// need not match; `--heldout-ids` alone decides scoring order). This
+    /// file's own bytes (the whole file, as read — not any per-row
+    /// re-derivation) are what `heldout_pairs_sha256` hashes (unit-63
+    /// adversarial-audit finding 5(a): the held-out TEXT is a total
+    /// determinant of every per-example loss `d_i`, so it must be
+    /// content-anchored exactly as `--heldout-ids` already is).
+    #[arg(long)]
+    heldout_jsonl: PathBuf,
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
+    #[arg(long, default_value_t = 1)]
+    epochs: usize,
+    #[arg(long, default_value_t = 1)]
+    eval_cadence: usize,
+    #[arg(long, default_value_t = 32)]
+    batch: usize,
+    #[arg(long, default_value_t = 2e-4)]
+    lr: f64,
+    /// `constant`, `cosine_decay`, or `linear_decay`.
+    #[arg(long, default_value = "constant")]
+    schedule: String,
+    #[arg(long, default_value_t = 0)]
+    warmup_steps: usize,
+    #[arg(long, default_value_t = 0.01)]
+    weight_decay: f64,
+    #[arg(long, default_value_t = 1)]
+    grad_accum: usize,
+    #[arg(long, default_value_t = 0.1)]
+    validation_fraction: f64,
+    /// MUST be `>= 10_000` (CONTRACT Frame's never-stops idiom) — the
+    /// run refuses a smaller value.
+    #[arg(long, default_value_t = 10_000)]
+    early_stopping_patience: usize,
+    /// `train_loss` or `val_loss`.
+    #[arg(long, default_value = "val_loss")]
+    early_stopping_metric: String,
+    /// `0.0` disables clipping.
+    #[arg(long, default_value_t = 1.0)]
+    max_grad_norm: f64,
+    /// `triplet` or `mnrl` — which embedding objective to train over the
+    /// SAME committed fixture (CONTRACT H4 amendment 2026-08-28; `mnrl`
+    /// consumes the (anchor, positive) projection of the same rows in
+    /// committed order, dropping the negative column). See
+    /// `finetune_run::Objective`'s own doc.
+    #[arg(long, default_value = "triplet")]
+    objective: String,
+    /// The Triplet objective's margin — read when `--objective triplet`.
+    #[arg(long, default_value_t = 0.3)]
+    margin: f64,
+    /// MNRL's similarity-scale knob — read when `--objective mnrl`. `20.0`
+    /// is the standard default (`jammi_wire::fine_tune::EmbeddingLoss::MultipleNegativesRanking`'s
+    /// own doc).
+    #[arg(long, default_value_t = 20.0)]
+    temperature: f64,
+    /// Comma-separated Matryoshka prefix dims; empty trains the full
+    /// dimension only.
+    #[arg(long, default_value = "")]
+    matryoshka_dims: String,
+    #[arg(long, default_value_t = 8)]
+    lora_rank: usize,
+    #[arg(long, default_value_t = 16.0)]
+    lora_alpha: f64,
+    #[arg(long, default_value_t = 0.05)]
+    lora_dropout: f64,
+    /// Comma-separated LoRA target selectors.
+    #[arg(long, default_value = "Wqkv,Wo,Wi")]
+    target_modules: String,
+    /// Backbone precision: f32, f16, or bf16.
+    #[arg(long, default_value = "f32")]
+    backbone_dtype: String,
+    #[arg(long, default_value_t = 64)]
+    max_seq_length: usize,
+    /// CALLER-declared premise for the report's `admission_is_dense` field
+    /// (default: `false`, matching the committed fixture's padded
+    /// transport). This tier's real-text path never reaches
+    /// `forward_with_lengths`'s dense-vs-padded fork, so there is no live
+    /// signal to check this claim against — the value is recorded exactly
+    /// as declared, for a downstream merger to check against the fixture's
+    /// own known shape (see `finetune_run::FinetuneRunParams::expect_dense`'s
+    /// doc).
+    #[arg(long, default_value_t = false)]
+    expect_dense: bool,
+    /// CUDA ordinal; omit for CPU (the CPU-hermetic smoke path).
+    #[arg(long)]
+    cuda: Option<usize>,
+    /// Scratch directory for this run's local catalog/artifact-store
+    /// state.
+    #[arg(long)]
+    work_dir: PathBuf,
+    /// Unit 63 round-7 audit, finding 1: the mutant's own label (e.g.
+    /// `"eps-0.10"`) — OPTIONAL, and all-or-none with `--mutant-base-sha` /
+    /// `--mutant-patch-sha256` (a partial mutant label is refused; see
+    /// `finetune_run::run`'s own leading validation). Omitted entirely for
+    /// an ordinary (non-mutant) leg — see
+    /// `finetune_run::FinetuneRunParams::mutant_id`'s own doc for why these
+    /// three are honest-labeling fields, never identity or provenance.
+    #[arg(long)]
+    mutant_id: Option<String>,
+    /// The git commit sha this mutant's patch was cut against — see
+    /// `mutant_id`'s doc.
+    #[arg(long)]
+    mutant_base_sha: Option<String>,
+    /// sha256 (hex) of the mutant patch's own content — see `mutant_id`'s
+    /// doc.
+    #[arg(long)]
+    mutant_patch_sha256: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -459,6 +595,19 @@ enum Command {
         #[arg(long)]
         row_lengths: Option<String>,
     },
+    /// The finetune-run tier (unit 63, CONTRACT H4): one full (seed, arm)
+    /// fine-tune run driving the REAL `TrainingLoopBuilder` + the public
+    /// `evaluate_held_out` seam over committed TRIPLET (anchor/positive/
+    /// negative) text fixtures. See `finetune_run.rs`'s module doc for the
+    /// resume-cycled per-epoch trajectory design and the arm-as-provenance
+    /// convention. Emits the JSON report with the `finetune_run` tier set.
+    ///
+    /// Boxed (`clippy::large_enum_variant`): this variant's field count
+    /// alone (every `FinetuneRunParams` knob is a CLI flag) makes it far
+    /// the largest `Command` payload — boxing, not a blanket `#[allow]`,
+    /// mirrors `jammi_ai::fine_tune::target::TrainingTarget::EncoderAdapters`'s
+    /// own fix for the identical lint (see that variant's doc).
+    FinetuneRun(Box<FinetuneRunArgs>),
     /// The jammi-vs-torch LEARNING oracle: one forward+backward at
     /// IDENTICAL LoRA weights (never an optimizer step), dumped per
     /// trainable tensor by name (loss + f32 gradient) for
@@ -667,6 +816,160 @@ async fn main() -> std::process::ExitCode {
                 },
             },
         }),
+        Command::FinetuneRun(args) => {
+            let FinetuneRunArgs {
+                model_dir,
+                arm,
+                train_jsonl,
+                heldout_ids,
+                heldout_jsonl,
+                seed,
+                epochs,
+                eval_cadence,
+                batch,
+                lr,
+                schedule,
+                warmup_steps,
+                weight_decay,
+                grad_accum,
+                validation_fraction,
+                early_stopping_patience,
+                early_stopping_metric,
+                max_grad_norm,
+                objective,
+                margin,
+                temperature,
+                matryoshka_dims,
+                lora_rank,
+                lora_alpha,
+                lora_dropout,
+                target_modules,
+                backbone_dtype,
+                max_seq_length,
+                expect_dense,
+                cuda,
+                work_dir,
+                mutant_id,
+                mutant_base_sha,
+                mutant_patch_sha256,
+            } = *args;
+            let arm = match arm.parse::<finetune_run::Arm>() {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("finetune-run: {e}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            let objective = match objective.parse::<finetune_run::Objective>() {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("finetune-run: {e}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            let (train_pairs, train_pairs_file_sha256) = match load_train_jsonl(&train_jsonl) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("finetune-run: --train-jsonl {train_jsonl:?}: {e}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            let (heldout_pairs, heldout_ids_sha256, heldout_pairs_sha256) =
+                match load_heldout_fixture(&heldout_ids, &heldout_jsonl) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!(
+                            "finetune-run: --heldout-ids {heldout_ids:?} / --heldout-jsonl \
+                             {heldout_jsonl:?}: {e}"
+                        );
+                        return std::process::ExitCode::FAILURE;
+                    }
+                };
+            let lr_schedule = match schedule.as_str() {
+                "constant" => jammi_ai::fine_tune::LrSchedule::Constant,
+                "cosine_decay" => jammi_ai::fine_tune::LrSchedule::CosineDecay,
+                "linear_decay" => jammi_ai::fine_tune::LrSchedule::LinearDecay,
+                other => {
+                    eprintln!(
+                        "finetune-run: unknown --schedule {other:?}; expected constant, \
+                         cosine_decay, or linear_decay"
+                    );
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            let early_stopping_metric_v = match early_stopping_metric.as_str() {
+                "train_loss" => jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,
+                "val_loss" => jammi_ai::fine_tune::EarlyStoppingMetric::ValLoss,
+                other => {
+                    eprintln!(
+                        "finetune-run: unknown --early-stopping-metric {other:?}; expected \
+                         train_loss or val_loss"
+                    );
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            let params = finetune_run::FinetuneRunParams {
+                model_dir,
+                arm,
+                train_pairs,
+                heldout_pairs,
+                train_pairs_file_sha256,
+                heldout_ids_sha256,
+                heldout_pairs_sha256,
+                seed,
+                epochs,
+                eval_cadence,
+                batch_size: batch,
+                learning_rate: lr,
+                lr_schedule,
+                warmup_steps,
+                weight_decay,
+                gradient_accumulation_steps: grad_accum,
+                validation_fraction,
+                early_stopping_patience,
+                early_stopping_metric: early_stopping_metric_v,
+                max_grad_norm,
+                objective,
+                margin,
+                temperature,
+                matryoshka_dims: matryoshka_dims
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.parse::<usize>())
+                    .collect::<Result<Vec<usize>, _>>()
+                    .unwrap_or_else(|e| {
+                        eprintln!("finetune-run: --matryoshka-dims is invalid: {e}");
+                        std::process::exit(1);
+                    }),
+                lora_rank,
+                lora_alpha,
+                lora_dropout,
+                target_modules: target_modules
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                backbone_dtype: match backbone_dtype.as_str() {
+                    "f32" => jammi_numerics::ComputePrecision::F32,
+                    "f16" => jammi_numerics::ComputePrecision::F16,
+                    "bf16" => jammi_numerics::ComputePrecision::BF16,
+                    other => {
+                        eprintln!("unknown backbone_dtype {other:?}; expected f32, f16, or bf16");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                },
+                max_seq_length,
+                expect_dense,
+                cuda_device: cuda,
+                work_dir,
+                mutant_id,
+                mutant_base_sha,
+                mutant_patch_sha256,
+            };
+            run_finetune_run(params).await
+        }
         Command::GradOracle {
             model_dir,
             batch,
@@ -794,6 +1097,177 @@ fn run_finetune_step(params: finetune_step::FinetuneStepParams) -> std::process:
     std::process::ExitCode::SUCCESS
 }
 
+/// One JSONL row shared by `--train-jsonl` and `--heldout-jsonl`: an
+/// (anchor, positive, negative) TRIPLET, keyed by `anchor_id` — the SAME
+/// field names the committed `finetune_heldout` fixture (CONTRACT H3) uses
+/// in its own `heldout_pairs.jsonl`, so a producer script can point this
+/// flag straight at that file (or a re-derivation of it) without a reshape.
+#[derive(serde::Deserialize)]
+struct TripletRow {
+    anchor_id: String,
+    anchor_text: String,
+    #[serde(rename = "positive_id")]
+    _positive_id: String,
+    positive_text: String,
+    #[serde(rename = "negative_id")]
+    _negative_id: String,
+    negative_text: String,
+}
+
+/// Load a JSONL file of [`TripletRow`]s, in file order, into
+/// [`finetune_run::IdTriplet`]s keyed by `anchor_id` — the shape
+/// `--train-jsonl` supplies. Returns the rows plus the sha256 (hex) of the
+/// file's own bytes (this run's `train_pairs_file_sha256` — MEASURED off the
+/// file this run actually read, never a caller-transcribed digest).
+///
+/// This is the RAW BYTES of one file this tier read directly, distinct in
+/// KIND from the committed fixture manifest's own `dataset_sha256` (a
+/// Merkle digest over PER-PAIR content hashes, built by a producer script
+/// off-process — see `ci/scripts/perf/finetune_run_ab.sh`'s
+/// `train_ids_sha256.json`): the two are different quantities computed by
+/// different mechanisms over overlapping-but-not-identical inputs, so this
+/// field earns its own name rather than colliding with that one under a
+/// shared spelling (unit-63 adversarial-audit finding 5(b)). Content-
+/// anchoring this run's train file against the committed
+/// `train_ids_sha256.json` manifest is the PRODUCER's pre-run provisioning
+/// check, not something this tier verifies for itself — it only records the
+/// digest of the bytes it actually read.
+fn load_train_jsonl(
+    path: &std::path::Path,
+) -> Result<(Vec<finetune_run::IdTriplet>, String), Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(path)?;
+    let sha256 = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        hex::encode(hasher.finalize())
+    };
+    let text = String::from_utf8(bytes)?;
+    let mut rows = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: TripletRow =
+            serde_json::from_str(line).map_err(|e| format!("line {}: {e}", i + 1))?;
+        rows.push(finetune_run::IdTriplet {
+            id: row.anchor_id,
+            anchor: row.anchor_text,
+            positive: row.positive_text,
+            negative: row.negative_text,
+        });
+    }
+    Ok((rows, sha256))
+}
+
+/// Load the held-out fixture: `heldout_ids` names the COMMITTED order
+/// (`anchor_id\tpositive_id\tnegative_id` per line — this file's bytes are
+/// what `heldout_ids_sha256` hashes, MEASURED here, never transcribed);
+/// `heldout_jsonl` supplies the TEXT, joined to each id row BY `anchor_id` —
+/// its own bytes are what `heldout_pairs_sha256` hashes, likewise MEASURED
+/// here off the file this run actually read (unit-63 adversarial-audit
+/// finding 5(a): the held-out TEXT is a total determinant of every per-
+/// example loss `d_i`, and until this fix it was hashed nowhere at all —
+/// only the id ORDER was anchored, never the anchor/positive/negative TEXT
+/// content a caller could swap under a constant id list without changing
+/// either committed digest).
+fn load_heldout_fixture(
+    heldout_ids: &std::path::Path,
+    heldout_jsonl: &std::path::Path,
+) -> Result<(Vec<finetune_run::IdTriplet>, String, String), Box<dyn std::error::Error>> {
+    let ids_bytes = std::fs::read(heldout_ids)?;
+    let heldout_ids_sha256 = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&ids_bytes);
+        hex::encode(hasher.finalize())
+    };
+    let ids_text = String::from_utf8(ids_bytes)?;
+
+    let jsonl_bytes = std::fs::read(heldout_jsonl)?;
+    let heldout_pairs_sha256 = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&jsonl_bytes);
+        hex::encode(hasher.finalize())
+    };
+    let jsonl_text = String::from_utf8(jsonl_bytes)?;
+    let mut by_anchor: std::collections::HashMap<String, (String, String, String)> =
+        std::collections::HashMap::new();
+    for (i, line) in jsonl_text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: TripletRow =
+            serde_json::from_str(line).map_err(|e| format!("heldout jsonl line {}: {e}", i + 1))?;
+        by_anchor.insert(
+            row.anchor_id,
+            (row.anchor_text, row.positive_text, row.negative_text),
+        );
+    }
+
+    let mut rows = Vec::new();
+    for (i, line) in ids_text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut cols = line.split('\t');
+        let anchor_id = cols
+            .next()
+            .ok_or_else(|| format!("heldout_ids line {}: missing anchor_id", i + 1))?
+            .to_string();
+        let (anchor_text, positive_text, negative_text) =
+            by_anchor.get(&anchor_id).cloned().ok_or_else(|| {
+                format!(
+                    "heldout_ids line {}: anchor_id {anchor_id:?} has no matching row in \
+                     --heldout-jsonl",
+                    i + 1
+                )
+            })?;
+        rows.push(finetune_run::IdTriplet {
+            id: anchor_id,
+            anchor: anchor_text,
+            positive: positive_text,
+            negative: negative_text,
+        });
+    }
+    Ok((rows, heldout_ids_sha256, heldout_pairs_sha256))
+}
+
+/// The `finetune-run` subcommand: run the tier (a resume-cycled multi-epoch
+/// leg over the REAL `TrainingLoopBuilder` + the public `evaluate_held_out`
+/// seam) and emit the report. `finetune_run::run` blocks on catalog/artifact-
+/// store I/O via `Handle::current().block_on(..)` (mirroring
+/// `fine_tune::worker::run_fine_tune_blocking`'s own posture — see that
+/// function's doc), so it is driven from `spawn_blocking`, never called
+/// directly on this async task (which would panic: "cannot start a runtime
+/// from within a runtime").
+async fn run_finetune_run(params: finetune_run::FinetuneRunParams) -> std::process::ExitCode {
+    let tier = match tokio::task::spawn_blocking(move || finetune_run::run(&params)).await {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => {
+            eprintln!("finetune-run failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("finetune-run: task panicked: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let report = Report::new(
+        "finetune-run",
+        Tiers {
+            finetune_run: Some(tier),
+            ..Default::default()
+        },
+    );
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).expect("serialize report")
+    );
+    std::process::ExitCode::SUCCESS
+}
+
 /// The `cache-slo-scale` subcommand: load the committed spec, run the tier (cold
 /// vs warm `Use` neighbour-graph build), emit the report, and exit non-zero if
 /// the warm hit did not clear the committed speed-up floor (or did not actually
@@ -822,6 +1296,7 @@ async fn run_cache_slo_scale() -> std::process::ExitCode {
             recall_sweep: None,
             training: None,
             finetune_step: None,
+            finetune_run: None,
             conformal: None,
             eval: None,
             propagate: None,
@@ -874,6 +1349,7 @@ async fn run_recompute_scale() -> std::process::ExitCode {
             recall_sweep: None,
             training: None,
             finetune_step: None,
+            finetune_run: None,
             conformal: None,
             eval: None,
             propagate: None,
@@ -977,6 +1453,7 @@ async fn run_train_scale() -> std::process::ExitCode {
             recall_sweep: None,
             training: Some(tier),
             finetune_step: None,
+            finetune_run: None,
             conformal: None,
             eval: None,
             propagate: None,
@@ -1039,6 +1516,7 @@ fn run_conformal_scale() -> std::process::ExitCode {
             recall_sweep: None,
             training: None,
             finetune_step: None,
+            finetune_run: None,
             conformal: Some(tier),
             eval: None,
             propagate: None,
@@ -1091,6 +1569,7 @@ fn run_eval_scale() -> std::process::ExitCode {
             recall_sweep: None,
             training: None,
             finetune_step: None,
+            finetune_run: None,
             conformal: None,
             eval: Some(tier),
             propagate: None,
@@ -1144,6 +1623,7 @@ async fn run_propagate_scale() -> std::process::ExitCode {
             recall_sweep: None,
             training: None,
             finetune_step: None,
+            finetune_run: None,
             conformal: None,
             eval: None,
             propagate: Some(tier),
@@ -1353,6 +1833,7 @@ fn run_graph_train_scale() -> std::process::ExitCode {
             recall_sweep: None,
             training: None,
             finetune_step: None,
+            finetune_run: None,
             conformal: None,
             eval: None,
             propagate: None,
@@ -1453,6 +1934,7 @@ async fn run_context_predictor_scale() -> std::process::ExitCode {
             recall_sweep: None,
             training: None,
             finetune_step: None,
+            finetune_run: None,
             conformal: None,
             eval: None,
             propagate: None,
@@ -1560,6 +2042,7 @@ async fn run_model_inference_scale() -> std::process::ExitCode {
             recall_sweep: None,
             training: None,
             finetune_step: None,
+            finetune_run: None,
             conformal: None,
             eval: None,
             propagate: None,
@@ -1754,6 +2237,7 @@ async fn run_search_rss() -> std::process::ExitCode {
             recall_sweep: None,
             training: None,
             finetune_step: None,
+            finetune_run: None,
             conformal: None,
             eval: None,
             propagate: None,
@@ -1808,6 +2292,7 @@ async fn run_arxiv() -> std::process::ExitCode {
             recall_sweep: None,
             training: None,
             finetune_step: None,
+            finetune_run: None,
             conformal: None,
             eval: None,
             propagate: None,
@@ -1868,6 +2353,7 @@ async fn run_recall_sweep(
             recall_sweep: Some(tier),
             training: None,
             finetune_step: None,
+            finetune_run: None,
             conformal: None,
             eval: None,
             propagate: None,

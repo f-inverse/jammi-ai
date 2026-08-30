@@ -194,7 +194,7 @@ const ATTENTION_DISABLE_KEYS: [&str; 3] = ["attention_block", "attention_block_f
 /// `attention_block_flash` is the key the eager leg disables, and the
 /// committed `s128_flash_on_1.json` fixture — block `0/0`, flash `840` —
 /// reads `"fused"` here, where a counter derivation read `"none"`.)
-fn attention_arm(kernels_disabled_requested: &[String]) -> &'static str {
+pub(crate) fn attention_arm(kernels_disabled_requested: &[String]) -> &'static str {
     if kernels_disabled_requested
         .iter()
         .any(|k| ATTENTION_DISABLE_KEYS.contains(&k.as_str()))

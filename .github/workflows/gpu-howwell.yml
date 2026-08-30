@@ -1,0 +1,171 @@
+name: GPU how-well (RunPod)
+
+# Runs the unit-63 how-well A/B (CONTRACT H4) on a real NVIDIA A100 (sm_80)
+# via an ephemeral RunPod pod — `ci/scripts/perf/finetune_run_ab.sh` driving
+# `jammi-bench finetune-run` per (seed, arm, repeat) against the committed
+# cookbook/fixtures/finetune_heldout/ fixture, merged (sign test + conjunctive
+# leg-premise refusal + determinism-floor reporting) by
+# `ci/scripts/perf/ab_merge.py`'s own `finetune-run` mode.
+#
+# Off the merge path, same discipline gpu-prove.yml's own header states — GPU
+# minutes cost money and A100 capacity is intermittent. Fires on: the
+# `run-howwell` PR label (opt-in per PR) and manual dispatch ONLY — NO
+# schedule (CONTRACT H4/PLAN.md v2 delta 11: v1 stays operator-triggered, a
+# standing nightly A/B is a later decision, not this workflow's own default).
+# Needs the `RUNPOD_API_KEY` repo secret and a `model_dir` naming a
+# checkpoint the target pod has already provisioned (this workflow does not
+# provision one itself — see `runpod_gpu_howwell.sh`'s own doc for why that
+# stays a separate, pod-seed-owned concern).
+#
+# Merge-path CI checks only ever validate COMMITTED artifacts (a future
+# how-well artifact schema gate, the same shape
+# `check_cuda_run_artifacts.py` already gives the clip/kernel-oracle
+# artifacts) — this workflow itself, and the RunPod run it drives, never sit
+# on that path; H5's own committed calibration/A-B artifacts are what a
+# merge-path gate would validate, not a re-execution of this workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_dir:
+        description: "Checkpoint directory on the target pod (config.json + model.safetensors + tokenizer.json)."
+        required: true
+        type: string
+      seeds:
+        description: "Comma-separated seed list (default: the pre-registered 12-seed gate set)."
+        required: false
+        type: string
+        default: "1,2,3,4,5,6,7,8,9,10,11,12"
+      objective:
+        description: "mnrl or triplet — the probe's objective selection. REQUIRED, no default: the choice must be made deliberately on every dispatch, never silently assumed (CONTRACT amendment 2026-08-28's default-on-ties rule governs how the MERGE step reads a tie, not this workflow's own selection)."
+        required: true
+        type: string
+      lr0_seeds:
+        description: "Comma-separated lr=0 RED control seeds (default: '1,2' — the first two of the pre-registered 12-seed gate set, CONTRACT H5 step 3's own 'x2 seeds' control; CONTRACT Frame 'RED control: lr=0 arm x2 seeds fails learning-happened'. This input only has a source on a workflow_dispatch trigger — a run-howwell PR-label trigger carries no inputs at all and this workflow now refuses loudly rather than silently dropping the control (see the 'Resolve' step). ab_merge.py's own finetune-run merger separately refuses (INVALID) whenever the resolved seed list is empty unless --allow-missing-lr0-control was explicitly passed, so clearing this field on a dispatch run records a deliberate, visible opt-out rather than a silent skip.)"
+        required: false
+        type: string
+        default: "1,2"
+  pull_request:
+    types: [labeled]
+
+# Least privilege: this lane only reads the checkout; the RunPod side is
+# driven by the RUNPOD_API_KEY secret, not the GitHub token.
+permissions:
+  contents: read
+
+jobs:
+  gpu-howwell:
+    name: how-well A/B on RunPod A100 (sm_80)
+    # Label event only runs for the `run-howwell` label; dispatch always
+    # runs. Mirrors gpu-prove.yml's own `run-gpu` gate exactly, one label
+    # name over.
+    if: github.event_name != 'pull_request' || github.event.label.name == 'run-howwell'
+    runs-on: ubuntu-latest
+    # Concurrency is on the JOB, not the workflow, and never cancels — the
+    # SAME $187-orphan lesson gpu-prove.yml's own comment records: cancelling
+    # SIGKILLs the runner before its EXIT trap can terminate the rented pod.
+    concurrency:
+      group: gpu-howwell-${{ github.ref }}
+      cancel-in-progress: false
+    # Mirrors gpu-prove.yml's own timeout derivation: RP_TIMEOUT (50m) plus
+    # up to 4 deploy candidates at RP_SSH_WAIT_SECS (600s) each = 40m worst
+    # case, well under this ceiling.
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+
+      # workflow_dispatch's own `model_dir`/`objective` inputs are required
+      # at the trigger level; the `pull_request: types: [labeled]` path
+      # carries no inputs at all, so a label-triggered run needs
+      # HOWWELL_MODEL_DIR/HOWWELL_OBJECTIVE set some other way (a repo
+      # variable, or dispatch is used instead) — this step refuses loudly
+      # rather than silently defaulting either one (a placeholder path a
+      # real pod would never have, or an unstated mnrl-vs-triplet choice the
+      # probe's selection must always be deliberate about).
+      - name: Resolve HOWWELL_MODEL_DIR / HOWWELL_OBJECTIVE / HOWWELL_LR0_SEEDS
+        id: resolve
+        run: |
+          MODEL_DIR="${{ github.event.inputs.model_dir }}"
+          if [ -z "$MODEL_DIR" ]; then
+            echo "::error::model_dir is required — set it via workflow_dispatch's own input (a run-howwell PR-label trigger carries no inputs and cannot supply one)."
+            exit 1
+          fi
+          echo "model_dir=$MODEL_DIR" >> "$GITHUB_OUTPUT"
+
+          OBJECTIVE="${{ github.event.inputs.objective }}"
+          if [ -z "$OBJECTIVE" ]; then
+            echo "::error::objective is required — set it via workflow_dispatch's own input (a run-howwell PR-label trigger carries no inputs and cannot supply one)."
+            exit 1
+          fi
+          echo "objective=$OBJECTIVE" >> "$GITHUB_OUTPUT"
+
+          # unit-63 round-3 audit block 5: workflow_dispatch's own
+          # `lr0_seeds` input carries a pre-registered default ("1,2") baked
+          # into this workflow's schema above, so it is empty only when an
+          # operator EXPLICITLY clears it (a deliberate, recorded opt-out —
+          # ab_merge.py's own finetune-run merger separately refuses INVALID
+          # on an empty seed list unless --allow-missing-lr0-control is
+          # passed, which this workflow does not yet forward, so clearing
+          # this field on a dispatch run currently makes the merge INVALID
+          # by design rather than silently skipping the control). A
+          #
+          # unit-63 round-4 audit advisory (A2), CURRENT TRUTH (an earlier
+          # draft of this comment claimed the ELSE branch below closed a gap
+          # where a run-howwell PR-label trigger silently dropped the
+          # control on EVERY run "with no visible signal" — that describes
+          # a run that could never start in the first place): a
+          # `pull_request: types: [labeled]` trigger carries NO
+          # workflow_dispatch inputs at all, so `model_dir` (and
+          # `objective`) above ALREADY refuse loudly before this step ever
+          # reaches the `lr0_seeds` branch below — the ELSE branch here is
+          # therefore dead code on every real trigger this workflow's own
+          # `on:` block admits today (`workflow_dispatch` always takes the
+          # `if`; `pull_request: labeled` never reaches this line at all).
+          # It is kept anyway, belt-and-braces, in case a FUTURE trigger is
+          # added to the `on:` block above without this step being
+          # revisited — a defensive refusal, not a fix for a reachable gap
+          # today.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            LR0_SEEDS="${{ github.event.inputs.lr0_seeds }}"
+          else
+            echo "::error::lr0_seeds has no source on this trigger (belt-and-braces — every trigger this workflow's own on: block currently admits either takes the workflow_dispatch branch above, or has already refused on the missing model_dir/objective inputs before reaching this line) — use workflow_dispatch so the pre-registered lr=0 RED control (or a deliberate, visible opt-out) can actually be selected."
+            exit 1
+          fi
+          echo "lr0_seeds=$LR0_SEEDS" >> "$GITHUB_OUTPUT"
+
+      - name: Run the how-well A/B on a real A100
+        id: howwell
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          GIT_REPO: https://github.com/${{ github.repository }}.git
+          GIT_REF: ${{ github.head_ref || github.ref_name }}
+          HOWWELL_MODEL_DIR: ${{ steps.resolve.outputs.model_dir }}
+          HOWWELL_SEEDS: ${{ github.event.inputs.seeds || '1,2,3,4,5,6,7,8,9,10,11,12' }}
+          HOWWELL_OBJECTIVE: ${{ steps.resolve.outputs.objective }}
+          HOWWELL_LR0_SEEDS: ${{ steps.resolve.outputs.lr0_seeds }}
+        run: |
+          set +e
+          bash ci/scripts/runpod_gpu_howwell.sh
+          rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit $rc
+
+      - name: Annotate a capacity failure
+        if: always() && steps.howwell.outputs.rc == '75'
+        run: echo "::warning::how-well A/B FAILED for capacity — no A100 on RunPod (SUPPLY_CONSTRAINT), not a code/statistical regression. The run stays red (nothing was proven); re-run once capacity returns."
+
+      # unit-63 audit advisory (c): the merged artifact previously never left
+      # the pod at all. runpod_gpu_howwell.sh itself rsyncs it to
+      # .gpu-pull/how-well/ before the pod is torn down; this step makes
+      # that local pull retrievable from the CI run too (the campaign's own
+      # committed-evidence path — a human still decides which run(s) get
+      # committed under a crate's own artifacts/ tree, this just keeps the
+      # bytes from being lost once the runner itself is recycled).
+      - name: Upload merged how-well artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: how-well-artifact-${{ github.run_id }}
+          path: .gpu-pull/how-well/
+          if-no-files-found: warn
+          retention-days: 14

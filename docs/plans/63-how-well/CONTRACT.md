@@ -150,3 +150,315 @@ the committed hashes are the trust surface, the network is not); any mismatch is
 refusal before any leg runs. "No network" is thereby narrowed to: no network during
 measured legs, and no unverified content ever. dataset_sha256 remains reconstructable from
 checkout + verified content. The H5 campaign runs the provisioning step once per pod.
+
+## Amendment 2026-08-29 (docs-ci, unit-63 re-audit round-2, finding 5): FinetuneRunTier
+## identity reshape — 32 fields, not H4's original 35
+
+H4's own `FinetuneRunTier::IDENTITY_FIELDS` list above ("superset of the existing 18 +
+epochs, lr, schedule, warmup_steps, weight_decay, grad-accum, validation_fraction,
+split_rule+seed, dataset_sha256, heldout_ids_sha256, heldout_batch_partition_sha256,
+embedding_loss+temp, matryoshka_dims, early_stopping patience+metric, eval_cadence") is
+WRONG-WHEN-WRITTEN as of this amendment — kept verbatim above, superseded here. The
+unit-63 adversarial-audit's finding 5 (identity-completeness) reshaped the actual set from
+35 entries to 32 (`ci/scripts/perf/identity_fields.py::FINETUNE_RUN_IDENTITY_FIELDS`,
+mirroring `crates/jammi-bench/src/report.rs`'s `FinetuneRunTier::IDENTITY_FIELDS` exactly):
+
+- ADDED: `heldout_pairs_sha256` — sha256 of the `--heldout-jsonl` file's own bytes, measured
+  at load; the held-out fixture's TEXT is a total determinant of every per-example loss
+  `d_i` and was hashed nowhere before this fix (only the id ORDER, via `heldout_ids_sha256`,
+  was anchored).
+- RENAMED: `dataset_sha256` → `train_pairs_file_sha256` — the old name collided with the
+  committed fixture manifest's OWN `dataset_sha256` (a Merkle digest over per-pair content
+  hashes, built off-process), a DIFFERENT quantity under the SAME spelling, so neither
+  anchored the other. The new name states exactly what it hashes: the `--train-jsonl`
+  file's own raw bytes, measured off the file this run actually read.
+- MOVED TO PROVENANCE: `split_rule`, `batched_forward`, `steps_measured` — none could vary
+  independently of an already-admitted field or a build-time constant (`split_rule` is a
+  hardcoded literal, `batched_forward` is always `true`, `steps_measured` is a MEASURED
+  outcome of running, not a premise the run was configured under).
+- DROPPED: `split_seed` — a pure, literal duplicate of `seed` (the split function takes no
+  separate seed parameter).
+- KEPT despite also being a pure function of already-identity inputs:
+  `heldout_batch_partition_sha256` (a genuine cross-arm equality guard against the
+  partitioning ALGORITHM diverging, not a redundant echo of inputs).
+
+Net: 35 − 4 (`split_rule`, `split_seed`, `batched_forward`, `steps_measured`) + 1
+(`heldout_pairs_sha256`) = 32. Contract and code now agree; this amendment is the record of
+that reconciliation, never a further code change.
+
+### Appended note, 2026-08-29 (docs-ci, unit-63 round-5 audit): golden supersession plan
+
+`ci/scripts/perf/fixtures/finetune_run_golden/modernbert_fused.json` and
+`modernbert_alloff.json` are, as of this note, a STAGED CLOSURE: their
+`checkpoint_config_sha256` names the CPU-hermetic `tiny_modernbert_ner`
+fixture (`head_dim=16`) while their dispatch counters are composited from
+real `head_dim=64` GPU legs — a combination no real producer invocation can
+emit (see the fixture's own `PROVENANCE.md`, "Emittability status" section,
+for the two precise arithmetic contradictions this leaves open). The
+campaign's first real ModernBERT-large (`head_dim == 64`) `finetune-run`
+probe leg — run at `finetune_run_ab.sh`'s own checkpoint/batch/seq shape,
+for both the `fused` and `alloff` arms — REPLACES both committed golden
+files VERBATIM (identity, provenance, premise, measurement, and
+dispatch-counter fields all sourced from that one real leg's own report),
+at which point the emittability claim becomes true and
+`GoldenProducerAnchoredFieldSetTests`'s field-set pin re-verifies against
+the replacement without modification. No skip, `xfail`, or `TODO` marker
+gates this — the plan is this prose record plus the fixture's own
+`PROVENANCE.md` "Supersession plan" section, not a pinned-but-disabled
+test.
+
+**Postscript, 2026-08-29 (docs-ci, unit-63 round-6 audit): plan discharged.**
+The supersession above has EXECUTED: `modernbert_fused.json` and
+`modernbert_alloff.json` are each now ONE real, producer-emitted
+`jammi-bench finetune-run` leg — `docs/plans/63-how-well/measurements/campaign-v2/`
+(campaign v2, GREEN, `clean_seed_count` 12/12), seed 1 (chosen as the first
+documented seed; its own `per_seed["1"]` entry carries no premise
+violation), `git_sha 6f5874d49ba07db0b99eb4947f855c0e2c464219`, box `a100`
+— copied byte-for-byte from `campaign-v2/raw/seed1__fused__r1.json` /
+`seed1__alloff__r1.json` (sha256-verified equal to the committed golden
+files; see the fixture's own `PROVENANCE.md`, "Supersession executed"
+section, for the full field table and the two "Emittability status"
+contradictions this closes by construction). This note's own text above is
+left exactly as originally recorded (append-only); this postscript is the
+close of record.
+
+## Amendment 2026-08-29b (lead, post-campaign-v1): probe bug fix + premise-failure handling + mutant dose ladder
+
+Basis (committed FIRST, auditable): docs/plans/63-how-well/measurements/campaign-v1/ at
+04ceb25c — the v1 run is INVALID (seed-4 alloff premise) and mutant M1 measured UNDETECTED.
+Pressure-tested (rule 9) before this amendment; the findings it encodes:
+
+1. NOT a rule amendment — an instrument bug fix. `learning_happened_delta`'s baseline is
+   taken after the first resume-cycle has already trained epoch 0 (finetune_run.rs's probe
+   ordering), so the premise measures epoch-1..final — excluding the largest learning
+   epoch — while its field doc claims "over the run"; and its endpoint choice was never
+   pre-registered (the "CONTRACT H4" citation at the definition site names a string this
+   contract never contained — a fabricated citation, corrected herewith). The fix is
+   statable with zero reference to seed 4:
+   (a) the probe anchors at the UNTRAINED model (one evaluate_held_out on the train-probe
+       batch before the first run(); LoRA init is ZerosB, so an lr=0 leg still reads
+       exactly 0.0 and the strict-> floor still bites);
+   (b) the producer emits the probe as a RAW per-epoch series INCLUDING the init point —
+       never a pre-derived scalar — and the MERGER derives the premise from the series
+       (rule: init_probe - final_probe > floor; the rule lives where rules live);
+   (c) premise-failure handling is now pre-registered: the primary verdict keeps the
+       strict 12-clean-or-INVALID rule unchanged; the merged artifact ALWAYS also emits a
+       non-parameterised, explicitly non-decisional `premise_failure_diagnostic` block
+       (failed seeds, failing legs, their raw series) — it can never promote
+       INVALID->GREEN and the merger accepts NO operator override for premise failures.
+2. Pre-published predictions (falsifiable, recorded BEFORE the v2 run):
+   (i) the corrected probe does not touch the training path (the no-RNG-perturbation seam
+       property is pinned by test), so v2's d-column is predicted to reproduce v1's
+       BIT-IDENTICALLY, with dispatch counters legitimately shifted by exactly one eval's
+       worth per leg;
+   (ii) conditional on (i), the v2 verdict is predicted now: GREEN — v1's diagnostic
+       d-column reads n_neg=8/12, mean_d=-0.0238, p=0.2266 (no concordant degradation;
+       the fused arm trends BETTER). An amendment that publishes its own outcome in
+       advance cannot be shopping for one. If (i) fails, the amendment's basis is void
+       and the discrepancy is a finding to investigate before any verdict is claimed.
+3. Mutant column, corrected design: M1 is recorded as a NON-DETECTION (a sign-flipping
+   early transient — wrong space of reasoning; see campaign-v1/README.md), not a bound.
+   v2 pre-registers a one-parameter, monotone, SUSTAINED dose family: the fused AdamW
+   update scaled by (1+eps), eps in {0.02, 0.10, 0.50}, each dose's predicted per-seed
+   effect stated in held-out example-mean units in mutants/README.md BEFORE the spend;
+   each dose column is produced by substituting the mutant INTO THE FUSED ARM and merged
+   against the SAME v2 alloff legs under the SAME >=11/12+mean rule (the gate's own
+   statistic — mutant-vs-fused is explicitly NOT the sensitivity claim); the reported
+   sensitivity is the pair of adjacent doses straddling detection. Acceptance 5's
+   "mutant column proven RED" is discharged by the smallest detected dose.
+4. Boundary constraints: no --allow-premise-failure, no waived-seed list, no rescale
+   switch anywhere in the merger; the off-sample reserve stays reserved for step 4;
+   decaying LR schedules stay disabled for this tier until the resume-cycle LR-horizon
+   defect (total_steps recomputed per cycle) is fixed — the campaign's constant/0-warmup
+   setting is unaffected.
+
+## Addendum 2026-08-29c (lead): signed dose family — the prediction table falsified the positive-eps direction pre-spend
+
+Amendment 2026-08-29b item 3 named eps in {0.02, 0.10, 0.50} (update scale 1+eps). The
+REQUIRED pre-spend prediction table (mutants/README.md, derived solely from the committed
+campaign-v1 measurements) predicts the (1+eps) direction as held-out IMPROVEMENT, not
+degradation — the lr0-vs-trained secant slope is positive for both measured seeds, so more
+effective lr lowers held-out loss over this range. A positive-eps dose therefore cannot
+discharge "mutant column proven RED (degradation)". This is the prediction discipline
+working: the design is falsified BEFORE the spend, on committed data, not after it.
+
+Resolution (still pre-spend, still one monotone one-parameter family — update scaled by
+(1+eps), eps now SIGNED): the ladder becomes eps in {-0.50, -0.10, +0.50}.
+- Negative doses (silent lr DEFLATION — the undertrained-regression class) carry the
+  predicted degradation direction (secant symmetric: predicted per-seed shift
+  +|eps|*slope_seed, sign-consistent across both measured seeds).
+- +0.50 is retained deliberately as the two-sided falsification cell for the improvement
+  prediction itself (if it reads RED_FOR_INVESTIGATION-shaped improvement, the prediction
+  is confirmed; if it degrades, the secant extrapolation is refuted and the README must
+  record that).
+- Acceptance 5's "mutant column proven RED" is discharged by the smallest detected
+  DEGRADATION dose (expected among the negative eps values); the reported sensitivity is
+  the adjacent-dose pair straddling detection within the negative branch.
+Patches M_eps_-0.10 / M_eps_-0.50 are cut from the same single-constant template; the
+prediction table gains their rows (same arithmetic, committed data only) before any leg runs.
+
+**Postscript, 2026-08-29c** (docs-ci, unit-63 round-7 audit advisory (a)): amendment
+2026-08-29b item 2(ii)'s own diagnostic-d-column sentence ("v1's diagnostic d-column reads
+n_neg=8/12, mean_d=-0.0238, p=0.2266") mixes two different denominators — the sign counts
+(n_pos/n_neg) and mean_d/p are all computed over the v1 run's 11 CLEAN (premise-passing)
+seeds (seed 4's alloff leg is the run's one premise failure, per that item's own basis
+paragraph), never the pre-registered 12-seed gate count. The correct, denominator-consistent
+statement: n_pos=3, n_neg=8 of 11; mean_d=-0.0238, p=0.2266, both also over the same 11. Item
+2(ii)'s own prose is left exactly as originally recorded (append-only); this postscript is
+the correction of record. measurements/campaign-v1/README.md carries the identical fix in
+place, with its own dated correction note.
+
+**Postscript, 2026-08-29 (docs-ci, unit-63 "RED-proof column"):** the signed `(1+eps)`
+ladder above DEMONSTRATED the detector (11/12 concordance, `p=0.00635 < alpha2`) but landed
+every scheduled dose in the IMPROVEMENT direction — no member of this family can discharge
+acceptance 5's "mutant column proven RED (degradation)" (see
+`measurements/dose-ladder/README.md`'s own finding 3). `ab_merge.py` therefore gains a
+**RED-proof label class**: a `dose_label` carrying the literal prefix `redproof-` (e.g.
+`redproof-nobc`, `redproof-signflip`, mutants/README.md's own `M_nobc`/`M_signflip` pair,
+both outside the `(1+eps)` lr-scale family by construction) participates fully in
+`build_mutant_dose_column` (premises, partner premises, identity, `detected` computation —
+unchanged) but is partitioned OUT of the eps-family scans (`sensitivity`,
+`two_sided_falsification`, `dose_anomalies`, and the duplicate-EPS arm of
+`mutant_dose_ladder_reject_duplicate_doses`) BEFORE those scans ever run — a partition on
+the label prefix, never a widening of `_dose_label_eps`'s own strict eps-only domain; the
+duplicate-LABEL and duplicate-PATCH_SHA arms still apply across the full set, so a
+RED-proof column remains subject to the same same-patch-measured-twice refusal any eps
+column is. The merged artifact gains `red_proof` (one
+`{dose_label, patch_sha256, detected, n_pos, n_neg, mean_d, p_value, clean_pair_count}` entry
+per RED-proof column) and `red_proof_verdict` — `"PROVEN"` iff at least one RED-proof column
+reads `detected == "RED"`, otherwise `"NOT_PROVEN"` naming every column's own `detected` (a
+column reading `RED_FOR_INVESTIGATION` is recorded as-is, an anomaly for a mutant expected to
+degrade, never a second way to reach `"PROVEN"`). `red_proof_verdict == "PROVEN"` contributes
+NOTHING to the exit code — it is the expected outcome and never masks another dose-ladder
+failure cause (a PROVEN merge can still exit non-zero on `sensitivity_error`, an `INVALID`
+dose column, `dose_anomalies`, or a non-GREEN primary status); `"NOT_PROVEN"` contributes
+non-zero, named in the merge's own stderr and artifact. This retires the prior "run
+`redproof-nobc`/`redproof-signflip` in
+their own, separate invocation and treat its exit 1 as expected" convention
+(mutants/README.md's own former "Minimal labeling convention" section) — reinterpreting a
+failure exit as success was never acceptable; the RED-proof verdict is now read directly off
+this merge's own first-class field, in the SAME artifact the primary decision lands in.
+
+**Postscript, 2026-08-29d** (docs-ci, unit-63 round-13 audit finding 2): the postscript above
+underspecified `red_proof_verdict`'s own null state. `ab_merge.py`'s `except
+(MutantDoseLadderSensitivityError, RedProofLabelError)` handler resets `sensitivity`/
+`two_sided_falsification`/`dose_anomalies` (+ `sensitivity_error`) on ANY dose-ladder refusal,
+but `red_proof_verdict` must distinguish two different refused states, never collapse them to
+the same `null`: no RED-proof label was ever present in the supplied dose set (kept `null`,
+exactly as before — nothing to report), versus at least one RED-proof-labeled column WAS
+scheduled but the refusal fired before RED-proof evaluation ever ran (`partition_red_proof_
+dose_columns` itself, or any eps-family scan downstream of it, raising before `build_red_
+proof_summary` is reached). The second state is now recorded as an explicit `NOT_PROVEN`-class
+verdict naming the refusal (`"NOT_PROVEN (dose set refused before RED-proof evaluation: <exc>)"`),
+never left `null` byte-identical to the first — a `null` `red_proof_verdict` means only "no
+RED-proof column was scheduled", never "one was scheduled but its own evaluation never ran".
+This lets both the existing NOT_PROVEN exit fold (`main()`'s own dose-ladder exit-code branch)
+and `runpod_gpu_howwell.sh`'s own GREEN-but-nonzero cause namer (`howwell_dose_ladder_cause.py`)
+fire on this state instead of falling through to an unexplained-contradiction "unknown" cause.
+
+## Amendment 2026-08-29e (lead, post-RED-proof measurement): the learning-happened premise
+decomposed for RED-proof mutant legs — pressure-tested design D*, data-contingent
+
+Basis (committed FIRST, auditable): docs/plans/63-how-well/measurements/red-proof/ at
+dc1cfc3b — 36 raw legs + the gated merge artifact whose `red_proof_verdict` reads
+`NOT_PROVEN (redproof-nobc=INVALID, redproof-signflip-v2=INVALID)`. Measured structural
+finding: `M_signflip_v2` is dispatch-effective (train probe climbs, e.g. seed 1
+3.3237→20.25) and 12/12 degradation-concordant in held-out raw data, yet every mutant leg
+fails the learning-happened premise because gradient ascent makes
+`train_probe_series[0] - train_probe_series[-1]` negative BY DESIGN — the premise (built
+for the primary C16 attribution question) refuses exactly the strongest true positives of
+the RED-proof detection question. Resolution pressure-tested this session (verdict REFINE,
+design D* adopted; candidates "blanket carve-out" / "weaker still-learning mutant as the
+discharge route" / "raw concordance outside the gated column" / "INVALID-as-stronger-than-
+RED" all killed, the second surviving only as an optional fully-pre-registered secondary
+column).
+
+THE RULE (D*). `learning_happened` is decomposed into two premises; with
+`FINETUNE_RUN_LEARNING_HAPPENED_FLOOR = 0.0`, `d > f ⟺ (|d| > f ∧ d > f)` for any
+`f ≥ 0`, so the decomposition is behavior-identical on every existing call site (lr0
+control, primary A/B both arms, alloff partner) — the round-12-audited primary path is
+unchanged:
+- `training_effective`: `|series[0] - series[-1]| > floor` — the optimizer demonstrably
+  moved the model. Retained on EVERY leg including RED-proof mutant legs, alongside all
+  five typed probe-series refusals (shape, length, init anchoring, finiteness), which are
+  retained unchanged.
+- `train_direction`: `sign(series[0] - series[-1])` must match the leg's declared
+  direction. For every non-RED-proof leg the declared direction is `descent` (exactly
+  today's behavior). For a RED-proof mutant leg it is read from
+  `RED_PROOF_EXPECTED_TRAIN_DIRECTION`, a merger-side committed constant keyed on
+  `patch_sha256` (NEVER the operator-supplied `dose_label`; the sha is doubly anchored —
+  CLI spec and producer stamp must already agree): `c81d0ed5… → ascent`,
+  `9b3c824d… → descent`. Values `{descent, ascent}` only; a RED-proof column whose
+  patch_sha256 is absent from the table is REFUSED (INVALID), never defaulted. No CLI
+  surface exists for the table — no operator-override channel.
+- `init_anchor_equality` (new, compensating): a RED-proof mutant leg's `series[0]` must
+  equal its alloff partner's `series[0]` exactly — a measured same-starting-model
+  guarantee (bit-identical 3.3236749470233917 across all 60 previously committed legs and
+  all 12 signflip_v2 legs).
+- The alloff PARTNER leg keeps every premise unchanged, including descent-direction
+  learning-happened. Column arithmetic unchanged: exactly 12 clean pairs, ≥11/12
+  concordance + mean sign, RED only in the degradation direction.
+
+Falsifiers (the rule can fail): an `ascent`-declared column whose probe descends on any
+leg → INVALID → NOT_PROVEN → non-zero exit (this WOULD have fired on inert M_signflip v1
+— 12/12 bit-identical legs have delta 0, failing `training_effective`'s strict floor —
+a real committed case the pre-D* merger passed silently); the held-out sign test can
+still read not-detected (M_nobc's own measured shape); any retained premise failing on
+any leg → INVALID.
+
+Ascent declaration provenance (pre-spend, quoted): the `c81d0ed5…` entry transcribes the
+prediction committed at 8f06a42c BEFORE the legs ran — "Predicted direction: DEGRADATION,
+with CERTAINTY … gradient ASCENT on `adjusted_grad`'s direction, every step, compounding
+for the length of the run" (mutants/README.md at 8f06a42c). The `9b3c824d…` (M_nobc)
+`descent` entry transcribes its own committed uncertain-but-still-learning prediction.
+
+RECONCILIATION (pressure-test blocking condition 2): mutants/README.md's M_nobc
+"Measured" record (n_pos=5/12, mean_d=-0.018) is the RAW 12-pair concordance, and stands
+as such in measurements/red-proof/README.md; the GATED column reads INVALID (2 of 12
+mutant legs — seeds 9 and 12 — show ascending probes against M_nobc's declared descent,
+so `clean_pair_count=10 ≠ 12`). Both readings are current truth at their own layers;
+mutants/README.md must cite the committed artifact and name the gated reading wherever it
+reports the raw one. Under D* the M_nobc column remains INVALID — recorded, not rescued.
+
+FINAL SCHEDULING + PRE-REGISTERED PREDICTIONS (published before the D* re-merge runs):
+the acceptance-5 discharge merge schedules `redproof-signflip-v2` ONLY (M_nobc's committed
+INVALID record stands as evidence; scheduling a column known-INVALID under its own
+declared direction would only re-manufacture an invalid_doses exit). Predictions:
+(i) all 12 signflip_v2 legs clear the D* premise set (all 12 ascend, matching `ascent`;
+init anchors bit-identical); (ii) the column reads n_pos=12, n_neg=0, two-sided
+p = 2/4096 = 1/2048 ≈ 0.000488 (NEVER 1/4096 — the sign test is exact two-sided),
+detected RED; (iii) `red_proof_verdict` = PROVEN; (iv) merge exit 0 (primary GREEN
+unchanged; PROVEN contributes nothing). Deviation from any prediction voids this
+amendment's basis and is a finding to investigate before any verdict claim.
+
+HONESTY RIDER (pressure-test blocking condition 3): D* discharges acceptance 5 at
+M = M_signflip_v2, a CATASTROPHIC mutant (held-out ~3.3 → ~20) — the detector's
+sensitivity CEILING, not a bound near the operating point. The corridor between M_nobc
+(undetected at |mean_d| ~0.02-0.06 raw) and M_signflip_v2 is UNRESOLVED and this unit
+does not claim otherwise: "detects a regression ≥ mutant M" is discharged with
+M = M_signflip_v2 named explicitly. The lr0-control polarity observation
+(a RISING probe at lr=0 is an instrument finding, today recorded as an ordinary
+learning-happened failure) is a SEPARATE decision, deliberately not folded into this
+amendment — the primary path stays byte-identical.
+
+**Postscript 2026-08-29f (lead, round-15 audit block — correcting the amendment's
+falsifier demonstration; the rule stands, the cited mechanism was wrong):** the
+2026-08-29e falsifier claim "this WOULD have fired on inert M_signflip v1 — 12/12
+bit-identical legs have delta 0, failing training_effective's strict floor — a real
+committed case the pre-D* merger passed silently" was TRIPLY WRONG against the very
+legs it cites, verified by execution in round 15: (1) the v1 legs' probe deltas read
++0.6806..+0.9449, not 0 — inertness means the mutant leg equals the CLEAN FUSED leg,
+which descends, so training demonstrably happened; (2) training_effective therefore
+PASSES 12/12 on them — what actually refuses the v1 column under D* is the
+RED_PROOF_EXPECTED_TRAIN_DIRECTION absent-sha refusal (v1's patch sha is not in the
+table): 12 named violations, INVALID; (3) the pre-D* merger did not pass it
+silently — it read detected=not-detected over 12 premise-clean pairs and exited 1
+with NOT_PROVEN (redproof-signflip=not-detected). The honest falsifier statement,
+still favourable to D* and now execution-verified: pre-D* ACCEPTED twelve legs that
+never executed the mutant as premise-CLEAN pairs and computed a sign test over that
+non-evidence (loud in exit code, silent in semantics); D* refuses the column
+outright at the table. The case training_effective's strict floor genuinely catches
+is a dead leg with delta exactly 0.0 — the shape all four committed lr0 control
+legs read. Amendment 2026-08-29e's rule, table, premises, predictions, and honesty
+rider are unchanged by this correction; only the falsifier's cited mechanism is
+superseded by this postscript.

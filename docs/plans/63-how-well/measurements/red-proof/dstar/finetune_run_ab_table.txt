@@ -1,0 +1,26 @@
+# finetune-run A/B -- fused cascade vs ALLOFF, exact two-sided sign test over d_i = fused - alloff (CONTRACT Frame / C16)
+seed    fused_r1  alloff_r1 d_i           premise     
+1       OK        OK        -0.042794     clean       
+2       OK        OK        0.114249      clean       
+3       OK        OK        -0.072175     clean       
+4       OK        OK        0.020832      clean       
+5       OK        OK        -0.102688     clean       
+6       OK        OK        0.152390      clean       
+7       OK        OK        -0.076371     clean       
+8       OK        OK        -0.085886     clean       
+9       OK        OK        -0.028556     clean       
+10      OK        OK        0.031859      clean       
+11      OK        OK        -0.130461     clean       
+12      OK        OK        -0.021356     clean       
+
+sign_test: n=12 n_pos=4 n_neg=8 ties=0 p_value=0.3876953125
+determinism_floor: max_r1_r2_delta=0.0 cross_seed_spread=0.08264997071681932 findings=0
+decision: clean_seed_count=12/12 threshold=11 concordant_direction=none mean_d=-0.020080 alpha2=0.0064 p_value=0.3876953125
+lr0_control: seeds=['1', '2'] violations=0
+status: GREEN
+
+# mutant dose ladder (amendment 2026-08-29b item 3; addendum 2026-08-29c signs it)
+  dose=redproof-signflip-v2 detected=RED          n_pos=12 n_neg=0 mean_d=15.967140335279206 p_value=0.00048828125 clean_pairs=12/12
+  sensitivity: None
+  red_proof: [{'dose_label': 'redproof-signflip-v2', 'patch_sha256': 'c81d0ed59d45761bbd6487dbb23c5aaae22f30739c0e2e613d96c4901ad9b202', 'detected': 'RED', 'n_pos': 12, 'n_neg': 0, 'mean_d': 15.967140335279206, 'p_value': 0.00048828125, 'clean_pair_count': 12}]
+  red_proof_verdict: PROVEN

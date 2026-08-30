@@ -16,36 +16,56 @@
 # TWO MODES, propagated verbatim (issue #335's final unit — see
 # `gpu_inference_ab.sh`'s own "TWO MODES" doc for the full rationale):
 # non-enforcing (the default, `GPU_PERF_AB_ENFORCE` unset/`0`) stays
-# recording-only; enforcing (`GPU_PERF_AB_ENFORCE=1`) opts this run into
-# also refusing a GREEN-premise run whose ratio falls outside the
-# pre-registered advisory band. `gpu_inference_ab.py`'s own exit codes (see
-# that module's doc) are the SAME ones this script propagates — 0 = report
-# written, merge status GREEN (and, under enforcing mode, the ratio landed
-# inside the pre-registered band); 1 = EITHER a real correctness-of-
-# measurement refusal (an identity/provenance mismatch, an
-# INVALID_MEASUREMENT, a GENUINE (parsed) recorded-order violation, or a
-# `b`-role runtime failure with the producer's own `mode` marker CONFIRMING
-# `ab` — round-3 adversarial audit B2 correction: an earlier version of
-# this doc claimed this arm was always "the PR's own problem, never the
-# parent's", which overclaimed a confirmation this driver does not always
-# have -- under `--aa-null` there is no PR to blame at all, and an
-# unconfirmed `mode` never escalates either) OR, under enforcing mode ONLY,
-# a real perf-magnitude refusal (`status` stays GREEN,
-# `enforce_verdict=PERF_REGRESSION` — the merged report's own `status`
-# field is what distinguishes the two, never the bare exit code alone); 2 =
-# a usage/infra error (bad args, a clone/checkout/wrong-tree/fetch
-# failure); 75 = neutral "nothing to compare safely right now" (no RunPod
-# capacity, insufficient free disk on the pod — this driver's own
-# pre-flight `df` check, round-2 adversarial audit F6 — a GPU-busy pod, a
-# PARENT-side build failure, a `MISSING`/`DRY_RUN` leg of either role, a
-# `b`-role runtime failure under `--aa-null`/an unconfirmed mode, an
-# unreadable/unparseable recorded timestamp (round-3 adversarial audit B3),
-# an `origin/main` refresh-fetch failure, `merge-base == HEAD`, or fewer
-# than four `OK` legs) — see `gpu_inference_ab.sh`'s own header for the
-# full, reconciled table this driver's exit code is drawn from verbatim.
-# This driver treats RunPod capacity misses (`rp_deploy_live_a100` failing)
-# with the SAME 75 convention runpod_gpu_prove.sh/runpod_gpu_howwell.sh
-# already use.
+# recording-only; enforcing (`GPU_PERF_AB_ENFORCE=1`, mutually exclusive
+# with `GPU_PERF_AB_AA_NULL=1`) opts this run into also refusing a
+# GREEN-premise run whose ratio falls outside the pre-registered advisory
+# band, on EITHER side (a NULL band, never a "faster is always fine" one —
+# see `gpu_inference_ab.py`'s own doc for why a too-fast ratio is
+# AMBIGUOUS, not favorable by default). `gpu_inference_ab.py`'s own exit
+# codes (see that module's doc) are the SAME ones this script propagates —
+# 0 = report written, merge status GREEN (and, under enforcing mode, `mode
+# == "ab"` AND the ratio landed inside the pre-registered band); 1 = EITHER
+# a real correctness-of-measurement refusal (an identity/provenance
+# mismatch, an INVALID_MEASUREMENT, a GENUINE (parsed) recorded-order
+# violation, or a `b`-role runtime failure with the producer's own `mode`
+# marker CONFIRMING `ab` — round-3 adversarial audit B2 correction: an
+# earlier version of this doc claimed this arm was always "the PR's own
+# problem, never the parent's", which overclaimed a confirmation this
+# driver does not always have -- under `--aa-null` there is no PR to blame
+# at all, and an unconfirmed `mode` never escalates either) OR, under
+# enforcing mode ONLY, one of THREE direction-honest enforcement refusals
+# (`status` stays GREEN in every one): `enforce_verdict=PERF_REGRESSION`
+# (ratio above the upper edge, a real slowdown signal),
+# `enforce_verdict=OUTSIDE_BAND_FAST` (ratio below the lower edge, an
+# AMBIGUOUS signal — a genuine improvement or a broken/short-circuited leg,
+# never assumed favorable), or `enforce_verdict=ENFORCE_INVALID_MODE`
+# (enforcement requested but `mode != "ab"`) — the merged report's own
+# `status`/`enforce_verdict` fields are what distinguish all of these, never
+# the bare exit code alone; 2 = a usage/infra error (bad args, a
+# clone/checkout/wrong-tree/fetch failure, OR
+# `GPU_PERF_AB_AA_NULL=1`-together-with-`GPU_PERF_AB_ENFORCE=1`, refused at
+# the producer's own edge before anything is rented); 75 = neutral "nothing
+# to compare safely right now" (no RunPod capacity, insufficient free disk
+# on the pod — this driver's own pre-flight `df` check, round-2 adversarial
+# audit F6 — a GPU-busy pod, a PARENT-side build failure, a `MISSING`/
+# `DRY_RUN` leg of either role, a `b`-role runtime failure under
+# `--aa-null`/an unconfirmed mode, an unreadable/unparseable recorded
+# timestamp (round-3 adversarial audit B3), an `origin/main` refresh-fetch
+# failure, `merge-base == HEAD`, or fewer than four `OK` legs) — see
+# `gpu_inference_ab.sh`'s own header for the full, reconciled table this
+# driver's exit code is drawn from verbatim. This driver treats RunPod
+# capacity misses (`rp_deploy_live_a100` failing) with the SAME 75
+# convention runpod_gpu_prove.sh/runpod_gpu_howwell.sh already use.
+#
+# GUARD (round-4 delta-audit advisory (3)): when `GPU_PERF_AB_ENFORCE=1`
+# was requested, this driver ALSO asserts the pulled report's own
+# `enforce_verdict` actually reflects that (a `GREEN`-status report reading
+# `NOT_ENFORCED`, or carrying no `enforce_verdict` at all, means the
+# `GPU_INFERENCE_AB_ENFORCE` env var was silently DROPPED somewhere between
+# this driver and the remote comparator — see the "surface the merged
+# status BY NAME" block below) — forcing a nonzero exit even if the
+# underlying `$rc` was `0`, so a dropped env var fails the workflow loudly
+# rather than reporting a silent, unearned green.
 #
 # Env vars:
 #   GIT_REPO   what to clone.
@@ -217,8 +237,27 @@ if [ -n "$REPORT_JSON" ] && [ -f "$REPORT_JSON" ]; then
   STATUS="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$REPORT_JSON" 2>/dev/null || echo "UNKNOWN")"
   ENFORCE_VERDICT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("enforce_verdict", "n/a"))' "$REPORT_JSON" 2>/dev/null || echo "UNKNOWN")"
   echo "=== merged status: ${STATUS} enforce_verdict: ${ENFORCE_VERDICT} (${REPORT_JSON}) ==="
+
+  # round-4 delta-audit advisory (3): enforcement was explicitly requested
+  # for THIS invocation but the pulled, GREEN-status report shows it was
+  # NOT applied (either no enforce_verdict field at all, or the
+  # NOT_ENFORCED value gpu_inference_ab.py::build_report only ever writes
+  # when its own `enforce` marker read False) -- the ONLY way that can
+  # happen on a GREEN report is a dropped GPU_INFERENCE_AB_ENFORCE env var
+  # somewhere between this driver and the remote comparator. A dropped
+  # request must fail the workflow, never silently pass as if
+  # non-enforcing had been asked for on purpose.
+  if [ "$GPU_PERF_AB_ENFORCE" = "1" ] && [ "$STATUS" = "GREEN" ] \
+     && { [ "$ENFORCE_VERDICT" = "NOT_ENFORCED" ] || [ "$ENFORCE_VERDICT" = "n/a" ] || [ "$ENFORCE_VERDICT" = "UNKNOWN" ]; }; then
+    echo "::error::GPU_PERF_AB_ENFORCE=1 was requested for this run, but the pulled report's own status=GREEN carries enforce_verdict='${ENFORCE_VERDICT}' -- enforcement was silently NOT applied (a dropped GPU_INFERENCE_AB_ENFORCE env var somewhere in the remote pipeline is the likely cause). Forcing failure rather than trusting rc=${rc} alone -- an operator's explicit enforcement request must never report a silent, unearned green." >&2
+    rc=1
+  fi
 else
   echo "::warning::no gpu_inference_ab_report.json found under ${GPU_PERF_AB_ARTIFACT_DIR} -- cannot name the merged status."
+  if [ "$GPU_PERF_AB_ENFORCE" = "1" ]; then
+    echo "::error::GPU_PERF_AB_ENFORCE=1 was requested for this run, but no merged report was even pulled -- cannot confirm enforcement was applied; forcing failure rather than trusting rc=${rc} alone." >&2
+    rc=1
+  fi
 fi
 
 exit "$rc"

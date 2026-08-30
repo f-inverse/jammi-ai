@@ -123,6 +123,47 @@ class DryRunSmokeTests(unittest.TestCase):
             self.assertEqual(report["enforce"], True)
             self.assertEqual(report["status"], "INCOMPLETE", "enforcement never fires on a non-GREEN status")
 
+    def test_aa_null_and_enforce_together_hard_fail_exit_2_before_anything_runs(self):
+        """round-4 delta-audit F4: `GPU_INFERENCE_AB_AA_NULL=1` together
+        with `GPU_INFERENCE_AB_ENFORCE=1` must refuse at the PRODUCER's own
+        edge -- exit 2 (a usage error), BEFORE `$RAW_DIR` is even created
+        (no `mode`/`enforce`/`pod_id` marker, no leg trace at all) -- strictly
+        cheaper than discovering the same contradiction only once
+        `gpu_inference_ab.py`'s own `ENFORCE_INVALID_MODE` arm runs after a
+        real four-leg pod rental.
+        """
+        with tempfile.TemporaryDirectory() as out_dir, tempfile.TemporaryDirectory() as work_dir:
+            result = run_dry(
+                out_dir,
+                work_dir,
+                extra_env={"GPU_INFERENCE_AB_AA_NULL": "1", "GPU_INFERENCE_AB_ENFORCE": "1"},
+            )
+            self.assertEqual(result.returncode, 2, f"stdout={result.stdout}\nstderr={result.stderr}")
+            self.assertIn("cannot both be set", result.stderr)
+            raw_dir = os.path.join(out_dir, "raw")
+            self.assertFalse(
+                os.path.isdir(raw_dir),
+                "the mutual-exclusion guard must refuse BEFORE $RAW_DIR is created at all",
+            )
+
+    def test_dry_run_writes_a_pod_id_marker_the_comparator_reads_back(self):
+        """round-4 delta-audit F3(d): the producer must write `$RAW_DIR/pod_id`
+        (`${RUNPOD_POD_ID:-$(hostname)}`) even on a dry run -- a non-empty
+        value round-trips through the REAL `gpu_inference_ab.py::load_pod_id`,
+        never re-implemented here. `RUNPOD_POD_ID` is unset in this hermetic
+        test environment, so the fallback (`$(hostname)`) is what is proven.
+        """
+        with tempfile.TemporaryDirectory() as out_dir, tempfile.TemporaryDirectory() as work_dir:
+            result = run_dry(out_dir, work_dir)
+            self.assertEqual(result.returncode, 75, f"stdout={result.stdout}\nstderr={result.stderr}")
+
+            raw_dir = os.path.join(out_dir, "raw")
+            pod_id_path = os.path.join(raw_dir, "pod_id")
+            self.assertTrue(os.path.isfile(pod_id_path))
+            pod_id = gpu_inference_ab.load_pod_id(raw_dir)
+            self.assertIsNotNone(pod_id)
+            self.assertTrue(pod_id.strip())
+
     def test_dry_run_never_creates_a_real_cargo_target_dir(self):
         """The strongest available proof this run touched no real build:
         `run_cmd`'s dry-run branch never executes `cargo build`, so neither

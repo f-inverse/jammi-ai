@@ -15,12 +15,17 @@ name: GPU perf A/B (RunPod)
 # EVERY label-triggered PR run, and any dispatch that leaves `enforce`
 # unset/`false`) stays recording-only, exactly as before — it uploads the
 # merged report as an artifact for a human to read, is not itself a required
-# merge-path check, and grants no such status. Enforcing
-# (`workflow_dispatch` with `enforce: true`, deliberately invoked, never a
-# label default) opts THAT ONE run into also refusing (exit 1,
-# `enforce_verdict=PERF_REGRESSION`) a GREEN-premise run whose ratio falls
-# outside the pre-registered band. The label-triggered PR path (`pull_request:
-# types: [labeled]`) NEVER sets `enforce` — this lane stays opt-in;
+# merge-path check, and grants no such status. Enforcing (`workflow_dispatch`
+# with `enforce: true`, deliberately invoked, never a label default, and
+# mutually exclusive with `aa_null: true` — guarded below, before any pod is
+# even rented) opts THAT ONE run into also refusing (exit 1) a GREEN-premise
+# run whose ratio falls outside the pre-registered band, DIRECTION-HONESTLY
+# on either side — this is a null band, not a "faster is always fine" one:
+# `enforce_verdict=PERF_REGRESSION` above the upper edge (a real slowdown
+# signal), `enforce_verdict=OUTSIDE_BAND_FAST` below the lower edge (an
+# AMBIGUOUS signal, never assumed favorable — a genuine improvement or a
+# broken/short-circuited leg). The label-triggered PR path (`pull_request`
+# `types: [labeled]`) NEVER sets `enforce` — this lane stays opt-in;
 # enforcement is invoked deliberately, never a PR-label side effect.
 #
 # Off the merge path, same discipline gpu-prove.yml/gpu-howwell.yml's own
@@ -81,6 +86,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # round-4 delta-audit F4: aa_null and enforce are mutually exclusive
+      # (no PR exists under --aa-null to enforce against; the null band
+      # itself was derived from exactly this shape of run). Guarded HERE,
+      # at the workflow's own edge, before renting/building anything --
+      # `ci/scripts/perf/gpu_inference_ab.sh`'s own edge guard and
+      # `gpu_inference_ab.py::build_report`'s own `ENFORCE_INVALID_MODE` arm
+      # BOTH also refuse this combination (defense in depth), but failing
+      # here is strictly cheaper still.
+      - name: Guard the aa_null/enforce checkbox combination
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.aa_null == 'true' && github.event.inputs.enforce == 'true'
+        run: |
+          echo "::error::aa_null and enforce cannot both be true -- --aa-null measures a null (parent-vs-parent) run with no PR to enforce against; refusing before any pod is rented."
+          exit 1
+
       - name: Run the GPU perf A/B on a real A100
         id: perfab
         env:
@@ -109,9 +128,9 @@ jobs:
         if: always() && steps.perfab.outputs.rc == '75'
         run: echo "::warning::gpu-perf-ab FAILED for capacity/build/nothing-to-compare (see the run log for which) — not a code/statistical regression. Re-run once the underlying condition clears."
 
-      - name: Annotate a premise refusal or a perf regression
+      - name: Annotate a premise refusal or an enforcement refusal
         if: always() && steps.perfab.outputs.rc == '1'
-        run: echo "::error::gpu-perf-ab refused (exit 1) — EITHER a real correctness-of-measurement problem, CONFIRMED real before being raised (an identity mismatch between legs, an INVALID_MEASUREMENT defect, a genuine parsed recorded-order violation, a binary whose own provenance did not match the clone it was built from, the PR-side clone's build itself failing, or a b-role leg that ran but did not produce an OK report with the producer's own mode marker confirming ab) — status will read something other than GREEN — OR (issue 335's final unit, enforce=true dispatch runs ONLY) a real perf-magnitude regression — the four legs' premises were GREEN, but the measured ratio fell outside the pre-registered advisory band (status stays GREEN, enforce_verdict=PERF_REGRESSION). See the merged report artifact's own status/enforce_verdict fields to tell the two apart — never inferred from this bare exit code alone."
+        run: echo "::error::gpu-perf-ab refused (exit 1) — EITHER a real correctness-of-measurement problem, CONFIRMED real before being raised (an identity mismatch between legs, an INVALID_MEASUREMENT defect, a genuine parsed recorded-order violation, a binary whose own provenance did not match the clone it was built from, the PR-side clone's build itself failing, or a b-role leg that ran but did not produce an OK report with the producer's own mode marker confirming ab) — status will read something other than GREEN — OR (issue 335's final unit, enforce=true dispatch runs ONLY) an enforcement refusal on an otherwise-GREEN run — enforce_verdict=PERF_REGRESSION (ratio above the band's upper edge, a real slowdown), enforce_verdict=OUTSIDE_BAND_FAST (ratio below the lower edge, AMBIGUOUS -- a genuine improvement or a broken leg, never assumed favorable), or enforce_verdict=ENFORCE_INVALID_MODE (enforcement requested on a non-ab-mode run). See the merged report artifact's own status/enforce_verdict fields to tell all of these apart — never inferred from this bare exit code alone."
 
       - name: Annotate a usage/infra error
         if: always() && steps.perfab.outputs.rc == '2'

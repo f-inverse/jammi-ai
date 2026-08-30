@@ -39,12 +39,15 @@ class DeriveClaimPigeonholeTests(unittest.TestCase):
         self.assertEqual(claim["k_short_rows"], 0)
         self.assertEqual(claim["r_threshold"], 1)
         self.assertEqual(claim["verdict"], "width uniform at W")
+        self.assertEqual(claim["state"], "uniform")
+        self.assertTrue(claim["full_batches_exist"])
 
     def test_no_rows_reach_cap_k_equals_n_never_provable_below_n_plus_1(self):
         claim = fwr.derive_claim([False, False, False], batch_size=3)
         self.assertEqual(claim["k_short_rows"], 3)
         self.assertEqual(claim["r_threshold"], 4)
         self.assertEqual(claim["verdict"], "not provable")
+        self.assertEqual(claim["state"], "not_provable")
 
     def test_mixed_k_short_rows_threshold_is_k_plus_one(self):
         # 12 rows, 3 short (reaches_cap=False) -- r_threshold = 4.
@@ -87,6 +90,8 @@ class DeriveClaimPigeonholeTests(unittest.TestCase):
         self.assertEqual(claim["r_threshold"], 1)
         self.assertEqual(claim["remainder_batch_size"], 0)
         self.assertEqual(claim["verdict"], "width uniform at W")
+        self.assertEqual(claim["state"], "uniform")
+        self.assertFalse(claim["full_batches_exist"])
 
 
 class RemainderBatchTests(unittest.TestCase):
@@ -107,6 +112,8 @@ class RemainderBatchTests(unittest.TestCase):
         self.assertEqual(claim["k_short_rows"], 3)
         self.assertEqual(claim["r_threshold"], 4)
         self.assertEqual(claim["remainder_batch_size"], 2)
+        self.assertTrue(claim["full_batches_exist"])
+        self.assertEqual(claim["state"], "qualified")
         self.assertNotEqual(claim["verdict"], "width uniform at W")
         self.assertIn("full-size", claim["verdict"])
         self.assertIn("remainder batch", claim["verdict"])
@@ -121,6 +128,7 @@ class RemainderBatchTests(unittest.TestCase):
         claim = fwr.derive_claim(reaches_cap, batch_size=3)
         self.assertEqual(claim["remainder_batch_size"], 2)
         self.assertEqual(claim["verdict"], "width uniform at W")
+        self.assertEqual(claim["state"], "uniform")
 
     def test_full_batches_not_uniform_remainder_cannot_rescue_it(self):
         # batch_size itself fails the threshold (batch_size == k) -- the
@@ -129,6 +137,7 @@ class RemainderBatchTests(unittest.TestCase):
         claim = fwr.derive_claim(reaches_cap, batch_size=2)  # 7 % 2 == 1
         self.assertEqual(claim["remainder_batch_size"], 1)
         self.assertEqual(claim["verdict"], "not provable")
+        self.assertEqual(claim["state"], "not_provable")
 
     def test_e1_like_1372_pairs_batch_32_remainder_28_qualifies(self):
         # The contract's own real numbers (module doc): 1372 train pairs,
@@ -144,6 +153,7 @@ class RemainderBatchTests(unittest.TestCase):
         self.assertEqual(claim["r_threshold"], 31)
         self.assertNotEqual(claim["verdict"], "width uniform at W")
         self.assertIn("not provable", claim["verdict"])
+        self.assertEqual(claim["state"], "qualified")
 
     def test_e1_like_1372_pairs_batch_32_remainder_28_still_uniform_when_k_is_small(self):
         # Same real shape, but few enough short rows (k=10) that even the
@@ -155,6 +165,53 @@ class RemainderBatchTests(unittest.TestCase):
         self.assertEqual(claim["remainder_batch_size"], 28)
         self.assertEqual(claim["r_threshold"], 11)
         self.assertEqual(claim["verdict"], "width uniform at W")
+        self.assertEqual(claim["state"], "uniform")
+
+
+class DegenerateArmTests(unittest.TestCase):
+    """Round-2 audit advisory 4's own named bug: `n_rows < batch_size` has
+    NO full-size batch at all -- there is exactly ONE batch (of size
+    n_rows), never "full-size batches plus a remainder". Before this fix,
+    the remainder-batch framing was applied even here, producing a
+    QUALIFIED verdict that talked about "full-size batches" that never
+    existed."""
+
+    def test_fewer_rows_than_one_batch_all_reach_cap_is_uniform(self):
+        # n=2, batch_size=5: only one (undersized) batch ever exists.
+        claim = fwr.derive_claim([True, True], batch_size=5)
+        self.assertEqual(claim["n_rows"], 2)
+        self.assertEqual(claim["remainder_batch_size"], 2)
+        self.assertFalse(claim["full_batches_exist"])
+        self.assertEqual(claim["state"], "uniform")
+        self.assertEqual(claim["verdict"], "width uniform at W")
+        self.assertNotIn("full-size", claim["verdict"])
+        self.assertNotIn("remainder", claim["verdict"])
+
+    def test_fewer_rows_than_one_batch_all_short_is_not_provable(self):
+        # n=2, batch_size=5, BOTH rows short -- k=2, r_threshold=3; the
+        # one real (2-row) batch does not clear it (2 < 3).
+        claim = fwr.derive_claim([False, False], batch_size=5)
+        self.assertEqual(claim["remainder_batch_size"], 2)
+        self.assertFalse(claim["full_batches_exist"])
+        self.assertEqual(claim["state"], "not_provable")
+        self.assertEqual(claim["verdict"], "not provable")
+        self.assertNotIn("full-size", claim["verdict"])
+
+    def test_fewer_rows_than_one_batch_exactly_at_threshold(self):
+        # n=3, batch_size=10, k=2 (one short of 3) -- r_threshold=3, the
+        # real batch (size 3) exactly clears it.
+        claim = fwr.derive_claim([False, False, True], batch_size=10)
+        self.assertEqual(claim["r_threshold"], 3)
+        self.assertFalse(claim["full_batches_exist"])
+        self.assertEqual(claim["state"], "uniform")
+
+    def test_n_equals_batch_size_is_not_degenerate(self):
+        # n == batch_size exactly: ONE full-size batch, remainder 0 --
+        # takes the normal (non-degenerate) path, full_batches_exist=True.
+        claim = fwr.derive_claim([True, True, True], batch_size=3)
+        self.assertEqual(claim["remainder_batch_size"], 0)
+        self.assertTrue(claim["full_batches_exist"])
+        self.assertEqual(claim["state"], "uniform")
 
 
 class BuildReportShapeTests(unittest.TestCase):

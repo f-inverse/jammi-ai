@@ -12,12 +12,11 @@
 # equivalent), an installed `nsys` (CONTRACT: 2025.3.2), and two real
 # checkpoint directories (`$MODEL_DIR_BERT`/`$MODEL_DIR_DISTILBERT`).
 # `PROFILE_356_LEGS_DRY_RUN=1` makes the WHOLE pipeline safe to exercise
-# hermetically (every `nsys`/`$BENCH_BIN` invocation is printed via
-# `run_cmd`, never executed; each run's own JSON stub is DERIVED from the
-# committed `finetune_run_golden` fixture -- see `_dry_run_stub_report`'s
-# own doc -- so every reader below runs against the SAME envelope shape a
-# real `jammi-bench finetune-run` actually emits, never a hand-shaped
-# stand-in).
+# hermetically: `$NSYS_BIN`/`$BENCH_BIN` are swapped for hermetic fake
+# stand-ins generated into `$DRY_RUN_STUB_DIR` (see that variable's own
+# doc) and ACTUALLY EXECUTED (never a hand-shaped bypass) through the
+# EXACT SAME capture path a real leg uses -- `_print_cmd` still prints the
+# real, would-be production command line for operator visibility.
 #
 # PRECONDITION GUARD (round-3 contract pressure-test, v4): this script
 # REFUSES, before any leg runs, unless the bench binary carries THREE
@@ -85,8 +84,10 @@
 # doc). `manifest.json` also carries `status`/`reason`/`census_ok` per leg
 # -- "leg INVALID, recorded, sweep continues" is a RECORD, not just a
 # warning line: a leg-level failure anywhere in this script never aborts
-# the whole sweep (every risky step is individually guarded; `run_leg`
-# itself always returns 0), but IS captured in that leg's own manifest.
+# the whole sweep, and every leg gets a manifest, always (phase-4 round-2
+# audit BLOCK 2 -- see `run_leg`'s own doc for how this is now enforced
+# by EXPLICIT guards, not by relying on `set -e`'s errexit-suspension
+# quirk alone).
 #
 # WALL DENOMINATOR (v4): each run's own `train_run_wall_s` is read from
 # `tiers.finetune_run` in its JSON report and passed to `kernel_census.py`
@@ -111,8 +112,9 @@
 #   MODEL_DIR_DISTILBERT   distilbert-base-uncased checkpoint dir
 #   OUT_DIR                output directory for every leg's artifacts
 #                          (default: `$REPO_ROOT/.profile-356-legs/<ts>`)
-#   PROFILE_356_LEGS_DRY_RUN   "1" prints every command, executes nothing
-#                              (default "0")
+#   PROFILE_356_LEGS_DRY_RUN   "1" swaps in hermetic fake nsys/bench
+#                              stand-ins and drives them through the real
+#                              capture path (default "0")
 #   PROFILE_356_LEGS_PREFLIGHT_ONLY
 #                              "1" runs the preflight probe then exits
 #                              (before the leg sweep) -- the hook a
@@ -126,9 +128,12 @@
 #
 # Hermetic self-tests: `python3 ci/scripts/perf/test_profile_356_legs_dry_run.py`
 # drives this script under PROFILE_356_LEGS_DRY_RUN=1 end to end (every
-# leg, every reader, the manifest schema); its own preflight arm drives
+# leg, every reader, the manifest schema, a chatty-fake-nsys stdout-
+# pollution arm); its own preflight arm drives
 # `PROFILE_356_LEGS_PREFLIGHT_ONLY=1` against a fake `$BENCH_BIN` stub
-# covering the pass case and each of the four distinguishable failure arms.
+# covering the pass case and each of the four distinguishable failure
+# arms; a fifth arm drives a mid-sweep `nsys --version` failure, asserting
+# the failing leg alone is recorded invalid and the NEXT leg still runs.
 
 set -euo pipefail
 
@@ -185,13 +190,36 @@ else
   echo "::warning::PROFILE_356_LEGS_DRY_RUN=1 -- nothing is read from MODEL_DIR_*/NSYS_BIN/BENCH_BIN."
 fi
 
+# `nsys --version` ONCE at startup (phase-4 round-2 audit BLOCK 2):
+# previously re-invoked, unguarded, inside `run_leg` for EVERY leg -- a
+# failing `nsys --version` (an unguarded plain assignment) aborted the
+# WHOLE sweep mid-leg via `set -e`, with no manifest for the failing leg.
+# Guarded here, computed once, reused by every leg -- a failure here
+# degrades to a recorded "unknown" string, never a script-wide abort.
+NSYS_VERSION="unknown"
+if [ "$PROFILE_356_LEGS_DRY_RUN" != "1" ]; then
+  NSYS_VERSION="$("$NSYS_BIN" --version 2>&1 | head -1)" || NSYS_VERSION="unknown (nsys --version failed)"
+fi
+
+# --- trace-echo helper (phase-4 round-2 audit BLOCK 1(a)): ALWAYS to
+# stderr, never stdout -- a trace line sharing stdout with a captured
+# child process's own JSON report was exactly how the report-envelope
+# capture bug (BLOCK 1(b), see run_traced's own doc) went undetected.
+_print_cmd() {
+  printf '+' >&2
+  printf ' %q' "$@" >&2
+  printf '\n' >&2
+}
+
 # --- state-changing command wrapper (same shape as finetune_run_ab.sh's
-# own run_cmd): always echoes what it would run; under DRY_RUN never
-# executes.
+# own run_cmd): always echoes what it would run (to stderr -- see
+# `_print_cmd`); under DRY_RUN never executes. Used for invocations whose
+# own stdout is never captured into a report file (corpus generation,
+# `verify_train_pairs.py`, `kernel_census.py`) -- `run_traced`'s own nsys/
+# bench invocation does NOT go through this wrapper; see its own doc for
+# why.
 run_cmd() {
-  printf '+'
-  printf ' %q' "$@"
-  printf '\n'
+  _print_cmd "$@"
   if [ "$PROFILE_356_LEGS_DRY_RUN" = "1" ]; then
     return 0
   fi
@@ -219,7 +247,13 @@ if [ "$PROFILE_356_LEGS_DRY_RUN" != "1" ]; then
 fi
 
 # =====================================================================
-# Precondition guard (P1 cross-check) -- see module doc.
+# Precondition guard (P1 cross-check) -- see module doc. Every setup step
+# below is explicitly guarded (phase-4 round-2 audit BLOCK 2's "sweep
+# preflight_probe too") -- a setup failure here is loud and intentional
+# (`exit 1`, a clear message), never a raw, unexplained `set -e` abort;
+# aborting the WHOLE script on a genuine preflight-setup failure is
+# correct (preflight gates the entire run), the fix here is HOW it aborts,
+# not WHETHER it does.
 # =====================================================================
 preflight_probe() {
   if [ "$PROFILE_356_LEGS_DRY_RUN" = "1" ]; then
@@ -241,16 +275,37 @@ preflight_probe() {
   # 2): an unqualified probe would fail on the unconditional
   # zero-trainable-LoRA refusal instead of ever reaching the dispatch
   # check.
-  local probe_dir; probe_dir="$(mktemp -d)"
+  local probe_dir
+  if ! probe_dir="$(mktemp -d)"; then
+    echo "::error::preflight_probe: mktemp -d failed -- cannot set up the probe corpus." >&2
+    exit 1
+  fi
   local probe_corpus="$probe_dir/probe.jsonl"
-  python3 "$DIR/gen_fixed_width_corpus.py" --rows 1 --min-wordpieces 4 --seed 1 --out "$probe_corpus" >/dev/null
+  if ! python3 "$DIR/gen_fixed_width_corpus.py" --rows 1 --min-wordpieces 4 --seed 1 --out "$probe_corpus" >/dev/null; then
+    echo "::error::preflight_probe: could not generate the probe corpus at $probe_corpus." >&2
+    rm -rf "$probe_dir"
+    exit 1
+  fi
   local probe_ids="$probe_dir/probe_ids.txt"
-  local anchor_id; anchor_id="$(python3 -c 'import json; print(json.loads(open("'"$probe_corpus"'").readline())["anchor_id"])')"
-  local positive_id; positive_id="$(python3 -c 'import json; print(json.loads(open("'"$probe_corpus"'").readline())["positive_id"])')"
-  local negative_id; negative_id="$(python3 -c 'import json; print(json.loads(open("'"$probe_corpus"'").readline())["negative_id"])')"
-  printf '%s\t%s\t%s\n' "$anchor_id" "$positive_id" "$negative_id" > "$probe_ids"
-  local probe_work; probe_work="$probe_dir/work"
-  mkdir -p "$probe_work"
+  local anchor_id positive_id negative_id
+  if ! anchor_id="$(python3 -c 'import json; print(json.loads(open("'"$probe_corpus"'").readline())["anchor_id"])')" \
+      || ! positive_id="$(python3 -c 'import json; print(json.loads(open("'"$probe_corpus"'").readline())["positive_id"])')" \
+      || ! negative_id="$(python3 -c 'import json; print(json.loads(open("'"$probe_corpus"'").readline())["negative_id"])')"; then
+    echo "::error::preflight_probe: could not parse ids out of the probe corpus." >&2
+    rm -rf "$probe_dir"
+    exit 1
+  fi
+  if ! printf '%s\t%s\t%s\n' "$anchor_id" "$positive_id" "$negative_id" > "$probe_ids"; then
+    echo "::error::preflight_probe: could not write $probe_ids." >&2
+    rm -rf "$probe_dir"
+    exit 1
+  fi
+  local probe_work="$probe_dir/work"
+  if ! mkdir -p "$probe_work"; then
+    echo "::error::preflight_probe: could not create $probe_work." >&2
+    rm -rf "$probe_dir"
+    exit 1
+  fi
   local probe_out="$probe_dir/probe.json"
   local probe_err="$probe_dir/probe.stderr"
   local probe_rc=0
@@ -329,30 +384,74 @@ HELDOUT_JSONL="$FIXTURE_DIR/heldout_pairs.jsonl"
 TRAIN_JSONL_REAL="${TRAIN_JSONL:-$FIXTURE_DIR/train_pairs.jsonl}"
 GOLDEN_FIXTURE="$REPO_ROOT/ci/scripts/perf/fixtures/finetune_run_golden/bert_fused.json"
 
-# Emits the REAL Report envelope shape (`{"tool":...,"tiers":
-# {"finetune_run":{...}}}` -- `main.rs::run_finetune_run`), DERIVED from
-# the committed golden fixture -- never hand-shaped -- so a DRY_RUN run
-# exercises the EXACT same JSON structure every real reader in this script
-# binds to (phase-4 audit CLASS 1: a hand-shaped `{"train_run_wall_s":
-# ...}` top-level stub let three real bugs -- the preflight field probe
-# always reading `false`, `_wall_s` KeyError-aborting the whole sweep
-# under `set -e`, `_lora_counters` silently yielding `{}` -- ship
-# undetected, because the stub never exercised the readers' real
-# `tiers.finetune_run` binding at all).
-_dry_run_stub_report() {
-  local out_json="$1" steps_measured="$2"
-  python3 -c '
+# Hermetic fake nsys/bench stand-ins, used ONLY under
+# PROFILE_356_LEGS_DRY_RUN=1 -- generated ONCE, reused for every leg, so
+# the DRY_RUN sweep drives the EXACT SAME capture path (the exec-wrapper,
+# the stderr redirect, the post-write envelope validation in `run_traced`)
+# a real GPU-pod run uses, never a hand-shaped bypass (phase-4 round-2
+# audit BLOCK 1's own "CRITICAL": a stub JSON written directly by this
+# script, skipping the capture machinery entirely, structurally cannot
+# catch a bug IN that machinery). `fake_nsys.sh` is deliberately CHATTY on
+# stdout for BOTH its subcommands (mirroring real nsys's own progress
+# output) to prove the capture path discards it regardless; `fake_bench.sh`
+# emits the golden-derived envelope on ITS OWN stdout (never writes a file
+# directly), exercising the exec-wrapper's redirect for real.
+DRY_RUN_STUB_DIR=""
+if [ "$PROFILE_356_LEGS_DRY_RUN" = "1" ]; then
+  DRY_RUN_STUB_DIR="$(mktemp -d)"
+  trap 'rm -rf "$DRY_RUN_STUB_DIR"' EXIT
+
+  cat > "$DRY_RUN_STUB_DIR/fake_nsys.sh" <<'FAKE_NSYS_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "fake_nsys: chatty stdout noise on purpose, mirroring real nsys progress output"
+if [ "$1" = "export" ]; then
+  shift
+  out=""
+  for a in "$@"; do
+    case "$a" in
+      --output=*) out="${a#--output=}" ;;
+    esac
+  done
+  echo "fake_nsys: export writing to '$out' (more stdout noise)"
+  if [ -n "$out" ]; then : > "$out"; fi
+  exit 0
+fi
+if [ "$1" = "profile" ]; then
+  shift
+  args=("$@")
+  for i in "${!args[@]}"; do
+    if [ "${args[$i]}" = "--" ]; then
+      rest=("${args[@]:$((i+1))}")
+      echo "fake_nsys: launching the traced command (even more stdout noise)"
+      exec "${rest[@]}"
+    fi
+  done
+  echo "fake_nsys: no -- separator found in profile args" >&2
+  exit 1
+fi
+echo "fake_nsys: unknown subcommand $1" >&2
+exit 1
+FAKE_NSYS_EOF
+  chmod +x "$DRY_RUN_STUB_DIR/fake_nsys.sh"
+
+  cat > "$DRY_RUN_STUB_DIR/fake_bench.sh" <<'FAKE_BENCH_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+# $1=steps_measured $2=golden_json_path -- emits the golden-derived Report
+# envelope on ITS OWN stdout (never writes a file directly), so the exec-
+# wrapper's own "redirect this child's stdout to the report file"
+# mechanism is what actually produces the report, for real.
+python3 -c '
 import copy, json, sys
-golden_path, out_path, steps_measured = sys.argv[1], sys.argv[2], int(sys.argv[3])
+steps_measured, golden_path = int(sys.argv[1]), sys.argv[2]
 golden = json.load(open(golden_path))
 tier = copy.deepcopy(golden["tiers"]["finetune_run"])
 # Proportional to steps_measured (never a flat constant): the M-step run
 # always declares more steps than the N-step run, so this keeps
-# wall_m > wall_a > 0 genuinely true across the stubbed pair, exercising
-# the wall-pair domain check in kernel_census.py the same way a real
-# same-workload N<M pair would satisfy it, rather than an equal (and
-# therefore WallPairInvalidError-triggering) constant. Bash single-quotes
-# this whole block -- NO apostrophes/contractions allowed in this comment.
+# wall_m > wall_a > 0 genuinely true across the fake pair, exercising the
+# wall-pair domain check in kernel_census.py the same way a real
+# same-workload N<M pair would satisfy it.
 tier["train_run_wall_s"] = 0.01 * steps_measured
 tier["steps_measured"] = steps_measured
 tier["lora_linear_eager_dispatches"] = 1
@@ -360,16 +459,59 @@ tier["lora_linear_fused_dispatches"] = 0
 tier["lora_epilogue_eager_dispatches"] = 1
 tier["lora_epilogue_fused_dispatches"] = 0
 report = {"tool": "dry-run", "profile_356_dry_run": True, "tiers": {"finetune_run": tier}}
-json.dump(report, open(out_path, "w"))
-' "$GOLDEN_FIXTURE" "$out_json" "$steps_measured"
+json.dump(report, sys.stdout)
+' "$1" "$2"
+echo "fake_bench: stderr noise too, never captured into the report" >&2
+FAKE_BENCH_EOF
+  chmod +x "$DRY_RUN_STUB_DIR/fake_bench.sh"
+fi
+
+# Validates "$1" parses as JSON and carries a `tiers.finetune_run` OBJECT
+# (phase-4 round-2 audit BLOCK 1(c)) -- called right after the traced
+# invocation writes the report, BEFORE any reader (`_wall_s`/
+# `_steps_measured`/`_lora_counters`) touches it. A parse failure or a
+# missing/wrong-shaped `tiers.finetune_run` is a recorded leg-INVALID
+# reason, never a downstream KeyError/TypeError surfacing from one of
+# those readers instead.
+_validate_report_envelope() {
+  python3 -c '
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        d = json.load(f)
+except (OSError, json.JSONDecodeError) as e:
+    print("::error::_validate_report_envelope: " + path + " does not parse as JSON: " + str(e), file=sys.stderr)
+    sys.exit(1)
+tiers = d.get("tiers")
+tier = tiers.get("finetune_run") if isinstance(tiers, dict) else None
+if not isinstance(tier, dict):
+    print("::error::_validate_report_envelope: " + path + " has no tiers.finetune_run object", file=sys.stderr)
+    sys.exit(1)
+' "$1"
 }
 
 # One nsys-traced finetune-run: writes "$out_json" (the run's own JSON
-# report) and "$out_sqlite" (the nsys sqlite export). Returns the
-# underlying command's exit status (0 on success) -- `run_leg` decides
-# what a nonzero return means for this leg's own status; this function
-# itself never aborts the sweep (every command here is either `run_cmd`,
-# already-guarded, or the DRY_RUN stub path).
+# report, VALIDATED before return -- see `_validate_report_envelope`) and
+# "$out_sqlite" (the nsys sqlite export). Returns the underlying command's
+# exit status (0 on success) -- `run_leg` decides what a nonzero return
+# means for this leg's own status.
+#
+# NEVER CAPTURES THE NSYS-WRAPPED PROCESS'S OWN STDOUT AS THE REPORT
+# (phase-4 round-2 audit BLOCK 1(b)): the previous
+# `run_cmd ... -- "${cmd[@]}" > "$out_json"` redirected run_cmd's OWN
+# trace echo AND nsys's OWN progress output AND the bench child's stdout
+# all into one file -- `json.load` then failed on every REAL leg (the
+# report always started with a `+ nsys profile ...` trace line), which
+# every reader below folded into a "leg invalid" status, so a real GPU-pod
+# run of this script recorded status=invalid on all 14 legs unconditionally,
+# never because of anything the profiled workload itself did. The fix:
+# the bench child's stdout is redirected to "$out_json" INSIDE the traced
+# invocation via a `bash -c 'exec ... > "$0"'` wrapper, so ONLY that
+# child's own stdout ever reaches the report file, regardless of what nsys
+# prints to ITS OWN stdout -- `_print_cmd` (stderr-only, see its own doc)
+# shows the real, would-be production command line for operator
+# visibility, entirely separate from the actual exec below.
 #
 # EVERY declared leg parameter reaches this cmd array (phase-4 audit
 # CLASS 3): `--max-seq-length "$width"` (previously OMITTED entirely --
@@ -384,7 +526,11 @@ run_traced() {
         width="${10}" steps_this_run="${11}" \
         work_dir="${12}" run_prefix="${13}" out_json="${14}" out_sqlite="${15}"
 
-  mkdir -p "$work_dir"
+  if ! mkdir -p "$work_dir"; then
+    echo "::error::run_traced: could not create $work_dir" >&2
+    return 1
+  fi
+
   local -a cmd=(
     "$BENCH_BIN" finetune-run
     --model-dir "$model_dir" --arm fused
@@ -402,28 +548,40 @@ run_traced() {
     cmd+=(--layers-to-transform "$layers_to_transform")
   fi
 
+  # What actually execs -- swapped for the hermetic fakes under DRY_RUN
+  # (see $DRY_RUN_STUB_DIR's own doc); $NSYS_BIN/cmd[] (below, via
+  # _print_cmd) always show the REAL, would-be production command line
+  # regardless of which binaries actually run.
+  local exec_nsys_bin="$NSYS_BIN"
+  local -a exec_cmd=("${cmd[@]}")
   if [ "$PROFILE_356_LEGS_DRY_RUN" = "1" ]; then
-    run_cmd "$NSYS_BIN" profile --trace=cuda -o "$run_prefix" --force-overwrite=true -- "${cmd[@]}"
-    run_cmd "$NSYS_BIN" export --type=sqlite --output="$out_sqlite" --force-overwrite=true "$run_prefix.nsys-rep"
-    _dry_run_stub_report "$out_json" "$steps_this_run"
-    : > "$out_sqlite"
-    return 0
+    exec_nsys_bin="$DRY_RUN_STUB_DIR/fake_nsys.sh"
+    exec_cmd=("$DRY_RUN_STUB_DIR/fake_bench.sh" "$steps_this_run" "$GOLDEN_FIXTURE")
   fi
 
+  local -a wrapped=(bash -c 'exec "$1" "${@:2}" > "$0"' "$out_json" "${exec_cmd[@]}")
+
+  _print_cmd "$NSYS_BIN" profile --trace=cuda -o "$run_prefix" --force-overwrite=true -- "${cmd[@]}"
   local rc=0
-  run_cmd "$NSYS_BIN" profile --trace=cuda -o "$run_prefix" --force-overwrite=true -- "${cmd[@]}" > "$out_json" 2> "$run_prefix.stderr" || rc=$?
-  run_cmd "$NSYS_BIN" export --type=sqlite --output="$out_sqlite" --force-overwrite=true "$run_prefix.nsys-rep" || rc=$?
+  "$exec_nsys_bin" profile --trace=cuda -o "$run_prefix" --force-overwrite=true -- "${wrapped[@]}" \
+    2> "$run_prefix.stderr" || rc=$?
+
+  if [ "$rc" -eq 0 ]; then
+    _print_cmd "$NSYS_BIN" export --type=sqlite --output="$out_sqlite" --force-overwrite=true "$run_prefix.nsys-rep"
+    "$exec_nsys_bin" export --type=sqlite --output="$out_sqlite" --force-overwrite=true "$run_prefix.nsys-rep" \
+      2>> "$run_prefix.stderr" || rc=$?
+  fi
+
+  if [ "$rc" -eq 0 ] && ! _validate_report_envelope "$out_json"; then
+    echo "::error::run_traced: $out_json failed report-envelope validation -- see stderr above" >&2
+    rc=1
+  fi
   return "$rc"
 }
 
 # Reads `tiers.finetune_run.train_run_wall_s` -- REFUSES (nonzero exit,
 # clear stderr message, no stray stdout) rather than KeyError-ing when
-# either the envelope or the field is absent (phase-4 audit CLASS 1: the
-# prior top-level `["train_run_wall_s"]` read KeyErrored, and as a plain
-# `var=$(...)` assignment under `set -e` this ABORTED THE WHOLE SWEEP --
-# `run_leg`'s own explicit `|| { leg_status=invalid; ...; }` guards at
-# every call site are what actually contain a refusal to this one leg now,
-# not this function's own exit code alone).
+# either the envelope or the field is absent.
 _wall_s() {
   python3 -c '
 import json, sys
@@ -436,7 +594,7 @@ print(tier["train_run_wall_s"])
 ' "$1"
 }
 
-# Reads `tiers.finetune_run.steps_measured` -- same REFUSE-don't-degrade
+# Reads `tiers.finetune_run.steps_measured` -- same REFUSE-dont-degrade
 # posture as `_wall_s`. Call sites tolerate absence explicitly (`||
 # steps_measured_x=""`) since this field is cross-checked "when available"
 # (CONTRACT/audit CLASS 4(c)), never required the way `train_run_wall_s`
@@ -479,19 +637,21 @@ print(json.dumps({k: tier[k] for k in required}))
 ' "$1"
 }
 
-# Writes leg_dir/manifest.json -- ALWAYS, regardless of whether this leg's
-# own status is "ok" or "invalid" (phase-4 audit CLASS 3: "leg INVALID,
-# recorded, sweep continues" must be an actual RECORD, not just a log
-# line). Every declared leg-table column (width, target_modules,
-# layers_to_transform, dtype, eval_cadence, steps_declared) plus the
-# report-measured steps_measured (when readable) and the census/LoRA-
-# counter outcome. `git_sha`/`box`/`driver`/`nsys_version` are this
-# producer's own per-leg elaboration of the contract's own legs-table
-# sentence, "one session, same box, one build, binary git-sha stamped per
-# leg" -- that sentence names the session-level invariant (same box, same
-# build, one git sha for the whole sweep); it does not itself enumerate
-# `driver`/`nsys_version` as separate fields, which this producer adds for
-# its own auditability.
+# Writes a leg's manifest.json -- callers guard the CALL itself (a write
+# failure is sweep-fatal, see `run_leg`'s own doc). Every declared
+# leg-table column (width, target_modules, layers_to_transform, dtype,
+# eval_cadence, steps_declared) plus the report-measured steps_measured
+# (when readable) and the census/LoRA-counter outcome. `git_sha`/`box`/
+# `driver`/`nsys_version` are this producer's own per-leg elaboration of
+# the contract's own legs-table sentence, "one session, same box, one
+# build, binary git-sha stamped per leg" -- that sentence names the
+# session-level invariant; it does not itself enumerate `driver`/
+# `nsys_version` as separate fields, which this producer adds for its own
+# auditability. `dry_run` (phase-4 round-2 audit advisory 1) marks every
+# manifest written under `PROFILE_356_LEGS_DRY_RUN=1` so a reader never
+# mistakes a hermetic fake-execution manifest for a real GPU-pod result --
+# `census_ok`/`status: ok` under DRY_RUN describe the FAKE pipeline
+# completing, never a real measurement.
 _write_manifest() {
   MANIFEST_LEG_ID="$1" MANIFEST_GIT_SHA="$2" MANIFEST_BOX="$3" MANIFEST_NSYS_VERSION="$4" \
   MANIFEST_DTYPE="$5" MANIFEST_WIDTH="$6" MANIFEST_TARGET_MODULES="$7" \
@@ -499,7 +659,7 @@ _write_manifest() {
   MANIFEST_STEPS_DECLARED_N="${10}" MANIFEST_STEPS_DECLARED_M="${11}" \
   MANIFEST_STEPS_MEASURED_N="${12}" MANIFEST_STEPS_MEASURED_M="${13}" \
   MANIFEST_STATUS="${14}" MANIFEST_REASON="${15}" MANIFEST_CENSUS_OK="${16}" \
-  MANIFEST_LORA_N="${17}" MANIFEST_LORA_M="${18}" MANIFEST_OUT="${19}" \
+  MANIFEST_LORA_N="${17}" MANIFEST_LORA_M="${18}" MANIFEST_DRY_RUN="${19}" MANIFEST_OUT="${20}" \
   python3 -c '
 import json, os
 
@@ -532,6 +692,7 @@ manifest = {
     "census_ok": os.environ["MANIFEST_CENSUS_OK"] == "true",
     "lora_counters_n_run": json.loads(os.environ["MANIFEST_LORA_N"]),
     "lora_counters_m_run": json.loads(os.environ["MANIFEST_LORA_M"]),
+    "dry_run": os.environ["MANIFEST_DRY_RUN"] == "true",
 }
 json.dump(manifest, open(os.environ["MANIFEST_OUT"], "w"), indent=1)
 '
@@ -539,15 +700,23 @@ json.dump(manifest, open(os.environ["MANIFEST_OUT"], "w"), indent=1)
 
 # One leg, start to finish. ALWAYS returns 0 -- a leg's own failure lives
 # in its `manifest.json` (`status`/`reason`), never in this function's own
-# exit code, so one leg's OOM/refusal never discards any other leg (phase-4
-# audit CLASS 3: previously several risky reads here were plain,
-# `set -e`-fatal commands -- e.g. `wall_n="$(_wall_s "$out_n")"` -- so a
-# single leg's read failure silently ABORTED THE ENTIRE 14-LEG SWEEP,
-# directly contradicting this function's own "never aborts" doc. Every
-# risky step below is now an explicit `if leg_status = ok; then ... ||
-# {leg_status=invalid; ...}; fi` guard, so a failure partway through a leg
-# skips only that leg's REMAINING steps -- never the sweep, and never even
-# this function's own control flow via `set -e`).
+# exit code, so one leg's OOM/refusal never discards any other leg.
+#
+# EVERY RISKY COMMAND IS EXPLICITLY GUARDED (phase-4 round-2 audit
+# BLOCK 2): round-1's fix relied in part on `set -e`'s own "errexit is
+# suspended for a command tested by if/||" behavior propagating through
+# nested calls -- true, but ONLY for commands reachable that way; a
+# handful of PLAIN, untested commands (the old per-leg `nsys --version`
+# capture, the corpus `head` redirects, the `manifest.json` write itself)
+# were still exposed, and a real pod run reproduced exactly that: a
+# failing `nsys --version` aborted the WHOLE 14-leg sweep mid-leg with NO
+# manifest for the failing leg. Every one of those is now an explicit
+# `if ... ; then ... ; else leg_status=invalid; fi` (or, for the manifest
+# write itself, a loud, intentional `exit 1` -- see below) -- this
+# function's own "never aborts" guarantee no longer depends on the
+# calling convention at its OWN call site (the bottom loop calls it
+# plainly, verified: a bug inside `run_leg` cannot escape `run_leg` at
+# all now, regardless of how it is invoked).
 run_leg() {
   local spec="$1"
   IFS='|' read -r leg_id model batch width dtype target_modules layers_to_transform corpus_mode n_steps m_steps <<< "$spec"
@@ -564,9 +733,24 @@ run_leg() {
   local model_dir
   if [ "$model" = "bert" ]; then model_dir="$MODEL_DIR_BERT"; else model_dir="$MODEL_DIR_DISTILBERT"; fi
 
+  local dry_run_flag="false"
+  if [ "$PROFILE_356_LEGS_DRY_RUN" = "1" ]; then dry_run_flag="true"; fi
+
   local leg_dir="$OUT_DIR/$leg_id"
   if ! mkdir -p "$leg_dir"; then
-    echo "::error::$leg_id: could not create $leg_dir -- nothing recorded for this leg." >&2
+    # Cannot write ANYTHING under leg_dir -- fall back to a FLAT manifest
+    # path directly under OUT_DIR (phase-4 round-2 audit BLOCK 2: "write a
+    # minimal manifest even there", never a silent return with nothing
+    # recorded for this leg).
+    echo "::error::$leg_id: could not create $leg_dir -- writing a fallback manifest instead." >&2
+    if ! _write_manifest \
+        "$leg_id" "$SHA" "$(hostname)" "$NSYS_VERSION" "$dtype" "$width" "$target_modules" \
+        "$layers_to_transform" "$EVAL_CADENCE" "$n_steps" "$m_steps" \
+        "" "" "invalid" "could not create leg directory $leg_dir" "false" \
+        "null" "null" "$dry_run_flag" "$OUT_DIR/${leg_id}.manifest.json"; then
+      echo "::error::$leg_id: could not write even the fallback manifest.json -- this IS sweep-fatal (results cannot be recorded); aborting." >&2
+      exit 1
+    fi
     return 0
   fi
 
@@ -587,9 +771,13 @@ run_leg() {
     if [ "$PROFILE_356_LEGS_DRY_RUN" != "1" ]; then
       if python3 "$DIR/gen_fixed_width_corpus.py" --rows "$rows_m" --min-wordpieces "$width" \
           --seed 42 --out "$full_corpus" "${verify_tok_args[@]}"; then
-        head -n "$rows_n" "$full_corpus" > "$leg_dir/corpus_n${n_steps}.jsonl"
-        train_n="$leg_dir/corpus_n${n_steps}.jsonl"
-        train_m="$full_corpus"
+        if head -n "$rows_n" "$full_corpus" > "$leg_dir/corpus_n${n_steps}.jsonl"; then
+          train_n="$leg_dir/corpus_n${n_steps}.jsonl"
+          train_m="$full_corpus"
+        else
+          leg_status="invalid"
+          leg_reason="head -n $rows_n $full_corpus failed while slicing the N-step corpus"
+        fi
       else
         leg_status="invalid"
         leg_reason="gen_fixed_width_corpus.py failed (see leg dir for any partial output)"
@@ -610,10 +798,14 @@ run_leg() {
     # absent/fails verification.
     if [ "$PROFILE_356_LEGS_DRY_RUN" != "1" ]; then
       if python3 "$DIR/verify_train_pairs.py" --pairs "$TRAIN_JSONL_REAL"; then
-        head -n "$(( batch * n_steps ))" "$TRAIN_JSONL_REAL" > "$leg_dir/corpus_n${n_steps}.jsonl"
-        head -n "$(( batch * m_steps ))" "$TRAIN_JSONL_REAL" > "$leg_dir/corpus_m${m_steps}.jsonl"
-        train_n="$leg_dir/corpus_n${n_steps}.jsonl"
-        train_m="$leg_dir/corpus_m${m_steps}.jsonl"
+        if head -n "$(( batch * n_steps ))" "$TRAIN_JSONL_REAL" > "$leg_dir/corpus_n${n_steps}.jsonl" \
+            && head -n "$(( batch * m_steps ))" "$TRAIN_JSONL_REAL" > "$leg_dir/corpus_m${m_steps}.jsonl"; then
+          train_n="$leg_dir/corpus_n${n_steps}.jsonl"
+          train_m="$leg_dir/corpus_m${m_steps}.jsonl"
+        else
+          leg_status="invalid"
+          leg_reason="head -n ... $TRAIN_JSONL_REAL failed while slicing the E1 real corpus"
+        fi
       else
         leg_status="invalid"
         leg_reason="$TRAIN_JSONL_REAL failed byte-verification against the committed train_ids_sha256.json"
@@ -661,10 +853,10 @@ run_leg() {
   fi
 
   # steps_measured: cross-checked "when available" -- absence alone is
-  # never a leg failure (a build predating that field, or a DRY_RUN stub
-  # that chose not to populate it, is not an error), only a DISAGREEMENT
-  # with the declared count is (kernel_census.py's own domain check, fed
-  # via --steps-measured-a/-b below).
+  # never a leg failure (a build predating that field, or a fake that
+  # chose not to populate it, is not an error), only a DISAGREEMENT with
+  # the declared count is (kernel_census.py's own domain check, fed via
+  # --steps-measured-a/-b below).
   local steps_measured_n="" steps_measured_m=""
   if [ "$leg_status" = "ok" ]; then
     steps_measured_n="$(_steps_measured "$out_n" 2>/dev/null)" || steps_measured_n=""
@@ -707,16 +899,19 @@ run_leg() {
     fi
   fi
 
-  local nsys_version="unknown"
-  if [ "$PROFILE_356_LEGS_DRY_RUN" != "1" ]; then
-    nsys_version="$("$NSYS_BIN" --version 2>&1 | head -1)"
+  # A manifest write failure IS sweep-fatal (this is the ONE thing this
+  # script cannot degrade gracefully from -- without it, this leg's
+  # result is unrecorded and unrecoverable) -- but it fails LOUDLY and
+  # deliberately (an explicit `exit 1` with a clear message), never a raw
+  # `set -e` trace (phase-4 round-2 audit BLOCK 2).
+  if ! _write_manifest \
+      "$leg_id" "$SHA" "$(hostname)" "$NSYS_VERSION" "$dtype" "$width" "$target_modules" \
+      "$layers_to_transform" "$EVAL_CADENCE" "$n_steps" "$m_steps" \
+      "$steps_measured_n" "$steps_measured_m" "$leg_status" "$leg_reason" "$census_ok" \
+      "$lora_n" "$lora_m" "$dry_run_flag" "$leg_dir/manifest.json"; then
+    echo "::error::$leg_id: could not write $leg_dir/manifest.json -- this IS sweep-fatal (this leg's result cannot be recorded); aborting the sweep now rather than continuing silently unrecorded." >&2
+    exit 1
   fi
-
-  _write_manifest \
-    "$leg_id" "$SHA" "$(hostname)" "$nsys_version" "$dtype" "$width" "$target_modules" \
-    "$layers_to_transform" "$EVAL_CADENCE" "$n_steps" "$m_steps" \
-    "$steps_measured_n" "$steps_measured_m" "$leg_status" "$leg_reason" "$census_ok" \
-    "$lora_n" "$lora_m" "$leg_dir/manifest.json"
 
   if [ "$leg_status" != "ok" ]; then
     echo "::warning::$leg_id: INVALID -- $leg_reason (recorded in $leg_dir/manifest.json; sweep continues)." >&2

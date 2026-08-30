@@ -2087,12 +2087,17 @@ def _finetune_run_tier(arm="fused", **overrides):
         #   - `train_run_wall_s` has NO equivalent live check -- it is a
         #     plain measurement field, never an `IDENTITY_FIELDS`/
         #     `PROVENANCE_FIELDS` member, so `assert_identity_fields_present`
-        #     says nothing about it. A dedicated bench-side test that runs
-        #     the real tier on the CPU-hermetic fixture and asserts the
-        #     serialized report contains BOTH `layers_to_transform` and
-        #     `train_run_wall_s` under `tiers.finetune_run` closes this
-        #     gap for the field that has no other live proof; reference
-        #     that test by name here once bench reports it.
+        #     says nothing about it. Closed by bench (phase-4 round-2 audit
+        #     advisory 2):
+        #     `finetune_run::tests::finetune_run_tier_json_actually_emits_
+        #     layers_to_transform_and_train_run_wall_s` (`crates/jammi-bench/
+        #     src/finetune_run.rs`) runs the real CPU-fixture path, wraps
+        #     the resulting tier in a real `Report`, serializes it, and
+        #     asserts at the `serde_json::Value` PATH level that
+        #     `tiers.finetune_run` carries BOTH `layers_to_transform` (any
+        #     presence, `Some(null)` counts) and a present, numeric
+        #     `train_run_wall_s` -- the dedicated live proof for the one
+        #     field `assert_identity_fields_present` does not itself cover.
         # `None` (no restriction -- every layer matching `target_modules`
         # gets a LoRA adapter) is this suite's own clean, predictable-for-
         # testing default; individual tests override it exactly like any

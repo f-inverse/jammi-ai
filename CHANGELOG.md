@@ -6,6 +6,24 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## [0.48.0] - 2026-08-30
+
+The eager and fused numeric paths now round the way torch/PEFT/HF round —
+the LoRA forward epilogue, gradient clipping, eager LayerNorm, and eager
+RoPE each collapse to a single rounding point at the wider dtype — and the
+fused-kernel substrate ships as a published crate for the first time.
+
+### Added
+- **`jammi-kernels` — first publish.** New leaf crate (candle-core/candle-nn
+  only, no jammi-* deps): candle `CustomOp` scaffolding plus the feature-gated
+  CUDA build path for the fused training/serving kernels (scaled-cast-add,
+  LayerNorm, RoPE, GeGLU, softmax, dropout, axpy, low-rank residual linear,
+  attention blocks, the fused multi-tensor AdamW step, and the vendored
+  FlashAttention-2 path behind the `flash-attn` feature). Consumed by
+  `jammi-lora` (via its `candle` feature), `jammi-encoders`, and optionally
+  `jammi-ai`; inserted into the crates.io publish topological order in
+  `.github/workflows/crates.yml` / `ci/scripts/publish_crates.sh`.
+
 ### Fixed
 - **The LoRA-site forward epilogue rounds ONCE at the wider dtype, matching
   PEFT (`jammi-lora`, `jammi-kernels`).** Both arms previously rounded the

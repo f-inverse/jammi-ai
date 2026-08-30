@@ -74,6 +74,7 @@ RPC PipelineService/AssembleContext
 RPC PipelineService/BuildNeighborGraph
 RPC PipelineService/PropagateEmbeddings
 RPC PipelineService/Recompute
+RPC TrainingService/ListTrainingJobs
 RPC TrainingService/StartTraining
 RPC TrainingService/TrainingStatus
 RPC TriggerService/Publish

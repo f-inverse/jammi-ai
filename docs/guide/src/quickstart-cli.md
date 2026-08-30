@@ -48,6 +48,8 @@ jammi status
 | `jammi channels …` | Manage evidence channels |
 | `jammi mutable …` | Manage mutable companion tables |
 | `jammi trigger …` | Manage trigger-stream topics |
+| `jammi train list` | List training jobs (lifecycle status; read-only) |
+| `jammi train status <JOB_ID>` | Read one training job's lifecycle status |
 
 ## Global options
 

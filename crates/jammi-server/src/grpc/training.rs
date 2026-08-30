@@ -1,6 +1,7 @@
 //! `TrainingService` gRPC implementation.
 //!
-//! Two verbs land on the wire: `StartTraining` and `TrainingStatus`. The service
+//! Three verbs land on the wire: `StartTraining`, `TrainingStatus`, and
+//! `ListTrainingJobs`. The service
 //! serves all three engine training kinds (`fine_tune`, `graph_fine_tune`,
 //! `context_predictor`) behind one verb: `StartTraining` carries a full
 //! `TrainingSpec` oneof, the handler decodes it to the engine `TrainingSpec` via
@@ -13,7 +14,12 @@
 //! handler carries both into the response. `TrainingStatus` reads the job record
 //! back and returns its status, output model id, and — when the job failed — the
 //! error message, so a remote `wait()` can retrieve the result and a failure
-//! reason. There is no progress stream — the abstraction exposes none.
+//! reason. `ListTrainingJobs` reads the same lifecycle projection for every job
+//! visible to the session tenant, most recent first — a listing of
+//! `TrainingStatus` answers plus each job's submit-time identity, never a
+//! progress surface. There is no progress stream — the abstraction exposes
+//! none, and the engine persists run metrics only at job finalization, so a
+//! mid-run row has no metric to read.
 //!
 //! Tenant scope is read from the request's [`crate::grpc::session::
 //! SessionTenant`] extension (set upstream by the async tenant-binding layer)
@@ -96,6 +102,38 @@ impl TrainingService for TrainingServer {
             // otherwise so a remote `wait()` reads it exactly when status is
             // "failed".
             error: record.error_message.unwrap_or_default(),
+        }))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
+    async fn list_training_jobs(
+        &self,
+        request: Request<pb::ListTrainingJobsRequest>,
+    ) -> Result<Response<pb::ListTrainingJobsResponse>, Status> {
+        let tenant = session_tenant_traced(&request);
+
+        let records = scoped(&self.session, tenant, || {
+            self.session.catalog().list_training_jobs()
+        })
+        .await
+        .map_err(map_engine_error)?;
+
+        Ok(Response::new(pb::ListTrainingJobsResponse {
+            jobs: records
+                .into_iter()
+                .map(|record| pb::TrainingJobSummary {
+                    job_id: record.job_id,
+                    kind: record.kind,
+                    status: record.status,
+                    base_model_id: record.base_model_id,
+                    // Empty until the job completes, matching `TrainingStatus`.
+                    output_model_id: record.output_model_id.unwrap_or_default(),
+                    created_at: record.created_at,
+                    // Non-empty exactly when status is "failed", matching
+                    // `TrainingStatus`.
+                    error: record.error_message.unwrap_or_default(),
+                })
+                .collect(),
         }))
     }
 }

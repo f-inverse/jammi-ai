@@ -12,10 +12,18 @@ us/step, memcpy/memset/step); the missing-kernel-table refusal (leg
 INVALID, no report written); the M<=N usage refusal; the negative-delta
 "not a comparable pair" refusal; the v4 additions (`wall_s_per_step`
 when `--wall-a`/`--wall-b` given, `excluded_from_chain_attribution`
-stamping); and the phase-4 audit's CLASS 4 census domain guards: a
+stamping); the phase-4 audit's CLASS 4 census domain guards: a
 PRESENT-but-EMPTY kernel table, a corrupt/unreadable sqlite export, an
 invalid wall pair (`wall_b > wall_a > 0` violated), and a declared-vs-
-measured steps mismatch.
+measured steps mismatch; the round-4 pod-run fix's FIXED-COST bucket
+classification (a dn==0 or within-`--launch-tolerance` bucket is excluded
+from the per-step report, never refused on its time delta the way a real
+added-work bucket is); and the round-5 audit's two BLOCKING fixes on that
+same classification -- an ALL-fixed-cost differenced pair now REFUSES
+(`EmptyDifferencedCensusError`) rather than silently emitting an empty-
+but-clean report, and a fixed-cost bucket's own time jitter is bounded
+RELATIVE TO ITS OWN magnitude (`fixed_cost_jitter_rel_tolerance`), never
+unconditionally waved through.
 
 Run: `python3 ci/scripts/perf/test_kernel_census.py`
 """
@@ -173,14 +181,27 @@ class CensusRefusalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             a = os.path.join(tmp, "a.sqlite")
             b = os.path.join(tmp, "b.sqlite")
-            _make_sqlite(a, _k1(10))
-            _make_sqlite(b, _k1(9))
-            # b has ONE fewer launch (and ~1000ns less time) than a -- within
-            # an explicit tolerance for both.
+            # k1: b has ONE fewer launch (and ~1000ns less time) than a --
+            # within an explicit --launch-tolerance, now classified
+            # FIXED-COST (round-4/5 fix) rather than a real added-work row.
+            # k2: a genuine dn>0 bucket so this pair is not ALL-fixed-cost
+            # (round-5 audit BLOCK 1 -- without k2 this scenario would now
+            # correctly raise EmptyDifferencedCensusError instead).
+            rows_a = _k1(10) + [
+                ("k2", 1, 1, 1, 32, 1, 1, i * 1000, i * 1000 + 1000) for i in range(3)
+            ]
+            rows_b = _k1(9) + [
+                ("k2", 1, 1, 1, 32, 1, 1, i * 1000, i * 1000 + 1000) for i in range(6)
+            ]
+            _make_sqlite(a, rows_a)
+            _make_sqlite(b, rows_b)
             report = kernel_census.build_report(
                 a, b, steps_a=1, steps_b=2, launch_tolerance=1, time_tolerance_us=2.0
             )
             self.assertEqual(report["steps_diff"], 1)
+            self.assertEqual(report["fixed_cost_buckets"], 1)  # k1's within-tolerance dn=-1
+            self.assertNotIn("k1", {r["kernel"] for r in report["by_kernel_and_grid"]})
+            self.assertTrue(all(r["launches_per_step"] >= 0 for r in report["by_kernel_and_grid"]))
 
 
 class CensusFixedCostGuardTests(unittest.TestCase):
@@ -246,6 +267,101 @@ class CensusFixedCostGuardTests(unittest.TestCase):
             _make_sqlite(b, rows_b)
             with self.assertRaises(kernel_census.NonComparablePairError):
                 kernel_census.build_report(a, b, steps_a=1, steps_b=2)
+
+
+class CensusFixedCostBoundGuardTests(unittest.TestCase):
+    """Phase-4 audit, round-5 (both BLOCKs raised on commit 04d452dc, the
+    round-4 fix's own first landing): BLOCK 1 -- an ALL-fixed-cost
+    differenced pair (every bucket's launch-count delta <= 0) must REFUSE
+    (`EmptyDifferencedCensusError`), never silently emit a structurally
+    empty but "clean-looking" report. BLOCK 2 -- a fixed-cost bucket's own
+    time jitter is bounded RELATIVE TO ITS OWN magnitude
+    (`fixed_cost_jitter_rel_tolerance`), never unconditionally waved
+    through regardless of size. Advisory 1 -- a dn-within-
+    `--launch-tolerance` bucket takes the SAME fixed-cost classification
+    (and the same relative bound) as an exact dn==0 bucket, and never
+    emits a negative rate into the by-kernel-and-grid headline."""
+
+    def test_all_fixed_cost_pair_refuses_empty_differenced_census(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            # Every bucket has dn == 0 (e.g. the M-step run silently
+            # executed only N steps, or the same export diffed against
+            # itself) -- zero buckets carry a positive launch-count delta.
+            _make_sqlite(a, _k1(10))
+            _make_sqlite(b, _k1(10))
+            with self.assertRaises(kernel_census.EmptyDifferencedCensusError):
+                kernel_census.build_report(a, b, steps_a=1, steps_b=2)
+
+    def test_all_fixed_cost_pair_main_exit_9_no_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            out = os.path.join(tmp, "out.json")
+            _make_sqlite(a, _k1(10))
+            _make_sqlite(b, _k1(10))
+            rc = kernel_census.main([a, b, "1", "2", out])
+            self.assertEqual(rc, 9)
+            self.assertFalse(os.path.exists(out))
+
+    def test_oversized_fixed_cost_jitter_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            # k1: real added work, so this is not an all-fixed-cost pair.
+            # k2: SAME launch count (dn=0) in both exports, but B's summed
+            # time is ~50ms MORE than A's own ~10us -- the round-4 pod-run
+            # live finding this bound exists to catch (a multi-millisecond
+            # swing dwarfing the bucket's own microsecond-scale duration).
+            rows_a = _k1(10) + [("k2", 1, 1, 1, 32, 1, 1, 0, 10_000)]  # 10us total
+            rows_b = _k1(20) + [("k2", 1, 1, 1, 32, 1, 1, 0, 50_010_000)]  # ~50.01ms total
+            _make_sqlite(a, rows_a)
+            _make_sqlite(b, rows_b)
+            with self.assertRaises(kernel_census.NonComparablePairError) as ctx:
+                kernel_census.build_report(a, b, steps_a=10, steps_b=20)
+            self.assertIn("fixed_cost_jitter_rel_tolerance", str(ctx.exception))
+
+    def test_small_fixed_cost_jitter_excluded_cleanly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            # k2: dn=0, jitter well within the default 10% relative bound
+            # (500ns / max(10000, 9500) == 0.05).
+            rows_a = _k1(10) + [("k2", 1, 1, 1, 32, 1, 1, 0, 10_000)]  # 10us
+            rows_b = _k1(20) + [("k2", 1, 1, 1, 32, 1, 1, 0, 9_500)]  # 9.5us (-5%)
+            _make_sqlite(a, rows_a)
+            _make_sqlite(b, rows_b)
+            report = kernel_census.build_report(a, b, steps_a=10, steps_b=20)
+            self.assertEqual(report["fixed_cost_buckets"], 1)
+            self.assertAlmostEqual(report["fixed_cost_jitter_max_rel"], 0.05)
+            self.assertNotIn("k2", {r["kernel"] for r in report["by_kernel_and_grid"]})
+            self.assertNotIn("k2", {r["kernel"] for r in report["by_kernel_name"]})
+
+    def test_within_launch_tolerance_bucket_never_emits_negative_rate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.sqlite")
+            b = os.path.join(tmp, "b.sqlite")
+            # k1: real added work (dn=10>0).
+            # k2: dn=-1 (within --launch-tolerance=1) -- previously this
+            # would have emitted a NEGATIVE launches_per_step row; now it
+            # is fixed-cost, excluded entirely. Total time is held equal
+            # across the count difference (5 * 900ns == 4 * 1125ns) so the
+            # relative-jitter bound (dns=0) is trivially satisfied -- this
+            # test is about the negative-rate/classification behavior, not
+            # the jitter bound (see the bound-specific tests above).
+            rows_a = _k1(10) + [
+                ("k2", 1, 1, 1, 32, 1, 1, i * 900, i * 900 + 900) for i in range(5)
+            ]
+            rows_b = _k1(20) + [
+                ("k2", 1, 1, 1, 32, 1, 1, i * 1125, i * 1125 + 1125) for i in range(4)
+            ]
+            _make_sqlite(a, rows_a)
+            _make_sqlite(b, rows_b)
+            report = kernel_census.build_report(a, b, steps_a=10, steps_b=20, launch_tolerance=1)
+            self.assertTrue(all(r["launches_per_step"] >= 0 for r in report["by_kernel_and_grid"]))
+            self.assertNotIn("k2", {r["kernel"] for r in report["by_kernel_and_grid"]})
+            self.assertEqual(report["fixed_cost_buckets"], 1)
 
 
 class CensusClass4GuardTests(unittest.TestCase):

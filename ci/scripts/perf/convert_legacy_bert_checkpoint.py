@@ -12,10 +12,15 @@ load; jammi's own loader does not (that engine-side gap is filed
 separately -- this script is the tracked, deterministic workaround so a
 stock checkpoint can be loaded at all, never a fix to the loader itself).
 
-Renames every tensor name whose LAST path component is exactly `gamma`
-(-> `weight`) or `beta` (-> `bias`) -- suffix-anchored: a name that merely
-CONTAINS "gamma"/"beta" earlier in the string, or as part of a longer
-final component, is left untouched. Refuses loudly (no output written) if:
+Renames every tensor name ending in the literal suffix `.gamma`
+(-> `.weight`) or `.beta` (-> `.bias`) -- `str.endswith`, suffix-anchored:
+a name that merely CONTAINS "gamma"/"beta" earlier in the string, that
+ends in "gamma"/"beta" WITHOUT the preceding dot (e.g. a bare `gamma`, or
+a hypothetical `gamma_scale.other`), is left untouched (phase-4 audit
+advisory 4 -- this is a literal string-suffix check, never a tokenized
+"last dot-separated path component" one; the two agree for every REAL
+dotted tensor name a checkpoint carries, but not for a dotless edge case).
+Refuses loudly (no output written) if:
 
   - the rename would produce a NAME COLLISION -- two tensors (a renamed
     one and either another renamed one or an already-`weight`/`bias`-named
@@ -38,12 +43,19 @@ Uses the `safetensors` package (`safetensors.deserialize`/`serialize`/
 re-serialize the checkpoint -- both a real-format validation (a malformed
 file fails inside `deserialize`, not inside hand-rolled header parsing
 here) and the guarantee that every renamed tensor's VALUE is copied
-byte-for-byte from input to output (only the header's name-and-metadata
-JSON changes; each tensor's raw byte buffer is passed through unmodified).
-Loud degrade if `safetensors` is not importable (the `fixture_width_report.py`
-precedent): refuses with a named, non-network, non-torch error rather than
-an unhandled `ImportError` traceback. Copies nothing else -- only the one
-named safetensors file; `config.json`/`tokenizer.json` are the caller's own
+byte-for-byte from input to output (only the header's tensor-name JSON
+keys change; each tensor's raw byte buffer is passed through unmodified).
+The input's own `__metadata__` block (a purely textual annotation map,
+e.g. HF's own `{"format": "pt"}`) is carried through to the output
+UNCHANGED too (phase-4 audit advisory 4) -- `safetensors.deserialize()`
+itself does not expose `__metadata__` at all, so this module reads it via
+one small, separately-documented primitive (`_read_metadata`) straight
+off the same already-validated header bytes, never a second independent
+trust boundary on unvalidated input. Loud degrade if `safetensors` is not
+importable (the `fixture_width_report.py` precedent): refuses with a
+named, non-network, non-torch error rather than an unhandled
+`ImportError` traceback. Copies nothing else -- only the one named
+safetensors file; `config.json`/`tokenizer.json` are the caller's own
 responsibility to keep alongside whichever path this script wrote.
 
 Deterministic: same input bytes -> same renamed set -> the same output
@@ -62,6 +74,8 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import json
+import struct
 import sys
 from pathlib import Path
 
@@ -101,15 +115,38 @@ class CheckpointConversionError(RuntimeError):
 
 
 def renamed_name(name: str) -> str:
-    """Suffix-anchored `.gamma`->`.weight` / `.beta`->`.bias` rename.
-    Returns `name` unchanged if neither suffix matches -- a name that
-    contains "gamma"/"beta" but not as its OWN trailing dotted component
-    (e.g. a hypothetical `gamma_scale.other`) is never touched."""
+    """Suffix-anchored `.gamma`->`.weight` / `.beta`->`.bias` rename via
+    plain `str.endswith` -- literally requires the preceding dot. Returns
+    `name` unchanged if neither suffix matches: a name that contains
+    "gamma"/"beta" mid-string (e.g. a hypothetical `gamma_scale.other`),
+    or a BARE `gamma`/`beta` with no leading dot at all, is never touched
+    (phase-4 audit advisory 4 -- this is a literal suffix check, not a
+    tokenized "last path component" one)."""
     if name.endswith(GAMMA_SUFFIX):
         return name[: -len(GAMMA_SUFFIX)] + ".weight"
     if name.endswith(BETA_SUFFIX):
         return name[: -len(BETA_SUFFIX)] + ".bias"
     return name
+
+
+def _read_metadata(raw: bytes) -> dict[str, str] | None:
+    """Reads the `__metadata__` block (a purely textual name->str
+    annotation map, e.g. HF's own `{"format": "pt"}`) straight out of a
+    safetensors file's own header bytes -- `safetensors.deserialize()`
+    itself does not expose it at all (confirmed empirically: it silently
+    DROPS `__metadata__` from its returned tensor list), so carrying it
+    through `convert()`'s round-trip needs this one small, well-documented
+    primitive: the format's own fixed 8-byte little-endian header-length
+    prefix, followed by that many bytes of JSON. Only ever called on
+    `raw` AFTER `deserialize(raw)` has already succeeded on the same
+    bytes in `convert()` below, so this second, narrower parse of the
+    identical header is guaranteed well-formed too -- never a second,
+    independent trust boundary on unvalidated input. Returns `None` if the
+    input never carried a `__metadata__` block at all (most real
+    checkpoints do; a truly metadata-less file is not an error)."""
+    (header_len,) = struct.unpack_from("<Q", raw, 0)
+    header = json.loads(raw[8 : 8 + header_len])
+    return header.get("__metadata__")
 
 
 def convert(in_path: str, out_path: str) -> int:
@@ -185,7 +222,7 @@ def convert(in_path: str, out_path: str) -> int:
             data_len=len(buf),
         )
 
-    out_blob = serialize(tensor_dict)
+    out_blob = serialize(tensor_dict, metadata=_read_metadata(raw))
     Path(out_path).write_bytes(out_blob)
     return renamed_count
 

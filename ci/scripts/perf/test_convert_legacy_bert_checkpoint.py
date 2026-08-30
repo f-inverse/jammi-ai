@@ -81,6 +81,16 @@ class RenamedNameSuffixAnchoredTests(unittest.TestCase):
         # must not match.
         self.assertEqual(clbc.renamed_name("somegamma"), "somegamma")
 
+    def test_literal_bare_gamma_name_is_untouched(self):
+        # Phase-4 audit advisory 4: `renamed_name` is a literal
+        # `str.endswith('.gamma')` suffix check, NOT a tokenized "last
+        # dot-separated path component" one -- a name that IS just the
+        # bare word "gamma", with no leading dot at all, has no
+        # `.gamma` suffix and must be left untouched (a tokenized
+        # last-component check would have wrongly renamed this).
+        self.assertEqual(clbc.renamed_name("gamma"), "gamma")
+        self.assertEqual(clbc.renamed_name("beta"), "beta")
+
 
 @unittest.skipUnless(_SAFETENSORS_AVAILABLE, "safetensors package not importable in this env")
 class ConvertFileLevelTests(unittest.TestCase):
@@ -89,7 +99,7 @@ class ConvertFileLevelTests(unittest.TestCase):
     real BERT checkpoint."""
 
     @staticmethod
-    def _make_fixture(path: str, tensors: dict) -> None:
+    def _make_fixture(path: str, tensors: dict, metadata: dict | None = None) -> None:
         """`tensors`: name -> (dtype ctor name, shape, raw bytes)."""
         import ctypes
 
@@ -104,7 +114,7 @@ class ConvertFileLevelTests(unittest.TestCase):
             tensor_dict[name] = TensorSpec(
                 dtype=dtype, shape=shape, data_ptr=ctypes.addressof(arr), data_len=len(buf)
             )
-        blob = serialize(tensor_dict)
+        blob = serialize(tensor_dict, metadata=metadata)
         Path(path).write_bytes(blob)
 
     @staticmethod
@@ -121,16 +131,21 @@ class ConvertFileLevelTests(unittest.TestCase):
             ln_weight_bytes = bytes(range(16))  # 4 x float32
             ln_bias_bytes = bytes(range(16, 32))
             embed_bytes = bytes(range(32, 40))  # 2 x float32
+            # A non-f32 dtype arm (phase-4 audit advisory 3) -- exercises
+            # the `_DTYPE_CODE_TO_CTOR` on-disk-code round-trip for a real
+            # checkpoint dtype other than the stock bert-base-uncased F32.
+            bf16_bytes = bytes(range(40, 44))  # 2 x bfloat16
             self._make_fixture(
                 in_path,
                 {
                     "encoder.layer.0.LayerNorm.gamma": ("float32", [4], ln_weight_bytes),
                     "encoder.layer.0.LayerNorm.beta": ("float32", [4], ln_bias_bytes),
                     "embeddings.word_embeddings.weight": ("float32", [2], embed_bytes),
+                    "encoder.layer.0.LayerNorm.bf16.gamma": ("bfloat16", [2], bf16_bytes),
                 },
             )
             n = clbc.convert(in_path, out_path)
-            self.assertEqual(n, 2)
+            self.assertEqual(n, 3)
 
             out_items = self._read_back(out_path)
             self.assertEqual(
@@ -139,8 +154,15 @@ class ConvertFileLevelTests(unittest.TestCase):
                     "encoder.layer.0.LayerNorm.weight",
                     "encoder.layer.0.LayerNorm.bias",
                     "embeddings.word_embeddings.weight",
+                    "encoder.layer.0.LayerNorm.bf16.weight",
                 },
             )
+            # Shape AND dtype are preserved, not just the raw data bytes --
+            # a rename must never reinterpret a tensor's own type.
+            self.assertEqual(out_items["encoder.layer.0.LayerNorm.weight"]["shape"], [4])
+            self.assertEqual(out_items["encoder.layer.0.LayerNorm.weight"]["dtype"], "F32")
+            self.assertEqual(out_items["encoder.layer.0.LayerNorm.bf16.weight"]["shape"], [2])
+            self.assertEqual(out_items["encoder.layer.0.LayerNorm.bf16.weight"]["dtype"], "BF16")
             self.assertEqual(
                 bytes(out_items["encoder.layer.0.LayerNorm.weight"]["data"]), ln_weight_bytes
             )
@@ -150,6 +172,54 @@ class ConvertFileLevelTests(unittest.TestCase):
             self.assertEqual(
                 bytes(out_items["embeddings.word_embeddings.weight"]["data"]), embed_bytes
             )
+            self.assertEqual(
+                bytes(out_items["encoder.layer.0.LayerNorm.bf16.weight"]["data"]), bf16_bytes
+            )
+
+    def test_unsupported_dtype_refuses_no_output_written(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            in_path = os.path.join(tmp, "legacy.safetensors")
+            out_path = os.path.join(tmp, "converted.safetensors")
+            # float8_e4m3fn is a real, constructible safetensors dtype (its
+            # on-disk code is "F8_E4M3") but deliberately NOT in
+            # `_DTYPE_CODE_TO_CTOR` (module doc: packed/exotic dtypes
+            # refuse rather than risk a silent mis-encode).
+            self._make_fixture(
+                in_path,
+                {"encoder.LayerNorm.gamma": ("float8_e4m3fn", [2], bytes([1, 2]))},
+            )
+            with self.assertRaises(clbc.CheckpointConversionError) as ctx:
+                clbc.convert(in_path, out_path)
+            self.assertIn("F8_E4M3", str(ctx.exception))
+            self.assertFalse(os.path.exists(out_path))
+
+    def test_metadata_block_carried_through_unchanged(self):
+        # Phase-4 audit advisory 4: `safetensors.deserialize()` itself
+        # drops `__metadata__` entirely -- `convert()` must still carry it
+        # through to the output UNCHANGED via `_read_metadata` reading the
+        # input's own header bytes directly.
+        with tempfile.TemporaryDirectory() as tmp:
+            in_path = os.path.join(tmp, "legacy.safetensors")
+            out_path = os.path.join(tmp, "converted.safetensors")
+            self._make_fixture(
+                in_path,
+                {"encoder.LayerNorm.gamma": ("float32", [1], bytes(4))},
+                metadata={"format": "pt", "custom_annotation": "hello"},
+            )
+            clbc.convert(in_path, out_path)
+            out_raw = Path(out_path).read_bytes()
+            self.assertEqual(
+                clbc._read_metadata(out_raw), {"format": "pt", "custom_annotation": "hello"}
+            )
+
+    def test_metadata_block_absent_is_not_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            in_path = os.path.join(tmp, "legacy.safetensors")
+            out_path = os.path.join(tmp, "converted.safetensors")
+            self._make_fixture(in_path, {"encoder.LayerNorm.gamma": ("float32", [1], bytes(4))})
+            clbc.convert(in_path, out_path)
+            out_raw = Path(out_path).read_bytes()
+            self.assertIsNone(clbc._read_metadata(out_raw))
 
     def test_collision_refuses_no_output_written(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -253,7 +323,15 @@ class NotImportableRefusalTests(unittest.TestCase):
                 text=True,
                 timeout=30,
             )
-            self.assertNotEqual(result.returncode, 0)
+            # Both the exact exit code AND the named `::error::` marker
+            # (phase-4 audit advisory 2): `assertNotEqual(rc, 0)` alone
+            # cannot distinguish this module's own LOUD, declared
+            # ImportError refusal (exit 1, a clear stderr message) from an
+            # UNHANDLED traceback elsewhere in the script also exiting
+            # nonzero -- exactly the failure state this test exists to
+            # exclude.
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("::error::convert_legacy_bert_checkpoint", result.stderr)
             self.assertFalse(out_path.exists())
 
 

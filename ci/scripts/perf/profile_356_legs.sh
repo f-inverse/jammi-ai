@@ -664,6 +664,30 @@ print(json.dumps({k: tier[k] for k in required}))
 ' "$1"
 }
 
+# Reads `fixed_cost_buckets`/`fixed_cost_time_us` off a `census.json`
+# (kernel_census.py's own top-level report fields, round-4/5 fix -- see
+# that module's own doc) -- REFUSES (nonzero exit, no stdout) if either is
+# absent, the same "never degrade to a silent {}" posture `_lora_counters`
+# above uses: this is only ever called after `census_ok=true` (kernel_census.py
+# exited 0 and wrote a report), so an absent field here means a report shape
+# this script does not understand, not a legitimately-missing measurement.
+# Surfaced into the per-leg manifest (phase-4 audit BLOCK 2) so the
+# emitted-for-visibility claim in kernel_census.py's own doc has an actual
+# consumer, not just an informational field nothing ever reads.
+_census_fixed_cost() {
+  python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+required = ("fixed_cost_buckets", "fixed_cost_time_us")
+missing = [k for k in required if k not in d]
+if missing:
+    print("::error::_census_fixed_cost: missing field(s) " + repr(missing) +
+          " in " + sys.argv[1], file=sys.stderr)
+    sys.exit(1)
+print(json.dumps({k: d[k] for k in required}))
+' "$1"
+}
+
 # Writes a leg's manifest.json -- callers guard the CALL itself (a write
 # failure is sweep-fatal, see `run_leg`'s own doc). Every declared
 # leg-table column (width, target_modules, layers_to_transform, dtype,
@@ -678,7 +702,11 @@ print(json.dumps({k: tier[k] for k in required}))
 # manifest written under `PROFILE_356_LEGS_DRY_RUN=1` so a reader never
 # mistakes a hermetic fake-execution manifest for a real GPU-pod result --
 # `census_ok`/`status: ok` under DRY_RUN describe the FAKE pipeline
-# completing, never a real measurement.
+# completing, never a real measurement. `fixed_cost_buckets`/
+# `fixed_cost_time_us` (phase-4 audit round-5 BLOCK 2) surface
+# `kernel_census.py`'s own informational fixed-cost tally into the
+# manifest -- both `null` unless `census_ok` (there is no fixed-cost tally
+# without a real census report to read it from).
 _write_manifest() {
   MANIFEST_LEG_ID="$1" MANIFEST_GIT_SHA="$2" MANIFEST_BOX="$3" MANIFEST_NSYS_VERSION="$4" \
   MANIFEST_DTYPE="$5" MANIFEST_WIDTH="$6" MANIFEST_TARGET_MODULES="$7" \
@@ -686,13 +714,19 @@ _write_manifest() {
   MANIFEST_STEPS_DECLARED_N="${10}" MANIFEST_STEPS_DECLARED_M="${11}" \
   MANIFEST_STEPS_MEASURED_N="${12}" MANIFEST_STEPS_MEASURED_M="${13}" \
   MANIFEST_STATUS="${14}" MANIFEST_REASON="${15}" MANIFEST_CENSUS_OK="${16}" \
-  MANIFEST_LORA_N="${17}" MANIFEST_LORA_M="${18}" MANIFEST_DRY_RUN="${19}" MANIFEST_OUT="${20}" \
+  MANIFEST_LORA_N="${17}" MANIFEST_LORA_M="${18}" MANIFEST_DRY_RUN="${19}" \
+  MANIFEST_FIXED_COST_BUCKETS="${20}" MANIFEST_FIXED_COST_TIME_US="${21}" \
+  MANIFEST_OUT="${22}" \
   python3 -c '
 import json, os
 
 
 def _int_or_none(v):
     return int(v) if v not in ("", None) else None
+
+
+def _float_or_none(v):
+    return float(v) if v not in ("", None) else None
 
 
 manifest = {
@@ -720,6 +754,8 @@ manifest = {
     "lora_counters_n_run": json.loads(os.environ["MANIFEST_LORA_N"]),
     "lora_counters_m_run": json.loads(os.environ["MANIFEST_LORA_M"]),
     "dry_run": os.environ["MANIFEST_DRY_RUN"] == "true",
+    "fixed_cost_buckets": _int_or_none(os.environ["MANIFEST_FIXED_COST_BUCKETS"]),
+    "fixed_cost_time_us": _float_or_none(os.environ["MANIFEST_FIXED_COST_TIME_US"]),
 }
 json.dump(manifest, open(os.environ["MANIFEST_OUT"], "w"), indent=1)
 '
@@ -788,7 +824,7 @@ run_leg() {
         "$leg_id" "$SHA" "$(hostname)" "$NSYS_VERSION" "$dtype" "$width" "$target_modules" \
         "$layers_to_transform" "$EVAL_CADENCE" "$n_steps" "$m_steps" \
         "" "" "invalid" "could not create leg directory $leg_dir" "false" \
-        "null" "null" "$dry_run_flag" "$OUT_DIR/${leg_id}.manifest.json"; then
+        "null" "null" "$dry_run_flag" "" "" "$OUT_DIR/${leg_id}.manifest.json"; then
       echo "::error::$leg_id: could not write even the fallback manifest.json -- this IS sweep-fatal (results cannot be recorded); aborting." >&2
       exit 1
     fi
@@ -929,6 +965,29 @@ run_leg() {
     fi
   fi
 
+  # Surfaces kernel_census.py's own informational fixed-cost tally into
+  # this leg's manifest (phase-4 audit round-5 BLOCK 2) so the
+  # emitted-for-visibility claim in that module's doc has an actual
+  # consumer. Both stay "" (-> null in the manifest) unless census_ok AND
+  # NOT DRY_RUN -- census_cmd itself goes through `run_cmd`, which under
+  # DRY_RUN only ECHOES the command and never executes it (see `run_cmd`'s
+  # own doc), so `census_json` is never actually written in that mode;
+  # `census_ok=true` there is the FAKE pipeline-completed stand-in this
+  # producer's own doc already names, and reading a fixed-cost tally out
+  # of a file that was never written would be a read against a
+  # nonexistent report, not a genuinely-missing field.
+  local fixed_cost_buckets="" fixed_cost_time_us=""
+  if [ "$census_ok" = "true" ] && [ "$PROFILE_356_LEGS_DRY_RUN" != "1" ]; then
+    local census_fixed_cost_json
+    if census_fixed_cost_json="$(_census_fixed_cost "$census_json")"; then
+      fixed_cost_buckets="$(printf '%s' "$census_fixed_cost_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["fixed_cost_buckets"])')"
+      fixed_cost_time_us="$(printf '%s' "$census_fixed_cost_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["fixed_cost_time_us"])')"
+    else
+      leg_status="invalid"
+      leg_reason="_census_fixed_cost refused on $census_json (missing fixed_cost_buckets/fixed_cost_time_us field -- an unrecognized report shape)"
+    fi
+  fi
+
   local lora_n="null" lora_m="null"
   if [ "$leg_status" = "ok" ]; then
     if ! lora_n="$(_lora_counters "$out_n")"; then
@@ -954,7 +1013,8 @@ run_leg() {
       "$leg_id" "$SHA" "$(hostname)" "$NSYS_VERSION" "$dtype" "$width" "$target_modules" \
       "$layers_to_transform" "$EVAL_CADENCE" "$n_steps" "$m_steps" \
       "$steps_measured_n" "$steps_measured_m" "$leg_status" "$leg_reason" "$census_ok" \
-      "$lora_n" "$lora_m" "$dry_run_flag" "$leg_dir/manifest.json"; then
+      "$lora_n" "$lora_m" "$dry_run_flag" \
+      "$fixed_cost_buckets" "$fixed_cost_time_us" "$leg_dir/manifest.json"; then
     echo "::error::$leg_id: could not write $leg_dir/manifest.json -- this IS sweep-fatal (this leg's result cannot be recorded); aborting the sweep now rather than continuing silently unrecorded." >&2
     exit 1
   fi

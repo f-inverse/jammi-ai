@@ -3,10 +3,13 @@ name: PyPI (jammi-server, CPU)
 # Publishes the CPU `jammi-server` wheel to PyPI on a `py-v*` tag — the SAME tag
 # that publishes the base client `jammi-ai` and the `jammi-ai-native` engine
 # wheels, so the whole Python surface ships in LOCKSTEP at one version. Thin
-# caller of the shared `_pypi-server` reusable (build -> package -> publish, NO
-# GPU prove-gate on this leg); see `_pypi-server.yml` for the manylinux/relabel
-# mechanics and the OIDC trusted-publishing setup shared with the CUDA leg
-# (pypi-server-cuda.yml).
+# caller of the shared `_pypi-server` reusable (build -> package, NO GPU
+# prove-gate on this leg); the publish job lives HERE, not in the reusable —
+# PyPI's token exchange and its attestation verification match different
+# workflow-ref claims for a reusable-workflow publish and can never both pass
+# (see `_pypi-server.yml`'s header). The PyPI trusted publisher for
+# `jammi-server` is registered under THIS file's name (workflow
+# `pypi-server.yml`, environment `pypi`).
 
 on:
   push:
@@ -27,9 +30,8 @@ concurrency:
   group: pypi-server-${{ github.ref }}
   cancel-in-progress: false
 
-# Least privilege at the workflow level; the calling job widens to
-# `id-token: write` so the reusable's publish job can use PyPI trusted
-# publishing (a called workflow can hold at most what its caller grants).
+# Least privilege at the workflow level; only the publish job below widens to
+# `id-token: write` (PyPI trusted publishing).
 permissions:
   contents: read
 
@@ -38,7 +40,6 @@ jobs:
     name: jammi-server (CPU)
     permissions:
       contents: read
-      id-token: write
     uses: ./.github/workflows/_pypi-server.yml
     with:
       container_image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
@@ -48,3 +49,29 @@ jobs:
       platform_tag: manylinux_2_28_x86_64
       run_gpu_prove: false
     secrets: inherit
+
+  publish:
+    name: Publish to PyPI
+    # Publishes ONLY from a `py-v*` tag ref — a tag push, or a
+    # workflow_dispatch run on the tag (recovery: PyPI rejects a re-upload of
+    # an existing version, so re-running the tag is idempotent). A branch
+    # dispatch or PR is an artifact-only dry run and can never publish. Same
+    # recovery contract as `pypi.yml`/`pypi-client.yml` on this lockstep
+    # surface. The implicit success() on this `if` requires the WHOLE called
+    # workflow (build -> package; gpu-prove is a no-op skip on this ungated
+    # leg, which does not fail the calling job) to have succeeded.
+    if: startsWith(github.ref, 'refs/tags/py-v')
+    needs: server-cpu
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: server-cpu-dist
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2 (release/v1)
+        with:
+          packages-dir: dist

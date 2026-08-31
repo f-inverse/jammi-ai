@@ -1035,15 +1035,26 @@ pub fn admission_mode() -> AdmissionMode {
     })
 }
 
-/// Whether `d` is a device every fused CPU/CUDA-backed op in this crate can
-/// actually run on: CPU always, and CUDA only when THIS BUILD compiled
-/// jammi-kernels' `cuda` feature (`cfg!(feature = "cuda")`).
+/// Whether `d` is a device every fused CPU/CUDA-backed `apply2`/`apply3`
+/// site in this crate can actually run on: CPU always, and CUDA only when
+/// THIS BUILD compiled jammi-kernels' `cuda` feature (`cfg!(feature =
+/// "cuda")`).
 ///
-/// Metal is refused unconditionally — no op in this crate has a `metal_fwd`,
-/// and candle's default `metal_fwd` ERRORS rather than falling back, so a
+/// **This function gates `apply2`/`apply3` sites specifically — it is not
+/// "does ANY op in this crate have a `metal_fwd`".** Metal is refused
+/// unconditionally here because no BINARY/TERNARY op this function gates
+/// (`LowRankResidualLinear`, `ScaledCastAdd`, and every other
+/// `CustomOp2`/`CustomOp3` this crate ships) has a `metal_fwd`, and
+/// candle's default `metal_fwd` ERRORS rather than falling back, so a
 /// Metal tensor reaching `apply2`/`apply3` would turn a working eager
 /// forward into a hard error rather than a clean fallback; refusing it here,
-/// before the tensor ever reaches an op, is what keeps the fallback clean.
+/// before the tensor ever reaches one of those ops, is what keeps the
+/// fallback clean. `ops::DropoutFused` (a UNARY `CustomOp1`, reached only
+/// through `apply1`, never through this predicate) is the one exception in
+/// this crate — see its module doc's "Metal: a device-scoped deterministic
+/// host fallback" section (issue #433) — but that does not change this
+/// function's answer for `apply2`/`apply3`'s own device set, which stays
+/// CPU/CUDA-only until one of those ops grows a real `metal_fwd` too.
 ///
 /// The `cfg!(feature = "cuda")` half exists for a narrower reason than
 /// Metal's: candle's `CustomOp2::cuda_fwd` ALSO has a default impl (a typed
@@ -1618,10 +1629,29 @@ mod tests {
 
     #[test]
     fn device_is_supported_rejects_metal() {
-        // No `metal` feature exists on this crate at all — the predicate
-        // must reject `Device::Metal` structurally, not via a cfg this
-        // crate doesn't even define. Mirrors
+        // `device_is_supported` must reject `Device::Metal` STRUCTURALLY —
+        // unconditionally, with no `cfg(feature = "metal")` branch of its
+        // own body (see its doc: this crate's `apply2`/`apply3` sites have
+        // no `metal_fwd`, regardless of whether candle-core itself was
+        // compiled with Metal support). This crate's own `metal` feature
+        // (added for issue #433, gating ONLY `tests/metal_parity.rs` and
+        // `ops::DropoutFused`'s UNARY `metal_fwd`) changes what
+        // `candle_core::MetalDevice` even IS at compile time — a real,
+        // non-unit struct when active, the dummy unit struct otherwise —
+        // so constructing a value of it (not `device_is_supported` itself)
+        // is the one place that legitimately needs a `cfg` branch. Mirrors
         // `jammi_encoders::layer_norm::tests::device_is_supported_rejects_metal`.
+        #[cfg(feature = "metal")]
+        let metal = match Device::new_metal(0) {
+            Ok(d) => d,
+            // No physical Metal device on this build host — the predicate
+            // itself is still exercised below via `Device::Cpu`; the
+            // `metal`-specific half of this assertion is covered instead
+            // by `ops::dropout`'s own Metal-gated tests, which already
+            // skip identically when no device is present.
+            Err(_) => return,
+        };
+        #[cfg(not(feature = "metal"))]
         let metal = Device::Metal(candle_core::MetalDevice);
         assert!(!device_is_supported(&metal));
         // CPU is unconditionally supported regardless of build features.

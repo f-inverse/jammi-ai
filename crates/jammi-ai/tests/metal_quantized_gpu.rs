@@ -997,6 +997,21 @@ async fn qlora_learns_on_metal_with_gguf_base() {
 /// forward+backward" the fix-verifier asked for, at far lower fixture
 /// cost than spinning up a whole GGUF checkpoint + `InferenceSession` +
 /// fine-tune job.
+///
+/// Constructed with `dropout: Some(0.05)` (NOT `None`) so the Metal
+/// backward this test runs actually crosses `DropoutFused`'s `metal_fwd`
+/// arm (`crates/jammi-kernels/src/ops/dropout.rs`) — with `dropout ==
+/// None`, `FrozenBase::Quantized`'s ALWAYS-composed `forward_composed`
+/// path (`LoraLinear::forward`'s own doc) never builds a `DropoutFused`
+/// op at all (`lora_linear.rs:834-840`), so this test would stay GREEN
+/// even with `metal_fwd` fully reverted to an `Error::Msg` stub —
+/// exactly the fix-verifier's TAUTOLOGICAL finding on this conjunct.
+/// `p = 0.05` is deliberately small (not the config-refused `1.0`
+/// boundary — see `new_with_base`'s `(0.0..1.0).contains` validation
+/// doc) so dropout scaling stays well-conditioned and the `is_finite`
+/// assertions below are testing the SAME thing conjunct 6 asks for
+/// (gradient finiteness), not accidentally probing dropout's own domain
+/// edge.
 #[tokio::test(flavor = "multi_thread")]
 async fn qlora_gradients_are_finite_by_count_on_metal() {
     skip_without_gpu!();
@@ -1027,7 +1042,17 @@ async fn qlora_gradients_are_finite_by_count_on_metal() {
         16.0,
         false,
         LoraInitMode::Gaussian, // nonzero A AND B, so gradients are non-vacuous
-        None,                   // dropout: not this conjunct's subject (conjunct 4 owns it)
+        Some(0.05),             // p > 0.0 so `forward_composed` actually reserves a
+        // `DropoutKey` and routes through `DropoutFused`'s Metal
+        // `metal_fwd` arm (`crates/jammi-kernels/src/ops/dropout.rs`) --
+        // `FrozenBase::Quantized` ALWAYS composes (`LoraLinear::forward`'s
+        // own doc), so this base's `dropout_key` is `Some` here and
+        // `forward_composed` (`lora_linear.rs:834-840`) builds a real
+        // `DropoutFused` op and calls `apply1` on it; a `None` dropout
+        // (as this test previously passed) skips that op entirely, so a
+        // fully-reverted `metal_fwd` stub would never be exercised and
+        // this test would stay green regardless of whether Metal dropout
+        // backward works -- see this test's own top-of-file mention.
         4242,
         &varmap,
         &vb,

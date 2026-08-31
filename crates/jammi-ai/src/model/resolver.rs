@@ -5,7 +5,7 @@ use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::store::ArtifactStore;
 
-use super::backend::gguf::{compute_precision_byte_size, estimate_gguf_residency};
+use super::backend::gguf::estimate_gguf_residency;
 use super::{
     BackendType, ModelId, ModelSource, ModelTask, ResolvedModel, TokenizerSource, WeightsFormat,
 };
@@ -195,16 +195,7 @@ impl ModelResolver {
         let tokenizer = discover_local_tokenizer(&artifact_dir);
 
         let estimated_memory: usize = if weights_format == WeightsFormat::Gguf {
-            let precision: jammi_numerics::ComputePrecision = model_config
-                .get("compute_precision")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
-            estimate_gguf_residency(
-                &weights_paths[0],
-                &model_config,
-                compute_precision_byte_size(precision),
-                &model_id.0,
-            )?
+            estimate_gguf_residency(&weights_paths[0], &model_config, &model_id.0)?
         } else {
             weights_paths
                 .iter()
@@ -336,16 +327,7 @@ impl ModelResolver {
         let tokenizer = discover_local_tokenizer(path);
 
         let estimated_memory: usize = if weights_format == WeightsFormat::Gguf {
-            let precision: jammi_numerics::ComputePrecision = config
-                .get("compute_precision")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
-            estimate_gguf_residency(
-                &weights_paths[0],
-                &config,
-                compute_precision_byte_size(precision),
-                &source.to_string(),
-            )?
+            estimate_gguf_residency(&weights_paths[0], &config, &source.to_string())?
         } else {
             weights_paths
                 .iter()
@@ -462,16 +444,7 @@ impl ModelResolver {
             });
 
         let estimated_memory: usize = if weights_format == WeightsFormat::Gguf {
-            let precision: jammi_numerics::ComputePrecision = config
-                .get("compute_precision")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
-            estimate_gguf_residency(
-                &weights_paths[0],
-                &config,
-                compute_precision_byte_size(precision),
-                &source.to_string(),
-            )?
+            estimate_gguf_residency(&weights_paths[0], &config, &source.to_string())?
         } else {
             weights_paths
                 .iter()

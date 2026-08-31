@@ -70,6 +70,19 @@ export CARGO_BUILD_RUSTC_WRAPPER=  # wrapper-off (ledger row 17: no cross-target
 # leg build and test its own native arch instead.
 export CUDA_COMPUTE_CAP=${NATIVE_COMPUTE_CAP}
 echo "::group::device"; nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv; echo "CUDA_COMPUTE_CAP=\${CUDA_COMPUTE_CAP:-<unset>}"; echo "::endgroup::"
+# Hard assertion: nvidia-smi's reported compute_cap (e.g. "8.0") and the
+# NATIVE_COMPUTE_CAP override above (e.g. "80") must name the SAME device --
+# a mismatch here means the rented pod is not the arch this leg thinks it is,
+# and every kernel built below would be silently wrong for it (issue #434's
+# exact failure mode, one layer earlier). nvidia-smi's dotted form is
+# normalized (dot stripped) before comparing against CUDA_COMPUTE_CAP's bare
+# digit form.
+compute_cap_raw="\$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | tr -d '[:space:]')"
+compute_cap_norm="\${compute_cap_raw//./}"
+if [ "\${compute_cap_norm}" != "\${CUDA_COMPUTE_CAP:-}" ]; then
+  echo "::error::compute_cap mismatch: nvidia-smi reports compute_cap=\${compute_cap_raw} (normalized \${compute_cap_norm}) but CUDA_COMPUTE_CAP=\${CUDA_COMPUTE_CAP:-<unset>} -- rented device does not match this leg's requested arch, refusing to build"
+  exit 97
+fi
 cd /root && rm -rf jammi-ai
 git clone --depth 1 -b "${GIT_REF}" "${GIT_REPO}" jammi-ai 2>&1 | tail -1
 cd jammi-ai

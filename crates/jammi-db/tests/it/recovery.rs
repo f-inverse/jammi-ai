@@ -87,6 +87,21 @@ async fn open_backend(kind: BackendKind, dir: &Path) -> Option<BackendImpl> {
     }
 }
 
+/// Require-gate (KO-7) for the `JAMMI_TEST_PG_URL`-unset skip every
+/// `open_backend(BackendKind::Postgres, ..)` call site in this file falls
+/// through to: by default (unset) the Postgres arm still silently skips,
+/// exactly as before — a lane that wants to REQUIRE the real Postgres arm
+/// run (never silently skip it) sets `JAMMI_REQUIRE_PG`, and this call
+/// panics instead.
+fn require_live_pg(test_name: &str) {
+    if std::env::var_os("JAMMI_REQUIRE_PG").is_some() {
+        panic!(
+            "{test_name}: JAMMI_REQUIRE_PG is set but JAMMI_TEST_PG_URL is unset -- this lane \
+             must run the real Postgres arm, not skip it"
+        );
+    }
+}
+
 /// Clear `result_tables` so a cross-tenant `recover()` scan sees only the rows
 /// this test creates. The SQLite lane has a fresh tempdir per test, but running
 /// the reset on both lanes keeps one code path; on the shared Postgres DB it is
@@ -228,6 +243,7 @@ async fn building_with_missing_bytes_fails(kind: BackendKind) {
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
+        require_live_pg("building_with_missing_bytes_fails");
         return;
     };
     let catalog = fresh_catalog(backend).await;
@@ -282,6 +298,7 @@ async fn building_with_torn_parquet_fails_and_reaps(kind: BackendKind) {
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
+        require_live_pg("building_with_torn_parquet_fails_and_reaps");
         return;
     };
     let catalog = fresh_catalog(backend).await;
@@ -336,6 +353,7 @@ async fn building_with_valid_parquet_promotes_with_true_count(kind: BackendKind)
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
+        require_live_pg("building_with_valid_parquet_promotes_with_true_count");
         return;
     };
     let catalog = fresh_catalog(backend).await;
@@ -418,6 +436,7 @@ async fn partial_but_valid_parquet_promotes_with_footer_count(kind: BackendKind)
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
+        require_live_pg("partial_but_valid_parquet_promotes_with_footer_count");
         return;
     };
     let catalog = fresh_catalog(backend).await;
@@ -451,6 +470,7 @@ async fn ready_with_missing_bytes_not_loaded(kind: BackendKind) {
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
+        require_live_pg("ready_with_missing_bytes_not_loaded");
         return;
     };
     let catalog = fresh_catalog(backend).await;
@@ -492,6 +512,7 @@ async fn recover_is_idempotent(kind: BackendKind) {
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
+        require_live_pg("recover_is_idempotent");
         return;
     };
     let catalog = fresh_catalog(backend).await;
@@ -531,6 +552,7 @@ async fn recover_reconciles_every_tenant(kind: BackendKind) {
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
+        require_live_pg("recover_reconciles_every_tenant");
         return;
     };
     // Unscoped (GLOBAL) catalog — the shape a startup recovery session has.

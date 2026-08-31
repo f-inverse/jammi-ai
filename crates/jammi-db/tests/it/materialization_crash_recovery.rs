@@ -43,6 +43,35 @@ const ARTIFACT_DIR_ENV: &str = "JAMMI_TEST_ARTIFACT_DIR";
 const TABLE_SOURCE: &str = "crash_docs";
 const DIMS: usize = 4;
 
+/// Require-gate (KO-7) for the SIGKILL-harness "am I the respawned child"
+/// dispatch this file's own crash-recovery test checks first:
+/// [`CHILD_MARKER_ENV`] is set ONLY by this file's OWN `Command::env(
+/// CHILD_MARKER_ENV, "1")` call, which spawns a fresh child process that
+/// re-invokes this exact test by name — there is no live external resource
+/// to require here (the dispatch is deterministic, never
+/// availability-dependent). The gate exists to close KO-7's "unrun-is-RED"
+/// concern for a DIFFERENT, real failure mode: a leaked/persistent
+/// `JAMMI_TEST_CRASH_CHILD` in the process environment (e.g. exported by a
+/// prior debug session, or a CI step that forgot to scope it) would make
+/// the TOP-LEVEL `cargo test` invocation itself silently take this branch,
+/// run only [`child_workload`], and never exercise the real SIGKILL +
+/// recovery assertions below it — a green run that proved nothing. A lane
+/// that wants to assert this can never silently happen sets
+/// `JAMMI_REQUIRE_CRASH_RECOVERY_HARNESS`; ordinary runs — including this
+/// harness's own legitimate spawned-child re-invocation, which inherits the
+/// parent process's environment and so would ALSO inherit this var were a
+/// lane to set it globally — leave it unset.
+fn crash_recovery_child_dispatch_require_gate(test_name: &str) {
+    if std::env::var_os("JAMMI_REQUIRE_CRASH_RECOVERY_HARNESS").is_some() {
+        panic!(
+            "{test_name}: JAMMI_REQUIRE_CRASH_RECOVERY_HARNESS is set but this invocation is \
+             dispatching into the SIGKILL-harness CHILD branch (JAMMI_TEST_CRASH_CHILD is set) \
+             -- this lane must prove the PARENT-role spawn/kill/recover assertions actually run, \
+             never silently take the child-only branch"
+        );
+    }
+}
+
 async fn child_workload() {
     let dir = std::env::var(ARTIFACT_DIR_ENV).expect("child needs artifact dir");
     let dir = PathBuf::from(dir);
@@ -134,6 +163,9 @@ async fn manifestless_parquet_is_reaped_under_sigkill() {
     const NAME: &str =
         "materialization_crash_recovery::manifestless_parquet_is_reaped_under_sigkill";
     if std::env::var(CHILD_MARKER_ENV).is_ok() {
+        crash_recovery_child_dispatch_require_gate(
+            "materialization_crash_recovery::manifestless_parquet_is_reaped_under_sigkill",
+        );
         child_workload().await;
         return;
     }

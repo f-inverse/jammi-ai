@@ -20,6 +20,21 @@ fn fresh_tenant() -> TenantId {
     TenantId::from_uuid(Uuid::new_v4()).unwrap()
 }
 
+/// Require-gate (KO-7) for the `JAMMI_TEST_PG_URL`-unset skip every
+/// `make_test_session(BackendKind::Postgres, ..)` call site in this file
+/// falls through to: by default (unset) the Postgres arm still silently
+/// skips, exactly as before — a lane that wants to REQUIRE the real
+/// Postgres arm run (never silently skip it) sets `JAMMI_REQUIRE_PG`, and
+/// this call panics instead.
+fn require_live_pg(test_name: &str) {
+    if std::env::var_os("JAMMI_REQUIRE_PG").is_some() {
+        panic!(
+            "{test_name}: JAMMI_REQUIRE_PG is set but JAMMI_TEST_PG_URL is unset -- this lane \
+             must run the real Postgres arm, not skip it"
+        );
+    }
+}
+
 fn record(run: &str, query: &str, cohorts: &str, metrics: &str) -> PerQueryEvalRecord {
     PerQueryEvalRecord {
         eval_run_id: run.to_string(),
@@ -40,6 +55,7 @@ async fn record_then_get_round_trips_per_query(backend: BackendKind) {
         Some(s) => s,
         None => {
             eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
+            require_live_pg("record_then_get_round_trips_per_query");
             return;
         }
     };
@@ -97,6 +113,7 @@ async fn per_query_rows_are_tenant_isolated(backend: BackendKind) {
         Some(s) => s,
         None => {
             eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
+            require_live_pg("per_query_rows_are_tenant_isolated");
             return;
         }
     };
@@ -104,6 +121,7 @@ async fn per_query_rows_are_tenant_isolated(backend: BackendKind) {
         Some(s) => s,
         None => {
             eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
+            require_live_pg("per_query_rows_are_tenant_isolated");
             return;
         }
     };
@@ -145,6 +163,7 @@ async fn aggregate_path_unaffected_by_per_query_rows(backend: BackendKind) {
         Some(s) => s,
         None => {
             eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
+            require_live_pg("aggregate_path_unaffected_by_per_query_rows");
             return;
         }
     };

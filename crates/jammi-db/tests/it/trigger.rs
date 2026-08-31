@@ -50,6 +50,20 @@ async fn build_harness(backend: BackendKind) -> Option<Harness> {
     build_harness_with_tenant(backend, None).await
 }
 
+/// Require-gate (KO-7) for the `JAMMI_TEST_PG_URL`-unset skip every
+/// Postgres-arm call site in this file falls through to: by default
+/// (unset) the Postgres arm still silently skips, exactly as before — a
+/// lane that wants to REQUIRE the real Postgres arm run (never silently
+/// skip it) sets `JAMMI_REQUIRE_PG`, and this call panics instead.
+fn require_live_pg(test_name: &str) {
+    if std::env::var_os("JAMMI_REQUIRE_PG").is_some() {
+        panic!(
+            "{test_name}: JAMMI_REQUIRE_PG is set but JAMMI_TEST_PG_URL is unset -- this lane \
+             must run the real Postgres arm, not skip it"
+        );
+    }
+}
+
 /// Like [`build_harness`] but also hands back the concrete [`InMemoryBroker`]
 /// so a test can arm `trigger_failure_for_next_publish`. The same broker is
 /// wired into the harness's publisher/subscriber as the `dyn TriggerBroker`,
@@ -527,6 +541,7 @@ async fn session_topic_register_drop_round_trip(backend: BackendKind) {
         Some(s) => s,
         None => {
             eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
+            require_live_pg("session_topic_register_drop_round_trip");
             return;
         }
     };
@@ -589,6 +604,7 @@ async fn session_drop_missing_topic_is_not_found(backend: BackendKind) {
         Some(s) => s,
         None => {
             eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
+            require_live_pg("session_drop_missing_topic_is_not_found");
             return;
         }
     };
@@ -1121,6 +1137,7 @@ async fn session_with_broker_swallows_fan_out_failure(backend: BackendKind) {
         BackendKind::Postgres => {
             let Some(url) = jammi_test_utils::pg_url_for_tests() else {
                 eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
+                require_live_pg("session_with_broker_swallows_fan_out_failure");
                 return;
             };
             let pg = PostgresBackend::open_with_options(&url, 8, None)
@@ -1380,6 +1397,7 @@ async fn at_least_once_no_skip_property_over_randomized_states(backend: BackendK
             Some(h) => h,
             None => {
                 eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
+                require_live_pg("at_least_once_no_skip_property_over_randomized_states");
                 return;
             }
         };

@@ -34,6 +34,21 @@ use test_case::test_case;
 /// Backend-unique mutable-table identifier. SQLite per-tempdir tests don't
 /// strictly need this, but Postgres runs share one schema; the suffix avoids
 /// `relation "<name>" already exists` between parameterized variants.
+/// Require-gate (KO-7) for the `JAMMI_TEST_PG_URL`-unset skip every
+/// `make_test_session(BackendKind::Postgres, ..)` call site in this file
+/// falls through to: by default (unset) the Postgres arm still silently
+/// skips, exactly as before — a lane that wants to REQUIRE the real
+/// Postgres arm run (never silently skip it) sets `JAMMI_REQUIRE_PG`, and
+/// this call panics instead.
+fn require_live_pg(test_name: &str) {
+    if std::env::var_os("JAMMI_REQUIRE_PG").is_some() {
+        panic!(
+            "{test_name}: JAMMI_REQUIRE_PG is set but JAMMI_TEST_PG_URL is unset -- this lane \
+             must run the real Postgres arm, not skip it"
+        );
+    }
+}
+
 fn unique_id(prefix: &str) -> MutableTableId {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -132,6 +147,7 @@ async fn mutable_thousand_row_insert_then_federation_join(backend: BackendKind) 
     let dir = tempdir().unwrap();
     let Some(session) = make_test_session(backend, dir.path()).await else {
         eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
+        require_live_pg("mutable_thousand_row_insert_then_federation_join");
         return;
     };
 
@@ -232,6 +248,7 @@ async fn mutable_join_parquet_returns_one_row_per_matching_id(backend: BackendKi
     let dir = tempdir().unwrap();
     let Some(session) = make_test_session(backend, dir.path()).await else {
         eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
+        require_live_pg("mutable_join_parquet_returns_one_row_per_matching_id");
         return;
     };
 

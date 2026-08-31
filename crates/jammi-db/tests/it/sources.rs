@@ -25,6 +25,21 @@ macro_rules! session_or_skip {
     };
 }
 
+/// Require-gate (KO-7) for the `JAMMI_TEST_PG_URL`-unset skip
+/// `session_respects_config_batch_size`'s `build_backend(BackendKind::
+/// Postgres, ..)` call site falls through to: by default (unset) the
+/// Postgres arm still silently skips, exactly as before — a lane that
+/// wants to REQUIRE the real Postgres arm run (never silently skip it)
+/// sets `JAMMI_REQUIRE_PG`, and this call panics instead.
+fn require_live_pg(test_name: &str) {
+    if std::env::var_os("JAMMI_REQUIRE_PG").is_some() {
+        panic!(
+            "{test_name}: JAMMI_REQUIRE_PG is set but JAMMI_TEST_PG_URL is unset -- this lane \
+             must run the real Postgres arm, not skip it"
+        );
+    }
+}
+
 /// Build a raw catalog backend on `backend`, without wrapping it in a
 /// session — used only by the one test that needs a caller-customized
 /// [`jammi_db::config::JammiConfig`] (a non-default `engine.batch_size`)
@@ -252,6 +267,7 @@ async fn session_respects_config_batch_size(backend: BackendKind) {
         Some(b) => b,
         None => {
             eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
+            require_live_pg("session_respects_config_batch_size");
             return;
         }
     };

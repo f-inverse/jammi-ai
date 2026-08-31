@@ -47,3 +47,14 @@ crates/jammi-encoders/src/modernbert.rs::growth_oracle_cuda_device
 crates/jammi-encoders/src/modernbert.rs::flash_oracle_require_gate
 crates/jammi-encoders/src/modernbert.rs::flash_compiled_or_skip
 crates/jammi-ai/tests/metal_quantized_gpu.rs::gpu_available
+crates/jammi-db/tests/it/catalog_ping.rs::require_live_pg
+crates/jammi-db/tests/it/eval_per_query.rs::require_live_pg
+crates/jammi-db/tests/it/materialization_crash_recovery.rs::crash_recovery_child_dispatch_require_gate
+crates/jammi-db/tests/it/mutable_crash_recovery.rs::crash_recovery_child_dispatch_require_gate
+crates/jammi-db/tests/it/mutable_federation.rs::require_live_pg
+crates/jammi-db/tests/it/recovery.rs::require_live_pg
+crates/jammi-db/tests/it/segment.rs::require_live_pg
+crates/jammi-db/tests/it/sources.rs::require_live_pg
+crates/jammi-db/tests/it/storage_cloud.rs::require_live_storage
+crates/jammi-db/tests/it/store.rs::require_live_pg
+crates/jammi-db/tests/it/trigger.rs::require_live_pg

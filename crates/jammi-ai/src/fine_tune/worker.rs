@@ -3443,14 +3443,19 @@ mod tests {
     /// (`build_encoder_adapters` itself calls
     /// `tokio::runtime::Handle::current().block_on(..)` for its catalog
     /// reads, which panics if invoked directly on a runtime worker
-    /// thread). `lora_dropout: 0.0` is pinned so the returned encoder's
-    /// forward is a pure function of its weights and inputs — a
-    /// `lora_dropout > 0` training-mode forward draws from the
-    /// dropout-mask RNG stream on every call and would make the
-    /// bit-exact forward comparison below flaky by construction; the
-    /// `lora_dropout > 0` arm itself is covered by
-    /// `tests/it/gguf_qlora.rs`'s
-    /// `quantized_base_training_forward_with_dropout_reserves_the_dropout_stream`.
+    /// thread). `lora_dropout: 0.0` is pinned as a SIMPLIFICATION, not a
+    /// flakiness necessity: `DropoutMasks` is a per-instance forward
+    /// counter starting at 0, keyed by `(run_seed, layer_id, forward_idx)`
+    /// through a counter-based Philox stream, and each phase below builds
+    /// a fresh encoder and takes exactly one forward, so the comparison
+    /// would stay bit-identical even at the default `lora_dropout` of
+    /// 0.05 — pinning 0.0 just removes the dropout term from the
+    /// comparison entirely. The `lora_dropout > 0` arm of
+    /// `build_encoder_adapters` itself is covered by
+    /// `build_encoder_adapters_gguf_bert_succeeds`,
+    /// `build_encoder_adapters_gguf_distilbert_succeeds`, and
+    /// `build_encoder_adapters_gguf_modernbert_succeeds` above, which all
+    /// use `FineTuneConfig::default()`.
     async fn build_encoder_adapters_for_dir(
         dir: &std::path::Path,
         target_modules: Vec<String>,

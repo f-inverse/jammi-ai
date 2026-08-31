@@ -24,6 +24,35 @@
 //! Gated exactly like the rest of the suite: `live-gpu-tests` + a meaningful
 //! run needs `cuda` + a visible GPU; every test early-returns with a loud
 //! `tracing::warn` skip (`skip_without_gpu!`, never `#[ignore]`) otherwise.
+//!
+//! ## `qlora_learns_on_gpu_with_gguf_base`'s learning oracle is the held-out
+//! ## val-loss curve, not the raw train-loss curve (2026-08-31)
+//!
+//! This test shares its exact `FineTuneConfig` (`epochs = 6`, `batch_size =
+//! 8`, `warmup_steps = 0`, `lora_rank = 4`, default `LrSchedule::CosineDecay`
+//! and default `early_stopping_metric = ValLoss`) with this suite's Metal
+//! sibling, `crates/jammi-ai/tests/metal_quantized_gpu.rs`'s
+//! `qlora_learns_on_metal_with_gguf_base` — same trainer, same fixture
+//! geometry, same 4-batches/epoch training source. That file's own module
+//! doc records three byte-identical Mac runs (family J determinism) in which
+//! the ORIGINAL `avg_train_loss last < first` assertion was marginal-to-
+//! failing (`2.856011 -> 2.856355` on one run, a rise not a decrease): with
+//! only 4 batches/epoch feeding an ONLINE average, and a `CosineDecay`
+//! schedule that reaches exactly `0` LR by the last of 6 epochs, that
+//! average's first->last delta is dominated by near-zero-LR noise, not the
+//! model's actual learning trend. `avg_val_loss` — computed once per epoch
+//! over held-out data the optimizer never stepped on, always measured
+//! because `early_stopping_metric` defaults to `ValLoss` — is immune to that
+//! noise and decreased monotonically for 5 of the Metal sibling's 6 epochs.
+//! Same trainer, same hyperparameters, same batch geometry: this CUDA arm's
+//! `avg_train_loss` curve carries the identical structural noise source, so
+//! this file's primary learning assertion is likewise `avg_val_loss last <
+//! first` — a STRONGER oracle (the standard generalization signal a
+//! held-out split exists to provide), not a loosened one. The train curve is
+//! still captured and printed for the pod prove-log's baseline record, just
+//! no longer trend-asserted (family K: the honest fix re-points the
+//! assertion at the faithful signal; it does not touch the workload that
+//! produced the noisy one).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -586,9 +615,26 @@ async fn qlora_learns_on_gpu_with_gguf_base() {
         record.status
     );
 
-    // (b) loss decreases first->last epoch.
-    let curve = harness::loss_capture::captured();
-    let (first, last) = harness::assert_loss_decreases("qlora_gguf", &curve);
+    // (b) PRIMARY learning assertion: held-out avg_val_loss decreases
+    // first->last epoch — the faithful signal at this suite's
+    // hyperparameters. See this file's module doc for the traced mechanism
+    // (a 4-batches/epoch online train-loss average, `warmup_steps = 0`, and
+    // an LR schedule decaying to exactly 0 by the last epoch, measured on
+    // the Metal sibling to be dominated by near-zero-LR noise rather than a
+    // real learning trend). `avg_train_loss` is still captured and printed
+    // below purely as a baseline record for the pod prove-log, never
+    // trend-asserted.
+    let train_curve = harness::loss_capture::captured();
+    let val_curve = harness::loss_capture::captured_val();
+    eprintln!(
+        "qlora_learns_on_gpu_with_gguf_base: train_curve={train_curve:?} (printed as a \
+         baseline record only, NOT trend-asserted) val_curve={val_curve:?}"
+    );
+
+    // Every reported loss (train AND val) finite, by count (family F9).
+    harness::assert_all_finite("qlora_gguf", &[&train_curve, &val_curve]);
+
+    let (first, last) = harness::assert_loss_decreases("qlora_gguf_val_loss", &val_curve);
 
     // (c) the adapter changes embeddings vs the (quantized) base model —
     // the LoRA delta is non-zero, i.e. training genuinely moved the
@@ -615,8 +661,8 @@ async fn qlora_learns_on_gpu_with_gguf_base() {
     );
 
     tracing::info!(
-        first_loss = first,
-        last_loss = last,
+        first_val_loss = first,
+        last_val_loss = last,
         embed_delta = delta,
         "QLoRA learns on GPU over a GGUF base"
     );

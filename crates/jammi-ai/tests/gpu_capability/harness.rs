@@ -292,19 +292,31 @@ pub mod loss_capture {
 
     /// `(epoch, avg_train_loss)` rows captured since the last [`reset`].
     static EPOCHS: OnceLock<Mutex<Vec<(u64, f64)>>> = OnceLock::new();
+    /// `(epoch, avg_val_loss)` rows — only pushed when the "Epoch complete"
+    /// event actually carried an `avg_val_loss` field (tracing's
+    /// `impl<T: Value> Value for Option<T>` skips recording a `None` field
+    /// entirely, so this buffer is naturally empty on a `TrainLoss`-monitored
+    /// run and populated on the default `ValLoss`-monitored one).
+    static VAL_EPOCHS: OnceLock<Mutex<Vec<(u64, f64)>>> = OnceLock::new();
     static INSTALLED: OnceLock<()> = OnceLock::new();
 
     fn buffer() -> &'static Mutex<Vec<(u64, f64)>> {
         EPOCHS.get_or_init(|| Mutex::new(Vec::new()))
     }
 
-    /// A `tracing` layer that records the `epoch` + `avg_train_loss` fields of
-    /// every "Epoch complete" event into the shared buffer.
+    fn val_buffer() -> &'static Mutex<Vec<(u64, f64)>> {
+        VAL_EPOCHS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// A `tracing` layer that records the `epoch` + `avg_train_loss` +
+    /// `avg_val_loss` fields of every "Epoch complete" event into the shared
+    /// buffers.
     struct EpochLossLayer;
 
     struct EpochVisitor {
         epoch: Option<u64>,
         loss: Option<f64>,
+        val_loss: Option<f64>,
         is_epoch_event: bool,
     }
 
@@ -327,6 +339,8 @@ pub mod loss_capture {
         fn record_f64(&mut self, field: &Field, value: f64) {
             if field.name() == "avg_train_loss" {
                 self.loss = Some(value);
+            } else if field.name() == "avg_val_loss" {
+                self.val_loss = Some(value);
             }
         }
     }
@@ -336,12 +350,16 @@ pub mod loss_capture {
             let mut v = EpochVisitor {
                 epoch: None,
                 loss: None,
+                val_loss: None,
                 is_epoch_event: false,
             };
             event.record(&mut v);
             if v.is_epoch_event {
                 if let (Some(e), Some(l)) = (v.epoch, v.loss) {
                     buffer().lock().unwrap().push((e, l));
+                }
+                if let (Some(e), Some(l)) = (v.epoch, v.val_loss) {
+                    val_buffer().lock().unwrap().push((e, l));
                 }
             }
         }
@@ -368,14 +386,22 @@ pub mod loss_capture {
         });
     }
 
-    /// Clear the buffer before a fresh fine-tune run.
+    /// Clear the buffers before a fresh fine-tune run.
     pub fn reset() {
         buffer().lock().unwrap().clear();
+        val_buffer().lock().unwrap().clear();
     }
 
     /// The captured `(epoch, avg_train_loss)` rows, ordered by capture order.
     pub fn captured() -> Vec<(u64, f64)> {
         buffer().lock().unwrap().clone()
+    }
+
+    /// The captured `(epoch, avg_val_loss)` rows, ordered by capture order —
+    /// empty unless the run's `early_stopping_metric` actually measured
+    /// validation loss (the default, `ValLoss`).
+    pub fn captured_val() -> Vec<(u64, f64)> {
+        val_buffer().lock().unwrap().clone()
     }
 }
 
@@ -401,6 +427,27 @@ pub fn assert_loss_decreases(label: &str, curve: &[(u64, f64)]) -> (f64, f64) {
          curve {curve:?}"
     );
     (first, last)
+}
+
+/// Assert every loss value across one or more captured curves is finite, BY
+/// COUNT (family F9: never a vacuous "some finite" pass — every reported
+/// value is checked and the tally is asserted, not merely the endpoints
+/// [`assert_loss_decreases`] happens to touch).
+pub fn assert_all_finite(label: &str, curves: &[&[(u64, f64)]]) {
+    let mut total = 0usize;
+    let mut finite = 0usize;
+    for curve in curves {
+        for &(_, l) in curve.iter() {
+            total += 1;
+            if l.is_finite() {
+                finite += 1;
+            }
+        }
+    }
+    assert_eq!(
+        finite, total,
+        "{label}: expected every reported epoch loss finite, got {finite}/{total}"
+    );
 }
 
 /// Assert CPU↔GPU parity for one named vector pair: cosine ≥ [`COSINE_FLOOR`]

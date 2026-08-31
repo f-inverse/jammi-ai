@@ -35,6 +35,16 @@
 //!   matches the f32 direction. This is the only place the gate's *admit* path
 //!   runs — the CPU suite reaches only the non-cuda reject arm and the decision
 //!   predicate in isolation. See `bf16_gpu_gate`.
+//! - **P5 — GGUF/k-quant serving + QLoRA on GPU (issue #351).** CPU↔GPU embed
+//!   parity over a programmatically-written GGUF-quantized fixture (a
+//!   Q8_1-activation-quantization-specific cosine floor — CUDA's quantized
+//!   matmul re-quantizes the activation, CPU's does not, so the plain P1
+//!   `COSINE_FLOOR` does not apply); a same-checkpoint GGUF-on-GPU vs
+//!   f32-on-GPU quantization-loss floor; a QLoRA (`FrozenBase::Quantized`)
+//!   fine-tune learning smoke on GPU; the resolver's `estimated_memory`
+//!   checked truthful against a real `nvidia-smi`-measured device memory
+//!   delta; and a printed (unasserted) quantized-vs-f32 throughput baseline.
+//!   See `gguf_quantized_gpu`.
 //!
 //! Conformal / RRF are pure-CPU numerics and are out of scope — there is no GPU
 //! kernel to validate for them.
@@ -69,6 +79,7 @@ mod classification_parity;
 mod clip_text_embeddings_parity;
 mod embeddings_parity;
 mod fine_tune_learns;
+mod gguf_quantized_gpu;
 mod graph_finetune_learns;
 mod graph_propagation_parity;
 mod htsat_audio_embeddings_parity;

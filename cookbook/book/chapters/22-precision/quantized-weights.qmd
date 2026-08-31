@@ -392,27 +392,50 @@ assert all(math.isfinite(x) for x in query_vec)
 print(f"fine-tuned model encodes a query to a {len(query_vec)}-dim, finite vector — QLoRA round-trips.")
 ```
 
-> **Honest limit: held-out val loss is not readable from this surface today.**
-> The engine trains this job against the same held-out-loss discipline every
-> `fine_tune` job uses — `early_stopping_metric="val_loss"` gates it on
-> `TrainingLoop::evaluate_held_out` (`crates/jammi-ai/src/fine_tune/trainer.rs`),
-> the held-out metric rather than train-loss, for the same reason any
-> held-out oracle is preferred: a training-loss trend can improve while a
-> model overfits the exact batches it is shown, and cannot distinguish that
-> from real generalization. But this book cannot *read that trend back* to
-> assert it lives measured on this render: the Python `TrainingJob` handle
-> (`crates/jammi-python/src/job.rs`) exposes only `job_id`, `model_id`,
-> `status()` (a bare lifecycle token), and `wait()` — no metrics getter — and
-> the model catalog's own client-facing projection is documented to stop
-> there by design: `ModelDescriptor` "carries only the fields a client keys
-> off (the model's id, inference backend, task, and lifecycle status)"; a
-> job's per-epoch loss is server-internal bookkeeping that "never reaches a
-> client" (`crates/jammi-db/src/catalog/model_repo.rs:64-84`). This is a real
-> gap in the public surface, not a shortcut taken here — the cell above
-> asserts the faithful thing this surface *does* expose: the job completes
-> (a NaN/diverging loss fails it outright,
-> `docs/guide/src/fine-tuning.md`'s own "Divergence detection" line) and the
-> resulting adapter round-trips through inference.
+## Held-out val loss — read directly, the same oracle early stopping uses
+
+`job.metrics()` (`crates/jammi-python/src/job.rs`) returns the catalog's
+run-summary blob as a dict — `final_loss`, `early_stopping_metric`,
+`total_steps`, and, per epoch actually run, `train_loss_curve` /
+`val_loss_curve` arrays of `{epoch, loss}` rows
+(`TrainingLoop::run`/`TrainingResult::metrics_json`,
+`crates/jammi-ai/src/fine_tune/trainer.rs`). `val_loss_curve` is present
+exactly when the job's `early_stopping_metric` is `"val_loss"` — the arm the
+cell above selects — because that is the only arm under which
+`TrainingLoop::evaluate_held_out` measures a held-out loss at all: the
+trainer prefers this held-out signal over train loss for early stopping
+because a training-loss trend can improve while a model overfits the exact
+batches it is shown, indistinguishable from real generalization on train
+loss alone. This cell reads that same signal back and asserts the faithful
+learning claim directly, on real numbers, mirroring the trainer's own
+oracle rationale rather than assuming it: every epoch's val loss is finite,
+and the final epoch's val loss is lower than the first's.
+
+```{python}
+metrics = job.metrics()
+assert "val_loss_curve" in metrics, (
+    "val_loss_curve must be present: this job's early_stopping_metric is "
+    "'val_loss', so TrainingLoop::evaluate_held_out measures a held-out loss "
+    "every epoch"
+)
+val_curve = metrics["val_loss_curve"]
+val_losses = [row["loss"] for row in val_curve]
+print(f"val_loss_curve: {val_curve}")
+
+assert len(val_losses) >= 2, f"expected at least 2 measured epochs, got {val_curve}"
+assert all(math.isfinite(v) for v in val_losses), (
+    f"a non-finite held-out loss in the curve: {val_losses}"
+)
+assert val_losses[-1] < val_losses[0], (
+    f"held-out val loss must fall from the first measured epoch to the last "
+    f"under QLoRA fine-tuning over the frozen quantized backbone; got {val_losses}"
+)
+print(
+    f"val loss: first={val_losses[0]:.6f}  last={val_losses[-1]:.6f}  "
+    f"(Δ={val_losses[0] - val_losses[-1]:.6f}) — the faithful learning signal, "
+    f"measured, not assumed."
+)
+```
 
 ## The honest limits: what quantization costs, and what it buys
 
@@ -466,7 +489,7 @@ here — this chapter's cells are CPU-only throughout, by the same convention
 > by the distinct-hash cell above. A `q8_0` GGUF backbone resolves, loads, and
 > embeds through the exact same public front door every other checkpoint in
 > this book uses, costs a cosine delta on the order of `1e-8` on this fixture,
-> and trains correctly under LoRA over its frozen weights — with one honest
-> gap this chapter names rather than papers over: the held-out val-loss trend
-> that gates its own early stopping is not, today, a number this book's
-> public surface can read back.
+> and trains correctly under LoRA over its frozen weights — and the held-out
+> val-loss trend that gates its own early stopping is a number this book's
+> public surface reads back and asserts directly: `job.metrics()`'s
+> `val_loss_curve`, falling from first measured epoch to last.

@@ -109,32 +109,28 @@ pub(crate) fn compute_precision_byte_size(precision: jammi_numerics::ComputePrec
 /// [`ComputePrecision`](jammi_numerics::ComputePrecision) variant can take.
 /// `F32`'s 4 bytes happens to be that value today
 /// ([`compute_precision_byte_size`]'s own match: `F32 => 4`, `F16`/`BF16 =>
-/// 2`) — this helper COMPUTES it, via an exhaustive match over every
-/// variant (no wildcard `_` arm, and no arm's body is textually identical
-/// to another's, so `clippy::match_same_arms` cannot silently collapse
-/// this back into one path), rather than hardcoding the literal `4` the
-/// round-2 clamp used at the call site. A future, wider `ComputePrecision`
-/// variant fails to compile inside `width_for` below until this function
-/// is deliberately revisited — the same "add a variant, the compiler makes
-/// you handle it" property [`compute_precision_byte_size`]'s own match
-/// already gives the per-variant width lookup, one level up.
+/// 2`) — this helper COMPUTES it via a single exhaustive match with one
+/// compile-forced arm per variant, and NO separate candidate list (round-4
+/// audit: an EARLIER version of this function folded the same three
+/// variants through a `[F32, F16, BF16]` array literal, which is a
+/// hand-maintained list a new variant could be added without ever
+/// touching, despite this doc's then-claim that the property was
+/// compiler-enforced). Each arm below recurses into the NEXT variant's own
+/// arm, so a future `ComputePrecision` variant fails to compile inside
+/// this match — not merely inside [`compute_precision_byte_size`]'s own
+/// match one level up — until this function is deliberately revisited to
+/// decide where the new variant folds in.
 pub(crate) fn widest_compute_precision_byte_size() -> usize {
     use jammi_numerics::ComputePrecision::{BF16, F16, F32};
-    let f32_bytes = compute_precision_byte_size(F32);
-    let f16_bytes = compute_precision_byte_size(F16);
-    let bf16_bytes = compute_precision_byte_size(BF16);
-    let width_for = |precision: jammi_numerics::ComputePrecision| -> usize {
+    fn widest_from(precision: jammi_numerics::ComputePrecision) -> usize {
+        let own_bytes = compute_precision_byte_size(precision);
         match precision {
-            F32 => f32_bytes,
-            F16 => f16_bytes,
-            BF16 => bf16_bytes,
+            F32 => own_bytes.max(widest_from(F16)),
+            F16 => own_bytes.max(widest_from(BF16)),
+            BF16 => own_bytes,
         }
-    };
-    [F32, F16, BF16]
-        .into_iter()
-        .map(width_for)
-        .max()
-        .unwrap_or(f32_bytes)
+    }
+    widest_from(F32)
 }
 
 /// Normalize DistilBERT config field names to the BERT-standard set every
@@ -422,7 +418,7 @@ fn read_gguf_header(path: &Path, model_id: &str) -> Result<gguf_file::Content> {
 /// resolved to one number:
 ///
 /// - on this module's own one-layer BERT fixture (the fixture
-///   `estimate_gguf_residency_stays_at_least_true_residency_under_a_wider_persisted_adapter_dtype`
+///   `estimate_gguf_residency_costs_every_densified_tensor_at_f32_width_unconditionally`
 ///   builds: 6 matmul-site Q4_0 weights + 6 F32 biases + one `[128,32]`
 ///   F32 embedding), an F16 `compute_precision` config's admission figure
 ///   — MEASURED at F16 width (2 bytes/element), the width a caller-supplied
@@ -430,15 +426,24 @@ fn read_gguf_header(path: &Path, model_id: &str) -> Result<gguf_file::Content> {
 ///   removed — is 58560 bytes; MEASURED at F32 width (the figure this
 ///   function reports unconditionally now, and always reported in
 ///   practice under the round-2 clamp) it is 75712 bytes, a +29% rise
-///   (`(75712 - 58560) / 58560 ≈ 0.293`) — both figures reproduced by this
-///   module's own `true_residency_contribution` test arithmetic at
-///   `target_dtype_bytes` = 2 and 4 respectively;
+///   (`(75712 - 58560) / 58560 ≈ 0.293`) — both figures reproduced by that
+///   test's `estimator_exact_residency_at` closure at `width` = 2 and 4
+///   respectively (an EXACT replica of this function's own arithmetic,
+///   including `MATRIX_ROW_PADDING`; the module's separate
+///   `true_residency_contribution` parity helper deliberately omits that
+///   padding term to stay a conservative lower bound, so it is never the
+///   producer of these two exact figures);
 /// - the dense (non-matmul-site) TERM specifically scales linearly with
-///   dtype width (`elem_count * width`), so for an embedding-dominated
-///   checkpoint (dense bytes >> the compressed matmul-site term) an F16-
-///   vs-F32 admission-figure ratio approaches the full ~2x the per-element
-///   width itself moves by — MEASURED directly from that formula (not a
-///   fixture), since it is width-proportional by construction.
+///   dtype width (`elem_count * width`), but the max-transient term's own
+///   `4 * elem_count` component is width-independent, so the admission
+///   figure's F32-vs-F16 ratio is NOT the full 2x the per-element width
+///   itself moves by: on this fixture (the `[128,32]` F32 embedding is the
+///   ENTIRE dense mass, not merely dominant among several), the MEASURED
+///   ratio is `75712 / 58560 ≈ 1.29` (the same +29% rise cited above) —
+///   the full 2x is only approached in the opposite regime, where the
+///   single largest densified tensor is negligible relative to the total
+///   densified byte count across every non-matmul-site tensor, which this
+///   fixture does not exercise.
 ///
 /// # The non-GGUF safetensors residency path is dtype-blind and out of this unit's scope
 ///
@@ -446,22 +451,25 @@ fn read_gguf_header(path: &Path, model_id: &str) -> Result<gguf_file::Content> {
 /// `std::fs::metadata` file-size sum in each of `resolver.rs`'s three
 /// resolve paths) is a SEPARATE, PRE-EXISTING estimator this unit does
 /// NOT touch (issue #351's contract froze it — see contract A5). It is
-/// genuinely dtype-blind, and CAN under-report true residency: nothing
-/// validates that a safetensors checkpoint's on-disk stored dtype matches
-/// the `compute_precision`/`effective_precision` it will actually be
-/// loaded at (`resolver.rs`'s `compute_precision` read is a bare
-/// `unwrap_or_default()`, with no check against the file's own dtype), and
-/// `CandleBackend::load` always loads a safetensors checkpoint at
-/// `compute_dtype`/`effective_precision` regardless of what dtype it was
-/// SAVED at (candle.rs's `VarBuilder::from_mmaped_safetensors` call). An
+/// genuinely dtype-blind, and CAN under-report true residency: nothing at
+/// resolve time validates that a safetensors checkpoint's on-disk stored
+/// dtype matches the `compute_precision`/`effective_precision` it will
+/// actually be loaded at, and `CandleBackend::load` always loads a
+/// safetensors checkpoint at `compute_dtype`/`effective_precision`
+/// regardless of what dtype it was SAVED at (candle.rs's
+/// `VarBuilder::from_mmaped_safetensors` call). An
 /// F16-on-disk checkpoint served under the `F32` default is therefore
 /// resident at roughly 2x its file-byte sum — a real under-estimate, not a
-/// hypothetical one. `jammi_ai::model::backend::ort`'s own residency
-/// estimator applies an independent 1.3x multiplier over its file-size sum
-/// (`OrtBackend::estimate_memory`) precisely because this tree does not,
-/// elsewhere, treat on-disk file size as an upper bound on resident bytes.
-/// Fixing the safetensors estimator is out of scope for this unit; it is
-/// tracked by a follow-up issue.
+/// hypothetical one (the `F32` default itself: `ComputePrecision`'s own
+/// `#[default]` arm, `jammi_numerics::precision.rs:38-41`, is what
+/// `candle.rs:2522-2524`'s `per_model_precision.unwrap_or(device_config.compute_precision)`
+/// falls back to whenever neither `config.json` nor `DeviceConfig`
+/// overrides it). `jammi_ai::model::backend::ort`'s own residency estimator
+/// separately applies a 1.3x multiplier over its file-size sum
+/// (`OrtBackend::estimate_memory`, `ort.rs:34`) — an observed, uncommented
+/// constant in that file, not something this module's own reasoning
+/// derives or explains. Fixing the safetensors estimator is out of scope
+/// for this unit; it is tracked by a follow-up issue.
 pub(crate) fn estimate_gguf_residency(
     path: &Path,
     model_config: &serde_json::Value,
@@ -867,6 +875,7 @@ mod tests {
         // expected byte width to be pinned here (and
         // `widest_compute_precision_byte_size` revisited, see the
         // cross-check below) before either function can be trusted again.
+        let mut expected_widest = 0usize;
         for precision in [F32, F16, BF16] {
             let expected = match precision {
                 F32 => 4,
@@ -874,18 +883,18 @@ mod tests {
                 BF16 => 2,
             };
             assert_eq!(compute_precision_byte_size(precision), expected);
+            expected_widest = expected_widest.max(expected);
         }
         // Cross-checks `widest_compute_precision_byte_size` against the
-        // SAME exhaustively-enumerated variant set, rather than
-        // hardcoding `4` a second time.
-        assert_eq!(
-            widest_compute_precision_byte_size(),
-            [F32, F16, BF16]
-                .into_iter()
-                .map(compute_precision_byte_size)
-                .max()
-                .unwrap()
-        );
+        // widest of THIS test's own exhaustively-pinned expected widths
+        // (`expected_widest`, folded in the loop above) — NOT a second
+        // `[F32, F16, BF16]` candidate array. That function no longer has
+        // one of its own to consume: round-4 audit found the previous
+        // implementation's array was hand-maintained, so it now derives
+        // every variant's width via its own exhaustive recursive match
+        // (see that function's doc); this assertion must not re-introduce
+        // the same kind of hand-maintained list on the test side.
+        assert_eq!(widest_compute_precision_byte_size(), expected_widest);
     }
 
     #[test]

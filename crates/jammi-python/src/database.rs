@@ -762,7 +762,11 @@ impl PyDatabase {
             .runtime
             .block_on(self.session.run_training_spec(spec))
             .map_err(to_pyerr)?;
-        Ok(PyTrainingJob::new(job, Arc::clone(&self.runtime)))
+        Ok(PyTrainingJob::new(
+            job,
+            Arc::clone(&self.runtime),
+            Arc::clone(&self.session),
+        ))
     }
 
     /// Predict a target's distribution with a trained context predictor (S19) by

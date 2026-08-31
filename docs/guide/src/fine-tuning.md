@@ -171,6 +171,27 @@ query_vec = db.encode_query(model=model_id, query="quantum computing")
 db.generate_embeddings(source="patents", model=model_id, columns=["abstract"], key="id", modality="text")
 ```
 
+## Run metrics
+
+`job.metrics()` (Python) returns the run summary recorded on the job — a
+dict with `final_loss` (the best value seen, on whichever metric
+`early_stopping_metric` monitored), `early_stopping_metric` (`"train_loss"`
+or `"val_loss"`), `total_steps`, and `started_at`/`completed_at`
+timestamps. It returns `{}` for a job that has not recorded anything yet
+(still queued, or running before its first stamp), and carries
+`error_message` instead when the job failed.
+
+```python
+job.wait()
+metrics = job.metrics()
+print(f"final loss: {metrics['final_loss']} ({metrics['early_stopping_metric']})")
+```
+
+This is a run summary, not a per-epoch curve: the trainer computes and logs
+`avg_train_loss`/`avg_val_loss` at every epoch boundary but does not retain
+them past that boundary, so no per-epoch trajectory is available through
+this surface today.
+
 ## How it works
 
 ```text

@@ -302,6 +302,17 @@ applied after pooling.
   distribution). Costs a slightly slower forward pass since the LoRA path
   runs per layer.
 
+### QLoRA (encoder adapters over a quantized base)
+
+`base_model` accepts a GGUF checkpoint (see [Quantized (GGUF)
+checkpoints](./local-models.md#quantized-gguf-checkpoints)) the same way it
+accepts a safetensors checkpoint. When the resolved base is `model.gguf`, an
+encoder-adapters job trains its LoRA A/B matrices over the frozen quantized
+backbone automatically — the base artifact selects this, not a separate flag
+or config field. The quantized weights themselves are never trained (LoRA
+never updates a frozen base, quantized or dense); only the low-rank adapters
+receive gradients, exactly as with a dense base.
+
 ## Training safety
 
 - **Divergence detection:** if loss is NaN or >100 for 3 consecutive batches, the job fails with a clear error

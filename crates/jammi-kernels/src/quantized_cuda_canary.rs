@@ -24,10 +24,13 @@
 //! `QCudaStorage::fwd` around BOTH fast arms entirely (`cuda.rs:853`) onto
 //! the legacy, PTX-JIT'd dequantize-then-matvec path — proven correct on
 //! the mismatched build (issue #434: measured `0.0288`, ordinary
-//! quantization error, vs `18.6` garbage on the broken fast path). Every
-//! OTHER kernel this workspace ships (dense matmul, dequantize,
-//! `jammi-kernels`'s own fused ops) is PTX-JIT'd already and unaffected by
-//! any of this — this module exists ONLY to gate the quantized fast path.
+//! quantization error, vs `18.6` garbage on the broken fast path — the same
+//! `0.0288` magnitude is independently reproduced in-tree, see
+//! `forward_parity_against_dense_dequantized_reference_q8_0_q4_0_q4k`'s own
+//! measured `Q8_0` residual). Every OTHER kernel this workspace ships
+//! (dense matmul, dequantize, `jammi-kernels`'s own fused ops) is PTX-JIT'd
+//! already and unaffected by any of this — this module exists ONLY to gate
+//! the quantized fast path.
 //!
 //! ## What this guard can, and cannot, detect
 //!
@@ -129,19 +132,24 @@
 //! product against a weight of amplitude `weight_amplitude`:
 //! `2.0 * k * weight_amplitude * 0.5 * activation_amplitude / 127`. At this
 //! fixture's own `k = 32`, `weight_amplitude = 1.0`,
-//! `activation_amplitude <= 1.0`: `~0.252` — squarely `O(0.5)`, matching
-//! this crate's own measured `Q8_0` forward-parity residual elsewhere
-//! (`ops::quant_matmul_grad`'s own CPU test module: `0.0288` at a larger,
-//! multi-block shape).
+//! `activation_amplitude <= 1.0`: `~0.252` (no-producer: analytically
+//! derived from the rounding-error formula stated in this same paragraph,
+//! not a measured run) — squarely `O(0.5)`, matching this crate's own
+//! measured `Q8_0` forward-parity residual elsewhere, see
+//! `forward_parity_against_dense_dequantized_reference_q8_0_q4_0_q4k`'s own
+//! `0.0288` at a larger, multi-block shape.
 //!
-//! `CANARY_BOUND` is `0.3` — roughly 1.2x the `~0.252` analytic
-//! ordinary-noise ceiling above (enough margin to absorb the fixture's own
-//! `f32` rounding without false-failing a healthy device), while sitting
-//! decisively BELOW this fixture's own known-answer magnitude (`~0.664`)
-//! and orders of magnitude below any garbage value issue #434 actually
-//! observed (`O(10)`-`O(1e38)`, uninitialized device memory read back
-//! after a silently-failed kernel launch). This is the fix for a real
-//! defect an earlier version of this guard had: `CANARY_BOUND == 1.0`
+//! `CANARY_BOUND` is `0.3` — roughly 1.2x the `~0.252` (no-producer:
+//! analytically derived, same rounding-error formula as above, not a
+//! measured run) ordinary-noise ceiling above (enough margin to absorb the
+//! fixture's own `f32` rounding without false-failing a healthy device),
+//! while sitting decisively BELOW this fixture's own known-answer
+//! magnitude (`~0.664`, see
+//! `canary_diff_passes_rejects_the_all_zeros_failed_launch_signature`'s own
+//! pinned fixture) and orders of magnitude below any garbage value issue
+//! #434 actually observed (`O(10)`-`O(1e38)`, uninitialized device memory
+//! read back after a silently-failed kernel launch). This is the fix for a
+//! real defect an earlier version of this guard had: `CANARY_BOUND == 1.0`
 //! admitted an ALL-ZEROS output — `|0.664 - 0| == 0.664 < 1.0` — the
 //! canonical signature of a failed launch reading back a zeroed (rather
 //! than uninitialized-garbage) allocation, which this fixture's own
@@ -149,6 +157,8 @@
 //! against the garbage-value ceiling and not against the known answer
 //! itself. `0.3 < 0.664` closes that gap: a zeroed buffer now fails
 //! decisively, proven by `canary_case_outcome`'s own decision-core test
+//! (see
+//! `canary_case_outcome_reports_a_known_answer_disagreement_as_ok_false`)
 //! constructing exactly that state (`diff == 0.664`, the zero-output
 //! signature) without needing a device at all. `CANARY_BOUND` is not
 //! feature-gated (unlike the fixture-shape constants below it): the
@@ -541,7 +551,8 @@ mod tests {
     }
 
     /// [`canary_diff_passes`] admits the fixture's own analytic
-    /// ordinary-noise ceiling (`~0.252`, module doc's bound derivation).
+    /// ordinary-noise ceiling (`~0.252`, no-producer: analytically derived,
+    /// module doc's bound derivation — not a measured run).
     #[test]
     fn canary_diff_passes_admits_ordinary_quantization_noise() {
         assert!(canary_diff_passes(0.252));

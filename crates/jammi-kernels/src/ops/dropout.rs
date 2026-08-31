@@ -131,7 +131,8 @@
 //! contrast `crate::cuda`, a full PTX build step) — porting Philox to a
 //! Metal compute shader from nothing, for one op, was judged
 //! disproportionate to the defect (a LoRA/QLoRA training run failing on
-//! Apple Silicon at the shipped default `lora_dropout = 0.05`, GH #433)
+//! Apple Silicon at the shipped default `lora_dropout = 0.05` (no-producer:
+//! the shipped LoRA config default, not a measured value), GH #433)
 //! versus the alternative below, which reuses [`dropout_f32`]/
 //! [`dropout_bf16`] — the SAME functions [`DropoutFused::cpu_fwd`] calls —
 //! verbatim.
@@ -486,19 +487,44 @@ mod tests {
     /// `metal_device_or_skip` (wave A's require/skip lattice shape), shared
     /// here between both of this file's own Metal legs so the same shape is
     /// written once, not duplicated per call site. `caller` names the test
-    /// in the panic/skip message. This fn's own callers sit in `src/`,
-    /// outside `check_kernel_oracles.py`'s KO-7 scan roots (`tests/**` in
-    /// this crate, `jammi-encoders/src/**` — issue #437 tracks widening
-    /// KO-7 to `jammi-kernels/src/**` too), so this gate is
-    /// voluntary-but-real rather than CI-enforced.
+    /// in the panic/skip message.
+    ///
+    /// Wraps `Device::new_metal(0)` in `std::panic::catch_unwind`, mirroring
+    /// `tests/metal_parity.rs`'s own `metal_device_or_skip`: on at least
+    /// one real GH `macos-14` runner `Device::new_metal(0)` does not merely
+    /// return `Err` on a missing/broken device — an `objc2` class lookup
+    /// inside candle-metal-kernels' `residency_set.rs:18`
+    /// (`MTLResidencySetDescriptor`) can PANIC instead, a probe-time
+    /// failure mode a bare `Result` cannot model. Catching that panic here
+    /// is sound for the same reason `tests/metal_parity.rs`'s own doc
+    /// gives: the probe owns no lock and mutates no shared state before
+    /// failing, so unwinding out of it leaves nothing poisoned to clean up.
+    /// Both failure shapes (a returned `Err`, or a caught panic) fold into
+    /// the same skip/require decision below, so both of this fn's call
+    /// sites (`:743`, `:884`) inherit the containment from this ONE wrap.
     fn metal_device_or_skip(caller: &str) -> Option<Device> {
-        match Device::new_metal(0) {
+        let outcome: std::result::Result<Device, String> =
+            match std::panic::catch_unwind(|| Device::new_metal(0)) {
+                Ok(Ok(d)) => Ok(d),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(payload) => {
+                    let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "<non-string panic payload>".to_string()
+                    };
+                    Err(format!("Device::new_metal(0) panicked: {msg}"))
+                }
+            };
+        match outcome {
             Ok(d) => Some(d),
-            Err(e) => {
+            Err(msg) => {
                 if std::env::var_os("JAMMI_REQUIRE_METAL").is_some() {
                     panic!(
                         "{caller}: JAMMI_REQUIRE_METAL is set but no Metal device is \
-                         available: {e}"
+                         available: {msg}"
                     );
                 }
                 eprintln!(
@@ -646,12 +672,15 @@ mod tests {
 
     /// esc-070 conjunct 4: a Philox-EXACT drop-count oracle.
     ///
-    /// `keep_rate_matches_p_within_a_binomial_bound` above is explicitly a
-    /// DISTRIBUTIONAL check — its own docstring states the 6-sigma band —
+    /// see `keep_rate_matches_p_within_a_binomial_bound` above is explicitly
+    /// a DISTRIBUTIONAL check — its own docstring states the 6-sigma band —
     /// and a band, by construction, tolerates a threshold/rounding bug
-    /// anywhere inside it: at `n = 1_000_000`, `p = 0.05` that band is
-    /// ~1302 elements (~0.13% of `n`), so an off-by-a-handful (or even
-    /// off-by-a-thousand) threshold bug passes it silently. esc-070's
+    /// anywhere inside it: at that test's OWN `n = 1_000_000`, `p = 0.05`
+    /// fixture the band is ~1302 elements (~0.13% of `n`, no-producer:
+    /// analytically derived from the same 6-sigma binomial-bound formula
+    /// that test's own doc states, not a value this test itself measures),
+    /// so an off-by-a-handful (or even off-by-a-thousand) threshold bug
+    /// passes it silently. esc-070's
     /// control demands the mask's keep-count EQUAL an independently-derived
     /// Philox-exact count, not merely fall within a band — this test
     /// supplies that oracle without displacing the band test above (kept as

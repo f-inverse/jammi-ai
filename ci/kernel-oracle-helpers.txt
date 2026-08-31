@@ -71,3 +71,7 @@ crates/jammi-ai/tests/distributed/artifact_crash_window.rs::required_backends
 crates/jammi-ai/tests/distributed/cross_tenant_isolation.rs::required_backends
 crates/jammi-ai/tests/distributed/exactly_one_claim.rs::required_backends
 crates/jammi-ai/tests/distributed/kill9_reclaim.rs::required_backends
+crates/jammi-kernels/src/admission.rs::require_flash_compiled_or_skip
+crates/jammi-kernels/src/admission.rs::metal_device_or_skip
+crates/jammi-kernels/src/ops/dropout.rs::metal_device_or_skip
+crates/jammi-kernels/src/ops/flash_attention.rs::cuda_device_or_skip

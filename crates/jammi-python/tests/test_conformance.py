@@ -871,13 +871,54 @@ def test_remote_and_embedded_training_job_metrics_agree_on_all_three_states(tmp_
     hazards rather than papering over them with a retry/sleep loop — a
     flake-prone workaround this file's own `test_failed_training_wait_
     raises_training_error_on_both_raise_sites` deliberately avoids taking
-    for the same class of reason ("not hermetic" / timing-fragile). Residual
-    gap: this seam requires the local fixtures and a live worker thread per
-    state, so it is not hermetic the way the stub-only tests in this module
-    are, and a from-scratch `jammi-db` read-consistency audit of that
-    stale-pooled-connection behavior is out of this crate's scope (it lives
-    in `jammi-db`, not `jammi-python`) — flagged here, not silently worked
-    around.
+    for the same class of reason ("not hermetic" / timing-fragile).
+
+    A THIRD hazard, not sidestepped by the above and dominant over both:
+    `_submit_job` starts a REAL live embedded worker for this session, and
+    that worker writes to the exact SAME `training_jobs.metrics` column this
+    test seeds (`_set_metrics`) and reads (`.metrics()`). The instant it
+    claims the job, `TrainingLoop::run` stamps `{"started_at": ...}` into
+    that column via `mark_training_running`
+    (`crates/jammi-ai/src/fine_tune/trainer.rs:551-557`), which the catalog
+    persists as `metrics = COALESCE($1, metrics)`
+    (`crates/jammi-db/src/catalog/training_repo.rs`, `mark_training_running`)
+    — a write wholly unsynchronized with this test's own seed-then-read pair.
+    If the worker's claim-and-stamp lands in that narrow window, either write
+    can clobber the other: the seeded valid/malformed payload can vanish
+    under the worker's `started_at` stamp, or vice versa, and the test then
+    observes a value it never seeded. Only the worker's idle-poll cadence
+    (`worker.rs:230`, one claim attempt per `intervals.idle_poll`) keeps a
+    freshly-created job's claim from landing essentially instantly, which
+    keeps a realization of this race rare rather than routine — but NOT so
+    rare it is merely theoretical: repeated full-suite runs during this
+    repair reproduced it directly, roughly every other invocation, as a hard
+    interpreter crash (`Fatal Python error: Bus error`, SIGBUS inside
+    SQLite's own WAL commit path, `sqlite3PagerCommitPhaseOne` /
+    `pagerWalFrames`) when `_set_metrics`'s raw `sqlite3` connection commits
+    concurrently with the live worker's pooled `sqlx` connection against the
+    same `-wal`/`-shm` files — the two independent SQLite library instances
+    (Python's stdlib `sqlite3` vs. Rust's vendored `sqlx-sqlite`) are not
+    always safe to commit to the same WAL file at the exact same instant.
+    Every observed realization is a FALSE RED (up to and including this
+    crash), never a false GREEN: it can only ever change WHICH value lands
+    in the column before this test's own read, or abort the process
+    entirely, never make a binding that mis-parses JSON appear to parse it
+    correctly, or vice versa — so a flake here is a spurious failure on
+    correct bindings, not a laundered bug. No cheap hardening consistent
+    with this file's own idioms was found: confirming the worker has already
+    claimed and stamped the job before seeding would require either a
+    second read on the SAME pooled session (reintroducing the stale-read
+    hazard the FIRST-read isolation above exists to avoid) or a poll/retry
+    loop, which this file already disavows as flake-prone for this exact
+    class of hazard. Flagging it here, honestly, is therefore the fix, not
+    a workaround.
+
+    Residual gap: this seam requires the local fixtures and a live worker
+    thread per state, so it is not hermetic the way the stub-only tests in
+    this module are, and a from-scratch `jammi-db` read-consistency audit of
+    the stale-pooled-connection behavior above is out of this crate's scope
+    (it lives in `jammi-db`, not `jammi-python`) — flagged here, not
+    silently worked around.
     """
     import sqlite3
 
@@ -926,7 +967,7 @@ def test_remote_and_embedded_training_job_metrics_agree_on_all_three_states(tmp_
 
     assert remote_absent.metrics() == {}
     assert remote_valid.metrics() == valid_expected
-    with pytest.raises(BackendError):
+    with pytest.raises(BackendError, match=r"metrics blob failed to parse as JSON"):
         remote_malformed.metrics()
 
     # --- Embedded arm: one fresh real job per state (see docstring). ------
@@ -986,7 +1027,9 @@ def test_remote_and_embedded_training_job_metrics_agree_on_all_three_states(tmp_
     # State 3: present + malformed — the SAME truncated payload string.
     malformed_db, malformed_job = _submit_job("metrics_malformed")
     _set_metrics(malformed_job.job_id, malformed_payload)
-    with pytest.raises(BackendError) as embedded_info:
+    with pytest.raises(
+        BackendError, match=r"metrics blob failed to parse as JSON"
+    ) as embedded_info:
         malformed_job.metrics()
     assert malformed_job.job_id in str(embedded_info.value)
     malformed_job.wait()

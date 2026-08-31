@@ -137,6 +137,16 @@ jobs:
       - name: Forward-render selector self-test
         run: python3 ci/scripts/select_render_chapters.py --self-test
 
+      # This MUST run before the selector step below: a bare `git` in a
+      # container `run:` step hits "fatal: detected dubious ownership"
+      # (exit 128) — the checkout is owned by a different user than the
+      # container's git, and the safe.directory `actions/checkout` sets is
+      # not visible here (same trap as ci.yml's build-sha step and
+      # dep-dag.yml's freshness step; CI run 33447230854 died on the
+      # selector's own `git fetch` exactly this way).
+      - name: Mark the checkout safe for git (container UID != checkout UID)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       # The forward render gate itself: classify every chapter and print the
       # subset THIS diff could move (LIVE_COMPUTE chapters on any engine-code
       # diff, plus CACHE_READ chapters whose build_*_cache.py producer or

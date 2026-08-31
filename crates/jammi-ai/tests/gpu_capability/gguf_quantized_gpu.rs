@@ -934,41 +934,29 @@ async fn gguf_gpu_load_admission_estimate_is_truthful_against_measured_device_me
     }
     let measured_delta = raw_delta as u64;
 
-    // Strengthened (round-3 audit item 3): `write_q8_0_gguf_fixture`'s
-    // BERT-tiny dims (`HIDDEN=32`/`INTERMEDIATE=128`/`LAYERS=1`/
-    // `VOCAB=256`) put its whole tensor payload far below one allocator
-    // pool block, so for THIS specific fixture `nvidia-smi`'s
-    // pool-quantized whole-device reading can only ever land on EXACTLY
-    // one block: never zero (the zero-delta branch above already
-    // returned), never more than one (the load can never cross a second
-    // block boundary at this scale). Pin that directly rather than leaving
-    // it implicit, so a future edit that grows the fixture past one block
-    // fails HERE, with a message that says why, instead of silently
-    // continuing to pass a bound it no longer actually exercises.
-    assert_eq!(
-        measured_delta, ALLOCATOR_POOL_BLOCK_BYTES,
-        "this fixture is sub-block-sized (far below {ALLOCATOR_POOL_BLOCK_BYTES} bytes of real \
-         tensor data): the measured device-memory delta must quantize to EXACTLY one allocator \
-         pool block, not {measured_delta} — either the fixture grew past one block (this \
-         assertion needs updating to a multi-block bound) or the measurement window is no \
-         longer isolating the GGUF load"
-    );
-
-    // What pinning `measured_delta` above actually buys: it makes the
-    // following bound non-vacuous. Before this fixture-scale pin, ANY
-    // `estimated` (including a resolver bug that always returns 0) would
-    // clear `estimated + ADMISSION_ALLOWANCE_BYTES >= measured_delta`
-    // whenever `measured_delta` was capped at one block — the phase-4
-    // audit's own named vacuity. With `measured_delta` now KNOWN to be
-    // exactly one block, additionally requiring `estimated` to be
-    // strictly positive and no larger than one block on its own catches
-    // both a zero/near-zero estimator (measured nothing) and a wildly
-    // over-sized one (already exceeds this fixture's own known scale)
-    // — neither of which the under-report-only bound below can see. What
-    // this still does NOT prove: byte-exact truthfulness past
-    // `nvidia-smi`'s own one-block measurement granularity, or
-    // truthfulness at a LARGER (multi-block) scale — a multi-block
-    // fixture would need its own block-COUNT bound, not this one.
+    // This bound is independent of `measured_delta` entirely — it closes
+    // the phase-4 audit's own named vacuity (a resolver bug that always
+    // returns `estimated_memory = 0` would otherwise clear an `estimated +
+    // ADMISSION_ALLOWANCE_BYTES >= measured_delta` check whenever
+    // `measured_delta` happened to be small) using only this fixture's own
+    // known scale: `write_q8_0_gguf_fixture`'s BERT-tiny dims
+    // (`HIDDEN=32`/`INTERMEDIATE=128`/`LAYERS=1`/`VOCAB=256`) put its whole
+    // tensor payload far below one allocator pool block, so a truthful
+    // estimator for THIS fixture must report something in `(0,
+    // ALLOCATOR_POOL_BLOCK_BYTES]` regardless of what `nvidia-smi` measured.
+    // Catches both a zero/near-zero estimator (measured nothing) and a
+    // wildly over-sized one (already exceeds this fixture's own known
+    // scale). What this — and the under-report bound below — still do NOT
+    // prove: `device_memory_used_bytes` is a WHOLE-DEVICE, MiB-granular
+    // `nvidia-smi` reading (any other process's allocations on this device
+    // fold into it, and it can only resolve `nvidia-smi`'s own reporting
+    // step, not `ALLOCATOR_POOL_BLOCK_BYTES` exactly), so there is no
+    // honest equality this instrument can support against `measured_delta`
+    // — only a signed lower bound (measurement never legitimately
+    // decreases, asserted above) and an under-report bound (below) that
+    // tolerates one block of allocator/measurement slop. Byte-exact
+    // truthfulness, or truthfulness at a LARGER (multi-block) scale, is
+    // simply outside what a whole-device, MiB-granular poll can observe.
     assert!(
         estimated > 0 && estimated <= ALLOCATOR_POOL_BLOCK_BYTES,
         "resolver estimated_memory {estimated} must be in (0, {ALLOCATOR_POOL_BLOCK_BYTES}] \

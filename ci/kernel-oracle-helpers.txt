@@ -40,6 +40,7 @@ crates/jammi-kernels/tests/flash_smoke.rs::cuda_device
 crates/jammi-kernels/tests/flash_op_oracles.rs::cuda_device
 crates/jammi-kernels/tests/flash_torch_parity.rs::cuda_device
 crates/jammi-kernels/tests/metal_parity.rs::metal_device_or_skip
+crates/jammi-lora/tests/metal_dropout_position.rs::metal_device_or_skip
 crates/jammi-kernels/tests/empty_non_contiguous_admission_class_oracle.rs::cuda_device_or_skip
 crates/jammi-encoders/src/modernbert.rs::growth_oracle_cuda_device
 crates/jammi-encoders/src/modernbert.rs::flash_oracle_require_gate

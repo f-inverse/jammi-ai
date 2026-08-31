@@ -314,6 +314,24 @@ impl CustomOp1 for DropoutFused {
         use candle_core::backend::BackendDevice;
 
         let shape = l1.shape().clone();
+        // Contiguity is checked FIRST, unconditionally — even before the
+        // `n == 0` fast path below — so this arm's domain matches
+        // `cpu_fwd`'s exactly: a non-contiguous VIEW is refused with the
+        // SAME typed error whether or not it happens to be empty. A prior
+        // version of this fn checked `shape.elem_count() == 0` first and
+        // returned through the fast path before ever calling
+        // `contiguous_offsets()` — silently ADMITTING a zero-element
+        // non-contiguous layout (e.g. a `(0, 3)` tensor transposed to
+        // `(3, 0)`: candle's own `Shape::is_contiguous` resets its stride
+        // accumulator to `0` at a zero-sized dim, so a LATER dim `> 1`
+        // with a real stride correctly reads as non-contiguous even though
+        // the tensor holds no elements) that `cpu_fwd` refuses outright.
+        // `o1`/`o2` are unused by the `n == 0` branch itself (it never
+        // reads the buffer) — computed here only so the domain check runs
+        // in the SAME place for both branches, not duplicated.
+        let (o1, o2) = l1
+            .contiguous_offsets()
+            .ok_or(Error::RequiresContiguous { op: self.name() })?;
         // `n == 0`: skip the download/upload round trip entirely.
         // candle-metal-kernels' zero-BYTE `newBufferWithBytes:length:0`
         // path (which `to_cpu_storage`'s blit-to-host buffer AND
@@ -326,8 +344,8 @@ impl CustomOp1 for DropoutFused {
         // SAME zero-element buffer successfully; `crate::cuda::alloc_empty`
         // is this crate's identically-motivated CUDA-side special case for
         // an analogous "n == 0" launch-shape restriction). Matches
-        // `cpu_fwd`/`cuda_fwd`'s own domain: an empty tensor is a no-op,
-        // never an error.
+        // `cpu_fwd`/`cuda_fwd`'s own domain: an empty (but CONTIGUOUS)
+        // tensor is a no-op, never an error.
         if shape.elem_count() == 0 {
             // Dtype domain still applies to the empty case — an
             // unsupported-dtype empty tensor is refused, exactly like
@@ -342,9 +360,6 @@ impl CustomOp1 for DropoutFused {
             let out = s1.device().zeros_impl(&shape, s1.dtype())?;
             return Ok((out, shape));
         }
-        let (o1, o2) = l1
-            .contiguous_offsets()
-            .ok_or(Error::RequiresContiguous { op: self.name() })?;
         // `to_cpu_storage` returns the FULL raw backing buffer (from
         // storage offset 0) — the same contract `cpu_fwd`'s `CpuStorage`
         // argument and `cuda_fwd`'s `CudaStorage` argument have. This arm

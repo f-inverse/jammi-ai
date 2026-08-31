@@ -52,25 +52,44 @@
 //! genuinely arch-mismatched cubin, a CI/build-matrix concern and a
 //! separate remediation wave; see issue #434).
 //!
-//! ## Cache granularity: per-process, not per-device
+//! ## Cache granularity: per-device VERDICT, per-process REMEDIATION
 //!
-//! `set_force_dmmv` is a `candle_core`-internal PROCESS-GLOBAL
-//! `AtomicBool` (`quantized/cuda.rs:22-27`), not a per-device switch — so
-//! this guard's own verdict is cached per-PROCESS ([`std::sync::OnceLock`]),
-//! not per-device-ordinal: once any CUDA device on this process is found to
-//! need the DMMV fallback, that fallback is (unavoidably, given candle's
-//! own global flag) in effect for every OTHER CUDA device this same
-//! process ever touches too. Forcing the proven-correct slow path onto a
-//! device that might otherwise have passed its own canary is the safe
-//! default under this constraint (never the reverse), not a bug to work
-//! around here.
+//! `canary_verdict` runs (and caches) the known-answer case ONCE PER
+//! CUDA ORDINAL, keyed in a `Mutex<HashMap<usize, CanaryVerdict>>` by
+//! `canary_device_ordinal` — a `FastKernelsTrusted` verdict on ordinal 0
+//! never admits ordinal 1 unchecked; a multi-GPU process with one
+//! arch-matched and one arch-mismatched device gets each device's OWN
+//! known-answer run. (An earlier version of this guard cached a single
+//! process-global verdict regardless of ordinal — a real defect, not a
+//! documented tradeoff: it let one passing device silently vouch for every
+//! other CUDA device in the process. Fixed as part of issue #434's
+//! remediation.)
+//!
+//! The one thing that IS still process-global, unavoidably, is the
+//! REMEDIATION `set_force_dmmv` itself applies: it is a `candle_core`-
+//! internal PROCESS-GLOBAL `AtomicBool` (`quantized/cuda.rs:22-27`), not a
+//! per-device switch. So once ANY ordinal's canary run calls
+//! `set_force_dmmv(true)`, every OTHER CUDA device this same process
+//! touches afterward — including one whose own canary already passed and
+//! is cached `FastKernelsTrusted` — actually executes on the legacy DMMV
+//! path from that point on too, regardless of what its own cached verdict
+//! says (the cached verdict only gates admission; it does not, and cannot,
+//! reach back into candle's own dispatch to force the fast path). This
+//! granularity mismatch (per-device diagnosis, per-process remediation) is
+//! a real, unavoidable consequence of `set_force_dmmv`'s own global scope,
+//! not a bug this guard can close from its own side — and it is the SAFE
+//! direction to be wrong in: forcing the proven-correct slow path onto a
+//! device that might otherwise have passed its own canary, never the
+//! reverse.
 //!
 //! ## Zero per-call overhead after the first
 //!
 //! [`crate::quantized_cuda_canary::ensure_quantized_cuda_admitted`] is the
 //! entry `ops::quant_matmul_grad` (`crate::ops::quant_matmul_grad`) calls
-//! before every dispatch; after the first CUDA call in the process, this
-//! degrades to one `OnceLock` read (no kernel launch, no host/device copy).
+//! before every dispatch; after the first CUDA call FOR A GIVEN ORDINAL in
+//! the process, this degrades to one table lookup (a `Mutex` lock + a
+//! `HashMap` get keyed on that ordinal — no kernel launch, no host/device
+//! copy).
 //!
 //! ## Why the canary calls `ops::apply_stateful1`/`QuantMatMulGrad`
 //! directly, never the public `quant_matmul_grad` helper
@@ -79,9 +98,11 @@
 //! [`crate::quantized_cuda_canary::ensure_quantized_cuda_admitted`] FIRST
 //! (the wiring this module exists for) — so a canary that called
 //! `quant_matmul_grad` to run its own known-answer forward would recurse
-//! into this same check (and, on the very first call, into a `OnceLock`
-//! still being initialized: `std::sync::OnceLock::get_or_init` panics on
-//! reentrant initialization). The canary instead constructs
+//! into this same check (and, on the very first call for a given ordinal,
+//! into UNBOUNDED recursion: `canary_verdict`'s own table has no entry
+//! for that ordinal yet — filling it in is the very thing this call is
+//! doing — so the recursive call would run the canary again, and again,
+//! never reaching a base case). The canary instead constructs
 //! [`crate::ops::QuantMatMulGrad`] and applies it via
 //! [`crate::ops::apply_stateful1`] directly — the exact same `CustomOp1`
 //! `quant_matmul_grad` itself applies, one layer below the wrapper that
@@ -113,16 +134,28 @@
 //! (`ops::quant_matmul_grad`'s own CPU test module: `0.0288` at a larger,
 //! multi-block shape).
 //!
-//! `CANARY_BOUND` is `1.0` — roughly 4x the analytic ordinary-noise ceiling
-//! above, while sitting orders of magnitude below any garbage value issue
-//! #434 actually observed (`O(10)`-`O(1e38)`, uninitialized device memory
-//! read back after a silently-failed kernel launch). A case whose
-//! reference value and tolerance are both `O(1)` and whose failure mode is
-//! `O(10)` or larger separates decisively — no headroom tuning is needed
-//! to tell the two apart. (`CANARY_BOUND` is a plain code span here, not
-//! an intra-doc link: it lives behind `#[cfg(feature = "cuda")]`, while
-//! this module doc is compiled unconditionally — a link would break the
-//! default, non-`cuda` rustdoc build.)
+//! `CANARY_BOUND` is `0.3` — roughly 1.2x the `~0.252` analytic
+//! ordinary-noise ceiling above (enough margin to absorb the fixture's own
+//! `f32` rounding without false-failing a healthy device), while sitting
+//! decisively BELOW this fixture's own known-answer magnitude (`~0.664`)
+//! and orders of magnitude below any garbage value issue #434 actually
+//! observed (`O(10)`-`O(1e38)`, uninitialized device memory read back
+//! after a silently-failed kernel launch). This is the fix for a real
+//! defect an earlier version of this guard had: `CANARY_BOUND == 1.0`
+//! admitted an ALL-ZEROS output — `|0.664 - 0| == 0.664 < 1.0` — the
+//! canonical signature of a failed launch reading back a zeroed (rather
+//! than uninitialized-garbage) allocation, which this fixture's own
+//! magnitude happens to be small enough to hide behind a bound sized only
+//! against the garbage-value ceiling and not against the known answer
+//! itself. `0.3 < 0.664` closes that gap: a zeroed buffer now fails
+//! decisively, proven by `canary_case_outcome`'s own decision-core test
+//! constructing exactly that state (`diff == 0.664`, the zero-output
+//! signature) without needing a device at all. `CANARY_BOUND` is not
+//! feature-gated (unlike the fixture-shape constants below it): the
+//! decision core that reads it (`canary_diff_passes`) is deliberately
+//! compiled and testable in every feature configuration, mirroring
+//! `decide`'s own "testable with literal inputs, independent of any real
+//! device" split.
 use candle_core::Device;
 
 use crate::error::{KernelError, Result};
@@ -130,7 +163,9 @@ use crate::error::{KernelError, Result};
 #[cfg(feature = "cuda")]
 use std::borrow::Cow;
 #[cfg(feature = "cuda")]
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+#[cfg(feature = "cuda")]
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(feature = "cuda")]
 use candle_core::quantized::{GgmlDType, QStorage, QTensor};
@@ -145,9 +180,14 @@ const CANARY_OUT_FEATURES: usize = 1;
 #[cfg(feature = "cuda")]
 const CANARY_ROWS: usize = 1;
 
-/// See the module doc's bound derivation.
-#[cfg(feature = "cuda")]
-const CANARY_BOUND: f32 = 1.0;
+/// See the module doc's bound derivation. NOT feature-gated (unlike the
+/// fixture-shape constants above): [`canary_diff_passes`], the decision
+/// core that reads this, is deliberately compiled and testable in every
+/// feature configuration. `#[cfg_attr(not(feature = "cuda"), allow(dead_code))]`
+/// mirrors [`CanaryVerdict`]'s own honest annotation just below: without
+/// the `cuda` feature, only this crate's own unit tests read it.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+const CANARY_BOUND: f32 = 0.3;
 
 /// The canary's own verdict — already-resolved, so [`decide`] (the
 /// decision core every call site's outcome flows through) is testable with
@@ -191,23 +231,99 @@ fn decide(verdict: CanaryVerdict) -> Result<()> {
     }
 }
 
-/// Computed exactly once per process (see the module doc's "cache
-/// granularity" section for why per-process, not per-device-ordinal, is
-/// the correct granularity given `set_force_dmmv`'s own global scope).
-#[cfg(feature = "cuda")]
-fn canary_verdict(device: &Device) -> CanaryVerdict {
-    static VERDICT: OnceLock<CanaryVerdict> = OnceLock::new();
-    *VERDICT.get_or_init(|| run_canary(device))
+/// [`canary_case_passes`]'s decision core: `diff` (a max absolute
+/// elementwise difference, already computed) is finite and strictly below
+/// [`CANARY_BOUND`]. Pure and device-independent — see the module doc's
+/// `CANARY_BOUND` paragraph for why `0.3` decisively separates ordinary
+/// quantization noise (`~0.252`) from BOTH this fixture's own known-answer
+/// magnitude (`~0.664`, the boundary an all-zeros failed-launch readback
+/// used to hide behind at the old `1.0` bound) and any larger garbage
+/// value a genuinely arch-mismatched launch produces.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn canary_diff_passes(diff: f32) -> bool {
+    diff.is_finite() && diff < CANARY_BOUND
 }
 
-/// Runs the known-answer case; on failure, logs ONCE (this function itself
-/// only ever runs once per process — see [`canary_verdict`]'s own
-/// `OnceLock`), flips `set_force_dmmv(true)`, and re-runs the case on the
-/// legacy path before giving up.
+/// [`canary_case_passes`]'s other decision-core half: given the `Result`
+/// [`canary_max_abs_diff`] already produced (`Ok(diff)`, or an infra `Err`
+/// this function itself never constructs — device OOM, allocation failure,
+/// a transient driver error), decides the case's outcome WITHOUT touching a
+/// device. `Ok(true)` is a known-answer match, `Ok(false)` is a
+/// successfully-computed, finite known-answer DISAGREEMENT (the real
+/// "arch-mismatched fast kernels" signal — see the module doc's failure
+/// class section), and `Err(_)` is an infra failure that PROPAGATES
+/// unchanged rather than being folded into either outcome: [`run_canary`]
+/// must never flip `set_force_dmmv` or settle on [`CanaryVerdict::Refused`]
+/// on account of a transient error that says nothing about whether the fast
+/// kernels themselves are correct. Literal `Result<f32>` inputs make all
+/// three outcomes independently testable below with no device or `cuda`
+/// feature required.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn canary_case_outcome(diff: candle_core::Result<f32>) -> candle_core::Result<bool> {
+    diff.map(canary_diff_passes)
+}
+
+/// This CUDA device's ordinal — the key [`canary_verdict`]'s per-device
+/// table uses (module doc's "cache granularity" section).
+/// `ensure_quantized_cuda_admitted`'s `cfg(feature = "cuda")` arm only ever
+/// calls [`canary_verdict`] after matching `Device::Cuda(_)`, so the
+/// `Cpu`/`Metal` arm below is unreachable in production today; it exists
+/// so this fn is TOTAL over every `DeviceLocation` variant (never a
+/// partial match relying on `unreachable!()`, which would turn a future,
+/// legitimate non-CUDA call site here into a new panic surface — this
+/// guard's own job is to be conservative, not to add one) rather than
+/// because ordinal `0` is a meaningful fallback for a non-CUDA device.
 #[cfg(feature = "cuda")]
-fn run_canary(device: &Device) -> CanaryVerdict {
-    if canary_case_passes(device) {
-        return CanaryVerdict::FastKernelsTrusted;
+fn canary_device_ordinal(device: &Device) -> usize {
+    match device.location() {
+        candle_core::DeviceLocation::Cuda { gpu_id } => gpu_id,
+        candle_core::DeviceLocation::Cpu | candle_core::DeviceLocation::Metal { .. } => 0,
+    }
+}
+
+/// Computed once PER CUDA ORDINAL (module doc's "cache granularity"
+/// section — this used to be a single process-global `OnceLock`, which let
+/// ordinal 0's verdict silently vouch for every other CUDA device in the
+/// process; fixed as part of issue #434's remediation). An infra `Err` from
+/// [`run_canary`] is NEVER cached here — it propagates straight to the
+/// caller (see [`canary_case_outcome`]'s own doc) and the NEXT call for
+/// this ordinal retries from scratch, exactly as if nothing had run yet.
+#[cfg(feature = "cuda")]
+fn canary_verdict(device: &Device) -> candle_core::Result<CanaryVerdict> {
+    static VERDICTS: OnceLock<Mutex<HashMap<usize, CanaryVerdict>>> = OnceLock::new();
+    let ordinal = canary_device_ordinal(device);
+    let table = VERDICTS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(v) = table
+        .lock()
+        .expect("quantized-CUDA canary verdict table mutex poisoned")
+        .get(&ordinal)
+    {
+        return Ok(*v);
+    }
+    // Runs OUTSIDE the lock: `run_canary` dispatches real device work
+    // (kernel launches, host<->device copies) that must never happen while
+    // holding this table's mutex.
+    let verdict = run_canary(device)?;
+    Ok(*table
+        .lock()
+        .expect("quantized-CUDA canary verdict table mutex poisoned")
+        .entry(ordinal)
+        .or_insert(verdict))
+}
+
+/// Runs the known-answer case; on failure, logs ONCE PER ORDINAL (this
+/// function itself only ever runs once per ordinal that reaches a
+/// non-`Err` outcome — see [`canary_verdict`]'s own table), flips
+/// `set_force_dmmv(true)`, and re-runs the case on the legacy path before
+/// giving up. An infra `Err` from either [`canary_case_passes`] call
+/// propagates immediately: neither arm of this fn ever flips
+/// `set_force_dmmv` or returns [`CanaryVerdict::Refused`] on account of a
+/// call that could not run at all, only on account of one that RAN and
+/// disagreed.
+#[cfg(feature = "cuda")]
+fn run_canary(device: &Device) -> candle_core::Result<CanaryVerdict> {
+    if canary_case_passes(device)? {
+        return Ok(CanaryVerdict::FastKernelsTrusted);
     }
     tracing::warn!(
         "quantized fast-path kernels (fast_mmvq/fast_mmq) cannot execute correctly on this \
@@ -215,19 +331,16 @@ fn run_canary(device: &Device) -> CanaryVerdict {
          the legacy PTX-JIT'd DMMV path: correct, slower"
     );
     candle_core::quantized::cuda::set_force_dmmv(true);
-    if canary_case_passes(device) {
-        CanaryVerdict::LegacyDmmvFallback
+    if canary_case_passes(device)? {
+        Ok(CanaryVerdict::LegacyDmmvFallback)
     } else {
-        CanaryVerdict::Refused
+        Ok(CanaryVerdict::Refused)
     }
 }
 
 #[cfg(feature = "cuda")]
-fn canary_case_passes(device: &Device) -> bool {
-    match canary_max_abs_diff(device) {
-        Ok(diff) => diff.is_finite() && diff < CANARY_BOUND,
-        Err(_) => false,
-    }
+fn canary_case_passes(device: &Device) -> candle_core::Result<bool> {
+    canary_case_outcome(canary_max_abs_diff(device))
 }
 
 /// Builds the known-answer case, runs it on CPU (the reference — CPU
@@ -290,13 +403,29 @@ fn canary_max_abs_diff(device: &Device) -> candle_core::Result<f32> {
 /// all — see `crate::admission::device_is_supported`'s own doc for the
 /// identical `cfg!(feature = "cuda")` reasoning this crate follows
 /// throughout.
-pub fn ensure_quantized_cuda_admitted(device: &Device) -> Result<()> {
+///
+/// Returns `candle_core::Result<()>`, not this crate's own
+/// [`crate::error::Result`], DELIBERATELY: two distinct failure kinds can
+/// reach a caller here, and only one of them is this module's own typed
+/// refusal. A [`KernelError::QuantizedCudaCanaryFailed`] (both the fast
+/// kernels AND the DMMV fallback disagreed with the known answer) is
+/// preserved, TYPED, through `candle_core::Error::Cuda`'s own
+/// `Box<dyn std::error::Error + Send + Sync>` payload — `Error::Cuda`
+/// downcasts (`std::error::Error::downcast_ref`) back to `KernelError` at
+/// any downstream call site that wants to match it specifically, rather
+/// than collapsing to an untyped `Error::Msg(e.to_string())` a caller can
+/// only pattern-match by string. An infra error from `canary_verdict`
+/// (device OOM, allocation failure, a transient driver error — see
+/// `canary_case_outcome`'s own doc) propagates completely unchanged: it
+/// is not this guard's own refusal at all, so it is never re-wrapped.
+pub fn ensure_quantized_cuda_admitted(device: &Device) -> candle_core::Result<()> {
     #[cfg(feature = "cuda")]
     {
         if !matches!(device, Device::Cuda(_)) {
             return Ok(());
         }
-        decide(canary_verdict(device))
+        let verdict = canary_verdict(device)?;
+        decide(verdict).map_err(|e| candle_core::Error::Cuda(Box::new(e)))
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -306,7 +435,7 @@ pub fn ensure_quantized_cuda_admitted(device: &Device) -> Result<()> {
         // bare `Ok(())`) so `decide`/`CanaryVerdict` stay live code in
         // EVERY feature configuration, not merely under `cuda` + `test`.
         let _ = device;
-        decide(CanaryVerdict::FastKernelsTrusted)
+        decide(CanaryVerdict::FastKernelsTrusted).map_err(|e| candle_core::Error::Cuda(Box::new(e)))
     }
 }
 
@@ -314,14 +443,21 @@ pub fn ensure_quantized_cuda_admitted(device: &Device) -> Result<()> {
 /// "mechanism pin" convention, `ops/mod.rs`): whether this process's
 /// quantized-CUDA canary settled on the fast kernels (as opposed to the
 /// legacy DMMV fallback) for `device`. Runs (and caches, via
-/// `canary_verdict`'s own `OnceLock`) the canary if it has not already
-/// run this process. `tests/cuda_parity.rs`'s
+/// `canary_verdict`'s own per-ordinal table) the canary if it has not
+/// already run for this device's own ordinal. `tests/cuda_parity.rs`'s
 /// `quantized_cuda_canary_passes_on_a_healthy_build_and_device` is the
-/// sole caller.
+/// sole caller — it always calls `quant_matmul_grad` first (which must
+/// itself succeed), so an infra `Err` reaching this fn's own
+/// `canary_verdict` call here would already have surfaced there; folding
+/// it to `false` here is therefore never observed to mask a real infra
+/// failure in practice.
 #[doc(hidden)]
 #[cfg(feature = "cuda")]
 pub fn quantized_cuda_canary_used_fast_kernels_for_test(device: &Device) -> bool {
-    matches!(canary_verdict(device), CanaryVerdict::FastKernelsTrusted)
+    matches!(
+        canary_verdict(device),
+        Ok(CanaryVerdict::FastKernelsTrusted)
+    )
 }
 
 #[cfg(test)]
@@ -351,6 +487,71 @@ mod tests {
     fn decide_refuses_when_both_paths_fail() {
         let err = decide(CanaryVerdict::Refused).unwrap_err();
         assert!(matches!(err, KernelError::QuantizedCudaCanaryFailed));
+    }
+
+    /// [`canary_diff_passes`] admits the fixture's own analytic
+    /// ordinary-noise ceiling (`~0.252`, module doc's bound derivation).
+    #[test]
+    fn canary_diff_passes_admits_ordinary_quantization_noise() {
+        assert!(canary_diff_passes(0.252));
+    }
+
+    /// [`canary_diff_passes`] REJECTS the all-zeros failed-launch signature
+    /// this guard's old `CANARY_BOUND == 1.0` used to admit: a zeroed
+    /// device readback against this fixture's own known-answer magnitude
+    /// (`~0.664`) yields `diff == 0.664` — the exact zero-output state the
+    /// module doc's `CANARY_BOUND` paragraph names.
+    #[test]
+    fn canary_diff_passes_rejects_the_all_zeros_failed_launch_signature() {
+        assert!(!canary_diff_passes(0.664));
+    }
+
+    /// [`canary_diff_passes`] rejects non-finite input outright — `NaN <
+    /// CANARY_BOUND` is `false` in IEEE-754 either way, but the explicit
+    /// `is_finite()` guard makes that fact load-bearing rather than
+    /// incidental (family F: a negative control must fail on every bad
+    /// path, non-finite included, never merely rely on a comparison that
+    /// happens to already reject it).
+    #[test]
+    fn canary_diff_passes_rejects_non_finite() {
+        assert!(!canary_diff_passes(f32::NAN));
+        assert!(!canary_diff_passes(f32::INFINITY));
+    }
+
+    /// [`canary_case_outcome`]'s first of three decision-core outcomes: a
+    /// successfully-computed, in-bound diff is `Ok(true)`.
+    #[test]
+    fn canary_case_outcome_admits_a_known_answer_match() {
+        assert!(canary_case_outcome(Ok(0.01)).unwrap());
+    }
+
+    /// Second outcome: a successfully-computed, OUT-of-bound diff is
+    /// `Ok(false)` — the zero-output state again, this time through the
+    /// SAME decision core [`canary_case_passes`] itself calls in
+    /// production, not just through [`canary_diff_passes`] directly.
+    #[test]
+    fn canary_case_outcome_reports_a_known_answer_disagreement_as_ok_false() {
+        assert!(!canary_case_outcome(Ok(0.664)).unwrap());
+    }
+
+    /// Third outcome: an infra `Err` (device OOM, allocation failure, a
+    /// transient driver error — never a computed disagreement) PROPAGATES
+    /// unchanged, rather than being folded into `Ok(false)`. Conflating
+    /// these two would let a transient error permanently flip
+    /// `set_force_dmmv` or refuse a healthy device outright (see
+    /// `canary_case_outcome`'s own doc) — this test pins that a
+    /// synthetic infra error survives the decision core as the SAME
+    /// error, not a laundered boolean.
+    #[test]
+    fn canary_case_outcome_propagates_infra_errors_without_flipping_or_refusing() {
+        let err = canary_case_outcome(Err(candle_core::Error::Msg(
+            "synthetic infra failure: device OOM".to_string(),
+        )))
+        .expect_err("an infra Err must propagate, never silently read as Ok(false)");
+        match err {
+            candle_core::Error::Msg(msg) => assert_eq!(msg, "synthetic infra failure: device OOM"),
+            other => panic!("expected the SAME Msg error to propagate unchanged, got {other:?}"),
+        }
     }
 
     /// [`ensure_quantized_cuda_admitted`] is a total no-op on a CPU device

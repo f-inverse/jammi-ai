@@ -10,12 +10,27 @@
 //! `cuda_parity.rs`'s own gating convention. At runtime, a machine that
 //! compiled with the feature but has no physical Metal device (or is not
 //! on macOS) is treated as "skip", not "fail" — `Device::new_metal(0)`
-//! erroring is the signal — UNLESS `JAMMI_REQUIRE_METAL` is set, in which
-//! case a device-acquisition failure PANICS instead of returning, for the
-//! exact reason `cuda_parity.rs`'s own doc gives: without that
-//! distinction a broken device acquisition on a machine that is SUPPOSED
-//! to have a GPU would silently read as skipped tests rather than failed
-//! ones.
+//! erroring, OR PANICKING, is the signal — UNLESS `JAMMI_REQUIRE_METAL` is
+//! set, in which case a device-acquisition failure PANICS instead of
+//! returning, for the exact reason `cuda_parity.rs`'s own doc gives:
+//! without that distinction a broken device acquisition on a machine that
+//! is SUPPOSED to have a GPU would silently read as skipped tests rather
+//! than failed ones.
+//!
+//! `metal_device_or_skip`'s acquisition is wrapped in
+//! `std::panic::catch_unwind`: on at least one real GH `macos-14` runner,
+//! `Device::new_metal(0)` does not merely return `Err` on a missing/broken
+//! device — an `objc2` class lookup inside candle-metal-kernels'
+//! `residency_set.rs:18` (`MTLResidencySetDescriptor`) can PANIC instead,
+//! a probe-time failure mode a bare `Result` cannot model. Catching that
+//! panic here is sound: the probe owns no lock and mutates no shared state
+//! before failing, so unwinding out of it leaves nothing poisoned to clean
+//! up — unlike catching a panic across a held mutex guard or a
+//! half-mutated `static`. Both failure shapes (a returned `Err`, or a
+//! caught panic) fold into the SAME skip/require message and the SAME
+//! `Option<Device>` lattice below, so every call site downstream of this
+//! fn sees one uniform "skip or proceed" decision regardless of which way
+//! acquisition actually failed.
 //!
 //! ## `ops::DropoutFused` (this file's primary subject)
 //!
@@ -58,17 +73,44 @@ use half::bf16;
 use jammi_kernels::ops::{apply1, quant_matmul_grad, DropoutFused};
 use std::sync::Arc;
 
+/// A panic payload folded to a human-readable string — `std::panic::
+/// catch_unwind`'s error type is `Box<dyn std::any::Any + Send>`, which
+/// carries no `Display`/`Debug` of its own; `panic!("{msg}")`/`panic!(msg)`
+/// (the two shapes `std`'s own panic machinery ever constructs) box either
+/// a `&'static str` or an owned `String`, so those two downcasts cover
+/// every REAL panic payload this process can produce.
+fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
 /// Acquire a Metal device, or `None` to skip — unless `JAMMI_REQUIRE_METAL`
-/// is set, in which case a failure panics. Mirrors `cuda_parity.rs`'s
-/// `cuda_device_or_skip`.
+/// is set, in which case a failure PANICS. Mirrors `cuda_parity.rs`'s
+/// `cuda_device_or_skip`, widened (module doc above) to fold BOTH a
+/// returned `Err` AND a caught panic from `Device::new_metal(0)` into the
+/// same `Result<Device, String>` before deciding skip-vs-require, so the
+/// decision itself (the `if`/`panic!` below) is written exactly once.
 fn metal_device_or_skip() -> Option<Device> {
-    match Device::new_metal(0) {
+    let outcome: Result<Device, String> = match std::panic::catch_unwind(|| Device::new_metal(0)) {
+        Ok(Ok(d)) => Ok(d),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(payload) => Err(format!(
+            "Device::new_metal(0) panicked: {}",
+            panic_payload_to_string(payload.as_ref())
+        )),
+    };
+    match outcome {
         Ok(d) => Some(d),
-        Err(e) => {
+        Err(msg) => {
             if std::env::var_os("JAMMI_REQUIRE_METAL").is_some() {
-                panic!("JAMMI_REQUIRE_METAL is set but no Metal device is available: {e}");
+                panic!("JAMMI_REQUIRE_METAL is set but no Metal device is available: {msg}");
             }
-            eprintln!("metal_parity: skipping — no Metal device available: {e}");
+            eprintln!("metal_parity: skipping — no Metal device available: {msg}");
             None
         }
     }
@@ -216,6 +258,79 @@ fn dropout_non_contiguous_view_is_refused_on_metal() {
     let op = DropoutFused::new(1, 0, 0, 0.3).unwrap();
     let err = apply1(&x, op).expect_err("non-contiguous Metal input must be refused");
     assert!(matches!(err, candle_core::Error::RequiresContiguous { .. }));
+}
+
+/// Domain oracle (family D), replayed on Metal, pinning the boundary WHERE
+/// the empty-fast-path and the non-contiguous refusal above could
+/// disagree: a ZERO-ELEMENT, NON-CONTIGUOUS view. `ops::dropout`'s
+/// `metal_fwd` used to check `elem_count() == 0` BEFORE calling
+/// `contiguous_offsets()`, so an empty-but-non-contiguous layout took the
+/// empty fast path silently instead of hitting the SAME
+/// `RequiresContiguous` refusal `cpu_fwd` gives it — the two domains
+/// disagreed exactly at this one corner. `Tensor::zeros((0, 3), ..)`
+/// transposed to `(3, 0)`: `candle_core::Shape::is_contiguous` resets its
+/// running stride accumulator to `0` at the zero-sized dim, so the
+/// FOLLOWING dim (`3`, stride `1` post-transpose) fails the `stride ==
+/// acc` check — genuinely non-contiguous by candle's own definition, even
+/// though it holds no elements. Built via `zeros` (not `from_slice`), same
+/// reason as `dropout_empty_tensor_is_a_no_op_on_metal` above.
+#[test]
+fn dropout_empty_non_contiguous_view_is_refused_on_metal() {
+    let Some(metal) = metal_device_or_skip() else {
+        return;
+    };
+    let x = Tensor::zeros((0, 3), DType::F32, &metal)
+        .unwrap()
+        .t()
+        .unwrap();
+    assert_eq!(x.elem_count(), 0);
+    assert!(
+        !x.is_contiguous(),
+        "a (0, 3) tensor transposed to (3, 0) must read as non-contiguous"
+    );
+    let op = DropoutFused::new(1, 0, 0, 0.3).unwrap();
+    let err = apply1(&x, op).expect_err("an empty, non-contiguous Metal input must be refused");
+    assert!(matches!(err, candle_core::Error::RequiresContiguous { .. }));
+}
+
+/// Domain oracle (family D) pinning byte-parity on the ONE input where
+/// this file's own module doc's "downloads the input's raw backing buffer
+/// ... slices `[o1..o2]` itself" design could plausibly diverge: an
+/// `o1 > 0` CONTIGUOUS view, built via `Tensor::narrow` on a larger
+/// backing buffer. `dropout_f32`/`dropout_bf16`'s KEEP/DROP decision is a
+/// function of the LOCAL element index within the sliced window (`0..len`,
+/// `dropout_f32`'s own `x.iter().enumerate()`), so a wrong slice window —
+/// e.g. reading from the downloaded buffer's absolute position `0` instead
+/// of `o1` — would apply the SAME mask decisions to the WRONG underlying
+/// VALUES rather than erroring, invisibly to every other fixture in this
+/// file (every one of which narrows nothing, so `o1 == 0` there and the
+/// "slice from `o1`" and "slice from `0`" bugs would coincide). This
+/// fixture's values are strictly increasing, so a wrong window changes the
+/// output vector, not just its mask.
+#[test]
+fn dropout_offset_narrowed_view_matches_cpu() {
+    let Some(metal) = metal_device_or_skip() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let n = 20usize;
+    let v: Vec<f32> = (0..n).map(|i| 1.0 + i as f32 * 0.001).collect();
+    let x_cpu = Tensor::from_slice(&v, (n,), &cpu)
+        .unwrap()
+        .narrow(0, 7, 10)
+        .unwrap();
+    let x_metal = Tensor::from_slice(&v, (n,), &metal)
+        .unwrap()
+        .narrow(0, 7, 10)
+        .unwrap();
+    assert!(x_cpu.is_contiguous());
+    assert!(x_metal.is_contiguous());
+    let out_cpu: Vec<f32> = dropout(3, 1, 2, 0.4, &x_cpu).to_vec1().unwrap();
+    let out_metal: Vec<f32> = dropout(3, 1, 2, 0.4, &x_metal).to_vec1().unwrap();
+    assert_eq!(
+        out_cpu, out_metal,
+        "an offset-narrowed (o1 > 0) contiguous Metal view must byte-match the identical CPU view"
+    );
 }
 
 /// `ops::QuantMatMulGrad`'s backward (`dx = dy @ dequantize(W)`) on Metal

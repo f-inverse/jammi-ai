@@ -849,24 +849,54 @@ async fn gguf_gpu_load_admission_estimate_is_truthful_against_measured_device_me
     };
     drop(loaded);
 
-    let measured_delta = after.saturating_sub(before);
+    // Signed so a genuine DECREASE (memory freed elsewhere during the
+    // measurement window — never a legitimate outcome of this load-only
+    // window) is distinguishable from a zero delta. `saturating_sub` on the
+    // unsigned reading would silently fold both into 0, hiding a real bug
+    // behind the same "granularity artifact" story a true zero gets below.
+    let raw_delta = after as i64 - before as i64;
     let estimated = resolved.estimated_memory as u64;
 
     eprintln!(
-        "gguf_gpu_admission_truthfulness: estimated_memory={estimated} \
-         measured_delta={measured_delta} (before={before} after={after}) \
-         allowance={ADMISSION_ALLOWANCE_BYTES} (one allocator pool block)"
+        "gguf_gpu_admission_truthfulness: estimated_memory={estimated} raw_delta={raw_delta} \
+         (before={before} after={after}) allowance={ADMISSION_ALLOWANCE_BYTES} (one allocator \
+         pool block)"
     );
 
-    // Non-vacuous pass arm (F9): the load must have allocated SOMETHING —
-    // an all-zero/no-op delta would trivially satisfy the direction check
-    // below regardless of whether `estimated_memory` is truthful.
+    // Hard failure (audit advisory 5): `nvidia-smi`'s pool-block
+    // quantization can only round a small positive delta DOWN toward zero —
+    // it cannot manufacture a negative one. A negative `raw_delta` here
+    // means device memory was measurably freed during a window that only
+    // ever loads a model, which is impossible for a correct measurement and
+    // must fail loud rather than be laundered into the soft zero-delta skip
+    // below.
     assert!(
-        measured_delta > 0,
-        "gguf_gpu_admission_truthfulness: measured device-memory delta was {measured_delta} \
-         (not > 0) — the GGUF load did not measurably allocate anything, so this oracle cannot \
-         say whether estimated_memory={estimated} is truthful"
+        raw_delta >= 0,
+        "gguf_gpu_admission_truthfulness: measured device memory DECREASED across the load \
+         window (before={before} after={after}, raw_delta={raw_delta}) — this is not a \
+         granularity artifact (quantization can only round toward zero, never negative); \
+         something else freed device memory during measurement, or the before/after ordering \
+         is wrong"
     );
+
+    // Soft skip (audit advisory 5), same shape as this test's two
+    // nvidia-smi-unavailable arms above: `nvidia-smi`'s whole-device
+    // reading is quantized to `ALLOCATOR_POOL_BLOCK_BYTES`, so a genuinely
+    // small GGUF load can round down to an observed delta of exactly zero.
+    // That is a measurement-granularity artifact, not evidence
+    // `estimated_memory` is untruthful — assert nothing about it and skip.
+    if raw_delta == 0 {
+        tracing::warn!(
+            "SKIP: measured device-memory delta was 0 (before={before} after={after}) — \
+             nvidia-smi's whole-device reading is quantized to \
+             {ADMISSION_ALLOWANCE_BYTES}-byte allocator pool blocks and can round a genuinely \
+             small GGUF load down to zero; cannot say whether estimated_memory={estimated} is \
+             truthful"
+        );
+        return;
+    }
+    let measured_delta = raw_delta as u64;
+
     // Direction-only, wide-documented-bound assertion (F9): the resolver's
     // estimate must not UNDER-report true residency by more than the
     // allocator's own single-pool-block granularity — never a byte-exact

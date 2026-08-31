@@ -611,6 +611,23 @@ jobs:
       - name: Pin Rust toolchain (rust-toolchain.toml)
         run: rustup show
 
+      # `.cargo/config.toml`'s `[build] rustc-wrapper = "sccache"` is
+      # committed and applies to every cargo invocation on every runner,
+      # this one included — there is no macOS-scoped opt-out in that file
+      # (unlike the mold `rustflags`, which the comment above already notes
+      # is scoped away from `aarch64-apple-darwin`). Per house doctrine this
+      # job must never override `RUSTC_WRAPPER` (unlike the two lanes in
+      # this workflow, and `pypi.yml`, that legitimately set
+      # `RUSTC_WRAPPER: ""` to opt out) — a `macos-14` GH-hosted runner has
+      # no `sccache` binary preinstalled, so without this step every cargo
+      # call below fails immediately trying to exec the wrapper. Installed
+      # fresh per run with a cold local disk cache (no `SCCACHE_GHA_ENABLED`
+      # / GHA cache backend wired here) — this job's compiles are narrow
+      # (two `--test` targets), so a warm cache is not worth the added
+      # surface; revisit only if this job's runtime becomes a problem.
+      - name: Install sccache (required by committed .cargo/config.toml rustc-wrapper)
+        run: brew install sccache
+
       - name: Clippy jammi-kernels --test metal_parity --features metal (Metal, no GPU op run)
         run: cargo clippy -p jammi-kernels --test metal_parity --features metal -- -D warnings
 

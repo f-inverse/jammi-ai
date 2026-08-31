@@ -6,6 +6,7 @@ use jammi_db::error::{JammiError, Result};
 use jammi_db::store::ArtifactStore;
 
 use super::backend::gguf::estimate_gguf_residency;
+use super::backend::safetensors_residency::estimate_safetensors_residency;
 use super::{
     BackendType, ModelId, ModelSource, ModelTask, ResolvedModel, TokenizerSource, WeightsFormat,
 };
@@ -90,6 +91,20 @@ impl ModelResolver {
         // dir candle can mmap (an in-place no-op for a `file://` root), and point
         // `adapter_path` at that dir. The base model resolves through its own
         // path, so this only routes the *adapter* through the artifact store.
+        //
+        // `estimated_memory` below is copied VERBATIM from `base_resolved`
+        // (issue #431): the adapter itself is a small LoRA delta this
+        // estimate deliberately does not fold in (out of scope for #431 —
+        // tracked separately). Now that `base_resolved.estimated_memory` is
+        // itself dtype-correct for a safetensors base (this file's
+        // `estimate_safetensors_residency` call, below, for both the
+        // catalog-lookup arm's OWN estimate and — transitively, through
+        // `self.resolve(&base_source, ..)` above — the base resolve this
+        // copy reads from) or header-derived for a GGUF base
+        // (`estimate_gguf_residency`), this copy inherits that correctness
+        // for free: it was never itself the estimator with the dtype-blind
+        // bug, only a verbatim reader of one that used to be.
+
         if record.model_type == "fine-tuned" {
             if let Some(ref base_id) = record.base_model_id {
                 let base_source = ModelSource::parse(base_id);
@@ -194,14 +209,26 @@ impl ModelResolver {
 
         let tokenizer = discover_local_tokenizer(&artifact_dir);
 
-        let estimated_memory: usize = if weights_format == WeightsFormat::Gguf {
-            estimate_gguf_residency(&weights_paths[0], &model_config, &model_id.0)?
-        } else {
-            weights_paths
+        // Exhaustive on `WeightsFormat` (issue #431): GGUF and safetensors
+        // both estimate from the artifact's own header at RESOLVE time (see
+        // `estimate_gguf_residency`/`estimate_safetensors_residency`'s own
+        // docs for why a plain file-byte sum under-reports true residency
+        // for either format) — only ONNX still falls back to the raw
+        // file-byte sum, which `OrtBackend::estimate_memory`'s own 1.3x
+        // multiplier already treats as untrustworthy on its own terms (out
+        // of this unit's scope, issue #431 contract).
+        let estimated_memory: usize = match weights_format {
+            WeightsFormat::Gguf => {
+                estimate_gguf_residency(&weights_paths[0], &model_config, &model_id.0)?
+            }
+            WeightsFormat::Safetensors => {
+                estimate_safetensors_residency(&weights_paths, &model_id.0)?
+            }
+            WeightsFormat::Onnx => weights_paths
                 .iter()
                 .filter_map(|p| std::fs::metadata(p).ok())
                 .map(|m| m.len() as usize)
-                .sum()
+                .sum(),
         };
 
         let pooling_config = read_local_pooling_config(&artifact_dir, &model_id.0)?;
@@ -326,14 +353,20 @@ impl ModelResolver {
 
         let tokenizer = discover_local_tokenizer(path);
 
-        let estimated_memory: usize = if weights_format == WeightsFormat::Gguf {
-            estimate_gguf_residency(&weights_paths[0], &config, &source.to_string())?
-        } else {
-            weights_paths
+        // See the catalog-lookup arm's identical match above for why this is
+        // exhaustive on `WeightsFormat` rather than a Gguf/else split.
+        let estimated_memory: usize = match weights_format {
+            WeightsFormat::Gguf => {
+                estimate_gguf_residency(&weights_paths[0], &config, &source.to_string())?
+            }
+            WeightsFormat::Safetensors => {
+                estimate_safetensors_residency(&weights_paths, &source.to_string())?
+            }
+            WeightsFormat::Onnx => weights_paths
                 .iter()
                 .filter_map(|p| std::fs::metadata(p).ok())
                 .map(|m| m.len() as usize)
-                .sum()
+                .sum(),
         };
 
         Ok(ResolvedModel {
@@ -512,14 +545,20 @@ impl ModelResolver {
                     .map(TokenizerSource::OpenClipBpe)
             });
 
-        let estimated_memory: usize = if weights_format == WeightsFormat::Gguf {
-            estimate_gguf_residency(&weights_paths[0], &config, &source.to_string())?
-        } else {
-            weights_paths
+        // See the catalog-lookup arm's identical match above for why this is
+        // exhaustive on `WeightsFormat` rather than a Gguf/else split.
+        let estimated_memory: usize = match weights_format {
+            WeightsFormat::Gguf => {
+                estimate_gguf_residency(&weights_paths[0], &config, &source.to_string())?
+            }
+            WeightsFormat::Safetensors => {
+                estimate_safetensors_residency(&weights_paths, &source.to_string())?
+            }
+            WeightsFormat::Onnx => weights_paths
                 .iter()
                 .filter_map(|p| std::fs::metadata(p).ok())
                 .map(|m| m.len() as usize)
-                .sum()
+                .sum(),
         };
 
         Ok(ResolvedModel {

@@ -3182,22 +3182,30 @@ impl ModelBackend for CandleBackend {
     }
 
     fn estimate_memory(&self, resolved: &ResolvedModel) -> usize {
-        // GGUF (issue #351, pin V5): the resolver already computed a
-        // conservative, header-parsed residency figure at resolve time
-        // (`gguf::estimate_gguf_residency`) — reuse it verbatim rather than
-        // re-deriving anything from `weights_paths` here (which, for a GGUF
-        // model, is a single-file byte size wildly unrepresentative of
-        // resident memory). The safetensors/ONNX arm below is
-        // byte-identical to every prior release.
-        if resolved.weights_format == WeightsFormat::Gguf {
-            return resolved.estimated_memory;
+        // GGUF (issue #351, pin V5) and safetensors (issue #431): the
+        // resolver already computed a conservative, header-parsed residency
+        // figure at resolve time (`gguf::estimate_gguf_residency` /
+        // `safetensors_residency::estimate_safetensors_residency`) — reuse
+        // it verbatim rather than re-deriving anything from `weights_paths`
+        // here. For GGUF this is because `weights_paths` is a single-file
+        // byte size wildly unrepresentative of resident memory; for
+        // safetensors it is because the plain on-disk file-byte sum is
+        // dtype-blind — it under-reports true residency whenever the
+        // on-disk dtype is narrower than the `compute_dtype`
+        // `VarBuilder::from_mmaped_safetensors` (below) actually
+        // materializes every weight at (issue #431). The ONNX arm below
+        // (the only `WeightsFormat` a Candle-backend resolve never
+        // produces, but kept as an exhaustive-match-safe fallback) stays
+        // the plain file-byte sum, byte-identical to every prior release.
+        match resolved.weights_format {
+            WeightsFormat::Gguf | WeightsFormat::Safetensors => resolved.estimated_memory,
+            WeightsFormat::Onnx => resolved
+                .weights_paths
+                .iter()
+                .filter_map(|p| std::fs::metadata(p).ok())
+                .map(|m| m.len() as usize)
+                .sum(),
         }
-        resolved
-            .weights_paths
-            .iter()
-            .filter_map(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len() as usize)
-            .sum()
     }
 }
 

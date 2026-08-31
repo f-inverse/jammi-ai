@@ -372,7 +372,22 @@ job = db.fine_tune(
     task="text_embedding",
     target_modules=["query", "value"],  # non-empty -> encoder-adapters (QLoRA)
     lora_rank=4,
-    epochs=2,
+    epochs=12,
+    # warmup_steps=0, not the engine default of 100. This fixture's 24 train
+    # rows / batch_size=8 give only 3 steps/epoch; against a 100-step linear
+    # warmup (`compute_lr`, `crates/jammi-ai/src/fine_tune/trainer.rs`) every
+    # step of a short run lands inside the ramp and the effective LR never
+    # clears ~1e-5 — this exact starvation was measured on this fixture at
+    # epochs=2/warmup=100 (default): a val-loss delta of 4.7e-5, indistinguishable
+    # from float32 reduction-order noise, not a learning signal. warmup_steps=0
+    # is the same override this engine's own GPU acceptance oracle uses on this
+    # identical hyperparameter surface for the identical reason
+    # (`crates/jammi-ai/tests/gpu_capability/gguf_quantized_gpu.rs`'s module
+    # doc, `qlora_learns_on_gpu_with_gguf_base`). learning_rate=1e-3 and 12
+    # epochs (36 steps total) were then chosen, measured below, to clear a
+    # documented floor with wide margin — see "Held-out val loss" below.
+    warmup_steps=0,
+    learning_rate=1e-3,
     validation_fraction=0.2,
     early_stopping_metric="val_loss",
     seed=0,
@@ -406,10 +421,11 @@ cell above selects — because that is the only arm under which
 trainer prefers this held-out signal over train loss for early stopping
 because a training-loss trend can improve while a model overfits the exact
 batches it is shown, indistinguishable from real generalization on train
-loss alone. This cell reads that same signal back and asserts the faithful
-learning claim directly, on real numbers, mirroring the trainer's own
-oracle rationale rather than assuming it: every epoch's val loss is finite,
-and the final epoch's val loss is lower than the first's.
+loss alone. This cell reads that same signal back and asserts against a
+**measured floor**, not a bare `last < first` sign check: a two-point (or
+even twelve-point) curve's *sign* alone is not a trustworthy oracle unless
+the magnitude of the fall is pinned far above run-to-run/environment-to-
+environment float noise — see the floor's derivation in the cell below.
 
 ```{python}
 metrics = job.metrics()
@@ -426,14 +442,49 @@ assert len(val_losses) >= 2, f"expected at least 2 measured epochs, got {val_cur
 assert all(math.isfinite(v) for v in val_losses), (
     f"a non-finite held-out loss in the curve: {val_losses}"
 )
-assert val_losses[-1] < val_losses[0], (
+
+# MEASURED (F9), not assumed, and not a bare sign check: a `last < first`
+# comparison on its own is a coin flip once the true effect size is inside
+# float32 reduction-order noise — this chapter shipped exactly that bug once
+# (val_loss_curve delta 4.7e-5 at epochs=2/warmup_steps=100, the engine
+# default; see the `fine_tune(...)` cell above for the root cause and the
+# fix). The floor below is derived from measurements taken while authoring
+# this cell, at these exact hyperparameters:
+#   - production run (seed=0, this cell's own config): first-last delta
+#     measured 0.050661.
+#   - repeated-run spread: the SAME config re-run 5x back-to-back (nothing
+#     varied but the run) was bit-identical every time — spread 0.0 — the
+#     single-threaded-BLAS/fixed-seed determinism regime this book pins on
+#     import (`jammi_cookbook.determinism`) holds within one environment.
+#   - cross-seed spread (seed in {0, 1, 2, 42}, everything else identical):
+#     delta ranged 0.034894-0.068716 — every one of those still clears the
+#     floor below by >=34x, so the signal is not a seed=0 fluke.
+#   - float32 noise ceiling: val loss magnitude is ~3.6; float32 relative
+#     precision is ~1.2e-7, so a single reading's reduction-order uncertainty
+#     is ~3.6 * 1.2e-7 ~= 4e-7, and a first-minus-last delta (two such
+#     readings) has a worst-case additive noise ceiling on the order of 1e-6
+#     — true regardless of which machine/BLAS/arch renders this chapter,
+#     unlike the single-machine spread measurement above.
+# VAL_LOSS_FLOOR sits with a wide margin under every measured delta above
+# (>=34x) and a wide margin over the float32 noise ceiling (~1e3x) — the same
+# wide-margin-floor discipline as this chapter's own cosine FLOOR (below) and
+# the engine's own `gguf_embedding_matches_f32_reference_within_a_measured_
+# cosine_floor`.
+# Named distinctly from the cosine-cost FLOOR (below): each floor lives in
+# its own cell's namespace elsewhere in this book, but this book's cells
+# share one Python process/namespace across the whole render, so a second
+# top-level `FLOOR` here would silently shadow the cosine section's.
+VAL_LOSS_FLOOR = 1e-3
+delta = val_losses[0] - val_losses[-1]
+assert delta > VAL_LOSS_FLOOR, (
     f"held-out val loss must fall from the first measured epoch to the last "
-    f"under QLoRA fine-tuning over the frozen quantized backbone; got {val_losses}"
+    f"by more than the measured floor {VAL_LOSS_FLOOR} under QLoRA fine-tuning "
+    f"over the frozen quantized backbone; got delta={delta} from {val_losses}"
 )
 print(
     f"val loss: first={val_losses[0]:.6f}  last={val_losses[-1]:.6f}  "
-    f"(Δ={val_losses[0] - val_losses[-1]:.6f}) — the faithful learning signal, "
-    f"measured, not assumed."
+    f"(Δ={delta:.6f}, vs the {VAL_LOSS_FLOOR} floor) — a learning signal "
+    f"measured with margin, not a bare sign check."
 )
 ```
 
@@ -492,4 +543,8 @@ here — this chapter's cells are CPU-only throughout, by the same convention
 > and trains correctly under LoRA over its frozen weights — and the held-out
 > val-loss trend that gates its own early stopping is a number this book's
 > public surface reads back and asserts directly: `job.metrics()`'s
-> `val_loss_curve`, falling from first measured epoch to last.
+> `val_loss_curve`, falling from first measured epoch to last by a
+> measured margin (`Δ ≈ 0.05` against a `1e-3` floor derived from this
+> fixture's own measured run-to-run spread and a float32 noise ceiling — see
+> "Held-out val loss" above) — not a bare sign check on a curve whose
+> unmargined delta could otherwise land inside reduction-order noise.

@@ -559,11 +559,12 @@ jobs:
 
   # esc-059's silicon-axis twin — CLOSED FOR COMPILE/LINT SURFACE ONLY, NOT
   # EXECUTION. `jammi-kernels`'s `metal_parity` test target
-  # (`required-features = ["metal"]`) and `jammi-ai`'s `metal_quantized_gpu`
-  # test target (same) were both compiled under NO merge-path `cargo clippy
+  # (`required-features = ["metal"]`), `jammi-ai`'s `metal_quantized_gpu`
+  # test target (same), and `jammi-lora`'s `metal_dropout_position` test
+  # target (same) were all compiled under NO merge-path `cargo clippy
   # -D warnings` lane — exactly the `check_lint_surface_closure.py` gap this
-  # branch introduced — so this job's two `clippy` steps close that gap and
-  # run on every PR for free.
+  # branch introduced — so this job's three `clippy` steps close that gap
+  # and run on every PR for free.
   #
   # Measured fact (PR #435, job 99546809214's backtrace): a GH-hosted
   # `macos-14` runner CANNOT construct a candle 0.11 Metal device.
@@ -593,15 +594,16 @@ jobs:
   # step visible in the log, not to change what would happen without it.
   #
   # Cost/runtime: macOS minutes bill at 10x the Linux rate on GitHub-hosted
-  # runners — this job's two remaining steps (two clippy compiles) are a
+  # runners — this job's three remaining steps (three clippy compiles) are a
   # real, ongoing per-PR cost the operator is choosing to pay in exchange
   # for closing the lint-coverage gap above; if that trade is ever judged
   # not worth it, scope this job to changes under
   # `crates/jammi-kernels/src/ops/**`, `crates/jammi-kernels/tests/
-  # metal_parity.rs`, `crates/jammi-ai/tests/metal_quantized_gpu.rs`, and
-  # both crates' `Cargo.toml` (matching `flash-attn-compile`'s own
-  # documented path-filter alternative above) rather than dropping the lane
-  # — a silently unfiltered lane that is deleted looks like it was never
+  # metal_parity.rs`, `crates/jammi-ai/tests/metal_quantized_gpu.rs`,
+  # `crates/jammi-lora/tests/metal_dropout_position.rs`, and all three
+  # crates' `Cargo.toml` (matching `flash-attn-compile`'s own documented
+  # path-filter alternative above) rather than dropping the lane — a
+  # silently unfiltered lane that is deleted looks like it was never
   # needed; a silently-added filter that misses a path looks like coverage
   # and isn't (worse than none), so this is left to the maintainer to
   # decide, not applied unilaterally here.
@@ -610,9 +612,12 @@ jobs:
   # construct a Metal device, see above): suites measured green on LOCAL
   # Apple-Silicon hardware and recorded in PR #435 — jammi-ai 4/4
   # (`metal_quantized_gpu`), jammi-kernels 8/8 (`metal_parity`, byte-exact).
-  # A recurring, always-on execution lane for this surface requires a
-  # self-hosted Apple-silicon runner; provisioning one is an operator
-  # decision, not applied unilaterally here.
+  # `jammi-lora`'s `metal_dropout_position` has no equivalent local-execution
+  # record cited here — this job closes its compile/lint surface only, same
+  # as it did for the other two targets before any execution record existed
+  # for them. A recurring, always-on execution lane for this surface
+  # requires a self-hosted Apple-silicon runner; provisioning one is an
+  # operator decision, not applied unilaterally here.
   test-metal:
     name: Test (Metal, macos-14)
     runs-on: macos-14
@@ -635,7 +640,7 @@ jobs:
       # call below fails immediately trying to exec the wrapper. Installed
       # fresh per run with a cold local disk cache (no `SCCACHE_GHA_ENABLED`
       # / GHA cache backend wired here) — this job's compiles are narrow
-      # (two `--test` targets), so a warm cache is not worth the added
+      # (three `--test` targets), so a warm cache is not worth the added
       # surface; revisit only if this job's runtime becomes a problem.
       - name: Install sccache (required by committed .cargo/config.toml rustc-wrapper)
         run: brew install sccache
@@ -645,6 +650,9 @@ jobs:
 
       - name: Clippy jammi-ai --test metal_quantized_gpu --features metal,local (Metal, no GPU op run)
         run: cargo clippy -p jammi-ai --test metal_quantized_gpu --features metal,local -- -D warnings
+
+      - name: Clippy jammi-lora --test metal_dropout_position --features metal (Metal, no GPU op run)
+        run: cargo clippy -p jammi-lora --test metal_dropout_position --features metal -- -D warnings
 
   oss-only-build:
     name: Guard (OSS-only build)

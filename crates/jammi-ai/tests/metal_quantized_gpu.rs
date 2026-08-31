@@ -141,13 +141,54 @@ use tempfile::TempDir;
 // 0.11's Metal backend carries no analogous JIT-version or architecture gate.
 // ─────────────────────────────────────────────────────────────────────────
 
+/// Probes for a Metal device, folding a returned `Err` AND a caught panic
+/// into the same `false` (no device) outcome. Wrapped in
+/// `std::panic::catch_unwind`: on at least one real GH `macos-14` runner,
+/// `Device::new_metal(0)` does not merely return `Err` on a missing/broken
+/// device — an `objc2` class lookup inside candle-metal-kernels'
+/// `residency_set.rs:18` (`MTLResidencySetDescriptor`) can PANIC instead, a
+/// probe-time failure mode a bare `Result` cannot model. Mirrors
+/// `crates/jammi-kernels/tests/metal_parity.rs::metal_device_or_skip`'s
+/// panic-safety mechanism exactly (see that fn's own doc for why catching
+/// this particular panic is sound: the probe owns no lock and mutates no
+/// shared state before failing, so unwinding out of it leaves nothing
+/// poisoned to clean up).
 #[cfg(feature = "metal")]
-fn gpu_available() -> bool {
-    Device::new_metal(0).is_ok()
+fn metal_probe_ok() -> bool {
+    std::panic::catch_unwind(|| Device::new_metal(0).is_ok()).unwrap_or(false)
 }
 
 #[cfg(not(feature = "metal"))]
+fn metal_probe_ok() -> bool {
+    false
+}
+
+/// Whether a Metal device is usable for this build — the real skip/require
+/// decision every `skip_without_gpu!` call site defers to. Carries the same
+/// `JAMMI_REQUIRE_METAL` require-gate CANONICAL shape (a real runtime
+/// `std::env::var_os` read, whose taken-when-set branch is EXACTLY one
+/// `panic!`) `crates/jammi-kernels/tests/metal_parity.rs::
+/// metal_device_or_skip` and `ci/kernel-oracle-helpers.txt`'s other KO-7
+/// registry entries carry, for the identical reason: without this
+/// distinction a broken/missing device on a runner that is SUPPOSED to have
+/// one would silently read as skipped tests, not failed ones. This fn is
+/// deliberately NOT registered in `ci/kernel-oracle-helpers.txt` —
+/// `check_kernel_oracles.py`'s own module doc scopes its KO-7 scan roots to
+/// `crates/jammi-kernels/tests/**/*.rs` and `crates/jammi-encoders/
+/// src/**/*.rs` only (`scan_files`), so `crates/jammi-ai/tests/*.rs` is
+/// structurally outside that gate's `source_texts` — `verify_helper_
+/// registry` fails any entry whose file it cannot resolve among the scanned
+/// set, so registering this fn there would be a guaranteed, self-inflicted
+/// registry FAIL, not a no-op. The mechanism is implemented here anyway
+/// (matching the canonical shape byte-for-byte) so the BEHAVIOR is honest
+/// regardless of whether today's static verifier can see it.
 fn gpu_available() -> bool {
+    if metal_probe_ok() {
+        return true;
+    }
+    if std::env::var_os("JAMMI_REQUIRE_METAL").is_some() {
+        panic!("JAMMI_REQUIRE_METAL is set but no Metal device is available");
+    }
     false
 }
 
@@ -634,22 +675,34 @@ const TEXTS: [&str; 5] = [
 // CUDA Q8_1-activation-quantization number.
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Measured on this Mac's Metal device, 2026-08-31: worst-case cosine across
-/// the five-sentence `TEXTS` set was `>= 0.999999` (see the test's own
-/// `eprintln!` for the exact run's number — printed every run so a future
+/// Re-measured on this Mac's real Metal device, 2026-08-31 (phase-4 audit
+/// advisory — the earlier `0.999` pin here was refuted by this same
+/// measurement, which was already far tighter than that floor allowed):
+/// `worst_cos=0.9999998137672513` across the five-sentence `TEXTS` set,
+/// reproduced byte-identical across 3 consecutive real-hardware runs (family
+/// J determinism holds). Per family F9 ("a number is measured-and-asserted,
+/// never transcribed"), `0.99999` (five nines) is pinned under that
+/// measurement: the allowed `1-cos` deficit (`1e-5`) is `~54x` the actually
+/// observed deficit (`~1.86e-7`) — real headroom for cross-machine variance
+/// (a different Apple Silicon generation on a CI runner) while still
+/// catching a real kernel/dtype bug (which collapses cosine far below 0.99,
+/// per every sibling suite's own documented claim). See the test's own
+/// `eprintln!` for each run's exact number — printed every run so a future
 /// regression is visible even though this floor itself does not move on
-/// every run). Pinned with real headroom under that measurement rather than
-/// at it, per this file's own "measured, not transcribed" doctrine (family
-/// F) — 0.999 leaves five nines of margin below the observed six-nines
-/// result while still catching a real kernel/dtype bug (which collapses
-/// cosine far below 0.99, per every sibling suite's own documented claim).
-const GGUF_METAL_EMBED_COSINE_FLOOR: f64 = 0.999;
+/// every run.
+const GGUF_METAL_EMBED_COSINE_FLOOR: f64 = 0.99999;
 
-/// A companion elementwise absolute-tolerance backstop. The fixture's own
-/// known weight amplitude (`det_vec`'s `* 0.1` scale) bounds any single-lane
-/// blowup; `5e-3` is generous headroom over the sub-`1e-5` deltas actually
-/// observed on-device (see the test's own printed `worst_abs`).
-const GGUF_METAL_ELEMENTWISE_ABS_TOL: f64 = 5e-3;
+/// A companion elementwise absolute-tolerance backstop. Re-measured on this
+/// Mac's real Metal device, 2026-08-31 (phase-4 audit advisory — the
+/// earlier `5e-3` pin and its doc's claimed "sub-`1e-5` deltas" were both
+/// stale/wrong: the actually observed worst case is over an order of
+/// magnitude larger than that claim): `worst_abs=0.00022670626640319824`,
+/// reproduced byte-identical across 3 consecutive real-hardware runs
+/// (family J). `1e-3` (matching `gpu_capability/harness.rs::
+/// ELEMENTWISE_ABS_TOL`'s own value) is pinned under that measurement —
+/// `~4.4x` headroom over the observed worst case, real margin without being
+/// vacuous.
+const GGUF_METAL_ELEMENTWISE_ABS_TOL: f64 = 1e-3;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn gguf_embedding_cpu_metal_parity() {
@@ -722,12 +775,20 @@ async fn gguf_embedding_cpu_metal_parity() {
 /// `tests/it/gguf_qlora.rs`'s CPU-hermetic measurement (`min_cosine >=
 /// 0.9999995` for this same fixture/text-set) is the device-independent
 /// proof that Q8_0 weight-quantization loss itself is tiny; this test
-/// reproduces the comparison with both arms on Metal instead of CPU. Pinned
-/// at the SAME `0.999` floor Half A pins for its CUDA arm, for the same
-/// reason: this is a bug-catching floor (a wrong dequantize path, wrong
-/// dtype), not a re-derivation of the loss bound — the measured on-device
-/// number is printed for the record.
-const GGUF_VS_F32_METAL_COSINE_FLOOR: f64 = 0.999;
+/// reproduces the comparison with both arms on Metal instead of CPU.
+///
+/// Re-measured on this Mac's real Metal device, 2026-08-31 (phase-4 audit
+/// advisory — the earlier `0.999` pin, borrowed from Half A's CUDA arm, was
+/// refuted by this measurement, which is far tighter):
+/// `worst_cos=0.9999996175034048`, reproduced byte-identical across 3
+/// consecutive real-hardware runs (family J). `0.99999` (five nines) is
+/// pinned under that measurement — the allowed `1-cos` deficit (`1e-5`) is
+/// `~26x` the actually observed deficit (`~3.83e-7`), real headroom for
+/// cross-machine variance while still catching a real bug (a wrong
+/// dequantize path, wrong dtype) — this is a bug-catching floor, not a
+/// re-derivation of the loss bound. The measured on-device number is still
+/// printed for the record every run.
+const GGUF_VS_F32_METAL_COSINE_FLOOR: f64 = 0.99999;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn gguf_on_metal_vs_f32_on_metal_quantization_loss_floor() {

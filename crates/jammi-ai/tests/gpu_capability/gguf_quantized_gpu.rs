@@ -345,23 +345,29 @@ const TEXTS: [&str; 5] = [
 // element at the widest site, `× sqrt(32) ≈ 0.57` L2 per site, and even a
 // SINGLE additional site already leaves no meaningful margin) — a
 // mechanically "conservative" chain in that style yields a VACUOUS floor,
-// not a meaningful one, which family F equally forbids. Instead this file
-// pins the SAME `[0.99, 1.0]` acceptance window `bf16_gpu_gate.rs` (P4,
-// already reviewed for this exact suite) uses for its own "real
-// device-precision mechanism, not a kernel bug" comparison (bf16 mantissa
-// truncation vs f32) — the reasoning transfers directly: a transposed
-// weight, wrong dtype, or off-by-one kernel bug collapses cosine well below
-// 0.99 (this suite's own `harness.rs` module doc makes the identical claim
-// for the tighter 0.9999 floor), while a genuine Q8_1-activation-only
-// divergence (a comparably-small, per-block 8-bit rounding step, the SAME
-// ORDER as the Q8_0 WEIGHT quantization the CPU-only
-// `gguf_embedding_matches_f32_reference_within_a_measured_cosine_floor` test
-// already measures at `min_cosine=0.9999995`) should sit far above 0.99 in
-// practice. This is a "derive now, pod-confirm later" pin, exactly
-// `cuda_parity.rs`'s own posture for the identical mechanism: every
-// assertion below PRINTS its measured cosine (`--nocapture`), so the pod
-// prove-lane run is the actual confirmation, not this analytic ceiling.
-const GGUF_CUDA_EMBED_COSINE_FLOOR: f64 = 0.99;
+// not a meaningful one, which family F equally forbids. An earlier revision
+// of this file pinned the SAME `[0.99, 1.0]` acceptance window
+// `bf16_gpu_gate.rs` (P4) uses for its own "real device-precision mechanism,
+// not a kernel bug" comparison, as a "derive now, pod-confirm later" pin.
+//
+// ## Tightened to `0.9999`, refuted-and-replaced by the measured pod run
+// (phase-4 audit advisory, 2026-08-31)
+//
+// The sm_90 (H100) pod run measured `worst_cos=0.9999999987` across this
+// file's five-sentence `TEXTS` set — nine nines, not the two nines the
+// analytic ceiling above conservatively allowed for. Per family F9 ("a
+// number is measured-and-asserted, never transcribed"), that measurement,
+// not the un-pod-confirmed analytic worst case, is what pins this floor:
+// `0.9999` (the SAME value `harness::COSINE_FLOOR` uses for an ordinary
+// fp32 forward) leaves ~1e-4 of margin below the measured 0.9999999987 —
+// roughly 1e5x the actual observed deviation from 1.0, comfortably wide
+// margin while still catching a real kernel/dtype bug (which collapses
+// cosine well below 0.99, per every sibling suite's own documented claim;
+// see `harness.rs`'s module doc for the identical reasoning at the tighter
+// number). Every assertion below still PRINTS its measured cosine
+// (`--nocapture`) so a future pod run's own number is the ongoing check,
+// never re-transcribed by analogy.
+const GGUF_CUDA_EMBED_COSINE_FLOOR: f64 = 0.9999;
 
 /// Headroom multiplier over [`q8_1_activation_quant_bound`]'s analytic
 /// worst case — mirrors `cuda_parity.rs::Q8_1_ACTIVATION_QUANT_MARGIN`
@@ -384,19 +390,47 @@ fn q8_1_activation_quant_bound(k: usize, weight_amplitude: f64, activation_ampli
 
 /// A companion elementwise absolute-tolerance backstop (mirrors
 /// `harness::ELEMENTWISE_ABS_TOL`'s role, but sized for THIS mechanism
-/// rather than reused from it): [`q8_1_activation_quant_bound`] at the
-/// fixture's widest-contraction site (`output.dense`, `in_f = INTERMEDIATE
-/// = 128`), the fixture's OWN known weight amplitude
-/// ([`FIXTURE_WEIGHT_AMPLITUDE`] `= 0.1`, exact — not a guess), and a
-/// round, generous `activation_amplitude = 1.0` (a full order of magnitude
-/// above this fixture's own LayerNorm-scaled activations, which are
-/// themselves bounded by [`FIXTURE_WEIGHT_AMPLITUDE`]-amplitude gamma/beta
-/// parameters) evaluates to `≈0.1008`; rounded up to `0.15` for headroom
-/// against applying a single-site estimate at the whole-embedding level.
+/// rather than reused from it).
+///
+/// ## Re-derived in NORMALIZED units (phase-4 audit finding, 2026-08-31)
+///
+/// The value this tolerance is compared against
+/// (`harness::max_abs_diff(&cpu_v, &gpu_v)`) is measured on
+/// `encode_text_query`'s OUTPUT — an L2-NORMALIZED (unit-norm) embedding
+/// vector, whose components sit at order `1/sqrt(HIDDEN)` for an
+/// approximately isotropic unit vector across `HIDDEN` dims (`≈0.1768` at
+/// `HIDDEN = 32`). An earlier revision of this fn plugged a RAW,
+/// pre-normalization `activation_amplitude = 1.0` into
+/// [`q8_1_activation_quant_bound`] — a unit-system mismatch: the resulting
+/// `0.1512` was `≈85%` of a typical normalized lane's own magnitude, i.e.
+/// nearly the WHOLE dynamic range a normalized component can occupy, making
+/// the backstop unable to catch anything short of a near-total blowup (not
+/// a meaningful per-lane guard at all — family F: a floor sized in the
+/// wrong unit system cannot "bite"). Using
+/// `activation_amplitude = 1/sqrt(HIDDEN)` here instead — the SAME
+/// normalized-lane scale the comparison target is actually denominated in
+/// — re-derives the mechanism's bound in the units it is compared against,
+/// at the fixture's widest-contraction site (`output.dense`, `in_f =
+/// INTERMEDIATE = 128`) and the fixture's OWN known weight amplitude
+/// ([`FIXTURE_WEIGHT_AMPLITUDE`] `= 0.1`, exact): `≈0.0178`, `×1.5` headroom
+/// `≈0.0267` — a real fraction (`≈15%`) of a typical normalized lane, not
+/// `≈85%` of one. The sm_90 pod run measured `worst_abs=1.7568e-5` on this
+/// exact comparison — `≈1500x` below `0.0267` — so this re-derived bound is
+/// both unit-correct AND comfortably wide-margin over the observed value;
+/// `10x` that measured anchor (`≈1.7568e-4`) is kept as an explicit floor so
+/// the analytic term is never trusted to dominate by construction alone.
+/// `10x` the sm_90-measured `worst_abs` anchor (`1.7568e-5`, 2026-08-31) —
+/// a measured-with-margin floor (family F9), not an arbitrary round number.
+const GGUF_CUDA_ELEMENTWISE_MEASURED_ANCHOR_FLOOR: f64 = 1.7568e-4;
+
 fn gguf_cuda_elementwise_abs_tol() -> f64 {
-    let single_site_bound =
-        q8_1_activation_quant_bound(INTERMEDIATE, FIXTURE_WEIGHT_AMPLITUDE, 1.0);
-    (single_site_bound * 1.5).max(0.15)
+    let normalized_lane_amplitude = 1.0 / (HIDDEN as f64).sqrt();
+    let single_site_bound = q8_1_activation_quant_bound(
+        INTERMEDIATE,
+        FIXTURE_WEIGHT_AMPLITUDE,
+        normalized_lane_amplitude,
+    );
+    (single_site_bound * 1.5).max(GGUF_CUDA_ELEMENTWISE_MEASURED_ANCHOR_FLOOR)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -474,21 +508,27 @@ async fn gguf_embedding_cpu_gpu_parity_within_q8_1_activation_quant_floor() {
 /// measured, on this workspace's hermetic CPU dev/CI arm (2026-08-30,
 /// re-confirmed 2026-08-31), `mean_cosine=0.99999964, min_cosine=0.9999995`
 /// for a Q8_0-quantized 1-layer/32-dim BERT tower vs its F32 reference over
-/// this SAME five-sentence set, and pinned a wide-margin floor of `0.999`
-/// under that measurement. This is the CPU-side proof that Q8_0's OWN
+/// this SAME five-sentence set. This is the CPU-side proof that Q8_0's OWN
 /// weight-quantization loss (independent of any device) is tiny. This test
-/// re-runs the identical comparison with BOTH arms on the GPU instead of
-/// CPU: CANNOT be measured on this host (no CUDA device — Half A of this
-/// unit's contract is compile-verified here, executed on the pod's A10G).
-/// Pinning the SAME `0.999` floor is the honest choice: Q8_0 weight
+/// re-runs the identical comparison with BOTH arms on the GPU instead of CPU.
+///
+/// ## Tightened to `0.9999`, refuted-and-replaced by the measured pod run
+/// (phase-4 audit advisory, 2026-08-31)
+///
+/// An earlier revision of this file pinned a `0.999` floor here — un-pod-
+/// confirmed at the time. The sm_90 (H100) pod run measured
+/// `worst_cos=0.9999995` on this exact GPU-vs-GPU comparison, matching the
+/// CPU-hermetic measurement above almost exactly (as expected: Q8_0 weight-
 /// quantization loss is a device-independent property of the quantized
-/// bytes themselves (the CPU measurement already proves it is tiny), so a
-/// GPU forward of the identical bytes should reproduce essentially the same
-/// number — this assertion's job is to catch a GPU-side quantization *bug*
-/// (a wrong dequantize path, wrong dtype), not to re-derive the loss bound.
-/// The measured value is PRINTED so the pod prove-log records the on-device
-/// baseline for future tightening.
-const GGUF_VS_F32_GPU_COSINE_FLOOR: f64 = 0.999;
+/// bytes themselves). Per family F9, that measurement — not the earlier
+/// un-confirmed pin — now sets the floor: `0.9999` leaves real margin
+/// (`≈1e-4`) below the measured `0.9999995` while staying decisively above
+/// what a real GPU-side quantization bug (a wrong dequantize path, wrong
+/// dtype) would produce — this assertion's job is to catch that bug, not to
+/// re-derive the loss bound. The measured value is still PRINTED every run
+/// so the pod prove-log keeps recording the on-device baseline for future
+/// tightening.
+const GGUF_VS_F32_GPU_COSINE_FLOOR: f64 = 0.9999;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn gguf_on_gpu_vs_f32_safetensors_on_gpu_quantization_loss_floor() {
@@ -701,13 +741,31 @@ fn device_memory_used_bytes() -> Option<u64> {
 /// 2026-08-24-p1-softmax-fold-bf8e807-a100-sxm4.json`'s `_comment`: the
 /// allocator rounds allocations up to ~32 MiB blocks, so a `nvidia-smi`-
 /// measured before/after delta is quantized to this granularity, never a
-/// byte-exact live-allocation figure). Two blocks of headroom is the
-/// "wide, documented bound" this oracle's own F9 discipline calls for
-/// (assert the DIRECTION — estimate does not under-report by more than
-/// this much allocator slop — never a byte-exact equality `nvidia-smi`
-/// cannot support).
+/// byte-exact live-allocation figure). The admission allowance below is
+/// EXACTLY one block — ALLOCATOR GRANULARITY ONLY, derived from and cited
+/// to this same convention, never a second, blind block of slop stacked on
+/// top (the phase-4 audit's own finding on this oracle: a 64 MiB, two-block
+/// allowance against a 166 KB `estimated_memory` made the pass arm vacuous
+/// — literally any non-negative estimate would clear it regardless of
+/// truthfulness).
 const ALLOCATOR_POOL_BLOCK_BYTES: u64 = 32 * 1024 * 1024;
-const ADMISSION_ALLOWANCE_BYTES: u64 = 2 * ALLOCATOR_POOL_BLOCK_BYTES;
+const ADMISSION_ALLOWANCE_BYTES: u64 = ALLOCATOR_POOL_BLOCK_BYTES;
+
+/// PHASE 0 of the two-phase measurement below: touch the CUDA device with a
+/// small, non-quantized allocation and synchronize, before this oracle's
+/// `before` snapshot is taken. This is the fix for the audit's other named
+/// mechanism ("the fail arm charges CUDA context/pool overhead to the
+/// resolver"): context/stream/allocator-pool bring-up is a one-time,
+/// per-process, per-device cost paid on FIRST device use, not a per-load
+/// cost `estimated_memory` has any duty to predict — measuring `before`
+/// prior to ANY device touch charges that bring-up cost into the GGUF-load
+/// delta this oracle is supposed to isolate. Settling first means `after -
+/// before` isolates the load-specific allocation instead.
+fn settle_cuda_device(device: &Device) {
+    let warm = Tensor::zeros((64, 64), candle_core::DType::F32, device).unwrap();
+    let _ = warm.sum_all().unwrap();
+    device.synchronize().unwrap();
+}
 
 fn gpu_device_config() -> DeviceConfig {
     DeviceConfig {
@@ -730,10 +788,23 @@ fn ephemeral_artifact_store() -> Arc<ArtifactStore> {
     )
 }
 
+/// Two-phase measurement (phase-4 audit finding 1's fix). What this oracle
+/// CAN isolate: the device-memory delta specifically attributable to
+/// resolving+loading THIS GGUF checkpoint, on an already-settled CUDA
+/// context (Phase 0 below excludes context/stream/pool bring-up). What it
+/// CANNOT isolate: sub-block allocator rounding — `nvidia-smi`'s whole-
+/// device reading is quantized to [`ALLOCATOR_POOL_BLOCK_BYTES`], so this
+/// oracle can never prove byte-exact truthfulness, only that the estimate
+/// does not under-report by more than one block of allocator slop.
 #[tokio::test(flavor = "multi_thread")]
 async fn gguf_gpu_load_admission_estimate_is_truthful_against_measured_device_memory() {
     skip_without_gpu!();
     harness::loss_capture::install();
+
+    // Phase 0: settle the CUDA device (context/stream/pool bring-up paid)
+    // BEFORE the `before` snapshot — see `settle_cuda_device`'s own doc.
+    let cuda = Device::new_cuda(0).unwrap();
+    settle_cuda_device(&cuda);
 
     let Some(before) = device_memory_used_bytes() else {
         tracing::warn!("SKIP: nvidia-smi unavailable — cannot measure device memory delta");
@@ -753,42 +824,59 @@ async fn gguf_gpu_load_admission_estimate_is_truthful_against_measured_device_me
         .await
         .unwrap();
 
-    // `backend.load` and the `Device::new_cuda(0)` synchronize call below run
+    // Phase 1: resolve+load the GGUF model on the SAME already-settled
+    // device, then synchronize. `backend.load` and `cuda.synchronize()` run
     // with NO `.await` between them, so both execute on the same OS thread
     // regardless of the tokio runtime's flavor — candle's `CudaDevice::new`
     // binds `context.per_thread_stream()` (`cuda_backend/device.rs:420`), a
-    // genuinely THREAD-LOCAL stream, so an independently-constructed
-    // `Device::new_cuda(0)` here still drains the SAME stream `backend.load`
+    // genuinely THREAD-LOCAL stream, so reusing the SAME already-constructed
+    // `cuda` handle here still drains the SAME stream `backend.load`
     // enqueued its work on.
     let backend = CandleBackend;
     let loaded: LoadedModel = backend.load(&resolved, &gpu_device_config()).unwrap();
-    let cuda = Device::new_cuda(0).unwrap();
     cuda.synchronize().unwrap();
-    drop(loaded); // keep the model resident through the synchronize/measure window
 
+    // AFTER snapshot MUST run with the model still resident — this is the
+    // audit's other named bug: the old `drop(loaded)` ran BEFORE this
+    // snapshot despite its own comment claiming to "keep the model resident
+    // through the synchronize/measure window". `drop(loaded)` now runs
+    // AFTER `after` is captured.
     let Some(after) = device_memory_used_bytes() else {
         tracing::warn!(
             "SKIP: nvidia-smi unavailable after load — cannot measure device memory delta"
         );
         return;
     };
+    drop(loaded);
+
     let measured_delta = after.saturating_sub(before);
     let estimated = resolved.estimated_memory as u64;
 
     eprintln!(
         "gguf_gpu_admission_truthfulness: estimated_memory={estimated} \
          measured_delta={measured_delta} (before={before} after={after}) \
-         allowance={ADMISSION_ALLOWANCE_BYTES}"
+         allowance={ADMISSION_ALLOWANCE_BYTES} (one allocator pool block)"
+    );
+
+    // Non-vacuous pass arm (F9): the load must have allocated SOMETHING —
+    // an all-zero/no-op delta would trivially satisfy the direction check
+    // below regardless of whether `estimated_memory` is truthful.
+    assert!(
+        measured_delta > 0,
+        "gguf_gpu_admission_truthfulness: measured device-memory delta was {measured_delta} \
+         (not > 0) — the GGUF load did not measurably allocate anything, so this oracle cannot \
+         say whether estimated_memory={estimated} is truthful"
     );
     // Direction-only, wide-documented-bound assertion (F9): the resolver's
     // estimate must not UNDER-report true residency by more than the
-    // allocator's own pool-block granularity — never a byte-exact equality
-    // `nvidia-smi`'s whole-device, pool-quantized reading cannot support.
+    // allocator's own single-pool-block granularity — never a byte-exact
+    // equality `nvidia-smi`'s whole-device, pool-quantized reading cannot
+    // support.
     assert!(
         estimated + ADMISSION_ALLOWANCE_BYTES >= measured_delta,
         "resolver estimated_memory {estimated} under-reports the measured device memory \
          delta {measured_delta} by more than the {ADMISSION_ALLOWANCE_BYTES}-byte allocator-\
-         granularity allowance — the admission gate is not truthful on real hardware"
+         pool-block allowance — the admission gate is not truthful on real hardware"
     );
 }
 

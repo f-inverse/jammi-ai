@@ -557,6 +557,83 @@ jobs:
       - name: Clippy jammi-encoders --features cuda (nvcc, no GPU) — covers the NOT(flash-attn) meta-test
         run: cargo clippy -p jammi-encoders --features cuda --tests -- -D warnings
 
+  # esc-059's silicon-axis twin, closed for real hardware instead of deferred:
+  # `jammi-kernels`'s `metal_parity` test target (`required-features =
+  # ["metal"]`) and `jammi-ai`'s `metal_quantized_gpu` test target (same) were
+  # both compiled under NO merge-path `cargo clippy -D warnings` lane —
+  # exactly the `check_lint_surface_closure.py` gap this branch introduced —
+  # AND the SILICON_ACCOUNTING `metal` row in `check_gpu_parity_matrix.py`
+  # was `Deferred("macos Metal execution lane pending ...")`. `macos-14` GH
+  # runners are Apple Silicon with a real, working Metal device (unlike
+  # `sm_80`..`sm_90`, which need a rented pod — `gpu-prove.yml` — this one
+  # runs on every PR for free hardware access), so ONE job here both closes
+  # the clippy-coverage gap AND gives the silicon-axis gate a real,
+  # always-on execution lane to cite instead of a deferral.
+  #
+  # No `./.github/actions/setup-rust-ci`: that composite's DEFAULT
+  # `rustflags` hardcodes `-C link-arg=-fuse-ld=mold` — a Linux-only linker
+  # this runner does not have (`.cargo/config.toml`'s own mold pin is
+  # scoped to the `x86_64`/`aarch64`-unknown-linux-gnu targets only, never
+  # `aarch64-apple-darwin`) — and this job otherwise has no need for the
+  # sccache-GHA-cache half either (a macOS runner has its own toolchain
+  # cache, not this repo's Linux container image's warm sccache server).
+  # Deliberately no RUSTFLAGS/RUSTC_WRAPPER override of any kind here: GH's
+  # `macos-14` image ships `rustup` + a working `cc`/linker already, and
+  # `rust-toolchain.toml` (channel 1.94.0, components rustfmt+clippy) is
+  # picked up automatically by every `cargo`/`rustup` invocation below
+  # (rustup auto-installs a missing pinned toolchain from that file) — the
+  # explicit `rustup show` step below is only to make that pin-and-install
+  # step visible in the log, not to change what would happen without it.
+  #
+  # Cost/runtime: macOS minutes bill at 10x the Linux rate on GitHub-hosted
+  # runners — this job's four steps (two clippy compiles, two real Metal
+  # test runs) are a real, ongoing per-PR cost the operator is choosing to
+  # pay in exchange for closing both gaps above; if that trade is ever
+  # judged not worth it, scope this job to changes under
+  # `crates/jammi-kernels/src/ops/**`, `crates/jammi-kernels/tests/
+  # metal_parity.rs`, `crates/jammi-ai/tests/metal_quantized_gpu.rs`, and
+  # both crates' `Cargo.toml` (matching `flash-attn-compile`'s own
+  # documented path-filter alternative above) rather than dropping the lane
+  # — a silently unfiltered lane that is deleted looks like it was never
+  # needed; a silently-added filter that misses a path looks like coverage
+  # and isn't (worse than none), so this is left to the maintainer to
+  # decide, not applied unilaterally here.
+  #
+  # Suites measured green on real Apple-Silicon Metal at this branch state:
+  # jammi-ai 4/4 (`metal_quantized_gpu`), jammi-kernels 6/6 (`metal_parity`).
+  test-metal:
+    name: Test (Metal, macos-14)
+    runs-on: macos-14
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pin Rust toolchain (rust-toolchain.toml)
+        run: rustup show
+
+      - name: Clippy jammi-kernels --test metal_parity --features metal (Metal, no GPU op run)
+        run: cargo clippy -p jammi-kernels --test metal_parity --features metal -- -D warnings
+
+      - name: Clippy jammi-ai --test metal_quantized_gpu --features metal,local (Metal, no GPU op run)
+        run: cargo clippy -p jammi-ai --test metal_quantized_gpu --features metal,local -- -D warnings
+
+      # `JAMMI_REQUIRE_METAL=1`: turns the harness's own "no Metal device ->
+      # skip" fallback (`metal_parity.rs`'s `metal_device_or_skip`) into a
+      # hard failure instead — on this runner a real Metal device MUST be
+      # present, so a silent skip here would be exactly the kind of
+      # false-green the silicon-axis gate exists to prevent.
+      - name: Test jammi-kernels --test metal_parity --features metal (real Metal device, required)
+        env:
+          JAMMI_REQUIRE_METAL: "1"
+        run: cargo test -p jammi-kernels --features metal --test metal_parity -- --test-threads=1
+
+      # `metal_quantized_gpu.rs` uses its own `skip_without_gpu!` loud-warn
+      # guard (mirrors `gpu_capability/harness.rs`'s CUDA guard) rather than
+      # a `JAMMI_REQUIRE_*` hard-fail env var — no override needed here to
+      # get a real run on this runner's real device.
+      - name: Test jammi-ai --test metal_quantized_gpu --features metal,local (real Metal device)
+        run: cargo test -p jammi-ai --features metal,local --test metal_quantized_gpu -- --test-threads=1
+
   oss-only-build:
     name: Guard (OSS-only build)
     runs-on: ubuntu-latest
@@ -1451,6 +1528,7 @@ jobs:
       - flash-attn-closure
       - lint-surface-closure
       - flash-attn-compile
+      - test-metal
       - oss-only-build
       - dep-audit
       - ts-client

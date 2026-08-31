@@ -279,13 +279,12 @@ SILICON_ACCOUNTING: list[tuple[str, SiliconAccountingEntry]] = [
     ),
     (
         "metal",
-        Deferred(
-            reason=(
-                "macos Metal execution lane pending the metal-gated oracles landing "
-                "on feat/351-quantized-gguf-qlora (#430); flip when that lane exists"
-            ),
-            owner="maintainers",
-            date="2026-08-31",
+        ProvenBy(
+            "ci.yml test-metal job (runs-on: macos-14, real Apple-Silicon Metal "
+            "device, on every PR): cargo test -p jammi-kernels --features metal "
+            "--test metal_parity (JAMMI_REQUIRE_METAL=1) and cargo test -p "
+            "jammi-ai --features metal,local --test metal_quantized_gpu, both "
+            "clippy-covered by the same job's own -D warnings lanes"
         ),
     ),
 ]

@@ -54,6 +54,16 @@
 //! so a header this parser cannot read is a header candle cannot load
 //! either — a refusal here can never reject a checkpoint that would
 //! otherwise have loaded fine.
+//!
+//! The running total accumulates in `u128` via saturating arithmetic (a
+//! hostile/malformed header's declared `shape` dims are otherwise
+//! unbounded), but the returned figure is still a `usize` byte count. The
+//! final `u128 -> usize` conversion goes through
+//! [`usize::try_from`] rather than an `as` cast: a checkpoint whose declared
+//! shape prices out past `usize::MAX` bytes (e.g. `[2^32, 2^32]` `F32`
+//! elements, 2^66 bytes) is refused with a typed error rather than silently
+//! wrapping down to a small, in-range figure that would ADMIT an unloadable
+//! model past a downstream residency check.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -230,7 +240,16 @@ pub(crate) fn estimate_safetensors_residency(paths: &[PathBuf], model_id: &str) 
         }
     }
 
-    Ok(total as usize)
+    usize::try_from(total).map_err(|_| {
+        refusal(
+            model_id,
+            format!(
+                "estimated safetensors residency {total} bytes across {} file(s) does not fit \
+                 in memory — malformed or hostile checkpoint shape",
+                paths.len()
+            ),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -404,6 +423,34 @@ mod tests {
         assert!(
             err.to_string().contains("exceeds the file's own size"),
             "expected a header-length-past-EOF refusal, got: {err}"
+        );
+    }
+
+    #[test]
+    fn overflowing_shape_is_a_typed_refusal_never_a_wrapped_small_admission() {
+        // A hostile/malformed header can claim any shape it likes — the
+        // estimator never reads tensor DATA (module doc), only this JSON.
+        // [2^32, 2^32] F32 elements cost 2^66 bytes, which overflows
+        // `usize` on a 64-bit host (max ~2^64) even though the running
+        // `u128` accumulator (module: "saturating u128 math") never itself
+        // saturates for this fixture. Before the fix, the final `as usize`
+        // truncating cast silently wrapped that 2^66-byte figure down to a
+        // small in-range `usize`, which would have let a downstream
+        // admission check ADMIT an unloadable multi-exabyte checkpoint
+        // instead of refusing it. This is a header-only fixture: the
+        // estimator never reads tensor data, so no multi-exabyte body is
+        // ever written to disk.
+        let dir = tempfile::tempdir().unwrap();
+        let huge_dim: usize = 1usize << 32;
+        let header = serde_json::json!({
+            "weight": tensor_entry("F32", &[huge_dim, huge_dim], 0, 0),
+        });
+        let (path, _) = write_fixture(dir.path(), "model.safetensors", &header, 0);
+
+        let err = estimate_safetensors_residency(&[path], "overflow-shape-model").unwrap_err();
+        assert!(
+            err.to_string().contains("does not fit in memory"),
+            "expected an overflow-shape refusal, got: {err}"
         );
     }
 

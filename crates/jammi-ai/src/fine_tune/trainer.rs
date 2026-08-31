@@ -6409,20 +6409,61 @@ mod loss_curve_metrics {
 
     /// Installs [`EpochLossLayer`] as the process's GLOBAL default tracing
     /// subscriber, exactly once (`OnceLock`, mirroring `tests/gpu_
-    /// capability/harness.rs::loss_capture::install`'s own idiom). A
-    /// THREAD-LOCAL (`with_default`-scoped) subscriber is NOT enough here:
-    /// `tracing`'s per-callsite/level fast-path (`tracing::enabled!`, and
-    /// the static max-level hint every `info!`/`event!` macro consults
-    /// before even constructing the event) is governed by the GLOBAL
-    /// default dispatcher's `max_level_hint`, never by a thread-local
-    /// `with_default` override — the no-op dispatcher tracing falls back to
-    /// before any global default is ever installed reports an `OFF` hint,
-    /// so every event is compiled-out-equivalent at the macro call site
-    /// regardless of which subscriber a given thread has scoped in. Setting
-    /// the REAL global default once, up front, is what makes the "Epoch
-    /// complete" callsite live for every thread — the THREAD-LOCAL buffers
-    /// above are what keep concurrently-running tests from corrupting each
-    /// other's captured curve despite sharing one subscriber.
+    /// capability/harness.rs::loss_capture::install`'s own idiom).
+    ///
+    /// # The TRUE mechanism (round-3 audit re-derivation)
+    ///
+    /// A prior version of this doc claimed a thread-local (`with_default`
+    /// / `set_default`) subscriber could never observe the "Epoch
+    /// complete" event because `tracing`'s static max-level hint is
+    /// governed by the GLOBAL default dispatcher "never" a scoped one.
+    /// That specific claim was wrong: constructing a `Dispatch` — global
+    /// OR thread-local — eagerly registers it and reruns interest
+    /// rebuilding for every ALREADY-KNOWN callsite, folding in every
+    /// currently-live dispatcher (scoped ones included). Proven directly:
+    /// `crates/jammi-ai/src/model/backend/candle.rs`'s
+    /// `device_tests::default_without_device_falls_back_to_cpu_with_warning`
+    /// captures a `tracing::warn!` purely via `tracing::subscriber::
+    /// with_default`, with NO global default ever installed anywhere in
+    /// that process, and passes when run alone (`cargo test -p jammi-ai
+    /// --lib model::backend::candle::device_tests::
+    /// default_without_device_falls_back_to_cpu_with_warning --
+    /// --test-threads=1 --exact`).
+    ///
+    /// The GLOBAL install here is still required, but for a DIFFERENT,
+    /// narrower reason a scoped guard cannot substitute for: this crate's
+    /// `cargo test` runs fully parallel by default (module doc above), and
+    /// OTHER, unrelated tests in this SAME lib test binary also call
+    /// `run_text_loop` — driving the identical "Epoch complete" callsite —
+    /// WITHOUT installing any subscriber of their own. `tracing-core`
+    /// caches a callsite's `Interest` PERMANENTLY the first time ANY
+    /// thread ever hits it (a `registration` CAS `Once`, not re-evaluated
+    /// per event); a thread with no subscriber resolves through the
+    /// process-wide GLOBAL default (`tracing_core::dispatcher::
+    /// get_default`'s fallback path) rather than any OTHER thread's
+    /// thread-local scope — a scoped `with_default`/`set_default` on ITS
+    /// OWN calling thread is invisible to every sibling thread's own
+    /// resolution. So if one of those untraced sibling tests happens to
+    /// win the race to be the FIRST-EVER caller of the "Epoch complete"
+    /// callsite while only a THREAD-LOCAL subscriber (not a global one) is
+    /// installed anywhere, that sibling's own resolution falls through to
+    /// the (unset) global default and permanently caches `Interest::never`
+    /// for the callsite — silently starving THIS test's own later capture
+    /// even though its own thread-local scope is live and correctly
+    /// entered. Empirically reproduced while investigating this claim: a
+    /// `set_default`-based scoped rewrite of this very function passed
+    /// every time run ALONE or with `--test-threads=1`, but flaked with an
+    /// EMPTY `TRAIN_CAPTURE` when run in the crate's normal parallel mode
+    /// alongside `metrics_json_omits_val_loss_curve_when_only_train_loss_
+    /// is_monitored` (another test in this module that also drives
+    /// `run_text_loop`, uninstrumented). Installing the GLOBAL default —
+    /// which every thread's fallback resolution consults, including
+    /// threads that never call `set_default` themselves — closes that race
+    /// for every sibling thread, not just the one that happens to call
+    /// `install()`. The THREAD-LOCAL `TRAIN_CAPTURE`/`VAL_CAPTURE` buffers
+    /// above are what then keep concurrently-running tests from
+    /// corrupting each other's captured curve despite sharing this one
+    /// global subscriber.
     fn install() {
         static INSTALLED: OnceLock<()> = OnceLock::new();
         INSTALLED.get_or_init(|| {

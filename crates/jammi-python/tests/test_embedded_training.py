@@ -104,6 +104,29 @@ def test_embedded_fine_tune_metrics_surfaces_val_loss_run_summary(tmp_path: Path
     assert metrics["started_at"]
     assert metrics["completed_at"]
 
+    # Per-epoch loss curves (issue #441) — asserted against the shape
+    # `TrainingLoop::run` actually emits (`crates/jammi-ai/src/fine_tune/
+    # trainer.rs`): a list of `{"epoch": int, "loss": float}` rows, one per
+    # epoch actually run, never a bare `[epoch, loss]` pair (the wrong shape
+    # would pass a looser check but silently diverge from the trainer's own
+    # `curve_json`).
+    train_curve = metrics["train_loss_curve"]
+    assert isinstance(train_curve, list)
+    assert len(train_curve) == 2  # epochs=2 was requested above
+    for row in train_curve:
+        assert set(row.keys()) == {"epoch", "loss"}
+        assert math.isfinite(row["loss"])
+
+    # This run measures ValLoss every epoch (early_stopping_metric="val_loss"),
+    # so val_loss_curve must be present — never silently omitted the way a
+    # TrainLoss-monitored run's would be.
+    val_curve = metrics["val_loss_curve"]
+    assert isinstance(val_curve, list)
+    assert len(val_curve) == 2
+    for row in val_curve:
+        assert set(row.keys()) == {"epoch", "loss"}
+        assert math.isfinite(row["loss"])
+
 
 def test_embedded_fine_tune_rejects_unknown_method_in_the_assembly(tmp_path: Path) -> None:
     db = _connect(tmp_path)

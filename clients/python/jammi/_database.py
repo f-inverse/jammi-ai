@@ -726,9 +726,23 @@ class RemoteTrainingJob:
         attempt records instead. Returns ``{}`` for a job that has not yet
         recorded any metrics (e.g. still queued or running before its first
         stamp) — `metrics_json` is unset on the wire in that case.
+
+        Raises :class:`jammi.errors.BackendError` if `metrics_json` IS set
+        but fails to parse as JSON — a catalog data-integrity fault, never
+        silently folded into the "not yet recorded" `{}` case. Mirrors the
+        embedded `TrainingJob.metrics`, which raises the same class for the
+        same present-but-malformed state.
         """
         resp = self._status_response()
-        return json.loads(resp.metrics_json) if resp.HasField("metrics_json") else {}
+        if not resp.HasField("metrics_json"):
+            return {}
+        try:
+            return json.loads(resp.metrics_json)
+        except json.JSONDecodeError as exc:
+            raise BackendError(
+                f"training job {self._job_id}: metrics blob failed to parse "
+                f"as JSON: {exc}"
+            ) from exc
 
 
 class RemoteDatabase:

@@ -1,14 +1,37 @@
 name: GPU prove (RunPod)
 
-# Runs the gated GPU suites on a REAL NVIDIA A100 (sm_80) via an ephemeral RunPod
-# pod — the only place jammi's CUDA path is exercised on a device before release.
+# Runs the gated GPU suites on REAL NVIDIA hardware via an ephemeral RunPod pod
+# — the only place jammi's CUDA path is exercised on a device before release.
 # Two suites: the served client/server GPU proof (`grpc_embedding_gpu`, the
 # recommended topology over gRPC) and the engine-core GPU correctness suite
 # (`gpu_capability`). It doubles as the #277 regression gate: the pod builds
-# candle's kernels at the CI image's baked CUDA_COMPUTE_CAP and runs them on an
-# 8.0 device, so a cap that regresses above the Ampere floor fails here.
+# candle's kernels at the CI image's baked CUDA_COMPUTE_CAP and runs them on a
+# real device, so a cap that regresses above the Ampere floor fails here.
 #
-# Off the merge path by default — GPU minutes cost money and A100 capacity is
+# Matrixed over every SHIPPED CUDA arch (crates/jammi-kernels/build.rs
+# GENCODE_ARCHES, mirrored by check_gpu_parity_matrix.py's silicon axis):
+# sm_80 (A100), sm_86 (A40-class Ampere workstation), sm_89 (L40S, Ada), sm_90
+# (H100, Hopper). `fail-fast: false` — one arch's capacity outage must not
+# hide another arch's result; each leg is an independent, individually
+# fail-closed proof. `ci/scripts/runpod_gpu_prove.sh`'s `GPU_PROVE_ARCH` input
+# selects the leg's device (see that script's own doc for the sm_XX ->
+# RunPod-GPU-type mapping, which lives in exactly one place).
+#
+# RENAME NOTE FOR HUMANS: this job previously ran ONE leg named "GPU prove on
+# RunPod A100 (sm_80)". It now runs FOUR legs, each named "GPU prove on RunPod
+# (<arch>)" (`sm_80`/`sm_86`/`sm_89`/`sm_90`) via the matrix `name:` below —
+# four distinct required-check names replacing the old single one. This
+# workflow is off the merge path (no branch-protection dependency today), but
+# if anything downstream starts requiring a specific check name from this
+# job, it must be repointed at "GPU prove on RunPod (sm_80)" (the closest
+# equivalent), not the old unmatrixed name.
+#
+# COST NOTE FOR HUMANS: four pods per prove run instead of one — roughly 4x
+# the GPU-minute spend of the previous single-A100 lane, each independently
+# billed and independently subject to the same $187 cancel-in-progress
+# lesson (see the concurrency comment below) if a run is superseded.
+#
+# Off the merge path by default — GPU minutes cost money and capacity is
 # intermittent. It fires on: the `run-gpu` PR label (opt-in per PR), a nightly
 # cron, and manual dispatch. Needs the `RUNPOD_API_KEY` repo secret.
 
@@ -27,17 +50,32 @@ permissions:
 
 jobs:
   gpu-prove:
-    name: GPU prove on RunPod A100 (sm_80)
+    name: GPU prove on RunPod (${{ matrix.arch }})
+    strategy:
+      # Independent legs: an sm_90 (H100) capacity outage must not hide a
+      # green sm_80 (A100) result, or vice versa — each arch is its own
+      # fail-closed proof, not a single pass/fail verdict over all four.
+      fail-fast: false
+      matrix:
+        arch: [sm_80, sm_86, sm_89, sm_90]
     # Label event only runs for the `run-gpu` label; dispatch/schedule always run.
     if: github.event_name != 'pull_request' || github.event.label.name == 'run-gpu'
     runs-on: ubuntu-latest
-    # Concurrency is on the JOB, not the workflow, and never cancels.
+    # Concurrency is on the JOB LEG (arch + ref), not the workflow or the job
+    # alone, and never cancels.
+    #
+    # Per-arch grouping is required BECAUSE of the matrix: a workflow- or
+    # job-level (arch-less) group would serialize all four legs against each
+    # other, or worse, let one arch's pending run evict another arch's
+    # in-flight run (GitHub replaces the older pending run in a group by
+    # default) — the four legs must run concurrently, each deduped only
+    # against ITS OWN prior run on the same ref.
     #
     # `on: pull_request: types: [labeled]` fires for EVERY label, so a
-    # workflow-level group would admit runs whose job the `if:` above skips —
-    # and those runs would still cancel an in-flight proof, or evict a pending
-    # one (GitHub replaces the older pending run in a group by default). At job
-    # level a skipped job never enters the group at all.
+    # workflow-level group would additionally admit runs whose job the `if:`
+    # above skips — and those runs would still cancel an in-flight proof, or
+    # evict a pending one. At job level a skipped job never enters the group
+    # at all.
     #
     # cancel-in-progress is false because this job rents hardware and cleans up
     # in an EXIT trap. Cancelling SIGKILLs the runner, the trap never runs, and
@@ -45,36 +83,38 @@ jobs:
     # `run-gpu` label leaked an A100 for seven days on 2026-07-24. Letting a
     # superseded run finish costs ~$0.50; cancelling one cost $187.
     concurrency:
-      group: gpu-prove-${{ github.ref }}
+      group: gpu-prove-${{ matrix.arch }}-${{ github.ref }}
       cancel-in-progress: false
     # A job-timeout kill is another trap bypass. The remote job is capped by
     # RP_TIMEOUT (50m); deploy itself is capped by RP_SSH_WAIT_SECS (default
-    # 600s) PER CANDIDATE, and the a100 arch fails over across up to 4
-    # candidates (SECURE/COMMUNITY × PCIe/SXM4) before returning 75 — so the
-    # worst case (every candidate rents but none becomes reachable) is
-    # 4 × 600s = 40m of deploy on top of the 50m job cap, well under this
-    # ceiling but no longer under the previous 75m one (raised here for
-    # exactly that reason — see runpod_lib.sh's own RP_SSH_WAIT_SECS doc).
+    # 600s) PER CANDIDATE, and every arch fails over across up to 4 candidates
+    # (SECURE/COMMUNITY × PCIe/SXM4, or fewer for archs with a shorter
+    # candidate list — see `rp_deploy_arch` in runpod_lib.sh) before returning
+    # 75 — so the worst case (every candidate rents but none becomes
+    # reachable) is 4 × 600s = 40m of deploy on top of the 50m job cap, well
+    # under this ceiling but no longer under the previous 75m one (raised here
+    # for exactly that reason — see runpod_lib.sh's own RP_SSH_WAIT_SECS doc).
     timeout-minutes: 100
     steps:
       - uses: actions/checkout@v4
 
-      # The orchestrator rents an A100, runs the gated GPU suites on it, streams
-      # the output, and terminates the pod on exit — best-effort, via an EXIT
-      # trap a SIGKILLed runner never reaches. The real guarantee is the deadline
-      # armed inside the pod's own entrypoint, plus the gpu-reap sweep. A `75`
-      # exit means no A100 capacity (SUPPLY_CONSTRAINT); the step re-exits with
-      # that code, so a capacity night FAILS the workflow red — fail-closed, a
-      # night with no capacity is a night with no proof, never a silent green.
-      # The `::warning::` step below annotates that red as a provider-capacity
-      # condition (not a code regression); operator recovery is a re-run once
-      # capacity returns.
-      - name: Prove GPU suites on a real A100
+      # The orchestrator rents the requested-arch GPU, runs the gated GPU
+      # suites on it, streams the output, and terminates the pod on exit —
+      # best-effort, via an EXIT trap a SIGKILLed runner never reaches. The
+      # real guarantee is the deadline armed inside the pod's own entrypoint,
+      # plus the gpu-reap sweep. A `75` exit means no capacity for this arch
+      # (SUPPLY_CONSTRAINT); the step re-exits with that code, so a capacity
+      # night FAILS this leg red — fail-closed, a leg with no capacity is a
+      # leg with no proof, never a silent green. The `::warning::` step below
+      # annotates that red as a provider-capacity condition (not a code
+      # regression); operator recovery is a re-run once capacity returns.
+      - name: Prove GPU suites on a real ${{ matrix.arch }} device
         id: prove
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
           GIT_REPO: https://github.com/${{ github.repository }}.git
           GIT_REF: ${{ github.head_ref || github.ref_name }}
+          GPU_PROVE_ARCH: ${{ matrix.arch }}
         run: |
           set +e
           bash ci/scripts/runpod_gpu_prove.sh
@@ -84,4 +124,4 @@ jobs:
 
       - name: Annotate a capacity failure
         if: always() && steps.prove.outputs.rc == '75'
-        run: echo "::warning::GPU prove FAILED for capacity — no A100 on RunPod (SUPPLY_CONSTRAINT), not a code regression. The run stays red (nothing was proven); re-run once capacity returns."
+        run: echo "::warning::GPU prove FAILED for capacity — no ${{ matrix.arch }} device on RunPod (SUPPLY_CONSTRAINT), not a code regression. The run stays red (nothing was proven); re-run once capacity returns."

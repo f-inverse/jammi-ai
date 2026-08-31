@@ -489,7 +489,7 @@ jobs:
       # clippy's lints at all. `flash-attn` forwards to `cuda`
       # (crates/jammi-kernels/Cargo.toml), so `--features flash-attn
       # --all-targets` is the SAME feature surface this crate's
-      # `runpod_gpu_prove.sh:56` GPU-pod clippy line already exercises
+      # `runpod_gpu_prove.sh:78` GPU-pod clippy line already exercises
       # (`cargo clippy -p jammi-kernels --all-targets --features cuda --
       # -D warnings`) — but THAT lane is `gpu-prove.yml`'s
       # `workflow_dispatch`/`pull_request: types: [labeled]`/nightly-cron

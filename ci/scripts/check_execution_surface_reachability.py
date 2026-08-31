@@ -21,7 +21,7 @@ NOTHING on the actual merge path ever runs it. That is exactly the esc-050 /
 esc-051 escape shape: `pod_seed_target.sh:859`'s
 `cargo clippy -p jammi-kernels --all-targets --features cuda -- -D warnings`
 went red on a fresh pod's seed the SAME day #389 merged, because clippy's
-only workflow-level twin (`runpod_gpu_prove.sh:56`, byte-identical) lives
+only workflow-level twin (`runpod_gpu_prove.sh:78`, byte-identical) lives
 behind `gpu-prove.yml`'s label/dispatch/schedule-only trigger — green
 "wiring", dead on the path that gates merges.
 

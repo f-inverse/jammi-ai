@@ -3167,7 +3167,7 @@ PY
 #        equality, never substring, so `cuda,flash-attn` can never satisfy
 #        `cuda`. Honest residual (the row's other half, NOT covered here):
 #        merge-path REACHABILITY of a blocking twin (ci.yml vs the
-#        gpu-prove.yml-only runpod_gpu_prove.sh:56 twin) is a workflow
+#        gpu-prove.yml-only runpod_gpu_prove.sh:78 twin) is a workflow
 #        property outside this suite's pod-substrate scope.
 {
   SEED_TARGET_SH="$REPO_ROOT/ci/scripts/pod_seed_target.sh"

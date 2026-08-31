@@ -1054,15 +1054,25 @@ p=(json.load(sys.stdin).get("data",{}).get("pod") or {}).get("runtime") or {}
 # mapping lives. A100 is the #277 floor (sm_80); l40s/l4 are Ada (sm_89, fp8
 # #308); h100 is Hopper (sm_90); a40 is Ampere-workstation (sm_86). (RunPod has
 # no Tesla T4 — #306 is Ampere+.) Returns 2 on an unknown arch.
+#
+# l4_l40s is the sm_89 prove-lane's own key, not a device name: L4 and L40S
+# are both Ada (sm_89) — identical SASS, so either proves the same
+# correctness target — but L4 is the canonical commodity cloud-inference
+# card (the deployment's quantized serving target) at roughly half L40S's
+# rental price, so it is tried first; L40S candidates are appended as a
+# capacity-only fallback within this SAME rp_deploy_live call, so exit 75
+# (SUPPLY_CONSTRAINT) still means "neither L4 nor L40S had capacity", not
+# "L4 didn't".
 rp_deploy_arch() { # $1=arch
   local cand
   case "$1" in
-    a100) cand=("SECURE|NVIDIA A100 80GB PCIe" "COMMUNITY|NVIDIA A100 80GB PCIe" "SECURE|NVIDIA A100-SXM4-80GB" "COMMUNITY|NVIDIA A100-SXM4-80GB") ;;
-    l40s) cand=("SECURE|NVIDIA L40S" "COMMUNITY|NVIDIA L40S") ;;
-    h100) cand=("SECURE|NVIDIA H100 80GB HBM3" "SECURE|NVIDIA H100 PCIe" "COMMUNITY|NVIDIA H100 80GB HBM3" "COMMUNITY|NVIDIA H100 PCIe") ;;
-    a40)  cand=("SECURE|NVIDIA A40" "COMMUNITY|NVIDIA A40") ;;
-    l4)   cand=("SECURE|NVIDIA L4" "COMMUNITY|NVIDIA L4") ;;
-    *) echo "::error::unknown arch '$1' (want: a100|l40s|h100|a40|l4)"; return 2 ;;
+    a100)    cand=("SECURE|NVIDIA A100 80GB PCIe" "COMMUNITY|NVIDIA A100 80GB PCIe" "SECURE|NVIDIA A100-SXM4-80GB" "COMMUNITY|NVIDIA A100-SXM4-80GB") ;;
+    l40s)    cand=("SECURE|NVIDIA L40S" "COMMUNITY|NVIDIA L40S") ;;
+    h100)    cand=("SECURE|NVIDIA H100 80GB HBM3" "SECURE|NVIDIA H100 PCIe" "COMMUNITY|NVIDIA H100 80GB HBM3" "COMMUNITY|NVIDIA H100 PCIe") ;;
+    a40)     cand=("SECURE|NVIDIA A40" "COMMUNITY|NVIDIA A40") ;;
+    l4)      cand=("SECURE|NVIDIA L4" "COMMUNITY|NVIDIA L4") ;;
+    l4_l40s) cand=("SECURE|NVIDIA L4" "COMMUNITY|NVIDIA L4" "SECURE|NVIDIA L40S" "COMMUNITY|NVIDIA L40S") ;;
+    *) echo "::error::unknown arch '$1' (want: a100|l40s|h100|a40|l4|l4_l40s)"; return 2 ;;
   esac
   RP_ARCH="$1"
   rp_deploy_live "${cand[@]}"

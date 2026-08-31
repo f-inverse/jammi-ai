@@ -22,6 +22,12 @@ Three independent test surfaces:
   golden-derived envelope on its OWN stdout). Also asserts every declared
   leg-table column (CLASS 3) reaches both the `manifest.json` record and
   (via the printed, stderr-only command lines) the `cmd` array itself.
+  Also covers `PROFILE_356_LEGS_ONLY`'s own startup guards (orchestration
+  only -- zero measurement-semantics change): a multi-id filter runs
+  EXACTLY the named legs, an id matching no known leg (a typo) refuses
+  loudly before any leg runs, and a leg whose `manifest.json` already
+  exists under `$OUT_DIR` refuses loudly rather than silently overwriting
+  it.
 
   `PreflightArmTests` (`PROFILE_356_LEGS_PREFLIGHT_ONLY=1`,
   `PROFILE_356_LEGS_DRY_RUN=0`): drives the REAL (non-dry) preflight probe
@@ -256,6 +262,64 @@ class DryRunSmokeTests(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(out_dir, "bert-E1", "manifest.json")))
             self.assertFalse(os.path.isfile(os.path.join(out_dir, "bert-A1", "manifest.json")))
             self.assertIn("skipping bert-A1", result.stdout)
+
+    def test_legs_only_filter_runs_exactly_the_named_legs(self):
+        """A multi-id PROFILE_356_LEGS_ONLY runs exactly that set -- no
+        more, no fewer -- proving the filter is a real set match, not a
+        single-id special case."""
+        with tempfile.TemporaryDirectory() as out_dir:
+            result = run_dry(out_dir, legs_only="bert-A3,bert-A4")
+            self.assertEqual(result.returncode, 0, _fail_msg(result))
+            all_leg_ids = [
+                f"{model}-{leg}"
+                for model in ("bert", "distilbert")
+                for leg in ("A1", "A2", "A3", "A4", "N1", "N3", "E1")
+            ]
+            ran = {leg_id for leg_id in all_leg_ids if os.path.isfile(os.path.join(out_dir, leg_id, "manifest.json"))}
+            self.assertEqual(ran, {"bert-A3", "bert-A4"}, result.stdout)
+            for skipped in sorted(set(all_leg_ids) - {"bert-A3", "bert-A4"}):
+                self.assertIn(f"skipping {skipped}", result.stdout)
+
+    def test_legs_only_typo_refuses_before_any_leg_runs(self):
+        """An id that matches no known leg (a typo) must refuse loudly at
+        startup, exit nonzero, and run NOTHING -- not silently skip every
+        leg the way an unmatched filter would look identical to
+        otherwise."""
+        with tempfile.TemporaryDirectory() as out_dir:
+            result = run_dry(out_dir, legs_only="bert-A3,bert-A9999-TYPO")
+            self.assertNotEqual(result.returncode, 0, _fail_msg(result))
+            self.assertIn("::error::", result.stderr)
+            self.assertIn("bert-A9999-TYPO", result.stderr)
+            self.assertEqual(list(Path(out_dir).rglob("manifest.json")), [], _fail_msg(result))
+            self.assertEqual(list(Path(out_dir).glob("*.manifest.json")), [], _fail_msg(result))
+
+    def test_existing_manifest_for_a_leg_about_to_run_refuses(self):
+        """A leg about to run whose manifest already exists under OUT_DIR
+        (a prior run's output, reused by mistake) must refuse loudly
+        before any leg runs, rather than silently overwriting it."""
+        with tempfile.TemporaryDirectory() as out_dir:
+            # First real run of bert-A3 writes a manifest.
+            result1 = run_dry(out_dir, legs_only="bert-A3")
+            self.assertEqual(result1.returncode, 0, _fail_msg(result1))
+            manifest_path = os.path.join(out_dir, "bert-A3", "manifest.json")
+            self.assertTrue(os.path.isfile(manifest_path))
+            before = Path(manifest_path).read_text()
+
+            # A second run against the SAME OUT_DIR, still targeting
+            # bert-A3, must refuse before touching anything -- the
+            # manifest content is byte-for-byte unchanged.
+            result2 = run_dry(out_dir, legs_only="bert-A3")
+            self.assertNotEqual(result2.returncode, 0, _fail_msg(result2))
+            self.assertIn("::error::", result2.stderr)
+            self.assertIn("bert-A3", result2.stderr)
+            self.assertIn("fresh OUT_DIR", result2.stderr)
+            self.assertEqual(Path(manifest_path).read_text(), before)
+
+            # A DIFFERENT leg, never yet run in this OUT_DIR, is unaffected
+            # by bert-A3's pre-existing manifest.
+            result3 = run_dry(out_dir, legs_only="bert-A4")
+            self.assertEqual(result3.returncode, 0, _fail_msg(result3))
+            self.assertTrue(os.path.isfile(os.path.join(out_dir, "bert-A4", "manifest.json")))
 
     def test_e1_leg_uses_the_heldout_corpus_mode(self):
         with tempfile.TemporaryDirectory() as out_dir:

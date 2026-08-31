@@ -137,7 +137,17 @@
 #                              "STEP-COUNT PIN" above)
 #   PROFILE_356_LEGS_ONLY      optional comma-separated leg-id filter
 #                              (e.g. "bert-A1,distilbert-E1") -- default
-#                              empty means every one of the 14 legs.
+#                              empty means every one of the 14 legs. Every
+#                              named id is validated against the known leg
+#                              table BEFORE any leg runs (a typo refuses
+#                              loudly, exit 2, rather than silently running
+#                              a smaller-than-intended set); every leg
+#                              about to actually run (the filtered set, or
+#                              all 14 when unset) is also checked for a
+#                              PRE-EXISTING manifest under `$OUT_DIR` and
+#                              refused (exit 2) the same way, before any
+#                              leg runs, to avoid a silent overwrite -- use
+#                              a fresh `$OUT_DIR` or narrow the filter.
 #
 # Hermetic self-tests: `python3 ci/scripts/perf/test_profile_356_legs_dry_run.py`
 # drives this script under PROFILE_356_LEGS_DRY_RUN=1 end to end (every
@@ -395,6 +405,68 @@ LEGS=(
   "distilbert-N3|distilbert|32|64|bf16|$DISTIL_ONE|0|synthetic|100|600"
   "distilbert-E1|distilbert|32|64|bf16|$DISTIL_FULL||heldout|$PROFILE_356_E1_STEPS_N|$PROFILE_356_E1_STEPS_M"
 )
+
+# =====================================================================
+# PROFILE_356_LEGS_ONLY validation + existing-manifest guard: BOTH checks
+# run here, before any per-leg work (before the fixture/DRY_RUN-stub setup
+# below, and long before the `for spec in "${LEGS[@]}"` loop at the bottom
+# calls `run_leg`) -- zero measurement-semantics change, this only gates
+# WHICH of the already-existing 14 legs the loop below is allowed to
+# touch. `run_leg`'s own per-leg skip (unchanged) still fires for every
+# leg not in the filter; this block exists solely to catch a TYPO in the
+# filter (a name matching no known leg id would otherwise just silently
+# skip every leg, including the ones the caller actually meant) and to
+# stop a leg from silently clobbering a manifest a PRIOR run already wrote
+# under this same `$OUT_DIR`.
+# =====================================================================
+ALL_LEG_IDS=()
+for _leg_spec in "${LEGS[@]}"; do
+  ALL_LEG_IDS+=("${_leg_spec%%|*}")
+done
+
+if [ -n "$PROFILE_356_LEGS_ONLY" ]; then
+  IFS=',' read -r -a _requested_leg_ids <<< "$PROFILE_356_LEGS_ONLY"
+  _unknown_leg_ids=()
+  for _requested in "${_requested_leg_ids[@]}"; do
+    _known=0
+    for _leg_id in "${ALL_LEG_IDS[@]}"; do
+      if [ "$_requested" = "$_leg_id" ]; then
+        _known=1
+        break
+      fi
+    done
+    if [ "$_known" -eq 0 ]; then
+      _unknown_leg_ids+=("$_requested")
+    fi
+  done
+  if [ "${#_unknown_leg_ids[@]}" -gt 0 ]; then
+    echo "::error::PROFILE_356_LEGS_ONLY names unknown leg id(s): ${_unknown_leg_ids[*]} -- known ids are: ${ALL_LEG_IDS[*]}" >&2
+    exit 2
+  fi
+fi
+
+# Legs about to actually run (the filtered set, or all 14 when
+# PROFILE_356_LEGS_ONLY is unset) -- refuse if `$OUT_DIR` already carries a
+# manifest for any of them, checking BOTH manifest shapes this driver can
+# write (the normal per-leg-subdirectory one and the flat fallback one --
+# see this driver's own "MANIFEST PATH" doc above) rather than silently
+# overwriting a prior run's recorded result.
+_existing_manifest_conflicts=()
+for _leg_id in "${ALL_LEG_IDS[@]}"; do
+  if [ -n "$PROFILE_356_LEGS_ONLY" ]; then
+    case ",$PROFILE_356_LEGS_ONLY," in
+      *",$_leg_id,"*) ;;
+      *) continue ;;
+    esac
+  fi
+  if [ -f "$OUT_DIR/$_leg_id/manifest.json" ] || [ -f "$OUT_DIR/${_leg_id}.manifest.json" ]; then
+    _existing_manifest_conflicts+=("$_leg_id")
+  fi
+done
+if [ "${#_existing_manifest_conflicts[@]}" -gt 0 ]; then
+  echo "::error::OUT_DIR ($OUT_DIR) already has a manifest for leg(s): ${_existing_manifest_conflicts[*]} -- refusing to silently overwrite; use a fresh OUT_DIR or narrow PROFILE_356_LEGS_ONLY to exclude them." >&2
+  exit 2
+fi
 
 FIXTURE_DIR="$REPO_ROOT/cookbook/fixtures/finetune_heldout"
 HELDOUT_IDS="$FIXTURE_DIR/heldout_ids.txt"

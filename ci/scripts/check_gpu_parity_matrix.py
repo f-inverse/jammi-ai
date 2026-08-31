@@ -106,6 +106,49 @@ Self-test (proves the reconciliation bites — a dropped PENDING entry and a
 bogus architecture reference are both caught): `python3 ci/scripts/check_gpu_parity_matrix.py --self-test`
 Hermetic: reads only files in the working tree (or synthetic in-memory data
 under `--self-test`); no network, no build, no GPU.
+
+## A second, orthogonal completeness axis: SILICON
+
+esc-028's parent principle — an uncovered cell cannot fail — is not specific
+to the (architecture × verb) axis above; it applies to any matrix this repo
+ships without a completeness check. The #351 GPU-validation review found a
+second, independent instance of exactly that shape on the SILICON axis: the
+`jammi-kernels` build compiles four real SASS binaries (`sm_80`/`sm_86`/
+`sm_89`/`sm_90`, [`GENCODE_ARCHES`] in `crates/jammi-kernels/build.rs`) and
+`jammi-ai` ships a `metal` feature, but execution proof (a real GPU run, not
+"it compiled") existed for exactly ONE of those five shipped cells — and
+because nothing enumerated "shipped silicon" against "silicon with a named
+execution lane", that four-out-of-five gap was invisible to every gate in
+this repo, the same way the empty ModernBERT×Classification scores were
+invisible before this file existed.
+
+The fix is the same shape as above, deliberately: two REVIEWED, in-repo sets
+(SHIPPED, parsed from source; SILICON_ACCOUNTING, reviewed by name) that must
+reconcile to sameness — never a grep for "sm_80 is proven", which only ever
+catches the one string a human already thought to check.
+
+  1. **SHIPPED silicon** — parsed from source, hermetically, no toolchain:
+     the `code=sm_XX` suffixes inside the [`GENCODE_ARCHES`] const literal in
+     `crates/jammi-kernels/build.rs` (parsed, not hardcoded, so a fifth
+     `-gencode` pair trips this gate the moment it lands — the same anchor
+     discipline [`EXTRA_ARCHITECTURES`] uses above), plus `"metal"` if
+     `crates/jammi-ai/Cargo.toml` declares a `metal = [` feature.
+  2. **SILICON_ACCOUNTING** — a reviewed declaration mapping each shipped
+     silicon target to EXACTLY ONE of `ProvenBy(<named execution lane>)` (a
+     real, recurring, named suite — not "it built once on someone's box") or
+     `Deferred(reason, owner, date)` (a conscious, visible deferral, not a
+     silent gap).
+  3. **Fail-closed contract**: a shipped target with no accounting row, an
+     accounting row naming a target no longer shipped (stale), or a target
+     accounted for twice are each a non-zero exit naming the cell. Every
+     failure states the same principle: "proof surface must equal shipped
+     surface — add an execution lane binding or a reviewed deferral row;
+     precedent is not an accounting."
+
+Self-test: `python3 ci/scripts/check_gpu_parity_matrix.py --self-test` also
+proves the silicon axis REDs on a synthetic shipped-but-unaccounted target
+and a synthetic stale accounting row (plus a duplicated row) — the axis-1
+self-test above is untouched by this addition.
 """
 
 from __future__ import annotations
@@ -120,6 +163,8 @@ ANY_ENCODER = REPO_ROOT / "crates" / "jammi-encoders" / "src" / "any.rs"
 MODEL_TASK = REPO_ROOT / "crates" / "jammi-db" / "src" / "model_task.rs"
 CANDLE_BACKEND = REPO_ROOT / "crates" / "jammi-ai" / "src" / "model" / "backend" / "candle.rs"
 GPU_CAPABILITY_DIR = REPO_ROOT / "crates" / "jammi-ai" / "tests" / "gpu_capability"
+KERNELS_BUILD_RS = REPO_ROOT / "crates" / "jammi-kernels" / "build.rs"
+JAMMI_AI_CARGO_TOML = REPO_ROOT / "crates" / "jammi-ai" / "Cargo.toml"
 
 
 class MatrixError(Exception):
@@ -156,6 +201,92 @@ EXTRA_ARCHITECTURES = [
         "OpenClipVision", CANDLE_BACKEND, "OpenClipVisionTransformer"
     ),
     ExtraArchitecture("HtsatAudio", CANDLE_BACKEND, "HtsatAudio"),
+]
+
+
+# --------------------------------------------------------------------------- #
+# SILICON axis — see the module docstring's "A second, orthogonal
+# completeness axis: SILICON" section for the full rationale (esc-028 +
+# the #351 GPU-validation review). Each shipped silicon target reconciles to
+# EXACTLY ONE of ProvenBy / Deferred below, reviewed at PR time exactly like
+# STRUCTURALLY_EXCLUDED / PENDING above.
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class ProvenBy:
+    """A silicon target with a real, named, recurring execution lane."""
+
+    lane: str
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return f"proven_by: {self.lane}"
+
+
+@dataclass(frozen=True)
+class Deferred:
+    """A silicon target with a conscious, visible deferral instead of proof."""
+
+    reason: str
+    owner: str
+    date: str
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return f"deferred: reason={self.reason!r}, owner={self.owner}, date={self.date}"
+
+
+SiliconAccountingEntry = ProvenBy | Deferred
+
+# A reviewed list (not a dict) so a duplicated target is representable and
+# this gate's own reconciliation catches it, rather than Python's dict
+# literal semantics silently keeping only the last entry.
+#
+# sm_80/sm_86/sm_89/sm_90 are each proven by their own matrix leg of
+# `gpu-prove.yml` (opt-in-PR/nightly/dispatch) and the reusable release gate
+# `_gpu-prove-gate.yml` (every CUDA artifact promotion) — both drive
+# `ci/scripts/runpod_gpu_prove.sh` with `GPU_PROVE_ARCH=<arch>`, which rents
+# the matching device via `rp_deploy_arch` (runpod_lib.sh) and runs the same
+# gated GPU suites (`grpc_embedding_gpu`, `gpu_capability`) real hardware ran
+# for sm_80 alone before the #351 GPU-validation review widened this to all
+# four shipped SASS targets.
+SILICON_ACCOUNTING: list[tuple[str, SiliconAccountingEntry]] = [
+    (
+        "sm_80",
+        ProvenBy(
+            "gpu-prove.yml / _gpu-prove-gate.yml matrix leg sm_80 "
+            "(ci/scripts/runpod_gpu_prove.sh GPU_PROVE_ARCH=sm_80 on a rented A100)"
+        ),
+    ),
+    (
+        "sm_86",
+        ProvenBy(
+            "gpu-prove.yml / _gpu-prove-gate.yml matrix leg sm_86 "
+            "(ci/scripts/runpod_gpu_prove.sh GPU_PROVE_ARCH=sm_86 on a rented A40)"
+        ),
+    ),
+    (
+        "sm_89",
+        ProvenBy(
+            "gpu-prove.yml / _gpu-prove-gate.yml matrix leg sm_89 "
+            "(ci/scripts/runpod_gpu_prove.sh GPU_PROVE_ARCH=sm_89 on a rented L40S)"
+        ),
+    ),
+    (
+        "sm_90",
+        ProvenBy(
+            "gpu-prove.yml / _gpu-prove-gate.yml matrix leg sm_90 "
+            "(ci/scripts/runpod_gpu_prove.sh GPU_PROVE_ARCH=sm_90 on a rented H100)"
+        ),
+    ),
+    (
+        "metal",
+        Deferred(
+            reason=(
+                "macos Metal execution lane pending the metal-gated oracles landing "
+                "on feat/351-quantized-gguf-qlora (#430); flip when that lane exists"
+            ),
+            owner="maintainers",
+            date="2026-08-31",
+        ),
+    ),
 ]
 
 
@@ -349,6 +480,107 @@ def load_shipped() -> tuple[set[str], set[str]]:
 
 
 # --------------------------------------------------------------------------- #
+# SILICON — SHIPPED-side parsing. CUDA archs come from the `code=sm_XX`
+# suffixes inside the [`GENCODE_ARCHES`] const literal in `build.rs` (comments
+# stripped first, the same discipline `parse_enum_variants` uses, so the
+# doc-comment's own worked example — "adding `arch=compute_100,code=sm_100`
+# to GENCODE_ARCHES" — is never mistaken for a real shipped entry). Metal is a
+# textual probe for the `metal = [` feature declaration.
+# --------------------------------------------------------------------------- #
+GENCODE_ARCHES_DECL_RE = re.compile(
+    r"const\s+GENCODE_ARCHES\s*:.*?;", re.DOTALL
+)
+GENCODE_SM_RE = re.compile(r"code=sm_(\d+)")
+METAL_FEATURE_RE = re.compile(r"^metal\s*=\s*\[", re.MULTILINE)
+
+
+def load_shipped_cuda_silicon() -> set[str]:
+    if not KERNELS_BUILD_RS.is_file():
+        raise MatrixError(f"jammi-kernels build script not found: {KERNELS_BUILD_RS}")
+    stripped = _strip_rust_comments(KERNELS_BUILD_RS.read_text(encoding="utf-8"))
+    decl = GENCODE_ARCHES_DECL_RE.search(stripped)
+    if decl is None:
+        raise MatrixError(
+            "GENCODE_ARCHES const declaration not found in "
+            f"{KERNELS_BUILD_RS.relative_to(REPO_ROOT)} — was it renamed or removed?"
+        )
+    sms = GENCODE_SM_RE.findall(decl.group(0))
+    if not sms:
+        raise MatrixError(
+            "GENCODE_ARCHES const declaration parsed to zero `code=sm_XX` gencode entries"
+        )
+    return {f"sm_{d}" for d in sms}
+
+
+def load_shipped_metal_silicon() -> set[str]:
+    if not JAMMI_AI_CARGO_TOML.is_file():
+        raise MatrixError(f"jammi-ai Cargo.toml not found: {JAMMI_AI_CARGO_TOML}")
+    text = JAMMI_AI_CARGO_TOML.read_text(encoding="utf-8")
+    if METAL_FEATURE_RE.search(text):
+        return {"metal"}
+    return set()
+
+
+def load_shipped_silicon() -> set[str]:
+    return load_shipped_cuda_silicon() | load_shipped_metal_silicon()
+
+
+SILICON_FAIL_PRINCIPLE = (
+    "proof surface must equal shipped surface — add an execution lane binding "
+    "or a reviewed deferral row; precedent is not an accounting."
+)
+
+
+def reconcile_silicon(
+    shipped: set[str],
+    accounting: list[tuple[str, SiliconAccountingEntry]],
+) -> list[str]:
+    failures: list[str] = []
+
+    seen: dict[str, SiliconAccountingEntry] = {}
+    for target, entry in accounting:
+        if target in seen:
+            failures.append(
+                f"silicon target `{target}` appears twice in SILICON_ACCOUNTING — "
+                f"pick one accounting row per target. {SILICON_FAIL_PRINCIPLE}"
+            )
+            continue
+        seen[target] = entry
+
+    accounted = set(seen)
+    for target in sorted(shipped - accounted):
+        failures.append(
+            f"silicon target `{target}` is SHIPPED but has no SILICON_ACCOUNTING row. "
+            f"{SILICON_FAIL_PRINCIPLE}"
+        )
+    for target in sorted(accounted - shipped):
+        failures.append(
+            f"SILICON_ACCOUNTING entry `{target}` names a target no longer shipped "
+            f"(stale) — remove it or the source it was parsed from changed. {SILICON_FAIL_PRINCIPLE}"
+        )
+
+    return failures
+
+
+def print_silicon_matrix(
+    shipped: set[str],
+    accounting: list[tuple[str, SiliconAccountingEntry]],
+) -> None:
+    by_target = dict(accounting)
+    print("\nGPU-silicon matrix (shipped target -> accounting):")
+    for target in sorted(shipped):
+        entry = by_target.get(target)
+        if entry is None:
+            print(f"    !!!! UNACCOUNTED !!!! {target}")
+        else:
+            print(f"    {target:<8} {entry}")
+    print(
+        f"\nSilicon summary: {len(shipped)} SHIPPED target(s), "
+        f"{len(accounting)} SILICON_ACCOUNTING row(s)."
+    )
+
+
+# --------------------------------------------------------------------------- #
 # reconciliation — pure function over parsed/declared data, so `--self-test`
 # can drive it with synthetic inputs and prove it actually bites.
 # --------------------------------------------------------------------------- #
@@ -484,9 +716,76 @@ def self_test() -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# SILICON self-test — proves the SILICON axis's reconciliation actually
+# bites, on synthetic data. Independent of `self_test()` above; the axis-1
+# self-test is untouched by this function's existence.
+# --------------------------------------------------------------------------- #
+def self_test_silicon() -> int:
+    failures: list[str] = []
+
+    shipped = {"sm_80", "sm_86"}
+    accounting: list[tuple[str, SiliconAccountingEntry]] = [
+        ("sm_80", ProvenBy("synthetic gpu-prove lane")),
+        ("sm_86", Deferred(reason="synthetic deferral", owner="maintainers", date="2026-08-31")),
+    ]
+
+    clean = reconcile_silicon(shipped, accounting)
+    if clean:
+        failures.append(
+            f"silicon self-test FAILED: a fully-accounted shipped set reported failures: {clean}"
+        )
+
+    # (a) synthetic shipped-but-unaccounted arch — a new arch ships with no
+    # accounting row and must be surfaced by name.
+    shipped_extra = shipped | {"sm_100"}
+    unaccounted = reconcile_silicon(shipped_extra, accounting)
+    if not any(
+        "sm_100" in f and "has no SILICON_ACCOUNTING row" in f for f in unaccounted
+    ):
+        failures.append(
+            f"silicon self-test FAILED: a shipped-but-unaccounted silicon target was not "
+            f"surfaced: {unaccounted}"
+        )
+
+    # (b) stale accounting row — an accounting entry naming a target that is
+    # no longer shipped must be surfaced by name.
+    accounting_stale = accounting + [
+        ("sm_120", Deferred(reason="synthetic stale row", owner="maintainers", date="2026-08-31"))
+    ]
+    stale = reconcile_silicon(shipped, accounting_stale)
+    if not any("sm_120" in f and "no longer shipped" in f for f in stale):
+        failures.append(
+            f"silicon self-test FAILED: a stale accounting row was not surfaced: {stale}"
+        )
+
+    # A target accounted for twice must be rejected.
+    accounting_dup = accounting + [
+        ("sm_80", Deferred(reason="synthetic duplicate", owner="maintainers", date="2026-08-31"))
+    ]
+    dup = reconcile_silicon(shipped, accounting_dup)
+    if not any("appears twice" in f for f in dup):
+        failures.append(
+            f"silicon self-test FAILED: a duplicated accounting row was not surfaced: {dup}"
+        )
+
+    if failures:
+        for f in failures:
+            print(f, file=sys.stderr)
+        print("gpu-silicon-matrix self-test: FAIL", file=sys.stderr)
+        return 1
+    print(
+        "gpu-silicon-matrix self-test: OK — a shipped-but-unaccounted silicon target, a "
+        "stale accounting row, and a duplicated accounting row are all caught."
+    )
+    return 0
+
+
 def main() -> int:
     if "--self-test" in sys.argv[1:]:
-        return self_test()
+        rc1 = self_test()
+        rc2 = self_test_silicon()
+        return 1 if (rc1 != 0 or rc2 != 0) else 0
 
     try:
         architectures, verbs = load_shipped()
@@ -514,6 +813,32 @@ def main() -> int:
     print(
         "\ngpu-parity-matrix: PASS — every SHIPPED (architecture × verb) cell is "
         "COVERED, STRUCTURALLY_EXCLUDED, or PENDING; no cell can hide a silent divergence."
+    )
+
+    try:
+        shipped_silicon = load_shipped_silicon()
+    except MatrixError as exc:
+        print(f"gpu-silicon-matrix: FAIL (uncomputable) — {exc}", file=sys.stderr)
+        return 1
+
+    silicon_failures = reconcile_silicon(shipped_silicon, SILICON_ACCOUNTING)
+
+    print_silicon_matrix(shipped_silicon, SILICON_ACCOUNTING)
+
+    if silicon_failures:
+        print("\ngpu-silicon-matrix: FAIL", file=sys.stderr)
+        for f in silicon_failures:
+            print(f"  - {f}", file=sys.stderr)
+        print(
+            f"\ngpu-silicon-matrix: {len(silicon_failures)} finding(s) — a shipped silicon "
+            "target has no accounting, or SILICON_ACCOUNTING has rotted. See above.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(
+        "\ngpu-silicon-matrix: PASS — every SHIPPED silicon target is proven or "
+        "consciously deferred by name; no cell can hide a silent gap."
     )
     return 0
 

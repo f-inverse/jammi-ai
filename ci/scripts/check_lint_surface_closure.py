@@ -13,7 +13,7 @@ one merge-path job that DID compile CUDA-feature code
 (`flash-attn-compile` in `ci.yml`) ran `cargo check`, not `clippy`, and
 never passed `--all-targets`/`--tests`, so it never even reached
 `cuda_parity.rs`; the one place that DID run the right `clippy` invocation
-(`runpod_gpu_prove.sh:56`) is wired only behind `gpu-prove.yml`'s
+(`runpod_gpu_prove.sh:78`) is wired only behind `gpu-prove.yml`'s
 `workflow_dispatch` / `pull_request: types: [labeled]` / nightly `schedule`
 triggers — never a trigger that fires on every PR-to-main. Four
 `clippy::doc_lazy_continuation` lints landed in `cuda_parity.rs` (M2 audit

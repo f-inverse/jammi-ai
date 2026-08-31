@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
-# GPU prove-lane: build jammi from source on a real A100 and run the gated GPU
+# GPU prove-lane: build jammi from source on a real GPU and run the gated GPU
 # suites — the served client/server proof (grpc_embedding_gpu) and the
 # engine-core correctness suite (gpu_capability). Doubles as the #277 regression
 # gate: builds candle's kernels at the image's baked CUDA_COMPUTE_CAP and runs
-# them on an 8.0 device. Shared deploy/run/teardown lives in runpod_lib.sh.
+# them on a real device. Shared deploy/run/teardown lives in runpod_lib.sh.
 #
-# Exit 0 = suites passed; 75 = no A100 capacity (neutral skip).
+# GPU_PROVE_ARCH selects WHICH shipped CUDA arch (crates/jammi-kernels/build.rs
+# GENCODE_ARCHES: sm_80/sm_86/sm_89/sm_90 today) this lane proves; default is
+# today's A100 (sm_80) behavior. The sm_XX -> `rp_deploy_arch` key mapping
+# below is the ONE place that translation lives; `rp_deploy_arch` itself
+# (runpod_lib.sh) is the ONE place the arch key -> actual RunPod GPU-type-id
+# candidate list lives — this script never hand-types a GPU-type-id string.
+#
+# Exit 0 = suites passed; 75 = no capacity for the requested arch (neutral skip).
 set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # This lane's own pods never need 8h — the remote job is capped by RP_TIMEOUT
@@ -17,6 +24,21 @@ source "$DIR/runpod_lib.sh"
 GIT_REPO="${GIT_REPO:-https://github.com/${GITHUB_REPOSITORY:-f-inverse/jammi-ai}.git}"
 GIT_REF="${GIT_REF:-${GITHUB_SHA:-main}}"
 
+# sm_XX (the GENCODE_ARCHES / check_gpu_parity_matrix.py silicon-axis naming)
+# -> the `rp_deploy_arch` candidate-list key (runpod_lib.sh). Comment on each
+# line names the SASS target the leg proves.
+GPU_PROVE_ARCH="${GPU_PROVE_ARCH:-sm_80}"
+case "$GPU_PROVE_ARCH" in
+  sm_80) RP_DEPLOY_ARCH=a100 ;; # Ampere floor — proves sm_80, #277.
+  sm_86) RP_DEPLOY_ARCH=a40  ;; # Ampere workstation class — proves sm_86.
+  sm_89) RP_DEPLOY_ARCH=l40s ;; # Ada — proves sm_89, fp8 #308.
+  sm_90) RP_DEPLOY_ARCH=h100 ;; # Hopper — proves sm_90.
+  *)
+    echo "::error::unknown GPU_PROVE_ARCH '${GPU_PROVE_ARCH}' (want: sm_80|sm_86|sm_89|sm_90)"
+    exit 2
+    ;;
+esac
+
 # Sweep before renting anything. This workflow sets cancel-in-progress, so a
 # superseded run is SIGKILLed and never runs its EXIT trap; the pod it had just
 # rented is orphaned. Running the sweep here bounds any such orphan to the gap
@@ -25,8 +47,8 @@ GIT_REF="${GIT_REF:-${GITHUB_SHA:-main}}"
 rp_sweep
 
 rp_init
-echo "=== provisioning a live A100 (sm_80) ==="
-rp_deploy_live_a100 || exit $?
+echo "=== provisioning a live ${RP_DEPLOY_ARCH} (${GPU_PROVE_ARCH}) ==="
+rp_deploy_arch "$RP_DEPLOY_ARCH" || exit $?
 
 echo "=== running GPU prove suites on ${RP_HOST}:${RP_PORT} ==="
 rp_run_remote <<REMOTE
@@ -49,7 +71,7 @@ echo "::endgroup::"
 echo "::group::jammi-kernels lib tests, default features (records the x86_64 Linux run this pod is the only artifact for)"
 cargo test -p jammi-kernels -- --nocapture --test-threads=1 || rc=\$?
 echo "::endgroup::"
-echo "::group::jammi-kernels lib tests, --features cuda (this pod's A100 is the GPU the suite needs)"
+echo "::group::jammi-kernels lib tests, --features cuda (this pod's GPU is the device the suite needs)"
 cargo test -p jammi-kernels --features cuda -- --nocapture --test-threads=1 || rc=\$?
 echo "::endgroup::"
 echo "::group::jammi-kernels clippy, --all-targets --features cuda (the only lane that can compile cuda_parity — required-features = [\"cuda\"] pulls dep:bindgen_cuda, a real CUDA toolchain the hermetic runner does not have)"

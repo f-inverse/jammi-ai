@@ -1,26 +1,37 @@
 name: _gpu-prove-gate
 
-# Reusable release gate: prove the exact release commit on a real A100 before any
-# CUDA artifact is promoted. Called by every CUDA release lane (pypi-server-cuda,
-# release-binaries, server-image) so build → prove → promote is one shared gate,
-# not three copies. Runs the from-source prove-lane (grpc_embedding_gpu +
-# gpu_capability) — the real #277 kernel gate — against the release ref.
+# Reusable release gate: prove the exact release commit on REAL hardware before
+# any CUDA artifact is promoted. Called by every CUDA release lane
+# (pypi-server-cuda, release-binaries, server-image) so build -> prove ->
+# promote is one shared gate, not three copies. Runs the from-source
+# prove-lane (grpc_embedding_gpu + gpu_capability) — the real #277 kernel gate
+# — against the release ref, matrixed over every SHIPPED CUDA arch
+# (crates/jammi-kernels/build.rs GENCODE_ARCHES, mirrored by
+# check_gpu_parity_matrix.py's silicon axis): sm_80 (A100), sm_86 (A40-class
+# Ampere workstation), sm_89 (L40S, Ada), sm_90 (H100, Hopper).
 #
-# A100 capacity is intermittent (exit 75, SUPPLY_CONSTRAINT). This gate is
-# fail-closed with bounded retry: on 75 it retries the prove script up to 3
-# total attempts, sleeping 300s between attempts (capacity outages are usually
-# transient on that timescale). If every attempt still returns 75, the job
-# FAILS — a capacity outage blocks promotion the same as a real suite failure;
-# it never silently promotes an unproven CUDA artifact (the class of failure
-# esc-028 eliminated on the inference path applies equally to the release
-# path). Every caller gates promotion on this job's `result == 'success'`, so
-# a failed gate here already blocks build-and-push-cu12 / publish / server-cu12
-# with no further wiring needed. Operator recovery: re-run this workflow's
-# failed jobs once A100 capacity returns; promotion stays blocked until the
-# gate is green.
+# COST NOTE FOR HUMANS: four pods per promotion prove instead of one — roughly
+# 4x the GPU-minute spend of the previous single-A100 gate, each independently
+# billed. This gate blocks release promotion, so this cost lands on every
+# tagged CUDA release, not just opt-in PRs — informed merge decision, not a
+# unilateral one.
 #
-# Any other non-zero rc (a real suite failure, not a capacity skip) fails
-# immediately with no retry. Needs the RUNPOD_API_KEY secret (pass
+# Capacity is intermittent (exit 75, SUPPLY_CONSTRAINT). This gate is
+# fail-closed with bounded retry PER ARCH: on 75 it retries that arch's prove
+# script up to 3 total attempts, sleeping 300s between attempts (capacity
+# outages are usually transient on that timescale). If every attempt for an
+# arch still returns 75, that leg FAILS — a capacity outage on ANY arch blocks
+# promotion the same as a real suite failure; it never silently promotes an
+# unproven CUDA artifact (the class of failure esc-028 eliminated on the
+# inference path applies equally to the release path, and now to every
+# shipped arch, not just sm_80). Every caller gates promotion on this job's
+# `result == 'success'` — with `strategy.matrix` a reusable workflow's overall
+# `result` is `success` only when EVERY leg succeeds, so no further wiring is
+# needed for "all four arches proven" to gate build-and-push-cu12 / publish /
+# server-cu12.
+#
+# Any other non-zero rc (a real suite failure, not a capacity skip) fails that
+# leg immediately with no retry. Needs the RUNPOD_API_KEY secret (pass
 # `secrets: inherit` from the caller).
 
 on:
@@ -38,27 +49,42 @@ permissions:
 
 jobs:
   prove:
-    name: Prove on a real A100 (sm_80)
+    name: Prove on a real device (${{ matrix.arch }})
+    strategy:
+      # Independent legs: an sm_90 (H100) capacity outage must not hide a
+      # green sm_80 (A100) result — every arch is its own fail-closed proof,
+      # and (per the reusable-workflow `result` semantics noted above) ALL
+      # four must succeed for the caller's `needs.*.result == 'success'` gate
+      # to pass, so a single stuck arch still correctly blocks promotion.
+      fail-fast: false
+      matrix:
+        arch: [sm_80, sm_86, sm_89, sm_90]
     runs-on: ubuntu-latest
-    # Serialize per release ref. A `v*` tag fires several callers (release-binaries,
-    # server-image, pypi-server-cuda) that each prove the SAME commit, so without
-    # this they rent an A100 apiece — concurrent rentals, each able to orphan its
-    # pod if the release run is cancelled. Never cancels: this job rents hardware
-    # and cleans up in an EXIT trap, and a SIGKILLed runner leaks the pod.
-    # An evicted pending gate leaves `result != 'success'`, which blocks promotion —
-    # fail-closed, which is the correct direction for a release gate.
+    # Serialize per (release ref, arch). A `v*` tag fires several callers
+    # (release-binaries, server-image, pypi-server-cuda) that each prove the
+    # SAME commit on the SAME arch, so without this they rent a GPU apiece —
+    # concurrent rentals, each able to orphan its pod if the release run is
+    # cancelled. The arch dimension is required BECAUSE of the matrix: an
+    # arch-less group would serialize sm_80 against sm_86/sm_89/sm_90 instead
+    # of letting all four legs run concurrently, deduped only against their
+    # own same-ref, same-arch prior run. Never cancels: this job rents
+    # hardware and cleans up in an EXIT trap, and a SIGKILLed runner leaks the
+    # pod. An evicted pending gate leaves `result != 'success'`, which blocks
+    # promotion — fail-closed, which is the correct direction for a release
+    # gate.
     concurrency:
-      group: gpu-prove-gate-${{ inputs.git_ref }}
+      group: gpu-prove-gate-${{ inputs.git_ref }}-${{ matrix.arch }}
       cancel-in-progress: false
     # Bounded retry is up to 3 prove attempts with 300s between; this caps the
     # job well under the 360m default, since a job-timeout kill bypasses the trap.
     timeout-minutes: 200
     steps:
       - uses: actions/checkout@v4
-      - name: Prove the release commit on A100 (retry on capacity, fail closed)
+      - name: Prove the release commit on a real device (retry on capacity, fail closed)
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
           GIT_REF: ${{ inputs.git_ref }}
+          GPU_PROVE_ARCH: ${{ matrix.arch }}
         run: |
           set +e
           max_attempts=3
@@ -70,10 +96,10 @@ jobs:
               exit "$rc"
             fi
             if [ "$attempt" -ge "$max_attempts" ]; then
-              echo "::error::A100 capacity unavailable (SUPPLY_CONSTRAINT) after ${attempt} attempts — this release is NOT GPU-proven. Promotion stays blocked. Operator action: re-run this workflow's failed jobs once A100 capacity returns."
+              echo "::error::${GPU_PROVE_ARCH} capacity unavailable (SUPPLY_CONSTRAINT) after ${attempt} attempts — this release is NOT GPU-proven for ${GPU_PROVE_ARCH}. Promotion stays blocked. Operator action: re-run this workflow's failed jobs once ${GPU_PROVE_ARCH} capacity returns."
               exit "$rc"
             fi
-            echo "::warning::A100 capacity unavailable (SUPPLY_CONSTRAINT), attempt ${attempt}/${max_attempts} — retrying in 300s."
+            echo "::warning::${GPU_PROVE_ARCH} capacity unavailable (SUPPLY_CONSTRAINT), attempt ${attempt}/${max_attempts} — retrying in 300s."
             sleep 300
             attempt=$((attempt + 1))
           done

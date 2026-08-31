@@ -438,7 +438,7 @@ fn read_gguf_header(path: &Path, model_id: &str) -> Result<gguf_file::Content> {
 ///   `4 * elem_count` component is width-independent, so the admission
 ///   figure's F32-vs-F16 ratio is NOT the full 2x the per-element width
 ///   itself moves by: on this fixture (the `[128,32]` F32 embedding is the
-///   ENTIRE dense mass, not merely dominant among several), the MEASURED
+///   entire non-matmul-site dense mass, not merely dominant among several), the MEASURED
 ///   ratio is `75712 / 58560 ≈ 1.29` (the same +29% rise cited above) —
 ///   the full 2x is only approached in the opposite regime, where the
 ///   single largest densified tensor is negligible relative to the total
@@ -460,11 +460,20 @@ fn read_gguf_header(path: &Path, model_id: &str) -> Result<gguf_file::Content> {
 /// `VarBuilder::from_mmaped_safetensors` call). An
 /// F16-on-disk checkpoint served under the `F32` default is therefore
 /// resident at roughly 2x its file-byte sum — a real under-estimate, not a
-/// hypothetical one (the `F32` default itself: `ComputePrecision`'s own
-/// `#[default]` arm, `jammi_numerics::precision.rs:38-41`, is what
+/// hypothetical one (the `F32` default that
 /// `candle.rs:2522-2524`'s `per_model_precision.unwrap_or(device_config.compute_precision)`
-/// falls back to whenever neither `config.json` nor `DeviceConfig`
-/// overrides it). `jammi_ai::model::backend::ort`'s own residency estimator
+/// falls back to whenever neither `config.json` nor `DeviceConfig` overrides
+/// it is produced not by `ComputePrecision`'s own `#[default]` arm
+/// (`jammi_numerics::precision.rs:38-41`) but by `GpuConfig`'s manual
+/// `impl Default` hardcoding `compute_precision:
+/// jammi_numerics::ComputePrecision::F32` at `jammi-db/src/config.rs:931`
+/// — reached via `device_config.compute_precision` (`DeviceConfig::from_config`,
+/// `backend/mod.rs:47`) ← `config.gpu.compute_precision`, whose
+/// missing-field fallback is routed by `GpuConfig`'s container-level
+/// `#[serde(default)]` (`jammi-db/src/config.rs:384`) to
+/// `GpuConfig::default()`, never to `ComputePrecision::default()`, making
+/// it a second hand-written `F32` default independent of `precision.rs:40`
+/// and thus able to drift from it). `jammi_ai::model::backend::ort`'s own residency estimator
 /// separately applies a 1.3x multiplier over its file-size sum
 /// (`OrtBackend::estimate_memory`, `ort.rs:34`) — an observed, uncommented
 /// constant in that file, not something this module's own reasoning

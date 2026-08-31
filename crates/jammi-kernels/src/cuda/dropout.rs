@@ -45,16 +45,32 @@ pub(crate) fn cuda_fwd(
     let shape = l1.shape().clone();
     let n = l1.shape().elem_count();
 
+    // Contiguity is checked FIRST, unconditionally -- even before the
+    // `n == 0` fast path below -- so this arm's domain matches `cpu_fwd`'s
+    // exactly (`ops::dropout::DropoutFused::cpu_fwd` has NO empty fast
+    // path at all: it calls `contiguous_offsets()` unconditionally, so an
+    // empty tensor is only ever a no-op if it is ALSO contiguous). A prior
+    // version of this fn checked `n == 0` first and returned through the
+    // fast path before ever calling `contiguous_offsets()` -- silently
+    // ADMITTING a zero-element non-contiguous layout (e.g. a `(0, 3)`
+    // tensor transposed to `(3, 0)`) that `cpu_fwd` refuses outright. See
+    // `ops::dropout::DropoutFused::metal_fwd`'s identical fix (29e8b569)
+    // for the full `Shape::is_contiguous`-at-a-zero-sized-dim rationale.
+    // `o1`/`o2` are unused by the `n == 0` branch itself -- computed here
+    // only so the domain check runs in the same place for both branches.
+    let (o1, o2) = l1
+        .contiguous_offsets()
+        .ok_or(Error::RequiresContiguous { op: OP })?;
+
     // n == 0: `launch_config(0)` would still clamp to at least 1 block —
     // matching every other op's CUDA glue in this crate, avoid the launch
-    // entirely and return an explicitly empty output instead.
+    // entirely and return an explicitly empty output instead. Matches
+    // `cpu_fwd`'s own domain: an empty (but CONTIGUOUS) tensor is a no-op,
+    // never an error.
     if n == 0 {
         return Ok((super::alloc_empty(&device, s1.dtype(), OP)?, shape));
     }
 
-    let (o1, o2) = l1
-        .contiguous_offsets()
-        .ok_or(Error::RequiresContiguous { op: OP })?;
     let cfg = launch_config(n as u64);
     let (seed, layer_id, forward_idx, threshold, scale) = params.cuda_launch_args();
     let n_u64 = n as u64;

@@ -115,10 +115,20 @@ pub(crate) fn cuda_fwd(
     let (b, s, h, d) = attention_dims(l1, name)?;
     let device = s1.device().clone();
     let out_shape = Shape::from((b, s, h * d));
-    if b == 0 || s == 0 || h == 0 {
-        let out = alloc_scratch(&device, s1.dtype(), 0)?;
-        return Ok((out, out_shape));
-    }
+
+    // `check_mask`/the dtype checks/`qkv`'s (and, under RoPE, `rope_pack`'s)
+    // contiguity are validated UNCONDITIONALLY, before the zero-extent fast
+    // path below — matching `cpu_fwd`'s documented domain exactly:
+    // `ops::attention_block::AttentionBlockFused::cpu_fwd`'s own comment
+    // states there is "No empty fast path on this arm" precisely because
+    // its general path (mask/dtype/contiguity checks, then the F32
+    // compute) runs even when `b`/`s`/`h` is 0, so a malformed mask or a
+    // non-contiguous `qkv`/`rope_pack` is refused on CPU regardless of
+    // whether the tensor is also empty. The CUDA arm keeps its own early
+    // return below purely to avoid handing cuBLAS a zero-extent GEMM — but
+    // only AFTER establishing the exact same admission this op gives on
+    // CPU, not before it.
+    //
     // `qkv` must be contiguous — the SAME domain the CPU arm's `cpu_fwd`
     // requires (`l1.contiguous_offsets()`). `slot_view`/`gather_bhsd`
     // could structurally tolerate an arbitrarily strided `qkv` (they read
@@ -150,6 +160,25 @@ pub(crate) fn cuda_fwd(
     }
     if !matches!(s1.dtype(), DType::F32 | DType::BF16) {
         return Err(Error::UnsupportedDTypeForOp(s1.dtype(), name));
+    }
+    if op.rope {
+        // `cos_l`/`sin_l` (built below, only once this fn is past the
+        // zero-extent fast path) derive `sin`'s start offset by ADDING
+        // `s_max * d` to `l2`'s own start offset — sound ONLY if `l2` is
+        // itself contiguous from that offset. Validated here, unconditionally,
+        // for the SAME reason `l1`'s own contiguity is checked above rather
+        // than only inside the non-empty path: `cpu_fwd`'s own rope_pack
+        // validation (`check_rope_pack` + `l2.contiguous_offsets()`) runs
+        // inside its F32 match, which itself runs unconditionally (no
+        // empty fast path there either).
+        check_rope_pack(l2, s, d, name)?;
+        l2.contiguous_offsets()
+            .ok_or(Error::RequiresContiguous { op: name })?;
+    }
+
+    if b == 0 || s == 0 || h == 0 {
+        let out = alloc_scratch(&device, s1.dtype(), 0)?;
+        return Ok((out, out_shape));
     }
 
     let q_view = slot_view(l1, 0)?;

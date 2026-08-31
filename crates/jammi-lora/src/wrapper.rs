@@ -1,21 +1,24 @@
-//! Closed-enum dispatch between a plain frozen `Linear` and a LoRA-wrapped one.
+//! Closed-enum dispatch between a plain frozen base ([`FrozenBase`]) and a
+//! LoRA-wrapped one.
 
 use std::collections::HashMap;
 
 use candle_core::{Device, Tensor};
-use candle_nn::{Linear, Module};
 
 use crate::error::LoraError;
+use crate::frozen_base::FrozenBase;
 use crate::lora_linear::LoraLinear;
 
-/// Either a frozen `candle_nn::Linear` or a LoRA-augmented one.
+/// Either a frozen base weight ([`FrozenBase`] — dense or GGUF-quantized) or
+/// a LoRA-augmented one.
 ///
 /// Construction is the only place callers decide which arm applies; once built,
 /// the rest of the model holds an opaque `MaybeLoraLinear` and forwards through
 /// it without branching.
 pub enum MaybeLoraLinear {
-    /// Plain frozen linear — no LoRA adapter installed.
-    Frozen(Linear),
+    /// Plain frozen base — no LoRA adapter installed. Dense or GGUF-quantized
+    /// (see [`FrozenBase`]).
+    Frozen(FrozenBase),
     /// Frozen base wrapped with a trainable LoRA A/B path.
     Lora(LoraLinear),
 }
@@ -23,20 +26,15 @@ pub enum MaybeLoraLinear {
 impl MaybeLoraLinear {
     /// Dispatch the forward pass to the appropriate variant.
     ///
-    /// The `Frozen` arm casts the input to the weight's dtype so the underlying
-    /// matmul sees matching precisions — this matters when a BF16 backbone is
-    /// driven by an F32 input.
+    /// The `Frozen` arm delegates to [`FrozenBase::forward`] — a dense base
+    /// casts the input to the weight's dtype so the underlying matmul sees
+    /// matching precisions (this matters when a BF16 backbone is driven by an
+    /// F32 input; behavior PRESERVED byte-for-byte from every prior release,
+    /// see that method's own doc), and a quantized base runs the uniform F32
+    /// activation rule (see [`crate::QuantizedLinear`]'s own doc).
     pub fn forward(&self, x: &Tensor) -> Result<Tensor, LoraError> {
         match self {
-            Self::Frozen(l) => {
-                let w_dtype = l.weight().dtype();
-                let x_cast = if x.dtype() != w_dtype {
-                    x.to_dtype(w_dtype)?
-                } else {
-                    x.clone()
-                };
-                Ok(l.forward(&x_cast)?)
-            }
+            Self::Frozen(base) => base.forward(x),
             Self::Lora(l) => l.forward(x),
         }
     }

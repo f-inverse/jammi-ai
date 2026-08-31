@@ -518,21 +518,33 @@
 //! ## esc-037 disposition
 //!
 //! This describes only call paths and file layout that hold on this
-//! branch. esc-037 (`.jammi/escapes.jsonl`) names TWO
+//! branch. esc-037 (`.jammi/escapes.jsonl`) named TWO
 //! backward-truncating APIs: `candle_nn::ops::softmax_last_dim`
-//! (`apply_op1_no_bwd`) and `QMatMul`, the natural entry point for
-//! quantized fine-tuning. esc-037's `softmax_last_dim` call sites live in
+//! (`apply_op1_no_bwd`) and `QMatMul` (`candle_core::quantized::QMatMul`'s
+//! own `Module::forward`, whose `QTensor` arm is exactly
+//! `xs.apply_op1_no_bwd(t.as_ref())` — `candle-core` 0.11.0
+//! `src/quantized/mod.rs:1023`), the natural entry point for
+//! quantized-weight matmul. esc-037's `softmax_last_dim` call sites live in
 //! `jammi-encoders`' CLIP-text, HTSAT, and OpenCLIP-vision attention
 //! forwards. [`SoftmaxLastDimFused`] is a DIFFERENT operator entirely — a
 //! `CustomOp2` with a REAL `bwd` (this module), dispatched via
 //! `super::apply2` (never `apply_op2_no_bwd`) — wired ONLY at ModernBERT's
 //! training arm, a call site `softmax_last_dim`'s callers above do not
-//! share and this op does not touch. `closes_escape` is NOT claimed here:
-//! esc-037 remains open for both the `softmax_last_dim` call sites above
-//! and `QMatMul`, neither of which this op reaches. (This op's OWN
-//! existence is also not a new instance of esc-037's hazard class: it
-//! never uses `apply_op2_no_bwd`, so nothing upstream of it silently loses
-//! its gradient the way esc-037 describes.)
+//! share and this op does not touch. `closes_escape` is NOT claimed here for
+//! the FULL escape: esc-037's `softmax_last_dim` half remains open (neither
+//! this op nor any op in this crate reaches those `jammi-encoders` call
+//! sites). The `QMatMul` half is now STRUCTURALLY closed for every
+//! GGUF-quantized-weight matmul this workspace performs:
+//! `crate::ops::quant_matmul_grad::QuantMatMulGrad` (`ops::quant_matmul_grad`)
+//! wraps the SAME `QTensor` (delegating to its own `cpu_fwd`/`cuda_fwd`/
+//! `metal_fwd` directly, module doc there) but supplies a REAL `bwd` and
+//! runs through `super::apply_stateful1` — never `QMatMul::forward`, never
+//! `apply_op1_no_bwd` — so a quantized weight this workspace loads is
+//! reached EXCLUSIVELY through that always-differentiable op, not through
+//! candle's own `QMatMul` wrapper. (This op's OWN existence is also not a
+//! new instance of esc-037's hazard class: it never uses
+//! `apply_op2_no_bwd`, so nothing upstream of it silently loses its
+//! gradient the way esc-037 describes.)
 //!
 //! ## Domain, continued: dtype / contiguity / rank
 //!

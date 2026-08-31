@@ -44,9 +44,12 @@ use jammi_kernels::ops::{
     ATTENTION_BLOCK_MAX_SEQ, MAX_HEAD_DIM, MAX_LAST_DIM, MAX_RANK, MEM_EFFICIENT_MAX_SEQ,
     MEM_EFFICIENT_MIN_CHUNK,
 };
-use jammi_lora::{effective_rank, should_apply_lora, LoraBuildConfig, LoraLinear, MaybeLoraLinear};
+use jammi_lora::{
+    effective_rank, should_apply_lora, FrozenBase, LoraBuildConfig, LoraLinear, MaybeLoraLinear,
+};
 
 use crate::error::EncoderError;
+use crate::frozen_weight_source::FrozenWeightLookup;
 use crate::layer_norm::LayerNorm;
 use crate::mask::{extended_attention_mask, sliding_window_mask};
 use crate::pooling::{pool_and_normalize, Pooling};
@@ -2658,6 +2661,7 @@ impl ModernBert {
             lora: LoraBuildConfig::frozen(),
             backbone_dtype: DType::F32,
             adapter_file: None,
+            weight_source: None,
         }
     }
 
@@ -3134,6 +3138,11 @@ pub struct ModernBertBuilder<'a> {
     lora: LoraBuildConfig<'a>,
     backbone_dtype: DType,
     adapter_file: Option<&'a Path>,
+    /// The wave-3 GGUF-quantized-weight construction seam — see
+    /// [`FrozenWeightLookup`]'s own module doc. `None` by default
+    /// ([`ModernBert::builder`]); every EXISTING call site that never calls
+    /// [`Self::weight_source`] gets byte-identical Dense-only behavior.
+    weight_source: Option<&'a FrozenWeightLookup<'a>>,
 }
 
 impl<'a> ModernBertBuilder<'a> {
@@ -3162,6 +3171,15 @@ impl<'a> ModernBertBuilder<'a> {
     /// [`VarMap`] at build time.
     pub fn adapter(mut self, p: Option<&'a Path>) -> Self {
         self.adapter_file = p;
+        self
+    }
+
+    /// Supply a per-tensor-name GGUF-quantized-weight override — see
+    /// [`FrozenWeightLookup`]'s own module doc. Defaulted: a builder that
+    /// never calls this stays byte-identical to every prior release (Dense
+    /// weights, loaded from `weights_paths`, everywhere).
+    pub fn weight_source(mut self, w: &'a FrozenWeightLookup<'a>) -> Self {
+        self.weight_source = Some(w);
         self
     }
 
@@ -3254,6 +3272,7 @@ impl<'a> ModernBertBuilder<'a> {
                 layer_idx: n,
                 lora: self.lora,
                 varmap,
+                weight_source: self.weight_source,
             };
 
             let wqkv = site.build(
@@ -3357,6 +3376,10 @@ struct LoraSite<'a, 'b> {
     lora: LoraBuildConfig<'b>,
     /// The trainable `VarMap` the seeded LoRA A/B tensors are registered into.
     varmap: &'a VarMap,
+    /// The wave-3 GGUF-quantized-weight construction seam — see
+    /// [`crate::FrozenWeightLookup`]'s own module doc. `None` at every
+    /// EXISTING call site (byte-identical to every prior release).
+    weight_source: Option<&'a FrozenWeightLookup<'a>>,
 }
 
 impl<'a, 'b> LoraSite<'a, 'b> {
@@ -3367,7 +3390,18 @@ impl<'a, 'b> LoraSite<'a, 'b> {
         in_features: usize,
         out_features: usize,
     ) -> Result<MaybeLoraLinear, EncoderError> {
-        let frozen = linear_no_bias(in_features, out_features, self.layer_vb.pp(safetensors_sub))?;
+        let sub_vb = self.layer_vb.pp(safetensors_sub);
+        // Wave-3 seam (module doc): consult `weight_source` first, falling
+        // back to the ORIGINAL Dense `linear_no_bias(..)` load (every
+        // ModernBERT linear is bias-free) when unset or missed.
+        let base = if let Some(lookup) = self.weight_source {
+            match lookup(&sub_vb.prefix())? {
+                Some(base) => base,
+                None => FrozenBase::Dense(linear_no_bias(in_features, out_features, sub_vb)?),
+            }
+        } else {
+            FrozenBase::Dense(linear_no_bias(in_features, out_features, sub_vb)?)
+        };
         if should_apply_lora(
             target_name,
             self.lora.target_modules,
@@ -3375,8 +3409,8 @@ impl<'a, 'b> LoraSite<'a, 'b> {
             self.lora.layers_to_transform,
         ) {
             let rank = effective_rank(target_name, self.lora.lora_rank, self.lora.rank_pattern);
-            let lora_linear = LoraLinear::new(
-                frozen,
+            let lora_linear = LoraLinear::new_with_base(
+                base,
                 rank,
                 self.lora.lora_alpha,
                 self.lora.use_rslora,
@@ -3388,7 +3422,7 @@ impl<'a, 'b> LoraSite<'a, 'b> {
             )?;
             Ok(MaybeLoraLinear::Lora(lora_linear))
         } else {
-            Ok(MaybeLoraLinear::Frozen(frozen))
+            Ok(MaybeLoraLinear::Frozen(base))
         }
     }
 }
@@ -8668,8 +8702,8 @@ mod tests {
             None,
         );
         ModernBertAttention {
-            wqkv: MaybeLoraLinear::Frozen(seeded_wqkv),
-            wo: MaybeLoraLinear::Frozen(seeded_wo),
+            wqkv: MaybeLoraLinear::Frozen(FrozenBase::Dense(seeded_wqkv)),
+            wo: MaybeLoraLinear::Frozen(FrozenBase::Dense(seeded_wo)),
             attn_norm: None,
             rope: Arc::new(rope(d, seq_for_table, 10_000.0, device)),
             is_local,
@@ -8993,8 +9027,8 @@ mod tests {
             None,
         );
         ModernBertAttention {
-            wqkv: MaybeLoraLinear::Frozen(seeded_wqkv),
-            wo: MaybeLoraLinear::Frozen(seeded_wo),
+            wqkv: MaybeLoraLinear::Frozen(FrozenBase::Dense(seeded_wqkv)),
+            wo: MaybeLoraLinear::Frozen(FrozenBase::Dense(seeded_wo)),
             attn_norm: None,
             rope: Arc::new(rope(d, seq_for_table, 10_000.0, device)),
             is_local,
@@ -9058,8 +9092,8 @@ mod tests {
 
         let half_window = is_local.then_some(TINY_LOCAL_HALF_WINDOW);
         let attention = ModernBertAttention {
-            wqkv: MaybeLoraLinear::Frozen(mk_linear(3 * hidden, hidden, 0.0131)),
-            wo: MaybeLoraLinear::Frozen(mk_linear(hidden, hidden, 0.0097)),
+            wqkv: MaybeLoraLinear::Frozen(FrozenBase::Dense(mk_linear(3 * hidden, hidden, 0.0131))),
+            wo: MaybeLoraLinear::Frozen(FrozenBase::Dense(mk_linear(hidden, hidden, 0.0097))),
             attn_norm: None,
             rope: Arc::new(rope(d, max_pos, 10_000.0, device)),
             is_local,
@@ -9069,8 +9103,12 @@ mod tests {
             training: true,
         };
         let mlp = ModernBertMlp {
-            wi: MaybeLoraLinear::Frozen(mk_linear(2 * intermediate, hidden, 0.0211)),
-            wo: MaybeLoraLinear::Frozen(mk_linear(hidden, intermediate, 0.0173)),
+            wi: MaybeLoraLinear::Frozen(FrozenBase::Dense(mk_linear(
+                2 * intermediate,
+                hidden,
+                0.0211,
+            ))),
+            wo: MaybeLoraLinear::Frozen(FrozenBase::Dense(mk_linear(hidden, intermediate, 0.0173))),
             mlp_norm,
             training: true,
         };

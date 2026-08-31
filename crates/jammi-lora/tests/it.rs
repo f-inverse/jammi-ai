@@ -6,7 +6,7 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder, VarMap};
 use jammi_lora::{
     effective_rank, load_adapter, save_adapter, should_apply_lora, AdapterConfig, ComputePrecision,
-    LoraBuildConfig, LoraError, LoraInitMode, LoraLinear, MaybeLoraLinear,
+    FrozenBase, LoraBuildConfig, LoraError, LoraInitMode, LoraLinear, MaybeLoraLinear,
 };
 
 fn cpu() -> Device {
@@ -308,7 +308,7 @@ fn rank_zero_is_a_typed_refusal_in_new_and_from_loaded() {
 fn maybe_lora_linear_frozen_forward_matches_underlying() {
     let device = cpu();
     let base = build_base(8, 16, &device);
-    let frozen = MaybeLoraLinear::Frozen(build_base(8, 16, &device));
+    let frozen = MaybeLoraLinear::Frozen(FrozenBase::Dense(build_base(8, 16, &device)));
 
     let x = rand_input(&device);
     let direct = base.forward(&x).unwrap();
@@ -331,7 +331,7 @@ fn maybe_lora_linear_named_weights_only_for_lora() {
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
 
-    let frozen = MaybeLoraLinear::Frozen(build_base(8, 16, &device));
+    let frozen = MaybeLoraLinear::Frozen(FrozenBase::Dense(build_base(8, 16, &device)));
     assert!(frozen.named_weights("query").unwrap().is_empty());
 
     let lora = MaybeLoraLinear::Lora(
@@ -504,7 +504,7 @@ fn lora_build_config_frozen_is_no_op() {
 mod backbone_precision_parity {
     use candle_core::{DType, Device, Tensor};
     use candle_nn::{Linear, VarMap};
-    use jammi_lora::{LoraInitMode, LoraLinear, MaybeLoraLinear};
+    use jammi_lora::{FrozenBase, LoraInitMode, LoraLinear, MaybeLoraLinear};
 
     const IN: usize = 24;
     const OUT: usize = 16;
@@ -577,7 +577,7 @@ mod backbone_precision_parity {
     /// Build both arms over the *same* weight tensor at `dtype`.
     fn arms(device: &Device, dtype: DType) -> (MaybeLoraLinear, MaybeLoraLinear, VarMap) {
         let w = weight(device).to_dtype(dtype).unwrap();
-        let frozen = MaybeLoraLinear::Frozen(Linear::new(w.clone(), None));
+        let frozen = MaybeLoraLinear::Frozen(FrozenBase::Dense(Linear::new(w.clone(), None)));
         let varmap = VarMap::new();
         let vb = candle_nn::VarBuilder::from_varmap(&varmap, DType::F32, device);
         let lora = LoraLinear::new(

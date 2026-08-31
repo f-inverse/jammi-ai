@@ -34,6 +34,9 @@ mod activations;
 mod any;
 mod attention;
 mod error;
+// The wave-3 GGUF-quantized-weight construction seam (`FrozenWeightLookup`)
+// shared by `bert`/`distilbert`/`modernbert` — see its own module doc.
+mod frozen_weight_source;
 mod layer_norm;
 mod mask;
 mod pooling;
@@ -51,6 +54,7 @@ pub use context::{
 };
 pub use distilbert::{DistilBert, DistilBertConfig};
 pub use error::EncoderError;
+pub use frozen_weight_source::FrozenWeightLookup;
 pub use htsat_audio::{HtsatAudio, HtsatAudioConfig};
 pub use modernbert::{ModernBert, ModernBertConfig};
 pub use open_clip_vision::{OpenClipVisionConfig, OpenClipVisionTransformer};

@@ -37,13 +37,28 @@
 //!    **Scoped by PROPERTY, not by filename** — `10b1f3b`'s audit found the
 //!    previous version hardcoded `flash_attention.rs` by name (advisory
 //!    finding: "discipline test keyed on filename"). A file is in scope iff
-//!    it declares a struct field of type `Saved<...>` on a non-comment line
-//!    ([`declares_a_saved_field`]) — the exact shape every
-//!    `StatefulKernelOp`-implementing op in this crate uses to hold its
-//!    interior-mutable state (`ops::saved`'s module doc). A future stateful
-//!    op added under ANY OTHER filename is caught automatically; the
+//!    it declares a struct field of type `Saved<...>` OR `Arc<...>` on a
+//!    non-comment line ([`declares_a_stateful_field`]) — `Saved<...>` is
+//!    the exact shape every `Saved`-bearing `StatefulKernelOp` in this
+//!    crate uses to hold its interior-mutable state (`ops::saved`'s module
+//!    doc); `Arc<...>` WIDENS the property (round-5, `ops::quant_matmul_grad`
+//!    landing) to the SAME hazard class for a struct that carries its
+//!    interior-mutable/shareable state through an `Arc` it did not
+//!    construct itself, rather than an owned `Saved<T>` — `QuantMatMulGrad`
+//!    holds `Arc<candle_core::quantized::QTensor>`, and `QTensor` itself
+//!    owns a `OnceLock` (`repacked_qs` — see that op's own module doc's
+//!    "repacked_qs" section for the full safety argument, argued not
+//!    denied) — the property this test enforces is "a file whose op struct
+//!    carries state that is NOT plain, owned, `Copy`-able construction
+//!    data", and an `Arc<...>` field is exactly as much a structural signal
+//!    of that as a `Saved<...>` one, even though `QuantMatMulGrad` itself
+//!    declares no `Saved<T>` field. A future stateful op added under ANY
+//!    OTHER filename, using EITHER shape, is caught automatically; the
 //!    previous filename-keyed version would have silently stopped
-//!    enforcing the ban on it.
+//!    enforcing the ban on it, and the previous `Saved<`-only property
+//!    would have silently let an `Arc`-only op like `QuantMatMulGrad`
+//!    reach `.apply_op1(`/`.apply_op3(` directly, bypassing
+//!    `apply_stateful1`/`apply_stateful3`'s gate, unchecked.
 //! 3. No `Saved`-bearing struct may derive `Clone`/`Copy`, and no field may
 //!    be `Arc<Saved<...>>` in place of an owned `Saved<...>` — the shape
 //!    `10b1f3b`'s audit demonstrated compiles and ALIASES (`Arc<X>` is
@@ -81,7 +96,7 @@ const FORBIDDEN_EVERYWHERE: &[&str] = &[
     "apply_op3_no_bwd(",
 ];
 
-/// Needles forbidden ONLY in files [`declares_a_saved_field`] scopes.
+/// Needles forbidden ONLY in files [`declares_a_stateful_field`] scopes.
 const FORBIDDEN_IN_SAVED_FIELD_FILES: &[&str] = &[".apply_op1(", ".apply_op2(", ".apply_op3("];
 
 fn walk_rs_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
@@ -103,16 +118,23 @@ fn is_comment_line(line: &str) -> bool {
 }
 
 /// PROPERTY-based scope check (see module doc, point 2): a file is in scope
-/// for the bare-call ban iff it declares a struct FIELD of type `Saved<`
-/// somewhere on a non-comment line. Broad enough to also (harmlessly) scope
-/// `ops/saved.rs` itself (`Saved<T>`'s own definition + its `#[cfg(test)]`
-/// module, neither of which calls `apply_op1/2/3`) — a false POSITIVE
-/// there would just mean an extra file gets checked and passes; the
-/// property must never produce a false NEGATIVE (a real stateful op file
-/// escaping scope), which filename-keying could.
-fn declares_a_saved_field(text: &str) -> bool {
+/// for the bare-call ban iff it declares a struct FIELD of type `Saved<` OR
+/// `Arc<` somewhere on a non-comment line — WIDENED (round-5,
+/// `ops::quant_matmul_grad` landing) from the original `Saved<`-only
+/// property, per this file's own module doc's scope section: an
+/// `Arc<...>`-carried field is the same "not plain, owned, `Copy`-able
+/// construction data" hazard shape a `Saved<T>` field is, even when the op
+/// struct declares no `Saved<T>` field of its own (`QuantMatMulGrad` holds
+/// `Arc<candle_core::quantized::QTensor>` only). Broad enough to also
+/// (harmlessly) scope `ops/saved.rs` itself (`Saved<T>`'s own definition,
+/// whose `inner` field is itself `Arc<Mutex<Option<T>>>` — doubly in scope
+/// — plus its `#[cfg(test)]` module, none of which calls `apply_op1/2/3`)
+/// — a false POSITIVE there would just mean an extra file gets checked and
+/// passes; the property must never produce a false NEGATIVE (a real
+/// stateful op file escaping scope), which filename-keying could.
+fn declares_a_stateful_field(text: &str) -> bool {
     text.lines()
-        .any(|line| !is_comment_line(line) && line.contains("Saved<"))
+        .any(|line| !is_comment_line(line) && (line.contains("Saved<") || line.contains("Arc<")))
 }
 
 /// Check 3 (module doc, point 3): a `Saved`-scoped file must not derive
@@ -158,13 +180,13 @@ fn no_src_file_bypasses_the_kernelop_stateful_kernelop_gate() {
     );
 
     let mut violations = Vec::new();
-    let mut saved_field_files_seen = 0usize;
+    let mut stateful_field_files_seen = 0usize;
     for path in &files {
         let text =
             fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
-        let in_scope = declares_a_saved_field(&text);
+        let in_scope = declares_a_stateful_field(&text);
         if in_scope {
-            saved_field_files_seen += 1;
+            stateful_field_files_seen += 1;
         }
         for (line_no, line) in text.lines().enumerate() {
             if is_comment_line(line) {
@@ -184,8 +206,9 @@ fn no_src_file_bypasses_the_kernelop_stateful_kernelop_gate() {
                 for needle in FORBIDDEN_IN_SAVED_FIELD_FILES {
                     if line.contains(needle) {
                         violations.push(format!(
-                            "{}:{}: {needle:?} (a file declaring a Saved<...> field must reach \
-                             candle only via super::apply_stateful1/apply_stateful3) — {}",
+                            "{}:{}: {needle:?} (a file declaring a Saved<...> or Arc<...> field \
+                             must reach candle only via \
+                             super::apply_stateful1/apply_stateful3) — {}",
                             path.display(),
                             line_no + 1,
                             line.trim()
@@ -205,10 +228,11 @@ fn no_src_file_bypasses_the_kernelop_stateful_kernelop_gate() {
         }
     }
     assert!(
-        saved_field_files_seen >= 2,
-        "sanity: expected at least 2 files declaring a Saved<...> field (ops/saved.rs's own \
-         definition + ops/flash_attention.rs's two op structs) — found {saved_field_files_seen}; \
-         the PROPERTY scope is untested if this is 0/1"
+        stateful_field_files_seen >= 3,
+        "sanity: expected at least 3 files declaring a Saved<...> or Arc<...> field \
+         (ops/saved.rs's own definition, ops/flash_attention.rs's two op structs, and \
+         ops/quant_matmul_grad.rs's Arc<QTensor> field) — found {stateful_field_files_seen}; \
+         the widened PROPERTY scope is untested if this stays at the pre-widening 0/1/2 count"
     );
     assert!(
         violations.is_empty(),
@@ -259,29 +283,47 @@ fn the_forbidden_needle_match_is_not_vacuous() {
     // --- Scope property (check 2): a struct field, not a doc mention.
     let real_field = "    lse: Saved<CudaSlice<f32>>,";
     assert!(
-        declares_a_saved_field(real_field),
+        declares_a_stateful_field(real_field),
         "a real Saved<...> struct field must scope the file in"
     );
     let no_mention = "    lse: CudaSlice<f32>,";
     assert!(
-        !declares_a_saved_field(no_mention),
-        "a file mentioning nothing about Saved must not be scoped in"
+        !declares_a_stateful_field(no_mention),
+        "a file mentioning nothing about Saved/Arc must not be scoped in"
     );
     let comment_only = "//! discusses `Saved<T>` in prose only, never as a field";
     assert!(
-        !declares_a_saved_field(comment_only),
+        !declares_a_stateful_field(comment_only),
         "a Saved<...> MENTION inside a comment must not scope the file in — ops/mod.rs's own \
          module doc does exactly this and must stay out of scope"
     );
 
+    // --- Scope property widening (round-5, QuantMatMulGrad landing): an
+    // Arc<...>-carried field (no Saved<T> field at all) must ALSO scope a
+    // file in — this is what mechanically forces ops/quant_matmul_grad.rs
+    // into the discipline apparatus despite holding Arc<QTensor>, not
+    // Saved<T>.
+    let arc_field = "    w: Arc<QTensor>,";
+    assert!(
+        declares_a_stateful_field(arc_field),
+        "an Arc<...>-carried struct field (no Saved<T> present) must ALSO scope the file in"
+    );
+    let arc_comment_only = "// w: Arc<QTensor> — considered and rejected, do not add it";
+    assert!(
+        !declares_a_stateful_field(arc_comment_only),
+        "an Arc<...> MENTION inside a comment must not scope the file in, mirroring Saved<...>'s \
+         own comment-skip"
+    );
+
     // Existing, already-reviewed bare `.apply_op3(` call sites in OTHER
-    // (non-Saved-declaring) files must NOT be flagged — the scope
-    // restriction is load-bearing, not incidental.
+    // (non-Saved-declaring, non-Arc-declaring) files must NOT be flagged —
+    // the scope restriction is load-bearing, not incidental.
     // kernel-oracles: fn-in-literal reviewed: grep-discipline fixture text, not code
     let attention_block_text = "pub(crate) fn foo() { qkv.apply_op3(rope_pack, mask, op) }";
     assert!(
-        !declares_a_saved_field(attention_block_text),
-        "a file with no Saved<...> field must stay out of scope even if it calls apply_op3"
+        !declares_a_stateful_field(attention_block_text),
+        "a file with no Saved<...>/Arc<...> field must stay out of scope even if it calls \
+         apply_op3"
     );
 
     // --- Check 3: Clone/Copy derive and Arc<Saved<...>> detection.

@@ -20,9 +20,12 @@ use std::path::Path;
 
 use candle_core::{DType, Device, Tensor, D};
 use candle_nn::{embedding, linear, Embedding, Linear, Module, VarBuilder, VarMap};
-use jammi_lora::{effective_rank, should_apply_lora, LoraBuildConfig, LoraLinear, MaybeLoraLinear};
+use jammi_lora::{
+    effective_rank, should_apply_lora, FrozenBase, LoraBuildConfig, LoraLinear, MaybeLoraLinear,
+};
 
 use crate::error::EncoderError;
+use crate::frozen_weight_source::FrozenWeightLookup;
 use crate::layer_norm::LayerNorm;
 use crate::mask::extended_attention_mask;
 use crate::pooling::{pool_and_normalize, Pooling};
@@ -240,6 +243,7 @@ impl Bert {
             lora: LoraBuildConfig::frozen(),
             backbone_dtype: DType::F32,
             adapter_file: None,
+            weight_source: None,
         }
     }
 
@@ -455,6 +459,11 @@ pub struct BertBuilder<'a> {
     lora: LoraBuildConfig<'a>,
     backbone_dtype: DType,
     adapter_file: Option<&'a Path>,
+    /// The wave-3 GGUF-quantized-weight construction seam — see
+    /// [`FrozenWeightLookup`]'s own module doc. `None` by default
+    /// ([`Bert::builder`]); every EXISTING call site that never calls
+    /// [`Self::weight_source`] gets byte-identical Dense-only behavior.
+    weight_source: Option<&'a FrozenWeightLookup<'a>>,
 }
 
 impl<'a> BertBuilder<'a> {
@@ -482,6 +491,15 @@ impl<'a> BertBuilder<'a> {
     /// caller-supplied `VarMap` for training.
     pub fn adapter(mut self, p: Option<&'a Path>) -> Self {
         self.adapter_file = p;
+        self
+    }
+
+    /// Supply a per-tensor-name GGUF-quantized-weight override — see
+    /// [`FrozenWeightLookup`]'s own module doc. Defaulted: a builder that
+    /// never calls this stays byte-identical to every prior release (Dense
+    /// weights, loaded from `weights_paths`, everywhere).
+    pub fn weight_source(mut self, w: &'a FrozenWeightLookup<'a>) -> Self {
+        self.weight_source = Some(w);
         self
     }
 
@@ -531,6 +549,7 @@ impl<'a> BertBuilder<'a> {
                 layer_idx: n,
                 lora: &self.lora,
                 varmap,
+                weight_source: self.weight_source,
             };
 
             let query = site.build("attention.self.query", "query", h, h)?;
@@ -597,10 +616,35 @@ struct LoraSite<'a, 'b> {
     lora: &'a LoraBuildConfig<'a>,
     /// The trainable `VarMap` the seeded LoRA A/B tensors are registered into.
     varmap: &'a VarMap,
+    /// The wave-3 GGUF-quantized-weight construction seam — see
+    /// [`crate::FrozenWeightLookup`]'s own module doc. `None` at every
+    /// EXISTING call site (byte-identical to every prior release).
+    weight_source: Option<&'a FrozenWeightLookup<'a>>,
 }
 
 impl LoraSite<'_, '_> {
-    /// Load the frozen `Linear` at `layer_vb.pp(module_name)` and, if the LoRA
+    /// Resolve the frozen base at `layer_vb.pp(module_name)`: consult
+    /// `weight_source` first (module doc's `FrozenWeightLookup` contract —
+    /// `Ok(Some(base))` uses it directly, `Ok(None)` falls through, `Err`
+    /// propagates loudly), falling back to the ORIGINAL Dense `linear(..)`
+    /// load when `weight_source` is `None` or misses this name.
+    fn resolve_base(
+        &self,
+        module_name: &str,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<FrozenBase, EncoderError> {
+        let module_vb = self.layer_vb.pp(module_name);
+        if let Some(lookup) = self.weight_source {
+            if let Some(base) = lookup(&module_vb.prefix())? {
+                return Ok(base);
+            }
+        }
+        let base: Linear = linear(in_features, out_features, module_vb)?;
+        Ok(FrozenBase::Dense(base))
+    }
+
+    /// Resolve the frozen base ([`Self::resolve_base`]) and, if the LoRA
     /// build config matches the site, wrap it in a `LoraLinear`. `lora_subpath`
     /// is the key prefix used to register / load the A/B tensors inside the
     /// trainable `VarBuilder`.
@@ -611,7 +655,7 @@ impl LoraSite<'_, '_> {
         in_features: usize,
         out_features: usize,
     ) -> Result<MaybeLoraLinear, EncoderError> {
-        let base: Linear = linear(in_features, out_features, self.layer_vb.pp(module_name))?;
+        let base = self.resolve_base(module_name, in_features, out_features)?;
         if should_apply_lora(
             module_name,
             self.lora.target_modules,
@@ -619,7 +663,7 @@ impl LoraSite<'_, '_> {
             self.lora.layers_to_transform,
         ) {
             let rank = effective_rank(module_name, self.lora.lora_rank, self.lora.rank_pattern);
-            let lora_linear = LoraLinear::new(
+            let lora_linear = LoraLinear::new_with_base(
                 base,
                 rank,
                 self.lora.lora_alpha,

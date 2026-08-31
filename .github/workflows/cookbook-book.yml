@@ -93,6 +93,18 @@ jobs:
           . "$GITHUB_WORKSPACE/.venv/bin/activate"
           python scripts/check_api_reference.py
 
+      # The RETURN half of the engine<->cookbook co-evolution loop (#351
+      # review doctrine): check_api_reference.py above guards that a shipped
+      # surface's signature hasn't drifted out from under a chapter; this
+      # guards that every shipped surface HAS a chapter (or a reviewed,
+      # dated deferral) exercising it in the first place, so a new public
+      # capability cannot ship with silently-unaccounted cookbook coverage.
+      - name: Chapter-coverage gate
+        working-directory: cookbook/book
+        run: |
+          . "$GITHUB_WORKSPACE/.venv/bin/activate"
+          python scripts/check_chapter_coverage.py
+
       - name: Lint
         working-directory: cookbook/book
         run: |

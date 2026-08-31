@@ -368,6 +368,24 @@ impl DataClient {
         Ok(resp.status)
     }
 
+    /// Run metrics recorded for a fine-tune job, as the raw JSON blob text the
+    /// catalog's `training_jobs.metrics` column carries (issue #441) — the same
+    /// blob the embedded `TrainingJob`'s catalog-backed metrics read returns.
+    /// `None` for a job that has not yet recorded any metrics (still queued or
+    /// running before its first stamp); this crate carries no `serde_json`
+    /// dependency, so the caller decodes the returned text.
+    pub async fn fine_tune_metrics(&self, id: &FineTuneJobId) -> Result<Option<String>> {
+        let resp = self
+            .training_client()
+            .training_status(TrainingStatusRequest {
+                job_id: id.0.clone(),
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        Ok(resp.metrics_json)
+    }
+
     // --- eval ------------------------------------------------------------
 
     /// Evaluate embedding quality against golden relevance judgments.

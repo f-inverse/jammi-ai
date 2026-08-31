@@ -672,8 +672,9 @@ mod tests {
 
     /// esc-070 conjunct 4: a Philox-EXACT drop-count oracle.
     ///
-    /// see `keep_rate_matches_p_within_a_binomial_bound` above is explicitly
-    /// a DISTRIBUTIONAL check — its own docstring states the 6-sigma band —
+    /// see `keep_rate_matches_p_within_a_binomial_bound` above, which is
+    /// explicitly a DISTRIBUTIONAL check — its own docstring states the
+    /// 6-sigma band —
     /// and a band, by construction, tolerates a threshold/rounding bug
     /// anywhere inside it: at that test's OWN `n = 1_000_000`, `p = 0.05`
     /// fixture the band is ~1302 elements (~0.13% of `n`, no-producer:

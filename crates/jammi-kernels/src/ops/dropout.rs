@@ -614,6 +614,124 @@ mod tests {
         );
     }
 
+    /// esc-070 conjunct 4: a Philox-EXACT drop-count oracle.
+    ///
+    /// `keep_rate_matches_p_within_a_binomial_bound` above is explicitly a
+    /// DISTRIBUTIONAL check — its own docstring states the 6-sigma band —
+    /// and a band, by construction, tolerates a threshold/rounding bug
+    /// anywhere inside it: at `n = 1_000_000`, `p = 0.05` that band is
+    /// ~1302 elements (~0.13% of `n`), so an off-by-a-handful (or even
+    /// off-by-a-thousand) threshold bug passes it silently. esc-070's
+    /// control demands the mask's keep-count EQUAL an independently-derived
+    /// Philox-exact count, not merely fall within a band — this test
+    /// supplies that oracle without displacing the band test above (kept as
+    /// the distribution-sanity companion).
+    ///
+    /// The replay below is genuinely independent of the op's own code
+    /// path: it calls ONLY [`philox_draw`] (`crate::philox`'s public
+    /// function — the same one [`DropoutFused::keeps`] itself calls, but
+    /// nothing further downstream of it), and reimplements the
+    /// `u64`-threshold comparison FROM SCRATCH, from the documented stream
+    /// contract in this module's own "KEEP/DROP: an INTEGER threshold"
+    /// doc section (`threshold = round(p_keep * 2^32)`, decision `draw <
+    /// threshold` in `u64` space) — written here as a standalone
+    /// expression, not by reading `DropoutFused`'s private `threshold`
+    /// field or by calling [`DropoutFused::keeps`], [`dropout_f32`], or
+    /// [`dropout_bf16`] (the op's own mask functions). Calling any of
+    /// those would make this test circular — it would prove only that the
+    /// op agrees with itself, not that its threshold logic is correct.
+    #[test]
+    fn philox_exact_drop_count_matches_an_independent_replay() {
+        let seed: u64 = 0x0BAD_C0FF_EE00_1234;
+        let layer_id: u32 = 3;
+        let forward_idx: u32 = 11;
+        let p: f32 = 0.05;
+        let n: usize = 131_072; // >= 100_000, per esc-070 conjunct 4
+
+        // Independent replay of the documented threshold formula --
+        // written standalone (not via `super::TWO_POW_32` or
+        // `DropoutFused`'s private `threshold` field).
+        let p_keep = 1.0_f64 - f64::from(p);
+        let two_pow_32 = 2.0_f64.powi(32);
+        let expected_threshold = (p_keep * two_pow_32).round() as u64;
+
+        // Independent replay of the per-element draw->threshold decision,
+        // calling ONLY the philox module's public draw function -- never
+        // `DropoutFused::keeps`/`dropout_f32`/`dropout_bf16`.
+        let derived_keep_count = (0..n as u64)
+            .filter(|&i| {
+                let draw = philox_draw(seed, layer_id, forward_idx, i);
+                u64::from(draw) < expected_threshold
+            })
+            .count();
+
+        // Non-degenerate (per the spec): a threshold that keeps
+        // everything or nothing would make the equality assertions below
+        // vacuous.
+        assert!(
+            derived_keep_count > 0 && derived_keep_count < n,
+            "derived keep-count {derived_keep_count} must be strictly \
+             between 0 and n={n} -- p={p} yields threshold \
+             {expected_threshold}"
+        );
+        eprintln!(
+            "philox_exact_drop_count_matches_an_independent_replay: n={n} \
+             threshold={expected_threshold} derived_keep_count={derived_keep_count}"
+        );
+
+        // CPU: run the actual op through the real dispatch path and count
+        // kept elements exactly (equality, not a band).
+        let cpu_device = Device::Cpu;
+        let v = vec![1.0f32; n];
+        let x_cpu = Tensor::from_slice(&v, (n,), &cpu_device).unwrap();
+        let out_cpu: Vec<f32> = dropout(seed, layer_id, forward_idx, p, &x_cpu)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let cpu_keep_count = out_cpu.iter().filter(|&&y| y != 0.0).count();
+        assert_eq!(
+            cpu_keep_count, derived_keep_count,
+            "CPU keep-count must EQUAL the independently-derived \
+             Philox-exact count, not merely fall within a distributional \
+             band -- cpu={cpu_keep_count} derived={derived_keep_count}"
+        );
+        eprintln!(
+            "philox_exact_drop_count_matches_an_independent_replay: \
+             cpu_keep_count={cpu_keep_count} (== derived_keep_count)"
+        );
+
+        // Metal: same equality oracle, run on a real Metal device when one
+        // is available on this host/build -- `Device::new_metal(0)`
+        // erroring is an honest, documented skip (mirrors
+        // `metal_matches_cpu_mask_for_identical_seed_key_position` above),
+        // not the enforced proof itself (`tests/metal_parity.rs` carries
+        // the `required-features = ["metal"]` gate for that).
+        let Ok(metal_device) = Device::new_metal(0) else {
+            eprintln!(
+                "philox_exact_drop_count_matches_an_independent_replay: \
+                 no Metal device available in this build/host -- skipping \
+                 the Metal leg (CPU leg above already ran and passed)"
+            );
+            return;
+        };
+        let x_metal = Tensor::from_slice(&v, (n,), &metal_device).unwrap();
+        let out_metal: Vec<f32> = dropout(seed, layer_id, forward_idx, p, &x_metal)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let metal_keep_count = out_metal.iter().filter(|&&y| y != 0.0).count();
+        eprintln!(
+            "philox_exact_drop_count_matches_an_independent_replay: \
+             metal_keep_count={metal_keep_count} (== derived_keep_count)"
+        );
+        assert_eq!(
+            metal_keep_count, derived_keep_count,
+            "Metal keep-count must EQUAL the independently-derived \
+             Philox-exact count -- metal={metal_keep_count} \
+             derived={derived_keep_count}"
+        );
+    }
+
     #[test]
     fn empty_tensor_is_a_no_op_not_an_error() {
         let device = Device::Cpu;

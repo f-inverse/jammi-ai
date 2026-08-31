@@ -126,11 +126,13 @@ use std::time::Instant;
 
 use candle_core::quantized::{gguf_file, GgmlDType, QTensor};
 use candle_core::{Device, Tensor};
+use candle_nn::{VarBuilder, VarMap};
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
 use jammi_db::config::{GpuConfig, InferenceConfig, JammiConfig, LoggingConfig};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+use jammi_lora::{FrozenBase, LoraInitMode, LoraLinear, QuantizedLinear};
 use jammi_numerics::ComputePrecision;
 use tempfile::TempDir;
 
@@ -966,7 +968,125 @@ async fn qlora_learns_on_metal_with_gguf_base() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Oracle (4): throughput baseline — printed only, no assertion. Perf
+// Oracle (4): esc-070 conjunct 6 -- LoRA/QLoRA gradient finiteness, BY
+// COUNT, elementwise over EVERY lora_a/lora_b gradient tensor from one
+// real QLoRA training forward+backward on Metal.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// esc-070 conjunct 6 (the fix-verifier's "indirect closure" finding,
+/// converted here to a literal, elementwise assertion): one real QLoRA
+/// training forward+backward on Metal, asserting EVERY element of EVERY
+/// `lora_a`/`lora_b` gradient tensor is finite BY COUNT (`finite ==
+/// total`, over each gradient's own flattened `to_vec1()`) — never a
+/// tolerance/aggregate compare (an `iter().all(f32::is_finite)` alone
+/// would report the SAME pass/fail as this count-based form on a genuine
+/// all-finite tensor, but only the count form leaves a falsifiable
+/// number in the failure message and cannot be satisfied by a check that
+/// silently short-circuits on the first element).
+///
+/// Built directly over `jammi_lora::LoraLinear` + a `FrozenBase::
+/// Quantized` base (mirroring `crates/jammi-lora/src/lora_linear.rs`'s
+/// own `quantized_base` test helper and `tests/metal_parity.rs`'s
+/// `quant_matmul_grad_backward_dx_matches_cpu`'s `QTensor::quantize_onto`
+/// pattern) rather than the full async `session.fine_tune` job pipeline:
+/// that pipeline has no seam back to the test for `lora_a`/`lora_b`'s
+/// post-backward `GradStore` entries (`TrainingLoop::after_backward` is
+/// wired for `jammi-ai`'s own internal unit tests, not this crate's
+/// external `tests/*.rs` integration binaries) — a hand-built
+/// `LoraLinear` over a real Metal-resident `Q8_0` quantized weight,
+/// forward, backward, is the direct, literal shape of "a QLoRA training
+/// forward+backward" the fix-verifier asked for, at far lower fixture
+/// cost than spinning up a whole GGUF checkpoint + `InferenceSession` +
+/// fine-tune job.
+#[tokio::test(flavor = "multi_thread")]
+async fn qlora_gradients_are_finite_by_count_on_metal() {
+    skip_without_gpu!();
+
+    let device = Device::new_metal(0).expect("gpu_available() already confirmed a Metal device");
+    let cpu = Device::Cpu;
+
+    let out_features = HIDDEN;
+    let in_features = HIDDEN;
+    let rank = 4usize;
+    let rows = 6usize;
+
+    // Deterministic fixture values (family J) via this file's own
+    // `det_tensor` builder, reused rather than re-derived.
+    let w_cpu = det_tensor(
+        "qlora_grad_finite.base.weight",
+        &[out_features, in_features],
+        &cpu,
+    );
+    let wq = Arc::new(QTensor::quantize_onto(&w_cpu, GgmlDType::Q8_0, &device).unwrap());
+    let base = QuantizedLinear::new(wq, None).unwrap();
+
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &device);
+    let mut lora = LoraLinear::new_with_base(
+        FrozenBase::Quantized(base),
+        rank,
+        16.0,
+        false,
+        LoraInitMode::Gaussian, // nonzero A AND B, so gradients are non-vacuous
+        None,                   // dropout: not this conjunct's subject (conjunct 4 owns it)
+        4242,
+        &varmap,
+        &vb,
+    )
+    .unwrap();
+    lora.set_training(true);
+
+    let x = det_tensor("qlora_grad_finite.x", &[rows, in_features], &device);
+    let y = lora.forward(&x).unwrap();
+    let dy = det_tensor("qlora_grad_finite.dy", &[rows, out_features], &device);
+    let loss = (&y * &dy).unwrap().sum_all().unwrap();
+    let grads = loss.backward().unwrap();
+
+    let grad_a: Vec<f32> = grads
+        .get(&lora.lora_a)
+        .expect("lora_a must receive a gradient from a real backward pass")
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let grad_b: Vec<f32> = grads
+        .get(&lora.lora_b)
+        .expect("lora_b must receive a gradient from a real backward pass")
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let mut total = 0usize;
+    let mut finite = 0usize;
+    for &v in grad_a.iter().chain(grad_b.iter()) {
+        total += 1;
+        if v.is_finite() {
+            finite += 1;
+        }
+    }
+    assert!(
+        total > 0,
+        "lora_a/lora_b gradient tensors must be non-empty for this assertion to be non-vacuous"
+    );
+    eprintln!(
+        "qlora_gradients_are_finite_by_count_on_metal: grad_a_len={} grad_b_len={} \
+         finite={finite} total={total}",
+        grad_a.len(),
+        grad_b.len()
+    );
+    assert_eq!(
+        finite,
+        total,
+        "qlora_gradients_are_finite_by_count_on_metal: expected every lora_a/lora_b gradient \
+         element finite, got {finite}/{total} (grad_a len={}, grad_b len={})",
+        grad_a.len(),
+        grad_b.len()
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Oracle (5): throughput baseline — printed only, no assertion. Perf
 // assertions belong to the perf-claims machinery, not this correctness
 // suite.
 // ─────────────────────────────────────────────────────────────────────────

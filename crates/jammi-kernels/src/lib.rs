@@ -32,6 +32,11 @@ pub mod ops;
 /// compilation unit) and the CUDA parity suite can both exercise the
 /// published known-answer test vectors directly.
 pub mod philox;
+/// The quantized-CUDA load-time canary (issue #434) — the engine guard
+/// `ops::quant_matmul_grad` calls before its first CUDA dispatch each
+/// process. See the module's own doc for the failure class it guards
+/// against and what it can/cannot detect.
+pub mod quantized_cuda_canary;
 
 #[cfg(feature = "cuda")]
 mod cuda;

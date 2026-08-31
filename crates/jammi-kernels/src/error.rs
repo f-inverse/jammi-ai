@@ -39,6 +39,19 @@ pub enum KernelError {
     /// wrong number.
     #[error("invalid scale {scale}: must be finite and > 0.0")]
     InvalidScale { scale: f32 },
+    /// Domain-validity refusal (family D / K2): `crate::quantized_cuda_canary`'s
+    /// load-time known-answer check failed on BOTH the quantized fast-kernel
+    /// CUDA path AND the legacy PTX-JIT'd DMMV fallback `set_force_dmmv(true)`
+    /// routes to (see that module's own doc for the full failure class this
+    /// guards against — issue #434). Refusal beats a confident wrong number:
+    /// this is returned instead of letting a quantized CUDA matmul run when
+    /// neither known-correct path could be proven trustworthy on this device.
+    #[error(
+        "quantized-CUDA canary failed on both the fast kernel path and the legacy DMMV \
+         fallback (see issue #434) -- refusing to run a quantized matmul on this device \
+         rather than risk silent garbage"
+    )]
+    QuantizedCudaCanaryFailed,
 }
 
 /// Crate-local `Result` alias for the admission scaffolding.

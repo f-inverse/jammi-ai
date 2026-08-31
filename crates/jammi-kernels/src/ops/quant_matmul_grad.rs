@@ -307,7 +307,20 @@ impl CustomOp1 for QuantMatMulGrad {
 
 /// The ONLY public entry point besides [`QuantMatMulGrad::new`] itself —
 /// always-differentiable, one code path for train and eval (module doc).
+///
+/// Calls [`crate::quantized_cuda_canary::ensure_quantized_cuda_admitted`]
+/// FIRST, on `x`'s own device (the device `apply_op1`'s dispatch actually
+/// keys off): a no-op on CPU/Metal and, after the first CUDA call this
+/// process makes, a cached `OnceLock` read (see that module's own doc for
+/// the full mechanism and why it exists — issue #434, the shipped
+/// `candle-kernels` 0.11 cu12 wheel's arch-mismatched single-arch-SASS
+/// quantized fast kernels silently returning uninitialized-memory garbage
+/// on an unsupported device rather than erroring). This is the choke point
+/// named in that module's own doc: no production quantized matmul in this
+/// workspace reaches a CUDA device's fast kernels ahead of this check.
 pub fn quant_matmul_grad(x: &Tensor, w: Arc<QTensor>) -> Result<Tensor> {
+    crate::quantized_cuda_canary::ensure_quantized_cuda_admitted(x.device())
+        .map_err(|e| Error::Msg(e.to_string()))?;
     let x = x.contiguous()?;
     apply_stateful1(&x, QuantMatMulGrad::new(w))
 }

@@ -11111,3 +11111,45 @@ fn quant_matmul_grad_eval_prune_matches_tracked_value_on_cuda() {
          forward's own value (same-device comparison)"
     );
 }
+
+// ---------------------------------------------------------------------
+// Quantized-CUDA canary (issue #434 remediation, PR #435): the engine
+// guard `jammi_kernels::quantized_cuda_canary::ensure_quantized_cuda_admitted`
+// runs before `quant_matmul_grad`'s FIRST CUDA dispatch every process (see
+// that module's own doc for the full mechanism). Every OTHER test above
+// this section already exercises `quant_matmul_grad` on CUDA, so the
+// canary has ALREADY run (and, on a healthy pod, ALREADY settled on
+// `FastKernelsTrusted`) by the time this test executes in the same test
+// binary -- this test's own value is asserting that outcome EXPLICITLY,
+// by name, rather than only implicitly through every other test's own
+// numeric parity passing. See this module's own doc's "what this guard can
+// and cannot detect" section: this does NOT and cannot reproduce the true
+// sm_90/cap_80 arch-mismatch scenario hermetically (that needs a genuinely
+// arch-mismatched cubin, a CI/build-matrix concern -- a separate
+// remediation wave; see issue #434); the true mismatch scenario was proven
+// end-to-end on a live H100 pod per that issue's own root-cause comment.
+// ---------------------------------------------------------------------
+#[test]
+fn quantized_cuda_canary_passes_on_a_healthy_build_and_device() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    // Force a quantized CUDA dispatch (and, through it, the canary) even
+    // if no earlier test in this binary already triggered it -- this test
+    // must not depend on run order.
+    let (_wq_cpu, wq_cuda) = qmm_grad_weight_pair(2usize, 32usize, GgmlDType::Q8_0, 4.5, &cuda);
+    let x = Tensor::from_vec(qmm_grad_x_fixture(1, 32, 0.25), (1usize, 32usize), &cuda).unwrap();
+    quant_matmul_grad(&x, wq_cuda)
+        .expect("quant_matmul_grad must succeed on a healthy CUDA device (canary must admit)");
+
+    assert!(
+        jammi_kernels::quantized_cuda_canary::quantized_cuda_canary_used_fast_kernels_for_test(
+            &cuda
+        ),
+        "quantized-CUDA canary must settle on FastKernelsTrusted on a healthy, arch-matched \
+         build+device -- a LegacyDmmvFallback verdict here would mean either the pod's own \
+         build genuinely mismatches this device's arch (a real, reportable finding) or the \
+         canary's own known-answer case/bound is miscalibrated; either way this test failing \
+         is signal, not noise"
+    );
+}

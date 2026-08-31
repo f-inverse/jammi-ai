@@ -1855,11 +1855,19 @@ staleness→recompute loop — that is the platform's, not the engine's
   quietly stopped learning through it. Reached exclusively through
   `super::apply_stateful1` (`BackpropOp::new1` self-prunes for eval — one
   code path serves both regimes, no train/eval branch in this op at all),
-  never candle's `apply_op1_no_bwd`. This STRUCTURALLY closes the `QMatMul`
-  half of `esc-037`'s named risk (`.jammi/escapes.jsonl`) for every
-  quantized-weight matmul this workspace performs; `esc-037`'s other named
-  entry points (`candle_nn::ops::softmax_last_dim`'s remaining eval call
-  site, `candle_nn::ops::sdpa`) are untouched by this op and stay
+  never candle's `apply_op1_no_bwd`. This closes the `QMatMul` half of
+  `esc-037`'s named risk (`.jammi/escapes.jsonl`) for every quantized-weight
+  matmul this workspace's own production code loads today (grep-verified: no
+  live call site anywhere in the workspace uses `QMatMul::forward` or
+  `apply_op1_no_bwd` on a quantized weight); that property is MECHANICALLY
+  enforced only within `jammi-kernels/src` (its own forbidden-needle scan,
+  `tests/stateful_op_discipline.rs`, walks `jammi-kernels/src` ONLY — not
+  `jammi-lora`, `jammi-encoders`, or `jammi-ai`), so nothing structurally
+  stops a future call site in one of those other crates from reintroducing
+  `QMatMul::forward`/`apply_op1_no_bwd` on a quantized weight — that half of
+  the class stays review-enforced, not mechanically closed. `esc-037`'s
+  other named entry points (`candle_nn::ops::softmax_last_dim`'s remaining
+  eval call site, `candle_nn::ops::sdpa`) are untouched by this op and stay
   open/latent respectively (that row's own notes).
 - **QLoRA (fine-tuning over a quantized base)** —
   `crates/jammi-ai/src/fine_tune/worker.rs` (`build_encoder_adapters`): a

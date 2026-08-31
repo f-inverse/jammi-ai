@@ -864,6 +864,40 @@ pub fn flash_attention_varlen_with_rope_ragged_test_only_bwd_window_override(
     super::apply_stateful3(qkv, &cos_r, &sin_r, op)
 }
 
+/// Acquire a CUDA device for this file's own CUDA-gated `#[cfg(test)]`
+/// modules, or `None` to skip — unless `JAMMI_REQUIRE_CUDA` is set, in
+/// which case a device-acquisition failure PANICS instead of returning.
+/// Mirrors `tests/cuda_parity.rs`'s own `cuda_device` exactly (same
+/// skip-vs-fail rationale: without this distinction a broken device
+/// acquisition on a machine that IS supposed to have a GPU would silently
+/// read as a skipped test rather than a failed one).
+///
+/// NOT currently registerable in `ci/kernel-oracle-helpers.txt`:
+/// `check_kernel_oracles.py`'s KO-7 scan covers `crates/jammi-kernels/
+/// tests/**` and `crates/jammi-encoders/src/**` only (verified: the
+/// existing `crates/jammi-kernels/src/ops/flash_attention.rs::cuda_device`
+/// registry attempt at this exact file/fn shape fails closed with "file
+/// not found among scanned files" — `crates/jammi-kernels/src/**` is
+/// simply not in scope yet). This helper still exists and is used by both
+/// `#[test]` fns below, matching the SAME `JAMMI_REQUIRE_CUDA` lattice
+/// every OTHER CUDA-gated skip in this crate uses, so that issue #437's
+/// widened scan (once `crates/jammi-kernels/src/**` is added to KO-7's
+/// scanned set) finds these two skips ALREADY gated, needing only a
+/// registry-line addition rather than a code change.
+#[cfg(test)]
+fn cuda_device_or_skip() -> Option<candle_core::Device> {
+    match candle_core::Device::new_cuda(0) {
+        Ok(d) => Some(d),
+        Err(e) => {
+            if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
+                panic!("JAMMI_REQUIRE_CUDA is set but no CUDA device could be acquired: {e}");
+            }
+            eprintln!("flash_attention: skipping — no CUDA device available: {e}");
+            None
+        }
+    }
+}
+
 /// Structural (white-box) proof that [`flash_attention_varlen`] does not
 /// silently pin `cfg.deterministic` — see the module doc's "Domain"
 /// section: "`cfg.deterministic` is whatever the caller passes ... this op
@@ -881,11 +915,7 @@ mod deterministic_passthrough {
 
     #[test]
     fn cfg_deterministic_flows_through_construction_unmodified() {
-        let Ok(cuda) = candle_core::Device::new_cuda(0) else {
-            eprintln!(
-                "cfg_deterministic_flows_through_construction_unmodified: skipping — no CUDA \
-                 device available"
-            );
+        let Some(cuda) = cuda_device_or_skip() else {
             return;
         };
         let dev = cuda.as_cuda_device().unwrap().clone();
@@ -955,11 +985,7 @@ mod fused_rope_matches_two_op_composition {
 
     #[test]
     fn fused_rope_matches_two_op_composition_bit_identical_fwd_and_bwd_cuda() {
-        let Ok(cuda) = candle_core::Device::new_cuda(0) else {
-            eprintln!(
-                "fused_rope_matches_two_op_composition_bit_identical_fwd_and_bwd_cuda: skipping \
-                 — no CUDA device available"
-            );
+        let Some(cuda) = cuda_device_or_skip() else {
             return;
         };
         let dev = cuda.as_cuda_device().unwrap().clone();

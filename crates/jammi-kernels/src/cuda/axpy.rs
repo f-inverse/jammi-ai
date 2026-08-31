@@ -29,6 +29,41 @@ pub(crate) fn cuda_fwd(
     let n = l1.shape().elem_count();
     let shape = l1.shape().clone();
 
+    // Contiguity is checked FIRST, unconditionally -- even before the
+    // `n == 0` fast path below -- so this arm's own documented domain
+    // (module doc: "the CUDA forward ... additionally requires contiguous
+    // storage") applies identically to an empty tensor: a non-contiguous
+    // VIEW is refused with `RequiresContiguous` whether or not it happens
+    // to be empty, rather than being silently ADMITTED through the fast
+    // path below (`cpu_fwd` itself never requires contiguity at all --
+    // `axpy_f32`/`axpy_f64`/`axpy_bf16` walk `StridedOffsets` -- so this is
+    // the CUDA arm's OWN self-consistency, not a match to `cpu_fwd`'s
+    // domain, which has none to match here).
+    //
+    // `is_contiguous()` alone is NOT sufficient: it does not imply
+    // `start_offset == 0` (candle's own doc on `Layout::is_contiguous`:
+    // "does not imply that the start offset is 0 or that there are no
+    // extra elements at the end of the storage") — a `narrow`'d-but-still-
+    // contiguous view can have a nonzero offset into a LARGER base buffer.
+    // `as_cuda_slice::<T>()` returns the WHOLE base `CudaSlice`, so reading
+    // it from element 0 (this function's previous behavior) reads the
+    // base buffer's first `n` elements instead of this tensor's actual
+    // `[start_offset, start_offset + n)` range — reproduced in
+    // `tests/cuda_parity.rs::parity_narrowed_with_nonzero_offset`.
+    // `contiguous_offsets()` gives the real `[o1, o2)` range; slicing to it
+    // is candle's own idiom for this exact situation
+    // (`cuda_backend/mod.rs`'s `IndexAdd` CUDA impl does the same
+    // `contiguous_offsets()` -> `slice(o1..o2)` on both of its tensor
+    // args). `o1_x`/`o2_x`/`o1_y`/`o2_y` are unused by the `n == 0` branch
+    // itself -- computed here only so the domain check runs in the same
+    // place for both branches.
+    let (o1_x, o2_x) = l1
+        .contiguous_offsets()
+        .ok_or(Error::RequiresContiguous { op: "axpy" })?;
+    let (o1_y, o2_y) = l2
+        .contiguous_offsets()
+        .ok_or(Error::RequiresContiguous { op: "axpy" })?;
+
     // n == 0: `LaunchConfig::for_num_elems(0)` yields grid_dim (0, 1, 1) —
     // an illegal launch. Match the CPU arm's documented no-op contract
     // (`ops::axpy`'s `empty_tensor_is_a_no_op_not_an_error`) instead of
@@ -51,28 +86,6 @@ pub(crate) fn cuda_fwd(
     // real element count and leaving the allocation's tail uninitialized —
     // a confident wrong answer, not a crash. Refuse explicitly instead.
     super::check_elem_count_fits_u32("axpy", n)?;
-
-    // `is_contiguous()` alone is NOT sufficient: it does not imply
-    // `start_offset == 0` (candle's own doc on `Layout::is_contiguous`:
-    // "does not imply that the start offset is 0 or that there are no
-    // extra elements at the end of the storage") — a `narrow`'d-but-still-
-    // contiguous view can have a nonzero offset into a LARGER base buffer.
-    // `as_cuda_slice::<T>()` returns the WHOLE base `CudaSlice`, so reading
-    // it from element 0 (this function's previous behavior) reads the
-    // base buffer's first `n` elements instead of this tensor's actual
-    // `[start_offset, start_offset + n)` range — reproduced in
-    // `tests/cuda_parity.rs::parity_narrowed_with_nonzero_offset`.
-    // `contiguous_offsets()` gives the real `[o1, o2)` range; slicing to it
-    // is candle's own idiom for this exact situation
-    // (`cuda_backend/mod.rs`'s `IndexAdd` CUDA impl does the same
-    // `contiguous_offsets()` -> `slice(o1..o2)` on both of its tensor
-    // args).
-    let (o1_x, o2_x) = l1
-        .contiguous_offsets()
-        .ok_or(Error::RequiresContiguous { op: "axpy" })?;
-    let (o1_y, o2_y) = l2
-        .contiguous_offsets()
-        .ok_or(Error::RequiresContiguous { op: "axpy" })?;
 
     let cfg = super::elemwise_launch_config(n as u32);
 

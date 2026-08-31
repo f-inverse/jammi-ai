@@ -51,18 +51,25 @@ pub(crate) fn moment_update_cuda_fwd(
         });
     }
     let n = l1.shape().elem_count();
+    // Dtype AND contiguity are validated UNCONDITIONALLY, before the
+    // `n == 0` fast path below -- so an empty, non-contiguous buffer is
+    // refused the SAME way a non-empty one would be, matching this op's
+    // own documented CUDA domain (`require_contiguous_f32`'s doc: "every
+    // buffer contiguous") rather than admitting it silently through the
+    // empty fast path (`cpu_fwd` itself never requires contiguity here --
+    // it walks `StridedOffsets` -- so this is the CUDA arm's OWN
+    // self-consistency, not a match to a `cpu_fwd` requirement). `ranges`
+    // is unused by the `n == 0` branch itself -- computed here only so the
+    // domain check runs in the same place for both branches.
+    let ranges = require_contiguous_f32(OP, &[(&*s1, l1), (s2, l2)])?;
     if n == 0 {
         // Match the CPU arm's documented no-op contract
         // (`ops::adamw_step::tests::empty_tensor_is_a_no_op_not_an_error`):
         // `LaunchConfig::for_num_elems(0)` yields an illegal `(0,1,1)` grid,
         // so this returns before ever building one.
-        if s1.dtype() != DType::F32 || s2.dtype() != DType::F32 {
-            return Err(Error::UnsupportedDTypeForOp(s1.dtype(), OP));
-        }
         return Ok(());
     }
     super::check_elem_count_fits_u32(OP, n)?;
-    let ranges = require_contiguous_f32(OP, &[(s1, l1), (s2, l2)])?;
     let (o1, o2) = ranges[0];
     let (o1_g, o2_g) = ranges[1];
 
@@ -113,14 +120,14 @@ pub(crate) fn moment_update_fma_contracted_red_control_cuda_fwd(
         });
     }
     let n = l1.shape().elem_count();
+    // Dtype AND contiguity are validated UNCONDITIONALLY, before the
+    // `n == 0` fast path -- see `moment_update_cuda_fwd`'s identical
+    // comment above.
+    let ranges = require_contiguous_f32(OP, &[(&*s1, l1), (s2, l2)])?;
     if n == 0 {
-        if s1.dtype() != DType::F32 || s2.dtype() != DType::F32 {
-            return Err(Error::UnsupportedDTypeForOp(s1.dtype(), OP));
-        }
         return Ok(());
     }
     super::check_elem_count_fits_u32(OP, n)?;
-    let ranges = require_contiguous_f32(OP, &[(s1, l1), (s2, l2)])?;
     let (o1, o2) = ranges[0];
     let (o1_g, o2_g) = ranges[1];
 
@@ -180,14 +187,14 @@ pub(crate) fn theta_update_cuda_fwd(
         });
     }
     let n = l1.shape().elem_count();
+    // Dtype AND contiguity are validated UNCONDITIONALLY, before the
+    // `n == 0` fast path -- see `moment_update_cuda_fwd`'s identical
+    // comment above.
+    let ranges = require_contiguous_f32(OP, &[(&*s1, l1), (s2, l2), (s3, l3)])?;
     if n == 0 {
-        if s1.dtype() != DType::F32 || s2.dtype() != DType::F32 || s3.dtype() != DType::F32 {
-            return Err(Error::UnsupportedDTypeForOp(s1.dtype(), OP));
-        }
         return Ok(());
     }
     super::check_elem_count_fits_u32(OP, n)?;
-    let ranges = require_contiguous_f32(OP, &[(s1, l1), (s2, l2), (s3, l3)])?;
     let (o1, o2) = ranges[0];
     let (o1_m, o2_m) = ranges[1];
     let (o1_v, o2_v) = ranges[2];

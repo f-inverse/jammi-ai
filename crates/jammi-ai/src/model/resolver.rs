@@ -5,7 +5,19 @@ use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::store::ArtifactStore;
 
-use super::{BackendType, ModelId, ModelSource, ModelTask, ResolvedModel, TokenizerSource};
+use super::backend::gguf::{compute_precision_byte_size, estimate_gguf_residency};
+use super::{
+    BackendType, ModelId, ModelSource, ModelTask, ResolvedModel, TokenizerSource, WeightsFormat,
+};
+
+/// The canonical GGUF weight filename (issue #351): mirrors
+/// `model.safetensors`/`model.onnx`'s own literal-filename convention — the
+/// digest-slot machinery (`backend::candle::all_candidate_paths`) stats
+/// known names only, so a GGUF checkpoint must be named exactly this, never
+/// sniffed by extension. A directory carrying some OTHER `*.gguf` filename
+/// is a typed refusal naming the file(s) found and this convention — see
+/// `ModelResolver::resolve_local`/`ModelResolver::resolve_hf_hub`.
+const GGUF_WEIGHTS_FILENAME: &str = "model.gguf";
 
 /// Resolves a `ModelSource` to file paths and backend selection.
 pub struct ModelResolver {
@@ -101,6 +113,7 @@ impl ModelResolver {
                 return Ok(Some(ResolvedModel {
                     model_id,
                     backend: base_resolved.backend,
+                    weights_format: base_resolved.weights_format,
                     task,
                     config_path: base_resolved.config_path,
                     weights_paths: base_resolved.weights_paths,
@@ -153,14 +166,17 @@ impl ModelResolver {
         });
 
         // Reconstruct weights paths from the artifact directory
-        let weights_paths: Vec<PathBuf> = match backend {
+        let (weights_paths, weights_format): (Vec<PathBuf>, WeightsFormat) = match backend {
             BackendType::Candle => {
                 let standard = artifact_dir.join("model.safetensors");
                 let open_clip = artifact_dir.join("open_clip_model.safetensors");
+                let gguf = artifact_dir.join(GGUF_WEIGHTS_FILENAME);
                 if standard.exists() {
-                    vec![standard]
+                    (vec![standard], WeightsFormat::Safetensors)
                 } else if open_clip.exists() {
-                    vec![open_clip]
+                    (vec![open_clip], WeightsFormat::Safetensors)
+                } else if gguf.exists() {
+                    (vec![gguf], WeightsFormat::Gguf)
                 } else {
                     return Ok(None);
                 }
@@ -168,7 +184,7 @@ impl ModelResolver {
             BackendType::Ort => {
                 let p = artifact_dir.join("model.onnx");
                 if p.exists() {
-                    vec![p]
+                    (vec![p], WeightsFormat::Onnx)
                 } else {
                     return Ok(None);
                 }
@@ -178,17 +194,31 @@ impl ModelResolver {
 
         let tokenizer = discover_local_tokenizer(&artifact_dir);
 
-        let estimated_memory: usize = weights_paths
-            .iter()
-            .filter_map(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len() as usize)
-            .sum();
+        let estimated_memory: usize = if weights_format == WeightsFormat::Gguf {
+            let precision: jammi_numerics::ComputePrecision = model_config
+                .get("compute_precision")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            estimate_gguf_residency(
+                &weights_paths[0],
+                &model_config,
+                compute_precision_byte_size(precision),
+                &model_id.0,
+            )?
+        } else {
+            weights_paths
+                .iter()
+                .filter_map(|p| std::fs::metadata(p).ok())
+                .map(|m| m.len() as usize)
+                .sum()
+        };
 
         let pooling_config = read_local_pooling_config(&artifact_dir, &model_id.0)?;
 
         Ok(Some(ResolvedModel {
             model_id,
             backend,
+            weights_format,
             task,
             config_path,
             weights_paths,
@@ -238,12 +268,20 @@ impl ModelResolver {
         let has_safetensors = path.join("model.safetensors").exists()
             || path.join("open_clip_model.safetensors").exists();
         let has_onnx = path.join("model.onnx").exists();
+        let has_gguf = path.join(GGUF_WEIGHTS_FILENAME).exists();
 
-        if !has_safetensors && !has_onnx {
+        // Precedence FROZEN (issue #351): safetensors-or-onnx wins, byte-for-
+        // byte, exactly as before this feature existed. Only when NEITHER is
+        // present does a `model.gguf` file (or the typed "found *.gguf but
+        // not model.gguf" refusal) enter the picture at all.
+        if !has_safetensors && !has_onnx && !has_gguf {
+            if let Some(other) = other_gguf_refusal(source, path) {
+                return Err(other);
+            }
             return Err(JammiError::Model {
                 model_id: source.to_string(),
                 message: "No model weights found (need model.safetensors, \
-                          open_clip_model.safetensors, or model.onnx)"
+                          open_clip_model.safetensors, model.onnx, or model.gguf)"
                     .into(),
             });
         }
@@ -254,14 +292,16 @@ impl ModelResolver {
             BackendType::Candle
         });
 
-        let weights_paths = match backend {
+        let (weights_paths, weights_format) = match backend {
             BackendType::Candle => {
                 let standard = path.join("model.safetensors");
                 let open_clip = path.join("open_clip_model.safetensors");
                 if standard.exists() {
-                    vec![standard]
+                    (vec![standard], WeightsFormat::Safetensors)
                 } else if open_clip.exists() {
-                    vec![open_clip]
+                    (vec![open_clip], WeightsFormat::Safetensors)
+                } else if has_gguf {
+                    (vec![path.join(GGUF_WEIGHTS_FILENAME)], WeightsFormat::Gguf)
                 } else {
                     return Err(JammiError::Model {
                         model_id: source.to_string(),
@@ -272,8 +312,13 @@ impl ModelResolver {
             BackendType::Ort => {
                 let p = path.join("model.onnx");
                 if p.exists() {
-                    vec![p]
+                    (vec![p], WeightsFormat::Onnx)
                 } else {
+                    // Reached when the directory carries `model.gguf` (or a
+                    // non-canonical `*.gguf` file) but the caller pinned the
+                    // ORT backend — GGUF is a Candle-only weight-storage
+                    // format (issue #351), so this is the correct typed
+                    // refusal, unmodified from today's ONNX-missing case.
                     return Err(JammiError::Model {
                         model_id: source.to_string(),
                         message: "No ONNX weights found for ORT backend".into(),
@@ -290,14 +335,28 @@ impl ModelResolver {
 
         let tokenizer = discover_local_tokenizer(path);
 
-        let estimated_memory: usize = weights_paths
-            .iter()
-            .filter_map(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len() as usize)
-            .sum();
+        let estimated_memory: usize = if weights_format == WeightsFormat::Gguf {
+            let precision: jammi_numerics::ComputePrecision = config
+                .get("compute_precision")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            estimate_gguf_residency(
+                &weights_paths[0],
+                &config,
+                compute_precision_byte_size(precision),
+                &source.to_string(),
+            )?
+        } else {
+            weights_paths
+                .iter()
+                .filter_map(|p| std::fs::metadata(p).ok())
+                .map(|m| m.len() as usize)
+                .sum()
+        };
 
         Ok(ResolvedModel {
             model_id: ModelId::from(source),
+            weights_format,
             backend,
             task,
             config_path,
@@ -362,9 +421,25 @@ impl ModelResolver {
 
         let backend = backend_hint.unwrap_or_else(|| self.select_backend_hf(&repo));
 
-        let weights_paths = match backend {
-            BackendType::Candle => self.download_safetensors(&repo, source)?,
-            BackendType::Ort => self.download_onnx(&repo, source)?,
+        // Precedence FROZEN (issue #351): safetensors wins, byte-for-byte,
+        // exactly as before this feature existed. Only when the safetensors
+        // download fails entirely does a `model.gguf` sibling (or the typed
+        // "found *.gguf siblings but not model.gguf" refusal) enter the
+        // picture.
+        let (weights_paths, weights_format) = match backend {
+            BackendType::Candle => match self.download_safetensors(&repo, source) {
+                Ok(paths) => (paths, WeightsFormat::Safetensors),
+                Err(safetensors_err) => match repo.get(GGUF_WEIGHTS_FILENAME) {
+                    Ok(p) => (vec![p], WeightsFormat::Gguf),
+                    Err(_) => {
+                        if let Some(other) = self.other_gguf_sibling_refusal(&repo, source) {
+                            return Err(other);
+                        }
+                        return Err(safetensors_err);
+                    }
+                },
+            },
+            BackendType::Ort => (self.download_onnx(&repo, source)?, WeightsFormat::Onnx),
             other => {
                 return Err(JammiError::Model {
                     model_id: source.to_string(),
@@ -386,15 +461,29 @@ impl ModelResolver {
                     .map(TokenizerSource::OpenClipBpe)
             });
 
-        let estimated_memory: usize = weights_paths
-            .iter()
-            .filter_map(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len() as usize)
-            .sum();
+        let estimated_memory: usize = if weights_format == WeightsFormat::Gguf {
+            let precision: jammi_numerics::ComputePrecision = config
+                .get("compute_precision")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            estimate_gguf_residency(
+                &weights_paths[0],
+                &config,
+                compute_precision_byte_size(precision),
+                &source.to_string(),
+            )?
+        } else {
+            weights_paths
+                .iter()
+                .filter_map(|p| std::fs::metadata(p).ok())
+                .map(|m| m.len() as usize)
+                .sum()
+        };
 
         Ok(ResolvedModel {
             model_id: ModelId::from(source),
             backend,
+            weights_format,
             task,
             config_path,
             weights_paths,
@@ -405,6 +494,39 @@ impl ModelResolver {
             base_model_id: None,
             adapter_path: None,
             estimated_memory,
+        })
+    }
+
+    /// `Some(typed error)` when `repo` lists at least one `*.gguf` sibling
+    /// OTHER than the canonical `GGUF_WEIGHTS_FILENAME` — names every such
+    /// file and points at the convention, mirroring `other_gguf_refusal`'s
+    /// local-directory counterpart. `None` when the repo listing itself is
+    /// unavailable (best-effort — the caller falls back to the original
+    /// safetensors-download error) or lists no `*.gguf` sibling at all.
+    fn other_gguf_sibling_refusal(
+        &self,
+        repo: &hf_hub::api::sync::ApiRepo,
+        source: &ModelSource,
+    ) -> Option<JammiError> {
+        let info = repo.info().ok()?;
+        let mut others: Vec<String> = info
+            .siblings
+            .iter()
+            .map(|s| s.rfilename.clone())
+            .filter(|name| name.ends_with(".gguf") && name != GGUF_WEIGHTS_FILENAME)
+            .collect();
+        if others.is_empty() {
+            return None;
+        }
+        others.sort();
+        Some(JammiError::Model {
+            model_id: source.to_string(),
+            message: format!(
+                "Found GGUF file(s) {} but no '{GGUF_WEIGHTS_FILENAME}' — the canonical \
+                 quantized-weights filename (mirrors model.safetensors/model.onnx); rename to \
+                 '{GGUF_WEIGHTS_FILENAME}' to load it",
+                others.join(", ")
+            ),
         })
     }
 
@@ -458,6 +580,33 @@ impl ModelResolver {
                 message: format!("No ONNX model found: {e}"),
             })
     }
+}
+
+/// `Some(typed error)` when `dir` contains at least one `*.gguf` file OTHER
+/// than the canonical `GGUF_WEIGHTS_FILENAME` — names every such file and
+/// points at the convention. `None` when the directory listing itself fails
+/// (best-effort — the caller falls back to the generic "no weights found"
+/// message) or lists no `*.gguf` file at all.
+fn other_gguf_refusal(source: &ModelSource, dir: &Path) -> Option<JammiError> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut others: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter(|name| name.ends_with(".gguf") && name != GGUF_WEIGHTS_FILENAME)
+        .collect();
+    if others.is_empty() {
+        return None;
+    }
+    others.sort();
+    Some(JammiError::Model {
+        model_id: source.to_string(),
+        message: format!(
+            "Found GGUF file(s) {} but no '{GGUF_WEIGHTS_FILENAME}' — the canonical \
+             quantized-weights filename (mirrors model.safetensors/model.onnx); rename to \
+             '{GGUF_WEIGHTS_FILENAME}' to load it",
+            others.join(", ")
+        ),
+    })
 }
 
 /// Read and parse `preprocessor_config.json` from a local model directory,

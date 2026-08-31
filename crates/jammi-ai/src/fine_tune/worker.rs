@@ -2135,10 +2135,17 @@ fn build_encoder_adapters(
         .and_then(|v| v.as_str())
         .unwrap_or("bert");
 
+    // GGUF/QLoRA (issue #351): the base artifact SELECTS this — no new
+    // trainer/config knob. `model.safetensors` wins when both happen to be
+    // present (mirrors the resolver's own FROZEN precedence,
+    // `model::resolver::ModelResolver::resolve_local`); only when it is
+    // ABSENT does `model.gguf` enter the picture at all.
     let weights_path = artifact_dir.join("model.safetensors");
-    if !weights_path.exists() {
+    let gguf_weights_path = artifact_dir.join("model.gguf");
+    let is_gguf = !weights_path.exists();
+    if is_gguf && !gguf_weights_path.exists() {
         return Err(JammiError::FineTune(format!(
-            "model.safetensors not found at {weights_path:?}"
+            "Neither model.safetensors nor model.gguf found at {artifact_dir:?}"
         )));
     }
 
@@ -2166,7 +2173,55 @@ fn build_encoder_adapters(
     let adapter_cfg =
         jammi_lora::AdapterConfig::from_build(model_type, &lora, config.backbone_dtype);
 
-    let weights_paths: Vec<&Path> = vec![weights_path.as_path()];
+    // GGUF/QLoRA (issue #351): everything the three encoder builders below
+    // need to train LoRA over a `FrozenBase::Quantized` backbone — built
+    // ONCE here from the GGUF file's tensor data, exactly the way
+    // `CandleBackend::load`'s inference path builds it (the SAME
+    // `crate::model::backend::gguf` module, so a QLoRA fine-tune and an
+    // inference load of the same `model.gguf` can never silently disagree
+    // on which tensors are matmul-site or which dtype loaded).
+    let gguf_backbone = if is_gguf {
+        let arch = crate::model::backend::gguf::GgufArchitecture::from_model_type(model_type)
+            .ok_or_else(|| {
+                JammiError::FineTune(format!(
+                    "quantized serving not supported for this architecture (model_type \
+                     '{model_type}')"
+                ))
+            })?;
+        let num_layers = model_config
+            .get("num_hidden_layers")
+            .or_else(|| model_config.get("num_layers"))
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                JammiError::FineTune(
+                    "GGUF load requires num_hidden_layers (or num_layers) in config.json".into(),
+                )
+            })? as usize;
+        Some(
+            crate::model::backend::gguf::load_gguf_backbone(
+                &gguf_weights_path,
+                arch,
+                num_layers,
+                backbone_dtype,
+                device,
+                base_model_id,
+            )
+            .map_err(|e| JammiError::FineTune(format!("Load GGUF backbone: {e}")))?,
+        )
+    } else {
+        None
+    };
+    let gguf_lookup = gguf_backbone.as_ref().map(|b| b.lookup());
+    // For a GGUF base this points at the synthesized densified safetensors
+    // file `load_gguf_backbone` writes (embeddings/norms/every other
+    // non-matmul-site tensor, dequantized to `backbone_dtype`); every
+    // construction site below that never consults `gguf_lookup` reads this
+    // exactly the way it reads a real safetensors checkpoint.
+    let vb_weights_path = match &gguf_backbone {
+        Some(b) => b.densified_path.clone(),
+        None => weights_path.clone(),
+    };
+    let weights_paths: Vec<&Path> = vec![vb_weights_path.as_path()];
 
     let encoder = match model_type {
         "distilbert" => {
@@ -2174,10 +2229,14 @@ fn build_encoder_adapters(
                 serde_json::from_value(model_config.clone()).map_err(|e| {
                     JammiError::FineTune(format!("Parse DistilBert config.json: {e}"))
                 })?;
+            let mut builder = jammi_encoders::DistilBert::builder()
+                .lora(lora)
+                .backbone_dtype(backbone_dtype);
+            if let Some(lookup) = &gguf_lookup {
+                builder = builder.weight_source(lookup);
+            }
             jammi_encoders::AnyEncoder::DistilBert(
-                jammi_encoders::DistilBert::builder()
-                    .lora(lora)
-                    .backbone_dtype(backbone_dtype)
+                builder
                     .build(&weights_paths, &distilbert_config, device, varmap)
                     .map_err(|e| JammiError::FineTune(format!("Build DistilBert encoder: {e}")))?,
             )
@@ -2187,10 +2246,14 @@ fn build_encoder_adapters(
                 serde_json::from_value(model_config.clone()).map_err(|e| {
                     JammiError::FineTune(format!("Parse ModernBert config.json: {e}"))
                 })?;
+            let mut builder = jammi_encoders::ModernBert::builder()
+                .lora(lora)
+                .backbone_dtype(backbone_dtype);
+            if let Some(lookup) = &gguf_lookup {
+                builder = builder.weight_source(lookup);
+            }
             jammi_encoders::AnyEncoder::ModernBert(
-                jammi_encoders::ModernBert::builder()
-                    .lora(lora)
-                    .backbone_dtype(backbone_dtype)
+                builder
                     .build(&weights_paths, &modernbert_config, device, varmap)
                     .map_err(|e| JammiError::FineTune(format!("Build ModernBert encoder: {e}")))?,
             )
@@ -2199,10 +2262,14 @@ fn build_encoder_adapters(
             let bert_config: jammi_encoders::BertConfig =
                 serde_json::from_value(model_config.clone())
                     .map_err(|e| JammiError::FineTune(format!("Parse Bert config.json: {e}")))?;
+            let mut builder = jammi_encoders::Bert::builder()
+                .lora(lora)
+                .backbone_dtype(backbone_dtype);
+            if let Some(lookup) = &gguf_lookup {
+                builder = builder.weight_source(lookup);
+            }
             jammi_encoders::AnyEncoder::Bert(
-                jammi_encoders::Bert::builder()
-                    .lora(lora)
-                    .backbone_dtype(backbone_dtype)
+                builder
                     .build(&weights_paths, &bert_config, device, varmap)
                     .map_err(|e| JammiError::FineTune(format!("Build Bert encoder: {e}")))?,
             )

@@ -464,6 +464,7 @@ fn load_base_model(
     let resolved = ResolvedModel {
         model_id: ModelId(model_dir.display().to_string()),
         backend: BackendType::Candle,
+        weights_format: jammi_ai::model::WeightsFormat::Safetensors,
         task: ModelTask::TextEmbedding,
         config_path,
         weights_paths: vec![model_dir.join("model.safetensors")],

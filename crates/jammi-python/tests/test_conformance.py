@@ -406,13 +406,14 @@ def test_training_verbs_have_identical_signatures_across_wheels():
 
 def test_remote_training_job_matches_the_local_handle_shape():
     """The client's `RemoteTrainingJob` carries the SAME handle surface as the
-    embedded engine's `TrainingJob`: the `job_id` / `model_id` properties and the
-    `status()` / `wait()` methods. A remote `wait()` polls `TrainingStatus` and
-    raises on a failed job with the wire error, mirroring the local handle, so a
-    caller treats the two interchangeably."""
+    embedded engine's `TrainingJob`: the `job_id` / `model_id` properties, the
+    `status()` / `wait()` methods, and `metrics()` (issue #441). A remote
+    `wait()` polls `TrainingStatus` and raises on a failed job with the wire
+    error, mirroring the local handle, so a caller treats the two
+    interchangeably."""
     local = jammi_native.TrainingJob
     remote = jammi.RemoteTrainingJob
-    for member in ("job_id", "model_id", "status", "wait"):
+    for member in ("job_id", "model_id", "status", "wait", "metrics"):
         assert hasattr(remote, member), member
         assert hasattr(local, member), member
     # `job_id` / `model_id` are read-only attributes on both handles (a property
@@ -808,6 +809,51 @@ def test_training_job_handle_protocol_is_satisfied_by_both_handles():
     assert isinstance(remote_job, jammi.TrainingJobHandle)
     for member in ("job_id", "model_id", "status", "wait"):
         assert hasattr(jammi_native.TrainingJob, member), member
+
+
+def test_remote_training_job_metrics_matches_embedded_absent_and_present_shape():
+    """`RemoteTrainingJob.metrics()` mirrors the embedded `TrainingJob.metrics`
+    semantics (issue #441) at the wire-field-presence layer: `metrics_json`
+    unset on `TrainingStatusResponse` (a job still queued/running before its
+    first stamp) parses to `{}`, exactly like the embedded arm's `unwrap_or`
+    default; `metrics_json` present parses the JSON payload verbatim,
+    including the `train_loss_curve` / `val_loss_curve` arrays the trainer
+    folds in. Hermetic: a stubbed `TrainingStatus` response, no server."""
+    from jammi._generated.jammi.v1 import training_pb2
+
+    # Absent arm — `HasField("metrics_json")` is False, optional field unset.
+    class _NoMetricsStub:
+        def TrainingStatus(self, *_args, **_kwargs):
+            return training_pb2.TrainingStatusResponse(status="running")
+
+    no_metrics_job = jammi.RemoteTrainingJob(
+        _NoMetricsStub(), (), job_id="job-1", model_id="model-1"
+    )
+    assert no_metrics_job.metrics() == {}
+
+    # Present arm — `HasField("metrics_json")` is True, JSON payload parsed
+    # verbatim, including the per-epoch loss curves.
+    payload = (
+        '{"final_loss": 0.42, "total_steps": 100, '
+        '"train_loss_curve": [[0, 1.0], [1, 0.5]], '
+        '"val_loss_curve": [[0, 1.1], [1, 0.6]]}'
+    )
+
+    class _WithMetricsStub:
+        def TrainingStatus(self, *_args, **_kwargs):
+            return training_pb2.TrainingStatusResponse(
+                status="completed", metrics_json=payload
+            )
+
+    with_metrics_job = jammi.RemoteTrainingJob(
+        _WithMetricsStub(), (), job_id="job-2", model_id="model-2"
+    )
+    assert with_metrics_job.metrics() == {
+        "final_loss": 0.42,
+        "total_steps": 100,
+        "train_loss_curve": [[0, 1.0], [1, 0.5]],
+        "val_loss_curve": [[0, 1.1], [1, 0.6]],
+    }
 
 
 class _StubTenant:

@@ -713,6 +713,23 @@ class RemoteTrainingJob:
                 raise TrainingError(resp.error or "training job failed")
             time.sleep(self._POLL_INTERVAL_SECONDS)
 
+    def metrics(self) -> Dict[str, Any]:
+        """Run metrics recorded for this job, as a dict.
+
+        The remote peer of the embedded `TrainingJob.metrics`: parses the
+        `TrainingStatusResponse.metrics_json` field the server fills verbatim
+        from the catalog's `training_jobs.metrics` column — the run-summary
+        blob the trainer hands the worker at completion (`final_loss`,
+        `early_stopping_metric`, `total_steps`, `started_at`,
+        `completed_at`, and the per-epoch `train_loss_curve` /
+        `val_loss_curve` arrays), or the `error_message` blob a failed
+        attempt records instead. Returns ``{}`` for a job that has not yet
+        recorded any metrics (e.g. still queued or running before its first
+        stamp) — `metrics_json` is unset on the wire in that case.
+        """
+        resp = self._status_response()
+        return json.loads(resp.metrics_json) if resp.HasField("metrics_json") else {}
+
 
 class RemoteDatabase:
     """A Database driving a remote jammi engine over the `jammi.v1` gRPC wire.

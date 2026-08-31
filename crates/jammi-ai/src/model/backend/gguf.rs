@@ -13,8 +13,12 @@
 //! (whose config.json already uses those names) but silently wrong for
 //! DistilBERT, whose config.json declares only the DistilBERT-native
 //! `n_layers`: the estimator saw zero layers (emptying `matmul_site` and
-//! costing every k-quant weight as dense, ~7x over-estimating residency)
-//! and the fine-tune load hard-refused outright.
+//! costing every k-quant weight as dense — ~7x on the matmul-site WEIGHT
+//! BYTES alone, but only ~1.9x on this module's own fixture's TOTAL
+//! residency once biases/embeddings/the dequantize transient are folded in
+//! (see `gguf_residency_estimate_is_meaningfully_smaller_than_its_own_all_dense_fallback_per_architecture`,
+//! whose fixture measures 85888 correctly-classified vs. 166912 all-dense
+//! bytes) — and the fine-tune load hard-refused outright.
 //!
 //! # The three supported architectures
 //!
@@ -171,8 +175,10 @@ pub(crate) fn normalize_model_config(
 /// field is present after normalization — every call site turns that into
 /// its own typed refusal naming the checkpoint/model, never a silent
 /// default (a `0`-layer fallback here would empty the matmul-site set and
-/// cost every k-quant weight as dense, ~7x over-estimating residency and
-/// refusing models that actually fit — issue #351 wave 5 audit).
+/// cost every k-quant weight as dense — ~7x on the matmul-site weight
+/// bytes alone, ~1.9x on this module's own fixture's total residency (see
+/// `gguf_residency_estimate_is_meaningfully_smaller_than_its_own_all_dense_fallback_per_architecture`)
+/// — and refusing models that actually fit — issue #351 wave 5 audit).
 pub(crate) fn gguf_num_layers(model_type: &str, config: &serde_json::Value) -> Option<usize> {
     let normalized = normalize_model_config(model_type, config);
     normalized
@@ -346,7 +352,7 @@ fn read_gguf_header(path: &Path, model_id: &str) -> Result<gguf_file::Content> {
 /// a typed refusal here too, at RESOLVE time — never silently estimated
 /// past a shape this workspace cannot actually load.
 ///
-/// # Documented limitation: the adapter-backbone-dtype window
+/// # The adapter-backbone-dtype window is CLOSED by clamping, not documented away
 ///
 /// `target_dtype_bytes` is derived from the RESOLVE-time `compute_precision`
 /// (`config.json`'s `compute_precision`, via [`compute_precision_byte_size`])
@@ -358,22 +364,35 @@ fn read_gguf_header(path: &Path, model_id: &str) -> Result<gguf_file::Content> {
 /// that call site's own comment), and when that persisted dtype is WIDER
 /// than the resolve-time `compute_precision` this function costed with
 /// (e.g. an F32-trained adapter served under an F16 `compute_precision`
-/// config), every DENSE tensor's true residency at load time is larger
-/// than what this function reports — an UNDER-estimate, breaking the
-/// documented `>= true residency` invariant for that one case. This is a
-/// KNOWN, bounded window (not silently ignored): the non-GGUF safetensors
-/// residency path (`ModelResolver`'s plain `std::fs::metadata` file-size
-/// sum) is EQUALLY dtype-blind — it reports the ON-DISK byte size
-/// regardless of `compute_precision` OR any adapter's `backbone_dtype` —
-/// so this is not a regression this function introduces, only a
-/// pre-existing limitation this function's own conservativeness claim did
-/// not previously call out for the GGUF arm specifically.
+/// config), every DENSE tensor's true residency at load time would be
+/// larger than a naive `target_dtype_bytes`-only estimate — so this
+/// function clamps the dense-cost dtype width to `target_dtype_bytes.max(4)`
+/// below: `F32`'s 4 bytes is [`ComputePrecision`](jammi_numerics::ComputePrecision)'s
+/// WIDEST variant (`compute_precision_byte_size`'s own match — `F32 => 4`,
+/// `F16`/`BF16 => 2`), so EVERY reachable `effective_precision`
+/// (`CandleBackend::load`'s own name for "adapter's persisted
+/// `backbone_dtype` if present, else `compute_precision`") is a
+/// `ComputePrecision` whose byte width is `<= 4` — the clamp therefore
+/// covers every value that dtype window could ever take, unconditionally,
+/// not merely the common case. The non-GGUF safetensors residency path
+/// (`ModelResolver`'s plain `std::fs::metadata` file-size sum) needs no
+/// analogous clamp: it reports the ON-DISK byte size directly, which is
+/// already `>=` any resident dequantized form regardless of dtype.
 pub(crate) fn estimate_gguf_residency(
     path: &Path,
     model_config: &serde_json::Value,
     target_dtype_bytes: usize,
     model_id: &str,
 ) -> Result<usize> {
+    // `ComputePrecision::F32` (4 bytes) is the widest variant this
+    // workspace represents (`compute_precision_byte_size`'s own doc/match)
+    // — clamping here, rather than trusting the caller's
+    // `compute_precision`-derived value, is what keeps the `>= true
+    // residency` invariant unconditional through the adapter-backbone-dtype
+    // window this doc's own section above names (a saved adapter's
+    // persisted `backbone_dtype` can be WIDER than the resolve-time
+    // `compute_precision` this function is normally called with).
+    let target_dtype_bytes = target_dtype_bytes.max(4);
     let content = read_gguf_header(path, model_id)?;
 
     let model_type = model_config
@@ -406,8 +425,10 @@ pub(crate) fn estimate_gguf_residency(
             // `n_layers`) must refuse here exactly the way an actual load
             // would, never silently fall back to `0` layers (which would
             // empty `matmul_site_weights` and cost every k-quant weight as
-            // dense, ~7x over-estimating residency — issue #351 wave 5
-            // audit).
+            // dense — ~7x on the matmul-site weight bytes alone, ~1.9x on
+            // this module's own fixture's total residency (see
+            // `gguf_residency_estimate_is_meaningfully_smaller_than_its_own_all_dense_fallback_per_architecture`)
+            // — issue #351 wave 5 audit).
             let num_layers = gguf_num_layers(model_type, model_config).ok_or_else(|| {
                 refusal(
                     model_id,
@@ -994,7 +1015,7 @@ mod tests {
             "a correctly-classified DistilBERT matmul-site set must cost strictly less than the \
              all-dense fallback (compressed Q4_0 weights vs. dense F32) — got \
              distilbert={distilbert_estimate} all_dense={all_dense_estimate}; equal values mean \
-             matmul_site_weights was silently empty (the wave-5-audit ~7x bug)"
+             matmul_site_weights was silently empty (the wave-5-audit all-dense-fallback bug)"
         );
         // MEASURED (F9): Q4_0 stores ~4.5 bits/weight vs. F32's 32 —
         // roughly a 7x compression on the matmul-site weight bytes alone,
@@ -1007,17 +1028,40 @@ mod tests {
         );
     }
 
-    /// Non-empty matmul-site classification for DistilBERT AND a sane
-    /// bound against the BERT/ModernBERT equivalents (same geometry, same
-    /// quantization) — kills the silent 7x by construction: if
-    /// DistilBERT's estimate were the all-dense fallback (the bug), it
-    /// would be roughly 7x its properly-classified peers, well outside
-    /// this bound.
+    /// Replaces a round-1 peer-ratio oracle (`(0.3..3.0).contains(&(db /
+    /// peer))`) that was VACUOUS against the exact bug it claimed to kill.
+    /// On this fixture (2 layers, `[64,32]` Q4_0 matmul-site weights,
+    /// `[64]` F32 matmul-site biases, one `[128,32]` F32 embedding,
+    /// `target_dtype_bytes = 4`), MEASURED (not assumed — F9) by this
+    /// function's own arithmetic below:
+    ///
+    /// - BERT/DistilBERT correctly-classified estimate: 85888 bytes
+    ///   (identical for both — same tensor geometry, only the tensor-name
+    ///   strings differ between the two architectures' fixtures).
+    /// - ModernBERT correctly-classified estimate: 77056 bytes (fewer,
+    ///   bias-free sites).
+    /// - The all-dense fallback (every matmul-site weight, including the
+    ///   Q4_0-quantized ones, costed dense — forced via an unrecognized
+    ///   `model_type`, which is EXACTLY what an empty `matmul_site_weights`
+    ///   set produces, the pre-wave-5 bug's own failure mode): 166912 bytes
+    ///   for BERT/DistilBert's geometry.
+    ///
+    /// The bug this test must kill makes DistilBERT's estimate equal ITS
+    /// OWN all-dense fallback (166912), not BERT's correctly-classified
+    /// figure. Under the round-1 oracle that buggy value's ratio against
+    /// BERT's correct estimate is `166912 / 85888 ≈ 1.943` — INSIDE
+    /// `0.3..3.0`, so the old test passed on a broken estimator. This test
+    /// instead asserts the `:966`-shaped bound directly and per
+    /// architecture: `correctly_classified < 0.7 * own_all_dense_fallback`.
+    /// The buggy value fails this by construction, since a bug that empties
+    /// `matmul_site_weights` makes `correctly_classified == all_dense`,
+    /// which is never `< 0.7 *` itself.
     #[test]
-    fn distilbert_gguf_residency_estimate_is_within_a_sane_bound_of_bert_and_modernbert() {
+    fn gguf_residency_estimate_is_meaningfully_smaller_than_its_own_all_dense_fallback_per_architecture(
+    ) {
         let device = Device::Cpu;
         let layers = 2;
-        let mut estimates: HashMap<&str, usize> = HashMap::new();
+        let unsupported_config = serde_json::json!({ "model_type": "some_unrecognized_arch" });
         for arch in [
             GgufArchitecture::Bert,
             GgufArchitecture::DistilBert,
@@ -1026,30 +1070,43 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let dir = tmp.path().join("model");
             write_est_fixture(&dir, arch, layers, GgmlDType::Q4_0, &device);
+            let path = dir.join("model.gguf");
             let config = est_raw_config(arch, layers);
-            let estimate =
-                estimate_gguf_residency(&dir.join("model.gguf"), &config, 4, "model").unwrap();
-            let key = match arch {
-                GgufArchitecture::Bert => "bert",
-                GgufArchitecture::DistilBert => "distilbert",
-                GgufArchitecture::ModernBert => "modernbert",
-            };
-            estimates.insert(key, estimate);
-        }
-
-        let db = estimates["distilbert"] as f64;
-        let bert = estimates["bert"] as f64;
-        let modernbert = estimates["modernbert"] as f64;
-        assert!(db > 0.0, "matmul-site classification must be non-empty");
-        for (label, peer) in [("bert", bert), ("modernbert", modernbert)] {
-            let ratio = db / peer;
+            let correctly_classified = estimate_gguf_residency(&path, &config, 4, "model").unwrap();
+            // Forces the all-dense fallback: an unrecognized `model_type`
+            // makes `matmul_site_weights` empty regardless of architecture
+            // — the SAME state a `0`-layer / mis-normalized-config bug
+            // would silently produce for a SUPPORTED architecture (module
+            // doc; the sibling
+            // `distilbert_gguf_residency_estimate_costs_matmul_site_weights_compressed_not_dense`
+            // test isolates that exact mechanism for DistilBERT).
+            let all_dense_fallback =
+                estimate_gguf_residency(&path, &unsupported_config, 4, "model").unwrap();
             assert!(
-                (0.3..3.0).contains(&ratio),
-                "DistilBERT estimate {db} must sit within a sane bound of the {label} \
-                 equivalent {peer} (ratio {ratio}) — a ~7x-off ratio is exactly the \
-                 all-dense-fallback bug this oracle kills"
+                (correctly_classified as f64) < (all_dense_fallback as f64) * 0.7,
+                "{arch:?}: correctly-classified estimate {correctly_classified} must be \
+                 meaningfully smaller than its own all-dense fallback {all_dense_fallback} \
+                 (bound: < 0.7x); a value at or near the fallback means \
+                 matmul_site_weights was silently empty — the wave-5-audit all-dense-fallback \
+                 bug this oracle kills"
             );
         }
+
+        // Authority-derived, non-vacuous positive control (replaces the
+        // unconditionally-true `db > 0.0` — embeddings alone made that
+        // positive regardless of classification): the matmul-site NAME
+        // authority itself (`matmul_site_names`, module doc) must derive
+        // exactly 12 DistilBERT sites (6 per layer × 2 layers) for this
+        // fixture — the exact count `estimate_gguf_residency` needs
+        // non-empty to avoid the all-dense fallback above.
+        let distilbert_sites =
+            matmul_site_names(GgufArchitecture::DistilBert, &HashMap::new(), layers);
+        assert_eq!(
+            distilbert_sites.len(),
+            12,
+            "authority-derived DistilBERT matmul-site count must be exactly 12 (6 sites/layer \
+             × 2 layers) for this fixture's geometry"
+        );
     }
 
     /// Domain-validity refusal (family D): a SUPPORTED architecture whose
@@ -1072,6 +1129,35 @@ mod tests {
 
         let err = estimate_gguf_residency(&dir.join("model.gguf"), &config, 4, "model")
             .expect_err("a supported architecture missing its layer-count field must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("num_hidden_layers") || msg.contains("num_layers"),
+            "refusal must name the missing field, got: {msg}"
+        );
+    }
+
+    /// A GGUF `config.json` LACKING `model_type` entirely: this fn's own
+    /// `model_config.get("model_type").and_then(..).unwrap_or("bert")`
+    /// (matching `CandleBackend::load`'s identical default at its own
+    /// `model_type` read, candle.rs) silently defaults to `"bert"` — a
+    /// SUPPORTED architecture, so this does NOT hit the `None`-architecture
+    /// all-dense fallback branch. Previously untested: a config missing
+    /// BOTH `model_type` and the BERT-standard layer-count field must still
+    /// refuse via the SAME typed error the sibling test above pins for an
+    /// EXPLICIT `model_type: "distilbert"`, never silently succeed on a
+    /// `0`-layer / empty-`matmul_site_weights` estimate.
+    #[test]
+    fn gguf_residency_estimate_refuses_a_config_lacking_model_type_entirely() {
+        let device = Device::Cpu;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("model");
+        write_est_fixture(&dir, GgufArchitecture::Bert, 1, GgmlDType::Q4_0, &device);
+        let config = serde_json::json!({}); // no model_type, no layer-count field at all
+
+        let err = estimate_gguf_residency(&dir.join("model.gguf"), &config, 4, "model").expect_err(
+            "a config missing model_type (defaulting to bert) AND its layer-count field \
+                 must refuse",
+        );
         let msg = err.to_string();
         assert!(
             msg.contains("num_hidden_layers") || msg.contains("num_layers"),
@@ -1181,6 +1267,29 @@ mod tests {
                 is_matmul_site_weight: false,
                 is_matmul_site_bias: false,
             },
+            Category {
+                // A QUANTIZED NON-matmul-site tensor (e.g. k-quant token-type
+                // embeddings — real GGUF checkpoints DO quantize embedding
+                // tables, not just matmul-site linear weights). This category
+                // was absent from the table pre-round-2: `load_gguf_backbone`'s
+                // densify loop (module doc) calls `.dequantize(device)`
+                // UNCONDITIONALLY on every tensor whose name isn't in
+                // `site_names` — the SAME path a dense-stored non-site tensor
+                // takes, never `SiteWeight::Quantized` (that arm is reachable
+                // ONLY for a matmul-site WEIGHT). `estimate_gguf_residency`'s
+                // own branch condition (`is_kquant && matmul_site_weights.
+                // contains(name)`) already agrees — a k-quant tensor NOT in
+                // `matmul_site_weights` falls through to the same dense/
+                // transient `else` arm — so this row is oracle COVERAGE
+                // (closing a blind spot the table never exercised), not a
+                // behavior fix: no divergence exists between the estimator
+                // and the loader for this category.
+                name: "embeddings.token_type_embeddings.weight".to_string(),
+                elems: 64 * 32,
+                stored_dtype: GgmlDType::Q4_0,
+                is_matmul_site_weight: false,
+                is_matmul_site_bias: false,
+            },
         ];
 
         // Every OTHER matmul-site tensor this fixture's `layers=1` BERT
@@ -1279,6 +1388,129 @@ mod tests {
                 .iter()
                 .map(|c| c.name.as_str())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Adapter-backbone-dtype window closure (issue #351 round-2 audit
+    // Block B): `target_dtype_bytes.max(4)` inside `estimate_gguf_residency`
+    // keeps `>= true residency` UNCONDITIONAL even when a saved fine-tune
+    // adapter's persisted `backbone_dtype` is wider than the resolve-time
+    // `compute_precision` this function is normally called with
+    // (candle.rs:2795-2800 → `encoder_backbone_dtype`; candle.rs:3192-3193
+    // → `estimate_memory`'s admission use of the resolve-time figure).
+    // ─────────────────────────────────────────────────────────────────
+
+    /// RED before the `target_dtype_bytes.max(4)` clamp (this test pins it
+    /// closed): `ModelResolver` calls `estimate_gguf_residency` with
+    /// `compute_precision_byte_size(precision)` straight from `config.json`
+    /// — for an `F16` `compute_precision` config that is `2` bytes, computed
+    /// BEFORE any adapter is even consulted (this fn's own doc). If a saved
+    /// adapter's persisted `backbone_dtype` later turns out to be `F32` (4
+    /// bytes — `ComputePrecision`'s widest variant), an UNCLAMPED estimate
+    /// would cost every dense (non-compressed-matmul-site) tensor at `2`
+    /// bytes/element instead of the `4` the real load actually produces —
+    /// strictly UNDER true residency, breaking the documented invariant.
+    /// This test calls the estimator with the F16 byte width exactly as
+    /// `ModelResolver` would, then checks the result against an
+    /// INDEPENDENTLY derived F32-load residency figure (the SAME per-
+    /// category `true_residency_contribution` helper the parity test above
+    /// uses, built fresh from this fixture's own category list — never from
+    /// `estimate_gguf_residency`'s own code, so this cannot pass by
+    /// tautologically re-deriving the function under test).
+    #[test]
+    fn estimate_gguf_residency_stays_at_least_true_residency_under_a_wider_persisted_adapter_dtype()
+    {
+        let device = Device::Cpu;
+        let layers = 1;
+        let arch = GgufArchitecture::Bert;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("model");
+        write_est_fixture(&dir, arch, layers, GgmlDType::Q4_0, &device);
+        let path = dir.join("model.gguf");
+        let config = est_raw_config(arch, layers);
+
+        // The resolve-time byte width `ModelResolver` would pass for an F16
+        // `compute_precision` config — BEFORE any adapter's persisted
+        // `backbone_dtype` is consulted (candle.rs:2795-2800's own comment:
+        // the adapter's backbone_dtype only wins once the adapter is
+        // actually loaded, which happens strictly AFTER this resolve-time
+        // call).
+        let f16_target_dtype_bytes =
+            compute_precision_byte_size(jammi_numerics::ComputePrecision::F16);
+        assert_eq!(f16_target_dtype_bytes, 2);
+
+        let estimate =
+            estimate_gguf_residency(&path, &config, f16_target_dtype_bytes, "model").unwrap();
+
+        // Independent per-category true-residency derivation AS IF a saved
+        // adapter's persisted `backbone_dtype` turned out to be `F32` (the
+        // widest window the clamp must cover) — mirrors this fixture's own
+        // geometry (`write_est_fixture`'s doc: six BERT sites/layer, one
+        // `[128,32]` F32 embedding).
+        let required = matmul_site_names(arch, &HashMap::new(), layers);
+        let mut categories: Vec<Category> = Vec::new();
+        for (prefix, has_bias) in &required {
+            categories.push(Category {
+                name: format!("{prefix}.weight"),
+                elems: 64 * 32,
+                stored_dtype: GgmlDType::Q4_0,
+                is_matmul_site_weight: true,
+                is_matmul_site_bias: false,
+            });
+            if *has_bias {
+                categories.push(Category {
+                    name: format!("{prefix}.bias"),
+                    elems: 64,
+                    stored_dtype: GgmlDType::F32,
+                    is_matmul_site_weight: false,
+                    is_matmul_site_bias: true,
+                });
+            }
+        }
+        categories.push(Category {
+            name: "embeddings.word_embeddings.weight".to_string(),
+            elems: 128 * 32,
+            stored_dtype: GgmlDType::F32,
+            is_matmul_site_weight: false,
+            is_matmul_site_bias: false,
+        });
+
+        let f32_target_dtype_bytes = 4usize;
+        let mut true_total_at_f32: u128 = 0;
+        let mut true_max_transient_at_f32: u128 = 0;
+        for c in &categories {
+            let (bytes, transient) = true_residency_contribution(c, f32_target_dtype_bytes);
+            true_total_at_f32 += bytes;
+            if transient > true_max_transient_at_f32 {
+                true_max_transient_at_f32 = transient;
+            }
+        }
+        let true_residency_at_f32 = true_total_at_f32 + true_max_transient_at_f32;
+
+        assert!(
+            (estimate as u128) >= true_residency_at_f32,
+            "estimate {estimate} (called with F16's target_dtype_bytes={f16_target_dtype_bytes}) \
+             must still be >= the true residency if a saved adapter's persisted backbone_dtype \
+             turns out to be F32 ({true_residency_at_f32}) — an UNCLAMPED target_dtype_bytes \
+             would cost every dense tensor at 2 bytes/element instead of 4, UNDER this figure, \
+             breaking the documented '>= true residency' invariant for the adapter-backbone- \
+             dtype window (issue #351 round-2 audit Block B); target_dtype_bytes.max(4) inside \
+             estimate_gguf_residency is what closes it"
+        );
+
+        // Pin the MECHANISM directly (family F: isolate it, don't merely
+        // bound the aggregate): an F16-called estimate must be IDENTICAL to
+        // an F32-called estimate on the SAME fixture — proof the clamp
+        // actually fires, not merely that the bound above happens to hold
+        // by coincidence.
+        let f32_called_estimate =
+            estimate_gguf_residency(&path, &config, f32_target_dtype_bytes, "model").unwrap();
+        assert_eq!(
+            estimate, f32_called_estimate,
+            "an F16-called estimate must equal an F32-called estimate on the SAME fixture — \
+             proof the target_dtype_bytes.max(4) clamp is actually firing, not merely \
+             coincidentally conservative"
         );
     }
 

@@ -526,3 +526,20 @@
                Natural Language Processing (EMNLP-IJCNLP)},
   year      = {2019}
 }
+
+% QLoRA: the quantized-weights chapter's theory citation for training LoRA
+% adapters against a FROZEN, quantized backbone (a block-quantized weight is
+% never trained through directly; only the low-rank adapter receives
+% gradients, exactly as this engine's QuantizedLinear/FrozenBase::Quantized
+% wiring does over a GGUF base). This paper's MatMul4Bit contract is the one
+% jammi-kernels' own `QuantMatMulGrad` module doc names directly as the
+% gradient-wrt-activation-only contract that op implements. Verified:
+% Dettmers et al., NeurIPS 2023, arXiv:2305.14314.
+@inproceedings{dettmers2023qlora,
+  title     = {{QLoRA}: Efficient Finetuning of Quantized {LLM}s},
+  author    = {Dettmers, Tim and Pagnoni, Artidoro and Holtzman, Ari and
+               Zettlemoyer, Luke},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2023},
+  note      = {arXiv:2305.14314}
+}

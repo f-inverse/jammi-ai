@@ -6435,35 +6435,34 @@ mod loss_curve_metrics {
     /// `cargo test` runs fully parallel by default (module doc above), and
     /// OTHER, unrelated tests in this SAME lib test binary also call
     /// `run_text_loop` — driving the identical "Epoch complete" callsite —
-    /// WITHOUT installing any subscriber of their own. `tracing-core`
-    /// caches a callsite's `Interest` PERMANENTLY the first time ANY
-    /// thread ever hits it (a `registration` CAS `Once`, not re-evaluated
-    /// per event); a thread with no subscriber resolves through the
-    /// process-wide GLOBAL default (`tracing_core::dispatcher::
-    /// get_default`'s fallback path) rather than any OTHER thread's
-    /// thread-local scope — a scoped `with_default`/`set_default` on ITS
-    /// OWN calling thread is invisible to every sibling thread's own
-    /// resolution. So if one of those untraced sibling tests happens to
-    /// win the race to be the FIRST-EVER caller of the "Epoch complete"
-    /// callsite while only a THREAD-LOCAL subscriber (not a global one) is
-    /// installed anywhere, that sibling's own resolution falls through to
-    /// the (unset) global default and permanently caches `Interest::never`
-    /// for the callsite — silently starving THIS test's own later capture
-    /// even though its own thread-local scope is live and correctly
-    /// entered. Empirically reproduced while investigating this claim: a
-    /// `set_default`-based scoped rewrite of this very function passed
-    /// every time run ALONE or with `--test-threads=1`, but flaked with an
-    /// EMPTY `TRAIN_CAPTURE` when run in the crate's normal parallel mode
-    /// alongside `metrics_json_omits_val_loss_curve_when_only_train_loss_
-    /// is_monitored` (another test in this module that also drives
+    /// WITHOUT installing any subscriber of their own. Empirically
+    /// reproduced while investigating this: a `set_default`-based scoped
+    /// rewrite of this very function passed every time run ALONE or with
+    /// `--test-threads=1`, but flaked with an EMPTY `TRAIN_CAPTURE` when run
+    /// in the crate's normal parallel mode alongside
+    /// `metrics_json_omits_val_loss_curve_when_only_train_loss_is_
+    /// monitored` (another test in this module that also drives
     /// `run_text_loop`, uninstrumented). Installing the GLOBAL default —
-    /// which every thread's fallback resolution consults, including
-    /// threads that never call `set_default` themselves — closes that race
-    /// for every sibling thread, not just the one that happens to call
-    /// `install()`. The THREAD-LOCAL `TRAIN_CAPTURE`/`VAL_CAPTURE` buffers
-    /// above are what then keep concurrently-running tests from
-    /// corrupting each other's captured curve despite sharing this one
-    /// global subscriber.
+    /// which `tracing_core::dispatcher::get_default`'s fallback path
+    /// consults for every thread that never calls `set_default`/
+    /// `with_default` itself — fixes the flake.
+    ///
+    /// A prior version of this doc went further and named the specific
+    /// mechanism: a per-callsite `Interest` cache populated once via a
+    /// registration CAS `Once` and never re-evaluated per event. That
+    /// mechanism claim is NOT established here and directly conflicts with
+    /// the paragraph above it — `tracing-core` rebuilds interest via
+    /// `rebuild_interest_cache()` on every new dispatcher registration,
+    /// scoped guards included, so "cached permanently" cannot be the whole
+    /// story. What IS established, by direct reproduction rather than
+    /// by reading `tracing-core`'s source, is only the empirical fact:
+    /// with only a thread-local subscriber installed anywhere in the
+    /// process, this test flakes under the crate's parallel test mode, and
+    /// installing the GLOBAL default fixes it. The precise interest-cache
+    /// interleaving responsible for the flake was not isolated. The
+    /// THREAD-LOCAL `TRAIN_CAPTURE`/`VAL_CAPTURE` buffers above are what
+    /// then keep concurrently-running tests from corrupting each other's
+    /// captured curve despite sharing this one global subscriber.
     fn install() {
         static INSTALLED: OnceLock<()> = OnceLock::new();
         INSTALLED.get_or_init(|| {

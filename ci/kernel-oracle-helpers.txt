@@ -20,13 +20,11 @@
 # than one fn with that name (ambiguous — this scanner does not track
 # `mod` boundaries). A line that fails is a registry FAIL naming the
 # file:line and why. An exact duplicate `<file>::<fn_name>` line fails too.
-#
 # Adding a line here is a reviewed PR diff, same discipline as a citation
 # or a `no-producer:` opt-out — the registry may only grow by entries the
 # shape-check accepts. A file that wants to call a SHARED helper it does
 # not itself define registers its own thin local wrapper of the same
 # canonical shape (gating is never cross-file by name alone).
-#
 # Known, deliberate, fail-CLOSED limitation (round-5 audit A2): gating
 # looks for a literal, BARE call to the registered NAME — `let g =
 # cuda_device; g();` (a same-file ALIAS binding, then calling the alias)
@@ -35,7 +33,6 @@
 # never as a false green), so it is a documented limitation, not a bug to
 # route around — the remedy is to call the registered name directly
 # (`cuda_device()`), never assign it to a local first.
-#
 # Format: one `<file-relative-to-repo-root>::<fn_name>` per line.
 
 crates/jammi-kernels/tests/cuda_parity.rs::cuda_device
@@ -50,3 +47,5 @@ crates/jammi-ai/tests/metal_quantized_gpu.rs::gpu_available
 crates/jammi-encoders/tests/it/batch_composition_invariance.rs::cuda_device_or_skip
 crates/jammi-encoders/tests/it/batch_composition_invariance.rs::sm89_window_control_exclusion_require_gate
 crates/jammi-lora/tests/esc046_epilogue_biting_oracle.rs::cuda_device
+crates/jammi-server/tests/it/grpc_embedding_gpu.rs::start_gpu_embedding_server
+crates/jammi-server/tests/it/grpc_remote_session_gpu.rs::start_gpu_engine_server

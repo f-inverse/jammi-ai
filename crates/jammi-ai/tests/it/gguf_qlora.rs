@@ -22,7 +22,7 @@ use candle_nn::{Linear, VarBuilder, VarMap};
 use jammi_ai::model::backend::candle::CandleBackend;
 use jammi_ai::model::backend::{DeviceConfig, ModelBackend};
 use jammi_ai::model::resolver::ModelResolver;
-use jammi_ai::model::{BackendType, LoadedModel, ModelSource, ModelTask};
+use jammi_ai::model::{BackendType, LoadedModel, ModelSource, ModelTask, WeightsFormat};
 use jammi_db::catalog::Catalog;
 use jammi_db::error::JammiError;
 use jammi_db::store::manifest::{
@@ -836,6 +836,47 @@ async fn other_gguf_filename_without_the_canonical_name_is_a_typed_refusal() {
         "expected a typed refusal naming 'weights.gguf' and the 'model.gguf' \
          convention, got: {msg}"
     );
+}
+
+/// Dual-format precedence pin (oracle advisory (b), issue #351 wave 12): a
+/// LOCAL directory carrying BOTH `model.safetensors` and `model.gguf`
+/// resolves to `WeightsFormat::Safetensors`, with the `model.gguf` sibling
+/// wholly ignored (never consulted, never even opened) — the frozen
+/// precedence `resolve_local` has always applied, now pinned so a future
+/// refactor of the local path can't accidentally acquire the Hub-path
+/// defect (a fallback keyed off download/read FAILURE rather than
+/// presence).
+#[tokio::test]
+async fn local_dir_with_both_safetensors_and_gguf_resolves_to_safetensors_and_ignores_gguf() {
+    let device = Device::Cpu;
+    let (tensors, config, sites) = small_fixture(&device);
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path().join("model");
+    write_json(&dir, "config.json", &config);
+    write_tokenizer(&dir);
+    write_f32_checkpoint(&dir, &tensors);
+    write_gguf_checkpoint(&dir, &tensors, &sites, GgmlDType::Q4_0);
+
+    let resolved = try_resolve(&dir, None).await.unwrap();
+    assert_eq!(
+        resolved.weights_format,
+        WeightsFormat::Safetensors,
+        "a directory carrying both formats must resolve to safetensors, \
+         with model.gguf ignored"
+    );
+    assert_eq!(
+        resolved.weights_paths,
+        vec![dir.join("model.safetensors")],
+        "the resolved weights path must be model.safetensors, not model.gguf"
+    );
+
+    // Corrupt the (ignored) GGUF sibling; the resolve above and a full
+    // load-and-embed below must both stay entirely unaffected, proving
+    // model.gguf was never read at all, not merely "read but discarded".
+    std::fs::write(dir.join("model.gguf"), b"not a real gguf file").unwrap();
+    let backend = CandleBackend;
+    let loaded = backend.load(&resolved, &device_config()).unwrap();
+    let _ = embed(&loaded, "dual-format precedence");
 }
 
 /// `model.gguf` present, `config.json` absent: config.json stays REQUIRED

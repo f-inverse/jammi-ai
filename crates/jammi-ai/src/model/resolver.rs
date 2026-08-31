@@ -404,23 +404,48 @@ impl ModelResolver {
         let backend = backend_hint.unwrap_or_else(|| self.select_backend_hf(&repo));
 
         // Precedence FROZEN (issue #351): safetensors wins, byte-for-byte,
-        // exactly as before this feature existed. Only when the safetensors
-        // download fails entirely does a `model.gguf` sibling (or the typed
-        // "found *.gguf siblings but not model.gguf" refusal) enter the
-        // picture.
+        // exactly as before this feature existed. The choice between
+        // safetensors/gguf/refusal is made from a repo LISTING
+        // (`decide_hub_weights_format` over `repo.info()`'s siblings), never
+        // from a download outcome — a transient download failure on a repo
+        // that lists BOTH formats must propagate as the failure it is, not
+        // silently substitute the other weight format (issue #351 wave 12;
+        // this is the confident-wrong-number class this unit exists to make
+        // fail-loud). `repo.info()` failing outright is itself a typed
+        // error: never guess a format without a listing.
         let (weights_paths, weights_format) = match backend {
-            BackendType::Candle => match self.download_safetensors(&repo, source) {
-                Ok(paths) => (paths, WeightsFormat::Safetensors),
-                Err(safetensors_err) => match repo.get(GGUF_WEIGHTS_FILENAME) {
-                    Ok(p) => (vec![p], WeightsFormat::Gguf),
-                    Err(_) => {
-                        if let Some(other) = self.other_gguf_sibling_refusal(&repo, source) {
-                            return Err(other);
-                        }
-                        return Err(safetensors_err);
+            BackendType::Candle => {
+                let info = repo.info().map_err(|e| JammiError::Model {
+                    model_id: source.to_string(),
+                    message: format!("Failed to list repo files: {e}"),
+                })?;
+                let sibling_names: Vec<String> =
+                    info.siblings.into_iter().map(|s| s.rfilename).collect();
+                match decide_hub_weights_format(&sibling_names, GGUF_WEIGHTS_FILENAME) {
+                    HubWeightsDecision::Safetensors => (
+                        self.download_safetensors(&repo, source)?,
+                        WeightsFormat::Safetensors,
+                    ),
+                    HubWeightsDecision::Gguf => {
+                        let p = repo
+                            .get(GGUF_WEIGHTS_FILENAME)
+                            .map_err(|e| JammiError::Model {
+                                model_id: source.to_string(),
+                                message: format!("Failed to download {GGUF_WEIGHTS_FILENAME}: {e}"),
+                            })?;
+                        (vec![p], WeightsFormat::Gguf)
                     }
-                },
-            },
+                    HubWeightsDecision::NonCanonicalGguf(others) => {
+                        return Err(gguf_rename_refusal(source, others));
+                    }
+                    HubWeightsDecision::Neither => {
+                        return Err(JammiError::Model {
+                            model_id: source.to_string(),
+                            message: "No safetensors weights found".into(),
+                        });
+                    }
+                }
+            }
             BackendType::Ort => (self.download_onnx(&repo, source)?, WeightsFormat::Onnx),
             other => {
                 return Err(JammiError::Model {
@@ -467,39 +492,6 @@ impl ModelResolver {
             base_model_id: None,
             adapter_path: None,
             estimated_memory,
-        })
-    }
-
-    /// `Some(typed error)` when `repo` lists at least one `*.gguf` sibling
-    /// OTHER than the canonical `GGUF_WEIGHTS_FILENAME` — names every such
-    /// file and points at the convention, mirroring `other_gguf_refusal`'s
-    /// local-directory counterpart. `None` when the repo listing itself is
-    /// unavailable (best-effort — the caller falls back to the original
-    /// safetensors-download error) or lists no `*.gguf` sibling at all.
-    fn other_gguf_sibling_refusal(
-        &self,
-        repo: &hf_hub::api::sync::ApiRepo,
-        source: &ModelSource,
-    ) -> Option<JammiError> {
-        let info = repo.info().ok()?;
-        let mut others: Vec<String> = info
-            .siblings
-            .iter()
-            .map(|s| s.rfilename.clone())
-            .filter(|name| name.ends_with(".gguf") && name != GGUF_WEIGHTS_FILENAME)
-            .collect();
-        if others.is_empty() {
-            return None;
-        }
-        others.sort();
-        Some(JammiError::Model {
-            model_id: source.to_string(),
-            message: format!(
-                "Found GGUF file(s) {} but no '{GGUF_WEIGHTS_FILENAME}' — the canonical \
-                 quantized-weights filename (mirrors model.safetensors/model.onnx); rename to \
-                 '{GGUF_WEIGHTS_FILENAME}' to load it",
-                others.join(", ")
-            ),
         })
     }
 
@@ -571,7 +563,65 @@ fn other_gguf_refusal(source: &ModelSource, dir: &Path) -> Option<JammiError> {
         return None;
     }
     others.sort();
-    Some(JammiError::Model {
+    Some(gguf_rename_refusal(source, others))
+}
+
+/// The outcome of [`decide_hub_weights_format`]: which weight format a Hub
+/// repo's file LISTING selects, decided once and up front — never inferred
+/// from a download outcome (issue #351 wave 12). This is the mechanism that
+/// keeps a transient download failure on a repo carrying BOTH formats from
+/// silently switching the served weight format: the format is fixed by the
+/// listing before any `repo.get(..)` is attempted, so a download failure in
+/// either the `Safetensors` or `Gguf` arm propagates as the failure it is.
+#[derive(Debug, PartialEq, Eq)]
+enum HubWeightsDecision {
+    /// At least one `*.safetensors` sibling is listed — safetensors wins,
+    /// byte-for-byte, exactly as the local-directory precedence (frozen
+    /// since before issue #351).
+    Safetensors,
+    /// No safetensors sibling listed, but the canonical GGUF filename is.
+    Gguf,
+    /// Neither safetensors nor the canonical GGUF filename listed, but at
+    /// least one OTHER `*.gguf` sibling is — the typed "rename to the
+    /// canonical name" refusal, naming every such file (sorted).
+    NonCanonicalGguf(Vec<String>),
+    /// No safetensors sibling and no `*.gguf` sibling of any name.
+    Neither,
+}
+
+/// Decide the Hub-path weight format from a repo's sibling filename LISTING
+/// alone — a pure function over names, deliberately independent of
+/// `hf_hub`/network types so it is unit-testable without a live repo (issue
+/// #351 wave 12). `canonical_gguf` is `GGUF_WEIGHTS_FILENAME` in production;
+/// parameterized here only so tests can assert the exact constant is what
+/// production passes.
+fn decide_hub_weights_format(siblings: &[String], canonical_gguf: &str) -> HubWeightsDecision {
+    if siblings.iter().any(|name| name.ends_with(".safetensors")) {
+        return HubWeightsDecision::Safetensors;
+    }
+    if siblings.iter().any(|name| name == canonical_gguf) {
+        return HubWeightsDecision::Gguf;
+    }
+    let mut others: Vec<String> = siblings
+        .iter()
+        .filter(|name| name.ends_with(".gguf"))
+        .cloned()
+        .collect();
+    if others.is_empty() {
+        return HubWeightsDecision::Neither;
+    }
+    others.sort();
+    HubWeightsDecision::NonCanonicalGguf(others)
+}
+
+/// The typed "found GGUF file(s) but not the canonical name" refusal, shared
+/// verbatim between the local-directory (`other_gguf_refusal`) and Hub
+/// (`decide_hub_weights_format`'s `NonCanonicalGguf` arm) paths. `others`
+/// need not be pre-sorted; this sorts for deterministic message text
+/// (family J).
+fn gguf_rename_refusal(source: &ModelSource, mut others: Vec<String>) -> JammiError {
+    others.sort();
+    JammiError::Model {
         model_id: source.to_string(),
         message: format!(
             "Found GGUF file(s) {} but no '{GGUF_WEIGHTS_FILENAME}' — the canonical \
@@ -579,7 +629,7 @@ fn other_gguf_refusal(source: &ModelSource, dir: &Path) -> Option<JammiError> {
              '{GGUF_WEIGHTS_FILENAME}' to load it",
             others.join(", ")
         ),
-    })
+    }
 }
 
 /// Read and parse `preprocessor_config.json` from a local model directory,
@@ -633,4 +683,77 @@ fn discover_local_tokenizer(dir: &Path) -> Option<TokenizerSource> {
         return Some(TokenizerSource::OpenClipBpe(bpe));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Arm 1: a repo listing carrying BOTH `model.safetensors` and
+    /// `model.gguf` decides `Safetensors` — the frozen precedence, decided
+    /// from the LISTING alone, never from a download attempt (issue #351
+    /// wave 12's defect: this is the exact shape a failed-download fallback
+    /// would get wrong).
+    #[test]
+    fn decide_hub_weights_format_prefers_safetensors_when_both_are_listed() {
+        let siblings = names(&["config.json", "model.safetensors", "model.gguf"]);
+        assert_eq!(
+            decide_hub_weights_format(&siblings, GGUF_WEIGHTS_FILENAME),
+            HubWeightsDecision::Safetensors
+        );
+    }
+
+    /// Arm 2: no safetensors sibling, canonical `model.gguf` listed.
+    #[test]
+    fn decide_hub_weights_format_selects_gguf_when_only_gguf_is_listed() {
+        let siblings = names(&["config.json", "model.gguf", "tokenizer.json"]);
+        assert_eq!(
+            decide_hub_weights_format(&siblings, GGUF_WEIGHTS_FILENAME),
+            HubWeightsDecision::Gguf
+        );
+    }
+
+    /// Arm 3: no safetensors, no canonical `model.gguf`, but a
+    /// differently-named `*.gguf` sibling — the typed rename refusal,
+    /// naming every non-canonical file found (sorted).
+    #[test]
+    fn decide_hub_weights_format_refuses_non_canonical_gguf_filenames() {
+        let siblings = names(&["config.json", "weights.q4.gguf", "other.gguf"]);
+        assert_eq!(
+            decide_hub_weights_format(&siblings, GGUF_WEIGHTS_FILENAME),
+            HubWeightsDecision::NonCanonicalGguf(vec![
+                "other.gguf".to_string(),
+                "weights.q4.gguf".to_string(),
+            ])
+        );
+    }
+
+    /// Arm 4: no safetensors and no `*.gguf` sibling of any name at all.
+    #[test]
+    fn decide_hub_weights_format_is_neither_when_no_weights_are_listed() {
+        let siblings = names(&["config.json", "tokenizer.json"]);
+        assert_eq!(
+            decide_hub_weights_format(&siblings, GGUF_WEIGHTS_FILENAME),
+            HubWeightsDecision::Neither
+        );
+    }
+
+    /// The defect this unit fixes, pinned directly at the decision level: a
+    /// repo listing carrying both formats never depends on which download
+    /// happens to succeed — `decide_hub_weights_format` is a pure function
+    /// of the listing, so calling it twice for the same listing (standing
+    /// in for "network attempt #1 failed transiently, #2 would have
+    /// succeeded") always returns the same, safetensors-preferring answer.
+    #[test]
+    fn decide_hub_weights_format_is_deterministic_over_a_dual_format_listing() {
+        let siblings = names(&["model.safetensors", "model.gguf"]);
+        let first = decide_hub_weights_format(&siblings, GGUF_WEIGHTS_FILENAME);
+        let second = decide_hub_weights_format(&siblings, GGUF_WEIGHTS_FILENAME);
+        assert_eq!(first, HubWeightsDecision::Safetensors);
+        assert_eq!(second, HubWeightsDecision::Safetensors);
+    }
 }

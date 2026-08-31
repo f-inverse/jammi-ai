@@ -480,6 +480,36 @@ mod tests {
         crate::ops::apply1(x, op)
     }
 
+    /// Acquire a Metal device for one of this module's in-file Metal-parity
+    /// tests, or `None` to skip — unless `JAMMI_REQUIRE_METAL` is set, in
+    /// which case a missing device PANICS. Mirrors `tests/metal_parity.rs`'s
+    /// `metal_device_or_skip` (wave A's require/skip lattice shape), shared
+    /// here between both of this file's own Metal legs so the same shape is
+    /// written once, not duplicated per call site. `caller` names the test
+    /// in the panic/skip message. This fn's own callers sit in `src/`,
+    /// outside `check_kernel_oracles.py`'s KO-7 scan roots (`tests/**` in
+    /// this crate, `jammi-encoders/src/**` — issue #437 tracks widening
+    /// KO-7 to `jammi-kernels/src/**` too), so this gate is
+    /// voluntary-but-real rather than CI-enforced.
+    fn metal_device_or_skip(caller: &str) -> Option<Device> {
+        match Device::new_metal(0) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                if std::env::var_os("JAMMI_REQUIRE_METAL").is_some() {
+                    panic!(
+                        "{caller}: JAMMI_REQUIRE_METAL is set but no Metal device is \
+                         available: {e}"
+                    );
+                }
+                eprintln!(
+                    "{caller}: no Metal device available in this build/host -- skipping \
+                     the Metal leg"
+                );
+                None
+            }
+        }
+    }
+
     /// `PhiloxKatProbe` through the CPU arm of the SAME `apply1` dispatch
     /// path the CUDA parity suite uses — a sanity check that the op
     /// wrapper itself (shape/dtype plumbing) doesn't perturb the raw
@@ -701,17 +731,15 @@ mod tests {
         );
 
         // Metal: same equality oracle, run on a real Metal device when one
-        // is available on this host/build -- `Device::new_metal(0)`
-        // erroring is an honest, documented skip (mirrors
-        // `metal_matches_cpu_mask_for_identical_seed_key_position` above),
-        // not the enforced proof itself (`tests/metal_parity.rs` carries
-        // the `required-features = ["metal"]` gate for that).
-        let Ok(metal_device) = Device::new_metal(0) else {
-            eprintln!(
-                "philox_exact_drop_count_matches_an_independent_replay: \
-                 no Metal device available in this build/host -- skipping \
-                 the Metal leg (CPU leg above already ran and passed)"
-            );
+        // is available on this host/build -- an honest, documented skip via
+        // `metal_device_or_skip` (mirrors
+        // `metal_matches_cpu_mask_for_identical_seed_key_position` below),
+        // loud (not silent) under `JAMMI_REQUIRE_METAL`; not the enforced
+        // proof itself (`tests/metal_parity.rs` carries the
+        // `required-features = ["metal"]` gate for that).
+        let Some(metal_device) =
+            metal_device_or_skip("philox_exact_drop_count_matches_an_independent_replay")
+        else {
             return;
         };
         let x_metal = Tensor::from_slice(&v, (n,), &metal_device).unwrap();
@@ -838,10 +866,11 @@ mod tests {
     /// must produce mask bytes byte-identical to `cpu_fwd`'s for the same
     /// `(seed, layer_id, forward_idx)` — the concrete, observable form of
     /// "the mask stream is a pure function of position" once a real
-    /// physical device is involved. `Device::new_metal(0)` erroring is a
-    /// documented, honest skip (the dummy Metal backend structurally
-    /// cannot construct a Metal tensor at all, so this build has nothing
-    /// to prove) — NOT the enforced proof itself: `tests/metal_parity.rs`
+    /// physical device is involved. `metal_device_or_skip` erroring is a
+    /// documented, honest — but loud under `JAMMI_REQUIRE_METAL` — skip
+    /// (the dummy Metal backend structurally cannot construct a Metal
+    /// tensor at all, so this build has nothing to prove) — NOT the
+    /// enforced proof itself: `tests/metal_parity.rs`
     /// (this crate's `[[test]] required-features = ["metal"]`, mirroring
     /// `cuda_parity.rs`) is what makes the assertion non-skippable in a
     /// Metal-capable build; this in-file copy exists so the same assertion
@@ -849,13 +878,9 @@ mod tests {
     /// metal` without needing the separate binary.
     #[test]
     fn metal_matches_cpu_mask_for_identical_seed_key_position() {
-        let Ok(metal_device) = Device::new_metal(0) else {
-            eprintln!(
-                "metal_matches_cpu_mask_for_identical_seed_key_position: \
-                 no Metal device available in this build/host — skipping \
-                 (see tests/metal_parity.rs for the enforced, \
-                 required-features-gated proof)"
-            );
+        let Some(metal_device) =
+            metal_device_or_skip("metal_matches_cpu_mask_for_identical_seed_key_position")
+        else {
             return;
         };
         let cpu_device = Device::Cpu;

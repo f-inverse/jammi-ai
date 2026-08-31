@@ -1648,8 +1648,24 @@ mod tests {
             // itself is still exercised below via `Device::Cpu`; the
             // `metal`-specific half of this assertion is covered instead
             // by `ops::dropout`'s own Metal-gated tests, which already
-            // skip identically when no device is present.
-            Err(_) => return,
+            // skip identically when no device is present. Honest but LOUD:
+            // `JAMMI_REQUIRE_METAL` upgrades this from a silent skip to a
+            // hard failure, the same require/skip lattice shape
+            // `tests/metal_parity.rs`'s `metal_device_or_skip` (wave A)
+            // uses. This fn's own runtime skip sits in `src/`, outside
+            // `check_kernel_oracles.py`'s KO-7 scan roots (which cover only
+            // `tests/**` in this crate and `jammi-encoders/src/**` — issue
+            // #437 tracks widening KO-7 to `jammi-kernels/src/**` too), so
+            // this gate is voluntary-but-real rather than CI-enforced.
+            Err(e) => {
+                if std::env::var_os("JAMMI_REQUIRE_METAL").is_some() {
+                    panic!(
+                        "device_is_supported_rejects_metal: JAMMI_REQUIRE_METAL is set but no \
+                         Metal device is available: {e}"
+                    );
+                }
+                return;
+            }
         };
         #[cfg(not(feature = "metal"))]
         let metal = Device::Metal(candle_core::MetalDevice);

@@ -529,12 +529,18 @@ pub(crate) fn materialize_contiguous_if_needed<S: BackendStorage>(
 }
 
 /// Converts [`crate::admission::admit`]'s own error type (`KernelError`,
-/// NOT bound to `candle_core::Result` — see `crate::error`'s module doc for
-/// why this crate deliberately has no blanket `From<KernelError> for
-/// candle_core::Error` impl) to `candle_core::Error` at the one boundary
-/// `bwd` crosses it: `CustomOp3::bwd`'s signature is fixed by candle-core
-/// to `candle_core::Result`, so `admit(..)?` inside it needs an explicit
-/// conversion. `predicate_holds` is always `true` at both of this file's
+/// NOT bound to `candle_core::Result`) to `candle_core::Error` at the one
+/// boundary `bwd` crosses it: `CustomOp3::bwd`'s signature is fixed by
+/// candle-core to `candle_core::Result`, so `admit(..)?` inside it needs an
+/// explicit conversion. The conversion itself is the crate-wide
+/// [`impl From<KernelError> for candle_core::Error`](crate::error) — the
+/// SAME downcastable `Error::Cuda(Box::new(..))` channel
+/// `crate::quantized_cuda_canary::ensure_quantized_cuda_admitted` uses for
+/// its own production call site (see that fn's own doc), rather than a
+/// second, ad-hoc `Error::Msg(e.to_string())` that would flatten a typed
+/// `KernelError::StrictModeFallback` refusal to an untyped string a STRICT-
+/// mode caller could only match by text. `predicate_holds` is always `true`
+/// at both of this file's
 /// two call sites (Wave 1 (e)/(f) — see `bwd`'s own comments): the fused
 /// kernel is structurally applicable for every `BF16` case `bwd` reaches
 /// it from (this op's own domain already restricts `x`'s dtype to `F32`/
@@ -577,7 +583,7 @@ fn admit_cast_boundary(
         true,
         crate::admission::counters_for(op),
     )
-    .map_err(|e| Error::Msg(e.to_string()))
+    .map_err(Error::from)
 }
 
 impl super::sealed::Sealed for LowRankResidualLinear {}

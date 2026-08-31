@@ -56,3 +56,30 @@ pub enum KernelError {
 
 /// Crate-local `Result` alias for the admission scaffolding.
 pub type Result<T> = std::result::Result<T, KernelError>;
+
+/// The ONE conversion from this crate's own [`KernelError`] to
+/// `candle_core::Error`, for the handful of call sites that must cross that
+/// boundary (a `CustomOp` trait method fixed to `candle_core::Result`, or a
+/// `pub fn` whose own signature is `candle_core::Result` for symmetry with
+/// the rest of this crate's public surface — `crate::quantized_cuda_canary`'s
+/// `ensure_quantized_cuda_admitted` and
+/// `ops::low_rank_residual_linear::admit_cast_boundary`'s `bwd` call sites,
+/// as of this writing).
+///
+/// Wraps via `Error::Cuda(Box::new(err))` — NOT `Error::Msg(err.to_string())`
+/// — deliberately: `Error::Cuda`'s payload is `Box<dyn std::error::Error +
+/// Send + Sync>`, so a caller downstream can
+/// `std::error::Error::downcast_ref::<KernelError>()` back to the ORIGINAL
+/// typed value (e.g. distinguishing [`KernelError::QuantizedCudaCanaryFailed`]
+/// from [`KernelError::StrictModeFallback`] programmatically) rather than
+/// being reduced to a `String` only a caller could pattern-match by text.
+/// The variant name `Cuda` is candle-core's own naming for "an opaque
+/// downstream error boxed through," not a claim that `err` is CUDA-specific
+/// — `KernelError::InvalidScale`, raised on every device, would flow through
+/// the identical channel. See `quantized_cuda_canary::tests` for the
+/// round-trip proof (construct a `KernelError`, convert, downcast back).
+impl From<KernelError> for candle_core::Error {
+    fn from(err: KernelError) -> Self {
+        candle_core::Error::Cuda(Box::new(err))
+    }
+}

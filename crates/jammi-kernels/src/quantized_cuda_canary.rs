@@ -409,15 +409,19 @@ fn canary_max_abs_diff(device: &Device) -> candle_core::Result<f32> {
 /// reach a caller here, and only one of them is this module's own typed
 /// refusal. A [`KernelError::QuantizedCudaCanaryFailed`] (both the fast
 /// kernels AND the DMMV fallback disagreed with the known answer) is
-/// preserved, TYPED, through `candle_core::Error::Cuda`'s own
-/// `Box<dyn std::error::Error + Send + Sync>` payload — `Error::Cuda`
-/// downcasts (`std::error::Error::downcast_ref`) back to `KernelError` at
-/// any downstream call site that wants to match it specifically, rather
-/// than collapsing to an untyped `Error::Msg(e.to_string())` a caller can
-/// only pattern-match by string. An infra error from `canary_verdict`
-/// (device OOM, allocation failure, a transient driver error — see
-/// `canary_case_outcome`'s own doc) propagates completely unchanged: it
-/// is not this guard's own refusal at all, so it is never re-wrapped.
+/// preserved, TYPED, through the crate-wide
+/// [`impl From<KernelError> for candle_core::Error`](crate::error) (wrapping
+/// via `Error::Cuda`'s own `Box<dyn std::error::Error + Send + Sync>`
+/// payload) — `Error::Cuda` downcasts (`std::error::Error::downcast_ref`)
+/// back to `KernelError` at any downstream call site that wants to match it
+/// specifically, rather than collapsing to an untyped
+/// `Error::Msg(e.to_string())` a caller can only pattern-match by string.
+/// `ops::low_rank_residual_linear::admit_cast_boundary` is this crate's
+/// OTHER production call site for the same conversion — see that fn's own
+/// doc. An infra error from `canary_verdict` (device OOM, allocation
+/// failure, a transient driver error — see `canary_case_outcome`'s own doc)
+/// propagates completely unchanged: it is not this guard's own refusal at
+/// all, so it is never re-wrapped.
 pub fn ensure_quantized_cuda_admitted(device: &Device) -> candle_core::Result<()> {
     #[cfg(feature = "cuda")]
     {
@@ -425,7 +429,7 @@ pub fn ensure_quantized_cuda_admitted(device: &Device) -> candle_core::Result<()
             return Ok(());
         }
         let verdict = canary_verdict(device)?;
-        decide(verdict).map_err(|e| candle_core::Error::Cuda(Box::new(e)))
+        decide(verdict).map_err(candle_core::Error::from)
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -435,7 +439,7 @@ pub fn ensure_quantized_cuda_admitted(device: &Device) -> candle_core::Result<()
         // bare `Ok(())`) so `decide`/`CanaryVerdict` stay live code in
         // EVERY feature configuration, not merely under `cuda` + `test`.
         let _ = device;
-        decide(CanaryVerdict::FastKernelsTrusted).map_err(|e| candle_core::Error::Cuda(Box::new(e)))
+        decide(CanaryVerdict::FastKernelsTrusted).map_err(candle_core::Error::from)
     }
 }
 
@@ -487,6 +491,53 @@ mod tests {
     fn decide_refuses_when_both_paths_fail() {
         let err = decide(CanaryVerdict::Refused).unwrap_err();
         assert!(matches!(err, KernelError::QuantizedCudaCanaryFailed));
+    }
+
+    /// The missing downcast oracle (audit advisory 4): `decide`'s typed
+    /// `KernelError`, wrapped through
+    /// [`impl From<KernelError> for candle_core::Error`](crate::error) —
+    /// the SAME conversion `ensure_quantized_cuda_admitted` and
+    /// `ops::low_rank_residual_linear::admit_cast_boundary` both apply at
+    /// their own production call sites — downcasts (`std::error::Error::
+    /// downcast_ref`) back to the ORIGINAL `KernelError` value on the other
+    /// side of `candle_core::Error::Cuda`'s `Box<dyn std::error::Error +
+    /// Send + Sync>` payload. Proven for BOTH `KernelError` variants that
+    /// production code actually constructs through this channel:
+    /// `QuantizedCudaCanaryFailed` (this module's own refusal, produced by
+    /// `decide`) and `StrictModeFallback` (`crate::admission`'s typed
+    /// refusal STRICT-mode callers exist to match) — a single test with two
+    /// independent round-trips, not two near-duplicate tests, since both
+    /// assert the identical mechanism against different `KernelError`
+    /// payloads.
+    #[test]
+    fn typed_kernel_error_round_trips_through_the_from_impl_via_downcast() {
+        let wrapped: candle_core::Error = decide(CanaryVerdict::Refused).unwrap_err().into();
+        let candle_core::Error::Cuda(boxed) = &wrapped else {
+            panic!("expected From<KernelError> to wrap via Error::Cuda, got {wrapped:?}");
+        };
+        let downcast = boxed
+            .downcast_ref::<KernelError>()
+            .expect("Error::Cuda's boxed payload must downcast back to KernelError");
+        assert!(matches!(downcast, KernelError::QuantizedCudaCanaryFailed));
+
+        let strict_fallback = KernelError::StrictModeFallback {
+            op: "low_rank_residual_linear",
+            predicate: "grad_res_is_bf16_a_fusable_two_kernel_chain",
+        };
+        let wrapped_strict: candle_core::Error = strict_fallback.into();
+        let candle_core::Error::Cuda(boxed_strict) = &wrapped_strict else {
+            panic!("expected From<KernelError> to wrap via Error::Cuda, got {wrapped_strict:?}");
+        };
+        let downcast_strict = boxed_strict
+            .downcast_ref::<KernelError>()
+            .expect("Error::Cuda's boxed payload must downcast back to KernelError");
+        assert!(matches!(
+            downcast_strict,
+            KernelError::StrictModeFallback {
+                op: "low_rank_residual_linear",
+                predicate: "grad_res_is_bf16_a_fusable_two_kernel_chain",
+            }
+        ));
     }
 
     /// [`canary_diff_passes`] admits the fixture's own analytic

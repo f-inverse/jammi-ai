@@ -46,3 +46,4 @@ crates/jammi-kernels/tests/metal_parity.rs::metal_device_or_skip
 crates/jammi-encoders/src/modernbert.rs::growth_oracle_cuda_device
 crates/jammi-encoders/src/modernbert.rs::flash_oracle_require_gate
 crates/jammi-encoders/src/modernbert.rs::flash_compiled_or_skip
+crates/jammi-ai/tests/metal_quantized_gpu.rs::gpu_available

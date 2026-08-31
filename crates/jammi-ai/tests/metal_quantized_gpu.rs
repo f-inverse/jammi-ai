@@ -173,17 +173,16 @@ fn metal_probe_ok() -> bool {
 /// metal_device_or_skip` and `ci/kernel-oracle-helpers.txt`'s other KO-7
 /// registry entries carry, for the identical reason: without this
 /// distinction a broken/missing device on a runner that is SUPPOSED to have
-/// one would silently read as skipped tests, not failed ones. This fn is
-/// deliberately NOT registered in `ci/kernel-oracle-helpers.txt` —
-/// `check_kernel_oracles.py`'s own module doc scopes its KO-7 scan roots to
-/// `crates/jammi-kernels/tests/**/*.rs` and `crates/jammi-encoders/
-/// src/**/*.rs` only (`scan_files`), so `crates/jammi-ai/tests/*.rs` is
-/// structurally outside that gate's `source_texts` — `verify_helper_
-/// registry` fails any entry whose file it cannot resolve among the scanned
-/// set, so registering this fn there would be a guaranteed, self-inflicted
-/// registry FAIL, not a no-op. The mechanism is implemented here anyway
-/// (matching the canonical shape byte-for-byte) so the BEHAVIOR is honest
-/// regardless of whether today's static verifier can see it.
+/// one would silently read as skipped tests, not failed ones. This fn IS
+/// registered in `ci/kernel-oracle-helpers.txt` — `check_kernel_oracles.py`'s
+/// KO-7 scan roots cover every crate's own `tests/`/`src/` directory
+/// (`scan_roots`/`scan_files`), which includes this file, so `verify_helper_
+/// registry` resolves and shape-checks this entry the same as any other.
+/// The mechanism was implemented here matching the canonical shape
+/// byte-for-byte even before the scan widened to reach this file, so the
+/// BEHAVIOR was always honest regardless of whether the static verifier
+/// could see it — registering it here only makes that already-true fact
+/// mechanically checked too.
 fn gpu_available() -> bool {
     if metal_probe_ok() {
         return true;

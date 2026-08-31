@@ -1977,10 +1977,11 @@ class TestRegistryFailureLineNumbersAndDuplicates(unittest.TestCase):
 
 
 class TestRecursiveScanRoots(unittest.TestCase):
-    """Advisory: the two scan roots are walked RECURSIVELY (not widened —
+    """Advisory: every discovered scan root (`crates/*/tests`, `crates/*/src`)
+    is walked RECURSIVELY, not merely globbed one level deep —
     `crates/jammi-encoders/src/context/*.rs` is a real subdirectory of the
-    already-in-scope `crates/jammi-encoders/src/` that a flat glob
-    silently missed)."""
+    in-scope `crates/jammi-encoders/src/` root that a flat glob silently
+    missed)."""
 
     def test_context_subdirectory_is_scanned_on_the_real_tree(self) -> None:
         texts = ko.scan_files()

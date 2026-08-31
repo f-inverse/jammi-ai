@@ -1,0 +1,916 @@
+{
+ "schema_version": 1,
+ "git_sha": "7820d697e6180e9e220ef61444f70de8fdcc3ae3",
+ "box": "d4ba79dc6030",
+ "producer": {
+  "path": "ci/scripts/perf/profile_356_legs.sh",
+  "kind": "script",
+  "invocation": "ci/scripts/perf/profile_356_legs.sh (main pass, 12 legs) + PROFILE_356_LEGS_ONLY=bert-A3,bert-A4 fill pass",
+  "gating": "none"
+ },
+ "status": "GREEN",
+ "notes": {
+  "what": "GH #356 close-out profile: pre-registered 14-leg census of the fully-eager BERT/DistilBERT training step (contract v4, frozen before measurement; disposition tables in the session record). Decides the remaining #356 perf-port branches.",
+  "gpu": "NVIDIA A100-SXM4-80GB, driver 570.172.08, RunPod pod nic18dhe0qjlj8",
+  "nsys": "2025.3.2 (CUDA 12.6 build)",
+  "checkpoints": "bert-base-uncased (gamma/beta names converted via ci/scripts/perf/convert_legacy_bert_checkpoint.py \u2014 engine defect GH #423), distilbert-base-uncased stock",
+  "recorded_deviations": [
+   "bert-A3/bert-A4 collected in a fill pass on binary 1e883393 (main pass: 7820d697); git diff 7820d697..1e883393 -- crates/ Cargo.lock Cargo.toml is EMPTY, so the A3(fill)-vs-N3(main) differencing pair is arithmetically same-build",
+   "E1 legs run corpus-bounded step pairs (10/40) instead of the 100/600 pin (1372-pair fixture ceiling at epochs=1); E1 is excluded from chain attribution by contract",
+   "per-leg raw nsys exports were deleted on-pod after each census.json was produced (disk budget); census.json + manifest are the records"
+  ],
+  "verdicts": {
+   "C-LORA": {
+    "bert": {
+     "share_wall_pct": {
+      "wire_b8_W512_F32": 13.8,
+      "chapter_b32_W64_BF16": 41.6
+     },
+     "verdict": "ACTIVATE"
+    },
+    "distilbert": {
+     "share_wall_pct": {
+      "wire_b8_W512_F32": 14.1,
+      "chapter_b32_W64_BF16": 40.1
+     },
+     "verdict": "ACTIVATE"
+    },
+    "method": "one-live-site ablation differential x S/(S-1), S=72 (bert) / 36 (distilbert); estimator over-estimates by <= +0.47%/+0.95% (worst 1/(S-1)); counter equations exact on every leg (eager == site_count x batches; twins eager == 1 x batches)",
+    "activation_bar": "share_wall >= 10% on >= 1 covered decision-grade leg (2x the 5% wall acceptance bar at >= 0.5 fusion efficiency)"
+   },
+   "C-LN": "UNRESOLVED \u2014 interval analysis over collided buckets pending, offline over these censuses",
+   "C-ATTN": "UNRESOLVED \u2014 element-count signature analysis pending, offline",
+   "C-MLP": "UNRESOLVED \u2014 name/shape analysis pending, offline"
+  }
+ },
+ "legs": [
+  {
+   "leg_id": "bert-A1",
+   "status": "ok",
+   "model": "bert",
+   "dtype": "f32",
+   "width": 512,
+   "batch_pairs": null,
+   "steps_n": null,
+   "steps_m": null,
+   "wall_s_per_step": 0.970890403436,
+   "gpu_kernel_us_per_step": 886930.6278280003,
+   "launches_per_step": 5982.0,
+   "fixed_cost_buckets": 296,
+   "fixed_cost_time_us": 475.009,
+   "fixed_cost_jitter_max_rel": 0.03125,
+   "census_exit": 0,
+   "lora_counters_n_run": {
+    "lora_linear_eager_dispatches": 7200,
+    "lora_linear_fused_dispatches": 0,
+    "lora_epilogue_eager_dispatches": 0,
+    "lora_epilogue_fused_dispatches": 0
+   },
+   "lora_counters_m_run": {
+    "lora_linear_eager_dispatches": 43200,
+    "lora_linear_fused_dispatches": 0,
+    "lora_epilogue_eager_dispatches": 0,
+    "lora_epilogue_fused_dispatches": 0
+   },
+   "binary_git_sha": "7820d697e6180e9e220ef61444f70de8fdcc3ae3",
+   "top5_kernels": [
+    {
+     "kernel": "badd_f32",
+     "us_per_step": 281615.3255219999,
+     "launches_per_step": 2625.0,
+     "share": 0.3175167444737433
+    },
+    {
+     "kernel": "bmul_f32",
+     "us_per_step": 63416.79335000001,
+     "launches_per_step": 400.0,
+     "share": 0.0715014132563006
+    },
+    {
+     "kernel": "ampere_sgemm_128x32_tn",
+     "us_per_step": 55779.687242,
+     "launches_per_step": 120.0,
+     "share": 0.0628906991052937
+    },
+    {
+     "kernel": "ampere_sgemm_64x32_sliced1x4_nt",
+     "us_per_step": 54204.720774,
+     "launches_per_step": 57.0,
+     "share": 0.06111494977543131
+    },
+    {
+     "kernel": "fast_sum_f32",
+     "us_per_step": 52413.563068,
+     "launches_per_step": 294.0,
+     "share": 0.05909544830620552
+    }
+   ]
+  },
+  {
+   "leg_id": "bert-A2",
+   "status": "ok",
+   "model": "bert",
+   "dtype": "bf16",
+   "width": 512,
+   "batch_pairs": null,
+   "steps_n": null,
+   "steps_m": null,
+   "wall_s_per_step": 0.756495386918,
+   "gpu_kernel_us_per_step": 673545.3226219998,
+   "launches_per_step": 6875.0,
+   "fixed_cost_buckets": 397,
+   "fixed_cost_time_us": 451.869,
+   "fixed_cost_jitter_max_rel": 0.06363636363636363,
+   "census_exit": 0,
+   "lora_counters_n_run": {
+    "lora_linear_eager_dispatches": 7200,
+    "lora_linear_fused_dispatches": 0,
+    "lora_epilogue_eager_dispatches": 0,
+    "lora_epilogue_fused_dispatches": 0
+   },
+   "lora_counters_m_run": {
+    "lora_linear_eager_dispatches": 43200,
+    "lora_linear_fused_dispatches": 0,
+    "lora_epilogue_eager_dispatches": 0,
+    "lora_epilogue_fused_dispatches": 0
+   },
+   "binary_git_sha": "7820d697e6180e9e220ef61444f70de8fdcc3ae3",
+   "top5_kernels": [
+    {
+     "kernel": "badd_bf16",
+     "us_per_step": 199781.23789400002,
+     "launches_per_step": 1161.0,
+     "share": 0.2966114249242871
+    },
+    {
+     "kernel": "badd_f32",
+     "us_per_step": 102169.55164200002,
+     "launches_per_step": 1722.0,
+     "share": 0.15168920072708839
+    },
+    {
+     "kernel": "bdiv_bf16",
+     "us_per_step": 44955.190332,
+     "launches_per_step": 65.0,
+     "share": 0.06674412073265824
+    },
+    {
+     "kernel": "bmul_bf16",
+     "us_per_step": 38698.153834000004,
+     "launches_per_step": 86.0,
+     "share": 0.05745441699951911
+    },
+    {
+     "kernel": "fast_sum_bf16",
+     "us_per_step": 36041.28540599999,
+     "launches_per_step": 51.0,
+     "share": 0.053509814700660775
+    }
+   ]
+  },
+  {
+   "leg_id": "bert-A3",
+   "status": "ok",
+   "model": "bert",
+   "dtype": "bf16",
+   "width": 64,
+   "batch_pairs": null,
+   "steps_n": null,
+   "steps_m": null,
+   "wall_s_per_step": 0.27584214048800004,
+   "gpu_kernel_us_per_step": 209785.59086000005,
+   "launches_per_step": 6913.0,
+   "fixed_cost_buckets": 8,
+   "fixed_cost_time_us": 8.048,
+   "fixed_cost_jitter_max_rel": 0.007220216606498195,
+   "census_exit": 0,
+   "lora_counters_n_run": {
+    "lora_linear_eager_dispatches": 7200,
+    "lora_linear_fused_dispatches": 0,
+    "lora_epilogue_eager_dispatches": 0,
+    "lora_epilogue_fused_dispatches": 0
+   },
+   "lora_counters_m_run": {
+    "lora_linear_eager_dispatches": 43200,
+    "lora_linear_fused_dispatches": 0,
+    "lora_epilogue_eager_dispatches": 0,
+    "lora_epilogue_fused_dispatches": 0
+   },
+   "binary_git_sha": "1e883393a224bb9e789d1b653ffab9b7461fe4ac",
+   "top5_kernels": [
+    {
+     "kernel": "badd_bf16",
+     "us_per_step": 55224.875168,
+     "launches_per_step": 1161.0,
+     "share": 0.2632443674592227
+    },
+    {
+     "kernel": "badd_f32",
+     "us_per_step": 51564.22919399999,
+     "launches_per_step": 1722.0,
+     "share": 0.2457949041333886
+    },
+    {
+     "kernel": "bmul_f32",
+     "us_per_step": 12071.444236,
+     "launches_per_step": 314.0,
+     "share": 0.05754181775075225
+    },
+    {
+     "kernel": "fast_sum_f32",
+     "us_per_step": 8937.74864,
+     "launches_per_step": 243.0,
+     "share": 0.04260420652991647
+    },
+    {
+     "kernel": "Kernel2",
+     "us_per_step": 7361.377736,
+     "launches_per_step": 216.0,
+     "share": 0.03509000644811969
+    }
+   ]
+  },
+  {
+   "leg_id": "bert-A4",
+   "status": "ok",
+   "model": "bert",
+   "dtype": "f32",
+   "width": 64,
+   "batch_pairs": null,
+   "steps_n": null,
+   "steps_m": null,
+   "wall_s_per_step": 0.36985255101799996,
+   "gpu_kernel_us_per_step": 309453.457368,
+   "launches_per_step": 6066.0,
+   "fixed_cost_buckets": 1,
+   "fixed_cost_time_us": 2.973,
+   "fixed_cost_jitter_max_rel": 0.0007128874122258873,
+   "census_exit": 0,
+   "lora_counters_n_run": {
+    "lora_linear_eager_dispatches": 7200,
+    "lora_linear_fused_dispatches": 0,
+    "lora_epilogue_eager_dispatches": 0,
+    "lora_epilogue_fused_dispatches": 0
+   },
+   "lora_counters_m_run": {
+    "lora_linear_eager_dispatches": 43200,
+    "lora_linear_fused_dispatches": 0,
+    "lora_epilogue_eager_dispatches": 0,
+    "lora_epilogue_fused_dispatches": 0
+   },
+   "binary_git_sha": "1e883393a224bb9e789d1b653ffab9b7461fe4ac",
+   "top5_kernels": [
+    {
+     "kernel": "badd_f32",
+     "us_per_step": 102145.86981600002,
+     "launches_per_step": 2625.0,
+     "share": 0.33008475873814147
+    },
+    {
+     "kernel": "ampere_sgemm_64x32_sliced1x4_nt",
+     "us_per_step": 27283.438376,
+     "launches_per_step": 57.0,
+     "share": 0.08816653272532261
+    },
+    {
+     "kernel": "bmul_f32",
+     "us_per_step": 17934.245398000003,
+     "launches_per_step": 400.0,
+     "share": 0.057954580797178544
+    },
+    {
+     "kernel": "ampere_sgemm_128x128_tn",
+     "us_per_step": 16540.632856,
+     "launches_per_step": 72.0,
+     "share": 0.0534511166773942
+    },
+    {
+     "kernel": "ampere_sgemm_32x128_tn",
+     "us_per_step": 15346.726038,
+     "launches_per_step": 84.0,
+     "share": 0.04959300234849138
+    }
+   ]
+  },
+  {
+   "leg_id": "bert-E1",
+   "status": "ok",
+   "model": "bert",
+   "dtype": "bf16",
+   "width": 64,
+   "batch_pairs": null,
+   "steps_n": null,
+   "steps_m": null,
+   "wall_s_per_step": 0.2728177864333334,
+   "gpu_kernel_us_per_step": 209878.7684666666,
+   "launches_per_step": 6913.0,
+   "fixed_cost_buckets": 8,
+   "fixed_cost_time_us": 6.627,
+   "fixed_cost_jitter_max_rel": 0.014336917562724014,
+   "census_exit": 0,
+   "lora_counters_n_run": {
+    "lora_linear_eager_dispatches": 720,
+    "lora_linear_fused_dispatches": 0,
+    "lora_epilogue_eager_dispatches": 0,
+    "lora_epilogue_fused_dispatches": 0
+   },
+   "lora_counters_m_run": {
+    "lora_linear_eager_dispatches": 2880,
+    "lora_linear_fused_dispatches": 0,
+    "lora_epilogue_eager_dispatches": 0,
+    "lora_epilogue_fused_dispatches": 0
+   },
+   "binary_git_sha": "7820d697e6180e9e220ef61444f70de8fdcc3ae3",
+   "top5_kernels": [
+    {
+     "kernel": "badd_bf16",
+     "us_per_step": 55252.72966666667,
+     "launches_per_step": 1161.0,
+     "share": 0.26326021479129286
+    },
+    {
+     "kernel": "badd_f32",
+     "us_per_step": 51589.86186666666,
+     "launches_per_step": 1722.0,
+     "share": 0.24580791207977892
+    },
+    {
+     "kernel": "bmul_f32",
+     "us_per_step": 12076.016,
+     "launches_per_step": 314.0,
+     "share": 0.05753805441219719
+    },
+    {
+     "kernel": "fast_sum_f32",
+     "us_per_step": 8940.542033333333,
+     "launches_per_step": 243.0,
+     "share": 0.04259860155770492
+    },
+    {
+     "kernel": "Kernel2",
+     "us_per_step": 7360.019366666666,
+     "launches_per_step": 216.0,
+     "share": 0.035067955755780034
+    }
+   ]
+  },
+  {
+   "leg_id": "bert-N1",
+   "status": "ok",
+   "model": "bert",
+   "dtype": "f32",
+   "width": 512,
+   "batch_pairs": null,
+   "steps_n": null,
+   "steps_m": null,
+   "wall_s_per_step": 0.8385102173819999,
+   "gpu_kernel_us_per_step": 781164.6354419998,
+   "launches_per_step": 3022.0,
+   "fixed_cost_buckets": 273,
+   "fixed_cost_time_us": 10900.969,
+   "fixed_cost_jitter_max_rel": 0.24726336289835854,
+   "census_exit": 0,
+   "lora_counters_n_run": {
+    "lora_linear_eager_dispatches": 100,
+    "lora_linear_fused_dispatches": 0,
+    "lora_epilogue_eager_dispatches": 0,
+    "lora_epilogue_fused_dispatches": 0
+   },
+   "lora_counters_m_run": {
+    "lora_linear_eager_dispatches": 600,
+    "lora_linear_fused_dispatches": 0,
+    "lora_epilogue_eager_dispatches": 0,
+    "lora_epilogue_fused_dispatches": 0
+   },
+   "binary_git_sha": "7820d697e6180e9e220ef61444f70de8fdcc3ae3",
+   "top5_kernels": [
+    {
+     "kernel": "badd_f32",
+     "us_per_step": 218029.22418400002,
+     "launches_per_step": 1414.0,
+     "share": 0.2791079041367949
+    },
+    {
+     "kernel": "bmul_f32",
+     "us_per_step": 63199.793710000005,
+     "launches_per_step": 258.0,
+     "share": 0.08090457611952723
+    },
+    {
+     "kernel": "ampere_sgemm_128x32_tn",
+     "us_per_step": 54507.850704000004,
+     "launches_per_step": 61.0,
+     "share": 0.06977767327262363
+    },
+    {
+     "kernel": "ampere_sgemm_64x32_sliced1x4_nt",
+     "us_per_step": 54155.968872,
+     "launches_per_step": 57.0,
+     "share": 0.06932721530763791
+    },
+    {
+     "kernel": "ampere_sgemm_128x32_nn",
+     "us_per_step": 51310.571342,
+     "launches_per_step": 57.0,
+     "share": 0.065684708464775
+    }
+   ]
+  },
+  {
+   "leg_id": "bert-N3",
+   "status": "ok",
+   "model": "bert",
+   "dtype": "bf16",
+   "width": 64,
+   "batch_pairs": null,
+   "steps_n": null,
+   "steps_m": null,
+   "wall_s_per_step": 0.16267972444599998,
+   "gpu_kernel_us_per_step": 127667.21489600003,
+   "launches_per_step": 3239.0,
+   "fixed_cost_buckets": 8,
+   "fixed_cost_time_us": 10.445,
+   "fixed_cost_jitter_max_rel": 0.005912523324521847,
+   "census_exit": 0,
+   "lora_counters_n_run": {
+    "lora_linear_eager_dispatches": 100,
+    "lora_linear_fused_dispatches": 0,
+    "lora_epilogue_eager_dispatches": 0,
+    "lora_epilogue_fused_dispatches": 0
+   },
+   "lora_counters_m_run": {
+    "lora_linear_eager_dispatches": 600,
+    "lora_linear_fused_dispatches": 0,
+    "lora_epilogue_eager_dispatches": 0,
+    "lora_epilogue_fused_dispatches": 0
+   },
+   "binary_git_sha": "7820d697e6180e9e220ef61444f70de8fdcc3ae3",
+   "top5_kernels": [
+    {
+     "kernel": "badd_bf16",
+     "us_per_step": 47994.838189999995,
+     "launches_per_step": 1015.0,
+     "share": 0.37593706598125004
+    },
+    {
+     "kernel": "badd_f32",
+     "us_per_step": 14728.757792,
+     "launches_per_step": 448.0,
+     "share": 0.11536836457189346
+    },
+    {
+     "kernel": "bmul_f32",
+     "us_per_step": 11578.343512000001,
+     "launches_per_step": 172.0,
+     "share": 0.09069159628360283
+    },
+    {
+     "kernel": "fast_sum_f32",
+     "us_per_step": 7335.888222,
+     "launches_per_step": 101.0,
+     "share": 0.057461018695958425
+    },
+    {
+     "kernel": "bmul_bf16",
+     "us_per_step": 5377.381198,
+     "launches_per_step": 86.0,
+     "share": 0.04212029848368283
+    }
+   ]
+  },
+  {
+   "leg_id": "distilbert-A1",
+   "status": "ok",
+   "model": "distilbert",
+   "dtype": "f32",
+   "width": 512,
+   "batch_pairs": null,
+   "steps_n": null,
+   "steps_m": null,
+   "wall_s_per_step": 0.4890329759040001,
+   "gpu_kernel_us_per_step": 442165.357932,
+   "launches_per_step": 3106.0,
+   "fixed_cost_buckets": 296,
+   "fixed_cost_time_us": 310.568,
+   "fixed_cost_jitter_max_rel": 0.02694067094296364,
+   "census_exit": 0,
+   "lora_counters_n_run": {
+    "lora_linear_eager_dispatches": 3600,
+    "lora_linear_fused_dispatches": 0,
+    "lora_epilogue_eager_dispatches": 0,
+    "lora_epilogue_fused_dispatches": 0
+   },
+   "lora_counters_m_run": {
+    "lora_linear_eager_dispatches": 21600,
+    "lora_linear_fused_dispatches": 0,
+    "lora_epilogue_eager_dispatches": 0,
+    "lora_epilogue_fused_dispatches": 0
+   },
+   "binary_git_sha": "7820d697e6180e9e220ef61444f70de8fdcc3ae3",
+   "top5_kernels": [
+    {
+     "kernel": "badd_f32",
+     "us_per_step": 140372.30539999998,
+     "launches_per_step": 1334.0,
+     "share": 0.31746563334703315
+    },
+    {
+     "kernel": "bmul_f32",
+     "us_per_step": 32125.551128,
+     "launches_per_step": 214.0,
+     "share": 0.07265506117044235
+    },
+    {
+     "kernel": "ampere_sgemm_128x32_tn",
+     "us_per_step": 27893.039264,
+     "launches_per_step": 60.0,
+     "share": 0.06308282357183131
+    },
+    {
+     "kernel": "fast_sum_f32",
+     "us_per_step": 26498.786324,
+     "launches_per_step": 156.0,
+     "share": 0.059929584823049865
+    },
+    {
+     "kernel": "ampere_sgemm_64x32_sliced1x4_nt",
+     "us_per_step": 26164.637226,
+     "launches_per_step": 27.0,
+     "share": 0.05917387410983884
+    }
+   ]
+  },
+  {
+   "leg_id": "distilbert-A2",
+   "status": "ok",
+   "model": "distilbert",
+   "dtype": "bf16",
+   "width": 512,
+   "batch_pairs": null,
+   "steps_n": null,
+   "steps_m": null,
+   "wall_s_per_step": 0.382978773494,
+   "gpu_kernel_us_per_step": 336790.3584319997,
+   "launches_per_step": 3549.0,
+   "fixed_cost_buckets": 396,
+   "fixed_cost_time_us": 340.691,
+   "fixed_cost_jitter_max_rel": 0.03076923076923077,
+   "census_exit": 0,
+   "lora_counters_n_run": {
+    "lora_linear_eager_dispatches": 3600,
+    "lora_linear_fused_dispatches": 0,
+    "lora_epilogue_eager_dispatches": 0,
+    "lora_epilogue_fused_dispatches": 0
+   },
+   "lora_counters_m_run": {
+    "lora_linear_eager_dispatches": 21600,
+    "lora_linear_fused_dispatches": 0,
+    "lora_epilogue_eager_dispatches": 0,
+    "lora_epilogue_fused_dispatches": 0
+   },
+   "binary_git_sha": "7820d697e6180e9e220ef61444f70de8fdcc3ae3",
+   "top5_kernels": [
+    {
+     "kernel": "badd_bf16",
+     "us_per_step": 99376.77742599999,
+     "launches_per_step": 602.0,
+     "share": 0.2950701376626993
+    },
+    {
+     "kernel": "badd_f32",
+     "us_per_step": 50974.379308,
+     "launches_per_step": 858.0,
+     "share": 0.15135344000143663
+    },
+    {
+     "kernel": "bdiv_bf16",
+     "us_per_step": 22564.119637999996,
+     "launches_per_step": 47.0,
+     "share": 0.06699752256285522
+    },
+    {
+     "kernel": "bmul_bf16",
+     "us_per_step": 19481.840086,
+     "launches_per_step": 56.0,
+     "share": 0.057845599193224885
+    },
+    {
+     "kernel": "fast_sum_bf16",
+     "us_per_step": 18108.954984000004,
+     "launches_per_step": 33.0,
+     "share": 0.05376922031945973
+    }
+   ]
+  },
+  {
+   "leg_id": "distilbert-A3",
+   "status": "ok",
+   "model": "distilbert",
+   "dtype": "bf16",
+   "width": 64,
+   "batch_pairs": null,
+   "steps_n": null,
+   "steps_m": null,
+   "wall_s_per_step": 0.140333089986,
+   "gpu_kernel_us_per_step": 104895.29299399997,
+   "launches_per_step": 3569.0,
+   "fixed_cost_buckets": 7,
+   "fixed_cost_time_us": 6.921,
+   "fixed_cost_jitter_max_rel": 0.004069175991861648,
+   "census_exit": 0,
+   "lora_counters_n_run": {
+    "lora_linear_eager_dispatches": 3600,
+    "lora_linear_fused_dispatches": 0,
+    "lora_epilogue_eager_dispatches": 0,
+    "lora_epilogue_fused_dispatches": 0
+   },
+   "lora_counters_m_run": {
+    "lora_linear_eager_dispatches": 21600,
+    "lora_linear_fused_dispatches": 0,
+    "lora_epilogue_eager_dispatches": 0,
+    "lora_epilogue_fused_dispatches": 0
+   },
+   "binary_git_sha": "7820d697e6180e9e220ef61444f70de8fdcc3ae3",
+   "top5_kernels": [
+    {
+     "kernel": "badd_bf16",
+     "us_per_step": 27360.860486,
+     "launches_per_step": 602.0,
+     "share": 0.2608397355595837
+    },
+    {
+     "kernel": "badd_f32",
+     "us_per_step": 25724.506967999998,
+     "launches_per_step": 858.0,
+     "share": 0.24523985999516149
+    },
+    {
+     "kernel": "bmul_f32",
+     "us_per_step": 6134.5486040000005,
+     "launches_per_step": 158.0,
+     "share": 0.0584825918199294
+    },
+    {
+     "kernel": "fast_sum_f32",
+     "us_per_step": 4553.305556,
+     "launches_per_step": 123.0,
+     "share": 0.04340810179404761
+    },
+    {
+     "kernel": "Kernel2",
+     "us_per_step": 3681.493232,
+     "launches_per_step": 108.0,
+     "share": 0.03509683920908235
+    }
+   ]
+  },
+  {
+   "leg_id": "distilbert-A4",
+   "status": "ok",
+   "model": "distilbert",
+   "dtype": "f32",
+   "width": 64,
+   "batch_pairs": null,
+   "steps_n": null,
+   "steps_m": null,
+   "wall_s_per_step": 0.18945469771999998,
+   "gpu_kernel_us_per_step": 154185.61805400005,
+   "launches_per_step": 3148.0,
+   "fixed_cost_buckets": 1,
+   "fixed_cost_time_us": 2.522,
+   "fixed_cost_jitter_max_rel": 0.001160632558550507,
+   "census_exit": 0,
+   "lora_counters_n_run": {
+    "lora_linear_eager_dispatches": 3600,
+    "lora_linear_fused_dispatches": 0,
+    "lora_epilogue_eager_dispatches": 0,
+    "lora_epilogue_fused_dispatches": 0
+   },
+   "lora_counters_m_run": {
+    "lora_linear_eager_dispatches": 21600,
+    "lora_linear_fused_dispatches": 0,
+    "lora_epilogue_eager_dispatches": 0,
+    "lora_epilogue_fused_dispatches": 0
+   },
+   "binary_git_sha": "7820d697e6180e9e220ef61444f70de8fdcc3ae3",
+   "top5_kernels": [
+    {
+     "kernel": "badd_f32",
+     "us_per_step": 50891.76163000001,
+     "launches_per_step": 1334.0,
+     "share": 0.3300681494961243
+    },
+    {
+     "kernel": "ampere_sgemm_64x32_sliced1x4_nt",
+     "us_per_step": 13169.911626000001,
+     "launches_per_step": 27.0,
+     "share": 0.08541595378492134
+    },
+    {
+     "kernel": "bmul_f32",
+     "us_per_step": 9178.889962,
+     "launches_per_step": 214.0,
+     "share": 0.05953142762501558
+    },
+    {
+     "kernel": "ampere_sgemm_128x128_tn",
+     "us_per_step": 8270.087172,
+     "launches_per_step": 36.0,
+     "share": 0.053637215172063504
+    },
+    {
+     "kernel": "ampere_sgemm_32x128_tn",
+     "us_per_step": 7672.779201999999,
+     "launches_per_step": 42.0,
+     "share": 0.04976326131346946
+    }
+   ]
+  },
+  {
+   "leg_id": "distilbert-E1",
+   "status": "ok",
+   "model": "distilbert",
+   "dtype": "bf16",
+   "width": 64,
+   "batch_pairs": null,
+   "steps_n": null,
+   "steps_m": null,
+   "wall_s_per_step": 0.14194155679999998,
+   "gpu_kernel_us_per_step": 104584.50060000006,
+   "launches_per_step": 3569.0,
+   "fixed_cost_buckets": 7,
+   "fixed_cost_time_us": 3.328,
+   "fixed_cost_jitter_max_rel": 0.014285714285714285,
+   "census_exit": 0,
+   "lora_counters_n_run": {
+    "lora_linear_eager_dispatches": 360,
+    "lora_linear_fused_dispatches": 0,
+    "lora_epilogue_eager_dispatches": 0,
+    "lora_epilogue_fused_dispatches": 0
+   },
+   "lora_counters_m_run": {
+    "lora_linear_eager_dispatches": 1440,
+    "lora_linear_fused_dispatches": 0,
+    "lora_epilogue_eager_dispatches": 0,
+    "lora_epilogue_fused_dispatches": 0
+   },
+   "binary_git_sha": "7820d697e6180e9e220ef61444f70de8fdcc3ae3",
+   "top5_kernels": [
+    {
+     "kernel": "badd_bf16",
+     "us_per_step": 27285.575600000007,
+     "launches_per_step": 602.0,
+     "share": 0.2608950221444189
+    },
+    {
+     "kernel": "badd_f32",
+     "us_per_step": 25669.9359,
+     "launches_per_step": 858.0,
+     "share": 0.24544684683420467
+    },
+    {
+     "kernel": "bmul_f32",
+     "us_per_step": 6113.9927,
+     "launches_per_step": 158.0,
+     "share": 0.05845983549114921
+    },
+    {
+     "kernel": "fast_sum_f32",
+     "us_per_step": 4536.191433333333,
+     "launches_per_step": 123.0,
+     "share": 0.043373457895857
+    },
+    {
+     "kernel": "Kernel2",
+     "us_per_step": 3672.858666666667,
+     "launches_per_step": 108.0,
+     "share": 0.03511857536820007
+    }
+   ]
+  },
+  {
+   "leg_id": "distilbert-N1",
+   "status": "ok",
+   "model": "distilbert",
+   "dtype": "f32",
+   "width": 512,
+   "batch_pairs": null,
+   "steps_n": null,
+   "steps_m": null,
+   "wall_s_per_step": 0.42218687387600007,
+   "gpu_kernel_us_per_step": 388792.14777799975,
+   "launches_per_step": 1646.0,
+   "fixed_cost_buckets": 273,
+   "fixed_cost_time_us": 216.878,
+   "fixed_cost_jitter_max_rel": 0.06299212598425197,
+   "census_exit": 0,
+   "lora_counters_n_run": {
+    "lora_linear_eager_dispatches": 100,
+    "lora_linear_fused_dispatches": 0,
+    "lora_epilogue_eager_dispatches": 0,
+    "lora_epilogue_fused_dispatches": 0
+   },
+   "lora_counters_m_run": {
+    "lora_linear_eager_dispatches": 600,
+    "lora_linear_fused_dispatches": 0,
+    "lora_epilogue_eager_dispatches": 0,
+    "lora_epilogue_fused_dispatches": 0
+   },
+   "binary_git_sha": "7820d697e6180e9e220ef61444f70de8fdcc3ae3",
+   "top5_kernels": [
+    {
+     "kernel": "badd_f32",
+     "us_per_step": 108059.691588,
+     "launches_per_step": 735.0,
+     "share": 0.2779369187509982
+    },
+    {
+     "kernel": "bmul_f32",
+     "us_per_step": 31922.078299999997,
+     "launches_per_step": 144.0,
+     "share": 0.08210576906565381
+    },
+    {
+     "kernel": "ampere_sgemm_128x32_tn",
+     "us_per_step": 27270.530813999998,
+     "launches_per_step": 31.0,
+     "share": 0.07014167073551976
+    },
+    {
+     "kernel": "ampere_sgemm_64x32_sliced1x4_nt",
+     "us_per_step": 26143.309199999996,
+     "launches_per_step": 27.0,
+     "share": 0.06724237963501213
+    },
+    {
+     "kernel": "fast_sum_f32",
+     "us_per_step": 25739.715208000005,
+     "launches_per_step": 86.0,
+     "share": 0.06620430827913062
+    }
+   ]
+  },
+  {
+   "leg_id": "distilbert-N3",
+   "status": "ok",
+   "model": "distilbert",
+   "dtype": "bf16",
+   "width": 64,
+   "batch_pairs": null,
+   "steps_n": null,
+   "steps_m": null,
+   "wall_s_per_step": 0.08568875843000001,
+   "gpu_kernel_us_per_step": 64299.54697600001,
+   "launches_per_step": 1761.0,
+   "fixed_cost_buckets": 7,
+   "fixed_cost_time_us": 13.441,
+   "fixed_cost_jitter_max_rel": 0.010680157391793142,
+   "census_exit": 0,
+   "lora_counters_n_run": {
+    "lora_linear_eager_dispatches": 100,
+    "lora_linear_fused_dispatches": 0,
+    "lora_epilogue_eager_dispatches": 0,
+    "lora_epilogue_fused_dispatches": 0
+   },
+   "lora_counters_m_run": {
+    "lora_linear_eager_dispatches": 600,
+    "lora_linear_fused_dispatches": 0,
+    "lora_epilogue_eager_dispatches": 0,
+    "lora_epilogue_fused_dispatches": 0
+   },
+   "binary_git_sha": "7820d697e6180e9e220ef61444f70de8fdcc3ae3",
+   "top5_kernels": [
+    {
+     "kernel": "badd_bf16",
+     "us_per_step": 23705.517101999994,
+     "launches_per_step": 528.0,
+     "share": 0.368673158939178
+    },
+    {
+     "kernel": "badd_f32",
+     "us_per_step": 7532.285708,
+     "launches_per_step": 232.0,
+     "share": 0.11714368237790924
+    },
+    {
+     "kernel": "bmul_f32",
+     "us_per_step": 5862.804349999999,
+     "launches_per_step": 88.0,
+     "share": 0.09117955919951205
+    },
+    {
+     "kernel": "fast_sum_f32",
+     "us_per_step": 3778.751568,
+     "launches_per_step": 53.0,
+     "share": 0.05876793454564198
+    },
+    {
+     "kernel": "bmul_bf16",
+     "us_per_step": 2750.4912419999996,
+     "launches_per_step": 56.0,
+     "share": 0.04277621494015546
+    }
+   ]
+  }
+ ]
+}

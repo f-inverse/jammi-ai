@@ -47,3 +47,6 @@ crates/jammi-encoders/src/modernbert.rs::growth_oracle_cuda_device
 crates/jammi-encoders/src/modernbert.rs::flash_oracle_require_gate
 crates/jammi-encoders/src/modernbert.rs::flash_compiled_or_skip
 crates/jammi-ai/tests/metal_quantized_gpu.rs::gpu_available
+crates/jammi-encoders/tests/it/batch_composition_invariance.rs::cuda_device_or_skip
+crates/jammi-encoders/tests/it/batch_composition_invariance.rs::sm89_window_control_exclusion_require_gate
+crates/jammi-lora/tests/esc046_epilogue_biting_oracle.rs::cuda_device

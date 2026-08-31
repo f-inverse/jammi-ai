@@ -67,6 +67,7 @@ impl<'a> EmbeddingPipeline<'a> {
         let backend_kind = guard.model.backend_kind();
         let compute_precision = guard.model.compute_precision();
         let content_digest = guard.model.content_digest()?;
+        let quantization = guard.model.quantization();
         drop(guard);
 
         // The materialization contract is knowable here — the model is loaded
@@ -90,6 +91,7 @@ impl<'a> EmbeddingPipeline<'a> {
                 backend: backend_kind.to_string(),
                 compute_precision,
                 content_digest,
+                quantization,
             }],
         );
         let inputs = vec![jammi_db::store::manifest::InputAnchor::unpinned_at_instant(

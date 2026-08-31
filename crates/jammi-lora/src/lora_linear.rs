@@ -9,6 +9,7 @@ use jammi_kernels::admission::{
 use jammi_kernels::ops::{apply1, apply3, DropoutFused, DropoutKey, LowRankResidualLinear};
 
 use crate::error::LoraError;
+use crate::frozen_base::FrozenBase;
 use crate::init::LoraInitMode;
 use crate::seeded::{
     gaussian_fill, kaiming_uniform_fill, seed_for_param, DropoutMasks, SplitMix64,
@@ -302,7 +303,7 @@ fn lora_linear_admission_predicate(
 /// non-`Var` intermediate, both of which have `track_op() == true`. See
 /// `jammi_kernels::ops::low_rank_residual_linear`'s module doc for what `dweight_needed`
 /// controls in the fused kernel's own `bwd`.
-fn frozen_weight_gate(w: &Tensor) -> Result<bool, LoraError> {
+pub(crate) fn frozen_weight_gate(w: &Tensor) -> Result<bool, LoraError> {
     if w.is_variable() {
         Ok(true)
     } else if !w.track_op() {
@@ -370,7 +371,7 @@ fn set_var(varmap: &VarMap, name: &str, value: &Tensor) -> Result<(), LoraError>
 /// The base weight is treated as frozen. The output is
 /// `base(x) + scaling * dropout(x @ A^T @ B^T)`.
 pub struct LoraLinear {
-    base: Linear,
+    base: FrozenBase,
     /// LoRA A matrix with shape `(rank, in_features)`.
     pub lora_a: Tensor,
     /// LoRA B matrix with shape `(out_features, rank)`.
@@ -436,11 +437,42 @@ impl LoraLinear {
         varmap: &VarMap,
         vb: &VarBuilder,
     ) -> Result<Self, LoraError> {
+        Self::new_with_base(
+            FrozenBase::Dense(base),
+            rank,
+            alpha,
+            use_rslora,
+            init_mode,
+            dropout,
+            seed,
+            varmap,
+            vb,
+        )
+    }
+
+    /// Wrap ANY [`FrozenBase`] — dense OR GGUF-quantized — with a LoRA
+    /// adapter. [`Self::new`] is the Dense-only convenience wrapper every
+    /// EXISTING construction path uses unchanged (`FrozenBase::Dense(base)`,
+    /// then this function); a quantized base (wave-3 GGUF loading) calls
+    /// this directly with `FrozenBase::Quantized(..)`. See [`Self::new`]'s
+    /// own doc for the rank/init/seed/dropout semantics, identical here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_base(
+        base: FrozenBase,
+        rank: usize,
+        alpha: f64,
+        use_rslora: bool,
+        init_mode: LoraInitMode,
+        dropout: Option<f32>,
+        seed: u64,
+        varmap: &VarMap,
+        vb: &VarBuilder,
+    ) -> Result<Self, LoraError> {
         if rank == 0 {
             return Err(LoraError::Config("LoRA rank must be > 0".into()));
         }
-        let in_features = base.weight().dim(1)?;
-        let out_features = base.weight().dim(0)?;
+        let in_features = base.in_features()?;
+        let out_features = base.out_features()?;
         let device = vb.device().clone();
 
         // Fetch (or, in the training path, allocate + register) the A/B tensors.
@@ -532,7 +564,7 @@ impl LoraLinear {
             .filter(|p| *p > 0.0)
             .map(|_| DropoutMasks::new(seed, &vb.prefix()));
 
-        let dweight_needed = frozen_weight_gate(base.weight())?;
+        let dweight_needed = base.dweight_needed()?;
 
         Ok(Self {
             base,
@@ -592,11 +624,26 @@ impl LoraLinear {
         alpha: f64,
         use_rslora: bool,
     ) -> Result<Self, LoraError> {
+        Self::from_loaded_with_base(FrozenBase::Dense(base), lora_a, lora_b, alpha, use_rslora)
+    }
+
+    /// Reconstruct a `LoraLinear` from tensors already loaded from disk,
+    /// over ANY [`FrozenBase`] — dense OR GGUF-quantized. [`Self::from_loaded`]
+    /// is the Dense-only convenience wrapper every EXISTING path uses
+    /// unchanged; see its own doc for the rank/scaling semantics, identical
+    /// here.
+    pub fn from_loaded_with_base(
+        base: FrozenBase,
+        lora_a: Tensor,
+        lora_b: Tensor,
+        alpha: f64,
+        use_rslora: bool,
+    ) -> Result<Self, LoraError> {
         let rank = lora_a.dims()[0];
         let scaling = lora_scaling(alpha, rank, use_rslora)?;
-        let in_features = base.weight().dim(1)?;
-        let out_features = base.weight().dim(0)?;
-        let dweight_needed = frozen_weight_gate(base.weight())?;
+        let in_features = base.in_features()?;
+        let out_features = base.out_features()?;
+        let dweight_needed = base.dweight_needed()?;
         Ok(Self {
             base,
             lora_a,
@@ -684,41 +731,51 @@ impl LoraLinear {
     /// `crates/jammi-encoders/src/modernbert.rs`), not a
     /// `candle_nn::VarBuilder::from_varmap` API guarantee — see
     /// `lora_linear_admission_predicate`'s doc for what this bounds.
+    ///
+    /// ## `FrozenBase::Quantized` ALWAYS composes — the fused site is Dense-ONLY
+    ///
+    /// `jammi_kernels::ops::LowRankResidualLinear`'s own domain requires a
+    /// dense `Tensor` weight argument (`apply3(x, w, &ab, op)` — `w` is a
+    /// plain matmul operand the op's `cpu_fwd`/`cuda_fwd` read directly);
+    /// there is no quantized-weight arm of that kernel. A `FrozenBase::
+    /// Quantized` base is therefore NEVER even offered to
+    /// `lora_linear_admission_predicate` — the training arm branches on
+    /// `self.base` FIRST, and only the `Dense` arm ever reaches the
+    /// admission/dispatch-counter machinery below. This is a STRUCTURAL
+    /// absence, not a domain-check failure: `lora_linear_fused_counters()`
+    /// is never touched by a quantized-base forward at all (neither a
+    /// `Fused` nor an `Eager` count) — the alternative (routing a
+    /// quantized base through `admit()` with a permanently-failing
+    /// predicate) would misrepresent "there is no fused kernel for this
+    /// storage format" as "the fused kernel's domain check declined this
+    /// call", which is a different, weaker claim.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor, LoraError> {
         if !self.training {
             // Eval/serving: always the eager composition, unconditionally
             // — see `forward`'s doc for why this must stay bit-identical
             // regardless of the fused kernel's existence.
-            let base_dtype = self.base.weight().dtype();
-            let x_base = if x.dtype() == base_dtype {
-                x.clone()
-            } else {
-                x.to_dtype(base_dtype)?
-            };
-            let base_out = self.base.forward(&x_base)?;
-            let lora_dtype = self.lora_a.dtype();
-            let x_lora = if x.dtype() != lora_dtype {
-                x.to_dtype(lora_dtype)?
-            } else {
-                x.clone()
-            };
-            let a_lin = Linear::new(self.lora_a.clone(), None);
-            let after_a = a_lin.forward(&x_lora)?;
-            let b_lin = Linear::new(self.lora_b.clone(), None);
-            let lora_out = b_lin.forward(&after_a)?;
-            return eager_epilogue(&base_out, &lora_out, self.scaling);
+            return self.forward_composed(x, None);
         }
 
-        // Training: reserve the dropout key ONCE, before admission — see
-        // `forward`'s doc's "Dropout key reservation" section.
+        // Training: reserve the dropout key ONCE, before the Dense/Quantized
+        // branch and before admission — see `forward`'s doc's "Dropout key
+        // reservation" section. Reserved uniformly regardless of base
+        // storage format, so esc-033's O(1) resume invariant holds for a
+        // quantized base exactly as it does for a dense one.
         let dropout_key: Option<DropoutKey> = match (self.dropout, &self.dropout_masks) {
             (Some(p), Some(masks)) if p > 0.0 => Some(masks.next_key(p)?),
             _ => None,
         };
 
-        let has_bias = self.base.bias().is_some();
+        // `FrozenBase::Quantized` ALWAYS composes — see this method's own
+        // doc, "the fused site is Dense-ONLY".
+        let FrozenBase::Dense(base_linear) = &self.base else {
+            return self.forward_composed(x, dropout_key);
+        };
+
+        let has_bias = base_linear.bias().is_some();
         let (holds, predicate) =
-            lora_linear_admission_predicate(x, self.base.weight(), self.lora_a.dtype(), has_bias);
+            lora_linear_admission_predicate(x, base_linear.weight(), self.lora_a.dtype(), has_bias);
         let outcome = admit(
             admission_mode(),
             "lora_linear_fused",
@@ -748,38 +805,45 @@ impl LoraLinear {
                     dropout_key,
                     self.dweight_needed,
                 )?;
-                Ok(apply3(x, self.base.weight(), &ab, op)?)
+                Ok(apply3(x, base_linear.weight(), &ab, op)?)
             }
-            DispatchOutcome::Eager => {
-                let base_dtype = self.base.weight().dtype();
-                let x_base = if x.dtype() == base_dtype {
-                    x.clone()
-                } else {
-                    x.to_dtype(base_dtype)?
-                };
-                let base_out = self.base.forward(&x_base)?;
-
-                let lora_dtype = self.lora_a.dtype();
-                let x_lora = if x.dtype() != lora_dtype {
-                    x.to_dtype(lora_dtype)?
-                } else {
-                    x.clone()
-                };
-                let lora_in = match dropout_key {
-                    Some(key) => {
-                        let op = DropoutFused::new(key.seed, key.layer_id, key.forward_idx, key.p)?;
-                        apply1(&x_lora, op)?
-                    }
-                    None => x_lora,
-                };
-
-                let a_lin = Linear::new(self.lora_a.clone(), None);
-                let after_a = a_lin.forward(&lora_in)?;
-                let b_lin = Linear::new(self.lora_b.clone(), None);
-                let lora_out = b_lin.forward(&after_a)?;
-                eager_epilogue(&base_out, &lora_out, self.scaling)
-            }
+            DispatchOutcome::Eager => self.forward_composed(x, dropout_key),
         }
+    }
+
+    /// The shared `[base, dropout, A-matmul, B-matmul, epilogue]`
+    /// composition — used by eval (`dropout_key == None`, always), the
+    /// Dense eager-fallback arm, and EVERY `Quantized`-base training
+    /// forward (see `forward`'s own doc). `self.base.forward(x)` is
+    /// [`FrozenBase::forward`] — Dense's cast-to-weight-dtype-then-forward,
+    /// preserved byte-for-byte from every prior release; Quantized's
+    /// uniform F32 rule.
+    fn forward_composed(
+        &self,
+        x: &Tensor,
+        dropout_key: Option<DropoutKey>,
+    ) -> Result<Tensor, LoraError> {
+        let base_out = self.base.forward(x)?;
+
+        let lora_dtype = self.lora_a.dtype();
+        let x_lora = if x.dtype() != lora_dtype {
+            x.to_dtype(lora_dtype)?
+        } else {
+            x.clone()
+        };
+        let lora_in = match dropout_key {
+            Some(key) => {
+                let op = DropoutFused::new(key.seed, key.layer_id, key.forward_idx, key.p)?;
+                apply1(&x_lora, op)?
+            }
+            None => x_lora,
+        };
+
+        let a_lin = Linear::new(self.lora_a.clone(), None);
+        let after_a = a_lin.forward(&lora_in)?;
+        let b_lin = Linear::new(self.lora_b.clone(), None);
+        let lora_out = b_lin.forward(&after_a)?;
+        eager_epilogue(&base_out, &lora_out, self.scaling)
     }
 
     /// References to the two trainable LoRA parameter tensors.
@@ -865,6 +929,100 @@ mod frozen_weight_gate_tests {
         assert!(tracked.track_op(), "fixture must actually be tracked");
         let err = frozen_weight_gate(&tracked).unwrap_err();
         assert!(matches!(err, crate::error::LoraError::Config(_)));
+    }
+}
+
+/// `LoraLinear::forward`'s `FrozenBase::Quantized` branch — see that
+/// method's own doc, "`FrozenBase::Quantized` ALWAYS composes". Isolated
+/// from `tests/fused_epilogue.rs`'s own dispatch-counter tests
+/// deliberately: this crate's LIB test binary (`jammi_lora-*`, what
+/// `cargo test -p jammi-lora` runs `#[cfg(test)]` code as) has NO OTHER
+/// test that calls `LoraLinear::forward` at all (`frozen_weight_gate_tests`/
+/// `lora_scaling_tests`/`eager_epilogue_tests` all exercise narrower
+/// functions directly), so a before/after `lora_linear_fused_counters()`
+/// snapshot EQUALITY assertion here is race-free under `cargo test`'s
+/// default concurrent-test-thread execution — an integration-test-level
+/// version of this same claim would NOT be safe (see
+/// `tests/fused_epilogue.rs`'s `esc_031_quantized_twin` module's own doc
+/// for why: sibling tests IN THAT FILE deliberately increment the same
+/// process-global counter for their own Dense-base assertions).
+#[cfg(test)]
+mod quantized_base_forward_tests {
+    use super::{lora_linear_fused_counters, LoraLinear};
+    use crate::frozen_base::{FrozenBase, QuantizedLinear};
+    use crate::init::LoraInitMode;
+    use candle_core::quantized::{GgmlDType, QTensor};
+    use candle_core::{Device, Tensor};
+    use candle_nn::VarBuilder;
+    use candle_nn::VarMap;
+    use std::sync::Arc;
+
+    fn quantized_base(out_f: usize, in_f: usize) -> FrozenBase {
+        let device = Device::Cpu;
+        let w_v: Vec<f32> = (0..out_f * in_f)
+            .map(|i| ((i as f64) * 0.029 + 0.7).sin() as f32)
+            .collect();
+        let w = Tensor::from_vec(w_v, (out_f, in_f), &device).unwrap();
+        let q = QTensor::quantize(&w, GgmlDType::Q8_0).unwrap();
+        FrozenBase::Quantized(QuantizedLinear::new(Arc::new(q), None).unwrap())
+    }
+
+    #[test]
+    fn quantized_base_forward_never_touches_the_fused_dispatch_counters() {
+        let device = Device::Cpu;
+        let (out_f, in_f, rows) = (4usize, 32usize, 2usize);
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &device);
+        let lora = LoraLinear::new_with_base(
+            quantized_base(out_f, in_f),
+            4,
+            8.0,
+            false,
+            LoraInitMode::Gaussian,
+            None,
+            11,
+            &varmap,
+            &vb,
+        )
+        .unwrap();
+        let x_v: Vec<f32> = (0..rows * in_f)
+            .map(|i| ((i as f64) * 0.013 + 0.2).cos() as f32)
+            .collect();
+        let x = Tensor::from_vec(x_v, (rows, in_f), &device).unwrap();
+
+        let before = lora_linear_fused_counters().snapshot();
+        let _ = lora.forward(&x).unwrap();
+        let after = lora_linear_fused_counters().snapshot();
+        assert_eq!(
+            (before.fused, before.eager),
+            (after.fused, after.eager),
+            "a Quantized base must never touch the (Dense-only) fused-site dispatch \
+             counters — before={before:?}, after={after:?}"
+        );
+    }
+
+    /// `dweight_needed` is `false` for a `LoraLinear` constructed over a
+    /// `Quantized` base — mirrors `FrozenBase::dweight_needed`'s own unit
+    /// test (`frozen_base.rs`), pinned again here through the full
+    /// `LoraLinear::new_with_base` construction path.
+    #[test]
+    fn dweight_needed_is_false_through_new_with_base_over_a_quantized_base() {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &device);
+        let lora = LoraLinear::new_with_base(
+            quantized_base(4, 32),
+            4,
+            8.0,
+            false,
+            LoraInitMode::ZerosB,
+            None,
+            13,
+            &varmap,
+            &vb,
+        )
+        .unwrap();
+        assert!(!lora.dweight_needed);
     }
 }
 

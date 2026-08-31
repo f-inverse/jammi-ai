@@ -14,6 +14,7 @@ use jammi_encoders::{
     OpenClipVisionTransformer,
 };
 
+use super::gguf::{self, GgufArchitecture};
 use super::open_clip_text::OpenClipTextForward;
 use super::{DeviceConfig, ModelBackend};
 use crate::fine_tune::classifier::SeqClassifier;
@@ -22,7 +23,9 @@ use crate::inference::{
     arrow_to_audio, arrow_to_images, arrow_to_texts, audio_preprocess, image_preprocess,
 };
 use crate::model::tokenizer::{BatchEncoding, TokenizerWrapper};
-use crate::model::{LoadedModel, ModelDimensions, ModelTask, ResolvedModel, TokenizerSource};
+use crate::model::{
+    LoadedModel, ModelDimensions, ModelTask, ResolvedModel, TokenizerSource, WeightsFormat,
+};
 
 /// Candle backend — loads safetensors models via candle.
 pub struct CandleBackend;
@@ -634,6 +637,13 @@ pub struct CandleModel {
     /// cryptographic one) and [`compute_model_fingerprint`] for the input
     /// set.
     pub(crate) fingerprint: ModelFingerprint,
+    /// The GGUF/k-quant weight-storage format this model's backbone loaded
+    /// from — `Some` (the MODAL quantized dtype among the backbone's
+    /// matmul-site tensors) for a `model.gguf` load, `None` for every
+    /// safetensors/ONNX load (issue #351). See
+    /// [`super::super::LoadedModel::quantization`]'s doc for the
+    /// output-affecting rationale.
+    pub(crate) quantization: Option<jammi_numerics::WeightQuantization>,
 }
 
 /// Mean-pool the `[batch, seq, hidden]` tensor along seq using
@@ -1175,10 +1185,17 @@ fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestSlot>> {
     // backend's reload attempt than the one that built this fingerprint —
     // that cross-hint interaction predates this fix and is a property of
     // `get_or_load`'s per-call `backend_hint` parameter, not of this slot.
+    // `model.gguf` (issue #351): a fourth mutually-substitutable named arm,
+    // the SAME "appearance flips the backend/format a cold resolve would
+    // pick" precedent `model.onnx` already established — a `model.gguf`
+    // appearing alongside an existing `model.safetensors` is exactly the
+    // shape the resolver's own FROZEN precedence (safetensors wins) makes
+    // invisible to a cold resolve, so it must be just as tracked here.
     let known_weight_names = [
         "model.safetensors",
         "open_clip_model.safetensors",
         "model.onnx",
+        "model.gguf",
     ];
     let weight_arms: Vec<RawArm> = known_weight_names
         .into_iter()
@@ -2547,6 +2564,94 @@ impl ModelBackend for CandleBackend {
             }
         };
 
+        // HF-CLAP audio checkpoints (`ClapAudioModelWithProjection`) declare
+        // `model_type == "clap_audio_model"` at the top level (flat
+        // `ClapAudioConfig`) or under a nested `audio_config` (top-level
+        // `ClapConfig`), and/or list `ClapModel`/`ClapAudioModelWithProjection`
+        // in `architectures`. OpenCLIP vision checkpoints carry `model_cfg`.
+        // The two are disjoint, so the audio branch is checked first.
+        let is_clap = is_hf_clap_config(&resolved.model_config);
+        let is_open_clip = !is_clap && resolved.model_config.get("model_cfg").is_some();
+
+        // Normalize DistilBERT config fields to standard BERT names — the
+        // SAME normalization authority `gguf::gguf_num_layers` (below, and
+        // through it `estimate_gguf_residency`/the fine-tune GGUF arm)
+        // routes through, so a DistilBERT config.json (whose only geometry
+        // fields are its own `dim`/`n_heads`/`n_layers`/`hidden_dim` names)
+        // can never diverge between this ordinary encoder-config build and
+        // any GGUF consumer (issue #351 wave 5 audit).
+        let model_config = gguf::normalize_model_config(model_type, &resolved.model_config);
+
+        // GGUF weight-storage format (issue #351): the resolver already
+        // classified this at resolve time (`ResolvedModel.weights_format`) —
+        // never re-derived by extension-sniffing here. `Ort` never resolves
+        // a GGUF path (`ModelResolver`'s local/HF arms only ever look for
+        // `model.onnx`), so `(Ort, Gguf)` cannot reach this Candle backend
+        // at all.
+        let is_gguf = resolved.weights_format == WeightsFormat::Gguf;
+        if is_gguf && (is_clap || is_open_clip) {
+            return Err(JammiError::Model {
+                model_id: resolved.model_id.0.clone(),
+                message: format!(
+                    "quantized serving not supported for this architecture (model_type \
+                     '{model_type}') — GGUF loading is threaded only through the \
+                     BERT-family/DistilBERT/ModernBERT text towers"
+                ),
+            });
+        }
+        let gguf_arch = if is_gguf {
+            Some(
+                GgufArchitecture::from_model_type(model_type).ok_or_else(|| JammiError::Model {
+                    model_id: resolved.model_id.0.clone(),
+                    message: format!(
+                        "quantized serving not supported for this architecture (model_type \
+                         '{model_type}')"
+                    ),
+                })?,
+            )
+        } else {
+            None
+        };
+        // Everything the GGUF load path needs, built ONCE here: a
+        // per-matmul-site `FrozenBase` map plus a synthesized in-memory
+        // safetensors file carrying every OTHER tensor densified to
+        // `compute_dtype` (embeddings, norms, classifier/NER heads — see
+        // `gguf::load_gguf_backbone`'s own doc). `None` for a non-GGUF load
+        // — every downstream site below stays byte-identical to today.
+        let gguf_backbone = match gguf_arch {
+            Some(arch) => {
+                let num_layers = gguf::gguf_num_layers(model_type, &resolved.model_config)
+                    .ok_or_else(|| JammiError::Model {
+                        model_id: resolved.model_id.0.clone(),
+                        message: "GGUF load requires num_hidden_layers (or num_layers) in \
+                                  config.json"
+                            .into(),
+                    })?;
+                Some(gguf::load_gguf_backbone(
+                    &resolved.weights_paths[0],
+                    arch,
+                    num_layers,
+                    compute_dtype,
+                    &device,
+                    &resolved.model_id.0,
+                )?)
+            }
+            None => None,
+        };
+        // MODAL quantized dtype among the backbone's matmul-site tensors —
+        // the value `ModelIdentity.quantization` reports (issue #351, pin
+        // Δ2). Honest residual: a GGUF file whose matmul-site tensors are
+        // ALL stored densely (F32/F16/BF16, no genuine k-quant tensor at
+        // all — a pathological, self-defeating "GGUF" checkpoint) reports
+        // `None` here rather than fabricating a quantized format that was
+        // never actually used.
+        let gguf_quantization = gguf_backbone.as_ref().and_then(|b| b.modal_quantization);
+        // The `FrozenWeightLookup`-shaped closure every text-tower builder
+        // below consults via `.weight_source(..)` — `None` for a non-GGUF
+        // load (every builder call site skips `.weight_source(..)`
+        // entirely, byte-identical to today).
+        let gguf_lookup = gguf_backbone.as_ref().map(|b| b.lookup());
+
         // The root `VarBuilder` loads every weight at `compute_dtype` — the
         // encoder backbone AND every head built from it (classifier,
         // projection, CLAP/OpenCLIP towers) — because a mismatched backbone ×
@@ -2554,12 +2659,24 @@ impl ModelBackend for CandleBackend {
         // fine-tune adapter path below, which loads the frozen backbone at its
         // own *persisted* `backbone_dtype` (a training-time choice, independent
         // of this inference-time knob) when a saved adapter is present.
+        //
+        // For a GGUF load, this reads the SYNTHESIZED densified safetensors
+        // file (`gguf_backbone`'s own doc), not `resolved.weights_paths`
+        // (a `model.gguf` file candle's own safetensors reader cannot parse
+        // at all) — every construction site below that never consults
+        // `gguf_lookup` (embeddings, LayerNorms, classifier/NER heads) reads
+        // this exactly the way it reads a real safetensors checkpoint.
+        let vb_weights_paths: Vec<std::path::PathBuf> = match &gguf_backbone {
+            Some(b) => vec![b.densified_path.clone()],
+            None => resolved.weights_paths.clone(),
+        };
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&resolved.weights_paths, compute_dtype, &device)
-                .map_err(|e| JammiError::Model {
+            VarBuilder::from_mmaped_safetensors(&vb_weights_paths, compute_dtype, &device).map_err(
+                |e| JammiError::Model {
                     model_id: resolved.model_id.0.clone(),
                     message: format!("Failed to load safetensors: {e}"),
-                })?
+                },
+            )?
         };
 
         // Parse id2label from config if present (classification models)
@@ -2579,23 +2696,6 @@ impl ModelBackend for CandleBackend {
 
         let is_classification = resolved.task == ModelTask::Classification && id2label.is_some();
         let is_ner = resolved.task == ModelTask::Ner && id2label.is_some();
-        // HF-CLAP audio checkpoints (`ClapAudioModelWithProjection`) declare
-        // `model_type == "clap_audio_model"` at the top level (flat
-        // `ClapAudioConfig`) or under a nested `audio_config` (top-level
-        // `ClapConfig`), and/or list `ClapModel`/`ClapAudioModelWithProjection`
-        // in `architectures`. OpenCLIP vision checkpoints carry `model_cfg`.
-        // The two are disjoint, so the audio branch is checked first.
-        let is_clap = is_hf_clap_config(&resolved.model_config);
-        let is_open_clip = !is_clap && resolved.model_config.get("model_cfg").is_some();
-
-        // Normalize DistilBERT config fields to standard BERT names.
-        // DistilBERT uses dim/n_heads/n_layers/hidden_dim instead of
-        // hidden_size/num_attention_heads/num_hidden_layers/intermediate_size.
-        let model_config = if model_type == "distilbert" {
-            normalize_distilbert_config(&resolved.model_config)
-        } else {
-            resolved.model_config.clone()
-        };
 
         // Read the saved adapter, if any. Both flavours of `SavedAdapter`
         // share the same on-disk layout (`adapter.safetensors` plus
@@ -2698,8 +2798,14 @@ impl ModelBackend for CandleBackend {
             .unwrap_or(compute_precision);
         let encoder_backbone_dtype =
             jammi_encoders::compute_precision_to_dtype(effective_precision);
+        // For a GGUF load this points at the SAME synthesized densified
+        // file `vb` above reads (`vb_weights_paths`'s own doc) — every
+        // `*Builder::build` call below constructs its OWN `frozen_vb` from
+        // this path independently of `vb`, so it must resolve to a real
+        // safetensors file too, never `resolved.weights_paths`'s raw
+        // `model.gguf`.
         let weights_paths_ref: Vec<&std::path::Path> =
-            resolved.weights_paths.iter().map(|p| p.as_path()).collect();
+            vb_weights_paths.iter().map(|p| p.as_path()).collect();
         let dummy_varmap = VarMap::new();
 
         // The pooling strategy the text-embedding path uses for the three
@@ -2777,11 +2883,15 @@ impl ModelBackend for CandleBackend {
                             model_id: resolved.model_id.0.clone(),
                             message: format!("Failed to parse DistilBERT config: {e}"),
                         })?;
-                    let distilbert = DistilBert::builder()
+                    let mut distilbert_builder = DistilBert::builder()
                         .pooling(Pooling::Mean)
                         .lora(lora_build)
                         .backbone_dtype(encoder_backbone_dtype)
-                        .adapter(encoder_adapter_file)
+                        .adapter(encoder_adapter_file);
+                    if let Some(lookup) = &gguf_lookup {
+                        distilbert_builder = distilbert_builder.weight_source(lookup);
+                    }
+                    let distilbert = distilbert_builder
                         .build(&weights_paths_ref, &db_config, &device, &dummy_varmap)
                         .map_err(|e| JammiError::Model {
                             model_id: resolved.model_id.0.clone(),
@@ -2814,10 +2924,14 @@ impl ModelBackend for CandleBackend {
                             model_id: resolved.model_id.0.clone(),
                             message: format!("Failed to parse DistilBERT config: {e}"),
                         })?;
-                    let model = DistilBert::builder()
+                    let mut distilbert_builder = DistilBert::builder()
                         .lora(lora_build)
                         .backbone_dtype(encoder_backbone_dtype)
-                        .adapter(encoder_adapter_file)
+                        .adapter(encoder_adapter_file);
+                    if let Some(lookup) = &gguf_lookup {
+                        distilbert_builder = distilbert_builder.weight_source(lookup);
+                    }
+                    let model = distilbert_builder
                         .build(&weights_paths_ref, &db_config, &device, &dummy_varmap)
                         .map_err(|e| JammiError::Model {
                             model_id: resolved.model_id.0.clone(),
@@ -2831,11 +2945,15 @@ impl ModelBackend for CandleBackend {
                             model_id: resolved.model_id.0.clone(),
                             message: format!("Failed to parse BERT config: {e}"),
                         })?;
-                    let bert = Bert::builder()
+                    let mut bert_builder = Bert::builder()
                         .pooling(Pooling::Mean)
                         .lora(lora_build)
                         .backbone_dtype(encoder_backbone_dtype)
-                        .adapter(encoder_adapter_file)
+                        .adapter(encoder_adapter_file);
+                    if let Some(lookup) = &gguf_lookup {
+                        bert_builder = bert_builder.weight_source(lookup);
+                    }
+                    let bert = bert_builder
                         .build(&weights_paths_ref, &bert_config, &device, &dummy_varmap)
                         .map_err(|e| JammiError::Model {
                             model_id: resolved.model_id.0.clone(),
@@ -2858,10 +2976,14 @@ impl ModelBackend for CandleBackend {
                             model_id: resolved.model_id.0.clone(),
                             message: format!("Failed to parse BERT config: {e}"),
                         })?;
-                    let bert = Bert::builder()
+                    let mut bert_builder = Bert::builder()
                         .lora(lora_build)
                         .backbone_dtype(encoder_backbone_dtype)
-                        .adapter(encoder_adapter_file)
+                        .adapter(encoder_adapter_file);
+                    if let Some(lookup) = &gguf_lookup {
+                        bert_builder = bert_builder.weight_source(lookup);
+                    }
+                    let bert = bert_builder
                         .build(&weights_paths_ref, &bert_config, &device, &dummy_varmap)
                         .map_err(|e| JammiError::Model {
                             model_id: resolved.model_id.0.clone(),
@@ -2878,11 +3000,15 @@ impl ModelBackend for CandleBackend {
                             model_id: resolved.model_id.0.clone(),
                             message: format!("Failed to parse ModernBERT config: {e}"),
                         })?;
-                    let backbone = ModernBert::builder()
+                    let mut modernbert_builder = ModernBert::builder()
                         .pooling(Pooling::Mean)
                         .lora(lora_build)
                         .backbone_dtype(encoder_backbone_dtype)
-                        .adapter(encoder_adapter_file)
+                        .adapter(encoder_adapter_file);
+                    if let Some(lookup) = &gguf_lookup {
+                        modernbert_builder = modernbert_builder.weight_source(lookup);
+                    }
+                    let backbone = modernbert_builder
                         .build(&weights_paths_ref, &mb_config, &device, &dummy_varmap)
                         .map_err(|e| JammiError::Model {
                             model_id: resolved.model_id.0.clone(),
@@ -2902,10 +3028,14 @@ impl ModelBackend for CandleBackend {
                             model_id: resolved.model_id.0.clone(),
                             message: format!("Failed to parse ModernBERT config: {e}"),
                         })?;
-                    let model = ModernBert::builder()
+                    let mut modernbert_builder = ModernBert::builder()
                         .lora(lora_build)
                         .backbone_dtype(encoder_backbone_dtype)
-                        .adapter(encoder_adapter_file)
+                        .adapter(encoder_adapter_file);
+                    if let Some(lookup) = &gguf_lookup {
+                        modernbert_builder = modernbert_builder.weight_source(lookup);
+                    }
+                    let model = modernbert_builder
                         .build(&weights_paths_ref, &mb_config, &device, &dummy_varmap)
                         .map_err(|e| JammiError::Model {
                             model_id: resolved.model_id.0.clone(),
@@ -2987,7 +3117,7 @@ impl ModelBackend for CandleBackend {
             // non-F32 backbone × F32 classifier matmul errors.
             let ner_vb = unsafe {
                 VarBuilder::from_mmaped_safetensors(
-                    &resolved.weights_paths,
+                    &vb_weights_paths,
                     encoder_backbone_dtype,
                     &device,
                 )
@@ -3047,10 +3177,21 @@ impl ModelBackend for CandleBackend {
             compute_precision: effective_precision,
             content_digest,
             fingerprint,
+            quantization: gguf_quantization,
         })))
     }
 
     fn estimate_memory(&self, resolved: &ResolvedModel) -> usize {
+        // GGUF (issue #351, pin V5): the resolver already computed a
+        // conservative, header-parsed residency figure at resolve time
+        // (`gguf::estimate_gguf_residency`) — reuse it verbatim rather than
+        // re-deriving anything from `weights_paths` here (which, for a GGUF
+        // model, is a single-file byte size wildly unrepresentative of
+        // resident memory). The safetensors/ONNX arm below is
+        // byte-identical to every prior release.
+        if resolved.weights_format == WeightsFormat::Gguf {
+            return resolved.estimated_memory;
+        }
         resolved
             .weights_paths
             .iter()
@@ -3266,40 +3407,6 @@ fn load_distribution_head(
                 message: format!("distribution LoRA scaling: {e}"),
             })?;
     Ok(Some(lora))
-}
-
-/// Normalize DistilBERT config fields to standard BERT names.
-///
-/// DistilBERT uses different field names and omits some fields that
-/// candle's `BertConfig` requires. This maps them to BERT equivalents.
-fn normalize_distilbert_config(config: &serde_json::Value) -> serde_json::Value {
-    let mut normalized = config.clone();
-    if let Some(obj) = normalized.as_object_mut() {
-        // Field renames: DistilBERT → BERT
-        let mappings: &[(&str, &str)] = &[
-            ("dim", "hidden_size"),
-            ("n_heads", "num_attention_heads"),
-            ("n_layers", "num_hidden_layers"),
-            ("hidden_dim", "intermediate_size"),
-            ("dropout", "hidden_dropout_prob"),
-            ("attention_dropout", "attention_probs_dropout_prob"),
-        ];
-        for &(src, dst) in mappings {
-            if let Some(val) = obj.get(src).cloned() {
-                obj.entry(dst).or_insert(val);
-            }
-        }
-        // activation → hidden_act (string value)
-        if let Some(val) = obj.get("activation").cloned() {
-            obj.entry("hidden_act").or_insert(val);
-        }
-        // Defaults for fields DistilBERT doesn't have but BertConfig requires
-        obj.entry("type_vocab_size")
-            .or_insert(serde_json::Value::from(2));
-        obj.entry("layer_norm_eps")
-            .or_insert(serde_json::json!(1e-12));
-    }
-    normalized
 }
 
 /// Resolve the inference device from configuration.
@@ -4015,6 +4122,7 @@ mod ner_nonfinite_logit_tests {
             // No real model directory backs this fixture either, so there is
             // nothing to fingerprint — `empty()` probes vacuously fresh.
             fingerprint: ModelFingerprint::empty(),
+            quantization: None,
         }
     }
 
@@ -4133,6 +4241,7 @@ mod digest_fingerprint_audit62_tests {
         ResolvedModel {
             model_id: crate::model::ModelId(format!("local:{}", dst.display())),
             backend: crate::model::BackendType::Candle,
+            weights_format: crate::model::WeightsFormat::Safetensors,
             task: ModelTask::TextEmbedding,
             config_path: dst.join("config.json"),
             weights_paths: vec![dst.join("model.safetensors")],
@@ -4902,6 +5011,7 @@ mod digest_fingerprint_audit62_tests {
         ResolvedModel {
             model_id: crate::model::ModelId(format!("local:{}", dst.display())),
             backend: crate::model::BackendType::Candle,
+            weights_format: crate::model::WeightsFormat::Safetensors,
             task: ModelTask::TextEmbedding,
             config_path,
             weights_paths: vec![dst.join("model.safetensors")],
@@ -5027,9 +5137,17 @@ mod digest_fingerprint_audit62_tests {
         } else {
             crate::model::BackendType::Candle
         };
+        let weights_format = if selected_name == "model.onnx" {
+            crate::model::WeightsFormat::Onnx
+        } else if selected_name == "model.gguf" {
+            crate::model::WeightsFormat::Gguf
+        } else {
+            crate::model::WeightsFormat::Safetensors
+        };
         ResolvedModel {
             model_id: crate::model::ModelId(format!("local:{}", dst.display())),
             backend,
+            weights_format,
             task: ModelTask::TextEmbedding,
             config_path: dst.join("config.json"),
             weights_paths: vec![weights_path],
@@ -5169,6 +5287,7 @@ mod digest_fingerprint_audit62_tests {
         ResolvedModel {
             model_id: crate::model::ModelId(format!("local:{}", dst.display())),
             backend: crate::model::BackendType::Candle,
+            weights_format: crate::model::WeightsFormat::Safetensors,
             task: ModelTask::TextEmbedding,
             config_path: dst.join("config.json"),
             weights_paths,
@@ -5327,6 +5446,7 @@ mod r5_f2_classification_pooling_tests {
         ResolvedModel {
             model_id: crate::model::ModelId(format!("local:{}", dst.display())),
             backend: crate::model::BackendType::Candle,
+            weights_format: crate::model::WeightsFormat::Safetensors,
             task: ModelTask::Classification,
             config_path: dst.join("config.json"),
             weights_paths: vec![dst.join("model.safetensors")],

@@ -220,6 +220,29 @@ pub struct ModelIdentity {
     /// computed. See [`ModelContentDigest`] for why this is not a bare
     /// `Option<String>`.
     pub content_digest: ModelContentDigest,
+    /// The GGUF/k-quant weight-storage format the model's weights were
+    /// loaded in, or `None` when the model ran unquantized (a dense
+    /// `f32`/`f16`/`bf16` weight tensor — the `compute_precision` field above
+    /// already names that case).
+    ///
+    /// `quantization` folds in here — the same place `compute_precision` and
+    /// `content_digest` do, for the same reason (see their doc comments
+    /// above): a `WeightQuantization` is a determinant of the weight BYTES a
+    /// model loaded, so it must enter the definition hash **uniformly for
+    /// every model-producing descriptor** the moment either records a
+    /// `ModelIdentity`, rather than requiring each new model-invoking
+    /// `ProducingDescriptor` variant to remember its own quantization field.
+    /// A `Q4K`-quantized run of a model is output-affecting relative to a
+    /// full-precision run of the same model over the same inputs — two such
+    /// runs must never collide on one materialization identity.
+    ///
+    /// `#[serde(skip_serializing_if = "Option::is_none")]` means an absent
+    /// key (a pre-feature row, or any row for a model that ran unquantized)
+    /// serialises to identical canonical bytes as before this field existed
+    /// — so every `DefinitionHash` recorded before this field was added is
+    /// preserved exactly; only a `Some` quantization changes the hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantization: Option<jammi_numerics::WeightQuantization>,
 }
 
 /// A model's content digest — the [`ModelIdentity`] determinant that closes
@@ -1103,6 +1126,7 @@ mod tests {
                 backend: "candle".into(),
                 compute_precision: ComputePrecision::F32,
                 content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
+                quantization: None,
             }],
         )
     }
@@ -1114,6 +1138,113 @@ mod tests {
         assert_eq!(
             definition_hash(&d, &env).unwrap(),
             definition_hash(&d, &env).unwrap()
+        );
+    }
+
+    /// HASH-PRESERVATION GOLDEN (issue #351, wave 2): `quantization: None`
+    /// must serialise to no key at all (`#[serde(skip_serializing_if =
+    /// "Option::is_none")]`), never a present `null` — a present-but-null key
+    /// would still change the canonical byte stream (and therefore every
+    /// existing `DefinitionHash`) relative to a pre-feature row that never
+    /// had this key in its JSON shape.
+    #[test]
+    fn quantization_none_serialises_to_no_key() {
+        let identity = ModelIdentity {
+            model_id: "sentence-transformers/all-MiniLM-L6-v2".into(),
+            backend: "candle".into(),
+            compute_precision: ComputePrecision::F32,
+            content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
+            quantization: None,
+        };
+        let value = serde_json::to_value(&identity).unwrap();
+        let object = value.as_object().unwrap();
+        assert!(
+            !object.contains_key("quantization"),
+            "quantization: None must serialise to no key, got {value:#?}"
+        );
+    }
+
+    /// HASH-PRESERVATION GOLDEN (issue #351, wave 2): the end-to-end
+    /// `definition_hash` for the representative `embedding_descriptor()` /
+    /// `cpu_env()` fixture (the same fixture `definition_hash_is_deterministic`
+    /// above uses) must still equal the value this exact fixture hashed to
+    /// BEFORE `ModelIdentity::quantization` existed. The literal below was
+    /// computed at base commit `309d1a10` (the commit this unit's contract
+    /// names as base; `jammi-db` is byte-identical between `309d1a10` and
+    /// wave 1's `7c90b328`, which touched only `jammi-numerics`/
+    /// `jammi-kernels`/`jammi-lora`/`jammi-encoders`) by temporarily adding a
+    /// `#[test] fn temp_print_golden_hash() { panic!("{}",
+    /// definition_hash(&embedding_descriptor(), &cpu_env()).unwrap()); }` to
+    /// this same test module at that commit, running
+    /// `cargo test -p jammi-db temp_print_golden_hash -- --nocapture`, and
+    /// copying the printed hex out of the panic message — then discarding
+    /// that scaffolding. If this test ever needs to change, no future edit
+    /// may just update the literal to match a new computed value; that would
+    /// silently rubber-stamp a migration. A migration is a new
+    /// `MANIFEST_VERSION` and a fresh golden recomputed at the NEW base.
+    #[test]
+    fn definition_hash_golden_is_preserved_across_the_quantization_fold() {
+        let d = embedding_descriptor();
+        let env = cpu_env();
+        let hash = definition_hash(&d, &env).unwrap();
+        assert_eq!(
+            hash.as_str(),
+            "bb0bb2f37aa2dcde1a2244d6e37f6ca9e8e73c04961c5009164eef72b426ecaa",
+            "definition_hash for the embedding_descriptor()/cpu_env() fixture drifted from \
+             the golden value computed at base commit 309d1a10 — the \
+             `quantization: None` fold must be byte-identical to the pre-feature shape, \
+             not a silent migration"
+        );
+    }
+
+    /// DISTINCTNESS (issue #351, wave 2): identical env except
+    /// `quantization: Some(Q4K)` vs `None` must hash differently — a
+    /// quantized run is output-affecting relative to a full-precision run of
+    /// the same model over the same inputs.
+    #[test]
+    fn quantization_some_differs_from_none() {
+        let d = embedding_descriptor();
+        let none_hash = definition_hash(&d, &cpu_env()).unwrap();
+
+        let mut quantized_env = cpu_env();
+        quantized_env.models[0].quantization = Some(jammi_numerics::WeightQuantization::Q4K);
+        let some_hash = definition_hash(&d, &quantized_env).unwrap();
+
+        assert_ne!(
+            none_hash, some_hash,
+            "quantization: Some(Q4K) must hash differently from quantization: None over an \
+             otherwise-identical ModelIdentity"
+        );
+    }
+
+    /// Serde round-trip (issue #351, wave 2): a pre-feature JSON row — one
+    /// with no `quantization` key at all, modelling what is actually on disk
+    /// from before this field existed — deserialises to `None` via
+    /// `#[serde(default)]`; a `Some` quantization round-trips through the
+    /// lowercase wire vocabulary `WeightQuantization` already defines
+    /// (`#[serde(rename_all = "lowercase")]`), so `Q4K` reads back as the
+    /// string `"q4k"`.
+    #[test]
+    fn quantization_serde_round_trips_and_pre_feature_rows_default_to_none() {
+        // A pre-feature row: no "quantization" key in the JSON at all.
+        let pre_feature_json = serde_json::json!({
+            "model_id": "sentence-transformers/all-MiniLM-L6-v2",
+            "backend": "candle",
+            "compute_precision": "f32",
+            "content_digest": {"state": "sha256", "value": "cpu-fixture-digest"},
+        });
+        let identity: ModelIdentity = serde_json::from_value(pre_feature_json).unwrap();
+        assert_eq!(identity.quantization, None);
+
+        // Some(Q4K) round-trips, and serialises as the lowercase wire tag.
+        let mut with_quant = identity.clone();
+        with_quant.quantization = Some(jammi_numerics::WeightQuantization::Q4K);
+        let value = serde_json::to_value(&with_quant).unwrap();
+        assert_eq!(value["quantization"], "q4k");
+        let back: ModelIdentity = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            back.quantization,
+            Some(jammi_numerics::WeightQuantization::Q4K)
         );
     }
 
@@ -1190,6 +1321,7 @@ mod tests {
                     backend: "candle".into(),
                     compute_precision: ComputePrecision::F32,
                     content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
+                    quantization: None,
                 }],
             ),
         )
@@ -1220,6 +1352,7 @@ mod tests {
                 backend: "candle".into(),
                 compute_precision: ComputePrecision::F32,
                 content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
+                quantization: None,
             }],
         );
         assert_ne!(base, definition_hash(&d, &other_model).unwrap());
@@ -1249,6 +1382,7 @@ mod tests {
                 backend: "candle".into(),
                 compute_precision: ComputePrecision::F32,
                 content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
+                quantization: None,
             }],
         );
         let f16_env = MaterializationEnv::new(
@@ -1258,6 +1392,7 @@ mod tests {
                 backend: "candle".into(),
                 compute_precision: ComputePrecision::F16,
                 content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
+                quantization: None,
             }],
         );
         assert_ne!(
@@ -1345,6 +1480,7 @@ mod tests {
         backend: String,
         compute_precision: ComputePrecision,
         content_digest: ModelContentDigest,
+        quantization: Option<jammi_numerics::WeightQuantization>,
     }
 
     fn model_identity_from_fields(p: &ModelIdentityFields) -> ModelIdentity {
@@ -1353,12 +1489,14 @@ mod tests {
             backend,
             compute_precision,
             content_digest,
+            quantization,
         } = p.clone();
         ModelIdentity {
             model_id,
             backend,
             compute_precision,
             content_digest,
+            quantization,
         }
     }
 
@@ -1373,6 +1511,7 @@ mod tests {
             backend: "candle".into(),
             compute_precision: ComputePrecision::F32,
             content_digest: ModelContentDigest::Sha256("base-digest".into()),
+            quantization: None,
         };
         let d = embedding_descriptor();
         let base_hash =
@@ -1393,6 +1532,9 @@ mod tests {
                 p.content_digest = ModelContentDigest::Unavailable(
                     ModelContentDigestUnavailableReason::ExternalImport,
                 )
+            }),
+            ("quantization (None -> Some(Q4K))", |p| {
+                p.quantization = Some(jammi_numerics::WeightQuantization::Q4K)
             }),
         ];
         for (label, mutate) in cases {

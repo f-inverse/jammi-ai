@@ -40,8 +40,8 @@
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder, VarMap};
 use jammi_lora::{
-    lora_epilogue_dispatch_snapshot, lora_linear_fused_dispatch_snapshot, LoraInitMode, LoraLinear,
-    MaybeLoraLinear,
+    lora_epilogue_dispatch_snapshot, lora_linear_fused_dispatch_snapshot, FrozenBase, LoraInitMode,
+    LoraLinear, MaybeLoraLinear,
 };
 
 fn cpu() -> Device {
@@ -351,7 +351,7 @@ fn esc_031_golden_holds_through_the_fused_path_with_dispatch_proof() {
         &vb,
     )
     .unwrap();
-    let frozen = MaybeLoraLinear::Frozen(w_for_frozen);
+    let frozen = MaybeLoraLinear::Frozen(FrozenBase::Dense(w_for_frozen));
 
     let before = lora_linear_fused_dispatch_snapshot();
     let lora_out = lora.forward(&x).unwrap();
@@ -982,4 +982,201 @@ fn rslora_irrational_scaling_agrees_between_fused_and_eager_arms_at_f32() {
          — a real divergence here would mean the fused epilogue silently uses a \
          DIFFERENT scaling than the documented eager formula"
     );
+}
+
+/// esc-031's quantized twin golden (issue #351): `Lora(Wq) == Frozen(Wq)`
+/// at `lora_b == 0`, mirroring `esc_031_golden_holds_through_the_fused_path_
+/// with_dispatch_proof`'s Dense golden above — but the PROOF shape is the
+/// opposite one: `LoraLinear::forward`'s own doc states a `Quantized` base
+/// NEVER touches `lora_linear_fused_counters()` at all (neither `Fused` nor
+/// `Eager` — the fused kernel's domain requires a dense weight `Tensor`
+/// argument, so a quantized base is never even offered to it), so the
+/// dispatch-counter proof here is that BOTH counts stay UNCHANGED across
+/// the forward, not that one of them increased.
+mod esc_031_quantized_twin {
+    use std::sync::Arc;
+
+    use candle_core::quantized::{GgmlDType, QTensor};
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::{VarBuilder, VarMap};
+    use jammi_lora::{FrozenBase, LoraInitMode, LoraLinear, MaybeLoraLinear, QuantizedLinear};
+
+    const IN: usize = 32; // Q8_0's block size — the domain [`QTensor::quantize`] requires.
+    const OUT: usize = 4;
+    const BATCH: usize = 3;
+
+    /// Deterministic, non-degenerate `[OUT, IN]` weight, quantized to
+    /// `Q8_0` — called TWICE per test (once for the `Frozen` arm, once for
+    /// the `Lora` arm) so the two arms hold INDEPENDENTLY quantized, but
+    /// content-identical, `QTensor`s (mirroring `build_base`'s own "same
+    /// construction every call" doc above).
+    fn quantized_weight() -> Arc<QTensor> {
+        let device = Device::Cpu;
+        let data: Vec<f32> = (0..OUT * IN)
+            .map(|i| ((i % 17) as f32 - 8.0) / 6.0)
+            .collect();
+        let w = Tensor::from_vec(data, (OUT, IN), &device).unwrap();
+        Arc::new(QTensor::quantize(&w, GgmlDType::Q8_0).unwrap())
+    }
+
+    fn input(device: &Device) -> Tensor {
+        let data: Vec<f32> = (0..BATCH * IN)
+            .map(|i| ((i % 13) as f32 - 6.0) / 5.0)
+            .collect();
+        Tensor::from_vec(data, (BATCH, IN), device).unwrap()
+    }
+
+    fn finite_count(t: &Tensor) -> usize {
+        t.flatten_all()
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .filter(|v| v.is_finite())
+            .count()
+    }
+
+    fn spread(t: &Tensor) -> f32 {
+        let v = t
+            .flatten_all()
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        v.iter().fold(f32::MIN, |a, b| a.max(*b)) - v.iter().fold(f32::MAX, |a, b| a.min(*b))
+    }
+
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        a.iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    #[test]
+    fn lora_wq_equals_frozen_wq_at_lora_b_zero() {
+        let device = Device::Cpu;
+        let x = input(&device);
+
+        let frozen = MaybeLoraLinear::Frozen(FrozenBase::Quantized(
+            QuantizedLinear::new(quantized_weight(), None).unwrap(),
+        ));
+
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let lora_base =
+            FrozenBase::Quantized(QuantizedLinear::new(quantized_weight(), None).unwrap());
+        let lora_inner = LoraLinear::new_with_base(
+            lora_base,
+            4,
+            8.0,
+            false,
+            LoraInitMode::ZerosB,
+            None,
+            31,
+            &varmap,
+            &vb,
+        )
+        .unwrap();
+        let lora = MaybeLoraLinear::Lora(lora_inner);
+
+        // The zero-delta premise, asserted BEFORE the comparison — without
+        // this, agreement below would be measuring "the LoRA contribution
+        // happens to be small", not the golden itself.
+        let MaybeLoraLinear::Lora(inner) = &lora else {
+            unreachable!("constructed as Lora")
+        };
+        let b_sum = inner
+            .lora_b
+            .abs()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert_eq!(b_sum, 0.0, "ZerosB must leave lora_b exactly zero");
+
+        // The "Quantized never touches the fused-site dispatch counters"
+        // claim is NOT re-checked here via a before/after snapshot: this
+        // integration-test BINARY runs every `#[test]` in this file
+        // CONCURRENTLY by default, and several sibling tests here
+        // (`training_mode_on_a_supported_dtype_dispatches_fused_and_is_counted`
+        // and friends) deliberately increment the SAME process-global
+        // counter — an exact before/after equality assertion would be
+        // flaky under that concurrency (a sibling test's own Dense
+        // dispatch could land between this test's two snapshots). The
+        // counter-untouched claim is instead pinned, isolation-safe,
+        // by `lora_linear.rs`'s own lib unit test
+        // `quantized_base_forward_never_touches_the_fused_dispatch_counters`
+        // (no other test in that binary calls `LoraLinear::forward` at
+        // all, so a before/after equality assertion there is race-free).
+        let fo = frozen.forward(&x).unwrap();
+        let lo = lora.forward(&x).unwrap();
+
+        // Non-vacuity: NaN fails every comparison bound in both directions,
+        // and a zeroed matmul would make any two outputs trivially agree.
+        assert_eq!(
+            finite_count(&fo),
+            fo.elem_count(),
+            "frozen output non-finite"
+        );
+        assert_eq!(finite_count(&lo), lo.elem_count(), "lora output non-finite");
+        assert!(spread(&fo) > 0.0, "frozen output is constant");
+        assert!(spread(&lo) > 0.0, "lora output is constant");
+
+        let delta = max_abs_diff(&fo, &lo);
+        assert_eq!(
+            delta, 0.0,
+            "with lora_b == 0 the LoRA arm is the frozen arm: Lora(Wq) must be \
+             bit-identical to Frozen(Wq), got delta={delta}"
+        );
+    }
+
+    /// Positive control: the harness above must actually be able to
+    /// DISCRIMINATE — with a NONZERO `lora_b` (Gaussian init), the two arms
+    /// must genuinely differ, proving `lora_wq_equals_frozen_wq_at_lora_b_
+    /// zero`'s `delta == 0.0` reading is a real agreement, not an artifact
+    /// of a fixture that always reads `delta == 0.0` regardless of
+    /// `lora_b`'s value.
+    #[test]
+    fn the_harness_discriminates_a_nonzero_lora_b() {
+        let device = Device::Cpu;
+        let x = input(&device);
+
+        let frozen = MaybeLoraLinear::Frozen(FrozenBase::Quantized(
+            QuantizedLinear::new(quantized_weight(), None).unwrap(),
+        ));
+
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let lora_base =
+            FrozenBase::Quantized(QuantizedLinear::new(quantized_weight(), None).unwrap());
+        let lora_inner = LoraLinear::new_with_base(
+            lora_base,
+            4,
+            8.0,
+            false,
+            LoraInitMode::Gaussian,
+            None,
+            31,
+            &varmap,
+            &vb,
+        )
+        .unwrap();
+        let lora = MaybeLoraLinear::Lora(lora_inner);
+
+        let fo = frozen.forward(&x).unwrap();
+        let lo = lora.forward(&x).unwrap();
+        let delta = max_abs_diff(&fo, &lo);
+        assert!(
+            delta > 1e-4,
+            "control void: Gaussian-initialized lora_b must produce a genuinely \
+             different output from the frozen arm, got delta={delta}"
+        );
+    }
 }

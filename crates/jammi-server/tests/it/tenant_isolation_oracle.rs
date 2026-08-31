@@ -1722,6 +1722,7 @@ async fn materialize_table_for_tenant_a() -> (Arc<InferenceSession>, Session, St
                     backend: "candle".into(),
                     compute_precision: ComputePrecision::F32,
                     content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
+                    quantization: None,
                 }],
             );
             let ctx = SessionContext::new();
@@ -2215,6 +2216,7 @@ async fn materialize_embedding_result_table(engine: &InferenceSession, source: &
             backend: "candle".into(),
             compute_precision: ComputePrecision::F32,
             content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
+            quantization: None,
         }],
     );
     store

@@ -116,6 +116,12 @@ pub(crate) mod low_rank_residual_linear;
 // at the flat `ops::` surface, mirroring `ATTENTION_BLOCK_*`'s own
 // rename-not-nested-path convention).
 mod mem_efficient_attention;
+// Private, mirroring `mem_efficient_attention`/`flash_attention`'s own
+// shape: `QuantMatMulGrad` holds `Arc<QTensor>` (an interior-mutable/
+// Arc-carried field, not a `Saved<T>` one — see its own module doc's
+// "repacked_qs" section), so `tests/stateful_op_discipline.rs`'s widened
+// scoping property sweeps this file into the discipline apparatus too.
+mod quant_matmul_grad;
 pub(crate) mod rope;
 pub(crate) mod rope_positions;
 mod saved;
@@ -192,6 +198,7 @@ pub use mem_efficient_attention::{
     mem_efficient_attention, MemEfficientAttention, MAX_SEQ as MEM_EFFICIENT_MAX_SEQ,
     MIN_CHUNK as MEM_EFFICIENT_MIN_CHUNK, WINDOW_MASKED_VALUE as MEM_EFFICIENT_WINDOW_MASKED_VALUE,
 };
+pub use quant_matmul_grad::{quant_matmul_grad, QuantMatMulGrad};
 pub use rope::{RopeFused, MAX_HEAD_DIM};
 pub use rope_positions::{rope_positions_fused_ragged, RopePositionsFused};
 pub use saved::{Saved, SavedError};

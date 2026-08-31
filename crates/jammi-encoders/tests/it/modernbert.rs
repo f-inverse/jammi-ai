@@ -3,12 +3,14 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarMap;
 use jammi_encoders::modernbert::ModernBertConfig;
-use jammi_encoders::{ModernBert, Pooling};
-use jammi_lora::{LoraBuildConfig, LoraInitMode};
+use jammi_encoders::{EncoderError, ModernBert, Pooling};
+use jammi_lora::{FrozenBase, LoraBuildConfig, LoraInitMode, QuantizedLinear};
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -755,4 +757,68 @@ fn padded_training_oracle_is_non_vacuous_including_pad_columns_changes_the_loss(
         "the oracle's real-rows-only reduction must actually EXCLUDE the pad columns, or this \
          whole test would vacuously pass regardless of a leak"
     );
+}
+
+/// A `weight_source` HIT whose quantized base geometry disagrees with
+/// `config.json` (a GGUF sized for the wrong `hidden_size`) must fail
+/// LOUDLY at `build()` — not be accepted and only surface as a
+/// mismatched-shape matmul at first `forward`. Every site queried returns
+/// the SAME wrong-shaped quantized base unconditionally, so the very first
+/// `LoraSite::build` call (layer 0's fused `attn.Wqkv`, expected
+/// `in_features=hidden_size, out_features=hidden_size*3`) is guaranteed to
+/// hit the mismatch.
+#[test]
+fn modernbert_rejects_a_weight_source_hit_with_mismatched_geometry() {
+    let device = Device::Cpu;
+    let config = load_config();
+    let varmap = VarMap::new();
+    let weights = weights_path();
+
+    // Matches `attn.Wqkv`'s expected out_features (hidden_size * 3) but
+    // doubles in_features (also a multiple of GgmlDType::Q8_0's 32-element
+    // block size) — disagrees with EVERY call site's expected
+    // `in_features`, since only `attn.Wqkv`'s out_features is 3x the rest.
+    let wrong_in_features = config.hidden_size * 2;
+    let wrong_out_features = config.hidden_size * 3;
+    let w_v: Vec<f32> = (0..wrong_out_features * wrong_in_features)
+        .map(|i| ((i as f64) * 0.037 + 0.3).sin() as f32)
+        .collect();
+    let w = Tensor::from_vec(w_v, (wrong_out_features, wrong_in_features), &device).unwrap();
+    let wrong_weight = Arc::new(QTensor::quantize(&w, GgmlDType::Q8_0).unwrap());
+
+    let lookup = move |_name: &str| -> Result<Option<FrozenBase>, EncoderError> {
+        Ok(Some(FrozenBase::Quantized(
+            QuantizedLinear::new(wrong_weight.clone(), None).unwrap(),
+        )))
+    };
+
+    // `ModernBert` does not implement `Debug`, so `Result::expect_err`
+    // (which requires `T: Debug` to format the panic message on an
+    // unexpected `Ok`) is not usable here — match explicitly instead.
+    let result = ModernBert::builder()
+        .pooling(Pooling::Mean)
+        .lora(LoraBuildConfig::frozen())
+        .backbone_dtype(DType::F32)
+        .adapter(None)
+        .weight_source(&lookup)
+        .build(&[weights.as_path()], &config, &device, &varmap);
+    let err = match result {
+        Ok(_) => panic!("wrong-shaped weight_source hit must fail at build(), not at forward()"),
+        Err(e) => e,
+    };
+
+    match err {
+        EncoderError::Config(msg) => {
+            assert!(
+                msg.contains("geometry mismatch"),
+                "expected a geometry-mismatch message, got: {msg}"
+            );
+            assert!(
+                msg.contains(&wrong_in_features.to_string())
+                    && msg.contains(&config.hidden_size.to_string()),
+                "expected the message to name expected/actual shapes, got: {msg}"
+            );
+        }
+        other => panic!("expected EncoderError::Config, got {other:?}"),
+    }
 }

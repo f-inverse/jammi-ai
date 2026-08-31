@@ -24,6 +24,11 @@ mod init;
 // `LoraError`'s every constructor lives in these modules, so it rides the gate too.
 #[cfg(feature = "candle")]
 mod error;
+// The frozen-base weight-source vocabulary (`FrozenBase`/`QuantizedLinear`)
+// — rides the same candle feature gate as `lora_linear`/`wrapper`, which
+// both depend on it.
+#[cfg(feature = "candle")]
+mod frozen_base;
 #[cfg(feature = "candle")]
 mod lora_linear;
 #[cfg(feature = "candle")]
@@ -39,6 +44,8 @@ pub use adapter::AdapterConfig;
 pub use config::{effective_rank, should_apply_lora, LoraBuildConfig};
 #[cfg(feature = "candle")]
 pub use error::LoraError;
+#[cfg(feature = "candle")]
+pub use frozen_base::{FrozenBase, QuantizedLinear};
 pub use init::LoraInitMode;
 // `AdapterConfig`'s `backbone_dtype` field is typed on `ComputePrecision`
 // (`jammi-numerics`'s candle-free compute-dtype vocabulary), re-exported here

@@ -143,6 +143,7 @@ fn env() -> MaterializationEnv {
             backend: "candle".into(),
             compute_precision: ComputePrecision::F32,
             content_digest: ModelContentDigest::Sha256("it-fixture-digest".into()),
+            quantization: None,
         }],
     )
 }

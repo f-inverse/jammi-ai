@@ -29,17 +29,20 @@
 
 #![cfg(feature = "cuda")]
 
+use candle_core::quantized::{GgmlDType, QStorage, QTensor};
 use candle_core::{DType, Device, Error, Layout, Tensor, Var, D};
 use half::bf16;
 use jammi_kernels::ops::{
     adamw_step_fused_t, apply1, apply2, apply3, apply_inplace2, bwd_gradient_gemm_layouts,
-    cast_add_bf16_into, cast_scale_bf16_f32_into, mem_efficient_attention, AdamMomentUpdate,
-    AdamMomentUpdateFmaContractedRedControl, AdamWParams, AttentionBlockFused, Axpy,
-    BwdGemmLayoutsParams, CastAddBf16, CastScaleBf16F32, DropoutFused, DropoutKey,
+    cast_add_bf16_into, cast_scale_bf16_f32_into, mem_efficient_attention, quant_matmul_grad,
+    AdamMomentUpdate, AdamMomentUpdateFmaContractedRedControl, AdamWParams, AttentionBlockFused,
+    Axpy, BwdGemmLayoutsParams, CastAddBf16, CastScaleBf16F32, DropoutFused, DropoutKey,
     FullyMaskedPolicy, GegluFused, GeluVariant, LayerNormFused, LowRankResidualLinear,
     MemEfficientAttention, PhiloxKatProbe, RopeFused, ScaledCastAdd, SoftmaxLastDimFused,
     ATTENTION_BLOCK_WINDOW_MASKED_VALUE, MEM_EFFICIENT_WINDOW_MASKED_VALUE,
 };
+use std::borrow::Cow;
+use std::sync::Arc;
 
 fn axpy(alpha: f64, x: &Tensor, y: &Tensor) -> candle_core::Result<Tensor> {
     apply2(x, y, Axpy::new(alpha))
@@ -10649,5 +10652,462 @@ fn mem_efficient_bwd_cuda_matches_cpu_bf16() {
         DType::BF16,
         MEM_EFFICIENT_MIN_CHUNK_FOR_TEST,
         MEM_EFFICIENT_BWD_BF16_BOUND,
+    );
+}
+
+// ---------------------------------------------------------------------
+// `QuantMatMulGrad` (issue #351 wave 17): CUDA-gated GPU parity oracles
+// for `ops::quant_matmul_grad` (`src/ops/quant_matmul_grad.rs`). That
+// file's own `#[cfg(test)]` module already proves forward/backward
+// correctness ON CPU ONLY (delegating to `QTensor::cpu_fwd`); every test
+// below instead exercises `QTensor::cuda_fwd`
+// (`candle-core` 0.11.0 `quantized/mod.rs:1007-1016`, itself delegating to
+// `QCudaStorage::fwd`, `quantized/cuda.rs:846-877`) -- the pod's
+// `cargo test -p jammi-kernels --features cuda` run (`ci/scripts/
+// runpod_gpu_prove.sh`) is the FIRST place this op's CUDA path runs at
+// all.
+// ---------------------------------------------------------------------
+
+/// Quantizes `w` (CPU `f32`) into a `GgmlDType` `QTensor` EXACTLY ONCE
+/// via `QTensor::quantize` (`quantized/mod.rs:543-561`, itself calling
+/// `QStorage::quantize` -> `k_quants.rs`'s per-dtype `GgmlType::
+/// from_float`), then builds a SECOND `QTensor`, resident on `cuda`, from
+/// the FIRST one's own raw bytes: `QTensor::data` (`quantized/mod.rs:754`,
+/// a `Cow<'_, [u8]>` borrow of the already-quantized storage) feeds
+/// `QStorage::from_data` (`quantized/mod.rs:94-125`; its `Device::Cuda`
+/// arm calls `cuda::load_quantized`, a straight host-to-device upload
+/// with NO re-quantization) and `QTensor::new` (`quantized/mod.rs:
+/// 533-540`). This is the literal "same QTensor bytes quantized once"
+/// contract: the CPU and CUDA `QTensor`s returned here carry
+/// BYTE-IDENTICAL quantized storage, so any forward divergence measured
+/// between them below is caused ONLY by the two dispatch paths'
+/// numerics (the CUDA `fast_mmvq`/`fast_mmq` arms' own Q8_1 activation
+/// quantization step, see [`q8_1_activation_quant_bound`]'s doc) -- never
+/// by two different quantizations of `W` disagreeing with each other.
+///
+/// `QTensor::cpu_fwd`/`cuda_fwd` each refuse a storage/dispatch mismatch
+/// (`cpu_fwd`'s `"Invalid storage"` `bail!` at `quantized/mod.rs:928`;
+/// `cuda_fwd`'s `unreachable!` at `:1014`) -- this is WHY two
+/// independently-constructed `Arc<QTensor>`s are required here at all,
+/// one CPU-resident and one CUDA-resident, never one shared `Arc` reused
+/// across a CPU call and a CUDA call.
+fn qmm_grad_weight_pair(
+    out_f: usize,
+    in_f: usize,
+    dtype: GgmlDType,
+    seed: f64,
+    cuda: &Device,
+) -> (Arc<QTensor>, Arc<QTensor>) {
+    let cpu = Device::Cpu;
+    let w_f32: Vec<f32> = (0..out_f * in_f)
+        .map(|i| ((i as f64) * 0.037 + seed).sin() as f32)
+        .collect();
+    let w = Tensor::from_vec(w_f32, (out_f, in_f), &cpu).unwrap();
+    let wq_cpu = QTensor::quantize(&w, dtype).unwrap();
+    let bytes = wq_cpu.data().unwrap().into_owned();
+    let cuda_storage = QStorage::from_data(Cow::Owned(bytes), cuda, dtype).unwrap();
+    let wq_cuda = QTensor::new(cuda_storage, wq_cpu.shape().clone()).unwrap();
+    (Arc::new(wq_cpu), Arc::new(wq_cuda))
+}
+
+/// Deterministic `f32` activation fixture, amplitude `<= 1.0` (mirrors
+/// `quant_matmul_grad.rs`'s own `make_x` exactly) -- the bounded amplitude
+/// is load-bearing for [`q8_1_activation_quant_bound`]'s derivation below,
+/// which is stated in terms of this fixture's own known amplitude rather
+/// than measuring it defensively at each call site.
+fn qmm_grad_x_fixture(rows: usize, in_f: usize, seed: f64) -> Vec<f32> {
+    (0..rows * in_f)
+        .map(|i| ((i as f64) * 0.091 + seed).cos() as f32)
+        .collect()
+}
+
+/// Headroom multiplier over [`q8_1_activation_quant_bound`]'s analytic
+/// worst case. This bound is DERIVED, not pod-measured: the host this
+/// test was authored on has no CUDA device to run it against (see this
+/// file's own `cuda_device` doc -- the pod session is this file's actual
+/// landing proof). Every assertion using this bound PRINTS its own
+/// measured `max_abs_diff` (`--nocapture`), so a pod run can confirm the
+/// analytic bound holds with real headroom to spare, the same "derive
+/// now, pod-confirm later" posture this file's `lora_linear_dx_abs_floor`
+/// doc already documents for a different op.
+const Q8_1_ACTIVATION_QUANT_MARGIN: f64 = 2.0;
+
+/// CPU `cpu_fwd` (`QTensor::matmul_t`, module doc: quantized `W` dotted
+/// against `x` at ITS OWN, unquantized, `f32` precision) and CUDA
+/// `cuda_fwd`'s fast paths diverge for exactly one reason once `W`'s
+/// bytes are held fixed (see [`qmm_grad_weight_pair`]): candle's CUDA
+/// `fast_mmvq`/`fast_mmq` BOTH re-quantize the ACTIVATION `x` to `Q8_1`
+/// before the dot product (`quantized/cuda.rs:48-95`'s `quantize_q8_1`
+/// CUDA kernel launch, invoked from `QCudaStorage::fwd`,
+/// `quantized/cuda.rs:846-877`) -- a quantization step `cpu_fwd` never
+/// performs at all. `Q8_1`'s own format (`k_quants.rs:741-800`'s
+/// `BlockQ8_1::from_float`, the CPU-side implementation of the IDENTICAL
+/// on-disk format the CUDA kernel must also produce to stay
+/// dequantization-compatible) quantizes each 32-element block
+/// (`Q8_1_BLOCK_SIZE`, `quantized/fast_mmvq.rs:13`) with scale `d =
+/// amax_block / 127`, round-to-nearest-int8 -- a half-ULP element-wise
+/// rounding error of at most `0.5 * d <= 0.5 * activation_amplitude /
+/// 127` (using the fixture's GLOBAL amplitude as an upper bound for any
+/// one block's own `amax_block`, since a block's max can never exceed the
+/// tensor's own max).
+///
+/// Because both forward paths dot-product against the IDENTICAL
+/// quantized `W` bytes, `W`'s own quantization error CANCELS in the
+/// CPU-vs-CUDA DIFFERENCE -- only the activation's `Q8_1` rounding
+/// survives as a first-order term. Propagated through one `k`-deep dot
+/// product against a weight row of magnitude at most `weight_amplitude`,
+/// the WORST CASE (every term's rounding error aligned in sign -- never
+/// assumed to cancel; family D's "never a confident wrong number" applied
+/// to the bound's own derivation, not just the op) is `k *
+/// weight_amplitude * 0.5 * activation_amplitude / 127`,
+/// [`Q8_1_ACTIVATION_QUANT_MARGIN`]-widened for the reasons in that
+/// constant's own doc.
+fn q8_1_activation_quant_bound(k: usize, weight_amplitude: f64, activation_amplitude: f64) -> f64 {
+    let per_element_rounding_err = 0.5 * activation_amplitude / 127.0;
+    Q8_1_ACTIVATION_QUANT_MARGIN * (k as f64) * weight_amplitude * per_element_rounding_err
+}
+
+/// Bundles one forward-parity leg's construction data into one value --
+/// the small-params-struct fix for `clippy::too_many_arguments` (no
+/// `#[allow]` per this file's own `LoraLinearParams` precedent) rather
+/// than a many-positional-argument function.
+#[derive(Clone, Copy)]
+struct QmmGradFwdLeg {
+    dtype: GgmlDType,
+    out_f: usize,
+    in_f: usize,
+    rows: usize,
+    seed_w: f64,
+    seed_x: f64,
+}
+
+/// Forward CPU<->CUDA parity for one [`QmmGradFwdLeg`], shared by the
+/// 3-dtype oracle and the kernel-arm sweep below. `label` identifies
+/// which arm/leg a failure or the printed measurement belongs to (family
+/// F9: every measured tolerance is printed with the test that produced
+/// it named).
+fn assert_qmm_grad_fwd_parity_cuda(cuda: &Device, label: &str, leg: QmmGradFwdLeg) {
+    let QmmGradFwdLeg {
+        dtype,
+        out_f,
+        in_f,
+        rows,
+        seed_w,
+        seed_x,
+    } = leg;
+    let (wq_cpu, wq_cuda) = qmm_grad_weight_pair(out_f, in_f, dtype, seed_w, cuda);
+    let x_v = qmm_grad_x_fixture(rows, in_f, seed_x);
+
+    let x_cpu = Tensor::from_vec(x_v.clone(), (rows, in_f), &Device::Cpu).unwrap();
+    let x_cuda = Tensor::from_vec(x_v, (rows, in_f), cuda).unwrap();
+
+    let y_cpu = quant_matmul_grad(&x_cpu, wq_cpu).unwrap();
+    let y_cuda = quant_matmul_grad(&x_cuda, wq_cuda).unwrap();
+    assert_eq!(
+        y_cpu.dims(),
+        &[rows, out_f],
+        "quant_matmul_grad fwd parity [{label}] {dtype:?}: unexpected CPU output shape"
+    );
+    assert_eq!(
+        y_cuda.dims(),
+        &[rows, out_f],
+        "quant_matmul_grad fwd parity [{label}] {dtype:?}: unexpected CUDA output shape"
+    );
+
+    let cpu_v = y_cpu.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let cuda_v = y_cuda.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+    let mut max_abs_diff = 0f64;
+    for (c, g) in cpu_v.iter().zip(cuda_v.iter()) {
+        max_abs_diff = max_abs_diff.max((f64::from(*c) - f64::from(*g)).abs());
+    }
+    let bound = q8_1_activation_quant_bound(in_f, 1.0, 1.0);
+    eprintln!(
+        "quant_matmul_grad fwd parity [{label}] {dtype:?} rows={rows} out_f={out_f} \
+         in_f={in_f}: max_abs_diff={max_abs_diff} bound={bound} (Q8_1 activation-quantization \
+         margin, Q8_1_ACTIVATION_QUANT_MARGIN={Q8_1_ACTIVATION_QUANT_MARGIN})"
+    );
+    assert!(
+        max_abs_diff < bound,
+        "quant_matmul_grad fwd parity [{label}] {dtype:?} rows={rows} out_f={out_f} \
+         in_f={in_f}: max_abs_diff {max_abs_diff} >= bound {bound}"
+    );
+}
+
+/// Oracle (1): forward CPU<->CUDA parity across the three formats the
+/// module doc's own CPU-only test already covers (`Q8_0`, `Q4_0`: last
+/// dim `% 32 == 0`; `Q4K`: last dim `== 256`, `QK_K`'s own block size) --
+/// this is the SAME leg, run cross-device instead of CPU-vs-dense-
+/// reference. `rows = 3` stays inside the `fast_mmvq` arm (`rows <=
+/// MMVQ_MAX_BATCH == 8`); the kernel-arm sweep below is what varies
+/// `rows` across the dispatch boundary.
+#[test]
+fn quant_matmul_grad_forward_parity_cpu_vs_cuda_q8_0_q4_0_q4k_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    for (dtype, out_f, in_f) in [
+        (GgmlDType::Q8_0, 4usize, 64usize),
+        (GgmlDType::Q4_0, 4usize, 64usize),
+        (GgmlDType::Q4K, 2usize, 256usize),
+    ] {
+        assert_qmm_grad_fwd_parity_cuda(
+            &cuda,
+            "3-dtype fwd, rows=3",
+            QmmGradFwdLeg {
+                dtype,
+                out_f,
+                in_f,
+                rows: 3,
+                seed_w: 0.5,
+                seed_x: 1.0,
+            },
+        );
+    }
+}
+
+/// Oracle (2): kernel-arm sweep. `QCudaStorage::fwd`
+/// (`quantized/cuda.rs:846-877`) dispatches ON BATCH SIZE alone (`b_size`,
+/// the product of every leading dim of `x`'s own shape -- `quant_matmul_
+/// grad`'s public helper passes `x` straight through as `rhs`, module
+/// doc: `x.contiguous()?` only, no reshape, so a rank-2 `x`'s `rows` IS
+/// `b_size` at the dispatch site): `fast_mmvq::try_fwd`
+/// (`quantized/fast_mmvq.rs:157-190`) is tried FIRST and handles
+/// `1 <= b_size <= MMVQ_MAX_BATCH` (`== 8`, `fast_mmvq.rs:38`);
+/// `fast_mmq::try_fwd` (`quantized/fast_mmq.rs:248-284`, no upper batch
+/// bound, requires only `k % qk_for(dtype) == 0` -- already guaranteed by
+/// `QTensor::quantize`'s own block-size check, `fast_mmq.rs:38-45`) is
+/// tried SECOND, exactly when `fast_mmvq` declines (`b_size >
+/// MMVQ_MAX_BATCH`). Each `rows` value below is named for the arm it
+/// exercises so the batch-size-dependent selection is demonstrated, not
+/// assumed; parity (via [`assert_qmm_grad_fwd_parity_cuda`]) must hold on
+/// every arm, for every dtype.
+#[test]
+fn quant_matmul_grad_forward_parity_kernel_arm_sweep_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let arms: [(&str, usize); 5] = [
+        ("fast_mmvq: single-row decode (rows=1)", 1),
+        ("fast_mmvq: mid-batch (rows=4)", 4),
+        ("fast_mmvq: MMVQ_MAX_BATCH boundary, still mmvq (rows=8)", 8),
+        ("fast_mmq: one past the mmvq boundary (rows=9)", 9),
+        ("fast_mmq: deep prefill batch (rows=16)", 16),
+    ];
+    let dtypes: [(GgmlDType, usize, usize); 3] = [
+        (GgmlDType::Q8_0, 4, 64),
+        (GgmlDType::Q4_0, 4, 64),
+        (GgmlDType::Q4K, 2, 256),
+    ];
+    for (arm, rows) in arms {
+        for (dtype, out_f, in_f) in dtypes {
+            assert_qmm_grad_fwd_parity_cuda(
+                &cuda,
+                arm,
+                QmmGradFwdLeg {
+                    dtype,
+                    out_f,
+                    in_f,
+                    rows,
+                    seed_w: 0.75,
+                    seed_x: 2.0,
+                },
+            );
+        }
+    }
+}
+
+/// Every element of `grad` must be finite (family F: a naive `diff <
+/// bound` comparison silently reads `NaN` as passing since `NaN < bound`
+/// is `false` only for the ASSERTION, not for a `NaN` masquerading as a
+/// small residual after a lossy cast elsewhere -- this is an explicit,
+/// independent, non-vacuous count-based control against non-finite
+/// values sneaking through, not a restatement of the tolerance check).
+fn assert_all_finite_by_count(label: &str, grad: &[f32]) {
+    let finite_count = grad.iter().filter(|v| v.is_finite()).count();
+    assert_eq!(
+        finite_count,
+        grad.len(),
+        "{label}: {finite_count}/{} gradient elements finite -- {} non-finite (NaN/Inf) \
+         element(s) present",
+        grad.len(),
+        grad.len() - finite_count,
+    );
+}
+
+/// Oracle (3): backward parity on CUDA. `quant_matmul_grad`'s own `bwd`
+/// (module doc: dequantize `W` once, then ONE dense `dy2 @ W_deq` GEMM,
+/// `src/ops/quant_matmul_grad.rs:260-305`) run ON CUDA is compared
+/// against (a) the SAME dense-dequantized reference computed
+/// INDEPENDENTLY on CUDA via candle's own autograd through `x @
+/// W_deq^T`, and (b) the CPU op's own gradient (identical math, different
+/// device). Unlike forward (`Q8_1` activation quantization, above),
+/// `bwd` NEVER quantizes an activation -- it is a plain `f32` GEMM on
+/// every device, so ordinary cuBLAS-vs-CPU-BLAS reduction-order noise
+/// (this file's own [`higham_bound`], whose leading `2.0` already covers
+/// "two different reduction orders disagreeing") is the only expected
+/// divergence; the contraction depth is `out_f` (`dy2 [m, out] @ W_deq
+/// [out, in]`), and the cotangent `dy` is a literal `ones` tensor
+/// (`sum_all().backward()`'s own cotangent), amplitude exactly `1.0` --
+/// so the bound is tiny and tight by construction, not widened for a
+/// mechanism (activation quantization) that does not exist on this path.
+#[test]
+fn quant_matmul_grad_backward_parity_cuda_dense_reference_and_cpu() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (out_f, in_f, rows) = (5usize, 64usize, 3usize);
+    let (wq_cpu, wq_cuda) = qmm_grad_weight_pair(out_f, in_f, GgmlDType::Q8_0, 0.25, &cuda);
+    let x_v = qmm_grad_x_fixture(rows, in_f, 2.0);
+
+    // The op's own bwd, on CUDA.
+    let x_op_cuda =
+        Var::from_tensor(&Tensor::from_vec(x_v.clone(), (rows, in_f), &cuda).unwrap()).unwrap();
+    let y_op_cuda = quant_matmul_grad(x_op_cuda.as_tensor(), wq_cuda.clone()).unwrap();
+    let grads_op_cuda = y_op_cuda.sum_all().unwrap().backward().unwrap();
+    let grad_op_cuda = grads_op_cuda.get(x_op_cuda.as_tensor());
+    assert!(
+        grad_op_cuda.is_some(),
+        "quant_matmul_grad bwd on CUDA must never be None (esc-037: candle's own \
+         backprop.rs:663 drops a None gradient silently)"
+    );
+    let grad_op_cuda_v = grad_op_cuda
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    assert_all_finite_by_count("quant_matmul_grad bwd cuda (op)", &grad_op_cuda_v);
+
+    // The dense dequantized reference, computed independently ON CUDA
+    // (dequantizing the SAME wq_cuda bytes the op's own bwd dequantizes).
+    let w_deq_cuda = wq_cuda.dequantize(&cuda).unwrap();
+    let x_dense_cuda =
+        Var::from_tensor(&Tensor::from_vec(x_v.clone(), (rows, in_f), &cuda).unwrap()).unwrap();
+    let y_dense_cuda = x_dense_cuda
+        .as_tensor()
+        .matmul(&w_deq_cuda.t().unwrap())
+        .unwrap();
+    let grads_dense_cuda = y_dense_cuda.sum_all().unwrap().backward().unwrap();
+    let grad_dense_cuda = grads_dense_cuda.get(x_dense_cuda.as_tensor());
+    assert!(
+        grad_dense_cuda.is_some(),
+        "dense dequantized reference bwd on CUDA must never be None"
+    );
+    let grad_dense_cuda_v = grad_dense_cuda
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    assert_all_finite_by_count(
+        "quant_matmul_grad bwd cuda (dense reference)",
+        &grad_dense_cuda_v,
+    );
+
+    // The CPU op's own gradient (same math, different device).
+    let x_op_cpu =
+        Var::from_tensor(&Tensor::from_vec(x_v, (rows, in_f), &Device::Cpu).unwrap()).unwrap();
+    let y_op_cpu = quant_matmul_grad(x_op_cpu.as_tensor(), wq_cpu).unwrap();
+    let grads_op_cpu = y_op_cpu.sum_all().unwrap().backward().unwrap();
+    let grad_op_cpu = grads_op_cpu.get(x_op_cpu.as_tensor());
+    assert!(
+        grad_op_cpu.is_some(),
+        "quant_matmul_grad bwd on CPU must never be None"
+    );
+    let grad_op_cpu_v = grad_op_cpu
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    assert_all_finite_by_count("quant_matmul_grad bwd cpu (op)", &grad_op_cpu_v);
+
+    // weight amplitude <= 1.0 by the sin-fixture construction
+    // (`qmm_grad_weight_pair`); dy amplitude == 1.0 exactly (`sum_all`'s
+    // own cotangent). chain_factor = 2.0: headroom over `higham_bound`'s
+    // already-included cross-order factor, matching this file's general
+    // "safety margin on top of the analytic minimum" convention -- this
+    // op's bwd is a single, unchained GEMM (module doc), so no further
+    // chaining multiplier is warranted the way `lora_linear_parity_
+    // tolerance`'s multi-GEMM outputs need.
+    let chain_factor = 2.0;
+    let bwd_bound = chain_factor * higham_bound(out_f, 1.0, F32_U);
+
+    let mut max_abs_diff_vs_dense = 0f64;
+    for (a, b) in grad_op_cuda_v.iter().zip(grad_dense_cuda_v.iter()) {
+        max_abs_diff_vs_dense = max_abs_diff_vs_dense.max((f64::from(*a) - f64::from(*b)).abs());
+    }
+    eprintln!(
+        "quant_matmul_grad bwd cuda vs dense-reference-on-cuda: \
+         max_abs_diff={max_abs_diff_vs_dense} bound={bwd_bound}"
+    );
+    assert!(
+        max_abs_diff_vs_dense < bwd_bound,
+        "quant_matmul_grad bwd cuda vs dense-reference-on-cuda: max_abs_diff \
+         {max_abs_diff_vs_dense} >= bound {bwd_bound}"
+    );
+
+    let mut max_abs_diff_vs_cpu = 0f64;
+    for (a, b) in grad_op_cuda_v.iter().zip(grad_op_cpu_v.iter()) {
+        max_abs_diff_vs_cpu = max_abs_diff_vs_cpu.max((f64::from(*a) - f64::from(*b)).abs());
+    }
+    eprintln!(
+        "quant_matmul_grad bwd cuda-op vs cpu-op: max_abs_diff={max_abs_diff_vs_cpu} \
+         bound={bwd_bound}"
+    );
+    assert!(
+        max_abs_diff_vs_cpu < bwd_bound,
+        "quant_matmul_grad bwd cuda-op vs cpu-op: max_abs_diff {max_abs_diff_vs_cpu} >= \
+         bound {bwd_bound}"
+    );
+}
+
+/// Oracle (4): eval-prune on CUDA. Mirrors `quant_matmul_grad.rs`'s own
+/// CPU-only `eval_path_output_carries_no_grad_op_and_matches_tracked_
+/// value` test, but with BOTH forward passes run ON CUDA (a "same-device
+/// comparison": the point is candle's own `BackpropOp::new1` self-pruning
+/// -- `op.rs:1100-1107`, `if arg.track_op() { Some(..) } else { None }`
+/// -- behaves identically when the op's `cuda_fwd` arm is the one that
+/// ran, not just `cpu_fwd`). An untracked (plain `Tensor`, not `Var`
+/// -derived) CUDA input must produce an output with `track_op() ==
+/// false` and a value bit-identical to the tracked forward's own CUDA
+/// output -- one code path serves both regimes (module doc), so there is
+/// no separate "eval" branch that could compute a different number.
+#[test]
+fn quant_matmul_grad_eval_prune_matches_tracked_value_on_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (out_f, in_f, rows) = (3usize, 32usize, 2usize);
+    let (_wq_cpu, wq_cuda) = qmm_grad_weight_pair(out_f, in_f, GgmlDType::Q4_0, 3.25, &cuda);
+    let x_v = qmm_grad_x_fixture(rows, in_f, 1.1);
+
+    let x_plain = Tensor::from_vec(x_v.clone(), (rows, in_f), &cuda).unwrap();
+    assert!(
+        !x_plain.track_op(),
+        "sanity: a plain (non-Var) Tensor must not track ops"
+    );
+    let y_plain = quant_matmul_grad(&x_plain, wq_cuda.clone()).unwrap();
+    assert!(
+        !y_plain.track_op(),
+        "an untracked CUDA input must produce an untracked CUDA output (self-pruned \
+         BackpropOp) -- no separate eval/train branch exists in quant_matmul_grad to get \
+         this wrong"
+    );
+
+    let x_tracked = Var::from_tensor(&Tensor::from_vec(x_v, (rows, in_f), &cuda).unwrap()).unwrap();
+    let y_tracked = quant_matmul_grad(x_tracked.as_tensor(), wq_cuda).unwrap();
+    assert!(
+        y_tracked.track_op(),
+        "sanity: a Var-derived CUDA input must track ops"
+    );
+
+    let plain_v = y_plain.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let tracked_v = y_tracked.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    assert_eq!(
+        plain_v, tracked_v,
+        "eval-path (untracked) CUDA output must be bit-identical to the tracked CUDA \
+         forward's own value (same-device comparison)"
     );
 }

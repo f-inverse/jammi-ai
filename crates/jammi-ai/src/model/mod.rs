@@ -117,6 +117,27 @@ pub enum BackendType {
     Http,
 }
 
+/// The on-disk STORAGE format of a resolved model's weight files — an
+/// explicit marker so a downstream consumer (the candle backend's load
+/// dispatch, the digest/fingerprint machinery) branches on THIS, never on
+/// sniffing `weights_paths`' file extension. Orthogonal to [`BackendType`]:
+/// `Gguf` is a weight-storage format the `Candle` backend alone knows how to
+/// load (issue #351) — an `Ort`-backed resolve never produces `Gguf` (the
+/// resolver's ORT arm only ever looks for `model.onnx`), so the pairing
+/// `(BackendType::Ort, WeightsFormat::Gguf)` is structurally unreachable
+/// through the resolver, not a case this type itself forbids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightsFormat {
+    /// One or more `*.safetensors` files (the historical default).
+    Safetensors,
+    /// A single `model.onnx` file (the `Ort` backend).
+    Onnx,
+    /// A single GGUF file (`model.gguf`, the literal canonical name — see
+    /// [`resolver::ModelResolver`]'s module doc) carrying k-quant and/or
+    /// dense tensors, loaded by the `Candle` backend's GGUF path.
+    Gguf,
+}
+
 /// What task this model performs.
 ///
 /// Re-exported from `jammi_db` so the engine — which owns the catalog
@@ -154,6 +175,8 @@ pub struct ResolvedModel {
     pub model_id: ModelId,
     /// Selected inference backend.
     pub backend: BackendType,
+    /// Weight-file storage format — see [`WeightsFormat`]'s own doc.
+    pub weights_format: WeightsFormat,
     /// ML task this model performs.
     pub task: ModelTask,
     /// Path to the model's `config.json`.
@@ -379,6 +402,23 @@ impl LoadedModel {
             LoadedModel::Ort(_) => Err(JammiError::Inference(
                 "ORT content digest not available in this build".into(),
             )),
+        }
+    }
+
+    /// The GGUF/k-quant weight-storage format this model's backbone was
+    /// loaded from — `Some` (the MODAL quantized dtype among the backbone's
+    /// matmul-site tensors, tie-broken by [`jammi_numerics::WeightQuantization`]'s
+    /// own `Ord`) for a `model.gguf` load, `None` for every safetensors/ONNX
+    /// load (issue #351). Output-affecting (a `Q4K` backbone emits different
+    /// bytes than an `F32` one), so the materialization contract folds it
+    /// into `ModelIdentity.quantization` alongside `backend_kind` /
+    /// `compute_precision` / `content_digest`. The ORT backend never loads a
+    /// GGUF file (see `WeightsFormat::Gguf`'s own doc), so it always
+    /// reports `None`.
+    pub fn quantization(&self) -> Option<jammi_numerics::WeightQuantization> {
+        match self {
+            LoadedModel::Candle(m) => m.quantization,
+            LoadedModel::Ort(_) => None,
         }
     }
 

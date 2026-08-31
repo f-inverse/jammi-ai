@@ -3,12 +3,14 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarMap;
 use jammi_encoders::bert::BertConfig;
 use jammi_encoders::{Bert, EncoderError, Pooling};
-use jammi_lora::{LoraBuildConfig, LoraInitMode};
+use jammi_lora::{FrozenBase, LoraBuildConfig, LoraInitMode, QuantizedLinear};
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cookbook/fixtures/tiny_bert")
@@ -341,5 +343,73 @@ fn bert_max_seq_length_check() {
         }
         Err(other) => panic!("expected SequenceTooLong, got {other:?}"),
         Ok(_) => panic!("expected SequenceTooLong, got Ok"),
+    }
+}
+
+/// A `weight_source` HIT whose quantized base geometry disagrees with
+/// `config.json` (a GGUF sized for the wrong `in_features`, e.g. a checkpoint
+/// built for a different `hidden_size`) must fail LOUDLY at `build()` — not
+/// be accepted and only surface as a mismatched-shape matmul at first
+/// `forward`. Every site queried returns the SAME wrong-shaped quantized
+/// base unconditionally, so the very first `LoraSite::resolve_base` call
+/// (layer 0's `query` projection) is guaranteed to hit the mismatch.
+#[test]
+fn bert_rejects_a_weight_source_hit_with_mismatched_geometry() {
+    let device = Device::Cpu;
+    let config = load_config();
+    let varmap = VarMap::new();
+    let weights = weights_path();
+
+    // tiny_bert's hidden_size is 32; every attention/FFN linear at this
+    // fixture is square (h -> h) or (h -> intermediate) — a base sized
+    // in_features=64 (double the true hidden_size, and a multiple of
+    // GgmlDType::Q8_0's 32-element block size) disagrees with EVERY call
+    // site's expected shape.
+    let wrong_in_features = config.hidden_size * 2;
+    let wrong_out_features = config.hidden_size;
+    let w_v: Vec<f32> = (0..wrong_out_features * wrong_in_features)
+        .map(|i| ((i as f64) * 0.037 + 0.3).sin() as f32)
+        .collect();
+    let w = Tensor::from_vec(w_v, (wrong_out_features, wrong_in_features), &device).unwrap();
+    let wrong_weight = Arc::new(QTensor::quantize(&w, GgmlDType::Q8_0).unwrap());
+
+    // The lookup returns the SAME wrong-shaped quantized weight for every
+    // queried name (an `Arc` clone, cheap and shareable across the `Fn`
+    // trait object's repeated calls) — every site the builder queries hits
+    // the same mismatch.
+    let lookup = move |_name: &str| -> Result<Option<FrozenBase>, EncoderError> {
+        Ok(Some(FrozenBase::Quantized(
+            QuantizedLinear::new(wrong_weight.clone(), None).unwrap(),
+        )))
+    };
+
+    // `Bert` does not implement `Debug`, so `Result::expect_err` (which
+    // requires `T: Debug` to format the panic message on an unexpected
+    // `Ok`) is not usable here — match explicitly instead.
+    let result = Bert::builder()
+        .pooling(Pooling::Mean)
+        .lora(LoraBuildConfig::frozen())
+        .backbone_dtype(DType::F32)
+        .adapter(None)
+        .weight_source(&lookup)
+        .build(&[weights.as_path()], &config, &device, &varmap);
+    let err = match result {
+        Ok(_) => panic!("wrong-shaped weight_source hit must fail at build(), not at forward()"),
+        Err(e) => e,
+    };
+
+    match err {
+        EncoderError::Config(msg) => {
+            assert!(
+                msg.contains("geometry mismatch"),
+                "expected a geometry-mismatch message, got: {msg}"
+            );
+            assert!(
+                msg.contains(&wrong_in_features.to_string())
+                    && msg.contains(&config.hidden_size.to_string()),
+                "expected the message to name expected/actual shapes, got: {msg}"
+            );
+        }
+        other => panic!("expected EncoderError::Config, got {other:?}"),
     }
 }

@@ -1815,11 +1815,80 @@ staleness→recompute loop — that is the platform's, not the engine's
   actually registered in a VarMap; the mmaped-load path leaves saved weights untouched.
   *This dual-path behavior is the single subtlest contract in the crate.*
 - **`MaybeLoraLinear`** — `crates/jammi-lora/src/wrapper.rs` (the `MaybeLoraLinear`
-  enum): closed enum `{ Frozen(Linear), Lora(LoraLinear) }`, decided **once at
-  construction** (`LoraSite::build`). `Frozen.forward` casts input to the weight dtype;
-  all other methods are no-ops on `Frozen`. This is the static-dispatch LoRA injection
-  point — used by `jammi-encoders` to hold attention/MLP linears (e.g.
-  `crates/jammi-encoders/src/bert.rs`).
+  enum): closed enum `{ Frozen(FrozenBase), Lora(LoraLinear) }`, decided **once at
+  construction** (`LoraSite::build`). `Frozen.forward` delegates to
+  `FrozenBase::forward`; all other methods are no-ops on `Frozen`. This is the
+  static-dispatch LoRA injection point — used by `jammi-encoders` to hold
+  attention/MLP linears (e.g. `crates/jammi-encoders/src/bert.rs`).
+- **`FrozenBase` + `QuantizedLinear`** — `crates/jammi-lora/src/frozen_base.rs`:
+  the closed enum naming what a frozen base weight (`MaybeLoraLinear::Frozen`'s
+  layer, or `LoraLinear`'s base) is stored as — `Dense(candle_nn::Linear)`
+  (every safetensors-loaded path, byte-unchanged) or
+  `Quantized(QuantizedLinear)` (a GGUF-quantized weight: `Arc<QTensor>`
+  `[out_features, in_features]` plus an optional dense bias). A closed
+  `match`, never a trait object, so a third arm added later fails to
+  *compile* every consumer that does not handle it. **The uniform F32
+  activation rule:** `QuantizedLinear::forward` always casts its input to
+  `F32` before the quantized matmul and casts the result back to the input's
+  original dtype — the one dtype every backend (CPU, CUDA, Metal) accepts
+  without hitting a candle-internal panic (Metal's own quantized-matmul path
+  asserts `F32` internally, not a typed error), never a per-device dtype
+  table. `FrozenBase::dweight_needed` is the fused `LowRankResidualLinear`
+  site's gate for whether `bwd` must compute `dW`: `Dense` routes through
+  the existing `frozen_weight_gate` three-way classification unchanged;
+  `Quantized` is CONSTANT `false` — a `QTensor` has no `is_variable`
+  accessor and is never constructed from a `Var` anywhere in this
+  workspace, so the "trainable base" / "ambiguous tracked-non-`Var`" cases
+  `frozen_weight_gate` exists to classify for `Dense` have no reachable
+  `Quantized` analogue at all.
+- **`quant_matmul_grad`** — `crates/jammi-kernels/src/ops/quant_matmul_grad.rs`
+  (`QuantMatMulGrad`, a `CustomOp1` wrapping `Arc<candle_core::quantized::
+  QTensor>`): the ONLY quantized-weight matmul entry point in the workspace,
+  and ALWAYS differentiable — never candle's own `QMatMul`/`apply_op1_no_bwd`.
+  `bwd` computes `dx = dy @ W` (gradient wrt the input only — there is no
+  gradient wrt a quantized weight; a frozen base is never trained through
+  directly, quantized or not, the same `bitsandbytes` `MatMul4Bit` contract)
+  and never returns `Ok(None)` for that slot — candle's own
+  `Tensor::backward()` drops a `None` gradient SILENTLY, indistinguishable
+  from a correctly-computed all-zero gradient, so a `bwd` that returned
+  `Ok(None)` here would look successful right up until a real training run
+  quietly stopped learning through it. Reached exclusively through
+  `super::apply_stateful1` (`BackpropOp::new1` self-prunes for eval — one
+  code path serves both regimes, no train/eval branch in this op at all),
+  never candle's `apply_op1_no_bwd`. This closes the `QMatMul` half of
+  `esc-037`'s named risk (`.jammi/escapes.jsonl`) for every quantized-weight
+  matmul this workspace's own production code loads today (grep-verified: no
+  live call site anywhere in the workspace uses `QMatMul::forward` or
+  `apply_op1_no_bwd` on a quantized weight); that property is MECHANICALLY
+  enforced only within `jammi-kernels/src` (its own forbidden-needle scan,
+  `tests/stateful_op_discipline.rs`, walks `jammi-kernels/src` ONLY — not
+  `jammi-lora`, `jammi-encoders`, or `jammi-ai`), so nothing structurally
+  stops a future call site in one of those other crates from reintroducing
+  `QMatMul::forward`/`apply_op1_no_bwd` on a quantized weight — that half of
+  the class stays review-enforced, not mechanically closed. `esc-037`'s
+  other named entry points (`candle_nn::ops::softmax_last_dim`'s remaining
+  eval call site, `candle_nn::ops::sdpa`) are untouched by this op and stay
+  open/latent respectively (that row's own notes).
+- **QLoRA (fine-tuning over a quantized base)** —
+  `crates/jammi-ai/src/fine_tune/worker.rs` (`build_encoder_adapters`): a
+  GGUF base artifact (`model.gguf` present, `model.safetensors` absent — the
+  same FROZEN precedence the resolver applies, §2.7) SELECTS training over
+  `FrozenBase::Quantized` sites; there is no separate QLoRA knob, trainer
+  mode, or wire field. The base's matmul-site tensors load through the SAME
+  `crate::model::backend::gguf::load_gguf_backbone` the inference path uses,
+  so a QLoRA fine-tune and an inference load of the same `model.gguf` can
+  never silently disagree on which tensors are matmul-site or which dtype
+  loaded. LoRA trains its usual low-rank adapters over the frozen quantized
+  backbone, never the backbone itself — `FrozenBase::dweight_needed` being
+  constant `false` for `Quantized` means the fused LoRA site's `bwd` never
+  even attempts a `dW` it structurally could not produce. **Correct by
+  construction, not merely tested:** because `quant_matmul_grad`'s `bwd`
+  always returns a real, non-`None` gradient rather than silently dropping
+  it, a QLoRA training pass cannot silently truncate the gradient reaching
+  the adapter the way a `None`-returning or no-bwd quantized matmul would —
+  the fail-loud property closes a class of bug that would otherwise look
+  like a converging, healthy training run with a permanently-frozen
+  adapter.
 - **`LoraBuildConfig` + selection helpers** — `crates/jammi-lora/src/config.rs` (the
   `LoraBuildConfig` struct): borrowed-ref, `Copy`, stack-built per call.
   `should_apply_lora` uses **suffix** match (`ends_with`); `effective_rank` uses
@@ -2160,6 +2229,98 @@ note below.
   the frozen "files located, backend chosen, not loaded" struct (resolver → backend
   contract).
 
+**GGUF/k-quant weight loading (`jammi-ai/model/resolver.rs` + `model/backend/gguf.rs`)**
+
+- **`WeightsFormat`** — `crates/jammi-ai/src/model/mod.rs` (the `WeightsFormat`
+  enum): `Safetensors` | `Onnx` | `Gguf`, the on-disk STORAGE format of a
+  resolved model's weight files, carried on `ResolvedModel.weights_format`.
+  Orthogonal to `BackendType`: `Gguf` is a weight-storage format only the
+  `Candle` backend loads — the resolver's ORT arm only ever looks for
+  `model.onnx`, so `(Ort, Gguf)` is structurally unreachable through the
+  resolver, not a case this type itself forbids.
+- **The `model.gguf` literal-filename contract** —
+  `crates/jammi-ai/src/model/resolver.rs` (`GGUF_WEIGHTS_FILENAME`): mirrors
+  `model.safetensors`/`model.onnx`'s own convention — the digest-slot
+  machinery (`backend::candle::all_candidate_paths`) stats known names only,
+  never sniffs by extension, so a quantized checkpoint must be named exactly
+  `model.gguf`. **Precedence is FROZEN:** `model.safetensors` (or
+  `open_clip_model.safetensors`) wins, byte-for-byte, exactly as before this
+  format existed — for a local directory, an HF Hub repo, AND a QLoRA
+  fine-tune's own base-artifact resolution (§2.6) alike. Only when neither
+  is present does `model.gguf` enter the picture. A directory or repo
+  carrying some OTHER `*.gguf` filename is a typed refusal naming every such
+  file and pointing at the convention, never a silent extension-sniff or a
+  fallback to the first `*.gguf` found.
+- **`config.json` is required — llama.cpp-style metadata-embedded GGUFs are
+  not a supported checkpoint shape.** Architecture (`model_type`) and layer
+  count (`num_hidden_layers`/`num_layers`) are read from the model
+  directory's `config.json`, the SAME source every safetensors load already
+  uses — never from the GGUF file's own key-value metadata (`general.
+  architecture`, `block_count`, etc., the convention some GGUF exporters
+  embed instead of shipping a sidecar `config.json`). A `model.gguf` with no
+  accompanying `config.json`, or one missing the layer-count key, is a typed
+  refusal ("GGUF load requires num_hidden_layers (or num_layers) in
+  config.json"), never a metadata-sniffing fallback into the GGUF file
+  itself.
+- **Three supported architectures; everything else is a typed refusal** —
+  `crates/jammi-ai/src/model/backend/gguf.rs` (`GgufArchitecture::
+  from_model_type`): BERT-family (`bert`/`roberta`/`camembert`/
+  `xlm-roberta`), `distilbert`, `modernbert` — the three text towers
+  `jammi-encoders`' `FrozenWeightLookup` seam (`crates/jammi-encoders/src/
+  frozen_weight_source.rs`) is wired into. OpenCLIP and HF-CLAP checkpoints
+  refuse at `CandleBackend::load`'s GGUF branch ("quantized serving not
+  supported for this architecture") — GGUF loading is threaded ONLY through
+  the three text towers named above.
+- **Matmul-site vs. everything else** — a "matmul-site" tensor is a
+  weight/bias one of the encoder's own per-layer linear modules routes
+  through `FrozenWeightLookup` (six per BERT-family/DistilBERT layer, four
+  per ModernBERT layer — bias-free). A matmul-site tensor stored at a
+  genuine k-quant dtype loads as `jammi_lora::FrozenBase::Quantized` and
+  NEVER gets dequantized at load — it stays resident as an `Arc<QTensor>`
+  (§2.6). Every OTHER tensor — embeddings, LayerNorms, classifier/NER heads,
+  and a matmul-site tensor that merely happens to be stored densely
+  (`F32`/`F16`/`BF16`, not k-quantized) — is dequantized to the model's
+  compute dtype at load and densified into a synthesized in-memory
+  safetensors file (`GgufBackbone::densified_path`) that every construction
+  site which never consults the lookup (embeddings, norms, heads) reads
+  exactly the way it reads a real safetensors checkpoint. A malformed
+  header, an element count that is not a multiple of its dtype's own block
+  size, an unsupported GGML dtype (neither a k-quant `WeightQuantization`
+  format nor `F32`/`F16`/`BF16`), or a missing required matmul-site tensor
+  is a typed refusal naming the tensor(s) and dtype, never a silent skip or
+  a deep candle panic surfacing mid-load.
+- **Resolve-time residency estimation** —
+  `crates/jammi-ai/src/model/backend/gguf.rs` (`estimate_gguf_residency`):
+  parses ONLY the GGUF header (never tensor data — `gguf_file::Content::
+  read` reads tensor bytes on demand, per-name, via a separate call) and
+  returns a CONSERVATIVE (≥ true residency) byte figure — a matmul-site
+  k-quant tensor is costed at its own storage size plus candle's own
+  quantized-CUDA-loader row-padding constant (applied unconditionally,
+  regardless of the actual target device, so the estimate stays
+  conservative on every device); every other tensor is costed as
+  dequantized-to-compute-dtype; the single largest per-tensor dequantize
+  TRANSIENT (`stored + 4·N + target·N` — candle's own `QTensor::dequantize`
+  always produces `F32` first, before any narrowing cast) is added ONCE,
+  covering the worst-case peak buffer overlap during load rather than
+  summing every tensor's transient. `CandleBackend::estimate_memory` reuses
+  this resolver-computed figure verbatim for a GGUF-resolved model rather
+  than re-deriving anything from `weights_paths` (a single `model.gguf`
+  file's raw byte size is wildly unrepresentative of resident memory).
+- **`ModelIdentity.quantization`** —
+  `crates/jammi-db/src/store/manifest.rs` (`ModelIdentity::quantization:
+  Option<jammi_numerics::WeightQuantization>`): the MODAL `WeightQuantization`
+  among a GGUF backbone's matmul-site tensors (ties broken by that type's
+  own `Ord`, i.e. GGUF wire-ID order), `None` for every safetensors/ONNX
+  load. Folds in alongside `compute_precision`/`content_digest` (`#[serde
+  (default, skip_serializing_if = "Option::is_none")]`, preserving every
+  pre-existing `DefinitionHash` byte-for-byte — a `None` serialises to no
+  key at all, never a present `null`) because a quantized run is
+  output-affecting relative to a full-precision run of the same model over
+  the same inputs: two such runs must never collide on one materialization
+  identity. `LoadedModel::quantization()` (`crates/jammi-ai/src/model/
+  mod.rs`) is the read path both `session.rs` and `pipeline/embedding.rs`
+  consult.
+
 **Catalog identity — the durable model row (`jammi-db/catalog/model_repo.rs`)**
 
 The catalog model surface is exactly five verbs. `Catalog` owns the SQL;
@@ -2290,6 +2451,27 @@ describing a removed surface.
   (`crates/jammi-numerics/src/classification.rs`). Metric structs (`RelevanceJudgment`,
   `QueryMetrics`, `AggregateMetrics`, `ClassMetrics`) derive serde and **cross the wire**
   via `jammi-wire` — field changes are wire-schema changes.
+- **`ComputePrecision`** — `crates/jammi-numerics/src/precision.rs`: the
+  floating-point dtype (`F32`/`F16`/`BF16`) a backbone's weights and
+  activations run at; `F32` is its `Default` — maximally compatible, the
+  byte-parity oracle's baseline.
+- **`WeightQuantization`** — `crates/jammi-numerics/src/quantization.rs` (the
+  `WeightQuantization` enum): the GGUF/k-quant weight-STORAGE-format
+  vocabulary — `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2K`, `Q3K`, `Q4K`,
+  `Q5K`, `Q6K` — a PEER of `ComputePrecision`, never a variant folded into
+  it: `ComputePrecision` names the dtype activations and unquantized
+  weights/matmuls run at; `WeightQuantization` names how a weight's bytes
+  are packed AT REST on disk, a storage concern orthogonal to compute
+  dtype — a `q4_0` weight is always dequantized to `F32` before any matmul
+  touches it (`jammi_lora::QuantizedLinear`'s uniform-F32-activation rule,
+  §2.6). `Ord`/`PartialOrd` are a MANUAL impl keyed on `gguf_wire_id()` (the
+  GGML wire ID GGUF itself assigns each dtype, `ggml.h`'s `enum ggml_type`),
+  never declaration order, so a sorted `Vec<WeightQuantization>` reproduces
+  GGUF's own wire order deterministically. No `Default`: unlike
+  `ComputePrecision`'s `F32`, there is no quantization format a caller
+  should silently fall into — whether a weight is quantized at all, and to
+  which format, is inherent to the GGUF file it loaded from, never a knob
+  with a sensible implicit value.
 - Sub-module families: `calibration`, `divergence`, `stats`, `gp`, `histogram`, `ner`,
   `pareto`. All deterministic, seeded-RNG-only [§5].
 

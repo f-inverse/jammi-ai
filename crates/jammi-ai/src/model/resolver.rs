@@ -5,7 +5,19 @@ use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::store::ArtifactStore;
 
-use super::{BackendType, ModelId, ModelSource, ModelTask, ResolvedModel, TokenizerSource};
+use super::backend::gguf::estimate_gguf_residency;
+use super::{
+    BackendType, ModelId, ModelSource, ModelTask, ResolvedModel, TokenizerSource, WeightsFormat,
+};
+
+/// The canonical GGUF weight filename (issue #351): mirrors
+/// `model.safetensors`/`model.onnx`'s own literal-filename convention — the
+/// digest-slot machinery (`backend::candle::all_candidate_paths`) stats
+/// known names only, so a GGUF checkpoint must be named exactly this, never
+/// sniffed by extension. A directory carrying some OTHER `*.gguf` filename
+/// is a typed refusal naming the file(s) found and this convention — see
+/// `ModelResolver::resolve_local`/`ModelResolver::resolve_hf_hub`.
+const GGUF_WEIGHTS_FILENAME: &str = "model.gguf";
 
 /// Resolves a `ModelSource` to file paths and backend selection.
 pub struct ModelResolver {
@@ -101,6 +113,7 @@ impl ModelResolver {
                 return Ok(Some(ResolvedModel {
                     model_id,
                     backend: base_resolved.backend,
+                    weights_format: base_resolved.weights_format,
                     task,
                     config_path: base_resolved.config_path,
                     weights_paths: base_resolved.weights_paths,
@@ -153,14 +166,17 @@ impl ModelResolver {
         });
 
         // Reconstruct weights paths from the artifact directory
-        let weights_paths: Vec<PathBuf> = match backend {
+        let (weights_paths, weights_format): (Vec<PathBuf>, WeightsFormat) = match backend {
             BackendType::Candle => {
                 let standard = artifact_dir.join("model.safetensors");
                 let open_clip = artifact_dir.join("open_clip_model.safetensors");
+                let gguf = artifact_dir.join(GGUF_WEIGHTS_FILENAME);
                 if standard.exists() {
-                    vec![standard]
+                    (vec![standard], WeightsFormat::Safetensors)
                 } else if open_clip.exists() {
-                    vec![open_clip]
+                    (vec![open_clip], WeightsFormat::Safetensors)
+                } else if gguf.exists() {
+                    (vec![gguf], WeightsFormat::Gguf)
                 } else {
                     return Ok(None);
                 }
@@ -168,7 +184,7 @@ impl ModelResolver {
             BackendType::Ort => {
                 let p = artifact_dir.join("model.onnx");
                 if p.exists() {
-                    vec![p]
+                    (vec![p], WeightsFormat::Onnx)
                 } else {
                     return Ok(None);
                 }
@@ -178,17 +194,22 @@ impl ModelResolver {
 
         let tokenizer = discover_local_tokenizer(&artifact_dir);
 
-        let estimated_memory: usize = weights_paths
-            .iter()
-            .filter_map(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len() as usize)
-            .sum();
+        let estimated_memory: usize = if weights_format == WeightsFormat::Gguf {
+            estimate_gguf_residency(&weights_paths[0], &model_config, &model_id.0)?
+        } else {
+            weights_paths
+                .iter()
+                .filter_map(|p| std::fs::metadata(p).ok())
+                .map(|m| m.len() as usize)
+                .sum()
+        };
 
         let pooling_config = read_local_pooling_config(&artifact_dir, &model_id.0)?;
 
         Ok(Some(ResolvedModel {
             model_id,
             backend,
+            weights_format,
             task,
             config_path,
             weights_paths,
@@ -238,12 +259,20 @@ impl ModelResolver {
         let has_safetensors = path.join("model.safetensors").exists()
             || path.join("open_clip_model.safetensors").exists();
         let has_onnx = path.join("model.onnx").exists();
+        let has_gguf = path.join(GGUF_WEIGHTS_FILENAME).exists();
 
-        if !has_safetensors && !has_onnx {
+        // Precedence FROZEN (issue #351): safetensors-or-onnx wins, byte-for-
+        // byte, exactly as before this feature existed. Only when NEITHER is
+        // present does a `model.gguf` file (or the typed "found *.gguf but
+        // not model.gguf" refusal) enter the picture at all.
+        if !has_safetensors && !has_onnx && !has_gguf {
+            if let Some(other) = other_gguf_refusal(source, path) {
+                return Err(other);
+            }
             return Err(JammiError::Model {
                 model_id: source.to_string(),
                 message: "No model weights found (need model.safetensors, \
-                          open_clip_model.safetensors, or model.onnx)"
+                          open_clip_model.safetensors, model.onnx, or model.gguf)"
                     .into(),
             });
         }
@@ -254,14 +283,16 @@ impl ModelResolver {
             BackendType::Candle
         });
 
-        let weights_paths = match backend {
+        let (weights_paths, weights_format) = match backend {
             BackendType::Candle => {
                 let standard = path.join("model.safetensors");
                 let open_clip = path.join("open_clip_model.safetensors");
                 if standard.exists() {
-                    vec![standard]
+                    (vec![standard], WeightsFormat::Safetensors)
                 } else if open_clip.exists() {
-                    vec![open_clip]
+                    (vec![open_clip], WeightsFormat::Safetensors)
+                } else if has_gguf {
+                    (vec![path.join(GGUF_WEIGHTS_FILENAME)], WeightsFormat::Gguf)
                 } else {
                     return Err(JammiError::Model {
                         model_id: source.to_string(),
@@ -272,8 +303,13 @@ impl ModelResolver {
             BackendType::Ort => {
                 let p = path.join("model.onnx");
                 if p.exists() {
-                    vec![p]
+                    (vec![p], WeightsFormat::Onnx)
                 } else {
+                    // Reached when the directory carries `model.gguf` (or a
+                    // non-canonical `*.gguf` file) but the caller pinned the
+                    // ORT backend — GGUF is a Candle-only weight-storage
+                    // format (issue #351), so this is the correct typed
+                    // refusal, unmodified from today's ONNX-missing case.
                     return Err(JammiError::Model {
                         model_id: source.to_string(),
                         message: "No ONNX weights found for ORT backend".into(),
@@ -290,14 +326,19 @@ impl ModelResolver {
 
         let tokenizer = discover_local_tokenizer(path);
 
-        let estimated_memory: usize = weights_paths
-            .iter()
-            .filter_map(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len() as usize)
-            .sum();
+        let estimated_memory: usize = if weights_format == WeightsFormat::Gguf {
+            estimate_gguf_residency(&weights_paths[0], &config, &source.to_string())?
+        } else {
+            weights_paths
+                .iter()
+                .filter_map(|p| std::fs::metadata(p).ok())
+                .map(|m| m.len() as usize)
+                .sum()
+        };
 
         Ok(ResolvedModel {
             model_id: ModelId::from(source),
+            weights_format,
             backend,
             task,
             config_path,
@@ -360,11 +401,96 @@ impl ModelResolver {
             }
         };
 
-        let backend = backend_hint.unwrap_or_else(|| self.select_backend_hf(&repo));
+        // Fetch the repo listing at most ONCE for the two DECISIONS that can
+        // consume it — backend auto-selection and the Candle weights-format
+        // plan (issue #351 wave 13 audit advisory 1) — never two separate
+        // live `info()` calls that could observe two different snapshots of
+        // a repo being pushed to concurrently. A failed fetch becomes
+        // `None`, not a fatal error here — hf-hub 0.5's `ApiRepo::get` is
+        // CACHE-FIRST and network-free on a hit (sync.rs:758-764) while
+        // `ApiRepo::info` is network-only (sync.rs:860-878), so a warm-cache
+        // repo must keep resolving exactly as it did before this feature
+        // existed even with no network at all. What `None` means to each
+        // decision is owned by that decision's own pure function
+        // (`select_backend_from_listing`, `hub_candle_weights_plan`), never
+        // decided at this call site.
+        //
+        // Lazy (issue #351 wave 14 round-8 audit advisory 2): a HINTED
+        // resolve for a non-Candle backend (e.g. `Some(BackendType::Ort)`)
+        // consumes neither decision above, so it must make NO listing call
+        // at all — restores the base (pre-#351) behavior for hinted
+        // non-Candle resolves, where `repo.info()` was never invoked.
+        let listing: Option<Vec<String>> =
+            if backend_hint.is_none() || backend_hint == Some(BackendType::Candle) {
+                repo.info()
+                    .ok()
+                    .map(|info| info.siblings.into_iter().map(|s| s.rfilename).collect())
+            } else {
+                None
+            };
 
-        let weights_paths = match backend {
-            BackendType::Candle => self.download_safetensors(&repo, source)?,
-            BackendType::Ort => self.download_onnx(&repo, source)?,
+        let backend =
+            backend_hint.unwrap_or_else(|| select_backend_from_listing(listing.as_deref()));
+
+        // Precedence FROZEN (issue #351): safetensors wins, byte-for-byte,
+        // exactly as before this feature existed. The choice between
+        // safetensors/gguf/refusal/attempt is made from the repo LISTING
+        // (`hub_candle_weights_plan` over `repo.info()`'s siblings) alone,
+        // never from a download outcome — a transient download failure on a
+        // repo that lists BOTH formats must propagate as the failure it is,
+        // not silently substitute the other weight format (issue #351 wave
+        // 12; this is the confident-wrong-number class this unit exists to
+        // make fail-loud). `repo.info()` failing outright is NOT itself a
+        // typed error: a missing listing is the `SafetensorsOnlyAttempt`
+        // arm below — the frozen pre-#351 path, never a guessed gguf format
+        // and never the listing-failure or rename-refusal error (issue
+        // #351 wave 13).
+        let (weights_paths, weights_format) = match backend {
+            BackendType::Candle => {
+                match hub_candle_weights_plan(listing.as_deref(), GGUF_WEIGHTS_FILENAME) {
+                    HubCandleWeightsPlan::Safetensors(listed_safetensors) => {
+                        // The listing PROVED at least one safetensors
+                        // sibling is present, so a download failure here is
+                        // worth naming that fact (issue #351 wave 13 audit
+                        // advisory 2): distinguishes "listed but every
+                        // download failed" from the bare message
+                        // `SafetensorsOnlyAttempt` below also returns when
+                        // there was no listing to make that claim from. The
+                        // names come straight off the plan arm that decided
+                        // this branch (issue #351 wave 14 round-8 audit
+                        // advisory 1), not re-derived from `listing` here.
+                        (
+                            self.download_safetensors(&repo, source).map_err(|e| {
+                                annotate_listed_safetensors_download_failure(e, &listed_safetensors)
+                            })?,
+                            WeightsFormat::Safetensors,
+                        )
+                    }
+                    HubCandleWeightsPlan::SafetensorsOnlyAttempt => (
+                        self.download_safetensors(&repo, source)?,
+                        WeightsFormat::Safetensors,
+                    ),
+                    HubCandleWeightsPlan::Gguf => {
+                        let p = repo
+                            .get(GGUF_WEIGHTS_FILENAME)
+                            .map_err(|e| JammiError::Model {
+                                model_id: source.to_string(),
+                                message: format!("Failed to download {GGUF_WEIGHTS_FILENAME}: {e}"),
+                            })?;
+                        (vec![p], WeightsFormat::Gguf)
+                    }
+                    HubCandleWeightsPlan::NonCanonicalGguf(others) => {
+                        return Err(gguf_rename_refusal(source, others));
+                    }
+                    HubCandleWeightsPlan::Neither => {
+                        return Err(JammiError::Model {
+                            model_id: source.to_string(),
+                            message: "No safetensors weights found".into(),
+                        });
+                    }
+                }
+            }
+            BackendType::Ort => (self.download_onnx(&repo, source)?, WeightsFormat::Onnx),
             other => {
                 return Err(JammiError::Model {
                     model_id: source.to_string(),
@@ -386,15 +512,20 @@ impl ModelResolver {
                     .map(TokenizerSource::OpenClipBpe)
             });
 
-        let estimated_memory: usize = weights_paths
-            .iter()
-            .filter_map(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len() as usize)
-            .sum();
+        let estimated_memory: usize = if weights_format == WeightsFormat::Gguf {
+            estimate_gguf_residency(&weights_paths[0], &config, &source.to_string())?
+        } else {
+            weights_paths
+                .iter()
+                .filter_map(|p| std::fs::metadata(p).ok())
+                .map(|m| m.len() as usize)
+                .sum()
+        };
 
         Ok(ResolvedModel {
             model_id: ModelId::from(source),
             backend,
+            weights_format,
             task,
             config_path,
             weights_paths,
@@ -406,15 +537,6 @@ impl ModelResolver {
             adapter_path: None,
             estimated_memory,
         })
-    }
-
-    fn select_backend_hf(&self, repo: &hf_hub::api::sync::ApiRepo) -> BackendType {
-        if let Ok(info) = repo.info() {
-            if info.siblings.iter().any(|s| s.rfilename == "model.onnx") {
-                return BackendType::Ort;
-            }
-        }
-        BackendType::Candle
     }
 
     fn download_safetensors(
@@ -457,6 +579,200 @@ impl ModelResolver {
                 model_id: source.to_string(),
                 message: format!("No ONNX model found: {e}"),
             })
+    }
+}
+
+/// `Some(typed error)` when `dir` contains at least one `*.gguf` file OTHER
+/// than the canonical `GGUF_WEIGHTS_FILENAME` — names every such file and
+/// points at the convention. `None` when the directory listing itself fails
+/// (best-effort — the caller falls back to the generic "no weights found"
+/// message) or lists no `*.gguf` file at all.
+fn other_gguf_refusal(source: &ModelSource, dir: &Path) -> Option<JammiError> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut others: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter(|name| name.ends_with(".gguf") && name != GGUF_WEIGHTS_FILENAME)
+        .collect();
+    if others.is_empty() {
+        return None;
+    }
+    others.sort();
+    Some(gguf_rename_refusal(source, others))
+}
+
+/// The outcome of [`decide_hub_weights_format`]: which weight format a Hub
+/// repo's file LISTING selects, decided once and up front — never inferred
+/// from a download outcome (issue #351 wave 12). This is the mechanism that
+/// keeps a transient download failure on a repo carrying BOTH formats from
+/// silently switching the served weight format: the format is fixed by the
+/// listing before any `repo.get(..)` is attempted, so a download failure in
+/// either the `Safetensors` or `Gguf` arm propagates as the failure it is.
+#[derive(Debug, PartialEq, Eq)]
+enum HubWeightsDecision {
+    /// At least one `*.safetensors` sibling is listed — safetensors wins,
+    /// byte-for-byte, exactly as the local-directory precedence (frozen
+    /// since before issue #351).
+    Safetensors,
+    /// No safetensors sibling listed, but the canonical GGUF filename is.
+    Gguf,
+    /// Neither safetensors nor the canonical GGUF filename listed, but at
+    /// least one OTHER `*.gguf` sibling is — the typed "rename to the
+    /// canonical name" refusal, naming every such file (sorted).
+    NonCanonicalGguf(Vec<String>),
+    /// No safetensors sibling and no `*.gguf` sibling of any name.
+    Neither,
+}
+
+/// Decide the Hub-path weight format from a repo's sibling filename LISTING
+/// alone — a pure function over names, deliberately independent of
+/// `hf_hub`/network types so it is unit-testable without a live repo (issue
+/// #351 wave 12). `canonical_gguf` is `GGUF_WEIGHTS_FILENAME` in production;
+/// parameterized here only so tests can assert the exact constant is what
+/// production passes.
+fn decide_hub_weights_format(siblings: &[String], canonical_gguf: &str) -> HubWeightsDecision {
+    if siblings.iter().any(|name| name.ends_with(".safetensors")) {
+        return HubWeightsDecision::Safetensors;
+    }
+    if siblings.iter().any(|name| name == canonical_gguf) {
+        return HubWeightsDecision::Gguf;
+    }
+    let mut others: Vec<String> = siblings
+        .iter()
+        .filter(|name| name.ends_with(".gguf"))
+        .cloned()
+        .collect();
+    if others.is_empty() {
+        return HubWeightsDecision::Neither;
+    }
+    others.sort();
+    HubWeightsDecision::NonCanonicalGguf(others)
+}
+
+/// The FULL decision the Candle-backend Hub-path resolve makes about which
+/// weight format to load, including the case the repo LISTING itself is
+/// unavailable — a strict superset of [`HubWeightsDecision`]'s four
+/// listing-present arms plus a fifth (issue #351 wave 13 audit block). `None`
+/// listing here means `repo.info()` itself failed, which hf-hub 0.5 makes a
+/// perfectly ordinary outcome: `ApiRepo::get` is CACHE-FIRST and
+/// network-free on a hit (sync.rs:758-764), while `ApiRepo::info` is
+/// network-only (sync.rs:860-878) — so a warm-cache safetensors-only repo
+/// that resolved fine offline before this feature existed must keep doing
+/// so. `hub_candle_weights_plan` is the single pure function that owns this
+/// decision; every arm below is unit-tested without a live repo.
+#[derive(Debug, PartialEq, Eq)]
+enum HubCandleWeightsPlan {
+    /// Listing available, safetensors sibling(s) listed — download them; a
+    /// failure here PROPAGATES (never falls back to gguf). Carries the
+    /// LISTED `*.safetensors` sibling name(s), taken from the same listing
+    /// that produced this arm (round-8 audit advisory, issue #351 wave
+    /// 14) — the call site needs these names to annotate a download
+    /// failure, and previously re-derived them from `listing` a second
+    /// time; carrying them here makes that re-derivation impossible to
+    /// drift from the decision that actually selected this arm.
+    Safetensors(Vec<String>),
+    /// Listing available, no safetensors but the canonical `model.gguf` IS
+    /// listed — download it; a failure here PROPAGATES too.
+    Gguf,
+    /// Listing available, no safetensors, no canonical `model.gguf`, but some
+    /// OTHER `*.gguf` sibling is listed — the typed rename refusal.
+    NonCanonicalGguf(Vec<String>),
+    /// Listing available, no safetensors and no `*.gguf` sibling at all.
+    Neither,
+    /// Listing UNAVAILABLE (`repo.info()` failed). Never decide gguf and
+    /// never emit the listing-failure or rename-refusal error from a failed
+    /// listing — this is the frozen pre-#351 path: attempt the cache-first
+    /// safetensors download exactly as the pre-feature code did, and
+    /// propagate whatever error THAT returns.
+    SafetensorsOnlyAttempt,
+}
+
+/// Decide the Candle-backend Hub-path weights plan from an OPTIONAL repo
+/// listing. `None` means the listing itself is unavailable (`repo.info()`
+/// failed) — NOT "no siblings"; `Some(&[])`/a listing with no weight
+/// siblings is the ordinary `Neither` arm. Pure and independent of
+/// `hf_hub`/network types, so every one of the five arms is unit-testable
+/// without a live repo (issue #351 wave 13).
+fn hub_candle_weights_plan(
+    listing: Option<&[String]>,
+    canonical_gguf: &str,
+) -> HubCandleWeightsPlan {
+    let Some(siblings) = listing else {
+        return HubCandleWeightsPlan::SafetensorsOnlyAttempt;
+    };
+    match decide_hub_weights_format(siblings, canonical_gguf) {
+        HubWeightsDecision::Safetensors => {
+            let listed: Vec<String> = siblings
+                .iter()
+                .filter(|name| name.ends_with(".safetensors"))
+                .cloned()
+                .collect();
+            HubCandleWeightsPlan::Safetensors(listed)
+        }
+        HubWeightsDecision::Gguf => HubCandleWeightsPlan::Gguf,
+        HubWeightsDecision::NonCanonicalGguf(others) => {
+            HubCandleWeightsPlan::NonCanonicalGguf(others)
+        }
+        HubWeightsDecision::Neither => HubCandleWeightsPlan::Neither,
+    }
+}
+
+/// Decide Hub backend auto-selection (issue #351's ONNX arm) from an
+/// OPTIONAL repo listing — pure, and deliberately shares the SAME listing
+/// `hub_candle_weights_plan` decides the weights format from (issue #351
+/// wave 13 audit advisory 1: one live `repo.info()` fetch per resolve, not
+/// two separate snapshots of a repo that could be pushed to concurrently
+/// between them). `None` (listing unavailable) falls back to `Candle`,
+/// exactly as the prior `if let Ok(info) = repo.info()` did on a failed
+/// fetch.
+fn select_backend_from_listing(listing: Option<&[String]>) -> BackendType {
+    if let Some(siblings) = listing {
+        if siblings.iter().any(|s| s == "model.onnx") {
+            return BackendType::Ort;
+        }
+    }
+    BackendType::Candle
+}
+
+/// Wrap a failed [`ModelResolver::download_safetensors`] error with context
+/// naming the SPECIFIC safetensors sibling(s) the repo listing had already
+/// proven present (issue #351 wave 13 audit advisory 2) — distinguishes "the
+/// listing said safetensors were there and every download of them failed"
+/// from the bare "No safetensors weights found" message
+/// `download_safetensors` also returns on the `SafetensorsOnlyAttempt` arm
+/// (no listing at all, so no such proof to name).
+fn annotate_listed_safetensors_download_failure(
+    err: JammiError,
+    listed_safetensors: &[String],
+) -> JammiError {
+    match err {
+        JammiError::Model { model_id, message } => JammiError::Model {
+            model_id,
+            message: format!(
+                "{message} (repo listing named safetensors sibling(s) {} but every \
+                 download attempt failed)",
+                listed_safetensors.join(", ")
+            ),
+        },
+        other => other,
+    }
+}
+
+/// The typed "found GGUF file(s) but not the canonical name" refusal, shared
+/// verbatim between the local-directory (`other_gguf_refusal`) and Hub
+/// (`decide_hub_weights_format`'s `NonCanonicalGguf` arm) paths. `others`
+/// need not be pre-sorted; this sorts for deterministic message text
+/// (family J).
+fn gguf_rename_refusal(source: &ModelSource, mut others: Vec<String>) -> JammiError {
+    others.sort();
+    JammiError::Model {
+        model_id: source.to_string(),
+        message: format!(
+            "Found GGUF file(s) {} but no '{GGUF_WEIGHTS_FILENAME}' — the canonical \
+             quantized-weights filename (mirrors model.safetensors/model.onnx); rename to \
+             '{GGUF_WEIGHTS_FILENAME}' to load it",
+            others.join(", ")
+        ),
     }
 }
 
@@ -511,4 +827,214 @@ fn discover_local_tokenizer(dir: &Path) -> Option<TokenizerSource> {
         return Some(TokenizerSource::OpenClipBpe(bpe));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Arm 1: a repo listing carrying BOTH `model.safetensors` and
+    /// `model.gguf` decides `Safetensors` — the frozen precedence, decided
+    /// from the LISTING alone, never from a download attempt (issue #351
+    /// wave 12's defect: this is the exact shape a failed-download fallback
+    /// would get wrong).
+    #[test]
+    fn decide_hub_weights_format_prefers_safetensors_when_both_are_listed() {
+        let siblings = names(&["config.json", "model.safetensors", "model.gguf"]);
+        assert_eq!(
+            decide_hub_weights_format(&siblings, GGUF_WEIGHTS_FILENAME),
+            HubWeightsDecision::Safetensors
+        );
+    }
+
+    /// Arm 2: no safetensors sibling, canonical `model.gguf` listed.
+    #[test]
+    fn decide_hub_weights_format_selects_gguf_when_only_gguf_is_listed() {
+        let siblings = names(&["config.json", "model.gguf", "tokenizer.json"]);
+        assert_eq!(
+            decide_hub_weights_format(&siblings, GGUF_WEIGHTS_FILENAME),
+            HubWeightsDecision::Gguf
+        );
+    }
+
+    /// Arm 3: no safetensors, no canonical `model.gguf`, but a
+    /// differently-named `*.gguf` sibling — the typed rename refusal,
+    /// naming every non-canonical file found (sorted).
+    #[test]
+    fn decide_hub_weights_format_refuses_non_canonical_gguf_filenames() {
+        let siblings = names(&["config.json", "weights.q4.gguf", "other.gguf"]);
+        assert_eq!(
+            decide_hub_weights_format(&siblings, GGUF_WEIGHTS_FILENAME),
+            HubWeightsDecision::NonCanonicalGguf(vec![
+                "other.gguf".to_string(),
+                "weights.q4.gguf".to_string(),
+            ])
+        );
+    }
+
+    /// Arm 4: no safetensors and no `*.gguf` sibling of any name at all.
+    #[test]
+    fn decide_hub_weights_format_is_neither_when_no_weights_are_listed() {
+        let siblings = names(&["config.json", "tokenizer.json"]);
+        assert_eq!(
+            decide_hub_weights_format(&siblings, GGUF_WEIGHTS_FILENAME),
+            HubWeightsDecision::Neither
+        );
+    }
+
+    /// The defect this unit fixes, pinned directly at the decision level: a
+    /// repo listing carrying both formats never depends on which download
+    /// happens to succeed — `decide_hub_weights_format` is a pure function
+    /// of the listing, so calling it twice for the same listing (standing
+    /// in for "network attempt #1 failed transiently, #2 would have
+    /// succeeded") always returns the same, safetensors-preferring answer.
+    #[test]
+    fn decide_hub_weights_format_is_deterministic_over_a_dual_format_listing() {
+        let siblings = names(&["model.safetensors", "model.gguf"]);
+        let first = decide_hub_weights_format(&siblings, GGUF_WEIGHTS_FILENAME);
+        let second = decide_hub_weights_format(&siblings, GGUF_WEIGHTS_FILENAME);
+        assert_eq!(first, HubWeightsDecision::Safetensors);
+        assert_eq!(second, HubWeightsDecision::Safetensors);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // `hub_candle_weights_plan` (issue #351 wave 13): the FULL five-arm
+    // decision, including the `None`-listing arm `decide_hub_weights_format`
+    // alone can't express. Plan arm 1: `Some` + safetensors-listed.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn plan_arm_1_some_listing_with_safetensors_selects_safetensors() {
+        let siblings = names(&["config.json", "model.safetensors", "model.gguf"]);
+        assert_eq!(
+            hub_candle_weights_plan(Some(&siblings), GGUF_WEIGHTS_FILENAME),
+            HubCandleWeightsPlan::Safetensors(vec!["model.safetensors".to_string()])
+        );
+    }
+
+    /// Plan arm 2: `Some` + only the canonical `model.gguf` listed.
+    #[test]
+    fn plan_arm_2_some_listing_with_only_canonical_gguf_selects_gguf() {
+        let siblings = names(&["config.json", "model.gguf"]);
+        assert_eq!(
+            hub_candle_weights_plan(Some(&siblings), GGUF_WEIGHTS_FILENAME),
+            HubCandleWeightsPlan::Gguf
+        );
+    }
+
+    /// Plan arm 3: `Some` + only a non-canonical `*.gguf` sibling — the
+    /// typed rename refusal, naming every such file (sorted).
+    #[test]
+    fn plan_arm_3_some_listing_with_non_canonical_gguf_only_refuses_with_names() {
+        let siblings = names(&["config.json", "weights.q4.gguf", "other.gguf"]);
+        assert_eq!(
+            hub_candle_weights_plan(Some(&siblings), GGUF_WEIGHTS_FILENAME),
+            HubCandleWeightsPlan::NonCanonicalGguf(vec![
+                "other.gguf".to_string(),
+                "weights.q4.gguf".to_string(),
+            ])
+        );
+    }
+
+    /// Plan arm 4: `Some` + neither safetensors nor any `*.gguf` sibling.
+    #[test]
+    fn plan_arm_4_some_listing_with_neither_format_is_neither() {
+        let siblings = names(&["config.json", "tokenizer.json"]);
+        assert_eq!(
+            hub_candle_weights_plan(Some(&siblings), GGUF_WEIGHTS_FILENAME),
+            HubCandleWeightsPlan::Neither
+        );
+    }
+
+    /// Plan arm 5 (the RED oracle this wave closes): `None` — the listing
+    /// itself is unavailable (`repo.info()` failed, e.g. no network against
+    /// a warm cache-first hit) — must NEVER decide gguf and must NEVER
+    /// return the listing-failure or rename-refusal error; it is
+    /// `SafetensorsOnlyAttempt`, the frozen pre-#351 path. At commit
+    /// 61b7bc7e (before this wave), the equivalent call site (resolver.rs,
+    /// prior `repo.info().map_err(..)?`) made a failed listing a HARD,
+    /// fatal `JammiError::Model` naming "Failed to list repo files" —
+    /// exactly the shape this arm's existence forbids. Asserting `None`
+    /// lands on `SafetensorsOnlyAttempt` (never `NonCanonicalGguf`/`Neither`
+    /// and never a listing-failure error) is what would have caught that
+    /// regression: a warm-cache safetensors-only repo resolving offline,
+    /// which the pre-feature code supported and 61b7bc7e broke.
+    #[test]
+    fn plan_arm_5_none_listing_attempts_safetensors_only_never_decides_gguf() {
+        assert_eq!(
+            hub_candle_weights_plan(None, GGUF_WEIGHTS_FILENAME),
+            HubCandleWeightsPlan::SafetensorsOnlyAttempt
+        );
+    }
+
+    /// The plan's `None` arm must agree with `decide_hub_weights_format`'s
+    /// `Some` arms whenever a listing IS actually available — `None` is not
+    /// a generic "give up" branch, it activates only when the listing
+    /// itself could not be fetched at all.
+    #[test]
+    fn plan_agrees_with_decide_hub_weights_format_when_listing_is_present() {
+        let siblings = names(&["model.safetensors", "model.gguf"]);
+        assert_eq!(
+            hub_candle_weights_plan(Some(&siblings), GGUF_WEIGHTS_FILENAME),
+            HubCandleWeightsPlan::Safetensors(vec!["model.safetensors".to_string()])
+        );
+        assert_ne!(
+            hub_candle_weights_plan(Some(&siblings), GGUF_WEIGHTS_FILENAME),
+            HubCandleWeightsPlan::SafetensorsOnlyAttempt
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // `select_backend_from_listing`: shares the SAME optional listing
+    // (advisory 1) — `None` falls back to `Candle`, exactly as the prior
+    // `if let Ok(info) = repo.info()` did on a failed fetch.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn select_backend_from_listing_picks_ort_when_model_onnx_is_listed() {
+        let siblings = names(&["config.json", "model.onnx"]);
+        assert_eq!(
+            select_backend_from_listing(Some(&siblings)),
+            BackendType::Ort
+        );
+    }
+
+    #[test]
+    fn select_backend_from_listing_falls_back_to_candle_when_listing_is_none() {
+        assert_eq!(select_backend_from_listing(None), BackendType::Candle);
+    }
+
+    #[test]
+    fn select_backend_from_listing_falls_back_to_candle_when_onnx_absent() {
+        let siblings = names(&["config.json", "model.safetensors"]);
+        assert_eq!(
+            select_backend_from_listing(Some(&siblings)),
+            BackendType::Candle
+        );
+    }
+
+    /// Advisory 2: a listing that PROVED safetensors present but every
+    /// download failed gets the original error message wrapped with the
+    /// specific sibling name(s) the listing had already named — never
+    /// silently substitutes the bare message.
+    #[test]
+    fn annotate_listed_safetensors_download_failure_names_the_listed_siblings() {
+        let original = JammiError::Model {
+            model_id: "some/repo".to_string(),
+            message: "No safetensors weights found".to_string(),
+        };
+        let wrapped = annotate_listed_safetensors_download_failure(
+            original,
+            &["model.safetensors".to_string()],
+        );
+        let msg = wrapped.to_string();
+        assert!(
+            msg.contains("No safetensors weights found") && msg.contains("model.safetensors"),
+            "expected the original message plus the listed sibling name, got: {msg}"
+        );
+    }
 }

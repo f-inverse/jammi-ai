@@ -17,9 +17,12 @@ use std::path::Path;
 
 use candle_core::{DType, Device, Module, Tensor, D};
 use candle_nn::{Embedding, VarBuilder, VarMap};
-use jammi_lora::{effective_rank, should_apply_lora, LoraBuildConfig, LoraLinear, MaybeLoraLinear};
+use jammi_lora::{
+    effective_rank, should_apply_lora, FrozenBase, LoraBuildConfig, LoraLinear, MaybeLoraLinear,
+};
 
 use crate::error::EncoderError;
+use crate::frozen_weight_source::{validate_frozen_base_geometry, FrozenWeightLookup};
 use crate::layer_norm::LayerNorm;
 use crate::pooling::{pool_and_normalize, Pooling};
 
@@ -185,6 +188,7 @@ impl DistilBert {
             lora: LoraBuildConfig::frozen(),
             backbone_dtype: DType::F32,
             adapter_file: None,
+            weight_source: None,
         }
     }
 
@@ -379,6 +383,11 @@ pub struct DistilBertBuilder<'a> {
     lora: LoraBuildConfig<'a>,
     backbone_dtype: DType,
     adapter_file: Option<&'a Path>,
+    /// The wave-3 GGUF-quantized-weight construction seam — see
+    /// [`FrozenWeightLookup`]'s own module doc. `None` by default
+    /// ([`DistilBert::builder`]); every EXISTING call site that never calls
+    /// [`Self::weight_source`] gets byte-identical Dense-only behavior.
+    weight_source: Option<&'a FrozenWeightLookup<'a>>,
 }
 
 impl<'a> DistilBertBuilder<'a> {
@@ -404,6 +413,15 @@ impl<'a> DistilBertBuilder<'a> {
     /// instead of initialising them from the supplied [`VarMap`].
     pub fn adapter(mut self, p: Option<&'a Path>) -> Self {
         self.adapter_file = p;
+        self
+    }
+
+    /// Supply a per-tensor-name GGUF-quantized-weight override — see
+    /// [`FrozenWeightLookup`]'s own module doc. Defaulted: a builder that
+    /// never calls this stays byte-identical to every prior release (Dense
+    /// weights, loaded from `weights_paths`, everywhere).
+    pub fn weight_source(mut self, w: &'a FrozenWeightLookup<'a>) -> Self {
+        self.weight_source = Some(w);
         self
     }
 
@@ -473,6 +491,7 @@ impl<'a> DistilBertBuilder<'a> {
                 layer_idx: n,
                 lora: &self.lora,
                 varmap,
+                weight_source: self.weight_source,
             };
             let q_lin = attn_slot.build_in(
                 &attn_vb,
@@ -516,6 +535,7 @@ impl<'a> DistilBertBuilder<'a> {
                 layer_idx: n,
                 lora: &self.lora,
                 varmap,
+                weight_source: self.weight_source,
             };
             let lin1 = ffn_slot.build_in(
                 &ffn_vb,
@@ -573,6 +593,10 @@ struct LoraSlot<'a, 'b> {
     lora: &'a LoraBuildConfig<'a>,
     /// The trainable `VarMap` the seeded LoRA A/B tensors are registered into.
     varmap: &'a VarMap,
+    /// The wave-3 GGUF-quantized-weight construction seam — see
+    /// [`crate::FrozenWeightLookup`]'s own module doc. `None` at every
+    /// EXISTING call site (byte-identical to every prior release).
+    weight_source: Option<&'a FrozenWeightLookup<'a>>,
 }
 
 impl LoraSlot<'_, '_> {
@@ -580,6 +604,13 @@ impl LoraSlot<'_, '_> {
     /// is the short suffix fed to [`should_apply_lora`]; `module_path` is the
     /// parent-relative path used to address the LoRA A/B tensors inside
     /// `lora_layer_vb`.
+    ///
+    /// A `weight_source` HIT is geometry-checked
+    /// (`validate_frozen_base_geometry`) against the `config.json`-derived
+    /// `(in_features, out_features)` this call site expects — a GGUF whose
+    /// per-site geometry disagrees with `config.json` fails HERE, at load,
+    /// rather than surfacing as a confidently-wrong-shaped matmul at first
+    /// inference.
     fn build_in(
         &self,
         parent_vb: &VarBuilder,
@@ -595,7 +626,22 @@ impl LoraSlot<'_, '_> {
             .rsplit_once('.')
             .map(|(_, child)| child)
             .unwrap_or(module_path);
-        let linear = candle_nn::linear(in_features, out_features, parent_vb.pp(child_segment))?;
+        let child_vb = parent_vb.pp(child_segment);
+
+        // Wave-3 seam (module doc): consult `weight_source` first, falling
+        // back to the ORIGINAL Dense `linear(..)` load when unset or missed.
+        let base = if let Some(lookup) = self.weight_source {
+            let site = child_vb.prefix();
+            match lookup(&site)? {
+                Some(base) => {
+                    validate_frozen_base_geometry(&site, &base, in_features, out_features)?;
+                    base
+                }
+                None => FrozenBase::Dense(candle_nn::linear(in_features, out_features, child_vb)?),
+            }
+        } else {
+            FrozenBase::Dense(candle_nn::linear(in_features, out_features, child_vb)?)
+        };
 
         if should_apply_lora(
             module_name,
@@ -604,8 +650,8 @@ impl LoraSlot<'_, '_> {
             self.lora.layers_to_transform,
         ) {
             let rank = effective_rank(module_name, self.lora.lora_rank, self.lora.rank_pattern);
-            let lora_linear = LoraLinear::new(
-                linear,
+            let lora_linear = LoraLinear::new_with_base(
+                base,
                 rank,
                 self.lora.lora_alpha,
                 self.lora.use_rslora,
@@ -617,7 +663,7 @@ impl LoraSlot<'_, '_> {
             )?;
             Ok(MaybeLoraLinear::Lora(lora_linear))
         } else {
-            Ok(MaybeLoraLinear::Frozen(linear))
+            Ok(MaybeLoraLinear::Frozen(base))
         }
     }
 }

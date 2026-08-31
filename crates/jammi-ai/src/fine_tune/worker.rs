@@ -2188,15 +2188,19 @@ fn build_encoder_adapters(
                      '{model_type}')"
                 ))
             })?;
-        let num_layers = model_config
-            .get("num_hidden_layers")
-            .or_else(|| model_config.get("num_layers"))
-            .and_then(|v| v.as_u64())
+        // Routes through the SAME normalization + layer-count authority
+        // `CandleBackend::load`'s GGUF path and `estimate_gguf_residency`
+        // use (`gguf::gguf_num_layers`) — a raw, un-normalized DistilBERT
+        // config declares its layer count under the DistilBERT-native
+        // `n_layers` name only, so reading `num_hidden_layers`/`num_layers`
+        // off the raw config here previously refused every DistilBERT GGUF
+        // fine-tune outright (issue #351 wave 5 audit).
+        let num_layers = crate::model::backend::gguf::gguf_num_layers(model_type, &model_config)
             .ok_or_else(|| {
                 JammiError::FineTune(
                     "GGUF load requires num_hidden_layers (or num_layers) in config.json".into(),
                 )
-            })? as usize;
+            })?;
         Some(
             crate::model::backend::gguf::load_gguf_backbone(
                 &gguf_weights_path,
@@ -2281,7 +2285,10 @@ fn build_encoder_adapters(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::time::Duration;
+
+    use candle_core::Tensor;
 
     use super::*;
 
@@ -2982,5 +2989,451 @@ mod tests {
             loader.regression_targets().unwrap(),
             vec![2017.0, 2017.0, 2017.0]
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // `build_encoder_adapters` GGUF class-closure oracle (issue #351 wave
+    // 5 audit): a `build_encoder_adapters` construction test for EACH of
+    // the three GGUF-threaded architectures. Before this wave's fix, the
+    // DistilBERT arm hard-refused ("GGUF load requires num_hidden_layers
+    // (or num_layers) in config.json") because it read the layer count
+    // off the RAW config.json, which for a DistilBERT checkpoint declares
+    // only the DistilBERT-native `n_layers` field — DistilBERT GGUF QLoRA
+    // was UNREACHABLE. BERT and ModernBERT already worked (their raw
+    // config.json already uses `num_hidden_layers`), which is exactly why
+    // this bug was invisible on those two arches and needed a per-
+    // architecture oracle to surface at all.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// FNV-1a-seeded deterministic small-magnitude values (family J: no
+    /// unseeded RNG) — independent per-tensor-name value stream without a
+    /// hand-maintained counter.
+    fn gguf_fixture_tensor(name: &str, dims: &[usize], device: &candle_core::Device) -> Tensor {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in name.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        let seed = h as f64;
+        let n: usize = dims.iter().product();
+        let v: Vec<f32> = (0..n)
+            .map(|i| (((seed % 97.0) + 1.0) * (i as f64) * 0.037 + seed * 1e-6).sin() as f32 * 0.1)
+            .collect();
+        Tensor::from_vec(v, dims, device).unwrap()
+    }
+
+    /// Write `dir/model.gguf`: every tensor whose name is in
+    /// `matmul_weight_names` is quantized at `quant`; every other tensor
+    /// (embeddings, LayerNorms, matmul-site biases) is written as an
+    /// `F32`-"quantized" `QTensor` — GGUF's own convention for a dense-
+    /// stored tensor. Mirrors `tests/it/gguf_qlora.rs`'s
+    /// `write_gguf_checkpoint`, independently re-derived here because
+    /// `build_encoder_adapters` is module-private and unreachable from
+    /// that external integration-test crate.
+    fn write_gguf_fixture(
+        dir: &std::path::Path,
+        tensors: &HashMap<String, Tensor>,
+        matmul_weight_names: &[String],
+        quant: candle_core::quantized::GgmlDType,
+    ) {
+        use candle_core::quantized::{gguf_file, QTensor};
+        std::fs::create_dir_all(dir).unwrap();
+        let mut names: Vec<&String> = tensors.keys().collect();
+        names.sort(); // deterministic write order (family J)
+        let mut qtensors: Vec<(String, QTensor)> = Vec::with_capacity(names.len());
+        for name in names {
+            let t = &tensors[name];
+            let dtype = if matmul_weight_names.iter().any(|n| n == name) {
+                quant
+            } else {
+                candle_core::quantized::GgmlDType::F32
+            };
+            qtensors.push((name.clone(), QTensor::quantize(t, dtype).unwrap()));
+        }
+        let file = std::fs::File::create(dir.join("model.gguf")).unwrap();
+        let mut writer = std::io::BufWriter::new(file);
+        let refs: Vec<(&str, &QTensor)> = qtensors.iter().map(|(n, q)| (n.as_str(), q)).collect();
+        gguf_file::write(&mut writer, &[], &refs).unwrap();
+    }
+
+    const GGUF_FIXTURE_HIDDEN: usize = 32;
+    const GGUF_FIXTURE_LAYERS: usize = 1;
+    const GGUF_FIXTURE_HEADS: usize = 2;
+    const GGUF_FIXTURE_INTERMEDIATE: usize = 64;
+    const GGUF_FIXTURE_VOCAB: usize = 64;
+    const GGUF_FIXTURE_MAX_POS: usize = 32;
+    const GGUF_FIXTURE_TYPE_VOCAB: usize = 2;
+
+    /// A raw (no `"bert."` wrapper) BERT-family fixture: tensors, config,
+    /// and the fully-qualified matmul-site `.weight` names — mirrors
+    /// `jammi_ai::model::backend::gguf::matmul_site_names`'s `Bert` arm.
+    fn bert_gguf_fixture(
+        device: &candle_core::Device,
+    ) -> (HashMap<String, Tensor>, serde_json::Value, Vec<String>) {
+        let (hidden, layers, heads, intermediate, vocab, max_pos, type_vocab) = (
+            GGUF_FIXTURE_HIDDEN,
+            GGUF_FIXTURE_LAYERS,
+            GGUF_FIXTURE_HEADS,
+            GGUF_FIXTURE_INTERMEDIATE,
+            GGUF_FIXTURE_VOCAB,
+            GGUF_FIXTURE_MAX_POS,
+            GGUF_FIXTURE_TYPE_VOCAB,
+        );
+        let mut map = HashMap::new();
+        let add = |map: &mut HashMap<String, Tensor>, name: String, dims: &[usize]| {
+            let t = gguf_fixture_tensor(&name, dims, device);
+            map.insert(name, t);
+        };
+        add(
+            &mut map,
+            "embeddings.word_embeddings.weight".into(),
+            &[vocab, hidden],
+        );
+        add(
+            &mut map,
+            "embeddings.position_embeddings.weight".into(),
+            &[max_pos, hidden],
+        );
+        add(
+            &mut map,
+            "embeddings.token_type_embeddings.weight".into(),
+            &[type_vocab, hidden],
+        );
+        add(&mut map, "embeddings.LayerNorm.weight".into(), &[hidden]);
+        add(&mut map, "embeddings.LayerNorm.bias".into(), &[hidden]);
+        let mut matmul_weights = Vec::new();
+        for n in 0..layers {
+            let p = format!("encoder.layer.{n}");
+            for site in [
+                "attention.self.query",
+                "attention.self.key",
+                "attention.self.value",
+                "attention.output.dense",
+            ] {
+                let w = format!("{p}.{site}.weight");
+                add(&mut map, w.clone(), &[hidden, hidden]);
+                matmul_weights.push(w);
+                add(&mut map, format!("{p}.{site}.bias"), &[hidden]);
+            }
+            let w = format!("{p}.intermediate.dense.weight");
+            add(&mut map, w.clone(), &[intermediate, hidden]);
+            matmul_weights.push(w);
+            add(
+                &mut map,
+                format!("{p}.intermediate.dense.bias"),
+                &[intermediate],
+            );
+            let w = format!("{p}.output.dense.weight");
+            add(&mut map, w.clone(), &[hidden, intermediate]);
+            matmul_weights.push(w);
+            add(&mut map, format!("{p}.output.dense.bias"), &[hidden]);
+            for ln in ["attention.output.LayerNorm", "output.LayerNorm"] {
+                add(&mut map, format!("{p}.{ln}.weight"), &[hidden]);
+                add(&mut map, format!("{p}.{ln}.bias"), &[hidden]);
+            }
+        }
+        let config = serde_json::json!({
+            "model_type": "bert",
+            "hidden_size": hidden,
+            "num_hidden_layers": layers,
+            "num_attention_heads": heads,
+            "intermediate_size": intermediate,
+            "vocab_size": vocab,
+            "max_position_embeddings": max_pos,
+            "type_vocab_size": type_vocab,
+            "layer_norm_eps": 1e-12,
+        });
+        (map, config, matmul_weights)
+    }
+
+    /// A DistilBERT fixture, config.json spelled with the DistilBERT-
+    /// native field names (`dim`/`n_layers`/`n_heads`/`hidden_dim`) — the
+    /// RAW shape a real DistilBERT checkpoint ships, on purpose: this is
+    /// exactly the config `gguf_num_layers`'s normalization step must
+    /// handle for the layer-count extraction to succeed at all.
+    fn distilbert_gguf_fixture(
+        device: &candle_core::Device,
+    ) -> (HashMap<String, Tensor>, serde_json::Value, Vec<String>) {
+        let (hidden, layers, heads, intermediate, vocab, max_pos) = (
+            GGUF_FIXTURE_HIDDEN,
+            GGUF_FIXTURE_LAYERS,
+            GGUF_FIXTURE_HEADS,
+            GGUF_FIXTURE_INTERMEDIATE,
+            GGUF_FIXTURE_VOCAB,
+            GGUF_FIXTURE_MAX_POS,
+        );
+        let mut map = HashMap::new();
+        let add = |map: &mut HashMap<String, Tensor>, name: String, dims: &[usize]| {
+            let t = gguf_fixture_tensor(&name, dims, device);
+            map.insert(name, t);
+        };
+        add(
+            &mut map,
+            "distilbert.embeddings.word_embeddings.weight".into(),
+            &[vocab, hidden],
+        );
+        add(
+            &mut map,
+            "distilbert.embeddings.position_embeddings.weight".into(),
+            &[max_pos, hidden],
+        );
+        add(
+            &mut map,
+            "distilbert.embeddings.LayerNorm.weight".into(),
+            &[hidden],
+        );
+        add(
+            &mut map,
+            "distilbert.embeddings.LayerNorm.bias".into(),
+            &[hidden],
+        );
+        let mut matmul_weights = Vec::new();
+        for n in 0..layers {
+            let p = format!("distilbert.transformer.layer.{n}");
+            for site in [
+                "attention.q_lin",
+                "attention.k_lin",
+                "attention.v_lin",
+                "attention.out_lin",
+            ] {
+                let w = format!("{p}.{site}.weight");
+                add(&mut map, w.clone(), &[hidden, hidden]);
+                matmul_weights.push(w);
+                add(&mut map, format!("{p}.{site}.bias"), &[hidden]);
+            }
+            add(&mut map, format!("{p}.sa_layer_norm.weight"), &[hidden]);
+            add(&mut map, format!("{p}.sa_layer_norm.bias"), &[hidden]);
+            let w = format!("{p}.ffn.lin1.weight");
+            add(&mut map, w.clone(), &[intermediate, hidden]);
+            matmul_weights.push(w);
+            add(&mut map, format!("{p}.ffn.lin1.bias"), &[intermediate]);
+            let w = format!("{p}.ffn.lin2.weight");
+            add(&mut map, w.clone(), &[hidden, intermediate]);
+            matmul_weights.push(w);
+            add(&mut map, format!("{p}.ffn.lin2.bias"), &[hidden]);
+            add(&mut map, format!("{p}.output_layer_norm.weight"), &[hidden]);
+            add(&mut map, format!("{p}.output_layer_norm.bias"), &[hidden]);
+        }
+        let config = serde_json::json!({
+            "model_type": "distilbert",
+            "dim": hidden,
+            "n_layers": layers,
+            "n_heads": heads,
+            "hidden_dim": intermediate,
+            "vocab_size": vocab,
+            "max_position_embeddings": max_pos,
+        });
+        (map, config, matmul_weights)
+    }
+
+    /// A ModernBERT fixture: bias-free matmul sites and LayerNorms
+    /// (`gguf::matmul_site_names`'s `ModernBert` arm), a single layer so
+    /// `attn_norm` (skipped at layer 0 — `ModernBertBuilder::build`'s own
+    /// `if n == 0 { None }`) never needs a tensor.
+    fn modernbert_gguf_fixture(
+        device: &candle_core::Device,
+    ) -> (HashMap<String, Tensor>, serde_json::Value, Vec<String>) {
+        let (hidden, layers, heads, intermediate, vocab, max_pos) = (
+            GGUF_FIXTURE_HIDDEN,
+            GGUF_FIXTURE_LAYERS,
+            GGUF_FIXTURE_HEADS,
+            GGUF_FIXTURE_INTERMEDIATE,
+            GGUF_FIXTURE_VOCAB,
+            GGUF_FIXTURE_MAX_POS,
+        );
+        let mut map = HashMap::new();
+        let add = |map: &mut HashMap<String, Tensor>, name: String, dims: &[usize]| {
+            let t = gguf_fixture_tensor(&name, dims, device);
+            map.insert(name, t);
+        };
+        add(
+            &mut map,
+            "model.embeddings.tok_embeddings.weight".into(),
+            &[vocab, hidden],
+        );
+        add(&mut map, "model.embeddings.norm.weight".into(), &[hidden]);
+        let mut matmul_weights = Vec::new();
+        for n in 0..layers {
+            let p = format!("model.layers.{n}");
+            let w = format!("{p}.attn.Wqkv.weight");
+            add(&mut map, w.clone(), &[hidden * 3, hidden]);
+            matmul_weights.push(w);
+            let w = format!("{p}.attn.Wo.weight");
+            add(&mut map, w.clone(), &[hidden, hidden]);
+            matmul_weights.push(w);
+            let w = format!("{p}.mlp.Wi.weight");
+            add(&mut map, w.clone(), &[intermediate * 2, hidden]);
+            matmul_weights.push(w);
+            let w = format!("{p}.mlp.Wo.weight");
+            add(&mut map, w.clone(), &[hidden, intermediate]);
+            matmul_weights.push(w);
+            add(&mut map, format!("{p}.mlp_norm.weight"), &[hidden]);
+        }
+        add(&mut map, "model.final_norm.weight".into(), &[hidden]);
+        let config = serde_json::json!({
+            "model_type": "modernbert",
+            "hidden_size": hidden,
+            "num_hidden_layers": layers,
+            "num_attention_heads": heads,
+            "intermediate_size": intermediate,
+            "vocab_size": vocab,
+            "max_position_embeddings": max_pos,
+        });
+        (map, config, matmul_weights)
+    }
+
+    fn gguf_test_artifact_store() -> Arc<ArtifactStore> {
+        let cache_dir = tempfile::tempdir().unwrap().keep();
+        Arc::new(
+            ArtifactStore::with_root(
+                jammi_db::storage::StorageUrl::memory("worker-gguf-test-artifacts"),
+                jammi_db::storage::StorageRegistry::new(),
+                cache_dir,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// Register `model_id` in `catalog` with `artifact_path` pointing at
+    /// `dir` (a `file://`-scheme local directory — `StorageUrl::parse`
+    /// normalizes a bare absolute path to `file://...`), and return the
+    /// exact `base_model_id` string `build_encoder_adapters` expects
+    /// (`ModelSource::parse` maps an absolute path straight through to
+    /// `Local(path)`, so the catalog key IS the path string).
+    async fn register_gguf_base_model(catalog: &Arc<Catalog>, dir: &std::path::Path) -> String {
+        let base_model_id = dir.to_str().unwrap().to_string();
+        catalog
+            .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
+                model_id: &base_model_id,
+                version: 1,
+                model_type: "embedding",
+                backend: "candle",
+                task: ModelTask::TextEmbedding,
+                base_model_id: None,
+                artifact_path: Some(dir.to_str().unwrap()),
+                config_json: None,
+            })
+            .await
+            .unwrap();
+        base_model_id
+    }
+
+    /// Drives `build_encoder_adapters` for one architecture's GGUF fixture
+    /// through the SAME `spawn_blocking` shape production code runs it
+    /// under (`build_encoder_adapters` itself calls
+    /// `tokio::runtime::Handle::current().block_on(..)` for its catalog
+    /// reads, which panics if invoked directly on a runtime worker
+    /// thread).
+    async fn build_encoder_adapters_gguf(
+        arch_model_type: &str,
+        tensors: HashMap<String, Tensor>,
+        config: serde_json::Value,
+        matmul_weights: Vec<String>,
+        target_modules: Vec<String>,
+    ) -> Result<(jammi_encoders::AnyEncoder, jammi_lora::AdapterConfig)> {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(arch_model_type);
+        write_gguf_fixture(
+            &dir,
+            &tensors,
+            &matmul_weights,
+            candle_core::quantized::GgmlDType::Q8_0,
+        );
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_string(&config).unwrap(),
+        )
+        .unwrap();
+
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
+        let base_model_id = register_gguf_base_model(&catalog, &dir).await;
+        let artifact_store = gguf_test_artifact_store();
+
+        tokio::task::spawn_blocking(move || {
+            let training_config = FineTuneConfig {
+                target_modules,
+                ..FineTuneConfig::default()
+            };
+            let varmap = candle_nn::VarMap::new();
+            let device = candle_core::Device::Cpu;
+            build_encoder_adapters(
+                &base_model_id,
+                &catalog,
+                &artifact_store,
+                &training_config,
+                &varmap,
+                &device,
+            )
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_encoder_adapters_gguf_bert_succeeds() {
+        let device = candle_core::Device::Cpu;
+        let (tensors, config, matmul_weights) = bert_gguf_fixture(&device);
+        let (encoder, adapter_cfg) = build_encoder_adapters_gguf(
+            "bert",
+            tensors,
+            config,
+            matmul_weights,
+            vec!["query".into(), "value".into()],
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(encoder, jammi_encoders::AnyEncoder::Bert(_)),
+            "expected a Bert encoder"
+        );
+        assert_eq!(adapter_cfg.model_type, "bert");
+    }
+
+    /// RED at 32a3552c (issue #351 wave 5 audit, before this fix): fails
+    /// with "GGUF load requires num_hidden_layers (or num_layers) in
+    /// config.json" — the raw config.json this fixture writes carries
+    /// only `n_layers`, DistilBERT's native field name, so reading
+    /// `num_hidden_layers`/`num_layers` directly off it (the pre-fix
+    /// `build_encoder_adapters`) always misses. GREEN after routing
+    /// through `gguf::gguf_num_layers`, which normalizes first.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_encoder_adapters_gguf_distilbert_succeeds() {
+        let device = candle_core::Device::Cpu;
+        let (tensors, config, matmul_weights) = distilbert_gguf_fixture(&device);
+        let (encoder, adapter_cfg) = build_encoder_adapters_gguf(
+            "distilbert",
+            tensors,
+            config,
+            matmul_weights,
+            vec!["q_lin".into(), "v_lin".into()],
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(encoder, jammi_encoders::AnyEncoder::DistilBert(_)),
+            "expected a DistilBert encoder"
+        );
+        assert_eq!(adapter_cfg.model_type, "distilbert");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_encoder_adapters_gguf_modernbert_succeeds() {
+        let device = candle_core::Device::Cpu;
+        let (tensors, config, matmul_weights) = modernbert_gguf_fixture(&device);
+        let (encoder, adapter_cfg) = build_encoder_adapters_gguf(
+            "modernbert",
+            tensors,
+            config,
+            matmul_weights,
+            vec!["Wqkv".into()],
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(encoder, jammi_encoders::AnyEncoder::ModernBert(_)),
+            "expected a ModernBert encoder"
+        );
+        assert_eq!(adapter_cfg.model_type, "modernbert");
     }
 }

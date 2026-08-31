@@ -379,6 +379,20 @@ async fn gguf_embedding_matches_f32_reference_within_a_measured_cosine_floor() {
         mean_cosine > 0.999,
         "mean cosine {mean_cosine} (min {min_cosine}) below the measured floor; cosines={cosines:?}"
     );
+    // MEASURED (F9), not assumed — re-confirmed on this workspace's hermetic
+    // CPU dev/CI arm (2026-08-31, issue #351 wave 5 audit): `min_cosine=
+    // 0.9999995`, matching the doc comment above exactly. `min_cosine` was
+    // previously computed and printed into failure messages but never
+    // itself asserted — a per-sentence outlier well below the mean could
+    // slip through unnoticed. The floor here (0.999, the SAME wide-margin
+    // floor `mean_cosine` already clears) is a real, non-vacuous bound: a
+    // broken dequantize/dtype-cast path corrupting even ONE sentence's
+    // embedding would land its cosine far below this, not merely nudge the
+    // mean.
+    assert!(
+        min_cosine > 0.999,
+        "min cosine {min_cosine} (mean {mean_cosine}) below the measured floor; cosines={cosines:?}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -694,6 +708,94 @@ fn qlora_input_gradient_parity_vs_dense_dequantized_reference() {
             "one SGD step must strictly decrease the loss: before={loss_before} after={loss_after}"
         );
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Advisory fold (issue #351 wave 5 audit): a training-mode `Quantized`
+// forward with `lora_dropout > 0`, so the esc-032/033 dropout-stream
+// reservation actually fires on the `FrozenBase::Quantized` arm at least
+// once. `LoraLinear::forward`'s own doc ("Dropout key reservation")
+// documents that `DropoutMasks::next_key` is called EXACTLY ONCE per
+// training forward, reserved UNIFORMLY regardless of base storage format —
+// but every training-mode forward this it-suite drove before this fold used
+// `lora_dropout == 0` (the A3 parity test above explicitly disables
+// training: `lora.set_training(false)`), so a Quantized base's dropout
+// reservation had never actually executed under test. Drives
+// `jammi_lora::LoraLinear` directly (its own public API — no change to
+// `jammi-lora` itself).
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn quantized_base_training_forward_with_dropout_reserves_the_dropout_stream() {
+    let device = Device::Cpu;
+    let (out_f, in_f, rows) = (8usize, 32usize, 3usize);
+    let seed = 7u64;
+
+    let w_v = det_vec("dropout_quantized_weight", out_f * in_f);
+    let w = Tensor::from_vec(w_v, (out_f, in_f), &device).unwrap();
+    let wq = Arc::new(QTensor::quantize(&w, GgmlDType::Q8_0).unwrap());
+    let quantized_base = FrozenBase::Quantized(QuantizedLinear::new(wq, None).unwrap());
+
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device).pp("site");
+    let mut lora = LoraLinear::new_with_base(
+        quantized_base,
+        4,
+        8.0,
+        false,
+        LoraInitMode::Gaussian,
+        Some(0.3), // lora_dropout > 0
+        seed,
+        &varmap,
+        &vb,
+    )
+    .unwrap();
+    // `new_with_base` already constructs with `training: true` (module doc),
+    // set explicitly here so this test's premise is visible without reading
+    // that source.
+    lora.set_training(true);
+
+    assert_eq!(
+        lora.dropout_position().unwrap(),
+        Some(0),
+        "a dropout-configured layer must start at forward-count 0, before any training forward"
+    );
+
+    let x = Tensor::from_vec(
+        det_vec("dropout_quantized_input", rows * in_f),
+        (rows, in_f),
+        &device,
+    )
+    .unwrap();
+    let y = lora.forward(&x).unwrap();
+    let y_v = y.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    assert!(
+        y_v.iter().all(|v| v.is_finite()),
+        "a training-mode Quantized forward with dropout must produce finite output: {y_v:?}"
+    );
+
+    // The oracle: ONE training forward over a Quantized base with
+    // `lora_dropout > 0` must advance the dropout-stream position by
+    // EXACTLY one (`DropoutMasks::next_key` called once, per `forward`'s
+    // own doc) — proof the reservation fired on this arm, not skipped
+    // (which would leave the position at 0, esc-033's O(1)-resume
+    // invariant silently broken for every Quantized-base QLoRA run) and
+    // not double-drawn (which would advance it by two).
+    assert_eq!(
+        lora.dropout_position().unwrap(),
+        Some(1),
+        "one training-mode forward over a Quantized base with lora_dropout > 0 must advance the \
+         dropout-stream position by exactly one"
+    );
+
+    // A second forward must advance it again, to 2 — the reservation fires
+    // on EVERY training forward, not merely the first.
+    let _ = lora.forward(&x).unwrap();
+    assert_eq!(
+        lora.dropout_position().unwrap(),
+        Some(2),
+        "a second training-mode forward must advance the dropout-stream position again"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────

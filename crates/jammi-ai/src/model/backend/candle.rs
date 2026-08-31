@@ -2573,14 +2573,14 @@ impl ModelBackend for CandleBackend {
         let is_clap = is_hf_clap_config(&resolved.model_config);
         let is_open_clip = !is_clap && resolved.model_config.get("model_cfg").is_some();
 
-        // Normalize DistilBERT config fields to standard BERT names.
-        // DistilBERT uses dim/n_heads/n_layers/hidden_dim instead of
-        // hidden_size/num_attention_heads/num_hidden_layers/intermediate_size.
-        let model_config = if model_type == "distilbert" {
-            normalize_distilbert_config(&resolved.model_config)
-        } else {
-            resolved.model_config.clone()
-        };
+        // Normalize DistilBERT config fields to standard BERT names — the
+        // SAME normalization authority `gguf::gguf_num_layers` (below, and
+        // through it `estimate_gguf_residency`/the fine-tune GGUF arm)
+        // routes through, so a DistilBERT config.json (whose only geometry
+        // fields are its own `dim`/`n_heads`/`n_layers`/`hidden_dim` names)
+        // can never diverge between this ordinary encoder-config build and
+        // any GGUF consumer (issue #351 wave 5 audit).
+        let model_config = gguf::normalize_model_config(model_type, &resolved.model_config);
 
         // GGUF weight-storage format (issue #351): the resolver already
         // classified this at resolve time (`ResolvedModel.weights_format`) —
@@ -2620,16 +2620,13 @@ impl ModelBackend for CandleBackend {
         // — every downstream site below stays byte-identical to today.
         let gguf_backbone = match gguf_arch {
             Some(arch) => {
-                let num_layers = model_config
-                    .get("num_hidden_layers")
-                    .or_else(|| model_config.get("num_layers"))
-                    .and_then(|v| v.as_u64())
+                let num_layers = gguf::gguf_num_layers(model_type, &resolved.model_config)
                     .ok_or_else(|| JammiError::Model {
                         model_id: resolved.model_id.0.clone(),
                         message: "GGUF load requires num_hidden_layers (or num_layers) in \
                                   config.json"
                             .into(),
-                    })? as usize;
+                    })?;
                 Some(gguf::load_gguf_backbone(
                     &resolved.weights_paths[0],
                     arch,
@@ -3410,40 +3407,6 @@ fn load_distribution_head(
                 message: format!("distribution LoRA scaling: {e}"),
             })?;
     Ok(Some(lora))
-}
-
-/// Normalize DistilBERT config fields to standard BERT names.
-///
-/// DistilBERT uses different field names and omits some fields that
-/// candle's `BertConfig` requires. This maps them to BERT equivalents.
-fn normalize_distilbert_config(config: &serde_json::Value) -> serde_json::Value {
-    let mut normalized = config.clone();
-    if let Some(obj) = normalized.as_object_mut() {
-        // Field renames: DistilBERT → BERT
-        let mappings: &[(&str, &str)] = &[
-            ("dim", "hidden_size"),
-            ("n_heads", "num_attention_heads"),
-            ("n_layers", "num_hidden_layers"),
-            ("hidden_dim", "intermediate_size"),
-            ("dropout", "hidden_dropout_prob"),
-            ("attention_dropout", "attention_probs_dropout_prob"),
-        ];
-        for &(src, dst) in mappings {
-            if let Some(val) = obj.get(src).cloned() {
-                obj.entry(dst).or_insert(val);
-            }
-        }
-        // activation → hidden_act (string value)
-        if let Some(val) = obj.get("activation").cloned() {
-            obj.entry("hidden_act").or_insert(val);
-        }
-        // Defaults for fields DistilBERT doesn't have but BertConfig requires
-        obj.entry("type_vocab_size")
-            .or_insert(serde_json::Value::from(2));
-        obj.entry("layer_norm_eps")
-            .or_insert(serde_json::json!(1e-12));
-    }
-    normalized
 }
 
 /// Resolve the inference device from configuration.

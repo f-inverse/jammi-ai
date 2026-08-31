@@ -49,3 +49,5 @@ crates/jammi-encoders/tests/it/batch_composition_invariance.rs::sm89_window_cont
 crates/jammi-lora/tests/esc046_epilogue_biting_oracle.rs::cuda_device
 crates/jammi-server/tests/it/grpc_embedding_gpu.rs::start_gpu_embedding_server
 crates/jammi-server/tests/it/grpc_remote_session_gpu.rs::start_gpu_engine_server
+crates/jammi-bench/src/finetune_step.rs::vram_off_gpu_arm_require_gate
+crates/jammi-bench/src/finetune_step.rs::vram_on_gpu_arm_require_gate

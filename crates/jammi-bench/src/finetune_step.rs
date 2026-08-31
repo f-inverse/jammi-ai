@@ -1591,6 +1591,15 @@ mod tests {
     fn clip_on_losses_are_bit_identical_across_processes() {
         const STEPS: usize = 3;
         const WARMUP: usize = 1;
+        // Round KO-7 gating: this is a self-re-exec harness, not a
+        // capability-gated skip — every real CI run of the PARENT role
+        // (below) spawns two CHILD-role invocations of this exact fn
+        // (`CROSS_PROCESS_CHILD_ENV` set) and neither role's assertions are
+        // ever bypassed, so there is no missing-resource condition here for
+        // a `JAMMI_REQUIRE_*` hatch to meaningfully gate — fabricating one
+        // that could never fire would itself be a vacuous control. The
+        // if/else below (no early `return`) removes the KO-7-recognized
+        // skip shape at its source instead.
         if std::env::var_os(CROSS_PROCESS_CHILD_ENV).is_some() {
             // CHILD: prove the clip is active, run the real entry point,
             // print the loss bits for the parent to compare.
@@ -1610,70 +1619,72 @@ mod tests {
             println!("CLIP_DETERMINISM_LOSSES {}", bits.join(","));
             println!("CLIP_DETERMINISM_INVOCATIONS {}", tier.clip_invocations);
             println!("CLIP_DETERMINISM_ATTENTION_ARM {}", tier.attention_arm);
-            return;
-        }
-
-        let exe = std::env::current_exe().expect("current_exe");
-        // libtest's name for this fn is the module path WITHOUT the crate
-        // prefix (`finetune_step::tests::…`), which `module_path!()` carries.
-        let (_, module) = module_path!()
-            .split_once("::")
-            .expect("module_path has a crate prefix");
-        let name = format!("{module}::clip_on_losses_are_bit_identical_across_processes");
-        let run_child = |label: &str| -> (String, String, String) {
-            let out = std::process::Command::new(&exe)
-                .args(["--exact", &name, "--nocapture", "--test-threads=1"])
-                .env(CROSS_PROCESS_CHILD_ENV, "1")
-                .output()
-                .expect("spawn child test process");
-            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-            assert!(
-                out.status.success(),
-                "child {label} failed ({:?})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
-                out.status
-            );
-            // libtest prints `test <name> ... ` WITHOUT a newline before the
-            // test body's own first `println!` under `--nocapture`, so the
-            // first marker sits mid-line: match by substring, not prefix.
-            let grab = |key: &str| -> String {
-                stdout
-                    .lines()
-                    .find_map(|l| l.split_once(key).map(|(_, v)| v.trim().to_string()))
-                    .unwrap_or_else(|| panic!("child {label} printed no `{key}` line:\n{stdout}"))
+        } else {
+            let exe = std::env::current_exe().expect("current_exe");
+            // libtest's name for this fn is the module path WITHOUT the crate
+            // prefix (`finetune_step::tests::…`), which `module_path!()` carries.
+            let (_, module) = module_path!()
+                .split_once("::")
+                .expect("module_path has a crate prefix");
+            let name = format!("{module}::clip_on_losses_are_bit_identical_across_processes");
+            let run_child = |label: &str| -> (String, String, String) {
+                let out = std::process::Command::new(&exe)
+                    .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+                    .env(CROSS_PROCESS_CHILD_ENV, "1")
+                    .output()
+                    .expect("spawn child test process");
+                let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+                let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+                assert!(
+                    out.status.success(),
+                    "child {label} failed ({:?})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+                    out.status
+                );
+                // libtest prints `test <name> ... ` WITHOUT a newline before the
+                // test body's own first `println!` under `--nocapture`, so the
+                // first marker sits mid-line: match by substring, not prefix.
+                let grab = |key: &str| -> String {
+                    stdout
+                        .lines()
+                        .find_map(|l| l.split_once(key).map(|(_, v)| v.trim().to_string()))
+                        .unwrap_or_else(|| {
+                            panic!("child {label} printed no `{key}` line:\n{stdout}")
+                        })
+                };
+                (
+                    grab("CLIP_DETERMINISM_LOSSES "),
+                    grab("CLIP_DETERMINISM_INVOCATIONS "),
+                    grab("CLIP_DETERMINISM_ATTENTION_ARM "),
+                )
             };
-            (
-                grab("CLIP_DETERMINISM_LOSSES "),
-                grab("CLIP_DETERMINISM_INVOCATIONS "),
-                grab("CLIP_DETERMINISM_ATTENTION_ARM "),
-            )
-        };
-        let (losses_a, invocations_a, arm_a) = run_child("A");
-        let (losses_b, invocations_b, arm_b) = run_child("B");
-        assert_eq!(
-            losses_a.split(',').count(),
-            STEPS,
-            "child A must report one loss per measured step: {losses_a}"
-        );
-        assert_eq!(
-            losses_a, losses_b,
-            "same seed, same --max-grad-norm, two processes: clip-on losses must be bit-identical \
-             (A={losses_a} B={losses_b}) — a mismatch is the esc-182 HashMap-order class"
-        );
-        assert_eq!(
-            invocations_a,
-            (STEPS + WARMUP + 1).to_string(),
-            "clip_invocations must count pre-step + warmup + measured"
-        );
-        assert_eq!(invocations_a, invocations_b);
-        assert_eq!(
-            arm_a, arm_b,
-            "attention_arm must be a function of the run, not the process"
-        );
-        assert!(
-            ["fused", "eager"].contains(&arm_a.as_str()),
-            "a single-arm run must read fused or eager, got {arm_a}"
-        );
+            let (losses_a, invocations_a, arm_a) = run_child("A");
+            let (losses_b, invocations_b, arm_b) = run_child("B");
+            assert_eq!(
+                losses_a.split(',').count(),
+                STEPS,
+                "child A must report one loss per measured step: {losses_a}"
+            );
+            assert_eq!(
+                losses_a, losses_b,
+                "same seed, same --max-grad-norm, two processes: clip-on losses must be \
+                 bit-identical (A={losses_a} B={losses_b}) — a mismatch is the esc-182 \
+                 HashMap-order class"
+            );
+            assert_eq!(
+                invocations_a,
+                (STEPS + WARMUP + 1).to_string(),
+                "clip_invocations must count pre-step + warmup + measured"
+            );
+            assert_eq!(invocations_a, invocations_b);
+            assert_eq!(
+                arm_a, arm_b,
+                "attention_arm must be a function of the run, not the process"
+            );
+            assert!(
+                ["fused", "eager"].contains(&arm_a.as_str()),
+                "a single-arm run must read fused or eager, got {arm_a}"
+            );
+        }
     }
 
     /// The `attention_arm` derivation, pinned (see the tier field's doc):
@@ -2528,6 +2539,40 @@ mod tests {
         device_memory_used_bytes().is_some()
     }
 
+    /// Registered KO-7 require-gate helper (`ci/kernel-oracle-helpers.txt`)
+    /// for the NO-`nvidia-smi` lattice cell below: a lane that specifically
+    /// wants to prove the off-GPU `peak_vram_bytes` arm sets
+    /// `JAMMI_REQUIRE_NO_GPU_VRAM_ARM` — if that lane's box unexpectedly
+    /// HAS `nvidia-smi` (so the arm cannot be observed), this is a hard
+    /// failure, never a silent skip.
+    fn vram_off_gpu_arm_require_gate() {
+        if std::env::var_os("JAMMI_REQUIRE_NO_GPU_VRAM_ARM").is_some() {
+            panic!(
+                "finetune_step_peak_vram_bytes_is_not_yet_measured_off_gpu: \
+                 JAMMI_REQUIRE_NO_GPU_VRAM_ARM is set but nvidia-smi is present on this box -- \
+                 the off-GPU peak_vram_bytes arm cannot be proven here; a silent skip is not \
+                 acceptable"
+            );
+        }
+    }
+
+    /// Registered KO-7 require-gate helper (`ci/kernel-oracle-helpers.txt`)
+    /// for the WITH-`nvidia-smi` lattice cell below — same
+    /// `JAMMI_REQUIRE_CUDA` RED-on-demand hatch the crate's other
+    /// device-gated tests use, extracted into its own fn so its call site
+    /// is a registrable, reviewed require-gate rather than an inline
+    /// `assert!` KO-7 cannot recognize as a gate.
+    fn vram_on_gpu_arm_require_gate() {
+        if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
+            panic!(
+                "finetune_step_peak_vram_bytes_is_measured_on_a_box_with_nvidia_smi: \
+                 JAMMI_REQUIRE_CUDA is set but nvidia-smi is not usable on this box -- the \
+                 on-GPU peak_vram_bytes arm cannot be proven here; a silent skip is not \
+                 acceptable"
+            );
+        }
+    }
+
     /// Lattice-cell arm for `run()`'s `peak_vram_bytes`, NO-`nvidia-smi`
     /// box (every CI lane): `VramSampler::start()` returns `None` (its
     /// first `device_memory_used_bytes()` call fails), so `run()`'s `match
@@ -2544,6 +2589,7 @@ mod tests {
     #[test]
     fn finetune_step_peak_vram_bytes_is_not_yet_measured_off_gpu() {
         if vram_probe_present() {
+            vram_off_gpu_arm_require_gate();
             eprintln!(
                 "finetune_step_peak_vram_bytes_is_not_yet_measured_off_gpu: nvidia-smi is present \
                  on this box, so the no-GPU arm is unobservable here — see the sibling \
@@ -2574,11 +2620,7 @@ mod tests {
     #[test]
     fn finetune_step_peak_vram_bytes_is_measured_on_a_box_with_nvidia_smi() {
         if !vram_probe_present() {
-            assert!(
-                std::env::var_os("JAMMI_REQUIRE_CUDA").is_none(),
-                "JAMMI_REQUIRE_CUDA is set but nvidia-smi is not usable on this box — the \
-                 on-GPU peak_vram_bytes arm cannot be proven here; a silent skip is not acceptable"
-            );
+            vram_on_gpu_arm_require_gate();
             eprintln!(
                 "finetune_step_peak_vram_bytes_is_measured_on_a_box_with_nvidia_smi: no nvidia-smi \
                  on this box, so the on-GPU arm is unobservable here — see the sibling \

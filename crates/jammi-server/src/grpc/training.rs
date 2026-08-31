@@ -102,6 +102,12 @@ impl TrainingService for TrainingServer {
             // otherwise so a remote `wait()` reads it exactly when status is
             // "failed".
             error: record.error_message.unwrap_or_default(),
+            // The catalog's `training_jobs.metrics` column, relayed verbatim —
+            // the SAME raw JSON blob the embedded `TrainingJob.metrics()` reads
+            // off this record, with the same absent-until-recorded semantics
+            // (`None` here maps to `optional` unset, matching field presence
+            // rather than an empty string).
+            metrics_json: record.metrics,
         }))
     }
 

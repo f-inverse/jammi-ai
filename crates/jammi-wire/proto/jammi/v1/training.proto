@@ -434,6 +434,19 @@ message TrainingStatusResponse {
   string model_id = 2;
   // The failure message when `status` is "failed"; empty otherwise.
   string error = 3;
+  // Run metrics recorded for this job, as an opaque JSON object — the SAME
+  // blob the catalog's `training_jobs.metrics` column carries and the
+  // embedded surface's `TrainingJob.metrics()` returns (issue #441). Its
+  // schema is documented at the trainer, not on the wire: `final_loss`,
+  // `early_stopping_metric`, `total_steps`, `started_at`, `completed_at`,
+  // and, for a fine-tune run, the `train_loss_curve` / `val_loss_curve`
+  // per-epoch arrays (`crates/jammi-ai/src/fine_tune/trainer.rs`, the
+  // `metrics_json` built at the end of `TrainingLoop::run`). Field presence
+  // (not the empty string) distinguishes "not yet recorded" (still queued or
+  // running before its first stamp) from an already-recorded blob — this
+  // field mirrors the catalog column's `NULL`/`NOT NULL`, never a decoded or
+  // re-encoded value, so both transports serve byte-identical JSON text.
+  optional string metrics_json = 4;
 }
 
 message ListTrainingJobsRequest {}

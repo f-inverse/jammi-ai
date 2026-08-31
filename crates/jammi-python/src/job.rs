@@ -69,16 +69,13 @@ impl PyTrainingJob {
     /// recorded any metrics (e.g. still queued or running before its first
     /// stamp).
     ///
-    /// Per-epoch train/val loss curves are NOT part of this surface: the
-    /// trainer computes `avg_train_loss`/`avg_val_loss` at every epoch
-    /// boundary (`TrainingLoop::run`, `crates/jammi-ai/src/fine_tune/trainer.rs`)
-    /// but only logs them (`tracing::info!`) — it never accumulates them into
-    /// a `Vec` or folds them into the metrics JSON it returns, so no curve is
-    /// retained anywhere this binding (or any consumer) can reach. Surfacing
-    /// curves needs a `jammi-ai` change: accumulate `(epoch, avg_train_loss,
-    /// avg_val_loss)` across the loop and add it to `TrainingResult::metrics_json`
-    /// (`trainer.rs`, around the `let metrics_json = serde_json::json!({...})`
-    /// at the end of `run`) — out of this crate's scope.
+    /// Per-epoch train/val loss curves ARE part of this surface (issue #441):
+    /// the trainer accumulates `(epoch, avg_train_loss)` / `(epoch,
+    /// avg_val_loss)` across `TrainingLoop::run`
+    /// (`crates/jammi-ai/src/fine_tune/trainer.rs`) and folds them into the
+    /// returned metrics JSON as the `train_loss_curve` / `val_loss_curve`
+    /// arrays, so this dict carries them exactly like every other recorded
+    /// metric.
     fn metrics(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let record = self
             .runtime

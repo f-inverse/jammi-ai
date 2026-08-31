@@ -421,6 +421,187 @@ async fn remote_fine_tune_status_reconstructs_the_exact_error_variant() {
     let _ = server.handle.await;
 }
 
+/// The contrastive columns the engine detects as `(text_a, text_b, score)`
+/// training data (mirrors `grpc_training.rs`'s fixture).
+fn training_pairs_columns() -> Vec<String> {
+    vec!["text_a".into(), "text_b".into(), "score".into()]
+}
+
+/// Register the shipped contrastive `training_pairs.csv` fixture as a source
+/// on the shared engine (both transports then reach the same source, matching
+/// `add_patents`).
+async fn add_training_pairs(session: &Session) {
+    session
+        .add_source(
+            "training",
+            SourceType::File,
+            file_connection("training_pairs.csv", FileFormat::Csv),
+        )
+        .await
+        .expect("add training_pairs");
+}
+
+/// K4 (issue #441): a completed fine-tune job's run-metrics blob round-trips
+/// byte-for-byte-equivalent over the wire, on the divergence-prone case — the
+/// multi-epoch `train_loss_curve` / `val_loss_curve` arrays, not a single
+/// scalar. The embedded surface reads the catalog's `training_jobs.metrics`
+/// column directly (the same read `jammi-python`'s `TrainingJob.metrics()`
+/// performs); the remote surface reads it back through the NEW
+/// `TrainingStatus.metrics_json` wire field. Both transports submit the
+/// identical spec (default config: 3 epochs, `early_stopping_metric:
+/// ValLoss`, so both curves populate) against the same shared engine, so any
+/// divergence is the wire adapter's fault, not the engine's.
+///
+/// `started_at`/`completed_at` are wall-clock timestamps stamped independently
+/// by each run (two separate jobs, two separate clock reads), so the raw JSON
+/// text is not byte-identical even for an identical spec; comparing those two
+/// keys away and asserting JSON-VALUE equality on everything else — including
+/// the full curve arrays — is the honest oracle here, not a byte compare (which
+/// would flake on clock skew) and not a "both non-empty" check (which would
+/// miss a divergence inside the curve arrays themselves, the failure mode this
+/// leg exists to catch).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_fine_tune_metrics_round_trips_like_local() {
+    let server = start_engine_server().await;
+    let remote = remote(&server).await;
+    let local = local(&server);
+    add_training_pairs(&local).await;
+
+    let columns = training_pairs_columns();
+    let model = tiny_bert_model_id();
+
+    let local_job = local
+        .fine_tune(
+            "training",
+            &model,
+            &columns,
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            None,
+        )
+        .await
+        .expect("local fine_tune submit");
+    let remote_job = remote
+        .fine_tune(
+            "training",
+            &model,
+            &columns,
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            None,
+        )
+        .await
+        .expect("remote fine_tune submit");
+
+    // Poll both to `completed` through the shared status-only surface (the
+    // same tiny local trait `remote_fine_tune_start_defers_failure_to_the_worker`
+    // uses to drive one poll loop over both transport types).
+    trait FineTuneStatus {
+        async fn status(
+            &self,
+            job: &jammi_ai::local_session::FineTuneJobId,
+        ) -> jammi_db::error::Result<String>;
+    }
+    impl FineTuneStatus for Session {
+        async fn status(
+            &self,
+            job: &jammi_ai::local_session::FineTuneJobId,
+        ) -> jammi_db::error::Result<String> {
+            self.fine_tune_status(job).await
+        }
+    }
+    impl FineTuneStatus for DataClient {
+        async fn status(
+            &self,
+            job: &jammi_ai::local_session::FineTuneJobId,
+        ) -> jammi_db::error::Result<String> {
+            self.fine_tune_status(job).await
+        }
+    }
+    async fn poll_until_completed(
+        session: &impl FineTuneStatus,
+        job: &jammi_ai::local_session::FineTuneJobId,
+    ) {
+        for _ in 0..600 {
+            let status = session.status(job).await.expect("fine_tune_status");
+            if status == "completed" {
+                return;
+            }
+            assert_ne!(
+                status, "failed",
+                "the minimal LoRA fine-tune over training_pairs.csv must complete"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("fine-tune job did not reach `completed` in time");
+    }
+    poll_until_completed(&local, &local_job).await;
+    poll_until_completed(&remote, &remote_job).await;
+
+    // Embedded read: straight off the catalog record, the same field
+    // `jammi-python`'s `TrainingJob.metrics()` decodes.
+    let local_record = server
+        .engine
+        .catalog()
+        .get_training_job(&local_job.0)
+        .await
+        .expect("local get_training_job");
+    let local_metrics: serde_json::Value = local_record
+        .metrics
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .expect("a completed local job carries a metrics blob");
+
+    // Remote read: the new `TrainingStatus.metrics_json` wire field.
+    let remote_metrics_json = remote
+        .fine_tune_metrics(&remote_job)
+        .await
+        .expect("remote fine_tune_metrics")
+        .expect("a completed remote job carries a metrics blob");
+    let remote_metrics: serde_json::Value =
+        serde_json::from_str(&remote_metrics_json).expect("remote metrics_json is valid JSON");
+
+    let strip_timestamps = |mut v: serde_json::Value| -> serde_json::Value {
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("started_at");
+            obj.remove("completed_at");
+        }
+        v
+    };
+    assert_eq!(
+        strip_timestamps(local_metrics.clone()),
+        strip_timestamps(remote_metrics.clone()),
+        "remote TrainingStatus.metrics_json must equal the embedded catalog metrics blob \
+         on the deterministic subset (every key but the two per-run wall-clock \
+         timestamps): local={local_metrics:?} remote={remote_metrics:?}"
+    );
+
+    // The divergence-prone case itself: multi-row curve arrays, not a single
+    // scalar. Default config trains 3 epochs with `early_stopping_metric:
+    // ValLoss`, so both curves populate on every completed run.
+    let curve_len =
+        |v: &serde_json::Value, key: &str| v.get(key).and_then(|c| c.as_array()).map(|a| a.len());
+    assert_eq!(
+        curve_len(&local_metrics, "train_loss_curve"),
+        Some(3),
+        "3 epochs must leave a 3-row train_loss_curve locally, got {local_metrics:?}"
+    );
+    assert_eq!(
+        curve_len(&remote_metrics, "train_loss_curve"),
+        curve_len(&local_metrics, "train_loss_curve"),
+        "the wire train_loss_curve must have the SAME row count as the embedded one \
+         (the divergence-prone multi-row case, not just \"both non-empty\")"
+    );
+    assert_eq!(
+        curve_len(&remote_metrics, "val_loss_curve"),
+        curve_len(&local_metrics, "val_loss_curve"),
+        "the wire val_loss_curve must have the SAME row count as the embedded one"
+    );
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
 /// A realistic mutable-table definition: a `patents_dim` companion keyed on a
 /// string id with a value column.
 fn patents_dim_definition() -> jammi_db::store::mutable::MutableTableDefinition {

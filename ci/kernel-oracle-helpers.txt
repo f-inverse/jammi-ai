@@ -49,3 +49,11 @@ crates/jammi-encoders/tests/it/batch_composition_invariance.rs::sm89_window_cont
 crates/jammi-lora/tests/esc046_epilogue_biting_oracle.rs::cuda_device
 crates/jammi-server/tests/it/grpc_embedding_gpu.rs::start_gpu_embedding_server
 crates/jammi-server/tests/it/grpc_remote_session_gpu.rs::start_gpu_engine_server
+crates/jammi-ai/src/fine_tune/optimizer.rs::cuda_device
+crates/jammi-ai/tests/gpu_capability/gguf_quantized_gpu.rs::device_memory_used_bytes_or_require
+crates/jammi-ai/tests/it/channel_contract.rs::regenerate_goldens_requested
+crates/jammi-ai/tests/it/fine_tune.rs::chmod_bypassed
+crates/jammi-ai/tests/distributed/artifact_crash_window.rs::required_backends
+crates/jammi-ai/tests/distributed/cross_tenant_isolation.rs::required_backends
+crates/jammi-ai/tests/distributed/exactly_one_claim.rs::required_backends
+crates/jammi-ai/tests/distributed/kill9_reclaim.rs::required_backends

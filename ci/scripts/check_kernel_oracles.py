@@ -104,10 +104,19 @@ fails closed, and a marker covering NO desync (on its own line or the line
 below) is itself a FAIL — a marker that no longer corresponds to a real desync
 must be removed, never accumulate as unreviewable dead weight.
 
-Scanned files: `crates/jammi-kernels/tests/**/*.rs`, `crates/jammi-encoders/
-src/**/*.rs` (recursive under both roots; test modules live inline in the
-latter; scanning the whole file costs nothing — non-test code simply carries
-no `#[test]` fn to check). KO-7 is TOTAL, over EVERY recognized skip shape
+Scanned files: `crates/*/tests/**/*.rs` and `crates/*/src/**/*.rs` — every
+crate's own `tests/` and `src/` directory (recursive under each; a ONE-LEVEL
+glob, so a nested vendored source tree, e.g. `crates/jammi-kernels/
+third_party/flash-attention/src`, does not match `crates/*/src` and stays out
+of scope — documented, not silently pulled in). Test modules live inline in
+`src/` for most crates; scanning the whole file costs nothing — non-test code
+simply carries no `#[test]` fn to check. This widens what was, through the
+round-6 audit, exactly two hardcoded roots (`crates/jammi-kernels/tests/`,
+`crates/jammi-encoders/src/`) to every crate honestly, closing the class the
+scoping itself was standing in for (KO-7 issue tightening) — the mechanism
+below (registry, dominance windowing, recognized-shapes list) is otherwise
+unchanged; only the file-discovery step widened. KO-7 is TOTAL, over EVERY
+recognized skip shape
 (above) inside EVERY `#[test]` fn in EVERY scanned file, not just new/changed
 ones — no diff-base input is needed in v1 for this reason. This is a
 deliberately narrower claim than "every possible way a Rust fn can exit
@@ -255,8 +264,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-KERNELS_TESTS_DIR = REPO_ROOT / "crates" / "jammi-kernels" / "tests"
-ENCODERS_SRC_DIR = REPO_ROOT / "crates" / "jammi-encoders" / "src"
+CRATES_DIR = REPO_ROOT / "crates"
+# Round-7 tightening (KO-7 issue): the two original hardcoded roots
+# (`crates/jammi-kernels/tests`, `crates/jammi-encoders/src`) generalized to
+# EVERY crate's own `tests/`/`src/` directory via `scan_roots()` below — they
+# are now a SUBSET of, not a synonym for, the full scan.
 ADMISSION_DEFINITION_FILE = "crates/jammi-kernels/src/admission.rs"
 
 # The `KO-1`..`KO-8` stable ids — bound to `docs/maintainer/cuda-kernel-guide.md`
@@ -1749,24 +1761,43 @@ def print_reconciliation(
 # --------------------------------------------------------------------------- #
 # orchestration
 # --------------------------------------------------------------------------- #
+def scan_roots() -> list[Path]:
+    """Every crate's own `tests/` and `src/` directory — `crates/*/tests`
+    and `crates/*/src`, a ONE-LEVEL glob under `CRATES_DIR` (so a nested
+    vendored source tree, e.g. `crates/jammi-kernels/third_party/
+    flash-attention/src`, does not match and stays out of scope — the SAME
+    "documented, not silently pulled in" discipline `scan_files`'s old
+    round-4 comment stated for the two original hardcoded roots). Sorted
+    for determinism; fails closed (`OracleError`) if `CRATES_DIR` itself, or
+    every candidate root under it, is missing — an empty result here would
+    otherwise make KO-7 vacuously PASS with a mis-pointed `REPO_ROOT`.
+    """
+    if not CRATES_DIR.is_dir():
+        raise OracleError(f"scan root not found: {CRATES_DIR}")
+    roots: list[Path] = []
+    for crate_dir in sorted(CRATES_DIR.iterdir()):
+        if not crate_dir.is_dir():
+            continue
+        for sub in ("tests", "src"):
+            candidate = crate_dir / sub
+            if candidate.is_dir():
+                roots.append(candidate)
+    if not roots:
+        raise OracleError(f"no `tests/`/`src/` directory found under any crate in {CRATES_DIR}")
+    return roots
+
+
 def scan_files() -> dict[str, str]:
-    if not KERNELS_TESTS_DIR.is_dir():
-        raise OracleError(f"scan root not found: {KERNELS_TESTS_DIR}")
-    if not ENCODERS_SRC_DIR.is_dir():
-        raise OracleError(f"scan root not found: {ENCODERS_SRC_DIR}")
-    # Round-4 audit advisory: RECURSIVE under the two roots (not additional
-    # roots — `crates/jammi-encoders/src/context/*.rs` is a real,
-    # previously-silently-unscanned subdirectory of the already-in-scope
-    # `crates/jammi-encoders/src/`; scope.py's 19 files elsewhere are a
-    # DIFFERENT crate entirely and stay out of scope, documented, not
-    # pulled in).
+    # Round-4 audit advisory (still true, now over every discovered root,
+    # not just the original two): RECURSIVE under each root — a real,
+    # previously-silently-unscanned subdirectory of an in-scope root (the
+    # live instance that motivated this: `crates/jammi-encoders/src/
+    # context/*.rs`) must not be missed by a flat, non-recursive glob.
     texts: dict[str, str] = {}
-    for path in sorted(KERNELS_TESTS_DIR.rglob("*.rs")):
-        rel = str(path.relative_to(REPO_ROOT))
-        texts[rel] = path.read_text(encoding="utf-8", errors="ignore")
-    for path in sorted(ENCODERS_SRC_DIR.rglob("*.rs")):
-        rel = str(path.relative_to(REPO_ROOT))
-        texts[rel] = path.read_text(encoding="utf-8", errors="ignore")
+    for root in scan_roots():
+        for path in sorted(root.rglob("*.rs")):
+            rel = str(path.relative_to(REPO_ROOT))
+            texts[rel] = path.read_text(encoding="utf-8", errors="ignore")
     return texts
 
 

@@ -4,6 +4,7 @@ use pyo3::prelude::*;
 
 use jammi_ai::fine_tune::training_job::TrainingJob;
 use jammi_ai::session::InferenceSession;
+use jammi_db::error::JammiError;
 
 use crate::convert::serializable_to_pydict;
 use crate::error::to_pyerr;
@@ -67,7 +68,10 @@ impl PyTrainingJob {
     /// `started_at`, `completed_at`), or the `error_message` blob a failed
     /// attempt records instead. Returns `{}` for a job that has not yet
     /// recorded any metrics (e.g. still queued or running before its first
-    /// stamp).
+    /// stamp — the column is absent). Raises `jammi.errors.BackendError` if
+    /// the column IS present but fails to parse as JSON — a catalog
+    /// data-integrity fault, never silently folded into the absent `{}` case
+    /// (matches the remote transport's `metrics()`).
     ///
     /// Per-epoch train/val loss curves ARE part of this surface (issue #441):
     /// the trainer accumulates `(epoch, avg_train_loss)` / `(epoch,
@@ -81,11 +85,22 @@ impl PyTrainingJob {
             .runtime
             .block_on(self.session.catalog().get_training_job(&self.inner.job_id))
             .map_err(to_pyerr)?;
-        let value: serde_json::Value = record
-            .metrics
-            .as_deref()
-            .and_then(|raw| serde_json::from_str(raw).ok())
-            .unwrap_or_else(|| serde_json::json!({}));
+        let value: serde_json::Value = match record.metrics.as_deref() {
+            // Absent — the job has not yet recorded any metrics. `{}`.
+            None => serde_json::json!({}),
+            // Present — must parse. A present-but-unparseable blob is a catalog
+            // data-integrity fault, distinct from "no metrics yet" — surfaced
+            // LOUDLY (never silently folded into the absent `{}` case) so it
+            // cannot be mistaken for a job that simply hasn't reported yet.
+            // Matches the remote transport's `metrics()`, which raises rather
+            // than returning `{}` for the same malformed-but-present state.
+            Some(raw) => serde_json::from_str(raw).map_err(|parse_err| {
+                to_pyerr(JammiError::Catalog(format!(
+                    "training job {}: metrics blob failed to parse as JSON: {parse_err}",
+                    self.inner.job_id,
+                )))
+            })?,
+        };
         serializable_to_pydict(py, &value)
     }
 }

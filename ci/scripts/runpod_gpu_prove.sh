@@ -31,7 +31,7 @@ GPU_PROVE_ARCH="${GPU_PROVE_ARCH:-sm_80}"
 case "$GPU_PROVE_ARCH" in
   sm_80) RP_DEPLOY_ARCH=a100 ;; # Ampere floor — proves sm_80, #277.
   sm_86) RP_DEPLOY_ARCH=a40  ;; # Ampere workstation class — proves sm_86.
-  sm_89) RP_DEPLOY_ARCH=l40s ;; # Ada — proves sm_89, fp8 #308.
+  sm_89) RP_DEPLOY_ARCH=l4_l40s ;; # Ada — proves sm_89, fp8 #308. L4 first (canonical commodity inference card, ~half L40S rental); L40S is a capacity-only fallback — same sm_89 SASS, identical correctness proof.
   sm_90) RP_DEPLOY_ARCH=h100 ;; # Hopper — proves sm_90.
   *)
     echo "::error::unknown GPU_PROVE_ARCH '${GPU_PROVE_ARCH}' (want: sm_80|sm_86|sm_89|sm_90)"

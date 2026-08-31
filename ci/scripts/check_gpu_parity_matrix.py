@@ -266,7 +266,8 @@ SILICON_ACCOUNTING: list[tuple[str, SiliconAccountingEntry]] = [
         "sm_89",
         ProvenBy(
             "gpu-prove.yml / _gpu-prove-gate.yml matrix leg sm_89 "
-            "(ci/scripts/runpod_gpu_prove.sh GPU_PROVE_ARCH=sm_89 on a rented L40S)"
+            "(ci/scripts/runpod_gpu_prove.sh GPU_PROVE_ARCH=sm_89 on a rented "
+            "L4 (L40S fallback))"
         ),
     ),
     (

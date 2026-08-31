@@ -70,7 +70,7 @@
 //! IDENTICAL condition `cpu_fwd` itself gates on, in the same relative
 //! position) — no divergence, so no fixture is needed there either.
 
-use candle_core::{DType, Device, Error, Tensor};
+use candle_core::{DType, Device, Error, Tensor, Var};
 use jammi_kernels::ops::{
     apply2, apply3, AttentionBlockFused, DropoutFused, FullyMaskedPolicy, LayerNormFused,
     SoftmaxLastDimFused,
@@ -213,6 +213,72 @@ fn assert_class_refuses_empty_non_contiguous_admission(device: &Device) {
 #[test]
 fn cpu_refuses_empty_non_contiguous_admission_across_representative_ops() {
     assert_class_refuses_empty_non_contiguous_admission(&Device::Cpu);
+}
+
+/// A DIFFERENT class from the admission-order fix above (shape, not
+/// cause): `crate::cuda::layer_norm::cuda_bwd_dgamma`'s `rows == 0,
+/// hidden != 0` fast path used to return `alloc_empty`'s `[0]`-shaped
+/// buffer — `cpu_fwd`'s OWN `rows == 0` path (`ln_bwd_dgamma_f32`'s
+/// `vec![0f32; hidden]`) returns a `[hidden]`-shaped, all-zero buffer
+/// instead, so the CUDA arm produced a WRONG-SHAPED `dgamma` for a
+/// zero-row batch. Pinned via the only public surface that reaches the
+/// (private) `LayerNormBwdDgamma` op: `LayerNormFused` with
+/// `dgamma_needed: true`, differentiated through `Tensor::backward()` —
+/// matching `ops::layer_norm::tests::bwd_dgamma_zero_rows_hidden_nonzero_
+/// is_hidden_shaped_all_zero_not_zero_length`'s CPU fixture exactly, one
+/// device parameter apart.
+fn assert_dgamma_zero_rows_hidden_nonzero_is_hidden_shaped_all_zero(device: &Device) {
+    let x = Tensor::zeros((0usize, 4usize), DType::F32, device).unwrap();
+    let gamma = Var::from_tensor(&Tensor::zeros((4usize,), DType::F32, device).unwrap()).unwrap();
+    let out = apply2(&x, gamma.as_tensor(), LayerNormFused::new(1e-5, true)).unwrap();
+    assert_eq!(
+        out.dims(),
+        &[0, 4],
+        "dgamma_class_oracle: fwd output shape sanity check"
+    );
+
+    let grads = out
+        .sum_all()
+        .unwrap()
+        .backward()
+        .expect("dgamma_class_oracle: backward through a zero-row batch must not error");
+    let dgamma = grads
+        .get(gamma.as_tensor())
+        .expect("dgamma_class_oracle: gamma must have a recorded gradient");
+    assert_eq!(
+        dgamma.dims(),
+        &[4],
+        "dgamma_class_oracle: rows == 0, hidden != 0 dgamma must be [hidden]-shaped, \
+         not [0]-shaped"
+    );
+    let values: Vec<f32> = dgamma.flatten_all().unwrap().to_vec1().unwrap();
+    assert!(
+        values.iter().all(|&v| v == 0.0),
+        "dgamma_class_oracle: summing zero rows must give exactly zero at every \
+         position, got {values:?}"
+    );
+}
+
+/// The CPU leg — unconditional, proving the fixture itself (and
+/// `LayerNormFused`'s CPU path) behaves as this file's module doc for the
+/// dgamma-shape class describes, independent of CUDA availability.
+#[test]
+fn cpu_dgamma_zero_rows_hidden_nonzero_is_hidden_shaped_all_zero() {
+    assert_dgamma_zero_rows_hidden_nonzero_is_hidden_shaped_all_zero(&Device::Cpu);
+}
+
+/// The CUDA leg — compiled only under the `cuda` feature, this crate's
+/// prove-lane landing proof that `crate::cuda::layer_norm::cuda_bwd_
+/// dgamma`'s `rows == 0, hidden != 0` fast path now returns a `[hidden]`-
+/// shaped, all-zero `dgamma`, matching `cpu_fwd` exactly, rather than the
+/// `[0]`-shaped buffer it returned before this fix.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_dgamma_zero_rows_hidden_nonzero_is_hidden_shaped_all_zero() {
+    let Some(device) = cuda_device_or_skip() else {
+        return;
+    };
+    assert_dgamma_zero_rows_hidden_nonzero_is_hidden_shaped_all_zero(&device);
 }
 
 /// Acquire a CUDA device for this file's own CUDA-gated leg, or `None` to

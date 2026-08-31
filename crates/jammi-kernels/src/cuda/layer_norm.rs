@@ -288,13 +288,10 @@ pub(crate) fn cuda_bwd_dgamma(
     // See `cuda_fwd`'s identical comment above: `hidden == 0` is checked
     // on its own, matching `ops::layer_norm`'s internal `LayerNormBwdDgamma
     // ::cpu_fwd` domain (its own early-return is gated on `hidden == 0`
-    // alone, before `contiguous_offsets()`). NOTE: the `Shape::from(0usize)`
-    // returned here (pre-existing, unchanged by this fix) is a `hidden ==
-    // 0`-only shape; `cpu_fwd`'s OWN `rows == 0, hidden != 0` path returns
-    // `Shape::from(hidden)` instead (`ln_bwd_dgamma_f32`'s `vec![0f32;
-    // hidden]`) — a SEPARATE, pre-existing shape divergence this
-    // contiguity-ordering fix does not attempt to correct; flagged, not
-    // silently left uninvestigated (see this crate's hand-off notes).
+    // alone, before `contiguous_offsets()`). This arm's `Shape::from(
+    // 0usize)` is correct ONLY here, where `hidden` (the output's own
+    // length) is itself `0` — see the `n == 0` fast path below for the
+    // `rows == 0, hidden != 0` case, which must NOT reuse this shape.
     if hidden == 0 {
         if s1.dtype() != s2.dtype() {
             return Err(Error::DTypeMismatchBinaryOp {
@@ -318,6 +315,14 @@ pub(crate) fn cuda_bwd_dgamma(
         .contiguous_offsets()
         .ok_or(Error::RequiresContiguous { op: OP })?;
 
+    // `rows == 0` here (`n == 0` with `hidden != 0`, since the `hidden ==
+    // 0` case already returned above): `dgamma` is a sum over rows, so
+    // zero rows still sum to a `[hidden]`-shaped, all-zero output — NOT
+    // `alloc_empty`'s `[0]`-shaped buffer, which would silently produce a
+    // wrong-shaped `dgamma` on CUDA relative to `cpu_fwd`'s own `rows ==
+    // 0` path (`ln_bwd_dgamma_f32`'s `vec![0f32; hidden]`, `Shape::from(
+    // hidden)`). See `super::alloc_zeros`'s doc for why this needs its own
+    // helper rather than reusing `alloc_empty`.
     if n == 0 {
         if s1.dtype() != s2.dtype() {
             return Err(Error::DTypeMismatchBinaryOp {
@@ -327,8 +332,8 @@ pub(crate) fn cuda_bwd_dgamma(
             });
         }
         return Ok((
-            super::alloc_empty(&device, s1.dtype(), OP)?,
-            Shape::from(0usize),
+            super::alloc_zeros(&device, s1.dtype(), hidden, OP)?,
+            Shape::from(hidden),
         ));
     }
     check_cuda_domain(OP, n, hidden)?;

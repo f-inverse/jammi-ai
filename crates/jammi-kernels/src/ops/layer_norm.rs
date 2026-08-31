@@ -963,6 +963,35 @@ mod tests {
         }
     }
 
+    /// `rows == 0, hidden != 0` (an empty batch over a non-empty hidden
+    /// dim) is a DIFFERENT domain point than `hidden == 0`: `cpu_fwd`'s
+    /// `hidden == 0` early-return is not taken here (`hidden` is `4`), so
+    /// this fixture instead falls through to `ln_bwd_dgamma_f32` with
+    /// `rows = 0` — `vec![0f32; hidden]`, all-zero and `[hidden]`-shaped,
+    /// NOT the `[0]`-shaped output the `hidden == 0` branch returns.
+    /// Pinning this shape+content here is what
+    /// `crate::cuda::layer_norm::cuda_bwd_dgamma`'s `n == 0` fast path
+    /// (the CUDA glue's OWN parallel branch) is checked against — see
+    /// this crate's `tests/empty_non_contiguous_admission_class_oracle.rs`
+    /// for the CUDA-gated twin over a real device.
+    #[test]
+    fn bwd_dgamma_zero_rows_hidden_nonzero_is_hidden_shaped_all_zero_not_zero_length() {
+        let device = Device::Cpu;
+        let x = Tensor::from_slice(&[] as &[f32], (0, 4), &device).unwrap();
+        let dy = Tensor::from_slice(&[] as &[f32], (0, 4), &device).unwrap();
+        let out = ln_bwd_dgamma(1e-5, &x, &dy).unwrap();
+        assert_eq!(
+            out.dims(),
+            &[4],
+            "rows == 0, hidden != 0 must still be [hidden]-shaped, not [0]-shaped"
+        );
+        let dgamma: Vec<f32> = out.to_vec1().unwrap();
+        assert!(
+            dgamma.iter().all(|&d| d == 0.0),
+            "summing zero rows must give exactly zero at every position, got {dgamma:?}"
+        );
+    }
+
     // -----------------------------------------------------------------
     // The four `+`->`-` eps-sign-flip survivors in the row kernels
     // (`ln_fwd_row_bf16`, `ln_bwd_dx_row_f32`, `ln_bwd_dgamma_f32`,

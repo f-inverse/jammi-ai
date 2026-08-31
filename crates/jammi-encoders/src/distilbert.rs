@@ -604,6 +604,13 @@ impl LoraSlot<'_, '_> {
     /// is the short suffix fed to [`should_apply_lora`]; `module_path` is the
     /// parent-relative path used to address the LoRA A/B tensors inside
     /// `lora_layer_vb`.
+    ///
+    /// A `weight_source` HIT is geometry-checked
+    /// ([`validate_frozen_base_geometry`]) against the `config.json`-derived
+    /// `(in_features, out_features)` this call site expects — a GGUF whose
+    /// per-site geometry disagrees with `config.json` fails HERE, at load,
+    /// rather than surfacing as a confidently-wrong-shaped matmul at first
+    /// inference.
     fn build_in(
         &self,
         parent_vb: &VarBuilder,
@@ -624,8 +631,12 @@ impl LoraSlot<'_, '_> {
         // Wave-3 seam (module doc): consult `weight_source` first, falling
         // back to the ORIGINAL Dense `linear(..)` load when unset or missed.
         let base = if let Some(lookup) = self.weight_source {
-            match lookup(&child_vb.prefix())? {
-                Some(base) => base,
+            let site = child_vb.prefix();
+            match lookup(&site)? {
+                Some(base) => {
+                    validate_frozen_base_geometry(&site, &base, in_features, out_features)?;
+                    base
+                }
                 None => FrozenBase::Dense(candle_nn::linear(in_features, out_features, child_vb)?),
             }
         } else {
@@ -655,4 +666,40 @@ impl LoraSlot<'_, '_> {
             Ok(MaybeLoraLinear::Frozen(base))
         }
     }
+}
+
+/// Validates a `weight_source` HIT's shape against the `(in_features,
+/// out_features)` `config.json` says this call site should have — an
+/// out-of-tree GGUF weight map keyed by name only, with no shape cross-check
+/// against `config.json` at the point it is consulted (module doc's
+/// `FrozenWeightLookup` contract). Without this check, a GGUF whose per-site
+/// geometry disagrees (e.g. a checkpoint built for a different `dim`) is
+/// accepted at construction and only fails once a mismatched matmul runs at
+/// first inference — a confident-wrong-shape load (family D), not a
+/// load-time refusal.
+///
+/// `site` is the tensor's fully-qualified dotted path (as returned by
+/// `VarBuilder::prefix()`), used verbatim in the error message so a caller
+/// can locate the offending GGUF entry without re-deriving the layer/module
+/// context.
+///
+/// The Dense fallback path (`candle_nn::linear` loading straight from the
+/// frozen safetensors `VarBuilder`) is NOT routed through this check —
+/// `candle_nn::linear` already fails loudly on a shape mismatch against its
+/// own `in_features`/`out_features` arguments, so re-validating it here
+/// would be redundant.
+fn validate_frozen_base_geometry(
+    site: &str,
+    base: &FrozenBase,
+    expected_in_features: usize,
+    expected_out_features: usize,
+) -> Result<(), EncoderError> {
+    let actual_in_features = base.in_features()?;
+    let actual_out_features = base.out_features()?;
+    if actual_in_features != expected_in_features || actual_out_features != expected_out_features {
+        return Err(EncoderError::Config(format!(
+            "weight_source geometry mismatch at {site}: expected (in_features={expected_in_features}, out_features={expected_out_features}), got (in_features={actual_in_features}, out_features={actual_out_features})"
+        )));
+    }
+    Ok(())
 }

@@ -6,11 +6,13 @@
 //! candle-transformers is covered by the BERT parity test.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarMap;
-use jammi_encoders::{DistilBert, Pooling};
-use jammi_lora::LoraBuildConfig;
+use jammi_encoders::{DistilBert, EncoderError, Pooling};
+use jammi_lora::{FrozenBase, LoraBuildConfig, QuantizedLinear};
 use tempfile::tempdir;
 
 /// Hand-rolled synthetic config matching the spec's exit criteria for test 6.
@@ -124,4 +126,68 @@ fn distilbert_loads_and_forwards() {
         "frozen LoRA config must yield zero trainable params, got {}",
         encoder.trainable_params().len()
     );
+}
+
+/// A `weight_source` HIT whose quantized base geometry disagrees with
+/// `config.json` (a GGUF sized for the wrong `dim`) must fail LOUDLY at
+/// `build()` — not be accepted and only surface as a mismatched-shape
+/// matmul at first `forward`. Every site queried returns the SAME
+/// wrong-shaped quantized base unconditionally, so the very first
+/// `LoraSlot::build_in` call (layer 0's `q_lin`) is guaranteed to hit the
+/// mismatch.
+#[test]
+fn distilbert_rejects_a_weight_source_hit_with_mismatched_geometry() {
+    let device = Device::Cpu;
+    let config = tiny_config();
+    let (_dir, weights_path) = write_synthetic_weights(&config, &device);
+    let varmap = VarMap::new();
+
+    // tiny_config's `dim` (hidden_size) is 32; every attention linear at
+    // this fixture is square (h -> h) — a base sized in_features=64
+    // (double the true hidden_size, and a multiple of GgmlDType::Q8_0's
+    // 32-element block size) disagrees with EVERY call site's expected
+    // shape.
+    let wrong_in_features = config.hidden_size * 2;
+    let wrong_out_features = config.hidden_size;
+    let w_v: Vec<f32> = (0..wrong_out_features * wrong_in_features)
+        .map(|i| ((i as f64) * 0.037 + 0.3).sin() as f32)
+        .collect();
+    let w = Tensor::from_vec(w_v, (wrong_out_features, wrong_in_features), &device).unwrap();
+    let wrong_weight = Arc::new(QTensor::quantize(&w, GgmlDType::Q8_0).unwrap());
+
+    let lookup = move |_name: &str| -> Result<Option<FrozenBase>, EncoderError> {
+        Ok(Some(FrozenBase::Quantized(
+            QuantizedLinear::new(wrong_weight.clone(), None).unwrap(),
+        )))
+    };
+
+    // `DistilBert` does not implement `Debug`, so `Result::expect_err`
+    // (which requires `T: Debug` to format the panic message on an
+    // unexpected `Ok`) is not usable here — match explicitly instead.
+    let result = DistilBert::builder()
+        .pooling(Pooling::Mean)
+        .lora(LoraBuildConfig::frozen())
+        .backbone_dtype(DType::F32)
+        .adapter(None)
+        .weight_source(&lookup)
+        .build(&[weights_path.as_path()], &config, &device, &varmap);
+    let err = match result {
+        Ok(_) => panic!("wrong-shaped weight_source hit must fail at build(), not at forward()"),
+        Err(e) => e,
+    };
+
+    match err {
+        EncoderError::Config(msg) => {
+            assert!(
+                msg.contains("geometry mismatch"),
+                "expected a geometry-mismatch message, got: {msg}"
+            );
+            assert!(
+                msg.contains(&wrong_in_features.to_string())
+                    && msg.contains(&config.hidden_size.to_string()),
+                "expected the message to name expected/actual shapes, got: {msg}"
+            );
+        }
+        other => panic!("expected EncoderError::Config, got {other:?}"),
+    }
 }

@@ -29,11 +29,16 @@
 //! `src/quantized/mod.rs:299-339` — verified against that table directly,
 //! not re-derived: `q4_0=2, q4_1=3, q5_0=6, q5_1=7, q8_0=8, q2k=10, q3k=11,
 //! q4k=12, q5k=13, q6k=14`; candle's own enum DECLARATION order interleaves
-//! `Q8_1`/`Q8K` — dtypes this crate does not name at all, since no k-quant
-//! consumer in this workspace loads them yet — between the ones this crate
-//! covers, so wire ID and this crate's variant-declaration order coincide
-//! only because the variants below are listed in ascending wire-ID order on
-//! purpose, not by construction). [`Ord`]/[`PartialOrd`] are a MANUAL impl
+//! `Q8_1`/`Q8K` between the ones this crate covers. This crate does not
+//! name either: they are GGML's ACTIVATION-side/intermediate quantized
+//! formats (`Q8_1`: an `im2col`/quantized-matmul scratch dtype; `Q8K`: the
+//! k-quant dot-product accumulator format), never a WEIGHT storage format
+//! GGUF itself writes to a checkpoint's tensor table — the durable,
+//! mechanism-side reason they are absent, not merely that no consumer has
+//! loaded one yet. Wire ID and this crate's variant-declaration order
+//! coincide only because the variants below are listed in ascending
+//! wire-ID order on purpose, not by construction). [`Ord`]/[`PartialOrd`]
+//! are a MANUAL impl
 //! keyed on `gguf_wire_id()` rather than a bare `#[derive(PartialOrd, Ord)]`
 //! over declaration order: a derive would happen to agree today (the
 //! variants below ARE declared in ascending wire-ID order) but would

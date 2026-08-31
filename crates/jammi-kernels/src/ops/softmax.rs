@@ -533,15 +533,23 @@
 //! share and this op does not touch. `closes_escape` is NOT claimed here for
 //! the FULL escape: esc-037's `softmax_last_dim` half remains open (neither
 //! this op nor any op in this crate reaches those `jammi-encoders` call
-//! sites). The `QMatMul` half is now STRUCTURALLY closed for every
-//! GGUF-quantized-weight matmul this workspace performs:
-//! `crate::ops::quant_matmul_grad::QuantMatMulGrad` (`ops::quant_matmul_grad`)
-//! wraps the SAME `QTensor` (delegating to its own `cpu_fwd`/`cuda_fwd`/
-//! `metal_fwd` directly, module doc there) but supplies a REAL `bwd` and
-//! runs through `super::apply_stateful1` — never `QMatMul::forward`, never
-//! `apply_op1_no_bwd` — so a quantized weight this workspace loads is
-//! reached EXCLUSIVELY through that always-differentiable op, not through
-//! candle's own `QMatMul` wrapper. (This op's OWN existence is also not a
+//! sites). The `QMatMul` half: `crate::ops::quant_matmul_grad::QuantMatMulGrad`
+//! (`ops::quant_matmul_grad`) wraps the SAME `QTensor` (delegating to its own
+//! `cpu_fwd`/`cuda_fwd`/`metal_fwd` directly, module doc there) but supplies
+//! a REAL `bwd` and runs through `super::apply_stateful1` — never
+//! `QMatMul::forward`, never `apply_op1_no_bwd` — so every GGUF-quantized
+//! weight this workspace's own production code loads is reached EXCLUSIVELY
+//! through that always-differentiable op today, not through candle's own
+//! `QMatMul` wrapper (grep-verified: no live call site anywhere in this
+//! workspace uses `QMatMul::forward` or `apply_op1_no_bwd` on a quantized
+//! weight). That property is MECHANICALLY enforced only within this crate
+//! (`jammi-kernels/src`'s own `apply_op1_no_bwd(`-etc. forbidden-needle scan,
+//! `tests/stateful_op_discipline.rs`, walks `jammi-kernels/src` ONLY); the
+//! same forbidden-needle scan does not walk `jammi-lora`, `jammi-encoders`,
+//! or `jammi-ai`, so nothing STRUCTURALLY stops a future call site in one of
+//! THOSE crates from reintroducing `QMatMul::forward`/`apply_op1_no_bwd` on
+//! a quantized weight — that half of the class stays review-enforced, not
+//! mechanically closed. (This op's OWN existence is also not a
 //! new instance of esc-037's hazard class: it never uses
 //! `apply_op2_no_bwd`, so nothing upstream of it silently loses its
 //! gradient the way esc-037 describes.)

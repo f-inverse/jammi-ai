@@ -124,9 +124,11 @@
 //! own `self.shape.dims2()?` (an `Err`, not a silent reinterpretation, on
 //! any other rank), so this op does not duplicate that check. `x` (`arg` at
 //! the public helper): made contiguous by [`quant_matmul_grad`] before
-//! dispatch (`QTensor::cpu_fwd` itself refuses a non-contiguous layout with
-//! a typed `RequiresContiguous` error — module doc's forward-delegation
-//! section); rank `>= 2` (`QTensor::cpu_fwd`'s own check: "input tensor has
+//! dispatch (`QTensor::cpu_fwd` itself refuses a non-contiguous layout —
+//! candle 0.11 does `crate::bail!("input tensor is not contiguous
+//! {layout:?}")` (`quantized/mod.rs:909-911`), an untyped `Error::Msg`, not
+//! a typed variant — module doc's forward-delegation section); rank `>= 2`
+//! (`QTensor::cpu_fwd`'s own check: "input tensor has
 //! only one dimension" is refused). `dy` (`grad_res`, `bwd`'s own input):
 //! rank 2 or 3 in every production call shape this op targets (a rank-2 `x`
 //! produces a rank-2 `y`/`dy`; a rank-3 `x`, rank-3) — `bwd`'s own reshape

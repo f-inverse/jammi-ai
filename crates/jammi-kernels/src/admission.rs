@@ -1285,6 +1285,19 @@ mod tests {
         assert!(!ComputeCapability::new(0, 0).meets_minimum());
     }
 
+    /// Panics if `JAMMI_REQUIRE_FLASH` is set, since a caller in that lane
+    /// must not be allowed to silently skip the flash-arm assertions.
+    #[cfg(test)]
+    fn require_flash_compiled_or_skip(test_name: &str) {
+        if std::env::var_os("JAMMI_REQUIRE_FLASH").is_some() {
+            panic!(
+                "{test_name}: JAMMI_REQUIRE_FLASH is set but this build's jammi-kernels was \
+                 compiled without the flash-attn feature (FLASH_COMPILED=false) -- this lane \
+                 must run the real flash arm, not skip it"
+            );
+        }
+    }
+
     /// The `flash_built_arches()` ACCESSOR's own behavior under this crate's
     /// default (no `flash-attn`) test build: `arches.is_empty()` here proves
     /// only that the `FLASH_COMPILED` gate degrades correctly (M3 plan v2
@@ -1304,28 +1317,16 @@ mod tests {
     /// [`gencode_smss_env_var_matches_the_pinned_build_rs_set`] below — see
     /// that test's own doc for why `env!()` makes it possible.
     ///
-    /// Panics rather than silently letting
-    /// [`flash_built_arches_degrades_to_empty_without_flash_compiled`] skip
-    /// its exact-pinned-arch-set assertions when `JAMMI_REQUIRE_FLASH` is
-    /// set but this build was not compiled with the `flash-attn` feature
-    /// (`FLASH_COMPILED == false`) — mirrors
-    /// `jammi_encoders::modernbert`'s own `flash_compiled_or_skip` gate
-    /// (same env var, same "this lane must run the real flash arm, not
-    /// skip it" rationale), narrowed here to the feature-compilation check
-    /// alone: this test has no device to probe, `flash_built_arches()` is
-    /// a pure compile-time accessor, so there is no arch-membership half
-    /// to check.
-    #[cfg(test)]
-    fn require_flash_compiled_or_skip(test_name: &str) {
-        if std::env::var_os("JAMMI_REQUIRE_FLASH").is_some() {
-            panic!(
-                "{test_name}: JAMMI_REQUIRE_FLASH is set but this build's jammi-kernels was \
-                 compiled without the flash-attn feature (FLASH_COMPILED=false) -- this lane \
-                 must run the real flash arm, not skip it"
-            );
-        }
-    }
-
+    /// Panics rather than silently letting this test skip its
+    /// exact-pinned-arch-set assertions when `JAMMI_REQUIRE_FLASH` is set
+    /// but this build was not compiled with the `flash-attn` feature
+    /// (`FLASH_COMPILED == false`) — mirrors `jammi_encoders::modernbert`'s
+    /// own `flash_compiled_or_skip` gate (same env var, same "this lane
+    /// must run the real flash arm, not skip it" rationale), narrowed here
+    /// to the feature-compilation check alone via
+    /// [`require_flash_compiled_or_skip`]: this test has no device to
+    /// probe, `flash_built_arches()` is a pure compile-time accessor, so
+    /// there is no arch-membership half to check.
     #[test]
     fn flash_built_arches_degrades_to_empty_without_flash_compiled() {
         let arches = flash_built_arches();

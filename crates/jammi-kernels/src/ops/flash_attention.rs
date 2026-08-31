@@ -872,18 +872,15 @@ pub fn flash_attention_varlen_with_rope_ragged_test_only_bwd_window_override(
 /// acquisition on a machine that IS supposed to have a GPU would silently
 /// read as a skipped test rather than a failed one).
 ///
-/// NOT currently registerable in `ci/kernel-oracle-helpers.txt`:
-/// `check_kernel_oracles.py`'s KO-7 scan covers `crates/jammi-kernels/
-/// tests/**` and `crates/jammi-encoders/src/**` only (verified: the
-/// existing `crates/jammi-kernels/src/ops/flash_attention.rs::cuda_device`
-/// registry attempt at this exact file/fn shape fails closed with "file
-/// not found among scanned files" — `crates/jammi-kernels/src/**` is
-/// simply not in scope yet). This helper still exists and is used by both
-/// `#[test]` fns below, matching the SAME `JAMMI_REQUIRE_CUDA` lattice
-/// every OTHER CUDA-gated skip in this crate uses, so that issue #437's
-/// widened scan (once `crates/jammi-kernels/src/**` is added to KO-7's
-/// scanned set) finds these two skips ALREADY gated, needing only a
-/// registry-line addition rather than a code change.
+/// Registered in `ci/kernel-oracle-helpers.txt` as
+/// `crates/jammi-kernels/src/ops/flash_attention.rs::cuda_device_or_skip`
+/// (issue #437's KO-7 scan-root widening brought `crates/jammi-kernels/
+/// src/**` into scope alongside `crates/jammi-kernels/tests/**` and
+/// `crates/jammi-encoders/src/**`; this helper already had the canonical
+/// shape before that widening landed, so it needed only the registry-line
+/// addition, not a code change). Used by both `#[test]` fns below, matching
+/// the SAME `JAMMI_REQUIRE_CUDA` lattice every OTHER CUDA-gated skip in
+/// this crate uses.
 #[cfg(test)]
 fn cuda_device_or_skip() -> Option<candle_core::Device> {
     match candle_core::Device::new_cuda(0) {

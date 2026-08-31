@@ -1303,6 +1303,29 @@ mod tests {
     /// feature configuration including this crate's default build, is
     /// [`gencode_smss_env_var_matches_the_pinned_build_rs_set`] below — see
     /// that test's own doc for why `env!()` makes it possible.
+    ///
+    /// Panics rather than silently letting
+    /// [`flash_built_arches_degrades_to_empty_without_flash_compiled`] skip
+    /// its exact-pinned-arch-set assertions when `JAMMI_REQUIRE_FLASH` is
+    /// set but this build was not compiled with the `flash-attn` feature
+    /// (`FLASH_COMPILED == false`) — mirrors
+    /// `jammi_encoders::modernbert`'s own `flash_compiled_or_skip` gate
+    /// (same env var, same "this lane must run the real flash arm, not
+    /// skip it" rationale), narrowed here to the feature-compilation check
+    /// alone: this test has no device to probe, `flash_built_arches()` is
+    /// a pure compile-time accessor, so there is no arch-membership half
+    /// to check.
+    #[cfg(test)]
+    fn require_flash_compiled_or_skip(test_name: &str) {
+        if std::env::var_os("JAMMI_REQUIRE_FLASH").is_some() {
+            panic!(
+                "{test_name}: JAMMI_REQUIRE_FLASH is set but this build's jammi-kernels was \
+                 compiled without the flash-attn feature (FLASH_COMPILED=false) -- this lane \
+                 must run the real flash arm, not skip it"
+            );
+        }
+    }
+
     #[test]
     fn flash_built_arches_degrades_to_empty_without_flash_compiled() {
         let arches = flash_built_arches();
@@ -1310,6 +1333,9 @@ mod tests {
             assert!(
                 arches.is_empty(),
                 "flash-attn not compiled: flash_built_arches() must be empty, not {arches:?}"
+            );
+            require_flash_compiled_or_skip(
+                "flash_built_arches_degrades_to_empty_without_flash_compiled",
             );
             return;
         }
@@ -1627,6 +1653,57 @@ mod tests {
         assert!(!FLASH_COMPILED || CUDA_COMPILED);
     }
 
+    /// Acquire a Metal device for [`device_is_supported_rejects_metal`]'s
+    /// own `metal`-feature-only leg, or `None` to skip — unless
+    /// `JAMMI_REQUIRE_METAL` is set, in which case a device-acquisition
+    /// failure PANICS. Wraps `Device::new_metal(0)` in
+    /// `std::panic::catch_unwind`, mirroring `tests/metal_parity.rs`'s own
+    /// `metal_device_or_skip`: on at least one real GH `macos-14` runner
+    /// `Device::new_metal(0)` does not merely return `Err` on a
+    /// missing/broken device — an `objc2` class lookup inside
+    /// candle-metal-kernels' `residency_set.rs:18`
+    /// (`MTLResidencySetDescriptor`) can PANIC instead, a probe-time
+    /// failure mode a bare `Result` cannot model. Catching that panic here
+    /// is sound for the same reason `tests/metal_parity.rs`'s own doc
+    /// gives: the probe owns no lock and mutates no shared state before
+    /// failing, so unwinding out of it leaves nothing poisoned to clean
+    /// up. Both failure shapes (a returned `Err`, or a caught panic) fold
+    /// into the same skip/require decision below.
+    #[cfg(all(test, feature = "metal"))]
+    fn metal_device_or_skip(test_name: &str) -> Option<Device> {
+        let outcome: std::result::Result<Device, String> =
+            match std::panic::catch_unwind(|| Device::new_metal(0)) {
+                Ok(Ok(d)) => Ok(d),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(payload) => {
+                    let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "<non-string panic payload>".to_string()
+                    };
+                    Err(format!("Device::new_metal(0) panicked: {msg}"))
+                }
+            };
+        match outcome {
+            Ok(d) => Some(d),
+            Err(msg) => {
+                if std::env::var_os("JAMMI_REQUIRE_METAL").is_some() {
+                    panic!(
+                        "{test_name}: JAMMI_REQUIRE_METAL is set but no Metal device is \
+                         available: {msg}"
+                    );
+                }
+                eprintln!(
+                    "{test_name}: no Metal device available in this build/host -- skipping the \
+                     Metal leg"
+                );
+                None
+            }
+        }
+    }
+
     #[test]
     fn device_is_supported_rejects_metal() {
         // `device_is_supported` must reject `Device::Metal` STRUCTURALLY —
@@ -1642,30 +1719,8 @@ mod tests {
         // is the one place that legitimately needs a `cfg` branch. Mirrors
         // `jammi_encoders::layer_norm::tests::device_is_supported_rejects_metal`.
         #[cfg(feature = "metal")]
-        let metal = match Device::new_metal(0) {
-            Ok(d) => d,
-            // No physical Metal device on this build host — the predicate
-            // itself is still exercised below via `Device::Cpu`; the
-            // `metal`-specific half of this assertion is covered instead
-            // by `ops::dropout`'s own Metal-gated tests, which already
-            // skip identically when no device is present. Honest but LOUD:
-            // `JAMMI_REQUIRE_METAL` upgrades this from a silent skip to a
-            // hard failure, the same require/skip lattice shape
-            // `tests/metal_parity.rs`'s `metal_device_or_skip` (wave A)
-            // uses. This fn's own runtime skip sits in `src/`, outside
-            // `check_kernel_oracles.py`'s KO-7 scan roots (which cover only
-            // `tests/**` in this crate and `jammi-encoders/src/**` — issue
-            // #437 tracks widening KO-7 to `jammi-kernels/src/**` too), so
-            // this gate is voluntary-but-real rather than CI-enforced.
-            Err(e) => {
-                if std::env::var_os("JAMMI_REQUIRE_METAL").is_some() {
-                    panic!(
-                        "device_is_supported_rejects_metal: JAMMI_REQUIRE_METAL is set but no \
-                         Metal device is available: {e}"
-                    );
-                }
-                return;
-            }
+        let Some(metal) = metal_device_or_skip("device_is_supported_rejects_metal") else {
+            return;
         };
         #[cfg(not(feature = "metal"))]
         let metal = Device::Metal(candle_core::MetalDevice);

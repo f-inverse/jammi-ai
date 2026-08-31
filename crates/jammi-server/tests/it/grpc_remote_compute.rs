@@ -561,6 +561,22 @@ async fn remote_fine_tune_metrics_round_trips_like_local() {
     let remote_metrics: serde_json::Value =
         serde_json::from_str(&remote_metrics_json).expect("remote metrics_json is valid JSON");
 
+    // The control-plane read (`CatalogClient::training_status`, composed on
+    // `DataClient`) must not silently lag the data-plane read of the SAME
+    // wire field (family M lockstep): both decode the identical
+    // `TrainingStatusResponse.metrics_json`.
+    let admin_status = remote
+        .catalog()
+        .training_status(&remote_job.0)
+        .await
+        .expect("catalog training_status");
+    assert_eq!(
+        admin_status.metrics_json.as_deref(),
+        Some(remote_metrics_json.as_str()),
+        "CatalogClient::training_status's metrics_json must match \
+         DataClient::fine_tune_metrics's — both decode the same wire field"
+    );
+
     let strip_timestamps = |mut v: serde_json::Value| -> serde_json::Value {
         if let Some(obj) = v.as_object_mut() {
             obj.remove("started_at");

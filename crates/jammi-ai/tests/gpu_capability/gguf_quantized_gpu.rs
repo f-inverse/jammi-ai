@@ -735,6 +735,29 @@ fn device_memory_used_bytes() -> Option<u64> {
         .map(|mib| mib * 1024 * 1024)
 }
 
+/// [`device_memory_used_bytes`], or a hard failure when `JAMMI_REQUIRE_CUDA`
+/// is set and the reading is unavailable. `skip_without_gpu!` already
+/// requires a real CUDA device on this path; on the pod session that is
+/// SUPPOSED to have one (`JAMMI_REQUIRE_CUDA=1`), `nvidia-smi` being
+/// unusable is also a hard failure, never a silent skip — the same
+/// require-gate idiom `crates/jammi-ai/src/fine_tune/optimizer.rs::
+/// cuda_device` and `crates/jammi-bench/src/finetune_step.rs::
+/// vram_probe_present`'s callers carry for device-measurement channels.
+fn device_memory_used_bytes_or_require(test: &str) -> Option<u64> {
+    match device_memory_used_bytes() {
+        Some(v) => Some(v),
+        None => {
+            if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
+                panic!(
+                    "{test}: JAMMI_REQUIRE_CUDA is set but nvidia-smi is unavailable — cannot \
+                     measure device memory; a silent skip is not acceptable here"
+                );
+            }
+            None
+        }
+    }
+}
+
 /// One CUDA caching-allocator pool block, per
 /// `crates/jammi-bench/src/finetune_step.rs`'s own documented convention
 /// (also recorded in `crates/jammi-kernels/artifacts/cuda-runs/
@@ -806,7 +829,9 @@ async fn gguf_gpu_load_admission_estimate_is_truthful_against_measured_device_me
     let cuda = Device::new_cuda(0).unwrap();
     settle_cuda_device(&cuda);
 
-    let Some(before) = device_memory_used_bytes() else {
+    let Some(before) = device_memory_used_bytes_or_require(
+        "gguf_gpu_load_admission_estimate_is_truthful_against_measured_device_memory",
+    ) else {
         tracing::warn!("SKIP: nvidia-smi unavailable — cannot measure device memory delta");
         return;
     };
@@ -841,7 +866,9 @@ async fn gguf_gpu_load_admission_estimate_is_truthful_against_measured_device_me
     // snapshot despite its own comment claiming to "keep the model resident
     // through the synchronize/measure window". `drop(loaded)` now runs
     // AFTER `after` is captured.
-    let Some(after) = device_memory_used_bytes() else {
+    let Some(after) = device_memory_used_bytes_or_require(
+        "gguf_gpu_load_admission_estimate_is_truthful_against_measured_device_memory",
+    ) else {
         tracing::warn!(
             "SKIP: nvidia-smi unavailable after load — cannot measure device memory delta"
         );
@@ -886,6 +913,16 @@ async fn gguf_gpu_load_admission_estimate_is_truthful_against_measured_device_me
     // That is a measurement-granularity artifact, not evidence
     // `estimated_memory` is untruthful — assert nothing about it and skip.
     if raw_delta == 0 {
+        // Re-verify the measurement channel is still healthy before treating
+        // a zero delta as an honest granularity artifact rather than a
+        // silently degraded `nvidia-smi` read: routes through the SAME
+        // require-gated helper the before/after snapshots use, so
+        // `JAMMI_REQUIRE_CUDA` still turns a genuinely broken channel into a
+        // hard failure here too, never a laundered skip.
+        let _ = device_memory_used_bytes_or_require(
+            "gguf_gpu_load_admission_estimate_is_truthful_against_measured_device_memory: \
+             zero-delta re-check",
+        );
         tracing::warn!(
             "SKIP: measured device-memory delta was 0 (before={before} after={after}) — \
              nvidia-smi's whole-device reading is quantized to \

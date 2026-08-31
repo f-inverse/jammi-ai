@@ -778,6 +778,20 @@ impl TrainingLoop {
         };
         let mut best_val_loss = f64::MAX;
         let mut patience_counter = 0;
+        // `(epoch, avg_train_loss)` / `(epoch, avg_val_loss)` rows, one push per
+        // epoch actually run — folded into `metrics_json` below as
+        // `train_loss_curve` / `val_loss_curve` (issue #441). Mirrors exactly
+        // what `tracing::info!("Epoch complete", ...)` below emits for the
+        // GPU-capability suite's own `loss_capture` tracing layer to read back
+        // (`crates/jammi-ai/tests/gpu_capability/harness.rs::loss_capture`), so
+        // the persisted curve and that test harness's captured curve are the
+        // SAME numbers, never two independently-computed ones that could drift.
+        // `val_loss_curve` only ever grows when this run's `early_stopping_
+        // metric` is `ValLoss` (see `avg_val_loss`'s own `None`-sentinel doc
+        // below) — an early-stopped run's curves are correctly SHORTER than
+        // `self.config.epochs`, since `break` below stops pushing further rows.
+        let mut train_loss_curve: Vec<(usize, f64)> = Vec::new();
+        let mut val_loss_curve: Vec<(usize, f64)> = Vec::new();
         // Train into a fresh worker-private tempdir, never a shared path: two
         // workers on the same `job_id` must not share a training-time file.
         // Checkpoints and the final adapter land here; the worker publishes the
@@ -1030,6 +1044,15 @@ impl TrainingLoop {
                 }
             };
 
+            // Accumulate this epoch's row into the run-level curves BEFORE the
+            // `tracing::info!` below, so both read the exact same `avg_train_loss`
+            // / `avg_val_loss` values `loss_capture`'s tracing layer captures
+            // from that event.
+            train_loss_curve.push((epoch, avg_train_loss));
+            if let Some(v) = avg_val_loss {
+                val_loss_curve.push((epoch, v));
+            }
+
             // Decide which loss to monitor for early stopping.
             let (monitor_loss, monitor_label) = match self.config.early_stopping_metric {
                 EarlyStoppingMetric::TrainLoss => (avg_train_loss, "train"),
@@ -1138,14 +1161,34 @@ impl TrainingLoop {
             EarlyStoppingMetric::TrainLoss => "train_loss",
             EarlyStoppingMetric::ValLoss => "val_loss",
         };
-        let metrics_json = serde_json::json!({
+        // `{"epoch": .., "loss": ..}` rows, one per epoch actually run — see
+        // `train_loss_curve`/`val_loss_curve`'s own doc above for why these are
+        // the SAME numbers `loss_capture`'s tracing layer reads. `val_loss_
+        // curve` is folded in only when validation actually ran this attempt
+        // (`EarlyStoppingMetric::ValLoss`) — a `TrainLoss`-monitored run never
+        // measures a held-out loss, so an empty array there would be a
+        // fabricated "measured zero epochs" rather than the honest "not
+        // applicable to this run" the field's absence states instead.
+        let curve_json = |curve: &[(usize, f64)]| -> serde_json::Value {
+            serde_json::Value::Array(
+                curve
+                    .iter()
+                    .map(|(epoch, loss)| serde_json::json!({"epoch": epoch, "loss": loss}))
+                    .collect(),
+            )
+        };
+        let mut metrics = serde_json::json!({
             "final_loss": best_val_loss,
             "early_stopping_metric": early_stopping_metric_label,
             "total_steps": global_step,
             "started_at": started_at,
             "completed_at": completed_at,
-        })
-        .to_string();
+            "train_loss_curve": curve_json(&train_loss_curve),
+        });
+        if !val_loss_curve.is_empty() {
+            metrics["val_loss_curve"] = curve_json(&val_loss_curve);
+        }
+        let metrics_json = metrics.to_string();
 
         Ok(TrainingResult {
             artifact_dir: artifact_tmp,
@@ -6262,6 +6305,250 @@ mod last_step_horizon_run_oracles {
             thread_sync_read_count() - before,
             1,
             "the disarmed overshoot must not read the norm again"
+        );
+    }
+}
+
+/// Issue #441 (jammi-ai half): `TrainingResult::metrics_json`'s `train_loss_
+/// curve` / `val_loss_curve` arrays must be genuinely retained, not
+/// transcribed — measured live against the SAME "Epoch complete" tracing
+/// event `crates/jammi-ai/tests/gpu_capability/harness.rs::loss_capture`
+/// reads (family F: a headline number is measured-and-asserted, never
+/// transcribed). This module's own [`EpochLossLayer`] mirrors that
+/// production tracing layer's field names/event match byte-for-byte — the
+/// two independently-defined layers agreeing pins that the metrics-JSON
+/// curve and what the GPU-capability suite already reads back off `tracing`
+/// are provably the SAME numbers, not two sources that merely happen to
+/// agree today.
+#[cfg(test)]
+mod loss_curve_metrics {
+    use std::cell::RefCell;
+    use std::sync::OnceLock;
+
+    use tracing::field::{Field, Visit};
+    use tracing::Event;
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+    use tracing_subscriber::Layer;
+
+    use super::super::{EarlyStoppingMetric, FineTuneConfig};
+    use super::last_step_run_harness::{pairs, run_text_loop, text_config};
+
+    // THREAD-LOCAL, not a shared `Mutex<Vec<_>>`: unlike the `gpu_capability`
+    // suite (mandated `--test-threads=1`), this crate's `cargo test` runs
+    // fully parallel by default, and every `run_text_loop` call below
+    // executes its whole epoch loop (including the "Epoch complete" event
+    // itself) synchronously on ITS OWN calling thread (`run()` is a plain
+    // sync fn; the one `Handle::block_on` call inside it still polls inline
+    // on the calling thread) — so a THREAD-LOCAL buffer is exactly the right
+    // granularity to isolate one test's captured curve from every other
+    // concurrently-running test that also drives the trainer through this
+    // same "Epoch complete" callsite.
+    thread_local! {
+        static TRAIN_CAPTURE: RefCell<Vec<(u64, f64)>> = const { RefCell::new(Vec::new()) };
+        static VAL_CAPTURE: RefCell<Vec<(u64, f64)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Captures `(epoch, avg_train_loss)` / `(epoch, avg_val_loss)` off every
+    /// "Epoch complete" event — the exact same event, field names, and
+    /// `Option<f64>`-skips-when-`None` semantics
+    /// `tests/gpu_capability/harness.rs::loss_capture::EpochLossLayer`
+    /// depends on, duplicated here (small-duplication-is-fine per this
+    /// crate's own convention) so a unit test in THIS binary can prove the
+    /// mechanism without depending on the separate `gpu_capability` test
+    /// binary's private module. Writes into the THREAD-LOCAL buffers above,
+    /// never a shared one.
+    struct EpochLossLayer;
+
+    #[derive(Default)]
+    struct EpochVisitor {
+        epoch: Option<u64>,
+        loss: Option<f64>,
+        val_loss: Option<f64>,
+        is_epoch_event: bool,
+    }
+
+    impl Visit for EpochVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" && format!("{value:?}").contains("Epoch complete") {
+                self.is_epoch_event = true;
+            }
+        }
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            if field.name() == "epoch" {
+                self.epoch = Some(value);
+            }
+        }
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            if field.name() == "epoch" {
+                self.epoch = Some(value as u64);
+            }
+        }
+        fn record_f64(&mut self, field: &Field, value: f64) {
+            if field.name() == "avg_train_loss" {
+                self.loss = Some(value);
+            } else if field.name() == "avg_val_loss" {
+                self.val_loss = Some(value);
+            }
+        }
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for EpochLossLayer {
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            let mut v = EpochVisitor::default();
+            event.record(&mut v);
+            if v.is_epoch_event {
+                if let (Some(e), Some(l)) = (v.epoch, v.loss) {
+                    TRAIN_CAPTURE.with(|c| c.borrow_mut().push((e, l)));
+                }
+                if let (Some(e), Some(l)) = (v.epoch, v.val_loss) {
+                    VAL_CAPTURE.with(|c| c.borrow_mut().push((e, l)));
+                }
+            }
+        }
+    }
+
+    /// Installs [`EpochLossLayer`] as the process's GLOBAL default tracing
+    /// subscriber, exactly once (`OnceLock`, mirroring `tests/gpu_
+    /// capability/harness.rs::loss_capture::install`'s own idiom). A
+    /// THREAD-LOCAL (`with_default`-scoped) subscriber is NOT enough here:
+    /// `tracing`'s per-callsite/level fast-path (`tracing::enabled!`, and
+    /// the static max-level hint every `info!`/`event!` macro consults
+    /// before even constructing the event) is governed by the GLOBAL
+    /// default dispatcher's `max_level_hint`, never by a thread-local
+    /// `with_default` override — the no-op dispatcher tracing falls back to
+    /// before any global default is ever installed reports an `OFF` hint,
+    /// so every event is compiled-out-equivalent at the macro call site
+    /// regardless of which subscriber a given thread has scoped in. Setting
+    /// the REAL global default once, up front, is what makes the "Epoch
+    /// complete" callsite live for every thread — the THREAD-LOCAL buffers
+    /// above are what keep concurrently-running tests from corrupting each
+    /// other's captured curve despite sharing one subscriber.
+    fn install() {
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            let subscriber = tracing_subscriber::registry().with(EpochLossLayer);
+            // `.ok()`: if some OTHER global default were already installed
+            // (not the case anywhere in this crate today — a genuine
+            // surprise, not a race, since `OnceLock` already serializes
+            // concurrent callers of THIS fn to one winner), failing softly
+            // here is still strictly better than panicking the whole test
+            // binary over a tracing-capture convenience harness.
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+    }
+
+    /// 20 pairs, `validation_fraction: 0.34` (`round(20 * 0.34) == 7` held-out
+    /// rows, 13 training rows — both non-empty), `early_stopping_metric:
+    /// ValLoss` so `avg_val_loss` is actually measured every epoch,
+    /// `early_stopping_patience: 10_000` (from `text_config`) so all 3
+    /// configured epochs run to completion — the curves' length is therefore
+    /// KNOWN, not merely "however many happened to run".
+    #[test]
+    fn metrics_json_loss_curves_match_the_epoch_complete_tracing_event() {
+        install();
+        TRAIN_CAPTURE.with(|c| c.borrow_mut().clear());
+        VAL_CAPTURE.with(|c| c.borrow_mut().clear());
+
+        let config = FineTuneConfig {
+            epochs: 3,
+            validation_fraction: 0.34,
+            early_stopping_metric: EarlyStoppingMetric::ValLoss,
+            ..text_config()
+        };
+        let result = run_text_loop("loss-curve-metrics", config, pairs(20), None, None).unwrap();
+
+        let metrics: serde_json::Value =
+            serde_json::from_str(&result.metrics_json).expect("metrics_json must be valid JSON");
+        let train_curve = metrics["train_loss_curve"]
+            .as_array()
+            .expect("train_loss_curve must be present and an array");
+        let val_curve = metrics["val_loss_curve"]
+            .as_array()
+            .expect("val_loss_curve must be present (this run measures ValLoss every epoch)");
+
+        let captured_train = TRAIN_CAPTURE.with(|c| c.borrow().clone());
+        let captured_val = VAL_CAPTURE.with(|c| c.borrow().clone());
+
+        assert_eq!(
+            train_curve.len(),
+            3,
+            "no early stopping fires (patience 10_000): all 3 configured epochs must have a \
+             train_loss_curve row, got {train_curve:?}"
+        );
+        assert_eq!(
+            val_curve.len(),
+            3,
+            "ValLoss is measured every epoch: val_loss_curve must have 3 rows too, got {val_curve:?}"
+        );
+        assert_eq!(
+            train_curve.len(),
+            captured_train.len(),
+            "metrics_json's train_loss_curve must be exactly as long as the tracing capture: \
+             {captured_train:?}"
+        );
+        assert_eq!(
+            val_curve.len(),
+            captured_val.len(),
+            "metrics_json's val_loss_curve must be exactly as long as the tracing capture: \
+             {captured_val:?}"
+        );
+
+        for (row, (epoch, loss)) in train_curve.iter().zip(captured_train.iter()) {
+            let json_epoch = row["epoch"].as_u64().expect("row.epoch is a u64");
+            let json_loss = row["loss"].as_f64().expect("row.loss is an f64");
+            assert!(
+                json_loss.is_finite(),
+                "train_loss_curve row must be finite: {row:?}"
+            );
+            assert_eq!(json_epoch, *epoch, "epoch must match the tracing capture");
+            assert_eq!(
+                json_loss, *loss,
+                "metrics_json's avg_train_loss must be the SAME f64 the tracing event carried \
+                 (bit-identical: both read off the same in-memory `avg_train_loss` local, never \
+                 re-derived)"
+            );
+        }
+        for (row, (epoch, loss)) in val_curve.iter().zip(captured_val.iter()) {
+            let json_epoch = row["epoch"].as_u64().expect("row.epoch is a u64");
+            let json_loss = row["loss"].as_f64().expect("row.loss is an f64");
+            assert!(
+                json_loss.is_finite(),
+                "val_loss_curve row must be finite: {row:?}"
+            );
+            assert_eq!(json_epoch, *epoch, "epoch must match the tracing capture");
+            assert_eq!(
+                json_loss, *loss,
+                "metrics_json's avg_val_loss must be the SAME f64 the tracing event carried"
+            );
+        }
+    }
+
+    /// The `TrainLoss`-monitored arm: `avg_val_loss` is never measured
+    /// (`text_config`'s default `early_stopping_metric`), so `val_loss_curve`
+    /// must be ABSENT from `metrics_json` entirely — never an empty array
+    /// (family F: a fabricated "measured zero epochs" is a different, false
+    /// claim from the honest "not applicable to this run").
+    #[test]
+    fn metrics_json_omits_val_loss_curve_when_only_train_loss_is_monitored() {
+        let config = FineTuneConfig {
+            epochs: 2,
+            ..text_config()
+        };
+        let result = run_text_loop("loss-curve-train-only", config, pairs(6), None, None).unwrap();
+        let metrics: serde_json::Value =
+            serde_json::from_str(&result.metrics_json).expect("metrics_json must be valid JSON");
+        let train_curve = metrics["train_loss_curve"]
+            .as_array()
+            .expect("train_loss_curve must still be present");
+        assert_eq!(
+            train_curve.len(),
+            2,
+            "both configured epochs must have a row"
+        );
+        assert!(
+            metrics.get("val_loss_curve").is_none(),
+            "a TrainLoss-monitored run must never measure avg_val_loss, so val_loss_curve must \
+             be absent, not an empty array: {metrics:?}"
         );
     }
 }

@@ -3437,55 +3437,33 @@ mod tests {
         assert_eq!(adapter_cfg.model_type, "modernbert");
     }
 
-    /// Dual-format precedence sweep (issue #351 wave 14, round-8 audit):
-    /// `build_encoder_adapters`'s own precedence check at
-    /// `is_gguf = !weights_path.exists()` had no dual-format test at
-    /// all — this mirrors `tests/it/gguf_qlora.rs`'s resolver-level pin
-    /// one layer down, at the fine-tune worker's independent precedence
-    /// decision.
-    ///
-    /// The base-model dir carries BOTH a valid `model.safetensors` and a
-    /// DELIBERATELY CORRUPTED `model.gguf`. `weights_path.exists()` is
-    /// true, so the presence-keyed precedence must take the safetensors
-    /// arm (`is_gguf == false`, dense `FrozenBase`) and never open
-    /// `model.gguf` at all. This is the mechanistic proof, not a
-    /// transcribed assertion (family F): a build that instead preferred
-    /// gguf, or fell back to it for any reason, would hand the corrupted
-    /// bytes to `load_gguf_backbone`, which cannot parse them, and the
-    /// whole build would return a load error instead of a `Bert`
-    /// encoder. A successful build IS the proof that `model.gguf` was
-    /// never read.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn build_encoder_adapters_prefers_safetensors_over_gguf_when_both_present() {
-        let device = candle_core::Device::Cpu;
-        let (tensors, config, _matmul_weights) = bert_gguf_fixture(&device);
-
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("dual_format_bert");
-        std::fs::create_dir_all(&dir).unwrap();
-
-        // Valid safetensors — the arm that must win.
-        candle_core::safetensors::save(&tensors, dir.join("model.safetensors")).unwrap();
-
-        // A CORRUPTED model.gguf sibling: if the gguf arm were ever taken
-        // (wrongly), load_gguf_backbone would fail to parse it and the
-        // whole build would error out instead of succeeding.
-        std::fs::write(dir.join("model.gguf"), b"not a real gguf file").unwrap();
-
-        std::fs::write(
-            dir.join("config.json"),
-            serde_json::to_string(&config).unwrap(),
-        )
-        .unwrap();
-
+    /// Drives `build_encoder_adapters` for a PRE-POPULATED base-model `dir`
+    /// (config.json + weights already written by the caller) through the
+    /// SAME `spawn_blocking` shape production code runs it under
+    /// (`build_encoder_adapters` itself calls
+    /// `tokio::runtime::Handle::current().block_on(..)` for its catalog
+    /// reads, which panics if invoked directly on a runtime worker
+    /// thread). `lora_dropout: 0.0` is pinned so the returned encoder's
+    /// forward is a pure function of its weights and inputs — a
+    /// `lora_dropout > 0` training-mode forward draws from the
+    /// dropout-mask RNG stream on every call and would make the
+    /// bit-exact forward comparison below flaky by construction; the
+    /// `lora_dropout > 0` arm itself is covered by
+    /// `tests/it/gguf_qlora.rs`'s
+    /// `quantized_base_training_forward_with_dropout_reserves_the_dropout_stream`.
+    async fn build_encoder_adapters_for_dir(
+        dir: &std::path::Path,
+        target_modules: Vec<String>,
+    ) -> Result<(jammi_encoders::AnyEncoder, jammi_lora::AdapterConfig)> {
         let catalog_dir = tempfile::tempdir().unwrap();
         let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
-        let base_model_id = register_gguf_base_model(&catalog, &dir).await;
+        let base_model_id = register_gguf_base_model(&catalog, dir).await;
         let artifact_store = gguf_test_artifact_store();
 
-        let (encoder, adapter_cfg) = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let training_config = FineTuneConfig {
-                target_modules: vec!["query".into(), "value".into()],
+                target_modules,
+                lora_dropout: 0.0,
                 ..FineTuneConfig::default()
             };
             let varmap = candle_nn::VarMap::new();
@@ -3501,13 +3479,188 @@ mod tests {
         })
         .await
         .unwrap()
-        .unwrap();
+    }
 
+    /// Deterministic additive-offset perturbation (family J: no unseeded
+    /// RNG) — every tensor is shifted by a fixed nonzero offset, keeping
+    /// its shape and dtype intact. A `model.gguf` written from this map
+    /// can NEVER forward-match a checkpoint built from the unperturbed
+    /// originals, so any equality between the two proves the gguf bytes
+    /// never reached the loaded weights.
+    fn perturb_tensors(tensors: &HashMap<String, Tensor>) -> HashMap<String, Tensor> {
+        tensors
+            .iter()
+            .map(|(name, t)| (name.clone(), t.affine(1.0, 10.0).unwrap()))
+            .collect()
+    }
+
+    /// One fixed `[1, 5]` token-id/mask forward through
+    /// `AnyEncoder::forward`, flattened to `Vec<f32>` — the shared
+    /// discriminator each phase of
+    /// [`build_encoder_adapters_prefers_safetensors_over_gguf_when_both_present`]
+    /// compares against the reference. Token ids stay within the fixture
+    /// vocabulary (`GGUF_FIXTURE_VOCAB`).
+    fn deterministic_bert_forward(
+        encoder: &jammi_encoders::AnyEncoder,
+        device: &candle_core::Device,
+    ) -> Vec<f32> {
+        let input_ids = Tensor::from_vec(vec![3u32, 7, 1, 9, 2], (1, 5), device).unwrap();
+        let mask = Tensor::from_vec(vec![1u32, 1, 1, 1, 1], (1, 5), device).unwrap();
+        encoder
+            .forward(&input_ids, &mask)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    }
+
+    /// The set of assertions both phases of
+    /// [`build_encoder_adapters_prefers_safetensors_over_gguf_when_both_present`]
+    /// re-check identically — factored out so the two call sites can
+    /// never silently drift apart: build must be `Ok`, the encoder must
+    /// be `AnyEncoder::Bert`, `adapter_cfg.model_type` must be `"bert"`,
+    /// the forward must be non-empty (an equality against empty proves
+    /// nothing), and the forward must be BIT-EXACT equal to
+    /// `reference_forward` — any deviation means `model.gguf`'s bytes
+    /// leaked into the loaded weights.
+    async fn assert_dual_format_build_phase(
+        dir: &std::path::Path,
+        target_modules: Vec<String>,
+        device: &candle_core::Device,
+        reference_forward: &[f32],
+        phase: &str,
+    ) {
+        let (encoder, adapter_cfg) = build_encoder_adapters_for_dir(dir, target_modules)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("phase {phase}: build_encoder_adapters must succeed, got: {e}")
+            });
         assert!(
             matches!(encoder, jammi_encoders::AnyEncoder::Bert(_)),
-            "expected a Bert encoder built from the safetensors arm — a gguf \
-             arm would have failed to parse the corrupted model.gguf instead"
+            "phase {phase}: expected a Bert encoder built from the safetensors arm"
         );
-        assert_eq!(adapter_cfg.model_type, "bert");
+        assert_eq!(
+            adapter_cfg.model_type, "bert",
+            "phase {phase}: adapter_cfg.model_type"
+        );
+        let forward = deterministic_bert_forward(&encoder, device);
+        assert!(
+            !forward.is_empty(),
+            "phase {phase}: the forward must be non-empty — an equality against \
+             empty proves nothing"
+        );
+        assert_eq!(
+            forward, reference_forward,
+            "phase {phase}: the dual-format directory's forward must EQUAL the \
+             safetensors-only reference's forward bit-for-bit — any deviation \
+             means model.gguf's bytes leaked into the loaded weights"
+        );
+    }
+
+    /// Dual-format precedence sweep (issue #351 wave 14, round-8 audit;
+    /// two-phase + forward-equality rework, round-9 audit): the
+    /// single-phase predecessor of this test corrupted `model.gguf`
+    /// BEFORE ever calling `build_encoder_adapters`, so only Ok-vs-Err
+    /// discriminated the two arms — a resolver refactored to "try gguf,
+    /// fall back to safetensors on a gguf READ failure" (a
+    /// `.ok()`-keyed fallback, not the frozen PRESENCE-keyed precedence
+    /// at `is_gguf = !weights_path.exists()`) would ALSO fail to read
+    /// the already-corrupt file and fall back to safetensors, passing
+    /// that test identically to the correct implementation.
+    ///
+    /// This version instead builds a safetensors-only REFERENCE encoder
+    /// first (its own dir, the SAME unperturbed fixture tensors) and
+    /// captures its forward, then runs the SAME assertions in two
+    /// phases against ONE dual-format dir:
+    ///
+    /// - Phase 1 (presence-precedence): `model.safetensors` is valid and
+    ///   `model.gguf` is ALSO valid, but written from PERTURBED tensors.
+    ///   A presence-keyed build (the correct, frozen behavior) picks
+    ///   safetensors here regardless of whether `model.gguf` is
+    ///   readable, so its forward matches `reference_forward`
+    ///   bit-for-bit. A read-keyed-fallback build would instead read the
+    ///   valid-but-perturbed `model.gguf` successfully and its forward
+    ///   would DEVIATE from `reference_forward` — this is the
+    ///   discriminator the corrupt-before-build predecessor lost, and it
+    ///   covers the dense-`FrozenBase` claim mechanistically (family F):
+    ///   quantized-base substitution changes the forward, not merely the
+    ///   Ok/Err outcome.
+    /// - Phase 2 (no-read): `model.gguf` is corrupted only AFTER phase 1
+    ///   has already resolved successfully, and the identical assertions
+    ///   are re-checked. This pins that the format decision never
+    ///   depends on `model.gguf` being readable at all (valid-perturbed
+    ///   or corrupt), i.e. that its bytes are genuinely never opened for
+    ///   the decision.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_encoder_adapters_prefers_safetensors_over_gguf_when_both_present() {
+        let device = candle_core::Device::Cpu;
+        let (tensors, config, matmul_weights) = bert_gguf_fixture(&device);
+        let target_modules = vec!["query".to_string(), "value".to_string()];
+        let tmp = tempfile::tempdir().unwrap();
+
+        // The safetensors-ONLY reference: same (unperturbed) tensors, no
+        // gguf sibling at all.
+        let ref_dir = tmp.path().join("reference_bert");
+        std::fs::create_dir_all(&ref_dir).unwrap();
+        candle_core::safetensors::save(&tensors, ref_dir.join("model.safetensors")).unwrap();
+        std::fs::write(
+            ref_dir.join("config.json"),
+            serde_json::to_string(&config).unwrap(),
+        )
+        .unwrap();
+        let (reference_encoder, _) =
+            build_encoder_adapters_for_dir(&ref_dir, target_modules.clone())
+                .await
+                .unwrap();
+        let reference_forward = deterministic_bert_forward(&reference_encoder, &device);
+
+        // The dual-format directory under test — safetensors starts (and
+        // stays) valid throughout both phases.
+        let dir = tmp.path().join("dual_format_bert");
+        std::fs::create_dir_all(&dir).unwrap();
+        candle_core::safetensors::save(&tensors, dir.join("model.safetensors")).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_string(&config).unwrap(),
+        )
+        .unwrap();
+
+        // Phase 1: model.gguf is VALID but built from PERTURBED tensors —
+        // if the gguf arm were ever (wrongly) taken, the forward would
+        // deviate from `reference_forward`.
+        let perturbed = perturb_tensors(&tensors);
+        write_gguf_fixture(
+            &dir,
+            &perturbed,
+            &matmul_weights,
+            candle_core::quantized::GgmlDType::Q8_0,
+        );
+        assert_dual_format_build_phase(
+            &dir,
+            target_modules.clone(),
+            &device,
+            &reference_forward,
+            "1 (gguf valid, perturbed)",
+        )
+        .await;
+
+        // Corrupt the (should-be-ignored) GGUF sibling AFTER phase 1 has
+        // already resolved successfully — proves phase 1's result wasn't
+        // merely a byproduct of a since-corrupted file.
+        std::fs::write(dir.join("model.gguf"), b"not a real gguf file").unwrap();
+
+        // Phase 2 (no-read): re-build against the now-corrupted
+        // model.gguf; the identical assertions must still hold, proving
+        // the format decision never depended on being able to read
+        // model.gguf's bytes.
+        assert_dual_format_build_phase(
+            &dir,
+            target_modules,
+            &device,
+            &reference_forward,
+            "2 (gguf corrupted)",
+        )
+        .await;
     }
 }

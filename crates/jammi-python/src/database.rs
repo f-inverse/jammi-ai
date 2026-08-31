@@ -42,8 +42,15 @@ pub struct PyDatabase {
     ephemeral_scanner: std::sync::Once,
     /// The embedded training worker this connection owns. An embedded `Database`
     /// both submits training jobs and runs them; the worker stops when the
-    /// `Database` drops (RAII). Held for its `Drop`, not read.
+    /// `Database` drops (RAII), OR gracefully and deterministically on `close()`
+    /// via `EmbeddedWorker::stop_and_join`.
     _worker: jammi_ai::fine_tune::worker::EmbeddedWorker,
+    /// Set exactly once, by [`PyDatabase::close`]. Every other pymethod calls
+    /// [`PyDatabase::check_open`] first and raises the typed `BackendError`
+    /// once this is set — the FFI-boundary guard making "a call against an
+    /// already-closed handle" unrepresentable as silent undefined behaviour on
+    /// a torn-down worker, rather than merely undocumented.
+    closed: std::sync::atomic::AtomicBool,
 }
 
 impl PyDatabase {
@@ -68,7 +75,23 @@ impl PyDatabase {
             runtime,
             ephemeral_scanner: std::sync::Once::new(),
             _worker: worker,
+            closed: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// `Err` (the same typed `BackendError` [`PyDatabase::close`] raises for
+    /// every later call) once `close()` has run; `Ok(())` otherwise. Every
+    /// pymethod but `close()` and `attach`'s target `training_job` calls this
+    /// first, so a caller who keeps using a handle after `close()` gets a
+    /// prompt, typed failure at each call site rather than racing whatever
+    /// state the worker/session were left in.
+    fn check_open(&self) -> PyResult<()> {
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(to_pyerr(JammiError::Catalog(
+                "Database is closed".to_string(),
+            )));
+        }
+        Ok(())
     }
 
     /// Spawn the ephemeral timeout scanner on first use. The scanner runs on
@@ -104,6 +127,64 @@ impl PyDatabase {
 
 #[pymethods]
 impl PyDatabase {
+    /// Gracefully close this connection.
+    ///
+    /// Signals the embedded training worker to stop and blocks until it
+    /// actually has (`EmbeddedWorker::stop_and_join` — the GIL is released
+    /// while blocking, so other Python threads keep running). Per that
+    /// method's own documented bound, this returns immediately if the worker
+    /// is idle between claim attempts (at most the configured
+    /// `idle_poll`, 1s by default), or after the remaining duration of a job
+    /// already claimed and running when `close()` is called — an in-flight
+    /// run is never force-cancelled, it always finishes and finalizes before
+    /// this returns.
+    ///
+    /// This is a DETERMINISTIC teardown point, not merely a request to stop:
+    /// once `close()` returns, the worker this connection owned has made no
+    /// further catalog writes and never will again, and this connection's own
+    /// clone of the shared session is released. A caller that also holds
+    /// derived handles from this connection (a `TrainingJob`, the `audit`
+    /// handle, an `EphemeralSession`) must drop those too before every engine
+    /// connection this `Database` is responsible for is actually gone — each
+    /// carries its own clone of the same shared session, by design, so it
+    /// keeps working independently of this connection's lifetime. This is the
+    /// primitive a caller needing to do something that races a live
+    /// connection to the same catalog file — e.g. write to it through a
+    /// separate raw connection — reaches for; ordinary usage needs no explicit
+    /// `close()`, since the embedded engine otherwise releases on drop (RAII),
+    /// which is why the higher-level `jammi.EmbeddedBackend.close()` wrapper
+    /// still raises `NotSupportedOnBackend` today.
+    ///
+    /// Idempotent — calling `close()` again is a no-op. Every OTHER method on
+    /// this handle raises `jammi.errors.BackendError` once this has run.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        if self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return Ok(());
+        }
+        py.detach(|| self.runtime.block_on(self._worker.stop_and_join()))
+            .map_err(to_pyerr)
+    }
+
+    /// Attach to an existing training job by id, on a freshly-opened
+    /// connection that never submitted it — the embedded peer of the remote
+    /// client's `RemoteTrainingJob`, which always attaches by id (every one of
+    /// its verbs re-fetches state over the wire per call). Closes the K4
+    /// asymmetry where the embedded engine could otherwise only ever hand out
+    /// a `TrainingJob` at submit time.
+    ///
+    /// A `job_id` with no matching row raises the SAME typed not-found
+    /// [`PyDatabase::sql`] et al. already raise for a missing catalog target —
+    /// there is no separate existence check here to drift from the catalog
+    /// read itself.
+    fn training_job(&self, job_id: &str) -> PyResult<PyTrainingJob> {
+        self.check_open()?;
+        PyTrainingJob::attach(
+            job_id.to_string(),
+            Arc::clone(&self.runtime),
+            Arc::clone(&self.session),
+        )
+    }
+
     /// Set the sticky tenant scope on this connection.
     ///
     /// Subsequent reads return rows whose `tenant_id` matches `tenant_id`
@@ -115,6 +196,7 @@ impl PyDatabase {
     /// setter, not a builder. For a block-scoped binding that restores the
     /// prior tenant on exit, use [`tenant_scope`](Self::tenant_scope).
     fn set_tenant(&self, tenant_id: &str) -> PyResult<()> {
+        self.check_open()?;
         if tenant_id.is_empty() {
             self.session.unbind_tenant();
             return Ok(());
@@ -139,6 +221,7 @@ impl PyDatabase {
     /// the *prior* tenant on entry and rebinds it on exit, rather than blindly
     /// clearing to unscoped.
     fn tenant_scope(&self, tenant_id: &str) -> PyResult<PyTenantScope> {
+        self.check_open()?;
         // Validate eagerly so `db.tenant_scope("bad")` raises at the call site,
         // not on `__enter__` — the bind happens on entry, but a malformed id is
         // a programming error the caller should learn where they name it.
@@ -151,19 +234,21 @@ impl PyDatabase {
     }
 
     /// The tenant currently bound to this connection, or `None`.
-    fn tenant(&self) -> Option<String> {
-        self.session.tenant().map(|t| t.to_string())
+    fn tenant(&self) -> PyResult<Option<String>> {
+        self.check_open()?;
+        Ok(self.session.tenant().map(|t| t.to_string()))
     }
 
     /// Handle to the per-query audit primitive: `db.audit.log([...])`,
     /// `db.audit.fetch_by_query_id(...)`, `db.audit.fetch_recent(...)`.
     /// Shares this connection's session, runtime, and tenant binding.
     #[getter]
-    fn audit(&self) -> crate::audit::PyAuditHandle {
-        crate::audit::PyAuditHandle {
+    fn audit(&self) -> PyResult<crate::audit::PyAuditHandle> {
+        self.check_open()?;
+        Ok(crate::audit::PyAuditHandle {
             session: Arc::clone(&self.session),
             runtime: Arc::clone(&self.runtime),
-        }
+        })
     }
 
     /// Open an ephemeral, session-scoped storage context bound to the tenant
@@ -184,6 +269,7 @@ impl PyDatabase {
         &self,
         timeout_seconds: u64,
     ) -> PyResult<crate::ephemeral::PyEphemeralSession> {
+        self.check_open()?;
         self.ensure_ephemeral_scanner();
         let timeout = std::time::Duration::from_secs(timeout_seconds);
         let session = self
@@ -202,6 +288,7 @@ impl PyDatabase {
     /// `azure://container/blob`.
     #[pyo3(signature = (name, *, url, format))]
     fn add_source(&self, name: &str, url: &str, format: &str) -> PyResult<()> {
+        self.check_open()?;
         let file_format = parse_file_format(format)?;
         let connection = SourceConnection::parse(url, file_format).map_err(to_pyerr)?;
         self.runtime
@@ -215,6 +302,7 @@ impl PyDatabase {
     /// with its own `status` / `row_count` / `dimensions`). Registry
     /// introspection, not a SQL query.
     fn list_sources(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
         let descriptors = self
             .runtime
             .block_on(self.session.catalog().list_source_descriptors())
@@ -226,6 +314,7 @@ impl PyDatabase {
     /// that id is visible to the current tenant. Returns the same dict shape
     /// `list_sources` yields per entry.
     fn describe_source(&self, py: Python<'_>, source_id: &str) -> PyResult<Option<Py<PyAny>>> {
+        self.check_open()?;
         let descriptor = self
             .runtime
             .block_on(self.session.catalog().describe_source(source_id))
@@ -241,6 +330,7 @@ impl PyDatabase {
     /// returns, so a caller reads identical keys regardless of transport. The
     /// peer of `list_sources`. Registry introspection, not a SQL query.
     fn list_models(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
         let records = self
             .runtime
             .block_on(self.local_session().list_models())
@@ -252,6 +342,7 @@ impl PyDatabase {
     /// is visible to the current tenant. Returns the same dict shape
     /// `list_models` yields per entry.
     fn describe_model(&self, py: Python<'_>, model_id: &str) -> PyResult<Option<Py<PyAny>>> {
+        self.check_open()?;
         let record = self
             .runtime
             .block_on(self.local_session().describe_model(model_id))
@@ -265,6 +356,7 @@ impl PyDatabase {
     /// is a no-op rather than an error.
     #[pyo3(signature = (model_id, *, version=None, if_exists=false))]
     fn delete_model(&self, model_id: &str, version: Option<i32>, if_exists: bool) -> PyResult<()> {
+        self.check_open()?;
         self.runtime
             .block_on(
                 self.local_session()
@@ -279,11 +371,13 @@ impl PyDatabase {
     /// the bundled `jammi`'s `get_server_info` (and `SessionService.
     /// GetServerInfo`) so the embedded and remote surfaces agree.
     fn get_server_info(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
         serializable_to_pydict(py, &jammi_db::ServerInfo::current())
     }
 
     /// Execute a SQL query. Returns a `pyarrow.Table`.
     fn sql(&self, py: Python<'_>, query: &str) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
         let batches = self
             .runtime
             .block_on(self.session.sql(query))
@@ -300,6 +394,7 @@ impl PyDatabase {
     /// (`jammi_ai::wire::generate_embeddings_from_bytes`). Returns the result
     /// table name. A malformed or invalid body raises `ValueError`.
     fn _generate_embeddings_proto(&self, proto_bytes: &[u8]) -> PyResult<String> {
+        self.check_open()?;
         let args =
             jammi_ai::wire::generate_embeddings_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         let (record, _outcome) = self
@@ -326,6 +421,7 @@ impl PyDatabase {
     /// (`jammi_ai::wire::import_embeddings_from_bytes`). Returns the result table
     /// name. A malformed or invalid body raises `ValueError`.
     fn _import_embeddings_proto(&self, proto_bytes: &[u8]) -> PyResult<String> {
+        self.check_open()?;
         let args =
             jammi_ai::wire::import_embeddings_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         let record = self
@@ -350,6 +446,7 @@ impl PyDatabase {
     /// (`jammi_ai::wire::infer_from_bytes`). Returns a `pyarrow.Table`. A
     /// malformed or invalid body raises `ValueError`.
     fn _infer_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
         let args = jammi_ai::wire::infer_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         let model_source = ModelSource::parse(&args.model);
         let (batches, _outcome) = self
@@ -368,6 +465,7 @@ impl PyDatabase {
 
     /// List registered topic names visible to the current tenant binding.
     fn list_topics(&self) -> PyResult<Vec<String>> {
+        self.check_open()?;
         let topic_repo = self.session.topic_repo();
         let tenant = self.session.tenant();
         let topics = self
@@ -387,6 +485,7 @@ impl PyDatabase {
     /// topic, this must match the topic's tenant.
     #[pyo3(signature = (topic, *, batch))]
     fn publish_topic(&self, topic: &str, batch: PyTable) -> PyResult<u64> {
+        self.check_open()?;
         let topic_repo = self.session.topic_repo();
         let tenant = self.session.tenant();
         let topic_def = self
@@ -435,6 +534,7 @@ impl PyDatabase {
         from_offset: Option<u64>,
         max_batches: usize,
     ) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
         let topic_repo = self.session.topic_repo();
         let tenant = self.session.tenant();
         let topic_def = self
@@ -481,6 +581,7 @@ impl PyDatabase {
     /// raises `RuntimeError` carrying `ChannelCatalog(AlreadyExists)`. A malformed
     /// or invalid body raises `ValueError`.
     fn _register_channel_proto(&self, proto_bytes: &[u8]) -> PyResult<()> {
+        self.check_open()?;
         let spec =
             jammi_ai::wire::register_channel_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         self.runtime
@@ -499,6 +600,7 @@ impl PyDatabase {
     /// `ChannelCatalog(ColumnConflict)`. A malformed or invalid body raises
     /// `ValueError`.
     fn _add_channel_columns_proto(&self, proto_bytes: &[u8]) -> PyResult<()> {
+        self.check_open()?;
         let args =
             jammi_ai::wire::add_channel_columns_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         self.runtime
@@ -519,6 +621,7 @@ impl PyDatabase {
     /// Columns appear in declaration order. An unbound session sees only the
     /// global (NULL-tenant) channels.
     fn list_channels(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
         let specs = self
             .runtime
             .block_on(self.session.catalog().channels().list())
@@ -555,6 +658,7 @@ impl PyDatabase {
         table: &str,
         expected_definition: Option<String>,
     ) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
         let expected = expected_definition.map(jammi_db::store::manifest::DefinitionHash);
         let verdict = self
             .runtime
@@ -576,6 +680,7 @@ impl PyDatabase {
         table: &str,
         current_definition: String,
     ) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
         let current = jammi_db::store::manifest::DefinitionHash(current_definition);
         let verdict = self
             .runtime
@@ -589,6 +694,7 @@ impl PyDatabase {
     /// `{"input", "derived", "kind"}`. Read-only lineage data the caller walks
     /// transitively.
     fn derives_from(&self, py: Python<'_>, table: &str) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
         let edges = self
             .runtime
             .block_on(self.local_session().derives_from(table))
@@ -606,6 +712,7 @@ impl PyDatabase {
     /// the definition. Returns the catalog id of the registered table. A malformed
     /// or invalid body raises `ValueError`.
     fn _create_mutable_table_proto(&self, proto_bytes: &[u8]) -> PyResult<String> {
+        self.check_open()?;
         let def =
             jammi_ai::wire::create_mutable_table_from_bytes(proto_bytes, self.session.tenant())
                 .map_err(status_to_pyerr)?;
@@ -621,6 +728,7 @@ impl PyDatabase {
     /// typed `MutableTableError::NotFound` variant.
     #[pyo3(signature = (name, *, if_exists=false))]
     fn drop_mutable_table(&self, name: String, if_exists: bool) -> PyResult<()> {
+        self.check_open()?;
         let id = MutableTableId::new(&name).map_err(to_pyerr)?;
         match self.runtime.block_on(self.session.drop_mutable_table(&id)) {
             Ok(()) => Ok(()),
@@ -636,6 +744,7 @@ impl PyDatabase {
     /// `{"name", "columns", "unique"}` dicts), `order_column` (str — empty when
     /// the table declares none), and `chunk_size` (int).
     fn list_mutable_tables(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
         let defs = self
             .runtime
             .block_on(self.session.list_mutable_tables())
@@ -677,6 +786,7 @@ impl PyDatabase {
     /// Returns the engine-minted topic id. A malformed body (or a schema carrying
     /// a DataType outside the supported wire types) raises `ValueError`.
     fn _register_topic_proto(&self, proto_bytes: &[u8]) -> PyResult<String> {
+        self.check_open()?;
         let topic = jammi_ai::wire::register_topic_from_bytes(proto_bytes, self.session.tenant())
             .map_err(status_to_pyerr)?;
         // Dual-register the broker driver and the catalog (so a later `publish`
@@ -698,6 +808,7 @@ impl PyDatabase {
     /// — the system of record is already consistent.
     #[pyo3(signature = (name, *, if_exists=false))]
     fn drop_topic(&self, name: String, if_exists: bool) -> PyResult<()> {
+        self.check_open()?;
         let tenant = self.session.tenant();
         let topic_repo = self.session.topic_repo();
         let topic_opt = self
@@ -736,6 +847,7 @@ impl PyDatabase {
     /// request is collapsed, the Arrow response wrapping stays here. A malformed
     /// or invalid body raises `ValueError`.
     fn _search_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
         let request = jammi_ai::wire::search_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         let batches = self
             .runtime
@@ -756,6 +868,7 @@ impl PyDatabase {
     /// executes it. Returns the same `TrainingJob` handle the per-verb embedded
     /// submits used to return. A malformed or invalid body raises `ValueError`.
     fn _start_training_proto(&self, proto_bytes: &[u8]) -> PyResult<PyTrainingJob> {
+        self.check_open()?;
         let spec =
             jammi_ai::wire::training_spec_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         let job = self
@@ -811,6 +924,7 @@ impl PyDatabase {
         min_weight: Option<f64>,
         hybrid_ann_k: Option<usize>,
     ) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
         use jammi_ai::pipeline::context_predictor::PredictedDistribution;
 
         let gather = edge_gather_from_kwargs(
@@ -882,6 +996,7 @@ impl PyDatabase {
     /// golden-set query) keys — byte-identical to the report the kwargs surface
     /// produced. A malformed or invalid body raises `ValueError`.
     fn _eval_embeddings_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
         let args =
             jammi_ai::wire::eval_embeddings_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         let report = self
@@ -908,6 +1023,7 @@ impl PyDatabase {
     /// dict of `recall@1/3/5/10`, `mrr`, `ndcg`, `distance`). A malformed or
     /// invalid body raises `ValueError`.
     fn _eval_per_query_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
         let eval_run_id =
             jammi_ai::wire::eval_per_query_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         let records = self
@@ -942,6 +1058,7 @@ impl PyDatabase {
     /// per predicted/gold pair) keys. A malformed or invalid body raises
     /// `ValueError`.
     fn _eval_inference_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
         let args =
             jammi_ai::wire::eval_inference_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         let report = self
@@ -968,6 +1085,7 @@ impl PyDatabase {
     /// every subsequent entry carries a `delta` against it. A malformed or invalid
     /// body raises `ValueError`.
     fn _eval_compare_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
         let args = jammi_ai::wire::eval_compare_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         let report = self
             .runtime
@@ -992,6 +1110,7 @@ impl PyDatabase {
     /// `per_cohort` (coverage + CRPS with n + CI per cohort), and `per_record`
     /// keys. A malformed or invalid body raises `ValueError`.
     fn _eval_calibration_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
         let args =
             jammi_ai::wire::eval_calibration_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         let report = self
@@ -1014,6 +1133,7 @@ impl PyDatabase {
     /// decode seam (`jammi_ai::wire::encode_query_from_bytes`). Returns the
     /// L2-normalized embedding. A malformed or invalid body raises `ValueError`.
     fn _encode_query_proto(&self, proto_bytes: &[u8]) -> PyResult<Vec<f32>> {
+        self.check_open()?;
         let args = jammi_ai::wire::encode_query_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         self.runtime
             .block_on(
@@ -1025,6 +1145,7 @@ impl PyDatabase {
 
     /// Preload a model into the cache without running inference.
     fn preload_model(&self, model_id: &str) -> PyResult<()> {
+        self.check_open()?;
         let source = ModelSource::parse(model_id);
         self.runtime
             .block_on(self.session.model_cache().get_or_load(
@@ -1045,6 +1166,7 @@ impl PyDatabase {
     /// (`jammi_ai::wire::build_neighbor_graph_from_bytes`). Returns the new edge
     /// table's name. A malformed or invalid body raises `ValueError`.
     fn _build_neighbor_graph_proto(&self, proto_bytes: &[u8]) -> PyResult<String> {
+        self.check_open()?;
         let args = jammi_ai::wire::build_neighbor_graph_from_bytes(proto_bytes)
             .map_err(status_to_pyerr)?;
         let (record, _outcome) = self
@@ -1069,6 +1191,7 @@ impl PyDatabase {
     /// materialised embedding table's name. A malformed or invalid body raises
     /// `ValueError`.
     fn _propagate_embeddings_proto(&self, proto_bytes: &[u8]) -> PyResult<String> {
+        self.check_open()?;
         let (request, cache) =
             jammi_ai::wire::propagate_request_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         let (record, _outcome) = self
@@ -1087,6 +1210,7 @@ impl PyDatabase {
     /// (`jammi_ai::wire::asof_join_from_bytes`). Returns the materialised table's
     /// name. A malformed or invalid body raises `ValueError`.
     fn _asof_join_proto(&self, proto_bytes: &[u8]) -> PyResult<String> {
+        self.check_open()?;
         let args = jammi_ai::wire::asof_join_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         let record = self
             .runtime
@@ -1107,6 +1231,7 @@ impl PyDatabase {
     /// remote client receives over gRPC. A malformed or invalid body raises
     /// `ValueError`; a pre-contract table raises the typed `NotRecomputable`.
     fn _recompute_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
         let args = jammi_ai::wire::recompute_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         let report = self
             .runtime
@@ -1143,6 +1268,7 @@ impl PyDatabase {
         score: Option<&str>,
         raps_params: Option<(f64, usize)>,
     ) -> PyResult<Vec<Vec<usize>>> {
+        self.check_open()?;
         let (raps_lambda, raps_k_reg) = raps_params.unwrap_or((0.0, 1));
         let score = parse_class_score(score.unwrap_or("aps"), raps_lambda, raps_k_reg)?;
         let model = jammi_ai::predict::ConformalModel::classification(
@@ -1175,6 +1301,7 @@ impl PyDatabase {
         test_predictions: Vec<f64>,
         alpha: f64,
     ) -> PyResult<Vec<(f64, f64)>> {
+        self.check_open()?;
         use jammi_ai::predict::{ConformalModel, IntervalScore};
         let model = ConformalModel::regression(
             &predictions,
@@ -1212,6 +1339,7 @@ impl PyDatabase {
         test_upper: Vec<f64>,
         alpha: f64,
     ) -> PyResult<Vec<(f64, f64)>> {
+        self.check_open()?;
         use jammi_ai::predict::{ConformalModel, IntervalScore};
         if test_lower.len() != test_upper.len() {
             return Err(PyValueError::new_err(
@@ -1243,6 +1371,7 @@ impl PyDatabase {
         ranked_lists: Vec<Vec<String>>,
         k_rrf: Option<u32>,
     ) -> PyResult<Vec<(String, f64)>> {
+        self.check_open()?;
         let k = k_rrf.unwrap_or(jammi_ai::query::DEFAULT_K_RRF);
         Ok(jammi_ai::query::rrf_fuse(&ranked_lists, k)
             .into_iter()
@@ -1268,6 +1397,7 @@ impl PyDatabase {
     /// `source` (the assembly fact). A malformed or invalid body raises
     /// `ValueError`.
     fn _assemble_context_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
         let request = jammi_ai::wire::assemble_context_request_from_bytes(proto_bytes)
             .map_err(status_to_pyerr)?;
         let context = self

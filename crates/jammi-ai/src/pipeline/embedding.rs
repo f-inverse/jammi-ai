@@ -90,6 +90,7 @@ impl<'a> EmbeddingPipeline<'a> {
                 backend: backend_kind.to_string(),
                 compute_precision,
                 content_digest,
+                quantization: None,
             }],
         );
         let inputs = vec![jammi_db::store::manifest::InputAnchor::unpinned_at_instant(

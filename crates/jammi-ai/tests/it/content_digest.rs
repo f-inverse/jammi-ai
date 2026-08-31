@@ -63,6 +63,7 @@ async fn definition_hash_for(dir: &Path) -> DefinitionHash {
         content_digest: model
             .content_digest()
             .expect("the Candle backend always reports a Sha256 content digest"),
+        quantization: None,
     };
     let descriptor = ProducingDescriptor::Embedding {
         model_id,

@@ -156,6 +156,9 @@ impl<'a> ImportPipeline<'a> {
                 content_digest: ModelContentDigest::Unavailable(
                     ModelContentDigestUnavailableReason::ExternalImport,
                 ),
+                // No inference ran through this engine, so there is no
+                // weight-quantization format to report either.
+                quantization: None,
             }],
         );
         // The sole input is the external vector object, which exposes no version

@@ -3436,4 +3436,78 @@ mod tests {
         );
         assert_eq!(adapter_cfg.model_type, "modernbert");
     }
+
+    /// Dual-format precedence sweep (issue #351 wave 14, round-8 audit):
+    /// `build_encoder_adapters`'s own precedence check at
+    /// `is_gguf = !weights_path.exists()` had no dual-format test at
+    /// all — this mirrors `tests/it/gguf_qlora.rs`'s resolver-level pin
+    /// one layer down, at the fine-tune worker's independent precedence
+    /// decision.
+    ///
+    /// The base-model dir carries BOTH a valid `model.safetensors` and a
+    /// DELIBERATELY CORRUPTED `model.gguf`. `weights_path.exists()` is
+    /// true, so the presence-keyed precedence must take the safetensors
+    /// arm (`is_gguf == false`, dense `FrozenBase`) and never open
+    /// `model.gguf` at all. This is the mechanistic proof, not a
+    /// transcribed assertion (family F): a build that instead preferred
+    /// gguf, or fell back to it for any reason, would hand the corrupted
+    /// bytes to `load_gguf_backbone`, which cannot parse them, and the
+    /// whole build would return a load error instead of a `Bert`
+    /// encoder. A successful build IS the proof that `model.gguf` was
+    /// never read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_encoder_adapters_prefers_safetensors_over_gguf_when_both_present() {
+        let device = candle_core::Device::Cpu;
+        let (tensors, config, _matmul_weights) = bert_gguf_fixture(&device);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("dual_format_bert");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Valid safetensors — the arm that must win.
+        candle_core::safetensors::save(&tensors, dir.join("model.safetensors")).unwrap();
+
+        // A CORRUPTED model.gguf sibling: if the gguf arm were ever taken
+        // (wrongly), load_gguf_backbone would fail to parse it and the
+        // whole build would error out instead of succeeding.
+        std::fs::write(dir.join("model.gguf"), b"not a real gguf file").unwrap();
+
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_string(&config).unwrap(),
+        )
+        .unwrap();
+
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
+        let base_model_id = register_gguf_base_model(&catalog, &dir).await;
+        let artifact_store = gguf_test_artifact_store();
+
+        let (encoder, adapter_cfg) = tokio::task::spawn_blocking(move || {
+            let training_config = FineTuneConfig {
+                target_modules: vec!["query".into(), "value".into()],
+                ..FineTuneConfig::default()
+            };
+            let varmap = candle_nn::VarMap::new();
+            let device = candle_core::Device::Cpu;
+            build_encoder_adapters(
+                &base_model_id,
+                &catalog,
+                &artifact_store,
+                &training_config,
+                &varmap,
+                &device,
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(
+            matches!(encoder, jammi_encoders::AnyEncoder::Bert(_)),
+            "expected a Bert encoder built from the safetensors arm — a gguf \
+             arm would have failed to parse the corrupted model.gguf instead"
+        );
+        assert_eq!(adapter_cfg.model_type, "bert");
+    }
 }

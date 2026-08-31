@@ -401,22 +401,33 @@ impl ModelResolver {
             }
         };
 
-        // Fetch the repo listing ONCE (issue #351 wave 13 audit advisory 1):
-        // backend auto-selection and the weights-format decision both need
-        // it, and two separate live `info()` calls could observe two
-        // different snapshots of a repo being pushed to concurrently. A
-        // failed fetch becomes `None`, not a fatal error here — hf-hub
-        // 0.5's `ApiRepo::get` is CACHE-FIRST and network-free on a hit
-        // (sync.rs:758-764) while `ApiRepo::info` is network-only
-        // (sync.rs:860-878), so a warm-cache repo must keep resolving
-        // exactly as it did before this feature existed even with no
-        // network at all. What `None` means to each decision is owned by
-        // that decision's own pure function (`select_backend_from_listing`,
-        // `hub_candle_weights_plan`), never decided at this call site.
-        let listing: Option<Vec<String>> = repo
-            .info()
-            .ok()
-            .map(|info| info.siblings.into_iter().map(|s| s.rfilename).collect());
+        // Fetch the repo listing at most ONCE for the two DECISIONS that can
+        // consume it — backend auto-selection and the Candle weights-format
+        // plan (issue #351 wave 13 audit advisory 1) — never two separate
+        // live `info()` calls that could observe two different snapshots of
+        // a repo being pushed to concurrently. A failed fetch becomes
+        // `None`, not a fatal error here — hf-hub 0.5's `ApiRepo::get` is
+        // CACHE-FIRST and network-free on a hit (sync.rs:758-764) while
+        // `ApiRepo::info` is network-only (sync.rs:860-878), so a warm-cache
+        // repo must keep resolving exactly as it did before this feature
+        // existed even with no network at all. What `None` means to each
+        // decision is owned by that decision's own pure function
+        // (`select_backend_from_listing`, `hub_candle_weights_plan`), never
+        // decided at this call site.
+        //
+        // Lazy (issue #351 wave 14 round-8 audit advisory 2): a HINTED
+        // resolve for a non-Candle backend (e.g. `Some(BackendType::Ort)`)
+        // consumes neither decision above, so it must make NO listing call
+        // at all — restores the base (pre-#351) behavior for hinted
+        // non-Candle resolves, where `repo.info()` was never invoked.
+        let listing: Option<Vec<String>> =
+            if backend_hint.is_none() || backend_hint == Some(BackendType::Candle) {
+                repo.info()
+                    .ok()
+                    .map(|info| info.siblings.into_iter().map(|s| s.rfilename).collect())
+            } else {
+                None
+            };
 
         let backend =
             backend_hint.unwrap_or_else(|| select_backend_from_listing(listing.as_deref()));
@@ -437,21 +448,17 @@ impl ModelResolver {
         let (weights_paths, weights_format) = match backend {
             BackendType::Candle => {
                 match hub_candle_weights_plan(listing.as_deref(), GGUF_WEIGHTS_FILENAME) {
-                    HubCandleWeightsPlan::Safetensors => {
+                    HubCandleWeightsPlan::Safetensors(listed_safetensors) => {
                         // The listing PROVED at least one safetensors
                         // sibling is present, so a download failure here is
                         // worth naming that fact (issue #351 wave 13 audit
                         // advisory 2): distinguishes "listed but every
                         // download failed" from the bare message
                         // `SafetensorsOnlyAttempt` below also returns when
-                        // there was no listing to make that claim from.
-                        let listed_safetensors: Vec<String> = listing
-                            .as_deref()
-                            .unwrap_or(&[])
-                            .iter()
-                            .filter(|name| name.ends_with(".safetensors"))
-                            .cloned()
-                            .collect();
+                        // there was no listing to make that claim from. The
+                        // names come straight off the plan arm that decided
+                        // this branch (issue #351 wave 14 round-8 audit
+                        // advisory 1), not re-derived from `listing` here.
                         (
                             self.download_safetensors(&repo, source).map_err(|e| {
                                 annotate_listed_safetensors_download_failure(e, &listed_safetensors)
@@ -656,8 +663,14 @@ fn decide_hub_weights_format(siblings: &[String], canonical_gguf: &str) -> HubWe
 #[derive(Debug, PartialEq, Eq)]
 enum HubCandleWeightsPlan {
     /// Listing available, safetensors sibling(s) listed — download them; a
-    /// failure here PROPAGATES (never falls back to gguf).
-    Safetensors,
+    /// failure here PROPAGATES (never falls back to gguf). Carries the
+    /// LISTED `*.safetensors` sibling name(s), taken from the same listing
+    /// that produced this arm (round-8 audit advisory, issue #351 wave
+    /// 14) — the call site needs these names to annotate a download
+    /// failure, and previously re-derived them from `listing` a second
+    /// time; carrying them here makes that re-derivation impossible to
+    /// drift from the decision that actually selected this arm.
+    Safetensors(Vec<String>),
     /// Listing available, no safetensors but the canonical `model.gguf` IS
     /// listed — download it; a failure here PROPAGATES too.
     Gguf,
@@ -688,7 +701,14 @@ fn hub_candle_weights_plan(
         return HubCandleWeightsPlan::SafetensorsOnlyAttempt;
     };
     match decide_hub_weights_format(siblings, canonical_gguf) {
-        HubWeightsDecision::Safetensors => HubCandleWeightsPlan::Safetensors,
+        HubWeightsDecision::Safetensors => {
+            let listed: Vec<String> = siblings
+                .iter()
+                .filter(|name| name.ends_with(".safetensors"))
+                .cloned()
+                .collect();
+            HubCandleWeightsPlan::Safetensors(listed)
+        }
         HubWeightsDecision::Gguf => HubCandleWeightsPlan::Gguf,
         HubWeightsDecision::NonCanonicalGguf(others) => {
             HubCandleWeightsPlan::NonCanonicalGguf(others)
@@ -892,7 +912,7 @@ mod tests {
         let siblings = names(&["config.json", "model.safetensors", "model.gguf"]);
         assert_eq!(
             hub_candle_weights_plan(Some(&siblings), GGUF_WEIGHTS_FILENAME),
-            HubCandleWeightsPlan::Safetensors
+            HubCandleWeightsPlan::Safetensors(vec!["model.safetensors".to_string()])
         );
     }
 
@@ -960,7 +980,7 @@ mod tests {
         let siblings = names(&["model.safetensors", "model.gguf"]);
         assert_eq!(
             hub_candle_weights_plan(Some(&siblings), GGUF_WEIGHTS_FILENAME),
-            HubCandleWeightsPlan::Safetensors
+            HubCandleWeightsPlan::Safetensors(vec!["model.safetensors".to_string()])
         );
         assert_ne!(
             hub_candle_weights_plan(Some(&siblings), GGUF_WEIGHTS_FILENAME),

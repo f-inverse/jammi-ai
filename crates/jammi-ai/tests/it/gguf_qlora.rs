@@ -839,25 +839,45 @@ async fn other_gguf_filename_without_the_canonical_name_is_a_typed_refusal() {
 }
 
 /// Dual-format precedence pin (oracle advisory (b), issue #351 wave 12; test
-/// honesty fold, issue #351 wave 13 audit advisory 3): a LOCAL directory
-/// carrying BOTH `model.safetensors` and `model.gguf` resolves to
+/// honesty fold, issue #351 wave 13 audit advisory 3; two-phase rework,
+/// issue #351 wave 14 round-8 audit): a LOCAL directory carrying BOTH
+/// `model.safetensors` and `model.gguf` resolves to
 /// `WeightsFormat::Safetensors`, with the `model.gguf` sibling wholly
-/// ignored (never consulted, never even opened) — the frozen precedence
-/// `resolve_local` has always applied, now pinned so a future refactor of
-/// the local path can't accidentally acquire the Hub-path defect (a
-/// fallback keyed off download/read FAILURE rather than presence).
+/// ignored — the frozen precedence `resolve_local` has always applied, now
+/// pinned so a future refactor of the local path can't accidentally
+/// acquire the Hub-path defect (a fallback keyed off download/read
+/// FAILURE rather than presence).
 ///
-/// `model.gguf` is corrupted BEFORE `try_resolve` is even called (not
-/// merely before `load`), so a resolve that peeked at the GGUF file's
-/// bytes for ANY reason — not just to decide the format, but e.g. to probe
-/// it as a fallback — would itself fail here, not just produce a
-/// wrong-but-not-crashing load. The resulting embedding is asserted EQUAL
-/// (not merely computed and discarded) to a same-tensors safetensors-ONLY
-/// reference directory's embedding of the identical text: since the local
-/// path never quantizes (plain F32 safetensors, deterministic CPU forward),
-/// this is a bit-exact equality, not a cosine floor — any accidental read
-/// of the corrupted `model.gguf` would produce a load failure or garbage
-/// output, not a value that happens to match the reference bit-for-bit.
+/// The single-phase predecessor of this test corrupted `model.gguf`
+/// BEFORE ever calling `try_resolve`, which destroyed its own
+/// discriminator: a resolver refactored to "try gguf, fall back to
+/// safetensors only on a gguf READ failure" — the exact class this unit
+/// forbids — would ALSO take the safetensors fallback against an
+/// already-corrupt file, passing that test identically to the correct
+/// presence-keyed implementation. This version instead runs the SAME set
+/// of assertions in two phases against the SAME directory:
+///
+/// - Phase 1 (presence-precedence): both `model.safetensors` and
+///   `model.gguf` are left VALID. A presence-keyed resolver (the correct,
+///   frozen behavior) picks safetensors here regardless of whether
+///   `model.gguf` is readable. A read-failure-keyed resolver would instead
+///   read the valid `model.gguf` successfully and return
+///   `WeightsFormat::Gguf`, FAILING this phase's format/path assertions —
+///   this is the discriminator the corrupt-before-resolve version lost.
+/// - Phase 2 (no-read): `model.gguf` is corrupted only AFTER phase 1 has
+///   already resolved successfully, and the identical assertions are
+///   re-checked. This pins that the format decision never depends on
+///   `model.gguf` being readable at all (valid or corrupt), i.e. that its
+///   bytes are genuinely never opened for the decision.
+///
+/// Each phase's resolved format/weights-path/embedding are asserted
+/// against a same-tensors safetensors-ONLY reference directory's load of
+/// the identical text: since the local path never quantizes (plain F32
+/// safetensors, deterministic CPU forward), this is bit-exact equality,
+/// not a cosine floor — any accidental read of `model.gguf` would produce
+/// a load failure or a value that doesn't match the reference bit-for-bit.
+/// The embedding is also asserted non-empty in each phase, since an
+/// equality between two empty vectors would otherwise be vacuous.
 #[tokio::test]
 async fn local_dir_with_both_safetensors_and_gguf_resolves_to_safetensors_and_ignores_gguf() {
     let device = Device::Cpu;
@@ -869,44 +889,69 @@ async fn local_dir_with_both_safetensors_and_gguf_resolves_to_safetensors_and_ig
     write_json(&ref_dir, "config.json", &config);
     write_tokenizer(&ref_dir);
     write_f32_checkpoint(&ref_dir, &tensors);
+    let reference = resolve_and_load(&ref_dir).await;
+    let reference_embedding = embed(&reference, "dual-format precedence");
 
-    // The dual-format directory under test.
+    // The dual-format directory under test — BOTH files valid to start.
     let dir = tmp.path().join("model");
     write_json(&dir, "config.json", &config);
     write_tokenizer(&dir);
     write_f32_checkpoint(&dir, &tensors);
     write_gguf_checkpoint(&dir, &tensors, &sites, GgmlDType::Q4_0);
 
-    // Corrupt the (should-be-ignored) GGUF sibling BEFORE resolving at all —
-    // proves the resolve decision never reads model.gguf's bytes, not merely
-    // that a subsequent load doesn't.
+    let backend = CandleBackend;
+
+    // Phase 1 (presence-precedence): both files still valid.
+    assert_dual_format_resolve_phase(&dir, &backend, &reference_embedding, "1 (both valid)").await;
+
+    // Corrupt the (should-be-ignored) GGUF sibling AFTER phase 1 has
+    // already resolved successfully with both files valid — proves phase
+    // 1's result wasn't merely a byproduct of a since-fixed corrupt file.
     std::fs::write(dir.join("model.gguf"), b"not a real gguf file").unwrap();
 
-    let resolved = try_resolve(&dir, None).await.unwrap();
+    // Phase 2 (no-read): re-resolve against the now-corrupted model.gguf;
+    // the identical assertions must still hold, proving the format
+    // decision never depended on being able to read model.gguf's bytes.
+    assert_dual_format_resolve_phase(&dir, &backend, &reference_embedding, "2 (gguf corrupted)")
+        .await;
+}
+
+/// The set of assertions both phases of
+/// [`local_dir_with_both_safetensors_and_gguf_resolves_to_safetensors_and_ignores_gguf`]
+/// re-check identically — factored out so the two call sites can never
+/// silently drift apart.
+async fn assert_dual_format_resolve_phase(
+    dir: &Path,
+    backend: &CandleBackend,
+    reference_embedding: &[f32],
+    phase: &str,
+) {
+    let resolved = try_resolve(dir, None).await.unwrap();
     assert_eq!(
         resolved.weights_format,
         WeightsFormat::Safetensors,
-        "a directory carrying both formats must resolve to safetensors, \
-         with model.gguf ignored"
+        "phase {phase}: a directory carrying both formats must resolve to \
+         safetensors, with model.gguf ignored"
     );
     assert_eq!(
         resolved.weights_paths,
         vec![dir.join("model.safetensors")],
-        "the resolved weights path must be model.safetensors, not model.gguf"
+        "phase {phase}: the resolved weights path must be model.safetensors, \
+         not model.gguf"
     );
-
-    let backend = CandleBackend;
     let loaded = backend.load(&resolved, &device_config()).unwrap();
     let embedding = embed(&loaded, "dual-format precedence");
-
-    let reference = resolve_and_load(&ref_dir).await;
-    let reference_embedding = embed(&reference, "dual-format precedence");
-
+    assert!(
+        !embedding.is_empty(),
+        "phase {phase}: the embedding must be non-empty — an empty-vs-empty \
+         equality below would be vacuous"
+    );
     assert_eq!(
         embedding, reference_embedding,
-        "the dual-format directory's embedding must EQUAL the safetensors-only \
-         reference's embedding of the same text — any deviation would mean \
-         model.gguf's (corrupted) bytes leaked into the loaded weights"
+        "phase {phase}: the dual-format directory's embedding must EQUAL the \
+         safetensors-only reference's embedding of the same text — any \
+         deviation would mean model.gguf's bytes leaked into the loaded \
+         weights"
     );
 }
 

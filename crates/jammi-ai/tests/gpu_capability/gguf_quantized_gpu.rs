@@ -934,11 +934,55 @@ async fn gguf_gpu_load_admission_estimate_is_truthful_against_measured_device_me
     }
     let measured_delta = raw_delta as u64;
 
-    // Direction-only, wide-documented-bound assertion (F9): the resolver's
-    // estimate must not UNDER-report true residency by more than the
-    // allocator's own single-pool-block granularity — never a byte-exact
-    // equality `nvidia-smi`'s whole-device, pool-quantized reading cannot
-    // support.
+    // Strengthened (round-3 audit item 3): `write_q8_0_gguf_fixture`'s
+    // BERT-tiny dims (`HIDDEN=32`/`INTERMEDIATE=128`/`LAYERS=1`/
+    // `VOCAB=256`) put its whole tensor payload far below one allocator
+    // pool block, so for THIS specific fixture `nvidia-smi`'s
+    // pool-quantized whole-device reading can only ever land on EXACTLY
+    // one block: never zero (the zero-delta branch above already
+    // returned), never more than one (the load can never cross a second
+    // block boundary at this scale). Pin that directly rather than leaving
+    // it implicit, so a future edit that grows the fixture past one block
+    // fails HERE, with a message that says why, instead of silently
+    // continuing to pass a bound it no longer actually exercises.
+    assert_eq!(
+        measured_delta, ALLOCATOR_POOL_BLOCK_BYTES,
+        "this fixture is sub-block-sized (far below {ALLOCATOR_POOL_BLOCK_BYTES} bytes of real \
+         tensor data): the measured device-memory delta must quantize to EXACTLY one allocator \
+         pool block, not {measured_delta} — either the fixture grew past one block (this \
+         assertion needs updating to a multi-block bound) or the measurement window is no \
+         longer isolating the GGUF load"
+    );
+
+    // What pinning `measured_delta` above actually buys: it makes the
+    // following bound non-vacuous. Before this fixture-scale pin, ANY
+    // `estimated` (including a resolver bug that always returns 0) would
+    // clear `estimated + ADMISSION_ALLOWANCE_BYTES >= measured_delta`
+    // whenever `measured_delta` was capped at one block — the phase-4
+    // audit's own named vacuity. With `measured_delta` now KNOWN to be
+    // exactly one block, additionally requiring `estimated` to be
+    // strictly positive and no larger than one block on its own catches
+    // both a zero/near-zero estimator (measured nothing) and a wildly
+    // over-sized one (already exceeds this fixture's own known scale)
+    // — neither of which the under-report-only bound below can see. What
+    // this still does NOT prove: byte-exact truthfulness past
+    // `nvidia-smi`'s own one-block measurement granularity, or
+    // truthfulness at a LARGER (multi-block) scale — a multi-block
+    // fixture would need its own block-COUNT bound, not this one.
+    assert!(
+        estimated > 0 && estimated <= ALLOCATOR_POOL_BLOCK_BYTES,
+        "resolver estimated_memory {estimated} must be in (0, {ALLOCATOR_POOL_BLOCK_BYTES}] \
+         bytes for this sub-block fixture — zero would mean the estimator measured nothing, \
+         and anything past one block would already contradict this fixture's own known scale"
+    );
+
+    // Direction-only, wide-documented-bound assertion (F9), retained as the
+    // GENERAL admission-truthfulness bound (the shape that still scales to
+    // a future multi-block fixture, unlike the two fixture-scale-specific
+    // assertions above): the resolver's estimate must not UNDER-report true
+    // residency by more than the allocator's own single-pool-block
+    // granularity — never a byte-exact equality `nvidia-smi`'s whole-
+    // device, pool-quantized reading cannot support.
     assert!(
         estimated + ADMISSION_ALLOWANCE_BYTES >= measured_delta,
         "resolver estimated_memory {estimated} under-reports the measured device memory \

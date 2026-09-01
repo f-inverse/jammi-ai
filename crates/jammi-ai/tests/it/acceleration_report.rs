@@ -1121,3 +1121,188 @@ async fn pre_device_resolution_failure_reports_undetermined_acceleration() {
         serde_json::json!("failed_before_device_resolution")
     );
 }
+
+/// The tri-state oracle for campaign #446 finding 1: once a job's status is
+/// TERMINAL, its `acceleration_report` may never still read
+/// `{"state":"pending"}` — "pending" asserts that no claimant has computed a
+/// determination YET, and "yet" is false the moment the row can no longer
+/// reach the probe.
+///
+/// Asserts the property, then the specific self-describing marker, and
+/// returns the parsed report so a caller can assert more.
+fn assert_terminal_report_is_not_pending(
+    record: &jammi_db::catalog::training_repo::TrainingJobRecord,
+    expected_reason: &str,
+    label: &str,
+) -> serde_json::Value {
+    assert!(
+        matches!(record.status.as_str(), "completed" | "failed"),
+        "{label}: this oracle only speaks about a TERMINAL row, got status {:?}",
+        record.status
+    );
+    let raw = record.acceleration_report.as_deref().unwrap_or_else(|| {
+        panic!(
+            "{label}: esc-075 control (iii) — a missing report is a FAILURE, never read as \
+             \"no misses\""
+        )
+    });
+    let report: serde_json::Value =
+        serde_json::from_str(raw).unwrap_or_else(|e| panic!("{label}: report must be JSON: {e}"));
+    assert_ne!(
+        report["state"],
+        serde_json::json!("pending"),
+        "{label}: a terminal job must never still carry the submission-time pending marker \
+         (campaign #446 finding 1) — got: {report}"
+    );
+    assert_eq!(
+        report["state"],
+        serde_json::json!("undetermined"),
+        "{label}: a job that failed before the probe ran must carry the self-describing \
+         undetermined marker, got: {report}"
+    );
+    assert_eq!(
+        report["reason"],
+        serde_json::json!(expected_reason),
+        "{label}: the undetermined reason must name WHERE it stopped, got: {report}"
+    );
+    report
+}
+
+/// Campaign #446 finding 1, worker side — the tri-state oracle driven through
+/// the PUBLIC surface (submit → force the failure → read the durable record),
+/// for every failure path between the claim and the acceleration probe that a
+/// CPU-only, in-process suite can actually force.
+///
+/// The catalog-edge mechanism this leans on is jammi-db's
+/// (`Catalog::fail_training_job` retires a still-`pending` report to
+/// `{"state":"undetermined","reason":"failed_before_probe"}` in the SAME
+/// lease-guarded UPDATE). What is asserted HERE is the worker's half: that
+/// each of these paths genuinely reaches `record_failed`, so the catalog-edge
+/// rule covers it. A path that bailed without a terminal write would leave
+/// the row `running` and this test would hang in `wait_for_any_terminal`
+/// rather than pass — the failure mode is loud, not silent.
+///
+/// Paths covered here (numbering matches `FineTuneWorker::run_claimed_job`'s
+/// own audit table):
+/// - **4 — base-model load error (missing artifact).** A raw job whose
+///   `training_spec` names a `local:` path that does not exist; the FK target
+///   is a real model row (minted by the seed job) so the failure lands where
+///   intended, inside `train_fine_tune`'s `model_cache().get_or_load`, AFTER
+///   the claim and well before any probe.
+/// - **3 — loader reconstruction error.** A job whose spec names a source
+///   table this session never registered, so `read_source_columns`'s SQL
+///   fails.
+/// - **1/2 — no / undeserialisable `training_spec`.** Covered by
+///   [`pre_device_resolution_failure_reports_undetermined_acceleration`]
+///   above, which additionally pins the MORE specific
+///   `failed_before_device_resolution` reason the worker pre-marks and the
+///   catalog edge preserves.
+///
+/// Paths deliberately NOT forced here, each with where it IS proven:
+/// - **9 — `spawn_blocking` panic / join error.** `crates/jammi-ai/src/
+///   fine_tune/worker.rs`'s `panicking_training_job_lands_failed_with_
+///   recorded_error` drives the exact `catch_unwind` → `panic_message` →
+///   `classify` → `record_failed` pipeline against a real catalog row. There
+///   is no public API that injects a panic into the trainer.
+/// - **6/7 — device-select and head/adapter construction errors.** Same
+///   `Err(Failed)` → `record_failed` arm as 3/4 (they differ only in where
+///   inside `run_fine_tune_blocking` they originate, all before the probe
+///   call); forcing 6 needs a device this CPU-only lane does not have.
+/// - **Cancelled / reclaim exhaustion.** Not a `record_failed` path at all
+///   by design — the OTHER half of the catalog-edge rule owns it, and
+///   `crates/jammi-db/tests/it/fine_tune_queue.rs` asserts both reclaim arms
+///   directly (exhausted → `lease_expired_attempts_exhausted`; requeue →
+///   reset to `pending`).
+// `jammi_kernels::admission`'s dispatch registries are process-wide — same
+// `#[serial]` rationale as the other tests in this file.
+#[serial(esc075_acceleration_report)]
+#[tokio::test(flavor = "multi_thread")]
+async fn every_pre_probe_failure_path_leaves_a_terminal_non_pending_report() {
+    let (session, _dir) = session_with_training_data().await;
+    let _worker = EmbeddedWorker::spawn(&session).expect("default worker intervals are valid");
+
+    // A real job first, purely to mint a valid `base_model_id` FK target —
+    // the same reuse pattern
+    // `pre_device_resolution_failure_reports_undetermined_acceleration` uses
+    // rather than re-deriving `ModelSource` resolution in a test.
+    let seed_job = session
+        .fine_tune(
+            "training",
+            &tiny_modernbert_model(),
+            &training_columns(),
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(encoder_adapters_config(ComputePrecision::F32)),
+        )
+        .await
+        .unwrap();
+    seed_job.wait().await.unwrap();
+    let seed_record = session
+        .catalog()
+        .get_training_job(&seed_job.job_id)
+        .await
+        .unwrap();
+    // Control: the seed job DID reach the probe, so the marker asserted below
+    // is a real state transition and not "every job is undetermined".
+    let seed_report = expect_determined_report(seed_record.acceleration_report.as_deref());
+    assert_eq!(seed_report["state"], serde_json::json!("determined"));
+
+    let spec_for = |source: &str, base_model: &str| {
+        serde_json::to_string(&TrainingSpec::FineTune {
+            source: source.to_string(),
+            columns: training_columns(),
+            method: FineTuneMethod::Lora,
+            task: ModelTask::TextEmbedding,
+            common: TrainingCommon {
+                base_model: base_model.to_string(),
+                config: encoder_adapters_config(ComputePrecision::F32),
+            },
+        })
+        .unwrap()
+    };
+
+    let cases = [
+        (
+            "esc446-f1-missing-artifact",
+            spec_for(
+                "training",
+                "local:/nonexistent/esc446/f1/no-such-checkpoint",
+            ),
+            "path 4 (base-model artifact missing)",
+        ),
+        (
+            "esc446-f1-unknown-source",
+            spec_for("no_such_table_esc446", &tiny_modernbert_model()),
+            "path 3 (source SQL / loader reconstruction)",
+        ),
+    ];
+
+    for (job_id, spec_json, label) in cases {
+        session
+            .catalog()
+            .create_training_job(CreateTrainingJobParams {
+                job_id,
+                base_model_id: &seed_record.base_model_id,
+                training_source: "training",
+                loss_type: "cosent",
+                hyperparams: "{}",
+                kind: "fine_tune",
+                training_spec: &spec_json,
+            })
+            .await
+            .unwrap();
+
+        let record = wait_for_any_terminal(session.catalog(), job_id).await;
+        assert_eq!(
+            record.status, "failed",
+            "{label}: the job must land terminal `failed`, never wedged `running` — got {} \
+             (error: {:?})",
+            record.status, record.error_message
+        );
+        assert!(
+            record.error_message.is_some(),
+            "{label}: record_failed must have surfaced the cause on the row"
+        );
+        assert_terminal_report_is_not_pending(&record, "failed_before_probe", label);
+    }
+}

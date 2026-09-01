@@ -246,6 +246,50 @@ impl TrainingWorker {
     /// `record` must be a row this worker claimed (its `claimed_by` is the
     /// worker's id). The driving loop ([`Self::run_until`]) is the normal caller;
     /// it is exposed so a test can drive one claimed job in isolation.
+    ///
+    /// # Every failure path between the claim and the acceleration probe
+    /// (campaign #446 finding 1, audited exhaustively)
+    ///
+    /// The esc-075 tri-state contract's `{"state":"pending"}` marker means "no
+    /// claimant has computed a determination YET", so it must not survive onto
+    /// a row that has gone terminal. `Catalog::fail_training_job` retires a
+    /// still-`pending` report to
+    /// `{"state":"undetermined","reason":"failed_before_probe"}` in the SAME
+    /// lease-guarded UPDATE (see its own doc) — which covers this function's
+    /// failure paths EXACTLY as long as each one goes through
+    /// `record_failed`. It does. Enumerated, so a path added later that
+    /// skips it is visibly outside this list rather than silently uncovered:
+    ///
+    /// | # | failure | terminal write |
+    /// |---|---|---|
+    /// | 1 | no `training_spec` at all | `mark_acceleration_undetermined` (a MORE specific `failed_before_device_resolution` reason, which the catalog edge preserves) then `record_failed` |
+    /// | 2 | undeserialisable `training_spec` | same as 1 |
+    /// | 3 | source SQL / loader reconstruction error (`read_source_columns`, `build_training_data_loader`, `reconstruct_graph_loader`) | `Err(Failed)` → `record_failed` |
+    /// | 4 | base-model load error, incl. a missing artifact (`model_cache().get_or_load`) | `Err(Failed)` → `record_failed` |
+    /// | 5 | base model exposes no embedding dim | `Err(Failed)` → `record_failed` |
+    /// | 6 | device-select error (`select_device`, inside `run_fine_tune_blocking` — BEFORE the probe) | `Err(Failed)` → `record_failed` |
+    /// | 7 | head/adapter construction error (`build_classification_head`, `build_distribution_head`, `build_encoder_adapters`, incl. `validate_backbone_precision`) — also before the probe | `Err(Failed)` → `record_failed` |
+    /// | 8 | typed training failure after the probe | `Err(Failed)` → `record_failed` (report is already `determined`) |
+    /// | 9 | `spawn_blocking` panic (caught) or join error | `Err(Failed)` → `record_failed` |
+    /// | 10 | final-artifact publish failure | `record_failed` |
+    /// | 11 | `register_model` failure | `record_failed` |
+    ///
+    /// The ONE deliberate exception is `Err(WorkerJobError::Cancelled)` (the
+    /// lease was lost, or a genuine error coincided with a lost lease — see
+    /// `classify`): this writes NO terminal status, because a different
+    /// worker now owns the job. Its `pending` marker is retired by the OTHER
+    /// half of the same catalog-edge rule —
+    /// `Catalog::reclaim_expired_training_jobs`' exhausted arm writes
+    /// `{"state":"undetermined","reason":"lease_expired_attempts_exhausted"}`,
+    /// and its requeue arm RESETS the column to `pending` for the fresh
+    /// attempt that will re-probe. Adding a `record_failed` here would be
+    /// wrong twice over: it would stamp `failed` over a job the re-claiming
+    /// worker is running, and its lease guard would not match anyway.
+    ///
+    /// `Self::publish_and_finalize`'s own `finalize_training_job`
+    /// `Ok(false)`/`Err` arms likewise leave the job `running` for reclaim —
+    /// those are POST-probe, so the report is already `determined` and the
+    /// tri-state contract is not at stake there.
     #[tracing::instrument(
         skip(self, session, record),
         fields(
@@ -2024,6 +2068,28 @@ async fn mark_acceleration_not_applicable(
 /// other esc-075 write uses — called BEFORE `record_failed` so the write
 /// still observes this attempt's `running` status (the lease guard requires
 /// it; `record_failed` flips the row to `failed` immediately after).
+///
+/// Campaign #446 finding 1 made this pre-mark REDUNDANT-but-preferred rather
+/// than load-bearing: `Catalog::fail_training_job` now retires ANY
+/// still-`pending` report to
+/// `{"state":"undetermined","reason":"failed_before_probe"}` at the catalog
+/// edge, so this path is covered even without the pre-mark. It is kept
+/// because its reason is strictly MORE specific (this job never even resolved
+/// a device, a fact the catalog edge cannot know), and the edge's rewrite is
+/// strictly `pending`-valued so it preserves this payload byte-for-byte.
+///
+/// **Never byte-compare a multi-key marker.** This function builds its JSON
+/// with `serde_json::json!`, whose default object is a `BTreeMap`, so the
+/// keys serialize ALPHABETICALLY (`{"reason":…,"state":…}`); jammi-db's own
+/// terminal markers are literal strings in declaration order
+/// (`{"state":…,"reason":…}`). The two producers therefore differ in byte
+/// order while carrying identical JSON. Every consumer parses (the Python
+/// binding, `expect_determined_report`, the catalog edge's own strictly-
+/// `pending`-valued `CASE`), so this is inert — but a future equality check
+/// against a marker with more than one key must compare parsed values, not
+/// bytes. The single-key `{"state":"pending"}` marker is the one exception,
+/// and it has exactly ONE producer (jammi-db's own `INSERT` const), which is
+/// what makes the catalog edge's byte match on it sound.
 async fn mark_acceleration_undetermined(
     catalog: &Arc<Catalog>,
     job_id: &str,

@@ -408,13 +408,13 @@ def test_training_verbs_have_identical_signatures_across_wheels():
 def test_remote_training_job_matches_the_local_handle_shape():
     """The client's `RemoteTrainingJob` carries the SAME handle surface as the
     embedded engine's `TrainingJob`: the `job_id` / `model_id` properties, the
-    `status()` / `wait()` methods, and `metrics()` (issue #441). A remote
-    `wait()` polls `TrainingStatus` and raises on a failed job with the wire
-    error, mirroring the local handle, so a caller treats the two
-    interchangeably."""
+    `status()` / `wait()` methods, `metrics()` (issue #441), and
+    `acceleration_report()` (esc-075, campaign #443). A remote `wait()` polls
+    `TrainingStatus` and raises on a failed job with the wire error, mirroring
+    the local handle, so a caller treats the two interchangeably."""
     local = jammi_native.TrainingJob
     remote = jammi.RemoteTrainingJob
-    for member in ("job_id", "model_id", "status", "wait", "metrics"):
+    for member in ("job_id", "model_id", "status", "wait", "metrics", "acceleration_report"):
         assert hasattr(remote, member), member
         assert hasattr(local, member), member
     # `job_id` / `model_id` are read-only attributes on both handles (a property

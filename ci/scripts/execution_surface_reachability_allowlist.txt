@@ -63,7 +63,7 @@ cargo clippy -p jammi-kernels --all-targets --features cuda -- -D warnings	T3 (p
 # own two-caller chain (gpu-prove.yml directly, and _gpu-prove-gate.yml via
 # three release-tag-scoped workflows) — neither is merge-path. ---
 cargo test -p jammi-server --features cuda,live-gpu-tests --test it grpc_embedding_gpu -- --nocapture --test-threads=1	runpod_gpu_prove.sh's served client/server GPU proof — needs a real A100.
-cargo test -p jammi-ai --features cuda,live-gpu-tests --test gpu_capability -- --nocapture --test-threads=1	runpod_gpu_prove.sh's engine-core GPU correctness suite — same residual as the row above.
+cargo test -p jammi-ai --features cuda,live-gpu-tests --test gpu_capability -- --nocapture --test-threads=1 --skip capability_surface	runpod_gpu_prove.sh's engine-core GPU correctness suite (campaign #443: skips capability_surface here — that test hard-requires JAMMI_KERNELS_STRICT=1 and runs in the script's own dedicated strict capability group instead) — same residual as the row above.
 cargo run -p jammi-bench --release --features cuda -- gpu-inference-scale	runpod_gpu_prove.sh's recorded-observability GPU embedding perf run (own comment: "non-gating") — same residual; this row exists for completeness, not because it was ever meant to gate a merge.
 cargo test -p jammi-kernels --features cuda -- --nocapture --test-threads=1	runpod_gpu_prove.sh's live `cuda_parity` run — same residual as the T2/`--no-run` compile-check row above, but the executed (not merely compiled) form.
 

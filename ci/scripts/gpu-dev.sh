@@ -722,6 +722,20 @@ bootstrap_or_die() {
 # --timing` (M6): the flock acquisition is the FIRST thing the detached
 # pane's own command does, so the lock's lifetime is the seed job's
 # lifetime, not this short-lived launcher's.
+#
+# Deliberately NOT given the `target` verb's own staged-caller-scripts fix
+# (deployment-gap note there): the seed BUILDS a CARGO_TARGET_DIR for the
+# pod's bootstrapped `/root/jammi-ai` checkout AT THE COMMIT that checkout
+# is actually on — running THIS laptop's own (possibly different-commit)
+# pod_seed_target.sh against that tree could seed against a workspace
+# member set / lockfile the checkout does not have, which is a worse
+# inconsistency than the one being avoided. No laptop-side preflight reads
+# a marker THIS script's version-specific behavior would need to agree
+# with (unlike pod_target_clone.sh's marker, which esc-077's
+# rp_target_preflight_lines DOES check) — the seed's own completion marker
+# (.jammi-seed-complete) is read by rp_seed_wait_script, whose OWN
+# reasonable expectations (a JSON marker existing/not) have not changed
+# across any version relevant here.
 start_seed_build() {
   local reseed_flag=""
   [ "$RESEED" = "1" ] && reseed_flag="--reseed"
@@ -1089,6 +1103,42 @@ EOF
 
   target)
     require_pod; rp_keep
+    # Deployment-gap fix (numerics r2 wave finding, folded into esc-077):
+    # this verb used to run `/root/jammi-ai/ci/scripts/pod_target_clone.sh`
+    # — the POD's own bootstrapped checkout, baked at boot time from
+    # whatever `main` was THEN, which can predate (or simply differ from)
+    # THIS laptop checkout by any number of commits. The esc-077 run-
+    # preflight (rp_target_preflight_lines, THIS checkout's own copy,
+    # always laptop-side) checks for a marker ONLY the matching version of
+    # pod_target_clone.sh knows to stamp — a pod booted before esc-077
+    # landed would clone successfully but stamp NOTHING, and the very next
+    # `run` would then refuse a perfectly legitimate clone. Fixed by
+    # STAGING this checkout's OWN copies of the pod-side scripts `target`
+    # depends on (never executing the pod's bootstrapped copies for this
+    # verb) — version consistency BY CONSTRUCTION, not by hoping the pod
+    # tree happens to be fresh, and immune to the SAME class of drift no
+    # matter which future commit adds the next pod-side behavior a local
+    # preflight needs to agree with.
+    #
+    # Four files, not just pod_target_clone.sh itself: it `.`-sources
+    # pod_seed_target.sh from ITS OWN directory (self-location via
+    # `${BASH_SOURCE[0]}`), and pod_provision_cutlass.sh (this verb's
+    # `--with-cutlass` arm) invokes pod_push_stamp.sh as a subprocess the
+    # SAME way — piping either script over a bare `ssh ... bash -s` stdin
+    # would break that self-location entirely (BASH_SOURCE[0] resolves to
+    # something with no real sibling directory). Staging all four into ONE
+    # fixed pod directory preserves both self-location relationships
+    # exactly as if this checkout's own ci/scripts/ had been pushed.
+    # `/root/.jammi-caller-scripts` is a single new path component directly
+    # under `/root` (which always exists on a booted pod), so rsync creates
+    # it unaided — no `rp_push_ensure_parent` needed (contrast `push`'s own
+    # `/root/trees/<name>`, two levels deep).
+    STAGE_DIR="/root/.jammi-caller-scripts"
+    rsync -az --no-owner --no-group -e "ssh ${RP_SSHO[*]} -p ${RP_PORT}" \
+      "$DIR/pod_target_clone.sh" "$DIR/pod_seed_target.sh" \
+      "$DIR/pod_provision_cutlass.sh" "$DIR/pod_push_stamp.sh" \
+      "root@${RP_HOST}:${STAGE_DIR}/" \
+      || { echo "::error::target: failed to stage this checkout's own pod-side scripts to ${STAGE_DIR} on the pod"; exit 1; }
     # NAME_TARGET_DIR is the CLONE destination (a CARGO_TARGET_DIR — build
     # OUTPUT), NAME_SOURCE_TREE_DIR is the tree's own SOURCE checkout — two
     # deliberately DIFFERENT directories (round-2 audit finding 1; see
@@ -1105,13 +1155,13 @@ EOF
       # test_pod_substrate.sh against the standalone script, not against
       # this remote invocation.
       cat | ssh "${RP_SSHO[@]}" -p "$RP_PORT" "root@${RP_HOST}" \
-        "bash /root/jammi-ai/ci/scripts/pod_target_clone.sh '' '${NAME_TARGET_DIR}' --verify"
+        "bash ${STAGE_DIR}/pod_target_clone.sh '' '${NAME_TARGET_DIR}' --verify"
       exit $?
     fi
     [ -n "$TARGET_NAME" ] || { echo "target: need a tree name"; exit 2; }
     rp_run_remote <<EOF
 set -uo pipefail
-bash /root/jammi-ai/ci/scripts/pod_target_clone.sh /root/.jammi-seed '${NAME_TARGET_DIR}'
+bash ${STAGE_DIR}/pod_target_clone.sh /root/.jammi-seed '${NAME_TARGET_DIR}'
 EOF
     rc=$?
     if [ "$rc" -eq 0 ] && [ "$TARGET_WITH_CUTLASS" = "1" ]; then
@@ -1126,10 +1176,14 @@ EOF
       # submodule fixture — see that file's own module doc for the
       # mechanism (source of truth: the tree's own push stamp;
       # provisioning: `cp -a` from /root/jammi-ai's initialised submodule,
-      # never `git submodule` inside the tree).
+      # never `git submodule` inside the tree). `/root/jammi-ai` in the
+      # ARGUMENT below (super-dir, the git checkout whose own initialised
+      # cutlass submodule gets copied FROM) is unrelated to the STAGE_DIR
+      # fix above — it names the real submodule content's location, never
+      # a script version.
       rp_run_remote <<EOF
 set -uo pipefail
-bash /root/jammi-ai/ci/scripts/pod_provision_cutlass.sh '${NAME_SOURCE_TREE_DIR}' /root/jammi-ai
+bash ${STAGE_DIR}/pod_provision_cutlass.sh '${NAME_SOURCE_TREE_DIR}' /root/jammi-ai
 EOF
       rc=$?
     fi

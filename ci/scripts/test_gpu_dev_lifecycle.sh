@@ -1870,6 +1870,72 @@ else
   bad "run (one-pod-per-wave): expected the concurrency preflight's generated text to compare against wave 'jammi-ai' by default: $(cat "$G10E_CAPTURE_DIR/3" 2>/dev/null || echo '<no call #3 captured>')"
 fi
 
+# ═════════════════════════════════════════════════════════════════════════
+# Group 11 (deployment-gap fix, folded into esc-077) — `target` must ship
+# THIS checkout's OWN pod-side scripts before executing them, never rely on
+# the pod's bootstrapped /root/jammi-ai copies (which predate esc-077 on
+# any pod booted before this PR merges, and would regress the same way any
+# time the pod tree lags the caller). rsync's own wire protocol cannot be
+# answered by the canned-text `ssh` stub the rest of this suite uses (it is
+# a real bidirectional handshake, not a single request/response) — instead
+# a fake `rsync` binary on PATH records its OWN argv, which is exactly the
+# observable this fix is about: did `target` ship this checkout's LOCAL
+# file paths, not merely "did some rsync happen".
+# ═════════════════════════════════════════════════════════════════════════
+G11_SESSION="g11target"; write_meta "$G11_SESSION" "pod-g11target" "8"
+
+G11_RSYNCBIN="$SANDBOX/g11-rsyncbin"; mkdir -p "$G11_RSYNCBIN"
+G11_RSYNC_CALLS="$SANDBOX/g11-rsync-calls.log"
+: > "$G11_RSYNC_CALLS"
+cat > "$G11_RSYNCBIN/rsync" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$G11_RSYNC_CALLS"
+exit 0
+STUB
+chmod +x "$G11_RSYNCBIN/rsync"
+
+G11_DIR="$SANDBOX/g11-ssh"; mkdir -p "$G11_DIR"
+write_ssh_resp "$G11_DIR" 1 0                                     # require_pod liveness
+write_ssh_resp "$G11_DIR" 2 0 "clone complete: /root/target-mytree"  # pod_target_clone.sh, via rp_run_remote
+rm -f "$SANDBOX/g11-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g11-counter" MOCK_SSH_RESPONSES_DIR="$G11_DIR" \
+  PATH="$G11_RSYNCBIN:$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" target "$G11_SESSION" mytree \
+  >"$SANDBOX/out-g11.log" 2>&1
+g11_rc=$?
+if grep -qF "$DIR/pod_target_clone.sh" "$G11_RSYNC_CALLS" \
+  && grep -qF "$DIR/pod_seed_target.sh" "$G11_RSYNC_CALLS" \
+  && grep -qF "$DIR/pod_provision_cutlass.sh" "$G11_RSYNC_CALLS" \
+  && grep -qF "$DIR/pod_push_stamp.sh" "$G11_RSYNC_CALLS" \
+  && grep -qF "/root/.jammi-caller-scripts/" "$G11_RSYNC_CALLS"; then
+  ok "target (deployment-gap fix): stages THIS checkout's own 4 pod-side scripts (never the pod's bootstrapped /root/jammi-ai copies) before executing them"
+else
+  bad "target (deployment-gap fix): expected an rsync call shipping this checkout's own pod_target_clone.sh/pod_seed_target.sh/pod_provision_cutlass.sh/pod_push_stamp.sh to /root/.jammi-caller-scripts/ (rc=$g11_rc); rsync calls: $(cat "$G11_RSYNC_CALLS" 2>/dev/null); out: $(cat "$SANDBOX/out-g11.log")"
+fi
+if [ "$g11_rc" -eq 0 ] && [ "$(cat "$SANDBOX/g11-counter" 2>/dev/null)" = "2" ]; then
+  ok "target (deployment-gap fix): the staging rsync precedes the clone call, which still runs (exactly 2 ssh calls: liveness + clone)"
+else
+  bad "target (deployment-gap fix): expected rc=0 and exactly 2 ssh calls after staging (got rc=$g11_rc, calls=$(cat "$SANDBOX/g11-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g11.log")"
+fi
+
+# --- 11b: --with-cutlass ALSO executes from the staged copy, not
+# /root/jammi-ai's bootstrapped pod_provision_cutlass.sh -----------------
+G11B_DIR="$SANDBOX/g11b-ssh"; mkdir -p "$G11B_DIR"
+write_ssh_resp "$G11B_DIR" 1 0
+write_ssh_resp "$G11B_DIR" 2 0 "clone complete: /root/target-mytree"
+write_ssh_resp "$G11B_DIR" 3 0 "cutlass provisioned"
+rm -f "$SANDBOX/g11b-counter"
+: > "$G11_RSYNC_CALLS"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g11b-counter" MOCK_SSH_RESPONSES_DIR="$G11B_DIR" \
+  PATH="$G11_RSYNCBIN:$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" target "$G11_SESSION" mytree --with-cutlass \
+  >"$SANDBOX/out-g11b.log" 2>&1
+g11b_rc=$?
+if [ "$g11b_rc" -eq 0 ] && [ "$(cat "$SANDBOX/g11b-counter" 2>/dev/null)" = "3" ] \
+  && grep -qF "$DIR/pod_provision_cutlass.sh" "$G11_RSYNC_CALLS"; then
+  ok "target --with-cutlass (deployment-gap fix): also stages + runs pod_provision_cutlass.sh from the staged copy (3 ssh calls: liveness + clone + cutlass)"
+else
+  bad "target --with-cutlass (deployment-gap fix): expected rc=0, exactly 3 ssh calls, and a staged pod_provision_cutlass.sh (got rc=$g11b_rc, calls=$(cat "$SANDBOX/g11b-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g11b.log")"
+fi
+
 echo
 echo "gpu-dev-lifecycle: ${PASS} passed, ${FAIL} failed, ${SKIP} skipped"
 [ "$FAIL" -eq 0 ]

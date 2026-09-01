@@ -779,6 +779,32 @@ DRV
     bad "(i) gpu-dev.sh's run case does not call rp_job_wrapper_with_marker_lines with (TREE_DIR, TARGET_DIR, JOB, RUN_TOKEN, TIMING, WAVE, TREE)"
   fi
 
+  # (i/deployment-gap) `target` must execute its OWN checkout's staged
+  # pod-side scripts (`/root/.jammi-caller-scripts/...`), never the pod's
+  # bootstrapped `/root/jammi-ai/ci/scripts/...` copies directly — a pod
+  # booted from an older `main` would otherwise run a pod_target_clone.sh
+  # that predates esc-077 and stamps no marker, and the very next `run`
+  # would refuse a perfectly legitimate clone. A structural check (rsync's
+  # own wire protocol cannot be driven through this file's mocked-ssh
+  # idiom at all — the SSH-mocked behavioral coverage for the actual rsync
+  # argv lives in test_gpu_dev_lifecycle.sh's Group 11).
+  GPU_DEV_SRC="$REPO_ROOT/ci/scripts/gpu-dev.sh"
+  if grep -q 'bash \${STAGE_DIR}/pod_target_clone.sh' "$GPU_DEV_SRC" \
+    && grep -q 'bash \${STAGE_DIR}/pod_provision_cutlass.sh' "$GPU_DEV_SRC" \
+    && grep -q 'bash \${STAGE_DIR}/pod_target_clone.sh .* --verify' "$GPU_DEV_SRC" \
+    && ! grep -q 'bash /root/jammi-ai/ci/scripts/pod_target_clone.sh' "$GPU_DEV_SRC" \
+    && ! grep -q 'bash /root/jammi-ai/ci/scripts/pod_provision_cutlass.sh' "$GPU_DEV_SRC"; then
+    ok "(i/deployment-gap) target's clone/--verify/--with-cutlass call sites all run from \${STAGE_DIR}, never gpu-dev.sh's old /root/jammi-ai/ci/scripts/... literal"
+  else
+    bad "(i/deployment-gap) expected every target call site to run from \${STAGE_DIR} and NONE to still hardcode /root/jammi-ai/ci/scripts/..."
+  fi
+  if grep -qF '"$DIR/pod_target_clone.sh" "$DIR/pod_seed_target.sh"' "$GPU_DEV_SRC" \
+    && grep -qF '"$DIR/pod_provision_cutlass.sh" "$DIR/pod_push_stamp.sh"' "$GPU_DEV_SRC"; then
+    ok "(i/deployment-gap) target's staging rsync ships all four THIS-checkout scripts pod_target_clone.sh needs (self-sources pod_seed_target.sh) and pod_provision_cutlass.sh needs (invokes pod_push_stamp.sh as a subprocess)"
+  else
+    bad "(i/deployment-gap) expected target's staging rsync to list pod_target_clone.sh, pod_seed_target.sh, pod_provision_cutlass.sh, and pod_push_stamp.sh as sources"
+  fi
+
   # rp_job_wrapper_with_marker_lines itself (round-N audit finding B3): same
   # env/cd/job carriage as rp_job_wrapper_lines above, PLUS the completion
   # marker wait-job actually reads, PLUS (one-pod-per-wave, WAVE-scoped) the

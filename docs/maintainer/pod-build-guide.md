@@ -364,6 +364,20 @@ ci/scripts/gpu-dev.sh target a100 mywork --with-cutlass   # ALSO requires the pu
 every other verb that acts on tree `mywork` (`run`/`attach`/`push`/`pull`)
 does, so pushing first is the ordinary flow in practice.)
 
+**Version consistency, by construction.** `target` stages THIS checkout's
+OWN `pod_target_clone.sh`/`pod_seed_target.sh`/`pod_provision_cutlass.sh`/
+`pod_push_stamp.sh` to `/root/.jammi-caller-scripts/` and runs THOSE, never
+the pod's bootstrapped `/root/jammi-ai` copies (baked at boot from whatever
+`main` was then) — a pod booted before a marker/behavior change like
+esc-077 landed would otherwise clone successfully with an OLDER
+`pod_target_clone.sh` that stamps no marker, and the very next `run` (whose
+own preflight is always THIS checkout's code) would refuse a perfectly
+legitimate clone. The seed build itself (`gpu-dev.sh up`/`shell`) is the one
+deliberate exception — it runs the pod's OWN bootstrapped
+`pod_seed_target.sh` against that SAME checkout's commit, since seeding a
+tree with a different commit's build script is a worse inconsistency than
+the one being avoided.
+
 Under the hood this is `pod_target_clone.sh <seed-dir> <dest-dir>
 [tree-dir]` (`ci/scripts/gpu-dev.sh:878-881`), which:
 

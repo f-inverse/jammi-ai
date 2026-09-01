@@ -149,7 +149,19 @@ echo "::group::served client/server GPU proof (jammi-server)"
 cargo test -p jammi-server --features cuda,live-gpu-tests --test it grpc_embedding_gpu -- --nocapture --test-threads=1 || rc=\$?
 echo "::endgroup::"
 echo "::group::engine-core GPU correctness (jammi-ai gpu_capability)"
-cargo test -p jammi-ai --features cuda,live-gpu-tests --test gpu_capability -- --nocapture --test-threads=1 || rc=\$?
+# \`--skip capability_surface\`: this generic sweep does not set
+# JAMMI_KERNELS_STRICT=1 (other gpu_capability tests legitimately exercise
+# the FALLBACK admission path, which strict mode would break), but
+# capability_surface.rs's own module doc REQUIRES strict mode and asserts
+# it at the top of the test (capability_surface.rs:425) — a real,
+# fail-closed guard, correctly tripping "wrong mode" here. It is NOT
+# skipped because it is unimportant: the dedicated capability-surface
+# group directly above already runs it, correctly, under
+# JAMMI_KERNELS_STRICT=1. Never weaken capability_surface's own guard and
+# never set strict mode on this generic sweep to work around it — do the
+# opposite (name-exclude it from the one group that cannot satisfy its
+# precondition).
+cargo test -p jammi-ai --features cuda,live-gpu-tests --test gpu_capability -- --nocapture --test-threads=1 --skip capability_surface || rc=\$?
 echo "::endgroup::"
 echo "::group::GPU embedding perf — recorded observability, non-gating (jammi-bench gpu-inference-scale)"
 cargo run -p jammi-bench --release --features cuda -- gpu-inference-scale || rc=\$?

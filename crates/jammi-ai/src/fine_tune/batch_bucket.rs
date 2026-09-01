@@ -22,32 +22,19 @@
 //! buckets)" — this module, and its call site in
 //! `TrainingLoop::encode_texts`.
 //!
-//! ## Design: power-of-two buckets, capped at `max_seq_length`
+//! ## Bucket DECISION lives in `jammi-numerics`, not here
 //!
-//! [`bucket_seq_len`] rounds a batch's own natural (`tokenizers::
-//! PaddingStrategy::BatchLongest`) padded width UP to the smallest bucket in
-//! the ladder `{MIN_BUCKET_LEN, 2*MIN_BUCKET_LEN, 4*MIN_BUCKET_LEN, ...,
-//! max_seq_length}`. Power-of-two doubling gives a BOUNDED bucket count —
-//! `ceil(log2(max_seq_length / MIN_BUCKET_LEN)) + 1` buckets regardless of
-//! how many distinct natural lengths a run's texts produce (for
-//! `max_seq_length = 128`, `MIN_BUCKET_LEN = 8`: `{8, 16, 32, 64, 128}`, 5
-//! buckets total) — matching the ledger's own "duplicated batches (a
-//! SINGLE repeated shape) plateau" finding by generalizing "one shape" to "a
-//! handful of shapes", which is enough to bound the allocator's distinct-size
-//! count for any run length. This is a UNIVERSAL engine mechanism: it runs
-//! for every dtype/objective through `TrainingLoop::encode_texts`'s single
-//! `EncoderAdapters` call site, never gated on `backbone_dtype` (esc-076's
-//! own symptom is f16-shaped only because admission today routes only f16 to
-//! the eager fallback at all — the allocator-fragmentation mechanism itself
-//! is dtype-independent, per the D3 doc's own "defect is dtype-INDEPENDENT
-//! in principle" finding).
-//!
-//! `MIN_BUCKET_LEN` floors the ladder so a run of very short texts does not
-//! still cycle through a `{1, 2, 4, ...}`-shaped ladder for no benefit (the
-//! per-shape allocator cost this fixes is roughly constant regardless of how
-//! small the shape is, so a coarser floor loses nothing while keeping the
-//! total bucket count — and therefore the worst-case wasted compute over
-//! padding — small).
+//! [`bucket_seq_len`] (re-exported from `jammi_numerics::bucket_seq_len`,
+//! see that function's own doc for the full ladder design and rationale) is
+//! a pure `usize -> usize` decision with no tensor/row dependency —
+//! `jammi-encoders`' own D3 GPU oracle
+//! (`tests/esc076_comparable_eager_control.rs`) needs the IDENTICAL decision
+//! to prove the fix bounds memory at the library seam, and campaign #443's
+//! dependency-direction rule forbids `jammi-encoders` depending on
+//! `jammi-ai` (this crate) — `jammi-numerics` is the shared, candle-free
+//! crate both already depend on, so the decision moved there; this module
+//! keeps only the row-mutating half ([`pad_rows_to_bucket`]) and its own
+//! call site.
 //!
 //! ## Correctness (K2/K7): padded positions are FULLY masked, never a wrong
 //! answer wearing a fixed shape
@@ -66,51 +53,13 @@
 //! output-invariance claim on a real encoder rather than asserting it from
 //! the padding contract alone.
 
-/// The smallest bucket length in the ladder [`bucket_seq_len`] rounds up to
-/// — see this module's doc for why a floor (not `{1, 2, 4, ...}`) is the
-/// right ladder.
-pub const MIN_BUCKET_LEN: usize = 8;
-
-/// Rounds `natural_len` (a batch's own tokenizer-padded width, already
-/// truncated to `max_seq_length` by the caller) UP to the smallest
-/// power-of-two bucket `>= natural_len`, floored at [`MIN_BUCKET_LEN`] and
-/// capped at `max_seq_length` — see this module's doc for the ladder and why
-/// it bounds the count of DISTINCT shapes a training run ever presents to
-/// the encoder.
-///
-/// `natural_len == 0` (an all-empty batch — never reachable from a real
-/// tokenizer call, since `[CLS]`/`[SEP]`-style special tokens make every row
-/// nonempty, but a defensive identity here rather than a bucket) and
-/// `max_seq_length == 0` both pass through unchanged: there is no
-/// well-formed bucket ladder to build over a zero-width sequence axis.
-///
-/// # Panics
-/// Never — this is a total function over `usize`.
-pub fn bucket_seq_len(natural_len: usize, max_seq_length: usize) -> usize {
-    if natural_len == 0 || max_seq_length == 0 {
-        return natural_len;
-    }
-    debug_assert!(
-        natural_len <= max_seq_length,
-        "bucket_seq_len's caller must already have truncated to max_seq_length \
-         (natural_len={natural_len} > max_seq_length={max_seq_length})"
-    );
-    let mut bucket = MIN_BUCKET_LEN.min(max_seq_length);
-    while bucket < natural_len && bucket < max_seq_length {
-        // Saturating: `max_seq_length` is a real, bounded config value (never
-        // anywhere near `usize::MAX`), so overflow here would itself be a
-        // caller error this function has no better response to than capping.
-        bucket = bucket.saturating_mul(2).min(max_seq_length);
-    }
-    // `natural_len` may still exceed the doubled ladder's own top rung only
-    // when `max_seq_length` sits strictly between two powers of two AND
-    // `natural_len` sits in that same gap above the ladder's last rung below
-    // `max_seq_length` — capping at `max_seq_length` (already applied above)
-    // is exactly the closing rung the ladder always ends on, so this is
-    // unreachable, kept as a debug-only invariant rather than trusted away.
-    debug_assert!(bucket >= natural_len.min(max_seq_length));
-    bucket
-}
+/// Re-exported from `jammi_numerics::bucket_seq_len`/`MIN_BUCKET_LEN` — see
+/// that function's own doc for the full ladder design, and this module's own
+/// doc ("Bucket DECISION lives in `jammi-numerics`, not here") for why the
+/// decision moved out of this crate. Re-exported (not merely called
+/// fully-qualified at the one call site below) so this file's own tests keep
+/// exercising the exact names this crate's call site imports.
+pub use jammi_numerics::{bucket_seq_len, MIN_BUCKET_LEN};
 
 /// Extends every row of `input_ids`/`attention_masks` (in place) from their
 /// current (equal, tokenizer-padded) width out to `bucketed_len`, with the

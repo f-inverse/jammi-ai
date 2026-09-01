@@ -51,14 +51,17 @@
 //! ## The four esc-076 vacuity controls, as implemented here
 //!
 //! 1. **ANTI-SIDESTEP** ([`assert_ran_eager`]): `JAMMI_KERNELS_DISABLE=all`
-//!    is set as the FIRST statement of the one `#[test]` in this file
-//!    (this file is its own Cargo-autodiscovered test binary/process, so
-//!    there is no other test racing `jammi_kernels::admission::disabled_ops`'s
+//!    is set as the FIRST statement of EVERY `#[test]` in this file (this
+//!    file is its own Cargo-autodiscovered test binary/process, so there is
+//!    no other test file racing `jammi_kernels::admission::disabled_ops`'s
 //!    process-wide `OnceLock` for who initializes it first — see that
 //!    function's own doc and `crates/jammi-bench/tests/finetune_step_kernel_disable.rs`'s
 //!    identical concern, resolved there by spawning a child process
-//!    instead; a single-test-per-binary file resolves it just as
-//!    completely without the subprocess indirection). [`assert_ran_eager`]
+//!    instead). This file's own tests are safe to run concurrently in the
+//!    SAME process (cargo's default) precisely BECAUSE every one of them
+//!    sets the identical value `"all"` — the `OnceLock` race the doc above
+//!    would matter for is between DIFFERENT disable configurations, never
+//!    between two writers agreeing on the same one. [`assert_ran_eager`]
 //!    reads [`jammi_encoders::ln_dispatch_snapshot`] (this crate's own
 //!    published counter, the same `LayerNormFused`/eager-fallback pair
 //!    every other dispatch-count oracle in this crate's own test suite
@@ -167,14 +170,30 @@
 //! wrap), this wave does NOT reach into `jammi-ai` to add bucketing:
 //! **the seam is reported here, precisely, for the lead to route.**
 //!
-//! [`esc076_variable_shape_eager_growth_vs_fixed_shape_control`] (below)
-//! is the committed reproduction of the growth mechanism at THIS crate's
-//! own seam (variable seq length per step vs a fixed-shape control at the
-//! identical step count) — it is EXPECTED TO FAIL until `jammi-ai` adds
-//! shape bucketing/padding at the batch-construction layer; a green result
-//! here without that upstream change would mean either the growth
-//! mechanism changed (re-open this attribution) or this oracle's own bound
-//! is miscalibrated, not that the escape is closed.
+//! [`esc076_variable_shape_unbucketed_reproduces_the_pre_fix_oom`] (below,
+//! `#[ignore]`d) is the committed reproduction of the growth mechanism at
+//! THIS crate's own seam (variable seq length per step vs a fixed-shape
+//! control at the identical step count) — it FAILS (RED) whenever run,
+//! by design, and is not part of the default green suite once the fix
+//! below landed; `fix-verifier` runs it explicitly (`--ignored`) as
+//! esc-076's RED oracle: revert `jammi-ai`'s bucketing fix and this test
+//! must fail the identical way it does today.
+//!
+//! **FOLLOW-UP (fix landed): `jammi-ai`'s sequence-length bucketing.**
+//! `crates/jammi-ai/src/fine_tune/batch_bucket.rs`, wired at
+//! `TrainingLoop::encode_texts`, now rounds each batch's natural width up
+//! to a small, fixed power-of-two bucket ladder before any tensor is
+//! built — the reporter-shape f16 leg completes on the pod (44.3GB flat)
+//! post-fix. The bucket DECISION itself
+//! (`bucket_seq_len`/`MIN_BUCKET_LEN`) lives in `jammi_numerics`
+//! (`crates/jammi-numerics/src/batch_shape.rs`) rather than `jammi-ai`,
+//! specifically so THIS crate's own D3 oracle
+//! ([`esc076_variable_shape_bucketed_completes_with_bounded_memory`],
+//! below) can call the IDENTICAL decision without depending on
+//! `jammi-ai` (the wrong dependency direction — `jammi-numerics` sits
+//! below both crates). That GREEN leg proves the fix bounds memory at
+//! THIS library seam directly, not merely inferred from `jammi-ai`'s own
+//! unit tests.
 //!
 //! **Pod finding, disclosed honestly (this branch's own landing run):** the
 //! FIRST attempt at [`VARIABLE_SHAPE_SEQS`] (five values, all `<=
@@ -826,6 +845,179 @@ fn run_leg_fixed_shape_same_step_count(
     }
 }
 
+/// The cap [`jammi_numerics::bucket_seq_len`] rounds each step's raw
+/// length up against — set to [`REPORTER_SEQ`] (`128`), matching the REAL
+/// `jammi-ai` trainer's own `effective_max` at the reporter shape (the
+/// SAME config the coordinator's own landing claim cites: "the
+/// reporter-shape f16 leg now completes on the pod (44.3GB flat)").
+///
+/// **POD FINDING (this branch's own landing run, disclosed honestly): a
+/// cap of `512` (matching [`VARIABLE_SHAPE_SEQS`]'s own raw maximum, this
+/// constant's FIRST value) does NOT green this leg** — bucketing to
+/// `{64, 128, 256, 512}` still visits `256`/`512`, and EACH of those
+/// individually costs tens of GB at this harness's shape (28-layer
+/// ModernBERT-large, 3-forward eager LoRA backward) — the leg OOM'd after
+/// 3 steps, identically to the un-bucketed RED leg. This is a REAL,
+/// important distinction bucketing does NOT erase: bucketing bounds the
+/// COUNT of distinct shapes within an ALREADY-reasonable `max_seq_length`
+/// ceiling; it does not lower that ceiling. A trainer configured with
+/// `max_seq_length = 512` and genuinely-512-token batches pays that cost
+/// regardless of bucketing — the lever for THAT is the `max_seq_length`
+/// config value itself, a data/config decision, not this mechanism. The
+/// coordinator's own "reporter-shape f16 leg... completes" claim is
+/// specifically about `max_seq_length = 128` (`REPORTER_SEQ`), so THAT is
+/// the cap this leg proves against — matching, not overreaching, the
+/// fix's real proven domain.
+const VARIABLE_SHAPE_BUCKET_CAP: usize = REPORTER_SEQ;
+
+/// The bucketed twin of [`run_leg_variable_shape`]: the IDENTICAL raw
+/// `VARIABLE_SHAPE_SEQS` cycle, but each step's raw length is FIRST
+/// truncated to [`VARIABLE_SHAPE_BUCKET_CAP`] (mirroring the REAL
+/// trainer's own tokenizer call, `tokenizer.encode_batch(&text_refs,
+/// Some(effective_max))`, which truncates BEFORE any bucketing ever runs —
+/// `crates/jammi-ai/src/fine_tune/trainer.rs`), then rounded UP through
+/// `jammi_numerics::bucket_seq_len` (the SAME candle-free decision that
+/// trainer calls next, via `crates/jammi-ai/src/fine_tune/batch_bucket.rs`)
+/// BEFORE any tensor is constructed. The extra `(bucketed_len - raw_len)`
+/// tail positions are padded with token id `0` and attention-mask `0` —
+/// the SAME trivial extend-with-zeros contract `jammi-ai`'s own
+/// `pad_rows_to_bucket` implements, re-stated inline here (a few lines)
+/// rather than IMPORTED, since `jammi-encoders` must not depend on
+/// `jammi-ai` (the wrong dependency direction for this workspace — only
+/// the candle-free bucket DECISION is shared, via `jammi-numerics`, never
+/// the row-mutation helper). This is the GREEN leg proving the fix AT ITS
+/// OWN PROVEN DOMAIN: truncate-then-bucket at `REPORTER_SEQ` collapses
+/// `VARIABLE_SHAPE_SEQS`'s 11 raw values (many `> REPORTER_SEQ`) down to
+/// just `{64, 128}` (2 distinct shapes, both already known-safe from the
+/// fixed-shape control) — completing without the un-bucketed
+/// [`run_leg_variable_shape`]'s pre-fix OOM.
+fn run_leg_variable_shape_bucketed(
+    dtype: DType,
+    config: &ModernBertConfig,
+    weights: &Path,
+    device: &Device,
+) -> LegOutcome {
+    let (model, varmap) = build_model(config, weights, dtype, device, /* with_lora */ true);
+    let trainable_vars = varmap.all_vars();
+    assert!(
+        !trainable_vars.is_empty(),
+        "sanity: with_lora=true must register at least one trainable Var (see run_leg's \
+         identical assertion)"
+    );
+    let mut optimizer = candle_nn::AdamW::new_lr(trainable_vars, 1e-4)
+        .unwrap_or_else(|e| panic!("esc076: AdamW::new_lr failed: {e}"));
+
+    // A row's ids/mask at the BUCKETED width: the first `raw_len` columns
+    // are real synthetic content (mirroring `synthetic_ids`'s own hash),
+    // the remaining `bucketed_len - raw_len` columns are pad id `0` /
+    // mask `0` — exactly `pad_rows_to_bucket`'s own contract, restated for
+    // a flat `(batch, bucketed_len)` tensor build.
+    let build_bucketed = |raw_len: usize, bucketed_len: usize, salt: u32| -> (Tensor, Tensor) {
+        let mut ids: Vec<u32> = Vec::with_capacity(REPORTER_BATCH * bucketed_len);
+        let mut mask: Vec<u32> = Vec::with_capacity(REPORTER_BATCH * bucketed_len);
+        for row in 0..REPORTER_BATCH {
+            for col in 0..bucketed_len {
+                if col < raw_len {
+                    let flat = (row * raw_len + col) as u32;
+                    ids.push(
+                        flat.wrapping_mul(2654435761).wrapping_add(salt) % config.vocab_size as u32,
+                    );
+                    mask.push(1);
+                } else {
+                    ids.push(0);
+                    mask.push(0);
+                }
+            }
+        }
+        (
+            Tensor::from_vec(ids, (REPORTER_BATCH, bucketed_len), device).unwrap(),
+            Tensor::from_vec(mask, (REPORTER_BATCH, bucketed_len), device).unwrap(),
+        )
+    };
+
+    let mut losses = Vec::with_capacity(VARIABLE_SHAPE_STEPS);
+    let mut free_mib_after_step = Vec::with_capacity(VARIABLE_SHAPE_STEPS);
+
+    for step in 0..VARIABLE_SHAPE_STEPS {
+        // Truncate FIRST (mirroring `tokenizer.encode_batch(&text_refs,
+        // Some(effective_max))`'s own truncation, which the real trainer
+        // runs BEFORE any bucketing) — a raw length above the cap is not a
+        // `bucket_seq_len` domain violation the caller silently walks into,
+        // it is the SAME "already truncated to max_seq_length" precondition
+        // that function's own doc states.
+        let raw_len = VARIABLE_SHAPE_SEQS[step % VARIABLE_SHAPE_SEQS.len()].min(REPORTER_SEQ);
+        let bucketed_len = jammi_numerics::bucket_seq_len(raw_len, VARIABLE_SHAPE_BUCKET_CAP);
+        let (anchor_ids, anchor_mask) = build_bucketed(raw_len, bucketed_len, 1);
+        let (positive_ids, _positive_mask) = build_bucketed(raw_len, bucketed_len, 2);
+        let (negative_ids, _negative_mask) = build_bucketed(raw_len, bucketed_len, 3);
+        // All three rows share the SAME mask (identical raw_len/bucketed_len
+        // per step, mirroring `run_leg_variable_shape`'s own single shared
+        // `mask` per step) — `_positive_mask`/`_negative_mask` are built
+        // (not skipped) so a future divergence in per-row padding would
+        // still construct a real tensor to compare against, even though
+        // this leg's own uniform-length-per-step design makes them
+        // identical to `anchor_mask` today.
+        let mask = anchor_mask;
+
+        let forward = |ids: &Tensor| -> Result<Tensor, jammi_encoders::EncoderError> {
+            model.forward(ids, &mask)
+        };
+        let step_result: Result<f32, jammi_encoders::EncoderError> = (|| {
+            let a = forward(&anchor_ids)?;
+            let p = forward(&positive_ids)?;
+            let n = forward(&negative_ids)?;
+            if step == 0 {
+                for (label, t) in [("anchor", &a), ("positive", &p), ("negative", &n)] {
+                    assert_eq!(
+                        t.dtype(),
+                        dtype,
+                        "[{dtype:?}] bucketed variable-shape {label}'s pooled output dtype is \
+                         {:?}, not the requested {dtype:?}",
+                        t.dtype()
+                    );
+                }
+            }
+            let a32 = a.to_dtype(DType::F32)?;
+            let p32 = p.to_dtype(DType::F32)?;
+            let n32 = n.to_dtype(DType::F32)?;
+            let cos_ap = (&a32 * &p32)?.sum(candle_core::D::Minus1)?;
+            let cos_an = (&a32 * &n32)?.sum(candle_core::D::Minus1)?;
+            let margin = 0.2f64;
+            let hinge = (cos_an - cos_ap)?.affine(1.0, margin)?.relu()?;
+            let loss = hinge.mean_all()?;
+            let loss_scalar = loss.to_scalar::<f32>()?;
+            optimizer.backward_step(&loss)?;
+            Ok(loss_scalar)
+        })();
+
+        match step_result {
+            Ok(loss) => {
+                losses.push(loss);
+                free_mib_after_step.push(cuda_free_mib(device));
+            }
+            Err(e) => {
+                let message = e.to_string();
+                return if message.contains("CUDA_ERROR_OUT_OF_MEMORY")
+                    || message.contains("OutOfMemory")
+                {
+                    LegOutcome::CudaOutOfMemory {
+                        steps_completed: step,
+                        free_mib_after_step,
+                        message,
+                    }
+                } else {
+                    LegOutcome::OtherError { message }
+                };
+            }
+        }
+    }
+
+    LegOutcome::Completed {
+        losses,
+        free_mib_after_step,
+    }
+}
+
 fn total_drop_mib(outcome: &LegOutcome) -> Option<f64> {
     let trace = match outcome {
         LegOutcome::Completed {
@@ -844,34 +1036,41 @@ fn total_drop_mib(outcome: &LegOutcome) -> Option<f64> {
     Some(trace[0] - trace[trace.len() - 1])
 }
 
-/// esc-076 D3(a): the variable-shape leg's own honest RED at the library
-/// seam. Runs BF16 (the escape's own comparable-eager arm's calibrated-good
-/// dtype — see `esc076_fully_eager_bf16_vs_f16_at_reporter_shape`'s
-/// `print_diagnosis`) fully-eager at [`VARIABLE_SHAPE_SEQS`] cycled
-/// round-robin, and its fixed-shape twin at the IDENTICAL step count, then
-/// asserts the two total-memory-drop traces are COMPARABLE — a
+/// esc-076 D3(a)'s ORIGINAL honest RED at the library seam — PRE-FIX
+/// reproduction, kept `#[ignore]`d now that the fix has landed
+/// (`crates/jammi-ai/src/fine_tune/batch_bucket.rs`, wired at
+/// `TrainingLoop::encode_texts`, campaign #443 follow-up). Runs BF16 (the
+/// escape's own comparable-eager arm's calibrated-good dtype — see
+/// `esc076_fully_eager_bf16_vs_f16_at_reporter_shape`'s `print_diagnosis`)
+/// fully-eager at [`VARIABLE_SHAPE_SEQS`] cycled round-robin, WITHOUT any
+/// bucketing (the pathological, pre-fix shape of a real variable-length
+/// trainer loop), and its fixed-shape twin at the IDENTICAL step count,
+/// then asserts the two total-memory-drop traces are COMPARABLE — a
 /// variable-shape leg that drops SUBSTANTIALLY more free memory than its
 /// own fixed-shape control over the SAME number of steps is measured,
 /// non-vacuous evidence of exactly the "distinct shapes keep growing"
-/// mechanism the ledger's MECHANISM PINNED finding names, reproduced here
-/// as a committed, re-runnable oracle rather than a scratchpad probe.
+/// mechanism the ledger's MECHANISM PINNED finding names.
 ///
-/// **This test is EXPECTED TO FAIL (RED) until the bounding fix lands** —
-/// per campaign #443's own fold-the-fix discipline ("this wave delivers
-/// the DIAGNOSIS and the control test, not the fix" — the SAME discipline
-/// `esc076_fully_eager_bf16_vs_f16_at_reporter_shape`'s `print_diagnosis`
-/// states for itself) and per D3(c)'s finding (this file's own doc, D3
-/// ATTRIBUTION section, added by campaign #443 W2c): the natural bounding
-/// seam is batch-shape bucketing/padding in `jammi-ai`'s trainer/data
-/// layer, which this crate's own worktree scope does not touch
-/// (extend-seams-not-upstream: the fix belongs at the seam that CONTROLS
-/// how many distinct shapes the eager composition ever sees, not inside
-/// the composition itself). A relative (never absolute) bound: `k = 3.0`
-/// applied to the fixed-shape leg's OWN drop (comparable_eager oracle
-/// design rule — a bound relative to the SAME run's own baseline, never a
-/// constant pulled from a different session).
+/// **`#[ignore]`d by default so the branch's GPU suite is green** — this
+/// test's OWN job now is being esc-076's RED oracle for `fix-verifier`
+/// (revert the bucketing fix, this test must fail the SAME way it did
+/// before the fix landed; confirm it, then re-apply the fix) — run it
+/// explicitly with `cargo test -- --ignored
+/// esc076_variable_shape_unbucketed_reproduces_the_pre_fix_oom`. It is
+/// EXPECTED TO fail (OOM) whenever it runs, by design: this is the
+/// UNBUCKETED path, which the fix's own point is to make unreachable from
+/// `jammi-ai`'s real trainer (see
+/// [`esc076_variable_shape_bucketed_completes_with_bounded_memory`] below
+/// for the GREEN, post-fix leg proving the SAME shape cycle completes once
+/// bucketed). A relative (never absolute) bound: `k = 3.0` applied to the
+/// fixed-shape leg's OWN drop (comparable_eager oracle design rule — a
+/// bound relative to the SAME run's own baseline, never a constant pulled
+/// from a different session).
 #[test]
-fn esc076_variable_shape_eager_growth_vs_fixed_shape_control() {
+#[ignore = "esc-076 pre-fix RED reproduction (unbucketed eager growth) -- \
+            run explicitly by fix-verifier with --ignored, not part of the \
+            default green suite; see this fn's own doc"]
+fn esc076_variable_shape_unbucketed_reproduces_the_pre_fix_oom() {
     std::env::set_var("JAMMI_KERNELS_DISABLE", "all");
 
     let Some(device) = cuda_device() else {
@@ -967,6 +1166,131 @@ fn esc076_variable_shape_eager_growth_vs_fixed_shape_control() {
          module doc's D3 ATTRIBUTION section for the seam this fix belongs at.",
         var_drop / fixed_drop.max(1.0),
         GROWTH_RATIO_BOUND
+    );
+}
+
+/// esc-076 D3 FIX VERIFICATION (GREEN, runs by default): the SAME
+/// [`VARIABLE_SHAPE_SEQS`] cycle the pre-fix RED leg
+/// ([`esc076_variable_shape_unbucketed_reproduces_the_pre_fix_oom`], above,
+/// `#[ignore]`d) OOMs on, except each step's raw length is FIRST truncated
+/// to [`VARIABLE_SHAPE_BUCKET_CAP`] (`REPORTER_SEQ` — mirroring the real
+/// trainer's own tokenizer truncation, `Some(effective_max)`) and THEN
+/// rounded up through `jammi_numerics::bucket_seq_len` — the SAME
+/// candle-free decision `jammi-ai`'s own trainer now calls at its
+/// batch-construction seam (`crates/jammi-ai/src/fine_tune/trainer.rs`,
+/// via `crates/jammi-ai/src/fine_tune/batch_bucket.rs`). Collapses
+/// `VARIABLE_SHAPE_SEQS`'s 11 raw values (most `> REPORTER_SEQ`) down to
+/// just `{64, 128}` (2 distinct shapes, [`VARIABLE_SHAPE_BUCKET_CAP`]'s own
+/// doc) — this proves the fix AT its own claimed domain (the reporter
+/// shape, `max_seq_length = REPORTER_SEQ`), at the `jammi-encoders`
+/// library seam directly (never through `jammi-ai`, which this crate must
+/// not depend on) rather than only inferred from `jammi-ai`'s own unit
+/// tests. See [`VARIABLE_SHAPE_BUCKET_CAP`]'s own doc for the POD FINDING
+/// that a cap matching the RAW range's own maximum (`512`) does NOT green
+/// this leg — bucketing bounds shape COUNT, not shape AMPLITUDE, and this
+/// leg is deliberately scoped to the domain where the fix's own landing
+/// claim was measured.
+///
+/// Asserts BOTH: (a) every one of `VARIABLE_SHAPE_STEPS` steps completes
+/// with a finite loss (never merely "did not panic" — KO-2/family F), and
+/// (b) the bucketed leg's own total free-memory drop stays within the SAME
+/// `3x`-of-its-fixed-shape-control bound the pre-fix RED leg uses to prove
+/// the OPPOSITE outcome — bucketing should genuinely BOUND this leg's
+/// memory behavior, not merely happen not to OOM at this run's particular
+/// step count.
+#[test]
+fn esc076_variable_shape_bucketed_completes_with_bounded_memory() {
+    std::env::set_var("JAMMI_KERNELS_DISABLE", "all");
+
+    let Some(device) = cuda_device() else {
+        return;
+    };
+
+    let config = modernbert_large_config();
+    let dir = tempfile::tempdir().expect("tempdir for synthetic checkpoint");
+    let weights_path = dir.path().join("model.safetensors");
+    write_synthetic_checkpoint(&config, &weights_path);
+
+    let bucketed_outcome = assert_ran_eager("variable_shape_bucketed_bf16", || {
+        run_leg_variable_shape_bucketed(DType::BF16, &config, &weights_path, &device)
+    });
+    let fixed_outcome =
+        assert_ran_eager("fixed_shape_bf16_same_step_count_bucketed_control", || {
+            run_leg_fixed_shape_same_step_count(DType::BF16, &config, &weights_path, &device)
+        });
+
+    println!(
+        "[esc-076 D3 FIX] bucketed variable-shape bf16 ({VARIABLE_SHAPE_STEPS} steps, raw \
+         seqs={VARIABLE_SHAPE_SEQS:?}, bucket cap={VARIABLE_SHAPE_BUCKET_CAP}): {}",
+        match &bucketed_outcome {
+            LegOutcome::Completed {
+                free_mib_after_step,
+                ..
+            } => summarize_free_mib_trace(free_mib_after_step),
+            LegOutcome::CudaOutOfMemory {
+                steps_completed,
+                free_mib_after_step,
+                message,
+            } => format!(
+                "CudaOutOfMemory after {steps_completed} steps -- {message}; trace so far: {}",
+                summarize_free_mib_trace(free_mib_after_step)
+            ),
+            LegOutcome::OtherError { message } => format!("OtherError -- {message}"),
+        }
+    );
+
+    match &bucketed_outcome {
+        LegOutcome::Completed { losses, .. } => {
+            assert_eq!(
+                losses.len(),
+                VARIABLE_SHAPE_STEPS,
+                "the bucketed leg must complete EVERY step, not merely more than the un-bucketed \
+                 leg's own partial 3-step run"
+            );
+            for (step, loss) in losses.iter().enumerate() {
+                assert!(
+                    loss.is_finite(),
+                    "[esc-076 D3 FIX] step {step} completed but loss is non-finite ({loss}) -- a \
+                     completing bucketed leg must produce a genuinely finite result at EVERY \
+                     step, never a silently-propagated NaN/inf read as success"
+                );
+            }
+        }
+        other => panic!(
+            "[esc-076 D3 FIX] the bucketed variable-shape leg must COMPLETE now that jammi-ai's \
+             sequence-length bucketing fix has landed -- got {other:?} instead. Either the fix \
+             regressed, or this leg's own shape/step budget needs re-measuring against the fix's \
+             own bucket ladder."
+        ),
+    }
+
+    let (Some(bucketed_drop), Some(fixed_drop)) = (
+        total_drop_mib(&bucketed_outcome),
+        total_drop_mib(&fixed_outcome),
+    ) else {
+        println!(
+            "[esc-076 D3 FIX] INCONCLUSIVE on the drop-ratio bound: a trace was too short to \
+             compare (the completion assertion above already establishes the primary GREEN \
+             claim)."
+        );
+        return;
+    };
+    println!(
+        "[esc-076 D3 FIX] total_drop_mib: bucketed-variable={bucketed_drop:.1} \
+         fixed-shape={fixed_drop:.1} ratio={:.2}",
+        bucketed_drop / fixed_drop.max(1.0)
+    );
+    const GROWTH_RATIO_BOUND: f64 = 3.0;
+    assert!(
+        bucketed_drop <= GROWTH_RATIO_BOUND * fixed_drop.max(1.0),
+        "[esc-076 D3 FIX] bucketed variable-shape eager composition dropped {bucketed_drop:.1} \
+         MiB of free memory over {VARIABLE_SHAPE_STEPS} steps vs {fixed_drop:.1} MiB for its \
+         fixed-shape control -- a {:.2}x ratio, past the SAME {GROWTH_RATIO_BOUND}x bound the \
+         pre-fix RED leg (above, #[ignore]d) uses to prove the OPPOSITE outcome -- bucketing \
+         should collapse this leg's own distinct-shape count down to {{64,128}} (2 buckets \
+         total, matching the ledger's own duplicated-shape-plateaus finding), not merely \
+         shrink the un-bucketed growth without genuinely bounding it.",
+        bucketed_drop / fixed_drop.max(1.0)
     );
 }
 

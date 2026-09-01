@@ -1542,8 +1542,7 @@ impl TrainingLoop {
                 // output-invariant. Every dtype/objective through this ONE
                 // `EncoderAdapters` call site is bucketed uniformly — never
                 // an f16-specific knob.
-                let cols =
-                    crate::fine_tune::batch_bucket::bucket_seq_len(natural_cols, effective_max);
+                let cols = jammi_numerics::bucket_seq_len(natural_cols, effective_max);
                 crate::fine_tune::batch_bucket::pad_rows_to_bucket(
                     &mut encoding.input_ids,
                     cols,

@@ -37,6 +37,8 @@ use jammi_server::grpc::proto::training::{
 use jammi_test_utils::{cookbook_fixture, fixture_url};
 use tonic::transport::Channel;
 
+#[cfg(feature = "train")]
+use super::common::grpc::start_engine_server_worker_quiesced;
 use super::common::grpc::{
     channel, start_engine_server, tenant_a, with_session, EngineServer, TENANT_A,
 };
@@ -845,11 +847,146 @@ async fn register_acceleration_test_model(catalog: &jammi_db::catalog::Catalog, 
 
 /// K4 (esc-075): a submitted job's `TrainingStatus.acceleration_report_json`
 /// matches the catalog's `training_jobs.acceleration_report` column
-/// byte-for-byte, immediately post-submission — the explicit `{"state":
+/// byte-for-byte, in the submission-time state — the explicit `{"state":
 /// "pending"}` marker `create_training_job` writes, never `NULL`. This is the
 /// divergence-prone tri-state field, not a single-scalar happy path.
+///
+/// THE READ POINT IS QUIESCED BY CONSTRUCTION (#446 finding 8): this fixture is
+/// [`start_engine_server_worker_quiesced`], whose embedded training worker has
+/// been stopped AND joined before the fixture returns, so between the submit and
+/// the two reads below there is NO claimant that could move the marker off
+/// `pending`. Reading the pre-claim state under the production fixture (worker
+/// running) is a TOCTOU: the worker claims a `queued` row on its first tick with
+/// no initial sleep, so on a slow runner the claim lands first — see
+/// `an_eagerly_running_worker_moves_the_acceleration_marker_off_pending` below,
+/// the control that demonstrates the mutation is real. The fix is the quiesced
+/// read point, NOT a weaker "pending-or-terminal" assertion: the byte-exact
+/// marker IS the K4 oracle and stays byte-exact.
+///
+/// Then the worker is released and the SAME parity assertion is re-run at the
+/// second quiesced point — the job's terminal state, with the worker stopped
+/// again — so the wire↔embedded byte-equality is pinned on both ends of the
+/// job's life, each read where nothing can mutate the row.
+#[cfg(feature = "train")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn training_status_acceleration_report_pending_state_matches_the_catalog_record() {
+    let server = start_engine_server_worker_quiesced().await;
+    add_training_source(
+        channel(server.addr).await,
+        None::<fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>>,
+    )
+    .await;
+    let mut client = TrainingServiceClient::new(channel(server.addr).await);
+
+    let start = client
+        .start_training(start_request())
+        .await
+        .expect("start_training")
+        .into_inner();
+
+    // Quiesced read point #1 — post-submission, pre-claim: no worker exists in
+    // this process and the catalog is the fixture's own temp dir, so no other
+    // claimant can exist either. The wire field and the embedded catalog read
+    // must carry the identical pending marker.
+    let resp = client
+        .training_status(TrainingStatusRequest {
+            job_id: start.job_id.clone(),
+        })
+        .await
+        .expect("training_status")
+        .into_inner();
+    let embedded = server
+        .engine
+        .catalog()
+        .get_training_job(&start.job_id)
+        .await
+        .expect("get_training_job");
+    // The fixture's quiescence is itself asserted, so this test can never pass
+    // vacuously against a job that was already claimed: a claimed row's status
+    // is `running`/terminal, never `queued`.
+    assert_eq!(
+        resp.status, "queued",
+        "the quiesced fixture must leave the submitted job unclaimed — a \
+         non-`queued` status here means a claimant ran and the read below is \
+         no longer a pre-claim read"
+    );
+    assert_eq!(
+        resp.acceleration_report_json.as_deref(),
+        Some(r#"{"state":"pending"}"#),
+        "a freshly submitted job's wire acceleration_report_json must carry the \
+         explicit pending marker, never absent or empty"
+    );
+    assert_eq!(
+        resp.acceleration_report_json, embedded.acceleration_report,
+        "TrainingStatus.acceleration_report_json must BYTE-EQUAL the embedded \
+         catalog record's acceleration_report column for the SAME job"
+    );
+
+    // Release the worker: the identical `EmbeddedWorker` the `train` tier
+    // spawns, over the identical engine session the server drives. The job now
+    // runs, and its terminal state is awaited through the PUBLIC wire surface.
+    let worker = server.spawn_training_worker();
+    let terminal = poll_until_terminal(&mut client, &start.job_id).await;
+    assert_eq!(
+        terminal.status, "completed",
+        "the released worker must run the submitted job to completion, got '{}' \
+         (error: {})",
+        terminal.status, terminal.error
+    );
+
+    // Quiesced read point #2 — the job is terminal AND the worker is stopped and
+    // joined again, so nothing can write the row between the two reads below.
+    worker
+        .stop_and_join()
+        .await
+        .expect("stop the released training worker");
+    let after = client
+        .training_status(TrainingStatusRequest {
+            job_id: start.job_id.clone(),
+        })
+        .await
+        .expect("training_status")
+        .into_inner();
+    let embedded_after = server
+        .engine
+        .catalog()
+        .get_training_job(&start.job_id)
+        .await
+        .expect("get_training_job");
+    assert_eq!(
+        after.acceleration_report_json, embedded_after.acceleration_report,
+        "at the job's terminal state the wire acceleration_report_json must \
+         still BYTE-EQUAL the embedded catalog record's column"
+    );
+    assert_eq!(
+        acceleration_state(after.acceleration_report_json.as_deref()),
+        Some("determined".to_string()),
+        "a completed job's report must have moved off the pending marker to the \
+         determined state, got {:?}",
+        after.acceleration_report_json
+    );
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// NON-VACUITY CONTROL for the quiesced fixture above (#446 finding 8): under
+/// the PRODUCTION fixture — `start_engine_server`, whose `train` tier spawns and
+/// keeps an embedded worker — the submission-time `{"state":"pending"}` marker
+/// is a TRANSIENT observable, not a stable one. This test submits the same job,
+/// lets the running worker claim it, and shows that once the job is observed
+/// claimed-and-terminal the very same field no longer reads `pending`.
+///
+/// That is exactly the mutation the old assertion shape raced: a byte-exact
+/// `pending` assert placed after the submit, against a fixture with a live
+/// worker, is asserting a value the worker is concurrently overwriting. This
+/// control fails if that mutation ever stops happening — which would make the
+/// quiesced read point above pointless — so the fix cannot rot into a no-op.
+#[cfg(feature = "train")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_eagerly_running_worker_moves_the_acceleration_marker_off_pending() {
+    // The production fixture: the `train` tier's embedded worker is running and
+    // claims `queued` rows on its first tick.
     let server = start_engine_server().await;
     add_training_source(
         channel(server.addr).await,
@@ -864,35 +1001,52 @@ async fn training_status_acceleration_report_pending_state_matches_the_catalog_r
         .expect("start_training")
         .into_inner();
 
-    // Immediately post-submission, before any completion race: the wire field
-    // and the embedded catalog read must carry the identical pending marker.
-    let resp = client
-        .training_status(TrainingStatusRequest {
-            job_id: start.job_id.clone(),
-        })
-        .await
-        .expect("training_status")
-        .into_inner();
-    let embedded = server
-        .engine
-        .catalog()
-        .get_training_job(&start.job_id)
-        .await
-        .expect("get_training_job");
+    // Observe the job past the claim, at a terminal state (the one point that IS
+    // stable under a running worker).
+    let terminal = poll_until_terminal(&mut client, &start.job_id).await;
     assert_eq!(
-        resp.acceleration_report_json.as_deref(),
+        terminal.status, "completed",
+        "the eager worker must run the submitted job to completion, got '{}' \
+         (error: {})",
+        terminal.status, terminal.error
+    );
+    assert_ne!(
+        terminal.acceleration_report_json.as_deref(),
         Some(r#"{"state":"pending"}"#),
-        "a freshly submitted job's wire acceleration_report_json must carry the \
-         explicit pending marker, never absent or empty"
+        "CONTROL: a claimed-and-run job's report must NOT still read the \
+         submission-time pending marker — if it did, the pending marker would \
+         be stable and the quiesced fixture unnecessary"
     );
     assert_eq!(
-        resp.acceleration_report_json, embedded.acceleration_report,
-        "TrainingStatus.acceleration_report_json must BYTE-EQUAL the embedded \
-         catalog record's acceleration_report column for the SAME job"
+        acceleration_state(terminal.acceleration_report_json.as_deref()),
+        Some("determined".to_string()),
+        "CONTROL: the claiming worker overwrites the pending marker with the \
+         determined report, got {:?}",
+        terminal.acceleration_report_json
     );
 
     let _ = server.shutdown.send(());
     let _ = server.handle.await;
+}
+
+/// The `state` discriminant of an `acceleration_report_json` field, or `None`
+/// for the field-absent (legacy `NULL`) case. Panics on a present-but-malformed
+/// payload — a report that is not valid JSON with a string `state` is its own
+/// loud failure, never folded into "absent".
+fn acceleration_state(field: Option<&str>) -> Option<String> {
+    let raw = field?;
+    let value: serde_json::Value = serde_json::from_str(raw).unwrap_or_else(|e| {
+        panic!("acceleration_report_json is not valid JSON: {e} (raw={raw:?})")
+    });
+    Some(
+        value
+            .get("state")
+            .and_then(|s| s.as_str())
+            .unwrap_or_else(|| {
+                panic!("acceleration_report_json carries no string `state`: {value}")
+            })
+            .to_string(),
+    )
 }
 
 /// K4 (esc-075), the determined-state and legacy-NULL halves: a claiming
@@ -998,18 +1152,15 @@ async fn remote_caller_distinguishes_acceleration_report_tri_state_purely_from_t
     }
 
     /// Classify purely off the wire response — no catalog / engine access.
+    /// Reads the `state` discriminant through the one shared
+    /// [`acceleration_state`] decoder, so this control and the pending/terminal
+    /// assertions above cannot drift into two different notions of "the state".
     fn classify(field: Option<&str>) -> AccelerationState {
-        match field {
+        match acceleration_state(field).as_deref() {
             None => AccelerationState::LegacyUnknown,
-            Some(raw) => {
-                let value: serde_json::Value =
-                    serde_json::from_str(raw).expect("acceleration_report_json is valid JSON");
-                match value.get("state").and_then(|s| s.as_str()) {
-                    Some("pending") => AccelerationState::Pending,
-                    Some("determined") => AccelerationState::Determined,
-                    other => panic!("unrecognized acceleration_report state: {other:?}"),
-                }
-            }
+            Some("pending") => AccelerationState::Pending,
+            Some("determined") => AccelerationState::Determined,
+            other => panic!("unrecognized acceleration_report state: {other:?}"),
         }
     }
 

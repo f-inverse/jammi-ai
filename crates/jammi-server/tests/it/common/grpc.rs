@@ -108,19 +108,42 @@ pub struct EngineServer {
     pub engine: Arc<InferenceSession>,
 }
 
+impl EngineServer {
+    /// Start a training worker over the SAME engine session this server drives,
+    /// returning the RAII guard that owns its loop (dropping the guard stops it).
+    ///
+    /// The release valve for [`start_engine_server_worker_quiesced`]: a test
+    /// reads a submitted job's pre-claim state while nothing can claim it, then
+    /// calls this to let the job actually run, and awaits its terminal state
+    /// through the public surface. A worker is a worker regardless of who
+    /// spawned it — this is the identical `EmbeddedWorker` the `train` tier
+    /// starts, over the identical session — so releasing here restores the
+    /// production shape rather than simulating it.
+    #[cfg(feature = "train")]
+    pub fn spawn_training_worker(&self) -> jammi_ai::fine_tune::worker::EmbeddedWorker {
+        jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&self.engine)
+            .expect("the test config's worker intervals are valid")
+    }
+}
+
 /// Spin up an in-process gRPC server hosting the chain *with* the engine-backed
 /// services, mounting every compiled-in tier **except** the event tier (no
 /// trigger handles). Shared by the `grpc_inference`, `grpc_eval`,
 /// `grpc_introspection`, and `grpc_training` suites so they drive the same
 /// wiring the embedding suite does.
 pub async fn start_engine_server() -> EngineServer {
-    // Every compiled-in optional tier except event — the engine-backed serve +
-    // eval + (when compiled) train surface, without the trigger stream.
+    start_engine_server_with_tiers(non_event_tiers()).await
+}
+
+/// Every compiled-in optional tier except event — the engine-backed serve +
+/// eval + (when compiled) train surface, without the trigger stream. The tier
+/// set [`start_engine_server`] and [`start_engine_server_worker_quiesced`]
+/// share, so the two fixtures mount the identical surface.
+fn non_event_tiers() -> jammi_server::tiers::TierSet {
     let optional = jammi_server::tiers::ServiceTier::OPTIONAL
         .into_iter()
         .filter(|t| *t != jammi_server::tiers::ServiceTier::Event && t.compiled_in());
-    let tiers = jammi_server::tiers::TierSet::resolve(optional).expect("non-event tiers resolve");
-    start_engine_server_with_tiers(tiers).await
+    jammi_server::tiers::TierSet::resolve(optional).expect("non-event tiers resolve")
 }
 
 /// Like [`start_engine_server`] but also mounts the trigger handles (the event
@@ -138,6 +161,40 @@ pub async fn start_engine_server_with_trigger() -> EngineServer {
 /// no way to construct a fixture whose handshake lies about its mount set.
 /// Used by the tier-gating tests to stand up serve-only / serve+train / etc.
 pub async fn start_engine_server_with_tiers(tiers: jammi_server::tiers::TierSet) -> EngineServer {
+    // Assemble the chain at the loopback ephemeral address and hand it to
+    // `spawn_bound_chain`, which binds the listener EAGERLY and serves on it —
+    // the port is held from bind through serve, so `addr` names a port no
+    // concurrent test process can have stolen.
+    let (chain, engine, dir) = engine_chain_at(ephemeral_addr(), tiers).await;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let (addr, handle) = spawn_bound_chain(chain, shutdown_rx).await;
+
+    EngineServer {
+        addr,
+        shutdown: shutdown_tx,
+        _dir: dir,
+        handle,
+        engine,
+    }
+}
+
+/// Build the engine-backed [`jammi_server::runtime::GrpcChain`] the fixtures
+/// above and below assemble: a fresh engine session over a temp artifact dir,
+/// mounting exactly `tiers`, addressed at `addr`. Returns the chain plus the
+/// shared engine handle and the `TempDir` that roots its artifacts.
+///
+/// The single expression of that wiring, so the eager-bind fixture
+/// ([`start_engine_server_with_tiers`]) and the worker-quiesced fixture
+/// ([`start_engine_server_worker_quiesced`]) cannot drift into serving
+/// different surfaces.
+async fn engine_chain_at(
+    addr: SocketAddr,
+    tiers: jammi_server::tiers::TierSet,
+) -> (
+    jammi_server::runtime::GrpcChain,
+    Arc<InferenceSession>,
+    TempDir,
+) {
     let dir = tempfile::tempdir().expect("tempdir");
     let cfg = test_config(dir.path());
     // `open` (not `new`) so the engine-backed server registers the compound
@@ -155,14 +212,9 @@ pub async fn start_engine_server_with_tiers(tiers: jammi_server::tiers::TierSet)
             subscriber: session.subscriber(),
         });
 
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let engine = Arc::clone(&session);
-    // Assemble the chain at the loopback ephemeral address and hand it to
-    // `spawn_bound_chain`, which binds the listener EAGERLY and serves on it —
-    // the port is held from bind through serve, so `addr` names a port no
-    // concurrent test process can have stolen.
     let chain = jammi_server::runtime::GrpcChain {
-        addr: ephemeral_addr(),
+        addr,
         flight_ctx: session.context().clone(),
         flight_binding: session.tenant_binding_arc(),
         store: store.clone(),
@@ -172,7 +224,72 @@ pub async fn start_engine_server_with_tiers(tiers: jammi_server::tiers::TierSet)
         metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
         tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(store),
     };
-    let (addr, handle) = spawn_bound_chain(chain, shutdown_rx).await;
+    (chain, engine, dir)
+}
+
+/// Spin up the SAME engine-backed server [`start_engine_server`] does (identical
+/// tier set, identical chain), but with the `train` tier's embedded
+/// `EmbeddedWorker` STOPPED AND JOINED before this returns: the fixture hands
+/// back a server with **no in-process claimant** for the `training_jobs` queue.
+///
+/// Why: `assemble_grpc_chain` spawns that worker as soon as the `train` tier is
+/// mounted, and its loop claims a `queued` row on its very first tick with no
+/// initial sleep. A test that submits a job and then reads a PRE-CLAIM field of
+/// it (the submission-time `{"state":"pending"}` acceleration marker, the
+/// `queued` status) is therefore racing the worker: on a slow runner the claim
+/// lands first and the read observes a post-claim value. Reading at a quiesced
+/// point removes that TOCTOU BY CONSTRUCTION, rather than weakening the
+/// assertion to "pre-claim or post-claim" (which would stop being an oracle).
+///
+/// The worker guard reaches the fixture through the engine's OWN public
+/// composability seam — `AssembledChain::into_layered_axum_router`'s
+/// `ChainParts::train_worker`, documented as a lifetime the downstream owns —
+/// so no test-only construction seam is added to the server.
+/// `EmbeddedWorker::stop_and_join` AWAITS the loop task's return, so once this
+/// fixture returns the loop is provably gone, not merely signalled; nothing
+/// else can claim, because the catalog is this fixture's own temp dir.
+///
+/// A test releases work when it wants it via
+/// [`EngineServer::spawn_training_worker`], which starts a worker over the very
+/// same engine session the server drives.
+#[cfg(feature = "train")]
+pub async fn start_engine_server_worker_quiesced() -> EngineServer {
+    // Bind the listener FIRST and hold it — its address feeds the chain and
+    // `axum::serve` serves on the very same held listener, so there is no
+    // release-then-rebind window (the same no-port-steal property
+    // `spawn_bound_chain` gives the eager-bind path).
+    let listener = tokio::net::TcpListener::bind(ephemeral_addr())
+        .await
+        .expect("bind grpc listener");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let (chain, engine, dir) = engine_chain_at(addr, non_event_tiers()).await;
+    // `into_layered_axum_router` is the SAFE-DEFAULT split: the returned router
+    // already carries the engine's canonical transport stack (metrics +
+    // gRPC-web trailer repair + gRPC-web framing), so what this fixture serves
+    // is the same remote surface `spawn_bound_chain` serves.
+    let (router, parts) = jammi_server::runtime::assemble_grpc_chain(chain)
+        .expect("assemble grpc chain")
+        .into_layered_axum_router();
+    // `None` only in a build whose `train` tier is not mounted at all — also
+    // quiesced (no worker was ever spawned), and such a build fails loudly at
+    // the first `StartTraining` rather than silently racing.
+    if let Some(worker) = parts.train_worker {
+        worker
+            .stop_and_join()
+            .await
+            .expect("stop the fixture's embedded training worker");
+    }
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("axum serve");
+    });
 
     EngineServer {
         addr,

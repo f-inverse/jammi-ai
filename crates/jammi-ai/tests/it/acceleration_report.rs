@@ -178,12 +178,37 @@ fn expect_determined_report_fails_closed_on_pending_marker() {
 
 /// esc-075 control (i): the SECOND f16 job in this process — run after a
 /// first f16 job already fired (and dedup-suppressed) the per-process
-/// `tracing::warn` for `layer_norm_fused`'s `f16` domain miss — still gets
-/// its OWN, independently-attributed `holds: false` on its OWN record. If the
+/// `tracing::warn` for `attention_block_fused`'s domain miss — still gets its
+/// OWN, independently-attributed `holds: false` on its OWN record. If the
 /// worker's report computation ever regressed to reading the process-lifetime
 /// `fallback_warnings_emitted()`/dedup state as ITS signal (rather than a
 /// delta scoped to this job's own probe), the second job would see no new
 /// evidence and could wrongly default to "no misses".
+///
+/// `attention_block` (not `layer_norm`) is the op under test here: campaign
+/// #443's W2a/W2b (landed in parallel, merged into this branch after this
+/// wave's base commit) widened `layer_norm`/`softmax`/`geglu`/`rope`'s dtype
+/// admission to include F16 — an f16 job on the current tree legitimately
+/// reports `Holds` on those four now, so "f16 ⇒ eager" is a stale premise for
+/// them. `attention_block_fused`'s domain additionally requires the fixed
+/// `head_dim` its kernel was built for (`jammi_kernels::ops::attention_block::
+/// HEAD_DIM == 64`); `tiny_modernbert`'s `head_dim` (`hidden_size /
+/// num_attention_heads`) is nowhere near 64, so this op declines
+/// REGARDLESS of dtype — a shape-based domain miss, not a dtype-widening
+/// candidate, so this control stays robust to further campaign #443 dtype
+/// widenings. (Today attention_block's own dtype check has NOT yet been
+/// widened to F16 either, so the observed reason key below is the dtype
+/// check's — `dtype_f32_or_bf16_matching_between_qkv_and_mask` — not the
+/// head_dim check's; if/when attention_block's dtype check is later widened
+/// to F16 too, the SAME shape miss still declines it, just under
+/// `head_dim_is_attention_block_fixed_head_dim` instead. Either way,
+/// `holds: false` here is not expected to flip.)
+///
+/// Also asserts `layer_norm` (now genuinely admitted at F16) reports
+/// `holds: true` on BOTH jobs — the anti-always-degraded half of this same
+/// control: an implementation that reports `holds: false` unconditionally,
+/// regardless of what actually dispatched, must fail here even though it
+/// would trivially "pass" the attention_block assertion above.
 // `jammi_kernels::admission`'s dispatch registries are process-wide, and this
 // binary's other `it` test modules also drive real encoder forwards
 // concurrently by default — `#[serial]` (the same idiom `inference.rs` uses
@@ -215,17 +240,26 @@ async fn second_f16_job_in_process_still_reports_its_own_eager_ops() {
     // converges or diverges over the eager-composed batches that follow.
     let record1 = wait_for_any_terminal(session.catalog(), &job1.job_id).await;
     let report1 = expect_determined_report(record1.acceleration_report.as_deref());
+    let ab1 = &report1["ops"]["attention_block"];
+    assert_eq!(
+        ab1["holds"],
+        serde_json::json!(false),
+        "job 1 (f16, CPU): attention_block_fused must decline (tiny_modernbert's head_dim is \
+         nowhere near the kernel's fixed 64), got: {report1}"
+    );
+    assert_eq!(
+        ab1["reason"],
+        serde_json::json!("dtype_f32_or_bf16_matching_between_qkv_and_mask"),
+        "job 1's miss reason must be the verbatim predicate key jammi-encoders' own \
+         `admit()` call site records, got: {report1}"
+    );
     let ln1 = &report1["ops"]["layer_norm"];
     assert_eq!(
         ln1["holds"],
-        serde_json::json!(false),
-        "job 1 (f16, CPU): layer_norm_fused must decline (f16 is not in {{f32,bf16}}), got: {report1}"
-    );
-    assert_eq!(
-        ln1["reason"],
-        serde_json::json!("dtype_f32_or_bf16_matching_between_x_and_weight"),
-        "job 1's miss reason must be the verbatim predicate key jammi-encoders' own \
-         `admit()` call site records, got: {report1}"
+        serde_json::json!(true),
+        "job 1 (f16): layer_norm_fused is genuinely admitted at F16 on the current tree \
+         (campaign #443 W2a/W2b widened it) — an always-degraded report would wrongly say \
+         false here, got: {report1}"
     );
 
     // Job 2: same process, same op, same f16 dtype — after job 1 already
@@ -243,17 +277,23 @@ async fn second_f16_job_in_process_still_reports_its_own_eager_ops() {
         .unwrap();
     let record2 = wait_for_any_terminal(session.catalog(), &job2.job_id).await;
     let report2 = expect_determined_report(record2.acceleration_report.as_deref());
-    let ln2 = &report2["ops"]["layer_norm"];
+    let ab2 = &report2["ops"]["attention_block"];
     assert_eq!(
-        ln2["holds"],
+        ab2["holds"],
         serde_json::json!(false),
         "job 2 must independently report its OWN eager outcome, not silence from the burned \
          dedup, got: {report2}"
     );
     assert_eq!(
-        ln2["reason"],
-        serde_json::json!("dtype_f32_or_bf16_matching_between_x_and_weight"),
+        ab2["reason"],
+        serde_json::json!("dtype_f32_or_bf16_matching_between_qkv_and_mask"),
         "job 2's reason must still resolve to the same verbatim predicate key, got: {report2}"
+    );
+    let ln2 = &report2["ops"]["layer_norm"];
+    assert_eq!(
+        ln2["holds"],
+        serde_json::json!(true),
+        "job 2 must also independently report layer_norm as genuinely admitted, got: {report2}"
     );
     assert_ne!(
         job1.job_id, job2.job_id,

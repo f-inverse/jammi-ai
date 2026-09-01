@@ -827,9 +827,36 @@ DRV
   # (esc-077-class one-pod-per-wave) the active-wave claim is written with
   # the caller's wave/tree at the very START (alongside .jammi.exit removal)
   # and removed again at the NORMAL-completion exit path.
-  printf '%s\n' "$marker_wrapper_text" | grep -qF 'printf "WAVE=mywave\nTREE=mytree\nTS=' \
+  printf '%s\n' "$marker_wrapper_text" | grep -qF "printf '%s\\n' 'WAVE=mywave' 'TREE=mytree' 'TS=" \
     && ok "(i/one-pod-per-wave) rp_job_wrapper_with_marker_lines writes the active-wave claim (wave+tree) up front" \
     || bad "(i/one-pod-per-wave) rp_job_wrapper_with_marker_lines did not write the expected active-wave claim — got: $marker_wrapper_text"
+  # The claim write puts caller-supplied values in the remote printf's
+  # ARGUMENT position, never its FORMAT position. With the value
+  # interpolated into the format string, `--wave '%d'` made the pod's own
+  # printf consume a missing argument and write `WAVE=0` (a claim for a
+  # wave nobody asked for), and a `"` closed the format string, turning the
+  # remainder of the generated line into remote shell code. Driven with the
+  # exotic values directly, BELOW the entrypoint allowlist, so the
+  # generator is pinned independently of it.
+  marker_wrapper_fmt="$(bash "$RUNPOD_DRIVER" rp_job_wrapper_with_marker_lines "/root/trees/t" "/root/target-t" "cargo test" "tok123" "0" '%d' 'a"b')"
+  claim_line="$(printf '%s\n' "$marker_wrapper_fmt" | grep -F '.jammi-active-wave' | grep -vF 'rm -f')"
+  case "$claim_line" in
+    "printf '%s\n' 'WAVE=%d' 'TREE=a\"b' 'TS="*)
+      ok "(i/one-pod-per-wave) a '%d' wave and a quote-bearing tree stay INERT DATA in the claim write (argument position, single-quoted)" ;;
+    *)
+      bad "(i/one-pod-per-wave) caller-supplied wave/tree must not reach the remote printf's format position — got: $claim_line" ;;
+  esac
+  # And the generated text, executed, writes those values VERBATIM — the
+  # end-to-end form of the same property (no format expansion, no escape).
+  claim_sandbox="$SANDBOX/i_claimfmt"; rm -rf "$claim_sandbox"; mkdir -p "$claim_sandbox"
+  printf '%s\n' "${claim_line//\/root\/.jammi-active-wave/$claim_sandbox/.jammi-active-wave}" > "$claim_sandbox/write.sh"
+  bash "$claim_sandbox/write.sh"
+  claim_head="$(head -2 "$claim_sandbox/.jammi-active-wave")"
+  if [ "$claim_head" = "$(printf 'WAVE=%%d\nTREE=a"b')" ]; then
+    ok "(i/one-pod-per-wave) executing the claim write records the %d wave and the quote-bearing tree VERBATIM — no format expansion, no injection"
+  else
+    bad "(i/one-pod-per-wave) the executed claim write mangled its values — got: $claim_head"
+  fi
   clear_count="$(printf '%s\n' "$marker_wrapper_text" | grep -cF 'rm -f /root/.jammi-active-wave')"
   [ "$clear_count" -ge 1 ] \
     && ok "(i/one-pod-per-wave) rp_job_wrapper_with_marker_lines clears the active-wave claim on normal completion" \

@@ -154,32 +154,58 @@ RP_REPO_URL="${RP_REPO_URL:-https://github.com/f-inverse/jammi-ai}"
 # a path separator or a `.`/`..` segment could point RP_WORK — and therefore
 # that `rm -rf` — OUTSIDE RP_SESSION_ROOT entirely (`RP_SESSION=../../etc`).
 #
-# A CONTAINMENT blacklist, not a character WHITELIST (round-3 audit on
-# #388): the previous `[A-Za-z0-9_-]+` whitelist rejected every session
-# name containing a `.` — including one gpu-dev.sh's OWN dispatch is happy
-# to create, e.g. `RP_SESSION=bench.1 gpu-dev.sh up` — so EVERY verb
-# refused against a session that had already rented a real pod, stranding
-# it for its full deadline with no `down` able to reach it. Only the shapes
-# that actually let RP_SESSION resolve outside RP_SESSION_ROOT are refused:
-# empty, `.`, or `..` (this function only ever runs for a NAMED session —
-# see the RP_SESSION_VALIDATE_SESSION gate below — so an empty value here
-# is a caller bug, never `shell`'s own genuinely anonymous RP_SESSION="",
-# which never reaches this check at all); anything containing a `/` (a
-# multi-segment path); and a leading `-` (reads as an option to any tool
-# RP_SESSION is later passed to positionally). Every OTHER shape — a dot
-# anywhere but as the WHOLE name included — is a legitimate session name.
-rp_session_name_check() {
-  case "$RP_SESSION" in
+# The ONE name rule every operator-supplied identifier in this tooling must
+# satisfy — session, tree, and wave alike. All three end up in the same two
+# dangerous positions: a LOCAL path (RP_WORK, and the unconditional
+# `rm -rf "$RP_WORK"` in rp_cleanup/rp_session_forget below — `RP_SESSION=
+# ../../etc` would point that removal outside RP_SESSION_ROOT entirely) and
+# REMOTE shell text (a tree name reaches `run`'s `.jammi-job.sh` dispatch,
+# `target --with-cutlass`, and `wait-job`'s check script; a wave and a tree
+# reach the active-wave claim write), where a quote, a backtick, a `$(...)`,
+# or a `%` in a printf format position is arbitrary code or a corrupted
+# claim on the pod.
+#
+# Refused, in this order so each shape gets its OWN diagnosis:
+#   empty / `.` / `..`   — resolve outside their own root (this function
+#                          only ever runs for a NAMED session, see the
+#                          RP_SESSION_VALIDATE_SESSION gate below, so an
+#                          empty value here is a caller bug, never
+#                          `shell`'s genuinely anonymous RP_SESSION="")
+#   contains `/`         — a multi-segment path
+#   leading `-`          — reads as an option to any tool the name is later
+#                          passed positionally
+#   anything outside `[A-Za-z0-9._-]` — the allowlist proper
+#
+# `.` is INSIDE the allowlist, deliberately: a dotted name (`bench.1`,
+# `a100.2`, `fix.443`) is a legitimate, in-use shape, and a rule that
+# refused it would refuse every verb against a session that had already
+# rented a real pod — stranding that pod for its full deadline with no
+# `down` able to reach it. `_` and `-` are in for the same reason (every
+# arch/tree/wave name in use). Nothing outside those four classes has ever
+# named a real session, tree, or wave in this repo, and each excluded
+# character is exactly what makes the two dangerous positions dangerous.
+# $1=the label to name in the error (e.g. RP_SESSION, --tree, --wave)
+# $2=the value.
+rp_name_allowlist_check() {
+  local label="${1:?rp_name_allowlist_check needs a label}" value="${2-}"
+  case "$value" in
     ''|.|..)
-      echo "::error::RP_SESSION may not be empty, '.', or '..' (got '${RP_SESSION}')" >&2
+      echo "::error::${label} may not be empty, '.', or '..' (got '${value}')" >&2
       return 2 ;;
     */*)
-      echo "::error::RP_SESSION may not contain '/' (got '${RP_SESSION}')" >&2
+      echo "::error::${label} may not contain '/' (got '${value}')" >&2
       return 2 ;;
     -*)
-      echo "::error::RP_SESSION may not start with '-' (got '${RP_SESSION}')" >&2
+      echo "::error::${label} may not start with '-' (got '${value}')" >&2
+      return 2 ;;
+    *[!A-Za-z0-9._-]*)
+      echo "::error::${label} may contain only letters, digits, '.', '_' and '-' (got '${value}') — it is embedded in remote shell text and in a printf argument" >&2
       return 2 ;;
   esac
+}
+
+rp_session_name_check() {
+  rp_name_allowlist_check RP_SESSION "$RP_SESSION"
 }
 # Gated on RP_SESSION_VALIDATE_SESSION, set by gpu-dev.sh only for the verbs
 # that actually RESOLVE a named session (up/attach/run/logs/push/pull/down)
@@ -580,25 +606,24 @@ rp_session_forget() {
 # break out of that heredoc and inject commands into the remote shell
 # (round-N audit: "closing the class your new heredoc site joins" — the
 # class was already reachable via `run`/`target`, `wait-job` is simply one
-# more instance of it). Mirrors rp_session_name_check's OWN containment
-# blacklist EXACTLY (never a whitelist — see that function's own doc for
-# why): a tree name is a directory-name-shaped string with the identical
-# legal shapes a session name has, so the identical rule applies for the
-# identical reason. Reads `$RP_TREE_CHECK_VALUE` (the same "check a global,
-# not a parameter" shape rp_session_name_check itself uses, so a caller
-# resolves it exactly the same way both times).
+# more instance of it). Applies rp_name_allowlist_check, the SAME rule
+# rp_session_name_check applies: a tree name is a directory-name-shaped
+# string with the identical legal shapes a session name has, so the
+# identical rule applies for the identical reason. Reads
+# `$RP_TREE_CHECK_VALUE` (the same "check a global, not a parameter" shape
+# rp_session_name_check itself uses, so a caller resolves it exactly the
+# same way both times).
 rp_tree_name_check() {
-  case "$RP_TREE_CHECK_VALUE" in
-    ''|.|..)
-      echo "::error::--tree may not be empty, '.', or '..' (got '${RP_TREE_CHECK_VALUE}')" >&2
-      return 2 ;;
-    */*)
-      echo "::error::--tree may not contain '/' (got '${RP_TREE_CHECK_VALUE}')" >&2
-      return 2 ;;
-    -*)
-      echo "::error::--tree may not start with '-' (got '${RP_TREE_CHECK_VALUE}')" >&2
-      return 2 ;;
-  esac
+  rp_name_allowlist_check --tree "$RP_TREE_CHECK_VALUE"
+}
+
+# A wave id reaches the pod as TEXT in the active-wave claim
+# (rp_job_wrapper_with_marker_lines) and as a literal in the concurrency
+# preflight's own comparison (rp_concurrency_preflight_lines), so it carries
+# the same exposure a tree name does and gets the same rule. Reads
+# `$RP_WAVE_CHECK_VALUE`, matching rp_tree_name_check's own shape.
+rp_wave_name_check() {
+  rp_name_allowlist_check --wave "$RP_WAVE_CHECK_VALUE"
 }
 
 # Tree name -> plain SOURCE checkout directory on the pod. "jammi-ai" is the
@@ -867,7 +892,16 @@ rp_job_wrapper_with_marker_lines() {
         wave="${6:?rp_job_wrapper_with_marker_lines needs a wave id}" \
         tree_name="${7:?rp_job_wrapper_with_marker_lines needs a tree name}"
   printf "rm -f '%s/.jammi.exit'\n" "$tree_dir"
-  printf 'printf "WAVE=%s\\nTREE=%s\\nTS=%s\\n" > /root/.jammi-active-wave\n' \
+  # `printf '%s\n' 'WAVE=...' ...` — never `printf "WAVE=%s\n..." "$wave"`
+  # with the value interpolated into the GENERATED text's own format
+  # string. A caller-supplied wave/tree landed in the REMOTE printf's
+  # FORMAT position there: `--wave '%d'` made the pod's own printf consume
+  # a (missing) argument and write `WAVE=0`, and a `"` closed the format
+  # string outright, turning the rest of the line into remote shell code.
+  # Here the values sit in ARGUMENT position, single-quoted; the allowlist
+  # every entrypoint applies (rp_name_allowlist_check) is what guarantees
+  # neither can contain the `'` that would close those quotes.
+  printf "printf '%%s\\\\n' 'WAVE=%s' 'TREE=%s' 'TS=%s' > /root/.jammi-active-wave\n" \
     "$wave" "$tree_name" "$(date -u +%FT%TZ)"
   if [ "$timing" = "1" ]; then
     cat <<FLOCKEOF

@@ -894,13 +894,13 @@ fi
 # subcommand here — a NAMED-session verb, unlike `ls`/`reap`, which never
 # apply this check at all (see Group 3e below).
 #
-# Round-3 audit on #388: the ORIGINAL fix used a `[A-Za-z0-9_-]+` character
-# WHITELIST, which rejected every session name containing a `.` —
-# including `bench.1`, a shape gpu-dev.sh's own dispatch is happy to
-# create (`RP_SESSION=bench.1 gpu-dev.sh up`) — so a live pod under a
-# dotted session name became unreachable by EVERY verb, stranded for its
-# full deadline. The fix below is a blacklist of the shapes that are
-# actually dangerous; a dot anywhere but as the whole name is accepted.
+# The rule (rp_name_allowlist_check) refuses ''/'.'/'..', an embedded '/',
+# a leading '-', and any character outside `[A-Za-z0-9._-]`. A `.` is
+# INSIDE the allowlist and its acceptance is pinned below, non-negotiably:
+# `bench.1` is a shape gpu-dev.sh's own dispatch is happy to create
+# (`RP_SESSION=bench.1 gpu-dev.sh up`), and a rule that refused it would
+# make a live pod under a dotted session name unreachable by EVERY verb,
+# stranded for its full deadline.
 # ═════════════════════════════════════════════════════════════════════════
 TRAVERSAL_TARGET="$SANDBOX/must-not-be-touched"
 mkdir -p "$TRAVERSAL_TARGET"
@@ -945,6 +945,46 @@ grep -q "RP_SESSION may" "$SANDBOX/out-dotted.log" \
 RP_SESSION="a100-2" bash "$DIR/gpu-dev.sh" down >"$SANDBOX/out-ordinary.log" 2>&1
 [ $? -eq 0 ] && ok "finding(RP_SESSION-blacklist): an ordinary [A-Za-z0-9_-] session name is still accepted" \
   || bad "finding(RP_SESSION-blacklist): an ordinary session name must still work ($(cat "$SANDBOX/out-ordinary.log"))"
+
+# ═════════════════════════════════════════════════════════════════════════
+# Group 3d-2 — CLI-level: --tree/--wave/RP_SESSION and `target`'s positional
+# tree name are all refused when they carry a character outside the
+# allowlist. Every one of these values is embedded in REMOTE shell text and
+# (for wave/tree) in the active-wave claim write, so a `%` reached the pod's
+# own printf FORMAT position (`--wave '%d'` wrote `WAVE=0`, silently
+# claiming a wave nobody asked for) and a `"` closed that format string
+# outright. Refusal happens before any path derives from the value and
+# before any ssh is attempted, so these need no pod and no mock.
+# ═════════════════════════════════════════════════════════════════════════
+name_refused() { # $1=label $2..=argv for gpu-dev.sh
+  local label="$1"; shift
+  local log="$SANDBOX/out-name-refused.log"
+  bash "$DIR/gpu-dev.sh" "$@" >"$log" 2>&1
+  local rc=$?
+  if [ "$rc" -eq 2 ] && grep -q "may contain only letters\|may not start with" "$log"; then
+    ok "finding(name-allowlist): ${label} refused (exit 2) with a rule-naming error"
+  else
+    bad "finding(name-allowlist): ${label} must be refused with exit 2 and a rule-naming error (got rc=$rc): $(cat "$log")"
+  fi
+}
+name_refused "--tree '%d'"       run a100 --tree '%d' true
+name_refused '--tree with a quote' run a100 --tree 'a"b' true
+name_refused '--tree $(...)'     run a100 --tree 'a$(id)b' true
+name_refused "--tree leading '-'" run a100 --tree -x true
+name_refused "--wave '%d'"       run a100 --wave '%d' true
+name_refused '--wave with a quote' run a100 --wave 'a"b' true
+name_refused '--wave $(...)'     run a100 --wave 'a$(id)b' true
+name_refused "target's positional tree name" target a100 'ev$(id)il'
+RP_SESSION='%d' bash "$DIR/gpu-dev.sh" down >"$SANDBOX/out-name-sess.log" 2>&1
+[ $? -eq 2 ] && ok "finding(name-allowlist): RP_SESSION='%d' refused (exit 2)" \
+  || bad "finding(name-allowlist): RP_SESSION='%d' must be refused ($(cat "$SANDBOX/out-name-sess.log"))"
+# Positive control, same shapes the repo actually uses: a legal name must
+# never trip the rule. (`run` has no pod here and fails later for its own
+# reasons; what is pinned is that it gets PAST the name gate.)
+bash "$DIR/gpu-dev.sh" run a100 --tree w4b --wave 'fix.443' true >"$SANDBOX/out-name-legal.log" 2>&1
+grep -q "may contain only letters\|--tree may\|--wave may" "$SANDBOX/out-name-legal.log" \
+  && bad "finding(name-allowlist): a legal --tree/--wave ('w4b'/'fix.443') must NOT be refused ($(cat "$SANDBOX/out-name-legal.log"))" \
+  || ok "finding(name-allowlist): legal dotted/alphanumeric --tree and --wave values pass the gate"
 
 # ═════════════════════════════════════════════════════════════════════════
 # Group 3e — CLI-level: a dotted session name works END TO END, not merely

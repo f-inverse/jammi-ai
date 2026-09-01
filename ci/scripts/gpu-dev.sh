@@ -589,6 +589,14 @@ source "$DIR/runpod_lib.sh"
 # site joins — see rp_tree_name_check's own doc). The default "jammi-ai"
 # passes trivially; only a caller-supplied --tree can fail this.
 RP_TREE_CHECK_VALUE="$TREE" rp_tree_name_check || exit 2
+# `target`'s POSITIONAL name is a tree name too — it is what rp_target_dir/
+# rp_tree_dir resolve for that verb (:1148), and both results go straight
+# into a remote heredoc. It never passes through $TREE, so the check above
+# does not cover it: `target a100 '<injection>'` reached the pod unchecked.
+# Empty is the "no name given" state `target --verify` legitimately has, so
+# only a non-empty value is checked here; the verb's own
+# "need a tree name" refusal still handles the empty case.
+[ -z "$TARGET_NAME" ] || { RP_TREE_CHECK_VALUE="$TARGET_NAME" rp_tree_name_check || exit 2; }
 
 # Resolved once, here, so every verb below (attach/run/logs/push/pull/target)
 # reads the SAME directories for the SAME --tree value — the one place
@@ -622,6 +630,12 @@ TMUX_SESSION="jammi-${TREE}"
 # operator can set ONE `--wave`/RP_WAVE across a whole push-then-run
 # sequence without either verb rejecting it.
 WAVE="${RP_WAVE:-$TREE}"
+# Same rule as --tree, for the same reason: WAVE is written into the pod's
+# active-wave claim and compared as a literal inside the concurrency
+# preflight's generated text, so an unvalidated value is remote shell text.
+# The `${RP_WAVE:-$TREE}` default inherits an already-checked tree name;
+# only a caller-supplied --wave/RP_WAVE can fail this.
+RP_WAVE_CHECK_VALUE="$WAVE" rp_wave_name_check || exit 2
 
 # The ref rules live with the code that sends the ref to the pod, so they are
 # applied here as soon as that code is available — before anything is rented.

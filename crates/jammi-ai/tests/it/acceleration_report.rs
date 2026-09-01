@@ -818,6 +818,98 @@ async fn probed_ops_bind_to_the_real_registry_and_key_sets_are_dtype_determinist
     );
 }
 
+/// Campaign #446 finding 3 — FABRICATED MISS REASONS. Four jobs in ONE
+/// process, all reading the SAME registry key (`attention_block_fused`), at
+/// two DIFFERENT failing predicates:
+///
+/// - `f32` on CPU clears the dtype gate and declines at the head-dim check →
+///   `head_dim_is_attention_block_fixed_head_dim` (`tiny_modernbert`'s head
+///   dim is nowhere near the kernel's fixed 64).
+/// - `f16` on CPU declines at the DTYPE check itself → `dtype_f32_matching_
+///   between_qkv_and_mask_on_cpu` (the round-2 device split: BF16/F16 are
+///   CUDA-only, matching `cpu_fwd`'s real domain), so the head-dim check
+///   below it is never reached.
+///
+/// **Why the order f32, f16, f32, f32 and not just two jobs.** The pre-fix
+/// `reason_for_registry_key` read the process-lifetime
+/// `fallback_warnings_emitted()` list and took the most recent entry for the
+/// op. That list is populated INSIDE `warn_fallback_once_with_message`'s
+/// `seen.insert((op, predicate))` guard (`crates/jammi-kernels/src/
+/// admission.rs`), so it records each `(op, predicate)` pair AT MOST ONCE per
+/// process. Jobs 1 and 2 therefore each push a fresh pair and read back
+/// correctly even pre-fix; job 3 is where it breaks: its `head_dim` pair is
+/// already in `seen`, nothing is pushed, and the most recent entry for
+/// `attention_block_fused` is still job 2's `dtype_...` — a different
+/// predicate, for a different dtype, persisted durably as THIS job's reason.
+/// Job 3 is the deterministic RED. (Verified by running this test against the
+/// unmodified `worker.rs`: job 3 reported `dtype_f32_matching_between_qkv_and_
+/// mask_on_cpu` for an f32 backbone.)
+///
+/// Job 4 is the SAME-predicate repeat (the dedupe case the naive
+/// "before/after window over `fallback_warnings_emitted()`" fix cannot serve
+/// either — that window is EMPTY for job 4, because the dedupe is upstream of
+/// the record). It must still carry its own predicate, never
+/// `reason_unavailable`.
+///
+/// Every job must also keep `holds: false` — the bug was never about the
+/// determination, only about the verbatim key attached to it.
+// `jammi_kernels::admission`'s dispatch registries and its warn-dedup set are
+// process-wide — same `#[serial]` rationale as the other tests in this file.
+#[serial(esc075_acceleration_report)]
+#[tokio::test(flavor = "multi_thread")]
+async fn each_job_reports_its_own_miss_predicate_not_the_most_recent_different_one() {
+    const HEAD_DIM_MISS: &str = "head_dim_is_attention_block_fixed_head_dim";
+    const CPU_DTYPE_MISS: &str = "dtype_f32_matching_between_qkv_and_mask_on_cpu";
+
+    let (session, _dir) = session_with_training_data().await;
+    let _worker = EmbeddedWorker::spawn(&session).expect("default worker intervals are valid");
+
+    let plan = [
+        (ComputePrecision::F32, HEAD_DIM_MISS, "job 1 (f32, first)"),
+        (ComputePrecision::F16, CPU_DTYPE_MISS, "job 2 (f16)"),
+        (
+            ComputePrecision::F32,
+            HEAD_DIM_MISS,
+            "job 3 (f32, after f16 burned the dedup for a DIFFERENT predicate)",
+        ),
+        (
+            ComputePrecision::F32,
+            HEAD_DIM_MISS,
+            "job 4 (f32, SAME predicate as job 3 — the dedupe case)",
+        ),
+    ];
+
+    for (precision, expected_reason, label) in plan {
+        let job = session
+            .fine_tune(
+                "training",
+                &tiny_modernbert_model(),
+                &training_columns(),
+                FineTuneMethod::Lora,
+                ModelTask::TextEmbedding,
+                Some(encoder_adapters_config(precision)),
+            )
+            .await
+            .unwrap();
+        let record = wait_for_any_terminal(session.catalog(), &job.job_id).await;
+        let report = expect_determined_report(record.acceleration_report.as_deref());
+        let ab = &report["ops"]["attention_block"];
+        assert_eq!(
+            ab["holds"],
+            serde_json::json!(false),
+            "{label}: attention_block_fused must decline on CPU at {precision}, got: {report}"
+        );
+        assert_eq!(
+            ab["reason"],
+            serde_json::json!(expected_reason),
+            "{label}: the miss reason must be the verbatim predicate key THIS job's own probe \
+             window recorded, never the most recent DIFFERENT predicate some earlier job left \
+             in the process-lifetime warn list (campaign #446 finding 3), and never a \
+             placeholder for a miss that really did record a predicate. Report: {report}"
+        );
+    }
+}
+
 /// Phase-4 adversarial-audit finding 4 ("PENDING-FOREVER"), `ContextPredictor`
 /// half: this job kind never routes through `run_fine_tune_blocking`'s
 /// measuring probe at all (`run_spec`'s `ContextPredictor` arm calls

@@ -176,6 +176,7 @@
 //! [`snapshot_all`]'s per-op `eager` counts directly, not lean on `"all"`
 //! coming back matched as if it were evidence for the whole registry.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock, RwLock};
@@ -612,6 +613,185 @@ pub fn fallback_warnings_emitted() -> Vec<FallbackWarning> {
         .clone()
 }
 
+// =============================================================================
+// The probe-window capture sink (campaign #446 finding 3)
+// =============================================================================
+//
+// [`fallback_warnings_emitted`] above is a LOG-ONCE record: every entry is
+// pushed inside `warn_fallback_once_with_message`'s
+// `seen.insert((op, predicate))` guard, so a given `(op, predicate)` pair
+// appears AT MOST ONCE per process. That makes it a fine oracle for "did this
+// process ever warn about X", and a WRONG source for "why did THIS job's
+// probe miss": a job whose miss repeats a pair some earlier job already
+// burned pushes nothing, and a reader taking the most recent entry for the op
+// gets the most recent DIFFERENT predicate — a fabricated reason, persisted
+// durably on the job record.
+//
+// A naive before/after window over `fallback_warnings_emitted()` cannot fix
+// that either: the dedupe is UPSTREAM of the record, so the window is empty
+// in exactly the repeat case that needs it. The sink below is therefore a
+// SECOND, independent channel: while armed, `admit_inner`'s miss path ALWAYS
+// records `(op, predicate)` here, whatever the log-once dedupe decides (which
+// stays exactly as it is, for logging).
+
+/// The predicate key `warn_disabled_once` logs and the sink records for a
+/// `JAMMI_KERNELS_DISABLE`-forced eager arm. Hoisted to a `const` so the two
+/// producers cannot drift: a consumer distinguishing "deliberate instruction"
+/// from "domain-predicate failure" compares against this ONE spelling.
+pub const DISABLED_PREDICATE_KEY: &str = "disabled_by_JAMMI_KERNELS_DISABLE";
+
+/// One captured miss: `(op, predicate_key)` — the same two fields
+/// [`fallback_warnings_emitted`] carries, without the formatted message
+/// (a consumer reading this wants the verbatim key, not log prose).
+pub type ProbeMiss = (&'static str, &'static str);
+
+thread_local! {
+    /// The armed probe window for THIS thread, or `None` when unarmed.
+    ///
+    /// **Thread-local, not process-wide, on purpose**: a process-wide sink
+    /// would mix a concurrently-probing second worker's misses into this
+    /// job's window, which is the same misattribution the process-lifetime
+    /// warn list already commits. Thread-local means a window captures
+    /// exactly the misses raised by the thread that armed it.
+    ///
+    /// `None` when unarmed — the hot path pays one TLS access plus an
+    /// `Option` check and allocates nothing (pinned by
+    /// `unarmed_admit_records_nothing_and_keeps_the_sink_none`).
+    static PROBE_CAPTURE: RefCell<Option<Vec<ProbeMiss>>> = const { RefCell::new(None) };
+}
+
+/// Records `(op, predicate)` into this thread's armed probe window, if one is
+/// armed. A no-op (and non-allocating) otherwise.
+///
+/// **Bounded by DISTINCT pairs, not by miss COUNT** (family E: bound the term
+/// that grows). The number of miss EVENTS in a window is caller-controlled —
+/// it scales with the probed model's layer count, which comes from the job
+/// spec. The number of DISTINCT `(op, predicate)` pairs does not: both fields
+/// are `&'static str` literals from a finite, compile-time set of admission
+/// call sites, so deduplicating on insert bounds the sink by the workspace's
+/// own op/predicate cardinality regardless of how large a model a caller
+/// submits. Duplicates carry no information for the consumer either — it asks
+/// "which predicate failed for this op", not "how many times".
+///
+/// The linear `contains` scan is over that same tiny set (single-digit
+/// entries in every real window); a `HashSet` would cost more to allocate
+/// than it saves, and would lose the insertion order
+/// [`probe_capture_reason_for`] resolves ties with.
+fn record_probe_miss(op: &'static str, predicate: &'static str) {
+    PROBE_CAPTURE.with(|slot| {
+        if let Ok(mut slot) = slot.try_borrow_mut() {
+            if let Some(sink) = slot.as_mut() {
+                if !sink.contains(&(op, predicate)) {
+                    sink.push((op, predicate));
+                }
+            }
+        }
+    });
+}
+
+/// Whether this thread currently has an armed probe window — the oracle a
+/// test asserts the hot path stays clean against (`None` when unarmed), and
+/// the honest answer to "would a miss right now be captured".
+pub fn probe_capture_is_armed() -> bool {
+    PROBE_CAPTURE.with(|slot| slot.borrow().is_some())
+}
+
+/// Arms a probe-window capture sink on THIS thread and returns the guard that
+/// owns it. While armed, EVERY [`admit`] miss on this thread records its
+/// `(op, predicate)` pair into the window, independent of the log-once dedupe
+/// [`fallback_warnings_emitted`] applies (which is left exactly as it is —
+/// this does not change what gets logged).
+///
+/// **Thread-locality is a real constraint on the caller.** The window
+/// captures only misses raised on the arming thread. `jammi-ai`'s esc-075
+/// probe satisfies this: `run_fine_tune_blocking` runs inside one
+/// `tokio::task::spawn_blocking` closure, and the probe's encoder forward,
+/// `Tensor::backward()` graph walk and `AdamW::step` are all synchronous
+/// calls on that single thread — candle's own intra-kernel parallelism sits
+/// BELOW the `admit()` call sites (inside gemm/rayon kernels), never around
+/// them. It would break if a future caller (a) armed the window and then
+/// awaited across a runtime yield point, so the probe resumed on a different
+/// worker thread, or (b) dispatched an admission-gated op from inside a
+/// `rayon`/`std::thread::spawn` closure — a data-parallel or multi-GPU arm is
+/// the realistic shape. Either case degrades HONESTLY, not silently: the
+/// window simply has no entry for that op and the consumer writes its own
+/// "reason unavailable" marker rather than a guess.
+///
+/// Dropping the guard without calling [`ProbeCaptureGuard::finish`] disarms
+/// and discards the window.
+#[must_use = "the window is disarmed as soon as the guard drops; bind it for the probe's \
+              duration and call finish() to read it"]
+pub fn probe_capture_begin() -> ProbeCaptureGuard {
+    let previous = PROBE_CAPTURE.with(|slot| slot.borrow_mut().replace(Vec::new()));
+    ProbeCaptureGuard {
+        previous,
+        restored: false,
+    }
+}
+
+/// The RAII owner of an armed probe window — see [`probe_capture_begin`].
+pub struct ProbeCaptureGuard {
+    /// Whatever window was armed on this thread when this guard armed its own
+    /// (`None` in every real use — nested windows are not a shape this
+    /// codebase has). Restored on `finish`/drop so a nested window cannot
+    /// silently destroy its parent's; an inner window's entries are NOT
+    /// merged into the outer one (the inner probe's misses are the inner
+    /// probe's, not the outer's).
+    previous: Option<Vec<ProbeMiss>>,
+    /// Set by the first `restore` so `finish` followed by `drop` restores
+    /// once, not twice (a second restore would clobber `previous` back to
+    /// `None` after `finish` had just put it back).
+    restored: bool,
+}
+
+impl ProbeCaptureGuard {
+    /// Disarms this window and returns its entries, or `None` if already
+    /// disarmed.
+    fn restore(&mut self) -> Option<Vec<ProbeMiss>> {
+        if self.restored {
+            return None;
+        }
+        self.restored = true;
+        PROBE_CAPTURE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let taken = slot.take();
+            *slot = self.previous.take();
+            taken
+        })
+    }
+
+    /// Disarms the window and returns every DISTINCT `(op, predicate)` miss
+    /// recorded on this thread while it was armed, in first-occurrence order.
+    pub fn finish(mut self) -> Vec<ProbeMiss> {
+        self.restore().unwrap_or_default()
+    }
+}
+
+impl Drop for ProbeCaptureGuard {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+/// The verbatim predicate key `window` recorded for `op`, or `None` if this
+/// window has no entry for it.
+///
+/// **First occurrence, not last.** A window CAN in principle hold more than
+/// one distinct predicate for one op (heterogeneous layers reaching different
+/// branches of the same predicate); the earliest miss is the one this
+/// reports, deterministically, and this fn never invents a summary key for
+/// the multi-predicate case. `None` is the honest answer a caller must
+/// surface as its own "unavailable" marker rather than filling in — the
+/// realistic causes are the thread-locality limits in
+/// [`probe_capture_begin`]'s doc and a concurrent thread's dispatch moving
+/// the counter this window's owner then attributed to itself.
+pub fn probe_capture_reason_for(window: &[ProbeMiss], op: &str) -> Option<&'static str> {
+    window
+        .iter()
+        .find(|(recorded_op, _)| *recorded_op == op)
+        .map(|&(_, predicate)| predicate)
+}
+
 /// Emits a `tracing::warn!` at most once per process for a given
 /// `(op, predicate)` pair, with `message` as the log line — split out from
 /// [`warn_fallback_once`] so [`warn_disabled_once`] can share the SAME
@@ -907,7 +1087,7 @@ struct AdmitDecision {
 fn warn_disabled_once(op: &'static str) -> FallbackReason {
     warn_fallback_once_with_message(
         op,
-        "disabled_by_JAMMI_KERNELS_DISABLE",
+        DISABLED_PREDICATE_KEY,
         "op disabled via JAMMI_KERNELS_DISABLE",
     );
     FallbackReason::Disabled
@@ -946,6 +1126,11 @@ fn admit_inner(
         // forced eager while every OTHER op passing through this same
         // function is still strictly proven fused.
         counters.record(DispatchOutcome::Eager);
+        // Campaign #446 finding 3: the probe window records EVERY miss,
+        // independent of `warn_disabled_once`'s log-once dedupe below — a
+        // repeat of an already-warned `(op, predicate)` pair still belongs to
+        // the job whose window is armed right now.
+        record_probe_miss(op, DISABLED_PREDICATE_KEY);
         let reason = warn_disabled_once(op);
         return Ok(AdmitDecision {
             outcome: DispatchOutcome::Eager,
@@ -960,6 +1145,11 @@ fn admit_inner(
         });
     }
     counters.record(DispatchOutcome::Eager);
+    // Recorded BEFORE the mode match, so a `Strict` run's hard error is
+    // captured too: `Strict` returns before `warn_predicate_failed_once` is
+    // ever reached, and a window that saw the counter move but has no entry
+    // for why would be exactly the blind spot this sink exists to close.
+    record_probe_miss(op, predicate_name);
     match mode {
         AdmissionMode::Fallback => {
             let reason = warn_predicate_failed_once(op, predicate_name);
@@ -2985,6 +3175,280 @@ mod tests {
                 "a dtype-neutral row resolves to the same key at every dtype"
             );
         }
+    }
+
+    /// (iv) The hot path must not grow: with no window armed, `admit()`
+    /// records nothing and the sink stays `None` — no `Vec` is ever
+    /// allocated for the overwhelming majority of dispatches (every
+    /// production forward outside a probe). Asserting `probe_capture_is_armed
+    /// () == false` AFTER a real miss is the non-vacuous form: a naive
+    /// implementation that lazily created the sink on first miss would leave
+    /// it `Some` here.
+    #[test]
+    fn unarmed_admit_records_nothing_and_keeps_the_sink_none() {
+        assert!(
+            !probe_capture_is_armed(),
+            "no window may be armed on a fresh thread"
+        );
+        let counters = DispatchCounters::new();
+        let decision = admit_inner(
+            AdmissionMode::Fallback,
+            "probe_sink_unarmed_op",
+            "probe_sink_unarmed_predicate",
+            false,
+            false,
+            &counters,
+        )
+        .expect("Fallback mode never errors on a predicate miss");
+        assert_eq!(decision.outcome, DispatchOutcome::Eager);
+        assert!(
+            !probe_capture_is_armed(),
+            "an unarmed admit() miss must NOT lazily create a sink — the hot path allocates \
+             nothing"
+        );
+        // And a window armed AFTERWARDS is empty: the earlier miss was
+        // genuinely dropped, not buffered somewhere and replayed.
+        let window = probe_capture_begin().finish();
+        assert!(
+            window.is_empty(),
+            "a window armed after an unarmed miss must be empty, got {window:?}"
+        );
+    }
+
+    /// An armed window records the miss AND survives the log-once dedupe: the
+    /// SAME `(op, predicate)` pair captured twice, in two successive windows,
+    /// even though `fallback_warnings_emitted()` records it only the first
+    /// time. This is finding 3's whole mechanism in one test — the second
+    /// window is exactly the case a before/after diff of the warn list
+    /// reports as empty.
+    #[test]
+    fn armed_window_records_a_miss_even_when_the_log_once_dedupe_suppresses_it() {
+        let counters = DispatchCounters::new();
+        let miss = || {
+            admit_inner(
+                AdmissionMode::Fallback,
+                "probe_sink_dedupe_op",
+                "probe_sink_dedupe_predicate",
+                false,
+                false,
+                &counters,
+            )
+            .expect("Fallback mode never errors on a predicate miss");
+        };
+
+        let first_guard = probe_capture_begin();
+        miss();
+        let first = first_guard.finish();
+        assert_eq!(
+            first,
+            vec![("probe_sink_dedupe_op", "probe_sink_dedupe_predicate")]
+        );
+
+        let warns_after_first = fallback_warnings_emitted()
+            .into_iter()
+            .filter(|(op, _, _)| *op == "probe_sink_dedupe_op")
+            .count();
+        assert_eq!(
+            warns_after_first, 1,
+            "the log-once record holds exactly one entry for this pair"
+        );
+
+        let second_guard = probe_capture_begin();
+        miss();
+        let second = second_guard.finish();
+        assert_eq!(
+            second,
+            vec![("probe_sink_dedupe_op", "probe_sink_dedupe_predicate")],
+            "the SECOND window must carry the pair too — the log-once dedupe governs logging \
+             only, never what a probe window may attribute to its own job"
+        );
+        assert_eq!(
+            fallback_warnings_emitted()
+                .into_iter()
+                .filter(|(op, _, _)| *op == "probe_sink_dedupe_op")
+                .count(),
+            warns_after_first,
+            "and the dedupe itself is UNCHANGED — the sink is a second channel, not a \
+             relaxation of the log-once contract"
+        );
+    }
+
+    /// Distinct pairs only, in first-occurrence order: the sink is bounded by
+    /// the workspace's finite `(op, predicate)` cardinality, not by the
+    /// caller-controlled number of miss EVENTS (family E). Ten misses over
+    /// two pairs yield two entries.
+    #[test]
+    fn armed_window_deduplicates_pairs_and_keeps_first_occurrence_order() {
+        let counters = DispatchCounters::new();
+        let guard = probe_capture_begin();
+        for i in 0..10 {
+            let predicate = if i % 2 == 0 {
+                "probe_sink_bound_predicate_a"
+            } else {
+                "probe_sink_bound_predicate_b"
+            };
+            admit_inner(
+                AdmissionMode::Fallback,
+                "probe_sink_bound_op",
+                predicate,
+                false,
+                false,
+                &counters,
+            )
+            .expect("Fallback mode never errors on a predicate miss");
+        }
+        let window = guard.finish();
+        assert_eq!(
+            window,
+            vec![
+                ("probe_sink_bound_op", "probe_sink_bound_predicate_a"),
+                ("probe_sink_bound_op", "probe_sink_bound_predicate_b"),
+            ],
+            "the sink must grow with DISTINCT (op, predicate) pairs, not with miss events"
+        );
+        assert_eq!(
+            probe_capture_reason_for(&window, "probe_sink_bound_op"),
+            Some("probe_sink_bound_predicate_a"),
+            "first occurrence wins, deterministically"
+        );
+        assert_eq!(
+            probe_capture_reason_for(&window, "an_op_this_window_never_saw"),
+            None,
+            "an op with no entry must be None — the caller's cue to write its own honest \
+             \"unavailable\" marker, never a guess"
+        );
+    }
+
+    /// (iii) Two threads with concurrent windows do not mix: each captures
+    /// only the misses raised on its OWN thread. A process-wide sink would
+    /// put both ops in both windows.
+    #[test]
+    fn concurrent_windows_on_two_threads_do_not_mix() {
+        use std::sync::mpsc;
+
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+
+        let handle = std::thread::spawn(move || {
+            let counters = DispatchCounters::new();
+            let guard = probe_capture_begin();
+            admit_inner(
+                AdmissionMode::Fallback,
+                "probe_sink_thread_b_op",
+                "probe_sink_thread_b_predicate",
+                false,
+                false,
+                &counters,
+            )
+            .expect("Fallback mode never errors on a predicate miss");
+            // Signal that B's window is armed AND populated, then hold it
+            // open until A has done its own miss — so the two windows really
+            // are concurrent, not merely sequential.
+            ready_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            guard.finish()
+        });
+
+        let counters = DispatchCounters::new();
+        let guard = probe_capture_begin();
+        ready_rx.recv().unwrap();
+        admit_inner(
+            AdmissionMode::Fallback,
+            "probe_sink_thread_a_op",
+            "probe_sink_thread_a_predicate",
+            false,
+            false,
+            &counters,
+        )
+        .expect("Fallback mode never errors on a predicate miss");
+        let a = guard.finish();
+        go_tx.send(()).unwrap();
+        let b = handle.join().expect("thread B must not panic");
+
+        assert_eq!(
+            a,
+            vec![("probe_sink_thread_a_op", "probe_sink_thread_a_predicate")],
+            "thread A's window must hold ONLY A's miss, got {a:?}"
+        );
+        assert_eq!(
+            b,
+            vec![("probe_sink_thread_b_op", "probe_sink_thread_b_predicate")],
+            "thread B's window must hold ONLY B's miss, got {b:?}"
+        );
+    }
+
+    /// Dropping the guard without `finish` disarms the window — a probe that
+    /// panics or returns early must not leave a sink armed for whatever runs
+    /// next on this thread (which would then attribute unrelated misses to a
+    /// job that is already over).
+    #[test]
+    fn dropping_the_guard_without_finish_disarms() {
+        {
+            let _guard = probe_capture_begin();
+            assert!(probe_capture_is_armed());
+        }
+        assert!(
+            !probe_capture_is_armed(),
+            "the window must be disarmed by Drop, not only by finish()"
+        );
+    }
+
+    /// The `JAMMI_KERNELS_DISABLE` arm records too, under the ONE hoisted
+    /// [`DISABLED_PREDICATE_KEY`] spelling — so a consumer can tell "you
+    /// disabled this op" apart from "the domain check failed" without
+    /// comparing log prose.
+    #[test]
+    fn disabled_arm_records_the_hoisted_disabled_predicate_key() {
+        let counters = DispatchCounters::new();
+        let guard = probe_capture_begin();
+        admit_inner(
+            AdmissionMode::Strict,
+            "probe_sink_disabled_op",
+            "a_predicate_that_holds",
+            true,
+            true,
+            &counters,
+        )
+        .expect("disable wins over Strict");
+        let window = guard.finish();
+        assert_eq!(
+            probe_capture_reason_for(&window, "probe_sink_disabled_op"),
+            Some(DISABLED_PREDICATE_KEY),
+            "a deliberate disable must be recorded as such, never as a domain-predicate failure"
+        );
+    }
+
+    /// A `Strict`-mode predicate failure records into the window even though
+    /// it returns `Err` before any warn helper runs — the arm that has NO
+    /// entry in `fallback_warnings_emitted()` at all.
+    #[test]
+    fn strict_mode_predicate_failure_still_records_into_the_window() {
+        let counters = DispatchCounters::new();
+        let guard = probe_capture_begin();
+        let err = admit_inner(
+            AdmissionMode::Strict,
+            "probe_sink_strict_op",
+            "probe_sink_strict_predicate",
+            false,
+            false,
+            &counters,
+        )
+        .expect_err("Strict turns a predicate miss into a hard error");
+        assert!(matches!(err, KernelError::StrictModeFallback { .. }));
+        let window = guard.finish();
+        assert_eq!(
+            probe_capture_reason_for(&window, "probe_sink_strict_op"),
+            Some("probe_sink_strict_predicate"),
+            "Strict returns before warn_predicate_failed_once, so the warn list has nothing — \
+             the window must still know why"
+        );
+        assert!(
+            !fallback_warnings_emitted()
+                .into_iter()
+                .any(|(op, _, _)| op == "probe_sink_strict_op"),
+            "control: the warn list genuinely has no entry for this op, so the assertion above \
+             is not passing through the old channel by accident"
+        );
     }
 
     /// `all_registry_keys` is the every-dtype enumeration (distinct from

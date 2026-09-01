@@ -2292,10 +2292,18 @@ fn validate_backbone_precision(
 // `jammi_encoders::layer_norm::LN_DISPATCH_COUNTERS`'s own doc: "a durable
 // job record ... uses" `jammi_encoders::ln_dispatch_snapshot`). This never
 // re-derives the dtype/shape/device domain check: it exercises the real one
-// and observes its real effect. A miss's `reason` is read back from
-// `jammi_kernels::admission::fallback_warnings_emitted()` by the SAME `op`
-// key the kernel's own `admit()` call site already uses — reused verbatim,
-// never invented here.
+// and observes its real effect. A miss's `reason` is read back out of THIS
+// probe's own `jammi_kernels::admission::probe_capture_begin()` window, by
+// the SAME `op` key the kernel's own `admit()` call site already uses —
+// reused verbatim, never invented here. That window is armed for exactly the
+// forward+backward+step below and records every miss on this thread,
+// independent of the log-once `(op, predicate)` dedupe
+// `fallback_warnings_emitted()` applies for LOGGING. Reading the deduped
+// warn list instead (the pre-#446 shape) attributed the most recent
+// DIFFERENT predicate to a job whose own miss repeated an already-burned
+// pair — see `reason_from_probe_window`'s doc. A `holds: false` op with no
+// entry in its own window gets the honest `"reason_unavailable"`, never a
+// guess.
 //
 // The probe runs a real forward pass PLUS one backward + optimizer step
 // (Phase-4 adversarial-audit finding 2, campaign #443): `layer_norm`,
@@ -2480,23 +2488,45 @@ fn two_arm_holds(
     }
 }
 
-/// The verbatim predicate key `jammi_kernels::admission::admit`'s Fallback-mode
-/// arm recorded for `registry_op_key`'s most recent miss, read from
-/// [`jammi_kernels::admission::fallback_warnings_emitted`] — the SAME
-/// `(op, predicate, message)` triple the kernel itself pushed, never a
-/// re-derived guess. Falls back to a clearly-labelled placeholder only if this
-/// process has genuinely never recorded a warning for this op (should not
-/// happen for a `holds == false` delta, since the SAME `admit()` call that
-/// incremented `eager` also pushes this entry synchronously — see
-/// `admit_inner`/`warn_predicate_failed_once` in
-/// `crates/jammi-kernels/src/admission.rs`).
-fn reason_for_registry_key(registry_op_key: &'static str) -> String {
-    jammi_kernels::admission::fallback_warnings_emitted()
-        .into_iter()
-        .rev()
-        .find(|(op, _, _)| *op == registry_op_key)
-        .map(|(_, predicate, _)| predicate.to_string())
-        .unwrap_or_else(|| "eager_no_fallback_warning_recorded".to_string())
+/// The `reason` written for a `holds: false` op whose OWN probe window
+/// recorded no `(op, predicate)` entry — an honest "this report cannot say",
+/// never a guess.
+///
+/// Reachable causes, all genuine: an admission-gated dispatch on ANOTHER
+/// thread moved this registry key's `eager` counter inside this probe's
+/// before/after window (the attribution precondition this section's module
+/// doc already documents), or a future admission-gated op dispatches off the
+/// probe's own thread (see
+/// [`jammi_kernels::admission::probe_capture_begin`]'s thread-locality doc).
+const REASON_UNAVAILABLE: &str = "reason_unavailable";
+
+/// The verbatim predicate key THIS probe's own capture window recorded for
+/// `registry_op_key` — the `(op, predicate)` pair the kernel's own
+/// `admit()` call pushed into
+/// [`jammi_kernels::admission::probe_capture_begin`]'s sink DURING this job's
+/// probe, never a re-derived guess and never another job's entry.
+///
+/// **This used to read
+/// [`jammi_kernels::admission::fallback_warnings_emitted`] and take the most
+/// recent entry for the op** (campaign #446 finding 3). That list is
+/// process-lifetime AND deduplicated on `(op, predicate)` — a job whose miss
+/// repeats a pair an earlier job already burned pushes nothing, so the "most
+/// recent entry for this op" was the most recent DIFFERENT predicate, from a
+/// different job at a different dtype, persisted durably on this job's
+/// record. A before/after window over that same list cannot fix it either:
+/// the dedupe sits UPSTREAM of the record, so the window is empty in exactly
+/// the repeat case. The capture sink is a second, undeduplicated channel that
+/// exists for precisely this window.
+///
+/// [`REASON_UNAVAILABLE`] when the window has no entry — see its doc for the
+/// causes. Never a placeholder that reads like a measured predicate.
+fn reason_from_probe_window(
+    window: &[jammi_kernels::admission::ProbeMiss],
+    registry_op_key: &str,
+) -> String {
+    jammi_kernels::admission::probe_capture_reason_for(window, registry_op_key)
+        .unwrap_or(REASON_UNAVAILABLE)
+        .to_string()
 }
 
 /// The compiled/device-level short-circuit reasons for `"flash"`, checked
@@ -2695,6 +2725,15 @@ fn probe_acceleration(
     encoder.set_training(true);
 
     let before = AdmissionProbeSnapshot::capture(dtype);
+    // Campaign #446 finding 3: arm THIS probe's own capture window before the
+    // forward, and read every `holds: false` reason back out of it. The window
+    // is thread-local and this whole function (forward, `Tensor::backward()`'s
+    // graph walk, `AdamW::step`) runs synchronously on the ONE
+    // `spawn_blocking` thread `run_fine_tune_blocking` was handed — see
+    // `jammi_kernels::admission::probe_capture_begin`'s doc for the constraint
+    // and exactly where it would break (a future async yield inside the probe,
+    // or an admission-gated op dispatched from a rayon/spawned worker).
+    let capture = jammi_kernels::admission::probe_capture_begin();
     // A tiny, arch-agnostic probe batch: token id `0` is valid for any
     // non-empty vocabulary, so this never depends on the job's actual
     // tokenizer/vocab size. A probe FAILURE (a malformed batch, an unforeseen
@@ -2711,6 +2750,9 @@ fn probe_acceleration(
     })()
     .is_some();
     let after = AdmissionProbeSnapshot::capture(dtype);
+    // Disarmed here, not by drop: nothing after this point may contribute to
+    // this job's window, and nothing before it may be lost.
+    let window = capture.finish();
 
     let mut ops = serde_json::Map::new();
     if probe_ok {
@@ -2723,7 +2765,7 @@ fn probe_acceleration(
                 let reason = if holds {
                     "domain_ok".to_string()
                 } else {
-                    reason_for_registry_key(registry_key)
+                    reason_from_probe_window(&window, registry_key)
                 };
                 ops.insert(
                     report_key.to_string(),
@@ -3061,6 +3103,47 @@ mod tests {
     use candle_core::Tensor;
 
     use super::*;
+
+    /// Campaign #446 finding 3, the honest-negative half:
+    /// [`reason_from_probe_window`] returns the window's OWN verbatim
+    /// predicate for an op it recorded, and [`REASON_UNAVAILABLE`] — never a
+    /// guess, and never some other op's predicate — for one it did not.
+    ///
+    /// The `None` branch is not reachable deterministically through the
+    /// public probe (it needs a concurrent thread's dispatch to move a
+    /// counter inside this probe's window, or a future off-thread admission
+    /// site), so it is pinned here directly rather than left as an
+    /// unexercised `unwrap_or`.
+    #[test]
+    fn reason_from_probe_window_reads_its_own_window_or_says_unavailable() {
+        let window: Vec<jammi_kernels::admission::ProbeMiss> = vec![
+            (
+                "attention_block_fused",
+                "head_dim_is_attention_block_fixed_head_dim",
+            ),
+            ("layer_norm_fused", "dtype_is_f32_bf16_or_f16"),
+        ];
+        assert_eq!(
+            reason_from_probe_window(&window, "attention_block_fused"),
+            "head_dim_is_attention_block_fixed_head_dim"
+        );
+        assert_eq!(
+            reason_from_probe_window(&window, "layer_norm_fused"),
+            "dtype_is_f32_bf16_or_f16",
+            "each op reads ITS OWN entry — never the most recent entry in the window"
+        );
+        assert_eq!(
+            reason_from_probe_window(&window, "lora_linear_fused"),
+            REASON_UNAVAILABLE,
+            "an op this window never recorded must get the honest unavailable marker, never a \
+             neighbouring op's predicate"
+        );
+        assert_eq!(
+            reason_from_probe_window(&[], "attention_block_fused"),
+            REASON_UNAVAILABLE,
+            "an empty window says so"
+        );
+    }
 
     /// The premise the bf16-on-CPU refusal rests on, pinned rather than
     /// remembered: candle's CPU matmul does not implement BF16.

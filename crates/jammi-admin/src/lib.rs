@@ -36,7 +36,9 @@ use jammi_wire::proto::catalog::{
     SetTenantRequest, Tenant,
 };
 use jammi_wire::proto::training::training_service_client::TrainingServiceClient;
-use jammi_wire::proto::training::{ListTrainingJobsRequest, TrainingStatusRequest};
+use jammi_wire::proto::training::{
+    ListTrainingJobsRequest, TrainingStatusRequest, TrainingStatusResponse,
+};
 use jammi_wire::{
     channel_from_proto, columns_to_proto, definition_list_from_proto, definition_to_proto,
     encode_ipc_stream, error_from_status, model_from_proto, source_descriptor_from_proto,
@@ -229,10 +231,13 @@ impl CatalogClient {
     // --- training jobs (read-only) ----------------------------------------
 
     /// Read one training job's lifecycle status by id: status, output model id
-    /// (empty until completed), and the failure message (non-empty exactly when
-    /// status is `"failed"`). The control-plane read peer of the data-plane
-    /// client's submit — there is no progress surface to read (the engine
-    /// persists run metrics only at job finalization).
+    /// (empty until completed), the failure message (non-empty exactly when
+    /// status is `"failed"`), and the run-metrics blob (issue #441; present once
+    /// the worker has stamped a first run record — the same catalog
+    /// `training_jobs.metrics` column the wire's `TrainingStatus.metrics_json`
+    /// carries). The control-plane read peer of the data-plane client's submit —
+    /// there is no progress surface to read (the engine persists run metrics
+    /// only at job finalization, with an early partial stamp at claim time).
     pub async fn training_status(&self, job_id: &str) -> Result<TrainingStatusInfo> {
         let resp = self
             .training_client()
@@ -242,11 +247,7 @@ impl CatalogClient {
             .await
             .map_err(|s| error_from_status(&s))?
             .into_inner();
-        Ok(TrainingStatusInfo {
-            status: resp.status,
-            model_id: resp.model_id,
-            error: resp.error,
-        })
+        Ok(training_status_info_from_proto(resp))
     }
 
     /// List training jobs visible to the session tenant, most recent first —
@@ -482,6 +483,64 @@ pub struct TrainingStatusInfo {
     pub model_id: String,
     /// The failure message; non-empty exactly when `status` is `"failed"`.
     pub error: String,
+    /// Run metrics recorded for this job, as the opaque JSON blob text the
+    /// wire's `TrainingStatus.metrics_json` carries (issue #441) — the SAME
+    /// catalog `training_jobs.metrics` column the embedded `TrainingJob.
+    /// metrics()` reads. `None` for a job with no run record yet (still
+    /// `"queued"`); this control-plane read never decodes or re-encodes the
+    /// blob, so it stays byte-identical to the wire field. Schema documented
+    /// at the trainer, not here.
+    pub metrics_json: Option<String>,
+}
+
+/// Build a [`TrainingStatusInfo`] from the wire response. Pulled out of
+/// [`CatalogClient::training_status`] so the `metrics_json` present/absent
+/// mapping is unit-testable without a live gRPC round trip.
+fn training_status_info_from_proto(resp: TrainingStatusResponse) -> TrainingStatusInfo {
+    TrainingStatusInfo {
+        status: resp.status,
+        model_id: resp.model_id,
+        error: resp.error,
+        metrics_json: resp.metrics_json,
+    }
+}
+
+#[cfg(test)]
+mod training_status_info_tests {
+    use super::*;
+
+    /// The present arm: a completed job's wire response carries a metrics
+    /// blob, and the control-plane read relays it verbatim (no decode, no
+    /// re-encode) — byte-identical to the wire text.
+    #[test]
+    fn metrics_json_present_arm_carries_the_wire_blob_verbatim() {
+        let resp = TrainingStatusResponse {
+            status: "completed".to_string(),
+            model_id: "jammi:fine-tuned:abc".to_string(),
+            error: String::new(),
+            metrics_json: Some(r#"{"final_loss":0.1,"train_loss_curve":[[0,0.2]]}"#.to_string()),
+        };
+        let info = training_status_info_from_proto(resp);
+        assert_eq!(
+            info.metrics_json.as_deref(),
+            Some(r#"{"final_loss":0.1,"train_loss_curve":[[0,0.2]]}"#)
+        );
+    }
+
+    /// The absent arm: a queued job's wire response carries no metrics field
+    /// yet (field presence, not an empty string) — the control-plane read
+    /// stays `None`, never inventing an empty-object placeholder.
+    #[test]
+    fn metrics_json_absent_arm_stays_none() {
+        let resp = TrainingStatusResponse {
+            status: "queued".to_string(),
+            model_id: String::new(),
+            error: String::new(),
+            metrics_json: None,
+        };
+        let info = training_status_info_from_proto(resp);
+        assert_eq!(info.metrics_json, None);
+    }
 }
 
 /// One row of [`CatalogClient::list_training_jobs`]: the

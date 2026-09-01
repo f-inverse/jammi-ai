@@ -178,7 +178,15 @@ clap = { version = "4", features = ["derive"] }
 
 # Utilities
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `float_roundtrip`: serde_json's DEFAULT float parsing is not correctly
+# rounded — a 17-significant-digit f64 (e.g. an averaged loss) can re-parse
+# 1 ulp off, so a blob written exactly (ryu) reads back as a DIFFERENT f64.
+# Python's json.loads parses correctly rounded, so without this feature the
+# embedded (Rust-parsed) and remote (Python-parsed) reads of one identical
+# metrics blob can disagree by 1 ulp — a cross-surface parity defect, not a
+# test nicety. Proven by CI run 33447230995's bit-identity failure
+# (0.42201741678374155 -> 0.4220174167837415) and a minimal two-arm repro.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 toml = "0.8"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }

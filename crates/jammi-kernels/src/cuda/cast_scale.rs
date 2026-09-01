@@ -28,6 +28,19 @@ pub(crate) fn cuda_fwd_cast_scale_bf16_f32(
     let n = shape.elem_count();
     let scale_f32 = scale as f32;
 
+    // Contiguity is checked FIRST, unconditionally -- even before the
+    // `n == 0` fast path below -- so a non-contiguous VIEW is refused the
+    // same way whether or not it happens to be empty, matching this op's
+    // own documented CUDA domain (module doc: "The CUDA arm additionally
+    // REQUIRES contiguous storage"; `cpu_fwd` itself never requires
+    // contiguity -- it walks `StridedOffsets` -- so this is the CUDA arm's
+    // OWN self-consistency, not a match to a `cpu_fwd` requirement). `o1`/
+    // `o2` are unused by the `n == 0` branch itself -- computed here only
+    // so the domain check runs in the same place for both branches.
+    let (o1, o2) = l1
+        .contiguous_offsets()
+        .ok_or(Error::RequiresContiguous { op: OP })?;
+
     // n == 0: match every other op's CUDA glue in this crate — an explicit
     // empty allocation, never a `LaunchConfig::for_num_elems(0)` launch
     // (grid_dim (0, 1, 1) is illegal).
@@ -37,9 +50,6 @@ pub(crate) fn cuda_fwd_cast_scale_bf16_f32(
 
     super::check_elem_count_fits_u32(OP, n)?;
 
-    let (o1, o2) = l1
-        .contiguous_offsets()
-        .ok_or(Error::RequiresContiguous { op: OP })?;
     let cfg = super::elemwise_launch_config(n as u32);
 
     let x = s1.as_cuda_slice::<bf16>()?.slice(o1..o2);
@@ -93,18 +103,22 @@ pub(crate) fn cuda_launch_cast_scale_bf16_f32_into(
     let n = l1.shape().elem_count();
     let scale_f32 = scale as f32;
 
-    if n == 0 {
-        return Ok(());
-    }
-
-    super::check_elem_count_fits_u32(OP, n)?;
-
+    // Contiguity checked before the `n == 0` fast path, matching this
+    // file's own domain -- see `cuda_fwd_cast_scale_bf16_f32`'s identical
+    // comment above.
     let (o1, o2) = l1
         .contiguous_offsets()
         .ok_or(Error::RequiresContiguous { op: OP })?;
     let (oo1, oo2) = l_out
         .contiguous_offsets()
         .ok_or(Error::RequiresContiguous { op: OP })?;
+
+    if n == 0 {
+        return Ok(());
+    }
+
+    super::check_elem_count_fits_u32(OP, n)?;
+
     let cfg = super::elemwise_launch_config(n as u32);
 
     let x = s1.as_cuda_slice::<bf16>()?.slice(o1..o2);
@@ -145,18 +159,21 @@ pub(crate) fn cuda_fwd_cast_add_bf16(
     let shape = l1.shape().clone();
     let n = shape.elem_count();
 
-    if n == 0 {
-        return Ok((super::alloc_empty(&device, DType::BF16, OP)?, shape));
-    }
-
-    super::check_elem_count_fits_u32(OP, n)?;
-
+    // Contiguity checked before the `n == 0` fast path -- see
+    // `cuda_fwd_cast_scale_bf16_f32`'s identical comment above.
     let (o1_base, o2_base) = l1
         .contiguous_offsets()
         .ok_or(Error::RequiresContiguous { op: OP })?;
     let (o1_f32, o2_f32) = l2
         .contiguous_offsets()
         .ok_or(Error::RequiresContiguous { op: OP })?;
+
+    if n == 0 {
+        return Ok((super::alloc_empty(&device, DType::BF16, OP)?, shape));
+    }
+
+    super::check_elem_count_fits_u32(OP, n)?;
+
     let cfg = super::elemwise_launch_config(n as u32);
 
     let base = s1.as_cuda_slice::<bf16>()?.slice(o1_base..o2_base);
@@ -216,12 +233,8 @@ pub(crate) fn cuda_launch_cast_add_bf16_into(
     let device = s1.device().clone();
     let n = l1.shape().elem_count();
 
-    if n == 0 {
-        return Ok(());
-    }
-
-    super::check_elem_count_fits_u32(OP, n)?;
-
+    // Contiguity checked before the `n == 0` fast path -- see
+    // `cuda_fwd_cast_scale_bf16_f32`'s identical comment above.
     let (o1_base, o2_base) = l1
         .contiguous_offsets()
         .ok_or(Error::RequiresContiguous { op: OP })?;
@@ -231,6 +244,13 @@ pub(crate) fn cuda_launch_cast_add_bf16_into(
     let (oo1, oo2) = l_out
         .contiguous_offsets()
         .ok_or(Error::RequiresContiguous { op: OP })?;
+
+    if n == 0 {
+        return Ok(());
+    }
+
+    super::check_elem_count_fits_u32(OP, n)?;
+
     let cfg = super::elemwise_launch_config(n as u32);
 
     let base = s1.as_cuda_slice::<bf16>()?.slice(o1_base..o2_base);

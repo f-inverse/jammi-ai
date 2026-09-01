@@ -1035,15 +1035,26 @@ pub fn admission_mode() -> AdmissionMode {
     })
 }
 
-/// Whether `d` is a device every fused CPU/CUDA-backed op in this crate can
-/// actually run on: CPU always, and CUDA only when THIS BUILD compiled
-/// jammi-kernels' `cuda` feature (`cfg!(feature = "cuda")`).
+/// Whether `d` is a device every fused CPU/CUDA-backed `apply2`/`apply3`
+/// site in this crate can actually run on: CPU always, and CUDA only when
+/// THIS BUILD compiled jammi-kernels' `cuda` feature (`cfg!(feature =
+/// "cuda")`).
 ///
-/// Metal is refused unconditionally — no op in this crate has a `metal_fwd`,
-/// and candle's default `metal_fwd` ERRORS rather than falling back, so a
+/// **This function gates `apply2`/`apply3` sites specifically — it is not
+/// "does ANY op in this crate have a `metal_fwd`".** Metal is refused
+/// unconditionally here because no BINARY/TERNARY op this function gates
+/// (`LowRankResidualLinear`, `ScaledCastAdd`, and every other
+/// `CustomOp2`/`CustomOp3` this crate ships) has a `metal_fwd`, and
+/// candle's default `metal_fwd` ERRORS rather than falling back, so a
 /// Metal tensor reaching `apply2`/`apply3` would turn a working eager
 /// forward into a hard error rather than a clean fallback; refusing it here,
-/// before the tensor ever reaches an op, is what keeps the fallback clean.
+/// before the tensor ever reaches one of those ops, is what keeps the
+/// fallback clean. `ops::DropoutFused` (a UNARY `CustomOp1`, reached only
+/// through `apply1`, never through this predicate) is the one exception in
+/// this crate — see its module doc's "Metal: a device-scoped deterministic
+/// host fallback" section (issue #433) — but that does not change this
+/// function's answer for `apply2`/`apply3`'s own device set, which stays
+/// CPU/CUDA-only until one of those ops grows a real `metal_fwd` too.
 ///
 /// The `cfg!(feature = "cuda")` half exists for a narrower reason than
 /// Metal's: candle's `CustomOp2::cuda_fwd` ALSO has a default impl (a typed
@@ -1274,6 +1285,19 @@ mod tests {
         assert!(!ComputeCapability::new(0, 0).meets_minimum());
     }
 
+    /// Panics if `JAMMI_REQUIRE_FLASH` is set, since a caller in that lane
+    /// must not be allowed to silently skip the flash-arm assertions.
+    #[cfg(test)]
+    fn require_flash_compiled_or_skip(test_name: &str) {
+        if std::env::var_os("JAMMI_REQUIRE_FLASH").is_some() {
+            panic!(
+                "{test_name}: JAMMI_REQUIRE_FLASH is set but this build's jammi-kernels was \
+                 compiled without the flash-attn feature (FLASH_COMPILED=false) -- this lane \
+                 must run the real flash arm, not skip it"
+            );
+        }
+    }
+
     /// The `flash_built_arches()` ACCESSOR's own behavior under this crate's
     /// default (no `flash-attn`) test build: `arches.is_empty()` here proves
     /// only that the `FLASH_COMPILED` gate degrades correctly (M3 plan v2
@@ -1292,6 +1316,17 @@ mod tests {
     /// feature configuration including this crate's default build, is
     /// [`gencode_smss_env_var_matches_the_pinned_build_rs_set`] below — see
     /// that test's own doc for why `env!()` makes it possible.
+    ///
+    /// Panics rather than silently letting this test skip its
+    /// exact-pinned-arch-set assertions when `JAMMI_REQUIRE_FLASH` is set
+    /// but this build was not compiled with the `flash-attn` feature
+    /// (`FLASH_COMPILED == false`) — mirrors `jammi_encoders::modernbert`'s
+    /// own `flash_compiled_or_skip` gate (same env var, same "this lane
+    /// must run the real flash arm, not skip it" rationale), narrowed here
+    /// to the feature-compilation check alone via
+    /// [`require_flash_compiled_or_skip`]: this test has no device to
+    /// probe, `flash_built_arches()` is a pure compile-time accessor, so
+    /// there is no arch-membership half to check.
     #[test]
     fn flash_built_arches_degrades_to_empty_without_flash_compiled() {
         let arches = flash_built_arches();
@@ -1299,6 +1334,9 @@ mod tests {
             assert!(
                 arches.is_empty(),
                 "flash-attn not compiled: flash_built_arches() must be empty, not {arches:?}"
+            );
+            require_flash_compiled_or_skip(
+                "flash_built_arches_degrades_to_empty_without_flash_compiled",
             );
             return;
         }
@@ -1616,12 +1654,76 @@ mod tests {
         assert!(!FLASH_COMPILED || CUDA_COMPILED);
     }
 
+    /// Acquire a Metal device for [`device_is_supported_rejects_metal`]'s
+    /// own `metal`-feature-only leg, or `None` to skip — unless
+    /// `JAMMI_REQUIRE_METAL` is set, in which case a device-acquisition
+    /// failure PANICS. Wraps `Device::new_metal(0)` in
+    /// `std::panic::catch_unwind`, mirroring `tests/metal_parity.rs`'s own
+    /// `metal_device_or_skip`: on at least one real GH `macos-14` runner
+    /// `Device::new_metal(0)` does not merely return `Err` on a
+    /// missing/broken device — an `objc2` class lookup inside
+    /// candle-metal-kernels' `residency_set.rs:18`
+    /// (`MTLResidencySetDescriptor`) can PANIC instead, a probe-time
+    /// failure mode a bare `Result` cannot model. Catching that panic here
+    /// is sound for the same reason `tests/metal_parity.rs`'s own doc
+    /// gives: the probe owns no lock and mutates no shared state before
+    /// failing, so unwinding out of it leaves nothing poisoned to clean
+    /// up. Both failure shapes (a returned `Err`, or a caught panic) fold
+    /// into the same skip/require decision below.
+    #[cfg(all(test, feature = "metal"))]
+    fn metal_device_or_skip(test_name: &str) -> Option<Device> {
+        let outcome: std::result::Result<Device, String> =
+            match std::panic::catch_unwind(|| Device::new_metal(0)) {
+                Ok(Ok(d)) => Ok(d),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(payload) => {
+                    let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "<non-string panic payload>".to_string()
+                    };
+                    Err(format!("Device::new_metal(0) panicked: {msg}"))
+                }
+            };
+        match outcome {
+            Ok(d) => Some(d),
+            Err(msg) => {
+                if std::env::var_os("JAMMI_REQUIRE_METAL").is_some() {
+                    panic!(
+                        "{test_name}: JAMMI_REQUIRE_METAL is set but no Metal device is \
+                         available: {msg}"
+                    );
+                }
+                eprintln!(
+                    "{test_name}: no Metal device available in this build/host -- skipping the \
+                     Metal leg"
+                );
+                None
+            }
+        }
+    }
+
     #[test]
     fn device_is_supported_rejects_metal() {
-        // No `metal` feature exists on this crate at all — the predicate
-        // must reject `Device::Metal` structurally, not via a cfg this
-        // crate doesn't even define. Mirrors
+        // `device_is_supported` must reject `Device::Metal` STRUCTURALLY —
+        // unconditionally, with no `cfg(feature = "metal")` branch of its
+        // own body (see its doc: this crate's `apply2`/`apply3` sites have
+        // no `metal_fwd`, regardless of whether candle-core itself was
+        // compiled with Metal support). This crate's own `metal` feature
+        // (added for issue #433, gating ONLY `tests/metal_parity.rs` and
+        // `ops::DropoutFused`'s UNARY `metal_fwd`) changes what
+        // `candle_core::MetalDevice` even IS at compile time — a real,
+        // non-unit struct when active, the dummy unit struct otherwise —
+        // so constructing a value of it (not `device_is_supported` itself)
+        // is the one place that legitimately needs a `cfg` branch. Mirrors
         // `jammi_encoders::layer_norm::tests::device_is_supported_rejects_metal`.
+        #[cfg(feature = "metal")]
+        let Some(metal) = metal_device_or_skip("device_is_supported_rejects_metal") else {
+            return;
+        };
+        #[cfg(not(feature = "metal"))]
         let metal = Device::Metal(candle_core::MetalDevice);
         assert!(!device_is_supported(&metal));
         // CPU is unconditionally supported regardless of build features.

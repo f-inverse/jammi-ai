@@ -713,6 +713,37 @@ class RemoteTrainingJob:
                 raise TrainingError(resp.error or "training job failed")
             time.sleep(self._POLL_INTERVAL_SECONDS)
 
+    def metrics(self) -> Dict[str, Any]:
+        """Run metrics recorded for this job, as a dict.
+
+        The remote peer of the embedded `TrainingJob.metrics`: parses the
+        `TrainingStatusResponse.metrics_json` field the server fills verbatim
+        from the catalog's `training_jobs.metrics` column — the run-summary
+        blob the trainer hands the worker at completion (`final_loss`,
+        `early_stopping_metric`, `total_steps`, `started_at`,
+        `completed_at`, and the per-epoch `train_loss_curve` /
+        `val_loss_curve` arrays), or the `error_message` blob a failed
+        attempt records instead. Returns ``{}`` for a job that has not yet
+        recorded any metrics (e.g. still queued or running before its first
+        stamp) — `metrics_json` is unset on the wire in that case.
+
+        Raises :class:`jammi.errors.BackendError` if `metrics_json` IS set
+        but fails to parse as JSON — a catalog data-integrity fault, never
+        silently folded into the "not yet recorded" `{}` case. Mirrors the
+        embedded `TrainingJob.metrics`, which raises the same class for the
+        same present-but-malformed state.
+        """
+        resp = self._status_response()
+        if not resp.HasField("metrics_json"):
+            return {}
+        try:
+            return json.loads(resp.metrics_json)
+        except json.JSONDecodeError as exc:
+            raise BackendError(
+                f"training job {self._job_id}: metrics blob failed to parse "
+                f"as JSON: {exc}"
+            ) from exc
+
 
 class RemoteDatabase:
     """A Database driving a remote jammi engine over the `jammi.v1` gRPC wire.

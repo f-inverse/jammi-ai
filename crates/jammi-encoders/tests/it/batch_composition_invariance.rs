@@ -453,6 +453,35 @@ fn cuda_device_or_skip(test_name: &str) -> Option<Device> {
     }
 }
 
+/// Require-gate (KO-7) for the sm89 window-radius admissibility exclusion
+/// documented above `pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda`
+/// (module doc's "Conjunctive red controls (scoped per-arch)" section): this
+/// control's own measured minimum separation on sm89 (L40S) is SMALLER than
+/// `SM89_COMPOSITION_FLOOR`, so it is genuinely, documentedly INADMISSIBLE
+/// there and taking this branch (skip, not assert) is correct even during a
+/// full `JAMMI_REQUIRE_CUDA=1` pod sweep that includes an sm89 arch (unit 62
+/// landing round, pod `kccwbawx92pou1`). A DIFFERENT resource is what this
+/// gate protects: not "is a CUDA device present" (that is
+/// `cuda_device_or_skip`'s own job), but "is this exclusion still exactly
+/// the one measured, documented sm89 case" -- a lane that wants to prove
+/// this branch never silently fires (e.g. a `probe_cuda_compute_capability`
+/// regression that misclassifies every arch as sm89, which would silently
+/// widen this exclusion to every arch and make the control vacuous
+/// everywhere) sets `JAMMI_REQUIRE_CUDA_SM89_WINDOW_CONTROL_EXCLUSION`, in
+/// which case taking this branch at all panics rather than silently
+/// skipping. Ordinary landing/CI runs -- including the four-arch pod sweep
+/// this file's own bounds were measured from -- leave it unset.
+#[cfg(feature = "cuda")]
+fn sm89_window_control_exclusion_require_gate(test_name: &str) {
+    if std::env::var_os("JAMMI_REQUIRE_CUDA_SM89_WINDOW_CONTROL_EXCLUSION").is_some() {
+        panic!(
+            "{test_name}: JAMMI_REQUIRE_CUDA_SM89_WINDOW_CONTROL_EXCLUSION is set but this leg \
+             is taking the sm89 window-radius admissibility exclusion -- this lane requires \
+             that exclusion be proven never to silently fire, not silently taken"
+        );
+    }
+}
+
 /// `Σ|a_i - b_i| / max(Σ|a_i|, f32::EPSILON)` -- a bare relative-L1
 /// ratio whose noise-free value is `0.0` (matching this file's CPU
 /// metric's floor), used for the `bf16` legs where an absolute
@@ -873,6 +902,7 @@ fn pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda() {
              gpu_composition_floor's own doc for the full derivation and the row-length \
              control's universal admissibility on this same arch."
         );
+        sm89_window_control_exclusion_require_gate(test_name);
         return;
     }
     let composition_floor = gpu_composition_floor(&device);

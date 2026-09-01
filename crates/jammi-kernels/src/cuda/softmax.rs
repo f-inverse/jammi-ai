@@ -89,7 +89,36 @@ pub(crate) fn cuda_fwd(
     let device = s1.device().clone();
     let n = l1.shape().elem_count();
 
-    if last == 0 || n == 0 {
+    // `last == 0` is checked FIRST, on its own — matching `cpu_fwd`'s
+    // domain exactly: `ops::softmax::SoftmaxLastDimFused::cpu_fwd` exempts
+    // contiguity ONLY when `last == 0` (its own early `empty_like` return,
+    // BEFORE `contiguous_offsets()`), never for a broader `n == 0`.
+    if last == 0 {
+        if s1.dtype() != s2.dtype() {
+            return Err(Error::DTypeMismatchBinaryOp {
+                lhs: s1.dtype(),
+                rhs: s2.dtype(),
+                op: OP,
+            });
+        }
+        return Ok((super::alloc_empty(&device, s1.dtype(), OP)?, shape));
+    }
+
+    // Contiguity is checked NEXT, before the (now `last != 0`) `n == 0`
+    // fast path below — a `rows == 0` (`n == 0` with `last != 0`)
+    // empty-but-non-contiguous layout still falls through `cpu_fwd`'s OWN
+    // `contiguous_offsets()` call (only `last == 0`, handled above, skips
+    // it there), so this arm must refuse the same layout rather than
+    // silently admitting it through a combined `last == 0 || n == 0` fast
+    // path — the exact class of divergence this fix closes.
+    let (o1, o2) = l1
+        .contiguous_offsets()
+        .ok_or(Error::RequiresContiguous { op: OP })?;
+    let (m1, m2) = l2
+        .contiguous_offsets()
+        .ok_or(Error::RequiresContiguous { op: OP })?;
+
+    if n == 0 {
         if s1.dtype() != s2.dtype() {
             return Err(Error::DTypeMismatchBinaryOp {
                 lhs: s1.dtype(),
@@ -103,12 +132,6 @@ pub(crate) fn cuda_fwd(
     check_rank(OP, rank)?;
     check_last_and_n(OP, n, last)?;
 
-    let (o1, o2) = l1
-        .contiguous_offsets()
-        .ok_or(Error::RequiresContiguous { op: OP })?;
-    let (m1, m2) = l2
-        .contiguous_offsets()
-        .ok_or(Error::RequiresContiguous { op: OP })?;
     let s_lead = lead_dims3(&l1.dims()[..rank - 1]);
     let m_lead = lead_dims3(&l2.dims()[..rank - 1]);
 
@@ -194,7 +217,31 @@ pub(crate) fn cuda_bwd_dscores(
     let device = s1.device().clone();
     let n = l1.shape().elem_count();
 
-    if last == 0 || n == 0 {
+    // See `cuda_fwd`'s identical comment above: `last == 0` is checked on
+    // its own, matching `ops::softmax`'s internal `SoftmaxBwdDScores::
+    // cpu_fwd` domain (its own early `empty_like` return is gated on
+    // `last == 0` alone, before `contiguous_offsets()`).
+    if last == 0 {
+        if s1.dtype() != s2.dtype() {
+            return Err(Error::DTypeMismatchBinaryOp {
+                lhs: s1.dtype(),
+                rhs: s2.dtype(),
+                op: OP,
+            });
+        }
+        return Ok((super::alloc_empty(&device, s1.dtype(), OP)?, shape));
+    }
+
+    // Contiguity checked before the (now `last != 0`) `n == 0` fast path —
+    // see `cuda_fwd`'s identical comment above.
+    let (o1, o2) = l1
+        .contiguous_offsets()
+        .ok_or(Error::RequiresContiguous { op: OP })?;
+    let (d1, d2) = l2
+        .contiguous_offsets()
+        .ok_or(Error::RequiresContiguous { op: OP })?;
+
+    if n == 0 {
         if s1.dtype() != s2.dtype() {
             return Err(Error::DTypeMismatchBinaryOp {
                 lhs: s1.dtype(),
@@ -206,13 +253,6 @@ pub(crate) fn cuda_bwd_dscores(
     }
     check_last_and_n(OP, n, last)?;
     let rows = n / last;
-
-    let (o1, o2) = l1
-        .contiguous_offsets()
-        .ok_or(Error::RequiresContiguous { op: OP })?;
-    let (d1, d2) = l2
-        .contiguous_offsets()
-        .ok_or(Error::RequiresContiguous { op: OP })?;
 
     let cfg = LaunchConfig {
         grid_dim: (rows as u32, 1, 1),

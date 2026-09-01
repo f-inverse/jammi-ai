@@ -252,6 +252,7 @@ fn scaffold_probe_crate(root: &Path) {
 
     fs::write(
         crate_dir.join("src").join("main.rs"),
+        // kernel-oracles: fn-in-literal reviewed: probe crate's src/main.rs source text (a build.rs fixture), not real code — legitimately contains a literal "fn main() {" substring
         "fn main() {\n    \
          println!(\"JAMMI_BUILD_SHA={}\", env!(\"JAMMI_BUILD_SHA\"));\n    \
          println!(\"JAMMI_BUILD_TARGET={}\", env!(\"JAMMI_BUILD_TARGET\"));\n    \

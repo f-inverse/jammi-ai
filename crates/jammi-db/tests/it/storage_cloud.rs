@@ -60,6 +60,25 @@ fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.is_empty())
 }
 
+/// Require-gate (KO-7) for the `JAMMI_TEST_*_BUCKET`-unset skip every live
+/// cloud round-trip test in this file falls through to: by default (unset)
+/// the round trip still silently skips, exactly as before — a lane that
+/// wants to REQUIRE the real live-cloud round trip run (never silently skip
+/// it) sets `JAMMI_REQUIRE_LIVE_STORAGE`, and this call panics instead.
+#[cfg(any(
+    feature = "live-s3-tests",
+    feature = "live-gcs-tests",
+    feature = "live-azure-tests"
+))]
+fn require_live_storage(test_name: &str, bucket_env: &str) {
+    if std::env::var_os("JAMMI_REQUIRE_LIVE_STORAGE").is_some() {
+        panic!(
+            "{test_name}: JAMMI_REQUIRE_LIVE_STORAGE is set but {bucket_env} is unset -- this \
+             lane must run the real live-cloud round trip, not skip it"
+        );
+    }
+}
+
 #[cfg(any(
     feature = "live-s3-tests",
     feature = "live-gcs-tests",
@@ -108,6 +127,7 @@ async fn round_trip_under(url: StorageUrl) {
 async fn s3_parquet_round_trip() {
     let Some(base) = env("JAMMI_TEST_S3_BUCKET") else {
         tracing::warn!("JAMMI_TEST_S3_BUCKET unset; skipping live S3 test");
+        require_live_storage("s3_parquet_round_trip", "JAMMI_TEST_S3_BUCKET");
         return;
     };
     let key = format!(
@@ -124,6 +144,7 @@ async fn s3_parquet_round_trip() {
 async fn gcs_parquet_round_trip() {
     let Some(base) = env("JAMMI_TEST_GCS_BUCKET") else {
         tracing::warn!("JAMMI_TEST_GCS_BUCKET unset; skipping live GCS test");
+        require_live_storage("gcs_parquet_round_trip", "JAMMI_TEST_GCS_BUCKET");
         return;
     };
     let key = format!(
@@ -140,6 +161,7 @@ async fn gcs_parquet_round_trip() {
 async fn azure_parquet_round_trip() {
     let Some(base) = env("JAMMI_TEST_AZURE_BUCKET") else {
         tracing::warn!("JAMMI_TEST_AZURE_BUCKET unset; skipping live Azure test");
+        require_live_storage("azure_parquet_round_trip", "JAMMI_TEST_AZURE_BUCKET");
         return;
     };
     let key = format!(

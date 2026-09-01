@@ -69,6 +69,35 @@ const LIFECYCLE_TOPIC: &str = "events.lifecycle";
 /// would differ between the two processes.
 const LIFECYCLE_TOPIC_ID: &str = "11111111-1111-4111-8111-111111111111";
 
+/// Require-gate (KO-7) for the SIGKILL-harness "am I the respawned child"
+/// dispatch every crash-recovery test in this file checks first:
+/// [`CHILD_MARKER_ENV`] is set ONLY by this file's OWN `Command::env(
+/// CHILD_MARKER_ENV, "1")` calls, which spawn a fresh child process that
+/// re-invokes the exact same test by name — there is no live external
+/// resource to require here (the dispatch is deterministic, never
+/// availability-dependent). The gate exists to close KO-7's "unrun-is-RED"
+/// concern for a DIFFERENT, real failure mode: a leaked/persistent
+/// `JAMMI_TEST_CRASH_CHILD` in the process environment (e.g. exported by a
+/// prior debug session, or a CI step that forgot to scope it) would make
+/// the TOP-LEVEL `cargo test` invocation itself silently take this branch,
+/// run only the child workload, and never exercise the real SIGKILL +
+/// recovery assertions below it — a green run that proved nothing. A lane
+/// that wants to assert this can never silently happen sets
+/// `JAMMI_REQUIRE_CRASH_RECOVERY_HARNESS`; ordinary runs — including this
+/// harness's own legitimate spawned-child re-invocation, which inherits the
+/// parent process's environment and so would ALSO inherit this var were a
+/// lane to set it globally — leave it unset.
+fn crash_recovery_child_dispatch_require_gate(test_name: &str) {
+    if std::env::var_os("JAMMI_REQUIRE_CRASH_RECOVERY_HARNESS").is_some() {
+        panic!(
+            "{test_name}: JAMMI_REQUIRE_CRASH_RECOVERY_HARNESS is set but this invocation is \
+             dispatching into the SIGKILL-harness CHILD branch (JAMMI_TEST_CRASH_CHILD is set) \
+             -- this lane must prove the PARENT-role spawn/kill/recover assertions actually run, \
+             never silently take the child-only branch"
+        );
+    }
+}
+
 fn crash_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -128,6 +157,9 @@ async fn child_workload() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mutable_partial_insert_rolls_back_under_sigkill() {
     if std::env::var(CHILD_MARKER_ENV).is_ok() {
+        crash_recovery_child_dispatch_require_gate(
+            "mutable_crash_recovery::mutable_partial_insert_rolls_back_under_sigkill",
+        );
         child_workload().await;
         return;
     }
@@ -415,6 +447,7 @@ where
 async fn register_table_crash_leaves_nothing() {
     const NAME: &str = "mutable_crash_recovery::register_table_crash_leaves_nothing";
     if std::env::var(CHILD_MARKER_ENV).is_ok() {
+        crash_recovery_child_dispatch_require_gate(NAME);
         lifecycle_child_workload("register").await;
         return;
     }
@@ -439,6 +472,7 @@ async fn register_table_crash_leaves_nothing() {
 async fn register_topic_crash_leaves_nothing() {
     const NAME: &str = "mutable_crash_recovery::register_topic_crash_leaves_nothing";
     if std::env::var(CHILD_MARKER_ENV).is_ok() {
+        crash_recovery_child_dispatch_require_gate(NAME);
         lifecycle_child_workload("register_topic").await;
         return;
     }
@@ -473,6 +507,7 @@ async fn register_topic_crash_leaves_nothing() {
 async fn drop_table_crash_leaves_everything() {
     const NAME: &str = "mutable_crash_recovery::drop_table_crash_leaves_everything";
     if std::env::var(CHILD_MARKER_ENV).is_ok() {
+        crash_recovery_child_dispatch_require_gate(NAME);
         lifecycle_child_workload("drop_table").await;
         return;
     }
@@ -501,6 +536,7 @@ async fn drop_table_crash_leaves_everything() {
 async fn drop_topic_crash_leaves_everything() {
     const NAME: &str = "mutable_crash_recovery::drop_topic_crash_leaves_everything";
     if std::env::var(CHILD_MARKER_ENV).is_ok() {
+        crash_recovery_child_dispatch_require_gate(NAME);
         lifecycle_child_workload("drop_topic").await;
         return;
     }

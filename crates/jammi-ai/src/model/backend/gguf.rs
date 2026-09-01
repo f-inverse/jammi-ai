@@ -445,23 +445,21 @@ fn read_gguf_header(path: &Path, model_id: &str) -> Result<gguf_file::Content> {
 ///   densified byte count across every non-matmul-site tensor, which this
 ///   fixture does not exercise.
 ///
-/// # The non-GGUF safetensors residency path is dtype-blind and out of this unit's scope
+/// # The non-GGUF safetensors residency path (issue #431 — CLOSED, see [`super::safetensors_residency`])
 ///
-/// `ModelResolver`'s non-GGUF residency estimate (the plain
-/// `std::fs::metadata` file-size sum in each of `resolver.rs`'s three
-/// resolve paths) is a SEPARATE, PRE-EXISTING estimator this unit does
-/// NOT touch (issue #351's contract froze it — see contract A5). It is
-/// genuinely dtype-blind, and CAN under-report true residency: nothing at
-/// resolve time validates that a safetensors checkpoint's on-disk stored
-/// dtype matches the `compute_precision`/`effective_precision` it will
-/// actually be loaded at, and `CandleBackend::load` always loads a
-/// safetensors checkpoint at `compute_dtype`/`effective_precision`
-/// regardless of what dtype it was SAVED at (candle.rs's
-/// `VarBuilder::from_mmaped_safetensors` call). An
-/// F16-on-disk checkpoint served under the `F32` default is therefore
+/// `ModelResolver`'s safetensors residency estimate USED TO BE (issue #351's
+/// contract froze it at the time — contract A5) the plain `std::fs::metadata`
+/// file-size sum in each of `resolver.rs`'s three resolve paths, and was
+/// genuinely dtype-blind: nothing at resolve time validated that a
+/// safetensors checkpoint's on-disk stored dtype matched the
+/// `compute_precision`/`effective_precision` it would actually be loaded at,
+/// while `CandleBackend::load` always loads a safetensors checkpoint at
+/// `compute_dtype`/`effective_precision` regardless of what dtype it was
+/// SAVED at (candle.rs's `VarBuilder::from_mmaped_safetensors` call). An
+/// F16-on-disk checkpoint served under the `F32` default was therefore
 /// resident at roughly 2x its file-byte sum — a real under-estimate, not a
 /// hypothetical one (the `F32` default that
-/// `candle.rs:2522-2524`'s `per_model_precision.unwrap_or(device_config.compute_precision)`
+/// `candle.rs`'s `per_model_precision.unwrap_or(device_config.compute_precision)`
 /// falls back to whenever neither `config.json` nor `DeviceConfig` overrides
 /// it is produced not by `ComputePrecision`'s own `#[default]` arm
 /// (`jammi_numerics::precision.rs:38-41`) but by `GpuConfig`'s manual
@@ -473,12 +471,24 @@ fn read_gguf_header(path: &Path, model_id: &str) -> Result<gguf_file::Content> {
 /// `#[serde(default)]` (`jammi-db/src/config.rs:384`) to
 /// `GpuConfig::default()`, never to `ComputePrecision::default()`, making
 /// it a second hand-written `F32` default independent of `precision.rs:40`
-/// and thus able to drift from it). `jammi_ai::model::backend::ort`'s own residency estimator
-/// separately applies a 1.3x multiplier over its file-size sum
-/// (`OrtBackend::estimate_memory`, `ort.rs:34`) — an observed, uncommented
-/// constant in that file, not something this module's own reasoning
-/// derives or explains. Fixing the safetensors estimator is out of scope
-/// for this unit; it is tracked by a follow-up issue.
+/// and thus able to drift from it).
+///
+/// Issue #431 closed this: `ModelResolver`'s three resolve paths and
+/// `CandleBackend::estimate_memory` now route a safetensors checkpoint
+/// through [`super::safetensors_residency::estimate_safetensors_residency`],
+/// which parses ONLY the safetensors header (never tensor data — the same
+/// "header, not data" shape this function uses) and costs every tensor at
+/// `elem_count * max(on_disk_dtype_bytes, `[`widest_compute_precision_byte_size`]`())`
+/// — the SAME widest-width clamp this function applies to every densified
+/// GGUF tensor, for the same reason (conservative under every reachable
+/// effective precision, including a persisted adapter's own
+/// `backbone_dtype`). `jammi_ai::model::backend::ort`'s own residency
+/// estimator still separately applies a 1.3x multiplier over its file-size
+/// sum (`OrtBackend::estimate_memory`, `ort.rs:34`) — an observed,
+/// uncommented constant in that file, not something this module's own
+/// reasoning derives or explains, and out of scope for issue #431 (the ORT
+/// backend is unavailable in this build regardless — `OrtBackend::load`
+/// always returns a typed refusal).
 pub(crate) fn estimate_gguf_residency(
     path: &Path,
     model_config: &serde_json::Value,

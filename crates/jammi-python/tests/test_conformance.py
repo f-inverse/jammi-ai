@@ -23,6 +23,7 @@ until a verb runs. No server is contacted.
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 
 import grpc
 import pytest
@@ -406,13 +407,14 @@ def test_training_verbs_have_identical_signatures_across_wheels():
 
 def test_remote_training_job_matches_the_local_handle_shape():
     """The client's `RemoteTrainingJob` carries the SAME handle surface as the
-    embedded engine's `TrainingJob`: the `job_id` / `model_id` properties and the
-    `status()` / `wait()` methods. A remote `wait()` polls `TrainingStatus` and
-    raises on a failed job with the wire error, mirroring the local handle, so a
-    caller treats the two interchangeably."""
+    embedded engine's `TrainingJob`: the `job_id` / `model_id` properties, the
+    `status()` / `wait()` methods, and `metrics()` (issue #441). A remote
+    `wait()` polls `TrainingStatus` and raises on a failed job with the wire
+    error, mirroring the local handle, so a caller treats the two
+    interchangeably."""
     local = jammi_native.TrainingJob
     remote = jammi.RemoteTrainingJob
-    for member in ("job_id", "model_id", "status", "wait"):
+    for member in ("job_id", "model_id", "status", "wait", "metrics"):
         assert hasattr(remote, member), member
         assert hasattr(local, member), member
     # `job_id` / `model_id` are read-only attributes on both handles (a property
@@ -808,6 +810,236 @@ def test_training_job_handle_protocol_is_satisfied_by_both_handles():
     assert isinstance(remote_job, jammi.TrainingJobHandle)
     for member in ("job_id", "model_id", "status", "wait"):
         assert hasattr(jammi_native.TrainingJob, member), member
+
+
+# crates/jammi-python/tests/this_file -> repo root is three parents up. Shared
+# with test_embedded_training.py: the embedded arm of the metrics-parity test
+# below needs a real `TrainingJob` handle bound to a genuine catalog row, which
+# needs a real base model + source.
+_METRICS_TEST_ROOT = Path(__file__).resolve().parents[3]
+_METRICS_TEST_TINY_BERT = _METRICS_TEST_ROOT / "cookbook" / "fixtures" / "tiny_bert"
+_METRICS_TEST_TRAINING_PAIRS = (
+    _METRICS_TEST_ROOT / "tests" / "fixtures" / "training_pairs.csv"
+)
+
+
+@pytest.mark.skipif(
+    not _METRICS_TEST_TINY_BERT.is_dir() or not _METRICS_TEST_TRAINING_PAIRS.is_file(),
+    reason="local tiny_bert / training_pairs fixtures not present",
+)
+def test_remote_and_embedded_training_job_metrics_agree_on_all_three_states(tmp_path):
+    """`RemoteTrainingJob.metrics()` and the embedded `TrainingJob.metrics()`
+    agree on the SAME three states the catalog's `training_jobs.metrics`
+    column can carry (issue #441 / adversarial-audit r3 BLOCK 4) — proven
+    against a REAL embedded engine + catalog on one arm, not a stub of both:
+
+      * absent (column NULL) -> `{}` on both.
+      * present + valid JSON -> the SAME parsed dict on both.
+      * present + unparseable JSON -> `jammi.errors.BackendError` on both,
+        NEVER silently folded into the absent `{}` case — a malformed-but-
+        present blob is a catalog data-integrity fault, not "not recorded
+        yet", and must fail loudly on both transports identically.
+
+    Drives the compiled `jammi_native._NativeDatabase` primitives DIRECTLY —
+    never the `jammi.EmbeddedBackend`/`jammi.connect` wrapper (`close()` /
+    `training_job()` are native-only today; see the asymmetry note at the
+    bottom of this docstring) — so this proves the built artifact's `close()`
+    and `training_job()` (attach-by-id), not a mock of either.
+
+    History this shape fixes (`esc-073`): `jammi_python::PyTrainingJob` used
+    to expose no way to obtain a handle for a job a session did not itself
+    submit (unlike `RemoteTrainingJob`, built here straight from a stub gRPC
+    channel), so an earlier version of this test opened a FRESH
+    `Database`/live worker PER STATE and seeded its value through a raw
+    `sqlite3` connection while that state's OWN worker was still live on the
+    same catalog file. That reproduced a hard interpreter crash (`Fatal
+    Python error: Bus error`, SIGBUS inside SQLite's own WAL commit path)
+    roughly every other full-suite run: the raw `sqlite3` seed write and the
+    live worker's pooled `sqlx` connection committed to the same
+    `-wal`/`-shm` files at the same instant — two independent SQLite library
+    instances (Python's stdlib `sqlite3` vs. Rust's vendored `sqlx-sqlite`)
+    are not always safe to coexist on one WAL file. `esc-073` tracks the
+    underlying engine-side behavior (a crash instead of a typed refusal for
+    an unsupported topology) as a `jammi-db`-scope defect, out of this
+    crate's reach; THIS test's exposure to it is what the shape below
+    structurally excludes, not merely makes rare.
+
+    `Database.close()` (deterministic worker stop + session release) +
+    `Database.training_job(job_id)` (attach-by-id, the embedded peer of
+    `RemoteTrainingJob`'s always-attach-by-id shape) let one job serve all
+    three states with NO window where a raw `sqlite3` write and a live
+    engine connection coexist:
+
+      1. ONE real job is submitted and driven to completion (`wait()`),
+         then `close()`d — which blocks until the embedded worker this
+         connection owned has actually stopped and this connection's own
+         session handle is released (see `PyDatabase.close`'s doc); the
+         Python references are `del`eted too, so no persistent handle this
+         test still holds (there are none by this point) could keep the
+         session alive past `close()`. No connection this test opened is
+         attached to the catalog file from here on, until step 3 opens a
+         new one.
+      2. Each state injects its own seed value through a raw `sqlite3`
+         connection that is itself fully closed (commit + close) before
+         the next step runs — never overlapping a live engine connection.
+      3. A FRESH `Database` attaches to the job by id and reads
+         `metrics()` — the new pool's first (and only) read of that row,
+         sidestepping the separate, pre-existing stale-pooled-connection
+         hazard (a second read on an already-warm pool not always
+         observing a write that landed through a separate handle) the same
+         way the prior version of this test did — then is itself `close()`d
+         before the next state's injection.
+
+    The "absent" state's `NULL` is INJECTED, not the job's natural
+    just-submitted state: `wait()` blocks until the job reaches `completed`
+    (required before `close()` can run), and by then the worker has already
+    stamped a real run summary into `metrics`. The state under test is the
+    READ arm on the column's three possible SHAPES (`NULL` / valid JSON /
+    malformed JSON) — reusing one job's completed row and overwriting its
+    `metrics` column directly exercises the identical read path the
+    naturally-absent case would (both are `None` at the `Option<String>`
+    boundary `metrics()` matches on), for one real training run instead of
+    three.
+
+    Asymmetry, named rather than papered over: `RemoteDatabase` already has
+    `close()` (used throughout this module); `close()` is therefore symmetric
+    across transports. `training_job(job_id)` is NOT — `RemoteDatabase` has
+    no equivalent convenience method, though a `RemoteTrainingJob` can always
+    be constructed directly from a `job_id` (every one of its verbs re-fetches
+    state over the wire per call, so it needs no server-side "attach" step).
+    Adding a `RemoteDatabase.training_job(...)` convenience method is
+    `clients/python` surface, out of this contract's scope.
+    """
+    import sqlite3
+
+    import jammi_native
+    from jammi._assembly import build_fine_tune_request
+    from jammi._generated.jammi.v1 import training_pb2
+    from jammi.errors import BackendError
+
+    valid_payload = (
+        '{"final_loss": 0.42, "total_steps": 100, '
+        '"train_loss_curve": [{"epoch": 0, "loss": 1.0}, {"epoch": 1, "loss": 0.5}], '
+        '"val_loss_curve": [{"epoch": 0, "loss": 1.1}, {"epoch": 1, "loss": 0.6}]}'
+    )
+    valid_expected = {
+        "final_loss": 0.42,
+        "total_steps": 100,
+        "train_loss_curve": [{"epoch": 0, "loss": 1.0}, {"epoch": 1, "loss": 0.5}],
+        "val_loss_curve": [{"epoch": 0, "loss": 1.1}, {"epoch": 1, "loss": 0.6}],
+    }
+    malformed_payload = '{"final_loss": 0.42, "total_steps"'  # truncated, invalid JSON
+
+    # --- Remote arm: three stubbed `TrainingStatusResponse`s. -------------
+    class _AbsentStub:
+        def TrainingStatus(self, *_args, **_kwargs):
+            return training_pb2.TrainingStatusResponse(status="running")
+
+    class _ValidStub:
+        def TrainingStatus(self, *_args, **_kwargs):
+            return training_pb2.TrainingStatusResponse(
+                status="completed", metrics_json=valid_payload
+            )
+
+    class _MalformedStub:
+        def TrainingStatus(self, *_args, **_kwargs):
+            return training_pb2.TrainingStatusResponse(
+                status="completed", metrics_json=malformed_payload
+            )
+
+    remote_absent = jammi.RemoteTrainingJob(
+        _AbsentStub(), (), job_id="remote-1", model_id="model-1"
+    )
+    remote_valid = jammi.RemoteTrainingJob(
+        _ValidStub(), (), job_id="remote-2", model_id="model-2"
+    )
+    remote_malformed = jammi.RemoteTrainingJob(
+        _MalformedStub(), (), job_id="remote-3", model_id="model-3"
+    )
+
+    assert remote_absent.metrics() == {}
+    assert remote_valid.metrics() == valid_expected
+    with pytest.raises(BackendError, match=r"metrics blob failed to parse as JSON"):
+        remote_malformed.metrics()
+
+    # --- Embedded arm: one real job, three close-before-inject cycles. ----
+    catalog_db = tmp_path / "catalog.db"
+
+    def _set_metrics(job_id: str, value) -> None:
+        conn = sqlite3.connect(str(catalog_db))
+        try:
+            conn.execute(
+                "UPDATE training_jobs SET metrics = ? WHERE job_id = ?",
+                (value, job_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    # Submit + run ONE real fine-tune job directly against the compiled
+    # `_NativeDatabase` — the same request assembly `EmbeddedBackend.fine_tune`
+    # drives, minus the wrapper, so the artifact under test is the native
+    # `close()` / `training_job()` primitives themselves.
+    submit_db = jammi_native.open_local(artifact_dir=str(tmp_path))
+    submit_db.add_source(
+        "metrics_states", url=str(_METRICS_TEST_TRAINING_PAIRS), format="csv"
+    )
+    request = build_fine_tune_request(
+        source="metrics_states",
+        base_model=f"local:{_METRICS_TEST_TINY_BERT}",
+        columns=["text_a", "text_b", "score"],
+        method="lora",
+        task="text_embedding",
+        epochs=2,
+        batch_size=8,
+        lora_rank=4,
+        warmup_steps=0,
+    )
+    submit_job = submit_db._start_training_proto(request.SerializeToString())
+    submit_job.wait()
+    assert submit_job.status() == "completed"
+    job_id = submit_job.job_id
+
+    # Deterministic teardown BEFORE any raw-sqlite3 injection (see the
+    # docstring): no engine connection this test opened is attached to the
+    # catalog file past this point.
+    submit_db.close()
+    del submit_job, submit_db
+
+    def _seed_and_attach(seed):
+        """Inject `seed` through a raw connection that is fully closed
+        before this returns, then attach a FRESH `Database` to the shared
+        job by id — that pool's first read. Returns the still-open
+        `(db, job)` pair so the caller can assert before tearing this
+        state down (`db.close()`) ahead of the next state's injection."""
+        _set_metrics(job_id, seed)
+        db = jammi_native.open_local(artifact_dir=str(tmp_path))
+        return db, db.training_job(job_id)
+
+    # State 1: absent (`NULL`) — injected explicitly; see the docstring on
+    # why the job's OWN natural post-submit state cannot be reused here.
+    absent_db, absent_job = _seed_and_attach(None)
+    assert absent_job.metrics() == {}
+    absent_db.close()
+    del absent_job, absent_db
+
+    # State 2: present + valid — the SAME payload string fed to the remote
+    # stub above, so a genuine equal-dicts comparison, not just "parses to
+    # something".
+    valid_db, valid_job = _seed_and_attach(valid_payload)
+    assert valid_job.metrics() == valid_expected
+    valid_db.close()
+    del valid_job, valid_db
+
+    # State 3: present + malformed — the SAME truncated payload string.
+    malformed_db, malformed_job = _seed_and_attach(malformed_payload)
+    with pytest.raises(
+        BackendError, match=r"metrics blob failed to parse as JSON"
+    ) as embedded_info:
+        malformed_job.metrics()
+    assert job_id in str(embedded_info.value)
+    malformed_db.close()
+    del malformed_job, malformed_db
 
 
 class _StubTenant:

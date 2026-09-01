@@ -52,12 +52,27 @@ mod postgres {
     use jammi_db::catalog::backend_postgres::PostgresBackend;
     use jammi_test_utils::pg_url_for_tests;
 
+    /// Require-gate (KO-7) for the `JAMMI_TEST_PG_URL`-unset skip directly
+    /// below: by default (unset) this test still silently skips, exactly as
+    /// before — a lane that wants to REQUIRE the real Postgres arm actually
+    /// run (never silently skip it) sets `JAMMI_REQUIRE_PG`, and this call
+    /// panics instead of letting the skip through.
+    fn require_live_pg(test_name: &str) {
+        if std::env::var_os("JAMMI_REQUIRE_PG").is_some() {
+            panic!(
+                "{test_name}: JAMMI_REQUIRE_PG is set but JAMMI_TEST_PG_URL is unset -- this \
+                 lane must run the real Postgres arm, not skip it"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn postgres_ping_succeeds_against_live_url() {
         let Some(url) = pg_url_for_tests() else {
             tracing::warn!(
                 "JAMMI_TEST_PG_URL not set; skipping postgres_ping_succeeds_against_live_url"
             );
+            require_live_pg("postgres_ping_succeeds_against_live_url");
             return;
         };
         let pg = PostgresBackend::open_with_options(&url, 4, None)

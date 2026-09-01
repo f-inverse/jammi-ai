@@ -8,9 +8,13 @@
 //! then registered as trainable `Var`s, and a per-layer [`DropoutMasks`]
 //! source draws each training forward's Bernoulli mask device-side, in-kernel
 //! (via `jammi_kernels::ops::DropoutFused`, a counter-based Philox draw —
-//! never candle's unseedable global RNG, and never a host-materialized mask).
-//! Nothing here touches a global RNG, so a fine-tune is a pure function of
-//! `(seed, source rows, config)`.
+//! never candle's unseedable global RNG; never a mask *tensor* on the
+//! autograd tape on any device, and CPU/CUDA never a host round trip at
+//! all — Metal is a disclosed exception, a transient host-side replay of
+//! the identical decision, never a graph-visible tensor; see
+//! [`DropoutMasks`]'s own doc and `jammi_kernels::ops::dropout`'s module
+//! doc). Nothing here touches a global RNG, so a fine-tune is a pure
+//! function of `(seed, source rows, config)`.
 //!
 //! **Cross-process determinism.** Every seeded-init draw stream is keyed by
 //! `(seed, fully-qualified parameter name)` via [`seed_for_param`], never by
@@ -112,11 +116,27 @@ pub(crate) fn gaussian_fill(rng: &mut SplitMix64, len: usize, stdev: f32) -> Vec
 /// `jammi_kernels::ops::dropout` module doc for the full rejected-mechanism
 /// writeup) with the mechanism this commit actually ships: every draw runs
 /// through `jammi_kernels::ops::DropoutFused`, a counter-based Philox
-/// `CustomOp1` — never a host-materialized mask, never a per-device RNG.
+/// `CustomOp1` — never a per-device RNG, and (CPU/CUDA) never a
+/// host-materialized mask at all. **Metal is the one disclosed exception**
+/// (issue #433): `DropoutFused::metal_fwd` has no Metal Philox compute
+/// kernel to run in-kernel the way CPU/CUDA do, so it computes the SAME
+/// decision via a transient host round trip instead (download, run the
+/// identical CPU decision function, re-upload) — see
+/// `jammi_kernels::ops::dropout`'s module doc, "Metal: a device-scoped
+/// deterministic host fallback", for the full design and the honestly
+/// disclosed cost. That transient host buffer is never a `Tensor`, never a
+/// graph node, and never retained past the single `metal_fwd` call, so the
+/// esc-032 residency clause below (no mask tensor on the autograd tape)
+/// still holds on Metal exactly as it does on CPU/CUDA — only the "no host
+/// round trip at all" claim is Metal-specific and disclosed as such.
 ///
 /// The mask for a layer's k-th training forward is a pure function of
-/// `(run seed, layer_id, k, element_index)`. Two properties follow, and
-/// both were absent from the advancing-stream design this replaces:
+/// `(run seed, layer_id, k, element_index)` — IDENTICALLY on every device,
+/// including Metal (see `jammi_kernels::ops::dropout`'s
+/// `tests::metal_matches_cpu_mask_for_identical_seed_key_position` and the
+/// crate-level `tests/metal_parity.rs` for the byte-identity proof). Two
+/// properties follow, and both were absent from the advancing-stream
+/// design this replaces:
 ///
 /// * **Restore is O(1).** The old stream had no closed-form skip, so
 ///   restoring a persisted position replayed that many draws one at a
@@ -124,13 +144,19 @@ pub(crate) fn gaussian_fill(rng: &mut SplitMix64, len: usize, stdev: f32) -> Vec
 ///   ACTIVATION ELEMENT (`batch * seq * in_features` per forward), so
 ///   after a single epoch of a large encoder that is on the order of 1e11
 ///   draws per layer — resume did not merely slow down, it failed to
-///   finish (esc-033). Restoring a counter is an assignment.
-/// * **The mask is never materialized at all**, on either device — closing
-///   the wip branch's finding #2 (candle's `Binary::Mul` backward retains a
-///   full-size gradient FOR a host-built mask tensor, since the mask is not
-///   itself a graph leaf `sorted_nodes` walks). `DropoutFused` is one
-///   `CustomOp1` node forward and one more node backward, with no third
-///   (mask) tensor ever created.
+///   finish (esc-033). Restoring a counter is an assignment, on every
+///   device — this crate's own `restore_position`/O(1) contract is device-
+///   independent, since it only ever touches the atomic counter, never a
+///   device buffer.
+/// * **The mask is never materialized as a graph-tape tensor, on any
+///   device** — closing the wip branch's finding #2 (candle's
+///   `Binary::Mul` backward retains a full-size gradient FOR a host-built
+///   mask tensor, since the mask is not itself a graph leaf `sorted_nodes`
+///   walks). `DropoutFused` is one `CustomOp1` node forward and one more
+///   node backward, with no third (mask) tensor EVER created on the
+///   autograd tape — Metal's transient host buffer (see above) is a
+///   dispatch-internal implementation detail of that one node, not a
+///   fourth tensor or a tape entry.
 ///
 /// `layer_id` is a pure hash of the layer's fully-qualified name (via
 /// [`layer_id_for_name`]) — NOT mixed with the run seed the way

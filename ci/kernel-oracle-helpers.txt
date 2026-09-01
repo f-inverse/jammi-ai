@@ -20,13 +20,11 @@
 # than one fn with that name (ambiguous — this scanner does not track
 # `mod` boundaries). A line that fails is a registry FAIL naming the
 # file:line and why. An exact duplicate `<file>::<fn_name>` line fails too.
-#
 # Adding a line here is a reviewed PR diff, same discipline as a citation
 # or a `no-producer:` opt-out — the registry may only grow by entries the
 # shape-check accepts. A file that wants to call a SHARED helper it does
 # not itself define registers its own thin local wrapper of the same
 # canonical shape (gating is never cross-file by name alone).
-#
 # Known, deliberate, fail-CLOSED limitation (round-5 audit A2): gating
 # looks for a literal, BARE call to the registered NAME — `let g =
 # cuda_device; g();` (a same-file ALIAS binding, then calling the alias)
@@ -35,13 +33,46 @@
 # never as a false green), so it is a documented limitation, not a bug to
 # route around — the remedy is to call the registered name directly
 # (`cuda_device()`), never assign it to a local first.
-#
 # Format: one `<file-relative-to-repo-root>::<fn_name>` per line.
 
 crates/jammi-kernels/tests/cuda_parity.rs::cuda_device
 crates/jammi-kernels/tests/flash_smoke.rs::cuda_device
 crates/jammi-kernels/tests/flash_op_oracles.rs::cuda_device
 crates/jammi-kernels/tests/flash_torch_parity.rs::cuda_device
+crates/jammi-kernels/tests/metal_parity.rs::metal_device_or_skip
+crates/jammi-lora/tests/metal_dropout_position.rs::metal_device_or_skip
+crates/jammi-kernels/tests/empty_non_contiguous_admission_class_oracle.rs::cuda_device_or_skip
 crates/jammi-encoders/src/modernbert.rs::growth_oracle_cuda_device
 crates/jammi-encoders/src/modernbert.rs::flash_oracle_require_gate
 crates/jammi-encoders/src/modernbert.rs::flash_compiled_or_skip
+crates/jammi-ai/tests/metal_quantized_gpu.rs::gpu_available
+crates/jammi-encoders/tests/it/batch_composition_invariance.rs::cuda_device_or_skip
+crates/jammi-encoders/tests/it/batch_composition_invariance.rs::sm89_window_control_exclusion_require_gate
+crates/jammi-lora/tests/esc046_epilogue_biting_oracle.rs::cuda_device
+crates/jammi-server/tests/it/grpc_embedding_gpu.rs::start_gpu_embedding_server
+crates/jammi-server/tests/it/grpc_remote_session_gpu.rs::start_gpu_engine_server
+crates/jammi-bench/src/finetune_step.rs::vram_off_gpu_arm_require_gate
+crates/jammi-bench/src/finetune_step.rs::vram_on_gpu_arm_require_gate
+crates/jammi-db/tests/it/catalog_ping.rs::require_live_pg
+crates/jammi-db/tests/it/eval_per_query.rs::require_live_pg
+crates/jammi-db/tests/it/materialization_crash_recovery.rs::crash_recovery_child_dispatch_require_gate
+crates/jammi-db/tests/it/mutable_crash_recovery.rs::crash_recovery_child_dispatch_require_gate
+crates/jammi-db/tests/it/mutable_federation.rs::require_live_pg
+crates/jammi-db/tests/it/recovery.rs::require_live_pg
+crates/jammi-db/tests/it/segment.rs::require_live_pg
+crates/jammi-db/tests/it/sources.rs::require_live_pg
+crates/jammi-db/tests/it/storage_cloud.rs::require_live_storage
+crates/jammi-db/tests/it/store.rs::require_live_pg
+crates/jammi-db/tests/it/trigger.rs::require_live_pg
+crates/jammi-ai/src/fine_tune/optimizer.rs::cuda_device
+crates/jammi-ai/tests/gpu_capability/gguf_quantized_gpu.rs::device_memory_used_bytes_or_require
+crates/jammi-ai/tests/it/channel_contract.rs::regenerate_goldens_requested
+crates/jammi-ai/tests/it/fine_tune.rs::chmod_bypassed
+crates/jammi-ai/tests/distributed/artifact_crash_window.rs::required_backends
+crates/jammi-ai/tests/distributed/cross_tenant_isolation.rs::required_backends
+crates/jammi-ai/tests/distributed/exactly_one_claim.rs::required_backends
+crates/jammi-ai/tests/distributed/kill9_reclaim.rs::required_backends
+crates/jammi-kernels/src/admission.rs::require_flash_compiled_or_skip
+crates/jammi-kernels/src/admission.rs::metal_device_or_skip
+crates/jammi-kernels/src/ops/dropout.rs::metal_device_or_skip
+crates/jammi-kernels/src/ops/flash_attention.rs::cuda_device_or_skip

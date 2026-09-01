@@ -42,6 +42,36 @@ async fn open_catalog() -> (tempfile::TempDir, Catalog) {
     (dir, catalog)
 }
 
+/// Whether this run opted into golden REGENERATION (`JAMMI_REGENERATE_GOLDENS`
+/// set) — the developer-only escape hatch that rewrites the checked-in golden
+/// and returns before the real byte-identity assertion runs. Unless
+/// `JAMMI_REQUIRE_GOLDEN_ASSERTION` is also set, in which case a regenerate
+/// request is itself a hard failure: CI sets this so an accidental
+/// `JAMMI_REGENERATE_GOLDENS=1` leaking into the CI environment can never
+/// silently take the regenerate-and-skip path instead of actually asserting
+/// against the golden — the same require-gate polarity every other
+/// `JAMMI_REQUIRE_*` skip-guard in this crate uses, applied to a mode flag
+/// instead of a hardware probe.
+// The nested `if`s below are deliberately NOT collapsed with `&&`: KO-7's
+// registry verifier (`ci/scripts/check_kernel_oracles.py::helper_shape_ok`)
+// requires the INNER `if`'s condition to be EXACTLY the `JAMMI_REQUIRE_*`
+// env-read call, with no leading/trailing condition — collapsing this into
+// `if requested && ...is_some()` would fail that shape check.
+#[allow(clippy::collapsible_if)]
+fn regenerate_goldens_requested() -> bool {
+    let requested = std::env::var("JAMMI_REGENERATE_GOLDENS").is_ok();
+    if requested {
+        if std::env::var_os("JAMMI_REQUIRE_GOLDEN_ASSERTION").is_some() {
+            panic!(
+                "JAMMI_REGENERATE_GOLDENS is set but JAMMI_REQUIRE_GOLDEN_ASSERTION forbids the \
+                 regenerate-and-skip path — this run must assert against the checked-in golden, \
+                 never silently rewrite and skip it"
+            );
+        }
+    }
+    requested
+}
+
 /// Canonical merge of `vector` + `inference` channels.
 ///
 /// The output schema is asserted against a checked-in golden so any
@@ -86,7 +116,7 @@ async fn vector_and_inference_reexpressed_produce_byte_identical_recordbatch() {
     let actual = schema_to_canonical_json(&schema);
 
     let golden_path = fixtures_dir().join("golden_provenance_schema.json");
-    if std::env::var("JAMMI_REGENERATE_GOLDENS").is_ok() {
+    if regenerate_goldens_requested() {
         std::fs::write(&golden_path, &actual).expect("regenerating golden_provenance_schema.json");
         eprintln!("regenerated golden at {}", golden_path.display());
         return;

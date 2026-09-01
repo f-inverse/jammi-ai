@@ -14,9 +14,43 @@ use crate::harness::{self, Backends, Fleet, JobSize};
 
 const TEST: &str = "exactly_one_claim";
 
+/// `Backends::from_env_or_skip`, upgraded to a hard failure when
+/// `JAMMI_REQUIRE_DISTRIBUTED` is set — the live-distributed/NATS-
+/// availability lane's own require-gate: the pod session that is SUPPOSED
+/// to have the shared Postgres + MinIO backends configured (CI's
+/// distributed workflow) treats an unconfigured lane as a failure, never a
+/// silent skip. Duplicated identically across this family's four live-
+/// distributed test binaries (`artifact_crash_window.rs`,
+/// `cross_tenant_isolation.rs`, `exactly_one_claim.rs`, `kill9_reclaim.rs`)
+/// rather than shared through `harness.rs`: `Backends::from_env_or_skip` is
+/// an ASSOCIATED fn always called qualified (`Backends::from_env_or_skip
+/// (..)`), never as a BARE call `check_kernel_oracles.py`'s KO-7 dominance
+/// check can credit, and gating is per-file by construction (never
+/// cross-file by name alone) — the same small-duplication idiom
+/// `cuda_device` carries across `crates/jammi-kernels/tests/{cuda_parity,
+/// flash_smoke,flash_op_oracles,flash_torch_parity}.rs`, applied here to a
+/// live-backend availability probe instead of a hardware one.
+///
+/// The nested (not `&&`-collapsed) `if`s below are deliberate: KO-7's
+/// registry verifier requires the INNER `if`'s condition to be EXACTLY the
+/// `JAMMI_REQUIRE_*` env-read call, with no leading/trailing condition.
+#[allow(clippy::collapsible_if)]
+fn required_backends(test: &str) -> Option<Backends> {
+    let backends = Backends::from_env_or_skip(test);
+    if backends.is_none() {
+        if std::env::var_os("JAMMI_REQUIRE_DISTRIBUTED").is_some() {
+            panic!(
+                "{test}: JAMMI_REQUIRE_DISTRIBUTED is set but the distributed lane's shared \
+                 backends are unconfigured — a silent skip is not acceptable here"
+            );
+        }
+    }
+    backends
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_job_n_workers_exactly_one_wins() {
-    let Some(backends) = Backends::from_env_or_skip(TEST) else {
+    let Some(backends) = required_backends(TEST) else {
         return;
     };
     let result_root = backends.unique_result_root(TEST);

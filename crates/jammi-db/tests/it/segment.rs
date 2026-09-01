@@ -38,6 +38,21 @@ async fn open_backend(kind: BackendKind, dir: &std::path::Path) -> Option<Backen
     }
 }
 
+/// Require-gate (KO-7) for the `JAMMI_TEST_PG_URL`-unset skip the
+/// `open_backend(BackendKind::Postgres, ..)` call site in this file falls
+/// through to: by default (unset) the Postgres arm still silently skips,
+/// exactly as before — a lane that wants to REQUIRE the real Postgres arm
+/// run (never silently skip it) sets `JAMMI_REQUIRE_PG`, and this call
+/// panics instead.
+fn require_live_pg(test_name: &str) {
+    if std::env::var_os("JAMMI_REQUIRE_PG").is_some() {
+        panic!(
+            "{test_name}: JAMMI_REQUIRE_PG is set but JAMMI_TEST_PG_URL is unset -- this lane \
+             must run the real Postgres arm, not skip it"
+        );
+    }
+}
+
 async fn fresh_catalog(backend: BackendImpl) -> Arc<Catalog> {
     backend.migrate().await.unwrap();
     let catalog = Arc::new(Catalog::from_backend(backend));
@@ -167,6 +182,7 @@ async fn concurrent_append_never_collides_and_cascades(kind: BackendKind) {
     let dir = tempdir().unwrap();
     let Some(backend) = open_backend(kind, dir.path()).await else {
         eprintln!("skipping {kind:?}: JAMMI_TEST_PG_URL unset");
+        require_live_pg("concurrent_append_never_collides_and_cascades");
         return;
     };
     let catalog = fresh_catalog(backend).await;

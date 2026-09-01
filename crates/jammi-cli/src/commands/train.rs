@@ -46,6 +46,11 @@ pub async fn run(
             if !info.error.is_empty() {
                 println!("error:    {}", info.error);
             }
+            if let Some(metrics) = &info.metrics_json {
+                // Opaque blob — printed verbatim, not parsed or reformatted.
+                // Its schema is documented at the trainer, not the CLI.
+                println!("metrics:  {metrics}");
+            }
         }
     }
     Ok(())

@@ -63,6 +63,24 @@ async fn resolve_hf_hub_selects_candle_for_safetensors_model() {
 
 // --- Local path resolution ---
 
+/// A minimal but genuinely VALID (zero-tensor) safetensors file: the 8-byte
+/// little-endian header-length prefix followed by that many bytes of an
+/// empty JSON object. Issue #431's `estimate_safetensors_residency` now
+/// parses the header at RESOLVE time (mirroring the GGUF arm's own
+/// resolve-time header parse) — a placeholder like the pre-#431
+/// `b"fake-weights"` this file used to write is not a safetensors file at
+/// all and correctly fails to resolve now, exactly as it would already have
+/// failed to LOAD. These backend/path-resolution tests only need SOME file
+/// at the expected name that a real safetensors header-parse accepts; they
+/// never load it.
+fn write_minimal_safetensors(path: &std::path::Path) {
+    let header = b"{}";
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    buf.extend_from_slice(header);
+    std::fs::write(path, buf).unwrap();
+}
+
 #[tokio::test]
 async fn resolve_local_path_with_safetensors() {
     let dir = tempdir().unwrap();
@@ -70,7 +88,7 @@ async fn resolve_local_path_with_safetensors() {
     std::fs::create_dir_all(&model_dir).unwrap();
 
     std::fs::write(model_dir.join("config.json"), r#"{"model_type":"bert"}"#).unwrap();
-    std::fs::write(model_dir.join("model.safetensors"), b"fake-weights").unwrap();
+    write_minimal_safetensors(&model_dir.join("model.safetensors"));
     std::fs::write(model_dir.join("tokenizer.json"), r#"{"version":"1.0"}"#).unwrap();
 
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
@@ -129,7 +147,7 @@ async fn resolve_local_prefers_onnx_once_it_appears_alongside_existing_safetenso
     std::fs::create_dir_all(&model_dir).unwrap();
 
     std::fs::write(model_dir.join("config.json"), r#"{"model_type":"bert"}"#).unwrap();
-    std::fs::write(model_dir.join("model.safetensors"), b"fake-weights").unwrap();
+    write_minimal_safetensors(&model_dir.join("model.safetensors"));
 
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
@@ -175,7 +193,7 @@ async fn backend_hint_overrides_heuristic() {
     std::fs::create_dir_all(&model_dir).unwrap();
 
     std::fs::write(model_dir.join("config.json"), r#"{"model_type":"bert"}"#).unwrap();
-    std::fs::write(model_dir.join("model.safetensors"), b"fake-weights").unwrap();
+    write_minimal_safetensors(&model_dir.join("model.safetensors"));
     std::fs::write(model_dir.join("model.onnx"), b"fake-onnx").unwrap();
 
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());

@@ -14,6 +14,7 @@ CPU, into a temp artifact dir. No network, no GPU.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import pytest
@@ -63,6 +64,68 @@ def test_embedded_fine_tune_runs_through_the_shared_assembly(tmp_path: Path) -> 
     assert job.model_id.startswith("jammi:fine-tuned:")
     job.wait()
     assert job.status() == "completed"
+
+
+def test_embedded_fine_tune_metrics_surfaces_val_loss_run_summary(tmp_path: Path) -> None:
+    """`TrainingJob.metrics()` (#441): the completed job's run summary, sourced
+    straight from the catalog's `training_jobs.metrics` column via the same
+    embedded session the job ran on — proving the built binding, not a log.
+
+    Engine-not-platform check: `metrics()` returns generic training telemetry
+    (loss/step/timing) with no consumer-specific field — the same shape any
+    fine-tuning caller reaches for (B1-clean).
+    """
+    db = _connect(tmp_path)
+    db.add_source("training", url=str(_TRAINING_PAIRS), format="csv")
+
+    job = db.fine_tune(
+        source="training",
+        base_model=f"local:{_TINY_BERT}",
+        columns=["text_a", "text_b", "score"],
+        method="lora",
+        task="text_embedding",
+        epochs=2,
+        batch_size=8,
+        lora_rank=4,
+        warmup_steps=0,
+        validation_fraction=0.2,
+        early_stopping_metric="val_loss",
+    )
+    job.wait()
+    assert job.status() == "completed"
+
+    metrics = job.metrics()
+    assert isinstance(metrics, dict)
+    # Divergence-prone case: the val_loss arm must actually be the metric
+    # recorded, not silently the train_loss default.
+    assert metrics["early_stopping_metric"] == "val_loss"
+    assert math.isfinite(metrics["final_loss"])
+    assert metrics["total_steps"] > 0
+    assert metrics["started_at"]
+    assert metrics["completed_at"]
+
+    # Per-epoch loss curves (issue #441) — asserted against the shape
+    # `TrainingLoop::run` actually emits (`crates/jammi-ai/src/fine_tune/
+    # trainer.rs`): a list of `{"epoch": int, "loss": float}` rows, one per
+    # epoch actually run, never a bare `[epoch, loss]` pair (the wrong shape
+    # would pass a looser check but silently diverge from the trainer's own
+    # `curve_json`).
+    train_curve = metrics["train_loss_curve"]
+    assert isinstance(train_curve, list)
+    assert len(train_curve) == 2  # epochs=2 was requested above
+    for row in train_curve:
+        assert set(row.keys()) == {"epoch", "loss"}
+        assert math.isfinite(row["loss"])
+
+    # This run measures ValLoss every epoch (early_stopping_metric="val_loss"),
+    # so val_loss_curve must be present — never silently omitted the way a
+    # TrainLoss-monitored run's would be.
+    val_curve = metrics["val_loss_curve"]
+    assert isinstance(val_curve, list)
+    assert len(val_curve) == 2
+    for row in val_curve:
+        assert set(row.keys()) == {"epoch", "loss"}
+        assert math.isfinite(row["loss"])
 
 
 def test_embedded_fine_tune_rejects_unknown_method_in_the_assembly(tmp_path: Path) -> None:

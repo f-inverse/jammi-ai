@@ -3182,22 +3182,30 @@ impl ModelBackend for CandleBackend {
     }
 
     fn estimate_memory(&self, resolved: &ResolvedModel) -> usize {
-        // GGUF (issue #351, pin V5): the resolver already computed a
-        // conservative, header-parsed residency figure at resolve time
-        // (`gguf::estimate_gguf_residency`) — reuse it verbatim rather than
-        // re-deriving anything from `weights_paths` here (which, for a GGUF
-        // model, is a single-file byte size wildly unrepresentative of
-        // resident memory). The safetensors/ONNX arm below is
-        // byte-identical to every prior release.
-        if resolved.weights_format == WeightsFormat::Gguf {
-            return resolved.estimated_memory;
+        // GGUF (issue #351, pin V5) and safetensors (issue #431): the
+        // resolver already computed a conservative, header-parsed residency
+        // figure at resolve time (`gguf::estimate_gguf_residency` /
+        // `safetensors_residency::estimate_safetensors_residency`) — reuse
+        // it verbatim rather than re-deriving anything from `weights_paths`
+        // here. For GGUF this is because `weights_paths` is a single-file
+        // byte size wildly unrepresentative of resident memory; for
+        // safetensors it is because the plain on-disk file-byte sum is
+        // dtype-blind — it under-reports true residency whenever the
+        // on-disk dtype is narrower than the `compute_dtype`
+        // `VarBuilder::from_mmaped_safetensors` (below) actually
+        // materializes every weight at (issue #431). The ONNX arm below
+        // (the only `WeightsFormat` a Candle-backend resolve never
+        // produces, but kept as an exhaustive-match-safe fallback) stays
+        // the plain file-byte sum, byte-identical to every prior release.
+        match resolved.weights_format {
+            WeightsFormat::Gguf | WeightsFormat::Safetensors => resolved.estimated_memory,
+            WeightsFormat::Onnx => resolved
+                .weights_paths
+                .iter()
+                .filter_map(|p| std::fs::metadata(p).ok())
+                .map(|m| m.len() as usize)
+                .sum(),
         }
-        resolved
-            .weights_paths
-            .iter()
-            .filter_map(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len() as usize)
-            .sum()
     }
 }
 
@@ -3409,6 +3417,91 @@ fn load_distribution_head(
     Ok(Some(lora))
 }
 
+/// A panic payload folded to a human-readable string. `std::panic::
+/// catch_unwind`'s error type is `Box<dyn std::any::Any + Send>`, which
+/// carries no `Display`/`Debug` of its own; `panic!("{msg}")`/`panic!(msg)`
+/// (the two shapes `std`'s own panic machinery ever constructs) box either a
+/// `&'static str` or an owned `String`, so those two downcasts cover every
+/// REAL panic payload this process can produce. Mirrors
+/// `crates/jammi-kernels/tests/metal_parity.rs`'s helper of the same name.
+///
+/// Gated like [`check_driver_floor`]: without an accelerator feature (or
+/// `test`, which exercises this via [`acquire_accelerator_device`]) nothing
+/// in the lib calls this, so it would otherwise be dead code in a CPU-only
+/// build.
+#[cfg(any(feature = "cuda", feature = "metal", test))]
+fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+/// Acquire an accelerator device through `ctor`, folding BOTH a returned
+/// `Err` and a caught PANIC into the same `None` ("unavailable") outcome.
+/// [`select_device`] treats every `None` from this function identically,
+/// regardless of which failure shape produced it: it moves on to the next
+/// backend, or — once none are left — calls [`gpu_unavailable`], which
+/// degrades to CPU with a loud warning by default or returns a typed
+/// [`JammiError::Gpu`] under `require_gpu`.
+///
+/// This exists because `Device::new_metal` does not always keep its `Result`
+/// contract: on at least one real GH `macos-14` runner (and, per this fix's
+/// own investigation, any macOS-14 host — a supported shipped configuration)
+/// it PANICS instead of returning `Err`, inside an `objc2` class lookup in
+/// candle-metal-kernels' `residency_set.rs` for `MTLResidencySetDescriptor`
+/// — a class that only exists on macOS 15+. A bare
+/// `if let Ok(dev) = Device::new_metal(...)` cannot model that failure mode:
+/// the unwind would escape `select_device` entirely, skipping BOTH of its
+/// documented degrade arms.
+///
+/// Wrapping the call in `catch_unwind` is sound at this exact call site: the
+/// probe owns no lock and mutates no shared/static state before it can fail
+/// (`ctor` is a plain constructor call, not a critical section), so
+/// unwinding out of it leaves nothing poisoned to clean up — unlike
+/// catching a panic across a held mutex guard or a half-mutated `static`.
+/// Mirrors the test-side mechanism in
+/// `crates/jammi-kernels/tests/metal_parity.rs`'s `metal_device_or_skip`
+/// (added at 29e8b569), which found this exact panic on a real `macos-14`
+/// runner.
+///
+/// `ctor` need not be `UnwindSafe` itself — `Device::new_cuda` /
+/// `Device::new_metal` capture nothing and trivially are, but requiring the
+/// bound would leak into every call site including test-injected closures.
+/// `AssertUnwindSafe` is sound here for the same no-shared-mutable-state
+/// reason documented above.
+///
+/// Gated like [`check_driver_floor`]: without an accelerator feature (or
+/// `test`) nothing in the lib calls this, so it would otherwise be dead
+/// code in a CPU-only build.
+#[cfg(any(feature = "cuda", feature = "metal", test))]
+fn acquire_accelerator_device(
+    backend: &str,
+    ordinal: usize,
+    ctor: impl FnOnce(usize) -> std::result::Result<Device, candle_core::Error>,
+) -> Option<Device> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctor(ordinal))) {
+        Ok(Ok(dev)) => Some(dev),
+        Ok(Err(_)) => None,
+        Err(payload) => {
+            let panic_message = panic_payload_to_string(payload.as_ref());
+            tracing::warn!(
+                backend,
+                ordinal,
+                panic = %panic_message,
+                "{backend} device {ordinal} acquisition PANICKED instead of returning Err \
+                 (known mechanism on some hosts: an objc2 MTLResidencySetDescriptor class \
+                 lookup inside candle-metal-kernels that only resolves on macOS 15+); treating \
+                 the device as unavailable rather than letting the panic escape"
+            );
+            None
+        }
+    }
+}
+
 /// Resolve the inference device from configuration.
 ///
 /// - A negative `gpu_device` selects CPU unconditionally.
@@ -3419,20 +3512,29 @@ fn load_distribution_head(
 ///   ([`check_compute_cap_floor`]) — so every precision this build supports
 ///   on CUDA is admissible on any device this function returns.
 /// - When a GPU is requested but unavailable — no accelerator feature in this
-///   build, or the device fails to initialize — the outcome depends on
-///   `require_gpu`: by default it degrades to CPU with a loud warning; if
-///   `require_gpu` is set it returns a [`JammiError::Gpu`] so the server fails
-///   fast rather than silently serving on CPU.
+///   build, the device fails to initialize, or acquisition PANICS (see
+///   [`acquire_accelerator_device`]) — the outcome depends on `require_gpu`:
+///   by default it degrades to CPU with a loud warning; if `require_gpu` is
+///   set it returns a [`JammiError::Gpu`] so the server fails fast rather
+///   than silently serving on CPU.
 ///
-/// This relies on `Device::new_cuda` / `Device::new_metal` returning `Err` when
-/// no device is present; it never papers over a panic.
+/// Device acquisition goes through [`acquire_accelerator_device`], which
+/// wraps `Device::new_cuda` / `Device::new_metal` in `catch_unwind`: a
+/// PANICKING acquisition (measured on real `macos-14` hosts — see that
+/// function's doc) is folded into the SAME unavailable outcome as a returned
+/// `Err`, so both of the arms above are reachable no matter which failure
+/// shape the underlying constructor produces. It never papers over a panic
+/// by swallowing it silently — every caught panic is logged with its
+/// payload before falling through to the documented degrade behavior.
 pub(crate) fn select_device(config: &DeviceConfig) -> Result<Device> {
     if config.gpu_device < 0 {
         return Ok(Device::Cpu);
     }
     #[cfg(feature = "cuda")]
     {
-        if let Ok(dev) = Device::new_cuda(config.gpu_device as usize) {
+        if let Some(dev) =
+            acquire_accelerator_device("cuda", config.gpu_device as usize, Device::new_cuda)
+        {
             // Fail fast on a driver too old to JIT this build's PTX, rather than
             // letting the first model load surface a raw
             // `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` from deep in candle.
@@ -3448,7 +3550,9 @@ pub(crate) fn select_device(config: &DeviceConfig) -> Result<Device> {
     }
     #[cfg(feature = "metal")]
     {
-        if let Ok(dev) = Device::new_metal(config.gpu_device as usize) {
+        if let Some(dev) =
+            acquire_accelerator_device("metal", config.gpu_device as usize, Device::new_metal)
+        {
             return Ok(dev);
         }
     }
@@ -3569,6 +3673,13 @@ fn cuda_compute_capability(dev: &Device) -> Result<(i32, i32)> {
 /// through the same [`select_device`] logic the loader uses (including the
 /// CPU-fallback when a requested GPU is unavailable), so the recorded device is
 /// the one that actually produced the floats, never merely the one requested.
+///
+/// It calls [`select_device`] directly rather than re-deriving device
+/// identity from `config`, so it inherits [`select_device`]'s panic-safe
+/// acquisition ([`acquire_accelerator_device`]) for free: a host on which
+/// `Device::new_metal`/`Device::new_cuda` panics resolves here the same way
+/// it resolves in `select_device` — CPU (via the `_` arm below), never a
+/// propagated panic — with no separate handling needed at this call site.
 pub(crate) fn effective_compute_device(config: &DeviceConfig) -> ComputeDevice {
     match select_device(config) {
         Ok(Device::Cpu) => ComputeDevice::Cpu,
@@ -3766,42 +3877,53 @@ mod device_tests {
         fn exit(&self, _: &tracing::span::Id) {}
     }
 
-    /// Both `*_without_device_*` tests below assert the NO-USABLE-GPU arm of
-    /// `select_device` (the typed `require_gpu` refusal; the loud CPU
-    /// fallback). On a host where CUDA device 0 is acquirable that arm is
-    /// unreachable — selection correctly serves the GPU — so they skip,
-    /// loudly, mirroring (inverted) the `cuda_device()` skip convention
-    /// elsewhere in this crate. Found by the full `--features cuda` lib run
-    /// on an A100 pod: both tests failed with "expected CPU fallback, got
-    /// Cuda(..)".
-    fn skip_on_cuda_capable_host(test: &str) -> bool {
-        match Device::new_cuda(0) {
-            Ok(_) => {
-                eprintln!(
-                    "{test}: skipping — this host can acquire CUDA device 0, so the \
-                     no-usable-GPU selection arm this test asserts is unreachable here"
-                );
-                true
-            }
-            Err(_) => false,
-        }
+    /// An acquisition "constructor" that always reports the device as
+    /// unavailable — via a plain `Err`, never a panic. Used below to reach
+    /// `select_device`'s NO-USABLE-GPU arm deterministically, through the
+    /// same [`acquire_accelerator_device`] seam production uses, instead of
+    /// depending on the host actually lacking a GPU.
+    ///
+    /// Before this seam existed, `require_gpu_without_device_fails_fast` and
+    /// `default_without_device_falls_back_to_cpu_with_warning` called
+    /// `select_device` directly and skipped on a CUDA-capable host (the
+    /// no-usable-GPU arm is unreachable there — selection correctly serves
+    /// the GPU). That skip only covered CUDA: on a real-Metal host (e.g.
+    /// this crate's own `--features metal,local` CI lane and any macOS dev
+    /// machine with a physical GPU) `select_device` likewise legitimately
+    /// acquires the real Metal device, and the old tests failed outright
+    /// ("expected CPU fallback, got Metal(..)") rather than skipping. Both
+    /// tests now inject `unavailable_ctor` through
+    /// `acquire_accelerator_device` — the exact function `select_device`'s
+    /// `cuda`/`metal` branches call — so they assert the SAME
+    /// `None` → [`gpu_unavailable`] fallback logic `select_device` runs,
+    /// without depending on what accelerator (if any) the test host has.
+    fn unavailable_ctor(_ordinal: usize) -> std::result::Result<Device, candle_core::Error> {
+        Err(candle_core::Error::Msg(
+            "no device (test seam: unavailable_ctor)".to_string(),
+        ))
+    }
+
+    /// An acquisition "constructor" that always PANICS — the failure mode
+    /// `Device::new_metal` was measured to hit on at least one real
+    /// `macos-14` runner (`acquire_accelerator_device`'s doc). Used to prove
+    /// the panic-catching arm is reachable: without `catch_unwind` in
+    /// `acquire_accelerator_device`, calling this would abort the test
+    /// process instead of yielding `None`.
+    fn panicking_ctor(_ordinal: usize) -> std::result::Result<Device, candle_core::Error> {
+        panic!("simulated Device::new_metal panic (objc2 MTLResidencySetDescriptor lookup)");
     }
 
     #[test]
     fn require_gpu_without_device_fails_fast() {
-        if skip_on_cuda_capable_host("require_gpu_without_device_fails_fast") {
-            return;
-        }
-        let config = DeviceConfig {
-            gpu_device: 0,
-            memory_fraction: 0.9,
-            require_gpu: true,
-            compute_precision: jammi_numerics::ComputePrecision::F32,
-        };
+        let acquired = acquire_accelerator_device("test", 0, unavailable_ctor);
+        assert!(
+            acquired.is_none(),
+            "an Err-returning ctor must fold to None"
+        );
         // On a host with no usable GPU (and on the default non-accelerator
         // build), selection must surface a typed GPU error rather than serving
         // on CPU.
-        match select_device(&config) {
+        match gpu_unavailable(0, true) {
             Err(JammiError::Gpu(msg)) => {
                 assert!(msg.contains("GPU required"), "unexpected message: {msg}");
             }
@@ -3811,21 +3933,18 @@ mod device_tests {
 
     #[test]
     fn default_without_device_falls_back_to_cpu_with_warning() {
-        if skip_on_cuda_capable_host("default_without_device_falls_back_to_cpu_with_warning") {
-            return;
-        }
         let capture = WarnCapture::default();
         let flag = Arc::clone(&capture.saw_fallback_warning);
 
         let device = tracing::subscriber::with_default(capture, || {
-            let config = DeviceConfig {
-                gpu_device: 0,
-                memory_fraction: 0.9,
-                require_gpu: false,
-                compute_precision: jammi_numerics::ComputePrecision::F32,
-            };
-            select_device(&config).expect("default fallback must not error")
-        });
+            let acquired = acquire_accelerator_device("test", 0, unavailable_ctor);
+            assert!(
+                acquired.is_none(),
+                "an Err-returning ctor must fold to None"
+            );
+            gpu_unavailable(0, false)
+        })
+        .expect("default fallback must not error");
 
         assert!(
             matches!(device, Device::Cpu),
@@ -3835,6 +3954,67 @@ mod device_tests {
             flag.load(Ordering::SeqCst),
             "expected a loud warn-level CPU-fallback log"
         );
+    }
+
+    /// REACHABLE-proof (round-2 audit BLOCK, item 4): a PANICKING acquisition
+    /// — the exact shape `Device::new_metal` was measured to produce on a
+    /// real `macos-14` runner — must fold to `None`, not propagate the
+    /// panic and abort the test process. This is the direct evidence that
+    /// `acquire_accelerator_device`'s `catch_unwind` wrapper actually runs
+    /// on the panicking path, independent of any particular host's
+    /// hardware.
+    #[test]
+    fn acquire_accelerator_device_catches_panic_and_returns_none() {
+        let acquired = acquire_accelerator_device("metal", 0, panicking_ctor);
+        assert!(
+            acquired.is_none(),
+            "a caught panic must fold to None, exactly like an Err ctor — never propagate"
+        );
+    }
+
+    /// REACHABLE-proof, degrade arm: composes the SAME two calls
+    /// `select_device`'s `metal`/`cuda` branches make — [`acquire_accelerator_device`]
+    /// then, on `None`, [`gpu_unavailable`] — with a PANICKING ctor, and
+    /// proves the result is the documented default degrade-to-CPU-with-
+    /// warning outcome, not a crashed test process.
+    #[test]
+    fn acquisition_panic_degrades_to_cpu_with_warning() {
+        let capture = WarnCapture::default();
+        let flag = Arc::clone(&capture.saw_fallback_warning);
+
+        let device = tracing::subscriber::with_default(capture, || {
+            let acquired = acquire_accelerator_device("metal", 0, panicking_ctor);
+            assert!(acquired.is_none(), "a caught panic must fold to None");
+            gpu_unavailable(0, false)
+        })
+        .expect("default fallback must not error even when acquisition panicked");
+
+        assert!(
+            matches!(device, Device::Cpu),
+            "expected CPU fallback after a caught panic, got {device:?}"
+        );
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "expected a loud warn-level CPU-fallback log after a caught panic"
+        );
+    }
+
+    /// REACHABLE-proof, `require_gpu` arm: the same composition as above,
+    /// but with `require_gpu = true` — proves a panicking acquisition still
+    /// surfaces the typed [`JammiError::Gpu`] refusal rather than either
+    /// crashing the process or silently serving CPU.
+    #[test]
+    fn acquisition_panic_with_require_gpu_fails_typed() {
+        let acquired = acquire_accelerator_device("metal", 0, panicking_ctor);
+        assert!(acquired.is_none(), "a caught panic must fold to None");
+        match gpu_unavailable(0, true) {
+            Err(JammiError::Gpu(msg)) => {
+                assert!(msg.contains("GPU required"), "unexpected message: {msg}");
+            }
+            other => panic!(
+                "expected JammiError::Gpu after a caught panic under require_gpu, got {other:?}"
+            ),
+        }
     }
 
     /// The PTX-ISA driver floor (#304): a driver below the CUDA 12.6 line the

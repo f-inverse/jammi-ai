@@ -557,6 +557,103 @@ jobs:
       - name: Clippy jammi-encoders --features cuda (nvcc, no GPU) — covers the NOT(flash-attn) meta-test
         run: cargo clippy -p jammi-encoders --features cuda --tests -- -D warnings
 
+  # esc-059's silicon-axis twin — CLOSED FOR COMPILE/LINT SURFACE ONLY, NOT
+  # EXECUTION. `jammi-kernels`'s `metal_parity` test target
+  # (`required-features = ["metal"]`), `jammi-ai`'s `metal_quantized_gpu`
+  # test target (same), and `jammi-lora`'s `metal_dropout_position` test
+  # target (same) were all compiled under NO merge-path `cargo clippy
+  # -D warnings` lane — exactly the `check_lint_surface_closure.py` gap this
+  # branch introduced — so this job's three `clippy` steps close that gap
+  # and run on every PR for free.
+  #
+  # Measured fact (PR #435, job 99546809214's backtrace): a GH-hosted
+  # `macos-14` runner CANNOT construct a candle 0.11 Metal device.
+  # `Device::new_metal(0)` PANICS there — objc2 class lookup fails on
+  # `MTLResidencySetDescriptor`, a class GH's hosted macOS image's Metal
+  # framework does not expose. This is not a flaky/slow lane, it is a
+  # hard, reproducible panic on every invocation — so this job runs NO
+  # execution step and MUST NOT claim one. An earlier revision of this job
+  # ran `cargo test ... --test metal_parity`/`--test metal_quantized_gpu`
+  # here and asserted "real, working Metal device" / "suites measured
+  # green"; both claims were false on this runner and are corrected by
+  # this comment and the removal of those two steps.
+  #
+  # No `./.github/actions/setup-rust-ci`: that composite's DEFAULT
+  # `rustflags` hardcodes `-C link-arg=-fuse-ld=mold` — a Linux-only linker
+  # this runner does not have (`.cargo/config.toml`'s own mold pin is
+  # scoped to the `x86_64`/`aarch64`-unknown-linux-gnu targets only, never
+  # `aarch64-apple-darwin`) — and this job otherwise has no need for the
+  # sccache-GHA-cache half either (a macOS runner has its own toolchain
+  # cache, not this repo's Linux container image's warm sccache server).
+  # Deliberately no RUSTFLAGS/RUSTC_WRAPPER override of any kind here: GH's
+  # `macos-14` image ships `rustup` + a working `cc`/linker already, and
+  # `rust-toolchain.toml` (channel 1.94.0, components rustfmt+clippy) is
+  # picked up automatically by every `cargo`/`rustup` invocation below
+  # (rustup auto-installs a missing pinned toolchain from that file) — the
+  # explicit `rustup show` step below is only to make that pin-and-install
+  # step visible in the log, not to change what would happen without it.
+  #
+  # Cost/runtime: macOS minutes bill at 10x the Linux rate on GitHub-hosted
+  # runners — this job's three remaining steps (three clippy compiles) are a
+  # real, ongoing per-PR cost the operator is choosing to pay in exchange
+  # for closing the lint-coverage gap above; if that trade is ever judged
+  # not worth it, scope this job to changes under
+  # `crates/jammi-kernels/src/ops/**`, `crates/jammi-kernels/tests/
+  # metal_parity.rs`, `crates/jammi-ai/tests/metal_quantized_gpu.rs`,
+  # `crates/jammi-lora/tests/metal_dropout_position.rs`, and all three
+  # crates' `Cargo.toml` (matching `flash-attn-compile`'s own documented
+  # path-filter alternative above) rather than dropping the lane — a
+  # silently unfiltered lane that is deleted looks like it was never
+  # needed; a silently-added filter that misses a path looks like coverage
+  # and isn't (worse than none), so this is left to the maintainer to
+  # decide, not applied unilaterally here.
+  #
+  # Execution proof (compile+lint only here — no GH-hosted runner can
+  # construct a Metal device, see above): suites measured green on LOCAL
+  # Apple-Silicon hardware and recorded in PR #435 — jammi-ai 4/4
+  # (`metal_quantized_gpu`), jammi-kernels 8/8 (`metal_parity`, byte-exact).
+  # `jammi-lora`'s `metal_dropout_position` has no equivalent local-execution
+  # record cited here — this job closes its compile/lint surface only, same
+  # as it did for the other two targets before any execution record existed
+  # for them. A recurring, always-on execution lane for this surface
+  # requires a self-hosted Apple-silicon runner; provisioning one is an
+  # operator decision, not applied unilaterally here.
+  test-metal:
+    name: Test (Metal, macos-14)
+    runs-on: macos-14
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pin Rust toolchain (rust-toolchain.toml)
+        run: rustup show
+
+      # `.cargo/config.toml`'s `[build] rustc-wrapper = "sccache"` is
+      # committed and applies to every cargo invocation on every runner,
+      # this one included — there is no macOS-scoped opt-out in that file
+      # (unlike the mold `rustflags`, which the comment above already notes
+      # is scoped away from `aarch64-apple-darwin`). Per house doctrine this
+      # job must never override `RUSTC_WRAPPER` (unlike the two lanes in
+      # this workflow, and `pypi.yml`, that legitimately set
+      # `RUSTC_WRAPPER: ""` to opt out) — a `macos-14` GH-hosted runner has
+      # no `sccache` binary preinstalled, so without this step every cargo
+      # call below fails immediately trying to exec the wrapper. Installed
+      # fresh per run with a cold local disk cache (no `SCCACHE_GHA_ENABLED`
+      # / GHA cache backend wired here) — this job's compiles are narrow
+      # (three `--test` targets), so a warm cache is not worth the added
+      # surface; revisit only if this job's runtime becomes a problem.
+      - name: Install sccache (required by committed .cargo/config.toml rustc-wrapper)
+        run: brew install sccache
+
+      - name: Clippy jammi-kernels --test metal_parity --features metal (Metal, no GPU op run)
+        run: cargo clippy -p jammi-kernels --test metal_parity --features metal -- -D warnings
+
+      - name: Clippy jammi-ai --test metal_quantized_gpu --features metal,local (Metal, no GPU op run)
+        run: cargo clippy -p jammi-ai --test metal_quantized_gpu --features metal,local -- -D warnings
+
+      - name: Clippy jammi-lora --test metal_dropout_position --features metal (Metal, no GPU op run)
+        run: cargo clippy -p jammi-lora --test metal_dropout_position --features metal -- -D warnings
+
   oss-only-build:
     name: Guard (OSS-only build)
     runs-on: ubuntu-latest
@@ -1451,6 +1548,7 @@ jobs:
       - flash-attn-closure
       - lint-surface-closure
       - flash-attn-compile
+      - test-metal
       - oss-only-build
       - dep-audit
       - ts-client

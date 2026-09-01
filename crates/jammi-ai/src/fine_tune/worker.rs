@@ -1089,7 +1089,13 @@ impl TrainingWorker {
 /// lifetime. The guard therefore bounds when the worker stops taking new work,
 /// not when the current job finishes.
 pub struct EmbeddedWorker {
-    handle: tokio::task::JoinHandle<()>,
+    /// `None` once [`Self::stop_and_join`] has taken it — the marker `Drop`
+    /// checks to skip its own abort (already gracefully joined, nothing left
+    /// to abort). Guarded by a `Mutex` rather than consuming `self` because
+    /// [`Self::stop_and_join`] takes `&self`: the owning `Database` binding
+    /// wants to signal-and-await without giving up the guard itself (its
+    /// `Drop` must still run at the connection's own end of life).
+    handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     stop: Arc<AtomicBool>,
 }
 
@@ -1107,7 +1113,52 @@ impl EmbeddedWorker {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_task = Arc::clone(&stop);
         let handle = tokio::spawn(async move { worker.run_until(stop_for_task).await });
-        Ok(Self { handle, stop })
+        Ok(Self {
+            handle: std::sync::Mutex::new(Some(handle)),
+            stop,
+        })
+    }
+
+    /// Gracefully stop this worker and wait for its loop task to actually
+    /// return, rather than `Drop`'s non-blocking signal-and-abort.
+    ///
+    /// This is the primitive an explicit, deterministic teardown (a bound
+    /// `Database::close()`) needs, distinct from `Drop`'s best-effort halt for
+    /// an unattended process exit: it signals `stop` and then *awaits* the loop
+    /// task rather than aborting it, so a caller blocking on this observes the
+    /// worker's actual quiescence, not merely "the signal was sent".
+    ///
+    /// **Bound on how long this takes to return**, because [`TrainingWorker::
+    /// run_until`]'s loop only re-checks `stop` between claim attempts (see its
+    /// doc): immediate if the worker is between claim attempts (asleep for at
+    /// most `intervals.idle_poll`, default 1s), or the remaining duration of a
+    /// job already claimed and running when this is called — such a job runs to
+    /// its own terminal state (finalize included) before the loop task returns.
+    /// This never force-cancels an in-flight training run; it only stops the
+    /// worker from picking up further work and waits for it to notice.
+    ///
+    /// Idempotent: a second call (concurrent or sequential) finds no handle left
+    /// to take and returns `Ok(())` immediately. Takes `&self` rather than
+    /// consuming — the caller keeps the guard (and its `Drop`) alive; `Drop`
+    /// checks the same `Mutex` and no-ops the abort once this has already taken
+    /// the handle.
+    pub async fn stop_and_join(&self) -> Result<()> {
+        self.stop.store(true, Ordering::Relaxed);
+        let taken = self
+            .handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some(handle) = taken else {
+            return Ok(());
+        };
+        // A join error here is a task panic inside `run_until` (every fallible
+        // step inside its loop is already caught and logged, not propagated as
+        // a panic) or the task having been aborted by a concurrent `Drop` —
+        // either is a genuine defect worth surfacing, not swallowing.
+        handle
+            .await
+            .map_err(|e| JammiError::FineTune(format!("training worker task join error: {e}")))
     }
 }
 
@@ -1116,9 +1167,21 @@ impl Drop for EmbeddedWorker {
     /// jobs; an in-flight `spawn_blocking` training run is not aborted by this —
     /// it runs to completion and writes its terminal status post-drop (see the
     /// type doc).
+    ///
+    /// No-ops the abort when [`Self::stop_and_join`] already took the handle —
+    /// there is nothing left to abort, and aborting a handle that already
+    /// returned would be a silent no-op anyway, but the explicit check keeps
+    /// the intent legible.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        self.handle.abort();
+        if let Some(handle) = self
+            .handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            handle.abort();
+        }
     }
 }
 
@@ -3667,5 +3730,39 @@ mod tests {
             "2 (gguf corrupted)",
         )
         .await;
+    }
+
+    /// `EmbeddedWorker::stop_and_join` actually AWAITS the loop task rather
+    /// than merely signalling it (`Drop`'s non-blocking shape) — the graceful
+    /// primitive a deterministic `Database::close()` needs. Drives a real
+    /// spawned worker with no job ever submitted (the idle path, so the loop
+    /// should notice `stop` and return well inside the default 1s idle-poll
+    /// window rather than hang), then checks it is safe to call twice.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_and_join_actually_awaits_the_loop_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = jammi_test_utils::test_config(dir.path());
+        let session = Arc::new(crate::session::InferenceSession::new(config).await.unwrap());
+        let worker = EmbeddedWorker::spawn(&session).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(10), worker.stop_and_join())
+            .await
+            .expect("stop_and_join must not hang on an idle worker")
+            .expect("an idle worker's loop task must join cleanly, not error");
+
+        // The task is gone: this exercises `Drop`'s no-op-when-already-taken
+        // arm directly (via the field it shares with `stop_and_join`) rather
+        // than only trusting that dropping `worker` at scope-end never panics.
+        assert!(
+            worker.handle.lock().unwrap().is_none(),
+            "stop_and_join must take the handle so a later Drop finds nothing to abort"
+        );
+
+        // Idempotent: a second call finds no handle left and returns
+        // immediately rather than blocking or erroring.
+        tokio::time::timeout(Duration::from_secs(5), worker.stop_and_join())
+            .await
+            .expect("a second stop_and_join must not hang")
+            .expect("a second stop_and_join on an already-joined worker is Ok");
     }
 }

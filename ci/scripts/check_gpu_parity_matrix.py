@@ -281,8 +281,13 @@ SILICON_ACCOUNTING: list[tuple[str, SiliconAccountingEntry]] = [
         "metal",
         Deferred(
             reason=(
-                "macos Metal execution lane pending the metal-gated oracles landing "
-                "on feat/351-quantized-gguf-qlora (#430); flip when that lane exists"
+                "GH-hosted macos-14 VMs cannot construct a candle 0.11 Metal "
+                "device (MTLResidencySetDescriptor absent; Device::new_metal "
+                "panics — proven in PR #435 CI); ci.yml test-metal proves the "
+                "compile/lint surface only; execution proof exists on local "
+                "Apple-silicon runs (PR #435: metal_parity 8/8 byte-exact, "
+                "metal_quantized_gpu 4/4 measured); a recurring execution lane "
+                "requires a self-hosted Apple-silicon runner"
             ),
             owner="maintainers",
             date="2026-08-31",

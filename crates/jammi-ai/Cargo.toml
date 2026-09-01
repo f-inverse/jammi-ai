@@ -225,3 +225,13 @@ required-features = ["live-distributed-tests"]
 name = "gpu_capability"
 path = "tests/gpu_capability/main.rs"
 required-features = ["live-gpu-tests"]
+
+# The Metal arm of the GGUF/k-quant + QLoRA GPU capability suite (issue #351,
+# wave 18, Half B) — a standalone binary rather than a `gpu_capability`
+# module because that suite's harness hardcodes CUDA device selection. Gated
+# on `metal` alone: `metal` already implies `local`, and the binary's own
+# `skip_without_gpu!` guard (a real Metal device) is the meaningful-run gate.
+[[test]]
+name = "metal_quantized_gpu"
+path = "tests/metal_quantized_gpu.rs"
+required-features = ["metal"]

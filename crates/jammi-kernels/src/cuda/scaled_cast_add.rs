@@ -29,6 +29,24 @@ pub(crate) fn cuda_fwd(
     let shape = l1.shape().clone();
     let scaling_f32 = scaling as f32;
 
+    // Contiguity is checked FIRST, unconditionally -- even before the
+    // `n == 0` fast path below -- so this arm's own domain (`RequiresContiguous`,
+    // the same nonzero-start_offset rationale as `crate::cuda::axpy::cuda_fwd`)
+    // applies identically to an empty tensor rather than being silently
+    // ADMITTED through the fast path (`cpu_fwd` itself never requires
+    // contiguity -- it walks `StridedOffsets` -- so this is the CUDA arm's
+    // OWN self-consistency, matching every other elementwise op's
+    // documented CUDA domain in this crate). `o1_base`/`o2_base`/
+    // `o1_lora`/`o2_lora` are unused by the `n == 0` branch itself --
+    // computed here only so the domain check runs in the same place for
+    // both branches.
+    let (o1_base, o2_base) = l1.contiguous_offsets().ok_or(Error::RequiresContiguous {
+        op: "scaled_cast_add",
+    })?;
+    let (o1_lora, o2_lora) = l2.contiguous_offsets().ok_or(Error::RequiresContiguous {
+        op: "scaled_cast_add",
+    })?;
+
     // n == 0: `LaunchConfig::for_num_elems(0)` yields grid_dim (0, 1, 1) —
     // an illegal launch. Match the CPU arm's documented no-op contract
     // (`ops::scaled_cast_add`'s `empty_tensor_is_a_no_op_not_an_error`)
@@ -56,15 +74,6 @@ pub(crate) fn cuda_fwd(
     // identical comment — the launch grid and the kernel's own bounds
     // check are both 32-bit.
     super::check_elem_count_fits_u32("scaled_cast_add", n)?;
-
-    // Same `contiguous_offsets()` requirement (and the same nonzero-
-    // start_offset rationale) as `crate::cuda::axpy::cuda_fwd`.
-    let (o1_base, o2_base) = l1.contiguous_offsets().ok_or(Error::RequiresContiguous {
-        op: "scaled_cast_add",
-    })?;
-    let (o1_lora, o2_lora) = l2.contiguous_offsets().ok_or(Error::RequiresContiguous {
-        op: "scaled_cast_add",
-    })?;
 
     let cfg = super::elemwise_launch_config(n as u32);
 

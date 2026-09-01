@@ -1,0 +1,550 @@
+---
+title: "Weight quantization: a GGUF checkpoint on the same resolve→load→embed path, a third orthogonal vocabulary"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Recipe:** a model DIRECTORY carrying a literal `model.gguf` (HF tensor names,
+not llama.cpp-style embedded metadata) plus a sidecar `config.json`, resolved
+through the exact same `local:`/resolve→load→embed path every safetensors
+checkpoint in this book already uses — no new verb, no new config knob ·
+`WeightQuantization` (the weight-storage format an artifact *carries*) next to
+[the compute-precision chapter](compute-precision.qmd)'s `ComputePrecision`
+(the dtype a forward pass *runs at*) — a third orthogonal vocabulary · QLoRA:
+`fine_tune(..., target_modules=[...])` against a GGUF `base_model` selects the
+frozen-quantized-backbone training path from the artifact itself · **Theory:**
+block quantization as a frozen-backbone compression [@dettmers2023qlora] ·
+**Rail:** measurement (a live embed through the quantized directory, its cosine
+against the live `f32` run of the *same* checkpoint measured and pinned with
+margin; two materializations shown never to collide on one definition hash;
+on-disk bytes, `f32` vs `q8_0`, both read off real files this chapter writes) —
+nothing here is transcribed from the engine's own hermetic suite, only cited
+alongside what this chapter independently measures.
+
+## A third vocabulary, not a third knob
+
+[Compute precision](compute-precision.qmd) is a *knob*: `[gpu] compute_precision`
+in the `jammi.connect(..., config=...)` TOML picks the floating-point dtype an
+encoder's weights and activations run at. Weight quantization is not a knob at
+all — there is no `weight_quantization = "q8_0"` setting anywhere in the
+config surface. It is a **fact the artifact itself carries**: a model
+directory either has a `model.gguf` file or it does not, and if it does, its
+matmul-site tensors are stored at whatever k-quant format they were quantized
+to when the file was written. `LoadedModel::quantization()` reports this fact
+— `Some(WeightQuantization::Q8_0)` for a GGUF load, `None` for every
+safetensors/ONNX load — as a **derived observation**, never a caller-set
+value:
+
+```{python}
+import inspect
+
+import jammi
+
+gen_params = set(inspect.signature(jammi.Session.generate_embeddings).parameters)
+print(f"generate_embeddings(...) keyword args: {sorted(gen_params)}")
+
+assert "model" in gen_params, "the model path is the only lever — no separate quantization kwarg"
+assert not any("quant" in p for p in gen_params), (
+    "weight quantization must not be a caller-set kwarg on generate_embeddings — "
+    "it is read off the resolved model directory, never chosen by the request"
+)
+print("\nconfirmed: no quantization kwarg exists anywhere on the embedding path — "
+      "the artifact decides, the caller never does.")
+```
+
+This makes `WeightQuantization` orthogonal to `ComputePrecision` in a sharper
+sense than storage-precision/compute-precision are orthogonal to each other
+(the [precision chapters](precision.qmd) still both take caller-set knobs on
+the same `[gpu]`/`embedding.ann` config surface). Here, one side of the pair
+is a *setting* and the other is a *fact about a file on disk*
+(`crates/jammi-ai/src/model/mod.rs:408-423`'s own doc: `quantization()` is
+`Some` "for a `model.gguf` load, `None` for every safetensors/ONNX load" —
+never a config lookup). A `q8_0` GGUF backbone can still run its densified
+(non-matmul-site) tensors and its dequantized activations at `compute_precision
+= "f16"` — the two vocabularies compose exactly as freely as storage/compute
+precision do, for the same reason: they describe different stages of the same
+pipeline.
+
+## The fixture — a `q8_0` copy of `tiny_bert`, written here
+
+This book has no Rust/candle binding, so it cannot call
+`candle_core::quantized::gguf_file::write` the way the engine's own hermetic
+fixture builder does
+(`crates/jammi-ai/tests/it/gguf_qlora.rs::write_gguf_checkpoint`). Instead
+`jammi_cookbook.gguf_fixture` is a pure-Python re-derivation of the exact same
+byte format — verified against the pinned `candle-core` 0.11.0 source
+(`~/.cargo/registry`) while this chapter was written, and independently
+round-tripped through a real `candle_core::quantized::gguf_file::Content::read`
+outside this book's own render to confirm parity. Only the **matmul-site**
+weight tensors (the six per-layer BERT projections
+`crates/jammi-ai/src/model/backend/gguf.rs`'s module doc names) are quantized;
+everything else (embeddings, LayerNorms, biases) is written densely at `F32` —
+the same split `load_gguf_backbone` documents for what stays resident in
+compressed form versus what gets densified at load.
+
+`q8_0`'s block size is 32 — `candle-core`'s own
+`quantized/mod.rs::check_shape` (`~/.cargo/registry/…/candle-core-0.11.0/src/
+quantized/mod.rs:518-529`) refuses any quantized tensor whose **last**
+dimension is not a multiple of the block size. This book's `tiny_bert` fixture
+(`cookbook/fixtures/tiny_bert`, `hidden_size=32`) is exactly the shape this
+constraint is honest about: every matmul-site tensor's last dim (32 for the
+four `hidden×hidden` projections, 32 for `intermediate.dense` in, 128 for
+`output.dense` in) is a multiple of 32, so `q8_0` quantizes it without a
+block-size refusal — the same reason the engine's own hermetic GGUF suite pins
+`hidden=32` for its tiny fixtures
+(`crates/jammi-ai/tests/it/gguf_qlora.rs`: `"hidden % 32 == 0 so q8_0/q4_0
+quantize without a block-size refusal"`).
+
+```{python}
+import shutil
+import tempfile
+from pathlib import Path
+
+import jammi_cookbook
+
+_ENGINE_ROOT = Path(jammi_cookbook.__file__).resolve().parents[3]
+TINY_BERT = _ENGINE_ROOT / "cookbook" / "fixtures" / "tiny_bert"
+assert TINY_BERT.exists(), f"missing engine fixture: {TINY_BERT}"
+
+work = Path(tempfile.mkdtemp(prefix="quantized_weights_"))
+gguf_dir = work / "gguf_model"
+f32_dir = work / "f32_model"
+for d in (gguf_dir, f32_dir):
+    d.mkdir(parents=True)
+    shutil.copy(TINY_BERT / "config.json", d / "config.json")
+    shutil.copy(TINY_BERT / "tokenizer.json", d / "tokenizer.json")
+shutil.copy(TINY_BERT / "model.safetensors", f32_dir / "model.safetensors")
+
+from jammi_cookbook.gguf_fixture import write_q8_0_gguf
+
+gguf_path = write_q8_0_gguf(TINY_BERT, num_layers=1, dest_dir=gguf_dir)
+assert gguf_path.exists() and gguf_path.name == "model.gguf"
+print(f"wrote {gguf_path} ({gguf_path.stat().st_size} bytes)")
+print(f"f32 sibling:  {(f32_dir / 'model.safetensors')} "
+      f"({(f32_dir / 'model.safetensors').stat().st_size} bytes)")
+```
+
+Two directories now exist: `f32_dir` (the ordinary `model.safetensors`
+checkpoint every other chapter in this book already uses) and `gguf_dir` (the
+*same* weight values, `q8_0`-quantized at every matmul site). Neither carries
+the other's weights file — `f32_dir` has no `model.gguf`, `gguf_dir` has no
+`model.safetensors` — so the frozen safetensors-wins precedence
+(`crates/jammi-ai/src/model/resolver.rs:264-268`, `"Precedence FROZEN (issue
+#351): safetensors-or-onnx wins, byte-for-byte, exactly as before this
+feature existed. Only when NEITHER is present does a model.gguf file … enter
+the picture at all."`) is not exercised by this pair; the next chapter section
+walks each directory through the resolve→load→embed path on its own.
+
+## Resolve→load→embed through the quantized directory — a real encode
+
+`generate_embeddings(..., model=f"local:{gguf_dir}", ...)` is the *exact same
+call* [the compute-precision chapter](compute-precision.qmd) makes against a
+safetensors directory — `ModelResolver::resolve` (`resolver.rs`) reads
+`config.json` for architecture and layer count, finds `model.gguf` because
+neither `model.safetensors` nor `model.onnx` is present, and the Candle
+backend's GGUF branch (`crates/jammi-ai/src/model/backend/gguf.rs`) loads it:
+every matmul-site tensor stored at `q8_0` stays resident as an `Arc<QTensor>`
+(never dequantized at load), and every other tensor is densified to the
+model's compute dtype through a synthesized in-memory safetensors file. This
+is a real, active forward pass — not a config value read and ignored.
+
+```{python}
+import math
+
+import jammi
+
+SOURCE_ID = "corpus"
+_TEXTS = [
+    "the quick brown fox",
+    "jumps over the lazy dog",
+    "hello world",
+    "gguf quantized inference test",
+    "a b c d e f g",
+]
+
+
+def open_session() -> tuple[jammi.Session, Path]:
+    cfg_dir = tempfile.mkdtemp(prefix="quantized_weights_cfg_")
+    cfg_path = f"{cfg_dir}/jammi.toml"
+    # device = -1 pins the request to CPU explicitly (mirroring
+    # compute-precision.qmd) — moot on this book's CPU wheel, states intent.
+    with open(cfg_path, "w") as f:
+        f.write("[gpu]\ndevice = -1\n")
+    art_dir = Path(tempfile.mkdtemp(prefix="quantized_weights_art_"))
+    db = jammi.connect(f"file://{art_dir}", config=cfg_path)
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    corpus_path = Path(tempfile.mkdtemp(prefix="quantized_weights_corpus_")) / "corpus.parquet"
+    pq.write_table(pa.table({"id": list(range(len(_TEXTS))), "text": _TEXTS}), corpus_path)
+    db.add_source(SOURCE_ID, url=f"file://{corpus_path}", format="parquet")
+    return db, art_dir
+
+
+db, art_dir = open_session()
+table_gguf = db.generate_embeddings(
+    source=SOURCE_ID, model=f"local:{gguf_dir}", columns=["text"], key="id", modality="text",
+)
+rows_gguf = db.sql(f'SELECT _row_id, vector FROM "jammi.{table_gguf}"').to_pylist()
+
+print(f"quantized embedding table {table_gguf!r}: {len(rows_gguf)} rows")
+dims = {len(r["vector"]) for r in rows_gguf}
+print(f"vector dimension(s) present: {dims}")
+
+assert len(rows_gguf) == len(_TEXTS)
+assert dims == {32}, f"tiny_bert's hidden_size is 32; got dimension(s) {dims}"
+for r in rows_gguf:
+    vec = r["vector"]
+    assert all(math.isfinite(x) for x in vec), (
+        f"a non-finite component in row {r['_row_id']}'s q8_0-computed vector: {vec}"
+    )
+print(f"every one of {len(rows_gguf)} q8_0-computed vectors is finite, dim=32")
+```
+
+## Cosine vs the `f32` reference — measured, not assumed
+
+The same corpus, the same key column, the same base checkpoint — the only
+difference between this table and the one above is `f32_dir` vs `gguf_dir`.
+Both are computed live in this render; the cosine between them is a real
+number this chapter measures itself, not a value transcribed from the
+engine's own hermetic suite (which pins a *different* fixture: a
+deterministically-generated 32-dim tower, not this book's real `tiny_bert`
+weights).
+
+```{python}
+table_f32 = db.generate_embeddings(
+    source=SOURCE_ID, model=f"local:{f32_dir}", columns=["text"], key="id", modality="text",
+)
+rows_f32 = {
+    r["_row_id"]: r["vector"]
+    for r in db.sql(f'SELECT _row_id, vector FROM "jammi.{table_f32}"').to_pylist()
+}
+rows_gguf_by_id = {r["_row_id"]: r["vector"] for r in rows_gguf}
+
+cosines = []
+for row_id in sorted(rows_f32):
+    a, b = rows_f32[row_id], rows_gguf_by_id[row_id]
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    cosines.append(dot / (na * nb))
+
+mean_cosine = sum(cosines) / len(cosines)
+min_cosine = min(cosines)
+print(f"cosine(f32, q8_0) per row: {[round(c, 8) for c in cosines]}")
+print(f"mean = {mean_cosine:.8f}   min = {min_cosine:.8f}")
+
+# MEASURED (F9), not assumed: on this book's own tiny_bert weights this
+# chapter measured mean=0.99999999, min=0.99999990 (recorded here for
+# provenance; the assertion below is the reproducible floor, not this exact
+# transcribed value). q8_0 is the lowest-error k-quant format this workspace
+# supports (one f16 scale per 32-element block), so a near-1.0 result is
+# expected. The floor is a real, non-vacuous bound with a wide margin under
+# the measured value — a broken dequantize/dtype-cast path would land far
+# below it — the same wide-margin-floor discipline the engine's own hermetic
+# `gguf_embedding_matches_f32_reference_within_a_measured_cosine_floor`
+# (`crates/jammi-ai/tests/it/gguf_qlora.rs`, which independently measured
+# mean=0.99999964/min=0.9999995 on its own deterministic fixture) uses.
+FLOOR = 0.9999
+assert mean_cosine > FLOOR, f"mean cosine {mean_cosine} below the measured floor {FLOOR}"
+assert min_cosine > FLOOR, f"min cosine {min_cosine} below the measured floor {FLOOR}"
+print(f"\nboth mean and min cosine clear the {FLOOR} floor — q8_0 is active and faithful.")
+```
+
+## Identity is bound to the weight format — two materializations that never collide
+
+`compute_precision` folds into `ModelIdentity` and, through it, into the
+materialization identity every result table carries — [the compute-precision
+chapter](compute-precision.qmd) already measured that two runs differing only
+in compute precision never collide on one `DefinitionHash`. `quantization`
+folds into the same `ModelIdentity` the same way, for the same reason
+(`crates/jammi-db/src/store/manifest.rs:223-245`: `"a WeightQuantization is a
+determinant of the weight BYTES a model loaded, so it must enter the
+definition hash uniformly … two such runs must never collide on one
+materialization identity"`). This chapter reads the consequence off the two
+tables it just materialized — `f32_dir` and `gguf_dir`, otherwise identical
+producing descriptors — by reading each table's `.materialization.json`
+manifest sidecar directly, the same way [the point-in-time chapter](
+../19-point-in-time/point-in-time.qmd) reads a `Match`-case `definition_hash`
+off its own sidecar (`verify_materialization`'s own return dict does not carry
+the hash on a bare `Match`; the manifest sidecar does).
+
+```{python}
+import json
+
+
+# The manifest sidecar lives beside the table under the connect() target's
+# own jammi_db/ directory — the same direct sidecar read
+# build_point_in_time_cache.py uses for its own Match-case definition_hash.
+def read_manifest(table: str) -> dict:
+    sidecar = art_dir / "jammi_db" / f"{table}.materialization.json"
+    return json.loads(sidecar.read_text())
+
+
+manifest_f32 = read_manifest(table_f32)
+manifest_gguf = read_manifest(table_gguf)
+hash_f32 = manifest_f32["definition_hash"]
+hash_gguf = manifest_gguf["definition_hash"]
+
+print(f"f32  definition_hash: {hash_f32[:16]}…")
+print(f"q8_0 definition_hash: {hash_gguf[:16]}…")
+
+assert hash_f32 != hash_gguf, (
+    "a q8_0-quantized load and its f32 reference must never collide on one "
+    "DefinitionHash even under an otherwise-identical descriptor"
+)
+print("\ndistinct: True — the two materializations never collide.")
+
+verdict_f32 = db.verify_materialization(table_f32, expected_definition=hash_f32)
+verdict_gguf = db.verify_materialization(table_gguf, expected_definition=hash_gguf)
+assert verdict_f32["verdict"] in ("match", "match_with_unpinned_inputs")
+assert verdict_gguf["verdict"] in ("match", "match_with_unpinned_inputs")
+print(f"f32  verify_materialization: {verdict_f32['verdict']}")
+print(f"q8_0 verify_materialization: {verdict_gguf['verdict']}")
+```
+
+> **What this cell shows, and what it cannot.** The manifest sidecar exposes
+> `definition_hash` (an opaque digest) and `input_anchors` — it does **not**
+> serialize the raw `ModelIdentity.quantization` field back out to a client
+> (`MaterializationManifest`'s own field list,
+> `crates/jammi-db/src/store/manifest.rs:875-899`, carries no `models`/
+> `ModelIdentity` list). So this cell measures the *consequence* Python can
+> see — a distinct hash — not the raw fact itself. The raw fact is proven
+> directly, on the Rust side, by
+> `gguf_model_identity_reports_quantization_and_a_distinct_definition_hash`
+> (`crates/jammi-ai/tests/it/gguf_qlora.rs`), which asserts
+> `gguf_model.quantization() == Some(WeightQuantization::Q8_0)` before hashing
+> it. This chapter's cell is the CI-visible proof that the consequence reaches
+> a Python caller; that oracle is what proves the cause.
+
+## QLoRA — LoRA over a frozen, quantized backbone
+
+`base_model` accepts a GGUF directory the same way it accepts a safetensors
+one, on `fine_tune(...)` exactly as on `generate_embeddings(...)`. When the
+resolved base is `model.gguf` and the job requests **encoder adapters**
+(`target_modules` non-empty), the training path builds its LoRA A/B matrices
+over the frozen quantized backbone automatically — "the base artifact selects
+this, not a separate flag or config field"
+(`docs/guide/src/local-models.md:66-69`; the same statement is repeated,
+essentially verbatim, at `docs/guide/src/fine-tuning.md:305-314`). The
+*default* fine-tune arm (an empty `target_modules`, a projection head trained
+outside the frozen encoder) never touches the backbone's matmul sites at all,
+quantized or not — QLoRA specifically means the **encoder-adapters** arm,
+which is why the cell below passes `target_modules`.
+
+**The quantized weights are never trained through directly — and, since this
+engine's own #351 work, the matmul that reads them can no longer silently
+drop that guarantee.** A block-quantized weight tensor loads as a candle
+`QTensor`; `QTensor` implements `CustomOp1` with the fast quantized-matmul
+kernel, but `CustomOp1`'s *default* backward is `Err(BackwardNotSupported)` —
+except candle's own `apply_op1_no_bwd` entry point sidesteps that default
+entirely and builds a `BackpropOp::none()` unconditionally, so a caller who
+reaches a quantized weight through it gets a live forward value and a
+**silently missing gradient**, not a loud error (`.jammi/escapes.jsonl`,
+row `esc-037-apply-op1-no-bwd-truncates-backward-silently`: `"the natural
+entry point for quantized fine-tuning"`, exactly this hazard). This engine's
+`QuantMatMulGrad` (`crates/jammi-kernels/src/ops/quant_matmul_grad.rs`) closes
+that hole for every quantized matmul site in this workspace: it wraps the
+same `Arc<QTensor>` but runs through the ordinary, always-tracked op path
+with a real `bwd` (gradient with respect to the activation only — "the
+bitsandbytes `MatMul4Bit` contract" [@dettmers2023qlora] — the frozen weight
+itself never receives one), so `jammi_lora::QuantizedLinear`/
+`FrozenBase::Quantized` and the GGUF loader route every quantized matmul-site
+weight through it exclusively — re-verified structurally closed on this
+branch's own escape ledger. This is not a training-quality claim; it is the
+narrower, load-bearing one: the quantized path cannot *silently* stop
+learning through the encoder the way the un-wrapped entry point could.
+
+```{python}
+PAIRS_PATH = _ENGINE_ROOT / "cookbook" / "fixtures" / "tiny_pairs.csv"
+assert PAIRS_PATH.exists(), f"missing engine fixture: {PAIRS_PATH}"
+
+db.add_source("qlora_training", url=str(PAIRS_PATH), format="csv")
+
+job = db.fine_tune(
+    source="qlora_training",
+    base_model=f"local:{gguf_dir}",
+    columns=["text_a", "text_b", "score"],
+    method="lora",
+    task="text_embedding",
+    target_modules=["query", "value"],  # non-empty -> encoder-adapters (QLoRA)
+    lora_rank=4,
+    epochs=12,
+    # warmup_steps=0, not the engine default of 100. This fixture's 24 train
+    # rows / batch_size=8 give only 3 steps/epoch; against a 100-step linear
+    # warmup (`compute_lr`, `crates/jammi-ai/src/fine_tune/trainer.rs`) every
+    # step of a short run lands inside the ramp and the effective LR never
+    # clears ~1e-5 — this exact starvation was measured on this fixture at
+    # epochs=2/warmup=100 (default): a val-loss delta of 4.7e-5, indistinguishable
+    # from float32 reduction-order noise, not a learning signal. warmup_steps=0
+    # is the same override this engine's own GPU acceptance oracle uses on this
+    # identical hyperparameter surface for the identical reason
+    # (`crates/jammi-ai/tests/gpu_capability/gguf_quantized_gpu.rs`'s module
+    # doc, `qlora_learns_on_gpu_with_gguf_base`). learning_rate=1e-3 and 12
+    # epochs (36 steps total) were then chosen, measured below, to clear a
+    # documented floor with wide margin — see "Held-out val loss" below.
+    warmup_steps=0,
+    learning_rate=1e-3,
+    validation_fraction=0.2,
+    early_stopping_metric="val_loss",
+    seed=0,
+)
+print(f"job_id: {job.job_id}")
+job.wait()  # raises on divergence/failure rather than returning silently
+print(f"status: {job.status()}")
+assert job.status() == "completed"
+
+model_id = job.model_id
+assert model_id.startswith("jammi:fine-tuned:")
+print(f"model_id: {model_id}")
+
+query_vec = db.encode_query(model=model_id, query="quantum computing applications")
+assert len(query_vec) == 32, f"tiny_bert is 32-dim; got {len(query_vec)}-dim from the fine-tuned model"
+assert all(math.isfinite(x) for x in query_vec)
+print(f"fine-tuned model encodes a query to a {len(query_vec)}-dim, finite vector — QLoRA round-trips.")
+```
+
+## Held-out val loss — read directly, the same oracle early stopping uses
+
+`job.metrics()` (`crates/jammi-python/src/job.rs`) returns the catalog's
+run-summary blob as a dict — `final_loss`, `early_stopping_metric`,
+`total_steps`, and, per epoch actually run, `train_loss_curve` /
+`val_loss_curve` arrays of `{epoch, loss}` rows
+(`TrainingLoop::run`/`TrainingResult::metrics_json`,
+`crates/jammi-ai/src/fine_tune/trainer.rs`). `val_loss_curve` is present
+exactly when the job's `early_stopping_metric` is `"val_loss"` — the arm the
+cell above selects — because that is the only arm under which
+`TrainingLoop::evaluate_held_out` measures a held-out loss at all: the
+trainer prefers this held-out signal over train loss for early stopping
+because a training-loss trend can improve while a model overfits the exact
+batches it is shown, indistinguishable from real generalization on train
+loss alone. This cell reads that same signal back and asserts against a
+**measured floor**, not a bare `last < first` sign check: a two-point (or
+even twelve-point) curve's *sign* alone is not a trustworthy oracle unless
+the magnitude of the fall is pinned far above run-to-run/environment-to-
+environment float noise — see the floor's derivation in the cell below.
+
+```{python}
+metrics = job.metrics()
+assert "val_loss_curve" in metrics, (
+    "val_loss_curve must be present: this job's early_stopping_metric is "
+    "'val_loss', so TrainingLoop::evaluate_held_out measures a held-out loss "
+    "every epoch"
+)
+val_curve = metrics["val_loss_curve"]
+val_losses = [row["loss"] for row in val_curve]
+print(f"val_loss_curve: {val_curve}")
+
+assert len(val_losses) >= 2, f"expected at least 2 measured epochs, got {val_curve}"
+assert all(math.isfinite(v) for v in val_losses), (
+    f"a non-finite held-out loss in the curve: {val_losses}"
+)
+
+# MEASURED (F9), not assumed, and not a bare sign check: a `last < first`
+# comparison on its own is a coin flip once the true effect size is inside
+# float32 reduction-order noise — this chapter shipped exactly that bug once
+# (val_loss_curve delta 4.7e-5 at epochs=2/warmup_steps=100, the engine
+# default; see the `fine_tune(...)` cell above for the root cause and the
+# fix). The floor below is derived from measurements taken while authoring
+# this cell, at these exact hyperparameters:
+#   - production run (seed=0, this cell's own config): first-last delta
+#     measured 0.050661.
+#   - repeated-run spread: the SAME config re-run 5x back-to-back (nothing
+#     varied but the run) was bit-identical every time — spread 0.0 — the
+#     single-threaded-BLAS/fixed-seed determinism regime this book pins on
+#     import (`jammi_cookbook.determinism`) holds within one environment.
+#   - cross-seed spread (seed in {0, 1, 2, 42}, everything else identical):
+#     delta ranged 0.034894-0.068716 — every one of those still clears the
+#     floor below by >=34x, so the signal is not a seed=0 fluke.
+#   - float32 noise ceiling: val loss magnitude is ~3.6; float32 relative
+#     precision is ~1.2e-7, so a single reading's reduction-order uncertainty
+#     is ~3.6 * 1.2e-7 ~= 4e-7, and a first-minus-last delta (two such
+#     readings) has a worst-case additive noise ceiling on the order of 1e-6
+#     — true regardless of which machine/BLAS/arch renders this chapter,
+#     unlike the single-machine spread measurement above.
+# VAL_LOSS_FLOOR sits with a wide margin under every measured delta above
+# (>=34x) and a wide margin over the float32 noise ceiling (~1e3x) — the same
+# wide-margin-floor discipline as this chapter's own cosine FLOOR (below) and
+# the engine's own `gguf_embedding_matches_f32_reference_within_a_measured_
+# cosine_floor`.
+# Named distinctly from the cosine-cost FLOOR (below): each floor lives in
+# its own cell's namespace elsewhere in this book, but this book's cells
+# share one Python process/namespace across the whole render, so a second
+# top-level `FLOOR` here would silently shadow the cosine section's.
+VAL_LOSS_FLOOR = 1e-3
+delta = val_losses[0] - val_losses[-1]
+assert delta > VAL_LOSS_FLOOR, (
+    f"held-out val loss must fall from the first measured epoch to the last "
+    f"by more than the measured floor {VAL_LOSS_FLOOR} under QLoRA fine-tuning "
+    f"over the frozen quantized backbone; got delta={delta} from {val_losses}"
+)
+print(
+    f"val loss: first={val_losses[0]:.6f}  last={val_losses[-1]:.6f}  "
+    f"(Δ={delta:.6f}, vs the {VAL_LOSS_FLOOR} floor) — a learning signal "
+    f"measured with margin, not a bare sign check."
+)
+```
+
+## The honest limits: what quantization costs, and what it buys
+
+Both measured live, on the exact two files this chapter wrote at the top —
+never transcribed.
+
+```{python}
+import os
+
+f32_bytes = os.path.getsize(f32_dir / "model.safetensors")
+gguf_bytes = os.path.getsize(gguf_dir / "model.gguf")
+savings = 1.0 - (gguf_bytes / f32_bytes)
+cosine_cost = 1.0 - mean_cosine
+
+print(f"on-disk bytes:  f32={f32_bytes}   q8_0={gguf_bytes}   "
+      f"({savings:.1%} smaller)")
+print(f"cosine cost:    1 - mean_cosine = {cosine_cost:.2e}  "
+      f"(vs the {FLOOR} floor asserted above)")
+
+assert gguf_bytes < f32_bytes, "q8_0 must be smaller on disk than its f32 sibling"
+assert savings > 0.20, f"expected a meaningful size reduction, got {savings:.1%}"
+```
+
+What `q8_0` buys, measured on this fixture: roughly a third smaller on disk,
+for a cosine cost on the order of `1e-8` — vanishingly small next to [the
+storage-precision chapters](precision.qmd)' `int8`/`binary` sidecar trade,
+which costs real, honest recall a retrieve→rescore stage has to work to
+recover. What it does not buy here: this is a 1-layer, 32-dim toy tower — a
+production-scale backbone's matmul-site tensors dominate its parameter count
+far more than `tiny_bert`'s do, so the *relative* size reduction measured
+here is a conservative floor, not a ceiling, for a real deployment. The
+CUDA/GPU story — `QuantMatMulGrad`'s forward and backward parity against a
+dense-dequantized reference, on real hardware — is proven in this engine's
+CI CUDA-gated prove lanes
+(`crates/jammi-kernels/tests/cuda_parity.rs::
+quant_matmul_grad_forward_parity_cpu_vs_cuda_q8_0_q4_0_q4k_cuda` and
+`::quant_matmul_grad_backward_parity_cuda_dense_reference_and_cpu`), not
+here — this chapter's cells are CPU-only throughout, by the same convention
+[the compute-precision chapter](compute-precision.qmd) states outright.
+
+## Bridge note
+
+> **A third vocabulary, composing freely with the other two.** `storage_precision`
+> ([the precision chapters](precision.qmd)) quantizes what a search sidecar
+> stores; `compute_precision` (the [compute-precision chapter](compute-precision.qmd))
+> sets the dtype a forward pass runs at; `WeightQuantization` — measured here
+> — is neither a knob nor a stage, but a fact an artifact carries: whether its
+> matmul-site tensors are stored block-quantized on disk. All three fold into
+> the same materialization identity (`ModelIdentity`), so no combination of
+> them ever collides on one `DefinitionHash` — proven directly for this axis
+> by the distinct-hash cell above. A `q8_0` GGUF backbone resolves, loads, and
+> embeds through the exact same public front door every other checkpoint in
+> this book uses, costs a cosine delta on the order of `1e-8` on this fixture,
+> and trains correctly under LoRA over its frozen weights — and the held-out
+> val-loss trend that gates its own early stopping is a number this book's
+> public surface reads back and asserts directly: `job.metrics()`'s
+> `val_loss_curve`, falling from first measured epoch to last by a
+> measured margin (`Δ ≈ 0.05` against a `1e-3` floor derived from this
+> fixture's own measured run-to-run spread and a float32 noise ceiling — see
+> "Held-out val loss" above) — not a bare sign check on a curve whose
+> unmargined delta could otherwise land inside reduction-order noise.

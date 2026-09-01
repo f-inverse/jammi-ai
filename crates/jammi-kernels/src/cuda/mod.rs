@@ -87,3 +87,32 @@ pub(crate) fn alloc_empty(
         dtype => Err(Error::UnsupportedDTypeForOp(dtype, op)),
     }
 }
+
+/// Wrap a freshly allocated, zero-FILLED device buffer of `dtype` and
+/// length `len` as a `CudaStorage` — for the `rows == 0, <reduction axis>
+/// != 0` degenerate fast path a summed-over-rows op (e.g.
+/// `layer_norm::cuda_bwd_dgamma`) must take: unlike [`alloc_empty`]'s
+/// zero-LENGTH buffer (correct only when the whole output is empty), a
+/// sum over zero rows still produces a `[hidden]`-shaped, all-zero
+/// output — the exact shape `layer_norm::ops`'s CPU reference
+/// (`ln_bwd_dgamma_f32`'s `vec![0f32; hidden]`) returns for the same
+/// input, so returning `alloc_empty`'s `[0]`-shaped buffer here instead
+/// would be a cross-arm shape divergence (family D).
+pub(crate) fn alloc_zeros(
+    device: &CudaDevice,
+    dtype: DType,
+    len: usize,
+    op: &'static str,
+) -> Result<CudaStorage> {
+    match dtype {
+        DType::F32 => {
+            let out = device.alloc_zeros::<f32>(len)?;
+            Ok(CudaStorage::wrap_cuda_slice(out, device.clone()))
+        }
+        DType::BF16 => {
+            let out = device.alloc_zeros::<bf16>(len)?;
+            Ok(CudaStorage::wrap_cuda_slice(out, device.clone()))
+        }
+        dtype => Err(Error::UnsupportedDTypeForOp(dtype, op)),
+    }
+}

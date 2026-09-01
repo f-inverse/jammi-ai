@@ -50,13 +50,23 @@ pub(crate) fn cuda_fwd(
         });
     }
 
-    if hidden == 0 || n == 0 {
-        // The dtype-agreement check above already guarantees
-        // `s1.dtype() == s2.dtype() == s3.dtype()` here.
+    // `hidden == 0` is checked on its own — matching `cpu_fwd`'s domain
+    // exactly: `ops::rope::RopeFused::cpu_fwd` exempts contiguity ONLY
+    // when `hidden == 0` (its own early `empty_like` return, BEFORE
+    // `contiguous_offsets()`), never for a broader `n == 0`. The
+    // dtype-agreement check above already guarantees `s1.dtype() ==
+    // s2.dtype() == s3.dtype()` here.
+    if hidden == 0 {
         return Ok((super::alloc_empty(&device, s1.dtype(), OP)?, shape));
     }
-    check_cuda_domain(OP, n, hidden)?;
 
+    // Contiguity is checked NEXT, before the (now `hidden != 0`) `n == 0`
+    // fast path below — a `total_rows == 0` (`n == 0` with `hidden != 0`)
+    // empty-but-non-contiguous layout still falls through `cpu_fwd`'s OWN
+    // `contiguous_offsets()` calls (only `hidden == 0`, handled above,
+    // skips them there), so this arm must refuse the same layout rather
+    // than silently admitting it through a combined `hidden == 0 || n ==
+    // 0` fast path — the exact class of divergence this fix closes.
     let (x1, x2) = l1
         .contiguous_offsets()
         .ok_or(Error::RequiresContiguous { op: OP })?;
@@ -66,6 +76,11 @@ pub(crate) fn cuda_fwd(
     let (s_1, s_2) = l3
         .contiguous_offsets()
         .ok_or(Error::RequiresContiguous { op: OP })?;
+
+    if n == 0 {
+        return Ok((super::alloc_empty(&device, s1.dtype(), OP)?, shape));
+    }
+    check_cuda_domain(OP, n, hidden)?;
 
     let cfg = super::elemwise_launch_config(n as u32);
     let hidden_u32 = hidden as u32;

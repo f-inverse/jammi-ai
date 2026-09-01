@@ -46,7 +46,36 @@ pub(crate) fn cuda_fwd(
     let device = s1.device().clone();
     let n = l1.shape().elem_count();
 
-    if hidden == 0 || n == 0 {
+    // `hidden == 0` is checked FIRST, on its own — matching `cpu_fwd`'s
+    // domain exactly: `ops::layer_norm::LayerNormFused::cpu_fwd` exempts
+    // contiguity ONLY when `hidden == 0` (its own early `empty_like`
+    // return, BEFORE `contiguous_offsets()`), never for a broader `n == 0`.
+    if hidden == 0 {
+        if s1.dtype() != s2.dtype() {
+            return Err(Error::DTypeMismatchBinaryOp {
+                lhs: s1.dtype(),
+                rhs: s2.dtype(),
+                op: OP,
+            });
+        }
+        return Ok((super::alloc_empty(&device, s1.dtype(), OP)?, shape));
+    }
+
+    // Contiguity is checked NEXT, before the (now `hidden != 0`) `n == 0`
+    // fast path below — a `rows == 0` (`n == 0` with `hidden != 0`)
+    // empty-but-non-contiguous layout still falls through `cpu_fwd`'s OWN
+    // `contiguous_offsets()` call (only `hidden == 0`, handled above,
+    // skips it there), so this arm must refuse the same layout rather than
+    // silently admitting it through a combined `hidden == 0 || n == 0`
+    // fast path — the exact class of divergence this fix closes.
+    let (o1, o2) = l1
+        .contiguous_offsets()
+        .ok_or(Error::RequiresContiguous { op: OP })?;
+    let (g1, g2) = l2
+        .contiguous_offsets()
+        .ok_or(Error::RequiresContiguous { op: OP })?;
+
+    if n == 0 {
         if s1.dtype() != s2.dtype() {
             return Err(Error::DTypeMismatchBinaryOp {
                 lhs: s1.dtype(),
@@ -58,13 +87,6 @@ pub(crate) fn cuda_fwd(
     }
     check_cuda_domain(OP, n, hidden)?;
     let rows = n / hidden;
-
-    let (o1, o2) = l1
-        .contiguous_offsets()
-        .ok_or(Error::RequiresContiguous { op: OP })?;
-    let (g1, g2) = l2
-        .contiguous_offsets()
-        .ok_or(Error::RequiresContiguous { op: OP })?;
 
     let cfg = LaunchConfig {
         grid_dim: (rows as u32, 1, 1),
@@ -145,7 +167,34 @@ pub(crate) fn cuda_bwd_dx(
     let device = s1.device().clone();
     let n = l1.shape().elem_count();
 
-    if hidden == 0 || n == 0 {
+    // See `cuda_fwd`'s identical comment above: `hidden == 0` is checked
+    // on its own, matching `ops::layer_norm::LayerNormBwdDx::cpu_fwd`'s
+    // domain (its own early `empty_like` return is gated on `hidden == 0`
+    // alone, before `contiguous_offsets()`).
+    if hidden == 0 {
+        if s1.dtype() != s2.dtype() {
+            return Err(Error::DTypeMismatchBinaryOp {
+                lhs: s1.dtype(),
+                rhs: s2.dtype(),
+                op: OP,
+            });
+        }
+        return Ok((super::alloc_empty(&device, s1.dtype(), OP)?, shape));
+    }
+
+    // Contiguity checked before the (now `hidden != 0`) `n == 0` fast path
+    // — see `cuda_fwd`'s identical comment above.
+    let (o1, o2) = l1
+        .contiguous_offsets()
+        .ok_or(Error::RequiresContiguous { op: OP })?;
+    let (g1, g2) = l2
+        .contiguous_offsets()
+        .ok_or(Error::RequiresContiguous { op: OP })?;
+    let (d1, d2) = l3
+        .contiguous_offsets()
+        .ok_or(Error::RequiresContiguous { op: OP })?;
+
+    if n == 0 {
         if s1.dtype() != s2.dtype() {
             return Err(Error::DTypeMismatchBinaryOp {
                 lhs: s1.dtype(),
@@ -157,16 +206,6 @@ pub(crate) fn cuda_bwd_dx(
     }
     check_cuda_domain(OP, n, hidden)?;
     let rows = n / hidden;
-
-    let (o1, o2) = l1
-        .contiguous_offsets()
-        .ok_or(Error::RequiresContiguous { op: OP })?;
-    let (g1, g2) = l2
-        .contiguous_offsets()
-        .ok_or(Error::RequiresContiguous { op: OP })?;
-    let (d1, d2) = l3
-        .contiguous_offsets()
-        .ok_or(Error::RequiresContiguous { op: OP })?;
 
     let cfg = LaunchConfig {
         grid_dim: (rows as u32, 1, 1),
@@ -246,7 +285,14 @@ pub(crate) fn cuda_bwd_dgamma(
     let device = s1.device().clone();
     let n = l1.shape().elem_count();
 
-    if hidden == 0 || n == 0 {
+    // See `cuda_fwd`'s identical comment above: `hidden == 0` is checked
+    // on its own, matching `ops::layer_norm`'s internal `LayerNormBwdDgamma
+    // ::cpu_fwd` domain (its own early-return is gated on `hidden == 0`
+    // alone, before `contiguous_offsets()`). This arm's `Shape::from(
+    // 0usize)` is correct ONLY here, where `hidden` (the output's own
+    // length) is itself `0` — see the `n == 0` fast path below for the
+    // `rows == 0, hidden != 0` case, which must NOT reuse this shape.
+    if hidden == 0 {
         if s1.dtype() != s2.dtype() {
             return Err(Error::DTypeMismatchBinaryOp {
                 lhs: s1.dtype(),
@@ -259,15 +305,39 @@ pub(crate) fn cuda_bwd_dgamma(
             Shape::from(0usize),
         ));
     }
-    check_cuda_domain(OP, n, hidden)?;
-    let rows = n / hidden;
 
+    // Contiguity checked before the (now `hidden != 0`) `n == 0` fast path
+    // — see `cuda_fwd`'s identical comment above.
     let (o1, o2) = l1
         .contiguous_offsets()
         .ok_or(Error::RequiresContiguous { op: OP })?;
     let (d1, d2) = l2
         .contiguous_offsets()
         .ok_or(Error::RequiresContiguous { op: OP })?;
+
+    // `rows == 0` here (`n == 0` with `hidden != 0`, since the `hidden ==
+    // 0` case already returned above): `dgamma` is a sum over rows, so
+    // zero rows still sum to a `[hidden]`-shaped, all-zero output — NOT
+    // `alloc_empty`'s `[0]`-shaped buffer, which would silently produce a
+    // wrong-shaped `dgamma` on CUDA relative to `cpu_fwd`'s own `rows ==
+    // 0` path (`ln_bwd_dgamma_f32`'s `vec![0f32; hidden]`, `Shape::from(
+    // hidden)`). See `super::alloc_zeros`'s doc for why this needs its own
+    // helper rather than reusing `alloc_empty`.
+    if n == 0 {
+        if s1.dtype() != s2.dtype() {
+            return Err(Error::DTypeMismatchBinaryOp {
+                lhs: s1.dtype(),
+                rhs: s2.dtype(),
+                op: OP,
+            });
+        }
+        return Ok((
+            super::alloc_zeros(&device, s1.dtype(), hidden, OP)?,
+            Shape::from(hidden),
+        ));
+    }
+    check_cuda_domain(OP, n, hidden)?;
+    let rows = n / hidden;
 
     // Pass 1 (row_cfg): one block per row, caching that row's mean/invvar
     // once. Pass 2 (col_cfg): column-tiled, grid-stride over `hidden`.

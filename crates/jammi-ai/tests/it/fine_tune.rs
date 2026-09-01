@@ -2574,6 +2574,34 @@ async fn cancelled_run_reclaims_epoch_checkpoints_that_actually_existed() {
 // tokio's separate blocking pool, but the warn under test fires from
 // `publish_and_finalize`, back on the single async thread, not from inside
 // that closure).
+/// PROBE a `chmod 0o555`'d directory for a real write-block: root (and a
+/// mode-ignoring filesystem) can write through it regardless, in which case
+/// the caller's failed-prune fault-injection premise never exists and it
+/// must skip loudly rather than assert against a fault that was never
+/// injected. Unless `JAMMI_REQUIRE_POSIX_PERMS` is set (the lane that is
+/// SUPPOSED to run unprivileged with real POSIX permission enforcement), in
+/// which case a bypassed chmod is itself a hard failure, never a silent
+/// skip — the same require-gate polarity every other `JAMMI_REQUIRE_*`
+/// skip-guard in this crate carries, applied to a filesystem-privilege
+/// probe instead of a hardware one.
+#[cfg(unix)]
+fn chmod_bypassed(dir: &std::path::Path) -> bool {
+    let probe = dir.join(".root_probe");
+    let bypassed = std::fs::write(&probe, b"x").is_ok();
+    if bypassed {
+        let _ = std::fs::remove_file(&probe);
+        if std::env::var_os("JAMMI_REQUIRE_POSIX_PERMS").is_some() {
+            panic!(
+                "JAMMI_REQUIRE_POSIX_PERMS is set but the process could write through a \
+                 0o555-chmod'd directory (root, or a mode-ignoring filesystem) — the \
+                 failed-prune fault-injection premise this test needs does not hold; a silent \
+                 skip is not acceptable here"
+            );
+        }
+    }
+    bypassed
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn finalize_reclaims_a_persistently_failed_prune_and_warns() {
@@ -2698,9 +2726,7 @@ async fn finalize_reclaims_a_persistently_failed_prune_and_warns() {
     // convention this batch applies in candle.rs's device_tests too). The
     // run is aborted rather than awaited: nothing below is meaningful
     // without the injected fault.
-    let probe = epoch0_dir.join(".root_probe");
-    if std::fs::write(&probe, b"x").is_ok() {
-        let _ = std::fs::remove_file(&probe);
+    if chmod_bypassed(&epoch0_dir) {
         let _ = std::fs::set_permissions(&epoch0_dir, std::fs::Permissions::from_mode(0o755));
         handle.abort();
         eprintln!(

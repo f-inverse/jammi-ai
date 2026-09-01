@@ -105,6 +105,22 @@ pub(crate) mod flash_attention;
 // op's domain check, not two that could silently drift apart.
 pub(crate) mod geglu;
 pub(crate) mod layer_norm;
+// NOT an op module (the only one in this list): the CUDA launch-domain
+// facts every op's CUDA glue shares — the `u32::MAX` element-count
+// ceiling and the grid-stride launch geometry. They live HERE, not in
+// `crate::cuda`, precisely because `mod cuda` is `#[cfg(feature =
+// "cuda")]`: a unit test of these pure-arithmetic rules placed there
+// would only ever compile on a CUDA-feature build, i.e. never on the CPU
+// lane that can actually prove them. `crate::cuda::mod` re-exports
+// (never re-implements) them — see the module's own doc for the full
+// indexing contract (campaign #446, finding 4).
+//
+// `dead_code` without the `cuda` feature is HONEST, not suppressed noise:
+// nothing outside `crate::cuda` calls these, so on a CPU-only build the
+// only consumers are this module's own tests (which `#[cfg(test)]` hides
+// from the lint).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) mod launch_domain;
 pub(crate) mod low_rank_residual_linear;
 // Private, mirroring `flash_attention`'s own `StatefulKernelOp` shape (a
 // `Saved<Tensor>` `lse` field — see that module's doc for why a stateful

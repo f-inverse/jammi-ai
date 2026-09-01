@@ -291,14 +291,25 @@ extern "C" __global__ void layer_norm_row_stats_bf16(
 // xhat[row,col])`. Each thread owns one or more columns (grid-stride);
 // `atomicAdd` is not used — columns are partitioned across threads, never
 // shared, so no thread ever writes another thread's output element.
+//
+// `col` is `size_t`, per the crate-wide INDEXING CONTRACT for grid-stride
+// loops (campaign #446 finding 4; stated in full in `geglu.cu`'s module
+// doc and `../ops/launch_domain.rs`'s). These three dgamma loops were
+// never REACHABLY vulnerable — `hidden` is bounded by `ops::MAX_HIDDEN`
+// (8192) at the host edge, far below any 32-bit wrap — but the contract is
+// a property of the loop SHAPE, not of one op's ceiling: a lexical scan
+// (`launch_domain::tests::every_grid_stride_loop_in_a_cuda_source_is_64_bit`)
+// cannot distinguish "bounded elsewhere" from "unbounded", so every
+// grid-stride loop in this directory is 64-bit and the rule stays
+// mechanically checkable.
 // ---------------------------------------------------------------------
 
 extern "C" __global__ void layer_norm_bwd_dgamma_f32(
     const float* x, const float* dy, const float* mean, const float* invvar,
     float* dgamma, const unsigned int rows, const unsigned int hidden
 ) {
-    for (unsigned int col = blockIdx.x * blockDim.x + threadIdx.x; col < hidden;
-         col += blockDim.x * gridDim.x) {
+    for (size_t col = (size_t)blockIdx.x * blockDim.x + threadIdx.x; col < hidden;
+         col += (size_t)blockDim.x * gridDim.x) {
         float acc = 0.0f;
         for (unsigned int r = 0; r < rows; r++) {
             float xhat = (x[(size_t)r * hidden + col] - mean[r]) * invvar[r];
@@ -318,8 +329,8 @@ extern "C" __global__ void layer_norm_bwd_dgamma_bf16(
     const float* invvar, float* dgamma_f32, const unsigned int rows,
     const unsigned int hidden
 ) {
-    for (unsigned int col = blockIdx.x * blockDim.x + threadIdx.x; col < hidden;
-         col += blockDim.x * gridDim.x) {
+    for (size_t col = (size_t)blockIdx.x * blockDim.x + threadIdx.x; col < hidden;
+         col += (size_t)blockDim.x * gridDim.x) {
         float acc = 0.0f;
         for (unsigned int r = 0; r < rows; r++) {
             float xhat =

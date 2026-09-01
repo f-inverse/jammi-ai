@@ -26,6 +26,20 @@ const DROPOUT_BLOCK: u32 = 256;
 /// single-pass kernel, this op has no `u32::MAX` element-count ceiling at
 /// all (see this module's `cuda_fwd`, which therefore does NOT check
 /// `n > u32::MAX` the way every other op's CUDA glue in this crate does).
+///
+/// ELEM-COUNT-GUARD-WAIVER: this is the one dispatch module in `src/cuda`
+/// that does not call `check_elem_count_fits_u32`, and the waiver is
+/// earned on BOTH halves of the crate's indexing contract
+/// (`ops::launch_domain`'s module doc), not just the loop's:
+/// `dropout_fwd_{f32,bf16,f16}` take `n` as an `unsigned long long`
+/// PARAMETER (so the Rust glue pushes a `u64`, no `as u32` anywhere in the
+/// path), their grid-stride induction variable is `unsigned long long`,
+/// and `launch_config` above takes `u64` and saturates the block count
+/// through a checked `u32::try_from`. There is nothing 32-bit left to
+/// truncate. `ops::launch_domain::tests::
+/// every_cuda_dispatch_bounds_its_element_count` requires exactly this
+/// marker of any launching module with no guard call, so a NEW op cannot
+/// inherit the exemption by silence.
 const DROPOUT_MAX_GRID: u32 = 65_535;
 
 fn launch_config(n: u64) -> LaunchConfig {

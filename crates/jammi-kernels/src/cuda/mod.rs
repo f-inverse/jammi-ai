@@ -66,24 +66,20 @@ pub(crate) const PTX_SOFTMAX: &str = include_str!(concat!(env!("OUT_DIR"), "/sof
 pub(crate) const PTX_SOFTMAX_F16: &str = include_str!(concat!(env!("OUT_DIR"), "/softmax_f16.ptx"));
 pub(crate) const PTX_GEGLU_F16: &str = include_str!(concat!(env!("OUT_DIR"), "/geglu_f16.ptx"));
 
-/// `n > u32::MAX`: every op's CUDA launch grid and its kernel's own
-/// indices are 32-bit, so an element count above `u32::MAX` would silently
-/// truncate via `as u32` (under-launching, leaving the allocation's tail
-/// uninitialized) rather than fail loudly (family D / K2) — refused here
-/// instead. Shared by every op's own domain check: `geglu::check_n` is a
-/// direct pass-through; `layer_norm`/`rope`'s combined `check_cuda_domain`
-/// and `softmax`'s combined `check_last_and_n` call this for the
-/// `u32::MAX` half of their check, alongside their own op-specific
-/// ceiling (`MAX_HIDDEN`/`MAX_HEAD_DIM`/`MAX_LAST_DIM`).
-pub(crate) fn check_elem_count_fits_u32(op: &'static str, n: usize) -> Result<()> {
-    if n > u32::MAX as usize {
-        return Err(Error::Msg(format!(
-            "{op}: {n} elements exceeds u32::MAX; the CUDA launch grid and \
-             the kernel's indices are both 32-bit"
-        )));
-    }
-    Ok(())
-}
+/// The element-count ceiling every dispatch below refuses above, and the
+/// grid-stride launch geometry `geglu`'s `launch_config` builds — RE-
+/// EXPORTED from `crate::ops::launch_domain`, never re-implemented here.
+///
+/// They are defined in `ops` because `mod cuda` is `#[cfg(feature =
+/// "cuda")]` and they are pure arithmetic/domain facts (no device, no PTX,
+/// no launch): defining them here would mean their unit tests only ever
+/// compiled on a CUDA-feature build. See `ops::launch_domain`'s own module
+/// doc for the full indexing contract (campaign #446, finding 4: 64-bit
+/// in-kernel index arithmetic, 32-bit kernel scalar parameters, and why
+/// each half needs the other).
+pub(crate) use crate::ops::launch_domain::{
+    check_elem_count_fits_u32, geglu_grid_blocks, GEGLU_BLOCK,
+};
 
 /// The grid-stride, one-thread-per-element launch config the crate's
 /// single-pass elementwise kernels (`Axpy`, `ScaledCastAdd`, `RopeFused`)

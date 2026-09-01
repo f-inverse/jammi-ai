@@ -235,6 +235,16 @@ def select(
             rel = c.path.relative_to(repo_root).as_posix()
         except ValueError:
             rel = c.path.as_posix()
+        # LIVE_COMPUTE_NEEDS_SERVER is never selected by this gate — not even
+        # when the chapter's own .qmd is in the diff. This gate's runner has
+        # no server harness (cookbook-render.yml's nightly does), so selecting
+        # a needs-server chapter here guarantees a structural red regardless
+        # of the chapter's correctness (campaign #443: a diff-touched
+        # needs-server chapter was auto-selected and died on the missing
+        # `jammi-server` binary). Reported, not silently rendered or dropped;
+        # the nightly full render is the lane that executes it.
+        if c.bucket == "LIVE_COMPUTE_NEEDS_SERVER":
+            continue
         if rel in self_touched:
             selected.add(c.path)
             continue
@@ -244,8 +254,8 @@ def select(
         if c.bucket == "CACHE_READ" and (c.datasets & changed_datasets):
             selected.add(c.path)
             continue
-        # LIVE_COMPUTE_NEEDS_SERVER and STATIC are never selected by this
-        # gate, on purpose -- reported, not silently rendered or dropped.
+        # STATIC is likewise never selected by this gate, on purpose --
+        # reported, not silently rendered or dropped.
     return classifications, selected
 
 
@@ -390,6 +400,21 @@ def _self_test() -> int:
         )
         sel_rel = {p.relative_to(root).as_posix() for p in sel}
         check("self-touched-chapter-always-selected", sel_rel == {"chapters/raw/raw.qmd"}, f"got {sel_rel}")
+
+        # 8. A self-touched LIVE_COMPUTE_NEEDS_SERVER chapter must NOT be
+        #    selected — this gate has no server harness, so selecting it
+        #    guarantees a structural red independent of the chapter's own
+        #    correctness (campaign #443: the diff-touched needs-server
+        #    chapter was auto-selected and died on the missing
+        #    `jammi-server` binary). The nightly full render owns it.
+        _, sel = select(
+            ["chapters/remote/remote.qmd"], chapters_dir=chapters, scripts_dir=scripts, repo_root=root
+        )
+        check(
+            "self-touched-needs-server-chapter-never-selected",
+            len(sel) == 0,
+            f"got {sel}",
+        )
 
     if failures:
         print(f"self-test: FAIL ({len(failures)}/{total} failing): {failures}", file=sys.stderr)

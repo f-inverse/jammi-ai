@@ -56,9 +56,26 @@ Two changes from the prior version:
    produced, f32 already exceeds bf16's own precision by 16 mantissa bits
    and halves storage again vs f64).
 
-Usage: /root/jammi-ai/.venv-torch-ref/bin/python generate_fixtures.py
+Usage: /root/jammi-ai/.venv-torch-ref/bin/python generate_fixtures.py [--dtype bfloat16|float16]
 Requires CUDA. Writes into this directory.
+
+# fp16 twin (campaign #443, D2/D3)
+
+`--dtype float16` generates the SAME `LEGS` sweep, at the SAME production
+amplitude/spread and the SAME from-scratch f64 TRUTH derivation, for the fp16
+twin of this op (`crate::flash::flash_varlen_{fwd,bwd}_f16`) — every file this
+produces is prefixed `f16_` (`f16_{name}_q.npy`, ..., sidecar written to
+`sidecar_f16.json`) so it NEVER collides with or overwrites the bf16 fixtures
+above; the bf16 invocation (no `--dtype`, or `--dtype bfloat16`) is
+byte-for-byte unchanged from before this parametrisation. Storage differs from
+the bf16 legs' own `int16`-bit-pattern workaround: numpy has a NATIVE
+`float16` dtype (`'<f2'`), and candle-core 0.11.0's `npy.rs` `Header::parse`
+DOES map `"f2"`/`"e"` to `DType::F16` (unlike bf16, which has no descr mapping
+at all — see this file's own "Storage" section above) — so fp16 inputs are
+saved as plain `.astype(np.float16)` arrays, no bit-reinterpretation needed,
+and `Tensor::read_npy` on the Rust side loads them directly as `DType::F16`.
 """
+import argparse
 import json
 import subprocess
 import sys
@@ -168,7 +185,13 @@ def truth_attention_bwd(q64, k64, v64, lse64, g64, lengths, window, scale):
     return dq, dk, dv
 
 
-def flash_attention_leg(name, lengths, window, dev, dtype):
+def flash_attention_leg(name, lengths, window, dev, dtype, file_prefix=""):
+    """`file_prefix` (empty for the bf16 legs, `"f16_"` for the fp16 twin —
+    see this file's module doc's "fp16 twin" section) is the ONLY thing that
+    differs about the on-disk layout between the two dtypes; every other
+    line of this function is dtype-PARAMETRIC already (`make_input`,
+    `torch.ops.aten._flash_attention_forward/_backward` are dtype-generic on
+    their `q`/`k`/`v` argument's own dtype)."""
     torch.manual_seed(SEED)
     total_q = sum(lengths)
     max_seqlen = max(lengths)
@@ -218,6 +241,22 @@ def flash_attention_leg(name, lengths, window, dev, dtype):
         assert t.dtype == torch.bfloat16
         return t.detach().contiguous().view(torch.int16).cpu().numpy()
 
+    def npf16_native(t):
+        # Native numpy float16 — see this file's module doc's "fp16 twin"
+        # section: unlike bf16, numpy DOES have a real float16 dtype and
+        # candle's npy reader DOES map it (`"f2"`/`"e"` -> `DType::F16`), so
+        # no bit-pattern workaround is needed here; this is a plain,
+        # lossless dtype-preserving cast (the values are already fp16-exact
+        # from `make_input`).
+        assert t.dtype == torch.float16
+        return t.detach().contiguous().to(torch.float16).cpu().numpy()
+
+    def npin(t):
+        # Dispatches to whichever of the two input-storage conventions
+        # matches `dtype` — the ONE place this function's own dtype
+        # parametrisation touches serialisation.
+        return npf16_native(t) if dtype == torch.float16 else npi16_bf16_bits(t)
+
     def maxabsdiff(a, b):
         return float((a.detach().to(torch.float32) - b.detach().to(torch.float32)).abs().max().item())
 
@@ -229,32 +268,35 @@ def flash_attention_leg(name, lengths, window, dev, dtype):
         "dv": maxabsdiff(dv1, dv2),
     }
 
-    # --- TRUTH: from-scratch f64 eager attention on the SAME bf16-exact
-    # inputs (upcast bf16 -> f64 is exact/lossless — the values were
-    # already rounded to bf16 by `make_input`).
+    # --- TRUTH: from-scratch f64 eager attention on the SAME dtype-exact
+    # inputs (upcast bf16/fp16 -> f64 is exact/lossless — the values were
+    # already rounded to `dtype` by `make_input`).
     q64, k64, v64, g64 = (t.detach().to(torch.float64) for t in (q, k, v, g1))
     truth_o, truth_lse = truth_attention_fwd(q64, k64, v64, lengths, window, scale)
     truth_dq, truth_dk, truth_dv = truth_attention_bwd(
         q64, k64, v64, truth_lse, g64, lengths, window, scale
     )
 
-    # --- Write: bf16-exact inputs as int16-bit-pattern npy (half the size
-    # of f32, zero precision loss); ref + truth outputs as f32 (never f64
-    # on disk — see module doc's "Storage").
-    np.save(HERE / f"{name}_q.npy", npi16_bf16_bits(q))
-    np.save(HERE / f"{name}_k.npy", npi16_bf16_bits(k))
-    np.save(HERE / f"{name}_v.npy", npi16_bf16_bits(v))
-    np.save(HERE / f"{name}_grad_out.npy", npi16_bf16_bits(g1))
-    np.save(HERE / f"{name}_o.npy", npf32(o1))
-    np.save(HERE / f"{name}_lse.npy", npf32(lse1))
-    np.save(HERE / f"{name}_dq.npy", npf32(dq1))
-    np.save(HERE / f"{name}_dk.npy", npf32(dk1))
-    np.save(HERE / f"{name}_dv.npy", npf32(dv1))
-    np.save(HERE / f"{name}_truth_o.npy", npf32(truth_o))
-    np.save(HERE / f"{name}_truth_lse.npy", npf32(truth_lse))
-    np.save(HERE / f"{name}_truth_dq.npy", npf32(truth_dq))
-    np.save(HERE / f"{name}_truth_dk.npy", npf32(truth_dk))
-    np.save(HERE / f"{name}_truth_dv.npy", npf32(truth_dv))
+    # --- Write: dtype-exact inputs (int16-bit-pattern for bf16, native
+    # float16 for fp16 — half the size of f32 either way, zero precision
+    # loss); ref + truth outputs as f32 (never f64 on disk — see module
+    # doc's "Storage"). `file_prefix` keeps the two dtypes' fixtures in
+    # disjoint namespaces within the SAME directory.
+    fp = file_prefix
+    np.save(HERE / f"{fp}{name}_q.npy", npin(q))
+    np.save(HERE / f"{fp}{name}_k.npy", npin(k))
+    np.save(HERE / f"{fp}{name}_v.npy", npin(v))
+    np.save(HERE / f"{fp}{name}_grad_out.npy", npin(g1))
+    np.save(HERE / f"{fp}{name}_o.npy", npf32(o1))
+    np.save(HERE / f"{fp}{name}_lse.npy", npf32(lse1))
+    np.save(HERE / f"{fp}{name}_dq.npy", npf32(dq1))
+    np.save(HERE / f"{fp}{name}_dk.npy", npf32(dk1))
+    np.save(HERE / f"{fp}{name}_dv.npy", npf32(dv1))
+    np.save(HERE / f"{fp}{name}_truth_o.npy", npf32(truth_o))
+    np.save(HERE / f"{fp}{name}_truth_lse.npy", npf32(truth_lse))
+    np.save(HERE / f"{fp}{name}_truth_dq.npy", npf32(truth_dq))
+    np.save(HERE / f"{fp}{name}_truth_dk.npy", npf32(truth_dk))
+    np.save(HERE / f"{fp}{name}_truth_dv.npy", npf32(truth_dv))
 
     truth_vs_ref = {
         "o": maxabsdiff(truth_o, o1),
@@ -284,8 +326,23 @@ def flash_attention_leg(name, lengths, window, dev, dtype):
 
 def main():
     assert torch.cuda.is_available(), "CUDA required to generate the reference fixtures"
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--dtype",
+        choices=["bfloat16", "float16"],
+        default="bfloat16",
+        help=(
+            "bf16 (default, unchanged historical behaviour, files unprefixed) or "
+            "float16 (campaign #443 D2/D3 fp16 twin, files prefixed f16_, sidecar "
+            "written to sidecar_f16.json)."
+        ),
+    )
+    args = parser.parse_args()
     dev = torch.device("cuda:0")
-    dtype = torch.bfloat16
+    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
+    is_f16 = dtype == torch.float16
+    file_prefix = "f16_" if is_f16 else ""
+    sidecar_name = "sidecar_f16.json" if is_f16 else "sidecar.json"
 
     sidecar = {
         "generator": "crates/jammi-kernels/tests/fixtures/flash_reference/generate_fixtures.py",
@@ -356,17 +413,32 @@ def main():
         "seed": SEED,
         "num_heads": H,
         "head_dim": D,
-        "dtype": "bfloat16",
+        "dtype": args.dtype,
         "legs": {},
     }
+    if is_f16:
+        # The fp16 twin's own storage convention differs from the bf16
+        # note above (native float16, not an int16 bit-pattern) — see this
+        # file's module doc's "fp16 twin" section.
+        sidecar["storage_note"] = (
+            "q/k/v/grad_out are saved as NATIVE float16 .npy ('<f2' descr) — "
+            "unlike bf16, numpy has a real float16 dtype and candle-core "
+            "0.11.0's npy.rs Header::parse DOES map 'f2'/'e' to DType::F16, "
+            "so no bit-pattern workaround is needed (plain, lossless "
+            "tensor.to(torch.float16).numpy()). o/lse/dq/dk/dv (both ref and "
+            "truth) remain float32 on disk, never float64, exactly as the "
+            "bf16 legs."
+        )
 
     for name, lengths, window in LEGS:
-        print(f"leg {name}: lengths={lengths} window={window}", file=sys.stderr)
-        sidecar["legs"][name] = flash_attention_leg(name, lengths, window, dev, dtype)
+        print(f"leg {name}: lengths={lengths} window={window} dtype={args.dtype}", file=sys.stderr)
+        sidecar["legs"][name] = flash_attention_leg(
+            name, lengths, window, dev, dtype, file_prefix=file_prefix
+        )
 
-    with open(HERE / "sidecar.json", "w") as f:
+    with open(HERE / sidecar_name, "w") as f:
         json.dump(sidecar, f, indent=2, sort_keys=True)
-    print("wrote", HERE / "sidecar.json", file=sys.stderr)
+    print("wrote", HERE / sidecar_name, file=sys.stderr)
 
 
 if __name__ == "__main__":

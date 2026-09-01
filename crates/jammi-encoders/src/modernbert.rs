@@ -206,7 +206,9 @@ pub(crate) static SOFTMAX_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters>
 /// The fused masked-softmax kernel's domain, checked at the call site
 /// (family D / K2): `scores`'s device is one
 /// [`jammi_kernels::admission::device_is_supported`] accepts, `scores`/`mask`
-/// share a dtype the kernel implements (F32 or BF16), BOTH `scores` and
+/// share a dtype the kernel implements (F32, BF16, or F16 — F16 widened in
+/// campaign #443 W2b, see [`softmax_admission_predicate`]'s own dtype
+/// check below for the compiled-arm citation), BOTH `scores` and
 /// `mask` are contiguous (`SoftmaxLastDimFused` refuses a strided view for
 /// EITHER argument — see its module doc; an earlier version of this
 /// predicate checked only `mask`, asymmetrically, an audit finding
@@ -802,7 +804,9 @@ fn mem_efficient_attention_predicate(
 /// The fused whole-attention-block kernel's domain, checked at the call
 /// site (family D / K2): `qkv`'s device is one
 /// [`jammi_kernels::admission::device_is_supported`] accepts, `qkv`/`extended_mask`
-/// share a dtype the kernel implements (F32 or BF16), `qkv` is contiguous
+/// share a dtype the kernel implements (F32, BF16, or F16 — F16 widened in
+/// campaign #443 D1, see the dtype check below for the composed-sub-kernel
+/// citation), `qkv` is contiguous
 /// (the free reshape from `Wqkv`'s own output — `AttentionBlockFused`
 /// refuses a strided `qkv`, same idiom as every other op in this crate),
 /// `head_dim` is exactly [`ATTENTION_BLOCK_HEAD_DIM`] (`AttentionBlockFused`'s
@@ -1858,7 +1862,8 @@ pub(crate) static GEGLU_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
 
 /// The fused GeGLU kernel's domain, checked at the call site (family D /
 /// K2): `wi_out`'s device is one [`jammi_kernels::admission::device_is_supported`]
-/// accepts, its dtype is one the kernel implements (F32 or BF16),
+/// accepts, its dtype is one the kernel implements (F32, BF16, or F16 — F16
+/// widened in campaign #443 W2b, see the dtype check below),
 /// `wi_out` is contiguous ([`jammi_kernels::ops::GegluFused`] refuses a
 /// strided view — see its module doc), and its last dimension is nonzero
 /// and even (the op splits it into two equal `gate`/`up` halves; an odd
@@ -2301,7 +2306,13 @@ fn compute_lengths_and_prefix(mask: &Tensor) -> Result<(Vec<usize>, bool), Encod
 /// The flash cascade's own admission predicate (contract v4 §3.2's
 /// consulted terms): device is CUDA and arch is a MEMBER of
 /// `jammi_kernels::admission::flash_validated_arches()` ([`flash_arch_ok`]),
-/// backbone dtype `BF16`, `head_dim ==
+/// backbone dtype `BF16` or `F16` (campaign #443 D2 — `jammi-kernels`'
+/// `build.rs` compiles BOTH dtype pairs of the vendored flash kernel
+/// unconditionally whenever `flash-attn` is on, so there is no
+/// third, narrower "F16 specifically compiled" flag to gate on separately
+/// from [`jammi_kernels::admission::FLASH_COMPILED`] — see
+/// [`flash_capability_gates`]'s own dtype check for the compiled-TU
+/// citation), `head_dim ==
 /// `[`FLASH_HEAD_DIM`]``, `flash-attn` compiled (`cfg!` TERM — L10, a
 /// [`PredicateOutcome::CapabilityMiss`], never `#[cfg]` on the call site),
 /// and the batch's mask is a prefix mask with every row length `>= 1`
@@ -2399,8 +2410,18 @@ fn flash_capability_gates(
             None,
         ));
     }
-    if dtype != DType::BF16 {
-        return Some((PredicateOutcome::DomainMiss, "dtype_is_bf16", None));
+    // Campaign #443 D2: `F16` joins `BF16`. `jammi-kernels`' `build.rs`
+    // compiles BOTH dtype pairs of the vendored flash kernel
+    // (`flash_{fwd,bwd}_hdim64_{bf16,fp16}_sm80.cu`) unconditionally
+    // whenever `flash-attn` is on — there is no scenario where
+    // `FLASH_COMPILED` is `true` but only one of the two dtypes' TUs
+    // exist, so `feature_compiled` (already gated above) is the ONLY
+    // compiled-ness question this predicate needs to ask; the reason key
+    // is renamed from the old `dtype_is_bf16` to name the real (now
+    // two-member) domain honestly rather than leaving a stale singular
+    // name on a widened check.
+    if !matches!(dtype, DType::BF16 | DType::F16) {
+        return Some((PredicateOutcome::DomainMiss, "dtype_is_bf16_or_f16", None));
     }
     if head_dim != FLASH_HEAD_DIM {
         return Some((
@@ -3622,7 +3643,8 @@ mod tests {
     /// UNREACHABLE on `Device::Cpu` (this crate's test suite has no CUDA
     /// device) — this test is a hermetic placeholder honestly documenting
     /// that gap, not a real coverage claim: the arch/dtype/head_dim gates
-    /// (`flash_arch_ok`'s call site, `dtype != DType::BF16`, `head_dim !=
+    /// (`flash_arch_ok`'s call site, `!matches!(dtype, DType::BF16 |
+    /// DType::F16)`, `head_dim !=
     /// FLASH_HEAD_DIM`) can only be exercised with `device.is_cuda() ==
     /// true`, which requires an actual CUDA device this environment does
     /// not have. `flash_arch_ok`'s OWN internal set-membership check IS
@@ -3635,6 +3657,47 @@ mod tests {
     fn flash_capability_gates_arch_dtype_head_dim_gates_are_untestable_without_cuda() {
         // Documents the gap; asserts nothing about the untestable branches.
         assert!(!Device::Cpu.is_cuda());
+    }
+
+    /// Campaign #443 D2's own real-CUDA closure of the gap the previous
+    /// test names: on an actual, arch-validated CUDA device, `F16` must
+    /// clear the dtype gate exactly like `BF16` does (the widening this
+    /// round made), and a dtype genuinely outside the compiled set (`F32`)
+    /// must still miss it, under the RENAMED reason key
+    /// (`dtype_is_bf16_or_f16`, not the stale singular `dtype_is_bf16`).
+    /// Requires `--features cuda` (and, to reach a real `Holds`/pass-through
+    /// rather than an early `arch_in_flash_validated_set` skip, an actual
+    /// Ampere-or-newer device) — `JAMMI_REQUIRE_CUDA=1` turns a missing
+    /// device into a hard failure rather than a silent skip, matching every
+    /// other CUDA-gated test in this module.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn flash_capability_gates_admits_f16_alongside_bf16_on_real_cuda_arch_and_head_dim() {
+        let Some(device) = growth_oracle_cuda_device() else {
+            return;
+        };
+        if !flash_arch_ok(&device) {
+            eprintln!(
+                "flash_capability_gates_admits_f16_alongside_bf16_on_real_cuda_arch_and_head_dim: \
+                 skipping -- this device's arch is not in flash_validated_arches()"
+            );
+            return;
+        }
+        for dtype in [DType::BF16, DType::F16] {
+            let miss = flash_capability_gates(true, &device, dtype, FLASH_HEAD_DIM);
+            assert_eq!(
+                miss, None,
+                "{dtype:?} must clear every capability/domain gate on a real, arch-validated \
+                 CUDA device -- got a miss: {miss:?}"
+            );
+        }
+        let miss = flash_capability_gates(true, &device, DType::F32, FLASH_HEAD_DIM);
+        assert_eq!(
+            miss,
+            Some((PredicateOutcome::DomainMiss, "dtype_is_bf16_or_f16", None)),
+            "a dtype outside the compiled {{BF16, F16}} set must still miss, under the renamed \
+             reason key"
+        );
     }
 
     /// Path P (contract v4 §3.7, v5 item 3, UPGRADED by M1b audit finding

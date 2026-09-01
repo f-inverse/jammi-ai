@@ -384,7 +384,7 @@ pub enum FlashError {
     /// `built_for`/`built_for_sms` are a DELIBERATE dual representation of
     /// the SAME set (round-2 audit advisory), not independent sources:
     /// `built_for` (`Vec<(u32, u32)>`, one tuple per validated arch) is
-    /// what [`arch_mismatch`] already has on hand — the SAME
+    /// what `arch_mismatch` already has on hand — the SAME
     /// `&[ComputeCapability]` `flash_validated_arches()` returned,
     /// re-mapped to plain tuples for a `{:?}` that prints `(8, 0)` rather
     /// than `ComputeCapability { major: 8, minor: 0 }`; `built_for_sms`

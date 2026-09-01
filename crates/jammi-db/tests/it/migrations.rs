@@ -1082,11 +1082,14 @@ async fn migration_024_adds_claim_policy_columns_and_index() {
 
 /// Migration 026 adds the `acceleration_report` column to `training_jobs`
 /// (esc-075). Asserted append-only-append (the column exists on a fresh open,
-/// migrations remain idempotent across a reopen) and the tri-state backfill: a
-/// row that predates the migration reads back `NULL` — "unknown" — never a
-/// fabricated `pending`, while a row created after the migration through
+/// migrations remain idempotent across a reopen) and the two catalog-owned
+/// states of its producer-owned-payload contract: a row that predates the
+/// migration reads back `NULL` — "unknown" — never a fabricated `pending`,
+/// while a row created after the migration through
 /// [`Catalog::create_training_job`] carries the explicit
-/// `{"state":"pending"}` marker from `INSERT` onward.
+/// `{"state":"pending"}` marker from `INSERT` onward. Every other payload
+/// shape (e.g. `{"state":"determined", ...}`) is the producer's to define and
+/// is exercised in `fine_tune_queue.rs`, not here.
 #[tokio::test]
 async fn migration_026_adds_acceleration_report_column_with_tristate_backfill() {
     use jammi_db::catalog::model_repo::RegisterModelParams;

@@ -40,21 +40,26 @@ pub struct TrainingJobRecord {
     /// a fresh process — the catalog stores it opaquely (the typed shape lives in
     /// the engine crate that produces and consumes it).
     pub training_spec: Option<String>,
-    /// The job's per-attempt acceleration determination (esc-075), as opaque
-    /// JSON — **tri-state**, and all three states ride in the payload rather
-    /// than in `Option`'s presence/absence alone (migration 026):
+    /// The job's per-attempt acceleration determination (esc-075), as an
+    /// opaque, self-describing JSON payload whose vocabulary the payload's
+    /// *producer* owns — matching `training_spec`'s and `metrics`'
+    /// schema-at-the-producer deferral, not a closed enum pinned here
+    /// (migration 026). `Option`'s two Rust-level states map to only the
+    /// mechanical part of the contract:
     ///
     ///   - `None` (SQL `NULL`) — unknown: a row written before migration 026,
     ///     or one this code never touched. Never read as "accelerated" or
     ///     "eager" — it is an honest absence of information, not a claim.
-    ///   - `Some({"state":"pending"})` — submitted, no claimant has computed a
-    ///     determination for this attempt yet. Written by
-    ///     [`Catalog::create_training_job`] at `INSERT` time.
-    ///   - `Some({"state":"determined", ...})` — the claiming worker's report.
-    ///     Written by [`Catalog::record_acceleration_report`]. The catalog
-    ///     stores the payload opaquely; the typed shape lives in the engine
-    ///     crate that produces and consumes it, matching `training_spec`'s
-    ///     existing opacity convention.
+    ///   - `Some(json)` — a payload landed. The ONE shape the catalog itself
+    ///     writes is `{"state":"pending"}`, stamped by
+    ///     [`Catalog::create_training_job`] at `INSERT` time before any
+    ///     claimant has recorded a determination. Every other payload —
+    ///     commonly `{"state":"determined", ...}` from the claiming worker via
+    ///     [`Catalog::record_acceleration_report`], but not limited to that
+    ///     one shape (a non-fine-tune job kind or a pre-device-resolution
+    ///     failure path may record a different `"state"`) — is the
+    ///     producer's to define; the catalog stores it byte-for-byte and never
+    ///     inspects, validates, or enumerates it.
     pub acceleration_report: Option<String>,
 }
 
@@ -66,7 +71,8 @@ const SELECT_COLS: &str = "job_id, base_model_id, output_model_id, training_sour
 /// into `acceleration_report`: the job exists but no claimant has yet computed
 /// an acceleration determination for it. Distinct from SQL `NULL` (a
 /// pre-migration-026 row this code never touched) — see
-/// [`TrainingJobRecord::acceleration_report`]'s tri-state contract.
+/// [`TrainingJobRecord::acceleration_report`]'s producer-owned-payload
+/// contract; this is the one payload shape the catalog itself writes.
 const ACCELERATION_REPORT_PENDING: &str = r#"{"state":"pending"}"#;
 
 /// Format leases write into `lease_expires_at`. Lexicographic ordering of two

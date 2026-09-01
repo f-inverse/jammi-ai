@@ -16,11 +16,14 @@
 //!    mirroring `jammi_encoders::layer_norm`'s own eval-mode bit-identity
 //!    test.
 //! 3. `training_mode_on_a_supported_dtype_dispatches_fused_and_is_counted`
-//!    / `training_mode_on_an_unsupported_dtype_falls_back_and_is_counted`
-//!    — the positive/negative dispatch-counter proof for the esc-031
-//!    golden's two branches (F32 base -> fused; F16 base -> eager
-//!    fallback, matching `backbone_precision_parity`'s existing dtype
-//!    split).
+//!    / `training_mode_on_an_f16_backbone_dispatches_fused_and_is_counted`
+//!    / `training_mode_on_a_mismatched_dtype_pair_falls_back_and_is_counted`
+//!    — the positive/negative dispatch-counter proof across the admission
+//!    predicate's real dtype domain (`F32`/`BF16`/`F16` all fuse when `x`
+//!    and the base weight MATCH; a mismatched pair falls back regardless
+//!    of either individual dtype's own support — campaign #443 D1 widened
+//!    both the fused kernel's own domain and this call-site predicate to
+//!    admit `F16`; esc-076 found the predicate widening had been missed).
 //! 4. `esc_031_golden_holds_through_the_fused_path_with_dispatch_proof` —
 //!    the esc-031 golden (`Lora(W) == Frozen(W)` at `lora_b == 0`),
 //!    re-run here with an explicit assertion that the FUSED kernel (not a
@@ -292,13 +295,20 @@ fn training_mode_on_a_supported_dtype_dispatches_fused_and_is_counted() {
 }
 
 #[test]
-fn training_mode_on_an_unsupported_dtype_falls_back_and_is_counted() {
+fn training_mode_on_a_mismatched_dtype_pair_falls_back_and_is_counted() {
     let device = cpu();
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-    // F16 backbone: candle's CPU matmul accepts F16 (unlike BF16), but
-    // `ScaledCastAdd`'s CPU forward implements F32/BF16 only — the
-    // admission predicate must refuse this and fall back.
+    // `x` (`rand_input`) is always `F32`; the base weight here is `F16` —
+    // a MISMATCHED `(x, w)` pair, which `lora_linear_admission_predicate`
+    // must refuse regardless of whether either individual dtype is, on
+    // its own, in the op's supported set (campaign #443 D1 widened that
+    // set — and this predicate — to admit `F16` too, but only a genuine
+    // `(F16, F16)` pair; see
+    // `training_mode_on_an_f16_backbone_dispatches_fused_and_is_counted`
+    // for that positive case). Named for what this fixture actually is
+    // (a mismatch), not "F16 is categorically unsupported" — the doc this
+    // replaced was stale the moment `F16` support landed.
     let base = build_base(8, 16, &device, DType::F16);
     let x = rand_input(&device);
 
@@ -320,8 +330,58 @@ fn training_mode_on_an_unsupported_dtype_falls_back_and_is_counted() {
     let after = lora_linear_fused_dispatch_snapshot();
     assert!(
         after.eager > before.eager,
-        "an F16-backbone training forward must fall back to eager \
+        "a mismatched (x=F32, w=F16) training forward must fall back to eager \
          (before={before:?}, after={after:?})"
+    );
+}
+
+/// The positive counterpart to
+/// `training_mode_on_a_mismatched_dtype_pair_falls_back_and_is_counted`:
+/// a GENUINE `(F16, F16)` pair (both `x` and the base weight) must
+/// dispatch the fused kernel, exactly like the existing `F32`/`BF16` cells
+/// — campaign #443 D1 widened `LowRankResidualLinear`'s (and
+/// `ScaledCastAdd`'s CPU epilogue's) own domain to `F16` end to end, and
+/// this predicate must actually admit it rather than leaving an `F16`
+/// backbone permanently eager-only (esc-076's residual finding: the
+/// eager fallback's extra `to_dtype`-materialized intermediates, taken on
+/// EVERY training step for an unadmitted `F16` backbone, are what
+/// fragmented the allocator enough to OOM the held-out eval pass later at
+/// an identically-shaped allocation).
+#[test]
+fn training_mode_on_an_f16_backbone_dispatches_fused_and_is_counted() {
+    let device = cpu();
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    let base = build_base(8, 16, &device, DType::F16);
+    let x = rand_input(&device).to_dtype(DType::F16).unwrap();
+
+    let lora = LoraLinear::new(
+        base,
+        4,
+        8.0,
+        false,
+        LoraInitMode::Gaussian,
+        None,
+        23,
+        &varmap,
+        &vb,
+    )
+    .unwrap();
+
+    let before = lora_linear_fused_dispatch_snapshot();
+    let epilogue_before = lora_epilogue_dispatch_snapshot();
+    let _ = lora.forward(&x).unwrap();
+    let after = lora_linear_fused_dispatch_snapshot();
+    let epilogue_after = lora_epilogue_dispatch_snapshot();
+    assert!(
+        after.fused > before.fused,
+        "a genuine (F16, F16) training forward must dispatch the fused kernel \
+         (before={before:?}, after={after:?})"
+    );
+    assert_eq!(
+        epilogue_after, epilogue_before,
+        "lora_epilogue's own counter must be untouched by a fused LoRA-site \
+         dispatch (before={epilogue_before:?}, after={epilogue_after:?})"
     );
 }
 

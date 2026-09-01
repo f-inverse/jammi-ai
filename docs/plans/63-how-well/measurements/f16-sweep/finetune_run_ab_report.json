@@ -1,0 +1,310 @@
+{
+  "seeds": [
+    "1",
+    "2",
+    "3"
+  ],
+  "arms": [
+    "fused",
+    "alloff"
+  ],
+  "per_seed": {
+    "1": {
+      "legs": {
+        "fused_r1": "OK",
+        "fused_r2": "OK",
+        "alloff_r1": "OK",
+        "alloff_r2": "OK"
+      },
+      "r1_r2_delta": {
+        "fused": 0.0,
+        "alloff": 0.0
+      },
+      "leg_premise_violations": [
+        "seed 1 fused r1: fused: attention_block_flash_fused_dispatches=3276 but backbone_dtype='f16' -- counters claim a dispatch the declared dtype forbids (flash_capability_gates admits only BF16, modernbert.rs's own dtype_is_bf16 gate); this leg's own report is internally contradictory, not merely unclassifiable",
+        "seed 1 fused r2: fused: attention_block_flash_fused_dispatches=3276 but backbone_dtype='f16' -- counters claim a dispatch the declared dtype forbids (flash_capability_gates admits only BF16, modernbert.rs's own dtype_is_bf16 gate); this leg's own report is internally contradictory, not merely unclassifiable"
+      ],
+      "d_i": -0.03286103159189224,
+      "trajectory": {
+        "fused": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.160720095038414,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.2074834406375885,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.335803858935833,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ],
+        "alloff": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.163632996380329,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.2139955684542656,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.368664890527725,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ]
+      }
+    },
+    "2": {
+      "legs": {
+        "fused_r1": "OK",
+        "fused_r2": "OK",
+        "alloff_r1": "OK",
+        "alloff_r2": "OK"
+      },
+      "r1_r2_delta": {
+        "fused": 0.0,
+        "alloff": 0.0
+      },
+      "leg_premise_violations": [
+        "seed 2 fused r1: fused: attention_block_flash_fused_dispatches=3276 but backbone_dtype='f16' -- counters claim a dispatch the declared dtype forbids (flash_capability_gates admits only BF16, modernbert.rs's own dtype_is_bf16 gate); this leg's own report is internally contradictory, not merely unclassifiable",
+        "seed 2 fused r2: fused: attention_block_flash_fused_dispatches=3276 but backbone_dtype='f16' -- counters claim a dispatch the declared dtype forbids (flash_capability_gates admits only BF16, modernbert.rs's own dtype_is_bf16 gate); this leg's own report is internally contradictory, not merely unclassifiable"
+      ],
+      "d_i": -0.060050420463085175,
+      "trajectory": {
+        "fused": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.1724365204572678,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.186988078057766,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.2585181072354317,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ],
+        "alloff": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.1778327599167824,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.1965616643428802,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.318568527698517,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ]
+      }
+    },
+    "3": {
+      "legs": {
+        "fused_r1": "OK",
+        "fused_r2": "OK",
+        "alloff_r1": "OK",
+        "alloff_r2": "OK"
+      },
+      "r1_r2_delta": {
+        "fused": 0.0,
+        "alloff": 0.0
+      },
+      "leg_premise_violations": [
+        "seed 3 fused r1: fused: attention_block_flash_fused_dispatches=3276 but backbone_dtype='f16' -- counters claim a dispatch the declared dtype forbids (flash_capability_gates admits only BF16, modernbert.rs's own dtype_is_bf16 gate); this leg's own report is internally contradictory, not merely unclassifiable",
+        "seed 3 fused r2: fused: attention_block_flash_fused_dispatches=3276 but backbone_dtype='f16' -- counters claim a dispatch the declared dtype forbids (flash_capability_gates admits only BF16, modernbert.rs's own dtype_is_bf16 gate); this leg's own report is internally contradictory, not merely unclassifiable"
+      ],
+      "d_i": 0.062198854982852936,
+      "trajectory": {
+        "fused": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.1799192056059837,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.266490302979946,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.3537766486406326,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ],
+        "alloff": [
+          {
+            "epoch": 0,
+            "held_out_mean": 3.1842562705278397,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 1,
+            "held_out_mean": 3.1887672767043114,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          },
+          {
+            "epoch": 2,
+            "held_out_mean": 3.2915777936577797,
+            "held_out_tie_fraction": 0.0,
+            "held_out_batch_partition_sha256": "5c0a624de6ba3c1baa64d1f3b9cc9d3b5117b320eb847c991d3465eb9e9f9061"
+          }
+        ]
+      }
+    }
+  },
+  "d_values": {},
+  "premise_failure_diagnostic": {
+    "failed_seeds": [],
+    "failing_legs": [],
+    "note": "Non-parameterised, explicitly non-decisional (CONTRACT amendment 2026-08-29b item 1(c)): names which CONTRACT Frame premise leg(s) failed on which leg, with that leg's raw train_probe_series, for investigation only. This block can NEVER promote an INVALID verdict to GREEN -- the 'status' field above is computed independently of it -- and the merger accepts NO operator override for a premise failure anywhere (no --allow-premise-failure, no waived-seed list, no rescale switch)."
+  },
+  "cross_seed_spread": 0.052409212771387624,
+  "determinism_floor": {
+    "deltas": [
+      {
+        "seed": "1",
+        "arm": "fused",
+        "delta": 0.0
+      },
+      {
+        "seed": "1",
+        "arm": "alloff",
+        "delta": 0.0
+      },
+      {
+        "seed": "2",
+        "arm": "fused",
+        "delta": 0.0
+      },
+      {
+        "seed": "2",
+        "arm": "alloff",
+        "delta": 0.0
+      },
+      {
+        "seed": "3",
+        "arm": "fused",
+        "delta": 0.0
+      },
+      {
+        "seed": "3",
+        "arm": "alloff",
+        "delta": 0.0
+      }
+    ],
+    "max_delta": 0.0,
+    "cross_seed_spread": 0.052409212771387624,
+    "findings": [],
+    "note": "r1/r2 same-seed repeat delta MEASURED AND REPORTED as the determinism floor -- RED only if it exceeds the cross-seed spread of d_i (CONTRACT H4/PLAN.md v2 delta 6: 'no CUDA bitwise contract exists -- the measurement must be able to report what it measures')."
+  },
+  "sign_test": null,
+  "sign_test_error": null,
+  "decision": null,
+  "wrong_seed_count": false,
+  "cross_seed_identity_violations": [],
+  "lr0_control": {
+    "seeds": [
+      "1",
+      "2"
+    ],
+    "per_seed": {
+      "1": {
+        "per_arm": {
+          "fused": {
+            "outcome": "OK",
+            "learning_happened_delta": 0.0,
+            "lr": 0.0,
+            "train_probe_series": [
+              3.325727254152298,
+              3.325727254152298,
+              3.325727254152298,
+              3.325727254152298
+            ],
+            "failing_premises": []
+          },
+          "alloff": {
+            "outcome": "OK",
+            "learning_happened_delta": 0.0,
+            "lr": 0.0,
+            "train_probe_series": [
+              3.325727254152298,
+              3.325727254152298,
+              3.325727254152298,
+              3.325727254152298
+            ],
+            "failing_premises": []
+          }
+        },
+        "violations": []
+      },
+      "2": {
+        "per_arm": {
+          "fused": {
+            "outcome": "OK",
+            "learning_happened_delta": 0.0,
+            "lr": 0.0,
+            "train_probe_series": [
+              3.325727254152298,
+              3.325727254152298,
+              3.325727254152298,
+              3.325727254152298
+            ],
+            "failing_premises": []
+          },
+          "alloff": {
+            "outcome": "OK",
+            "learning_happened_delta": 0.0,
+            "lr": 0.0,
+            "train_probe_series": [
+              3.325727254152298,
+              3.325727254152298,
+              3.325727254152298,
+              3.325727254152298
+            ],
+            "failing_premises": []
+          }
+        },
+        "violations": []
+      }
+    },
+    "violations": [],
+    "allow_missing_lr0_control": false,
+    "note": "lr=0 RED control (CONTRACT Frame / audit advisory (b)): separate seeds, never counted into the A/B set's own d_values/sign test above. A clean control leg FAILS learning-happened (its own learning_happened_delta does not clear FINETUNE_RUN_LEARNING_HAPPENED_FLOOR); a passing leg is recorded as a violation against the FLOOR=0.0 premise-leg ruling itself. An empty 'seeds' list is itself a refusal (INVALID) unless 'allow_missing_lr0_control' is true (block 5) -- the pre-registered control is not silently optional."
+  },
+  "status": "INVALID"
+}

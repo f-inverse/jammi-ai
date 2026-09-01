@@ -120,6 +120,26 @@
 #                              already-produced 'mutant-<dose_label>'-tagged
 #                              legs under THIS run's own $RAW_DIR. Default
 #                              empty = no dose ladder in this merge.
+#   FINETUNE_RUN_AB_BACKBONE_DTYPE
+#                              --backbone-dtype passthrough for EVERY leg
+#                              `run_leg` runs -- both A/B arms, every seed,
+#                              AND the lr=0 RED control below (default
+#                              "bf16", byte-identical to this script's
+#                              previous hardcoded `--backbone-dtype bf16`
+#                              when unset). `backbone_dtype` is IDENTITY
+#                              FIELD #10 on `FINETUNE_RUN_IDENTITY_FIELDS`
+#                              (identity_fields.py) -- cross-arm AND
+#                              cross-seed homogeneity requires every leg to
+#                              report the SAME value, so this is read ONCE
+#                              here and forwarded unconditionally from the
+#                              one `run_leg` both loops (main sweep, lr=0
+#                              control) share, never overridden per-arm/
+#                              per-loop. `main.rs`'s own CLI accepts "f32",
+#                              "f16", or "bf16" (`FinetuneRunArgs::
+#                              backbone_dtype`'s match arms) -- this script
+#                              does not itself re-validate the value, it
+#                              relies on the binary's own refusal of an
+#                              unrecognized spelling.
 #   FINETUNE_RUN_AB_CUDA       CUDA ordinal (default: 0). Unset
 #                              FINETUNE_RUN_AB_CPU=1 to omit --cuda entirely
 #                              (the CPU-hermetic smoke path finetune-run's
@@ -204,6 +224,10 @@ FINETUNE_RUN_AB_LR="${FINETUNE_RUN_AB_LR:-}"
 # sweep loop below; run through their own dedicated loop, tagged with
 # ab_merge.py's own FINETUNE_RUN_LR0_REPEAT label.
 FINETUNE_RUN_AB_LR0_SEEDS="${FINETUNE_RUN_AB_LR0_SEEDS:-}"
+# --backbone-dtype passthrough for EVERY leg (see env-var doc above) --
+# default "bf16" is byte-identical to this script's previous hardcoded
+# `--backbone-dtype bf16` when this var is unset.
+FINETUNE_RUN_AB_BACKBONE_DTYPE="${FINETUNE_RUN_AB_BACKBONE_DTYPE:-bf16}"
 FINETUNE_RUN_AB_CUDA="${FINETUNE_RUN_AB_CUDA:-0}"
 FINETUNE_RUN_AB_CPU="${FINETUNE_RUN_AB_CPU:-0}"
 # unit-63 audit finding 4 -- see this script's own env-var doc above.
@@ -382,8 +406,11 @@ run_leg() {
     # requires every leg (both arms, every seed, INCLUDING the lr=0
     # control below) to report the SAME value, so this is passed
     # unconditionally here in the one `run_leg` both loops share, never
-    # only on the `fused` arm.
-    --backbone-dtype bf16
+    # only on the `fused` arm. Value comes from
+    # `$FINETUNE_RUN_AB_BACKBONE_DTYPE` (default "bf16", byte-identical to
+    # this line's previous hardcoded literal when unset -- see that
+    # env-var's own doc above).
+    --backbone-dtype "$FINETUNE_RUN_AB_BACKBONE_DTYPE"
     --work-dir "$work_dir"
   )
   if [ -n "$lr_override" ]; then

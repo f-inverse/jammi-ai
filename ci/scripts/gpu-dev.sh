@@ -43,7 +43,10 @@
 #                                                      (esc-077) unless <tree>'s CARGO_TARGET_DIR
 #                                                      carries a `target`-stamped clone marker
 #                                                      (`.jammi-clone-of-seed`); remedy in the
-#                                                      error, or RP_ALLOW_COLD_TARGET=1 to force
+#                                                      error, or RP_ALLOW_COLD_TARGET=1 to force —
+#                                                      ALSO refuses (one-pod-per-wave) a job while
+#                                                      another tree's job is live on this pod;
+#                                                      rent another pod or RP_ALLOW_CONCURRENT=1
 #   gpu-dev.sh logs    [session] [--tree T]           tail the detached job's output
 #   gpu-dev.sh push    [session] [--tree T]           rsync YOUR OWN checkout (this script's
 #                                                      own on-disk location, never $PWD) TO the pod
@@ -126,7 +129,9 @@ gpu-dev.sh — GPU development on RunPod
   run     [session] [--tree T] <cmd...>   run <cmd> detached under tmux, in <tree> — REFUSES
                                           (esc-077) unless <tree>'s CARGO_TARGET_DIR carries a
                                           `target`-stamped clone marker (else a silent cold
-                                          full-workspace build); RP_ALLOW_COLD_TARGET=1 bypasses
+                                          full-workspace build); RP_ALLOW_COLD_TARGET=1 bypasses.
+                                          ALSO refuses (one-pod-per-wave) while another tree's
+                                          job is live on this pod; RP_ALLOW_CONCURRENT=1 bypasses
   logs    [session] [--tree T]            tail the detached job's output
   push    [session] [--tree T]            rsync YOUR OWN checkout (this script's own on-disk
                                           location, never $PWD) TO the pod's <tree>
@@ -841,6 +846,39 @@ EOF
           ;;
         *)
           echo "::error::run preflight could not determine ${TARGET_DIR}'s provisioning state (got: '${TARGET_PREFLIGHT_STATE}') — refusing to guess; set RP_ALLOW_COLD_TARGET=1 to bypass" >&2
+          exit 1
+          ;;
+      esac
+    fi
+
+    # esc-077-class (one-pod-per-wave): refuse a job when this pod already
+    # has a LIVE job for a DIFFERENT tree — an operator kept re-learning
+    # this norm from prose alone (the same class esc-077 fixed for cold
+    # builds). Two waves' builds/tests competing for the same pod's CPU/
+    # disk/nvcc produce meaningless timings at best and can corrupt a
+    # shared CARGO_TARGET_DIR at worst. `jammi-seed` (the boot-time seed
+    # build) and this tree's OWN prior session are excluded — see
+    # rp_concurrency_preflight_lines's own doc. RP_ALLOW_CONCURRENT=1 is
+    # the SOLE, explicit bypass, for deliberate co-tenancy (e.g. a
+    # build-only job that genuinely doesn't compete for the GPU).
+    if [ "${RP_ALLOW_CONCURRENT:-0}" != "1" ]; then
+      CONCURRENCY_PREFLIGHT_STATE="$(rp_run_remote <<EOF
+set -uo pipefail
+$(rp_concurrency_preflight_lines "$TMUX_SESSION")
+EOF
+)"
+      case "$CONCURRENCY_PREFLIGHT_STATE" in
+        *GPU_DEV_CONCURRENCY_STATE=CLEAR*) : ;;
+        *GPU_DEV_CONCURRENCY_STATE=BUSY:*)
+          BUSY_LINE="$(printf '%s\n' "$CONCURRENCY_PREFLIGHT_STATE" | grep -o 'GPU_DEV_CONCURRENCY_STATE=BUSY:[^[:space:]]*' | head -1)"
+          BUSY_SESSION="${BUSY_LINE#GPU_DEV_CONCURRENCY_STATE=BUSY:}"
+          BUSY_TREE="${BUSY_SESSION#jammi-}"
+          echo "::error::run refused: this pod already has a live job for tree '${BUSY_TREE}' (tmux session ${BUSY_SESSION}) — one-pod-per-wave." >&2
+          echo "remedy: rent another pod: RP_SESSION=<alias> $(basename "$0") up <arch>   (or set RP_ALLOW_CONCURRENT=1 to co-tenant deliberately, e.g. a build-only job)" >&2
+          exit 1
+          ;;
+        *)
+          echo "::error::run preflight could not determine the pod's job-concurrency state (got: '${CONCURRENCY_PREFLIGHT_STATE}') — refusing to guess; set RP_ALLOW_CONCURRENT=1 to bypass" >&2
           exit 1
           ;;
       esac

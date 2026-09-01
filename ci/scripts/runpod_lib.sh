@@ -688,6 +688,45 @@ fi
 EOF
 }
 
+# esc-077-class (one-pod-per-wave): the shell TEXT that checks whether any
+# OTHER jammi-* tmux JOB session (a different tree's `run`) is alive on this
+# pod — mechanizes the one-pod-per-wave norm (an operator kept re-learning it
+# from prose alone, the same class esc-077 fixed for cold builds). `jammi-
+# seed` (the boot-time build-substrate seed, gpu-dev.sh's own bootstrap) is
+# deliberately EXCLUDED: it is not a competing wave's job, and a `run` job
+# cannot honestly have a real seed-clone target dir yet while the very first
+# seed build is still in flight anyway (esc-077's own preflight already
+# refuses that shape first). $1=this tree's own tmux session name (e.g.
+# "jammi-mywork", TMUX_SESSION at the call site) — excluded from the scan so
+# a same-tree re-run (`run`'s existing kill-then-replace of its OWN session)
+# is never mistaken for cross-tree contention. A plain function, directly
+# testable the same way rp_target_preflight_lines is (source this file, run
+# the printed text against a faked `tmux` on PATH — no ssh, no pod). Prints
+# exactly one line, `GPU_DEV_CONCURRENCY_STATE=<CLEAR|BUSY:<other-session>>`.
+# NOTE on the heredoc body below: this is TEXT generated for REMOTE
+# execution, not this file's own bash — the escaped \$other is deliberate
+# (it survives THIS function's own heredoc expansion unexpanded and
+# resolves only when the REMOTE shell runs it, same pattern as
+# rp_target_preflight_lines) — shellcheck's static parse of the heredoc
+# body cannot know that and reads the escaped form as a hardcoded
+# non-empty literal (SC2157), hence the disable directive placed INSIDE
+# the heredoc, immediately before the flagged line. No backticks appear
+# anywhere in the heredoc body itself — an unquoted heredoc treats a
+# literal backtick as old-style command substitution, which would corrupt
+# the generated text.
+rp_concurrency_preflight_lines() {
+  local own_session="${1:?rp_concurrency_preflight_lines needs its own tmux session name}"
+  cat <<EOF
+other="\$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^jammi-' | grep -vx 'jammi-seed' | grep -vx '${own_session}' | head -1)" # tripwire-ok: tmux list-sessions exits non-zero with no server/sessions at all -- a real, expected, checked state (an empty \$other, handled by the if/else right below), never a silent pass on a real error this remote script would otherwise need to escalate
+# shellcheck disable=SC2157
+if [ -n "\$other" ]; then
+  echo "GPU_DEV_CONCURRENCY_STATE=BUSY:\$other"
+else
+  echo "GPU_DEV_CONCURRENCY_STATE=CLEAR"
+fi
+EOF
+}
+
 # The env-source + CARGO_TARGET_DIR + cd preamble shared by every remote
 # command that must run correctly as if it were an interactive shell in the
 # tree (an SSH login shell does not inherit the container's Dockerfile ENV —

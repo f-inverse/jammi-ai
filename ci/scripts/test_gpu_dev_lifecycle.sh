@@ -1619,34 +1619,164 @@ else
   bad "run (esc-077): expected a named UNMARKED refusal + exactly 2 ssh calls (got rc=$g9c_rc, calls=$(cat "$SANDBOX/g9c-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9c.log")"
 fi
 
-# --- 9d: a marked clone (OK) -> proceeds to the real job-launch call ------
+# --- 9d: a marked clone (OK) -> proceeds past esc-077 into the NEW
+# concurrency preflight (call #3, CLEAR here) -> the real job-launch call
+# (#4). This call count grew by one now that the one-pod-per-wave
+# concurrency preflight also runs by default (RP_ALLOW_CONCURRENT unset).
 G9D_DIR="$SANDBOX/g9d-ssh"; mkdir -p "$G9D_DIR"
 write_ssh_resp "$G9D_DIR" 1 0
 write_ssh_resp "$G9D_DIR" 2 0 "GPU_DEV_TARGET_STATE=OK"
-write_ssh_resp "$G9D_DIR" 3 0 "started"
+write_ssh_resp "$G9D_DIR" 3 0 "GPU_DEV_CONCURRENCY_STATE=CLEAR"
+write_ssh_resp "$G9D_DIR" 4 0 "started"
 rm -f "$SANDBOX/g9d-counter"
 MOCK_SSH_CALL_COUNTER="$SANDBOX/g9d-counter" MOCK_SSH_RESPONSES_DIR="$G9D_DIR" \
   PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" run "$G9_SESSION" echo hi \
   >"$SANDBOX/out-g9d.log" 2>&1
-if [ "$(cat "$SANDBOX/g9d-counter")" = "3" ] && grep -q "detached" "$SANDBOX/out-g9d.log"; then
-  ok "run (esc-077): a marked (OK) clone proceeds past the preflight to the real job-launch call"
+if [ "$(cat "$SANDBOX/g9d-counter")" = "4" ] && grep -q "detached" "$SANDBOX/out-g9d.log"; then
+  ok "run (esc-077): a marked (OK) clone + a CLEAR concurrency check proceeds to the real job-launch call"
 else
-  bad "run (esc-077): expected exactly 3 ssh calls (preflight OK -> job launch) (got calls=$(cat "$SANDBOX/g9d-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9d.log")"
+  bad "run (esc-077): expected exactly 4 ssh calls (target preflight OK -> concurrency preflight CLEAR -> job launch) (got calls=$(cat "$SANDBOX/g9d-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9d.log")"
 fi
 
-# --- 9e: RP_ALLOW_COLD_TARGET=1 skips the preflight call entirely ---------
+# --- 9e: RP_ALLOW_COLD_TARGET=1 skips ONLY the target preflight — the
+# concurrency preflight still runs (a separate override, RP_ALLOW_CONCURRENT,
+# gates it) -------------------------------------------------------------
 G9E_DIR="$SANDBOX/g9e-ssh"; mkdir -p "$G9E_DIR"
 write_ssh_resp "$G9E_DIR" 1 0
-write_ssh_resp "$G9E_DIR" 2 0 "started"                        # the job-launch call, now #2
+write_ssh_resp "$G9E_DIR" 2 0 "GPU_DEV_CONCURRENCY_STATE=CLEAR"  # the concurrency preflight, now #2
+write_ssh_resp "$G9E_DIR" 3 0 "started"                          # the job-launch call, now #3
 rm -f "$SANDBOX/g9e-counter"
 MOCK_SSH_CALL_COUNTER="$SANDBOX/g9e-counter" MOCK_SSH_RESPONSES_DIR="$G9E_DIR" \
   RP_ALLOW_COLD_TARGET=1 \
   PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" run "$G9_SESSION" echo hi \
   >"$SANDBOX/out-g9e.log" 2>&1
-if [ "$(cat "$SANDBOX/g9e-counter")" = "2" ] && grep -q "detached" "$SANDBOX/out-g9e.log"; then
-  ok "run (esc-077): RP_ALLOW_COLD_TARGET=1 skips the preflight ssh call entirely (exactly 2 calls: liveness + job launch)"
+if [ "$(cat "$SANDBOX/g9e-counter")" = "3" ] && grep -q "detached" "$SANDBOX/out-g9e.log"; then
+  ok "run (esc-077): RP_ALLOW_COLD_TARGET=1 skips ONLY the target preflight (liveness + concurrency preflight + job launch = 3 calls)"
 else
-  bad "run (esc-077): expected RP_ALLOW_COLD_TARGET=1 to skip straight to the job-launch call (2 total calls) (got calls=$(cat "$SANDBOX/g9e-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9e.log")"
+  bad "run (esc-077): expected RP_ALLOW_COLD_TARGET=1 to skip straight to the concurrency preflight then job launch (3 total calls) (got calls=$(cat "$SANDBOX/g9e-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9e.log")"
+fi
+
+# ═════════════════════════════════════════════════════════════════════════
+# Group 10 (one-pod-per-wave, same class as esc-077) — `run` refuses a job
+# while a DIFFERENT tree's job is already live on this pod.
+# ═════════════════════════════════════════════════════════════════════════
+
+# --- 10a: rp_concurrency_preflight_lines classifies BUSY/CLEAR correctly
+# against a FAKED `tmux` on PATH — no ssh, no pod, no mocking of gpu-dev.sh
+# itself. Same isolation rationale as 9a (subshell + group-local results
+# file + outer tally, since `ok`/`bad` mutate counters a subshell cannot
+# persist).
+G10A_RESULTS="$SANDBOX/g10a-results.log"
+: > "$G10A_RESULTS"
+(
+  RUNPOD_API_KEY="test-dummy-key"
+  # shellcheck source=ci/scripts/runpod_lib.sh
+  source "$DIR/runpod_lib.sh"
+  record() { echo "$1:$2" >> "$G10A_RESULTS"; }
+
+  G10A_FAKEBIN="$SANDBOX/g10a-fakebin"; mkdir -p "$G10A_FAKEBIN"
+  fake_tmux() { # $1=newline-joined session list
+    cat > "$G10A_FAKEBIN/tmux" <<STUB
+#!/usr/bin/env bash
+if [ "\$1" = "list-sessions" ]; then
+  printf '%s'
+fi
+STUB
+    printf '%s' "$1" >> "$G10A_FAKEBIN/tmux.sessions"
+    cat > "$G10A_FAKEBIN/tmux" <<STUB
+#!/usr/bin/env bash
+if [ "\$1" = "list-sessions" ]; then
+  cat "$G10A_FAKEBIN/tmux.sessions"
+fi
+STUB
+    chmod +x "$G10A_FAKEBIN/tmux"
+  }
+
+  rm -f "$G10A_FAKEBIN/tmux.sessions"
+  fake_tmux $'jammi-seed\njammi-otherwave\njammi-mywork\n'
+  out_busy="$(PATH="$G10A_FAKEBIN:$PATH" bash <(rp_concurrency_preflight_lines "jammi-mywork"))"
+  if [ "$out_busy" = "GPU_DEV_CONCURRENCY_STATE=BUSY:jammi-otherwave" ]; then
+    record PASS "rp_concurrency_preflight_lines: a different tree's live session classified BUSY, naming it"
+  else
+    record FAIL "rp_concurrency_preflight_lines: expected BUSY:jammi-otherwave (got: $out_busy)"
+  fi
+
+  rm -f "$G10A_FAKEBIN/tmux.sessions"
+  fake_tmux $'jammi-seed\njammi-mywork\n'
+  out_own="$(PATH="$G10A_FAKEBIN:$PATH" bash <(rp_concurrency_preflight_lines "jammi-mywork"))"
+  if [ "$out_own" = "GPU_DEV_CONCURRENCY_STATE=CLEAR" ]; then
+    record PASS "rp_concurrency_preflight_lines: this tree's own session (+ the boot-time seed) is never mistaken for cross-tree contention"
+  else
+    record FAIL "rp_concurrency_preflight_lines: expected CLEAR for own-session-only (got: $out_own)"
+  fi
+
+  rm -f "$G10A_FAKEBIN/tmux.sessions"
+  fake_tmux ''
+  out_none="$(PATH="$G10A_FAKEBIN:$PATH" bash <(rp_concurrency_preflight_lines "jammi-mywork"))"
+  if [ "$out_none" = "GPU_DEV_CONCURRENCY_STATE=CLEAR" ]; then
+    record PASS "rp_concurrency_preflight_lines: no tmux sessions at all classified CLEAR"
+  else
+    record FAIL "rp_concurrency_preflight_lines: expected CLEAR for no sessions (got: $out_none)"
+  fi
+)
+while IFS=: read -r status name; do
+  [ -n "$status" ] || continue
+  if [ "$status" = "PASS" ]; then ok "$name"; else bad "$name"; fi
+done < "$G10A_RESULTS"
+
+# --- 10b-10d: `run`'s own dispatch, SSH-mocked (call order: #1 liveness,
+# #2 target preflight OK, #3 concurrency preflight, #4 job launch — unless
+# an override skips a step).
+
+# --- 10b: refuse-when-other-tree-busy -------------------------------------
+G10B_DIR="$SANDBOX/g10b-ssh"; mkdir -p "$G10B_DIR"
+write_ssh_resp "$G10B_DIR" 1 0
+write_ssh_resp "$G10B_DIR" 2 0 "GPU_DEV_TARGET_STATE=OK"
+write_ssh_resp "$G10B_DIR" 3 0 "GPU_DEV_CONCURRENCY_STATE=BUSY:jammi-otherwave"
+rm -f "$SANDBOX/g10b-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g10b-counter" MOCK_SSH_RESPONSES_DIR="$G10B_DIR" \
+  PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" run "$G9_SESSION" echo hi \
+  >"$SANDBOX/out-g10b.log" 2>&1
+g10b_rc=$?
+if [ "$g10b_rc" -ne 0 ] && grep -q "already has a live job for tree 'otherwave'" "$SANDBOX/out-g10b.log" \
+  && grep -q "RP_SESSION=<alias> $(basename "$DIR/gpu-dev.sh") up <arch>" "$SANDBOX/out-g10b.log" \
+  && grep -q "RP_ALLOW_CONCURRENT=1" "$SANDBOX/out-g10b.log" \
+  && [ "$(cat "$SANDBOX/g10b-counter")" = "3" ]; then
+  ok "run (one-pod-per-wave): refuses while a DIFFERENT tree's job is live, naming the busy tree and the remedy, never reaching the job-launch call"
+else
+  bad "run (one-pod-per-wave): expected a named BUSY refusal + exactly 3 ssh calls (got rc=$g10b_rc, calls=$(cat "$SANDBOX/g10b-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g10b.log")"
+fi
+
+# --- 10c: allow-same-tree-sequential (CLEAR -> proceeds to job launch) ----
+G10C_DIR="$SANDBOX/g10c-ssh"; mkdir -p "$G10C_DIR"
+write_ssh_resp "$G10C_DIR" 1 0
+write_ssh_resp "$G10C_DIR" 2 0 "GPU_DEV_TARGET_STATE=OK"
+write_ssh_resp "$G10C_DIR" 3 0 "GPU_DEV_CONCURRENCY_STATE=CLEAR"
+write_ssh_resp "$G10C_DIR" 4 0 "started"
+rm -f "$SANDBOX/g10c-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g10c-counter" MOCK_SSH_RESPONSES_DIR="$G10C_DIR" \
+  PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" run "$G9_SESSION" echo hi \
+  >"$SANDBOX/out-g10c.log" 2>&1
+if [ "$(cat "$SANDBOX/g10c-counter")" = "4" ] && grep -q "detached" "$SANDBOX/out-g10c.log"; then
+  ok "run (one-pod-per-wave): a CLEAR concurrency state (no OTHER tree busy — a same-tree re-run is exactly this shape) proceeds to the job-launch call"
+else
+  bad "run (one-pod-per-wave): expected exactly 4 ssh calls ending in job launch (got calls=$(cat "$SANDBOX/g10c-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g10c.log")"
+fi
+
+# --- 10d: RP_ALLOW_CONCURRENT=1 skips the concurrency preflight call ------
+G10D_DIR="$SANDBOX/g10d-ssh"; mkdir -p "$G10D_DIR"
+write_ssh_resp "$G10D_DIR" 1 0
+write_ssh_resp "$G10D_DIR" 2 0 "GPU_DEV_TARGET_STATE=OK"
+write_ssh_resp "$G10D_DIR" 3 0 "started"                       # the job-launch call, now #3
+rm -f "$SANDBOX/g10d-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g10d-counter" MOCK_SSH_RESPONSES_DIR="$G10D_DIR" \
+  RP_ALLOW_CONCURRENT=1 \
+  PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" run "$G9_SESSION" echo hi \
+  >"$SANDBOX/out-g10d.log" 2>&1
+if [ "$(cat "$SANDBOX/g10d-counter")" = "3" ] && grep -q "detached" "$SANDBOX/out-g10d.log"; then
+  ok "run (one-pod-per-wave): RP_ALLOW_CONCURRENT=1 skips the concurrency preflight ssh call entirely (target preflight + job launch = 3 calls incl. liveness)"
+else
+  bad "run (one-pod-per-wave): expected RP_ALLOW_CONCURRENT=1 to skip straight to the job-launch call (3 total calls) (got calls=$(cat "$SANDBOX/g10d-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g10d.log")"
 fi
 
 echo

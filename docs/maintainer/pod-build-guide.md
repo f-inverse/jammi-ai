@@ -399,6 +399,13 @@ Under the hood this is `pod_target_clone.sh <seed-dir> <dest-dir>
    and invokes `cargo` by hand bypasses it entirely; it is not claimed
    closed, only that the sanctioned path fails closed.
 
+**One-pod-per-wave.** `gpu-dev.sh run` also REFUSES when a DIFFERENT tree's
+job is already live on the pod (`jammi-<tree>` tmux session, excluding the
+boot-time `jammi-seed` build and this tree's own prior job), naming the busy
+tree and the remedy — rent another pod (`RP_SESSION=<alias> gpu-dev.sh up
+<arch>`) — with `RP_ALLOW_CONCURRENT=1` as the override for deliberate
+co-tenancy (e.g. a build-only job); same documented-residual scope as above.
+
 **Poisoned-clone detection**, concretely:
 
 ```bash

@@ -175,6 +175,34 @@
 //! here without that upstream change would mean either the growth
 //! mechanism changed (re-open this attribution) or this oracle's own bound
 //! is miscalibrated, not that the escape is closed.
+//!
+//! **Pod finding, disclosed honestly (this branch's own landing run):** the
+//! FIRST attempt at [`VARIABLE_SHAPE_SEQS`] (five values, all `<=
+//! REPORTER_SEQ = 128`, `20` steps) produced a FLAT trace on BOTH the
+//! variable-shape leg AND its fixed-shape control (`0.0` MiB drop, both) —
+//! a genuine NEGATIVE result at that scale, not silently discarded (kept
+//! as this constant's own prior-value note). Reproduction required
+//! WIDENING the shape range up to `512` (`11` values, `33` steps) — at
+//! which point the variable-shape leg OOM'd after only 3 completed steps
+//! (having reached seq lengths 64, 96, 128 before failing at 160), while
+//! the fixed-shape control (33 steps at the fixed `REPORTER_SEQ = 128`)
+//! completed cleanly. This is an HONEST but IMPERFECT isolation of the
+//! ledger's own "count of DISTINCT shapes" variable: this leg's shapes
+//! both vary in COUNT and GROW in AMPLITUDE across the cycle (unlike the
+//! ledger's own controls, which held amplitude fixed and varied only
+//! whether a shape repeated), so this reproduction demonstrates "a
+//! realistic variable-length-batch training loop OOMs at a moderate,
+//! ordinary shape where a fixed-shape loop of the same nominal severity
+//! does not" — the same CLASS of defect and the same practical
+//! consequence — without cleanly separating "shape variety alone" from
+//! "the largest shape reached, retained via a non-releasing allocator"
+//! as independent causes. Either framing routes to the SAME fix (bound
+//! the shape variety AND the peak amplitude a step can introduce, i.e.
+//! bucket/pad at the batch-construction layer), so the attribution and
+//! routing above stand; a reader wanting the cleaner isolation should
+//! re-run at a FIXED amplitude (all shapes `== REPORTER_SEQ`'s own
+//! token count, permuted only in which axis carries it) before treating
+//! "distinct count alone, no growth" as separately confirmed.
 
 #![cfg(feature = "cuda")]
 
@@ -608,15 +636,31 @@ fn oom_capability_witness_leg(
 /// range a variable-length-batch trainer would actually produce, never a
 /// single repeated value (which would degenerate to the fixed-shape leg
 /// this file already carries).
-const VARIABLE_SHAPE_SEQS: [usize; 5] = [64, 80, 96, 112, 128];
+/// AMENDED (this branch's first pod run): the initial 5-value,
+/// `<=REPORTER_SEQ` set produced a flat, non-reproducing trace (0.0 MiB
+/// drop, identical to the fixed-shape control) — an honest negative
+/// result at that scale, not a silently-adjusted one (see this file's
+/// module doc, D3 ATTRIBUTION, for the full disclosure). Widened to 11
+/// values spanning up to `max_position_embeddings`'s own practical
+/// mid-range (`512` — the escape's OWN second failing config, `b8*s512`,
+/// per `esc-076`'s `observable` field) so the leg sweeps genuinely NOVEL
+/// allocation sizes across a wider range, closer to what a real
+/// variable-length-sentence dataset would produce (natural sentence
+/// lengths rarely repeat exactly), rather than 5 small values a
+/// non-caching allocator's driver-level arena might already have slack
+/// for.
+const VARIABLE_SHAPE_SEQS: [usize; 11] = [64, 96, 128, 160, 192, 224, 256, 320, 384, 448, 512];
 
-/// Steps for the variable-shape leg: 4 full cycles through
-/// [`VARIABLE_SHAPE_SEQS`] (`5 * 4 = 20`) — enough for a genuine trend
+/// Steps for the variable-shape leg: 3 full cycles through
+/// [`VARIABLE_SHAPE_SEQS`] (`11 * 3 = 33`) — enough for a genuine trend
 /// (vs a single cycle, which cannot distinguish "one-time cost per NEW
 /// shape, then plateau" from "unbounded per-cycle growth") while staying
 /// inside a pod session's practical wall-clock budget (this crate's own
-/// `STEPS_PER_LEG=40` fixed-shape leg is the existing budget precedent).
-const VARIABLE_SHAPE_STEPS: usize = 20;
+/// `STEPS_PER_LEG=40` fixed-shape leg is the existing budget precedent;
+/// the WIDER shape range above, up to 4x `REPORTER_SEQ`'s own token
+/// count, already costs proportionally more per step than the original
+/// 5-value/20-step design did, so the step count is not raised further).
+const VARIABLE_SHAPE_STEPS: usize = 33;
 
 /// The variable-shape twin of [`run_leg`]: IDENTICAL pipeline (same
 /// weights, same LoRA config, same three-forward-pass margin-loss shape,

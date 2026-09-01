@@ -42,9 +42,8 @@ use jammi_kernels::ops::{
     AdamMomentUpdate, AdamMomentUpdateFmaContractedRedControl, AdamWParams, AttentionBlockFused,
     Axpy, BwdGemmLayoutsParams, CastAddBf16, CastAddF16, CastScaleBf16F32, CastScaleF16F32,
     DropoutFused, DropoutKey, FullyMaskedPolicy, GegluFused, GeluVariant, LayerNormFused,
-    LowRankResidualLinear, MemEfficientAttention, PhiloxKatProbe, RopeFused, RopePositionsFused,
-    ScaledCastAdd, SoftmaxLastDimFused, ATTENTION_BLOCK_WINDOW_MASKED_VALUE,
-    MEM_EFFICIENT_WINDOW_MASKED_VALUE,
+    LowRankResidualLinear, MemEfficientAttention, PhiloxKatProbe, RopeFused, ScaledCastAdd,
+    SoftmaxLastDimFused, ATTENTION_BLOCK_WINDOW_MASKED_VALUE, MEM_EFFICIENT_WINDOW_MASKED_VALUE,
 };
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -12149,19 +12148,27 @@ fn assert_dropout_parity_f16(
         "dropout f16 NOT bit-identical: {mismatches}/{n} mismatches"
     );
     // Forced defect: a different Philox key, through the op's own public
-    // knobs, must diverge from `out_gpu`.
-    let out_defect: Vec<f16> = dropout(seed ^ 0xDEAD_BEEF, layer_id, forward_idx, p, &x_gpu)
-        .unwrap()
-        .to_device(&cpu)
-        .unwrap()
-        .to_vec1()
-        .unwrap();
-    let defect_diffs = (0..n).filter(|&i| out_cpu[i] != out_defect[i]).count();
-    assert!(
-        defect_diffs > 0,
-        "dropout f16 FORCED DEFECT: a different Philox key produced an IDENTICAL mask -- the \
-         bit-exact oracle above would be vacuous"
-    );
+    // knobs, must diverge from `out_gpu`. Skipped at `p == 0.0`: the
+    // KEEP/DROP decision there is `draw < threshold` with `threshold ==
+    // 2^32` (every possible `u32` draw), so EVERY element is kept
+    // regardless of which key drew it — a different key is genuinely a
+    // no-op at this op's own `p == 0.0` domain edge, not a harness defect
+    // (mirrors `p_zero_is_a_bit_exact_no_op`'s own CPU-only doc: "p=0.0
+    // must be a bit-exact no-op on every element").
+    if p > 0.0 {
+        let out_defect: Vec<f16> = dropout(seed ^ 0xDEAD_BEEF, layer_id, forward_idx, p, &x_gpu)
+            .unwrap()
+            .to_device(&cpu)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let defect_diffs = (0..n).filter(|&i| out_cpu[i] != out_defect[i]).count();
+        assert!(
+            defect_diffs > 0,
+            "dropout f16 FORCED DEFECT: a different Philox key produced an IDENTICAL mask -- the \
+             bit-exact oracle above would be vacuous"
+        );
+    }
 }
 
 #[test]

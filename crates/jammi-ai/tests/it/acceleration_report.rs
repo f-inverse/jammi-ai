@@ -196,13 +196,16 @@ fn expect_determined_report_fails_closed_on_pending_marker() {
 /// num_attention_heads`) is nowhere near 64, so this op declines
 /// REGARDLESS of dtype — a shape-based domain miss, not a dtype-widening
 /// candidate, so this control stays robust to further campaign #443 dtype
-/// widenings. (Today attention_block's own dtype check has NOT yet been
-/// widened to F16 either, so the observed reason key below is the dtype
-/// check's — `dtype_f32_or_bf16_matching_between_qkv_and_mask` — not the
-/// head_dim check's; if/when attention_block's dtype check is later widened
-/// to F16 too, the SAME shape miss still declines it, just under
-/// `head_dim_is_attention_block_fixed_head_dim` instead. Either way,
-/// `holds: false` here is not expected to flip.)
+/// widenings. (This doc's OWN prior revision predicted exactly this
+/// eventuality: campaign #443 W2d has SINCE widened attention_block's own
+/// dtype check to F16 too — `crates/jammi-encoders/src/modernbert.rs`'s
+/// `attention_block_admission_predicate` checks dtype FIRST, then head_dim —
+/// so an F16 `qkv` now clears the (now three-way) dtype check and the
+/// SAME shape miss declines it one check later, under
+/// `head_dim_is_attention_block_fixed_head_dim` instead of the dtype
+/// check's own reason key. `holds: false` did not flip, exactly as
+/// predicted — only which check fires first, and therefore which verbatim
+/// reason key this test reads back, changed.)
 ///
 /// Also asserts `layer_norm` (now genuinely admitted at F16) reports
 /// `holds: true` on BOTH jobs — the anti-always-degraded half of this same
@@ -249,9 +252,10 @@ async fn second_f16_job_in_process_still_reports_its_own_eager_ops() {
     );
     assert_eq!(
         ab1["reason"],
-        serde_json::json!("dtype_f32_or_bf16_matching_between_qkv_and_mask"),
+        serde_json::json!("head_dim_is_attention_block_fixed_head_dim"),
         "job 1's miss reason must be the verbatim predicate key jammi-encoders' own \
-         `admit()` call site records, got: {report1}"
+         `admit()` call site records — the dtype check now admits F16 too (campaign #443 \
+         W2d), so the shape (head_dim) check fires next, got: {report1}"
     );
     let ln1 = &report1["ops"]["layer_norm"];
     assert_eq!(
@@ -286,8 +290,9 @@ async fn second_f16_job_in_process_still_reports_its_own_eager_ops() {
     );
     assert_eq!(
         ab2["reason"],
-        serde_json::json!("dtype_f32_or_bf16_matching_between_qkv_and_mask"),
-        "job 2's reason must still resolve to the same verbatim predicate key, got: {report2}"
+        serde_json::json!("head_dim_is_attention_block_fixed_head_dim"),
+        "job 2's reason must still resolve to the same verbatim predicate key (the shape/ \
+         head_dim check, now that the dtype check admits F16 too), got: {report2}"
     );
     let ln2 = &report2["ops"]["layer_norm"];
     assert_eq!(

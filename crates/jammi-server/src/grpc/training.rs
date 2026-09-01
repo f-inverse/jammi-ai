@@ -109,12 +109,13 @@ impl TrainingService for TrainingServer {
             // rather than an empty string).
             metrics_json: record.metrics,
             // The catalog's `training_jobs.acceleration_report` column, relayed
-            // verbatim — the SAME tri-state opaque JSON blob the embedded
-            // surface's catalog record read returns off this row (esc-075).
-            // `None` (SQL `NULL`, a pre-migration-026 row) maps to `optional`
-            // unset here, never an empty string; `{"state":"pending"}` and a
-            // claiming worker's `{"state":"determined",...}` pass through
-            // byte-for-byte, matching `metrics_json`'s presence contract.
+            // verbatim — the SAME opaque, self-describing JSON blob the
+            // embedded surface's catalog record read returns off this row
+            // (esc-075). `None` (SQL `NULL`, a pre-migration-026 row) maps to
+            // `optional` unset here, never an empty string; any present blob
+            // (whose `"state"` vocabulary is owned by the producer, not this
+            // handler) passes through byte-for-byte, matching `metrics_json`'s
+            // presence contract.
             acceleration_report_json: record.acceleration_report,
         }))
     }

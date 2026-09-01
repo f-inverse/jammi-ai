@@ -1765,6 +1765,38 @@ STUB
   else
     record FAIL "rp_concurrency_preflight_lines: expected CLEAR for a stale claim with no live session (got: $out)"
   fi
+
+  # --- Own-session exclusion must be a LITERAL, whole-line match ---------
+  # A tree name legitimately contains regex metacharacters (rp_tree_name_check
+  # refuses only ''/'.'/'..'/'/'-leading-'-'; `bench.1`-shaped names are real,
+  # and `--tree 'fix.443'` reproduced this). Read as a BRE, the own-session
+  # pattern deletes OTHER sessions from the list the gate is scanning, so the
+  # gate reports CLEAR while a different wave is genuinely running: it fails
+  # OPEN. These cases drive the generated text DIRECTLY, so they hold for the
+  # function itself regardless of any entrypoint validation layered above it.
+  metachar_case() { # $1=own_session $2=session list $3=expected other session
+    fake_tmux "$2"
+    printf 'WAVE=wave-B\nTREE=othertree\nTS=2026-09-01T00:00:00Z\n' > "$G10A_ROOT/.jammi-active-wave"
+    local out; out="$(run_preflight "$1" "wave-A")"
+    if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=BUSY:wave-B:$3" ]; then
+      record PASS "rp_concurrency_preflight_lines: own-session '$1' excluded LITERALLY — the live cross-wave session '$3' is still seen (BUSY), never regex-swallowed"
+    else
+      record FAIL "rp_concurrency_preflight_lines: own-session '$1' — expected BUSY:wave-B:$3 (got: $out)"
+    fi
+  }
+  # `.` — a BRE `jammi-fix.443` also matches the live `jammi-fixX443`.
+  metachar_case 'jammi-fix.443' $'jammi-seed\njammi-fixX443\njammi-fix.443\n' 'jammi-fixX443'
+  # `*` — a BRE `jammi-w*` matches `jammi-www` (and NOT the literal own name),
+  # so the old form excluded the OTHER session and then reported OUR OWN
+  # session as the contending one.
+  metachar_case 'jammi-w*' $'jammi-seed\njammi-www\njammi-w*\n' 'jammi-www'
+  # `[` — an unbalanced bracket is an INVALID BRE: grep exits 2 printing
+  # nothing, so `other` came back empty and every session on the pod
+  # vanished from the gate's view at once.
+  metachar_case 'jammi-a[b' $'jammi-seed\njammi-other\njammi-a[b\n' 'jammi-other'
+  # Prefix collision (regression pin for the `-x` whole-line anchor, which
+  # `-F` must not silently drop): `jammi-abc` may never exclude `jammi-abcd`.
+  metachar_case 'jammi-abc' $'jammi-seed\njammi-abcd\njammi-abc\n' 'jammi-abcd'
 )
 while IFS=: read -r status name; do
   [ -n "$status" ] || continue

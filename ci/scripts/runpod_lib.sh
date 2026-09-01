@@ -736,11 +736,25 @@ EOF
 # backticks appear anywhere in the heredoc body itself — an unquoted
 # heredoc treats a literal backtick as old-style command substitution,
 # which would corrupt the generated text.
+#
+# Both session exclusions are `grep -Fvx -e` — a LITERAL, whole-line,
+# option-safe match — never a bare `grep -vx PATTERN`. A session name is a
+# tree name (`jammi-<tree>`), and a tree name legitimately contains `.`
+# (rp_tree_name_check's containment blacklist permits it, deliberately:
+# `bench.1`-shaped names are real). Read as a BRE, `jammi-fix.443` also
+# matches ANOTHER wave's `jammi-fixX443` — the own-session exclusion then
+# deletes the very session it exists to detect and the gate reports CLEAR:
+# a concurrency gate that fails OPEN. `*` mis-excludes a sibling the same
+# way, and an unbalanced `[` makes grep exit 2 with NO output at all,
+# emptying `other` and failing open for every session on the pod. `-e`
+# additionally keeps a name that begins with `-` from being read as an
+# option. This robustness is the FUNCTION's own, independent of the
+# entrypoint allowlist that also refuses the exotic shapes.
 rp_concurrency_preflight_lines() {
   local own_session="${1:?rp_concurrency_preflight_lines needs its own tmux session name}" \
         own_wave="${2:?rp_concurrency_preflight_lines needs its own wave id}"
   cat <<EOF
-other="\$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^jammi-' | grep -vx 'jammi-seed' | grep -vx '${own_session}' | head -1)" # tripwire-ok: tmux list-sessions exits non-zero with no server/sessions at all -- a real, expected, checked state (an empty \$other, handled by the if/else right below), never a silent pass on a real error this remote script would otherwise need to escalate
+other="\$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^jammi-' | grep -Fvx -e 'jammi-seed' | grep -Fvx -e '${own_session}' | head -1)" # tripwire-ok: tmux list-sessions exits non-zero with no server/sessions at all -- a real, expected, checked state (an empty \$other, handled by the if/else right below), never a silent pass on a real error this remote script would otherwise need to escalate
 # shellcheck disable=SC2157
 if [ -z "\$other" ]; then
   echo "GPU_DEV_CONCURRENCY_STATE=CLEAR"

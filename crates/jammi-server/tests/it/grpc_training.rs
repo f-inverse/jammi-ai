@@ -749,3 +749,345 @@ async fn start_training_rejects_missing_columns() {
     let _ = server.shutdown.send(());
     let _ = server.handle.await;
 }
+
+// ---------------------------------------------------------------------------
+// esc-075: `TrainingStatus.acceleration_report_json` (campaign #443).
+//
+// The tri-state esc-075 marker (`NULL` legacy-unknown / `{"state":"pending"}`
+// / `{"state":"determined",...}`) rides the wire on
+// `TrainingStatusResponse.acceleration_report_json`, appended after
+// `metrics_json` (field 5) with the identical presence contract: field
+// presence — never the empty string — distinguishes "no column value" from an
+// already-recorded blob, mirroring the catalog's `NULL`/`NOT NULL`. The
+// ai-core worker-side writer has not landed yet (a parallel wave adds it), so
+// these tests seed the column directly through the catalog API rather than
+// driving a real claim-time determination.
+// ---------------------------------------------------------------------------
+
+/// Directly seed a `training_jobs` row, bypassing
+/// [`jammi_db::catalog::Catalog::create_training_job`] (which always lands
+/// `status = 'queued'`). The row this writes never passes through `'queued'`,
+/// so it is race-free against the server's own background `TrainingWorker` —
+/// mounted alongside `TrainingService` by every `start_engine_server*` fixture
+/// — which claims exclusively `WHERE status = 'queued'` and would otherwise
+/// compete for a freshly-queued row nondeterministically.
+async fn seed_training_job_row(
+    catalog: &jammi_db::catalog::Catalog,
+    job_id: &str,
+    base_model_id: &str,
+    status: &str,
+    claimed_by: Option<&str>,
+    attempts: i64,
+    acceleration_report: Option<&str>,
+) {
+    use jammi_db::catalog::backend::{SqlNullType, SqlValue, TxOptions};
+
+    let job_id = job_id.to_string();
+    let base_model_id = base_model_id.to_string();
+    let status = status.to_string();
+    let claimed_by = claimed_by.map(str::to_string);
+    let acceleration_report = acceleration_report.map(str::to_string);
+    // Far enough in the future that `reclaim_expired_training_jobs`'s
+    // `lease_expires_at < now` sweep (run on every worker tick) never reclaims
+    // this row mid-test.
+    let lease_expires_at = claimed_by
+        .is_some()
+        .then(|| "9999-12-31T23:59:59.000000Z".to_string());
+
+    catalog
+        .backend_arc()
+        .transaction(TxOptions::default(), move |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO training_jobs \
+                     (job_id, base_model_id, training_source, loss_type, hyperparams, status, \
+                      kind, training_spec, tenant_id, acceleration_report, claimed_by, attempts, \
+                      lease_expires_at) \
+                     VALUES ($1, $2, 'seed.csv', 'contrastive', '{}', $3, 'fine_tune', $4, $5, \
+                             $6, $7, $8, $9)",
+                    &[
+                        SqlValue::TextOwned(job_id),
+                        SqlValue::TextOwned(base_model_id),
+                        SqlValue::TextOwned(status),
+                        SqlValue::Null(SqlNullType::Text),
+                        SqlValue::Null(SqlNullType::Text),
+                        SqlValue::from(acceleration_report),
+                        SqlValue::from(claimed_by),
+                        SqlValue::Int(attempts),
+                        SqlValue::from(lease_expires_at),
+                    ],
+                )
+                .await
+            })
+        })
+        .await
+        .expect("seed training_jobs row");
+}
+
+/// Register the FK target model every seeded row's `base_model_id` points at.
+async fn register_acceleration_test_model(catalog: &jammi_db::catalog::Catalog, model_id: &str) {
+    use jammi_db::catalog::model_repo::RegisterModelParams;
+
+    catalog
+        .register_model(RegisterModelParams {
+            model_id,
+            version: 1,
+            model_type: "embedding",
+            backend: "candle",
+            task: jammi_db::ModelTask::TextEmbedding,
+            base_model_id: None,
+            artifact_path: None,
+            config_json: None,
+        })
+        .await
+        .expect("register acceleration-report test model");
+}
+
+/// K4 (esc-075): a submitted job's `TrainingStatus.acceleration_report_json`
+/// matches the catalog's `training_jobs.acceleration_report` column
+/// byte-for-byte, immediately post-submission — the explicit `{"state":
+/// "pending"}` marker `create_training_job` writes, never `NULL`. This is the
+/// divergence-prone tri-state field, not a single-scalar happy path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn training_status_acceleration_report_pending_state_matches_the_catalog_record() {
+    let server = start_engine_server().await;
+    add_training_source(
+        channel(server.addr).await,
+        None::<fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>>,
+    )
+    .await;
+    let mut client = TrainingServiceClient::new(channel(server.addr).await);
+
+    let start = client
+        .start_training(start_request())
+        .await
+        .expect("start_training")
+        .into_inner();
+
+    // Immediately post-submission, before any completion race: the wire field
+    // and the embedded catalog read must carry the identical pending marker.
+    let resp = client
+        .training_status(TrainingStatusRequest {
+            job_id: start.job_id.clone(),
+        })
+        .await
+        .expect("training_status")
+        .into_inner();
+    let embedded = server
+        .engine
+        .catalog()
+        .get_training_job(&start.job_id)
+        .await
+        .expect("get_training_job");
+    assert_eq!(
+        resp.acceleration_report_json.as_deref(),
+        Some(r#"{"state":"pending"}"#),
+        "a freshly submitted job's wire acceleration_report_json must carry the \
+         explicit pending marker, never absent or empty"
+    );
+    assert_eq!(
+        resp.acceleration_report_json, embedded.acceleration_report,
+        "TrainingStatus.acceleration_report_json must BYTE-EQUAL the embedded \
+         catalog record's acceleration_report column for the SAME job"
+    );
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// K4 (esc-075), the determined-state and legacy-NULL halves: a claiming
+/// worker's `{"state":"determined",...}` report, and a pre-migration-026 row's
+/// `NULL`, both round-trip over `TrainingStatus.acceleration_report_json`
+/// byte-for-byte against the embedded catalog read. Absence semantics: the
+/// legacy row surfaces as field-ABSENT (`None`), never the empty string.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn training_status_acceleration_report_determined_and_legacy_states_match_the_catalog_record()
+{
+    let server = start_engine_server().await;
+    let catalog = server.engine.catalog();
+    register_acceleration_test_model(catalog, "acc-test-base").await;
+
+    // A claimed, running job carrying the explicit pending marker — the exact
+    // shape `create_training_job` + a real claim produce — which this test
+    // then overwrites with a determined report through the same catalog API
+    // the claiming worker itself would call.
+    seed_training_job_row(
+        catalog,
+        "acc-determined",
+        "acc-test-base::1",
+        "running",
+        Some("acc-test-worker"),
+        1,
+        Some(r#"{"state":"pending"}"#),
+    )
+    .await;
+    let determined_json = r#"{"state":"determined","fa2_f16":true,"reason":"sm_90 capable"}"#;
+    let wrote = catalog
+        .record_acceleration_report("acc-determined", "acc-test-worker", 1, determined_json)
+        .await
+        .expect("record_acceleration_report");
+    assert!(
+        wrote,
+        "the seeded row's lease/attempt must match the write guard"
+    );
+
+    // A legacy row: `acceleration_report` is SQL `NULL`, never touched by any
+    // migration-026-aware writer — the pre-migration-026 shape.
+    seed_training_job_row(
+        catalog,
+        "acc-legacy",
+        "acc-test-base::1",
+        "completed",
+        None,
+        0,
+        None,
+    )
+    .await;
+
+    let mut client = TrainingServiceClient::new(channel(server.addr).await);
+
+    for (job_id, expect_absent) in [("acc-determined", false), ("acc-legacy", true)] {
+        let resp = client
+            .training_status(TrainingStatusRequest {
+                job_id: job_id.to_string(),
+            })
+            .await
+            .expect("training_status")
+            .into_inner();
+        let embedded = catalog
+            .get_training_job(job_id)
+            .await
+            .expect("get_training_job");
+        assert_eq!(
+            resp.acceleration_report_json, embedded.acceleration_report,
+            "TrainingStatus.acceleration_report_json for '{job_id}' must BYTE-EQUAL \
+             the embedded catalog record's acceleration_report column"
+        );
+        if expect_absent {
+            assert_eq!(
+                resp.acceleration_report_json, None,
+                "a legacy NULL row must surface as field-ABSENT over the wire, \
+                 never the empty string"
+            );
+        } else {
+            assert_eq!(
+                resp.acceleration_report_json.as_deref(),
+                Some(determined_json),
+                "a determined report must round-trip verbatim over the wire"
+            );
+        }
+    }
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// esc-075 remote-visibility control: a REMOTE caller — reading nothing but
+/// `TrainingStatusResponse.acceleration_report_json` — can distinguish all
+/// three tri-state values (legacy-unknown / pending / determined) purely from
+/// the response. This is `esc-075-f16-silent-eager-no-per-job-signal`'s
+/// closure proof: the tri-state marker must survive the wire round-trip
+/// losslessly, not merely "both transports respond".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_caller_distinguishes_acceleration_report_tri_state_purely_from_the_response() {
+    #[derive(Debug, PartialEq, Eq)]
+    enum AccelerationState {
+        LegacyUnknown,
+        Pending,
+        Determined,
+    }
+
+    /// Classify purely off the wire response — no catalog / engine access.
+    fn classify(field: Option<&str>) -> AccelerationState {
+        match field {
+            None => AccelerationState::LegacyUnknown,
+            Some(raw) => {
+                let value: serde_json::Value =
+                    serde_json::from_str(raw).expect("acceleration_report_json is valid JSON");
+                match value.get("state").and_then(|s| s.as_str()) {
+                    Some("pending") => AccelerationState::Pending,
+                    Some("determined") => AccelerationState::Determined,
+                    other => panic!("unrecognized acceleration_report state: {other:?}"),
+                }
+            }
+        }
+    }
+
+    let server = start_engine_server().await;
+    let catalog = server.engine.catalog();
+    register_acceleration_test_model(catalog, "acc-vis-base").await;
+
+    seed_training_job_row(
+        catalog,
+        "acc-vis-legacy",
+        "acc-vis-base::1",
+        "completed",
+        None,
+        0,
+        None,
+    )
+    .await;
+    // A claimed, running row still carrying the pending marker — never
+    // overwritten, so it stays distinguishable from the determined row below.
+    seed_training_job_row(
+        catalog,
+        "acc-vis-pending",
+        "acc-vis-base::1",
+        "running",
+        Some("acc-vis-worker-1"),
+        1,
+        Some(r#"{"state":"pending"}"#),
+    )
+    .await;
+    seed_training_job_row(
+        catalog,
+        "acc-vis-determined",
+        "acc-vis-base::1",
+        "running",
+        Some("acc-vis-worker-2"),
+        1,
+        Some(r#"{"state":"pending"}"#),
+    )
+    .await;
+    let determined_json = r#"{"state":"determined","fa2_f16":false}"#;
+    assert!(
+        catalog
+            .record_acceleration_report(
+                "acc-vis-determined",
+                "acc-vis-worker-2",
+                1,
+                determined_json
+            )
+            .await
+            .expect("record_acceleration_report"),
+        "the seeded row's lease/attempt must match the write guard"
+    );
+
+    let mut client = TrainingServiceClient::new(channel(server.addr).await);
+    async fn read(client: &mut TrainingServiceClient<Channel>, job_id: &str) -> Option<String> {
+        client
+            .training_status(TrainingStatusRequest {
+                job_id: job_id.to_string(),
+            })
+            .await
+            .expect("training_status")
+            .into_inner()
+            .acceleration_report_json
+    }
+
+    assert_eq!(
+        classify(read(&mut client, "acc-vis-legacy").await.as_deref()),
+        AccelerationState::LegacyUnknown
+    );
+    assert_eq!(
+        classify(read(&mut client, "acc-vis-pending").await.as_deref()),
+        AccelerationState::Pending
+    );
+    assert_eq!(
+        classify(read(&mut client, "acc-vis-determined").await.as_deref()),
+        AccelerationState::Determined
+    );
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}

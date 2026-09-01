@@ -43,7 +43,8 @@ use jammi_kernels::ops::{
     Axpy, BwdGemmLayoutsParams, CastAddBf16, CastAddF16, CastScaleBf16F32, CastScaleF16F32,
     DropoutFused, DropoutKey, FullyMaskedPolicy, GegluFused, GeluVariant, LayerNormFused,
     LowRankResidualLinear, MemEfficientAttention, PhiloxKatProbe, RopeFused, ScaledCastAdd,
-    SoftmaxLastDimFused, ATTENTION_BLOCK_WINDOW_MASKED_VALUE, MEM_EFFICIENT_WINDOW_MASKED_VALUE,
+    SoftmaxLastDimFused, ATTENTION_BLOCK_WINDOW_MASKED_VALUE, MAX_LAST_DIM,
+    MEM_EFFICIENT_WINDOW_MASKED_VALUE,
 };
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -1858,41 +1859,147 @@ fn assert_rope_parity_f16(cuda: &Device, batch: usize, seq: usize, hidden: usize
 }
 
 /// Behavioral boundary oracle: `rope_f16.cu` accumulates `x*cos +
-/// rotate_half(x)*sin*sign` in f32 and rounds to F16 exactly once — a
-/// `cos` table scaled well beyond `1.0` (a synthetic, non-unit-circle
-/// fixture; this op's real call site always uses genuine `cos`/`sin`
-/// values in `[-1, 1]`) pushes that final rounding beyond `F16_MAX`, which
-/// must saturate to `±inf`, never a silently clamped finite value.
+/// rotate_half(x)*sin*sign` in f32 and rounds to F16 exactly once, so an
+/// f32 accumulator that is FINITE but past `F16_OVERFLOW_TIE` must
+/// saturate to `±inf` at that one rounding — never a silently clamped
+/// finite value.
+///
+/// REWRITTEN, campaign #446 finding 7: the previous version built its
+/// `cos` table as `f16::from_f32(100_000.0)`. `100_000 > F16_MAX`, so the
+/// TABLE ITSELF was already `+inf` before the kernel ever read it, and
+/// `inf * x` is `inf` under any implementation — the assertion could not
+/// fail, and in particular could not distinguish "the final `__float2half`
+/// saturates correctly" (the thing under test) from "an infinity was
+/// propagated" (a different thing entirely, and not a property of this
+/// kernel). Every input here is now finite by construction and CHECKED to
+/// be, which is the vacuous-control guard: re-widening the fixture back
+/// past `F16_MAX` fails the fixture assertions instead of silently
+/// re-vacating the oracle.
+///
+/// The construction, stated: `cos[i] = F16_MAX` (65504.0 — the LARGEST
+/// FINITE f16, exactly representable, so the table is at the top of the
+/// finite range without leaving it) and `sin = 0` (isolating the `x*cos`
+/// term). The two arms straddle the rounding boundary using nothing but
+/// the `x` value:
+///
+///   * SATURATING arm, `x = 2`: the f32 accumulator is `2 * 65504 =
+///     131008` — finite in f32, and at/above `F16_OVERFLOW_TIE` (65520),
+///     so the final `__float2half` must produce `+inf`.
+///   * FINITE CONTROL arm, `x = 1`: the accumulator is exactly `65504` —
+///     `F16_MAX` itself, which rounds to a finite f16. This is what makes
+///     the saturating arm non-vacuous: a kernel (or harness) that
+///     returned `inf` unconditionally, or that had lost its inputs, fails
+///     HERE. The two arms differ in one scalar and nothing else.
+///
+/// Both arms are also compared against the SAME op's CPU f16 arm, which is
+/// an independent implementation of the same round-once contract, not a
+/// restatement of the CUDA one.
 #[test]
 fn rope_parity_f16_output_saturates_to_infinity_beyond_f16_max() {
     let Some(cuda) = cuda_device() else {
         return;
     };
+    let cpu = Device::Cpu;
     let hidden = 4;
     let period = 1;
-    let xv = [1.0f32, 2.0, 3.0, 4.0];
-    let xh: Vec<f16> = xv.iter().map(|&v| f16::from_f32(v)).collect();
-    // cos scaled so x*cos alone overflows F16_MAX (even at x's smallest
-    // value, 1.0) — 100_000 * 1.0 = 100_000 > F16_MAX; sin = 0 isolates
-    // the cos term.
-    let ch = vec![f16::from_f32(100_000.0); hidden * period];
+
+    // The cos table: FINITE, and at the very top of f16's finite range.
+    let cos_scale = F16_MAX;
+    let ch = vec![f16::from_f32(cos_scale); hidden * period];
     let sh = vec![f16::ZERO; hidden * period];
-    let x_gpu = Tensor::from_slice(&xh, (1, 1, period, hidden), &cuda).unwrap();
-    let cos_gpu = Tensor::from_slice(&ch, (1, 1, period, hidden), &cuda).unwrap();
-    let sin_gpu = Tensor::from_slice(&sh, (1, 1, period, hidden), &cuda).unwrap();
-    let out_gpu: Vec<f16> = rope(false, &x_gpu, &cos_gpu, &sin_gpu)
-        .unwrap()
-        .to_device(&Device::Cpu)
-        .unwrap()
-        .flatten_all()
-        .unwrap()
-        .to_vec1()
-        .unwrap();
-    assert!(
-        out_gpu.iter().all(|h| h.is_infinite()),
-        "expected every output element to saturate to +/-inf beyond F16_MAX ({F16_MAX}); \
-         got {out_gpu:?}"
+    // VACUOUS-CONTROL GUARD (the whole point of the rewrite): if this
+    // table is ever non-finite again, the oracle below proves nothing, so
+    // fail here rather than pass there.
+    for (i, c) in ch.iter().enumerate() {
+        assert_finite_f16(*c, &format!("rope f16 saturation fixture cos[{i}]"));
+    }
+    assert_eq!(
+        ch[0].to_f32(),
+        F16_MAX,
+        "fixture invariant: F16_MAX must round-trip through f16 exactly, so the table is \
+         EXACTLY the largest finite f16 and not something rounded"
     );
+
+    for (x_value, must_saturate) in [(2.0f32, true), (1.0f32, false)] {
+        let xh = vec![f16::from_f32(x_value); hidden];
+        for (i, x) in xh.iter().enumerate() {
+            assert_finite_f16(*x, &format!("rope f16 saturation fixture x[{i}]"));
+        }
+        // The f32 accumulator the kernel forms, computed here
+        // independently. It must be FINITE either way — that is what makes
+        // this a test of the final ROUNDING rather than of infinity
+        // propagation.
+        let accumulator = xh[0].to_f32() * ch[0].to_f32();
+        assert!(
+            accumulator.is_finite(),
+            "fixture invariant: the f32 accumulator ({accumulator}) must be finite, or this \
+             oracle degenerates into the inf-propagation test the rewrite exists to remove"
+        );
+        if must_saturate {
+            // KO-8 independent reference: `half::f16::from_f32` — the same
+            // conversion `__float2half` performs — really does saturate at
+            // this magnitude (and this call itself refuses a magnitude
+            // below `F16_OVERFLOW_TIE`, so the fixture cannot drift into
+            // the round-back-down band unnoticed).
+            assert_saturates_to_infinity(accumulator);
+        } else {
+            assert_eq!(
+                accumulator, F16_MAX,
+                "fixture invariant: the control arm's accumulator must land exactly on \
+                 F16_MAX, the largest finite f16"
+            );
+            assert_finite_f16(
+                f16::from_f32(accumulator),
+                "rope f16 saturation control-arm reference",
+            );
+        }
+
+        let run = |device: &Device| -> Vec<f16> {
+            let x_t = Tensor::from_slice(&xh, (1, 1, period, hidden), device).unwrap();
+            let cos_t = Tensor::from_slice(&ch, (1, 1, period, hidden), device).unwrap();
+            let sin_t = Tensor::from_slice(&sh, (1, 1, period, hidden), device).unwrap();
+            rope(false, &x_t, &cos_t, &sin_t)
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap()
+        };
+        let out_gpu = run(&cuda);
+        let out_cpu = run(&cpu);
+        assert_eq!(out_gpu.len(), hidden, "rope f16 GPU output length mismatch");
+
+        if must_saturate {
+            for (i, h) in out_gpu.iter().enumerate() {
+                assert!(
+                    h.is_infinite() && !h.is_sign_negative(),
+                    "x = {x_value}: the f32 accumulator ({accumulator}) is finite and at or \
+                     beyond F16_OVERFLOW_TIE, so element {i} must saturate to +inf at the \
+                     kernel's single f16 rounding; a finite answer here is a confident WRONG \
+                     number at the boundary. got {out_gpu:?}"
+                );
+            }
+        } else {
+            for (i, h) in out_gpu.iter().enumerate() {
+                assert_finite_f16(*h, &format!("rope f16 finite-control out[{i}]"));
+                assert_eq!(
+                    h.to_f32(),
+                    F16_MAX,
+                    "x = {x_value}: element {i} must be exactly F16_MAX -- if the kernel \
+                     saturated HERE too, the saturating arm above would be vacuous \
+                     (everything is inf) rather than a boundary oracle. got {out_gpu:?}"
+                );
+            }
+        }
+        assert_eq!(
+            out_gpu, out_cpu,
+            "x = {x_value}: the CUDA and CPU f16 arms must agree bit-for-bit at this \
+             boundary -- both are documented as accumulating in f32 and rounding to f16 \
+             exactly once"
+        );
+    }
 }
 
 /// Mirror-image boundary oracle (family D, the small-magnitude end):
@@ -2566,6 +2673,11 @@ fn softmax_parity_long_row_seq_512_class() {
     let sv = fixture(rows * last, 2.0);
     assert_softmax_parity_f32(&cuda, rows, last, &sv);
     assert_softmax_parity_bf16(&cuda, rows, last, &sv);
+    // Campaign #446, finding 7: the f16 leg was MISSING here while
+    // production reaches exactly this `last` on the f16 arm (ModernBERT's
+    // `attention_block` f16 path), so the shipped long-row f16 kernel had
+    // no parity oracle at all above `last = 8`.
+    assert_softmax_parity_f16(&cuda, rows, last, &sv);
 }
 
 #[test]
@@ -2580,6 +2692,53 @@ fn softmax_parity_non_power_of_two_last_dim() {
     let sv = fixture(rows * last, 3.0);
     assert_softmax_parity_f32(&cuda, rows, last, &sv);
     assert_softmax_parity_bf16(&cuda, rows, last, &sv);
+    // f16 leg added with the same finding-7 rationale as
+    // `softmax_parity_long_row_seq_512_class` above.
+    assert_softmax_parity_f16(&cuda, rows, last, &sv);
+}
+
+/// F16 coverage of EVERY row-length regime `softmax_f16.cu` actually has,
+/// on BOTH sides of each boundary (campaign #446, finding 7 — before this,
+/// the only f16 softmax parity shape in this file was `last = 8`).
+///
+/// The kernel has exactly one row-length structure: one block of
+/// `SM_BLOCK = 256` threads per row, with every pass over the row written
+/// as `for (i = threadIdx.x; i < last; i += blockDim.x)` (the fully-masked
+/// scan, the max pass, the sum pass, and the normalize pass — all four).
+/// So `SM_BLOCK` is the only boundary, and it splits three ways:
+///
+///   * `last < 256` — some threads NEVER enter the loop and carry their
+///     initialiser into the block reduction (`-INFINITY` for the max pass,
+///     `0.0` for the sum pass). A wrong initialiser is invisible at any
+///     larger `last`.
+///   * `last == 256` — every thread runs exactly one iteration; no idle
+///     lane, no tail.
+///   * `last > 256` — each thread ACCUMULATES across iterations before the
+///     block reduction, and unless `last` is a multiple of 256 some
+///     threads run one fewer iteration than others (the intra-row tail).
+///
+/// The shapes below cover: below (255, which is also a tail), exactly at
+/// (256), the first multi-iteration count (257, the most extreme tail —
+/// only thread 0 iterates twice), an exact multiple (1024 = 4x), a
+/// multiple-plus-tail (513), and `ops::MAX_LAST_DIM` itself (4096, the
+/// largest `last` the CUDA domain check admits — the legal side of the
+/// admission boundary). `last = 512` and `last = 300` are deliberately NOT
+/// repeated here; they are covered by the two named tests above.
+#[test]
+fn softmax_parity_f16_row_length_regimes() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let rows = 2;
+    for last in [255usize, 256, 257, 513, 1024, MAX_LAST_DIM] {
+        assert!(
+            last <= MAX_LAST_DIM,
+            "fixture invariant: last={last} must be inside the CUDA domain \
+             (MAX_LAST_DIM={MAX_LAST_DIM})"
+        );
+        let sv = fixture(rows * last, 1.0 + last as f32 * 0.001);
+        assert_softmax_parity_f16(&cuda, rows, last, &sv);
+    }
 }
 
 #[test]
@@ -3641,12 +3800,19 @@ fn geglu_parity_non_power_of_two_intermediate() {
         return;
     };
     // 300 is not a power of two and not a multiple of GEGLU_BLOCK (256) --
-    // exercises the grid-stride tail.
+    // exercises the grid-stride tail: n_out = 3*300 = 900 = 3 full blocks
+    // plus a 132-element tail.
     let rows = 3;
     let intermediate = 300;
     let wv = fixture(rows * 2 * intermediate, 3.0);
     assert_geglu_parity_f32(&cuda, rows, intermediate, &wv);
     assert_geglu_parity_bf16(&cuda, rows, intermediate, &wv);
+    // Campaign #446, finding 7: the f16 leg was MISSING on every geglu
+    // shape except `geglu_parity_contiguous_small` (n_out = 32, a SINGLE
+    // partial block), so the shipped f16 kernel's grid-stride TAIL — the
+    // `idx` values a launch's last block does not cover uniformly — had no
+    // oracle. This is the tail half of that gap.
+    assert_geglu_parity_f16(&cuda, rows, intermediate, &wv);
 }
 
 #[test]
@@ -3660,6 +3826,14 @@ fn geglu_parity_multi_block_exact_multiple_of_block_size() {
     let intermediate = 512;
     let wv = fixture(rows * 2 * intermediate, 4.0);
     assert_geglu_parity_f32(&cuda, rows, intermediate, &wv);
+    // Finding-7's multi-block half (see the tail half in
+    // `geglu_parity_non_power_of_two_intermediate`): four full blocks, so
+    // every thread of every block does exactly one iteration and the
+    // row/col decomposition `row = idx / intermediate` crosses a block
+    // boundary — the case a single-partial-block fixture cannot reach.
+    // bf16 already has multi-block coverage via
+    // `geglu_parity_production_width_modernbert_large` (n_out = 5248).
+    assert_geglu_parity_f16(&cuda, rows, intermediate, &wv);
 }
 
 #[test]

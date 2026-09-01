@@ -103,6 +103,18 @@ impl TestServer {
         format!("grpc://127.0.0.1:{}", self.flight_port)
     }
 
+    /// The server's `JAMMI_ARTIFACT_DIR` — the directory its catalog (default
+    /// SQLite at `<dir>/catalog.db`) and any other on-disk state live under. A
+    /// test that needs to seed a row the CLI itself has no write path for
+    /// (e.g. a training-job fixture; submission is SDK-only, never the CLI)
+    /// opens a second [`jammi_db::catalog::Catalog`] against the same
+    /// directory — safe because the backend runs WAL mode with a 5s busy
+    /// timeout, so the concurrent server subprocess and the test's own
+    /// connection don't collide.
+    pub fn artifact_dir(&self) -> &Path {
+        self._scratch.path()
+    }
+
     /// A `jammi` CLI command pre-pointed at this server's `--target`.
     pub fn cli(&self) -> AssertCommand {
         let mut cmd = AssertCommand::cargo_bin("jammi").expect("jammi-cli binary built");

@@ -1,13 +1,18 @@
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::cudarc::driver::PushKernelArg;
 use candle_core::{CudaStorage, DType, Error, Layout, Result, Shape};
-use half::bf16;
+use half::{bf16, f16};
 
-use super::PTX_SCALED_CAST_ADD;
+use super::{PTX_SCALED_CAST_ADD, PTX_SCALED_CAST_ADD_F16};
 
 /// The kernel module name PTX functions are loaded under — arbitrary, but
 /// stable and unique to this op (mirrors `crate::cuda::axpy::MODULE_NAME`).
 const MODULE_NAME: &str = "jammi_kernels_scaled_cast_add";
+
+/// The F16 arms' OWN PTX module name (campaign #443 W2c) —
+/// `scaled_cast_add_f16.cu` is a SEPARATE translation unit (see that file's
+/// module doc), so it needs a distinct module name from [`MODULE_NAME`].
+const MODULE_NAME_F16: &str = "jammi_kernels_scaled_cast_add_f16";
 
 pub(crate) fn cuda_fwd(
     scaling: f64,
@@ -54,15 +59,30 @@ pub(crate) fn cuda_fwd(
     if n == 0 {
         // Output dtype follows `base_dtype` (`s1`) regardless of
         // `lora_dtype` (`s2`) — the same rule the non-empty match below
-        // encodes across its four dtype-pair arms. Each tensor's dtype is
-        // validated independently (base first, matching the original
-        // match's arm order) before deferring the actual empty-alloc
-        // dispatch to the shared helper.
-        if !matches!(s1.dtype(), DType::F32 | DType::BF16) {
-            return Err(Error::UnsupportedDTypeForOp(s1.dtype(), "scaled_cast_add"));
-        }
-        if !matches!(s2.dtype(), DType::F32 | DType::BF16) {
-            return Err(Error::UnsupportedDTypeForOp(s2.dtype(), "scaled_cast_add"));
+        // encodes across its seven dtype-pair arms. The PAIR (not each
+        // dtype checked independently) is validated against the EXACT
+        // combinations the non-empty match dispatches: `BF16`+`F16` and
+        // `F16`+`BF16` are each independently a "known" dtype for this op
+        // on ONE operand, but neither pair is a supported COMBINATION (no
+        // such kernel exists) — checking each side separately would
+        // silently ADMIT that unsupported pair at `n == 0` while the
+        // non-empty match refuses it, exactly the shape-dependent dtype
+        // domain split campaign #443's D1 audit named for `alloc_empty`'s
+        // callers (family D). Matching the pair directly here closes it.
+        match (s1.dtype(), s2.dtype()) {
+            (DType::F32, DType::F32)
+            | (DType::F32, DType::BF16)
+            | (DType::BF16, DType::F32)
+            | (DType::BF16, DType::BF16)
+            | (DType::F16, DType::F32)
+            | (DType::F32, DType::F16)
+            | (DType::F16, DType::F16) => {}
+            (base_dtype, _) if !matches!(base_dtype, DType::F32 | DType::BF16 | DType::F16) => {
+                return Err(Error::UnsupportedDTypeForOp(base_dtype, "scaled_cast_add"));
+            }
+            (_, lora_dtype) => {
+                return Err(Error::UnsupportedDTypeForOp(lora_dtype, "scaled_cast_add"));
+            }
         }
         return Ok((
             super::alloc_empty(&device, s1.dtype(), "scaled_cast_add")?,
@@ -150,7 +170,61 @@ pub(crate) fn cuda_fwd(
             unsafe { builder.launch(cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
             Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
         }
-        (base_dtype, _) if !matches!(base_dtype, DType::F32 | DType::BF16) => {
+        (DType::F16, DType::F32) => {
+            let base = s1.as_cuda_slice::<f16>()?.slice(o1_base..o2_base);
+            let lora = s2.as_cuda_slice::<f32>()?.slice(o1_lora..o2_lora);
+            let func = device.get_or_load_custom_func(
+                "scaled_cast_add_f16_f32",
+                MODULE_NAME_F16,
+                PTX_SCALED_CAST_ADD_F16,
+            )?;
+            let out = unsafe { device.alloc::<f16>(n) }?;
+            let mut builder = func.builder();
+            builder.arg(&scaling_f32);
+            builder.arg(&base);
+            builder.arg(&lora);
+            builder.arg(&out);
+            builder.arg(&n);
+            unsafe { builder.launch(cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
+            Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
+        }
+        (DType::F32, DType::F16) => {
+            let base = s1.as_cuda_slice::<f32>()?.slice(o1_base..o2_base);
+            let lora = s2.as_cuda_slice::<f16>()?.slice(o1_lora..o2_lora);
+            let func = device.get_or_load_custom_func(
+                "scaled_cast_add_f32_f16",
+                MODULE_NAME_F16,
+                PTX_SCALED_CAST_ADD_F16,
+            )?;
+            let out = unsafe { device.alloc::<f32>(n) }?;
+            let mut builder = func.builder();
+            builder.arg(&scaling_f32);
+            builder.arg(&base);
+            builder.arg(&lora);
+            builder.arg(&out);
+            builder.arg(&n);
+            unsafe { builder.launch(cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
+            Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
+        }
+        (DType::F16, DType::F16) => {
+            let base = s1.as_cuda_slice::<f16>()?.slice(o1_base..o2_base);
+            let lora = s2.as_cuda_slice::<f16>()?.slice(o1_lora..o2_lora);
+            let func = device.get_or_load_custom_func(
+                "scaled_cast_add_f16_f16",
+                MODULE_NAME_F16,
+                PTX_SCALED_CAST_ADD_F16,
+            )?;
+            let out = unsafe { device.alloc::<f16>(n) }?;
+            let mut builder = func.builder();
+            builder.arg(&scaling_f32);
+            builder.arg(&base);
+            builder.arg(&lora);
+            builder.arg(&out);
+            builder.arg(&n);
+            unsafe { builder.launch(cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
+            Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
+        }
+        (base_dtype, _) if !matches!(base_dtype, DType::F32 | DType::BF16 | DType::F16) => {
             Err(Error::UnsupportedDTypeForOp(base_dtype, "scaled_cast_add"))
         }
         (_, lora_dtype) => Err(Error::UnsupportedDTypeForOp(lora_dtype, "scaled_cast_add")),

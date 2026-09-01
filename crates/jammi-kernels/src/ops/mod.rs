@@ -179,7 +179,7 @@ pub use axpy::Axpy;
 /// itself becoming a public module.
 #[cfg(feature = "cuda")]
 pub use cast_scale::{cast_add_bf16_into, cast_scale_bf16_f32_into};
-pub use cast_scale::{CastAddBf16, CastScaleBf16F32};
+pub use cast_scale::{CastAddBf16, CastAddF16, CastScaleBf16F32, CastScaleF16F32};
 pub use dropout::{DropoutFused, PhiloxKatProbe};
 #[cfg(feature = "flash-attn")]
 pub use flash_attention::{

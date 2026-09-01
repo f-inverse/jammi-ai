@@ -195,10 +195,22 @@
 //! `JAMMI_KERNELS_DISABLE=cast_scale_bf16_f32` / `cast_add_bf16` force the
 //! ORIGINAL two-kernel eager composition back on for a same-build forced
 //! A/B, and a zero-dispatch run is observable (never silently green).
+//!
+//! ## [`CastScaleF16F32`] / [`CastAddF16`] — F16 analogs, campaign #443 W2c
+//!
+//! [`CastScaleBf16F32`] and [`CastAddBf16`] are domain-restricted to `BF16`
+//! BY CONSTRUCTION (see each type's own doc) — an F16 analog is therefore a
+//! NEW, independent pair of types, not a widened match arm on either
+//! existing one (per the per-op f16 reference-regime table's own structural
+//! finding, `docs/maintainer/cuda-kernel-guide.md` §3.10). See each new
+//! type's own doc for its double-rounding-safety margin at F16's narrower
+//! (11-bit, vs BF16's 8-bit) significand — the classical bound holds with
+//! EQUALITY rather than comfortable headroom, worth stating explicitly
+//! rather than assuming BF16's argument transfers unchanged.
 
 use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, CustomOp1, CustomOp2, DType, Error, Layout, Result, Shape, Tensor};
-use half::bf16;
+use half::{bf16, f16};
 
 use crate::layout_walk::StridedOffsets;
 
@@ -379,6 +391,201 @@ fn cast_add_bf16(base: &[bf16], lb: &Layout, f32val: &[f32], lf: &Layout) -> Vec
         .zip(StridedOffsets::from_layout(lf))
         .map(|(ib, il)| {
             let delta = bf16::from_f32(f32val[il]);
+            base[ib] + delta
+        })
+        .collect()
+}
+
+/// [`CastScaleBf16F32`]'s F16 analog (campaign #443 W2c): `out = f32(x) *
+/// scale + 0.0`, `x` required `F16`. This is a NEW, independent type — not
+/// a widened match arm on [`CastScaleBf16F32`] — per the per-op f16
+/// reference-regime table's own structural finding
+/// (`docs/maintainer/cuda-kernel-guide.md` §3.10): `CastScaleBf16F32` is
+/// domain-restricted to `BF16` BY CONSTRUCTION (its own name and doc state
+/// this), so an F16 analog is genuine kernel authoring, mirroring the SAME
+/// `+ 0.0` signed-zero-identity argument [`CastScaleBf16F32`]'s own doc
+/// makes (unchanged by the substituted dtype — IEEE754 signed-zero
+/// arithmetic does not depend on the narrow format being widened FROM).
+///
+/// **Double-rounding-safety margin, at the boundary rather than far past
+/// it.** `CastScaleBf16F32`'s CPU arm needs no such argument (its input is
+/// already `BF16`, one widen-then-round is the whole computation); THIS
+/// op's own domain doc states the general concern for F16-boundary work:
+/// F32's 24-bit significand against F16's 11-bit (10 stored + implicit)
+/// significand is a 13-bit margin — `24 >= 2*11+2` holds with EQUALITY
+/// (`24 == 24`), not with room to spare the way BF16's 16-bit margin
+/// against F32 has. This op computes only ONE rounding (f32 multiply, one
+/// round to F16 on the way out — no intermediate narrow-precision value at
+/// all), so the classical double-rounding hazard (which requires an
+/// intermediate ALSO being rounded) does not arise here regardless of
+/// margin size; the margin is stated because a future caller composing
+/// this op's F32 output with a SECOND F16 rounding step would be operating
+/// exactly at that boundary, not comfortably past it.
+///
+/// STATELESS BY CONSTRUCTION (`Copy`, see `ops`'s module doc).
+#[derive(Debug, Clone, Copy)]
+pub struct CastScaleF16F32 {
+    pub scale: f64,
+}
+
+impl CastScaleF16F32 {
+    pub fn new(scale: f64) -> Self {
+        Self { scale }
+    }
+}
+
+impl super::sealed::Sealed for CastScaleF16F32 {}
+
+impl CustomOp1 for CastScaleF16F32 {
+    fn name(&self) -> &'static str {
+        "cast_scale_f16_f32"
+    }
+
+    fn cpu_fwd(&self, s1: &CpuStorage, l1: &Layout) -> Result<(CpuStorage, Shape)> {
+        match s1 {
+            CpuStorage::F16(x) => {
+                let out = cast_scale_f16_f32(self.scale, x, l1);
+                Ok((CpuStorage::F32(out), l1.shape().clone()))
+            }
+            s1 => Err(Error::UnsupportedDTypeForOp(s1.dtype(), self.name())),
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        s1: &candle_core::CudaStorage,
+        l1: &Layout,
+    ) -> Result<(candle_core::CudaStorage, Shape)> {
+        crate::cuda::cast_scale::cuda_fwd_cast_scale_f16_f32(self.scale, s1, l1)
+    }
+
+    /// [`CastScaleBf16F32::bwd`]'s exact twin, substituting `half::f16`.
+    fn bwd(&self, arg: &Tensor, _res: &Tensor, grad_res: &Tensor) -> Result<Option<Tensor>> {
+        let d = grad_res.affine(self.scale, 0.0)?;
+        let d = if arg.dtype() == d.dtype() {
+            d
+        } else {
+            d.to_dtype(arg.dtype())?
+        };
+        Ok(Some(d))
+    }
+}
+
+/// [`cast_scale_bf16_f32`]'s exact twin, substituting `half::f16`. Fixed
+/// fold order (family J): `StridedOffsets` walked in the same sequence for
+/// a given layout every time.
+fn cast_scale_f16_f32(scale: f64, x: &[f16], lx: &Layout) -> Vec<f32> {
+    let scale = scale as f32;
+    StridedOffsets::from_layout(lx)
+        .map(|ix| x[ix].to_f32() * scale + 0.0f32)
+        .collect()
+}
+
+/// [`CastAddBf16`]'s F16 analog (campaign #443 W2c): `out = base +
+/// round_to_f16(f32val)`, `base` required `F16`, `f32val` required `F32`,
+/// identical shape (not broadcasting). A NEW, independent type for the SAME
+/// structural reason [`CastScaleF16F32`]'s doc states — `CastAddBf16` is
+/// domain-restricted to `BF16` by construction.
+///
+/// **CPU arm and the double-rounding argument, restated at F16's margin.**
+/// `half::f16`'s own `Add` impl (mirroring `half::bf16::Add`, which
+/// `CastAddBf16`'s own doc cites) widens both operands to `f32`, adds, and
+/// rounds back to `f16` ONCE. F32's 24-bit significand against F16's 11-bit
+/// is a 13-bit margin (`24 >= 2*11+2` holds with EQUALITY) — see
+/// [`CastScaleF16F32`]'s doc for the same margin note. `base` and `delta`
+/// (rounded down from `f32val` just before the add) are both F16-precision
+/// operands here, exactly the situation the classical double-rounding-safety
+/// bound covers, and equality still satisfies the bound (non-strict:
+/// `>=`), so `round_f16(round_f32(a + b)) == round_f16(a + b)` continues to
+/// hold for F16-representable `a`, `b` at this narrower margin — the CPU
+/// arm's widen-add-round idiom remains exact, not merely "close enough at
+/// this dtype too."
+///
+/// STATELESS BY CONSTRUCTION (`Copy`): no construction data, mirroring
+/// [`CastAddBf16`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CastAddF16;
+
+impl CastAddF16 {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl super::sealed::Sealed for CastAddF16 {}
+
+impl CustomOp2 for CastAddF16 {
+    fn name(&self) -> &'static str {
+        "cast_add_f16"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        if l1.dims() != l2.dims() {
+            return Err(Error::ShapeMismatchBinaryOp {
+                lhs: l1.shape().clone(),
+                rhs: l2.shape().clone(),
+                op: self.name(),
+            });
+        }
+        match (s1, s2) {
+            (CpuStorage::F16(base), CpuStorage::F32(f32val)) => {
+                let out = cast_add_f16(base, l1, f32val, l2);
+                Ok((CpuStorage::F16(out), l1.shape().clone()))
+            }
+            (s1, s2) => {
+                if s1.dtype() != DType::F16 {
+                    Err(Error::UnsupportedDTypeForOp(s1.dtype(), self.name()))
+                } else {
+                    Err(Error::UnsupportedDTypeForOp(s2.dtype(), self.name()))
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        s1: &candle_core::CudaStorage,
+        l1: &Layout,
+        s2: &candle_core::CudaStorage,
+        l2: &Layout,
+    ) -> Result<(candle_core::CudaStorage, Shape)> {
+        crate::cuda::cast_scale::cuda_fwd_cast_add_f16(s1, l1, s2, l2)
+    }
+
+    /// [`CastAddBf16::bwd`]'s exact twin.
+    fn bwd(
+        &self,
+        _base: &Tensor,
+        f32val: &Tensor,
+        _res: &Tensor,
+        grad_res: &Tensor,
+    ) -> Result<(Option<Tensor>, Option<Tensor>)> {
+        let d_base = grad_res.clone();
+        let d_f32val = if grad_res.dtype() == f32val.dtype() {
+            grad_res.clone()
+        } else {
+            grad_res.to_dtype(f32val.dtype())?
+        };
+        Ok((Some(d_base), Some(d_f32val)))
+    }
+}
+
+/// [`cast_add_bf16`]'s exact twin, substituting `half::f16`. Fixed fold
+/// order (family J), and the double-rounding-safety argument
+/// [`CastAddF16`]'s doc states.
+fn cast_add_f16(base: &[f16], lb: &Layout, f32val: &[f32], lf: &Layout) -> Vec<f16> {
+    StridedOffsets::from_layout(lb)
+        .zip(StridedOffsets::from_layout(lf))
+        .map(|(ib, il)| {
+            let delta = f16::from_f32(f32val[il]);
             base[ib] + delta
         })
         .collect()
@@ -1053,6 +1260,300 @@ mod tests {
                 vec![bf16::from_f32(1.0), bf16::from_f32(4.0)],
                 vec![bf16::from_f32(2.0), bf16::from_f32(5.0)],
                 vec![bf16::from_f32(3.0), bf16::from_f32(6.0)],
+            ]
+        );
+    }
+
+    // ---- CastScaleF16F32 / CastAddF16 (campaign #443 W2c) ----
+
+    fn cast_scale_f16(scale: f64, x: &Tensor) -> Result<Tensor> {
+        crate::ops::apply1(x, CastScaleF16F32::new(scale))
+    }
+
+    fn cast_add_f16_op(base: &Tensor, f32val: &Tensor) -> Result<Tensor> {
+        crate::ops::apply2(base, f32val, CastAddF16::new())
+    }
+
+    #[test]
+    fn cast_scale_f16_op_name_is_pinned() {
+        assert_eq!(CastScaleF16F32::new(1.0).name(), "cast_scale_f16_f32");
+    }
+
+    #[test]
+    fn cast_scale_f16_cpu_fwd_matches_hand_computed_values() {
+        let device = Device::Cpu;
+        let xv = [f16::from_f32(1.5), f16::from_f32(-2.25), f16::from_f32(0.0)];
+        let x = Tensor::from_slice(&xv, (3,), &device).unwrap();
+        let out = cast_scale_f16(2.0, &x).unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(out.as_slice(), [3.0f32, -4.5, 0.0]);
+    }
+
+    #[test]
+    fn cast_scale_f16_bit_identical_to_the_eager_two_kernel_chain_at_production_amplitude() {
+        // Mirrors `bit_identical_to_the_eager_two_kernel_chain_at_production_amplitude`
+        // (the BF16 op's own oracle), substituting F16 and its own boundary
+        // values.
+        let device = Device::Cpu;
+        let n = 4096usize;
+        let mut xv: Vec<f16> = (0..n)
+            .map(|i| f16::from_f32(((i as f32 * 0.017).sin()) * 60.0))
+            .collect();
+        xv[0] = f16::from_f32(0.0);
+        xv[1] = f16::from_f32(-0.0);
+        xv[2] = f16::from_bits(0x0001); // smallest positive f16 subnormal
+        xv[3] = f16::from_bits(0x8001); // smallest negative f16 subnormal
+        xv[4] = f16::MIN_POSITIVE;
+
+        let x = Tensor::from_slice(&xv, (n,), &device).unwrap();
+        let scale = 0.11048_f64;
+
+        let fused = cast_scale_f16(scale, &x).unwrap().to_vec1::<f32>().unwrap();
+        let eager = x
+            .to_dtype(DType::F32)
+            .unwrap()
+            .affine(scale, 0.0)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        let fused_finite = fused.iter().filter(|v| v.is_finite()).count();
+        let eager_finite = eager.iter().filter(|v| v.is_finite()).count();
+        assert_eq!(fused_finite, n, "fused arm produced a non-finite element");
+        assert_eq!(eager_finite, n, "eager arm produced a non-finite element");
+
+        for i in 0..n {
+            assert!(
+                fused[i].to_bits() == eager[i].to_bits(),
+                "index {i}: fused {} (bits {:#010x}) != eager {} (bits {:#010x})",
+                fused[i],
+                fused[i].to_bits(),
+                eager[i],
+                eager[i].to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn cast_scale_f16_red_control_a_missing_plus_zero_diverges_on_negative_zero() {
+        // Same non-vacuity control as the BF16 op's own — the `+ 0.0`
+        // identity's load-bearing role does not depend on which 16-bit
+        // dtype is widened FROM.
+        let scale = 3.0_f32;
+        let neg_zero = f16::from_f32(-0.0);
+        let correct = neg_zero.to_f32() * scale + 0.0f32;
+        let wrong = neg_zero.to_f32() * scale;
+        assert_eq!(correct.to_bits(), 0f32.to_bits());
+        assert_eq!(wrong.to_bits(), (-0.0f32).to_bits());
+        assert_ne!(
+            correct.to_bits(),
+            wrong.to_bits(),
+            "RED control did not diverge — the +0.0 oracle would be vacuous"
+        );
+    }
+
+    #[test]
+    fn cast_scale_f16_empty_tensor_is_a_no_op_not_an_error() {
+        let device = Device::Cpu;
+        let x = Tensor::from_slice(&[] as &[f16], (0,), &device).unwrap();
+        let out = cast_scale_f16(3.0, &x).unwrap().to_vec1::<f32>().unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn cast_scale_f16_bf16_input_is_refused_with_a_typed_error() {
+        // This op's domain is F16-only (mirroring `CastScaleBf16F32`'s
+        // BF16-only domain) — a BF16 input (a DIFFERENT 16-bit dtype, not
+        // merely "any wrong dtype") must still be refused, never silently
+        // reinterpreted.
+        let device = Device::Cpu;
+        let x =
+            Tensor::from_slice(&[bf16::from_f32(1.0), bf16::from_f32(2.0)], (2,), &device).unwrap();
+        let err = cast_scale_f16(1.0, &x)
+            .expect_err("BF16 input must be refused, not silently treated as F16");
+        assert!(matches!(err, Error::UnsupportedDTypeForOp(DType::BF16, ..)));
+    }
+
+    #[test]
+    fn cast_scale_f16_non_contiguous_view_is_still_correct_on_cpu() {
+        let device = Device::Cpu;
+        let xv: Vec<f16> = (1..=6).map(|i| f16::from_f32(i as f32)).collect();
+        let x = Tensor::from_slice(&xv, (2, 3), &device)
+            .unwrap()
+            .t()
+            .unwrap();
+        assert!(!x.is_contiguous());
+        let out = cast_scale_f16(2.0, &x).unwrap().to_vec2::<f32>().unwrap();
+        assert_eq!(out, vec![vec![2.0, 8.0], vec![4.0, 10.0], vec![6.0, 12.0]]);
+    }
+
+    #[test]
+    fn cast_add_f16_op_name_is_pinned() {
+        assert_eq!(CastAddF16::new().name(), "cast_add_f16");
+    }
+
+    #[test]
+    fn cast_add_f16_cpu_fwd_matches_hand_computed_values() {
+        let device = Device::Cpu;
+        let base =
+            Tensor::from_slice(&[f16::from_f32(1.0), f16::from_f32(-2.0)], (2,), &device).unwrap();
+        let f32val = Tensor::from_slice(&[0.5f32, 3.25], (2,), &device).unwrap();
+        let out = cast_add_f16_op(&base, &f32val)
+            .unwrap()
+            .to_vec1::<f16>()
+            .unwrap();
+        let expected = [
+            f16::from_f32(1.0) + f16::from_f32(0.5),
+            f16::from_f32(-2.0) + f16::from_f32(3.25),
+        ];
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn cast_add_f16_bit_identical_to_the_eager_two_kernel_chain_at_production_amplitude() {
+        let device = Device::Cpu;
+        let n = 4096usize;
+        let mut base_v: Vec<f16> = (0..n)
+            .map(|i| f16::from_f32(((i as f32 * 0.013).cos()) * 60.0))
+            .collect();
+        let mut f32_v: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.029).sin()) * 3.7).collect();
+        base_v[0] = f16::from_f32(0.0);
+        base_v[1] = f16::from_f32(-0.0);
+        f32_v[0] = 0.0;
+        f32_v[1] = -0.0;
+        f32_v[2] = f32::MIN_POSITIVE;
+        f32_v[3] = -f32::MIN_POSITIVE;
+        f32_v[4] = f32::from_bits(1);
+
+        let base = Tensor::from_slice(&base_v, (n,), &device).unwrap();
+        let f32val = Tensor::from_slice(&f32_v, (n,), &device).unwrap();
+
+        let fused = cast_add_f16_op(&base, &f32val)
+            .unwrap()
+            .to_vec1::<f16>()
+            .unwrap();
+        // Portable mathematical reference: cast f32val to f16, then add in
+        // f16 (round-to-nearest-even) — the same "hand-computed, not a
+        // literal Tensor::add" discipline the BF16 op's own oracle states
+        // (candle-core's CPU Add for narrow dtypes on a NEON host is not a
+        // portable oracle at production width; `half::f16::Add` IS
+        // round-to-nearest and IS what this reference reproduces).
+        let eager: Vec<f16> = base_v
+            .iter()
+            .zip(f32_v.iter())
+            .map(|(&b, &f)| b + f16::from_f32(f))
+            .collect();
+
+        let fused_finite = fused.iter().filter(|v| v.to_f32().is_finite()).count();
+        let eager_finite = eager.iter().filter(|v| v.to_f32().is_finite()).count();
+        assert_eq!(fused_finite, n, "fused arm produced a non-finite element");
+        assert_eq!(eager_finite, n, "eager arm produced a non-finite element");
+
+        for i in 0..n {
+            assert!(
+                fused[i].to_bits() == eager[i].to_bits(),
+                "index {i}: fused {} (bits {:#06x}) != eager {} (bits {:#06x})",
+                fused[i],
+                fused[i].to_bits(),
+                eager[i],
+                eager[i].to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn cast_add_f16_red_control_rounding_after_the_add_instead_of_before_diverges() {
+        // F16's own twin of the BF16 op's rounding-order non-vacuity
+        // control: a value chosen so "round f32val to f16 FIRST, then add"
+        // and "accumulate in f32, round once" pick DIFFERENT nearest f16
+        // values. `base = 1.0`; f16's ULP near 1.0 is 2^-10 = 0.0009765625,
+        // so the round-to-zero/round-to-ULP halfway point for a small
+        // `f32val` treated on its own is ~0.00048828125. `f32val =
+        // 0.0004884` sits JUST ABOVE that halfway point: rounded ALONE
+        // (`f16::from_f32(f32val)`) it is close enough to the halfway line
+        // that adding it to `1.0` in f16-native arithmetic (both operands
+        // already f16-precision) still resolves to `1.0` exactly, whereas
+        // accumulating `1.0 + f32val` at FULL f32 precision first pushes
+        // the true sum just past the halfway point BETWEEN `1.0` and the
+        // next f16 above it, rounding UP to `1.0009766` instead — an
+        // exhaustive brute-force search (0.1 microstep, `half` crate,
+        // documented here rather than re-derived by hand: see this
+        // fixture's own hand-off report) confirmed this is a genuine
+        // divergence, not a hand-calculation error.
+        let base = f16::from_f32(1.0);
+        let f32val = 0.0004884_f32;
+        let correct = base + f16::from_f32(f32val); // round f32val to f16 FIRST, then add
+        let wrong = f16::from_f32(base.to_f32() + f32val); // accumulate-then-round-once
+        assert_eq!(
+            correct,
+            f16::from_f32(1.0),
+            "fixture invariant: correct arm expected 1.0"
+        );
+        assert_eq!(
+            wrong,
+            f16::from_f32(1.0009766),
+            "fixture invariant: wrong arm expected the next f16 above 1.0"
+        );
+        assert_ne!(
+            correct.to_bits(),
+            wrong.to_bits(),
+            "RED control did not diverge — the rounding-order oracle would be vacuous"
+        );
+    }
+
+    #[test]
+    fn cast_add_f16_empty_tensor_is_a_no_op_not_an_error() {
+        let device = Device::Cpu;
+        let base = Tensor::from_slice(&[] as &[f16], (0,), &device).unwrap();
+        let f32val = Tensor::from_slice(&[] as &[f32], (0,), &device).unwrap();
+        let out = cast_add_f16_op(&base, &f32val)
+            .unwrap()
+            .to_vec1::<f16>()
+            .unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn cast_add_f16_shape_mismatch_is_refused_not_broadcast() {
+        let device = Device::Cpu;
+        let base =
+            Tensor::from_slice(&[f16::from_f32(1.0), f16::from_f32(2.0)], (2,), &device).unwrap();
+        let f32val = Tensor::from_slice(&[1.0f32, 2.0, 3.0], (3,), &device).unwrap();
+        let err = cast_add_f16_op(&base, &f32val)
+            .expect_err("mismatched shapes must not silently broadcast");
+        assert!(matches!(err, Error::ShapeMismatchBinaryOp { .. }));
+    }
+
+    #[test]
+    fn cast_add_f16_bf16_base_is_refused_with_a_typed_error() {
+        let device = Device::Cpu;
+        let base =
+            Tensor::from_slice(&[bf16::from_f32(1.0), bf16::from_f32(2.0)], (2,), &device).unwrap();
+        let f32val = Tensor::from_slice(&[1.0f32, 2.0], (2,), &device).unwrap();
+        let err = cast_add_f16_op(&base, &f32val)
+            .expect_err("BF16 base must be refused, not treated as F16");
+        assert!(matches!(err, Error::UnsupportedDTypeForOp(DType::BF16, ..)));
+    }
+
+    #[test]
+    fn cast_add_f16_non_contiguous_view_is_still_correct_on_cpu() {
+        let device = Device::Cpu;
+        let base_v: Vec<f16> = (1..=6).map(|i| f16::from_f32(i as f32)).collect();
+        let base = Tensor::from_slice(&base_v, (2, 3), &device)
+            .unwrap()
+            .t()
+            .unwrap();
+        assert!(!base.is_contiguous());
+        let f32val = Tensor::from_slice(&[0.0f32; 6], (3, 2), &device).unwrap();
+        let out = cast_add_f16_op(&base, &f32val)
+            .unwrap()
+            .to_vec2::<f16>()
+            .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                vec![f16::from_f32(1.0), f16::from_f32(4.0)],
+                vec![f16::from_f32(2.0), f16::from_f32(5.0)],
+                vec![f16::from_f32(3.0), f16::from_f32(6.0)],
             ]
         );
     }

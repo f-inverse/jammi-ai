@@ -48,10 +48,16 @@
 //!    `softmax`) — distinct from "single point" because it exercises the
 //!    reduction machinery at a nontrivial size while still being
 //!    analytically exact.
-//! 4. **Out-of-range** — a magnitude at or beyond `F16_MAX`, and a
-//!    magnitude at or below `F16_MIN_POSITIVE_SUBNORMAL`, run through
-//!    `assert_saturates_to_infinity` / `assert_underflows_to_zero` below,
-//!    not through the op's ordinary tolerance-vs-reference comparison.
+//! 4. **Out-of-range** — a magnitude at or beyond `F16_MAX` (run through
+//!    `assert_saturates_to_infinity`), and — for the underflow-to-zero
+//!    contract — a magnitude at or below `F16_UNDERFLOW_TIE` (HALF of
+//!    `F16_MIN_POSITIVE_SUBNORMAL`, run through `assert_underflows_to_zero`).
+//!    A magnitude strictly BETWEEN `F16_UNDERFLOW_TIE` and
+//!    `F16_MIN_POSITIVE_SUBNORMAL` is a DIFFERENT boundary case — it rounds
+//!    UP to the nonzero subnormal under round-to-nearest-even, not down to
+//!    zero (see `F16_UNDERFLOW_TIE`'s own doc) — and must never be run
+//!    through `assert_underflows_to_zero`, which now refuses it. Neither
+//!    band is covered by the op's ordinary tolerance-vs-reference comparison.
 
 use half::f16;
 
@@ -73,6 +79,30 @@ pub const F16_MIN_POSITIVE_NORMAL: f32 = 6.103_515_6e-5; // 2^-14
 /// finite value with a smaller magnitude rounds to exact zero. `no-
 /// producer: derived from f16's format` (`2^-14 * 2^-10`).
 pub const F16_MIN_POSITIVE_SUBNORMAL: f32 = 5.960_464_5e-8; // 2^-24
+
+/// The round-to-zero / round-to-subnormal TIE point for f16's underflow
+/// boundary: exactly HALF of [`F16_MIN_POSITIVE_SUBNORMAL`] (`2^-25`).
+/// This — NOT `F16_MIN_POSITIVE_SUBNORMAL` itself — is the true domain
+/// boundary [`assert_underflows_to_zero`] validates against.
+///
+/// Under IEEE754 round-to-nearest-EVEN: a magnitude strictly between `0`
+/// and this tie rounds DOWN to exact zero; a magnitude strictly between
+/// this tie and `F16_MIN_POSITIVE_SUBNORMAL` rounds UP to the NONZERO
+/// subnormal (`F16_MIN_POSITIVE_SUBNORMAL` itself) — despite still being
+/// smaller than `F16_MIN_POSITIVE_SUBNORMAL`, it does NOT underflow to
+/// zero. The exact tie value rounds to zero: the two nearest representable
+/// f16 values are `0` and `F16_MIN_POSITIVE_SUBNORMAL`, and zero's mantissa
+/// (all bits clear) is the "even" one of the pair, so ties-to-even picks it.
+///
+/// A phase-4 audit found this crate's stated underflow domain FALSE: an
+/// earlier revision of [`assert_underflows_to_zero`] (and this module's own
+/// checklist above, and two `tests/cuda_parity.rs` fixtures) claimed the
+/// boundary was "at or below `F16_MIN_POSITIVE_SUBNORMAL`" — which silently
+/// mis-describes the entire `(F16_UNDERFLOW_TIE, F16_MIN_POSITIVE_SUBNORMAL)`
+/// half of that band, where the true IEEE754 outcome is a nonzero subnormal,
+/// not zero. `no-producer: derived from f16's format (half of
+/// F16_MIN_POSITIVE_SUBNORMAL's own derivation)`.
+pub const F16_UNDERFLOW_TIE: f32 = F16_MIN_POSITIVE_SUBNORMAL / 2.0; // 2^-25
 
 /// BEHAVIORAL saturation contract: an `x` STRICTLY BEYOND [`F16_MAX`] in
 /// magnitude converts to `±inf` under round-to-nearest (IEEE754 binary16
@@ -104,15 +134,24 @@ pub fn assert_saturates_to_infinity(x: f32) {
     );
 }
 
-/// BEHAVIORAL underflow contract: an `x` strictly between `0` and
-/// [`F16_MIN_POSITIVE_SUBNORMAL`] in magnitude rounds to EXACT zero (never
-/// a subnormal wraparound, never a sign flip) — the mirror-image boundary
-/// case to [`assert_saturates_to_infinity`] at the small-magnitude end.
+/// BEHAVIORAL underflow contract: an `x` with magnitude strictly greater
+/// than `0` and AT OR BELOW [`F16_UNDERFLOW_TIE`] (half of
+/// [`F16_MIN_POSITIVE_SUBNORMAL`]) rounds to EXACT zero under
+/// round-to-nearest-even (never a subnormal wraparound, never a sign
+/// flip) — the mirror-image boundary case to [`assert_saturates_to_infinity`]
+/// at the small-magnitude end. A magnitude strictly ABOVE the tie but still
+/// below `F16_MIN_POSITIVE_SUBNORMAL` is OUTSIDE this contract's domain —
+/// see [`F16_UNDERFLOW_TIE`]'s doc: it rounds UP to the nonzero subnormal,
+/// not to zero, and this function refuses (panics on) that input rather
+/// than silently asserting the wrong outcome for it.
 pub fn assert_underflows_to_zero(x: f32) {
     assert!(
-        x != 0.0 && x.abs() < F16_MIN_POSITIVE_SUBNORMAL,
-        "assert_underflows_to_zero called on a magnitude ({x}) that is not strictly below \
-         f16's smallest subnormal ({F16_MIN_POSITIVE_SUBNORMAL})"
+        x != 0.0 && x.abs() <= F16_UNDERFLOW_TIE,
+        "assert_underflows_to_zero called on a magnitude ({x}) outside its TRUE domain: \
+         nonzero and at or below the round-to-zero/round-to-subnormal tie \
+         (F16_UNDERFLOW_TIE = {F16_UNDERFLOW_TIE} = F16_MIN_POSITIVE_SUBNORMAL/2) -- a magnitude \
+         in (F16_UNDERFLOW_TIE, F16_MIN_POSITIVE_SUBNORMAL) rounds UP to the nonzero subnormal \
+         under round-to-nearest-even, not to zero (see F16_UNDERFLOW_TIE's own doc)"
     );
     let h = f16::from_f32(x);
     assert_eq!(
@@ -255,9 +294,56 @@ mod tests {
 
     #[test]
     fn underflows_to_zero_below_the_subnormal_floor_both_signs() {
-        assert_underflows_to_zero(F16_MIN_POSITIVE_SUBNORMAL / 2.0);
-        assert_underflows_to_zero(-F16_MIN_POSITIVE_SUBNORMAL / 2.0);
+        assert_underflows_to_zero(F16_UNDERFLOW_TIE * 0.99);
+        assert_underflows_to_zero(-F16_UNDERFLOW_TIE * 0.99);
         assert_underflows_to_zero(1.0e-30);
+    }
+
+    /// The exact tie ([`F16_UNDERFLOW_TIE`]) itself rounds to zero
+    /// (ties-to-even picks the zero mantissa) — pinned on its own since it
+    /// is the boundary VALUE itself, not merely a value close to it.
+    #[test]
+    fn underflows_to_zero_at_the_exact_tie_both_signs() {
+        assert_underflows_to_zero(F16_UNDERFLOW_TIE);
+        assert_underflows_to_zero(-F16_UNDERFLOW_TIE);
+    }
+
+    /// The band boundary, pinned from BOTH sides (phase-4 audit fix): a
+    /// magnitude strictly ABOVE the tie but still strictly BELOW
+    /// `F16_MIN_POSITIVE_SUBNORMAL` rounds UP to the nonzero subnormal, not
+    /// down to zero — the exact band the old "at or below
+    /// F16_MIN_POSITIVE_SUBNORMAL" domain claim got wrong. Two halves: (a)
+    /// `assert_underflows_to_zero` must now REFUSE this input (outside its
+    /// documented domain); (b) the actual f16 conversion in this band is
+    /// independently checked NONZERO, both signs, so "rounds to the
+    /// subnormal, not zero" is demonstrated, not merely asserted.
+    #[test]
+    fn magnitude_between_tie_and_full_subnormal_rounds_up_not_to_zero() {
+        let x = (F16_UNDERFLOW_TIE + F16_MIN_POSITIVE_SUBNORMAL) / 2.0; // midpoint of the open band
+        assert!(
+            x > F16_UNDERFLOW_TIE && x < F16_MIN_POSITIVE_SUBNORMAL,
+            "fixture invariant: x must sit strictly inside the (tie, full subnormal) band"
+        );
+
+        let r = std::panic::catch_unwind(|| assert_underflows_to_zero(x));
+        assert!(
+            r.is_err(),
+            "assert_underflows_to_zero must refuse a magnitude in the round-UP band, not \
+             silently accept it"
+        );
+        let r_neg = std::panic::catch_unwind(|| assert_underflows_to_zero(-x));
+        assert!(r_neg.is_err());
+
+        let h = f16::from_f32(x);
+        assert_ne!(
+            h,
+            f16::ZERO,
+            "expected a nonzero subnormal in the round-UP band, got exact zero"
+        );
+        assert!(h.is_sign_positive());
+        let h_neg = f16::from_f32(-x);
+        assert_ne!(h_neg, f16::ZERO);
+        assert!(h_neg.is_sign_negative());
     }
 
     #[test]

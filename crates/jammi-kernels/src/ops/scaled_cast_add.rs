@@ -26,16 +26,17 @@ use crate::layout_walk::StridedOffsets;
 ///
 /// NOT a broadcasting op: `base` and `lora` must have identical shape (a
 /// mismatch is `Error::ShapeMismatchBinaryOp`, never silently broadcast).
-/// CPU forward supports `base`/`lora` each independently `F32` or `BF16`
-/// (four combinations); any other dtype on either side is a typed
-/// `Error::UnsupportedDTypeForOp`. The CUDA forward (feature-gated)
-/// supports the same four combinations and additionally requires
-/// contiguous storage. F16 is additionally supported on the CPU-only
-/// oracle-reference arm (`base`/`lora` each independently `F32` or `F16`,
-/// three new combinations — `F16`+`F16`, `F16`+`F32`, `F32`+`F16`; no CUDA
-/// F16 dispatch arm exists yet, so admission is not widened to F16 until
-/// one does, see `docs/maintainer/cuda-kernel-guide.md`'s per-op f16
-/// reference-regime table).
+/// CPU forward supports `base`/`lora` each independently `F32`, `BF16`, or
+/// `F16` (seven combinations — the four `{F32,BF16}x{F32,BF16}` plus three
+/// new `F16`+`F16`, `F16`+`F32`, `F32`+`F16`; `BF16`+`F16` and `F16`+`BF16`
+/// are NOT implemented, on either arm — no kernel exists for mixing those
+/// two 16-bit dtypes); any other dtype, or an unimplemented pair, is a
+/// typed `Error::UnsupportedDTypeForOp`. The CUDA forward (feature-gated)
+/// supports the SAME seven combinations (campaign #443 W2c added the three
+/// F16 combinations via the SEPARATE `cuda/scaled_cast_add_f16.cu`
+/// translation unit — monomorphic kernels, not template instantiations
+/// sharing code with the F32/BF16 kernels) and additionally requires
+/// contiguous storage.
 ///
 /// ## The bf16 rounding model: f32-accumulate, round ONCE (esc-046 fix)
 ///

@@ -118,10 +118,14 @@
 //! Contiguous storage only (`Layout::contiguous_offsets`) — a raw-pointer
 //! per-element kernel has no flat linear index for a strided view, and
 //! contiguity is what makes "logical index" and "storage index" coincide
-//! (see the counter-mapping section above). CPU/CUDA/Metal all support
-//! `F32` and `BF16` (this crate's two production activation dtypes); any
-//! other dtype is a typed `Error::UnsupportedDTypeForOp`. An empty tensor
-//! (`elem_count == 0`) is a no-op, not an error.
+//! (see the counter-mapping section above). CPU and CUDA support `F32`,
+//! `BF16`, and (campaign #443 W2c, via the SEPARATE `cuda/dropout_f16.cu`
+//! monomorphic translation unit — see that file's module doc) `F16`; Metal
+//! supports `F32`/`BF16` only (see the "Metal: a device-scoped
+//! deterministic host fallback" section below — F16 is deliberately NOT
+//! widened there, CUDA-only scope). Any other dtype is a typed
+//! `Error::UnsupportedDTypeForOp`. An empty tensor (`elem_count == 0`) is a
+//! no-op, not an error.
 //!
 //! ## Metal: a device-scoped deterministic host fallback, NOT a Metal
 //! Philox kernel (issue #433)

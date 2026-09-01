@@ -1,14 +1,19 @@
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::cudarc::driver::PushKernelArg;
 use candle_core::{CudaStorage, DType, Error, Layout, Result, Shape};
-use half::bf16;
+use half::{bf16, f16};
 
-use super::PTX_AXPY;
+use super::{PTX_AXPY, PTX_AXPY_F16};
 
 /// The kernel module name PTX functions are loaded under
 /// (`CudaDevice::get_or_load_custom_func`'s module cache key) — arbitrary,
 /// but stable and unique to this op so a second op's module never collides.
 const MODULE_NAME: &str = "jammi_kernels_axpy";
+
+/// The F16 arm's OWN PTX module name (campaign #443 W2c) — `axpy_f16.cu` is
+/// a SEPARATE translation unit (see that file's module doc), so it needs a
+/// distinct module name from [`MODULE_NAME`].
+const MODULE_NAME_F16: &str = "jammi_kernels_axpy_f16";
 
 pub(crate) fn cuda_fwd(
     alpha: f64,
@@ -110,6 +115,21 @@ pub(crate) fn cuda_fwd(
             let y = s2.as_cuda_slice::<bf16>()?.slice(o1_y..o2_y);
             let func = device.get_or_load_custom_func("axpy_bf16", MODULE_NAME, PTX_AXPY)?;
             let out = unsafe { device.alloc::<bf16>(n) }?;
+            let alpha_f32 = alpha as f32;
+            let mut builder = func.builder();
+            builder.arg(&alpha_f32);
+            builder.arg(&x);
+            builder.arg(&y);
+            builder.arg(&out);
+            builder.arg(&n);
+            unsafe { builder.launch(cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
+            Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
+        }
+        (DType::F16, DType::F16) => {
+            let x = s1.as_cuda_slice::<f16>()?.slice(o1_x..o2_x);
+            let y = s2.as_cuda_slice::<f16>()?.slice(o1_y..o2_y);
+            let func = device.get_or_load_custom_func("axpy_f16", MODULE_NAME_F16, PTX_AXPY_F16)?;
+            let out = unsafe { device.alloc::<f16>(n) }?;
             let alpha_f32 = alpha as f32;
             let mut builder = func.builder();
             builder.arg(&alpha_f32);

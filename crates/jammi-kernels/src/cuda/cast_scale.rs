@@ -6,12 +6,17 @@
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::cudarc::driver::PushKernelArg;
 use candle_core::{CudaStorage, DType, Error, Layout, Result, Shape};
-use half::bf16;
+use half::{bf16, f16};
 
-use super::PTX_CAST_SCALE;
+use super::{PTX_CAST_SCALE, PTX_CAST_SCALE_F16};
 
 /// See `../axpy.rs`'s identical constant for the module-name rationale.
 const MODULE_NAME: &str = "jammi_kernels_cast_scale";
+
+/// The F16 arms' OWN PTX module name (campaign #443 W2c) —
+/// `cast_scale_f16.cu` is a SEPARATE translation unit (see that file's
+/// module doc), so it needs a distinct module name from [`MODULE_NAME`].
+const MODULE_NAME_F16: &str = "jammi_kernels_cast_scale_f16";
 
 pub(crate) fn cuda_fwd_cast_scale_bf16_f32(
     scale: f64,
@@ -264,4 +269,113 @@ pub(crate) fn cuda_launch_cast_add_bf16_into(
     builder.arg(&n);
     unsafe { builder.launch(cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
     Ok(())
+}
+
+/// [`cuda_fwd_cast_scale_bf16_f32`]'s F16 analog (campaign #443 W2c), for
+/// [`crate::ops::CastScaleF16F32`] — a SEPARATE, independent type from
+/// [`crate::ops::CastScaleBf16F32`] (see that type's own doc), backed by
+/// the SEPARATE `cast_scale_f16.cu` translation unit.
+pub(crate) fn cuda_fwd_cast_scale_f16_f32(
+    scale: f64,
+    s1: &CudaStorage,
+    l1: &Layout,
+) -> Result<(CudaStorage, Shape)> {
+    const OP: &str = "cast_scale_f16_f32";
+    if s1.dtype() != DType::F16 {
+        return Err(Error::UnsupportedDTypeForOp(s1.dtype(), OP));
+    }
+
+    let device = s1.device().clone();
+    let shape = l1.shape().clone();
+    let n = shape.elem_count();
+    let scale_f32 = scale as f32;
+
+    // Contiguity checked before the `n == 0` fast path -- see
+    // `cuda_fwd_cast_scale_bf16_f32`'s identical comment above.
+    let (o1, o2) = l1
+        .contiguous_offsets()
+        .ok_or(Error::RequiresContiguous { op: OP })?;
+
+    if n == 0 {
+        return Ok((super::alloc_empty(&device, DType::F32, OP)?, shape));
+    }
+
+    super::check_elem_count_fits_u32(OP, n)?;
+
+    let cfg = super::elemwise_launch_config(n as u32);
+
+    let x = s1.as_cuda_slice::<f16>()?.slice(o1..o2);
+    let func = device.get_or_load_custom_func(
+        "cast_scale_f16_f32",
+        MODULE_NAME_F16,
+        PTX_CAST_SCALE_F16,
+    )?;
+    let out = unsafe { device.alloc::<f32>(n) }?;
+    let mut builder = func.builder();
+    builder.arg(&scale_f32);
+    builder.arg(&x);
+    builder.arg(&out);
+    builder.arg(&n);
+    unsafe { builder.launch(cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
+    Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
+}
+
+/// [`cuda_fwd_cast_add_bf16`]'s F16 analog (campaign #443 W2c), for
+/// [`crate::ops::CastAddF16`] — a SEPARATE, independent type from
+/// [`crate::ops::CastAddBf16`] (see that type's own doc), backed by the
+/// SEPARATE `cast_scale_f16.cu` translation unit.
+pub(crate) fn cuda_fwd_cast_add_f16(
+    s1: &CudaStorage,
+    l1: &Layout,
+    s2: &CudaStorage,
+    l2: &Layout,
+) -> Result<(CudaStorage, Shape)> {
+    const OP: &str = "cast_add_f16";
+    if l1.dims() != l2.dims() {
+        return Err(Error::ShapeMismatchBinaryOp {
+            lhs: l1.shape().clone(),
+            rhs: l2.shape().clone(),
+            op: OP,
+        });
+    }
+    if s1.dtype() != DType::F16 {
+        return Err(Error::UnsupportedDTypeForOp(s1.dtype(), OP));
+    }
+    if s2.dtype() != DType::F32 {
+        return Err(Error::UnsupportedDTypeForOp(s2.dtype(), OP));
+    }
+
+    let device = s1.device().clone();
+    let shape = l1.shape().clone();
+    let n = shape.elem_count();
+
+    // Contiguity checked before the `n == 0` fast path -- see
+    // `cuda_fwd_cast_scale_bf16_f32`'s identical comment above.
+    let (o1_base, o2_base) = l1
+        .contiguous_offsets()
+        .ok_or(Error::RequiresContiguous { op: OP })?;
+    let (o1_f32, o2_f32) = l2
+        .contiguous_offsets()
+        .ok_or(Error::RequiresContiguous { op: OP })?;
+
+    if n == 0 {
+        return Ok((super::alloc_empty(&device, DType::F16, OP)?, shape));
+    }
+
+    super::check_elem_count_fits_u32(OP, n)?;
+
+    let cfg = super::elemwise_launch_config(n as u32);
+
+    let base = s1.as_cuda_slice::<f16>()?.slice(o1_base..o2_base);
+    let f32val = s2.as_cuda_slice::<f32>()?.slice(o1_f32..o2_f32);
+    let func =
+        device.get_or_load_custom_func("cast_add_f16", MODULE_NAME_F16, PTX_CAST_SCALE_F16)?;
+    let out = unsafe { device.alloc::<f16>(n) }?;
+    let mut builder = func.builder();
+    builder.arg(&base);
+    builder.arg(&f32val);
+    builder.arg(&out);
+    builder.arg(&n);
+    unsafe { builder.launch(cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
+    Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
 }

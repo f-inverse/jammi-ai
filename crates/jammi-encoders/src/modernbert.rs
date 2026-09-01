@@ -2317,12 +2317,19 @@ fn flash_admission_predicate(
     trusted_lengths: Option<&[usize]>,
 ) -> FlashPredicateResult {
     // Reads `jammi_kernels::admission::FLASH_COMPILED` (contract v5 item 2)
-    // rather than a LOCAL `cfg!(feature = "flash-attn")`: this crate's own
-    // `flash-attn` feature is not yet forwarded any further up the stack
-    // (`jammi-ai`/`jammi-bench` do not request it), and — because
-    // `jammi_kernels::flash` is itself `#[cfg(feature = "flash-attn")]`-gated
-    // — a call site can never "stay compiled" behind a bare `cfg!()` bool if
-    // reaching the `true` branch would need to NAME a type from that module.
+    // rather than a LOCAL `cfg!(feature = "flash-attn")`: because
+    // `jammi_kernels::flash` is itself `#[cfg(feature = "flash-attn")]`-gated,
+    // a call site can never "stay compiled" behind a bare `cfg!()` bool if
+    // reaching the `true` branch would need to NAME a type from that module —
+    // this is true regardless of how far up the stack the feature is
+    // forwarded. (Campaign #443 W1 DID add `flash-attn` forwarding through
+    // `jammi-ai`/`jammi-bench`/`jammi-server` — `jammi-ai/Cargo.toml`'s own
+    // `flash-attn = ["cuda", "jammi-encoders/flash-attn",
+    // "jammi-kernels/flash-attn"]` and the by-name passthroughs in
+    // `jammi-bench`/`jammi-server`'s own manifests — so any consumer can now
+    // opt in; that forwarding is orthogonal to why THIS function reads
+    // `FLASH_COMPILED` rather than a local `cfg!()`, which is the
+    // name-a-gated-type constraint above, not an absence of forwarding.)
     // `FLASH_COMPILED` is exactly the escape hatch: a plain, unconditionally-
     // compiled `bool` reflecting how `jammi-kernels` itself was actually
     // built, readable regardless of whether THIS crate's own feature flag is

@@ -40,10 +40,11 @@ use jammi_kernels::ops::{
     adamw_step_fused_t, apply1, apply2, apply3, apply_inplace2, bwd_gradient_gemm_layouts,
     cast_add_bf16_into, cast_scale_bf16_f32_into, mem_efficient_attention, quant_matmul_grad,
     AdamMomentUpdate, AdamMomentUpdateFmaContractedRedControl, AdamWParams, AttentionBlockFused,
-    Axpy, BwdGemmLayoutsParams, CastAddBf16, CastScaleBf16F32, DropoutFused, DropoutKey,
-    FullyMaskedPolicy, GegluFused, GeluVariant, LayerNormFused, LowRankResidualLinear,
-    MemEfficientAttention, PhiloxKatProbe, RopeFused, ScaledCastAdd, SoftmaxLastDimFused,
-    ATTENTION_BLOCK_WINDOW_MASKED_VALUE, MEM_EFFICIENT_WINDOW_MASKED_VALUE,
+    Axpy, BwdGemmLayoutsParams, CastAddBf16, CastAddF16, CastScaleBf16F32, CastScaleF16F32,
+    DropoutFused, DropoutKey, FullyMaskedPolicy, GegluFused, GeluVariant, LayerNormFused,
+    LowRankResidualLinear, MemEfficientAttention, PhiloxKatProbe, RopeFused, RopePositionsFused,
+    ScaledCastAdd, SoftmaxLastDimFused, ATTENTION_BLOCK_WINDOW_MASKED_VALUE,
+    MEM_EFFICIENT_WINDOW_MASKED_VALUE,
 };
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -1335,7 +1336,12 @@ fn ln_parity_f16_output_underflows_to_zero_below_f16_min_subnormal() {
     );
     // Isolated reference (KO-8): the smaller-magnitude elements' true f32
     // product (|xhat| ~= 0.4472 for x in {2,3}) really is below the
-    // subnormal floor.
+    // subnormal floor. Reconciled against the phase-4 fix to
+    // `assert_underflows_to_zero`'s domain (`f16_oracle::F16_UNDERFLOW_TIE`
+    // = HALF of F16_MIN_POSITIVE_SUBNORMAL, not the full value): 0.4472 <
+    // 0.5, so this fixture sits comfortably inside the TRUE round-to-zero
+    // domain on both the old (false) and the corrected boundary -- this
+    // call site needed no value change, only the shared helper did.
     assert_underflows_to_zero(0.4472 * F16_MIN_POSITIVE_SUBNORMAL);
 }
 
@@ -1934,7 +1940,10 @@ fn rope_parity_f16_output_underflows_to_zero_below_f16_min_subnormal() {
         );
     }
     // Isolated reference (KO-8): the true f32 product really is below the
-    // subnormal floor.
+    // subnormal floor -- and by a huge margin (F16_MIN_POSITIVE_SUBNORMAL
+    // squared is ~3.55e-15, many orders of magnitude below even the
+    // corrected tie, f16_oracle::F16_UNDERFLOW_TIE = subnormal/2), so this
+    // fixture needed no value change for the phase-4 domain fix.
     assert_underflows_to_zero(F16_MIN_POSITIVE_SUBNORMAL * F16_MIN_POSITIVE_SUBNORMAL);
 }
 
@@ -3547,22 +3556,20 @@ fn geglu_parity_f16_product_saturates_to_infinity_beyond_f16_max() {
 
 /// Mirror-image boundary oracle (small-magnitude end): `gate =
 /// gelu_erf(gate) * up`, rounded to f16 at the very end (ROUND 2), must
-/// underflow to EXACT zero when the true product's magnitude sits
-/// strictly below HALF of f16's smallest subnormal — the genuine
-/// round-to-zero threshold for round-to-nearest-even at this boundary
-/// (`assert_underflows_to_zero`'s own doc states "strictly below
-/// `F16_MIN_POSITIVE_SUBNORMAL`", but round-to-nearest-even actually
-/// rounds a magnitude in `(subnormal/2, subnormal)` UP to the subnormal
-/// itself, not down to zero — confirmed empirically on this pod: a first
-/// draft of this fixture used `gate = 1.0` (`gelu_erf(1.0) ~= 0.8413`),
-/// whose product with `F16_MIN_POSITIVE_SUBNORMAL` landed at `~0.84 *
-/// subnormal`, ABOVE the true `0.5 * subnormal` threshold, and rounded UP
-/// to the subnormal rather than down to zero — a real, hermetic RED this
-/// oracle caught, not a false positive; see this branch's hand-off report).
-/// `gate = 0.1` (`gelu_erf(0.1) ~= 0.05399`) times
+/// underflow to EXACT zero when the true product's magnitude sits at or
+/// below [`f16_oracle::F16_UNDERFLOW_TIE`] — the genuine round-to-zero
+/// threshold for round-to-nearest-even at this boundary, HALF of
+/// `F16_MIN_POSITIVE_SUBNORMAL`, not the full value (a phase-4 audit fixed
+/// `assert_underflows_to_zero`'s own domain to match this exactly — see
+/// that function's doc and `F16_UNDERFLOW_TIE`'s). This test's OWN fixture
+/// discovery is what surfaced the gap: a first draft used `gate = 1.0`
+/// (`gelu_erf(1.0) ~= 0.8413`), whose product with `F16_MIN_POSITIVE_SUBNORMAL`
+/// landed at `~0.84 * subnormal`, ABOVE the true `0.5 * subnormal` tie, and
+/// rounded UP to the subnormal rather than down to zero — a real, hermetic
+/// RED this oracle caught, not a false positive; see this branch's hand-off
+/// report. `gate = 0.1` (`gelu_erf(0.1) ~= 0.05399`) times
 /// `up = F16_MIN_POSITIVE_SUBNORMAL` (a legitimately representable,
-/// nonzero f16 value) lands at `~0.054 * subnormal`, safely below the
-/// `0.5 * subnormal` threshold.
+/// nonzero f16 value) lands at `~0.054 * subnormal`, safely below the tie.
 #[test]
 fn geglu_parity_f16_product_underflows_to_zero_below_f16_min_subnormal() {
     let Some(cuda) = cuda_device() else {
@@ -11948,4 +11955,814 @@ fn quantized_cuda_canary_passes_on_a_healthy_build_and_device() {
          canary's own known-answer case/bound is miscalibrated; either way this test failing \
          is signal, not noise"
     );
+}
+
+// =======================================================================
+// Campaign #443 W2c — f16 kernels, batch 2: `rope_positions`, `axpy`,
+// `dropout`, `scaled_cast_add`, `cast_scale`/`cast_add`'s NEW F16 analogs.
+// Per-op tolerances derived from the §3.10 regime table (each op is
+// f32-internal, single-fmad-class or bit-exact per its own kernel's use
+// of `__fmul_rn`/`__fadd_rn`/no-multiply-at-all — cited per leg below).
+// =======================================================================
+
+/// `k = 2.0`, mirroring `axpy_bf16`'s own choice for the identical
+/// `alpha*x + y` fmad-prone shape (a single multiply-add, no reduction):
+/// nvcc's `--fmad=true` default may contract this into one hardware FMA
+/// (rounding the true product once, before the add) vs the CPU's two
+/// separately-rounded f32 operations — a sub-f32-ULP gap that F16's own
+/// (far coarser, 2^-10-relative) rounding grain absorbs at `k = 2` with
+/// margin, same as every other elementwise f16 leg in this file.
+const AXPY_F16_K_REL: f32 = 2.0;
+
+fn assert_axpy_parity_f16(cuda: &Device, alpha: f64, xv: &[f32], yv: &[f32]) {
+    let cpu = Device::Cpu;
+    let n = xv.len();
+    let xh: Vec<f16> = xv.iter().map(|&v| f16::from_f32(v)).collect();
+    let yh: Vec<f16> = yv.iter().map(|&v| f16::from_f32(v)).collect();
+
+    let x_cpu = Tensor::from_slice(&xh, (n,), &cpu).unwrap();
+    let y_cpu = Tensor::from_slice(&yh, (n,), &cpu).unwrap();
+    let out_cpu: Vec<f32> = axpy(alpha, &x_cpu, &y_cpu)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let x_gpu = Tensor::from_slice(&xh, (n,), cuda).unwrap();
+    let y_gpu = Tensor::from_slice(&yh, (n,), cuda).unwrap();
+    let out_gpu: Vec<f32> = axpy(alpha, &x_gpu, &y_gpu)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    assert_eq!(out_cpu.len(), n);
+    assert_eq!(
+        out_gpu.len(),
+        n,
+        "f16 GPU forward output length mismatch (got {}, expected {n})",
+        out_gpu.len()
+    );
+    assert_floor_below_f16_gradient_band(2, max_abs(xv).max(max_abs(yv)));
+    let out_floor = measured_near_zero_floor_f16(&out_cpu);
+    let out_bound = |r: f32| f16_relative_bound(r, out_floor, AXPY_F16_K_REL);
+    assert_relative_bound("axpy f16 fwd", &out_cpu, &out_gpu, out_bound);
+    // Forced defect: same "dropped scale" public-knob mutant as the
+    // f32/bf16 legs above.
+    let wrong_alpha = if alpha == 1.0 { 0.0 } else { 1.0 };
+    let out_defect: Vec<f32> = axpy(wrong_alpha, &x_gpu, &y_gpu)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_forced_defect_exceeds_bound("axpy f16 fwd", &out_cpu, &out_defect, out_bound);
+}
+
+#[test]
+fn axpy_parity_f16_contiguous_small() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let xv = fixture(37, 1.0);
+    let yv = fixture(37, 5.0);
+    assert_axpy_parity_f16(&cuda, 1.75, &xv, &yv);
+}
+
+#[test]
+fn axpy_parity_f16_production_width() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let xv = fixture(12_288, 1.0);
+    let yv = fixture(12_288, 9.0);
+    assert_axpy_parity_f16(&cuda, -2.25, &xv, &yv);
+}
+
+/// Boundary/degenerate contract (family D, `docs/maintainer/cuda-kernel-
+/// guide.md`'s per-op f16 checklist + `f16_oracle`'s own checklist):
+/// empty input, and the two out-of-range bands — saturation and
+/// (correctly-fixed-boundary) underflow — run through the shared
+/// `f16_oracle` helpers directly against a REAL CUDA `axpy_f16` output,
+/// not merely a standalone `f16::from_f32` conversion.
+#[test]
+fn axpy_parity_f16_empty_tensor_is_a_no_op_not_an_error() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let x = Tensor::from_slice(&[] as &[f16], (0,), &cuda).unwrap();
+    let y = Tensor::from_slice(&[] as &[f16], (0,), &cuda).unwrap();
+    let out: Vec<f16> = axpy(2.0, &x, &y).unwrap().to_vec1().unwrap();
+    assert!(out.is_empty());
+}
+
+#[test]
+fn axpy_parity_f16_boundary_saturates_and_underflows() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    // Saturation: alpha*x alone is far beyond F16_MAX.
+    let xv = [F16_MAX, -F16_MAX];
+    let yv = [0.0f32, 0.0];
+    let xh: Vec<f16> = xv.iter().map(|&v| f16::from_f32(v)).collect();
+    let yh: Vec<f16> = yv.iter().map(|&v| f16::from_f32(v)).collect();
+    let x = Tensor::from_slice(&xh, (2,), &cuda).unwrap();
+    let y = Tensor::from_slice(&yh, (2,), &cuda).unwrap();
+    let out: Vec<f16> = axpy(1000.0, &x, &y).unwrap().to_vec1().unwrap();
+    assert!(out[0].is_infinite() && out[0].is_sign_positive());
+    assert!(out[1].is_infinite() && out[1].is_sign_negative());
+    assert_saturates_to_infinity(1000.0 * F16_MAX);
+
+    // Underflow: a tiny alpha applied to a tiny x, added to an exact zero
+    // y, sits at or below the corrected tie (f16_oracle::F16_UNDERFLOW_TIE
+    // — see that constant's own doc for why this is HALF of
+    // F16_MIN_POSITIVE_SUBNORMAL, not the full value).
+    let tiny = f16::from_f32(F16_MIN_POSITIVE_SUBNORMAL);
+    let zero = f16::ZERO;
+    let x2 = Tensor::from_slice(&[tiny], (1,), &cuda).unwrap();
+    let y2 = Tensor::from_slice(&[zero], (1,), &cuda).unwrap();
+    let out2: Vec<f16> = axpy(0.4, &x2, &y2).unwrap().to_vec1().unwrap();
+    assert_eq!(
+        out2[0],
+        f16::ZERO,
+        "expected underflow to exact zero at 0.4 * F16_MIN_POSITIVE_SUBNORMAL"
+    );
+    assert_underflows_to_zero(0.4 * F16_MIN_POSITIVE_SUBNORMAL);
+}
+
+// ---- dropout f16 ----
+
+/// Decision + applied-value parity for F16: the KEEP/DROP decision is
+/// dtype-independent (Philox draws from POSITION, never value), and the
+/// applied scale on a KEPT element is a single `__fmul_rn` multiply on
+/// CUDA vs a single plain `f32` multiply on CPU — no neighboring add for
+/// either arm to fuse, so this is expected BIT-EXACT, not merely bounded
+/// (mirroring `ops::dropout`'s own `keep_drop_pattern_is_identical_
+/// across_supported_dtypes` CPU-only oracle, now run CPU-vs-CUDA).
+fn assert_dropout_parity_f16(
+    cuda: &Device,
+    seed: u64,
+    layer_id: u32,
+    forward_idx: u32,
+    p: f32,
+    xv: &[f32],
+) {
+    let cpu = Device::Cpu;
+    let n = xv.len();
+    let xh: Vec<f16> = xv.iter().map(|&v| f16::from_f32(v)).collect();
+
+    let x_cpu = Tensor::from_slice(&xh, (n,), &cpu).unwrap();
+    let out_cpu: Vec<f16> = dropout(seed, layer_id, forward_idx, p, &x_cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let x_gpu = Tensor::from_slice(&xh, (n,), cuda).unwrap();
+    let out_gpu: Vec<f16> = dropout(seed, layer_id, forward_idx, p, &x_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    assert_eq!(out_cpu.len(), n);
+    assert_eq!(out_gpu.len(), n, "dropout f16 GPU fwd length mismatch");
+    let mut mismatches = 0usize;
+    for (i, (c, g)) in out_cpu.iter().zip(out_gpu.iter()).enumerate() {
+        assert!(
+            g.is_finite(),
+            "dropout f16 fwd[{i}]: non-finite CUDA output {g:?}"
+        );
+        if c.to_bits() != g.to_bits() {
+            mismatches += 1;
+            eprintln!("dropout f16 fwd[{i}]: cpu {c:?} vs cuda {g:?}");
+        }
+    }
+    assert_eq!(
+        mismatches, 0,
+        "dropout f16 NOT bit-identical: {mismatches}/{n} mismatches"
+    );
+    // Forced defect: a different Philox key, through the op's own public
+    // knobs, must diverge from `out_gpu`.
+    let out_defect: Vec<f16> = dropout(seed ^ 0xDEAD_BEEF, layer_id, forward_idx, p, &x_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let defect_diffs = (0..n).filter(|&i| out_cpu[i] != out_defect[i]).count();
+    assert!(
+        defect_diffs > 0,
+        "dropout f16 FORCED DEFECT: a different Philox key produced an IDENTICAL mask -- the \
+         bit-exact oracle above would be vacuous"
+    );
+}
+
+#[test]
+fn dropout_parity_f16_production_width() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let xv = fixture(12_288, 2.0);
+    assert_dropout_parity_f16(&cuda, 4242, 3, 7, 0.3, &xv);
+}
+
+#[test]
+fn dropout_parity_f16_p_zero_is_bit_exact_no_op() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let xv = fixture(4096, 3.0);
+    assert_dropout_parity_f16(&cuda, 1, 0, 0, 0.0, &xv);
+}
+
+#[test]
+fn dropout_parity_f16_empty_tensor_is_a_no_op_not_an_error() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let x = Tensor::from_slice(&[] as &[f16], (0,), &cuda).unwrap();
+    let out: Vec<f16> = dropout(1, 0, 0, 0.3, &x).unwrap().to_vec1().unwrap();
+    assert!(out.is_empty());
+}
+
+// ---- rope_positions f16 ----
+
+/// F16's exact twin of `assert_rope_positions_bit_identical_to_rope_fused_bf16`
+/// — both `rope_f16.cu` and `rope_positions_f16.cu` compute the IDENTICAL
+/// `rope_rotate`-shaped expression (own duplicated copies, per the W2b/W2c
+/// no-shared-`.cuh` contract), so this is expected BIT-EXACT on real
+/// hardware, mirroring the bf16 oracle's own zero-tolerance precedent.
+fn assert_rope_positions_bit_identical_to_rope_fused_f16(
+    cuda: &Device,
+    b: usize,
+    h: usize,
+    s: usize,
+    theta_base: f64,
+) {
+    let d = 64usize; // ModernBERT-large's real head_dim (production).
+    let n = b * h * s * d;
+    let xv = fixture(n, 1.0);
+    let fv = fixture(n, 7.0);
+    let xh: Vec<f16> = xv.iter().map(|&v| f16::from_f32(v)).collect();
+    let fh: Vec<f16> = fv.iter().map(|&v| f16::from_f32(v)).collect();
+    let cos_v = rope_table(s, d, theta_base);
+    let sin_v = rope_sin_table(s, d, theta_base);
+    let ch: Vec<f16> = cos_v.iter().map(|&v| f16::from_f32(v)).collect();
+    let sh: Vec<f16> = sin_v.iter().map(|&v| f16::from_f32(v)).collect();
+
+    let x_bhsd = Tensor::from_slice(&xh, (b, h, s, d), cuda).unwrap();
+    let filler_bhsd = Tensor::from_slice(&fh, (b, h, s, d), cuda).unwrap();
+    let cos = Tensor::from_slice(&ch, (1, 1, s, d), cuda).unwrap();
+    let sin = Tensor::from_slice(&sh, (1, 1, s, d), cuda).unwrap();
+
+    let reference = rope(false, &x_bhsd, &cos, &sin).unwrap();
+
+    let qkv = pack_bhsd_into_qkv_dev(&x_bhsd, &filler_bhsd, 0);
+    let out = rope_positions(s, false, &qkv, &cos, &sin).unwrap();
+    let got_q = unpack_qkv_slot_dev(&out, 0, b, s);
+    assert_eq!(
+        to_bits_f32(&got_q),
+        to_bits_f32(&reference),
+        "rope_positions_fused (CUDA, f16) on slot 0 (q) must be bit-identical to RopeFused on \
+         [b,h,s,d]: b={b} h={h} s={s} d={d} theta={theta_base}"
+    );
+
+    let got_v = unpack_qkv_slot_dev(&out, 2, b, s);
+    let expected_v = unpack_qkv_slot_dev(&qkv, 2, b, s);
+    assert_eq!(
+        to_bits_f32(&got_v),
+        to_bits_f32(&expected_v),
+        "rope_positions_fused (CUDA, f16) must pass V through unchanged: b={b} h={h} s={s} d={d}"
+    );
+
+    let out_negated = rope_positions(s, true, &qkv, &cos, &sin).unwrap();
+    let got_q_negated = unpack_qkv_slot_dev(&out_negated, 0, b, s);
+    assert_ne!(
+        to_bits_f32(&got_q_negated),
+        to_bits_f32(&reference),
+        "RED control: sign-flipped rope_positions_fused (CUDA, f16) must NOT match the \
+         reference: b={b} h={h} s={s} d={d}"
+    );
+
+    let qkv_k = pack_bhsd_into_qkv_dev(&x_bhsd, &filler_bhsd, 1);
+    let out_k = rope_positions(s, false, &qkv_k, &cos, &sin).unwrap();
+    let got_k = unpack_qkv_slot_dev(&out_k, 1, b, s);
+    assert_eq!(
+        to_bits_f32(&got_k),
+        to_bits_f32(&reference),
+        "rope_positions_fused (CUDA, f16) on slot 1 (k) must be bit-identical to RopeFused on \
+         [b,h,s,d]: b={b} h={h} s={s} d={d} theta={theta_base}"
+    );
+}
+
+#[test]
+fn rope_positions_bit_identical_to_rope_fused_f16_b8_s512_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_rope_positions_bit_identical_to_rope_fused_f16(&cuda, 8, 16, 512, 160_000.0);
+}
+
+#[test]
+fn rope_positions_bit_identical_to_rope_fused_f16_b1_s128_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    assert_rope_positions_bit_identical_to_rope_fused_f16(&cuda, 1, 16, 128, 10_000.0);
+}
+
+#[test]
+fn rope_positions_parity_f16_degenerate_d_zero_is_empty_not_a_panic() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let qkv = Tensor::zeros((3, 3, 2, 0), DType::F16, &cuda).unwrap();
+    let cos = Tensor::zeros((4, 0), DType::F16, &cuda).unwrap();
+    let sin = Tensor::zeros((4, 0), DType::F16, &cuda).unwrap();
+    let out = rope_positions(4, false, &qkv, &cos, &sin).unwrap();
+    assert_eq!(out.dims(), qkv.dims());
+    assert_eq!(out.elem_count(), 0);
+}
+
+// ---- scaled_cast_add f16 (three combinations) ----
+
+/// `F16` base / `F32` lora — the F16-backbone analog of the reachable
+/// production combination (`BF16` base / `F32` lora), forward-only +
+/// forced defect, mirroring `assert_scaled_cast_add_parity_bf16_base`'s
+/// own shape exactly (that function likewise skips backward parity: this
+/// op's gradient formula is a straight-through identity/cast/scale with no
+/// dtype-specific rounding surface of its own to re-verify per dtype).
+fn assert_scaled_cast_add_parity_f16_base(
+    cuda: &Device,
+    scaling: f64,
+    basev: &[f32],
+    loraev: &[f32],
+) {
+    let cpu = Device::Cpu;
+    let n = basev.len();
+    let base_f16: Vec<f16> = basev.iter().map(|&v| f16::from_f32(v)).collect();
+
+    let base_cpu = Tensor::from_slice(&base_f16, (n,), &cpu).unwrap();
+    let lora_cpu = Tensor::from_slice(loraev, (n,), &cpu).unwrap();
+    let out_cpu: Vec<f32> = scaled_cast_add(scaling, &base_cpu, &lora_cpu)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let base_gpu = Tensor::from_slice(&base_f16, (n,), cuda).unwrap();
+    let lora_gpu = Tensor::from_slice(loraev, (n,), cuda).unwrap();
+    let out_gpu: Vec<f32> = scaled_cast_add(scaling, &base_gpu, &lora_gpu)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    assert_eq!(out_cpu.len(), n);
+    assert_eq!(
+        out_gpu.len(),
+        n,
+        "f16-base GPU forward output length mismatch (got {}, expected {n})",
+        out_gpu.len()
+    );
+    assert_floor_below_f16_gradient_band(2, max_abs(basev).max(max_abs(loraev)));
+    let out_floor = measured_near_zero_floor_f16(&out_cpu);
+    let out_bound = |r: f32| f16_relative_bound(r, out_floor, 2.0);
+    assert_relative_bound(
+        "scaled_cast_add f16-base fwd",
+        &out_cpu,
+        &out_gpu,
+        out_bound,
+    );
+    let wrong_scaling = if scaling == 1.0 { 0.0 } else { 1.0 };
+    let out_defect: Vec<f32> = scaled_cast_add(wrong_scaling, &base_gpu, &lora_gpu)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_forced_defect_exceeds_bound(
+        "scaled_cast_add f16-base fwd",
+        &out_cpu,
+        &out_defect,
+        out_bound,
+    );
+}
+
+/// `F32` base / `F16` lora.
+fn assert_scaled_cast_add_parity_f32_base_f16_lora(
+    cuda: &Device,
+    scaling: f64,
+    basev: &[f32],
+    loraev: &[f32],
+) {
+    let cpu = Device::Cpu;
+    let n = basev.len();
+    let lora_f16: Vec<f16> = loraev.iter().map(|&v| f16::from_f32(v)).collect();
+
+    let base_cpu = Tensor::from_slice(basev, (n,), &cpu).unwrap();
+    let lora_cpu = Tensor::from_slice(&lora_f16, (n,), &cpu).unwrap();
+    let out_cpu: Vec<f32> = scaled_cast_add(scaling, &base_cpu, &lora_cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let base_gpu = Tensor::from_slice(basev, (n,), cuda).unwrap();
+    let lora_gpu = Tensor::from_slice(&lora_f16, (n,), cuda).unwrap();
+    let out_gpu: Vec<f32> = scaled_cast_add(scaling, &base_gpu, &lora_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    assert_eq!(out_cpu.len(), n);
+    assert_eq!(
+        out_gpu.len(),
+        n,
+        "f32-base/f16-lora GPU fwd length mismatch"
+    );
+    // Output dtype is F32 here (follows `base`), so the DOMINANT rounding
+    // point is `lora`'s own f16->f32 widening (exact) times `scaling`
+    // (f32) — closer to the f32 elementwise bound than a genuinely
+    // f16-output op; still keyed to `f16_relative_bound` at the LORA
+    // operand's own f16 ULP scale (`k=2`, matching every other single-
+    // fmad-class elementwise leg here) since `lora`'s own quantization
+    // (before this op ever runs) is the coarsest step in the pipeline.
+    assert_floor_below_f16_gradient_band(2, max_abs(basev).max(max_abs(loraev)));
+    let out_floor = measured_near_zero_floor_f16(&out_cpu);
+    let out_bound = |r: f32| f16_relative_bound(r, out_floor, 2.0);
+    assert_relative_bound(
+        "scaled_cast_add f32-base/f16-lora fwd",
+        &out_cpu,
+        &out_gpu,
+        out_bound,
+    );
+    let wrong_scaling = if scaling == 1.0 { 0.0 } else { 1.0 };
+    let out_defect: Vec<f32> = scaled_cast_add(wrong_scaling, &base_gpu, &lora_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_forced_defect_exceeds_bound(
+        "scaled_cast_add f32-base/f16-lora fwd",
+        &out_cpu,
+        &out_defect,
+        out_bound,
+    );
+}
+
+/// `F16` base / `F16` lora.
+fn assert_scaled_cast_add_parity_f16_f16(
+    cuda: &Device,
+    scaling: f64,
+    basev: &[f32],
+    loraev: &[f32],
+) {
+    let cpu = Device::Cpu;
+    let n = basev.len();
+    let base_f16: Vec<f16> = basev.iter().map(|&v| f16::from_f32(v)).collect();
+    let lora_f16: Vec<f16> = loraev.iter().map(|&v| f16::from_f32(v)).collect();
+
+    let base_cpu = Tensor::from_slice(&base_f16, (n,), &cpu).unwrap();
+    let lora_cpu = Tensor::from_slice(&lora_f16, (n,), &cpu).unwrap();
+    let out_cpu: Vec<f32> = scaled_cast_add(scaling, &base_cpu, &lora_cpu)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let base_gpu = Tensor::from_slice(&base_f16, (n,), cuda).unwrap();
+    let lora_gpu = Tensor::from_slice(&lora_f16, (n,), cuda).unwrap();
+    let out_gpu: Vec<f32> = scaled_cast_add(scaling, &base_gpu, &lora_gpu)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    assert_eq!(out_cpu.len(), n);
+    assert_eq!(out_gpu.len(), n, "f16/f16 GPU fwd length mismatch");
+    assert_floor_below_f16_gradient_band(2, max_abs(basev).max(max_abs(loraev)));
+    let out_floor = measured_near_zero_floor_f16(&out_cpu);
+    let out_bound = |r: f32| f16_relative_bound(r, out_floor, 2.0);
+    assert_relative_bound("scaled_cast_add f16/f16 fwd", &out_cpu, &out_gpu, out_bound);
+    let wrong_scaling = if scaling == 1.0 { 0.0 } else { 1.0 };
+    let out_defect: Vec<f32> = scaled_cast_add(wrong_scaling, &base_gpu, &lora_gpu)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_forced_defect_exceeds_bound(
+        "scaled_cast_add f16/f16 fwd",
+        &out_cpu,
+        &out_defect,
+        out_bound,
+    );
+}
+
+#[test]
+fn scaled_cast_add_parity_f16_combinations_contiguous_small() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let base = fixture(64, 1.0);
+    let lora = fixture(64, 4.0);
+    assert_scaled_cast_add_parity_f16_base(&cuda, 1.75, &base, &lora);
+    assert_scaled_cast_add_parity_f32_base_f16_lora(&cuda, 1.75, &base, &lora);
+    assert_scaled_cast_add_parity_f16_f16(&cuda, 1.75, &base, &lora);
+}
+
+#[test]
+fn scaled_cast_add_parity_f16_combinations_production_width() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let base = fixture(12_288, 2.0);
+    let lora = fixture(12_288, 6.0);
+    assert_scaled_cast_add_parity_f16_base(&cuda, -2.25, &base, &lora);
+    assert_scaled_cast_add_parity_f32_base_f16_lora(&cuda, -2.25, &base, &lora);
+    assert_scaled_cast_add_parity_f16_f16(&cuda, -2.25, &base, &lora);
+}
+
+#[test]
+fn scaled_cast_add_parity_f16_empty_tensor_is_a_no_op_not_an_error() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let base = Tensor::from_slice(&[] as &[f16], (0,), &cuda).unwrap();
+    let lora = Tensor::from_slice(&[] as &[f32], (0,), &cuda).unwrap();
+    let out: Vec<f16> = scaled_cast_add(1.0, &base, &lora)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert!(out.is_empty());
+
+    let base2 = Tensor::from_slice(&[] as &[f16], (0,), &cuda).unwrap();
+    let lora2 = Tensor::from_slice(&[] as &[f16], (0,), &cuda).unwrap();
+    let out2: Vec<f16> = scaled_cast_add(1.0, &base2, &lora2)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert!(out2.is_empty());
+}
+
+/// D1 audit fix, family D: the `BF16`+`F16` and `F16`+`BF16` PAIRS are NOT
+/// implemented on either arm (no kernel exists for mixing those two
+/// 16-bit dtypes — see `ops::scaled_cast_add`'s module doc) even though
+/// EACH dtype independently is otherwise supported. This must refuse
+/// IDENTICALLY at `n == 0` and `n > 0` — a shape-dependent split here would
+/// reproduce the exact `alloc_empty` hazard campaign #443's D1 audit named
+/// for `axpy`/`dropout`/`rope_positions` before this wave widened their
+/// own dispatch (`crate::cuda::mod`'s `alloc_empty`/`alloc_zeros` doc).
+#[test]
+fn scaled_cast_add_bf16_f16_pair_is_refused_identically_empty_and_nonempty() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let base_bf16_empty = Tensor::from_slice(&[] as &[bf16], (0,), &cuda).unwrap();
+    let lora_f16_empty = Tensor::from_slice(&[] as &[f16], (0,), &cuda).unwrap();
+    let err_empty = scaled_cast_add(1.0, &base_bf16_empty, &lora_f16_empty)
+        .expect_err("BF16 base + F16 lora must be refused at n==0, not silently admitted");
+    assert!(matches!(err_empty, Error::UnsupportedDTypeForOp(..)));
+
+    let base_bf16 = Tensor::from_slice(&[bf16::from_f32(1.0); 8], (8,), &cuda).unwrap();
+    let lora_f16 = Tensor::from_slice(&[f16::from_f32(1.0); 8], (8,), &cuda).unwrap();
+    let err_nonempty = scaled_cast_add(1.0, &base_bf16, &lora_f16)
+        .expect_err("BF16 base + F16 lora must be refused at n>0");
+    assert!(matches!(err_nonempty, Error::UnsupportedDTypeForOp(..)));
+}
+
+// ---- cast_scale_f16_f32 / cast_add_f16 (NEW types, campaign #443 W2c) ----
+
+/// F16 twin of `cast_scale_bit_identical_to_the_eager_two_kernel_chain_on_cuda_across_scales`
+/// — `CastScaleF16F32` is a NEW, independent type (not a widened
+/// `CastScaleBf16F32` match arm), backed by `cast_scale_f16.cu`'s
+/// `out[i] = f32(x)*scale + 0.0f` — the SAME `+0.0f`-required expression,
+/// substituting `__half`, expected bit-exact against the eager
+/// `x.to_dtype(F32).affine(scale, 0.0)` chain for the identical reason
+/// (no neighboring multiply-then-add for nvcc to contract differently: a
+/// `mul + 0.0` fma is numerically a no-op).
+#[test]
+fn cast_scale_f16_bit_identical_to_the_eager_two_kernel_chain_on_cuda_across_scales() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let n = 12_288usize * 256;
+    let mut xv: Vec<f16> = (0..n)
+        .map(|i| f16::from_f32(((i as f32) * 0.017).sin() * 60.0))
+        .collect();
+    xv[0] = f16::from_f32(0.0);
+    xv[1] = f16::from_f32(-0.0);
+    xv[2] = f16::from_bits(0x0001);
+    xv[3] = f16::from_bits(0x8001);
+    xv[4] = f16::MIN_POSITIVE;
+    let x = Tensor::from_slice(&xv, (n,), &cuda).unwrap();
+    for &scale in &[0.11048f64, 0.03125, 2.0, 1e-30, 3.0] {
+        let fused = apply1(&x, CastScaleF16F32::new(scale))
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let eager = x
+            .to_dtype(DType::F32)
+            .unwrap()
+            .affine(scale, 0.0)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(
+            fused.iter().filter(|v| v.is_finite()).count(),
+            n,
+            "fused arm produced a non-finite element at scale={scale}"
+        );
+        assert_eq!(
+            eager.iter().filter(|v| v.is_finite()).count(),
+            n,
+            "eager arm produced a non-finite element at scale={scale}"
+        );
+        let mut mismatches = 0usize;
+        let mut first: Option<(usize, u32, u32)> = None;
+        for i in 0..n {
+            if fused[i].to_bits() != eager[i].to_bits() {
+                mismatches += 1;
+                if first.is_none() {
+                    first = Some((i, fused[i].to_bits(), eager[i].to_bits()));
+                }
+            }
+        }
+        assert_eq!(
+            mismatches, 0,
+            "cast_scale_f16_f32 NOT bit-identical to the eager two-kernel chain at scale={scale}: \
+             {mismatches}/{n} mismatches, first={first:?}"
+        );
+        if scale > 0.0 {
+            assert_eq!(
+                fused[1].to_bits(),
+                0x0000_0000u32,
+                "the `+0.0f` term was optimised away: fused[-0.0] = {:#010x} at scale={scale}",
+                fused[1].to_bits()
+            );
+        }
+    }
+}
+
+#[test]
+fn cast_scale_f16_empty_tensor_is_a_no_op_not_an_error() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let x = Tensor::from_slice(&[] as &[f16], (0,), &cuda).unwrap();
+    let out = apply1(&x, CastScaleF16F32::new(2.0))
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    assert!(out.is_empty());
+}
+
+/// F16 twin of `cast_add_bit_identical_to_the_eager_two_kernel_chain_on_cuda_with_red_control`
+/// — `CastAddF16` is a NEW, independent type, backed by `cast_scale_f16.cu`'s
+/// `out = base + round_to_f16(f32val)` (`__hadd` on two already-`__half`
+/// operands, matching `half::f16::Add`'s widen-add-round CPU idiom).
+#[test]
+fn cast_add_f16_bit_identical_to_the_eager_two_kernel_chain_on_cuda_with_red_control() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let n = 12_288usize * 128;
+    let mut base_v: Vec<f16> = (0..n)
+        .map(|i| f16::from_f32(((i as f32) * 0.0131).cos() * 4.0))
+        .collect();
+    let mut f32_v: Vec<f32> = (0..n)
+        .map(|i| ((i as f32) * 0.00029).sin() * 0.03 + ((i % 97) as f32) * 1.0e-4)
+        .collect();
+    base_v[0] = f16::from_f32(0.0);
+    base_v[1] = f16::from_f32(-0.0);
+    base_v[2] = f16::from_bits(0x0001);
+    f32_v[0] = -0.0;
+    f32_v[1] = -0.0;
+    f32_v[2] = f32::from_bits(1);
+    f32_v[3] = -f32::from_bits(1);
+    f32_v[4] = f32::MIN_POSITIVE;
+
+    let base = Tensor::from_slice(&base_v, (n,), &cuda).unwrap();
+    let f32val = Tensor::from_slice(&f32_v, (n,), &cuda).unwrap();
+
+    let fused = apply2(&base, &f32val, CastAddF16::new())
+        .unwrap()
+        .to_vec1::<f16>()
+        .unwrap();
+    let eager = (&base + &f32val.to_dtype(DType::F16).unwrap())
+        .unwrap()
+        .to_vec1::<f16>()
+        .unwrap();
+
+    let wrong: Vec<f16> = base_v
+        .iter()
+        .zip(f32_v.iter())
+        .map(|(&b, &f)| f16::from_f32(b.to_f32() + f))
+        .collect();
+    let wrong_diffs = (0..n)
+        .filter(|&i| wrong[i].to_bits() != eager[i].to_bits())
+        .count();
+    assert!(
+        wrong_diffs > 0,
+        "RED control is vacuous on this fixture: accumulate-then-round agrees with \
+         round-then-add everywhere"
+    );
+
+    let mut mismatches = 0usize;
+    let mut first: Option<(usize, u16, u16)> = None;
+    for i in 0..n {
+        if fused[i].to_bits() != eager[i].to_bits() {
+            mismatches += 1;
+            if first.is_none() {
+                first = Some((i, fused[i].to_bits(), eager[i].to_bits()));
+            }
+        }
+    }
+    assert_eq!(
+        mismatches, 0,
+        "cast_add_f16 NOT bit-identical to the eager two-kernel chain: {mismatches}/{n} \
+         mismatches, first={first:?}"
+    );
+}
+
+#[test]
+fn cast_add_f16_empty_tensor_is_a_no_op_not_an_error() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let base = Tensor::from_slice(&[] as &[f16], (0,), &cuda).unwrap();
+    let f32val = Tensor::from_slice(&[] as &[f32], (0,), &cuda).unwrap();
+    let out = apply2(&base, &f32val, CastAddF16::new())
+        .unwrap()
+        .to_vec1::<f16>()
+        .unwrap();
+    assert!(out.is_empty());
+}
+
+/// D1 audit fix: `CastScaleBf16F32`/`CastAddBf16` (the ORIGINAL, BF16-only
+/// types) remain WITHOUT an F16 dispatch arm after this wave (see
+/// `ops::cast_scale`'s module doc — `CastScaleF16F32`/`CastAddF16` are NEW,
+/// independent types, never a widened match arm on these). Pin the typed
+/// refusal on F16 input EXPLICITLY at BOTH `n > 0` and `n == 0` — these two
+/// ops' own `cuda_fwd` functions check `s1.dtype() != DType::BF16`
+/// UNCONDITIONALLY, before their `n == 0` fast path, so no shape-dependent
+/// accept/refuse split exists here (unlike `axpy`/`dropout`/
+/// `rope_positions`'s pre-W2c hazard) — this test makes that fact an
+/// asserted invariant, not merely an implication of reading the source.
+#[test]
+fn cast_scale_bf16_f32_and_cast_add_bf16_refuse_f16_both_empty_and_nonempty() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+
+    let x_f16_nonempty = Tensor::from_slice(&[f16::from_f32(1.0); 8], (8,), &cuda).unwrap();
+    let err = apply1(&x_f16_nonempty, CastScaleBf16F32::new(1.0))
+        .expect_err("cast_scale_bf16_f32 must refuse F16 input at n>0");
+    assert!(matches!(err, Error::UnsupportedDTypeForOp(DType::F16, ..)));
+
+    let x_f16_empty = Tensor::from_slice(&[] as &[f16], (0,), &cuda).unwrap();
+    let err_empty = apply1(&x_f16_empty, CastScaleBf16F32::new(1.0)).expect_err(
+        "cast_scale_bf16_f32 must refuse F16 input at n==0 too -- no accept/refuse split",
+    );
+    assert!(matches!(
+        err_empty,
+        Error::UnsupportedDTypeForOp(DType::F16, ..)
+    ));
+
+    let base_f16_nonempty = Tensor::from_slice(&[f16::from_f32(1.0); 8], (8,), &cuda).unwrap();
+    let f32val_nonempty = Tensor::from_slice(&[1.0f32; 8], (8,), &cuda).unwrap();
+    let err2 = apply2(&base_f16_nonempty, &f32val_nonempty, CastAddBf16::new())
+        .expect_err("cast_add_bf16 must refuse F16 base at n>0");
+    assert!(matches!(err2, Error::UnsupportedDTypeForOp(DType::F16, ..)));
+
+    let base_f16_empty = Tensor::from_slice(&[] as &[f16], (0,), &cuda).unwrap();
+    let f32val_empty = Tensor::from_slice(&[] as &[f32], (0,), &cuda).unwrap();
+    let err2_empty = apply2(&base_f16_empty, &f32val_empty, CastAddBf16::new())
+        .expect_err("cast_add_bf16 must refuse F16 base at n==0 too -- no accept/refuse split");
+    assert!(matches!(
+        err2_empty,
+        Error::UnsupportedDTypeForOp(DType::F16, ..)
+    ));
 }

@@ -23,11 +23,14 @@ use crate::layout_walk::StridedOffsets;
 /// mismatch); the CUDA forward (feature-gated) supports F32, BF16 and
 /// additionally requires contiguous storage (a raw-pointer kernel has no
 /// flat linear index for a strided/broadcast view — `Error::RequiresContiguous`).
-/// F16's CPU arm (`axpy_f16`, added as an oracle reference — see
-/// `docs/maintainer/cuda-kernel-guide.md`'s per-op f16 reference-regime
-/// table) mirrors `axpy_bf16`'s f32-accumulate-round-once regime; no CUDA
-/// F16 dispatch arm exists yet, so admission never routes an F16 tensor
-/// here on CUDA (K2: no Hold-without-dispatch).
+/// F16's CPU arm (`axpy_f16`, originally added as an oracle reference —
+/// see `docs/maintainer/cuda-kernel-guide.md`'s per-op f16 reference-regime
+/// table) mirrors `axpy_bf16`'s f32-accumulate-round-once regime. Campaign
+/// #443 W2c added the matching CUDA F16 dispatch arm (`crate::cuda::axpy`'s
+/// `(DType::F16, DType::F16)` arm, backed by the SEPARATE `cuda/axpy_f16.cu`
+/// translation unit — a monomorphic kernel, not a template instantiation
+/// that shares code with the F32/BF16 kernel), so F16 is now a real,
+/// dispatchable CUDA dtype for this op (K2: no Hold-without-dispatch).
 #[derive(Debug, Clone, Copy)]
 pub struct Axpy {
     pub alpha: f64,

@@ -10,15 +10,57 @@
 //!   arms (not a runtime branch), so the assertion is honest under either
 //!   build: a build compiled WITHOUT `flash-attn` cannot even express "assert
 //!   FLASH_COMPILED == true".
-//! - Every op the manifest's `fused_op_admission` list declares admits
-//!   (`Holds`) on THIS device, for the dtypes the current tree admits fused
-//!   kernels for today (f32, bf16 — f16 kernel authoring is a separate,
-//!   in-flight wave; campaign #443 plan v3 §Part 3), under
-//!   `JAMMI_KERNELS_STRICT=1` (any admission Miss anywhere would hard-error
-//!   the forward pass below — see `jammi_kernels::admission::admit`'s
-//!   Strict-mode contract), by reading the per-op dispatch-registry deltas.
+//! - Every op the manifest's `fused_op_admission` list declares that this
+//!   file can attribute to a real dispatch-registry key admits (`Holds`) on
+//!   THIS device, for the dtypes the current tree admits fused kernels for
+//!   today (f32, bf16 — f16 kernel authoring is a separate, in-flight wave;
+//!   campaign #443 plan v3 §Part 3), under `JAMMI_KERNELS_STRICT=1` (a
+//!   two-arm op's admission Miss hard-errors under Strict — see
+//!   `jammi_kernels::admission::admit`'s Strict-mode contract), by reading
+//!   the per-op dispatch-registry deltas around a real forward + backward +
+//!   one optimizer step over a synthetic batch.
 //! - `flash_dtypes` admits (`Holds`) the flash cascade when this build
-//!   compiled `flash-attn` — cfg-gated off entirely otherwise.
+//!   compiled `flash-attn` AND the dtype is one flash preempts attention_block
+//!   for — see the `attention_block` TIER PREEMPTION note below.
+//!
+//! ## TIER PREEMPTION: `attention_block` vs the flash cascade
+//! (adversarial-audit finding 1, campaign #443 Phase 4)
+//!
+//! `ModernBertAttention::forward_training_attention`
+//! (`crates/jammi-encoders/src/modernbert.rs:~1192`) consults the flash
+//! cascade FIRST and returns immediately on `CascadeOutcome::Fused` —
+//! `attention_block_fused`'s own `admit()` call is never even reached in
+//! that case. So on a `flash-attn`-compiled build, for a dtype the manifest's
+//! `flash_dtypes` declares (today: `bf16`), the flash cascade counter moves
+//! and `attention_block_fused`'s counter does NOT — asserting BOTH moved (the
+//! pre-fix bug) is mutually exclusive and fails on whichever build the OTHER
+//! half assumes. This file computes, per dtype, whether flash is expected to
+//! preempt (`FLASH_COMPILED && flash_dtypes.contains(dtype)`) and asserts the
+//! CORRESPONDING real pair: preemption asserts flash moved AND
+//! `attention_block_fused` did NOT; no preemption asserts `attention_block_fused`
+//! moved AND flash did NOT (both are real assertions — neither arm is
+//! logging-only).
+//!
+//! ## VACUOUS-COVERAGE fix: a real backward + optimizer step
+//! (adversarial-audit finding 2, campaign #443 Phase 4)
+//!
+//! A forward-only probe cannot claim "a Strict-mode failure anywhere in this
+//! op's dispatch would already have hard-errored the forward" for an op that
+//! never dispatches during a plain forward — that claim is FALSE, not merely
+//! unproven, for a backward/optimizer-time op. [`probe_dtype`] now runs a
+//! real `loss.backward()` plus one [`jammi_ai::fine_tune::adamw::AdamW`] step
+//! over the trainable LoRA vars, so any backward/optimizer-time
+//! admission-gated dispatch genuinely fires and its registry delta is
+//! readable. Reading (never editing — off-limits per this wave's contract)
+//! every `jammi_kernels::admission::{admit, admit_cascade}` call site in the
+//! workspace turned up NO registered dispatch-registry key anywhere for
+//! `rope_positions`, `axpy`, `cast_scale`, or `scaled_cast_add` — see
+//! [`KNOWN_NO_DISPATCH_SITE_OPS`]'s doc: these four manifest entries have no
+//! admit()-gated arm to observe even after the backward+step extension, and
+//! are logged as such (never claimed hard-error-if-Miss) rather than folded
+//! into the generic "no dedicated mapping" bucket that DOES still lean on the
+//! completed-run argument for ops this file simply hasn't wired a snapshot
+//! reader for yet.
 //!
 //! ## Why a synthetic, directly-built ModernBERT (not `session.fine_tune`)
 //!
@@ -41,7 +83,13 @@
 //! this wave's own established idiom for a controlled-shape admission
 //! probe). `global_attn_every_n_layers = 1` makes every layer global (no
 //! sliding-window local-mask path), keeping the domain surface to exactly
-//! the dtype/head-dim/seq checks this test cares about.
+//! the dtype/head-dim/seq checks this test cares about. The whole model
+//! (fresh `VarMap`, fresh weights file) is discarded after each dtype's
+//! probe, so the backward+optimizer step's weight mutation and RNG draw have
+//! no effect beyond this test process — unlike the worker's own in-place
+//! production probe (`crates/jammi-ai/src/fine_tune/worker.rs`'s esc-075
+//! module doc), which snapshots and restores the real trainable weights for
+//! exactly this reason.
 //!
 //! `ci/scripts/runpod_gpu_prove.sh`'s capability-surface group invokes this
 //! test by EXACT name (`--test gpu_capability capability_surface`) and reads
@@ -57,6 +105,7 @@ use std::path::Path;
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarMap;
+use jammi_ai::fine_tune::adamw::{AdamW, ParamsAdamW};
 use jammi_ai::fine_tune::ComputePrecision;
 use jammi_encoders::{ModernBert, ModernBertConfig, Pooling};
 use jammi_kernels::admission::{AdmissionMode, CascadeDispatchSnapshot, DispatchSnapshot};
@@ -79,42 +128,54 @@ const MANIFEST_PATH: &str = concat!(
 /// Manifest-declared op → the process-wide TWO-ARM dispatch-registry `op` key
 /// the kernel's own `jammi_kernels::admission::admit` call site registers
 /// under — reused VERBATIM (never re-derived) from reading
-/// `crates/jammi-encoders/src/layer_norm.rs:100`,
-/// `crates/jammi-encoders/src/modernbert.rs:190,671,1827`, and
-/// `crates/jammi-lora/src/lora_linear.rs:36,65,205`.
+/// `crates/jammi-encoders/src/layer_norm.rs:103`,
+/// `crates/jammi-encoders/src/modernbert.rs:1838`, and
+/// `crates/jammi-lora/src/lora_linear.rs:37,66,205`.
 ///
 /// `"dropout"` and `"low_rank_residual_linear"` BOTH map to `lora_linear_fused`
-/// — `lora_linear.rs:36`'s own doc states its `lora_dropout` counter is
+/// — `lora_linear.rs:37`'s own doc states its `lora_dropout` counter is
 /// "Permanently `{fused: 0, eager: 0}` today": dropout is now reserved via
 /// `DropoutMasks::next_key` and consumed DIRECTLY inside
 /// `LowRankResidualLinear`'s own fused-or-eager arm, folded into the SAME
 /// `lora_linear_fused` dispatch decision this file already reads for
 /// `"low_rank_residual_linear"` — there is no longer a SEPARATE admission
 /// signal for dropout to read; asserting `lora_linear_fused` Holds proves
-/// both. Both fire during a plain forward pass (LoRA's forward composes
-/// `base(x) + lora_delta(x)`), so no backward/optimizer step is needed.
+/// both (`lora_linear.rs:752-812`'s `forward` — confirmed by reading it
+/// carefully during Phase-4 audit remediation, closing advisory 8: the
+/// fused/eager decision fires during the plain forward pass this probe
+/// already runs, before the backward+step extension below).
+///
+/// `"attention_block"` is deliberately ABSENT from this list — its own
+/// admission can be PREEMPTED by the flash cascade (see this file's module
+/// doc's "TIER PREEMPTION" section) and is handled separately, per-dtype, in
+/// [`capability_surface`] itself.
 ///
 /// `"softmax"` and `"rope"` are deliberately ABSENT from this list — see
 /// [`STRICT_UNREACHABLE_OPS`]'s doc for why asserting either `Holds` in a
 /// Strict-mode run through ModernBERT's attention path is not merely
 /// untested but STRUCTURALLY IMPOSSIBLE.
+///
+/// `"rope_positions"`/`"axpy"`/`"cast_scale"`/`"scaled_cast_add"` are
+/// deliberately ABSENT — see [`KNOWN_NO_DISPATCH_SITE_OPS`]'s doc.
 const TWO_ARM_OPS: &[(&str, &str)] = &[
     ("layer_norm", "layer_norm_fused"),
     ("geglu", "geglu_fused"),
-    ("attention_block", "attention_block_fused"),
     ("dropout", "lora_linear_fused"),
     ("low_rank_residual_linear", "lora_linear_fused"),
 ];
 
 /// Manifest-declared op → the process-wide CASCADE dispatch-registry `op`
 /// key (`jammi_kernels::admission::cascade_counters_for`) —
-/// `crates/jammi-encoders/src/modernbert.rs:1242` et al.
+/// `crates/jammi-encoders/src/modernbert.rs:1253` et al.
 ///
 /// Logged informationally rather than asserted `Holds`: `admit_cascade` has
-/// no `fallback_warnings`-shaped reason channel, and `mem_efficient_attention`
+/// no `fallback_warnings`-shaped reason channel, `mem_efficient_attention`
 /// additionally has its OWN shape/capability domain (independent of dtype) —
 /// declining on this test's tiny fixture shape is a legitimate `DomainMiss`,
-/// not evidence against f32/bf16 dtype admission.
+/// not evidence against f32/bf16 dtype admission — and, per Phase-4 finding
+/// number one, `mem_efficient_attention` is ALSO consulted only after the
+/// flash cascade declines (`forward_training_attention`'s own ordering), so
+/// it can be preempted by flash exactly like `attention_block_fused` can.
 const CASCADE_OPS: &[(&str, &str)] = &[("mem_efficient_attention", "mem_efficient_attention")];
 
 /// Manifest-declared ops that are structurally UNREACHABLE in a
@@ -140,6 +201,29 @@ const CASCADE_OPS: &[(&str, &str)] = &[("mem_efficient_attention", "mem_efficien
 /// run — logged informationally, never asserted `Holds`, and never silently
 /// dropped either (a human reading `--nocapture` output sees exactly why).
 const STRICT_UNREACHABLE_OPS: &[&str] = &["softmax", "rope"];
+
+/// Manifest-declared ops with NO registered `jammi_kernels::admission::admit`
+/// or `admit_cascade` call site ANYWHERE in this workspace today — verified
+/// by reading (never editing) every `counters_for("...")` /
+/// `cascade_counters_for("...")` call site in `crates/jammi-kernels`,
+/// `crates/jammi-encoders`, `crates/jammi-lora`, and `crates/jammi-ai`
+/// (Phase-4 audit remediation, finding 2). Even with this file's
+/// backward+optimizer-step extension, these four never dispatch through
+/// `admit`: `low_rank_residual_linear`'s own backward-time epilogue kernel
+/// (`crates/jammi-kernels/src/ops/low_rank_residual_linear.rs`'s `bwd`,
+/// `admit_cast_boundary("cast_add_bf16", ..)`) is real and IS reached by the
+/// backward+step extension, but it registers under `"cast_add_bf16"` — a
+/// DIFFERENT op name than any of these four, and not itself a manifest
+/// entry. No call site anywhere passes `"rope_positions"`, `"axpy"`,
+/// `"cast_scale"`, or `"scaled_cast_add"` to either admission function, so
+/// there is no registry key for this file (or any probe, forward or
+/// backward) to read a delta from. This is reported to the campaign lead for
+/// a manifest edit (exclude these four from `fused_op_admission`, or replace
+/// them with the real op names these kernels dispatch under) rather than
+/// silently claimed covered by the completed-run argument, which is FALSE
+/// for an op that never dispatches through `admit` at all.
+const KNOWN_NO_DISPATCH_SITE_OPS: &[&str] =
+    &["rope_positions", "axpy", "cast_scale", "scaled_cast_add"];
 
 /// The purpose-built tiny ModernBERT shape this test proves admission
 /// against: `hidden_size / num_attention_heads == 64` —
@@ -264,14 +348,14 @@ fn compute_precision_to_candle_dtype(p: ComputePrecision) -> DType {
 /// trainable adapter is the comparable, real shape) at `dtype` on `device`,
 /// sets it to training mode (the ONLY mode any of these fused arms is
 /// reachable from — see `crates/jammi-ai/src/fine_tune/worker.rs`'s esc-075
-/// module doc), and runs ONE forward pass over a synthetic batch. Returns the
-/// forward `Result` unchanged — the caller decides what a failure means.
-fn build_and_probe_forward(
-    config: &ModernBertConfig,
-    weights: &Path,
-    dtype: DType,
-    device: &Device,
-) -> Result<Tensor, jammi_encoders::EncoderError> {
+/// module doc), and drives ONE forward + backward + optimizer step over a
+/// synthetic batch — closing the vacuous-coverage gap a forward-only probe
+/// left (Phase-4 audit finding 2): backward/optimizer-time admission-gated
+/// ops (e.g. `low_rank_residual_linear`'s own backward-time `cast_add_bf16`
+/// epilogue) now genuinely dispatch. The whole model is discarded after this
+/// call returns (fresh `VarMap` per call), so the step's weight mutation and
+/// dropout RNG draw have no effect beyond this test process.
+fn probe_dtype(config: &ModernBertConfig, weights: &Path, dtype: DType, device: &Device) {
     let varmap = VarMap::new();
     let target_modules = vec!["Wqkv".to_string(), "Wo".to_string()];
     let lora = LoraBuildConfig {
@@ -280,8 +364,9 @@ fn build_and_probe_forward(
         lora_rank: 4,
         lora_alpha: 8.0,
         use_rslora: false,
-        // Nonzero: exercises the `lora_dropout` admission site too (a `0.0`
-        // dropout takes a structurally different, dropout-free path).
+        // Nonzero: exercises the `lora_dropout`/`lora_linear_fused` dropout
+        // admission site too (a `0.0` dropout takes a structurally
+        // different, dropout-free path).
         lora_dropout: Some(0.1),
         rank_pattern: &HashMap::new(),
         init_mode: LoraInitMode::Gaussian,
@@ -297,9 +382,43 @@ fn build_and_probe_forward(
 
     let input_ids = synthetic_ids(2, 8, config.vocab_size, device);
     let mask = Tensor::ones((2, 8), DType::U32, device).unwrap();
-    model.forward(&input_ids, &mask)
+    let output = model.forward(&input_ids, &mask).unwrap_or_else(|e| {
+        panic!(
+            "capability_surface: the probe forward at backbone_dtype={dtype:?} must complete \
+             under JAMMI_KERNELS_STRICT=1 — a failure here means a manifest-declared fused op \
+             did NOT admit for this dtype on this device: {e}"
+        )
+    });
+
+    // Backward + one optimizer step (Phase-4 audit finding 2): a plain scalar
+    // loss over the pooled output is enough to drive a real
+    // `Tensor::backward()` walk through every LoRA-touched layer.
+    let loss = output
+        .to_dtype(DType::F32)
+        .and_then(|t| t.sqr())
+        .and_then(|t| t.mean_all())
+        .unwrap_or_else(|e| panic!("capability_surface: loss at backbone_dtype={dtype:?}: {e}"));
+    let grads = loss.backward().unwrap_or_else(|e| {
+        panic!("capability_surface: backward at backbone_dtype={dtype:?}: {e}")
+    });
+    let mut opt = AdamW::new(varmap.all_vars(), ParamsAdamW::default()).unwrap_or_else(|e| {
+        panic!("capability_surface: AdamW::new at backbone_dtype={dtype:?}: {e}")
+    });
+    opt.step(&grads).unwrap_or_else(|e| {
+        panic!(
+            "capability_surface: the optimizer step at backbone_dtype={dtype:?} must complete \
+             under JAMMI_KERNELS_STRICT=1 — a failure here means a manifest-declared \
+             backward/optimizer-time fused op did NOT admit for this dtype on this device: {e}"
+        )
+    });
 }
 
+// The CUDA_COMPILED/FLASH_COMPILED asserts below are deliberately over a
+// compile-time constant: the point is pinning "this build's `cfg!()`-derived
+// constant matches the feature this test was actually compiled with", a
+// regression guard against the two ever silently drifting from `cfg!()`'s
+// own value — not a removable tautology.
+#[allow(clippy::assertions_on_constants)]
 #[tokio::test(flavor = "multi_thread")]
 async fn capability_surface() {
     skip_without_gpu!();
@@ -328,7 +447,8 @@ async fn capability_surface() {
     assert!(
         !jammi_kernels::admission::FLASH_COMPILED,
         "built WITHOUT flash-attn: FLASH_COMPILED must be false — the flash arm below is \
-         cfg-off (honest), never silently skipped at runtime"
+         driven by this same runtime constant, never a `#[cfg]` branch, so it degrades \
+         correctly rather than silently skipping"
     );
 
     let manifest = load_manifest();
@@ -338,6 +458,21 @@ async fn capability_surface() {
         "ci/release-feature-manifest.json's {MANIFEST_LANE:?} lane must declare a non-empty \
          fused_op_admission list"
     );
+    // Read once: which dtypes (if any) this build's flash cascade preempts
+    // `attention_block`/`mem_efficient_attention` for — empty on a
+    // non-`flash-attn` build (never even reads the manifest key in that
+    // case, matching "flash arm cfg-off honest").
+    let flash_dtypes: Vec<String> = if jammi_kernels::admission::FLASH_COMPILED {
+        manifest_string_list(&manifest, "flash_dtypes")
+    } else {
+        Vec::new()
+    };
+    if jammi_kernels::admission::FLASH_COMPILED {
+        assert!(
+            !flash_dtypes.is_empty(),
+            "{MANIFEST_LANE:?}'s flash_dtypes must be non-empty when flash_compiled is true"
+        );
+    }
 
     let device = Device::new_cuda(0).expect("skip_without_gpu already proved a CUDA device opens");
     let config = probe_config();
@@ -347,13 +482,20 @@ async fn capability_surface() {
 
     let mapped: HashSet<&str> = TWO_ARM_OPS
         .iter()
-        .chain(CASCADE_OPS.iter())
         .map(|&(op, _)| op)
+        .chain(CASCADE_OPS.iter().map(|&(op, _)| op))
         .chain(STRICT_UNREACHABLE_OPS.iter().copied())
+        .chain(KNOWN_NO_DISPATCH_SITE_OPS.iter().copied())
+        .chain(std::iter::once("attention_block"))
         .collect();
 
     for dtype in [ComputePrecision::F32, ComputePrecision::BF16] {
         let candle_dtype = compute_precision_to_candle_dtype(dtype);
+        // TIER PREEMPTION (Phase-4 audit finding 1): whether THIS dtype is
+        // one the flash cascade is expected to preempt attention_block /
+        // mem_efficient_attention for, on THIS build.
+        let flash_should_preempt = flash_dtypes.iter().any(|d| d == &dtype.to_string());
+
         let two_arm_before: Vec<(&str, DispatchSnapshot)> = TWO_ARM_OPS
             .iter()
             .map(|&(_, key)| (key, jammi_kernels::admission::counters_for(key).snapshot()))
@@ -367,16 +509,12 @@ async fn capability_surface() {
                 )
             })
             .collect();
+        let attention_block_before =
+            jammi_kernels::admission::counters_for("attention_block_fused").snapshot();
+        let flash_cascade_before =
+            jammi_kernels::admission::cascade_counters_for("attention_block_flash").snapshot();
 
-        build_and_probe_forward(&config, &weights_path, candle_dtype, &device).unwrap_or_else(
-            |e| {
-                panic!(
-                    "capability_surface: the probe forward at backbone_dtype={dtype} must \
-                     complete under JAMMI_KERNELS_STRICT=1 — a failure here means a \
-                     manifest-declared fused op did NOT admit for this dtype on this device: {e}"
-                )
-            },
-        );
+        probe_dtype(&config, &weights_path, candle_dtype, &device);
 
         for &(report_op, registry_key) in TWO_ARM_OPS {
             if !declared_ops.iter().any(|d| d == report_op) {
@@ -398,8 +536,57 @@ async fn capability_surface() {
                 after.eager, before.eager,
                 "manifest-declared op {report_op:?} must not have fallen back to eager at \
                  backbone_dtype={dtype} (a real eager fallback here would already have \
-                 hard-errored the probe forward under Strict) — before={before:?} after={after:?}"
+                 hard-errored the probe under Strict) — before={before:?} after={after:?}"
             );
+        }
+
+        // `attention_block`: the TIER-PREEMPTION-AWARE pair of assertions —
+        // both arms real, never logging-only (Phase-4 audit finding 1).
+        if declared_ops.iter().any(|d| d == "attention_block") {
+            let attention_block_after =
+                jammi_kernels::admission::counters_for("attention_block_fused").snapshot();
+            let flash_cascade_after =
+                jammi_kernels::admission::cascade_counters_for("attention_block_flash").snapshot();
+            if flash_should_preempt {
+                assert!(
+                    flash_cascade_after.fused > flash_cascade_before.fused,
+                    "backbone_dtype={dtype} is a declared flash_dtype on a flash-attn build — \
+                     the flash cascade must have dispatched FUSED at least once, got \
+                     before={flash_cascade_before:?} after={flash_cascade_after:?}"
+                );
+                assert_eq!(
+                    attention_block_after.fused, attention_block_before.fused,
+                    "backbone_dtype={dtype}: attention_block_fused must NOT have dispatched — \
+                     the flash cascade preempts it (forward_training_attention consults flash \
+                     FIRST and returns on Fused) — before={attention_block_before:?} \
+                     after={attention_block_after:?}"
+                );
+                assert_eq!(
+                    attention_block_after.eager, attention_block_before.eager,
+                    "backbone_dtype={dtype}: attention_block_fused must not have been reached \
+                     AT ALL (fused or eager) when flash preempts it — \
+                     before={attention_block_before:?} after={attention_block_after:?}"
+                );
+            } else {
+                assert!(
+                    attention_block_after.fused > attention_block_before.fused,
+                    "backbone_dtype={dtype} (flash absent or not a declared flash_dtype): \
+                     attention_block_fused must have dispatched FUSED at least once, got \
+                     before={attention_block_before:?} after={attention_block_after:?}"
+                );
+                assert_eq!(
+                    attention_block_after.eager, attention_block_before.eager,
+                    "attention_block_fused must not have fallen back to eager at \
+                     backbone_dtype={dtype} — before={attention_block_before:?} \
+                     after={attention_block_after:?}"
+                );
+                assert_eq!(
+                    flash_cascade_after.fused, flash_cascade_before.fused,
+                    "backbone_dtype={dtype} does not preempt attention_block via flash on this \
+                     build/dtype — the flash cascade must not have dispatched FUSED, got \
+                     before={flash_cascade_before:?} after={flash_cascade_after:?}"
+                );
+            }
         }
 
         for &(report_op, registry_key) in CASCADE_OPS {
@@ -415,10 +602,12 @@ async fn capability_surface() {
             tracing::info!(
                 op = report_op,
                 dtype = %dtype,
+                flash_should_preempt,
                 ?before,
                 ?after,
                 "capability_surface: cascade op observed (informational only — see this \
-                 file's CASCADE_OPS doc for why it is not asserted Holds)"
+                 file's CASCADE_OPS doc for why it is not asserted Holds, including its own \
+                 flash-preemption exposure)"
             );
         }
 
@@ -435,52 +624,32 @@ async fn capability_surface() {
             );
         }
 
+        for &op in KNOWN_NO_DISPATCH_SITE_OPS {
+            if !declared_ops.iter().any(|d| d == op) {
+                continue;
+            }
+            tracing::info!(
+                op,
+                dtype = %dtype,
+                "capability_surface: NO admission-gated dispatch site exists anywhere in this \
+                 workspace for this manifest-declared op (verified by reading every admit()/ \
+                 admit_cascade() call site) — never dispatches through ANY probe, forward or \
+                 backward; flagged for a manifest edit (exclude, or repoint at the real \
+                 dispatch-registry key), not claimed covered by the completed-run argument"
+            );
+        }
+
         for op in &declared_ops {
             if !mapped.contains(op.as_str()) {
                 tracing::info!(
                     op,
                     dtype = %dtype,
-                    "capability_surface: no dedicated dispatch-registry mapping for this \
-                     manifest-declared op — covered only by the coarser \"the probe forward \
-                     completed under Strict mode\" proof above (any admission Miss anywhere in \
-                     this op's dispatch would already have hard-errored that forward)"
+                    "capability_surface: no dedicated dispatch-registry mapping wired for this \
+                     manifest-declared op in this file today — UNVERIFIED by this probe (never \
+                     claimed as \"the completed run would have hard-errored\": that argument is \
+                     only sound for an op this file has confirmed genuinely dispatches)"
                 );
             }
-        }
-    }
-
-    // Flash: only meaningful (and only compiled at all) when this build
-    // turned on `flash-attn`. Cfg-off entirely otherwise — "flash arm cfg-off
-    // honest" per the campaign #443 W3 contract.
-    #[cfg(feature = "flash-attn")]
-    {
-        let flash_dtypes = manifest_string_list(&manifest, "flash_dtypes");
-        assert!(
-            !flash_dtypes.is_empty(),
-            "{MANIFEST_LANE:?}'s flash_dtypes must be non-empty when flash_compiled is true"
-        );
-        for dtype_name in &flash_dtypes {
-            let dtype: ComputePrecision = dtype_name.parse().unwrap_or_else(|e| {
-                panic!("manifest flash_dtypes entry {dtype_name:?} is not a known dtype: {e:?}")
-            });
-            let candle_dtype = compute_precision_to_candle_dtype(dtype);
-            let before =
-                jammi_kernels::admission::cascade_counters_for("attention_block_flash").snapshot();
-            build_and_probe_forward(&config, &weights_path, candle_dtype, &device).unwrap_or_else(
-                |e| {
-                    panic!(
-                        "capability_surface: the flash-dtype probe forward at \
-                         backbone_dtype={dtype} must complete under JAMMI_KERNELS_STRICT=1: {e}"
-                    )
-                },
-            );
-            let after =
-                jammi_kernels::admission::cascade_counters_for("attention_block_flash").snapshot();
-            assert!(
-                after.fused > before.fused,
-                "flash_dtypes declares {dtype_name:?} — the flash cascade must have dispatched \
-                 FUSED at least once for it, got before={before:?} after={after:?}"
-            );
         }
     }
 }

@@ -491,16 +491,16 @@ pub struct TrainingStatusInfo {
     /// blob, so it stays byte-identical to the wire field. Schema documented
     /// at the trainer, not here.
     pub metrics_json: Option<String>,
-    /// Claim-time GPU-acceleration determination for this job, as the opaque
-    /// JSON blob text the wire's `TrainingStatus.acceleration_report_json`
-    /// carries (esc-075) — the SAME catalog `training_jobs.
-    /// acceleration_report` column the embedded record read returns. Tri-state:
-    /// `None` for a legacy row predating the column (SQL `NULL`),
-    /// `Some(r#"{"state":"pending"}"#)` once submitted but not yet claimed, and
-    /// `Some(r#"{"state":"determined",...}"#)` once the claiming worker has
-    /// resolved the run's acceleration capability. This control-plane read
-    /// never decodes or re-encodes the blob, so it stays byte-identical to the
-    /// wire field.
+    /// GPU-acceleration determination for this job, as the opaque,
+    /// self-describing JSON blob text the wire's `TrainingStatus.
+    /// acceleration_report_json` carries (esc-075) — the SAME catalog
+    /// `training_jobs.acceleration_report` column the embedded record read
+    /// returns. `None` for a legacy row predating the column (SQL `NULL`);
+    /// otherwise a `"state"`-keyed object whose vocabulary is owned by the
+    /// payload's producer (e.g. `"pending"` before a determination exists,
+    /// `"determined"` once one does) and documented there, not enumerated
+    /// here. This control-plane read never decodes or re-encodes the blob, so
+    /// it stays byte-identical to the wire field.
     pub acceleration_report_json: Option<String>,
 }
 

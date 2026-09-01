@@ -830,6 +830,13 @@ DRV
   printf '%s\n' "$marker_wrapper_text" | grep -qF "printf '%s\\n' 'WAVE=mywave' 'TREE=mytree' 'TS=" \
     && ok "(i/one-pod-per-wave) rp_job_wrapper_with_marker_lines writes the active-wave claim (wave+tree) up front" \
     || bad "(i/one-pod-per-wave) rp_job_wrapper_with_marker_lines did not write the expected active-wave claim — got: $marker_wrapper_text"
+  # Every claim write and every claim removal is inside a flock critical
+  # section (fd 8 on RP_CLAIM_LOCK) — a reader never sees a half-written
+  # claim, and two holders launching at once never race on the store.
+  unlocked="$(printf '%s\n' "$marker_wrapper_text" | grep -F '.jammi-active-wave.d/' | grep -vc 'flock 8')"
+  [ "$unlocked" -eq 0 ] \
+    && ok "(i/one-pod-per-wave) every claim-store statement runs inside the flock critical section" \
+    || bad "(i/one-pod-per-wave) $unlocked claim-store statement(s) run OUTSIDE the flock — got: $marker_wrapper_text"
   # The claim write puts caller-supplied values in the remote printf's
   # ARGUMENT position, never its FORMAT position. With the value
   # interpolated into the format string, `--wave '%d'` made the pod's own
@@ -839,25 +846,27 @@ DRV
   # exotic values directly, BELOW the entrypoint allowlist, so the
   # generator is pinned independently of it.
   marker_wrapper_fmt="$(bash "$RUNPOD_DRIVER" rp_job_wrapper_with_marker_lines "/root/trees/t" "/root/target-t" "cargo test" "tok123" "0" '%d' 'a"b')"
-  claim_line="$(printf '%s\n' "$marker_wrapper_fmt" | grep -F '.jammi-active-wave' | grep -vF 'rm -f')"
+  claim_line="$(printf '%s\n' "$marker_wrapper_fmt" | grep -F ".claim'" | grep -vF 'rm -f')"
   case "$claim_line" in
-    "printf '%s\n' 'WAVE=%d' 'TREE=a\"b' 'TS="*)
+    "( flock 8; printf '%s\n' 'WAVE=%d' 'TREE=a\"b' 'TS="*)
       ok "(i/one-pod-per-wave) a '%d' wave and a quote-bearing tree stay INERT DATA in the claim write (argument position, single-quoted)" ;;
     *)
       bad "(i/one-pod-per-wave) caller-supplied wave/tree must not reach the remote printf's format position — got: $claim_line" ;;
   esac
   # And the generated text, executed, writes those values VERBATIM — the
-  # end-to-end form of the same property (no format expansion, no escape).
+  # end-to-end form of the same property (no format expansion, no escape,
+  # and the claim FILENAME the tree name lands in stays inert too).
   claim_sandbox="$SANDBOX/i_claimfmt"; rm -rf "$claim_sandbox"; mkdir -p "$claim_sandbox"
-  printf '%s\n' "${claim_line//\/root\/.jammi-active-wave/$claim_sandbox/.jammi-active-wave}" > "$claim_sandbox/write.sh"
+  printf '%s\n' "$marker_wrapper_fmt" | grep -F '.jammi-active-wave' | grep -vF 'rm -f' \
+    | sed "s#/root/.jammi-active-wave#$claim_sandbox/.jammi-active-wave#g" > "$claim_sandbox/write.sh"
   bash "$claim_sandbox/write.sh"
-  claim_head="$(head -2 "$claim_sandbox/.jammi-active-wave")"
+  claim_head="$(head -2 "$claim_sandbox/.jammi-active-wave.d/a\"b.claim" 2>/dev/null)"
   if [ "$claim_head" = "$(printf 'WAVE=%%d\nTREE=a"b')" ]; then
     ok "(i/one-pod-per-wave) executing the claim write records the %d wave and the quote-bearing tree VERBATIM — no format expansion, no injection"
   else
     bad "(i/one-pod-per-wave) the executed claim write mangled its values — got: $claim_head"
   fi
-  clear_count="$(printf '%s\n' "$marker_wrapper_text" | grep -cF 'rm -f /root/.jammi-active-wave')"
+  clear_count="$(printf '%s\n' "$marker_wrapper_text" | grep -cF "rm -f '/root/.jammi-active-wave.d/mytree.claim'")"
   [ "$clear_count" -ge 1 ] \
     && ok "(i/one-pod-per-wave) rp_job_wrapper_with_marker_lines clears the active-wave claim on normal completion" \
     || bad "(i/one-pod-per-wave) rp_job_wrapper_with_marker_lines never clears the active-wave claim — got: $marker_wrapper_text"
@@ -873,10 +882,48 @@ DRV
   # though the actual job command never ran) — two `rm -f` occurrences
   # total in the timing=1 text: one on the lock-refused arm, one on normal
   # completion.
-  clear_count_timing="$(printf '%s\n' "$marker_wrapper_timing" | grep -cF 'rm -f /root/.jammi-active-wave')"
+  clear_count_timing="$(printf '%s\n' "$marker_wrapper_timing" | grep -cF "rm -f '/root/.jammi-active-wave.d/mytree.claim'")"
   [ "$clear_count_timing" -ge 2 ] \
-    && ok "(i/one-pod-per-wave) timing=1's lock-refused early exit ALSO clears the active-wave claim, not only normal completion" \
+    && ok "(i/one-pod-per-wave) timing=1's lock-refused early exit ALSO clears this holder's claim, not only normal completion" \
     || bad "(i/one-pod-per-wave) expected the claim cleared on BOTH the lock-refused and normal-completion paths (got $clear_count_timing occurrence(s)) — got: $marker_wrapper_timing"
+  # Ordering: under --timing the claim is written only AFTER the timing
+  # lock is held. A run whose `flock -n 9` is REFUSED never ran a job, so
+  # it must never have appeared in the store on behalf of that job.
+  flock_ln="$(printf '%s\n' "$marker_wrapper_timing" | grep -n 'flock -n 9' | head -1 | cut -d: -f1)"
+  claim_ln="$(printf '%s\n' "$marker_wrapper_timing" | grep -nF "> '/root/.jammi-active-wave.d/mytree.claim'" | head -1 | cut -d: -f1)"
+  { [ -n "$flock_ln" ] && [ -n "$claim_ln" ] && [ "$claim_ln" -gt "$flock_ln" ]; } \
+    && ok "(i/one-pod-per-wave) timing=1 writes the claim only AFTER acquiring the timing lock (claim line $claim_ln > flock line $flock_ln)" \
+    || bad "(i/one-pod-per-wave) the claim write must follow the timing-lock acquisition (flock line '$flock_ln', claim line '$claim_ln') — got: $marker_wrapper_timing"
+
+  # Co-tenancy, executed: TWO same-wave holders on different trees each
+  # write their OWN claim file, both survive, and the first holder's own
+  # completion path removes ONLY its own — the second holder stays visible
+  # to the concurrency gate. With one shared claim file, holder B's launch
+  # overwrote holder A's claim and holder A's completion deleted the claim
+  # B was still relying on, leaving a busy pod reading as unclaimed.
+  cot="$SANDBOX/i_cotenancy"; rm -rf "$cot"; mkdir -p "$cot"
+  rebase_claim_store() { # $1=generated text -> the same text against $cot
+    printf '%s\n' "${1//\/root\/.jammi-active-wave/$cot/.jammi-active-wave}"
+  }
+  hold_a="$(bash "$RUNPOD_DRIVER" rp_job_wrapper_with_marker_lines "/root/trees/tree-a" "/root/target-a" ":" "tokA" "0" "wave-A" "tree-a")"
+  hold_b="$(bash "$RUNPOD_DRIVER" rp_job_wrapper_with_marker_lines "/root/trees/tree-b" "/root/target-b" ":" "tokB" "0" "wave-A" "tree-b")"
+  rebase_claim_store "$hold_a" | grep -F '.jammi-active-wave' | grep -vF 'rm -f' > "$cot/write-a.sh"
+  rebase_claim_store "$hold_b" | grep -F '.jammi-active-wave' | grep -vF 'rm -f' > "$cot/write-b.sh"
+  rebase_claim_store "$hold_a" | grep -F '.jammi-active-wave' | grep -F 'rm -f' > "$cot/clear-a.sh"
+  bash "$cot/write-a.sh"; bash "$cot/write-b.sh"
+  claims_after_both="$(find "$cot/.jammi-active-wave.d" -name '*.claim' 2>/dev/null | wc -l | tr -d ' ')"
+  [ "$claims_after_both" = "2" ] \
+    && ok "(i/one-pod-per-wave) two same-wave holders on different trees BOTH hold a claim (neither clobbers the other)" \
+    || bad "(i/one-pod-per-wave) expected 2 surviving claims for two same-wave holders (got $claims_after_both)"
+  bash "$cot/clear-a.sh"
+  if [ ! -f "$cot/.jammi-active-wave.d/tree-a.claim" ] && [ -f "$cot/.jammi-active-wave.d/tree-b.claim" ]; then
+    ok "(i/one-pod-per-wave) a holder's completion removes ONLY its own claim — the co-tenant's claim survives"
+  else
+    bad "(i/one-pod-per-wave) holder A's completion must remove exactly its own claim (a=$([ -f "$cot/.jammi-active-wave.d/tree-a.claim" ] && echo present || echo gone), b=$([ -f "$cot/.jammi-active-wave.d/tree-b.claim" ] && echo present || echo gone))"
+  fi
+  [ "$(cat "$cot/.jammi-active-wave.d/tree-b.claim" 2>/dev/null | head -2)" = "$(printf 'WAVE=wave-A\nTREE=tree-b')" ] \
+    && ok "(i/one-pod-per-wave) the surviving co-tenant's claim still names ITS own wave and tree" \
+    || bad "(i/one-pod-per-wave) the surviving claim's content is wrong — got: $(cat "$cot/.jammi-active-wave.d/tree-b.claim" 2>/dev/null)"
 
   # target-then-push composition, end to end, on a LOCAL fixture pod
   # filesystem (real pod_target_clone.sh, real rsync, real exclude list —

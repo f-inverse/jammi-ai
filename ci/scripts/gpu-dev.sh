@@ -956,7 +956,7 @@ EOF
           BUSY_WAVE="${BUSY_REST%%:*}"
           BUSY_SESSION="${BUSY_REST#*:}"
           if [ "$BUSY_WAVE" = "UNKNOWN" ]; then
-            echo "::error::run refused: this pod already has a live job (tmux session ${BUSY_SESSION}) but its wave identity could not be determined (no readable /root/.jammi-active-wave claim) — one-pod-per-wave fails CLOSED on an unknown wave." >&2
+            echo "::error::run refused: this pod already has a live job (tmux session ${BUSY_SESSION}) but its wave identity could not be determined (no readable claim in /root/.jammi-active-wave.d) — one-pod-per-wave fails CLOSED on an unknown wave." >&2
           else
             echo "::error::run refused: this pod already has a live job for wave '${BUSY_WAVE}' (tmux session ${BUSY_SESSION}) — one-pod-per-wave, wave-scoped. Pass --wave ${BUSY_WAVE} (or RP_WAVE=${BUSY_WAVE}) if this job is really part of that same wave." >&2
           fi

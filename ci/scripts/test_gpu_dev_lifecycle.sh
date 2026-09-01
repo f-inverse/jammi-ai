@@ -1711,14 +1711,14 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 
 # --- 10a: rp_concurrency_preflight_lines classifies BUSY/CLEAR correctly
-# against a FAKED `tmux` + a fixture `/root/.jammi-active-wave`-shaped file
-# — no ssh, no pod, no mocking of gpu-dev.sh itself. Same isolation
+# against a FAKED `tmux` + a fixture claim store (RP_CLAIM_DIR-shaped) —
+# no ssh, no pod, no mocking of gpu-dev.sh itself. Same isolation
 # rationale as 9a (subshell + group-local results file + outer tally,
 # since `ok`/`bad` mutate counters a subshell cannot persist). The real
-# function hardcodes `/root/.jammi-active-wave`; these cases patch that
-# ONE literal path in the GENERATED text to a sandbox path before
-# executing it (never touching a real /root) — the generated text is
-# otherwise run completely unmodified.
+# function hardcodes the `/root/.jammi-active-wave`-prefixed store paths;
+# these cases patch that ONE literal prefix in the GENERATED text to a
+# sandbox path before executing it (never touching a real /root) — the
+# generated text is otherwise run completely unmodified.
 G10A_RESULTS="$SANDBOX/g10a-results.log"
 : > "$G10A_RESULTS"
 (
@@ -1747,9 +1747,19 @@ STUB
     PATH="$G10A_STUBDIR:$PATH" bash -c "$gen"
   }
 
+  # The claim store the real writer maintains: one file per HOLDER, named
+  # by that holder's tree (rp_job_wrapper_with_marker_lines writes exactly
+  # this shape; see RP_CLAIM_DIR's own doc for why it is a directory).
+  G10A_CLAIMS="$G10A_ROOT/.jammi-active-wave.d"
+  claim() { # $1=tree $2=wave
+    mkdir -p "$G10A_CLAIMS"
+    printf 'WAVE=%s\nTREE=%s\nTS=2026-09-01T00:00:00Z\n' "$2" "$1" > "$G10A_CLAIMS/$1.claim"
+  }
+  no_claims() { rm -rf "$G10A_CLAIMS"; }
+
   fake_tmux $'jammi-seed\njammi-othertree\njammi-mywork\n'
-  rm -f "$G10A_ROOT/.jammi-active-wave"
-  printf 'WAVE=wave-B\nTREE=othertree\nTS=2026-09-01T00:00:00Z\n' > "$G10A_ROOT/.jammi-active-wave"
+  no_claims
+  claim othertree wave-B
   out="$(run_preflight "jammi-mywork" "wave-A")"
   if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=BUSY:wave-B:jammi-othertree" ]; then
     record PASS "rp_concurrency_preflight_lines: cross-wave (live other tree's claim names a DIFFERENT wave) classified BUSY, naming the owning wave and the session"
@@ -1757,7 +1767,7 @@ STUB
     record FAIL "rp_concurrency_preflight_lines: expected BUSY:wave-B:jammi-othertree (got: $out)"
   fi
 
-  printf 'WAVE=wave-A\nTREE=othertree\nTS=2026-09-01T00:00:00Z\n' > "$G10A_ROOT/.jammi-active-wave"
+  claim othertree wave-A
   out="$(run_preflight "jammi-mywork" "wave-A")"
   if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=CLEAR" ]; then
     record PASS "rp_concurrency_preflight_lines: same-wave-two-trees (live other tree's claim names the SAME wave) classified CLEAR — the sanctioned sub-unit-sharing shape"
@@ -1765,7 +1775,7 @@ STUB
     record FAIL "rp_concurrency_preflight_lines: expected CLEAR for a matching wave claim on a different tree (got: $out)"
   fi
 
-  rm -f "$G10A_ROOT/.jammi-active-wave"
+  no_claims
   out="$(run_preflight "jammi-mywork" "wave-A")"
   if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=BUSY:UNKNOWN:jammi-othertree" ]; then
     record PASS "rp_concurrency_preflight_lines: a live other session with NO readable active-wave claim fails CLOSED (BUSY:UNKNOWN), never silently assumed safe"
@@ -1798,7 +1808,7 @@ STUB
   # says — failing OPEN on staleness, per this campaign's own instruction,
   # rather than refusing forever on an orphaned file no process will ever
   # clean up again.
-  printf 'WAVE=wave-B\nTREE=othertree\nTS=2020-01-01T00:00:00Z\n' > "$G10A_ROOT/.jammi-active-wave"
+  claim othertree wave-B
   out="$(run_preflight "jammi-mywork" "wave-A")"
   if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=CLEAR" ]; then
     record PASS "rp_concurrency_preflight_lines: a stale claim (file present, NO live tmux session for it) is treated CLEAR -- tmux liveness is the primary signal, fail OPEN on staleness"
@@ -1816,7 +1826,8 @@ STUB
   # function itself regardless of any entrypoint validation layered above it.
   metachar_case() { # $1=own_session $2=session list $3=expected other session
     fake_tmux "$2"
-    printf 'WAVE=wave-B\nTREE=othertree\nTS=2026-09-01T00:00:00Z\n' > "$G10A_ROOT/.jammi-active-wave"
+    no_claims
+    claim "${3#jammi-}" wave-B
     local out; out="$(run_preflight "$1" "wave-A")"
     if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=BUSY:wave-B:$3" ]; then
       record PASS "rp_concurrency_preflight_lines: own-session '$1' excluded LITERALLY — the live cross-wave session '$3' is still seen (BUSY), never regex-swallowed"
@@ -1837,6 +1848,58 @@ STUB
   # Prefix collision (regression pin for the `-x` whole-line anchor, which
   # `-F` must not silently drop): `jammi-abc` may never exclude `jammi-abcd`.
   metachar_case 'jammi-abc' $'jammi-seed\njammi-abcd\njammi-abc\n' 'jammi-abcd'
+
+  # --- N same-wave holders at once (the sanctioned co-tenancy shape) -----
+  # Every live holder is independently represented in the store, so a wave
+  # whose sub-units already occupy the pod on two other trees still reads
+  # CLEAR for a third sub-unit of that same wave. Under a single shared
+  # claim file only the LAST writer existed at all, and the first holder to
+  # finish deleted the claim the others were still relying on.
+  fake_tmux $'jammi-seed\njammi-tree-a\njammi-tree-b\njammi-mywork\n'
+  no_claims
+  claim tree-a wave-A
+  claim tree-b wave-A
+  out="$(run_preflight "jammi-mywork" "wave-A")"
+  if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=CLEAR" ]; then
+    record PASS "rp_concurrency_preflight_lines: TWO live same-wave holders are both represented — a third sub-unit of that wave reads CLEAR"
+  else
+    record FAIL "rp_concurrency_preflight_lines: expected CLEAR with two live same-wave holders (got: $out)"
+  fi
+
+  # A cross-wave holder among same-wave ones still refuses, naming THAT
+  # holder's own wave and session (not merely 'some other session').
+  claim tree-b wave-B
+  out="$(run_preflight "jammi-mywork" "wave-A")"
+  if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=BUSY:wave-B:jammi-tree-b" ]; then
+    record PASS "rp_concurrency_preflight_lines: a cross-wave holder among same-wave holders still refuses, naming that holder's own wave and session"
+  else
+    record FAIL "rp_concurrency_preflight_lines: expected BUSY:wave-B:jammi-tree-b with a cross-wave holder present (got: $out)"
+  fi
+
+  # Per-holder staleness: tree-a's cross-wave claim survives on disk but
+  # its session is gone (SIGKILL/pod death interrupted the wrapper's own
+  # cleanup), so it is reaped by the SAME liveness rule the whole-pod
+  # signal uses and must not refuse the live same-wave holder.
+  fake_tmux $'jammi-seed\njammi-tree-b\njammi-mywork\n'
+  no_claims
+  claim tree-a wave-B
+  claim tree-b wave-A
+  out="$(run_preflight "jammi-mywork" "wave-A")"
+  if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=CLEAR" ]; then
+    record PASS "rp_concurrency_preflight_lines: a STALE holder (claim on disk, its own session gone) is reaped per-holder — the live same-wave holder still reads CLEAR"
+  else
+    record FAIL "rp_concurrency_preflight_lines: expected CLEAR with a stale cross-wave holder and a live same-wave holder (got: $out)"
+  fi
+
+  # ...and staleness never launders a LIVE cross-wave holder: same store,
+  # tree-a alive again, must refuse.
+  fake_tmux $'jammi-seed\njammi-tree-a\njammi-tree-b\njammi-mywork\n'
+  out="$(run_preflight "jammi-mywork" "wave-A")"
+  if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=BUSY:wave-B:jammi-tree-a" ]; then
+    record PASS "rp_concurrency_preflight_lines: the same cross-wave claim refuses once ITS session is live again — staleness is a liveness fact, not a permanent exemption"
+  else
+    record FAIL "rp_concurrency_preflight_lines: expected BUSY:wave-B:jammi-tree-a once the holder's session is live (got: $out)"
+  fi
 )
 while IFS=: read -r status name; do
   [ -n "$status" ] || continue

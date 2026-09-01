@@ -713,6 +713,30 @@ fi
 EOF
 }
 
+# The pod-global one-pod-per-wave claim store, named ONCE here and
+# interpolated into every generated remote script that touches it (the
+# reader below, the writer in rp_job_wrapper_with_marker_lines).
+#
+# A DIRECTORY of per-holder claims, never one shared file: same-wave
+# co-tenancy is the sanctioned shape (a wave's sub-units sharing one warm
+# seed), so N holders are live at once and a single file can only ever
+# record the last writer. With one file, holder B's launch overwrote
+# holder A's claim and holder A's completion then deleted the claim B was
+# still relying on — after which the pod, still genuinely busy, read as
+# "no claim" to the next `run`. One file per holder, keyed by the holder's
+# TREE (the pod runs at most one job per tree: `run` kills any existing
+# `jammi-<tree>` session before starting a new one, so a same-tree re-run
+# refreshes its own claim in place rather than colliding), makes every
+# holder independently visible and independently removable.
+#
+# Every write and every removal happens inside a flock on RP_CLAIM_LOCK, so
+# a reader never observes a half-written claim and two launching holders
+# never race on the store's creation. RP_CLAIM_LOCK is a separate lock from
+# `/root/.jammi-timing.lock` (which serialises whole JOBS for `--timing`);
+# this one is held only for the length of a single claim write or removal.
+RP_CLAIM_DIR='/root/.jammi-active-wave.d'
+RP_CLAIM_LOCK='/root/.jammi-active-wave.lock'
+
 # esc-077-class (one-pod-per-wave, WAVE-scoped): the shell TEXT that checks
 # whether this pod is genuinely BUSY with a DIFFERENT wave's job —
 # mechanizes the one-pod-per-wave norm (an operator kept re-learning it from
@@ -723,31 +747,34 @@ EOF
 # one warm seed). Two signals, tmux liveness PRIMARY:
 #   1. Is any OTHER jammi-* tmux JOB session alive at all (`jammi-seed`, the
 #      boot-time build-substrate seed, and this tree's OWN session are
-#      excluded — same exclusions as before)? If not, CLEAR — regardless of
-#      whatever `/root/.jammi-active-wave` happens to still say (a claim
-#      whose session already ended is definitionally stale: the wrapper
-#      that wrote it, rp_job_wrapper_with_marker_lines, removes it at BOTH
-#      of its own exit paths, so a leftover claim with no live session can
-#      only mean the wrapper's own cleanup was interrupted — SIGKILL/pod
-#      death — never a job that finished normally. Failing OPEN on that
-#      staleness, rather than refusing forever on an orphaned file, is the
-#      deliberate choice here: tmux's own liveness check is what actually
-#      answers "is the pod busy right now", and a stale claim answers
-#      nothing).
-#   2. Only if another session IS alive: read that claim's WAVE field. The
-#      SAME wave on a DIFFERENT tree is exactly the sanctioned shape (a
-#      wave's own sub-units sharing one pod) -> CLEAR; a DIFFERENT wave (or
-#      no readable claim at all, e.g. a job launched by tooling that
-#      predates this wave-scoping, or a session started outside `run`
-#      entirely) -> BUSY, failing CLOSED (the old tree-scoped behavior) on
-#      that ambiguity rather than guessing it is safe to share.
+#      excluded)? If not, CLEAR — regardless of what any claim file happens
+#      to still say (a claim whose session already ended is definitionally
+#      stale: the wrapper that wrote it, rp_job_wrapper_with_marker_lines,
+#      removes it at BOTH of its own exit paths, so a leftover claim with
+#      no live session can only mean the wrapper's own cleanup was
+#      interrupted — SIGKILL/pod death — never a job that finished
+#      normally. Failing OPEN on that staleness, rather than refusing
+#      forever on an orphaned file, is the deliberate choice here: tmux's
+#      own liveness check is what actually answers "is the pod busy right
+#      now", and a stale claim answers nothing).
+#   2. Only if another session IS alive: aggregate EVERY holder's claim in
+#      RP_CLAIM_DIR, skipping this session's own and skipping any holder
+#      whose own `jammi-<TREE>` session is no longer alive (per-holder
+#      staleness, the same liveness rule signal 1 applies to the pod as a
+#      whole). Same-wave co-tenancy is sanctioned, so ALL surviving holders
+#      must name THIS wave for CLEAR; the FIRST holder naming a different
+#      wave is reported BUSY, naming that holder's own wave and session
+#      rather than an arbitrary "some other session". No surviving holder
+#      at all (a job launched by tooling that predates the claim store, or
+#      a session started outside `run` entirely) -> BUSY:UNKNOWN, failing
+#      CLOSED on the ambiguity rather than guessing it is safe to share.
 # $1=this tree's own tmux session name (e.g. "jammi-mywork", TMUX_SESSION
 # at the call site) $2=this run's own wave id (WAVE at the call site,
 # defaults to the tree name — see gpu-dev.sh's own WAVE resolution). A
 # plain function, directly testable the same way rp_target_preflight_lines
-# is (source this file, run the printed text against a faked `tmux` +a
-# fixture `/root/.jammi-active-wave`-shaped file on PATH/disk — no ssh, no
-# pod). Prints exactly one line:
+# is (source this file, run the printed text against a faked `tmux` + a
+# fixture claim store on PATH/disk — no ssh, no pod). Prints exactly one
+# line:
 #   GPU_DEV_CONCURRENCY_STATE=CLEAR
 #   GPU_DEV_CONCURRENCY_STATE=BUSY:<owning-wave-or-UNKNOWN>:<other-session>
 # NOTE on the heredoc body below: this is TEXT generated for REMOTE
@@ -779,21 +806,36 @@ rp_concurrency_preflight_lines() {
   local own_session="${1:?rp_concurrency_preflight_lines needs its own tmux session name}" \
         own_wave="${2:?rp_concurrency_preflight_lines needs its own wave id}"
   cat <<EOF
-other="\$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^jammi-' | grep -Fvx -e 'jammi-seed' | grep -Fvx -e '${own_session}' | head -1)" # tripwire-ok: tmux list-sessions exits non-zero with no server/sessions at all -- a real, expected, checked state (an empty \$other, handled by the if/else right below), never a silent pass on a real error this remote script would otherwise need to escalate
+live="\$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^jammi-')" # tripwire-ok: tmux list-sessions exits non-zero with no server/sessions at all -- a real, expected, checked state (an empty \$live, which makes \$other empty and lands on the CLEAR branch below), never a silent pass on a real error this remote script would otherwise need to escalate
+other="\$(printf '%s\\n' "\$live" | grep -Fvx -e 'jammi-seed' | grep -Fvx -e '${own_session}' | head -1)" # tripwire-ok: grep -v legitimately matches nothing when this tree's own session is the only one -- the empty \$other IS the CLEAR state, handled by the if/else right below
 # shellcheck disable=SC2157
 if [ -z "\$other" ]; then
   echo "GPU_DEV_CONCURRENCY_STATE=CLEAR"
 else
-  claim_wave=""
-  if [ -f /root/.jammi-active-wave ]; then
-    claim_wave="\$(grep '^WAVE=' /root/.jammi-active-wave 2>/dev/null | head -1 | cut -d= -f2-)" # tripwire-ok: an absent/unreadable/malformed claim file is a real, checked state (empty claim_wave, handled by the elif chain right below as the fail-closed UNKNOWN case), never a silent pass
-  fi
-  if [ -z "\$claim_wave" ]; then
+  busy_wave=""
+  busy_session=""
+  holders=0
+  for claim in ${RP_CLAIM_DIR}/*.claim; do
+    [ -f "\$claim" ] || continue
+    claim_wave="\$(grep '^WAVE=' "\$claim" 2>/dev/null | head -1 | cut -d= -f2-)" # tripwire-ok: an unreadable/malformed claim file is a real, checked state (the empty-field guard on the next line drops it, and a store with no readable holder at all lands on the fail-closed UNKNOWN branch below), never a silent pass
+    claim_tree="\$(grep '^TREE=' "\$claim" 2>/dev/null | head -1 | cut -d= -f2-)" # tripwire-ok: same as claim_wave above -- both fields are required, and a claim missing either is dropped by the guard on the next line
+    [ -n "\$claim_wave" ] && [ -n "\$claim_tree" ] || continue
+    claim_session="jammi-\$claim_tree"
+    [ "\$claim_session" = '${own_session}' ] && continue
+    printf '%s\\n' "\$live" | grep -Fxq -e "\$claim_session" || continue
+    holders=\$((holders + 1))
+    if [ "\$claim_wave" != '${own_wave}' ]; then
+      busy_wave="\$claim_wave"
+      busy_session="\$claim_session"
+      break
+    fi
+  done
+  if [ -n "\$busy_wave" ]; then
+    echo "GPU_DEV_CONCURRENCY_STATE=BUSY:\$busy_wave:\$busy_session"
+  elif [ "\$holders" -eq 0 ]; then
     echo "GPU_DEV_CONCURRENCY_STATE=BUSY:UNKNOWN:\$other"
-  elif [ "\$claim_wave" = '${own_wave}' ]; then
-    echo "GPU_DEV_CONCURRENCY_STATE=CLEAR"
   else
-    echo "GPU_DEV_CONCURRENCY_STATE=BUSY:\$claim_wave:\$other"
+    echo "GPU_DEV_CONCURRENCY_STATE=CLEAR"
   fi
 fi
 EOF
@@ -871,18 +913,23 @@ rp_job_wrapper_lines() {
 # checkout path).
 #
 # Wave-scoped one-pod-per-wave claim (folded into this SAME start/end
-# lifecycle `.jammi.exit` already uses, per that marker's own idiom):
-# `/root/.jammi-active-wave` (one file, POD-global — a pod hosts one job at
-# a time regardless of tree) is WRITTEN at the very START, before the job
-# ever runs, so a concurrent `run` on another tree sees the claim the
-# instant this one launches; it is REMOVED whenever this wrapper's own
-# execution ends — normal completion AND the lock-refused (timing) early
-# exit both clear it, so a stale claim can only ever be "wrapper cleanup
-# was interrupted" (SIGKILL/pod death), never "a job finished and cleanup
-# was forgotten". `rp_concurrency_preflight_lines` (below) reads this file
-# and, per this campaign's own instruction, treats a claim with NO matching
-# live tmux session as CLEAR (fail OPEN on staleness) rather than refusing
-# forever on an orphaned file — tmux liveness stays the PRIMARY signal.
+# lifecycle `.jammi.exit` already uses, per that marker's own idiom): THIS
+# holder's own claim file in RP_CLAIM_DIR (see that constant's doc for why
+# the store is a directory of per-holder files and not one shared file) is
+# WRITTEN before the job runs, so a concurrent `run` sees this holder the
+# instant it launches, and REMOVED whenever this wrapper's execution ends —
+# normal completion AND the lock-refused (timing) early exit both clear it,
+# so a stale claim can only ever be "wrapper cleanup was interrupted"
+# (SIGKILL/pod death), never "a job finished and cleanup was forgotten".
+# Every write and removal runs inside a flock on RP_CLAIM_LOCK (fd 8).
+#
+# Under `timing=1` the claim write comes AFTER the timing lock is acquired,
+# never before: a run whose `flock -n 9` is REFUSED never became a holder
+# at all, and writing its claim first meant a refused run touched the store
+# on behalf of a job that never ran. `rp_concurrency_preflight_lines`
+# (above) reads the store and treats a holder with NO matching live tmux
+# session as absent (fail OPEN on staleness) rather than refusing forever
+# on an orphaned file — tmux liveness stays the PRIMARY signal.
 rp_job_wrapper_with_marker_lines() {
   local tree_dir="${1:?rp_job_wrapper_with_marker_lines needs a tree dir}" \
         target_dir="${2:?rp_job_wrapper_with_marker_lines needs a target dir}" \
@@ -892,27 +939,30 @@ rp_job_wrapper_with_marker_lines() {
         wave="${6:?rp_job_wrapper_with_marker_lines needs a wave id}" \
         tree_name="${7:?rp_job_wrapper_with_marker_lines needs a tree name}"
   printf "rm -f '%s/.jammi.exit'\n" "$tree_dir"
-  # `printf '%s\n' 'WAVE=...' ...` — never `printf "WAVE=%s\n..." "$wave"`
-  # with the value interpolated into the GENERATED text's own format
-  # string. A caller-supplied wave/tree landed in the REMOTE printf's
-  # FORMAT position there: `--wave '%d'` made the pod's own printf consume
-  # a (missing) argument and write `WAVE=0`, and a `"` closed the format
-  # string outright, turning the rest of the line into remote shell code.
-  # Here the values sit in ARGUMENT position, single-quoted; the allowlist
-  # every entrypoint applies (rp_name_allowlist_check) is what guarantees
-  # neither can contain the `'` that would close those quotes.
-  printf "printf '%%s\\\\n' 'WAVE=%s' 'TREE=%s' 'TS=%s' > /root/.jammi-active-wave\n" \
-    "$wave" "$tree_name" "$(date -u +%FT%TZ)"
+  # This holder's own claim file, and the write/removal statements that
+  # maintain it — built ONCE here and emitted on every path below, so the
+  # three sites can never drift apart. Both statements run inside a flock
+  # on RP_CLAIM_LOCK (fd 8): a reader never sees a half-written claim, and
+  # two holders launching at once never race on the store's creation.
+  local claim_file="${RP_CLAIM_DIR}/${tree_name}.claim" claim_write claim_clear
+  claim_write="$(printf "mkdir -p %s\n( flock 8; printf '%%s\\\\n' 'WAVE=%s' 'TREE=%s' 'TS=%s' > '%s' ) 8>%s" \
+    "$RP_CLAIM_DIR" "$wave" "$tree_name" "$(date -u +%FT%TZ)" "$claim_file" "$RP_CLAIM_LOCK")"
+  claim_clear="$(printf "( flock 8; rm -f '%s' ) 8>%s" "$claim_file" "$RP_CLAIM_LOCK")"
   if [ "$timing" = "1" ]; then
+    # The timing lock FIRST, this holder's claim only once it is held: a
+    # refused run never ran a job, so it must never appear in the store.
+    # Its own claim is still cleared on the refusal path, which reaps a
+    # claim an EARLIER, SIGKILLed run on this same tree may have left.
     cat <<FLOCKEOF
 exec 9>/root/.jammi-timing.lock
 if ! flock -n 9; then
   printf '{"token":"${token}","rc":75,"lock_refused":true}' > '${tree_dir}/.jammi.exit'
-  rm -f /root/.jammi-active-wave
+${claim_clear}
   exit 75
 fi
 FLOCKEOF
   fi
+  printf '%s\n' "$claim_write"
   rp_job_env_lines "$tree_dir" "$target_dir"
   # `( job )` — a SUBSHELL, never the bare job text directly in this script
   # — so a job command that happens to invoke the shell's own `exit` builtin
@@ -927,7 +977,7 @@ FLOCKEOF
   cat <<MARKEREOF
 __jammi_job_rc=\$?
 printf '{"token":"${token}","rc":'"\$__jammi_job_rc"',"lock_refused":false}' > '${tree_dir}/.jammi.exit'
-rm -f /root/.jammi-active-wave
+${claim_clear}
 exit "\$__jammi_job_rc"
 MARKEREOF
 }

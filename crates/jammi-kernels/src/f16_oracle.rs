@@ -48,16 +48,22 @@
 //!    `softmax`) — distinct from "single point" because it exercises the
 //!    reduction machinery at a nontrivial size while still being
 //!    analytically exact.
-//! 4. **Out-of-range** — a magnitude at or beyond `F16_MAX` (run through
-//!    `assert_saturates_to_infinity`), and — for the underflow-to-zero
-//!    contract — a magnitude at or below `F16_UNDERFLOW_TIE` (HALF of
-//!    `F16_MIN_POSITIVE_SUBNORMAL`, run through `assert_underflows_to_zero`).
-//!    A magnitude strictly BETWEEN `F16_UNDERFLOW_TIE` and
-//!    `F16_MIN_POSITIVE_SUBNORMAL` is a DIFFERENT boundary case — it rounds
-//!    UP to the nonzero subnormal under round-to-nearest-even, not down to
-//!    zero (see `F16_UNDERFLOW_TIE`'s own doc) — and must never be run
-//!    through `assert_underflows_to_zero`, which now refuses it. Neither
-//!    band is covered by the op's ordinary tolerance-vs-reference comparison.
+//! 4. **Out-of-range** — a magnitude at or beyond `F16_OVERFLOW_TIE` (the
+//!    midpoint between `F16_MAX` and `65536.0` — NOT `F16_MAX` itself; run
+//!    through `assert_saturates_to_infinity`), and — for the
+//!    underflow-to-zero contract — a magnitude at or below
+//!    `F16_UNDERFLOW_TIE` (HALF of `F16_MIN_POSITIVE_SUBNORMAL`, run
+//!    through `assert_underflows_to_zero`). Each tie has an OPEN band on
+//!    its finite side that is a DIFFERENT boundary case, covered by
+//!    NEITHER boundary helper NOR the op's ordinary tolerance-vs-reference
+//!    comparison: a magnitude strictly BETWEEN `F16_MAX` and
+//!    `F16_OVERFLOW_TIE` rounds DOWN to finite `F16_MAX`, not up to `±inf`
+//!    (see `F16_OVERFLOW_TIE`'s own doc); a magnitude strictly BETWEEN
+//!    `F16_UNDERFLOW_TIE` and `F16_MIN_POSITIVE_SUBNORMAL` rounds UP to the
+//!    nonzero subnormal, not down to zero (see `F16_UNDERFLOW_TIE`'s own
+//!    doc). `assert_saturates_to_infinity`/`assert_underflows_to_zero` both
+//!    refuse (panic on) an input from their respective open band rather
+//!    than silently asserting the wrong outcome for it.
 
 use half::f16;
 
@@ -104,28 +110,66 @@ pub const F16_MIN_POSITIVE_SUBNORMAL: f32 = 5.960_464_5e-8; // 2^-24
 /// F16_MIN_POSITIVE_SUBNORMAL's own derivation)`.
 pub const F16_UNDERFLOW_TIE: f32 = F16_MIN_POSITIVE_SUBNORMAL / 2.0; // 2^-25
 
-/// BEHAVIORAL saturation contract: an `x` STRICTLY BEYOND [`F16_MAX`] in
-/// magnitude converts to `±inf` under round-to-nearest (IEEE754 binary16
-/// overflow), NEVER a clamped finite value and never a silently wrong
-/// number. Note `F16_MAX` ITSELF is finite and exactly representable (it
-/// is the largest finite f16, not a saturation trigger) — this contract
-/// is about magnitudes beyond it. Panics if `x` is not actually beyond the
-/// boundary (a caller error, not a test failure signal) or if the
-/// conversion fails to saturate, or saturates with the wrong sign.
+/// The round-to-finite / round-to-infinity TIE point for f16's overflow
+/// boundary: the arithmetic midpoint between [`F16_MAX`] (the largest
+/// finite f16, `65504`) and `65536` (`2^16`, the smallest magnitude the
+/// NEXT exponent would represent if f16's 5-bit exponent field had room for
+/// it — it doesn't, so this is a conceptual "next candidate", not an
+/// f16-representable value). This — NOT `F16_MAX` itself — is the true
+/// domain boundary [`assert_saturates_to_infinity`] validates against.
+///
+/// Under IEEE754 round-to-nearest-EVEN: a magnitude strictly between
+/// `F16_MAX` and this tie rounds DOWN to the finite `F16_MAX` (`65504`);
+/// a magnitude at OR above this tie rounds to `±inf`. Unlike
+/// [`F16_UNDERFLOW_TIE`] (whose exact tie rounds DOWN, to zero, because
+/// zero's all-clear mantissa is the "even" candidate), the exact overflow
+/// tie rounds UP, to infinity: the two nearest representable candidates are
+/// `F16_MAX` (mantissa `0b1111111111`, odd) and `+inf` (mantissa `0`,
+/// even), so ties-to-even picks infinity. This asymmetry is measured, not
+/// assumed — see this module's own `overflow_tie_rounds_up_to_infinity_not_down_to_f16_max`
+/// test.
+///
+/// A round-2 adversarial audit found this crate's stated overflow domain
+/// FALSE: an earlier revision of [`assert_saturates_to_infinity`] (and this
+/// module's own checklist above) claimed the boundary was "strictly beyond
+/// `F16_MAX`" — under which a magnitude in `(F16_MAX, F16_OVERFLOW_TIE)`
+/// (e.g. `65510.0`) satisfies the precondition but rounds BACK to finite
+/// `65504`, not `±inf`, silently mis-describing that entire sub-band the
+/// same shape [`F16_UNDERFLOW_TIE`]'s own fix closed on the small-magnitude
+/// end. `no-producer: derived from f16's format ((F16_MAX + 65536.0) / 2.0)`.
+pub const F16_OVERFLOW_TIE: f32 = (F16_MAX + 65536.0) / 2.0; // 65520.0
+
+/// BEHAVIORAL saturation contract: an `x` AT OR BEYOND [`F16_OVERFLOW_TIE`]
+/// in magnitude converts to `±inf` under round-to-nearest-even (IEEE754
+/// binary16 overflow), NEVER a clamped finite value and never a silently
+/// wrong number. Note `F16_MAX` itself is finite and exactly representable
+/// (it is the largest finite f16, not a saturation trigger), and a
+/// magnitude strictly BETWEEN `F16_MAX` and `F16_OVERFLOW_TIE` rounds back
+/// DOWN to finite `F16_MAX` — NOT `±inf` — under round-to-nearest-even (see
+/// [`F16_OVERFLOW_TIE`]'s own doc for why this tie rounds the opposite
+/// direction from [`F16_UNDERFLOW_TIE`]'s). This contract is about
+/// magnitudes at or beyond the tie specifically, never merely "beyond
+/// `F16_MAX`". Panics if `x` is not actually at or beyond the tie (a caller
+/// error, not a test failure signal) or if the conversion fails to
+/// saturate, or saturates with the wrong sign.
 pub fn assert_saturates_to_infinity(x: f32) {
     assert!(
-        x.abs() > F16_MAX,
-        "assert_saturates_to_infinity called on a magnitude ({x}) at or inside f16's finite \
-         range (F16_MAX = {F16_MAX}) — this is a boundary assertion for magnitudes STRICTLY \
-         BEYOND F16_MAX, not an interior (or exactly-F16_MAX) one; use the op's ordinary \
-         tolerance oracle instead"
+        x.abs() >= F16_OVERFLOW_TIE,
+        "assert_saturates_to_infinity called on a magnitude ({x}) outside its TRUE domain: at \
+         or beyond the round-to-finite/round-to-infinity tie (F16_OVERFLOW_TIE = \
+         {F16_OVERFLOW_TIE} = (F16_MAX + 65536.0) / 2.0) -- a magnitude in (F16_MAX, \
+         F16_OVERFLOW_TIE) rounds DOWN to finite F16_MAX ({F16_MAX}) under \
+         round-to-nearest-even, not to +/-inf (see F16_OVERFLOW_TIE's own doc); use the op's \
+         ordinary tolerance oracle for that sub-band, or `assert_finite_f16` if the point is \
+         that it stays finite"
     );
     let h = f16::from_f32(x);
     assert!(
         h.is_infinite(),
-        "expected f16 saturation to +/-inf at magnitude {x} (>= F16_MAX = {F16_MAX}), got \
-         {h:?} instead -- a confident WRONG finite number at the boundary is exactly the family \
-         D failure mode this oracle exists to catch, not a saturation"
+        "expected f16 saturation to +/-inf at magnitude {x} (>= F16_OVERFLOW_TIE = \
+         {F16_OVERFLOW_TIE}), got {h:?} instead -- a confident WRONG finite number at the \
+         boundary is exactly the family D failure mode this oracle exists to catch, not a \
+         saturation"
     );
     assert_eq!(
         h.is_sign_negative(),
@@ -275,21 +319,83 @@ mod tests {
     }
 
     #[test]
-    fn saturates_to_infinity_at_and_beyond_the_boundary_both_signs() {
-        // A tiny nudge past F16_MAX (still well inside f32's own finite
-        // range) — F16_MAX itself is finite and exactly representable, so
-        // it deliberately is NOT used as a saturation-trigger fixture here.
+    fn saturates_to_infinity_at_and_beyond_the_overflow_tie_both_signs() {
+        // A magnitude genuinely at/beyond the TIE (not merely past F16_MAX
+        // -- round-2 audit fix: F16_MAX * 1.001 = 65569.5.., well above
+        // F16_OVERFLOW_TIE = 65520.0, so this fixture was always valid; kept
+        // as-is, plus the exact tie and further-out magnitudes below).
         assert_saturates_to_infinity(F16_MAX * 1.001);
         assert_saturates_to_infinity(-F16_MAX * 1.001);
         assert_saturates_to_infinity(1.0e6);
         assert_saturates_to_infinity(-1.0e6);
         assert_saturates_to_infinity(f32::INFINITY);
+        // The exact tie itself: rounds UP to infinity (see
+        // `F16_OVERFLOW_TIE`'s own doc on why this tie rounds the opposite
+        // direction from `F16_UNDERFLOW_TIE`'s).
+        assert_saturates_to_infinity(F16_OVERFLOW_TIE);
+        assert_saturates_to_infinity(-F16_OVERFLOW_TIE);
+    }
+
+    /// The band boundary, pinned from BOTH sides (round-2 adversarial audit
+    /// F2 fix, mirroring `magnitude_between_tie_and_full_subnormal_rounds_up_not_to_zero`
+    /// exactly): a magnitude strictly ABOVE `F16_MAX` but still strictly
+    /// BELOW `F16_OVERFLOW_TIE` rounds DOWN to finite `F16_MAX`, not up to
+    /// `±inf` -- the exact band the old "strictly beyond F16_MAX" domain
+    /// claim got wrong. Two halves: (a) `assert_saturates_to_infinity` must
+    /// now REFUSE this input (outside its documented domain); (b) the
+    /// actual f16 conversion in this band is independently checked as the
+    /// NON-inf, finite `F16_MAX` outcome, both signs, so "rounds back to
+    /// finite F16_MAX, not inf" is demonstrated, not merely asserted.
+    #[test]
+    fn magnitude_between_f16_max_and_overflow_tie_rounds_down_to_finite_f16_max_not_inf() {
+        let x = (F16_MAX + F16_OVERFLOW_TIE) / 2.0; // midpoint of the open band
+        assert!(
+            x > F16_MAX && x < F16_OVERFLOW_TIE,
+            "fixture invariant: x must sit strictly inside the (F16_MAX, F16_OVERFLOW_TIE) band"
+        );
+
+        let r = std::panic::catch_unwind(|| assert_saturates_to_infinity(x));
+        assert!(
+            r.is_err(),
+            "assert_saturates_to_infinity must refuse a magnitude in the round-DOWN band, not \
+             silently accept it"
+        );
+        let r_neg = std::panic::catch_unwind(|| assert_saturates_to_infinity(-x));
+        assert!(r_neg.is_err());
+
+        let h = f16::from_f32(x);
+        assert!(
+            h.is_finite() && !h.is_infinite(),
+            "expected the finite F16_MAX outcome in the round-DOWN band, got {h:?} instead"
+        );
+        assert_eq!(h.to_f32(), F16_MAX);
+        assert!(h.is_sign_positive());
+        let h_neg = f16::from_f32(-x);
+        assert!(h_neg.is_finite() && !h_neg.is_infinite());
+        assert_eq!(h_neg.to_f32(), -F16_MAX);
+        assert!(h_neg.is_sign_negative());
+    }
+
+    /// Measures (not assumes) the asymmetry `F16_OVERFLOW_TIE`'s own doc
+    /// states: unlike the underflow tie (which rounds DOWN, to zero), the
+    /// exact overflow tie rounds UP, to infinity.
+    #[test]
+    fn overflow_tie_rounds_up_to_infinity_not_down_to_f16_max() {
+        assert!(f16::from_f32(F16_OVERFLOW_TIE).is_infinite());
+        assert!(f16::from_f32(-F16_OVERFLOW_TIE).is_infinite());
+        assert!(f16::from_f32(F16_UNDERFLOW_TIE) == f16::ZERO);
     }
 
     #[test]
-    #[should_panic(expected = "boundary assertion")]
+    #[should_panic(expected = "outside its TRUE domain")]
     fn saturates_to_infinity_refuses_an_interior_magnitude() {
         assert_saturates_to_infinity(1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "outside its TRUE domain")]
+    fn saturates_to_infinity_refuses_a_magnitude_strictly_between_f16_max_and_the_tie() {
+        assert_saturates_to_infinity(F16_MAX * 1.0001); // 65510.55.. < F16_OVERFLOW_TIE
     }
 
     #[test]

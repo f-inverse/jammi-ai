@@ -2532,6 +2532,11 @@ fn softmax_parity_f16_scale_multiply_saturates_to_infinity_beyond_f16_max() {
     // magnitude, establishing what the kernel's own rounding step must
     // reproduce.
     for &v in &sv {
+        // Round-2 audit F2 reconciliation: `sv = [1.0, 2.0, 3.0, 4.0]`
+        // (above) times `huge_scale = 100_000.0` yields magnitudes in
+        // `[100_000, 400_000]`, all comfortably at/above
+        // `f16_oracle::F16_OVERFLOW_TIE` (65_520.0) -- this call sits in
+        // the corrected domain, not merely "beyond F16_MAX".
         assert_saturates_to_infinity(v * huge_scale);
     }
 }
@@ -12076,6 +12081,9 @@ fn axpy_parity_f16_boundary_saturates_and_underflows() {
     let out: Vec<f16> = axpy(1000.0, &x, &y).unwrap().to_vec1().unwrap();
     assert!(out[0].is_infinite() && out[0].is_sign_positive());
     assert!(out[1].is_infinite() && out[1].is_sign_negative());
+    // Round-2 audit F2 reconciliation: `1000.0 * F16_MAX` = 65_504_000.0,
+    // far above `f16_oracle::F16_OVERFLOW_TIE` (65_520.0) -- this call
+    // sits in the corrected domain, not merely "beyond F16_MAX".
     assert_saturates_to_infinity(1000.0 * F16_MAX);
 
     // Underflow: a tiny alpha applied to a tiny x, added to an exact zero

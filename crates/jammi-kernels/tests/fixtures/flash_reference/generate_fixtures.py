@@ -365,11 +365,17 @@ def main():
         "truth_note": (
             "truth_{o,lse,dq,dk,dv} are a from-scratch f64 EAGER attention implementation "
             "(einsum + softmax, no FlashAttention kernel of any generation) on the SAME "
-            "bf16-exact q/k/v/grad_out this leg's ref (torch FA2) also consumed — the "
-            "higher-precision anchor docs/maintainer/cuda-kernel-guide.md §3.3 requires. "
-            "truth_minus_ref_max_abs_diff in each leg below is |truth - ref|, computed HERE "
-            "(numpy-equivalent, torch f64 CPU/GPU arithmetic) so the consuming Rust oracle "
-            "(tests/flash_torch_parity.rs) never has to trust an unverified bound."
+            f"{'fp16' if is_f16 else 'bf16'}-exact q/k/v/grad_out this leg's ref (torch FA2) "
+            "also consumed — the higher-precision anchor "
+            "docs/maintainer/cuda-kernel-guide.md §3.3 requires. truth_minus_ref_max_abs_diff "
+            "in each leg below is |truth - ref|, computed HERE (numpy-equivalent, torch f64 "
+            "CPU/GPU arithmetic) so the consuming Rust oracle "
+            f"({'tests/flash_torch_parity_f16.rs' if is_f16 else 'tests/flash_torch_parity.rs'}) "
+            "never has to trust an unverified bound. NOTE: neither consuming Rust test opens "
+            "this sidecar file at run time — every number it asserts on (o/lse/dq/dk/dv, "
+            "truth-relative bound) is recomputed live from the .npy fixtures each run (family "
+            "F); this JSON is provenance/human-review documentation only, self_noise_max_abs_diff "
+            "included, which is REPORTED here but never consumed as a live bound."
         ),
         "storage_note": (
             "q/k/v/grad_out are saved as int16 .npy — a bit-for-bit reinterpretation of the "
@@ -405,8 +411,11 @@ def main():
             "csrc/flash_attn/src/softmax.h:85-89 at that commit: forces "
             "exp2f(__fmul_rn(x,scale)-max) instead of the fusable "
             "exp2f(x*scale-max)) and does NOT pass --use_fast_math, while "
-            "jammi's three flash translation units DO "
-            "(crates/jammi-kernels/third_party/flash-attention/VENDORED.md's "
+            "jammi's five flash translation units DO (the bf16 and fp16 "
+            "fwd/bwd .cu sources plus the flash_api_jammi.cu wrapper -- "
+            "campaign #443's fp16 twins widened this from three to five; "
+            "see crates/jammi-kernels/build.rs's flash source list and "
+            "crates/jammi-kernels/third_party/flash-attention/VENDORED.md's "
             "Build section)."
         ),
         "device": torch.cuda.get_device_name(0),

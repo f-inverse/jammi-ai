@@ -804,9 +804,10 @@ fn mem_efficient_attention_predicate(
 /// The fused whole-attention-block kernel's domain, checked at the call
 /// site (family D / K2): `qkv`'s device is one
 /// [`jammi_kernels::admission::device_is_supported`] accepts, `qkv`/`extended_mask`
-/// share a dtype the kernel implements (F32, BF16, or F16 — F16 widened in
-/// campaign #443 D1, see the dtype check below for the composed-sub-kernel
-/// citation), `qkv` is contiguous
+/// share a dtype the kernel implements PER-DEVICE (`F32` on either device;
+/// `BF16` or `F16` admitted ONLY on CUDA — F16 widened in campaign #443 D1,
+/// see the dtype check below for the composed-sub-kernel citation and the
+/// CPU-refusal regression this device split closes), `qkv` is contiguous
 /// (the free reshape from `Wqkv`'s own output — `AttentionBlockFused`
 /// refuses a strided `qkv`, same idiom as every other op in this crate),
 /// `head_dim` is exactly [`ATTENTION_BLOCK_HEAD_DIM`] (`AttentionBlockFused`'s
@@ -841,16 +842,42 @@ fn attention_block_admission_predicate(
     if !device_is_supported(qkv.device()) {
         return (false, "device_is_cpu_or_cuda");
     }
-    // campaign #443 D1: `F16` joins `BF16` — `AttentionBlockFused`'s own
-    // CUDA gate (`crate::cuda::attention_block::cuda_fwd`, in
-    // `jammi-kernels`) now admits it on the same basis: this composition
-    // owns no `.cu` kernel, so its domain follows its two composed
-    // sub-kernels' ([`RopeFused`], [`SoftmaxLastDimFused`]) real `F16`
-    // dispatch arms.
-    if qkv.dtype() != extended_mask.dtype()
-        || !matches!(qkv.dtype(), DType::F32 | DType::BF16 | DType::F16)
-    {
-        return (false, "dtype_f32_bf16_or_f16_matching_between_qkv_and_mask");
+    // campaign #443 D1, PER-DEVICE-HONEST (round-2 audit F1 fix): `F16`
+    // joins `BF16` on CUDA ONLY — `AttentionBlockFused`'s own CUDA gate
+    // (`crate::cuda::attention_block::cuda_fwd`, in `jammi-kernels`) admits
+    // it on the same basis this composition owns no `.cu` kernel, so its
+    // domain follows its two composed sub-kernels' ([`RopeFused`],
+    // [`SoftmaxLastDimFused`]) real `F16` dispatch arms, all CUDA-only.
+    // `cpu_fwd` (same file, `jammi-kernels::ops::attention_block`) has NO
+    // `BF16`/`F16` match arm at all — it hard-errors with
+    // `UnsupportedDTypeForOp` on anything but `F32`. The D1 landing widened
+    // this check to `F32 | BF16 | F16` with no device split, which made the
+    // predicate `Holds` for CPU+F16 (`BF16` was already latent-broken the
+    // same way; `F16` is the one this crate's own dtype matrix now
+    // exercises) — the per-layer cascade would then dispatch the fused arm
+    // and the op's own refusal would fire AFTER `memeff_will_fire`'s
+    // once-per-forward suppression had already deleted the block/eager
+    // fallback's mask bundle, the exact `HARD-ERROR-where-eager-used-to-run`
+    // shape `mem_efficient_attention_predicate` above was fixed against.
+    // Device-split here the same way: `BF16`/`F16` admitted ONLY when
+    // `qkv.device().is_cuda()`; CPU stays `F32`-only, matching `cpu_fwd`'s
+    // real domain exactly.
+    let dtype_ok = if qkv.dtype() != extended_mask.dtype() {
+        false
+    } else if qkv.device().is_cuda() {
+        matches!(qkv.dtype(), DType::F32 | DType::BF16 | DType::F16)
+    } else {
+        matches!(qkv.dtype(), DType::F32)
+    };
+    if !dtype_ok {
+        return (
+            false,
+            if qkv.device().is_cuda() {
+                "dtype_f32_bf16_or_f16_matching_between_qkv_and_mask_on_cuda"
+            } else {
+                "dtype_f32_matching_between_qkv_and_mask_on_cpu"
+            },
+        );
     }
     if !qkv.is_contiguous() {
         return (false, "qkv_contiguous");
@@ -8942,6 +8969,124 @@ mod tests {
         let (holds, predicate) =
             attention_block_admission_predicate(&qkv, s, h, d, &mask, false, None);
         assert!(holds, "global: predicate={predicate}");
+    }
+
+    /// Round-2 adversarial audit F1 fix, PER-DEVICE-HONEST dtype gate
+    /// (mirrors `mem_efficient_attention_predicate_dtype_gate_is_per_device_honest`
+    /// exactly): campaign #443 D1 widened this predicate's dtype match to
+    /// `F32 | BF16 | F16` with NO device split, which made it claim `Holds`
+    /// for CPU+F16 (and CPU+BF16) even though `AttentionBlockFused::cpu_fwd`
+    /// (`jammi_kernels::ops::attention_block`) has no `BF16`/`F16` `MatMul`
+    /// arm at all and hard-errors with `UnsupportedDTypeForOp`. On CPU only
+    /// `F32` may hold; on CUDA `F32`, `BF16`, and `F16` all hold (the real
+    /// domain the composed `RopeFused`/`SoftmaxLastDimFused` sub-kernels
+    /// implement there).
+    #[test]
+    fn attention_block_admission_predicate_dtype_gate_is_per_device_honest() {
+        let device = Device::Cpu;
+        let (b, s, h, d) = (1usize, 4usize, 2usize, ATTENTION_BLOCK_HEAD_DIM);
+        let mask = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
+
+        let qkv_f16 = Tensor::zeros((b, s, 3, h, d), DType::F16, &device).unwrap();
+        let mask_f16 = mask.to_dtype(DType::F16).unwrap();
+        let (holds, predicate) =
+            attention_block_admission_predicate(&qkv_f16, s, h, d, &mask_f16, false, None);
+        assert!(
+            !holds,
+            "F16 must NOT hold on CPU -- cpu_fwd has no F16 MatMul arm"
+        );
+        assert_eq!(predicate, "dtype_f32_matching_between_qkv_and_mask_on_cpu");
+
+        let qkv_bf16 = Tensor::zeros((b, s, 3, h, d), DType::BF16, &device).unwrap();
+        let mask_bf16 = mask.to_dtype(DType::BF16).unwrap();
+        let (holds, predicate) =
+            attention_block_admission_predicate(&qkv_bf16, s, h, d, &mask_bf16, false, None);
+        assert!(
+            !holds,
+            "BF16 must NOT hold on CPU either, same reason as F16"
+        );
+        assert_eq!(predicate, "dtype_f32_matching_between_qkv_and_mask_on_cpu");
+
+        // F32 on CPU still admits (sanity: the dtype gate must not be
+        // over-broad and refuse the domain-valid case too).
+        let qkv_f32 = Tensor::zeros((b, s, 3, h, d), DType::F32, &device).unwrap();
+        let (holds, _) = attention_block_admission_predicate(&qkv_f32, s, h, d, &mask, false, None);
+        assert!(holds, "F32 on CPU must still hold");
+    }
+
+    /// F1's end-to-end proof (adversarial audit round 2): before this
+    /// predicate's dtype gate was device-split, campaign #443 D1's
+    /// undifferentiated `F32 | BF16 | F16` widening made this predicate
+    /// claim `Holds` for a CPU+F16 forward at a shape (short `seq`, `d ==
+    /// ATTENTION_BLOCK_HEAD_DIM`) that would otherwise dispatch the fused
+    /// block arm -- `admit()` would then dispatch `Fused`,
+    /// `AttentionBlockFused::cpu_fwd` would hard-error with
+    /// `UnsupportedDTypeForOp`, and a CPU+F16 training forward that used to
+    /// run eager (this crate's own pre-D1 baseline) would regress to an
+    /// unconditional hard error. Proves the fix restores that baseline:
+    /// the block arm's own dispatch counter is unchanged (never consulted
+    /// as `Fused`) and the forward completes via the eager composition
+    /// with a finite, correctly-shaped, still-F16 output.
+    #[test]
+    fn attention_block_f16_cpu_forward_falls_through_to_eager_without_error() {
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let (b, s, h, d) = (1usize, 4usize, 2usize, ATTENTION_BLOCK_HEAD_DIM);
+        let n = b * s * 3 * h * d;
+        let qkv_v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.031).sin() * 0.1).collect();
+        let qkv = Tensor::from_vec(qkv_v, (b, s, 3 * h * d), &device)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
+        let mask = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
+        let fused = FusedAttentionMasks::build(&mask, None, DType::F16).unwrap();
+
+        let attn = attention_block_fixture(false, h, s, &device);
+        let (holds, predicate) =
+            attention_block_admission_predicate(&qkv, s, h, d, &mask, false, None);
+        assert!(!holds, "F16 on CPU must decline: predicate={predicate}");
+
+        let block_before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+        let out = attn
+            .forward_training_attention(
+                &qkv,
+                b,
+                s,
+                h,
+                d,
+                TrainingMaskInputs {
+                    extended: &mask,
+                    local_band: None,
+                    fused: Some(&fused),
+                },
+                &declined_flash(),
+            )
+            .expect(
+                "CPU+F16 must fall through the block arm (dtype decline) to the eager \
+                 composition, never error -- this is the base behaviour the device-split dtype \
+                 gate must restore",
+            );
+        let block_after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+
+        assert_eq!(out.dims(), &[b, s, h * d]);
+        assert_eq!(out.dtype(), DType::F16);
+        let v: Vec<f32> = out
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert!(
+            v.iter().all(|x| x.is_finite()),
+            "every output element must be finite"
+        );
+        assert_eq!(
+            block_after.fused, block_before.fused,
+            "the block arm must never dispatch fused for a dtype cpu_fwd cannot serve"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────

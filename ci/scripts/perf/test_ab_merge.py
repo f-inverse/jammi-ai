@@ -2106,12 +2106,16 @@ def _finetune_run_tier(arm="fused", **overrides):
         # unit-63 round-4 audit F-1: the fused arm's own dispatch counters
         # (`_FINETUNE_RUN_DISPATCH_COUNTERS["fused"]`, folded in below)
         # claim a positive `attention_block_flash_fused_dispatches` --
-        # `flash_capability_gates` admits BF16 only, so `bf16` is the ONLY
-        # dtype this tier's own counters can be self-consistent under
-        # (`finetune_run_dispatch_proof_violations`'s new arm-agnostic
-        # consistency premise). `finetune_run_ab.sh` now passes
-        # `--backbone-dtype bf16` unconditionally on every real leg for
-        # exactly this reason.
+        # `flash_capability_gates` admits `{bf16, f16}` (CONTRACT.md
+        # amendment 2026-09-01 widened this from bf16-only, tracking
+        # campaign #443 commit e98b4b46's `dtype_is_bf16_or_f16` gate), so
+        # `bf16` is ONE of the dtypes this tier's own counters can be
+        # self-consistent under (`finetune_run_dispatch_proof_violations`'s
+        # arm-agnostic consistency premise) -- kept as this suite's own
+        # clean default; `test_clean_fused_tier_at_f16_has_no_violations`
+        # pins the SAME premise at the other admitted dtype.
+        # `finetune_run_ab.sh` passes an explicit `--backbone-dtype` on
+        # every real leg for exactly this reason.
         "backbone_dtype": "bf16",
         "checkpoint_config_sha256": "cfg-sha",
         "checkpoint_weights_sha256": "weights-sha",
@@ -2479,6 +2483,23 @@ class FinetuneRunDispatchProofMutantTests(unittest.TestCase):
         self.assertEqual(
             ab_merge.finetune_run_dispatch_proof_violations("fused", _finetune_run_tier(arm="fused")), []
         )
+
+    def test_clean_fused_tier_at_f16_has_no_violations(self):
+        # CONTRACT.md amendment 2026-09-01: the flash-cascade differential's
+        # admitted dtype set widened from bf16-only to {bf16, f16},
+        # tracking flash_capability_gates's own dtype_is_bf16_or_f16 gate
+        # (campaign #443 commit e98b4b46). The default clean fixture's
+        # dispatch counters already claim a positive
+        # attention_block_flash_fused_dispatches (see _finetune_run_tier's
+        # own doc) -- overriding ONLY backbone_dtype to "f16" exercises
+        # BOTH the arm-agnostic check-0 counters-vs-dtype contradiction
+        # AND the fused arm's own defining dtype premise at once, proving
+        # neither fires for f16 post-amendment (both fired for f32 in
+        # test_fused_arm_with_non_bf16_dtype_and_positive_flash_counter_is_a_contradiction/
+        # test_fused_arm_with_non_bf16_dtype_is_an_invalid_premise_even_with_clean_counters,
+        # which remain refused, unchanged).
+        tier = _finetune_run_tier(arm="fused", backbone_dtype="f16")
+        self.assertEqual(ab_merge.finetune_run_dispatch_proof_violations("fused", tier), [])
 
     def test_clean_alloff_tier_has_no_violations(self):
         self.assertEqual(

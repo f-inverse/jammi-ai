@@ -1507,18 +1507,21 @@ async fn acceleration_report_survives_fail(backend: BackendKind) {
     );
 }
 
-/// Reclaim (both the re-queue arm and the attempts-exhausted arm) leaves
-/// `acceleration_report` untouched — the stale report from the reclaimed
-/// attempt may legitimately persist until the NEW claimant overwrites it via
-/// its own [`Catalog::record_acceleration_report`] call; reclaim itself never
-/// clears or rewrites the column.
+/// The two reclaim arms compose across a full requeue → re-claim → exhaust
+/// lifecycle, and they move `acceleration_report` in OPPOSITE directions
+/// because they mean opposite things about the job's future (#446 finding 1):
+/// the re-queue arm resets the dead attempt's report to the pending marker
+/// (a new attempt will re-probe), while the terminal attempts-exhausted arm
+/// preserves whatever determination the last attempt did record.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
     test_case(BackendKind::Postgres ; "postgres")
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn acceleration_report_persists_across_reclaim_until_overwritten(backend: BackendKind) {
+async fn acceleration_report_reclaim_arms_reset_on_requeue_and_persist_on_exhaustion(
+    backend: BackendKind,
+) {
     let dir = tempdir().unwrap();
     let (_session, catalog) = queue_catalog!(backend, dir.path());
 
@@ -1548,9 +1551,10 @@ async fn acceleration_report_persists_across_reclaim_until_overwritten(backend: 
     assert_eq!(requeued.status, TrainingJobStatus::Queued.to_string());
     assert_eq!(
         requeued.acceleration_report.as_deref(),
-        Some(stale_report),
-        "the requeue arm of reclaim leaves the stale report untouched — it is overwritten \
-         only by the NEW claimant's own record_acceleration_report call"
+        Some(r#"{"state":"pending"}"#),
+        "the requeue arm of reclaim resets the dead attempt's report to the pending \
+         marker — the row is queued for a NEW attempt that will re-probe, so the stale \
+         determination must not survive onto it"
     );
 
     // The new claimant re-claims with a zero lease too (immediately expired),
@@ -1586,5 +1590,504 @@ async fn acceleration_report_persists_across_reclaim_until_overwritten(backend: 
         failed.acceleration_report.as_deref(),
         Some(fresh_report),
         "the exhausted-attempts reclaim arm leaves acceleration_report untouched too"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// esc-075 / #446 finding 1 — the tri-state `acceleration_report` lifecycle is
+// closed AT THE CATALOG EDGE.
+//
+// `create_training_job` stamps `{"state":"pending"}` = "submitted, no claimant
+// has computed a determination YET". That sentence stops being true the moment
+// the row reaches a TERMINAL status: a job that failed between claim and the
+// acceleration probe would otherwise carry `pending` forever, a state the
+// contract has no reading for. The three transitions below make that
+// unrepresentable by construction — inside the same lease-guarded / reclaim
+// UPDATE, not at N worker call sites (any of which can be skipped, or added
+// later without the marker).
+//
+// Every test asserts the marker BYTES (the vocabulary embedded and remote
+// surfaces read) and the degenerate arms: an already-terminal report is
+// PRESERVED (never re-stamped), and a legacy pre-migration-026 `NULL`
+// ("unknown") is never fabricated into a state it does not have.
+// ---------------------------------------------------------------------------
+
+/// The exact marker bytes the catalog substitutes for a still-`pending` report
+/// on the lease-guarded terminal-failure write.
+const FAILED_BEFORE_PROBE: &str = r#"{"state":"undetermined","reason":"failed_before_probe"}"#;
+
+/// The exact marker bytes the catalog substitutes for a still-`pending` report
+/// on the reclaim attempts-exhausted arm.
+const LEASE_EXPIRED_EXHAUSTED: &str =
+    r#"{"state":"undetermined","reason":"lease_expired_attempts_exhausted"}"#;
+
+/// The submission-time marker, repeated here as the literal bytes the wire
+/// surfaces read (not re-exported from the crate — the test asserts the
+/// vocabulary independently of the constant that produces it).
+const PENDING_MARKER: &str = r#"{"state":"pending"}"#;
+
+/// Overwrite `acceleration_report` for `job_id` directly, bypassing every
+/// lease guard — used only to construct a state the public API cannot reach
+/// (a pre-migration-026 legacy `NULL`).
+async fn set_acceleration_report_raw(catalog: &Catalog, job_id: &str, report: Option<&str>) {
+    let job_id = job_id.to_string();
+    let report = report.map(str::to_string);
+    catalog
+        .backend_arc()
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE training_jobs SET acceleration_report = $1 WHERE job_id = $2",
+                    &[SqlValue::from(report), SqlValue::TextOwned(job_id)],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+}
+
+/// (i) A job that fails between claim and the acceleration probe must not keep
+/// the submission-time `pending` marker past its terminal `failed` status:
+/// [`Catalog::fail_training_job`] rewrites `pending → undetermined` with reason
+/// `failed_before_probe` INSIDE the same lease-guarded UPDATE. No worker call
+/// site participates — this is the property that makes the unmarked
+/// `record_failed` sites in the worker unable to leak a pending-forever row.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fail_rewrites_a_pending_report_to_undetermined(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    catalog
+        .create_training_job(job_params("ar-f-pending"))
+        .await
+        .unwrap();
+    let claimed = catalog
+        .claim_next_training_job("worker-a", Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("job claimed");
+    assert_eq!(claimed.attempts, 1);
+    // The probe never runs: no `record_acceleration_report` call at all.
+    let before = catalog.get_training_job("ar-f-pending").await.unwrap();
+    assert_eq!(
+        before.acceleration_report.as_deref(),
+        Some(PENDING_MARKER),
+        "precondition: the row still carries the submission-time pending marker"
+    );
+
+    let failed = catalog
+        .fail_training_job(
+            "ar-f-pending",
+            "worker-a",
+            Some(r#"{"error_message":"died before the probe"}"#),
+        )
+        .await
+        .unwrap();
+    assert!(failed, "the lease owner records the failure");
+
+    let after = catalog.get_training_job("ar-f-pending").await.unwrap();
+    assert_eq!(after.status, TrainingJobStatus::Failed.to_string());
+    assert_eq!(
+        after.acceleration_report.as_deref(),
+        Some(FAILED_BEFORE_PROBE),
+        "a terminal `failed` row must never carry `pending` — the catalog edge rewrites it \
+         to the self-describing undetermined marker in the SAME UPDATE"
+    );
+}
+
+/// (ii) The rewrite is strictly `pending → undetermined`: an already-terminal
+/// report (`determined`, `not_applicable`, or an `undetermined` with the
+/// worker's OWN more specific reason) is PRESERVED byte-for-byte. A blanket
+/// "stamp undetermined on fail" would destroy the measured determination of
+/// every job that failed AFTER a successful probe — the exact regression this
+/// arm pins.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fail_preserves_an_already_terminal_report(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    // Every non-pending payload shape a producer may have already written,
+    // including one that is ALREADY `undetermined` but with a more specific
+    // reason the catalog must not coarsen to `failed_before_probe`.
+    let cases = [
+        (
+            "ar-f-det",
+            r#"{"state":"determined","attempt":1,"device":"cuda:0"}"#,
+        ),
+        (
+            "ar-f-na",
+            r#"{"state":"not_applicable","reason":"context_predictor"}"#,
+        ),
+        (
+            "ar-f-und",
+            r#"{"state":"undetermined","reason":"failed_before_device_resolution"}"#,
+        ),
+    ];
+
+    for (job_id, report) in cases {
+        catalog
+            .create_training_job(job_params(job_id))
+            .await
+            .unwrap();
+        let claimed = catalog
+            .claim_next_training_job("worker-a", Duration::from_secs(3600))
+            .await
+            .unwrap()
+            .expect("job claimed");
+        assert_eq!(
+            claimed.job_id, job_id,
+            "claims run oldest-first, one job at a time"
+        );
+        let wrote = catalog
+            .record_acceleration_report(job_id, "worker-a", claimed.attempts, report)
+            .await
+            .unwrap();
+        assert!(wrote, "the lease owner records its determination");
+
+        let failed = catalog
+            .fail_training_job(job_id, "worker-a", Some(r#"{"error_message":"boom"}"#))
+            .await
+            .unwrap();
+        assert!(failed, "the lease owner records the failure");
+
+        let after = catalog.get_training_job(job_id).await.unwrap();
+        assert_eq!(after.status, TrainingJobStatus::Failed.to_string());
+        assert_eq!(
+            after.acceleration_report.as_deref(),
+            Some(report),
+            "{job_id}: an already-terminal report survives `fail` byte-for-byte — the \
+             rewrite fires ONLY on the pending marker"
+        );
+    }
+}
+
+/// (ii, degenerate) A legacy pre-migration-026 row reads back SQL `NULL` —
+/// "unknown", an honest absence of information. `fail` must NOT fabricate a
+/// state for it: `NULL` is not `pending`, and the three-valued `NULL = 'x'`
+/// comparison correctly falls through to the ELSE arm on both backends.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fail_leaves_a_legacy_null_report_unknown(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    catalog
+        .create_training_job(job_params("ar-f-null"))
+        .await
+        .unwrap();
+    set_acceleration_report_raw(&catalog, "ar-f-null", None).await;
+    catalog
+        .claim_next_training_job("worker-a", Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("job claimed");
+
+    let failed = catalog
+        .fail_training_job("ar-f-null", "worker-a", Some(r#"{"error_message":"x"}"#))
+        .await
+        .unwrap();
+    assert!(failed);
+
+    let after = catalog.get_training_job("ar-f-null").await.unwrap();
+    assert_eq!(after.status, TrainingJobStatus::Failed.to_string());
+    assert_eq!(
+        after.acceleration_report, None,
+        "a legacy NULL stays NULL ('unknown') — the pending rewrite must never fabricate \
+         a state for a row that never had one"
+    );
+}
+
+/// (iii) The reclaim attempts-exhausted arm is the OTHER path to a terminal
+/// `failed` status — reached with no worker in the loop at all (the claimant
+/// is dead; nothing on that side can ever compensate). Same rule, its own
+/// reason: `pending → undetermined/lease_expired_attempts_exhausted`.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reclaim_exhaustion_rewrites_a_pending_report_to_undetermined(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    catalog
+        .create_training_job(job_params("ar-x-pending"))
+        .await
+        .unwrap();
+    // Zero lease: already expired when reclaim runs. attempts -> 1.
+    let claimed = catalog
+        .claim_next_training_job("worker-a", Duration::from_secs(0))
+        .await
+        .unwrap()
+        .expect("job claimed");
+    assert_eq!(claimed.attempts, 1);
+
+    // max_attempts = 1, so attempts (1) >= max (1): the exhausted arm, not
+    // requeue.
+    let actioned = catalog.reclaim_expired_training_jobs(1).await.unwrap();
+    assert_eq!(actioned, 1, "attempts (1) >= max (1): the job fails");
+
+    let after = catalog.get_training_job("ar-x-pending").await.unwrap();
+    assert_eq!(after.status, TrainingJobStatus::Failed.to_string());
+    assert_eq!(
+        after.acceleration_report.as_deref(),
+        Some(LEASE_EXPIRED_EXHAUSTED),
+        "the exhausted-attempts reclaim arm drives the row terminal, so it must also \
+         retire the pending marker — with the reason that names WHY no determination exists"
+    );
+}
+
+/// (iv) The exhausted arm's rewrite is `pending`-only too: a determination the
+/// dead attempt DID record before its lease expired is the last true thing
+/// known about the job, and survives the terminal reclaim byte-for-byte.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reclaim_exhaustion_preserves_a_determined_report(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    catalog
+        .create_training_job(job_params("ar-x-det"))
+        .await
+        .unwrap();
+    let claimed = catalog
+        .claim_next_training_job("worker-a", Duration::from_secs(0))
+        .await
+        .unwrap()
+        .expect("job claimed");
+    let report = r#"{"state":"determined","attempt":1,"device":"cpu"}"#;
+    let wrote = catalog
+        .record_acceleration_report("ar-x-det", "worker-a", claimed.attempts, report)
+        .await
+        .unwrap();
+    assert!(wrote, "the claimant probed before its lease expired");
+
+    let actioned = catalog.reclaim_expired_training_jobs(1).await.unwrap();
+    assert_eq!(actioned, 1, "attempts (1) >= max (1): the job fails");
+
+    let after = catalog.get_training_job("ar-x-det").await.unwrap();
+    assert_eq!(after.status, TrainingJobStatus::Failed.to_string());
+    assert_eq!(
+        after.acceleration_report.as_deref(),
+        Some(report),
+        "a determination recorded by the dead attempt survives the terminal reclaim"
+    );
+}
+
+/// (v) The requeue arm is NOT terminal — it hands the job back to the queue for
+/// a NEW attempt that will re-probe. A `determined` report from the dead
+/// attempt describes the hardware/config THAT attempt saw, and must not survive
+/// onto a `queued` row where every reader would attribute it to the job's
+/// current (not-yet-started) attempt. Reclaim resets it to the submission-time
+/// pending marker — the same state a freshly-created queued job carries.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reclaim_requeue_resets_the_report_to_pending(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    catalog
+        .create_training_job(job_params("ar-rq"))
+        .await
+        .unwrap();
+    let claimed = catalog
+        .claim_next_training_job("worker-a", Duration::from_secs(0))
+        .await
+        .unwrap()
+        .expect("job claimed");
+    let stale = r#"{"state":"determined","attempt":1,"device":"cuda:0"}"#;
+    let wrote = catalog
+        .record_acceleration_report("ar-rq", "worker-a", claimed.attempts, stale)
+        .await
+        .unwrap();
+    assert!(wrote);
+
+    // max_attempts = 5 > attempts (1): the requeue arm.
+    let actioned = catalog.reclaim_expired_training_jobs(5).await.unwrap();
+    assert_eq!(actioned, 1, "the expired lease is re-queued");
+
+    let requeued = catalog.get_training_job("ar-rq").await.unwrap();
+    assert_eq!(requeued.status, TrainingJobStatus::Queued.to_string());
+    assert_eq!(
+        requeued.acceleration_report.as_deref(),
+        Some(PENDING_MARKER),
+        "a re-queued job is awaiting a fresh determination — the dead attempt's report \
+         must not survive onto a queued row"
+    );
+
+    // And the next claimant's own report lands over the reset marker as usual.
+    let second = catalog
+        .claim_next_training_job("worker-b", Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("worker-b re-claims");
+    assert_eq!(second.attempts, 2);
+    assert_eq!(
+        second.acceleration_report.as_deref(),
+        Some(PENDING_MARKER),
+        "the claim itself does not resurrect the dead attempt's report"
+    );
+    let fresh = r#"{"state":"determined","attempt":2,"device":"cpu"}"#;
+    catalog
+        .record_acceleration_report("ar-rq", "worker-b", 2, fresh)
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog
+            .get_training_job("ar-rq")
+            .await
+            .unwrap()
+            .acceleration_report
+            .as_deref(),
+        Some(fresh)
+    );
+}
+
+/// (vi) Control — the rewrite fires ONLY on the two terminal-failure paths and
+/// the requeue reset. A job that never fails is untouched at every other
+/// transition: submission, claim, `mark_training_running`, heartbeat, a live
+/// (unexpired) lease surviving a reclaim sweep, and `finalize`. If this control
+/// ever goes red, the CASE has leaked into a write it must not touch.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_that_never_fails_keeps_its_report_untouched(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    catalog
+        .create_training_job(job_params("ar-ok"))
+        .await
+        .unwrap();
+    catalog
+        .register_model(RegisterModelParams {
+            model_id: "jammi:fine-tuned:ar-ok",
+            version: 1,
+            model_type: "fine-tuned",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: Some("q-base::1"),
+            artifact_path: None,
+            config_json: None,
+        })
+        .await
+        .unwrap();
+
+    // Submitted, unclaimed: pending, and a reclaim sweep does not see it.
+    assert_eq!(
+        catalog
+            .get_training_job("ar-ok")
+            .await
+            .unwrap()
+            .acceleration_report
+            .as_deref(),
+        Some(PENDING_MARKER)
+    );
+    assert_eq!(
+        catalog.reclaim_expired_training_jobs(5).await.unwrap(),
+        0,
+        "a queued job has no lease to reclaim"
+    );
+    assert_eq!(
+        catalog
+            .get_training_job("ar-ok")
+            .await
+            .unwrap()
+            .acceleration_report
+            .as_deref(),
+        Some(PENDING_MARKER),
+        "a no-op reclaim sweep must not reset an unclaimed job's marker"
+    );
+
+    // Claimed under a LIVE lease, still pre-probe: pending survives the claim,
+    // a run-start metrics stamp, a heartbeat, and a reclaim sweep that finds
+    // the lease unexpired.
+    let claimed = catalog
+        .claim_next_training_job("worker-a", Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("job claimed");
+    assert_eq!(claimed.acceleration_report.as_deref(), Some(PENDING_MARKER));
+    assert!(catalog
+        .mark_training_running(
+            "ar-ok",
+            "worker-a",
+            Some(r#"{"started_at":"2026-01-01T00:00:00Z"}"#)
+        )
+        .await
+        .unwrap());
+    assert!(catalog
+        .heartbeat_training_job("ar-ok", "worker-a", Duration::from_secs(3600))
+        .await
+        .unwrap());
+    assert_eq!(
+        catalog.reclaim_expired_training_jobs(5).await.unwrap(),
+        0,
+        "a live lease is not reclaimed"
+    );
+    assert_eq!(
+        catalog
+            .get_training_job("ar-ok")
+            .await
+            .unwrap()
+            .acceleration_report
+            .as_deref(),
+        Some(PENDING_MARKER),
+        "no non-terminal transition retires the pending marker"
+    );
+
+    // The probe lands, then the job completes: the determination is the row's
+    // final, untouched state.
+    let report = r#"{"state":"determined","attempt":1,"device":"cuda:0"}"#;
+    assert!(catalog
+        .record_acceleration_report("ar-ok", "worker-a", claimed.attempts, report)
+        .await
+        .unwrap());
+    assert!(catalog
+        .finalize_training_job(FinalizeTrainingJobParams {
+            job_id: "ar-ok",
+            worker_id: "worker-a",
+            output_model_id: "jammi:fine-tuned:ar-ok",
+            output_model_version: 1,
+            artifact_path: "file:///artifacts/ar-ok/worker-a/0",
+            metrics: Some(r#"{"completed_at":"2026-01-01T00:01:00Z"}"#),
+            epoch_checkpoints: &[],
+        })
+        .await
+        .unwrap());
+
+    let after = catalog.get_training_job("ar-ok").await.unwrap();
+    assert_eq!(after.status, TrainingJobStatus::Completed.to_string());
+    assert_eq!(
+        after.acceleration_report.as_deref(),
+        Some(report),
+        "the happy path's determination is untouched by every write in the lifecycle"
     );
 }

@@ -1042,6 +1042,150 @@ def test_remote_and_embedded_training_job_metrics_agree_on_all_three_states(tmp_
     del malformed_job, malformed_db
 
 
+@pytest.mark.skipif(
+    not _METRICS_TEST_TINY_BERT.is_dir() or not _METRICS_TEST_TRAINING_PAIRS.is_file(),
+    reason="local tiny_bert / training_pairs fixtures not present",
+)
+def test_remote_and_embedded_training_job_acceleration_report_agree_on_all_three_states(
+    tmp_path,
+):
+    """`RemoteTrainingJob.acceleration_report()` and the embedded
+    `TrainingJob.acceleration_report()` agree on the SAME three states the
+    catalog's `training_jobs.acceleration_report` column can carry (esc-075 /
+    campaign #443 K4 follow-up) — VALUE parity, not merely
+    `test_remote_training_job_matches_the_local_handle_shape`'s method-
+    existence check above:
+
+      * `NULL` (column absent / wire field unset) -> `None` on BOTH — an
+        honest absence, never coerced to `{}` or any acceleration-state claim
+        on either transport. This is the tri-state's load-bearing case: it is
+        NOT `metrics()`'s "absent means `{}`" shape (that column's `NULL` and
+        "not recorded yet" are one state); `acceleration_report`'s `NULL` and
+        the submission-time `"pending"` marker are deliberately two different,
+        distinguishable states, and a transport that collapsed `NULL` to `{}`
+        would erase that distinction.
+      * present + `{"state": "pending"}` -> the SAME parsed dict on both.
+      * present + `{"state": "determined", ...}` -> the SAME parsed dict on
+        both, using the byte-identical JSON text a REAL run's esc-075 probe
+        produced on the embedded side (never a hand-built stand-in) fed
+        verbatim to the remote stub — so this proves the two `JSON-decode`
+        implementations agree on the real producer's actual output shape, not
+        just on a convenient literal.
+
+    Same close-before-inject / one-real-job discipline as
+    `test_remote_and_embedded_training_job_metrics_agree_on_all_three_states`
+    (esc-073) — see that test's docstring for why.
+    """
+    import json
+    import sqlite3
+
+    import jammi_native
+    from jammi._assembly import build_fine_tune_request
+    from jammi._generated.jammi.v1 import training_pb2
+
+    pending_payload = '{"state":"pending"}'
+    pending_expected = {"state": "pending"}
+
+    # --- Embedded arm: one real job, three close-before-inject cycles. ----
+    catalog_db = tmp_path / "catalog.db"
+
+    def _set_acceleration_report(job_id: str, value) -> None:
+        conn = sqlite3.connect(str(catalog_db))
+        try:
+            conn.execute(
+                "UPDATE training_jobs SET acceleration_report = ? WHERE job_id = ?",
+                (value, job_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    submit_db = jammi_native.open_local(artifact_dir=str(tmp_path))
+    submit_db.add_source(
+        "acceleration_states", url=str(_METRICS_TEST_TRAINING_PAIRS), format="csv"
+    )
+    request = build_fine_tune_request(
+        source="acceleration_states",
+        base_model=f"local:{_METRICS_TEST_TINY_BERT}",
+        columns=["text_a", "text_b", "score"],
+        method="lora",
+        task="text_embedding",
+        epochs=2,
+        batch_size=8,
+        lora_rank=4,
+        warmup_steps=0,
+    )
+    submit_job = submit_db._start_training_proto(request.SerializeToString())
+    submit_job.wait()
+    assert submit_job.status() == "completed"
+    job_id = submit_job.job_id
+
+    # State "determined": the job's OWN natural post-completion payload — a
+    # REAL esc-075 probe result, not a hand-built stand-in.
+    embedded_determined = submit_job.acceleration_report()
+    assert isinstance(embedded_determined, dict)
+    assert embedded_determined["state"] == "determined"
+    # The byte-identical raw JSON text the catalog itself holds, fed to the
+    # remote stub below so the parity assertion covers the real producer's
+    # actual output shape, not a convenient literal.
+    determined_payload = json.dumps(embedded_determined)
+
+    submit_db.close()
+    del submit_job, submit_db
+
+    def _seed_and_attach(seed):
+        _set_acceleration_report(job_id, seed)
+        db = jammi_native.open_local(artifact_dir=str(tmp_path))
+        return db, db.training_job(job_id)
+
+    absent_db, absent_job = _seed_and_attach(None)
+    embedded_absent = absent_job.acceleration_report()
+    absent_db.close()
+    del absent_job, absent_db
+
+    pending_db, pending_job = _seed_and_attach(pending_payload)
+    embedded_pending = pending_job.acceleration_report()
+    pending_db.close()
+    del pending_job, pending_db
+
+    # --- Remote arm: three stubbed `TrainingStatusResponse`s. -------------
+    class _AbsentStub:
+        def TrainingStatus(self, *_args, **_kwargs):
+            return training_pb2.TrainingStatusResponse(status="running")
+
+    class _PendingStub:
+        def TrainingStatus(self, *_args, **_kwargs):
+            return training_pb2.TrainingStatusResponse(
+                status="running", acceleration_report_json=pending_payload
+            )
+
+    class _DeterminedStub:
+        def TrainingStatus(self, *_args, **_kwargs):
+            return training_pb2.TrainingStatusResponse(
+                status="completed", acceleration_report_json=determined_payload
+            )
+
+    remote_absent = jammi.RemoteTrainingJob(
+        _AbsentStub(), (), job_id="remote-accel-1", model_id="model-1"
+    )
+    remote_pending = jammi.RemoteTrainingJob(
+        _PendingStub(), (), job_id="remote-accel-2", model_id="model-2"
+    )
+    remote_determined = jammi.RemoteTrainingJob(
+        _DeterminedStub(), (), job_id="remote-accel-3", model_id="model-3"
+    )
+
+    # --- Value parity, both directions of the tri-state. -------------------
+    assert embedded_absent is None
+    assert remote_absent.acceleration_report() is None
+
+    assert embedded_pending == pending_expected
+    assert remote_pending.acceleration_report() == pending_expected
+    assert embedded_pending == remote_pending.acceleration_report()
+
+    assert remote_determined.acceleration_report() == embedded_determined
+
+
 class _StubTenant:
     id = ""
 

@@ -744,9 +744,9 @@ class RemoteTrainingJob:
                 f"as JSON: {exc}"
             ) from exc
 
-    def acceleration_report(self) -> Dict[str, Any]:
-        """GPU-acceleration determination for this job, as a dict (esc-075,
-        campaign #443).
+    def acceleration_report(self) -> Optional[Dict[str, Any]]:
+        """GPU-acceleration determination for this job, as a dict or ``None``
+        (esc-075, campaign #443).
 
         The remote peer of the embedded `TrainingJob.acceleration_report`:
         parses the `TrainingStatusResponse.acceleration_report_json` field the
@@ -767,20 +767,27 @@ class RemoteTrainingJob:
         ``"undetermined"``) — the vocabulary is owned by the producer, not
         enumerated here.
 
-        Returns ``{}`` for a legacy row predating the column (`optional`
-        unset on the wire, mirroring SQL `NULL`) — deliberately distinct from
-        the ``{"state": "pending"}`` marker every job submitted after
-        migration 026 carries.
+        Returns ``None`` for a legacy row predating the column (`optional`
+        unset on the wire, mirroring SQL `NULL`) — an honest absence of
+        information, never coerced into `{}` or any acceleration-state claim.
+        Deliberately distinct from the ``{"state": "pending"}`` marker every
+        job submitted after migration 026 carries. Mirrors the embedded
+        `TrainingJob.acceleration_report`'s own `None`-for-`NULL` contract
+        exactly — the two transports must agree on this tri-state, not merely
+        both "return something" (`metrics()`'s `{}`-for-absent default does
+        NOT apply here: that column's `NULL` and "not recorded yet" are the
+        same state, whereas `acceleration_report`'s `NULL` and `"pending"` are
+        deliberately two different, distinguishable states).
 
         Raises :class:`jammi.errors.BackendError` if `acceleration_report_json`
         IS set but fails to parse as JSON — a catalog data-integrity fault,
-        never silently folded into the "absent" `{}` case. Mirrors the
+        never silently folded into the "absent" `None` case. Mirrors the
         embedded `TrainingJob.acceleration_report`, which raises the same
         class for the same present-but-malformed state.
         """
         resp = self._status_response()
         if not resp.HasField("acceleration_report_json"):
-            return {}
+            return None
         try:
             return json.loads(resp.acceleration_report_json)
         except json.JSONDecodeError as exc:

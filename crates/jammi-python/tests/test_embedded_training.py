@@ -128,13 +128,13 @@ def test_embedded_fine_tune_metrics_surfaces_val_loss_run_summary(tmp_path: Path
         assert math.isfinite(row["loss"])
 
 
-def test_embedded_fine_tune_acceleration_report_three_states(tmp_path: Path) -> None:
+def test_embedded_fine_tune_acceleration_report_four_states(tmp_path: Path) -> None:
     """`TrainingJob.acceleration_report()` (campaign #443): the catalog's
     `training_jobs.acceleration_report` column, decoded the same way
     `metrics()` decodes its column (issue #441) but preserving THIS column's
     own two-state contract (`TrainingJobRecord::acceleration_report`'s doc,
     migration 026) rather than `metrics()`'s "absent means `{}`" default —
-    proven against a REAL embedded engine + catalog on all three states:
+    proven against a REAL embedded engine + catalog on all four states:
 
       * the submission-time `{"state": "pending"}` marker
         `Catalog::create_training_job` stamps before any claimant has
@@ -146,8 +146,12 @@ def test_embedded_fine_tune_acceleration_report_three_states(tmp_path: Path) -> 
       * SQL `NULL` (a row this code never touched) -> Python `None`, never
         silently coerced to `{}` or read as any particular acceleration
         state.
+      * present + unparseable JSON -> `jammi.errors.BackendError`, mirroring
+        `metrics()`'s malformed-blob idiom exactly: a data-integrity fault,
+        never silently folded into the `None`/"absent" case (K4 follow-up —
+        this state was missing from the original three-state coverage).
 
-    Reuses ONE real fine-tune run for all three reads with the SAME
+    Reuses ONE real fine-tune run for all four reads with the SAME
     close-before-inject discipline `test_conformance.py`'s
     `test_remote_and_embedded_training_job_metrics_agree_on_all_three_states`
     documents (esc-073): a raw `sqlite3` seed write never overlaps a live
@@ -161,8 +165,10 @@ def test_embedded_fine_tune_acceleration_report_three_states(tmp_path: Path) -> 
 
     import jammi_native
     from jammi._assembly import build_fine_tune_request
+    from jammi.errors import BackendError
 
     pending_marker = '{"state":"pending"}'
+    malformed_payload = '{"state":"determined", "attempt"'  # truncated, invalid JSON
 
     catalog_db = tmp_path / "catalog.db"
 
@@ -242,6 +248,20 @@ def test_embedded_fine_tune_acceleration_report_three_states(tmp_path: Path) -> 
     assert null_job.acceleration_report() is None
     null_db.close()
     del null_job, null_db
+
+    # State 4: present + malformed -> `BackendError`, never silently folded
+    # into the `None`/"absent" case. Mirrors `metrics()`'s own
+    # present-but-unparseable-blob guard (see
+    # `test_remote_and_embedded_training_job_metrics_agree_on_all_three_states`'s
+    # "State 3" in `test_conformance.py`).
+    malformed_db, malformed_job = _seed_and_attach(malformed_payload)
+    with pytest.raises(
+        BackendError, match=r"acceleration_report blob failed to parse as JSON"
+    ) as malformed_info:
+        malformed_job.acceleration_report()
+    assert job_id in str(malformed_info.value)
+    malformed_db.close()
+    del malformed_job, malformed_db
 
 
 def test_embedded_fine_tune_rejects_unknown_method_in_the_assembly(tmp_path: Path) -> None:

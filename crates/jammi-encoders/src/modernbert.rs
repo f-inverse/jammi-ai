@@ -708,8 +708,14 @@ pub(crate) static ATTENTION_BLOCK_DISPATCH_COUNTERS: LazyLock<&'static DispatchC
 ///
 /// **`dtype` gate, PER-DEVICE-HONEST (adversarial audit round 3, F2 fix;
 /// widened to `F16` on CUDA by campaign #443 D1):** the op's own domain is
-/// dtype-split by device — `F32`-only on CPU (`cpu_fwd`'s own module doc,
-/// candle-core 0.11's CPU backend has no `BF16`/`F16` `MatMul`), `F32`,
+/// dtype-split by device — `F32`-only on CPU (`cpu_fwd`'s own module doc;
+/// CORRECTED, campaign #446 finding 14: candle-core 0.11's CPU `MatMul`
+/// has no `BF16` impl, but it DOES accept `F16` in this workspace's
+/// default gemm build — `cpu_backend`'s `impl Map2 for MatMul` admits
+/// `F16 | F32 | F64`. `F16` is nonetheless out of this op's CPU domain
+/// because `cpu_fwd` is a hand-written `f32` raw-storage online-softmax
+/// loop with no narrower arm at all, not because candle could not
+/// multiply it), `F32`,
 /// `BF16`, OR `F16` on CUDA (`cuda_fwd`'s own module doc — `F16` upcasts to
 /// `f32` at the boundary on the SAME mechanism `BF16` already used, no new
 /// `.cu` kernel). An earlier revision had NO dtype gate here at all — the op's own
@@ -756,8 +762,14 @@ fn mem_efficient_attention_predicate(
     // mechanism `BF16` already used — no new `.cu` kernel, so this
     // predicate's domain follows the op's own, not a build-time capability
     // this crate would need to detect separately). The CPU side is
-    // UNCHANGED: candle-core 0.11's CPU backend has no `BF16`/`F16` `MatMul`
-    // impl, so `cpu_fwd` still refuses both.
+    // UNCHANGED: `cpu_fwd` is `F32`-only and still refuses both `BF16` and
+    // `F16`. CORRECTED reason (campaign #446 finding 14 — an earlier
+    // revision of this comment said candle-core 0.11's CPU backend "has no
+    // `BF16`/`F16` `MatMul` impl", which is only half true): candle's
+    // default gemm CPU `MatMul` admits `F16 | F32 | F64` and refuses
+    // `BF16`. The op's CPU refusal of `F16` comes from ITS OWN `cpu_fwd`
+    // (a hand-written `f32` raw-storage loop with no 16-bit arm), not from
+    // a missing candle kernel.
     let dtype_ok = if device.is_cuda() {
         matches!(dtype, DType::F32 | DType::BF16 | DType::F16)
     } else {

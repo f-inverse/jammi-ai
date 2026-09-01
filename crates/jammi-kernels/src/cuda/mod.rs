@@ -98,11 +98,23 @@ pub(crate) fn elemwise_launch_config(n: u32) -> LaunchConfig {
 /// this crate's production dtypes (F16 added in campaign #443 W2b for
 /// `layer_norm`/`softmax`/`geglu`/`rope`, extended in W2c to
 /// `rope_positions`/`axpy`/`dropout`/`scaled_cast_add` — every op with a
-/// compiled F16 dispatch arm; a caller for any OTHER op never reaches this
-/// arm with `DType::F16` because ITS OWN dtype match fails first — see
-/// `tests::empty_f16_is_refused_for_an_op_with_no_f16_dispatch_arm` below
-/// for `cast_scale_bf16_f32`/`cast_add_bf16`, the two ops this crate ships
-/// WITHOUT an F16 dispatch arm as of W2c), anything else a typed refusal.
+/// compiled F16 dispatch arm), anything else a typed refusal.
+///
+/// The two ops this crate ships WITHOUT an F16 dispatch arm
+/// (`cast_scale_bf16_f32`, `cast_add_bf16`) cannot reach this function's
+/// `DType::F16` arm at all, and the reason is STRUCTURAL rather than
+/// test-pinned (a prior revision of this comment cited a
+/// `tests::empty_f16_is_refused_for_an_op_with_no_f16_dispatch_arm` that
+/// has never existed in this tree — campaign #446, finding 14): their
+/// CUDA glue (`cast_scale::cuda_fwd_cast_scale_bf16_f32`,
+/// `cuda_fwd_cast_add_bf16`) refuses any non-BF16 input with
+/// `UnsupportedDTypeForOp` at its FIRST statement, before the `n == 0`
+/// fast path, and each then passes a LITERAL `DType::F32`/`DType::BF16`
+/// here — never `s1.dtype()`. That refusal IS test-pinned, on the CUDA
+/// arm and at BOTH `n == 0` and `n > 0`, by
+/// `tests/cuda_parity.rs`'s
+/// `cast_scale_bf16_f32_and_cast_add_bf16_refuse_f16_both_empty_and_nonempty`
+/// — the test the missing citation was presumably reaching for.
 /// The caller validates cross-tensor dtype agreement FIRST (this only
 /// handles the single already-agreed-on `dtype`, exactly like every
 /// inlined match this replaces did).

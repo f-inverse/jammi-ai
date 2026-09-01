@@ -441,10 +441,18 @@ fn dropout_bf16(params: &DropoutFused, x: &[bf16]) -> Vec<bf16> {
 }
 
 /// [`dropout_bf16`]'s exact twin, substituting `half::f16` — this op's
-/// CPU-only F16 oracle-reference arm (no CUDA/Metal F16 dispatch arm
-/// exists yet, see `docs/maintainer/cuda-kernel-guide.md`'s per-op f16
-/// reference-regime table). Byte-identical KEEP/DROP decision (the mask
-/// is dtype-independent), one rounding point on a KEPT element.
+/// F16 CPU arm, which doubles as the reference the CUDA F16 arm is
+/// compared against. CORRECTION (campaign #446, finding 14): an earlier
+/// revision of this comment said "no CUDA/Metal F16 dispatch arm exists
+/// yet". That is false for CUDA and has been since campaign #443 W2c —
+/// `cuda/dropout.rs`'s `cuda_fwd` has a real `DType::F16` arm dispatching
+/// `dropout_fwd_f16` from the separate `cuda/dropout_f16.cu` translation
+/// unit (this module's own doc, "supports ... `F16`", was already
+/// correct; only this line lagged). It remains true for METAL: `metal_fwd`
+/// deliberately admits `F32`/`BF16` only — see its own `DType::F32 |
+/// DType::BF16 => {}` gate and the "deliberately NOT widened to F16"
+/// note there. Byte-identical KEEP/DROP decision (the mask is
+/// dtype-independent), one rounding point on a KEPT element.
 fn dropout_f16(params: &DropoutFused, x: &[f16]) -> Vec<f16> {
     x.iter()
         .enumerate()

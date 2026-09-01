@@ -110,12 +110,18 @@
 //! ## Domain (family D)
 //!
 //! `qkv`: rank 5 `[batch, seq, 3, heads, head_dim]`, contiguous, dtype
-//! `F32` (CPU and CUDA) or `BF16`/`F16` (CUDA only — candle-core 0.11's CPU
-//! backend has no `BF16`/`F16` `MatMul` impl, the SAME pre-existing
-//! limitation `LowRankResidualLinear`'s module doc discloses; this op's CPU
-//! domain therefore accepts `F32` only, refusing `BF16`/`F16` with a typed
+//! `F32` (CPU and CUDA) or `BF16`/`F16` (CUDA only). This op's CPU domain
+//! accepts `F32` ONLY, refusing `BF16`/`F16` with a typed
 //! `UnsupportedDTypeForOp` rather than reaching a confusing failure three
-//! calls deep inside a matmul). `F16` (campaign #443 D1) is admitted on
+//! calls deep inside a matmul. CORRECTED reason (campaign #446 finding
+//! 14; an earlier revision of this line said candle-core 0.11's CPU
+//! backend "has no `BF16`/`F16` `MatMul` impl", which is only half true —
+//! [`LowRankResidualLinear`]'s module doc already states it correctly):
+//! candle's default gemm CPU `MatMul` admits `F16`/`F32`/`F64` and refuses
+//! `BF16`. `BF16` therefore IS a candle limitation; `F16` is not — it is
+//! refused because `cpu_fwd` below is written against `CpuStorage::F32`
+//! throughout (its GEMMs are literal `CpuStorage::F32(..).matmul(..)`
+//! calls), with no 16-bit arm to reach. `F16` (campaign #443 D1) is admitted on
 //! CUDA on exactly the same basis as `BF16`: this op has no `.cu` kernel of
 //! its own (`crate::cuda::attention_block`'s module doc), so its dtype
 //! domain is the INTERSECTION of what candle's own generic storage ops
@@ -2184,9 +2190,12 @@ mod tests {
 
     /// Family D boundary oracle (campaign #443 D1): the CPU domain is
     /// `F32`-only, unaffected by this campaign's CUDA-side `F16` widening
-    /// (`crate::cuda::attention_block`'s dtype check) — candle-core 0.11's
-    /// CPU backend has no `BF16`/`F16` `MatMul` impl (module doc's "Domain"
-    /// section). Both 16-bit dtypes must be refused with a TYPED
+    /// (`crate::cuda::attention_block`'s dtype check) — `cpu_fwd` is
+    /// written against `CpuStorage::F32` throughout, and `BF16` is
+    /// additionally unsupported by candle's own CPU `MatMul` (module doc's
+    /// "Domain" section states both halves precisely; candle's CPU
+    /// `MatMul` DOES admit `F16`, so that half is this op's own limit, not
+    /// candle's). Both 16-bit dtypes must be refused with a TYPED
     /// `UnsupportedDTypeForOp` naming the OFFENDING dtype, never a silent
     /// upcast and never a generic error three calls deep inside a matmul —
     /// pinned on BOTH dtypes so a future CPU `BF16`-only carve-out could not

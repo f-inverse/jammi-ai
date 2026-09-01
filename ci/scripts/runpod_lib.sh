@@ -1185,12 +1185,29 @@ p=(json.load(sys.stdin).get("data",{}).get("pod") or {}).get("runtime") or {}
 rp_deploy_arch() { # $1=arch
   local cand
   case "$1" in
+    # sm_80 has NO useful same-SASS sibling on RunPod (no A800/A30 in the
+    # catalog; A100-SXM4-40GB is half-VRAM and community-only) — both 80GB
+    # variants are already listed, so an sm_80 drought has no fallback lever.
     a100)    cand=("SECURE|NVIDIA A100 80GB PCIe" "COMMUNITY|NVIDIA A100 80GB PCIe" "SECURE|NVIDIA A100-SXM4-80GB" "COMMUNITY|NVIDIA A100-SXM4-80GB") ;;
-    l40s)    cand=("SECURE|NVIDIA L40S" "COMMUNITY|NVIDIA L40S") ;;
-    h100)    cand=("SECURE|NVIDIA H100 80GB HBM3" "SECURE|NVIDIA H100 PCIe" "COMMUNITY|NVIDIA H100 80GB HBM3" "COMMUNITY|NVIDIA H100 PCIe") ;;
-    a40)     cand=("SECURE|NVIDIA A40" "COMMUNITY|NVIDIA A40") ;;
-    l4)      cand=("SECURE|NVIDIA L4" "COMMUNITY|NVIDIA L4") ;;
-    l4_l40s) cand=("SECURE|NVIDIA L4" "COMMUNITY|NVIDIA L4" "SECURE|NVIDIA L40S" "COMMUNITY|NVIDIA L40S") ;;
+    # sm_89, 48GB-class: RTX 6000 Ada is the equal-VRAM same-SASS sibling.
+    l40s)    cand=("SECURE|NVIDIA L40S" "COMMUNITY|NVIDIA L40S" "SECURE|NVIDIA RTX 6000 Ada Generation" "COMMUNITY|NVIDIA RTX 6000 Ada Generation") ;;
+    # sm_90 capacity fallbacks (campaign #443 proactive sweep — the H100
+    # SXM/PCIe pools run dry too): H100 NVL (94GB) and H200 (141GB) are
+    # same-GH100 sm_90 SASS with >= VRAM, so both the prove proof and a
+    # dev pod's memory envelope are preserved; H200 last (priciest).
+    h100)    cand=("SECURE|NVIDIA H100 80GB HBM3" "SECURE|NVIDIA H100 PCIe" "COMMUNITY|NVIDIA H100 80GB HBM3" "COMMUNITY|NVIDIA H100 PCIe" "SECURE|NVIDIA H100 NVL" "COMMUNITY|NVIDIA H100 NVL" "SECURE|NVIDIA H200" "COMMUNITY|NVIDIA H200") ;;
+    # sm_86 capacity fallbacks (campaign #443: two prove attempts died on an
+    # A40 drought): RTX A6000 (48GB, ECC — closest A40 twin) then RTX 3090
+    # (24GB, no ECC — same GA10x sm_86 SASS, identical correctness proof;
+    # ordered last for the ECC difference, which affects fault tolerance,
+    # never the computed values a parity/capability suite asserts).
+    a40)     cand=("SECURE|NVIDIA A40" "COMMUNITY|NVIDIA A40" "SECURE|NVIDIA RTX A6000" "COMMUNITY|NVIDIA RTX A6000" "SECURE|NVIDIA GeForce RTX 3090" "COMMUNITY|NVIDIA GeForce RTX 3090") ;;
+    l4)      cand=("SECURE|NVIDIA L4" "COMMUNITY|NVIDIA L4" "SECURE|NVIDIA GeForce RTX 4090" "COMMUNITY|NVIDIA GeForce RTX 4090") ;; # sm_89, 24GB-class: 4090 = equal-VRAM same-SASS sibling
+    # sm_89 capacity fallbacks (same drought, L4+L40S both dry): RTX 6000 Ada
+    # (48GB, ECC) then RTX 4090 (24GB — matches L4's own 24GB envelope, so any
+    # suite that fits the first-choice card fits this one; no ECC, same AD10x
+    # sm_89 SASS, identical correctness proof).
+    l4_l40s) cand=("SECURE|NVIDIA L4" "COMMUNITY|NVIDIA L4" "SECURE|NVIDIA L40S" "COMMUNITY|NVIDIA L40S" "SECURE|NVIDIA RTX 6000 Ada Generation" "COMMUNITY|NVIDIA RTX 6000 Ada Generation" "SECURE|NVIDIA GeForce RTX 4090" "COMMUNITY|NVIDIA GeForce RTX 4090") ;;
     *) echo "::error::unknown arch '$1' (want: a100|l40s|h100|a40|l4|l4_l40s)"; return 2 ;;
   esac
   RP_ARCH="$1"

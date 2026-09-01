@@ -11,6 +11,8 @@
 #[cfg(feature = "local")]
 pub mod adamw;
 #[cfg(feature = "local")]
+pub mod batch_bucket;
+#[cfg(feature = "local")]
 pub mod classifier;
 #[cfg(feature = "local")]
 pub mod data;

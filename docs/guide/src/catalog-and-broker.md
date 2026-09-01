@@ -88,9 +88,19 @@ A working copy of this file ships at
 | --- | --- | --- |
 | Operational footprint | One file under `artifact_dir`. No daemon. | Externally-managed Postgres cluster. |
 | Concurrent writers | One; WAL mode lets many readers run alongside one writer. | Many. |
-| Multi-process deployment | Single-process only — sharing the file across `jammi-server` replicas corrupts WAL. | Multi-replica safe. |
+| Multi-process deployment | Single-process only, and refused rather than corrupted: the engine opens the catalog through SQLite's `unix-excl` VFS, holding a process-scoped exclusive lock and keeping the wal-index in heap, so a second process opening the same file gets a typed `BackendError` (an `SQLITE_BUSY`-class refusal) instead of silently corrupting WAL. | Multi-replica safe. |
 | Failure recovery | File restore from backup. | Standard Postgres point-in-time-recovery. |
 | Pool tuning | None — opens one pool of 8 connections. | `pool_size` + `max_lifetime_secs` honour `sqlx::PgPool` knobs. |
+
+**What the exclusive lock does not cover.** It is a lock between *processes*.
+A second SQLite **library instance inside the same process** — for example
+CPython's `sqlite3` module opening the catalog file directly from a Python
+program that also holds an embedded engine — is invisible to it: POSIX
+advisory locks are per-process, so the two instances cannot see each other's
+locks, and closing either one's last descriptor drops that process's locks on
+the file. That topology is out of contract and unprotected. Read and write the
+catalog through the engine's API; never open the catalog file with another
+SQLite library alongside a live engine.
 
 For laptop / single-tenant deployments, SQLite is the right answer; the
 trade-off table tilts to Postgres the moment a second `jammi-server`

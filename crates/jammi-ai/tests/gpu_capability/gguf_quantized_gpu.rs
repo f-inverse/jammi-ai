@@ -437,6 +437,14 @@ fn gguf_cuda_elementwise_abs_tol() -> f64 {
 async fn gguf_embedding_cpu_gpu_parity_within_q8_1_activation_quant_floor() {
     skip_without_gpu!();
     harness::loss_capture::install();
+    // Finding 9: this file's admission oracle reads DEVICE-GLOBAL memory as a
+    // before/after delta, so every OTHER test in this file must be held out of
+    // that window. Holding the same `harness::serial_cuda_device` slot for
+    // this test's whole body is what makes "one at a time" a property of the
+    // file rather than of a `--test-threads=1` flag nothing enforces. The
+    // binding is `_gpu` (not `_`), so it lives to the end of the fn — `let _ =`
+    // would drop it immediately and silently restore the race.
+    let _gpu = harness::serial_cuda_device();
 
     let tmp = TempDir::new().unwrap();
     let gguf_dir = tmp.path().join("gguf_model");
@@ -534,6 +542,14 @@ const GGUF_VS_F32_GPU_COSINE_FLOOR: f64 = 0.9999;
 async fn gguf_on_gpu_vs_f32_safetensors_on_gpu_quantization_loss_floor() {
     skip_without_gpu!();
     harness::loss_capture::install();
+    // Finding 9: this file's admission oracle reads DEVICE-GLOBAL memory as a
+    // before/after delta, so every OTHER test in this file must be held out of
+    // that window. Holding the same `harness::serial_cuda_device` slot for
+    // this test's whole body is what makes "one at a time" a property of the
+    // file rather than of a `--test-threads=1` flag nothing enforces. The
+    // binding is `_gpu` (not `_`), so it lives to the end of the fn — `let _ =`
+    // would drop it immediately and silently restore the race.
+    let _gpu = harness::serial_cuda_device();
 
     let tmp = TempDir::new().unwrap();
     let gguf_dir = tmp.path().join("gguf_model");
@@ -608,6 +624,14 @@ async fn qlora_learns_on_gpu_with_gguf_base() {
     skip_without_gpu!();
     harness::loss_capture::install();
     harness::loss_capture::reset();
+    // Finding 9: this file's admission oracle reads DEVICE-GLOBAL memory as a
+    // before/after delta, so every OTHER test in this file must be held out of
+    // that window. Holding the same `harness::serial_cuda_device` slot for
+    // this test's whole body is what makes "one at a time" a property of the
+    // file rather than of a `--test-threads=1` flag nothing enforces. The
+    // binding is `_gpu` (not `_`), so it lives to the end of the fn — `let _ =`
+    // would drop it immediately and silently restore the race.
+    let _gpu = harness::serial_cuda_device();
 
     let fixture_dir = TempDir::new().unwrap();
     let gguf_dir = fixture_dir.path().join("gguf_base");
@@ -827,14 +851,40 @@ fn ephemeral_artifact_store() -> Arc<ArtifactStore> {
 /// device reading is quantized to [`ALLOCATOR_POOL_BLOCK_BYTES`], so this
 /// oracle can never prove byte-exact truthfulness, only that the estimate
 /// does not under-report by more than one block of allocator slop.
+///
+/// ## One-at-a-time is STRUCTURAL here (campaign #446, finding 9)
+///
+/// [`device_memory_used_bytes`] is a DEVICE-GLOBAL reading, and this oracle
+/// asserts on a before/after DELTA around a model load. `cargo test` runs one
+/// binary's tests concurrently, and `gpu_capability` is a fourteen-module
+/// binary in which essentially every other test allocates on the same device
+/// — a sibling's allocation inside this window is charged to this load
+/// (inflating `measured_delta` past the allowance: a false RED), and a
+/// sibling's free can drive the signed delta negative (the hard-failure arm
+/// below: also a false RED). The window is therefore held under
+/// `harness::serial_cuda_device`'s process-wide slot, which is taken BEFORE
+/// the device is acquired and released only when `cuda` drops at the end of
+/// this fn — a test added to this file tomorrow cannot obtain the device
+/// without taking it.
+///
+/// The slot is not, on its own, sufficient for this binary: the other
+/// thirteen modules build their GPU sessions through `harness::gpu_session`
+/// and do NOT take it, so they are held off this window only by
+/// `ci/scripts/runpod_gpu_prove.sh`'s `--test-threads=1` on the
+/// `gpu_capability` invocation. That residual is stated at the mechanism, in
+/// `harness::SerialGpu`'s own doc, rather than left to be rediscovered.
 #[tokio::test(flavor = "multi_thread")]
 async fn gguf_gpu_load_admission_estimate_is_truthful_against_measured_device_memory() {
     skip_without_gpu!();
     harness::loss_capture::install();
 
     // Phase 0: settle the CUDA device (context/stream/pool bring-up paid)
-    // BEFORE the `before` snapshot — see `settle_cuda_device`'s own doc.
-    let cuda = Device::new_cuda(0).unwrap();
+    // BEFORE the `before` snapshot — see `settle_cuda_device`'s own doc. The
+    // slot this returns is held for the whole measurement window (finding 9);
+    // `skip_without_gpu!` above already proved a CUDA device opens, so a
+    // `None` here is a genuine late failure, not the GPU-less lane.
+    let cuda = harness::serial_cuda_device()
+        .expect("skip_without_gpu! already proved a CUDA device opens");
     settle_cuda_device(&cuda);
 
     let Some(before) = device_memory_used_bytes_or_require(
@@ -998,6 +1048,11 @@ async fn gguf_gpu_load_admission_estimate_is_truthful_against_measured_device_me
 async fn gguf_vs_f32_gpu_throughput_baseline() {
     skip_without_gpu!();
     harness::loss_capture::install();
+    // Finding 9, and doubly so here: a THROUGHPUT baseline shares a device
+    // with the admission oracle's memory window, so leaving them concurrent
+    // corrupts both directions — this leg's timings absorb the other's load,
+    // and the other's delta absorbs this leg's activations.
+    let _gpu = harness::serial_cuda_device();
 
     let tmp = TempDir::new().unwrap();
     let gguf_dir = tmp.path().join("gguf_model");

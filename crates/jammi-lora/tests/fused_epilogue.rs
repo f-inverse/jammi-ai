@@ -342,11 +342,16 @@ fn training_mode_on_a_mismatched_dtype_pair_falls_back_and_is_counted() {
 /// — campaign #443 D1 widened `LowRankResidualLinear`'s (and
 /// `ScaledCastAdd`'s CPU epilogue's) own domain to `F16` end to end, and
 /// this predicate must actually admit it rather than leaving an `F16`
-/// backbone permanently eager-only (esc-076's residual finding: the
-/// eager fallback's extra `to_dtype`-materialized intermediates, taken on
-/// EVERY training step for an unadmitted `F16` backbone, are what
-/// fragmented the allocator enough to OOM the held-out eval pass later at
-/// an identically-shaped allocation).
+/// backbone permanently eager-only (esc-075/esc-076's own triage row: this
+/// call site's `F16` gap left it silently, permanently eager; the pod's
+/// own 17360-fused/0-eager trace, reproduced by this test's own
+/// counter-delta assertion below, is the measured proof this widening
+/// closes it). This is NOT a claimed fix for the separate `s512`
+/// held-out-eval OOM esc-076 also tracked — that OOM reproduced on BOTH
+/// `bf16` and `f16` `alloff` legs alike and was pinned to, and fixed at, a
+/// different call site entirely (`evaluate_held_out`'s eval-batch
+/// bucket-up, `be1450ae`); no causal link between the two is asserted
+/// here.
 #[test]
 fn training_mode_on_an_f16_backbone_dispatches_fused_and_is_counted() {
     let device = cpu();

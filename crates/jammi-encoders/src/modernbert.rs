@@ -9044,9 +9044,21 @@ mod tests {
         let fused = FusedAttentionMasks::build(&mask, None, DType::F16).unwrap();
 
         let attn = attention_block_fixture(false, h, s, &device);
+        // Round-3 audit advisory: pass `fused.global` (F16, matching `qkv`),
+        // not the F32 `mask` built above -- an F32 mask against an F16
+        // `qkv` would decline via the dtype-MISMATCH arm regardless of
+        // device, which proves nothing about the device-split CPU refusal
+        // this test exists to exercise. `fused.global` is `mask` cast to
+        // the backbone dtype (`FusedAttentionMasks::build`'s own contract),
+        // so this call now genuinely reaches, and declines via, the
+        // CPU+F16 arm.
         let (holds, predicate) =
-            attention_block_admission_predicate(&qkv, s, h, d, &mask, false, None);
+            attention_block_admission_predicate(&qkv, s, h, d, &fused.global, false, None);
         assert!(!holds, "F16 on CPU must decline: predicate={predicate}");
+        assert_eq!(
+            predicate, "dtype_f32_matching_between_qkv_and_mask_on_cpu",
+            "must decline via the CPU+F16 device-split arm specifically, not a dtype mismatch"
+        );
 
         let block_before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
         let out = attn

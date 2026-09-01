@@ -222,13 +222,20 @@ pub fn lora_linear_fused_dispatch_snapshot() -> DispatchSnapshot {
 /// widened to match until this fix, so an `F16` backbone fell back to
 /// [`LoraLinear::forward_composed`]'s eager `[mul, cast, add]` composition
 /// for every training forward despite the fused kernel's own domain
-/// already covering it; esc-076's residual: that eager fallback's extra
-/// `to_dtype`-materialized intermediates, taken on EVERY training step for
-/// an `F16` backbone (never for `BF16`, which this predicate already
-/// admitted), fragment the allocator over the whole training run enough
-/// that a same-sized allocation the held-out eval pass later makes at the
-/// identical call site can fail even with total device memory well under
-/// budget); `w`
+/// already covering it (esc-075/esc-076's own triage row: an `F16`
+/// backbone was silently, permanently eager at this site — the fused/0
+/// eager dispatch-count proof below, and the pod's own 17360-fused/0-eager
+/// trace, is what this widening closes). This widening is NOT a fix for
+/// the separate `s512` held-out-eval OOM esc-076 also tracked: that OOM's
+/// mechanism was pinned by pod trace evidence to `evaluate_held_out`
+/// rounding its first eval batch UP to the `512` bucket rung (a bucketing
+/// call-site bug, `be1450ae`) — it reproduced on BOTH `bf16` and `f16`
+/// `alloff` legs alike, not `F16` alone, and was fixed independently, at
+/// that call site, by routing eval through natural-width tokenization
+/// instead of bucket-up padding. No causal claim is made here about
+/// eager-arm allocator fragmentation contributing to (or explaining) that
+/// OOM — this predicate's own domain-coverage gap is the only thing
+/// measured and fixed by this change; `w`
 /// contiguous (`x` is NOT required to be — the op materializes a
 /// non-contiguous `x` internally; see the op's own domain doc); the base
 /// weight carries no bias (see

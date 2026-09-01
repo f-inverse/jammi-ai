@@ -919,6 +919,20 @@ jobs:
           # the single `ci-summary` gate covers it.
           - name: doc↔enum parity
             cmd: python3 ci/scripts/check_doc_parity.py
+          # `ci/release-feature-manifest.json` states one capability surface
+          # three times (once per CUDA release lane), and classifies every op
+          # it names by HOW that op is proven (an observed dispatch-registry
+          # delta / an admitted parent's delta / compiled-only). This guard is
+          # the internal-consistency floor: the three lanes must agree, every
+          # op must sit in exactly one category (two categories = two
+          # contradictory proof claims), and every internal sub-kernel's
+          # parent + launch-site citation must resolve. Whether a declared
+          # capability HOLDS on a real device stays with capability_surface.rs
+          # and the flash-attn closure guard.
+          - name: release manifest consistency
+            cmd: python3 ci/scripts/check_release_manifest.py
+          - name: release manifest consistency (self-test)
+            cmd: python3 ci/scripts/check_release_manifest.py --self-test
           # Every measurement-shaped number (an N/M element count with M >= 64,
           # an X%/X.Y%, or a bare 2-6-decimal cosine) with a trigger word
           # ANYWHERE in its enclosing doc-comment BLOCK, in a kernel/test doc

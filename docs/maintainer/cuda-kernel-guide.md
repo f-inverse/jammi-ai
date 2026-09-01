@@ -215,6 +215,28 @@ op has an F16 CPU arm today therefore tracks whether its CPU forward is composed
 dtype-generic ops (it does) or is a monomorphic `_f32` function (it does not) — never the BF16
 matmul gap.
 
+### 3.10.1 Dispatch status of the table's non-admitted-looking rows
+
+Having an f16 arm is not the same as being *provable* on a device. Three different proof
+mechanisms exist, and `ci/release-feature-manifest.json` is the single source of truth for
+which one applies to which op — that file's `_schema_doc` defines each mechanism; this
+subsection only states where the rows above land, so a reader of the table does not have
+to guess.
+
+| Op | Status | What proves it |
+|---|---|---|
+| `cast_scale` | **Admitted**, under dtype-keyed registry keys `cast_scale_bf16_f32` / `cast_scale_f16_f32` | A dispatch-registry delta on those keys in the `capability_surface` probe. The manifest names it dtype-neutrally as `cast_scale` in `fused_op_admission`; the name→key mapping is `jammi-kernels`'s own static table. |
+| `cast_add` | **Admitted**, under `cast_add_bf16` / `cast_add_f16` | Same mechanism; both admit through `admit_cast_boundary` in `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs`, called from that op's BF16 and F16 backward arms. |
+| `rope_positions` | **Internal sub-kernel** of the flash-attention op | No `admit()` of its own: `crates/jammi-kernels/src/ops/flash_attention.rs` launches `crate::cuda::rope_positions::cuda_fwd` directly. It is proven by compiling in the lane's build *and* by its parent's admitted dispatch being observed (a delta on the flash cascade's key) — never by a counter of its own, which does not exist. |
+| `scaled_cast_add` | **Internal sub-kernel** of `low_rank_residual_linear` | Same mechanism: `ScaledCastAdd::new` is constructed bare in that op's epilogue, so the parent's observed dispatch is the proof. |
+| `axpy` | **Compiled only** | Real kernels and dispatch arms, no admission call site, and no admitted parent that launches it — it has zero call sites in the workspace. Proven ONLY by compiling in the lane's build; a claim that it *dispatched* has nothing to read. |
+
+The distinction is load-bearing when reading a capability report: an internal sub-kernel
+is neither "unreachable" nor "independently admitted" — it runs exactly when its parent
+does. A compiled-only op has no such parent, so nothing in a device run says it ran.
+Wiring a real `admit()` call site (or an admitted parent that launches it) is what moves
+an op between these rows, in the same unit as that code edit.
+
 ## 4. Benchmarking
 
 Two levels, always both. HF's own warning: their RMSNorm was **1.88x isolated but ~6% end-to-end**,

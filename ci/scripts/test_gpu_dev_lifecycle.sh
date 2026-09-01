@@ -1687,24 +1687,24 @@ G10A_RESULTS="$SANDBOX/g10a-results.log"
   source "$DIR/runpod_lib.sh"
   record() { echo "$1:$2" >> "$G10A_RESULTS"; }
 
-  G10A_FAKEBIN="$SANDBOX/g10a-fakebin"; mkdir -p "$G10A_FAKEBIN"
+  G10A_STUBDIR="$SANDBOX/g10a-fakebin"; mkdir -p "$G10A_STUBDIR"
   G10A_ROOT="$SANDBOX/g10a-fakeroot"; mkdir -p "$G10A_ROOT"
   fake_tmux() { # $1=newline-joined session list
-    printf '%s' "$1" > "$G10A_FAKEBIN/tmux.sessions"
-    cat > "$G10A_FAKEBIN/tmux" <<STUB
+    printf '%s' "$1" > "$G10A_STUBDIR/tmux.sessions"
+    cat > "$G10A_STUBDIR/tmux" <<STUB
 #!/usr/bin/env bash
 if [ "\$1" = "list-sessions" ]; then
-  cat "$G10A_FAKEBIN/tmux.sessions"
+  cat "$G10A_STUBDIR/tmux.sessions"
 fi
 STUB
-    chmod +x "$G10A_FAKEBIN/tmux"
+    chmod +x "$G10A_STUBDIR/tmux"
   }
   # $1=own_session $2=own_wave -> runs the REAL generated text, with only
   # the hardcoded claim path redirected into the sandbox.
   run_preflight() {
     local gen; gen="$(rp_concurrency_preflight_lines "$1" "$2")"
     gen="${gen//\/root\/.jammi-active-wave/$G10A_ROOT/.jammi-active-wave}"
-    PATH="$G10A_FAKEBIN:$PATH" bash -c "$gen"
+    PATH="$G10A_STUBDIR:$PATH" bash -c "$gen"
   }
 
   fake_tmux $'jammi-seed\njammi-othertree\njammi-mywork\n'

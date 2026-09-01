@@ -182,7 +182,7 @@ use candle_core::backend::BackendStorage;
 use candle_core::{
     CpuStorage, CustomOp1, DType, Error, Layout, MetalStorage, Result, Shape, Tensor,
 };
-use half::bf16;
+use half::{bf16, f16};
 
 use crate::philox::{philox4x32_10, philox_draw};
 
@@ -288,6 +288,10 @@ impl CustomOp1 for DropoutFused {
                 CpuStorage::BF16(dropout_bf16(self, &x[o1..o2])),
                 l1.shape().clone(),
             )),
+            CpuStorage::F16(x) => Ok((
+                CpuStorage::F16(dropout_f16(self, &x[o1..o2])),
+                l1.shape().clone(),
+            )),
             s => Err(Error::UnsupportedDTypeForOp(s.dtype(), self.name())),
         }
     }
@@ -354,6 +358,12 @@ impl CustomOp1 for DropoutFused {
             // it (that match runs unconditionally there, empty or not;
             // this arm's fast path has to check explicitly since it
             // bypasses that match entirely).
+            // NOTE: deliberately NOT widened to F16 alongside `cpu_fwd`
+            // above — this crate's D2 f16-oracle work is CUDA-facing only
+            // (F16 admission is not proposed for Metal at all; see
+            // `docs/maintainer/cuda-kernel-guide.md`'s per-op f16
+            // reference-regime table), so the Metal host fallback keeps
+            // refusing F16 exactly as before.
             match s1.dtype() {
                 DType::F32 | DType::BF16 => {}
                 dtype => return Err(Error::UnsupportedDTypeForOp(dtype, self.name())),
@@ -368,6 +378,8 @@ impl CustomOp1 for DropoutFused {
         // assuming the download already landed windowed to this tensor's
         // logical view.
         let downloaded = s1.to_cpu_storage()?;
+        // Deliberately NOT widened to F16 — see the `n == 0` fast path's
+        // identical note just above.
         let out_cpu = match &downloaded {
             CpuStorage::F32(x) => CpuStorage::F32(dropout_f32(self, &x[o1..o2])),
             CpuStorage::BF16(x) => CpuStorage::BF16(dropout_bf16(self, &x[o1..o2])),
@@ -419,6 +431,24 @@ fn dropout_bf16(params: &DropoutFused, x: &[bf16]) -> Vec<bf16> {
                 bf16::from_f32(v.to_f32() * params.scale)
             } else {
                 bf16::ZERO
+            }
+        })
+        .collect()
+}
+
+/// [`dropout_bf16`]'s exact twin, substituting `half::f16` — this op's
+/// CPU-only F16 oracle-reference arm (no CUDA/Metal F16 dispatch arm
+/// exists yet, see `docs/maintainer/cuda-kernel-guide.md`'s per-op f16
+/// reference-regime table). Byte-identical KEEP/DROP decision (the mask
+/// is dtype-independent), one rounding point on a KEPT element.
+fn dropout_f16(params: &DropoutFused, x: &[f16]) -> Vec<f16> {
+    x.iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            if params.keeps(i as u64) {
+                f16::from_f32(v.to_f32() * params.scale)
+            } else {
+                f16::ZERO
             }
         })
         .collect()
@@ -871,11 +901,19 @@ mod tests {
         let n = 256usize;
         let v: Vec<f32> = (0..n).map(|i| 1.0 + i as f32).collect();
         let vb: Vec<bf16> = v.iter().map(|&x| bf16::from_f32(x)).collect();
+        let vh: Vec<f16> = v.iter().map(|&x| f16::from_f32(x)).collect();
         let x_f32 = Tensor::from_slice(&v, (n,), &device).unwrap();
         let x_bf16 = Tensor::from_slice(&vb, (n,), &device).unwrap();
+        let x_f16 = Tensor::from_slice(&vh, (n,), &device).unwrap();
 
         let out_f32: Vec<f32> = dropout(5, 1, 1, 0.25, &x_f32).unwrap().to_vec1().unwrap();
         let out_bf16: Vec<f32> = dropout(5, 1, 1, 0.25, &x_bf16)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let out_f16: Vec<f32> = dropout(5, 1, 1, 0.25, &x_f16)
             .unwrap()
             .to_dtype(DType::F32)
             .unwrap()
@@ -886,7 +924,12 @@ mod tests {
             assert_eq!(
                 out_f32[i] == 0.0,
                 out_bf16[i] == 0.0,
-                "element {i}: KEEP/DROP must agree across dtypes"
+                "element {i}: KEEP/DROP must agree across dtypes (f32 vs bf16)"
+            );
+            assert_eq!(
+                out_f32[i] == 0.0,
+                out_f16[i] == 0.0,
+                "element {i}: KEEP/DROP must agree across dtypes (f32 vs f16)"
             );
         }
     }

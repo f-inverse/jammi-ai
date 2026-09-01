@@ -97,12 +97,23 @@
 //! (dtype/shape/contiguity/capability) is supposed to catch and fall back
 //! on, not something this op should try to generalize into and risk
 //! getting the row-grouping wrong for. `gamma` must be rank-1 with length
-//! equal to `x`'s last dimension. CPU supports F32 and BF16 (bias-free
-//! LayerNorm's real training dtype); no F64 leg — this op's domain is
-//! deliberately the same on CPU and CUDA (unlike `Axpy`, which is more
-//! generically typed), since the profiled workload (ModernBERT-large,
-//! bf16) never needs F64 here and keeping the domain device-uniform
-//! avoids a CPU-passes/CUDA-refuses split with no oracle covering it.
+//! equal to `x`'s last dimension. CPU supports F32, BF16 (bias-free
+//! LayerNorm's real training dtype), and F16; no F64 leg. F32/BF16 stay
+//! device-uniform with CUDA (unlike `Axpy`, which is more generically
+//! typed), since the profiled workload (ModernBERT-large, bf16) never
+//! needs F64 here and keeping the domain device-uniform avoids a
+//! CPU-passes/CUDA-refuses split with no oracle covering it. **F16 is a
+//! disclosed, TEMPORARY exception to that device-uniformity rule**: the
+//! CPU F16 arm (`ln_fwd_f16`/`ln_bwd_dx_f16`/`ln_bwd_dgamma_f16` below)
+//! exists to serve as the independent-reference arm the f16 oracle suites
+//! need (`docs/maintainer/cuda-kernel-guide.md`'s per-op f16
+//! reference-regime table names this op's regime as f32-internal,
+//! round-once, matching `jammi_encoders::layer_norm::LayerNorm::slow`'s
+//! F16 upcast at `jammi-encoders/src/layer_norm.rs:353-370`); no CUDA F16
+//! dispatch arm exists yet, and the admission predicate is not widened to
+//! F16 until one does (K2's no-Hold-without-dispatch rule), so this
+//! asymmetry is covered by an oracle (this op's own CPU tests below), not
+//! a silent gap.
 //! `hidden == 0` degenerates to an empty output (nothing to normalize) —
 //! this makes `rows = elem_count / hidden` safe without a separate empty
 //! fast-path, since `elem_count == 0` follows fromm `hidden == 0` (a
@@ -111,7 +122,7 @@
 
 use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, CustomOp2, CustomOp3, Error, Layout, Result, Shape, Tensor};
-use half::bf16;
+use half::{bf16, f16};
 
 use super::empty_like;
 
@@ -212,6 +223,10 @@ impl CustomOp2 for LayerNormFused {
             (CpuStorage::BF16(x), CpuStorage::BF16(g)) => {
                 let out = ln_fwd_bf16(&x[o1..o2], &g[g1..g2], rows, hidden, self.eps as f32);
                 Ok((CpuStorage::BF16(out), l1.shape().clone()))
+            }
+            (CpuStorage::F16(x), CpuStorage::F16(g)) => {
+                let out = ln_fwd_f16(&x[o1..o2], &g[g1..g2], rows, hidden, self.eps as f32);
+                Ok((CpuStorage::F16(out), l1.shape().clone()))
             }
             (s1, s2) if s1.dtype() != s2.dtype() => Err(Error::DTypeMismatchBinaryOp {
                 lhs: s1.dtype(),
@@ -337,6 +352,17 @@ impl CustomOp3 for LayerNormBwdDx {
                 );
                 Ok((CpuStorage::BF16(dx), l1.shape().clone()))
             }
+            (CpuStorage::F16(x), CpuStorage::F16(g), CpuStorage::F16(dy)) => {
+                let dx = ln_bwd_dx_f16(
+                    &x[o1..o2],
+                    &g[g1..g2],
+                    &dy[d1..d2],
+                    rows,
+                    hidden,
+                    self.eps as f32,
+                );
+                Ok((CpuStorage::F16(dx), l1.shape().clone()))
+            }
             (s1, s2, _) if s1.dtype() != s2.dtype() => Err(Error::DTypeMismatchBinaryOp {
                 lhs: s1.dtype(),
                 rhs: s2.dtype(),
@@ -412,6 +438,9 @@ impl CustomOp2 for LayerNormBwdDgamma {
                 (CpuStorage::BF16(_), CpuStorage::BF16(_)) => {
                     Ok((CpuStorage::BF16(Vec::new()), Shape::from(0usize)))
                 }
+                (CpuStorage::F16(_), CpuStorage::F16(_)) => {
+                    Ok((CpuStorage::F16(Vec::new()), Shape::from(0usize)))
+                }
                 (s1, s2) if s1.dtype() != s2.dtype() => Err(Error::DTypeMismatchBinaryOp {
                     lhs: s1.dtype(),
                     rhs: s2.dtype(),
@@ -435,6 +464,10 @@ impl CustomOp2 for LayerNormBwdDgamma {
             (CpuStorage::BF16(x), CpuStorage::BF16(dy)) => {
                 let dg = ln_bwd_dgamma_bf16(&x[o1..o2], &dy[d1..d2], rows, hidden, self.eps as f32);
                 Ok((CpuStorage::BF16(dg), Shape::from(hidden)))
+            }
+            (CpuStorage::F16(x), CpuStorage::F16(dy)) => {
+                let dg = ln_bwd_dgamma_f16(&x[o1..o2], &dy[d1..d2], rows, hidden, self.eps as f32);
+                Ok((CpuStorage::F16(dg), Shape::from(hidden)))
             }
             (s1, s2) if s1.dtype() != s2.dtype() => Err(Error::DTypeMismatchBinaryOp {
                 lhs: s1.dtype(),
@@ -544,6 +577,45 @@ fn ln_fwd_bf16(x: &[bf16], gamma: &[bf16], rows: usize, hidden: usize, eps: f32)
     out
 }
 
+/// F16 row mean/variance, accumulated in f32 — [`mean_var_bf16`]'s exact
+/// twin, substituting `half::f16`. This op's f32-internal regime (see the
+/// module doc and `docs/maintainer/cuda-kernel-guide.md`'s per-op table)
+/// matches `jammi_encoders::layer_norm::LayerNorm::slow`'s F16 upcast.
+fn mean_var_f16(row: &[f16], hidden: usize) -> (f32, f32) {
+    let mut sum = 0f32;
+    for v in row {
+        sum += v.to_f32();
+    }
+    let mean = sum / hidden as f32;
+    let mut sumsq = 0f32;
+    for v in row {
+        let d = v.to_f32() - mean;
+        sumsq += d * d;
+    }
+    (mean, sumsq / hidden as f32)
+}
+
+/// F32-accumulate, round-to-f16 once — [`ln_fwd_row_bf16`]'s exact twin.
+fn ln_fwd_row_f16(x: &[f16], gamma: &[f16], eps: f32, out: &mut [f16]) {
+    let hidden = x.len();
+    let (mean, var) = mean_var_f16(x, hidden);
+    let invvar = 1.0 / (var + eps).sqrt();
+    for i in 0..hidden {
+        let xhat = (x[i].to_f32() - mean) * invvar;
+        out[i] = f16::from_f32(xhat * gamma[i].to_f32());
+    }
+}
+
+fn ln_fwd_f16(x: &[f16], gamma: &[f16], rows: usize, hidden: usize, eps: f32) -> Vec<f16> {
+    let mut out = vec![f16::ZERO; rows * hidden];
+    for r in 0..rows {
+        let lo = r * hidden;
+        let hi = lo + hidden;
+        ln_fwd_row_f16(&x[lo..hi], gamma, eps, &mut out[lo..hi]);
+    }
+    out
+}
+
 /// The Apex/ATen canonical `dx`, computed row-by-row in f32:
 /// `xhat = (x-mean)*invvar`; `t = dy*gamma`;
 /// `dx = (t - mean_row(t) - xhat * mean_row(t*xhat)) * invvar`.
@@ -627,6 +699,47 @@ fn ln_bwd_dx_bf16(
     out
 }
 
+/// [`ln_bwd_dx_row_bf16`]'s exact twin, substituting `half::f16`.
+fn ln_bwd_dx_row_f16(x: &[f16], gamma: &[f16], dy: &[f16], eps: f32, dx: &mut [f16]) {
+    let hidden = x.len();
+    let (mean, var) = mean_var_f16(x, hidden);
+    let invvar = 1.0 / (var + eps).sqrt();
+
+    let mut sum_t = 0f32;
+    let mut sum_t_xhat = 0f32;
+    for i in 0..hidden {
+        let xhat = (x[i].to_f32() - mean) * invvar;
+        let t = dy[i].to_f32() * gamma[i].to_f32();
+        sum_t += t;
+        sum_t_xhat += t * xhat;
+    }
+    let mean_t = sum_t / hidden as f32;
+    let mean_t_xhat = sum_t_xhat / hidden as f32;
+
+    for i in 0..hidden {
+        let xhat = (x[i].to_f32() - mean) * invvar;
+        let t = dy[i].to_f32() * gamma[i].to_f32();
+        dx[i] = f16::from_f32((t - mean_t - xhat * mean_t_xhat) * invvar);
+    }
+}
+
+fn ln_bwd_dx_f16(
+    x: &[f16],
+    gamma: &[f16],
+    dy: &[f16],
+    rows: usize,
+    hidden: usize,
+    eps: f32,
+) -> Vec<f16> {
+    let mut out = vec![f16::ZERO; rows * hidden];
+    for r in 0..rows {
+        let lo = r * hidden;
+        let hi = lo + hidden;
+        ln_bwd_dx_row_f16(&x[lo..hi], gamma, &dy[lo..hi], eps, &mut out[lo..hi]);
+    }
+    out
+}
+
 /// `dgamma_i = sum_rows(dy_i * xhat_i)` — fixed fold order: rows walked
 /// `0..rows` in ascending order, accumulating into `dgamma[i]` each time
 /// (family J: the same input always folds in the same order).
@@ -664,6 +777,24 @@ fn ln_bwd_dgamma_bf16(x: &[bf16], dy: &[bf16], rows: usize, hidden: usize, eps: 
     // One rounding to bf16 at the very end, matching the crate's
     // f32-accumulate-round-once convention.
     acc.into_iter().map(bf16::from_f32).collect()
+}
+
+/// [`ln_bwd_dgamma_bf16`]'s exact twin, substituting `half::f16`.
+fn ln_bwd_dgamma_f16(x: &[f16], dy: &[f16], rows: usize, hidden: usize, eps: f32) -> Vec<f16> {
+    let mut acc = vec![0f32; hidden];
+    for r in 0..rows {
+        let lo = r * hidden;
+        let hi = lo + hidden;
+        let xr = &x[lo..hi];
+        let dyr = &dy[lo..hi];
+        let (mean, var) = mean_var_f16(xr, hidden);
+        let invvar = 1.0 / (var + eps).sqrt();
+        for i in 0..hidden {
+            let xhat = (xr[i].to_f32() - mean) * invvar;
+            acc[i] += dyr[i].to_f32() * xhat;
+        }
+    }
+    acc.into_iter().map(f16::from_f32).collect()
 }
 
 #[cfg(test)]
@@ -808,6 +939,39 @@ mod tests {
         }
     }
 
+    /// F16 forward's exact twin of `bf16_forward_matches_f32_accumulation_
+    /// rounded_once` above — the independent, higher-precision (f64)
+    /// reference this op's own module doc and the per-op f16
+    /// reference-regime table (`docs/maintainer/cuda-kernel-guide.md`)
+    /// pin: mean/var over the f16-rounded inputs, one final rounding to
+    /// f16.
+    #[test]
+    fn f16_forward_matches_f32_accumulation_rounded_once() {
+        use half::f16;
+        let device = Device::Cpu;
+        let xv = [1.0f32, 2.0, 3.0, 4.0];
+        let xh: Vec<f16> = xv.iter().map(|&v| f16::from_f32(v)).collect();
+        let gh = [f16::from_f32(1.0); 4];
+        let x = Tensor::from_slice(&xh, (1, 4), &device).unwrap();
+        let gamma = Tensor::from_slice(&gh, (4,), &device).unwrap();
+        let out: Vec<f16> = ln(1e-5, false, &x, &gamma)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        let xf: Vec<f64> = xh.iter().map(|v| v.to_f32() as f64).collect();
+        let mean: f64 = xf.iter().sum::<f64>() / xf.len() as f64;
+        let var: f64 = xf.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / xf.len() as f64;
+        let invvar = 1.0 / (var + 1e-5).sqrt();
+        let expected: Vec<f32> = xf.iter().map(|&v| ((v - mean) * invvar) as f32).collect();
+
+        for (o, e) in out.iter().zip(expected.iter()) {
+            assert!((o.to_f32() - e).abs() < 1e-2, "{o} vs {e}");
+        }
+    }
+
     // -----------------------------------------------------------------
     // `LayerNormFused::cpu_fwd`'s dtype-mismatch guard (its `(s1, s2) if
     // s1.dtype() != s2.dtype()` match arm), the SAME-unsupported-dtype
@@ -816,23 +980,24 @@ mod tests {
     // x_and_gamma_is_refused` above; that test alone does not kill the
     // guard-forced-`true` mutant, because BOTH the real code and the
     // `true` mutant return `DTypeMismatchBinaryOp` on a real mismatch.
-    // Only a SAME (equal), UNSUPPORTED dtype on both operands (F16 here
-    // — not F32, not BF16) tells them apart: real code falls through to
-    // `UnsupportedDTypeForOp`; the `true` mutant reports
+    // Only a SAME (equal), UNSUPPORTED dtype on both operands (F64 here
+    // — not F32, not BF16, not F16: this crate's D2 f16-oracle work added
+    // a real F16 CPU arm, so F16 stopped being a same-unsupported-dtype
+    // witness and F64 replaces it, verified to still fall through to the
+    // same `_ => UnsupportedDTypeForOp` arm) tells them apart: real code
+    // falls through to `UnsupportedDTypeForOp`; the `true` mutant reports
     // `DTypeMismatchBinaryOp` instead even though the two dtypes agree.
     // -----------------------------------------------------------------
     #[test]
     fn same_unsupported_dtype_is_unsupported_not_a_false_mismatch() {
-        use half::f16;
         let device = Device::Cpu;
-        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0].map(f16::from_f32), (1, 4), &device)
-            .unwrap();
-        let gamma = Tensor::from_slice(&[1.0f32; 4].map(f16::from_f32), (4,), &device).unwrap();
+        let x = Tensor::from_slice(&[1.0f64, 2.0, 3.0, 4.0], (1, 4), &device).unwrap();
+        let gamma = Tensor::from_slice(&[1.0f64; 4], (4,), &device).unwrap();
         let err = ln(1e-5, false, &x, &gamma)
-            .expect_err("F16/F16 is a real dtype (equal on both sides) this op does not implement");
+            .expect_err("F64/F64 is a real dtype (equal on both sides) this op does not implement");
         match err {
-            Error::UnsupportedDTypeForOp(dtype, _) => assert_eq!(dtype, DType::F16),
-            other => panic!("expected UnsupportedDTypeForOp(F16, _), got {other:?}"),
+            Error::UnsupportedDTypeForOp(dtype, _) => assert_eq!(dtype, DType::F64),
+            other => panic!("expected UnsupportedDTypeForOp(F64, _), got {other:?}"),
         }
     }
 
@@ -872,22 +1037,22 @@ mod tests {
         }
     }
 
-    /// Same-unsupported-dtype cell (x == gamma == dy == F16): kills the
-    /// guard-forced-`true` mutant, which would otherwise report
-    /// `DTypeMismatchBinaryOp` for two operands that actually agree.
+    /// Same-unsupported-dtype cell (x == gamma == dy == F64, per the same
+    /// F16-now-real-arm retarget as `same_unsupported_dtype_is_unsupported_
+    /// not_a_false_mismatch` above): kills the guard-forced-`true` mutant,
+    /// which would otherwise report `DTypeMismatchBinaryOp` for two
+    /// operands that actually agree.
     #[test]
     fn bwd_dx_same_unsupported_dtype_is_unsupported_not_a_false_mismatch() {
-        use half::f16;
         let device = Device::Cpu;
-        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0].map(f16::from_f32), (1, 4), &device)
-            .unwrap();
-        let gamma = Tensor::from_slice(&[1.0f32; 4].map(f16::from_f32), (4,), &device).unwrap();
-        let dy = Tensor::from_slice(&[1.0f32; 4].map(f16::from_f32), (1, 4), &device).unwrap();
+        let x = Tensor::from_slice(&[1.0f64, 2.0, 3.0, 4.0], (1, 4), &device).unwrap();
+        let gamma = Tensor::from_slice(&[1.0f64; 4], (4,), &device).unwrap();
+        let dy = Tensor::from_slice(&[1.0f64; 4], (1, 4), &device).unwrap();
         let err = ln_bwd_dx(1e-5, &x, &gamma, &dy)
-            .expect_err("F16/F16/F16 is a real, equal-dtype triple this op does not implement");
+            .expect_err("F64/F64/F64 is a real, equal-dtype triple this op does not implement");
         match err {
-            Error::UnsupportedDTypeForOp(dtype, _) => assert_eq!(dtype, DType::F16),
-            other => panic!("expected UnsupportedDTypeForOp(F16, _), got {other:?}"),
+            Error::UnsupportedDTypeForOp(dtype, _) => assert_eq!(dtype, DType::F64),
+            other => panic!("expected UnsupportedDTypeForOp(F64, _), got {other:?}"),
         }
     }
 
@@ -921,15 +1086,14 @@ mod tests {
 
     #[test]
     fn bwd_dgamma_hidden_zero_same_unsupported_dtype_is_unsupported_not_a_false_mismatch() {
-        use half::f16;
         let device = Device::Cpu;
-        let x = Tensor::from_slice(&[] as &[f16], (3, 0), &device).unwrap();
-        let dy = Tensor::from_slice(&[] as &[f16], (3, 0), &device).unwrap();
+        let x = Tensor::from_slice(&[] as &[f64], (3, 0), &device).unwrap();
+        let dy = Tensor::from_slice(&[] as &[f64], (3, 0), &device).unwrap();
         let err = ln_bwd_dgamma(1e-5, &x, &dy)
-            .expect_err("F16/F16 (equal, hidden == 0) is not implemented by this op");
+            .expect_err("F64/F64 (equal, hidden == 0) is not implemented by this op");
         match err {
-            Error::UnsupportedDTypeForOp(dtype, _) => assert_eq!(dtype, DType::F16),
-            other => panic!("expected UnsupportedDTypeForOp(F16, _), got {other:?}"),
+            Error::UnsupportedDTypeForOp(dtype, _) => assert_eq!(dtype, DType::F64),
+            other => panic!("expected UnsupportedDTypeForOp(F64, _), got {other:?}"),
         }
     }
 
@@ -950,16 +1114,14 @@ mod tests {
 
     #[test]
     fn bwd_dgamma_hidden_nonzero_same_unsupported_dtype_is_unsupported_not_a_false_mismatch() {
-        use half::f16;
         let device = Device::Cpu;
-        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0].map(f16::from_f32), (1, 4), &device)
-            .unwrap();
-        let dy = Tensor::from_slice(&[1.0f32; 4].map(f16::from_f32), (1, 4), &device).unwrap();
+        let x = Tensor::from_slice(&[1.0f64, 2.0, 3.0, 4.0], (1, 4), &device).unwrap();
+        let dy = Tensor::from_slice(&[1.0f64; 4], (1, 4), &device).unwrap();
         let err = ln_bwd_dgamma(1e-5, &x, &dy)
-            .expect_err("F16/F16 (equal, hidden > 0) is not implemented by this op");
+            .expect_err("F64/F64 (equal, hidden > 0) is not implemented by this op");
         match err {
-            Error::UnsupportedDTypeForOp(dtype, _) => assert_eq!(dtype, DType::F16),
-            other => panic!("expected UnsupportedDTypeForOp(F16, _), got {other:?}"),
+            Error::UnsupportedDTypeForOp(dtype, _) => assert_eq!(dtype, DType::F64),
+            other => panic!("expected UnsupportedDTypeForOp(F64, _), got {other:?}"),
         }
     }
 

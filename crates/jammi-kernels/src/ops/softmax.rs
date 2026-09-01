@@ -603,7 +603,7 @@
 
 use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, CustomOp2, Error, Layout, Result, Shape, Tensor};
-use half::bf16;
+use half::{bf16, f16};
 
 use super::empty_like;
 
@@ -940,6 +940,19 @@ impl CustomOp2 for SoftmaxLastDimFused {
                 );
                 Ok((CpuStorage::BF16(out), l1.shape().clone()))
             }
+            (CpuStorage::F16(sc), CpuStorage::F16(mk)) => {
+                let out = softmax_fwd_f16(
+                    &sc[o1..o2],
+                    &mk[m1..m2],
+                    rows,
+                    last,
+                    s_lead,
+                    m_lead,
+                    self.fully_masked,
+                    self.scale,
+                );
+                Ok((CpuStorage::F16(out), l1.shape().clone()))
+            }
             (s1, s2) if s1.dtype() != s2.dtype() => Err(Error::DTypeMismatchBinaryOp {
                 lhs: s1.dtype(),
                 rhs: s2.dtype(),
@@ -1062,6 +1075,10 @@ impl CustomOp2 for SoftmaxBwdDScores {
             (CpuStorage::BF16(y), CpuStorage::BF16(dy)) => {
                 let out = dscores_bf16(&y[o1..o2], &dy[d1..d2], rows, last);
                 Ok((CpuStorage::BF16(out), l1.shape().clone()))
+            }
+            (CpuStorage::F16(y), CpuStorage::F16(dy)) => {
+                let out = dscores_f16(&y[o1..o2], &dy[d1..d2], rows, last);
+                Ok((CpuStorage::F16(out), l1.shape().clone()))
             }
             (s1, s2) if s1.dtype() != s2.dtype() => Err(Error::DTypeMismatchBinaryOp {
                 lhs: s1.dtype(),
@@ -1283,6 +1300,78 @@ fn softmax_fwd_bf16(
     out
 }
 
+/// F16's exact twin of [`softmax_row_bf16`] — the dtype-native regime
+/// (see `docs/maintainer/cuda-kernel-guide.md`'s per-op f16
+/// reference-regime table): `scores[i] * scale_f16` and `scaled[i] +
+/// mask[i]` each round to F16 IMMEDIATELY, matching `half::f16`'s own
+/// `Mul`/`Add` impls (round-trip through F32, round once per op) and
+/// `candle_nn::ops::softmax`'s native F16 `broadcast_add`. Everything
+/// after the mask add (max/exp/sum/normalize) still accumulates in F32.
+fn softmax_row_f16(
+    scores: &[f16],
+    mask: &[f16],
+    out: &mut [f16],
+    policy: FullyMaskedPolicy,
+    scale_f16: f16,
+) {
+    let last = scores.len();
+    if policy == FullyMaskedPolicy::Zeros {
+        let mask_row_max = mask
+            .iter()
+            .map(|m| m.to_f32())
+            .fold(f32::NEG_INFINITY, f32::max);
+        if mask_row_max < 0.0 {
+            out.fill(f16::ZERO);
+            return;
+        }
+    }
+    let mut v = vec![0f32; last];
+    let mut max = f32::NEG_INFINITY;
+    for i in 0..last {
+        let scaled = f16::from_f32(scores[i].to_f32() * scale_f16.to_f32());
+        let vi = f16::from_f32(scaled.to_f32() + mask[i].to_f32()).to_f32();
+        v[i] = vi;
+        if vi > max {
+            max = vi;
+        }
+    }
+    let mut exps = vec![0f32; last];
+    let mut sum = 0f32;
+    for i in 0..last {
+        let e = (v[i] - max).exp();
+        exps[i] = e;
+        sum += e;
+    }
+    for i in 0..last {
+        out[i] = f16::from_f32(exps[i] / sum);
+    }
+}
+
+// See `softmax_fwd_f32`'s identical note.
+#[allow(clippy::too_many_arguments)]
+fn softmax_fwd_f16(
+    scores: &[f16],
+    mask: &[f16],
+    rows: usize,
+    last: usize,
+    s_lead: &[usize],
+    m_lead: &[usize],
+    policy: FullyMaskedPolicy,
+    scale: f32,
+) -> Vec<f16> {
+    // Rounded ONCE per call — [`softmax_fwd_bf16`]'s exact twin.
+    let scale_f16 = f16::from_f32(scale);
+    let mut out = vec![f16::ZERO; rows * last];
+    for r in 0..rows {
+        let mrow = mask_row_offset(r, s_lead, m_lead);
+        let sr = &scores[r * last..(r + 1) * last];
+        let mr = &mask[mrow * last..(mrow + 1) * last];
+        let outr = &mut out[r * last..(r + 1) * last];
+        softmax_row_f16(sr, mr, outr, policy, scale_f16);
+    }
+    out
+}
+
 /// `dscores_row = (dy - dot(dy, y)) * y` — the standard softmax backward
 /// identity, needing only `y` and `dy`. Fixed fold order (family J):
 /// `dot` accumulates over the row in ascending index order.
@@ -1324,6 +1413,28 @@ fn dscores_bf16(y: &[bf16], dy: &[bf16], rows: usize, last: usize) -> Vec<bf16> 
         let dyr = &dy[r * last..(r + 1) * last];
         let outr = &mut out[r * last..(r + 1) * last];
         dscores_row_bf16(yr, dyr, outr);
+    }
+    out
+}
+
+/// [`dscores_row_bf16`]'s exact twin, substituting `half::f16`.
+fn dscores_row_f16(y: &[f16], dy: &[f16], out: &mut [f16]) {
+    let mut dot = 0f32;
+    for i in 0..y.len() {
+        dot += dy[i].to_f32() * y[i].to_f32();
+    }
+    for i in 0..y.len() {
+        out[i] = f16::from_f32((dy[i].to_f32() - dot) * y[i].to_f32());
+    }
+}
+
+fn dscores_f16(y: &[f16], dy: &[f16], rows: usize, last: usize) -> Vec<f16> {
+    let mut out = vec![f16::ZERO; rows * last];
+    for r in 0..rows {
+        let yr = &y[r * last..(r + 1) * last];
+        let dyr = &dy[r * last..(r + 1) * last];
+        let outr = &mut out[r * last..(r + 1) * last];
+        dscores_row_f16(yr, dyr, outr);
     }
     out
 }
@@ -1806,6 +1917,37 @@ mod tests {
             .unwrap();
 
         let xf: Vec<f64> = sb.iter().map(|v| v.to_f32() as f64).collect();
+        let max = xf.iter().cloned().fold(f64::MIN, f64::max);
+        let exps: Vec<f64> = xf.iter().map(|&v| (v - max).exp()).collect();
+        let sum: f64 = exps.iter().sum();
+        let expected: Vec<f32> = exps.iter().map(|&e| (e / sum) as f32).collect();
+
+        for (o, e) in out.iter().zip(expected.iter()) {
+            assert!((o.to_f32() - e).abs() < 1e-2, "{o} vs {e}");
+        }
+    }
+
+    /// F16's exact twin of `bf16_forward_matches_f32_accumulation_
+    /// rounded_once` above — the dtype-native regime the per-op f16
+    /// reference-regime table (`docs/maintainer/cuda-kernel-guide.md`)
+    /// records for this op.
+    #[test]
+    fn f16_forward_matches_f32_accumulation_rounded_once() {
+        use half::f16;
+        let device = Device::Cpu;
+        let sv = [1.0f32, 2.0, -3.0, 0.5];
+        let sh: Vec<f16> = sv.iter().map(|&v| f16::from_f32(v)).collect();
+        let mh = [f16::ZERO; 4];
+        let scores = Tensor::from_slice(&sh, (1, 4), &device).unwrap();
+        let mask = Tensor::from_slice(&mh, (1, 4), &device).unwrap();
+        let out: Vec<f16> = fused(&scores, &mask)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        let xf: Vec<f64> = sh.iter().map(|v| v.to_f32() as f64).collect();
         let max = xf.iter().cloned().fold(f64::MIN, f64::max);
         let exps: Vec<f64> = xf.iter().map(|&v| (v - max).exp()).collect();
         let sum: f64 = exps.iter().sum();
@@ -2694,21 +2836,22 @@ mod tests {
     // test above; that test alone does not kill the guard-forced-`true`
     // mutant (both the real code and the `true` mutant return
     // `DTypeMismatchBinaryOp` on a genuine mismatch) — only a SAME,
-    // unsupported dtype on both operands (F16 here) tells them apart.
+    // unsupported dtype on both operands (F64 here — not F32, not BF16,
+    // not F16: this crate's D2 f16-oracle work added a real F16 CPU arm,
+    // so F16 stopped being a same-unsupported-dtype witness and F64
+    // replaces it, verified to still fall through to the same `_ =>
+    // UnsupportedDTypeForOp` arm) tells them apart.
     // -------------------------------------------------------------------
     #[test]
     fn same_unsupported_dtype_is_unsupported_not_a_false_mismatch() {
-        use half::f16;
         let device = Device::Cpu;
-        let scores =
-            Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0].map(f16::from_f32), (1, 4), &device)
-                .unwrap();
-        let mask = Tensor::from_slice(&[0.0f32; 4].map(f16::from_f32), (1, 4), &device).unwrap();
+        let scores = Tensor::from_slice(&[1.0f64, 2.0, 3.0, 4.0], (1, 4), &device).unwrap();
+        let mask = Tensor::from_slice(&[0.0f64; 4], (1, 4), &device).unwrap();
         let err = fused(&scores, &mask)
-            .expect_err("F16/F16 is a real, equal-dtype pair this op does not implement");
+            .expect_err("F64/F64 is a real, equal-dtype pair this op does not implement");
         match err {
-            Error::UnsupportedDTypeForOp(dtype, _) => assert_eq!(dtype, DType::F16),
-            other => panic!("expected UnsupportedDTypeForOp(F16, _), got {other:?}"),
+            Error::UnsupportedDTypeForOp(dtype, _) => assert_eq!(dtype, DType::F64),
+            other => panic!("expected UnsupportedDTypeForOp(F64, _), got {other:?}"),
         }
     }
 
@@ -2741,15 +2884,14 @@ mod tests {
 
     #[test]
     fn bwd_dscores_same_unsupported_dtype_is_unsupported_not_a_false_mismatch() {
-        use half::f16;
         let device = Device::Cpu;
-        let y = Tensor::from_slice(&[0.25f32; 4].map(f16::from_f32), (1, 4), &device).unwrap();
-        let dy = Tensor::from_slice(&[1.0f32; 4].map(f16::from_f32), (1, 4), &device).unwrap();
+        let y = Tensor::from_slice(&[0.25f64; 4], (1, 4), &device).unwrap();
+        let dy = Tensor::from_slice(&[1.0f64; 4], (1, 4), &device).unwrap();
         let err = bwd_dscores(&y, &dy)
-            .expect_err("F16/F16 is a real, equal-dtype pair this op does not implement");
+            .expect_err("F64/F64 is a real, equal-dtype pair this op does not implement");
         match err {
-            Error::UnsupportedDTypeForOp(dtype, _) => assert_eq!(dtype, DType::F16),
-            other => panic!("expected UnsupportedDTypeForOp(F16, _), got {other:?}"),
+            Error::UnsupportedDTypeForOp(dtype, _) => assert_eq!(dtype, DType::F64),
+            other => panic!("expected UnsupportedDTypeForOp(F64, _), got {other:?}"),
         }
     }
 

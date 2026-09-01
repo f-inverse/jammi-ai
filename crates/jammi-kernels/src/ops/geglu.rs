@@ -244,7 +244,11 @@
 //! reason: a raw-pointer kernel has no flat linear index for a strided
 //! view — this op's real call site is always contiguous, being a matmul's
 //! direct output). CPU supports F32 and BF16 (this crate's real training
-//! dtypes). The last dimension must be EVEN (it packs two equal halves) —
+//! dtypes), plus F16 as a disclosed, temporary CPU-only oracle-reference
+//! arm (`geglu_fwd_f16`/`geglu_bwd_f16` below — no CUDA F16 dispatch arm
+//! exists yet, so admission is not widened to F16 until one does; see
+//! `docs/maintainer/cuda-kernel-guide.md`'s per-op f16 reference-regime
+//! table). The last dimension must be EVEN (it packs two equal halves) —
 //! an ODD last dimension is a structural domain violation (there is no way
 //! to split it into equal `gate`/`up` halves), refused with a typed error,
 //! not silently truncated or padded. A last dimension of exactly `0`
@@ -264,7 +268,7 @@
 
 use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, CustomOp1, CustomOp2, Error, Layout, Result, Shape, Tensor};
-use half::bf16;
+use half::{bf16, f16};
 
 /// `1/sqrt(2)` — ATen's `kAlpha` (`ActivationGeluKernel.cu`'s erf-mode
 /// `gelu_backward`), reused for both the forward CDF and the backward
@@ -410,6 +414,7 @@ impl CustomOp1 for GegluFused {
             return match s1 {
                 CpuStorage::F32(_) => Ok((CpuStorage::F32(Vec::new()), out_shape)),
                 CpuStorage::BF16(_) => Ok((CpuStorage::BF16(Vec::new()), out_shape)),
+                CpuStorage::F16(_) => Ok((CpuStorage::F16(Vec::new()), out_shape)),
                 s => Err(Error::UnsupportedDTypeForOp(s.dtype(), self.name())),
             };
         }
@@ -424,6 +429,10 @@ impl CustomOp1 for GegluFused {
             CpuStorage::BF16(x) => {
                 let out = geglu_fwd_bf16(&x[o1..o2], rows, intermediate);
                 Ok((CpuStorage::BF16(out), out_shape))
+            }
+            CpuStorage::F16(x) => {
+                let out = geglu_fwd_f16(&x[o1..o2], rows, intermediate);
+                Ok((CpuStorage::F16(out), out_shape))
             }
             s => Err(Error::UnsupportedDTypeForOp(s.dtype(), self.name())),
         }
@@ -500,6 +509,7 @@ impl CustomOp2 for GegluBwdDWiOut {
             return match s1 {
                 CpuStorage::F32(_) => Ok((CpuStorage::F32(Vec::new()), l1.shape().clone())),
                 CpuStorage::BF16(_) => Ok((CpuStorage::BF16(Vec::new()), l1.shape().clone())),
+                CpuStorage::F16(_) => Ok((CpuStorage::F16(Vec::new()), l1.shape().clone())),
                 s => Err(Error::UnsupportedDTypeForOp(s.dtype(), self.name())),
             };
         }
@@ -517,6 +527,10 @@ impl CustomOp2 for GegluBwdDWiOut {
             (CpuStorage::BF16(x), CpuStorage::BF16(dy)) => {
                 let out = geglu_bwd_bf16(&x[o1..o2], &dy[d1..d2], rows, intermediate);
                 Ok((CpuStorage::BF16(out), l1.shape().clone()))
+            }
+            (CpuStorage::F16(x), CpuStorage::F16(dy)) => {
+                let out = geglu_bwd_f16(&x[o1..o2], &dy[d1..d2], rows, intermediate);
+                Ok((CpuStorage::F16(out), l1.shape().clone()))
             }
             (s1, _) => Err(Error::UnsupportedDTypeForOp(s1.dtype(), self.name())),
         }
@@ -590,6 +604,30 @@ fn geglu_fwd_bf16(wi_out: &[bf16], rows: usize, intermediate: usize) -> Vec<bf16
     out
 }
 
+/// [`geglu_fwd_row_bf16`]'s exact twin, substituting `half::f16` — the
+/// same two-rounding-point regime (candle's own F16 `GeluErf::f16` arm
+/// ALSO computes in f64, mirroring its `bf16` arm exactly — see
+/// `candle-core`'s `op.rs`), recorded in the per-op f16 reference-regime
+/// table (`docs/maintainer/cuda-kernel-guide.md`).
+fn geglu_fwd_row_f16(row: &[f16], intermediate: usize, out: &mut [f16]) {
+    for i in 0..intermediate {
+        let gate = row[i].to_f32();
+        let up = row[intermediate + i].to_f32();
+        let act_f16 = f16::from_f32(gelu_erf_f32(gate)); // ROUND 1
+        out[i] = f16::from_f32(act_f16.to_f32() * up); // ROUND 2
+    }
+}
+
+fn geglu_fwd_f16(wi_out: &[f16], rows: usize, intermediate: usize) -> Vec<f16> {
+    let mut out = vec![f16::ZERO; rows * intermediate];
+    for r in 0..rows {
+        let row = &wi_out[r * 2 * intermediate..(r + 1) * 2 * intermediate];
+        let outr = &mut out[r * intermediate..(r + 1) * intermediate];
+        geglu_fwd_row_f16(row, intermediate, outr);
+    }
+    out
+}
+
 /// `d_gate = dy*up*gelu_erf'(gate)`, `d_up = dy*gelu_erf(gate)` — see the
 /// module doc's "backward derivation" section.
 fn geglu_bwd_row_f32(row: &[f32], dy: &[f32], intermediate: usize, dwi: &mut [f32]) {
@@ -636,6 +674,29 @@ fn geglu_bwd_bf16(wi_out: &[bf16], dy: &[bf16], rows: usize, intermediate: usize
         let dyr = &dy[r * intermediate..(r + 1) * intermediate];
         let dwr = &mut out[r * 2 * intermediate..(r + 1) * 2 * intermediate];
         geglu_bwd_row_bf16(row, dyr, intermediate, dwr);
+    }
+    out
+}
+
+/// [`geglu_bwd_row_bf16`]'s exact twin, substituting `half::f16`.
+fn geglu_bwd_row_f16(row: &[f16], dy: &[f16], intermediate: usize, dwi: &mut [f16]) {
+    for i in 0..intermediate {
+        let gate = row[i].to_f32();
+        let up = row[intermediate + i].to_f32();
+        let dyi = dy[i].to_f32();
+        let (gelu_val, gelu_deriv) = gelu_erf_and_grad_f32(gate);
+        dwi[i] = f16::from_f32(dyi * up * gelu_deriv);
+        dwi[intermediate + i] = f16::from_f32(dyi * gelu_val);
+    }
+}
+
+fn geglu_bwd_f16(wi_out: &[f16], dy: &[f16], rows: usize, intermediate: usize) -> Vec<f16> {
+    let mut out = vec![f16::ZERO; rows * 2 * intermediate];
+    for r in 0..rows {
+        let row = &wi_out[r * 2 * intermediate..(r + 1) * 2 * intermediate];
+        let dyr = &dy[r * intermediate..(r + 1) * intermediate];
+        let dwr = &mut out[r * 2 * intermediate..(r + 1) * 2 * intermediate];
+        geglu_bwd_row_f16(row, dyr, intermediate, dwr);
     }
     out
 }
@@ -803,6 +864,33 @@ mod tests {
         let cdf = 0.5 * (1.0 + libm::erf(gate * std::f64::consts::FRAC_1_SQRT_2));
         let act = bf16::from_f64(gate * cdf);
         let expected = bf16::from_f64(act.to_f64() * up);
+        assert!(
+            (out[0].to_f32() - expected.to_f32()).abs() < 1e-2,
+            "{:?} vs {:?}",
+            out[0],
+            expected
+        );
+    }
+
+    /// F16's exact twin of `bf16_forward_matches_f32_reference_within_a_
+    /// small_tolerance` above.
+    #[test]
+    fn f16_forward_matches_f32_reference_within_a_small_tolerance() {
+        let device = Device::Cpu;
+        let v: [f32; 4] = [1.5, -2.0, 0.25, 3.0];
+        let vh: Vec<f16> = v.iter().map(|&x| f16::from_f32(x)).collect();
+        let wi = Tensor::from_slice(&vh, (1, 4), &device).unwrap();
+        let out: Vec<f16> = fused(GeluVariant::Erf, &wi)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let gate = vh[0].to_f64();
+        let up = vh[2].to_f64();
+        let cdf = 0.5 * (1.0 + libm::erf(gate * std::f64::consts::FRAC_1_SQRT_2));
+        let act = f16::from_f64(gate * cdf);
+        let expected = f16::from_f64(act.to_f64() * up);
         assert!(
             (out[0].to_f32() - expected.to_f32()).abs() < 1e-2,
             "{:?} vs {:?}",

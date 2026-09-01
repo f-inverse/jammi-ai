@@ -173,6 +173,46 @@ over `crates/jammi-kernels/{src,tests}`, `crates/jammi-encoders/src`, `crates/ja
 required — currently 33/69 = 47.8% real, 36/69 = 52.2% noise (see
 `ci/doc_number_allowlist_classification.md`).
 
+## 3.10 f16 per-op reference-regime table (campaign #443, Part 3 / W2a)
+
+**Why this table exists before any f16 tolerance is written (KO-8, "match the eager reference's
+operand form").** The eager reference's own arithmetic is NOT uniform across ops: some upcast to
+F32 internally and round once on the way out; others compute dtype-native (in the tensor's own
+16-bit type) at specific mid-loop points, matching what candle's own composed ops (`Tensor::affine`,
+`broadcast_add`, `GeluErf`) actually do at that dtype. A blanket `2^-9` (f16's ULP-relative
+constant, `no-producer: derived from f16's 10-bit mantissa`) tolerance would be either too loose
+(hiding a real divergence in an op that should be f32-accumulate-exact) or meaningless (an op that
+genuinely rounds mid-loop needs a *behavioral* boundary oracle, not a tolerance at all — see
+`docs/maintainer/cuda-kernel-guide.md` §3's KO-8 and the f16 boundary-contract doctrine in D4 of
+campaign #443's numerics contract). Every row below states: (a) the eager reference's regime
+(`f32-internal` = upcasts to F32, computes, rounds back once; `dtype-native` = computes in the
+tensor's own 16-bit type at the stated step, matching what candle's un-fused ops would do), (b) the
+rounding-POINT count (how many times a value crosses a 16-bit rounding boundary), and (c) the CPU
+F16 reference-arm status this wave (W2a) leaves the op in.
+
+| Op | Eager regime | Rounding points | CPU F16 arm (W2a) |
+|---|---|---|---|
+| `layer_norm` (`LayerNormFused`/`LayerNormBwdDx`/`LayerNormBwdDgamma`) | f32-internal (mean/var/xhat accumulate in f32; `jammi-encoders/src/layer_norm.rs:353-370`'s `LayerNorm::slow` upcasts F16\|BF16→F32, casts back once) | 1 (final cast to f16) | **Added** — `ln_fwd_f16`/`ln_bwd_dx_f16`/`ln_bwd_dgamma_f16`, `crates/jammi-kernels/src/ops/layer_norm.rs` |
+| `softmax_last_dim` (`SoftmaxLastDimFused`/`SoftmaxBwdDScores`) | dtype-native at two steps (the scale-multiply and the mask-add each round to the 16-bit dtype immediately, matching `candle_nn::ops::softmax`'s native `broadcast_add` and `Tensor::affine`'s own rounding point — `cuda/softmax.cu:75-101`'s `bf16_mul_rounded`/`bf16_add_rounded`); every step AFTER the mask add (max/exp/sum/normalize) stays f32 | 2 (scale-mul, mask-add); `dscores` bwd is 1 (final cast) | **Added** — `softmax_row_f16`/`softmax_fwd_f16`/`dscores_row_f16`/`dscores_f16`, `crates/jammi-kernels/src/ops/softmax.rs` |
+| `geglu` (`GegluFused`/`GegluBwdDWiOut`) | dtype-native, two-op eager shape reproduced deliberately (candle's own `GeluErf::f16` arm ALSO computes in f64, mirroring its `bf16` arm exactly — `candle-core-0.11.0/src/op.rs:1002-1009` — but this op's OWN activation is computed in f32, matching the upstream HF/`kernels-community` "fp32 opmath" reference more closely than candle's f64 arm; see the module doc's "bf16 boundary-rounding" section) | 2 fwd (round activation, round product); 2 bwd (round `d_gate`, round `d_up`, each independently, f32-accumulated) | **Added** — `geglu_fwd_row_f16`/`geglu_fwd_f16`/`geglu_bwd_row_f16`/`geglu_bwd_f16`, `crates/jammi-kernels/src/ops/geglu.rs` |
+| `rope`/`rope_positions` (`RopeFused`/`RopePositionsFused`) | f32-internal (accumulate in f32, matching `layer_norm`'s BF16 arms and the CUDA kernel) | 1 (final cast) | **Added** — `rope_fwd_row_f16`/`rope_fwd_f16` (`ops/rope.rs`), `rope_positions_fwd_f16` (`ops/rope_positions.rs`) |
+| `axpy` | f32-internal | 1 | **Added** — `axpy_f16`, `crates/jammi-kernels/src/ops/axpy.rs` |
+| `dropout` | dtype-independent decision (Philox mask is a pure function of position, not value) + f32-internal scale multiply on a KEPT element | 1 (KEPT element only; a DROPPED element is exact zero, no rounding) | **Added** — `dropout_f16`, `crates/jammi-kernels/src/ops/dropout.rs` (Metal host-fallback arm deliberately NOT widened — out of this campaign's CUDA-only scope) |
+| `scaled_cast_add` (`ScaledCastAdd`) | f32-internal (esc-046 fix: widen `base` to f32, add the already-f32 scaled `lora`, round the sum once — matches PEFT's own promote-add-cast-once model) | 1 | **Added** — `scaled_cast_add_f16_f32`/`scaled_cast_add_f32_f16`/`scaled_cast_add_f16_f16`, `crates/jammi-kernels/src/ops/scaled_cast_add.rs` (mirrors the existing 4-combo F32/BF16 matrix with 3 new F16 combos) |
+| `cast_scale`/`cast_add` (`CastScaleBf16F32`/`CastAddBf16`) | N/A — **structurally BF16-monomorphic, not dtype-generic** | N/A | **Deferred to W2c.** These two types are named and domain-restricted to BF16 by construction (`CastScaleBf16F32`'s own doc: "this op's domain is BF16-only rather than accepting F32 too — nothing to fuse there"); an F16 analog is a NEW pair of types (`CastScaleF16F32`/`CastAddF16`), each with its own double-rounding-safety argument (F16's 11-bit significand vs F32's 24-bit: `24 >= 2*11+2` holds with equality, at the boundary rather than "far past" it the way BF16's 16-bit margin is — worth an explicit check when authored, not assumed), not a match-arm widening of an existing generic op. This is genuine kernel-authoring, scheduled with W2c's other new-type work, not W2a's groundwork. |
+| `attention_block` (`AttentionBlockFused`) | f32-only on CPU by a **real, disclosed candle limitation for BF16** (candle-core 0.11's CPU backend has no BF16 `MatMul` impl) — **but this limitation does NOT extend to F16**: `candle-core-0.11.0/src/cpu_backend/mod.rs:1382-1385`'s `MatMul::f` accepts `DType::F16 \| F32 \| F64` (the `gemm` crate ships a real `gemm-f16` backend, confirmed present in this workspace's own dependency tree), so an F16 CPU matmul arm is architecturally possible where a BF16 one never was. Rounding regime unstated (`f32 accumulate throughout` per the module doc's own F32-only CPU domain — an F16 arm would need to decide de novo whether QK^T/PV GEMMs run in f16-native or f32-accumulated precision, i.e. this is a fresh design decision, not a mechanical copy) | N/A (not yet designed) | **Deferred to W2c.** The CPU forward is a ~500-line monomorphic `attention_fwd_f32` (with its own `AttentionFwdF32Params` struct, RoPE-packing, mask-broadcast, and paired `bwd_core`/gradient-GEMM-layout machinery) — duplicating it for F16 is genuine kernel authoring, not a match-arm extension, and belongs with this op's CUDA f16 kernel in the same wave (W2c) per the campaign's own wave split. |
+| `mem_efficient_attention` (`MemEfficientAttentionFused`) | Same F32-only-CPU-by-BF16-matmul-limitation shape as `attention_block`; F16 matmul is architecturally possible for the same `gemm-f16` reason above | N/A (not yet designed) | **Deferred to W2c** — same reasoning as `attention_block` (chunked/flash-style CPU forward, ~2900 lines, its own GEMM-layout oracle machinery). |
+| `low_rank_residual_linear`/`lora_linear` (`LowRankResidualLinear`) | Same F32-only-CPU-by-BF16-matmul-limitation shape; F16 matmul is architecturally possible for the same `gemm-f16` reason above | N/A (not yet designed) | **Deferred to W2c** — same reasoning; this op's own module doc (`low_rank_residual_linear.rs:1729-1751`) is where the BF16 CPU-matmul limitation is documented in the most detail and is the right place to add the parallel F16-is-different-from-BF16-here disclosure when W2c lands the F16 arm. |
+
+**Structural finding for W2c (family K, "diagnose the structure before reaching for a tool"):**
+candle-core 0.11's CPU backend refuses `BF16` for `matmul` (no `gemm-bf16` backend exists in the
+`gemm` crate) but DOES accept `F16` (`gemm-f16` is a real, present dependency — verified by this
+wave's `cargo test -p jammi-kernels axpy::` build pulling in `gemm-f16 v0.19.0`). Every "CPU
+F32-only" domain comment in `attention_block.rs`/`mem_efficient_attention.rs`/
+`low_rank_residual_linear.rs` that cites the BF16 matmul gap as the reason does NOT automatically
+apply to F16 — W2c should read this as "F16 CPU matmul is possible, unlike BF16," not assume the
+same refusal transfers.
+
 ## 4. Benchmarking
 
 Two levels, always both. HF's own warning: their RMSNorm was **1.88x isolated but ~6% end-to-end**,

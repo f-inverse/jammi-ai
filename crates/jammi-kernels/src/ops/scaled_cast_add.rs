@@ -1,6 +1,6 @@
 use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, CustomOp2, DType, Error, Layout, Result, Shape, Tensor};
-use half::bf16;
+use half::{bf16, f16};
 
 use crate::layout_walk::StridedOffsets;
 
@@ -30,7 +30,12 @@ use crate::layout_walk::StridedOffsets;
 /// (four combinations); any other dtype on either side is a typed
 /// `Error::UnsupportedDTypeForOp`. The CUDA forward (feature-gated)
 /// supports the same four combinations and additionally requires
-/// contiguous storage.
+/// contiguous storage. F16 is additionally supported on the CPU-only
+/// oracle-reference arm (`base`/`lora` each independently `F32` or `F16`,
+/// three new combinations — `F16`+`F16`, `F16`+`F32`, `F32`+`F16`; no CUDA
+/// F16 dispatch arm exists yet, so admission is not widened to F16 until
+/// one does, see `docs/maintainer/cuda-kernel-guide.md`'s per-op f16
+/// reference-regime table).
 ///
 /// ## The bf16 rounding model: f32-accumulate, round ONCE (esc-046 fix)
 ///
@@ -146,8 +151,20 @@ impl CustomOp2 for ScaledCastAdd {
                 let out = scaled_cast_add_bf16_bf16(self.scaling, base, l1, lora, l2);
                 Ok((CpuStorage::BF16(out), l1.shape().clone()))
             }
+            (CpuStorage::F32(base), CpuStorage::F16(lora)) => {
+                let out = scaled_cast_add_f32_f16(self.scaling, base, l1, lora, l2);
+                Ok((CpuStorage::F32(out), l1.shape().clone()))
+            }
+            (CpuStorage::F16(base), CpuStorage::F32(lora)) => {
+                let out = scaled_cast_add_f16_f32(self.scaling, base, l1, lora, l2);
+                Ok((CpuStorage::F16(out), l1.shape().clone()))
+            }
+            (CpuStorage::F16(base), CpuStorage::F16(lora)) => {
+                let out = scaled_cast_add_f16_f16(self.scaling, base, l1, lora, l2);
+                Ok((CpuStorage::F16(out), l1.shape().clone()))
+            }
             (s1, s2) => {
-                let unsupported = |d: DType| !matches!(d, DType::F32 | DType::BF16);
+                let unsupported = |d: DType| !matches!(d, DType::F32 | DType::BF16 | DType::F16);
                 if unsupported(s1.dtype()) {
                     Err(Error::UnsupportedDTypeForOp(s1.dtype(), self.name()))
                 } else {
@@ -273,6 +290,54 @@ fn scaled_cast_add_bf16_bf16(
         .collect()
 }
 
+/// [`scaled_cast_add_f32_bf16`]'s exact twin, substituting `half::f16`.
+fn scaled_cast_add_f32_f16(
+    scaling: f64,
+    base: &[f32],
+    lb: &Layout,
+    lora: &[f16],
+    ll: &Layout,
+) -> Vec<f32> {
+    let scaling = scaling as f32;
+    StridedOffsets::from_layout(lb)
+        .zip(StridedOffsets::from_layout(ll))
+        .map(|(ib, il)| base[ib] + lora[il].to_f32() * scaling)
+        .collect()
+}
+
+/// [`scaled_cast_add_bf16_f32`]'s exact twin, substituting `half::f16` —
+/// this is the F16-backbone analog of the reachable production
+/// combination, per the per-op f16 reference-regime table
+/// (`docs/maintainer/cuda-kernel-guide.md`): f32-accumulate, round-once.
+fn scaled_cast_add_f16_f32(
+    scaling: f64,
+    base: &[f16],
+    lb: &Layout,
+    lora: &[f32],
+    ll: &Layout,
+) -> Vec<f16> {
+    let scaling = scaling as f32;
+    StridedOffsets::from_layout(lb)
+        .zip(StridedOffsets::from_layout(ll))
+        .map(|(ib, il)| f16::from_f32(base[ib].to_f32() + lora[il] * scaling))
+        .collect()
+}
+
+/// [`scaled_cast_add_bf16_bf16`]'s exact twin, substituting `half::f16`.
+fn scaled_cast_add_f16_f16(
+    scaling: f64,
+    base: &[f16],
+    lb: &Layout,
+    lora: &[f16],
+    ll: &Layout,
+) -> Vec<f16> {
+    let scaling = scaling as f32;
+    StridedOffsets::from_layout(lb)
+        .zip(StridedOffsets::from_layout(ll))
+        .map(|(ib, il)| f16::from_f32(base[ib].to_f32() + lora[il].to_f32() * scaling))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,6 +372,26 @@ mod tests {
         let expected = [
             bf16::from_f32(1.0 + bf16::from_f32(0.5 * 4.0).to_f32()),
             bf16::from_f32(2.0 + bf16::from_f32(0.5 * -8.0).to_f32()),
+        ];
+        assert_eq!(out, expected);
+    }
+
+    /// F16's exact twin of `cpu_fwd_bf16_f32_matches_hand_computed_values`
+    /// above — the F16-backbone analog of the reachable production
+    /// combination.
+    #[test]
+    fn cpu_fwd_f16_f32_matches_hand_computed_values() {
+        let device = Device::Cpu;
+        let base =
+            Tensor::from_slice(&[f16::from_f32(1.0), f16::from_f32(2.0)], (2,), &device).unwrap();
+        let lora = Tensor::from_slice(&[4.0f32, -8.0], (2,), &device).unwrap();
+        let out = scaled_cast_add(0.5, &base, &lora)
+            .unwrap()
+            .to_vec1::<f16>()
+            .unwrap();
+        let expected = [
+            f16::from_f32(1.0 + f16::from_f32(0.5 * 4.0).to_f32()),
+            f16::from_f32(2.0 + f16::from_f32(0.5 * -8.0).to_f32()),
         ];
         assert_eq!(out, expected);
     }

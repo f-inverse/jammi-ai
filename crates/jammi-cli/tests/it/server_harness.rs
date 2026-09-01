@@ -7,6 +7,18 @@
 //! its `/readyz` probe before returning. Dropping the server SIGKILLs the child
 //! (RAII), so a failed assertion never leaks a server process.
 //!
+//! **The server owns its catalog exclusively.** The SQLite catalog is
+//! single-process (`docs/guide/src/catalog-and-broker.md`): for as long as the
+//! subprocess is live it holds `<dir>/catalog.db`, and a second process opening
+//! that file is out of contract — the backend refuses it with an
+//! `SQLITE_BUSY`-class `BackendError`, and before that refusal existed the
+//! sharing silently corrupted the WAL. A test that needs catalog state the CLI
+//! itself has no write path for therefore seeds it BEFORE the server exists,
+//! via [`TestServer::spawn_with_scratch`]; a test that needs to read the
+//! catalog directly stops the server first (drop the [`TestServer`]). While the
+//! server is live, the only supported way in or out is its public surface —
+//! the CLI binary or the gRPC client.
+//!
 //! The server binary is resolved by walking up from the running test executable
 //! to its sibling under `{target}/{profile}/jammi-server` — the same trick the
 //! distributed harness uses, robust to a custom `CARGO_TARGET_DIR` without
@@ -40,9 +52,39 @@ impl TestServer {
     /// binds the ports itself and announces the ACTUAL ports it got on stdout —
     /// the harness reads that banner rather than pre-picking a port and dropping
     /// it (which would open a release-then-rebind race). The catalog and artifact
-    /// state live under a per-test `TempDir`.
+    /// state live under a fresh per-test `TempDir`.
+    ///
+    /// Use [`TestServer::spawn_with_scratch`] instead when the test needs
+    /// catalog rows seeded before the server comes up.
     pub fn spawn() -> Self {
-        let scratch = TempDir::new().expect("tempdir for server scratch");
+        Self::spawn_with_scratch(TempDir::new().expect("tempdir for server scratch"))
+    }
+
+    /// Like [`TestServer::spawn`], but on a scratch directory the caller has
+    /// already prepared — the seam for a test that must seed catalog state the
+    /// CLI itself has no write path for (e.g. a training-job fixture;
+    /// submission is SDK-only, never the CLI).
+    ///
+    /// The catalog is single-process, so seeding happens strictly BEFORE the
+    /// server exists: open a `jammi_db::catalog::Catalog` on the directory,
+    /// insert the fixture rows, drop the catalog and settle the close with
+    /// [`await_catalog_released`], then hand the directory here. Opening a
+    /// second catalog on this directory while the returned handle is live is
+    /// out of contract (see the module doc) — read through the CLI or the gRPC
+    /// client instead, or drop the handle first.
+    ///
+    /// This constructor verifies that precondition rather than trusting it: it
+    /// panics up front if this process still holds the catalog, instead of
+    /// racing the server onto a file it cannot take exclusively and leaving a
+    /// `/readyz` timeout to explain it.
+    pub fn spawn_with_scratch(scratch: TempDir) -> Self {
+        assert!(
+            !catalog_sidecars_present(scratch.path()),
+            "the catalog at {} is still open in this process — the server subprocess cannot \
+             take it exclusively. Drop the seeding `Catalog` and `await_catalog_released` \
+             before spawning.",
+            scratch.path().join("catalog.db").display()
+        );
         let exe = server_binary();
 
         let mut child = Command::new(&exe)
@@ -103,18 +145,6 @@ impl TestServer {
         format!("grpc://127.0.0.1:{}", self.flight_port)
     }
 
-    /// The server's `JAMMI_ARTIFACT_DIR` — the directory its catalog (default
-    /// SQLite at `<dir>/catalog.db`) and any other on-disk state live under. A
-    /// test that needs to seed a row the CLI itself has no write path for
-    /// (e.g. a training-job fixture; submission is SDK-only, never the CLI)
-    /// opens a second [`jammi_db::catalog::Catalog`] against the same
-    /// directory — safe because the backend runs WAL mode with a 5s busy
-    /// timeout, so the concurrent server subprocess and the test's own
-    /// connection don't collide.
-    pub fn artifact_dir(&self) -> &Path {
-        self._scratch.path()
-    }
-
     /// A `jammi` CLI command pre-pointed at this server's `--target`.
     pub fn cli(&self) -> AssertCommand {
         let mut cmd = AssertCommand::cargo_bin("jammi").expect("jammi-cli binary built");
@@ -140,6 +170,48 @@ impl Drop for TestServer {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Wait until no connection from THIS process holds `<dir>/catalog.db`, so a
+/// [`TestServer`] can then take the file exclusively.
+///
+/// **Dropping a `Catalog` is not by itself a release.** `sqlx` hands a pooled
+/// connection back — and, on a closed pool, shuts it down — from a spawned
+/// task, so the close only happens once the runtime is driven again; a drop
+/// followed by blocking the runtime thread leaves the file held indefinitely
+/// (measured: the `-wal`/`-shm` sidecars survive a 4s blocking wait, and
+/// vanish within one 50ms `await`). That is why this is `async` and why it
+/// yields between polls rather than sleeping the thread.
+///
+/// The barrier is observable, not a fixed sleep: when the last connection to a
+/// WAL database closes cleanly, SQLite checkpoints into the main file and
+/// removes both sidecars. Their absence is the proof.
+///
+/// A directory with no `catalog.db` at all has nothing to release and returns
+/// immediately.
+pub async fn await_catalog_released(dir: &Path) {
+    if !dir.join("catalog.db").exists() {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if !catalog_sidecars_present(dir) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "catalog at {} still has live WAL sidecars after 30s — this process has not closed \
+         its own connections. Drop the seeding `Catalog` (and every clone of its backend \
+         `Arc`) first, and make sure the runtime is free to drive the close.",
+        dir.join("catalog.db").display()
+    );
+}
+
+/// Whether `<dir>/catalog.db` has live `-wal`/`-shm` sidecars — i.e. some
+/// connection still has the WAL database open. See [`await_catalog_released`].
+fn catalog_sidecars_present(dir: &Path) -> bool {
+    dir.join("catalog.db-wal").exists() || dir.join("catalog.db-shm").exists()
 }
 
 /// Parse the server's fixed startup banner — `jammi-server listening

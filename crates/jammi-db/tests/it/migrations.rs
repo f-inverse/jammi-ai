@@ -185,6 +185,7 @@ async fn applied_migrations_ledger_records_all_migrations() {
             "023_storage_precision",
             "024_claim_policy",
             "025_index_segments",
+            "026_acceleration_report",
         ]
     );
 }
@@ -1076,5 +1077,170 @@ async fn migration_024_adds_claim_policy_columns_and_index() {
     assert!(
         claimable,
         "a row born before migration 024 backfills to claimable = TRUE"
+    );
+}
+
+/// Migration 026 adds the `acceleration_report` column to `training_jobs`
+/// (esc-075). Asserted append-only-append (the column exists on a fresh open,
+/// migrations remain idempotent across a reopen) and the tri-state backfill: a
+/// row that predates the migration reads back `NULL` — "unknown" — never a
+/// fabricated `pending`, while a row created after the migration through
+/// [`Catalog::create_training_job`] carries the explicit
+/// `{"state":"pending"}` marker from `INSERT` onward.
+#[tokio::test]
+async fn migration_026_adds_acceleration_report_column_with_tristate_backfill() {
+    use jammi_db::catalog::model_repo::RegisterModelParams;
+    use jammi_db::catalog::training_repo::CreateTrainingJobParams;
+    use jammi_db::model_task::ModelTask;
+
+    let dir = tempdir().unwrap();
+    let catalog = Catalog::open(dir.path()).await.unwrap();
+    let backend = BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await);
+
+    // --- Fresh catalog: the column exists. ---
+    let columns = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    tx.query::<_, String>(
+                        "SELECT name FROM pragma_table_info('training_jobs')",
+                        &[],
+                        |row| row.get("name"),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        columns.iter().any(|c| c == "acceleration_report"),
+        "training_jobs must have 'acceleration_report' after migration 026; got {columns:?}"
+    );
+
+    // A freshly-submitted job carries the explicit pending marker, never NULL.
+    catalog
+        .register_model(RegisterModelParams {
+            model_id: "acc-base",
+            version: 1,
+            model_type: "embedding",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: None,
+            artifact_path: None,
+            config_json: None,
+        })
+        .await
+        .unwrap();
+    catalog
+        .create_training_job(CreateTrainingJobParams {
+            job_id: "acc-fresh",
+            base_model_id: "acc-base::1",
+            training_source: "src.csv",
+            loss_type: "contrastive",
+            hyperparams: "{}",
+            kind: "fine_tune",
+            training_spec: "{}",
+        })
+        .await
+        .unwrap();
+    let fresh = catalog.get_training_job("acc-fresh").await.unwrap();
+    assert_eq!(
+        fresh.acceleration_report.as_deref(),
+        Some(r#"{"state":"pending"}"#),
+        "a freshly submitted job must carry the explicit pending marker"
+    );
+
+    // --- Pre-026-migrated catalog: roll migration 026 back by hand to
+    // reproduce a pre-migration schema, insert a row under that schema (no
+    // acceleration_report column at all, so the eventual backfilled value is
+    // SQL NULL, not an empty string or fabricated pending marker), then
+    // reopen — the runner re-applies 026 and the legacy row reads back NULL
+    // ("unknown"), never "pending" or any other fabricated state. ---
+    backend
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "ALTER TABLE training_jobs DROP COLUMN acceleration_report",
+                    &[],
+                )
+                .await?;
+                tx.execute(
+                    "DELETE FROM applied_migrations WHERE name = '026_acceleration_report'",
+                    &[],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    backend
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO training_jobs \
+                     (job_id, base_model_id, training_source, loss_type, hyperparams, status, kind, \
+                      training_spec) \
+                     VALUES ('acc-legacy', 'acc-base::1', 'src.csv', 'contrastive', '{}', 'queued', \
+                              'fine_tune', '{}')",
+                    &[],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+
+    drop(catalog);
+    let reopened = Catalog::open(dir.path()).await.unwrap();
+
+    // Idempotent re-open: migrations run again with no error, and the column
+    // is back.
+    let columns_after = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    tx.query::<_, String>(
+                        "SELECT name FROM pragma_table_info('training_jobs')",
+                        &[],
+                        |row| row.get("name"),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        columns_after.iter().any(|c| c == "acceleration_report"),
+        "training_jobs must regain 'acceleration_report' after re-applying migration 026"
+    );
+
+    let legacy = reopened.get_training_job("acc-legacy").await.unwrap();
+    assert_eq!(
+        legacy.acceleration_report, None,
+        "a row born before migration 026 backfills to NULL ('unknown'), never a \
+         fabricated pending or determined state"
+    );
+
+    // A genuinely idempotent re-open (no manual rollback this time — the
+    // column and the `applied_migrations` row are both already in place):
+    // running the migration set again must be a no-op, leaving the
+    // backfilled legacy row's NULL exactly as it was.
+    drop(reopened);
+    let reopened_again = Catalog::open(dir.path()).await.unwrap();
+    let legacy_after_second_reopen = reopened_again.get_training_job("acc-legacy").await.unwrap();
+    assert_eq!(
+        legacy_after_second_reopen.acceleration_report, None,
+        "a second, genuinely idempotent reopen must not disturb the backfilled NULL"
     );
 }

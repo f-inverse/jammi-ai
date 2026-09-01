@@ -40,11 +40,34 @@ pub struct TrainingJobRecord {
     /// a fresh process — the catalog stores it opaquely (the typed shape lives in
     /// the engine crate that produces and consumes it).
     pub training_spec: Option<String>,
+    /// The job's per-attempt acceleration determination (esc-075), as opaque
+    /// JSON — **tri-state**, and all three states ride in the payload rather
+    /// than in `Option`'s presence/absence alone (migration 026):
+    ///
+    ///   - `None` (SQL `NULL`) — unknown: a row written before migration 026,
+    ///     or one this code never touched. Never read as "accelerated" or
+    ///     "eager" — it is an honest absence of information, not a claim.
+    ///   - `Some({"state":"pending"})` — submitted, no claimant has computed a
+    ///     determination for this attempt yet. Written by
+    ///     [`Catalog::create_training_job`] at `INSERT` time.
+    ///   - `Some({"state":"determined", ...})` — the claiming worker's report.
+    ///     Written by [`Catalog::record_acceleration_report`]. The catalog
+    ///     stores the payload opaquely; the typed shape lives in the engine
+    ///     crate that produces and consumes it, matching `training_spec`'s
+    ///     existing opacity convention.
+    pub acceleration_report: Option<String>,
 }
 
 const SELECT_COLS: &str = "job_id, base_model_id, output_model_id, training_source, loss_type, \
      hyperparams, status, metrics, created_at, kind, claimed_by, lease_expires_at, attempts, \
-     tenant_id, training_spec";
+     tenant_id, training_spec, acceleration_report";
+
+/// The explicit submission-time marker [`Catalog::create_training_job`] writes
+/// into `acceleration_report`: the job exists but no claimant has yet computed
+/// an acceleration determination for it. Distinct from SQL `NULL` (a
+/// pre-migration-026 row this code never touched) — see
+/// [`TrainingJobRecord::acceleration_report`]'s tri-state contract.
+const ACCELERATION_REPORT_PENDING: &str = r#"{"state":"pending"}"#;
 
 /// Format leases write into `lease_expires_at`. Lexicographic ordering of two
 /// timestamps in this fixed-width UTC form matches chronological ordering, so
@@ -111,6 +134,7 @@ fn parse_row(row: &Row<'_>) -> std::result::Result<TrainingJobRecord, BackendErr
         attempts: row.get::<i32>("attempts")? as u32,
         tenant_id,
         training_spec: row.try_get("training_spec")?,
+        acceleration_report: row.try_get("acceleration_report")?,
     })
 }
 
@@ -266,8 +290,8 @@ impl Catalog {
                     tx.execute(
                         "INSERT INTO training_jobs \
                          (job_id, base_model_id, training_source, loss_type, hyperparams, status, \
-                          kind, training_spec, tenant_id) \
-                         VALUES ($1, $2, $3, $4, $5, 'queued', $6, $7, $8)",
+                          kind, training_spec, tenant_id, acceleration_report) \
+                         VALUES ($1, $2, $3, $4, $5, 'queued', $6, $7, $8, $9)",
                         &[
                             SqlValue::TextOwned(job_id),
                             SqlValue::TextOwned(base_model_id),
@@ -277,6 +301,7 @@ impl Catalog {
                             SqlValue::TextOwned(kind),
                             SqlValue::TextOwned(training_spec),
                             SqlValue::from(tenant.map(|t| t.to_string())),
+                            SqlValue::Text(ACCELERATION_REPORT_PENDING),
                         ],
                     )
                     .await?;
@@ -640,6 +665,68 @@ impl Catalog {
                             SqlValue::TextOwned(job_id),
                             SqlValue::TextOwned(worker_id),
                             SqlValue::TextOwned(running),
+                        ],
+                    )
+                    .await
+                })
+            })
+            .await?;
+        Ok(updated == 1)
+    }
+
+    /// Record the claiming worker's acceleration determination (esc-075) for
+    /// this attempt of a job the caller still owns — the report-writing peer of
+    /// [`Self::mark_training_running`]. Replaces `acceleration_report`
+    /// **only** while the row is still `running`, `claimed_by == worker_id`,
+    /// **and `attempts == attempt`**.
+    ///
+    /// The `attempts` guard is mandatory, not a defensive extra: `claimed_by`
+    /// carries `JAMMI_WORKER_ID`, which is deliberately **stable across
+    /// process restarts** (worker.rs), so `(job_id, claimed_by, status)` alone
+    /// cannot tell "the current claimant, mid-run" from "a zombie of the same
+    /// worker identity, from an attempt this job already moved past via
+    /// reclaim". A reclaim always bumps `attempts` on re-claim
+    /// (`claim_next_training_job`'s `attempts = attempts + 1`), so pinning the
+    /// exact attempt closes precisely that gap: a zombie presenting its own
+    /// stale `attempt` value matches zero rows and can never overwrite the
+    /// current claimant's report, even when it shares the current claimant's
+    /// worker id and the row happens to be `running` again under a *later*
+    /// attempt.
+    ///
+    /// Returns `true` when the write landed (the guard matched) and `false`
+    /// when it did not — the lease was lost, the job is no longer running, or
+    /// the caller's `attempt` is stale. Not tenant-scoped, matching the other
+    /// lease-identity operations ([`Self::mark_training_running`],
+    /// [`Self::fail_training_job`], [`Self::finalize_training_job`]).
+    pub async fn record_acceleration_report(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        attempt: u32,
+        report_json: &str,
+    ) -> Result<bool> {
+        let running = TrainingJobStatus::Running.to_string();
+        let job_id = job_id.to_string();
+        let worker_id = worker_id.to_string();
+        let report_json = report_json.to_string();
+        let attempt = attempt as i64;
+        let now = lease_now();
+
+        let updated = self
+            .backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE training_jobs \
+                         SET acceleration_report = $1, updated_at = $2 \
+                         WHERE job_id = $3 AND claimed_by = $4 AND status = $5 AND attempts = $6",
+                        &[
+                            SqlValue::TextOwned(report_json),
+                            SqlValue::TextOwned(now),
+                            SqlValue::TextOwned(job_id),
+                            SqlValue::TextOwned(worker_id),
+                            SqlValue::TextOwned(running),
+                            SqlValue::Int(attempt),
                         ],
                     )
                     .await

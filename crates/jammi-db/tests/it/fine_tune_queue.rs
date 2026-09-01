@@ -1240,3 +1240,349 @@ async fn reclaim_leaves_live_leases_untouched(backend: BackendKind) {
     let still_running = catalog.get_training_job("live").await.unwrap();
     assert_eq!(still_running.status, TrainingJobStatus::Running.to_string());
 }
+
+/// [`Catalog::create_training_job`] writes the explicit `{"state":"pending"}`
+/// tri-state marker (never SQL NULL) at submission; the claiming worker's
+/// [`Catalog::record_acceleration_report`] overwrites it under a valid lease,
+/// pinning `attempts` to the exact attempt the claim returned.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn record_acceleration_report_writes_under_a_valid_lease(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    catalog
+        .create_training_job(job_params("ar-1"))
+        .await
+        .unwrap();
+    let submitted = catalog.get_training_job("ar-1").await.unwrap();
+    assert_eq!(
+        submitted.acceleration_report.as_deref(),
+        Some(r#"{"state":"pending"}"#),
+        "submission writes the explicit pending marker, never NULL"
+    );
+
+    let claimed = catalog
+        .claim_next_training_job("worker-a", Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("job claimed");
+    assert_eq!(claimed.attempts, 1);
+
+    let report =
+        r#"{"state":"determined","attempt":1,"device":"cuda:0","ops":{"layer_norm":"hit"}}"#;
+    let wrote = catalog
+        .record_acceleration_report("ar-1", "worker-a", claimed.attempts, report)
+        .await
+        .unwrap();
+    assert!(wrote, "the current lease holder's write must land");
+
+    let after = catalog.get_training_job("ar-1").await.unwrap();
+    assert_eq!(
+        after.acceleration_report.as_deref(),
+        Some(report),
+        "the determined report round-trips through parse_row verbatim"
+    );
+
+    // A non-owner (right attempt, wrong worker) cannot write it.
+    let stolen = catalog
+        .record_acceleration_report(
+            "ar-1",
+            "worker-b",
+            claimed.attempts,
+            "{\"state\":\"determined\"}",
+        )
+        .await
+        .unwrap();
+    assert!(!stolen, "a non-owner must not overwrite the report");
+    let unchanged = catalog.get_training_job("ar-1").await.unwrap();
+    assert_eq!(unchanged.acceleration_report.as_deref(), Some(report));
+}
+
+/// The mandatory `attempts` guard closes the zombie gap: `JAMMI_WORKER_ID` is
+/// stable across process restarts, so a reclaimed job re-claimed by a worker
+/// carrying the SAME worker id (a restarted process, or — as modeled here —
+/// the exact identity a real restart preserves) is distinguished from its own
+/// zombie only by `attempts`. After a reclaim bumps `attempts`, a write
+/// presenting the OLD attempt must NOT land (the report stays whatever it was
+/// before the stale write), while a write presenting the CURRENT attempt does.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn record_acceleration_report_rejects_a_zombies_stale_attempt(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    catalog
+        .create_training_job(job_params("ar-zombie"))
+        .await
+        .unwrap();
+
+    // worker-a's first attempt claims with a zero lease (immediately expired).
+    let first = catalog
+        .claim_next_training_job("worker-a", Duration::from_secs(0))
+        .await
+        .unwrap()
+        .expect("worker-a claims attempt 1");
+    assert_eq!(first.attempts, 1);
+
+    // The lease expires and reclaim re-queues the job.
+    let actioned = catalog.reclaim_expired_training_jobs(5).await.unwrap();
+    assert_eq!(actioned, 1, "the expired lease is re-queued");
+
+    // worker-a re-claims — SAME worker id (JAMMI_WORKER_ID is stable across
+    // restarts), but a NEW attempt. This is the current, live claimant.
+    let second = catalog
+        .claim_next_training_job("worker-a", Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("worker-a re-claims as attempt 2");
+    assert_eq!(second.attempts, 2);
+    assert_eq!(second.claimed_by.as_deref(), Some("worker-a"));
+
+    // The zombie: worker-a's FIRST process, still holding attempt=1 in memory,
+    // computes and tries to write its (now-stale) report. `claimed_by` and
+    // `status` alone would match (same worker id, still running) — only the
+    // `attempts` guard distinguishes it from the live claimant.
+    let zombie_report = r#"{"state":"determined","attempt":1,"stale":true}"#;
+    let zombie_wrote = catalog
+        .record_acceleration_report("ar-zombie", "worker-a", 1, zombie_report)
+        .await
+        .unwrap();
+    assert!(
+        !zombie_wrote,
+        "a zombie presenting the OLD attempt must not write, even with the SAME \
+         worker id and a currently-running status"
+    );
+    let after_zombie = catalog.get_training_job("ar-zombie").await.unwrap();
+    assert_ne!(
+        after_zombie.acceleration_report.as_deref(),
+        Some(zombie_report),
+        "the zombie's stale report must never land"
+    );
+
+    // The current claimant (attempt=2) writes successfully.
+    let current_report = r#"{"state":"determined","attempt":2,"stale":false}"#;
+    let current_wrote = catalog
+        .record_acceleration_report("ar-zombie", "worker-a", 2, current_report)
+        .await
+        .unwrap();
+    assert!(current_wrote, "the current claimant's write must land");
+    let after_current = catalog.get_training_job("ar-zombie").await.unwrap();
+    assert_eq!(
+        after_current.acceleration_report.as_deref(),
+        Some(current_report),
+        "the current claimant's report is what the row carries"
+    );
+
+    // A late zombie write (still presenting attempt=1) after the current
+    // claimant has already written must also be rejected, and must not
+    // clobber the current claimant's now-recorded report.
+    let late_zombie_wrote = catalog
+        .record_acceleration_report("ar-zombie", "worker-a", 1, zombie_report)
+        .await
+        .unwrap();
+    assert!(!late_zombie_wrote, "a late zombie write is still rejected");
+    let after_late_zombie = catalog.get_training_job("ar-zombie").await.unwrap();
+    assert_eq!(
+        after_late_zombie.acceleration_report.as_deref(),
+        Some(current_report),
+        "the current claimant's report survives a late zombie write attempt"
+    );
+}
+
+/// `acceleration_report` is not the `metrics` blob: the terminal `finalize`
+/// transition overwrites `metrics`/`status`/`output_model_id` but leaves
+/// `acceleration_report` untouched.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acceleration_report_survives_finalize(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    catalog
+        .create_training_job(job_params("ar-fin"))
+        .await
+        .unwrap();
+    catalog
+        .register_model(RegisterModelParams {
+            model_id: "jammi:fine-tuned:ar-fin",
+            version: 1,
+            model_type: "fine-tuned",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: Some("q-base::1"),
+            artifact_path: None,
+            config_json: None,
+        })
+        .await
+        .unwrap();
+
+    let claimed = catalog
+        .claim_next_training_job("worker-a", Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("job claimed");
+    let report = r#"{"state":"determined","attempt":1,"device":"cuda:0"}"#;
+    catalog
+        .record_acceleration_report("ar-fin", "worker-a", claimed.attempts, report)
+        .await
+        .unwrap();
+
+    let finalized = catalog
+        .finalize_training_job(FinalizeTrainingJobParams {
+            job_id: "ar-fin",
+            worker_id: "worker-a",
+            output_model_id: "jammi:fine-tuned:ar-fin",
+            output_model_version: 1,
+            artifact_path: "file:///artifacts/ar-fin/worker-a/0",
+            metrics: Some(r#"{"completed_at":"2026-01-01T00:00:00Z"}"#),
+            epoch_checkpoints: &[],
+        })
+        .await
+        .unwrap();
+    assert!(finalized, "the lease owner finalizes the job");
+
+    let after = catalog.get_training_job("ar-fin").await.unwrap();
+    assert_eq!(after.status, TrainingJobStatus::Completed.to_string());
+    assert_eq!(
+        after.acceleration_report.as_deref(),
+        Some(report),
+        "finalize must leave acceleration_report INTACT — it is not the metrics blob"
+    );
+}
+
+/// The terminal `fail` transition leaves `acceleration_report` untouched, the
+/// same as `finalize`.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acceleration_report_survives_fail(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    catalog
+        .create_training_job(job_params("ar-fail"))
+        .await
+        .unwrap();
+    let claimed = catalog
+        .claim_next_training_job("worker-a", Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("job claimed");
+    let report = r#"{"state":"determined","attempt":1,"device":"cpu"}"#;
+    catalog
+        .record_acceleration_report("ar-fail", "worker-a", claimed.attempts, report)
+        .await
+        .unwrap();
+
+    let failed = catalog
+        .fail_training_job("ar-fail", "worker-a", Some(r#"{"error_message":"boom"}"#))
+        .await
+        .unwrap();
+    assert!(failed, "the lease owner records the failure");
+
+    let after = catalog.get_training_job("ar-fail").await.unwrap();
+    assert_eq!(after.status, TrainingJobStatus::Failed.to_string());
+    assert_eq!(
+        after.acceleration_report.as_deref(),
+        Some(report),
+        "fail must leave acceleration_report INTACT — it is not the metrics blob"
+    );
+}
+
+/// Reclaim (both the re-queue arm and the attempts-exhausted arm) leaves
+/// `acceleration_report` untouched — the stale report from the reclaimed
+/// attempt may legitimately persist until the NEW claimant overwrites it via
+/// its own [`Catalog::record_acceleration_report`] call; reclaim itself never
+/// clears or rewrites the column.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acceleration_report_persists_across_reclaim_until_overwritten(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    catalog
+        .create_training_job(job_params("ar-rc"))
+        .await
+        .unwrap();
+    let claimed = catalog
+        .claim_next_training_job("worker-a", Duration::from_secs(0))
+        .await
+        .unwrap()
+        .expect("job claimed");
+    let stale_report = r#"{"state":"determined","attempt":1,"stale":true}"#;
+    let wrote = catalog
+        .record_acceleration_report("ar-rc", "worker-a", claimed.attempts, stale_report)
+        .await
+        .unwrap();
+    assert!(
+        wrote,
+        "the attempt-1 claimant writes its report before expiry"
+    );
+
+    // Requeue arm: the lease is already expired, so reclaim re-queues the job.
+    let actioned = catalog.reclaim_expired_training_jobs(5).await.unwrap();
+    assert_eq!(actioned, 1, "the expired lease is re-queued");
+    let requeued = catalog.get_training_job("ar-rc").await.unwrap();
+    assert_eq!(requeued.status, TrainingJobStatus::Queued.to_string());
+    assert_eq!(
+        requeued.acceleration_report.as_deref(),
+        Some(stale_report),
+        "the requeue arm of reclaim leaves the stale report untouched — it is overwritten \
+         only by the NEW claimant's own record_acceleration_report call"
+    );
+
+    // The new claimant re-claims with a zero lease too (immediately expired),
+    // so the next reclaim sweep can act on it directly without a live lease
+    // blocking the claim), and overwrites the stale report with its own.
+    let reclaimed = catalog
+        .claim_next_training_job("worker-b", Duration::from_secs(0))
+        .await
+        .unwrap()
+        .expect("worker-b re-claims the requeued job");
+    assert_eq!(reclaimed.attempts, 2);
+    let fresh_report = r#"{"state":"determined","attempt":2,"stale":false}"#;
+    catalog
+        .record_acceleration_report("ar-rc", "worker-b", reclaimed.attempts, fresh_report)
+        .await
+        .unwrap();
+    let after_overwrite = catalog.get_training_job("ar-rc").await.unwrap();
+    assert_eq!(
+        after_overwrite.acceleration_report.as_deref(),
+        Some(fresh_report),
+        "the new claimant's write replaces the stale report"
+    );
+
+    // Exhausted-attempts arm: worker-b's lease (already expired) is reclaimed
+    // with a max that is already met by its `attempts = 2`, driving the job
+    // straight to `failed` (the exhausted branch, not requeue) — the report
+    // is left exactly as the current claimant wrote it.
+    let actioned = catalog.reclaim_expired_training_jobs(2).await.unwrap();
+    assert_eq!(actioned, 1, "attempts (2) >= max (2): the job fails");
+    let failed = catalog.get_training_job("ar-rc").await.unwrap();
+    assert_eq!(failed.status, TrainingJobStatus::Failed.to_string());
+    assert_eq!(
+        failed.acceleration_report.as_deref(),
+        Some(fresh_report),
+        "the exhausted-attempts reclaim arm leaves acceleration_report untouched too"
+    );
+}

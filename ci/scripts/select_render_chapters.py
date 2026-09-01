@@ -26,13 +26,23 @@ Three buckets, in order of priority:
 
                       A LIVE_COMPUTE chapter whose live cell ALSO opens a
                       `grpc://` target needs a running `jammi-server` to
-                      render -- the Book gate job builds no server (see
-                      `cookbook-book.yml`'s docstring; that is deliberate,
-                      cost-bounded scope, preserved here). Such a chapter is
-                      classified LIVE_COMPUTE_NEEDS_SERVER: real live-compute,
-                      but out of THIS gate's reach, staying on the nightly
-                      `cookbook-render.yml` leg. It is reported, never
-                      silently dropped.
+                      render, and is classified LIVE_COMPUTE_NEEDS_SERVER.
+                      NEEDS_SERVER is a LANE CAPABILITY, not a chapter
+                      property: such a chapter is selected by EXACTLY the
+                      same rules as LIVE_COMPUTE (self-touched, or an
+                      engine-surface diff, or a dataset trigger it also
+                      carries), and this script reports the capability the
+                      selected set needs (`--needs-server`) so the caller can
+                      PROVISION it. The server that capability asks for is a
+                      plain CPU `cargo build --release -p jammi-server`,
+                      which the shared `setup-jammi-py` action already builds
+                      behind its `build-server` input; the caller pays it
+                      only when the flag is true. Excluding the chapter
+                      instead is what let a touched needs-server chapter
+                      merge having executed NOWHERE -- the nightly full
+                      render runs the PRE-merge base, so "the nightly owns
+                      it" is true only for the code already on main, never
+                      for the diff under review.
 
   CACHE_READ          No executed cell calls a live-compute verb, but the
                       chapter reads a committed artifact (`contracts.load_artifact(`
@@ -53,13 +63,16 @@ Three buckets, in order of priority:
 
 A chapter whose own `.qmd` file appears in the diff is always selected,
 regardless of bucket -- the trivial "you touched it, prove it still renders"
-case this script would be dishonest to omit.
+case this script would be dishonest to omit. STATIC is the one bucket that
+rule reaches but no OTHER rule does: a STATIC chapter nobody touched is never
+selected. There is no bucket this rule exempts.
 
 Usage:
     python3 ci/scripts/select_render_chapters.py --diff <path-to-file-list>
     python3 ci/scripts/select_render_chapters.py --base <sha> --head <sha>
     python3 ci/scripts/select_render_chapters.py --classify   # dry-run table, no diff
     python3 ci/scripts/select_render_chapters.py --self-test
+    python3 ci/scripts/select_render_chapters.py --base <sha> --head <sha> --needs-server
 
 `--diff` reads a newline-separated list of repo-root-relative changed paths
 (what a CI job's `git diff --name-only` produces) from a file, or `-` for
@@ -67,6 +80,14 @@ stdin. `--base`/`--head` run `git diff --name-only` in-process (requires a git
 checkout with both revisions present). Prints the selected chapters'
 repo-root-relative paths, one per line, to stdout; a job substitutes that list
 into `quarto render`.
+
+`--needs-server` prints, INSTEAD of the chapter list, exactly `true` or
+`false` on one line: whether the set this same diff selects contains a chapter
+that needs a running `jammi-server`. Machine-readable on purpose -- a workflow
+reads it into a step output and provisions the server on exactly that
+condition (see `.github/workflows/cookbook-book.yml`). It is a query over the
+SAME deterministic selection, so a caller that runs both forms on one diff
+gets one consistent answer.
 
 Hermetic: no network. `--base`/`--head` shell out to `git diff` only.
 """
@@ -219,7 +240,9 @@ def select(
         if m:
             changed_datasets.add(m.group(1))
 
-    # A chapter's own file is in the diff -- rendered no matter its bucket.
+    # A chapter's own file is in the diff -- rendered no matter its bucket,
+    # LIVE_COMPUTE_NEEDS_SERVER included (the caller provisions the server
+    # that bucket asks for; see the module doc).
     try:
         book_rel_chapters_dir = chapters_dir.relative_to(repo_root).as_posix()
     except ValueError:
@@ -235,28 +258,36 @@ def select(
             rel = c.path.relative_to(repo_root).as_posix()
         except ValueError:
             rel = c.path.as_posix()
-        # LIVE_COMPUTE_NEEDS_SERVER is never selected by this gate — not even
-        # when the chapter's own .qmd is in the diff. This gate's runner has
-        # no server harness (cookbook-render.yml's nightly does), so selecting
-        # a needs-server chapter here guarantees a structural red regardless
-        # of the chapter's correctness (campaign #443: a diff-touched
-        # needs-server chapter was auto-selected and died on the missing
-        # `jammi-server` binary). Reported, not silently rendered or dropped;
-        # the nightly full render is the lane that executes it.
-        if c.bucket == "LIVE_COMPUTE_NEEDS_SERVER":
-            continue
         if rel in self_touched:
             selected.add(c.path)
             continue
-        if c.bucket == "LIVE_COMPUTE" and engine_touched:
+        # LIVE_COMPUTE_NEEDS_SERVER selects on exactly the LIVE_COMPUTE
+        # rules: the server it needs is a lane capability the caller
+        # provisions off `selection_needs_server` below, never a reason to
+        # drop a chapter this diff could move.
+        if c.bucket in ("LIVE_COMPUTE", "LIVE_COMPUTE_NEEDS_SERVER") and engine_touched:
             selected.add(c.path)
             continue
         if c.bucket == "CACHE_READ" and (c.datasets & changed_datasets):
             selected.add(c.path)
             continue
-        # STATIC is likewise never selected by this gate, on purpose --
+        # STATIC is never selected unless self-touched, on purpose --
         # reported, not silently rendered or dropped.
     return classifications, selected
+
+
+def selection_needs_server(
+    classifications: list[Classification], selected: set[Path]
+) -> bool:
+    """Does rendering `selected` require a running `jammi-server`?
+
+    True iff the selected set contains a LIVE_COMPUTE_NEEDS_SERVER chapter.
+    This is the LANE CAPABILITY the caller must provision (a CPU
+    `cargo build --release -p jammi-server` on PATH) before rendering the
+    set -- the selection itself never bends around whether the caller has
+    one."""
+    sel = set(selected)
+    return any(c.bucket == "LIVE_COMPUTE_NEEDS_SERVER" and c.path in sel for c in classifications)
 
 
 # --------------------------------------------------------------------------
@@ -326,9 +357,8 @@ def _self_test() -> int:
 
         # 3. A live call whose executed cell ALSO opens a grpc:// target
         #    must classify LIVE_COMPUTE_NEEDS_SERVER, not plain LIVE_COMPUTE
-        #    -- this gate builds no server (cookbook-book.yml's own scope),
-        #    so a server-needing chapter must never enter the PR-gate
-        #    render set even though it IS live-compute.
+        #    -- the bucket is what tells the caller which lane capability
+        #    (a running jammi-server) rendering this chapter needs.
         _write(
             chapters / "remote" / "remote.qmd",
             """---\ntitle: remote\n---\n\n"""
@@ -365,15 +395,31 @@ def _self_test() -> int:
             f"got {smap}",
         )
 
-        # 6. End-to-end selection: an engine-code diff selects LIVE_COMPUTE
-        #    (never LIVE_COMPUTE_NEEDS_SERVER), a cache-build-script diff
-        #    selects only that dataset's CACHE_READ chapters, and a
-        #    docs-only diff (no engine, no script) selects nothing.
-        _, sel = select(["crates/jammi-ai/src/lib.rs"], chapters_dir=chapters, scripts_dir=scripts, repo_root=root)
+        # 6. End-to-end selection: an engine-code diff selects BOTH
+        #    live-compute buckets (plain and needs-server -- the server is a
+        #    lane capability the caller provisions, not a selection filter),
+        #    a cache-build-script diff selects only that dataset's CACHE_READ
+        #    chapters, and a docs-only diff (no engine, no script) selects
+        #    nothing.
+        cls, sel = select(
+            ["crates/jammi-ai/src/lib.rs"], chapters_dir=chapters, scripts_dir=scripts, repo_root=root
+        )
         sel_rel = {p.relative_to(root).as_posix() for p in sel}
         check(
-            "engine-diff-selects-live-compute-only",
-            sel_rel == {"chapters/mixed/mixed.qmd"},
+            "engine-diff-selects-both-live-compute-buckets",
+            sel_rel == {"chapters/mixed/mixed.qmd", "chapters/remote/remote.qmd"},
+            f"got {sel_rel}",
+        )
+        check(
+            "engine-touched-needs-server-chapter-is-selected-and-flagged",
+            "chapters/remote/remote.qmd" in sel_rel and selection_needs_server(cls, sel),
+            f"got sel={sel_rel} needs_server={selection_needs_server(cls, sel)}",
+        )
+        # STATIC stays out of every rule but self-touch: an engine diff must
+        # not drag raw.qmd in just because the render set grew.
+        check(
+            "static-chapter-not-selected-by-engine-diff",
+            "chapters/raw/raw.qmd" not in sel_rel,
             f"got {sel_rel}",
         )
 
@@ -387,10 +433,21 @@ def _self_test() -> int:
             f"got {sel_rel}",
         )
 
-        _, sel = select(
+        cls, sel = select(
             ["docs/guide/something.md"], chapters_dir=chapters, scripts_dir=scripts, repo_root=root
         )
         check("docs-only-diff-selects-nothing", len(sel) == 0, f"got {sel}")
+        # A diff that moves nothing this book renders must ALSO report the
+        # server capability as not needed -- the flag tracks the SELECTED
+        # set, never the book's mere possession of a needs-server chapter
+        # (a flag that read true on every diff would make the caller build a
+        # server on every PR, which is the cost this scoping exists to
+        # avoid).
+        check(
+            "irrelevant-diff-selects-no-needs-server-chapter-and-flags-false",
+            selection_needs_server(cls, sel) is False,
+            f"got needs_server={selection_needs_server(cls, sel)}",
+        )
 
         # 7. A chapter's own file in the diff is always selected, even a
         #    STATIC one -- the "you touched it, prove it still renders"
@@ -401,19 +458,39 @@ def _self_test() -> int:
         sel_rel = {p.relative_to(root).as_posix() for p in sel}
         check("self-touched-chapter-always-selected", sel_rel == {"chapters/raw/raw.qmd"}, f"got {sel_rel}")
 
-        # 8. A self-touched LIVE_COMPUTE_NEEDS_SERVER chapter must NOT be
-        #    selected — this gate has no server harness, so selecting it
-        #    guarantees a structural red independent of the chapter's own
-        #    correctness (campaign #443: the diff-touched needs-server
-        #    chapter was auto-selected and died on the missing
-        #    `jammi-server` binary). The nightly full render owns it.
-        _, sel = select(
+        # 8. A self-touched LIVE_COMPUTE_NEEDS_SERVER chapter IS selected,
+        #    and the selection reports that it needs a server. Dropping it
+        #    instead is what let a touched needs-server chapter merge having
+        #    executed nowhere: the nightly full render runs the PRE-merge
+        #    base, so it proves the chapter as it was, never as the diff
+        #    leaves it. The server is a lane capability the caller
+        #    provisions off this flag (a CPU `cargo build --release -p
+        #    jammi-server`), paid only on a diff that selects such a
+        #    chapter.
+        cls, sel = select(
             ["chapters/remote/remote.qmd"], chapters_dir=chapters, scripts_dir=scripts, repo_root=root
         )
+        sel_rel = {p.relative_to(root).as_posix() for p in sel}
         check(
-            "self-touched-needs-server-chapter-never-selected",
-            len(sel) == 0,
-            f"got {sel}",
+            "self-touched-needs-server-chapter-is-selected",
+            sel_rel == {"chapters/remote/remote.qmd"},
+            f"got {sel_rel}",
+        )
+        check(
+            "self-touched-needs-server-selection-flags-needs-server",
+            selection_needs_server(cls, sel) is True,
+            f"got needs_server={selection_needs_server(cls, sel)}",
+        )
+        # The flag is a property of the SELECTED set, not of the bucket
+        # table: a selection carrying only plain LIVE_COMPUTE must read
+        # false even though the book contains a needs-server chapter.
+        cls, sel = select(
+            ["chapters/mixed/mixed.qmd"], chapters_dir=chapters, scripts_dir=scripts, repo_root=root
+        )
+        check(
+            "plain-live-compute-selection-flags-no-server",
+            selection_needs_server(cls, sel) is False,
+            f"got needs_server={selection_needs_server(cls, sel)}",
         )
 
     if failures:
@@ -454,6 +531,19 @@ def _cmd_classify() -> int:
     return 0
 
 
+def _cmd_needs_server(changed_paths: list[str]) -> int:
+    """Print exactly `true`/`false`: does the set THIS diff selects need a
+    running `jammi-server`? One machine-readable token on stdout, so a
+    workflow can capture it straight into a step output; the classification
+    table still goes to stderr, never mixed into the answer."""
+    classifications, selected = select(changed_paths)
+    print("# classification", file=sys.stderr)
+    for line in _table_lines(classifications):
+        print(f"#   {line}", file=sys.stderr)
+    print("true" if selection_needs_server(classifications, selected) else "false")
+    return 0
+
+
 def _cmd_select(changed_paths: list[str]) -> int:
     classifications, selected = select(changed_paths)
     print("# classification", file=sys.stderr)
@@ -474,6 +564,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--head", help="head git ref (with --base)")
     ap.add_argument("--classify", action="store_true", help="print the full classification table and exit")
     ap.add_argument("--self-test", action="store_true", help="run the RED-proof self-tests and exit")
+    ap.add_argument(
+        "--needs-server",
+        action="store_true",
+        help="print `true`/`false` (does the selected set need a running jammi-server?) "
+        "instead of the chapter list",
+    )
     args = ap.parse_args(argv)
 
     if args.self_test:
@@ -482,18 +578,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.classify:
         return _cmd_classify()
 
+    run = _cmd_needs_server if args.needs_server else _cmd_select
+
     if args.base or args.head:
         if not (args.base and args.head):
             ap.error("--base and --head must be given together")
         changed = _git_diff_names(args.base, args.head)
-        return _cmd_select(changed)
+        return run(changed)
 
     if args.diff:
         if args.diff == "-":
             changed = sys.stdin.read().splitlines()
         else:
             changed = Path(args.diff).read_text().splitlines()
-        return _cmd_select(changed)
+        return run(changed)
 
     ap.error("one of --diff, --base/--head, --classify, or --self-test is required")
     return 2

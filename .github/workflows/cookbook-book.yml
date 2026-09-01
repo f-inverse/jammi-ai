@@ -11,19 +11,31 @@ name: Cookbook book
 # dispatch it); this job runs on every PR, no dispatch required.
 #
 # Still deliberately NOT a full-book render: `ci/scripts/select_render_chapters.py`
-# classifies every chapter (LIVE_COMPUTE / CACHE_READ / STATIC — see its own
-# docstring) and returns only the O(affected) subset a GIVEN diff could move —
-# today that is exactly one LIVE_COMPUTE chapter
-# (chapters/22-precision/compute-precision.qmd) on an engine-code diff, plus
-# whichever CACHE_READ chapters a touched `build_*_cache.py` script feeds. The
-# full nightly render (every chapter, incl. the grpc://-live-server chapters no
-# server exists for here, + the release-recipe leg) stays in the separate
+# classifies every chapter (LIVE_COMPUTE / LIVE_COMPUTE_NEEDS_SERVER /
+# CACHE_READ / STATIC — see its own docstring) and returns only the O(affected)
+# subset a GIVEN diff could move: the live-compute chapters on an engine-code
+# diff, plus whichever CACHE_READ chapters a touched `build_*_cache.py` script
+# feeds, plus any chapter the diff touches directly. The full nightly render
+# (every chapter + the release-recipe leg) stays in the separate
 # `cookbook-render.yml` — full-book quarto render is not something a PR gate
 # should pay for on every push; the selector is what keeps this gate
 # cost-bounded instead of reverting to "render everything". No skip flag, no
 # continue-on-error on the render step: a flaky chapter under this gate is a
 # chapter bug to fix, not a gate to soften. The engine's own SDK-recipes smoke
 # (cookbook.yml) and it/cookbook.rs are separate and unchanged.
+#
+# A grpc:// chapter needs a running `jammi-server`, and that is a LANE
+# CAPABILITY this job provisions, not a chapter property that excludes it: the
+# selector reports `needs_server` for the set it picked, and the wheel-build
+# step below builds the plain CPU `jammi-server` (the shared
+# `setup-jammi-py` action's own `build-server` input) on exactly that
+# condition, putting `target/release` on PATH for the render the same way
+# `cookbook-render.yml` does. The marginal cost is minutes of `cargo build
+# --release -p jammi-server` against the same sccache this job already warms,
+# and only on a diff that selects such a chapter. Excluding those chapters
+# instead is what let a touched grpc:// chapter merge having executed NOWHERE:
+# the nightly renders the PRE-merge base, so it proves the chapter as it was,
+# never as the diff leaves it.
 #
 # The return half — chapter-coverage accounting (which chapters a merged PR's
 # diff SHOULD have moved, closing the loop the other direction) — is built
@@ -72,15 +84,76 @@ jobs:
         with:
           rustflags: "-C link-arg=-fuse-ld=mold"
 
+      # The selector's own house-guard self-test: RED-proves the misclassification
+      # shapes named in its docstring (a live-compute call in an otherwise
+      # cache-read chapter, a live call in prose-only, a grpc:// chapter
+      # classified needs-server AND still selected, etc.) against synthetic
+      # fixtures — never against the real book, so it keeps proving something
+      # even the day the real book stops containing an edge case. Runs before
+      # the classifier is trusted with a real diff below.
+      - name: Forward-render selector self-test
+        run: python3 ci/scripts/select_render_chapters.py --self-test
+
+      # This MUST run before the selector step below: a bare `git` in a
+      # container `run:` step hits "fatal: detected dubious ownership"
+      # (exit 128) — the checkout is owned by a different user than the
+      # container's git, and the safe.directory `actions/checkout` sets is
+      # not visible here (same trap as ci.yml's build-sha step and
+      # dep-dag.yml's freshness step; CI run 33447230854 died on the
+      # selector's own `git fetch` exactly this way).
+      - name: Mark the checkout safe for git (container UID != checkout UID)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # The forward render gate itself: classify every chapter and print the
+      # subset THIS diff could move (the live-compute chapters on any
+      # engine-code diff, plus CACHE_READ chapters whose build_*_cache.py
+      # producer or committed artifact directory changed, plus any chapter
+      # the diff touches directly). `needs_server` is the LANE CAPABILITY the
+      # selected set asks for; the wheel-build step below reads it. This runs
+      # BEFORE that build precisely so the build can be told whether to
+      # produce a server — never so the render set can be trimmed to whatever
+      # the job already happens to have.
+      - name: Select the chapters this diff must render (forward render gate)
+        id: select
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --quiet origin "${{ github.base_ref }}"
+            base="origin/${{ github.base_ref }}"
+          else
+            before="${{ github.event.before }}"
+            if [ -n "$before" ] && [ "$before" != "0000000000000000000000000000000000000000" ] \
+                && git cat-file -e "$before" 2>/dev/null; then
+              base="$before"
+            else
+              base="HEAD~1"
+            fi
+          fi
+          selected="$(python3 ci/scripts/select_render_chapters.py --base "$base" --head HEAD)"
+          needs_server="$(python3 ci/scripts/select_render_chapters.py --base "$base" --head HEAD --needs-server)"
+          echo "needs_server=${needs_server}" >> "$GITHUB_OUTPUT"
+          {
+            echo "chapters<<RENDER_SET_EOF"
+            echo "$selected"
+            echo "RENDER_SET_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       # The book runs against two lockstep dists — the base client `jammi-ai`
       # (import `jammi`) and the compiled `jammi-ai-native` wheel, built fresh
       # and force-reinstalled (mode: wheel — a fresh wheel, never a copy) so
       # the book runs the engine built from THIS commit. The shared
-      # setup-jammi-py action owns the venv/maturin mechanics.
+      # setup-jammi-py action owns the venv/maturin mechanics — including the
+      # plain CPU `cargo build --release -p jammi-server` behind
+      # `build-server`, which this job asks for on exactly the diffs whose
+      # selected set needs one (a grpc:// chapter). Wiring the existing input
+      # here rather than adding a second build step keeps one place that knows
+      # how this repo builds a server, and costs nothing on the diffs that
+      # pass `false`.
       - name: Build + install the HEAD wheels
         uses: ./.github/actions/setup-jammi-py
         with:
           mode: wheel
+          build-server: ${{ steps.select.outputs.needs_server }}
 
       - name: Install the book (against the HEAD wheel)
         run: |
@@ -127,53 +200,6 @@ jobs:
           . "$GITHUB_WORKSPACE/.venv/bin/activate"
           python scripts/check_citations.py
 
-      # The selector's own house-guard self-test: RED-proves the misclassification
-      # shapes named in its docstring (a live-compute call in an otherwise
-      # cache-read chapter, a live call in prose-only, a grpc://-live-server
-      # chapter correctly excluded from THIS gate, etc.) against synthetic
-      # fixtures — never against the real book, so it keeps proving something
-      # even the day the real book stops containing an edge case. Runs before
-      # the classifier is trusted with a real diff below.
-      - name: Forward-render selector self-test
-        run: python3 ci/scripts/select_render_chapters.py --self-test
-
-      # This MUST run before the selector step below: a bare `git` in a
-      # container `run:` step hits "fatal: detected dubious ownership"
-      # (exit 128) — the checkout is owned by a different user than the
-      # container's git, and the safe.directory `actions/checkout` sets is
-      # not visible here (same trap as ci.yml's build-sha step and
-      # dep-dag.yml's freshness step; CI run 33447230854 died on the
-      # selector's own `git fetch` exactly this way).
-      - name: Mark the checkout safe for git (container UID != checkout UID)
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      # The forward render gate itself: classify every chapter and print the
-      # subset THIS diff could move (LIVE_COMPUTE chapters on any engine-code
-      # diff, plus CACHE_READ chapters whose build_*_cache.py producer or
-      # committed artifact directory changed).
-      - name: Select the chapters this diff must render (forward render gate)
-        id: select
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            git fetch --quiet origin "${{ github.base_ref }}"
-            base="origin/${{ github.base_ref }}"
-          else
-            before="${{ github.event.before }}"
-            if [ -n "$before" ] && [ "$before" != "0000000000000000000000000000000000000000" ] \
-                && git cat-file -e "$before" 2>/dev/null; then
-              base="$before"
-            else
-              base="HEAD~1"
-            fi
-          fi
-          selected="$(python3 ci/scripts/select_render_chapters.py --base "$base" --head HEAD)"
-          {
-            echo "chapters<<RENDER_SET_EOF"
-            echo "$selected"
-            echo "RENDER_SET_EOF"
-          } >> "$GITHUB_OUTPUT"
-
       # Render exactly the selected set with the PR wheel already installed
       # above — the chapter asserts against a frozen golden ARE the check; a
       # nonzero `quarto render` (an assertion failure, an artifact-shape
@@ -188,15 +214,24 @@ jobs:
       # This step pays that render cost once more, plus this job's own
       # already-paid-for cold-start (wheel install, jammi_cookbook import) —
       # low seconds, not minutes. The selector is what keeps this O(affected)
-      # as more chapters/scripts are added, not O(book): a future LIVE_COMPUTE
+      # as more chapters/scripts are added, not O(book): a future live-compute
       # or newly-touched CACHE_READ chapter widens this set, never the whole
       # book at once.
+      #
+      # `target/release` goes on PATH exactly as `cookbook-render.yml` does,
+      # for the grpc:// chapters that shell out to `jammi-server`. The
+      # directory is on PATH unconditionally and holds a server only when the
+      # selector's `needs_server` asked the build step above for one — a
+      # PATH entry is not a capability claim, and making the export itself
+      # conditional would only add a second place that has to agree with the
+      # flag.
       - name: Render this diff's selected chapters (forward render gate)
         if: ${{ steps.select.outputs.chapters != '' }}
         working-directory: cookbook/book
         run: |
           set -euo pipefail
           . "$GITHUB_WORKSPACE/.venv/bin/activate"
+          export PATH="$GITHUB_WORKSPACE/target/release:$PATH"
           while IFS= read -r chapter; do
             [ -z "$chapter" ] && continue
             rel="${chapter#cookbook/book/}"

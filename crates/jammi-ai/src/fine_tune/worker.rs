@@ -2007,9 +2007,23 @@ fn run_fine_tune_blocking(
         } else {
             crate::fine_tune::lora::build_projection_head(hidden_size, &config, &varmap, &vb)?
         };
+        // esc-075: `backbone_dtype` never takes effect on this arm (see
+        // `validate_backbone_precision`'s doc), so there is no encoder to probe
+        // fused-op admission against — the report still names the resolved
+        // device + compiled capabilities, with an empty `ops`/coarse `flash`
+        // (never a fabricated per-op measurement for an arm that never ran one).
+        compute_and_persist_acceleration_report(
+            &catalog,
+            &job_id,
+            &worker_id,
+            attempt,
+            &device,
+            config.backbone_dtype,
+            None,
+        );
         crate::fine_tune::target::TrainingTarget::ProjectionHead { head }
     } else {
-        let (encoder, adapter_cfg) = build_encoder_adapters(
+        let (mut encoder, adapter_cfg) = build_encoder_adapters(
             &base_model,
             &catalog,
             &artifact_store,
@@ -2017,6 +2031,20 @@ fn run_fine_tune_blocking(
             &varmap,
             &device,
         )?;
+        // esc-075: right after `build_encoder_adapters` (which calls
+        // `validate_backbone_precision` and materialises the real, dtype-typed
+        // encoder) and BEFORE the training loop's first step — the earliest
+        // point a per-job admission determination is both possible (the real
+        // encoder exists) and cheap (nothing has trained yet).
+        compute_and_persist_acceleration_report(
+            &catalog,
+            &job_id,
+            &worker_id,
+            attempt,
+            &device,
+            config.backbone_dtype,
+            Some(&mut encoder),
+        );
         crate::fine_tune::target::TrainingTarget::EncoderAdapters(Box::new(
             crate::fine_tune::target::EncoderAdaptersTarget {
                 encoder,
@@ -2099,6 +2127,364 @@ fn validate_backbone_precision(
         ));
     }
     Ok(())
+}
+
+// =============================================================================
+// esc-075: claim-time, per-job acceleration report.
+//
+// A compute precision the public API accepts (`ComputePrecision`) is either
+// accelerated by the fused kernels or it silently runs the eager composition
+// — and, before this, the ONLY signal was a `tracing::warn` deduplicated for
+// the life of the PROCESS (`jammi_kernels::admission::warn_fallback_once`),
+// so a second f16 job read the same silence as a first, accelerated one. This
+// section computes a compact, per-JOB determination — computed from the SAME
+// admission predicates the kernels use, never a parallel re-derivation of
+// them — and persists it on the job's catalog record
+// (`Catalog::record_acceleration_report`) before the training loop's first
+// step, so a status poll mid-training always finds a `"determined"` report.
+//
+// **How "the same predicates" is honoured without a private admission API**:
+// every per-op fused-kernel domain check in `jammi-encoders` is a *private*
+// function requiring real tensors (e.g. `layer_norm.rs`'s
+// `fused_admission_predicate(x, weight)`), so this module cannot call it
+// directly. Instead it runs the SAME real, PUBLIC forward path
+// (`AnyEncoder::forward`) the training loop itself is about to run, over a
+// minimal synthetic batch (token id `0` — valid for any non-empty
+// vocabulary), and reads the outcome back through the SAME public,
+// process-wide dispatch registries `jammi-encoders`/`jammi-kernels` already
+// expose for exactly this "durable job record" consumer (see
+// `jammi_encoders::layer_norm::LN_DISPATCH_COUNTERS`'s own doc: "a durable
+// job record ... uses" `jammi_encoders::ln_dispatch_snapshot`). This never
+// re-derives the dtype/shape/device domain check: it exercises the real one
+// and observes its real effect. A miss's `reason` is read back from
+// `jammi_kernels::admission::fallback_warnings_emitted()` by the SAME `op`
+// key the kernel's own `admit()` call site already uses — reused verbatim,
+// never invented here.
+//
+// This is scoped to the two-arm ops `jammi-encoders` exposes a snapshot
+// reader for and that a plain forward pass (no LoRA backward, no optimizer
+// step) actually exercises: `layer_norm`, `rope`, `softmax`, `geglu`,
+// `attention_block`. LoRA epilogue/backward-time ops
+// (`low_rank_residual_linear`, `cast_scale`, `scaled_cast_add`, `axpy`,
+// `dropout`, `rope_positions`) are not claimed here — an op this probe never
+// exercises is OMITTED from `ops`, never fabricated as a `holds` either way
+// (K-series: ship the honest negative, not a vacuous positive). `flash`
+// degrades to a compiled/device-level fact (`cuda_not_compiled` /
+// `flash_not_compiled` / `device_is_cpu_or_metal_not_cuda`) whenever the
+// cascade admission path cannot even be reached; the cascade's own
+// `admit_cascade` has no `fallback_warnings`-shaped reason channel at all
+// (verified by reading `crates/jammi-kernels/src/admission.rs`), so a
+// reached-but-declined cascade reports the coarser, honestly-labelled
+// `"capability_or_domain_miss"` rather than a fabricated verbatim key that
+// does not exist on any public surface today.
+// =============================================================================
+
+/// The two-arm fused ops probed for the esc-075 acceleration report: `(report
+/// key, the `op` key `jammi_kernels::admission::admit`'s call site for this op
+/// uses)`. The second element is reused VERBATIM to look up this op's miss
+/// reason in `fallback_warnings_emitted()` — never re-typed independently of
+/// the kernel crate that owns it. Sourced by reading (never editing)
+/// `crates/jammi-encoders/src/layer_norm.rs:100` and
+/// `crates/jammi-encoders/src/modernbert.rs:190,204,671,1827`.
+const PROBED_ACCELERATION_OPS: &[(&str, &str)] = &[
+    ("layer_norm", "layer_norm_fused"),
+    ("rope", "rope_fused"),
+    ("softmax", "softmax_last_dim_fused"),
+    ("geglu", "geglu_fused"),
+    ("attention_block", "attention_block_fused"),
+];
+
+/// A snapshot of every dispatch registry [`PROBED_ACCELERATION_OPS`] plus the
+/// `attention_block_flash` cascade read, taken once immediately before and
+/// once immediately after the probe forward pass so a per-job report reads a
+/// DELTA (attributable to this job's own probe call) rather than the
+/// process-lifetime total (which every OTHER job sharing this process also
+/// contributes to).
+#[derive(Clone, Copy)]
+struct AdmissionProbeSnapshot {
+    layer_norm: jammi_kernels::admission::DispatchSnapshot,
+    rope: jammi_kernels::admission::DispatchSnapshot,
+    softmax: jammi_kernels::admission::DispatchSnapshot,
+    geglu: jammi_kernels::admission::DispatchSnapshot,
+    attention_block: jammi_kernels::admission::DispatchSnapshot,
+    attention_block_flash: jammi_kernels::admission::CascadeDispatchSnapshot,
+}
+
+impl AdmissionProbeSnapshot {
+    fn capture() -> Self {
+        Self {
+            layer_norm: jammi_encoders::ln_dispatch_snapshot(),
+            rope: jammi_encoders::rope_dispatch_snapshot(),
+            softmax: jammi_encoders::softmax_dispatch_snapshot(),
+            geglu: jammi_encoders::geglu_dispatch_snapshot(),
+            attention_block: jammi_encoders::attention_block_dispatch_snapshot(),
+            attention_block_flash: jammi_encoders::attention_block_flash_dispatch_snapshot(),
+        }
+    }
+
+    /// The [`jammi_kernels::admission::DispatchSnapshot`] for one of
+    /// [`PROBED_ACCELERATION_OPS`]'s report keys, or `None` for an unknown key
+    /// (never reached — the caller always iterates `PROBED_ACCELERATION_OPS`
+    /// itself).
+    fn two_arm(&self, report_key: &str) -> Option<jammi_kernels::admission::DispatchSnapshot> {
+        match report_key {
+            "layer_norm" => Some(self.layer_norm),
+            "rope" => Some(self.rope),
+            "softmax" => Some(self.softmax),
+            "geglu" => Some(self.geglu),
+            "attention_block" => Some(self.attention_block),
+            _ => None,
+        }
+    }
+}
+
+/// Whether a two-arm op's DELTA between `before` and `after` shows it fired
+/// fused, fired eager, or was not exercised at all: `Some(true)` (fused moved,
+/// eager did not), `Some(false)` (eager moved, fused did not), or `None`
+/// (neither moved — the probe never reached this op — or both moved, an
+/// ambiguous signal this fn never rounds up to a clean positive; family D).
+fn two_arm_holds(
+    before: jammi_kernels::admission::DispatchSnapshot,
+    after: jammi_kernels::admission::DispatchSnapshot,
+) -> Option<bool> {
+    let fused_moved = after.fused > before.fused;
+    let eager_moved = after.eager > before.eager;
+    match (fused_moved, eager_moved) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        _ => None,
+    }
+}
+
+/// The verbatim predicate key `jammi_kernels::admission::admit`'s Fallback-mode
+/// arm recorded for `registry_op_key`'s most recent miss, read from
+/// [`jammi_kernels::admission::fallback_warnings_emitted`] — the SAME
+/// `(op, predicate, message)` triple the kernel itself pushed, never a
+/// re-derived guess. Falls back to a clearly-labelled placeholder only if this
+/// process has genuinely never recorded a warning for this op (should not
+/// happen for a `holds == false` delta, since the SAME `admit()` call that
+/// incremented `eager` also pushes this entry synchronously — see
+/// `admit_inner`/`warn_predicate_failed_once` in
+/// `crates/jammi-kernels/src/admission.rs`).
+fn reason_for_registry_key(registry_op_key: &'static str) -> String {
+    jammi_kernels::admission::fallback_warnings_emitted()
+        .into_iter()
+        .rev()
+        .find(|(op, _, _)| *op == registry_op_key)
+        .map(|(_, predicate, _)| predicate.to_string())
+        .unwrap_or_else(|| "eager_no_fallback_warning_recorded".to_string())
+}
+
+/// The `"flash"` field of the esc-075 report. Checks compiled/device facts
+/// FIRST (each a plain, honestly-named reason no probe is needed for); only
+/// when flash is compiled AND the device is CUDA does it consult the probe's
+/// `attention_block_flash` cascade delta, and even then it can only report
+/// the coarse `"capability_or_domain_miss"` on a decline — `admit_cascade`
+/// has no `fallback_warnings`-shaped reason channel a caller can read a
+/// verbatim predicate key back from (see this section's module doc).
+fn flash_report(
+    device: &candle_core::Device,
+    probe_ok: bool,
+    before: jammi_kernels::admission::CascadeDispatchSnapshot,
+    after: jammi_kernels::admission::CascadeDispatchSnapshot,
+) -> serde_json::Value {
+    if !jammi_kernels::admission::CUDA_COMPILED {
+        return serde_json::json!({"holds": false, "reason": "cuda_not_compiled"});
+    }
+    if !jammi_kernels::admission::FLASH_COMPILED {
+        return serde_json::json!({"holds": false, "reason": "flash_not_compiled"});
+    }
+    if !device.is_cuda() {
+        return serde_json::json!({"holds": false, "reason": "device_is_cpu_or_metal_not_cuda"});
+    }
+    if !probe_ok {
+        return serde_json::json!({"holds": false, "reason": "probe_forward_failed"});
+    }
+    let fused_moved = after.fused > before.fused;
+    let declined_moved = after.declined > before.declined;
+    match (fused_moved, declined_moved) {
+        (true, false) => serde_json::json!({"holds": true, "reason": "domain_ok"}),
+        (false, true) => serde_json::json!({"holds": false, "reason": "capability_or_domain_miss"}),
+        _ => serde_json::json!({"holds": false, "reason": "flash_not_exercised_by_probe"}),
+    }
+}
+
+/// A human-readable label for the resolved device: the CUDA driver's device
+/// name when available (`jammi_kernels::admission::probe_cuda_device_name`),
+/// else a plain `"cuda"`/`"metal"`/`"cpu"` kind — never a raw `Debug` dump
+/// (candle's `Device` debug form is not designed as a durable-artifact
+/// field).
+fn device_report_label(device: &candle_core::Device) -> String {
+    if device.is_cuda() {
+        jammi_kernels::admission::probe_cuda_device_name(device).unwrap_or_else(|| "cuda".into())
+    } else if device.is_metal() {
+        "metal".to_string()
+    } else {
+        "cpu".to_string()
+    }
+}
+
+/// Runs the esc-075 probe forward pass (when `encoder` is `Some`) and builds
+/// the `ops` map + `flash` field from its before/after dispatch-registry
+/// delta. `encoder` is `None` on the projection-head arm (`backbone_dtype`
+/// never takes effect there — see `validate_backbone_precision`'s doc): `ops`
+/// is then empty and `flash` degrades to the compiled/device-level facts
+/// only, never a fabricated per-op measurement for an arm that built no
+/// dtype-typed encoder to probe.
+fn probe_acceleration(
+    device: &candle_core::Device,
+    encoder: Option<&mut jammi_encoders::AnyEncoder>,
+) -> (
+    serde_json::Map<String, serde_json::Value>,
+    serde_json::Value,
+) {
+    let Some(encoder) = encoder else {
+        return (
+            serde_json::Map::new(),
+            flash_report(
+                device,
+                false,
+                jammi_kernels::admission::CascadeDispatchSnapshot::default(),
+                jammi_kernels::admission::CascadeDispatchSnapshot::default(),
+            ),
+        );
+    };
+
+    // Every fused-kernel admission predicate this probe reads is gated on
+    // TRAINING mode (`LayerNorm::forward`'s `(bias.is_none(), training)`
+    // match; `ModernBertAttention`/`RotaryEmbedding`'s `self.training`
+    // branches) — an eval-mode forward never reaches ANY of them, fused or
+    // eager, regardless of dtype (verified by reading
+    // `crates/jammi-encoders/src/layer_norm.rs`'s `forward` doc: "Eval
+    // (`training == false`) NEVER reaches the fused arm"). The training loop
+    // built moments later (`TrainingLoopBuilder::build`) calls
+    // `set_training(true)` unconditionally anyway, so flipping it here first
+    // changes nothing about the run this attempt actually trains.
+    encoder.set_training(true);
+
+    let before = AdmissionProbeSnapshot::capture();
+    // A tiny, arch-agnostic probe batch: token id `0` is valid for any
+    // non-empty vocabulary, so this never depends on the job's actual
+    // tokenizer/vocab size. A probe FAILURE (a malformed batch, an unforeseen
+    // shape constraint on some future encoder family) degrades to an empty
+    // `ops` map — never a propagated error (this function, and its caller,
+    // are infallible by construction: esc-075 requires training to be
+    // unaffected by a report-computation failure).
+    let probe_ok = (|| -> Option<()> {
+        let input_ids = candle_core::Tensor::from_vec(vec![0u32; 4], (1, 4), device).ok()?;
+        let mask = candle_core::Tensor::from_vec(vec![1u32; 4], (1, 4), device).ok()?;
+        encoder.forward(&input_ids, &mask).ok()?;
+        Some(())
+    })()
+    .is_some();
+    let after = AdmissionProbeSnapshot::capture();
+
+    let mut ops = serde_json::Map::new();
+    if probe_ok {
+        for &(report_key, registry_key) in PROBED_ACCELERATION_OPS {
+            let (Some(b), Some(a)) = (before.two_arm(report_key), after.two_arm(report_key)) else {
+                continue;
+            };
+            if let Some(holds) = two_arm_holds(b, a) {
+                let reason = if holds {
+                    "domain_ok".to_string()
+                } else {
+                    reason_for_registry_key(registry_key)
+                };
+                ops.insert(
+                    report_key.to_string(),
+                    serde_json::json!({"holds": holds, "reason": reason}),
+                );
+            }
+        }
+    }
+
+    let flash = flash_report(
+        device,
+        probe_ok,
+        before.attention_block_flash,
+        after.attention_block_flash,
+    );
+    (ops, flash)
+}
+
+/// Builds the esc-075 acceleration-report JSON payload for this attempt. See
+/// this section's module doc for the full design; in short, `ops`/`flash` are
+/// measured by running the real, public forward path over a tiny synthetic
+/// batch and reading the SAME dispatch registries the kernels themselves
+/// maintain — never a re-derivation of their domain predicates.
+fn build_acceleration_report_json(
+    attempt: u32,
+    device: &candle_core::Device,
+    backbone_dtype: jammi_numerics::ComputePrecision,
+    encoder: Option<&mut jammi_encoders::AnyEncoder>,
+) -> String {
+    let (ops, flash) = probe_acceleration(device, encoder);
+    serde_json::json!({
+        "state": "determined",
+        "attempt": attempt,
+        "device": device_report_label(device),
+        "dtype": backbone_dtype.to_string(),
+        "cuda_compiled": jammi_kernels::admission::CUDA_COMPILED,
+        "flash_compiled": jammi_kernels::admission::FLASH_COMPILED,
+        "ops": ops,
+        "flash": flash,
+    })
+    .to_string()
+}
+
+/// Computes and persists this attempt's esc-075 acceleration report. Runs
+/// synchronously inside the blocking training thread
+/// (`run_fine_tune_blocking`), right after the device is resolved and (on the
+/// encoder-adapters arm) right after `validate_backbone_precision` /
+/// `build_encoder_adapters` return — before the training loop's first step,
+/// so a status poll mid-training always finds a `"determined"` report rather
+/// than the submission-time `"pending"` marker for this run's whole
+/// lifetime.
+///
+/// Never fails training: report computation is infallible by construction
+/// (see [`probe_acceleration`]'s doc), and a `false`/`Err` from
+/// [`Catalog::record_acceleration_report`] itself (the lease was lost, or the
+/// catalog write failed) is logged and swallowed here — this attempt's
+/// eventual finalize/fail is governed entirely by the training loop that
+/// follows, unaffected by whether this write landed.
+fn compute_and_persist_acceleration_report(
+    catalog: &Arc<Catalog>,
+    job_id: &str,
+    worker_id: &str,
+    attempt: u32,
+    device: &candle_core::Device,
+    backbone_dtype: jammi_numerics::ComputePrecision,
+    encoder: Option<&mut jammi_encoders::AnyEncoder>,
+) {
+    let report_json = build_acceleration_report_json(attempt, device, backbone_dtype, encoder);
+    match tokio::runtime::Handle::current().block_on(catalog.record_acceleration_report(
+        job_id,
+        worker_id,
+        attempt,
+        &report_json,
+    )) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                job_id = %job_id,
+                worker_id = %worker_id,
+                attempt,
+                "esc-075: record_acceleration_report's lease guard did not match (lease lost or \
+                 stale attempt); continuing training without a persisted acceleration report"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                job_id = %job_id,
+                worker_id = %worker_id,
+                attempt,
+                error = %e,
+                "esc-075: record_acceleration_report failed; continuing training without a \
+                 persisted acceleration report"
+            );
+        }
+    }
 }
 
 /// Construct an encoder-adapters target: load the frozen backbone weights from

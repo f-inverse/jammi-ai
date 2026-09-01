@@ -7,6 +7,7 @@ mod concurrent_writers;
 mod ephemeral;
 mod esc_071_cross_session_visibility;
 mod esc_072_two_pool_writers;
+mod esc_073_foreign_sqlite_library;
 mod eval_per_query;
 mod exact_search;
 mod fine_tune_queue;

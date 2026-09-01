@@ -39,6 +39,14 @@
 //! Both sessions are unscoped (tenant `NULL`), never a tenant-disjoint pair:
 //! disjoint tenants would make the assertion vacuous, which is exactly the hole
 //! `tenant_scope.rs` leaves.
+//!
+//! Companion coverage: the reported lag's ACTUAL topology is not this one. The
+//! python wave's writer was a raw CPython `sqlite3` connection — a second SQLite
+//! *library instance* in the process, not a second engine pool — and the
+//! sequential two-library equivalent of the loop below lives in
+//! `esc_073_foreign_sqlite_library.rs`'s stale-read arm. Read the two together:
+//! this file pins the SUPPORTED two-pool topology, that one pins the
+//! out-of-contract two-library one.
 
 use std::path::Path;
 use std::sync::Arc;

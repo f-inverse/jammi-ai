@@ -167,7 +167,7 @@ use candle_core::cuda_backend::cudarc::driver::{
     CudaSlice, CudaView, CudaViewMut, DevicePtr, DevicePtrMut, DriverError,
 };
 use candle_core::CudaDevice;
-use half::bf16;
+use half::{bf16, f16};
 use thiserror::Error;
 
 use crate::admission::{flash_validated_arches, ComputeCapability};
@@ -208,6 +208,10 @@ pub mod raw {
         pub window_size_right: i32,
         pub softmax_scale: f32,
         pub p_dropout: f32,
+        /// `jammi_flash_dtype` (campaign #443 D2): 0 = bf16, 1 = fp16. MUST
+        /// be the LAST field, matching the header's own append-only
+        /// placement (`flash_api_jammi.h`'s own comment on this field).
+        pub dtype: i32,
     }
 
     /// Mirror of `jammi_flash_varlen_bwd_args`.
@@ -243,6 +247,9 @@ pub mod raw {
         pub p_dropout: f32,
         pub deterministic: i32,
         pub dq_accum_splits: i32,
+        /// See `FwdArgs::dtype`'s doc — same values, same "must be last"
+        /// rule.
+        pub dtype: i32,
     }
 
     unsafe extern "C" {
@@ -261,9 +268,16 @@ pub mod raw {
     }
 }
 
-/// Head dimension the vendored kernels are instantiated for (the only one
-/// compiled: `run_mha_{fwd,bwd}_<bf16, 64, false>`).
+/// Head dimension the vendored kernels are instantiated for (the two
+/// dtypes compiled: `run_mha_{fwd,bwd}_<bf16, 64, false>` and, since
+/// campaign #443 D2, `run_mha_{fwd,bwd}_<fp16, 64, false>`).
 pub const HEAD_DIM: usize = 64;
+
+/// `jammi_flash_dtype` mirror (campaign #443 D2) — `raw::FwdArgs::dtype` /
+/// `raw::BwdArgs::dtype`'s two valid values, selecting which of the two
+/// compiled explicit specialisations `flash_api_jammi.cu` calls.
+const JAMMI_FLASH_DTYPE_BF16: i32 = 0;
+const JAMMI_FLASH_DTYPE_FP16: i32 = 1;
 
 /// Rows of padding per sequence the backward scratch carries
 /// (`flash_api.cpp:1100,1106`: "128 is the max block size on the seqlen_q
@@ -301,6 +315,8 @@ pub enum FlashStatus {
     DqAccumSplits = 12,
     /// A window size below `-1`.
     Window = 13,
+    /// `dtype` is neither `0` (bf16) nor `1` (fp16) — campaign #443 D2.
+    Dtype = 14,
 }
 
 impl FlashStatus {
@@ -321,6 +337,7 @@ impl FlashStatus {
             11 => Self::Abi,
             12 => Self::DqAccumSplits,
             13 => Self::Window,
+            14 => Self::Dtype,
             _ => return None,
         })
     }
@@ -1050,6 +1067,7 @@ pub fn flash_varlen_fwd_into(
         window_size_right,
         softmax_scale: cfg.softmax_scale,
         p_dropout: 0.0,
+        dtype: JAMMI_FLASH_DTYPE_BF16,
     };
     // SAFETY: every pointer comes from a live cudarc view whose element
     // count was just checked against the shape; the guards above keep the
@@ -1198,6 +1216,7 @@ pub fn flash_varlen_bwd_into(
         p_dropout: 0.0,
         deterministic: cfg.deterministic as i32,
         dq_accum_splits: as_i32("dq_accum_splits", splits)?,
+        dtype: JAMMI_FLASH_DTYPE_BF16,
     };
     // SAFETY: as in `flash_varlen_fwd_into`.
     let code = unsafe { raw::jammi_flash_varlen_bwd(&args) };
@@ -1233,6 +1252,237 @@ pub fn flash_varlen_bwd(
         cu,
         num_heads,
         BwdBuffers {
+            qkv: qkv.as_view(),
+            o: o.as_view(),
+            lse: lse.as_view(),
+            d_o: d_o.as_view(),
+            d_qkv: d_qkv.as_view_mut(),
+            softmax_d: scratch.softmax_d.as_view_mut(),
+            dq_accum: scratch.dq_accum.as_view_mut(),
+            dq_accum_splits: scratch.splits,
+        },
+        cfg,
+    )?;
+    Ok(d_qkv)
+}
+
+// ---- fp16 (campaign #443 D2) — monomorphic twins of the bf16 functions
+// above, per this crate's own established idiom for a second dtype at a
+// fixed fusion site (`crates/jammi-kernels/src/cuda/*_f16.rs`'s "separate
+// monomorphic file/functions, duplicated helpers" pattern, applied here to
+// the ONE seam file this crate has for flash rather than a second `.cu`
+// file — there is no per-dtype `.cu` split on the RUST side, only on the
+// vendored TU side). The ONLY difference from each bf16 twin is the
+// element type (`half::f16` vs `half::bf16`) and `dtype:
+// JAMMI_FLASH_DTYPE_FP16` in the `raw::{Fwd,Bwd}Args` literal — every
+// check, every buffer-length derivation, and every `VarlenGeometry`/
+// `CuSeqlens` call is IDENTICAL, since none of that logic is dtype-aware
+// (the C shim's `dtype` field is the only place the two paths diverge).
+// The bf16 functions above are byte-unchanged apart from the new
+// `dtype: JAMMI_FLASH_DTYPE_BF16` field this campaign's struct-widening
+// requires at every call site (see `raw::FwdArgs`/`raw::BwdArgs`'s own
+// doc) — their behaviour is unchanged.
+
+/// [`flash_varlen_fwd_into`]'s fp16 twin (campaign #443 D2).
+pub fn flash_varlen_fwd_into_f16(
+    dev: &CudaDevice,
+    qkv: CudaView<'_, f16>,
+    cu: &CuSeqlens,
+    mut o: CudaViewMut<'_, f16>,
+    mut lse: CudaViewMut<'_, f32>,
+    num_heads: usize,
+    cfg: &VarlenConfig,
+) -> Result<()> {
+    let geom = cu.geometry(num_heads)?;
+    cfg.validate()?;
+    check_len("qkv", qkv.len(), geom.qkv_len())?;
+    check_len("o", o.len(), geom.o_len())?;
+    check_len("lse", lse.len(), geom.lse_len())?;
+    let (window_size_left, window_size_right) = cfg.window_sizes()?;
+    bind(dev)?;
+    check_abi()?;
+    check_arch(dev)?;
+
+    let stream = dev.cuda_stream();
+    let cu_seqlens = cu.as_view();
+    let (qkv_p, _g_qkv) = qkv.device_ptr(&stream);
+    let (cu_p, _g_cu) = cu_seqlens.device_ptr(&stream);
+    let (o_p, _g_o) = o.device_ptr_mut(&stream);
+    let (lse_p, _g_lse) = lse.device_ptr_mut(&stream);
+    let args = raw::FwdArgs {
+        qkv: qkv_p as usize as *const c_void,
+        o: o_p as usize as *mut c_void,
+        softmax_lse: lse_p as usize as *mut f32,
+        cu_seqlens: cu_p as usize as *const i32,
+        stream: stream.cu_stream() as *mut c_void,
+        qkv_len: geom.qkv_len() as i64,
+        o_len: geom.o_len() as i64,
+        softmax_lse_len: geom.lse_len() as i64,
+        cu_seqlens_len: geom.cu_seqlens_len() as i64,
+        struct_size: std::mem::size_of::<raw::FwdArgs>() as i32,
+        total_q: as_i32("total_q", geom.total_q())?,
+        batch: as_i32("batch", geom.batch())?,
+        num_heads: as_i32("num_heads", geom.num_heads())?,
+        head_dim: HEAD_DIM as i32,
+        max_seqlen: as_i32("max_seqlen", geom.max_seqlen())?,
+        window_size_left,
+        window_size_right,
+        softmax_scale: cfg.softmax_scale,
+        p_dropout: 0.0,
+        dtype: JAMMI_FLASH_DTYPE_FP16,
+    };
+    // SAFETY: as in `flash_varlen_fwd_into`.
+    let code = unsafe { raw::jammi_flash_varlen_fwd(&args) };
+    check_status(code)
+}
+
+/// [`flash_varlen_fwd`]'s fp16 twin (campaign #443 D2).
+pub fn flash_varlen_fwd_f16(
+    dev: &CudaDevice,
+    qkv: &CudaSlice<f16>,
+    cu: &CuSeqlens,
+    num_heads: usize,
+    cfg: &VarlenConfig,
+) -> Result<(CudaSlice<f16>, CudaSlice<f32>)> {
+    let geom = cu.geometry(num_heads)?;
+    // SAFETY: as in `flash_varlen_fwd`.
+    let mut o = unsafe { dev.alloc::<f16>(geom.o_len()) }?;
+    let mut lse = unsafe { dev.alloc::<f32>(geom.lse_len()) }?;
+    flash_varlen_fwd_into_f16(
+        dev,
+        qkv.as_view(),
+        cu,
+        o.as_view_mut(),
+        lse.as_view_mut(),
+        num_heads,
+        cfg,
+    )?;
+    Ok((o, lse))
+}
+
+/// [`BwdBuffers`]'s fp16 twin (campaign #443 D2).
+pub struct BwdBuffersF16<'a> {
+    pub qkv: CudaView<'a, f16>,
+    pub o: CudaView<'a, f16>,
+    pub lse: CudaView<'a, f32>,
+    pub d_o: CudaView<'a, f16>,
+    pub d_qkv: CudaViewMut<'a, f16>,
+    pub softmax_d: CudaViewMut<'a, f32>,
+    pub dq_accum: CudaViewMut<'a, f32>,
+    pub dq_accum_splits: usize,
+}
+
+/// [`flash_varlen_bwd_into`]'s fp16 twin (campaign #443 D2).
+pub fn flash_varlen_bwd_into_f16(
+    dev: &CudaDevice,
+    cu: &CuSeqlens,
+    num_heads: usize,
+    bufs: BwdBuffersF16<'_>,
+    cfg: &VarlenConfig,
+) -> Result<()> {
+    let geom = cu.geometry(num_heads)?;
+    cfg.validate()?;
+    let BwdBuffersF16 {
+        qkv,
+        o,
+        lse,
+        d_o,
+        mut d_qkv,
+        mut softmax_d,
+        mut dq_accum,
+        dq_accum_splits: splits,
+    } = bufs;
+    check_len("qkv", qkv.len(), geom.qkv_len())?;
+    check_len("o", o.len(), geom.o_len())?;
+    check_len("lse", lse.len(), geom.lse_len())?;
+    check_len("d_o", d_o.len(), geom.o_len())?;
+    check_len("d_qkv", d_qkv.len(), geom.qkv_len())?;
+    check_len("softmax_d", softmax_d.len(), geom.softmax_d_len())?;
+    let expected_splits = dq_accum_splits(dev, geom.batch(), geom.num_heads(), cfg.deterministic)?;
+    if splits != expected_splits {
+        return Err(FlashError::Geometry(format!(
+            "dq_accum was sized for {splits} split(s) but this device/config uses {expected_splits}"
+        )));
+    }
+    check_len("dq_accum", dq_accum.len(), geom.dq_accum_len(splits))?;
+    let (window_size_left, window_size_right) = cfg.window_sizes()?;
+    bind(dev)?;
+    check_abi()?;
+    check_arch(dev)?;
+
+    let stream = dev.cuda_stream();
+    // See `flash_varlen_bwd_into`'s own comment: `dq_accum` must be
+    // all-zero on entry when `cfg.deterministic`.
+    if cfg.deterministic {
+        stream.memset_zeros(&mut dq_accum)?;
+    }
+    let cu_seqlens = cu.as_view();
+    let (qkv_p, _g_qkv) = qkv.device_ptr(&stream);
+    let (cu_p, _g_cu) = cu_seqlens.device_ptr(&stream);
+    let (o_p, _g_o) = o.device_ptr(&stream);
+    let (lse_p, _g_lse) = lse.device_ptr(&stream);
+    let (do_p, _g_do) = d_o.device_ptr(&stream);
+    let (dqkv_p, _g_dqkv) = d_qkv.device_ptr_mut(&stream);
+    let (sd_p, _g_sd) = softmax_d.device_ptr_mut(&stream);
+    let (dqa_p, _g_dqa) = dq_accum.device_ptr_mut(&stream);
+    let args = raw::BwdArgs {
+        qkv: qkv_p as usize as *const c_void,
+        o: o_p as usize as *const c_void,
+        softmax_lse: lse_p as usize as *const f32,
+        d_o: do_p as usize as *const c_void,
+        d_qkv: dqkv_p as usize as *mut c_void,
+        softmax_d: sd_p as usize as *mut f32,
+        dq_accum: dqa_p as usize as *mut f32,
+        cu_seqlens: cu_p as usize as *const i32,
+        stream: stream.cu_stream() as *mut c_void,
+        qkv_len: geom.qkv_len() as i64,
+        o_len: geom.o_len() as i64,
+        softmax_lse_len: geom.lse_len() as i64,
+        d_o_len: geom.o_len() as i64,
+        d_qkv_len: geom.qkv_len() as i64,
+        softmax_d_len: geom.softmax_d_len() as i64,
+        dq_accum_len: geom.dq_accum_len(splits) as i64,
+        cu_seqlens_len: geom.cu_seqlens_len() as i64,
+        struct_size: std::mem::size_of::<raw::BwdArgs>() as i32,
+        total_q: as_i32("total_q", geom.total_q())?,
+        batch: as_i32("batch", geom.batch())?,
+        num_heads: as_i32("num_heads", geom.num_heads())?,
+        head_dim: HEAD_DIM as i32,
+        max_seqlen: as_i32("max_seqlen", geom.max_seqlen())?,
+        window_size_left,
+        window_size_right,
+        softmax_scale: cfg.softmax_scale,
+        p_dropout: 0.0,
+        deterministic: cfg.deterministic as i32,
+        dq_accum_splits: as_i32("dq_accum_splits", splits)?,
+        dtype: JAMMI_FLASH_DTYPE_FP16,
+    };
+    // SAFETY: as in `flash_varlen_fwd_into`.
+    let code = unsafe { raw::jammi_flash_varlen_bwd(&args) };
+    check_status(code)
+}
+
+/// [`flash_varlen_bwd`]'s fp16 twin (campaign #443 D2).
+#[allow(clippy::too_many_arguments)]
+pub fn flash_varlen_bwd_f16(
+    dev: &CudaDevice,
+    qkv: &CudaSlice<f16>,
+    cu: &CuSeqlens,
+    num_heads: usize,
+    o: &CudaSlice<f16>,
+    lse: &CudaSlice<f32>,
+    d_o: &CudaSlice<f16>,
+    cfg: &VarlenConfig,
+) -> Result<CudaSlice<f16>> {
+    let geom = cu.geometry(num_heads)?;
+    let mut scratch = BwdScratch::alloc(dev, &geom, cfg.deterministic)?;
+    // SAFETY: as in `flash_varlen_bwd`.
+    let mut d_qkv = unsafe { dev.alloc::<f16>(geom.qkv_len()) }?;
+    flash_varlen_bwd_into_f16(
+        dev,
+        cu,
+        num_heads,
+        BwdBuffersF16 {
             qkv: qkv.as_view(),
             o: o.as_view(),
             lse: lse.as_view(),
@@ -1658,21 +1908,31 @@ mod tests {
 
     #[test]
     fn status_codes_round_trip_and_zero_is_ok() {
-        for code in 1..=13 {
+        // campaign #443 D2 adds code 14 (`Dtype`) — the round-trip range
+        // widens from `1..=13` to `1..=14`, and the "unknown code" probe
+        // moves from the now-real `14` to `15`.
+        for code in 1..=14 {
             let s = FlashStatus::from_code(code).expect("known code");
             assert_eq!(s as i32, code);
         }
         assert!(FlashStatus::from_code(0).is_none());
-        assert!(FlashStatus::from_code(14).is_none());
+        assert!(FlashStatus::from_code(15).is_none());
         assert!(FlashStatus::from_code(-1).is_none());
     }
 
     #[test]
     fn args_struct_sizes_match_the_c_header() {
-        // 5 pointers + 4 i64 + 10 × 4-byte = 40 + 32 + 40 = 112;
-        // 9 pointers + 8 i64 + 12 × 4-byte = 72 + 64 + 48 = 184.
-        assert_eq!(std::mem::size_of::<raw::FwdArgs>(), 112);
-        assert_eq!(std::mem::size_of::<raw::BwdArgs>(), 184);
+        // campaign #443 D2 appends one `i32 dtype` field to each struct:
+        // 5 pointers + 4 i64 + 11 × 4-byte = 40 + 32 + 44 = 116, rounded up
+        // to the struct's own 8-byte alignment (from the pointer/i64
+        // fields) = 120 (was 112 pre-D2 — the OLD 10 × 4-byte tally with no
+        // trailing pad, since 40 was already a multiple of 8);
+        // 9 pointers + 8 i64 + 13 × 4-byte = 72 + 64 + 52 = 188, rounded up
+        // to 192 (was 184 pre-D2, same "already aligned" reason). Verified
+        // against a standalone `#[repr(C)]` probe with no candle/cuda
+        // dependency (`size_of` needs no CUDA toolkit) before landing.
+        assert_eq!(std::mem::size_of::<raw::FwdArgs>(), 120);
+        assert_eq!(std::mem::size_of::<raw::BwdArgs>(), 192);
         // The linked library agrees (this is the same check the safe API
         // makes on every call).
         check_abi().unwrap();

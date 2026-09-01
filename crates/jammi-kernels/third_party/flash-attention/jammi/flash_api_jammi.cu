@@ -1,6 +1,7 @@
 /*
  * flash_api_jammi.cu — jammi's torch-free wrapper over the vendored
- * FlashAttention-2 hdim64/bf16/sm80 non-causal kernels. See
+ * FlashAttention-2 hdim64/{bf16,fp16}/sm80 non-causal kernels (campaign
+ * #443 D2 adds the fp16 pair; `args->dtype` selects which). See
  * flash_api_jammi.h for the ABI and the layout it serves.
  *
  * Every `params.*` assignment below cites the upstream line in
@@ -14,6 +15,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
 
 #include <cuda_runtime.h>
 #include <cutlass/numeric_types.h>
@@ -22,14 +24,19 @@
 #include "flash.h"
 
 namespace FLASH_NAMESPACE {
-// The two explicit specialisations defined in
-// flash_{fwd,bwd}_hdim64_bf16_sm80.cu. Declared here so the calls below
-// bind to those definitions rather than implicitly instantiating the
-// (definition-less) primary templates from flash.h:189-192.
+// The four explicit specialisations defined in
+// flash_{fwd,bwd}_hdim64_{bf16,fp16}_sm80.cu (campaign #443 D2 adds the
+// fp16 pair). Declared here so the calls below bind to those definitions
+// rather than implicitly instantiating the (definition-less) primary
+// templates from flash.h:189-192.
 template <>
 void run_mha_fwd_<cutlass::bfloat16_t, 64, false>(Flash_fwd_params &params, cudaStream_t stream);
 template <>
 void run_mha_bwd_<cutlass::bfloat16_t, 64, false>(Flash_bwd_params &params, cudaStream_t stream);
+template <>
+void run_mha_fwd_<cutlass::half_t, 64, false>(Flash_fwd_params &params, cudaStream_t stream);
+template <>
+void run_mha_bwd_<cutlass::half_t, 64, false>(Flash_bwd_params &params, cudaStream_t stream);
 }  // namespace FLASH_NAMESPACE
 
 namespace {
@@ -148,6 +155,14 @@ int32_t check_common(int32_t total_q, int32_t batch, int32_t num_heads, int32_t 
     return JAMMI_FLASH_OK;
 }
 
+// campaign #443 D2: `dtype` must be one of the two compiled
+// specialisations — anything else is refused loudly rather than silently
+// treated as bf16 (family D: a caller passing an out-of-range enum value
+// gets a typed error naming the field, never a default).
+bool dtype_is_valid(int32_t dtype) {
+    return dtype == JAMMI_FLASH_DTYPE_BF16 || dtype == JAMMI_FLASH_DTYPE_FP16;
+}
+
 int32_t check_device() {
     int device = 0, cc_major = 0;
     int32_t st = query_device(&device, nullptr, &cc_major);
@@ -157,8 +172,30 @@ int32_t check_device() {
     return JAMMI_FLASH_OK;
 }
 
+// Maps `jammi_flash_dtype` to the CUTLASS element type the compiled kernel
+// specialisations expect. `T` selects BOTH the pointer reinterpretation
+// below (safe: `cutlass::bfloat16_t` and `cutlass::half_t` are both
+// 2-byte types, so the pointer ARITHMETIC — `qkv_t + hd`, etc. — is
+// identical regardless of which 16-bit type is selected; only the
+// element's BIT INTERPRETATION differs, which is exactly what `params.
+// is_bf16` and the caller's own choice of `run_mha_{fwd,bwd}_<T, ...>`
+// downstream communicate to the kernel) and `params.is_bf16` (flash_api.
+// cpp:58 / :198, read by the online-softmax kernel to pick its own
+// internal rounding — campaign #443 D2's ENTIRE fp16 addition is this one
+// compile-time switch plus the two new TUs; no other line in this
+// function changes per dtype).
+template <typename T>
+constexpr bool kIsBf16 = std::is_same<T, cutlass::bfloat16_t>::value;
+
 // set_params_fprop, flash_api.cpp:26-159, for the packed varlen layout.
-// `window_size_*` must already be normalised by check_common.
+// `window_size_*` must already be normalised by check_common. `T` is
+// `cutlass::bfloat16_t` or `cutlass::half_t` (campaign #443 D2) — the
+// SAME function body upstream's own `set_params_fprop` runs for both
+// dtypes (upstream takes an `at::ScalarType` at runtime and reads
+// `q.dtype() == torch::kBFloat16`; this templated form picks the SAME
+// branch at compile time, once per instantiation, rather than carrying a
+// runtime branch through a function this crate calls twice per request).
+template <typename T>
 void fill_fprop(FLASH_NAMESPACE::Flash_fwd_params &params, const void *qkv, void *o,
                 float *softmax_lse, const int32_t *cu_seqlens, int32_t total_q, int32_t batch,
                 int32_t num_heads, int32_t max_seqlen, float softmax_scale,
@@ -173,15 +210,15 @@ void fill_fprop(FLASH_NAMESPACE::Flash_fwd_params &params, const void *qkv, void
     params = {};
 
     // flash_api.cpp:58.
-    params.is_bf16 = true;
+    params.is_bf16 = kIsBf16<T>;
 
     // flash_api.cpp:61-63 with the packed layout: q/k/v are the three
     // [H, D] slabs of each [3, H, D] row.
     const index_t hd = index_t(num_heads) * kHeadDim;
-    const cutlass::bfloat16_t *qkv_t = static_cast<const cutlass::bfloat16_t *>(qkv);
-    params.q_ptr = const_cast<cutlass::bfloat16_t *>(qkv_t);
-    params.k_ptr = const_cast<cutlass::bfloat16_t *>(qkv_t + hd);
-    params.v_ptr = const_cast<cutlass::bfloat16_t *>(qkv_t + 2 * hd);
+    const T *qkv_t = static_cast<const T *>(qkv);
+    params.q_ptr = const_cast<T *>(qkv_t);
+    params.k_ptr = const_cast<T *>(qkv_t + hd);
+    params.v_ptr = const_cast<T *>(qkv_t + 2 * hd);
     // flash_api.cpp:64-70 "All stride are in elements": stride(-3) of a
     // [total_q, 3, H, D] view narrowed on dim 1 is 3*H*D; stride(-2) is D.
     params.q_row_stride = 3 * hd;
@@ -261,6 +298,83 @@ void fill_fprop(FLASH_NAMESPACE::Flash_fwd_params &params, const void *qkv, void
     params.rng_state = rng_state_scratch();
 }
 
+// The dtype-dependent tail of `jammi_flash_varlen_bwd` (campaign #443 D2):
+// `set_params_dgrad`, flash_api.cpp:161-241, continued past `fill_fprop`'s
+// own `set_params_fprop` prefix. Templated on `T` for the SAME reason
+// `fill_fprop` is — `dq_ptr`/`dk_ptr`/`dv_ptr`'s pointer arithmetic is
+// identical for `cutlass::bfloat16_t`/`cutlass::half_t` (both 2-byte
+// types); only the element's bit interpretation (via `T`) and the final
+// `run_mha_bwd_<T, 64, false>` specialisation differ. All the shared,
+// dtype-INDEPENDENT validation (`check_common`, buffer-length checks,
+// `dq_accum_splits`) stays in the caller, `jammi_flash_varlen_bwd`, run
+// exactly once regardless of `a->dtype`.
+template <typename T>
+int32_t run_bwd_for_dtype(const jammi_flash_varlen_bwd_args *a, int32_t window_size_left,
+                          int32_t window_size_right, bool deterministic, int64_t rows_padded) {
+    using index_t = FLASH_NAMESPACE::Qkv_params::index_t;
+    FLASH_NAMESPACE::Flash_bwd_params params;
+    // set_params_dgrad, flash_api.cpp:161-241, begins with set_params_fprop
+    // (flash_api.cpp:196-210) — same arguments as the forward, o = the
+    // forward's output (flash_api.cpp:1144).
+    fill_fprop<T>(params, a->qkv, const_cast<void *>(a->o), const_cast<float *>(a->softmax_lse),
+                 a->cu_seqlens, a->total_q, a->batch, a->num_heads, a->max_seqlen, a->softmax_scale,
+                 window_size_left, window_size_right);
+    // the rng_state scratch allocation failed — the backward kernel
+    // dereferences `params.rng_state[0]`/`[1]` unconditionally
+    // (`flash_bwd_kernel.h:446`), so a NULL here would be a null pointer
+    // dereference in device code, not a clean refusal.
+    if (params.rng_state == nullptr) return JAMMI_FLASH_ERR_CUDA;
+
+    // flash_api.cpp:213-215: d_o is contiguous [total_q, H, D].
+    params.do_ptr = const_cast<void *>(a->d_o);
+    params.do_row_stride = index_t(a->num_heads) * kHeadDim;
+    params.do_head_stride = kHeadDim;
+    // flash_api.cpp:216-224 with dq/dk/dv = the three slabs of the packed
+    // d_qkv (upstream's qkvpacked path hands `dqkv[:, 0/1/2]` views in;
+    // their stride(-3) is 3*H*D and stride(-2) is D).
+    T *dqkv_t = static_cast<T *>(a->d_qkv);
+    params.dq_ptr = dqkv_t;
+    params.dk_ptr = dqkv_t + index_t(a->num_heads) * kHeadDim;
+    params.dv_ptr = dqkv_t + 2 * index_t(a->num_heads) * kHeadDim;
+    params.dq_row_stride = 3 * index_t(a->num_heads) * kHeadDim;
+    params.dk_row_stride = 3 * index_t(a->num_heads) * kHeadDim;
+    params.dv_row_stride = 3 * index_t(a->num_heads) * kHeadDim;
+    params.dq_head_stride = kHeadDim;
+    params.dk_head_stride = kHeadDim;
+    params.dv_head_stride = kHeadDim;
+    // flash_api.cpp:226-231: *_batch_stride are unused with cu_seqlens
+    // (left zero by `params = {}`).
+
+    // flash_api.cpp:233-235 with mha_varlen_bwd's arguments
+    // (flash_api.cpp:1148-1150): dq_accum set (loop == true), dk/dv accum NULL.
+    params.dq_accum_ptr = a->dq_accum;
+    params.dk_accum_ptr = nullptr;
+    params.dv_accum_ptr = nullptr;
+    // flash_api.cpp:238 / :1152.
+    params.dsoftmax_sum = a->softmax_d;
+    // flash_api.cpp:240 / :1158.
+    params.deterministic = deterministic;
+    // flash_api.cpp:1160: `!deterministic ? 0 : dq_accum.stride(0)` of the
+    // [nsplits, total_q + 128*batch, num_heads, head_size_rounded] tensor.
+    params.dq_accum_split_stride =
+        !deterministic ? 0 : index_t(rows_padded) * index_t(a->num_heads) * kHeadDimRounded;
+    // flash_api.cpp:1161.
+    params.total_q = a->total_q;
+    // flash_api.cpp:1171-1180: rng_state / philox_args only matter under
+    // dropout (compiled out); both stay NULL/zero from `params = {}`.
+
+    if (params.num_splits > 1) return JAMMI_FLASH_ERR_SPLIT_KERNEL;
+
+    (void)cudaGetLastError();
+    // flash_api.cpp:1163,1185 `run_mha_bwd(params, stream)` →
+    // flash_api.cpp:761 `run_mha_bwd_<elem_type, kHeadDim, Is_causal>` —
+    // `elem_type` selected by `a->dtype` at the call site below (campaign
+    // #443 D2; was hardcoded `cutlass::bfloat16_t` before this campaign).
+    FLASH_NAMESPACE::run_mha_bwd_<T, 64, false>(params, static_cast<cudaStream_t>(a->stream));
+    if (cudaGetLastError() != cudaSuccess) return JAMMI_FLASH_ERR_CUDA;
+    return JAMMI_FLASH_OK;
+}
+
 }  // namespace
 
 extern "C" {
@@ -281,6 +395,7 @@ const char *jammi_flash_strerror(int32_t status) {
         case JAMMI_FLASH_ERR_ABI: return "args struct size mismatch between the Rust mirror and flash_api_jammi.h";
         case JAMMI_FLASH_ERR_DQ_ACCUM_SPLITS: return "dq_accum_splits differs from the split count the backward kernel uses on this device";
         case JAMMI_FLASH_ERR_WINDOW: return "window_size_left/right must be -1 (unbounded) or >= 0";
+        case JAMMI_FLASH_ERR_DTYPE: return "dtype must be 0 (bf16) or 1 (fp16)";
         default: return "unknown jammi_flash status";
     }
 }
@@ -310,6 +425,7 @@ int32_t jammi_flash_varlen_fwd(const jammi_flash_varlen_fwd_args *a) {
     if (a->qkv == nullptr || a->o == nullptr || a->softmax_lse == nullptr || a->cu_seqlens == nullptr) {
         return JAMMI_FLASH_ERR_NULL_POINTER;
     }
+    if (!dtype_is_valid(a->dtype)) return JAMMI_FLASH_ERR_DTYPE;
     int32_t window_size_left = a->window_size_left;
     int32_t window_size_right = a->window_size_right;
     int32_t st = check_common(a->total_q, a->batch, a->num_heads, a->head_dim, a->max_seqlen,
@@ -326,24 +442,34 @@ int32_t jammi_flash_varlen_fwd(const jammi_flash_varlen_fwd_args *a) {
     if (st != JAMMI_FLASH_OK) return st;
 
     FLASH_NAMESPACE::Flash_fwd_params params;
-    fill_fprop(params, a->qkv, a->o, a->softmax_lse, a->cu_seqlens, a->total_q, a->batch,
-               a->num_heads, a->max_seqlen, a->softmax_scale, window_size_left, window_size_right);
-    // the rng_state scratch allocation failed.
-    if (params.rng_state == nullptr) return JAMMI_FLASH_ERR_CUDA;
-    // The recompute-soundness invariant: the split-KV forward
-    // (flash_api.cpp:247-251, `num_splits > 1 || force_split_kernel`) is
-    // never selected. `params = {}` made num_splits 0; assert it anyway so
-    // a future edit that sets it cannot pass silently — and the split
-    // kernel's TU is not compiled into this library at all.
-    if (params.num_splits > 1) return JAMMI_FLASH_ERR_SPLIT_KERNEL;
-
     // Clear any stale (non-sticky) error so the post-launch check below
     // reports THIS launch, not an earlier caller's.
     (void)cudaGetLastError();
     // flash_api.cpp:738-739 `run_mha_fwd(params, stream, /*force_split_kernel=*/paged_KV=false)`
-    // → flash_api.cpp:248 `run_mha_fwd_<elem_type, kHeadDim, Is_causal>` with
-    // <bf16, 64, false>.
-    FLASH_NAMESPACE::run_mha_fwd_<cutlass::bfloat16_t, 64, false>(params, static_cast<cudaStream_t>(a->stream));
+    // → flash_api.cpp:248 `run_mha_fwd_<elem_type, kHeadDim, Is_causal>` —
+    // `elem_type` selected by `a->dtype` (campaign #443 D2; was hardcoded
+    // `cutlass::bfloat16_t` before this campaign).
+    if (a->dtype == JAMMI_FLASH_DTYPE_FP16) {
+        fill_fprop<cutlass::half_t>(params, a->qkv, a->o, a->softmax_lse, a->cu_seqlens, a->total_q,
+                                    a->batch, a->num_heads, a->max_seqlen, a->softmax_scale,
+                                    window_size_left, window_size_right);
+        if (params.rng_state == nullptr) return JAMMI_FLASH_ERR_CUDA;
+        if (params.num_splits > 1) return JAMMI_FLASH_ERR_SPLIT_KERNEL;
+        FLASH_NAMESPACE::run_mha_fwd_<cutlass::half_t, 64, false>(params, static_cast<cudaStream_t>(a->stream));
+    } else {
+        fill_fprop<cutlass::bfloat16_t>(params, a->qkv, a->o, a->softmax_lse, a->cu_seqlens, a->total_q,
+                                        a->batch, a->num_heads, a->max_seqlen, a->softmax_scale,
+                                        window_size_left, window_size_right);
+        // the rng_state scratch allocation failed.
+        if (params.rng_state == nullptr) return JAMMI_FLASH_ERR_CUDA;
+        // The recompute-soundness invariant: the split-KV forward
+        // (flash_api.cpp:247-251, `num_splits > 1 || force_split_kernel`) is
+        // never selected. `params = {}` made num_splits 0; assert it anyway
+        // so a future edit that sets it cannot pass silently — and the
+        // split kernel's TU is not compiled into this library at all.
+        if (params.num_splits > 1) return JAMMI_FLASH_ERR_SPLIT_KERNEL;
+        FLASH_NAMESPACE::run_mha_fwd_<cutlass::bfloat16_t, 64, false>(params, static_cast<cudaStream_t>(a->stream));
+    }
     if (cudaGetLastError() != cudaSuccess) return JAMMI_FLASH_ERR_CUDA;
     return JAMMI_FLASH_OK;
 }
@@ -356,6 +482,7 @@ int32_t jammi_flash_varlen_bwd(const jammi_flash_varlen_bwd_args *a) {
         a->cu_seqlens == nullptr) {
         return JAMMI_FLASH_ERR_NULL_POINTER;
     }
+    if (!dtype_is_valid(a->dtype)) return JAMMI_FLASH_ERR_DTYPE;
     int32_t window_size_left = a->window_size_left;
     int32_t window_size_right = a->window_size_right;
     int32_t st = check_common(a->total_q, a->batch, a->num_heads, a->head_dim, a->max_seqlen,
@@ -386,67 +513,15 @@ int32_t jammi_flash_varlen_bwd(const jammi_flash_varlen_bwd_args *a) {
     st = check_device();
     if (st != JAMMI_FLASH_OK) return st;
 
-    using index_t = FLASH_NAMESPACE::Qkv_params::index_t;
-    FLASH_NAMESPACE::Flash_bwd_params params;
-    // set_params_dgrad, flash_api.cpp:161-241, begins with set_params_fprop
-    // (flash_api.cpp:196-210) — same arguments as the forward, o = the
-    // forward's output (flash_api.cpp:1144).
-    fill_fprop(params, a->qkv, const_cast<void *>(a->o), const_cast<float *>(a->softmax_lse),
-               a->cu_seqlens, a->total_q, a->batch, a->num_heads, a->max_seqlen, a->softmax_scale,
-               window_size_left, window_size_right);
-    // the rng_state scratch allocation failed — the backward kernel
-    // dereferences `params.rng_state[0]`/`[1]` unconditionally
-    // (`flash_bwd_kernel.h:446`), so a NULL here would be a null pointer
-    // dereference in device code, not a clean refusal.
-    if (params.rng_state == nullptr) return JAMMI_FLASH_ERR_CUDA;
-
-    // flash_api.cpp:213-215: d_o is contiguous [total_q, H, D].
-    params.do_ptr = const_cast<void *>(a->d_o);
-    params.do_row_stride = index_t(a->num_heads) * kHeadDim;
-    params.do_head_stride = kHeadDim;
-    // flash_api.cpp:216-224 with dq/dk/dv = the three slabs of the packed
-    // d_qkv (upstream's qkvpacked path hands `dqkv[:, 0/1/2]` views in;
-    // their stride(-3) is 3*H*D and stride(-2) is D).
-    cutlass::bfloat16_t *dqkv_t = static_cast<cutlass::bfloat16_t *>(a->d_qkv);
-    params.dq_ptr = dqkv_t;
-    params.dk_ptr = dqkv_t + index_t(a->num_heads) * kHeadDim;
-    params.dv_ptr = dqkv_t + 2 * index_t(a->num_heads) * kHeadDim;
-    params.dq_row_stride = 3 * index_t(a->num_heads) * kHeadDim;
-    params.dk_row_stride = 3 * index_t(a->num_heads) * kHeadDim;
-    params.dv_row_stride = 3 * index_t(a->num_heads) * kHeadDim;
-    params.dq_head_stride = kHeadDim;
-    params.dk_head_stride = kHeadDim;
-    params.dv_head_stride = kHeadDim;
-    // flash_api.cpp:226-231: *_batch_stride are unused with cu_seqlens
-    // (left zero by `params = {}`).
-
-    // flash_api.cpp:233-235 with mha_varlen_bwd's arguments
-    // (flash_api.cpp:1148-1150): dq_accum set (loop == true), dk/dv accum NULL.
-    params.dq_accum_ptr = a->dq_accum;
-    params.dk_accum_ptr = nullptr;
-    params.dv_accum_ptr = nullptr;
-    // flash_api.cpp:238 / :1152.
-    params.dsoftmax_sum = a->softmax_d;
-    // flash_api.cpp:240 / :1158.
-    params.deterministic = deterministic != 0;
-    // flash_api.cpp:1160: `!deterministic ? 0 : dq_accum.stride(0)` of the
-    // [nsplits, total_q + 128*batch, num_heads, head_size_rounded] tensor.
-    params.dq_accum_split_stride =
-        !deterministic ? 0 : index_t(rows_padded) * index_t(a->num_heads) * kHeadDimRounded;
-    // flash_api.cpp:1161.
-    params.total_q = a->total_q;
-    // flash_api.cpp:1171-1180: rng_state / philox_args only matter under
-    // dropout (compiled out); both stay NULL/zero from `params = {}`.
-
-    if (params.num_splits > 1) return JAMMI_FLASH_ERR_SPLIT_KERNEL;
-
-    (void)cudaGetLastError();
-    // flash_api.cpp:1163,1185 `run_mha_bwd(params, stream)` →
-    // flash_api.cpp:761 `run_mha_bwd_<elem_type, kHeadDim, Is_causal>` with
-    // <bf16, 64, false>.
-    FLASH_NAMESPACE::run_mha_bwd_<cutlass::bfloat16_t, 64, false>(params, static_cast<cudaStream_t>(a->stream));
-    if (cudaGetLastError() != cudaSuccess) return JAMMI_FLASH_ERR_CUDA;
-    return JAMMI_FLASH_OK;
+    // The dtype-dependent tail lives in `run_bwd_for_dtype<T>` (campaign
+    // #443 D2) — every check above this line is dtype-independent and
+    // therefore runs exactly once regardless of `a->dtype`.
+    if (a->dtype == JAMMI_FLASH_DTYPE_FP16) {
+        return run_bwd_for_dtype<cutlass::half_t>(a, window_size_left, window_size_right,
+                                                  deterministic != 0, rows_padded);
+    }
+    return run_bwd_for_dtype<cutlass::bfloat16_t>(a, window_size_left, window_size_right,
+                                                  deterministic != 0, rows_padded);
 }
 
 }  // extern "C"

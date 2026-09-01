@@ -110,12 +110,18 @@
 //! ## Domain (family D)
 //!
 //! `qkv`: rank 5 `[batch, seq, 3, heads, head_dim]`, contiguous, dtype
-//! `F32` (CPU and CUDA) or `BF16` (CUDA only — candle-core 0.11's CPU
-//! backend has no `BF16` `MatMul` impl, the SAME pre-existing limitation
-//! `LowRankResidualLinear`'s module doc discloses; this op's CPU domain
-//! therefore accepts `F32` only, refusing `BF16` with a typed
+//! `F32` (CPU and CUDA) or `BF16`/`F16` (CUDA only — candle-core 0.11's CPU
+//! backend has no `BF16`/`F16` `MatMul` impl, the SAME pre-existing
+//! limitation `LowRankResidualLinear`'s module doc discloses; this op's CPU
+//! domain therefore accepts `F32` only, refusing `BF16`/`F16` with a typed
 //! `UnsupportedDTypeForOp` rather than reaching a confusing failure three
-//! calls deep inside a matmul). `head_dim` must be exactly `HEAD_DIM`.
+//! calls deep inside a matmul). `F16` (campaign #443 D1) is admitted on
+//! CUDA on exactly the same basis as `BF16`: this op has no `.cu` kernel of
+//! its own (`crate::cuda::attention_block`'s module doc), so its dtype
+//! domain is the INTERSECTION of what candle's own generic storage ops
+//! support and what its two composed sub-kernels ([`RopeFused`],
+//! [`super::SoftmaxLastDimFused`]) dispatch for — both now compile real
+//! `F16` arms (campaign #443 W2b). `head_dim` must be exactly `HEAD_DIM`.
 //! `seq` must be `<= MAX_SEQ`. `rope_pack` (when `rope == true`): rank
 //! 5 `[2, 1, 1, seq_max, head_dim]`, `seq_max >= seq`, contiguous, same
 //! dtype as `qkv`. `mask`: rank 4 `[batch|1, 1, seq|1, seq]`, contiguous,
@@ -2174,6 +2180,34 @@ mod tests {
         let got = fused(&qkv, &rope_pack, &mask, op).unwrap();
         assert_eq!(got.dims(), &[b, s, 0]);
         assert_eq!(got.elem_count(), 0);
+    }
+
+    /// Family D boundary oracle (campaign #443 D1): the CPU domain is
+    /// `F32`-only, unaffected by this campaign's CUDA-side `F16` widening
+    /// (`crate::cuda::attention_block`'s dtype check) — candle-core 0.11's
+    /// CPU backend has no `BF16`/`F16` `MatMul` impl (module doc's "Domain"
+    /// section). Both 16-bit dtypes must be refused with a TYPED
+    /// `UnsupportedDTypeForOp` naming the OFFENDING dtype, never a silent
+    /// upcast and never a generic error three calls deep inside a matmul —
+    /// pinned on BOTH dtypes so a future CPU `BF16`-only carve-out could not
+    /// silently leave `F16` refused via some OTHER, undocumented path.
+    #[test]
+    fn cpu_fwd_refuses_both_16_bit_dtypes_with_a_typed_error_naming_the_dtype() {
+        let device = Device::Cpu;
+        let (b, s, h, d) = (1usize, 3usize, 2usize, HEAD_DIM);
+        for dtype in [DType::BF16, DType::F16] {
+            let qkv = Tensor::zeros((b, s, 3, h, d), dtype, &device).unwrap();
+            let mask = Tensor::zeros((1, 1, 1, s), dtype, &device).unwrap();
+            let (cos, sin) = rope_tables(s, d, &device);
+            let rope_pack = pack_rope(&cos, &sin).unwrap().to_dtype(dtype).unwrap();
+            let op = AttentionBlockFused::new(0.125, FullyMaskedPolicy::Propagate, true).unwrap();
+            let err = fused(&qkv, &rope_pack, &mask, op)
+                .expect_err(&format!("{dtype:?} must be refused on the CPU arm"));
+            assert!(
+                matches!(err, Error::UnsupportedDTypeForOp(got, _) if got == dtype),
+                "{dtype:?}: expected UnsupportedDTypeForOp naming {dtype:?}, got {err:?}"
+            );
+        }
     }
 
     #[test]

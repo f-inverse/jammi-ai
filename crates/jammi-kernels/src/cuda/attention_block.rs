@@ -66,6 +66,23 @@ fn alloc_scratch(device: &CudaDevice, dtype: DType, n: usize) -> Result<CudaStor
             let s = unsafe { device.alloc::<half::bf16>(n) }?;
             Ok(CudaStorage::wrap_cuda_slice(s, device.clone()))
         }
+        // campaign #443 D1: `F16` is sound here for the SAME reason `BF16`
+        // is — this file allocates no fused `.cu` kernel of its own (module
+        // doc's opening line); every compute step is either candle's own
+        // generic storage op (`copy_strided_src`/`matmul`/`affine`, all
+        // dtype-generic on the CUDA backend) or a direct call into
+        // `RopeFused`/`SoftmaxLastDimFused`'s OWN `cuda_fwd`, both of which
+        // now carry real `F16` dispatch arms (`crate::cuda::rope`'s
+        // `DType::F16` arm, `rope_f16.cu`; `crate::cuda::softmax`'s
+        // `(DType::F16, DType::F16)` arm, `softmax_f16.cu` — campaign #443
+        // W2b). Widening this scratch allocator is what makes the dtype
+        // check below able to admit `F16` at all: without an `F16` arm
+        // here, `gather_bhsd`'s `alloc_scratch` call would itself refuse
+        // before the RoPE/softmax calls are ever reached.
+        DType::F16 => {
+            let s = unsafe { device.alloc::<half::f16>(n) }?;
+            Ok(CudaStorage::wrap_cuda_slice(s, device.clone()))
+        }
         dtype => Err(Error::UnsupportedDTypeForOp(dtype, "attention_block_fused")),
     }
 }
@@ -158,7 +175,10 @@ pub(crate) fn cuda_fwd(
             op: name,
         });
     }
-    if !matches!(s1.dtype(), DType::F32 | DType::BF16) {
+    // campaign #443 D1: `F16` joins `BF16` here — see `alloc_scratch`'s own
+    // doc for why this composition's domain follows its callees' compiled
+    // dispatch arms, not a kernel this file owns.
+    if !matches!(s1.dtype(), DType::F32 | DType::BF16 | DType::F16) {
         return Err(Error::UnsupportedDTypeForOp(s1.dtype(), name));
     }
     if op.rope {

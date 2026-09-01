@@ -128,6 +128,122 @@ def test_embedded_fine_tune_metrics_surfaces_val_loss_run_summary(tmp_path: Path
         assert math.isfinite(row["loss"])
 
 
+def test_embedded_fine_tune_acceleration_report_three_states(tmp_path: Path) -> None:
+    """`TrainingJob.acceleration_report()` (campaign #443): the catalog's
+    `training_jobs.acceleration_report` column, decoded the same way
+    `metrics()` decodes its column (issue #441) but preserving THIS column's
+    own two-state contract (`TrainingJobRecord::acceleration_report`'s doc,
+    migration 026) rather than `metrics()`'s "absent means `{}`" default —
+    proven against a REAL embedded engine + catalog on all three states:
+
+      * the submission-time `{"state": "pending"}` marker
+        `Catalog::create_training_job` stamps before any claimant has
+        recorded a determination.
+      * the claiming worker's `{"state": "determined", ...}` payload, from a
+        REAL run that actually claimed the job and probed its device/dtype/
+        kernel-admission (esc-075) — not a hand-built stand-in, so this
+        exercises the real producer path, not just the read side.
+      * SQL `NULL` (a row this code never touched) -> Python `None`, never
+        silently coerced to `{}` or read as any particular acceleration
+        state.
+
+    Reuses ONE real fine-tune run for all three reads with the SAME
+    close-before-inject discipline `test_conformance.py`'s
+    `test_remote_and_embedded_training_job_metrics_agree_on_all_three_states`
+    documents (esc-073): a raw `sqlite3` seed write never overlaps a live
+    engine connection on the same WAL file, which otherwise reproduces a hard
+    interpreter crash. `jammi.EmbeddedBackend` has no `training_job`/`close`
+    convenience (asymmetric with the remote client — see that test's
+    docstring), so this drives the compiled `jammi_native` primitives
+    directly, like it does.
+    """
+    import sqlite3
+
+    import jammi_native
+    from jammi._assembly import build_fine_tune_request
+
+    pending_marker = '{"state":"pending"}'
+
+    catalog_db = tmp_path / "catalog.db"
+
+    def _set_acceleration_report(job_id: str, value) -> None:
+        conn = sqlite3.connect(str(catalog_db))
+        try:
+            conn.execute(
+                "UPDATE training_jobs SET acceleration_report = ? WHERE job_id = ?",
+                (value, job_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    # One real job, driven to completion directly against the compiled
+    # `_NativeDatabase` — the same request assembly `EmbeddedBackend.fine_tune`
+    # drives, minus the wrapper.
+    submit_db = jammi_native.open_local(artifact_dir=str(tmp_path))
+    submit_db.add_source("training", url=str(_TRAINING_PAIRS), format="csv")
+    request = build_fine_tune_request(
+        source="training",
+        base_model=f"local:{_TINY_BERT}",
+        columns=["text_a", "text_b", "score"],
+        method="lora",
+        task="text_embedding",
+        epochs=2,
+        batch_size=8,
+        lora_rank=4,
+        warmup_steps=0,
+    )
+    submit_job = submit_db._start_training_proto(request.SerializeToString())
+    submit_job.wait()
+    assert submit_job.status() == "completed"
+    job_id = submit_job.job_id
+
+    # State 1: determined — the job's OWN natural post-completion state. The
+    # esc-075 report-computation runs synchronously right after device
+    # resolution, before the training loop's first step, so a completed run's
+    # row is `"determined"` for its whole lifetime — never read here as the
+    # submission-time `"pending"` marker.
+    determined = submit_job.acceleration_report()
+    assert isinstance(determined, dict)
+    assert determined["state"] == "determined"
+    assert isinstance(determined["attempt"], int)
+    assert determined["device"]
+    assert determined["dtype"]
+    assert isinstance(determined["cuda_compiled"], bool)
+    assert isinstance(determined["flash_compiled"], bool)
+
+    # Deterministic teardown BEFORE any raw-sqlite3 injection (see the
+    # docstring): no engine connection this test opened is attached to the
+    # catalog file past this point.
+    submit_db.close()
+    del submit_job, submit_db
+
+    def _seed_and_attach(seed):
+        """Inject `seed` through a raw connection that is fully closed before
+        this returns, then attach a FRESH `Database` to the shared job by id
+        — that pool's first read."""
+        _set_acceleration_report(job_id, seed)
+        db = jammi_native.open_local(artifact_dir=str(tmp_path))
+        return db, db.training_job(job_id)
+
+    # State 2: pending — injected explicitly (the completed job's own natural
+    # state has already moved past it; see the docstring on why the "absent"/
+    # pre-determination state cannot be reused from the natural run here).
+    # The SAME literal `create_training_job` stamps at submission time.
+    pending_db, pending_job = _seed_and_attach(pending_marker)
+    assert pending_job.acceleration_report() == {"state": "pending"}
+    pending_db.close()
+    del pending_job, pending_db
+
+    # State 3: `NULL` -> `None` — a row this code never touched (pre-migration
+    # or a kind that never records one). Never coerced into `{}` or any state
+    # claim.
+    null_db, null_job = _seed_and_attach(None)
+    assert null_job.acceleration_report() is None
+    null_db.close()
+    del null_job, null_db
+
+
 def test_embedded_fine_tune_rejects_unknown_method_in_the_assembly(tmp_path: Path) -> None:
     db = _connect(tmp_path)
     db.add_source("training", url=str(_TRAINING_PAIRS), format="csv")

@@ -1,31 +1,58 @@
 #!/usr/bin/env python3
-"""Assert no workspace member's feature closure reaches
-`jammi-kernels/flash-attn` except through the feature itself.
+"""Assert flash-attn is reachable exactly where it is DECLARED.
 
-`jammi-kernels`'s `flash-attn` feature builds the vendored FlashAttention-2
-kernels (CUTLASS submodule + a minute of `nvcc` + a static archive). It
-DEPENDS on `cuda` but must never be IMPLIED by it: `.github/workflows/
-release-binaries.yml` builds `jammi-server --features cuda,...` and that lane
-must stay CUTLASS-free. Cargo has no "never enable this feature" primitive,
-so this script walks the workspace's feature graph the way the resolver
-does and proves the property mechanically.
+**Guarded property**: `jammi-kernels/flash-attn` is reachable exactly where a
+lane or a workspace member DECLARES it, via the exact declared 1:1 chain, and
+NEVER from `cuda`/`default` alone. `jammi-kernels`'s `flash-attn` feature
+builds the vendored FlashAttention-2 kernels (CUTLASS submodule + a minute of
+`nvcc` + a static archive). It DEPENDS on `cuda` but must never be IMPLIED by
+it. Cargo has no "never enable this feature" primitive, so this script walks
+the workspace's feature graph the way the resolver does and proves the
+property mechanically.
 
 Method (hermetic: `cargo metadata --no-deps`, no network, no build):
 
   1. Load every workspace package's `[features]` table and dependency list.
-  2. For `jammi-server` specifically (`ROOT`) — the package
-     `release-binaries.yml` actually builds — check three selections:
-     `default`, the release lane's `cuda,jetstream-broker,storage-cloud`,
-     and `jammi-server --all-features`.
-  3. Beyond `jammi-server`: for EVERY OTHER workspace member (a leak
-     through `jammi-bench` or `jammi-python`, both of which reach
-     `jammi-ai` → ... → `jammi-kernels` transitively, would not be visible
-     from `jammi-server`'s closure alone), check THAT member's own
-     `--all-features` selection. `jammi-kernels` itself is excluded from
-     this loop — asking "does building jammi-kernels with all its own
-     features enable jammi-kernels/flash-attn" is vacuously true and not
-     the property this script guards (a crate is not its own consumer).
-  4. Propagation uses the resolver-v2 rules for workspace members: a plain
+  2. Read `ci/release-feature-manifest.json`'s `lanes` object — the single
+     source of truth for every CUDA release lane's exact cargo feature list
+     (cu12 tarball, cu12 wheel, cu12 image today; any future lane the
+     manifest gains is picked up automatically). For EVERY lane, assert its
+     declared `capabilities.flash_compiled` matches whether its
+     `cargo_features` selection actually reaches
+     `jammi-kernels/flash-attn` — a `true` lane that fails to reach it (a
+     broken or renamed forwarding chain) and a `false` lane that DOES reach
+     it (an undeclared leak) both FAIL. FAILS on a missing/unreadable
+     manifest, a missing/renamed `lanes` key, or an empty lane list — this is
+     the PR-time drift enforcement for every release lane (this gate runs on
+     every PR via ci.yml), covering `release-binaries.yml`'s own missing
+     `pull_request` trigger.
+  3. Lane-independent invariants on `jammi-server` (`ROOT`) directly, held
+     regardless of what the manifest says: a plain `cuda` selection and the
+     bare `default` selection never reach `jammi-kernels/flash-attn`.
+  4. Positive control (broken-walk vacuity guard): `ROOT`'s plain `cuda`
+     selection MUST reach `jammi-kernels/cuda` — proving the walk actually
+     traverses the server -> ai -> encoders/lora -> kernels chain rather than
+     trivially seeing an empty set.
+  5. `ROOT`'s own `--all-features` selection uses the SAME member-exemption
+     idiom `ALL_FEATURES_FLASH_EXEMPT` gives every other workspace member
+     (see step 6): accepted iff `jammi-server`'s own `flash-attn` feature
+     spec is EXACTLY `["jammi-ai/flash-attn"]` (a verified 1:1 passthrough)
+     AND its `default`/`cuda` real selections (checked via the same
+     `_check_exempt_member_real_lanes` helper the member loop uses,
+     including `default = ["train"]`) stay flash-free.
+  6. Beyond `ROOT`: for EVERY OTHER workspace member (a leak through
+     `jammi-bench` or `jammi-python`, both of which reach `jammi-ai` ->
+     ... -> `jammi-kernels` transitively, would not be visible from
+     `jammi-server`'s closure alone), check THAT member's own
+     `--all-features` selection. `jammi-kernels` itself is excluded (asking
+     "does building jammi-kernels with all its own features enable
+     jammi-kernels/flash-attn" is vacuously true and not the property this
+     script guards). A member's leak under `--all-features` is accepted ONLY
+     if `ALL_FEATURES_FLASH_EXEMPT` names that member with the member's
+     OWN `flash-attn` feature spec matching EXACTLY — and even then, its own
+     `default`/`cuda` selections must independently stay flash-free
+     (`_check_exempt_member_real_lanes`).
+  7. Propagation uses the resolver-v2 rules for workspace members: a plain
      `feat` enables it on the same package; `dep:name` activates an
      optional dependency (with its declared `features` and, unless
      `default-features = false`, `default`); `name/feat` activates `name`
@@ -34,18 +61,17 @@ Method (hermetic: `cargo metadata --no-deps`, no network, no build):
      active package are active. Dev dependencies are ignored (they are not
      part of a binary's closure). Non-workspace packages are opaque (they
      cannot enable a workspace member's feature).
-  5. FAIL if `flash-attn` is enabled on `jammi-kernels` under any selection
-     in steps 2 or 3. Also FAIL the positive control if `jammi-server`'s
-     cuda-lane selection does NOT enable `jammi-kernels/cuda` — that proves
-     the walk actually traverses the server → ai → encoders/lora → kernels
-     chain rather than trivially seeing an empty set.
 
-`--self-test` runs the walker over synthetic metadata: a leaked edge
-(`ai: cuda = ["jammi-kernels/flash-attn"]`), a weak-dep edge, and a clean
-graph, asserting each verdict.
+`--self-test` runs the walker over synthetic metadata: a leaked edge, a weak-
+dep edge, a clean graph, the manifest-derived per-lane checks (including a
+synthetic `flash_compiled: false` lane so the negative-polarity branch is
+provably alive), the member exemptions (`jammi-ai`, `jammi-bench`,
+`jammi-encoders`), the `ROOT` `--all-features` exemption, and a name-only-
+passthrough control (a declared `flash-attn` whose closure fails to actually
+enable `jammi-kernels/flash-attn` FAILS).
 
 Run: `python3 ci/scripts/check_flash_attn_closure.py`
-Exit 0 = property holds; 1 = a leak (or a broken control); 2 = usage/metadata error.
+Exit 0 = property holds; 1 = a leak/mismatch (or a broken control); 2 = usage/metadata/manifest error.
 """
 
 from __future__ import annotations
@@ -56,14 +82,18 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+MANIFEST_PATH = REPO_ROOT / "ci" / "release-feature-manifest.json"
 
 ROOT = "jammi-server"
 TARGET_PKG = "jammi-kernels"
 FORBIDDEN_FEATURE = "flash-attn"
-# The lane that must stay CUTLASS-free (release-binaries.yml's cuda build).
-CUDA_LANE = ["cuda", "jetstream-broker", "storage-cloud"]
-# Positive control: this feature MUST be reachable from the cuda lane.
+# Positive control: this feature MUST be reachable from ROOT's plain `cuda`
+# selection.
 CONTROL_FEATURE = "cuda"
+
+# `ROOT`'s own by-name `flash-attn` passthrough — the ONE spec its
+# `--all-features` selection is exempted for (step 5 above).
+ROOT_ALL_FEATURES_EXEMPT_SPEC = [f"jammi-ai/{FORBIDDEN_FEATURE}"]
 
 # Workspace members permitted to reach TARGET_PKG/FORBIDDEN_FEATURE under
 # their OWN `--all-features` selection ONLY (P6 Stage B, `jammi-encoders`'s
@@ -71,7 +101,12 @@ CONTROL_FEATURE = "cuda"
 # path for `flash_attention_varlen`/`CuSeqlens` — a `#[cfg(feature =
 # "flash-attn")]` call site, never a bare `cfg!()` runtime check around a
 # `jammi_kernels::flash` type reference, which would fail to compile with
-# the feature off; see the call site's own doc). The value is the EXACT
+# the feature off; see the call site's own doc). `jammi-ai` forwards to both
+# `jammi-encoders/flash-attn` and `jammi-kernels/flash-attn` directly (the
+# same "explicit direct entry, not only transitive" precedent its `cuda`
+# feature already carries for `jammi-kernels/cuda`). `jammi-bench` needs its
+# own entry because the reporter-scenario producer (`jammi-bench
+# finetune-run`) must be able to compile FA2 too. The value is the EXACT
 # feature-spec list the member's own `flash-attn` entry must equal for the
 # exemption to apply — a verified 1:1 passthrough, not "any leak from this
 # crate is fine": if a future edit adds a second spec (e.g. also pulling in
@@ -81,13 +116,16 @@ CONTROL_FEATURE = "cuda"
 # `--all-features` is a synthetic "build everything" selection no release
 # lane uses; an opt-in feature `--all-features` could never reach would be
 # untestable dead weight, so exempting it here does not weaken the
-# property this script actually guards. That property — the CUDA release
-# lane AND any plain `cuda`/`default` build of the exempted member stay
-# CUTLASS-free — is enforced separately below, per exempted member, by
-# re-running ITS OWN `default` and `cuda` selections (if it declares them)
-# and still FAILing if either reaches `FORBIDDEN_FEATURE`.
+# property this script actually guards. That property — every REAL lane
+# (the manifest's declared lanes) AND any plain `cuda`/`default` build of the
+# exempted member stay CUTLASS-free unless the lane/member DECLARES
+# `flash-attn` — is enforced separately, per exempted member, by re-running
+# ITS OWN `default` and `cuda` selections (if it declares them) and still
+# FAILing if either reaches `FORBIDDEN_FEATURE`.
 ALL_FEATURES_FLASH_EXEMPT: dict[str, list[str]] = {
     "jammi-encoders": [f"{TARGET_PKG}/{FORBIDDEN_FEATURE}"],
+    "jammi-ai": ["cuda", f"jammi-encoders/{FORBIDDEN_FEATURE}", f"{TARGET_PKG}/{FORBIDDEN_FEATURE}"],
+    "jammi-bench": [f"jammi-ai/{FORBIDDEN_FEATURE}"],
 }
 
 
@@ -104,6 +142,49 @@ def load_metadata() -> dict:
         print(f"ERROR: cargo metadata failed: {e}", file=sys.stderr)
         sys.exit(2)
     return json.loads(out)
+
+
+def load_manifest_lanes() -> dict[str, dict]:
+    """Read and validate `ci/release-feature-manifest.json`'s `lanes`
+    object. FAILS (exit 2) on a missing/unreadable file, a missing/renamed
+    `lanes` key, an empty lane list, or a lane missing a required field —
+    the manifest-read closure assertion for esc-074 must be unable to pass
+    vacuously on a broken or absent manifest."""
+    try:
+        raw = MANIFEST_PATH.read_text()
+    except OSError as e:
+        print(f"ERROR: cannot read {MANIFEST_PATH}: {e}", file=sys.stderr)
+        sys.exit(2)
+    try:
+        manifest = json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"ERROR: {MANIFEST_PATH} is not valid JSON: {e}", file=sys.stderr)
+        sys.exit(2)
+    lanes = manifest.get("lanes")
+    if not lanes:
+        print(
+            f"ERROR: {MANIFEST_PATH} has no (or an empty) `lanes` key — "
+            f"nothing to guard (was it renamed?)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    for lane_name, lane in lanes.items():
+        for key in ("package", "cargo_features", "capabilities"):
+            if key not in lane:
+                print(
+                    f"ERROR: lane `{lane_name}` in {MANIFEST_PATH} is missing "
+                    f"required key `{key}`",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+        if "flash_compiled" not in lane["capabilities"]:
+            print(
+                f"ERROR: lane `{lane_name}` in {MANIFEST_PATH} is missing "
+                f"required key `capabilities.flash_compiled`",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+    return lanes
 
 
 class Graph:
@@ -215,28 +296,107 @@ class Graph:
 deferred: list[tuple[str, dict, str]] = []
 
 
-def verdict(graph: Graph, verbose: bool = True) -> int:
+def _reaches_flash(graph: Graph, pkg: str, feats: list[str]) -> tuple[bool, list[str]]:
+    deferred.clear()
+    enabled = graph.closure(pkg, feats)
+    kernels = sorted(enabled.get(TARGET_PKG, set()))
+    return FORBIDDEN_FEATURE in kernels, kernels
+
+
+def _check_manifest_lanes(graph: Graph, lanes: dict[str, dict], verbose: bool) -> int:
+    """Per-lane, manifest-derived assertions (step 2 of the module doc)."""
     rc = 0
-    selections = {
-        "default": ["default"] if "default" in graph.pkgs[ROOT]["features"] else [],
-        "cuda lane (" + ",".join(CUDA_LANE) + ")": CUDA_LANE,
-        "--all-features": graph.all_features(ROOT),
-    }
-    for label, feats in selections.items():
-        deferred.clear()
-        enabled = graph.closure(ROOT, feats)
-        kernels = sorted(enabled.get(TARGET_PKG, set()))
-        if verbose:
-            print(f"{ROOT} [{label}] -> {TARGET_PKG} features: {kernels}")
-        if FORBIDDEN_FEATURE in kernels:
+    for lane_name, lane in lanes.items():
+        pkg = lane["package"]
+        feats = lane["cargo_features"]
+        want_flash = bool(lane["capabilities"]["flash_compiled"])
+        if pkg not in graph.pkgs:
             if verbose:
                 print(
-                    f"FAIL: {ROOT} [{label}] reaches {TARGET_PKG}/{FORBIDDEN_FEATURE} — "
-                    f"the release lane would compile the vendored FlashAttention-2 kernels",
+                    f"FAIL: lane `{lane_name}` names package `{pkg}`, which is "
+                    f"not a workspace member",
                     file=sys.stderr,
                 )
             rc = 1
-        if label.startswith("cuda lane") and CONTROL_FEATURE not in kernels:
+            continue
+        reached, kernels = _reaches_flash(graph, pkg, feats)
+        if verbose:
+            print(
+                f"lane `{lane_name}` ({pkg} [{','.join(feats)}]) -> "
+                f"{TARGET_PKG} features: {kernels} (flash_compiled declared={want_flash})"
+            )
+        if reached != want_flash:
+            if verbose:
+                if want_flash:
+                    print(
+                        f"FAIL: lane `{lane_name}` declares capabilities.flash_compiled=true "
+                        f"but its cargo_features do NOT reach {TARGET_PKG}/{FORBIDDEN_FEATURE} "
+                        f"— a broken or renamed forwarding chain (name-only passthrough)",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"FAIL: lane `{lane_name}` declares capabilities.flash_compiled=false "
+                        f"but its cargo_features DO reach {TARGET_PKG}/{FORBIDDEN_FEATURE} "
+                        f"— an undeclared leak",
+                        file=sys.stderr,
+                    )
+            rc = 1
+    return rc
+
+
+def _check_exempt_member_real_lanes(graph: Graph, pkg: str, verbose: bool) -> int:
+    """The real property an `--all-features` exemption above must not
+    weaken: an exempted member's OWN `default` and `cuda` selections (the
+    selections a real build lane actually uses) must still exclude
+    `FORBIDDEN_FEATURE`."""
+    rc = 0
+    for label in ("default", "cuda"):
+        if label not in graph.pkgs[pkg]["features"]:
+            continue
+        reached, kernels = _reaches_flash(graph, pkg, [label])
+        if verbose:
+            print(f"{pkg} [{label}] -> {TARGET_PKG} features: {kernels}")
+        if reached:
+            if verbose:
+                print(
+                    f"FAIL: {pkg} [{label}] reaches {TARGET_PKG}/{FORBIDDEN_FEATURE} — the "
+                    f"exemption only covers --all-features, not a real build lane",
+                    file=sys.stderr,
+                )
+            rc = 1
+    return rc
+
+
+def verdict(graph: Graph, lanes: dict[str, dict], verbose: bool = True) -> int:
+    rc = 0
+
+    # (2) Per-lane, manifest-derived assertions — the PR-time drift
+    # enforcement for every declared CUDA release lane.
+    rc |= _check_manifest_lanes(graph, lanes, verbose)
+
+    # (3) Lane-independent invariants: `cuda` alone and bare `default` never
+    # reach jammi-kernels/flash-attn, regardless of what any lane declares.
+    lane_independent = {
+        "default": ["default"] if "default" in graph.pkgs[ROOT]["features"] else [],
+        "cuda": [CONTROL_FEATURE],
+    }
+    for label, feats in lane_independent.items():
+        if not feats:
+            continue
+        reached, kernels = _reaches_flash(graph, ROOT, feats)
+        if verbose:
+            print(f"{ROOT} [{label}] -> {TARGET_PKG} features: {kernels}")
+        if reached:
+            if verbose:
+                print(
+                    f"FAIL: {ROOT} [{label}] reaches {TARGET_PKG}/{FORBIDDEN_FEATURE} — "
+                    f"`{label}` must never imply flash-attn",
+                    file=sys.stderr,
+                )
+            rc = 1
+        # (4) Positive control (broken-walk vacuity guard).
+        if label == "cuda" and CONTROL_FEATURE not in kernels:
             if verbose:
                 print(
                     f"FAIL (positive control): {ROOT} [{label}] does not reach "
@@ -246,17 +406,41 @@ def verdict(graph: Graph, verbose: bool = True) -> int:
                 )
             rc = 1
 
-    # Widen beyond ROOT: every OTHER workspace member's OWN --all-features
-    # selection (jammi-kernels itself excluded — see the module docstring).
+    # (5) ROOT's own `--all-features`, using the SAME exemption idiom the
+    # member loop below uses (never dead config for ROOT).
+    reached, kernels = _reaches_flash(graph, ROOT, graph.all_features(ROOT))
+    if verbose:
+        print(f"{ROOT} [--all-features] -> {TARGET_PKG} features: {kernels}")
+    if reached:
+        own_spec = graph.pkgs[ROOT]["features"].get(FORBIDDEN_FEATURE)
+        if own_spec == ROOT_ALL_FEATURES_EXEMPT_SPEC:
+            if verbose:
+                print(
+                    f"EXEMPT: {ROOT} [--all-features] reaches {TARGET_PKG}/{FORBIDDEN_FEATURE} "
+                    f"only via its own by-name `{FORBIDDEN_FEATURE} = {own_spec}` passthrough "
+                    f"— checking {ROOT}'s own default/cuda selections instead"
+                )
+            rc |= _check_exempt_member_real_lanes(graph, ROOT, verbose)
+        else:
+            if verbose:
+                print(
+                    f"FAIL: {ROOT} [--all-features] reaches {TARGET_PKG}/{FORBIDDEN_FEATURE} "
+                    f"and its own `{FORBIDDEN_FEATURE}` spec ({own_spec}) does not match the "
+                    f"exempted 1:1 passthrough {ROOT_ALL_FEATURES_EXEMPT_SPEC}",
+                    file=sys.stderr,
+                )
+            rc = 1
+
+    # (6) Widen beyond ROOT: every OTHER workspace member's OWN
+    # --all-features selection (jammi-kernels itself excluded — see the
+    # module docstring).
     for pkg in sorted(graph.pkgs):
         if pkg in (ROOT, TARGET_PKG):
             continue
-        deferred.clear()
-        enabled = graph.closure(pkg, graph.all_features(pkg))
-        kernels = sorted(enabled.get(TARGET_PKG, set()))
+        reached, kernels = _reaches_flash(graph, pkg, graph.all_features(pkg))
         if verbose:
             print(f"{pkg} [--all-features] -> {TARGET_PKG} features: {kernels}")
-        if FORBIDDEN_FEATURE in kernels:
+        if reached:
             own_spec = graph.pkgs[pkg]["features"].get(FORBIDDEN_FEATURE)
             exempt_spec = ALL_FEATURES_FLASH_EXEMPT.get(pkg)
             if exempt_spec is not None and own_spec == exempt_spec:
@@ -273,30 +457,6 @@ def verdict(graph: Graph, verbose: bool = True) -> int:
                     f"FAIL: {pkg} [--all-features] reaches {TARGET_PKG}/{FORBIDDEN_FEATURE} — "
                     f"a workspace member other than {ROOT} would compile the vendored "
                     f"FlashAttention-2 kernels",
-                    file=sys.stderr,
-                )
-            rc = 1
-    return rc
-
-
-def _check_exempt_member_real_lanes(graph: Graph, pkg: str, verbose: bool) -> int:
-    """The real property the exemption above must not weaken: an exempted
-    member's OWN `default` and `cuda` selections (the selections a real
-    build lane actually uses) must still exclude `FORBIDDEN_FEATURE`."""
-    rc = 0
-    for label in ("default", "cuda"):
-        if label not in graph.pkgs[pkg]["features"]:
-            continue
-        deferred.clear()
-        enabled = graph.closure(pkg, [label])
-        kernels = sorted(enabled.get(TARGET_PKG, set()))
-        if verbose:
-            print(f"{pkg} [{label}] -> {TARGET_PKG} features: {kernels}")
-        if FORBIDDEN_FEATURE in kernels:
-            if verbose:
-                print(
-                    f"FAIL: {pkg} [{label}] reaches {TARGET_PKG}/{FORBIDDEN_FEATURE} — the "
-                    f"exemption only covers --all-features, not a real build lane",
                     file=sys.stderr,
                 )
             rc = 1
@@ -340,19 +500,31 @@ def _synthetic(ai_cuda: list[str], kernels_extra: dict | None = None) -> dict:
     }
 
 
+def _default_lanes() -> dict[str, dict]:
+    """A single clean synthetic lane matching the clean synthetic graph —
+    used by self-test cases that don't care about lane checking itself."""
+    return {
+        "cu12-tarball": {
+            "package": "jammi-server",
+            "cargo_features": ["cuda"],
+            "capabilities": {"flash_compiled": False},
+        }
+    }
+
+
 def self_test() -> int:
     # Clean graph: cuda reaches kernels/cuda, never flash-attn.
     g = Graph(_synthetic(["jammi-kernels/cuda"]))
-    assert verdict(g, verbose=False) == 0, "clean graph must pass"
+    assert verdict(g, _default_lanes(), verbose=False) == 0, "clean graph must pass"
     # Leaked edge in the middle crate.
     g = Graph(_synthetic(["jammi-kernels/cuda", "jammi-kernels/flash-attn"]))
-    assert verdict(g, verbose=False) == 1, "leaked edge must fail"
+    assert verdict(g, _default_lanes(), verbose=False) == 1, "leaked edge must fail"
     # Leak through the kernels crate's own `cuda` feature.
     g = Graph(_synthetic(["jammi-kernels/cuda"], {"cuda": ["dep:bindgen_cuda", "flash-attn"]}))
-    assert verdict(g, verbose=False) == 1, "self-implication must fail"
+    assert verdict(g, _default_lanes(), verbose=False) == 1, "self-implication must fail"
     # Broken chain: the positive control must trip.
     g = Graph(_synthetic([]))
-    assert verdict(g, verbose=False) == 1, "unreached control must fail"
+    assert verdict(g, _default_lanes(), verbose=False) == 1, "unreached control must fail"
     # Weak dep edge `dep?/feat` does not activate an inactive optional dep —
     # checked against ROOT's OWN selections directly (`closure`, not
     # `verdict`): `verdict` ALSO runs the widened per-member loop below, and
@@ -366,19 +538,81 @@ def self_test() -> int:
     )
     g = Graph(meta)
     deferred.clear()
-    enabled = g.closure(ROOT, CUDA_LANE)
+    enabled = g.closure(ROOT, [CONTROL_FEATURE])
     assert FORBIDDEN_FEATURE not in enabled.get(TARGET_PKG, set()), (
-        "weak edge on an inactive optional dep must not leak from ROOT's own cuda-lane selection"
+        "weak edge on an inactive optional dep must not leak from ROOT's own cuda selection"
     )
     # The per-member loop catches what ROOT's own selections cannot see:
     # `jammi-ai --all-features` activates "extra" directly,
     # which makes `extra?/flash-attn` fire — a genuine leak under
     # `cargo build -p jammi-ai --all-features` that a jammi-server-only
     # closure walk would miss entirely.
-    assert verdict(g, verbose=False) == 1, (
+    assert verdict(g, _default_lanes(), verbose=False) == 1, (
         "the widened per-member --all-features loop must catch the leak "
         "jammi-server's own selections cannot see"
     )
+
+    # --- Manifest-derived per-lane checks, including the synthetic
+    # `flash_compiled: false` lane the negative-polarity branch needs to be
+    # provably alive (all three REAL lanes today are `true`; without this
+    # case the `false` branch would have zero instances). These target
+    # `jammi-ai` directly (not `jammi-server`/ROOT) with its OWN declared
+    # `flash-attn` feature so the lane check is exercised independently of
+    # ROOT's `cuda`-alone invariant (a different, always-on check) — the
+    # spec mirrors the real `jammi-ai` Cargo.toml entry exactly so it also
+    # matches the module-level `ALL_FEATURES_FLASH_EXEMPT["jammi-ai"]`
+    # value, keeping the rest of verdict()'s checks clean for these cases.
+    meta = _synthetic(["jammi-kernels/cuda"])
+    meta["packages"][1]["features"]["flash-attn"] = [
+        "cuda", "jammi-encoders/flash-attn", f"{TARGET_PKG}/{FORBIDDEN_FEATURE}",
+    ]
+    g = Graph(meta)
+    lanes_true_pass = {
+        "cu12-tarball": {
+            "package": "jammi-ai",
+            "cargo_features": ["flash-attn"],
+            "capabilities": {"flash_compiled": True},
+        }
+    }
+    assert verdict(g, lanes_true_pass, verbose=False) == 0, (
+        "a lane declaring flash_compiled=true whose cargo_features genuinely "
+        "reach jammi-kernels/flash-attn must pass"
+    )
+    lanes_false_fail = {
+        "cu12-tarball": {
+            "package": "jammi-ai",
+            "cargo_features": ["flash-attn"],
+            "capabilities": {"flash_compiled": False},
+        }
+    }
+    assert verdict(g, lanes_false_fail, verbose=False) == 1, (
+        "a lane declaring flash_compiled=false whose cargo_features reach "
+        "jammi-kernels/flash-attn anyway (an undeclared leak) must FAIL — "
+        "the synthetic false-lane negative-polarity case"
+    )
+    # Name-only passthrough: the lane DECLARES flash_compiled=true but the
+    # closure fails to actually enable jammi-kernels/flash-attn (a broken
+    # forwarding chain, e.g. a rename that silently stopped propagating —
+    # `flash-attn` only forwards `cuda`, never `jammi-kernels/flash-attn`).
+    meta_broken = _synthetic(["jammi-kernels/cuda"])
+    meta_broken["packages"][1]["features"]["flash-attn"] = ["cuda"]
+    g_broken = Graph(meta_broken)
+    lanes_true_but_broken = {
+        "cu12-tarball": {
+            "package": "jammi-ai",
+            "cargo_features": ["flash-attn"],
+            "capabilities": {"flash_compiled": True},
+        }
+    }
+    assert verdict(g_broken, lanes_true_but_broken, verbose=False) == 1, (
+        "a lane declaring flash_compiled=true whose closure does NOT reach "
+        "jammi-kernels/flash-attn (name-only passthrough) must FAIL"
+    )
+    # Empty/missing lanes must be treated as an error by the caller
+    # (load_manifest_lanes), not silently accepted by verdict(); verdict()
+    # itself just iterates whatever dict it's given, so this is asserted at
+    # the load_manifest_lanes() level below instead.
+    assert load_manifest_lanes_rejects_empty(), "empty `lanes` must be rejected"
 
     # The ALL_FEATURES_FLASH_EXEMPT mechanism (P6 Stage B): a member that
     # declares its OWN by-name `flash-attn` passthrough must pass under
@@ -395,7 +629,7 @@ def self_test() -> int:
         meta = _synthetic(["jammi-kernels/cuda"])
         meta["packages"][1]["features"]["flash-attn"] = [f"{TARGET_PKG}/{FORBIDDEN_FEATURE}"]
         g = Graph(meta)
-        assert verdict(g, verbose=False) == 0, (
+        assert verdict(g, _default_lanes(), verbose=False) == 0, (
             "a member with a verified 1:1 flash-attn passthrough must pass "
             "once exempted, provided its own cuda/default selections stay clean"
         )
@@ -405,7 +639,7 @@ def self_test() -> int:
         meta = _synthetic(["jammi-kernels/cuda", f"{TARGET_PKG}/{FORBIDDEN_FEATURE}"])
         meta["packages"][1]["features"]["flash-attn"] = [f"{TARGET_PKG}/{FORBIDDEN_FEATURE}"]
         g = Graph(meta)
-        assert verdict(g, verbose=False) == 1, (
+        assert verdict(g, _default_lanes(), verbose=False) == 1, (
             "the exemption covers --all-features only; a leak via the member's "
             "own cuda selection must still fail"
         )
@@ -420,7 +654,7 @@ def self_test() -> int:
             "some-other-feature",
         ]
         g = Graph(meta)
-        assert verdict(g, verbose=False) == 1, (
+        assert verdict(g, _default_lanes(), verbose=False) == 1, (
             "a flash-attn spec that does not match the exemption exactly "
             "must not be silently exempted"
         )
@@ -428,8 +662,68 @@ def self_test() -> int:
         ALL_FEATURES_FLASH_EXEMPT.clear()
         ALL_FEATURES_FLASH_EXEMPT.update(saved_exempt)
 
+    # --- ROOT's own --all-features exemption (step 5): jammi-server's
+    # `flash-attn = ["jammi-ai/flash-attn"]` passthrough must be accepted,
+    # but only when ROOT's own default/cuda selections stay flash-free, and
+    # only when the spec matches EXACTLY. `jammi-ai`'s own `flash-attn`
+    # spec is set to match `ALL_FEATURES_FLASH_EXEMPT["jammi-ai"]` exactly
+    # (mirroring the real Cargo.toml) so the widened per-member loop's own
+    # check of `jammi-ai [--all-features]` is independently clean and these
+    # cases isolate ROOT-level behavior only. ---
+    ai_flash_spec = ["cuda", "jammi-encoders/flash-attn", f"{TARGET_PKG}/{FORBIDDEN_FEATURE}"]
+    meta = _synthetic(["jammi-kernels/cuda"])
+    meta["packages"][0]["features"]["flash-attn"] = ["jammi-ai/flash-attn"]
+    meta["packages"][1]["features"]["flash-attn"] = ai_flash_spec
+    g = Graph(meta)
+    assert verdict(g, _default_lanes(), verbose=False) == 0, (
+        "ROOT's own verified 1:1 flash-attn passthrough must be exempted under "
+        "--all-features, provided ROOT's own default/cuda selections stay clean"
+    )
+    # Same shape, but ROOT's `cuda` selection ALSO reaches flash-attn
+    # directly (e.g. someone folded the passthrough into `cuda` by
+    # mistake) — must still FAIL.
+    meta = _synthetic(["jammi-kernels/cuda"])
+    meta["packages"][0]["features"]["cuda"] = ["jammi-ai/cuda", "jammi-ai/flash-attn"]
+    meta["packages"][0]["features"]["flash-attn"] = ["jammi-ai/flash-attn"]
+    meta["packages"][1]["features"]["flash-attn"] = ai_flash_spec
+    g = Graph(meta)
+    assert verdict(g, _default_lanes(), verbose=False) == 1, (
+        "ROOT's --all-features exemption must not launder a leak through "
+        "ROOT's own real cuda selection"
+    )
+    # ROOT's flash-attn spec doesn't match the exempted 1:1 form exactly —
+    # must not be silently exempted.
+    meta = _synthetic(["jammi-kernels/cuda"])
+    meta["packages"][0]["features"]["flash-attn"] = ["jammi-ai/flash-attn", "some-other-feature"]
+    meta["packages"][1]["features"]["flash-attn"] = ai_flash_spec
+    g = Graph(meta)
+    assert verdict(g, _default_lanes(), verbose=False) == 1, (
+        "a ROOT flash-attn spec that does not match the exemption exactly "
+        "must not be silently exempted"
+    )
+
     print("self-test: ok")
     return 0
+
+
+def load_manifest_lanes_rejects_empty() -> bool:
+    """Exercise `load_manifest_lanes`'s fail-closed behavior on a missing/
+    empty `lanes` key without touching the real manifest file on disk."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        bad_manifest = Path(td) / "release-feature-manifest.json"
+        bad_manifest.write_text(json.dumps({"lanes": {}}))
+        global MANIFEST_PATH
+        saved = MANIFEST_PATH
+        MANIFEST_PATH = bad_manifest
+        try:
+            load_manifest_lanes()
+            return False  # should have exited
+        except SystemExit as e:
+            return e.code == 2
+        finally:
+            MANIFEST_PATH = saved
 
 
 def main(argv: list[str]) -> int:
@@ -447,7 +741,8 @@ def main(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return 2
-    rc = verdict(graph)
+    lanes = load_manifest_lanes()
+    rc = verdict(graph, lanes)
     print("check_flash_attn_closure: " + ("PASS" if rc == 0 else "FAIL"))
     return rc
 

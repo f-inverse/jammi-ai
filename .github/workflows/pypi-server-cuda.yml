@@ -23,6 +23,7 @@ on:
       - ".github/workflows/pypi-server-cuda.yml"
       - ".github/workflows/_pypi-server.yml"
       - "crates/jammi-server/**"
+      - "ci/release-feature-manifest.json"
 
 # Serialize per ref, never cancel: a publish in flight must finish (PyPI
 # uploads are not resumable), matching the other release lanes.
@@ -36,18 +37,57 @@ permissions:
   contents: read
 
 jobs:
+  read-manifest:
+    name: Read release feature list
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      cargo_features: ${{ steps.manifest.outputs.cargo_features }}
+    steps:
+      - uses: actions/checkout@v4
+      # `ci/release-feature-manifest.json` is the single source of truth for
+      # this lane's cargo feature list (`cu12-wheel`) — read here rather
+      # than restating it inline in `with:` below, so a manifest edit moves
+      # this build in the same unit with no separate edit to keep in sync.
+      # A plain `ubuntu-latest` runner (no container) always has `jq`.
+      - name: Read ci/release-feature-manifest.json (cu12-wheel lane)
+        id: manifest
+        run: |
+          set -euo pipefail
+          features="$(jq -r '.lanes["cu12-wheel"].cargo_features | join(",")' ci/release-feature-manifest.json)"
+          if [ -z "$features" ]; then
+            echo "::error::ci/release-feature-manifest.json produced an empty cu12-wheel cargo_features list" >&2
+            exit 1
+          fi
+          echo "cargo_features=$features" >> "$GITHUB_OUTPUT"
+
   server-cu12:
     name: jammi-server-cu12 (CUDA)
+    needs: [read-manifest]
     permissions:
       contents: read
     uses: ./.github/workflows/_pypi-server.yml
     with:
       container_image: ${{ vars.JAMMI_CI_IMAGE_CUDA || 'ghcr.io/f-inverse/jammi-ai-ci-cuda:latest' }}
-      cargo_features: cuda,jetstream-broker,storage-cloud
+      cargo_features: ${{ needs.read-manifest.outputs.cargo_features }}
       package_dir: packaging/server-cu12
       artifact_prefix: server-cu12
       platform_tag: manylinux_2_28_x86_64
       verify_link_set: true
+      # `flash-attn` is now in the manifest's cu12-wheel feature list, which
+      # needs the vendored CUTLASS submodule at build time.
+      init_cutlass_submodule: true
+      # Already gates publish behind the shared A100 prove-gate
+      # (`_gpu-prove-gate.yml`, the SAME reusable `release-binaries.yml`'s
+      # `server-cu12` tarball job calls) — `publish` below `needs:
+      # server-cu12`, and a reusable-workflow-call job's result reflects
+      # the WHOLE called workflow's outcome, so a failed `gpu-prove` leg
+      # inside `_pypi-server.yml` fails this job and `publish` never runs.
+      # `_gpu-prove-gate.yml`'s own concurrency group is keyed on
+      # `(git_ref, arch)` — shared across every caller — so a re-run of
+      # this same tag never rents a second GPU for an arch already proven
+      # (or in flight) for that ref.
       run_gpu_prove: true
     secrets: inherit
 

@@ -1,0 +1,118 @@
+{
+  "_schema_doc": [
+    "Single source of truth for the three CUDA `jammi-server` release lanes",
+    "(tarball, PyPI wheel, container image): the exact cargo feature list each",
+    "lane builds and the capability assertions a real device must prove for",
+    "that build. Both the release workflows (`.github/workflows/release-",
+    "binaries.yml`, `pypi-server-cuda.yml`, `server-image.yml`) and",
+    "`ci/scripts/check_flash_attn_closure.py` / `ci/scripts/",
+    "runpod_gpu_prove.sh` read THIS file rather than each carrying their own",
+    "copy of the feature list — a fact lives in exactly one place (family T,",
+    "DRY). A workflow reads `.lanes.<lane>.cargo_features` with `jq`; the",
+    "closure gate reads the whole `lanes` object and asserts, for every lane,",
+    "that `capabilities.flash_compiled` matches whether `cargo_features`",
+    "actually reaches `jammi-kernels/flash-attn` in the workspace feature",
+    "graph; `runpod_gpu_prove.sh` reads a lane's `cargo_features` to build",
+    "with EXACTLY that list and derives the `jammi-ai`-applicable subset by",
+    "subtracting `server_only_cargo_features` (documented below) — never a",
+    "second hardcoded copy of either list.",
+    "",
+    "Adding a lane: add an entry under `lanes`; the closure gate iterates the",
+    "object and FAILS on an empty or missing `lanes` key, so a lane can never",
+    "silently drop out of PR-time coverage.",
+    "",
+    "Changing what a lane ships: edit `cargo_features` here; the workflow",
+    "that builds it and the closure gate that guards it both move in the",
+    "same unit (no separate lane-by-lane edit to keep in sync)."
+  ],
+  "lanes": {
+    "cu12-tarball": {
+      "_doc": "The self-contained CUDA `jammi-server` tarball (binary + bundled CUDA runtime .so's + LD_LIBRARY_PATH launcher).",
+      "workflow": ".github/workflows/release-binaries.yml:server-cu12",
+      "package": "jammi-server",
+      "cargo_features": ["cuda", "flash-attn", "jetstream-broker", "storage-cloud"],
+      "capabilities": {
+        "cuda_compiled": true,
+        "flash_compiled": true,
+        "flash_dtypes": ["bf16"],
+        "fused_op_admission": [
+          "layer_norm",
+          "softmax",
+          "geglu",
+          "rope",
+          "rope_positions",
+          "axpy",
+          "dropout",
+          "cast_scale",
+          "scaled_cast_add",
+          "attention_block",
+          "mem_efficient_attention",
+          "low_rank_residual_linear"
+        ]
+      }
+    },
+    "cu12-wheel": {
+      "_doc": "The `jammi-server-cu12` PyPI wheel, built through `_pypi-server.yml` (reusable) by `.github/workflows/pypi-server-cuda.yml`.",
+      "workflow": ".github/workflows/pypi-server-cuda.yml (via _pypi-server.yml)",
+      "package": "jammi-server",
+      "cargo_features": ["cuda", "flash-attn", "jetstream-broker", "storage-cloud"],
+      "capabilities": {
+        "cuda_compiled": true,
+        "flash_compiled": true,
+        "flash_dtypes": ["bf16"],
+        "fused_op_admission": [
+          "layer_norm",
+          "softmax",
+          "geglu",
+          "rope",
+          "rope_positions",
+          "axpy",
+          "dropout",
+          "cast_scale",
+          "scaled_cast_add",
+          "attention_block",
+          "mem_efficient_attention",
+          "low_rank_residual_linear"
+        ]
+      }
+    },
+    "cu12-image": {
+      "_doc": "The `jammi-ai-server-cu12` container image's `runtime-cuda`/`builder-cuda` Dockerfile stage, published by `.github/workflows/server-image.yml`.",
+      "workflow": ".github/workflows/server-image.yml:build-and-push-cu12 (Dockerfile builder-cuda stage)",
+      "package": "jammi-server",
+      "cargo_features": ["cuda", "flash-attn", "jetstream-broker", "storage-cloud"],
+      "capabilities": {
+        "cuda_compiled": true,
+        "flash_compiled": true,
+        "flash_dtypes": ["bf16"],
+        "fused_op_admission": [
+          "layer_norm",
+          "softmax",
+          "geglu",
+          "rope",
+          "rope_positions",
+          "axpy",
+          "dropout",
+          "cast_scale",
+          "scaled_cast_add",
+          "attention_block",
+          "mem_efficient_attention",
+          "low_rank_residual_linear"
+        ]
+      }
+    }
+  },
+  "server_only_cargo_features": {
+    "_doc": [
+      "Features that exist on `jammi-server` with no `jammi-ai` equivalent",
+      "(broker/cloud-storage plumbing the embedded engine crate does not",
+      "carry). A consumer deriving the `jammi-ai`-applicable subset of a",
+      "lane's `cargo_features` (e.g. `runpod_gpu_prove.sh`'s capability-",
+      "surface build, which runs `cargo test -p jammi-ai --features <subset>`",
+      "rather than `-p jammi-server`) subtracts this list from",
+      "`lanes.<lane>.cargo_features`. Every lane above resolves to",
+      "`[\"cuda\", \"flash-attn\"]` on `jammi-ai` once these are removed."
+    ],
+    "features": ["jetstream-broker", "storage-cloud"]
+  }
+}

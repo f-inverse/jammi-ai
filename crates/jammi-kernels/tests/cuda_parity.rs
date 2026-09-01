@@ -31,7 +31,11 @@
 
 use candle_core::quantized::{GgmlDType, QStorage, QTensor};
 use candle_core::{DType, Device, Error, Layout, Tensor, Var, D};
-use half::bf16;
+use half::{bf16, f16};
+use jammi_kernels::f16_oracle::{
+    assert_finite_f16, assert_floor_below_f16_gradient_band, assert_saturates_to_infinity,
+    assert_underflows_to_zero, f16_ulp_size_at, F16_MAX, F16_MIN_POSITIVE_SUBNORMAL,
+};
 use jammi_kernels::ops::{
     adamw_step_fused_t, apply1, apply2, apply3, apply_inplace2, bwd_gradient_gemm_layouts,
     cast_add_bf16_into, cast_scale_bf16_f32_into, mem_efficient_attention, quant_matmul_grad,
@@ -243,6 +247,37 @@ fn measured_near_zero_floor(reference: &[f32]) -> f32 {
 /// site).
 fn bf16_relative_bound(reference: f32, floor: f32, k: f32) -> f32 {
     k * bf16_ulp(reference.abs().max(floor))
+}
+
+/// [`measured_near_zero_floor`]'s F16 twin: the smallest STRICTLY POSITIVE
+/// `|reference|` this run's own comparison array produced, or (all-zero)
+/// f16's own smallest representable positive (subnormal) magnitude —
+/// `f16_oracle::F16_MIN_POSITIVE_SUBNORMAL` — rather than bf16's coarser
+/// one (campaign #443 D4: "never a coarser dtype's floor").
+fn measured_near_zero_floor_f16(reference: &[f32]) -> f32 {
+    let smallest_nonzero = reference
+        .iter()
+        .map(|v| v.abs())
+        .filter(|v| *v > 0.0)
+        .fold(f32::INFINITY, f32::min);
+    if smallest_nonzero.is_finite() {
+        smallest_nonzero
+    } else {
+        F16_MIN_POSITIVE_SUBNORMAL
+    }
+}
+
+/// [`bf16_relative_bound`]'s F16 twin: `k` f16 ULPs of `reference`'s own
+/// magnitude (floored at `floor` for a near-zero reference), DERIVED from
+/// f16's own quantization step at that magnitude
+/// (`f16_oracle::f16_ulp_size_at`) — never a blanket `2^-9` constant
+/// (`docs/maintainer/cuda-kernel-guide.md` §3.10's per-op regime table is
+/// what picks `k` at each call site, mirroring the BF16 legs' own
+/// per-site `k` citations). Every call site additionally asserts (via
+/// [`assert_floor_below_f16_gradient_band`]) that its chosen `k` sits
+/// strictly below the bf16-shaped 8x line (KO-3: no bf16-shaped floor).
+fn f16_relative_bound(reference: f32, floor: f32, k: f32) -> f32 {
+    k * f16_ulp_size_at(reference.abs().max(floor))
 }
 
 /// One f32 ULP at `|x|` (`2^(e - 23)`, f32's 23 explicit mantissa bits),
@@ -1102,6 +1137,208 @@ fn assert_ln_parity_bf16(
     assert_forced_defect_exceeds_bound("ln bf16 dgamma", &dg_cpu_v, &dg_defect, dg_bound);
 }
 
+/// [`assert_ln_parity_bf16`]'s F16 twin (campaign #443 W2b) — compares the
+/// SAME op's two device arms (CPU `CpuStorage::F16` vs CUDA
+/// `layer_norm_f16.cu`), both f32-internal/round-once per the per-op f16
+/// regime table (`docs/maintainer/cuda-kernel-guide.md` §3.10). `k = 2`,
+/// mirroring the bf16 leg's identical citation (the `rsqrtf()`-vs-
+/// `1.0/sqrt()` cross-device divergence, `layer_norm.rs`/`layer_norm.cu`),
+/// derived from f16's OWN quantization step, never bf16's coarser one.
+fn assert_ln_parity_f16(
+    cuda: &Device,
+    eps: f64,
+    rows: usize,
+    hidden: usize,
+    xv: &[f32],
+    gv: &[f32],
+) {
+    let cpu = Device::Cpu;
+    let n = rows * hidden;
+    let xh: Vec<f16> = xv.iter().map(|&v| f16::from_f32(v)).collect();
+    let gh: Vec<f16> = gv.iter().map(|&v| f16::from_f32(v)).collect();
+    let dyv_f = cotangent_fixture(n, 0xDA57_1D5E_2000_0003, 3.0);
+    let dyh: Vec<f16> = dyv_f.iter().map(|&v| f16::from_f32(v)).collect();
+
+    let x_cpu = Var::from_tensor(&Tensor::from_slice(&xh, (rows, hidden), &cpu).unwrap()).unwrap();
+    let g_cpu = Var::from_tensor(&Tensor::from_slice(&gh, (hidden,), &cpu).unwrap()).unwrap();
+    let dy_cpu = Tensor::from_slice(&dyh, (rows, hidden), &cpu).unwrap();
+    let out_cpu = ln_forward(eps, true, &x_cpu, &g_cpu).unwrap();
+
+    let x_gpu = Var::from_tensor(&Tensor::from_slice(&xh, (rows, hidden), cuda).unwrap()).unwrap();
+    let g_gpu = Var::from_tensor(&Tensor::from_slice(&gh, (hidden,), cuda).unwrap()).unwrap();
+    let dy_gpu = Tensor::from_slice(&dyh, (rows, hidden), cuda).unwrap();
+    let out_gpu = ln_forward(eps, true, &x_gpu, &g_gpu).unwrap();
+
+    let to_f32 = |t: &Tensor| -> Vec<f32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    };
+
+    let out_cpu_v = to_f32(&out_cpu);
+    let out_gpu_v = to_f32(&out_gpu.to_device(&cpu).unwrap());
+    assert_eq!(out_cpu_v.len(), n);
+    assert_eq!(out_gpu_v.len(), n, "LN f16 GPU fwd length mismatch");
+    assert_floor_below_f16_gradient_band(2, max_abs(xv).max(max_abs(gv)));
+    let out_floor = measured_near_zero_floor_f16(&out_cpu_v);
+    let out_bound = |r: f32| f16_relative_bound(r, out_floor, 2.0);
+    assert_relative_bound("ln f16 fwd", &out_cpu_v, &out_gpu_v, out_bound);
+    let out_defect = ln_fwd_no_gamma_defect(xv, rows, hidden, eps);
+    assert_forced_defect_exceeds_bound("ln f16 fwd", &out_cpu_v, &out_defect, out_bound);
+
+    let grads_cpu = (&out_cpu * &dy_cpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
+    let grads_gpu = (&out_gpu * &dy_gpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
+
+    let dx_cpu_v = to_f32(&grads_cpu.get(&x_cpu).unwrap().clone());
+    let dx_gpu_v = to_f32(&grads_gpu.get(&x_gpu).unwrap().to_device(&cpu).unwrap());
+    assert_eq!(dx_cpu_v.len(), n);
+    assert_eq!(dx_gpu_v.len(), n, "LN f16 GPU dx length mismatch");
+    let dx_norm: f64 = dx_cpu_v.iter().map(|&v| (v as f64) * (v as f64)).sum();
+    assert!(
+        dx_norm.sqrt() > 1e-3,
+        "CPU f16 dx must be measured-nonzero (norm {}) -- a vacuous all-zero reference would \
+         make the parity loop below prove nothing",
+        dx_norm.sqrt()
+    );
+    // Every element of `dx`/`dgamma`'s gradient must be a genuinely
+    // finite f16 (KO-6/KO-7 live signal, family F non-vacuous negative
+    // control): a NaN gradient must be caught here, not silently accepted
+    // by a naive tolerance comparison (`NaN > c` is `false`).
+    let dx_gpu_f16: Vec<f16> = grads_gpu
+        .get(&x_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_dtype(DType::F16)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    for (i, h) in dx_gpu_f16.iter().enumerate() {
+        assert_finite_f16(*h, &format!("ln f16 dx[{i}]"));
+    }
+    let dx_floor = measured_near_zero_floor_f16(&dx_cpu_v);
+    let dx_bound = |r: f32| f16_relative_bound(r, dx_floor, 2.0);
+    assert_relative_bound("ln f16 dx", &dx_cpu_v, &dx_gpu_v, dx_bound);
+    let dx_defect = ln_bwd_dx_no_centering_defect(xv, gv, &dyv_f, rows, hidden, eps);
+    assert_forced_defect_exceeds_bound("ln f16 dx", &dx_cpu_v, &dx_defect, dx_bound);
+
+    let dg_cpu_v = to_f32(&grads_cpu.get(&g_cpu).unwrap().clone());
+    let dg_gpu_v = to_f32(&grads_gpu.get(&g_gpu).unwrap().to_device(&cpu).unwrap());
+    assert_eq!(dg_cpu_v.len(), hidden);
+    assert_eq!(dg_gpu_v.len(), hidden, "LN f16 GPU dgamma length mismatch");
+    let dg_floor = measured_near_zero_floor_f16(&dg_cpu_v);
+    let dg_bound = |r: f32| f16_relative_bound(r, dg_floor, 2.0);
+    assert_relative_bound("ln f16 dgamma", &dg_cpu_v, &dg_gpu_v, dg_bound);
+    let dg_defect = ln_bwd_dgamma_mean_not_sum_defect(xv, &dyv_f, rows, hidden, eps);
+    assert_forced_defect_exceeds_bound("ln f16 dgamma", &dg_cpu_v, &dg_defect, dg_bound);
+}
+
+/// Behavioral boundary oracle (family D / campaign #443 D4): the fused
+/// F16 CUDA kernel's OWN final `__float2half` rounding must saturate to
+/// `±inf` at a magnitude beyond `F16_MAX`, exactly like `half::f16`'s
+/// conversion does on the CPU arm -- NEVER a tolerance-vs-finite-f32
+/// comparison (there is no finite f16 answer at this magnitude to be
+/// "close to"). `hidden = 4`, `gamma` scaled so a genuinely-normalized
+/// `xhat` (`O(1)` magnitude) times `gamma` crosses `F16_MAX`.
+#[test]
+fn ln_parity_f16_output_saturates_to_infinity_beyond_f16_max() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let hidden = 4;
+    let xv = [1.0f32, 2.0, 3.0, 4.0];
+    let xh: Vec<f16> = xv.iter().map(|&v| f16::from_f32(v)).collect();
+    // gamma = F16_MAX itself (the largest FINITE, representable f16 value
+    // — gamma must stay representable for this to test the MULTIPLY's own
+    // overflow, not gamma's own storage already saturating): `xhat` for
+    // `x=4` is `(4-2.5)*invvar ~= 1.34`, so `xhat * F16_MAX ~= 8.8e4`,
+    // beyond F16_MAX by a wide margin.
+    let gv = [F16_MAX; 4];
+    let gh: Vec<f16> = gv.iter().map(|&v| f16::from_f32(v)).collect();
+    assert_eq!(
+        gh[0].to_f32(),
+        F16_MAX,
+        "fixture invariant: F16_MAX must round-trip through f16 exactly"
+    );
+    let x_gpu = Tensor::from_slice(&xh, (1, hidden), &cuda).unwrap();
+    let g_gpu = Tensor::from_slice(&gh, (hidden,), &cuda).unwrap();
+    let out_gpu: Vec<f16> = ln_forward(1e-5, false, &x_gpu, &g_gpu)
+        .unwrap()
+        .to_device(&Device::Cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let any_saturated = out_gpu.iter().any(|h| h.is_infinite());
+    assert!(
+        any_saturated,
+        "expected at least one output element to saturate to +/-inf beyond F16_MAX \
+         ({F16_MAX}); got {out_gpu:?} -- a confident wrong finite number at this \
+         boundary is exactly the family D failure mode this oracle exists to catch"
+    );
+    for h in &out_gpu {
+        assert!(
+            h.is_finite() || h.is_infinite(),
+            "expected finite or +/-inf, never NaN, got {h:?}"
+        );
+    }
+}
+
+/// Mirror-image boundary oracle (small-magnitude end): `xhat * gamma`
+/// computed in f32 then rounded to f16 must underflow to EXACT zero when
+/// the true product's magnitude sits strictly below f16's smallest
+/// subnormal. `gamma = F16_MIN_POSITIVE_SUBNORMAL` (a legitimately
+/// representable, nonzero f16 value) times the smaller-magnitude `xhat`
+/// elements (`x` in `{2, 3}`, `|xhat| ~= 0.4472`) lands strictly below the
+/// subnormal floor.
+#[test]
+fn ln_parity_f16_output_underflows_to_zero_below_f16_min_subnormal() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let hidden = 4;
+    let xv = [1.0f32, 2.0, 3.0, 4.0];
+    let xh: Vec<f16> = xv.iter().map(|&v| f16::from_f32(v)).collect();
+    let tiny = f16::from_f32(F16_MIN_POSITIVE_SUBNORMAL);
+    let gh = vec![tiny; hidden];
+    let x_gpu = Tensor::from_slice(&xh, (1, hidden), &cuda).unwrap();
+    let g_gpu = Tensor::from_slice(&gh, (hidden,), &cuda).unwrap();
+    let out_gpu: Vec<f16> = ln_forward(1e-5, false, &x_gpu, &g_gpu)
+        .unwrap()
+        .to_device(&Device::Cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let any_underflowed = out_gpu.contains(&f16::ZERO);
+    assert!(
+        any_underflowed,
+        "expected at least one output element to underflow to exact zero below \
+         F16_MIN_POSITIVE_SUBNORMAL ({F16_MIN_POSITIVE_SUBNORMAL}); got {out_gpu:?}"
+    );
+    // Isolated reference (KO-8): the smaller-magnitude elements' true f32
+    // product (|xhat| ~= 0.4472 for x in {2,3}) really is below the
+    // subnormal floor.
+    assert_underflows_to_zero(0.4472 * F16_MIN_POSITIVE_SUBNORMAL);
+}
+
 #[test]
 fn ln_parity_contiguous_hidden_1024_modernbert_shape() {
     let Some(cuda) = cuda_device() else {
@@ -1113,6 +1350,7 @@ fn ln_parity_contiguous_hidden_1024_modernbert_shape() {
     let g = fixture(hidden, 2.0);
     assert_ln_parity_f32(&cuda, 1e-5, rows, hidden, &x, &g);
     assert_ln_parity_bf16(&cuda, 1e-5, rows, hidden, &x, &g);
+    assert_ln_parity_f16(&cuda, 1e-5, rows, hidden, &x, &g);
 }
 
 #[test]
@@ -1128,6 +1366,7 @@ fn ln_parity_contiguous_non_1024_hidden() {
     let g = fixture(hidden, 4.0);
     assert_ln_parity_f32(&cuda, 1e-5, rows, hidden, &x, &g);
     assert_ln_parity_bf16(&cuda, 1e-5, rows, hidden, &x, &g);
+    assert_ln_parity_f16(&cuda, 1e-5, rows, hidden, &x, &g);
 }
 
 #[test]
@@ -1510,6 +1749,195 @@ fn assert_rope_parity_bf16(cuda: &Device, batch: usize, seq: usize, hidden: usiz
     assert_forced_defect_exceeds_bound("rope bf16 dx", &dx_cpu_v, &dx_defect, dx_bound);
 }
 
+/// [`assert_rope_parity_bf16`]'s F16 twin (campaign #443 W2b): compares
+/// the SAME op's two device arms (CPU `CpuStorage::F16` vs CUDA
+/// `rope_f16.cu`). `k = 1`, mirroring the bf16 leg's identical
+/// monotone-round-to-nearest-even rationale (both arms compute the whole
+/// expression in f32 and round to f16 exactly once — see the per-op f16
+/// regime table, `docs/maintainer/cuda-kernel-guide.md` §3.10).
+fn assert_rope_parity_f16(cuda: &Device, batch: usize, seq: usize, hidden: usize, xv: &[f32]) {
+    let cpu = Device::Cpu;
+    let n = xv.len();
+    let cos_v = rope_table(seq, hidden, 10_000.0);
+    let sin_v = rope_sin_table(seq, hidden, 10_000.0);
+    let xh: Vec<f16> = xv.iter().map(|&v| f16::from_f32(v)).collect();
+    let ch: Vec<f16> = cos_v.iter().map(|&v| f16::from_f32(v)).collect();
+    let sh: Vec<f16> = sin_v.iter().map(|&v| f16::from_f32(v)).collect();
+    let dyv_f = cotangent_fixture(n, 0x20BE_1D5E_2000_0003, 3.0);
+    let dyh: Vec<f16> = dyv_f.iter().map(|&v| f16::from_f32(v)).collect();
+
+    let x_cpu =
+        Var::from_tensor(&Tensor::from_slice(&xh, (batch, 1, seq, hidden), &cpu).unwrap()).unwrap();
+    let cos_cpu = Tensor::from_slice(&ch, (1, 1, seq, hidden), &cpu).unwrap();
+    let sin_cpu = Tensor::from_slice(&sh, (1, 1, seq, hidden), &cpu).unwrap();
+    let dy_cpu = Tensor::from_slice(&dyh, (batch, 1, seq, hidden), &cpu).unwrap();
+    let out_cpu = rope(false, &x_cpu, &cos_cpu, &sin_cpu).unwrap();
+
+    let x_gpu =
+        Var::from_tensor(&Tensor::from_slice(&xh, (batch, 1, seq, hidden), cuda).unwrap()).unwrap();
+    let cos_gpu = Tensor::from_slice(&ch, (1, 1, seq, hidden), cuda).unwrap();
+    let sin_gpu = Tensor::from_slice(&sh, (1, 1, seq, hidden), cuda).unwrap();
+    let dy_gpu = Tensor::from_slice(&dyh, (batch, 1, seq, hidden), cuda).unwrap();
+    let out_gpu = rope(false, &x_gpu, &cos_gpu, &sin_gpu).unwrap();
+
+    let to_f32 = |t: &Tensor| -> Vec<f32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    };
+
+    let out_cpu_v = to_f32(&out_cpu);
+    let out_gpu_v = to_f32(&out_gpu.to_device(&cpu).unwrap());
+    assert_eq!(out_cpu_v.len(), n);
+    assert_eq!(out_gpu_v.len(), n, "rope f16 GPU fwd length mismatch");
+    assert_floor_below_f16_gradient_band(1, max_abs(xv));
+    let out_floor = measured_near_zero_floor_f16(&out_cpu_v);
+    let out_bound = |r: f32| f16_relative_bound(r, out_floor, 1.0);
+    assert_relative_bound("rope f16 fwd", &out_cpu_v, &out_gpu_v, out_bound);
+    let out_defect: Vec<f32> = to_f32(
+        &rope(true, &x_gpu, &cos_gpu, &sin_gpu)
+            .unwrap()
+            .to_device(&cpu)
+            .unwrap(),
+    );
+    assert_forced_defect_exceeds_bound("rope f16 fwd", &out_cpu_v, &out_defect, out_bound);
+
+    let grads_cpu = (&out_cpu * &dy_cpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
+    let grads_gpu = (&out_gpu * &dy_gpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
+
+    let dx_cpu_v = to_f32(&grads_cpu.get(&x_cpu).unwrap().clone());
+    let dx_gpu_v = to_f32(&grads_gpu.get(&x_gpu).unwrap().to_device(&cpu).unwrap());
+    assert_eq!(dx_cpu_v.len(), n);
+    assert_eq!(dx_gpu_v.len(), n, "rope f16 GPU dx length mismatch");
+    // Live-signal, non-vacuous finiteness (KO-6/KO-7, family F).
+    let dx_gpu_f16: Vec<f16> = grads_gpu
+        .get(&x_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_dtype(DType::F16)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    for (i, h) in dx_gpu_f16.iter().enumerate() {
+        assert_finite_f16(*h, &format!("rope f16 dx[{i}]"));
+    }
+    let dx_floor = measured_near_zero_floor_f16(&dx_cpu_v);
+    let dx_bound = |r: f32| f16_relative_bound(r, dx_floor, 1.0);
+    assert_relative_bound("rope f16 dx", &dx_cpu_v, &dx_gpu_v, dx_bound);
+    let dx_defect: Vec<f32> = {
+        let grads_defect = (&rope(true, &x_gpu, &cos_gpu, &sin_gpu).unwrap() * &dy_gpu)
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .backward()
+            .unwrap();
+        to_f32(&grads_defect.get(&x_gpu).unwrap().to_device(&cpu).unwrap())
+    };
+    assert_forced_defect_exceeds_bound("rope f16 dx", &dx_cpu_v, &dx_defect, dx_bound);
+}
+
+/// Behavioral boundary oracle: `rope_f16.cu` accumulates `x*cos +
+/// rotate_half(x)*sin*sign` in f32 and rounds to F16 exactly once — a
+/// `cos` table scaled well beyond `1.0` (a synthetic, non-unit-circle
+/// fixture; this op's real call site always uses genuine `cos`/`sin`
+/// values in `[-1, 1]`) pushes that final rounding beyond `F16_MAX`, which
+/// must saturate to `±inf`, never a silently clamped finite value.
+#[test]
+fn rope_parity_f16_output_saturates_to_infinity_beyond_f16_max() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let hidden = 4;
+    let period = 1;
+    let xv = [1.0f32, 2.0, 3.0, 4.0];
+    let xh: Vec<f16> = xv.iter().map(|&v| f16::from_f32(v)).collect();
+    // cos scaled so x*cos alone overflows F16_MAX (even at x's smallest
+    // value, 1.0) — 100_000 * 1.0 = 100_000 > F16_MAX; sin = 0 isolates
+    // the cos term.
+    let ch = vec![f16::from_f32(100_000.0); hidden * period];
+    let sh = vec![f16::ZERO; hidden * period];
+    let x_gpu = Tensor::from_slice(&xh, (1, 1, period, hidden), &cuda).unwrap();
+    let cos_gpu = Tensor::from_slice(&ch, (1, 1, period, hidden), &cuda).unwrap();
+    let sin_gpu = Tensor::from_slice(&sh, (1, 1, period, hidden), &cuda).unwrap();
+    let out_gpu: Vec<f16> = rope(false, &x_gpu, &cos_gpu, &sin_gpu)
+        .unwrap()
+        .to_device(&Device::Cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert!(
+        out_gpu.iter().all(|h| h.is_infinite()),
+        "expected every output element to saturate to +/-inf beyond F16_MAX ({F16_MAX}); \
+         got {out_gpu:?}"
+    );
+}
+
+/// Mirror-image boundary oracle (family D, the small-magnitude end):
+/// `x*cos` computed in f32 then rounded to f16 must underflow to EXACT
+/// zero when the true product's magnitude sits strictly below f16's
+/// smallest representable subnormal, never a sign flip or a subnormal
+/// wraparound. `x` and `cos` are each individually f16's own smallest
+/// positive subnormal (so both are legitimately representable, nonzero
+/// f16 inputs), whose PRODUCT (computed in f32) is far below the
+/// subnormal floor.
+#[test]
+fn rope_parity_f16_output_underflows_to_zero_below_f16_min_subnormal() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let hidden = 4;
+    let period = 1;
+    let tiny = f16::from_f32(F16_MIN_POSITIVE_SUBNORMAL);
+    assert_eq!(
+        tiny.to_f32(),
+        F16_MIN_POSITIVE_SUBNORMAL,
+        "fixture invariant: F16_MIN_POSITIVE_SUBNORMAL must round-trip through f16 exactly"
+    );
+    let xh = vec![tiny; hidden];
+    let ch = vec![tiny; hidden * period];
+    let sh = vec![f16::ZERO; hidden * period];
+    let x_gpu = Tensor::from_slice(&xh, (1, 1, period, hidden), &cuda).unwrap();
+    let cos_gpu = Tensor::from_slice(&ch, (1, 1, period, hidden), &cuda).unwrap();
+    let sin_gpu = Tensor::from_slice(&sh, (1, 1, period, hidden), &cuda).unwrap();
+    let out_gpu: Vec<f16> = rope(false, &x_gpu, &cos_gpu, &sin_gpu)
+        .unwrap()
+        .to_device(&Device::Cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    for h in &out_gpu {
+        assert_eq!(
+            *h,
+            f16::ZERO,
+            "expected underflow to exact zero below F16_MIN_POSITIVE_SUBNORMAL \
+             ({F16_MIN_POSITIVE_SUBNORMAL}); got {h:?} across {out_gpu:?}"
+        );
+    }
+    // Isolated reference (KO-8): the true f32 product really is below the
+    // subnormal floor.
+    assert_underflows_to_zero(F16_MIN_POSITIVE_SUBNORMAL * F16_MIN_POSITIVE_SUBNORMAL);
+}
+
 #[test]
 fn rope_parity_contiguous_head_dim_64_modernbert_large_shape() {
     let Some(cuda) = cuda_device() else {
@@ -1521,6 +1949,7 @@ fn rope_parity_contiguous_head_dim_64_modernbert_large_shape() {
     let x = fixture(batch * seq * hidden, 1.0);
     assert_rope_parity_f32(&cuda, batch, seq, hidden, &x);
     assert_rope_parity_bf16(&cuda, batch, seq, hidden, &x);
+    assert_rope_parity_f16(&cuda, batch, seq, hidden, &x);
 }
 
 #[test]
@@ -1927,6 +2356,178 @@ fn assert_softmax_parity_bf16(cuda: &Device, rows: usize, last: usize, sv: &[f32
     assert_forced_defect_exceeds_bound("softmax bf16 dscores", &dx_cpu_v, &dx_defect, dx_bound);
 }
 
+/// [`assert_softmax_parity_bf16`]'s F16 twin (campaign #443 W2b): compares
+/// the SAME op's two device arms (CPU `CpuStorage::F16` vs CUDA
+/// `softmax_f16.cu`). Per the per-op f16 regime table
+/// (`docs/maintainer/cuda-kernel-guide.md` §3.10) this op is
+/// DTYPE-NATIVE at the scale-multiply and mask-add — `k = 2`, mirroring
+/// the bf16 leg's own citation (both devices independently compute
+/// `exp()`/`expf()`), derived from f16's own quantization step.
+fn assert_softmax_parity_f16(cuda: &Device, rows: usize, last: usize, sv: &[f32]) {
+    let cpu = Device::Cpu;
+    let n = rows * last;
+    let mv = mask_fixture(last);
+    let sh: Vec<f16> = sv.iter().map(|&v| f16::from_f32(v)).collect();
+    let mh: Vec<f16> = mv.iter().map(|&v| f16::from_f32(v)).collect();
+
+    let s_cpu = Var::from_tensor(&Tensor::from_slice(&sh, (rows, last), &cpu).unwrap()).unwrap();
+    let m_cpu = Tensor::from_slice(&mh, (1, last), &cpu).unwrap();
+    let out_cpu = softmax(&s_cpu, &m_cpu).unwrap();
+
+    let s_gpu = Var::from_tensor(&Tensor::from_slice(&sh, (rows, last), cuda).unwrap()).unwrap();
+    let m_gpu = Tensor::from_slice(&mh, (1, last), cuda).unwrap();
+    let out_gpu = softmax(&s_gpu, &m_gpu).unwrap();
+
+    let to_f32 = |t: &Tensor| -> Vec<f32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    };
+    let out_cpu_v = to_f32(&out_cpu);
+    let out_gpu_v = to_f32(&out_gpu.to_device(&cpu).unwrap());
+    assert_eq!(out_cpu_v.len(), n);
+    assert_eq!(out_gpu_v.len(), n, "softmax f16 GPU fwd length mismatch");
+    assert_floor_below_f16_gradient_band(2, max_abs(sv).max(max_abs(&mv)));
+    let out_floor = measured_near_zero_floor_f16(&out_cpu_v);
+    let out_bound = |r: f32| f16_relative_bound(r, out_floor, 2.0);
+    assert_relative_bound("softmax f16 fwd", &out_cpu_v, &out_gpu_v, out_bound);
+    // Forced defect: the mask dropped, same mutant class every other
+    // dtype leg in this file uses.
+    let zero_mask_gpu = Tensor::from_slice(&vec![f16::ZERO; last], (1, last), cuda).unwrap();
+    let out_defect = to_f32(
+        &softmax(&s_gpu, &zero_mask_gpu)
+            .unwrap()
+            .to_device(&cpu)
+            .unwrap(),
+    );
+    assert_forced_defect_exceeds_bound("softmax f16 fwd", &out_cpu_v, &out_defect, out_bound);
+
+    let dy_seed_f = fixture(n, 5.0);
+    let dy_seed_h: Vec<f16> = dy_seed_f.iter().map(|&v| f16::from_f32(v)).collect();
+    let dy_cpu = Tensor::from_slice(&dy_seed_h, (rows, last), &cpu).unwrap();
+    let dy_gpu = Tensor::from_slice(&dy_seed_h, (rows, last), cuda).unwrap();
+    let loss_cpu = (&out_cpu * &dy_cpu).unwrap().sum_all().unwrap();
+    let loss_gpu = (&out_gpu * &dy_gpu).unwrap().sum_all().unwrap();
+    let grads_cpu = loss_cpu.backward().unwrap();
+    let grads_gpu = loss_gpu.backward().unwrap();
+
+    let dx_cpu_v = to_f32(&grads_cpu.get(&s_cpu).unwrap().clone());
+    let dx_gpu_v = to_f32(&grads_gpu.get(&s_gpu).unwrap().to_device(&cpu).unwrap());
+    assert_eq!(dx_cpu_v.len(), n);
+    assert_eq!(dx_gpu_v.len(), n, "softmax f16 GPU dscores length mismatch");
+    let dx_cpu_norm: f64 = dx_cpu_v
+        .iter()
+        .map(|&v| (v as f64) * (v as f64))
+        .sum::<f64>()
+        .sqrt();
+    assert!(
+        dx_cpu_norm > 1e-3,
+        "CPU dscores must be measured-nonzero (norm {dx_cpu_norm}) -- a vacuous \
+         all-zero reference would make the parity check below prove nothing"
+    );
+    // Live-signal, non-vacuous finiteness (KO-6/KO-7, family F).
+    let dx_gpu_f16: Vec<f16> = grads_gpu
+        .get(&s_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_dtype(DType::F16)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    for (i, h) in dx_gpu_f16.iter().enumerate() {
+        assert_finite_f16(*h, &format!("softmax f16 dscores[{i}]"));
+    }
+    let dx_floor = measured_near_zero_floor_f16(&dx_cpu_v);
+    let dx_bound = |r: f32| f16_relative_bound(r, dx_floor, 2.0);
+    assert_relative_bound("softmax f16 dscores", &dx_cpu_v, &dx_gpu_v, dx_bound);
+    let zero_mask_gpu = Tensor::from_slice(&vec![f16::ZERO; last], (1, last), cuda).unwrap();
+    let dx_defect: Vec<f32> = {
+        let loss_defect = (&softmax(&s_gpu, &zero_mask_gpu).unwrap() * &dy_gpu)
+            .unwrap()
+            .sum_all()
+            .unwrap();
+        to_f32(
+            &loss_defect
+                .backward()
+                .unwrap()
+                .get(&s_gpu)
+                .unwrap()
+                .to_device(&cpu)
+                .unwrap(),
+        )
+    };
+    assert_forced_defect_exceeds_bound("softmax f16 dscores", &dx_cpu_v, &dx_defect, dx_bound);
+}
+
+/// Behavioral boundary oracle: `softmax_f16.cu`'s scale-multiply
+/// (`f16_mul_rounded`) rounds `scores * scale` to F16 IMMEDIATELY (the
+/// dtype-native regime the per-op table documents) — a `scale` large
+/// enough to push that product beyond `F16_MAX` must saturate to `±inf`
+/// there, exactly like `half::f16`'s own conversion, never a silently
+/// clamped finite value. The row is NOT fully masked (`mask` all-zero,
+/// `FullyMaskedPolicy::Propagate`), so the scaled-and-masked value really
+/// does reach the rounding step under test.
+#[test]
+fn softmax_parity_f16_scale_multiply_saturates_to_infinity_beyond_f16_max() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let last = 4;
+    let sv = [1.0f32, 2.0, 3.0, 4.0];
+    let sh: Vec<f16> = sv.iter().map(|&v| f16::from_f32(v)).collect();
+    let mh = vec![f16::ZERO; last];
+    let s_gpu = Tensor::from_slice(&sh, (1, last), &cuda).unwrap();
+    let m_gpu = Tensor::from_slice(&mh, (1, last), &cuda).unwrap();
+    // scale so large that scores[i] * scale overflows F16_MAX for every i.
+    let huge_scale = 100_000.0f32;
+    let out_gpu: Vec<f16> = softmax_scale(&s_gpu, &m_gpu, huge_scale)
+        .unwrap()
+        .to_device(&Device::Cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    // After the scale-multiply saturates to +inf for every position, the
+    // row-max subtraction (`v - maxv`) is `inf - inf = NaN` for the max
+    // element itself under naive IEEE754 arithmetic, so the CONTRACT here
+    // is non-finite detection (family F), not a specific output value:
+    // this boundary input is outside the op's intended `scale` domain
+    // (`SoftmaxLastDimFused::with_scale`'s own finite-positive-scale
+    // contract governs ORDINARY use; this test proves the KERNEL's raw
+    // arithmetic at least does not silently produce a confident WRONG
+    // finite softmax probability at this boundary).
+    eprintln!("softmax f16 scale-saturation boundary output: {out_gpu:?}");
+    // Every scaled score saturates to +inf, so the row-max subtraction
+    // (`v - maxv`) is `inf - inf = NaN` at that position -- the kernel
+    // must surface this as a genuine non-finite value, NEVER silently
+    // compute some plausible-looking but WRONG finite probability
+    // distribution at a magnitude outside this op's intended domain
+    // (family F: the non-finite path must actually be reachable and
+    // detected, not silently absorbed into a finite-looking result).
+    assert!(
+        out_gpu.iter().any(|h| !h.is_finite()),
+        "expected at least one non-finite output at this out-of-domain scale \
+         (huge_scale={huge_scale}) -- a fully-finite result here would be a confident \
+         WRONG softmax distribution, exactly the family D/F failure mode this oracle \
+         exists to catch: {out_gpu:?}"
+    );
+    // The scale-multiply step itself, isolated (KO-8 independent
+    // reference): confirm `half::f16::from_f32` -- the SAME conversion
+    // `f16_mul_rounded` performs -- really does saturate at this
+    // magnitude, establishing what the kernel's own rounding step must
+    // reproduce.
+    for &v in &sv {
+        assert_saturates_to_infinity(v * huge_scale);
+    }
+}
+
 #[test]
 fn softmax_parity_contiguous_small() {
     let Some(cuda) = cuda_device() else {
@@ -1937,6 +2538,7 @@ fn softmax_parity_contiguous_small() {
     let sv = fixture(rows * last, 1.0);
     assert_softmax_parity_f32(&cuda, rows, last, &sv);
     assert_softmax_parity_bf16(&cuda, rows, last, &sv);
+    assert_softmax_parity_f16(&cuda, rows, last, &sv);
 }
 
 #[test]
@@ -2801,6 +3403,199 @@ fn assert_geglu_parity_bf16(cuda: &Device, rows: usize, intermediate: usize, wv:
     assert_forced_defect_exceeds_bound("geglu bf16 dwi_out", &dwi_cpu_v, &dwi_defect, dwi_bound);
 }
 
+/// [`assert_geglu_parity_bf16`]'s F16 twin (campaign #443 W2b): compares
+/// the SAME op's two device arms (CPU `CpuStorage::F16` vs CUDA
+/// `geglu_f16.cu`). `k = 2`, same rationale as the bf16 leg (identical
+/// fused single-rounding-per-op-step kernel on different hardware).
+fn assert_geglu_parity_f16(cuda: &Device, rows: usize, intermediate: usize, wv: &[f32]) {
+    let cpu = Device::Cpu;
+    let n_out = rows * intermediate;
+    let wh: Vec<f16> = wv.iter().map(|&v| f16::from_f32(v)).collect();
+    let dyv_f = cotangent_fixture(n_out, 0x6E61_1D5E_2000_0003, 3.0);
+    let dyh: Vec<f16> = dyv_f.iter().map(|&v| f16::from_f32(v)).collect();
+
+    let wi_cpu =
+        Var::from_tensor(&Tensor::from_slice(&wh, (rows, 2 * intermediate), &cpu).unwrap())
+            .unwrap();
+    let dy_cpu = Tensor::from_slice(&dyh, (rows, intermediate), &cpu).unwrap();
+    let out_cpu = geglu(&wi_cpu).unwrap();
+
+    let wi_gpu =
+        Var::from_tensor(&Tensor::from_slice(&wh, (rows, 2 * intermediate), cuda).unwrap())
+            .unwrap();
+    let dy_gpu = Tensor::from_slice(&dyh, (rows, intermediate), cuda).unwrap();
+    let out_gpu = geglu(&wi_gpu).unwrap();
+
+    let to_f32 = |t: &Tensor| -> Vec<f32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    };
+    let out_cpu_v = to_f32(&out_cpu);
+    let out_gpu_v = to_f32(&out_gpu.to_device(&cpu).unwrap());
+    assert_eq!(out_cpu_v.len(), n_out);
+    assert_eq!(out_gpu_v.len(), n_out, "geglu f16 GPU fwd length mismatch");
+    assert_floor_below_f16_gradient_band(2, max_abs(wv));
+    // `no-producer: derived` — one f16 ULP at the INPUT's own amplitude
+    // (the near-root-gelu floor rationale [`assert_geglu_parity_bf16`]
+    // documents above, re-derived from f16's own quantization step
+    // instead of copying bf16's `2^-10` input-fraction constant).
+    let out_floor = f16_ulp_size_at(max_abs(wv));
+    let out_bound = |r: f32| f16_relative_bound(r, out_floor, 2.0);
+    assert_relative_bound("geglu f16 fwd", &out_cpu_v, &out_gpu_v, out_bound);
+    let out_defect = geglu_identity_activation_defect(wv, rows, intermediate);
+    assert_forced_defect_exceeds_bound("geglu f16 fwd", &out_cpu_v, &out_defect, out_bound);
+
+    let grads_cpu = (&out_cpu * &dy_cpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
+    let grads_gpu = (&out_gpu * &dy_gpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
+
+    let dwi_cpu_v = to_f32(&grads_cpu.get(&wi_cpu).unwrap().clone());
+    let dwi_gpu_v = to_f32(&grads_gpu.get(&wi_gpu).unwrap().to_device(&cpu).unwrap());
+    assert_eq!(dwi_cpu_v.len(), rows * 2 * intermediate);
+    assert_eq!(
+        dwi_gpu_v.len(),
+        rows * 2 * intermediate,
+        "geglu f16 GPU dwi_out length mismatch"
+    );
+    // Live-signal, non-vacuous finiteness (KO-6/KO-7, family F).
+    let dwi_gpu_f16: Vec<f16> = grads_gpu
+        .get(&wi_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_dtype(DType::F16)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    for (i, h) in dwi_gpu_f16.iter().enumerate() {
+        assert_finite_f16(*h, &format!("geglu f16 dwi_out[{i}]"));
+    }
+    let dwi_floor = f16_ulp_size_at(max_abs(wv));
+    let dwi_bound = |r: f32| f16_relative_bound(r, dwi_floor, 2.0);
+    assert_relative_bound("geglu f16 dwi_out", &dwi_cpu_v, &dwi_gpu_v, dwi_bound);
+    let dwi_defect = geglu_identity_activation_dwi_defect(wv, &dyv_f, rows, intermediate);
+    assert_forced_defect_exceeds_bound("geglu f16 dwi_out", &dwi_cpu_v, &dwi_defect, dwi_bound);
+}
+
+/// Behavioral boundary oracle: `geglu_f16.cu`'s forward rounds the
+/// activation to F16 (ROUND 1), then multiplies by `up` and rounds again
+/// (ROUND 2). Since `gelu_erf_cdf(gate) < 1.0` strictly, `gate` itself
+/// must already be a REPRESENTABLE (i.e. `<= F16_MAX`) f16 value for this
+/// op's own input domain, so ROUND 1 alone can never overflow — the
+/// reachable boundary is ROUND 2: `gate` and `up` each within range, but
+/// their PRODUCT exceeding `F16_MAX`, must saturate to `±inf` there,
+/// exactly like `half::f16`'s own conversion.
+#[test]
+fn geglu_parity_f16_product_saturates_to_infinity_beyond_f16_max() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let intermediate = 1;
+    // Both f16-representable (60_000 is an exact multiple of f16's ULP at
+    // this magnitude, 32) and both well beyond the region where
+    // `gelu_erf_cdf` is float-indistinguishable from `1.0`, so
+    // `act_f32 ~= gate` exactly (ROUND 1 is a no-op here) — but
+    // `act * up` overflows F16_MAX by five orders of magnitude.
+    let gate = 60_000.0f32;
+    let up = 60_000.0f32;
+    let wv = [gate, up];
+    let wh: Vec<f16> = wv.iter().map(|&v| f16::from_f32(v)).collect();
+    assert_eq!(
+        wh[0].to_f32(),
+        gate,
+        "fixture invariant: gate must round-trip through f16 exactly"
+    );
+    let wi_gpu = Tensor::from_slice(&wh, (1, 2 * intermediate), &cuda).unwrap();
+    let out_gpu: Vec<f16> = geglu(&wi_gpu)
+        .unwrap()
+        .to_device(&Device::Cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert!(
+        out_gpu[0].is_infinite() && out_gpu[0].is_sign_positive(),
+        "expected gate*up to saturate to +inf beyond F16_MAX ({F16_MAX}) for \
+         gate={gate}, up={up}; got {:?} -- a confident wrong finite number here is \
+         exactly the family D failure mode this oracle exists to catch",
+        out_gpu[0]
+    );
+    // Isolated reference (KO-8): the product itself, computed
+    // independently, really does exceed F16_MAX.
+    assert!(
+        (gate as f64) * (up as f64) > F16_MAX as f64,
+        "fixture invariant: gate*up must genuinely exceed F16_MAX for this to be a \
+         real boundary case"
+    );
+}
+
+/// Mirror-image boundary oracle (small-magnitude end): `gate =
+/// gelu_erf(gate) * up`, rounded to f16 at the very end (ROUND 2), must
+/// underflow to EXACT zero when the true product's magnitude sits
+/// strictly below HALF of f16's smallest subnormal — the genuine
+/// round-to-zero threshold for round-to-nearest-even at this boundary
+/// (`assert_underflows_to_zero`'s own doc states "strictly below
+/// `F16_MIN_POSITIVE_SUBNORMAL`", but round-to-nearest-even actually
+/// rounds a magnitude in `(subnormal/2, subnormal)` UP to the subnormal
+/// itself, not down to zero — confirmed empirically on this pod: a first
+/// draft of this fixture used `gate = 1.0` (`gelu_erf(1.0) ~= 0.8413`),
+/// whose product with `F16_MIN_POSITIVE_SUBNORMAL` landed at `~0.84 *
+/// subnormal`, ABOVE the true `0.5 * subnormal` threshold, and rounded UP
+/// to the subnormal rather than down to zero — a real, hermetic RED this
+/// oracle caught, not a false positive; see this branch's hand-off report).
+/// `gate = 0.1` (`gelu_erf(0.1) ~= 0.05399`) times
+/// `up = F16_MIN_POSITIVE_SUBNORMAL` (a legitimately representable,
+/// nonzero f16 value) lands at `~0.054 * subnormal`, safely below the
+/// `0.5 * subnormal` threshold.
+#[test]
+fn geglu_parity_f16_product_underflows_to_zero_below_f16_min_subnormal() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let intermediate = 1;
+    let gate = 0.1f32;
+    let up = F16_MIN_POSITIVE_SUBNORMAL;
+    let wv = [gate, up];
+    let wh: Vec<f16> = wv.iter().map(|&v| f16::from_f32(v)).collect();
+    let wi_gpu = Tensor::from_slice(&wh, (1, 2 * intermediate), &cuda).unwrap();
+    let out_gpu: Vec<f16> = geglu(&wi_gpu)
+        .unwrap()
+        .to_device(&Device::Cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(
+        out_gpu[0],
+        f16::ZERO,
+        "expected gate*up to underflow to exact zero below F16_MIN_POSITIVE_SUBNORMAL \
+         ({F16_MIN_POSITIVE_SUBNORMAL}) for gate={gate}, up={up}; got {:?}",
+        out_gpu[0]
+    );
+    // Isolated reference (KO-8): the true activation*up product, computed
+    // independently, really is below the subnormal floor.
+    let cdf = 0.5 * (1.0 + libm::erf((gate as f64) * std::f64::consts::FRAC_1_SQRT_2));
+    let act = gate as f64 * cdf;
+    assert_underflows_to_zero((act * up as f64) as f32);
+}
+
 #[test]
 fn geglu_parity_contiguous_small() {
     let Some(cuda) = cuda_device() else {
@@ -2811,6 +3606,7 @@ fn geglu_parity_contiguous_small() {
     let wv = fixture(rows * 2 * intermediate, 1.0);
     assert_geglu_parity_f32(&cuda, rows, intermediate, &wv);
     assert_geglu_parity_bf16(&cuda, rows, intermediate, &wv);
+    assert_geglu_parity_f16(&cuda, rows, intermediate, &wv);
 }
 
 #[test]

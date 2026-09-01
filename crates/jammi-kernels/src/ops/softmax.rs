@@ -557,7 +557,15 @@
 //! ## Domain, continued: dtype / contiguity / rank
 //!
 //! CPU supports F32 and BF16 (this crate's real training dtypes, matching
-//! every other fused op here). Both `scores` and `mask` must be fully
+//! every other fused op here), plus F16 (`softmax_fwd_f16`/`dscores_f16`
+//! below). Campaign #443 W2b added the matching CUDA F16 dispatch arm
+//! (`crate::cuda::softmax`'s `(DType::F16, DType::F16)` arms, backed by
+//! the SEPARATE `cuda/softmax_f16.cu` translation unit — see that file's
+//! module doc for why it duplicates rather than shares code with the
+//! F32/BF16 kernels), so `jammi-encoders`' admission predicate is now
+//! widened to F16 too (K2's no-Hold-without-dispatch rule); see
+//! `docs/maintainer/cuda-kernel-guide.md`'s per-op f16 reference-regime
+//! table. Both `scores` and `mask` must be fully
 //! contiguous (`contiguous_offsets()`, the same idiom as every other op in
 //! this crate, and for the same reason: a raw-pointer kernel has no flat
 //! linear index for a strided view). `last == 0` degenerates to an empty

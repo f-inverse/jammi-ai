@@ -1,15 +1,21 @@
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
 use candle_core::{CudaStorage, DType, Error, Layout, Result, Shape};
-use half::bf16;
+use half::{bf16, f16};
 
-use super::PTX_LAYER_NORM;
+use super::{PTX_LAYER_NORM, PTX_LAYER_NORM_F16};
 use crate::ops::layer_norm::hidden_of;
 use crate::ops::MAX_HIDDEN;
 
 /// See `../../cuda/axpy.rs`'s identical constant for the module-name
 /// rationale — arbitrary but stable and unique to this op's PTX module.
 const MODULE_NAME: &str = "jammi_kernels_layer_norm";
+
+/// The F16 arm's OWN PTX module name — `layer_norm_f16.cu` is a SEPARATE
+/// translation unit (see that file's module doc), so it needs a distinct
+/// module name from [`MODULE_NAME`] to avoid colliding with the F32/BF16
+/// module's cached `get_or_load_custom_func` entry.
+const MODULE_NAME_F16: &str = "jammi_kernels_layer_norm_f16";
 
 /// One CUDA thread block per row; must match `LN_BLOCK` in `layer_norm.cu`.
 const LN_BLOCK: u32 = 256;
@@ -133,6 +139,24 @@ pub(crate) fn cuda_fwd(
             unsafe { builder.launch(cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
             Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
         }
+        (DType::F16, DType::F16) => {
+            let x = s1.as_cuda_slice::<f16>()?.slice(o1..o2);
+            let g = s2.as_cuda_slice::<f16>()?.slice(g1..g2);
+            let func = device.get_or_load_custom_func(
+                "layer_norm_fwd_f16",
+                MODULE_NAME_F16,
+                PTX_LAYER_NORM_F16,
+            )?;
+            let out = unsafe { device.alloc::<f16>(n) }?;
+            let mut builder = func.builder();
+            builder.arg(&x);
+            builder.arg(&g);
+            builder.arg(&out);
+            builder.arg(&hidden_u32);
+            builder.arg(&eps_f32);
+            unsafe { builder.launch(cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
+            Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
+        }
         (lhs, rhs) if lhs != rhs => Err(Error::DTypeMismatchBinaryOp { lhs, rhs, op: OP }),
         (dtype, _) => Err(Error::UnsupportedDTypeForOp(dtype, OP)),
     }
@@ -246,6 +270,26 @@ pub(crate) fn cuda_bwd_dx(
                 PTX_LAYER_NORM,
             )?;
             let out = unsafe { device.alloc::<bf16>(n) }?;
+            let mut builder = func.builder();
+            builder.arg(&x);
+            builder.arg(&g);
+            builder.arg(&dy);
+            builder.arg(&out);
+            builder.arg(&hidden_u32);
+            builder.arg(&eps_f32);
+            unsafe { builder.launch(cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
+            Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
+        }
+        (DType::F16, DType::F16) => {
+            let x = s1.as_cuda_slice::<f16>()?.slice(o1..o2);
+            let g = s2.as_cuda_slice::<f16>()?.slice(g1..g2);
+            let dy = s3.as_cuda_slice::<f16>()?.slice(d1..d2);
+            let func = device.get_or_load_custom_func(
+                "layer_norm_bwd_dx_f16",
+                MODULE_NAME_F16,
+                PTX_LAYER_NORM_F16,
+            )?;
+            let out = unsafe { device.alloc::<f16>(n) }?;
             let mut builder = func.builder();
             builder.arg(&x);
             builder.arg(&g);
@@ -447,6 +491,62 @@ pub(crate) fn cuda_bwd_dgamma(
                 PTX_LAYER_NORM,
             )?;
             let out = unsafe { device.alloc::<bf16>(hidden) }?;
+            let cast_cfg = LaunchConfig::for_num_elems(hidden as u32);
+            let mut cast_builder = cast_func.builder();
+            cast_builder.arg(&f32_scratch);
+            cast_builder.arg(&out);
+            cast_builder.arg(&hidden_u32);
+            unsafe { cast_builder.launch(cast_cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
+            Ok((
+                CudaStorage::wrap_cuda_slice(out, device),
+                Shape::from(hidden),
+            ))
+        }
+        (DType::F16, DType::F16) => {
+            let x = s1.as_cuda_slice::<f16>()?.slice(o1..o2);
+            let dy = s2.as_cuda_slice::<f16>()?.slice(d1..d2);
+
+            let mean = unsafe { device.alloc::<f32>(rows) }?;
+            let invvar = unsafe { device.alloc::<f32>(rows) }?;
+            let stats_func = device.get_or_load_custom_func(
+                "layer_norm_row_stats_f16",
+                MODULE_NAME_F16,
+                PTX_LAYER_NORM_F16,
+            )?;
+            let mut stats_builder = stats_func.builder();
+            stats_builder.arg(&x);
+            stats_builder.arg(&mean);
+            stats_builder.arg(&invvar);
+            stats_builder.arg(&hidden_u32);
+            stats_builder.arg(&eps_f32);
+            unsafe { stats_builder.launch(row_cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
+
+            let dgamma_func = device.get_or_load_custom_func(
+                "layer_norm_bwd_dgamma_f16",
+                MODULE_NAME_F16,
+                PTX_LAYER_NORM_F16,
+            )?;
+            // Accumulate in F32 (column-tiled, no atomics — see
+            // layer_norm_f16.cu's module doc), then round to f16 once via a
+            // tiny elementwise cast kernel, matching the BF16 arm's
+            // identical convention.
+            let f32_scratch = unsafe { device.alloc::<f32>(hidden) }?;
+            let mut dg_builder = dgamma_func.builder();
+            dg_builder.arg(&x);
+            dg_builder.arg(&dy);
+            dg_builder.arg(&mean);
+            dg_builder.arg(&invvar);
+            dg_builder.arg(&f32_scratch);
+            dg_builder.arg(&rows_u32);
+            dg_builder.arg(&hidden_u32);
+            unsafe { dg_builder.launch(col_cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
+
+            let cast_func = device.get_or_load_custom_func(
+                "layer_norm_cast_f32_to_f16",
+                MODULE_NAME_F16,
+                PTX_LAYER_NORM_F16,
+            )?;
+            let out = unsafe { device.alloc::<f16>(hidden) }?;
             let cast_cfg = LaunchConfig::for_num_elems(hidden as u32);
             let mut cast_builder = cast_func.builder();
             cast_builder.arg(&f32_scratch);

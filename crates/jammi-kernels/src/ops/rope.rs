@@ -126,11 +126,14 @@
 //! `LayerNormFused`'s `hidden == 0` case documents. CPU supports F32 and
 //! BF16 (RoPE's real training dtypes; matches `LayerNormFused`'s CPU
 //! domain deliberately, for the same reason: the profiled workload never
-//! needs F64 here), plus F16 as a disclosed, temporary CPU-only
-//! oracle-reference arm (`rope_fwd_f16` below — no CUDA F16 dispatch arm
-//! exists yet, so admission is not widened to F16 until one does; see
-//! `docs/maintainer/cuda-kernel-guide.md`'s per-op f16 reference-regime
-//! table).
+//! needs F64 here), plus F16 (`rope_fwd_f16` below). Campaign #443 W2b
+//! added the matching CUDA F16 dispatch arm (`crate::cuda::rope`'s
+//! `DType::F16` arm, backed by the SEPARATE `cuda/rope_f16.cu` translation
+//! unit — see that file's module doc for why it duplicates rather than
+//! shares code with the F32/BF16 kernel), so `jammi-encoders`' admission
+//! predicate is now widened to F16 too (K2's no-Hold-without-dispatch
+//! rule); see `docs/maintainer/cuda-kernel-guide.md`'s per-op f16
+//! reference-regime table.
 
 use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, CustomOp3, Error, Layout, Result, Shape, Tensor, D};

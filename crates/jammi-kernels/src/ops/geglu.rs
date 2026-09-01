@@ -244,11 +244,15 @@
 //! reason: a raw-pointer kernel has no flat linear index for a strided
 //! view — this op's real call site is always contiguous, being a matmul's
 //! direct output). CPU supports F32 and BF16 (this crate's real training
-//! dtypes), plus F16 as a disclosed, temporary CPU-only oracle-reference
-//! arm (`geglu_fwd_f16`/`geglu_bwd_f16` below — no CUDA F16 dispatch arm
-//! exists yet, so admission is not widened to F16 until one does; see
+//! dtypes), plus F16 (`geglu_fwd_f16`/`geglu_bwd_f16` below). Campaign
+//! #443 W2b added the matching CUDA F16 dispatch arm
+//! (`crate::cuda::geglu`'s `DType::F16` arms, backed by the SEPARATE
+//! `cuda/geglu_f16.cu` translation unit — see that file's module doc for
+//! why it duplicates rather than shares code with the F32/BF16 kernels),
+//! so `jammi-encoders`' admission predicate is now widened to F16 too
+//! (K2's no-Hold-without-dispatch rule); see
 //! `docs/maintainer/cuda-kernel-guide.md`'s per-op f16 reference-regime
-//! table). The last dimension must be EVEN (it packs two equal halves) —
+//! table. The last dimension must be EVEN (it packs two equal halves) —
 //! an ODD last dimension is a structural domain violation (there is no way
 //! to split it into equal `gate`/`up` halves), refused with a typed error,
 //! not silently truncated or padded. A last dimension of exactly `0`

@@ -102,18 +102,20 @@
 //! device-uniform with CUDA (unlike `Axpy`, which is more generically
 //! typed), since the profiled workload (ModernBERT-large, bf16) never
 //! needs F64 here and keeping the domain device-uniform avoids a
-//! CPU-passes/CUDA-refuses split with no oracle covering it. **F16 is a
-//! disclosed, TEMPORARY exception to that device-uniformity rule**: the
+//! CPU-passes/CUDA-refuses split with no oracle covering it. **F16**: the
 //! CPU F16 arm (`ln_fwd_f16`/`ln_bwd_dx_f16`/`ln_bwd_dgamma_f16` below)
-//! exists to serve as the independent-reference arm the f16 oracle suites
-//! need (`docs/maintainer/cuda-kernel-guide.md`'s per-op f16
-//! reference-regime table names this op's regime as f32-internal,
+//! originally existed only to serve as the independent-reference arm the
+//! f16 oracle suites need (`docs/maintainer/cuda-kernel-guide.md`'s per-op
+//! f16 reference-regime table names this op's regime as f32-internal,
 //! round-once, matching `jammi_encoders::layer_norm::LayerNorm::slow`'s
-//! F16 upcast at `jammi-encoders/src/layer_norm.rs:353-370`); no CUDA F16
-//! dispatch arm exists yet, and the admission predicate is not widened to
-//! F16 until one does (K2's no-Hold-without-dispatch rule), so this
-//! asymmetry is covered by an oracle (this op's own CPU tests below), not
-//! a silent gap.
+//! F16 upcast at `jammi-encoders/src/layer_norm.rs:353-370`); campaign
+//! #443 W2b added the matching CUDA F16 dispatch arm
+//! (`crate::cuda::layer_norm`'s `(DType::F16, DType::F16)` arms, backed by
+//! the SEPARATE `cuda/layer_norm_f16.cu` translation unit — see that
+//! file's module doc for why it duplicates rather than shares code with
+//! the F32/BF16 kernels), so `jammi-encoders`' admission predicate is now
+//! widened to F16 too (K2's no-Hold-without-dispatch rule: the predicate
+//! widening landed in the SAME change as the dispatch arm it depends on).
 //! `hidden == 0` degenerates to an empty output (nothing to normalize) —
 //! this makes `rows = elem_count / hidden` safe without a separate empty
 //! fast-path, since `elem_count == 0` follows fromm `hidden == 0` (a

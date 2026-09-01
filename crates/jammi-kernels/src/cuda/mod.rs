@@ -5,7 +5,7 @@
 
 use candle_core::cuda_backend::cudarc::driver::LaunchConfig;
 use candle_core::{CudaDevice, CudaStorage, DType, Error, Result};
-use half::bf16;
+use half::{bf16, f16};
 
 pub(crate) mod adamw_step;
 pub(crate) mod attention_block;
@@ -26,12 +26,22 @@ pub(crate) const PTX_CAST_SCALE: &str = include_str!(concat!(env!("OUT_DIR"), "/
 pub(crate) const PTX_DROPOUT: &str = include_str!(concat!(env!("OUT_DIR"), "/dropout.ptx"));
 pub(crate) const PTX_GEGLU: &str = include_str!(concat!(env!("OUT_DIR"), "/geglu.ptx"));
 pub(crate) const PTX_LAYER_NORM: &str = include_str!(concat!(env!("OUT_DIR"), "/layer_norm.ptx"));
+/// F16 monomorphic arm — see `layer_norm_f16.cu`'s module doc for why this
+/// is a SEPARATE `.cu` file (and thus a separate PTX module) rather than
+/// a widened `layer_norm.cu`.
+pub(crate) const PTX_LAYER_NORM_F16: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/layer_norm_f16.ptx"));
 pub(crate) const PTX_ROPE: &str = include_str!(concat!(env!("OUT_DIR"), "/rope.ptx"));
+/// F16 monomorphic arm — see `rope_f16.cu`'s module doc.
+pub(crate) const PTX_ROPE_F16: &str = include_str!(concat!(env!("OUT_DIR"), "/rope_f16.ptx"));
 pub(crate) const PTX_ROPE_POSITIONS: &str =
     include_str!(concat!(env!("OUT_DIR"), "/rope_positions.ptx"));
 pub(crate) const PTX_SCALED_CAST_ADD: &str =
     include_str!(concat!(env!("OUT_DIR"), "/scaled_cast_add.ptx"));
 pub(crate) const PTX_SOFTMAX: &str = include_str!(concat!(env!("OUT_DIR"), "/softmax.ptx"));
+/// F16 monomorphic arm — see `softmax_f16.cu`'s module doc.
+pub(crate) const PTX_SOFTMAX_F16: &str = include_str!(concat!(env!("OUT_DIR"), "/softmax_f16.ptx"));
+pub(crate) const PTX_GEGLU_F16: &str = include_str!(concat!(env!("OUT_DIR"), "/geglu_f16.ptx"));
 
 /// `n > u32::MAX`: every op's CUDA launch grid and its kernel's own
 /// indices are 32-bit, so an element count above `u32::MAX` would silently
@@ -65,11 +75,14 @@ pub(crate) fn elemwise_launch_config(n: u32) -> LaunchConfig {
 
 /// Wrap a freshly allocated, zero-length device buffer of `dtype` as a
 /// `CudaStorage` — the degenerate "0 output elements" fast path every op's
-/// `cuda_fwd` (and backward helper) takes identically: F32/BF16 are this
-/// crate's two production dtypes, anything else a typed refusal. The
-/// caller validates cross-tensor dtype agreement FIRST (this only handles
-/// the single already-agreed-on `dtype`, exactly like every inlined match
-/// this replaces did).
+/// `cuda_fwd` (and backward helper) takes identically: F32/BF16/F16 are
+/// this crate's production dtypes (F16 added in campaign #443 W2b,
+/// exactly where a compiled F16 dispatch arm exists — `layer_norm`,
+/// `softmax`, `geglu`, `rope`; a caller for any OTHER op never reaches
+/// this arm with `DType::F16` because ITS OWN dtype match fails first),
+/// anything else a typed refusal. The caller validates cross-tensor dtype
+/// agreement FIRST (this only handles the single already-agreed-on
+/// `dtype`, exactly like every inlined match this replaces did).
 pub(crate) fn alloc_empty(
     device: &CudaDevice,
     dtype: DType,
@@ -82,6 +95,10 @@ pub(crate) fn alloc_empty(
         }
         DType::BF16 => {
             let out = unsafe { device.alloc::<bf16>(0) }?;
+            Ok(CudaStorage::wrap_cuda_slice(out, device.clone()))
+        }
+        DType::F16 => {
+            let out = unsafe { device.alloc::<f16>(0) }?;
             Ok(CudaStorage::wrap_cuda_slice(out, device.clone()))
         }
         dtype => Err(Error::UnsupportedDTypeForOp(dtype, op)),
@@ -111,6 +128,10 @@ pub(crate) fn alloc_zeros(
         }
         DType::BF16 => {
             let out = device.alloc_zeros::<bf16>(len)?;
+            Ok(CudaStorage::wrap_cuda_slice(out, device.clone()))
+        }
+        DType::F16 => {
+            let out = device.alloc_zeros::<f16>(len)?;
             Ok(CudaStorage::wrap_cuda_slice(out, device.clone()))
         }
         dtype => Err(Error::UnsupportedDTypeForOp(dtype, op)),

@@ -1,14 +1,19 @@
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
 use candle_core::{CudaStorage, DType, Error, Layout, Result, Shape};
-use half::bf16;
+use half::{bf16, f16};
 
-use super::PTX_GEGLU;
+use super::{PTX_GEGLU, PTX_GEGLU_F16};
 use crate::ops::geglu::{check_variant, geglu_dims, output_shape, GeluVariant};
 
 /// See `../axpy.rs`'s identical constant for the module-name rationale —
 /// arbitrary but stable and unique to this op's PTX module.
 const MODULE_NAME: &str = "jammi_kernels_geglu";
+
+/// The F16 arm's OWN PTX module name — `geglu_f16.cu` is a SEPARATE
+/// translation unit (see that file's module doc), so it needs a distinct
+/// module name from [`MODULE_NAME`].
+const MODULE_NAME_F16: &str = "jammi_kernels_geglu_f16";
 
 /// Grid-stride block size (see `geglu.cu`'s module doc for why this op is
 /// purely elementwise, with no per-row block reduction).
@@ -69,6 +74,19 @@ pub(crate) fn cuda_fwd(
             let x = s1.as_cuda_slice::<bf16>()?.slice(o1..o2);
             let func = device.get_or_load_custom_func("geglu_fwd_bf16", MODULE_NAME, PTX_GEGLU)?;
             let out = unsafe { device.alloc::<bf16>(n_out) }?;
+            let mut builder = func.builder();
+            builder.arg(&x);
+            builder.arg(&out);
+            builder.arg(&intermediate_u32);
+            builder.arg(&n_out_u32);
+            unsafe { builder.launch(cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
+            Ok((CudaStorage::wrap_cuda_slice(out, device), out_shape))
+        }
+        DType::F16 => {
+            let x = s1.as_cuda_slice::<f16>()?.slice(o1..o2);
+            let func =
+                device.get_or_load_custom_func("geglu_fwd_f16", MODULE_NAME_F16, PTX_GEGLU_F16)?;
+            let out = unsafe { device.alloc::<f16>(n_out) }?;
             let mut builder = func.builder();
             builder.arg(&x);
             builder.arg(&out);
@@ -147,6 +165,24 @@ pub(crate) fn cuda_bwd_dwi_out(
             let func =
                 device.get_or_load_custom_func("geglu_bwd_dwi_out_bf16", MODULE_NAME, PTX_GEGLU)?;
             let out = unsafe { device.alloc::<bf16>(n_full) }?;
+            let mut builder = func.builder();
+            builder.arg(&x);
+            builder.arg(&dy);
+            builder.arg(&out);
+            builder.arg(&intermediate_u32);
+            builder.arg(&n_out_u32);
+            unsafe { builder.launch(cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
+            Ok((CudaStorage::wrap_cuda_slice(out, device), wi_shape))
+        }
+        DType::F16 => {
+            let x = s1.as_cuda_slice::<f16>()?.slice(o1..o2);
+            let dy = s2.as_cuda_slice::<f16>()?.slice(d1..d2);
+            let func = device.get_or_load_custom_func(
+                "geglu_bwd_dwi_out_f16",
+                MODULE_NAME_F16,
+                PTX_GEGLU_F16,
+            )?;
+            let out = unsafe { device.alloc::<f16>(n_full) }?;
             let mut builder = func.builder();
             builder.arg(&x);
             builder.arg(&dy);

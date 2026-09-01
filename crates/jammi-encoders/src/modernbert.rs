@@ -260,8 +260,16 @@ fn softmax_admission_predicate(
     if !device_is_supported(scores.device()) {
         return (false, "device_is_cpu_or_cuda");
     }
-    if scores.dtype() != mask.dtype() || !matches!(scores.dtype(), DType::F32 | DType::BF16) {
-        return (false, "dtype_f32_or_bf16_matching_between_scores_and_mask");
+    // F32/BF16/F16 — F16 widened in campaign #443 W2b, exactly where
+    // `jammi_kernels::cuda::softmax` gained a compiled F16 dispatch arm
+    // backed by the SEPARATE `cuda/softmax_f16.cu` translation unit.
+    if scores.dtype() != mask.dtype()
+        || !matches!(scores.dtype(), DType::F32 | DType::BF16 | DType::F16)
+    {
+        return (
+            false,
+            "dtype_f32_bf16_or_f16_matching_between_scores_and_mask",
+        );
     }
     if !scores.is_contiguous() {
         return (false, "scores_contiguous");
@@ -631,11 +639,14 @@ fn rope_admission_predicate(
     if !device_is_supported(x_device) {
         return (false, "device_is_cpu_or_cuda");
     }
+    // F32/BF16/F16 — F16 widened in campaign #443 W2b, exactly where
+    // `jammi_kernels::cuda::rope` gained a compiled F16 dispatch arm
+    // backed by the SEPARATE `cuda/rope_f16.cu` translation unit.
     if x_dtype != cos.dtype()
         || x_dtype != sin.dtype()
-        || !matches!(x_dtype, DType::F32 | DType::BF16)
+        || !matches!(x_dtype, DType::F32 | DType::BF16 | DType::F16)
     {
-        return (false, "dtype_f32_or_bf16_matching_between_x_cos_sin");
+        return (false, "dtype_f32_bf16_or_f16_matching_between_x_cos_sin");
     }
     if !cos.is_contiguous() || !sin.is_contiguous() {
         return (false, "cos_sin_contiguous");
@@ -1839,8 +1850,11 @@ fn geglu_admission_predicate(wi_out: &Tensor) -> (bool, &'static str) {
     if !device_is_supported(wi_out.device()) {
         return (false, "device_is_cpu_or_cuda");
     }
-    if !matches!(wi_out.dtype(), DType::F32 | DType::BF16) {
-        return (false, "dtype_f32_or_bf16");
+    // F32/BF16/F16 — F16 widened in campaign #443 W2b, exactly where
+    // `jammi_kernels::cuda::geglu` gained a compiled F16 dispatch arm
+    // backed by the SEPARATE `cuda/geglu_f16.cu` translation unit.
+    if !matches!(wi_out.dtype(), DType::F32 | DType::BF16 | DType::F16) {
+        return (false, "dtype_f32_bf16_or_f16");
     }
     if !wi_out.is_contiguous() {
         return (false, "wi_out_contiguous");
@@ -7792,6 +7806,21 @@ mod tests {
         assert_eq!(predicate, "head_dim_even_and_nonzero");
     }
 
+    /// The domain-widening PROOF (K2): F16 `x`/`cos`/`sin` must now HOLD —
+    /// campaign #443 W2b's CUDA F16 dispatch arm
+    /// (`jammi_kernels::cuda::rope`'s `DType::F16` arm) is what makes this
+    /// widening sound; before that arm existed, F16 was correctly refused
+    /// here (`dtype_f32_bf16_or_f16_matching_between_x_cos_sin`, née
+    /// `dtype_f32_or_bf16_matching_between_x_cos_sin`).
+    #[test]
+    fn rope_admission_predicate_now_accepts_f16() {
+        let device = Device::Cpu;
+        let cos = Tensor::from_slice(&[f16::from_f32(1.0); 8], (1, 1, 1, 8), &device).unwrap();
+        let sin = Tensor::from_slice(&[f16::from_f32(0.0); 8], (1, 1, 1, 8), &device).unwrap();
+        let (holds, predicate) = rope_admission_predicate(DType::F16, &device, &cos, &sin, 8);
+        assert!(holds, "matching F16 x/cos/sin must now hold: {predicate}");
+    }
+
     /// The eval-path bit-identity requirement, mirroring
     /// `crate::layer_norm`'s identical test: a `training == false` RoPE
     /// application must be UNCHANGED by `apply_training`'s existence, on
@@ -7941,8 +7970,22 @@ mod tests {
         assert!(!holds, "dtype mismatch must be refused");
         assert_eq!(
             predicate,
-            "dtype_f32_or_bf16_matching_between_scores_and_mask"
+            "dtype_f32_bf16_or_f16_matching_between_scores_and_mask"
         );
+    }
+
+    /// The domain-widening PROOF (K2): matching F16 `scores`/`mask` must
+    /// now HOLD — campaign #443 W2b's CUDA F16 dispatch arm
+    /// (`jammi_kernels::cuda::softmax`'s `(DType::F16, DType::F16)` arm)
+    /// is what makes this widening sound; before that arm existed, F16
+    /// was correctly refused here.
+    #[test]
+    fn softmax_admission_predicate_now_accepts_matching_f16() {
+        let device = Device::Cpu;
+        let scores = Tensor::from_slice(&[f16::from_f32(0.0); 4], (1, 1, 1, 4), &device).unwrap();
+        let mask = Tensor::from_slice(&[f16::from_f32(0.0); 4], (1, 1, 1, 4), &device).unwrap();
+        let (holds, predicate) = softmax_admission_predicate(&scores, &mask, 1.0);
+        assert!(holds, "matching F16 scores/mask must now hold: {predicate}");
     }
 
     /// A `last` (softmax reduction axis) size beyond `MAX_LAST_DIM` is
@@ -8511,6 +8554,19 @@ mod tests {
         let (holds, predicate) = geglu_admission_predicate(&wi_out);
         assert!(!holds, "an odd last dim must be refused");
         assert_eq!(predicate, "last_dim_nonzero_and_even");
+    }
+
+    /// The domain-widening PROOF (K2): an F16 `wi_out` must now HOLD —
+    /// campaign #443 W2b's CUDA F16 dispatch arm
+    /// (`jammi_kernels::cuda::geglu`'s `DType::F16` arms) is what makes
+    /// this widening sound; before that arm existed, F16 was correctly
+    /// refused here (`dtype_f32_bf16_or_f16`, née `dtype_f32_or_bf16`).
+    #[test]
+    fn geglu_admission_predicate_now_accepts_f16() {
+        let device = Device::Cpu;
+        let wi_out = Tensor::from_slice(&[f16::from_f32(0.0); 2 * 8], (1, 2, 8), &device).unwrap();
+        let (holds, predicate) = geglu_admission_predicate(&wi_out);
+        assert!(holds, "F16 wi_out must now be admitted: {predicate}");
     }
 
     /// The eval-path bit-identity requirement, mirroring

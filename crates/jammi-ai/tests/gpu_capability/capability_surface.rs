@@ -436,6 +436,44 @@ fn manifest_string_list(manifest: &serde_json::Value, capability: &str) -> Vec<S
         .collect()
 }
 
+/// `capabilities.internal_subkernels`, which — unlike its sibling capability
+/// lists — is an OBJECT keyed by op, not a string array:
+/// `{"<op>": {"parent": "<op>", "launch_site": "<path>"}, ..}`
+/// (`ci/scripts/check_release_manifest.py` validates that every `parent`
+/// resolves and every `launch_site` exists).
+///
+/// The shape is the point, not an inconsistency to paper over: an internal
+/// subkernel has no admission gate of its own and is PROVABLE only through its
+/// parent's dispatch, so the manifest records the proof RELATION alongside the
+/// name. A plain string list could name the op but not say what proves it —
+/// the same "claimed but unprovable" shape campaign #446 finding 2 was about.
+/// Returns `(op, parent)` pairs, sorted by op.
+fn manifest_internal_subkernels(manifest: &serde_json::Value) -> Vec<(String, String)> {
+    let obj = manifest["lanes"][MANIFEST_LANE]["capabilities"][MANIFEST_INTERNAL_SUBKERNELS]
+        .as_object()
+        .unwrap_or_else(|| {
+            panic!(
+                "manifest lane {MANIFEST_LANE:?}'s capabilities.{MANIFEST_INTERNAL_SUBKERNELS} \
+                 must be an OBJECT keyed by op (each value carrying `parent` + `launch_site`), \
+                 not an array — see ci/scripts/check_release_manifest.py"
+            )
+        });
+    let mut out: Vec<(String, String)> = obj
+        .iter()
+        .map(|(op, entry)| {
+            let parent = entry["parent"].as_str().unwrap_or_else(|| {
+                panic!(
+                    "capabilities.{MANIFEST_INTERNAL_SUBKERNELS}[{op:?}] must carry a string \
+                     `parent` — the op whose fused dispatch is what proves this subkernel ran"
+                )
+            });
+            (op.clone(), parent.to_string())
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 fn compute_precision_to_candle_dtype(p: ComputePrecision) -> DType {
     match p {
         ComputePrecision::F32 => DType::F32,
@@ -800,20 +838,26 @@ async fn capability_surface() {
 /// this suite at all, so `cargo test -p jammi-ai --features live-gpu-tests
 /// --test gpu_capability` runs it anywhere.
 ///
-/// **Expected RED until the campaign lead's manifest reclassification
-/// lands.** That edit (`ci/release-feature-manifest.json` is the docs-ci
-/// owner's file, not this crate's) must:
-/// - add `cast_scale` and `cast_add` to `fused_op_admission` — both DO admit,
-///   under dtype-resolved registry keys (`low_rank_residual_linear.rs:800,
-///   814,899,911`);
-/// - introduce `internal_subkernels = ["rope_positions", "scaled_cast_add"]`
-///   — no admission gate, proven via the parent's dispatch;
-/// - leave `fused_kernels_compiled = ["axpy"]` alone (pending its own W2
-///   disposition).
+/// The manifest reclassification this used to wait on has LANDED
+/// (`ci/release-feature-manifest.json`, `969376cd`): `fused_op_admission`
+/// gained `cast_scale`/`cast_add` (both DO admit, under dtype-resolved
+/// registry keys — `low_rank_residual_linear.rs:800,814,899,911`) and
+/// `adamw_step`; `internal_subkernels` was introduced; `fused_kernels_compiled`
+/// keeps only `axpy`. This test is GREEN and is now a live drift guard rather
+/// than a pending-work marker.
 ///
-/// A RED here names exactly which side is missing which key; it is never a
-/// reason to weaken the assertion to a subset check, because a subset check
-/// is precisely what let the f16 keys go missing.
+/// The three categories are read in the SHAPE each actually has —
+/// `fused_op_admission`/`fused_kernels_compiled` as string lists,
+/// `internal_subkernels` as an OBJECT keyed by op (see
+/// [`manifest_internal_subkernels`], and `ci/scripts/check_release_manifest.py`
+/// which validates each entry's `parent`/`launch_site`). That asymmetry is
+/// deliberate on the manifest's side and is asserted THROUGH here, not
+/// flattened away: a subkernel's `parent` is the only evidence it ran at all.
+///
+/// A RED here names exactly which side is missing which key (or which parent
+/// the two disagree on); it is never a reason to weaken the assertion to a
+/// subset check, because a subset check is precisely what let the f16 keys go
+/// missing.
 #[test]
 fn manifest_capability_categories_match_probed_ops_by_kind() {
     let manifest = load_manifest();
@@ -839,22 +883,28 @@ fn manifest_capability_categories_match_probed_ops_by_kind() {
          cast-epilogue keys went missing). See this test's doc for the pending manifest edit."
     );
 
-    let mut expected_subkernels: Vec<&str> = internal_subkernel_ops()
+    // `internal_subkernels` is checked on BOTH the op set AND the proof
+    // relation. Set-equality alone would let the manifest name the right op
+    // while attributing it to the wrong parent — and the parent IS the whole
+    // evidence chain for these rows (they have no admission gate; "it ran" is
+    // inferred entirely from the parent dispatching fused). A manifest that
+    // said `scaled_cast_add`'s parent were, say, `attention_block_flash` would
+    // be claiming a proof that does not exist, which set-equality could not
+    // see. Comparing `(op, parent)` pairs makes the table and the manifest
+    // agree on the relation, not just the name.
+    let mut expected_subkernels: Vec<(String, String)> = internal_subkernel_ops()
         .into_iter()
-        .map(|(op, _)| op)
+        .map(|(op, parent)| (op.to_string(), parent.to_string()))
         .collect();
-    expected_subkernels.sort_unstable();
-    let mut declared_subkernels = manifest_string_list(&manifest, MANIFEST_INTERNAL_SUBKERNELS);
-    declared_subkernels.sort();
+    expected_subkernels.sort();
+    let declared_subkernels = manifest_internal_subkernels(&manifest);
     assert_eq!(
-        declared_subkernels,
-        expected_subkernels
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect::<Vec<String>>(),
+        declared_subkernels, expected_subkernels,
         "manifest lane {MANIFEST_LANE:?}'s {MANIFEST_INTERNAL_SUBKERNELS} must name EXACTLY the \
-         PROBED_OPS rows with no admission gate of their own, each proven via its parent's \
-         fused dispatch"
+         PROBED_OPS rows with no admission gate of their own, AND agree with the table on each \
+         one's `parent` — the op whose fused dispatch is the only thing that proves the \
+         subkernel ran. A name-only match with a wrong parent is a claimed proof that does not \
+         exist."
     );
 
     // The compiled-but-unprovable bucket must be DISJOINT from everything

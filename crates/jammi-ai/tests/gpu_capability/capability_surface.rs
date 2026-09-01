@@ -196,6 +196,16 @@ fn dtype_class(p: ComputePrecision) -> DtypeClass {
 /// backbone `LowRankResidualLinear::bwd` takes a structurally different,
 /// `admit()`-free "nothing to fuse" branch, so there is no key to assert and
 /// the op is absent rather than claimed a miss.
+///
+/// `"adamw_step"` appears at EVERY dtype (a `DtypeClass::Any` row): the fused
+/// multi-tensor AdamW step's own domain is `F32`, but that is a fact about
+/// the TRAINABLE VARS — which are `F32` on every backbone — not about the
+/// job's backbone dtype class. [`probe_dtype`] already runs a real
+/// `AdamW::step`, so this row is asserted `Holds` under Strict on the
+/// optimizer step that probe already performs; nothing new has to run for it.
+/// See `jammi_kernels::admission::PROBED_OPS`'s "the optimizer's dtype DOMAIN
+/// is not a dtype CLASS" note for why encoding it as `DtypeClass::F32` would
+/// have silently omitted it from every bf16/f16 report.
 fn two_arm_ops_for(dtype: DtypeClass) -> Vec<(&'static str, &'static str)> {
     PROBED_OPS
         .iter()

@@ -1604,9 +1604,38 @@ impl ProbedOp {
 /// | `low_rank_residual_linear` | TwoArm | `lora_linear_fused` | `crates/jammi-lora/src/lora_linear.rs:205` (`admit` at `:799`) |
 /// | `cast_scale` | TwoArm | bf16 → `cast_scale_bf16_f32`, f16 → `cast_scale_f16_f32` | `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:800`, `:814` |
 /// | `cast_add` | TwoArm | bf16 → `cast_add_bf16`, f16 → `cast_add_f16` | `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:899`, `:911` |
+/// | `adamw_step` | TwoArm | `adamw_step_fused` | `crates/jammi-ai/src/fine_tune/adamw.rs:33` (`admit` at `:257`) |
 /// | `mem_efficient_attention` | Cascade | `mem_efficient_attention` | `crates/jammi-encoders/src/modernbert.rs:1303` |
 /// | `rope_positions` | InternalSubkernel(`attention_block_flash`) | — | `crates/jammi-kernels/src/ops/flash_attention.rs:645` |
 /// | `scaled_cast_add` | InternalSubkernel(`low_rank_residual_linear`) | — | `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:693` (CPU), `crates/jammi-kernels/src/cuda/low_rank_residual_linear.rs:131` (CUDA) |
+///
+/// **`adamw_step`: the optimizer's dtype DOMAIN is not a dtype CLASS.**
+/// `adamw_step_fused`'s own admission predicate requires
+/// `theta`/`first_moment`/`second_moment`/`grad` to be `F32`
+/// (`crates/jammi-ai/src/fine_tune/adamw.rs`'s `fused_admission_predicate`,
+/// `dtype_f32`), and `crates/jammi-kernels/src/ops/adamw_step.rs`'s module
+/// doc names `F32` as the op's only implemented dtype. It is tempting to
+/// encode that as `(DtypeClass::F32, "adamw_step_fused")`. **That would be
+/// wrong**, and wrong in exactly finding 2's own shape.
+///
+/// [`DtypeClass`] selects on the JOB'S BACKBONE dtype — it is what a caller
+/// resolves a registry key WITH (`crates/jammi-ai/src/fine_tune/worker.rs`'s
+/// `dtype_class_of(config.backbone_dtype)`). The optimizer's `F32` domain is
+/// a fact about a DIFFERENT tensor set: the TRAINABLE variables, which are
+/// `F32` on every backbone. `jammi-lora` refuses a non-`F32` adapter outright
+/// (`lora_linear.rs`'s `lora_ab_dtype_f32` predicate), and the trainer builds
+/// its `VarBuilder` at `DType::F32` regardless of `backbone_dtype`. So an
+/// `f16`- or `bf16`-backbone job's optimizer step admits and dispatches
+/// `adamw_step_fused` exactly as an `f32` job's does.
+///
+/// Gating the row on `DtypeClass::F32` would therefore OMIT `adamw_step` from
+/// every `bf16`/`f16` job's report while the op demonstrably dispatched —
+/// a silent-eager invisibility on the headline dtype, which is the defect
+/// this whole table exists to retire. `Any` is the honest encoding: one
+/// registry key covering every backbone dtype. The `F32`-only domain still
+/// shows up where it belongs — as this op's own admission PREDICATE, whose
+/// failure would be reported as `holds: false` with the verbatim `dtype_f32`
+/// key, never as an absent row.
 ///
 /// **Registry keys that exist but are deliberately NOT rows** (each read at
 /// the cited call site during this population, and excluded for a stated
@@ -1619,12 +1648,6 @@ impl ProbedOp {
 ///   `ci/release-feature-manifest.json` declares it as `flash_compiled` +
 ///   `flash_dtypes`, not as a `fused_op_admission` entry. Adding it here
 ///   would make the same fact appear twice in one artifact.
-/// - `adamw_step_fused` (`crates/jammi-ai/src/fine_tune/adamw.rs:33`, `admit`
-///   at `:257`) — a real two-arm site that DOES dispatch during the probe's
-///   optimizer step, but it is not a declared capability in
-///   `ci/release-feature-manifest.json` today. Adding it is a report-
-///   vocabulary (K4) and manifest change in its own right, raised to the
-///   campaign lead rather than slipped in here.
 /// - `lora_dropout` (`crates/jammi-lora/src/lora_linear.rs:37`) and
 ///   `lora_epilogue` (`:66`) — registry entries with NO `admit()` call site
 ///   anywhere: both are documented as "permanently `{fused: 0, eager: 0}`",
@@ -1697,6 +1720,15 @@ pub const PROBED_OPS: &[ProbedOp] = &[
             (DtypeClass::Bf16, "cast_add_bf16"),
             (DtypeClass::F16, "cast_add_f16"),
         ],
+    },
+    ProbedOp {
+        report_key: "adamw_step",
+        kind: ProbedOpKind::TwoArm,
+        // `DtypeClass::Any`, NOT `F32` — see this table's "the optimizer's
+        // dtype domain is not a dtype CLASS" note. The op's own tensors are
+        // F32-only; the JOB's backbone dtype is a different axis, and it is
+        // the job's that `DtypeClass` selects on.
+        registry: &[(DtypeClass::Any, "adamw_step_fused")],
     },
     ProbedOp {
         report_key: "mem_efficient_attention",

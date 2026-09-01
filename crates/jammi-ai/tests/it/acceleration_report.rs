@@ -816,6 +816,37 @@ async fn probed_ops_bind_to_the_real_registry_and_key_sets_are_dtype_determinist
         "the f32 control must still report layer_norm as genuinely admitted — otherwise the \
          cast_scale/cast_add absence above would be vacuous. Report: {f32_report}"
     );
+
+    // `adamw_step` (campaign #446 scope item 2): the fused multi-tensor AdamW
+    // step admits and dispatches on CPU at F32 — `adamw_step.rs` ships real
+    // `cpu_fwd` arms for both `AdamMomentUpdate` (InplaceOp2) and
+    // `AdamThetaUpdate` (InplaceOp3), and `jammi_kernels::admission::
+    // device_is_supported` accepts CPU — so this assertion is a genuine live
+    // binding of the table's `adamw_step_fused` key on THIS lane, not a
+    // CUDA-only claim taken on trust.
+    //
+    // Asserted on ALL THREE jobs, including the two f16 ones, because that is
+    // the load-bearing half: the op's own predicate is F32-ONLY
+    // (`fused_admission_predicate`'s `dtype_f32`), but that is a fact about
+    // the TRAINABLE VARS, which are F32 on every backbone (`jammi-lora`
+    // refuses a non-F32 adapter via `lora_ab_dtype_f32`; the trainer's
+    // `VarBuilder` is built at `DType::F32` regardless of `backbone_dtype`).
+    // The dtype CLASS the table resolves on is the JOB's BACKBONE dtype — a
+    // different axis. Had the row been encoded `DtypeClass::F32`, the two f16
+    // reports below would OMIT `adamw_step` while the op demonstrably
+    // dispatched: a silent-eager invisibility on the headline dtype, i.e. a
+    // fresh instance of the very defect this table retired. These two f16
+    // assertions are what make that concrete rather than argued.
+    for (precision, report) in &reports {
+        assert_eq!(
+            report["ops"]["adamw_step"]["holds"],
+            serde_json::json!(true),
+            "the {precision} job must report adamw_step as genuinely admitted — the fused \
+             AdamW step dispatches on CPU at F32 trainable vars on EVERY backbone dtype, so a \
+             missing (or false) entry here means either the probe's optimizer step never ran \
+             or the table gated this row on the wrong dtype axis. Report: {report}"
+        );
+    }
 }
 
 /// Campaign #446 finding 3 — FABRICATED MISS REASONS. Four jobs in ONE

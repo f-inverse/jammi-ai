@@ -44,8 +44,11 @@ source (`crates/jammi-kernels/third_party/flash-attention`), gated behind the `f
 feature, and only the CUDA release lanes (the tarball, the `cu12` wheel, the container image)
 compile it in. The `jammi-server` this render's own `grpc://` cell talks to is **not** one of
 those builds — it is a plain `cargo build --release -p jammi-server`, no `cuda` feature, no
-`flash-attn` feature (the same binary `cookbook-book.yml` / `cookbook-render.yml` build via
-`setup-jammi-py`'s `build-server: "true"` input) — because neither this book's PR gate nor its
+`flash-attn` feature (the same binary this book's CI provisions through `setup-jammi-py`'s
+`build-server: "true"` input, which is exactly that bare `cargo build --release -p jammi-server`:
+the nightly full-book render always builds it — `cookbook-render.yml` — and the PR book gate
+builds it when its chapter selector picks a chapter that needs a live server, as this one always
+does when it is selected at all) — because neither this book's PR gate nor its
 nightly render ever has a CUDA device to hand a compiled kernel to. That is a fact about *this
 render's own CI machine*, not a gap in the report mechanism: everything below through the
 `## Measured on real GPU hardware, not here` heading is a live, real submission against a live,
@@ -79,29 +82,40 @@ print(f"encoder: {TINY_MODERNBERT}  (tiny ModernBERT architecture, hidden_size=3
 ## Standing up the remote server
 
 The same `LiveServer` shape [the model-catalog cache emit](lifecycle.qmd) uses: a real
-`jammi-server` on a free loopback port, readiness-polled via a client handshake, torn down on
-exit. `jammi-server` must already be on `PATH` — the render harness places the freshly built
-binary there before invoking `quarto render`, exactly as `cookbook-render.yml` documents.
+`jammi-server` on a loopback port **the kernel assigns to the child itself**, readiness-polled via
+a client handshake, torn down on exit. `jammi-server` must already be on `PATH` — the render
+harness places the freshly built binary there before invoking `quarto render`, exactly as
+`cookbook-render.yml` documents.
+
+One detail worth naming, because it is the difference between a chapter that renders and a
+chapter that flakes: this cell never *picks* a port. Binding a socket in this process to learn a
+free port, closing it, and handing the number to the child opens a release-then-rebind window —
+any other process on the machine (a parallel render, another test) can take that port in between,
+and the server dies on a bind error that looks like a chapter bug. Instead both listeners are
+configured `127.0.0.1:0`, so the **child** holds each binding from the instant the kernel assigns
+it, and the child announces the addresses it actually got on stdout in a fixed, machine-parseable
+line (`jammi-server listening flight=<addr> health=<addr>`, printed after bind and before serve —
+the engine's own subprocess harnesses read exactly this banner). The reader below keeps draining
+that pipe for the process's whole life, not just until the banner: a full stdout pipe would block
+the child's own logging.
 
 ```{python}
 import os
+import queue
 import shutil
-import socket
 import subprocess
 import tempfile
+import threading
 import time
 
 import jammi
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 class LiveServer:
-    """A real `jammi-server` on a free port — readiness-polled, torn down on exit."""
+    """A real `jammi-server` on kernel-assigned ports — announced, readiness-polled, torn down."""
+
+    # The server's own fixed startup banner, printed between bind and serve.
+    BANNER = "jammi-server listening "
 
     def __enter__(self) -> "LiveServer":
         server_bin = shutil.which("jammi-server")
@@ -110,21 +124,53 @@ class LiveServer:
             "the render harness builds and places on PATH (see cookbook-render.yml)"
         )
         self._artifact_dir = tempfile.mkdtemp(prefix="jammi_srv_ftaccel_")
-        flight_port, health_port = _free_port(), _free_port()
         env = dict(os.environ)
         env["JAMMI_ARTIFACT_DIR"] = self._artifact_dir
-        env["JAMMI_SERVER__FLIGHT_LISTEN"] = f"127.0.0.1:{flight_port}"
-        env["JAMMI_SERVER__HEALTH_LISTEN"] = f"127.0.0.1:{health_port}"
+        # `:0` on BOTH listeners — the child binds, the kernel assigns, nothing
+        # here ever holds-and-releases a port number.
+        env["JAMMI_SERVER__FLIGHT_LISTEN"] = "127.0.0.1:0"
+        env["JAMMI_SERVER__HEALTH_LISTEN"] = "127.0.0.1:0"
         env["JAMMI_SERVER__SERVICES"] = "all"
         self.proc = subprocess.Popen(
-            [server_bin], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+            [server_bin],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
         )
-        self.port = flight_port
+        announced: queue.Queue = queue.Queue(maxsize=1)
+        self._log: list = []
+
+        def drain() -> None:
+            reported = False
+            for line in self.proc.stdout:
+                self._log.append(line)
+                if not reported and line.startswith(self.BANNER):
+                    fields = dict(
+                        tok.split("=", 1)
+                        for tok in line[len(self.BANNER):].split()
+                        if "=" in tok
+                    )
+                    announced.put(int(fields["flight"].rsplit(":", 1)[1]))
+                    reported = True  # announced once; keep draining regardless
+
+        self._drain_thread = threading.Thread(target=drain, daemon=True)
+        self._drain_thread.start()
+        try:
+            self.port = announced.get(timeout=30)
+        except queue.Empty:
+            self.proc.terminate()
+            raise RuntimeError(
+                "jammi-server never announced its listening ports (did it fail to "
+                f"bind?):\n{''.join(self._log)}"
+            ) from None
+        # Bound is not yet serving — the banner prints before `serve()` — so
+        # still poll a real client handshake before handing the server out.
         deadline = time.time() + 30
         while time.time() < deadline:
             if self.proc.poll() is not None:
-                out = self.proc.stdout.read().decode(errors="replace") if self.proc.stdout else ""
-                raise RuntimeError(f"jammi-server exited early:\n{out}")
+                raise RuntimeError(f"jammi-server exited early:\n{''.join(self._log)}")
             try:
                 handshake = jammi.connect(f"grpc://127.0.0.1:{self.port}")
                 handshake.get_server_info()
@@ -170,15 +216,32 @@ remote.add_source("ftaccel_pairs", url=f"file://{_corpus_path}", format="parquet
 print("registered a 12-row (anchor, positive) pairs source")
 ```
 
-## Submitting an `f16` fine-tune, and reading its report before it is known
+## Submitting an `f16` fine-tune, and reading its report across the job's lifecycle
 
 `fine_tune`'s `backbone_dtype` only takes effect on the LoRA-adapter arm (`target_modules`
 non-empty) — that is the arm that actually materializes a dtype-typed encoder to run the
-acceleration probe against. Right after submission the report is `{"state": "pending"}`: the job
-exists, but no worker has claimed it yet, so no device is even known. The SAME handle's
-`wait()` blocks until the run finishes; by then the claiming worker has long since resolved a
-device and recorded a `"determined"` report — read back through the exact call a mid-training
-status poll would make.
+acceleration probe against. Submission itself writes `{"state": "pending"}` into the job's report
+column: the job exists, but no worker has claimed it yet, so no device is even known. That marker
+is an **explicit written state**, not an empty column — which is why the read below can pin
+something absolute even though it cannot pin *which* live state it catches: an unset report is
+`None` on this surface (an honest absence of information, deliberately distinguishable from
+`pending`), so a just-submitted job is never `None`.
+
+**Why the next cell does not assert `pending` byte-exactly.** The server this chapter starts is
+an all-in-one deployment: mounting the `train` tier is what makes `fine_tune` callable at all,
+and that same tier runs the claiming worker *inside this server*. So between the submit RPC
+returning and the status RPC landing, that worker's claim loop may already have claimed this job,
+resolved the device and replaced the marker with a `"determined"` report — a genuine race, not a
+flake, and one a slower (2-vCPU) render machine loses more often than a fast one. There is **no
+public surface on this client to submit a job with the worker paused** — no "queue only" mode, no
+claim-holding handle; turning the `train` tier off to stop the worker removes submission along
+with it. That is reported here as a gap in the public surface rather than papered over: this
+chapter will not sleep to widen a window, and will not assert a state it cannot deterministically
+observe. It therefore asserts (a) the race-free fact — never `None`, a real marker was written at
+submission — and (b) whichever of the two legal live states it caught, **byte-exactly, in that
+state's own branch**: a report that is neither is a real contract violation and still fails here.
+The byte-exact `"determined"` assertions then land after `wait()`, where the job is terminal and
+nothing races the read.
 
 ```{python}
 import json
@@ -199,11 +262,23 @@ job_f16 = remote.fine_tune(
     target_modules=TARGET_MODULES,
 )
 
-# Read the report BEFORE waiting — this is the submission-time state every job
-# carries, an explicit marker rather than SQL NULL (esc-075's own contract).
-pending = job_f16.acceleration_report()
-print("immediately after submit:", pending)
-assert pending == {"state": "pending"}, pending
+# Read the report BEFORE waiting. Race-free part first: submission ALWAYS
+# writes a marker, so this is never `None` — `None` is reserved for a genuinely
+# unset column, an absence of information, never an acceleration-state claim.
+at_submit = job_f16.acceleration_report()
+print("immediately after submit:", at_submit)
+assert at_submit is not None, "a just-submitted job must carry a written marker, not an unset one"
+
+# Racy part, pinned honestly: the in-server worker may already have claimed.
+# Exactly two states are legal at this instant, and each is asserted BYTE-EXACT
+# in its own branch — nothing is loosened, only the choice between them is
+# conceded to the race the prose above names.
+if at_submit["state"] == "pending":
+    assert at_submit == {"state": "pending"}, at_submit
+    print("  -> caught the submission-time marker (the worker had not claimed yet)")
+else:
+    assert at_submit["state"] == "determined", at_submit
+    print("  -> the in-server worker claimed before this read; already determined")
 
 job_f16.wait()
 report_f16 = job_f16.acceleration_report()
@@ -220,9 +295,13 @@ The report's `ops` map is one entry per fused primitive this job's own probe for
 exercised, each `{"holds": bool, "reason": str}` — `holds: true` means the SAME dispatch
 registry the kernel's own admission gate maintains actually recorded a fused hit for THIS job;
 `holds: false` carries the exact domain-check `reason` key the admission predicate itself
-produced, never a re-derived one. This one CPU job Holds on six of the seven `ops` entries and
-Misses on the seventh (`attention_block`); `flash` (a separate field, discussed below) Misses
-too — each Miss teaches a different, independent limit:
+produced, never a re-derived one. This one CPU job `Hold`s on all six of the primitives its probe
+attributed a clean dispatch to — `layer_norm`, `rope`, `softmax`, `geglu`, `dropout`,
+`low_rank_residual_linear` — and `Miss`es on the one remaining entry, `attention_block`; `flash`
+(a separate field, discussed below) `Miss`es too. The map's *membership* is itself a measured
+fact, not a fixed-size table: an op whose before/after dispatch counters show no clean single-arm
+signal is omitted entirely rather than guessed at (the mechanism, and a GPU report that omits
+more, are discussed further down). Each `Miss` teaches a different, independent limit:
 
 ```{python}
 for op in sorted(report_f16["ops"]):
@@ -232,6 +311,23 @@ for op in sorted(report_f16["ops"]):
 
 print(f"\n  {'flash':<24s} {'Hold' if report_f16['flash']['holds'] else 'Miss':<5s} "
       f"reason={report_f16['flash']['reason']}")
+
+# Measured, per op — the verdicts and reason keys the prose below explains, each
+# asserted individually so a widened probe (a new attributed op appearing in the
+# map) cannot quietly invalidate any claim made here.
+HOLDING = ("layer_norm", "rope", "softmax", "geglu", "dropout", "low_rank_residual_linear")
+for op in HOLDING:
+    assert report_f16["ops"][op] == {"holds": True, "reason": "domain_ok"}, report_f16["ops"][op]
+
+assert report_f16["ops"]["attention_block"] == {
+    "holds": False,
+    "reason": "dtype_f32_matching_between_qkv_and_mask_on_cpu",
+}, report_f16["ops"]["attention_block"]
+assert report_f16["flash"] == {"holds": False, "reason": "cuda_not_compiled"}, report_f16["flash"]
+
+n_hold = sum(1 for e in report_f16["ops"].values() if e["holds"])
+print(f"\n  attributed ops: {len(report_f16['ops'])}   Hold: {n_hold}   "
+      f"Miss: {len(report_f16['ops']) - n_hold}")
 ```
 
 - **`layer_norm` / `rope` / `softmax` / `geglu` / `dropout` / `low_rank_residual_linear` →
@@ -406,10 +502,16 @@ proof; that oracle is the numerics proof, and the two are deliberately separate 
 
 Two honest observations about what a GPU report for this job looks like. First, on real A100
 hardware the LoRA epilogue genuinely dispatches fused at `f16` — the engine's own committed
-A/B provenance for this exact fixture records `lora_linear_fused` firing on every training
-forward of an `f16` run with **zero** eager fallbacks (`docs/plans/63-how-well/measurements/`
-carries the raw per-leg reports), so a GPU report shows `low_rank_residual_linear` `Hold`ing
-just as the CPU cells above do. Second, a GPU report's `ops` map may omit `rope`, `softmax`,
+A/B provenance for the reporter's own checkpoint — ModernBERT-large, not this render's tiny
+fixture — records `lora_linear_fused` firing on every training forward of an `f16` run with
+**zero** eager fallbacks: all sixteen committed legs of that `f16` sweep report
+`lora_linear_fused_dispatches = 13104` against `lora_linear_eager_dispatches = 0`
+(`docs/plans/63-how-well/measurements/f16-sweep/raw/`). One honesty note on that citation: the
+sweep's own artifact is stamped `INVALID` as an **A/B verdict** (its merge-time premise
+pre-registered the flash-cascade differential as `BF16`-only, so every `f16` leg violated it and
+no sign test ran) — the dispatch counters cited here are raw recorded per-leg facts that verdict
+does not touch, and nothing about the A/B comparison is claimed from them. So a GPU report shows
+`low_rank_residual_linear` `Hold`ing just as the CPU cells above do. Second, a GPU report's `ops` map may omit `rope`, `softmax`,
 and `attention_block` entirely rather than reporting them: `two_arm_holds` (the mechanism that
 turns a before/after dispatch-counter delta into a report entry) declines to fabricate an entry
 for an op whose counters show no clean single-arm signal, and once FlashAttention itself owns
@@ -442,7 +544,7 @@ honest "no independent signal", never a smoothed-over claim.
 > submission, `{"state": "determined", "ops": {...}, "flash": {...}}` once a worker resolves a
 > device, each entry carrying the SAME `Hold`/`Miss` + `reason` vocabulary the kernel's own
 > admission gate produces. On this render's CPU-only server every `ops` entry this chapter
-> measured is real (six of seven primitives genuinely `Hold` — a portable, dtype-only domain
+> measured is real (the six named primitives genuinely `Hold` — a portable, dtype-only domain
 > check `f16` now clears everywhere it is dtype-eligible — while `attention_block`'s per-device
 > dtype gate genuinely `Miss`es, for the reason this chapter names exactly), and `flash` is always
 > the honest compiled-away floor. The numbers only a real CUDA server can produce —

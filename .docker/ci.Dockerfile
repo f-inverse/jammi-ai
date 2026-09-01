@@ -1,5 +1,16 @@
 FROM quay.io/pypa/manylinux_2_28_x86_64
 
+# Platform SQLite runtime (`/lib64/libsqlite3.so.0`). The esc-073 harness
+# (`crates/jammi-db/tests/it/esc_073_foreign_sqlite_library.rs`) `dlopen`s it to
+# get a SECOND SQLite library instance in one process alongside the statically
+# bundled `libsqlite3-sys`; with no platform library the harness has nothing to
+# collide with and reports itself vacuous. The base image happens to carry
+# `sqlite-libs` today, but NO package in it requires that package, so a base
+# rebuild could drop it and silently hollow out the harness. Named explicitly
+# here instead of inherited by luck (a no-op when already present).
+RUN yum install -y sqlite-libs \
+    && yum clean all
+
 # protoc: prost-build (via substrait) invokes protoc at build time.
 # Not in AlmaLinux 8 repos — install from GitHub release.
 ARG PROTOC_VERSION=28.3

@@ -233,8 +233,9 @@ CPU-hermetic `modernbert_alloff.json` run ("How to regenerate" above) --
 "aarch64-apple-darwin"`, `build_features: []` (both the top-level
 `provenance` block and the `finetune_run` tier's own field). This is not
 merely stale metadata: `flash_capability_gates` DomainMisses the flash
-cascade whenever `dtype != DType::BF16`
-(`jammi-encoders/src/modernbert.rs`'s own `dtype_is_bf16` gate), and no CUDA
+cascade whenever `dtype` is neither `DType::BF16` nor `DType::F16`
+(`jammi-encoders/src/modernbert.rs:2450`'s own `dtype_is_bf16_or_f16` gate;
+`f32` is outside that admitted set), and no CUDA
 device exists on `aarch64-apple-darwin` at all -- a `fused` golden
 reporting `attention_block_flash_fused_dispatches: 840` while ALSO claiming
 `f32`/`cpu`/`aarch64-apple-darwin` was an UNEMITTABLE state no real producer

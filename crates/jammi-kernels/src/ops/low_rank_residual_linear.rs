@@ -28,7 +28,11 @@
 //! ## The three tensor arguments
 //!
 //! - `x`: `[.., in]` (rank 2 — a pooled/flattened activation — or rank 3
-//!   — `[batch, seq, in]`), the backbone dtype (`F32` or `BF16`).
+//!   — `[batch, seq, in]`), the backbone dtype (`F32`, `BF16`, or `F16` —
+//!   campaign #443 D1 widens the CUDA arm's admitted dtype set to `F16` on
+//!   the same basis `crate::cuda::attention_block`'s own widening states:
+//!   this op's `.cu`-kernel-free composition follows its callees'
+//!   (`DropoutFused`/`ScaledCastAdd`) compiled dispatch arms).
 //! - `w`: `[out, in]`, the FROZEN base weight, same dtype as `x`.
 //! - `ab`: `F32` `[in + out, rank]`, THE pack layout — row 0 through
 //!   `in - 1` holds `A^T` (`[in, rank]`), row `in` through `in + out - 1`
@@ -302,7 +306,9 @@ use candle_core::{
     CpuStorage, CustomOp1, CustomOp2, CustomOp3, DType, Error, Layout, Result, Shape, Tensor,
 };
 
-use super::{CastAddBf16, CastScaleBf16F32, DropoutFused, ScaledCastAdd};
+use super::{
+    CastAddBf16, CastAddF16, CastScaleBf16F32, CastScaleF16F32, DropoutFused, ScaledCastAdd,
+};
 
 /// The Philox draw's `(seed, layer_id, forward_idx, p)` key, reserved ONCE
 /// per site per forward by the CALL SITE's own key-reservation function
@@ -611,7 +617,7 @@ impl CustomOp3 for LowRankResidualLinear {
                 op: self.name(),
             });
         }
-        if !matches!(s1.dtype(), DType::F32 | DType::BF16) {
+        if !matches!(s1.dtype(), DType::F32 | DType::BF16 | DType::F16) {
             return Err(Error::UnsupportedDTypeForOp(s1.dtype(), self.name()));
         }
         for (l, what) in [(l2, "w"), (l3, "ab")] {
@@ -770,28 +776,55 @@ impl CustomOp3 for LowRankResidualLinear {
         // already minimal); the `BF16` branch is the cast-boundary lever's
         // Wave 1 (e) — `CastScaleBf16F32` folds the widening cast and the
         // affine into one kernel (`ops::cast_scale`'s module doc has the
-        // full traffic model and bit-identity derivation). Dispatched
-        // through `admit` so `JAMMI_KERNELS_DISABLE=cast_scale_bf16_f32`
-        // forces the original two-kernel chain back on for a same-build
-        // forced A/B, and the dispatch count is observable either way
-        // (zero dispatch is RED, never green — guide §3.5).
-        let d_lora_2d = if grad_res.dtype() == DType::F32 {
-            grad_res
+        // full traffic model and bit-identity derivation). The `F16` branch
+        // (campaign #443 D1, the 8th admission-widening site) is the SAME
+        // lever at `F16`'s own margin — `CastScaleF16F32` (campaign #443
+        // W2c), a genuinely independent type (not `CastScaleBf16F32` with
+        // its input reinterpreted — `ops::cast_scale`'s module doc states
+        // why an `F16` analog is real kernel authoring, not a cast). Each
+        // 16-bit branch is dispatched through `admit` under its OWN op key
+        // so `JAMMI_KERNELS_DISABLE=cast_scale_bf16_f32` (or
+        // `cast_scale_f16_f32`) forces its own two-kernel chain back on
+        // independently, and the dispatch count is observable either way
+        // (zero dispatch is RED, never green — guide §3.5). A dtype
+        // reaching neither arm here would already have been refused at the
+        // op's own forward-boundary dtype gate (`cuda_fwd`'s/`cpu_fwd`'s
+        // `matches!` check) — this match is therefore exhaustive over the
+        // op's real domain, with a named refusal (not a silent catch-all)
+        // for anything else that reaches `bwd` directly (e.g. a test).
+        let d_lora_2d = match grad_res.dtype() {
+            DType::F32 => grad_res
                 .affine(f64::from(self.scale), 0.0)?
-                .reshape((m, outf))?
-        } else {
-            let dy_f32 = match admit_cast_boundary(
-                "cast_scale_bf16_f32",
-                "grad_res_is_bf16_a_fusable_two_kernel_chain",
-            )? {
-                crate::admission::DispatchOutcome::Fused => {
-                    super::apply1(grad_res, CastScaleBf16F32::new(f64::from(self.scale)))?
-                }
-                crate::admission::DispatchOutcome::Eager => grad_res
-                    .to_dtype(DType::F32)?
-                    .affine(f64::from(self.scale), 0.0)?,
-            };
-            dy_f32.reshape((m, outf))?
+                .reshape((m, outf))?,
+            DType::BF16 => {
+                let dy_f32 = match admit_cast_boundary(
+                    "cast_scale_bf16_f32",
+                    "grad_res_is_bf16_a_fusable_two_kernel_chain",
+                )? {
+                    crate::admission::DispatchOutcome::Fused => {
+                        super::apply1(grad_res, CastScaleBf16F32::new(f64::from(self.scale)))?
+                    }
+                    crate::admission::DispatchOutcome::Eager => grad_res
+                        .to_dtype(DType::F32)?
+                        .affine(f64::from(self.scale), 0.0)?,
+                };
+                dy_f32.reshape((m, outf))?
+            }
+            DType::F16 => {
+                let dy_f32 = match admit_cast_boundary(
+                    "cast_scale_f16_f32",
+                    "grad_res_is_f16_a_fusable_two_kernel_chain",
+                )? {
+                    crate::admission::DispatchOutcome::Fused => {
+                        super::apply1(grad_res, CastScaleF16F32::new(f64::from(self.scale)))?
+                    }
+                    crate::admission::DispatchOutcome::Eager => grad_res
+                        .to_dtype(DType::F32)?
+                        .affine(f64::from(self.scale), 0.0)?,
+                };
+                dy_f32.reshape((m, outf))?
+            }
+            other => return Err(Error::UnsupportedDTypeForOp(other, self.name())),
         };
 
         // Recompute x32 / xd / h (no save-for-backward in candle 0.11).
@@ -845,16 +878,25 @@ impl CustomOp3 for LowRankResidualLinear {
         // one kernel, rounding `d_xd` to `bf16` IN-REGISTER first and then
         // adding in native `bf16` (`ops::cast_scale`'s module doc has the
         // full traffic model, the rounding-order derivation, and the
-        // double-rounding-safety argument for the CPU arm). Dispatched
-        // through `admit` so `JAMMI_KERNELS_DISABLE=cast_add_bf16` forces
-        // the original two-kernel chain back on for a same-build forced
-        // A/B (guide §3.5/§3.6).
+        // double-rounding-safety argument for the CPU arm). The `F16`
+        // branch (campaign #443 D1, `low_rank_residual_linear.rs`'s own
+        // `base_dtype_is_..._a_fusable_two_kernel_chain` predicate — the
+        // 8th admission-widening site from the phase-1 class enumeration)
+        // is the SAME lever at `F16`'s own margin, via `CastAddF16`
+        // (campaign #443 W2c) — a genuinely independent type, not
+        // `CastAddBf16` reinterpreted (`ops::cast_scale`'s module doc's
+        // "double-rounding-safety" note, restated at `F16`'s narrower
+        // 11-bit significand). Each 16-bit branch is dispatched through
+        // `admit` under its OWN op key
+        // (`JAMMI_KERNELS_DISABLE=cast_add_bf16` / `cast_add_f16`), and any
+        // dtype outside this op's real domain (already pinned at the
+        // forward boundary) is a named refusal here too, never a silent
+        // catch-all.
         let dy_base_2d = grad_res.reshape((m, outf))?;
         let dx_base_2d = dy_base_2d.matmul(w)?; // [M, in], base_dtype.
-        let dx_2d = if base_dtype == DType::F32 {
-            (&dx_base_2d + &d_x_lora_f32_2d)?
-        } else {
-            match admit_cast_boundary(
+        let dx_2d = match base_dtype {
+            DType::F32 => (&dx_base_2d + &d_x_lora_f32_2d)?,
+            DType::BF16 => match admit_cast_boundary(
                 "cast_add_bf16",
                 "base_dtype_is_bf16_a_fusable_two_kernel_chain",
             )? {
@@ -865,7 +907,20 @@ impl CustomOp3 for LowRankResidualLinear {
                     let d_x_lora_2d = d_x_lora_f32_2d.to_dtype(base_dtype)?;
                     (&dx_base_2d + &d_x_lora_2d)?
                 }
-            }
+            },
+            DType::F16 => match admit_cast_boundary(
+                "cast_add_f16",
+                "base_dtype_is_f16_a_fusable_two_kernel_chain",
+            )? {
+                crate::admission::DispatchOutcome::Fused => {
+                    super::apply2(&dx_base_2d, &d_x_lora_f32_2d, CastAddF16::new())?
+                }
+                crate::admission::DispatchOutcome::Eager => {
+                    let d_x_lora_2d = d_x_lora_f32_2d.to_dtype(base_dtype)?;
+                    (&dx_base_2d + &d_x_lora_2d)?
+                }
+            },
+            other => return Err(Error::UnsupportedDTypeForOp(other, self.name())),
         };
         let dx = dx_2d.reshape(x.shape())?;
 
@@ -1115,6 +1170,125 @@ mod tests {
             fused.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             manual.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             "F32, no dropout: must be bit-exact against the eager composition"
+        );
+    }
+
+    /// `F16`'s own CPU positive-path oracle (campaign #443 D1): UNLIKE
+    /// `BF16` (candle-core 0.11's CPU backend has no `BF16` `MatMul` impl —
+    /// `bf16_base_on_cpu_is_a_typed_error...` above), `F16` DOES have a real
+    /// CPU `MatMul` (candle's CPU backend links the `gemm-f16` crate; this
+    /// crate's own `cargo check` build graph pulls it in), so widening this
+    /// op's CPU dtype gate to `F16` (campaign #443 D1) makes it a genuinely
+    /// NEW, working capability, not a refusal deferred deeper — pinned here
+    /// with the SAME exact-integer-fixture bit-exactness technique
+    /// [`cpu_f32_matches_manual_composition_bit_exact`] uses: `exact_fixture`'s
+    /// small-integer values (see that fn's own doc) are exactly
+    /// `F16`-representable, and every partial sum this op's GEMMs form
+    /// stays a small exact integer (`F16`'s exact-integer range extends to
+    /// `2^11 = 2048`, far above anything these tiny shapes can sum to), so
+    /// `F16`'s narrower mantissa never actually rounds anything here — the
+    /// SAME "no accident of one CPU's blocking order" argument, restated at
+    /// `F16`'s own exact-integer domain rather than `F32`'s.
+    #[test]
+    fn cpu_f16_matches_manual_composition_bit_exact() {
+        let device = Device::Cpu;
+        let (rows, inf, outf, r) = (4usize, 3usize, 5usize, 2usize);
+        let scale = 2.0f32; // exact in binary: no epilogue rounding either.
+
+        let x_v = exact_fixture(rows * inf, 1);
+        let w_v = exact_fixture(outf * inf, 2);
+        let a_v = exact_fixture(r * inf, 3);
+        let b_v = exact_fixture(outf * r, 4);
+
+        let x = Tensor::from_slice(&x_v, (rows, inf), &device)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
+        let w = Tensor::from_slice(&w_v, (outf, inf), &device)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
+        // `ab` stays `F32` — `check_w_and_ab`'s own domain requires it
+        // regardless of the base dtype (the LoRA A/B pair is never
+        // narrowed by this op).
+        let ab = pack_ab(&a_v, inf, &b_v, outf, r, &device);
+
+        let op = LowRankResidualLinear::new(scale, inf, outf, r, None, false).unwrap();
+        let fused = fused_forward(&x, &w, &ab, op).unwrap();
+        assert_eq!(fused.dtype(), DType::F16, "output must stay the base dtype");
+
+        let expected = reference_forward(&x_v, rows, inf, &w_v, outf, &a_v, r, &b_v, scale, None);
+        let got: Vec<f32> = fused
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(
+            got, expected,
+            "F16, exact-integer fixture: must be bit-exact against the F32 reference"
+        );
+    }
+
+    /// KO-6/guide-§3.5 "zero dispatch is RED, never green", restated for
+    /// the two `F16` cast-boundary sites this campaign's D1 widens
+    /// (`grad_res`'s `cast_scale_f16_f32` and `base_dtype`'s
+    /// `cast_add_f16` — see `bwd`'s own doc comments at each `match`).
+    /// `admission_mode()` defaults to Fused-unless-disabled, so a plain
+    /// backward pass at `F16` must increment BOTH counters' `fused` side
+    /// by exactly one per call, never the `eager` side, and never leave
+    /// either counter untouched (which would mean the `F16` arm added in
+    /// this campaign was never actually reached).
+    #[test]
+    fn cpu_f16_bwd_dispatches_both_new_cast_boundary_kernels() {
+        let device = Device::Cpu;
+        let (rows, inf, outf, r) = (3usize, 4usize, 3usize, 2usize);
+        let scale = 1.5f32;
+
+        let x_v = exact_fixture(rows * inf, 11);
+        let w_v = exact_fixture(outf * inf, 12);
+        let a_v = exact_fixture(r * inf, 13);
+        let b_v = exact_fixture(outf * r, 14);
+
+        let x = Var::from_tensor(
+            &Tensor::from_slice(&x_v, (rows, inf), &device)
+                .unwrap()
+                .to_dtype(DType::F16)
+                .unwrap(),
+        )
+        .unwrap();
+        let w = Tensor::from_slice(&w_v, (outf, inf), &device)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
+        let ab = pack_ab(&a_v, inf, &b_v, outf, r, &device);
+
+        let op = LowRankResidualLinear::new(scale, inf, outf, r, None, false).unwrap();
+        let out = fused_forward(x.as_tensor(), &w, &ab, op).unwrap();
+        let loss = out.sum_all().unwrap();
+
+        let before_scale = crate::admission::counters_for("cast_scale_f16_f32").snapshot();
+        let before_add = crate::admission::counters_for("cast_add_f16").snapshot();
+        let grads = loss.backward().unwrap();
+        assert!(
+            grads.get(&x).is_some(),
+            "x's gradient must be populated by the real backward walk"
+        );
+        let after_scale = crate::admission::counters_for("cast_scale_f16_f32").snapshot();
+        let after_add = crate::admission::counters_for("cast_add_f16").snapshot();
+
+        assert_eq!(
+            after_scale.fused - before_scale.fused,
+            1,
+            "cast_scale_f16_f32 must dispatch Fused exactly once, got before={before_scale:?} \
+             after={after_scale:?}"
+        );
+        assert_eq!(
+            after_add.fused - before_add.fused,
+            1,
+            "cast_add_f16 must dispatch Fused exactly once, got before={before_add:?} \
+             after={after_add:?}"
         );
     }
 

@@ -535,13 +535,16 @@ fn build_cuda() {
 ///   audit finding A: an earlier revision of this doc claimed it
 ///   "mitigates" this build's own memory cost — backwards: a flat default
 ///   of `4` regardless of how many TUs run concurrently MULTIPLIES peak
-///   front-end memory, since this build ALSO spawns all three TUs as
-///   concurrent processes — 3 TUs × 4 per-TU threads = 12 simultaneous
-///   nvcc front-ends, each with its own footprint (~2.9 GB/TU-arch-thread
-///   recorded on the A100 pod spike) — exactly what OOM'd the 16 GB
-///   `ubuntu-latest` CI runner this crate's own flash-attn-compile lane
-///   uses. `N` now defaults to `available_parallelism() / 3` (this
-///   build's own TU count), bounding TOTAL front-end concurrency to
+///   front-end memory, since this build ALSO spawns every one of `tus`'s
+///   entries as a concurrent process — originally 3 TUs × 4 per-TU threads
+///   = 12 simultaneous nvcc front-ends (campaign #443 D2 widens `tus` to 5
+///   — the fp16 hdim64 fwd/bwd TUs — so the SAME arithmetic now reads 5 ×
+///   `N`, which is exactly why `N` is derived from `tus.len()` below rather
+///   than a literal), each with its own footprint (~2.9 GB/TU-arch-thread
+///   recorded on the A100 pod spike, pre-fp16) — exactly what OOM'd the
+///   16 GB `ubuntu-latest` CI runner this crate's own flash-attn-compile
+///   lane uses. `N` now defaults to `available_parallelism() / tus.len()`
+///   (this build's own, current TU count), bounding TOTAL front-end concurrency to
 ///   roughly the machine's own core count rather than a flat multiple of
 ///   it; `$NVCC_THREADS`, when set (`> 0`), overrides this entirely — a
 ///   caller who has actually measured their own machine's headroom keeps
@@ -554,7 +557,10 @@ fn build_cuda() {
 ///   online softmax) are what every cross-stack parity oracle is calibrated
 ///   against. Turning it off here would produce a kernel no upstream user
 ///   runs and move every bf16 rounding decision away from the reference
-///   the oracles compare with. Scoped to these three TUs only.
+///   the oracles compare with (the fp16 TUs this same flag now ALSO
+///   applies to, campaign #443 D2, need the identical justification at
+///   fp16's own margin — upstream ships those wheels with `--use_fast_math`
+///   too). Scoped to `tus`'s own entries only, never `src/cuda/*.cu`.
 /// - `-U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__
 ///   -U__CUDA_NO_HALF2_OPERATORS__ -U__CUDA_NO_BFLOAT16_CONVERSIONS__`
 /// - `-DFLASHATTENTION_DISABLE_DROPOUT -DFLASHATTENTION_DISABLE_ALIBI
@@ -692,7 +698,15 @@ fn build_flash_attn() {
         fa_dir.join("VENDORED.md").display()
     );
 
-    let tus: [(&str, PathBuf); 3] = [
+    // campaign #443 D2: two new TUs join the original three — the fp16
+    // forward/backward hdim64 specialisations, authored in the SAME
+    // auto-generated-style, one-explicit-specialisation-per-file idiom
+    // upstream's own `generate_kernels.py` uses for every other
+    // (dtype, hdim, causal) combination (see each new `.cu` file's own
+    // header comment). `[(&str, PathBuf); 5]` (not `3`) — every consumer
+    // of `tus` below already reads `tus.len()`, never a hardcoded literal,
+    // so this array's length is the ONE place the TU count is stated.
+    let tus: [(&str, PathBuf); 5] = [
         (
             "flash_fwd_hdim64_bf16_sm80",
             src_dir.join("flash_fwd_hdim64_bf16_sm80.cu"),
@@ -700,6 +714,14 @@ fn build_flash_attn() {
         (
             "flash_bwd_hdim64_bf16_sm80",
             src_dir.join("flash_bwd_hdim64_bf16_sm80.cu"),
+        ),
+        (
+            "flash_fwd_hdim64_fp16_sm80",
+            src_dir.join("flash_fwd_hdim64_fp16_sm80.cu"),
+        ),
+        (
+            "flash_bwd_hdim64_fp16_sm80",
+            src_dir.join("flash_bwd_hdim64_fp16_sm80.cu"),
         ),
         ("flash_api_jammi", jammi_dir.join("flash_api_jammi.cu")),
     ];
@@ -770,11 +792,14 @@ fn build_flash_attn() {
         ])
         .collect();
 
-    // ---- Compile the three TUs concurrently (they are independent; the
-    // bwd TU alone is ~70 s on an A100 pod, the fwd ~45 s, the wrapper ~5 s
-    // — measured on the OLD single-arch build; four gencodes each cost more
-    // wall, see `VENDORED.md`'s re-measured build-times table once a pod
-    // run records it, per the M3 plan's D1 cost note).
+    // ---- Compile every TU in `tus` concurrently (they are independent;
+    // the bf16 bwd TU alone was ~70 s on an A100 pod, the bf16 fwd ~45 s,
+    // the wrapper ~5 s — measured on the OLD single-arch, bf16-only,
+    // 3-TU build; four gencodes each cost more wall, and campaign #443 D2
+    // adds two more TUs (the fp16 hdim64 fwd/bwd), so this build's own
+    // wall-clock is now `tus.len() == 5` concurrent compiles, not 3 — see
+    // `VENDORED.md`'s re-measured build-times table once a pod run records
+    // the bf16-vs-bf16+fp16 delta, per the M3 plan's D1 cost note).
     //
     // Peak-RSS instrumentation (M3 plan v2 delta 5) is OPT-IN via
     // `JAMMI_FLASH_MEASURE_RSS=1`.
@@ -783,10 +808,10 @@ fn build_flash_attn() {
     // each TU's OWN per-child peak RSS (GNU `time -v`'s report, scoped to
     // that ONE nvcc process and its descendants) — it does NOT, and
     // structurally CANNOT, observe the AGGREGATE memory footprint across
-    // the `tus.len()` concurrently-spawned TUs. If all three TUs peak at
+    // the `tus.len()` concurrently-spawned TUs. If every TU peaks at
     // the same instant (plausible — they are launched together), the real
-    // constraint on the host is close to the SUM of their three peaks, not
-    // any one child's own max, and a per-child sampler has no way to see
+    // constraint on the host is close to the SUM of all `tus.len()` peaks,
+    // not any one child's own max, and a per-child sampler has no way to see
     // that. This instrumentation is DIAGNOSTIC ONLY. The actual
     // aggregate-memory safety mechanism is finding A's own fix above
     // (bounding `nvcc_threads` so total front-end concurrency tracks the
@@ -888,7 +913,8 @@ fn build_flash_attn() {
         match peak_rss_kb {
             Some(kb) => eprintln!(
                 "jammi-kernels flash-attn: {stem} wall={secs:.1}s peak_rss_kb={kb} \
-                 (per-child only, not the 3-TU aggregate — see this block's own doc)"
+                 (per-child only, not the {}-TU aggregate — see this block's own doc)",
+                tus.len(),
             ),
             None => eprintln!("jammi-kernels flash-attn: {stem} wall={secs:.1}s"),
         }

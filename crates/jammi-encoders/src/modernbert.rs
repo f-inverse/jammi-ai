@@ -704,11 +704,13 @@ pub(crate) static ATTENTION_BLOCK_DISPATCH_COUNTERS: LazyLock<&'static DispatchC
 /// plan's OQ ruling, advisories: this op is stock-op composition,
 /// arch-agnostic PTX-forward, not a kernel tuned to one SM target).
 ///
-/// **`dtype` gate, PER-DEVICE-HONEST (adversarial audit round 3, F2 fix):**
-/// the op's own domain is dtype-split by device — `F32`-only on CPU
-/// (`cpu_fwd`'s own module doc, candle-core 0.11's CPU backend has no
-/// `BF16` `MatMul`), `F32` OR `BF16` on CUDA (`cuda_fwd`'s own module doc).
-/// An earlier revision had NO dtype gate here at all — the op's own
+/// **`dtype` gate, PER-DEVICE-HONEST (adversarial audit round 3, F2 fix;
+/// widened to `F16` on CUDA by campaign #443 D1):** the op's own domain is
+/// dtype-split by device — `F32`-only on CPU (`cpu_fwd`'s own module doc,
+/// candle-core 0.11's CPU backend has no `BF16`/`F16` `MatMul`), `F32`,
+/// `BF16`, OR `F16` on CUDA (`cuda_fwd`'s own module doc — `F16` upcasts to
+/// `f32` at the boundary on the SAME mechanism `BF16` already used, no new
+/// `.cu` kernel). An earlier revision had NO dtype gate here at all — the op's own
 /// `UnsupportedDTypeForOp` refusal was the only thing standing between an
 /// `F16` (or any other unsupported dtype) long-seq forward and a hard
 /// error, and by the time that refusal fired, `ModernBert::
@@ -745,8 +747,17 @@ fn mem_efficient_attention_predicate(
     if !device_is_supported(device) {
         return (PredicateOutcome::CapabilityMiss, "device_is_cpu_or_cuda");
     }
+    // campaign #443 D1: `F16` joins `BF16` on the CUDA side —
+    // [`jammi_kernels::ops::MemEfficientAttention`]'s own `cuda_fwd` gate
+    // now admits it too (that op's module doc's "Rounding contract"
+    // section: `F16` upcasts to `f32` once, at the boundary, the SAME
+    // mechanism `BF16` already used — no new `.cu` kernel, so this
+    // predicate's domain follows the op's own, not a build-time capability
+    // this crate would need to detect separately). The CPU side is
+    // UNCHANGED: candle-core 0.11's CPU backend has no `BF16`/`F16` `MatMul`
+    // impl, so `cpu_fwd` still refuses both.
     let dtype_ok = if device.is_cuda() {
-        matches!(dtype, DType::F32 | DType::BF16)
+        matches!(dtype, DType::F32 | DType::BF16 | DType::F16)
     } else {
         matches!(dtype, DType::F32)
     };
@@ -754,7 +765,7 @@ fn mem_efficient_attention_predicate(
         return (
             PredicateOutcome::DomainMiss,
             if device.is_cuda() {
-                "dtype_f32_or_bf16_on_cuda"
+                "dtype_f32_bf16_or_f16_on_cuda"
             } else {
                 "dtype_f32_only_on_cpu"
             },
@@ -826,8 +837,16 @@ fn attention_block_admission_predicate(
     if !device_is_supported(qkv.device()) {
         return (false, "device_is_cpu_or_cuda");
     }
-    if qkv.dtype() != extended_mask.dtype() || !matches!(qkv.dtype(), DType::F32 | DType::BF16) {
-        return (false, "dtype_f32_or_bf16_matching_between_qkv_and_mask");
+    // campaign #443 D1: `F16` joins `BF16` — `AttentionBlockFused`'s own
+    // CUDA gate (`crate::cuda::attention_block::cuda_fwd`, in
+    // `jammi-kernels`) now admits it on the same basis: this composition
+    // owns no `.cu` kernel, so its domain follows its two composed
+    // sub-kernels' ([`RopeFused`], [`SoftmaxLastDimFused`]) real `F16`
+    // dispatch arms.
+    if qkv.dtype() != extended_mask.dtype()
+        || !matches!(qkv.dtype(), DType::F32 | DType::BF16 | DType::F16)
+    {
+        return (false, "dtype_f32_bf16_or_f16_matching_between_qkv_and_mask");
     }
     if !qkv.is_contiguous() {
         return (false, "qkv_contiguous");

@@ -67,7 +67,7 @@
 //!   autograd_of_the_current_composition`) are unchanged: they were
 //!   already a `1e-3` tolerance, never a `tol == 0.0` claim.
 
-use candle_core::{DType, Device, Result, Tensor, Var};
+use candle_core::{DType, Device, Error, Result, Tensor, Var};
 use jammi_kernels::ops::{DropoutKey, LowRankResidualLinear};
 
 /// The eager composition `LoraLinear::forward`'s training arm builds
@@ -657,25 +657,78 @@ fn production_width_dropout_matches_dropout_fused_applied_directly() {
     );
 }
 
-/// `F16` (an unrelated reduced dtype, NOT `BF16`) reaching the fused op's
-/// `w`/`x` slot is a typed domain refusal, not a silent misinterpretation
-/// — this op's dtype domain is `(F32, F32)` / `(BF16, BF16)` only.
+/// `F64` (a genuinely unsupported dtype, distinct from `F32`/`BF16`/`F16`)
+/// reaching the fused op's `w`/`x` slot is a typed domain refusal, not a
+/// silent misinterpretation — this op's dtype domain is `F32`, `BF16`, or
+/// `F16` only (campaign #443 D1 retargets this MUT-1 sentinel from `F16`,
+/// which is now a genuinely SUPPORTED dtype on CPU — see
+/// `f16_base_on_cpu_matches_the_f32_eager_reference` below — to `F64`, a
+/// dtype still outside this op's domain on every arm, keeping the
+/// forced-`true`-mutant kill this sentinel exists for alive against a real
+/// still-refused dtype rather than a stale claim).
 #[test]
-fn f16_base_is_a_typed_domain_refusal() {
+fn f64_base_is_a_typed_domain_refusal() {
     let device = Device::Cpu;
     let (rows, inf, outf, r) = (4usize, 8usize, 6usize, 2usize);
     let x = Tensor::from_slice(&fixture(rows * inf, 6.0), (rows, inf), &device)
         .unwrap()
-        .to_dtype(DType::F16)
+        .to_dtype(DType::F64)
         .unwrap();
     let w = Tensor::from_slice(&fixture(outf * inf, 6.1), (outf, inf), &device)
         .unwrap()
-        .to_dtype(DType::F16)
+        .to_dtype(DType::F64)
         .unwrap();
     let a = Tensor::from_slice(&fixture(r * inf, 6.2), (r, inf), &device).unwrap();
     let b = Tensor::from_slice(&fixture(outf * r, 6.3), (outf, r), &device).unwrap();
     let ab = pack_ab(&a, &b).unwrap();
 
     let op = LowRankResidualLinear::new(1.0, inf, outf, r, None, false).unwrap();
-    assert!(fused_forward(&x, &w, &ab, op).is_err());
+    let err = fused_forward(&x, &w, &ab, op).expect_err("F64 must be refused, not silently cast");
+    assert!(
+        matches!(err, Error::UnsupportedDTypeForOp(DType::F64, _)),
+        "expected Error::UnsupportedDTypeForOp(F64, _), got {err:?}"
+    );
+}
+
+/// `F16` positive-path oracle (campaign #443 D1): candle-core 0.11's CPU
+/// backend DOES have a real `F16` `MatMul` (unlike `BF16`), so widening
+/// this op's CPU dtype gate to `F16` is a genuinely new working capability
+/// — proven here at the public `apply_op3` surface (mirroring this file's
+/// own `production_width_*` bit-exact legs) rather than only at the
+/// internal `ops::low_rank_residual_linear` module-test surface. Exact-integer
+/// fixtures keep the claim architecture-independent (see `exact_fixture`'s
+/// own doc): every partial sum stays a small exact integer, well inside
+/// `F16`'s exact-integer range, so `F32` and `F16` must agree bit-exactly.
+#[test]
+fn f16_base_on_cpu_matches_the_f32_eager_reference_bit_exact() {
+    let device = Device::Cpu;
+    let (rows, inf, outf, r) = (4usize, 8usize, 6usize, 2usize);
+    let scale = 2.0; // exact in binary.
+
+    let x_f32 = Tensor::from_slice(&exact_fixture(rows * inf, 41), (rows, inf), &device).unwrap();
+    let w_f32 = Tensor::from_slice(&exact_fixture(outf * inf, 42), (outf, inf), &device).unwrap();
+    let a = Tensor::from_slice(&exact_fixture(r * inf, 43), (r, inf), &device).unwrap();
+    let b = Tensor::from_slice(&exact_fixture(outf * r, 44), (outf, r), &device).unwrap();
+    let ab = pack_ab(&a, &b).unwrap();
+
+    let x_f16 = x_f32.to_dtype(DType::F16).unwrap();
+    let w_f16 = w_f32.to_dtype(DType::F16).unwrap();
+
+    let op = LowRankResidualLinear::new(scale as f32, inf, outf, r, None, false).unwrap();
+    let fused = fused_forward(&x_f16, &w_f16, &ab, op).unwrap();
+    assert_eq!(fused.dtype(), DType::F16);
+
+    let expected = eager_forward(&x_f32, &w_f32, &a, &b, scale).unwrap();
+    assert_close(
+        &fused
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap(),
+        &expected.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        0.0,
+        "f16_base_on_cpu_matches_the_f32_eager_reference_bit_exact",
+    );
 }

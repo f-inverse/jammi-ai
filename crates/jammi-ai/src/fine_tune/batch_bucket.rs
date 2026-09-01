@@ -22,16 +22,26 @@
 //! buckets)" — this module, and its TRAINING-STEP call site in
 //! `TrainingLoop::encode_texts` (`tokenize_and_bucket`).
 //!
-//! **Eval amendment (adversarial-audit round 2, campaign #443, item 3):**
-//! bucketing is a TRAINING-STEP-only concern — it bounds the allocator's
-//! distinct-shape count across an UNBOUNDED sequence of per-step batches,
-//! which an eval pass (`evaluate`/`evaluate_held_out`, running at most a
-//! handful of times per training run) never is. `encode_texts` only calls
-//! into this module while `self.training_mode` is `true`; while evaluating
-//! (`training_mode == false`) it calls the natural-width sibling
-//! `tokenize_natural_width` instead — see that function's own doc for the
-//! measured OOM (a real 321-token held-out batch bucketed up to the 512
-//! rung) this exemption closes.
+//! **Eval amendment (adversarial-audit round 2, campaign #443, item 3;
+//! bound corrected per r3 finding B4 — read `tokenize_natural_width`'s own
+//! doc for the full argument, this is only the summary):** bucketing is a
+//! TRAINING-STEP-only concern — it bounds the allocator's distinct-shape
+//! count across a sequence of per-step batches that is UNBOUNDED across
+//! the whole run. An eval pass (`evaluate`/`evaluate_held_out`) is bounded
+//! on a DIFFERENT axis than "how often it runs": its held-out/val
+//! partition is DETERMINISTIC (same rows, same batch order, every pass),
+//! so it re-presents the IDENTICAL width sequence each time — its
+//! distinct-shape contribution is paid ONCE per run, never growing
+//! per-step or per-epoch, regardless of `eval_cadence`. That one-time set's
+//! SIZE is still caller-dependent (bounded by the split's own natural-width
+//! diversity, not by this ladder), so this exemption RESTORES the
+//! pre-esc-076 eval baseline rather than newly bounding it — esc-076
+//! remains OPEN on that residual, caller-dependent axis. `encode_texts`
+//! only calls into this module while `self.training_mode` is `true`; while
+//! evaluating (`training_mode == false`) it calls the natural-width
+//! sibling `tokenize_natural_width` instead — see that function's own doc
+//! for the measured OOM (a real 321-token held-out batch bucketed up to
+//! the 512 rung) this exemption closes.
 //!
 //! ## Bucket DECISION lives in `jammi-numerics`, not here
 //!

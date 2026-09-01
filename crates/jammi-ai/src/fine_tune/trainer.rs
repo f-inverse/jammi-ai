@@ -609,22 +609,55 @@ fn tokenize_and_bucket(
 /// while `self.training_mode` is `false` — i.e. inside
 /// [`TrainingLoop::with_dropout_disabled`]'s bracket
 /// ([`TrainingLoop::evaluate`]/[`TrainingLoop::evaluate_held_out`]).
-/// [`tokenize_and_bucket`]'s bucket ladder exists to bound the COUNT of
-/// DISTINCT tensor shapes a non-caching CUDA allocator (`cudarc`) sees
-/// across the training loop's UNBOUNDED sequence of per-step batches
-/// (esc-076's own mechanism, `crate::fine_tune::batch_bucket`'s module doc)
-/// — an eval pass runs at most `epochs / eval_cadence` times per training
-/// run, never per-step, so it was never the shape-churn esc-076's fix
-/// targeted. Rounding an eval batch's real width UP to the run's
+///
+/// **The bound this exemption actually relies on** (r3 finding B4 —
+/// superseding an earlier, wrong version of this doc that argued "eval
+/// runs infrequently"; that bounds the number of PASSES, not the quantity
+/// esc-076 cares about): esc-076's mechanism is the COUNT of DISTINCT
+/// tensor shapes a non-caching CUDA allocator (`cudarc`) is ever asked to
+/// satisfy — a held-out split with several batches of several different
+/// natural widths presents that many distinct shapes in a SINGLE eval
+/// pass, regardless of `eval_cadence`; "runs at most a handful of times"
+/// says nothing about that count. The real reason eval's contribution is
+/// still bounded: the held-out/val partition is DETERMINISTIC — the same
+/// rows, in the same batch order, on every pass
+/// ([`TrainingLoop::evaluate_held_out`]'s own `example_ids` contract) — so
+/// eval re-presents the IDENTICAL sequence of natural widths every time it
+/// runs. Its distinct-shape contribution to the allocator is therefore
+/// paid EXACTLY ONCE per run (on the first pass; cudarc never returns a
+/// reserved block to the OS, so every later pass's widths are already-seen
+/// repeats, not new shapes) — never growing per-step or per-epoch the way
+/// esc-076's own genuinely UNBOUNDED per-training-step churn did.
+///
+/// That one-time set's SIZE is caller-dependent, and this doc does not
+/// hide that: it is bounded by the held-out split's own natural-width
+/// diversity (up to one distinct width per batch in the split, not by the
+/// bucket ladder's ~11 rungs), so a sufficiently wide/varied held-out split
+/// could still present a nontrivial one-time shape count. This exemption
+/// does not newly bound that — it RESTORES the pre-esc-076 baseline for
+/// eval (eval encoded at natural width before the training-step bucket
+/// ladder existed at all; esc-076's own fix never touched eval's
+/// shape-count exposure, only the training step's) rather than introducing
+/// a new regression. **esc-076 remains OPEN on this residual axis**: an
+/// eval split large/varied enough to itself present many distinct widths
+/// in its one-time set is not proven bounded by anything in this module —
+/// only that this exemption does not make that pre-existing exposure any
+/// worse than it always was.
+///
+/// [`tokenize_and_bucket`]'s bucket ladder still exists to bound the
+/// TRAINING-STEP path's actually-unbounded-across-the-run distinct-shape
+/// count (esc-076's own mechanism, `crate::fine_tune::batch_bucket`'s
+/// module doc). Rounding an eval batch's real width UP to the run's
 /// `max_seq_length` bucket regardless of how short its actual content is
 /// (e.g. a genuine 321-token held-out batch padded to the 512 bucket, a
-/// measured `~2.5x` softmax-intermediate blow-up: `512² / 321² ≈ 2.5`) is a
-/// pure cost with no allocator-stability upside at eval's own call
-/// frequency, and measurably OOM'd a `--batch 8 --max-seq-length 512` bf16
-/// leg that ran clean at the pre-bucketing baseline (adversarial-audit
-/// round 2 dispute; `.jammi/escapes.jsonl`'s esc-076 entry itself never
-/// exercised a real eval-time batch at a natural width anywhere near a
-/// bucket rung, since its own reporter shape used `max_seq_length: 128`).
+/// measured `~2.5x` softmax-intermediate blow-up: `512² / 321² ≈ 2.5`) paid
+/// a real memory cost for a shape-count benefit eval's deterministic,
+/// paid-once partition never needed, and measurably OOM'd a `--batch 8
+/// --max-seq-length 512` bf16 leg that ran clean at the pre-bucketing
+/// baseline (adversarial-audit round 2 dispute; `.jammi/escapes.jsonl`'s
+/// esc-076 entry itself never exercised a real eval-time batch at a
+/// natural width anywhere near a bucket rung, since its own reporter shape
+/// used `max_seq_length: 128`).
 fn tokenize_natural_width(
     tokenizer: &crate::model::tokenizer::TokenizerWrapper,
     texts: &[String],
@@ -1639,16 +1672,27 @@ impl TrainingLoop {
 
                 let effective_max = self.config.max_seq_length.min(encoder.max_seq_length());
                 // esc-076 amendment (adversarial-audit round 2, campaign
-                // #443, item 3): bucket-UP padding is a TRAINING-STEP-only
-                // concern (bounding the allocator's distinct-shape count
-                // across an unbounded run of steps) — an eval pass
-                // (`self.training_mode == false`, set by
+                // #443, item 3; r3 finding B4 corrected the bound below —
+                // see `tokenize_natural_width`'s own doc for the full
+                // argument, never shortened to "eval runs infrequently"
+                // again, that bounds passes, not distinct shapes):
+                // bucket-UP padding is a TRAINING-STEP-only concern —
+                // it bounds the allocator's distinct-shape count against an
+                // UNBOUNDED-across-the-run sequence of per-step batches.
+                // Eval (`self.training_mode == false`, set by
                 // `with_dropout_disabled`'s bracket around
-                // `evaluate`/`evaluate_held_out`) runs at most a handful of
-                // times per training run and pays bucketing's inflated
-                // shape with no matching allocator-stability benefit; see
-                // `tokenize_natural_width`'s own doc for the measured OOM
-                // this exemption closes.
+                // `evaluate`/`evaluate_held_out`) instead re-presents the
+                // SAME deterministic held-out partition's width sequence on
+                // every pass, so its distinct-shape contribution is paid
+                // ONCE per run, not per-step — bucketing it up buys no
+                // allocator-stability benefit that determinism doesn't
+                // already provide, at a real memory cost (the measured OOM
+                // `tokenize_natural_width`'s own doc cites). esc-076 stays
+                // OPEN on the residual, caller-dependent axis (a held-out
+                // split wide/varied enough to itself present many distinct
+                // widths in that one-time set) — this exemption restores
+                // the pre-esc-076 baseline for eval, it does not newly
+                // bound that axis.
                 let (encoding, rows, cols) = if self.training_mode {
                     tokenize_and_bucket(tokenizer, texts, effective_max)?
                 } else {
@@ -11000,6 +11044,70 @@ mod encode_texts_bucketing_oracle {
             bucketed_cols > natural_cols,
             "fixture must produce a real bucket ({bucketed_cols}) vs natural ({natural_cols}) \
              gap for this test to be meaningful"
+        );
+    }
+
+    /// (d) r3 finding B4: pins argument (a) of `tokenize_natural_width`'s
+    /// own doc — eval's distinct-shape contribution to the allocator is
+    /// paid ONCE per run because the held-out/val partition presents the
+    /// IDENTICAL sequence of natural widths on every pass, never a
+    /// reshuffled or re-ordered one. `tokenize_natural_width` itself is a
+    /// pure function of its input texts (tokenization has no randomness),
+    /// so this cannot catch a bug INSIDE it — what it CAN catch is a caller
+    /// that fed a re-ordered/re-partitioned split across passes (which
+    /// would invalidate the "paid once" argument the doc above relies on):
+    /// encodes the SAME ordered, multi-batch split — mirroring
+    /// `evaluate_held_out`'s own fixed `example_ids` partition — batch by
+    /// batch, across two independent "passes", and asserts the per-batch
+    /// natural-width SEQUENCE is identical.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial(tokenize_dispatch_calls)]
+    async fn eval_tokenize_natural_width_repeats_the_same_width_sequence_across_passes_over_the_same_split(
+    ) {
+        let base_model = tiny_modernbert_base_model().await;
+        let tokenizer = tokenizer_of(&base_model);
+
+        // A 3-batch split with deliberately different natural widths per
+        // batch (mirroring how a real held-out set groups rows of varying
+        // length) — a width-SEQUENCE comparison across passes is only
+        // meaningful if the sequence itself has more than one distinct
+        // value.
+        let split: Vec<Vec<String>> = vec![
+            vec!["a".to_string(), "a b".to_string()],
+            ragged_texts(),
+            vec!["a b c d e f g h i j k l m n o p".to_string()],
+        ];
+
+        let widths_for_one_pass = |split: &[Vec<String>]| -> Vec<usize> {
+            split
+                .iter()
+                .map(|batch| {
+                    let (_, _, cols) =
+                        super::tokenize_natural_width(tokenizer, batch, EFFECTIVE_MAX).unwrap();
+                    cols
+                })
+                .collect()
+        };
+
+        let pass_1 = widths_for_one_pass(&split);
+        let pass_2 = widths_for_one_pass(&split);
+        assert_eq!(
+            pass_1, pass_2,
+            "the SAME ordered split must produce the IDENTICAL per-batch natural-width \
+             sequence across repeated passes -- this determinism is what \
+             tokenize_natural_width's own doc relies on to argue eval's distinct-shape \
+             contribution is paid once per run, never once per pass"
+        );
+        // Sanity: the split's own widths actually vary, so pass_1 == pass_2
+        // is not a vacuous single-element-sequence agreement.
+        assert!(
+            pass_1
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                > 1,
+            "split fixture must present more than one distinct natural width for this test \
+             to be meaningful, got {pass_1:?}"
         );
     }
 }

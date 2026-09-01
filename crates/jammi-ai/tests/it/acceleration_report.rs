@@ -196,16 +196,25 @@ fn expect_determined_report_fails_closed_on_pending_marker() {
 /// num_attention_heads`) is nowhere near 64, so this op declines
 /// REGARDLESS of dtype — a shape-based domain miss, not a dtype-widening
 /// candidate, so this control stays robust to further campaign #443 dtype
-/// widenings. (This doc's OWN prior revision predicted exactly this
-/// eventuality: campaign #443 W2d has SINCE widened attention_block's own
-/// dtype check to F16 too — `crates/jammi-encoders/src/modernbert.rs`'s
-/// `attention_block_admission_predicate` checks dtype FIRST, then head_dim —
-/// so an F16 `qkv` now clears the (now three-way) dtype check and the
-/// SAME shape miss declines it one check later, under
-/// `head_dim_is_attention_block_fixed_head_dim` instead of the dtype
-/// check's own reason key. `holds: false` did not flip, exactly as
-/// predicted — only which check fires first, and therefore which verbatim
-/// reason key this test reads back, changed.)
+/// widenings.
+///
+/// (Revision history, kept because a prior version of this doc got the
+/// PREDICATE ORDER wrong and it is worth remembering why: campaign #443 W2d
+/// briefly widened `attention_block_admission_predicate`'s dtype check to
+/// `F32 | BF16 | F16` with NO device split, which made CPU+F16 wrongly
+/// CLEAR the dtype gate — this doc's prior revision predicted that would
+/// make the head_dim check fire next, reason
+/// `head_dim_is_attention_block_fixed_head_dim`. That was itself a real bug
+/// (CPU's `cpu_fwd`, `jammi-kernels::ops::attention_block`, has no `BF16`/
+/// `F16` match arm at all — it only ever supported `F32`), fixed by the
+/// round-2 audit's device-split correction: `BF16`/`F16` are admitted ONLY
+/// when `qkv.device().is_cuda()`; CPU stays `F32`-only, matching `cpu_fwd`'s
+/// real domain. On this CPU-only suite, an f16 job's `qkv` therefore declines
+/// at the DTYPE check itself — reason `dtype_f32_matching_between_qkv_and_
+/// mask_on_cpu` — and the head_dim check below it is never reached. `holds:
+/// false` still never flips; only the verbatim reason key this test reads
+/// back does, and it has now round-tripped back to the dtype reason it
+/// started at, for the correct underlying cause.)
 ///
 /// Also asserts `layer_norm` (now genuinely admitted at F16) reports
 /// `holds: true` on BOTH jobs — the anti-always-degraded half of this same
@@ -252,10 +261,12 @@ async fn second_f16_job_in_process_still_reports_its_own_eager_ops() {
     );
     assert_eq!(
         ab1["reason"],
-        serde_json::json!("head_dim_is_attention_block_fixed_head_dim"),
+        serde_json::json!("dtype_f32_matching_between_qkv_and_mask_on_cpu"),
         "job 1's miss reason must be the verbatim predicate key jammi-encoders' own \
-         `admit()` call site records — the dtype check now admits F16 too (campaign #443 \
-         W2d), so the shape (head_dim) check fires next, got: {report1}"
+         `admit()` call site records — on CPU, attention_block's dtype check admits ONLY \
+         F32 (the round-2 audit's device-split fix: BF16/F16 are CUDA-only, matching \
+         cpu_fwd's real domain), so an f16 qkv declines at the dtype check itself and the \
+         head_dim check below it is never reached, got: {report1}"
     );
     let ln1 = &report1["ops"]["layer_norm"];
     assert_eq!(
@@ -290,9 +301,9 @@ async fn second_f16_job_in_process_still_reports_its_own_eager_ops() {
     );
     assert_eq!(
         ab2["reason"],
-        serde_json::json!("head_dim_is_attention_block_fixed_head_dim"),
-        "job 2's reason must still resolve to the same verbatim predicate key (the shape/ \
-         head_dim check, now that the dtype check admits F16 too), got: {report2}"
+        serde_json::json!("dtype_f32_matching_between_qkv_and_mask_on_cpu"),
+        "job 2's reason must still resolve to the same verbatim predicate key (CPU's dtype \
+         check declines f16 before the head_dim check is ever reached), got: {report2}"
     );
     let ln2 = &report2["ops"]["layer_norm"];
     assert_eq!(

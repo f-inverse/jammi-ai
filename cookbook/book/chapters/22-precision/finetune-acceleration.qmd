@@ -16,7 +16,9 @@ exponent is the dtype the original mixed-precision-training recipe *did* need lo
 IO-aware kernel rather than fusing a single primitive [@dao2022flashattention] · **Rail:**
 measurement (a live fine-tune submitted over the remote `grpc://` client, its per-job
 acceleration report read back through `pending` → `determined`, both dtypes' outcomes asserted)
-+ the honest limit (two facts measured on real GPU hardware, cited rather than recomputed here).
++ the honest arc (real GPU-only facts — FlashAttention-2's own `f16` admission, and a real
+memory limit that was root-caused and closed, not fabricated shut — cited rather than
+recomputed here).
 
 ## A third precision knob — and the first one this book cannot fully render
 
@@ -218,8 +220,9 @@ The report's `ops` map is one entry per fused primitive this job's own probe for
 exercised, each `{"holds": bool, "reason": str}` — `holds: true` means the SAME dispatch
 registry the kernel's own admission gate maintains actually recorded a fused hit for THIS job;
 `holds: false` carries the exact domain-check `reason` key the admission predicate itself
-produced, never a re-derived one. Three different `reason` shapes show up on this one CPU job,
-and each teaches a different limit:
+produced, never a re-derived one. This one CPU job Holds on six of the seven `ops` entries and
+Misses on the seventh (`attention_block`); `flash` (a separate field, discussed below) Misses
+too — each Miss teaches a different, independent limit:
 
 ```{python}
 for op in sorted(report_f16["ops"]):
@@ -231,29 +234,31 @@ print(f"\n  {'flash':<24s} {'Hold' if report_f16['flash']['holds'] else 'Miss':<
       f"reason={report_f16['flash']['reason']}")
 ```
 
-- **`layer_norm` / `rope` / `softmax` / `geglu` → `Hold`, `domain_ok`.** These four fused kernels
-  are dtype-domain-gated, not device-gated: their admission predicate checks only that the
-  tensor's dtype is one the kernel implements (`F32`/`BF16`/`F16` — `F16` a widened domain this
-  campaign added), and each carries its own portable CPU implementation alongside its CUDA one —
-  the *numeric* benefit (one rounding point instead of several) is real on CPU too, even though
-  the *wall-clock* benefit is a CUDA-only property. A CPU render `Hold`ing these is therefore not
-  a mistake; it is the honest, correct value of a domain check whose domain never mentioned the
-  device.
-- **`dropout` / `low_rank_residual_linear` → `Miss`, `base_dtype_f32_or_bf16_matched`.** These
-  two report keys both read the SAME `lora_linear_fused` registry — the LoRA-epilogue fused
-  kernel — whose admission predicate accepts only a `(F32, F32)` or `(BF16, BF16)` base/LoRA
-  dtype pair (`crates/jammi-lora/src/lora_linear.rs`'s own `lora_linear_admission_predicate`).
-  `F16` has **not** been widened here — a real, standing limit this render measured directly, not
-  a device artifact: an `F16` job declines this fused epilogue on CUDA hardware too, for the
-  identical dtype-domain reason.
-- **`attention_block` → `Miss`, `head_dim_is_attention_block_fixed_head_dim`.** This is a SHAPE
-  gate, not a dtype one — `tiny_modernbert`'s `hidden_size=32` over 2 heads gives `head_dim=16`,
-  and the fused attention block (like FlashAttention itself, below) is compiled for exactly one
-  fixed head dimension. `f32` misses this gate for the identical shape reason (verify by rerunning
-  the cell above's `report_f16["ops"]["attention_block"]` against an `f32` job — same reason,
-  every time). ModernBERT-base *and* ModernBERT-large both clear it in practice — `768 / 12 = 64`
-  heads-to-hidden, `1024 / 16 = 64` — this render's own fixture is simply built too small to
-  reach it, on purpose (hermetic, CPU-fast).
+- **`layer_norm` / `rope` / `softmax` / `geglu` / `dropout` / `low_rank_residual_linear` →
+  `Hold`, `domain_ok`.** All six now hold for `F16` on CPU. The last two are the most recently
+  widened: both report keys read the SAME `lora_linear_fused` registry — the LoRA-epilogue fused
+  kernel — whose admission predicate used to accept only a `(F32, F32)` or `(BF16, BF16)`
+  base/LoRA dtype pair; a `(F16, F16)` arm now exists too
+  (`crates/jammi-lora/src/lora_linear.rs`'s `lora_linear_admission_predicate`, its declined-pair
+  reason renamed from the old bf16-only `base_dtype_f32_or_bf16_matched` to
+  `base_dtype_f32_bf16_or_f16_matched` — a string that no longer exists in this codebase, because
+  the two-member domain it named no longer exists either). Every one of these six kernels is
+  dtype-domain-gated with a portable CPU implementation alongside its CUDA one — the *numeric*
+  benefit (one rounding point instead of several) is real on CPU too, even though the *wall-clock*
+  benefit is a CUDA-only property. A CPU render `Hold`ing these is therefore not a mistake; it is
+  the honest, correct value of a domain check whose domain never mentioned the device.
+- **`attention_block` → `Miss`, `dtype_f32_matching_between_qkv_and_mask_on_cpu`.** This is the
+  op's fused kernel's OWN per-device dtype domain, not a re-derivation: its `cpu_fwd` arm
+  implements `F32` only (no `F16`/`BF16` `MatMul` on CPU), so an `F16` job's qkv tensor fails this
+  check before the predicate ever reaches its SEPARATE, later `head_dim` gate — the two are
+  independent checks, and this one simply fires first for this dtype. That head_dim gate is real
+  and durable regardless: `attention_block_fused` (like FlashAttention itself, below) is compiled
+  for exactly one fixed head dimension (`64`), and `tiny_modernbert`'s `hidden_size=32` over 2
+  heads gives `head_dim=16` — an `f32` job on this same fixture clears the dtype gate above and
+  then Misses on `head_dim_is_attention_block_fixed_head_dim` instead (the ONE gate a dtype change
+  cannot route around here). ModernBERT-base *and* ModernBERT-large both clear the shape gate in
+  practice — `768 / 12 = 64` heads-to-hidden, `1024 / 16 = 64` — this render's own fixture is
+  simply built too small to reach it, on purpose (hermetic, CPU-fast).
 - **`flash` → `Miss`, `cuda_not_compiled`.** The flash cascade short-circuits on a
   compiled/device-level fact *before* it ever consults a domain check — this build has no `cuda`
   feature at all, so this is the honest floor every dtype gets on this render, discussed next.
@@ -350,17 +355,25 @@ expected count, peak memory **44.3 GB, flat** after the initial ramp (1 Hz `nvid
 sampling) — bounded, not the pre-fix unbounded 0→49 GB→78 GB growth trajectory that OOM'd.
 `bf16`/`f32` complete at the same shape too, with finite, comparable losses.
 
-**The honest limit: `f16` at batch 8, sequence 512 still OOMs.** The stress shape is reported
-as an open finding, not a fabricated pass. Its own memory trace shows a ramp to roughly 63 GB
-within the first one-to-two steps, then failure — an early-step OOM, not the bucketing fix's own
-"shape variety accumulates over time" mechanism (which needs *many* steps to manifest). The
-attention block still declines `f16`'s fused/flash arms at this shape (the same domain gates
-measured above), so eager attention's `O(batch · seq²)` intermediates at `seq=512` — eight times
-the reporter shape's own `batch · seq²` term — appear to exceed the card's 80 GB on their own,
-independent of the shape-count growth the bucketing fix targets. This needs a different remedy
-(forced admission to a memory-efficient attention arm, gradient checkpointing, or accepting the
-shape as out-of-budget for pure-eager `f16` at this model scale) — reported honestly as
-open, not claimed fixed.
+**A second, campaign-induced limit at batch 8, sequence 512 — root-caused and closed.** The
+stress shape OOM'd too, both `bf16` and `f16`, under the disabled-fusion arm, on legs the
+pre-bucketing baseline ran clean — an early-step, not gradual, ramp to roughly 63 GB. This looked
+like a second, independent memory ceiling; it was not. The actual mechanism was in the bucketing
+fix itself: `evaluate_held_out`'s eval pass reused the SAME bucket-UP-to-the-nearest-power-of-two
+padding the training-step fix above introduces, so a real held-out batch whose natural width was
+321 tokens got rounded up to the 512 rung — `max_seq_length`'s own cap — a roughly 2.5×
+softmax-intermediate blow-up relative to its true width. This was a defect the bucketing fix
+introduced on the EVAL path, not a pre-existing eager-attention ceiling, and — being
+dtype-independent — it explains why `bf16`, not only `f16`, was affected. The fix:
+`encode_texts` now dispatches on `self.training_mode` — bucket-up padding stays on the
+training-step path (unbounded per-step shape churn is the growth mechanism the first fix above
+targets), while `evaluate` / `evaluate_held_out` use a `tokenize_natural_width` sibling instead,
+matching the tokenizer's own natural per-batch width, exactly as it behaved before the bucketing
+fix existed. Re-measured on the pod after the fix: `batch 8, sequence 512` now **completes** for
+both `bf16` and `f16`, under both the fused and the disabled-fusion arm, with a full 1 Hz memory
+trace — stable around **60.4 GB peak**, no OOM. The honest arc: a real limit existed, its root
+cause was a second-order effect of this campaign's own first fix (never a pre-existing
+eager-attention ceiling), and it is closed — not reported as still open.
 
 **FlashAttention-2's own admission gate, measured Holding on real hardware.** `flash`'s cascade
 (all five gates must pass, in order): the `flash-attn` cargo feature was compiled in; the
@@ -391,15 +404,18 @@ gets. Two new translation units back this (`flash_fwd_hdim64_fp16_sm80.cu` /
 kernel bit-for-bit against a `torch` reference — this live submission is the admission-gate
 proof; that oracle is the numerics proof, and the two are deliberately separate concerns.
 
-One more honest observation from that same real run: its `ops` map carries `layer_norm` /
-`geglu` / `dropout` / `low_rank_residual_linear` (`low_rank_residual_linear` still `Miss`,
-identically to the CPU run above — a real, hardware-independent dtype-domain gap, not a device
-artifact) but **not** `rope`, `softmax`, or `attention_block` — `two_arm_holds` (the mechanism
-that turns a before/after dispatch-counter delta into a report entry) omits an op whose counters
-show no clean single-arm signal, and once FlashAttention itself owns the whole attention block,
-`rope`/`softmax`'s own per-primitive counters no longer move the same way they do under the
-eager/fused-primitive composition this chapter's CPU cells exercise. Reported as observed, not
-smoothed into a claim this render cannot independently check.
+Two honest observations about what a GPU report for this job looks like. First, on real A100
+hardware the LoRA epilogue genuinely dispatches fused at `f16` — the engine's own committed
+A/B provenance for this exact fixture records `lora_linear_fused` firing on every training
+forward of an `f16` run with **zero** eager fallbacks (`docs/plans/63-how-well/measurements/`
+carries the raw per-leg reports), so a GPU report shows `low_rank_residual_linear` `Hold`ing
+just as the CPU cells above do. Second, a GPU report's `ops` map may omit `rope`, `softmax`,
+and `attention_block` entirely rather than reporting them: `two_arm_holds` (the mechanism that
+turns a before/after dispatch-counter delta into a report entry) declines to fabricate an entry
+for an op whose counters show no clean single-arm signal, and once FlashAttention itself owns
+the whole attention block, those per-primitive counters no longer move the way they do under
+the eager/fused-primitive composition this chapter's CPU cells exercise. An omitted op is an
+honest "no independent signal", never a smoothed-over claim.
 
 ## The `bf16`-vs-`f16` guidance, grounded in what is actually measured
 
@@ -411,11 +427,11 @@ smoothed into a claim this render cannot independently check.
   where `bf16` is refused outright (measured above) rather than merely slower. The stability
   probe backs this: at the probed shape, `f16` sits inside the same acceptance band `bf16` itself
   calibrates, 3 of 3 seeds, no late-epoch divergence.
-- **`f16` at the reporter's own shape (batch 16, sequence 128) now runs, bounded, at 44.3 GB** —
-  a real fix, not a workaround; the OOM this campaign started from is closed at that shape.
-- **`f16` at batch 8, sequence 512 is not yet closed.** Treat larger batch × longer sequence
-  eager `f16` fine-tunes as **out of budget until this is resolved** — this is the one place this
-  chapter's guidance is a caution, not a green light, and it is stated as one on purpose.
+- **`f16` at the reporter's own shape (batch 16, sequence 128) now runs, bounded, at 44.3 GB,
+  and the batch 8, sequence 512 stress shape now runs too, at ~60.4 GB.** Both were real fixes,
+  not workarounds — the second one root-caused to this campaign's own bucketing fix leaking onto
+  the eval path, not a pre-existing eager-attention ceiling. Both OOMs this campaign started from
+  are closed.
 
 ## Bridge note
 
@@ -426,10 +442,12 @@ smoothed into a claim this render cannot independently check.
 > submission, `{"state": "determined", "ops": {...}, "flash": {...}}` once a worker resolves a
 > device, each entry carrying the SAME `Hold`/`Miss` + `reason` vocabulary the kernel's own
 > admission gate produces. On this render's CPU-only server every `ops` entry this chapter
-> measured is real (`layer_norm`/`rope`/`softmax`/`geglu` genuinely `Hold` — a portable,
-> dtype-only domain check — while `lora_linear_fused` and the fixed-head-dim gates genuinely
-> `Miss`, for reasons this chapter names exactly), and `flash` is always the honest
-> compiled-away floor. The numbers only a real CUDA server can produce — FlashAttention-2's own
-> `f16` admission, and the two-sided memory story (a real fix at one shape, a real open limit at
-> another) — are reported as measured on real A100 hardware, cited rather than recomputed, the
-> same honesty contract [the preceding chapter](compute-precision.qmd) already keeps for `bf16`.
+> measured is real (six of seven primitives genuinely `Hold` — a portable, dtype-only domain
+> check `f16` now clears everywhere it is dtype-eligible — while `attention_block`'s per-device
+> dtype gate genuinely `Miss`es, for the reason this chapter names exactly), and `flash` is always
+> the honest compiled-away floor. The numbers only a real CUDA server can produce —
+> FlashAttention-2's own `f16` admission actually `Hold`ing, and the memory story's honest arc (a
+> real limit, root-caused to this campaign's own earlier fix leaking onto the eval path, and
+> closed at both measured shapes) — are reported as measured on real A100 hardware, cited rather
+> than recomputed, the same honesty contract [the preceding chapter](compute-precision.qmd)
+> already keeps for `bf16`.

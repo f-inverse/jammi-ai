@@ -405,6 +405,7 @@ MEASUREMENT_FILES = [
     "docs/plans/63-how-well/measurements/campaign-v1/README.md",
     "docs/plans/63-how-well/measurements/campaign-v2/README.md",
     "docs/plans/63-how-well/measurements/dose-ladder/README.md",
+    "docs/plans/63-how-well/measurements/f16-sweep/README.md",
     "docs/plans/63-how-well/measurements/red-proof/README.md",
     "docs/plans/63-how-well/measurements/red-proof/dstar/README.md",
     "docs/plans/63-how-well/mutants/README.md",
@@ -517,6 +518,15 @@ FILE_TOKEN_DENOMINATOR: dict[str, int] = {
     "docs/plans/63-how-well/measurements/campaign-v1/README.md": 40,
     "docs/plans/63-how-well/measurements/campaign-v2/README.md": 17,
     "docs/plans/63-how-well/measurements/dose-ladder/README.md": 22,
+    # The f16 sweep, registered in this list rather than left to its own
+    # "this README is not registered" notice — a measurement record that
+    # documents its own exemption is still an unchecked measurement record.
+    # Its `raw/*.json` legs (not just the merged report) are producers here:
+    # the run's stated configuration (epochs/batch/lr/patience) binds to the
+    # fields the legs actually recorded, and the per-seed d-column binds both
+    # to `#/per_seed/{N}/d_i` and, for the sign summary, to the raw-
+    # concordance recipe recomputed from the legs themselves.
+    "docs/plans/63-how-well/measurements/f16-sweep/README.md": 53,
     "docs/plans/63-how-well/measurements/red-proof/README.md": 46,
     "docs/plans/63-how-well/measurements/red-proof/dstar/README.md": 31,
     # +2 (round-22 A1): heading lines are now in scope — the "### Step 3 —
@@ -556,6 +566,7 @@ FENCE_LINE_DENOMINATOR: dict[str, int] = {
     "docs/plans/63-how-well/measurements/campaign-v1/README.md": 0,
     "docs/plans/63-how-well/measurements/campaign-v2/README.md": 0,
     "docs/plans/63-how-well/measurements/dose-ladder/README.md": 0,
+    "docs/plans/63-how-well/measurements/f16-sweep/README.md": 0,
     "docs/plans/63-how-well/measurements/red-proof/README.md": 0,
     "docs/plans/63-how-well/measurements/red-proof/dstar/README.md": 0,
     "docs/plans/63-how-well/mutants/README.md": 91,

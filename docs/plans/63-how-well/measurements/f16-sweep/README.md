@@ -1,13 +1,18 @@
-# F16 backbone-dtype sweep (campaign #443, W4-bench) — status: INVALID (both reasons pre-registered, expected)
+# F16 backbone-dtype sweep (campaign #443, W4-bench) — status: INVALID (premise violation fired; see below)
 
 **Numbers-not-registered-with-the-citation-checker notice:** unlike `campaign-v1`/
 `campaign-v2`/`dose-ladder`/`red-proof` in this directory, this README does NOT use
 the `<!-- claims63: ... -->` citation convention `ci/scripts/check_measurement_claims.py`
-enforces — that checker's `MEASUREMENT_FILES`/`FILE_TOKEN_DENOMINATOR` allowlist is
-docs-ci-owned, and wiring a new file into it is a distinct, coordinated change this
-bench-scoped task did not make. Every number below is instead a direct, literal copy
-from the committed `finetune_run_ab_report.json`/`raw/*.json` in this same directory —
-re-derive any of them with `python3 -c "import json; print(json.load(open('finetune_run_ab_report.json'))['...'])"`
+enforces. That checker's `MEASUREMENT_FILES` is a hardcoded list literal in
+`check_measurement_claims.py` itself (`docs/plans/63-how-well/measurements/{campaign-v1,
+campaign-v2,dose-ladder,red-proof,red-proof/dstar}/README.md` + `mutants/README.md`), each
+entry paired with a pinned `FILE_TOKEN_DENOMINATOR`/`FENCE_LINE_DENOMINATOR` in that SAME
+file — adding this README to it is therefore NOT a README-local change; it requires
+editing `check_measurement_claims.py` itself, which is docs-ci-owned shared tooling this
+bench-scoped task does not touch. Left flagged as a follow-up for docs-ci, per the
+auditor's own conditional. Every number below is instead a direct, literal copy from the
+committed `finetune_run_ab_report.json`/`raw/*.json` in this same directory — re-derive
+any of them with `python3 -c "import json; print(json.load(open('finetune_run_ab_report.json'))['...'])"`
 against the committed file to check.
 
 ## OPERATOR-APPROVED REDUCED SEED SET — disclosed prominently
@@ -18,8 +23,11 @@ reduction from the pre-registered N=12 gate set the committed **bf16** goldens
 campaign #443 (W4-bench: f16 perf legs through the provenance machinery) specifically
 to exercise the merger/provenance machinery under a new `backbone_dtype`, not to
 re-litigate the bf16 A/B verdict at full N. **No sign test / GREEN-RED-INVALID decision
-at this N should be read as a statistically powered replication of campaign-v2** — see
-"Why status is INVALID" below, reason (a).
+at this N should be read as a statistically powered replication of campaign-v2** — as it
+happens this run's own premise violation (see "Why `status` is INVALID" below) means no
+sign test ran at all, so this caveat is design context for what a hypothetical
+premise-clean run at N=3 would still not deliver, not a report-cited cause of the
+`INVALID` this artifact actually recorded.
 
 ## Run
 
@@ -43,7 +51,7 @@ at this N should be read as a statistically powered replication of campaign-v2**
 - Build: `cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn`
   (the script's own build step). Every committed leg's own `provenance.build_features`
   reads `["bench-cuda", "cuda", "flash-attn"]` — flash-attn WAS compiled in, matching
-  the campaign-v2/campaign-v1 build feature list exactly (`raw/seed1__fused__r1.json#/provenance`).
+  the campaign-v2/campaign-v1 build feature list exactly (`raw/seed1__fused__r1.json#/provenance/build_features`).
 - **Provenance cross-check residual (round-6 audit item D, `ci/scripts/gpu-dev.sh`'s own
   documented gap):** a tree populated purely by `push` carries no `.git` at all, so
   `finetune_run_ab.sh`'s own `git -C "$REPO_ROOT" rev-parse HEAD` provenance cross-check
@@ -104,33 +112,47 @@ report, not a re-run of the bf16 verdict at reduced power.
   — the fused/alloff differential is real and correctly distinguished at f16, not a
   null experiment.
 
-## Why `status` is INVALID (both reasons pre-registered, neither a plumbing bug)
+## Why `status` is INVALID
 
-1. **`gate_seed_count` = 3, not the pre-registered 12.** `ab_merge.py`'s own decision
-   rule text is explicit: "the rule is pre-registered FOR 12 seeds; never rescaled
-   silently" — this is the disclosed reduction above, working exactly as designed
-   (`sign_test: n/a`, `decision: null`).
-2. **Every `fused` leg fails `ab_merge.py`'s own CONTRACT 63 Frame premise (unit-63
-   round-4 audit F-1):** `leg_premise_violations` for every seed reads `VIOLATED (2)` —
-   the merger's `dispatch_arm_consistency` check pre-registers the flash-cascade
-   differential as **BF16-only** ("CONTRACT 63 Frame pre-registers the flash cascade
-   as this arm's own admitted branch, and that branch is BF16-only ... a `fused` leg
-   run at any other dtype cannot exercise the pre-registered differential" —
-   `ab_merge.py`'s own comment, unchanged by this task). This is a genuine,
-   **correctly-firing, pre-registered CONTRACT gap**, not a merger bug and not
-   something this bench-scoped change silently patches: the underlying engine
-   capability (`flash_capability_gates` / `dtype_is_bf16_or_f16`,
-   `jammi-encoders/src/modernbert.rs`, landed on the `fix/443-fa2-f16-capability`
-   branch this task merged in) now admits F16 alongside BF16 for real dispatch — as
-   the dispatch-count evidence above shows — but `ab_merge.py`'s own CONTRACT 63
-   Frame premise text has NOT been re-registered to recognize F16 as an admitted
-   flash-cascade dtype for THIS specific A/B differential. Extending CONTRACT 63
-   Frame (and `ab_merge.py`'s premise check) to admit F16 is a distinct, docs-ci-owned
-   governance action — flagged here as a follow-up, not performed by this task.
+**The report's actual, sole recorded cause: every `fused` leg fails `ab_merge.py`'s own
+CONTRACT 63 Frame premise (unit-63 round-4 audit F-1).** Every seed's
+`#/per_seed/{N}/leg_premise_violations` holds exactly 2 entries (`fused r1`, `fused r2`),
+each reading `"...counters claim a dispatch the declared dtype forbids
+(flash_capability_gates admits only BF16, modernbert.rs's own dtype_is_bf16 gate)..."`
+— at the time this sweep's own merge ran, `ab_merge.py`'s
+`finetune_run_dispatch_proof_violations` premise pre-registered the flash-cascade
+differential as **BF16-only**, and every
+`fused` leg here declared `backbone_dtype="f16"` while counting a positive
+`attention_block_flash_fused_dispatches`, which that premise (correctly, as written at
+the time) refused as internally contradictory. Because zero seeds clear the premise,
+`clean_seed_count=0`, `#/sign_test` is `null`, and `#/decision` is `null` — the merger
+never reaches the point of comparing a clean-seed count against the pre-registered N=12
+gate at all. **There is no separate, independently-fired `gate_seed_count`-based reason
+in this report** — `finetune_run_ab_report.json` has no top-level `gate_seed_count` field
+(it would live under `#/decision`, which is `null` here), and `#/wrong_seed_count` reads
+`false`.
 
-Both reasons are independently sufficient for INVALID; a future N=12, CONTRACT-amended
-f16 re-run would need reason (2) resolved first, or its own fused-arm verdict will
-read INVALID regardless of seed count.
+**Design context, not a second report-cited reason:** the N=3 reduction disclosed above
+is a real, pre-registered, operator-approved fact of THIS sweep's design, independent of
+whether the premise above fired. Had every leg cleared the premise instead, `ab_merge.py`'s
+own decision-rule text is explicit that its sign-test threshold is "pre-registered FOR 12
+seeds; never rescaled silently" — so a hypothetical premise-clean run at N=3 would still
+not have produced a verdict comparable to campaign-v2's own pre-registered, fully-powered
+N=12 read. This is stated here as a caveat on what N=3 CAN and CANNOT deliver even in the
+best case, not as a JSON-field this report actually cites for its `INVALID` status.
+
+**Since amended (docs-ci, not performed by this task):** `docs/plans/63-how-well/
+CONTRACT.md`'s "Amendment 2026-09-01" (commit `f97326ed`, folded into this worktree after
+this artifact was committed) widens the flash-cascade differential's admitted dtype set
+from `{BF16}` to `{BF16, F16}`, tracking `flash_capability_gates`'s own
+`dtype_is_bf16_or_f16` widening, and updates `ab_merge.py`'s premise checks to match —
+motivated explicitly by this sweep's own dispatch-count evidence (above). That amendment's
+own commit message states it deliberately does NOT re-run or re-merge this committed
+artifact: this README's `INVALID` status is honest history for the premise this sweep's
+own merge actually ran under, not retroactively recomputed. A future f16 fused-arm sweep
+merged under the amended `ab_merge.py` would no longer trip this specific premise —
+whether it produces a non-`INVALID` verdict would then depend on the (separate, still
+pre-registered-for-12) seed-count gate the design-context paragraph above describes.
 
 ## Files
 

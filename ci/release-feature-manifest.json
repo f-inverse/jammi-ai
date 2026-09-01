@@ -81,7 +81,8 @@
         "cuda_compiled": true,
         "flash_compiled": true,
         "flash_dtypes": [
-          "bf16"
+          "bf16",
+          "f16"
         ],
         "fused_op_admission": [
           "layer_norm",
@@ -115,7 +116,8 @@
         "cuda_compiled": true,
         "flash_compiled": true,
         "flash_dtypes": [
-          "bf16"
+          "bf16",
+          "f16"
         ],
         "fused_op_admission": [
           "layer_norm",
@@ -149,7 +151,8 @@
         "cuda_compiled": true,
         "flash_compiled": true,
         "flash_dtypes": [
-          "bf16"
+          "bf16",
+          "f16"
         ],
         "fused_op_admission": [
           "layer_norm",

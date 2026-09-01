@@ -46,6 +46,22 @@ fn per_micro_batch_host_read_count() -> u64 {
     PER_MICRO_BATCH_HOST_READ_COUNT.load(Ordering::Relaxed)
 }
 
+/// Test-only call counters for `encode_texts`'s `EncoderAdapters`-branch
+/// dispatch between [`tokenize_and_bucket`] (train) and
+/// [`tokenize_natural_width`] (eval) — adversarial-audit round 2, campaign
+/// #443, item 3. Both functions return SELF-CONSISTENT `(rows, cols)` pairs
+/// (a caller cannot tell, from `encode_texts`'s pooled `[rows, hidden]`
+/// output alone, which one actually ran — bucketing is deliberately
+/// output-invariant), so a black-box test cannot observe the routing
+/// decision from the return value. Mirrors
+/// [`PER_MICRO_BATCH_HOST_READ_COUNT`]'s own role just above: a test cannot
+/// observe the internal path taken directly, so this is the structural
+/// proxy.
+#[cfg(test)]
+static BUCKETED_TOKENIZE_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static NATURAL_TOKENIZE_CALLS: AtomicU64 = AtomicU64::new(0);
+
 /// Result of a completed training run.
 ///
 /// The loop trains and persists the adapter into a worker-private local
@@ -526,6 +542,101 @@ impl TrainingLoopBuilder {
         training_loop.set_training(true);
         Ok(training_loop)
     }
+}
+
+/// Tokenizes `texts` via `tokenizer`'s own `BatchLongest` padding, then
+/// rounds the batch's natural width UP to
+/// [`jammi_numerics::bucket_seq_len`]'s bucket ladder and extends every row
+/// to that bucketed width — see `crate::fine_tune::batch_bucket`'s module
+/// doc for the mechanism/rationale this closes (esc-076,
+/// `.jammi/escapes.jsonl`). Returns the bucketed [`BatchEncoding`] alongside
+/// the row count and the bucketed column width actually produced, so a
+/// caller can build a `[rows, cols]` tensor directly without recomputing
+/// either.
+///
+/// **TRAINING-STEP path only** (adversarial-audit round 2, campaign #443,
+/// item 3 — amending esc-076): [`TrainingLoop::encode_texts`]'s
+/// `EncoderAdapters` branch calls this ONLY while `self.training_mode` is
+/// `true`; see [`tokenize_natural_width`]'s doc for the sibling eval-time
+/// path and why bucket-UP padding is wrong there. Bucketing exists to bound
+/// the COUNT of distinct tensor shapes a non-caching CUDA allocator sees
+/// across the UNBOUNDED sequence of per-training-step batches (esc-076's own
+/// mechanism) — an eval pass is not that path.
+///
+/// Factored out of [`TrainingLoop::encode_texts`]'s `EncoderAdapters` branch
+/// (its only caller) — not merely inlined there — so a unit test can drive
+/// the PRODUCTION tokenize+bucket step directly and assert its bucketed
+/// shape without duplicating the decision: deleting either
+/// `pad_rows_to_bucket` call below turns
+/// `encode_texts_bucketing_oracle::tokenize_and_bucket_pads_every_row_to_the_bucket_ladder`
+/// red (rows stay at their natural, unbucketed width, so `cols` no longer
+/// matches every row's actual length).
+fn tokenize_and_bucket(
+    tokenizer: &crate::model::tokenizer::TokenizerWrapper,
+    texts: &[String],
+    effective_max: usize,
+) -> Result<(crate::model::tokenizer::BatchEncoding, usize, usize)> {
+    #[cfg(test)]
+    BUCKETED_TOKENIZE_CALLS.fetch_add(1, Ordering::Relaxed);
+    let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+    let mut encoding = tokenizer.encode_batch(&text_refs, Some(effective_max))?;
+
+    let rows = encoding.input_ids.len();
+    let natural_cols = encoding.input_ids.first().map_or(0, |v| v.len());
+    // esc-076: round this batch's own (tokenizer `BatchLongest`) natural
+    // width UP to a small, fixed bucket ladder — see
+    // `crate::fine_tune::batch_bucket`'s module doc for why an UNBOUNDED
+    // count of distinct per-step tensor shapes fragments/grows cudarc's
+    // non-caching CUDA allocator, and why extending the SAME trailing-zero
+    // padding contract `BatchLongest` already relies on (pad id `0`, mask
+    // `0`) is output-invariant. Every dtype/objective through this ONE
+    // `EncoderAdapters` TRAINING-STEP call site is bucketed uniformly —
+    // never an f16-specific knob (but see the eval-time exemption above:
+    // this function is only reached from the training-step path today).
+    let cols = jammi_numerics::bucket_seq_len(natural_cols, effective_max);
+    crate::fine_tune::batch_bucket::pad_rows_to_bucket(&mut encoding.input_ids, cols, 0);
+    crate::fine_tune::batch_bucket::pad_rows_to_bucket(&mut encoding.attention_masks, cols, 0);
+
+    Ok((encoding, rows, cols))
+}
+
+/// Tokenizes `texts` via `tokenizer`'s own `BatchLongest` padding WITHOUT any
+/// further bucket-rounding — every row is exactly the batch's own natural
+/// (tokenizer `BatchLongest`) width, matching pre-esc-076 behaviour.
+///
+/// **EVAL path only** (adversarial-audit round 2, campaign #443, item 3):
+/// [`TrainingLoop::encode_texts`]'s `EncoderAdapters` branch calls this
+/// while `self.training_mode` is `false` — i.e. inside
+/// [`TrainingLoop::with_dropout_disabled`]'s bracket
+/// ([`TrainingLoop::evaluate`]/[`TrainingLoop::evaluate_held_out`]).
+/// [`tokenize_and_bucket`]'s bucket ladder exists to bound the COUNT of
+/// DISTINCT tensor shapes a non-caching CUDA allocator (`cudarc`) sees
+/// across the training loop's UNBOUNDED sequence of per-step batches
+/// (esc-076's own mechanism, `crate::fine_tune::batch_bucket`'s module doc)
+/// — an eval pass runs at most `epochs / eval_cadence` times per training
+/// run, never per-step, so it was never the shape-churn esc-076's fix
+/// targeted. Rounding an eval batch's real width UP to the run's
+/// `max_seq_length` bucket regardless of how short its actual content is
+/// (e.g. a genuine 321-token held-out batch padded to the 512 bucket, a
+/// measured `~2.5x` softmax-intermediate blow-up: `512² / 321² ≈ 2.5`) is a
+/// pure cost with no allocator-stability upside at eval's own call
+/// frequency, and measurably OOM'd a `--batch 8 --max-seq-length 512` bf16
+/// leg that ran clean at the pre-bucketing baseline (adversarial-audit
+/// round 2 dispute; `.jammi/escapes.jsonl`'s esc-076 entry itself never
+/// exercised a real eval-time batch at a natural width anywhere near a
+/// bucket rung, since its own reporter shape used `max_seq_length: 128`).
+fn tokenize_natural_width(
+    tokenizer: &crate::model::tokenizer::TokenizerWrapper,
+    texts: &[String],
+    effective_max: usize,
+) -> Result<(crate::model::tokenizer::BatchEncoding, usize, usize)> {
+    #[cfg(test)]
+    NATURAL_TOKENIZE_CALLS.fetch_add(1, Ordering::Relaxed);
+    let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+    let encoding = tokenizer.encode_batch(&text_refs, Some(effective_max))?;
+    let rows = encoding.input_ids.len();
+    let cols = encoding.input_ids.first().map_or(0, |v| v.len());
+    Ok((encoding, rows, cols))
 }
 
 impl TrainingLoop {
@@ -1526,33 +1637,23 @@ impl TrainingLoop {
                     )),
                 };
 
-                let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
                 let effective_max = self.config.max_seq_length.min(encoder.max_seq_length());
-                let mut encoding = tokenizer.encode_batch(&text_refs, Some(effective_max))?;
-
-                let rows = encoding.input_ids.len();
-                let natural_cols = encoding.input_ids.first().map_or(0, |v| v.len());
-                // esc-076: round this batch's own (tokenizer `BatchLongest`)
-                // natural width UP to a small, fixed bucket ladder — see
-                // `crate::fine_tune::batch_bucket`'s module doc for why an
-                // UNBOUNDED count of distinct per-step tensor shapes
-                // fragments/grows cudarc's non-caching CUDA allocator, and
-                // why extending the SAME trailing-zero padding contract
-                // `BatchLongest` already relies on (pad id `0`, mask `0`) is
-                // output-invariant. Every dtype/objective through this ONE
-                // `EncoderAdapters` call site is bucketed uniformly — never
-                // an f16-specific knob.
-                let cols = jammi_numerics::bucket_seq_len(natural_cols, effective_max);
-                crate::fine_tune::batch_bucket::pad_rows_to_bucket(
-                    &mut encoding.input_ids,
-                    cols,
-                    0,
-                );
-                crate::fine_tune::batch_bucket::pad_rows_to_bucket(
-                    &mut encoding.attention_masks,
-                    cols,
-                    0,
-                );
+                // esc-076 amendment (adversarial-audit round 2, campaign
+                // #443, item 3): bucket-UP padding is a TRAINING-STEP-only
+                // concern (bounding the allocator's distinct-shape count
+                // across an unbounded run of steps) — an eval pass
+                // (`self.training_mode == false`, set by
+                // `with_dropout_disabled`'s bracket around
+                // `evaluate`/`evaluate_held_out`) runs at most a handful of
+                // times per training run and pays bucketing's inflated
+                // shape with no matching allocator-stability benefit; see
+                // `tokenize_natural_width`'s own doc for the measured OOM
+                // this exemption closes.
+                let (encoding, rows, cols) = if self.training_mode {
+                    tokenize_and_bucket(tokenizer, texts, effective_max)?
+                } else {
+                    tokenize_natural_width(tokenizer, texts, effective_max)?
+                };
 
                 let input_ids = Tensor::from_vec(
                     encoding
@@ -10367,7 +10468,7 @@ mod encoder_adapters_training_state_tests {
     /// `tests/it/encoder_adapters.rs` fine-tunes end-to-end. `CARGO_MANIFEST_DIR`
     /// is `crates/jammi-ai`; `tests/fixtures` sits two levels up, at the
     /// workspace root (mirrors `tests/gpu_capability/harness.rs::fixture`).
-    fn tiny_modernbert_fixture_dir() -> std::path::PathBuf {
+    pub(super) fn tiny_modernbert_fixture_dir() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -10383,7 +10484,10 @@ mod encoder_adapters_training_state_tests {
     /// attention linears — the same pair `tests/it/encoder_adapters.rs` uses)
     /// and dropout ON, so a real `LoraLinear` dropout gate is exercised
     /// alongside the encoder body's own `training` flag.
-    fn build_encoder_adapters_target(device: &Device, varmap: &VarMap) -> TrainingTarget {
+    pub(super) fn build_encoder_adapters_target(
+        device: &Device,
+        varmap: &VarMap,
+    ) -> TrainingTarget {
         let dir = tiny_modernbert_fixture_dir();
         let config_raw = std::fs::read_to_string(dir.join("config.json"))
             .expect("tiny_modernbert fixture config.json must be readable");
@@ -10541,6 +10645,362 @@ mod encoder_adapters_training_state_tests {
              encoder body INTO training mode as a side effect"
         );
         assert!(!loop_.training_mode, "mirror must agree with real state");
+    }
+}
+
+/// F4 (adversarial-audit round 2, campaign #443): a production-call-site
+/// oracle for esc-076's bucketing fix (`.jammi/escapes.jsonl`).
+///
+/// Every existing bucketing test lives in
+/// `crate::fine_tune::batch_bucket`'s own unit-test module and calls
+/// `pad_rows_to_bucket`/`bucket_seq_len` directly — none of them drive
+/// [`TrainingLoop::encode_texts`]'s `EncoderAdapters` branch, the ONLY
+/// production call site (via this file's own `tokenize_and_bucket`, its
+/// sole caller). The prior audit round proved deleting both
+/// `pad_rows_to_bucket` calls there left every test in the crate green.
+/// This module closes that gap: `tokenize_and_bucket_pads_every_row_to_the_
+/// bucket_ladder` drives `tokenize_and_bucket` itself against a real
+/// tokenizer and asserts the returned rows are actually padded to the
+/// bucket ladder (RED if either `pad_rows_to_bucket` call is deleted), and
+/// `encode_texts_output_is_bucket_invariant_at_the_real_call_site` proves
+/// that padding does not move the real, production `encode_texts` output
+/// versus an independently-built natural-width forward pass.
+#[cfg(test)]
+mod encode_texts_bucketing_oracle {
+    use std::sync::Arc;
+
+    use candle_core::{Device, Tensor};
+    use candle_nn::VarMap;
+    use serial_test::serial;
+
+    use super::super::target::TrainingTarget;
+    use super::super::FineTuneConfig;
+    use super::encoder_adapters_training_state_tests::build_encoder_adapters_target;
+    use super::TrainingLoopBuilder;
+    use crate::model::{LoadedModel, ModelSource, ModelTask};
+
+    // The three tests below all call into `tokenize_and_bucket`/
+    // `tokenize_natural_width` (directly, or indirectly via
+    // `TrainingLoop::encode_texts`'s `EncoderAdapters` branch), which
+    // increment the process-wide `BUCKETED_TOKENIZE_CALLS`/
+    // `NATURAL_TOKENIZE_CALLS` test-only counters (c) reads. `cargo test`
+    // runs tests in parallel threads within the SAME process, so an
+    // unmarked set racing on those counters would be flaky — `#[serial(..)]`
+    // under a shared key forces them to run one at a time relative to each
+    // other, mirroring this file's own `trainer_host_read_count` precedent.
+
+    /// Real `LoadedModel` (the `base_model` `encode_texts` reads its
+    /// tokenizer from) for the SAME `tiny_modernbert` fixture the
+    /// `EncoderAdapters` target below is built from — shared vocab/config,
+    /// so the tokenizer's emitted token ids are valid inputs to the
+    /// encoder's own embedding table. Mirrors
+    /// `test_fixtures::tiny_bert`'s real model-cache load path, substituting
+    /// `tiny_modernbert_fixture_dir` for the cookbook `tiny_bert` fixture.
+    async fn tiny_modernbert_base_model() -> Arc<LoadedModel> {
+        let dir = tempfile::tempdir().unwrap();
+        let config = jammi_test_utils::test_config(dir.path());
+        let session = crate::session::InferenceSession::new(config).await.unwrap();
+        let source = ModelSource::Local(
+            super::encoder_adapters_training_state_tests::tiny_modernbert_fixture_dir(),
+        );
+        let guard = session
+            .model_cache()
+            .get_or_load(&source, ModelTask::TextEmbedding, None)
+            .await
+            .unwrap();
+        guard.model.clone()
+    }
+
+    fn tokenizer_of(base: &LoadedModel) -> &crate::model::tokenizer::TokenizerWrapper {
+        match base {
+            LoadedModel::Candle(m) => m.tokenizer.as_ref().expect("fixture ships a tokenizer"),
+            _ => panic!("tiny_modernbert fixture must load as a Candle model"),
+        }
+    }
+
+    /// `tiny_modernbert`'s own `max_position_embeddings` (see its committed
+    /// `config.json`) — `encode_texts`'s own `effective_max =
+    /// self.config.max_seq_length.min(encoder.max_seq_length())` reduces to
+    /// this value under `FineTuneConfig::default()`'s `max_seq_length:
+    /// 512`.
+    const EFFECTIVE_MAX: usize = 128;
+
+    /// Two rows whose tokenizer-emitted natural width (after `[CLS]`/`[SEP]`
+    /// and WordPiece per-letter tokens, then the batch's own `BatchLongest`
+    /// intra-batch padding) lands strictly between two `bucket_seq_len`
+    /// rungs — verified in the test below via the SAME decision
+    /// `tokenize_and_bucket` uses, never hand-asserted: `"a b c d e f g h
+    /// i"` tokenizes to `[CLS] a b c d e f g h i [SEP]` = 11 tokens, and
+    /// `bucket_seq_len(11, 128) == 16` (`> 11`, so this batch genuinely
+    /// exercises padding).
+    fn ragged_texts() -> Vec<String> {
+        vec!["a b c d e f g h i".to_string(), "a".to_string()]
+    }
+
+    /// (a) The production oracle: calling `tokenize_and_bucket` — the exact
+    /// helper `TrainingLoop::encode_texts`'s `EncoderAdapters` branch calls,
+    /// its only caller — against a real tokenizer must return rows extended
+    /// to `bucket_seq_len`'s ladder, strictly wider than the batch's own
+    /// natural (tokenizer `BatchLongest`) width.
+    ///
+    /// RED-PROOF: deleting either `pad_rows_to_bucket` call inside
+    /// `tokenize_and_bucket` leaves every row at its natural width, so
+    /// `row.len() == cols` fails below (`cols` is still computed from
+    /// `bucket_seq_len` independently of whether the rows were actually
+    /// extended to it — the assertion cannot pass vacuously).
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial(tokenize_dispatch_calls)]
+    async fn tokenize_and_bucket_pads_every_row_to_the_bucket_ladder() {
+        let base = tiny_modernbert_base_model().await;
+        let tokenizer = tokenizer_of(&base);
+
+        let texts = ragged_texts();
+        let (encoding, rows, cols) =
+            super::tokenize_and_bucket(tokenizer, &texts, EFFECTIVE_MAX).unwrap();
+
+        assert_eq!(rows, texts.len());
+
+        // Natural width independently recomputed via a SEPARATE, unbucketed
+        // `encode_batch` call — never read off `encoding` itself, since
+        // that is the very value under test.
+        let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let natural = tokenizer
+            .encode_batch(&text_refs, Some(EFFECTIVE_MAX))
+            .unwrap();
+        let natural_cols = natural.input_ids[0].len();
+        assert!(
+            cols > natural_cols,
+            "fixture texts must produce a non-bucket-aligned natural width \
+             ({natural_cols}) so this test actually exercises padding, got bucketed={cols}"
+        );
+        assert_eq!(
+            cols,
+            jammi_numerics::bucket_seq_len(natural_cols, EFFECTIVE_MAX),
+            "cols must be the bucket_seq_len decision for this batch's own natural width"
+        );
+        for (i, row) in encoding.input_ids.iter().enumerate() {
+            assert_eq!(
+                row.len(),
+                cols,
+                "input_ids row {i} must be padded to the bucketed width {cols}, got {}",
+                row.len()
+            );
+        }
+        for (i, row) in encoding.attention_masks.iter().enumerate() {
+            assert_eq!(
+                row.len(),
+                cols,
+                "attention_mask row {i} must be padded to the bucketed width {cols}, got {}",
+                row.len()
+            );
+            // Every position beyond the natural width must be fully masked
+            // (K2/K7 correctness — never a wrong answer wearing a fixed
+            // shape).
+            for &m in &row[natural_cols..] {
+                assert_eq!(m, 0, "padded tail of attention_mask row {i} must be masked");
+            }
+        }
+    }
+
+    /// (b) Output-invariance at the REAL call site: [`TrainingLoop::encode_
+    /// texts`]'s `EncoderAdapters` branch, driven end-to-end through a real
+    /// `TrainingLoop`, must produce the same pooled output as an
+    /// independently-built forward pass over the batch's own NATURAL
+    /// (unbucketed) width.
+    ///
+    /// The comparison encoder is a second, independently-loaded instance of
+    /// the identical `tiny_modernbert` fixture (`LoraInitMode::ZerosB`
+    /// means the injected LoRA branch contributes exactly zero at this
+    /// freshly-built, untrained state — regardless of dropout, since `B =
+    /// 0` zeroes the whole `B * dropout(A * x)` term — so two independently
+    /// loaded encoders over the same frozen base weights agree bit-for-bit
+    /// on a pure base forward pass); this isolates the bucketing effect
+    /// from any risk of the comparison silently reusing `encode_texts`'s
+    /// own internals.
+    ///
+    /// Tolerance: `1e-4` absolute per lane, derived from this fixture's
+    /// `hidden_size=32` F32 accumulation error over an attention softmax
+    /// reduction whose extra (fully-masked) columns still enter the
+    /// max/sum reduction before their `exp()` drives them to ~0 — looser
+    /// than `batch_bucket.rs`'s own `1e-5` (a hand-built fixture with a
+    /// narrower padded tail, 8 vs this fixture's 16) to account for the
+    /// wider padded tail here, and orders of magnitude tighter than any
+    /// real bug (a wrong mask, wrong pad id, or a divisor that counted
+    /// padding) would produce, which collapses agreement completely.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial(tokenize_dispatch_calls)]
+    async fn encode_texts_output_is_bucket_invariant_at_the_real_call_site() {
+        let device = Device::Cpu;
+        let base_model = tiny_modernbert_base_model().await;
+        let texts = ragged_texts();
+
+        // The REAL, bucketed path: exactly what a training step calls.
+        let varmap = VarMap::new();
+        let target = build_encoder_adapters_target(&device, &varmap);
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.keep();
+        let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
+        let loop_ = TrainingLoopBuilder::new(target, varmap, FineTuneConfig::default())
+            .device(device.clone())
+            .base_model(base_model.clone())
+            .job_id("encode-texts-bucketing-oracle-job".into())
+            .worker_id("encode-texts-bucketing-oracle-worker".into())
+            .catalog(catalog)
+            .artifact_dir(dir_path)
+            .build()
+            .unwrap();
+        let bucketed_out = loop_
+            .encode_texts(&texts)
+            .expect("bucketed encode_texts must succeed")
+            .to_vec2::<f32>()
+            .unwrap();
+
+        // The natural (unbucketed) comparison.
+        let varmap2 = VarMap::new();
+        let target2 = build_encoder_adapters_target(&device, &varmap2);
+        let encoder2 = match &target2 {
+            TrainingTarget::EncoderAdapters(state) => &state.encoder,
+            TrainingTarget::ProjectionHead { .. } => {
+                unreachable!("build_encoder_adapters_target always builds EncoderAdapters")
+            }
+        };
+        let tokenizer = tokenizer_of(&base_model);
+        let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let natural = tokenizer
+            .encode_batch(&text_refs, Some(EFFECTIVE_MAX))
+            .unwrap();
+        let rows = natural.input_ids.len();
+        let cols = natural.input_ids[0].len();
+        let to_tensor = |data: Vec<Vec<u32>>| -> Tensor {
+            Tensor::from_vec(
+                data.into_iter().flatten().collect::<Vec<u32>>(),
+                (rows, cols),
+                &device,
+            )
+            .unwrap()
+        };
+        let input_ids = to_tensor(natural.input_ids);
+        let attention_mask = to_tensor(natural.attention_masks);
+        let natural_out = encoder2
+            .forward(&input_ids, &attention_mask)
+            .expect("natural-width forward must succeed")
+            .to_vec2::<f32>()
+            .unwrap();
+
+        assert_eq!(bucketed_out.len(), natural_out.len());
+        const TOLERANCE: f32 = 1e-4;
+        for (row_i, (b_row, n_row)) in bucketed_out.iter().zip(&natural_out).enumerate() {
+            assert_eq!(b_row.len(), n_row.len());
+            for (lane, (b, n)) in b_row.iter().zip(n_row).enumerate() {
+                assert!(
+                    (b - n).abs() <= TOLERANCE,
+                    "row {row_i} lane {lane}: bucketed={b} natural={n} differ by {} > \
+                     tolerance {TOLERANCE} -- bucketing at the real `encode_texts` call site \
+                     must not move the pooled output",
+                    (b - n).abs()
+                );
+            }
+        }
+    }
+
+    /// (c) esc-076 eval amendment (adversarial-audit round 2, campaign
+    /// #443, item 3): `encode_texts`'s `EncoderAdapters` branch must
+    /// dispatch to [`super::tokenize_and_bucket`] while `self.training_mode
+    /// == true` and to [`super::tokenize_natural_width`] while it is
+    /// `false` — proven via the process-wide call counters
+    /// ([`super::BUCKETED_TOKENIZE_CALLS`]/[`super::NATURAL_TOKENIZE_CALLS`])
+    /// since both functions are, by design, output-invariant (bucketing a
+    /// batch does not change its pooled result — test (b) above), so a
+    /// black-box comparison of `encode_texts`'s RETURN VALUE cannot tell
+    /// which path actually ran.
+    ///
+    /// RED-PROOF: hard-coding `encode_texts`'s `EncoderAdapters` branch to
+    /// always call `tokenize_and_bucket` (dropping the `if
+    /// self.training_mode` dispatch this fix adds) turns this test red at
+    /// its eval-mode counter assertions — `NATURAL_TOKENIZE_CALLS` would
+    /// stay at its pre-call snapshot while `BUCKETED_TOKENIZE_CALLS` moves
+    /// instead.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial(tokenize_dispatch_calls)]
+    async fn encode_texts_dispatches_on_training_mode_between_bucketed_and_natural_tokenize() {
+        use std::sync::atomic::Ordering;
+
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let target = build_encoder_adapters_target(&device, &varmap);
+        let base_model = tiny_modernbert_base_model().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.keep();
+        let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
+        let mut loop_ = TrainingLoopBuilder::new(target, varmap, FineTuneConfig::default())
+            .device(device.clone())
+            .base_model(base_model.clone())
+            .job_id("encode-texts-eval-width-oracle-job".into())
+            .worker_id("encode-texts-eval-width-oracle-worker".into())
+            .catalog(catalog)
+            .artifact_dir(dir_path)
+            .build()
+            .unwrap();
+        assert!(
+            loop_.training_mode,
+            "TrainingLoopBuilder::build must leave the loop in training mode"
+        );
+
+        let texts = ragged_texts();
+
+        // Train mode (the loop's own post-`build` state): must dispatch to
+        // `tokenize_and_bucket`, never `tokenize_natural_width`.
+        let bucketed_before = super::BUCKETED_TOKENIZE_CALLS.load(Ordering::Relaxed);
+        let natural_before = super::NATURAL_TOKENIZE_CALLS.load(Ordering::Relaxed);
+        loop_
+            .encode_texts(&texts)
+            .expect("train-mode encode_texts must succeed");
+        assert_eq!(
+            super::BUCKETED_TOKENIZE_CALLS.load(Ordering::Relaxed),
+            bucketed_before + 1,
+            "train-mode encode_texts must call tokenize_and_bucket exactly once"
+        );
+        assert_eq!(
+            super::NATURAL_TOKENIZE_CALLS.load(Ordering::Relaxed),
+            natural_before,
+            "train-mode encode_texts must NOT call tokenize_natural_width"
+        );
+
+        // Flip to eval mode via the SAME production seam
+        // `evaluate`/`evaluate_held_out` use (`with_dropout_disabled` ->
+        // `set_training(false)`), never a raw field write.
+        loop_.set_training(false);
+        let bucketed_before = super::BUCKETED_TOKENIZE_CALLS.load(Ordering::Relaxed);
+        let natural_before = super::NATURAL_TOKENIZE_CALLS.load(Ordering::Relaxed);
+        loop_
+            .encode_texts(&texts)
+            .expect("eval-mode encode_texts must succeed");
+        assert_eq!(
+            super::NATURAL_TOKENIZE_CALLS.load(Ordering::Relaxed),
+            natural_before + 1,
+            "eval-mode encode_texts must call tokenize_natural_width exactly once"
+        );
+        assert_eq!(
+            super::BUCKETED_TOKENIZE_CALLS.load(Ordering::Relaxed),
+            bucketed_before,
+            "eval-mode encode_texts must NOT call tokenize_and_bucket (esc-076 eval amendment \
+             — bucketing an eval batch up to the run's max_seq_length bucket measurably OOM'd \
+             a shape that ran clean pre-bucketing; see tokenize_natural_width's own doc)"
+        );
+
+        // Sanity: this fixture's texts really do produce a bucket/natural
+        // gap, so the counters above are distinguishing a REAL difference,
+        // not two paths that happen to coincide for this input.
+        let tokenizer = tokenizer_of(&base_model);
+        let (_, _, bucketed_cols) =
+            super::tokenize_and_bucket(tokenizer, &texts, EFFECTIVE_MAX).unwrap();
+        let (_, _, natural_cols) =
+            super::tokenize_natural_width(tokenizer, &texts, EFFECTIVE_MAX).unwrap();
+        assert!(
+            bucketed_cols > natural_cols,
+            "fixture must produce a real bucket ({bucketed_cols}) vs natural ({natural_cols}) \
+             gap for this test to be meaningful"
+        );
     }
 }
 

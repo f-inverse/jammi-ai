@@ -12,16 +12,19 @@
 //!   FLASH_COMPILED == true".
 //! - Every op the manifest's `fused_op_admission` list declares that this
 //!   file can attribute to a real dispatch-registry key admits (`Holds`) on
-//!   THIS device, for the dtypes the current tree admits fused kernels for
-//!   today (f32, bf16 — f16 kernel authoring is a separate, in-flight wave;
-//!   campaign #443 plan v3 §Part 3), under `JAMMI_KERNELS_STRICT=1` (a
-//!   two-arm op's admission Miss hard-errors under Strict — see
-//!   `jammi_kernels::admission::admit`'s Strict-mode contract), by reading
-//!   the per-op dispatch-registry deltas around a real forward + backward +
-//!   one optimizer step over a synthetic batch.
+//!   THIS device, for every dtype the current tree admits fused kernels for
+//!   (f32, bf16, f16 — f16 kernel authoring landed in campaign #443's FA2
+//!   fp16 wave, closing the gap plan v3 §Part 3 tracked as in-flight),
+//!   under `JAMMI_KERNELS_STRICT=1` (a two-arm op's admission Miss
+//!   hard-errors under Strict — see `jammi_kernels::admission::admit`'s
+//!   Strict-mode contract), by reading the per-op dispatch-registry deltas
+//!   around a real forward + backward + one optimizer step over a synthetic
+//!   batch.
 //! - `flash_dtypes` admits (`Holds`) the flash cascade when this build
 //!   compiled `flash-attn` AND the dtype is one flash preempts attention_block
-//!   for — see the `attention_block` TIER PREEMPTION note below.
+//!   for — see the `attention_block` TIER PREEMPTION note below. The
+//!   manifest's `flash_dtypes` is `["bf16", "f16"]` (widened alongside FA2
+//!   fp16 dispatch, campaign #443) — never bf16-only.
 //!
 //! ## TIER PREEMPTION: `attention_block` vs the flash cascade
 //! (adversarial-audit finding 1, campaign #443 Phase 4)
@@ -489,7 +492,11 @@ async fn capability_surface() {
         .chain(std::iter::once("attention_block"))
         .collect();
 
-    for dtype in [ComputePrecision::F32, ComputePrecision::BF16] {
+    for dtype in [
+        ComputePrecision::F32,
+        ComputePrecision::BF16,
+        ComputePrecision::F16,
+    ] {
         let candle_dtype = compute_precision_to_candle_dtype(dtype);
         // TIER PREEMPTION (Phase-4 audit finding 1): whether THIS dtype is
         // one the flash cascade is expected to preempt attention_block /

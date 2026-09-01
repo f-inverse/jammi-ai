@@ -19,8 +19,19 @@
 //! activation INSIDE a mean/variance reduction fabricates values); the D3
 //! doc names the sound fix point as "the trainer's own batch-construction
 //! step (padding/bucketing sequence lengths to a small, fixed set of
-//! buckets)" — this module, and its call site in
-//! `TrainingLoop::encode_texts`.
+//! buckets)" — this module, and its TRAINING-STEP call site in
+//! `TrainingLoop::encode_texts` (`tokenize_and_bucket`).
+//!
+//! **Eval amendment (adversarial-audit round 2, campaign #443, item 3):**
+//! bucketing is a TRAINING-STEP-only concern — it bounds the allocator's
+//! distinct-shape count across an UNBOUNDED sequence of per-step batches,
+//! which an eval pass (`evaluate`/`evaluate_held_out`, running at most a
+//! handful of times per training run) never is. `encode_texts` only calls
+//! into this module while `self.training_mode` is `true`; while evaluating
+//! (`training_mode == false`) it calls the natural-width sibling
+//! `tokenize_natural_width` instead — see that function's own doc for the
+//! measured OOM (a real 321-token held-out batch bucketed up to the 512
+//! rung) this exemption closes.
 //!
 //! ## Bucket DECISION lives in `jammi-numerics`, not here
 //!
@@ -48,10 +59,17 @@
 //! `attention_mask` with `0` (fully masked — the identical mechanism
 //! `BatchLongest` already relies on for intra-batch length variance; this
 //! module only extends how FAR that trailing zero run goes, never how it is
-//! interpreted downstream). `bucket_batch_parity` (this crate's own
-//! integration test, `tests/it/ft_determinism.rs`) proves this
+//! interpreted downstream). `bucketed_and_natural_batches_produce_the_same_
+//! pooled_output` (this module's own unit test, below) proves this
 //! output-invariance claim on a real encoder rather than asserting it from
-//! the padding contract alone.
+//! the padding contract alone; `crate::fine_tune::trainer`'s own
+//! `encode_texts_bucketing_oracle` module proves the same property AND
+//! shape-bucketing itself at the real production call site
+//! (`TrainingLoop::encode_texts`'s `EncoderAdapters` branch, via that
+//! file's own `tokenize_and_bucket` helper — the sole caller of
+//! [`pad_rows_to_bucket`] outside this module's tests), since a unit test
+//! that only calls [`pad_rows_to_bucket`] directly cannot catch the call
+//! site itself going unwired.
 
 /// Re-exported from `jammi_numerics::bucket_seq_len`/`MIN_BUCKET_LEN` — see
 /// that function's own doc for the full ladder design, and this module's own
@@ -263,8 +281,8 @@ mod tests {
             .build(&[weights.as_path()], &config, &device, &varmap)
             .expect("tiny_modernbert fixture must build");
 
-        // Two rows of DIFFERENT real-token lengths (5 and 8), matching a
-        // genuine `BatchLongest` natural width of 8 — token ids kept well
+        // Two rows of DIFFERENT real-token lengths (5 and 10), matching a
+        // genuine `BatchLongest` natural width of 10 — token ids kept well
         // inside `vocab_size=256`, deterministic (family L/J: no unseeded
         // RNG).
         let row_a: Vec<u32> = vec![10, 11, 12, 13, 14];

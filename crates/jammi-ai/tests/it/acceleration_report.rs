@@ -623,6 +623,201 @@ async fn projection_head_arm_reports_no_probe_attempted_not_a_fabricated_failure
     assert_eq!(report["flash"]["holds"], serde_json::json!(false));
 }
 
+/// This test's `ComputePrecision` as the dtype class
+/// `jammi_kernels::admission::PROBED_OPS` resolves registry keys against —
+/// mirrors `crates/jammi-ai/src/fine_tune/worker.rs`'s own `dtype_class_of`.
+fn dtype_class(p: ComputePrecision) -> jammi_kernels::admission::DtypeClass {
+    match p {
+        ComputePrecision::F32 => jammi_kernels::admission::DtypeClass::F32,
+        ComputePrecision::BF16 => jammi_kernels::admission::DtypeClass::Bf16,
+        ComputePrecision::F16 => jammi_kernels::admission::DtypeClass::F16,
+    }
+}
+
+/// The report keys `jammi_kernels::admission::PROBED_OPS` says a job at this
+/// dtype class CAN produce a measurement for — the report's candidate `ops`
+/// key set, a pure function of the dtype class.
+fn candidate_report_keys(p: ComputePrecision) -> std::collections::BTreeSet<&'static str> {
+    let dtype = dtype_class(p);
+    jammi_kernels::admission::PROBED_OPS
+        .iter()
+        .filter(|op| op.kind == jammi_kernels::admission::ProbedOpKind::TwoArm)
+        .filter(|op| op.registry_keys_for(dtype).next().is_some())
+        .map(|op| op.report_key)
+        .collect()
+}
+
+fn ops_keys(report: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    report["ops"]
+        .as_object()
+        .expect("a determined report's `ops` is an object")
+        .keys()
+        .cloned()
+        .collect()
+}
+
+/// Campaign #446 finding 2 — the f16 report's missing cast epilogue, and the
+/// process-history-dependent key set behind it. THREE jobs in ONE process
+/// (f16, f16, f32) prove all four halves the finding names:
+///
+/// **(c) the table binds to the REAL registry, measured live.** `cast_scale`
+/// and `cast_add` are not asserted from the table's own say-so: an f16 job's
+/// report carries them `holds: true`, which can only happen if the
+/// before/after delta on `cast_scale_f16_f32` / `cast_add_f16` — the exact
+/// registry keys the table names for `DtypeClass::F16` — actually moved,
+/// i.e. if some workspace call site really does pass those literals to
+/// `admit()` (`crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:814`,
+/// `:911`, reached from `LowRankResidualLinear::bwd` during the probe's
+/// backward pass). Before the fix the shipped table named only
+/// `cast_add_bf16`, so an f16 job's report could not contain either key at
+/// any value.
+///
+/// **CPU-runnable vs CUDA-only arms.** This suite is CPU-only, so the F16
+/// cast-boundary keys are the ones proven live here — `low_rank_residual_
+/// linear.rs`'s own `cpu_f16_bwd_dispatches_both_new_cast_boundary_kernels`
+/// pins the same two keys at the kernel level. The **`Bf16` arms
+/// (`cast_scale_bf16_f32` / `cast_add_bf16`) cannot execute on CPU at all**:
+/// `bwd`'s bf16 branch runs `dx_base_2d = dy_base_2d.matmul(w)` in bf16, and
+/// candle's CPU matmul has no BF16 implementation (pinned by this crate's own
+/// `cpu_matmul_still_cannot_do_bf16`), so a bf16 backbone is refused before
+/// training on CPU (`validate_backbone_precision`). Those two keys are
+/// exercised only on the CUDA lane, by
+/// `crates/jammi-ai/tests/gpu_capability/capability_surface.rs`'s per-dtype
+/// two-arm assertions, which derive from the SAME table.
+///
+/// **(d) the key set is deterministic per dtype class, regardless of process
+/// history.** The two f16 jobs run back to back in one process — the second
+/// after the first has already burned the process-wide warn dedup and already
+/// populated every registry entry — and must produce IDENTICAL `ops` key
+/// sets. A key set derived from `jammi_kernels::admission::snapshot_all()`
+/// (which reflects only ops looked up at least once) could not guarantee
+/// this: the first job in a fresh process would see a strictly smaller table
+/// than the second.
+///
+/// **The K4 report-vocabulary change.** No report may carry a dtype-SUFFIXED
+/// key: `"cast_add_bf16"` was a REGISTRY key spelled into the report's
+/// dtype-neutral vocabulary, and its removal in favour of `"cast_add"` is a
+/// consumer-visible surface change asserted here explicitly, not left
+/// implicit.
+///
+/// **The f32 negative control is real, not vacuous.** An f32 backbone takes
+/// `bwd`'s `admit()`-free "nothing to fuse" branch, so `cast_scale`/`cast_add`
+/// must be ABSENT from its report — not present-and-false. An implementation
+/// that emitted every table key unconditionally (the obvious way to make (d)
+/// pass) fails here.
+// `jammi_kernels::admission`'s dispatch registries are process-wide — same
+// `#[serial]` rationale as the other tests in this file.
+#[serial(esc075_acceleration_report)]
+#[tokio::test(flavor = "multi_thread")]
+async fn probed_ops_bind_to_the_real_registry_and_key_sets_are_dtype_deterministic() {
+    let (session, _dir) = session_with_training_data().await;
+    let _worker = EmbeddedWorker::spawn(&session).expect("default worker intervals are valid");
+
+    let mut reports = Vec::new();
+    for precision in [
+        ComputePrecision::F16,
+        ComputePrecision::F16,
+        ComputePrecision::F32,
+    ] {
+        let job = session
+            .fine_tune(
+                "training",
+                &tiny_modernbert_model(),
+                &training_columns(),
+                FineTuneMethod::Lora,
+                ModelTask::TextEmbedding,
+                Some(encoder_adapters_config(precision)),
+            )
+            .await
+            .unwrap();
+        // Tolerant of either terminal outcome: the report is written before
+        // the first training step, so f16's own numeric stability on this
+        // tiny fixture is irrelevant to what is asserted here.
+        let record = wait_for_any_terminal(session.catalog(), &job.job_id).await;
+        reports.push((
+            precision,
+            expect_determined_report(record.acceleration_report.as_deref()),
+        ));
+    }
+
+    // Every realized key must be a candidate for that job's own dtype class —
+    // no fabricated key, and (the direct finding-2 guard) no dtype-suffixed
+    // registry key leaking into the report vocabulary.
+    for (precision, report) in &reports {
+        let candidates = candidate_report_keys(*precision);
+        for key in ops_keys(report) {
+            assert!(
+                candidates.contains(key.as_str()),
+                "report key {key:?} at {precision} is not a PROBED_OPS two-arm row with a \
+                 registry key for that dtype class (candidates: {candidates:?}) — the report \
+                 must never name an op it cannot attribute to a real dispatch decision. \
+                 Report: {report}"
+            );
+            for suffix in ["_bf16", "_f16", "_f32"] {
+                assert!(
+                    !key.ends_with(suffix),
+                    "report key {key:?} carries a dtype suffix — report keys are dtype-NEUTRAL \
+                     (campaign #446 finding 2's K4 vocabulary change: `cast_add_bf16` became \
+                     `cast_add`, with the registry key resolved from the backbone dtype). \
+                     Report: {report}"
+                );
+            }
+        }
+    }
+
+    let (_, f16_first) = &reports[0];
+    let (_, f16_second) = &reports[1];
+    let (_, f32_report) = &reports[2];
+
+    // (d): same dtype, same process, different position in process history →
+    // identical key sets.
+    assert_eq!(
+        ops_keys(f16_first),
+        ops_keys(f16_second),
+        "two f16 jobs in ONE process must produce IDENTICAL `ops` key sets — a key set that \
+         depends on which job ran first is a report shape derived from process history, not \
+         from the job. first={f16_first} second={f16_second}"
+    );
+
+    // (c): the F16 cast-boundary keys the pre-#446 table could not name, and
+    // the live proof they bind to real `admit()` sites.
+    for (label, report) in [("first", f16_first), ("second", f16_second)] {
+        for key in ["cast_scale", "cast_add"] {
+            assert_eq!(
+                report["ops"][key]["holds"],
+                serde_json::json!(true),
+                "the {label} f16 job's report must carry {key:?} as `holds: true` — \
+                 LowRankResidualLinear::bwd dispatches its F16 cast-boundary kernels fused on \
+                 CPU (low_rank_residual_linear.rs:814,911). Before campaign #446 the probed-op \
+                 table named only `cast_add_bf16`, so an f16 job's report was structurally \
+                 unable to contain this key at all. Report: {report}"
+            );
+        }
+        assert!(
+            !ops_keys(report).contains("cast_add_bf16"),
+            "the retired dtype-suffixed report key must be gone. Report: {report}"
+        );
+    }
+
+    // The f32 negative control: absent, never present-and-false.
+    for key in ["cast_scale", "cast_add"] {
+        assert!(
+            !ops_keys(f32_report).contains(key),
+            "an f32 backbone takes LowRankResidualLinear::bwd's admit()-free \"nothing to \
+             fuse\" branch — there is no registry key for {key:?} at f32, so the report must \
+             OMIT it rather than claim a determination. Report: {f32_report}"
+        );
+    }
+    // Non-vacuity: the f32 job did measure something, so the absence above is
+    // a real dtype-resolved absence and not an empty report.
+    assert_eq!(
+        f32_report["ops"]["layer_norm"]["holds"],
+        serde_json::json!(true),
+        "the f32 control must still report layer_norm as genuinely admitted — otherwise the \
+         cast_scale/cast_add absence above would be vacuous. Report: {f32_report}"
+    );
+}
+
 /// Phase-4 adversarial-audit finding 4 ("PENDING-FOREVER"), `ContextPredictor`
 /// half: this job kind never routes through `run_fine_tune_blocking`'s
 /// measuring probe at all (`run_spec`'s `ContextPredictor` arm calls

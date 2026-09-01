@@ -2307,18 +2307,36 @@ fn validate_backbone_precision(
 // during the forward pass (`LoraLinear::forward`, `lora_linear.rs:752-812`
 // — confirmed by reading it: a prior revision of this comment wrongly
 // claimed these needed backward, corrected during Phase-4 remediation,
-// advisory 8); and `LowRankResidualLinear`'s own backward-time epilogue
-// kernel (`cast_add_bf16`, `crates/jammi-kernels/src/ops/
-// low_rank_residual_linear.rs`'s `bwd`) dispatches ONLY during backward, so
-// a forward-only probe could never honestly claim to have measured it.
-// `rope_positions`/`axpy`/`cast_scale`/`scaled_cast_add` have NO
-// `jammi_kernels::admission::admit`/`admit_cascade` call site anywhere in
-// this workspace (verified by reading every such call site) — they are not
-// claimed here even after the backward+step extension, since there is no
-// registry key for any probe to read a delta from; an op this probe cannot
-// attribute to a real dispatch decision is OMITTED from `ops`, never
-// fabricated as a `holds` either way (K-series: ship the honest negative,
-// not a vacuous positive). The backward+optimizer step runs on the REAL
+// advisory 8); and `LowRankResidualLinear`'s own backward-time cast-boundary
+// epilogue kernels (`cast_scale`/`cast_add`, `crates/jammi-kernels/src/ops/
+// low_rank_residual_linear.rs`'s `bwd`) dispatch ONLY during backward, so
+// a forward-only probe could never honestly claim to have measured them.
+//
+// **Which ops this probe can attribute is ONE static fact**, not a list
+// re-typed here: `jammi_kernels::admission::PROBED_OPS` (campaign #446
+// finding 2). A prior revision of this comment claimed `rope_positions`,
+// `axpy`, `cast_scale` and `scaled_cast_add` all "have NO admit/admit_cascade
+// call site anywhere in this workspace". That was FALSE for two of the four
+// and is corrected here: `cast_scale` and `cast_add` DO admit, under
+// dtype-resolved registry keys (`cast_scale_bf16_f32`/`cast_scale_f16_f32`,
+// `cast_add_bf16`/`cast_add_f16` — `low_rank_residual_linear.rs:800,814,899,
+// 911`), which is why an f16 job's report was structurally unable to name its
+// own cast epilogue while a bf16 job's named only half of it. `rope_positions`
+// and `scaled_cast_add` genuinely have no admission gate: each is a bare
+// launcher call from inside an already-admitted parent's fused arm
+// (`ProbedOpKind::InternalSubkernel`), so no probe can read a delta for
+// them and they are OMITTED from `ops` — never fabricated as a `holds`
+// either way (K-series: ship the honest negative, not a vacuous positive).
+// `axpy` has no dispatch site and no parent at all.
+//
+// The report's `ops` CANDIDATE key set is therefore a pure function of the
+// job's backbone dtype class (`PROBED_OPS` filtered by
+// `ProbedOp::registry_keys_for`), never a function of what else this process
+// happened to run — which is what `jammi_kernels::admission::snapshot_all()`
+// would have given (it reflects only ops looked up at least once, so its key
+// set varies with process history; see its own doc).
+//
+// The backward+optimizer step runs on the REAL
 // production trainable weights (there is no separate throwaway model to
 // probe instead — see `run_backward_and_optimizer_probe`'s doc), so it
 // snapshots every trainable var with a genuine deep copy and restores it
@@ -2354,82 +2372,93 @@ fn validate_backbone_precision(
 // function makes.
 // =============================================================================
 
-/// The fused ops probed for the esc-075 acceleration report: `(report key,
-/// the `op` key `jammi_kernels::admission::admit`'s call site for this op
-/// uses)`. The second element is reused VERBATIM to look up this op's miss
-/// reason in `fallback_warnings_emitted()` — never re-typed independently of
-/// the kernel crate that owns it. Sourced by reading (never editing)
-/// `crates/jammi-encoders/src/layer_norm.rs:100`,
-/// `crates/jammi-encoders/src/modernbert.rs:190,204,671,1827`,
-/// `crates/jammi-lora/src/lora_linear.rs:37,205`, and
-/// `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs`'s
-/// `admit_cast_boundary("cast_add_bf16", ..)` call site.
-///
-/// `"dropout"` and `"low_rank_residual_linear"` both read `lora_linear_fused`
-/// (see this section's module doc for why they are the SAME dispatch
-/// decision, not two). `"cast_add_bf16"` is backward-only — see
-/// [`run_backward_and_optimizer_probe`]'s doc — and reports `holds: false`
-/// (omitted, actually: see [`two_arm_holds`]) on an `F32` backbone, where the
-/// kernel's own `bwd` takes a structurally different, `admit()`-free "nothing
-/// to fuse" branch (never a domain miss).
-const PROBED_ACCELERATION_OPS: &[(&str, &str)] = &[
-    ("layer_norm", "layer_norm_fused"),
-    ("rope", "rope_fused"),
-    ("softmax", "softmax_last_dim_fused"),
-    ("geglu", "geglu_fused"),
-    ("attention_block", "attention_block_fused"),
-    ("dropout", "lora_linear_fused"),
-    ("low_rank_residual_linear", "lora_linear_fused"),
-    ("cast_add_bf16", "cast_add_bf16"),
-];
+/// This job's backbone dtype as the [`jammi_kernels::admission::DtypeClass`]
+/// the probed-op table resolves registry keys against — the ONE place a
+/// `ComputePrecision` becomes a dtype class for report purposes.
+fn dtype_class_of(
+    precision: jammi_numerics::ComputePrecision,
+) -> jammi_kernels::admission::DtypeClass {
+    match precision {
+        jammi_numerics::ComputePrecision::F32 => jammi_kernels::admission::DtypeClass::F32,
+        jammi_numerics::ComputePrecision::BF16 => jammi_kernels::admission::DtypeClass::Bf16,
+        jammi_numerics::ComputePrecision::F16 => jammi_kernels::admission::DtypeClass::F16,
+    }
+}
 
-/// A snapshot of every dispatch registry [`PROBED_ACCELERATION_OPS`] plus the
-/// `attention_block_flash` cascade read, taken once immediately before and
-/// once immediately after the probe forward pass so a per-job report reads a
-/// DELTA (attributable to this job's own probe call) rather than the
+/// The report keys this job's dtype class can produce a measurement for, in
+/// [`jammi_kernels::admission::PROBED_OPS`] order — the report's CANDIDATE
+/// `ops` key set.
+///
+/// A pure function of `dtype` alone: it never consults
+/// `jammi_kernels::admission::snapshot_all()` (whose key set reflects only
+/// ops looked up at least once in THIS process, so an identical job would get
+/// a different report shape depending on what ran before it — campaign #446
+/// finding 2). Only [`jammi_kernels::admission::ProbedOpKind::TwoArm`] rows
+/// appear: a cascade has no `fallback_warnings`-shaped reason channel (the
+/// flash cascade gets the report's own dedicated top-level `flash` field
+/// instead), and an `InternalSubkernel` row has no registry key for any probe
+/// to read a delta from at all.
+///
+/// A candidate key is REALIZED into `ops` only if the probe actually moved
+/// its counter one way and not the other ([`two_arm_holds`]) — an op the
+/// probe never reached is omitted, never claimed as a miss.
+fn probed_report_keys(
+    dtype: jammi_kernels::admission::DtypeClass,
+) -> Vec<(&'static str, &'static str)> {
+    jammi_kernels::admission::PROBED_OPS
+        .iter()
+        .filter(|op| op.kind == jammi_kernels::admission::ProbedOpKind::TwoArm)
+        .filter_map(|op| {
+            op.registry_keys_for(dtype)
+                .next()
+                .map(|key| (op.report_key, key))
+        })
+        .collect()
+}
+
+/// A snapshot of every two-arm dispatch registry
+/// [`jammi_kernels::admission::PROBED_OPS`] names for this job's dtype class,
+/// plus the `attention_block_flash` cascade — taken once immediately before
+/// and once immediately after the probe so a per-job report reads a DELTA
+/// (attributable to this job's own probe call) rather than the
 /// process-lifetime total (which every OTHER job sharing this process also
 /// contributes to).
-#[derive(Clone, Copy)]
+///
+/// Keyed by REGISTRY key, not by report key: `"dropout"` and
+/// `"low_rank_residual_linear"` are the same `lora_linear_fused` dispatch
+/// decision, so storing one entry per registry key is what makes that a
+/// structural fact rather than a match arm that has to remember it. Storing
+/// one struct FIELD per op (the pre-#446 shape) is what let the table and the
+/// snapshot drift apart in the first place.
 struct AdmissionProbeSnapshot {
-    layer_norm: jammi_kernels::admission::DispatchSnapshot,
-    rope: jammi_kernels::admission::DispatchSnapshot,
-    softmax: jammi_kernels::admission::DispatchSnapshot,
-    geglu: jammi_kernels::admission::DispatchSnapshot,
-    attention_block: jammi_kernels::admission::DispatchSnapshot,
-    lora_linear_fused: jammi_kernels::admission::DispatchSnapshot,
-    cast_add_bf16: jammi_kernels::admission::DispatchSnapshot,
+    two_arm: std::collections::BTreeMap<&'static str, jammi_kernels::admission::DispatchSnapshot>,
     attention_block_flash: jammi_kernels::admission::CascadeDispatchSnapshot,
 }
 
 impl AdmissionProbeSnapshot {
-    fn capture() -> Self {
+    /// Snapshots every registry key the table names for `dtype`, straight
+    /// through `counters_for(key)` — the SAME `&'static DispatchCounters` the
+    /// kernels' own `admit()` sites accumulate into (the
+    /// `jammi_encoders::ln_dispatch_snapshot()`-style accessors this used to
+    /// call are themselves `counters_for("layer_norm_fused")` under the hood,
+    /// `crates/jammi-encoders/src/layer_norm.rs:103`).
+    fn capture(dtype: jammi_kernels::admission::DtypeClass) -> Self {
+        let two_arm = probed_report_keys(dtype)
+            .into_iter()
+            .map(|(_, key)| (key, jammi_kernels::admission::counters_for(key).snapshot()))
+            .collect();
         Self {
-            layer_norm: jammi_encoders::ln_dispatch_snapshot(),
-            rope: jammi_encoders::rope_dispatch_snapshot(),
-            softmax: jammi_encoders::softmax_dispatch_snapshot(),
-            geglu: jammi_encoders::geglu_dispatch_snapshot(),
-            attention_block: jammi_encoders::attention_block_dispatch_snapshot(),
-            lora_linear_fused: jammi_lora::lora_linear_fused_dispatch_snapshot(),
-            cast_add_bf16: jammi_kernels::admission::counters_for("cast_add_bf16").snapshot(),
+            two_arm,
             attention_block_flash: jammi_encoders::attention_block_flash_dispatch_snapshot(),
         }
     }
 
-    /// The [`jammi_kernels::admission::DispatchSnapshot`] for one of
-    /// [`PROBED_ACCELERATION_OPS`]'s report keys, or `None` for an unknown key
-    /// (never reached — the caller always iterates `PROBED_ACCELERATION_OPS`
-    /// itself).
-    fn two_arm(&self, report_key: &str) -> Option<jammi_kernels::admission::DispatchSnapshot> {
-        match report_key {
-            "layer_norm" => Some(self.layer_norm),
-            "rope" => Some(self.rope),
-            "softmax" => Some(self.softmax),
-            "geglu" => Some(self.geglu),
-            "attention_block" => Some(self.attention_block),
-            "dropout" | "low_rank_residual_linear" => Some(self.lora_linear_fused),
-            "cast_add_bf16" => Some(self.cast_add_bf16),
-            _ => None,
-        }
+    /// The [`jammi_kernels::admission::DispatchSnapshot`] for a REGISTRY key
+    /// this snapshot captured, or `None` for a key outside the captured dtype
+    /// class (never reached — the caller iterates [`probed_report_keys`] with
+    /// the SAME `dtype` this was captured with).
+    fn two_arm(&self, registry_key: &str) -> Option<jammi_kernels::admission::DispatchSnapshot> {
+        self.two_arm.get(registry_key).copied()
     }
 }
 
@@ -2638,6 +2667,7 @@ fn run_backward_and_optimizer_probe(varmap: &candle_nn::VarMap, output: &candle_
 /// probe that was never even tried (Phase-4 adversarial-audit finding 3).
 fn probe_acceleration(
     device: &candle_core::Device,
+    backbone_dtype: jammi_numerics::ComputePrecision,
     varmap: Option<&candle_nn::VarMap>,
     encoder: Option<&mut jammi_encoders::AnyEncoder>,
 ) -> (
@@ -2650,6 +2680,7 @@ fn probe_acceleration(
             flash_report_no_probe_attempted(device),
         );
     };
+    let dtype = dtype_class_of(backbone_dtype);
 
     // Every fused-kernel admission predicate this probe reads is gated on
     // TRAINING mode (`LayerNorm::forward`'s `(bias.is_none(), training)`
@@ -2663,7 +2694,7 @@ fn probe_acceleration(
     // changes nothing about the run this attempt actually trains.
     encoder.set_training(true);
 
-    let before = AdmissionProbeSnapshot::capture();
+    let before = AdmissionProbeSnapshot::capture(dtype);
     // A tiny, arch-agnostic probe batch: token id `0` is valid for any
     // non-empty vocabulary, so this never depends on the job's actual
     // tokenizer/vocab size. A probe FAILURE (a malformed batch, an unforeseen
@@ -2679,12 +2710,13 @@ fn probe_acceleration(
         Some(())
     })()
     .is_some();
-    let after = AdmissionProbeSnapshot::capture();
+    let after = AdmissionProbeSnapshot::capture(dtype);
 
     let mut ops = serde_json::Map::new();
     if probe_ok {
-        for &(report_key, registry_key) in PROBED_ACCELERATION_OPS {
-            let (Some(b), Some(a)) = (before.two_arm(report_key), after.two_arm(report_key)) else {
+        for (report_key, registry_key) in probed_report_keys(dtype) {
+            let (Some(b), Some(a)) = (before.two_arm(registry_key), after.two_arm(registry_key))
+            else {
                 continue;
             };
             if let Some(holds) = two_arm_holds(b, a) {
@@ -2722,7 +2754,7 @@ fn build_acceleration_report_json(
     varmap: Option<&candle_nn::VarMap>,
     encoder: Option<&mut jammi_encoders::AnyEncoder>,
 ) -> String {
-    let (ops, flash) = probe_acceleration(device, varmap, encoder);
+    let (ops, flash) = probe_acceleration(device, backbone_dtype, varmap, encoder);
     serde_json::json!({
         "state": "determined",
         "attempt": attempt,

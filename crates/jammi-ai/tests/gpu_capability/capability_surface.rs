@@ -54,16 +54,24 @@
 //! real `loss.backward()` plus one [`jammi_ai::fine_tune::adamw::AdamW`] step
 //! over the trainable LoRA vars, so any backward/optimizer-time
 //! admission-gated dispatch genuinely fires and its registry delta is
-//! readable. Reading (never editing — off-limits per this wave's contract)
-//! every `jammi_kernels::admission::{admit, admit_cascade}` call site in the
-//! workspace turned up NO registered dispatch-registry key anywhere for
-//! `rope_positions`, `axpy`, `cast_scale`, or `scaled_cast_add` — see
-//! [`KNOWN_NO_DISPATCH_SITE_OPS`]'s doc: these four manifest entries have no
-//! admit()-gated arm to observe even after the backward+step extension, and
-//! are logged as such (never claimed hard-error-if-Miss) rather than folded
-//! into the generic "no dedicated mapping" bucket that DOES still lean on the
-//! completed-run argument for ops this file simply hasn't wired a snapshot
-//! reader for yet.
+//! readable.
+//!
+//! ## The probed-op table is ONE static fact (campaign #446 finding 2)
+//!
+//! Every "op → dispatch-registry key" fact below is DERIVED from
+//! `jammi_kernels::admission::PROBED_OPS`, shared with
+//! `crates/jammi-ai/src/fine_tune/worker.rs`'s esc-075 acceleration report.
+//! An earlier revision of this file hand-encoded its own copy and stated, as
+//! settled fact, that `rope_positions`, `axpy`, `cast_scale` and
+//! `scaled_cast_add` all had no `admit`/`admit_cascade` call site anywhere.
+//! That was WRONG for `cast_scale` (and its sibling `cast_add`), which admit
+//! under DTYPE-RESOLVED registry keys — `cast_scale_bf16_f32` /
+//! `cast_scale_f16_f32`, `cast_add_bf16` / `cast_add_f16` — not under a bare
+//! report-key literal. `rope_positions`/`scaled_cast_add` genuinely have no
+//! admission gate but are provable through their PARENT's fused dispatch
+//! (`ProbedOpKind::InternalSubkernel`), and `axpy` alone is left with neither
+//! a gate nor a parent. See [`known_no_dispatch_site_ops`] and
+//! [`internal_subkernel_ops`].
 //!
 //! ## Why a synthetic, directly-built ModernBERT (not `session.fine_tune`)
 //!
@@ -128,48 +136,82 @@ const MANIFEST_PATH: &str = concat!(
     "/../../ci/release-feature-manifest.json"
 );
 
-/// Manifest-declared op → the process-wide TWO-ARM dispatch-registry `op` key
-/// the kernel's own `jammi_kernels::admission::admit` call site registers
-/// under — reused VERBATIM (never re-derived) from reading
-/// `crates/jammi-encoders/src/layer_norm.rs:103`,
-/// `crates/jammi-encoders/src/modernbert.rs:1838`, and
-/// `crates/jammi-lora/src/lora_linear.rs:37,66,205`.
-///
-/// `"dropout"` and `"low_rank_residual_linear"` BOTH map to `lora_linear_fused`
-/// — `lora_linear.rs:37`'s own doc states its `lora_dropout` counter is
-/// "Permanently `{fused: 0, eager: 0}` today": dropout is now reserved via
-/// `DropoutMasks::next_key` and consumed DIRECTLY inside
-/// `LowRankResidualLinear`'s own fused-or-eager arm, folded into the SAME
-/// `lora_linear_fused` dispatch decision this file already reads for
-/// `"low_rank_residual_linear"` — there is no longer a SEPARATE admission
-/// signal for dropout to read; asserting `lora_linear_fused` Holds proves
-/// both (`lora_linear.rs:752-812`'s `forward` — confirmed by reading it
-/// carefully during Phase-4 audit remediation, closing advisory 8: the
-/// fused/eager decision fires during the plain forward pass this probe
-/// already runs, before the backward+step extension below).
-///
-/// `"attention_block"` is deliberately ABSENT from this list — its own
-/// admission can be PREEMPTED by the flash cascade (see this file's module
-/// doc's "TIER PREEMPTION" section) and is handled separately, per-dtype, in
-/// [`capability_surface`] itself.
-///
-/// `"softmax"` and `"rope"` are deliberately ABSENT from this list — see
-/// [`STRICT_UNREACHABLE_OPS`]'s doc for why asserting either `Holds` in a
-/// Strict-mode run through ModernBERT's attention path is not merely
-/// untested but STRUCTURALLY IMPOSSIBLE.
-///
-/// `"rope_positions"`/`"axpy"`/`"cast_scale"`/`"scaled_cast_add"` are
-/// deliberately ABSENT — see [`KNOWN_NO_DISPATCH_SITE_OPS`]'s doc.
-const TWO_ARM_OPS: &[(&str, &str)] = &[
-    ("layer_norm", "layer_norm_fused"),
-    ("geglu", "geglu_fused"),
-    ("dropout", "lora_linear_fused"),
-    ("low_rank_residual_linear", "lora_linear_fused"),
-];
+/// This test's ONE source of probed-op facts:
+/// [`jammi_kernels::admission::PROBED_OPS`] (campaign #446 finding 2). Before
+/// it, this file hand-encoded its own copy of "op → registry key", the worker
+/// hand-encoded a second and third (its snapshot struct's fields and its
+/// `two_arm` match), and the two drifted — the f16 cast-epilogue keys were in
+/// none of them. Nothing below re-types a registry key.
+use jammi_kernels::admission::{DtypeClass, ProbedOpKind, PROBED_OPS};
 
-/// Manifest-declared op → the process-wide CASCADE dispatch-registry `op`
-/// key (`jammi_kernels::admission::cascade_counters_for`) —
-/// `crates/jammi-encoders/src/modernbert.rs:1253` et al.
+/// The manifest capability list every [`ProbedOpKind::TwoArm`] /
+/// [`ProbedOpKind::Cascade`] row belongs to.
+const MANIFEST_FUSED_OP_ADMISSION: &str = "fused_op_admission";
+
+/// The manifest capability list every [`ProbedOpKind::InternalSubkernel`] row
+/// belongs to — the category the campaign lead's manifest reclassification
+/// introduces for kernels that are launched unconditionally from inside an
+/// already-admitted parent's fused arm and therefore have NO admission gate
+/// of their own to assert `Holds` against.
+const MANIFEST_INTERNAL_SUBKERNELS: &str = "internal_subkernels";
+
+/// The manifest capability list for kernels this build COMPILES but that
+/// dispatch through no admission gate and have no probed parent either —
+/// after the reclassification, `axpy` alone (pending its own W2 disposition).
+const MANIFEST_FUSED_KERNELS_COMPILED: &str = "fused_kernels_compiled";
+
+/// This test's `ComputePrecision` as the dtype class [`PROBED_OPS`] resolves
+/// registry keys against — mirrors `crates/jammi-ai/src/fine_tune/worker.rs`'s
+/// own `dtype_class_of`.
+fn dtype_class(p: ComputePrecision) -> DtypeClass {
+    match p {
+        ComputePrecision::F32 => DtypeClass::F32,
+        ComputePrecision::BF16 => DtypeClass::Bf16,
+        ComputePrecision::F16 => DtypeClass::F16,
+    }
+}
+
+/// `(manifest-declared op, TWO-ARM dispatch-registry key)` for `dtype`,
+/// DERIVED from [`PROBED_OPS`] — never re-typed here.
+///
+/// Two report keys are filtered out, each for a reason this file proves
+/// elsewhere rather than by omission:
+///
+/// - `"attention_block"` — its own admission can be PREEMPTED by the flash
+///   cascade (see this file's module doc's "TIER PREEMPTION" section), so it
+///   is asserted separately, per-dtype, in [`capability_surface`] itself with
+///   the preemption-aware PAIR of assertions.
+/// - `"softmax"`/`"rope"` ([`STRICT_UNREACHABLE_OPS`]) — asserting either
+///   `Holds` in a Strict-mode run through ModernBERT's attention path is not
+///   merely untested but STRUCTURALLY IMPOSSIBLE; see that const's doc.
+///
+/// `"dropout"` and `"low_rank_residual_linear"` both resolve to
+/// `lora_linear_fused` — that is a fact of the table now, not of this file
+/// (`crates/jammi-lora/src/lora_linear.rs:37`'s own doc: the separate
+/// `lora_dropout` counter is "Permanently `{fused: 0, eager: 0}` today";
+/// dropout is consumed directly inside `LowRankResidualLinear`'s own
+/// fused-or-eager arm, folded into the SAME dispatch decision).
+///
+/// `"cast_scale"`/`"cast_add"` appear ONLY for `bf16`/`f16`: on an `f32`
+/// backbone `LowRankResidualLinear::bwd` takes a structurally different,
+/// `admit()`-free "nothing to fuse" branch, so there is no key to assert and
+/// the op is absent rather than claimed a miss.
+fn two_arm_ops_for(dtype: DtypeClass) -> Vec<(&'static str, &'static str)> {
+    PROBED_OPS
+        .iter()
+        .filter(|op| op.kind == ProbedOpKind::TwoArm)
+        .filter(|op| op.report_key != "attention_block")
+        .filter(|op| !STRICT_UNREACHABLE_OPS.contains(&op.report_key))
+        .filter_map(|op| {
+            op.registry_keys_for(dtype)
+                .next()
+                .map(|key| (op.report_key, key))
+        })
+        .collect()
+}
+
+/// `(manifest-declared op, CASCADE dispatch-registry key)`, DERIVED from
+/// [`PROBED_OPS`]'s [`ProbedOpKind::Cascade`] rows.
 ///
 /// Logged informationally rather than asserted `Holds`: `admit_cascade` has
 /// no `fallback_warnings`-shaped reason channel, `mem_efficient_attention`
@@ -179,7 +221,35 @@ const TWO_ARM_OPS: &[(&str, &str)] = &[
 /// number one, `mem_efficient_attention` is ALSO consulted only after the
 /// flash cascade declines (`forward_training_attention`'s own ordering), so
 /// it can be preempted by flash exactly like `attention_block_fused` can.
-const CASCADE_OPS: &[(&str, &str)] = &[("mem_efficient_attention", "mem_efficient_attention")];
+fn cascade_ops() -> Vec<(&'static str, &'static str)> {
+    PROBED_OPS
+        .iter()
+        .filter(|op| op.kind == ProbedOpKind::Cascade)
+        .filter_map(|op| {
+            op.registry_keys_for(DtypeClass::Any)
+                .next()
+                .map(|key| (op.report_key, key))
+        })
+        .collect()
+}
+
+/// `(op, the parent whose fused dispatch proves it ran)`, DERIVED from
+/// [`PROBED_OPS`]'s [`ProbedOpKind::InternalSubkernel`] rows — the manifest's
+/// new `internal_subkernels` category.
+fn internal_subkernel_ops() -> Vec<(&'static str, &'static str)> {
+    PROBED_OPS
+        .iter()
+        .filter_map(|op| match op.kind {
+            ProbedOpKind::InternalSubkernel { parent } => Some((op.report_key, parent)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every [`PROBED_OPS`] report key, regardless of kind.
+fn all_probed_report_keys() -> HashSet<&'static str> {
+    PROBED_OPS.iter().map(|op| op.report_key).collect()
+}
 
 /// Manifest-declared ops that are structurally UNREACHABLE in a
 /// `JAMMI_KERNELS_STRICT=1` run through ModernBERT's attention path, proven
@@ -205,28 +275,47 @@ const CASCADE_OPS: &[(&str, &str)] = &[("mem_efficient_attention", "mem_efficien
 /// dropped either (a human reading `--nocapture` output sees exactly why).
 const STRICT_UNREACHABLE_OPS: &[&str] = &["softmax", "rope"];
 
-/// Manifest-declared ops with NO registered `jammi_kernels::admission::admit`
-/// or `admit_cascade` call site ANYWHERE in this workspace today — verified
-/// by reading (never editing) every `counters_for("...")` /
-/// `cascade_counters_for("...")` call site in `crates/jammi-kernels`,
-/// `crates/jammi-encoders`, `crates/jammi-lora`, and `crates/jammi-ai`
-/// (Phase-4 audit remediation, finding 2). Even with this file's
-/// backward+optimizer-step extension, these four never dispatch through
-/// `admit`: `low_rank_residual_linear`'s own backward-time epilogue kernel
-/// (`crates/jammi-kernels/src/ops/low_rank_residual_linear.rs`'s `bwd`,
-/// `admit_cast_boundary("cast_add_bf16", ..)`) is real and IS reached by the
-/// backward+step extension, but it registers under `"cast_add_bf16"` — a
-/// DIFFERENT op name than any of these four, and not itself a manifest
-/// entry. No call site anywhere passes `"rope_positions"`, `"axpy"`,
-/// `"cast_scale"`, or `"scaled_cast_add"` to either admission function, so
-/// there is no registry key for this file (or any probe, forward or
-/// backward) to read a delta from. This is reported to the campaign lead for
-/// a manifest edit (exclude these four from `fused_op_admission`, or replace
-/// them with the real op names these kernels dispatch under) rather than
-/// silently claimed covered by the completed-run argument, which is FALSE
-/// for an op that never dispatches through `admit` at all.
-const KNOWN_NO_DISPATCH_SITE_OPS: &[&str] =
-    &["rope_positions", "axpy", "cast_scale", "scaled_cast_add"];
+/// Manifest-declared ops that [`PROBED_OPS`] names in NO capacity at all:
+/// no `admit`/`admit_cascade` registry key AND no probed parent whose fused
+/// dispatch would imply they ran. Derived from the manifest's
+/// `fused_kernels_compiled` list minus every [`PROBED_OPS`] report key —
+/// never re-typed.
+///
+/// **The prior revision of this doc was WRONG and is corrected here**
+/// (campaign #446 finding 2). It claimed `"rope_positions"`, `"axpy"`,
+/// `"cast_scale"` and `"scaled_cast_add"` ALL had "NO registered
+/// `admit`/`admit_cascade` call site ANYWHERE in this workspace". Two of the
+/// four do:
+///
+/// - `cast_scale` DOES admit, under dtype-resolved keys
+///   `cast_scale_bf16_f32` / `cast_scale_f16_f32`
+///   (`crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:800`,
+///   `:814`); `cast_add` likewise under `cast_add_bf16` / `cast_add_f16`
+///   (`:899`, `:911`). The old claim held only because the old text looked
+///   for a bare `"cast_scale"` literal, which is a REPORT key, not a registry
+///   key — the exact confusion that left the f16 acceleration report unable
+///   to name its own cast epilogue.
+/// - `rope_positions` (`crates/jammi-kernels/src/ops/flash_attention.rs:645`)
+///   and `scaled_cast_add`
+///   (`crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:693`,
+///   `crates/jammi-kernels/src/cuda/low_rank_residual_linear.rs:131`) really
+///   do have no admission gate — but they are not unobservable either: each
+///   is a bare launcher call from inside an already-admitted PARENT's fused
+///   arm, so the parent dispatching fused proves the subkernel ran. They are
+///   [`ProbedOpKind::InternalSubkernel`] rows, reported through
+///   [`internal_subkernel_ops`].
+///
+/// What is left in this bucket is `axpy` alone: compiled, but with no
+/// dispatch decision and no parent to prove it through. It is logged, never
+/// claimed covered by the completed-run argument (which is FALSE for an op
+/// that never dispatches through `admit` at all).
+fn known_no_dispatch_site_ops(manifest: &serde_json::Value) -> Vec<String> {
+    let probed = all_probed_report_keys();
+    manifest_string_list(manifest, MANIFEST_FUSED_KERNELS_COMPILED)
+        .into_iter()
+        .filter(|op| !probed.contains(op.as_str()))
+        .collect()
+}
 
 /// The purpose-built tiny ModernBERT shape this test proves admission
 /// against: `hidden_size / num_attention_heads == 64` —
@@ -455,7 +544,7 @@ async fn capability_surface() {
     );
 
     let manifest = load_manifest();
-    let declared_ops = manifest_string_list(&manifest, "fused_op_admission");
+    let declared_ops = manifest_string_list(&manifest, MANIFEST_FUSED_OP_ADMISSION);
     assert!(
         !declared_ops.is_empty(),
         "ci/release-feature-manifest.json's {MANIFEST_LANE:?} lane must declare a non-empty \
@@ -483,13 +572,14 @@ async fn capability_surface() {
     let weights_path = dir.path().join("model.safetensors");
     write_synthetic_checkpoint(&config, &weights_path);
 
-    let mapped: HashSet<&str> = TWO_ARM_OPS
-        .iter()
-        .map(|&(op, _)| op)
-        .chain(CASCADE_OPS.iter().map(|&(op, _)| op))
-        .chain(STRICT_UNREACHABLE_OPS.iter().copied())
-        .chain(KNOWN_NO_DISPATCH_SITE_OPS.iter().copied())
-        .chain(std::iter::once("attention_block"))
+    let no_dispatch_site_ops = known_no_dispatch_site_ops(&manifest);
+    let subkernel_ops = internal_subkernel_ops();
+    let cascade_op_list = cascade_ops();
+    let mapped: HashSet<String> = all_probed_report_keys()
+        .into_iter()
+        .map(str::to_string)
+        .chain(STRICT_UNREACHABLE_OPS.iter().map(|s| (*s).to_string()))
+        .chain(no_dispatch_site_ops.iter().cloned())
         .collect();
 
     for dtype in [
@@ -498,16 +588,22 @@ async fn capability_surface() {
         ComputePrecision::F16,
     ] {
         let candle_dtype = compute_precision_to_candle_dtype(dtype);
+        // The two-arm rows this dtype class actually has a registry key for —
+        // `cast_scale`/`cast_add` appear for bf16/f16 and are absent for f32
+        // (the `admit()`-free "nothing to fuse" branch), which is exactly the
+        // dtype-resolved fact the pre-#446 hand-encoded table could not
+        // express.
+        let two_arm_ops = two_arm_ops_for(dtype_class(dtype));
         // TIER PREEMPTION (Phase-4 audit finding 1): whether THIS dtype is
         // one the flash cascade is expected to preempt attention_block /
         // mem_efficient_attention for, on THIS build.
         let flash_should_preempt = flash_dtypes.iter().any(|d| d == &dtype.to_string());
 
-        let two_arm_before: Vec<(&str, DispatchSnapshot)> = TWO_ARM_OPS
+        let two_arm_before: Vec<(&str, DispatchSnapshot)> = two_arm_ops
             .iter()
             .map(|&(_, key)| (key, jammi_kernels::admission::counters_for(key).snapshot()))
             .collect();
-        let cascade_before: Vec<(&str, CascadeDispatchSnapshot)> = CASCADE_OPS
+        let cascade_before: Vec<(&str, CascadeDispatchSnapshot)> = cascade_op_list
             .iter()
             .map(|&(_, key)| {
                 (
@@ -523,7 +619,7 @@ async fn capability_surface() {
 
         probe_dtype(&config, &weights_path, candle_dtype, &device);
 
-        for &(report_op, registry_key) in TWO_ARM_OPS {
+        for &(report_op, registry_key) in &two_arm_ops {
             if !declared_ops.iter().any(|d| d == report_op) {
                 continue;
             }
@@ -596,7 +692,7 @@ async fn capability_surface() {
             }
         }
 
-        for &(report_op, registry_key) in CASCADE_OPS {
+        for &(report_op, registry_key) in &cascade_op_list {
             if !declared_ops.iter().any(|d| d == report_op) {
                 continue;
             }
@@ -613,7 +709,7 @@ async fn capability_surface() {
                 ?before,
                 ?after,
                 "capability_surface: cascade op observed (informational only — see this \
-                 file's CASCADE_OPS doc for why it is not asserted Holds, including its own \
+                 file's `cascade_ops` doc for why it is not asserted Holds, including its own \
                  flash-preemption exposure)"
             );
         }
@@ -631,18 +727,38 @@ async fn capability_surface() {
             );
         }
 
-        for &op in KNOWN_NO_DISPATCH_SITE_OPS {
-            if !declared_ops.iter().any(|d| d == op) {
-                continue;
-            }
+        // `internal_subkernels`: no admission gate of their own, but PROVEN
+        // by the parent's fused dispatch — which the assertions above already
+        // established for `low_rank_residual_linear` (and, for
+        // `attention_block_flash`, the preemption arm). Logged with the
+        // parent named, so a human reading `--nocapture` sees the actual
+        // evidence chain rather than a bare "unverified".
+        for &(op, parent) in &subkernel_ops {
+            tracing::info!(
+                op,
+                parent,
+                dtype = %dtype,
+                "capability_surface: internal subkernel — launched unconditionally from inside \
+                 its parent's already-admitted fused arm (a bare launcher call, not a tracked \
+                 Tensor op), so it has NO registry key of its own; its execution is implied by \
+                 the parent dispatching fused, never claimed as an independent admission"
+            );
+        }
+
+        // Whatever the manifest's `fused_kernels_compiled` still lists that
+        // PROBED_OPS names in no capacity at all (post-reclassification:
+        // `axpy`). Not filtered by `declared_ops` — these live in a DIFFERENT
+        // manifest list than `fused_op_admission`, and filtering them by it
+        // would silently log nothing at all.
+        for op in &no_dispatch_site_ops {
             tracing::info!(
                 op,
                 dtype = %dtype,
-                "capability_surface: NO admission-gated dispatch site exists anywhere in this \
-                 workspace for this manifest-declared op (verified by reading every admit()/ \
-                 admit_cascade() call site) — never dispatches through ANY probe, forward or \
-                 backward; flagged for a manifest edit (exclude, or repoint at the real \
-                 dispatch-registry key), not claimed covered by the completed-run argument"
+                "capability_surface: NO admission-gated dispatch site AND no probed parent \
+                 exists anywhere in this workspace for this manifest-declared compiled kernel \
+                 — it never dispatches through ANY probe, forward or backward, and nothing \
+                 else's dispatch implies it ran; logged, never claimed covered by the \
+                 completed-run argument"
             );
         }
 
@@ -659,4 +775,100 @@ async fn capability_surface() {
             }
         }
     }
+}
+
+/// Set-EQUALITY between `ci/release-feature-manifest.json`'s capability
+/// categories and [`PROBED_OPS`] grouped by [`ProbedOpKind`] — the structural
+/// guard that stops the manifest and the probed-op table from drifting apart
+/// again (campaign #446 finding 2's root cause was five unsynced copies of
+/// this same fact; the manifest was a sixth).
+///
+/// Deliberately NOT gated on a GPU (`skip_without_gpu!` is absent): this is a
+/// pure data cross-check between a JSON file and a `const`, and gating it on
+/// hardware would make the one assertion that catches manifest drift run only
+/// on the pod. It still needs the `live-gpu-tests` feature to compile into
+/// this suite at all, so `cargo test -p jammi-ai --features live-gpu-tests
+/// --test gpu_capability` runs it anywhere.
+///
+/// **Expected RED until the campaign lead's manifest reclassification
+/// lands.** That edit (`ci/release-feature-manifest.json` is the docs-ci
+/// owner's file, not this crate's) must:
+/// - add `cast_scale` and `cast_add` to `fused_op_admission` — both DO admit,
+///   under dtype-resolved registry keys (`low_rank_residual_linear.rs:800,
+///   814,899,911`);
+/// - introduce `internal_subkernels = ["rope_positions", "scaled_cast_add"]`
+///   — no admission gate, proven via the parent's dispatch;
+/// - leave `fused_kernels_compiled = ["axpy"]` alone (pending its own W2
+///   disposition).
+///
+/// A RED here names exactly which side is missing which key; it is never a
+/// reason to weaken the assertion to a subset check, because a subset check
+/// is precisely what let the f16 keys go missing.
+#[test]
+fn manifest_capability_categories_match_probed_ops_by_kind() {
+    let manifest = load_manifest();
+
+    let mut expected_admission: Vec<&str> = PROBED_OPS
+        .iter()
+        .filter(|op| matches!(op.kind, ProbedOpKind::TwoArm | ProbedOpKind::Cascade))
+        .map(|op| op.report_key)
+        .collect();
+    expected_admission.sort_unstable();
+    let mut declared_admission = manifest_string_list(&manifest, MANIFEST_FUSED_OP_ADMISSION);
+    declared_admission.sort();
+    assert_eq!(
+        declared_admission,
+        expected_admission
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect::<Vec<String>>(),
+        "manifest lane {MANIFEST_LANE:?}'s {MANIFEST_FUSED_OP_ADMISSION} must name EXACTLY the \
+         PROBED_OPS rows that dispatch through admit()/admit_cascade(). A key only the manifest \
+         names is a capability nothing can prove; a key only PROBED_OPS names is a real \
+         admission decision the release manifest does not claim (which is how the f16 \
+         cast-epilogue keys went missing). See this test's doc for the pending manifest edit."
+    );
+
+    let mut expected_subkernels: Vec<&str> = internal_subkernel_ops()
+        .into_iter()
+        .map(|(op, _)| op)
+        .collect();
+    expected_subkernels.sort_unstable();
+    let mut declared_subkernels = manifest_string_list(&manifest, MANIFEST_INTERNAL_SUBKERNELS);
+    declared_subkernels.sort();
+    assert_eq!(
+        declared_subkernels,
+        expected_subkernels
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect::<Vec<String>>(),
+        "manifest lane {MANIFEST_LANE:?}'s {MANIFEST_INTERNAL_SUBKERNELS} must name EXACTLY the \
+         PROBED_OPS rows with no admission gate of their own, each proven via its parent's \
+         fused dispatch"
+    );
+
+    // The compiled-but-unprovable bucket must be DISJOINT from everything
+    // PROBED_OPS names: an op that is both "probed" and "no dispatch site" is
+    // a contradiction, and the pre-#446 manifest had exactly that shape
+    // (`cast_scale`/`scaled_cast_add`/`rope_positions` sat in
+    // `fused_kernels_compiled` while two of the three were provable).
+    let probed = all_probed_report_keys();
+    let compiled_only = manifest_string_list(&manifest, MANIFEST_FUSED_KERNELS_COMPILED);
+    let overlap: Vec<&String> = compiled_only
+        .iter()
+        .filter(|op| probed.contains(op.as_str()))
+        .collect();
+    assert!(
+        overlap.is_empty(),
+        "manifest lane {MANIFEST_LANE:?}'s {MANIFEST_FUSED_KERNELS_COMPILED} must not name any \
+         op PROBED_OPS can attribute — {overlap:?} are provable (as an admit() site or via a \
+         parent's dispatch) and belong in {MANIFEST_FUSED_OP_ADMISSION} / \
+         {MANIFEST_INTERNAL_SUBKERNELS} instead"
+    );
+    assert!(
+        !compiled_only.is_empty(),
+        "a {MANIFEST_FUSED_KERNELS_COMPILED} that is EMPTY would make the disjointness \
+         assertion above vacuous — it must still name the compiled kernels with neither a \
+         dispatch gate nor a probed parent (today: axpy)"
+    );
 }

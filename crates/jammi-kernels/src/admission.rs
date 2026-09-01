@@ -1272,6 +1272,268 @@ pub fn snapshot_all() -> std::collections::BTreeMap<&'static str, DispatchSnapsh
         .collect()
 }
 
+// =============================================================================
+// The probed-op table (campaign #446 finding 2)
+// =============================================================================
+//
+// ONE static fact about which ops a per-job acceleration report / capability
+// probe can attribute to a real dispatch decision, and under which registry
+// key. Before this table the same facts were hand-encoded in five unsynced
+// places (`crates/jammi-ai/src/fine_tune/worker.rs`'s
+// `PROBED_ACCELERATION_OPS` + its `AdmissionProbeSnapshot` struct fields +
+// its `two_arm` match, and `crates/jammi-ai/tests/gpu_capability/
+// capability_surface.rs`'s `TWO_ARM_OPS` + `KNOWN_NO_DISPATCH_SITE_OPS`),
+// which is exactly how the f16 cast-epilogue keys came to be missing from
+// the shipped report on the headline dtype.
+//
+// **Why not `snapshot_all`.** `snapshot_all()` reflects only ops that have
+// been looked up via `counters_for` AT LEAST ONCE in this process (its own
+// doc says so), so a key set derived from it varies with process history: a
+// job that happens to run first in a fresh process would report a strictly
+// smaller `ops` key set than the identical job running second. A durable
+// per-job artifact whose SHAPE depends on what else the process did is not a
+// measurement (family F). This table is a compile-time constant instead, so
+// the candidate key set is a pure function of the job's dtype class.
+
+/// The dtype family a [`ProbedOp`]'s registry key is resolved under.
+///
+/// A probed op's REPORT key is deliberately dtype-NEUTRAL (`"cast_scale"`,
+/// never `"cast_scale_bf16_f32"`) because it names the *capability* a
+/// consumer asks about; the registry key the kernel's own `admit()` call
+/// site passes is NOT dtype-neutral, because each 16-bit cast-boundary
+/// kernel is a genuinely independent type (`CastScaleBf16F32` vs
+/// `CastScaleF16F32` — see `crate::ops::cast_scale`'s module doc on why an
+/// `F16` analog is real kernel authoring, not a reinterpretation), dispatched
+/// under its OWN key so `JAMMI_KERNELS_DISABLE` can force each back to its
+/// two-kernel chain independently. The registry key is therefore RESOLVED
+/// from the job's backbone dtype at probe time, never spelled into the
+/// report.
+///
+/// [`DtypeClass::Any`] on a table ENTRY means "this op dispatches under one
+/// key regardless of dtype"; passing `Any` as the QUERY dtype to
+/// [`ProbedOp::registry_keys_for`] therefore matches only the dtype-neutral
+/// entries — see that method's doc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum DtypeClass {
+    /// One registry key covering every backbone dtype.
+    Any,
+    /// `f32` backbones only.
+    F32,
+    /// `bf16` backbones only.
+    Bf16,
+    /// `f16` backbones only.
+    F16,
+}
+
+/// How a [`ProbedOp`]'s dispatch decision is (or is not) observable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProbedOpKind {
+    /// A two-arm [`admit`] site: [`counters_for`]'s `fused`/`eager` split is
+    /// the observable, and a miss carries a verbatim predicate key.
+    TwoArm,
+    /// An [`admit_cascade`] site: [`cascade_counters_for`]'s
+    /// `fused`/`declined` split is the observable. `admit_cascade` has NO
+    /// `fallback_warnings`-shaped reason channel, so a decline can only ever
+    /// be reported at the coarse `capability_or_domain_miss` grain.
+    Cascade,
+    /// A kernel with NO admission gate of its own: it is launched
+    /// unconditionally from INSIDE `parent`'s already-admitted fused arm (a
+    /// bare launcher call at the storage level, not a tracked `Tensor` op),
+    /// so it has no registry key and no probe can read a delta for it. Its
+    /// execution is implied by `parent` dispatching fused — which is what
+    /// makes it provable at all, and why it must never be claimed as an
+    /// independently-admitting op.
+    InternalSubkernel {
+        /// The [`ProbedOp::report_key`] of the op whose fused arm launches
+        /// this kernel.
+        parent: &'static str,
+    },
+}
+
+/// One row of [`PROBED_OPS`]: a dtype-neutral report key, how its dispatch
+/// is observable, and the registry key(s) its kernel's own `admit()` /
+/// `admit_cascade()` call site passes, per dtype class.
+#[derive(Debug, Clone, Copy)]
+pub struct ProbedOp {
+    /// The dtype-NEUTRAL key this op appears under in a durable acceleration
+    /// report and in `ci/release-feature-manifest.json`'s capability lists.
+    pub report_key: &'static str,
+    /// How (or whether) this op's dispatch decision can be observed.
+    pub kind: ProbedOpKind,
+    /// `(dtype class, registry key)` — the key the kernel's own call site
+    /// passes to [`admit`]/[`admit_cascade`], reused VERBATIM. Empty for a
+    /// [`ProbedOpKind::InternalSubkernel`], which has no key at all.
+    pub registry: &'static [(DtypeClass, &'static str)],
+}
+
+impl ProbedOp {
+    /// The registry key(s) this op dispatches under for a job whose backbone
+    /// dtype is `dtype`: every entry whose class is [`DtypeClass::Any`] or
+    /// exactly `dtype`.
+    ///
+    /// Passing [`DtypeClass::Any`] yields ONLY the dtype-neutral entries —
+    /// the honest reading of "this caller has no concrete dtype in hand", not
+    /// a wildcard that would silently claim both 16-bit keys at once. Use
+    /// [`ProbedOp::all_registry_keys`] for the every-dtype enumeration.
+    ///
+    /// Today every [`ProbedOpKind::TwoArm`]/[`ProbedOpKind::Cascade`] row
+    /// yields AT MOST ONE key for any concrete dtype class — pinned by
+    /// `probed_ops_resolve_to_at_most_one_registry_key_per_dtype_class`, not
+    /// assumed.
+    pub fn registry_keys_for(&self, dtype: DtypeClass) -> impl Iterator<Item = &'static str> + '_ {
+        self.registry
+            .iter()
+            .filter(move |(class, _)| *class == DtypeClass::Any || *class == dtype)
+            .map(|&(_, key)| key)
+    }
+
+    /// Every registry key this op can dispatch under, across all dtype
+    /// classes — the enumeration a "is this table's key set closed over the
+    /// workspace's real call sites" audit reads.
+    pub fn all_registry_keys(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.registry.iter().map(|&(_, key)| key)
+    }
+}
+
+/// The ONE static fact about which ops an acceleration report / capability
+/// probe can attribute, and under which registry key.
+///
+/// **Populated by reading every `counters_for("...")` /
+/// `cascade_counters_for("...")` / `admit_cast_boundary("...")` literal in
+/// `crates/jammi-kernels`, `crates/jammi-encoders`, `crates/jammi-lora` and
+/// `crates/jammi-ai` — never from memory.** Row-by-row provenance:
+///
+/// | report key | kind | registry key(s) | call site |
+/// |---|---|---|---|
+/// | `layer_norm` | TwoArm | `layer_norm_fused` | `crates/jammi-encoders/src/layer_norm.rs:103` |
+/// | `rope` | TwoArm | `rope_fused` | `crates/jammi-encoders/src/modernbert.rs:190` |
+/// | `softmax` | TwoArm | `softmax_last_dim_fused` | `crates/jammi-encoders/src/modernbert.rs:204` |
+/// | `geglu` | TwoArm | `geglu_fused` | `crates/jammi-encoders/src/modernbert.rs:1888` |
+/// | `attention_block` | TwoArm | `attention_block_fused` | `crates/jammi-encoders/src/modernbert.rs:684` |
+/// | `dropout` | TwoArm | `lora_linear_fused` | `crates/jammi-lora/src/lora_linear.rs:205` (`admit` at `:799`) |
+/// | `low_rank_residual_linear` | TwoArm | `lora_linear_fused` | `crates/jammi-lora/src/lora_linear.rs:205` (`admit` at `:799`) |
+/// | `cast_scale` | TwoArm | bf16 → `cast_scale_bf16_f32`, f16 → `cast_scale_f16_f32` | `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:800`, `:814` |
+/// | `cast_add` | TwoArm | bf16 → `cast_add_bf16`, f16 → `cast_add_f16` | `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:899`, `:911` |
+/// | `mem_efficient_attention` | Cascade | `mem_efficient_attention` | `crates/jammi-encoders/src/modernbert.rs:1303` |
+/// | `rope_positions` | InternalSubkernel(`attention_block_flash`) | — | `crates/jammi-kernels/src/ops/flash_attention.rs:645` |
+/// | `scaled_cast_add` | InternalSubkernel(`low_rank_residual_linear`) | — | `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:693` (CPU), `crates/jammi-kernels/src/cuda/low_rank_residual_linear.rs:131` (CUDA) |
+///
+/// **Registry keys that exist but are deliberately NOT rows** (each read at
+/// the cited call site during this population, and excluded for a stated
+/// reason — an omission with no reason is how finding 2 happened):
+///
+/// - `attention_block_flash` (`crates/jammi-encoders/src/modernbert.rs:1259`,
+///   `:1556`) — a real cascade, but the esc-075 report surfaces it through
+///   its OWN dedicated top-level `flash` field (with the compiled/device
+///   short-circuit reasons a plain `ops` entry cannot express), and
+///   `ci/release-feature-manifest.json` declares it as `flash_compiled` +
+///   `flash_dtypes`, not as a `fused_op_admission` entry. Adding it here
+///   would make the same fact appear twice in one artifact.
+/// - `adamw_step_fused` (`crates/jammi-ai/src/fine_tune/adamw.rs:33`, `admit`
+///   at `:257`) — a real two-arm site that DOES dispatch during the probe's
+///   optimizer step, but it is not a declared capability in
+///   `ci/release-feature-manifest.json` today. Adding it is a report-
+///   vocabulary (K4) and manifest change in its own right, raised to the
+///   campaign lead rather than slipped in here.
+/// - `lora_dropout` (`crates/jammi-lora/src/lora_linear.rs:37`) and
+///   `lora_epilogue` (`:66`) — registry entries with NO `admit()` call site
+///   anywhere: both are documented as "permanently `{fused: 0, eager: 0}`",
+///   superseded by `lora_linear_fused`, and kept only for snapshot-schema
+///   compatibility. A row for either would put a permanently-unmoving
+///   counter in the report.
+/// - `axpy` — grepped for across all four crates: NO `counters_for` /
+///   `admit` / bare-launcher site at all. It is a compiled kernel with no
+///   dispatch decision and no parent to prove it through, so it is neither a
+///   probed op nor an internal subkernel.
+///
+/// **`registry` is empty for a [`ProbedOpKind::InternalSubkernel`] row on
+/// purpose**: `rope_positions` and `scaled_cast_add` are launched by a bare
+/// call into `crate::cuda::rope_positions::cuda_fwd` /
+/// `ScaledCastAdd::{cpu_fwd,cuda_fwd}` from INSIDE an already-admitted parent
+/// arm, deliberately bypassing the tracked-`Tensor` op path (and therefore
+/// [`admit`]) — see `FlashVarlenAttentionRope`'s own doc for why (candle's
+/// tape would otherwise retain the rotated buffer for the whole backward
+/// pass). They have no key for any probe to read a delta from; their
+/// execution is proven by the PARENT dispatching fused, and must never be
+/// claimed as an independent admission.
+pub const PROBED_OPS: &[ProbedOp] = &[
+    ProbedOp {
+        report_key: "layer_norm",
+        kind: ProbedOpKind::TwoArm,
+        registry: &[(DtypeClass::Any, "layer_norm_fused")],
+    },
+    ProbedOp {
+        report_key: "rope",
+        kind: ProbedOpKind::TwoArm,
+        registry: &[(DtypeClass::Any, "rope_fused")],
+    },
+    ProbedOp {
+        report_key: "softmax",
+        kind: ProbedOpKind::TwoArm,
+        registry: &[(DtypeClass::Any, "softmax_last_dim_fused")],
+    },
+    ProbedOp {
+        report_key: "geglu",
+        kind: ProbedOpKind::TwoArm,
+        registry: &[(DtypeClass::Any, "geglu_fused")],
+    },
+    ProbedOp {
+        report_key: "attention_block",
+        kind: ProbedOpKind::TwoArm,
+        registry: &[(DtypeClass::Any, "attention_block_fused")],
+    },
+    ProbedOp {
+        report_key: "dropout",
+        kind: ProbedOpKind::TwoArm,
+        registry: &[(DtypeClass::Any, "lora_linear_fused")],
+    },
+    ProbedOp {
+        report_key: "low_rank_residual_linear",
+        kind: ProbedOpKind::TwoArm,
+        registry: &[(DtypeClass::Any, "lora_linear_fused")],
+    },
+    ProbedOp {
+        report_key: "cast_scale",
+        kind: ProbedOpKind::TwoArm,
+        registry: &[
+            (DtypeClass::Bf16, "cast_scale_bf16_f32"),
+            (DtypeClass::F16, "cast_scale_f16_f32"),
+        ],
+    },
+    ProbedOp {
+        report_key: "cast_add",
+        kind: ProbedOpKind::TwoArm,
+        registry: &[
+            (DtypeClass::Bf16, "cast_add_bf16"),
+            (DtypeClass::F16, "cast_add_f16"),
+        ],
+    },
+    ProbedOp {
+        report_key: "mem_efficient_attention",
+        kind: ProbedOpKind::Cascade,
+        registry: &[(DtypeClass::Any, "mem_efficient_attention")],
+    },
+    ProbedOp {
+        report_key: "rope_positions",
+        kind: ProbedOpKind::InternalSubkernel {
+            parent: "attention_block_flash",
+        },
+        registry: &[],
+    },
+    ProbedOp {
+        report_key: "scaled_cast_add",
+        kind: ProbedOpKind::InternalSubkernel {
+            parent: "low_rank_residual_linear",
+        },
+        registry: &[],
+    },
+];
+
+/// The [`PROBED_OPS`] row with this `report_key`, or `None`.
+pub fn probed_op(report_key: &str) -> Option<&'static ProbedOp> {
+    PROBED_OPS.iter().find(|op| op.report_key == report_key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2575,6 +2837,166 @@ mod tests {
         assert_eq!(
             out_a,
             vec!["alpha".to_string(), "mu".to_string(), "zeta".to_string()]
+        );
+    }
+
+    /// Every concrete dtype class. [`DtypeClass::Any`] is deliberately NOT
+    /// here: it is a table-ENTRY class ("one key for every dtype"), never a
+    /// job's resolved backbone dtype.
+    const CONCRETE_DTYPE_CLASSES: &[DtypeClass] =
+        &[DtypeClass::F32, DtypeClass::Bf16, DtypeClass::F16];
+
+    /// The invariant [`ProbedOp::registry_keys_for`]'s doc claims and every
+    /// consumer relies on: for a CONCRETE dtype class, a two-arm/cascade row
+    /// resolves to at most one registry key, so "the key for this op at this
+    /// dtype" is well defined and a consumer never has to guess which of two
+    /// counters is the op's real dispatch signal.
+    #[test]
+    fn probed_ops_resolve_to_at_most_one_registry_key_per_dtype_class() {
+        for op in PROBED_OPS {
+            if matches!(op.kind, ProbedOpKind::InternalSubkernel { .. }) {
+                continue;
+            }
+            for &dtype in CONCRETE_DTYPE_CLASSES {
+                let keys: Vec<&str> = op.registry_keys_for(dtype).collect();
+                assert!(
+                    keys.len() <= 1,
+                    "PROBED_OPS row {:?} resolves to {} registry keys at {dtype:?} ({keys:?}) — \
+                     a report/capability consumer would have to guess which one is this op's \
+                     dispatch signal",
+                    op.report_key,
+                    keys.len()
+                );
+            }
+        }
+    }
+
+    /// A report key must be dtype-NEUTRAL and unique. The `!key.ends_with`
+    /// checks are the direct regression guard on finding 2's root cause: the
+    /// shipped table spelled a bf16-specific REGISTRY key (`cast_add_bf16`)
+    /// into the report's dtype-neutral vocabulary, which is what made the f16
+    /// job's report structurally unable to name its own cast epilogue.
+    #[test]
+    fn probed_ops_report_keys_are_dtype_neutral_and_unique() {
+        let mut seen = HashSet::new();
+        for op in PROBED_OPS {
+            assert!(
+                seen.insert(op.report_key),
+                "duplicate PROBED_OPS report key {:?}",
+                op.report_key
+            );
+            for suffix in ["_bf16", "_f16", "_f32", "_bf16_f32", "_f16_f32"] {
+                assert!(
+                    !op.report_key.ends_with(suffix),
+                    "PROBED_OPS report key {:?} carries a dtype suffix {suffix:?} — report keys \
+                     are dtype-neutral (campaign #446 finding 2); the dtype lives in the \
+                     `registry` column, resolved at probe time",
+                    op.report_key
+                );
+            }
+        }
+    }
+
+    /// An internal-subkernel row has NO registry key (there is no `admit()`
+    /// site to read a delta from) and names a PARENT that is itself either a
+    /// probed row or the flash cascade the acceleration report surfaces
+    /// through its own `flash` field — a parent no consumer can resolve would
+    /// make "proven via the parent's dispatch" unprovable.
+    #[test]
+    fn internal_subkernel_rows_have_no_registry_key_and_a_resolvable_parent() {
+        for op in PROBED_OPS {
+            let ProbedOpKind::InternalSubkernel { parent } = op.kind else {
+                continue;
+            };
+            assert!(
+                op.registry.is_empty(),
+                "internal subkernel {:?} must have no registry key — it is launched from inside \
+                 {parent:?}'s already-admitted arm, never through admit()",
+                op.report_key
+            );
+            let resolvable = probed_op(parent).is_some() || parent == "attention_block_flash";
+            assert!(
+                resolvable,
+                "internal subkernel {:?} names parent {parent:?}, which is neither a PROBED_OPS \
+                 row nor the flash cascade — its execution would be unprovable",
+                op.report_key
+            );
+        }
+    }
+
+    /// Every two-arm/cascade row DOES carry at least one registry key (the
+    /// mirror of the test above: a probed row with no key is a row a probe
+    /// silently drops — exactly the shape `axpy` has, which is why `axpy` is
+    /// not a row at all).
+    #[test]
+    fn two_arm_and_cascade_rows_all_carry_a_registry_key() {
+        for op in PROBED_OPS {
+            if matches!(op.kind, ProbedOpKind::InternalSubkernel { .. }) {
+                continue;
+            }
+            assert!(
+                !op.registry.is_empty(),
+                "PROBED_OPS row {:?} is {:?} but names no registry key — a probe would silently \
+                 drop it",
+                op.report_key,
+                op.kind
+            );
+        }
+    }
+
+    /// [`DtypeClass::Any`] as the QUERY dtype yields only the dtype-neutral
+    /// entries, never both 16-bit keys at once — the documented, non-wildcard
+    /// reading. A wildcard here would let a caller with no dtype in hand
+    /// snapshot `cast_add_bf16` AND `cast_add_f16` and then report whichever
+    /// moved, which is the fabrication this table exists to prevent.
+    #[test]
+    fn registry_keys_for_any_yields_only_dtype_neutral_entries() {
+        let cast_add = probed_op("cast_add").expect("cast_add is a PROBED_OPS row");
+        assert_eq!(
+            cast_add.registry_keys_for(DtypeClass::Any).count(),
+            0,
+            "cast_add has no dtype-neutral key, so an Any query must yield none"
+        );
+        assert_eq!(
+            cast_add
+                .registry_keys_for(DtypeClass::F16)
+                .collect::<Vec<_>>(),
+            vec!["cast_add_f16"]
+        );
+        assert_eq!(
+            cast_add
+                .registry_keys_for(DtypeClass::Bf16)
+                .collect::<Vec<_>>(),
+            vec!["cast_add_bf16"]
+        );
+        assert_eq!(
+            cast_add.registry_keys_for(DtypeClass::F32).count(),
+            0,
+            "an f32 backbone takes low_rank_residual_linear's admit()-free \"nothing to fuse\" \
+             branch — there is no cast_add key for it, and the report must omit the op rather \
+             than claim a miss"
+        );
+
+        let layer_norm = probed_op("layer_norm").expect("layer_norm is a PROBED_OPS row");
+        for &dtype in CONCRETE_DTYPE_CLASSES {
+            assert_eq!(
+                layer_norm.registry_keys_for(dtype).collect::<Vec<_>>(),
+                vec!["layer_norm_fused"],
+                "a dtype-neutral row resolves to the same key at every dtype"
+            );
+        }
+    }
+
+    /// `all_registry_keys` is the every-dtype enumeration (distinct from
+    /// `registry_keys_for`): a "does this table's key set cover the
+    /// workspace's real call sites" audit reads it, and it must not collapse
+    /// the two 16-bit keys into one.
+    #[test]
+    fn all_registry_keys_enumerates_every_dtype_variant() {
+        let cast_scale = probed_op("cast_scale").expect("cast_scale is a PROBED_OPS row");
+        assert_eq!(
+            cast_scale.all_registry_keys().collect::<Vec<_>>(),
+            vec!["cast_scale_bf16_f32", "cast_scale_f16_f32"]
         );
     }
 }

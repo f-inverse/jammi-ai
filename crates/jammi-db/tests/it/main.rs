@@ -5,6 +5,7 @@ mod channels;
 mod common;
 mod concurrent_writers;
 mod ephemeral;
+mod esc_071_cross_session_visibility;
 mod eval_per_query;
 mod exact_search;
 mod fine_tune_queue;

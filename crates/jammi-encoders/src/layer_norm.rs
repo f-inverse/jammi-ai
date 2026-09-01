@@ -19,7 +19,10 @@
 //! `LayerNormFused` has no `metal_fwd`, and candle's default `metal_fwd`
 //! ERRORS rather than falling back, so a Metal tensor is refused by this
 //! predicate rather than reaching `apply2` and hard-erroring; dtype
-//! F32/BF16 matching between `x` and `weight`; both contiguous; `hidden`
+//! F32/BF16/F16 matching between `x` and `weight` — F16 widened in
+//! campaign #443 W2b, exactly where `jammi_kernels::cuda::layer_norm`
+//! gained a compiled F16 dispatch arm (K2's no-Hold-without-dispatch
+//! rule); both contiguous; `hidden`
 //! within the kernel's ceiling). Outside that domain — or on the
 //! `parity-test`/BERT/DistilBERT paths, which are BIASED and so never
 //! reach this arm at all — `slow()` runs exactly as before. This is a K2
@@ -101,7 +104,10 @@ pub static LN_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
 
 /// The fused kernel's domain, checked at the call site (family D / K2):
 /// `x` and `weight` live on a device [`device_is_supported`] accepts,
-/// share a dtype the kernel implements (F32 or BF16), both are
+/// share a dtype the kernel implements (F32, BF16, or F16 — F16 widened
+/// in campaign #443 W2b, exactly where `jammi_kernels::cuda::layer_norm`
+/// gained a compiled F16 dispatch arm backed by the SEPARATE
+/// `cuda/layer_norm_f16.cu` translation unit), both are
 /// contiguous (`LayerNormFused` refuses a strided view rather than risk
 /// misreading the row grouping — see its module doc), `weight` is rank-1
 /// matching `x`'s last dimension, and that dimension is within the
@@ -115,8 +121,8 @@ fn fused_admission_predicate(x: &Tensor, weight: &Tensor) -> (bool, &'static str
     if !device_is_supported(x.device()) {
         return (false, "device_is_cpu_or_cuda");
     }
-    if x.dtype() != weight.dtype() || !matches!(x.dtype(), DType::F32 | DType::BF16) {
-        return (false, "dtype_f32_or_bf16_matching_between_x_and_weight");
+    if x.dtype() != weight.dtype() || !matches!(x.dtype(), DType::F32 | DType::BF16 | DType::F16) {
+        return (false, "dtype_f32_bf16_or_f16_matching_between_x_and_weight");
     }
     if !x.is_contiguous() {
         return (false, "x_contiguous");
@@ -313,12 +319,12 @@ impl LayerNorm {
     /// Domain check (K2): `weight`'s (and, when biased, `bias`'s) dtype
     /// must match `x`'s own dtype — mirroring only the MATCHING half of
     /// `fused_admission_predicate`'s
-    /// `dtype_f32_or_bf16_matching_between_x_and_weight` check above, not
-    /// its F32/BF16 restriction: `slow()` is the fallback path for EVERY
-    /// dtype `internal_dtype`'s match arm above accepts (F16 and F64
-    /// included, not just F32/BF16 — the fused kernel's tighter dtype
+    /// `dtype_f32_bf16_or_f16_matching_between_x_and_weight` check above,
+    /// not its F32/BF16/F16 restriction: `slow()` is the fallback path for
+    /// EVERY dtype `internal_dtype`'s match arm above accepts (F64
+    /// included, not just F32/BF16/F16 — the fused kernel's tighter dtype
     /// domain does not apply here), so it only refuses a MISMATCH, never
-    /// a dtype outside `{F32, BF16}`. Before this check existed, a caller
+    /// a dtype outside `{F32, BF16, F16}`. Before this check existed, a caller
     /// passing a mismatched-dtype
     /// weight got candle's own `broadcast_mul` dtype-mismatch error (the
     /// pre-fix code multiplied at `x_dtype` directly); the internal-dtype
@@ -334,8 +340,8 @@ impl LayerNorm {
                 "LayerNorm::slow: weight dtype {:?} does not match x dtype {:?} -- refusing \
                  rather than silently upcasting a mismatched-dtype weight into `internal_dtype` \
                  (mirrors only the MATCHING half of `fused_admission_predicate`'s \
-                 `dtype_f32_or_bf16_matching_between_x_and_weight` check -- slow() itself \
-                 accepts any dtype `internal_dtype` handles, not just F32/BF16)",
+                 `dtype_f32_bf16_or_f16_matching_between_x_and_weight` check -- slow() itself \
+                 accepts any dtype `internal_dtype` handles, not just F32/BF16/F16)",
                 self.weight.dtype(),
                 x_dtype
             )));
@@ -407,6 +413,27 @@ mod tests {
         let weight = Tensor::from_slice(&[1.0f32; 4], (hidden,), &device).unwrap();
         let (holds, predicate) = fused_admission_predicate(&x, &weight);
         assert!(holds, "CPU must satisfy the device clause: {predicate}");
+    }
+
+    /// The domain-widening PROOF (K2): F16 must now HOLD, not just fail to
+    /// error — campaign #443 W2b's CUDA F16 dispatch arm
+    /// (`jammi_kernels::cuda::layer_norm`'s `(DType::F16, DType::F16)`
+    /// arm) is what makes this admission-widening sound; before that arm
+    /// existed, an F16 `x`/`weight` pair was correctly refused here
+    /// (`dtype_f32_bf16_or_f16_matching_between_x_and_weight`, née
+    /// `dtype_f32_or_bf16_matching_between_x_and_weight`) — this test
+    /// pins the flip, not merely its absence.
+    #[test]
+    fn fused_admission_predicate_now_accepts_matching_f16() {
+        let device = Device::Cpu;
+        let hidden = 4;
+        let xv: Vec<f16> = (0..hidden).map(|i| f16::from_f32(i as f32 * 0.5)).collect();
+        let wv: Vec<f16> = (0..hidden).map(|_| f16::from_f32(1.0)).collect();
+        let x = Tensor::from_slice(&xv, (1, hidden), &device).unwrap();
+        let weight = Tensor::from_slice(&wv, (hidden,), &device).unwrap();
+        let (holds, predicate) = fused_admission_predicate(&x, &weight);
+        assert!(holds, "matching F16 x/weight must now hold: {predicate}");
+        assert_eq!(predicate, "domain_ok");
     }
 
     /// The NEGATIVE half: a Metal device must be REJECTED. This IS
@@ -657,7 +684,7 @@ mod tests {
     /// `internal_dtype` and rounded down to a confident wrong bf16
     /// number. This is the exact mismatch
     /// `fused_admission_predicate`'s own
-    /// `dtype_f32_or_bf16_matching_between_x_and_weight` check refuses on
+    /// `dtype_f32_bf16_or_f16_matching_between_x_and_weight` check refuses on
     /// the fused path; `slow()` must refuse it too.
     #[test]
     fn slow_refuses_a_dtype_mismatched_weight_instead_of_silently_upcasting() {

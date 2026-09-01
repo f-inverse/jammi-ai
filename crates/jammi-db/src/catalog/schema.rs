@@ -787,3 +787,39 @@ CREATE TABLE index_segments (
 );
 ALTER TABLE result_tables DROP COLUMN index_path;
 "#;
+
+/// Migration 026 — the per-job acceleration-report column on `training_jobs`
+/// (esc-075: a compute precision that silently runs the unaccelerated eager
+/// composition has no caller-visible, per-job signal). `acceleration_report`
+/// carries an **opaque, self-describing JSON payload whose vocabulary the
+/// payload's producer owns** — mirroring this table's own `training_spec`
+/// and `metrics` columns' schema-at-the-producer deferral — not a closed
+/// enum enumerated here. The catalog itself guarantees only two things about
+/// this column, both mechanical rather than semantic:
+///
+///   - **absent / SQL `NULL`** — a legacy row written before this migration,
+///     or (should it ever occur) a row this code never touched. Read back as
+///     "unknown", never fabricated as any producer state.
+///   - **`{"state":"pending"}`** — the ONE payload the catalog itself writes,
+///     stamped by [`Catalog::create_training_job`] at submission time: the
+///     job exists and is queued/running, but no claimant has yet recorded a
+///     determination.
+///
+/// Every other payload — most commonly `{"state":"determined", ...}`,
+/// written by [`Catalog::record_acceleration_report`] once the claiming
+/// worker resolves `(device, compiled capabilities, admission predicates)`
+/// for this attempt, but not limited to it (a non-fine-tune job kind or a
+/// pre-device-resolution failure path may record a different `"state"`) — is
+/// the producer's to define and evolve; the catalog stores it byte-for-byte
+/// and never inspects, validates, or enumerates its shape. A `"state"` key is
+/// the convention every producer uses as its discriminant, not a contract
+/// this migration or column enforces.
+///
+/// The column is nullable so a pre-migration row backfills to the honest
+/// "unknown" state rather than a fabricated `pending`; every row created
+/// after this migration always carries the explicit `pending` marker from
+/// `INSERT` onward, so "no report yet" and "row pre-dates this feature" are
+/// never confused for a row born under the new contract.
+pub(super) const MIGRATION_026_ACCELERATION_REPORT: &str = r#"
+ALTER TABLE training_jobs ADD COLUMN acceleration_report TEXT;
+"#;

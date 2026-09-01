@@ -1,0 +1,11 @@
+# finetune-run A/B -- fused cascade vs ALLOFF, exact two-sided sign test over d_i = fused - alloff (CONTRACT Frame / C16)
+seed    fused_r1  alloff_r1 d_i           premise     
+1       OK        OK        -0.032861     VIOLATED (2)
+2       OK        OK        -0.060050     VIOLATED (2)
+3       OK        OK        0.062199      VIOLATED (2)
+
+sign_test: n/a -- no seed produced a premise-clean d_i
+determinism_floor: max_r1_r2_delta=0.0 cross_seed_spread=0.052409212771387624 findings=0
+decision: n/a -- no sign_test result to decide over
+lr0_control: seeds=['1', '2'] violations=0
+status: INVALID

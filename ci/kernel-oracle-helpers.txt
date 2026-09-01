@@ -76,3 +76,8 @@ crates/jammi-kernels/src/admission.rs::require_flash_compiled_or_skip
 crates/jammi-kernels/src/admission.rs::metal_device_or_skip
 crates/jammi-kernels/src/ops/dropout.rs::metal_device_or_skip
 crates/jammi-kernels/src/ops/flash_attention.rs::cuda_device_or_skip
+crates/jammi-encoders/tests/esc076_comparable_eager_control.rs::cuda_device
+crates/jammi-kernels/tests/flash_torch_parity_f16.rs::cuda_device
+crates/jammi-encoders/src/modernbert.rs::flash_arch_gate
+crates/jammi-kernels/tests/flash_torch_parity_f16.rs::f16_fixtures_present_or_skip
+crates/jammi-encoders/tests/esc076_comparable_eager_control.rs::esc076_trace_gate

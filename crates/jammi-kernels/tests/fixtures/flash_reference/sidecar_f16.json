@@ -1,0 +1,294 @@
+{
+  "amplitude_note": "randn * 9.0, clamped to [-18.0, 18.0], production amplitude (matches tests/flash_decisive_timing.rs's own convention), not an unclamped unit-variance torch.randn draw.",
+  "calling_convention_note": "torch's _flash_attention_forward/_backward take SEPARATE query/key/value tensors (FLASH_NAMESPACE::mha_varlen_fwd); jammi's op takes ONE packed qkv [total_q,3,H,64] tensor (flash_attn_varlen_qkvpacked_func's upstream layout). Both dispatch to the same underlying mha_varlen_fwd/bwd kernel (upstream flash_attn_interface.py's qkvpacked wrapper docstring: packing only changes whether the backward needs an explicit concat of dQ/dK/dV, not the forward/backward math) — so this fixture's q/k/v arrays, STACKED along a new axis 1, are byte-for-byte the qkv tensor the jammi leg must feed the same kernel with the SAME numeric values.",
+  "device": "NVIDIA A100 80GB PCIe",
+  "dtype": "float16",
+  "generator": "crates/jammi-kernels/tests/fixtures/flash_reference/generate_fixtures.py",
+  "head_dim": 64,
+  "jammi_flash_attention_use_fast_math": true,
+  "jammi_flash_attention_vendored_commit": "a8aa52b1ab3e9ca574c8a33b3f35afc017ffa2e2",
+  "jammi_flash_attention_vendored_tag": "v2.8.3.post1",
+  "legs": {
+    "b1_s512": {
+      "dk_max_abs": 1454.0,
+      "dq_max_abs": 2058.0,
+      "dv_max_abs": 77.9375,
+      "head_dim": 64,
+      "lengths": [
+        512
+      ],
+      "lse_max_abs": 403.6272277832031,
+      "max_seqlen": 512,
+      "num_heads": 16,
+      "o_max_abs": 18.0,
+      "self_noise_max_abs_diff": {
+        "dk": 0.0,
+        "dq": 0.001953125,
+        "dv": 0.0,
+        "lse": 0.0,
+        "o": 0.0
+      },
+      "softmax_scale": 0.125,
+      "total_q": 512,
+      "truth_minus_ref_max_abs_diff": {
+        "dk": 1.2369918823242188,
+        "dq": 0.9606406688690186,
+        "dv": 0.02922821044921875,
+        "lse": 0.0001220703125,
+        "o": 0.009654998779296875
+      },
+      "window_radius": null
+    },
+    "b1_s512_win64": {
+      "dk_max_abs": 1428.0,
+      "dq_max_abs": 2068.0,
+      "dv_max_abs": 83.5,
+      "head_dim": 64,
+      "lengths": [
+        512
+      ],
+      "lse_max_abs": 367.96923828125,
+      "max_seqlen": 512,
+      "num_heads": 16,
+      "o_max_abs": 18.0,
+      "self_noise_max_abs_diff": {
+        "dk": 0.0,
+        "dq": 0.0,
+        "dv": 0.0,
+        "lse": 0.0,
+        "o": 0.0
+      },
+      "softmax_scale": 0.125,
+      "total_q": 512,
+      "truth_minus_ref_max_abs_diff": {
+        "dk": 1.229347825050354,
+        "dq": 1.04833984375,
+        "dv": 0.02020263671875,
+        "lse": 0.0001220703125,
+        "o": 0.00994110107421875
+      },
+      "window_radius": 64
+    },
+    "b1_tile129": {
+      "dk_max_abs": 1421.0,
+      "dq_max_abs": 2068.0,
+      "dv_max_abs": 64.125,
+      "head_dim": 64,
+      "lengths": [
+        129
+      ],
+      "lse_max_abs": 331.146240234375,
+      "max_seqlen": 129,
+      "num_heads": 16,
+      "o_max_abs": 18.0,
+      "self_noise_max_abs_diff": {
+        "dk": 0.0,
+        "dq": 0.0,
+        "dv": 0.0,
+        "lse": 0.0,
+        "o": 0.0
+      },
+      "softmax_scale": 0.125,
+      "total_q": 129,
+      "truth_minus_ref_max_abs_diff": {
+        "dk": 0.989346981048584,
+        "dq": 0.8559784293174744,
+        "dv": 0.02146148681640625,
+        "lse": 0.0001220703125,
+        "o": 0.0087890625
+      },
+      "window_radius": null
+    },
+    "b1_tile257": {
+      "dk_max_abs": 1359.0,
+      "dq_max_abs": 2078.0,
+      "dv_max_abs": 74.0625,
+      "head_dim": 64,
+      "lengths": [
+        257
+      ],
+      "lse_max_abs": 361.60540771484375,
+      "max_seqlen": 257,
+      "num_heads": 16,
+      "o_max_abs": 18.0,
+      "self_noise_max_abs_diff": {
+        "dk": 0.0,
+        "dq": 0.0,
+        "dv": 0.0,
+        "lse": 0.0,
+        "o": 0.0
+      },
+      "softmax_scale": 0.125,
+      "total_q": 257,
+      "truth_minus_ref_max_abs_diff": {
+        "dk": 1.4486619234085083,
+        "dq": 1.46240234375,
+        "dv": 0.0243988037109375,
+        "lse": 0.0001220703125,
+        "o": 0.00994110107421875
+      },
+      "window_radius": null
+    },
+    "b8_s128": {
+      "dk_max_abs": 1740.0,
+      "dq_max_abs": 2524.0,
+      "dv_max_abs": 72.8125,
+      "head_dim": 64,
+      "lengths": [
+        128,
+        120,
+        128,
+        100,
+        128,
+        115,
+        128,
+        128
+      ],
+      "lse_max_abs": 428.97845458984375,
+      "max_seqlen": 128,
+      "num_heads": 16,
+      "o_max_abs": 18.0,
+      "self_noise_max_abs_diff": {
+        "dk": 0.0,
+        "dq": 0.0,
+        "dv": 0.0,
+        "lse": 0.0,
+        "o": 0.0
+      },
+      "softmax_scale": 0.125,
+      "total_q": 975,
+      "truth_minus_ref_max_abs_diff": {
+        "dk": 1.1923789978027344,
+        "dq": 1.16552734375,
+        "dv": 0.022918701171875,
+        "lse": 0.0001220703125,
+        "o": 0.010066986083984375
+      },
+      "window_radius": null
+    },
+    "b8_s512": {
+      "dk_max_abs": 1760.0,
+      "dq_max_abs": 2750.0,
+      "dv_max_abs": 91.75,
+      "head_dim": 64,
+      "lengths": [
+        512,
+        500,
+        512,
+        480,
+        512,
+        505,
+        490,
+        512
+      ],
+      "lse_max_abs": 436.4244079589844,
+      "max_seqlen": 512,
+      "num_heads": 16,
+      "o_max_abs": 18.0,
+      "self_noise_max_abs_diff": {
+        "dk": 0.0,
+        "dq": 0.0625,
+        "dv": 0.0,
+        "lse": 0.0,
+        "o": 0.0
+      },
+      "softmax_scale": 0.125,
+      "total_q": 4023,
+      "truth_minus_ref_max_abs_diff": {
+        "dk": 1.4758329391479492,
+        "dq": 1.62353515625,
+        "dv": 0.0339813232421875,
+        "lse": 0.00018310546875,
+        "o": 0.00994873046875
+      },
+      "window_radius": null
+    },
+    "b8_s512_win64": {
+      "dk_max_abs": 2200.0,
+      "dq_max_abs": 2848.0,
+      "dv_max_abs": 81.0625,
+      "head_dim": 64,
+      "lengths": [
+        512,
+        500,
+        512,
+        480,
+        512,
+        505,
+        490,
+        512
+      ],
+      "lse_max_abs": 401.7319030761719,
+      "max_seqlen": 512,
+      "num_heads": 16,
+      "o_max_abs": 18.0,
+      "self_noise_max_abs_diff": {
+        "dk": 0.0,
+        "dq": 0.0,
+        "dv": 0.0,
+        "lse": 0.0,
+        "o": 0.0
+      },
+      "softmax_scale": 0.125,
+      "total_q": 4023,
+      "truth_minus_ref_max_abs_diff": {
+        "dk": 1.3480224609375,
+        "dq": 1.711181640625,
+        "dv": 0.0303955078125,
+        "lse": 0.000152587890625,
+        "o": 0.009607315063476562
+      },
+      "window_radius": 64
+    },
+    "prefix_mixed": {
+      "dk_max_abs": 1511.0,
+      "dq_max_abs": 2570.0,
+      "dv_max_abs": 82.1875,
+      "head_dim": 64,
+      "lengths": [
+        512,
+        300,
+        129,
+        64
+      ],
+      "lse_max_abs": 428.97845458984375,
+      "max_seqlen": 512,
+      "num_heads": 16,
+      "o_max_abs": 18.0,
+      "self_noise_max_abs_diff": {
+        "dk": 0.0,
+        "dq": 0.25,
+        "dv": 0.0,
+        "lse": 0.0,
+        "o": 0.0
+      },
+      "softmax_scale": 0.125,
+      "total_q": 1005,
+      "truth_minus_ref_max_abs_diff": {
+        "dk": 1.3206920623779297,
+        "dq": 1.15673828125,
+        "dv": 0.031982421875,
+        "lse": 0.000152587890625,
+        "o": 0.009443283081054688
+      },
+      "window_radius": null
+    }
+  },
+  "num_heads": 16,
+  "seed": 20260825,
+  "storage_note": "q/k/v/grad_out are saved as NATIVE float16 .npy ('<f2' descr) — unlike bf16, numpy has a real float16 dtype and candle-core 0.11.0's npy.rs Header::parse DOES map 'f2'/'e' to DType::F16, so no bit-pattern workaround is needed (plain, lossless tensor.to(torch.float16).numpy()). o/lse/dq/dk/dv (both ref and truth) remain float32 on disk, never float64, exactly as the bf16 legs.",
+  "torch_cuda": "12.6",
+  "torch_flash_attention_build_defines": [
+    "FLASHATTENTION_DISABLE_ALIBI",
+    "FLASHATTENTION_DISABLE_SOFTCAP",
+    "UNFUSE_FMA"
+  ],
+  "torch_flash_attention_kernel_subtree": "third_party/flash-attn/csrc/flash_attn/src (classic tree, same subtree jammi vendors)",
+  "torch_flash_attention_use_fast_math": false,
+  "torch_flash_attention_vendored_commit": "6c4f74fb338e0c3cdb07ac6f5eab5f54fc367c15",
+  "torch_flash_attention_vendored_version": "2.8.4",
+  "torch_flash_attention_vendored_version_source": "flash_attn/__init__.py:6 __version__ at that commit; also the git tag fa4-v4.0.0.beta15 resolves to the SAME SHA (a naming artifact of the upstream repo, not a different content generation — verified: torch's CMake globs csrc/flash_attn/src/*.cu, the classic tree, at that commit)",
+  "torch_version": "2.13.0+cu126",
+  "truth_note": "truth_{o,lse,dq,dk,dv} are a from-scratch f64 EAGER attention implementation (einsum + softmax, no FlashAttention kernel of any generation) on the SAME fp16-exact q/k/v/grad_out this leg's ref (torch FA2) also consumed — the higher-precision anchor docs/maintainer/cuda-kernel-guide.md §3.3 requires. truth_minus_ref_max_abs_diff in each leg below is |truth - ref|, computed HERE (numpy-equivalent, torch f64 CPU/GPU arithmetic) so the consuming Rust oracle (tests/flash_torch_parity_f16.rs) never has to trust an unverified bound. NOTE: neither consuming Rust test opens this sidecar file at run time — every number it asserts on (o/lse/dq/dk/dv, truth-relative bound) is recomputed live from the .npy fixtures each run (family F); this JSON is provenance/human-review documentation only, self_noise_max_abs_diff included, which is REPORTED here but never consumed as a live bound.",
+  "version_mismatch_note": "torch pins Dao-AILab/flash-attention at commit 6c4f74fb338e = release 2.8.4 (flash_attn/__init__.py:6's __version__ string, and torch's own CMake globs the classic csrc/flash_attn/src tree at that commit, aten/src/ATen/CMakeLists.txt:359-365 at the v2.13.0 tag) — ONE patch release above jammi's pinned v2.8.3.post1, same kernel source lineage. Torch's build additionally defines UNFUSE_FMA (verified at csrc/flash_attn/src/softmax.h:85-89 at that commit: forces exp2f(__fmul_rn(x,scale)-max) instead of the fusable exp2f(x*scale-max)) and does NOT pass --use_fast_math, while jammi's five flash translation units DO (the bf16 and fp16 fwd/bwd .cu sources plus the flash_api_jammi.cu wrapper -- campaign #443's fp16 twins widened this from three to five; see crates/jammi-kernels/build.rs's flash source list and crates/jammi-kernels/third_party/flash-attention/VENDORED.md's Build section)."
+}

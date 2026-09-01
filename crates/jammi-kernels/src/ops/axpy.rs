@@ -1,6 +1,6 @@
 use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, CustomOp2, Error, Layout, Result, Shape, Tensor};
-use half::bf16;
+use half::{bf16, f16};
 
 use crate::layout_walk::StridedOffsets;
 
@@ -19,10 +19,18 @@ use crate::layout_walk::StridedOffsets;
 /// Domain (family D): this is NOT a broadcasting op. `x` and `y` must have
 /// identical shape; a shape mismatch is refused (`Error::ShapeMismatchBinaryOp`)
 /// rather than silently broadcast or truncated. CPU forward supports F32,
-/// F64, BF16 (typed error for any other dtype, or a lhs/rhs dtype
+/// F64, BF16, F16 (typed error for any other dtype, or a lhs/rhs dtype
 /// mismatch); the CUDA forward (feature-gated) supports F32, BF16 and
 /// additionally requires contiguous storage (a raw-pointer kernel has no
 /// flat linear index for a strided/broadcast view — `Error::RequiresContiguous`).
+/// F16's CPU arm (`axpy_f16`, originally added as an oracle reference —
+/// see `docs/maintainer/cuda-kernel-guide.md`'s per-op f16 reference-regime
+/// table) mirrors `axpy_bf16`'s f32-accumulate-round-once regime. Campaign
+/// #443 W2c added the matching CUDA F16 dispatch arm (`crate::cuda::axpy`'s
+/// `(DType::F16, DType::F16)` arm, backed by the SEPARATE `cuda/axpy_f16.cu`
+/// translation unit — a monomorphic kernel, not a template instantiation
+/// that shares code with the F32/BF16 kernel), so F16 is now a real,
+/// dispatchable CUDA dtype for this op (K2: no Hold-without-dispatch).
 #[derive(Debug, Clone, Copy)]
 pub struct Axpy {
     pub alpha: f64,
@@ -67,6 +75,10 @@ impl CustomOp2 for Axpy {
             (CpuStorage::BF16(x), CpuStorage::BF16(y)) => {
                 let out = axpy_bf16(self.alpha, x, l1, y, l2);
                 Ok((CpuStorage::BF16(out), l1.shape().clone()))
+            }
+            (CpuStorage::F16(x), CpuStorage::F16(y)) => {
+                let out = axpy_f16(self.alpha, x, l1, y, l2);
+                Ok((CpuStorage::F16(out), l1.shape().clone()))
             }
             (s1, s2) if s1.dtype() != s2.dtype() => Err(Error::DTypeMismatchBinaryOp {
                 lhs: s1.dtype(),
@@ -162,6 +174,18 @@ fn axpy_bf16(alpha: f64, x: &[bf16], lx: &Layout, y: &[bf16], ly: &Layout) -> Ve
         .collect()
 }
 
+/// F16 accumulates in f32, rounding back to f16 once — the exact same
+/// regime as [`axpy_bf16`] above, substituting `half::f16`. Not
+/// bit-identical to candle's own native-f16 `affine`+`add` composition
+/// either, for the same reason `axpy_bf16`'s doc states.
+fn axpy_f16(alpha: f64, x: &[f16], lx: &Layout, y: &[f16], ly: &Layout) -> Vec<f16> {
+    let alpha = alpha as f32;
+    StridedOffsets::from_layout(lx)
+        .zip(StridedOffsets::from_layout(ly))
+        .map(|(ix, iy)| f16::from_f32(alpha * x[ix].to_f32() + y[iy].to_f32()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +224,21 @@ mod tests {
         let expected = [
             bf16::from_f32(2.0 * 1.5 + 0.25),
             bf16::from_f32(2.0 * -2.25 + 1.0),
+        ];
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn cpu_fwd_f16_matches_f32_accumulation_rounded_once() {
+        let device = Device::Cpu;
+        let xv = [f16::from_f32(1.5), f16::from_f32(-2.25)];
+        let yv = [f16::from_f32(0.25), f16::from_f32(1.0)];
+        let x = Tensor::from_slice(&xv, (2,), &device).unwrap();
+        let y = Tensor::from_slice(&yv, (2,), &device).unwrap();
+        let out = axpy(2.0, &x, &y).unwrap().to_vec1::<f16>().unwrap();
+        let expected = [
+            f16::from_f32(2.0 * 1.5 + 0.25),
+            f16::from_f32(2.0 * -2.25 + 1.0),
         ];
         assert_eq!(out, expected);
     }

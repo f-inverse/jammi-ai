@@ -75,6 +75,7 @@
 mod harness;
 
 mod bf16_gpu_gate;
+mod capability_surface;
 mod classification_parity;
 mod clip_text_embeddings_parity;
 mod embeddings_parity;

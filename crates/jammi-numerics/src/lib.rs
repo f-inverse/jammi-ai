@@ -22,6 +22,7 @@
 //! (`jammi-db`, `jammi-ai`, and any downstream layers) depend on this crate,
 //! never the reverse.
 
+pub mod batch_shape;
 pub mod calibration;
 pub mod classification;
 pub mod distance;
@@ -36,6 +37,7 @@ pub mod quantization;
 pub mod retrieval;
 pub mod stats;
 
+pub use batch_shape::{bucket_seq_len, MIN_BUCKET_LEN};
 pub use error::{NumericsError, Result};
 pub use precision::ComputePrecision;
 pub use quantization::WeightQuantization;

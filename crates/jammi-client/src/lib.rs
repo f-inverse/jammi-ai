@@ -386,6 +386,30 @@ impl DataClient {
         Ok(resp.metrics_json)
     }
 
+    /// GPU-acceleration determination for a fine-tune job, as the raw,
+    /// self-describing JSON blob text the catalog's `training_jobs.
+    /// acceleration_report` column carries (esc-075) — the same blob the
+    /// embedded catalog-backed record read returns. `None` for a legacy row
+    /// predating the column (SQL `NULL`); otherwise a `"state"`-keyed object
+    /// whose vocabulary is owned by the payload's producer (e.g. `"pending"`
+    /// before a determination exists, `"determined"` once one does) and
+    /// documented there, not enumerated here. This crate carries no
+    /// `serde_json` dependency, so the caller decodes the returned text.
+    pub async fn fine_tune_acceleration_report(
+        &self,
+        id: &FineTuneJobId,
+    ) -> Result<Option<String>> {
+        let resp = self
+            .training_client()
+            .training_status(TrainingStatusRequest {
+                job_id: id.0.clone(),
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        Ok(resp.acceleration_report_json)
+    }
+
     // --- eval ------------------------------------------------------------
 
     /// Evaluate embedding quality against golden relevance judgments.

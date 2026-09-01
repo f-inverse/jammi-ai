@@ -1,15 +1,20 @@
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::cudarc::driver::PushKernelArg;
 use candle_core::{CudaStorage, DType, Error, Layout, Result, Shape};
-use half::bf16;
+use half::{bf16, f16};
 
-use super::PTX_ROPE;
+use super::{PTX_ROPE, PTX_ROPE_F16};
 use crate::ops::rope::rope_dims;
 use crate::ops::MAX_HEAD_DIM;
 
 /// See `../axpy.rs`'s identical constant for the module-name rationale —
 /// arbitrary but stable and unique to this op's PTX module.
 const MODULE_NAME: &str = "jammi_kernels_rope";
+
+/// The F16 arm's OWN PTX module name — `rope_f16.cu` is a SEPARATE
+/// translation unit (see that file's module doc), so it needs a distinct
+/// module name from [`MODULE_NAME`].
+const MODULE_NAME_F16: &str = "jammi_kernels_rope_f16";
 
 /// `hidden > MAX_HEAD_DIM`: refused above a conservative, VALIDATED
 /// ceiling — NOT a hardware limit (see `ops::MAX_HEAD_DIM`'s doc). `n >
@@ -112,6 +117,25 @@ pub(crate) fn cuda_fwd(
             let sin = s3.as_cuda_slice::<bf16>()?.slice(s_1..s_2);
             let func = device.get_or_load_custom_func("rope_fwd_bf16", MODULE_NAME, PTX_ROPE)?;
             let out = unsafe { device.alloc::<bf16>(n) }?;
+            let mut builder = func.builder();
+            builder.arg(&x);
+            builder.arg(&cos);
+            builder.arg(&sin);
+            builder.arg(&out);
+            builder.arg(&hidden_u32);
+            builder.arg(&period_u32);
+            builder.arg(&sign);
+            builder.arg(&n);
+            unsafe { builder.launch(cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
+            Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
+        }
+        DType::F16 => {
+            let x = s1.as_cuda_slice::<f16>()?.slice(x1..x2);
+            let cos = s2.as_cuda_slice::<f16>()?.slice(c1..c2);
+            let sin = s3.as_cuda_slice::<f16>()?.slice(s_1..s_2);
+            let func =
+                device.get_or_load_custom_func("rope_fwd_f16", MODULE_NAME_F16, PTX_ROPE_F16)?;
+            let out = unsafe { device.alloc::<f16>(n) }?;
             let mut builder = func.builder();
             builder.arg(&x);
             builder.arg(&cos);

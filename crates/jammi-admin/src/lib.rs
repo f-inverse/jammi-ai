@@ -491,6 +491,17 @@ pub struct TrainingStatusInfo {
     /// blob, so it stays byte-identical to the wire field. Schema documented
     /// at the trainer, not here.
     pub metrics_json: Option<String>,
+    /// GPU-acceleration determination for this job, as the opaque,
+    /// self-describing JSON blob text the wire's `TrainingStatus.
+    /// acceleration_report_json` carries (esc-075) — the SAME catalog
+    /// `training_jobs.acceleration_report` column the embedded record read
+    /// returns. `None` for a legacy row predating the column (SQL `NULL`);
+    /// otherwise a `"state"`-keyed object whose vocabulary is owned by the
+    /// payload's producer (e.g. `"pending"` before a determination exists,
+    /// `"determined"` once one does) and documented there, not enumerated
+    /// here. This control-plane read never decodes or re-encodes the blob, so
+    /// it stays byte-identical to the wire field.
+    pub acceleration_report_json: Option<String>,
 }
 
 /// Build a [`TrainingStatusInfo`] from the wire response. Pulled out of
@@ -502,6 +513,7 @@ fn training_status_info_from_proto(resp: TrainingStatusResponse) -> TrainingStat
         model_id: resp.model_id,
         error: resp.error,
         metrics_json: resp.metrics_json,
+        acceleration_report_json: resp.acceleration_report_json,
     }
 }
 
@@ -519,6 +531,7 @@ mod training_status_info_tests {
             model_id: "jammi:fine-tuned:abc".to_string(),
             error: String::new(),
             metrics_json: Some(r#"{"final_loss":0.1,"train_loss_curve":[[0,0.2]]}"#.to_string()),
+            acceleration_report_json: Some(r#"{"state":"determined","fa2_f16":true}"#.to_string()),
         };
         let info = training_status_info_from_proto(resp);
         assert_eq!(
@@ -537,9 +550,69 @@ mod training_status_info_tests {
             model_id: String::new(),
             error: String::new(),
             metrics_json: None,
+            acceleration_report_json: Some(r#"{"state":"pending"}"#.to_string()),
         };
         let info = training_status_info_from_proto(resp);
         assert_eq!(info.metrics_json, None);
+    }
+
+    /// The determined arm (esc-075): a claimed job's wire response carries the
+    /// claiming worker's determination, and the control-plane read relays it
+    /// verbatim (no decode, no re-encode) — byte-identical to the wire text.
+    /// Mirrors `metrics_json_present_arm_carries_the_wire_blob_verbatim`.
+    #[test]
+    fn acceleration_report_json_determined_arm_carries_the_wire_blob_verbatim() {
+        let resp = TrainingStatusResponse {
+            status: "running".to_string(),
+            model_id: String::new(),
+            error: String::new(),
+            metrics_json: None,
+            acceleration_report_json: Some(
+                r#"{"state":"determined","fa2_f16":true,"reason":"sm_90 capable"}"#.to_string(),
+            ),
+        };
+        let info = training_status_info_from_proto(resp);
+        assert_eq!(
+            info.acceleration_report_json.as_deref(),
+            Some(r#"{"state":"determined","fa2_f16":true,"reason":"sm_90 capable"}"#)
+        );
+    }
+
+    /// The pending arm (esc-075): a freshly submitted, unclaimed job's wire
+    /// response carries the explicit pending marker, never `None` or an empty
+    /// string.
+    #[test]
+    fn acceleration_report_json_pending_arm_carries_the_explicit_marker() {
+        let resp = TrainingStatusResponse {
+            status: "queued".to_string(),
+            model_id: String::new(),
+            error: String::new(),
+            metrics_json: None,
+            acceleration_report_json: Some(r#"{"state":"pending"}"#.to_string()),
+        };
+        let info = training_status_info_from_proto(resp);
+        assert_eq!(
+            info.acceleration_report_json.as_deref(),
+            Some(r#"{"state":"pending"}"#)
+        );
+    }
+
+    /// The absent arm (esc-075): a legacy row predating the
+    /// `acceleration_report` column carries no wire field (field presence,
+    /// not an empty string) — the control-plane read stays `None`, never
+    /// inventing a fabricated tri-state value. Mirrors
+    /// `metrics_json_absent_arm_stays_none`.
+    #[test]
+    fn acceleration_report_json_absent_arm_stays_none() {
+        let resp = TrainingStatusResponse {
+            status: "completed".to_string(),
+            model_id: "jammi:fine-tuned:legacy".to_string(),
+            error: String::new(),
+            metrics_json: Some(r#"{"final_loss":0.2}"#.to_string()),
+            acceleration_report_json: None,
+        };
+        let info = training_status_info_from_proto(resp);
+        assert_eq!(info.acceleration_report_json, None);
     }
 }
 

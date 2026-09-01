@@ -214,8 +214,28 @@ pub fn lora_linear_fused_dispatch_snapshot() -> DispatchSnapshot {
 /// The fused LoRA-SITE kernel's domain, checked at the call site (family D
 /// / K2): [`device_is_supported`]; `x` rank 2 (a pooled head) or 3
 /// (`[batch, seq, in]`); `x`/`w` share a dtype
-/// that is EITHER both `F32` or both `BF16` (the two combinations
-/// [`jammi_kernels::ops::LowRankResidualLinear`] actually implements); `w`
+/// that is `F32`, `BF16`, or `F16` (all three matched, never mixed — the
+/// three combinations [`jammi_kernels::ops::LowRankResidualLinear`]
+/// actually implements, `F16` widened in campaign #443 D1: that op's own
+/// `cpu_fwd`/`cuda_fwd` dtype gate, and `ScaledCastAdd`'s CPU epilogue,
+/// both admit `F16` end to end — this call-site predicate had NOT been
+/// widened to match until this fix, so an `F16` backbone fell back to
+/// [`LoraLinear::forward_composed`]'s eager `[mul, cast, add]` composition
+/// for every training forward despite the fused kernel's own domain
+/// already covering it (esc-075/esc-076's own triage row: an `F16`
+/// backbone was silently, permanently eager at this site — the fused/0
+/// eager dispatch-count proof below, and the pod's own 17360-fused/0-eager
+/// trace, is what this widening closes). This widening is NOT a fix for
+/// the separate `s512` held-out-eval OOM esc-076 also tracked: that OOM's
+/// mechanism was pinned by pod trace evidence to `evaluate_held_out`
+/// rounding its first eval batch UP to the `512` bucket rung (a bucketing
+/// call-site bug, `be1450ae`) — it reproduced on BOTH `bf16` and `f16`
+/// `alloff` legs alike, not `F16` alone, and was fixed independently, at
+/// that call site, by routing eval through natural-width tokenization
+/// instead of bucket-up padding. No causal claim is made here about
+/// eager-arm allocator fragmentation contributing to (or explaining) that
+/// OOM — this predicate's own domain-coverage gap is the only thing
+/// measured and fixed by this change; `w`
 /// contiguous (`x` is NOT required to be — the op materializes a
 /// non-contiguous `x` internally; see the op's own domain doc); the base
 /// weight carries no bias (see
@@ -278,8 +298,8 @@ fn lora_linear_admission_predicate(
         return (false, "out_features_ge_1");
     }
     match (x.dtype(), w.dtype()) {
-        (DType::F32, DType::F32) | (DType::BF16, DType::BF16) => {}
-        _ => return (false, "base_dtype_f32_or_bf16_matched"),
+        (DType::F32, DType::F32) | (DType::BF16, DType::BF16) | (DType::F16, DType::F16) => {}
+        _ => return (false, "base_dtype_f32_bf16_or_f16_matched"),
     }
     (true, "domain_ok")
 }

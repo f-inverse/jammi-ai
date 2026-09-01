@@ -1,9 +1,9 @@
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
 use candle_core::{CudaStorage, DType, Error, Layout, Result, Shape};
-use half::bf16;
+use half::{bf16, f16};
 
-use super::PTX_SOFTMAX;
+use super::{PTX_SOFTMAX, PTX_SOFTMAX_F16};
 use crate::ops::softmax::{softmax_dims, FullyMaskedPolicy, MAX_LAST_DIM, MAX_RANK};
 
 /// `FullyMaskedPolicy` as the `u32` flag the CUDA kernels take (`1` =
@@ -21,6 +21,11 @@ fn policy_flag(policy: FullyMaskedPolicy) -> u32 {
 /// See `../../cuda/axpy.rs`'s identical constant for the module-name
 /// rationale — arbitrary but stable and unique to this op's PTX module.
 const MODULE_NAME: &str = "jammi_kernels_softmax";
+
+/// The F16 arm's OWN PTX module name — `softmax_f16.cu` is a SEPARATE
+/// translation unit (see that file's module doc), so it needs a distinct
+/// module name from [`MODULE_NAME`].
+const MODULE_NAME_F16: &str = "jammi_kernels_softmax_f16";
 
 /// One CUDA thread block per row; must match `SM_BLOCK` in `softmax.cu`.
 const SM_BLOCK: u32 = 256;
@@ -188,6 +193,31 @@ pub(crate) fn cuda_fwd(
             unsafe { builder.launch(cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
             Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
         }
+        (DType::F16, DType::F16) => {
+            let sc = s1.as_cuda_slice::<f16>()?.slice(o1..o2);
+            let mk = s2.as_cuda_slice::<f16>()?.slice(m1..m2);
+            let func = device.get_or_load_custom_func(
+                "softmax_fwd_f16",
+                MODULE_NAME_F16,
+                PTX_SOFTMAX_F16,
+            )?;
+            let out = unsafe { device.alloc::<f16>(n) }?;
+            let mut builder = func.builder();
+            builder.arg(&sc);
+            builder.arg(&mk);
+            builder.arg(&out);
+            builder.arg(&last_u32);
+            builder.arg(&s_lead[0]);
+            builder.arg(&s_lead[1]);
+            builder.arg(&s_lead[2]);
+            builder.arg(&m_lead[0]);
+            builder.arg(&m_lead[1]);
+            builder.arg(&m_lead[2]);
+            builder.arg(&policy_u32);
+            builder.arg(&scale);
+            unsafe { builder.launch(cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
+            Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
+        }
         (lhs, rhs) if lhs != rhs => Err(Error::DTypeMismatchBinaryOp { lhs, rhs, op: OP }),
         (dtype, _) => Err(Error::UnsupportedDTypeForOp(dtype, OP)),
     }
@@ -288,6 +318,23 @@ pub(crate) fn cuda_bwd_dscores(
                 PTX_SOFTMAX,
             )?;
             let out = unsafe { device.alloc::<bf16>(n) }?;
+            let mut builder = func.builder();
+            builder.arg(&y);
+            builder.arg(&dy);
+            builder.arg(&out);
+            builder.arg(&last_u32);
+            unsafe { builder.launch(cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
+            Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
+        }
+        (DType::F16, DType::F16) => {
+            let y = s1.as_cuda_slice::<f16>()?.slice(o1..o2);
+            let dy = s2.as_cuda_slice::<f16>()?.slice(d1..d2);
+            let func = device.get_or_load_custom_func(
+                "softmax_bwd_dscores_f16",
+                MODULE_NAME_F16,
+                PTX_SOFTMAX_F16,
+            )?;
+            let out = unsafe { device.alloc::<f16>(n) }?;
             let mut builder = func.builder();
             builder.arg(&y);
             builder.arg(&dy);

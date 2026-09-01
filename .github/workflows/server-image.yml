@@ -34,6 +34,7 @@ on:
     paths:
       - "Dockerfile"
       - ".github/workflows/server-image.yml"
+      - "ci/release-feature-manifest.json"
   workflow_dispatch:
     inputs:
       selfcontained:
@@ -88,7 +89,11 @@ jobs:
   # Self-contained variant: opt-in, dispatch-only. Builds the
   # `runtime-selfcontained` stage (baked config + encoder) from the
   # dispatched ref and pushes `:selfcontained` + a `:sha-<sha>` tag.
-  # Independent of the tag-triggered generic publish above.
+  # Independent of the tag-triggered generic publish above. Deliberately
+  # manifest-free (no `ci/release-feature-manifest.json` read, no
+  # `CARGO_FEATURES` build-arg) like the generic CPU image above: this
+  # variant builds from the CPU `builder` stage, not `builder-cuda`, so it
+  # never carries a CUDA feature to source from the manifest.
   build-and-push-selfcontained:
     if: github.event_name == 'workflow_dispatch' && inputs.selfcontained
     runs-on: ubuntu-latest
@@ -145,6 +150,35 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Deliberately NOT `submodules: recursive` — a targeted init below
+          # keeps the scope auditable, same idiom as ci.yml's `flash-attn-
+          # compile` job and the other CUDA release lanes this wave touches.
+          submodules: false
+
+      # `ci/release-feature-manifest.json`'s `cu12-image` lane is the single
+      # source of truth for this build's cargo feature list (fed into the
+      # Dockerfile's `CARGO_FEATURES` build-arg below) — read here rather
+      # than hardcoding it a second time. `jq` is preinstalled on
+      # `ubuntu-latest` (no container on this job).
+      - name: Read release feature list (ci/release-feature-manifest.json)
+        id: manifest
+        run: |
+          set -euo pipefail
+          features="$(jq -r '.lanes["cu12-image"].cargo_features | join(",")' ci/release-feature-manifest.json)"
+          if [ -z "$features" ]; then
+            echo "::error::ci/release-feature-manifest.json produced an empty cu12-image cargo_features list" >&2
+            exit 1
+          fi
+          echo "cargo_features=$features" >> "$GITHUB_OUTPUT"
+
+      # `flash-attn` (now in the manifest's cu12-image feature list) needs
+      # the vendored CUTLASS submodule in the build CONTEXT: `docker/build-
+      # push-action` builds from the local checkout (context: "."), not a
+      # fresh `git clone` inside the container, so the submodule must be
+      # materialized here before the build starts.
+      - name: Init the CUTLASS submodule (scoped to this job's checkout only)
+        run: git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
 
       - uses: ./.github/actions/docker-publish
         with:
@@ -156,15 +190,17 @@ jobs:
             type=sha,format=long
           build-args: |
             RUNTIME_VARIANT=runtime-cuda
+            CARGO_FEATURES=${{ steps.manifest.outputs.cargo_features }}
           push: "true"
           cache-scope: cu12
 
   # Build-only verification for the CUDA image on pull requests that touch the
   # Dockerfile or this workflow. GPU runtime can't be exercised in CI (no GPU on
   # the runners), so this proves the CUDA Dockerfile *compiles* (`jammi-server
-  # --features cuda` builds, candle's CUDA backend links, the runtime stage
-  # assembles) before a `v*` tag triggers the real push. No `--push`, no tags
-  # consumed, no GHCR write.
+  # --features cuda,flash-attn,...` builds, candle's CUDA backend links, the
+  # vendored FlashAttention-2 kernels compile, the runtime stage assembles)
+  # before a `v*` tag triggers the real push. No `--push`, no tags consumed,
+  # no GHCR write.
   build-cuda-pr:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -173,10 +209,27 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Read release feature list (ci/release-feature-manifest.json)
+        id: manifest
+        run: |
+          set -euo pipefail
+          features="$(jq -r '.lanes["cu12-image"].cargo_features | join(",")' ci/release-feature-manifest.json)"
+          if [ -z "$features" ]; then
+            echo "::error::ci/release-feature-manifest.json produced an empty cu12-image cargo_features list" >&2
+            exit 1
+          fi
+          echo "cargo_features=$features" >> "$GITHUB_OUTPUT"
+
+      - name: Init the CUTLASS submodule (scoped to this job's checkout only)
+        run: git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
 
       - uses: ./.github/actions/docker-publish
         with:
           build-args: |
             RUNTIME_VARIANT=runtime-cuda
+            CARGO_FEATURES=${{ steps.manifest.outputs.cargo_features }}
           push: "false"
           cache-scope: cu12

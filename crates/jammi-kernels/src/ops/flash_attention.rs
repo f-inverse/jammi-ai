@@ -74,7 +74,7 @@ use candle_core::{
     CpuStorage, CudaStorage, CustomOp1, CustomOp3, DType, Device, Error, Layout, Result, Shape,
     Tensor,
 };
-use half::bf16;
+use half::{bf16, f16};
 
 use crate::flash::{self, CuSeqlens, VarlenConfig, HEAD_DIM};
 use crate::ops::rope_positions::PositionArm;
@@ -92,28 +92,38 @@ fn saved_err(who: &'static str, e: crate::ops::saved::SavedError) -> Error {
 }
 
 /// `qkv`'s expected packed shape: rank 4, `[total_q, 3, H, HEAD_DIM]`,
-/// bf16. Returns `(total_q, num_heads)`. Shared by both ops' `cuda_fwd`.
+/// bf16 OR f16 (campaign #443 D2: both dtype pairs of the vendored kernel
+/// are compiled UNCONDITIONALLY under `flash-attn` — `build.rs` builds all
+/// 5 TUs regardless of which dtype a given call site ends up using — so
+/// there is no compiled-vs-not distinction to gate on here, only "is this
+/// one of the two dtypes the C shim's `dtype` switch knows how to route",
+/// `crate::flash::JAMMI_FLASH_DTYPE_{BF16,FP16}`). Returns `(total_q,
+/// num_heads)`. Shared by both ops' `cuda_fwd`; the CALLER re-reads
+/// `dtype` itself (already had it) to pick which flash twin to launch —
+/// this function's only job is domain validation, not dispatch.
 fn check_qkv_domain(dims: &[usize], dtype: DType) -> Result<(usize, usize)> {
     if dims.len() != 4 || dims[1] != 3 || dims[3] != HEAD_DIM {
         return Err(Error::Msg(format!(
             "{OP_NAME}: qkv must be rank-4 [total_q, 3, H, {HEAD_DIM}], got {dims:?}"
         )));
     }
-    if dtype != DType::BF16 {
+    if !matches!(dtype, DType::BF16 | DType::F16) {
         return Err(Error::UnsupportedDTypeForOp(dtype, OP_NAME));
     }
     Ok((dims[0], dims[2]))
 }
 
-/// `o`/`d_o`'s expected shape: rank 3, `[total_q, H, HEAD_DIM]`, bf16 —
-/// the forward's own output shape (`crate::flash`'s module doc table).
+/// `o`/`d_o`'s expected shape: rank 3, `[total_q, H, HEAD_DIM]`, bf16 or
+/// f16 (see [`check_qkv_domain`]'s doc for why both are this op's real
+/// domain) — the forward's own output shape (`crate::flash`'s module doc
+/// table).
 fn check_o_domain(dims: &[usize], dtype: DType, total_q: usize, num_heads: usize) -> Result<()> {
     if dims.len() != 3 || dims[0] != total_q || dims[1] != num_heads || dims[2] != HEAD_DIM {
         return Err(Error::Msg(format!(
             "{OP_NAME}: expected o/grad_o shape [{total_q}, {num_heads}, {HEAD_DIM}], got {dims:?}"
         )));
     }
-    if dtype != DType::BF16 {
+    if !matches!(dtype, DType::BF16 | DType::F16) {
         return Err(Error::UnsupportedDTypeForOp(dtype, OP_NAME));
     }
     Ok(())
@@ -167,7 +177,8 @@ impl CustomOp1 for FlashVarlenAttention {
     }
 
     fn cuda_fwd(&self, s1: &CudaStorage, l1: &Layout) -> Result<(CudaStorage, Shape)> {
-        let (total_q, num_heads) = check_qkv_domain(l1.dims(), s1.dtype())?;
+        let dtype = s1.dtype();
+        let (total_q, num_heads) = check_qkv_domain(l1.dims(), dtype)?;
         if num_heads != self.num_heads {
             return Err(Error::Msg(format!(
                 "{OP_NAME}: qkv has {num_heads} heads but this op was constructed for {} — the \
@@ -181,36 +192,67 @@ impl CustomOp1 for FlashVarlenAttention {
         let (x1, x2) = l1
             .contiguous_offsets()
             .ok_or(Error::RequiresContiguous { op: OP_NAME })?;
-        let qkv_view = s1.as_cuda_slice::<bf16>()?.slice(x1..x2);
-
-        // SAFETY: uninitialised outputs `flash_varlen_fwd_into` fully
-        // overwrites — the identical allocation `flash::flash_varlen_fwd`
-        // (its owning convenience wrapper) makes for the same reason.
-        let mut o = unsafe { device.alloc::<bf16>(geom.o_len()) }?;
-        let mut lse = unsafe { device.alloc::<f32>(geom.lse_len()) }?;
-        flash::flash_varlen_fwd_into(
-            &device,
-            qkv_view,
-            &self.cu_seqlens,
-            o.as_view_mut(),
-            lse.as_view_mut(),
-            num_heads,
-            &self.cfg,
-        )
-        .map_err(flash_err)?;
-
-        // Stash `lse` for `bwd` — see the module doc's "Two op types, one
-        // seam" section. `set()` cannot legitimately fail here: this
-        // instance's `cuda_fwd` runs at most once (fresh instance per
-        // `apply_stateful1` call — see `StatefulKernelOp`'s own doc) — an
-        // `Err` here would mean candle called `cuda_fwd` twice on ONE
-        // instance, a candle-internal contract violation this op cannot
-        // recover from silently, so it is propagated rather than
-        // `.expect()`-panicked.
-        self.lse.set(lse).map_err(|e| saved_err(OP_NAME, e))?;
-
         let out_shape = Shape::from((total_q, num_heads, HEAD_DIM));
-        Ok((CudaStorage::wrap_cuda_slice(o, device), out_shape))
+
+        // Per-dtype dispatch (campaign #443 D2): `check_qkv_domain` above
+        // already narrowed `dtype` to `{BF16, F16}` — this match is
+        // therefore exhaustive over the op's real domain, with a named
+        // (unreachable-in-practice) refusal for anything else, mirroring
+        // `low_rank_residual_linear.rs`'s own `match dtype { ... other =>
+        // Err(UnsupportedDTypeForOp) }` idiom rather than an `.unwrap()`.
+        match dtype {
+            DType::BF16 => {
+                let qkv_view = s1.as_cuda_slice::<bf16>()?.slice(x1..x2);
+                // SAFETY: uninitialised outputs `flash_varlen_fwd_into`
+                // fully overwrites — the identical allocation
+                // `flash::flash_varlen_fwd` (its owning convenience
+                // wrapper) makes for the same reason.
+                let mut o = unsafe { device.alloc::<bf16>(geom.o_len()) }?;
+                let mut lse = unsafe { device.alloc::<f32>(geom.lse_len()) }?;
+                flash::flash_varlen_fwd_into(
+                    &device,
+                    qkv_view,
+                    &self.cu_seqlens,
+                    o.as_view_mut(),
+                    lse.as_view_mut(),
+                    num_heads,
+                    &self.cfg,
+                )
+                .map_err(flash_err)?;
+                // Stash `lse` for `bwd` — see the module doc's "Two op
+                // types, one seam" section. `set()` cannot legitimately
+                // fail here: this instance's `cuda_fwd` runs at most once
+                // (fresh instance per `apply_stateful1` call — see
+                // `StatefulKernelOp`'s own doc) — an `Err` here would mean
+                // candle called `cuda_fwd` twice on ONE instance, a
+                // candle-internal contract violation this op cannot
+                // recover from silently, so it is propagated rather than
+                // `.expect()`-panicked.
+                self.lse.set(lse).map_err(|e| saved_err(OP_NAME, e))?;
+                Ok((CudaStorage::wrap_cuda_slice(o, device), out_shape))
+            }
+            DType::F16 => {
+                let qkv_view = s1.as_cuda_slice::<f16>()?.slice(x1..x2);
+                // SAFETY: as the BF16 arm above — `flash_varlen_fwd_into_f16`
+                // makes the identical fully-overwrites contract, dtype
+                // aside.
+                let mut o = unsafe { device.alloc::<f16>(geom.o_len()) }?;
+                let mut lse = unsafe { device.alloc::<f32>(geom.lse_len()) }?;
+                flash::flash_varlen_fwd_into_f16(
+                    &device,
+                    qkv_view,
+                    &self.cu_seqlens,
+                    o.as_view_mut(),
+                    lse.as_view_mut(),
+                    num_heads,
+                    &self.cfg,
+                )
+                .map_err(flash_err)?;
+                self.lse.set(lse).map_err(|e| saved_err(OP_NAME, e))?;
+                Ok((CudaStorage::wrap_cuda_slice(o, device), out_shape))
+            }
+            other => Err(Error::UnsupportedDTypeForOp(other, OP_NAME)),
+        }
     }
 
     fn bwd(&self, arg: &Tensor, res: &Tensor, grad_res: &Tensor) -> Result<Option<Tensor>> {
@@ -281,7 +323,8 @@ impl CustomOp3 for FlashVarlenBwdHelper {
     ) -> Result<(CudaStorage, Shape)> {
         // s1/l1 = qkv, s2/l2 = o, s3/l3 = d_o — exactly the three tensors
         // `FlashVarlenAttention::bwd` passed to `apply_stateful3`.
-        let (total_q, num_heads) = check_qkv_domain(l1.dims(), s1.dtype())?;
+        let dtype = s1.dtype();
+        let (total_q, num_heads) = check_qkv_domain(l1.dims(), dtype)?;
         if num_heads != self.num_heads {
             return Err(Error::Msg(format!(
                 "{BWD_OP_NAME}: qkv has {num_heads} heads but this op was constructed for {}",
@@ -290,51 +333,101 @@ impl CustomOp3 for FlashVarlenBwdHelper {
         }
         check_o_domain(l2.dims(), s2.dtype(), total_q, num_heads)?;
         check_o_domain(l3.dims(), s3.dtype(), total_q, num_heads)?;
+        // Cross-dtype consistency: `check_qkv_domain`/`check_o_domain` each
+        // validate their OWN tensor is in `{BF16, F16}` independently, but
+        // never against EACH OTHER — the vendored kernel is dtype-
+        // monomorphic per launch (one `dtype:` field, one compiled
+        // specialisation), so a caller handing `qkv` as bf16 and `o`/`d_o`
+        // as f16 (or vice versa) is not a launch this FFI can represent at
+        // all; refuse it here rather than silently reinterpreting one
+        // buffer's bytes as the other's dtype.
+        if s2.dtype() != dtype || s3.dtype() != dtype {
+            return Err(Error::Msg(format!(
+                "{BWD_OP_NAME}: qkv/o/d_o dtypes must agree — got qkv={dtype:?}, o={:?}, \
+                 d_o={:?}; the vendored flash kernel is dtype-monomorphic per launch",
+                s2.dtype(),
+                s3.dtype()
+            )));
+        }
         let device = s1.device().clone();
         let geom = geometry_for(&self.cu_seqlens, num_heads, total_q)?;
 
         let (qx1, qx2) = l1
             .contiguous_offsets()
             .ok_or(Error::RequiresContiguous { op: BWD_OP_NAME })?;
-        let qkv_view = s1.as_cuda_slice::<bf16>()?.slice(qx1..qx2);
         let (ox1, ox2) = l2
             .contiguous_offsets()
             .ok_or(Error::RequiresContiguous { op: BWD_OP_NAME })?;
-        let o_view = s2.as_cuda_slice::<bf16>()?.slice(ox1..ox2);
         let (gx1, gx2) = l3
             .contiguous_offsets()
             .ok_or(Error::RequiresContiguous { op: BWD_OP_NAME })?;
-        let do_view = s3.as_cuda_slice::<bf16>()?.slice(gx1..gx2);
-
-        let lse = self.lse.take().map_err(|e| saved_err(BWD_OP_NAME, e))?;
-
-        let mut scratch =
-            flash::BwdScratch::alloc(&device, &geom, self.cfg.deterministic).map_err(flash_err)?;
-        // SAFETY: uninitialised output `flash_varlen_bwd_into` fully
-        // overwrites (dq via `convert_dQ` over every row block, dk/dv over
-        // every key block) — the identical allocation `flash::flash_varlen_bwd`
-        // makes.
-        let mut d_qkv = unsafe { device.alloc::<bf16>(geom.qkv_len()) }?;
-        flash::flash_varlen_bwd_into(
-            &device,
-            &self.cu_seqlens,
-            num_heads,
-            flash::BwdBuffers {
-                qkv: qkv_view,
-                o: o_view,
-                lse: lse.as_view(),
-                d_o: do_view,
-                d_qkv: d_qkv.as_view_mut(),
-                softmax_d: scratch.softmax_d.as_view_mut(),
-                dq_accum: scratch.dq_accum.as_view_mut(),
-                dq_accum_splits: scratch.splits,
-            },
-            &self.cfg,
-        )
-        .map_err(flash_err)?;
-
         let out_shape = Shape::from((total_q, 3, num_heads, HEAD_DIM));
-        Ok((CudaStorage::wrap_cuda_slice(d_qkv, device), out_shape))
+
+        // Per-dtype dispatch (campaign #443 D2) — see
+        // `FlashVarlenAttention::cuda_fwd`'s identical match for the
+        // exhaustiveness rationale.
+        match dtype {
+            DType::BF16 => {
+                let qkv_view = s1.as_cuda_slice::<bf16>()?.slice(qx1..qx2);
+                let o_view = s2.as_cuda_slice::<bf16>()?.slice(ox1..ox2);
+                let do_view = s3.as_cuda_slice::<bf16>()?.slice(gx1..gx2);
+                let lse = self.lse.take().map_err(|e| saved_err(BWD_OP_NAME, e))?;
+                let mut scratch = flash::BwdScratch::alloc(&device, &geom, self.cfg.deterministic)
+                    .map_err(flash_err)?;
+                // SAFETY: uninitialised output `flash_varlen_bwd_into`
+                // fully overwrites (dq via `convert_dQ` over every row
+                // block, dk/dv over every key block) — the identical
+                // allocation `flash::flash_varlen_bwd` makes.
+                let mut d_qkv = unsafe { device.alloc::<bf16>(geom.qkv_len()) }?;
+                flash::flash_varlen_bwd_into(
+                    &device,
+                    &self.cu_seqlens,
+                    num_heads,
+                    flash::BwdBuffers {
+                        qkv: qkv_view,
+                        o: o_view,
+                        lse: lse.as_view(),
+                        d_o: do_view,
+                        d_qkv: d_qkv.as_view_mut(),
+                        softmax_d: scratch.softmax_d.as_view_mut(),
+                        dq_accum: scratch.dq_accum.as_view_mut(),
+                        dq_accum_splits: scratch.splits,
+                    },
+                    &self.cfg,
+                )
+                .map_err(flash_err)?;
+                Ok((CudaStorage::wrap_cuda_slice(d_qkv, device), out_shape))
+            }
+            DType::F16 => {
+                let qkv_view = s1.as_cuda_slice::<f16>()?.slice(qx1..qx2);
+                let o_view = s2.as_cuda_slice::<f16>()?.slice(ox1..ox2);
+                let do_view = s3.as_cuda_slice::<f16>()?.slice(gx1..gx2);
+                let lse = self.lse.take().map_err(|e| saved_err(BWD_OP_NAME, e))?;
+                let mut scratch = flash::BwdScratch::alloc(&device, &geom, self.cfg.deterministic)
+                    .map_err(flash_err)?;
+                // SAFETY: as the BF16 arm above, dtype aside.
+                let mut d_qkv = unsafe { device.alloc::<f16>(geom.qkv_len()) }?;
+                flash::flash_varlen_bwd_into_f16(
+                    &device,
+                    &self.cu_seqlens,
+                    num_heads,
+                    flash::BwdBuffersF16 {
+                        qkv: qkv_view,
+                        o: o_view,
+                        lse: lse.as_view(),
+                        d_o: do_view,
+                        d_qkv: d_qkv.as_view_mut(),
+                        softmax_d: scratch.softmax_d.as_view_mut(),
+                        dq_accum: scratch.dq_accum.as_view_mut(),
+                        dq_accum_splits: scratch.splits,
+                    },
+                    &self.cfg,
+                )
+                .map_err(flash_err)?;
+                Ok((CudaStorage::wrap_cuda_slice(d_qkv, device), out_shape))
+            }
+            other => Err(Error::UnsupportedDTypeForOp(other, BWD_OP_NAME)),
+        }
     }
 
     // Second-order gradient (differentiating THROUGH `d_qkv`, this op's own
@@ -523,7 +616,8 @@ impl CustomOp3 for FlashVarlenAttentionFusedRope {
         s3: &CudaStorage,
         l3: &Layout,
     ) -> Result<(CudaStorage, Shape)> {
-        let (total_q, num_heads) = check_qkv_domain(l1.dims(), s1.dtype())?;
+        let dtype = s1.dtype();
+        let (total_q, num_heads) = check_qkv_domain(l1.dims(), dtype)?;
         if num_heads != self.num_heads {
             return Err(Error::Msg(format!(
                 "{FUSED_ROPE_OP_NAME}: qkv has {num_heads} heads but this op was constructed \
@@ -544,6 +638,10 @@ impl CustomOp3 for FlashVarlenAttentionFusedRope {
         // rope_positions::cuda_fwd`'s own contract, same as every other CUDA
         // kernel launcher in this crate) — `Layout::contiguous` reconstructs
         // exactly that, never a layout re-derived from anything else.
+        // `crate::cuda::rope_positions::cuda_fwd` is already dtype-generic
+        // (F32/BF16/F16, dispatched internally on `s1.dtype()`), so the
+        // rotated buffer comes back in the SAME dtype `qkv` was passed in —
+        // no widening needed at this call.
         let (rot_storage, rot_shape) = crate::cuda::rope_positions::cuda_fwd(
             self.seq, false, self.arm, s1, l1, s2, l2, s3, l3,
         )?;
@@ -553,35 +651,65 @@ impl CustomOp3 for FlashVarlenAttentionFusedRope {
             .ok_or(Error::RequiresContiguous {
                 op: FUSED_ROPE_OP_NAME,
             })?;
-        let qkv_view = rot_storage.as_cuda_slice::<bf16>()?.slice(rx1..rx2);
-
-        // SAFETY: uninitialised outputs `flash_varlen_fwd_into` fully
-        // overwrites — identical to `FlashVarlenAttention::cuda_fwd`'s own
-        // allocation for the same reason.
-        let mut o = unsafe { device.alloc::<bf16>(geom.o_len()) }?;
-        let mut lse = unsafe { device.alloc::<f32>(geom.lse_len()) }?;
-        flash::flash_varlen_fwd_into(
-            &device,
-            qkv_view,
-            &self.cu_seqlens,
-            o.as_view_mut(),
-            lse.as_view_mut(),
-            num_heads,
-            &self.cfg,
-        )
-        .map_err(flash_err)?;
-
-        // `rot_storage` (the rotated scratch buffer) is dropped HERE, at the
-        // end of this function — nothing outside this call retains it: `o`
-        // (the real output) is an independent allocation this function
-        // built separately, and `lse` (below) is `f32`-sized, not
-        // `[total,3,H,64]`-sized. This is the whole point of this type.
-        self.lse
-            .set(lse)
-            .map_err(|e| saved_err(FUSED_ROPE_OP_NAME, e))?;
-
         let out_shape = Shape::from((total_q, num_heads, HEAD_DIM));
-        Ok((CudaStorage::wrap_cuda_slice(o, device), out_shape))
+
+        // Per-dtype dispatch (campaign #443 D2) — see
+        // `FlashVarlenAttention::cuda_fwd`'s identical match for the
+        // exhaustiveness rationale. `rot_storage`'s own dtype is `dtype`
+        // (the rotation preserves it), so this match's arm selection is
+        // shared with `qkv`'s.
+        match dtype {
+            DType::BF16 => {
+                let qkv_view = rot_storage.as_cuda_slice::<bf16>()?.slice(rx1..rx2);
+                // SAFETY: uninitialised outputs `flash_varlen_fwd_into`
+                // fully overwrites — identical to
+                // `FlashVarlenAttention::cuda_fwd`'s own allocation for the
+                // same reason.
+                let mut o = unsafe { device.alloc::<bf16>(geom.o_len()) }?;
+                let mut lse = unsafe { device.alloc::<f32>(geom.lse_len()) }?;
+                flash::flash_varlen_fwd_into(
+                    &device,
+                    qkv_view,
+                    &self.cu_seqlens,
+                    o.as_view_mut(),
+                    lse.as_view_mut(),
+                    num_heads,
+                    &self.cfg,
+                )
+                .map_err(flash_err)?;
+                // `rot_storage` (the rotated scratch buffer) is dropped
+                // HERE, at the end of this function — nothing outside this
+                // call retains it: `o` (the real output) is an independent
+                // allocation this function built separately, and `lse`
+                // (below) is `f32`-sized, not `[total,3,H,64]`-sized. This
+                // is the whole point of this type.
+                self.lse
+                    .set(lse)
+                    .map_err(|e| saved_err(FUSED_ROPE_OP_NAME, e))?;
+                Ok((CudaStorage::wrap_cuda_slice(o, device), out_shape))
+            }
+            DType::F16 => {
+                let qkv_view = rot_storage.as_cuda_slice::<f16>()?.slice(rx1..rx2);
+                // SAFETY: as the BF16 arm above, dtype aside.
+                let mut o = unsafe { device.alloc::<f16>(geom.o_len()) }?;
+                let mut lse = unsafe { device.alloc::<f32>(geom.lse_len()) }?;
+                flash::flash_varlen_fwd_into_f16(
+                    &device,
+                    qkv_view,
+                    &self.cu_seqlens,
+                    o.as_view_mut(),
+                    lse.as_view_mut(),
+                    num_heads,
+                    &self.cfg,
+                )
+                .map_err(flash_err)?;
+                self.lse
+                    .set(lse)
+                    .map_err(|e| saved_err(FUSED_ROPE_OP_NAME, e))?;
+                Ok((CudaStorage::wrap_cuda_slice(o, device), out_shape))
+            }
+            other => Err(Error::UnsupportedDTypeForOp(other, FUSED_ROPE_OP_NAME)),
+        }
     }
 
     /// Recomputes the rotation from the (already-alive) `qkv`/`cos`/`sin`
@@ -707,7 +835,7 @@ pub fn flash_attention_varlen_with_rope(
 /// `lengths.len()` variable-length segments (no padding), never a padded
 /// `[batch, seq]` grid. `cu_seqlens` (the FFI's own varlen geometry) and
 /// the per-row rotation table are BOTH derived from this ONE `lengths`
-/// slice — see [`crate::ops::rope_positions`]'s module doc, "The ragged
+/// slice — see `crate::ops::rope_positions`'s module doc, "The ragged
 /// arm" section, for why that makes a table/segmentation mismatch (the
 /// two-op composition's own hazard this type's doc names) structurally
 /// unconstructible for THIS function specifically: there is exactly one
@@ -721,9 +849,9 @@ pub fn flash_attention_varlen_with_rope(
 /// `cos_base`/`sin_base`: the SAME base-table convention
 /// [`super::RopePositionsFused::new`]'s dense arm accepts (`[period_base,
 /// d]`, any leading dims of size 1) — gathered INTERNALLY, via
-/// [`crate::ops::rope_positions::gather_ragged_tables`], into the `[total,
+/// `crate::ops::rope_positions::gather_ragged_tables`, into the `[total,
 /// d]` tables this op's own `CustomOp3` node is actually built over —
-/// exactly what [`crate::ops::rope_positions::rope_positions_fused_ragged`]
+/// exactly what [`super::rope_positions_fused_ragged`]
 /// (the CPU/eager entry) does, so the two entries share ONE gathering
 /// implementation rather than two. That SAME shared gather is called
 /// BEFORE `CuSeqlens::from_lengths` below (not after) specifically so a
@@ -772,7 +900,7 @@ pub fn flash_attention_varlen_with_rope_ragged(
 /// function above, which leaves `bwd_cfg_override` `None`). Identical to
 /// [`flash_attention_varlen_with_rope`] except the FORWARD launch uses
 /// `fwd_cfg` and the BACKWARD launch uses a DIFFERENT config, `bwd_cfg` —
-/// [`FlashVarlenAttentionFusedRope`]'s own `bwd_cfg_override` field, which
+/// `FlashVarlenAttentionFusedRope`'s own `bwd_cfg_override` field, which
 /// production construction never sets. This exists because a
 /// backward-only defect in the window radius (or any other `VarlenConfig`
 /// field) cannot be modelled by crafting a different INPUT tensor the way
@@ -1125,6 +1253,18 @@ mod tests {
         assert_eq!(num_heads, 4);
     }
 
+    /// Campaign #443 D2: the op's domain widened from BF16-only to
+    /// `{BF16, F16}` — this cell pins that F16 is accepted, not merely
+    /// that BF16 still is (a regression here would silently narrow the
+    /// domain back without any other test noticing, since every OTHER
+    /// cell in this module only exercises BF16).
+    #[test]
+    fn check_qkv_domain_accepts_f16() {
+        let (total_q, num_heads) = check_qkv_domain(&OK_DIMS, DType::F16).unwrap();
+        assert_eq!(total_q, 21);
+        assert_eq!(num_heads, 4);
+    }
+
     #[test]
     fn check_qkv_domain_refuses_wrong_rank_alone() {
         // Rank 3 (missing the `3` axis) — dims[1]/dims[3] positions shift,
@@ -1160,7 +1300,7 @@ mod tests {
     }
 
     #[test]
-    fn check_qkv_domain_refuses_non_bf16_with_shape_otherwise_correct() {
+    fn check_qkv_domain_refuses_dtype_outside_bf16_f16_with_shape_otherwise_correct() {
         let e = check_qkv_domain(&OK_DIMS, DType::F32).unwrap_err();
         assert!(
             matches!(e, Error::UnsupportedDTypeForOp(DType::F32, OP_NAME)),
@@ -1173,6 +1313,13 @@ mod tests {
     #[test]
     fn check_o_domain_accepts_the_canonical_shape() {
         check_o_domain(&OK_O_DIMS, DType::BF16, 21, 4).unwrap();
+    }
+
+    /// Campaign #443 D2 — same widening as `check_qkv_domain_accepts_f16`,
+    /// on `o`/`d_o`'s own domain check.
+    #[test]
+    fn check_o_domain_accepts_f16() {
+        check_o_domain(&OK_O_DIMS, DType::F16, 21, 4).unwrap();
     }
 
     #[test]
@@ -1204,7 +1351,7 @@ mod tests {
     }
 
     #[test]
-    fn check_o_domain_refuses_non_bf16_with_shape_otherwise_correct() {
+    fn check_o_domain_refuses_dtype_outside_bf16_f16_with_shape_otherwise_correct() {
         let e = check_o_domain(&OK_O_DIMS, DType::F32, 21, 4).unwrap_err();
         assert!(
             matches!(e, Error::UnsupportedDTypeForOp(DType::F32, OP_NAME)),

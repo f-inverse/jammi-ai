@@ -197,6 +197,20 @@ cuda = [
     "jammi-kernels/cuda",
 ]
 metal = ["local", "candle-core/metal", "candle-nn/metal"]
+# Forwards to `jammi-encoders`'s and `jammi-kernels`'s own `flash-attn`
+# features — one link of the declared 1:1 chain
+# `jammi-server`/`jammi-bench` -> `jammi-ai` -> `{jammi-encoders,jammi-kernels}`
+# -> `jammi-kernels/flash-attn` that `ci/scripts/check_flash_attn_closure.py`
+# walks and asserts. DEPENDS on `cuda` (both forwarded features themselves
+# depend on `cuda`) but is NEVER implied by it: `cuda` alone must never reach
+# `jammi-kernels/flash-attn` — that is the closure gate's core invariant.
+# `jammi-kernels/flash-attn` is listed explicitly (not left to the transitive
+# `jammi-encoders/flash-attn` edge alone) because `fine_tune::adamw::AdamW`
+# and the direct `jammi-kernels` dependency this crate already carries under
+# `local` may reach flash types without going through `jammi-encoders` at
+# all — the same "explicit direct entry, not only transitive" precedent the
+# `cuda` feature above already documents for `jammi-kernels/cuda`.
+flash-attn = ["cuda", "jammi-encoders/flash-attn", "jammi-kernels/flash-attn"]
 
 # The `it` integration suite drives the embedded engine end-to-end (model loading,
 # inference, fine-tune, search), so it requires the `local` feature. Declaring the

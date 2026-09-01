@@ -206,7 +206,9 @@ pub(crate) static SOFTMAX_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters>
 /// The fused masked-softmax kernel's domain, checked at the call site
 /// (family D / K2): `scores`'s device is one
 /// [`jammi_kernels::admission::device_is_supported`] accepts, `scores`/`mask`
-/// share a dtype the kernel implements (F32 or BF16), BOTH `scores` and
+/// share a dtype the kernel implements (F32, BF16, or F16 — F16 widened in
+/// campaign #443 W2b, see [`softmax_admission_predicate`]'s own dtype
+/// check below for the compiled-arm citation), BOTH `scores` and
 /// `mask` are contiguous (`SoftmaxLastDimFused` refuses a strided view for
 /// EITHER argument — see its module doc; an earlier version of this
 /// predicate checked only `mask`, asymmetrically, an audit finding
@@ -260,8 +262,16 @@ fn softmax_admission_predicate(
     if !device_is_supported(scores.device()) {
         return (false, "device_is_cpu_or_cuda");
     }
-    if scores.dtype() != mask.dtype() || !matches!(scores.dtype(), DType::F32 | DType::BF16) {
-        return (false, "dtype_f32_or_bf16_matching_between_scores_and_mask");
+    // F32/BF16/F16 — F16 widened in campaign #443 W2b, exactly where
+    // `jammi_kernels::cuda::softmax` gained a compiled F16 dispatch arm
+    // backed by the SEPARATE `cuda/softmax_f16.cu` translation unit.
+    if scores.dtype() != mask.dtype()
+        || !matches!(scores.dtype(), DType::F32 | DType::BF16 | DType::F16)
+    {
+        return (
+            false,
+            "dtype_f32_bf16_or_f16_matching_between_scores_and_mask",
+        );
     }
     if !scores.is_contiguous() {
         return (false, "scores_contiguous");
@@ -631,11 +641,14 @@ fn rope_admission_predicate(
     if !device_is_supported(x_device) {
         return (false, "device_is_cpu_or_cuda");
     }
+    // F32/BF16/F16 — F16 widened in campaign #443 W2b, exactly where
+    // `jammi_kernels::cuda::rope` gained a compiled F16 dispatch arm
+    // backed by the SEPARATE `cuda/rope_f16.cu` translation unit.
     if x_dtype != cos.dtype()
         || x_dtype != sin.dtype()
-        || !matches!(x_dtype, DType::F32 | DType::BF16)
+        || !matches!(x_dtype, DType::F32 | DType::BF16 | DType::F16)
     {
-        return (false, "dtype_f32_or_bf16_matching_between_x_cos_sin");
+        return (false, "dtype_f32_bf16_or_f16_matching_between_x_cos_sin");
     }
     if !cos.is_contiguous() || !sin.is_contiguous() {
         return (false, "cos_sin_contiguous");
@@ -693,11 +706,13 @@ pub(crate) static ATTENTION_BLOCK_DISPATCH_COUNTERS: LazyLock<&'static DispatchC
 /// plan's OQ ruling, advisories: this op is stock-op composition,
 /// arch-agnostic PTX-forward, not a kernel tuned to one SM target).
 ///
-/// **`dtype` gate, PER-DEVICE-HONEST (adversarial audit round 3, F2 fix):**
-/// the op's own domain is dtype-split by device — `F32`-only on CPU
-/// (`cpu_fwd`'s own module doc, candle-core 0.11's CPU backend has no
-/// `BF16` `MatMul`), `F32` OR `BF16` on CUDA (`cuda_fwd`'s own module doc).
-/// An earlier revision had NO dtype gate here at all — the op's own
+/// **`dtype` gate, PER-DEVICE-HONEST (adversarial audit round 3, F2 fix;
+/// widened to `F16` on CUDA by campaign #443 D1):** the op's own domain is
+/// dtype-split by device — `F32`-only on CPU (`cpu_fwd`'s own module doc,
+/// candle-core 0.11's CPU backend has no `BF16`/`F16` `MatMul`), `F32`,
+/// `BF16`, OR `F16` on CUDA (`cuda_fwd`'s own module doc — `F16` upcasts to
+/// `f32` at the boundary on the SAME mechanism `BF16` already used, no new
+/// `.cu` kernel). An earlier revision had NO dtype gate here at all — the op's own
 /// `UnsupportedDTypeForOp` refusal was the only thing standing between an
 /// `F16` (or any other unsupported dtype) long-seq forward and a hard
 /// error, and by the time that refusal fired, `ModernBert::
@@ -734,8 +749,17 @@ fn mem_efficient_attention_predicate(
     if !device_is_supported(device) {
         return (PredicateOutcome::CapabilityMiss, "device_is_cpu_or_cuda");
     }
+    // campaign #443 D1: `F16` joins `BF16` on the CUDA side —
+    // [`jammi_kernels::ops::MemEfficientAttention`]'s own `cuda_fwd` gate
+    // now admits it too (that op's module doc's "Rounding contract"
+    // section: `F16` upcasts to `f32` once, at the boundary, the SAME
+    // mechanism `BF16` already used — no new `.cu` kernel, so this
+    // predicate's domain follows the op's own, not a build-time capability
+    // this crate would need to detect separately). The CPU side is
+    // UNCHANGED: candle-core 0.11's CPU backend has no `BF16`/`F16` `MatMul`
+    // impl, so `cpu_fwd` still refuses both.
     let dtype_ok = if device.is_cuda() {
-        matches!(dtype, DType::F32 | DType::BF16)
+        matches!(dtype, DType::F32 | DType::BF16 | DType::F16)
     } else {
         matches!(dtype, DType::F32)
     };
@@ -743,7 +767,7 @@ fn mem_efficient_attention_predicate(
         return (
             PredicateOutcome::DomainMiss,
             if device.is_cuda() {
-                "dtype_f32_or_bf16_on_cuda"
+                "dtype_f32_bf16_or_f16_on_cuda"
             } else {
                 "dtype_f32_only_on_cpu"
             },
@@ -780,7 +804,10 @@ fn mem_efficient_attention_predicate(
 /// The fused whole-attention-block kernel's domain, checked at the call
 /// site (family D / K2): `qkv`'s device is one
 /// [`jammi_kernels::admission::device_is_supported`] accepts, `qkv`/`extended_mask`
-/// share a dtype the kernel implements (F32 or BF16), `qkv` is contiguous
+/// share a dtype the kernel implements PER-DEVICE (`F32` on either device;
+/// `BF16` or `F16` admitted ONLY on CUDA — F16 widened in campaign #443 D1,
+/// see the dtype check below for the composed-sub-kernel citation and the
+/// CPU-refusal regression this device split closes), `qkv` is contiguous
 /// (the free reshape from `Wqkv`'s own output — `AttentionBlockFused`
 /// refuses a strided `qkv`, same idiom as every other op in this crate),
 /// `head_dim` is exactly [`ATTENTION_BLOCK_HEAD_DIM`] (`AttentionBlockFused`'s
@@ -815,8 +842,42 @@ fn attention_block_admission_predicate(
     if !device_is_supported(qkv.device()) {
         return (false, "device_is_cpu_or_cuda");
     }
-    if qkv.dtype() != extended_mask.dtype() || !matches!(qkv.dtype(), DType::F32 | DType::BF16) {
-        return (false, "dtype_f32_or_bf16_matching_between_qkv_and_mask");
+    // campaign #443 D1, PER-DEVICE-HONEST (round-2 audit F1 fix): `F16`
+    // joins `BF16` on CUDA ONLY — `AttentionBlockFused`'s own CUDA gate
+    // (`crate::cuda::attention_block::cuda_fwd`, in `jammi-kernels`) admits
+    // it on the same basis this composition owns no `.cu` kernel, so its
+    // domain follows its two composed sub-kernels' ([`RopeFused`],
+    // [`SoftmaxLastDimFused`]) real `F16` dispatch arms, all CUDA-only.
+    // `cpu_fwd` (same file, `jammi-kernels::ops::attention_block`) has NO
+    // `BF16`/`F16` match arm at all — it hard-errors with
+    // `UnsupportedDTypeForOp` on anything but `F32`. The D1 landing widened
+    // this check to `F32 | BF16 | F16` with no device split, which made the
+    // predicate `Holds` for CPU+F16 (`BF16` was already latent-broken the
+    // same way; `F16` is the one this crate's own dtype matrix now
+    // exercises) — the per-layer cascade would then dispatch the fused arm
+    // and the op's own refusal would fire AFTER `memeff_will_fire`'s
+    // once-per-forward suppression had already deleted the block/eager
+    // fallback's mask bundle, the exact `HARD-ERROR-where-eager-used-to-run`
+    // shape `mem_efficient_attention_predicate` above was fixed against.
+    // Device-split here the same way: `BF16`/`F16` admitted ONLY when
+    // `qkv.device().is_cuda()`; CPU stays `F32`-only, matching `cpu_fwd`'s
+    // real domain exactly.
+    let dtype_ok = if qkv.dtype() != extended_mask.dtype() {
+        false
+    } else if qkv.device().is_cuda() {
+        matches!(qkv.dtype(), DType::F32 | DType::BF16 | DType::F16)
+    } else {
+        matches!(qkv.dtype(), DType::F32)
+    };
+    if !dtype_ok {
+        return (
+            false,
+            if qkv.device().is_cuda() {
+                "dtype_f32_bf16_or_f16_matching_between_qkv_and_mask_on_cuda"
+            } else {
+                "dtype_f32_matching_between_qkv_and_mask_on_cpu"
+            },
+        );
     }
     if !qkv.is_contiguous() {
         return (false, "qkv_contiguous");
@@ -1828,7 +1889,8 @@ pub(crate) static GEGLU_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
 
 /// The fused GeGLU kernel's domain, checked at the call site (family D /
 /// K2): `wi_out`'s device is one [`jammi_kernels::admission::device_is_supported`]
-/// accepts, its dtype is one the kernel implements (F32 or BF16),
+/// accepts, its dtype is one the kernel implements (F32, BF16, or F16 — F16
+/// widened in campaign #443 W2b, see the dtype check below),
 /// `wi_out` is contiguous ([`jammi_kernels::ops::GegluFused`] refuses a
 /// strided view — see its module doc), and its last dimension is nonzero
 /// and even (the op splits it into two equal `gate`/`up` halves; an odd
@@ -1839,8 +1901,11 @@ fn geglu_admission_predicate(wi_out: &Tensor) -> (bool, &'static str) {
     if !device_is_supported(wi_out.device()) {
         return (false, "device_is_cpu_or_cuda");
     }
-    if !matches!(wi_out.dtype(), DType::F32 | DType::BF16) {
-        return (false, "dtype_f32_or_bf16");
+    // F32/BF16/F16 — F16 widened in campaign #443 W2b, exactly where
+    // `jammi_kernels::cuda::geglu` gained a compiled F16 dispatch arm
+    // backed by the SEPARATE `cuda/geglu_f16.cu` translation unit.
+    if !matches!(wi_out.dtype(), DType::F32 | DType::BF16 | DType::F16) {
+        return (false, "dtype_f32_bf16_or_f16");
     }
     if !wi_out.is_contiguous() {
         return (false, "wi_out_contiguous");
@@ -2268,7 +2333,13 @@ fn compute_lengths_and_prefix(mask: &Tensor) -> Result<(Vec<usize>, bool), Encod
 /// The flash cascade's own admission predicate (contract v4 §3.2's
 /// consulted terms): device is CUDA and arch is a MEMBER of
 /// `jammi_kernels::admission::flash_validated_arches()` ([`flash_arch_ok`]),
-/// backbone dtype `BF16`, `head_dim ==
+/// backbone dtype `BF16` or `F16` (campaign #443 D2 — `jammi-kernels`'
+/// `build.rs` compiles BOTH dtype pairs of the vendored flash kernel
+/// unconditionally whenever `flash-attn` is on, so there is no
+/// third, narrower "F16 specifically compiled" flag to gate on separately
+/// from [`jammi_kernels::admission::FLASH_COMPILED`] — see
+/// [`flash_capability_gates`]'s own dtype check for the compiled-TU
+/// citation), `head_dim ==
 /// `[`FLASH_HEAD_DIM`]``, `flash-attn` compiled (`cfg!` TERM — L10, a
 /// [`PredicateOutcome::CapabilityMiss`], never `#[cfg]` on the call site),
 /// and the batch's mask is a prefix mask with every row length `>= 1`
@@ -2303,12 +2374,19 @@ fn flash_admission_predicate(
     trusted_lengths: Option<&[usize]>,
 ) -> FlashPredicateResult {
     // Reads `jammi_kernels::admission::FLASH_COMPILED` (contract v5 item 2)
-    // rather than a LOCAL `cfg!(feature = "flash-attn")`: this crate's own
-    // `flash-attn` feature is not yet forwarded any further up the stack
-    // (`jammi-ai`/`jammi-bench` do not request it), and — because
-    // `jammi_kernels::flash` is itself `#[cfg(feature = "flash-attn")]`-gated
-    // — a call site can never "stay compiled" behind a bare `cfg!()` bool if
-    // reaching the `true` branch would need to NAME a type from that module.
+    // rather than a LOCAL `cfg!(feature = "flash-attn")`: because
+    // `jammi_kernels::flash` is itself `#[cfg(feature = "flash-attn")]`-gated,
+    // a call site can never "stay compiled" behind a bare `cfg!()` bool if
+    // reaching the `true` branch would need to NAME a type from that module —
+    // this is true regardless of how far up the stack the feature is
+    // forwarded. (Campaign #443 W1 DID add `flash-attn` forwarding through
+    // `jammi-ai`/`jammi-bench`/`jammi-server` — `jammi-ai/Cargo.toml`'s own
+    // `flash-attn = ["cuda", "jammi-encoders/flash-attn",
+    // "jammi-kernels/flash-attn"]` and the by-name passthroughs in
+    // `jammi-bench`/`jammi-server`'s own manifests — so any consumer can now
+    // opt in; that forwarding is orthogonal to why THIS function reads
+    // `FLASH_COMPILED` rather than a local `cfg!()`, which is the
+    // name-a-gated-type constraint above, not an absence of forwarding.)
     // `FLASH_COMPILED` is exactly the escape hatch: a plain, unconditionally-
     // compiled `bool` reflecting how `jammi-kernels` itself was actually
     // built, readable regardless of whether THIS crate's own feature flag is
@@ -2359,8 +2437,18 @@ fn flash_capability_gates(
             None,
         ));
     }
-    if dtype != DType::BF16 {
-        return Some((PredicateOutcome::DomainMiss, "dtype_is_bf16", None));
+    // Campaign #443 D2: `F16` joins `BF16`. `jammi-kernels`' `build.rs`
+    // compiles BOTH dtype pairs of the vendored flash kernel
+    // (`flash_{fwd,bwd}_hdim64_{bf16,fp16}_sm80.cu`) unconditionally
+    // whenever `flash-attn` is on — there is no scenario where
+    // `FLASH_COMPILED` is `true` but only one of the two dtypes' TUs
+    // exist, so `feature_compiled` (already gated above) is the ONLY
+    // compiled-ness question this predicate needs to ask; the reason key
+    // is renamed from the old `dtype_is_bf16` to name the real (now
+    // two-member) domain honestly rather than leaving a stale singular
+    // name on a widened check.
+    if !matches!(dtype, DType::BF16 | DType::F16) {
+        return Some((PredicateOutcome::DomainMiss, "dtype_is_bf16_or_f16", None));
     }
     if head_dim != FLASH_HEAD_DIM {
         return Some((
@@ -3582,7 +3670,8 @@ mod tests {
     /// UNREACHABLE on `Device::Cpu` (this crate's test suite has no CUDA
     /// device) — this test is a hermetic placeholder honestly documenting
     /// that gap, not a real coverage claim: the arch/dtype/head_dim gates
-    /// (`flash_arch_ok`'s call site, `dtype != DType::BF16`, `head_dim !=
+    /// (`flash_arch_ok`'s call site, `!matches!(dtype, DType::BF16 |
+    /// DType::F16)`, `head_dim !=
     /// FLASH_HEAD_DIM`) can only be exercised with `device.is_cuda() ==
     /// true`, which requires an actual CUDA device this environment does
     /// not have. `flash_arch_ok`'s OWN internal set-membership check IS
@@ -3595,6 +3684,50 @@ mod tests {
     fn flash_capability_gates_arch_dtype_head_dim_gates_are_untestable_without_cuda() {
         // Documents the gap; asserts nothing about the untestable branches.
         assert!(!Device::Cpu.is_cuda());
+    }
+
+    /// Campaign #443 D2's own real-CUDA closure of the gap the previous
+    /// test names: on an actual, arch-validated CUDA device, `F16` must
+    /// clear the dtype gate exactly like `BF16` does (the widening this
+    /// round made), and a dtype genuinely outside the compiled set (`F32`)
+    /// must still miss it, under the RENAMED reason key
+    /// (`dtype_is_bf16_or_f16`, not the stale singular `dtype_is_bf16`).
+    /// Requires `--features cuda` (and, to reach a real `Holds`/pass-through
+    /// rather than an early `arch_in_flash_validated_set` skip, an actual
+    /// Ampere-or-newer device) — `JAMMI_REQUIRE_CUDA=1` turns a missing
+    /// device into a hard failure rather than a silent skip, matching every
+    /// other CUDA-gated test in this module.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn flash_capability_gates_admits_f16_alongside_bf16_on_real_cuda_arch_and_head_dim() {
+        let Some(device) = growth_oracle_cuda_device() else {
+            return;
+        };
+        if !flash_arch_ok(&device) {
+            flash_arch_gate(
+                "flash_capability_gates_admits_f16_alongside_bf16_on_real_cuda_arch_and_head_dim",
+            );
+            eprintln!(
+                "flash_capability_gates_admits_f16_alongside_bf16_on_real_cuda_arch_and_head_dim: \
+                 skipping -- this device's arch is not in flash_validated_arches()"
+            );
+            return;
+        }
+        for dtype in [DType::BF16, DType::F16] {
+            let miss = flash_capability_gates(true, &device, dtype, FLASH_HEAD_DIM);
+            assert_eq!(
+                miss, None,
+                "{dtype:?} must clear every capability/domain gate on a real, arch-validated \
+                 CUDA device -- got a miss: {miss:?}"
+            );
+        }
+        let miss = flash_capability_gates(true, &device, DType::F32, FLASH_HEAD_DIM);
+        assert_eq!(
+            miss,
+            Some((PredicateOutcome::DomainMiss, "dtype_is_bf16_or_f16", None)),
+            "a dtype outside the compiled {{BF16, F16}} set must still miss, under the renamed \
+             reason key"
+        );
     }
 
     /// Path P (contract v4 §3.7, v5 item 3, UPGRADED by M1b audit finding
@@ -5768,6 +5901,22 @@ mod tests {
     /// suite (the pod lane) must not silently read a missing
     /// `JAMMI_FLASH_ORACLE_MODEL_DIR` as green.
     #[cfg(feature = "cuda")]
+    /// KO-7 require-gate for an arch-conditioned flash skip (registered in
+    /// `ci/kernel-oracle-helpers.txt`): under `JAMMI_REQUIRE_CUDA` a device
+    /// whose arch is outside `flash_validated_arches()` must FAIL the test
+    /// loudly, never skip it silently — the prove lanes pin exactly the
+    /// validated arches, so a skip there is a wrong pod, not a soft pass.
+    #[cfg(feature = "cuda")]
+    fn flash_arch_gate(test_name: &str) {
+        if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
+            panic!(
+                "{test_name}: JAMMI_REQUIRE_CUDA is set but this device's arch is not in \
+                 flash_validated_arches() — a silent arch skip is not acceptable on a prove lane"
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
     fn flash_oracle_require_gate(test_name: &str) {
         if std::env::var_os("JAMMI_REQUIRE_FLASH_ORACLE").is_some() {
             panic!(
@@ -7792,6 +7941,21 @@ mod tests {
         assert_eq!(predicate, "head_dim_even_and_nonzero");
     }
 
+    /// The domain-widening PROOF (K2): F16 `x`/`cos`/`sin` must now HOLD —
+    /// campaign #443 W2b's CUDA F16 dispatch arm
+    /// (`jammi_kernels::cuda::rope`'s `DType::F16` arm) is what makes this
+    /// widening sound; before that arm existed, F16 was correctly refused
+    /// here (`dtype_f32_bf16_or_f16_matching_between_x_cos_sin`, née
+    /// `dtype_f32_or_bf16_matching_between_x_cos_sin`).
+    #[test]
+    fn rope_admission_predicate_now_accepts_f16() {
+        let device = Device::Cpu;
+        let cos = Tensor::from_slice(&[f16::from_f32(1.0); 8], (1, 1, 1, 8), &device).unwrap();
+        let sin = Tensor::from_slice(&[f16::from_f32(0.0); 8], (1, 1, 1, 8), &device).unwrap();
+        let (holds, predicate) = rope_admission_predicate(DType::F16, &device, &cos, &sin, 8);
+        assert!(holds, "matching F16 x/cos/sin must now hold: {predicate}");
+    }
+
     /// The eval-path bit-identity requirement, mirroring
     /// `crate::layer_norm`'s identical test: a `training == false` RoPE
     /// application must be UNCHANGED by `apply_training`'s existence, on
@@ -7941,8 +8105,22 @@ mod tests {
         assert!(!holds, "dtype mismatch must be refused");
         assert_eq!(
             predicate,
-            "dtype_f32_or_bf16_matching_between_scores_and_mask"
+            "dtype_f32_bf16_or_f16_matching_between_scores_and_mask"
         );
+    }
+
+    /// The domain-widening PROOF (K2): matching F16 `scores`/`mask` must
+    /// now HOLD — campaign #443 W2b's CUDA F16 dispatch arm
+    /// (`jammi_kernels::cuda::softmax`'s `(DType::F16, DType::F16)` arm)
+    /// is what makes this widening sound; before that arm existed, F16
+    /// was correctly refused here.
+    #[test]
+    fn softmax_admission_predicate_now_accepts_matching_f16() {
+        let device = Device::Cpu;
+        let scores = Tensor::from_slice(&[f16::from_f32(0.0); 4], (1, 1, 1, 4), &device).unwrap();
+        let mask = Tensor::from_slice(&[f16::from_f32(0.0); 4], (1, 1, 1, 4), &device).unwrap();
+        let (holds, predicate) = softmax_admission_predicate(&scores, &mask, 1.0);
+        assert!(holds, "matching F16 scores/mask must now hold: {predicate}");
     }
 
     /// A `last` (softmax reduction axis) size beyond `MAX_LAST_DIM` is
@@ -8513,6 +8691,19 @@ mod tests {
         assert_eq!(predicate, "last_dim_nonzero_and_even");
     }
 
+    /// The domain-widening PROOF (K2): an F16 `wi_out` must now HOLD —
+    /// campaign #443 W2b's CUDA F16 dispatch arm
+    /// (`jammi_kernels::cuda::geglu`'s `DType::F16` arms) is what makes
+    /// this widening sound; before that arm existed, F16 was correctly
+    /// refused here (`dtype_f32_bf16_or_f16`, née `dtype_f32_or_bf16`).
+    #[test]
+    fn geglu_admission_predicate_now_accepts_f16() {
+        let device = Device::Cpu;
+        let wi_out = Tensor::from_slice(&[f16::from_f32(0.0); 2 * 8], (1, 2, 8), &device).unwrap();
+        let (holds, predicate) = geglu_admission_predicate(&wi_out);
+        assert!(holds, "F16 wi_out must now be admitted: {predicate}");
+    }
+
     /// The eval-path bit-identity requirement, mirroring
     /// `eval_mode_attention_softmax_is_bit_identical_regardless_of_fused_
     /// eligibility`: `ModernBertMlp::forward`'s `training == false` arm
@@ -8797,6 +8988,136 @@ mod tests {
         let (holds, predicate) =
             attention_block_admission_predicate(&qkv, s, h, d, &mask, false, None);
         assert!(holds, "global: predicate={predicate}");
+    }
+
+    /// Round-2 adversarial audit F1 fix, PER-DEVICE-HONEST dtype gate
+    /// (mirrors `mem_efficient_attention_predicate_dtype_gate_is_per_device_honest`
+    /// exactly): campaign #443 D1 widened this predicate's dtype match to
+    /// `F32 | BF16 | F16` with NO device split, which made it claim `Holds`
+    /// for CPU+F16 (and CPU+BF16) even though `AttentionBlockFused::cpu_fwd`
+    /// (`jammi_kernels::ops::attention_block`) has no `BF16`/`F16` `MatMul`
+    /// arm at all and hard-errors with `UnsupportedDTypeForOp`. On CPU only
+    /// `F32` may hold; on CUDA `F32`, `BF16`, and `F16` all hold (the real
+    /// domain the composed `RopeFused`/`SoftmaxLastDimFused` sub-kernels
+    /// implement there).
+    #[test]
+    fn attention_block_admission_predicate_dtype_gate_is_per_device_honest() {
+        let device = Device::Cpu;
+        let (b, s, h, d) = (1usize, 4usize, 2usize, ATTENTION_BLOCK_HEAD_DIM);
+        let mask = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
+
+        let qkv_f16 = Tensor::zeros((b, s, 3, h, d), DType::F16, &device).unwrap();
+        let mask_f16 = mask.to_dtype(DType::F16).unwrap();
+        let (holds, predicate) =
+            attention_block_admission_predicate(&qkv_f16, s, h, d, &mask_f16, false, None);
+        assert!(
+            !holds,
+            "F16 must NOT hold on CPU -- cpu_fwd has no F16 MatMul arm"
+        );
+        assert_eq!(predicate, "dtype_f32_matching_between_qkv_and_mask_on_cpu");
+
+        let qkv_bf16 = Tensor::zeros((b, s, 3, h, d), DType::BF16, &device).unwrap();
+        let mask_bf16 = mask.to_dtype(DType::BF16).unwrap();
+        let (holds, predicate) =
+            attention_block_admission_predicate(&qkv_bf16, s, h, d, &mask_bf16, false, None);
+        assert!(
+            !holds,
+            "BF16 must NOT hold on CPU either, same reason as F16"
+        );
+        assert_eq!(predicate, "dtype_f32_matching_between_qkv_and_mask_on_cpu");
+
+        // F32 on CPU still admits (sanity: the dtype gate must not be
+        // over-broad and refuse the domain-valid case too).
+        let qkv_f32 = Tensor::zeros((b, s, 3, h, d), DType::F32, &device).unwrap();
+        let (holds, _) = attention_block_admission_predicate(&qkv_f32, s, h, d, &mask, false, None);
+        assert!(holds, "F32 on CPU must still hold");
+    }
+
+    /// F1's end-to-end proof (adversarial audit round 2): before this
+    /// predicate's dtype gate was device-split, campaign #443 D1's
+    /// undifferentiated `F32 | BF16 | F16` widening made this predicate
+    /// claim `Holds` for a CPU+F16 forward at a shape (short `seq`, `d ==
+    /// ATTENTION_BLOCK_HEAD_DIM`) that would otherwise dispatch the fused
+    /// block arm -- `admit()` would then dispatch `Fused`,
+    /// `AttentionBlockFused::cpu_fwd` would hard-error with
+    /// `UnsupportedDTypeForOp`, and a CPU+F16 training forward that used to
+    /// run eager (this crate's own pre-D1 baseline) would regress to an
+    /// unconditional hard error. Proves the fix restores that baseline:
+    /// the block arm's own dispatch counter is unchanged (never consulted
+    /// as `Fused`) and the forward completes via the eager composition
+    /// with a finite, correctly-shaped, still-F16 output.
+    #[test]
+    fn attention_block_f16_cpu_forward_falls_through_to_eager_without_error() {
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let (b, s, h, d) = (1usize, 4usize, 2usize, ATTENTION_BLOCK_HEAD_DIM);
+        let n = b * s * 3 * h * d;
+        let qkv_v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.031).sin() * 0.1).collect();
+        let qkv = Tensor::from_vec(qkv_v, (b, s, 3 * h * d), &device)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
+        let mask = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
+        let fused = FusedAttentionMasks::build(&mask, None, DType::F16).unwrap();
+
+        let attn = attention_block_fixture(false, h, s, &device);
+        // Round-3 audit advisory: pass `fused.global` (F16, matching `qkv`),
+        // not the F32 `mask` built above -- an F32 mask against an F16
+        // `qkv` would decline via the dtype-MISMATCH arm regardless of
+        // device, which proves nothing about the device-split CPU refusal
+        // this test exists to exercise. `fused.global` is `mask` cast to
+        // the backbone dtype (`FusedAttentionMasks::build`'s own contract),
+        // so this call now genuinely reaches, and declines via, the
+        // CPU+F16 arm.
+        let (holds, predicate) =
+            attention_block_admission_predicate(&qkv, s, h, d, &fused.global, false, None);
+        assert!(!holds, "F16 on CPU must decline: predicate={predicate}");
+        assert_eq!(
+            predicate, "dtype_f32_matching_between_qkv_and_mask_on_cpu",
+            "must decline via the CPU+F16 device-split arm specifically, not a dtype mismatch"
+        );
+
+        let block_before = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+        let out = attn
+            .forward_training_attention(
+                &qkv,
+                b,
+                s,
+                h,
+                d,
+                TrainingMaskInputs {
+                    extended: &mask,
+                    local_band: None,
+                    fused: Some(&fused),
+                },
+                &declined_flash(),
+            )
+            .expect(
+                "CPU+F16 must fall through the block arm (dtype decline) to the eager \
+                 composition, never error -- this is the base behaviour the device-split dtype \
+                 gate must restore",
+            );
+        let block_after = ATTENTION_BLOCK_DISPATCH_COUNTERS.snapshot();
+
+        assert_eq!(out.dims(), &[b, s, h * d]);
+        assert_eq!(out.dtype(), DType::F16);
+        let v: Vec<f32> = out
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert!(
+            v.iter().all(|x| x.is_finite()),
+            "every output element must be finite"
+        );
+        assert_eq!(
+            block_after.fused, block_before.fused,
+            "the block arm must never dispatch fused for a dtype cpu_fwd cannot serve"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────

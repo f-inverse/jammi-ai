@@ -41,6 +41,17 @@ use jammi_kernels::flash::{
     VarlenConfig, VarlenGeometry, HEAD_DIM,
 };
 
+/// Mirrors `crate::flash`'s private `JAMMI_FLASH_DTYPE_BF16` constant
+/// (campaign #443 D2's `raw::FwdArgs`/`raw::BwdArgs::dtype` field: `0` =
+/// bf16, `1` = fp16) — duplicated here rather than imported because this
+/// file is a SEPARATE integration-test crate (`tests/`) and the source
+/// constant is crate-private by design (the C shim's own two valid values
+/// are an internal wiring detail, not a public API this test surface
+/// should depend on). Every buffer this file builds is `bf16`
+/// ([`RawBuffers`]'s own fields), so every raw-args literal below
+/// legitimately uses THIS value, never the fp16 one.
+const DTYPE_BF16: i32 = 0;
+
 fn cuda_device() -> Option<CudaDevice> {
     match Device::new_cuda(0) {
         Ok(d) => Some(d.as_cuda_device().unwrap().clone()),
@@ -853,6 +864,7 @@ fn valid_fwd_args(dev: &CudaDevice, b: &RawBuffers) -> raw::FwdArgs {
         window_size_right: 2,
         softmax_scale: SCALE,
         p_dropout: 0.0,
+        dtype: DTYPE_BF16,
     }
 }
 
@@ -888,6 +900,7 @@ fn valid_bwd_args(dev: &CudaDevice, b: &RawBuffers) -> raw::BwdArgs {
         p_dropout: 0.0,
         deterministic: 1,
         dq_accum_splits: b.scratch.splits as i32,
+        dtype: DTYPE_BF16,
     }
 }
 
@@ -1510,6 +1523,22 @@ fn abi_sizes_match_between_rust_and_c() {
     let bwd = unsafe { raw::jammi_flash_sizeof_bwd_args() };
     assert_eq!(fwd, std::mem::size_of::<raw::FwdArgs>());
     assert_eq!(bwd, std::mem::size_of::<raw::BwdArgs>());
-    assert_eq!(fwd, 112);
-    assert_eq!(bwd, 184);
+    // Campaign #443 D2 appended one `int32_t dtype` field to BOTH structs
+    // (`raw::FwdArgs`/`raw::BwdArgs`'s own doc: "MUST be the LAST field").
+    // Pre-D2 these pins were 112/184 (both structs' own field sum with no
+    // `dtype` at all, 8-byte-aligned throughout since every struct starts
+    // with pointers/i64 fields) — a stale literal left over from THAT
+    // widening (never updated to match the new field) is exactly the bug
+    // this test caught on a real pod run: the trailing `dtype: i32` adds 4
+    // bytes of data, and the struct's own 8-byte alignment (driven by its
+    // leading pointer/`i64` fields) then pads that up to the next multiple
+    // of 8 — `112 + 4 -> 116 -> 120` for `FwdArgs`, `184 + 4 -> 188 -> 192`
+    // for `BwdArgs`. These two literals are a REDUNDANT pin on top of the
+    // two `assert_eq!` calls above (which already prove Rust and C agree
+    // with EACH OTHER); they exist so a future field reordering or size
+    // change that moves BOTH sides identically (e.g. an accidental extra
+    // field added to both the header and `raw` in lockstep) still gets
+    // caught, not just a Rust/C divergence.
+    assert_eq!(fwd, 120);
+    assert_eq!(bwd, 192);
 }

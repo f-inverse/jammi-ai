@@ -393,7 +393,7 @@
 //! module doc's "Admission" section) is the layer responsible for keeping
 //! this real term bounded in production, not this op's own domain checks.
 //!
-//! ## Rounding contract (dtype-split; CPU is F32-only, CUDA admits BF16)
+//! ## Rounding contract (dtype-split; CPU is F32-only, CUDA admits BF16/F16)
 //!
 //! `F32` (this op's only CPU dtype, and `cuda_fwd`'s/`bwd`'s other admitted
 //! dtype): `f32` accumulation throughout — `scale` folded into `Q` once (a
@@ -405,8 +405,11 @@
 //! doctrine `softmax.cu`'s own module doc states does not apply here —
 //! stated as N/A, not silently omitted.
 //!
-//! `BF16` (the CUDA-arm-only concern — `cpu_fwd` refuses it, module doc's
-//! "CPU: `F32` only" section): NOT `softmax.cu`'s own per-fused-kernel
+//! `BF16`/`F16` (campaign #443 D1 widens this section's original `BF16`-only
+//! prose to both 16-bit dtypes — the mechanism below is dtype-generic, not
+//! specific to `BF16`'s mantissa; the CUDA-arm-only concern — `cpu_fwd`
+//! refuses both, module doc's "CPU: `F32` only" section): NOT `softmax.cu`'s
+//! own per-fused-kernel
 //! `bf16_mul_rounded`/`bf16_add_rounded` round-back granularity (that
 //! primitive pair governs a SINGLE fused kernel's internal rounding
 //! sites; this op is a multi-launch composition with no such kernel to
@@ -957,7 +960,17 @@ impl CustomOp3 for MemEfficientAttention {
                 op,
             });
         }
-        if !matches!(s1.dtype(), DType::F32 | DType::BF16) {
+        // campaign #443 D1: `F16` joins `BF16` on the SAME basis the module
+        // doc's "Rounding contract" section states for `BF16` — this op
+        // upcasts every operand to `f32` ONCE, immediately at the op
+        // boundary (`Tensor::to_dtype`, dtype-generic, no per-dtype kernel
+        // of its own to author), runs the whole online-softmax recurrence
+        // in `f32`, and rounds back exactly once at exit. That mechanism is
+        // identical for `F16` and `BF16` — the only thing that differs is
+        // how far the narrower mantissa is from `f32`'s, which is a
+        // TOLERANCE question for the oracles, not a domain question for
+        // this admission check.
+        if !matches!(s1.dtype(), DType::F32 | DType::BF16 | DType::F16) {
             return Err(Error::UnsupportedDTypeForOp(s1.dtype(), op));
         }
 
@@ -2032,6 +2045,38 @@ mod tests {
                 Error::UnsupportedDTypeForOp(candle_core::DType::BF16, _)
             ),
             "expected Error::UnsupportedDTypeForOp(BF16, _), got {err:?}"
+        );
+    }
+
+    /// `F16`'s own twin of [`bf16_is_refused_on_cpu`] (campaign #443 D1):
+    /// this op's CPU domain stays `F32`-only — the CUDA-side widening to
+    /// `F16` (module doc's "Rounding contract" section) has no CPU
+    /// counterpart, since candle-core 0.11's CPU backend has no `F16`
+    /// `MatMul` impl either, the SAME limitation `BF16` hits.
+    #[test]
+    fn f16_is_refused_on_cpu() {
+        use half::f16;
+        let device = Device::Cpu;
+        let (b, h, s, d) = (1usize, 1usize, 4usize, 4usize);
+        let qkv = Tensor::zeros((b, s, 3, h, d), candle_core::DType::F16, &device).unwrap();
+        let (cos, sin) = rope_tables(s, d, &device);
+        let (cos, sin) = (
+            cos.to_dtype(candle_core::DType::F16).unwrap(),
+            sin.to_dtype(candle_core::DType::F16).unwrap(),
+        );
+        let rope_pack = pack_rope(&cos, &sin).unwrap();
+        let mask =
+            Tensor::from_vec(vec![f16::from_f32(0.0); b * s], (b, 1, 1, s), &device).unwrap();
+        let op = MemEfficientAttention::new(0.5, FullyMaskedPolicy::Propagate, false, None, 512)
+            .unwrap();
+        let err =
+            apply_stateful3(&qkv, &rope_pack, &mask, op).expect_err("F16 must be refused on CPU");
+        assert!(
+            matches!(
+                err,
+                Error::UnsupportedDTypeForOp(candle_core::DType::F16, _)
+            ),
+            "expected Error::UnsupportedDTypeForOp(F16, _), got {err:?}"
         );
     }
 

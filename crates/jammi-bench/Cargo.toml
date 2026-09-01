@@ -64,3 +64,10 @@ hex.workspace = true
 # a real device. Off by default so the rest of the harness stays CPU-hermetic;
 # the GPU prove-lane builds with it.
 cuda = ["jammi-ai/cuda"]
+# By-name passthrough to `jammi-ai`'s own `flash-attn` feature. Needed so the
+# reporter-scenario producer (`jammi-bench finetune-run`) can compile the
+# fused f16/bf16 dispatch WITH FlashAttention-2 engaged for the reporter's
+# b16·s128 scenario — `ci/scripts/check_flash_attn_closure.py` exempts this
+# crate's `--all-features` selection on the same verified 1:1 idiom as
+# `jammi-encoders`'s own `flash-attn` entry.
+flash-attn = ["jammi-ai/flash-attn"]

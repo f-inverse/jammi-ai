@@ -106,6 +106,19 @@
 # acquire of the SAME flock from a child process — that would deadlock
 # against the parent that already holds it). `lock_held: true` is recorded
 # in the result JSON as a live witness, not merely asserted in a comment.
+#
+# esc-077 anti-jamming note: this producer's whole point is measuring a
+# genuinely COLD build against a genuinely CLONED one, so it must never be
+# subject to `gpu-dev.sh run`'s own seed-clone-marker preflight refusal —
+# and it is not, BY CONSTRUCTION, not by an override env var: this script
+# is run directly on the pod per the Usage line above (a maintainer's own
+# shell, or an interactive `gpu-dev.sh attach`), never as the <cmd...>
+# argument to `gpu-dev.sh run`. Both its clone leg ((ii), calling
+# `pod_target_clone.sh` directly) and its cold leg ((iv), `CARGO_TARGET_DIR=
+# "$COLD_DIR" cargo build ...` directly against a freshly `rm -rf && mkdir`'d
+# directory) invoke `pod_target_clone.sh`/`cargo build` themselves — neither
+# leg, nor this script as a whole, ever goes through the `run` verb, so
+# RP_ALLOW_COLD_TARGET has nothing to set here and nothing to bypass.
 set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

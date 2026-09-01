@@ -23,6 +23,16 @@
 
 pub mod admission;
 pub mod error;
+/// f16 oracle scaffolds (campaign #443, Part 3 / W2a's D4 deliverable):
+/// the shared BEHAVIORAL boundary-contract helpers (saturation at
+/// `F16_MAX`/`-F16_MAX`, underflow-to-zero, non-finite detection) and
+/// ULP-distance/derived-floor helpers every per-op f16 oracle W2b/W2c
+/// writes needs, so no op reinvents its own (and inevitably
+/// slightly-different) boundary logic. Public so both this crate's own
+/// unit tests and the integration suite under `tests/*.rs` can use it. See
+/// the module's own doc for why these are BEHAVIORAL assertions, never a
+/// tolerance-vs-finite-f32-reference comparison at the boundary.
+pub mod f16_oracle;
 mod layout_walk;
 pub mod ops;
 /// Philox4x32-10 (ported from Random123, BSD-3-Clause — see the module's

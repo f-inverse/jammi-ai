@@ -447,6 +447,21 @@ message TrainingStatusResponse {
   // field mirrors the catalog column's `NULL`/`NOT NULL`, never a decoded or
   // re-encoded value, so both transports serve byte-identical JSON text.
   optional string metrics_json = 4;
+  // GPU-acceleration determination for this job, as an opaque, self-describing
+  // JSON object — the SAME blob the catalog's `training_jobs.
+  // acceleration_report` column carries and the embedded surface's record
+  // read returns. Its schema is owned by the payload's producer (the engine
+  // at submission, the claiming worker once it runs), not enumerated on the
+  // wire: a `"state"` key is the discriminant callers switch on (e.g.
+  // `"pending"` before a determination exists, `"determined"` once one does),
+  // but the full vocabulary and its evolution live at the producer — mirroring
+  // `metrics_json`'s own schema-at-the-trainer deferral above, not a closed
+  // enum pinned here. Field presence (not the empty string) distinguishes "no
+  // column value" (a legacy row predating this column, `NULL`) from an
+  // already-recorded blob — this field mirrors the catalog column's
+  // `NULL`/`NOT NULL`, never a decoded or re-encoded value, so both
+  // transports serve byte-identical JSON text (esc-075).
+  optional string acceleration_report_json = 5;
 }
 
 message ListTrainingJobsRequest {}

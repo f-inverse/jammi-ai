@@ -44,7 +44,20 @@ pub(crate) fn cuda_fwd(
             op: op.name(),
         });
     }
-    if !matches!(s1.dtype(), DType::F32 | DType::BF16) {
+    // campaign #443 D1: `F16` joins `BF16`. `x`'s dtype (`s1`) reaches only
+    // two dtype-sensitive callees in this forward: `DropoutFused` (Step 3)
+    // is always called on `x32_storage` — Step 2's `to_dtype(F32)` runs
+    // UNCONDITIONALLY on every input dtype, so dropout itself never sees
+    // `x`'s own dtype, `F16` included, and needs no `F16` arm of its own
+    // for this call site — and `ScaledCastAdd`'s epilogue (Step 6), whose
+    // `base` operand IS `x`'s own dtype end-to-end (Step 1's `x @ w^T`
+    // GEMM output) and which now compiles real `(F16, F32)` combos
+    // (`scaled_cast_add_f16.cu`, campaign #443 W2c). Every other step
+    // (`matmul`, the two zero-copy `ab` narrows) is a candle generic
+    // storage op, dtype-generic on the CUDA backend — this file authors no
+    // `.cu` kernel of its own, so its dtype domain follows its callees',
+    // exactly as `crate::cuda::attention_block`'s own `F16` widening does.
+    if !matches!(s1.dtype(), DType::F32 | DType::BF16 | DType::F16) {
         return Err(Error::UnsupportedDTypeForOp(s1.dtype(), op.name()));
     }
     for (l, what) in [(l2, "w"), (l3, "ab")] {

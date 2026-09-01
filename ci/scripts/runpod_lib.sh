@@ -664,6 +664,102 @@ mkdir -p '${parent_dir}'
 EOF
 }
 
+# esc-077: the shell TEXT that classifies $1 (a CARGO_TARGET_DIR path, e.g.
+# TARGET_DIR from rp_target_dir) as MISSING, UNMARKED, or a genuine seed-clone
+# (OK) — `.jammi-clone-of-seed` is the marker `pod_target_clone.sh` stamps on
+# every successful clone. A plain function, not inlined by hand into
+# gpu-dev.sh's `run` heredoc, so it is directly testable: source this file,
+# call it with a real local directory, and run the printed text (`bash <
+# <(rp_target_preflight_lines "$dir")`) against real fixture directories —
+# no ssh, no pod, no mocking. Prints exactly one line,
+# `GPU_DEV_TARGET_STATE=<MISSING|UNMARKED|OK>`, so the caller's remote
+# execution of this same text (over `rp_run_remote`) is trivially parsed by
+# a `case` at the call site. $1=target_dir.
+rp_target_preflight_lines() {
+  local target_dir="${1:?rp_target_preflight_lines needs a target dir}"
+  cat <<EOF
+if [ ! -d '${target_dir}' ]; then
+  echo GPU_DEV_TARGET_STATE=MISSING
+elif [ ! -f '${target_dir}/.jammi-clone-of-seed' ]; then
+  echo GPU_DEV_TARGET_STATE=UNMARKED
+else
+  echo GPU_DEV_TARGET_STATE=OK
+fi
+EOF
+}
+
+# esc-077-class (one-pod-per-wave, WAVE-scoped): the shell TEXT that checks
+# whether this pod is genuinely BUSY with a DIFFERENT wave's job —
+# mechanizes the one-pod-per-wave norm (an operator kept re-learning it from
+# prose alone, the same class esc-077 fixed for cold builds), scoped to
+# WAVE rather than tree (operator-directed refinement: a tree-scoped gate
+# tripped a single wave against ITSELF the moment it used a second tree,
+# nudging per-agent renting where a wave's own sub-units could safely share
+# one warm seed). Two signals, tmux liveness PRIMARY:
+#   1. Is any OTHER jammi-* tmux JOB session alive at all (`jammi-seed`, the
+#      boot-time build-substrate seed, and this tree's OWN session are
+#      excluded — same exclusions as before)? If not, CLEAR — regardless of
+#      whatever `/root/.jammi-active-wave` happens to still say (a claim
+#      whose session already ended is definitionally stale: the wrapper
+#      that wrote it, rp_job_wrapper_with_marker_lines, removes it at BOTH
+#      of its own exit paths, so a leftover claim with no live session can
+#      only mean the wrapper's own cleanup was interrupted — SIGKILL/pod
+#      death — never a job that finished normally. Failing OPEN on that
+#      staleness, rather than refusing forever on an orphaned file, is the
+#      deliberate choice here: tmux's own liveness check is what actually
+#      answers "is the pod busy right now", and a stale claim answers
+#      nothing).
+#   2. Only if another session IS alive: read that claim's WAVE field. The
+#      SAME wave on a DIFFERENT tree is exactly the sanctioned shape (a
+#      wave's own sub-units sharing one pod) -> CLEAR; a DIFFERENT wave (or
+#      no readable claim at all, e.g. a job launched by tooling that
+#      predates this wave-scoping, or a session started outside `run`
+#      entirely) -> BUSY, failing CLOSED (the old tree-scoped behavior) on
+#      that ambiguity rather than guessing it is safe to share.
+# $1=this tree's own tmux session name (e.g. "jammi-mywork", TMUX_SESSION
+# at the call site) $2=this run's own wave id (WAVE at the call site,
+# defaults to the tree name — see gpu-dev.sh's own WAVE resolution). A
+# plain function, directly testable the same way rp_target_preflight_lines
+# is (source this file, run the printed text against a faked `tmux` +a
+# fixture `/root/.jammi-active-wave`-shaped file on PATH/disk — no ssh, no
+# pod). Prints exactly one line:
+#   GPU_DEV_CONCURRENCY_STATE=CLEAR
+#   GPU_DEV_CONCURRENCY_STATE=BUSY:<owning-wave-or-UNKNOWN>:<other-session>
+# NOTE on the heredoc body below: this is TEXT generated for REMOTE
+# execution, not this file's own bash — every escaped `\$` is deliberate
+# (it survives THIS function's own heredoc expansion unexpanded and
+# resolves only when the REMOTE shell runs it, same pattern as
+# rp_target_preflight_lines) — shellcheck's static parse of the heredoc
+# body cannot know that and reads an escaped form used in a `-n`/`-z` test
+# as a hardcoded non-empty literal (SC2157), hence the disable directives
+# placed INSIDE the heredoc, immediately before each flagged line. No
+# backticks appear anywhere in the heredoc body itself — an unquoted
+# heredoc treats a literal backtick as old-style command substitution,
+# which would corrupt the generated text.
+rp_concurrency_preflight_lines() {
+  local own_session="${1:?rp_concurrency_preflight_lines needs its own tmux session name}" \
+        own_wave="${2:?rp_concurrency_preflight_lines needs its own wave id}"
+  cat <<EOF
+other="\$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^jammi-' | grep -vx 'jammi-seed' | grep -vx '${own_session}' | head -1)" # tripwire-ok: tmux list-sessions exits non-zero with no server/sessions at all -- a real, expected, checked state (an empty \$other, handled by the if/else right below), never a silent pass on a real error this remote script would otherwise need to escalate
+# shellcheck disable=SC2157
+if [ -z "\$other" ]; then
+  echo "GPU_DEV_CONCURRENCY_STATE=CLEAR"
+else
+  claim_wave=""
+  if [ -f /root/.jammi-active-wave ]; then
+    claim_wave="\$(grep '^WAVE=' /root/.jammi-active-wave 2>/dev/null | head -1 | cut -d= -f2-)" # tripwire-ok: an absent/unreadable/malformed claim file is a real, checked state (empty claim_wave, handled by the elif chain right below as the fail-closed UNKNOWN case), never a silent pass
+  fi
+  if [ -z "\$claim_wave" ]; then
+    echo "GPU_DEV_CONCURRENCY_STATE=BUSY:UNKNOWN:\$other"
+  elif [ "\$claim_wave" = '${own_wave}' ]; then
+    echo "GPU_DEV_CONCURRENCY_STATE=CLEAR"
+  else
+    echo "GPU_DEV_CONCURRENCY_STATE=BUSY:\$claim_wave:\$other"
+  fi
+fi
+EOF
+}
+
 # The env-source + CARGO_TARGET_DIR + cd preamble shared by every remote
 # command that must run correctly as if it were an interactive shell in the
 # tree (an SSH login shell does not inherit the container's Dockerfile ENV —
@@ -730,19 +826,41 @@ rp_job_wrapper_lines() {
 # `run` invocation — carried in the marker purely for a human reading it
 # directly; wait-job itself never needs to know the expected value, since
 # the remove-then-rewrite-under-session-liveness discipline above already
-# rules out a stale marker on its own) $5=timing (0|1).
+# rules out a stale marker on its own) $5=timing (0|1) $6=wave (RP_WAVE,
+# defaults to the tree name at the gpu-dev.sh call site) $7=tree (the short
+# tree name, e.g. "mywork" — distinct from $1 tree_dir, which is the full
+# checkout path).
+#
+# Wave-scoped one-pod-per-wave claim (folded into this SAME start/end
+# lifecycle `.jammi.exit` already uses, per that marker's own idiom):
+# `/root/.jammi-active-wave` (one file, POD-global — a pod hosts one job at
+# a time regardless of tree) is WRITTEN at the very START, before the job
+# ever runs, so a concurrent `run` on another tree sees the claim the
+# instant this one launches; it is REMOVED whenever this wrapper's own
+# execution ends — normal completion AND the lock-refused (timing) early
+# exit both clear it, so a stale claim can only ever be "wrapper cleanup
+# was interrupted" (SIGKILL/pod death), never "a job finished and cleanup
+# was forgotten". `rp_concurrency_preflight_lines` (below) reads this file
+# and, per this campaign's own instruction, treats a claim with NO matching
+# live tmux session as CLEAR (fail OPEN on staleness) rather than refusing
+# forever on an orphaned file — tmux liveness stays the PRIMARY signal.
 rp_job_wrapper_with_marker_lines() {
   local tree_dir="${1:?rp_job_wrapper_with_marker_lines needs a tree dir}" \
         target_dir="${2:?rp_job_wrapper_with_marker_lines needs a target dir}" \
         job="${3:?rp_job_wrapper_with_marker_lines needs a job command}" \
         token="${4:?rp_job_wrapper_with_marker_lines needs a token}" \
-        timing="${5:?rp_job_wrapper_with_marker_lines needs a timing flag}"
+        timing="${5:?rp_job_wrapper_with_marker_lines needs a timing flag}" \
+        wave="${6:?rp_job_wrapper_with_marker_lines needs a wave id}" \
+        tree_name="${7:?rp_job_wrapper_with_marker_lines needs a tree name}"
   printf "rm -f '%s/.jammi.exit'\n" "$tree_dir"
+  printf 'printf "WAVE=%s\\nTREE=%s\\nTS=%s\\n" > /root/.jammi-active-wave\n' \
+    "$wave" "$tree_name" "$(date -u +%FT%TZ)"
   if [ "$timing" = "1" ]; then
     cat <<FLOCKEOF
 exec 9>/root/.jammi-timing.lock
 if ! flock -n 9; then
   printf '{"token":"${token}","rc":75,"lock_refused":true}' > '${tree_dir}/.jammi.exit'
+  rm -f /root/.jammi-active-wave
   exit 75
 fi
 FLOCKEOF
@@ -761,6 +879,7 @@ FLOCKEOF
   cat <<MARKEREOF
 __jammi_job_rc=\$?
 printf '{"token":"${token}","rc":'"\$__jammi_job_rc"',"lock_refused":false}' > '${tree_dir}/.jammi.exit'
+rm -f /root/.jammi-active-wave
 exit "\$__jammi_job_rc"
 MARKEREOF
 }
@@ -1066,12 +1185,29 @@ p=(json.load(sys.stdin).get("data",{}).get("pod") or {}).get("runtime") or {}
 rp_deploy_arch() { # $1=arch
   local cand
   case "$1" in
+    # sm_80 has NO useful same-SASS sibling on RunPod (no A800/A30 in the
+    # catalog; A100-SXM4-40GB is half-VRAM and community-only) — both 80GB
+    # variants are already listed, so an sm_80 drought has no fallback lever.
     a100)    cand=("SECURE|NVIDIA A100 80GB PCIe" "COMMUNITY|NVIDIA A100 80GB PCIe" "SECURE|NVIDIA A100-SXM4-80GB" "COMMUNITY|NVIDIA A100-SXM4-80GB") ;;
-    l40s)    cand=("SECURE|NVIDIA L40S" "COMMUNITY|NVIDIA L40S") ;;
-    h100)    cand=("SECURE|NVIDIA H100 80GB HBM3" "SECURE|NVIDIA H100 PCIe" "COMMUNITY|NVIDIA H100 80GB HBM3" "COMMUNITY|NVIDIA H100 PCIe") ;;
-    a40)     cand=("SECURE|NVIDIA A40" "COMMUNITY|NVIDIA A40") ;;
-    l4)      cand=("SECURE|NVIDIA L4" "COMMUNITY|NVIDIA L4") ;;
-    l4_l40s) cand=("SECURE|NVIDIA L4" "COMMUNITY|NVIDIA L4" "SECURE|NVIDIA L40S" "COMMUNITY|NVIDIA L40S") ;;
+    # sm_89, 48GB-class: RTX 6000 Ada is the equal-VRAM same-SASS sibling.
+    l40s)    cand=("SECURE|NVIDIA L40S" "COMMUNITY|NVIDIA L40S" "SECURE|NVIDIA RTX 6000 Ada Generation" "COMMUNITY|NVIDIA RTX 6000 Ada Generation") ;;
+    # sm_90 capacity fallbacks (campaign #443 proactive sweep — the H100
+    # SXM/PCIe pools run dry too): H100 NVL (94GB) and H200 (141GB) are
+    # same-GH100 sm_90 SASS with >= VRAM, so both the prove proof and a
+    # dev pod's memory envelope are preserved; H200 last (priciest).
+    h100)    cand=("SECURE|NVIDIA H100 80GB HBM3" "SECURE|NVIDIA H100 PCIe" "COMMUNITY|NVIDIA H100 80GB HBM3" "COMMUNITY|NVIDIA H100 PCIe" "SECURE|NVIDIA H100 NVL" "COMMUNITY|NVIDIA H100 NVL" "SECURE|NVIDIA H200" "COMMUNITY|NVIDIA H200") ;;
+    # sm_86 capacity fallbacks (campaign #443: two prove attempts died on an
+    # A40 drought): RTX A6000 (48GB, ECC — closest A40 twin) then RTX 3090
+    # (24GB, no ECC — same GA10x sm_86 SASS, identical correctness proof;
+    # ordered last for the ECC difference, which affects fault tolerance,
+    # never the computed values a parity/capability suite asserts).
+    a40)     cand=("SECURE|NVIDIA A40" "COMMUNITY|NVIDIA A40" "SECURE|NVIDIA RTX A6000" "COMMUNITY|NVIDIA RTX A6000" "SECURE|NVIDIA GeForce RTX 3090" "COMMUNITY|NVIDIA GeForce RTX 3090") ;;
+    l4)      cand=("SECURE|NVIDIA L4" "COMMUNITY|NVIDIA L4" "SECURE|NVIDIA GeForce RTX 4090" "COMMUNITY|NVIDIA GeForce RTX 4090") ;; # sm_89, 24GB-class: 4090 = equal-VRAM same-SASS sibling
+    # sm_89 capacity fallbacks (same drought, L4+L40S both dry): RTX 6000 Ada
+    # (48GB, ECC) then RTX 4090 (24GB — matches L4's own 24GB envelope, so any
+    # suite that fits the first-choice card fits this one; no ECC, same AD10x
+    # sm_89 SASS, identical correctness proof).
+    l4_l40s) cand=("SECURE|NVIDIA L4" "COMMUNITY|NVIDIA L4" "SECURE|NVIDIA L40S" "COMMUNITY|NVIDIA L40S" "SECURE|NVIDIA RTX 6000 Ada Generation" "COMMUNITY|NVIDIA RTX 6000 Ada Generation" "SECURE|NVIDIA GeForce RTX 4090" "COMMUNITY|NVIDIA GeForce RTX 4090") ;;
     *) echo "::error::unknown arch '$1' (want: a100|l40s|h100|a40|l4|l4_l40s)"; return 2 ;;
   esac
   RP_ARCH="$1"

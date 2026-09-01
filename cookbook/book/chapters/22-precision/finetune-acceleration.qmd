@@ -1,0 +1,453 @@
+---
+title: "Fine-tune acceleration, made visible — the per-job report, and f16's honest limits"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Recipe:** `fine_tune(..., backbone_dtype=...)` on `[gpu]` · `TrainingJob.acceleration_report()`
+— the same handle `wait()`/`status()`/`metrics()` already carry · **Theory:** mixed-precision
+training's two reduced-precision floats are not interchangeable — `bf16` carries `f32`'s full
+8-bit exponent range and needs no loss-scaling [@kalamkar2019bfloat16], `f16`'s narrower 5-bit
+exponent is the dtype the original mixed-precision-training recipe *did* need loss-scaling for
+[@micikevicius2018mixedprecision] — and FlashAttention fuses the whole attention block into one
+IO-aware kernel rather than fusing a single primitive [@dao2022flashattention] · **Rail:**
+measurement (a live fine-tune submitted over the remote `grpc://` client, its per-job
+acceleration report read back through `pending` → `determined`, both dtypes' outcomes asserted)
++ the honest arc (real GPU-only facts — FlashAttention-2's own `f16` admission, and a real
+memory limit that was root-caused and closed, not fabricated shut — cited rather than
+recomputed here).
+
+## A third precision knob — and the first one this book cannot fully render
+
+[Two earlier chapters](precision.qmd) measured `storage_precision` (what an ANN sidecar keeps on
+disk); [the one before this](compute-precision.qmd) measured `compute_precision` (what dtype
+*inference* runs at). This chapter measures a third, independent knob: `fine_tune`'s own
+`backbone_dtype` — what dtype the encoder's weights and activations run at *during training*.
+Same three literals (`f32` / `f16` / `bf16`), same load-boundary honesty contract, but a
+different lifecycle entirely: a fine-tune is not a call that returns a value, it is a **job** —
+submitted, queued, claimed by a worker, and only *then* does the engine know which device it
+landed on and which fused kernels that job's own dtype can actually reach. That gap between
+"submitted" and "known" is exactly what `TrainingJob.acceleration_report()` exists to close: a
+per-job, claim-time determination of whether this job's fused kernels and FlashAttention are
+`Hold`ing (dispatching for real) or `Miss`ing (declining, with the same domain-check reason key
+the kernel's own admission gate recorded) — read back through the SAME handle `wait()` and
+`metrics()` already live on, on both the embedded and the remote transport.
+
+## The honesty contract: which surface, which build
+
+`fine_tune`'s **remote** arm (`jammi.connect("grpc://…").fine_tune(...)`) is the only public
+surface that can ever reach a *flash-compiled* binary: FlashAttention is vendored CUTLASS/CUDA
+source (`crates/jammi-kernels/third_party/flash-attention`), gated behind the `flash-attn` cargo
+feature, and only the CUDA release lanes (the tarball, the `cu12` wheel, the container image)
+compile it in. The `jammi-server` this render's own `grpc://` cell talks to is **not** one of
+those builds — it is a plain `cargo build --release -p jammi-server`, no `cuda` feature, no
+`flash-attn` feature (the same binary `cookbook-book.yml` / `cookbook-render.yml` build via
+`setup-jammi-py`'s `build-server: "true"` input) — because neither this book's PR gate nor its
+nightly render ever has a CUDA device to hand a compiled kernel to. That is a fact about *this
+render's own CI machine*, not a gap in the report mechanism: everything below through the
+`## Measured on real GPU hardware, not here` heading is a live, real submission against a live,
+real server — it simply resolves onto CPU, so its `flash` verdict is always the *compiled-away*
+reason, never a *declined-on-domain* one. The declined-on-domain evidence, and the numbers a real
+CUDA server produces, are reported honestly as measured elsewhere, exactly the way
+[the preceding chapter](compute-precision.qmd) reports its own `bf16`-on-Ampere number.
+
+## The fixture — a real server, a GPU-free encoder
+
+The live cells below spin up a real `jammi-server` subprocess and drive it over `grpc://` with
+the engine's own public `tiny_modernbert` fixture (hidden size 32, one layer) — the same
+GPU-free, hermetic ModernBERT-architecture stand-in [the model-catalog chapter](lifecycle.qmd)
+trains against. The facts this campaign measured on real hardware, cited further down, were
+gathered against the real checkpoint that motivated this work — ModernBERT-large
+[@warner2024modernbert], `head_dim = 64` — which this render does not download or train; the two
+are never conflated below.
+
+```{python}
+from pathlib import Path
+
+import jammi_cookbook
+
+_ENGINE_ROOT = Path(jammi_cookbook.__file__).resolve().parents[3]
+TINY_MODERNBERT = _ENGINE_ROOT / "tests" / "fixtures" / "tiny_modernbert"
+
+assert TINY_MODERNBERT.exists(), f"missing engine fixture: {TINY_MODERNBERT}"
+print(f"encoder: {TINY_MODERNBERT}  (tiny ModernBERT architecture, hidden_size=32)")
+```
+
+## Standing up the remote server
+
+The same `LiveServer` shape [the model-catalog cache emit](lifecycle.qmd) uses: a real
+`jammi-server` on a free loopback port, readiness-polled via a client handshake, torn down on
+exit. `jammi-server` must already be on `PATH` — the render harness places the freshly built
+binary there before invoking `quarto render`, exactly as `cookbook-render.yml` documents.
+
+```{python}
+import os
+import shutil
+import socket
+import subprocess
+import tempfile
+import time
+
+import jammi
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class LiveServer:
+    """A real `jammi-server` on a free port — readiness-polled, torn down on exit."""
+
+    def __enter__(self) -> "LiveServer":
+        server_bin = shutil.which("jammi-server")
+        assert server_bin, (
+            "jammi-server is not on PATH — this chapter needs a real server binary "
+            "the render harness builds and places on PATH (see cookbook-render.yml)"
+        )
+        self._artifact_dir = tempfile.mkdtemp(prefix="jammi_srv_ftaccel_")
+        flight_port, health_port = _free_port(), _free_port()
+        env = dict(os.environ)
+        env["JAMMI_ARTIFACT_DIR"] = self._artifact_dir
+        env["JAMMI_SERVER__FLIGHT_LISTEN"] = f"127.0.0.1:{flight_port}"
+        env["JAMMI_SERVER__HEALTH_LISTEN"] = f"127.0.0.1:{health_port}"
+        env["JAMMI_SERVER__SERVICES"] = "all"
+        self.proc = subprocess.Popen(
+            [server_bin], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+        )
+        self.port = flight_port
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                out = self.proc.stdout.read().decode(errors="replace") if self.proc.stdout else ""
+                raise RuntimeError(f"jammi-server exited early:\n{out}")
+            try:
+                handshake = jammi.connect(f"grpc://127.0.0.1:{self.port}")
+                handshake.get_server_info()
+                handshake.close()
+                return self
+            except Exception:
+                time.sleep(0.25)
+        self.proc.terminate()
+        raise RuntimeError("jammi-server did not become ready within 30s")
+
+    def __exit__(self, *exc) -> None:
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+
+
+server = LiveServer().__enter__()
+# The literal `grpc://` target — the same public front door every other
+# remote-transport chapter in this book opens, over a real live server this
+# render itself just started.
+remote = jammi.connect(f"grpc://127.0.0.1:{server.port}")
+print(f"remote jammi-server up at grpc://127.0.0.1:{server.port}")
+```
+
+```{python}
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+# A tiny, generic (anchor, positive) pairs corpus — the same `pairs` training
+# format the model-catalog cache emit uses. Deterministic content; no consumer
+# vocabulary.
+PAIRS = {
+    "anchor": ["a graph", "a node", "an edge", "a model"] * 3,
+    "positive": ["a network", "a vertex", "a link", "a net"] * 3,
+}
+_work = tempfile.mkdtemp(prefix="jammi_ftaccel_corpus_")
+_corpus_path = f"{_work}/pairs.parquet"
+pq.write_table(pa.table(PAIRS), _corpus_path)
+
+remote.add_source("ftaccel_pairs", url=f"file://{_corpus_path}", format="parquet")
+print("registered a 12-row (anchor, positive) pairs source")
+```
+
+## Submitting an `f16` fine-tune, and reading its report before it is known
+
+`fine_tune`'s `backbone_dtype` only takes effect on the LoRA-adapter arm (`target_modules`
+non-empty) — that is the arm that actually materializes a dtype-typed encoder to run the
+acceleration probe against. Right after submission the report is `{"state": "pending"}`: the job
+exists, but no worker has claimed it yet, so no device is even known. The SAME handle's
+`wait()` blocks until the run finishes; by then the claiming worker has long since resolved a
+device and recorded a `"determined"` report — read back through the exact call a mid-training
+status poll would make.
+
+```{python}
+import json
+
+BASE_MODEL = f"local:{TINY_MODERNBERT}"
+TARGET_MODULES = ["Wqkv", "Wo", "Wi"]  # ModernBERT's own LoRA-eligible linear names
+
+job_f16 = remote.fine_tune(
+    source="ftaccel_pairs",
+    base_model=BASE_MODEL,
+    columns=["anchor", "positive"],
+    method="lora",
+    task="text_embedding",
+    epochs=1,
+    batch_size=4,
+    seed=0,
+    backbone_dtype="f16",
+    target_modules=TARGET_MODULES,
+)
+
+# Read the report BEFORE waiting — this is the submission-time state every job
+# carries, an explicit marker rather than SQL NULL (esc-075's own contract).
+pending = job_f16.acceleration_report()
+print("immediately after submit:", pending)
+assert pending == {"state": "pending"}, pending
+
+job_f16.wait()
+report_f16 = job_f16.acceleration_report()
+print(json.dumps(report_f16, indent=2, sort_keys=True))
+
+assert report_f16["state"] == "determined"
+assert report_f16["dtype"] == "f16"
+assert report_f16["device"] == "cpu"  # this render's server has no CUDA device
+```
+
+## Reading `Holds` and `Miss` — the real vocabulary, on a real (CPU) job
+
+The report's `ops` map is one entry per fused primitive this job's own probe forward pass
+exercised, each `{"holds": bool, "reason": str}` — `holds: true` means the SAME dispatch
+registry the kernel's own admission gate maintains actually recorded a fused hit for THIS job;
+`holds: false` carries the exact domain-check `reason` key the admission predicate itself
+produced, never a re-derived one. This one CPU job Holds on six of the seven `ops` entries and
+Misses on the seventh (`attention_block`); `flash` (a separate field, discussed below) Misses
+too — each Miss teaches a different, independent limit:
+
+```{python}
+for op in sorted(report_f16["ops"]):
+    entry = report_f16["ops"][op]
+    mark = "Hold" if entry["holds"] else "Miss"
+    print(f"  {op:<24s} {mark:<5s} reason={entry['reason']}")
+
+print(f"\n  {'flash':<24s} {'Hold' if report_f16['flash']['holds'] else 'Miss':<5s} "
+      f"reason={report_f16['flash']['reason']}")
+```
+
+- **`layer_norm` / `rope` / `softmax` / `geglu` / `dropout` / `low_rank_residual_linear` →
+  `Hold`, `domain_ok`.** All six now hold for `F16` on CPU. The last two are the most recently
+  widened: both report keys read the SAME `lora_linear_fused` registry — the LoRA-epilogue fused
+  kernel — whose admission predicate used to accept only a `(F32, F32)` or `(BF16, BF16)`
+  base/LoRA dtype pair; a `(F16, F16)` arm now exists too
+  (`crates/jammi-lora/src/lora_linear.rs`'s `lora_linear_admission_predicate`, its declined-pair
+  reason renamed from the old bf16-only `base_dtype_f32_or_bf16_matched` to
+  `base_dtype_f32_bf16_or_f16_matched` — a string that no longer exists in this codebase, because
+  the two-member domain it named no longer exists either). Every one of these six kernels is
+  dtype-domain-gated with a portable CPU implementation alongside its CUDA one — the *numeric*
+  benefit (one rounding point instead of several) is real on CPU too, even though the *wall-clock*
+  benefit is a CUDA-only property. A CPU render `Hold`ing these is therefore not a mistake; it is
+  the honest, correct value of a domain check whose domain never mentioned the device.
+- **`attention_block` → `Miss`, `dtype_f32_matching_between_qkv_and_mask_on_cpu`.** This is the
+  op's fused kernel's OWN per-device dtype domain, not a re-derivation: its `cpu_fwd` arm
+  implements `F32` only (no `F16`/`BF16` `MatMul` on CPU), so an `F16` job's qkv tensor fails this
+  check before the predicate ever reaches its SEPARATE, later `head_dim` gate — the two are
+  independent checks, and this one simply fires first for this dtype. That head_dim gate is real
+  and durable regardless: `attention_block_fused` (like FlashAttention itself, below) is compiled
+  for exactly one fixed head dimension (`64`), and `tiny_modernbert`'s `hidden_size=32` over 2
+  heads gives `head_dim=16` — an `f32` job on this same fixture clears the dtype gate above and
+  then Misses on `head_dim_is_attention_block_fixed_head_dim` instead (the ONE gate a dtype change
+  cannot route around here). ModernBERT-base *and* ModernBERT-large both clear the shape gate in
+  practice — `768 / 12 = 64` heads-to-hidden, `1024 / 16 = 64` — this render's own fixture is
+  simply built too small to reach it, on purpose (hermetic, CPU-fast).
+- **`flash` → `Miss`, `cuda_not_compiled`.** The flash cascade short-circuits on a
+  compiled/device-level fact *before* it ever consults a domain check — this build has no `cuda`
+  feature at all, so this is the honest floor every dtype gets on this render, discussed next.
+
+## `bf16` is refused, loud — the training-side peer of the inference gate
+
+[The compute-precision chapter](compute-precision.qmd) measured `bf16` refused at *inference*
+load time on a CPU-only build. Fine-tuning's own gate is a different function
+(`validate_backbone_precision`, checked once the claiming worker resolves a device) with a
+**coarser** predicate: it refuses `bf16` on *any* non-CUDA device, not specifically below an
+Ampere compute-capability floor — because a CPU-only build (like this render's) is exactly the
+build class `bf16` never runs on, floor or no floor.
+
+```{python}
+try:
+    job_bf16 = remote.fine_tune(
+        source="ftaccel_pairs",
+        base_model=BASE_MODEL,
+        columns=["anchor", "positive"],
+        method="lora",
+        task="text_embedding",
+        epochs=1,
+        batch_size=4,
+        seed=0,
+        backbone_dtype="bf16",
+        target_modules=TARGET_MODULES,
+    )
+    job_bf16.wait()
+    raise RuntimeError("bf16 must be refused on this CPU-only build — it completed instead")
+except jammi.errors.TrainingError as exc:
+    message = str(exc)
+    print(f"caught {type(exc).__name__}: {message}")
+    for token in ("bf16", "requires a CUDA device", "Use f16"):
+        assert token in message, f"expected {token!r} in the refusal message: {message}"
+
+print("\nbf16 fine-tuning was refused loud, with the typed remedy message pointing at f16 — "
+      "never a silent downgrade, never a silently-eager bf16 run.")
+```
+
+```{python}
+# | echo: false
+remote.close()
+server.__exit__(None, None, None)
+```
+
+## Measured on real GPU hardware, not here
+
+Everything above is a live, real submission — it simply resolves onto a CPU-only build, because
+that is what this render's own CI machine can offer. What follows is reported, not recomputed
+*in this render*: the FlashAttention-2 admission result below is the same live submission this
+chapter's own cells make, re-run once against a real NVIDIA A100 80GB with a
+`cuda,flash-attn`-featured `jammi-server`, to close the one gap a CPU-only render structurally
+cannot close; the stability and memory findings that follow it are this capability's own
+dedicated probe, measured earlier at the reporter's real target shape. Both are cited by fact,
+never transcribed as a headline this render invented.
+
+**The stability probe: `f16` inside the `bf16`-calibrated band.** Before shipping `f16` fused
+kernels, the engine measured whether raw `f16` forward/backward is even numerically stable at
+all, relative to the reduced-precision dtype already known-good (`bf16`). Three seeds
+(`{2, 3, 4}`), three dtypes (`f16` / `bf16` / `f32`), the same small fine-tune shape (batch 2,
+sequence 128, 3 epochs, fully eager), scored on the held-out `held_out_example_mean` at the final
+epoch:
+
+| seed | `\|f16 − f32\|` | `\|bf16 − f32\|` |
+|-----:|---------------:|----------------:|
+|    2 |         0.2528 |          0.3575 |
+|    3 |         0.2025 |          0.0304 |
+|    4 |         0.0819 |          0.3016 |
+
+`bf16` — the accepted-good reduced-precision dtype — is itself what CALIBRATES the acceptance
+band: `max(2 × max_seed|bf16 − f32|, 0.02) = max(2 × 0.3575, 0.02) = 0.715`. Every one of `f16`'s
+three per-seed deltas (0.2528 / 0.2025 / 0.0819) sits inside that band, and no seed shows
+late-epoch divergence (an `f16` per-epoch value exceeding 1.5× that seed's `f32` value at the
+same epoch) — 3-of-3 seeds pass. `f16` is therefore numerically admitted for training at the
+probed shape: not "as good as `bf16`" on any single seed (seed 2 and 3 both show `f16` *further*
+from `f32` than `bf16` is), but inside the same acceptance band `bf16` itself has to clear.
+
+**The eager-vs-fused memory story, and a real fix.** The reporter's own target shape — batch 16,
+sequence 128, ModernBERT-large [@warner2024modernbert] — could not run `f16` fine-tuning **at
+all** on an 80GB A100: it OOM'd in the backward pass, while the identical shape at `bf16`/`f32`
+completed. The confound was real: under the disabled-fusion arm, `f16` declines every fused
+kernel (the very `Miss`es this chapter's live cells show above) and runs the fully-eager
+composition, while `bf16`/`f32` ran mostly fused — so the eager composition's own memory profile
+was never isolated from the *dtype*. Root cause, once isolated: `cudarc` (and candle's own CUDA
+backend) carries no caching allocator — every distinct tensor shape a training loop ever requests
+is a fresh `cuMemAlloc`, so a loop whose per-step shapes are drawn from an unbounded set grows the
+allocator's reserved footprint with the **count of distinct shapes ever seen**, independent of
+dtype. The fix bucketed each batch's natural tokenizer-padded width up to the nearest
+power-of-two (a bounded, 5-rung ladder at `max_seq_length=128`), at the trainer's own
+batch-construction seam — never inside `jammi-encoders`' eager arithmetic, where padding an
+activation inside a mean/variance reduction would corrupt the math. Post-fix: the reporter's
+exact scenario (`f16`, batch 16, sequence 128) **completes**, `steps_measured` at the full
+expected count, peak memory **44.3 GB, flat** after the initial ramp (1 Hz `nvidia-smi`
+sampling) — bounded, not the pre-fix unbounded 0→49 GB→78 GB growth trajectory that OOM'd.
+`bf16`/`f32` complete at the same shape too, with finite, comparable losses.
+
+**A second, campaign-induced limit at batch 8, sequence 512 — root-caused and closed.** The
+stress shape OOM'd too, both `bf16` and `f16`, under the disabled-fusion arm, on legs the
+pre-bucketing baseline ran clean — an early-step, not gradual, ramp to roughly 63 GB. This looked
+like a second, independent memory ceiling; it was not. The actual mechanism was in the bucketing
+fix itself: `evaluate_held_out`'s eval pass reused the SAME bucket-UP-to-the-nearest-power-of-two
+padding the training-step fix above introduces, so a real held-out batch whose natural width was
+321 tokens got rounded up to the 512 rung — `max_seq_length`'s own cap — a roughly 2.5×
+softmax-intermediate blow-up relative to its true width. This was a defect the bucketing fix
+introduced on the EVAL path, not a pre-existing eager-attention ceiling, and — being
+dtype-independent — it explains why `bf16`, not only `f16`, was affected. The fix:
+`encode_texts` now dispatches on `self.training_mode` — bucket-up padding stays on the
+training-step path (unbounded per-step shape churn is the growth mechanism the first fix above
+targets), while `evaluate` / `evaluate_held_out` use a `tokenize_natural_width` sibling instead,
+matching the tokenizer's own natural per-batch width, exactly as it behaved before the bucketing
+fix existed. Re-measured on the pod after the fix: `batch 8, sequence 512` now **completes** for
+both `bf16` and `f16`, under both the fused and the disabled-fusion arm, with a full 1 Hz memory
+trace — stable around **60.4 GB peak**, no OOM. The honest arc: a real limit existed, its root
+cause was a second-order effect of this campaign's own first fix (never a pre-existing
+eager-attention ceiling), and it is closed — not reported as still open.
+
+**FlashAttention-2's own admission gate, measured Holding on real hardware.** `flash`'s cascade
+(all five gates must pass, in order): the `flash-attn` cargo feature was compiled in; the
+resolved device is CUDA; that device's compute-capability major/minor is in the validated set
+`{80, 86, 89, 90}`; the tensor's dtype is `BF16` **or** `F16` (this capability's own widening —
+the gate used to accept `BF16` alone); and `head_dim` is exactly the one dimension the vendored
+kernel was compiled for (`64`). ModernBERT-large clears the shape gate by construction
+(`1024 / 16 = 64`). This is not a code-reading inference: submitting the exact same `f16`
+fine-tune this chapter's live cells submit — same call, same corpus, same
+`TrainingJob.acceleration_report()` read — against ModernBERT-large on a real NVIDIA A100 80GB,
+with `jammi-server` built `--features cuda,flash-attn`, returns
+
+```json
+{
+  "state": "determined",
+  "device": "NVIDIA A100 80GB PCIe",
+  "dtype": "f16",
+  "cuda_compiled": true,
+  "flash_compiled": true,
+  "flash": {"holds": true, "reason": "domain_ok"}
+}
+```
+
+— `flash.holds: true` on `f16`, the same `domain_ok` reason a `bf16` job on the same hardware
+gets. Two new translation units back this (`flash_fwd_hdim64_fp16_sm80.cu` /
+`flash_bwd_hdim64_fp16_sm80.cu`, upstream FlashAttention-2's own most-tested dtype
+[@dao2022flashattention]), and the engine's own `flash_torch_parity_f16.rs` oracle proves the
+kernel bit-for-bit against a `torch` reference — this live submission is the admission-gate
+proof; that oracle is the numerics proof, and the two are deliberately separate concerns.
+
+Two honest observations about what a GPU report for this job looks like. First, on real A100
+hardware the LoRA epilogue genuinely dispatches fused at `f16` — the engine's own committed
+A/B provenance for this exact fixture records `lora_linear_fused` firing on every training
+forward of an `f16` run with **zero** eager fallbacks (`docs/plans/63-how-well/measurements/`
+carries the raw per-leg reports), so a GPU report shows `low_rank_residual_linear` `Hold`ing
+just as the CPU cells above do. Second, a GPU report's `ops` map may omit `rope`, `softmax`,
+and `attention_block` entirely rather than reporting them: `two_arm_holds` (the mechanism that
+turns a before/after dispatch-counter delta into a report entry) declines to fabricate an entry
+for an op whose counters show no clean single-arm signal, and once FlashAttention itself owns
+the whole attention block, those per-primitive counters no longer move the way they do under
+the eager/fused-primitive composition this chapter's CPU cells exercise. An omitted op is an
+honest "no independent signal", never a smoothed-over claim.
+
+## The `bf16`-vs-`f16` guidance, grounded in what is actually measured
+
+- **On a CUDA device of compute capability ≥ 8.0, prefer `bf16`.** It needs no loss-scaling
+  [@micikevicius2018mixedprecision], preserves `f32`'s exponent range
+  [@kalamkar2019bfloat16], and every fused kernel this campaign shipped already accepted it
+  before `f16` joined.
+- **`f16` is the right choice off that floor** — a pre-Ampere CUDA device, or (uniquely) CPU,
+  where `bf16` is refused outright (measured above) rather than merely slower. The stability
+  probe backs this: at the probed shape, `f16` sits inside the same acceptance band `bf16` itself
+  calibrates, 3 of 3 seeds, no late-epoch divergence.
+- **`f16` at the reporter's own shape (batch 16, sequence 128) now runs, bounded, at 44.3 GB,
+  and the batch 8, sequence 512 stress shape now runs too, at ~60.4 GB.** Both were real fixes,
+  not workarounds — the second one root-caused to this campaign's own bucketing fix leaking onto
+  the eval path, not a pre-existing eager-attention ceiling. Both OOMs this campaign started from
+  are closed.
+
+## Bridge note
+
+> **A third precision axis, and the first with a lifecycle.** `storage_precision` and
+> `compute_precision` are properties of a single call; `backbone_dtype` is a property of a
+> **job**, and the fact this chapter adds to the book is that a job's own acceleration
+> determination has to be *computed and read back*, not assumed — `{"state": "pending"}` at
+> submission, `{"state": "determined", "ops": {...}, "flash": {...}}` once a worker resolves a
+> device, each entry carrying the SAME `Hold`/`Miss` + `reason` vocabulary the kernel's own
+> admission gate produces. On this render's CPU-only server every `ops` entry this chapter
+> measured is real (six of seven primitives genuinely `Hold` — a portable, dtype-only domain
+> check `f16` now clears everywhere it is dtype-eligible — while `attention_block`'s per-device
+> dtype gate genuinely `Miss`es, for the reason this chapter names exactly), and `flash` is always
+> the honest compiled-away floor. The numbers only a real CUDA server can produce —
+> FlashAttention-2's own `f16` admission actually `Hold`ing, and the memory story's honest arc (a
+> real limit, root-caused to this campaign's own earlier fix leaking onto the eval path, and
+> closed at both measured shapes) — are reported as measured on real A100 hardware, cited rather
+> than recomputed, the same honesty contract [the preceding chapter](compute-precision.qmd)
+> already keeps for `bf16`.

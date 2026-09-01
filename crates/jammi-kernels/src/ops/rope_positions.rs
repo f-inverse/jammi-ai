@@ -140,7 +140,7 @@
 
 use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, CustomOp3, Error, Layout, Result, Shape, Tensor};
-use half::bf16;
+use half::{bf16, f16};
 
 const OP: &str = "rope_positions_fused";
 
@@ -550,6 +550,49 @@ fn rope_positions_fwd_bf16(
     out
 }
 
+/// [`rope_positions_fwd_bf16`]'s exact twin, substituting `half::f16` —
+/// f32-accumulate, round-once, per the per-op f16 reference-regime table
+/// (`docs/maintainer/cuda-kernel-guide.md`).
+#[allow(clippy::too_many_arguments)]
+fn rope_positions_fwd_f16(
+    qkv: &[f16],
+    cos: &[f16],
+    sin: &[f16],
+    total: usize,
+    h: usize,
+    d: usize,
+    seq: usize,
+    sign: f32,
+) -> Vec<f16> {
+    let half = d / 2;
+    let mut out = vec![f16::ZERO; total * 3 * h * d];
+    for token in 0..total {
+        let seq_idx = if seq == 0 { 0 } else { token % seq };
+        let table_base = seq_idx * d;
+        for slot in 0..3usize {
+            for h_idx in 0..h {
+                let row_base = ((token * 3 + slot) * h + h_idx) * d;
+                if slot == 2 {
+                    out[row_base..row_base + d].copy_from_slice(&qkv[row_base..row_base + d]);
+                    continue;
+                }
+                for c in 0..d {
+                    let xv = f32::from(qkv[row_base + c]);
+                    let rh = if c < half {
+                        -f32::from(qkv[row_base + c + half])
+                    } else {
+                        f32::from(qkv[row_base + c - half])
+                    };
+                    let cc = f32::from(cos[table_base + c]);
+                    let ss = f32::from(sin[table_base + c]);
+                    out[row_base + c] = f16::from_f32(xv * cc + rh * ss * sign);
+                }
+            }
+        }
+    }
+    out
+}
+
 impl CustomOp3 for RopePositionsFused {
     fn name(&self) -> &'static str {
         OP
@@ -611,6 +654,19 @@ impl CustomOp3 for RopePositionsFused {
                     sign,
                 );
                 Ok((CpuStorage::BF16(out), l1.shape().clone()))
+            }
+            (CpuStorage::F16(x), CpuStorage::F16(cos), CpuStorage::F16(sin)) => {
+                let out = rope_positions_fwd_f16(
+                    &x[x1..x2],
+                    &cos[c1..c2],
+                    &sin[s_1..s_2],
+                    total,
+                    h,
+                    d,
+                    self.seq,
+                    sign,
+                );
+                Ok((CpuStorage::F16(out), l1.shape().clone()))
             }
             (s1, _, _) => Err(Error::UnsupportedDTypeForOp(s1.dtype(), OP)),
         }

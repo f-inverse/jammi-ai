@@ -51,6 +51,14 @@ pub async fn run(
                 // Its schema is documented at the trainer, not the CLI.
                 println!("metrics:  {metrics}");
             }
+            if let Some(report) = &info.acceleration_report_json {
+                // Opaque blob — printed verbatim, not parsed or reformatted.
+                // Its schema (including the `"state"` vocabulary) is
+                // documented at the trainer, not the CLI. Absent entirely
+                // when the row predates the column (SQL `NULL`) — no
+                // fabricated placeholder in that case.
+                println!("acceleration_report: {report}");
+            }
         }
     }
     Ok(())

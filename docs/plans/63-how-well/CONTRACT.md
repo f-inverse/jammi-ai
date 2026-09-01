@@ -462,3 +462,41 @@ is a dead leg with delta exactly 0.0 — the shape all four committed lr0 contro
 legs read. Amendment 2026-08-29e's rule, table, premises, predictions, and honesty
 rider are unchanged by this correction; only the falsifier's cited mechanism is
 superseded by this postscript.
+
+## Amendment 2026-09-01 (docs-ci, campaign #443 fold-in): flash-cascade differential extends to F16
+
+Basis: campaign #443 landed `flash_capability_gates` widening `jammi-encoders/src/
+modernbert.rs`'s dtype gate from BF16-only (`dtype_is_bf16`) to `{BF16, F16}`
+(`dtype_is_bf16_or_f16`) — commits e98b4b46 (FA2 fp16 dispatch + admission widening)
+and ea84270a (`ci/release-feature-manifest.json`'s `flash_dtypes` widened to
+`["bf16", "f16"]` to match). The Frame's own differential — "fused cascade vs
+ALLOFF=attention_block_flash,adamw_step_fused" — never named a dtype in its own text;
+`ab_merge.py`'s premise check (`finetune_run_dispatch_proof_violations`, unit-63 round-4
+audit F-1) read it as BF16-only because BF16 was the ONLY dtype the engine admitted for
+the flash cascade at the time that check was written — a correct reading of the engine's
+then-current capability, not a dtype restriction the Frame text itself imposed.
+Motivating measurement: `docs/plans/63-how-well/measurements/f16-sweep/` (campaign #443,
+W4-bench) shows the flash cascade genuinely dispatching under F16 on real A100 hardware —
+every `fused` leg reports `attention_block_flash_fused_dispatches=3276` (identical to the
+BF16 campaigns' own fused legs) with `flash_compiled=true`, and every `alloff` leg
+correctly shows the cascade DECLINED with the block-arm fallback engaging instead — the
+fused/alloff differential is real and correctly distinguished at F16, not a null
+experiment forced through a stale premise.
+
+RULING: the flash-cascade differential's admitted dtype set widens from `{BF16}` to
+`{BF16, F16}`, tracking `flash_capability_gates` exactly (never wider than the engine's
+own admitted set — a future dtype the engine does not admit for the cascade must not be
+silently accepted here either). `ab_merge.py`'s `finetune_run_dispatch_proof_violations`
+premise checks (both the arm-agnostic F-1 counter-vs-dtype contradiction check and the
+`fused` arm's own defining premise) are updated to accept `backbone_dtype` canonicalizing
+to either `bf16` or `f16` — `f32` and any other dtype remain refused exactly as before;
+the check's own comments cite this amendment. This is a WIDENING of what dtype can
+exercise the pre-registered experiment, never a widening of the experiment's own decision
+rule (N=12, exact sign test, alpha2=0.0064 — all unchanged and dtype-independent).
+
+Non-retroactive: the already-committed `f16-sweep` measurement artifact is NOT
+re-merged or edited by this amendment and remains `status: INVALID` in its own
+README — independently for its disclosed N=3 reduction (reason 1, unaffected by this
+amendment) and, historically honestly, because it ran and was merged BEFORE this
+amendment existed (reason 2, as recorded). A future N=12 F16 re-run merged AFTER this
+amendment lands would no longer trip the now-superseded BF16-only premise text.

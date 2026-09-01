@@ -126,11 +126,18 @@
 //! `LayerNormFused`'s `hidden == 0` case documents. CPU supports F32 and
 //! BF16 (RoPE's real training dtypes; matches `LayerNormFused`'s CPU
 //! domain deliberately, for the same reason: the profiled workload never
-//! needs F64 here).
+//! needs F64 here), plus F16 (`rope_fwd_f16` below). Campaign #443 W2b
+//! added the matching CUDA F16 dispatch arm (`crate::cuda::rope`'s
+//! `DType::F16` arm, backed by the SEPARATE `cuda/rope_f16.cu` translation
+//! unit — see that file's module doc for why it duplicates rather than
+//! shares code with the F32/BF16 kernel), so `jammi-encoders`' admission
+//! predicate is now widened to F16 too (K2's no-Hold-without-dispatch
+//! rule); see `docs/maintainer/cuda-kernel-guide.md`'s per-op f16
+//! reference-regime table.
 
 use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, CustomOp3, Error, Layout, Result, Shape, Tensor, D};
-use half::bf16;
+use half::{bf16, f16};
 
 /// The largest `hidden` (`head_dim`) the CUDA kernel accepts.
 ///
@@ -337,6 +344,18 @@ impl CustomOp3 for RopeFused {
                 );
                 Ok((CpuStorage::BF16(out), l1.shape().clone()))
             }
+            (CpuStorage::F16(x), CpuStorage::F16(cos), CpuStorage::F16(sin)) => {
+                let out = rope_fwd_f16(
+                    &x[x1..x2],
+                    &cos[c1..c2],
+                    &sin[s_1..s_2],
+                    total_rows,
+                    period,
+                    hidden,
+                    sign,
+                );
+                Ok((CpuStorage::F16(out), l1.shape().clone()))
+            }
             (s1, _, _) => Err(Error::UnsupportedDTypeForOp(s1.dtype(), op)),
         }
     }
@@ -515,6 +534,46 @@ fn rope_fwd_bf16(
         let sr = &sin[seq_idx * hidden..(seq_idx + 1) * hidden];
         let outr = &mut out[r * hidden..(r + 1) * hidden];
         rope_fwd_row_bf16(xr, cr, sr, sign, outr);
+    }
+    out
+}
+
+/// [`rope_fwd_row_bf16`]'s exact twin, substituting `half::f16` —
+/// f32-accumulate, round-once, per the per-op f16 reference-regime table
+/// (`docs/maintainer/cuda-kernel-guide.md`).
+fn rope_fwd_row_f16(x: &[f16], cos: &[f16], sin: &[f16], sign: f32, out: &mut [f16]) {
+    let hidden = x.len();
+    let half = hidden / 2;
+    for col in 0..hidden {
+        let xv = x[col].to_f32();
+        let rh = if col < half {
+            -x[col + half].to_f32()
+        } else {
+            x[col - half].to_f32()
+        };
+        let c = cos[col].to_f32();
+        let s = sin[col].to_f32();
+        out[col] = f16::from_f32(xv * c + rh * s * sign);
+    }
+}
+
+fn rope_fwd_f16(
+    x: &[f16],
+    cos: &[f16],
+    sin: &[f16],
+    total_rows: usize,
+    period: usize,
+    hidden: usize,
+    sign: f32,
+) -> Vec<f16> {
+    let mut out = vec![f16::ZERO; total_rows * hidden];
+    for r in 0..total_rows {
+        let seq_idx = r % period;
+        let xr = &x[r * hidden..(r + 1) * hidden];
+        let cr = &cos[seq_idx * hidden..(seq_idx + 1) * hidden];
+        let sr = &sin[seq_idx * hidden..(seq_idx + 1) * hidden];
+        let outr = &mut out[r * hidden..(r + 1) * hidden];
+        rope_fwd_row_f16(xr, cr, sr, sign, outr);
     }
     out
 }
@@ -720,6 +779,41 @@ mod tests {
         let xf: Vec<f64> = xb.iter().map(|v| v.to_f32() as f64).collect();
         let cff = cb[0].to_f32() as f64;
         let sff = sb[0].to_f32() as f64;
+        let expected: Vec<f32> = vec![
+            (xf[0] * cff - xf[2] * sff) as f32,
+            (xf[1] * cff - xf[3] * sff) as f32,
+            (xf[2] * cff + xf[0] * sff) as f32,
+            (xf[3] * cff + xf[1] * sff) as f32,
+        ];
+        for (o, e) in out.iter().zip(expected.iter()) {
+            assert!((o.to_f32() - e).abs() < 1e-2, "{o} vs {e}");
+        }
+    }
+
+    /// F16's exact twin of `bf16_forward_matches_f32_accumulation_
+    /// rounded_once` above.
+    #[test]
+    fn f16_forward_matches_f32_accumulation_rounded_once() {
+        let device = Device::Cpu;
+        let cf = 0.5f32;
+        let sf = 3f32.sqrt() / 2.0;
+        let xv = [1.0f32, 2.0, 3.0, 4.0];
+        let xh: Vec<f16> = xv.iter().map(|&v| f16::from_f32(v)).collect();
+        let ch = [f16::from_f32(cf); 4];
+        let sh = [f16::from_f32(sf); 4];
+        let x = Tensor::from_slice(&xh, (1, 4), &device).unwrap();
+        let cos = Tensor::from_slice(&ch, (1, 4), &device).unwrap();
+        let sin = Tensor::from_slice(&sh, (1, 4), &device).unwrap();
+        let out: Vec<f16> = fused(false, &x, &cos, &sin)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        let xf: Vec<f64> = xh.iter().map(|v| v.to_f32() as f64).collect();
+        let cff = ch[0].to_f32() as f64;
+        let sff = sh[0].to_f32() as f64;
         let expected: Vec<f32> = vec![
             (xf[0] * cff - xf[2] * sff) as f32,
             (xf[1] * cff - xf[3] * sff) as f32,

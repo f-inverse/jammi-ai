@@ -66,6 +66,14 @@ default = ["train"]
 train = []
 cuda  = ["jammi-ai/cuda"]
 metal = ["jammi-ai/metal"]
+# By-name passthrough to `jammi-ai`'s own `flash-attn` feature — the ONE
+# forwarding link `ci/scripts/check_flash_attn_closure.py` exempts under
+# `jammi-server --all-features` (a verified 1:1 spec match, not "any leak is
+# fine"): the CUDA release lanes (`release-binaries.yml`'s `server-cu12`,
+# `pypi-server-cuda.yml`, `server-image.yml`'s CUDA image) opt this feature
+# IN explicitly via `ci/release-feature-manifest.json`'s per-lane
+# `cargo_features` list — it is never reachable from `cuda`/`default` alone.
+flash-attn = ["jammi-ai/flash-attn"]
 # Compiles the gated GPU-host integration lane (the client/server-topology GPU
 # proof in `tests/it/grpc_embedding_gpu.rs`). Off by default; a meaningful run
 # also needs `cuda` + a visible GPU, otherwise the suite skips. Mirrors

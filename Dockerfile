@@ -56,18 +56,36 @@ RUN mkdir -p /tmp/jammi-data
 # at build time to target the GPU architecture; CC/CXX/PATH for nvcc are baked into the base.
 FROM ghcr.io/f-inverse/jammi-ai-ci-cuda:latest AS builder-cuda
 
+# Redeclared HERE (post-FROM) rather than only as a global arg above: a
+# pre-FROM global ARG does not cross a `FROM` boundary, so this stage needs
+# its own declaration to see a `--build-arg CARGO_FEATURES=...` value. The
+# default matches today's published CUDA image lane exactly (no `flash-attn`)
+# so a bare `docker build` — no `--build-arg` at all — stays CUTLASS-free,
+# matching `server-image.yml`'s CPU-variant no-CUDA-features behavior in
+# spirit: nobody gets the vendored FlashAttention-2 build without asking for
+# it. `server-image.yml`'s CUDA jobs pass the manifest-derived
+# (`ci/release-feature-manifest.json`, lane `cu12-image`) feature list
+# explicitly via this build-arg.
+ARG CARGO_FEATURES=cuda,jetstream-broker,storage-cloud
+
 WORKDIR /workspace
 COPY . .
 
-# Same cache-mount strategy as the CPU builder. The only delta is `--features cuda`,
-# which pulls in candle's CUDA backend (compiled for compute capability 80 — PTX,
-# forward-compatible via JIT to 8.6/8.9/9.0). Both
-# binaries are built so the GPU image carries the admin `jammi` CLI too.
+# Same cache-mount strategy as the CPU builder. The delta is `--features`,
+# which (per CARGO_FEATURES above) at minimum pulls in candle's CUDA backend
+# (compiled for compute capability 80 — PTX, forward-compatible via JIT to
+# 8.6/8.9/9.0) and, when the published lane's manifest includes it, the
+# vendored FlashAttention-2 kernels (`flash-attn`, needs the CUTLASS
+# submodule already present in the build context — see server-image.yml's
+# submodule-checkout step). Both binaries are built so the GPU image carries
+# the admin `jammi` CLI too. `jammi-server/` prefixes every feature name so
+# `jammi-cli`'s own build (no `--features`) is unaffected by the arg's value.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/workspace/target,sharing=locked \
-    cargo build --release \
+    features="$(printf '%s' "${CARGO_FEATURES}" | awk -F',' '{out=""; for(i=1;i<=NF;i++){out = out (i>1?",":"") "jammi-server/" $i} print out}')" \
+    && cargo build --release \
         --package jammi-server --bin jammi-server \
-        --features jammi-server/cuda,jammi-server/jetstream-broker,jammi-server/storage-cloud \
+        --features "${features}" \
     && cargo build --release --package jammi-cli --bin jammi \
     && cp target/release/jammi-server /tmp/jammi-server \
     && cp target/release/jammi /tmp/jammi \

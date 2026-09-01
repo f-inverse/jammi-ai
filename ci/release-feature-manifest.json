@@ -1,0 +1,192 @@
+{
+  "_schema_doc": [
+    "Single source of truth for the three CUDA `jammi-server` release lanes",
+    "(tarball, PyPI wheel, container image): the exact cargo feature list each",
+    "lane builds and the capability assertions a real device must prove for",
+    "that build. Both the release workflows (`.github/workflows/release-",
+    "binaries.yml`, `pypi-server-cuda.yml`, `server-image.yml`) and",
+    "`ci/scripts/check_flash_attn_closure.py` / `ci/scripts/",
+    "runpod_gpu_prove.sh` read THIS file rather than each carrying their own",
+    "copy of the feature list \u2014 a fact lives in exactly one place (family T,",
+    "DRY). A workflow reads `.lanes.<lane>.cargo_features` with `jq`; the",
+    "closure gate reads the whole `lanes` object and asserts, for every lane,",
+    "that `capabilities.flash_compiled` matches whether `cargo_features`",
+    "actually reaches `jammi-kernels/flash-attn` in the workspace feature",
+    "graph; `runpod_gpu_prove.sh` reads a lane's `cargo_features` to build",
+    "with EXACTLY that list and derives the `jammi-ai`-applicable subset by",
+    "subtracting `server_only_cargo_features` (documented below) \u2014 never a",
+    "second hardcoded copy of either list.",
+    "",
+    "Adding a lane: add an entry under `lanes`; the closure gate iterates the",
+    "object and FAILS on an empty or missing `lanes` key, so a lane can never",
+    "silently drop out of PR-time coverage.",
+    "",
+    "Changing what a lane ships: edit `cargo_features` here; the workflow",
+    "that builds it and the closure gate that guards it both move in the",
+    "same unit (no separate lane-by-lane edit to keep in sync).",
+    "",
+    "`capabilities.fused_op_admission` vs `capabilities.fused_kernels_compiled`",
+    "(campaign #443 Phase-4 adversarial-audit finding 2, esc-074 follow-up):",
+    "these are two DIFFERENT proof mechanisms, not one list split by",
+    "convenience. `fused_op_admission` is ONLY ops",
+    "`crates/jammi-ai/tests/gpu_capability/capability_surface.rs` can attribute",
+    "to a real `jammi_kernels::admission::{admit,admit_cascade}` dispatch-",
+    "registry key \u2014 that test reads THIS key (via `capabilities.",
+    "fused_op_admission`) and, for each op it maps (its own `TWO_ARM_OPS`/",
+    "`CASCADE_OPS` tables + the `attention_block` tier-preemption special",
+    "case), asserts a real registry-counter DELTA around a live forward +",
+    "backward + optimizer step on a real CUDA device \u2014 a Fused dispatch that",
+    "genuinely fired, not a completed-run inference. Two of these eight",
+    "(`softmax`, `rope`) are structurally UNREACHABLE under",
+    "`JAMMI_KERNELS_STRICT=1` through ModernBERT's attention path once",
+    "`attention_block_fused` admits \u2014 see that test's own",
+    "`STRICT_UNREACHABLE_OPS` doc \u2014 so the test logs them informationally",
+    "rather than asserting `Holds`; they stay listed here (removing them would",
+    "misrepresent them as never covered by fused-kernel authoring, which is",
+    "false \u2014 they DO have real registry keys, just not an independently",
+    "provable Strict-mode run through this attention path) but a manifest",
+    "consumer must not read every `fused_op_admission` entry as \"asserted",
+    "Holds\" without also reading that test's own per-op caveats.",
+    "`fused_kernels_compiled` is the OPPOSITE case: ops W2c gave real f16 CUDA",
+    "kernels and dispatch arms (`crates/jammi-kernels/src/cuda/*_f16.cu`) but",
+    "which have NO `admit()`/`admit_cascade()` call site anywhere in the",
+    "workspace today (verified by reading, never editing, every call site \u2014",
+    "see `capability_surface.rs`'s `KNOWN_NO_DISPATCH_SITE_OPS` doc) \u2014 so",
+    "there is no dispatch-registry counter for ANY probe, forward or backward,",
+    "to read a delta from. These are proven ONLY by (1) their dispatch arms",
+    "compiling as part of this lane's own build (this manifest's",
+    "`cargo_features` list, exercised by `runpod_gpu_prove.sh`'s capability-",
+    "surface build group and CI's `flash-attn-compile` clippy job) and (2) the",
+    "Strict-mode `capability_surface` probe completing end-to-end on a real",
+    "device without a hard Strict-mode error anywhere else in the dispatch",
+    "graph \u2014 NEVER by a claim that these specific ops dispatched, since no",
+    "registry counter exists to observe that. A future edit that wires a real",
+    "`admit()`/`admit_cascade()` call site for one of these ops (and adds it",
+    "to `capability_surface.rs`'s dispatch tables) is what promotes it from",
+    "`fused_kernels_compiled` to `fused_op_admission`, in the same unit as",
+    "that dispatch-site edit \u2014 never a manifest-only move."
+  ],
+  "lanes": {
+    "cu12-tarball": {
+      "_doc": "The self-contained CUDA `jammi-server` tarball (binary + bundled CUDA runtime .so's + LD_LIBRARY_PATH launcher).",
+      "workflow": ".github/workflows/release-binaries.yml:server-cu12",
+      "package": "jammi-server",
+      "cargo_features": [
+        "cuda",
+        "flash-attn",
+        "jetstream-broker",
+        "storage-cloud"
+      ],
+      "capabilities": {
+        "cuda_compiled": true,
+        "flash_compiled": true,
+        "flash_dtypes": [
+          "bf16",
+          "f16"
+        ],
+        "fused_op_admission": [
+          "layer_norm",
+          "softmax",
+          "geglu",
+          "rope",
+          "attention_block",
+          "mem_efficient_attention",
+          "low_rank_residual_linear",
+          "dropout"
+        ],
+        "fused_kernels_compiled": [
+          "rope_positions",
+          "axpy",
+          "cast_scale",
+          "scaled_cast_add"
+        ]
+      }
+    },
+    "cu12-wheel": {
+      "_doc": "The `jammi-server-cu12` PyPI wheel, built through `_pypi-server.yml` (reusable) by `.github/workflows/pypi-server-cuda.yml`.",
+      "workflow": ".github/workflows/pypi-server-cuda.yml (via _pypi-server.yml)",
+      "package": "jammi-server",
+      "cargo_features": [
+        "cuda",
+        "flash-attn",
+        "jetstream-broker",
+        "storage-cloud"
+      ],
+      "capabilities": {
+        "cuda_compiled": true,
+        "flash_compiled": true,
+        "flash_dtypes": [
+          "bf16",
+          "f16"
+        ],
+        "fused_op_admission": [
+          "layer_norm",
+          "softmax",
+          "geglu",
+          "rope",
+          "attention_block",
+          "mem_efficient_attention",
+          "low_rank_residual_linear",
+          "dropout"
+        ],
+        "fused_kernels_compiled": [
+          "rope_positions",
+          "axpy",
+          "cast_scale",
+          "scaled_cast_add"
+        ]
+      }
+    },
+    "cu12-image": {
+      "_doc": "The `jammi-ai-server-cu12` container image's `runtime-cuda`/`builder-cuda` Dockerfile stage, published by `.github/workflows/server-image.yml`.",
+      "workflow": ".github/workflows/server-image.yml:build-and-push-cu12 (Dockerfile builder-cuda stage)",
+      "package": "jammi-server",
+      "cargo_features": [
+        "cuda",
+        "flash-attn",
+        "jetstream-broker",
+        "storage-cloud"
+      ],
+      "capabilities": {
+        "cuda_compiled": true,
+        "flash_compiled": true,
+        "flash_dtypes": [
+          "bf16",
+          "f16"
+        ],
+        "fused_op_admission": [
+          "layer_norm",
+          "softmax",
+          "geglu",
+          "rope",
+          "attention_block",
+          "mem_efficient_attention",
+          "low_rank_residual_linear",
+          "dropout"
+        ],
+        "fused_kernels_compiled": [
+          "rope_positions",
+          "axpy",
+          "cast_scale",
+          "scaled_cast_add"
+        ]
+      }
+    }
+  },
+  "server_only_cargo_features": {
+    "_doc": [
+      "Features that exist on `jammi-server` with no `jammi-ai` equivalent",
+      "(broker/cloud-storage plumbing the embedded engine crate does not",
+      "carry). A consumer deriving the `jammi-ai`-applicable subset of a",
+      "lane's `cargo_features` (e.g. `runpod_gpu_prove.sh`'s capability-",
+      "surface build, which runs `cargo test -p jammi-ai --features <subset>`",
+      "rather than `-p jammi-server`) subtracts this list from",
+      "`lanes.<lane>.cargo_features`. Every lane above resolves to",
+      "`[\"cuda\", \"flash-attn\"]` on `jammi-ai` once these are removed."
+    ],
+    "features": [
+      "jetstream-broker",
+      "storage-cloud"
+    ]
+  }
+}

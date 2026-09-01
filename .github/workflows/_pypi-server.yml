@@ -64,6 +64,16 @@ on:
         type: boolean
         required: false
         default: false
+      init_cutlass_submodule:
+        description: >
+          Init the vendored CUTLASS submodule (crates/jammi-kernels/third_party/
+          cutlass) before the binary build — required when `cargo_features`
+          includes `flash-attn` (the cu12 CUDA wheel lane). Default false, so
+          the CPU wheel caller (`pypi-server.yml`) stays byte-unaffected: it
+          never sets this input and this step no-ops for it.
+        type: boolean
+        required: false
+        default: false
 
 # Least privilege: nothing in this reusable publishes, so no job here needs
 # `id-token: write` — that lives on each caller's own publish job.
@@ -80,6 +90,23 @@ jobs:
     container: ${{ inputs.container_image }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Deliberately NOT `submodules: recursive` — a targeted init below
+          # (only when `init_cutlass_submodule` is set) keeps the scope
+          # auditable and leaves the CPU wheel caller's checkout untouched.
+          submodules: false
+
+      # `flash-attn` (the cu12 CUDA wheel lane's manifest-declared feature)
+      # needs the vendored CUTLASS submodule at build time (`build.rs::
+      # build_flash_attn`). Scoped to this job's own checkout only, same
+      # idiom as `ci.yml`'s `flash-attn-compile` job and `release-binaries.
+      # yml`'s `server-cu12` job. A no-op when `init_cutlass_submodule` is
+      # false (the CPU wheel lane never sets it).
+      - name: Init the CUTLASS submodule (scoped to this job's checkout only)
+        if: inputs.init_cutlass_submodule
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
 
       - uses: ./.github/actions/setup-rust-ci
         with:

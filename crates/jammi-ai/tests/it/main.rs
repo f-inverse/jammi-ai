@@ -1,3 +1,4 @@
+mod acceleration_report;
 mod asof_merge;
 mod asof_scale;
 mod asof_verb;

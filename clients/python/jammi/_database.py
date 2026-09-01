@@ -744,6 +744,58 @@ class RemoteTrainingJob:
                 f"as JSON: {exc}"
             ) from exc
 
+    def acceleration_report(self) -> Optional[Dict[str, Any]]:
+        """GPU-acceleration determination for this job, as a dict or ``None``
+        (esc-075, campaign #443).
+
+        The remote peer of the embedded `TrainingJob.acceleration_report`:
+        parses the `TrainingStatusResponse.acceleration_report_json` field the
+        server fills verbatim from the catalog's
+        `training_jobs.acceleration_report` column — computed by the claiming
+        worker at device-resolution time, before the training loop's first
+        step, so a poll mid-training (or after completion) always finds
+        either the submission-time ``{"state": "pending"}`` marker (no
+        claimant has computed a determination yet) or a ``{"state":
+        "determined", ...}`` payload carrying ``dtype``, ``cuda_compiled``,
+        ``flash_compiled``, a per-op ``ops`` map, and a ``flash`` field. Each
+        ``ops``/``flash`` entry is ``{"holds": bool, "reason": str}`` —
+        ``holds: true`` means the real fused kernel dispatched for this job's
+        own probe forward pass; ``holds: false`` carries the SAME domain-check
+        ``reason`` key the kernel's own admission predicate recorded, never a
+        re-derived one. A non-fine-tune job kind or a pre-device-resolution
+        failure may record a different ``"state"`` (``"not_applicable"`` /
+        ``"undetermined"``) — the vocabulary is owned by the producer, not
+        enumerated here.
+
+        Returns ``None`` for a legacy row predating the column (`optional`
+        unset on the wire, mirroring SQL `NULL`) — an honest absence of
+        information, never coerced into `{}` or any acceleration-state claim.
+        Deliberately distinct from the ``{"state": "pending"}`` marker every
+        job submitted after migration 026 carries. Mirrors the embedded
+        `TrainingJob.acceleration_report`'s own `None`-for-`NULL` contract
+        exactly — the two transports must agree on this tri-state, not merely
+        both "return something" (`metrics()`'s `{}`-for-absent default does
+        NOT apply here: that column's `NULL` and "not recorded yet" are the
+        same state, whereas `acceleration_report`'s `NULL` and `"pending"` are
+        deliberately two different, distinguishable states).
+
+        Raises :class:`jammi.errors.BackendError` if `acceleration_report_json`
+        IS set but fails to parse as JSON — a catalog data-integrity fault,
+        never silently folded into the "absent" `None` case. Mirrors the
+        embedded `TrainingJob.acceleration_report`, which raises the same
+        class for the same present-but-malformed state.
+        """
+        resp = self._status_response()
+        if not resp.HasField("acceleration_report_json"):
+            return None
+        try:
+            return json.loads(resp.acceleration_report_json)
+        except json.JSONDecodeError as exc:
+            raise BackendError(
+                f"training job {self._job_id}: acceleration_report blob failed "
+                f"to parse as JSON: {exc}"
+            ) from exc
+
 
 class RemoteDatabase:
     """A Database driving a remote jammi engine over the `jammi.v1` gRPC wire.

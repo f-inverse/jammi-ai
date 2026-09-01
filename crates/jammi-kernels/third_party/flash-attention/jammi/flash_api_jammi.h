@@ -1,7 +1,10 @@
 /*
  * flash_api_jammi.h — torch-free C ABI over the vendored FlashAttention-2
- * hdim64 / bf16 / sm80 / non-causal forward + backward kernels
- * (`third_party/flash-attention/src/flash_{fwd,bwd}_hdim64_bf16_sm80.cu`).
+ * hdim64 / bf16-or-fp16 / sm80 / non-causal forward + backward kernels
+ * (`third_party/flash-attention/src/flash_{fwd,bwd}_hdim64_{bf16,fp16}_sm80.cu`
+ * — campaign #443 D2 adds the fp16 pair alongside the original bf16 one;
+ * `dtype` below (0 = bf16, 1 = fp16) selects which explicit specialisation
+ * `flash_api_jammi.cu` calls).
  *
  * This file is jammi's own (not upstream). It exists so the Rust side
  * (`crates/jammi-kernels/src/flash/mod.rs`) never has to see
@@ -106,15 +109,30 @@ enum jammi_flash_status {
     /* `window_size_left` / `window_size_right` below -1 (the only negative
      * value with a meaning is -1 = unbounded). */
     JAMMI_FLASH_ERR_WINDOW = 13,
+    /* `dtype` is neither 0 (bf16) nor 1 (fp16) — campaign #443 D2. */
+    JAMMI_FLASH_ERR_DTYPE = 14,
+};
+
+/* Element dtype selector for `dtype` below (campaign #443 D2): selects
+ * which of the two compiled explicit specialisations
+ * (`run_mha_{fwd,bwd}_<cutlass::bfloat16_t, 64, false>` /
+ * `run_mha_{fwd,bwd}_<cutlass::half_t, 64, false>`) `flash_api_jammi.cu`
+ * calls. Every buffer's element type (`qkv`/`o`/`d_o`/`d_qkv`) is this
+ * dtype; `softmax_lse`/`softmax_d`/`dq_accum` stay `f32` regardless. */
+enum jammi_flash_dtype {
+    JAMMI_FLASH_DTYPE_BF16 = 0,
+    JAMMI_FLASH_DTYPE_FP16 = 1,
 };
 
 /* Forward arguments. Field order: 8-byte fields first (pointers, i64),
  * then 4-byte fields, so the C and Rust layouts carry no interior padding
  * that could differ between the two. `struct_size` MUST be set to
- * sizeof(jammi_flash_varlen_fwd_args) by the caller. */
+ * sizeof(jammi_flash_varlen_fwd_args) by the caller. `dtype` (campaign
+ * #443 D2) is a 4-byte field, placed with the other 4-byte fields — its
+ * addition does not change any OTHER field's offset, only appends one. */
 typedef struct jammi_flash_varlen_fwd_args {
-    const void *qkv;            /* bf16 [total_q, 3, num_heads, 64] */
-    void *o;                    /* bf16 [total_q, num_heads, 64] */
+    const void *qkv;            /* dtype [total_q, 3, num_heads, 64] */
+    void *o;                    /* dtype [total_q, num_heads, 64] */
     float *softmax_lse;         /* f32  [num_heads, total_q] */
     const int32_t *cu_seqlens;  /* i32  [batch + 1], device, cumulative */
     void *stream;               /* cudaStream_t (CUstream); NULL = default */
@@ -132,15 +150,16 @@ typedef struct jammi_flash_varlen_fwd_args {
     int32_t window_size_right;  /* -1 = unbounded; else keys <= q + right */
     float softmax_scale;
     float p_dropout;            /* must be 0.0f */
+    int32_t dtype;              /* jammi_flash_dtype: 0 = bf16, 1 = fp16 */
 } jammi_flash_varlen_fwd_args;
 
 /* Backward arguments. Same ordering rule as the forward struct. */
 typedef struct jammi_flash_varlen_bwd_args {
-    const void *qkv;            /* bf16 [total_q, 3, num_heads, 64] */
-    const void *o;              /* bf16 [total_q, num_heads, 64] (the fwd output) */
+    const void *qkv;            /* dtype [total_q, 3, num_heads, 64] */
+    const void *o;              /* dtype [total_q, num_heads, 64] (the fwd output) */
     const float *softmax_lse;   /* f32  [num_heads, total_q] (the fwd lse) */
-    const void *d_o;            /* bf16 [total_q, num_heads, 64] */
-    void *d_qkv;                /* bf16 [total_q, 3, num_heads, 64], written */
+    const void *d_o;            /* dtype [total_q, num_heads, 64] */
+    void *d_qkv;                /* dtype [total_q, 3, num_heads, 64], written */
     float *softmax_d;           /* f32  [num_heads, total_q + 128*batch], scratch */
     float *dq_accum;            /* f32  [dq_accum_splits, total_q + 128*batch, num_heads, 64], scratch */
     const int32_t *cu_seqlens;  /* i32  [batch + 1] */
@@ -165,6 +184,7 @@ typedef struct jammi_flash_varlen_bwd_args {
     float p_dropout;            /* must be 0.0f */
     int32_t deterministic;      /* 0 / 1 */
     int32_t dq_accum_splits;    /* the split count dq_accum was allocated with */
+    int32_t dtype;              /* jammi_flash_dtype: 0 = bf16, 1 = fp16 */
 } jammi_flash_varlen_bwd_args;
 
 /* Runs the forward. Writes `o` and `softmax_lse`. Asynchronous on `stream`. */

@@ -1431,7 +1431,12 @@ if command -v tmux >/dev/null 2>&1 && command -v flock >/dev/null 2>&1; then
     # --- 8d (B3): rc=0 — a real successful job, driven through the ACTUAL
     # wrapper the way `run` builds it, then read back by rp_job_wait_script.
     TREED="$G8_SANDBOX/tree-ok"; mkdir -p "$TREED"
-    wrap_ok="$(rp_job_wrapper_with_marker_lines "$TREED" "$TREED/.target" "true" "tokOK" "0")"
+    wrap_ok="$(rp_job_wrapper_with_marker_lines "$TREED" "$TREED/.target" "true" "tokOK" "0" "wave-g8" "ok-tree")"
+    # The wrapper's own generated text hardcodes /root/.jammi-active-wave
+    # (esc-077-class one-pod-per-wave claim); substituted here to a
+    # SANDBOXED path — same idiom 8f already uses for /root/.jammi-timing.lock
+    # — so this test never touches the real /root on the machine running it.
+    wrap_ok="${wrap_ok//\/root\/.jammi-active-wave/$TREED/.jammi-active-wave}"
     printf '%s\n' "$wrap_ok" > "$TREED/.jammi-job.sh"
     bash "$TREED/.jammi-job.sh" > "$TREED/.jammi.log" 2>&1
     job_ok_rc=$?
@@ -1451,7 +1456,8 @@ if command -v tmux >/dev/null 2>&1 && command -v flock >/dev/null 2>&1; then
     # exact case rp_job_wrapper_with_marker_lines's own `( job )` subshell
     # wrapping exists to contain: an unwrapped bare `exit` would terminate
     # the WHOLE generated script, skipping the marker write below it.
-    wrap_fail="$(rp_job_wrapper_with_marker_lines "$TREEF" "$TREEF/.target" "exit 3" "tokFAIL" "0")"
+    wrap_fail="$(rp_job_wrapper_with_marker_lines "$TREEF" "$TREEF/.target" "exit 3" "tokFAIL" "0" "wave-g8" "fail-tree")"
+    wrap_fail="${wrap_fail//\/root\/.jammi-active-wave/$TREEF/.jammi-active-wave}"
     printf '%s\n' "$wrap_fail" > "$TREEF/.jammi-job.sh"
     bash "$TREEF/.jammi-job.sh" > "$TREEF/.jammi.log" 2>&1
     job_fail_rc=$?
@@ -1473,11 +1479,12 @@ if command -v tmux >/dev/null 2>&1 && command -v flock >/dev/null 2>&1; then
     tmux kill-session -t "=jammi-g8-lockholder-$$" 2>/dev/null
     tmux new-session -d -s "jammi-g8-lockholder-$$" "exec 9>'$LOCKFILE'; flock -x 9; sleep 5"
     sleep 0.3
-    wrap_lock="$(rp_job_wrapper_with_marker_lines "$TREEL" "$TREEL/.target" "true" "tokLOCK" "1")"
-    # The wrapper's own generated text hardcodes /root/.jammi-timing.lock;
-    # substituted here to the SANDBOXED lock file so this test never
-    # touches the real path.
+    wrap_lock="$(rp_job_wrapper_with_marker_lines "$TREEL" "$TREEL/.target" "true" "tokLOCK" "1" "wave-g8" "lock-tree")"
+    # The wrapper's own generated text hardcodes /root/.jammi-timing.lock
+    # AND /root/.jammi-active-wave; both substituted here to SANDBOXED
+    # paths so this test never touches either real path.
     wrap_lock="${wrap_lock//\/root\/.jammi-timing.lock/$LOCKFILE}"
+    wrap_lock="${wrap_lock//\/root\/.jammi-active-wave/$TREEL/.jammi-active-wave}"
     printf '%s\n' "$wrap_lock" > "$TREEL/.jammi-job.sh"
     bash "$TREEL/.jammi-job.sh" > "$TREEL/.jammi.log" 2>&1
     job_lock_rc=$?
@@ -1518,6 +1525,416 @@ while IFS=: read -r status name; do
     bad "$name"
   fi
 done < "$RESULTS"
+
+# ═════════════════════════════════════════════════════════════════════════
+# Group 9 (esc-077) — `run` refuses a job whose CARGO_TARGET_DIR never went
+# through the seed-clone substrate. Two layers: (9a) a hermetic, no-ssh unit
+# test of the state-classification TEXT itself (rp_target_preflight_lines,
+# runpod_lib.sh) against real local fixture directories — the SSH-mocked
+# Group 7 idiom below only proves `run`'s DISPATCH on a given canned answer,
+# never that the embedded remote script computes the right answer against a
+# real filesystem; (9b-9e) the SAME WAITBIN ssh-stub idiom Group 7 uses,
+# proving `run`'s own refuse/proceed/override control flow end to end.
+# ═════════════════════════════════════════════════════════════════════════
+
+# --- 9a: rp_target_preflight_lines classifies MISSING/UNMARKED/OK correctly
+# against real directories — no ssh, no pod, no mocking. Subshelled so
+# sourcing runpod_lib.sh (which requires RUNPOD_API_KEY, unrelated to any
+# other group's own env) never leaks into the rest of this suite. Writes to
+# a group-LOCAL results file via `record` (never `ok`/`bad` directly inside
+# the subshell — `ok`/`bad` increment the PASS/FAIL COUNTERS by mutating
+# global variables, and a subshell's variable mutations are discarded the
+# instant it exits, exactly like Group 0's own `record`-in-a-subshell
+# idiom above); the OUTER shell tallies this group-local file right after,
+# so the counters actually persist.
+G9A_RESULTS="$SANDBOX/g9a-results.log"
+: > "$G9A_RESULTS"
+(
+  RUNPOD_API_KEY="test-dummy-key"
+  # shellcheck source=ci/scripts/runpod_lib.sh
+  source "$DIR/runpod_lib.sh"
+  record() { echo "$1:$2" >> "$G9A_RESULTS"; }
+  G9A_SANDBOX="$SANDBOX/g9a"; mkdir -p "$G9A_SANDBOX"
+
+  out_missing="$(bash <(rp_target_preflight_lines "$G9A_SANDBOX/does-not-exist"))"
+  if [ "$out_missing" = "GPU_DEV_TARGET_STATE=MISSING" ]; then
+    record PASS "rp_target_preflight_lines: MISSING target dir classified MISSING"
+  else
+    record FAIL "rp_target_preflight_lines: expected MISSING (got: $out_missing)"
+  fi
+
+  mkdir -p "$G9A_SANDBOX/unmarked"
+  out_unmarked="$(bash <(rp_target_preflight_lines "$G9A_SANDBOX/unmarked"))"
+  if [ "$out_unmarked" = "GPU_DEV_TARGET_STATE=UNMARKED" ]; then
+    record PASS "rp_target_preflight_lines: existing but unmarked target dir classified UNMARKED"
+  else
+    record FAIL "rp_target_preflight_lines: expected UNMARKED (got: $out_unmarked)"
+  fi
+
+  mkdir -p "$G9A_SANDBOX/marked"
+  : > "$G9A_SANDBOX/marked/.jammi-clone-of-seed"
+  out_ok="$(bash <(rp_target_preflight_lines "$G9A_SANDBOX/marked"))"
+  if [ "$out_ok" = "GPU_DEV_TARGET_STATE=OK" ]; then
+    record PASS "rp_target_preflight_lines: a marked (.jammi-clone-of-seed present) target dir classified OK"
+  else
+    record FAIL "rp_target_preflight_lines: expected OK (got: $out_ok)"
+  fi
+)
+while IFS=: read -r status name; do
+  [ -n "$status" ] || continue
+  if [ "$status" = "PASS" ]; then ok "$name"; else bad "$name"; fi
+done < "$G9A_RESULTS"
+
+# --- 9b-9e: `run`'s own dispatch, over the SAME WAITBIN ssh-stub Group 7
+# builds above (call order: #1 require_pod liveness, #2 the esc-077
+# preflight — SKIPPED entirely under RP_ALLOW_COLD_TARGET=1 — #3 the real
+# job-launch heredoc, reached only when the preflight allows it).
+G9_SESSION="g9run"; write_meta "$G9_SESSION" "pod-g9run" "8"
+
+# --- 9b: MISSING target dir -> refuse (exit 1), remedy named -------------
+G9B_DIR="$SANDBOX/g9b-ssh"; mkdir -p "$G9B_DIR"
+write_ssh_resp "$G9B_DIR" 1 0                                  # require_pod liveness
+write_ssh_resp "$G9B_DIR" 2 0 "GPU_DEV_TARGET_STATE=MISSING"   # esc-077 preflight
+rm -f "$SANDBOX/g9b-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g9b-counter" MOCK_SSH_RESPONSES_DIR="$G9B_DIR" \
+  PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" run "$G9_SESSION" echo hi \
+  >"$SANDBOX/out-g9b.log" 2>&1
+g9b_rc=$?
+if [ "$g9b_rc" -ne 0 ] && grep -q "does not exist on the pod" "$SANDBOX/out-g9b.log" \
+  && grep -q "target ${G9_SESSION} jammi-ai --with-cutlass" "$SANDBOX/out-g9b.log" \
+  && grep -q "RP_ALLOW_COLD_TARGET=1" "$SANDBOX/out-g9b.log" \
+  && [ "$(cat "$SANDBOX/g9b-counter")" = "2" ]; then
+  ok "run (esc-077): refuses a MISSING target dir (exit $g9b_rc), naming the target remedy and the override, never reaching the job-launch call"
+else
+  bad "run (esc-077): expected a named MISSING refusal + exactly 2 ssh calls (got rc=$g9b_rc, calls=$(cat "$SANDBOX/g9b-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9b.log")"
+fi
+
+# --- 9c: existing-but-UNMARKED target dir -> refuse (exit 1) --------------
+G9C_DIR="$SANDBOX/g9c-ssh"; mkdir -p "$G9C_DIR"
+write_ssh_resp "$G9C_DIR" 1 0
+write_ssh_resp "$G9C_DIR" 2 0 "GPU_DEV_TARGET_STATE=UNMARKED"
+rm -f "$SANDBOX/g9c-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g9c-counter" MOCK_SSH_RESPONSES_DIR="$G9C_DIR" \
+  PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" run "$G9_SESSION" echo hi \
+  >"$SANDBOX/out-g9c.log" 2>&1
+g9c_rc=$?
+if [ "$g9c_rc" -ne 0 ] && grep -q "no seed-clone marker" "$SANDBOX/out-g9c.log" \
+  && grep -q "RP_ALLOW_COLD_TARGET=1" "$SANDBOX/out-g9c.log" \
+  && [ "$(cat "$SANDBOX/g9c-counter")" = "2" ]; then
+  ok "run (esc-077): refuses an existing but UNMARKED target dir (exit $g9c_rc), never reaching the job-launch call"
+else
+  bad "run (esc-077): expected a named UNMARKED refusal + exactly 2 ssh calls (got rc=$g9c_rc, calls=$(cat "$SANDBOX/g9c-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9c.log")"
+fi
+
+# --- 9d: a marked clone (OK) -> proceeds past esc-077 into the NEW
+# concurrency preflight (call #3, CLEAR here) -> the real job-launch call
+# (#4). This call count grew by one now that the one-pod-per-wave
+# concurrency preflight also runs by default (RP_ALLOW_CONCURRENT unset).
+G9D_DIR="$SANDBOX/g9d-ssh"; mkdir -p "$G9D_DIR"
+write_ssh_resp "$G9D_DIR" 1 0
+write_ssh_resp "$G9D_DIR" 2 0 "GPU_DEV_TARGET_STATE=OK"
+write_ssh_resp "$G9D_DIR" 3 0 "GPU_DEV_CONCURRENCY_STATE=CLEAR"
+write_ssh_resp "$G9D_DIR" 4 0 "started"
+rm -f "$SANDBOX/g9d-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g9d-counter" MOCK_SSH_RESPONSES_DIR="$G9D_DIR" \
+  PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" run "$G9_SESSION" echo hi \
+  >"$SANDBOX/out-g9d.log" 2>&1
+if [ "$(cat "$SANDBOX/g9d-counter")" = "4" ] && grep -q "detached" "$SANDBOX/out-g9d.log"; then
+  ok "run (esc-077): a marked (OK) clone + a CLEAR concurrency check proceeds to the real job-launch call"
+else
+  bad "run (esc-077): expected exactly 4 ssh calls (target preflight OK -> concurrency preflight CLEAR -> job launch) (got calls=$(cat "$SANDBOX/g9d-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9d.log")"
+fi
+
+# --- 9e: RP_ALLOW_COLD_TARGET=1 skips ONLY the target preflight — the
+# concurrency preflight still runs (a separate override, RP_ALLOW_CONCURRENT,
+# gates it) -------------------------------------------------------------
+G9E_DIR="$SANDBOX/g9e-ssh"; mkdir -p "$G9E_DIR"
+write_ssh_resp "$G9E_DIR" 1 0
+write_ssh_resp "$G9E_DIR" 2 0 "GPU_DEV_CONCURRENCY_STATE=CLEAR"  # the concurrency preflight, now #2
+write_ssh_resp "$G9E_DIR" 3 0 "started"                          # the job-launch call, now #3
+rm -f "$SANDBOX/g9e-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g9e-counter" MOCK_SSH_RESPONSES_DIR="$G9E_DIR" \
+  RP_ALLOW_COLD_TARGET=1 \
+  PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" run "$G9_SESSION" echo hi \
+  >"$SANDBOX/out-g9e.log" 2>&1
+if [ "$(cat "$SANDBOX/g9e-counter")" = "3" ] && grep -q "detached" "$SANDBOX/out-g9e.log"; then
+  ok "run (esc-077): RP_ALLOW_COLD_TARGET=1 skips ONLY the target preflight (liveness + concurrency preflight + job launch = 3 calls)"
+else
+  bad "run (esc-077): expected RP_ALLOW_COLD_TARGET=1 to skip straight to the concurrency preflight then job launch (3 total calls) (got calls=$(cat "$SANDBOX/g9e-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9e.log")"
+fi
+
+# ═════════════════════════════════════════════════════════════════════════
+# Group 10 (one-pod-per-wave, WAVE-scoped, same class as esc-077) —
+# operator-directed refinement of the original tree-scoped gate: `run`
+# refuses only when a LIVE job belongs to a DIFFERENT wave; a wave's own
+# sub-units may share a pod across DIFFERENT trees under the SAME wave id.
+# ═════════════════════════════════════════════════════════════════════════
+
+# --- 10a: rp_concurrency_preflight_lines classifies BUSY/CLEAR correctly
+# against a FAKED `tmux` + a fixture `/root/.jammi-active-wave`-shaped file
+# — no ssh, no pod, no mocking of gpu-dev.sh itself. Same isolation
+# rationale as 9a (subshell + group-local results file + outer tally,
+# since `ok`/`bad` mutate counters a subshell cannot persist). The real
+# function hardcodes `/root/.jammi-active-wave`; these cases patch that
+# ONE literal path in the GENERATED text to a sandbox path before
+# executing it (never touching a real /root) — the generated text is
+# otherwise run completely unmodified.
+G10A_RESULTS="$SANDBOX/g10a-results.log"
+: > "$G10A_RESULTS"
+(
+  RUNPOD_API_KEY="test-dummy-key"
+  # shellcheck source=ci/scripts/runpod_lib.sh
+  source "$DIR/runpod_lib.sh"
+  record() { echo "$1:$2" >> "$G10A_RESULTS"; }
+
+  G10A_STUBDIR="$SANDBOX/g10a-fakebin"; mkdir -p "$G10A_STUBDIR"
+  G10A_ROOT="$SANDBOX/g10a-fakeroot"; mkdir -p "$G10A_ROOT"
+  fake_tmux() { # $1=newline-joined session list
+    printf '%s' "$1" > "$G10A_STUBDIR/tmux.sessions"
+    cat > "$G10A_STUBDIR/tmux" <<STUB
+#!/usr/bin/env bash
+if [ "\$1" = "list-sessions" ]; then
+  cat "$G10A_STUBDIR/tmux.sessions"
+fi
+STUB
+    chmod +x "$G10A_STUBDIR/tmux"
+  }
+  # $1=own_session $2=own_wave -> runs the REAL generated text, with only
+  # the hardcoded claim path redirected into the sandbox.
+  run_preflight() {
+    local gen; gen="$(rp_concurrency_preflight_lines "$1" "$2")"
+    gen="${gen//\/root\/.jammi-active-wave/$G10A_ROOT/.jammi-active-wave}"
+    PATH="$G10A_STUBDIR:$PATH" bash -c "$gen"
+  }
+
+  fake_tmux $'jammi-seed\njammi-othertree\njammi-mywork\n'
+  rm -f "$G10A_ROOT/.jammi-active-wave"
+  printf 'WAVE=wave-B\nTREE=othertree\nTS=2026-09-01T00:00:00Z\n' > "$G10A_ROOT/.jammi-active-wave"
+  out="$(run_preflight "jammi-mywork" "wave-A")"
+  if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=BUSY:wave-B:jammi-othertree" ]; then
+    record PASS "rp_concurrency_preflight_lines: cross-wave (live other tree's claim names a DIFFERENT wave) classified BUSY, naming the owning wave and the session"
+  else
+    record FAIL "rp_concurrency_preflight_lines: expected BUSY:wave-B:jammi-othertree (got: $out)"
+  fi
+
+  printf 'WAVE=wave-A\nTREE=othertree\nTS=2026-09-01T00:00:00Z\n' > "$G10A_ROOT/.jammi-active-wave"
+  out="$(run_preflight "jammi-mywork" "wave-A")"
+  if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=CLEAR" ]; then
+    record PASS "rp_concurrency_preflight_lines: same-wave-two-trees (live other tree's claim names the SAME wave) classified CLEAR — the sanctioned sub-unit-sharing shape"
+  else
+    record FAIL "rp_concurrency_preflight_lines: expected CLEAR for a matching wave claim on a different tree (got: $out)"
+  fi
+
+  rm -f "$G10A_ROOT/.jammi-active-wave"
+  out="$(run_preflight "jammi-mywork" "wave-A")"
+  if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=BUSY:UNKNOWN:jammi-othertree" ]; then
+    record PASS "rp_concurrency_preflight_lines: a live other session with NO readable active-wave claim fails CLOSED (BUSY:UNKNOWN), never silently assumed safe"
+  else
+    record FAIL "rp_concurrency_preflight_lines: expected BUSY:UNKNOWN:jammi-othertree for a missing claim file (got: $out)"
+  fi
+
+  fake_tmux $'jammi-seed\njammi-mywork\n'
+  out="$(run_preflight "jammi-mywork" "wave-A")"
+  if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=CLEAR" ]; then
+    record PASS "rp_concurrency_preflight_lines: this tree's own session (+ the boot-time seed) is never mistaken for cross-wave contention"
+  else
+    record FAIL "rp_concurrency_preflight_lines: expected CLEAR for own-session-only (got: $out)"
+  fi
+
+  fake_tmux ''
+  out="$(run_preflight "jammi-mywork" "wave-A")"
+  if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=CLEAR" ]; then
+    record PASS "rp_concurrency_preflight_lines: no tmux sessions at all classified CLEAR"
+  else
+    record FAIL "rp_concurrency_preflight_lines: expected CLEAR for no sessions (got: $out)"
+  fi
+
+  # Stale-claim handling (explicit regression pin, item 4): a claim FILE
+  # naming a totally different wave sits on disk, but NO tmux session is
+  # actually alive (the wrapper's own cleanup was interrupted — SIGKILL/
+  # pod death — before it could `rm -f` the claim). tmux liveness is
+  # checked FIRST and is the PRIMARY signal here: with no live OTHER
+  # session at all, this must read CLEAR regardless of what the stale file
+  # says — failing OPEN on staleness, per this campaign's own instruction,
+  # rather than refusing forever on an orphaned file no process will ever
+  # clean up again.
+  printf 'WAVE=wave-B\nTREE=othertree\nTS=2020-01-01T00:00:00Z\n' > "$G10A_ROOT/.jammi-active-wave"
+  out="$(run_preflight "jammi-mywork" "wave-A")"
+  if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=CLEAR" ]; then
+    record PASS "rp_concurrency_preflight_lines: a stale claim (file present, NO live tmux session for it) is treated CLEAR -- tmux liveness is the primary signal, fail OPEN on staleness"
+  else
+    record FAIL "rp_concurrency_preflight_lines: expected CLEAR for a stale claim with no live session (got: $out)"
+  fi
+)
+while IFS=: read -r status name; do
+  [ -n "$status" ] || continue
+  if [ "$status" = "PASS" ]; then ok "$name"; else bad "$name"; fi
+done < "$G10A_RESULTS"
+
+# --- 10b-10e: `run`'s own dispatch, SSH-mocked (call order: #1 liveness,
+# #2 target preflight OK, #3 concurrency preflight, #4 job launch — unless
+# an override skips a step). The concurrency-preflight response is now
+# `GPU_DEV_CONCURRENCY_STATE=<CLEAR|BUSY:<wave>:<session>>`.
+
+# --- 10b: cross-wave refuses, naming the wave -----------------------------
+G10B_DIR="$SANDBOX/g10b-ssh"; mkdir -p "$G10B_DIR"
+write_ssh_resp "$G10B_DIR" 1 0
+write_ssh_resp "$G10B_DIR" 2 0 "GPU_DEV_TARGET_STATE=OK"
+write_ssh_resp "$G10B_DIR" 3 0 "GPU_DEV_CONCURRENCY_STATE=BUSY:wave-B:jammi-othertree"
+rm -f "$SANDBOX/g10b-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g10b-counter" MOCK_SSH_RESPONSES_DIR="$G10B_DIR" \
+  PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" run "$G9_SESSION" echo hi \
+  >"$SANDBOX/out-g10b.log" 2>&1
+g10b_rc=$?
+if [ "$g10b_rc" -ne 0 ] && grep -q "already has a live job for wave 'wave-B'" "$SANDBOX/out-g10b.log" \
+  && grep -q "RP_SESSION=<alias> $(basename "$DIR/gpu-dev.sh") up <arch>" "$SANDBOX/out-g10b.log" \
+  && grep -q "RP_ALLOW_CONCURRENT=1" "$SANDBOX/out-g10b.log" \
+  && [ "$(cat "$SANDBOX/g10b-counter")" = "3" ]; then
+  ok "run (one-pod-per-wave): cross-wave refuses, naming the owning wave and the remedy, never reaching the job-launch call"
+else
+  bad "run (one-pod-per-wave): expected a named cross-wave BUSY refusal + exactly 3 ssh calls (got rc=$g10b_rc, calls=$(cat "$SANDBOX/g10b-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g10b.log")"
+fi
+
+# --- 10c: same-wave-two-trees (CLEAR) proceeds to job launch --------------
+G10C_DIR="$SANDBOX/g10c-ssh"; mkdir -p "$G10C_DIR"
+write_ssh_resp "$G10C_DIR" 1 0
+write_ssh_resp "$G10C_DIR" 2 0 "GPU_DEV_TARGET_STATE=OK"
+write_ssh_resp "$G10C_DIR" 3 0 "GPU_DEV_CONCURRENCY_STATE=CLEAR"
+write_ssh_resp "$G10C_DIR" 4 0 "started"
+rm -f "$SANDBOX/g10c-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g10c-counter" MOCK_SSH_RESPONSES_DIR="$G10C_DIR" \
+  RP_WAVE=shared-wave \
+  PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" run "$G9_SESSION" echo hi \
+  >"$SANDBOX/out-g10c.log" 2>&1
+if [ "$(cat "$SANDBOX/g10c-counter")" = "4" ] && grep -q "detached" "$SANDBOX/out-g10c.log"; then
+  ok "run (one-pod-per-wave): a CLEAR concurrency state (same wave on a different tree, or a genuine same-tree re-run) proceeds to the job-launch call"
+else
+  bad "run (one-pod-per-wave): expected exactly 4 ssh calls ending in job launch (got calls=$(cat "$SANDBOX/g10c-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g10c.log")"
+fi
+
+# --- 10d: RP_ALLOW_CONCURRENT=1 skips the concurrency preflight call ------
+G10D_DIR="$SANDBOX/g10d-ssh"; mkdir -p "$G10D_DIR"
+write_ssh_resp "$G10D_DIR" 1 0
+write_ssh_resp "$G10D_DIR" 2 0 "GPU_DEV_TARGET_STATE=OK"
+write_ssh_resp "$G10D_DIR" 3 0 "started"                       # the job-launch call, now #3
+rm -f "$SANDBOX/g10d-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g10d-counter" MOCK_SSH_RESPONSES_DIR="$G10D_DIR" \
+  RP_ALLOW_CONCURRENT=1 \
+  PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" run "$G9_SESSION" echo hi \
+  >"$SANDBOX/out-g10d.log" 2>&1
+if [ "$(cat "$SANDBOX/g10d-counter")" = "3" ] && grep -q "detached" "$SANDBOX/out-g10d.log"; then
+  ok "run (one-pod-per-wave): RP_ALLOW_CONCURRENT=1 skips the concurrency preflight ssh call entirely (target preflight + job launch = 3 calls incl. liveness)"
+else
+  bad "run (one-pod-per-wave): expected RP_ALLOW_CONCURRENT=1 to skip straight to the job-launch call (3 total calls) (got calls=$(cat "$SANDBOX/g10d-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g10d.log")"
+fi
+
+# --- 10e: default-wave (unset --wave/RP_WAVE) resolves to the TREE name —
+# a regression pin on 8515cbb9's tree-scoped semantics: a caller who opts
+# into NOTHING new must still get exactly the old behavior. Uses a
+# CAPTURING ssh stub (distinct from WAITBIN, which discards its stdin) so
+# the test can inspect the ACTUAL text `run` generated for the concurrency
+# preflight — proving the embedded own-wave value really is the tree name
+# ("jammi-ai", the default `--tree`), not merely that the overall exit
+# code happens to match.
+G10E_CAPTUREBIN="$SANDBOX/g10e-capturebin"; mkdir -p "$G10E_CAPTUREBIN"
+G10E_CAPTURE_DIR="$SANDBOX/g10e-capture"; mkdir -p "$G10E_CAPTURE_DIR"
+cat > "$G10E_CAPTUREBIN/ssh" <<'STUB'
+#!/usr/bin/env bash
+n=0
+[ -f "${MOCK_SSH_CALL_COUNTER:?MOCK_SSH_CALL_COUNTER unset}" ] && n="$(cat "$MOCK_SSH_CALL_COUNTER")"
+n=$((n + 1))
+echo "$n" > "$MOCK_SSH_CALL_COUNTER"
+capdir="${MOCK_SSH_CAPTURE_DIR:?MOCK_SSH_CAPTURE_DIR unset}"
+cat > "$capdir/$n"
+dir="${MOCK_SSH_RESPONSES_DIR:?MOCK_SSH_RESPONSES_DIR unset}"
+resp="$dir/$n"
+[ -f "$resp" ] || resp="$dir/$(ls "$dir" | sort -n | tail -1)"
+rc="$(head -n1 "$resp")"
+tail -n +2 "$resp"
+exit "$rc"
+STUB
+chmod +x "$G10E_CAPTUREBIN/ssh"
+G10E_DIR="$SANDBOX/g10e-ssh"; mkdir -p "$G10E_DIR"
+write_ssh_resp "$G10E_DIR" 1 0
+write_ssh_resp "$G10E_DIR" 2 0 "GPU_DEV_TARGET_STATE=OK"
+write_ssh_resp "$G10E_DIR" 3 0 "GPU_DEV_CONCURRENCY_STATE=CLEAR"
+write_ssh_resp "$G10E_DIR" 4 0 "started"
+rm -f "$SANDBOX/g10e-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g10e-counter" MOCK_SSH_RESPONSES_DIR="$G10E_DIR" \
+  MOCK_SSH_CAPTURE_DIR="$G10E_CAPTURE_DIR" \
+  PATH="$G10E_CAPTUREBIN:$PATH" bash "$DIR/gpu-dev.sh" run "$G9_SESSION" echo hi \
+  >"$SANDBOX/out-g10e.log" 2>&1
+if [ -f "$G10E_CAPTURE_DIR/3" ] && grep -qF "= 'jammi-ai'" "$G10E_CAPTURE_DIR/3"; then
+  ok "run (one-pod-per-wave): default --wave/RP_WAVE resolves to the tree name ('jammi-ai') -- 8515cbb9's tree-scoped default is preserved exactly"
+else
+  bad "run (one-pod-per-wave): expected the concurrency preflight's generated text to compare against wave 'jammi-ai' by default: $(cat "$G10E_CAPTURE_DIR/3" 2>/dev/null || echo '<no call #3 captured>')"
+fi
+
+# ═════════════════════════════════════════════════════════════════════════
+# Group 11 (deployment-gap fix, folded into esc-077) — `target` must ship
+# THIS checkout's OWN pod-side scripts before executing them, never rely on
+# the pod's bootstrapped /root/jammi-ai copies (which predate esc-077 on
+# any pod booted before this PR merges, and would regress the same way any
+# time the pod tree lags the caller). rsync's own wire protocol cannot be
+# answered by the canned-text `ssh` stub the rest of this suite uses (it is
+# a real bidirectional handshake, not a single request/response) — instead
+# a fake `rsync` binary on PATH records its OWN argv, which is exactly the
+# observable this fix is about: did `target` ship this checkout's LOCAL
+# file paths, not merely "did some rsync happen".
+# ═════════════════════════════════════════════════════════════════════════
+G11_SESSION="g11target"; write_meta "$G11_SESSION" "pod-g11target" "8"
+
+G11_RSYNCBIN="$SANDBOX/g11-rsyncbin"; mkdir -p "$G11_RSYNCBIN"
+G11_RSYNC_CALLS="$SANDBOX/g11-rsync-calls.log"
+: > "$G11_RSYNC_CALLS"
+cat > "$G11_RSYNCBIN/rsync" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$G11_RSYNC_CALLS"
+exit 0
+STUB
+chmod +x "$G11_RSYNCBIN/rsync"
+
+G11_DIR="$SANDBOX/g11-ssh"; mkdir -p "$G11_DIR"
+write_ssh_resp "$G11_DIR" 1 0                                     # require_pod liveness
+write_ssh_resp "$G11_DIR" 2 0 "clone complete: /root/target-mytree"  # pod_target_clone.sh, via rp_run_remote
+rm -f "$SANDBOX/g11-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g11-counter" MOCK_SSH_RESPONSES_DIR="$G11_DIR" \
+  PATH="$G11_RSYNCBIN:$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" target "$G11_SESSION" mytree \
+  >"$SANDBOX/out-g11.log" 2>&1
+g11_rc=$?
+if grep -qF "$DIR/pod_target_clone.sh" "$G11_RSYNC_CALLS" \
+  && grep -qF "$DIR/pod_seed_target.sh" "$G11_RSYNC_CALLS" \
+  && grep -qF "$DIR/pod_provision_cutlass.sh" "$G11_RSYNC_CALLS" \
+  && grep -qF "$DIR/pod_push_stamp.sh" "$G11_RSYNC_CALLS" \
+  && grep -qF "/root/.jammi-caller-scripts/" "$G11_RSYNC_CALLS"; then
+  ok "target (deployment-gap fix): stages THIS checkout's own 4 pod-side scripts (never the pod's bootstrapped /root/jammi-ai copies) before executing them"
+else
+  bad "target (deployment-gap fix): expected an rsync call shipping this checkout's own pod_target_clone.sh/pod_seed_target.sh/pod_provision_cutlass.sh/pod_push_stamp.sh to /root/.jammi-caller-scripts/ (rc=$g11_rc); rsync calls: $(cat "$G11_RSYNC_CALLS" 2>/dev/null); out: $(cat "$SANDBOX/out-g11.log")"
+fi
+if [ "$g11_rc" -eq 0 ] && [ "$(cat "$SANDBOX/g11-counter" 2>/dev/null)" = "2" ]; then
+  ok "target (deployment-gap fix): the staging rsync precedes the clone call, which still runs (exactly 2 ssh calls: liveness + clone)"
+else
+  bad "target (deployment-gap fix): expected rc=0 and exactly 2 ssh calls after staging (got rc=$g11_rc, calls=$(cat "$SANDBOX/g11-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g11.log")"
+fi
+
+# --- 11b: --with-cutlass ALSO executes from the staged copy, not
+# /root/jammi-ai's bootstrapped pod_provision_cutlass.sh -----------------
+G11B_DIR="$SANDBOX/g11b-ssh"; mkdir -p "$G11B_DIR"
+write_ssh_resp "$G11B_DIR" 1 0
+write_ssh_resp "$G11B_DIR" 2 0 "clone complete: /root/target-mytree"
+write_ssh_resp "$G11B_DIR" 3 0 "cutlass provisioned"
+rm -f "$SANDBOX/g11b-counter"
+: > "$G11_RSYNC_CALLS"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g11b-counter" MOCK_SSH_RESPONSES_DIR="$G11B_DIR" \
+  PATH="$G11_RSYNCBIN:$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" target "$G11_SESSION" mytree --with-cutlass \
+  >"$SANDBOX/out-g11b.log" 2>&1
+g11b_rc=$?
+if [ "$g11b_rc" -eq 0 ] && [ "$(cat "$SANDBOX/g11b-counter" 2>/dev/null)" = "3" ] \
+  && grep -qF "$DIR/pod_provision_cutlass.sh" "$G11_RSYNC_CALLS"; then
+  ok "target --with-cutlass (deployment-gap fix): also stages + runs pod_provision_cutlass.sh from the staged copy (3 ssh calls: liveness + clone + cutlass)"
+else
+  bad "target --with-cutlass (deployment-gap fix): expected rc=0, exactly 3 ssh calls, and a staged pod_provision_cutlass.sh (got rc=$g11b_rc, calls=$(cat "$SANDBOX/g11b-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g11b.log")"
+fi
 
 echo
 echo "gpu-dev-lifecycle: ${PASS} passed, ${FAIL} failed, ${SKIP} skipped"

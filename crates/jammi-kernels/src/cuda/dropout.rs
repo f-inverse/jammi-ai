@@ -1,13 +1,18 @@
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
 use candle_core::{CudaStorage, DType, Error, Layout, Result, Shape};
-use half::bf16;
+use half::{bf16, f16};
 
-use super::PTX_DROPOUT;
+use super::{PTX_DROPOUT, PTX_DROPOUT_F16};
 use crate::ops::DropoutFused;
 
 /// See `../axpy.rs`'s identical constant for the module-name rationale.
 const MODULE_NAME: &str = "jammi_kernels_dropout";
+
+/// The F16 arm's OWN PTX module name (campaign #443 W2c) — `dropout_f16.cu`
+/// is a SEPARATE translation unit (see that file's module doc), so it needs
+/// a distinct module name from [`MODULE_NAME`].
+const MODULE_NAME_F16: &str = "jammi_kernels_dropout_f16";
 
 /// Grid-stride block size — same choice as `geglu.cu`/`GEGLU_BLOCK`: this
 /// kernel is purely elementwise (no per-row reduction, no shared memory),
@@ -98,6 +103,26 @@ pub(crate) fn cuda_fwd(
             let func =
                 device.get_or_load_custom_func("dropout_fwd_bf16", MODULE_NAME, PTX_DROPOUT)?;
             let out = unsafe { device.alloc::<bf16>(n) }?;
+            let mut builder = func.builder();
+            builder.arg(&seed);
+            builder.arg(&layer_id);
+            builder.arg(&forward_idx);
+            builder.arg(&threshold);
+            builder.arg(&scale);
+            builder.arg(&x);
+            builder.arg(&out);
+            builder.arg(&n_u64);
+            unsafe { builder.launch(cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
+            Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
+        }
+        DType::F16 => {
+            let x = s1.as_cuda_slice::<f16>()?.slice(o1..o2);
+            let func = device.get_or_load_custom_func(
+                "dropout_fwd_f16",
+                MODULE_NAME_F16,
+                PTX_DROPOUT_F16,
+            )?;
+            let out = unsafe { device.alloc::<f16>(n) }?;
             let mut builder = func.builder();
             builder.arg(&seed);
             builder.arg(&layer_id);

@@ -187,6 +187,51 @@ impl PyTrainingJob {
         };
         serializable_to_pydict(py, &value)
     }
+
+    /// This job's per-attempt acceleration determination (esc-075), as a
+    /// dict, or `None`.
+    ///
+    /// This is exactly what the catalog's `training_jobs.acceleration_report`
+    /// column carries, decoded the same way `metrics()` decodes its column —
+    /// but preserving that column's own two-state contract
+    /// (`TrainingJobRecord::acceleration_report`'s doc) rather than
+    /// `metrics()`'s "absent means `{}`" default: SQL `NULL` — a row written
+    /// before migration 026, or one this code never touched — maps to Python
+    /// `None`, an honest absence of information, never silently coerced to
+    /// `{}` or read as any particular acceleration state. A present value
+    /// decodes to a dict whose vocabulary the payload's *producer* owns; the
+    /// catalog itself writes only `{"state": "pending"}` at submission time,
+    /// before any claimant has recorded a determination, and the claiming
+    /// worker typically replaces it with `{"state": "determined", ...}` once
+    /// the device/dtype/kernel-admission probe for this attempt has run.
+    ///
+    /// Raises `jammi.errors.BackendError` if the column IS present but fails
+    /// to parse as JSON — a catalog data-integrity fault, matching
+    /// `metrics()`'s same-shaped guard.
+    fn acceleration_report(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let record = self
+            .runtime
+            .block_on(self.session.catalog().get_training_job(self.job_id_str()))
+            .map_err(to_pyerr)?;
+        match record.acceleration_report.as_deref() {
+            // NULL — honest absence, never coerced into a state claim.
+            None => Ok(py.None()),
+            // Present — must parse. A present-but-unparseable blob is a
+            // catalog data-integrity fault, surfaced LOUDLY rather than
+            // folded into the `None` case (matches `metrics()`'s treatment
+            // of its own malformed-but-present blob).
+            Some(raw) => {
+                let value: serde_json::Value = serde_json::from_str(raw).map_err(|parse_err| {
+                    to_pyerr(JammiError::Catalog(format!(
+                        "training job {}: acceleration_report blob failed to parse as JSON: \
+                         {parse_err}",
+                        self.job_id_str(),
+                    )))
+                })?;
+                serializable_to_pydict(py, &value)
+            }
+        }
+    }
 }
 
 /// Poll `catalog.get_training_job(job_id)` until it reaches a terminal state,

@@ -60,6 +60,7 @@ REQUIRED: dict[str, list[str]] = {
         "source", "base_model", "columns", "method", "task", "embedding_loss",
         "mnrl_temperature", "mine_hard_negatives", "hard_negative_k",
         "hard_negative_exclude_hops", "hard_negative_refresh_every", "matryoshka_dims",
+        "backbone_dtype", "target_modules",
     ],
     "fine_tune_graph": [
         "node_source",

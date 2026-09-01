@@ -364,6 +364,20 @@ ci/scripts/gpu-dev.sh target a100 mywork --with-cutlass   # ALSO requires the pu
 every other verb that acts on tree `mywork` (`run`/`attach`/`push`/`pull`)
 does, so pushing first is the ordinary flow in practice.)
 
+**Version consistency, by construction.** `target` stages THIS checkout's
+OWN `pod_target_clone.sh`/`pod_seed_target.sh`/`pod_provision_cutlass.sh`/
+`pod_push_stamp.sh` to `/root/.jammi-caller-scripts/` and runs THOSE, never
+the pod's bootstrapped `/root/jammi-ai` copies (baked at boot from whatever
+`main` was then) — a pod booted before a marker/behavior change like
+esc-077 landed would otherwise clone successfully with an OLDER
+`pod_target_clone.sh` that stamps no marker, and the very next `run` (whose
+own preflight is always THIS checkout's code) would refuse a perfectly
+legitimate clone. The seed build itself (`gpu-dev.sh up`/`shell`) is the one
+deliberate exception — it runs the pod's OWN bootstrapped
+`pod_seed_target.sh` against that SAME checkout's commit, since seeding a
+tree with a different commit's build script is a worse inconsistency than
+the one being avoided.
+
 Under the hood this is `pod_target_clone.sh <seed-dir> <dest-dir>
 [tree-dir]` (`ci/scripts/gpu-dev.sh:878-881`), which:
 
@@ -386,6 +400,37 @@ Under the hood this is `pod_target_clone.sh <seed-dir> <dest-dir>
    additional to, never a substitute for, the unconditional check in step 3
    — `--verify` only ever runs when a human remembers to run it and only
    catches units Fresh on *this one* build.
+
+5. **Stamps `<dest-dir>/.jammi-clone-of-seed`** (esc-077) with the seed dir,
+   the seed's own completion-marker mtime/sha256, and the clone timestamp —
+   `gpu-dev.sh run` REFUSES a job whose `CARGO_TARGET_DIR` is missing this
+   marker (a raw/cold target dir, never a real clone), naming the exact
+   `target ... --with-cutlass` remedy; `RP_ALLOW_COLD_TARGET=1` is the sole
+   override, for a deliberate cold build (`pod_build_timings.sh`'s own
+   measurement legs bypass `run` entirely and are unaffected — see that
+   script's own module doc). **Documented residual:** this gate covers only
+   a job launched through `run` — a caller who `ssh`es onto the pod directly
+   and invokes `cargo` by hand bypasses it entirely; it is not claimed
+   closed, only that the sanctioned path fails closed.
+
+**One-pod-per-wave, wave-scoped; sub-units share.** `gpu-dev.sh run` REFUSES
+when a LIVE job on the pod belongs to a DIFFERENT wave — `--wave W` /
+`RP_WAVE` names the wave (default: the tree name, exactly preserving the
+tree-scoped behavior a caller who sets neither ever sees). `run` records the
+claim (`/root/.jammi-active-wave`: wave + tree + timestamp) at job launch and
+clears it when the job's tmux session ends; `push` also accepts `--wave`/
+`RP_WAVE` (writes no claim itself — only so an operator can use the SAME
+`--wave` across a push-then-run sequence without either verb rejecting it).
+A wave's own sub-units (e.g. a CPU-build tree and a GPU-test tree) sharing
+ONE `--wave` id may run sequentially on the SAME pod across DIFFERENT trees
+— per-tree tmux still serializes the actual jobs; only a genuinely
+DIFFERENT wave's live job is refused, naming the owning wave and the remedy
+(rent another pod: `RP_SESSION=<alias> gpu-dev.sh up <arch>`), with
+`RP_ALLOW_CONCURRENT=1` as the override for deliberate cross-wave
+co-tenancy. A stale claim (file present, no live tmux session — e.g. the
+wrapper's own cleanup was interrupted by a SIGKILL/pod death) is treated
+CLEAR: tmux liveness is the primary signal, never the claim file alone.
+Same documented-residual scope as above.
 
 **Poisoned-clone detection**, concretely:
 

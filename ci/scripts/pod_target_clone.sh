@@ -105,4 +105,36 @@ if ! pod_seed_assert_member_free "$DEST_DIR" "$TREE_DIR_FOR_METADATA"; then
   exit 1
 fi
 
+# esc-077: stamp a marker INSIDE the destination so `gpu-dev.sh run`'s
+# preflight (and a human) can tell a genuine seed-clone from a raw/cold
+# CARGO_TARGET_DIR at a glance — mirroring this script's own SEED-marker
+# check above (COMPLETE_MARKER, :62) rather than inventing a new marker
+# shape. Records the seed's completion-marker CONTENT (mtime + sha256, not
+# just its path) so a later re-seed of the SAME seed dir (a new, different
+# completion marker) is distinguishable from the seed this clone was
+# actually taken from — self-contained python3 (hashlib/os/datetime), no
+# new bash-side hashing dependency beyond what this substrate already
+# assumes elsewhere (pod_seed_target.sh's own JSON-marker idiom).
+CLONE_MARKER="${DEST_DIR}/.jammi-clone-of-seed"
+python3 -c '
+import hashlib, json, os, sys, datetime
+seed_dir, complete_marker, dest_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+h = hashlib.sha256()
+with open(complete_marker, "rb") as f:
+    h.update(f.read())
+mtime = os.path.getmtime(complete_marker)
+now = datetime.datetime.now(tz=datetime.timezone.utc)
+print(json.dumps({
+    "seed_dir": seed_dir,
+    "seed_complete_marker": complete_marker,
+    "seed_complete_marker_mtime": datetime.datetime.fromtimestamp(mtime, tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "seed_complete_marker_sha256": h.hexdigest(),
+    "dest_dir": dest_dir,
+    "clone_timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+}, indent=2))
+' "$SEED_DIR" "$COMPLETE_MARKER" "$DEST_DIR" > "$CLONE_MARKER"
+rc=$?
+[ "$rc" -eq 0 ] || { echo "::error::failed to stamp clone marker at ${CLONE_MARKER} (exit $rc)" >&2; exit "$rc"; }
+echo "clone marker stamped: ${CLONE_MARKER}"
+
 echo "=== clone complete: ${DEST_DIR} ==="

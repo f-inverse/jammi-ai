@@ -187,6 +187,44 @@ DRV
     bad "(b) clone did not reproduce seed content or removed the seed (rc=$rc); output: $(cat "$SANDBOX/b2.out")"
   fi
 
+  # esc-077 (e): the clone stamps a marker INSIDE the destination recording
+  # the seed dir, the seed's own completion-marker content (mtime + sha256),
+  # and the clone timestamp — gpu-dev.sh `run`'s preflight (esc-077) reads
+  # exactly this file's PRESENCE; this test also cross-checks its CONTENT is
+  # honest (never just "the file exists").
+  CLONE_MARKER="$DEST/.jammi-clone-of-seed"
+  if [ -f "$CLONE_MARKER" ]; then
+    marker_check="$(python3 -c '
+import hashlib, json, sys
+seed_dir, complete_marker, dest_dir, marker_path = sys.argv[1:5]
+with open(marker_path) as f:
+    m = json.load(f)
+with open(complete_marker, "rb") as f:
+    expected_sha = hashlib.sha256(f.read()).hexdigest()
+ok = (
+    m.get("seed_dir") == seed_dir
+    and m.get("seed_complete_marker") == complete_marker
+    and m.get("seed_complete_marker_sha256") == expected_sha
+    and m.get("dest_dir") == dest_dir
+    and bool(m.get("seed_complete_marker_mtime"))
+    and bool(m.get("clone_timestamp"))
+)
+print("OK" if ok else "MISMATCH: " + json.dumps(m))
+' "$SEED" "${SEED}.jammi-seed-complete" "$DEST" "$CLONE_MARKER")"
+    if [ "$marker_check" = "OK" ]; then
+      ok "(b/esc-077) pod_target_clone.sh stamps \$DEST/.jammi-clone-of-seed with honest seed_dir/seed-marker-sha256/dest_dir/timestamps"
+    else
+      bad "(b/esc-077) clone marker content is wrong: $marker_check"
+    fi
+  else
+    bad "(b/esc-077) pod_target_clone.sh did not stamp $CLONE_MARKER on a successful clone"
+  fi
+
+  # esc-077 (e), continued: snapshot the marker's own bytes BEFORE the
+  # refusal attempt below, so "survives" is a real before/after comparison,
+  # never a file compared against itself.
+  CLONE_MARKER_BEFORE="$(cat "$CLONE_MARKER" 2>/dev/null)"
+
   # Refuses to clone onto an existing destination.
   bash "$CLONE_SH" "$SEED" "$DEST" "$REPO_ROOT" >/dev/null 2>"$SANDBOX/b3.err"
   rc=$?
@@ -194,6 +232,14 @@ DRV
     ok "(b) pod_target_clone.sh refuses to clone over an existing destination"
   else
     bad "(b) expected exit 2 cloning over an existing destination (got rc=$rc)"
+  fi
+
+  # The refusal path exits before `cp`/the marker-stamp step even run, so
+  # the marker from the ORIGINAL successful clone must survive byte-for-byte.
+  if [ -f "$CLONE_MARKER" ] && [ "$(cat "$CLONE_MARKER")" = "$CLONE_MARKER_BEFORE" ]; then
+    ok "(b/esc-077) the existing-destination refusal path leaves the prior successful clone's marker untouched"
+  else
+    bad "(b/esc-077) the existing-destination refusal path unexpectedly mutated or removed the clone marker"
   fi
 
   # round-3 audit N2: a POISONED seed (a fake .fingerprint entry named after
@@ -727,16 +773,43 @@ DRV
   # rp_job_wrapper_lines call here with the marker-bearing variant, so
   # wait-job can tell a job's own real completion apart from a stale log or
   # a flock-refused invocation.
-  if grep -q 'rp_job_wrapper_with_marker_lines "\$TREE_DIR" "\$TARGET_DIR" "\$JOB" "\$RUN_TOKEN" "\$TIMING"' "$REPO_ROOT/ci/scripts/gpu-dev.sh"; then
+  if grep -q 'rp_job_wrapper_with_marker_lines "\$TREE_DIR" "\$TARGET_DIR" "\$JOB" "\$RUN_TOKEN" "\$TIMING" "\$WAVE" "\$TREE"' "$REPO_ROOT/ci/scripts/gpu-dev.sh"; then
     ok "(i) gpu-dev.sh's run case builds its job wrapper via rp_job_wrapper_with_marker_lines"
   else
-    bad "(i) gpu-dev.sh's run case does not call rp_job_wrapper_with_marker_lines with (TREE_DIR, TARGET_DIR, JOB, RUN_TOKEN, TIMING)"
+    bad "(i) gpu-dev.sh's run case does not call rp_job_wrapper_with_marker_lines with (TREE_DIR, TARGET_DIR, JOB, RUN_TOKEN, TIMING, WAVE, TREE)"
+  fi
+
+  # (i/deployment-gap) `target` must execute its OWN checkout's staged
+  # pod-side scripts (`/root/.jammi-caller-scripts/...`), never the pod's
+  # bootstrapped `/root/jammi-ai/ci/scripts/...` copies directly — a pod
+  # booted from an older `main` would otherwise run a pod_target_clone.sh
+  # that predates esc-077 and stamps no marker, and the very next `run`
+  # would refuse a perfectly legitimate clone. A structural check (rsync's
+  # own wire protocol cannot be driven through this file's mocked-ssh
+  # idiom at all — the SSH-mocked behavioral coverage for the actual rsync
+  # argv lives in test_gpu_dev_lifecycle.sh's Group 11).
+  GPU_DEV_SRC="$REPO_ROOT/ci/scripts/gpu-dev.sh"
+  if grep -q 'bash \${STAGE_DIR}/pod_target_clone.sh' "$GPU_DEV_SRC" \
+    && grep -q 'bash \${STAGE_DIR}/pod_provision_cutlass.sh' "$GPU_DEV_SRC" \
+    && grep -q 'bash \${STAGE_DIR}/pod_target_clone.sh .* --verify' "$GPU_DEV_SRC" \
+    && ! grep -q 'bash /root/jammi-ai/ci/scripts/pod_target_clone.sh' "$GPU_DEV_SRC" \
+    && ! grep -q 'bash /root/jammi-ai/ci/scripts/pod_provision_cutlass.sh' "$GPU_DEV_SRC"; then
+    ok "(i/deployment-gap) target's clone/--verify/--with-cutlass call sites all run from \${STAGE_DIR}, never gpu-dev.sh's old /root/jammi-ai/ci/scripts/... literal"
+  else
+    bad "(i/deployment-gap) expected every target call site to run from \${STAGE_DIR} and NONE to still hardcode /root/jammi-ai/ci/scripts/..."
+  fi
+  if grep -qF '"$DIR/pod_target_clone.sh" "$DIR/pod_seed_target.sh"' "$GPU_DEV_SRC" \
+    && grep -qF '"$DIR/pod_provision_cutlass.sh" "$DIR/pod_push_stamp.sh"' "$GPU_DEV_SRC"; then
+    ok "(i/deployment-gap) target's staging rsync ships all four THIS-checkout scripts pod_target_clone.sh needs (self-sources pod_seed_target.sh) and pod_provision_cutlass.sh needs (invokes pod_push_stamp.sh as a subprocess)"
+  else
+    bad "(i/deployment-gap) expected target's staging rsync to list pod_target_clone.sh, pod_seed_target.sh, pod_provision_cutlass.sh, and pod_push_stamp.sh as sources"
   fi
 
   # rp_job_wrapper_with_marker_lines itself (round-N audit finding B3): same
   # env/cd/job carriage as rp_job_wrapper_lines above, PLUS the completion
-  # marker wait-job actually reads.
-  marker_wrapper_text="$(bash "$RUNPOD_DRIVER" rp_job_wrapper_with_marker_lines "/root/trees/mytree" "/root/target-mytree" "cargo test" "tok123" "0")"
+  # marker wait-job actually reads, PLUS (one-pod-per-wave, WAVE-scoped) the
+  # active-wave claim write/clear.
+  marker_wrapper_text="$(bash "$RUNPOD_DRIVER" rp_job_wrapper_with_marker_lines "/root/trees/mytree" "/root/target-mytree" "cargo test" "tok123" "0" "mywave" "mytree")"
   if printf '%s\n' "$marker_wrapper_text" | grep -qF "export CARGO_TARGET_DIR='/root/target-mytree'"; then
     ok "(i/B3) rp_job_wrapper_with_marker_lines still emits the CARGO_TARGET_DIR export"
   else
@@ -751,13 +824,32 @@ DRV
   printf '%s\n' "$marker_wrapper_text" | grep -q 'flock -n 9' \
     && bad "(i/B3) timing=0 must NOT emit a flock acquisition — got: $marker_wrapper_text" \
     || ok "(i/B3) timing=0 emits no flock acquisition"
-  marker_wrapper_timing="$(bash "$RUNPOD_DRIVER" rp_job_wrapper_with_marker_lines "/root/trees/mytree" "/root/target-mytree" "cargo test" "tok123" "1")"
+  # (esc-077-class one-pod-per-wave) the active-wave claim is written with
+  # the caller's wave/tree at the very START (alongside .jammi.exit removal)
+  # and removed again at the NORMAL-completion exit path.
+  printf '%s\n' "$marker_wrapper_text" | grep -qF 'printf "WAVE=mywave\nTREE=mytree\nTS=' \
+    && ok "(i/one-pod-per-wave) rp_job_wrapper_with_marker_lines writes the active-wave claim (wave+tree) up front" \
+    || bad "(i/one-pod-per-wave) rp_job_wrapper_with_marker_lines did not write the expected active-wave claim — got: $marker_wrapper_text"
+  clear_count="$(printf '%s\n' "$marker_wrapper_text" | grep -cF 'rm -f /root/.jammi-active-wave')"
+  [ "$clear_count" -ge 1 ] \
+    && ok "(i/one-pod-per-wave) rp_job_wrapper_with_marker_lines clears the active-wave claim on normal completion" \
+    || bad "(i/one-pod-per-wave) rp_job_wrapper_with_marker_lines never clears the active-wave claim — got: $marker_wrapper_text"
+  marker_wrapper_timing="$(bash "$RUNPOD_DRIVER" rp_job_wrapper_with_marker_lines "/root/trees/mytree" "/root/target-mytree" "cargo test" "tok123" "1" "mywave" "mytree")"
   printf '%s\n' "$marker_wrapper_timing" | grep -q 'flock -n 9' \
     && ok "(i/B3) timing=1 emits the fd-based flock acquisition INSIDE the wrapper" \
     || bad "(i/B3) timing=1 did not emit a flock acquisition — got: $marker_wrapper_timing"
   printf '%s\n' "$marker_wrapper_timing" | grep -qF '"rc":75,"lock_refused":true' \
     && ok "(i/B3) timing=1's refusal arm writes an rc=75/lock_refused=true marker before exiting" \
     || bad "(i/B3) timing=1 did not write the lock-refused marker — got: $marker_wrapper_timing"
+  # (esc-077-class one-pod-per-wave) the lock-refused early-exit path must
+  # ALSO clear the claim (the job's tmux session ends there too, even
+  # though the actual job command never ran) — two `rm -f` occurrences
+  # total in the timing=1 text: one on the lock-refused arm, one on normal
+  # completion.
+  clear_count_timing="$(printf '%s\n' "$marker_wrapper_timing" | grep -cF 'rm -f /root/.jammi-active-wave')"
+  [ "$clear_count_timing" -ge 2 ] \
+    && ok "(i/one-pod-per-wave) timing=1's lock-refused early exit ALSO clears the active-wave claim, not only normal completion" \
+    || bad "(i/one-pod-per-wave) expected the claim cleared on BOTH the lock-refused and normal-completion paths (got $clear_count_timing occurrence(s)) — got: $marker_wrapper_timing"
 
   # target-then-push composition, end to end, on a LOCAL fixture pod
   # filesystem (real pod_target_clone.sh, real rsync, real exclude list —

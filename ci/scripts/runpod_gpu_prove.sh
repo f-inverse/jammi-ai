@@ -87,11 +87,81 @@ cd /root && rm -rf jammi-ai
 git clone --depth 1 -b "${GIT_REF}" "${GIT_REPO}" jammi-ai 2>&1 | tail -1
 cd jammi-ai
 rc=0
+# The vendored FlashAttention-2 build (\`flash-attn\`, now in the manifest's
+# cu12-tarball feature list read below) needs the CUTLASS submodule; a plain
+# shallow \`git clone\` above does not fetch submodules.
+git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass \
+  || { echo "::error::CUTLASS submodule init failed (network/remote unreachable?) — refusing to attempt the flash-attn build" >&2; exit 1; }
+
+echo "::group::capability-surface build (ci/release-feature-manifest.json, cu12-tarball lane, never a hardcoded copy)"
+# esc-074: the manifest is the single source of truth for the CUDA release
+# lanes' exact feature list; this leg reads it (python3, always present in
+# the CUDA CI image this pod boots from) rather than restating it. Fails
+# loud on a missing/malformed manifest — never a silent empty-string build.
+cu12_features="\$(python3 -c "
+import json
+d = json.load(open('ci/release-feature-manifest.json'))
+print(','.join(d['lanes']['cu12-tarball']['cargo_features']))
+")"
+if [ -z "\${cu12_features}" ]; then
+  echo "::error::ci/release-feature-manifest.json produced an empty cu12-tarball cargo_features list" >&2
+  exit 1
+fi
+# jammi-ai lacks jammi-server-only plumbing (jetstream-broker, storage-cloud)
+# — the manifest's own \`server_only_cargo_features.features\` documents the
+# subtraction so this mapping lives in one place, not a second hardcoded
+# copy here.
+ai_features="\$(python3 -c "
+import json
+d = json.load(open('ci/release-feature-manifest.json'))
+lane = set(d['lanes']['cu12-tarball']['cargo_features'])
+server_only = set(d['server_only_cargo_features']['features'])
+print(','.join(sorted(lane - server_only)))
+")"
+if [ -z "\${ai_features}" ]; then
+  echo "::error::deriving the jammi-ai-applicable feature subset from ci/release-feature-manifest.json produced an empty list" >&2
+  exit 1
+fi
+echo "cu12-tarball cargo_features=\${cu12_features}"
+echo "jammi-ai-applicable subset=\${ai_features}"
+cargo build --release -p jammi-server --bin jammi-server --features "\${cu12_features}" || rc=\$?
+cargo test -p jammi-ai --features "\${ai_features},live-gpu-tests" --test gpu_capability --no-run || rc=\$?
+echo "::endgroup::"
+
+echo "::group::capability-surface proof (jammi-ai gpu_capability capability_surface, JAMMI_KERNELS_STRICT=1)"
+# \`capability_surface\` is delivered by ai-core in a LATER wave of THIS SAME
+# PR (campaign #443, the W3+ waves after this one) — this group must FAIL
+# LOUD, never silently skip, if that test is absent from this ref: a name
+# filter that matches zero tests exits 0 (\"running 0 tests ... test result:
+# ok\"), which would otherwise read as a false-green capability proof.
+cap_out="\$(JAMMI_KERNELS_STRICT=1 cargo test -p jammi-ai --features "\${ai_features},live-gpu-tests" --test gpu_capability capability_surface -- --nocapture 2>&1)"
+cap_rc=\$?
+echo "\${cap_out}"
+if echo "\${cap_out}" | grep -q "running 0 tests"; then
+  echo "::error::jammi-ai gpu_capability's capability_surface test matched ZERO tests on this ref — ai-core's capability-surface delivery (campaign #443) has not landed here; refusing to read a 0-test run as a pass" >&2
+  rc=1
+elif [ "\${cap_rc}" -ne 0 ]; then
+  rc=\${cap_rc}
+fi
+echo "::endgroup::"
+
 echo "::group::served client/server GPU proof (jammi-server)"
 cargo test -p jammi-server --features cuda,live-gpu-tests --test it grpc_embedding_gpu -- --nocapture --test-threads=1 || rc=\$?
 echo "::endgroup::"
 echo "::group::engine-core GPU correctness (jammi-ai gpu_capability)"
-cargo test -p jammi-ai --features cuda,live-gpu-tests --test gpu_capability -- --nocapture --test-threads=1 || rc=\$?
+# \`--skip capability_surface\`: this generic sweep does not set
+# JAMMI_KERNELS_STRICT=1 (other gpu_capability tests legitimately exercise
+# the FALLBACK admission path, which strict mode would break), but
+# capability_surface.rs's own module doc REQUIRES strict mode and asserts
+# it at the top of the test (capability_surface.rs:425) — a real,
+# fail-closed guard, correctly tripping "wrong mode" here. It is NOT
+# skipped because it is unimportant: the dedicated capability-surface
+# group directly above already runs it, correctly, under
+# JAMMI_KERNELS_STRICT=1. Never weaken capability_surface's own guard and
+# never set strict mode on this generic sweep to work around it — do the
+# opposite (name-exclude it from the one group that cannot satisfy its
+# precondition).
+cargo test -p jammi-ai --features cuda,live-gpu-tests --test gpu_capability -- --nocapture --test-threads=1 --skip capability_surface || rc=\$?
 echo "::endgroup::"
 echo "::group::GPU embedding perf — recorded observability, non-gating (jammi-bench gpu-inference-scale)"
 cargo run -p jammi-bench --release --features cuda -- gpu-inference-scale || rc=\$?

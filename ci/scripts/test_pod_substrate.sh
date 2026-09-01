@@ -773,16 +773,17 @@ DRV
   # rp_job_wrapper_lines call here with the marker-bearing variant, so
   # wait-job can tell a job's own real completion apart from a stale log or
   # a flock-refused invocation.
-  if grep -q 'rp_job_wrapper_with_marker_lines "\$TREE_DIR" "\$TARGET_DIR" "\$JOB" "\$RUN_TOKEN" "\$TIMING"' "$REPO_ROOT/ci/scripts/gpu-dev.sh"; then
+  if grep -q 'rp_job_wrapper_with_marker_lines "\$TREE_DIR" "\$TARGET_DIR" "\$JOB" "\$RUN_TOKEN" "\$TIMING" "\$WAVE" "\$TREE"' "$REPO_ROOT/ci/scripts/gpu-dev.sh"; then
     ok "(i) gpu-dev.sh's run case builds its job wrapper via rp_job_wrapper_with_marker_lines"
   else
-    bad "(i) gpu-dev.sh's run case does not call rp_job_wrapper_with_marker_lines with (TREE_DIR, TARGET_DIR, JOB, RUN_TOKEN, TIMING)"
+    bad "(i) gpu-dev.sh's run case does not call rp_job_wrapper_with_marker_lines with (TREE_DIR, TARGET_DIR, JOB, RUN_TOKEN, TIMING, WAVE, TREE)"
   fi
 
   # rp_job_wrapper_with_marker_lines itself (round-N audit finding B3): same
   # env/cd/job carriage as rp_job_wrapper_lines above, PLUS the completion
-  # marker wait-job actually reads.
-  marker_wrapper_text="$(bash "$RUNPOD_DRIVER" rp_job_wrapper_with_marker_lines "/root/trees/mytree" "/root/target-mytree" "cargo test" "tok123" "0")"
+  # marker wait-job actually reads, PLUS (one-pod-per-wave, WAVE-scoped) the
+  # active-wave claim write/clear.
+  marker_wrapper_text="$(bash "$RUNPOD_DRIVER" rp_job_wrapper_with_marker_lines "/root/trees/mytree" "/root/target-mytree" "cargo test" "tok123" "0" "mywave" "mytree")"
   if printf '%s\n' "$marker_wrapper_text" | grep -qF "export CARGO_TARGET_DIR='/root/target-mytree'"; then
     ok "(i/B3) rp_job_wrapper_with_marker_lines still emits the CARGO_TARGET_DIR export"
   else
@@ -797,13 +798,32 @@ DRV
   printf '%s\n' "$marker_wrapper_text" | grep -q 'flock -n 9' \
     && bad "(i/B3) timing=0 must NOT emit a flock acquisition — got: $marker_wrapper_text" \
     || ok "(i/B3) timing=0 emits no flock acquisition"
-  marker_wrapper_timing="$(bash "$RUNPOD_DRIVER" rp_job_wrapper_with_marker_lines "/root/trees/mytree" "/root/target-mytree" "cargo test" "tok123" "1")"
+  # (esc-077-class one-pod-per-wave) the active-wave claim is written with
+  # the caller's wave/tree at the very START (alongside .jammi.exit removal)
+  # and removed again at the NORMAL-completion exit path.
+  printf '%s\n' "$marker_wrapper_text" | grep -qF 'printf "WAVE=mywave\nTREE=mytree\nTS=' \
+    && ok "(i/one-pod-per-wave) rp_job_wrapper_with_marker_lines writes the active-wave claim (wave+tree) up front" \
+    || bad "(i/one-pod-per-wave) rp_job_wrapper_with_marker_lines did not write the expected active-wave claim — got: $marker_wrapper_text"
+  clear_count="$(printf '%s\n' "$marker_wrapper_text" | grep -cF 'rm -f /root/.jammi-active-wave')"
+  [ "$clear_count" -ge 1 ] \
+    && ok "(i/one-pod-per-wave) rp_job_wrapper_with_marker_lines clears the active-wave claim on normal completion" \
+    || bad "(i/one-pod-per-wave) rp_job_wrapper_with_marker_lines never clears the active-wave claim — got: $marker_wrapper_text"
+  marker_wrapper_timing="$(bash "$RUNPOD_DRIVER" rp_job_wrapper_with_marker_lines "/root/trees/mytree" "/root/target-mytree" "cargo test" "tok123" "1" "mywave" "mytree")"
   printf '%s\n' "$marker_wrapper_timing" | grep -q 'flock -n 9' \
     && ok "(i/B3) timing=1 emits the fd-based flock acquisition INSIDE the wrapper" \
     || bad "(i/B3) timing=1 did not emit a flock acquisition — got: $marker_wrapper_timing"
   printf '%s\n' "$marker_wrapper_timing" | grep -qF '"rc":75,"lock_refused":true' \
     && ok "(i/B3) timing=1's refusal arm writes an rc=75/lock_refused=true marker before exiting" \
     || bad "(i/B3) timing=1 did not write the lock-refused marker — got: $marker_wrapper_timing"
+  # (esc-077-class one-pod-per-wave) the lock-refused early-exit path must
+  # ALSO clear the claim (the job's tmux session ends there too, even
+  # though the actual job command never ran) — two `rm -f` occurrences
+  # total in the timing=1 text: one on the lock-refused arm, one on normal
+  # completion.
+  clear_count_timing="$(printf '%s\n' "$marker_wrapper_timing" | grep -cF 'rm -f /root/.jammi-active-wave')"
+  [ "$clear_count_timing" -ge 2 ] \
+    && ok "(i/one-pod-per-wave) timing=1's lock-refused early exit ALSO clears the active-wave claim, not only normal completion" \
+    || bad "(i/one-pod-per-wave) expected the claim cleared on BOTH the lock-refused and normal-completion paths (got $clear_count_timing occurrence(s)) — got: $marker_wrapper_timing"
 
   # target-then-push composition, end to end, on a LOCAL fixture pod
   # filesystem (real pod_target_clone.sh, real rsync, real exclude list —

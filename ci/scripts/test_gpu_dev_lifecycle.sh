@@ -1431,7 +1431,12 @@ if command -v tmux >/dev/null 2>&1 && command -v flock >/dev/null 2>&1; then
     # --- 8d (B3): rc=0 — a real successful job, driven through the ACTUAL
     # wrapper the way `run` builds it, then read back by rp_job_wait_script.
     TREED="$G8_SANDBOX/tree-ok"; mkdir -p "$TREED"
-    wrap_ok="$(rp_job_wrapper_with_marker_lines "$TREED" "$TREED/.target" "true" "tokOK" "0")"
+    wrap_ok="$(rp_job_wrapper_with_marker_lines "$TREED" "$TREED/.target" "true" "tokOK" "0" "wave-g8" "ok-tree")"
+    # The wrapper's own generated text hardcodes /root/.jammi-active-wave
+    # (esc-077-class one-pod-per-wave claim); substituted here to a
+    # SANDBOXED path — same idiom 8f already uses for /root/.jammi-timing.lock
+    # — so this test never touches the real /root on the machine running it.
+    wrap_ok="${wrap_ok//\/root\/.jammi-active-wave/$TREED/.jammi-active-wave}"
     printf '%s\n' "$wrap_ok" > "$TREED/.jammi-job.sh"
     bash "$TREED/.jammi-job.sh" > "$TREED/.jammi.log" 2>&1
     job_ok_rc=$?
@@ -1451,7 +1456,8 @@ if command -v tmux >/dev/null 2>&1 && command -v flock >/dev/null 2>&1; then
     # exact case rp_job_wrapper_with_marker_lines's own `( job )` subshell
     # wrapping exists to contain: an unwrapped bare `exit` would terminate
     # the WHOLE generated script, skipping the marker write below it.
-    wrap_fail="$(rp_job_wrapper_with_marker_lines "$TREEF" "$TREEF/.target" "exit 3" "tokFAIL" "0")"
+    wrap_fail="$(rp_job_wrapper_with_marker_lines "$TREEF" "$TREEF/.target" "exit 3" "tokFAIL" "0" "wave-g8" "fail-tree")"
+    wrap_fail="${wrap_fail//\/root\/.jammi-active-wave/$TREEF/.jammi-active-wave}"
     printf '%s\n' "$wrap_fail" > "$TREEF/.jammi-job.sh"
     bash "$TREEF/.jammi-job.sh" > "$TREEF/.jammi.log" 2>&1
     job_fail_rc=$?
@@ -1473,11 +1479,12 @@ if command -v tmux >/dev/null 2>&1 && command -v flock >/dev/null 2>&1; then
     tmux kill-session -t "=jammi-g8-lockholder-$$" 2>/dev/null
     tmux new-session -d -s "jammi-g8-lockholder-$$" "exec 9>'$LOCKFILE'; flock -x 9; sleep 5"
     sleep 0.3
-    wrap_lock="$(rp_job_wrapper_with_marker_lines "$TREEL" "$TREEL/.target" "true" "tokLOCK" "1")"
-    # The wrapper's own generated text hardcodes /root/.jammi-timing.lock;
-    # substituted here to the SANDBOXED lock file so this test never
-    # touches the real path.
+    wrap_lock="$(rp_job_wrapper_with_marker_lines "$TREEL" "$TREEL/.target" "true" "tokLOCK" "1" "wave-g8" "lock-tree")"
+    # The wrapper's own generated text hardcodes /root/.jammi-timing.lock
+    # AND /root/.jammi-active-wave; both substituted here to SANDBOXED
+    # paths so this test never touches either real path.
     wrap_lock="${wrap_lock//\/root\/.jammi-timing.lock/$LOCKFILE}"
+    wrap_lock="${wrap_lock//\/root\/.jammi-active-wave/$TREEL/.jammi-active-wave}"
     printf '%s\n' "$wrap_lock" > "$TREEL/.jammi-job.sh"
     bash "$TREEL/.jammi-job.sh" > "$TREEL/.jammi.log" 2>&1
     job_lock_rc=$?
@@ -1657,15 +1664,21 @@ else
 fi
 
 # ═════════════════════════════════════════════════════════════════════════
-# Group 10 (one-pod-per-wave, same class as esc-077) — `run` refuses a job
-# while a DIFFERENT tree's job is already live on this pod.
+# Group 10 (one-pod-per-wave, WAVE-scoped, same class as esc-077) —
+# operator-directed refinement of the original tree-scoped gate: `run`
+# refuses only when a LIVE job belongs to a DIFFERENT wave; a wave's own
+# sub-units may share a pod across DIFFERENT trees under the SAME wave id.
 # ═════════════════════════════════════════════════════════════════════════
 
 # --- 10a: rp_concurrency_preflight_lines classifies BUSY/CLEAR correctly
-# against a FAKED `tmux` on PATH — no ssh, no pod, no mocking of gpu-dev.sh
-# itself. Same isolation rationale as 9a (subshell + group-local results
-# file + outer tally, since `ok`/`bad` mutate counters a subshell cannot
-# persist).
+# against a FAKED `tmux` + a fixture `/root/.jammi-active-wave`-shaped file
+# — no ssh, no pod, no mocking of gpu-dev.sh itself. Same isolation
+# rationale as 9a (subshell + group-local results file + outer tally,
+# since `ok`/`bad` mutate counters a subshell cannot persist). The real
+# function hardcodes `/root/.jammi-active-wave`; these cases patch that
+# ONE literal path in the GENERATED text to a sandbox path before
+# executing it (never touching a real /root) — the generated text is
+# otherwise run completely unmodified.
 G10A_RESULTS="$SANDBOX/g10a-results.log"
 : > "$G10A_RESULTS"
 (
@@ -1675,14 +1688,9 @@ G10A_RESULTS="$SANDBOX/g10a-results.log"
   record() { echo "$1:$2" >> "$G10A_RESULTS"; }
 
   G10A_FAKEBIN="$SANDBOX/g10a-fakebin"; mkdir -p "$G10A_FAKEBIN"
+  G10A_ROOT="$SANDBOX/g10a-fakeroot"; mkdir -p "$G10A_ROOT"
   fake_tmux() { # $1=newline-joined session list
-    cat > "$G10A_FAKEBIN/tmux" <<STUB
-#!/usr/bin/env bash
-if [ "\$1" = "list-sessions" ]; then
-  printf '%s'
-fi
-STUB
-    printf '%s' "$1" >> "$G10A_FAKEBIN/tmux.sessions"
+    printf '%s' "$1" > "$G10A_FAKEBIN/tmux.sessions"
     cat > "$G10A_FAKEBIN/tmux" <<STUB
 #!/usr/bin/env bash
 if [ "\$1" = "list-sessions" ]; then
@@ -1691,32 +1699,71 @@ fi
 STUB
     chmod +x "$G10A_FAKEBIN/tmux"
   }
+  # $1=own_session $2=own_wave -> runs the REAL generated text, with only
+  # the hardcoded claim path redirected into the sandbox.
+  run_preflight() {
+    local gen; gen="$(rp_concurrency_preflight_lines "$1" "$2")"
+    gen="${gen//\/root\/.jammi-active-wave/$G10A_ROOT/.jammi-active-wave}"
+    PATH="$G10A_FAKEBIN:$PATH" bash -c "$gen"
+  }
 
-  rm -f "$G10A_FAKEBIN/tmux.sessions"
-  fake_tmux $'jammi-seed\njammi-otherwave\njammi-mywork\n'
-  out_busy="$(PATH="$G10A_FAKEBIN:$PATH" bash <(rp_concurrency_preflight_lines "jammi-mywork"))"
-  if [ "$out_busy" = "GPU_DEV_CONCURRENCY_STATE=BUSY:jammi-otherwave" ]; then
-    record PASS "rp_concurrency_preflight_lines: a different tree's live session classified BUSY, naming it"
+  fake_tmux $'jammi-seed\njammi-othertree\njammi-mywork\n'
+  rm -f "$G10A_ROOT/.jammi-active-wave"
+  printf 'WAVE=wave-B\nTREE=othertree\nTS=2026-09-01T00:00:00Z\n' > "$G10A_ROOT/.jammi-active-wave"
+  out="$(run_preflight "jammi-mywork" "wave-A")"
+  if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=BUSY:wave-B:jammi-othertree" ]; then
+    record PASS "rp_concurrency_preflight_lines: cross-wave (live other tree's claim names a DIFFERENT wave) classified BUSY, naming the owning wave and the session"
   else
-    record FAIL "rp_concurrency_preflight_lines: expected BUSY:jammi-otherwave (got: $out_busy)"
+    record FAIL "rp_concurrency_preflight_lines: expected BUSY:wave-B:jammi-othertree (got: $out)"
   fi
 
-  rm -f "$G10A_FAKEBIN/tmux.sessions"
+  printf 'WAVE=wave-A\nTREE=othertree\nTS=2026-09-01T00:00:00Z\n' > "$G10A_ROOT/.jammi-active-wave"
+  out="$(run_preflight "jammi-mywork" "wave-A")"
+  if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=CLEAR" ]; then
+    record PASS "rp_concurrency_preflight_lines: same-wave-two-trees (live other tree's claim names the SAME wave) classified CLEAR — the sanctioned sub-unit-sharing shape"
+  else
+    record FAIL "rp_concurrency_preflight_lines: expected CLEAR for a matching wave claim on a different tree (got: $out)"
+  fi
+
+  rm -f "$G10A_ROOT/.jammi-active-wave"
+  out="$(run_preflight "jammi-mywork" "wave-A")"
+  if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=BUSY:UNKNOWN:jammi-othertree" ]; then
+    record PASS "rp_concurrency_preflight_lines: a live other session with NO readable active-wave claim fails CLOSED (BUSY:UNKNOWN), never silently assumed safe"
+  else
+    record FAIL "rp_concurrency_preflight_lines: expected BUSY:UNKNOWN:jammi-othertree for a missing claim file (got: $out)"
+  fi
+
   fake_tmux $'jammi-seed\njammi-mywork\n'
-  out_own="$(PATH="$G10A_FAKEBIN:$PATH" bash <(rp_concurrency_preflight_lines "jammi-mywork"))"
-  if [ "$out_own" = "GPU_DEV_CONCURRENCY_STATE=CLEAR" ]; then
-    record PASS "rp_concurrency_preflight_lines: this tree's own session (+ the boot-time seed) is never mistaken for cross-tree contention"
+  out="$(run_preflight "jammi-mywork" "wave-A")"
+  if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=CLEAR" ]; then
+    record PASS "rp_concurrency_preflight_lines: this tree's own session (+ the boot-time seed) is never mistaken for cross-wave contention"
   else
-    record FAIL "rp_concurrency_preflight_lines: expected CLEAR for own-session-only (got: $out_own)"
+    record FAIL "rp_concurrency_preflight_lines: expected CLEAR for own-session-only (got: $out)"
   fi
 
-  rm -f "$G10A_FAKEBIN/tmux.sessions"
   fake_tmux ''
-  out_none="$(PATH="$G10A_FAKEBIN:$PATH" bash <(rp_concurrency_preflight_lines "jammi-mywork"))"
-  if [ "$out_none" = "GPU_DEV_CONCURRENCY_STATE=CLEAR" ]; then
+  out="$(run_preflight "jammi-mywork" "wave-A")"
+  if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=CLEAR" ]; then
     record PASS "rp_concurrency_preflight_lines: no tmux sessions at all classified CLEAR"
   else
-    record FAIL "rp_concurrency_preflight_lines: expected CLEAR for no sessions (got: $out_none)"
+    record FAIL "rp_concurrency_preflight_lines: expected CLEAR for no sessions (got: $out)"
+  fi
+
+  # Stale-claim handling (explicit regression pin, item 4): a claim FILE
+  # naming a totally different wave sits on disk, but NO tmux session is
+  # actually alive (the wrapper's own cleanup was interrupted — SIGKILL/
+  # pod death — before it could `rm -f` the claim). tmux liveness is
+  # checked FIRST and is the PRIMARY signal here: with no live OTHER
+  # session at all, this must read CLEAR regardless of what the stale file
+  # says — failing OPEN on staleness, per this campaign's own instruction,
+  # rather than refusing forever on an orphaned file no process will ever
+  # clean up again.
+  printf 'WAVE=wave-B\nTREE=othertree\nTS=2020-01-01T00:00:00Z\n' > "$G10A_ROOT/.jammi-active-wave"
+  out="$(run_preflight "jammi-mywork" "wave-A")"
+  if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=CLEAR" ]; then
+    record PASS "rp_concurrency_preflight_lines: a stale claim (file present, NO live tmux session for it) is treated CLEAR -- tmux liveness is the primary signal, fail OPEN on staleness"
+  else
+    record FAIL "rp_concurrency_preflight_lines: expected CLEAR for a stale claim with no live session (got: $out)"
   fi
 )
 while IFS=: read -r status name; do
@@ -1724,30 +1771,31 @@ while IFS=: read -r status name; do
   if [ "$status" = "PASS" ]; then ok "$name"; else bad "$name"; fi
 done < "$G10A_RESULTS"
 
-# --- 10b-10d: `run`'s own dispatch, SSH-mocked (call order: #1 liveness,
+# --- 10b-10e: `run`'s own dispatch, SSH-mocked (call order: #1 liveness,
 # #2 target preflight OK, #3 concurrency preflight, #4 job launch — unless
-# an override skips a step).
+# an override skips a step). The concurrency-preflight response is now
+# `GPU_DEV_CONCURRENCY_STATE=<CLEAR|BUSY:<wave>:<session>>`.
 
-# --- 10b: refuse-when-other-tree-busy -------------------------------------
+# --- 10b: cross-wave refuses, naming the wave -----------------------------
 G10B_DIR="$SANDBOX/g10b-ssh"; mkdir -p "$G10B_DIR"
 write_ssh_resp "$G10B_DIR" 1 0
 write_ssh_resp "$G10B_DIR" 2 0 "GPU_DEV_TARGET_STATE=OK"
-write_ssh_resp "$G10B_DIR" 3 0 "GPU_DEV_CONCURRENCY_STATE=BUSY:jammi-otherwave"
+write_ssh_resp "$G10B_DIR" 3 0 "GPU_DEV_CONCURRENCY_STATE=BUSY:wave-B:jammi-othertree"
 rm -f "$SANDBOX/g10b-counter"
 MOCK_SSH_CALL_COUNTER="$SANDBOX/g10b-counter" MOCK_SSH_RESPONSES_DIR="$G10B_DIR" \
   PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" run "$G9_SESSION" echo hi \
   >"$SANDBOX/out-g10b.log" 2>&1
 g10b_rc=$?
-if [ "$g10b_rc" -ne 0 ] && grep -q "already has a live job for tree 'otherwave'" "$SANDBOX/out-g10b.log" \
+if [ "$g10b_rc" -ne 0 ] && grep -q "already has a live job for wave 'wave-B'" "$SANDBOX/out-g10b.log" \
   && grep -q "RP_SESSION=<alias> $(basename "$DIR/gpu-dev.sh") up <arch>" "$SANDBOX/out-g10b.log" \
   && grep -q "RP_ALLOW_CONCURRENT=1" "$SANDBOX/out-g10b.log" \
   && [ "$(cat "$SANDBOX/g10b-counter")" = "3" ]; then
-  ok "run (one-pod-per-wave): refuses while a DIFFERENT tree's job is live, naming the busy tree and the remedy, never reaching the job-launch call"
+  ok "run (one-pod-per-wave): cross-wave refuses, naming the owning wave and the remedy, never reaching the job-launch call"
 else
-  bad "run (one-pod-per-wave): expected a named BUSY refusal + exactly 3 ssh calls (got rc=$g10b_rc, calls=$(cat "$SANDBOX/g10b-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g10b.log")"
+  bad "run (one-pod-per-wave): expected a named cross-wave BUSY refusal + exactly 3 ssh calls (got rc=$g10b_rc, calls=$(cat "$SANDBOX/g10b-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g10b.log")"
 fi
 
-# --- 10c: allow-same-tree-sequential (CLEAR -> proceeds to job launch) ----
+# --- 10c: same-wave-two-trees (CLEAR) proceeds to job launch --------------
 G10C_DIR="$SANDBOX/g10c-ssh"; mkdir -p "$G10C_DIR"
 write_ssh_resp "$G10C_DIR" 1 0
 write_ssh_resp "$G10C_DIR" 2 0 "GPU_DEV_TARGET_STATE=OK"
@@ -1755,10 +1803,11 @@ write_ssh_resp "$G10C_DIR" 3 0 "GPU_DEV_CONCURRENCY_STATE=CLEAR"
 write_ssh_resp "$G10C_DIR" 4 0 "started"
 rm -f "$SANDBOX/g10c-counter"
 MOCK_SSH_CALL_COUNTER="$SANDBOX/g10c-counter" MOCK_SSH_RESPONSES_DIR="$G10C_DIR" \
+  RP_WAVE=shared-wave \
   PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" run "$G9_SESSION" echo hi \
   >"$SANDBOX/out-g10c.log" 2>&1
 if [ "$(cat "$SANDBOX/g10c-counter")" = "4" ] && grep -q "detached" "$SANDBOX/out-g10c.log"; then
-  ok "run (one-pod-per-wave): a CLEAR concurrency state (no OTHER tree busy — a same-tree re-run is exactly this shape) proceeds to the job-launch call"
+  ok "run (one-pod-per-wave): a CLEAR concurrency state (same wave on a different tree, or a genuine same-tree re-run) proceeds to the job-launch call"
 else
   bad "run (one-pod-per-wave): expected exactly 4 ssh calls ending in job launch (got calls=$(cat "$SANDBOX/g10c-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g10c.log")"
 fi
@@ -1777,6 +1826,48 @@ if [ "$(cat "$SANDBOX/g10d-counter")" = "3" ] && grep -q "detached" "$SANDBOX/ou
   ok "run (one-pod-per-wave): RP_ALLOW_CONCURRENT=1 skips the concurrency preflight ssh call entirely (target preflight + job launch = 3 calls incl. liveness)"
 else
   bad "run (one-pod-per-wave): expected RP_ALLOW_CONCURRENT=1 to skip straight to the job-launch call (3 total calls) (got calls=$(cat "$SANDBOX/g10d-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g10d.log")"
+fi
+
+# --- 10e: default-wave (unset --wave/RP_WAVE) resolves to the TREE name —
+# a regression pin on 8515cbb9's tree-scoped semantics: a caller who opts
+# into NOTHING new must still get exactly the old behavior. Uses a
+# CAPTURING ssh stub (distinct from WAITBIN, which discards its stdin) so
+# the test can inspect the ACTUAL text `run` generated for the concurrency
+# preflight — proving the embedded own-wave value really is the tree name
+# ("jammi-ai", the default `--tree`), not merely that the overall exit
+# code happens to match.
+G10E_CAPTUREBIN="$SANDBOX/g10e-capturebin"; mkdir -p "$G10E_CAPTUREBIN"
+G10E_CAPTURE_DIR="$SANDBOX/g10e-capture"; mkdir -p "$G10E_CAPTURE_DIR"
+cat > "$G10E_CAPTUREBIN/ssh" <<'STUB'
+#!/usr/bin/env bash
+n=0
+[ -f "${MOCK_SSH_CALL_COUNTER:?MOCK_SSH_CALL_COUNTER unset}" ] && n="$(cat "$MOCK_SSH_CALL_COUNTER")"
+n=$((n + 1))
+echo "$n" > "$MOCK_SSH_CALL_COUNTER"
+capdir="${MOCK_SSH_CAPTURE_DIR:?MOCK_SSH_CAPTURE_DIR unset}"
+cat > "$capdir/$n"
+dir="${MOCK_SSH_RESPONSES_DIR:?MOCK_SSH_RESPONSES_DIR unset}"
+resp="$dir/$n"
+[ -f "$resp" ] || resp="$dir/$(ls "$dir" | sort -n | tail -1)"
+rc="$(head -n1 "$resp")"
+tail -n +2 "$resp"
+exit "$rc"
+STUB
+chmod +x "$G10E_CAPTUREBIN/ssh"
+G10E_DIR="$SANDBOX/g10e-ssh"; mkdir -p "$G10E_DIR"
+write_ssh_resp "$G10E_DIR" 1 0
+write_ssh_resp "$G10E_DIR" 2 0 "GPU_DEV_TARGET_STATE=OK"
+write_ssh_resp "$G10E_DIR" 3 0 "GPU_DEV_CONCURRENCY_STATE=CLEAR"
+write_ssh_resp "$G10E_DIR" 4 0 "started"
+rm -f "$SANDBOX/g10e-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g10e-counter" MOCK_SSH_RESPONSES_DIR="$G10E_DIR" \
+  MOCK_SSH_CAPTURE_DIR="$G10E_CAPTURE_DIR" \
+  PATH="$G10E_CAPTUREBIN:$PATH" bash "$DIR/gpu-dev.sh" run "$G9_SESSION" echo hi \
+  >"$SANDBOX/out-g10e.log" 2>&1
+if [ -f "$G10E_CAPTURE_DIR/3" ] && grep -qF "= 'jammi-ai'" "$G10E_CAPTURE_DIR/3"; then
+  ok "run (one-pod-per-wave): default --wave/RP_WAVE resolves to the tree name ('jammi-ai') -- 8515cbb9's tree-scoped default is preserved exactly"
+else
+  bad "run (one-pod-per-wave): expected the concurrency preflight's generated text to compare against wave 'jammi-ai' by default: $(cat "$G10E_CAPTURE_DIR/3" 2>/dev/null || echo '<no call #3 captured>')"
 fi
 
 echo

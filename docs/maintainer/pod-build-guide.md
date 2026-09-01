@@ -399,12 +399,24 @@ Under the hood this is `pod_target_clone.sh <seed-dir> <dest-dir>
    and invokes `cargo` by hand bypasses it entirely; it is not claimed
    closed, only that the sanctioned path fails closed.
 
-**One-pod-per-wave.** `gpu-dev.sh run` also REFUSES when a DIFFERENT tree's
-job is already live on the pod (`jammi-<tree>` tmux session, excluding the
-boot-time `jammi-seed` build and this tree's own prior job), naming the busy
-tree and the remedy — rent another pod (`RP_SESSION=<alias> gpu-dev.sh up
-<arch>`) — with `RP_ALLOW_CONCURRENT=1` as the override for deliberate
-co-tenancy (e.g. a build-only job); same documented-residual scope as above.
+**One-pod-per-wave, wave-scoped; sub-units share.** `gpu-dev.sh run` REFUSES
+when a LIVE job on the pod belongs to a DIFFERENT wave — `--wave W` /
+`RP_WAVE` names the wave (default: the tree name, exactly preserving the
+tree-scoped behavior a caller who sets neither ever sees). `run` records the
+claim (`/root/.jammi-active-wave`: wave + tree + timestamp) at job launch and
+clears it when the job's tmux session ends; `push` also accepts `--wave`/
+`RP_WAVE` (writes no claim itself — only so an operator can use the SAME
+`--wave` across a push-then-run sequence without either verb rejecting it).
+A wave's own sub-units (e.g. a CPU-build tree and a GPU-test tree) sharing
+ONE `--wave` id may run sequentially on the SAME pod across DIFFERENT trees
+— per-tree tmux still serializes the actual jobs; only a genuinely
+DIFFERENT wave's live job is refused, naming the owning wave and the remedy
+(rent another pod: `RP_SESSION=<alias> gpu-dev.sh up <arch>`), with
+`RP_ALLOW_CONCURRENT=1` as the override for deliberate cross-wave
+co-tenancy. A stale claim (file present, no live tmux session — e.g. the
+wrapper's own cleanup was interrupted by a SIGKILL/pod death) is treated
+CLEAR: tmux liveness is the primary signal, never the claim file alone.
+Same documented-residual scope as above.
 
 **Poisoned-clone detection**, concretely:
 

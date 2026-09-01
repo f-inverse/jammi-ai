@@ -40,13 +40,16 @@
 #                                                      already exists — `push` to <name> FIRST
 #   gpu-dev.sh attach  [session] [--tree T]           shell into a surviving session
 #   gpu-dev.sh run     [session] [--tree T] <cmd...>  run <cmd> detached under tmux — REFUSES
-#                                                      (esc-077) unless <tree>'s CARGO_TARGET_DIR
+#                      [--wave W]                      (esc-077) unless <tree>'s CARGO_TARGET_DIR
 #                                                      carries a `target`-stamped clone marker
 #                                                      (`.jammi-clone-of-seed`); remedy in the
 #                                                      error, or RP_ALLOW_COLD_TARGET=1 to force —
-#                                                      ALSO refuses (one-pod-per-wave) a job while
-#                                                      another tree's job is live on this pod;
-#                                                      rent another pod or RP_ALLOW_CONCURRENT=1
+#                                                      ALSO refuses (one-pod-per-wave, WAVE-scoped)
+#                                                      a job while a DIFFERENT wave's job is live on
+#                                                      this pod; --wave/RP_WAVE (default: the tree
+#                                                      name) lets a wave's own sub-units share one
+#                                                      pod across trees; rent another pod or
+#                                                      RP_ALLOW_CONCURRENT=1 for real cross-wave use
 #   gpu-dev.sh logs    [session] [--tree T]           tail the detached job's output
 #   gpu-dev.sh push    [session] [--tree T]           rsync YOUR OWN checkout (this script's
 #                                                      own on-disk location, never $PWD) TO the pod
@@ -127,11 +130,14 @@ gpu-dev.sh — GPU development on RunPod
   attach  [session] [--tree T]            join a surviving session's running job
                                           (--shell for a plain prompt instead)
   run     [session] [--tree T] <cmd...>   run <cmd> detached under tmux, in <tree> — REFUSES
-                                          (esc-077) unless <tree>'s CARGO_TARGET_DIR carries a
+          [--wave W]                     (esc-077) unless <tree>'s CARGO_TARGET_DIR carries a
                                           `target`-stamped clone marker (else a silent cold
                                           full-workspace build); RP_ALLOW_COLD_TARGET=1 bypasses.
-                                          ALSO refuses (one-pod-per-wave) while another tree's
-                                          job is live on this pod; RP_ALLOW_CONCURRENT=1 bypasses
+                                          ALSO refuses (one-pod-per-wave, WAVE-scoped) while a
+                                          DIFFERENT wave's job is live on this pod (--wave/RP_WAVE
+                                          defaults to the tree name — a wave's own sub-units may
+                                          share one pod across trees under the SAME wave id);
+                                          RP_ALLOW_CONCURRENT=1 bypasses for real cross-wave use
   logs    [session] [--tree T]            tail the detached job's output
   push    [session] [--tree T]            rsync YOUR OWN checkout (this script's own on-disk
                                           location, never $PWD) TO the pod's <tree>
@@ -446,20 +452,44 @@ case "$CMD" in
       exit 2
     fi
     SESSION="${ARG:-${RP_SESSION:-a100}}"; ARCH=""
-    # `--tree`, when present, is a LEADING flag right after the (optional)
-    # session positional — before `run`'s own command tail, which this loop
-    # must never touch (`cargo test -- --tree-of-life` is someone's ACTUAL
-    # command, not a flag for this script). Only attach/run/logs/push/pull
-    # take it; `down` acts on the pod, not a tree within it.
+    # `--tree`/`--wave`, when present, are LEADING flags right after the
+    # (optional) session positional — before `run`'s own command tail,
+    # which this loop must never touch (`cargo test -- --tree-of-life` is
+    # someone's ACTUAL command, not a flag for this script). Only
+    # attach/run/logs/push/pull take `--tree`; `down` acts on the pod, not
+    # a tree within it. `--wave` (one-pod-per-wave, the WAVE identity a
+    # concurrency claim is recorded/compared under — see
+    # rp_concurrency_preflight_lines) is narrower still: only `run` (which
+    # records the claim) and `push` (so an operator can set the SAME
+    # `--wave`/RP_WAVE across both verbs without either one rejecting it —
+    # `push` itself writes no claim; the claim exists only once a job
+    # actually launches) accept it. A LOOP, not a one-shot `case` like the
+    # old `--tree`-only form: the two flags may now appear in either order.
     case "$CMD" in
       attach|run|logs|push|pull)
-        case "${1:-}" in
-          --tree)
-            [ $# -ge 2 ] || { echo "::error::--tree needs a value"; exit 2; }
-            TREE="$2"; shift 2 ;;
-          --tree=*)
-            TREE="${1#--tree=}"; shift ;;
-        esac
+        while :; do
+          case "${1:-}" in
+            --tree)
+              [ $# -ge 2 ] || { echo "::error::--tree needs a value"; exit 2; }
+              TREE="$2"; shift 2 ;;
+            --tree=*)
+              TREE="${1#--tree=}"; shift ;;
+            --wave)
+              case "$CMD" in
+                run|push) : ;;
+                *) echo "::error::--wave applies only to 'run'/'push', not '${CMD}'"; exit 2 ;;
+              esac
+              [ $# -ge 2 ] || { echo "::error::--wave needs a value"; exit 2; }
+              RP_WAVE="$2"; shift 2 ;;
+            --wave=*)
+              case "$CMD" in
+                run|push) : ;;
+                *) echo "::error::--wave applies only to 'run'/'push', not '${CMD}'"; exit 2 ;;
+              esac
+              RP_WAVE="${1#--wave=}"; shift ;;
+            *) break ;;
+          esac
+        done
         ;;
     esac
     ;;
@@ -576,6 +606,22 @@ TARGET_DIR="$(rp_target_dir "$TREE")"
 # session (`jammi-ai` would otherwise match a session literally named
 # `jammi-ai-2`) — the fix for the shipped unanchored `-t jammi` bug (M6).
 TMUX_SESSION="jammi-${TREE}"
+# One-pod-per-wave is WAVE-scoped, not tree-scoped (operator-directed
+# refinement of the original tree-scoped gate, 8515cbb9): a single wave
+# legitimately spans more than one tree (e.g. a CPU-build sub-unit and a
+# GPU-test sub-unit sharing the same warm seed), and the old tree-scoped
+# check tripped a wave against ITSELF the moment it used a second tree.
+# WAVE defaults to the tree name — a caller who sets neither `--wave` nor
+# RP_WAVE gets EXACTLY 8515cbb9's tree-scoped behavior (the regression this
+# default is required to preserve; pinned by Group 10's own
+# default-wave-is-tree-scoped test). Resolved here, for every verb that
+# reaches this point (not just `run`), so `push --wave X` / `RP_WAVE=X
+# gpu-dev.sh push ...` is accepted rather than erroring on an unrecognised
+# concept — `push` itself writes no claim (only `run`'s job launch does;
+# see rp_job_wrapper_with_marker_lines's own doc), so this is purely so an
+# operator can set ONE `--wave`/RP_WAVE across a whole push-then-run
+# sequence without either verb rejecting it.
+WAVE="${RP_WAVE:-$TREE}"
 
 # The ref rules live with the code that sends the ref to the pod, so they are
 # applied here as soon as that code is available — before anything is rented.
@@ -851,30 +897,42 @@ EOF
       esac
     fi
 
-    # esc-077-class (one-pod-per-wave): refuse a job when this pod already
-    # has a LIVE job for a DIFFERENT tree — an operator kept re-learning
-    # this norm from prose alone (the same class esc-077 fixed for cold
-    # builds). Two waves' builds/tests competing for the same pod's CPU/
-    # disk/nvcc produce meaningless timings at best and can corrupt a
-    # shared CARGO_TARGET_DIR at worst. `jammi-seed` (the boot-time seed
-    # build) and this tree's OWN prior session are excluded — see
-    # rp_concurrency_preflight_lines's own doc. RP_ALLOW_CONCURRENT=1 is
-    # the SOLE, explicit bypass, for deliberate co-tenancy (e.g. a
-    # build-only job that genuinely doesn't compete for the GPU).
+    # esc-077-class (one-pod-per-wave, WAVE-scoped): refuse a job when this
+    # pod already has a LIVE job for a DIFFERENT WAVE — an operator kept
+    # re-learning this norm from prose alone (the same class esc-077 fixed
+    # for cold builds). Scoped to WAVE, not tree (operator-directed
+    # refinement): a single wave spanning two trees (e.g. a CPU-build
+    # sub-unit and a GPU-test sub-unit sharing the warm seed) is the
+    # SANCTIONED shape and must proceed; two DIFFERENT waves' builds/tests
+    # competing for the same pod's CPU/disk/nvcc still produce meaningless
+    # timings at best and can corrupt a shared CARGO_TARGET_DIR at worst.
+    # `jammi-seed` (the boot-time seed build) and this tree's OWN prior
+    # session are excluded, and a live OTHER session with no readable
+    # active-wave claim fails CLOSED (unknown wave) — see
+    # rp_concurrency_preflight_lines's own doc for the full state table.
+    # RP_ALLOW_CONCURRENT=1 is the SOLE, explicit CROSS-WAVE bypass, for
+    # deliberate co-tenancy (e.g. a build-only job that genuinely doesn't
+    # compete for the GPU).
     if [ "${RP_ALLOW_CONCURRENT:-0}" != "1" ]; then
       CONCURRENCY_PREFLIGHT_STATE="$(rp_run_remote <<EOF
 set -uo pipefail
-$(rp_concurrency_preflight_lines "$TMUX_SESSION")
+$(rp_concurrency_preflight_lines "$TMUX_SESSION" "$WAVE")
 EOF
 )"
       case "$CONCURRENCY_PREFLIGHT_STATE" in
         *GPU_DEV_CONCURRENCY_STATE=CLEAR*) : ;;
         *GPU_DEV_CONCURRENCY_STATE=BUSY:*)
+          # `GPU_DEV_CONCURRENCY_STATE=BUSY:<owning-wave-or-UNKNOWN>:<other-session>`
           BUSY_LINE="$(printf '%s\n' "$CONCURRENCY_PREFLIGHT_STATE" | grep -o 'GPU_DEV_CONCURRENCY_STATE=BUSY:[^[:space:]]*' | head -1)"
-          BUSY_SESSION="${BUSY_LINE#GPU_DEV_CONCURRENCY_STATE=BUSY:}"
-          BUSY_TREE="${BUSY_SESSION#jammi-}"
-          echo "::error::run refused: this pod already has a live job for tree '${BUSY_TREE}' (tmux session ${BUSY_SESSION}) — one-pod-per-wave." >&2
-          echo "remedy: rent another pod: RP_SESSION=<alias> $(basename "$0") up <arch>   (or set RP_ALLOW_CONCURRENT=1 to co-tenant deliberately, e.g. a build-only job)" >&2
+          BUSY_REST="${BUSY_LINE#GPU_DEV_CONCURRENCY_STATE=BUSY:}"
+          BUSY_WAVE="${BUSY_REST%%:*}"
+          BUSY_SESSION="${BUSY_REST#*:}"
+          if [ "$BUSY_WAVE" = "UNKNOWN" ]; then
+            echo "::error::run refused: this pod already has a live job (tmux session ${BUSY_SESSION}) but its wave identity could not be determined (no readable /root/.jammi-active-wave claim) — one-pod-per-wave fails CLOSED on an unknown wave." >&2
+          else
+            echo "::error::run refused: this pod already has a live job for wave '${BUSY_WAVE}' (tmux session ${BUSY_SESSION}) — one-pod-per-wave, wave-scoped. Pass --wave ${BUSY_WAVE} (or RP_WAVE=${BUSY_WAVE}) if this job is really part of that same wave." >&2
+          fi
+          echo "remedy: rent another pod: RP_SESSION=<alias> $(basename "$0") up <arch>   (or set RP_ALLOW_CONCURRENT=1 to co-tenant across waves deliberately, e.g. a build-only job)" >&2
           exit 1
           ;;
         *)
@@ -920,7 +978,7 @@ EOF
     rp_run_remote <<EOF
 set -uo pipefail
 cat > '${TREE_DIR}'/.jammi-job.sh <<'JOBEOF'
-$(rp_job_wrapper_with_marker_lines "$TREE_DIR" "$TARGET_DIR" "$JOB" "$RUN_TOKEN" "$TIMING")
+$(rp_job_wrapper_with_marker_lines "$TREE_DIR" "$TARGET_DIR" "$JOB" "$RUN_TOKEN" "$TIMING" "$WAVE" "$TREE")
 JOBEOF
 tmux kill-session -t "=${TMUX_SESSION}" 2>/dev/null # tripwire-ok: idempotent best-effort cleanup of a session that may legitimately not exist yet (first `run` for this tree/session) — the new-session command right below is unconditional
 tmux new-session -d -s "${TMUX_SESSION}" "${LAUNCH}"

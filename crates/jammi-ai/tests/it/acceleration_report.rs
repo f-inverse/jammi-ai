@@ -515,17 +515,306 @@ async fn embedded_and_raw_transports_produce_the_same_report_shape() {
         keys_a, keys_b,
         "the embedded and raw-transport reports must carry the same top-level shape"
     );
-    let mut ops_a: Vec<&String> = report_a["ops"].as_object().unwrap().keys().collect();
-    let mut ops_b: Vec<&String> = report_b["ops"].as_object().unwrap().keys().collect();
-    ops_a.sort();
-    ops_b.sort();
-    assert_eq!(
-        ops_a, ops_b,
-        "both transports measure the same set of ops for the same job config"
+    // NOT a strict ops-key-SET equality: `"low_rank_residual_linear"`/
+    // `"dropout"` read the heavily-shared `lora_linear_fused` registry key
+    // (advisory 6's documented attribution precondition — every OTHER LoRA
+    // test in this `cargo test -p jammi-ai` binary races the SAME counter,
+    // and `crates/jammi-ai/tests/it/encoder_adapters.rs`'s plain-BERT LoRA
+    // legitimately dispatches it EAGER, `has_bias`, unlike this test's
+    // bias-free ModernBERT config) — a concurrently-running test can shift
+    // one transport's probe window into ambiguity (`two_arm_holds`'s
+    // both-moved `None`) without the other's, which is a shared-counter
+    // artifact of running the full suite in parallel, not a transport-parity
+    // regression. `"layer_norm"` is asserted per-op instead: uncontended in
+    // practice (every concurrent CPU test in this suite trains at F32/BF16,
+    // never forcing it eager), so its determination is a reliable,
+    // race-free K4 parity signal.
+    let ops_a = report_a["ops"].as_object().unwrap();
+    let ops_b = report_b["ops"].as_object().unwrap();
+    assert!(
+        !ops_a.is_empty() && !ops_b.is_empty(),
+        "both transports must measure at least one op, got a={ops_a:?} b={ops_b:?}"
     );
     assert_eq!(
         report_a["ops"]["layer_norm"], report_b["ops"]["layer_norm"],
         "the same config on the same device must produce the same per-op determination \
          regardless of submission transport"
+    );
+}
+
+/// Phase-4 adversarial-audit finding 3 ("FABRICATED REASON"): the
+/// projection-head arm (`target_modules` empty — `backbone_dtype` never
+/// takes effect there) never builds an encoder to probe at all. Before the
+/// fix, `worker.rs` passed `probe_ok = false` into `flash_report` for this
+/// arm, fabricating `"reason": "probe_forward_failed"` for a probe that was
+/// NEVER attempted. `flash_compiled_device_reason`'s compiled/device
+/// short-circuits are checked FIRST regardless (`"cuda_not_compiled"` on
+/// this CPU-only scoped-gate build — legitimately true, and cheaper to state
+/// than "no probe" when flash could never hold here either way), so THIS
+/// test's own build can only prove the fabricated value is GONE, not that
+/// the honest `"no_encoder_to_probe_projection_head_arm"` reason is reached
+/// (that needs `cuda` compiled AND a real CUDA device — see
+/// `flash_report_no_probe_attempted`'s doc). `ops` must be empty regardless
+/// (never a fabricated per-op measurement for an arm that built no
+/// dtype-typed encoder).
+#[serial(esc075_acceleration_report)]
+#[tokio::test(flavor = "multi_thread")]
+async fn projection_head_arm_reports_no_probe_attempted_not_a_fabricated_failure() {
+    let (session, _dir) = session_with_training_data().await;
+    let _worker = EmbeddedWorker::spawn(&session).expect("default worker intervals are valid");
+
+    let job = session
+        .fine_tune(
+            "training",
+            &tiny_modernbert_model(),
+            &training_columns(),
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(FineTuneConfig {
+                epochs: 1,
+                batch_size: 4,
+                warmup_steps: 0,
+                lr_schedule: LrSchedule::Constant,
+                // target_modules left empty (the default): the projection-head
+                // arm, which never builds an encoder to probe.
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let record = wait_for_any_terminal(session.catalog(), &job.job_id).await;
+    let report = expect_determined_report(record.acceleration_report.as_deref());
+
+    assert_eq!(
+        report["ops"],
+        serde_json::json!({}),
+        "the projection-head arm builds no encoder to probe — ops must be empty, got: {report}"
+    );
+    assert_ne!(
+        report["flash"]["reason"],
+        serde_json::json!("probe_forward_failed"),
+        "the projection-head arm never attempts a probe at all — it must never claim the \
+         probe-was-attempted-and-failed reason, got: {report}"
+    );
+    if cfg!(feature = "cuda") && report["device"] == serde_json::json!("cuda") {
+        assert_eq!(
+            report["flash"]["reason"],
+            serde_json::json!("no_encoder_to_probe_projection_head_arm"),
+            "on a real CUDA device the honest no-probe-attempted reason must appear, got: \
+             {report}"
+        );
+    }
+    assert_eq!(report["flash"]["holds"], serde_json::json!(false));
+}
+
+/// Phase-4 adversarial-audit finding 4 ("PENDING-FOREVER"), `ContextPredictor`
+/// half: this job kind never routes through `run_fine_tune_blocking`'s
+/// measuring probe at all (`run_spec`'s `ContextPredictor` arm calls
+/// `InferenceSession::run_context_predictor_training` directly). Before the
+/// fix, its `acceleration_report` stayed at the submission-time
+/// `{"state":"pending"}` marker FOREVER, even past this job's terminal
+/// status — which the tri-state contract's own definition of "pending"
+/// (no claimant has computed a determination YET) does not describe once the
+/// job is done. The self-describing `{"state":"not_applicable",
+/// "reason":"context_predictor"}` marker must land instead, regardless of
+/// whether the predictor training itself succeeds (this test's own tiny
+/// synthetic dataset is not tuned to guarantee that — `wait_for_any_terminal`
+/// accepts either outcome, since the marker is written BEFORE training even
+/// starts).
+#[serial(esc075_acceleration_report)]
+#[tokio::test(flavor = "multi_thread")]
+async fn context_predictor_job_reports_not_applicable_acceleration() {
+    use arrow::array::{ArrayRef, Float64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use jammi_ai::pipeline::context_predictor::{
+        ContextPredictorTrainConfig, GaussianObjective, PredictiveHead,
+    };
+    use jammi_encoders::ContextArchitecture;
+    use parquet::arrow::ArrowWriter;
+
+    let dir = TempDir::new().unwrap();
+    let config = common::test_config(dir.path());
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    session.register_query_functions();
+
+    // A minimal meta-dataset-shaped source: a few rows across two tasks. This
+    // test does not need the predictor to actually LEARN anything (or even
+    // complete) — only that the job reaches a terminal status with the
+    // acceleration marker already written.
+    let ids = ["a0", "a1", "a2", "b0", "b1", "b2"];
+    let tasks = ["task_a", "task_a", "task_a", "task_b", "task_b", "task_b"];
+    let ys = [0.1_f64, 0.2, 0.3, 0.4, 0.5, 0.6];
+    let texts = [
+        "task a example zero",
+        "task a example one",
+        "task a example two",
+        "task b example zero",
+        "task b example one",
+        "task b example two",
+    ];
+    let schema = std::sync::Arc::new(Schema::new(vec![
+        Field::new("_row_id", DataType::Utf8, false),
+        Field::new("task", DataType::Utf8, false),
+        Field::new("y", DataType::Float64, false),
+        Field::new("text", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::clone(&schema),
+        vec![
+            std::sync::Arc::new(StringArray::from(ids.to_vec())) as ArrayRef,
+            std::sync::Arc::new(StringArray::from(tasks.to_vec())),
+            std::sync::Arc::new(Float64Array::from(ys.to_vec())),
+            std::sync::Arc::new(StringArray::from(texts.to_vec())),
+        ],
+    )
+    .unwrap();
+    let source_path = dir.path().join("ctx_source.parquet");
+    {
+        let file = std::fs::File::create(&source_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, std::sync::Arc::clone(&schema), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+    session
+        .add_source(
+            "ctx",
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", source_path.to_str().unwrap())),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    session
+        .generate_text_embeddings(
+            "ctx",
+            &tiny_modernbert_model(),
+            &["text".to_string()],
+            "_row_id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
+        .await
+        .unwrap();
+
+    let predictor_spec = ContextPredictorTrainConfig {
+        model_id: "esc075-ctx-predictor".to_string(),
+        architecture: ContextArchitecture::Cnp,
+        key_column: "_row_id".to_string(),
+        task_column: "task".to_string(),
+        value_column: "y".to_string(),
+        context_k: 2,
+        hidden_dim: 8,
+        num_heads: 1,
+        num_layers: 1,
+        head: PredictiveHead::Gaussian {
+            objective: GaussianObjective::Crps,
+        },
+        epochs: 1,
+        learning_rate: 0.01,
+        grad_clip: 1.0,
+        test_task_fraction: 0.5,
+        min_task_count: 2,
+        seed: 1,
+    };
+
+    let _worker = EmbeddedWorker::spawn(&session).expect("default worker intervals are valid");
+    let job = session
+        .train_context_predictor("ctx", &predictor_spec)
+        .await
+        .unwrap();
+    let record = wait_for_any_terminal(session.catalog(), &job.job_id).await;
+    let report_json = record.acceleration_report.as_deref().expect(
+        "esc-075 control (iii): a missing report is a failure — a ContextPredictor job must \
+         still carry a self-describing terminal marker, never the submission-time pending \
+         marker forever",
+    );
+    let report: serde_json::Value = serde_json::from_str(report_json).unwrap();
+    assert_eq!(
+        report["state"],
+        serde_json::json!("not_applicable"),
+        "a ContextPredictor job never runs the fine-tune measuring probe — its record must \
+         carry the self-describing not_applicable marker, got: {report}"
+    );
+    assert_eq!(report["reason"], serde_json::json!("context_predictor"));
+}
+
+/// Phase-4 adversarial-audit finding 4 ("PENDING-FOREVER"), pre-device-
+/// resolution-failure half: a job that fails in `run_claimed_job` BEFORE
+/// `run_spec`/`run_fine_tune_blocking` are ever reached (an undeserialisable
+/// `training_spec`) never runs the measuring probe either. Before the fix,
+/// its `acceleration_report` stayed at the submission-time
+/// `{"state":"pending"}` marker forever past this job's terminal `failed`
+/// status. The self-describing `{"state":"undetermined",
+/// "reason":"failed_before_device_resolution"}` marker must land instead.
+#[serial(esc075_acceleration_report)]
+#[tokio::test(flavor = "multi_thread")]
+async fn pre_device_resolution_failure_reports_undetermined_acceleration() {
+    let (session, _dir) = session_with_training_data().await;
+    let _worker = EmbeddedWorker::spawn(&session).expect("default worker intervals are valid");
+
+    // A real job first, purely to mint a valid `base_model_id` FK target —
+    // mirrors `embedded_and_raw_transports_produce_the_same_report_shape`'s
+    // own reuse pattern rather than re-deriving `ModelSource` resolution.
+    let seed_job = session
+        .fine_tune(
+            "training",
+            &tiny_modernbert_model(),
+            &training_columns(),
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(encoder_adapters_config(ComputePrecision::F32)),
+        )
+        .await
+        .unwrap();
+    seed_job.wait().await.unwrap();
+    let seed_record = session
+        .catalog()
+        .get_training_job(&seed_job.job_id)
+        .await
+        .unwrap();
+
+    // A raw job carrying a deliberately undeserialisable `training_spec` —
+    // fails in `run_claimed_job` before `run_spec`/`run_fine_tune_blocking`
+    // (and therefore the device resolution + measuring probe) are ever
+    // reached.
+    let job_id = "esc075-pre-device-resolution-failure".to_string();
+    session
+        .catalog()
+        .create_training_job(CreateTrainingJobParams {
+            job_id: &job_id,
+            base_model_id: &seed_record.base_model_id,
+            training_source: "training",
+            loss_type: "cosent",
+            hyperparams: "{}",
+            kind: "fine_tune",
+            training_spec: "this is not valid JSON at all {{{",
+        })
+        .await
+        .unwrap();
+
+    let record = wait_for_any_terminal(session.catalog(), &job_id).await;
+    assert_eq!(
+        record.status, "failed",
+        "an undeserialisable training_spec must land the job failed, got {}",
+        record.status
+    );
+    let report_json = record.acceleration_report.as_deref().expect(
+        "esc-075 control (iii): a missing report is a failure — a pre-device-resolution \
+         failure must still carry a self-describing terminal marker, never the submission-time \
+         pending marker forever",
+    );
+    let report: serde_json::Value = serde_json::from_str(report_json).unwrap();
+    assert_eq!(
+        report["state"],
+        serde_json::json!("undetermined"),
+        "a job that fails before the device is ever resolved never runs the measuring probe — \
+         its record must carry the self-describing undetermined marker, got: {report}"
+    );
+    assert_eq!(
+        report["reason"],
+        serde_json::json!("failed_before_device_resolution")
     );
 }

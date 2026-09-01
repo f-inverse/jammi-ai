@@ -259,6 +259,20 @@ fn modernbert_large_config() -> ModernBertConfig {
     }
 }
 
+/// KO-7 require-gate for the drop-ratio INCONCLUSIVE fallback branches
+/// (registered in `ci/kernel-oracle-helpers.txt`): under `JAMMI_REQUIRE_CUDA`
+/// a too-short memory trace must FAIL loudly rather than fall back to an
+/// inconclusive skip — on a prove lane an unmeasurable oracle is a failure,
+/// never a soft pass.
+fn esc076_trace_gate(context: &str) {
+    if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
+        panic!(
+            "{context}: JAMMI_REQUIRE_CUDA is set but the memory trace was too short to compare \
+             — an inconclusive drop-ratio oracle is not acceptable on a prove lane"
+        );
+    }
+}
+
 fn cuda_device() -> Option<Device> {
     match Device::new_cuda(0) {
         Ok(d) => Some(d),
@@ -1146,6 +1160,7 @@ fn esc076_variable_shape_unbucketed_reproduces_the_pre_fix_oom() {
              short to compare (see the OOM-branch check above for the sharper reproduction this \
              falls back from)."
         );
+        esc076_trace_gate("esc076_variable_shape_unbucketed_reproduces_the_pre_fix_oom");
         return;
     };
     println!(
@@ -1273,6 +1288,7 @@ fn esc076_variable_shape_bucketed_completes_with_bounded_memory() {
              compare (the completion assertion above already establishes the primary GREEN \
              claim)."
         );
+        esc076_trace_gate("esc076_variable_shape_bucketed_completes_with_bounded_memory");
         return;
     };
     println!(

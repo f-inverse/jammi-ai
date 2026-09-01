@@ -3704,6 +3704,9 @@ mod tests {
             return;
         };
         if !flash_arch_ok(&device) {
+            flash_arch_gate(
+                "flash_capability_gates_admits_f16_alongside_bf16_on_real_cuda_arch_and_head_dim",
+            );
             eprintln!(
                 "flash_capability_gates_admits_f16_alongside_bf16_on_real_cuda_arch_and_head_dim: \
                  skipping -- this device's arch is not in flash_validated_arches()"
@@ -5897,6 +5900,22 @@ mod tests {
     /// gate: a machine that should be running this real-checkpoint-gated
     /// suite (the pod lane) must not silently read a missing
     /// `JAMMI_FLASH_ORACLE_MODEL_DIR` as green.
+    #[cfg(feature = "cuda")]
+    /// KO-7 require-gate for an arch-conditioned flash skip (registered in
+    /// `ci/kernel-oracle-helpers.txt`): under `JAMMI_REQUIRE_CUDA` a device
+    /// whose arch is outside `flash_validated_arches()` must FAIL the test
+    /// loudly, never skip it silently — the prove lanes pin exactly the
+    /// validated arches, so a skip there is a wrong pod, not a soft pass.
+    #[cfg(feature = "cuda")]
+    fn flash_arch_gate(test_name: &str) {
+        if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
+            panic!(
+                "{test_name}: JAMMI_REQUIRE_CUDA is set but this device's arch is not in \
+                 flash_validated_arches() — a silent arch skip is not acceptable on a prove lane"
+            );
+        }
+    }
+
     #[cfg(feature = "cuda")]
     fn flash_oracle_require_gate(test_name: &str) {
         if std::env::var_os("JAMMI_REQUIRE_FLASH_ORACLE").is_some() {

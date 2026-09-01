@@ -1519,6 +1519,136 @@ while IFS=: read -r status name; do
   fi
 done < "$RESULTS"
 
+# ═════════════════════════════════════════════════════════════════════════
+# Group 9 (esc-077) — `run` refuses a job whose CARGO_TARGET_DIR never went
+# through the seed-clone substrate. Two layers: (9a) a hermetic, no-ssh unit
+# test of the state-classification TEXT itself (rp_target_preflight_lines,
+# runpod_lib.sh) against real local fixture directories — the SSH-mocked
+# Group 7 idiom below only proves `run`'s DISPATCH on a given canned answer,
+# never that the embedded remote script computes the right answer against a
+# real filesystem; (9b-9e) the SAME WAITBIN ssh-stub idiom Group 7 uses,
+# proving `run`'s own refuse/proceed/override control flow end to end.
+# ═════════════════════════════════════════════════════════════════════════
+
+# --- 9a: rp_target_preflight_lines classifies MISSING/UNMARKED/OK correctly
+# against real directories — no ssh, no pod, no mocking. Subshelled so
+# sourcing runpod_lib.sh (which requires RUNPOD_API_KEY, unrelated to any
+# other group's own env) never leaks into the rest of this suite. Writes to
+# a group-LOCAL results file via `record` (never `ok`/`bad` directly inside
+# the subshell — `ok`/`bad` increment the PASS/FAIL COUNTERS by mutating
+# global variables, and a subshell's variable mutations are discarded the
+# instant it exits, exactly like Group 0's own `record`-in-a-subshell
+# idiom above); the OUTER shell tallies this group-local file right after,
+# so the counters actually persist.
+G9A_RESULTS="$SANDBOX/g9a-results.log"
+: > "$G9A_RESULTS"
+(
+  RUNPOD_API_KEY="test-dummy-key"
+  # shellcheck source=ci/scripts/runpod_lib.sh
+  source "$DIR/runpod_lib.sh"
+  record() { echo "$1:$2" >> "$G9A_RESULTS"; }
+  G9A_SANDBOX="$SANDBOX/g9a"; mkdir -p "$G9A_SANDBOX"
+
+  out_missing="$(bash <(rp_target_preflight_lines "$G9A_SANDBOX/does-not-exist"))"
+  if [ "$out_missing" = "GPU_DEV_TARGET_STATE=MISSING" ]; then
+    record PASS "rp_target_preflight_lines: MISSING target dir classified MISSING"
+  else
+    record FAIL "rp_target_preflight_lines: expected MISSING (got: $out_missing)"
+  fi
+
+  mkdir -p "$G9A_SANDBOX/unmarked"
+  out_unmarked="$(bash <(rp_target_preflight_lines "$G9A_SANDBOX/unmarked"))"
+  if [ "$out_unmarked" = "GPU_DEV_TARGET_STATE=UNMARKED" ]; then
+    record PASS "rp_target_preflight_lines: existing but unmarked target dir classified UNMARKED"
+  else
+    record FAIL "rp_target_preflight_lines: expected UNMARKED (got: $out_unmarked)"
+  fi
+
+  mkdir -p "$G9A_SANDBOX/marked"
+  : > "$G9A_SANDBOX/marked/.jammi-clone-of-seed"
+  out_ok="$(bash <(rp_target_preflight_lines "$G9A_SANDBOX/marked"))"
+  if [ "$out_ok" = "GPU_DEV_TARGET_STATE=OK" ]; then
+    record PASS "rp_target_preflight_lines: a marked (.jammi-clone-of-seed present) target dir classified OK"
+  else
+    record FAIL "rp_target_preflight_lines: expected OK (got: $out_ok)"
+  fi
+)
+while IFS=: read -r status name; do
+  [ -n "$status" ] || continue
+  if [ "$status" = "PASS" ]; then ok "$name"; else bad "$name"; fi
+done < "$G9A_RESULTS"
+
+# --- 9b-9e: `run`'s own dispatch, over the SAME WAITBIN ssh-stub Group 7
+# builds above (call order: #1 require_pod liveness, #2 the esc-077
+# preflight — SKIPPED entirely under RP_ALLOW_COLD_TARGET=1 — #3 the real
+# job-launch heredoc, reached only when the preflight allows it).
+G9_SESSION="g9run"; write_meta "$G9_SESSION" "pod-g9run" "8"
+
+# --- 9b: MISSING target dir -> refuse (exit 1), remedy named -------------
+G9B_DIR="$SANDBOX/g9b-ssh"; mkdir -p "$G9B_DIR"
+write_ssh_resp "$G9B_DIR" 1 0                                  # require_pod liveness
+write_ssh_resp "$G9B_DIR" 2 0 "GPU_DEV_TARGET_STATE=MISSING"   # esc-077 preflight
+rm -f "$SANDBOX/g9b-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g9b-counter" MOCK_SSH_RESPONSES_DIR="$G9B_DIR" \
+  PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" run "$G9_SESSION" echo hi \
+  >"$SANDBOX/out-g9b.log" 2>&1
+g9b_rc=$?
+if [ "$g9b_rc" -ne 0 ] && grep -q "does not exist on the pod" "$SANDBOX/out-g9b.log" \
+  && grep -q "target ${G9_SESSION} jammi-ai --with-cutlass" "$SANDBOX/out-g9b.log" \
+  && grep -q "RP_ALLOW_COLD_TARGET=1" "$SANDBOX/out-g9b.log" \
+  && [ "$(cat "$SANDBOX/g9b-counter")" = "2" ]; then
+  ok "run (esc-077): refuses a MISSING target dir (exit $g9b_rc), naming the target remedy and the override, never reaching the job-launch call"
+else
+  bad "run (esc-077): expected a named MISSING refusal + exactly 2 ssh calls (got rc=$g9b_rc, calls=$(cat "$SANDBOX/g9b-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9b.log")"
+fi
+
+# --- 9c: existing-but-UNMARKED target dir -> refuse (exit 1) --------------
+G9C_DIR="$SANDBOX/g9c-ssh"; mkdir -p "$G9C_DIR"
+write_ssh_resp "$G9C_DIR" 1 0
+write_ssh_resp "$G9C_DIR" 2 0 "GPU_DEV_TARGET_STATE=UNMARKED"
+rm -f "$SANDBOX/g9c-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g9c-counter" MOCK_SSH_RESPONSES_DIR="$G9C_DIR" \
+  PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" run "$G9_SESSION" echo hi \
+  >"$SANDBOX/out-g9c.log" 2>&1
+g9c_rc=$?
+if [ "$g9c_rc" -ne 0 ] && grep -q "no seed-clone marker" "$SANDBOX/out-g9c.log" \
+  && grep -q "RP_ALLOW_COLD_TARGET=1" "$SANDBOX/out-g9c.log" \
+  && [ "$(cat "$SANDBOX/g9c-counter")" = "2" ]; then
+  ok "run (esc-077): refuses an existing but UNMARKED target dir (exit $g9c_rc), never reaching the job-launch call"
+else
+  bad "run (esc-077): expected a named UNMARKED refusal + exactly 2 ssh calls (got rc=$g9c_rc, calls=$(cat "$SANDBOX/g9c-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9c.log")"
+fi
+
+# --- 9d: a marked clone (OK) -> proceeds to the real job-launch call ------
+G9D_DIR="$SANDBOX/g9d-ssh"; mkdir -p "$G9D_DIR"
+write_ssh_resp "$G9D_DIR" 1 0
+write_ssh_resp "$G9D_DIR" 2 0 "GPU_DEV_TARGET_STATE=OK"
+write_ssh_resp "$G9D_DIR" 3 0 "started"
+rm -f "$SANDBOX/g9d-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g9d-counter" MOCK_SSH_RESPONSES_DIR="$G9D_DIR" \
+  PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" run "$G9_SESSION" echo hi \
+  >"$SANDBOX/out-g9d.log" 2>&1
+if [ "$(cat "$SANDBOX/g9d-counter")" = "3" ] && grep -q "detached" "$SANDBOX/out-g9d.log"; then
+  ok "run (esc-077): a marked (OK) clone proceeds past the preflight to the real job-launch call"
+else
+  bad "run (esc-077): expected exactly 3 ssh calls (preflight OK -> job launch) (got calls=$(cat "$SANDBOX/g9d-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9d.log")"
+fi
+
+# --- 9e: RP_ALLOW_COLD_TARGET=1 skips the preflight call entirely ---------
+G9E_DIR="$SANDBOX/g9e-ssh"; mkdir -p "$G9E_DIR"
+write_ssh_resp "$G9E_DIR" 1 0
+write_ssh_resp "$G9E_DIR" 2 0 "started"                        # the job-launch call, now #2
+rm -f "$SANDBOX/g9e-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g9e-counter" MOCK_SSH_RESPONSES_DIR="$G9E_DIR" \
+  RP_ALLOW_COLD_TARGET=1 \
+  PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" run "$G9_SESSION" echo hi \
+  >"$SANDBOX/out-g9e.log" 2>&1
+if [ "$(cat "$SANDBOX/g9e-counter")" = "2" ] && grep -q "detached" "$SANDBOX/out-g9e.log"; then
+  ok "run (esc-077): RP_ALLOW_COLD_TARGET=1 skips the preflight ssh call entirely (exactly 2 calls: liveness + job launch)"
+else
+  bad "run (esc-077): expected RP_ALLOW_COLD_TARGET=1 to skip straight to the job-launch call (2 total calls) (got calls=$(cat "$SANDBOX/g9e-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9e.log")"
+fi
+
 echo
 echo "gpu-dev-lifecycle: ${PASS} passed, ${FAIL} failed, ${SKIP} skipped"
 [ "$FAIL" -eq 0 ]

@@ -187,6 +187,44 @@ DRV
     bad "(b) clone did not reproduce seed content or removed the seed (rc=$rc); output: $(cat "$SANDBOX/b2.out")"
   fi
 
+  # esc-077 (e): the clone stamps a marker INSIDE the destination recording
+  # the seed dir, the seed's own completion-marker content (mtime + sha256),
+  # and the clone timestamp — gpu-dev.sh `run`'s preflight (esc-077) reads
+  # exactly this file's PRESENCE; this test also cross-checks its CONTENT is
+  # honest (never just "the file exists").
+  CLONE_MARKER="$DEST/.jammi-clone-of-seed"
+  if [ -f "$CLONE_MARKER" ]; then
+    marker_check="$(python3 -c '
+import hashlib, json, sys
+seed_dir, complete_marker, dest_dir, marker_path = sys.argv[1:5]
+with open(marker_path) as f:
+    m = json.load(f)
+with open(complete_marker, "rb") as f:
+    expected_sha = hashlib.sha256(f.read()).hexdigest()
+ok = (
+    m.get("seed_dir") == seed_dir
+    and m.get("seed_complete_marker") == complete_marker
+    and m.get("seed_complete_marker_sha256") == expected_sha
+    and m.get("dest_dir") == dest_dir
+    and bool(m.get("seed_complete_marker_mtime"))
+    and bool(m.get("clone_timestamp"))
+)
+print("OK" if ok else "MISMATCH: " + json.dumps(m))
+' "$SEED" "${SEED}.jammi-seed-complete" "$DEST" "$CLONE_MARKER")"
+    if [ "$marker_check" = "OK" ]; then
+      ok "(b/esc-077) pod_target_clone.sh stamps \$DEST/.jammi-clone-of-seed with honest seed_dir/seed-marker-sha256/dest_dir/timestamps"
+    else
+      bad "(b/esc-077) clone marker content is wrong: $marker_check"
+    fi
+  else
+    bad "(b/esc-077) pod_target_clone.sh did not stamp $CLONE_MARKER on a successful clone"
+  fi
+
+  # esc-077 (e), continued: snapshot the marker's own bytes BEFORE the
+  # refusal attempt below, so "survives" is a real before/after comparison,
+  # never a file compared against itself.
+  CLONE_MARKER_BEFORE="$(cat "$CLONE_MARKER" 2>/dev/null)"
+
   # Refuses to clone onto an existing destination.
   bash "$CLONE_SH" "$SEED" "$DEST" "$REPO_ROOT" >/dev/null 2>"$SANDBOX/b3.err"
   rc=$?
@@ -194,6 +232,14 @@ DRV
     ok "(b) pod_target_clone.sh refuses to clone over an existing destination"
   else
     bad "(b) expected exit 2 cloning over an existing destination (got rc=$rc)"
+  fi
+
+  # The refusal path exits before `cp`/the marker-stamp step even run, so
+  # the marker from the ORIGINAL successful clone must survive byte-for-byte.
+  if [ -f "$CLONE_MARKER" ] && [ "$(cat "$CLONE_MARKER")" = "$CLONE_MARKER_BEFORE" ]; then
+    ok "(b/esc-077) the existing-destination refusal path leaves the prior successful clone's marker untouched"
+  else
+    bad "(b/esc-077) the existing-destination refusal path unexpectedly mutated or removed the clone marker"
   fi
 
   # round-3 audit N2: a POISONED seed (a fake .fingerprint entry named after

@@ -664,6 +664,30 @@ mkdir -p '${parent_dir}'
 EOF
 }
 
+# esc-077: the shell TEXT that classifies $1 (a CARGO_TARGET_DIR path, e.g.
+# TARGET_DIR from rp_target_dir) as MISSING, UNMARKED, or a genuine seed-clone
+# (OK) — `.jammi-clone-of-seed` is the marker `pod_target_clone.sh` stamps on
+# every successful clone. A plain function, not inlined by hand into
+# gpu-dev.sh's `run` heredoc, so it is directly testable: source this file,
+# call it with a real local directory, and run the printed text (`bash <
+# <(rp_target_preflight_lines "$dir")`) against real fixture directories —
+# no ssh, no pod, no mocking. Prints exactly one line,
+# `GPU_DEV_TARGET_STATE=<MISSING|UNMARKED|OK>`, so the caller's remote
+# execution of this same text (over `rp_run_remote`) is trivially parsed by
+# a `case` at the call site. $1=target_dir.
+rp_target_preflight_lines() {
+  local target_dir="${1:?rp_target_preflight_lines needs a target dir}"
+  cat <<EOF
+if [ ! -d '${target_dir}' ]; then
+  echo GPU_DEV_TARGET_STATE=MISSING
+elif [ ! -f '${target_dir}/.jammi-clone-of-seed' ]; then
+  echo GPU_DEV_TARGET_STATE=UNMARKED
+else
+  echo GPU_DEV_TARGET_STATE=OK
+fi
+EOF
+}
+
 # The env-source + CARGO_TARGET_DIR + cd preamble shared by every remote
 # command that must run correctly as if it were an interactive shell in the
 # tree (an SSH login shell does not inherit the container's Dockerfile ENV —

@@ -387,6 +387,18 @@ Under the hood this is `pod_target_clone.sh <seed-dir> <dest-dir>
    — `--verify` only ever runs when a human remembers to run it and only
    catches units Fresh on *this one* build.
 
+5. **Stamps `<dest-dir>/.jammi-clone-of-seed`** (esc-077) with the seed dir,
+   the seed's own completion-marker mtime/sha256, and the clone timestamp —
+   `gpu-dev.sh run` REFUSES a job whose `CARGO_TARGET_DIR` is missing this
+   marker (a raw/cold target dir, never a real clone), naming the exact
+   `target ... --with-cutlass` remedy; `RP_ALLOW_COLD_TARGET=1` is the sole
+   override, for a deliberate cold build (`pod_build_timings.sh`'s own
+   measurement legs bypass `run` entirely and are unaffected — see that
+   script's own module doc). **Documented residual:** this gate covers only
+   a job launched through `run` — a caller who `ssh`es onto the pod directly
+   and invokes `cargo` by hand bypasses it entirely; it is not claimed
+   closed, only that the sanctioned path fails closed.
+
 **Poisoned-clone detection**, concretely:
 
 ```bash

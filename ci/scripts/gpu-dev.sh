@@ -39,7 +39,11 @@
 #                                                      (`/root/target-<name>`) for a tree that
 #                                                      already exists — `push` to <name> FIRST
 #   gpu-dev.sh attach  [session] [--tree T]           shell into a surviving session
-#   gpu-dev.sh run     [session] [--tree T] <cmd...>  run <cmd> detached under tmux
+#   gpu-dev.sh run     [session] [--tree T] <cmd...>  run <cmd> detached under tmux — REFUSES
+#                                                      (esc-077) unless <tree>'s CARGO_TARGET_DIR
+#                                                      carries a `target`-stamped clone marker
+#                                                      (`.jammi-clone-of-seed`); remedy in the
+#                                                      error, or RP_ALLOW_COLD_TARGET=1 to force
 #   gpu-dev.sh logs    [session] [--tree T]           tail the detached job's output
 #   gpu-dev.sh push    [session] [--tree T]           rsync YOUR OWN checkout (this script's
 #                                                      own on-disk location, never $PWD) TO the pod
@@ -119,7 +123,10 @@ gpu-dev.sh — GPU development on RunPod
                                           (pod_target_clone.sh)
   attach  [session] [--tree T]            join a surviving session's running job
                                           (--shell for a plain prompt instead)
-  run     [session] [--tree T] <cmd...>   run <cmd> detached under tmux, in <tree>
+  run     [session] [--tree T] <cmd...>   run <cmd> detached under tmux, in <tree> — REFUSES
+                                          (esc-077) unless <tree>'s CARGO_TARGET_DIR carries a
+                                          `target`-stamped clone marker (else a silent cold
+                                          full-workspace build); RP_ALLOW_COLD_TARGET=1 bypasses
   logs    [session] [--tree T]            tail the detached job's output
   push    [session] [--tree T]            rsync YOUR OWN checkout (this script's own on-disk
                                           location, never $PWD) TO the pod's <tree>
@@ -798,6 +805,47 @@ case "$CMD" in
     case "${1:-}" in --timing) TIMING=1; shift ;; esac
     [ $# -gt 0 ] || { echo "run: need a command"; exit 2; }
     require_pod; rp_keep
+
+    # esc-077: refuse a job whose CARGO_TARGET_DIR (TARGET_DIR, resolved at
+    # :562 from --tree) never went through the seed-clone substrate
+    # (pod_target_clone.sh, the `target` verb below) — a missing or unmarked
+    # target dir means this job would silently pay a full COLD workspace
+    # build (~20-40min) instead of the seeded clone's ~80s incremental
+    # build, and nothing else at this launch choke point would notice
+    # (esc-077's own observable: four wave contracts paid this cost
+    # unnoticed). Checked on the POD's filesystem — TARGET_DIR is a remote
+    # path — before anything is launched. RP_ALLOW_COLD_TARGET=1 is the
+    # SOLE, explicit bypass; `ci/scripts/perf/pod_build_timings.sh`'s own
+    # cold-build leg sets it deliberately (see that script's own comment).
+    # Documented residual: this covers only a job launched THROUGH this
+    # verb — a caller who `ssh`es in directly and runs `cargo` by hand
+    # bypasses this wrapper entirely (stated in docs/maintainer/
+    # pod-build-guide.md and this script's own usage header).
+    if [ "${RP_ALLOW_COLD_TARGET:-0}" != "1" ]; then
+      TARGET_PREFLIGHT_STATE="$(rp_run_remote <<EOF
+set -uo pipefail
+$(rp_target_preflight_lines "$TARGET_DIR")
+EOF
+)"
+      case "$TARGET_PREFLIGHT_STATE" in
+        *GPU_DEV_TARGET_STATE=OK*) : ;;
+        *GPU_DEV_TARGET_STATE=MISSING*)
+          echo "::error::run refused: CARGO_TARGET_DIR ${TARGET_DIR} does not exist on the pod — this job would pay a COLD full workspace build (~20-40min) instead of the seeded clone's ~80s incremental build." >&2
+          echo "remedy: $(basename "$0") target ${SESSION} ${TREE} --with-cutlass   (or set RP_ALLOW_COLD_TARGET=1 to proceed cold deliberately)" >&2
+          exit 1
+          ;;
+        *GPU_DEV_TARGET_STATE=UNMARKED*)
+          echo "::error::run refused: CARGO_TARGET_DIR ${TARGET_DIR} exists but carries no seed-clone marker (.jammi-clone-of-seed) — it was never provisioned via pod_target_clone.sh (the \`target\` verb), so this job would pay a COLD full workspace build." >&2
+          echo "remedy: $(basename "$0") target ${SESSION} ${TREE} --with-cutlass   (or set RP_ALLOW_COLD_TARGET=1 to proceed cold deliberately)" >&2
+          exit 1
+          ;;
+        *)
+          echo "::error::run preflight could not determine ${TARGET_DIR}'s provisioning state (got: '${TARGET_PREFLIGHT_STATE}') — refusing to guess; set RP_ALLOW_COLD_TARGET=1 to bypass" >&2
+          exit 1
+          ;;
+      esac
+    fi
+
     JOB="$*"
     # A per-run token, generated HERE (locally, before anything is sent to
     # the pod) — carried into the completion marker purely for a human

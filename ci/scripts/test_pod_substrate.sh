@@ -261,6 +261,80 @@ print("OK" if ok else "MISMATCH: " + json.dumps(m))
     bad "(b/N2) expected a poisoned seed's clone to be refused and removed (rc=$rc, dest exists=$([ -e "$POISON_DEST" ] && echo yes || echo no)): $(cat "$SANDBOX/b6.out")"
   fi
 
+  # --adopt (the executable remedy for `run`'s UNMARKED_WARM refusal): a
+  # target dir that is already WARM but carries no marker — one built
+  # before the marker scheme existed, or by any path other than the
+  # `target` verb — is stamped in place. The clone path cannot serve this
+  # case at all: it refuses an existing destination (pinned right above),
+  # which is exactly why the old refusal's remedy could not execute.
+  #
+  # Adoption is CHECKED, not a rubber stamp: it runs the SAME content
+  # validation every clone runs (pod_seed_assert_member_free, off the real
+  # workspace member list resolved from REPO_ROOT) and demands the OPPOSITE
+  # answer — member artifacts MUST be present, because those artifacts are
+  # the warmth being claimed.
+  ADOPT_WARM="$SANDBOX/b_adopt_warm"
+  rm -rf "$ADOPT_WARM"
+  mkdir -p "$ADOPT_WARM/debug/.fingerprint/jammi-bench-deadbeef"
+  echo x > "$ADOPT_WARM/debug/.fingerprint/jammi-bench-deadbeef/lib-jammi-bench.json"
+  bash "$CLONE_SH" "$SEED" "$ADOPT_WARM" "$REPO_ROOT" --adopt > "$SANDBOX/b7.out" 2>&1
+  rc=$?
+  if [ "$rc" -eq 0 ] && [ -f "$ADOPT_WARM/.jammi-clone-of-seed" ]; then
+    ok "(b/adopt) --adopt stamps the marker on an EXISTING warm target dir the clone path refuses outright"
+  else
+    bad "(b/adopt) expected --adopt to accept and stamp a warm dir (rc=$rc): $(cat "$SANDBOX/b7.out")"
+  fi
+  # The marker is HONEST about what it is: an adoption, with no seed
+  # provenance to claim (an adopted dir came from no seed).
+  adopt_marker_check="$(python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    m = json.load(f)
+print("OK" if (m.get("adopted") is True and m.get("seed_dir") is None
+                and m.get("dest_dir") == sys.argv[2]
+                and bool(m.get("adopted_timestamp"))) else "MISMATCH: " + json.dumps(m))
+' "$ADOPT_WARM/.jammi-clone-of-seed" "$ADOPT_WARM" 2>&1)"
+  [ "$adopt_marker_check" = "OK" ] \
+    && ok "(b/adopt) the adoption marker records adopted=true with NO fabricated seed provenance" \
+    || bad "(b/adopt) adoption marker content is wrong: $adopt_marker_check"
+  # The warm dir's own content is untouched — adoption copies and deletes
+  # nothing.
+  [ -f "$ADOPT_WARM/debug/.fingerprint/jammi-bench-deadbeef/lib-jammi-bench.json" ] \
+    && ok "(b/adopt) adoption leaves the warm dir's own artifacts in place (nothing copied, nothing deleted)" \
+    || bad "(b/adopt) adoption must not disturb the warm dir's existing artifacts"
+  # A genuinely COLD dir (a real cargo profile tree with no member
+  # artifacts) is still refused — --adopt can never launder cold into
+  # marked.
+  ADOPT_COLD="$SANDBOX/b_adopt_cold"
+  rm -rf "$ADOPT_COLD"
+  mkdir -p "$ADOPT_COLD/debug/.fingerprint/serde-1234abcd"
+  bash "$CLONE_SH" "$SEED" "$ADOPT_COLD" "$REPO_ROOT" --adopt > "$SANDBOX/b8.out" 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ] && [ ! -f "$ADOPT_COLD/.jammi-clone-of-seed" ] && grep -q 'NO workspace-member artifacts' "$SANDBOX/b8.out"; then
+    ok "(b/adopt) a COLD dir (no workspace-member artifacts) is refused and left unmarked"
+  else
+    bad "(b/adopt) expected a cold dir to be refused unmarked (rc=$rc): $(cat "$SANDBOX/b8.out")"
+  fi
+  # A dir that is not a built CARGO_TARGET_DIR at all (no debug/, no
+  # release/) is a structural refusal, not a silent stamp.
+  ADOPT_EMPTY="$SANDBOX/b_adopt_empty"
+  rm -rf "$ADOPT_EMPTY"; mkdir -p "$ADOPT_EMPTY"
+  bash "$CLONE_SH" "$SEED" "$ADOPT_EMPTY" "$REPO_ROOT" --adopt > "$SANDBOX/b9.out" 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ] && [ ! -f "$ADOPT_EMPTY/.jammi-clone-of-seed" ]; then
+    ok "(b/adopt) a dir with neither debug/ nor release/ is refused (structurally not a target dir), never stamped"
+  else
+    bad "(b/adopt) expected a structural refusal for a non-target dir (rc=$rc): $(cat "$SANDBOX/b9.out")"
+  fi
+  # A missing dir is refused too (there is nothing warm to adopt).
+  bash "$CLONE_SH" "$SEED" "$SANDBOX/b_adopt_absent" "$REPO_ROOT" --adopt > "$SANDBOX/b10.out" 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ] && [ ! -e "$SANDBOX/b_adopt_absent" ]; then
+    ok "(b/adopt) --adopt against a MISSING dir is refused and creates nothing"
+  else
+    bad "(b/adopt) expected --adopt to refuse a missing dir and create nothing (rc=$rc): $(cat "$SANDBOX/b10.out")"
+  fi
+
   # --verify: a log WITHOUT a Fresh jammi-* line passes.
   CLEAN_LOG="$SANDBOX/b_clean.log"
   { echo "   Compiling jammi-kernels v0.47.0"; echo "   Compiling jammi-bench v0.47.0"; echo "    Finished release"; } > "$CLEAN_LOG"

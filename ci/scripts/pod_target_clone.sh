@@ -9,7 +9,7 @@
 # writing through a hardlinked path mutates the seed's own copy), so this
 # never hardlinks.
 #
-# Usage: pod_target_clone.sh <seed-dir> <dest-dir> [tree-dir] [--verify]
+# Usage: pod_target_clone.sh <seed-dir> <dest-dir> [tree-dir] [--verify|--adopt]
 #   --verify: after the caller's own first build against <dest-dir>, pass a
 #     `cargo build -v` LOG on stdin; this asserts it names NO `Fresh jammi-*`
 #     unit line — a member-free seed means every member unit must actually
@@ -20,6 +20,21 @@
 #     and only ever catches member units that were Fresh on ONE specific
 #     build; the filesystem check runs on every single clone regardless and
 #     catches a leftover artifact whether or not anyone ever rebuilds.
+#   --adopt: stamp the clone marker on an ALREADY-WARM <dest-dir> that
+#     carries none — a target dir built before the marker scheme existed, or
+#     by any path other than the `target` verb. Nothing is cloned or copied.
+#     This is the executable remedy for `run`'s UNMARKED_WARM refusal: a
+#     warm dir cannot be re-provisioned by a clone (the clone refuses to
+#     write over an existing destination) and is NOT cold, so refusing it
+#     with "run `target` again" left an operator with no runnable move at
+#     all. Adoption is CHECKED, never a rubber stamp: it applies
+#     pod_seed_assert_member_free — the SAME content validation every clone
+#     is put through — and demands the OPPOSITE answer. A clone must be
+#     member-FREE (nothing of this workspace built into it yet); a dir worth
+#     adopting must contain member artifacts, because those artifacts ARE
+#     the warmth being claimed. A structurally invalid dir (no debug/ and no
+#     release/) and a member-free (cold) dir are both refused, so `--adopt`
+#     can never launder a cold dir into a marked one.
 #   [tree-dir]: where `cargo metadata` resolves the workspace member list
 #     from for the member-freedom check (default /root/jammi-ai — the
 #     bootstrap checkout, always present, whose workspace member LIST is
@@ -31,16 +46,19 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 . "$DIR/pod_seed_target.sh"
 
-usage() { echo "usage: $(basename "$0") <seed-dir> <dest-dir> [tree-dir] [--verify]" >&2; exit 2; }
+usage() { echo "usage: $(basename "$0") <seed-dir> <dest-dir> [tree-dir] [--verify|--adopt]" >&2; exit 2; }
 
 VERIFY=0
+ADOPT=0
 ARGS=()
 for a in "$@"; do
   case "$a" in
     --verify) VERIFY=1 ;;
+    --adopt) ADOPT=1 ;;
     *) ARGS+=("$a") ;;
   esac
 done
+[ "$VERIFY" = "1" ] && [ "$ADOPT" = "1" ] && { echo "::error::--verify and --adopt are different operations; pass at most one" >&2; exit 2; }
 [ "${#ARGS[@]}" -ge 2 ] || usage
 SEED_DIR="${ARGS[0]}"
 DEST_DIR="${ARGS[1]}"
@@ -56,6 +74,56 @@ if [ "$VERIFY" = "1" ]; then
     exit 1
   fi
   echo "clone verify OK — no Fresh jammi-* unit on the clone's first build"
+  exit 0
+fi
+
+if [ "$ADOPT" = "1" ]; then
+  # No seed is read and nothing is copied: adoption only ever ADDS the
+  # marker to a directory that already earned it.
+  [ -d "$DEST_DIR" ] || {
+    echo "::error::refusing to adopt: ${DEST_DIR} does not exist — there is nothing warm here to adopt; provision it with a clone instead" >&2
+    exit 2
+  }
+  if [ -f "${DEST_DIR}/.jammi-clone-of-seed" ]; then
+    echo "adopt: ${DEST_DIR} already carries .jammi-clone-of-seed — nothing to do"
+    exit 0
+  fi
+  # The SAME content validation every clone is put through, with the
+  # OPPOSITE expected answer (see --adopt's own doc above). rc=2 is a
+  # structural refusal (not a built CARGO_TARGET_DIR at all), rc=0 means
+  # member-free — a cold dir, which must NOT be marked warm — and rc=1
+  # means member artifacts are present, which is exactly the warmth being
+  # adopted. Its own stderr describes a SEED violation, which is the wrong
+  # story here, so it is captured and this branch tells the real one.
+  member_scan="$(pod_seed_assert_member_free "$DEST_DIR" "$TREE_DIR_FOR_METADATA" 2>&1)"
+  scan_rc=$?
+  case "$scan_rc" in
+    1) : ;;  # member artifacts present -> genuinely warm
+    0)
+      echo "::error::refusing to adopt: ${DEST_DIR} contains NO workspace-member artifacts — it is a cold (or member-free seed-shaped) target dir, not a warm one; a job against it would pay the full build this marker exists to promise it will not" >&2
+      exit 1 ;;
+    *)
+      echo "::error::refusing to adopt: ${DEST_DIR} did not pass the target-dir content check (rc=${scan_rc}):" >&2
+      printf '%s\n' "$member_scan" >&2
+      exit "$scan_rc" ;;
+  esac
+  ADOPT_MARKER="${DEST_DIR}/.jammi-clone-of-seed"
+  python3 -c '
+import json, sys, datetime
+dest_dir = sys.argv[1]
+now = datetime.datetime.now(tz=datetime.timezone.utc)
+print(json.dumps({
+    "adopted": True,
+    "seed_dir": None,
+    "dest_dir": dest_dir,
+    "adopted_timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "warmth_evidence": "pod_seed_assert_member_free reported workspace-member artifacts present",
+}, indent=2))
+' "$DEST_DIR" > "$ADOPT_MARKER"
+  rc=$?
+  [ "$rc" -eq 0 ] || { echo "::error::failed to stamp adoption marker at ${ADOPT_MARKER} (exit $rc)" >&2; exit "$rc"; }
+  echo "adopt marker stamped: ${ADOPT_MARKER}"
+  echo "=== adopt complete: ${DEST_DIR} ==="
   exit 0
 fi
 

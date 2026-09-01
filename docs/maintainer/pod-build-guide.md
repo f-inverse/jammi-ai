@@ -379,23 +379,23 @@ tree with a different commit's build script is a worse inconsistency than
 the one being avoided.
 
 Under the hood this is `pod_target_clone.sh <seed-dir> <dest-dir>
-[tree-dir]` (`ci/scripts/gpu-dev.sh:878-881`), which:
+[tree-dir]` (`ci/scripts/gpu-dev.sh:1203-1213`), which:
 
 1. **Refuses without the seed's completion marker** (exit 3) —
-   `pod_target_clone.sh:62-71`. No seed, no clone: this is the "did the
+   `pod_target_clone.sh:130-140`. No seed, no clone: this is the "did the
    seed actually finish" gate a caller cannot bypass by accident.
 2. **`cp -a --reflink=auto`** the seed into the destination
-   (`:76-89`) — CoW where the filesystem supports it, a real copy
+   (`:144-160`) — CoW where the filesystem supports it, a real copy
    otherwise; never a hardlink (a hardlink clone was reproduced to corrupt
    the seed itself — writing through a hardlinked path mutates the shared
    inode, `pod_target_clone.sh:1-10`).
 3. **Unconditional member-freedom check on the clone**
-   (`pod_seed_assert_member_free`, `:98-106`) — if the seed was *not*
+   (`pod_seed_assert_member_free`, `:166-174`) — if the seed was *not*
    actually member-free, the clone is deleted and the call fails right
    here, rather than surfacing later as a mysterious stale-artifact bug.
 4. **`--verify` (opt-in, after your own first build):** pipe a `cargo
    build -v` log on stdin; asserts no line matches `^\s*Fresh\s+jammi-`
-   (`:49-60`) — a member-free seed means every `jammi-*` unit must actually
+   (`:68-77`) — a member-free seed means every `jammi-*` unit must actually
    *compile* (not report `Fresh`) on the clone's first build. This is
    additional to, never a substitute for, the unconditional check in step 3
    — `--verify` only ever runs when a human remembers to run it and only
@@ -404,14 +404,32 @@ Under the hood this is `pod_target_clone.sh <seed-dir> <dest-dir>
 5. **Stamps `<dest-dir>/.jammi-clone-of-seed`** (esc-077) with the seed dir,
    the seed's own completion-marker mtime/sha256, and the clone timestamp —
    `gpu-dev.sh run` REFUSES a job whose `CARGO_TARGET_DIR` is missing this
-   marker (a raw/cold target dir, never a real clone), naming the exact
-   `target ... --with-cutlass` remedy; `RP_ALLOW_COLD_TARGET=1` is the sole
-   override, for a deliberate cold build (`pod_build_timings.sh`'s own
-   measurement legs bypass `run` entirely and are unaffected — see that
-   script's own module doc). **Documented residual:** this gate covers only
-   a job launched through `run` — a caller who `ssh`es onto the pod directly
-   and invokes `cargo` by hand bypasses it entirely; it is not claimed
-   closed, only that the sanctioned path fails closed.
+   marker, and the refusal it gives depends on which of the three unmarked
+   states the dir is in:
+
+   | preflight state | what it means | remedy the refusal names |
+   |---|---|---|
+   | `MISSING` | no such directory | `target <session> <tree> --with-cutlass` |
+   | `UNMARKED_COLD` | exists, no workspace-member artifacts — a job would pay the full build | `target <session> <tree> --with-cutlass` |
+   | `UNMARKED_WARM` | carries this workspace's own member fingerprints, but no marker: built before the marker scheme, or outside the `target` verb. **Warm — a job would not rebuild the workspace; only its provenance is unverified.** | `target <session> <tree> --adopt` |
+
+   `--adopt` copies and deletes nothing: it re-runs the same content
+   validation a clone runs (`pod_seed_assert_member_free`, demanding the
+   opposite answer — member artifacts must be PRESENT, since they are the
+   warmth being claimed) and stamps the marker in place, recording
+   `adopted: true` and no seed provenance. A cold dir, a dir with neither
+   `debug/` nor `release/`, and a missing dir are all refused, so `--adopt`
+   can never launder a cold dir into a marked one. A plain clone cannot
+   serve a warm dir at all — it refuses to write over an existing
+   destination (`ci/scripts/pod_target_clone.sh:142`).
+
+   `RP_ALLOW_COLD_TARGET=1` is the sole override for proceeding without a
+   marker (`pod_build_timings.sh`'s own measurement legs bypass `run`
+   entirely and are unaffected — see that script's own module doc).
+   **Documented residual:** this gate covers only a job launched through
+   `run` — a caller who `ssh`es onto the pod directly and invokes `cargo`
+   by hand bypasses it entirely; it is not claimed closed, only that the
+   sanctioned path fails closed.
 
 **One-pod-per-wave, wave-scoped; sub-units share.** `gpu-dev.sh run` REFUSES
 when a LIVE job on the pod belongs to a DIFFERENT wave — `--wave W` /

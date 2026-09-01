@@ -690,23 +690,42 @@ EOF
 }
 
 # esc-077: the shell TEXT that classifies $1 (a CARGO_TARGET_DIR path, e.g.
-# TARGET_DIR from rp_target_dir) as MISSING, UNMARKED, or a genuine seed-clone
-# (OK) — `.jammi-clone-of-seed` is the marker `pod_target_clone.sh` stamps on
-# every successful clone. A plain function, not inlined by hand into
-# gpu-dev.sh's `run` heredoc, so it is directly testable: source this file,
-# call it with a real local directory, and run the printed text (`bash <
+# TARGET_DIR from rp_target_dir) — `.jammi-clone-of-seed` is the marker
+# `pod_target_clone.sh` stamps on every successful clone or adoption. A
+# plain function, not inlined by hand into gpu-dev.sh's `run` heredoc, so
+# it is directly testable: source this file, call it with a real local
+# directory, and run the printed text (`bash <
 # <(rp_target_preflight_lines "$dir")`) against real fixture directories —
 # no ssh, no pod, no mocking. Prints exactly one line,
-# `GPU_DEV_TARGET_STATE=<MISSING|UNMARKED|OK>`, so the caller's remote
-# execution of this same text (over `rp_run_remote`) is trivially parsed by
-# a `case` at the call site. $1=target_dir.
+# `GPU_DEV_TARGET_STATE=<MISSING|UNMARKED_COLD|UNMARKED_WARM|OK>`, so the
+# caller's remote execution of this same text (over `rp_run_remote`) is
+# trivially parsed by a `case` at the call site. $1=target_dir.
+#
+# The two UNMARKED states are DIFFERENT facts and get different diagnoses
+# and different remedies at the call site. "No marker" was reported as "it
+# was never provisioned via pod_target_clone.sh, so this job would pay a
+# COLD full workspace build" — false for a target dir that predates the
+# marker scheme (or was built by any path other than the `target` verb):
+# such a dir is genuinely WARM, the job would NOT rebuild the workspace,
+# and the offered remedy (`target ... --with-cutlass`) cannot even run,
+# since pod_target_clone.sh refuses to clone over an existing destination.
+# WARM is decided on the ONE piece of evidence that actually answers "would
+# this build be incremental": workspace-member fingerprints under a cargo
+# profile directory. It is a cheap, structural signal for the DIAGNOSIS
+# only — `target --adopt`, the executable remedy, re-checks the same
+# content with pod_seed_assert_member_free (the authoritative scan, off the
+# real workspace member list) before it stamps anything.
 rp_target_preflight_lines() {
   local target_dir="${1:?rp_target_preflight_lines needs a target dir}"
   cat <<EOF
 if [ ! -d '${target_dir}' ]; then
   echo GPU_DEV_TARGET_STATE=MISSING
 elif [ ! -f '${target_dir}/.jammi-clone-of-seed' ]; then
-  echo GPU_DEV_TARGET_STATE=UNMARKED
+  if ls '${target_dir}/debug/.fingerprint' '${target_dir}/release/.fingerprint' 2>/dev/null | grep -q '^jammi'; then # tripwire-ok: a missing debug//release/ .fingerprint dir is a real, checked state -- it IS the cold answer this if/else selects, never a silent pass
+    echo GPU_DEV_TARGET_STATE=UNMARKED_WARM
+  else
+    echo GPU_DEV_TARGET_STATE=UNMARKED_COLD
+  fi
 else
   echo GPU_DEV_TARGET_STATE=OK
 fi

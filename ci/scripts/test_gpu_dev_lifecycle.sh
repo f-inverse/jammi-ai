@@ -1603,12 +1603,52 @@ G9A_RESULTS="$SANDBOX/g9a-results.log"
     record FAIL "rp_target_preflight_lines: expected MISSING (got: $out_missing)"
   fi
 
+  # An existing dir with no marker is TWO different facts, and they earn
+  # different refusals: a genuinely cold dir (a job against it really would
+  # rebuild the workspace) versus a WARM dir that merely predates the
+  # marker scheme (a job against it would not rebuild anything, and the
+  # clone remedy cannot even run against it).
   mkdir -p "$G9A_SANDBOX/unmarked"
   out_unmarked="$(bash <(rp_target_preflight_lines "$G9A_SANDBOX/unmarked"))"
-  if [ "$out_unmarked" = "GPU_DEV_TARGET_STATE=UNMARKED" ]; then
-    record PASS "rp_target_preflight_lines: existing but unmarked target dir classified UNMARKED"
+  if [ "$out_unmarked" = "GPU_DEV_TARGET_STATE=UNMARKED_COLD" ]; then
+    record PASS "rp_target_preflight_lines: an existing, unmarked, artifact-free target dir classified UNMARKED_COLD"
   else
-    record FAIL "rp_target_preflight_lines: expected UNMARKED (got: $out_unmarked)"
+    record FAIL "rp_target_preflight_lines: expected UNMARKED_COLD (got: $out_unmarked)"
+  fi
+
+  # Warm: workspace-member fingerprints under a cargo profile dir, which is
+  # exactly what a pre-marker-scheme target dir carries.
+  mkdir -p "$G9A_SANDBOX/warm/debug/.fingerprint/jammi-kernels-9f8e7d6c"
+  : > "$G9A_SANDBOX/warm/debug/.fingerprint/jammi-kernels-9f8e7d6c/lib-jammi_kernels"
+  out_warm="$(bash <(rp_target_preflight_lines "$G9A_SANDBOX/warm"))"
+  if [ "$out_warm" = "GPU_DEV_TARGET_STATE=UNMARKED_WARM" ]; then
+    record PASS "rp_target_preflight_lines: an unmarked dir carrying workspace-member fingerprints classified UNMARKED_WARM, never lumped in with cold"
+  else
+    record FAIL "rp_target_preflight_lines: expected UNMARKED_WARM (got: $out_warm)"
+  fi
+
+  # A cargo profile dir whose fingerprints are all NON-member (a
+  # dependency-only tree — the shape the member-free seed itself has) is
+  # not this workspace's warmth and stays COLD.
+  mkdir -p "$G9A_SANDBOX/deps-only/release/.fingerprint/serde-1234abcd"
+  out_deps="$(bash <(rp_target_preflight_lines "$G9A_SANDBOX/deps-only"))"
+  if [ "$out_deps" = "GPU_DEV_TARGET_STATE=UNMARKED_COLD" ]; then
+    record PASS "rp_target_preflight_lines: a dependency-only fingerprint tree (no member artifacts) stays UNMARKED_COLD"
+  else
+    record FAIL "rp_target_preflight_lines: expected UNMARKED_COLD for a dependency-only fingerprint tree (got: $out_deps)"
+  fi
+
+  # The remedy's OUTCOME at this layer: `target --adopt` stamps
+  # .jammi-clone-of-seed on the warm dir (pod_target_clone.sh --adopt, run
+  # for real against real fixtures in test_pod_substrate.sh's (b/adopt)
+  # legs), and the SAME dir then classifies OK — the refusal is actually
+  # escapable, which is the whole point.
+  : > "$G9A_SANDBOX/warm/.jammi-clone-of-seed"
+  out_adopted="$(bash <(rp_target_preflight_lines "$G9A_SANDBOX/warm"))"
+  if [ "$out_adopted" = "GPU_DEV_TARGET_STATE=OK" ]; then
+    record PASS "rp_target_preflight_lines: the same warm dir classifies OK once the marker the adopt remedy stamps is present"
+  else
+    record FAIL "rp_target_preflight_lines: expected OK for an adopted warm dir (got: $out_adopted)"
   fi
 
   mkdir -p "$G9A_SANDBOX/marked"
@@ -1649,22 +1689,50 @@ else
   bad "run (esc-077): expected a named MISSING refusal + exactly 2 ssh calls (got rc=$g9b_rc, calls=$(cat "$SANDBOX/g9b-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9b.log")"
 fi
 
-# --- 9c: existing-but-UNMARKED target dir -> refuse (exit 1) --------------
+# --- 9c: existing-but-UNMARKED target dir -> refuse (exit 1), with the
+# diagnosis and the remedy that MATCH which unmarked state it is ----------
 G9C_DIR="$SANDBOX/g9c-ssh"; mkdir -p "$G9C_DIR"
 write_ssh_resp "$G9C_DIR" 1 0
-write_ssh_resp "$G9C_DIR" 2 0 "GPU_DEV_TARGET_STATE=UNMARKED"
+write_ssh_resp "$G9C_DIR" 2 0 "GPU_DEV_TARGET_STATE=UNMARKED_COLD"
 rm -f "$SANDBOX/g9c-counter"
 MOCK_SSH_CALL_COUNTER="$SANDBOX/g9c-counter" MOCK_SSH_RESPONSES_DIR="$G9C_DIR" \
   PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" run "$G9_SESSION" echo hi \
   >"$SANDBOX/out-g9c.log" 2>&1
 g9c_rc=$?
 if [ "$g9c_rc" -ne 0 ] && grep -q "no seed-clone marker" "$SANDBOX/out-g9c.log" \
+  && grep -q "target ${G9_SESSION} jammi-ai --with-cutlass" "$SANDBOX/out-g9c.log" \
   && grep -q "RP_ALLOW_COLD_TARGET=1" "$SANDBOX/out-g9c.log" \
   && [ "$(cat "$SANDBOX/g9c-counter")" = "2" ]; then
-  ok "run (esc-077): refuses an existing but UNMARKED target dir (exit $g9c_rc), never reaching the job-launch call"
+  ok "run (esc-077): refuses a COLD unmarked target dir (exit $g9c_rc), naming the clone remedy, never reaching the job-launch call"
 else
-  bad "run (esc-077): expected a named UNMARKED refusal + exactly 2 ssh calls (got rc=$g9c_rc, calls=$(cat "$SANDBOX/g9c-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9c.log")"
+  bad "run (esc-077): expected a named UNMARKED_COLD refusal + exactly 2 ssh calls (got rc=$g9c_rc, calls=$(cat "$SANDBOX/g9c-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9c.log")"
 fi
+
+# --- 9c-2: a WARM unmarked dir (one that predates the marker scheme) is
+# refused with the CORRECT diagnosis (not "you would pay a cold build") and
+# with a remedy that can actually execute. The clone remedy cannot: it
+# refuses to write over an existing destination, which left the operator
+# with no runnable move at all.
+G9C2_DIR="$SANDBOX/g9c2-ssh"; mkdir -p "$G9C2_DIR"
+write_ssh_resp "$G9C2_DIR" 1 0
+write_ssh_resp "$G9C2_DIR" 2 0 "GPU_DEV_TARGET_STATE=UNMARKED_WARM"
+rm -f "$SANDBOX/g9c2-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g9c2-counter" MOCK_SSH_RESPONSES_DIR="$G9C2_DIR" \
+  PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" run "$G9_SESSION" echo hi \
+  >"$SANDBOX/out-g9c2.log" 2>&1
+g9c2_rc=$?
+if [ "$g9c2_rc" -ne 0 ] \
+  && grep -q "it is WARM" "$SANDBOX/out-g9c2.log" \
+  && grep -q "NOT a cold-build refusal" "$SANDBOX/out-g9c2.log" \
+  && grep -q "target ${G9_SESSION} jammi-ai --adopt" "$SANDBOX/out-g9c2.log" \
+  && [ "$(cat "$SANDBOX/g9c2-counter")" = "2" ]; then
+  ok "run (esc-077): refuses a WARM unmarked target dir with the provenance diagnosis and the executable --adopt remedy, never claiming a cold build"
+else
+  bad "run (esc-077): expected a WARM-specific refusal naming --adopt (got rc=$g9c2_rc, calls=$(cat "$SANDBOX/g9c2-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9c2.log")"
+fi
+grep -q "COLD full workspace build" "$SANDBOX/out-g9c2.log" \
+  && bad "run (esc-077): the WARM refusal must NOT claim a cold full workspace build — that was the false diagnosis" \
+  || ok "run (esc-077): the WARM refusal makes no cold-build claim about a dir that is warm"
 
 # --- 9d: a marked clone (OK) -> proceeds past esc-077 into the NEW
 # concurrency preflight (call #3, CLEAR here) -> the real job-launch call
@@ -2070,6 +2138,49 @@ if [ "$g11b_rc" -eq 0 ] && [ "$(cat "$SANDBOX/g11b-counter" 2>/dev/null)" = "3" 
 else
   bad "target --with-cutlass (deployment-gap fix): expected rc=0, exactly 3 ssh calls, and a staged pod_provision_cutlass.sh (got rc=$g11b_rc, calls=$(cat "$SANDBOX/g11b-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g11b.log")"
 fi
+
+# --- 11c: `target --adopt` — the executable remedy `run`'s UNMARKED_WARM
+# refusal names — stages the same scripts and then invokes pod_target_clone.sh
+# with --adopt against THIS tree's own target dir. It must never attempt a
+# clone: the dir it is being pointed at already exists, which a clone
+# refuses outright (that refusal is what left the operator stuck).
+G11C_CAPTUREBIN="$SANDBOX/g11c-capturebin"; mkdir -p "$G11C_CAPTUREBIN"
+G11C_CAPTURE_DIR="$SANDBOX/g11c-capture"; mkdir -p "$G11C_CAPTURE_DIR"
+cat > "$G11C_CAPTUREBIN/ssh" <<STUB
+#!/usr/bin/env bash
+counter="\${MOCK_SSH_CALL_COUNTER:?MOCK_SSH_CALL_COUNTER unset}"
+n=\$(( \$( [ -f "\$counter" ] && cat "\$counter" || echo 0 ) + 1 ))
+echo "\$n" > "\$counter"
+capdir="\${MOCK_SSH_CAPTURE_DIR:?MOCK_SSH_CAPTURE_DIR unset}"
+cat > "\$capdir/\$n"
+dir="\${MOCK_SSH_RESPONSES_DIR:?MOCK_SSH_RESPONSES_DIR unset}"
+resp="\$dir/\$n"
+[ -f "\$resp" ] || resp="\$dir/\$(ls "\$dir" | sort -n | tail -1)"
+rc="\$(head -n1 "\$resp")"
+tail -n +2 "\$resp"
+exit "\$rc"
+STUB
+chmod +x "$G11C_CAPTUREBIN/ssh"
+G11C_DIR="$SANDBOX/g11c-ssh"; mkdir -p "$G11C_DIR"
+write_ssh_resp "$G11C_DIR" 1 0
+write_ssh_resp "$G11C_DIR" 2 0 "adopt marker stamped: /root/target-mytree/.jammi-clone-of-seed"
+rm -f "$SANDBOX/g11c-counter"
+: > "$G11_RSYNC_CALLS"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g11c-counter" MOCK_SSH_RESPONSES_DIR="$G11C_DIR" \
+  MOCK_SSH_CAPTURE_DIR="$G11C_CAPTURE_DIR" \
+  PATH="$G11_RSYNCBIN:$G11C_CAPTUREBIN:$PATH" bash "$DIR/gpu-dev.sh" target "$G11_SESSION" mytree --adopt \
+  >"$SANDBOX/out-g11c.log" 2>&1
+g11c_rc=$?
+if [ "$g11c_rc" -eq 0 ] \
+  && grep -qF "pod_target_clone.sh /root/.jammi-seed '/root/target-mytree' --adopt" "$G11C_CAPTURE_DIR/2" \
+  && grep -q "ADOPTED existing dir /root/target-mytree" "$SANDBOX/out-g11c.log"; then
+  ok "target --adopt: invokes pod_target_clone.sh --adopt against the tree's own target dir and reports the adoption (never a clone over an existing dir)"
+else
+  bad "target --adopt: expected an --adopt invocation against /root/target-mytree (rc=$g11c_rc): sent=$(cat "$G11C_CAPTURE_DIR/2" 2>/dev/null) out=$(cat "$SANDBOX/out-g11c.log")"
+fi
+grep -qF "$DIR/pod_target_clone.sh" "$G11_RSYNC_CALLS" \
+  && ok "target --adopt: stages THIS checkout's own pod-side scripts first, exactly as the clone path does" \
+  || bad "target --adopt: expected the same staging rsync as the clone path; rsync calls: $(cat "$G11_RSYNC_CALLS" 2>/dev/null)"
 
 echo
 echo "gpu-dev-lifecycle: ${PASS} passed, ${FAIL} failed, ${SKIP} skipped"

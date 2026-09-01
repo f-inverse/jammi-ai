@@ -1242,9 +1242,11 @@ async fn reclaim_leaves_live_leases_untouched(backend: BackendKind) {
 }
 
 /// [`Catalog::create_training_job`] writes the explicit `{"state":"pending"}`
-/// tri-state marker (never SQL NULL) at submission; the claiming worker's
-/// [`Catalog::record_acceleration_report`] overwrites it under a valid lease,
-/// pinning `attempts` to the exact attempt the claim returned.
+/// marker (never SQL NULL) at submission — the one payload shape the catalog
+/// itself writes; the claiming worker's
+/// [`Catalog::record_acceleration_report`] overwrites it under a valid lease
+/// with its own producer-owned payload, pinning `attempts` to the exact
+/// attempt the claim returned.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",

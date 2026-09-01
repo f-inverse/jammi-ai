@@ -791,24 +791,29 @@ ALTER TABLE result_tables DROP COLUMN index_path;
 /// Migration 026 — the per-job acceleration-report column on `training_jobs`
 /// (esc-075: a compute precision that silently runs the unaccelerated eager
 /// composition has no caller-visible, per-job signal). `acceleration_report`
-/// is a **tri-state** field, and all three states ride *in* the column's
-/// payload rather than in presence/absence of the column value alone — a
-/// bare nullable column can express only two states (`NULL` / non-`NULL`),
-/// one short of the three this field must carry:
+/// carries an **opaque, self-describing JSON payload whose vocabulary the
+/// payload's producer owns** — mirroring this table's own `training_spec`
+/// and `metrics` columns' schema-at-the-producer deferral — not a closed
+/// enum enumerated here. The catalog itself guarantees only two things about
+/// this column, both mechanical rather than semantic:
 ///
 ///   - **absent / SQL `NULL`** — a legacy row written before this migration,
 ///     or (should it ever occur) a row this code never touched. Read back as
-///     "unknown", never fabricated as either of the other two states.
-///   - **`{"state":"pending"}`** — written by [`Catalog::create_training_job`]
-///     at submission time: the job exists and is queued/running, but no
-///     claimant has yet computed and recorded its acceleration determination.
-///   - **`{"state":"determined", ...}`** — written by
-///     [`Catalog::record_acceleration_report`] once the claiming worker has
-///     resolved `(device, compiled capabilities, admission predicates)` for
-///     this attempt. The catalog stores the payload opaquely; the typed shape
-///     (per-op Hit/Miss, reasons, flash-dtype outcome) lives in the engine
-///     crate that produces and consumes it, matching the `training_spec`
-///     column's existing opacity convention.
+///     "unknown", never fabricated as any producer state.
+///   - **`{"state":"pending"}`** — the ONE payload the catalog itself writes,
+///     stamped by [`Catalog::create_training_job`] at submission time: the
+///     job exists and is queued/running, but no claimant has yet recorded a
+///     determination.
+///
+/// Every other payload — most commonly `{"state":"determined", ...}`,
+/// written by [`Catalog::record_acceleration_report`] once the claiming
+/// worker resolves `(device, compiled capabilities, admission predicates)`
+/// for this attempt, but not limited to it (a non-fine-tune job kind or a
+/// pre-device-resolution failure path may record a different `"state"`) — is
+/// the producer's to define and evolve; the catalog stores it byte-for-byte
+/// and never inspects, validates, or enumerates its shape. A `"state"` key is
+/// the convention every producer uses as its discriminant, not a contract
+/// this migration or column enforces.
 ///
 /// The column is nullable so a pre-migration row backfills to the honest
 /// "unknown" state rather than a fabricated `pending`; every row created

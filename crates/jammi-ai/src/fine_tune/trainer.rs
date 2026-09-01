@@ -1528,10 +1528,32 @@ impl TrainingLoop {
 
                 let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
                 let effective_max = self.config.max_seq_length.min(encoder.max_seq_length());
-                let encoding = tokenizer.encode_batch(&text_refs, Some(effective_max))?;
+                let mut encoding = tokenizer.encode_batch(&text_refs, Some(effective_max))?;
 
                 let rows = encoding.input_ids.len();
-                let cols = encoding.input_ids.first().map_or(0, |v| v.len());
+                let natural_cols = encoding.input_ids.first().map_or(0, |v| v.len());
+                // esc-076: round this batch's own (tokenizer `BatchLongest`)
+                // natural width UP to a small, fixed bucket ladder — see
+                // `crate::fine_tune::batch_bucket`'s module doc for why an
+                // UNBOUNDED count of distinct per-step tensor shapes
+                // fragments/grows cudarc's non-caching CUDA allocator, and
+                // why extending the SAME trailing-zero padding contract
+                // `BatchLongest` already relies on (pad id `0`, mask `0`) is
+                // output-invariant. Every dtype/objective through this ONE
+                // `EncoderAdapters` call site is bucketed uniformly — never
+                // an f16-specific knob.
+                let cols =
+                    crate::fine_tune::batch_bucket::bucket_seq_len(natural_cols, effective_max);
+                crate::fine_tune::batch_bucket::pad_rows_to_bucket(
+                    &mut encoding.input_ids,
+                    cols,
+                    0,
+                );
+                crate::fine_tune::batch_bucket::pad_rows_to_bucket(
+                    &mut encoding.attention_masks,
+                    cols,
+                    0,
+                );
 
                 let input_ids = Tensor::from_vec(
                     encoding

@@ -2073,6 +2073,29 @@ else
   bad "run (one-pod-per-wave): expected the concurrency preflight's generated text to compare against wave 'jammi-ai' by default: $(cat "$G10E_CAPTURE_DIR/3" 2>/dev/null || echo '<no call #3 captured>')"
 fi
 
+# (g10f) `run`'s job-launch heredoc has an UNQUOTED delimiter — it must
+# expand ${TREE_DIR}/${TMUX_SESSION}/${LAUNCH} and the
+# rp_job_wrapper_with_marker_lines substitution. An unquoted heredoc body
+# also performs COMMAND SUBSTITUTION on backticks, so a backticked word in
+# the body's own PROSE (a comment reading "first `run` for this
+# tree/session") was executed ON THE LAPTOP on every single `run`: bash
+# printed "gpu-dev.sh: line <n>: run: command not found" to stderr and
+# spliced the word out of the text that actually reached the pod. Observed
+# live during the sm_86/89/90 proof run. Harmless in that one instance only
+# because the substituted word happened to name no real command — the
+# defect is live command substitution over arbitrary prose, which is a
+# property of the heredoc, not of which word sat inside the backticks.
+# Asserted on the EMITTED text (capture #4, the job-launch call), not on
+# the source file: escaping in the source is the fix, but "the backtick
+# survives to the pod" is the invariant.
+if [ -f "$G10E_CAPTURE_DIR/4" ] \
+  && grep -qF 'first `run` for this tree/session' "$G10E_CAPTURE_DIR/4" \
+  && ! grep -q 'command not found' "$SANDBOX/out-g10e.log"; then
+  ok "run (heredoc quoting): a backticked word in the job-launch heredoc's own prose is emitted LITERALLY to the pod, never command-substituted on the laptop"
+else
+  bad "run (heredoc quoting): expected the emitted job-launch text to carry the literal backticked prose and the run to print no 'command not found': sent=$(cat "$G10E_CAPTURE_DIR/4" 2>/dev/null || echo '<no call #4 captured>') out=$(cat "$SANDBOX/out-g10e.log" 2>/dev/null)"
+fi
+
 # ═════════════════════════════════════════════════════════════════════════
 # Group 11 (deployment-gap fix, folded into esc-077) — `target` must ship
 # THIS checkout's OWN pod-side scripts before executing them, never rely on

@@ -1029,7 +1029,7 @@ set -uo pipefail
 cat > '${TREE_DIR}'/.jammi-job.sh <<'JOBEOF'
 $(rp_job_wrapper_with_marker_lines "$TREE_DIR" "$TARGET_DIR" "$JOB" "$RUN_TOKEN" "$TIMING" "$WAVE" "$TREE")
 JOBEOF
-tmux kill-session -t "=${TMUX_SESSION}" 2>/dev/null # tripwire-ok: idempotent best-effort cleanup of a session that may legitimately not exist yet (first `run` for this tree/session) — the new-session command right below is unconditional
+tmux kill-session -t "=${TMUX_SESSION}" 2>/dev/null # tripwire-ok: idempotent best-effort cleanup of a session that may legitimately not exist yet (first \`run\` for this tree/session) — the new-session command right below is unconditional; the backticks around \`run\` are ESCAPED because this heredoc's delimiter is UNQUOTED (it must expand \${TMUX_SESSION}/\${LAUNCH}) — an unescaped backtick pair in an unquoted heredoc body is LIVE command substitution, run on the LAPTOP, which printed 'run: command not found' and spliced the word away before the text ever reached the pod
 tmux new-session -d -s "${TMUX_SESSION}" "${LAUNCH}"
 tmux set-option -w -t "=${TMUX_SESSION}:" remain-on-exit off
 echo "started (tree=${TREE}, timing-locked=${TIMING}, token=${RUN_TOKEN}): ${JOB}"

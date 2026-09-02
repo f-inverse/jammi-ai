@@ -315,6 +315,48 @@ impl PyDatabase {
         )
     }
 
+    /// List every training job visible to the current tenant, most recent
+    /// first. Each entry is a dict carrying the SAME field set the wire's
+    /// `TrainingJobSummary` carries — `job_id`, `kind`, `status`,
+    /// `base_model_id`, `output_model_id`, `created_at`, `error` — so a caller
+    /// reads one vocabulary regardless of transport. A listing of
+    /// `TrainingJob.status()` answers plus the submit-time identity, not a
+    /// progress surface: the engine persists run metrics only at finalization,
+    /// so there is no mid-run metric here to expose.
+    ///
+    /// `output_model_id` is the empty string until the job completes and
+    /// `error` is empty unless it failed — the same two conventions
+    /// `TrainingService.ListTrainingJobs` relays, reproduced here rather than
+    /// mapping absence onto `None` on one transport only.
+    ///
+    /// Tenant-scoped by the catalog read itself
+    /// (`WHERE tenant_id = $1 OR tenant_id IS NULL`), which is the same call —
+    /// `Catalog::list_training_jobs` — the server's own handler makes, so the
+    /// two arms cannot drift on which rows are visible.
+    fn list_training_jobs(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
+        let records = self
+            .runtime
+            .block_on(self.session.catalog().list_training_jobs())
+            .map_err(to_pyerr)?;
+        let list = PyList::empty(py);
+        for record in &records {
+            let entry = PyDict::new(py);
+            entry.set_item("job_id", &record.job_id)?;
+            entry.set_item("kind", &record.kind)?;
+            entry.set_item("status", &record.status)?;
+            entry.set_item("base_model_id", &record.base_model_id)?;
+            entry.set_item(
+                "output_model_id",
+                record.output_model_id.as_deref().unwrap_or(""),
+            )?;
+            entry.set_item("created_at", &record.created_at)?;
+            entry.set_item("error", record.error_message.as_deref().unwrap_or(""))?;
+            list.append(entry)?;
+        }
+        Ok(list.into_any().unbind())
+    }
+
     /// Set the sticky tenant scope on this connection.
     ///
     /// Subsequent reads return rows whose `tenant_id` matches `tenant_id`

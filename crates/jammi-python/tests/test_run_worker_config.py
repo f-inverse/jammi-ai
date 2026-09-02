@@ -257,14 +257,16 @@ def test_queued_job_reads_identically_on_the_remote_arm(
     column values against the embedded arm's live read is the parity claim
     minus one hop.
 
-    **The gap, stated.** The hop not covered here is a live `jammi-server`
-    started with `JAMMI_TRAINING__RUN_WORKER=false`: the server arm's own
-    honouring of the key is a separate unit of this campaign
-    (`crates/jammi-server`'s worker spawn is still unconditional at the time of
-    writing), so a live-server assertion here would be red on another leg's
-    absence rather than on this one's behaviour. This test covers what the
-    Python surface owns — that both clients turn the same two column values
-    into the same two Python values.
+    **Where the remaining hop is covered.** The one thing this hermetic test
+    cannot show is a live `jammi-server` started with
+    `JAMMI_TRAINING__RUN_WORKER=false` actually holding a job `queued`. That is
+    the server leg of this campaign, and it is proven where a server can be
+    run: `clients/python/tests/test_remote_training_job_live.py` starts one with
+    exactly that environment and compares its reads of the seeded row against
+    the embedded arm's, and the engine's own `grpc_training` it-suite polls the
+    `queued` / `{"state":"pending"}` pair across the idle window. This test
+    covers what the Python surface owns without a server — that both clients
+    turn the same two column values into the same two Python values.
     """
     from jammi._database import RemoteTrainingJob
     from jammi._generated.jammi.v1 import training_pb2

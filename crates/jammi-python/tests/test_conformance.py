@@ -121,6 +121,12 @@ _TRAINING_VERBS = {
     "fine_tune_graph",
     "train_context_predictor",
     "predict_with_context_predictor",
+    # The two attach/listing verbs: a submitted job is reachable by id from a
+    # session that never submitted it, and the tenant's jobs are listable. Both
+    # arms carry both — neither is a `Capability`, because nothing about a
+    # transport makes "look up a job I already have the id of" unavailable.
+    "training_job",
+    "list_training_jobs",
 }
 
 

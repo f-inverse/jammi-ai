@@ -430,6 +430,36 @@ class EmbeddedBackend:
         """Fuse several ranked retrieval lists by reciprocal-rank fusion."""
         return self._native.rrf_fuse(ranked_lists, k_rrf=k_rrf)
 
+    def training_job(self, job_id: str) -> Any:
+        """Attach to an existing training job by id.
+
+        The handle a `fine_tune` call returns is bound to the session that made
+        it; this is how a session that never submitted the job reaches it — the
+        peer of :meth:`jammi.RemoteDatabase.training_job`, and the reason a job
+        outlives its submitting connection. Every read verb works on the
+        result: `status()`, `metrics()`, `acceleration_report()`, `wait()`.
+
+        A `job_id` with no row VISIBLE TO THIS TENANT raises the typed
+        :class:`~jammi.errors.BackendError` — the same class the remote arm
+        raises for the same miss, and the same class every other catalog miss
+        raises here. There is no separate existence check to drift from the
+        catalog read itself.
+        """
+        return self._native.training_job(job_id)
+
+    def list_training_jobs(self) -> List[Dict[str, Any]]:
+        """Training jobs visible to the current tenant, most recent first.
+
+        Each entry carries the wire's `TrainingJobSummary` field set —
+        ``job_id``, ``kind``, ``status``, ``base_model_id``,
+        ``output_model_id``, ``created_at``, ``error`` — with
+        ``output_model_id`` empty until the job completes and ``error`` empty
+        unless it failed. A listing of :meth:`training_job` answers plus the
+        submit-time identity; there is no progress surface here, because the
+        engine records run metrics only at finalization.
+        """
+        return self._native.list_training_jobs()
+
     def fine_tune(
         self,
         *,

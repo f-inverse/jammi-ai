@@ -169,6 +169,27 @@ def _source_descriptor_to_dict(d: catalog_pb2.SourceDescriptor) -> Dict[str, Any
     }
 
 
+def _training_job_summary_to_dict(j: training_pb2.TrainingJobSummary) -> Dict[str, Any]:
+    """Project a wire `TrainingJobSummary` into the job dict a caller reads.
+
+    Every field the message carries and nothing else — the embedded
+    `list_training_jobs` builds the same seven keys at its FFI boundary from the
+    catalog record, applying the same two conventions this message documents:
+    `output_model_id` is the empty string until the job completes, `error` is
+    empty unless it failed. Neither arm maps either onto `None`, so a caller
+    branches on one thing on both transports.
+    """
+    return {
+        "job_id": j.job_id,
+        "kind": j.kind,
+        "status": j.status,
+        "base_model_id": j.base_model_id,
+        "output_model_id": j.output_model_id,
+        "created_at": j.created_at,
+        "error": j.error,
+    }
+
+
 def _index_segment_to_dict(s: catalog_pb2.IndexSegment) -> Dict[str, Any]:
     """Project a wire `IndexSegment` into the segment dict a caller reads.
 
@@ -2323,6 +2344,59 @@ class RemoteDatabase:
         request = catalog_pb2.DerivesFromRequest(table=table)
         resp = self._call(self._catalog.DerivesFrom, request)
         return _derives_from_edges_to_list(resp)
+
+    def training_job(self, job_id: str) -> RemoteTrainingJob:
+        """Attach to an existing training job by id.
+
+        The handle a `fine_tune` call returns is bound to the channel that made
+        it and dies with it; this is how a session that never submitted the job
+        — a later process, a different client — reaches it. The peer of
+        :meth:`jammi.EmbeddedBackend.training_job`; every read verb works on the
+        result (`status()`, `metrics()`, `acceleration_report()`, `wait()`),
+        each of which re-fetches over the wire per call, so the handle carries
+        no snapshot to go stale.
+
+        Existence is resolved HERE, with one `TrainingStatus` call, rather than
+        handing back a handle that fails on its first read: a `job_id` with no
+        row visible to this session's tenant raises the typed
+        :class:`~jammi.errors.BackendError`, the same class the embedded arm
+        raises for the same miss.
+
+        `model_id` is the one value that differs from the embedded attach, and
+        it differs because the wire says so: `TrainingStatusResponse.model_id`
+        is empty until the job completes (its own documented contract), whereas
+        the embedded attach re-derives the deterministic id from the persisted
+        spec. This client does NOT re-derive it — that rule belongs to the
+        engine, and duplicating it here would be a second implementation of a
+        naming scheme the server owns. Read `model_id` on a completed job, or
+        keep the id the submit call returned.
+        """
+        resp = self._call(
+            self._training.TrainingStatus,
+            training_pb2.TrainingStatusRequest(job_id=job_id),
+        )
+        return RemoteTrainingJob(
+            self._training,
+            self._metadata,
+            job_id=job_id,
+            model_id=resp.model_id,
+        )
+
+    def list_training_jobs(self) -> List[Dict[str, Any]]:
+        """Training jobs visible to the current tenant, most recent first.
+
+        Maps to `TrainingService.ListTrainingJobs`; same dict shape per entry as
+        the embedded :meth:`jammi.EmbeddedBackend.list_training_jobs` — the
+        wire's `TrainingJobSummary` field set, with ``output_model_id`` empty
+        until the job completes and ``error`` empty unless it failed. A listing
+        of :meth:`training_job` answers plus the submit-time identity; there is
+        no progress surface, because the engine records run metrics only at
+        finalization.
+        """
+        resp = self._call(
+            self._training.ListTrainingJobs, training_pb2.ListTrainingJobsRequest()
+        )
+        return [_training_job_summary_to_dict(j) for j in resp.jobs]
 
     def _start_training(
         self, request: training_pb2.StartTrainingRequest

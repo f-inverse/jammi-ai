@@ -29,7 +29,7 @@ def _free_port() -> int:
 
 
 @contextlib.contextmanager
-def _server_on(artifact_dir):
+def _server_on(artifact_dir, *, env_overrides=None):
     """A real `jammi-server` (CPU, all tiers) on a free port over
     `artifact_dir`, torn down on exit. The one implementation both the
     module-scoped :func:`live_server` and the :func:`live_server_on` factory
@@ -39,6 +39,12 @@ def _server_on(artifact_dir):
     seeded and released; the server opens it like any other. That is what lets a
     parity test compare a remote read against an embedded read of the very same
     rows, rather than of two separately-built approximations of them.
+
+    `env_overrides` are applied last, over this fixture's own `JAMMI_*` keys —
+    the deployment knobs a test needs the server to answer differently, read by
+    the server's `JammiConfig::load` exactly as an operator's would be (e.g.
+    `JAMMI_TRAINING__RUN_WORKER=false`, to hold a seeded job `queued` so a read
+    is compared against a stable row rather than a moving one).
     """
     flight_port = _free_port()
     health_port = _free_port()
@@ -47,6 +53,7 @@ def _server_on(artifact_dir):
     env["JAMMI_SERVER__FLIGHT_LISTEN"] = f"127.0.0.1:{flight_port}"
     env["JAMMI_SERVER__HEALTH_LISTEN"] = f"127.0.0.1:{health_port}"
     env["JAMMI_SERVER__SERVICES"] = "all"
+    env.update(env_overrides or {})
 
     proc = subprocess.Popen(
         [SERVER_BIN],

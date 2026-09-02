@@ -42,25 +42,44 @@
 //! Comparators and byte-count assertions must run on the raw fields, never on
 //! the rendered output.
 //!
-//! # `hung` vs `killed` vs `complete`
+//! **The cap is a second, independent incompleteness source from the reader
+//! threads themselves**: a capture whose reader threads both reached a clean
+//! EOF (`Completeness::Complete`) can still be silently missing bytes the cap
+//! dropped from the middle of a long-running child's output.
+//! `Capture::complete` alone does NOT mean "trust this evidence as whole" —
+//! see `Capture::is_trustworthy`, below, for the single predicate that does.
 //!
-//! These are three separate axes, not one:
+//! # `hung` vs `killed` vs `complete` vs trustworthy
+//!
+//! Four separate axes, not one:
 //!
 //! - `Capture::killed` — did `wait_bounded` ever call `kill()`? True whenever
 //!   the ceiling was reached (or an OS error forced a defensive kill),
 //!   independent of whether the child turns out to have needed it.
-//! - `Capture::hung` — computed from the reaped status by the pure
-//!   `disposition` function: a signal death, or a reap give-up (`status:
-//!   None` after a kill), is `true`; a normal exit code is `false` **even
-//!   when `killed` is also `true`** — the ceiling and a fast, self-
-//!   terminating exit can race, and a child that finishes on its own in that
-//!   window is not a hang just because the kill was already in flight.
-//! - `Capture::complete` ([`Completeness`]) — did the drained reader threads
-//!   actually reach EOF before the ~1 s settle bound expired? A `Capture` can
-//!   be `hung: false` and still `SettleExpired` (an fd-inheriting grandchild
-//!   holding the pipe past the settle bound; see "Precondition for a
-//!   complete log"), or `hung: true` and still `Completeness::Complete` (a
-//!   killed child whose own readers finish the instant its pipe closes).
+//! - `Capture::hung` — computed from `killed` and the reaped status by the
+//!   pure `disposition` function: `true` **iff a kill was issued** and the
+//!   reaped status is a signal death or a reap give-up (`status: None`
+//!   after that kill). A normal exit code is `false` even when `killed` is
+//!   also `true` — the ceiling and a fast, self-terminating exit can race,
+//!   and a child that finishes on its own in that window is not a hang just
+//!   because the kill was already in flight. A signal death `wait_bounded`
+//!   never issued a kill for (a genuine self-inflicted crash, e.g. a
+//!   `SIGSEGV`) is also `false` — that is a live signal exit for the caller
+//!   to inspect via `Capture::status` directly, not a hang this driver
+//!   detected and terminated.
+//! - `Capture::complete` ([`Completeness`]) — the READER-THREAD axis only:
+//!   did both drained reader threads actually reach EOF before the ~1 s
+//!   settle bound expired? A `Capture` can be `hung: false` and still
+//!   `SettleExpired` (an fd-inheriting grandchild holding the pipe past the
+//!   settle bound; see "Precondition for a complete log"), or `hung: true`
+//!   and still `Completeness::Complete` (a killed child whose own readers
+//!   finish the instant its pipe closes). It says nothing about the
+//!   retention cap — see the previous section.
+//! - `Capture::is_trustworthy()` — the single predicate a consumer should
+//!   gate a "this evidence is whole" decision on: `complete ==
+//!   Completeness::Complete` AND no `wait_error` AND neither stream was
+//!   truncated by the cap. This is the AND of the reader axis and the cap
+//!   axis; `complete` by itself is not sufficient.
 //!
 //! Any OS-level error encountered while producing a `Capture` (`try_wait`,
 //! `kill`, the reap poll, or the undrained driver's `wait_with_output`) is
@@ -493,8 +512,8 @@ impl DrainedChild {
         // above (the fd-inheriting-grandchild case). They keep running
         // against their shared Arc<Mutex<..>> buffers, harmlessly, until the
         // pipe's last writer eventually closes it.
-        let stdout_panicked = join_if_finished(stdout_done, stdout_handle);
-        let stderr_panicked = join_if_finished(stderr_done, stderr_handle);
+        let stdout_panic = join_if_finished(stdout_done, stdout_handle);
+        let stderr_panic = join_if_finished(stderr_done, stderr_handle);
 
         let stdout_outcome_val = lock_or_recover(&stdout_outcome).clone();
         let stderr_outcome_val = lock_or_recover(&stderr_outcome).clone();
@@ -506,22 +525,25 @@ impl DrainedChild {
             Some(ReaderOutcome::Error(e)) => Some(format!("stderr reader: {e}")),
             _ => None,
         };
-        let complete = if !(stdout_done && stderr_done) {
-            Completeness::SettleExpired
-        } else if stdout_panicked
-            || stderr_panicked
-            || stdout_reader_error.is_some()
-            || stderr_reader_error.is_some()
-        {
-            Completeness::ReaderFailed
-        } else {
-            Completeness::Complete
-        };
-        // Reader read-errors are folded into `wait_error` too (rather than
-        // only driving `complete`), so a panic message that only prints
-        // `wait_error` still names what went wrong.
+        let complete = completeness(
+            stdout_done,
+            stderr_done,
+            &stdout_panic,
+            &stderr_panic,
+            &stdout_reader_error,
+            &stderr_reader_error,
+        );
+        // Reader panics/read-errors are folded into `wait_error` too (rather
+        // than only driving `complete`), so a panic message that only
+        // prints `wait_error` still names what went wrong.
         let wait_error = {
             let mut parts: Vec<String> = wait_error.into_iter().collect();
+            if let Some(p) = stdout_panic {
+                parts.push(format!("stdout reader panicked: {p}"));
+            }
+            if let Some(p) = stderr_panic {
+                parts.push(format!("stderr reader panicked: {p}"));
+            }
             parts.extend(stdout_reader_error);
             parts.extend(stderr_reader_error);
             joined_or_none(parts)
@@ -620,16 +642,22 @@ impl DrainedChild {
     }
 }
 
-/// `epoch_base + ceiling`, saturating instead of panicking if the addition
+/// `epoch_base + ceiling`, clamped instead of panicking if the addition
 /// would overflow `Instant`'s internal representation — a `ceiling` extreme
 /// enough to trigger this is unreachable in practice (nobody passes a
-/// multi-decade ceiling), but the fallback keeps the contract total: a
-/// deadline far enough out that it never fires spuriously, rather than
-/// panicking or silently treating the ceiling as already expired.
+/// multi-decade ceiling), but the fallback keeps the contract total. Every
+/// step uses `checked_add`, never the panicking `+`, including the fallback
+/// itself: clamp to `now() + 1 year` (via `checked_add`, not `+`); if even
+/// that overflows (only possible if `now()` is itself already absurdly
+/// close to `Instant`'s maximum representable value), clamp to `now()`
+/// directly. Either fallback yields a deadline that never fires
+/// spuriously in any realistic run, without ever risking a panic.
 fn saturating_deadline(epoch_base: Instant, ceiling: Duration) -> Instant {
-    epoch_base
-        .checked_add(ceiling)
-        .unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 24 * 3600))
+    epoch_base.checked_add(ceiling).unwrap_or_else(|| {
+        let now = Instant::now();
+        now.checked_add(Duration::from_secs(365 * 24 * 3600))
+            .unwrap_or(now)
+    })
 }
 
 /// Pure function turning a reaped status plus whether a kill was issued into
@@ -658,11 +686,57 @@ fn is_signal_death(_status: ExitStatus) -> bool {
 }
 
 /// If `done`, joins `handle` (cheap and non-blocking, since it has already
-/// finished) and reports whether it panicked; otherwise drops `handle`
-/// without joining, leaving the thread detached rather than blocking on a
-/// reader that has not observed EOF.
-fn join_if_finished(done: bool, handle: JoinHandle<()>) -> bool {
-    done && handle.join().is_err()
+/// finished) and, if it panicked, returns the panic payload rendered as a
+/// human-readable string (never discarded — it is what tells a caller
+/// *why* `Completeness::ReaderFailed`); otherwise (not done, or finished
+/// cleanly) returns `None`. A reader that has not observed EOF is left
+/// running rather than joined (joining it would block past the settle bound
+/// already enforced by the caller).
+fn join_if_finished(done: bool, handle: JoinHandle<()>) -> Option<String> {
+    if !done {
+        return None;
+    }
+    handle.join().err().map(|payload| panic_message(&*payload))
+}
+
+/// Render a `std::thread` panic payload as a human-readable string. Panics
+/// raised via `panic!("...")`/`assert!`/`unwrap` carry a `&str` or `String`
+/// payload; anything else (a custom `panic_any` payload) falls back to a
+/// fixed message rather than failing to report at all.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "reader thread panicked with a non-string payload".to_string()
+    }
+}
+
+/// Pure classification of the drained reader threads' terminal state into
+/// [`Completeness`], factored out of `finish_drained` so it can be
+/// unit-tested directly (a cheap, deterministic `Completeness::ReaderFailed`
+/// oracle, without needing to actually inject a panic into a live reader
+/// thread — see the `completeness_*` tests below).
+fn completeness(
+    stdout_done: bool,
+    stderr_done: bool,
+    stdout_panic: &Option<String>,
+    stderr_panic: &Option<String>,
+    stdout_reader_error: &Option<String>,
+    stderr_reader_error: &Option<String>,
+) -> Completeness {
+    if !(stdout_done && stderr_done) {
+        Completeness::SettleExpired
+    } else if stdout_panic.is_some()
+        || stderr_panic.is_some()
+        || stdout_reader_error.is_some()
+        || stderr_reader_error.is_some()
+    {
+        Completeness::ReaderFailed
+    } else {
+        Completeness::Complete
+    }
 }
 
 /// Kill `child` and reap it by polling `try_wait` for up to `ceiling`.
@@ -734,9 +808,11 @@ pub struct Capture {
     /// The child's exit status, or `None` if it was killed and never reaped
     /// within the reap bound (see [`DrainedChild::wait_bounded`]).
     pub status: Option<ExitStatus>,
-    /// `true` iff the reaped status represents a genuine hang (a signal
-    /// death or a reap give-up) — see the module doc's "hung vs killed vs
-    /// complete" section and `disposition`.
+    /// `true` iff a kill was issued (`killed == true`) *and* the reaped
+    /// status is a signal death or a reap give-up — see the module doc's
+    /// "hung vs killed vs complete" section and `disposition`. A signal
+    /// death `wait_bounded` never killed for (a self-inflicted crash) is
+    /// `false`: it is a live signal exit visible via `status`, not a hang.
     pub hung: bool,
     /// `true` iff `wait_bounded` issued a `kill()` for this call, regardless
     /// of whether the reaped status turned out to be a hang or a raced
@@ -761,9 +837,12 @@ pub struct Capture {
     pub last_byte_instant: Option<Instant>,
     /// Absolute stamp of when this `Capture` was constructed (post-settle).
     pub returned_at: Instant,
-    /// Whether the drained reader threads actually reached EOF before the
-    /// settle bound expired. `Completeness::Undrained` for a `Capture` from
-    /// the `cfg(test)` undrained driver.
+    /// The READER-THREAD completeness axis only: whether the drained reader
+    /// threads actually reached EOF before the settle bound expired.
+    /// `Completeness::Undrained` for a `Capture` from the `cfg(test)`
+    /// undrained driver. This does NOT account for the retention cap — a
+    /// `Complete` capture can still be missing bytes the cap dropped; use
+    /// [`Capture::is_trustworthy`] to gate on both axes at once.
     pub complete: Completeness,
     /// Text of any `try_wait`/`kill`/reap/`wait_with_output` error
     /// encountered while producing this `Capture`; `None` if none occurred.
@@ -782,6 +861,25 @@ impl Capture {
     pub fn silence(&self) -> Option<Duration> {
         self.last_byte_instant
             .map(|t| self.returned_at.saturating_duration_since(t))
+    }
+
+    /// The single predicate a consumer should gate a "this evidence is
+    /// whole" decision on: the drained reader threads reached a clean EOF
+    /// (`complete == Completeness::Complete`), no OS-level error occurred
+    /// while producing this `Capture` (`wait_error.is_none()`), and the
+    /// retention cap did not drop any bytes from either stream
+    /// (`stdout_truncated == 0 && stderr_truncated == 0`). `complete` alone
+    /// is only the reader-thread axis (see the module doc's "hung vs killed
+    /// vs complete vs trustworthy" section) — a fully-drained,
+    /// EOF-reached capture can still be silently missing bytes the cap
+    /// dropped from the middle of a long-running child's output, so a
+    /// caller that only checks `complete` can be fooled into trusting a
+    /// truncated log.
+    pub fn is_trustworthy(&self) -> bool {
+        self.complete == Completeness::Complete
+            && self.wait_error.is_none()
+            && self.stdout_truncated == 0
+            && self.stderr_truncated == 0
     }
 
     /// Safe form of the free [`render`] function for `stdout`: always uses
@@ -1038,6 +1136,94 @@ mod tests {
         format!("{stripped}::{name}")
     }
 
+    // ---- saturating_deadline: pure, no subprocess involved -----------
+
+    #[test]
+    fn saturating_deadline_does_not_panic_on_an_overflowing_ceiling() {
+        let base = Instant::now();
+        // Duration::from_secs(u64::MAX) is a valid Duration but adding it to
+        // any real Instant overflows the internal representation on every
+        // platform this crate builds for -- this exercises the
+        // checked_add-returns-None fallback for real, not just in theory.
+        let deadline = saturating_deadline(base, Duration::from_secs(u64::MAX));
+        assert!(
+            deadline >= base,
+            "an overflowing ceiling must still yield a valid, non-panicking \
+             Instant at or after epoch_base, deadline={deadline:?} base={base:?}"
+        );
+    }
+
+    #[test]
+    fn saturating_deadline_is_exact_for_an_ordinary_ceiling() {
+        let base = Instant::now();
+        let deadline = saturating_deadline(base, Duration::from_secs(5));
+        assert_eq!(deadline, base + Duration::from_secs(5));
+    }
+
+    // ---- completeness: pure, no subprocess involved (the cheap
+    // Completeness::ReaderFailed oracle: rather than injecting a real panic
+    // into a live reader thread -- which would need a test-only hook into
+    // spawn_reader's generic Read type, widening spawn_inner's signature
+    // just for this -- the classification logic itself is factored into
+    // this pure function and exercised directly here, the same way
+    // `disposition` covers `hung` without a live subprocess) -------------
+
+    #[test]
+    fn completeness_settle_expired_when_either_reader_is_unfinished() {
+        assert_eq!(
+            completeness(false, true, &None, &None, &None, &None),
+            Completeness::SettleExpired
+        );
+        assert_eq!(
+            completeness(true, false, &None, &None, &None, &None),
+            Completeness::SettleExpired
+        );
+        assert_eq!(
+            completeness(false, false, &None, &None, &None, &None),
+            Completeness::SettleExpired
+        );
+    }
+
+    #[test]
+    fn completeness_reader_failed_on_a_panic_or_a_read_error() {
+        let panic = Some("boom".to_string());
+        let err = Some("read error".to_string());
+        assert_eq!(
+            completeness(true, true, &panic, &None, &None, &None),
+            Completeness::ReaderFailed,
+            "stdout panic"
+        );
+        assert_eq!(
+            completeness(true, true, &None, &panic, &None, &None),
+            Completeness::ReaderFailed,
+            "stderr panic"
+        );
+        assert_eq!(
+            completeness(true, true, &None, &None, &err, &None),
+            Completeness::ReaderFailed,
+            "stdout read error"
+        );
+        assert_eq!(
+            completeness(true, true, &None, &None, &None, &err),
+            Completeness::ReaderFailed,
+            "stderr read error"
+        );
+        // SettleExpired takes precedence: an unfinished reader beats a
+        // failure recorded on the other, already-finished one.
+        assert_eq!(
+            completeness(false, true, &None, &panic, &None, &None),
+            Completeness::SettleExpired
+        );
+    }
+
+    #[test]
+    fn completeness_complete_when_both_readers_finish_cleanly() {
+        assert_eq!(
+            completeness(true, true, &None, &None, &None, &None),
+            Completeness::Complete
+        );
+    }
+
     // ---- disposition: pure, no subprocess involved -------------------
 
     #[cfg(unix)]
@@ -1075,6 +1261,27 @@ mod tests {
             !disposition(Some(status_nonzero), true),
             "a nonzero-but-not-signaled exit is still not a hang"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disposition_signal_death_without_a_kill_is_not_hung() {
+        // A self-inflicted crash (e.g. SIGSEGV) that `wait_bounded` never
+        // killed is not a hang -- it's a live signal exit the caller sees
+        // via `Capture::status` directly, not something this driver
+        // detected and terminated.
+        let status = exit_status_signal(11); // SIGSEGV
+        assert!(
+            !disposition(Some(status), false),
+            "a signal death without an issued kill is not `hung`"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disposition_normal_exit_without_a_kill_is_not_hung() {
+        let status = exit_status_code(0);
+        assert!(!disposition(Some(status), false));
     }
 
     #[test]
@@ -1138,6 +1345,10 @@ mod tests {
             "stdout should carry libtest's banner: {stdout_text:?}"
         );
         assert_eq!(cap.stdout_truncated, 0, "{cap:?}");
+        assert!(
+            cap.is_trustworthy(),
+            "a complete, untruncated, error-free capture must be trustworthy: {cap:?}"
+        );
 
         assert!(
             cap.elapsed < Duration::from_secs(10),
@@ -1288,7 +1499,12 @@ mod tests {
     /// tail 256 KiB, a 2 MiB flood must retain exactly the first 1 MiB and
     /// exactly the last 256 KiB, report the exact dropped middle, and render
     /// exactly one truncation marker; a flood well under the combined cap
-    /// must render no marker at all.
+    /// must render no marker at all. Also pins the two-axis distinction the
+    /// module doc draws: the over-cap capture's reader threads still reach a
+    /// clean EOF (`complete == Completeness::Complete`) even though bytes
+    /// were dropped, so `complete` alone would wrongly look like "trust
+    /// this" — `is_trustworthy()` must be `false` here specifically because
+    /// of the truncation, not because of `complete`.
     #[test]
     fn flood_over_cap() {
         dispatch_if_child();
@@ -1308,10 +1524,20 @@ mod tests {
         assert!(!cap.hung, "{cap:?}");
         assert!(!cap.killed, "{cap:?}");
         assert_eq!(cap.status.and_then(|s| s.code()), Some(0), "{cap:?}");
+        assert_eq!(
+            cap.complete,
+            Completeness::Complete,
+            "the reader threads still reach a clean EOF despite the cap: {cap:?}"
+        );
 
         let full = expected_flood_stream(OVER_CAP_LINES);
         let expected_truncated = full.len() as u64 - (HEAD_CAP + TAIL_CAP) as u64;
         assert_eq!(cap.stderr_truncated, expected_truncated, "{cap:?}");
+        assert!(
+            !cap.is_trustworthy(),
+            "complete==Complete must NOT imply trustworthy once the cap has \
+             dropped bytes: {cap:?}"
+        );
         assert_eq!(cap.stderr.len(), HEAD_CAP + TAIL_CAP, "{cap:?}");
         assert_eq!(
             &cap.stderr[..HEAD_CAP],
@@ -1349,6 +1575,10 @@ mod tests {
         let sub_cap = sub_child.wait_bounded(Duration::from_secs(30), Epoch::Spawn);
         assert!(!sub_cap.hung, "{sub_cap:?}");
         assert_eq!(sub_cap.stderr_truncated, 0, "{sub_cap:?}");
+        assert!(
+            sub_cap.is_trustworthy(),
+            "well under the cap, with no truncation, must be trustworthy: {sub_cap:?}"
+        );
         let sub_expected = expected_flood_stream(SUB_CAP_LINES);
         assert_eq!(sub_cap.stderr, sub_expected, "{sub_cap:?}");
         let sub_rendered = sub_cap.render_stderr();
@@ -1361,18 +1591,20 @@ mod tests {
     // ---- round W1.1: Epoch::Call, Duration::ZERO, snapshot(), try_wait() --
 
     /// A zero ceiling measured from `Epoch::Call` against a still-running
-    /// child must kill immediately: the deadline check precedes any sleep,
-    /// so the very first `try_wait` poll (finding the sleeper still running)
-    /// is immediately followed by a kill, never a 20 ms sleep. The bound
+    /// child is well-defined and kills: the deadline check precedes any
+    /// sleep (see `wait_bounded`'s doc), so `Duration::ZERO` does not
+    /// silently behave as an unbounded wait. This wall-clock oracle cannot
+    /// observe *whether* a single 20 ms poll sleep happened before the kill
+    /// (that is an implementation detail the black-box timing here has no
+    /// way to distinguish from noise) — what it does prove is that the wait
+    /// ends nowhere near the sleeper's own natural 3s lifetime. The bound
     /// (2s) matches `wait_bounded`'s own documented kill-path worst case
     /// ("ceiling plus roughly 2s", ceiling here being zero) rather than a
     /// tighter number: under heavy in-binary parallelism (this module's
     /// other 12+ tests, several themselves spawning subprocesses,
     /// contending for the host's CPUs) a tighter bound was observed to
     /// flake even on the *other* new test below, purely from scheduling
-    /// delay, not from `wait_bounded` failing to kill promptly. It is still
-    /// a real assertion: it rules out waiting anywhere near the sleeper's
-    /// own natural 3s lifetime.
+    /// delay, not from `wait_bounded` failing to kill promptly.
     #[test]
     fn zero_ceiling_with_epoch_call_kills_immediately() {
         dispatch_if_child();

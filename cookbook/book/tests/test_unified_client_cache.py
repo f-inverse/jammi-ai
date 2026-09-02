@@ -14,7 +14,7 @@ recompute, only the client contract to hold to its frozen shape:
 * **embedded↔remote parity** — every member the shared `Session` Protocol names
   is present on BOTH concrete backends, and both satisfy `Session` structurally;
 * **the capability contract** — `supports(Capability.X)` is the committed boolean
-  per backend (the two CLOSED-five sets are exactly complementary), and a
+  per backend (the two CLOSED-four sets are exactly complementary), and a
   one-sided feature on the wrong backend raises `NotSupportedOnBackend`;
 * **the two-sided taxonomy** — one `except JammiError` catches a failure on BOTH
   transports, and a bad argument is the SAME `InvalidArgument` class on both;
@@ -149,7 +149,7 @@ def test_session_protocol_vocabulary_present_on_both_backends():
 @_needs_cache
 def test_supports_booleans_match_and_are_complementary():
     """`supports(Capability.X)` is the committed boolean per backend, and the two
-    CLOSED-five capability sets are exactly complementary."""
+    CLOSED-four capability sets are exactly complementary."""
     rec = _record()["capability"]
     with tempfile.TemporaryDirectory() as d:
         embedded = jammi.connect(f"file://{d}")
@@ -187,17 +187,33 @@ def test_wrong_side_capability_raises_not_supported():
 
 
 @_needs_cache
-def test_capability_enum_is_the_closed_five():
-    """The capability enum is the committed CLOSED five — no silent sixth."""
+def test_capability_enum_is_the_closed_four():
+    """The capability enum is the committed CLOSED four — no silent fifth.
+
+    The literal set is deliberately spelled out beside the golden rather than
+    read from it: a member added to the enum AND to a regenerated
+    `unified_client.json` in one move would satisfy the equality above on its
+    own. This is the independent oracle that catches it.
+
+    `CLOSE` is pinned as an ABSENCE for the same reason it left: both transports
+    now carry `close()` (the embedded arm's releases the catalog file — an
+    awaited event, not a drop; see
+    `crates/jammi-db/src/catalog/backend_sqlite.rs`), so a flag every backend
+    sets would be a predicate that never discriminates. Re-adding it has to be a
+    deliberate act, not a silent one.
+    """
     rec = _record()["capability"]
     assert [c.value for c in Capability] == rec["enum_values"]
     assert set(rec["enum_values"]) == {
         "audit",
         "ephemeral_session",
         "preload_model",
-        "close",
         "session_id",
     }
+    assert not hasattr(Capability, "CLOSE"), (
+        "close() is carried by BOTH transports and is an ordinary Session verb, "
+        "not a capability"
+    )
 
 
 # --------------------------------------------------------------------------- #

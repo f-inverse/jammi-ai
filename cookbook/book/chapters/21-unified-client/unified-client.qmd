@@ -172,16 +172,28 @@ this shared list — the one-sided, capability-gated members — is the subject 
 
 Most of the verb vocabulary is shared: sources, embeddings, search, inference, training,
 evaluation, channels, mutable tables, SQL — every one present on both transports, which is
-what lets the earlier chapters swap `file://` for `grpc://` freely. A closed set of five
+what lets the earlier chapters swap `file://` for `grpc://` freely. A closed set of four
 features genuinely diverge. The embedded engine carries the in-process primitives — the
 per-query `audit` log, an `ephemeral_session` storage context, `preload_model` — because
-they only mean something in-process. The remote client carries the two that only mean
-something across a channel — an explicit `close` (the embedded engine releases on drop,
-RAII) and an opaque per-connection `session_id`.
+they only mean something in-process. The remote client carries the one that only means
+something across a channel: an opaque per-connection `session_id`.
+
+`close()` is deliberately NOT on that list, and the reason is worth reading. It used to be:
+the embedded arm was documented as releasing on drop (RAII), so an explicit close was
+remote-only. The engine's `unix-excl` catalog seam falsified that — the catalog file is held
+for as long as any connection in the process has it open, and `sqlx` returns pooled
+connections from a background task, so a dropped handle releases nothing at any bounded
+moment. Releasing it is an **awaited event**, and `close()` is where the engine awaits it
+(`crates/jammi-db/src/catalog/backend_sqlite.rs`). Both transports now carry `close()` —
+the remote arm closing a channel, the embedded arm releasing the catalog file — so the flag
+described no divergence, and a flag every backend sets is a predicate that never
+discriminates. **A member leaves this enum when it stops diverging**, which is the enum's
+charter working, not an exception to it. Chapter 23's producer is the consumer that needed
+it: it hands the artifact directory over before reading it with stdlib `sqlite3`.
 
 `supports(Capability.X)` answers "does *this* backend carry that feature?" — so a program
 that must run on either transport asks first, rather than guessing and catching. The two
-sets are exactly complementary across the closed five: every capability is carried by
+sets are exactly complementary across the closed four: every capability is carried by
 precisely one transport.
 
 ```{python}
@@ -420,7 +432,8 @@ assert got.nbytes > edge["demo_cap_bytes"]
 ```{python}
 tax = rec["taxonomy"]
 print("unified client surface — measured:")
-print(f"  capability sets complementary across the closed five:  {cap['complementary']}")
+print(f"  capability sets complementary ({len(cap['enum_values'])} capabilities): "
+      f"{cap['complementary']}")
 print(f"  wrong-side capability -> NotSupportedOnBackend:         "
       f"{cap['embedded_wrong_side']['raised'] == cap['remote_wrong_side']['raised'] == 'NotSupportedOnBackend'}")
 print(f"  bad argument -> same InvalidArgument on both transports: {tax['two_sided_same_class']}")

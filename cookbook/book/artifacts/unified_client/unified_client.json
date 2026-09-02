@@ -3,7 +3,6 @@
     "complementary": true,
     "embedded_supports": {
       "audit": true,
-      "close": false,
       "ephemeral_session": true,
       "preload_model": true,
       "session_id": false
@@ -16,12 +15,10 @@
       "audit",
       "ephemeral_session",
       "preload_model",
-      "close",
       "session_id"
     ],
     "remote_supports": {
       "audit": false,
-      "close": true,
       "ephemeral_session": false,
       "preload_model": false,
       "session_id": true

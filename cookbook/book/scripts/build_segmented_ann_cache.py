@@ -77,8 +77,9 @@ truncate the `-wal` the engine still tracks. No engine-side seam can arbitrate
 locks it cannot see; the caller has to not create the topology. So `emit()` closes
 the engine and only then opens a **read-only** handle on the file.
 
-The AWAITED close is the proof — this script adds no second one. `PyDatabase::close`
-(`crates/jammi-python/src/database.rs`) stops the training worker, then awaits
+The AWAITED close is the proof — this script adds no second one. The public
+`Session.close()` (both arms carry it; the embedded arm's delegates to
+`PyDatabase::close`, `crates/jammi-python/src/database.rs`) stops the training worker, then awaits
 `CatalogBackend::close`, which drains the pool and waits out SQLite's own release
 evidence across a settle window before returning. "`close()` returned" therefore
 already MEANS "released"; re-deriving that here from the presence of a sidecar file
@@ -122,7 +123,6 @@ import jammi
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
-from jammi.errors import NotSupportedOnBackend
 
 import jammi_cookbook  # noqa: F401  # applies the determinism env on import
 
@@ -229,28 +229,17 @@ def _close_engine(db) -> None:
     the catalog is released — so its return is this script's proof, and the caller
     below adds no second check of its own.
 
-    The public `jammi.Session` surface does not carry it on the embedded arm yet:
-    `EmbeddedBackend.close()` raises `NotSupportedOnBackend(Capability.CLOSE)`
-    ("the embedded engine releases on drop — RAII"), while the compiled handle
-    underneath it DOES carry the real release verb (`PyDatabase::close`, which
-    stops the training worker and closes the catalog pool). That asymmetry is
-    reported as an engine gap alongside the missing `index_segments` surface; the
-    interim here is to reach the compiled handle directly, deliberately and
-    loudly, rather than to keep a raw read against a live engine. The public verb
-    is tried FIRST, so the day `Capability.CLOSE` lands on the embedded backend
-    this function starts using it with no edit.
+    This goes through the PUBLIC front door and nothing else. `close()` is now a
+    real member of the `jammi.Session` surface on BOTH arms — the embedded arm
+    releases the catalog file, the remote arm closes a channel — so `Capability`
+    no longer carries a `CLOSE` flag (a flag every backend sets discriminates
+    nothing) and this script no longer reaches for the compiled handle. The
+    earlier fallback to `db._native.close()` existed only while
+    `EmbeddedBackend.close()` still raised `NotSupportedOnBackend`; that gap is
+    closed, so the fallback is gone rather than left in as dead cover.
     """
-    try:
-        db.close()
-        print("  engine closed via the public Session.close()", flush=True)
-    except NotSupportedOnBackend:
-        db._native.close()
-        print(
-            "  engine closed via the compiled handle's close() — "
-            "Capability.CLOSE is not on the embedded Session surface yet "
-            "(reported as an engine gap)",
-            flush=True,
-        )
+    db.close()
+    print("  engine closed via the public Session.close()", flush=True)
 
 
 def _read_segment_catalog(artifact_dir: Path, table_name: str) -> dict:

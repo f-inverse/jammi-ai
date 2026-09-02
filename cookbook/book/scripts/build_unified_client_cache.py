@@ -20,7 +20,9 @@ facts and freezes them:
   structurally (``isinstance`` runtime-checkable), so a program written against
   the Protocol runs local or remote by target alone;
 * **the capability contract** — ``supports(Capability.X)`` is a hard boolean per
-  backend (the two sets are exactly complementary across the CLOSED five), and
+  backend (the two sets are exactly complementary across the CLOSED four —
+  ``close()`` is NOT among them: both transports carry it, the embedded arm's
+  releasing the catalog file as an awaited event rather than on drop), and
   invoking a one-sided feature on the backend that lacks it raises the typed
   ``NotSupportedOnBackend`` rather than a bare ``AttributeError``;
 * **the JammiError taxonomy, two-sided** — one ``except JammiError`` catches a

@@ -834,7 +834,7 @@ ARTIFACTS: dict[str, Artifact] = {
         produced_by="unified_client",
         note="The one-front-door client contract measured LIVE on CPU, hermetic (no "
         "server socket): the capability contract (supports(Capability.X) is a hard "
-        "boolean per backend — the CLOSED-five sets are exactly complementary across "
+        "boolean per backend — the CLOSED-four sets are exactly complementary across "
         "the embedded Database and the remote RemoteDatabase — and a one-sided feature "
         "on the wrong backend raises the typed NotSupportedOnBackend); the JammiError "
         "taxonomy two-sided (one except JammiError catches a failure on BOTH transports, "

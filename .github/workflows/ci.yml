@@ -338,6 +338,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
 
+      # A bare `git` in a container `run:` step hits "fatal: detected
+      # dubious ownership" (exit 128) — same trap as `ci.yml`'s "Run tests"
+      # step and `flash-attn-compile`'s submodule init above (see those
+      # comment blocks for the full story). Since esc-081, this job's own
+      # `check_prove_surface` calls `discover_all_tuples`, which shells out
+      # to `git ls-files` to enumerate tracked files — this is that job's
+      # first git call, so it is the first place this trap can fire here.
+      - name: Mark the checkout safe for git (container UID != checkout UID)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       # `jammi-kernels/flash-attn` vendors CUTLASS + a multi-minute `nvcc`
       # build; it must depend on `cuda` but never be IMPLIED by it, or the
       # release lane (`release-binaries.yml`'s `cuda,jetstream-broker,

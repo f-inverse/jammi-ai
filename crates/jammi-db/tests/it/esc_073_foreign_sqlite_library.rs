@@ -1157,16 +1157,21 @@ enum Attempt {
     /// panic in `drive_with` and the classification tests derive them the
     /// same way, via [`last_phase_marker`] and `Capture::silence`).
     Hung,
-    /// The capture's own evidence cannot be trusted for a content-dependent
-    /// classification: `Capture::complete != Completeness::Complete` (the
-    /// drained reader threads never reached EOF within the settle bound —
-    /// e.g. an fd-inheriting grandchild) or `Capture::wait_error.is_some()`
-    /// (an OS-level error while producing the capture). Distinct from
+    /// `!Capture::is_trustworthy()` — the capture's own evidence cannot be
+    /// trusted for a content-dependent classification, for any of the four
+    /// reasons that predicate ANDs together: the drained reader threads
+    /// never reached a clean EOF within the settle bound
+    /// (`complete != Completeness::Complete`, e.g. an fd-inheriting
+    /// grandchild, or `Completeness::Undrained`), an OS-level error occurred
+    /// while producing the capture (`wait_error.is_some()`), or the
+    /// retention cap dropped bytes from stdout or stderr
+    /// (`stdout_truncated`/`stderr_truncated != 0`). Distinct from
     /// [`Attempt::Truncated`]: `Truncated` means the evidence IS trustworthy
     /// but the class's own required line is missing; `Incomplete` means the
-    /// evidence itself is not fully collected, so no content-dependent class
-    /// (`Survived`/`Tripped`/`Stale`/`Corrupt`/`Skipped`) may ever be
-    /// reported. Carries the reason text.
+    /// evidence itself is not fully collected/trustworthy, so no
+    /// content-dependent class (`Survived`/`Tripped`/`Stale`/`Corrupt`/
+    /// `Skipped`) may ever be reported. Carries the reason text (see
+    /// [`incompleteness_reason`] for which of the four conditions it names).
     Incomplete(String),
 }
 
@@ -1219,16 +1224,23 @@ fn terminus_satisfied(stderr: &[u8], role: Role) -> bool {
     }
 }
 
-/// `Some(reason)` when `cap`'s evidence cannot be trusted for a
-/// content-dependent classification (`Survived`/`Tripped`/`Stale`/`Corrupt`/
-/// `Skipped` — every one of them decides its outcome by reading `cap.stderr`)
-/// — either the drained reader threads never reached EOF within the settle
-/// bound (`Capture::complete != Completeness::Complete`), or an OS-level
-/// error occurred while producing the capture (`Capture::wait_error`).
+/// `Some(reason)` when `cap.is_trustworthy()` is `false` — the single
+/// predicate gating every content-dependent classification
+/// (`Survived`/`Tripped`/`Stale`/`Corrupt`/`Skipped`, every one of which
+/// decides its outcome by reading `cap.stderr`). Names WHICH of
+/// `is_trustworthy`'s four ANDed conditions failed (checked in the same
+/// order `is_trustworthy` ANDs them, so the first checked is the first
+/// named): reader completeness (`complete != Completeness::Complete`,
+/// including `Completeness::Undrained`), an OS-level wait error, a
+/// stdout-retention-cap truncation, a stderr-retention-cap truncation.
 /// `None` when the capture is fully trustworthy. `Attempt::Signal`/`Hung`/
 /// `ExitCode` never consult this: they classify from `cap.status` alone, not
-/// from stderr content, so an incomplete log does not make them unreliable.
+/// from stderr content, so an untrustworthy capture does not make them
+/// unreliable.
 fn incompleteness_reason(cap: &Capture) -> Option<String> {
+    if cap.is_trustworthy() {
+        return None;
+    }
     if cap.complete != Completeness::Complete {
         return Some(format!(
             "capture incomplete ({:?}) — its stderr content cannot be trusted for classification",
@@ -1240,7 +1252,24 @@ fn incompleteness_reason(cap: &Capture) -> Option<String> {
             "an OS-level error occurred while producing this capture: {err}"
         ));
     }
-    None
+    if cap.stdout_truncated != 0 {
+        return Some(format!(
+            "the retention cap dropped {} byte(s) from stdout — its content cannot be trusted \
+             for classification",
+            cap.stdout_truncated
+        ));
+    }
+    if cap.stderr_truncated != 0 {
+        return Some(format!(
+            "the retention cap dropped {} byte(s) from stderr — its content cannot be trusted \
+             for classification",
+            cap.stderr_truncated
+        ));
+    }
+    unreachable!(
+        "is_trustworthy() was false but none of its four ANDed conditions failed — \
+         incompleteness_reason and Capture::is_trustworthy have drifted out of sync"
+    )
 }
 
 /// Classify a settled (non-hung) [`Capture`] into an [`Attempt`], applying the
@@ -1250,6 +1279,12 @@ fn incompleteness_reason(cap: &Capture) -> Option<String> {
 /// of a content-dependent class, regardless of what its exit code would
 /// otherwise imply.
 fn classify(cap: &Capture, role: Role) -> Attempt {
+    // `hung` is now `true` iff `wait_bounded` issued a `kill()` and the
+    // reaped status is a signal death or a reap give-up — a genuine
+    // self-inflicted crash (a signal death `wait_bounded` never killed for)
+    // is `hung == false`, and falls through to the `status.signal()` check
+    // below unaffected: this ordering (hung, then signal) already routes a
+    // self-signalled child to `Attempt::Signal`, not `Attempt::Hung`.
     if cap.hung {
         return Attempt::Hung;
     }
@@ -1854,6 +1889,11 @@ fn grandchild_capture_is_incomplete_not_survived() {
         "the mechanism this oracle exercises: the reader thread must not have observed EOF \
          within the settle bound because the sleeper grandchild still holds the pipe. Log:\n{}",
         rendered_log(&cap)
+    );
+    assert!(
+        !cap.is_trustworthy(),
+        "SettleExpired must fail is_trustworthy() — the single predicate incompleteness_reason \
+         gates on: {cap:?}"
     );
     assert!(
         reason.contains("SettleExpired"),

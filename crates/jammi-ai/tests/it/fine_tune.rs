@@ -2098,6 +2098,7 @@ async fn configured_short_lease_drives_reclaim() {
         lease_duration_secs: 6,
         heartbeat_interval_secs: 2,
         idle_poll_secs: 1,
+        ..Default::default()
     };
 
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
@@ -2355,6 +2356,7 @@ async fn cancelled_run_reclaims_epoch_checkpoints_that_actually_existed() {
         lease_duration_secs: 3,
         heartbeat_interval_secs: 1,
         idle_poll_secs: 1,
+        ..Default::default()
     };
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
     session

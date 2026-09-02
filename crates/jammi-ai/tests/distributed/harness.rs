@@ -160,6 +160,8 @@ fn shared_config(backends: &Backends, result_root: &str, artifact_dir: &Path) ->
             lease_duration_secs: LEASE_SECS,
             heartbeat_interval_secs: HEARTBEAT_SECS,
             idle_poll_secs: IDLE_POLL_SECS,
+            // These processes are the workers under test — claim loop on.
+            ..Default::default()
         },
         ..Default::default()
     }

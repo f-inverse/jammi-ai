@@ -30,6 +30,18 @@ credentials_path = "/var/run/secrets/nats.creds"
 execution_threads = 8
 batch_size = 8192
 
+[training]
+# Whether THIS process runs the training claim loop. Default `true`: the
+# process both accepts submitted jobs and works them. Set `false` to accept
+# submissions without ever claiming — jobs stay queued until a process with
+# `run_worker = true` opens the catalog. A Postgres catalog is multi-process,
+# so a `run_worker = false` submission front-end and one or more
+# `run_worker = true` workers can run against this same catalog at once;
+# on SQLite (single-process) the front-end must close first.
+# Overridable per process with `JAMMI_TRAINING__RUN_WORKER` (true/false/1/0;
+# anything else is a hard config error, never a silent fall-back).
+run_worker = true
+
 [server]
 health_listen = "0.0.0.0:8080"
 flight_listen = "0.0.0.0:8081"

@@ -503,8 +503,12 @@ healthy evidence at all.
 and silent" — a genuinely hung leg pays the FULL budget before `timeout` ever
 fires. `rp_run_remote_watched` (`runpod_lib.sh`, used by
 `runpod_gpu_prove.sh` only) layers an inactivity watchdog on top: `RP_INACTIVITY`
-seconds (default 600) of silent remote stdout+stderr kills the ssh session and
-returns 76, well before `RP_TIMEOUT` would ever have expired.
+seconds (default 900 — derived from D5 run 33674156137's largest healthy
+in-window silence, 285.2s on sm_90 during the repository clone, × R2's own
+3x margin, rounded up to the next 300s step; see `runpod_lib.sh`'s own
+setter comment for the full derivation) of silent remote stdout+stderr kills
+the ssh session and returns 76, well before `RP_TIMEOUT` would ever have
+expired.
 `check_gpu_prove_timings.py`'s R2 re-demands `RP_INACTIVITY >= 3 ×` the largest
 silent gap any healthy (or `slow-host`-disposed) leg has shown, on every run —
 the same "re-checked, not one-time-derived" discipline R3 applies to

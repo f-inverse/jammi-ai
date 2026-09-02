@@ -47,7 +47,11 @@
 #   RP_INACTIVITY seconds of silent (no new output byte) remote stdout+stderr
 #                 before `rp_run_remote_watched` (esc-080) kills the ssh
 #                 session as a hang, rather than waiting out the full
-#                 RP_TIMEOUT budget (default 600). This is a DIFFERENT axis
+#                 RP_TIMEOUT budget (default 900 -- derived from D5 run
+#                 33674156137's largest healthy in-window silence, 285.2s on
+#                 sm_90, x R2's 3x margin, rounded up to the next 300s step;
+#                 see the setter's own comment below for the full
+#                 derivation). This is a DIFFERENT axis
 #                 from RP_TIMEOUT: a hung leg (e.g. a genuinely stuck test)
 #                 goes silent well before any wall-clock budget expires, and
 #                 a bare `timeout` has no notion of "still running but dead"
@@ -154,13 +158,14 @@ RP_SSH_WAIT_SECS=$((10#$RP_SSH_WAIT_SECS))
 # silent-output span this long (seconds, no NEW bytes on the remote's
 # stdout+stderr stream) is read as a genuine hang, not merely a slow
 # command, and kills the ssh session rather than waiting out the full
-# RP_TIMEOUT budget. Default 600s -- >= 3x the longest silent gap any
-# healthy prove-lane leg has shown (161s, `ci/artifacts/gpu-prove-timings/`),
-# per `check_gpu_prove_timings.py`'s own R2 rule, which re-demands this
-# margin every time a fresh artifact lands. Validated here, not at use, same
-# reasoning as RP_SSH_WAIT_SECS above: it drives arithmetic with no `-e` set
-# anywhere in this file.
-RP_INACTIVITY="${RP_INACTIVITY:-600}"
+# RP_TIMEOUT budget. Default 900s -- derived from D5 run 33674156137:
+# largest healthy in-window silence 285.2s (sm_90, repository clone --
+# `ci/artifacts/gpu-prove-timings/33674156137-sm_90.json`) x
+# `check_gpu_prove_timings.py`'s own R2 3x margin = 855.6s, rounded up to
+# the next 300s step; re-derive when R2 moves it. Validated here, not at
+# use, same reasoning as RP_SSH_WAIT_SECS above: it drives arithmetic with
+# no `-e` set anywhere in this file.
+RP_INACTIVITY="${RP_INACTIVITY:-900}"
 case "$RP_INACTIVITY" in
   ''|*[!0-9]*) echo "::error::RP_INACTIVITY must be a positive integer (got '${RP_INACTIVITY}')" >&2; exit 2 ;;
 esac

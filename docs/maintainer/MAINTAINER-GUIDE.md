@@ -302,7 +302,7 @@ RPCs (it also covers module functions `open_local`/`connect`, the pure-Python
 | `CatalogService` | `ListModels`/`DescribeModel`/`DeleteModel` | `grpc/catalog.rs` |
 | `CatalogService` | `RegisterChannel`/`AddChannelColumns`/`ListChannels` | `grpc/catalog.rs` |
 | `CatalogService` | `VerifyMaterialization` | `grpc/catalog.rs` (`CatalogService::verify_materialization`) |
-| `CatalogService` | `Staleness`/`DerivesFrom` | `grpc/catalog.rs` |
+| `CatalogService` | `Staleness`/`DerivesFrom`/`ListIndexSegments` | `grpc/catalog.rs` |
 | `CatalogService` | `CreateMutableTable`/`DropMutableTable`/`ListMutableTables` | `grpc/catalog.rs` |
 | `CatalogService` | `RegisterTopic`/`DropTopic`/`ListTopics` | `grpc/catalog.rs` |
 | `EmbeddingService` | `GenerateEmbeddings`/`EncodeQuery`/`Search` | `grpc/embedding.rs` |

@@ -7,6 +7,16 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Added
+- **`CatalogService/ListIndexSegments` — a result table's ANN index-segment
+  set reaches the public surface.** The `index_segments` rows (migration
+  025) were readable through no public surface: not `db.sql()`'s federation,
+  not any `Session` verb, not any `jammi.v1` rpc — a caller had to close the
+  engine and read its SQLite catalog file. Now `Session::list_index_segments`,
+  a 1:1 `CatalogService` rpc, and a `CatalogClient` wrapper, tenant-scoped by
+  resolving the table through the tenant-filtered `result_tables` read first;
+  a table the caller cannot resolve lists exactly what an unknown table
+  lists, so the verb is not an existence oracle. Additive
+  (`api_freeze_baseline.txt` updated).
 - **An explicit catalog release handshake, at every layer.**
   `CatalogBackend::close` (`crates/jammi-db/src/catalog/backend.rs:88`),
   `Catalog::close` (`crates/jammi-db/src/catalog/mod.rs:93`), and

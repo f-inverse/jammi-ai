@@ -176,7 +176,7 @@
 //! [`snapshot_all`]'s per-op `eager` counts directly, not lean on `"all"`
 //! coming back matched as if it were evidence for the whole registry.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock, RwLock};
@@ -658,7 +658,41 @@ thread_local! {
     /// `Option` check and allocates nothing (pinned by
     /// `unarmed_admit_records_nothing_and_keeps_the_sink_none`).
     static PROBE_CAPTURE: RefCell<Option<Vec<ProbeMiss>>> = const { RefCell::new(None) };
+
+    /// The identity of the window currently armed on this thread, or
+    /// [`NO_WINDOW`] when unarmed — the token a [`ProbeCaptureGuard`] checks
+    /// itself against before it restores anything (campaign #446 round-1
+    /// advisory: nested windows finished OUT OF ORDER would otherwise
+    /// misattribute entries; see [`ProbeCaptureGuard::restore`]).
+    ///
+    /// Read and written ONLY by `probe_capture_begin`/`ProbeCaptureGuard` —
+    /// never by `record_probe_miss`, so the armed and unarmed hot paths are
+    /// byte-for-byte what they were.
+    static ARMED_WINDOW: Cell<u64> = const { Cell::new(NO_WINDOW) };
+
+    /// This thread's monotonic window-token source. Per-thread and
+    /// deterministic (never an RNG, family J): tokens are only ever compared
+    /// for equality against a guard armed on the SAME thread, so two threads
+    /// minting the same number is not a collision.
+    static NEXT_WINDOW_TOKEN: Cell<u64> = const { Cell::new(FIRST_WINDOW) };
 }
+
+/// The [`ARMED_WINDOW`] value meaning "no window armed on this thread". Never
+/// minted as a token, so a guard can never match it.
+const NO_WINDOW: u64 = 0;
+
+/// The first token [`NEXT_WINDOW_TOKEN`] mints.
+const FIRST_WINDOW: u64 = 1;
+
+/// The refusal message [`ProbeCaptureGuard`] panics with when a window is
+/// finished or dropped out of order. Hoisted so the `finish` and `Drop`
+/// spellings cannot drift, and so the test that pins the shape asserts
+/// against the one text.
+const OUT_OF_ORDER_WINDOW: &str =
+    "jammi-kernels: probe-capture windows must be finished innermost-first — this guard armed a \
+     window that is no longer the one armed on this thread, so restoring it would hand a NESTED \
+     window's entries to the wrong probe (and destroy the inner window's own). Finish or drop \
+     the inner ProbeCaptureGuard first.";
 
 /// Records `(op, predicate)` into this thread's armed probe window, if one is
 /// armed. A no-op (and non-allocating) otherwise.
@@ -719,12 +753,34 @@ pub fn probe_capture_is_armed() -> bool {
 ///
 /// Dropping the guard without calling [`ProbeCaptureGuard::finish`] disarms
 /// and discards the window.
+///
+/// **Windows nest strictly.** Each call mints a fresh per-thread token and
+/// records it as this thread's armed window; the returned guard restores only
+/// while it still owns that token. Finishing or dropping guards out of order
+/// is REFUSED with a panic rather than silently misattributing entries — see
+/// [`ProbeCaptureGuard::finish`], and `ProbeCaptureGuard::restore` (private)
+/// for why restoring out of order would misattribute twice over.
 #[must_use = "the window is disarmed as soon as the guard drops; bind it for the probe's \
               duration and call finish() to read it"]
 pub fn probe_capture_begin() -> ProbeCaptureGuard {
+    let token = NEXT_WINDOW_TOKEN.with(|next| {
+        let token = next.get();
+        // Saturating, not wrapping: a wrap could re-mint a token an
+        // outer guard still holds, which is exactly the aliasing the token
+        // exists to detect. `u64::MAX` windows on one thread is not a
+        // reachable count, and pinning at the ceiling degrades to "every
+        // further window shares one token" — loud (an inner guard would then
+        // wrongly pass the check) only in a scenario that cannot occur, and
+        // never silently wrong for the first 2^64 - 1 windows.
+        next.set(token.saturating_add(1));
+        token
+    });
     let previous = PROBE_CAPTURE.with(|slot| slot.borrow_mut().replace(Vec::new()));
+    let previous_token = ARMED_WINDOW.with(|armed| armed.replace(token));
     ProbeCaptureGuard {
         previous,
+        previous_token,
+        token,
         restored: false,
     }
 }
@@ -738,20 +794,56 @@ pub struct ProbeCaptureGuard {
     /// merged into the outer one (the inner probe's misses are the inner
     /// probe's, not the outer's).
     previous: Option<Vec<ProbeMiss>>,
+    /// The [`ARMED_WINDOW`] token in force when this guard armed its own —
+    /// restored alongside `previous`, so the token and the sink always move
+    /// together.
+    previous_token: u64,
+    /// This guard's own window identity, minted by [`probe_capture_begin`].
+    /// A restore is legal only while [`ARMED_WINDOW`] still equals this.
+    token: u64,
     /// Set by the first `restore` so `finish` followed by `drop` restores
     /// once, not twice (a second restore would clobber `previous` back to
-    /// `None` after `finish` had just put it back).
+    /// `None` after `finish` had just put it back). Also set by a REFUSED
+    /// restore, so a refusal cannot repeat from `Drop` during its own unwind.
     restored: bool,
 }
 
 impl ProbeCaptureGuard {
+    /// Whether the window this guard armed is still the one armed on this
+    /// thread — false exactly in the out-of-order shape (an inner window was
+    /// armed after this one and has not been finished/dropped yet).
+    fn owns_the_armed_window(&self) -> bool {
+        ARMED_WINDOW.with(|armed| armed.get()) == self.token
+    }
+
     /// Disarms this window and returns its entries, or `None` if already
     /// disarmed.
+    ///
+    /// # Panics
+    ///
+    /// Panics with [`OUT_OF_ORDER_WINDOW`] when this guard no longer owns the
+    /// window armed on this thread — i.e. a nested window was armed after it
+    /// and is still live. Restoring here would take the INNER window's
+    /// entries (the sink holds the innermost window, not this guard's) and
+    /// then overwrite the sink with this guard's `previous`, destroying the
+    /// inner window outright: two misattributions in one move. The advisory
+    /// that prompted this is not reachable today — `jammi-ai`'s esc-075 probe
+    /// is the only caller and never nests — so this is a REFUSAL that makes
+    /// the shape impossible to introduce silently, not a recovery from a live
+    /// bug. The sink is deliberately left untouched on refusal: the inner
+    /// window keeps its own entries and its own guard still restores
+    /// correctly.
     fn restore(&mut self) -> Option<Vec<ProbeMiss>> {
         if self.restored {
             return None;
         }
+        // Marked spent BEFORE the refusal, so this guard's own `Drop` (which
+        // runs during the panic's unwind) finds nothing to do rather than
+        // panicking a second time — a panic-in-panic aborts the process,
+        // which would replace a legible refusal with a bare SIGABRT.
         self.restored = true;
+        assert!(self.owns_the_armed_window(), "{OUT_OF_ORDER_WINDOW}");
+        ARMED_WINDOW.with(|armed| armed.set(self.previous_token));
         PROBE_CAPTURE.with(|slot| {
             let mut slot = slot.borrow_mut();
             let taken = slot.take();
@@ -762,13 +854,37 @@ impl ProbeCaptureGuard {
 
     /// Disarms the window and returns every DISTINCT `(op, predicate)` miss
     /// recorded on this thread while it was armed, in first-occurrence order.
+    ///
+    /// # Panics
+    ///
+    /// Panics when this window is not the innermost one armed on this thread:
+    /// the sink holds the INNER window, so restoring here would hand the
+    /// inner probe's entries to this one and destroy the inner window in the
+    /// same move. The refusal touches nothing (see the private
+    /// `ProbeCaptureGuard::restore`).
     pub fn finish(mut self) -> Vec<ProbeMiss> {
         self.restore().unwrap_or_default()
     }
 }
 
 impl Drop for ProbeCaptureGuard {
+    /// Restores this thread's window, refusing the out-of-order shape the
+    /// same way [`ProbeCaptureGuard::finish`] does — with one concession the
+    /// `finish` path does not need: a `Drop` that is ALREADY running inside
+    /// someone else's unwind cannot panic (that aborts the process), so it
+    /// refuses silently there. Refusing means leaving the sink alone, which
+    /// is the fail-safe direction in both cases.
     fn drop(&mut self) {
+        if self.restored {
+            return;
+        }
+        if !self.owns_the_armed_window() {
+            self.restored = true;
+            if std::thread::panicking() {
+                return;
+            }
+            panic!("{OUT_OF_ORDER_WINDOW}");
+        }
         let _ = self.restore();
     }
 }
@@ -3420,6 +3536,138 @@ mod tests {
             !probe_capture_is_armed(),
             "the window must be disarmed by Drop, not only by finish()"
         );
+    }
+
+    /// The POSITIVE control for the out-of-order refusal below: properly
+    /// nested windows (inner finished first) still work exactly as
+    /// documented. Without this, a `restore` that refused unconditionally
+    /// would "pass" the refusal test while breaking every real caller.
+    ///
+    /// Also pins the nesting semantics the guard's own doc states: the
+    /// inner window's entries are the INNER probe's (never merged upward),
+    /// and the outer window's own entries survive the nested window intact.
+    #[test]
+    fn properly_nested_windows_finish_innermost_first_and_keep_their_own_entries() {
+        std::thread::spawn(|| {
+            let counters = DispatchCounters::new();
+            let miss = |op: &'static str| {
+                admit_inner(
+                    AdmissionMode::Fallback,
+                    op,
+                    "probe_sink_nesting_predicate",
+                    false,
+                    false,
+                    &counters,
+                )
+                .expect("Fallback mode never errors on a predicate miss");
+            };
+
+            let outer = probe_capture_begin();
+            miss("probe_sink_nesting_outer_op");
+            let inner = probe_capture_begin();
+            miss("probe_sink_nesting_inner_op");
+            assert_eq!(
+                inner.finish(),
+                vec![(
+                    "probe_sink_nesting_inner_op",
+                    "probe_sink_nesting_predicate"
+                )],
+                "the inner window holds ONLY the misses raised while it was armed"
+            );
+            assert!(
+                probe_capture_is_armed(),
+                "finishing the inner window must restore the OUTER one, not disarm the thread"
+            );
+            miss("probe_sink_nesting_outer_op_again");
+            assert_eq!(
+                outer.finish(),
+                vec![
+                    (
+                        "probe_sink_nesting_outer_op",
+                        "probe_sink_nesting_predicate"
+                    ),
+                    (
+                        "probe_sink_nesting_outer_op_again",
+                        "probe_sink_nesting_predicate"
+                    ),
+                ],
+                "the outer window keeps its pre-nesting entries AND records again after the \
+                 inner window closed; the inner probe's miss is never merged into it"
+            );
+            assert!(!probe_capture_is_armed());
+        })
+        .join()
+        .expect("the properly nested shape must not panic");
+    }
+
+    /// Campaign #446 round-1 advisory: a window finished OUT OF ORDER (an
+    /// outer guard finished while an inner one is still armed) must be
+    /// REFUSED, loudly, rather than handing the inner window's entries to the
+    /// outer probe and destroying the inner window in the same move.
+    ///
+    /// Not reachable from today's callers — `jammi-ai`'s esc-075 probe is the
+    /// only one and never nests — so this test constructs the shape directly.
+    /// It runs on its OWN thread for two reasons: the sink is thread-local,
+    /// and the refusal deliberately leaves this thread's sink ARMED (the
+    /// fail-safe: it touches nothing), which must not leak into a sibling
+    /// test sharing the harness thread.
+    #[test]
+    fn out_of_order_window_finish_is_refused_and_leaves_the_inner_window_intact() {
+        std::thread::spawn(|| {
+            let counters = DispatchCounters::new();
+            let outer = probe_capture_begin();
+            let inner = probe_capture_begin();
+            admit_inner(
+                AdmissionMode::Fallback,
+                "probe_sink_out_of_order_op",
+                "probe_sink_out_of_order_predicate",
+                false,
+                false,
+                &counters,
+            )
+            .expect("Fallback mode never errors on a predicate miss");
+
+            // Silence the default hook for the expected panic only, so a
+            // refusal this test EXPECTS does not print a scary backtrace
+            // while a genuinely unexpected panic elsewhere still does.
+            let previous_hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let refused =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || outer.finish()));
+            std::panic::set_hook(previous_hook);
+
+            let payload = refused.expect_err(
+                "finishing the OUTER window while the inner one is still armed must be refused \
+                 — silently restoring would hand the inner probe's entries to the outer one",
+            );
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("<non-string panic payload>");
+            assert!(
+                message.contains("innermost-first"),
+                "the refusal must say WHAT is wrong and HOW to fix it, got: {message}"
+            );
+
+            // The refusal touched nothing: the inner window is still armed
+            // and still owns its entry, so the inner probe's own `finish`
+            // remains correct.
+            assert!(
+                probe_capture_is_armed(),
+                "a refused restore must leave the sink alone, not disarm the inner window"
+            );
+            assert_eq!(
+                inner.finish(),
+                vec![(
+                    "probe_sink_out_of_order_op",
+                    "probe_sink_out_of_order_predicate"
+                )],
+                "the inner window keeps its own entries through the outer guard's refusal"
+            );
+        })
+        .join()
+        .expect("the refusal must be a catchable panic on the guard, not a thread-killing one");
     }
 
     /// The `JAMMI_KERNELS_DISABLE` arm records too, under the ONE hoisted

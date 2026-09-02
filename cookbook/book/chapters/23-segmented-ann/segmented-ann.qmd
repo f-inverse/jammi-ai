@@ -226,7 +226,13 @@ for claim in record["append_no_rebuild"]["headline_test_asserts"]:
 ```{python}
 assert append_suite["exit_code"] == 0
 assert append_suite["failed"] == 0
-assert append_suite["passed"] == 4
+# The passed count is asserted against the frozen golden BELOW, once. It is
+# deliberately NOT also written here as a literal: `segment::` is a live test
+# MODULE, not a fixed-size table — this release grew it by two when the session
+# verb landed — so a hand-copied count is a second copy of an already-gated
+# number whose only future is to go stale. What is invariant is the shape:
+# every test the run reported is a pass, and there is at least one.
+assert append_suite["passed"] == len(append_suite["tests"]) > 0, append_suite["tests"]
 assert "segment::append_does_not_rebuild_prior_segments ... ok" in "\n".join(append_suite["tests"])
 
 contracts.assert_close("segmented_ann.append.exit_code", float(append_suite["exit_code"]))

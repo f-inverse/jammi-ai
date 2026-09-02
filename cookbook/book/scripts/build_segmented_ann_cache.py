@@ -133,8 +133,11 @@ ARTIFACTS = Path(__file__).resolve().parent.parent / "artifacts" / "segmented_an
 # `segment::` module of the `jammi-db` it-suite. `append_does_not_rebuild_prior_segments`
 # is the headline proof (segment 0's raw `.usearch` bytes are read before/after
 # the append and asserted byte-identical, and both segments' rows are searchable
-# through the merge); the other three cover the catalog migration, the
-# quantized two-segment merge, and concurrent-append id allocation.
+# through the merge); the rest cover the catalog migration, the quantized
+# two-segment merge, concurrent-append id allocation, and the session verb's
+# ordering and tenant gate. The population is deliberately NOT counted here or
+# in the chapter: `segment::` is a live module that grows with the capability,
+# and the emitted `passed`/`failed` pair is the measured fact.
 _CARGO_TEST_FILTER = "segment::"
 
 # k values swept per query row for the N=1 exact-search property.

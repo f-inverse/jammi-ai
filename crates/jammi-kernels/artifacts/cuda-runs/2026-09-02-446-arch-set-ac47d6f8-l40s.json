@@ -1,0 +1,110 @@
+{
+ "schema_version": 1,
+ "unit": "446-f16-softmax-dscores-arch-set-l40s",
+ "git_sha": "ac47d6f8d46b0720abbefe8a453b0116f347904e",
+ "date": "2026-09-02T03:00:00Z",
+ "box": "jammi-l40s (NVIDIA L40S 46068 MiB, driver 570.124.06, nvcc 12.6.85, compute_cap 8.9)",
+ "driver": "570.124.06",
+ "gpu": "NVIDIA L40S",
+ "features": "cuda,flash-attn",
+ "status": "GREEN",
+ "env": {
+  "JAMMI_REQUIRE_CUDA": "1",
+  "JAMMI_REQUIRE_FLASH": "1",
+  "JAMMI_REQUIRE_FLASH_ORACLE": "1",
+  "JAMMI_FLASH_ORACLE_MODEL_DIR": "/root/checkpoints/ModernBERT-large",
+  "CUDA_COMPUTE_CAP": "89",
+  "CARGO_TARGET_DIR": "/root/target-f16sm"
+ },
+ "producer": {
+  "path": "crates/jammi-encoders/src/modernbert.rs",
+  "kind": "cargo-test",
+  "invocation": "JAMMI_REQUIRE_CUDA=1 JAMMI_REQUIRE_FLASH=1 JAMMI_REQUIRE_FLASH_ORACLE=1 JAMMI_FLASH_ORACLE_MODEL_DIR=<checkpoint> cargo test -p jammi-encoders --lib --features cuda,flash-attn -- --exact modernbert::tests::flash_arm_padded_matches_block_arm_on_real_rows_cuda",
+  "gating": "env:JAMMI_REQUIRE_CUDA"
+ },
+ "observed": {
+  "flash_arm_padded_real_row_ratio_per_seed": {
+   "201": 0.13299,
+   "202": 0.11235,
+   "203": 0.24808,
+   "204": 0.11282,
+   "205": 0.11069,
+   "206": 0.11966,
+   "207": 0.16463,
+   "208": 0.15986
+  },
+  "mean": 0.145135,
+  "max": 0.248084,
+  "bound_at_run": 0.5,
+  "note": "The eight per-seed ratios reproduce the 2026-09-02-446-arch-set-5f281d8-l40s RED artifact's own values DIGIT-FOR-DIGIT, which in turn reproduced the 2026-08-28 m3-arch-set-80a451a-l40s artifact's — the sm89 flash-arm regression anchor is unchanged by this unit's two bound fixes, measured rather than argued. Checkpoint model.safetensors sha256 44510fec5d3a81a1877f225637b869495f18e55f6f23a09abb9be0acc030295f (matches the digest the predecessor artifact pinned).",
+  "softmax_parity_f16_row_length_regimes_now_green": {
+   "was": "RED at 5f281d81 on sm_80/86/89/90, byte-identically: `softmax f16 dscores[35]: cpu -0.0010614395 vs cuda -0.0010671616 (bound 1.9073486e-6)` at last=257, rows=2 (n=514). The loop aborted there, so last 513/1024/4096 had NEVER been evaluated on any arch.",
+   "root_cause": "NOT a kernel defect. `softmax_bwd_dscores_f16` meets guide 3.10's regime (all-f32, one rounding point at the final cast, no __half2 path, no f16 temporary); isolating it with an identical `y` moves dscores by at most ONE f16 ULP at every length. The divergence is the FORWARD's: `softmax_fwd_f16`'s f32 row sum is a 256-way strided partial folded through a shared-memory tree while `softmax_row_f16` folds sequentially in ascending index order, and although the two f32 sums agree to 3.3e-7 relative (7.63e-6 of 23.1259 at last=257) that is enough to move `e_i / sum` across an f16 round-to-nearest midpoint. At last=257 exactly two of the row's 257 quotients straddle: y[68]'s exact quotients are 0.029258731 and 0.029258722 against the midpoint 0.029258728. The resulting 1-ULP flip in a large y_j is worth dy_j*ulp(y_j) in `dot` (|Ddot| = 1.46e-4, a hundredfold jump over the ~1e-6 the backward's own fold order contributes), and `dscores_i = (dy_i - dot)*y_i` is 317x cancelled at i=35 (|dy_i| = 7.832 vs |dy_i - dot| = 0.0247), turning that into 6 f16 ULPs of a 1.06e-3 result.",
+   "fix": "The bound gained the two mechanisms it omitted, as separate additive terms (`softmax_f16_dscores_propagation_terms`, `softmax_f16_dscores_dot_fold_terms`); k stayed at 2. The propagation term is provably ZERO when the two forwards agree bitwise, so at the four lengths where they do, the bound is bit-for-bit the pre-fix one.",
+   "per_length_worst_delta_over_bound": {
+    "last_255_fwd": 0.0,
+    "last_255_dscores": 0.0,
+    "last_256_fwd": 0.0,
+    "last_256_dscores": 0.0,
+    "last_257_fwd": 0.5,
+    "last_257_dscores": 0.5073465,
+    "last_513_fwd": 0.0,
+    "last_513_dscores": 0.47911653,
+    "last_1024_fwd": 0.5,
+    "last_1024_dscores": 0.436365,
+    "last_4096_fwd": 0.5,
+    "last_4096_dscores": 0.13614704
+   },
+   "note": "513/1024/4096 are FIRST-EVER measurements on any arch — the pre-fix loop never reached them. Every forced-defect control on this leg still fires at ~1e5x over bound."
+  },
+  "geglu_f16_fwd_zero_headroom_closed": {
+   "was": "worst delta/bound EXACTLY 1.0 at n_out=1024 on both sm_80 (the a100 artifact) and sm_89 (re-measured here at 5f281d81) — the only bound in either kernels leg sitting on its own worst case.",
+   "root_cause": "`k = 2` was read off guide 3.10's rounding-point COUNT. ROUND 1 (`cuda/geglu_f16.cu:57`, the activation cast) sits UPSTREAM of `:58`'s multiply: the two arms' pre-ROUND-1 activations differ by ~1 f32 ULP (CUDA `erff` vs the CPU reference's `erf`) and can straddle an f16 midpoint — 384 of 1024 elements are within one f32 ULP of one on this fixture — so |Dact| <= 1 ulp(act), a relative 2^-10, which `act*up` carries into `out` as up to 2 ULPs of out, on top of ROUND 2's own <=1. Derived k = 3.",
+   "worst_delta_over_bound_after": {
+    "n_out_32": 0.013020833,
+    "n_out_900": 0.33333334,
+    "n_out_1024": 0.6666667
+   },
+   "note": "Headroom is 1.5x BY CONSTRUCTION at n_out=1024 — a worst-case-derived bound against a near-worst-case sample. Not a kernel defect: `geglu_f16.cu` implements exactly the two-rounding-point regime the table states. The bf16 twin takes the same derived k (identical structure); its observed ratios are 0.0/0.010/0.333."
+  }
+ },
+ "note": "Campaign #446 f16-softmax-dscores unit: fresh per-arch validation for compute_cap 8.9 at THIS unit's tip, superseding the 2026-09-02-446-arch-set-5f281d8-l40s RED artifact whose only red leg was `softmax_parity_f16_row_length_regimes`. Every leg is GREEN and every leg ran at the SAME sha (ac47d6f8), on a first-choice SECURE L40S with no SUPPLY_CONSTRAINT and no fallback. One reproducibility caveat, recorded rather than left implicit: the tree reaches the pod by rsync of a laptop worktree whose Git-LFS payloads are POINTER files, so `crates/jammi-kernels/tests/fixtures/` was re-materialized on the pod from its own LFS-smudged bootstrap clone before leg 2 — legitimate because that path is byte-identical between main and this tip (`git diff --stat main HEAD -- crates/jammi-kernels/tests/fixtures/` is empty), and without it `flash_torch_parity`'s three legs fail with 'npy/npz error magic string mismatch' on the pointer bytes rather than on anything numeric. PROVENANCE: branch sha on fix/446-v049-blocker; the train PR must land as a MERGE COMMIT for this git_sha to become an ancestor of HEAD.",
+ "legs": [
+  {
+   "name": "jammi-encoders flash_arm_padded_matches_block_arm_on_real_rows_cuda (real ModernBERT-large checkpoint, 8 seeds) — the per-arch producer",
+   "command": "JAMMI_REQUIRE_CUDA=1 JAMMI_REQUIRE_FLASH=1 JAMMI_REQUIRE_FLASH_ORACLE=1 JAMMI_FLASH_ORACLE_MODEL_DIR=/root/checkpoints/ModernBERT-large cargo test -p jammi-encoders --lib --features cuda,flash-attn -- --exact modernbert::tests::flash_arm_padded_matches_block_arm_on_real_rows_cuda --nocapture",
+   "status": "ok",
+   "exit": 0,
+   "wall_seconds": 11,
+   "failed": 0,
+   "note": "1 passed; 0 failed; 187 filtered out. Wall is short because the build was already warm from the preceding legs; the measurement itself is 6.09s of test time."
+  },
+  {
+   "name": "jammi-kernels full suite (cuda,flash-attn) — flash + cuda parity incl. the previously-RED f16 oracle",
+   "command": "cargo test -p jammi-kernels --features cuda,flash-attn -- --test-threads=1",
+   "status": "ok",
+   "exit": 0,
+   "wall_seconds": 321,
+   "failed": 0,
+   "note": "cuda_parity: 135 passed; 0 failed; 1 ignored (was 133 passed / 1 failed at 5f281d81). flash_torch_parity: 3 passed. Every other binary green; 456-test lib suite green."
+  },
+  {
+   "name": "jammi-ai gpu_capability capability_surface, STRICT (JAMMI_KERNELS_STRICT=1) — the prove lane's own capability leg, incl. its zero-test guard",
+   "command": "JAMMI_KERNELS_STRICT=1 cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability capability_surface -- --nocapture",
+   "status": "ok",
+   "exit": 0,
+   "wall_seconds": 2,
+   "failed": 0,
+   "note": "2 passed; 24 filtered out — a non-zero test count, so not a false green under runpod_gpu_prove.sh's own guard."
+  },
+  {
+   "name": "jammi-ai gpu_capability generic sweep, capability_surface name-excluded (it requires strict mode, which the fallback-path tests here cannot run under)",
+   "command": "cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability -- --nocapture --test-threads=1 --skip capability_surface",
+   "status": "ok",
+   "exit": 0,
+   "wall_seconds": 167,
+   "failed": 0,
+   "note": "24 passed; 0 failed; 2 filtered out."
+  }
+ ]
+}

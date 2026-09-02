@@ -6,6 +6,24 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+### Removed
+- **The `axpy` fused kernel (`jammi-kernels`), and the compiled-only
+  capability category that held it.** The op had real CUDA kernels and
+  dispatch arms but no `admit()` call site and no admitted parent launching
+  it, so nothing a shipped build could say about it went beyond "it
+  compiled". A pre-registered rule — wire it iff its share reaches 2% of
+  per-step GPU time on some shipped leg *and* one dispatch site covers at
+  least half of that share — measured 0.007% / 0.026% / 0.027% across the
+  three shipped dtype legs of a ModernBERT-large fine-tune, with the only
+  axpy-shaped work coming from a third-party autograd accumulation rather
+  than any jammi call site
+  (`crates/jammi-kernels/artifacts/cuda-runs/2026-09-01-axpy-census-bdeb80c-a100-pcie.json`).
+  `ci/release-feature-manifest.json`'s `fused_kernels_compiled` category
+  went with it: a proof category whose only content is "it compiled" is an
+  empty slot the next unwired kernel gets filed into, so a kernel with no
+  admission site and no admitted parent now has no manifest category at
+  all — it is wired or deleted in the same unit as its authoring.
+
 ## [0.48.0] - 2026-08-30
 
 The eager and fused numeric paths now round the way torch/PEFT/HF round —

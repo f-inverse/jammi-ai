@@ -1,0 +1,197 @@
+{
+ "schema_version": 1,
+ "unit": "446-w3-arch-set-a100-pcie",
+ "git_sha": "5f281d81ba9d68342b94cbd7cbd728a80db7c30d",
+ "date": "2026-09-02T01:50:00Z",
+ "box": "jammi-a100 (NVIDIA A100 80GB PCIe, driver 580.159.04, compute_cap 8.0)",
+ "driver": "580.159.04",
+ "gpu": "NVIDIA A100 80GB PCIe",
+ "features": "cuda,flash-attn",
+ "status": "RED",
+ "env": {
+  "JAMMI_REQUIRE_CUDA": "1",
+  "JAMMI_REQUIRE_FLASH": "1",
+  "JAMMI_REQUIRE_FLASH_ORACLE": "1",
+  "JAMMI_FLASH_ORACLE_MODEL_DIR": "/root/checkpoints/ModernBERT-large",
+  "CUDA_COMPUTE_CAP": "80",
+  "CARGO_TARGET_DIR": "/root/target-w3",
+  "CARGO_BUILD_RUSTC_WRAPPER": "",
+  "CARGO_TERM_COLOR": "never",
+  "CI": "1 (jammi-db legs only)",
+  "JAMMI_KERNELS_STRICT": "1 (capability_surface leg only)",
+  "nvcc": "release 12.6, V12.6.85"
+ },
+ "producer": {
+  "path": "crates/jammi-encoders/src/modernbert.rs",
+  "kind": "cargo-test",
+  "invocation": "JAMMI_REQUIRE_CUDA=1 JAMMI_REQUIRE_FLASH=1 JAMMI_REQUIRE_FLASH_ORACLE=1 JAMMI_FLASH_ORACLE_MODEL_DIR=<checkpoint> cargo test -p jammi-encoders --lib --features cuda,flash-attn -- --exact modernbert::tests::flash_arm_padded_matches_block_arm_on_real_rows_cuda",
+  "gating": "env:JAMMI_REQUIRE_CUDA"
+ },
+ "observed": {
+  "flash_arm_padded_real_row_ratio_per_seed": {
+   "201": 0.12709,
+   "202": 0.10404,
+   "203": 0.15364,
+   "204": 0.14898,
+   "205": 0.11905,
+   "206": 0.10969,
+   "207": 0.11109,
+   "208": 0.28857
+  },
+  "mean": 0.145268,
+  "max": 0.288572,
+  "bound_at_run": 0.5,
+  "note": "BIT-IDENTICAL to the 2026-08-28 m3-arch-set A100-SXM4 artifact's own 8-seed harvest (and to the M1b 6ef586a A100 run) on a DIFFERENT A100 SKU (80GB PCIe, driver 580.159.04, nvcc 12.6) at a tip 44 commits later -- the sm80 regression anchor is stable across box, driver and the campaign #443/#446 flash-surface delta. This is the per-arch producer leg and it is GREEN; the artifact's overall status is RED for an UNRELATED leg (see `note` and the `kernels_cuda*` legs).",
+  "softmax_parity_f16_row_length_regimes_red": {
+   "regime": "last=257 (the multiple-of-256-plus-tail block-reduction regime), rows=2, n=514",
+   "leg": "dscores (softmax backward), element 35",
+   "cpu": -0.0010614395,
+   "cuda": -0.0010671616,
+   "abs_delta": 5.7221e-06,
+   "bound": 1.9073486e-06,
+   "delta_over_bound": 3.0,
+   "bound_derivation": "f16_relative_bound(reference, measured_near_zero_floor_f16(dx_cpu), k=2.0) = 2 f16 ULPs at |ref|; 1 f16 ULP at 1.06e-3 is 2^-20 = 9.5367e-7",
+   "fwd_leg_at_same_regime": "GREEN, worst delta/bound = 0.5 (n=514)",
+   "regimes_proven_before_the_abort": [
+    255,
+    256
+   ],
+   "regimes_never_evaluated_because_the_loop_aborts_at_257": [
+    513,
+    1024,
+    4096
+   ],
+   "reproducibility": "bit-identical panic text over 3 independent runs on this pod (job1 leg kernels_cuda, job2 kernels_cuda_nff, job3 kernels_cuda + kernels_cuda_nff + kernels_cuda_flash*)"
+  },
+  "geglu_f16_fwd_zero_headroom": {
+   "regime": "intermediate=1024, n=1024",
+   "max_abs_delta": 3.0517578e-05,
+   "max_bound": 0.125,
+   "worst_delta_over_bound": 1.0,
+   "note": "GREEN but with EXACTLY zero headroom -- the only bound in either kernels leg whose worst observed ratio is 1.0. Reported as an amber observation, not a failure: a different arch/driver/cuBLAS accumulation order tips this RED with no margin at all. Every other f16/bf16 leg in this run sits at <= 0.5."
+  }
+ },
+ "note": "Campaign #446 wave 3 (W3-A) REAL-DEVICE proof on sm_80 at the fix/446-v049-blocker tip (5f281d81, 44 commits over main), and the fresh per-arch validation evidence the arch-freshness gate (ci/scripts/check_arch_validation_freshness.py) demands for compute_cap 8.0. STATUS IS RED, NOT GREEN: 12 of the 13 recorded legs are green on hardware, but `cuda_parity::softmax_parity_f16_row_length_regimes` -- one of THIS wave's new f16 oracles -- fails deterministically on this arch at the last=257 regime (see observed.softmax_parity_f16_row_length_regimes_red for the verbatim panic values). Because Rule 1 of the freshness gate admits only `status == \"GREEN\"` artifacts as evidence, this file does NOT clear arch 80's Rule-2 staleness and the allowlist's arch-80 waiver row is NOT dead -- recording the failure honestly is the point; a GREEN-with-a-caveat here would be exactly the false per-arch evidence the gate exists to prevent. PROVEN GREEN on this device at this tip: the whole jammi-encoders cuda,flash-attn suite (188 lib + esc076's 2 live tests + 45 padded-oracle tests) including the SerialGpu-serialized esc076_comparable_eager_control binary; the 8-seed modernbert padded-vs-block real-row oracle (producer above, values bit-identical to the sm80 anchor); jammi-ai gpu_capability's generic sweep (23 tests) AND the strict capability_surface leg (JAMMI_KERNELS_STRICT=1, 2 tests -- the manifest cross-check over adamw_step/cast_scale/cast_add/internal_subkernels by (op,parent), the F9 serial slot, and the FIRST EVER execution of the CUDA-only dtype-neutral report keys cast_scale_bf16_f32/cast_add_bf16 under both bf16 and f16); acceleration_report's F1/F2/F3 tri-state + PROBED_OPS + capture-sink tests (12); the served grpc_embedding_gpu proof; and jammi-db's esc-071/072/073 (10) + sqlite_single_process_seam (5) on the Linux libsqlite3.so.0 dlopen path with CI=1. Inside the RED kernels legs themselves, EVERY other test target is green under --no-fail-fast: flash_smoke (16), flash_op_oracles (7), flash_torch_parity (3, bf16), flash_torch_parity_f16 (4), geglu/layer_norm/rope/lora_linear/scaled_cast_add/oracles/stateful_op (58 total), lib (454) -- cuda_parity is the sole failing target, with 133 of its 134 non-ignored tests passing, INCLUDING the rewritten rope f16 saturation/underflow pair, the geglu f16 saturation/underflow pair, the ln f16 pair, softmax_parity_non_power_of_two_last_dim (900) and softmax_parity_long_row_seq_512_class (1024). The axpy-free cuda_parity file (previously syntax-proven only on macOS) COMPILES AND RUNS on a real CUDA toolchain here -- that half of the wave's claim is confirmed. HARNESS NOTE (not a device result): the first two jobs on this pod ran against an rsync-pushed tree whose crates/jammi-kernels/tests/fixtures/flash_reference/*.npy were UNFETCHED git-lfs pointers, which reddened flash_torch_parity (3) and flash_torch_parity_f16 (3) with the suites' own fail-closed 'this is an UNFETCHED git-lfs pointer file' guard -- correct behaviour by those tests. `git lfs pull` + re-push fixed it and both targets are green above; the kernels legs recorded here are the POST-FIX job-3 run. PROVENANCE: branch sha -- the train PR must land as a MERGE COMMIT. Pod: RunPod minmzasovc86gt, session `a100`, tree /root/trees/w3, CARGO_TARGET_DIR /root/target-w3 (seed-clone substrate).",
+ "legs": [
+  {
+   "name": "jammi-kernels cuda parity",
+   "cmd": "cargo test -p jammi-kernels --features cuda -- --nocapture --test-threads=1",
+   "status": "FAILED",
+   "exit": 101,
+   "wall_s": 101,
+   "failed": 1,
+   "failing_tests": [
+    "cuda_parity::softmax_parity_f16_row_length_regimes"
+   ],
+   "note": "cuda_parity: 133 passed, 1 failed, 1 ignored. All other targets in this leg green (see the --no-fail-fast enumeration leg below)."
+  },
+  {
+   "name": "jammi-kernels flash parity (f16 + bf16)",
+   "cmd": "cargo test -p jammi-kernels --features cuda,flash-attn -- --nocapture --test-threads=1",
+   "status": "FAILED",
+   "exit": 101,
+   "wall_s": 152,
+   "failed": 1,
+   "failing_tests": [
+    "cuda_parity::softmax_parity_f16_row_length_regimes"
+   ],
+   "note": "Same single failure; fail-fast stops the leg at cuda_parity, so the flash targets are proven by the enumeration leg below rather than by this one."
+  },
+  {
+   "name": "jammi-kernels cuda, --no-fail-fast enumeration",
+   "cmd": "cargo test -p jammi-kernels --features cuda --no-fail-fast -- --nocapture --test-threads=1",
+   "status": "FAILED",
+   "exit": 101,
+   "wall_s": 149,
+   "failed": 1,
+   "failing_tests": [
+    "cuda_parity::softmax_parity_f16_row_length_regimes"
+   ],
+   "note": "Run so the fail-fast abort above cannot hide a second failure: cuda_parity is the ONLY failing target; 17 other targets green."
+  },
+  {
+   "name": "jammi-kernels cuda,flash-attn, --no-fail-fast enumeration",
+   "cmd": "cargo test -p jammi-kernels --features cuda,flash-attn --no-fail-fast -- --nocapture --test-threads=1",
+   "status": "FAILED",
+   "exit": 101,
+   "wall_s": 293,
+   "failed": 1,
+   "failing_tests": [
+    "cuda_parity::softmax_parity_f16_row_length_regimes"
+   ],
+   "note": "lib 454 ok; cuda_parity 133/1 FAILED; flash_smoke 16 ok; flash_op_oracles 7 ok; flash_torch_parity 3 ok; flash_torch_parity_f16 4 ok; geglu 7; layer_norm 7; lora_linear 12; oracles 11; rope 7; scaled_cast_add 10; scaled_cast_add_peft_rounding 2; stateful_op_discipline 2; empty_non_contiguous 4; feature_table 3; build_rs_unit 0; flash_decisive_timing 1 ignored."
+  },
+  {
+   "name": "jammi-encoders full suite (cuda,flash-attn) incl. esc076_comparable_eager_control",
+   "cmd": "cargo test -p jammi-encoders --features cuda,flash-attn -- --nocapture --test-threads=1",
+   "status": "ok",
+   "exit": 0,
+   "wall_s": 1164,
+   "failed": 0,
+   "note": "lib 188 ok; esc076_comparable_eager_control 2 passed + 1 ignored in ONE binary run under SerialGpu (the ignored one is esc076_variable_shape_unbucketed_reproduces_the_pre_fix_oom, an explicit #[ignore] fix-verifier RED reproduction, not a silent skip); padded-oracle suite 45 ok + 1 ignored. The OOM capability witness fired (CONFIRMED: harness can detect a real CUDA OOM), so the memory legs are non-vacuous."
+  },
+  {
+   "name": "per-arch producer: modernbert flash-arm padded vs block real-row oracle, 8 seeds",
+   "cmd": "JAMMI_REQUIRE_CUDA=1 JAMMI_REQUIRE_FLASH=1 JAMMI_REQUIRE_FLASH_ORACLE=1 JAMMI_FLASH_ORACLE_MODEL_DIR=/root/checkpoints/ModernBERT-large cargo test -p jammi-encoders --lib --features cuda,flash-attn -- --exact modernbert::tests::flash_arm_padded_matches_block_arm_on_real_rows_cuda --nocapture",
+   "status": "ok",
+   "exit": 0,
+   "wall_s": 6,
+   "failed": 0,
+   "note": "1 passed, 187 filtered out (a zero-test match would have been forced to exit non-zero by the harness guard). Ratios in `observed`."
+  },
+  {
+   "name": "jammi-ai gpu_capability generic sweep (prove-script --skip capability_surface rule)",
+   "cmd": "cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability -- --nocapture --test-threads=1 --skip capability_surface",
+   "status": "ok",
+   "exit": 0,
+   "wall_s": 335,
+   "failed": 0,
+   "note": "23 passed, 2 filtered out. Strict mode deliberately NOT set here: capability_surface.rs asserts strict mode itself, so it is name-excluded exactly as ci/scripts/runpod_gpu_prove.sh does, and proven by the strict leg below."
+  },
+  {
+   "name": "jammi-ai capability_surface, STRICT (JAMMI_KERNELS_STRICT=1)",
+   "cmd": "JAMMI_KERNELS_STRICT=1 cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability capability_surface -- --nocapture",
+   "status": "ok",
+   "exit": 0,
+   "wall_s": 2,
+   "failed": 0,
+   "note": "2 passed (capability_surface::capability_surface + capability_surface::manifest_capability_categories_match_probed_ops_by_kind), 23 filtered out -- a zero-test match is forced to fail by the harness guard, mirroring the prove script's own 'running 0 tests' check. On-device proof of the manifest cross-check by (op,parent), the F9 serial slot, and the dtype-neutral report keys under bf16 AND f16 (cast_scale_bf16_f32 / cast_add_bf16 are CUDA-only: this is their first execution)."
+  },
+  {
+   "name": "jammi-ai acceleration_report (F1/F2/F3 tri-state + PROBED_OPS + capture sinks)",
+   "cmd": "cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test it acceleration_report -- --nocapture --test-threads=1",
+   "status": "ok",
+   "exit": 0,
+   "wall_s": 74,
+   "failed": 0,
+   "note": "12 passed, 337 filtered out."
+  },
+  {
+   "name": "served client/server GPU proof (jammi-server grpc_embedding_gpu)",
+   "cmd": "cargo test -p jammi-server --features cuda,live-gpu-tests --test it grpc_embedding_gpu -- --nocapture --test-threads=1",
+   "status": "ok",
+   "exit": 0,
+   "wall_s": 89,
+   "failed": 0,
+   "note": "1 passed (text_embeddings_served_over_the_wire_on_gpu), 134 filtered out. `live-gpu-tests` is REQUIRED here (it is what compiles tests/it/grpc_embedding_gpu.rs) -- the prove lane's own form; --features cuda alone would have matched zero tests."
+  },
+  {
+   "name": "jammi-db esc-071/072/073 (Linux libsqlite3.so.0 dlopen path, CI=1)",
+   "cmd": "CI=1 cargo test -p jammi-db --test it esc_07 -- --nocapture",
+   "status": "ok",
+   "exit": 0,
+   "wall_s": 176,
+   "failed": 0,
+   "note": "10 passed, 246 filtered out. CI=1 makes a missing platform sqlite library a hard FAIL rather than a skip, so the dlopen path is genuinely exercised."
+  },
+  {
+   "name": "jammi-db sqlite_single_process_seam (CI=1)",
+   "cmd": "CI=1 cargo test -p jammi-db --test it sqlite_single_process_seam -- --nocapture",
+   "status": "ok",
+   "exit": 0,
+   "wall_s": 32,
+   "failed": 0,
+   "note": "5 passed, 251 filtered out; the second-process refusal produced the typed locked-catalog error live."
+  }
+ ]
+}

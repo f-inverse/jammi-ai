@@ -170,9 +170,11 @@ def test_embedded_default_config_claims_and_completes_the_same_job(
 
 # A successor process that opens the catalog directory with the DEFAULT config
 # (no `JAMMI_TRAINING__RUN_WORKER` in its environment — the parent strips it),
-# attaches to the queued job by id and waits for it. It drives the low-level
-# `jammi_native` handle for the same reason the close-release oracle does:
-# `jammi.EmbeddedBackend` has no `training_job` attach convenience.
+# attaches to the queued job by id and waits for it. It opens the catalog with
+# `jammi_native.open_local` — the legitimate low-level entry, and the very call
+# whose config resolution this file is about — rather than through the
+# `jammi.EmbeddedBackend` wrapper, which does offer the same `training_job`
+# attach convenience but would only sit between the test and the arm under test.
 _CLAIMING_SUCCESSOR = textwrap.dedent(
     """
     import os

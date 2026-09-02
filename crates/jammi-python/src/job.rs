@@ -198,11 +198,18 @@ impl PyTrainingJob {
     /// before migration 026, or one this code never touched — maps to Python
     /// `None`, an honest absence of information, never silently coerced to
     /// `{}` or read as any particular acceleration state. A present value
-    /// decodes to a dict whose vocabulary the payload's *producer* owns; the
-    /// catalog itself writes only `{"state": "pending"}` at submission time,
-    /// before any claimant has recorded a determination, and the claiming
-    /// worker typically replaces it with `{"state": "determined", ...}` once
-    /// the device/dtype/kernel-admission probe for this attempt has run.
+    /// decodes to a dict whose `"state"` is one of four values: `"pending"` —
+    /// the submission-time marker, meaning the job exists and no claimant has
+    /// computed a determination yet — or one of the three determination
+    /// outcomes `"determined"`, `"not_applicable"`, and `"undetermined"`, the
+    /// last of which always carries a `"reason"` string. `"pending"` is a
+    /// transient marker, not a resting state: a job that reaches a terminal
+    /// status without a determination has its marker retired to
+    /// `"undetermined"` with a reason naming the edge that retired it, and a
+    /// requeued job is reset to `"pending"` for its next attempt — so a read
+    /// can legitimately land on any of the four. Everything beside `"state"`
+    /// is the payload producer's to define; this binding decodes the blob
+    /// as-is and never inspects it.
     ///
     /// Raises `jammi.errors.BackendError` if the column IS present but fails
     /// to parse as JSON — a catalog data-integrity fault, matching

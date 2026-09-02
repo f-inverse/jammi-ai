@@ -788,21 +788,28 @@ class RemoteTrainingJob:
         The remote peer of the embedded `TrainingJob.acceleration_report`:
         parses the `TrainingStatusResponse.acceleration_report_json` field the
         server fills verbatim from the catalog's
-        `training_jobs.acceleration_report` column — computed by the claiming
-        worker at device-resolution time, before the training loop's first
-        step, so a poll mid-training (or after completion) always finds
-        either the submission-time ``{"state": "pending"}`` marker (no
-        claimant has computed a determination yet) or a ``{"state":
-        "determined", ...}`` payload carrying ``dtype``, ``cuda_compiled``,
-        ``flash_compiled``, a per-op ``ops`` map, and a ``flash`` field. Each
-        ``ops``/``flash`` entry is ``{"holds": bool, "reason": str}`` —
+        `training_jobs.acceleration_report` column. Its ``"state"`` is one of
+        four values: ``"pending"`` — the submission-time marker, meaning the
+        job exists and no claimant has computed a determination yet — or one
+        of the three determination outcomes ``"determined"``,
+        ``"not_applicable"``, and ``"undetermined"``, the last of which always
+        carries a ``"reason"`` string. ``"pending"`` is a transient marker,
+        not a resting state: a job that reaches a terminal status without a
+        determination has its marker retired to ``"undetermined"`` with a
+        reason naming the edge that retired it, and a requeued job is reset to
+        ``"pending"`` for its next attempt — so a poll mid-training, or after
+        completion, can legitimately land on any of the four. A
+        ``"determined"`` payload is computed by the claiming worker at
+        device-resolution time, before the training loop's first step, and
+        carries ``dtype``, ``cuda_compiled``, ``flash_compiled``, a per-op
+        ``ops`` map, and a ``flash`` field. Each ``ops``/``flash`` entry is
+        ``{"holds": bool, "reason": str}`` —
         ``holds: true`` means the real fused kernel dispatched for this job's
         own probe forward pass; ``holds: false`` carries the SAME domain-check
         ``reason`` key the kernel's own admission predicate recorded, never a
-        re-derived one. A non-fine-tune job kind or a pre-device-resolution
-        failure may record a different ``"state"`` (``"not_applicable"`` /
-        ``"undetermined"``) — the vocabulary is owned by the producer, not
-        enumerated here.
+        re-derived one. Everything beside ``"state"`` is the payload
+        producer's to define; this client decodes the blob as-is and never
+        inspects it.
 
         Returns ``None`` for a legacy row predating the column (`optional`
         unset on the wire, mirroring SQL `NULL`) — an honest absence of

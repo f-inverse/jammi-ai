@@ -380,10 +380,27 @@ fn count_bound_violations(
     actual: &[f32],
     bound_fn: impl Fn(f32) -> f32,
 ) -> usize {
+    count_bound_violations_indexed(reference, actual, |_, c| bound_fn(c))
+}
+
+/// [`count_bound_violations`]'s index-aware form. A leg whose allowance
+/// depends on THIS element's own operands — not just on the reference
+/// VALUE — needs the index to reach them (see
+/// [`softmax_f16_dscores_propagation_terms`], whose per-element term is
+/// `|dy_i - dot|·|Δy_i| + |Δdot|·|y_i|`). The value-only
+/// [`count_bound_violations`] is this function with the index discarded,
+/// so both forms share one definition of "violation" (including guide
+/// §3.7's non-finite rule).
+fn count_bound_violations_indexed(
+    reference: &[f32],
+    actual: &[f32],
+    bound_fn: impl Fn(usize, f32) -> f32,
+) -> usize {
     reference
         .iter()
         .zip(actual.iter())
-        .filter(|(c, g)| !(g.is_finite() && (**c - **g).abs() <= bound_fn(**c)))
+        .enumerate()
+        .filter(|(i, (c, g))| !(g.is_finite() && (**c - **g).abs() <= bound_fn(*i, **c)))
         .count()
 }
 
@@ -403,12 +420,25 @@ fn assert_relative_bound(
     actual: &[f32],
     bound_fn: impl Fn(f32) -> f32,
 ) -> f32 {
+    assert_relative_bound_indexed(label, reference, actual, |_, c| bound_fn(c))
+}
+
+/// [`assert_relative_bound`]'s index-aware form — see
+/// [`count_bound_violations_indexed`] for why an index-aware allowance
+/// exists at all. Identical reporting (the worst `|Δ|/bound` ratio is
+/// still printed for the pod log).
+fn assert_relative_bound_indexed(
+    label: &str,
+    reference: &[f32],
+    actual: &[f32],
+    bound_fn: impl Fn(usize, f32) -> f32,
+) -> f32 {
     assert_eq!(reference.len(), actual.len(), "{label}: length mismatch");
     let mut max_delta = 0f32;
     let mut max_bound = 0f32;
     let mut worst_ratio = 0f32;
     for (i, (c, g)) in reference.iter().zip(actual.iter()).enumerate() {
-        let bd = bound_fn(*c);
+        let bd = bound_fn(i, *c);
         assert!(
             g.is_finite() && (*c - *g).abs() <= bd,
             "{label}[{i}]: cpu {c} vs cuda {g} (bound {bd:e})"
@@ -440,17 +470,33 @@ fn assert_forced_defect_exceeds_bound(
     defect: &[f32],
     bound_fn: impl Fn(f32) -> f32,
 ) {
+    assert_forced_defect_exceeds_bound_indexed(label, reference, defect, |_, c| bound_fn(c))
+}
+
+/// [`assert_forced_defect_exceeds_bound`]'s index-aware form. The
+/// discriminating half must use the SAME closure the green path used, so
+/// a leg with an index-aware allowance needs an index-aware control too —
+/// otherwise the control would be checked against a DIFFERENT (tighter)
+/// bound than the one that actually admitted the clean run, which is
+/// exactly the vacuous-control shape guide §3.7 forbids.
+fn assert_forced_defect_exceeds_bound_indexed(
+    label: &str,
+    reference: &[f32],
+    defect: &[f32],
+    bound_fn: impl Fn(usize, f32) -> f32,
+) {
     assert_eq!(
         reference.len(),
         defect.len(),
         "{label}: forced-defect length mismatch"
     );
-    let violations = count_bound_violations(reference, defect, &bound_fn);
+    let violations = count_bound_violations_indexed(reference, defect, &bound_fn);
     let worst_ratio = reference
         .iter()
         .zip(defect.iter())
-        .map(|(c, d)| {
-            let bd = bound_fn(*c).max(f32::MIN_POSITIVE);
+        .enumerate()
+        .map(|(i, (c, d))| {
+            let bd = bound_fn(i, *c).max(f32::MIN_POSITIVE);
             if d.is_finite() {
                 (*c - *d).abs() / bd
             } else {
@@ -2128,13 +2174,244 @@ fn assert_softmax_parity_bf16(cuda: &Device, rows: usize, last: usize, sv: &[f32
     assert_forced_defect_exceeds_bound("softmax bf16 dscores", &dx_cpu_v, &dx_defect, dx_bound);
 }
 
+/// The PROPAGATED-INPUT term of the f16 `dscores` allowance — campaign
+/// #446's `softmax_parity_f16_row_length_regimes` RED, root-caused.
+///
+/// `dscores_i = (dy_i - dot)·y_i`, `dot = Σ_j dy_j·y_j`, and the two arms
+/// of this comparison do NOT run the backward on the same `y`: each runs
+/// it on ITS OWN forward output. Those two forward outputs are legitimately
+/// allowed to differ — the forward leg above certifies `|Δy| <= 2` f16
+/// ULPs and, at `last = 257`, an L40S measures `Δy/bound = 0.5` (one f16
+/// ULP at two of the row's 257 positions) because the CUDA forward's f32
+/// row-sum is folded as a 256-way strided partial plus a shared-memory
+/// tree while `softmax_row_f16` folds it sequentially in ascending index
+/// order. That f32 fold difference (≈3e-7 relative) is far below f16's
+/// step, but it pushes `e_i / sum` across an f16 round-to-nearest midpoint
+/// for whichever elements happen to sit within it — an unavoidable,
+/// non-defective 1-ULP quantization flip.
+///
+/// A 1-ULP flip in a LARGE `y_j` is worth `dy_j · ulp16(y_j)` in `dot`
+/// (measured at `last = 257`: `|Δdot| = 1.46e-4`, a hundredfold jump over
+/// the ≈1e-6 the bwd kernel's OWN fold order contributes), and `dscores_i`
+/// is a DIFFERENCE of two same-scale quantities, so a cancelled element
+/// amplifies it without bound (at `last = 257`, `i = 35`: `|dy_i| = 7.83`
+/// against `|dy_i - dot| = 0.0247`, a 317x cancellation, turning `1.46e-4`
+/// into 6 f16 ULPs of the 1.06e-3 result).
+///
+/// This is the SAME failure this file already diagnosed and fixed for its
+/// `f32` legs with [`f32_two_term_bound`] (see that function's doc and the
+/// floor design note above [`measured_near_zero_floor`]: "an OUTPUT/gradient
+/// value orders of magnitude smaller than the operands that computed it —
+/// via ordinary cancellation, not a defect"). The f16 legs never received
+/// it because until campaign #446's finding 7 the only f16 softmax shape in
+/// this file was `last = 8`, where there is no room for a flip to land.
+///
+/// The term below is NOT a widened `k`. It is the exact triangle-inequality
+/// bound on the algebraic identity
+///
+/// ```text
+/// dscores_i^gpu - dscores_i^cpu = (dy_i - dot)·Δy_i - Δdot·(y_i + Δy_i)
+/// ```
+///
+/// evaluated on THIS run's own MEASURED `Δy = y_gpu - y_cpu` (guide §3.2's
+/// measured-not-hardcoded rule). It cannot mask a backward-kernel defect:
+/// `Δy` is the FORWARD's output difference, asserted separately and
+/// independently by the forward leg, and a broken `softmax_bwd_dscores_f16`
+/// changes neither `y_cpu` nor `y_gpu`. `Δdot` is accumulated in `f64` so
+/// the term itself has no fold-order ambiguity of its own.
+///
+/// The backward's OWN `dot` fold order is a separate mechanism and gets its
+/// own separate term — see [`softmax_f16_dscores_dot_fold_terms`]. Keeping
+/// the two apart is what lets this one carry the strong property its
+/// control asserts: it is EXACTLY zero when the two forwards agree bitwise.
+///
+/// Returns one allowance per element of the flattened `[rows, last]` array.
+fn softmax_f16_dscores_propagation_terms(
+    y_cpu: &[f32],
+    y_gpu: &[f32],
+    dy: &[f32],
+    rows: usize,
+    last: usize,
+) -> Vec<f32> {
+    assert_eq!(y_cpu.len(), rows * last);
+    assert_eq!(y_gpu.len(), rows * last);
+    assert_eq!(dy.len(), rows * last);
+    let mut out = vec![0f32; rows * last];
+    for r in 0..rows {
+        let span = r * last..(r + 1) * last;
+        // `dot` as the CPU reference forms it, and `Δdot` as the measured
+        // forward difference propagates into it. Both in f64 so this
+        // allowance is itself fold-order-independent (family J).
+        let dot: f64 = (0..last)
+            .map(|i| dy[span.start + i] as f64 * y_cpu[span.start + i] as f64)
+            .sum();
+        let ddot: f64 = (0..last)
+            .map(|i| {
+                dy[span.start + i] as f64
+                    * (y_gpu[span.start + i] as f64 - y_cpu[span.start + i] as f64)
+            })
+            .sum();
+        for i in span {
+            let dyi = dy[i] as f64;
+            let yi = y_cpu[i] as f64;
+            let dyi_y = (y_gpu[i] as f64 - yi).abs();
+            out[i] = ((dyi - dot).abs() * dyi_y + ddot.abs() * (yi.abs() + dyi_y)) as f32;
+        }
+    }
+    out
+}
+
+/// The `dscores` allowance's fold-order term — the SECOND of the two
+/// mechanisms [`softmax_f16_dscores_propagation_terms`] separates.
+///
+/// `dot = Σ_j dy_j·y_j` is an f32 reduction, and the two arms fold it
+/// differently: `dscores_row_f16` sums sequentially in ascending index
+/// order (its own doc says so — family J), while
+/// `softmax_bwd_dscores_f16` sums a 256-way strided per-thread partial
+/// into a shared-memory tree. Higham Thm 4.2 bounds each arm's departure
+/// from the exact sum by `γ_n · Σ_j |dy_j·y_j|`, so the two arms differ by
+/// at most that (the tree's own depth is far shallower, so charging the
+/// sequential arm's `γ_n` to both is conservative), and that difference
+/// reaches `dscores_i = (dy_i - dot)·y_i` scaled by `|y_i|`.
+///
+/// Why this is not left to the `k = 2` term it was implicitly riding on:
+/// `k` ULPs are ULPs of the RESULT, and `dscores_i` is a cancelled
+/// difference — an element with a large `y_i` and a near-zero
+/// `(dy_i - dot)` gets a large absolute contribution and a tiny ULP
+/// allowance, which is the same shape as the RED this whole change
+/// root-causes. Device evidence that the term is small in practice, not an
+/// excuse for slack: at `last = 512` the forward is bit-identical, so this
+/// is the ONLY active source, and the worst observed `Δ/bound` there is
+/// 0.5 — one f16 ULP.
+///
+/// Depends only on `y_cpu`/`dy`, never on the CUDA arm's output, so it can
+/// no more mask a kernel defect than the propagation term can.
+fn softmax_f16_dscores_dot_fold_terms(
+    y_cpu: &[f32],
+    dy: &[f32],
+    rows: usize,
+    last: usize,
+) -> Vec<f32> {
+    assert_eq!(y_cpu.len(), rows * last);
+    assert_eq!(dy.len(), rows * last);
+    // `u = 2^-24` is f32's unit roundoff; `last <= MAX_LAST_DIM` (4096)
+    // keeps `n·u <= 2.4e-4`, so `γ_n` is within a rounding of `n·u` — the
+    // `(1 - n·u)` denominator is kept because it is the theorem's own
+    // form, not an approximation of it.
+    let nu = last as f64 * 2f64.powi(-24);
+    let gamma = nu / (1.0 - nu);
+    let mut out = vec![0f32; rows * last];
+    for r in 0..rows {
+        let span = r * last..(r + 1) * last;
+        let terms_abs: f64 = span
+            .clone()
+            .map(|i| (dy[i] as f64 * y_cpu[i] as f64).abs())
+            .sum();
+        let ddot_fold = gamma * terms_abs;
+        for i in span {
+            out[i] = (ddot_fold * (y_cpu[i] as f64).abs()) as f32;
+        }
+    }
+    out
+}
+
+/// Non-vacuity control for [`softmax_f16_dscores_propagation_terms`]
+/// (family F). Needs no GPU — it runs on any host that builds this target,
+/// device or not, because it pins the new allowance's OWN behavior against
+/// hand-computed values rather than against a measurement. The term can
+/// therefore never quietly become a blanket widening.
+///
+/// Two independent claims, both of which a "just make the bound bigger"
+/// implementation would fail:
+///
+/// 1. **Inert where it is not needed.** When the two arms' forward outputs
+///    are BIT-IDENTICAL the term is EXACTLY zero at every element, so this
+///    leg's bound is bit-for-bit the `k = 2` bound it has always been.
+///    (That is the case at `last` 255/256/300/512, where the L40S measures
+///    the f16 forward `max|Δ| = 0`.)
+/// 2. **Row-local and correctly sized where it is.** A one-f16-ULP
+///    perturbation of a single element of row 0 produces the exact
+///    triangle-inequality values below at BOTH elements of row 0 and
+///    leaves row 1 at exactly zero — a term that leaked across rows would
+///    hand every row the worst row's allowance.
+#[test]
+fn softmax_f16_dscores_propagation_term_is_inert_without_a_forward_divergence() {
+    let (rows, last) = (2, 2);
+    // A softmax-shaped `y` (positive, each row sums to 1) and a
+    // non-uniform `dy`, chosen so every quantity below is a short exact
+    // binary fraction and the expected terms are computable by hand.
+    let y_cpu = [0.25f32, 0.75, 0.5, 0.5];
+    let dy = [1.0f32, -1.0, 2.0, -2.0];
+
+    let inert = softmax_f16_dscores_propagation_terms(&y_cpu, &y_cpu, &dy, rows, last);
+    assert_eq!(
+        inert,
+        vec![0f32; rows * last],
+        "a bit-identical forward must leave the dscores allowance at exactly the k=2 bound"
+    );
+
+    // One f16 ULP at 0.75 is 2^-1 * 2^-10 = 2^-11.
+    let d = 2f32.powi(-11);
+    let y_gpu = [0.25f32, 0.75 + d, 0.5, 0.5];
+    let active = softmax_f16_dscores_propagation_terms(&y_cpu, &y_gpu, &dy, rows, last);
+    // Row 0: dot = 1*0.25 + (-1)*0.75 = -0.5, Δdot = (-1)*d = -d.
+    //   i=0: |dy0-dot|*0     + |Δdot|*(0.25 + 0) = 0.25*d
+    //   i=1: |dy1-dot|*d     + |Δdot|*(0.75 + d) = 0.5*d + 0.75*d + d^2
+    let expect_0 = 0.25f64 * d as f64;
+    let expect_1 = 0.5f64 * d as f64 + 0.75f64 * d as f64 + (d as f64) * (d as f64);
+    assert_eq!(active[0], expect_0 as f32);
+    assert_eq!(active[1], expect_1 as f32);
+    // Row 1 is untouched by row 0's divergence.
+    assert_eq!(
+        &active[2..4],
+        &[0f32, 0f32],
+        "the propagation term must be row-local — `dot` is a per-row reduction"
+    );
+    // And the active term really is the thing that matters at a cancelled
+    // element: at `i = 1` it dwarfs the k=2 rounding allowance it is added
+    // to (2 f16 ULPs at the row-1 dscores scale), which is exactly why the
+    // pre-#446 single-term bound false-failed.
+    assert!(
+        active[1] > 2.0 * f16_ulp_size_at(0.25),
+        "expected the propagated term ({}) to exceed the k=2 term it supplements",
+        active[1]
+    );
+
+    // The fold-order term is the OTHER mechanism, and it is deliberately
+    // NOT a function of the CUDA arm's output at all — same hand-computed
+    // treatment. Row 0: Σ|dy_j·y_j| = 0.25 + 0.75 = 1; row 1: 0.5 + 0.5 =
+    // 1... times |dy| 2, so 2. γ = 2·2^-24 / (1 - 2·2^-24).
+    let fold = softmax_f16_dscores_dot_fold_terms(&y_cpu, &dy, rows, last);
+    let nu = 2.0f64 * 2f64.powi(-24);
+    let gamma = nu / (1.0 - nu);
+    assert_eq!(fold[0], (gamma * 1.0 * 0.25) as f32);
+    assert_eq!(fold[1], (gamma * 1.0 * 0.75) as f32);
+    assert_eq!(fold[2], (gamma * 2.0 * 0.5) as f32);
+    assert_eq!(fold[3], (gamma * 2.0 * 0.5) as f32);
+    // Non-vacuous the other way too: it is strictly positive (a term that
+    // silently evaluated to zero would leave the mechanism uncovered) and
+    // far SMALLER than the propagation term it sits beside, so it cannot
+    // be what admits a genuinely divergent element.
+    assert!(fold.iter().all(|t| *t > 0.0), "fold terms: {fold:?}");
+    assert!(
+        fold[1] < active[1] / 1000.0,
+        "the f32 fold-order term ({}) must stay orders below the f16 flip term ({})",
+        fold[1],
+        active[1]
+    );
+}
+
 /// [`assert_softmax_parity_bf16`]'s F16 twin (campaign #443 W2b): compares
 /// the SAME op's two device arms (CPU `CpuStorage::F16` vs CUDA
 /// `softmax_f16.cu`). Per the per-op f16 regime table
 /// (`docs/maintainer/cuda-kernel-guide.md` §3.10) this op is
 /// DTYPE-NATIVE at the scale-multiply and mask-add — `k = 2`, mirroring
 /// the bf16 leg's own citation (both devices independently compute
-/// `exp()`/`expf()`), derived from f16's own quantization step.
+/// `exp()`/`expf()`), derived from f16's own quantization step. The
+/// `dscores` leg additionally carries
+/// [`softmax_f16_dscores_propagation_terms`] — see that function for why a
+/// rounding-point count alone is not a parity allowance when the two arms
+/// feed the backward DIFFERENT (each within-bound) forward outputs.
 fn assert_softmax_parity_f16(cuda: &Device, rows: usize, last: usize, sv: &[f32]) {
     let cpu = Device::Cpu;
     let n = rows * last;
@@ -2216,8 +2493,19 @@ fn assert_softmax_parity_f16(cuda: &Device, rows: usize, last: usize, sv: &[f32]
         assert_finite_f16(*h, &format!("softmax f16 dscores[{i}]"));
     }
     let dx_floor = measured_near_zero_floor_f16(&dx_cpu_v);
-    let dx_bound = |r: f32| f16_relative_bound(r, dx_floor, 2.0);
-    assert_relative_bound("softmax f16 dscores", &dx_cpu_v, &dx_gpu_v, dx_bound);
+    // Three additive terms, one per mechanism, none of them a widened `k`:
+    // `k = 2` for this leg's own rounding (each arm's single final cast to
+    // f16, guide §3.10's "dscores bwd is 1"), plus the FORWARD's own
+    // within-bound `Δy` after this op's cancellation amplifies it, plus the
+    // `dot` reduction's fold-order difference between the two arms. See
+    // [`softmax_f16_dscores_propagation_terms`] and
+    // [`softmax_f16_dscores_dot_fold_terms`].
+    let dx_prop =
+        softmax_f16_dscores_propagation_terms(&out_cpu_v, &out_gpu_v, &dy_seed_f, rows, last);
+    let dx_fold = softmax_f16_dscores_dot_fold_terms(&out_cpu_v, &dy_seed_f, rows, last);
+    let dx_bound =
+        |i: usize, r: f32| f16_relative_bound(r, dx_floor, 2.0) + dx_prop[i] + dx_fold[i];
+    assert_relative_bound_indexed("softmax f16 dscores", &dx_cpu_v, &dx_gpu_v, dx_bound);
     let zero_mask_gpu = Tensor::from_slice(&vec![f16::ZERO; last], (1, last), cuda).unwrap();
     let dx_defect: Vec<f32> = {
         let loss_defect = (&softmax(&s_gpu, &zero_mask_gpu).unwrap() * &dy_gpu)
@@ -2234,7 +2522,12 @@ fn assert_softmax_parity_f16(cuda: &Device, rows: usize, last: usize, sv: &[f32]
                 .unwrap(),
         )
     };
-    assert_forced_defect_exceeds_bound("softmax f16 dscores", &dx_cpu_v, &dx_defect, dx_bound);
+    assert_forced_defect_exceeds_bound_indexed(
+        "softmax f16 dscores",
+        &dx_cpu_v,
+        &dx_defect,
+        dx_bound,
+    );
 }
 
 /// Behavioral boundary oracle: `softmax_f16.cu`'s scale-multiply
@@ -2381,6 +2674,21 @@ fn softmax_parity_non_power_of_two_last_dim() {
 /// largest `last` the CUDA domain check admits — the legal side of the
 /// admission boundary). `last = 512` and `last = 300` are deliberately NOT
 /// repeated here; they are covered by the two named tests above.
+///
+/// **What this test found (campaign #446).** At `last = 257` — the FIRST
+/// shape here where a thread accumulates across iterations — the L40S
+/// measures a forward `Δy/bound` of 0.5: the CUDA forward's f32 row sum,
+/// folded as a strided partial plus a shared-memory tree, differs from
+/// `softmax_row_f16`'s sequential ascending fold by ≈3e-7 relative, which
+/// is enough to push `e_i / sum` across an f16 round-to-nearest midpoint
+/// at two of the row's 257 positions. That within-bound 1-ULP forward
+/// divergence is then amplified 317x by the backward's own cancellation
+/// and lands as 6 f16 ULPs of `dscores[35]`. The kernel is NOT at fault
+/// (`softmax_bwd_dscores_f16` keeps every step in f32 through one rounding
+/// point, exactly as §3.10 specifies, and its own block-reduction fold
+/// order is device-measured at <=1 ULP wherever `Δy` is bit-zero); the
+/// pre-#446 `dscores` bound was, for omitting the propagated-input term.
+/// See [`softmax_f16_dscores_propagation_terms`].
 #[test]
 fn softmax_parity_f16_row_length_regimes() {
     let Some(cuda) = cuda_device() else {

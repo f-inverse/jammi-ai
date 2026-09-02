@@ -214,6 +214,36 @@ op has an F16 CPU arm today therefore tracks whether its CPU forward is composed
 dtype-generic ops (it does) or is a monomorphic `_f32` function (it does not) — never the BF16
 matmul gap.
 
+### 3.10.0 A rounding-point COUNT is not a parity tolerance
+
+The `Rounding points` column above answers "how many times does a value cross a 16-bit rounding
+boundary". It does **not** answer "how far apart may two correct arms of this op land", and reading
+it as if it did is what produced campaign #446's `softmax_parity_f16_row_length_regimes` RED. The
+count is only the *local* allowance; a rounding point also **propagates** whenever its result is
+afterwards multiplied, or is consumed by a later step whose own condition number is large. The
+rule, with a live instance in `crates/jammi-kernels/tests/cuda_parity.rs`:
+
+1. **When an op's two arms are fed DIFFERENT (each individually within-bound) inputs, the output
+   allowance must include those inputs' difference times the op's own sensitivity.** A CPU-vs-CUDA
+   *backward* parity leg does exactly this whenever it takes each arm's own forward output as `y`.
+   `softmax`'s `dscores = (dy - Σ dy·y)·y` has one rounding point and is bit-tight given identical
+   `y` — but the CUDA forward's f32 row sum is a strided partial plus a shared-memory tree while
+   `softmax_row_f16` folds sequentially, and although that ≈3e-7 relative difference is far below
+   f16's step it flips `e_i / sum` by one f16 ULP wherever the exact quotient sits within it. A
+   1-ULP flip in a large `y_j` moves `dot` by `dy_j·ulp(y_j)`, and `dscores_i` is a difference of
+   two same-scale quantities, so a cancelled element amplifies it without limit (measured at
+   `last = 257`: 317x, turning `|Δdot| = 1.46e-4` into 6 f16 ULPs of a 1.06e-3 result). The fix is
+   the propagated term, not a bigger `k`: see `softmax_f16_dscores_propagation_terms`, which
+   evaluates the exact triangle-inequality expansion on the run's own measured `Δy`. The identical
+   trap for `f32` legs was already closed by `f32_two_term_bound`; the 16-bit legs simply never met
+   it while their only softmax fixture was `last = 8`.
+
+This is not a kernel defect and it is not a reason to narrow an f16 admission domain:
+`softmax_f16.cu` meets the regime this table states, at every admitted `last`. What it is is a
+reason to derive a 16-bit parity `k` from the rounding STRUCTURE — where each rounding sits
+relative to the op's multiplies and reductions, and whether the two arms are even fed the same
+inputs — rather than from the count.
+
 ### 3.10.1 Dispatch status of the table's non-admitted-looking rows
 
 Having an f16 arm is not the same as being *provable* on a device. Two different proof

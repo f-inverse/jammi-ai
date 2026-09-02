@@ -139,18 +139,44 @@ def _legacy_group_name(title: str) -> str | None:
 _DRIVER_EXIT_LINE_RE = re.compile(r"GPU prove suites exit=")
 
 
+def _canon_group_name(title: str, legacy: bool) -> str | None:
+    """The one place CURRENT and LEGACY modes agree on what counts as a
+    prove-lane group at all -- everything else in a raw job log (the
+    GitHub runner's own step-boundary `##[group]Run actions/checkout@v4`/
+    `##[group]Operating System`/etc. groups, sitting BEFORE this script's
+    own first group) is not a group this producer has any business timing.
+    LEGACY already filtered through `_legacy_group_name`'s prefix map;
+    CURRENT gets the same treatment against the exact `CURRENT_GROUP_NAMES`
+    set instead of accepting any title verbatim (the D5 measurement-scope
+    bug: an unfiltered CURRENT-mode title let the runner's own provisioning
+    groups anchor the window)."""
+    if legacy:
+        return _legacy_group_name(title)
+    return title if title in CURRENT_GROUP_NAMES else None
+
+
 def parse_log(text: str, legacy: bool) -> dict:
     """Returns {groups: [{name, wall_s, rc}], max_silent_gap_s,
     max_silent_gap_after, git_sha (or None), tuples: {(crate,kind): feat},
     prove_exit (or None), box, driver, wall_s}.
 
-    The WALL/silence window is bounded to [first `::group::` open, last of
-    {an `::endgroup::`, a `PROVE_EXIT=` line, a "GPU prove suites exit="
-    driver line}] -- NOT the whole job log, which also carries the GitHub
-    runner's own provisioning/checkout overhead (several minutes) before
-    this script's first `::group::device` line, and a short post-job
-    cleanup tail after the driver's own exit echo. Neither belongs to the
-    prove lane's own wall or silence accounting.
+    The WALL/silence window is bounded to [first CANONICAL `::group::` open
+    (`device`, or the first of the canonical tokens to appear if `device`
+    is absent), last of {a CANONICAL group's own `::endgroup::`, a
+    `PROVE_EXIT=` line, a "GPU prove suites exit=" driver line}] -- NOT the
+    whole job log. A raw job log also carries the GitHub runner's own
+    provisioning/checkout step groups (several minutes) BEFORE this
+    script's first `::group::device` line, and the runner's own post-job
+    cleanup step groups AFTER the driver's own exit echo; a naive "first/
+    last `##[group]`/`##[endgroup]` in the file" anchor silently absorbs
+    both into `wall_s`/`max_silent_gap_s` (the D5 measurement-scope bug --
+    confirmed live: sm_90's reported `max_silent_gap_s` was the pod-
+    provisioning wait, sm_80's reported `wall_s` was the WHOLE job's
+    duration). Neither runner phase belongs to the prove lane's own wall or
+    silence accounting; a non-canonical `##[group]` title occurring OUTSIDE
+    this window is ignored entirely, and one occurring INSIDE it (the
+    driver holds exactly one canonical group open at a time in this range,
+    by construction) is a parse error, not a silently-dropped group.
     """
     events = list(_iter_log_lines(text))
     if not events:
@@ -178,17 +204,20 @@ def parse_log(text: str, legacy: bool) -> dict:
     driver: str | None = None
     first_group_ts: datetime | None = None
     last_boundary_ts: datetime | None = None
+    stray_groups: list[tuple[datetime, str]] = []
 
     for ts, msg in events:
         gm = _GROUP_RE.search(msg)
         if gm:
             title = gm.group("title").strip()
-            name = _legacy_group_name(title) if legacy else title
+            name = _canon_group_name(title, legacy)
             if name is not None:
                 open_groups[name] = ts
                 current_open_name = name
                 if first_group_ts is None:
                     first_group_ts = ts
+            else:
+                stray_groups.append((ts, title))
             continue
         if _ENDGROUP_RE.search(msg):
             if current_open_name and current_open_name in open_groups:
@@ -201,7 +230,14 @@ def parse_log(text: str, legacy: bool) -> dict:
                     }
                 )
                 del open_groups[current_open_name]
-            last_boundary_ts = ts
+                current_open_name = None
+                # Only a CANONICAL group's own close can move the window's
+                # end boundary -- a runner's own post-job cleanup group
+                # (e.g. artifact upload) closing AFTER the driver's last
+                # canonical group has no `current_open_name` to match here,
+                # so it no longer silently drags `last_boundary_ts` (and
+                # therefore `wall_s`) out to the whole job's duration.
+                last_boundary_ts = ts
             continue
         rc_m = _GROUP_RC_RE.search(msg)
         if rc_m:
@@ -233,6 +269,16 @@ def parse_log(text: str, legacy: bool) -> dict:
     if last_boundary_ts is None or last_boundary_ts < first_group_ts:
         last_boundary_ts = events[-1][0]
 
+    in_window_strays = [(t, title) for t, title in stray_groups if first_group_ts <= t <= last_boundary_ts]
+    if in_window_strays:
+        bad_ts, bad_title = in_window_strays[0]
+        raise ValueError(
+            f"non-canonical `##[group]{bad_title}` opened at {bad_ts.isoformat()}, INSIDE the "
+            "measured window (first canonical group open through the last marker) -- the "
+            "driver holds exactly one canonical group open at a time in this range, so an "
+            "interleaved runner/other group here is a parse error, not a silent group"
+        )
+
     max_gap = 0.0
     max_gap_after = None
     prev_ts = None
@@ -249,7 +295,7 @@ def parse_log(text: str, legacy: bool) -> dict:
         gm = _GROUP_RE.search(msg)
         if gm:
             title = gm.group("title").strip()
-            name = _legacy_group_name(title) if legacy else title
+            name = _canon_group_name(title, legacy)
             if name is not None:
                 prev_name = name
 
@@ -451,7 +497,7 @@ _SELF_TEST_GROUP_FOR_TUPLE = [
 ]
 
 
-def _healthy_synth_log() -> str:
+def _healthy_lines() -> list[str]:
     manifest = prove_surface.load_manifest()
     lines = ["##[group]device", "name, compute_cap, driver_version", "NVIDIA A100 80GB PCIe, 8.0, 570.195.03", "CUDA_COMPUTE_CAP=80", "##[endgroup]"]
     lines += ["PROVE_SHA=" + "a" * 40]
@@ -481,7 +527,53 @@ def _healthy_synth_log() -> str:
     lines.append("##[endgroup]")
     lines.append("PROVE_EXIT=0")
     lines.append("=== GPU prove suites exit=0 (raw=0) ===")
-    return _synth_log(lines)
+    return lines
+
+
+def _healthy_synth_log() -> str:
+    return _synth_log(_healthy_lines())
+
+
+def _synth_log_from_offsets(entries: list[tuple[float, str]]) -> str:
+    """Same `<job>\\t<step>\\t<ts> <msg>` shape as `_synth_log`, but each
+    line carries its OWN explicit second-offset from the fixed epoch
+    instead of one-second-per-line -- needed to place a genuine 500+s gap
+    (a real pod-provisioning wait) inside a fixture without inflating every
+    OTHER line's spacing too."""
+    out = []
+    base = datetime(2026, 1, 1, 0, 0, 0)
+    for offset, msg in entries:
+        stamp = (base + timedelta(seconds=offset)).strftime("%Y-%m-%dT%H:%M:%S.0000000Z")
+        out.append(f"{_JOB}\t{_STEP}\t{stamp} {msg}")
+    return "\n".join(out) + "\n"
+
+
+def _healthy_synth_log_with_runner_preamble() -> str:
+    """D5 measurement-scope regression fixture (esc-080..083 followup): a
+    REALISTIC GitHub-runner preamble -- provisioning/checkout step groups,
+    then the driver's own `waiting for SSH`/`SSH up` pair separated by a
+    500+s pod-provisioning wait -- BEFORE this script's own first
+    `::group::device`, exactly the shape a real D5 job log carries. The
+    body after the preamble is byte-identical to `_healthy_lines()`'s own
+    output, so `wall_s`/`max_silent_gap_s`/`groups[]` computed from this
+    log must come out IDENTICAL to `_healthy_synth_log()`'s -- any
+    difference means the preamble leaked into the measured window."""
+    preamble: list[tuple[float, str]] = [
+        (0.0, "##[group]Runner Image Provisioner"),
+        (1.0, "Info: Provisioning is complete."),
+        (2.0, "##[endgroup]"),
+        (3.0, "##[group]Run actions/checkout@v4"),
+        (4.0, "Cloning the repository"),
+        (5.0, "##[endgroup]"),
+        (6.0, "##[group]Run set +e"),
+        (7.0, "deployed uuva3xc7ex3gmr on SECURE / NVIDIA H100 80GB HBM3; waiting for SSH (≤600s)..."),
+        (520.0, "SSH up on uuva3xc7ex3gmr"),
+    ]
+    preamble_end = preamble[-1][0]
+    entries = list(preamble)
+    for i, msg in enumerate(_healthy_lines()):
+        entries.append((preamble_end + 1 + i, msg))
+    return _synth_log_from_offsets(entries)
 
 
 def _cut_synth_log() -> str:
@@ -602,6 +694,52 @@ def _self_test() -> int:
 
     watchdog_artifact = build_artifact(arch="sm_80", run_id="5", job_id="5", log_text=_watchdog_kill_synth_log(), legacy=False)
     check("watchdog-kill-outcome", watchdog_artifact["outcome"] == "watchdog-kill", f"{watchdog_artifact['outcome']}")
+
+    # D5 measurement-scope fix: a runner preamble (provisioning/checkout
+    # groups + a 500+s SSH-wait gap) BEFORE `::group::device` must not move
+    # `wall_s`/`max_silent_gap_s`, and `groups[]` must carry ONLY canonical
+    # names -- never the runner's own step groups.
+    preamble_artifact = build_artifact(
+        arch="sm_80", run_id="6", job_id="6", log_text=_healthy_synth_log_with_runner_preamble(), legacy=False
+    )
+    check(
+        "runner-preamble-wall-s-unchanged",
+        preamble_artifact["wall_s"] == healthy_artifact["wall_s"],
+        f"{preamble_artifact['wall_s']} vs {healthy_artifact['wall_s']}",
+    )
+    check(
+        "runner-preamble-max-silent-gap-unchanged",
+        preamble_artifact["max_silent_gap_s"] == healthy_artifact["max_silent_gap_s"],
+        f"{preamble_artifact['max_silent_gap_s']} vs {healthy_artifact['max_silent_gap_s']}",
+    )
+    preamble_group_names = {g["name"] for g in preamble_artifact["groups"]}
+    check(
+        "runner-preamble-groups-canonical-only",
+        preamble_group_names <= CURRENT_GROUP_NAMES,
+        f"{preamble_group_names}",
+    )
+    check(
+        "runner-preamble-groups-same-as-no-preamble",
+        preamble_group_names == {g["name"] for g in healthy_artifact["groups"]},
+        f"{preamble_group_names} vs {[g['name'] for g in healthy_artifact['groups']]}",
+    )
+
+    # A non-canonical `##[group]` INSIDE the measured window is a parse
+    # error, not a silently-dropped group (BLOCK C follow-up: the driver's
+    # own convention never interleaves a foreign group between canonical
+    # ones, so seeing one there means the log itself is suspect).
+    stray_inside_lines = _healthy_lines()
+    device_close_idx = stray_inside_lines.index("##[endgroup]")
+    stray_inside_lines = (
+        stray_inside_lines[: device_close_idx + 1]
+        + ["##[group]Post job cleanup", "##[endgroup]"]
+        + stray_inside_lines[device_close_idx + 1 :]
+    )
+    try:
+        parse_log(_synth_log(stray_inside_lines), legacy=False)
+        check("stray-group-inside-window-rejected", False, "expected a ValueError")
+    except ValueError as e:
+        check("stray-group-inside-window-rejected", "INSIDE the" in str(e), str(e))
 
     if failures:
         print(f"self-test: FAIL ({len(failures)}/{total} failing): {failures}", file=sys.stderr)

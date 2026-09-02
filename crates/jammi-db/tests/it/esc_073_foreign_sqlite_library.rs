@@ -75,6 +75,27 @@ use jammi_test_utils::child::{Capture, Completeness, DrainedChild, Epoch};
 /// Env var carrying the child's role. Absent ⇒ this process is the parent.
 const ROLE_ENV: &str = "JAMMI_ESC073_ROLE";
 
+/// Env var carrying the exact `--exact` path this process was invoked with,
+/// so [`Role::Grandchild`]'s body can reuse it when spawning its own
+/// grandchild — the parent's `run_child` sets this on every spawn, unused by
+/// every role except `Grandchild`.
+const SELF_EXACT_ENV: &str = "JAMMI_ESC073_SELF_EXACT";
+
+/// The [`ROLE_ENV`] value [`Role::Grandchild`]'s body spawns its OWN child
+/// with — deliberately NOT a [`Role`] variant: the sleeper is never
+/// dispatched through `run_child`/`classify` (nothing in this harness spawns
+/// it directly; only `Role::Grandchild`'s body does), so it must never reach
+/// `Role::parse`'s unknown-text panic. [`dispatch_if_child`] checks for this
+/// exact value and runs [`run_grandchild_sleeper`] BEFORE `Role::parse` ever
+/// sees it. Grandchild's body sets this explicitly on its own spawn — never
+/// inheriting `ROLE_ENV`'s `"grandchild"` value, which would fork-bomb
+/// (each grandchild would spawn its own grandchild, forever).
+const GRANDCHILD_SLEEPER_ROLE_VALUE: &str = "sleeper";
+
+/// [`Role::Grandchild`]'s sentinel line, in one place so [`Terminus`] and the
+/// synthetic body agree by construction.
+const GRANDCHILD_SENTINEL: &str = "[child] GRANDCHILD-DONE";
+
 /// Attempt budget per arm. The row records a historical ~2-in-4 reproduction
 /// rate for the pytest shape; the parent stops at the first reproduction, so a
 /// deterministic mechanism costs one attempt and a rare one still gets 40.
@@ -143,11 +164,20 @@ enum Role {
     /// `[child] phase:` marker AFTER it — the negative control for the
     /// ordering conjunct.
     PostMarker,
+    /// Synthetic: the [`Attempt::Incomplete`] oracle. Prints its sentinel and
+    /// exits 0 immediately, but FIRST spawns its own grandchild (in the
+    /// sleeper sub-mode, never a `Role`) without stdio redirection, so the
+    /// grandchild inherits stderr — the very pipe `DrainedChild` is draining.
+    /// The sleeper sleeps 3 s, well past `wait_bounded`'s ~1 s settle bound,
+    /// so the reader thread never observes EOF within the settle window:
+    /// `Capture::complete` comes back `SettleExpired` even though every byte
+    /// this role itself wrote (including the sentinel) was already read.
+    Grandchild,
 }
 
 impl Role {
     /// Every variant, for the round-trip/totality test.
-    const ALL: [Role; 10] = [
+    const ALL: [Role; 11] = [
         Role::Collide,
         Role::Keeper,
         Role::EngineChurn,
@@ -158,6 +188,7 @@ impl Role {
         Role::Mute,
         Role::Bannerless,
         Role::PostMarker,
+        Role::Grandchild,
     ];
 
     fn as_str(self) -> &'static str {
@@ -172,6 +203,7 @@ impl Role {
             Role::Mute => "mute",
             Role::Bannerless => "bannerless",
             Role::PostMarker => "postmarker",
+            Role::Grandchild => "grandchild",
         }
     }
 
@@ -181,7 +213,10 @@ impl Role {
     /// stale value from an old harness — not a "fall through to the parent"
     /// case. Call sites read the env var first and only call `parse` when it
     /// is present (`.ok().map(|r| Role::parse(&r))`), so an ABSENT env var
-    /// still takes the parent path unchanged.
+    /// still takes the parent path unchanged. The grandchild's own sleeper
+    /// sub-mode is checked (and dispatched) BEFORE this ever runs — see
+    /// [`dispatch_if_child`] — so `GRANDCHILD_SLEEPER_ROLE_VALUE` never
+    /// reaches here and never trips this panic.
     fn parse(s: &str) -> Self {
         match s {
             "collide" => Role::Collide,
@@ -194,11 +229,12 @@ impl Role {
             "mute" => Role::Mute,
             "bannerless" => Role::Bannerless,
             "postmarker" => Role::PostMarker,
+            "grandchild" => Role::Grandchild,
             other => panic!("esc-073 harness: unknown {ROLE_ENV}={other:?}"),
         }
     }
 
-    /// `Some` for the six synthetic roles that branch to [`run_synthetic`]
+    /// `Some` for the seven synthetic roles that branch to [`run_synthetic`]
     /// BEFORE the production prelude runs; `None` for the four production
     /// roles. Total over every variant.
     fn synthetic(self) -> Option<SyntheticKind> {
@@ -209,13 +245,14 @@ impl Role {
             Role::Mute => Some(SyntheticKind::Mute),
             Role::Bannerless => Some(SyntheticKind::Bannerless),
             Role::PostMarker => Some(SyntheticKind::PostMarker),
+            Role::Grandchild => Some(SyntheticKind::Grandchild),
             Role::Collide | Role::Keeper | Role::EngineChurn | Role::StaleRead => None,
         }
     }
 
     /// The terminus [`terminus_satisfied`] checks for this role. Total over
     /// every variant (asserted by
-    /// `role_round_trip_and_totality_covers_all_ten_variants`).
+    /// `role_round_trip_and_totality_covers_all_eleven_variants`).
     fn expected_terminus(self) -> Terminus {
         match self {
             Role::Collide
@@ -231,13 +268,20 @@ impl Role {
             // classified via `Capture::hung` before `terminus_satisfied` is
             // ever consulted. This arm exists only so the function is total.
             Role::Wedge => Terminus::SentinelExact("[child] WEDGE-UNREACHABLE"),
+            // Grandchild's terminus would be satisfiable in isolation (its
+            // sentinel IS present and exit code 0 IS its own), but this
+            // Capture is never scored against it: `classify` gates on
+            // `incompleteness_reason` before `terminus_satisfied` is ever
+            // consulted for a `SettleExpired` capture. This arm exists so the
+            // function is total and so the sentinel text lives in ONE place.
+            Role::Grandchild => Terminus::SentinelExact(GRANDCHILD_SENTINEL),
         }
     }
 }
 
 /// What kind of synthetic body [`run_synthetic`] runs — a narrower type than
-/// [`Role`] so `run_synthetic`'s `match` is total over exactly the six
-/// synthetic shapes, not all ten roles.
+/// [`Role`] so `run_synthetic`'s `match` is total over exactly the seven
+/// synthetic shapes, not all eleven roles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SyntheticKind {
     Flood,
@@ -246,6 +290,7 @@ enum SyntheticKind {
     Mute,
     Bannerless,
     PostMarker,
+    Grandchild,
 }
 
 /// What [`terminus_satisfied`] checks for a role's exit-0 (or, for
@@ -747,6 +792,51 @@ fn run_synthetic(kind: SyntheticKind) -> ! {
             eprintln!("[child] phase: zombie");
             std::process::exit(0);
         }
+        SyntheticKind::Grandchild => {
+            // Spawn the sleeper WITHOUT stdio redirection: it inherits this
+            // process's stderr, the very pipe `DrainedChild` is draining.
+            // `ROLE_ENV` is explicitly OVERRIDDEN to the sleeper sentinel
+            // (never inherited as `"grandchild"` — that would fork-bomb).
+            let exact = std::env::var(SELF_EXACT_ENV).expect(
+                "Role::Grandchild requires SELF_EXACT_ENV, set by run_child on every spawn",
+            );
+            let mut cmd =
+                Command::new(std::env::current_exe().expect("current_exe for grandchild spawn"));
+            cmd.args(["--exact", &exact, "--nocapture", "--test-threads=1"])
+                .env(ROLE_ENV, GRANDCHILD_SLEEPER_ROLE_VALUE);
+            let _sleeper = cmd.spawn().expect("spawn sleeper grandchild");
+            // This role's own sentinel — printed and exited immediately, so
+            // every byte of THIS process's output is already read by the
+            // time it exits. The pipe stays open only because the sleeper
+            // (not this process) still holds it.
+            eprintln!("{GRANDCHILD_SENTINEL}");
+            std::process::exit(0);
+        }
+    }
+}
+
+/// [`GRANDCHILD_SLEEPER_ROLE_VALUE`]'s body: sleeps 3 s — well past
+/// `wait_bounded`'s ~1 s settle bound, so the reader thread reading its
+/// inherited stderr never observes EOF within the settle window — then exits
+/// 0. Self-terminating: nothing leaks across the suite even though nothing
+/// ever waits on this process directly (it is the harness's grandchild, not
+/// its child).
+fn run_grandchild_sleeper() -> ! {
+    std::thread::sleep(Duration::from_secs(3));
+    std::process::exit(0);
+}
+
+/// The dispatch guard: every spawning test's first statement. Checks the
+/// grandchild's own sleeper sentinel BEFORE [`Role::parse`] — the sleeper is
+/// never a [`Role`] (see [`GRANDCHILD_SLEEPER_ROLE_VALUE`]), so it must never
+/// reach `Role::parse`'s unknown-text panic. When [`ROLE_ENV`] is absent,
+/// this is a no-op and the test proceeds as the parent.
+fn dispatch_if_child() {
+    if std::env::var(ROLE_ENV).as_deref() == Ok(GRANDCHILD_SLEEPER_ROLE_VALUE) {
+        run_grandchild_sleeper();
+    }
+    if let Some(role) = std::env::var(ROLE_ENV).ok().map(|r| Role::parse(&r)) {
+        child_main(role);
     }
 }
 
@@ -999,7 +1089,8 @@ fn child_main(role: Role) -> ! {
         | Role::Wedge
         | Role::Mute
         | Role::Bannerless
-        | Role::PostMarker => {
+        | Role::PostMarker
+        | Role::Grandchild => {
             unreachable!(
                 "synthetic roles return via run_synthetic before this match is ever reached"
             )
@@ -1266,11 +1357,16 @@ impl Summary {
 /// child runs, so a chatty-but-healthy child is never mistaken for a hang and
 /// a killed child's progress is never discarded — the esc-078 fix this
 /// harness now consumes). Bounded by `ceiling` from [`Epoch::Spawn`].
+///
+/// [`SELF_EXACT_ENV`] is set unconditionally (`test_name`, the exact `--exact`
+/// path this spawn used) so [`Role::Grandchild`]'s body can reuse it for its
+/// own grandchild spawn; every other role ignores it.
 fn run_child(role: Role, test_name: &str, ceiling: Duration) -> (Attempt, Capture) {
     let exe = std::env::current_exe().expect("current test binary");
     let mut cmd = Command::new(exe);
     cmd.args(["--exact", test_name, "--nocapture", "--test-threads=1"])
-        .env(ROLE_ENV, role.as_str());
+        .env(ROLE_ENV, role.as_str())
+        .env(SELF_EXACT_ENV, test_name);
     let child = DrainedChild::spawn(&mut cmd).expect("spawn child");
     let cap = child.wait_bounded(ceiling, Epoch::Spawn);
     let attempt = classify(&cap, role);
@@ -1469,9 +1565,7 @@ fn drive_with(role: Role, test_name: &str, stop_at_first_failure: bool) -> Summa
 fn foreign_library_write_cycle_never_kills_the_process() {
     let name =
         "esc_073_foreign_sqlite_library::foreign_library_write_cycle_never_kills_the_process";
-    if let Some(role) = std::env::var(ROLE_ENV).ok().map(|r| Role::parse(&r)) {
-        child_main(role);
-    }
+    dispatch_if_child();
     let s = drive(Role::Collide, name);
     assert!(
         s.is_clean(),
@@ -1494,9 +1588,7 @@ fn foreign_library_write_cycle_never_kills_the_process() {
 fn keeper_connection_suppresses_the_close_time_checkpoint() {
     let name =
         "esc_073_foreign_sqlite_library::keeper_connection_suppresses_the_close_time_checkpoint";
-    if let Some(role) = std::env::var(ROLE_ENV).ok().map(|r| Role::parse(&r)) {
-        child_main(role);
-    }
+    dispatch_if_child();
     let s = drive(Role::Keeper, name);
     assert!(
         s.is_clean(),
@@ -1522,9 +1614,7 @@ fn keeper_connection_suppresses_the_close_time_checkpoint() {
 fn engine_pool_churn_under_a_live_foreign_connection_never_kills_the_process() {
     let name = "esc_073_foreign_sqlite_library::\
                 engine_pool_churn_under_a_live_foreign_connection_never_kills_the_process";
-    if let Some(role) = std::env::var(ROLE_ENV).ok().map(|r| Role::parse(&r)) {
-        child_main(role);
-    }
+    dispatch_if_child();
     let s = drive(Role::EngineChurn, name);
     assert!(
         s.is_clean(),
@@ -1566,9 +1656,7 @@ fn engine_pool_churn_under_a_live_foreign_connection_never_kills_the_process() {
 fn the_stale_read_topology_neither_signals_nor_corrupts_the_file() {
     let name = "esc_073_foreign_sqlite_library::\
                 the_stale_read_topology_neither_signals_nor_corrupts_the_file";
-    if let Some(role) = std::env::var(ROLE_ENV).ok().map(|r| Role::parse(&r)) {
-        child_main(role);
-    }
+    dispatch_if_child();
     let s = drive_all(Role::StaleRead, name);
     assert!(
         s.is_signal_free_and_uncorrupted(),
@@ -1587,14 +1675,14 @@ fn the_stale_read_topology_neither_signals_nor_corrupts_the_file() {
 // ── Role machinery + synthetic-role classification (esc-078/esc-079) ───────
 
 /// `Role::parse`/`as_str`/`synthetic`/`expected_terminus` must round-trip and
-/// be total over every one of the ten variants — the four production roles
-/// AND the six synthetic ones.
+/// be total over every one of the eleven variants — the four production
+/// roles AND the seven synthetic ones (including [`Role::Grandchild`]).
 #[test]
-fn role_round_trip_and_totality_covers_all_ten_variants() {
+fn role_round_trip_and_totality_covers_all_eleven_variants() {
     assert_eq!(
         Role::ALL.len(),
-        10,
-        "the enumeration itself must list all ten"
+        11,
+        "the enumeration itself must list all eleven"
     );
     for role in Role::ALL {
         let s = role.as_str();
@@ -1631,9 +1719,7 @@ const GUARD_TEST: &str =
 /// rendered form) — the oracle for this harness's `DrainedChild` consumption.
 #[test]
 fn flood_role_survives_and_retains_every_byte() {
-    if let Some(role) = std::env::var(ROLE_ENV).ok().map(|r| Role::parse(&r)) {
-        child_main(role);
-    }
+    dispatch_if_child();
     let (attempt, cap) = run_child(Role::Flood, GUARD_TEST, Duration::from_secs(30));
     assert!(
         matches!(attempt, Attempt::Survived),
@@ -1655,9 +1741,7 @@ fn flood_role_survives_and_retains_every_byte() {
 /// `Survived`.
 #[test]
 fn quiet_role_survives_with_its_sentinel() {
-    if let Some(role) = std::env::var(ROLE_ENV).ok().map(|r| Role::parse(&r)) {
-        child_main(role);
-    }
+    dispatch_if_child();
     let (attempt, cap) = run_child(Role::Quiet, GUARD_TEST, Duration::from_secs(30));
     assert!(
         matches!(attempt, Attempt::Survived),
@@ -1671,9 +1755,7 @@ fn quiet_role_survives_with_its_sentinel() {
 /// `Terminus::SentinelExact`.
 #[test]
 fn mute_role_is_truncated_for_missing_its_sentinel() {
-    if let Some(role) = std::env::var(ROLE_ENV).ok().map(|r| Role::parse(&r)) {
-        child_main(role);
-    }
+    dispatch_if_child();
     let (attempt, cap) = run_child(Role::Mute, GUARD_TEST, Duration::from_secs(30));
     assert!(
         matches!(attempt, Attempt::Truncated { code: 0 }),
@@ -1687,9 +1769,7 @@ fn mute_role_is_truncated_for_missing_its_sentinel() {
 /// control for the banner conjunct.
 #[test]
 fn bannerless_role_is_truncated_for_missing_the_banner() {
-    if let Some(role) = std::env::var(ROLE_ENV).ok().map(|r| Role::parse(&r)) {
-        child_main(role);
-    }
+    dispatch_if_child();
     let (attempt, cap) = run_child(Role::Bannerless, GUARD_TEST, Duration::from_secs(30));
     assert!(
         matches!(attempt, Attempt::Truncated { code: 0 }),
@@ -1703,9 +1783,7 @@ fn bannerless_role_is_truncated_for_missing_the_banner() {
 /// the negative control for the ordering conjunct.
 #[test]
 fn post_marker_role_is_truncated_for_a_marker_after_the_terminal_line() {
-    if let Some(role) = std::env::var(ROLE_ENV).ok().map(|r| Role::parse(&r)) {
-        child_main(role);
-    }
+    dispatch_if_child();
     let (attempt, cap) = run_child(Role::PostMarker, GUARD_TEST, Duration::from_secs(30));
     assert!(
         matches!(attempt, Attempt::Truncated { code: 0 }),
@@ -1721,9 +1799,7 @@ fn post_marker_role_is_truncated_for_a_marker_after_the_terminal_line() {
 /// sub-ceiling wall-clock assertion: the ceiling itself is the bound.
 #[test]
 fn wedge_role_is_hung_with_its_last_phase_marker() {
-    if let Some(role) = std::env::var(ROLE_ENV).ok().map(|r| Role::parse(&r)) {
-        child_main(role);
-    }
+    dispatch_if_child();
     let ceiling = Duration::from_secs(15);
     let (attempt, cap) = run_child(Role::Wedge, GUARD_TEST, ceiling);
     assert!(
@@ -1742,5 +1818,60 @@ fn wedge_role_is_hung_with_its_last_phase_marker() {
     assert!(
         diagnostic.contains("[child] phase: b"),
         "the formatted panic text must carry the last phase marker: {diagnostic}"
+    );
+}
+
+/// **The `Attempt::Incomplete` oracle.** [`Role::Grandchild`] prints its
+/// sentinel and exits 0 IMMEDIATELY, but a grandchild it spawned (inheriting
+/// stderr) is still asleep when `wait_bounded`'s ~1 s settle bound expires:
+/// `Capture::complete` comes back `SettleExpired`. The mechanism assertion is
+/// that this must NEVER be scored `Survived`, even though by every
+/// content-only measure it looks like a clean pass (exit code 0, sentinel
+/// line present, nothing else wrong) — a content-dependent classification
+/// arm that nothing can ever reach is a no-op waiting to happen (a real
+/// incomplete capture silently scored as its exit code's "clean" class).
+///
+/// No sub-ceiling wall-clock assertion: the 10 s ceiling is comfortably above
+/// both `wait_bounded`'s ~1 s settle bound and the 3 s sleeper, so this test
+/// exercises the settle-expiry path (not the ceiling-kill path) — the
+/// sleeper is never killed, only outlasted; it self-terminates at 3 s
+/// regardless of this test's outcome, so nothing leaks across the suite.
+#[test]
+fn grandchild_capture_is_incomplete_not_survived() {
+    dispatch_if_child();
+    let (attempt, cap) = run_child(Role::Grandchild, GUARD_TEST, Duration::from_secs(10));
+    let reason = match attempt {
+        Attempt::Incomplete(reason) => reason,
+        other => panic!(
+            "expected Incomplete, got {other:?} — a SettleExpired capture must never be scored \
+             Survived even though its exit code and sentinel look clean. Log:\n{}",
+            rendered_log(&cap)
+        ),
+    };
+    assert_eq!(
+        cap.complete,
+        Completeness::SettleExpired,
+        "the mechanism this oracle exercises: the reader thread must not have observed EOF \
+         within the settle bound because the sleeper grandchild still holds the pipe. Log:\n{}",
+        rendered_log(&cap)
+    );
+    assert!(
+        reason.contains("SettleExpired"),
+        "the Incomplete reason must name SettleExpired: {reason}"
+    );
+    assert_eq!(
+        cap.status.and_then(|s| s.code()),
+        Some(0),
+        "Role::Grandchild itself exits 0 — the incompleteness is orthogonal to its exit code"
+    );
+    let diagnostic = incomplete_diagnostic(Role::Grandchild, 1, 1, &reason, &cap);
+    assert!(
+        diagnostic.contains(GRANDCHILD_SENTINEL),
+        "the sentinel's evidence IS retained (only the reader's EOF is late) — the formatted \
+         diagnostic must still carry it: {diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("SettleExpired"),
+        "the formatted diagnostic must carry the reason: {diagnostic}"
     );
 }

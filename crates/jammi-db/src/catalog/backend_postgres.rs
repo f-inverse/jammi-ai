@@ -109,6 +109,15 @@ impl CatalogBackend for PostgresBackend {
         })
     }
 
+    /// Close the pool and wait for every connection to shut down. Postgres
+    /// holds no local file locks, so this is a courtesy to the server's
+    /// connection budget rather than a correctness requirement — but the
+    /// contract is the same one the SQLite backend needs, so the seam is
+    /// uniform.
+    fn close(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move { super::backend::close_pool_and_drain(&self.pool).await })
+    }
+
     fn backend_kind(&self) -> BackendKind {
         BackendKind::Postgres
     }

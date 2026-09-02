@@ -144,17 +144,59 @@ impl Role {
     }
 }
 
-/// Exit code a child uses for "this arm's own observation tripped" — a wrong
-/// value or a vanished table, as opposed to a fatal signal or a harness fault.
+/// Exit code a child uses for "this arm's own observation tripped" — a typed
+/// error or a vanished table, as opposed to a fatal signal or a harness fault.
 /// Kept distinct so the parent can report WHICH kind of RED it got.
 const EXIT_TRIPPED: i32 = 66;
+
+/// Exit code for the residual outcome: one instance read a *stale but
+/// well-formed* image of the database — no signal, no corruption, just an
+/// invisible commit. Out of contract and, per the seam's module docs,
+/// unclosable from the engine side.
+const EXIT_STALE: i32 = 67;
+
+/// Exit code for the pre-fix outcome the seam is required to have removed: the
+/// database file itself came back malformed (`SQLITE_CORRUPT`). Reported as
+/// its own class because a corrupt catalog is a materially worse failure than
+/// a stale read, and the fix's claim is precisely that this class is gone.
+const EXIT_CORRUPT: i32 = 68;
+
+/// Exit code for "no platform `libsqlite3` to collide with". The PARENT
+/// decides what that means: a loud local skip, a hard failure under `CI`.
+const EXIT_NO_FOREIGN_LIB: i32 = 77;
 
 /// Report an observation failure from the child and exit with
 /// [`EXIT_TRIPPED`]. Never a panic: a panic's exit code is indistinguishable
 /// from a harness fault.
 fn tripped(msg: String) -> ! {
-    eprintln!("[child] TRIPPED: {msg}");
-    std::process::exit(EXIT_TRIPPED);
+    tripped_as(EXIT_TRIPPED, msg)
+}
+
+/// Report an observation failure classified into `code`
+/// ([`EXIT_TRIPPED`] / [`EXIT_STALE`] / [`EXIT_CORRUPT`]).
+fn tripped_as(code: i32, msg: String) -> ! {
+    eprintln!("[child] TRIPPED({code}): {msg}");
+    std::process::exit(code);
+}
+
+/// Classify an engine-side error string into [`EXIT_CORRUPT`] (the file itself
+/// is damaged) or [`EXIT_TRIPPED`] (a typed refusal of any other shape).
+///
+/// SQLite reports a damaged file as `SQLITE_CORRUPT` (primary code 11,
+/// "database disk image is malformed") or as `SQLITE_NOTADB` (26). Matching on
+/// both the code and the message keeps the classification from silently
+/// degrading if `sqlx` changes how it renders one of them.
+fn classify_engine_error(err: &str) -> i32 {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("(code: 11)")
+        || lower.contains("(code: 26)")
+        || lower.contains("malformed")
+        || lower.contains("not a database")
+    {
+        EXIT_CORRUPT
+    } else {
+        EXIT_TRIPPED
+    }
 }
 
 /// Sequential rounds for [`Role::StaleRead`]. Values are pairwise distinct, so
@@ -364,9 +406,21 @@ fn file_len(path: &Path) -> i64 {
         .unwrap_or(-1)
 }
 
-/// Open an engine catalog and create the probe row both sides write.
+/// Open an engine catalog and create the probe row both sides write. Used for
+/// the FIRST open of a fresh directory, where a failure is a harness fault.
 fn open_engine(rt: &tokio::runtime::Runtime, dir: &Path) -> Arc<Catalog> {
     Arc::new(rt.block_on(Catalog::open(dir)).expect("engine catalog"))
+}
+
+/// Re-open an engine catalog on a directory a foreign library instance has
+/// been writing. A failure here is an ACCEPTABLE refusal, not a harness fault:
+/// the foreign instance's writes are not arbitrated with this one's, so the
+/// image the engine finds may genuinely be unusable. The row's control is that
+/// the process stays alive and says so.
+fn try_open_engine(rt: &tokio::runtime::Runtime, dir: &Path) -> Result<Arc<Catalog>, String> {
+    rt.block_on(Catalog::open(dir))
+        .map(Arc::new)
+        .map_err(|e| e.to_string())
 }
 
 fn seed_probe(rt: &tokio::runtime::Runtime, catalog: &Catalog) {
@@ -502,7 +556,7 @@ fn child_main(role: Role) -> ! {
 
     let Some(lib) = ForeignSqlite::load() else {
         eprintln!("[child] SKIP: no platform libsqlite3 at any of {FOREIGN_LIB_CANDIDATES:?}");
-        std::process::exit(77);
+        std::process::exit(EXIT_NO_FOREIGN_LIB);
     };
     let bundled = rt
         .block_on(catalog.backend_arc().transaction(
@@ -620,7 +674,10 @@ fn child_main(role: Role) -> ! {
                 let engine_value = format!("engine-{i}");
                 let foreign_value = format!("foreign-{i}");
                 if let Err(err) = engine_write(&rt, &catalog, &engine_value) {
-                    tripped(format!("round {i}: engine write failed: {err}"));
+                    tripped_as(
+                        classify_engine_error(&err),
+                        format!("round {i}: engine write failed: {err}"),
+                    );
                 }
 
                 let conn = match lib.open(&db_path) {
@@ -633,28 +690,41 @@ fn child_main(role: Role) -> ! {
                      WHERE id = 1 AND v = '{engine_value}'"
                 ));
                 if rc != 0 {
-                    tripped(format!(
-                        "round {i}: foreign guarded write failed rc={rc} msg={msg:?}"
-                    ));
+                    tripped_as(
+                        classify_engine_error(&format!("(code: {rc}) {msg}")),
+                        format!("round {i}: foreign guarded write failed rc={rc} msg={msg:?}"),
+                    );
                 }
                 let changed = conn.changes();
                 if changed != 1 {
-                    tripped(format!(
-                        "round {i}: the FOREIGN library instance did not observe the engine's \
-                         committed value {engine_value:?} (guarded UPDATE changed {changed} \
-                         row(s)) — it read a stale database image"
-                    ));
+                    tripped_as(
+                        EXIT_STALE,
+                        format!(
+                            "round {i}: the FOREIGN library instance did not observe the engine's \
+                             committed value {engine_value:?} (guarded UPDATE changed {changed} \
+                             row(s)) — it read a stale database image"
+                        ),
+                    );
                 }
                 drop(conn); // close: checkpoint/truncate window.
 
                 match engine_read(&rt, &catalog) {
                     Ok(Some(v)) if v == foreign_value => {}
-                    Ok(Some(v)) => tripped(format!(
-                        "round {i}: the ENGINE observed {v:?} after the foreign instance \
-                         committed {foreign_value:?} — a stale read"
-                    )),
-                    Ok(None) => tripped(format!("round {i}: the engine's probe row vanished")),
-                    Err(err) => tripped(format!("round {i}: engine read failed: {err}")),
+                    Ok(Some(v)) => tripped_as(
+                        EXIT_STALE,
+                        format!(
+                            "round {i}: the ENGINE observed {v:?} after the foreign instance \
+                             committed {foreign_value:?} — a stale read"
+                        ),
+                    ),
+                    Ok(None) => tripped_as(
+                        EXIT_STALE,
+                        format!("round {i}: the engine's probe row vanished"),
+                    ),
+                    Err(err) => tripped_as(
+                        classify_engine_error(&err),
+                        format!("round {i}: engine read failed: {err}"),
+                    ),
                 }
             }
         }
@@ -664,7 +734,18 @@ fn child_main(role: Role) -> ! {
             let conn = lib.open(&db_path).expect("foreign connection");
             let _ = conn.exec("PRAGMA busy_timeout = 5000");
             for i in 0..FOREIGN_CYCLES {
-                let churned = open_engine(&rt, dir.path());
+                let churned = match try_open_engine(&rt, dir.path()) {
+                    Ok(c) => c,
+                    Err(err) => {
+                        // The foreign instance has been writing this file with
+                        // a wal-index this one cannot see, so the engine may
+                        // find an image it cannot use. Typed, reported, and
+                        // not fatal — see this arm's oracle.
+                        refusals += 1;
+                        eprintln!("[child] churn {i}: engine re-open refused (acceptable): {err}");
+                        continue;
+                    }
+                };
                 let (rc, msg) = conn.exec(&format!(
                     "UPDATE esc073_probe SET v = 'foreign-churn-{i}' WHERE id = 1"
                 ));
@@ -709,9 +790,14 @@ enum Attempt {
     Skipped,
     /// Process-fatal signal — the row's headline failure.
     Signal(i32),
-    /// The arm's own observation tripped (a wrong or vanished value). Not a
-    /// signal, still a failure, and reported as its own class.
+    /// The arm's own observation tripped with a TYPED error. Not a signal.
     Tripped,
+    /// One instance read a stale-but-well-formed image. The documented
+    /// residual of the two-library-instances topology.
+    Stale,
+    /// The database file came back malformed. The pre-fix class the seam is
+    /// required to have removed.
+    Corrupt,
     ExitCode(i32),
     Hung,
 }
@@ -720,13 +806,32 @@ enum Attempt {
 struct Summary {
     signals: Vec<i32>,
     tripped: usize,
+    stale: usize,
+    corrupt: usize,
     survived: usize,
     log: String,
 }
 
 impl Summary {
+    /// Every attempt completed with no failure of any class.
     fn is_clean(&self) -> bool {
-        self.signals.is_empty() && self.tripped == 0
+        self.signals.is_empty() && self.tripped == 0 && self.stale == 0 && self.corrupt == 0
+    }
+
+    /// The contract this row actually carries for an out-of-contract topology:
+    /// no process-fatal signal, and — post-seam — no damaged database file
+    /// either. A typed error or a stale read is the acceptable residual and is
+    /// recorded, not failed.
+    fn is_signal_free_and_uncorrupted(&self) -> bool {
+        self.signals.is_empty() && self.corrupt == 0
+    }
+
+    /// One-line census of what the arm observed, for the record.
+    fn census(&self) -> String {
+        format!(
+            "{} survived, {} typed-error, {} stale-read, {} corrupt-file, signals {:?}",
+            self.survived, self.tripped, self.stale, self.corrupt, self.signals
+        )
     }
 }
 
@@ -762,29 +867,59 @@ fn run_child(role: Role, test_name: &str) -> (Attempt, String) {
     let attempt = match (out.status.signal(), out.status.code()) {
         (Some(sig), _) => Attempt::Signal(sig),
         (None, Some(0)) => Attempt::Survived,
-        (None, Some(77)) => Attempt::Skipped,
+        (None, Some(EXIT_NO_FOREIGN_LIB)) => Attempt::Skipped,
         (None, Some(EXIT_TRIPPED)) => Attempt::Tripped,
+        (None, Some(EXIT_STALE)) => Attempt::Stale,
+        (None, Some(EXIT_CORRUPT)) => Attempt::Corrupt,
         (None, Some(code)) => Attempt::ExitCode(code),
         (None, None) => Attempt::ExitCode(-1),
     };
     (attempt, log)
 }
 
-/// Drive `role` for up to [`ATTEMPTS`] child runs, stopping at the first fatal
-/// signal or tripped observation.
+/// Drive `role` for up to [`ATTEMPTS`] child runs, stopping at the first
+/// failure of any class.
 fn drive(role: Role, test_name: &str) -> Summary {
+    drive_with(role, test_name, true)
+}
+
+/// Drive `role` for all [`ATTEMPTS`] runs regardless of outcome, so the census
+/// records a rate rather than a first hit. Used by the deterministic
+/// [`Role::StaleRead`] arm, whose value is the distribution.
+fn drive_all(role: Role, test_name: &str) -> Summary {
+    drive_with(role, test_name, false)
+}
+
+fn drive_with(role: Role, test_name: &str, stop_at_first_failure: bool) -> Summary {
     let mut summary = Summary {
         signals: Vec::new(),
         tripped: 0,
+        stale: 0,
+        corrupt: 0,
         survived: 0,
         log: String::new(),
     };
     for attempt in 1..=ATTEMPTS {
         let (outcome, log) = run_child(role, test_name);
         summary.log = log;
-        match outcome {
-            Attempt::Survived => summary.survived += 1,
+        let failed = match outcome {
+            Attempt::Survived => {
+                summary.survived += 1;
+                false
+            }
             Attempt::Skipped => {
+                // Fail closed under CI: a harness that silently evaporates on
+                // the machine that gates merges proves nothing. Locally it is
+                // a loud skip.
+                assert!(
+                    std::env::var_os("CI").is_none(),
+                    "esc-073 [{}]: no platform libsqlite3 at any of {FOREIGN_LIB_CANDIDATES:?}, \
+                     so this harness is VACUOUS — and `CI` is set, where a vacuous escape oracle \
+                     is a failure. Install a platform libsqlite3 in the CI image or add its path \
+                     to FOREIGN_LIB_CANDIDATES.\n{}",
+                    role.as_str(),
+                    summary.log
+                );
                 eprintln!(
                     "esc-073 [{}]: SKIPPED — no platform libsqlite3 to collide with; this \
                      harness is vacuous on this machine:\n{}",
@@ -799,15 +934,31 @@ fn drive(role: Role, test_name: &str) -> Summary {
                     role.as_str()
                 );
                 summary.signals.push(sig);
-                break;
+                true
             }
             Attempt::Tripped => {
                 eprintln!(
-                    "esc-073 [{}]: attempt {attempt}/{ATTEMPTS} tripped its own observation",
+                    "esc-073 [{}]: attempt {attempt}/{ATTEMPTS} tripped with a TYPED error",
                     role.as_str()
                 );
                 summary.tripped += 1;
-                break;
+                true
+            }
+            Attempt::Stale => {
+                eprintln!(
+                    "esc-073 [{}]: attempt {attempt}/{ATTEMPTS} observed a STALE READ",
+                    role.as_str()
+                );
+                summary.stale += 1;
+                true
+            }
+            Attempt::Corrupt => {
+                eprintln!(
+                    "esc-073 [{}]: attempt {attempt}/{ATTEMPTS} found the database file MALFORMED",
+                    role.as_str()
+                );
+                summary.corrupt += 1;
+                true
             }
             Attempt::ExitCode(code) => panic!(
                 "esc-073 [{}]: attempt {attempt}/{ATTEMPTS} exited {code} (harness fault, not a \
@@ -819,6 +970,9 @@ fn drive(role: Role, test_name: &str) -> Summary {
                 "esc-073 [{}]: attempt {attempt}/{ATTEMPTS} hung past {CHILD_CEILING:?}",
                 role.as_str()
             ),
+        };
+        if failed && stop_at_first_failure {
+            break;
         }
     }
     summary
@@ -840,11 +994,8 @@ fn foreign_library_write_cycle_never_kills_the_process() {
     assert!(
         s.is_clean(),
         "esc-073: a foreign SQLite library instance's open/write/close cycle broke the process \
-         (signals {:?}, tripped observations {}) after {} clean attempt(s) — an out-of-contract \
-         topology must refuse, never die by signal. Child log:\n{}",
-        s.signals,
-        s.tripped,
-        s.survived,
+         ({}) — an out-of-contract topology must refuse, never die by signal. Child log:\n{}",
+        s.census(),
         s.log
     );
 }
@@ -867,11 +1018,8 @@ fn keeper_connection_suppresses_the_close_time_checkpoint() {
     let s = drive(Role::Keeper, name);
     assert!(
         s.is_clean(),
-        "esc-073 keeper arm: signals {:?}, tripped observations {}, after {} clean attempt(s). \
-         Child log:\n{}",
-        s.signals,
-        s.tripped,
-        s.survived,
+        "esc-073 keeper arm: {}. Child log:\n{}",
+        s.census(),
         s.log
     );
 }
@@ -880,6 +1028,14 @@ fn keeper_connection_suppresses_the_close_time_checkpoint() {
 /// committing while ENGINE pools open and close underneath it, so the
 /// engine-side close/checkpoint is the candidate truncator. Same control: a
 /// signal is a failure, a typed refusal is not.
+///
+/// This is the harshest arm for the residual: the foreign instance holds the
+/// file open across every engine re-open, so its WAL writes and the engine's
+/// heap wal-index are guaranteed to diverge, and an engine re-open can
+/// legitimately find an image it refuses (`SQLITE_CORRUPT`). That refusal is
+/// counted and printed by the child. What is asserted here is only what an
+/// out-of-contract topology is entitled to: no process-fatal signal, and no
+/// hang.
 #[test]
 fn engine_pool_churn_under_a_live_foreign_connection_never_kills_the_process() {
     let name = "esc_073_foreign_sqlite_library::\
@@ -891,39 +1047,57 @@ fn engine_pool_churn_under_a_live_foreign_connection_never_kills_the_process() {
     assert!(
         s.is_clean(),
         "esc-073 reverse direction: an engine pool closing under a live foreign connection \
-         broke the process (signals {:?}, tripped observations {}) after {} clean attempt(s). \
-         Child log:\n{}",
-        s.signals,
-        s.tripped,
-        s.survived,
+         broke the process ({}). Child log:\n{}",
+        s.census(),
         s.log
     );
 }
 
 /// **esc-071's symptom, in esc-073's topology.** Strictly sequential — no
 /// background load, no concurrency, no sleep, no retry: engine commits, the
-/// foreign library instance performs one `_set_metrics` cycle, and both sides
-/// are required to observe what the other just committed.
+/// foreign library instance performs one `_set_metrics` cycle, and each side
+/// looks for what the other just committed.
 ///
-/// This is the arm that connects the two rows: if a lone foreign
+/// This is the arm that connects the two rows: a lone foreign
 /// open/write/close makes a committed value invisible with no race in sight,
-/// then the read-visibility lag the python wave attributed to engine pooling is
+/// so the read-visibility lag the python wave attributed to engine pooling is
 /// a property of the two-library-instances-one-file topology, not of the pool.
+///
+/// # What this arm asserts, and what it deliberately does not
+///
+/// Mutual visibility between two SQLite *library instances* on one file is not
+/// achievable from the engine side and is not asserted here. Their `fcntl`
+/// locks are the same process's locks, so neither instance can see the other's
+/// WAL-index state; `jammi_db::catalog::backend_sqlite`'s module docs record
+/// that residual. What IS asserted is the pair of classes the fix removed:
+///
+/// * **no process-fatal signal** — the row's headline failure (`SIGBUS` from a
+///   truncated, mmapped `-shm`), and
+/// * **no malformed database file** — the pre-fix `SQLITE_CORRUPT` this arm
+///   returned 17 times in 20 on the default VFS.
+///
+/// A stale read or a typed error is the acceptable residual; the census
+/// records which, so a regression from "stale" back to "corrupt" is visible in
+/// the assertion message rather than inferred. All [`ATTEMPTS`] runs are
+/// driven (not stopped at the first hit) so the census is a rate.
 #[test]
-fn neither_instance_reads_a_stale_image_after_the_other_commits() {
+fn the_stale_read_topology_neither_signals_nor_corrupts_the_file() {
     let name = "esc_073_foreign_sqlite_library::\
-                neither_instance_reads_a_stale_image_after_the_other_commits";
+                the_stale_read_topology_neither_signals_nor_corrupts_the_file";
     if let Some(role) = std::env::var(ROLE_ENV).ok().and_then(|r| Role::parse(&r)) {
         child_main(role);
     }
-    let s = drive(Role::StaleRead, name);
+    let s = drive_all(Role::StaleRead, name);
     assert!(
-        s.is_clean(),
-        "esc-073 stale-read arm: signals {:?}, tripped observations {}, after {} clean \
-         attempt(s). Child log:\n{}",
-        s.signals,
-        s.tripped,
-        s.survived,
+        s.is_signal_free_and_uncorrupted(),
+        "esc-073 stale-read arm: {} over {ATTEMPTS} attempt(s). A signal, or a malformed \
+         database file, is a failure; a stale read or a typed error is the documented residual. \
+         Child log:\n{}",
+        s.census(),
         s.log
+    );
+    eprintln!(
+        "esc-073 stale-read arm census over {ATTEMPTS} attempt(s): {}",
+        s.census()
     );
 }

@@ -28,6 +28,7 @@ mod recovery;
 mod register_computed_embedding;
 mod segment;
 mod sources;
+mod sqlite_single_process_seam;
 mod storage_cloud;
 mod store;
 mod tenant_scope;

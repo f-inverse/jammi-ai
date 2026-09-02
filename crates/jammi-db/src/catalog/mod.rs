@@ -71,6 +71,29 @@ impl Catalog {
         Ok(cat)
     }
 
+    /// Shut the catalog down deterministically: close the backend pool and
+    /// wait for every connection to be returned and closed.
+    ///
+    /// **Dropping a `Catalog` is not a release point.** `sqlx` closes a
+    /// returned connection from a background task, so after a plain `drop` the
+    /// pool's connections stay open for an unbounded time — and for the SQLite
+    /// backend those connections hold the process-exclusive file lock and keep
+    /// `catalog.db-wal` alive. Any handoff that depends on the file actually
+    /// being free — seeding a catalog directory and then spawning a second
+    /// process on it, a test asserting the sidecars are gone, an orderly
+    /// server shutdown — must `close().await` and not merely drop.
+    ///
+    /// Consumes the handle, but the backend is shared (`Arc`): sibling handles
+    /// made by [`Catalog::pinned_to_tenant`] or
+    /// [`Catalog::from_backend`] over the same [`BackendImpl`] observe the
+    /// same closed pool and will fail their next query. Closing is idempotent.
+    ///
+    /// Awaiting this waits for outstanding checkouts; a caller holding a live
+    /// transaction elsewhere will wait for it to finish.
+    pub async fn close(self) {
+        self.backend.close().await;
+    }
+
     /// Open a catalog from a pre-built backend. Used by tests and by the
     /// server deployment shape that wires a Postgres backend.
     pub fn from_backend(backend: BackendImpl) -> Self {

@@ -849,6 +849,37 @@ impl JammiSession {
         &self.catalog
     }
 
+    /// Release this session's hold on the catalog file.
+    ///
+    /// Closes the catalog's connection pool and waits for every connection to
+    /// shut down. Takes `&self`, so it works on the `Arc<JammiSession>` shape
+    /// every embedding host holds, and is idempotent.
+    ///
+    /// **Dropping a session is not a release point.** `sqlx` closes returned
+    /// connections from a background task, so after the last handle drops the
+    /// pool's connections — and, for the SQLite backend, the process-exclusive
+    /// file lock and the `catalog.db-wal` sidecar they keep alive — persist for
+    /// an unbounded time. Anything that hands the catalog *directory* to
+    /// another party must await this first:
+    ///
+    /// * a process that seeds a catalog and then spawns a second process on
+    ///   the same directory (the second process is otherwise refused — see
+    ///   [`crate::catalog::backend_sqlite`]);
+    /// * an embedding host (e.g. the Python extension) whose caller then
+    ///   writes the same file through a *different* SQLite library instance.
+    ///   That topology is out of contract in any case, but it is only
+    ///   *harmless* once the engine has actually let go: while the engine holds
+    ///   the file its WAL index lives in heap memory that no other library
+    ///   instance can see, so a foreign connection opened before this returns
+    ///   reads and writes a divergent image of the database.
+    ///
+    /// Awaiting this waits for outstanding checkouts, so a caller holding a
+    /// live transaction on another task will wait for it to finish. Every
+    /// subsequent catalog operation on this session fails.
+    pub async fn close(&self) {
+        self.catalog.backend_arc().close().await;
+    }
+
     /// Shared handle to the storage registry. Components that write
     /// Jammi-owned artifacts (result Parquet, sidecar indexes) consult
     /// this to resolve a [`crate::storage::JammiObjectStore`] for any

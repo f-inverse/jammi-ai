@@ -20,7 +20,7 @@ workspace ships every publishable crate at the same
 - **An explicit catalog release handshake, at every layer.**
   `CatalogBackend::close` (`crates/jammi-db/src/catalog/backend.rs:88`),
   `Catalog::close` (`crates/jammi-db/src/catalog/mod.rs:93`), and
-  `JammiSession::close` (`crates/jammi-db/src/session.rs:879`) close the
+  `JammiSession::close` (`crates/jammi-db/src/session.rs:914`) close the
   catalog connection pool and await the drain. Dropping a handle is not a
   release point: `sqlx` returns pooled connections from a background task,
   so the pool's connections — and, for SQLite, the process-exclusive file

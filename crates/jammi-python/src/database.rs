@@ -127,42 +127,104 @@ impl PyDatabase {
 
 #[pymethods]
 impl PyDatabase {
-    /// Gracefully close this connection.
+    /// Gracefully close this connection and RELEASE the catalog file.
     ///
-    /// Signals the embedded training worker to stop and blocks until it
-    /// actually has (`EmbeddedWorker::stop_and_join` — the GIL is released
-    /// while blocking, so other Python threads keep running). Per that
-    /// method's own documented bound, this returns immediately if the worker
-    /// is idle between claim attempts (at most the configured
-    /// `idle_poll`, 1s by default), or after the remaining duration of a job
-    /// already claimed and running when `close()` is called — an in-flight
-    /// run is never force-cancelled, it always finishes and finalizes before
-    /// this returns.
+    /// Two awaited steps, in this order, with the GIL released across both
+    /// (`py.detach`, so other Python threads keep running):
     ///
-    /// This is a DETERMINISTIC teardown point, not merely a request to stop:
-    /// once `close()` returns, the worker this connection owned has made no
-    /// further catalog writes and never will again, and this connection's own
-    /// clone of the shared session is released. A caller that also holds
-    /// derived handles from this connection (a `TrainingJob`, the `audit`
-    /// handle, an `EphemeralSession`) must drop those too before every engine
-    /// connection this `Database` is responsible for is actually gone — each
-    /// carries its own clone of the same shared session, by design, so it
-    /// keeps working independently of this connection's lifetime. This is the
-    /// primitive a caller needing to do something that races a live
-    /// connection to the same catalog file — e.g. write to it through a
-    /// separate raw connection — reaches for; ordinary usage needs no explicit
-    /// `close()`, since the embedded engine otherwise releases on drop (RAII),
-    /// which is why the higher-level `jammi.EmbeddedBackend.close()` wrapper
-    /// still raises `NotSupportedOnBackend` today.
+    /// 1. **Stop the embedded training worker.** Signals it to stop and blocks
+    ///    until it actually has (`EmbeddedWorker::stop_and_join`). Per that
+    ///    method's own documented bound, this returns immediately if the
+    ///    worker is idle between claim attempts (at most the configured
+    ///    `idle_poll`, 1s by default), or after the remaining duration of a job
+    ///    already claimed and running when `close()` is called — an in-flight
+    ///    run is never force-cancelled, it always finishes and finalizes before
+    ///    this returns.
+    /// 2. **Close the catalog connection pool** — the same release handshake
+    ///    [`jammi_db::session::JammiSession::close`] performs, reached here
+    ///    through this session's shared catalog backend
+    ///    (`Catalog::backend_arc().close()`), so the embedded binding and the
+    ///    native session agree on what "closed" means rather than the binding
+    ///    having a weaker private notion of it. It closes the pool, drains its
+    ///    connection accounting to zero, and waits for SQLite's own evidence of
+    ///    release (`catalog.db-wal` gone).
     ///
-    /// Idempotent — calling `close()` again is a no-op. Every OTHER method on
-    /// this handle raises `jammi.errors.BackendError` once this has run.
+    /// **The order is load-bearing.** The worker is the one component that
+    /// takes new catalog connections on a schedule this call does not control,
+    /// so it is stopped FIRST: after step 1 nothing will check a connection out
+    /// again, and the pool therefore drains monotonically to a bounded release.
+    /// Closing the pool first would leave a live worker acquiring against a
+    /// closing pool — its in-flight run's finalize write would fail with a
+    /// pool-closed error instead of committing, turning an orderly teardown
+    /// into a partial write, and the drain would be racing a party still
+    /// handing connections back. Step 2 runs unconditionally, even when the
+    /// worker's join reports an error (a task panic): a failed teardown is
+    /// exactly when leaving the catalog file locked would be worst, so the
+    /// release is never made conditional on it, and the join error is
+    /// propagated afterwards.
+    ///
+    /// # What "released" buys the caller
+    ///
+    /// The SQLite catalog opens through the `unix-excl` VFS (see
+    /// [`jammi_db::catalog::backend_sqlite`]): a *process-scoped* exclusive
+    /// lock is held while ANY connection in this process has the file open, and
+    /// the WAL index lives in heap memory rather than in a `-shm` file. So
+    /// while this connection's pool is open:
+    ///
+    /// * another OS PROCESS opening the same catalog directory is refused with
+    ///   a typed `jammi.errors.BackendError` naming the single-process
+    ///   contract; and
+    /// * a foreign SQLite LIBRARY INSTANCE inside this same process (CPython's
+    ///   `sqlite3` module alongside this extension's statically bundled
+    ///   amalgamation) sees a *divergent* image of the database — heap memory
+    ///   is not shareable, so reads are stale and writes are invisible to the
+    ///   engine.
+    ///
+    /// Once `close()` returns, both are over: the catalog file is released to
+    /// other processes (a successor process opens the directory immediately,
+    /// without waiting out a busy timeout) and to a foreign in-process SQLite
+    /// instance. A plain drop is NOT that point — `sqlx` returns a connection
+    /// to the pool from a background task, so dropping the handle releases
+    /// nothing at any bounded moment. This is the primitive a caller needing to
+    /// touch the catalog file through a separate raw connection reaches for,
+    /// and the two sanctioned raw-`sqlite3` touch points in this crate's test
+    /// suite depend on exactly it.
+    ///
+    /// # Scope of the release
+    ///
+    /// The pool is SHARED by every handle derived from this connection, by
+    /// design (a `TrainingJob`, the `audit` handle, an `EphemeralSession` each
+    /// carry a clone of the same session). Releasing the file therefore has to
+    /// be, and is, connection-wide: after `close()` those derived handles'
+    /// catalog operations fail too, and the pool is never silently reopened —
+    /// re-taking the exclusive lock behind the caller's back would undo the
+    /// very handover they just asked for. A caller that still needs them must
+    /// finish with them before closing, and open a fresh connection afterwards.
+    ///
+    /// Ordinary usage needs no explicit `close()`: the embedded engine
+    /// otherwise releases on drop (RAII, unbounded but eventual), which is why
+    /// the higher-level `jammi.EmbeddedBackend.close()` wrapper still raises
+    /// `NotSupportedOnBackend` today. The remote arm is unaffected in every
+    /// respect — `jammi.RemoteDatabase.close()` closes a gRPC channel and holds
+    /// no catalog file at all; the file this releases exists only on the
+    /// embedded arm.
+    ///
+    /// Idempotent — calling `close()` again is a no-op that returns `None`,
+    /// never an error. Every OTHER method on this handle raises
+    /// `jammi.errors.BackendError` once this has run.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         if self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return Ok(());
         }
-        py.detach(|| self.runtime.block_on(self._worker.stop_and_join()))
-            .map_err(to_pyerr)
+        py.detach(|| {
+            self.runtime.block_on(async {
+                let stopped = self._worker.stop_and_join().await;
+                let backend = self.session.catalog().backend_arc();
+                backend.close().await;
+                stopped
+            })
+        })
+        .map_err(to_pyerr)
     }
 
     /// Attach to an existing training job by id, on a freshly-opened

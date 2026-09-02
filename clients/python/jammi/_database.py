@@ -2432,7 +2432,19 @@ class RemoteDatabase:
     # --- Lifecycle ---------------------------------------------------------------
 
     def close(self) -> None:
-        """Close the underlying channel. Idempotent."""
+        """Close the underlying channel. Idempotent.
+
+        A TRANSPORT release, and only that: the remote arm holds no catalog
+        file. The server owns the catalog and whatever single-process lock its
+        backend takes, so this frees the gRPC and Flight channels and touches
+        nothing on the local filesystem — unlike the embedded arm, where the
+        native handle's ``close()`` is the catalog-FILE release point (after it
+        returns, another process, or a foreign in-process SQLite instance, may
+        open the artifact directory). The two are deliberately different
+        primitives, which is why ``Capability.CLOSE`` is remote-only and
+        :meth:`EmbeddedBackend.close` raises
+        :class:`~jammi.errors.NotSupportedOnBackend`.
+        """
         if self._flight is not None:
             self._flight.close()
             self._flight = None

@@ -234,6 +234,17 @@ _LIFECYCLE_VERBS = {
 }
 
 
+# The index-segment listing. A result table's ANN index is a SET of immutable
+# segments (one `index_segments` catalog row each); this is the reader for that
+# set. It DOES hit the wire on the remote arm (`CatalogService.
+# ListIndexSegments`) because the catalog lives in the engine. Both arms carry
+# it — it is a verb, never a `Capability`: nothing about a transport makes a
+# segment listing unavailable, so a caller never has to ask whether it exists.
+_SEGMENT_VERBS = {
+    "list_index_segments",
+}
+
+
 def test_remote_surface_has_every_verb():
     """The client's `RemoteDatabase` exposes the full transport-agnostic verb
     set — the same vocabulary the embedded `Database` carries."""
@@ -247,6 +258,7 @@ def test_remote_surface_has_every_verb():
         | _CHANNEL_VERBS
         | _MUTABLE_TOPIC_VERBS
         | _LIFECYCLE_VERBS
+        | _SEGMENT_VERBS
     ):
         assert callable(getattr(jammi.RemoteDatabase, verb)), verb
 
@@ -261,6 +273,54 @@ def test_lifecycle_verbs_have_identical_signatures_across_wheels():
         client = _call_surface(getattr(jammi.RemoteDatabase, verb))
         embed = _call_surface(_embed_method(verb))
         assert client == embed, f"{verb}: {embed} != {client}"
+
+
+def test_segment_verbs_have_identical_signatures_across_wheels():
+    """The index-segment listing carries the SAME call surface on both
+    transports — one positional `table_name`, no transport-shaped extra."""
+    for verb in _SEGMENT_VERBS:
+        client = _call_surface(getattr(jammi.RemoteDatabase, verb))
+        embed = _call_surface(_embed_method(verb))
+        assert client == embed, f"{verb}: {embed} != {client}"
+
+
+# The client-facing segment projection: exactly the keys a `list_index_segments`
+# entry carries on BOTH transports. The embed wheel builds the dict at its FFI
+# boundary from the engine's `IndexSegment`; the remote builds it from the wire
+# `IndexSegment` — so the two agree key-for-key, and neither carries the row's
+# `tenant_id` / `created_at` bookkeeping.
+_INDEX_SEGMENT_DICT_KEYS = {"segment_id", "index_path", "row_count"}
+
+
+def test_index_segment_projection_is_the_whole_row_and_nothing_more():
+    """The wire `IndexSegment` message — the single source of the client-facing
+    segment shape — carries exactly the three projected fields. Pinned against
+    the proto descriptor, so adding a catalog-internal column (`tenant_id`,
+    `created_at`) to the projection reds here.
+
+    Hermetic: reads the generated proto descriptor, never dialing a server."""
+    from jammi._generated.jammi.v1 import catalog_pb2
+
+    proto_fields = {f.name for f in catalog_pb2.IndexSegment.DESCRIPTOR.fields}
+    assert proto_fields == _INDEX_SEGMENT_DICT_KEYS, (
+        f"wire IndexSegment fields {proto_fields} != the client projection "
+        f"{_INDEX_SEGMENT_DICT_KEYS} — a catalog-internal field leaked"
+    )
+
+
+def test_embed_list_index_segments_returns_the_projection_shape(tmp_path):
+    """The embedded `list_index_segments` returns a list (never `None`, never an
+    error) for a table that does not exist — the unknown-table arm of the
+    four-way empty contract — and every entry it ever yields carries exactly the
+    projected keys.
+
+    Hermetic: opens a local engine (`file://`), contacts no server."""
+    db = jammi.connect(f"file://{tmp_path}")
+    try:
+        segments = db.list_index_segments("no_such_table")
+        assert segments == []
+    finally:
+        db.close()
 
 
 # The client-facing model projection: exactly the keys a `list_models` /

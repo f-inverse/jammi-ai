@@ -251,6 +251,16 @@ class EmbeddedBackend:
         """Describe one registered source by id, or ``None`` if not visible."""
         return self._native.describe_source(source_id)
 
+    def list_index_segments(self, table_name: str) -> List[Dict[str, Any]]:
+        """The ANN index segments of one result table, in ``segment_id`` order.
+
+        Each entry carries ``segment_id`` / ``index_path`` / ``row_count``.
+        Empty for a table with no segments, a flat (unsegmented) index, an
+        unknown table, and a table this tenant cannot resolve — the last two by
+        design, so the verb is not an existence oracle.
+        """
+        return self._native.list_index_segments(table_name)
+
     def list_models(self) -> List[Dict[str, Any]]:
         """A record for every model in the current tenant's catalog."""
         return self._native.list_models()

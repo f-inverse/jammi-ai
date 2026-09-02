@@ -169,6 +169,22 @@ def _source_descriptor_to_dict(d: catalog_pb2.SourceDescriptor) -> Dict[str, Any
     }
 
 
+def _index_segment_to_dict(s: catalog_pb2.IndexSegment) -> Dict[str, Any]:
+    """Project a wire `IndexSegment` into the segment dict a caller reads.
+
+    The whole row and nothing else — `segment_id`, `index_path`, `row_count` —
+    the same three keys, spelled the same way, that the embedded
+    `list_index_segments` builds at its FFI boundary. `row_count` rides the wire
+    as a `uint64` and lands as a plain Python `int`, which is unbounded, so the
+    widening the engine does on the send side has no narrowing peer here.
+    """
+    return {
+        "segment_id": s.segment_id,
+        "index_path": s.index_path,
+        "row_count": s.row_count,
+    }
+
+
 def _model_to_dict(m: catalog_pb2.Model) -> Dict[str, Any]:
     """Project a wire `Model` into the model dict a caller reads.
 
@@ -1054,6 +1070,26 @@ class RemoteDatabase:
                 return None
             raise
         return _source_descriptor_to_dict(d)
+
+    def list_index_segments(self, table_name: str) -> List[Dict[str, Any]]:
+        """The ANN index segments of one result table, in ``segment_id`` order.
+
+        Maps to `CatalogService.ListIndexSegments`; same dict shape per entry as
+        the embedded :meth:`jammi.EmbeddedBackend.list_index_segments` —
+        ``segment_id`` / ``index_path`` / ``row_count``, the whole
+        `index_segments` row and nothing re-shaped in between.
+
+        Empty for a table with no segments, a table whose index is flat
+        (unsegmented), an unknown table, and a table this session's tenant
+        cannot resolve. The last two answer identically by design, so the verb
+        is not an existence oracle for a peer tenant's table names — never an
+        error for any of the four.
+        """
+        resp = self._call(
+            self._catalog.ListIndexSegments,
+            catalog_pb2.ListIndexSegmentsRequest(table_name=table_name),
+        )
+        return [_index_segment_to_dict(s) for s in resp.segments]
 
     def list_models(self) -> List[Dict[str, Any]]:
         """A record for every model in the current tenant's catalog.

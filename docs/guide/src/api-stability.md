@@ -35,6 +35,7 @@ verb list:
 | `_NUMERIC_VERBS` | `conformalize`, `conformalize_interval`, `conformalize_cqr`, `rrf_fuse` |
 | `_MUTABLE_TOPIC_VERBS` | `create_mutable_table`, `drop_mutable_table`, `list_mutable_tables`, `register_topic`, `drop_topic`, `list_topics`, `publish_topic`, `subscribe_collect` |
 | `_LIFECYCLE_VERBS` | `list_models`, `describe_model`, `delete_model` |
+| `_SEGMENT_VERBS` | `list_index_segments` |
 | `_SEARCH_VERBS` | `search` (pinned separately for the `embedding_table=` selector) |
 
 The conformance suite is the *enforced annotation*: removing or renaming a verb,

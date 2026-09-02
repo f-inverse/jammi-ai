@@ -454,6 +454,45 @@ impl PyDatabase {
             .transpose()
     }
 
+    /// List the ANN index segments of one result table, ordered by
+    /// `segment_id`. Each entry is a dict carrying exactly `segment_id`
+    /// (`int`), `index_path` (`str`) and `row_count` (`int`) — the whole
+    /// `index_segments` row a reader needs to locate and size a segment, the
+    /// same three fields the remote transport returns. The segment-set peer of
+    /// `list_sources` on a result table's own index; registry introspection,
+    /// not a SQL query (the catalog's own tables are not in the federation
+    /// `sql` runs over).
+    ///
+    /// Returns an EMPTY list — never an error — for a table with no segments,
+    /// a table whose index is flat (unsegmented), an unknown table, and a table
+    /// this session's tenant cannot resolve. The last two answer identically by
+    /// design, so the verb is not an existence oracle for a peer tenant's table
+    /// names; the tenant gate itself is
+    /// [`jammi_db::session::JammiSession::list_index_segments`]'s, reached here
+    /// through the same `Session` abstraction every other verb uses rather than
+    /// through the un-gated catalog read underneath it.
+    ///
+    /// The dict is built field-by-field here rather than serialized from the
+    /// engine struct: the key set a Python caller sees is then stated at the
+    /// boundary, and an engine-side field added later cannot leak into it
+    /// silently.
+    fn list_index_segments(&self, py: Python<'_>, table_name: &str) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
+        let segments = self
+            .runtime
+            .block_on(self.local_session().list_index_segments(table_name))
+            .map_err(to_pyerr)?;
+        let list = PyList::empty(py);
+        for segment in &segments {
+            let entry = PyDict::new(py);
+            entry.set_item("segment_id", segment.segment_id)?;
+            entry.set_item("index_path", &segment.index_path)?;
+            entry.set_item("row_count", segment.row_count)?;
+            list.append(entry)?;
+        }
+        Ok(list.into_any().unbind())
+    }
+
     /// List a descriptor for every model registered to the current tenant. Each
     /// is a dict carrying the model's `model_id`, `backend`, `task`, and
     /// `status` — the same client-facing projection the remote transport

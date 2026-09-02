@@ -60,6 +60,7 @@
 //! reported, not failed.
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::io::Write;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -69,6 +70,7 @@ use std::time::Duration;
 
 use jammi_db::catalog::backend::{SqlValue, TxOptions};
 use jammi_db::catalog::Catalog;
+use jammi_test_utils::child::{render, Capture, DrainedChild, Epoch, DEFAULT_HEAD_CAP};
 
 /// Env var carrying the child's role. Absent ⇒ this process is the parent.
 const ROLE_ENV: &str = "JAMMI_ESC073_ROLE";
@@ -102,7 +104,7 @@ const FOREIGN_LIB_CANDIDATES: &[&str] = &[
 ];
 
 /// What a child does.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Role {
     /// Engine pool live; foreign connections opened, written, and CLOSED in a
     /// loop — the `_set_metrics` shape. This is the arm the row's control
@@ -122,27 +124,143 @@ enum Role {
     /// strictly sequential. Answers whether the two-library topology alone
     /// (not pooling, not races) is what makes a committed value invisible.
     StaleRead,
+    /// Synthetic (esc-078/esc-079 harness-drain oracle): writes a 4 MiB flood
+    /// to stderr past any undrained pipe's capacity, then its sentinel, and
+    /// exits 0. The `DrainedChild`-consumption oracle for `Terminus::Sentinel`.
+    Flood,
+    /// Synthetic: exits 0 with a single sentinel line and no other output.
+    Quiet,
+    /// Synthetic: prints two phase markers then loops forever — never exits
+    /// on its own, so the harness must classify it via `Capture::hung`.
+    Wedge,
+    /// Synthetic: exits 0 but never prints its own sentinel — the negative
+    /// control for `Terminus::SentinelExact`.
+    Mute,
+    /// Synthetic: prints an `EngineArm`-shaped terminal line but never the
+    /// banner substring — the negative control for the banner conjunct.
+    Bannerless,
+    /// Synthetic: prints the banner, then the terminal line, then a
+    /// `[child] phase:` marker AFTER it — the negative control for the
+    /// ordering conjunct.
+    PostMarker,
 }
 
 impl Role {
+    /// Every variant, for the round-trip/totality test.
+    const ALL: [Role; 10] = [
+        Role::Collide,
+        Role::Keeper,
+        Role::EngineChurn,
+        Role::StaleRead,
+        Role::Flood,
+        Role::Quiet,
+        Role::Wedge,
+        Role::Mute,
+        Role::Bannerless,
+        Role::PostMarker,
+    ];
+
     fn as_str(self) -> &'static str {
         match self {
             Role::Collide => "collide",
             Role::Keeper => "keeper",
             Role::EngineChurn => "engine-churn",
             Role::StaleRead => "stale-read",
+            Role::Flood => "flood",
+            Role::Quiet => "quiet",
+            Role::Wedge => "wedge",
+            Role::Mute => "mute",
+            Role::Bannerless => "bannerless",
+            Role::PostMarker => "postmarker",
         }
     }
 
-    fn parse(s: &str) -> Option<Self> {
+    /// Parses a role env value, panicking on anything unrecognized (the
+    /// seam's own `dispatch_child` sets this precedent, `:420-433`): an
+    /// unknown role text is a harness bug — a typo in a role literal, or a
+    /// stale value from an old harness — not a "fall through to the parent"
+    /// case. Call sites read the env var first and only call `parse` when it
+    /// is present (`.ok().map(|r| Role::parse(&r))`), so an ABSENT env var
+    /// still takes the parent path unchanged.
+    fn parse(s: &str) -> Self {
         match s {
-            "collide" => Some(Role::Collide),
-            "keeper" => Some(Role::Keeper),
-            "engine-churn" => Some(Role::EngineChurn),
-            "stale-read" => Some(Role::StaleRead),
-            _ => None,
+            "collide" => Role::Collide,
+            "keeper" => Role::Keeper,
+            "engine-churn" => Role::EngineChurn,
+            "stale-read" => Role::StaleRead,
+            "flood" => Role::Flood,
+            "quiet" => Role::Quiet,
+            "wedge" => Role::Wedge,
+            "mute" => Role::Mute,
+            "bannerless" => Role::Bannerless,
+            "postmarker" => Role::PostMarker,
+            other => panic!("esc-073 harness: unknown {ROLE_ENV}={other:?}"),
         }
     }
+
+    /// `Some` for the six synthetic roles that branch to [`run_synthetic`]
+    /// BEFORE the production prelude runs; `None` for the four production
+    /// roles. Total over every variant.
+    fn synthetic(self) -> Option<SyntheticKind> {
+        match self {
+            Role::Flood => Some(SyntheticKind::Flood),
+            Role::Quiet => Some(SyntheticKind::Quiet),
+            Role::Wedge => Some(SyntheticKind::Wedge),
+            Role::Mute => Some(SyntheticKind::Mute),
+            Role::Bannerless => Some(SyntheticKind::Bannerless),
+            Role::PostMarker => Some(SyntheticKind::PostMarker),
+            Role::Collide | Role::Keeper | Role::EngineChurn | Role::StaleRead => None,
+        }
+    }
+
+    /// The terminus [`terminus_satisfied`] checks for this role. Total over
+    /// every variant (asserted by
+    /// `role_round_trip_and_totality_covers_all_ten_variants`).
+    fn expected_terminus(self) -> Terminus {
+        match self {
+            Role::Collide
+            | Role::Keeper
+            | Role::EngineChurn
+            | Role::StaleRead
+            | Role::Bannerless
+            | Role::PostMarker => Terminus::EngineArm,
+            Role::Flood => Terminus::SentinelPrefix("[child] FLOOD-DONE bytes="),
+            Role::Quiet => Terminus::SentinelExact("[child] QUIET-DONE"),
+            Role::Mute => Terminus::SentinelExact("[child] MUTE-DONE"),
+            // Wedge never reaches a terminus on its own: it is always
+            // classified via `Capture::hung` before `terminus_satisfied` is
+            // ever consulted. This arm exists only so the function is total.
+            Role::Wedge => Terminus::SentinelExact("[child] WEDGE-UNREACHABLE"),
+        }
+    }
+}
+
+/// What kind of synthetic body [`run_synthetic`] runs — a narrower type than
+/// [`Role`] so `run_synthetic`'s `match` is total over exactly the six
+/// synthetic shapes, not all ten roles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyntheticKind {
+    Flood,
+    Quiet,
+    Wedge,
+    Mute,
+    Bannerless,
+    PostMarker,
+}
+
+/// What [`terminus_satisfied`] checks for a role's exit-0 (or, for
+/// [`Role::Wedge`], unreachable) terminus.
+#[derive(Debug, Clone, Copy)]
+enum Terminus {
+    /// The four production roles' terminal line:
+    /// `[child role=<r>] survived: …`, with no `[child] phase:` line after
+    /// it and the banner substring present somewhere in stderr.
+    EngineArm,
+    /// The last non-empty stderr line must equal this exactly.
+    SentinelExact(&'static str),
+    /// The last non-empty stderr line must start with this prefix (Flood's
+    /// sentinel encodes a byte count, so it cannot be matched exactly).
+    SentinelPrefix(&'static str),
 }
 
 /// Exit code a child uses for "this arm's own observation tripped" — a typed
@@ -486,6 +604,19 @@ fn engine_read(rt: &tokio::runtime::Runtime, catalog: &Catalog) -> Result<Option
     .map_err(|e| e.to_string())
 }
 
+/// One engine-side load task's join-time attribution: an iteration counter
+/// bumped after every completed transaction, and an in-flight flag set
+/// immediately before `backend.transaction(...)` and cleared after it
+/// returns. The main thread reads both, right before joining the task, to
+/// name a stall inside a synchronous foreign C call without the load task
+/// itself printing anything (see the "Phase markers" section of the W2
+/// design: load tasks emit NO new lines).
+struct LoadTaskHandle {
+    join: tokio::task::JoinHandle<()>,
+    iterations: Arc<AtomicU64>,
+    in_flight: Arc<AtomicBool>,
+}
+
 /// Engine-side load: read-then-write transactions in a tight loop, which keeps
 /// this instance's WAL index (`-shm`) mapped and actively touched.
 fn spawn_engine_load(
@@ -493,17 +624,22 @@ fn spawn_engine_load(
     catalog: &Arc<Catalog>,
     stop: &Arc<AtomicBool>,
     errors: &Arc<AtomicU64>,
-) -> Vec<tokio::task::JoinHandle<()>> {
+) -> Vec<LoadTaskHandle> {
     (0..ENGINE_LOAD_TASKS)
         .map(|n| {
             let catalog = Arc::clone(catalog);
             let stop = Arc::clone(stop);
             let errors = Arc::clone(errors);
-            rt.spawn(async move {
+            let iterations = Arc::new(AtomicU64::new(0));
+            let in_flight = Arc::new(AtomicBool::new(false));
+            let iterations_task = Arc::clone(&iterations);
+            let in_flight_task = Arc::clone(&in_flight);
+            let join = rt.spawn(async move {
                 let mut i: i64 = 0;
                 while !stop.load(Ordering::Relaxed) {
                     let backend = catalog.backend_arc();
                     let value = format!("engine-{n}-{i}");
+                    in_flight_task.store(true, Ordering::Relaxed);
                     let res = backend
                         .transaction(TxOptions::default(), move |tx| {
                             Box::pin(async move {
@@ -523,6 +659,8 @@ fn spawn_engine_load(
                             })
                         })
                         .await;
+                    in_flight_task.store(false, Ordering::Relaxed);
+                    iterations_task.fetch_add(1, Ordering::Relaxed);
                     if let Err(err) = res {
                         // An error is the ACCEPTABLE refusal shape for this
                         // out-of-contract topology — counted and reported, not
@@ -533,14 +671,95 @@ fn spawn_engine_load(
                     i += 1;
                     tokio::task::yield_now().await;
                 }
-            })
+            });
+            LoadTaskHandle {
+                join,
+                iterations,
+                in_flight,
+            }
         })
         .collect()
+}
+
+// ── Synthetic roles (esc-078/esc-079 harness-drain oracle) ──────────────────
+
+/// One 64-byte flood line: `[child] flood <012-digit n>` right-padded with
+/// spaces to 63 bytes, plus a trailing newline. Mirrors
+/// `jammi_test_utils::child`'s own flood-line shape (round 5 of the plan) so
+/// this harness's flood body is independently reproducible from its spec.
+fn synthetic_flood_line(n: u32) -> [u8; 64] {
+    let mut line = [b' '; 64];
+    let text = format!("[child] flood {n:012}");
+    line[..text.len()].copy_from_slice(text.as_bytes());
+    line[63] = b'\n';
+    line
+}
+
+/// [`Role::Flood`]'s body: exactly 4 MiB (65536 fixed-width lines) to stderr,
+/// then its sentinel, then exit 0. Its stderr is far past any undrained
+/// pipe's ~64 KiB capacity — the oracle for `DrainedChild` consumption in this
+/// harness.
+fn synthetic_flood() -> ! {
+    const LINES: u32 = 65536; // 65536 * 64 = 4_194_304 bytes = 4 MiB
+    let mut out = std::io::stderr();
+    for n in 0..LINES {
+        out.write_all(&synthetic_flood_line(n))
+            .expect("write flood line");
+    }
+    out.write_all(format!("[child] FLOOD-DONE bytes={}\n", LINES as u64 * 64).as_bytes())
+        .expect("write flood sentinel");
+    out.flush().expect("flush flood stderr");
+    std::process::exit(0);
+}
+
+/// Dispatches a synthetic role's body. Never returns.
+fn run_synthetic(kind: SyntheticKind) -> ! {
+    match kind {
+        SyntheticKind::Flood => synthetic_flood(),
+        SyntheticKind::Quiet => {
+            eprintln!("[child] QUIET-DONE");
+            std::process::exit(0);
+        }
+        SyntheticKind::Wedge => {
+            eprintln!("[child] phase: a");
+            eprintln!("[child] phase: b");
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+        SyntheticKind::Mute => {
+            // Deliberately NOT its sentinel ("[child] MUTE-DONE") — the
+            // negative control for `Terminus::SentinelExact`.
+            eprintln!("[child] mute");
+            std::process::exit(0);
+        }
+        SyntheticKind::Bannerless => {
+            // An EngineArm-shaped terminal line with NO banner substring —
+            // the negative control for the banner conjunct.
+            eprintln!("[child role=bannerless] survived: 0 refusal(s), 0 engine error(s)");
+            std::process::exit(0);
+        }
+        SyntheticKind::PostMarker => {
+            // The banner AND the terminal line, but a `[child] phase:` marker
+            // AFTER it — the negative control for the ordering conjunct.
+            eprintln!("[child role=postmarker] bundled(sqlx, static)=synthetic");
+            eprintln!("[child role=postmarker] survived: 0 refusal(s), 0 engine error(s)");
+            eprintln!("[child] phase: zombie");
+            std::process::exit(0);
+        }
+    }
 }
 
 /// The child body. Never returns — always `exit`s, so a clean run is
 /// distinguishable from a signal by wait status alone.
 fn child_main(role: Role) -> ! {
+    // Synthetic roles branch BEFORE the production prelude: they exist only
+    // to exercise `run_child`'s per-role terminus and the `DrainedChild`
+    // consumption, not the foreign-SQLite mechanism.
+    if let Some(kind) = role.synthetic() {
+        run_synthetic(kind);
+    }
+
     let dir = tempfile::tempdir().expect("child tempdir");
     let db_path: PathBuf = dir.path().join("catalog.db");
     let shm = dir.path().join("catalog.db-shm");
@@ -634,7 +853,9 @@ fn child_main(role: Role) -> ! {
                 None
             };
 
+            eprintln!("[child] phase: foreign-loop start");
             for i in 0..FOREIGN_CYCLES {
+                eprintln!("[child] phase: cycle {i}");
                 let conn = match lib.open(&db_path) {
                     Ok(c) => c,
                     Err(rc) => {
@@ -735,6 +956,7 @@ fn child_main(role: Role) -> ! {
             let conn = lib.open(&db_path).expect("foreign connection");
             let _ = conn.exec("PRAGMA busy_timeout = 5000");
             for i in 0..FOREIGN_CYCLES {
+                eprintln!("[child] phase: churn {i} open");
                 let churned = match try_open_engine(&rt, dir.path()) {
                     Ok(c) => c,
                     Err(err) => {
@@ -747,6 +969,7 @@ fn child_main(role: Role) -> ! {
                         continue;
                     }
                 };
+                eprintln!("[child] phase: churn {i} write");
                 let (rc, msg) = conn.exec(&format!(
                     "UPDATE esc073_probe SET v = 'foreign-churn-{i}' WHERE id = 1"
                 ));
@@ -755,6 +978,7 @@ fn child_main(role: Role) -> ! {
                     eprintln!("[child] foreign write refused rc={rc} msg={msg:?} (acceptable)");
                 }
                 let before = (file_len(&shm), file_len(&wal));
+                eprintln!("[child] phase: churn {i} drop");
                 drop(churned); // ← engine-side close/checkpoint.
                 let after = (file_len(&shm), file_len(&wal));
                 if before != after {
@@ -762,6 +986,7 @@ fn child_main(role: Role) -> ! {
                         "[child] churn {i}: engine close changed (shm,wal) {before:?} -> {after:?}"
                     );
                 }
+                eprintln!("[child] phase: churn {i} read");
                 let (rc, msg) = conn.exec("SELECT count(*) FROM esc073_probe");
                 if rc != 0 {
                     refusals += 1;
@@ -769,12 +994,40 @@ fn child_main(role: Role) -> ! {
                 }
             }
         }
+        Role::Flood
+        | Role::Quiet
+        | Role::Wedge
+        | Role::Mute
+        | Role::Bannerless
+        | Role::PostMarker => {
+            unreachable!(
+                "synthetic roles return via run_synthetic before this match is ever reached"
+            )
+        }
     }
 
     stop.store(true, Ordering::Relaxed);
-    for h in load {
-        let _ = rt.block_on(h);
+    eprintln!("[child] phase: stop-set");
+    for (n, task) in load.into_iter().enumerate() {
+        // Read the atomics BEFORE joining: a stall inside a synchronous
+        // foreign C call under `backend.transaction(...)` shows up here as
+        // `in_flight=true` with `iter` frozen, without the load task itself
+        // ever printing a line (its own `eprintln!` cannot block — pipes are
+        // drained by `DrainedChild`).
+        eprintln!(
+            "[child] phase: join task {n} (iter={}, in_flight={})",
+            task.iterations.load(Ordering::Relaxed),
+            task.in_flight.load(Ordering::Relaxed)
+        );
+        let _ = rt.block_on(task.join);
     }
+    // Ordering invariant: no `[child] phase:` line is EVER emitted after the
+    // terminal line below. It holds by construction — every phase marker
+    // above is on this (main) thread, and this thread's own next line is the
+    // terminal line itself, immediately followed by `exit(0)` (which runs no
+    // destructors and starts no new output). `pre-terminal` is therefore
+    // always the LAST phase marker.
+    eprintln!("[child] phase: pre-terminal");
     eprintln!(
         "[child role={}] survived: {refusals} refusal(s), {} engine error(s)",
         role.as_str(),
@@ -786,6 +1039,7 @@ fn child_main(role: Role) -> ! {
 // ── Parent ──────────────────────────────────────────────────────────────────
 
 /// Outcome of one child run.
+#[derive(Debug)]
 enum Attempt {
     Survived,
     Skipped,
@@ -799,8 +1053,125 @@ enum Attempt {
     /// The database file came back malformed. The pre-fix class the seam is
     /// required to have removed.
     Corrupt,
+    /// Exited with a code whose class was recognized, but the per-role
+    /// terminus (or, for a `TRIPPED`/`SKIP` code, its own required line) was
+    /// not found — evidence lost or malformed, not a clean member of that
+    /// class.
+    Truncated {
+        code: i32,
+    },
     ExitCode(i32),
+    /// Killed at the ceiling. Carries no data itself: the last phase marker
+    /// and `silence()` are read from the `Capture` at the call site (both the
+    /// panic in `drive_with` and the classification tests derive them the
+    /// same way, via [`last_phase_marker`] and `Capture::silence`).
     Hung,
+}
+
+/// Last stderr line matching `^\[child\] phase:`, or `None` if there is none.
+/// Used to name where a hung child stalled without needing a per-phase bound.
+fn last_phase_marker(stderr: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .rev()
+        .find(|l| l.starts_with("[child] phase:"))
+        .map(str::to_string)
+}
+
+/// The last non-empty stderr line, or `None` if stderr is empty/all-blank.
+fn last_nonempty_line(stderr: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .map(str::to_string)
+}
+
+/// Whether `stderr`'s per-role [`Terminus`] is satisfied. See the `Terminus`
+/// variants for what each comparator requires.
+fn terminus_satisfied(stderr: &[u8], role: Role) -> bool {
+    match role.expected_terminus() {
+        Terminus::EngineArm => {
+            let text = String::from_utf8_lossy(stderr);
+            let lines: Vec<&str> = text.lines().collect();
+            let prefix = format!("[child role={}] survived:", role.as_str());
+            match lines.iter().rposition(|l| l.starts_with(&prefix)) {
+                // Robust to a stray post-terminal worker line: only a
+                // `[child] phase:` marker after the terminal line disproves
+                // the ordering conjunct.
+                Some(idx) => {
+                    let no_marker_after = lines[idx + 1..]
+                        .iter()
+                        .all(|l| !l.starts_with("[child] phase:"));
+                    no_marker_after && text.contains("bundled(sqlx, static)=")
+                }
+                None => false,
+            }
+        }
+        Terminus::SentinelExact(expected) => {
+            last_nonempty_line(stderr).as_deref() == Some(expected)
+        }
+        Terminus::SentinelPrefix(prefix) => {
+            last_nonempty_line(stderr).is_some_and(|l| l.starts_with(prefix))
+        }
+    }
+}
+
+/// Classify a settled (non-hung) [`Capture`] into an [`Attempt`], applying the
+/// per-role terminus / per-code evidence check (see the W2 design's "Scoring"
+/// table).
+fn classify(cap: &Capture, role: Role) -> Attempt {
+    if cap.hung {
+        return Attempt::Hung;
+    }
+    if let Some(sig) = cap.status.and_then(|s| s.signal()) {
+        return Attempt::Signal(sig);
+    }
+    let has_tripped_line = |code: i32| {
+        last_nonempty_line(&cap.stderr)
+            .is_some_and(|l| l.starts_with(&format!("[child] TRIPPED({code}):")))
+    };
+    match cap.status.and_then(|s| s.code()) {
+        Some(0) => {
+            if terminus_satisfied(&cap.stderr, role) {
+                Attempt::Survived
+            } else {
+                Attempt::Truncated { code: 0 }
+            }
+        }
+        Some(EXIT_TRIPPED) => {
+            if has_tripped_line(EXIT_TRIPPED) {
+                Attempt::Tripped
+            } else {
+                Attempt::Truncated { code: EXIT_TRIPPED }
+            }
+        }
+        Some(EXIT_STALE) => {
+            if has_tripped_line(EXIT_STALE) {
+                Attempt::Stale
+            } else {
+                Attempt::Truncated { code: EXIT_STALE }
+            }
+        }
+        Some(EXIT_CORRUPT) => {
+            if has_tripped_line(EXIT_CORRUPT) {
+                Attempt::Corrupt
+            } else {
+                Attempt::Truncated { code: EXIT_CORRUPT }
+            }
+        }
+        Some(EXIT_NO_FOREIGN_LIB) => {
+            if String::from_utf8_lossy(&cap.stderr).contains("[child] SKIP:") {
+                Attempt::Skipped
+            } else {
+                Attempt::Truncated {
+                    code: EXIT_NO_FOREIGN_LIB,
+                }
+            }
+        }
+        Some(other) => Attempt::ExitCode(other),
+        None => Attempt::ExitCode(-1),
+    }
 }
 
 /// What a whole arm observed across its attempts.
@@ -836,46 +1207,69 @@ impl Summary {
     }
 }
 
-/// Re-execute this test binary as a child in `role`, running only `test_name`.
-fn run_child(role: Role, test_name: &str) -> (Attempt, String) {
+/// Re-execute this test binary as a child in `role`, running only `test_name`,
+/// via [`DrainedChild`] (both streams drained on background threads while the
+/// child runs, so a chatty-but-healthy child is never mistaken for a hang and
+/// a killed child's progress is never discarded — the esc-078 fix this
+/// harness now consumes). Bounded by `ceiling` from [`Epoch::Spawn`].
+fn run_child(role: Role, test_name: &str, ceiling: Duration) -> (Attempt, Capture) {
     let exe = std::env::current_exe().expect("current test binary");
-    let mut child = Command::new(exe)
-        .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
-        .env(ROLE_ENV, role.as_str())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn child");
+    let mut cmd = Command::new(exe);
+    cmd.args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+        .env(ROLE_ENV, role.as_str());
+    let child = DrainedChild::spawn(&mut cmd).expect("spawn child");
+    let cap = child.wait_bounded(ceiling, Epoch::Spawn);
+    let attempt = classify(&cap, role);
+    (attempt, cap)
+}
 
-    let deadline = std::time::Instant::now() + CHILD_CEILING;
-    loop {
-        match child.try_wait().expect("try_wait") {
-            Some(_) => break,
-            None if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return (Attempt::Hung, String::new());
-            }
-            None => std::thread::sleep(Duration::from_millis(20)),
-        }
-    }
-    let out = child.wait_with_output().expect("child output");
-    let log = format!(
+/// Render both of a [`Capture`]'s streams (stdout then stderr, matching the
+/// pre-drain harness's own `log` shape) for a panic/failure message.
+fn rendered_log(cap: &Capture) -> String {
+    format!(
         "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let attempt = match (out.status.signal(), out.status.code()) {
-        (Some(sig), _) => Attempt::Signal(sig),
-        (None, Some(0)) => Attempt::Survived,
-        (None, Some(EXIT_NO_FOREIGN_LIB)) => Attempt::Skipped,
-        (None, Some(EXIT_TRIPPED)) => Attempt::Tripped,
-        (None, Some(EXIT_STALE)) => Attempt::Stale,
-        (None, Some(EXIT_CORRUPT)) => Attempt::Corrupt,
-        (None, Some(code)) => Attempt::ExitCode(code),
-        (None, None) => Attempt::ExitCode(-1),
-    };
-    (attempt, log)
+        render(&cap.stdout, cap.stdout_truncated, DEFAULT_HEAD_CAP),
+        render(&cap.stderr, cap.stderr_truncated, DEFAULT_HEAD_CAP),
+    )
+}
+
+/// Shared formatting for a hung child's diagnostic text — used both by
+/// `drive_with`'s panic and by `wedge_role_is_hung_with_its_last_phase_marker`
+/// (which asserts on the formatted text WITHOUT panicking, per the plan's
+/// acceptance criterion for the Wedge role).
+fn hung_diagnostic(
+    role: Role,
+    attempt_no: usize,
+    total: usize,
+    ceiling: Duration,
+    cap: &Capture,
+) -> String {
+    format!(
+        "esc-073 [{}]: attempt {attempt_no}/{total} hung past {ceiling:?}; last phase \
+         marker={:?} silence={:?}. Both streams:\n{}",
+        role.as_str(),
+        last_phase_marker(&cap.stderr),
+        cap.silence(),
+        rendered_log(cap),
+    )
+}
+
+/// Shared formatting for a `Truncated` (evidence-lost/malformed) diagnostic.
+fn truncated_diagnostic(
+    role: Role,
+    attempt_no: usize,
+    total: usize,
+    code: i32,
+    cap: &Capture,
+) -> String {
+    format!(
+        "esc-073 [{}]: attempt {attempt_no}/{total} exited {code} without its expected terminus \
+         (evidence lost or malformed); last phase marker={:?} silence={:?}. Both streams:\n{}",
+        role.as_str(),
+        last_phase_marker(&cap.stderr),
+        cap.silence(),
+        rendered_log(cap),
+    )
 }
 
 /// Drive `role` for up to [`ATTEMPTS`] child runs, stopping at the first
@@ -900,9 +1294,9 @@ fn drive_with(role: Role, test_name: &str, stop_at_first_failure: bool) -> Summa
         survived: 0,
         log: String::new(),
     };
-    for attempt in 1..=ATTEMPTS {
-        let (outcome, log) = run_child(role, test_name);
-        summary.log = log;
+    for attempt_no in 1..=ATTEMPTS {
+        let (outcome, cap) = run_child(role, test_name, CHILD_CEILING);
+        summary.log = rendered_log(&cap);
         let failed = match outcome {
             Attempt::Survived => {
                 summary.survived += 1;
@@ -931,7 +1325,7 @@ fn drive_with(role: Role, test_name: &str, stop_at_first_failure: bool) -> Summa
             }
             Attempt::Signal(sig) => {
                 eprintln!(
-                    "esc-073 [{}]: attempt {attempt}/{ATTEMPTS} died with SIGNAL {sig}",
+                    "esc-073 [{}]: attempt {attempt_no}/{ATTEMPTS} died with SIGNAL {sig}",
                     role.as_str()
                 );
                 summary.signals.push(sig);
@@ -939,7 +1333,7 @@ fn drive_with(role: Role, test_name: &str, stop_at_first_failure: bool) -> Summa
             }
             Attempt::Tripped => {
                 eprintln!(
-                    "esc-073 [{}]: attempt {attempt}/{ATTEMPTS} tripped with a TYPED error",
+                    "esc-073 [{}]: attempt {attempt_no}/{ATTEMPTS} tripped with a TYPED error",
                     role.as_str()
                 );
                 summary.tripped += 1;
@@ -947,7 +1341,7 @@ fn drive_with(role: Role, test_name: &str, stop_at_first_failure: bool) -> Summa
             }
             Attempt::Stale => {
                 eprintln!(
-                    "esc-073 [{}]: attempt {attempt}/{ATTEMPTS} observed a STALE READ",
+                    "esc-073 [{}]: attempt {attempt_no}/{ATTEMPTS} observed a STALE READ",
                     role.as_str()
                 );
                 summary.stale += 1;
@@ -955,22 +1349,31 @@ fn drive_with(role: Role, test_name: &str, stop_at_first_failure: bool) -> Summa
             }
             Attempt::Corrupt => {
                 eprintln!(
-                    "esc-073 [{}]: attempt {attempt}/{ATTEMPTS} found the database file MALFORMED",
+                    "esc-073 [{}]: attempt {attempt_no}/{ATTEMPTS} found the database file \
+                     MALFORMED",
                     role.as_str()
                 );
                 summary.corrupt += 1;
                 true
             }
+            Attempt::Truncated { code } => {
+                panic!(
+                    "{}",
+                    truncated_diagnostic(role, attempt_no, ATTEMPTS, code, &cap)
+                )
+            }
             Attempt::ExitCode(code) => panic!(
-                "esc-073 [{}]: attempt {attempt}/{ATTEMPTS} exited {code} (harness fault, not a \
-                 crash):\n{}",
+                "esc-073 [{}]: attempt {attempt_no}/{ATTEMPTS} exited {code} (harness fault, not \
+                 a crash):\n{}",
                 role.as_str(),
                 summary.log
             ),
-            Attempt::Hung => panic!(
-                "esc-073 [{}]: attempt {attempt}/{ATTEMPTS} hung past {CHILD_CEILING:?}",
-                role.as_str()
-            ),
+            Attempt::Hung => {
+                panic!(
+                    "{}",
+                    hung_diagnostic(role, attempt_no, ATTEMPTS, CHILD_CEILING, &cap)
+                )
+            }
         };
         if failed && stop_at_first_failure {
             break;
@@ -988,7 +1391,7 @@ fn drive_with(role: Role, test_name: &str, stop_at_first_failure: bool) -> Summa
 fn foreign_library_write_cycle_never_kills_the_process() {
     let name =
         "esc_073_foreign_sqlite_library::foreign_library_write_cycle_never_kills_the_process";
-    if let Some(role) = std::env::var(ROLE_ENV).ok().and_then(|r| Role::parse(&r)) {
+    if let Some(role) = std::env::var(ROLE_ENV).ok().map(|r| Role::parse(&r)) {
         child_main(role);
     }
     let s = drive(Role::Collide, name);
@@ -1013,7 +1416,7 @@ fn foreign_library_write_cycle_never_kills_the_process() {
 fn keeper_connection_suppresses_the_close_time_checkpoint() {
     let name =
         "esc_073_foreign_sqlite_library::keeper_connection_suppresses_the_close_time_checkpoint";
-    if let Some(role) = std::env::var(ROLE_ENV).ok().and_then(|r| Role::parse(&r)) {
+    if let Some(role) = std::env::var(ROLE_ENV).ok().map(|r| Role::parse(&r)) {
         child_main(role);
     }
     let s = drive(Role::Keeper, name);
@@ -1041,7 +1444,7 @@ fn keeper_connection_suppresses_the_close_time_checkpoint() {
 fn engine_pool_churn_under_a_live_foreign_connection_never_kills_the_process() {
     let name = "esc_073_foreign_sqlite_library::\
                 engine_pool_churn_under_a_live_foreign_connection_never_kills_the_process";
-    if let Some(role) = std::env::var(ROLE_ENV).ok().and_then(|r| Role::parse(&r)) {
+    if let Some(role) = std::env::var(ROLE_ENV).ok().map(|r| Role::parse(&r)) {
         child_main(role);
     }
     let s = drive(Role::EngineChurn, name);
@@ -1085,7 +1488,7 @@ fn engine_pool_churn_under_a_live_foreign_connection_never_kills_the_process() {
 fn the_stale_read_topology_neither_signals_nor_corrupts_the_file() {
     let name = "esc_073_foreign_sqlite_library::\
                 the_stale_read_topology_neither_signals_nor_corrupts_the_file";
-    if let Some(role) = std::env::var(ROLE_ENV).ok().and_then(|r| Role::parse(&r)) {
+    if let Some(role) = std::env::var(ROLE_ENV).ok().map(|r| Role::parse(&r)) {
         child_main(role);
     }
     let s = drive_all(Role::StaleRead, name);
@@ -1100,5 +1503,166 @@ fn the_stale_read_topology_neither_signals_nor_corrupts_the_file() {
     eprintln!(
         "esc-073 stale-read arm census over {ATTEMPTS} attempt(s): {}",
         s.census()
+    );
+}
+
+// ── Role machinery + synthetic-role classification (esc-078/esc-079) ───────
+
+/// `Role::parse`/`as_str`/`synthetic`/`expected_terminus` must round-trip and
+/// be total over every one of the ten variants — the four production roles
+/// AND the six synthetic ones.
+#[test]
+fn role_round_trip_and_totality_covers_all_ten_variants() {
+    assert_eq!(
+        Role::ALL.len(),
+        10,
+        "the enumeration itself must list all ten"
+    );
+    for role in Role::ALL {
+        let s = role.as_str();
+        assert_eq!(
+            Role::parse(s),
+            role,
+            "Role::parse(Role::as_str({role:?})) did not round-trip through {s:?}"
+        );
+        // Both are total functions over every variant — calling them must
+        // not panic for any role.
+        let _ = role.synthetic();
+        let _ = role.expected_terminus();
+    }
+}
+
+/// `Role::parse` panics on unknown text rather than silently falling through
+/// to the parent path — an unrecognized role env value is a harness bug.
+#[test]
+#[should_panic(expected = "esc-073 harness: unknown")]
+fn role_parse_panics_on_unrecognized_text() {
+    Role::parse("not-a-real-role");
+}
+
+/// Every `#[test]` below that spawns a child carries the dispatch guard, even
+/// though each spawns its child under `GUARD_TEST`'s own name (whose guard is
+/// what actually dispatches): the rule is uniform across every child-spawning
+/// test in this file, so a future refactor that changes which test name is
+/// reused cannot silently drop the guard.
+const GUARD_TEST: &str =
+    "esc_073_foreign_sqlite_library::foreign_library_write_cycle_never_kills_the_process";
+
+/// [`Role::Flood`] must be classified `Survived`, with every one of its 4 MiB
+/// of flood bytes retained (asserted on the RAW `Capture::stderr`, never the
+/// rendered form) — the oracle for this harness's `DrainedChild` consumption.
+#[test]
+fn flood_role_survives_and_retains_every_byte() {
+    if let Some(role) = std::env::var(ROLE_ENV).ok().map(|r| Role::parse(&r)) {
+        child_main(role);
+    }
+    let (attempt, cap) = run_child(Role::Flood, GUARD_TEST, Duration::from_secs(30));
+    assert!(
+        matches!(attempt, Attempt::Survived),
+        "expected Survived, got {attempt:?}. Log:\n{}",
+        rendered_log(&cap)
+    );
+    let sentinel_len = "[child] FLOOD-DONE bytes=4194304\n".len();
+    assert_eq!(
+        cap.stderr.len(),
+        4_194_304 + sentinel_len,
+        "stderr byte count mismatch: {} bytes retained (truncated={})",
+        cap.stderr.len(),
+        cap.stderr_truncated
+    );
+    assert_eq!(cap.stderr_truncated, 0, "well under the retention cap");
+}
+
+/// [`Role::Quiet`] exits 0 with only its sentinel line — classified
+/// `Survived`.
+#[test]
+fn quiet_role_survives_with_its_sentinel() {
+    if let Some(role) = std::env::var(ROLE_ENV).ok().map(|r| Role::parse(&r)) {
+        child_main(role);
+    }
+    let (attempt, cap) = run_child(Role::Quiet, GUARD_TEST, Duration::from_secs(30));
+    assert!(
+        matches!(attempt, Attempt::Survived),
+        "expected Survived, got {attempt:?}. Log:\n{}",
+        rendered_log(&cap)
+    );
+}
+
+/// [`Role::Mute`] exits 0 but never prints its sentinel — classified
+/// `Truncated { code: 0 }`, never `Survived`: the negative control for
+/// `Terminus::SentinelExact`.
+#[test]
+fn mute_role_is_truncated_for_missing_its_sentinel() {
+    if let Some(role) = std::env::var(ROLE_ENV).ok().map(|r| Role::parse(&r)) {
+        child_main(role);
+    }
+    let (attempt, cap) = run_child(Role::Mute, GUARD_TEST, Duration::from_secs(30));
+    assert!(
+        matches!(attempt, Attempt::Truncated { code: 0 }),
+        "expected Truncated{{code:0}}, got {attempt:?}. Log:\n{}",
+        rendered_log(&cap)
+    );
+}
+
+/// [`Role::Bannerless`] prints an `EngineArm`-shaped terminal line with no
+/// banner substring — classified `Truncated { code: 0 }`: the negative
+/// control for the banner conjunct.
+#[test]
+fn bannerless_role_is_truncated_for_missing_the_banner() {
+    if let Some(role) = std::env::var(ROLE_ENV).ok().map(|r| Role::parse(&r)) {
+        child_main(role);
+    }
+    let (attempt, cap) = run_child(Role::Bannerless, GUARD_TEST, Duration::from_secs(30));
+    assert!(
+        matches!(attempt, Attempt::Truncated { code: 0 }),
+        "expected Truncated{{code:0}}, got {attempt:?}. Log:\n{}",
+        rendered_log(&cap)
+    );
+}
+
+/// [`Role::PostMarker`] prints the banner and the terminal line, but follows
+/// it with a `[child] phase:` marker — classified `Truncated { code: 0 }`:
+/// the negative control for the ordering conjunct.
+#[test]
+fn post_marker_role_is_truncated_for_a_marker_after_the_terminal_line() {
+    if let Some(role) = std::env::var(ROLE_ENV).ok().map(|r| Role::parse(&r)) {
+        child_main(role);
+    }
+    let (attempt, cap) = run_child(Role::PostMarker, GUARD_TEST, Duration::from_secs(30));
+    assert!(
+        matches!(attempt, Attempt::Truncated { code: 0 }),
+        "expected Truncated{{code:0}}, got {attempt:?}. Log:\n{}",
+        rendered_log(&cap)
+    );
+}
+
+/// [`Role::Wedge`] never exits on its own — classified `Hung`, with its last
+/// phase marker == `"[child] phase: b"` and that marker present in the SAME
+/// formatted diagnostic text `drive_with` would panic with (asserted here
+/// WITHOUT panicking, by calling the shared formatting function directly). No
+/// sub-ceiling wall-clock assertion: the ceiling itself is the bound.
+#[test]
+fn wedge_role_is_hung_with_its_last_phase_marker() {
+    if let Some(role) = std::env::var(ROLE_ENV).ok().map(|r| Role::parse(&r)) {
+        child_main(role);
+    }
+    let ceiling = Duration::from_secs(15);
+    let (attempt, cap) = run_child(Role::Wedge, GUARD_TEST, ceiling);
+    assert!(
+        matches!(attempt, Attempt::Hung),
+        "expected Hung, got {attempt:?}. Log:\n{}",
+        rendered_log(&cap)
+    );
+    let last_marker = last_phase_marker(&cap.stderr);
+    assert_eq!(
+        last_marker.as_deref(),
+        Some("[child] phase: b"),
+        "wedge's last phase marker should be \"[child] phase: b\". Log:\n{}",
+        rendered_log(&cap)
+    );
+    let diagnostic = hung_diagnostic(Role::Wedge, 1, 1, ceiling, &cap);
+    assert!(
+        diagnostic.contains("[child] phase: b"),
+        "the formatted panic text must carry the last phase marker: {diagnostic}"
     );
 }

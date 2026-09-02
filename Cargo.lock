@@ -4390,6 +4390,7 @@ name = "jammi-test-utils"
 version = "0.48.0"
 dependencies = [
  "jammi-db",
+ "libc",
 ]
 
 [[package]]

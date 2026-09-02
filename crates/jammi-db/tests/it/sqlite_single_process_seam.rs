@@ -68,6 +68,7 @@ use jammi_db::catalog::backend::{BackendError, SqlValue, TxOptions};
 use jammi_db::catalog::backend_sqlite::{catalog_vfs, SQLITE_VFS_ENV};
 use jammi_db::catalog::Catalog;
 use jammi_db::error::JammiError;
+use jammi_test_utils::child::{Capture, DrainedChild, Epoch};
 
 /// Env var carrying a child's role. Absent ⇒ this process is the parent.
 const ROLE_ENV: &str = "JAMMI_SEAM_ROLE";
@@ -190,8 +191,27 @@ fn sidecars(dir: &Path) -> (bool, bool) {
 
 // ── Children ────────────────────────────────────────────────────────────────
 
+/// Render both of a [`Capture`]'s streams (stdout then stderr) for a
+/// panic/failure message. Prefers `Capture::render_stdout`/`render_stderr`
+/// over the free `render` function: they always use the head-retention cap
+/// the capture was actually built with, so they cannot be called with a
+/// mismatched cap.
+fn rendered_log(cap: &Capture) -> String {
+    format!("{}{}", cap.render_stdout(), cap.render_stderr())
+}
+
 /// Re-execute this binary running only `test_name`, in `role`, with `envs`
-/// applied. Returns `(exit code or None-if-signalled, signal, elapsed, log)`.
+/// applied, via [`DrainedChild`] (both streams drained on background threads
+/// while the child runs, so evidence survives both a chatty child and a
+/// killed one). Returns `(exit code or None-if-signalled, signal, elapsed,
+/// log)`.
+///
+/// `elapsed` is [`Capture::elapsed`] — measured POST-SETTLE (after the reader
+/// threads observe EOF), not at exit DETECTION the way this harness's
+/// pre-drain `started.elapsed()` was. That is up to ~1 s later, which is safe
+/// against every ceiling this value is checked against here
+/// ([`REFUSAL_CEILING`], 30 s): the settle bound is a small fraction of that
+/// margin.
 fn run_child(
     role: &str,
     test_name: &str,
@@ -200,37 +220,24 @@ fn run_child(
     let exe = std::env::current_exe().expect("current test binary");
     let mut cmd = Command::new(exe);
     cmd.args(["--exact", test_name, "--nocapture", "--test-threads=1"])
-        .env(ROLE_ENV, role)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .env(ROLE_ENV, role);
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    let started = Instant::now();
-    let mut child = cmd.spawn().expect("spawn child");
-    let deadline = started + CHILD_CEILING;
-    loop {
-        match child.try_wait().expect("try_wait") {
-            Some(_) => break,
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!(
-                    "esc-073 seam: child role={role} hung past {CHILD_CEILING:?} — a refusal must \
-                     be bounded by the busy timeout, never a hang"
-                );
-            }
-            None => std::thread::sleep(Duration::from_millis(20)),
-        }
+    let child = DrainedChild::spawn(&mut cmd).expect("spawn child");
+    let cap = child.wait_bounded(CHILD_CEILING, Epoch::Spawn);
+    if cap.hung {
+        panic!(
+            "esc-073 seam: child role={role} hung past {CHILD_CEILING:?} — a refusal must be \
+             bounded by the busy timeout, never a hang. Both streams:\n{}",
+            rendered_log(&cap)
+        );
     }
-    let elapsed = started.elapsed();
-    let out = child.wait_with_output().expect("child output");
-    let log = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    (out.status.code(), out.status.signal(), elapsed, log)
+    let code = cap.status.and_then(|s| s.code());
+    let signal = cap.status.and_then(|s| s.signal());
+    let elapsed = cap.elapsed;
+    let log = rendered_log(&cap);
+    (code, signal, elapsed, log)
 }
 
 /// Report a child observation and exit with `code`. Never a panic: a panic's
@@ -557,30 +564,40 @@ fn the_first_process_to_open_wins_whichever_it_is() {
     let dir_path = dir.path().to_path_buf();
 
     let exe = std::env::current_exe().expect("current test binary");
-    let mut holder = Command::new(exe)
-        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+    let mut cmd = Command::new(exe);
+    cmd.args(["--exact", name, "--nocapture", "--test-threads=1"])
         .env(ROLE_ENV, "hold")
-        .env(DIR_ENV, dir_path.display().to_string())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn holder");
+        .env(DIR_ENV, dir_path.display().to_string());
+    let mut holder = DrainedChild::spawn(&mut cmd).expect("spawn holder");
 
     // Wait for the holder to actually own the file.
     let ready_by = Instant::now() + CHILD_CEILING;
-    while !dir_path.join("ready").exists() {
+    loop {
+        if dir_path.join("ready").exists() {
+            break;
+        }
         if let Some(status) = holder.try_wait().expect("try_wait") {
-            let out = holder.wait_with_output().expect("holder output");
+            // The holder already exited: settle (it's already down, so this
+            // returns promptly) and snapshot rather than reading via
+            // `wait_with_output` directly, so the panic below carries the
+            // SAME drained log shape every other diagnostic in this file
+            // does.
+            let cap = holder.wait_bounded(Duration::from_secs(1), Epoch::Call);
             panic!(
-                "holder exited ({status:?}) before signalling ready:\n{}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
+                "holder exited ({status:?}) before signalling ready. Both streams:\n{}",
+                rendered_log(&cap)
             );
         }
-        assert!(
-            Instant::now() < ready_by,
-            "holder never signalled ready within {CHILD_CEILING:?}"
-        );
+        if Instant::now() >= ready_by {
+            // `wait_bounded` checks its deadline BEFORE sleeping, so a zero
+            // ceiling is well-defined: it kills the holder immediately,
+            // settles, and snapshots — never a second, unbounded wait.
+            let cap = holder.wait_bounded(Duration::ZERO, Epoch::Call);
+            panic!(
+                "holder never signalled ready within {CHILD_CEILING:?}. Both streams:\n{}",
+                rendered_log(&cap)
+            );
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
 
@@ -589,14 +606,26 @@ fn the_first_process_to_open_wins_whichever_it_is() {
     let elapsed = started.elapsed();
 
     // Release the holder before asserting, so a failed assertion cannot leave
-    // an orphan process behind.
+    // an orphan process behind. Bounded from THIS call (`Epoch::Call`), not
+    // from spawn: a legal refusal of up to `REFUSAL_CEILING` plus the
+    // holder's own open could otherwise exhaust a from-spawn budget and
+    // SIGKILL a healthy holder — this bounds only the post-`stop` drain.
     std::fs::write(dir_path.join("stop"), b"1").expect("stop flag");
-    let holder_out = holder.wait_with_output().expect("holder output");
-    let holder_log = format!(
-        "{}{}",
-        String::from_utf8_lossy(&holder_out.stdout),
-        String::from_utf8_lossy(&holder_out.stderr)
-    );
+    let holder_cap = holder.wait_bounded(CHILD_CEILING, Epoch::Call);
+    // `hung` is checked BEFORE the signal/code asserts below: a SIGKILLed
+    // holder must be reported as hung, not misread as "died with a signal".
+    if holder_cap.hung {
+        panic!(
+            "esc-073 seam: the holder process did not exit within {CHILD_CEILING:?} after the \
+             parent wrote `stop` — this harness asserts that its OWN subprocess exit is bounded, \
+             not an engine release guarantee (the holder's body is `drop(catalog)` then \
+             `process::exit`; `drop` is documented as NOT a release point, only \
+             `Catalog::close().await` is). A kill here is a harness-observed hang; its evidence \
+             follows. Both streams:\n{}",
+            rendered_log(&holder_cap)
+        );
+    }
+    let holder_log = rendered_log(&holder_cap);
 
     match outcome {
         Ok(_) => panic!(
@@ -620,17 +649,17 @@ fn the_first_process_to_open_wins_whichever_it_is() {
         elapsed < REFUSAL_CEILING,
         "the refusal took {elapsed:?}, past the {REFUSAL_CEILING:?} ceiling"
     );
+    let holder_code = holder_cap.status.and_then(|s| s.code());
+    let holder_signal = holder_cap.status.and_then(|s| s.signal());
     assert_eq!(
-        holder_out.status.signal(),
-        None,
+        holder_signal, None,
         "the holder died with a signal:\n{holder_log}"
     );
     assert_eq!(
-        holder_out.status.code(),
+        holder_code,
         Some(0),
-        "the holder exited {:?} — holding a catalog while another process is refused must be \
-         uneventful for the incumbent:\n{holder_log}",
-        holder_out.status.code()
+        "the holder exited {holder_code:?} — holding a catalog while another process is refused \
+         must be uneventful for the incumbent:\n{holder_log}"
     );
 }
 

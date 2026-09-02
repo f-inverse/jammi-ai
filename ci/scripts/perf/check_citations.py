@@ -154,6 +154,52 @@ ancestry conclusion is drawn, not just before the case-1 `git show` —
 computed once per artifact file (the same sha decides every citation inside
 it), never per citation.
 
+## A maintainer guide's citations are resolved by FULL PATH, not by basename
+
+`_KNOWN_FILES` is a BASENAME map, and that shape is load-bearing for the
+roots above: a handful of files are cited by bare filename dozens of times,
+so a hand-registered mapping is what makes a typo'd filename fail loudly
+(`KeyError`-shaped) instead of silently resolving to the wrong file. It does
+not scale past a handful. `docs/maintainer/pod-build-guide.md` alone cites
+NINE distinct scripts and `docs/maintainer/cuda-kernel-guide.md` another
+seven source files; registering every one of them by basename would also
+make the map ambiguous the first time two directories hold a same-named file
+(`layer_norm.rs` exists under both `jammi-kernels/src/ops/` and
+`jammi-encoders/src/`, today).
+
+Citing files under `_DOC_SEARCH_ROOTS` (the maintainer guides) therefore get
+a SECOND, additional citation form: a repo-root-relative FULL PATH, e.g.
+`` `rp_tree_dir` (`ci/scripts/runpod_lib.sh:644`) ``. The full-path form is
+resolved directly against the working tree, and the loud-failure property
+the basename map provides is preserved by a DIFFERENT mechanism rather than
+dropped: a full path that does not exist under `REPO_ROOT` is a
+`Violation` ("cites <path> but that file does not exist"), never a silently
+skipped citation. Both forms are subject to the IDENTICAL adjacent-
+identifier rule and in-bounds check — the full-path form buys a citation no
+registration step, never a weaker check. A full path is constrained to the
+prefixes this repo's own sources live under (`_FULL_PATH_ROOT_PREFIXES`) so
+a citation of a VENDORED third-party file (`candle-core-0.11.0/src/op.rs:…`,
+which `cuda-kernel-guide.md` legitimately cites and which is not in this
+tree at all) is not matched and then reported as a missing path.
+
+The basename form still applies everywhere it did before, including inside
+the doc roots. Where both forms match the same text — a full path whose last
+component happens to be a registered basename — the FULL-PATH match wins and
+the basename match nested inside it is dropped, so one citation is never
+reported twice.
+
+DOCUMENTED RESIDUAL, stated rather than implied: the full-path form is
+enabled for `_DOC_SEARCH_ROOTS` citing files ONLY, not for the
+`_SEARCH_ROOTS` files above. Those roots do carry full-path citations of
+their own (in `ci/scripts/perf/finetune_ab.sh`, `gpu_inference_ab.sh`,
+`test_finetune_ab_disable_op_keys.py`, and three `cuda-runs` artifacts),
+and a survey run at the time this form was added found roughly twenty of
+them bare or stale. Turning the form on for those roots is a real coverage
+extension and a real fix-up unit — it is NOT done here silently as a side
+effect of a docs change, and this paragraph exists so the gap is a named
+scope boundary rather than an accidental blind spot a later reader mistakes
+for coverage.
+
 Run: `python3 ci/scripts/perf/check_citations.py`
 Hermetic for every non-artifact citation (reads only files in the working
 tree; no network, no build). An artifact-scoped citation additionally shells
@@ -232,6 +278,31 @@ _SEARCH_ROOTS = (
     REPO_ROOT / "ci" / "scripts" / "perf",
     REPO_ROOT / "crates" / "jammi-kernels" / "artifacts" / "cuda-runs",
 )
+
+# The citing roots whose files ALSO get the full-path citation form (see the
+# module doc's "A maintainer guide's citations are resolved by FULL PATH"
+# section). A separate tuple from `_SEARCH_ROOTS`, not an entry appended to
+# it, precisely because the two are not interchangeable: everything here is
+# additionally scanned for full-path citations, and every existing test that
+# monkeypatches `_SEARCH_ROOTS` onto a throwaway fixture keeps meaning
+# exactly what it meant before.
+_DOC_SEARCH_ROOTS = (
+    REPO_ROOT / "docs" / "maintainer",
+)
+
+# A full-path citation must start with one of these — the roots this repo's
+# OWN sources live under. Without this constraint a maintainer guide's
+# legitimate citation of a VENDORED third-party file (cuda-kernel-guide.md
+# cites `candle-core-0.11.0/src/op.rs` and `.../cpu_backend/mod.rs`, neither
+# of which is in this tree) would match and then be reported as a missing
+# path — a false finding about a citation that is correct as written.
+_FULL_PATH_ROOT_PREFIXES = ("ci/scripts/", "crates/", "docs/", ".github/")
+
+# The suffixes a full-path citation may name. Deliberately explicit (not
+# "any extension"): the trailing `:<digits>` is the only structural signal
+# that a path-shaped token is a citation at all, and a permissive suffix
+# set turns ordinary prose mentioning a path plus a number into one.
+_FULL_PATH_SUFFIXES = ("sh", "py", "rs", "cu", "toml", "md", "yml", "yaml", "json")
 
 
 # --------------------------------------------------------------------------- #
@@ -351,6 +422,74 @@ def _citation_re() -> re.Pattern:
         r"`?(?P<file>" + "|".join(re.escape(f) for f in _KNOWN_FILES) + r"):(?P<line>\d+)`?"
     )
 
+
+def _full_path_citation_re() -> re.Pattern:
+    """The FULL-PATH citation form, built fresh from the CURRENT
+    `_FULL_PATH_ROOT_PREFIXES`/`_FULL_PATH_SUFFIXES` on every call — same
+    reason `_citation_re` is: `test_check_citations.py` monkeypatches those
+    module variables per test, and a module-load-time-frozen pattern would
+    silently keep matching only whatever they held at import time.
+
+    A leading `(?<![A-Za-z0-9_./-])` guard keeps a prefix from matching in
+    the MIDDLE of a longer path (`vendor/crates/foo.rs:1` must not be read
+    as a `crates/`-rooted citation of a file this repo does not have).
+    """
+    prefixes = "|".join(re.escape(p) for p in _FULL_PATH_ROOT_PREFIXES)
+    suffixes = "|".join(re.escape(s) for s in _FULL_PATH_SUFFIXES)
+    return re.compile(
+        r"(?<![A-Za-z0-9_./-])`?(?P<path>(?:" + prefixes + r")[A-Za-z0-9_./-]+\.(?:"
+        + suffixes + r")):(?P<line>\d+)`?"
+    )
+
+
+def _cited_targets(path: Path, text: str) -> list[tuple[int, str, Path, int]]:
+    """Every citation in `text`, as `(match_start, label, target_path,
+    cited_line)`, ordered by position.
+
+    The basename form always applies; the full-path form applies only when
+    the CITING file lives under `_DOC_SEARCH_ROOTS` (module doc's
+    "resolved by FULL PATH" section, including its documented residual).
+    Where a full-path match SPANS a basename match — a path whose last
+    component is a registered `_KNOWN_FILES` name — the nested basename
+    match is dropped, so one citation is reported once, by its more
+    specific form.
+    """
+    spans: list[tuple[int, int, str, Path, int]] = []
+    if _is_under(path, _DOC_SEARCH_ROOTS):
+        for m in _full_path_citation_re().finditer(text):
+            rel = m.group("path")
+            spans.append(
+                (m.start(), m.end(), f"{rel}:{m.group('line')}", REPO_ROOT / rel, int(m.group("line")))
+            )
+    full_spans = [(s, e) for (s, e, _l, _t, _n) in spans]
+    for m in _citation_re().finditer(text):
+        if any(s <= m.start() and m.end() <= e for (s, e) in full_spans):
+            continue
+        spans.append(
+            (
+                m.start(), m.end(),
+                f"{m.group('file')}:{m.group('line')}",
+                _KNOWN_FILES[m.group("file")],
+                int(m.group("line")),
+            )
+        )
+    spans.sort(key=lambda t: t[0])
+    return [(s, label, target, n) for (s, _e, label, target, n) in spans]
+
+
+def _is_under(path: Path, roots: tuple[Path, ...]) -> bool:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    for root in roots:
+        try:
+            resolved.relative_to(root.resolve())
+            return True
+        except (ValueError, OSError):
+            continue
+    return False
+
 # A backtick-quoted span -- candidate identifiers.
 _IDENT_RE = re.compile(r"`([^`\n]{1,200})`")
 
@@ -455,7 +594,7 @@ class Exemption:
 
 def _iter_source_files():
     seen = set()
-    for root in _SEARCH_ROOTS:
+    for root in (*_SEARCH_ROOTS, *_DOC_SEARCH_ROOTS):
         if not root.is_dir():
             continue
         for path in sorted(root.rglob("*")):
@@ -500,12 +639,12 @@ def _check_file_impl(path: Path) -> tuple[list[Violation], list[Exemption]]:
         _require_history()
         sha_is_ancestor = _is_ancestor(artifact_sha)
 
-    for m in _citation_re().finditer(text):
-        cited_file = m.group("file")
-        cited_line = int(m.group("line"))
-        source_line_no = text.count("\n", 0, m.start()) + 1
-
-        target_path = _KNOWN_FILES[cited_file]
+    for citation_start, cited_label, target_path, cited_line in _cited_targets(path, text):
+        # `cited_file` keeps naming the citation exactly as the doc wrote it
+        # (a bare basename, or a full path) so every message below quotes
+        # back the text a reader has to go find and fix.
+        cited_file = cited_label.rsplit(":", 1)[0]
+        source_line_no = text.count("\n", 0, citation_start) + 1
 
         if artifact_sha is not None and not sha_is_ancestor:
             # Case 3: the artifact's own git_sha is NOT an ancestor of
@@ -583,7 +722,7 @@ def _check_file_impl(path: Path) -> tuple[list[Violation], list[Exemption]]:
                 )
                 continue
 
-        ident = _find_adjacent_identifier(ident_spans, m.start())
+        ident = _find_adjacent_identifier(ident_spans, citation_start)
         if ident is None:
             violations.append(
                 Violation(

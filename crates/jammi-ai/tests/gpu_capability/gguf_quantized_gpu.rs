@@ -885,7 +885,7 @@ async fn gguf_gpu_load_admission_estimate_is_truthful_against_measured_device_me
     // `None` here is a genuine late failure, not the GPU-less lane.
     let cuda = harness::serial_cuda_device()
         .expect("skip_without_gpu! already proved a CUDA device opens");
-    settle_cuda_device(&cuda);
+    settle_cuda_device(cuda.device());
 
     let Some(before) = device_memory_used_bytes_or_require(
         "gguf_gpu_load_admission_estimate_is_truthful_against_measured_device_memory",
@@ -917,7 +917,7 @@ async fn gguf_gpu_load_admission_estimate_is_truthful_against_measured_device_me
     // enqueued its work on.
     let backend = CandleBackend;
     let loaded: LoadedModel = backend.load(&resolved, &gpu_device_config()).unwrap();
-    cuda.synchronize().unwrap();
+    cuda.device().synchronize().unwrap();
 
     // AFTER snapshot MUST run with the model still resident — this is the
     // audit's other named bug: the old `drop(loaded)` ran BEFORE this

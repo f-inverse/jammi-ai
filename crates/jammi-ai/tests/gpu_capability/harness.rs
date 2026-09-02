@@ -83,8 +83,31 @@ static GPU_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// only way to get a `Device` for such an oracle, and it hands back this
 /// wrapper, which holds the slot for as long as the caller holds the device.
 /// A test added tomorrow cannot forget to serialize, because it cannot obtain
-/// the device without doing so. `Deref<Target = Device>` keeps `&device` call
-/// sites unchanged.
+/// the device without doing so.
+///
+/// # Why there is no `Deref<Target = Device>` (round-1 audit)
+///
+/// This type used to `impl Deref<Target = Device>`, which kept `&device` call
+/// sites unchanged — and let `let d = (*serial_cuda_device().unwrap()).clone();`
+/// type-check. That one-liner ENDS the serialization: the temporary guard
+/// (and with it the slot) is dropped at the end of the statement, while `d`
+/// is a live, owned `Device` the caller then measures on with no slot held —
+/// the exact escape the wrapper exists to prevent, spelled as ordinary deref
+/// usage.
+///
+/// [`Self::device`] replaces it: the borrow it returns is tied to `&self`, so
+/// no `&Device` can outlive the guard. Every call site passes
+/// `guard.device()` where it used to pass `&guard`.
+///
+/// **What is still open, stated rather than implied.** `candle_core::Device`
+/// is `Clone`, so `guard.device().clone()` compiles and always will —
+/// nothing an API of this shape can do prevents cloning a `Clone` type
+/// reachable by reference (a `&DeviceRef` newtype does not help: if it
+/// derefs to `Device` the clone resolves straight through it, and if it does
+/// not, no call site can pass it where `&Device` is wanted). What changed is
+/// that the escape is now an EXPLICIT, greppable `.device().clone()` rather
+/// than an incidental consequence of deref — a reviewer looking for it has a
+/// single spelling to grep for, and no correct call site needs it.
 ///
 /// **What this does NOT close, stated plainly rather than implied.** Only the
 /// callers of `serial_cuda_device` take the slot. The other thirteen modules
@@ -108,12 +131,27 @@ pub struct SerialGpu {
     _slot: std::sync::MutexGuard<'static, ()>,
 }
 
-impl std::ops::Deref for SerialGpu {
-    type Target = candle_core::Device;
-
-    fn deref(&self) -> &candle_core::Device {
+impl SerialGpu {
+    /// This guard's device, borrowed for no longer than the guard itself —
+    /// the ONLY way to reach it, and the reason there is no `Deref` (see the
+    /// type doc). Deliberately NOT `into_device`/`to_device`: nothing in this
+    /// binary has a legitimate reason to hold a `Device` past the slot.
+    pub fn device(&self) -> &candle_core::Device {
         &self.device
     }
+}
+
+/// Take this binary's one-at-a-time GPU slot, recovering a poisoned lock
+/// rather than unwrapping it (see [`SerialGpu`]'s doc for why).
+///
+/// Split out from [`serial_cuda_device`] so the exclusion property itself is
+/// testable on a GPU-less lane, where no `SerialGpu` can ever be constructed:
+/// `gpu_slot_is_exclusive_while_held` below is the non-vacuous control that
+/// the slot is a real mutex and not a decorative field.
+fn take_gpu_slot() -> std::sync::MutexGuard<'static, ()> {
+    GPU_SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// A CUDA device bound to this binary's one-at-a-time [`GPU_SERIAL`] slot —
@@ -126,15 +164,38 @@ pub fn serial_cuda_device() -> Option<SerialGpu> {
     // Taken BEFORE `Device::new_cuda`, so even device ACQUISITION (which
     // allocates a context on the device) is serialized against a sibling
     // leg's memory trace.
-    let slot = GPU_SERIAL
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let slot = take_gpu_slot();
     candle_core::Device::new_cuda(0)
         .ok()
         .map(|device| SerialGpu {
             device,
             _slot: slot,
         })
+}
+
+/// The slot is a real mutual exclusion, and it is released only when the
+/// guard drops — the property every device-global oracle in this binary
+/// leans on, pinned on EVERY lane (this one needs no GPU, so the CPU lane
+/// proves it too, where no [`SerialGpu`] can be constructed at all).
+///
+/// Non-vacuous in both directions: `try_lock` must FAIL while the slot is
+/// held (a decorative, always-available mutex fails here) and SUCCEED once it
+/// is dropped (a slot that leaked would fail here instead).
+#[test]
+fn gpu_slot_is_exclusive_while_held() {
+    {
+        let _slot = take_gpu_slot();
+        assert!(
+            GPU_SERIAL.try_lock().is_err(),
+            "a second holder must not be able to take the slot while it is held — without \
+             this, `SerialGpu` would serialize nothing"
+        );
+    }
+    assert!(
+        GPU_SERIAL.try_lock().is_ok(),
+        "dropping the guard must release the slot — a leaked slot would deadlock every \
+         later device-global oracle in this binary"
+    );
 }
 
 /// Early-return a test with a loud `tracing::warn` skip (never `#[ignore]`)

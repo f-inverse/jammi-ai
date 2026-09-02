@@ -197,6 +197,20 @@ async fn engine_chain_at(
 ) {
     let dir = tempfile::tempdir().expect("tempdir");
     let cfg = test_config(dir.path());
+    let (chain, engine) = engine_chain_from_config(addr, tiers, cfg).await;
+    (chain, engine, dir)
+}
+
+/// The chain-building half of [`engine_chain_at`], parameterised on the
+/// `JammiConfig` the engine session is opened with — so a fixture can vary a
+/// CONFIG KEY (not a construction seam) and still serve the identical surface
+/// every other fixture serves. Returns the chain plus the shared engine handle;
+/// the caller owns whatever roots the config's `artifact_dir`.
+async fn engine_chain_from_config(
+    addr: SocketAddr,
+    tiers: jammi_server::tiers::TierSet,
+    cfg: jammi_db::config::JammiConfig,
+) -> (jammi_server::runtime::GrpcChain, Arc<InferenceSession>) {
     // `open` (not `new`) so the engine-backed server registers the compound
     // query SQL functions (`annotate`, …) on its context — the same shape the
     // production `OssServer` builds, and what the Flight SQL `annotate` test
@@ -224,7 +238,7 @@ async fn engine_chain_at(
         metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
         tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(store),
     };
-    (chain, engine, dir)
+    (chain, engine)
 }
 
 /// Spin up the SAME engine-backed server [`start_engine_server`] does (identical
@@ -324,5 +338,80 @@ pub fn with_session(
     move |mut req: Request<()>| {
         req.metadata_mut().insert(SESSION_HEADER, id.clone());
         Ok(req)
+    }
+}
+
+/// Spin up the SAME engine-backed server [`start_engine_server`] does (identical
+/// tier set — the `train` tier included — identical chain, identical eager
+/// bind), with `[training] run_worker` set to `run_worker` **through a real
+/// `jammi.toml` loaded by `JammiConfig::load`** — the exact path the
+/// `jammi-server` binary takes to its config.
+///
+/// This is the parameterised config variant of the fixture, and it is
+/// deliberately NOT a construction seam: nothing here reaches into
+/// [`jammi_server::runtime::ChainParts::train_worker`] or stops a worker after
+/// the fact. Whether a claim loop exists in this process is decided by the one
+/// TOML key, read by [`jammi_server::runtime::assemble_grpc_chain`] off the
+/// session's own config — so a test built on this fixture proves the KNOB, not
+/// the seam.
+///
+/// The loaded config is asserted to actually carry the requested value before
+/// the session opens: `JammiConfig::load` applies `JAMMI_*` environment
+/// overrides, so an ambient `JAMMI_TRAINING__RUN_WORKER` in the test runner's
+/// environment would otherwise silently invert the oracle. It fails loud here
+/// instead.
+///
+/// The rest of the config mirrors `jammi_test_utils::test_config` (CPU device,
+/// small batch, temp artifact dir) so the surface served is the one every other
+/// engine-backed fixture serves.
+#[cfg(feature = "train")]
+pub async fn start_engine_server_with_run_worker(run_worker: bool) -> EngineServer {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = dir.path().join("jammi.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "artifact_dir = \"{artifact_dir}\"\n\
+             \n\
+             [gpu]\n\
+             device = -1\n\
+             \n\
+             [inference]\n\
+             batch_size = 8\n\
+             \n\
+             [logging]\n\
+             level = \"debug\"\n\
+             \n\
+             [training]\n\
+             run_worker = {run_worker}\n",
+            artifact_dir = dir.path().display(),
+        ),
+    )
+    .expect("write the fixture's jammi.toml");
+
+    let cfg = jammi_db::config::JammiConfig::load(Some(&config_path))
+        .expect("the fixture's jammi.toml loads");
+    assert_eq!(
+        cfg.training.run_worker, run_worker,
+        "the loaded config must carry the run_worker this fixture asked for — a \
+         mismatch means an ambient JAMMI_TRAINING__RUN_WORKER override is \
+         inverting the oracle"
+    );
+    assert_eq!(
+        cfg.artifact_dir.as_path(),
+        dir.path(),
+        "the loaded config must root its artifacts in this fixture's temp dir"
+    );
+
+    let (chain, engine) = engine_chain_from_config(ephemeral_addr(), non_event_tiers(), cfg).await;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let (addr, handle) = spawn_bound_chain(chain, shutdown_rx).await;
+
+    EngineServer {
+        addr,
+        shutdown: shutdown_tx,
+        _dir: dir,
+        handle,
+        engine,
     }
 }

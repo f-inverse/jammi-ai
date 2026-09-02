@@ -507,6 +507,12 @@ pub struct ChainParts {
     /// The embedded training worker guard. The downstream MUST hold this for the
     /// lifetime of its serve loop — dropping it stops the worker and submitted
     /// jobs stop running.
+    ///
+    /// `None` when this process runs no claim loop: either the `train` tier is
+    /// not mounted at all, or it is mounted with `[training] run_worker = false`
+    /// (the mount-without-claiming configuration — `TrainingService` still
+    /// serves, this process just never claims). In both cases there is nothing
+    /// for the downstream to hold and nothing for its shutdown to await.
     #[cfg(feature = "train")]
     pub train_worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker>,
 }
@@ -850,7 +856,13 @@ impl BoundChain {
 /// **Mounted by tier** (only when `tiers` selected them):
 /// - `EvalService` ← [`ServiceTier::Eval`]
 /// - `TrainingService` ← [`ServiceTier::Train`] (and only when the `train`
-///   feature is compiled in — the mount code itself is `#[cfg]`-gated)
+///   feature is compiled in — the mount code itself is `#[cfg]`-gated). The
+///   tier also spawns the embedded training worker, unless `chain.engine`'s
+///   `[training] run_worker` is `false`: that key decides whether THIS process
+///   claims queued jobs, and it does NOT change what is mounted or advertised
+///   (`TrainingService` serves either way, so a `run_worker = false` deployment
+///   still accepts submissions and just leaves them `queued` for whichever
+///   process does claim).
 /// - `TriggerService` ← [`ServiceTier::Event`], driven by `trigger` being
 ///   `Some` (the caller derives the handles iff the event tier is mounted)
 ///
@@ -997,14 +1009,37 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
         // the feature is compiled out.
         #[cfg(feature = "train")]
         if tiers.contains(ServiceTier::Train) {
-            // Start the worker that runs submitted jobs: a "GPU worker pool" is
-            // just N processes claiming from the shared catalog, and the server
-            // `train` tier runs one of them. `spawn` borrows `session` before it
-            // is moved into `TrainingServer::new`; the worker is stored in
-            // `AssembledChain` so it stops when the serve future resolves.
-            train_worker = Some(jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(
-                &session,
-            )?);
+            // Whether THIS process also runs the claim loop is configuration, not
+            // a second code path: `[training] run_worker` (default `true`). The
+            // tier still mounts `TrainingService` either way — the surface and
+            // what `GetServerInfo.services` advertises are unchanged, because the
+            // service IS mounted — so a `run_worker = false` deployment still
+            // accepts submissions; it just never claims them. The embedded arm
+            // reads the same key off the same config, so a wire deployment and an
+            // in-process one answer the question identically.
+            if session.inner_config().training.run_worker {
+                // Start the worker that runs submitted jobs: a "GPU worker pool"
+                // is just N processes claiming from the shared catalog, and the
+                // server `train` tier runs one of them. `spawn` borrows `session`
+                // before it is moved into `TrainingServer::new`; the worker is
+                // stored in `AssembledChain` so it stops when the serve future
+                // resolves.
+                train_worker = Some(jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(
+                    &session,
+                )?);
+                tracing::info!(
+                    run_worker = true,
+                    "train tier: TrainingService mounted; this process claims queued training jobs"
+                );
+            } else {
+                // No worker exists to stop, so shutdown has nothing extra to
+                // await: `AssembledChain::_train_worker` stays `None` and its
+                // drop is a no-op.
+                tracing::info!(
+                    run_worker = false,
+                    "train tier: TrainingService mounted; this process does not claim training jobs"
+                );
+            }
             mount_engine!(
                 routes,
                 mounted,

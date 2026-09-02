@@ -304,6 +304,8 @@ def _write(path: Path, text: str) -> None:
 
 
 def _self_test() -> int:
+    import contextlib
+    import io
     import tempfile
 
     failures: list[str] = []
@@ -493,6 +495,51 @@ def _self_test() -> int:
             f"got needs_server={selection_needs_server(cls, sel)}",
         )
 
+        # 9. The `--needs-server` CLI SURFACE, not just the predicate behind
+        #    it. `cookbook-book.yml` captures this command's stdout straight
+        #    into a step output that decides whether a `jammi-server` gets
+        #    built, so the stream discipline is load-bearing: exactly ONE
+        #    token on stdout, the classification table on stderr, exit 0. A
+        #    stray print to stdout (a debug line, or the table leaking over)
+        #    would make the step output `true\n# classification\n...` — a
+        #    truthy-looking string that is not `true`, decided by whatever
+        #    the consuming shell does with it. Checks 1-8 above prove the
+        #    predicate and would all stay green through that regression.
+        buf_out, buf_err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+            rc = _cmd_needs_server(
+                ["chapters/remote/remote.qmd"],
+                chapters_dir=chapters,
+                scripts_dir=scripts,
+                repo_root=root,
+            )
+        check("needs-server-cli-exits-zero", rc == 0, f"got exit {rc}")
+        check(
+            "needs-server-cli-prints-one-bare-token-on-stdout",
+            buf_out.getvalue() == "true\n",
+            f"got stdout={buf_out.getvalue()!r}",
+        )
+        check(
+            "needs-server-cli-keeps-the-table-on-stderr",
+            "# classification" in buf_err.getvalue()
+            and "LIVE_COMPUTE_NEEDS_SERVER" in buf_err.getvalue()
+            and not any(l.startswith("#") for l in buf_out.getvalue().splitlines()),
+            f"got stderr={buf_err.getvalue()[:120]!r} stdout={buf_out.getvalue()!r}",
+        )
+        buf_out, buf_err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+            rc = _cmd_needs_server(
+                ["chapters/mixed/mixed.qmd"],
+                chapters_dir=chapters,
+                scripts_dir=scripts,
+                repo_root=root,
+            )
+        check(
+            "needs-server-cli-prints-bare-false-when-no-server-is-needed",
+            rc == 0 and buf_out.getvalue() == "false\n",
+            f"got exit {rc}, stdout={buf_out.getvalue()!r}",
+        )
+
     if failures:
         print(f"self-test: FAIL ({len(failures)}/{total} failing): {failures}", file=sys.stderr)
         return 1
@@ -516,10 +563,12 @@ def _git_diff_names(base: str, head: str) -> list[str]:
     return out.stdout.splitlines()
 
 
-def _table_lines(classifications: list[Classification]) -> list[str]:
+def _table_lines(classifications: list[Classification], repo_root: Path = REPO_ROOT) -> list[str]:
+    """`repo_root` is a parameter only so `_self_test` can render the table
+    for a synthetic tree; every production caller takes the default."""
     lines = []
     for c in classifications:
-        rel = c.path.relative_to(REPO_ROOT).as_posix()
+        rel = c.path.relative_to(repo_root).as_posix()
         ds = ",".join(sorted(c.datasets)) if c.datasets else "-"
         lines.append(f"{c.bucket:24s} {ds:30s} {rel}")
     return lines
@@ -531,14 +580,35 @@ def _cmd_classify() -> int:
     return 0
 
 
-def _cmd_needs_server(changed_paths: list[str]) -> int:
+def _cmd_needs_server(
+    changed_paths: list[str],
+    *,
+    chapters_dir: Path | None = None,
+    scripts_dir: Path | None = None,
+    repo_root: Path | None = None,
+) -> int:
     """Print exactly `true`/`false`: does the set THIS diff selects need a
     running `jammi-server`? One machine-readable token on stdout, so a
     workflow can capture it straight into a step output; the classification
-    table still goes to stderr, never mixed into the answer."""
-    classifications, selected = select(changed_paths)
+    table still goes to stderr, never mixed into the answer.
+
+    The three directory overrides exist for `_self_test` only — `select`'s
+    own defaults bind at def time, so a self-test that patched the module
+    constants would silently keep reading the REAL book, which is exactly
+    what this file's self-test discipline forbids. `main()` passes none of
+    them and gets the module defaults, unchanged."""
+    dirs = {
+        k: v
+        for k, v in (
+            ("chapters_dir", chapters_dir),
+            ("scripts_dir", scripts_dir),
+            ("repo_root", repo_root),
+        )
+        if v is not None
+    }
+    classifications, selected = select(changed_paths, **dirs)
     print("# classification", file=sys.stderr)
-    for line in _table_lines(classifications):
+    for line in _table_lines(classifications, repo_root or REPO_ROOT):
         print(f"#   {line}", file=sys.stderr)
     print("true" if selection_needs_server(classifications, selected) else "false")
     return 0

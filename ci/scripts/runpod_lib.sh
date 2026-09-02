@@ -1446,15 +1446,21 @@ rp_run_remote() {
     | ssh "${RP_SSHO[@]}" -p "$RP_PORT" "root@${RP_HOST}" "timeout ${RP_TIMEOUT:-3000} bash -s"
 }
 
-# Like `rp_run_remote`, plus an INACTIVITY watchdog (esc-080): RP_INACTIVITY
-# seconds of silent (no new output byte) remote stdout+stderr kills the ssh
-# session as a hang, rather than waiting out the full RP_TIMEOUT budget --
-# the two axes are independent (a leg can be busy-but-slow, which only
-# RP_TIMEOUT should catch, or silent-and-stuck, which this watchdog catches
-# far earlier). File-backed streaming (never a `$(...)` capture, which would
-# buffer the ENTIRE output in memory and print nothing until the process
-# exits) so a caller sees the same bytes live, exactly as `rp_run_remote`'s
-# direct pipe does.
+# Like `rp_run_remote`, plus an INACTIVITY watchdog (esc-080): `$1` seconds
+# (optional; defaults to the validated `RP_INACTIVITY` global -- every real
+# caller omits `$1` and gets that default) of silent (no new output byte)
+# remote stdout+stderr kills the ssh session as a hang, rather than waiting
+# out the full RP_TIMEOUT budget -- the two axes are independent (a leg can
+# be busy-but-slow, which only RP_TIMEOUT should catch, or silent-and-stuck,
+# which this watchdog catches far earlier). `$1` exists so a FIXTURE can pass
+# a short test-local threshold as a plain function argument rather than a
+# committed `RP_INACTIVITY=<n>` assignment, which `check_gpu_prove_timings.
+# py`'s R1 setter-predicate scan would (correctly) flag as a second source of
+# truth for the real default -- see `test_gpu_prove_lane.sh`'s own use.
+# File-backed streaming (never a `$(...)` capture, which would buffer the
+# ENTIRE output in memory and print nothing until the process exits) so a
+# caller sees the same bytes live, exactly as `rp_run_remote`'s direct pipe
+# does.
 #
 # This is a GENERIC primitive: it knows the `::group::`/`PROVE_GROUP_RC
 # name=<n> rc=<v>` marker SHAPE (to name a hung/cut group in its own
@@ -1479,6 +1485,7 @@ rp_run_remote() {
 #     `PROVE_EXIT=124` already printed) is a different case, indistinguishable
 #     from a real budget cut by exit code alone, and gets no extra line.
 rp_run_remote_watched() {
+  local inactivity="${1:-$RP_INACTIVITY}"
   local out; out="$(mktemp)"
   local preamble; preamble="$RP_ENV_PREAMBLE"
   { printf '%s\n' "$preamble"; cat; } \
@@ -1558,7 +1565,7 @@ rp_run_remote_watched() {
       _rrw_scan_new_text "$_RRW_CHUNK"
       printed=$size
       last_growth=$SECONDS
-    elif [ $((SECONDS - last_growth)) -ge "${RP_INACTIVITY:-600}" ]; then
+    elif [ $((SECONDS - last_growth)) -ge "$inactivity" ]; then
       kill -TERM "$pid" 2>/dev/null
       sleep 1
       kill -KILL "$pid" 2>/dev/null
@@ -1570,7 +1577,7 @@ rp_run_remote_watched() {
         printf '%s' "$_RRW_CHUNK"
         _rrw_scan_new_text "$_RRW_CHUNK"
       fi
-      echo "=== GPU prove: NO PROGRESS for ${RP_INACTIVITY:-600}s in group \"${last_group}\"; groups: $(_rrw_group_list) ===" >&2
+      echo "=== GPU prove: NO PROGRESS for ${inactivity}s in group \"${last_group}\"; groups: $(_rrw_group_list) ===" >&2
       rm -f "$out"
       return 76
     fi

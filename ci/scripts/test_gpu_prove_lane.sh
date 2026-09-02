@@ -103,10 +103,13 @@ ssh() {
 }
 export -f ssh
 RP_SSHO=(); RP_PORT=22; RP_HOST=localhost
-RP_INACTIVITY=3
-out="$(rp_run_remote_watched <<< "noop" 2>&1)"
+# A fixture-local threshold passed as a plain function ARGUMENT (never a
+# committed `RP_INACTIVITY=<n>` assignment, which check_gpu_prove_timings.
+# py's R1 setter-predicate scan would -- correctly -- flag as a second
+# source of truth for the real default) -- see rp_run_remote_watched's own
+# `$1` doc.
+out="$(rp_run_remote_watched 3 <<< "noop" 2>&1)"
 rc=$?
-unset RP_INACTIVITY
 if [ "$rc" -eq 76 ] \
   && echo "$out" | grep -q 'NO PROGRESS' \
   && echo "$out" | grep -q 'group "served-client-server-proof"' \
@@ -292,10 +295,8 @@ ssh() {
   return 0
 }
 export -f ssh
-RP_INACTIVITY=6
-out="$(rp_run_remote_watched <<< "noop" 2>&1)"
+out="$(rp_run_remote_watched 6 <<< "noop" 2>&1)"
 rc=$?
-unset RP_INACTIVITY
 if [ "$rc" -eq 76 ] && echo "$out" | grep -q 'groups: \[engine-core-sweep:0\]'; then
   ok "partial-line-at-poll-boundary: a marker split across two polls is reassembled correctly"
 else

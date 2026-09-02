@@ -67,7 +67,7 @@ exactly one place).
    own acceptance measurement — pod_build_timings.sh)
 ```
 
-Each box's own entry point: bootstrap is `rp_bootstrap` (`ci/scripts/runpod_lib.sh:1782`);
+Each box's own entry point: bootstrap is `rp_bootstrap` (`ci/scripts/runpod_lib.sh:1970`);
 the detached seed is `start_seed_build` (`ci/scripts/gpu-dev.sh:762`), called
 from `[ -n "$RP_REF" ] && start_seed_build` (`ci/scripts/gpu-dev.sh:785`) for
 `shell` and again at `[ -n "$RP_REF" ] && start_seed_build` (`ci/scripts/gpu-dev.sh:869`)
@@ -79,8 +79,8 @@ A **seed** is a `CARGO_TARGET_DIR` for one pod, built once, member-free (no
 `CARGO_TARGET_DIR` that starts as a pure copy of the seed. A **tree** is a
 plain directory (`/root/jammi-ai` for the bootstrap checkout, or
 `/root/trees/<name>` for any other) produced by `rp_tree_dir`
-(`ci/scripts/runpod_lib.sh:644`) — never a git worktree, because
-`a worktree add fails on the checked-out ref` (`ci/scripts/runpod_lib.sh:635`)
+(`ci/scripts/runpod_lib.sh:670`) — never a git worktree, because
+`a worktree add fails on the checked-out ref` (`ci/scripts/runpod_lib.sh:661`)
 and a shared `.git` couples trees that must diverge independently.
 
 **Who may do what.** Agents build and test over SSH (`shell`/`attach`/`run`,
@@ -90,9 +90,9 @@ lead or the user runs the verbs that rent or terminate hardware:
 `down`/`reap` are destructive: `down` runs its own verify-before-terminate
 machinery at `rp_pod_verify "$RP_POD_ID"` (`ci/scripts/gpu-dev.sh:1258`), and
 `reap`'s own doc states `Every ambiguity resolves toward terminating`
-(`ci/scripts/runpod_lib.sh:1568`). A session or pod belonging to a process
+(`ci/scripts/runpod_lib.sh:1756`). A session or pod belonging to a process
 you did not start is never yours to `down` — the session-name containment
-check `rp_session_name_check` (`ci/scripts/runpod_lib.sh:207`) and the
+check `rp_session_name_check` (`ci/scripts/runpod_lib.sh:233`) and the
 `up --replace` refusal path, `refusing to silently replace it`
 (`ci/scripts/gpu-dev.sh:844`), exist specifically because two processes
 racing `up`/`down` on the same alias is how the
@@ -110,32 +110,32 @@ terminated an unrelated pod.
    loudly (not silently) if neither is set.
 2. **`RP_TTL_HOURS` / `RP_DEV_TTL_HOURS`.** Every pod self-terminates at a
    deadline baked into its own entrypoint at deploy — `_rp_deploy_payload`
-   (`ci/scripts/runpod_lib.sh:1173`) builds a `watchdog = ("( sleep %d; "`
-   (`ci/scripts/runpod_lib.sh:1199`) into it. `up` alone raises the default
-   from `RP_TTL_HOURS="${RP_TTL_HOURS:-8}"` (`ci/scripts/runpod_lib.sh:94`)
+   (`ci/scripts/runpod_lib.sh:1199`) builds a `watchdog = ("( sleep %d; "`
+   (`ci/scripts/runpod_lib.sh:1225`) into it. `up` alone raises the default
+   from `RP_TTL_HOURS="${RP_TTL_HOURS:-8}"` (`ci/scripts/runpod_lib.sh:103`)
    to `RP_DEV_TTL_HOURS="${RP_DEV_TTL_HOURS:-72}"`
    (`ci/scripts/gpu-dev.sh:575`), assigned by
    `RP_TTL_HOURS="$RP_DEV_TTL_HOURS"` (`ci/scripts/gpu-dev.sh:589`) when
    `RP_TTL_HOURS` is not set explicitly — a dev session someone is actively
    using is meant to survive a workday, not die at the throwaway-pod
    default. This is independent of the **account-level sweep**: `rp_sweep`
-   (`ci/scripts/runpod_lib.sh:1571`) judges each `jammi-gpu*` pod against the
+   (`ci/scripts/runpod_lib.sh:1759`) judges each `jammi-gpu*` pod against the
    deadline carried in its own name, `"name": "%s-ttl%s" % (prefix, ttl_h),`
-   (`ci/scripts/runpod_lib.sh:1223`), read back by
+   (`ci/scripts/runpod_lib.sh:1249`), read back by
    `if tail.startswith('-ttl') and tail[4:].isdigit():`
-   (`ci/scripts/runpod_lib.sh:1658`) — so rent a dev pod with
+   (`ci/scripts/runpod_lib.sh:1846`) — so rent a dev pod with
    `RP_TTL_HOURS`/`RP_DEV_TTL_HOURS` set to at least the job's expected
    length; there is no verb to pause the sweep for one pod —
-   `Every pod this tooling rents is named` (`ci/scripts/runpod_lib.sh:95`)
+   `Every pod this tooling rents is named` (`ci/scripts/runpod_lib.sh:104`)
    — and the sweep runs on its own schedule,
    `cron: "23 */6 * * *"` (`.github/workflows/gpu-reap.yml:22`), independent
    of anything else. `RP_DEV_TTL_HOURS` is validated to be a positive
    integer before use — `RP_DEV_TTL_HOURS must be a positive integer`
    (`ci/scripts/gpu-dev.sh:586`) and `RP_DEV_TTL_HOURS must be > 0`
    (`ci/scripts/gpu-dev.sh:588`) — as is `RP_TTL_HOURS` itself, by
-   `RP_TTL_HOURS must be a positive integer` (`ci/scripts/runpod_lib.sh:103`).
+   `RP_TTL_HOURS must be a positive integer` (`ci/scripts/runpod_lib.sh:112`).
 3. **Disk sizing.** `RP_DISK_GB` (default 60 —
-   `RP_DISK_GB="${RP_DISK_GB:-60}"`, `ci/scripts/runpod_lib.sh:106`) must cover `>= 25 (base) + S_src + S_seed +
+   `RP_DISK_GB="${RP_DISK_GB:-60}"`, `ci/scripts/runpod_lib.sh:115`) must cover `>= 25 (base) + S_src + S_seed +
    N*S_clone` (one clone per tree the pod hosts) — the exact `S_src`/
    `S_seed`/`S_clone` byte counts are measured by
    `ci/scripts/perf/pod_build_timings.sh` and committed at
@@ -146,13 +146,13 @@ terminated an unrelated pod.
    default, so a pod hosting 3+ trees sizes up (`RP_DISK_GB=70`+). A mutation-testing session (copy-mode `cargo mutants`, one full
    workspace+target copy per job) wants `RP_DISK_GB >= 120` —
    `A mutation-testing session wants >= 120 GB.`
-   (`ci/scripts/runpod_lib.sh:72`), repeated in the CLI's own env doc at
+   (`ci/scripts/runpod_lib.sh:81`), repeated in the CLI's own env doc at
    `a mutation-testing session wants >= 120 GB.`
    (`ci/scripts/gpu-dev.sh:102`).
 4. **Tool preflight, on the pod.** Both `pod_seed_target.sh` and
    `pod_push_stamp.sh` assert every external tool they call exists
    *before* spending real time: `pod_seed_assert_required_tools`
-   (`ci/scripts/pod_seed_target.sh:105`) requires `cargo`, `git`,
+   (`ci/scripts/pod_seed_target.sh:110`) requires `cargo`, `git`,
    `python3`, and `sha256sum` or `shasum`, and
    `pod_push_assert_required_tools` (`ci/scripts/pod_push_stamp.sh:98`)
    additionally requires `rsync`, `stat`, `awk`, `sort`. Both fail loudly,
@@ -168,17 +168,17 @@ ci/scripts/gpu-dev.sh up a100                 # lead/user only
 ```
 
 `up` provisions across a candidate list built by `rp_deploy_arch`
-(`ci/scripts/runpod_lib.sh:1376`) — SECURE then COMMUNITY cloud tier, PCIe
+(`ci/scripts/runpod_lib.sh:1402`) — SECURE then COMMUNITY cloud tier, PCIe
 then SXM4 variant for `a100`, plus that arch's same-SASS capacity
 fallbacks where it has any (`a100)    cand=`,
-`ci/scripts/runpod_lib.sh:1382`). It polls for SSH up to
+`ci/scripts/runpod_lib.sh:1408`). It polls for SSH up to
 `RP_SSH_WAIT_SECS="${RP_SSH_WAIT_SECS:-600}"`
-(`ci/scripts/runpod_lib.sh:137`), raised for a cold image pull that can take
+(`ci/scripts/runpod_lib.sh:146`), raised for a cold image pull that can take
 minutes before sshd is even up, and rejects any candidate below NVIDIA
 driver r560 — the CUDA 12.6 PTX floor,
 `RP_MIN_DRIVER_MAJOR="${RP_MIN_DRIVER_MAJOR:-560}"`
-(`ci/scripts/runpod_lib.sh:91`), enforced at
-`-ge "$RP_MIN_DRIVER_MAJOR"` (`ci/scripts/runpod_lib.sh:1330`). Expected
+(`ci/scripts/runpod_lib.sh:100`), enforced at
+`-ge "$RP_MIN_DRIVER_MAJOR"` (`ci/scripts/runpod_lib.sh:1356`). Expected
 output ends with:
 
 ```
@@ -192,20 +192,20 @@ output ends with:
 
 — printed by `=== session '${SESSION}' up on` (`ci/scripts/gpu-dev.sh:873`).
 No candidate reachable at all exits `75`, a neutral capacity skip:
-`rp_deploy_live` (`ci/scripts/runpod_lib.sh:1236`) ends with its own
-`return 75` (`ci/scripts/runpod_lib.sh:1360`). Retry — this is not a code
+`rp_deploy_live` (`ci/scripts/runpod_lib.sh:1262`) ends with its own
+`return 75` (`ci/scripts/runpod_lib.sh:1386`). Retry — this is not a code
 failure.
 
 **Readiness is polled state, never a log-banner grep.** `up`/`shell` block
 on SSH liveness inside `rp_deploy_live`'s own wait loop —
 `while [ "$SECONDS" -lt "$_rp_deploy_deadline" ]; do`
-(`ci/scripts/runpod_lib.sh:1317`) — and every later verb
+(`ci/scripts/runpod_lib.sh:1343`) — and every later verb
 (`attach`/`run`/`push`/…) calls `require_pod`
 (`ci/scripts/gpu-dev.sh:691`), which is
 `rp_session_load && rp_session_alive` (`ci/scripts/gpu-dev.sh:692`), and
-`rp_session_alive` (`ci/scripts/runpod_lib.sh:513`) is an actual
+`rp_session_alive` (`ci/scripts/runpod_lib.sh:539`) is an actual
 `ssh "${RP_SSHO[@]}" -p "$RP_PORT" "root@${RP_HOST}" true`
-(`ci/scripts/runpod_lib.sh:515`) — never a string match against a boot log.
+(`ci/scripts/runpod_lib.sh:541`) — never a string match against a boot log.
 Chain any further pod work on this liveness check, not on a fixed sleep.
 
 **`up` refuses over a live session** (exit 2) rather than silently deploying
@@ -221,12 +221,12 @@ terminates the old pod —
 
 **A branch that exists only on your laptop cannot be `--ref`'d.** `up`
 resolves a branch or tag against the remote *before* renting anything —
-`rp_ref_precheck` (`ci/scripts/runpod_lib.sh:1736`) — and a name the remote
+`rp_ref_precheck` (`ci/scripts/runpod_lib.sh:1924`) — and a name the remote
 does not carry fails closed with
-`is not a branch or tag in` (`ci/scripts/runpod_lib.sh:1746`), naming that
+`is not a branch or tag in` (`ci/scripts/runpod_lib.sh:1934`), naming that
 `nothing was rented`; an unreachable remote is equally refused
 (`refusing to rent a pod for a ref that cannot be verified`,
-`ci/scripts/runpod_lib.sh:1748`). Only a 40-hex commit id skips the remote
+`ci/scripts/runpod_lib.sh:1936`). Only a 40-hex commit id skips the remote
 check, and it is then verified on the pod instead. So an unpushed campaign
 branch reaches the pod the other way: boot on `main` (or any pushed ref) and
 `push --tree <name>` the working tree, which sends uncommitted work too. §5
@@ -237,9 +237,9 @@ ci/scripts/gpu-dev.sh ls                      # every session this machine start
 ```
 
 Prints session/pod/ref/arch@host via `rp_session_list`
-(`ci/scripts/runpod_lib.sh:522`), with
+(`ci/scripts/runpod_lib.sh:548`), with
 `column widths are derived from the rows rather than fixed`
-(`ci/scripts/runpod_lib.sh:519`) — a ref is a branch name or a 40-character
+(`ci/scripts/runpod_lib.sh:545`) — a ref is a branch name or a 40-character
 commit id, so every fixed width is eventually too narrow.
 
 ```bash
@@ -279,13 +279,13 @@ tmux attach -t =jammi-seed          # detach: Ctrl-B then D
 or tail `/root/.jammi-seed.log` directly.
 
 **The phases, in order**, all inside `pod_seed_target_main`
-(`ci/scripts/pod_seed_target.sh:634`):
+(`ci/scripts/pod_seed_target.sh:639`):
 
 1. **`--no-lock` re-exec.** Absent `--no-lock`, the script re-execs itself
    through `exec "$DIR/pod_timing_lock.sh" acquire -w`
-   (`ci/scripts/pod_seed_target.sh:661`), waiting up to
+   (`ci/scripts/pod_seed_target.sh:666`), waiting up to
    `JAMMI_SEED_LOCK_WAIT_SECS="${JAMMI_SEED_LOCK_WAIT_SECS:-1800}"`
-   (`ci/scripts/pod_seed_target.sh:58`). `start_seed_build` already runs
+   (`ci/scripts/pod_seed_target.sh:63`). `start_seed_build` already runs
    `--no-lock` inside its own tmux+flock wrapper
    (`flock -n -E 75 /root/.jammi-timing.lock`,
    `ci/scripts/gpu-dev.sh:768`), so this arm is for a caller invoking the
@@ -293,104 +293,105 @@ or tail `/root/.jammi-seed.log` directly.
 2. **Marker gate.** If `.jammi-seed-complete` already exists and `--reseed`
    was not given, the whole run is a no-op —
    `seed already complete ($COMPLETE_MARKER)`
-   (`ci/scripts/pod_seed_target.sh:686`). If `.jammi-seed-failed` exists it
+   (`ci/scripts/pod_seed_target.sh:691`). If `.jammi-seed-failed` exists it
    refuses to retry automatically and prints the failure tail —
    `seed previously FAILED ($FAILED_MARKER)`
-   (`ci/scripts/pod_seed_target.sh:690`). `--reseed` forces either case, and
+   (`ci/scripts/pod_seed_target.sh:695`). `--reseed` forces either case, and
    removes BOTH markers before the rebuild starts:
    `rm -f "$FAILED_MARKER" "$COMPLETE_MARKER"`
-   (`ci/scripts/pod_seed_target.sh:703`).
+   (`ci/scripts/pod_seed_target.sh:708`).
 3. **Required-tools preflight** — `pod_seed_assert_required_tools || return 1`
-   (`ci/scripts/pod_seed_target.sh:678`), §2 item 4 above.
+   (`ci/scripts/pod_seed_target.sh:683`), §2 item 4 above.
 4. **`cargo metadata --locked` priming, network allowed, exactly once** —
    `cargo metadata --locked --format-version 1`
-   (`ci/scripts/pod_seed_target.sh:777`). This is load-bearing: every later
+   (`ci/scripts/pod_seed_target.sh:782`). This is load-bearing: every later
    `--frozen` metadata call in this script needs the *full* cross-platform
    dependency graph already fetched (`cargo metadata` without
    `--filter-platform` walks platform-conditional crates `cargo build` alone
    never fetches). Skipping this step is what produced the a100c incident in
    §8, row 8.
 5. **T1** — `cargo build --release -p jammi-bench --features cuda`
-   (`ci/scripts/pod_seed_target.sh:786`).
+   (`ci/scripts/pod_seed_target.sh:791`).
 6. **T1b** — `cargo build --release -p jammi-bench --features cuda,jammi-kernels/flash-attn`
-   (`ci/scripts/pod_seed_target.sh:831`), **main-only**, gated on the
+   (`ci/scripts/pod_seed_target.sh:836`), **main-only**, gated on the
    checkout's *resolved sha* matching `origin/main` (or
    `JAMMI_SEED_IS_MAIN=1`), never on `abbrev-ref == "main"` — a
    checkout-by-sha always leaves a detached HEAD. The resolution is
    `_seed_main_sha="$(git rev-parse --verify --quiet origin/main`
-   (`ci/scripts/pod_seed_target.sh:735`), compared at
+   (`ci/scripts/pod_seed_target.sh:740`), compared at
    `_seed_main_reason="resolved sha matches origin/main"`
-   (`ci/scripts/pod_seed_target.sh:744`); see §8 row 3.
+   (`ci/scripts/pod_seed_target.sh:749`); see §8 row 3.
    `pod_seed_pkg_has_feature`
-   (`ci/scripts/pod_seed_target.sh:319`) detects flash-attn live via
+   (`ci/scripts/pod_seed_target.sh:324`) detects flash-attn live via
    `cargo metadata`, never hand-asserted; its rc=2 ("could not determine")
    **aborts the whole seed** rather than silently skipping T1b —
    `refusing to guess 'absent'`
-   (`ci/scripts/pod_seed_target.sh:847`). A broken metadata query read as
+   (`ci/scripts/pod_seed_target.sh:852`). A broken metadata query read as
    "absent" is exactly how a seed once stamped complete without its FA2
    artifacts. When T1b's prerequisite checkout is missing, the seed
    provisions it first —
    `git submodule update --init --force --checkout --depth 1`
    (`ci/scripts/pod_seed_target.sh:825`).
-7. **T2** — `cargo test --no-run` for a FIXED, pre-esc-081 crates/features/
-   `--test` selection — a dev-loop compile-cache seed, never asserted to be
-   tuple-for-tuple in lockstep with `runpod_gpu_prove.sh`'s own
-   `PROVE_TUPLE`-declared invocations, several of which esc-081 widened
-   (`cuda,flash-attn,...`) independently of this seed:
+7. **T2** — `cargo test --no-run` for a FIXED crate/feature/`--test`
+   selection (jammi-server/jammi-ai/jammi-kernels, `cuda`/
+   `cuda,live-gpu-tests`) — a dev-loop compile-cache seed that stands on its
+   own: it is never asserted to be tuple-for-tuple in lockstep with
+   `runpod_gpu_prove.sh`'s own `PROVE_TUPLE`-declared invocations, which may
+   carry a different feature list:
    `cargo test -p jammi-server --features cuda,live-gpu-tests --test it --no-run`
-   (`ci/scripts/pod_seed_target.sh:853`) through
+   (`ci/scripts/pod_seed_target.sh:858`) through
    `cargo test -p jammi-kernels --features cuda --no-run`
-   (`ci/scripts/pod_seed_target.sh:856`).
+   (`ci/scripts/pod_seed_target.sh:861`).
 8. **T3** — `cargo clippy -p jammi-kernels --all-targets --features cuda -- -D warnings`
-   (`ci/scripts/pod_seed_target.sh:859`).
+   (`ci/scripts/pod_seed_target.sh:864`).
 9. **Capture build-script stdout before cleaning** —
    `pod_seed_capture_build_output`
-   (`ci/scripts/pod_seed_target.sh:255`), called once per profile at
+   (`ci/scripts/pod_seed_target.sh:260`), called once per profile at
    `pod_seed_capture_build_output "$JAMMI_SEED_DIR" "$capture" debug`
-   (`ci/scripts/pod_seed_target.sh:862`) and
+   (`ci/scripts/pod_seed_target.sh:867`) and
    `pod_seed_capture_build_output "$JAMMI_SEED_DIR" "$capture" release`
-   (`ci/scripts/pod_seed_target.sh:863`). Cargo's own cleaner removes
+   (`ci/scripts/pod_seed_target.sh:868`). Cargo's own cleaner removes
    `build/<pkg>-*/output`, so this is the only chance to read it.
 10. **Member-free clean**: `cargo clean --workspace --frozen`
-    (`ci/scripts/pod_seed_target.sh:866`) and
+    (`ci/scripts/pod_seed_target.sh:871`) and
     `cargo clean --workspace --release --frozen`
-    (`ci/scripts/pod_seed_target.sh:867`), plus an explicit
+    (`ci/scripts/pod_seed_target.sh:872`), plus an explicit
     `rm -rf "${JAMMI_SEED_DIR}"/*/incremental`
-    (`ci/scripts/pod_seed_target.sh:868`) — cargo's own cleaner does not
+    (`ci/scripts/pod_seed_target.sh:873`) — cargo's own cleaner does not
     remove `incremental/build_script_build-*`.
 11. **Non-member path/patch package check** via `cargo metadata`: no
     `source: null` package outside `workspace_members` —
     `asserting no non-member path/patch package (cargo metadata)`
-    (`ci/scripts/pod_seed_target.sh:876`), which fails at
+    (`ci/scripts/pod_seed_target.sh:881`), which fails at
     `non-member path/patch package(s) with source=null`
-    (`ci/scripts/pod_seed_target.sh:883`).
+    (`ci/scripts/pod_seed_target.sh:888`).
 12. **Filesystem-level member-free assertion** —
     `pod_seed_assert_member_free`
-    (`ci/scripts/pod_seed_target.sh:393`), invoked at
+    (`ci/scripts/pod_seed_target.sh:398`), invoked at
     `pod_seed_assert_member_free "$JAMMI_SEED_DIR" "$JAMMI_TREE_DIR" || exit 1`
-    (`ci/scripts/pod_seed_target.sh:888`) — the *only* mechanical,
+    (`ci/scripts/pod_seed_target.sh:893`) — the *only* mechanical,
     always-on check that no `jammi-*`-named entry (hyphenated,
     underscored, or `lib`+underscored — the compiled-library naming form)
     survives under `{debug,release}/{.fingerprint,deps,build,incremental}`.
 13. **Env-surface cross-check** — `pod_seed_check_stdout_subset`
-    (`ci/scripts/pod_seed_target.sh:223`), invoked at
+    (`ci/scripts/pod_seed_target.sh:228`), invoked at
     `pod_seed_check_stdout_subset "$capture" "$MANIFEST" || {`
-    (`ci/scripts/pod_seed_target.sh:891`): every
+    (`ci/scripts/pod_seed_target.sh:896`): every
     `cargo:rerun-if-env-changed=<NAME>` the captured build-script output
     actually announced must be listed in
     `ci/scripts/pod_seed_key_inputs.toml` (§9 below). A captured file that
     is legitimately zero bytes (a build script with nothing `cargo:`-shaped
     to print) is **not** an error on its own —
-    `cargo creates a` (`ci/scripts/pod_seed_target.sh:209`) such a file for
+    `cargo creates a` (`ci/scripts/pod_seed_target.sh:214`) such a file for
     every build script it runs. Only zero *captured files total* is an
     error: `cross-check saw no build-script output at all (capture_count=0)`
-    (`ci/scripts/pod_seed_target.sh:237`), see §8 row 9.
+    (`ci/scripts/pod_seed_target.sh:242`), see §8 row 9.
 14. **Completion marker** — `${JAMMI_SEED_DIR}.jammi-seed-complete`, JSON:
     `ref`, `sha`, `date`, `tuples` (`["T1","T2","T3"]` plus `"T1b"` iff it
     ran), `rustflags`, `size_bytes`, `manifest_sha256`,
     `"t1b_flash_attn_ran": t1b_ran, "t1b_flash_attn_reason": sys.argv[8],`
-    (`ci/scripts/pod_seed_target.sh:919`), written by
-    `> "$COMPLETE_MARKER"` (`ci/scripts/pod_seed_target.sh:922`).
+    (`ci/scripts/pod_seed_target.sh:924`), written by
+    `> "$COMPLETE_MARKER"` (`ci/scripts/pod_seed_target.sh:927`).
 
 **Verifying the seed:**
 
@@ -408,7 +409,7 @@ the phase in progress at failure (the last `=== ... ===` echo), `df -h /`
 and a memory snapshot, every line matching an error/warning/`nvcc fatal`/
 `Killed`/`::error::`/`::warning::` shape (adjacent duplicates collapsed)
 with 20 lines of trailing context, and the last 40 lines — all written by
-`pod_seed_write_failure_marker` (`ci/scripts/pod_seed_target.sh:584`). Read
+`pod_seed_write_failure_marker` (`ci/scripts/pod_seed_target.sh:589`). Read
 it:
 
 ```bash
@@ -418,7 +419,7 @@ ssh -F ~/.config/runpod/ssh_config jammi-a100 \
 
 Re-running without `--reseed` refuses and reprints the tail —
 `seed previously FAILED ($FAILED_MARKER)`
-(`ci/scripts/pod_seed_target.sh:690`) — this is deliberate, so `up`/`shell`
+(`ci/scripts/pod_seed_target.sh:695`) — this is deliberate, so `up`/`shell`
 never silently burn real
 compile minutes retrying a known-broken seed on every invocation. Once the
 real cause is fixed:
@@ -461,8 +462,8 @@ nondeterminism), stated rather than dropped.
 **`target` clones the build-substrate SEED into a fresh `CARGO_TARGET_DIR`
 (`/root/target-<name>`) — it never creates or populates the tree/checkout
 itself.** A tree is populated ONLY by `push`, as `rp_tree_dir`
-(`ci/scripts/runpod_lib.sh:644`) states in its own doc:
-`A tree is populated by` (`ci/scripts/runpod_lib.sh:637`) that verb's rsync
+(`ci/scripts/runpod_lib.sh:670`) states in its own doc:
+`A tree is populated by` (`ci/scripts/runpod_lib.sh:663`) that verb's rsync
 and nothing else. `--with-cutlass` provisions cutlass INTO an
 already-pushed tree (`pod_provision_cutlass.sh`); against a tree that has
 never been pushed it REFUSES with the tool's own error text —
@@ -649,21 +650,21 @@ repository for `crates/jammi-bench/build.rs`'s `git rev-parse` fallback to
 read: it bakes `build_sha="unknown"`, and every producer that cross-checks a
 binary's own reported provenance then refuses the run. The default closes
 this without anyone typing a sha: the job wrapper's env preamble
-`rp_job_env_lines` (`ci/scripts/runpod_lib.sh:871`) ends by calling
-`rp_job_build_sha_lines "$tree_dir"` (`ci/scripts/runpod_lib.sh:876`), and
-`rp_job_build_sha_lines` (`ci/scripts/runpod_lib.sh:915`) reads
+`rp_job_env_lines` (`ci/scripts/runpod_lib.sh:897`) ends by calling
+`rp_job_build_sha_lines "$tree_dir"` (`ci/scripts/runpod_lib.sh:902`), and
+`rp_job_build_sha_lines` (`ci/scripts/runpod_lib.sh:941`) reads
 `<tree>/.jammi-push-stamp.json` on the pod and runs
-`export JAMMI_BUILD_SHA` (`ci/scripts/runpod_lib.sh:941`) — **but only when
+`export JAMMI_BUILD_SHA` (`ci/scripts/runpod_lib.sh:967`) — **but only when
 that stamp says the pushed tree was CLEAN**, i.e.
 `and stamp.get("porcelain_sha256") == clean`
-(`ci/scripts/runpod_lib.sh:934`) and the same for `diff_head_sha256`, both
+(`ci/scripts/runpod_lib.sh:960`) and the same for `diff_head_sha256`, both
 against the digest of the empty string. `push` sends uncommitted work too,
 so on a dirty push `laptop_head` names the commit the tree was *based on*,
 not the commit it *is*; exporting it there would be a fabricated
 provenance, which is worse than `unknown` because a reader cannot detect
 it. On a dirty (or absent, or unreadable) stamp the variable is left unset
 and the job log carries `JAMMI_BUILD_SHA left UNSET`
-(`ci/scripts/runpod_lib.sh:945`) as a `::warning::`.
+(`ci/scripts/runpod_lib.sh:971`) as a `::warning::`.
 
 Two consequences worth knowing:
 
@@ -893,8 +894,8 @@ lifetime is the job's lifetime, not the short-lived SSH invocation that
 started tmux and returned in under a second. `run --timing` moved its OWN
 acquisition *inside* the generated `.jammi-job.sh` wrapper instead:
 `rp_job_wrapper_with_marker_lines`
-(`ci/scripts/runpod_lib.sh:1026`) emits the fd-based
-`if ! flock -n 9; then` (`ci/scripts/runpod_lib.sh:1051`), essentially the
+(`ci/scripts/runpod_lib.sh:1052`) emits the fd-based
+`if ! flock -n 9; then` (`ci/scripts/runpod_lib.sh:1077`), essentially the
 first real step of that script too, for the identical M6 reasoning — rather
 than split across an outer `flock -n -E 75 ... bash job.sh` command line,
 which is why `LAUNCH`'s own if/else,
@@ -1030,15 +1031,15 @@ ci/scripts/gpu-dev.sh down a100               # lead/user only
 `down` (`ci/scripts/gpu-dev.sh:1246`) never trusts the locally-recorded pod
 id on its own: it calls `rp_pod_verify "$RP_POD_ID" >/dev/null`
 (`ci/scripts/gpu-dev.sh:1258`), and `rp_pod_verify`
-(`ci/scripts/runpod_lib.sh:349`) confirms the id is **both** still present
+(`ci/scripts/runpod_lib.sh:375`) confirms the id is **both** still present
 in the account's live pod list **and** named like this tooling's own pods —
 `shape = re.compile(r"^%s-ttl[0-9]+$" % re.escape(prefix))`
-(`ci/scripts/runpod_lib.sh:367`):
+(`ci/scripts/runpod_lib.sh:393`):
 
 - **Match** → `rp_terminate "$RP_POD_ID"` (`ci/scripts/gpu-dev.sh:1261`),
   then **confirm gone** by re-querying the account —
   `if rp_pod_gone "$RP_POD_ID"; then` (`ci/scripts/gpu-dev.sh:1268`), whose
-  implementation is `rp_pod_gone` (`ci/scripts/runpod_lib.sh:404`) — before
+  implementation is `rp_pod_gone` (`ci/scripts/runpod_lib.sh:430`) — before
   forgetting the local record. A rejected `podTerminate` must never both
   leak the pod and destroy the only record pointing at it, so the
   unconfirmed arm keeps it: `the local session record is KEPT — retry`
@@ -1056,9 +1057,9 @@ in the account's live pod list **and** named like this tooling's own pods —
   refuse on.
 
 **The id, not the TTL, is authoritative** — `Two earlier versions tried`
-(`ci/scripts/runpod_lib.sh:293`) to make the exact TTL part of this check,
+(`ci/scripts/runpod_lib.sh:319`) to make the exact TTL part of this check,
 and both were removed: one as a false-refusal source, the other because it
-was `found INERT on every input` (`ci/scripts/runpod_lib.sh:303`). The full
+was `found INERT on every input` (`ci/scripts/runpod_lib.sh:329`). The full
 history is in that comment. RunPod pod ids are globally unique, so
 name-shape plus a matched id is already sufficient.
 
@@ -1078,29 +1079,29 @@ ci/scripts/gpu-dev.sh reap 2                  # force-reap everything older than
 
 `reap` is account-wide (never a per-session verb) and judges age from
 `Age comes from createdAt, never from runtime.uptimeInSeconds`
-(`ci/scripts/runpod_lib.sh:1636`) — uptime is null for the first minutes of
+(`ci/scripts/runpod_lib.sh:1824`) — uptime is null for the first minutes of
 a healthy pod and can reset on a container restart, either of which would
 misjudge age. `Every ambiguity resolves toward terminating.`
-(`ci/scripts/runpod_lib.sh:1568`): a stopped pod
+(`ci/scripts/runpod_lib.sh:1756`): a stopped pod
 (`print(p['id'], age if age is not None else -1, 'not-running'); continue`,
-`ci/scripts/runpod_lib.sh:1649`) and an unparseable deadline
+`ci/scripts/runpod_lib.sh:1837`) and an unparseable deadline
 (`print(p['id'], age, 'unparseable-deadline'); continue`,
-`ci/scripts/runpod_lib.sh:1661`) are both swept. The ONE deliberate
+`ci/scripts/runpod_lib.sh:1849`) are both swept. The ONE deliberate
 exception is a pod with no usable `createdAt` at all: it is reported for an
 operator to force-reap, never terminated on a guess —
-`has no usable createdAt` (`ci/scripts/runpod_lib.sh:1676`), selected by
+`has no usable createdAt` (`ci/scripts/runpod_lib.sh:1864`), selected by
 `print('UNAGEABLE', p['id'], name); continue`
-(`ci/scripts/runpod_lib.sh:1653`). A query that cannot reach RunPod at all
+(`ci/scripts/runpod_lib.sh:1841`). A query that cannot reach RunPod at all
 fails loudly rather than reporting "nothing to clean up":
-`sweep could NOT enumerate pods` (`ci/scripts/runpod_lib.sh:1669`).
+`sweep could NOT enumerate pods` (`ci/scripts/runpod_lib.sh:1805`).
 
 **Reconciling account state when boot output was empty.** If `up`/`shell`
 returned with no coordinates (a dropped connection mid-deploy, a killed
 laptop), do not assume nothing was rented — `rp_deploy_live` sets
-`RP_POD_CREATED=1` (`ci/scripts/runpod_lib.sh:1287`) the *instant* a pod id
+`RP_POD_CREATED=1` (`ci/scripts/runpod_lib.sh:1313`) the *instant* a pod id
 comes back from the deploy mutation, minutes before SSH ever comes up
 (`THIS is the moment a pod exists and starts billing`,
-`ci/scripts/runpod_lib.sh:1278`), so a pod can exist and bill even when the
+`ci/scripts/runpod_lib.sh:1304`), so a pod can exist and bill even when the
 invocation that rented it never got to print anything. Reconcile via:
 
 ```bash
@@ -1125,16 +1126,16 @@ exists) a `test_pod_substrate.sh` leg.
 |---|---|---|---|---|
 | 1 | A tree has `.git` | `push` excludes `.git` entirely — `pod_push_excludes` (`ci/scripts/pod_push_stamp.sh:163`) — a pushed tree is a plain rsync'd directory | `git submodule`/any git command on a pushed tree fails "not a git repository" | `ONE provisioning surface for cutlass in ANY tree` (`ci/scripts/pod_provision_cutlass.sh:16`), that file's own module doc; `(m/A1 match) matching stamp/submodule` (`ci/scripts/test_pod_substrate.sh:1601`) and its `(m/A1 drift)`/`(m/A1 deinit)`/`(m/A1 fetch-failure)`/`(m/A1 revert-RED)` siblings |
 | 2 | A destination path is either untouched or a real git submodule | It can already hold a **copy-provisioned** cutlass (`cp -a` with `.git` stripped — `rm -rf "${TREE_SOURCE_DIR:?}/${CUTLASS_PATH:?}/.git"`, `ci/scripts/pod_provision_cutlass.sh:236`) | `git submodule update --init` on that path refuses (non-empty, non-submodule-shaped dir) — a live a100c run wasted 819s before failing | `the class this fix closes` (`ci/scripts/pod_provision_cutlass.sh:39`), that file's module doc; provisioning now `rm -rf` + `cp -a` unconditionally, never asks git to touch the destination |
-| 3 | `git rev-parse --abbrev-ref HEAD == "main"` on a checkout of main | A checkout-by-sha (the ordinary shape for an FA2 PR tip / a resolved seed sha) always leaves a **detached HEAD**, whose abbrev-ref reads the literal `"HEAD"` | T1b/the FA2 leg silently never ran, with no recorded reason — indistinguishable from "correctly determined not-main" | `_seed_is_main="false"` (`ci/scripts/pod_seed_target.sh:736`); `Gated on the RESOLVED` (`ci/scripts/perf/pod_build_timings.sh:427`); `(n/addendum EXECUTABLE b) DETACHED HEAD at the SAME sha as origin/main` (`ci/scripts/test_pod_substrate.sh:1982`) — gated on the *resolved sha*, `t1b_ran`/`t1b_reason` and `fa2_ran`/`fa2_reason` always recorded |
+| 3 | `git rev-parse --abbrev-ref HEAD == "main"` on a checkout of main | A checkout-by-sha (the ordinary shape for an FA2 PR tip / a resolved seed sha) always leaves a **detached HEAD**, whose abbrev-ref reads the literal `"HEAD"` | T1b/the FA2 leg silently never ran, with no recorded reason — indistinguishable from "correctly determined not-main" | `_seed_is_main="false"` (`ci/scripts/pod_seed_target.sh:741`); `Gated on the RESOLVED` (`ci/scripts/perf/pod_build_timings.sh:427`); `(n/addendum EXECUTABLE b) DETACHED HEAD at the SAME sha as origin/main` (`ci/scripts/test_pod_substrate.sh:1982`) — gated on the *resolved sha*, `t1b_ran`/`t1b_reason` and `fa2_ran`/`fa2_reason` always recorded |
 | 4 | `git status --porcelain`/`git diff HEAD` failing == "no output" == "clean" | A failing git command in a real repo (locked index, corrupted ref) also produces empty stdout, hashing to the identical `sha256("")` a genuinely clean tree would produce | `manifest_sha256`/`porcelain_sha256` reports a byte-identical "clean" hash for a broken repo-root | `'git status --porcelain' failed in a real repo` (`ci/scripts/pod_push_stamp.sh:281`), discriminated on whether `HEAD` itself resolved at `if [ "$head" = "unknown" ]; then` (`ci/scripts/pod_push_stamp.sh:275`) |
 | 5 | `git rev-parse HEAD:<path>` on a missing path fails with empty output | The **bare** form echoes its own argument text to stdout (rc=128) — `git rev-parse HEAD:no/such/path` literally prints `HEAD:no/such/path` | A bogus literal string becomes `cutlass_gitlink`/an expected pin, read as a real (but wrong) value | `cutlass_gitlink="$(git -C "$repo" rev-parse --verify --quiet` (`ci/scripts/pod_push_stamp.sh:321`); `git rev-parse HEAD:<gitlink-path>` (`ci/scripts/pod_provision_cutlass.sh:63`) — every call site now uses `--verify --quiet`, silent on a miss |
 | 6 | `stat -f FORMAT` means "use this format string" | On GNU coreutils, `-f` means "display file **system** status" (the opposite of BSD) — the old fallthrough printed a multi-line, live `Free:`-block-bearing status report to stdout before failing | `manifest_sha256` diverged nondeterministically between two hosts building the identical bundle (a100c vs a100e) | `pod_push_stat_mode` (`ci/scripts/pod_push_stamp.sh:134`) — flavour detected once via `if stat --version >/dev/null 2>&1; then` (`ci/scripts/pod_push_stamp.sh:137`), memoized |
 | 7 | Pushing files as `root@pod` leaves them root-owned | `rsync -a` preserves owner/group from the **laptop's** own uid (e.g. 501) unless told not to | `git`, run as root inside the pushed tree, refuses "detected dubious ownership" | `rsync -azc --no-times --no-owner --no-group --delete` (`ci/scripts/gpu-dev.sh:1114`) |
-| 8 | `cargo metadata --frozen` "just works" once `Cargo.lock` exists | `cargo metadata` (unlike `cargo build`) resolves the **full cross-platform** graph by default, needing source for platform-conditional crates never otherwise fetched | Seed pipeline died on "failed to download android_system_properties ... --frozen was specified" *after* T1–T3 had already succeeded | `cargo metadata --locked --format-version 1` (`ci/scripts/pod_seed_target.sh:777`), the one-time network-allowed priming call before every `--frozen` call; `pod_seed_cargo_metadata_frozen` (`ci/scripts/pod_seed_target.sh:306`) captures real stderr, never discards it |
-| 9 | A zero-byte captured `build/<pkg>-*/output` file means "captured at the wrong moment" | Cargo creates that file for **every** build script it runs, regardless of whether the script prints anything — a real no-op script legitimately produces zero bytes | An earlier fix flagged legitimate zero-byte captures (chrono-tz, esaxx-rs, pulldown-cmark, rustls, scratch, snap, stacker, prometheus) as errors, aborting every real seed build | `pod_seed_check_stdout_subset` (`ci/scripts/pod_seed_target.sh:223`), whose own doc records that `cargo creates a` (`ci/scripts/pod_seed_target.sh:209`) zero-byte file legitimately; `(l/N4) an unlisted announced var reddens the cross-check` (`ci/scripts/test_pod_substrate.sh:1356`) and `(l/N4 revert-RED) the OLD per-file empty-is-an-error rule` (`ci/scripts/test_pod_substrate.sh:1424`) |
+| 8 | `cargo metadata --frozen` "just works" once `Cargo.lock` exists | `cargo metadata` (unlike `cargo build`) resolves the **full cross-platform** graph by default, needing source for platform-conditional crates never otherwise fetched | Seed pipeline died on "failed to download android_system_properties ... --frozen was specified" *after* T1–T3 had already succeeded | `cargo metadata --locked --format-version 1` (`ci/scripts/pod_seed_target.sh:782`), the one-time network-allowed priming call before every `--frozen` call; `pod_seed_cargo_metadata_frozen` (`ci/scripts/pod_seed_target.sh:311`) captures real stderr, never discards it |
+| 9 | A zero-byte captured `build/<pkg>-*/output` file means "captured at the wrong moment" | Cargo creates that file for **every** build script it runs, regardless of whether the script prints anything — a real no-op script legitimately produces zero bytes | An earlier fix flagged legitimate zero-byte captures (chrono-tz, esaxx-rs, pulldown-cmark, rustls, scratch, snap, stacker, prometheus) as errors, aborting every real seed build | `pod_seed_check_stdout_subset` (`ci/scripts/pod_seed_target.sh:228`), whose own doc records that `cargo creates a` (`ci/scripts/pod_seed_target.sh:214`) zero-byte file legitimately; `(l/N4) an unlisted announced var reddens the cross-check` (`ci/scripts/test_pod_substrate.sh:1356`) and `(l/N4 revert-RED) the OLD per-file empty-is-an-error rule` (`ci/scripts/test_pod_substrate.sh:1424`) |
 | 10 | Two builds of the identical tree on the same box produce byte-identical linked binaries | mold 2.35.1 / clang 21's ThinLTO codegen embeds local-symbol suffixes (`anon.<h>.N.llvm.<hash>`) that differ between two builds of the **same** tree | `release/jammi-bench` (467 differing symbols) made the byte-equality leg read `false` even though every deterministic artifact (`*.ptx`, `.rlib`/`.rmeta`) matched | `the FINAL LINKED BINARY` (`ci/scripts/perf/pod_build_timings.sh:375`) and `"byte_equal_scope": {` (`ci/scripts/perf/pod_build_timings.sh:700`) — the linked binary is explicitly excluded, never silently dropped from the claim |
-| 11 | `push --tree <name>`'s rsync destination is reachable | rsync creates only the LAST path component of its own destination — nothing in the pod bootstrap or the build-substrate seed provisions `/root/trees` itself | The very FIRST `push` for a name no session has ever pushed before fails outright on a fresh pod: `rsync: mkdir "/root/trees/<name>" failed: No such file or directory (2)` (observed live on pod u4hfsqyu0i2qwa) | `rp_push_ensure_parent` (`ci/scripts/runpod_lib.sh:682`), a bounded, idempotent remote `mkdir -p` on the parent called before every push at `rp_push_ensure_parent "$TREE_DIR" \` (`ci/scripts/gpu-dev.sh:1084`); `(y/esc-056) gpu-dev.sh's push case calls rp_push_ensure_parent` (`ci/scripts/test_pod_substrate.sh:3699`) |
-| 12 | `gpu-dev.sh`'s `REPO_ROOT` names the checkout the caller means | It is derived from the SCRIPT's own on-disk location, never `$PWD` — a multi-worktree laptop keeps more than one copy simultaneously | Invoking one tree's script copy from inside a DIFFERENT tree silently `push`/`run`/`target`s the WRONG tree; the push-stamp's own `laptop_head` field was the only tell (M1b) | `if [ "${RP_ALLOW_ROOT_MISMATCH:-0}" != "1" ]; then` (`ci/scripts/gpu-dev.sh:293`) — push/run/target refuse on a cwd/`REPO_ROOT` mismatch at `would silently act on ${REPO_ROOT}, NOT the tree you are standing in.` (`ci/scripts/gpu-dev.sh:297`), and `set RP_ALLOW_ROOT_MISMATCH=1 to override` (`ci/scripts/gpu-dev.sh:299`); `(z/esc-056) 'push' from a plain (non-git) mismatched cwd REFUSES` (`ci/scripts/test_pod_substrate.sh:3827`) |
+| 11 | `push --tree <name>`'s rsync destination is reachable | rsync creates only the LAST path component of its own destination — nothing in the pod bootstrap or the build-substrate seed provisions `/root/trees` itself | The very FIRST `push` for a name no session has ever pushed before fails outright on a fresh pod: `rsync: mkdir "/root/trees/<name>" failed: No such file or directory (2)` (observed live on pod u4hfsqyu0i2qwa) | `rp_push_ensure_parent` (`ci/scripts/runpod_lib.sh:708`), a bounded, idempotent remote `mkdir -p` on the parent called before every push at `rp_push_ensure_parent "$TREE_DIR" \` (`ci/scripts/gpu-dev.sh:1084`); `(y/esc-056) gpu-dev.sh's push case calls rp_push_ensure_parent` (`ci/scripts/test_pod_substrate.sh:3704`) |
+| 12 | `gpu-dev.sh`'s `REPO_ROOT` names the checkout the caller means | It is derived from the SCRIPT's own on-disk location, never `$PWD` — a multi-worktree laptop keeps more than one copy simultaneously | Invoking one tree's script copy from inside a DIFFERENT tree silently `push`/`run`/`target`s the WRONG tree; the push-stamp's own `laptop_head` field was the only tell (M1b) | `if [ "${RP_ALLOW_ROOT_MISMATCH:-0}" != "1" ]; then` (`ci/scripts/gpu-dev.sh:293`) — push/run/target refuse on a cwd/`REPO_ROOT` mismatch at `would silently act on ${REPO_ROOT}, NOT the tree you are standing in.` (`ci/scripts/gpu-dev.sh:297`), and `set RP_ALLOW_ROOT_MISMATCH=1 to override` (`ci/scripts/gpu-dev.sh:299`); `(z/esc-056) 'push' from a plain (non-git) mismatched cwd REFUSES` (`ci/scripts/test_pod_substrate.sh:3832`) |
 
 ---
 
@@ -1142,8 +1143,8 @@ exists) a `test_pod_substrate.sh` leg.
 
 | Script | Synopsis | Key env vars | Exit codes |
 |---|---|---|---|
-| `ci/scripts/gpu-dev.sh` | The CLI: `shell`/`up`/`target`/`attach`/`run`/`logs`/`push`/`pull`/`wait-seed`/`wait-job`/`down`/`ls`/`reap` — `# Usage:` (`ci/scripts/gpu-dev.sh:33`), restated for `--help` by `usage()` (`ci/scripts/gpu-dev.sh:119`) | `RUNPOD_API_KEY`, `RP_IMAGE`, `RP_TTL_HOURS`, `RP_DEV_TTL_HOURS`, `RP_DISK_GB`, `RP_VOLUME_GB`, `RP_WAIT_TIMEOUT_SECS`, `RP_WAIT_INTERVAL_SECS`, `RP_WAIT_MAX_TRANSPORT_FAILS` — `# Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE,` (`ci/scripts/gpu-dev.sh:95`), restated in `usage()`'s own `Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE,` (`ci/scripts/gpu-dev.sh:229`) | `0` ok; `2` usage/argument error; `1` a real failure (bootstrap, verify, named wait-seed/wait-job failure); `75` no-capacity neutral skip (propagated from `rp_deploy_live`); `wait-seed`/`wait-job` additionally: `2` transport failure, `3` timed out with no verdict — `A timeout with no verdict either way exits 3.` (`ci/scripts/gpu-dev.sh:228`), implemented by `rp_wait_poll` (`ci/scripts/runpod_lib.sh:1489`) |
-| `ci/scripts/runpod_lib.sh` | Shared RunPod primitive — deploy/verify/terminate/sweep/wait-poll; sourced, not run directly — `Shared RunPod GPU primitive — one seam for every caller.` (`ci/scripts/runpod_lib.sh:2`) | `RUNPOD_API_KEY`, `RP_SESSION`, `RP_KEEP`, `RP_TTL_HOURS` (default 8 — `RP_TTL_HOURS="${RP_TTL_HOURS:-8}"`, `ci/scripts/runpod_lib.sh:94`), `RP_DISK_GB` (default 60 — `RP_DISK_GB="${RP_DISK_GB:-60}"`, `ci/scripts/runpod_lib.sh:106`), `RP_SSH_WAIT_SECS` (default 600 — `RP_SSH_WAIT_SECS="${RP_SSH_WAIT_SECS:-600}"`, `ci/scripts/runpod_lib.sh:137`), `RP_WAIT_SSH_BOUND_SECS`, the local kill bound `_rp_bounded_capture` (`ci/scripts/runpod_lib.sh:1434`) applies | `rp_pod_verify`: `0` match, `1` present-wrong-shape, `2` query failed, `3` absent — `Returns 1 (present, but` (`ci/scripts/runpod_lib.sh:315`), implemented at `rp_pod_verify` (`ci/scripts/runpod_lib.sh:349`); `rp_deploy_live`: `0` ok, `1` real deploy fault, `75` no reachable capacity — `(neutral skip) when no candidate yields a reachable pod` (`ci/scripts/runpod_lib.sh:1234`), implemented at `rp_deploy_live` (`ci/scripts/runpod_lib.sh:1236`); `rp_wait_poll`: `0` success, `1` named failure, `2` transport failure, `3` timed out — `Returns 0 (success), 1 (named failure` (`ci/scripts/runpod_lib.sh:1486`) |
+| `ci/scripts/gpu-dev.sh` | The CLI: `shell`/`up`/`target`/`attach`/`run`/`logs`/`push`/`pull`/`wait-seed`/`wait-job`/`down`/`ls`/`reap` — `# Usage:` (`ci/scripts/gpu-dev.sh:33`), restated for `--help` by `usage()` (`ci/scripts/gpu-dev.sh:119`) | `RUNPOD_API_KEY`, `RP_IMAGE`, `RP_TTL_HOURS`, `RP_DEV_TTL_HOURS`, `RP_DISK_GB`, `RP_VOLUME_GB`, `RP_WAIT_TIMEOUT_SECS`, `RP_WAIT_INTERVAL_SECS`, `RP_WAIT_MAX_TRANSPORT_FAILS` — `# Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE,` (`ci/scripts/gpu-dev.sh:95`), restated in `usage()`'s own `Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE,` (`ci/scripts/gpu-dev.sh:229`) | `0` ok; `2` usage/argument error; `1` a real failure (bootstrap, verify, named wait-seed/wait-job failure); `75` no-capacity neutral skip (propagated from `rp_deploy_live`); `wait-seed`/`wait-job` additionally: `2` transport failure, `3` timed out with no verdict — `A timeout with no verdict either way exits 3.` (`ci/scripts/gpu-dev.sh:228`), implemented by `rp_wait_poll` (`ci/scripts/runpod_lib.sh:1677`) |
+| `ci/scripts/runpod_lib.sh` | Shared RunPod primitive — deploy/verify/terminate/sweep/wait-poll; sourced, not run directly — `Shared RunPod GPU primitive — one seam for every caller.` (`ci/scripts/runpod_lib.sh:2`) | `RUNPOD_API_KEY`, `RP_SESSION`, `RP_KEEP`, `RP_TTL_HOURS` (default 8 — `RP_TTL_HOURS="${RP_TTL_HOURS:-8}"`, `ci/scripts/runpod_lib.sh:103`), `RP_DISK_GB` (default 60 — `RP_DISK_GB="${RP_DISK_GB:-60}"`, `ci/scripts/runpod_lib.sh:115`), `RP_SSH_WAIT_SECS` (default 600 — `RP_SSH_WAIT_SECS="${RP_SSH_WAIT_SECS:-600}"`, `ci/scripts/runpod_lib.sh:146`), `RP_WAIT_SSH_BOUND_SECS`, the local kill bound `_rp_bounded_capture` (`ci/scripts/runpod_lib.sh:1622`) applies | `rp_pod_verify`: `0` match, `1` present-wrong-shape, `2` query failed, `3` absent — `Returns 1 (present, but` (`ci/scripts/runpod_lib.sh:341`), implemented at `rp_pod_verify` (`ci/scripts/runpod_lib.sh:375`); `rp_deploy_live`: `0` ok, `1` real deploy fault, `75` no reachable capacity — `(neutral skip) when no candidate yields a reachable pod` (`ci/scripts/runpod_lib.sh:1260`), implemented at `rp_deploy_live` (`ci/scripts/runpod_lib.sh:1262`); `rp_wait_poll`: `0` success, `1` named failure, `2` transport failure, `3` timed out — `Returns 0 (success), 1 (named failure` (`ci/scripts/runpod_lib.sh:1674`) |
 | `ci/scripts/pod_seed_target.sh` | Builds/cleans the member-free seed — `Builds and cleans a MEMBER-FREE pod build-substrate seed` (`ci/scripts/pod_seed_target.sh:2`) | `JAMMI_SEED_DIR` (default `/root/.jammi-seed`), `JAMMI_TREE_DIR` (default `/root/jammi-ai`), `JAMMI_SEED_LOCK_WAIT_SECS` (default 1800), `--reseed`, `--no-lock`, `JAMMI_SEED_DRY_RUN` | `0` ok/no-op; non-zero on any build/check failure, writes `.jammi-seed-failed` |
 | `ci/scripts/pod_target_clone.sh` | Clones the seed into a fresh `CARGO_TARGET_DIR`; `--verify` checks a piped `cargo build -v` log — `Usage: pod_target_clone.sh <seed-dir> <dest-dir> [tree-dir] [--verify|--adopt]` (`ci/scripts/pod_target_clone.sh:12`) | positional `<seed-dir> <dest-dir> [tree-dir]`, `--verify` | `0` ok; `1` member-free check failed post-clone (clone removed) or verify found a `Fresh jammi-*` unit; `2` destination already exists; `3` no seed at `<seed-dir>` |
 | `ci/scripts/pod_provision_cutlass.sh` | The one cutlass provisioning surface into an existing tree — `Provisions cutlass INTO an already-pushed tree` (`ci/scripts/pod_provision_cutlass.sh:2`) | positional `<source-tree-dir> [super-dir]` (default `/root/jammi-ai`) | `0` ok/no-op (self-target); `1` any validation, network, or mismatch failure |
@@ -1218,13 +1219,13 @@ header in the file) covers:
   (`ci/scripts/test_pod_substrate.sh:3510`) — the seed-tuple-unguarded class
   closure.
 - `(y/esc-056) escape esc-056-pod-substrate-assumes-single-fresh-state,`
-  (`ci/scripts/test_pod_substrate.sh:3680`) — `push` provisions its own
+  (`ci/scripts/test_pod_substrate.sh:3685`) — `push` provisions its own
   tree's parent directory before rsyncing, on a fresh pod.
 - `(z/esc-056) escape esc-056-pod-substrate-assumes-single-fresh-state,`
-  (`ci/scripts/test_pod_substrate.sh:3808`) — `push`/`run`/`target` refuse a
+  (`ci/scripts/test_pod_substrate.sh:3813`) — `push`/`run`/`target` refuse a
   cwd/`REPO_ROOT` mismatch, `RP_ALLOW_ROOT_MISMATCH=1` overrides.
 - `(aa/esc-056) escape esc-056-pod-substrate-assumes-single-fresh-state,`
-  (`ci/scripts/test_pod_substrate.sh:3908`) — `up` records the session the
+  (`ci/scripts/test_pod_substrate.sh:3913`) — `up` records the session the
   MOMENT the pod id comes back from the deploy mutation, never only after
   the reachability wait, so a failure in that window cannot leave a
   running, billing pod recorded nowhere.

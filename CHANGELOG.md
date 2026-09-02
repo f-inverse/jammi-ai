@@ -43,6 +43,33 @@ workspace ships every publishable crate at the same
   `:116`) is the one operator knob and is diagnostic only: unset selects the
   seam, `default` restores the platform VFS and re-arms the failure the seam
   closes. Engaging it logs a `WARN`; it is never set in production.
+- **`[training] run_worker` / `JAMMI_TRAINING__RUN_WORKER` — whether THIS
+  process runs the training claim loop.** The `run_worker` field
+  (`crates/jammi-db/src/config.rs:703`, `TrainingConfig`) defaults to
+  `true`; the `JAMMI_TRAINING__RUN_WORKER` environment override is parsed by
+  the fail-closed `parse_env_bool` (`crates/jammi-db/src/config.rs:1241`) —
+  an unparsable value is a typed load error, never a silently ignored
+  override. Read by the server runtime's `assemble_grpc_chain`
+  (`crates/jammi-server/src/runtime.rs:879`), the Python embedded arm's
+  `PyDatabase::open` (`crates/jammi-python/src/database.rs:91`), and the
+  Rust SDK front door's `Session::with_configured_worker`
+  (`crates/jammi-ai/src/local_session.rs:156`): with `run_worker = false` a
+  process still mounts and serves `TrainingService` and still accepts
+  submissions, but never claims. Submitted jobs stay `queued` until some
+  process configured with `run_worker = true` opens the catalog; on SQLite
+  (a single-process catalog) a queued job is claimed by the next claiming
+  process that opens the directory, not necessarily the one that submitted
+  it.
+- **Python `training_job(job_id)` and `list_training_jobs()`, on both
+  client arms.** A training job handle now survives its submitting
+  connection: `training_job` attaches to an existing job by id and
+  `list_training_jobs` lists every job visible to the current tenant, most
+  recent first — both on the embedded arm
+  (`clients/python/jammi/_embedded.py:433`, `:450`) and the remote arm
+  (`clients/python/jammi/_database.py:2348`, `:2391`). A `job_id` with no
+  row visible to this tenant raises the same typed `BackendError` every
+  other catalog miss raises; there is no separate existence check to drift
+  from the catalog read itself.
 
 ### Changed
 - **Embedded `Session.close()` is an awaited release, not a documented RAII
@@ -56,6 +83,30 @@ workspace ships every publishable crate at the same
   the two arms carry one contract (`clients/python/jammi/_backend.py:83`).
   What each releases still differs — the gRPC and Flight channels remote,
   the catalog file embedded — the contract does not.
+- **BEHAVIOUR CHANGE: the embedded Python arm now resolves configuration
+  exactly like the server binary.** `open_local`
+  (`crates/jammi-python/src/lib.rs:78`) builds its `JammiConfig` through the
+  same `JammiConfig::load` (`crates/jammi-db/src/config.rs:1058`) call
+  `jammi-server`'s `main` makes, with the same precedence: the explicit
+  `config` path, else `JAMMI_CONFIG`, else `./jammi.toml`, else the platform
+  config dir, and then every `JAMMI_*` environment override layered on top.
+  Previously the embedded arm used defaults and no `JAMMI_*` override
+  reached an embedded process — a key only one arm honoured was a
+  server-only feature masquerading as a deployment setting. The explicit
+  keyword arguments `open_local` accepts are still applied AFTER the load
+  and still win: a config file or `JAMMI_ARTIFACT_DIR` never overrides an
+  `artifact_dir` passed explicitly.
+- **WIRE SEMANTICS CHANGE (shape-compatible, `api_freeze` unaffected):
+  `TrainingStatusResponse.model_id` is now populated at every lifecycle
+  status.** `model_id`
+  (`crates/jammi-wire/proto/jammi/v1/training.proto:445`) previously stayed
+  empty until the job completed; it now carries the engine's derived id at
+  `queued`, `running`, `completed`, and `failed` alike, resolved by
+  `resolve_model_id`
+  (`crates/jammi-ai/src/fine_tune/training_job.rs:117`) from the persisted
+  job row. An integrator that used a non-empty `model_id` as a completion
+  test must use `status` instead — the embedded and remote attaches now
+  agree on `model_id` at every state, not only at completion.
 
 ### Removed
 - **`Capability.CLOSE`, from the Python client `jammi`.** A public API

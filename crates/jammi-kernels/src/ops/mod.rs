@@ -15,9 +15,12 @@
 //! carries maintenance cost instead of proving anything: campaign #446
 //! W2-B removed the one such op this module still had (a toy
 //! `y' = alpha * x + y`) after a CUDA census measured the work it could
-//! have replaced at well under the pre-registered wire bar on every
-//! shipped dtype leg — see this crate's `artifacts/cuda-runs/` census
-//! record dated 2026-09-01 and the commit that deleted it.
+//! have replaced at 0.0074% / 0.0259% / 0.0269% of per-step GPU time on
+//! the shipped f32 / bf16 / f16 ModernBERT-large legs, against a wire bar
+//! of 2.0% registered before any leg ran — measured by
+//! `crates/jammi-kernels/artifacts/cuda-runs/2026-09-01-axpy-census-bdeb80c-a100-pcie.json`,
+//! which also records why the eager-AdamW control leg's 1.65% cannot
+//! carry a wire decision (it is a fallback the shipped path never takes).
 //!
 //! **Statelessness is TOTAL for the `applyN` family** ([`apply1`],
 //! [`apply2`], [`apply3`]): every op reachable through them is [`KernelOp`]

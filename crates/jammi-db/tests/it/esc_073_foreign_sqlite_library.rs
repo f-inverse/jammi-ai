@@ -101,16 +101,24 @@ const GRANDCHILD_CHILD_ROLE_VALUE: &str = "sleeper";
 /// then by the grandchild-of-grandchild itself.
 const GRANDCHILD_MODE_ENV: &str = "JAMMI_ESC073_GRANDCHILD_MODE";
 
-/// [`GRANDCHILD_MODE_ENV`] value: a continuous `[grandchild] heartbeat <n>`
-/// writer, one line every 10 ms for 3 s. The reader threads in
-/// `jammi_test_utils::child` are poll-based (`libc::poll`, 50 ms timeout) and
-/// conclude EOF on the first EMPTY poll after the target process (here,
-/// `Role::Grandchild` itself) is reaped — a holder that merely holds the
-/// pipe open no longer delays completeness at all under that mechanism. Only
-/// a holder that keeps WRITING with gaps shorter than the 50 ms poll timeout
-/// keeps presenting `POLLIN`, so the reader never sees the empty poll and
-/// keeps draining: this is the `Completeness::SettleExpired` oracle. 10 ms is
-/// deliberately well under the 50 ms poll timeout.
+/// [`GRANDCHILD_MODE_ENV`] value: a continuous writer, one line every 10 ms
+/// for 3 s. The reader threads in `jammi_test_utils::child` are poll-based
+/// (`libc::poll`, 50 ms timeout) and conclude EOF on the first EMPTY poll
+/// after the target process (here, `Role::Grandchild` itself) is reaped — a
+/// holder that merely holds the pipe open no longer delays completeness at
+/// all under that mechanism. Only a holder that keeps WRITING with gaps
+/// shorter than the 50 ms poll timeout keeps presenting `POLLIN`, so the
+/// reader never sees the empty poll and keeps draining: this is the
+/// `Completeness::SettleExpired` oracle. 10 ms is deliberately well under
+/// the 50 ms poll timeout. The repeated line is [`GRANDCHILD_SENTINEL`]
+/// itself (not a distinct "heartbeat" line): whichever prefix of these 300
+/// lines the reader captures before the settle bound expires, the LAST
+/// captured line is ALSO the sentinel — this is what builds the
+/// untrustworthy-AND-terminus-satisfied state
+/// `grandchild_capture_is_incomplete_not_survived` needs to actually oracle
+/// the ORDER `classify` checks trust vs terminus in (a distinct "heartbeat"
+/// line would leave the terminus unsatisfied regardless of that order,
+/// making the two orderings indistinguishable to that test).
 const GRANDCHILD_MODE_WRITING: &str = "writing";
 
 /// [`GRANDCHILD_MODE_ENV`] value: a silent holder that sleeps 3 s and writes
@@ -124,6 +132,13 @@ const GRANDCHILD_MODE_HOLDING: &str = "holding";
 /// [`Role::Grandchild`]'s sentinel line, in one place so [`Terminus`] and the
 /// synthetic body agree by construction.
 const GRANDCHILD_SENTINEL: &str = "[child] GRANDCHILD-DONE";
+
+/// Env var overriding [`Role::Flood`]'s line count (default 65536, exactly 4
+/// MiB, when absent) — parameterizes the EXISTING `Flood` role by an env var,
+/// the same shape [`GRANDCHILD_MODE_ENV`] already uses, so the H1
+/// retention-cap oracle can flood well past `DEFAULT_HEAD_CAP +
+/// DEFAULT_TAIL_CAP` (8 MiB) without a new role.
+const FLOOD_LINES_ENV: &str = "JAMMI_ESC073_FLOOD_LINES";
 
 /// Attempt budget per arm. The row records a historical ~2-in-4 reproduction
 /// rate for the pytest shape; the parent stops at the first reproduction, so a
@@ -777,18 +792,24 @@ fn synthetic_flood_line(n: u32) -> [u8; 64] {
     line
 }
 
-/// [`Role::Flood`]'s body: exactly 4 MiB (65536 fixed-width lines) to stderr,
-/// then its sentinel, then exit 0. Its stderr is far past any undrained
-/// pipe's ~64 KiB capacity — the oracle for `DrainedChild` consumption in this
-/// harness.
+/// [`Role::Flood`]'s body: `FLOOD_LINES_ENV` fixed-width lines (default
+/// 65536, exactly 4 MiB) to stderr, then its sentinel, then exit 0. The
+/// default is far past any undrained pipe's ~64 KiB capacity — the oracle for
+/// `DrainedChild` consumption in this harness; a caller can override the
+/// count via `FLOOD_LINES_ENV` (parameterizing the EXISTING role by an env
+/// var, the same shape `GRANDCHILD_MODE_ENV` already uses, rather than adding
+/// a new role) to flood well past the retention cap for the H1 oracle.
 fn synthetic_flood() -> ! {
-    const LINES: u32 = 65536; // 65536 * 64 = 4_194_304 bytes = 4 MiB
+    let lines: u32 = std::env::var(FLOOD_LINES_ENV)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(65536); // default: 65536 * 64 = 4_194_304 bytes = 4 MiB
     let mut out = std::io::stderr();
-    for n in 0..LINES {
+    for n in 0..lines {
         out.write_all(&synthetic_flood_line(n))
             .expect("write flood line");
     }
-    out.write_all(format!("[child] FLOOD-DONE bytes={}\n", LINES as u64 * 64).as_bytes())
+    out.write_all(format!("[child] FLOOD-DONE bytes={}\n", lines as u64 * 64).as_bytes())
         .expect("write flood sentinel");
     out.flush().expect("flush flood stderr");
     std::process::exit(0);
@@ -872,12 +893,13 @@ fn run_synthetic(kind: SyntheticKind) -> ! {
 fn run_grandchild_of_grandchild() -> ! {
     let mode = std::env::var(GRANDCHILD_MODE_ENV).unwrap_or_default();
     if mode == GRANDCHILD_MODE_WRITING {
-        // A `[grandchild] heartbeat <n>` line every 10 ms for 3 s (300
-        // lines) — well under the poll-based reader's 50 ms poll timeout, so
-        // `POLLIN` keeps arriving and the reader never sees an empty poll
-        // while this process is still writing.
-        for n in 0..300 {
-            eprintln!("[grandchild] heartbeat {n}");
+        // The sentinel itself, repeated every 10 ms for 3 s (300 lines) —
+        // well under the poll-based reader's 50 ms poll timeout, so `POLLIN`
+        // keeps arriving and the reader never sees an empty poll while this
+        // process is still writing. See `GRANDCHILD_MODE_WRITING`'s doc for
+        // why the repeated line is the sentinel and not a distinct one.
+        for _ in 0..300 {
+            eprintln!("{GRANDCHILD_SENTINEL}");
             let _ = std::io::stderr().flush();
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -1178,7 +1200,19 @@ fn child_main(role: Role) -> ! {
             task.iterations.load(Ordering::Relaxed),
             task.in_flight.load(Ordering::Relaxed)
         );
-        let _ = rt.block_on(task.join);
+        if let Err(join_err) = rt.block_on(task.join) {
+            // A panicked load task must fail the attempt, not vanish behind
+            // a clean-looking exit 0: route it through the EXISTING
+            // `EXIT_TRIPPED`/`Attempt::Tripped` arm (no new `Attempt`
+            // variant) by printing and exiting BEFORE the terminal line is
+            // ever reached. `terminus_satisfied`'s `EngineArm` check only
+            // requires the terminal line's presence, so silently dropping
+            // this `JoinError` (as before) would leave `Attempt::Survived`
+            // even though a background worker crashed — this line is what
+            // the parent's `has_tripped_line`/`classify` and
+            // `Summary::is_clean()` already score as a failure.
+            tripped(format!("load task {n} panicked: {join_err}"));
+        }
     }
     // Ordering invariant: no `[child] phase:` line is EVER emitted after the
     // terminal line below. It holds by construction — every phase marker
@@ -1292,23 +1326,57 @@ fn terminus_satisfied(stderr: &[u8], role: Role) -> bool {
     }
 }
 
-/// `Some(reason)` when `cap.is_trustworthy()` is `false` — the single
-/// predicate gating every content-dependent classification
-/// (`Survived`/`Tripped`/`Stale`/`Corrupt`/`Skipped`, every one of which
-/// decides its outcome by reading `cap.stderr`). Names WHICH of
-/// `is_trustworthy`'s four ANDed conditions failed (checked in the same
-/// order `is_trustworthy` ANDs them, so the first checked is the first
-/// named): reader completeness (`complete != Completeness::Complete`,
-/// including `Completeness::Undrained`), an OS-level wait error, a
-/// stdout-retention-cap truncation, a stderr-retention-cap truncation.
-/// `None` when the capture is fully trustworthy. `Attempt::Signal`/`Hung`/
-/// `ExitCode` never consult this: they classify from `cap.status` alone, not
-/// from stderr content, so an untrustworthy capture does not make them
-/// unreliable.
+/// `Some(reason)` when `cap`'s evidence cannot be trusted for a
+/// content-dependent classification (`Survived`/`Tripped`/`Stale`/`Corrupt`/
+/// `Skipped`, every one of which decides its outcome by reading
+/// `cap.stderr`). The veto is deliberately narrower than
+/// `Capture::is_trustworthy()`: reader completeness
+/// (`complete != Completeness::Complete`, including `Completeness::Undrained`)
+/// or an OS-level wait error, and NOTHING ELSE. `None` when neither holds.
+/// `Attempt::Signal`/`Hung`/`ExitCode` never consult this: they classify from
+/// `cap.status` alone, not from stderr content, so untrustworthy evidence
+/// does not make them unreliable.
+///
+/// # Why retention-cap truncation is NOT a veto here
+///
+/// `is_trustworthy()` ANDs in `stdout_truncated == 0 && stderr_truncated ==
+/// 0` too, but this harness does not — a truncation-only capture still
+/// classifies normally, with the truncation surfaced only as a diagnostic
+/// (`rendered_log`/`hung_diagnostic`/`truncated_diagnostic`/
+/// `incomplete_diagnostic` all render both streams, which already carry the
+/// dropped-byte count via `render`'s `[... N bytes truncated ...]` marker).
+/// The retention cap keeps the first `DEFAULT_HEAD_CAP` (6 MiB) bytes and the
+/// last `DEFAULT_TAIL_CAP` (2 MiB) bytes of each stream and drops only the
+/// middle (`jammi_test_utils::child`'s `RetainedBuf`); every line every
+/// comparator in this file reads survives that split BY CONSTRUCTION:
+/// - the banner (`bundled(sqlx, static)=`, checked by `terminus_satisfied`'s
+///   `EngineArm` arm) is the FIRST diagnostic line `child_main` ever prints,
+///   well inside the head;
+/// - the terminal / `[child] TRIPPED(<code>):` / `[child] SKIP:` line
+///   (checked by `terminus_satisfied`, `has_tripped_line`, and the
+///   `EXIT_NO_FOREIGN_LIB` arm) is the LAST line before `exit`, well inside
+///   the tail;
+/// - the ordering conjunct (`terminus_satisfied`'s `EngineArm` arm) only
+///   scans lines AFTER the terminal line's position for a stray
+///   `[child] phase:` marker — those lines are themselves in the tail too.
+///
+/// The rendered truncation marker itself
+/// (`"[... N bytes truncated ...]"`, from `render`/`render_stderr`) cannot be
+/// mistaken for any of the above by any comparator, for the simpler reason
+/// that every comparator here reads the RAW `Capture::stdout`/`stderr`
+/// fields directly (never `render`'s output) — the marker is inserted only
+/// at render time and never appears in the raw buffers a comparator sees.
+///
+/// Meanwhile the load tasks' `[child] engine error …` lines
+/// (`spawn_engine_load`) are UNBOUNDED, and draining removed the pipe's
+/// implicit 64 KiB backpressure that used to throttle them: a
+/// persistently-erroring CI attempt can cross the combined 8 MiB cap in
+/// seconds on an otherwise-healthy run. Vetoing on truncation would hard-fail
+/// that attempt on output VOLUME alone — on exactly the class of arm esc-079
+/// exists to observe, not on any actual missing evidence. See
+/// `flood_role_survives_past_the_retention_cap_with_truncation` for the
+/// behavior-pinning oracle.
 fn incompleteness_reason(cap: &Capture) -> Option<String> {
-    if cap.is_trustworthy() {
-        return None;
-    }
     if cap.complete != Completeness::Complete {
         return Some(format!(
             "capture incomplete ({:?}) — its stderr content cannot be trusted for classification",
@@ -1320,24 +1388,7 @@ fn incompleteness_reason(cap: &Capture) -> Option<String> {
             "an OS-level error occurred while producing this capture: {err}"
         ));
     }
-    if cap.stdout_truncated != 0 {
-        return Some(format!(
-            "the retention cap dropped {} byte(s) from stdout — its content cannot be trusted \
-             for classification",
-            cap.stdout_truncated
-        ));
-    }
-    if cap.stderr_truncated != 0 {
-        return Some(format!(
-            "the retention cap dropped {} byte(s) from stderr — its content cannot be trusted \
-             for classification",
-            cap.stderr_truncated
-        ));
-    }
-    unreachable!(
-        "is_trustworthy() was false but none of its four ANDed conditions failed — \
-         incompleteness_reason and Capture::is_trustworthy have drifted out of sync"
-    )
+    None
 }
 
 /// Classify a settled (non-hung) [`Capture`] into an [`Attempt`], applying the
@@ -1504,6 +1555,23 @@ fn run_grandchild(test_name: &str, ceiling: Duration, mode: &str) -> (Attempt, C
     let child = DrainedChild::spawn(&mut cmd).expect("spawn child");
     let cap = child.wait_bounded(ceiling, Epoch::Spawn);
     let attempt = classify(&cap, Role::Grandchild);
+    (attempt, cap)
+}
+
+/// Like [`run_child`], specialized to [`Role::Flood`]: also sets
+/// [`FLOOD_LINES_ENV`] to `lines`, so a caller can flood well past
+/// `DEFAULT_HEAD_CAP + DEFAULT_TAIL_CAP` without a new role — the H1
+/// retention-cap oracle's only caller.
+fn run_flood(test_name: &str, ceiling: Duration, lines: u32) -> (Attempt, Capture) {
+    let exe = std::env::current_exe().expect("current test binary");
+    let mut cmd = Command::new(exe);
+    cmd.args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+        .env(ROLE_ENV, Role::Flood.as_str())
+        .env(SELF_EXACT_ENV, test_name)
+        .env(FLOOD_LINES_ENV, lines.to_string());
+    let child = DrainedChild::spawn(&mut cmd).expect("spawn child");
+    let cap = child.wait_bounded(ceiling, Epoch::Spawn);
+    let attempt = classify(&cap, Role::Flood);
     (attempt, cap)
 }
 
@@ -1875,6 +1943,39 @@ fn flood_role_survives_and_retains_every_byte() {
     assert_eq!(cap.stderr_truncated, 0, "well under the retention cap");
 }
 
+/// **H1 oracle: a retention-cap truncation must NEVER veto a
+/// content-dependent classification.** [`FLOOD_LINES_ENV`] parameterizes the
+/// EXISTING `Role::Flood` (no new role) to flood well past
+/// `DEFAULT_HEAD_CAP + DEFAULT_TAIL_CAP` (6 MiB + 2 MiB = 8 MiB); its
+/// sentinel is its LAST line, which the retention cap's tail always keeps
+/// (see `incompleteness_reason`'s doc for the full head/tail argument), so
+/// this must still classify `Survived` via the `Sentinel` terminus — with
+/// `stderr_truncated > 0` surfaced only as a diagnostic, never as
+/// `Attempt::Incomplete`. Sibling/boundary control:
+/// `flood_role_survives_and_retains_every_byte` (4 MiB, `stderr_truncated ==
+/// 0`) pins the UNDER-cap case; this test pins the OVER-cap one.
+#[test]
+fn flood_role_survives_past_the_retention_cap_with_truncation() {
+    dispatch_if_child();
+    // 200_000 * 64 = 12_800_000 bytes (~12.2 MiB), comfortably past the 8 MiB
+    // combined cap.
+    const OVER_CAP_LINES: u32 = 200_000;
+    let (attempt, cap) = run_flood(GUARD_TEST, Duration::from_secs(30), OVER_CAP_LINES);
+    assert!(
+        matches!(attempt, Attempt::Survived),
+        "expected Survived — a retention-cap truncation must never veto a content-dependent \
+         classification (the sentinel line survives in the tail by construction), got \
+         {attempt:?}. Log:\n{}",
+        rendered_log(&cap)
+    );
+    assert!(
+        cap.stderr_truncated > 0,
+        "this oracle requires an ACTUAL truncation to be meaningful — {} lines did not exceed \
+         the cap: {cap:?}",
+        OVER_CAP_LINES
+    );
+}
+
 /// [`Role::Quiet`] exits 0 with only its sentinel line — classified
 /// `Survived`.
 #[test]
@@ -1959,21 +2060,30 @@ fn wedge_role_is_hung_with_its_last_phase_marker() {
     );
 }
 
-/// **The `Attempt::Incomplete` oracle.** [`Role::Grandchild`] prints its
-/// sentinel and exits 0 IMMEDIATELY, but the grandchild-of-grandchild it
-/// spawned (inheriting stderr, in [`GRANDCHILD_MODE_WRITING`]) keeps writing
-/// a heartbeat line every 10 ms — well under the poll-based reader's 50 ms
-/// poll timeout — for 3 s, so `POLLIN` keeps arriving and the reader never
-/// sees an empty poll before `wait_bounded`'s ~1 s settle bound expires:
-/// `Capture::complete` comes back `SettleExpired`. The mechanism assertion is
-/// that this must NEVER be scored `Survived`, even though by every
-/// content-only measure it looks like a clean pass (exit code 0, sentinel
-/// line present, nothing else wrong) — a content-dependent classification
-/// arm that nothing can ever reach is a no-op waiting to happen (a real
-/// incomplete capture silently scored as its exit code's "clean" class).
-/// Sibling: [`holding_grandchild_capture_is_complete`] pins the OTHER side of
-/// this boundary — a grandchild-of-grandchild that only holds the pipe,
-/// never writing, does NOT produce `SettleExpired`.
+/// **The `Attempt::Incomplete` oracle — and the ONLY thing that makes it an
+/// oracle over the ORDER `classify` checks trust vs terminus in.**
+/// [`Role::Grandchild`] prints its sentinel and exits 0 IMMEDIATELY, but the
+/// grandchild-of-grandchild it spawned (inheriting stderr, in
+/// [`GRANDCHILD_MODE_WRITING`]) keeps re-printing that SAME sentinel line
+/// every 10 ms — well under the poll-based reader's 50 ms poll timeout — for
+/// 3 s, so `POLLIN` keeps arriving and the reader never sees an empty poll
+/// before `wait_bounded`'s ~1 s settle bound expires: `Capture::complete`
+/// comes back `SettleExpired` (untrustworthy) while `last_nonempty_line ==
+/// GRANDCHILD_SENTINEL` regardless of how many of the 300 repeats got
+/// captured before the settle gave up (terminus-satisfied). That combination
+/// — untrustworthy AND terminus-satisfied at once — is deliberate and
+/// load-bearing: a distinct one-off "heartbeat" line there (an earlier draft
+/// of this test used one) would leave the terminus permanently unsatisfied,
+/// and a `classify` that checked terminus BEFORE the trust gate would still
+/// (coincidentally) return `Incomplete` via its terminus-failed fallback
+/// branch — the two orderings would be indistinguishable to this test, an
+/// untested branch masquerading as coverage. With the sentinel repeated,
+/// checking terminus first would find it SATISFIED and return `Survived` —
+/// exactly the false GREEN this gate exists to prevent — so this test now
+/// actually reds under that reordering. Sibling:
+/// [`holding_grandchild_capture_is_complete`] pins the OTHER side of the
+/// completeness boundary — a grandchild-of-grandchild that only holds the
+/// pipe, never writing, does NOT produce `SettleExpired`.
 ///
 /// No sub-ceiling wall-clock assertion: the 10 s ceiling is comfortably above
 /// both `wait_bounded`'s ~1 s settle bound and the 3 s writer, so this test
@@ -1986,11 +2096,20 @@ fn grandchild_capture_is_incomplete_not_survived() {
     dispatch_if_child();
     let (attempt, cap) =
         run_grandchild(GUARD_TEST, Duration::from_secs(10), GRANDCHILD_MODE_WRITING);
+    assert_eq!(
+        last_nonempty_line(&cap.stderr).as_deref(),
+        Some(GRANDCHILD_SENTINEL),
+        "this oracle requires the captured state to be terminus-satisfied DESPITE being \
+         untrustworthy — otherwise it cannot distinguish the correct trust-gate-first order from \
+         a terminus-first reordering. Log:\n{}",
+        rendered_log(&cap)
+    );
     let reason = match attempt {
         Attempt::Incomplete(reason) => reason,
         other => panic!(
-            "expected Incomplete, got {other:?} — a SettleExpired capture must never be scored \
-             Survived even though its exit code and sentinel look clean. Log:\n{}",
+            "expected Incomplete, got {other:?} — an untrustworthy-but-terminus-satisfied capture \
+             must never be scored Survived (that is exactly a terminus-before-trust-gate ordering \
+             bug). Log:\n{}",
             rendered_log(&cap)
         ),
     };

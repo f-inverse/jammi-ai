@@ -839,11 +839,38 @@ class RemoteDatabase:
         # Flight SQL and the typed gRPC services on one Tonic port); built lazily
         # on first `sql` so a connection that never queries SQL pays nothing.
         self._flight = None
+        # Set exactly once, by `close()`. Every transport entry point checks it
+        # first (`_check_open`) — the peer of the embedded engine's FFI-boundary
+        # guard, so a closed session behaves the SAME on both transports.
+        self._closed = False
 
     @property
     def session_id(self) -> str:
         """The opaque session id the server keys this connection's tenant by."""
         return self._session_id
+
+    # --- The closed-session guard -----------------------------------------------
+
+    def _check_open(self) -> None:
+        """Raise the typed :class:`BackendError` once :meth:`close` has run.
+
+        The remote peer of the embedded engine's FFI-boundary guard
+        (`_NativeDatabase::check_open`), and the reason a closed
+        :class:`~jammi.Session` behaves identically on both transports. Without
+        it, a verb on a closed channel escaped the taxonomy entirely: grpcio
+        raises a bare ``ValueError("Cannot invoke RPC on closed channel!")``,
+        which no ``except JammiError`` catches — so the one program a caller
+        writes against `Session` needed two different `except` clauses depending
+        on the transport it happened to be pointed at.
+
+        Called from every transport ENTRY point rather than from each verb: the
+        unary choke point :meth:`_call`, the streaming
+        :meth:`subscribe_collect`, and the separate Flight SQL lane
+        :meth:`sql`. A verb reaches the wire through one of those three or not at
+        all, so there is no per-verb list to drift.
+        """
+        if self._closed:
+            raise BackendError("Database is closed")
 
     # --- The single wire choke point --------------------------------------------
 
@@ -857,6 +884,7 @@ class RemoteDatabase:
         per-verb try/excepts. Call-sites that special-case ``NOT_FOUND`` catch the
         mapped exception and branch on its ``.code`` (carried from the status).
         """
+        self._check_open()
         try:
             return method(request, metadata=self._metadata)
         except grpc.RpcError as exc:
@@ -864,14 +892,19 @@ class RemoteDatabase:
 
     # --- Capability contract ----------------------------------------------------
     #
-    # The remote transport carries `close` (real gRPC teardown) and `session_id`
-    # (the per-connection scoping key); it does NOT carry the embedded-only
-    # in-process primitives (`audit`, `ephemeral_session`, `preload_model`).
-    # `supports()` answers the divergence, and the one-sided members raise a typed
-    # `NotSupportedOnBackend` rather than a bare `AttributeError`, so a caller that
-    # ignores `supports()` still gets a legible error naming the capability.
+    # The remote transport carries `session_id` (the per-connection scoping key);
+    # it does NOT carry the embedded-only in-process primitives (`audit`,
+    # `ephemeral_session`, `preload_model`). `supports()` answers the divergence,
+    # and the one-sided members raise a typed `NotSupportedOnBackend` rather than
+    # a bare `AttributeError`, so a caller that ignores `supports()` still gets a
+    # legible error naming the capability.
+    #
+    # `close` is NOT here (and no longer a `Capability` at all): the embedded arm
+    # carries a real `close()` too — the catalog-file release — so the flag
+    # described no divergence, only a primitive the public client could not
+    # reach.
 
-    _CAPABILITIES = frozenset({Capability.CLOSE, Capability.SESSION_ID})
+    _CAPABILITIES = frozenset({Capability.SESSION_ID})
 
     def supports(self, capability: Capability) -> bool:
         """Whether this (remote) backend carries `capability`."""
@@ -1264,6 +1297,9 @@ class RemoteDatabase:
         server-side; `from_offset` starts the replay at an offset (unset == live
         tail only). Maps to `TriggerService.Subscribe`.
         """
+        # The streaming lane opens its call directly rather than through `_call`,
+        # so the closed-session guard is applied here explicitly.
+        self._check_open()
         request = trigger_pb2.SubscribeRequest(
             topic=trigger_pb2.TopicName(name=topic),
             predicate=predicate or "",
@@ -2393,6 +2429,10 @@ class RemoteDatabase:
         `pyarrow.Table`. The embedded `Database.sql` is the in-process peer of
         this verb — same SQL, same `annotate` function, transport apart.
         """
+        # The Flight SQL lane does not pass through `_call`, so the closed-session
+        # guard is applied here explicitly — a closed session must fail the same
+        # way on both of the remote arm's transports.
+        self._check_open()
         client = self._flight_client()
         options = self._flight_options()
         # The Flight SQL lane is a separate transport whose faults surface as
@@ -2432,23 +2472,27 @@ class RemoteDatabase:
     # --- Lifecycle ---------------------------------------------------------------
 
     def close(self) -> None:
-        """Close the underlying channel. Idempotent.
+        """Close the underlying channels. Idempotent.
 
         A TRANSPORT release, and only that: the remote arm holds no catalog
         file. The server owns the catalog and whatever single-process lock its
         backend takes, so this frees the gRPC and Flight channels and touches
-        nothing on the local filesystem — unlike the embedded arm, where the
-        native handle's ``close()`` is the catalog-FILE release point (after it
-        returns, another process, or a foreign in-process SQLite instance, may
-        open the artifact directory). The two are deliberately different
-        primitives, which is why ``Capability.CLOSE`` is remote-only and
-        :meth:`EmbeddedBackend.close` raises
-        :class:`~jammi.errors.NotSupportedOnBackend`.
+        nothing on the local filesystem — unlike the embedded
+        :meth:`~jammi.EmbeddedBackend.close`, which is the catalog-FILE release
+        point (after it returns, another process, or a foreign in-process SQLite
+        instance, may open the artifact directory).
+
+        Both transports carry `close()`, so it is an ordinary member of the
+        :class:`~jammi.Session` surface, not a :class:`~jammi.Capability`. What
+        each one releases differs; the CONTRACT does not — both are idempotent,
+        and afterwards every verb on either transport raises
+        :class:`~jammi.errors.BackendError`.
         """
         if self._flight is not None:
             self._flight.close()
             self._flight = None
         self._channel.close()
+        self._closed = True
 
     def __enter__(self) -> "RemoteDatabase":
         return self

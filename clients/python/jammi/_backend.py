@@ -81,7 +81,10 @@ class Session(Protocol):
         """Whether this backend carries a one-sided :class:`Capability`."""
 
     def close(self) -> None:
-        """Release the session. Real teardown remote; a no-op (RAII) embedded."""
+        """Release the session. Idempotent, and a REAL release on both transports:
+        the gRPC + Flight channels remote, the catalog file (an awaited handshake,
+        not a drop) embedded. Every verb afterwards raises
+        :class:`~jammi.errors.BackendError` on either transport."""
 
     def __enter__(self) -> "Session": ...
     def __exit__(self, *exc: object) -> Optional[bool]: ...

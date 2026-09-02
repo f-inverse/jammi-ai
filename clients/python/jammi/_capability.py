@@ -9,9 +9,17 @@ against this enum, and invoking a feature the backend lacks raises
 
 The set is CLOSED: exactly the features that genuinely diverge between the two
 transports today. It names no consumer — each value is a generic engine feature
-(an audit log, a session-scoped storage context, a model preload, channel
-teardown, a connection id), reachable by any user who never heard of a
-particular one.
+(an audit log, a session-scoped storage context, a model preload, a connection
+id), reachable by any user who never heard of a particular one.
+
+"Genuinely diverge" is load-bearing in both directions, and a member LEAVES when
+it stops diverging. `CLOSE` was such a member: the embedded arm was documented as
+releasing on drop, so `close()` was remote-only. That was never true under the
+engine's `unix-excl` catalog seam — releasing the catalog file is an AWAITED
+event the engine exposes as `close()`, and the flag was hiding a primitive that
+existed rather than describing a divergence. Both transports now carry `close()`,
+so it is an ordinary member of the :class:`~jammi.Session` surface and NOT a
+capability: a flag every backend sets is a predicate that never discriminates.
 """
 
 from __future__ import annotations
@@ -34,9 +42,6 @@ class Capability(str, Enum):
     EPHEMERAL_SESSION = "ephemeral_session"
     #: Preloading a model into the cache (`db.preload_model`) — embedded only.
     PRELOAD_MODEL = "preload_model"
-    #: Explicit channel teardown (`db.close`) — remote only (the embedded engine
-    #: releases its resources on drop).
-    CLOSE = "close"
     #: The opaque per-connection session id (`db.session_id`) — remote only.
     SESSION_ID = "session_id"
 

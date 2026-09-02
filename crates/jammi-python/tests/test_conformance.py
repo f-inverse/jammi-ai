@@ -1243,8 +1243,13 @@ def test_supports_and_not_supported_on_backend_contract(tmp_path):
     and invoking a capability the backend lacks raises the typed
     `NotSupportedOnBackend` — never a bare `AttributeError`. The embedded engine
     carries the in-process primitives (audit / ephemeral / preload); the remote
-    carries the transport lifecycle (close / session_id); each raises for the
-    other's."""
+    carries the per-connection scoping key (session_id); each raises for the
+    other's.
+
+    `close` is NOT among them any more, on either side: it is a SHARED verb both
+    backends implement (a channel teardown remote, the catalog-file release
+    embedded), so it is asserted as an ordinary member of the Session surface
+    here rather than as a capability."""
     from jammi import Capability
     from jammi.errors import NotSupportedOnBackend
 
@@ -1254,20 +1259,22 @@ def test_supports_and_not_supported_on_backend_contract(tmp_path):
         assert embed.supports(Capability.AUDIT) is True
         assert embed.supports(Capability.EPHEMERAL_SESSION) is True
         assert embed.supports(Capability.PRELOAD_MODEL) is True
-        assert embed.supports(Capability.CLOSE) is False
         assert embed.supports(Capability.SESSION_ID) is False
 
-        assert remote.supports(Capability.CLOSE) is True
         assert remote.supports(Capability.SESSION_ID) is True
         assert remote.supports(Capability.AUDIT) is False
         assert remote.supports(Capability.EPHEMERAL_SESSION) is False
         assert remote.supports(Capability.PRELOAD_MODEL) is False
 
+        # `close` is a shared verb, not a capability: both backends carry it,
+        # and neither raises for it.
+        assert callable(embed.close)
+        assert callable(remote.close)
+        assert not hasattr(Capability, "CLOSE")
+
         # A one-sided op on the wrong backend raises the typed error.
         with pytest.raises(NotSupportedOnBackend):
             embed.session_id
-        with pytest.raises(NotSupportedOnBackend):
-            embed.close()
         with pytest.raises(NotSupportedOnBackend):
             remote.audit
         with pytest.raises(NotSupportedOnBackend):
@@ -1275,22 +1282,86 @@ def test_supports_and_not_supported_on_backend_contract(tmp_path):
         with pytest.raises(NotSupportedOnBackend):
             remote.preload_model("some-model")
     finally:
+        embed.close()
         remote.close()
 
 
-def test_capability_enum_is_the_closed_five():
-    """The capability set is CLOSED — exactly the five one-sided features that
-    diverge between the transports, no more. Pinned so a sixth is a deliberate
-    decision, not a silent addition."""
+def test_capability_enum_is_the_closed_four():
+    """The capability set is CLOSED — exactly the four one-sided features that
+    diverge between the transports, no more. Pinned so a fifth is a deliberate
+    decision, not a silent addition.
+
+    `close` was the fifth until the embedded arm gained a real `close()` (the
+    catalog-file release the engine's own contract documents and the public
+    client had no way to reach). The enum's charter — "exactly the features that
+    genuinely diverge between the two transports today" — then FORCES its
+    removal: a `Capability` every backend supports is a predicate that never
+    discriminates, and leaving it in would have said the embedded engine lacks a
+    primitive it has. Pinned as an absence, not merely by the set below, in
+    `test_supports_and_not_supported_on_backend_contract`."""
     from jammi import Capability
 
     assert {c.value for c in Capability} == {
         "audit",
         "ephemeral_session",
         "preload_model",
-        "close",
         "session_id",
     }
+
+
+def test_close_is_idempotent_and_use_after_close_raises_the_same_error_on_both(
+    tmp_path,
+):
+    """Value-parity on the closed-session contract: BOTH backends make `close()`
+    idempotent and BOTH raise the same typed `BackendError` from every verb
+    afterwards.
+
+    This is the parity that `Capability.CLOSE`'s removal asserts. "Both have a
+    `close()`" would be a shallow claim if the two disagreed on what a closed
+    session then does — and they did: the embedded arm raised the typed
+    `BackendError` from its FFI-boundary guard while the remote arm let grpcio's
+    bare `ValueError("Cannot invoke RPC on closed channel!")` escape the
+    `JammiError` taxonomy entirely. A caller writing one program against
+    :class:`jammi.Session` must be able to catch one exception type.
+
+    The CLASS is pinned identical (that is the contract a caller writes
+    `except`ing); the message is pinned only to say "closed", because each arm
+    truthfully names the resource it released — the embedded arm the catalog,
+    the remote arm the channel — and forcing one sentence would make one of them
+    lie.
+
+    The verbs cover both remote transports: the typed gRPC lane (`list_sources`,
+    `tenant`, `get_server_info`) and the separate Flight SQL lane (`sql`), so a
+    guard installed on only one of them fails here.
+
+    Hermetic on the remote side — the guard fires before any wire hop, so the
+    unreachable endpoint is never dialed."""
+    from jammi.errors import BackendError, JammiError
+
+    embed = jammi.connect(f"file://{tmp_path}")
+    remote = jammi.connect("grpc://127.0.0.1:8081")
+
+    raised: dict[tuple[str, str], type] = {}
+    for name, session in (("embedded", embed), ("remote", remote)):
+        session.close()
+        # Idempotent: a second and third close are no-ops, not errors.
+        session.close()
+        session.close()
+
+        for verb, call in (
+            ("list_sources", lambda s=session: s.list_sources()),
+            ("tenant", lambda s=session: s.tenant()),
+            ("get_server_info", lambda s=session: s.get_server_info()),
+            ("sql", lambda s=session: s.sql("SELECT 1")),
+        ):
+            with pytest.raises(BackendError) as excinfo:
+                call()
+            assert issubclass(excinfo.type, JammiError), (name, verb)
+            assert "closed" in str(excinfo.value), (name, verb, str(excinfo.value))
+            raised[(name, verb)] = excinfo.type
+
+    # One class across both transports and every verb — the whole point.
+    assert set(raised.values()) == {BackendError}
 
 
 class _FakeRpcError(grpc.RpcError):

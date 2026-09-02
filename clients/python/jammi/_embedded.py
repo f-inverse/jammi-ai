@@ -128,10 +128,16 @@ class EmbeddedBackend:
     #
     # The embedded engine carries the in-process primitives (`audit`,
     # `ephemeral_session`, `preload_model`); it does NOT carry the remote-only
-    # `close` (it releases on drop — RAII) or `session_id` (no per-connection
-    # scoping key). `supports()` answers the divergence, and the remote-only
-    # members raise a typed `NotSupportedOnBackend` rather than a bare
-    # `AttributeError`, so parity with the remote capability surface holds.
+    # `session_id` (no per-connection scoping key). `supports()` answers the
+    # divergence, and the remote-only member raises a typed
+    # `NotSupportedOnBackend` rather than a bare `AttributeError`, so parity with
+    # the remote capability surface holds.
+    #
+    # `close` is NOT a capability: both transports carry it (see
+    # `EmbeddedBackend.close`). It used to be listed as remote-only on the claim
+    # that the embedded engine "releases on drop"; it does not — under the
+    # engine's `unix-excl` catalog seam the release is an awaited event, and
+    # `close()` is the only bounded point at which it happens.
 
     _CAPABILITIES = frozenset(
         {Capability.AUDIT, Capability.EPHEMERAL_SESSION, Capability.PRELOAD_MODEL}
@@ -160,15 +166,45 @@ class EmbeddedBackend:
         raise NotSupportedOnBackend(Capability.SESSION_ID)
 
     def close(self) -> None:
-        """Remote-only: the embedded engine releases its resources on drop (RAII)."""
-        raise NotSupportedOnBackend(Capability.CLOSE)
+        """Stop this session's training worker and RELEASE the catalog file.
+
+        The embedded peer of :meth:`~jammi.RemoteDatabase.close`, and the only
+        bounded point at which the artifact directory becomes somebody else's to
+        open. It is a delegation to the engine's own release handshake
+        (`_NativeDatabase.close`), never a weaker private notion of "closed":
+        the embedded training worker is stopped first, then the catalog
+        connection pool is closed and awaited.
+
+        Dropping the session is NOT equivalent. The catalog opens through
+        SQLite's `unix-excl` VFS, which holds a process-scoped exclusive lock for
+        as long as any connection in this process has the file open, and `sqlx`
+        returns pooled connections from a background task — so a dropped handle
+        releases nothing at any bounded moment (in the limit, not until the
+        pool's idle reaper runs). Until `close()` returns, a successor PROCESS
+        opening the same directory is refused with
+        :class:`~jammi.errors.BackendError`, and a foreign in-process SQLite
+        instance (e.g. the stdlib `sqlite3`) reads a divergent image of the
+        database. After it returns, both succeed.
+
+        The release is CONNECTION-WIDE by design: handles derived from this
+        session share the pool, so their catalog operations fail too, and the
+        pool is never silently reopened. `close()` is idempotent — a second call
+        is a no-op — and every other verb afterwards raises the typed
+        :class:`~jammi.errors.BackendError` the engine's boundary guard raises,
+        never a silent no-op.
+        """
+        self._native.close()
 
     def __enter__(self) -> "EmbeddedBackend":
         return self
 
     def __exit__(self, *exc: object) -> bool:
-        # RAII: the engine releases on drop, so block exit needs no explicit
-        # teardown. Does not suppress exceptions raised in the block.
+        # Block exit releases the catalog, exactly as the remote arm's `__exit__`
+        # releases the channel: a `with` block that reads as a scoped resource
+        # has to be one. Drop is NOT a release here (see `close`), so leaving
+        # this a no-op would hold the artifact directory for the process
+        # lifetime. Does not suppress exceptions raised in the block.
+        self.close()
         return False
 
     # --- Tenant scope + handshake ----------------------------------------------

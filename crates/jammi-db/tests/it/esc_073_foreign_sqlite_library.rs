@@ -82,15 +82,44 @@ const ROLE_ENV: &str = "JAMMI_ESC073_ROLE";
 const SELF_EXACT_ENV: &str = "JAMMI_ESC073_SELF_EXACT";
 
 /// The [`ROLE_ENV`] value [`Role::Grandchild`]'s body spawns its OWN child
-/// with — deliberately NOT a [`Role`] variant: the sleeper is never
-/// dispatched through `run_child`/`classify` (nothing in this harness spawns
-/// it directly; only `Role::Grandchild`'s body does), so it must never reach
-/// `Role::parse`'s unknown-text panic. [`dispatch_if_child`] checks for this
-/// exact value and runs [`run_grandchild_sleeper`] BEFORE `Role::parse` ever
-/// sees it. Grandchild's body sets this explicitly on its own spawn — never
-/// inheriting `ROLE_ENV`'s `"grandchild"` value, which would fork-bomb
-/// (each grandchild would spawn its own grandchild, forever).
-const GRANDCHILD_SLEEPER_ROLE_VALUE: &str = "sleeper";
+/// with (the "grandchild-of-grandchild") — deliberately NOT a [`Role`]
+/// variant: it is never dispatched through `run_child`/`classify` (nothing in
+/// this harness spawns it directly; only `Role::Grandchild`'s body does), so
+/// it must never reach `Role::parse`'s unknown-text panic.
+/// [`dispatch_if_child`] checks for this exact value and runs
+/// [`run_grandchild_of_grandchild`] BEFORE `Role::parse` ever sees it.
+/// Grandchild's body sets this explicitly on its own spawn — never
+/// inheriting `ROLE_ENV`'s `"grandchild"` value, which would fork-bomb (each
+/// grandchild would spawn its own grandchild, forever). Which of the two
+/// shapes [`run_grandchild_of_grandchild`] runs is a further choice, carried
+/// by [`GRANDCHILD_MODE_ENV`].
+const GRANDCHILD_CHILD_ROLE_VALUE: &str = "sleeper";
+
+/// Env var carrying which grandchild-of-grandchild shape
+/// [`run_grandchild_of_grandchild`] runs — set by [`run_grandchild`] and read
+/// by [`Role::Grandchild`]'s own body (which forwards it onto its spawn) and
+/// then by the grandchild-of-grandchild itself.
+const GRANDCHILD_MODE_ENV: &str = "JAMMI_ESC073_GRANDCHILD_MODE";
+
+/// [`GRANDCHILD_MODE_ENV`] value: a continuous `[grandchild] heartbeat <n>`
+/// writer, one line every 10 ms for 3 s. The reader threads in
+/// `jammi_test_utils::child` are poll-based (`libc::poll`, 50 ms timeout) and
+/// conclude EOF on the first EMPTY poll after the target process (here,
+/// `Role::Grandchild` itself) is reaped — a holder that merely holds the
+/// pipe open no longer delays completeness at all under that mechanism. Only
+/// a holder that keeps WRITING with gaps shorter than the 50 ms poll timeout
+/// keeps presenting `POLLIN`, so the reader never sees the empty poll and
+/// keeps draining: this is the `Completeness::SettleExpired` oracle. 10 ms is
+/// deliberately well under the 50 ms poll timeout.
+const GRANDCHILD_MODE_WRITING: &str = "writing";
+
+/// [`GRANDCHILD_MODE_ENV`] value: a silent holder that sleeps 3 s and writes
+/// nothing, then exits. Pins the boundary `jammi_test_utils::child` documents
+/// from the other side: under the poll-based reader, merely holding the
+/// inherited pipe open — without writing to it — does NOT produce
+/// `Completeness::SettleExpired`; the capture comes back `Complete` and
+/// `is_trustworthy()`.
+const GRANDCHILD_MODE_HOLDING: &str = "holding";
 
 /// [`Role::Grandchild`]'s sentinel line, in one place so [`Terminus`] and the
 /// synthetic body agree by construction.
@@ -164,14 +193,18 @@ enum Role {
     /// `[child] phase:` marker AFTER it — the negative control for the
     /// ordering conjunct.
     PostMarker,
-    /// Synthetic: the [`Attempt::Incomplete`] oracle. Prints its sentinel and
-    /// exits 0 immediately, but FIRST spawns its own grandchild (in the
-    /// sleeper sub-mode, never a `Role`) without stdio redirection, so the
-    /// grandchild inherits stderr — the very pipe `DrainedChild` is draining.
-    /// The sleeper sleeps 3 s, well past `wait_bounded`'s ~1 s settle bound,
-    /// so the reader thread never observes EOF within the settle window:
-    /// `Capture::complete` comes back `SettleExpired` even though every byte
-    /// this role itself wrote (including the sentinel) was already read.
+    /// Synthetic: prints its sentinel and exits 0 immediately, but FIRST
+    /// spawns its own grandchild-of-grandchild (never a `Role` — see
+    /// [`GRANDCHILD_CHILD_ROLE_VALUE`]) without stdio redirection, so it
+    /// inherits stderr — the very pipe `DrainedChild` is draining. Which of
+    /// two shapes that spawned process takes is controlled by
+    /// [`GRANDCHILD_MODE_ENV`], set by [`run_grandchild`]: a continuous
+    /// writer produces `Completeness::SettleExpired` (the
+    /// [`Attempt::Incomplete`] oracle, `grandchild_capture_is_incomplete_not_survived`);
+    /// a silent holder produces `Completeness::Complete` (the
+    /// `is_trustworthy()` boundary, `holding_grandchild_capture_is_complete`)
+    /// — see [`GRANDCHILD_MODE_WRITING`]/[`GRANDCHILD_MODE_HOLDING`] for the
+    /// mechanism each exercises.
     Grandchild,
 }
 
@@ -215,7 +248,7 @@ impl Role {
     /// is present (`.ok().map(|r| Role::parse(&r))`), so an ABSENT env var
     /// still takes the parent path unchanged. The grandchild's own sleeper
     /// sub-mode is checked (and dispatched) BEFORE this ever runs — see
-    /// [`dispatch_if_child`] — so `GRANDCHILD_SLEEPER_ROLE_VALUE` never
+    /// [`dispatch_if_child`] — so `GRANDCHILD_CHILD_ROLE_VALUE` never
     /// reaches here and never trips this panic.
     fn parse(s: &str) -> Self {
         match s {
@@ -268,12 +301,14 @@ impl Role {
             // classified via `Capture::hung` before `terminus_satisfied` is
             // ever consulted. This arm exists only so the function is total.
             Role::Wedge => Terminus::SentinelExact("[child] WEDGE-UNREACHABLE"),
-            // Grandchild's terminus would be satisfiable in isolation (its
-            // sentinel IS present and exit code 0 IS its own), but this
-            // Capture is never scored against it: `classify` gates on
-            // `incompleteness_reason` before `terminus_satisfied` is ever
-            // consulted for a `SettleExpired` capture. This arm exists so the
-            // function is total and so the sentinel text lives in ONE place.
+            // Grandchild's sentinel and exit code are always its own,
+            // regardless of `GRANDCHILD_MODE_ENV` — this terminus is the
+            // SAME in both scenarios. What differs is whether `classify`
+            // ever reaches it: for the writing grandchild-of-grandchild the
+            // capture is untrustworthy (`SettleExpired`), so `classify`
+            // returns `Attempt::Incomplete` before this terminus is ever
+            // consulted; for the holding one the capture IS trustworthy, so
+            // this exact terminus decides `Attempt::Survived`.
             Role::Grandchild => Terminus::SentinelExact(GRANDCHILD_SENTINEL),
         }
     }
@@ -795,47 +830,78 @@ fn run_synthetic(kind: SyntheticKind) -> ! {
             std::process::exit(0);
         }
         SyntheticKind::Grandchild => {
-            // Spawn the sleeper WITHOUT stdio redirection: it inherits this
-            // process's stderr, the very pipe `DrainedChild` is draining.
-            // `ROLE_ENV` is explicitly OVERRIDDEN to the sleeper sentinel
-            // (never inherited as `"grandchild"` — that would fork-bomb).
+            // Spawn the grandchild-of-grandchild WITHOUT stdio redirection:
+            // it inherits this process's stderr, the very pipe
+            // `DrainedChild` is draining. `ROLE_ENV` is explicitly
+            // OVERRIDDEN to `GRANDCHILD_CHILD_ROLE_VALUE` (never inherited as
+            // `"grandchild"` — that would fork-bomb); `GRANDCHILD_MODE_ENV`
+            // is forwarded unchanged, selecting which of the two shapes
+            // `run_grandchild_of_grandchild` runs.
             let exact = std::env::var(SELF_EXACT_ENV).expect(
-                "Role::Grandchild requires SELF_EXACT_ENV, set by run_child on every spawn",
+                "Role::Grandchild requires SELF_EXACT_ENV, set by run_grandchild on every spawn",
+            );
+            let mode = std::env::var(GRANDCHILD_MODE_ENV).expect(
+                "Role::Grandchild requires GRANDCHILD_MODE_ENV (writing or holding), set by \
+                 run_grandchild on every spawn",
             );
             let mut cmd =
                 Command::new(std::env::current_exe().expect("current_exe for grandchild spawn"));
             cmd.args(["--exact", &exact, "--nocapture", "--test-threads=1"])
-                .env(ROLE_ENV, GRANDCHILD_SLEEPER_ROLE_VALUE);
-            let _sleeper = cmd.spawn().expect("spawn sleeper grandchild");
+                .env(ROLE_ENV, GRANDCHILD_CHILD_ROLE_VALUE)
+                .env(GRANDCHILD_MODE_ENV, &mode);
+            let _grandchild_of_grandchild = cmd.spawn().expect("spawn grandchild-of-grandchild");
             // This role's own sentinel — printed and exited immediately, so
             // every byte of THIS process's output is already read by the
-            // time it exits. The pipe stays open only because the sleeper
-            // (not this process) still holds it.
+            // time it exits. Whether the pipe then looks "still open" to the
+            // poll-based reader depends entirely on what the
+            // grandchild-of-grandchild does next (see `GRANDCHILD_MODE_ENV`'s
+            // two values).
             eprintln!("{GRANDCHILD_SENTINEL}");
             std::process::exit(0);
         }
     }
 }
 
-/// [`GRANDCHILD_SLEEPER_ROLE_VALUE`]'s body: sleeps 3 s — well past
-/// `wait_bounded`'s ~1 s settle bound, so the reader thread reading its
-/// inherited stderr never observes EOF within the settle window — then exits
-/// 0. Self-terminating: nothing leaks across the suite even though nothing
-/// ever waits on this process directly (it is the harness's grandchild, not
-/// its child).
-fn run_grandchild_sleeper() -> ! {
-    std::thread::sleep(Duration::from_secs(3));
-    std::process::exit(0);
+/// [`GRANDCHILD_CHILD_ROLE_VALUE`]'s body: dispatches on [`GRANDCHILD_MODE_ENV`]
+/// to one of two shapes (see [`GRANDCHILD_MODE_WRITING`]/
+/// [`GRANDCHILD_MODE_HOLDING`] for the mechanism each exercises), panicking
+/// on any other value the same way [`Role::parse`] does. Self-terminating
+/// either way (3 s): nothing leaks across the suite even though nothing ever
+/// waits on this process directly (it is the harness's grandchild-of-
+/// grandchild, not its child).
+fn run_grandchild_of_grandchild() -> ! {
+    let mode = std::env::var(GRANDCHILD_MODE_ENV).unwrap_or_default();
+    if mode == GRANDCHILD_MODE_WRITING {
+        // A `[grandchild] heartbeat <n>` line every 10 ms for 3 s (300
+        // lines) — well under the poll-based reader's 50 ms poll timeout, so
+        // `POLLIN` keeps arriving and the reader never sees an empty poll
+        // while this process is still writing.
+        for n in 0..300 {
+            eprintln!("[grandchild] heartbeat {n}");
+            let _ = std::io::stderr().flush();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::process::exit(0);
+    }
+    if mode == GRANDCHILD_MODE_HOLDING {
+        // Holds the inherited pipe open without ever writing to it. Under
+        // the poll-based reader, the first EMPTY poll after `Role::Grandchild`
+        // itself is reaped concludes EOF immediately — merely holding the fd
+        // open no longer delays completeness at all.
+        std::thread::sleep(Duration::from_secs(3));
+        std::process::exit(0);
+    }
+    panic!("child.rs test harness: unknown {GRANDCHILD_MODE_ENV}={mode:?}");
 }
 
 /// The dispatch guard: every spawning test's first statement. Checks the
-/// grandchild's own sleeper sentinel BEFORE [`Role::parse`] — the sleeper is
-/// never a [`Role`] (see [`GRANDCHILD_SLEEPER_ROLE_VALUE`]), so it must never
+/// grandchild-of-grandchild's own sentinel BEFORE [`Role::parse`] — it is
+/// never a [`Role`] (see [`GRANDCHILD_CHILD_ROLE_VALUE`]), so it must never
 /// reach `Role::parse`'s unknown-text panic. When [`ROLE_ENV`] is absent,
 /// this is a no-op and the test proceeds as the parent.
 fn dispatch_if_child() {
-    if std::env::var(ROLE_ENV).as_deref() == Ok(GRANDCHILD_SLEEPER_ROLE_VALUE) {
-        run_grandchild_sleeper();
+    if std::env::var(ROLE_ENV).as_deref() == Ok(GRANDCHILD_CHILD_ROLE_VALUE) {
+        run_grandchild_of_grandchild();
     }
     if let Some(role) = std::env::var(ROLE_ENV).ok().map(|r| Role::parse(&r)) {
         child_main(role);
@@ -1422,6 +1488,25 @@ fn run_child(role: Role, test_name: &str, ceiling: Duration) -> (Attempt, Captur
     (attempt, cap)
 }
 
+/// Like [`run_child`], specialized to [`Role::Grandchild`]: also sets
+/// [`GRANDCHILD_MODE_ENV`] to `mode` ([`GRANDCHILD_MODE_WRITING`] or
+/// [`GRANDCHILD_MODE_HOLDING`]), selecting which grandchild-of-grandchild
+/// shape the role's body spawns. The two `Role::Grandchild` oracles
+/// (`grandchild_capture_is_incomplete_not_survived`,
+/// `holding_grandchild_capture_is_complete`) are its only callers.
+fn run_grandchild(test_name: &str, ceiling: Duration, mode: &str) -> (Attempt, Capture) {
+    let exe = std::env::current_exe().expect("current test binary");
+    let mut cmd = Command::new(exe);
+    cmd.args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+        .env(ROLE_ENV, Role::Grandchild.as_str())
+        .env(SELF_EXACT_ENV, test_name)
+        .env(GRANDCHILD_MODE_ENV, mode);
+    let child = DrainedChild::spawn(&mut cmd).expect("spawn child");
+    let cap = child.wait_bounded(ceiling, Epoch::Spawn);
+    let attempt = classify(&cap, Role::Grandchild);
+    (attempt, cap)
+}
+
 /// Render both of a [`Capture`]'s streams (stdout then stderr, matching the
 /// pre-drain harness's own `log` shape) for a panic/failure message. Prefers
 /// `Capture::render_stdout`/`render_stderr` over the free `render` function:
@@ -1875,24 +1960,32 @@ fn wedge_role_is_hung_with_its_last_phase_marker() {
 }
 
 /// **The `Attempt::Incomplete` oracle.** [`Role::Grandchild`] prints its
-/// sentinel and exits 0 IMMEDIATELY, but a grandchild it spawned (inheriting
-/// stderr) is still asleep when `wait_bounded`'s ~1 s settle bound expires:
+/// sentinel and exits 0 IMMEDIATELY, but the grandchild-of-grandchild it
+/// spawned (inheriting stderr, in [`GRANDCHILD_MODE_WRITING`]) keeps writing
+/// a heartbeat line every 10 ms — well under the poll-based reader's 50 ms
+/// poll timeout — for 3 s, so `POLLIN` keeps arriving and the reader never
+/// sees an empty poll before `wait_bounded`'s ~1 s settle bound expires:
 /// `Capture::complete` comes back `SettleExpired`. The mechanism assertion is
 /// that this must NEVER be scored `Survived`, even though by every
 /// content-only measure it looks like a clean pass (exit code 0, sentinel
 /// line present, nothing else wrong) — a content-dependent classification
 /// arm that nothing can ever reach is a no-op waiting to happen (a real
 /// incomplete capture silently scored as its exit code's "clean" class).
+/// Sibling: [`holding_grandchild_capture_is_complete`] pins the OTHER side of
+/// this boundary — a grandchild-of-grandchild that only holds the pipe,
+/// never writing, does NOT produce `SettleExpired`.
 ///
 /// No sub-ceiling wall-clock assertion: the 10 s ceiling is comfortably above
-/// both `wait_bounded`'s ~1 s settle bound and the 3 s sleeper, so this test
+/// both `wait_bounded`'s ~1 s settle bound and the 3 s writer, so this test
 /// exercises the settle-expiry path (not the ceiling-kill path) — the
-/// sleeper is never killed, only outlasted; it self-terminates at 3 s
-/// regardless of this test's outcome, so nothing leaks across the suite.
+/// grandchild-of-grandchild is never killed, only outlasted; it
+/// self-terminates at 3 s regardless of this test's outcome, so nothing
+/// leaks across the suite.
 #[test]
 fn grandchild_capture_is_incomplete_not_survived() {
     dispatch_if_child();
-    let (attempt, cap) = run_child(Role::Grandchild, GUARD_TEST, Duration::from_secs(10));
+    let (attempt, cap) =
+        run_grandchild(GUARD_TEST, Duration::from_secs(10), GRANDCHILD_MODE_WRITING);
     let reason = match attempt {
         Attempt::Incomplete(reason) => reason,
         other => panic!(
@@ -1904,8 +1997,9 @@ fn grandchild_capture_is_incomplete_not_survived() {
     assert_eq!(
         cap.complete,
         Completeness::SettleExpired,
-        "the mechanism this oracle exercises: the reader thread must not have observed EOF \
-         within the settle bound because the sleeper grandchild still holds the pipe. Log:\n{}",
+        "the mechanism this oracle exercises: the reader thread must not have observed an empty \
+         poll before the settle bound expired, because the grandchild-of-grandchild kept writing \
+         with gaps under the 50 ms poll timeout. Log:\n{}",
         rendered_log(&cap)
     );
     assert!(
@@ -1931,5 +2025,43 @@ fn grandchild_capture_is_incomplete_not_survived() {
     assert!(
         diagnostic.contains("SettleExpired"),
         "the formatted diagnostic must carry the reason: {diagnostic}"
+    );
+}
+
+/// **The `Completeness::Complete` boundary, from the other side.** Sibling to
+/// [`grandchild_capture_is_incomplete_not_survived`]: SAME role, SAME
+/// sentinel, SAME exit code — the only difference is that the
+/// grandchild-of-grandchild here ([`GRANDCHILD_MODE_HOLDING`]) merely holds
+/// the inherited pipe open for 3 s and never writes to it. Under the
+/// poll-based reader, the first EMPTY poll after `Role::Grandchild` itself is
+/// reaped concludes EOF immediately — a silent fd-holder no longer delays
+/// completeness at all, regardless of why it still has the pipe open. That
+/// alone flips the outcome from `Incomplete` to `Survived`, pinning the exact
+/// boundary `jammi_test_utils::child` documents between "holding" and
+/// "writing".
+///
+/// No sub-ceiling wall-clock assertion: the settle here is expected to
+/// complete almost immediately (one 50 ms poll after `Role::Grandchild`
+/// reaps), well inside the 10 s ceiling; the holder self-terminates at 3 s
+/// regardless, so nothing leaks across the suite.
+#[test]
+fn holding_grandchild_capture_is_complete() {
+    dispatch_if_child();
+    let (attempt, cap) =
+        run_grandchild(GUARD_TEST, Duration::from_secs(10), GRANDCHILD_MODE_HOLDING);
+    assert!(
+        matches!(attempt, Attempt::Survived),
+        "expected Survived — merely holding the pipe (never writing) must not delay \
+         completeness under the poll-based reader, got {attempt:?}. Log:\n{}",
+        rendered_log(&cap)
+    );
+    assert_eq!(
+        cap.complete,
+        Completeness::Complete,
+        "a silent holder (no writes) must NOT produce SettleExpired: {cap:?}"
+    );
+    assert!(
+        cap.is_trustworthy(),
+        "a Complete, untruncated, error-free capture must be trustworthy: {cap:?}"
     );
 }

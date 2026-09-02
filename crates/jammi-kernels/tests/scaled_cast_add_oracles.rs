@@ -6,7 +6,7 @@
 //!      scaling values so a sign error in either grad slot cannot hide).
 //!      `ScaledCastAdd`'s CPU forward implements F32/BF16 storage only (no
 //!      F64 arm — the op's whole reason to exist is bf16-boundary
-//!      rounding, which F64 cannot exercise), unlike `Axpy`'s f64 leg.
+//!      rounding, which F64 cannot exercise).
 //!   2. `fused_vs_eager_*` — fwd AND bwd vs. the eager `[mul, add, cast]`
 //!      composition `LoraLinear::forward` actually runs today (esc-046 fix,
 //!      GH#374: `base` promotes to `f32`, adds the `f32`-scaled `lora`,
@@ -15,11 +15,13 @@
 //!      used). `F32`/`F32` and `BF16`(base)/`F32`(lora) — the two dtype
 //!      combinations `jammi-lora`'s admission predicate actually reaches —
 //!      are asserted BIT-EXACT (`assert_eq!`), not merely within a
-//!      tolerance: this op now follows `Axpy`'s "f32-accumulate, round
-//!      once" precedent rather than diverging from it.
-//!   3. `bwd_chains_through_an_intermediate_*` — the chain-rule oracle
-//!      through an intermediate (non-`Var`) input, mirroring `Axpy`'s
-//!      `oracles.rs`.
+//!      tolerance: this op now follows this crate's "f32-accumulate,
+//!      round once" convention rather than diverging from it.
+//!   3. `bwd_*` — the chain-rule oracle through an intermediate
+//!      (non-`Var`) input, plus the two adjacent cases that separate
+//!      "candle never called `bwd`" from "`bwd` answered `None`" (see
+//!      `jammi_kernels::ops`'s module doc on why `is_variable()` is not a
+//!      safe gradient-need gate).
 //!   4. `f32_base_bf16_lora_*` / `bf16_base_bf16_lora_*` — the
 //!      UNREACHABLE-today `(F32, BF16)` and `(BF16, BF16)` combinations
 //!      (`ScaledCastAdd` accepts them; `jammi-lora`'s admission predicate
@@ -153,7 +155,7 @@ fn gradcheck_scaled_cast_add_bwd_f32() {
 fn gradcheck_scaled_cast_add_bwd_f32_negative_scaling() {
     // A second scaling value (negative, non-unit) — the closed form is
     // `d_base = 1`, `d_lora = scaling`, so a positive-only fixture could
-    // hide a sign error the way a single alpha could for Axpy.
+    // let a sign error in `d_lora` pass unnoticed.
     gradcheck_f32(-0.4, 1e-3, 5e-2);
 }
 
@@ -207,7 +209,7 @@ fn round_before_add(base: f32, lora: f32, scaling: f32) -> bf16 {
 }
 
 /// This op's ACTUAL model since esc-046: accumulate the whole expression in
-/// `f32` and round ONCE at the end (`Axpy`'s own precedent) — matches
+/// `f32` and round ONCE at the end (this crate's convention) — matches
 /// PEFT's `Linear.forward` source exactly (see this op's own module doc).
 fn f32_accumulate_round_once(base: f32, lora: f32, scaling: f32) -> bf16 {
     bf16::from_f32(base + lora * scaling)
@@ -412,6 +414,40 @@ fn bwd_populates_a_grad_for_a_true_frozen_leaf_input_too_and_it_is_harmless() {
         grads.get(&base).unwrap().to_vec1::<f32>().unwrap(),
         vec![1.0, 1.0, 1.0]
     );
+}
+
+/// The layer ABOVE this op's `bwd`: when NEITHER input is (or leads to) a
+/// `Var`, candle's own pre-pass (`Tensor::sorted_nodes`'s `track_grad`,
+/// `backprop.rs:47-158`) decides the whole `CustomOp2` node needs no
+/// gradient and never pushes it onto `sorted_nodes` — so `bwd` is never
+/// invoked at all here, one layer above anything this op's `bwd` body
+/// controls. `.backward()` must still SUCCEED (a degenerate-but-valid,
+/// all-constants graph is not an error), and both slots are absent — not
+/// because `bwd` returned `None`. Compare
+/// [`bwd_populates_a_grad_for_a_true_frozen_leaf_input_too_and_it_is_harmless`]
+/// above, where ONE `Var` being present makes candle call `bwd`, which
+/// then returns `Some` for BOTH slots including the still-frozen one:
+/// together the two tests separate "candle never asked" from "the op
+/// answered `None`", which a single test cannot.
+///
+/// (Ported unchanged in campaign #446 W2-B from the deleted proof op's
+/// oracle file, which was this property's only home in the tree.)
+#[test]
+fn bwd_is_never_called_when_neither_input_leads_to_a_variable() {
+    let device = Device::Cpu;
+    let base = Tensor::from_slice(&[1.0f32], (1,), &device).unwrap();
+    let lora = Tensor::from_slice(&[2.0f32], (1,), &device).unwrap();
+    assert!(!base.is_variable() && !lora.is_variable());
+
+    let out = fused_fwd(1.0, &base, &lora).unwrap();
+    assert_eq!(
+        out.to_vec1::<f32>().unwrap(),
+        vec![3.0],
+        "the forward itself must still be computed"
+    );
+    let grads = out.backward().unwrap();
+    assert!(grads.get(&base).is_none());
+    assert!(grads.get(&lora).is_none());
 }
 
 // ---------------------------------------------------------------------

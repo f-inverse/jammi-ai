@@ -11,9 +11,9 @@
 //! downstream crate's `CustomOp` cannot actually construct one. This file
 //! reproduces that type's iteration algorithm (the same row-major
 //! unravel-against-`dims` walk, offset arithmetic included) under a public
-//! constructor (`StridedOffsets::from_layout`) so `Axpy`'s CPU forward can
-//! honor that documented contract instead of silently requiring
-//! contiguity. Per Apache License, Version 2.0 §4(b)/(c): this file is a
+//! constructor (`StridedOffsets::from_layout`) so this crate's elementwise
+//! CPU forwards can honor that documented contract instead of silently
+//! requiring contiguity. Per Apache License, Version 2.0 §4(b)/(c): this file is a
 //! modified copy of candle-core source, its origin is stated here, and
 //! candle-core's own license (MIT OR Apache-2.0) is unaffected by this
 //! reuse — candle-core carries no separate per-file copyright header on
@@ -21,7 +21,7 @@
 //!
 //! Determinism (family J): iteration order is fixed by `dims`/`stride`
 //! alone — the same layout always yields the same offset sequence, which is
-//! what makes the CPU fold order in `ops::axpy` reproducible.
+//! what makes every CPU fold order built on top of it reproducible.
 
 use candle_core::Layout;
 

@@ -15,11 +15,16 @@ workspace crate.
   `sm_80`+), per-op dispatch counters, a log-once-per-process WARN helper,
   and a `Strict` mode that turns a failed domain check into a hard error
   instead of a silent fallback.
-- `ops::Axpy` — `y' = alpha * x + y`, the proof op. A `CustomOp2` with real
-  CPU forward/backward (F32, F64, BF16) and, behind the `cuda` feature, a
-  CUDA forward loaded from build-time-compiled PTX via
-  `CudaDevice::get_or_load_custom_func`. Stateless: `alpha` is construction
-  data, nothing is saved between forward and backward.
+- `ops` — the fused ops themselves (LayerNorm, RoPE, softmax, GeGLU,
+  dropout, scaled-cast-add, cast-scale, fused AdamW step, low-rank residual
+  linear, attention block). Each is a `CustomOp` with a real CPU
+  forward/backward and, behind the `cuda` feature, a CUDA forward loaded
+  from build-time-compiled PTX via `CudaDevice::get_or_load_custom_func`.
+  Stateless by construction: every op reachable through `apply1`/`apply2`/
+  `apply3` is `Copy`, so its fields are plain construction data and nothing
+  is saved between forward and backward (the one genuinely stateful op,
+  FlashAttention-2 varlen, goes through the separate `apply_stateful*`
+  family instead).
 - `build.rs` — early-returns unless the `cuda` feature is active. Under the
   feature, compiles `src/cuda/*.cu` to PTX via `bindgen_cuda`, pinned to the
   `sm_80` baseline (the driver JIT-forwards to 8.6/8.9/9.0) with no

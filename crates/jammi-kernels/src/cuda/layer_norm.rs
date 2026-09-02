@@ -7,7 +7,7 @@ use super::{PTX_LAYER_NORM, PTX_LAYER_NORM_F16};
 use crate::ops::layer_norm::hidden_of;
 use crate::ops::MAX_HIDDEN;
 
-/// See `../../cuda/axpy.rs`'s identical constant for the module-name
+/// See `crate::cuda`'s module doc for the module-name
 /// rationale — arbitrary but stable and unique to this op's PTX module.
 const MODULE_NAME: &str = "jammi_kernels_layer_norm";
 
@@ -26,8 +26,9 @@ const LN_BLOCK: u32 = 256;
 /// nothing about the launch itself breaks above this value; the refusal
 /// is about validated numerics/performance coverage, not a real ceiling
 /// this kernel design imposes). `n > u32::MAX`: the launch grid and the
-/// kernel's own indices are 32-bit, exactly the guard `axpy.rs` documents
-/// for the same reason.
+/// kernel's own indices are 32-bit, exactly the guard
+/// `ops::launch_domain::check_elem_count_fits_u32` documents for the same
+/// reason.
 fn check_cuda_domain(op: &'static str, n: usize, hidden: usize) -> Result<()> {
     if hidden > MAX_HIDDEN {
         return Err(Error::Msg(format!(

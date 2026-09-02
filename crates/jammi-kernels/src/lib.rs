@@ -12,11 +12,11 @@
 //! `AUTHORS` ship in the published tarball; see that directory's
 //! `VENDORED.md` for provenance and the exact pinned upstream version).
 //!
-//! [`ops::Axpy`] is the proof op
-//! establishing the pattern every later fused op copies (real CPU fwd/bwd, a
-//! feature-gated CUDA fwd loaded from build-time PTX, statelessness enforced
-//! structurally — every op is required to be `Copy`, see `ops`'s module
-//! doc); [`admission`] is the runtime scaffolding — a CUDA
+//! [`ops`] holds the fused ops themselves; every one of them follows the
+//! same pattern (real CPU fwd/bwd, a feature-gated CUDA fwd loaded from
+//! build-time PTX, statelessness enforced structurally — every op
+//! reachable through `apply1`/`apply2`/`apply3` is required to be `Copy`,
+//! see `ops`'s module doc). [`admission`] is the runtime scaffolding — a CUDA
 //! compute-capability probe, per-op dispatch counters, a log-once WARN, and
 //! a `Strict` mode — every later fused op's call site uses to decide
 //! fused-vs-eager and make that decision observable.

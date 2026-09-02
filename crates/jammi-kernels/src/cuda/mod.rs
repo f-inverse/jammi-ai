@@ -1,7 +1,38 @@
 //! CUDA glue, compiled only when the `cuda` feature is active. `build.rs`
-//! compiles `axpy.cu` to PTX at `OUT_DIR/axpy.ptx`; embedded here via
-//! `include_str!` and loaded at runtime through candle's public
+//! compiles every `src/cuda/*.cu` to PTX (e.g. `layer_norm.cu` to
+//! `OUT_DIR/layer_norm.ptx`); embedded here via `include_str!` and loaded
+//! at runtime through candle's public
 //! `CudaDevice::get_or_load_custom_func`.
+//!
+//! ## Two conventions every op's glue in here shares
+//!
+//! **PTX module names.** Each op loads its PTX under a `MODULE_NAME`
+//! constant (`CudaDevice::get_or_load_custom_func`'s module cache key).
+//! The exact string is arbitrary; what matters is that it is stable and
+//! unique to that op, so a second op's module never collides with it. An
+//! op with a separate monomorphic F16 translation unit carries a second,
+//! equally distinct `MODULE_NAME_F16`.
+//!
+//! **Contiguity is checked FIRST, and `is_contiguous()` alone is NOT
+//! sufficient.** Every `cuda_fwd` here resolves its buffers with
+//! `Layout::contiguous_offsets()` before its `n == 0` fast path, so a
+//! non-contiguous VIEW is refused with `Error::RequiresContiguous`
+//! whether or not it happens to be empty (the CPU arms never require
+//! contiguity — they walk `StridedOffsets` — so this is the CUDA arm's
+//! OWN self-consistency, not a match to a `cpu_fwd` requirement).
+//! `is_contiguous()` does not imply `start_offset == 0` (candle's own doc
+//! on `Layout::is_contiguous`: "does not imply that the start offset is 0
+//! or that there are no extra elements at the end of the storage") — a
+//! `narrow`'d-but-still-contiguous view can have a nonzero offset into a
+//! LARGER base buffer. `as_cuda_slice::<T>()` returns the WHOLE base
+//! `CudaSlice`, so reading it from element 0 would read the base buffer's
+//! first `n` elements instead of this tensor's actual `[start_offset,
+//! start_offset + n)` range — a confident wrong answer with no error.
+//! `contiguous_offsets()` gives the real `[o1, o2)` range, and slicing to
+//! it is candle's own idiom for this exact situation
+//! (`cuda_backend/mod.rs`'s `IndexAdd` CUDA impl does the same
+//! `contiguous_offsets()` -> `slice(o1..o2)` on both of its tensor args).
+//! `tests/cuda_parity.rs`'s nonzero-start-offset parity legs pin it.
 
 use candle_core::cuda_backend::cudarc::driver::LaunchConfig;
 use candle_core::{CudaDevice, CudaStorage, DType, Error, Result};
@@ -9,7 +40,6 @@ use half::{bf16, f16};
 
 pub(crate) mod adamw_step;
 pub(crate) mod attention_block;
-pub(crate) mod axpy;
 pub(crate) mod cast_scale;
 pub(crate) mod dropout;
 pub(crate) mod geglu;
@@ -21,10 +51,6 @@ pub(crate) mod scaled_cast_add;
 pub(crate) mod softmax;
 
 pub(crate) const PTX_ADAMW_STEP: &str = include_str!(concat!(env!("OUT_DIR"), "/adamw_step.ptx"));
-pub(crate) const PTX_AXPY: &str = include_str!(concat!(env!("OUT_DIR"), "/axpy.ptx"));
-/// F16 monomorphic arm (campaign #443 W2c) — see `axpy_f16.cu`'s module doc
-/// for why this is a SEPARATE `.cu` file rather than a widened `axpy.cu`.
-pub(crate) const PTX_AXPY_F16: &str = include_str!(concat!(env!("OUT_DIR"), "/axpy_f16.ptx"));
 pub(crate) const PTX_CAST_SCALE: &str = include_str!(concat!(env!("OUT_DIR"), "/cast_scale.ptx"));
 /// F16 monomorphic arm (campaign #443 W2c) — see `cast_scale_f16.cu`'s
 /// module doc. Backs the NEW `CastScaleF16F32`/`CastAddF16` types
@@ -82,7 +108,7 @@ pub(crate) use crate::ops::launch_domain::{
 };
 
 /// The grid-stride, one-thread-per-element launch config the crate's
-/// single-pass elementwise kernels (`Axpy`, `ScaledCastAdd`, `RopeFused`)
+/// single-pass elementwise kernels (`ScaledCastAdd`, `RopeFused`)
 /// all use — the kernel's own `if (i < n)` bounds check covers `n` in one
 /// launch, so `LaunchConfig::for_num_elems` alone is sufficient.
 /// `GegluFused`'s own `launch_config` (`cuda/geglu.rs`) is DELIBERATELY
@@ -97,7 +123,7 @@ pub(crate) fn elemwise_launch_config(n: u32) -> LaunchConfig {
 /// `cuda_fwd` (and backward helper) takes identically: F32/BF16/F16 are
 /// this crate's production dtypes (F16 added in campaign #443 W2b for
 /// `layer_norm`/`softmax`/`geglu`/`rope`, extended in W2c to
-/// `rope_positions`/`axpy`/`dropout`/`scaled_cast_add` — every op with a
+/// `rope_positions`/`dropout`/`scaled_cast_add` — every op with a
 /// compiled F16 dispatch arm), anything else a typed refusal.
 ///
 /// The two ops this crate ships WITHOUT an F16 dispatch arm

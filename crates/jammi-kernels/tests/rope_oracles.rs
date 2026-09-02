@@ -37,9 +37,9 @@
 //!      measured on these fixtures; see the bf16 tests' own docs for why
 //!      that is not a structural guarantee at every shape.
 //!   3. `chain_rule_through_an_intermediate_x` — the same
-//!      `is_variable() == false` intermediate hazard `Axpy`'s regression
-//!      test exercises, at a 4D (batch/heads/seq/head_dim) shape matching
-//!      the real call site.
+//!      `is_variable() == false` intermediate hazard
+//!      `jammi_kernels::ops`'s module doc names, at a 4D
+//!      (batch/heads/seq/head_dim) shape matching the real call site.
 //!   4. `negated_sin_bwd_matches_a_hand_computed_sign_flip` — a
 //!      hand-computable 4-element case pinning the sign convention (which
 //!      half of `rotate_half` gets the negation) so a sign flip fails with
@@ -47,8 +47,7 @@
 //!
 //! The CUDA↔CPU parity leg (fwd + bwd, contiguous/narrowed/empty, head_dim
 //! 64 and a non-power-of-two even head_dim, bf16+f32) lives in
-//! `tests/cuda_parity.rs`, gated the same way `Axpy`'s/`LayerNormFused`'s
-//! are.
+//! `tests/cuda_parity.rs`, gated the same way `LayerNormFused`'s is.
 
 use candle_core::{DType, Device, Tensor, Var, D};
 use half::bf16;
@@ -364,8 +363,9 @@ fn fused_vs_formula_bf16_bwd_is_bit_exact_after_the_one_rounding_fix() {
 }
 
 /// Chain-rule oracle: `x` is an INTERMEDIATE (`w.affine(2, 0)`) on a path
-/// to a `Var` — `is_variable() == false`, the exact hazard `Axpy`'s own
-/// regression test exercises — at the real 4D call-site shape.
+/// to a `Var` — `is_variable() == false`, the exact hazard
+/// `jammi_kernels::ops`'s module doc names — at the real 4D call-site
+/// shape.
 #[test]
 fn chain_rule_through_an_intermediate_x() {
     let device = Device::Cpu;

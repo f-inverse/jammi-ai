@@ -91,8 +91,9 @@
 //! differently in a future nvcc version if this expression ever grew a
 //! neighboring add) so the pinning is stated in the kernel text itself,
 //! not merely inferred from "there happens to be no add nearby" — the same
-//! doctrine C1 established for `Axpy`'s FMA-contraction disclosure, applied
-//! here as a POSITIVE guarantee instead of a disclosed gap.
+//! doctrine C1 established for this crate's FMA-contraction disclosure
+//! (`build.rs`'s PINNED FLAGS comment), applied here as a POSITIVE
+//! guarantee instead of a disclosed gap.
 //!
 //! ## No save-for-backward (candle 0.11): bwd IS fwd
 //!
@@ -422,8 +423,9 @@ fn dropout_f32(params: &DropoutFused, x: &[f32]) -> Vec<f32> {
 }
 
 /// BF16: widen to `f32`, apply the same lone multiply, round to `bf16`
-/// once — this crate's usual single-rounding convention (`Axpy`'s bf16
-/// arm), and there is only ever ONE rounding point here regardless (unlike
+/// once — this crate's usual single-rounding convention
+/// (f32-accumulate, round once), and there is only ever ONE rounding
+/// point here regardless (unlike
 /// `ScaledCastAdd`'s two-round PEFT-matching model): a KEPT element is
 /// `bf16::from_f32(x_i_as_f32 * scale)`, a DROPPED element is an exact
 /// `bf16::ZERO`, never a rounded quantity.

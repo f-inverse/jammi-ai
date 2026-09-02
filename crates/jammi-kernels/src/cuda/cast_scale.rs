@@ -10,7 +10,7 @@ use half::{bf16, f16};
 
 use super::{PTX_CAST_SCALE, PTX_CAST_SCALE_F16};
 
-/// See `../axpy.rs`'s identical constant for the module-name rationale.
+/// See `crate::cuda`'s module doc for the module-name rationale.
 const MODULE_NAME: &str = "jammi_kernels_cast_scale";
 
 /// The F16 arms' OWN PTX module name (campaign #443 W2c) —

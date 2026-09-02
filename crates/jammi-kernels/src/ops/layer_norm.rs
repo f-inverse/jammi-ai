@@ -19,7 +19,8 @@
 //! ## Three kernels, one call site
 //!
 //! - [`LayerNormFused`] (`CustomOp2`: `x`, `gamma`) — the forward. Its
-//!   `bwd` does not compose ordinary `Tensor` ops (the way `Axpy`'s does);
+//!   `bwd` does not compose ordinary `Tensor` ops (the way
+//!   `ScaledCastAdd`'s does);
 //!   it dispatches into two more `KernelOp`s so the expensive per-element
 //!   work (the `dx` recompute) is a genuine fused kernel on CUDA, not a
 //!   handful of broadcasted candle ops:
@@ -47,14 +48,14 @@
 //! chosen once and never revisited.
 //!
 //! That deviation is DELIBERATE and sound, not a relapse into the
-//! `is_variable()` hazard `Axpy`'s doc warns about (`is_variable()`
+//! `is_variable()` hazard `ops`'s module doc warns about (`is_variable()`
 //! cannot tell a true external constant apart from an INTERMEDIATE on a
-//! path to a `Var`, and gating `bwd`'s OWN return value on it — the
-//! design `Axpy` replaced — reproduces that chain-rule break). The
+//! path to a `Var`, and gating `bwd`'s OWN return value on it reproduces
+//! that chain-rule break). The
 //! difference here is WHAT is being tested and WHEN: `dx`'s slot is
 //! still ALWAYS `Some(dx)` regardless of `x`'s `is_variable()` status —
-//! `LayerNormFused::bwd` never gates `dx` on anything, exactly like
-//! `Axpy`. Only `gamma`'s slot uses `is_variable()`, and only because a
+//! `LayerNormFused::bwd` never gates `dx` on anything, exactly like every
+//! other op here. Only `gamma`'s slot uses `is_variable()`, and only because a
 //! `LayerNorm`'s `gamma` is structurally a LEAF MODULE PARAMETER — loaded
 //! straight from a `VarBuilder`, never produced by composing other
 //! tensors — so the INTERMEDIATE-on-a-path-to-a-`Var` case that makes
@@ -74,7 +75,7 @@
 //! relying on whoever adds trainable-gamma support later to remember to
 //! flip a hardcoded bool. Here there is no ambiguity for `dx`'s slot —
 //! `LayerNormFused::bwd` ALWAYS returns `Some(dx)` for `x`, exactly like
-//! `Axpy`'s bwd always returns `Some` for both slots, regardless of
+//! every other op's bwd here returns `Some` for its input slots, regardless of
 //! whether `x` happens to be an intermediate. If `gamma` somehow WERE an
 //! intermediate despite never being constructed that way, `is_variable()
 //! == false` would make this op emit `None` for it, and if that turned
@@ -87,10 +88,12 @@
 //!
 //! `x` and `gamma` must be fully contiguous (`contiguous_offsets()`,
 //! honoring a nonzero `start_offset` from a narrowed-but-contiguous view —
-//! the same idiom `Axpy`'s CUDA arm uses, and for the same reason: a
-//! raw-pointer kernel has no flat linear index for a strided view). This
+//! the same idiom every CUDA arm in this crate uses, and for the same
+//! reason: a raw-pointer kernel has no flat linear index for a strided
+//! view — see `crate::cuda`'s module doc). This
 //! is a real domain restriction (arbitrary strides are NOT walked here,
-//! unlike `Axpy`'s CPU arm), deliberately: LayerNorm's per-row reduction
+//! unlike the `StridedOffsets`-walking CPU arms of `cast_scale`/
+//! `scaled_cast_add`/`adamw_step`), deliberately: LayerNorm's per-row reduction
 //! needs a well-defined `[rows, hidden]` grouping, and the actual call
 //! site (encoder activations) is always contiguous — a non-contiguous
 //! input is exactly the kind of case the call site's own admission check
@@ -99,8 +102,8 @@
 //! getting the row-grouping wrong for. `gamma` must be rank-1 with length
 //! equal to `x`'s last dimension. CPU supports F32, BF16 (bias-free
 //! LayerNorm's real training dtype), and F16; no F64 leg. F32/BF16 stay
-//! device-uniform with CUDA (unlike `Axpy`, which is more generically
-//! typed), since the profiled workload (ModernBERT-large, bf16) never
+//! device-uniform with CUDA, since the profiled workload
+//! (ModernBERT-large, bf16) never
 //! needs F64 here and keeping the domain device-uniform avoids a
 //! CPU-passes/CUDA-refuses split with no oracle covering it. **F16**: the
 //! CPU F16 arm (`ln_fwd_f16`/`ln_bwd_dx_f16`/`ln_bwd_dgamma_f16` below)
@@ -253,8 +256,8 @@ impl CustomOp2 for LayerNormFused {
     /// See the module doc's "no save-for-backward" and "construction
     /// data" sections. `dx`'s slot is ALWAYS `Some` — `x` may be an
     /// intermediate on a path to a `Var` (`Tensor::is_variable() ==
-    /// false` does not mean "no gradient needed", see `Axpy`'s doc on
-    /// this exact hazard) — only `gamma`'s slot is ever `None`, and only
+    /// false` does not mean "no gradient needed", see `ops`'s module doc
+    /// on this exact hazard) — only `gamma`'s slot is ever `None`, and only
     /// when `self.dgamma_needed` says so.
     fn bwd(
         &self,
@@ -557,8 +560,8 @@ fn ln_fwd_f32(x: &[f32], gamma: &[f32], rows: usize, hidden: usize, eps: f32) ->
 }
 
 /// BF16 accumulates in f32 (mean/var/xhat), rounding to bf16 exactly once
-/// on the way out — the same accumulation semantics documented on
-/// `ops::axpy`'s BF16 arm, and what the CUDA kernel does too.
+/// on the way out — this crate's f32-accumulate-round-once convention,
+/// and what the CUDA kernel does too.
 fn ln_fwd_row_bf16(x: &[bf16], gamma: &[bf16], eps: f32, out: &mut [bf16]) {
     let hidden = x.len();
     let (mean, var) = mean_var_bf16(x, hidden);

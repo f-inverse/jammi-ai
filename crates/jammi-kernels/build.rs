@@ -479,7 +479,7 @@ fn build_cuda() {
     // `build_ptx()` invokes nvcc (a SEPARATE nvcc invocation per kernel
     // file, distinct from `Builder::default()`'s own `compute_cap()`-time
     // probe above) and writes one `<kernel-stem>.ptx` file per kernel into
-    // `OUT_DIR` (e.g. `axpy.ptx` for `src/cuda/axpy.cu`). Each op's Rust
+    // `OUT_DIR` (e.g. `layer_norm.ptx` for `src/cuda/layer_norm.cu`). Each op's Rust
     // glue embeds its own PTX with
     // `include_str!(concat!(env!("OUT_DIR"), "/<name>.ptx"))` directly, so
     // the `Bindings` helper-file generator (`.write(..)`) is not needed here.

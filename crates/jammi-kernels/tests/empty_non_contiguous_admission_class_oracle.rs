@@ -54,8 +54,8 @@
 //!    run even when `b`/`s`/`h` is 0; only the actual GEMM/gather compute
 //!    is skipped for an empty `qkv`. [`AttentionBlockFused`] is this leg.
 //!
-//! `crate::cuda::{axpy,scaled_cast_add,cast_scale,adamw_step}`'s own fix
-//! (the SAME reordering, `crate::cuda::axpy::cuda_fwd`'s own doc) is a
+//! `crate::cuda::{scaled_cast_add,cast_scale,adamw_step}`'s own fix
+//! (the SAME reordering, `crate::cuda`'s own module doc) is a
 //! DIFFERENT shape not exercised by THIS file: those ops' `cpu_fwd` arms
 //! never call `contiguous_offsets()` at all (they walk `StridedOffsets`,
 //! tolerating any stride), so there is no "same refusal on CPU" to prove

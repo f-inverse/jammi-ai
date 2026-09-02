@@ -473,7 +473,7 @@ fn eager_vs_fused_bf16_bwd_diverges_and_stays_within_the_stated_tolerance_at_pro
 fn chain_rule_through_an_intermediate_wi_out_matches_eager() {
     // `wi_out` is an INTERMEDIATE (`w.affine(1.5, 0.2)`) on a path to a
     // `Var` (`w`) — `is_variable() == false`, the same regression shape
-    // `Axpy`/`LayerNormFused`/`SoftmaxLastDimFused` all carry. `bwd`'s
+    // `LayerNormFused`/`SoftmaxLastDimFused`/`ScaledCastAdd` all carry. `bwd`'s
     // `dwi_out` slot must still populate (it is ALWAYS `Some`, never
     // gated on `is_variable()`), and the chain rule through the affine
     // must match the eager composition's own gradient for `w`.

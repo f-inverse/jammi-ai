@@ -2,9 +2,9 @@ use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::cudarc::driver::PushKernelArg;
 use candle_core::{CudaStorage, DType, Error, Layout, Result};
 
-/// The kernel module name PTX functions are loaded under (see
-/// `cuda::axpy`'s identical doc on `MODULE_NAME`) — arbitrary, but stable
-/// and unique to this op.
+/// The kernel module name PTX functions are loaded under (see this
+/// module's parent `crate::cuda` doc, "PTX module names") — arbitrary, but
+/// stable and unique to this op.
 const MODULE_NAME: &str = "jammi_kernels_adamw_step";
 
 /// Domain check shared by both kernels here: F32 only (the optimizer is
@@ -12,7 +12,7 @@ const MODULE_NAME: &str = "jammi_kernels_adamw_step";
 /// doc) and every buffer contiguous. Returns each buffer's
 /// `[start, end)` element range in its OWN base storage (`contiguous_
 /// offsets`, candle's own idiom for a `narrow`'d-but-contiguous view with a
-/// nonzero start offset — see `cuda::axpy::cuda_fwd`'s doc on why
+/// nonzero start offset — see `crate::cuda`'s module doc on why
 /// `is_contiguous()` alone is not sufficient).
 fn require_contiguous_f32(
     op: &'static str,

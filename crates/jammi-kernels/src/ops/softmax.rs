@@ -513,7 +513,7 @@
 //! `mask` broadcast, then reshape) for the case a future caller DOES make
 //! it trainable — the same "correctness over micro-optimization, this
 //! path is provably dead today" choice `RopeFused::bwd`'s `dcos`/`dsin`
-//! and `Axpy::bwd` both make.
+//! makes (see also `ops`'s module doc on why `None` is not the default).
 //!
 //! ## esc-037 disposition
 //!

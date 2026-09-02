@@ -1654,10 +1654,6 @@ impl ProbedOp {
 ///   superseded by `lora_linear_fused`, and kept only for snapshot-schema
 ///   compatibility. A row for either would put a permanently-unmoving
 ///   counter in the report.
-/// - `axpy` — grepped for across all four crates: NO `counters_for` /
-///   `admit` / bare-launcher site at all. It is a compiled kernel with no
-///   dispatch decision and no parent to prove it through, so it is neither a
-///   probed op nor an internal subkernel.
 ///
 /// **`registry` is empty for a [`ProbedOpKind::InternalSubkernel`] row on
 /// purpose**: `rope_positions` and `scaled_cast_add` are launched by a bare
@@ -3148,8 +3144,9 @@ mod tests {
 
     /// Every two-arm/cascade row DOES carry at least one registry key (the
     /// mirror of the test above: a probed row with no key is a row a probe
-    /// silently drops — exactly the shape `axpy` has, which is why `axpy` is
-    /// not a row at all).
+    /// silently drops — exactly the shape `lora_dropout`/`lora_epilogue`
+    /// have, which is why neither is a row at all; see this constant's own
+    /// doc for that exclusion).
     #[test]
     fn two_arm_and_cascade_rows_all_carry_a_registry_key() {
         for op in PROBED_OPS {

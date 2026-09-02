@@ -82,7 +82,7 @@ use candle_core::{Error, Result};
 ///
 /// This is the ONE place that fact lives. Every op's own domain check
 /// calls it: `cuda::geglu::cuda_fwd`/`cuda_bwd_dwi_out` directly,
-/// `cuda::axpy`/`cast_scale`/`scaled_cast_add`/`adamw_step` directly, and
+/// `cuda::cast_scale`/`scaled_cast_add`/`adamw_step` directly, and
 /// `layer_norm`/`rope`/`rope_positions`'s combined `check_cuda_domain`
 /// plus `softmax`'s combined `check_last_and_n` for the `u32::MAX` half
 /// of their check, alongside their own op-specific ceiling
@@ -112,8 +112,9 @@ pub(crate) const GEGLU_BLOCK: u32 = 256;
 
 /// A conservative 1-D grid cap for the same kernels. The kernels' own
 /// grid-stride loop covers any `n_out` beyond `GEGLU_BLOCK *
-/// GEGLU_MAX_GRID` correctly — unlike `Axpy`'s single-pass `if (i < n)`
-/// kernel, these do not need the grid to cover `n_out` in one pass.
+/// GEGLU_MAX_GRID` correctly — unlike this crate's single-pass
+/// `if (i < n)` kernels (`scaled_cast_add`, `cast_scale`, `rope`), these
+/// do not need the grid to cover `n_out` in one pass.
 /// `GEGLU_BLOCK * GEGLU_MAX_GRID` is the grid-stride STRIDE, i.e. exactly
 /// the quantity that used to overflow a 32-bit induction variable (this
 /// module's doc).

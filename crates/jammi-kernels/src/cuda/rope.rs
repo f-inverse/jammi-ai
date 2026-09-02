@@ -7,7 +7,7 @@ use super::{PTX_ROPE, PTX_ROPE_F16};
 use crate::ops::rope::rope_dims;
 use crate::ops::MAX_HEAD_DIM;
 
-/// See `../axpy.rs`'s identical constant for the module-name rationale —
+/// See `crate::cuda`'s module doc for the module-name rationale —
 /// arbitrary but stable and unique to this op's PTX module.
 const MODULE_NAME: &str = "jammi_kernels_rope";
 
@@ -19,8 +19,9 @@ const MODULE_NAME_F16: &str = "jammi_kernels_rope_f16";
 /// `hidden > MAX_HEAD_DIM`: refused above a conservative, VALIDATED
 /// ceiling — NOT a hardware limit (see `ops::MAX_HEAD_DIM`'s doc). `n >
 /// u32::MAX`: the kernel's own indices (`hidden`, `period` arguments) and
-/// the launch grid are 32-bit, exactly the guard `axpy.rs`/`layer_norm.rs`
-/// document for the same reason.
+/// the launch grid are 32-bit, exactly the guard
+/// `ops::launch_domain::check_elem_count_fits_u32` documents for the same
+/// reason.
 fn check_cuda_domain(op: &'static str, n: usize, hidden: usize) -> Result<()> {
     if hidden > MAX_HEAD_DIM {
         return Err(Error::Msg(format!(

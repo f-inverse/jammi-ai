@@ -6,7 +6,7 @@ use half::{bf16, f16};
 use super::{PTX_GEGLU, PTX_GEGLU_F16};
 use crate::ops::geglu::{check_variant, geglu_dims, output_shape, GeluVariant};
 
-/// See `../axpy.rs`'s identical constant for the module-name rationale —
+/// See `crate::cuda`'s module doc for the module-name rationale —
 /// arbitrary but stable and unique to this op's PTX module.
 const MODULE_NAME: &str = "jammi_kernels_geglu";
 

@@ -6,7 +6,7 @@ use half::{bf16, f16};
 use super::{PTX_DROPOUT, PTX_DROPOUT_F16};
 use crate::ops::DropoutFused;
 
-/// See `../axpy.rs`'s identical constant for the module-name rationale.
+/// See `crate::cuda`'s module doc for the module-name rationale.
 const MODULE_NAME: &str = "jammi_kernels_dropout";
 
 /// The F16 arm's OWN PTX module name (campaign #443 W2c) — `dropout_f16.cu`
@@ -22,8 +22,9 @@ const DROPOUT_BLOCK: u32 = 256;
 
 /// A conservative 1-D grid cap; the kernel's own grid-stride loop (written
 /// in `unsigned long long`, NOT `unsigned int`) covers any `n` beyond
-/// `DROPOUT_BLOCK * DROPOUT_MAX_GRID` correctly — unlike `Axpy`'s
-/// single-pass kernel, this op has no `u32::MAX` element-count ceiling at
+/// `DROPOUT_BLOCK * DROPOUT_MAX_GRID` correctly — unlike this crate's
+/// single-pass `if (i < n)` kernels (`scaled_cast_add`, `cast_scale`,
+/// `rope`), this op has no `u32::MAX` element-count ceiling at
 /// all (see this module's `cuda_fwd`, which therefore does NOT check
 /// `n > u32::MAX` the way every other op's CUDA glue in this crate does).
 ///

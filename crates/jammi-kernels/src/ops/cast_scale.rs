@@ -44,7 +44,7 @@
 //! silent reinterpretation). The CUDA arm additionally REQUIRES contiguous
 //! storage (`Error::RequiresContiguous`, never a silent misread of a
 //! strided view) — matching every other elementwise op in this crate
-//! ([`super::Axpy`]/[`super::ScaledCastAdd`]'s own documented CUDA domain).
+//! ([`super::ScaledCastAdd`]'s own documented CUDA domain).
 //! See "Contiguity at the call site" below for why `bwd` never actually
 //! reaches this refusal in production.
 //!
@@ -165,7 +165,7 @@
 //! non-contiguous input the way a CALL SITE'S OWN admission predicate can
 //! (e.g. `LoraLinear::forward`'s `lora_linear_admission_predicate`) — it
 //! returns `Error::RequiresContiguous`, matching every other elementwise op
-//! in this crate ([`super::Axpy`]/[`super::ScaledCastAdd`]'s documented
+//! in this crate ([`super::ScaledCastAdd`]'s documented
 //! CUDA domain: "additionally requires contiguous storage"). `bwd` itself
 //! has no eager alternative to fall back TO at this point (unlike the
 //! outer `LowRankResidualLinear` site, which decided fused-vs-eager BEFORE
@@ -220,8 +220,8 @@ use crate::layout_walk::StridedOffsets;
 /// `BF16`-only rather than accepting `F32` too (nothing to fuse there).
 ///
 /// STATELESS BY CONSTRUCTION (`Copy`, see `ops`'s module doc): `scale` is
-/// construction data, matching [`super::Axpy`]/[`super::ScaledCastAdd`]'s
-/// own `f64`-typed scalar field.
+/// construction data, matching [`super::ScaledCastAdd`]'s own `f64`-typed
+/// scalar field.
 #[derive(Debug, Clone, Copy)]
 pub struct CastScaleBf16F32 {
     pub scale: f64,
@@ -267,7 +267,7 @@ impl CustomOp1 for CastScaleBf16F32 {
     /// argument is an untracked upstream-gradient tensor, never itself
     /// re-differentiated — see that op's own module doc, "Tensor-level"),
     /// implemented anyway for the same reason
-    /// [`super::Axpy::bwd`]/[`super::ScaledCastAdd::bwd`] always return
+    /// [`super::ScaledCastAdd::bwd`] always returns
     /// `Some`: this is a generic primitive (family L), not guaranteed to
     /// stay behind an untracked call site forever.
     fn bwd(&self, arg: &Tensor, _res: &Tensor, grad_res: &Tensor) -> Result<Option<Tensor>> {
@@ -297,7 +297,7 @@ fn cast_scale_bf16_f32(scale: f64, x: &[bf16], lx: &Layout) -> Vec<f32> {
 /// arm's widen-add-round idiom.
 ///
 /// STATELESS BY CONSTRUCTION (`Copy`): no construction data at all — unlike
-/// [`CastScaleBf16F32`]/[`super::Axpy`], this op has no scalar field, only
+/// [`CastScaleBf16F32`]/[`super::ScaledCastAdd`], this op has no scalar field, only
 /// the fixed cast-then-add expression.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CastAddBf16;
@@ -356,8 +356,8 @@ impl CustomOp2 for CastAddBf16 {
     }
 
     /// `d_base = dy` (identity — `base` enters the sum unrounded, matching
-    /// [`super::Axpy::bwd`]'s "the add is linear with unit coefficient"
-    /// convention); `d_f32val = cast_to(F32)(dy)` — the chain rule through
+    /// [`super::ScaledCastAdd::bwd`]'s "the add is linear with unit
+    /// coefficient" convention); `d_f32val = cast_to(F32)(dy)` — the chain rule through
     /// the (straight-through) round, matching
     /// [`super::ScaledCastAdd::bwd`]'s `d_lora` cast. Dead in
     /// `LowRankResidualLinear::bwd`'s own usage today for the same reason

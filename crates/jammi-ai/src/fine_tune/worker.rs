@@ -287,9 +287,28 @@ impl TrainingWorker {
     /// worker is running, and its lease guard would not match anyway.
     ///
     /// `Self::publish_and_finalize`'s own `finalize_training_job`
-    /// `Ok(false)`/`Err` arms likewise leave the job `running` for reclaim —
-    /// those are POST-probe, so the report is already `determined` and the
-    /// tri-state contract is not at stake there.
+    /// `Ok(false)`/`Err` arms likewise leave the job `running` for reclaim, so
+    /// no terminal status is written on them either and the same reclaim half
+    /// of the catalog-edge rule applies.
+    ///
+    /// # The SUCCESS path is not exempt (campaign #446 round-1 audit)
+    ///
+    /// An earlier revision of this note claimed the post-probe paths were not
+    /// at stake "because the report is already `determined`". That is not
+    /// guaranteed: `persist_acceleration_report` deliberately SWALLOWS a
+    /// lease-guard miss (`Ok(false)`, e.g. a stale `attempt`) and a catalog
+    /// error, by design — the write not landing must never fail training. A
+    /// job whose probe write was swallowed and which then finalizes
+    /// successfully reaches `completed` with the submission-time `pending`
+    /// marker still on the row, which is the SAME forbidden state the failure
+    /// paths above avoid, by a success path. It is covered at the same ONE
+    /// catalog edge: `Catalog::finalize_training_job` retires a still-`pending`
+    /// report to `{"state":"undetermined","reason":
+    /// "finalized_without_determination"}` in the SAME CAS that stamps
+    /// `completed`, and preserves any already-`determined` payload
+    /// byte-for-byte. `crates/jammi-ai/tests/it/acceleration_report.rs`'s
+    /// `completed_job_with_a_swallowed_report_write_is_never_left_pending`
+    /// drives both legs.
     #[tracing::instrument(
         skip(self, session, record),
         fields(
@@ -1992,6 +2011,15 @@ async fn record_failed(catalog: &Arc<Catalog>, job_id: &str, worker_id: &str, ms
 /// (`compute_and_persist_acceleration_report`) or one of the terminal
 /// markers below for a job kind/path that never reaches the measuring probe
 /// at all (Phase-4 adversarial-audit finding 4).
+///
+/// **Swallowing is deliberate, and it is covered downstream.** A `false`
+/// (lease-guard miss: the lease was lost, or this attempt's `attempt` no
+/// longer matches the row's `attempts`) or an `Err` here must never fail
+/// training. The consequence — a job that goes on to complete with its
+/// submission-time `{"state":"pending"}` marker never overwritten — is
+/// retired at the catalog's terminal edge, not compensated for here; see
+/// [`TrainingWorker::run_claimed_job`]'s "The SUCCESS path is not exempt"
+/// section.
 async fn persist_acceleration_report(
     catalog: &Arc<Catalog>,
     job_id: &str,
@@ -2887,9 +2915,11 @@ fn build_acceleration_report_json(
 /// (`run_fine_tune_blocking`), right after the device is resolved and (on the
 /// encoder-adapters arm) right after `validate_backbone_precision` /
 /// `build_encoder_adapters` return — before the training loop's first step,
-/// so a status poll mid-training always finds a `"determined"` report rather
-/// than the submission-time `"pending"` marker for this run's whole
-/// lifetime.
+/// so a status poll mid-training finds a `"determined"` report rather than
+/// the submission-time `"pending"` marker for this run's whole lifetime
+/// **whenever the write lands**; when it does not (see
+/// [`persist_acceleration_report`]'s swallowing note), the row keeps the
+/// `pending` marker until its terminal catalog write retires it.
 ///
 /// Never fails training: report computation is infallible by construction
 /// (see [`probe_acceleration`]'s doc), and a `false`/`Err` from

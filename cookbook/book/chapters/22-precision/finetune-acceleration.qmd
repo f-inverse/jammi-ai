@@ -384,28 +384,41 @@ remote = jammi.connect(f"grpc://127.0.0.1:{server_b.port}")
 print(f"server B (default run_worker) up at grpc://127.0.0.1:{server_b.port}, same artifact dir")
 ```
 
-One surface gap, named where it was found rather than smoothed over: `fine_tune` returns a
-`jammi.RemoteTrainingJob` — a public, exported handle class — but no public verb re-attaches such
-a handle to an existing job id over a *different* connection. Server A's handle died with server
-A's channel, so the cell below constructs that same public class against server B's connection,
-reading the two transport values off the connection object directly. That is the chapter reaching
-past the public surface, and it is reported as the missing verb it is — a `training_job(job_id)`
-re-attach, on both transports — never presented as the intended way to do this.
+A job handle is **re-attachable across connections**, on both arms: `db.training_job(job_id)`
+hands back a handle to a job this session never submitted — the same
+`jammi.RemoteTrainingJob` here that `fine_tune` returns, and the embedded arm's own
+`TrainingJob` there. That is what makes the sequence below expressible through the public
+surface at all: server A's handle died with server A's channel, and the id is the only thing
+that crosses. Existence is resolved at attach time, by one `TrainingStatus` call, rather
+than left for the first read to discover: a job id with no row visible to this session's
+tenant raises the typed `jammi.errors.BackendError` — the same class on both transports —
+instead of handing back a handle that fails later.
+
+One value differs between the two arms, and it differs because the wire says so:
+`TrainingStatusResponse.model_id` is empty until the job *completes*, so a remote attach
+made before then carries an empty `model_id` (the embedded attach re-derives the
+deterministic id from the persisted spec; this client does not duplicate a naming rule the
+engine owns). Nothing is asserted about it at attach time here — whether server B's claim
+loop has already finished this job by then is a race, and a race is exactly what this
+chapter refuses to assert into. The re-attach *after* `wait()` in the cell below is the
+deterministic read, and it recovers the very id server A was handed at submit — over a
+connection to a process that never accepted the submission.
 
 ```{python}
-# Job A, over server B's connection. Same job id — nothing is resubmitted.
-job_f16 = jammi.RemoteTrainingJob(
-    remote._training,
-    remote._metadata,
-    job_id=JOB_A_ID,
-    model_id=JOB_A_MODEL_ID,
-)
+# Job A, over server B's connection, through the public verb. Same job id —
+# nothing is resubmitted.
+job_f16 = remote.training_job(JOB_A_ID)
 assert job_f16.job_id == JOB_A_ID
 
 # The queue outlived the process that accepted it: a job server B never saw
 # submitted leaves `queued` under server B's own claim loop.
 job_f16.wait()
 assert job_f16.status() == "completed", job_f16.status()
+
+# A second attach, now that the job is terminal — the deterministic `model_id`
+# read. Server B recovers the exact output id server A was handed at submit,
+# from the catalog alone.
+assert remote.training_job(JOB_A_ID).model_id == JOB_A_MODEL_ID
 
 report_f16 = job_f16.acceleration_report()
 print(json.dumps(report_f16, indent=2, sort_keys=True))
@@ -545,6 +558,7 @@ try:
         backbone_dtype="bf16",
         target_modules=TARGET_MODULES,
     )
+    JOB_BF16_ID = job_bf16.job_id
     job_bf16.wait()
     raise RuntimeError("bf16 must be refused on this CPU-only build — it completed instead")
 except jammi.errors.TrainingError as exc:
@@ -555,6 +569,47 @@ except jammi.errors.TrainingError as exc:
 
 print("\nbf16 fine-tuning was refused loud, with the typed remedy message pointing at f16 — "
       "never a silent downgrade, never a silently-eager bf16 run.")
+```
+
+## Both outcomes, from the catalog — `list_training_jobs`
+
+Two jobs have now run through this artifact directory, submitted by two different processes over
+two different connections: the `f16` one server A accepted and server B claimed and completed,
+and the `bf16` one server B refused. Neither handle is needed to see them. `db.list_training_jobs()`
+is the tenant-scoped listing peer of `training_job(job_id)` — the same `TrainingJobSummary` field
+set on both arms (`job_id`, `kind`, `status`, `base_model_id`, `output_model_id`, `created_at`,
+`error`), most recent first, with `output_model_id` empty until a job completes and `error` empty
+unless it failed. Neither arm maps either onto `None`, so a caller branches on one thing on both
+transports. There is no progress surface here by construction: the engine records run metrics only
+at finalization, so a listing shows terminal facts, not a percentage.
+
+```{python}
+jobs = remote.list_training_jobs()
+for j in jobs:
+    print(f"  {j['job_id']}  status={j['status']:<10s} "
+          f"output_model_id={j['output_model_id']!r} error={j['error'][:40]!r}")
+
+by_id = {j["job_id"]: j for j in jobs}
+assert set(by_id) == {JOB_A_ID, JOB_BF16_ID}, sorted(by_id)
+# Most recent first — the bf16 submission is the later of the two.
+assert jobs[0]["job_id"] == JOB_BF16_ID, jobs[0]["job_id"]
+
+# The completed job carries its output id; the refused one carries its error —
+# and each carries the empty string, not `None`, where the other carries a value.
+done, refused = by_id[JOB_A_ID], by_id[JOB_BF16_ID]
+assert done["status"] == "completed", done["status"]
+assert done["output_model_id"] == JOB_A_MODEL_ID, done["output_model_id"]
+assert done["error"] == "", repr(done["error"])
+assert refused["status"] == "failed", refused["status"]
+assert refused["output_model_id"] == "", repr(refused["output_model_id"])
+assert "bf16" in refused["error"], refused["error"]
+
+# The field set is the wire's, exactly — no arm adds or drops a key.
+SUMMARY_KEYS = {
+    "job_id", "kind", "status", "base_model_id", "output_model_id", "created_at", "error",
+}
+for j in jobs:
+    assert set(j) == SUMMARY_KEYS, sorted(set(j) ^ SUMMARY_KEYS)
 ```
 
 ```{python}

@@ -201,13 +201,29 @@ impl PyDatabase {
     /// very handover they just asked for. A caller that still needs them must
     /// finish with them before closing, and open a fresh connection afterwards.
     ///
-    /// Ordinary usage needs no explicit `close()`: the embedded engine
-    /// otherwise releases on drop (RAII, unbounded but eventual), which is why
-    /// the higher-level `jammi.EmbeddedBackend.close()` wrapper still raises
-    /// `NotSupportedOnBackend` today. The remote arm is unaffected in every
-    /// respect — `jammi.RemoteDatabase.close()` closes a gRPC channel and holds
-    /// no catalog file at all; the file this releases exists only on the
-    /// embedded arm.
+    /// # The public surface
+    ///
+    /// `jammi.EmbeddedBackend.close()` — what a caller of
+    /// `jammi.connect("file://…")` actually holds — delegates straight to this
+    /// method, and its `__exit__` calls the same, so a `with` block releases
+    /// the catalog on exit. The wrapper adds no private notion of "closed": the
+    /// binding, the native session and the client all mean this handshake by
+    /// the word.
+    ///
+    /// `close` is therefore an ordinary member of the client's `Session`
+    /// surface on BOTH transports, not a `jammi.Capability` — the enum member
+    /// `CLOSE` no longer exists. It was there while the wrapper raised
+    /// `NotSupportedOnBackend` on the claim that the embedded engine "releases
+    /// on drop"; that claim is exactly what the `unix-excl` seam falsifies (see
+    /// above — a drop releases nothing at any bounded moment), so the flag was
+    /// hiding a primitive that existed rather than describing a divergence.
+    ///
+    /// What each transport releases still differs, and the remote arm is
+    /// unaffected in every respect: `jammi.RemoteDatabase.close()` closes a
+    /// gRPC channel and a Flight client, and holds no catalog file at all — the
+    /// file this releases exists only on the embedded arm. The CONTRACT is
+    /// shared, though: both are idempotent, and after either one every verb
+    /// raises `jammi.errors.BackendError`.
     ///
     /// Idempotent — calling `close()` again is a no-op that returns `None`,
     /// never an error. Every OTHER method on this handle raises

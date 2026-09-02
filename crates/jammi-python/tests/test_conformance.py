@@ -517,8 +517,10 @@ def test_numeric_verbs_compute_identically_across_wheels(tmp_path):
             ranked_lists, k_rrf=40
         )
     finally:
-        # The embedded engine releases its resources on drop; only the remote
-        # client holds a gRPC channel that needs an explicit close.
+        # Only the remote client's gRPC channel needs an explicit close in a
+        # `finally`. The embedded arm carries a real `close()` too (the catalog
+        # release), but this test opens a fresh per-test directory no successor
+        # ever reopens, so letting the handle drop is enough here.
         remote.close()
 
 

@@ -421,22 +421,15 @@ fn f32_two_term_bound(reference: f32, operand_amplitude: f32, k_rel: f32, k_abs:
 /// per-element allowance, OR `actual` is non-finite (guide §3.7: a
 /// non-finite actual must count as a violation, never silently pass a
 /// naive `>` comparison).
-fn count_bound_violations(
-    reference: &[f32],
-    actual: &[f32],
-    bound_fn: impl Fn(f32) -> f32,
-) -> usize {
-    count_bound_violations_indexed(reference, actual, |_, c| bound_fn(c))
-}
-
-/// [`count_bound_violations`]'s index-aware form. A leg whose allowance
-/// depends on THIS element's own operands — not just on the reference
-/// VALUE — needs the index to reach them (see
+///
+/// Index-aware, and index-aware ONLY: a leg whose allowance depends on
+/// THIS element's own operands — not just on the reference VALUE — needs
+/// the index to reach them (see
 /// [`softmax_f16_dscores_propagation_terms`], whose per-element term is
-/// `|dy_i - dot|·|Δy_i| + |Δdot|·|y_i|`). The value-only
-/// [`count_bound_violations`] is this function with the index discarded,
-/// so both forms share one definition of "violation" (including guide
-/// §3.7's non-finite rule).
+/// `|dy_i - dot|·|Δy_i| + |Δdot|·|y_i|`). A value-only caller passes
+/// `|_, c| bound_fn(c)`; that one-line adapter is cheaper than a wrapper
+/// function, and keeping a single definition of "violation" (including
+/// guide §3.7's non-finite rule) is the point.
 fn count_bound_violations_indexed(
     reference: &[f32],
     actual: &[f32],

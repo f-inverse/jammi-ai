@@ -188,6 +188,33 @@ release promotes.
   the `[hidden]`-shaped dgamma zeros.
 - **64-bit grid-stride indexing** across the fused kernels' loops, with a host
   guard (#447).
+- **esc-073 child harness no longer hangs CI on an undrained pipe
+  (`jammi-test-utils`, `jammi-db`; #449, esc-078/esc-079).** The harness
+  children that prove the SQLite two-library coexistence seam wrote more
+  than a pipe's worth of diagnostics while the parent waited on exit, so a
+  refusing child parked in `write(2)` until the ceiling killed it with an
+  empty log. `jammi_test_utils::child::DrainedChild` drains both streams
+  from the moment of spawn, treats an idle descriptor as done only once the
+  child is confirmed reaped, caps retention to a head-and-tail window, and
+  reports completeness, truncation, hang, kill, and silence as separate
+  axes; every attempt is scored against a per-role terminal line, and an
+  untrustworthy capture is classified `Incomplete`, never `Survived`. A
+  standing differential keeps the undrained driver in the tree and
+  reproduces the hang on every run.
+- **GPU prove lane: proof surface equals shipped surface, and the ceilings
+  are measured (#450, esc-080..esc-083).** The tag-path four-arch prove
+  lane reported a budget kill as a proof failure after every proof had
+  passed. The served, capability-surface, and kernel proofs are now derived
+  from the release manifest's declared `prove_lane` kinds and a closure
+  guard fails when an invocation is not on the manifest; each proof group
+  emits its own return-code marker and a final exit line so a partial log
+  names the group that was cut; the remote stream carries an inactivity
+  watchdog and a budget cut is reported as a budget cut; and a producer
+  turns each job log into a committed per-arch timing artifact that rules
+  R1–R5 check on every run, so the inactivity window (900 s, three times
+  the largest healthy silence observed) and the timeout backstop are
+  derived from evidence rather than guessed. Bench is not proof and never
+  gates.
 
 ### Removed
 - **`Capability.CLOSE`, from the Python client `jammi`.** A public API

@@ -2389,8 +2389,8 @@ fn validate_backbone_precision(
 // **Which ops this probe can attribute is ONE static fact**, not a list
 // re-typed here: `jammi_kernels::admission::PROBED_OPS` (campaign #446
 // finding 2). A prior revision of this comment claimed `rope_positions`,
-// `axpy`, `cast_scale` and `scaled_cast_add` all "have NO admit/admit_cascade
-// call site anywhere in this workspace". That was FALSE for two of the four
+// `cast_scale` and `scaled_cast_add` all "have NO admit/admit_cascade call
+// site anywhere in this workspace". That was FALSE for two of the three
 // and is corrected here: `cast_scale` and `cast_add` DO admit, under
 // dtype-resolved registry keys (`cast_scale_bf16_f32`/`cast_scale_f16_f32`,
 // `cast_add_bf16`/`cast_add_f16` — `low_rank_residual_linear.rs:800,814,899,
@@ -2401,7 +2401,13 @@ fn validate_backbone_precision(
 // (`ProbedOpKind::InternalSubkernel`), so no probe can read a delta for
 // them and they are OMITTED from `ops` — never fabricated as a `holds`
 // either way (K-series: ship the honest negative, not a vacuous positive).
-// `axpy` has no dispatch site and no parent at all.
+// Every kernel this build compiles is now in one of those two positions:
+// campaign #446 W2 deleted the workspace's last kernel that had neither an
+// admission gate nor an admitted parent — a measured CUDA census, not a
+// judgement call:
+// `crates/jammi-kernels/artifacts/cuda-runs/2026-09-01-axpy-census-bdeb80c-a100-pcie.json`
+// — so there is no longer a class of compiled kernel this report is
+// structurally unable to say anything about.
 //
 // The report's `ops` CANDIDATE key set is therefore a pure function of the
 // job's backbone dtype class (`PROBED_OPS` filtered by

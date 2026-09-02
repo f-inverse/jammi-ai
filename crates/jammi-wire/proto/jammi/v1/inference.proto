@@ -7,7 +7,7 @@ import "jammi/v1/trigger.proto";
 // InferenceService — the wire surface for the engine's inference verb.
 //
 // `Infer` is an imperative session method, not a SQL query, so it lives as a
-// typed gRPC RPC alongside SessionService / TriggerService / EmbeddingService
+// typed gRPC RPC alongside CatalogService / TriggerService / EmbeddingService
 // rather than on the Flight SQL surface (which carries query/result only, per
 // ADR-01 §3.2). The verb is a substrate primitive: it names the act of running
 // a model over a source, not any tenant-domain concept.
@@ -88,7 +88,7 @@ message InferRequest {
   // Column whose value becomes each output row's `_row_id` key.
   string key_column = 5;
   // Optional tenant scope override; if unset, the session's tenant
-  // (set via SessionService.SetTenant) applies. Empty string == none.
+  // (set via CatalogService.SetTenant) applies. Empty string == none.
   string tenant_id = 6;
   // Opt-in memoization. UNSPECIFIED maps to the engine default (`Bypass`).
   // Inference anchors its source `UnpinnedAtInstant`, so a `Use` request is

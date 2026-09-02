@@ -12,7 +12,7 @@ import "jammi/v1/trigger.proto";
 //
 // `BuildNeighborGraph`, `PropagateEmbeddings`, and `AssembleContext` are
 // imperative session methods, not SQL queries, so they live as typed gRPC RPCs
-// alongside SessionService / EmbeddingService / InferenceService / EvalService
+// alongside CatalogService / EmbeddingService / InferenceService / EvalService
 // rather than on the Flight SQL surface (which carries query/result only, per
 // ADR-01 §3.2). They are substrate primitives — materialising a k-NN graph,
 // propagating features over a declared graph, or pooling a retrieval into a

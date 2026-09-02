@@ -51,10 +51,11 @@ pub struct TrainingJobRecord {
     ///     or one this code never touched. Never read as "accelerated" or
     ///     "eager" — it is an honest absence of information, not a claim.
     ///   - `Some(json)` — a payload landed. The catalog itself writes exactly
-    ///     three payload shapes, all of them PENDING-valued transitions (see
-    ///     the lifecycle below): `{"state":"pending"}` at `INSERT` time, and
-    ///     the two `"undetermined"` retirements of that marker on the terminal
-    ///     paths. Every other payload — commonly `{"state":"determined", ...}`
+    ///     four payload shapes (see the lifecycle below): `{"state":"pending"}`
+    ///     at `INSERT` time and again on the requeue reset, plus the three
+    ///     `"undetermined"` retirements of that marker — one per terminal
+    ///     write, each strictly `pending`-valued. Every other payload —
+    ///     commonly `{"state":"determined", ...}`
     ///     from the claiming worker via
     ///     [`Catalog::record_acceleration_report`], but not limited to that
     ///     one shape (a non-fine-tune job kind or a pre-device-resolution
@@ -69,32 +70,47 @@ pub struct TrainingJobRecord {
     /// word — it is only true while the job can still reach the probe. The
     /// moment the row goes TERMINAL, `pending` describes a state that will
     /// never resolve, which is exactly the state this contract has no reading
-    /// for. So the catalog retires it at the ONE edge every terminal write
-    /// passes through, never at N caller sites (a caller can be skipped, or a
-    /// new terminal caller added without the marker; the reclaim paths have no
-    /// live caller at all — the claimant is dead):
+    /// for. So the catalog retires it INSIDE each terminal write's own UPDATE,
+    /// never at N caller sites (a caller can be skipped, or a new terminal
+    /// caller added without the marker; the reclaim paths have no live caller
+    /// at all — the claimant is dead). There are exactly THREE writes that
+    /// drive a row terminal, and every one of them carries the retirement:
     ///
-    ///   - [`Catalog::fail_training_job`] — `pending` → `{"state":
-    ///     "undetermined","reason":"failed_before_probe"}`, in the SAME
-    ///     lease-guarded UPDATE that stamps `failed`.
+    ///   - [`Catalog::finalize_training_job`] — terminal `completed`. `pending`
+    ///     → `{"state":"undetermined","reason":
+    ///     "finalized_without_determination"}`, in the SAME lease-guarded
+    ///     UPDATE that stamps `completed`. Success is NOT evidence that a
+    ///     determination exists: the claimant's report-persist step is
+    ///     best-effort (it can lose its lease guard, or hit a catalog error,
+    ///     and the run still proceeds to publish and finalize), so a
+    ///     successful job can arrive here having never recorded one.
+    ///   - [`Catalog::fail_training_job`] — terminal `failed`. `pending` →
+    ///     `{"state":"undetermined","reason":"failed_before_probe"}`, in the
+    ///     SAME lease-guarded UPDATE that stamps `failed`.
     ///   - [`Catalog::reclaim_expired_training_jobs`], attempts-exhausted arm
-    ///     — `pending` → `{"state":"undetermined","reason":
+    ///     — terminal `failed`. `pending` → `{"state":"undetermined","reason":
     ///     "lease_expired_attempts_exhausted"}`, in the SAME UPDATE that
     ///     stamps `failed`.
+    ///
+    /// One further write moves the column without being terminal:
+    ///
     ///   - [`Catalog::reclaim_expired_training_jobs`], requeue arm — the row
     ///     returns to `queued` for a NEW attempt that will re-probe, so the
     ///     column is RESET to `{"state":"pending"}`. The dead attempt's report
     ///     described the hardware/config THAT attempt saw; leaving it on a
     ///     queued row would attribute it to an attempt that has not started.
     ///
-    /// Both terminal rewrites are strictly `pending`-valued: a payload that is
-    /// already `determined` / `not_applicable` / `undetermined` is the last
-    /// true thing known about the job and is preserved byte-for-byte, and a
-    /// legacy SQL `NULL` stays `NULL` (three-valued `NULL = '…'` is not true,
+    /// All three terminal rewrites are strictly `pending`-valued: a payload
+    /// that is already `determined` / `not_applicable` / `undetermined` is the
+    /// last true thing known about the job and is preserved byte-for-byte, and
+    /// a legacy SQL `NULL` stays `NULL` (three-valued `NULL = '…'` is not true,
     /// so the CASE falls through) — "unknown" is never fabricated into a state.
-    /// No non-terminal write (claim, heartbeat,
-    /// [`Catalog::mark_training_running`], [`Catalog::finalize_training_job`])
-    /// touches the column at all.
+    /// Each terminal reason is distinct, so the retired marker names WHICH edge
+    /// retired it. No status transition outside the four above touches the
+    /// column at all (claim, heartbeat, [`Catalog::mark_training_running`]);
+    /// the only other writer is [`Catalog::record_acceleration_report`], which
+    /// is the PRODUCER stamping its own payload under the lease guard, not a
+    /// status transition.
     pub acceleration_report: Option<String>,
 }
 
@@ -107,7 +123,9 @@ const SELECT_COLS: &str = "job_id, base_model_id, output_model_id, training_sour
 /// an acceleration determination for it. Distinct from SQL `NULL` (a
 /// pre-migration-026 row this code never touched) — see
 /// [`TrainingJobRecord::acceleration_report`]'s producer-owned-payload
-/// contract; this is the one payload shape the catalog itself writes.
+/// contract. This is the only value the catalog ever writes that is not a
+/// retirement of itself: every terminal write below matches these exact bytes
+/// and replaces them, so `pending` never survives onto a terminal row.
 const ACCELERATION_REPORT_PENDING: &str = r#"{"state":"pending"}"#;
 
 /// The marker [`Catalog::fail_training_job`] substitutes for a still-`pending`
@@ -127,6 +145,18 @@ const ACCELERATION_REPORT_FAILED_BEFORE_PROBE: &str =
 /// [`TrainingJobRecord::acceleration_report`]'s lifecycle section.
 const ACCELERATION_REPORT_LEASE_EXPIRED_EXHAUSTED: &str =
     r#"{"state":"undetermined","reason":"lease_expired_attempts_exhausted"}"#;
+
+/// The marker [`Catalog::finalize_training_job`] substitutes for a
+/// still-`pending` report, in the same lease-guarded UPDATE that stamps
+/// `completed`: the run SUCCEEDED, but nothing ever recorded a determination
+/// for it — the claimant's report-persist step is best-effort (it can lose its
+/// lease guard, or hit a catalog error, and the run still proceeds to publish
+/// and finalize), so success is not evidence that a determination exists. The
+/// reason is self-describing and distinct from both failure reasons: this row
+/// is `completed`, not `failed`. Byte-for-byte vocabulary; see
+/// [`TrainingJobRecord::acceleration_report`]'s lifecycle section.
+const ACCELERATION_REPORT_FINALIZED_WITHOUT_DETERMINATION: &str =
+    r#"{"state":"undetermined","reason":"finalized_without_determination"}"#;
 
 /// A backend-portable `SET acceleration_report = …` clause that retires the
 /// submission-time pending marker and leaves every other payload alone:
@@ -467,6 +497,23 @@ impl Catalog {
     /// possible on that row. The `models` predicate above is the one that needed
     /// tenant scoping, because `models.name` is NOT globally unique the way
     /// `job_id` is.
+    ///
+    /// This is a TERMINAL write, so the same CAS also retires a still-`pending`
+    /// `acceleration_report` to
+    /// `{"state":"undetermined","reason":"finalized_without_determination"}`.
+    /// A successful run is not evidence that a determination was recorded: the
+    /// claimant's report-persist step is best-effort — it can lose its lease
+    /// guard or hit a catalog error, and the run still proceeds to publish and
+    /// finalize — so a job can arrive here `completed` while still carrying the
+    /// submission-time marker, and "no claimant has computed a determination
+    /// YET" is not a true sentence about a row that will never be claimed
+    /// again. Riding the SAME statement as the status transition is what makes
+    /// the property hold by construction, exactly as in
+    /// [`Self::fail_training_job`]. Strictly `pending`-valued: an already
+    /// `determined`/`not_applicable`/`undetermined` payload is preserved
+    /// byte-for-byte and a legacy SQL `NULL` stays `NULL`. See
+    /// [`TrainingJobRecord::acceleration_report`]'s lifecycle section and
+    /// `retire_pending_report_clause`.
     pub async fn finalize_training_job(
         &self,
         params: FinalizeTrainingJobParams<'_>,
@@ -490,6 +537,16 @@ impl Catalog {
         let metrics = metrics.map(str::to_string);
         let now = lease_now();
         let tenant = self.current_tenant();
+        // Placeholders stay in ascending order of first appearance in the SQL
+        // text — SQLite assigns `$N` indices by first appearance, so an
+        // out-of-order literal would bind the wrong value.
+        let retire = retire_pending_report_clause(4, 5);
+        let job_sql = format!(
+            "UPDATE training_jobs \
+             SET output_model_id = $1, status = $2, \
+                 metrics = COALESCE($3, metrics), {retire}, updated_at = $6 \
+             WHERE job_id = $7 AND claimed_by = $8 AND status = $9"
+        );
         // Owned, 'static-lifetime copies of the epoch rows so the transaction
         // closure (which must be `'static` — see `TxOptions`/`transaction`'s
         // signature) can move them without borrowing `epoch_checkpoints`.
@@ -513,14 +570,13 @@ impl Catalog {
                     tx.set_tenant(tenant);
                     let job_updated = tx
                         .execute(
-                            "UPDATE training_jobs \
-                             SET output_model_id = $1, status = $2, \
-                                 metrics = COALESCE($3, metrics), updated_at = $4 \
-                             WHERE job_id = $5 AND claimed_by = $6 AND status = $7",
+                            &job_sql,
                             &[
                                 SqlValue::TextOwned(output_model_id.clone()),
                                 SqlValue::TextOwned(completed),
                                 SqlValue::from(metrics),
+                                SqlValue::Text(ACCELERATION_REPORT_PENDING),
+                                SqlValue::Text(ACCELERATION_REPORT_FINALIZED_WITHOUT_DETERMINATION),
                                 SqlValue::TextOwned(now.clone()),
                                 SqlValue::TextOwned(job_id),
                                 SqlValue::TextOwned(worker_id),

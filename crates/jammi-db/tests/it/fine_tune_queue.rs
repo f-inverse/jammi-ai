@@ -1967,11 +1967,13 @@ async fn reclaim_requeue_resets_the_report_to_pending(backend: BackendKind) {
     );
 }
 
-/// (vi) Control — the rewrite fires ONLY on the two terminal-failure paths and
-/// the requeue reset. A job that never fails is untouched at every other
-/// transition: submission, claim, `mark_training_running`, heartbeat, a live
-/// (unexpired) lease surviving a reclaim sweep, and `finalize`. If this control
-/// ever goes red, the CASE has leaked into a write it must not touch.
+/// (vi) Control — the rewrite fires ONLY on the three terminal writes (and the
+/// requeue reset), and only against the `pending` marker. A job that probes and
+/// then succeeds keeps its determination through every transition in its
+/// lifecycle: submission, claim, `mark_training_running`, heartbeat, a live
+/// (unexpired) lease surviving a reclaim sweep, and the terminal `finalize`. If
+/// this control ever goes red, a CASE has leaked past the pending marker into a
+/// payload it must not touch.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
@@ -2089,5 +2091,221 @@ async fn a_job_that_never_fails_keeps_its_report_untouched(backend: BackendKind)
         after.acceleration_report.as_deref(),
         Some(report),
         "the happy path's determination is untouched by every write in the lifecycle"
+    );
+}
+
+/// The exact marker bytes the catalog substitutes for a still-`pending` report
+/// on the lease-guarded terminal-success write.
+const FINALIZED_WITHOUT_DETERMINATION: &str =
+    r#"{"state":"undetermined","reason":"finalized_without_determination"}"#;
+
+/// Register the output model `finalize_training_job` commits the served path
+/// onto, for `job_id`'s conventional output id.
+async fn register_output_model(catalog: &Catalog, job_id: &str) -> String {
+    let model_id = format!("jammi:fine-tuned:{job_id}");
+    catalog
+        .register_model(RegisterModelParams {
+            model_id: &model_id,
+            version: 1,
+            model_type: "fine-tuned",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: Some("q-base::1"),
+            artifact_path: None,
+            config_json: None,
+        })
+        .await
+        .unwrap();
+    model_id
+}
+
+/// (vii) `finalize` is the THIRD terminal writer, and success is not evidence
+/// of a determination: the worker's acceleration-report persist step is
+/// best-effort (a lost lease guard or a catalog error is swallowed, and the run
+/// proceeds to publish-and-finalize), so a job can reach terminal `completed`
+/// having never recorded one. `pending` on a `completed` row is the same
+/// unreadable state the failure paths retire — so the same lease-guarded
+/// UPDATE that stamps `completed` retires it, with the reason that names WHY:
+/// the job finished, but nothing ever determined its acceleration.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finalize_rewrites_a_pending_report_to_undetermined(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    catalog
+        .create_training_job(job_params("ar-fin-pending"))
+        .await
+        .unwrap();
+    let output_model_id = register_output_model(&catalog, "ar-fin-pending").await;
+    let claimed = catalog
+        .claim_next_training_job("worker-a", Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("job claimed");
+    assert_eq!(claimed.attempts, 1);
+    // The probe's persist step never landed: no `record_acceleration_report`
+    // call at all, exactly as a swallowed lease-guard miss or catalog error
+    // leaves the row.
+    let before = catalog.get_training_job("ar-fin-pending").await.unwrap();
+    assert_eq!(
+        before.acceleration_report.as_deref(),
+        Some(PENDING_MARKER),
+        "precondition: the row still carries the submission-time pending marker"
+    );
+
+    let finalized = catalog
+        .finalize_training_job(FinalizeTrainingJobParams {
+            job_id: "ar-fin-pending",
+            worker_id: "worker-a",
+            output_model_id: &output_model_id,
+            output_model_version: 1,
+            artifact_path: "file:///artifacts/ar-fin-pending/worker-a/0",
+            metrics: Some(r#"{"completed_at":"2026-01-01T00:00:00Z"}"#),
+            epoch_checkpoints: &[],
+        })
+        .await
+        .unwrap();
+    assert!(finalized, "the lease owner finalizes the job");
+
+    let after = catalog.get_training_job("ar-fin-pending").await.unwrap();
+    assert_eq!(after.status, TrainingJobStatus::Completed.to_string());
+    assert_eq!(
+        after.acceleration_report.as_deref(),
+        Some(FINALIZED_WITHOUT_DETERMINATION),
+        "a terminal `completed` row must never carry `pending` — finalize is a TERMINAL \
+         write, so it retires the marker in the SAME lease-guarded UPDATE"
+    );
+}
+
+/// (viii) `finalize`'s rewrite is strictly `pending`-valued, exactly like the
+/// failure paths': every already-terminal payload a producer may have written —
+/// `determined`, `not_applicable`, and an `undetermined` carrying the worker's
+/// OWN more specific reason — survives byte-for-byte. A blanket "stamp
+/// undetermined on finalize" would destroy the measured determination of every
+/// successful run, which is the regression this arm pins.
+/// `acceleration_report_survives_finalize` is the single-payload control for
+/// the same property.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finalize_preserves_an_already_terminal_report(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    let cases = [
+        (
+            "ar-fin-det",
+            r#"{"state":"determined","attempt":1,"device":"cuda:0"}"#,
+        ),
+        (
+            "ar-fin-na",
+            r#"{"state":"not_applicable","reason":"context_predictor"}"#,
+        ),
+        (
+            "ar-fin-und",
+            r#"{"state":"undetermined","reason":"failed_before_device_resolution"}"#,
+        ),
+    ];
+
+    for (job_id, report) in cases {
+        catalog
+            .create_training_job(job_params(job_id))
+            .await
+            .unwrap();
+        let output_model_id = register_output_model(&catalog, job_id).await;
+        let claimed = catalog
+            .claim_next_training_job("worker-a", Duration::from_secs(3600))
+            .await
+            .unwrap()
+            .expect("job claimed");
+        assert_eq!(
+            claimed.job_id, job_id,
+            "claims run oldest-first, one job at a time"
+        );
+        let wrote = catalog
+            .record_acceleration_report(job_id, "worker-a", claimed.attempts, report)
+            .await
+            .unwrap();
+        assert!(wrote, "the lease owner records its determination");
+
+        let finalized = catalog
+            .finalize_training_job(FinalizeTrainingJobParams {
+                job_id,
+                worker_id: "worker-a",
+                output_model_id: &output_model_id,
+                output_model_version: 1,
+                artifact_path: "file:///artifacts/x/worker-a/0",
+                metrics: Some(r#"{"completed_at":"2026-01-01T00:00:00Z"}"#),
+                epoch_checkpoints: &[],
+            })
+            .await
+            .unwrap();
+        assert!(finalized, "the lease owner finalizes the job");
+
+        let after = catalog.get_training_job(job_id).await.unwrap();
+        assert_eq!(after.status, TrainingJobStatus::Completed.to_string());
+        assert_eq!(
+            after.acceleration_report.as_deref(),
+            Some(report),
+            "{job_id}: an already-terminal report survives `finalize` byte-for-byte — the \
+             rewrite fires ONLY on the pending marker"
+        );
+    }
+}
+
+/// (ix, degenerate) A legacy pre-migration-026 row reads back SQL `NULL` —
+/// "unknown". `finalize` must not fabricate a state for it either: the
+/// three-valued `NULL = 'x'` comparison falls through to the `ELSE` arm on both
+/// backends, so `NULL` stays `NULL`.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finalize_leaves_a_legacy_null_report_unknown(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    catalog
+        .create_training_job(job_params("ar-fin-null"))
+        .await
+        .unwrap();
+    let output_model_id = register_output_model(&catalog, "ar-fin-null").await;
+    set_acceleration_report_raw(&catalog, "ar-fin-null", None).await;
+    catalog
+        .claim_next_training_job("worker-a", Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("job claimed");
+
+    let finalized = catalog
+        .finalize_training_job(FinalizeTrainingJobParams {
+            job_id: "ar-fin-null",
+            worker_id: "worker-a",
+            output_model_id: &output_model_id,
+            output_model_version: 1,
+            artifact_path: "file:///artifacts/ar-fin-null/worker-a/0",
+            metrics: None,
+            epoch_checkpoints: &[],
+        })
+        .await
+        .unwrap();
+    assert!(finalized);
+
+    let after = catalog.get_training_job("ar-fin-null").await.unwrap();
+    assert_eq!(after.status, TrainingJobStatus::Completed.to_string());
+    assert_eq!(
+        after.acceleration_report, None,
+        "a legacy NULL stays NULL ('unknown') — finalize's pending rewrite must never \
+         fabricate a state for a row that never had one"
     );
 }

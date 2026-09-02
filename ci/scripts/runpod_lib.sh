@@ -873,6 +873,80 @@ rp_job_env_lines() {
   printf '[ -f /root/.jammi_env ] && . /root/.jammi_env\n'
   printf "export CARGO_TARGET_DIR='%s'\n" "$target_dir"
   printf "cd '%s'\n" "$tree_dir"
+  rp_job_build_sha_lines "$tree_dir"
+}
+
+# The pod-side default for `JAMMI_BUILD_SHA`, emitted as shell text into the
+# job wrapper (rp_job_env_lines above) and evaluated ON THE POD, where the
+# push stamp actually lives.
+#
+# WHY THIS EXISTS: `push` rsyncs the working tree WITHOUT `.git` (the exclude
+# set is pod_push_stamp.sh's own `pod_push_excludes`), so a `cargo build` on a
+# pushed tree has no repository for `crates/jammi-bench/build.rs`'s
+# `git rev-parse` fallback to read and bakes `build_sha="unknown"`. Every
+# producer that cross-checks provenance then refuses the binary's own output,
+# which is correct — the binary genuinely could not say what it was built
+# from — but it makes an otherwise valid measurement unrecordable, and the
+# operator's only recourse was to remember to type the sha by hand on every
+# build. `<tree>/.jammi-push-stamp.json` already records exactly the missing
+# fact (`laptop_head`, written by the same `push` that sent the bytes), so the
+# default reads it from there.
+#
+# CLEAN-ONLY, and that restriction is the whole safety argument. `push` sends
+# uncommitted work too, so `laptop_head` names the commit the pushed tree was
+# BASED on, not necessarily the commit it IS. Naming a commit whose tree is
+# not the built bytes is a FABRICATED provenance — strictly worse than
+# "unknown", because it is a false claim a downstream reader cannot detect.
+# So the stamp's own `porcelain_sha256`/`diff_head_sha256` must BOTH equal the
+# digest of the empty string (a clean `git status --porcelain` and a clean
+# `git diff HEAD` at push time — the emitted python computes that digest
+# rather than hardcoding it, so the comparison cannot rot into a stale
+# literal). Anything else leaves the variable UNSET: build.rs bakes
+# "unknown", the producer refuses loudly, and the message says why.
+#
+# A caller-supplied `JAMMI_BUILD_SHA` always wins and is never overwritten —
+# the manual escape hatch stays exactly as it was for the dirty-tree case.
+#
+# Cost: `cargo:rerun-if-env-changed=JAMMI_BUILD_SHA` means the first job after
+# a push at a NEW commit re-runs jammi-bench's build script and relinks that
+# one binary. That is the price of the binary knowing what it is.
+#
+# $1=tree_dir.
+rp_job_build_sha_lines() {
+  local tree_dir="${1:?rp_job_build_sha_lines needs a tree dir}"
+  printf "__jammi_push_stamp='%s/.jammi-push-stamp.json'\n" "$tree_dir"
+  cat <<'BUILDSHAEOF'
+if [ -z "${JAMMI_BUILD_SHA:-}" ]; then
+  JAMMI_BUILD_SHA="$(python3 - "$__jammi_push_stamp" <<'JAMMIPUSHSTAMPEOF'
+import hashlib, json, re, sys
+
+try:
+    stamp = json.load(open(sys.argv[1]))
+except Exception:
+    # No stamp, or an unreadable one: print nothing. The caller's own
+    # empty-result branch says what that means; a traceback here would only
+    # bury it.
+    sys.exit(0)
+head = stamp.get("laptop_head") or ""
+clean = hashlib.sha256(b"").hexdigest()
+if (
+    re.fullmatch(r"[0-9a-f]{40}", head)
+    and stamp.get("porcelain_sha256") == clean
+    and stamp.get("diff_head_sha256") == clean
+):
+    print(head)
+JAMMIPUSHSTAMPEOF
+)"
+  if [ -n "${JAMMI_BUILD_SHA:-}" ]; then
+    export JAMMI_BUILD_SHA
+    echo "jammi: JAMMI_BUILD_SHA=${JAMMI_BUILD_SHA} (from ${__jammi_push_stamp} — the pushed tree was CLEAN at that commit)" >&2
+  else
+    unset JAMMI_BUILD_SHA
+    echo "::warning::JAMMI_BUILD_SHA left UNSET — ${__jammi_push_stamp} is absent or unreadable, or records a push whose working tree was DIRTY (its bytes are not any one commit). A binary built here bakes build_sha=\"unknown\" and every provenance cross-check will refuse its output. Commit and re-push, or set JAMMI_BUILD_SHA=<the 40-hex tip the pushed tree actually is> yourself — never a sha these bytes are not." >&2
+  fi
+fi
+unset __jammi_push_stamp
+BUILDSHAEOF
 }
 
 # Builds the per-tree job wrapper script body (`<tree>/.jammi-job.sh`,

@@ -503,6 +503,54 @@ this: the push stamp is iteration provenance only, never a substitute for a
 pushed (reachable-from-a-remote-branch) sha on a committed artifact
 (`pod_push_stamp.sh:1-9`).
 
+**`JAMMI_BUILD_SHA` — what a binary built on a pushed tree knows about
+itself.** `push` excludes `.git`, so a `cargo build` in a pushed tree has no
+repository for `crates/jammi-bench/build.rs`'s `git rev-parse` fallback to
+read: it bakes `build_sha="unknown"`, and every producer that cross-checks a
+binary's own reported provenance then refuses the run. The default closes
+this without anyone typing a sha: the job wrapper's env preamble
+(`rp_job_env_lines` → `rp_job_build_sha_lines`, `ci/scripts/runpod_lib.sh`)
+reads `<tree>/.jammi-push-stamp.json` on the pod and exports
+`JAMMI_BUILD_SHA=<laptop_head>` — **but only when that stamp says the pushed
+tree was CLEAN** (`porcelain_sha256` and `diff_head_sha256` both equal the
+digest of the empty string). `push` sends uncommitted work too, so on a dirty
+push `laptop_head` names the commit the tree was *based on*, not the commit
+it *is*; exporting it there would be a fabricated provenance, which is worse
+than `unknown` because a reader cannot detect it. On a dirty (or absent, or
+unreadable) stamp the variable is left unset and the job log carries a
+`::warning::` saying so.
+
+Two consequences worth knowing:
+
+- **The manual form is still the escape hatch, and still wins.** A
+  caller-supplied `JAMMI_BUILD_SHA` is never overwritten. Use it when you
+  must measure a dirty tree, and the value **must be the pushed tree's exact
+  commit** — a sha the bytes are not is a fabricated provenance, the one
+  failure mode this whole path exists to avoid. `build.rs` accepts it
+  verbatim iff it is exactly 40 lowercase hex characters, and falls back to
+  `unknown` otherwise, so a typo degrades to "unknown" rather than to a
+  plausible lie. A profiling producer that builds its own binary outside
+  `run` carries the same requirement in its own interface, as a *required*
+  sha argument rather than an optional one — it has no push stamp to fall
+  back to.
+- **The first job after a push at a new commit relinks `jammi-bench`.**
+  `build.rs` emits `cargo:rerun-if-env-changed=JAMMI_BUILD_SHA`, so changing
+  the value re-runs that one build script and relinks that one binary. That
+  is the cost of the binary knowing what it is; it is not a workspace
+  rebuild.
+
+**ModernBERT-large does not fit at `b=8`/`W=512` on an 80 GB A100.** A leg
+table that pre-registers that shape cannot run: every configuration
+(f32/f16/bf16 fused and the eager-AdamW control) fails with
+`DriverError(CUDA_ERROR_OUT_OF_MEMORY)` out of the LoRA encoder forward, at a
+sampled device high-water mark of 75757 MiB of 81920 MiB — on an otherwise
+idle GPU (0 MiB used, no other compute apps resident), so this is the model's
+own footprint and not contention. `b=4` is the largest shape that fits and is
+shared by every leg (`b=2` also clears). Pin the batch **before** writing a
+leg table, and pin ONE batch across all legs: a per-leg batch makes the
+per-step denominators, and therefore any ratio computed against them,
+incomparable across legs.
+
 **`--with-cutlass`**, concretely — `pod_provision_cutlass.sh
 <tree-source-dir> [super-dir]` (defaults `/root/jammi-ai`), the *one*
 provisioning surface for cutlass in any tree

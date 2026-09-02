@@ -999,6 +999,127 @@ DRV
     && ok "(i/one-pod-per-wave) the surviving co-tenant's claim still names ITS own wave and tree" \
     || bad "(i/one-pod-per-wave) the surviving claim's content is wrong — got: $(cat "$cot/.jammi-active-wave.d/tree-b.claim" 2>/dev/null)"
 
+  # ── (i/build-sha) JAMMI_BUILD_SHA defaults from the push stamp, and ONLY
+  # from a CLEAN one ─────────────────────────────────────────────────────
+  # `push` rsyncs the working tree WITHOUT `.git`, so a bench binary built
+  # on a pushed tree has no repository for build.rs's `git rev-parse`
+  # fallback and bakes build_sha="unknown" — every producer's provenance
+  # cross-check then refuses its output. `<tree>/.jammi-push-stamp.json`
+  # already records the missing fact, so rp_job_env_lines emits a default
+  # that reads it.
+  #
+  # The property under test is not "a sha appears" but WHICH trees get one:
+  # `push` sends uncommitted work too, so `laptop_head` names the commit
+  # the tree was BASED on. Exporting it for a DIRTY push would fabricate a
+  # provenance — a false claim no downstream reader can detect, strictly
+  # worse than "unknown". The generated text is EXECUTED here (not merely
+  # grepped) against real fixture stamps, because a grep cannot tell the
+  # clean branch from the dirty one.
+  bsha="$SANDBOX/i_buildsha"; rm -rf "$bsha"; mkdir -p "$bsha"
+  bsha_clean_digest="$(python3 -c 'import hashlib; print(hashlib.sha256(b"").hexdigest())')"
+  bsha_head40="0123456789abcdef0123456789abcdef01234567"
+  bsha_write_stamp() { # $1=tree_dir $2=laptop_head $3=porcelain $4=diff
+    mkdir -p "$1"
+    python3 - "$1/.jammi-push-stamp.json" "$2" "$3" "$4" <<'BSHAPY'
+import json, sys
+json.dump(
+    {
+        "laptop_head": sys.argv[2],
+        "porcelain_sha256": sys.argv[3],
+        "diff_head_sha256": sys.argv[4],
+        "manifest_sha256": "fixture",
+        "cutlass_gitlink": None,
+        "ts": "fixture",
+        "session": "fixture",
+    },
+    open(sys.argv[1], "w"),
+)
+BSHAPY
+  }
+  # Run the emitted preamble and report what JAMMI_BUILD_SHA ended up as.
+  # $1=tree_dir; $2 (optional) = a pre-set JAMMI_BUILD_SHA the caller brings.
+  bsha_resolve() {
+    local text
+    text="$(bash "$RUNPOD_DRIVER" rp_job_build_sha_lines "$1")"
+    if [ -n "${2:-}" ]; then
+      JAMMI_BUILD_SHA="$2" bash -c "${text}; printf '%s' \"\${JAMMI_BUILD_SHA:-}\"" 2>/dev/null # tripwire-ok: the emitted text writes an intentional ::warning:: to stderr on every refusal branch; this helper reports the RESOLVED VALUE only, and each caller below asserts that value explicitly — a discarded warning is never a silent pass
+    else
+      bash -c "${text}; printf '%s' \"\${JAMMI_BUILD_SHA:-}\"" 2>/dev/null # tripwire-ok: same as the branch above
+    fi
+  }
+
+  bsha_write_stamp "$bsha/clean" "$bsha_head40" "$bsha_clean_digest" "$bsha_clean_digest"
+  [ "$(bsha_resolve "$bsha/clean")" = "$bsha_head40" ] \
+    && ok "(i/build-sha) a CLEAN push stamp's laptop_head becomes the job's JAMMI_BUILD_SHA (no hand-typed sha, no build_sha=unknown)" \
+    || bad "(i/build-sha) a clean push stamp did not yield its laptop_head — got: '$(bsha_resolve "$bsha/clean")'"
+
+  # Dirty on EITHER hash: the pushed bytes are not that commit.
+  bsha_write_stamp "$bsha/dirty_status" "$bsha_head40" "0000000000000000000000000000000000000000000000000000000000000000" "$bsha_clean_digest"
+  [ -z "$(bsha_resolve "$bsha/dirty_status")" ] \
+    && ok "(i/build-sha) a push stamp with a DIRTY working tree (porcelain) exports nothing — a fabricated provenance is worse than \"unknown\"" \
+    || bad "(i/build-sha) a dirty-porcelain stamp fabricated a sha — got: '$(bsha_resolve "$bsha/dirty_status")'"
+  bsha_write_stamp "$bsha/dirty_diff" "$bsha_head40" "$bsha_clean_digest" "1111111111111111111111111111111111111111111111111111111111111111"
+  [ -z "$(bsha_resolve "$bsha/dirty_diff")" ] \
+    && ok "(i/build-sha) a push stamp with unstaged diff content exports nothing either (both hashes are load-bearing)" \
+    || bad "(i/build-sha) a dirty-diff stamp fabricated a sha — got: '$(bsha_resolve "$bsha/dirty_diff")'"
+
+  # `laptop_head` is the literal "unknown" when the pushed repo-root was
+  # not a git checkout — the one value that is shaped like a field but is
+  # not a sha.
+  bsha_write_stamp "$bsha/unknown_head" "unknown" "$bsha_clean_digest" "$bsha_clean_digest"
+  [ -z "$(bsha_resolve "$bsha/unknown_head")" ] \
+    && ok "(i/build-sha) laptop_head=\"unknown\" is not shaped like a sha and exports nothing" \
+    || bad "(i/build-sha) laptop_head=unknown leaked into JAMMI_BUILD_SHA — got: '$(bsha_resolve "$bsha/unknown_head")'"
+
+  # No stamp at all, and a corrupt one: both refuse quietly-valued (empty),
+  # loudly-messaged — never a traceback, never a partial value.
+  mkdir -p "$bsha/no_stamp"
+  [ -z "$(bsha_resolve "$bsha/no_stamp")" ] \
+    && ok "(i/build-sha) a tree with no push stamp exports nothing (build.rs bakes \"unknown\" and the producer refuses, as it should)" \
+    || bad "(i/build-sha) a stampless tree produced a sha — got: '$(bsha_resolve "$bsha/no_stamp")'"
+  mkdir -p "$bsha/corrupt"; printf 'not json' > "$bsha/corrupt/.jammi-push-stamp.json"
+  [ -z "$(bsha_resolve "$bsha/corrupt")" ] \
+    && ok "(i/build-sha) a corrupt push stamp exports nothing (and does not abort the job with a traceback)" \
+    || bad "(i/build-sha) a corrupt push stamp produced a sha — got: '$(bsha_resolve "$bsha/corrupt")'"
+
+  # The manual escape hatch still wins: an operator who KNOWS the pushed
+  # tip (the dirty-tree case) types it and is never overridden.
+  [ "$(bsha_resolve "$bsha/dirty_status" "ffffffffffffffffffffffffffffffffffffffff")" = "ffffffffffffffffffffffffffffffffffffffff" ] \
+    && ok "(i/build-sha) a caller-supplied JAMMI_BUILD_SHA is never overwritten by the stamp default" \
+    || bad "(i/build-sha) the stamp default clobbered a caller-supplied JAMMI_BUILD_SHA"
+
+  # Wired into the preamble EVERY job runs through, not merely defined —
+  # the same single-source discipline the CARGO_TARGET_DIR assertions above
+  # check for their own line.
+  printf '%s\n' "$marker_wrapper_text" | grep -qF "__jammi_push_stamp='/root/trees/mytree/.jammi-push-stamp.json'" \
+    && ok "(i/build-sha) the real job wrapper carries the stamp-derived JAMMI_BUILD_SHA default (rp_job_env_lines, one definition)" \
+    || bad "(i/build-sha) rp_job_wrapper_with_marker_lines does not carry the build-sha default — got: $marker_wrapper_text"
+
+  # revert-RED: neuter rp_job_build_sha_lines on a SCRATCH copy of
+  # runpod_lib.sh and confirm the clean-stamp case stops resolving. Without
+  # this the assertions above could pass against a tree where the default
+  # came from somewhere else entirely (or from the ambient environment).
+  bsha_scratch_lib="$bsha/runpod_lib_neutered.sh"
+  python3 - "$RUNPOD_LIB_SH" "$bsha_scratch_lib" <<'BSHAREVERTPY'
+import re
+import sys
+
+src = open(sys.argv[1]).read()
+# Replace the function BODY with a no-op emitter — the pre-change shape,
+# where the job preamble said nothing about JAMMI_BUILD_SHA at all.
+start = src.index("rp_job_build_sha_lines() {")
+end = src.index("\nBUILDSHAEOF\n}", start) + len("\nBUILDSHAEOF\n}")
+neutered = "rp_job_build_sha_lines() {\n  : \"${1:?needs a tree dir}\"\n}"
+open(sys.argv[2], "w").write(src[:start] + neutered + src[end:])
+BSHAREVERTPY
+  bsha_scratch_driver="$bsha/probe_neutered.sh"
+  sed "s#^\. \"$RUNPOD_LIB_SH\"\$#. \"$bsha_scratch_lib\"#" "$RUNPOD_DRIVER" > "$bsha_scratch_driver"
+  bsha_reverted_text="$(bash "$bsha_scratch_driver" rp_job_build_sha_lines "$bsha/clean")"
+  bsha_reverted_value="$(bash -c "${bsha_reverted_text}; printf '%s' \"\${JAMMI_BUILD_SHA:-}\"" 2>/dev/null)" # tripwire-ok: the neutered emitter is EXPECTED to produce nothing at all; the empty resolved value is the assertion right below, never a silent pass
+  [ -z "$bsha_reverted_value" ] \
+    && ok "(i/build-sha revert-RED) neutering rp_job_build_sha_lines on a scratch copy reproduces the ORIGINAL gap — the same CLEAN stamp now resolves nothing, so the default is genuinely load-bearing" \
+    || bad "(i/build-sha revert-RED) the neutered copy still resolved a sha ('$bsha_reverted_value') — this leg is not testing what it claims"
+
   # target-then-push composition, end to end, on a LOCAL fixture pod
   # filesystem (real pod_target_clone.sh, real rsync, real exclude list —
   # no ssh needed since the mechanism under test is path separation, not

@@ -2098,9 +2098,10 @@ disclosed choice against a named upstream reference, not this crate's own
   scaled delta is rounded to `base`'s dtype, then added and rounded once more —
   matching PEFT's reference (`peft/tuners/lora/layer.py`,
   `Linear.forward`: the delta casts down to the base result's dtype *before*
-  the add), the opposite rounding-order choice from `Axpy`'s own "f32-
-  accumulate, round once" precedent, made explicitly because here the thing
-  being matched itself rounds twice.
+  the add), the opposite rounding-order choice from the "f32-accumulate, round
+  once" convention the f32-internal ops otherwise follow (`ops/layer_norm.rs`,
+  `ops/rope.rs` — see the CUDA kernel guide's §3.10 regime table), made
+  explicitly because here the thing being matched itself rounds twice.
 - **Policy is construction data, never a runtime predicate re-derived from
   tensor state at call time inside the op.** `FullyMaskedPolicy`
   (`SoftmaxLastDimFused::fully_masked`), `GeluVariant`
@@ -2108,8 +2109,9 @@ disclosed choice against a named upstream reference, not this crate's own
   `check_variant`, not an unimplemented path), and `dgamma_needed`
   (`LayerNormFused`, frozen in at construction from the *call site's*
   `weight.is_variable()`, re-evaluated per call but never inspected by the op
-  itself) all follow this rule: the op stays exactly as stateless as `Axpy`
-  (see `ops`'s module doc's `Copy` discussion), and a caller whose masking/
+  itself) all follow this rule: the op stays exactly as stateless as every
+  other `KernelOp` (the family's `Copy` bound — see `ops`'s module doc's
+  `Copy` discussion), and a caller whose masking/
   activation convention does not match a policy's premise simply never
   requests it, rather than the op silently guessing.
 - **`SoftmaxLastDimFused::scale` — construction data with a numeric domain,

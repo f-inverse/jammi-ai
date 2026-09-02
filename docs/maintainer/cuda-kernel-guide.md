@@ -196,7 +196,6 @@ the op has a CPU F16 reference arm today, and what backs it.
 | `softmax_last_dim` (`SoftmaxLastDimFused`/`SoftmaxBwdDScores`) | dtype-native at two steps (the scale-multiply and the mask-add each round to the 16-bit dtype immediately, matching `candle_nn::ops::softmax`'s native `broadcast_add` and `Tensor::affine`'s own rounding point — `cuda/softmax.cu:75-101`'s `bf16_mul_rounded`/`bf16_add_rounded`); every step AFTER the mask add (max/exp/sum/normalize) stays f32 | 2 (scale-mul, mask-add); `dscores` bwd is 1 (final cast) | **Present** — `softmax_row_f16`/`softmax_fwd_f16`/`dscores_row_f16`/`dscores_f16`, `crates/jammi-kernels/src/ops/softmax.rs` |
 | `geglu` (`GegluFused`/`GegluBwdDWiOut`) | dtype-native, two-op eager shape reproduced deliberately (candle's own `GeluErf::f16` arm ALSO computes in f64, mirroring its `bf16` arm exactly — `candle-core-0.11.0/src/op.rs:1002-1009` — but this op's OWN activation is computed in f32, matching the upstream HF/`kernels-community` "fp32 opmath" reference more closely than candle's f64 arm; see the module doc's "bf16 boundary-rounding" section) | 2 fwd (round activation, round product); 2 bwd (round `d_gate`, round `d_up`, each independently, f32-accumulated) | **Present** — `geglu_fwd_row_f16`/`geglu_fwd_f16`/`geglu_bwd_row_f16`/`geglu_bwd_f16`, `crates/jammi-kernels/src/ops/geglu.rs` |
 | `rope`/`rope_positions` (`RopeFused`/`RopePositionsFused`) | f32-internal (accumulate in f32, matching `layer_norm`'s BF16 arms and the CUDA kernel) | 1 (final cast) | **Present** — `rope_fwd_row_f16`/`rope_fwd_f16` (`ops/rope.rs`), `rope_positions_fwd_f16` (`ops/rope_positions.rs`) |
-| `axpy` | f32-internal | 1 | **Present** — `axpy_f16`, `crates/jammi-kernels/src/ops/axpy.rs` |
 | `dropout` | dtype-independent decision (Philox mask is a pure function of position, not value) + f32-internal scale multiply on a KEPT element | 1 (KEPT element only; a DROPPED element is exact zero, no rounding) | **Present** — `dropout_f16`, `crates/jammi-kernels/src/ops/dropout.rs` (Metal host-fallback arm deliberately NOT widened — out of this campaign's CUDA-only scope) |
 | `scaled_cast_add` (`ScaledCastAdd`) | f32-internal (esc-046 fix: widen `base` to f32, add the already-f32 scaled `lora`, round the sum once — matches PEFT's own promote-add-cast-once model) | 1 | **Present** — `scaled_cast_add_f16_f32`/`scaled_cast_add_f32_f16`/`scaled_cast_add_f16_f16`, `crates/jammi-kernels/src/ops/scaled_cast_add.rs` (mirrors the existing 4-combo F32/BF16 matrix with 3 new F16 combos) |
 | `cast_scale`/`cast_add` (`CastScaleBf16F32`/`CastAddBf16`; F16: `CastScaleF16F32`/`CastAddF16`) | N/A — **each type is structurally dtype-monomorphic, not dtype-generic** | N/A | **Present, as a SEPARATE pair of types** — `CastScaleF16F32` (`crates/jammi-kernels/src/ops/cast_scale.rs:427`) and `CastAddF16` (`:508`), each with its own CPU arm and its own CUDA arm (`crates/jammi-kernels/src/cuda/cast_scale_f16.cu:1`). They are not match arms on the BF16 types: those are domain-restricted to BF16 by construction (`CastScaleBf16F32`'s own doc: "this op's domain is BF16-only rather than accepting F32 too — nothing to fuse there"), so the F16 analogs carry their own double-rounding-safety argument at F16's 11-bit significand (`24 >= 2*11+2` holds with EQUALITY — at the boundary, not far past it the way BF16's margin is; each type's doc states this explicitly rather than inheriting BF16's). `low_rank_residual_linear`'s F16 backward admits both (`crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:814`, `:911`), and both are pinned bit-identical to the eager two-kernel chain (`crates/jammi-kernels/tests/cuda_parity.rs:12582`, `:12662`). |
@@ -217,7 +216,7 @@ matmul gap.
 
 ### 3.10.1 Dispatch status of the table's non-admitted-looking rows
 
-Having an f16 arm is not the same as being *provable* on a device. Three different proof
+Having an f16 arm is not the same as being *provable* on a device. Two different proof
 mechanisms exist, and `ci/release-feature-manifest.json` is the single source of truth for
 which one applies to which op — that file's `_schema_doc` defines each mechanism; this
 subsection only states where the rows above land, so a reader of the table does not have
@@ -229,13 +228,22 @@ to guess.
 | `cast_add` | **Admitted**, under `cast_add_bf16` / `cast_add_f16` | Same mechanism; both admit through `admit_cast_boundary` in `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs`, called from that op's BF16 and F16 backward arms. |
 | `rope_positions` | **Internal sub-kernel** of the flash-attention op | No `admit()` of its own: `crates/jammi-kernels/src/ops/flash_attention.rs` launches `crate::cuda::rope_positions::cuda_fwd` directly. It is proven by compiling in the lane's build *and* by its parent's admitted dispatch being observed (a delta on the flash cascade's key) — never by a counter of its own, which does not exist. |
 | `scaled_cast_add` | **Internal sub-kernel** of `low_rank_residual_linear` | Same mechanism: `ScaledCastAdd::new` is constructed bare in that op's epilogue, so the parent's observed dispatch is the proof. |
-| `axpy` | **Compiled only** | Real kernels and dispatch arms, no admission call site, and no admitted parent that launches it — it has zero call sites in the workspace. Proven ONLY by compiling in the lane's build; a claim that it *dispatched* has nothing to read. |
 
 The distinction is load-bearing when reading a capability report: an internal sub-kernel
 is neither "unreachable" nor "independently admitted" — it runs exactly when its parent
-does. A compiled-only op has no such parent, so nothing in a device run says it ran.
-Wiring a real `admit()` call site (or an admitted parent that launches it) is what moves
-an op between these rows, in the same unit as that code edit.
+does. Wiring a real `admit()` call site (or an admitted parent that launches it) is what
+moves an op between these rows, in the same unit as that code edit.
+
+There is no third, compiled-only status, and a kernel that would need one does not stay.
+A kernel with no `admit()` site and no admitted parent has no row here and no manifest
+category: the only thing a shipped build says about it is that it compiled, which no
+capability report can act on. Such a kernel is wired or deleted in the same unit as its
+authoring, decided by measuring its share of shipped-leg GPU time against a threshold
+fixed before the numbers are seen — see
+`crates/jammi-kernels/artifacts/cuda-runs/2026-09-01-axpy-census-bdeb80c-a100-pcie.json`,
+where a pre-registered rule (wire iff the share reaches 2% of per-step GPU time on some
+shipped leg *and* one dispatch site covers at least half of it) measured 0.007% / 0.026% /
+0.027% across the three shipped dtype legs and the kernel was deleted.
 
 ## 4. Benchmarking
 

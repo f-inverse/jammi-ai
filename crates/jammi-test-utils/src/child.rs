@@ -85,13 +85,20 @@
 //!   to inspect via `Capture::status` directly, not a hang this driver
 //!   detected and terminated.
 //! - `Capture::complete` ([`Completeness`]) — the READER-THREAD axis only:
-//!   did both drained reader threads actually reach EOF before the ~1 s
-//!   settle bound expired? A `Capture` can be `hung: false` and still
-//!   `SettleExpired` (an fd-inheriting grandchild holding the pipe past the
-//!   settle bound; see "Precondition for a complete log"), or `hung: true`
-//!   and still `Completeness::Complete` (a killed child whose own readers
-//!   finish the instant its pipe closes). It says nothing about the
-//!   retention cap — see the previous section.
+//!   did both reader threads conclude `Eof` before the ~1 s settle bound
+//!   expired? On unix `Eof` is not necessarily a literal closed pipe: once
+//!   `wait_bounded` has reaped the child, a reader that finds the pipe idle
+//!   on one 50 ms poll concludes `Eof` for THAT CHILD's bytes, regardless
+//!   of whether some other process still holds the write end open (see
+//!   "Precondition for a complete log") — a foreign holder only produces
+//!   `SettleExpired` if it keeps writing with gaps shorter than that 50 ms
+//!   window; a foreign grandchild's own later bytes, in either case, are
+//!   never part of this child's evidence. `hung: false` and
+//!   `SettleExpired` can both be true together (a fast-writing foreign
+//!   holder), and so can `hung: true` and `Completeness::Complete` (a
+//!   killed child whose own readers conclude `Eof` the moment the confirmed
+//!   exit's next idle poll lands). It says nothing about the retention cap
+//!   — see the previous section.
 //! - `Capture::is_trustworthy()` — the single predicate a consumer should
 //!   gate a "this evidence is whole" decision on: `complete ==
 //!   Completeness::Complete` AND no `wait_error` AND neither stream was
@@ -225,6 +232,18 @@ fn lock_or_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// never across any of the slower work afterward (reader-thread setup,
 /// `wait_bounded`'s poll loop) — so it adds no measurable serialization
 /// beyond the syscall window it exists to protect.
+///
+/// Defensive, with no local oracle: `concurrent_spawns_do_not_race_the_pipe_cloexec_window`
+/// cannot demonstrate this lock's necessity by itself, because the fd a
+/// racing `fork` would mis-inherit lands at an arbitrary, a-priori-unknown
+/// descriptor number in the *other* process's fd table — nothing in that
+/// process's own code (e.g. `eprintln!`, hardcoded to fd 2) ever writes to
+/// it, so the poll-based reader's "an idle fd is done" rule (see
+/// `spawn_reader`) already treats a mis-inherited-but-never-written-to fd as
+/// harmless regardless of whether this lock ran. A test that could write to
+/// that specific, unpredictable fd number would need to enumerate the
+/// process's own open descriptors, a materially larger fixture than this
+/// round's scope covers; tracked as a residual, not fixed here.
 static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 /// A stream's retained bytes: the first `head_cap` bytes seen plus the last
@@ -320,6 +339,18 @@ enum ReaderOutcome {
 /// this reader keeps draining it and never falsely concludes `Eof` — that
 /// case still relies on `finish_drained`'s bounded settle, now a rarely-hit
 /// fallback rather than the primary mechanism.
+///
+/// `child_exited` is loaded **before** calling `poll`, not after it returns
+/// — loading it afterward would leave the interval between "poll observed
+/// nothing" and "we read the flag" unprotected: a child that writes its
+/// final line, exits, and is reaped inside that interval would have that
+/// poll's empty result (computed strictly before the write) paired with a
+/// newly-true flag, and the reader would conclude `Eof` having never
+/// actually re-checked the pipe after the write landed — silently dropping
+/// it. Loading the flag first instead guarantees that if it reads `true`,
+/// the `poll` call that follows runs strictly after the confirmed exit (and
+/// therefore strictly after every byte the child will ever write), so an
+/// empty result from *that* `poll` is genuinely final.
 #[cfg(unix)]
 fn spawn_reader<R: Read + AsRawFd + Send + 'static>(
     mut pipe: R,
@@ -332,6 +363,8 @@ fn spawn_reader<R: Read + AsRawFd + Send + 'static>(
         let fd = pipe.as_raw_fd();
         let mut chunk = [0u8; 8192];
         loop {
+            // See the fn doc: this MUST be read before `poll`, not after.
+            let exited_before_poll = child_exited.load(Ordering::SeqCst);
             let mut pollfd = libc::pollfd {
                 fd,
                 events: libc::POLLIN,
@@ -350,8 +383,10 @@ fn spawn_reader<R: Read + AsRawFd + Send + 'static>(
                 break;
             }
             if ret == 0 {
-                // Timed out: nothing available right now.
-                if child_exited.load(Ordering::SeqCst) {
+                // Timed out: nothing available right now. Safe to conclude
+                // `Eof` only because the exit was already confirmed BEFORE
+                // this specific `poll` call ran (see the fn doc).
+                if exited_before_poll {
                     *lock_or_recover(&outcome) = Some(ReaderOutcome::Eof);
                     break;
                 }
@@ -983,13 +1018,24 @@ fn joined_or_none(errors: Vec<String>) -> Option<String> {
 /// section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Completeness {
-    /// Both reader threads observed EOF before the ~1 s settle bound expired.
+    /// Both reader threads concluded `Eof` before the ~1 s settle bound
+    /// expired. On unix this is not necessarily a literal closed pipe: once
+    /// the child is confirmed reaped, an idle 50 ms poll is treated as
+    /// `Eof` for that child's own bytes (a reaped child cannot write
+    /// again). A foreign process that still holds the write end open, but
+    /// is not itself writing faster than that 50 ms window, is
+    /// indistinguishable from "done" on any single poll and lands here too
+    /// — see the module doc's "Precondition for a complete log".
     Complete,
-    /// At least one reader thread had not observed EOF when the settle bound
-    /// expired — most commonly an fd-inheriting grandchild still holding the
-    /// pipe open (see the module doc's "Precondition for a complete log").
-    /// The unfinished thread(s) are left running, detached by necessity,
-    /// until the pipe's last writer eventually closes it.
+    /// At least one reader thread had not concluded `Eof` when the settle
+    /// bound expired — on unix this means it kept observing `POLLIN` (new
+    /// data) with gaps shorter than the 50 ms poll timeout even after the
+    /// target child was confirmed reaped: a foreign process (e.g. an
+    /// fd-inheriting grandchild) still ACTIVELY WRITING, not merely holding
+    /// the pipe open — a silent holder is folded into `Complete` instead
+    /// (see the module doc's "Precondition for a complete log"). The
+    /// unfinished thread(s) are left running, detached by necessity, until
+    /// the pipe's last writer eventually closes it.
     SettleExpired,
     /// Both reader threads finished, but at least one ended on a read error
     /// or panicked rather than a clean EOF.
@@ -1039,9 +1085,13 @@ pub struct Capture {
     pub last_byte_instant: Option<Instant>,
     /// Absolute stamp of when this `Capture` was constructed (post-settle).
     pub returned_at: Instant,
-    /// The READER-THREAD completeness axis only: whether the drained reader
-    /// threads actually reached EOF before the settle bound expired.
-    /// `Completeness::Undrained` for a `Capture` from the `cfg(test)`
+    /// The READER-THREAD completeness axis only: whether both reader
+    /// threads concluded `Eof` before the settle bound expired. On unix
+    /// this is synthesized from an idle poll after the child is confirmed
+    /// reaped, not a literal observed pipe close — see
+    /// [`Completeness::Complete`] for the exact boundary (a foreign holder
+    /// that writes slower than the 50 ms poll timeout is folded in here
+    /// too). `Completeness::Undrained` for a `Capture` from the `cfg(test)`
     /// undrained driver. This does NOT account for the retention cap — a
     /// `Complete` capture can still be missing bytes the cap dropped; use
     /// [`Capture::is_trustworthy`] to gate on both axes at once.
@@ -1066,17 +1116,23 @@ impl Capture {
     }
 
     /// The single predicate a consumer should gate a "this evidence is
-    /// whole" decision on: the drained reader threads reached a clean EOF
-    /// (`complete == Completeness::Complete`), no OS-level error occurred
-    /// while producing this `Capture` (`wait_error.is_none()`), and the
-    /// retention cap did not drop any bytes from either stream
+    /// whole" decision on: both reader threads concluded `Eof`
+    /// (`complete == Completeness::Complete` — on unix, an idle 50 ms poll
+    /// after the child is confirmed reaped, not necessarily a literal
+    /// closed pipe; see [`Completeness::Complete`]), no OS-level error
+    /// occurred while producing this `Capture` (`wait_error.is_none()`),
+    /// and the retention cap did not drop any bytes from either stream
     /// (`stdout_truncated == 0 && stderr_truncated == 0`). `complete` alone
     /// is only the reader-thread axis (see the module doc's "hung vs killed
-    /// vs complete vs trustworthy" section) — a fully-drained,
-    /// EOF-reached capture can still be silently missing bytes the cap
-    /// dropped from the middle of a long-running child's output, so a
-    /// caller that only checks `complete` can be fooled into trusting a
-    /// truncated log.
+    /// vs complete vs trustworthy" section) — a `Complete` capture can
+    /// still be silently missing bytes the cap dropped from the middle of a
+    /// long-running child's output, so a caller that only checks `complete`
+    /// can be fooled into trusting a truncated log. A live foreign writer
+    /// with gaps under 50 ms keeps a capture `SettleExpired` (never falsely
+    /// `Complete`), but a foreign grandchild's OWN later bytes are never
+    /// part of THIS child's evidence in the first place —
+    /// `is_trustworthy()` says nothing about data anyone else produces on a
+    /// shared fd.
     pub fn is_trustworthy(&self) -> bool {
         self.complete == Completeness::Complete
             && self.wait_error.is_none()
@@ -1174,6 +1230,7 @@ mod tests {
         Sleeper,
         WritingSleeper,
         PrintSleep,
+        QuietThenFinalLine,
     }
 
     impl ChildMode {
@@ -1187,6 +1244,7 @@ mod tests {
                 ChildMode::Sleeper => "sleeper",
                 ChildMode::WritingSleeper => "writing-sleeper",
                 ChildMode::PrintSleep => "printsleep",
+                ChildMode::QuietThenFinalLine => "quiet-then-final-line",
             }
         }
 
@@ -1200,6 +1258,7 @@ mod tests {
                 "sleeper" => ChildMode::Sleeper,
                 "writing-sleeper" => ChildMode::WritingSleeper,
                 "printsleep" => ChildMode::PrintSleep,
+                "quiet-then-final-line" => ChildMode::QuietThenFinalLine,
                 _ => return None,
             })
         }
@@ -1229,6 +1288,7 @@ mod tests {
             ChildMode::Sleeper => sleeper_child(),
             ChildMode::WritingSleeper => writing_sleeper_child(),
             ChildMode::PrintSleep => printsleep_child(),
+            ChildMode::QuietThenFinalLine => quiet_then_final_line_child(),
         }
     }
 
@@ -1353,6 +1413,17 @@ mod tests {
         eprintln!("hello-mid-run");
         let _ = io::stderr().flush();
         thread::sleep(Duration::from_secs(2));
+        std::process::exit(0);
+    }
+
+    /// Quiet for ~150 ms (spanning several of the reader's 50 ms poll
+    /// cycles with nothing to read), then writes exactly one line and exits
+    /// immediately -- the F1 exit-observation-ordering oracle's child. See
+    /// `exit_observed_then_the_final_bytes_are_still_read`.
+    fn quiet_then_final_line_child() -> ! {
+        thread::sleep(Duration::from_millis(150));
+        eprintln!("final-line");
+        let _ = io::stderr().flush();
         std::process::exit(0);
     }
 
@@ -1992,24 +2063,30 @@ mod tests {
 
     // ---- the pipe-CLOEXEC-race oracle -----------------------------------
 
-    /// Pins `SPAWN_LOCK`'s effect (the fix for the macOS non-atomic-CLOEXEC
-    /// race documented in the module doc's "Precondition for a complete
-    /// log", cause 2): two OS threads of this SAME process each call
+    /// What this ACTUALLY pins (corrected: it does not, and structurally
+    /// cannot, pin `SPAWN_LOCK`'s necessity -- see that static's own doc for
+    /// why): two OS threads of this SAME process each call
     /// `DrainedChild::spawn` as close together as a `Barrier` can make them,
-    /// one for a long-lived sleeper and one for the flood child. Without
-    /// `SPAWN_LOCK` serializing each spawn's pipe-creation-to-exec window,
-    /// this shape is exactly what raced on Apple platforms: the sibling's
-    /// `fork` could inherit the flood child's not-yet-`CLOEXEC` pipe write
-    /// end and hold it open for its own 10s lifetime, so the flood
-    /// child's stderr reader never sees EOF and the settle bound expires
-    /// (`Completeness::SettleExpired`) despite every byte already having
-    /// arrived. With the lock in place this is deterministic, not
-    /// probabilistic: `spawn_inner` holds `SPAWN_LOCK` across the actual
-    /// `Command::spawn()` call, so even though the barrier releases both
-    /// threads together, only one can be inside that call at a time --
-    /// the race window this test tries to hit cannot occur by construction,
-    /// and the flood capture must be `Completeness::Complete` /
-    /// `is_trustworthy()` on every run, not just probabilistically.
+    /// one for a long-lived silent sibling and one for the flood child, and
+    /// the flood capture must still be `Completeness::Complete` /
+    /// `is_trustworthy()`. This pins the poll-based reader's immunity (see
+    /// "Precondition for a complete log") to a foreign process merely
+    /// HOLDING an inherited pipe end open without writing to it -- which is
+    /// also exactly the reason this test cannot go red with `SPAWN_LOCK`
+    /// removed: even if the sibling's `fork` mis-inherits the flood's
+    /// not-yet-`CLOEXEC` write end (the race the lock defends against), the
+    /// mis-inherited fd lands at an arbitrary descriptor number in the
+    /// sibling's fd table that the sibling's own code never targets
+    /// (`eprintln!` always writes fd 2, not whatever number a stray
+    /// inheritance happened to land on), so it is only ever silently held,
+    /// never written to -- indistinguishable, to the flood's reader, from
+    /// no race having happened at all. A test that could discriminate the
+    /// lock would need a sibling that enumerates and writes to its own
+    /// unexpected open descriptors, a materially larger fixture than this
+    /// round's scope covers (see `SPAWN_LOCK`'s doc). What remains true and
+    /// worth pinning here: concurrent spawns from independent threads never
+    /// corrupt each other's completeness under ordinary (non-racing)
+    /// conditions.
     #[test]
     fn concurrent_spawns_do_not_race_the_pipe_cloexec_window() {
         dispatch_if_child();
@@ -2037,9 +2114,36 @@ mod tests {
         assert_eq!(
             flood_cap.complete,
             Completeness::Complete,
-            "the flood child's pipe must not be held open by the concurrently \
-             spawned sibling sleeper: {flood_cap:?}"
+            "the flood child's pipe must not be held open by the concurrently spawned sibling sleeper: {flood_cap:?}"
         );
         assert!(flood_cap.is_trustworthy(), "{flood_cap:?}");
+    }
+
+    /// The oracle for the reader's exit-observation ordering (F1): a child
+    /// that is quiet for ~150 ms (long enough to span several of the
+    /// reader's 50 ms poll cycles with nothing to read), then writes
+    /// exactly one line and exits immediately, must still have that line in
+    /// the resulting `Capture` with `is_trustworthy() == true`. Pre-fix,
+    /// loading `child_exited` AFTER `poll` returned left the interval
+    /// between "poll observed nothing" and "the flag read" unprotected: a
+    /// write+exit+reap landing in that interval let the reader conclude
+    /// `Eof` on a poll result computed strictly BEFORE the write, silently
+    /// dropping it (demonstrated: `complete=Complete trustworthy=true
+    /// has_final=false stderr=""`). See `spawn_reader`'s doc for the fix
+    /// (load the flag before `poll`, not after).
+    #[test]
+    fn exit_observed_then_the_final_bytes_are_still_read() {
+        dispatch_if_child();
+        let exact = test_exact_path("exit_observed_then_the_final_bytes_are_still_read");
+        let mut cmd = self_exec(&exact, ChildMode::QuietThenFinalLine);
+        let child = DrainedChild::spawn(&mut cmd).expect("spawn quiet-then-final-line child");
+        let cap = child.wait_bounded(Duration::from_secs(10), Epoch::Spawn);
+
+        assert!(!cap.hung, "{cap:?}");
+        assert!(
+            String::from_utf8_lossy(&cap.stderr).contains("final-line"),
+            "the child's only line must survive even though it arrives at the edge of a poll-timeout boundary after ~150ms of quiet: {cap:?}"
+        );
+        assert!(cap.is_trustworthy(), "{cap:?}");
     }
 }

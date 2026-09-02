@@ -358,6 +358,16 @@ fn spawn_reader<R: Read + AsRawFd + Send + 'static>(
     last_byte: Option<Arc<Mutex<Option<Instant>>>>,
     outcome: Arc<Mutex<Option<ReaderOutcome>>>,
     child_exited: Arc<AtomicBool>,
+    // Test-only hook, invoked exactly once, right after `poll` returns 0
+    // and BEFORE `exited_before_poll` is consulted -- lets a test pin the
+    // exact TOCTOU interleaving the fn doc above describes (child writes
+    // its final line, exits, and is reaped) deterministically instead of
+    // hoping wall-clock timing lands in that interval. Does not exist in
+    // non-test builds: zero cost, no public API, and it cannot affect the
+    // shipped driver's behavior even in a `cfg(test)` build of a consuming
+    // crate, since it is private to this module and always `None` at both
+    // of `spawn_reader`'s call sites in `spawn_inner`.
+    #[cfg(test)] mut ready_hook: Option<Box<dyn FnOnce() + Send>>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let fd = pipe.as_raw_fd();
@@ -383,6 +393,10 @@ fn spawn_reader<R: Read + AsRawFd + Send + 'static>(
                 break;
             }
             if ret == 0 {
+                #[cfg(test)]
+                if let Some(hook) = ready_hook.take() {
+                    hook();
+                }
                 // Timed out: nothing available right now. Safe to conclude
                 // `Eof` only because the exit was already confirmed BEFORE
                 // this specific `poll` call ran (see the fn doc).
@@ -438,6 +452,9 @@ fn spawn_reader<R: Read + Send + 'static>(
     last_byte: Option<Arc<Mutex<Option<Instant>>>>,
     outcome: Arc<Mutex<Option<ReaderOutcome>>>,
     _child_exited: Arc<AtomicBool>,
+    // See the unix `spawn_reader`'s doc -- this mechanism is unix-`poll`-
+    // specific, so the hook is accepted for call-site parity but unused.
+    #[cfg(test)] _ready_hook: Option<Box<dyn FnOnce() + Send>>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut chunk = [0u8; 8192];
@@ -541,6 +558,8 @@ impl DrainedChild {
             None,
             Arc::clone(&stdout_outcome),
             Arc::clone(&child_exited),
+            #[cfg(test)]
+            None,
         );
         let stderr_handle = spawn_reader(
             stderr_pipe,
@@ -548,6 +567,8 @@ impl DrainedChild {
             Some(Arc::clone(&stderr_last_byte)),
             Arc::clone(&stderr_outcome),
             Arc::clone(&child_exited),
+            #[cfg(test)]
+            None,
         );
         Ok(Self {
             child,
@@ -1230,7 +1251,6 @@ mod tests {
         Sleeper,
         WritingSleeper,
         PrintSleep,
-        QuietThenFinalLine,
     }
 
     impl ChildMode {
@@ -1244,7 +1264,6 @@ mod tests {
                 ChildMode::Sleeper => "sleeper",
                 ChildMode::WritingSleeper => "writing-sleeper",
                 ChildMode::PrintSleep => "printsleep",
-                ChildMode::QuietThenFinalLine => "quiet-then-final-line",
             }
         }
 
@@ -1258,7 +1277,6 @@ mod tests {
                 "sleeper" => ChildMode::Sleeper,
                 "writing-sleeper" => ChildMode::WritingSleeper,
                 "printsleep" => ChildMode::PrintSleep,
-                "quiet-then-final-line" => ChildMode::QuietThenFinalLine,
                 _ => return None,
             })
         }
@@ -1288,7 +1306,6 @@ mod tests {
             ChildMode::Sleeper => sleeper_child(),
             ChildMode::WritingSleeper => writing_sleeper_child(),
             ChildMode::PrintSleep => printsleep_child(),
-            ChildMode::QuietThenFinalLine => quiet_then_final_line_child(),
         }
     }
 
@@ -1413,17 +1430,6 @@ mod tests {
         eprintln!("hello-mid-run");
         let _ = io::stderr().flush();
         thread::sleep(Duration::from_secs(2));
-        std::process::exit(0);
-    }
-
-    /// Quiet for ~150 ms (spanning several of the reader's 50 ms poll
-    /// cycles with nothing to read), then writes exactly one line and exits
-    /// immediately -- the F1 exit-observation-ordering oracle's child. See
-    /// `exit_observed_then_the_final_bytes_are_still_read`.
-    fn quiet_then_final_line_child() -> ! {
-        thread::sleep(Duration::from_millis(150));
-        eprintln!("final-line");
-        let _ = io::stderr().flush();
         std::process::exit(0);
     }
 
@@ -2063,30 +2069,28 @@ mod tests {
 
     // ---- the pipe-CLOEXEC-race oracle -----------------------------------
 
-    /// What this ACTUALLY pins (corrected: it does not, and structurally
-    /// cannot, pin `SPAWN_LOCK`'s necessity -- see that static's own doc for
-    /// why): two OS threads of this SAME process each call
-    /// `DrainedChild::spawn` as close together as a `Barrier` can make them,
-    /// one for a long-lived silent sibling and one for the flood child, and
-    /// the flood capture must still be `Completeness::Complete` /
-    /// `is_trustworthy()`. This pins the poll-based reader's immunity (see
-    /// "Precondition for a complete log") to a foreign process merely
-    /// HOLDING an inherited pipe end open without writing to it -- which is
-    /// also exactly the reason this test cannot go red with `SPAWN_LOCK`
-    /// removed: even if the sibling's `fork` mis-inherits the flood's
-    /// not-yet-`CLOEXEC` write end (the race the lock defends against), the
-    /// mis-inherited fd lands at an arbitrary descriptor number in the
-    /// sibling's fd table that the sibling's own code never targets
-    /// (`eprintln!` always writes fd 2, not whatever number a stray
-    /// inheritance happened to land on), so it is only ever silently held,
-    /// never written to -- indistinguishable, to the flood's reader, from
-    /// no race having happened at all. A test that could discriminate the
-    /// lock would need a sibling that enumerates and writes to its own
-    /// unexpected open descriptors, a materially larger fixture than this
-    /// round's scope covers (see `SPAWN_LOCK`'s doc). What remains true and
-    /// worth pinning here: concurrent spawns from independent threads never
-    /// corrupt each other's completeness under ordinary (non-racing)
-    /// conditions.
+    /// What this test ACTUALLY exercises: two OS threads of this SAME
+    /// process each call `DrainedChild::spawn` as close together as a
+    /// `Barrier` can make them, one for a long-lived silent sibling and one
+    /// for the flood child, and the flood capture completes and reports
+    /// `Completeness::Complete` / `is_trustworthy()`. It is a shape-level
+    /// sanity check for concurrent spawning from independent threads under
+    /// ORDINARY (non-racing) conditions -- it does not discriminate any one
+    /// mechanism. It cannot pin `SPAWN_LOCK`'s necessity (see that static's
+    /// own doc): the fd a racing `fork` would mis-inherit lands at an
+    /// arbitrary descriptor number in the sibling's own fd table that the
+    /// sibling's code never targets, so it is only ever silently held, not
+    /// written to, regardless of whether the lock ran. Nor does it
+    /// discriminate the poll-based reader's immunity to a silently-held
+    /// foreign fd (confirmed by reverting the reader to a plain blocking
+    /// `read()` and rerunning this same test unchanged: still green, 30-100
+    /// runs) -- the CLOEXEC race this test tries to hit is itself too rare
+    /// to reproduce reliably here, on either mechanism. The real oracle for
+    /// "a foreign process silently holding an inherited pipe end does not
+    /// block completeness" is `settle_returns_within_bound_when_a_grandchild_holds_the_pipe`,
+    /// which constructs that holding deterministically (via direct,
+    /// unredirected fd inheritance, not an accidental race) and does go red
+    /// against a reverted (blocking-read) reader.
     #[test]
     fn concurrent_spawns_do_not_race_the_pipe_cloexec_window() {
         dispatch_if_child();
@@ -2119,31 +2123,81 @@ mod tests {
         assert!(flood_cap.is_trustworthy(), "{flood_cap:?}");
     }
 
-    /// The oracle for the reader's exit-observation ordering (F1): a child
-    /// that is quiet for ~150 ms (long enough to span several of the
-    /// reader's 50 ms poll cycles with nothing to read), then writes
-    /// exactly one line and exits immediately, must still have that line in
-    /// the resulting `Capture` with `is_trustworthy() == true`. Pre-fix,
-    /// loading `child_exited` AFTER `poll` returned left the interval
-    /// between "poll observed nothing" and "the flag read" unprotected: a
-    /// write+exit+reap landing in that interval let the reader conclude
-    /// `Eof` on a poll result computed strictly BEFORE the write, silently
-    /// dropping it (demonstrated: `complete=Complete trustworthy=true
-    /// has_final=false stderr=""`). See `spawn_reader`'s doc for the fix
-    /// (load the flag before `poll`, not after).
+    /// The oracle for the reader's exit-observation ordering (F1), pinned
+    /// deterministically rather than hoped for: drives `spawn_reader`
+    /// directly (bypassing `DrainedChild`/subprocesses entirely) with a
+    /// hand-controlled real pipe, using the `ready_hook` parameter to pause
+    /// the reader thread's loop EXACTLY between `poll` returning 0 and the
+    /// `exited_before_poll` decision. The hook then writes the final line,
+    /// closes the write end, and sets `child_exited` -- reproducing "the
+    /// child writes its final line, exits, and is reaped inside the
+    /// interval between poll-returned-0 and the flag read" on demand, on
+    /// every run, rather than relying on wall-clock alignment (a live
+    /// subprocess reproduction of this exact shape did not naturally occur
+    /// in 580 attempts across two earlier probing sessions on a real box --
+    /// the true window is narrower than timing alone can reliably hit, which
+    /// is exactly why this test drives the mechanism directly instead).
+    ///
+    /// Pre-fix ordering (load `child_exited` AFTER `poll`, reproduced by
+    /// moving the load in `spawn_reader` below the `poll` call and rerunning
+    /// this same test): RED, deterministically, every time --
+    /// `complete_outcome=Some(Eof) has_final=false stderr=""`, byte-for-byte
+    /// the shape this fix closes. Post-fix (the committed ordering): GREEN,
+    /// deterministically -- the flag was already `false` when sampled
+    /// before this `poll` call, so the reader `continue`s and re-polls,
+    /// correctly observing the data the hook just wrote.
+    #[cfg(unix)]
     #[test]
     fn exit_observed_then_the_final_bytes_are_still_read() {
-        dispatch_if_child();
-        let exact = test_exact_path("exit_observed_then_the_final_bytes_are_still_read");
-        let mut cmd = self_exec(&exact, ChildMode::QuietThenFinalLine);
-        let child = DrainedChild::spawn(&mut cmd).expect("spawn quiet-then-final-line child");
-        let cap = child.wait_bounded(Duration::from_secs(10), Epoch::Spawn);
+        use std::io::Write as _;
+        use std::os::unix::io::FromRawFd;
 
-        assert!(!cap.hung, "{cap:?}");
-        assert!(
-            String::from_utf8_lossy(&cap.stderr).contains("final-line"),
-            "the child's only line must survive even though it arrives at the edge of a poll-timeout boundary after ~150ms of quiet: {cap:?}"
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe(2) failed");
+        // SAFETY: `fds[0]`/`fds[1]` are freshly created, valid, distinct fds
+        // from the `pipe(2)` call just above; each is taken exactly once.
+        let read_file = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let write_fd = fds[1];
+
+        let buf = Arc::new(Mutex::new(RetainedBuf::new(
+            DEFAULT_HEAD_CAP,
+            DEFAULT_TAIL_CAP,
+        )));
+        let outcome = Arc::new(Mutex::new(None));
+        let child_exited = Arc::new(AtomicBool::new(false));
+
+        let hook_child_exited = Arc::clone(&child_exited);
+        let ready_hook: Box<dyn FnOnce() + Send> = Box::new(move || {
+            // SAFETY: `write_fd` is the write end from the `pipe(2)` call
+            // above, not yet taken by anything else at this point.
+            let mut write_file = unsafe { std::fs::File::from_raw_fd(write_fd) };
+            write_file
+                .write_all(
+                    b"final-line
+",
+                )
+                .expect("write the final line");
+            drop(write_file); // close the write end
+            hook_child_exited.store(true, Ordering::SeqCst);
+        });
+
+        let handle = spawn_reader(
+            read_file,
+            Arc::clone(&buf),
+            None,
+            Arc::clone(&outcome),
+            Arc::clone(&child_exited),
+            Some(ready_hook),
         );
-        assert!(cap.is_trustworthy(), "{cap:?}");
+        handle.join().expect("reader thread must not panic");
+
+        let raw = lock_or_recover(&buf).raw();
+        let text = String::from_utf8_lossy(&raw);
+        let outcome_val = lock_or_recover(&outcome).clone();
+        assert!(
+            text.contains("final-line"),
+            "exit observed then the final bytes must still be read: \
+             complete_outcome={outcome_val:?} has_final=false stderr={text:?}"
+        );
     }
 }

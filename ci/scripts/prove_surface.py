@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -65,6 +66,18 @@ KIND_RELEASE = "release"
 KIND_TEST = "test"
 KIND_DEFAULT = "default"
 KINDS = (KIND_RELEASE, KIND_TEST, KIND_DEFAULT)
+
+# ONE marker grammar, one parser PER LANGUAGE (esc-080/esc-082/esc-083,
+# BLOCK 3 audit fix): `PROVE_GROUP_RC name=<n> rc=<v>`, exactly as
+# `runpod_lib.sh`'s own `rp_parse_prove_marker` (the bash-side twin, shared
+# by `rp_run_remote_watched` and `runpod_gpu_prove.sh`'s `rp_prove_verdict`)
+# parses it. This is the SINGLE Python-side source of truth --
+# `ci/scripts/perf/gpu_prove_timings.py` imports this constant rather than
+# compiling its own copy, so the two languages' grammars cannot silently
+# drift apart. A cross-parser fixture in `test_gpu_prove_lane.sh` feeds the
+# identical marker text to both the bash function and this regex and
+# asserts identical (name, rc) extraction.
+PROVE_GROUP_RC_RE = re.compile(r"PROVE_GROUP_RC name=(?P<name>\S+) rc=(?P<rc>-?\d+)")
 
 
 def declared(crate: str, repo_root: Path = REPO_ROOT) -> set[str]:

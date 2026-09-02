@@ -618,15 +618,23 @@ def check_prove_surface(manifest: dict, repo_root: Path = REPO_ROOT, verbose: bo
         for pair in _scan_prove_tuple_pairs(fpath):
             crate, kind = pair["crate"], pair["kind"]
             if crate is None:
-                if is_gated(pair["tuple"]):
-                    if verbose:
-                        print(
-                            f"FAIL: {prove_file}:{pair['lineno']}: cuda-bearing invocation "
-                            f"`{pair['tuple']}` has no preceding PROVE_TUPLE echo — an "
-                            f"unlisted pair",
-                            file=sys.stderr,
-                        )
-                    rc = 1
+                # Every invocation found in a PROVE_SCOPE file is a FINDING
+                # when un-echoed — NOT only a gated (cuda/flash-attn) one.
+                # An un-gated bare invocation (e.g. a second, unlisted
+                # `cargo test -p jammi-kernels` with no `--features`) is
+                # itself an EXTRA `default`-kind invocation of a
+                # prove-scope crate that this script's set-equality rule
+                # would otherwise never see (it is not "gated", so a
+                # gated-only check silently waved it through) — the proof
+                # surface can drift by count even when every DECLARED pair
+                # still resolves once.
+                if verbose:
+                    print(
+                        f"FAIL: {prove_file}:{pair['lineno']}: invocation `{pair['tuple']}` "
+                        f"has no preceding PROVE_TUPLE echo — an unlisted invocation",
+                        file=sys.stderr,
+                    )
+                rc = 1
                 continue
             if pair["echoed_features"] != pair["actual_features"]:
                 if verbose:
@@ -1090,6 +1098,16 @@ def _self_test_prove_surface() -> None:
     # preceding PROVE_TUPLE echo at all -- an unlisted pair.
     unlisted = good + "cargo test -p jammi-ai --features cuda -- --nocapture\n"
     assert _run_prove_surface_fixture(unlisted) == 1, "a new bare unechoed cuda invocation must FAIL"
+
+    # An un-echoed, UN-GATED bare invocation naming a prove-scope crate is
+    # ALSO a FINDING -- a second, unlisted `cargo test -p jammi-kernels`
+    # (no --features, so `is_gated` alone would never flag it) is an extra
+    # `default`-kind invocation this script's own set-equality rule cannot
+    # otherwise see.
+    unlisted_ungated = good + "cargo test -p jammi-kernels -- --nocapture\n"
+    assert _run_prove_surface_fixture(unlisted_ungated) == 1, (
+        "an un-echoed, un-gated cargo invocation naming a prove-scope crate must FAIL too"
+    )
 
     # Emptied manifest: prove_lane.crates has nothing to prove.
     m2 = json.loads(json.dumps(_FIXTURE_MANIFEST))

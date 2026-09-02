@@ -1237,6 +1237,16 @@ jobs:
           # history.
           - name: gpu prove timings self-test
             cmd: python3 ci/scripts/check_gpu_prove_timings.py --self-test
+          # The gpu-prove-timings PRODUCER's own self-test (BLOCK 1 audit
+          # fix): pins the current-mode marker-attribution path (a
+          # PROVE_GROUP_RC marker precedes its own ::endgroup:: by design,
+          # so it must be attributed by its own name= field, never by
+          # membership in the already-closed list) against a synthetic
+          # fully-healthy log (outcome healthy, wall_s set, all six gating
+          # groups rc=0) and a synthetic budget-cut log — the exact bug
+          # shape that silently mislabeled every healthy leg as budget-cut.
+          - name: gpu prove timings producer self-test
+            cmd: python3 ci/scripts/perf/gpu_prove_timings.py --self-test
           # The prove-lane fixture suite (F1-F7, esc-080/esc-082): drives the
           # REAL `rp_run_remote_watched`/driver-rule mechanism in
           # runpod_gpu_prove.sh against a STUBBED ssh — no RunPod account, no

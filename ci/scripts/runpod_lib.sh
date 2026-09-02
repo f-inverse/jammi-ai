@@ -1484,6 +1484,36 @@ rp_run_remote() {
 #     discriminator: an in-suite 124 (the remote script's OWN exit, with
 #     `PROVE_EXIT=124` already printed) is a different case, indistinguishable
 #     from a real budget cut by exit code alone, and gets no extra line.
+# ONE marker grammar, one parser (esc-080/esc-082/esc-083, BLOCK 3 audit
+# fix): `PROVE_GROUP_RC name=<n> rc=<v>` -- used by BOTH this file's own
+# `rp_run_remote_watched` (live-stream bookkeeping, below) and
+# `runpod_gpu_prove.sh`'s `rp_prove_verdict` (which reads an already-drained
+# log file) -- never two independently-drifting copies of the same
+# match+extract logic. `ci/scripts/perf/gpu_prove_timings.py`'s own
+# extraction is the Python-side twin, sharing this SAME grammar via
+# `ci/scripts/prove_surface.py`'s `PROVE_GROUP_RC_RE` constant; a
+# cross-parser fixture in `test_gpu_prove_lane.sh` feeds the identical
+# marker text to both this function and the Python regex and asserts
+# identical (name, rc) extraction.
+#
+# `$1` = a candidate line (a whole logical line, never a fragment). Sets
+# `RP_PARSED_MARKER_NAME`/`RP_PARSED_MARKER_RC` (plain globals -- bash has
+# no return-by-value) and returns 0 on a match; UNSETS both and returns 1
+# on a non-match, so a caller can never read a PRIOR call's stale values on
+# a miss.
+rp_parse_prove_marker() {
+  unset RP_PARSED_MARKER_NAME RP_PARSED_MARKER_RC
+  case "$1" in
+    *"PROVE_GROUP_RC "*"name="*"rc="*)
+      local rest="${1#*PROVE_GROUP_RC }"
+      RP_PARSED_MARKER_NAME="${rest#name=}"; RP_PARSED_MARKER_NAME="${RP_PARSED_MARKER_NAME%% *}"
+      RP_PARSED_MARKER_RC="${rest##*rc=}"; RP_PARSED_MARKER_RC="${RP_PARSED_MARKER_RC%% *}"
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 rp_run_remote_watched() {
   local inactivity="${1:-$RP_INACTIVITY}"
   local out; out="$(mktemp)"
@@ -1492,6 +1522,19 @@ rp_run_remote_watched() {
     | ssh "${RP_SSHO[@]}" -p "$RP_PORT" "root@${RP_HOST}" "timeout ${RP_TIMEOUT:-3000} bash -s" \
     > "$out" 2>&1 &
   local pid=$!
+  # `$!` names only the LAST stage of a backgrounded pipeline (ssh); `jobs -l
+  # %+` lists every constituent PID of the CURRENT (most recent) job right
+  # after backgrounding it -- its first data line's second field is the
+  # pipeline HEAD's pid (`{ preamble; cat; }`). Recorded so an inactivity
+  # kill can `wait` on it BY PID (never a bare `wait`, which would block on
+  # every OTHER background job this shell happens to be running, not just
+  # this one). This reap assumes the pipeline head's OWN stdin is BOUNDED --
+  # a heredoc (finite content already buffered by bash), never an
+  # open-ended/interactive stream -- so `cat` inside it is guaranteed to hit
+  # EOF and exit on its own in bounded time once ssh stops consuming (a
+  # write past that point gets SIGPIPE); an unbounded-stdin caller would
+  # need its own explicit teardown, not this one.
+  local head_pid; head_pid="$(jobs -l %+ 2>/dev/null | awk 'NR==1{print $2}')"
   local printed=0 last_growth=$SECONDS last_group="" parse_carry=""
   local group_names=() group_rcs_assoc_keys=() group_rcs_assoc_vals=()
 
@@ -1505,11 +1548,9 @@ rp_run_remote_watched() {
   }
 
   _rrw_record_rc() {
-    # `$1` = a `PROVE_GROUP_RC name=<n> rc=<v>` line (already validated to
-    # contain that literal substring by the caller).
-    local rest="${1#*PROVE_GROUP_RC }"
-    local gname="${rest#name=}"; gname="${gname%% *}"
-    local grcv="${rest##*rc=}"; grcv="${grcv%% *}"
+    # $1=name $2=rc -- already extracted by `rp_parse_prove_marker`, the ONE
+    # shared marker parser (never re-parsed here).
+    local gname="$1" grcv="$2"
     local i found=0
     for i in "${!group_names[@]}"; do
       if [ "${group_names[$i]}" = "$gname" ]; then
@@ -1551,8 +1592,10 @@ rp_run_remote_watched() {
     while IFS= read -r line; do
       case "$line" in
         *"::group::"*) last_group="${line#*::group::}" ;;
-        *"PROVE_GROUP_RC "*"name="*"rc="*) _rrw_record_rc "$line" ;;
       esac
+      if rp_parse_prove_marker "$line"; then
+        _rrw_record_rc "$RP_PARSED_MARKER_NAME" "$RP_PARSED_MARKER_RC"
+      fi
     done <<< "$combined"
   }
 
@@ -1570,7 +1613,11 @@ rp_run_remote_watched() {
       sleep 1
       kill -KILL "$pid" 2>/dev/null
       wait "$pid" 2>/dev/null
-      wait 2>/dev/null || true  # reap the `{ preamble; cat; }` pipeline head
+      # Reap the `{ preamble; cat; }` pipeline head BY ITS RECORDED PID
+      # (never a bare `wait`, which blocks on every OTHER background job
+      # this shell happens to be running) -- see `head_pid`'s own doc above
+      # for the bounded-stdin precondition this reap relies on.
+      [ -n "$head_pid" ] && wait "$head_pid" 2>/dev/null
       local size2; size2=$(wc -c < "$out" 2>/dev/null || echo 0)
       if [ "$size2" -gt "$printed" ]; then
         _rrw_read_chunk "$((printed + 1))"
@@ -1597,9 +1644,14 @@ rp_run_remote_watched() {
   # Force any still-carried partial final line (no trailing newline in the
   # remote's own output, e.g. an abrupt kill mid-write) into the marker scan
   # too -- a `PROVE_EXIT=<n>` or `PROVE_GROUP_RC` line the remote never
-  # newline-terminated before dying must still count.
+  # newline-terminated before dying must still count. `_rrw_scan_new_text`
+  # ALREADY prepends `parse_carry` to its own `$1` (see its own doc above) --
+  # passing `$parse_carry` here TOO would double it (BLOCK 2 audit fix: this
+  # site used to pass `"$parse_carry"$'\n'`, corrupting the final unterminated
+  # line into e.g. `cut group "kernels-cuda::group::kernels-cuda"`). Passing
+  # bare `$'\n'` supplies only the missing terminator the carry itself lacks.
   if [ -n "$parse_carry" ]; then
-    _rrw_scan_new_text "$parse_carry"$'\n'
+    _rrw_scan_new_text $'\n'
   fi
   if [ "$rc" -eq 124 ] && ! grep -q '^PROVE_EXIT=' "$out"; then
     echo "=== GPU prove: BUDGET (RP_TIMEOUT=${RP_TIMEOUT:-3000}s) cut group \"${last_group}\"; groups: $(_rrw_group_list) ===" >&2

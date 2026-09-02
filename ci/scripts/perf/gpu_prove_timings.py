@@ -54,7 +54,7 @@ import argparse
 import json
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -100,7 +100,10 @@ LEGACY_TITLE_PREFIXES: list[tuple[str, str]] = [
 _LOG_LINE_RE = re.compile(r"^(?P<job>[^\t]*)\t(?P<step>[^\t]*)\t(?P<ts>\S+)\s(?P<msg>.*)$")
 _GROUP_RE = re.compile(r"##\[group\](?P<title>.*)$")
 _ENDGROUP_RE = re.compile(r"##\[endgroup\]\s*$")
-_GROUP_RC_RE = re.compile(r"PROVE_GROUP_RC name=(?P<name>\S+) rc=(?P<rc>-?\d+)")
+# The ONE Python-side marker grammar (BLOCK 3 audit fix) -- imported from
+# prove_surface.py rather than compiled here a second time, so this and the
+# bash-side `rp_parse_prove_marker` (runpod_lib.sh) cannot silently drift.
+_GROUP_RC_RE = prove_surface.PROVE_GROUP_RC_RE
 _PROVE_SHA_RE = re.compile(r"PROVE_SHA=(?P<sha>[0-9a-f]+)")
 _PROVE_TUPLE_RE = re.compile(r"PROVE_TUPLE crate=(?P<crate>\S+) kind=(?P<kind>\S+) features=(?P<features>\S*)")
 _PROVE_EXIT_RE = re.compile(r"PROVE_EXIT=(?P<rc>-?\d+)")
@@ -156,6 +159,18 @@ def parse_log(text: str, legacy: bool) -> dict:
     open_groups: dict[str, datetime] = {}
     closed: list[dict] = []
     current_open_name: str | None = None
+    # BLOCK 1 audit fix: `PROVE_GROUP_RC` markers are emitted BEFORE their
+    # own `::endgroup::` by design (runpod_gpu_prove.sh's own convention),
+    # so at the moment a marker is seen its group is still in `open_groups`,
+    # never yet in `closed` -- searching `closed` for a name match (the
+    # original shape) found nothing for EVERY current-mode marker, silently
+    # leaving `rc: None` on every group and reading a fully healthy log as
+    # `budget-cut`. Attribute by the marker's OWN `name=` field into a plain
+    # dict instead (the marker already states which group it belongs to;
+    # only one group is ever open at a time, so this needs no additional
+    # "is it the currently-open one" check) and pull from that dict the
+    # moment the SAME-named group closes.
+    rc_by_name: dict[str, int] = {}
     git_sha: str | None = None
     tuples: dict[tuple[str, str], str] = {}
     prove_exit: int | None = None
@@ -178,17 +193,19 @@ def parse_log(text: str, legacy: bool) -> dict:
         if _ENDGROUP_RE.search(msg):
             if current_open_name and current_open_name in open_groups:
                 wall = (ts - open_groups[current_open_name]).total_seconds()
-                closed.append({"name": current_open_name, "wall_s": round(wall, 3), "rc": None})
+                closed.append(
+                    {
+                        "name": current_open_name,
+                        "wall_s": round(wall, 3),
+                        "rc": rc_by_name.get(current_open_name),
+                    }
+                )
                 del open_groups[current_open_name]
             last_boundary_ts = ts
             continue
         rc_m = _GROUP_RC_RE.search(msg)
         if rc_m:
-            gname, grc = rc_m.group("name"), int(rc_m.group("rc"))
-            for g in closed:
-                if g["name"] == gname and g["rc"] is None:
-                    g["rc"] = grc
-                    break
+            rc_by_name[rc_m.group("name")] = int(rc_m.group("rc"))
             continue
         sha_m = _PROVE_SHA_RE.search(msg)
         if sha_m:
@@ -297,6 +314,17 @@ def build_artifact(
 
     artifact: dict = {
         "schema_version": SCHEMA_VERSION,
+        "_doc": [
+            "wall_s (healthy) / wall_lower_bound_s (cut/kill) is the WINDOW",
+            "from the first `::group::` open to the last of {an",
+            "`::endgroup::`, a `PROVE_EXIT=` line, a \"GPU prove suites",
+            "exit=\" driver line} -- it deliberately EXCLUDES the GitHub",
+            "runner's own provisioning/checkout overhead before the first",
+            "group and the short post-job cleanup tail after the driver's",
+            "own exit echo, neither of which belongs to the prove lane's",
+            "own wall or silence accounting. `max_silent_gap_s` is computed",
+            "over the SAME window.",
+        ],
         "arch": arch,
         "box": box,
         "driver": driver,
@@ -318,7 +346,108 @@ def build_artifact(
     return artifact
 
 
+# --------------------------------------------------------------------------- #
+# Self-test (BLOCK 1 audit fix): pins the CURRENT-mode marker-attribution
+# path (a marker precedes its own `::endgroup::` by design) against both a
+# fully healthy synthetic log and a genuine budget-cut one -- the exact
+# shape whose bug (matching `closed` instead of the marker's own `name=`
+# field) silently mislabeled every healthy leg as `budget-cut`.
+# --------------------------------------------------------------------------- #
+_JOB = "GPU prove on RunPod (sm_80)"
+_STEP = "UNKNOWN STEP"
+
+
+def _synth_log(lines: list[str]) -> str:
+    """`lines`, one GH-raw-log line per entry, timestamped one second apart
+    starting at a fixed epoch -- the exact `<job>\\t<step>\\t<ts> <msg>` shape
+    `_LOG_LINE_RE` parses."""
+    out = []
+    base = datetime(2026, 1, 1, 0, 0, 0)
+    for i, msg in enumerate(lines):
+        stamp = (base + timedelta(seconds=i)).strftime("%Y-%m-%dT%H:%M:%S.0000000Z")
+        out.append(f"{_JOB}\t{_STEP}\t{stamp} {msg}")
+    return "\n".join(out) + "\n"
+
+
+def _healthy_synth_log() -> str:
+    lines = ["##[group]device", "name, compute_cap, driver_version", "NVIDIA A100 80GB PCIe, 8.0, 570.195.03", "CUDA_COMPUTE_CAP=80", "##[endgroup]"]
+    lines += ["PROVE_SHA=" + "a" * 40]
+    for name in (
+        "capability-surface-build",
+        "capability-surface-proof",
+        "served-client-server-proof",
+        "engine-core-sweep",
+        "kernels-default",
+        "kernels-cuda",
+    ):
+        lines.append(f"##[group]{name}")
+        lines.append(f"PROVE_GROUP_RC name={name} rc=0")
+        lines.append("##[endgroup]")
+    lines.append("##[group]bench")
+    lines.append("BENCH_EXIT=1")
+    lines.append("PROVE_GROUP_RC name=bench rc=1")
+    lines.append("##[endgroup]")
+    lines.append("PROVE_EXIT=0")
+    lines.append("=== GPU prove suites exit=0 (raw=0) ===")
+    return _synth_log(lines)
+
+
+def _cut_synth_log() -> str:
+    lines = ["##[group]device", "name, compute_cap, driver_version", "NVIDIA A100 80GB PCIe, 8.0, 570.195.03", "CUDA_COMPUTE_CAP=80", "##[endgroup]"]
+    lines += ["PROVE_SHA=" + "b" * 40]
+    for name in ("capability-surface-build", "capability-surface-proof", "served-client-server-proof"):
+        lines.append(f"##[group]{name}")
+        lines.append(f"PROVE_GROUP_RC name={name} rc=0")
+        lines.append("##[endgroup]")
+    # engine-core-sweep is cut mid-flight -- opened, never closed, no marker.
+    lines.append("##[group]engine-core-sweep")
+    lines.append("Compiling jammi-kernels v0.48.0")
+    return _synth_log(lines)
+
+
+def _self_test() -> int:
+    failures: list[str] = []
+    total = 0
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        nonlocal total
+        total += 1
+        print(f"self-test[{name}]: " + ("ok" if cond else f"FAIL -- {detail}"))
+        if not cond:
+            failures.append(name)
+
+    healthy_artifact = build_artifact(
+        arch="sm_80", run_id="1", job_id="1", log_text=_healthy_synth_log(), legacy=False
+    )
+    check("healthy-outcome", healthy_artifact["outcome"] == "healthy", f"{healthy_artifact['outcome']}")
+    check("healthy-has-wall-s", "wall_s" in healthy_artifact and isinstance(healthy_artifact["wall_s"], float), "")
+    check("healthy-no-wall-lower-bound", "wall_lower_bound_s" not in healthy_artifact, "")
+    gating = {g["name"]: g["rc"] for g in healthy_artifact["groups"] if g["name"] in CURRENT_GROUP_NAMES - {"device", "bench"}}
+    check(
+        "healthy-all-six-gating-rcs-zero",
+        len(gating) == 6 and all(rc == 0 for rc in gating.values()),
+        f"{gating}",
+    )
+    bench_group = next(g for g in healthy_artifact["groups"] if g["name"] == "bench")
+    check("healthy-bench-rc-recorded-non-gating", bench_group["rc"] == 1, f"{bench_group}")
+
+    cut_artifact = build_artifact(arch="sm_80", run_id="2", job_id="2", log_text=_cut_synth_log(), legacy=False)
+    check("cut-outcome", cut_artifact["outcome"] == "budget-cut", f"{cut_artifact['outcome']}")
+    check("cut-has-wall-lower-bound", "wall_lower_bound_s" in cut_artifact, "")
+    check("cut-no-wall-s", "wall_s" not in cut_artifact, "")
+    cut_names = {g["name"] for g in cut_artifact["groups"]}
+    check("cut-engine-core-sweep-not-closed", "engine-core-sweep" not in cut_names, f"{cut_names}")
+
+    if failures:
+        print(f"self-test: FAIL ({len(failures)}/{total} failing): {failures}", file=sys.stderr)
+        return 1
+    print(f"self-test: all {total} checks passed")
+    return 0
+
+
 def main(argv: list[str]) -> int:
+    if "--self-test" in argv:
+        return _self_test()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("job_log", type=Path)
     ap.add_argument("--arch", required=True)

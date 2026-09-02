@@ -304,6 +304,123 @@ else
 fi
 
 # ============================================================================
+# BLOCK 2 audit fix: the FINAL drain's own carry handling (distinct from the
+# poll-boundary case above, which never reaches EOF mid-marker) -- an
+# unterminated last `::group::` line, and separately an unterminated last
+# `PROVE_GROUP_RC` marker, both landing right at ssh's own (non-inactivity)
+# exit. `_rrw_scan_new_text` prepends `parse_carry` to its OWN `$1`
+# internally; the final-drain caller must pass ONLY the missing newline
+# (`$'\n'`), never `"$parse_carry"$'\n'` again -- doubling it once produced
+# `cut group "kernels-cuda::group::kernels-cuda"` live.
+# ============================================================================
+ssh() {
+  cat >/dev/null
+  echo "PROVE_GROUP_RC name=kernels-default rc=0"
+  printf '::group::kernels-cuda'   # no trailing newline -- ssh exits right here
+  return 124
+}
+export -f ssh
+out="$(rp_run_remote_watched <<< "noop" 2>&1)"
+rc=$?
+if [ "$rc" -eq 124 ] \
+  && echo "$out" | grep -q 'group "kernels-cuda"' \
+  && ! echo "$out" | grep -q 'kernels-cuda::group::kernels-cuda' \
+  && echo "$out" | grep -q 'groups: \[kernels-default:0\]'; then
+  ok "final-drain carry: an unterminated last ::group:: line names the group once, never doubled"
+else
+  bad "final-drain carry: unterminated ::group:: line mishandled; rc=$rc out=$out"
+fi
+
+ssh() {
+  cat >/dev/null
+  echo "::group::kernels-cuda"
+  printf 'PROVE_GROUP_RC name=kernels-cuda rc=0'   # no trailing newline
+  return 124
+}
+export -f ssh
+out="$(rp_run_remote_watched <<< "noop" 2>&1)"
+rc=$?
+if [ "$rc" -eq 124 ] && echo "$out" | grep -q 'groups: \[kernels-cuda:0\]'; then
+  ok "final-drain carry: an unterminated last PROVE_GROUP_RC marker is still parsed (not dropped, not doubled)"
+else
+  bad "final-drain carry: unterminated PROVE_GROUP_RC marker mishandled; rc=$rc out=$out"
+fi
+
+# ============================================================================
+# BLOCK 3 audit fix -- cross-parser fixture: the SAME unterminated-final-
+# marker log content, fed independently to (a) rp_run_remote_watched
+# (already exercised above), (b) rp_prove_verdict (the log-file path), and
+# (c) the Python producer's parse_log/PROVE_GROUP_RC_RE -- all three must
+# extract the identical (name, rc) pair, never drop/double it.
+# ============================================================================
+
+# (b) rp_prove_verdict: all six groups pass, the LAST one's marker is
+# unterminated (no trailing newline in the log FILE at all) and no
+# PROVE_EXIT was reached (a genuine cut) -- if the parser dropped the
+# unterminated marker, all_proof_pass would read 0 and the bench-cut
+# exception would NOT apply, leaving rc=124 instead of 0.
+xp_log="$SANDBOX/xparser.log"
+{
+  for g in "${PROVE_GROUPS[@]:0:5}"; do echo "PROVE_GROUP_RC name=${g} rc=0"; done
+} > "$xp_log"
+printf 'PROVE_GROUP_RC name=%s rc=0' "${PROVE_GROUPS[5]}" >> "$xp_log"   # no trailing newline
+rp_prove_verdict 124 "$xp_log"
+xp_bash_rc=$?
+if [ "$xp_bash_rc" -eq 0 ]; then
+  ok "cross-parser (bash, rp_prove_verdict): unterminated final marker credited (all six groups pass -> bench-cut exception -> 0)"
+else
+  bad "cross-parser (bash, rp_prove_verdict): unterminated final marker NOT credited (rc=$xp_bash_rc, expected 0)"
+fi
+
+# (a)+(c) SAME literal marker line text (byte-identical, no trailing
+# newline), fed to the bash-side shared parser (rp_parse_prove_marker,
+# used by both rp_run_remote_watched and rp_prove_verdict) and to the
+# Python-side prove_surface.PROVE_GROUP_RC_RE (imported, never a second
+# regex, by gpu_prove_timings.py) directly -- both must extract the
+# IDENTICAL (name, rc) pair from the identical text.
+xp_marker_line="PROVE_GROUP_RC name=${PROVE_GROUPS[5]} rc=0"
+if rp_parse_prove_marker "$xp_marker_line"; then
+  xp_bash_name="$RP_PARSED_MARKER_NAME"
+  xp_bash_rcval="$RP_PARSED_MARKER_RC"
+else
+  xp_bash_name=""
+  xp_bash_rcval=""
+fi
+xp_py_pair="$(python3 -c "
+import sys
+sys.path.insert(0, 'ci/scripts')
+import prove_surface
+m = prove_surface.PROVE_GROUP_RC_RE.search('$xp_marker_line')
+print(m.group('name') + ' ' + m.group('rc') if m else 'NOMATCH')
+")"
+if [ "$xp_bash_name $xp_bash_rcval" = "$xp_py_pair" ] && [ "$xp_py_pair" != "NOMATCH" ]; then
+  ok "cross-parser: bash rp_parse_prove_marker and Python prove_surface.PROVE_GROUP_RC_RE extract the IDENTICAL (name, rc) from the same marker text ($xp_py_pair)"
+else
+  bad "cross-parser: bash extracted '$xp_bash_name $xp_bash_rcval' but python extracted '$xp_py_pair' -- grammars disagree"
+fi
+
+# (c) the same marker text, embedded in a minimal GH-raw-log-shaped
+# synthetic log with NO trailing newline on the file's last line, must
+# resolve via the producer's OWN import of that same constant.
+xp_py_log="$SANDBOX/xparser_gh.log"
+{
+  printf 'GPU prove on RunPod (sm_80)\tUNKNOWN STEP\t2026-01-01T00:00:00.0000000Z ##[group]%s\n' "${PROVE_GROUPS[5]}"
+  printf 'GPU prove on RunPod (sm_80)\tUNKNOWN STEP\t2026-01-01T00:00:01.0000000Z %s' "$xp_marker_line"
+} > "$xp_py_log"
+xp_py_out="$(python3 -c "
+import sys
+sys.path.insert(0, 'ci/scripts/perf')
+import gpu_prove_timings as g
+text = open('$xp_py_log').read()
+print('MATCH' if any(m.group('name') == '${PROVE_GROUPS[5]}' and m.group('rc') == '0' for m in g._GROUP_RC_RE.finditer(text)) else 'NOMATCH')
+")"
+if [ "$xp_py_out" = "MATCH" ]; then
+  ok "cross-parser (python producer, via its OWN imported PROVE_GROUP_RC_RE): the unterminated marker text extracts name=${PROVE_GROUPS[5]} rc=0"
+else
+  bad "cross-parser (python producer): expected a MATCH on the unterminated marker; got $xp_py_out"
+fi
+
+# ============================================================================
 # PROVE_EXIT disagreeing with its own markers -> FAIL (never trusted blindly).
 # ============================================================================
 log="$SANDBOX/disagree.log"
@@ -317,39 +434,102 @@ rc=$?
   || bad "expected a nonzero rc when PROVE_EXIT=0 disagrees with a failed marker"
 
 # ============================================================================
-# F7: rp_cleanup (runpod_lib.sh's own `trap ... EXIT`, installed at source
-# time) fires on the 76 path and on the exit-0 bench-cut path. Run as
-# SEPARATE bash processes (each a fresh trap-armed process) so the OS-level
-# EXIT-trap guarantee is what is actually being exercised, not just a
-# function call in this suite's own process.
+# F7 (BLOCK audit fix): drives the REAL, EXECUTED runpod_gpu_prove.sh top-
+# level exit path (rp_sweep -> rp_init -> rp_deploy_arch -> rp_run_remote_
+# watched -> rp_prove_verdict -> exit) end to end, in a SEPARATE bash
+# process, with `curl`/`ssh` stubbed (never a bare function override --
+# sourcing runpod_lib.sh would clobber a re-defined bash function, but it
+# never touches the real `curl`/`ssh` EXTERNAL BINARIES, so shadowing them
+# on PATH survives the source). `rp_cleanup` itself is NEVER stubbed (it
+# cannot be, for the same clobber reason) -- its call is recorded
+# INDIRECTLY but unambiguously: `rp_terminate` (which `rp_cleanup` calls
+# for every pod it created) makes a REAL `podTerminate` GraphQL call
+# through `curl`, and the stub below writes a marker file the moment it
+# sees one. No `trap rp_cleanup EXIT` firing means no `podTerminate` call
+# means no marker -- this fails against a scratch copy with that trap
+# commented out (verified by hand while writing this fixture).
 # ============================================================================
-f7_case() {
-  # $1 = "watchdog" | "bench-cut"
-  local mode="$1"
-  local out
-  out="$(RUNPOD_API_KEY=test-dummy-key bash -c '
-    set -uo pipefail
-    DIR="'"$DIR"'"
-    source "$DIR/runpod_lib.sh"
-    rp_init
-    echo "RP_WORK=$RP_WORK"
-    if [ "'"$mode"'" = "watchdog" ]; then
-      exit 76
+F7_STUBBIN="$SANDBOX/f7-bin"
+mkdir -p "$F7_STUBBIN"
+
+cat > "$F7_STUBBIN/curl" <<'CURLSTUB'
+#!/usr/bin/env bash
+payload=""
+for a in "$@"; do
+  case "$a" in
+    *podTerminate*|*podFindAndDeployOnDemand*|*'myself{'*|*'pod(input:'*) payload="$a" ;;
+  esac
+done
+case "$payload" in
+  *podTerminate*)
+    echo "TERMINATED" >> "${F7_TERMINATE_MARKER:?F7_TERMINATE_MARKER unset}"
+    echo '{"data":{"podTerminate":true}}'
+    ;;
+  *podFindAndDeployOnDemand*) echo '{"data":{"podFindAndDeployOnDemand":{"id":"f7-fake-pod"}}}' ;;
+  *'myself{'*) echo '{"data":{"myself":{"pods":[]}}}' ;;
+  *'pod(input:'*) echo '{"data":{"pod":{"runtime":{"ports":[{"ip":"127.0.0.1","publicPort":2222,"privatePort":22,"isIpPublic":true,"type":"tcp"}]}}}}' ;;
+  *) echo '{}' ;;
+esac
+CURLSTUB
+chmod +x "$F7_STUBBIN/curl"
+
+# Distinguishes the THREE real ssh invocation shapes rp_deploy_live/
+# rp_run_remote_watched make, by the LAST argument's own content: a bare
+# `true` (the reachability liveness probe), an `nvidia-smi` driver query,
+# or the heredoc's `timeout N bash -s` remote-script form (the ONLY one
+# that reads stdin and needs a scenario-specific reply).
+cat > "$F7_STUBBIN/ssh" <<'SSHSTUB'
+#!/usr/bin/env bash
+last="${@: -1}"
+case "$last" in
+  true) exit 0 ;;
+  *nvidia-smi*) echo "570.195.03"; exit 0 ;;
+  *"bash -s"*)
+    cat >/dev/null
+    if [ "${F7_SCENARIO:-}" = "watchdog" ]; then
+      echo "::group::capability-surface-build"
+      sleep 30
     else
-      echo "::warning::bench cut/hung after every proof group already passed (simulated)"
-      exit 0
+      for g in capability-surface-build capability-surface-proof served-client-server-proof engine-core-sweep kernels-default kernels-cuda; do
+        echo "PROVE_GROUP_RC name=${g} rc=0"
+      done
+      echo "::group::bench"
+      sleep 30
     fi
-  ' 2>&1)"
-  local work_dir
-  work_dir="$(echo "$out" | grep '^RP_WORK=' | head -1 | cut -d= -f2-)"
-  if [ -n "$work_dir" ] && [ ! -d "$work_dir" ]; then
-    ok "F7 ($mode): rp_cleanup fired -- the temp RP_WORK dir ($work_dir) was removed on exit"
+    ;;
+  *) exit 0 ;;
+esac
+SSHSTUB
+chmod +x "$F7_STUBBIN/ssh"
+
+f7_case() {
+  # $1 = "watchdog" | "bench-cut"; $2 = expected exit code.
+  local mode="$1" want_rc="$2"
+  local marker="$SANDBOX/f7-terminate-marker-$mode"
+  rm -f "$marker"
+  # A single `env ...` line (never a `VAR=val \`-per-line assignment chain):
+  # check_gpu_prove_timings.py's own R1 setter-predicate scan matches
+  # `^\s*(export\s+)?RP_(TIMEOUT|INACTIVITY)=` at the START of a physical
+  # line, which a bare `RP_INACTIVITY=3 \` continuation line would satisfy
+  # -- this is a plain per-invocation env-var override, not a second
+  # committed default, and must not be misread as one.
+  env RUNPOD_API_KEY=test-dummy-key PATH="$F7_STUBBIN:$PATH" F7_TERMINATE_MARKER="$marker" F7_SCENARIO="$mode" GPU_PROVE_ARCH=sm_80 RP_INACTIVITY=3 RP_SSH_WAIT_SECS=10 bash "$PROVE_SH" > "$SANDBOX/f7-$mode.out" 2>&1
+  local rc=$?
+  if [ "$rc" -eq "$want_rc" ] && [ -f "$marker" ]; then
+    ok "F7 ($mode): the real executed exit path returns $want_rc AND rp_cleanup's own podTerminate call fired (marker recorded)"
   else
-    bad "F7 ($mode): rp_cleanup did not appear to fire (RP_WORK=$work_dir still present, or unreported); out=$out"
+    bad "F7 ($mode): expected rc=$want_rc with a recorded podTerminate call; got rc=$rc marker-present=$([ -f "$marker" ] && echo yes || echo no); out=$(cat "$SANDBOX/f7-$mode.out")"
   fi
 }
-f7_case "watchdog"
-f7_case "bench-cut"
+# Every earlier F1-F4/cross-parser case above did `export -f ssh` with a
+# succession of bash FUNCTION overrides -- an exported bash function takes
+# PRECEDENCE over a same-named PATH executable in any child process, so
+# without unsetting it here the f7_case subprocess below would inherit the
+# LAST test's own `ssh` function instead of ever reaching $F7_STUBBIN/ssh
+# on PATH.
+unset -f ssh
+f7_case "watchdog" 76
+f7_case "bench-cut" 0
 
 echo
 echo "gpu-prove-lane: ${PASS} passed, ${FAIL} failed"

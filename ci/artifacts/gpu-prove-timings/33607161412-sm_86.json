@@ -1,4 +1,15 @@
 {
+  "_doc": [
+    "wall_s (healthy) / wall_lower_bound_s (cut/kill) is the WINDOW",
+    "from the first `::group::` open to the last of {an",
+    "`::endgroup::`, a `PROVE_EXIT=` line, a \"GPU prove suites",
+    "exit=\" driver line} -- it deliberately EXCLUDES the GitHub",
+    "runner's own provisioning/checkout overhead before the first",
+    "group and the short post-job cleanup tail after the driver's",
+    "own exit echo, neither of which belongs to the prove lane's",
+    "own wall or silence accounting. `max_silent_gap_s` is computed",
+    "over the SAME window."
+  ],
   "arch": "sm_86",
   "box": "NVIDIA A40",
   "disposition": {

@@ -79,6 +79,18 @@ ALLOWLIST_PATH = REPO_ROOT / ALLOWLIST_REL
 RUNPOD_LIB_REL = "ci/scripts/runpod_lib.sh"
 RUNPOD_PROVE_REL = "ci/scripts/runpod_gpu_prove.sh"
 
+# The CLOSED set of `outcome` values (matches the producer's own
+# `--outcome` argparse `choices`) -- an unrecognized value (a typo, a
+# renamed value on one side only) is a schema FAIL, never silently ignored.
+# Of these, only `budget-cut`/`watchdog-kill` need an R4 disposition
+# (a genuine cut/kill whose cause is undetermined without one); `healthy`
+# needs none by definition, and `suite-fail`/`capacity` need none EITHER --
+# a suite failure names its own cause in the leg's own suite output, and a
+# capacity skip (exit 75) is a supply condition, not a hang/cut requiring a
+# hand-reviewed disposition.
+OUTCOME_VALUES = frozenset({"healthy", "budget-cut", "watchdog-kill", "suite-fail", "capacity"})
+OUTCOMES_NEEDING_DISPOSITION = frozenset({"budget-cut", "watchdog-kill"})
+
 _GIT_NO_BACKGROUND_MAINTENANCE = ("-c", "gc.auto=0", "-c", "gc.autoDetach=false", "-c", "maintenance.auto=false")
 
 
@@ -229,6 +241,11 @@ def check_schema(artifacts: list[dict]) -> list[str]:
             problems.append(f"schema: {a['_path']}: unreadable/invalid JSON: {a['_load_error']}")
             continue
         outcome = a.get("outcome")
+        if outcome not in OUTCOME_VALUES:
+            problems.append(
+                f"schema: run {a.get('run_id')}/{a.get('arch')}: outcome={outcome!r} is not one of "
+                f"the closed set {sorted(OUTCOME_VALUES)} -- a typo or a renamed value on one side only"
+            )
         if outcome != "healthy" and "wall_s" in a:
             problems.append(
                 f"schema: run {a.get('run_id')}/{a.get('arch')}: outcome={outcome!r} but carries "
@@ -262,7 +279,12 @@ def check_r2(artifacts: list[dict], defaults: dict[str, int]) -> list[str]:
         and (a.get("outcome") == "healthy" or (a.get("disposition") or {}).get("kind") == "slow-host")
     ]
     if not gaps:
-        return problems  # nothing to bound yet (no artifacts at all)
+        # VACUOUS, exactly like R3's own arch-coverage check -- a margin
+        # with nothing to bound it against is never silently accepted as
+        # clean; it is a FAIL demanding at least one healthy or
+        # slow-host-disposed artifact before this rule can mean anything.
+        problems.append("R2: VACUOUS -- no healthy or slow-host-disposed artifact to bound RP_INACTIVITY against")
+        return problems
     max_gap = max(gaps)
     inactivity = defaults.get("rp_inactivity")
     if inactivity is None:
@@ -315,14 +337,18 @@ def check_r3(artifacts: list[dict], defaults: dict[str, int], repo_root: Path = 
 
 
 # --------------------------------------------------------------------------- #
-# R4
+# R4 -- an arm for every non-healthy `outcome` (see OUTCOME_VALUES' own doc):
+# `budget-cut`/`watchdog-kill` REQUIRE a disposition (this is the only arm
+# below); `suite-fail`/`capacity` require NONE, by design, and are simply
+# never visited by this loop -- stated here so that omission reads as a
+# decision, not an oversight.
 # --------------------------------------------------------------------------- #
 def check_r4(artifacts: list[dict]) -> list[str]:
     problems: list[str] = []
     for a in artifacts:
         if "_load_error" in a:
             continue
-        if a.get("outcome") in ("budget-cut", "watchdog-kill"):
+        if a.get("outcome") in OUTCOMES_NEEDING_DISPOSITION:
             disp = a.get("disposition")
             label = f"run {a.get('run_id')}/{a.get('arch')}"
             if not disp:
@@ -343,18 +369,27 @@ def check_r4(artifacts: list[dict]) -> list[str]:
 # --------------------------------------------------------------------------- #
 # R5
 # --------------------------------------------------------------------------- #
-def load_waivers(path: Path = ALLOWLIST_PATH) -> list[tuple[str, str, str]]:
+def load_waivers(path: Path = ALLOWLIST_PATH) -> tuple[list[tuple[str, str, str]], list[str]]:
+    """Returns `(rows, problems)` -- a malformed row (not exactly
+    `<arch><TAB><reviewed_up_to_sha><TAB><reason>`, three tab-separated
+    fields) is a NAMED FAIL in `problems`, never silently skipped: a typo'd
+    tab count must not quietly drop a row from R5's coverage."""
     if not path.is_file():
-        return []
-    out = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+        return [], []
+    rows: list[tuple[str, str, str]] = []
+    problems: list[str] = []
+    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         parts = line.split("\t")
         if len(parts) != 3:
+            problems.append(
+                f"R5 waiver rot: {ALLOWLIST_REL}:{lineno}: malformed row (expected exactly 3 "
+                f"tab-separated fields <arch>\\t<reviewed_up_to_sha>\\t<reason>, got {len(parts)}): {line!r}"
+            )
             continue
-        out.append((parts[0], parts[1], parts[2]))
-    return out
+        rows.append((parts[0], parts[1], parts[2]))
+    return rows, problems
 
 
 def check_r5(
@@ -372,7 +407,9 @@ def check_r5(
 
     manifest = manifest if manifest is not None else prove_surface.load_manifest()
     current_id = prove_surface.current_expected_id(manifest, repo_root)
-    waivers = waivers if waivers is not None else load_waivers()
+    if waivers is None:
+        waivers, waiver_load_problems = load_waivers()
+        problems.extend(waiver_load_problems)
     waived_arches = {w[0] for w in waivers}
 
     fresh_arches = set()
@@ -615,6 +652,14 @@ def _self_test() -> int:
         arts = load_artifacts(root / ARTIFACT_DIR_REL)
         r5 = check_r5(arts, root, manifest, waivers=[("sm_80", head_sha, "no longer needed")])
         check("dead-waiver-r5-caught", any("dead waiver" in p for p in r5), f"{r5}")
+
+    # --- malformed waiver row: a named FAIL, never silently skipped. ---
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        waivers_path = root / "waivers.txt"
+        waivers_path.write_text("sm_80\tonly-two-fields\n# a comment, ignored\n\nsm_86\tdeadbeef\ttoo\tmany\tfields\n")
+        rows, load_problems = load_waivers(waivers_path)
+        check("malformed-waiver-row-caught", len(load_problems) == 2 and rows == [], f"{load_problems} {rows}")
 
     # --- committed setter: a shell assignment AND a YAML env key, both
     # OUTSIDE the two allowed sites; a comment mention must NOT fire.

@@ -121,15 +121,20 @@ rp_prove_verdict() {
   local raw_rc="$1" log="$2"
   declare -A grc_map=()
   local line
-  while IFS= read -r line; do
-    case "$line" in
-      *"PROVE_GROUP_RC "*"name="*"rc="*)
-        local rest="${line#*PROVE_GROUP_RC }"
-        local gname="${rest#name=}"; gname="${gname%% *}"
-        local gval="${rest##*rc=}"; gval="${gval%% *}"
-        grc_map["$gname"]="$gval"
-        ;;
-    esac
+  # `|| [ -n "$line" ]` (BLOCK 3 audit fix): a bare `while IFS= read -r line;
+  # do ...; done < "$log"` silently DROPS the log's final line whenever it
+  # has no trailing newline (`read` returns non-zero at EOF, which ends the
+  # loop BEFORE the body runs for that last read, even though `read` already
+  # populated `line`) -- exactly the shape an abrupt ssh cut leaves behind
+  # (the remote's own last byte written is mid-line). This form still
+  # processes that final, unterminated line. `rp_parse_prove_marker`
+  # (runpod_lib.sh) is the ONE shared grammar/parser both this function and
+  # `rp_run_remote_watched`'s own live-stream bookkeeping use -- never a
+  # second, independently-drifting copy of the same match+extract logic.
+  while IFS= read -r line || [ -n "$line" ]; do
+    if rp_parse_prove_marker "$line"; then
+      grc_map["$RP_PARSED_MARKER_NAME"]="$RP_PARSED_MARKER_RC"
+    fi
   done < "$log"
 
   local has_prove_exit=0

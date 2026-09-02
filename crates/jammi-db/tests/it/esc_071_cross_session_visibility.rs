@@ -1,5 +1,5 @@
-//! esc-071 RED oracle — cross-session catalog read visibility on ONE SQLite
-//! catalog file.
+//! esc-071 RED oracle (`closes_escape: esc-071`) — cross-session catalog read
+//! visibility on ONE SQLite catalog file.
 //!
 //! Contract under test (`docs/guide/src/catalog-and-broker.md:90` "many readers
 //! alongside one writer"; two-sessions-per-process supported per

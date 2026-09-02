@@ -1,5 +1,6 @@
-//! esc-073 RED oracle — a foreign SQLite **library instance** coexisting with a
-//! live engine pool on one catalog file must never kill the process.
+//! esc-073 RED oracle (`closes_escape: esc-073`) — a foreign SQLite **library
+//! instance** coexisting with a live engine pool on one catalog file must never
+//! kill the process.
 //!
 //! Contract under test: a foreign in-process SQLite connection writing to
 //! `catalog.db` while an engine session's pool is live is OUT OF CONTRACT

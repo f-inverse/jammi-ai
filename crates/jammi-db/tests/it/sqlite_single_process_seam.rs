@@ -1,5 +1,5 @@
-//! esc-073 FIX oracle — the SQLite catalog's single-process contract is
-//! enforced by a mechanism, not by prose.
+//! esc-073 FIX oracle (`closes_escape: esc-073`) — the SQLite catalog's
+//! single-process contract is enforced by a mechanism, not by prose.
 //!
 //! `docs/guide/src/catalog-and-broker.md`'s SQLite row states the contract:
 //! one process per catalog file; sharing it corrupts the WAL. Two facts follow

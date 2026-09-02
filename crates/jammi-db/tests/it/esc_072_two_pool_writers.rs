@@ -1,5 +1,5 @@
-//! esc-072 RED oracle — transaction integrity with TWO live pools on one
-//! SQLite catalog file.
+//! esc-072 RED oracle (`closes_escape: esc-072`) — transaction integrity with
+//! TWO live pools on one SQLite catalog file.
 //!
 //! Contract under test: two live sessions in one process on one `catalog.db`,
 //! each running concurrent catalog write loops of the training worker's

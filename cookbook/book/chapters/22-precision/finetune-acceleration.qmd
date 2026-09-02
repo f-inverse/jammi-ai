@@ -15,7 +15,9 @@ exponent is the dtype the original mixed-precision-training recipe *did* need lo
 [@micikevicius2018mixedprecision] — and FlashAttention fuses the whole attention block into one
 IO-aware kernel rather than fusing a single primitive [@dao2022flashattention] · **Rail:**
 measurement (a live fine-tune submitted over the remote `grpc://` client, its per-job
-acceleration report read back through `pending` → `determined`, both dtypes' outcomes asserted)
+acceleration report read back through `pending` — byte-exact and stable, against a live server
+configured not to claim — → `determined` under a claiming successor process that opens the same
+catalog, both dtypes' outcomes asserted)
 + the honest arc (real GPU-only facts — FlashAttention-2's own `f16` admission, and a real
 memory limit that was root-caused and closed, not fabricated shut — cited rather than
 recomputed here).
@@ -79,13 +81,22 @@ assert TINY_MODERNBERT.exists(), f"missing engine fixture: {TINY_MODERNBERT}"
 print(f"encoder: {TINY_MODERNBERT}  (tiny ModernBERT architecture, hidden_size=32)")
 ```
 
-## Standing up the remote server
+## Standing up the remote servers — one artifact directory, two processes in sequence
 
 The same `LiveServer` shape [the model-catalog cache emit](lifecycle.qmd) uses: a real
 `jammi-server` on a loopback port **the kernel assigns to the child itself**, readiness-polled via
 a client handshake, torn down on exit. `jammi-server` must already be on `PATH` — the render
 harness places the freshly built binary there before invoking `quarto render`, exactly as
 `cookbook-render.yml` documents.
+
+This chapter runs **two** such servers, one after the other, over the **same artifact
+directory** — which is why the artifact directory is a constructor *parameter* here rather than
+something the harness invents per instance. Server **A** mounts the training surface but is
+configured not to claim; server **B** is today's ordinary all-in-one. They are strictly
+sequential, never concurrent, because this render's catalog is SQLite and SQLite is a
+single-process store: the first server must have really exited before the second may open the
+same directory. The section below the submission cell says what that buys and what the knob
+actually is.
 
 One detail worth naming, because it is the difference between a chapter that renders and a
 chapter that flakes: this cell never *picks* a port. Binding a socket in this process to learn a
@@ -117,15 +128,27 @@ class LiveServer:
     # The server's own fixed startup banner, printed between bind and serve.
     BANNER = "jammi-server listening "
 
+    def __init__(self, artifact_dir: str, *, run_worker: bool = True) -> None:
+        # The artifact directory is a PARAMETER, not something this harness
+        # invents: the two servers below open the SAME directory in sequence,
+        # which is what makes the job queue observably outlive a process.
+        self._artifact_dir = artifact_dir
+        # `[training] run_worker` — configuration, not a code path. `False`
+        # still mounts and serves the training surface (submissions are
+        # accepted); it only declines to run the claim loop.
+        self._run_worker = run_worker
+        # Set by `__exit__` from the awaited child exit; `None` while running.
+        self.returncode = None
+
     def __enter__(self) -> "LiveServer":
         server_bin = shutil.which("jammi-server")
         assert server_bin, (
             "jammi-server is not on PATH — this chapter needs a real server binary "
             "the render harness builds and places on PATH (see cookbook-render.yml)"
         )
-        self._artifact_dir = tempfile.mkdtemp(prefix="jammi_srv_ftaccel_")
         env = dict(os.environ)
         env["JAMMI_ARTIFACT_DIR"] = self._artifact_dir
+        env["JAMMI_TRAINING__RUN_WORKER"] = "true" if self._run_worker else "false"
         # `:0` on BOTH listeners — the child binds, the kernel assigns, nothing
         # here ever holds-and-releases a port number.
         env["JAMMI_SERVER__FLIGHT_LISTEN"] = "127.0.0.1:0"
@@ -182,19 +205,29 @@ class LiveServer:
         raise RuntimeError("jammi-server did not become ready within 30s")
 
     def __exit__(self, *exc) -> None:
+        """Stop the child and AWAIT its real exit — the release point itself.
+
+        No `kill` fallback and no sidecar poll of the catalog file: a server
+        that will not close on request is a finding, and a successor's
+        successful open is what proves the single-process catalog was released.
+        """
         self.proc.terminate()
-        try:
-            self.proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
+        self.proc.wait(timeout=30)
+        self.returncode = self.proc.returncode
 
 
-server = LiveServer().__enter__()
+# One artifact directory, opened by BOTH servers below, in sequence.
+ARTIFACT_DIR = tempfile.mkdtemp(prefix="jammi_srv_ftaccel_")
+
+# Server A: the training surface is mounted and accepts submissions, but this
+# process never claims — `[training] run_worker = false`.
+server_a = LiveServer(ARTIFACT_DIR, run_worker=False).__enter__()
 # The literal `grpc://` target — the same public front door every other
 # remote-transport chapter in this book opens, over a real live server this
 # render itself just started.
-remote = jammi.connect(f"grpc://127.0.0.1:{server.port}")
-print(f"remote jammi-server up at grpc://127.0.0.1:{server.port}")
+remote_a = jammi.connect(f"grpc://127.0.0.1:{server_a.port}")
+print(f"server A (run_worker=false) up at grpc://127.0.0.1:{server_a.port}")
+print(f"  artifact dir: {ARTIFACT_DIR}")
 ```
 
 ```{python}
@@ -212,7 +245,7 @@ _work = tempfile.mkdtemp(prefix="jammi_ftaccel_corpus_")
 _corpus_path = f"{_work}/pairs.parquet"
 pq.write_table(pa.table(PAIRS), _corpus_path)
 
-remote.add_source("ftaccel_pairs", url=f"file://{_corpus_path}", format="parquet")
+remote_a.add_source("ftaccel_pairs", url=f"file://{_corpus_path}", format="parquet")
 print("registered a 12-row (anchor, positive) pairs source")
 ```
 
@@ -222,26 +255,45 @@ print("registered a 12-row (anchor, positive) pairs source")
 non-empty) — that is the arm that actually materializes a dtype-typed encoder to run the
 acceleration probe against. Submission itself writes `{"state": "pending"}` into the job's report
 column: the job exists, but no worker has claimed it yet, so no device is even known. That marker
-is an **explicit written state**, not an empty column — which is why the read below can pin
-something absolute even though it cannot pin *which* live state it catches: an unset report is
-`None` on this surface (an honest absence of information, deliberately distinguishable from
-`pending`), so a just-submitted job is never `None`.
+is an **explicit written state**, not an empty column: an unset report is `None` on this surface
+(an honest absence of information, deliberately distinguishable from `pending`), so a
+just-submitted job is never `None` — the tri-state is `None` / `pending` / `determined`, and the
+cell below pins the middle one exactly.
 
-**Why the next cell does not assert `pending` byte-exactly.** The server this chapter starts is
-an all-in-one deployment: mounting the `train` tier is what makes `fine_tune` callable at all,
-and that same tier runs the claiming worker *inside this server*. So between the submit RPC
-returning and the status RPC landing, that worker's claim loop may already have claimed this job,
-resolved the device and replaced the marker with a `"determined"` report — a genuine race, not a
-flake, and one a slower (2-vCPU) render machine loses more often than a fast one. There is **no
-public surface on this client to submit a job with the worker paused** — no "queue only" mode, no
-claim-holding handle; turning the `train` tier off to stop the worker removes submission along
-with it. That is reported here as a gap in the public surface rather than papered over: this
-chapter will not sleep to widen a window, and will not assert a state it cannot deterministically
-observe. It therefore asserts (a) the race-free fact — never `None`, a real marker was written at
-submission — and (b) whichever of the two legal live states it caught, **byte-exactly, in that
-state's own branch**: a report that is neither is a real contract violation and still fails here.
-The byte-exact `"determined"` assertions then land after `wait()`, where the job is terminal and
-nothing races the read.
+**What this section used to concede, and what changed.** Until recently the server this chapter
+started was necessarily an all-in-one deployment: mounting the `train` tier is what makes
+`fine_tune` callable at all, and that same tier ran the claiming worker *inside the very process
+that accepted the submission*. Between the submit RPC returning and the status RPC landing, that
+worker's claim loop could already have claimed the job, resolved the device and replaced the
+marker with a `"determined"` report — a genuine race, not a flake, and one a slower (2-vCPU)
+render machine lost more often than a fast one. So this section asserted the race-free fact
+(never `None`) plus *whichever of the two legal live states it caught*, byte-exactly inside that
+state's own branch. That two-branch form was the honest previous state, and it is worth saying
+why: it never loosened an assertion, it conceded only the **choice** between two assertions,
+because a state the chapter could not deterministically observe is a state it must not claim to
+have measured.
+
+What changed is not a code path — it is **configuration**. `TrainingConfig::run_worker`
+(`crates/jammi-db/src/config.rs`) is a runtime setting that answers exactly one question: does
+THIS process run the training claim loop? With `[training] run_worker = false` (or the
+environment override `JAMMI_TRAINING__RUN_WORKER=false`) the process still mounts and serves the
+training surface and still accepts submissions — it simply never claims, and submitted jobs stay
+`queued`. Submission and claiming, previously welded together by the tier mount, are separable by
+a deployment knob; and because it is one key read by whatever arm decides whether to spawn the
+loop, the same knob is honored identically by a server over the wire and by the embedded,
+in-process arm — not two settings that have to be kept in agreement. The race below is therefore
+not *widened*, it is **removed**: with no claimant in the process, `pending` is not a window to be
+caught, it is the job's steady state. The two-branch concession is deleted rather than loosened,
+and what replaces it is strictly stronger — one byte-exact dict and one byte-exact status string,
+asserted on **every** poll of a multi-poll window that outlasts a claiming worker's own idle poll.
+
+Sleeping is precisely what the previous version refused to do, so it is worth being exact about
+why it is correct here. A sleep that widens a race window is a way of *making a flaky assertion
+pass*; a sleep that spans more than the interval a claimant would have woken on is a way of
+*demonstrating that nothing claims*. The first hides a state the chapter cannot observe; the
+second measures one it can. `TrainingConfig`'s default `idle_poll_secs = 1` — the interval an idle
+worker polls for a queued job on — is the number that has to be exceeded, and the span below
+exceeds it.
 
 ```{python}
 import json
@@ -249,7 +301,7 @@ import json
 BASE_MODEL = f"local:{TINY_MODERNBERT}"
 TARGET_MODULES = ["Wqkv", "Wo", "Wi"]  # ModernBERT's own LoRA-eligible linear names
 
-job_f16 = remote.fine_tune(
+job_a = remote_a.fine_tune(
     source="ftaccel_pairs",
     base_model=BASE_MODEL,
     columns=["anchor", "positive"],
@@ -261,26 +313,100 @@ job_f16 = remote.fine_tune(
     backbone_dtype="f16",
     target_modules=TARGET_MODULES,
 )
+JOB_A_ID, JOB_A_MODEL_ID = job_a.job_id, job_a.model_id
+print(f"submitted job {JOB_A_ID} to a server that does not claim")
 
-# Read the report BEFORE waiting. Race-free part first: submission ALWAYS
-# writes a marker, so this is never `None` — `None` is reserved for a genuinely
-# unset column, an absence of information, never an acceleration-state claim.
-at_submit = job_f16.acceleration_report()
-print("immediately after submit:", at_submit)
-assert at_submit is not None, "a just-submitted job must carry a written marker, not an unset one"
+# `TrainingConfig`'s own default idle poll — the interval a CLAIMING process
+# wakes on to look for a queued job. The observation span below must EXCEED it,
+# or "still pending" would prove nothing about claiming.
+WORKER_IDLE_POLL_SECONDS = 1.0
+POLL_COUNT = 4
+POLL_GAP_SECONDS = 0.5
 
-# Racy part, pinned honestly: the in-server worker may already have claimed.
-# Exactly two states are legal at this instant, and each is asserted BYTE-EXACT
-# in its own branch — nothing is loosened, only the choice between them is
-# conceded to the race the prose above names.
-if at_submit["state"] == "pending":
-    assert at_submit == {"state": "pending"}, at_submit
-    print("  -> caught the submission-time marker (the worker had not claimed yet)")
-else:
-    assert at_submit["state"] == "determined", at_submit
-    print("  -> the in-server worker claimed before this read; already determined")
+observed = []
+t0 = time.monotonic()
+for i in range(POLL_COUNT):
+    if i:
+        time.sleep(POLL_GAP_SECONDS)
+    report, status = job_a.acceleration_report(), job_a.status()
+    observed.append((time.monotonic() - t0, report, status))
+    # Byte-exact on the PARSED dict and the status string, EVERY poll. One
+    # value each, no branch: with no claimant in this process there is exactly
+    # one legal answer, and a `determined` report here would be a real bug.
+    assert report == {"state": "pending"}, report
+    assert status == "queued", status
 
+for at, report, status in observed:
+    print(f"  t+{at:>4.2f}s  acceleration_report()={report}  status()={status!r}")
+
+span = observed[-1][0]
+assert len(observed) >= 3, observed
+assert span > WORKER_IDLE_POLL_SECONDS, span
+print(
+    f"\nstable: {len(observed)} polls spanning {span:.2f}s > the {WORKER_IDLE_POLL_SECONDS}s "
+    "worker idle poll — pending is this job's steady state, not a window"
+)
+```
+
+## Handing the queue to a claiming process
+
+Server A has done everything a submission-only deployment can do: the job is real, queued, and
+recorded in the catalog. To determine anything about it, something has to *claim* it — and the
+claim is what computes the `"determined"` report the rest of this chapter measures.
+
+The order below is forced by the store, not chosen for convenience. This render's catalog is
+SQLite, a single-process store, so server A must have really exited before server B may open the
+same artifact directory — and the successor's successful open is itself the proof that the
+predecessor released the catalog, rather than a sidecar poll of a lock file or a sleep-and-hope.
+On Postgres the same knob composes differently and better: a multi-process catalog lets a
+`run_worker = false` submission front end and a `run_worker = true` worker run **concurrently**,
+which is the deployment shape the flag exists for. The strict sequencing here is SQLite's
+constraint showing through, not the flag's.
+
+What survives the process boundary is the queue itself. Server B is today's ordinary all-in-one —
+no override, `run_worker` at its default `true` — and it claims a job it never accepted, submitted
+by a process that no longer exists, because the job lives in the catalog rather than in either
+server's memory. On SQLite that is the rule in general: a queued job is claimed by the next
+claiming process that opens the directory.
+
+```{python}
+# Server A closes FIRST, and the close is AWAITED — a single-process store is
+# not released until the process is really gone.
+remote_a.close()
+server_a.__exit__(None, None, None)
+assert server_a.returncode is not None, "server A did not exit"
+print(f"server A closed (returncode={server_a.returncode})")
+
+# Server B: today's all-in-one, no override, `run_worker` at its default. That
+# this open SUCCEEDS on the same directory is the release proof.
+server_b = LiveServer(ARTIFACT_DIR).__enter__()
+remote = jammi.connect(f"grpc://127.0.0.1:{server_b.port}")
+print(f"server B (default run_worker) up at grpc://127.0.0.1:{server_b.port}, same artifact dir")
+```
+
+One surface gap, named where it was found rather than smoothed over: `fine_tune` returns a
+`jammi.RemoteTrainingJob` — a public, exported handle class — but no public verb re-attaches such
+a handle to an existing job id over a *different* connection. Server A's handle died with server
+A's channel, so the cell below constructs that same public class against server B's connection,
+reading the two transport values off the connection object directly. That is the chapter reaching
+past the public surface, and it is reported as the missing verb it is — a `training_job(job_id)`
+re-attach, on both transports — never presented as the intended way to do this.
+
+```{python}
+# Job A, over server B's connection. Same job id — nothing is resubmitted.
+job_f16 = jammi.RemoteTrainingJob(
+    remote._training,
+    remote._metadata,
+    job_id=JOB_A_ID,
+    model_id=JOB_A_MODEL_ID,
+)
+assert job_f16.job_id == JOB_A_ID
+
+# The queue outlived the process that accepted it: a job server B never saw
+# submitted leaves `queued` under server B's own claim loop.
 job_f16.wait()
+assert job_f16.status() == "completed", job_f16.status()
+
 report_f16 = job_f16.acceleration_report()
 print(json.dumps(report_f16, indent=2, sort_keys=True))
 
@@ -434,7 +560,7 @@ print("\nbf16 fine-tuning was refused loud, with the typed remedy message pointi
 ```{python}
 # | echo: false
 remote.close()
-server.__exit__(None, None, None)
+server_b.__exit__(None, None, None)
 ```
 
 ## Measured on real GPU hardware, not here
@@ -580,7 +706,11 @@ honest "no independent signal", never a smoothed-over claim.
 > determination has to be *computed and read back*, not assumed — `{"state": "pending"}` at
 > submission, `{"state": "determined", "ops": {...}, "flash": {...}}` once a worker resolves a
 > device, each entry carrying the SAME `Hold`/`Miss` + `reason` vocabulary the kernel's own
-> admission gate produces. On this render's CPU-only server every `ops` entry this chapter
+> admission gate produces. Both halves are observed here over live servers because submission and
+> claiming are separable by **configuration** (`TrainingConfig::run_worker`), not by a second code
+> path: one process accepts and never claims, a second opens the same catalog and claims what the
+> first accepted — which also makes the queue's survival across a process boundary a measured
+> fact rather than a design claim. On this render's CPU-only server every `ops` entry this chapter
 > measured is real (the nine named primitives genuinely `Hold` — a portable, dtype-only domain
 > check `f16` now clears everywhere it is dtype-eligible, including the backward-pass cast
 > boundary its report key names dtype-neutrally and the `f32`-domain optimizer step — while

@@ -6,7 +6,57 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+### Added
+- **An explicit catalog release handshake, at every layer.**
+  `CatalogBackend::close` (`crates/jammi-db/src/catalog/backend.rs:88`),
+  `Catalog::close` (`crates/jammi-db/src/catalog/mod.rs:93`), and
+  `JammiSession::close` (`crates/jammi-db/src/session.rs:879`) close the
+  catalog connection pool and await the drain. Dropping a handle is not a
+  release point: `sqlx` returns pooled connections from a background task,
+  so the pool's connections — and, for SQLite, the process-exclusive file
+  lock and the `catalog.db-wal` sidecar they keep alive — outlive the drop
+  for an unbounded time. Anything that hands the catalog *directory* to
+  another party (a seed-then-spawn handoff, or an embedding host whose
+  caller opens the same file through a different SQLite library instance)
+  awaits `close()` first.
+- **`close()` on the Python client's embedded transport**
+  (`clients/python/jammi/_embedded.py:168`, `c3dbddbd`) — a delegation to
+  that same engine handshake: the training worker is stopped, then the
+  catalog pool is closed and awaited. `EmbeddedBackend.__exit__` calls it,
+  so a `with` block is a scoped resource on both transports rather than on
+  one.
+- **The `unix-excl` SQLite seam.** On unix the catalog pool opens through
+  SQLite's `unix-excl` VFS
+  (`crates/jammi-db/src/catalog/backend_sqlite.rs:124`, `catalog_vfs`), so a
+  second process on the same catalog directory is refused with a typed error
+  rather than faulting. `JAMMI_SQLITE_VFS` (`SQLITE_VFS_ENV`, same file
+  `:116`) is the one operator knob and is diagnostic only: unset selects the
+  seam, `default` restores the platform VFS and re-arms the failure the seam
+  closes. Engaging it logs a `WARN`; it is never set in production.
+
+### Changed
+- **Embedded `Session.close()` is an awaited release, not a documented RAII
+  no-op.** It previously raised `NotSupportedOnBackend` on the claim that the
+  embedded engine released its resources on drop; under the `unix-excl` seam
+  that claim was false, and `close()` is now the one bounded point at which
+  the artifact directory becomes somebody else's to open. Idempotent, and
+  every verb on the session afterwards raises `BackendError` — never a
+  silent no-op.
+- **Use-after-close raises `BackendError` on the remote transport too**, so
+  the two arms carry one contract (`clients/python/jammi/_backend.py:83`).
+  What each releases still differs — the gRPC and Flight channels remote,
+  the catalog file embedded — the contract does not.
+
 ### Removed
+- **`Capability.CLOSE`, from the Python client `jammi`.** A public API
+  break: `Capability.CLOSE` no longer exists, so `supports(Capability.CLOSE)`
+  and any `except NotSupportedOnBackend` guarding a `close()` call have
+  nothing to reference. Migration: call `close()` unconditionally, or use the
+  session as a context manager. A capability names a feature that genuinely
+  diverges between the two transports, and a flag every backend sets is a
+  predicate that never discriminates — the closed set is now FOUR members:
+  `AUDIT`, `EPHEMERAL_SESSION`, `PRELOAD_MODEL` (embedded only) and
+  `SESSION_ID` (remote only) (`clients/python/jammi/_capability.py:30`).
 - **The `axpy` fused kernel (`jammi-kernels`), and the compiled-only
   capability category that held it.** The op had real CUDA kernels and
   dispatch arms but no `admit()` call site and no admitted parent launching
@@ -23,6 +73,13 @@ workspace ships every publishable crate at the same
   empty slot the next unwired kernel gets filed into, so a kernel with no
   admission site and no admitted parent now has no manifest category at
   all — it is wired or deleted in the same unit as its authoring.
+
+### Breaking
+- `CatalogBackend` trait grew a new required method `close`
+  (`crates/jammi-db/src/catalog/backend.rs:88`). Any out-of-tree implementor
+  must add it; the workspace has no such callers. Migration: return a future
+  that closes the backend's pool and awaits the drain — a backend with
+  nothing to release returns an immediately-ready future.
 
 ## [0.48.0] - 2026-08-30
 

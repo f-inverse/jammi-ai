@@ -87,6 +87,27 @@ default_batch_size = 8
 # Checkpoint every N fraction of training. Default: 0.1.
 checkpoint_fraction = 0.1
 
+[training]
+# Whether THIS process runs the training claim loop. Default: true.
+# true  - the process claims queued jobs, renews the lease while they run,
+#         and reclaims leases that expired under a dead claimant.
+# false - the process still mounts and serves the training surface and still
+#         accepts submissions, but never claims. Submitted jobs stay queued
+#         until some process with run_worker = true opens the catalog. The
+#         SQLite catalog is single-process, so this process must close the
+#         catalog before that one can open it; a Postgres catalog is
+#         multi-process and can run both at once.
+run_worker = true
+# How long a claim leases a job before it is reclaimable. Default: 30.
+lease_duration_secs = 30
+# How often the worker renews the lease while a job runs. Must leave a real
+# margin under the lease (heartbeat_interval_secs * 2 < lease_duration_secs),
+# so a single missed beat does not drop a live worker's lease. Default: 10.
+heartbeat_interval_secs = 10
+# How often an idle worker polls for a queued job (and reclaims expired
+# leases). Must be > 0 - a zero poll is a busy-loop. Default: 1.
+idle_poll_secs = 1
+
 [cache]
 # Enable ANN query cache. Default: true.
 ann_cache_enabled = true
@@ -114,15 +135,44 @@ format = "text"
 
 ## Environment variable overrides
 
-Every config field can be overridden with an environment variable using the pattern `JAMMI_<SECTION>__<FIELD>`:
+The loader reads the environment variables below, and only these. Each name
+follows the pattern `JAMMI_<SECTION>__<FIELD>` — note the double underscore
+(`__`) separating section from field — but the pattern describes the names
+that exist, it does not generate them. A config field with no row here has no
+environment override, and setting a plausible-looking name for one
+(`JAMMI_TRAINING__LEASE_DURATION_SECS`, say) does nothing at all rather than
+failing. Set it in the file.
 
 | Variable | Overrides |
 |----------|-----------|
 | `JAMMI_ARTIFACT_DIR` | `artifact_dir` |
 | `JAMMI_ENGINE__BATCH_SIZE` | `engine.batch_size` |
+| `JAMMI_ENGINE__EXECUTION_THREADS` | `engine.execution_threads` |
+| `JAMMI_ENGINE__MEMORY_LIMIT` | `engine.memory_limit` |
 | `JAMMI_GPU__DEVICE` | `gpu.device` |
+| `JAMMI_GPU__MEMORY_FRACTION` | `gpu.memory_fraction` |
+| `JAMMI_GPU__MEMORY_LIMIT` | `gpu.memory_limit` |
 | `JAMMI_GPU__REQUIRE_GPU` | `gpu.require_gpu` |
 | `JAMMI_INFERENCE__BATCH_SIZE` | `inference.batch_size` |
+| `JAMMI_INFERENCE__BATCH_TIMEOUT_SECS` | `inference.batch_timeout_secs` |
+| `JAMMI_INFERENCE__DEFAULT_BACKEND` | `inference.default_backend` |
+| `JAMMI_INFERENCE__MAX_LOADED_MODELS` | `inference.max_loaded_models` |
+| `JAMMI_LOGGING__FORMAT` | `logging.format` |
 | `JAMMI_LOGGING__LEVEL` | `logging.level` |
+| `JAMMI_SERVER__FLIGHT_LISTEN` | `server.flight_listen` |
+| `JAMMI_SERVER__HEALTH_LISTEN` | `server.health_listen` |
+| `JAMMI_SERVER__SERVICES` | `server.services` |
+| `JAMMI_TRAINING__RUN_WORKER` | `training.run_worker` |
 
-Note the double underscore (`__`) separating section and field.
+`JAMMI_CONFIG` is not in the table because it is not an override: it names
+which config *file* to load.
+
+`JAMMI_TRAINING__RUN_WORKER` is a boolean override (`TrainingConfig::run_worker`
+in `crates/jammi-db/src/config.rs`). It accepts `true`, `false`, `1`, and `0`,
+case-insensitively and with surrounding whitespace trimmed. Any other value —
+including an empty one — fails the config load with an error naming the
+variable, the rejected value, and the accepted set. It is not ignored and does
+not fall back to the file's value: a yes/no question about what the process
+will do has no safe direction to guess in, and silently dropping the override
+would leave the process doing the opposite of what was written, with nothing
+in the config file to explain it.

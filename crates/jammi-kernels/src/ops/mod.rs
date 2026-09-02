@@ -1,7 +1,26 @@
-//! Fused `CustomOp` implementations. `Axpy` is the proof op establishing the
-//! pattern every later fused op (LayerNorm, RoPE, softmax, GeGLU) copies:
-//! real CPU forward+backward and a feature-gated CUDA forward loaded from
-//! build-time PTX.
+//! Fused `CustomOp` implementations. Every op here follows one pattern:
+//! a real CPU forward+backward and a feature-gated CUDA forward loaded
+//! from build-time PTX. [`LayerNormFused`] is the worked example this doc
+//! points at throughout — it exercises the whole pattern end to end (CPU
+//! forward AND backward, a `CustomOp3` backward helper, a CUDA arm) and
+//! sits on a shipped dispatch path.
+//!
+//! **Every op here is required to be reachable from a real dispatch path
+//! in this workspace** — either through its own [`crate::admission::admit`]
+//! site, or by a bare launch from inside an already-admitted parent's arm
+//! (see [`crate::admission::PROBED_OPS`]' own doc for that split, and
+//! `ci/release-feature-manifest.json` for the per-lane declaration the
+//! `capability_surface` suite cross-checks that table against). A fused
+//! kernel that only demonstrates the pattern, with no consumer at all,
+//! carries maintenance cost instead of proving anything: campaign #446
+//! W2-B removed the one such op this module still had (a toy
+//! `y' = alpha * x + y`) after a CUDA census measured the work it could
+//! have replaced at 0.0074% / 0.0259% / 0.0269% of per-step GPU time on
+//! the shipped f32 / bf16 / f16 ModernBERT-large legs, against a wire bar
+//! of 2.0% registered before any leg ran — measured by
+//! `crates/jammi-kernels/artifacts/cuda-runs/2026-09-01-axpy-census-bdeb80c-a100-pcie.json`,
+//! which also records why the eager-AdamW control leg's 1.65% cannot
+//! carry a wire decision (it is a fallback the shipped path never takes).
 //!
 //! **Statelessness is TOTAL for the `applyN` family** ([`apply1`],
 //! [`apply2`], [`apply3`]): every op reachable through them is [`KernelOp`]
@@ -16,8 +35,8 @@
 //! caught by `10b1f3b`'s audit (BLOCKING finding 4). `StatefulKernelOp`'s
 //! blanket impl (below) requires only `Send + Sync + 'static + Sealed` —
 //! it drops the `Copy` requirement entirely, it does not additionally
-//! FORBID `Copy`. So every existing `KernelOp` op (e.g. [`Axpy`], which is
-//! `Copy`) ALSO satisfies `StatefulKernelOp`'s bound; the set of types
+//! FORBID `Copy`. So every existing `KernelOp` op (e.g.
+//! [`ScaledCastAdd`], which is `Copy`) ALSO satisfies `StatefulKernelOp`'s bound; the set of types
 //! implementing `StatefulKernelOp` is a SUPERSET of those implementing
 //! `KernelOp`, not a disjoint set. What genuinely IS one-directional and
 //! load-bearing: a type holding an OWNED [`Saved`] field can never be
@@ -72,6 +91,35 @@
 //!   value, regardless of what it points to). That class of statefulness
 //!   is a REVIEW concern this bound cannot catch at compile time — stated
 //!   here explicitly rather than left as an overclaim.
+//!
+//! ## `is_variable()` is NOT a "does this need a gradient?" gate
+//!
+//! Shared hazard, stated once here because nearly every `bwd` in this
+//! module has to make the same call. `Tensor::is_variable() == false` does
+//! NOT mean "no gradient needed": it cannot distinguish a genuine frozen
+//! external constant from an INTERMEDIATE on a path to a `Var` (e.g.
+//! `w.affine(2.0, 0.0)` where `w` IS a `Var` — the intermediate is not
+//! itself a variable, yet the chain rule needs its gradient). A `bwd` that
+//! returns `None` for a slot because `is_variable()` was false therefore
+//! BREAKS the chain rule silently for every caller who reached the op
+//! through an intermediate: candle's backward walk gets no gradient to
+//! propagate, and the upstream `Var` is updated as if that path did not
+//! exist. No error, a confident wrong number.
+//!
+//! So the default in this module is: `bwd` ALWAYS returns `Some` for every
+//! differentiable input slot, computing a real gradient even where the
+//! path is provably dead at today's call sites (correctness over
+//! micro-optimization — a dead branch that is correct costs one unused
+//! composition; a hardcoded `None` that later becomes reachable costs a
+//! silent training bug). The two sanctioned exceptions gate on something
+//! STRUCTURAL rather than on `is_variable()` alone —
+//! [`LayerNormFused`]'s `dgamma_needed` (a leaf module parameter that
+//! cannot be an intermediate by construction; see its module doc) and
+//! [`RopeFused`]'s `track_op()` check on `dcos`/`dsin` (see its module
+//! doc for why `track_op()` is the narrower, safe predicate). Every op's
+//! own oracle suite pins the intermediate case with a
+//! `bwd_chains_through_an_intermediate_non_variable_x`-style regression
+//! test.
 
 use candle_core::backend::BackendStorage;
 use candle_core::{
@@ -80,13 +128,13 @@ use candle_core::{
 };
 
 mod adamw_step;
-// `pub(crate)`, not private like `axpy`/`layer_norm`/`rope`: `crate::cuda::attention_block`
+// `pub(crate)`, not private like `adamw_step`/`cast_scale`/`scaled_cast_add`:
+// `crate::cuda::attention_block`
 // imports `attention_dims`/`check_mask`/`check_rope_pack` directly from here
 // (the SAME domain checks the CPU arm applies), mirroring `ops::softmax`'s
 // identical `pub(crate)` rationale.
 pub(crate) mod attention_block;
-mod axpy;
-// Private, like `axpy`/`scaled_cast_add`: `crate::cuda::cast_scale` does its
+// Private, like `adamw_step`/`scaled_cast_add`: `crate::cuda::cast_scale` does its
 // own domain checks directly (mirroring `crate::cuda::scaled_cast_add`'s
 // shape) rather than importing a shared helper from here.
 mod cast_scale;
@@ -97,7 +145,7 @@ mod dropout;
 // `KernelOp`.
 #[cfg(feature = "flash-attn")]
 pub(crate) mod flash_attention;
-// `pub(crate)`, not private like `axpy`/`scaled_cast_add`: each op's CUDA
+// `pub(crate)`, not private like `cast_scale`/`scaled_cast_add`: each op's CUDA
 // glue (`crate::cuda::geglu`/`layer_norm`/`rope`/`softmax`) imports its
 // shared dims/domain helper (`geglu_dims`/`output_shape`/`check_variant`,
 // `hidden_of`, `rope_dims`, `softmax_dims`) directly from here rather than
@@ -105,6 +153,22 @@ pub(crate) mod flash_attention;
 // op's domain check, not two that could silently drift apart.
 pub(crate) mod geglu;
 pub(crate) mod layer_norm;
+// NOT an op module (the only one in this list): the CUDA launch-domain
+// facts every op's CUDA glue shares — the `u32::MAX` element-count
+// ceiling and the grid-stride launch geometry. They live HERE, not in
+// `crate::cuda`, precisely because `mod cuda` is `#[cfg(feature =
+// "cuda")]`: a unit test of these pure-arithmetic rules placed there
+// would only ever compile on a CUDA-feature build, i.e. never on the CPU
+// lane that can actually prove them. `crate::cuda::mod` re-exports
+// (never re-implements) them — see the module's own doc for the full
+// indexing contract (campaign #446, finding 4).
+//
+// `dead_code` without the `cuda` feature is HONEST, not suppressed noise:
+// nothing outside `crate::cuda` calls these, so on a CPU-only build the
+// only consumers are this module's own tests (which `#[cfg(test)]` hides
+// from the lint).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) mod launch_domain;
 pub(crate) mod low_rank_residual_linear;
 // Private, mirroring `flash_attention`'s own `StatefulKernelOp` shape (a
 // `Saved<Tensor>` `lse` field — see that module's doc for why a stateful
@@ -168,7 +232,6 @@ pub const ATTENTION_BLOCK_MAX_SEQ: usize = attention_block::MAX_SEQ;
 /// crates agree exactly (family F: a measured, asserted equality, not an
 /// assumed one).
 pub const ATTENTION_BLOCK_WINDOW_MASKED_VALUE: f32 = attention_block::WINDOW_MASKED_VALUE;
-pub use axpy::Axpy;
 /// TEST-ONLY preallocated-output entry points (doc-hidden in
 /// `ops::cast_scale`'s own doc — see there for why they exist:
 /// `tests/cuda_parity.rs`'s isolated-timing harness needs to separate a
@@ -219,8 +282,8 @@ mod sealed {
 /// enforcement is total (via [`apply2`]/[`apply3`]) rather than a per-op
 /// opt-in assertion. `'static` matches `CustomOp2`/`CustomOp3`'s own bound
 /// on `apply_op2`/`apply_op3` (an op carries no borrowed data — every
-/// field is owned, plain construction data like `Axpy::alpha` or
-/// `LayerNormFused::eps`).
+/// field is owned, plain construction data like `ScaledCastAdd::scaling`
+/// or `LayerNormFused::eps`).
 ///
 /// Deliberately NOT bounded by `CustomOp2` (or any specific arity) here:
 /// `LayerNormFused`'s backward recomputes `dx` through an internal

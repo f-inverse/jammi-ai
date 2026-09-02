@@ -6,7 +6,7 @@ use half::{bf16, f16};
 use super::{PTX_SCALED_CAST_ADD, PTX_SCALED_CAST_ADD_F16};
 
 /// The kernel module name PTX functions are loaded under — arbitrary, but
-/// stable and unique to this op (mirrors `crate::cuda::axpy::MODULE_NAME`).
+/// stable and unique to this op (see `crate::cuda`'s module doc).
 const MODULE_NAME: &str = "jammi_kernels_scaled_cast_add";
 
 /// The F16 arms' OWN PTX module name (campaign #443 W2c) —
@@ -36,7 +36,7 @@ pub(crate) fn cuda_fwd(
 
     // Contiguity is checked FIRST, unconditionally -- even before the
     // `n == 0` fast path below -- so this arm's own domain (`RequiresContiguous`,
-    // the same nonzero-start_offset rationale as `crate::cuda::axpy::cuda_fwd`)
+    // the same nonzero-start_offset rationale `crate::cuda`'s module doc gives)
     // applies identically to an empty tensor rather than being silently
     // ADMITTED through the fast path (`cpu_fwd` itself never requires
     // contiguity -- it walks `StridedOffsets` -- so this is the CUDA arm's
@@ -90,9 +90,9 @@ pub(crate) fn cuda_fwd(
         ));
     }
 
-    // K2 (refuse, don't compute past the domain): see `crate::cuda::axpy`'s
-    // identical comment — the launch grid and the kernel's own bounds
-    // check are both 32-bit.
+    // K2 (refuse, don't compute past the domain): see
+    // `crate::ops::launch_domain::check_elem_count_fits_u32`'s own doc —
+    // the launch grid and the kernel's own bounds check are both 32-bit.
     super::check_elem_count_fits_u32("scaled_cast_add", n)?;
 
     let cfg = super::elemwise_launch_config(n as u32);

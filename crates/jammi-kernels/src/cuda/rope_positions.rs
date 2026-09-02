@@ -7,7 +7,7 @@ use super::{PTX_ROPE_POSITIONS, PTX_ROPE_POSITIONS_F16};
 use crate::ops::rope_positions::{rope_positions_dims, PositionArm};
 use crate::ops::MAX_HEAD_DIM;
 
-/// See `../axpy.rs`'s identical constant for the module-name rationale.
+/// See `crate::cuda`'s module doc for the module-name rationale.
 const MODULE_NAME: &str = "jammi_kernels_rope_positions";
 
 /// The F16 arm's OWN PTX module name (campaign #443 W2c) —

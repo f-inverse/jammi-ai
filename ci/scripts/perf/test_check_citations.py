@@ -31,11 +31,15 @@ class CheckCitationsFixture(unittest.TestCase):
 
         self._orig_known_files = cc._KNOWN_FILES
         self._orig_roots = cc._SEARCH_ROOTS
+        self._orig_doc_roots = cc._DOC_SEARCH_ROOTS
+        self._orig_repo_root = cc.REPO_ROOT
         self.addCleanup(self._restore)
 
     def _restore(self):
         cc._KNOWN_FILES = self._orig_known_files
         cc._SEARCH_ROOTS = self._orig_roots
+        cc._DOC_SEARCH_ROOTS = self._orig_doc_roots
+        cc.REPO_ROOT = self._orig_repo_root
 
     def _write(self, rel: str, content: str) -> Path:
         path = self.root / rel
@@ -321,6 +325,142 @@ class SearchRootsTests(CheckCitationsFixture):
         cuda_runs = cc.REPO_ROOT / "crates" / "jammi-kernels" / "artifacts" / "cuda-runs"
         self.assertIn(cuda_runs, real_roots)
         self.assertTrue(cuda_runs.is_dir())
+
+
+class MaintainerGuideFullPathTests(CheckCitationsFixture):
+    """The FULL-PATH citation form the maintainer guides use (module doc's
+    "A maintainer guide's citations are resolved by FULL PATH" section).
+
+    Every test builds a throwaway repo-shaped fixture — a `ci/scripts/`
+    target plus a `docs/maintainer/` citing doc — and points
+    `REPO_ROOT`/`_DOC_SEARCH_ROOTS`/`_SEARCH_ROOTS` at it, so none of this
+    depends on the real repo's own (constantly changing) citation
+    inventory. `_KNOWN_FILES` is collapsed to a single unrelated entry so
+    the BASENAME form can never be what makes an assertion pass here.
+    """
+
+    def _repo_fixture(self, target_body: str, doc_body: str) -> Path:
+        self._write("target/unrelated.rs", "nothing\n")
+        cc._KNOWN_FILES = {"unrelated.rs": self.root / "target" / "unrelated.rs"}
+        self._write("ci/scripts/thing.sh", target_body)
+        doc = self._write("docs/maintainer/guide.md", doc_body)
+        cc.REPO_ROOT = self.root
+        cc._SEARCH_ROOTS = ()
+        cc._DOC_SEARCH_ROOTS = (self.root / "docs" / "maintainer",)
+        return doc
+
+    def test_a_resolved_full_path_citation_passes(self):
+        doc = self._repo_fixture(
+            "first line\nrp_tree_dir() {\n",
+            "the tree resolver `rp_tree_dir` (`ci/scripts/thing.sh:2`) does it\n",
+        )
+        self.assertEqual(cc.check_file(doc), [])
+        self.assertEqual(cc.main(), 0)
+
+    def test_an_in_bounds_but_stale_full_path_citation_fails(self):
+        """RED proof, and the ONE predicate an in-bounds-only check misses:
+        the cited line still EXISTS, so a bounds check reads green — only
+        the adjacent-identifier rule catches that it now names unrelated
+        code. This is exactly the shape that made most of the pod-build
+        guide's stale citations invisible: in bounds, pointing at nothing
+        related.
+        """
+        doc = self._repo_fixture(
+            "first line\nsomething_else_entirely() {\n",
+            "the tree resolver `rp_tree_dir` (`ci/scripts/thing.sh:2`) does it\n",
+        )
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1)
+        self.assertIn("STALE", violations[0].message)
+        self.assertEqual(cc.main(), 1)
+
+    def test_a_bare_full_path_citation_with_no_adjacent_identifier_fails(self):
+        doc = self._repo_fixture(
+            "first line\nrp_tree_dir() {\n",
+            "the tree resolver does it, see ci/scripts/thing.sh:2 for how\n",
+        )
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1)
+        self.assertIn("no resolvable adjacent backtick-quoted identifier", violations[0].message)
+        self.assertEqual(cc.main(), 1)
+
+    def test_a_full_path_that_does_not_exist_fails_loudly(self):
+        """The loud-failure property `_KNOWN_FILES` provides for the
+        basename form, preserved by a different mechanism for this one: a
+        path that is not in the tree is a Violation, never a silently
+        skipped citation."""
+        doc = self._repo_fixture(
+            "first line\nrp_tree_dir() {\n",
+            "see `rp_tree_dir` (`ci/scripts/no_such_file.sh:2`)\n",
+        )
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1)
+        self.assertIn("does not exist", violations[0].message)
+
+    def test_an_out_of_bounds_full_path_citation_fails(self):
+        doc = self._repo_fixture(
+            "first line\nrp_tree_dir() {\n",
+            "see `rp_tree_dir` (`ci/scripts/thing.sh:99`)\n",
+        )
+        violations = cc.check_file(doc)
+        self.assertEqual(len(violations), 1)
+        self.assertIn("only has 2 lines", violations[0].message)
+
+    def test_a_vendored_third_party_path_is_not_matched_at_all(self):
+        """`cuda-kernel-guide.md` legitimately cites
+        `candle-core-0.11.0/src/op.rs:<n>` — a file that is not in this
+        tree by construction. Matching it would report a MISSING path for a
+        citation that is correct as written, so the prefix allowlist keeps
+        it out of scope entirely rather than needing a per-path exemption.
+        """
+        doc = self._repo_fixture(
+            "first line\nrp_tree_dir() {\n",
+            "candle's own arm (`candle-core-0.11.0/src/op.rs:1002`) computes in f64\n",
+        )
+        self.assertEqual(cc.check_file(doc), [])
+
+    def test_the_full_path_form_is_off_for_non_doc_citing_files(self):
+        """The documented residual, pinned so it cannot drift silently: a
+        `_SEARCH_ROOTS` file's own full-path citation is NOT resolved by
+        this form yet. If a later unit turns it on, this test fails and
+        must be updated deliberately — never a blind spot nobody notices.
+        """
+        self._write("target/unrelated.rs", "nothing\n")
+        cc._KNOWN_FILES = {"unrelated.rs": self.root / "target" / "unrelated.rs"}
+        self._write("ci/scripts/thing.sh", "first line\nrp_tree_dir() {\n")
+        script = self._write(
+            "perf/producer.sh",
+            "# see `totally_wrong` (`ci/scripts/thing.sh:2`)\n",
+        )
+        cc.REPO_ROOT = self.root
+        cc._SEARCH_ROOTS = (self.root / "perf",)
+        cc._DOC_SEARCH_ROOTS = ()
+        self.assertEqual(cc.check_file(script), [])
+
+    def test_a_full_path_wins_over_the_basename_nested_inside_it(self):
+        """A full path whose last component IS a registered `_KNOWN_FILES`
+        basename must be reported ONCE, by the full-path form — never twice
+        (once per form), and never resolved against the basename map's own
+        location for a DIFFERENT file of that name."""
+        self._write("target/thing.sh", "wrong file\nwrong line\n")
+        cc._KNOWN_FILES = {"thing.sh": self.root / "target" / "thing.sh"}
+        self._write("ci/scripts/thing.sh", "first line\nrp_tree_dir() {\n")
+        doc = self._write(
+            "docs/maintainer/guide.md",
+            "see `rp_tree_dir` (`ci/scripts/thing.sh:2`)\n",
+        )
+        cc.REPO_ROOT = self.root
+        cc._SEARCH_ROOTS = ()
+        cc._DOC_SEARCH_ROOTS = (self.root / "docs" / "maintainer",)
+        self.assertEqual(cc.check_file(doc), [])
+
+    def test_real_doc_roots_include_the_maintainer_guides(self):
+        """Drives the REAL (non-monkeypatched) `_DOC_SEARCH_ROOTS` —
+        confirms this addition actually registered, not just a
+        fixture-only code path."""
+        maintainer = cc.REPO_ROOT / "docs" / "maintainer"
+        self.assertIn(maintainer, self._orig_doc_roots)
+        self.assertTrue(maintainer.is_dir())
 
 
 class MainEntryPointTests(CheckCitationsFixture):

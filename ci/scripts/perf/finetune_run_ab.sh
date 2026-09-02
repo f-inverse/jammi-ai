@@ -392,8 +392,10 @@ run_leg() {
     # unit-63 round-4 audit F-1: `main.rs`'s own `--backbone-dtype` default
     # is `f32` (`FinetuneRunArgs::backbone_dtype`'s own `#[arg(long,
     # default_value = "f32")]`), and `flash_capability_gates` DomainMisses
-    # the whole flash cascade whenever `dtype != DType::BF16`
-    # (`jammi-encoders/src/modernbert.rs`'s own `dtype_is_bf16` gate). CONTRACT
+    # the whole flash cascade whenever `dtype` is neither `DType::BF16` nor
+    # `DType::F16` (`jammi-encoders/src/modernbert.rs:2450`'s own
+    # `dtype_is_bf16_or_f16` gate — `f32` is outside that admitted set, and
+    # this script's own default, `bf16`, is inside it). CONTRACT
     # 63 Frame pre-registers the flash cascade as the `fused` arm's own
     # admitted branch, so an unset `--backbone-dtype` (silently f32) makes
     # `attention_block_flash` unable to fire on EITHER arm's real leg --

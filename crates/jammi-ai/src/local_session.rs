@@ -38,6 +38,7 @@ use futures::Stream;
 use jammi_db::catalog::eval_repo::PerQueryEvalRecord;
 use jammi_db::catalog::model_repo::ModelDescriptor;
 use jammi_db::catalog::result_repo::ResultTableRecord;
+use jammi_db::catalog::segment_repo::IndexSegment;
 use jammi_db::catalog::source_repo::SourceDescriptor;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::source::{SourceConnection, SourceType};
@@ -68,12 +69,19 @@ pub use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelSpec};
 /// other verb delegates straight through.
 pub struct Session {
     engine: Arc<InferenceSession>,
-    /// The embedded training worker, present only on the front-door session
-    /// ([`crate::Jammi::open`]) — the one drop point that owns the worker for
-    /// the process's lifetime. Per-request wrappers (gRPC handlers, the Python
-    /// `Database`'s internal session) construct via [`Self::new`] and carry
-    /// `None`, so a worker is not spawned per call. Dropping the front-door
-    /// session stops the worker (RAII). Held for its `Drop`, not read.
+    /// The embedded training worker, present only on a front-door session
+    /// ([`crate::Jammi::open`]) whose config asks this process to claim — the
+    /// one drop point that owns the worker for the process's lifetime.
+    /// Per-request wrappers (gRPC handlers, the Python `Database`'s internal
+    /// session) construct via [`Self::new`] and carry `None`, so a worker is not
+    /// spawned per call. Dropping the front-door session stops the worker
+    /// (RAII). Held for its `Drop`, not read.
+    ///
+    /// `None` is also what a `training.run_worker = false` front door carries
+    /// (see [`Self::with_configured_worker`]): "no claim loop exists in this
+    /// process" is a state the type holds rather than a behaviour a reader has
+    /// to infer, and the drop path has correspondingly nothing to signal or
+    /// abort — `Option::drop` on `None` is a no-op.
     _worker: Option<crate::fine_tune::worker::EmbeddedWorker>,
 }
 
@@ -91,11 +99,20 @@ impl Session {
     }
 
     /// Wrap an engine session and spawn the embedded
-    /// [`crate::fine_tune::worker::TrainingWorker`] the resulting session owns.
-    /// This is the SDK front-door form ([`crate::Jammi::open`]): the embedded
-    /// engine both submits training jobs and runs them, and the worker stops when
-    /// this session drops (RAII). Must be called inside a tokio runtime context
-    /// (the worker spawns a task).
+    /// [`crate::fine_tune::worker::TrainingWorker`] the resulting session owns —
+    /// **unconditionally**, whatever the session's `[training] run_worker` says.
+    /// The embedded engine both submits training jobs and runs them, and the
+    /// worker stops when this session drops (RAII). Must be called inside a
+    /// tokio runtime context (the worker spawns a task).
+    ///
+    /// This is the *explicit* form, for a caller that owns the decision itself
+    /// (a test harness that must have a claimant; an embedder that has already
+    /// decided out of band). The SDK front door ([`crate::Jammi::open`]) does
+    /// **not** use it — it uses [`Self::with_configured_worker`], so that a
+    /// deployment's `training.run_worker` reaches the Rust SDK arm exactly as it
+    /// reaches the server and the Python binding. Reach for this one only when
+    /// "spawn regardless of configuration" is what you mean; the name is a
+    /// promise it keeps.
     ///
     /// Returns [`jammi_db::error::JammiError::Config`] if the session's
     /// `[training]` timing violates the worker invariants; the engine's
@@ -106,6 +123,52 @@ impl Session {
             engine,
             _worker: Some(worker),
         })
+    }
+
+    /// Wrap an engine session and spawn the embedded training worker **only when
+    /// the session's own configuration asks this process to claim** — the SDK
+    /// front-door form ([`crate::Jammi::open`]).
+    ///
+    /// The decision is one key, [`jammi_db::config::TrainingConfig::run_worker`]
+    /// (default `true`), read off `engine`'s loaded config — the SAME key the
+    /// server's `train` tier reads before spawning its worker and the same key
+    /// the Python `Database` reads before spawning its own, so a wire deployment
+    /// and an in-process one answer "does THIS process claim?" identically
+    /// rather than by three private conventions:
+    ///
+    /// * `true` — the claim loop runs here. The embedded engine both submits
+    ///   training jobs and runs them, and the worker stops when this session
+    ///   drops (RAII).
+    /// * `false` — no worker is spawned at all. The training surface is
+    ///   unchanged: [`Self::fine_tune`] still submits and
+    ///   [`Self::fine_tune_status`] still serves status; this process just never
+    ///   claims, so on a single-process catalog (SQLite) a submitted job stays
+    ///   `queued` with its submission-time `{"state":"pending"}` acceleration
+    ///   marker until a process configured to claim opens the directory. On a
+    ///   multi-process catalog (Postgres) a claiming process can run
+    ///   concurrently. Nothing was spawned, so dropping this session has no
+    ///   worker to stop.
+    ///
+    /// Must be called inside a tokio runtime context when a worker is spawned.
+    /// Returns [`jammi_db::error::JammiError::Config`] if the session's
+    /// `[training]` timing violates the worker invariants; the engine's
+    /// `JammiConfig::load` already validated it for the normal front-door flow.
+    pub fn with_configured_worker(engine: Arc<InferenceSession>) -> Result<Self> {
+        if engine.inner_config().training.run_worker {
+            tracing::info!(
+                run_worker = true,
+                "embedded session: training surface available; this process claims queued training jobs"
+            );
+            Self::with_embedded_worker(engine)
+        } else {
+            // No worker exists to stop, so teardown has nothing extra to await:
+            // the `_worker` slot stays `None` and its drop is a no-op.
+            tracing::info!(
+                run_worker = false,
+                "embedded session: training surface available; this process does not claim training jobs"
+            );
+            Ok(Self::new(engine))
+        }
     }
 
     /// The underlying engine session. The in-process affordances that are not
@@ -441,6 +504,21 @@ impl Session {
             .result_store()
             .derives_from(&record.table_name)
             .await
+    }
+
+    /// Every ANN index segment of a result table, ordered by `segment_id` — the
+    /// per-table segment set (`index_segments`) a reader needs to locate and
+    /// size each immutable segment bundle. Registry introspection, not a SQL
+    /// query: the catalog's own tables are not registered in the DataFusion
+    /// federation [`Self::sql`] runs over.
+    ///
+    /// Tenant-scoped: the table is resolved through the tenant-filtered
+    /// result-table read before its segments are listed, so a peer that cannot
+    /// resolve the table gets an **empty** listing — the same answer an unknown
+    /// table gets, so the verb is not an existence oracle. A table whose index
+    /// is flat (unsegmented) likewise lists nothing.
+    pub async fn list_index_segments(&self, table_name: &str) -> Result<Vec<IndexSegment>> {
+        self.engine.list_index_segments(table_name).await
     }
 
     /// Re-invoke a result table's recorded producer over the inputs' *current*

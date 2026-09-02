@@ -1,5 +1,6 @@
-//! CPU-hermetic oracles for `LayerNormFused` — the same rigor-chain
-//! pattern `tests/oracles.rs` establishes for `Axpy`, extended for a
+//! CPU-hermetic oracles for `LayerNormFused` — this crate's usual
+//! rigor chain (gradcheck, fused-vs-independent-formula, and the
+//! chain-rule-through-an-intermediate regression), for a
 //! `CustomOp2` whose backward is NOT ordinary `Tensor` composition (it
 //! dispatches into two more `KernelOp`s — see
 //! `jammi_kernels::ops::layer_norm`'s module doc).
@@ -36,8 +37,8 @@
 //!      reachable at all. `formula()`'s value here is narrower than that:
 //!      it lets THIS crate's own `LayerNormFused` fwd/bwd oracles run
 //!      hermetically with no `jammi-*` dependency, the same reason
-//!      axpy's `formula_fwd` reproduces `affine`+`add` rather than
-//!      importing anything.
+//!      every other `*_oracles.rs` file here reimplements its op's
+//!      reference formula rather than importing one.
 //!   3. `dgamma_needed_true_through_an_intermediate_*` /
 //!      `dgamma_needed_false_on_a_frozen_leaf_*` — the construction-data
 //!      regression oracle: `dgamma_needed=true` through an INTERMEDIATE
@@ -48,7 +49,7 @@
 //!
 //! The CUDA↔CPU parity leg (fwd + both bwd outputs, contiguous/narrowed/
 //! empty/multi-row, hidden 1024 and non-1024, bf16+f32) lives in
-//! `tests/cuda_parity.rs`, gated the same way `Axpy`'s is.
+//! `tests/cuda_parity.rs`, gated the same way every other op's is.
 
 use candle_core::{DType, Device, Tensor, Var, D};
 use half::bf16;
@@ -426,8 +427,8 @@ fn fused_vs_formula_bf16_bwd_is_bit_exact_after_the_one_rounding_fix() {
 #[test]
 fn dgamma_needed_true_through_an_intermediate_x_matches_formula() {
     // `x` is an INTERMEDIATE (`w.affine(2, 0)`) on a path to a `Var`
-    // (`w`) — `is_variable() == false`, exactly the case `Axpy`'s own
-    // regression test exercises (see `tests/oracles.rs`). `dx`'s slot
+    // (`w`) — `is_variable() == false`, exactly the hazard
+    // `jammi_kernels::ops`'s module doc names. `dx`'s slot
     // must still be populated (LayerNormFused::bwd never gates it on
     // `is_variable()`), and with `dgamma_needed=true`, `gamma`'s slot
     // (a genuine `Var` here) must also match the formula gradient.

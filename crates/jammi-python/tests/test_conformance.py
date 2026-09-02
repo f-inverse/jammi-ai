@@ -121,6 +121,12 @@ _TRAINING_VERBS = {
     "fine_tune_graph",
     "train_context_predictor",
     "predict_with_context_predictor",
+    # The two attach/listing verbs: a submitted job is reachable by id from a
+    # session that never submitted it, and the tenant's jobs are listable. Both
+    # arms carry both — neither is a `Capability`, because nothing about a
+    # transport makes "look up a job I already have the id of" unavailable.
+    "training_job",
+    "list_training_jobs",
 }
 
 
@@ -234,6 +240,17 @@ _LIFECYCLE_VERBS = {
 }
 
 
+# The index-segment listing. A result table's ANN index is a SET of immutable
+# segments (one `index_segments` catalog row each); this is the reader for that
+# set. It DOES hit the wire on the remote arm (`CatalogService.
+# ListIndexSegments`) because the catalog lives in the engine. Both arms carry
+# it — it is a verb, never a `Capability`: nothing about a transport makes a
+# segment listing unavailable, so a caller never has to ask whether it exists.
+_SEGMENT_VERBS = {
+    "list_index_segments",
+}
+
+
 def test_remote_surface_has_every_verb():
     """The client's `RemoteDatabase` exposes the full transport-agnostic verb
     set — the same vocabulary the embedded `Database` carries."""
@@ -247,6 +264,7 @@ def test_remote_surface_has_every_verb():
         | _CHANNEL_VERBS
         | _MUTABLE_TOPIC_VERBS
         | _LIFECYCLE_VERBS
+        | _SEGMENT_VERBS
     ):
         assert callable(getattr(jammi.RemoteDatabase, verb)), verb
 
@@ -261,6 +279,54 @@ def test_lifecycle_verbs_have_identical_signatures_across_wheels():
         client = _call_surface(getattr(jammi.RemoteDatabase, verb))
         embed = _call_surface(_embed_method(verb))
         assert client == embed, f"{verb}: {embed} != {client}"
+
+
+def test_segment_verbs_have_identical_signatures_across_wheels():
+    """The index-segment listing carries the SAME call surface on both
+    transports — one positional `table_name`, no transport-shaped extra."""
+    for verb in _SEGMENT_VERBS:
+        client = _call_surface(getattr(jammi.RemoteDatabase, verb))
+        embed = _call_surface(_embed_method(verb))
+        assert client == embed, f"{verb}: {embed} != {client}"
+
+
+# The client-facing segment projection: exactly the keys a `list_index_segments`
+# entry carries on BOTH transports. The embed wheel builds the dict at its FFI
+# boundary from the engine's `IndexSegment`; the remote builds it from the wire
+# `IndexSegment` — so the two agree key-for-key, and neither carries the row's
+# `tenant_id` / `created_at` bookkeeping.
+_INDEX_SEGMENT_DICT_KEYS = {"segment_id", "index_path", "row_count"}
+
+
+def test_index_segment_projection_is_the_whole_row_and_nothing_more():
+    """The wire `IndexSegment` message — the single source of the client-facing
+    segment shape — carries exactly the three projected fields. Pinned against
+    the proto descriptor, so adding a catalog-internal column (`tenant_id`,
+    `created_at`) to the projection reds here.
+
+    Hermetic: reads the generated proto descriptor, never dialing a server."""
+    from jammi._generated.jammi.v1 import catalog_pb2
+
+    proto_fields = {f.name for f in catalog_pb2.IndexSegment.DESCRIPTOR.fields}
+    assert proto_fields == _INDEX_SEGMENT_DICT_KEYS, (
+        f"wire IndexSegment fields {proto_fields} != the client projection "
+        f"{_INDEX_SEGMENT_DICT_KEYS} — a catalog-internal field leaked"
+    )
+
+
+def test_embed_list_index_segments_returns_the_projection_shape(tmp_path):
+    """The embedded `list_index_segments` returns a list (never `None`, never an
+    error) for a table that does not exist — the unknown-table arm of the
+    four-way empty contract — and every entry it ever yields carries exactly the
+    projected keys.
+
+    Hermetic: opens a local engine (`file://`), contacts no server."""
+    db = jammi.connect(f"file://{tmp_path}")
+    try:
+        segments = db.list_index_segments("no_such_table")
+        assert segments == []
+    finally:
+        db.close()
 
 
 # The client-facing model projection: exactly the keys a `list_models` /
@@ -517,8 +583,10 @@ def test_numeric_verbs_compute_identically_across_wheels(tmp_path):
             ranked_lists, k_rrf=40
         )
     finally:
-        # The embedded engine releases its resources on drop; only the remote
-        # client holds a gRPC channel that needs an explicit close.
+        # Only the remote client's gRPC channel needs an explicit close in a
+        # `finally`. The embedded arm carries a real `close()` too (the catalog
+        # release), but this test opens a fresh per-test directory no successor
+        # ever reopens, so letting the handle drop is enough here.
         remote.close()
 
 
@@ -1243,8 +1311,13 @@ def test_supports_and_not_supported_on_backend_contract(tmp_path):
     and invoking a capability the backend lacks raises the typed
     `NotSupportedOnBackend` — never a bare `AttributeError`. The embedded engine
     carries the in-process primitives (audit / ephemeral / preload); the remote
-    carries the transport lifecycle (close / session_id); each raises for the
-    other's."""
+    carries the per-connection scoping key (session_id); each raises for the
+    other's.
+
+    `close` is NOT among them any more, on either side: it is a SHARED verb both
+    backends implement (a channel teardown remote, the catalog-file release
+    embedded), so it is asserted as an ordinary member of the Session surface
+    here rather than as a capability."""
     from jammi import Capability
     from jammi.errors import NotSupportedOnBackend
 
@@ -1254,20 +1327,22 @@ def test_supports_and_not_supported_on_backend_contract(tmp_path):
         assert embed.supports(Capability.AUDIT) is True
         assert embed.supports(Capability.EPHEMERAL_SESSION) is True
         assert embed.supports(Capability.PRELOAD_MODEL) is True
-        assert embed.supports(Capability.CLOSE) is False
         assert embed.supports(Capability.SESSION_ID) is False
 
-        assert remote.supports(Capability.CLOSE) is True
         assert remote.supports(Capability.SESSION_ID) is True
         assert remote.supports(Capability.AUDIT) is False
         assert remote.supports(Capability.EPHEMERAL_SESSION) is False
         assert remote.supports(Capability.PRELOAD_MODEL) is False
 
+        # `close` is a shared verb, not a capability: both backends carry it,
+        # and neither raises for it.
+        assert callable(embed.close)
+        assert callable(remote.close)
+        assert not hasattr(Capability, "CLOSE")
+
         # A one-sided op on the wrong backend raises the typed error.
         with pytest.raises(NotSupportedOnBackend):
             embed.session_id
-        with pytest.raises(NotSupportedOnBackend):
-            embed.close()
         with pytest.raises(NotSupportedOnBackend):
             remote.audit
         with pytest.raises(NotSupportedOnBackend):
@@ -1275,22 +1350,86 @@ def test_supports_and_not_supported_on_backend_contract(tmp_path):
         with pytest.raises(NotSupportedOnBackend):
             remote.preload_model("some-model")
     finally:
+        embed.close()
         remote.close()
 
 
-def test_capability_enum_is_the_closed_five():
-    """The capability set is CLOSED — exactly the five one-sided features that
-    diverge between the transports, no more. Pinned so a sixth is a deliberate
-    decision, not a silent addition."""
+def test_capability_enum_is_the_closed_four():
+    """The capability set is CLOSED — exactly the four one-sided features that
+    diverge between the transports, no more. Pinned so a fifth is a deliberate
+    decision, not a silent addition.
+
+    `close` was the fifth until the embedded arm gained a real `close()` (the
+    catalog-file release the engine's own contract documents and the public
+    client had no way to reach). The enum's charter — "exactly the features that
+    genuinely diverge between the two transports today" — then FORCES its
+    removal: a `Capability` every backend supports is a predicate that never
+    discriminates, and leaving it in would have said the embedded engine lacks a
+    primitive it has. Pinned as an absence, not merely by the set below, in
+    `test_supports_and_not_supported_on_backend_contract`."""
     from jammi import Capability
 
     assert {c.value for c in Capability} == {
         "audit",
         "ephemeral_session",
         "preload_model",
-        "close",
         "session_id",
     }
+
+
+def test_close_is_idempotent_and_use_after_close_raises_the_same_error_on_both(
+    tmp_path,
+):
+    """Value-parity on the closed-session contract: BOTH backends make `close()`
+    idempotent and BOTH raise the same typed `BackendError` from every verb
+    afterwards.
+
+    This is the parity that `Capability.CLOSE`'s removal asserts. "Both have a
+    `close()`" would be a shallow claim if the two disagreed on what a closed
+    session then does — and they did: the embedded arm raised the typed
+    `BackendError` from its FFI-boundary guard while the remote arm let grpcio's
+    bare `ValueError("Cannot invoke RPC on closed channel!")` escape the
+    `JammiError` taxonomy entirely. A caller writing one program against
+    :class:`jammi.Session` must be able to catch one exception type.
+
+    The CLASS is pinned identical (that is the contract a caller writes
+    `except`ing); the message is pinned only to say "closed", because each arm
+    truthfully names the resource it released — the embedded arm the catalog,
+    the remote arm the channel — and forcing one sentence would make one of them
+    lie.
+
+    The verbs cover both remote transports: the typed gRPC lane (`list_sources`,
+    `tenant`, `get_server_info`) and the separate Flight SQL lane (`sql`), so a
+    guard installed on only one of them fails here.
+
+    Hermetic on the remote side — the guard fires before any wire hop, so the
+    unreachable endpoint is never dialed."""
+    from jammi.errors import BackendError, JammiError
+
+    embed = jammi.connect(f"file://{tmp_path}")
+    remote = jammi.connect("grpc://127.0.0.1:8081")
+
+    raised: dict[tuple[str, str], type] = {}
+    for name, session in (("embedded", embed), ("remote", remote)):
+        session.close()
+        # Idempotent: a second and third close are no-ops, not errors.
+        session.close()
+        session.close()
+
+        for verb, call in (
+            ("list_sources", lambda s=session: s.list_sources()),
+            ("tenant", lambda s=session: s.tenant()),
+            ("get_server_info", lambda s=session: s.get_server_info()),
+            ("sql", lambda s=session: s.sql("SELECT 1")),
+        ):
+            with pytest.raises(BackendError) as excinfo:
+                call()
+            assert issubclass(excinfo.type, JammiError), (name, verb)
+            assert "closed" in str(excinfo.value), (name, verb, str(excinfo.value))
+            raised[(name, verb)] = excinfo.type
+
+    # One class across both transports and every verb — the whole point.
+    assert set(raised.values()) == {BackendError}
 
 
 class _FakeRpcError(grpc.RpcError):

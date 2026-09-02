@@ -894,13 +894,13 @@ fi
 # subcommand here — a NAMED-session verb, unlike `ls`/`reap`, which never
 # apply this check at all (see Group 3e below).
 #
-# Round-3 audit on #388: the ORIGINAL fix used a `[A-Za-z0-9_-]+` character
-# WHITELIST, which rejected every session name containing a `.` —
-# including `bench.1`, a shape gpu-dev.sh's own dispatch is happy to
-# create (`RP_SESSION=bench.1 gpu-dev.sh up`) — so a live pod under a
-# dotted session name became unreachable by EVERY verb, stranded for its
-# full deadline. The fix below is a blacklist of the shapes that are
-# actually dangerous; a dot anywhere but as the whole name is accepted.
+# The rule (rp_name_allowlist_check) refuses ''/'.'/'..', an embedded '/',
+# a leading '-', and any character outside `[A-Za-z0-9._-]`. A `.` is
+# INSIDE the allowlist and its acceptance is pinned below, non-negotiably:
+# `bench.1` is a shape gpu-dev.sh's own dispatch is happy to create
+# (`RP_SESSION=bench.1 gpu-dev.sh up`), and a rule that refused it would
+# make a live pod under a dotted session name unreachable by EVERY verb,
+# stranded for its full deadline.
 # ═════════════════════════════════════════════════════════════════════════
 TRAVERSAL_TARGET="$SANDBOX/must-not-be-touched"
 mkdir -p "$TRAVERSAL_TARGET"
@@ -945,6 +945,46 @@ grep -q "RP_SESSION may" "$SANDBOX/out-dotted.log" \
 RP_SESSION="a100-2" bash "$DIR/gpu-dev.sh" down >"$SANDBOX/out-ordinary.log" 2>&1
 [ $? -eq 0 ] && ok "finding(RP_SESSION-blacklist): an ordinary [A-Za-z0-9_-] session name is still accepted" \
   || bad "finding(RP_SESSION-blacklist): an ordinary session name must still work ($(cat "$SANDBOX/out-ordinary.log"))"
+
+# ═════════════════════════════════════════════════════════════════════════
+# Group 3d-2 — CLI-level: --tree/--wave/RP_SESSION and `target`'s positional
+# tree name are all refused when they carry a character outside the
+# allowlist. Every one of these values is embedded in REMOTE shell text and
+# (for wave/tree) in the active-wave claim write, so a `%` reached the pod's
+# own printf FORMAT position (`--wave '%d'` wrote `WAVE=0`, silently
+# claiming a wave nobody asked for) and a `"` closed that format string
+# outright. Refusal happens before any path derives from the value and
+# before any ssh is attempted, so these need no pod and no mock.
+# ═════════════════════════════════════════════════════════════════════════
+name_refused() { # $1=label $2..=argv for gpu-dev.sh
+  local label="$1"; shift
+  local log="$SANDBOX/out-name-refused.log"
+  bash "$DIR/gpu-dev.sh" "$@" >"$log" 2>&1
+  local rc=$?
+  if [ "$rc" -eq 2 ] && grep -q "may contain only letters\|may not start with" "$log"; then
+    ok "finding(name-allowlist): ${label} refused (exit 2) with a rule-naming error"
+  else
+    bad "finding(name-allowlist): ${label} must be refused with exit 2 and a rule-naming error (got rc=$rc): $(cat "$log")"
+  fi
+}
+name_refused "--tree '%d'"       run a100 --tree '%d' true
+name_refused '--tree with a quote' run a100 --tree 'a"b' true
+name_refused '--tree $(...)'     run a100 --tree 'a$(id)b' true
+name_refused "--tree leading '-'" run a100 --tree -x true
+name_refused "--wave '%d'"       run a100 --wave '%d' true
+name_refused '--wave with a quote' run a100 --wave 'a"b' true
+name_refused '--wave $(...)'     run a100 --wave 'a$(id)b' true
+name_refused "target's positional tree name" target a100 'ev$(id)il'
+RP_SESSION='%d' bash "$DIR/gpu-dev.sh" down >"$SANDBOX/out-name-sess.log" 2>&1
+[ $? -eq 2 ] && ok "finding(name-allowlist): RP_SESSION='%d' refused (exit 2)" \
+  || bad "finding(name-allowlist): RP_SESSION='%d' must be refused ($(cat "$SANDBOX/out-name-sess.log"))"
+# Positive control, same shapes the repo actually uses: a legal name must
+# never trip the rule. (`run` has no pod here and fails later for its own
+# reasons; what is pinned is that it gets PAST the name gate.)
+bash "$DIR/gpu-dev.sh" run a100 --tree w4b --wave 'fix.443' true >"$SANDBOX/out-name-legal.log" 2>&1
+grep -q "may contain only letters\|--tree may\|--wave may" "$SANDBOX/out-name-legal.log" \
+  && bad "finding(name-allowlist): a legal --tree/--wave ('w4b'/'fix.443') must NOT be refused ($(cat "$SANDBOX/out-name-legal.log"))" \
+  || ok "finding(name-allowlist): legal dotted/alphanumeric --tree and --wave values pass the gate"
 
 # ═════════════════════════════════════════════════════════════════════════
 # Group 3e — CLI-level: a dotted session name works END TO END, not merely
@@ -1563,12 +1603,52 @@ G9A_RESULTS="$SANDBOX/g9a-results.log"
     record FAIL "rp_target_preflight_lines: expected MISSING (got: $out_missing)"
   fi
 
+  # An existing dir with no marker is TWO different facts, and they earn
+  # different refusals: a genuinely cold dir (a job against it really would
+  # rebuild the workspace) versus a WARM dir that merely predates the
+  # marker scheme (a job against it would not rebuild anything, and the
+  # clone remedy cannot even run against it).
   mkdir -p "$G9A_SANDBOX/unmarked"
   out_unmarked="$(bash <(rp_target_preflight_lines "$G9A_SANDBOX/unmarked"))"
-  if [ "$out_unmarked" = "GPU_DEV_TARGET_STATE=UNMARKED" ]; then
-    record PASS "rp_target_preflight_lines: existing but unmarked target dir classified UNMARKED"
+  if [ "$out_unmarked" = "GPU_DEV_TARGET_STATE=UNMARKED_COLD" ]; then
+    record PASS "rp_target_preflight_lines: an existing, unmarked, artifact-free target dir classified UNMARKED_COLD"
   else
-    record FAIL "rp_target_preflight_lines: expected UNMARKED (got: $out_unmarked)"
+    record FAIL "rp_target_preflight_lines: expected UNMARKED_COLD (got: $out_unmarked)"
+  fi
+
+  # Warm: workspace-member fingerprints under a cargo profile dir, which is
+  # exactly what a pre-marker-scheme target dir carries.
+  mkdir -p "$G9A_SANDBOX/warm/debug/.fingerprint/jammi-kernels-9f8e7d6c"
+  : > "$G9A_SANDBOX/warm/debug/.fingerprint/jammi-kernels-9f8e7d6c/lib-jammi_kernels"
+  out_warm="$(bash <(rp_target_preflight_lines "$G9A_SANDBOX/warm"))"
+  if [ "$out_warm" = "GPU_DEV_TARGET_STATE=UNMARKED_WARM" ]; then
+    record PASS "rp_target_preflight_lines: an unmarked dir carrying workspace-member fingerprints classified UNMARKED_WARM, never lumped in with cold"
+  else
+    record FAIL "rp_target_preflight_lines: expected UNMARKED_WARM (got: $out_warm)"
+  fi
+
+  # A cargo profile dir whose fingerprints are all NON-member (a
+  # dependency-only tree — the shape the member-free seed itself has) is
+  # not this workspace's warmth and stays COLD.
+  mkdir -p "$G9A_SANDBOX/deps-only/release/.fingerprint/serde-1234abcd"
+  out_deps="$(bash <(rp_target_preflight_lines "$G9A_SANDBOX/deps-only"))"
+  if [ "$out_deps" = "GPU_DEV_TARGET_STATE=UNMARKED_COLD" ]; then
+    record PASS "rp_target_preflight_lines: a dependency-only fingerprint tree (no member artifacts) stays UNMARKED_COLD"
+  else
+    record FAIL "rp_target_preflight_lines: expected UNMARKED_COLD for a dependency-only fingerprint tree (got: $out_deps)"
+  fi
+
+  # The remedy's OUTCOME at this layer: `target --adopt` stamps
+  # .jammi-clone-of-seed on the warm dir (pod_target_clone.sh --adopt, run
+  # for real against real fixtures in test_pod_substrate.sh's (b/adopt)
+  # legs), and the SAME dir then classifies OK — the refusal is actually
+  # escapable, which is the whole point.
+  : > "$G9A_SANDBOX/warm/.jammi-clone-of-seed"
+  out_adopted="$(bash <(rp_target_preflight_lines "$G9A_SANDBOX/warm"))"
+  if [ "$out_adopted" = "GPU_DEV_TARGET_STATE=OK" ]; then
+    record PASS "rp_target_preflight_lines: the same warm dir classifies OK once the marker the adopt remedy stamps is present"
+  else
+    record FAIL "rp_target_preflight_lines: expected OK for an adopted warm dir (got: $out_adopted)"
   fi
 
   mkdir -p "$G9A_SANDBOX/marked"
@@ -1609,22 +1689,50 @@ else
   bad "run (esc-077): expected a named MISSING refusal + exactly 2 ssh calls (got rc=$g9b_rc, calls=$(cat "$SANDBOX/g9b-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9b.log")"
 fi
 
-# --- 9c: existing-but-UNMARKED target dir -> refuse (exit 1) --------------
+# --- 9c: existing-but-UNMARKED target dir -> refuse (exit 1), with the
+# diagnosis and the remedy that MATCH which unmarked state it is ----------
 G9C_DIR="$SANDBOX/g9c-ssh"; mkdir -p "$G9C_DIR"
 write_ssh_resp "$G9C_DIR" 1 0
-write_ssh_resp "$G9C_DIR" 2 0 "GPU_DEV_TARGET_STATE=UNMARKED"
+write_ssh_resp "$G9C_DIR" 2 0 "GPU_DEV_TARGET_STATE=UNMARKED_COLD"
 rm -f "$SANDBOX/g9c-counter"
 MOCK_SSH_CALL_COUNTER="$SANDBOX/g9c-counter" MOCK_SSH_RESPONSES_DIR="$G9C_DIR" \
   PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" run "$G9_SESSION" echo hi \
   >"$SANDBOX/out-g9c.log" 2>&1
 g9c_rc=$?
 if [ "$g9c_rc" -ne 0 ] && grep -q "no seed-clone marker" "$SANDBOX/out-g9c.log" \
+  && grep -q "target ${G9_SESSION} jammi-ai --with-cutlass" "$SANDBOX/out-g9c.log" \
   && grep -q "RP_ALLOW_COLD_TARGET=1" "$SANDBOX/out-g9c.log" \
   && [ "$(cat "$SANDBOX/g9c-counter")" = "2" ]; then
-  ok "run (esc-077): refuses an existing but UNMARKED target dir (exit $g9c_rc), never reaching the job-launch call"
+  ok "run (esc-077): refuses a COLD unmarked target dir (exit $g9c_rc), naming the clone remedy, never reaching the job-launch call"
 else
-  bad "run (esc-077): expected a named UNMARKED refusal + exactly 2 ssh calls (got rc=$g9c_rc, calls=$(cat "$SANDBOX/g9c-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9c.log")"
+  bad "run (esc-077): expected a named UNMARKED_COLD refusal + exactly 2 ssh calls (got rc=$g9c_rc, calls=$(cat "$SANDBOX/g9c-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9c.log")"
 fi
+
+# --- 9c-2: a WARM unmarked dir (one that predates the marker scheme) is
+# refused with the CORRECT diagnosis (not "you would pay a cold build") and
+# with a remedy that can actually execute. The clone remedy cannot: it
+# refuses to write over an existing destination, which left the operator
+# with no runnable move at all.
+G9C2_DIR="$SANDBOX/g9c2-ssh"; mkdir -p "$G9C2_DIR"
+write_ssh_resp "$G9C2_DIR" 1 0
+write_ssh_resp "$G9C2_DIR" 2 0 "GPU_DEV_TARGET_STATE=UNMARKED_WARM"
+rm -f "$SANDBOX/g9c2-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g9c2-counter" MOCK_SSH_RESPONSES_DIR="$G9C2_DIR" \
+  PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" run "$G9_SESSION" echo hi \
+  >"$SANDBOX/out-g9c2.log" 2>&1
+g9c2_rc=$?
+if [ "$g9c2_rc" -ne 0 ] \
+  && grep -q "it is WARM" "$SANDBOX/out-g9c2.log" \
+  && grep -q "NOT a cold-build refusal" "$SANDBOX/out-g9c2.log" \
+  && grep -q "target ${G9_SESSION} jammi-ai --adopt" "$SANDBOX/out-g9c2.log" \
+  && [ "$(cat "$SANDBOX/g9c2-counter")" = "2" ]; then
+  ok "run (esc-077): refuses a WARM unmarked target dir with the provenance diagnosis and the executable --adopt remedy, never claiming a cold build"
+else
+  bad "run (esc-077): expected a WARM-specific refusal naming --adopt (got rc=$g9c2_rc, calls=$(cat "$SANDBOX/g9c2-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g9c2.log")"
+fi
+grep -q "COLD full workspace build" "$SANDBOX/out-g9c2.log" \
+  && bad "run (esc-077): the WARM refusal must NOT claim a cold full workspace build — that was the false diagnosis" \
+  || ok "run (esc-077): the WARM refusal makes no cold-build claim about a dir that is warm"
 
 # --- 9d: a marked clone (OK) -> proceeds past esc-077 into the NEW
 # concurrency preflight (call #3, CLEAR here) -> the real job-launch call
@@ -1671,14 +1779,14 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 
 # --- 10a: rp_concurrency_preflight_lines classifies BUSY/CLEAR correctly
-# against a FAKED `tmux` + a fixture `/root/.jammi-active-wave`-shaped file
-# — no ssh, no pod, no mocking of gpu-dev.sh itself. Same isolation
+# against a FAKED `tmux` + a fixture claim store (RP_CLAIM_DIR-shaped) —
+# no ssh, no pod, no mocking of gpu-dev.sh itself. Same isolation
 # rationale as 9a (subshell + group-local results file + outer tally,
 # since `ok`/`bad` mutate counters a subshell cannot persist). The real
-# function hardcodes `/root/.jammi-active-wave`; these cases patch that
-# ONE literal path in the GENERATED text to a sandbox path before
-# executing it (never touching a real /root) — the generated text is
-# otherwise run completely unmodified.
+# function hardcodes the `/root/.jammi-active-wave`-prefixed store paths;
+# these cases patch that ONE literal prefix in the GENERATED text to a
+# sandbox path before executing it (never touching a real /root) — the
+# generated text is otherwise run completely unmodified.
 G10A_RESULTS="$SANDBOX/g10a-results.log"
 : > "$G10A_RESULTS"
 (
@@ -1707,9 +1815,19 @@ STUB
     PATH="$G10A_STUBDIR:$PATH" bash -c "$gen"
   }
 
+  # The claim store the real writer maintains: one file per HOLDER, named
+  # by that holder's tree (rp_job_wrapper_with_marker_lines writes exactly
+  # this shape; see RP_CLAIM_DIR's own doc for why it is a directory).
+  G10A_CLAIMS="$G10A_ROOT/.jammi-active-wave.d"
+  claim() { # $1=tree $2=wave
+    mkdir -p "$G10A_CLAIMS"
+    printf 'WAVE=%s\nTREE=%s\nTS=2026-09-01T00:00:00Z\n' "$2" "$1" > "$G10A_CLAIMS/$1.claim"
+  }
+  no_claims() { rm -rf "$G10A_CLAIMS"; }
+
   fake_tmux $'jammi-seed\njammi-othertree\njammi-mywork\n'
-  rm -f "$G10A_ROOT/.jammi-active-wave"
-  printf 'WAVE=wave-B\nTREE=othertree\nTS=2026-09-01T00:00:00Z\n' > "$G10A_ROOT/.jammi-active-wave"
+  no_claims
+  claim othertree wave-B
   out="$(run_preflight "jammi-mywork" "wave-A")"
   if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=BUSY:wave-B:jammi-othertree" ]; then
     record PASS "rp_concurrency_preflight_lines: cross-wave (live other tree's claim names a DIFFERENT wave) classified BUSY, naming the owning wave and the session"
@@ -1717,7 +1835,7 @@ STUB
     record FAIL "rp_concurrency_preflight_lines: expected BUSY:wave-B:jammi-othertree (got: $out)"
   fi
 
-  printf 'WAVE=wave-A\nTREE=othertree\nTS=2026-09-01T00:00:00Z\n' > "$G10A_ROOT/.jammi-active-wave"
+  claim othertree wave-A
   out="$(run_preflight "jammi-mywork" "wave-A")"
   if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=CLEAR" ]; then
     record PASS "rp_concurrency_preflight_lines: same-wave-two-trees (live other tree's claim names the SAME wave) classified CLEAR — the sanctioned sub-unit-sharing shape"
@@ -1725,7 +1843,7 @@ STUB
     record FAIL "rp_concurrency_preflight_lines: expected CLEAR for a matching wave claim on a different tree (got: $out)"
   fi
 
-  rm -f "$G10A_ROOT/.jammi-active-wave"
+  no_claims
   out="$(run_preflight "jammi-mywork" "wave-A")"
   if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=BUSY:UNKNOWN:jammi-othertree" ]; then
     record PASS "rp_concurrency_preflight_lines: a live other session with NO readable active-wave claim fails CLOSED (BUSY:UNKNOWN), never silently assumed safe"
@@ -1758,12 +1876,97 @@ STUB
   # says — failing OPEN on staleness, per this campaign's own instruction,
   # rather than refusing forever on an orphaned file no process will ever
   # clean up again.
-  printf 'WAVE=wave-B\nTREE=othertree\nTS=2020-01-01T00:00:00Z\n' > "$G10A_ROOT/.jammi-active-wave"
+  claim othertree wave-B
   out="$(run_preflight "jammi-mywork" "wave-A")"
   if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=CLEAR" ]; then
     record PASS "rp_concurrency_preflight_lines: a stale claim (file present, NO live tmux session for it) is treated CLEAR -- tmux liveness is the primary signal, fail OPEN on staleness"
   else
     record FAIL "rp_concurrency_preflight_lines: expected CLEAR for a stale claim with no live session (got: $out)"
+  fi
+
+  # --- Own-session exclusion must be a LITERAL, whole-line match ---------
+  # A tree name legitimately contains regex metacharacters (rp_tree_name_check
+  # refuses only ''/'.'/'..'/'/'-leading-'-'; `bench.1`-shaped names are real,
+  # and `--tree 'fix.443'` reproduced this). Read as a BRE, the own-session
+  # pattern deletes OTHER sessions from the list the gate is scanning, so the
+  # gate reports CLEAR while a different wave is genuinely running: it fails
+  # OPEN. These cases drive the generated text DIRECTLY, so they hold for the
+  # function itself regardless of any entrypoint validation layered above it.
+  metachar_case() { # $1=own_session $2=session list $3=expected other session
+    fake_tmux "$2"
+    no_claims
+    claim "${3#jammi-}" wave-B
+    local out; out="$(run_preflight "$1" "wave-A")"
+    if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=BUSY:wave-B:$3" ]; then
+      record PASS "rp_concurrency_preflight_lines: own-session '$1' excluded LITERALLY — the live cross-wave session '$3' is still seen (BUSY), never regex-swallowed"
+    else
+      record FAIL "rp_concurrency_preflight_lines: own-session '$1' — expected BUSY:wave-B:$3 (got: $out)"
+    fi
+  }
+  # `.` — a BRE `jammi-fix.443` also matches the live `jammi-fixX443`.
+  metachar_case 'jammi-fix.443' $'jammi-seed\njammi-fixX443\njammi-fix.443\n' 'jammi-fixX443'
+  # `*` — a BRE `jammi-w*` matches `jammi-www` (and NOT the literal own name),
+  # so the old form excluded the OTHER session and then reported OUR OWN
+  # session as the contending one.
+  metachar_case 'jammi-w*' $'jammi-seed\njammi-www\njammi-w*\n' 'jammi-www'
+  # `[` — an unbalanced bracket is an INVALID BRE: grep exits 2 printing
+  # nothing, so `other` came back empty and every session on the pod
+  # vanished from the gate's view at once.
+  metachar_case 'jammi-a[b' $'jammi-seed\njammi-other\njammi-a[b\n' 'jammi-other'
+  # Prefix collision (regression pin for the `-x` whole-line anchor, which
+  # `-F` must not silently drop): `jammi-abc` may never exclude `jammi-abcd`.
+  metachar_case 'jammi-abc' $'jammi-seed\njammi-abcd\njammi-abc\n' 'jammi-abcd'
+
+  # --- N same-wave holders at once (the sanctioned co-tenancy shape) -----
+  # Every live holder is independently represented in the store, so a wave
+  # whose sub-units already occupy the pod on two other trees still reads
+  # CLEAR for a third sub-unit of that same wave. Under a single shared
+  # claim file only the LAST writer existed at all, and the first holder to
+  # finish deleted the claim the others were still relying on.
+  fake_tmux $'jammi-seed\njammi-tree-a\njammi-tree-b\njammi-mywork\n'
+  no_claims
+  claim tree-a wave-A
+  claim tree-b wave-A
+  out="$(run_preflight "jammi-mywork" "wave-A")"
+  if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=CLEAR" ]; then
+    record PASS "rp_concurrency_preflight_lines: TWO live same-wave holders are both represented — a third sub-unit of that wave reads CLEAR"
+  else
+    record FAIL "rp_concurrency_preflight_lines: expected CLEAR with two live same-wave holders (got: $out)"
+  fi
+
+  # A cross-wave holder among same-wave ones still refuses, naming THAT
+  # holder's own wave and session (not merely 'some other session').
+  claim tree-b wave-B
+  out="$(run_preflight "jammi-mywork" "wave-A")"
+  if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=BUSY:wave-B:jammi-tree-b" ]; then
+    record PASS "rp_concurrency_preflight_lines: a cross-wave holder among same-wave holders still refuses, naming that holder's own wave and session"
+  else
+    record FAIL "rp_concurrency_preflight_lines: expected BUSY:wave-B:jammi-tree-b with a cross-wave holder present (got: $out)"
+  fi
+
+  # Per-holder staleness: tree-a's cross-wave claim survives on disk but
+  # its session is gone (SIGKILL/pod death interrupted the wrapper's own
+  # cleanup), so it is reaped by the SAME liveness rule the whole-pod
+  # signal uses and must not refuse the live same-wave holder.
+  fake_tmux $'jammi-seed\njammi-tree-b\njammi-mywork\n'
+  no_claims
+  claim tree-a wave-B
+  claim tree-b wave-A
+  out="$(run_preflight "jammi-mywork" "wave-A")"
+  if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=CLEAR" ]; then
+    record PASS "rp_concurrency_preflight_lines: a STALE holder (claim on disk, its own session gone) is reaped per-holder — the live same-wave holder still reads CLEAR"
+  else
+    record FAIL "rp_concurrency_preflight_lines: expected CLEAR with a stale cross-wave holder and a live same-wave holder (got: $out)"
+  fi
+
+  # ...and staleness never launders a LIVE cross-wave holder: same store,
+  # tree-a alive again, must refuse.
+  fake_tmux $'jammi-seed\njammi-tree-a\njammi-tree-b\njammi-mywork\n'
+  out="$(run_preflight "jammi-mywork" "wave-A")"
+  if [ "$out" = "GPU_DEV_CONCURRENCY_STATE=BUSY:wave-B:jammi-tree-a" ]; then
+    record PASS "rp_concurrency_preflight_lines: the same cross-wave claim refuses once ITS session is live again — staleness is a liveness fact, not a permanent exemption"
+  else
+    record FAIL "rp_concurrency_preflight_lines: expected BUSY:wave-B:jammi-tree-a once the holder's session is live (got: $out)"
   fi
 )
 while IFS=: read -r status name; do
@@ -1870,6 +2073,29 @@ else
   bad "run (one-pod-per-wave): expected the concurrency preflight's generated text to compare against wave 'jammi-ai' by default: $(cat "$G10E_CAPTURE_DIR/3" 2>/dev/null || echo '<no call #3 captured>')"
 fi
 
+# (g10f) `run`'s job-launch heredoc has an UNQUOTED delimiter — it must
+# expand ${TREE_DIR}/${TMUX_SESSION}/${LAUNCH} and the
+# rp_job_wrapper_with_marker_lines substitution. An unquoted heredoc body
+# also performs COMMAND SUBSTITUTION on backticks, so a backticked word in
+# the body's own PROSE (a comment reading "first `run` for this
+# tree/session") was executed ON THE LAPTOP on every single `run`: bash
+# printed "gpu-dev.sh: line <n>: run: command not found" to stderr and
+# spliced the word out of the text that actually reached the pod. Observed
+# live during the sm_86/89/90 proof run. Harmless in that one instance only
+# because the substituted word happened to name no real command — the
+# defect is live command substitution over arbitrary prose, which is a
+# property of the heredoc, not of which word sat inside the backticks.
+# Asserted on the EMITTED text (capture #4, the job-launch call), not on
+# the source file: escaping in the source is the fix, but "the backtick
+# survives to the pod" is the invariant.
+if [ -f "$G10E_CAPTURE_DIR/4" ] \
+  && grep -qF 'first `run` for this tree/session' "$G10E_CAPTURE_DIR/4" \
+  && ! grep -q 'command not found' "$SANDBOX/out-g10e.log"; then
+  ok "run (heredoc quoting): a backticked word in the job-launch heredoc's own prose is emitted LITERALLY to the pod, never command-substituted on the laptop"
+else
+  bad "run (heredoc quoting): expected the emitted job-launch text to carry the literal backticked prose and the run to print no 'command not found': sent=$(cat "$G10E_CAPTURE_DIR/4" 2>/dev/null || echo '<no call #4 captured>') out=$(cat "$SANDBOX/out-g10e.log" 2>/dev/null)"
+fi
+
 # ═════════════════════════════════════════════════════════════════════════
 # Group 11 (deployment-gap fix, folded into esc-077) — `target` must ship
 # THIS checkout's OWN pod-side scripts before executing them, never rely on
@@ -1935,6 +2161,49 @@ if [ "$g11b_rc" -eq 0 ] && [ "$(cat "$SANDBOX/g11b-counter" 2>/dev/null)" = "3" 
 else
   bad "target --with-cutlass (deployment-gap fix): expected rc=0, exactly 3 ssh calls, and a staged pod_provision_cutlass.sh (got rc=$g11b_rc, calls=$(cat "$SANDBOX/g11b-counter" 2>/dev/null)): $(cat "$SANDBOX/out-g11b.log")"
 fi
+
+# --- 11c: `target --adopt` — the executable remedy `run`'s UNMARKED_WARM
+# refusal names — stages the same scripts and then invokes pod_target_clone.sh
+# with --adopt against THIS tree's own target dir. It must never attempt a
+# clone: the dir it is being pointed at already exists, which a clone
+# refuses outright (that refusal is what left the operator stuck).
+G11C_CAPTUREBIN="$SANDBOX/g11c-capturebin"; mkdir -p "$G11C_CAPTUREBIN"
+G11C_CAPTURE_DIR="$SANDBOX/g11c-capture"; mkdir -p "$G11C_CAPTURE_DIR"
+cat > "$G11C_CAPTUREBIN/ssh" <<STUB
+#!/usr/bin/env bash
+counter="\${MOCK_SSH_CALL_COUNTER:?MOCK_SSH_CALL_COUNTER unset}"
+n=\$(( \$( [ -f "\$counter" ] && cat "\$counter" || echo 0 ) + 1 ))
+echo "\$n" > "\$counter"
+capdir="\${MOCK_SSH_CAPTURE_DIR:?MOCK_SSH_CAPTURE_DIR unset}"
+cat > "\$capdir/\$n"
+dir="\${MOCK_SSH_RESPONSES_DIR:?MOCK_SSH_RESPONSES_DIR unset}"
+resp="\$dir/\$n"
+[ -f "\$resp" ] || resp="\$dir/\$(ls "\$dir" | sort -n | tail -1)"
+rc="\$(head -n1 "\$resp")"
+tail -n +2 "\$resp"
+exit "\$rc"
+STUB
+chmod +x "$G11C_CAPTUREBIN/ssh"
+G11C_DIR="$SANDBOX/g11c-ssh"; mkdir -p "$G11C_DIR"
+write_ssh_resp "$G11C_DIR" 1 0
+write_ssh_resp "$G11C_DIR" 2 0 "adopt marker stamped: /root/target-mytree/.jammi-clone-of-seed"
+rm -f "$SANDBOX/g11c-counter"
+: > "$G11_RSYNC_CALLS"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g11c-counter" MOCK_SSH_RESPONSES_DIR="$G11C_DIR" \
+  MOCK_SSH_CAPTURE_DIR="$G11C_CAPTURE_DIR" \
+  PATH="$G11_RSYNCBIN:$G11C_CAPTUREBIN:$PATH" bash "$DIR/gpu-dev.sh" target "$G11_SESSION" mytree --adopt \
+  >"$SANDBOX/out-g11c.log" 2>&1
+g11c_rc=$?
+if [ "$g11c_rc" -eq 0 ] \
+  && grep -qF "pod_target_clone.sh /root/.jammi-seed '/root/target-mytree' --adopt" "$G11C_CAPTURE_DIR/2" \
+  && grep -q "ADOPTED existing dir /root/target-mytree" "$SANDBOX/out-g11c.log"; then
+  ok "target --adopt: invokes pod_target_clone.sh --adopt against the tree's own target dir and reports the adoption (never a clone over an existing dir)"
+else
+  bad "target --adopt: expected an --adopt invocation against /root/target-mytree (rc=$g11c_rc): sent=$(cat "$G11C_CAPTURE_DIR/2" 2>/dev/null) out=$(cat "$SANDBOX/out-g11c.log")"
+fi
+grep -qF "$DIR/pod_target_clone.sh" "$G11_RSYNC_CALLS" \
+  && ok "target --adopt: stages THIS checkout's own pod-side scripts first, exactly as the clone path does" \
+  || bad "target --adopt: expected the same staging rsync as the clone path; rsync calls: $(cat "$G11_RSYNC_CALLS" 2>/dev/null)"
 
 echo
 echo "gpu-dev-lifecycle: ${PASS} passed, ${FAIL} failed, ${SKIP} skipped"

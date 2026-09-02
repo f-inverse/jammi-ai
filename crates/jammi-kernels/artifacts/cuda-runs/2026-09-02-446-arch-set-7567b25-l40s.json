@@ -1,0 +1,132 @@
+{
+ "schema_version": 1,
+ "unit": "446-w3c-arch-set-l40s",
+ "git_sha": "7567b255655029d0cc90e77bcf9d878f055a43c5",
+ "date": "2026-09-02T04:20:00Z",
+ "box": "jammi-l40s (NVIDIA L40S 46068 MiB, driver 570.124.06, nvcc 12.6.85, compute_cap 8.9, RunPod SECURE pod e5p37mp2mld33c, GPU-073cd48e-c5aa-1333-65a4-59b4bbfb5b8d)",
+ "driver": "570.124.06",
+ "gpu": "NVIDIA L40S",
+ "features": "cuda,flash-attn",
+ "status": "GREEN",
+ "env": {
+  "JAMMI_REQUIRE_CUDA": "1",
+  "JAMMI_REQUIRE_FLASH": "1",
+  "JAMMI_REQUIRE_FLASH_ORACLE": "1",
+  "JAMMI_FLASH_ORACLE_MODEL_DIR": "/root/checkpoints/ModernBERT-large",
+  "CUDA_COMPUTE_CAP": "89",
+  "NATIVE_COMPUTE_CAP": "89",
+  "CARGO_TARGET_DIR": "/root/target-w3c",
+  "CARGO_TERM_COLOR": "never",
+  "JAMMI_KERNELS_STRICT": "1 (capability_surface leg only)",
+  "JAMMI_BUILD_SHA": "7567b255655029d0cc90e77bcf9d878f055a43c5",
+  "nvcc": "release 12.6, V12.6.85"
+ },
+ "producer": {
+  "path": "crates/jammi-encoders/src/modernbert.rs",
+  "kind": "cargo-test",
+  "invocation": "JAMMI_REQUIRE_CUDA=1 JAMMI_REQUIRE_FLASH=1 JAMMI_REQUIRE_FLASH_ORACLE=1 JAMMI_FLASH_ORACLE_MODEL_DIR=<checkpoint> cargo test -p jammi-encoders --lib --features cuda,flash-attn -- --exact modernbert::tests::flash_arm_padded_matches_block_arm_on_real_rows_cuda",
+  "gating": "env:JAMMI_REQUIRE_CUDA"
+ },
+ "observed": {
+  "flash_arm_padded_real_row_ratio_per_seed": {
+   "201": 0.13299,
+   "202": 0.11235,
+   "203": 0.24808,
+   "204": 0.11282,
+   "205": 0.11069,
+   "206": 0.11966,
+   "207": 0.16463,
+   "208": 0.15986
+  },
+  "mean": 0.145135,
+  "max": 0.248084,
+  "bound_at_run": 0.5,
+  "note": "The eight per-seed ratios reproduce this ARCH's own predecessor artifacts (2026-09-02-446-arch-set-5f281d8-l40s.json, 2026-08-28-m3-arch-set-80a451a-l40s.json, and the superseded ac47d6f8 artifact) DIGIT-FOR-DIGIT — the per-arch flash-arm regression anchor is unchanged by this campaign's two bound fixes, measured rather than argued. The ratio set is arch-DEPENDENT (all four devices produce different numbers, each stable across three artifact generations), which is exactly why it is a per-arch producer and not a shared one. Checkpoint model.safetensors sha256 44510fec5d3a81a1877f225637b869495f18e55f6f23a09abb9be0acc030295f, verified on the pod before any GPU time was spent (matches the digest docs/maintainer/pod-build-guide.md Runbook C pins).",
+  "softmax_parity_f16_row_length_regimes": {
+   "was": "RED at 5f281d81 on sm_80/86/89/90, byte-identically: `softmax f16 dscores[35]: cpu -0.0010614395 vs cuda -0.0010671616 (bound 1.9073486e-6)` at last=257, rows=2 (n=514). The loop aborted there, so 513/1024/4096 had NEVER been evaluated on any arch.",
+   "now": "GREEN at 7567b255 on this arch, with all six regimes evaluated. The per-length worst delta/bound values below are BYTE-IDENTICAL on all four devices measured in this unit (sm_80/86/89/90) — which is the substantive finding, not a restatement: the divergence 721bfef4 root-caused is a FOLD-ORDER property of `softmax_fwd_f16`'s 256-way strided partial versus `softmax_row_f16`'s sequential ascending fold, so it is a property of the source, not of the SASS any one arch compiles to, and an arch-VARYING result here would have falsified that account.",
+   "per_length_worst_delta_over_bound": {
+    "last_255_fwd": 0.0,
+    "last_255_dscores": 0.0,
+    "last_256_fwd": 0.0,
+    "last_256_dscores": 0.0,
+    "last_257_fwd": 0.5,
+    "last_257_dscores": 0.5073465,
+    "last_513_fwd": 0.0,
+    "last_513_dscores": 0.47911653,
+    "last_1024_fwd": 0.5,
+    "last_1024_dscores": 0.4363655,
+    "last_4096_fwd": 0.5,
+    "last_4096_dscores": 0.13614704
+   },
+   "forced_defect_worst_delta_over_bound_all_twelve_controls": [
+    252928.0,
+    295424.0,
+    247040.0,
+    288768.0,
+    238592.0,
+    297728.0,
+    128704.0,
+    102656.0,
+    64416.0,
+    38112.0,
+    16032.0,
+    8744.0
+   ],
+   "forced_defect_note": "Twelve forced-defect controls (fwd + dscores at each of the six lengths), every one firing, worst ratio ranging 8.744e3 to 2.97728e5 — so the green path above is NON-VACUOUS: the same bound that admits the measured delta rejects a real semantic mutant by four to five orders of magnitude. Byte-identical on all four arches."
+  },
+  "geglu_16bit_fwd_k_equals_3": {
+   "was": "worst delta/bound EXACTLY 1.0 at n_out=1024 — zero headroom, the only bound in either kernels leg sitting on its own worst case.",
+   "f16_fwd_worst_delta_over_bound_after": {
+    "n_out_32": 0.013020833,
+    "n_out_900": 0.33333334,
+    "n_out_1024": 0.6666667
+   },
+   "bf16_fwd_worst_delta_over_bound_after": {
+    "n_out_32": 0.0,
+    "n_out_900": 0.010416667,
+    "n_out_5248": 0.33333334
+   },
+   "note": "37653d41 derived k from the rounding STRUCTURE (3), not the rounding-point count (2): ROUND 1's activation cast sits UPSTREAM of the multiply, so its <=1 f16 ULP flip rides `act*up` into `out`. Headroom at n_out=1024 is now 1.5x BY CONSTRUCTION — a worst-case-derived bound against a near-worst-case sample, not a kernel defect. These ratios too are byte-identical on all four arches."
+  }
+ },
+ "note": "Campaign #446 unit W3-C, the final real-device round before the freeze: fresh per-arch validation for compute_cap 8.9 at the campaign branch tip. This RE-PROVES sm_89 at a sha that is an ancestor of the campaign branch. The artifact it replaces, 2026-09-02-446-arch-set-ac47d6f8-l40s.json, named git_sha ac47d6f8 — the PREDECESSOR unit's own worktree commit, which the lead cherry-picked onto this branch as c8812929 — so ac47d6f8 was an ancestor of nothing here and check_cuda_run_artifacts.py failed it with `git_sha ... is not an ancestor of HEAD`, i.e. evidence about the ORACLE rather than the code (cuda-kernel-guide.md §4). That artifact is DELETED in this commit rather than re-stamped: re-stamping a sha the run did not measure is fabricated provenance, strictly worse than the honest failure. sm_89 is therefore re-measured here from scratch on a fresh L40S at the real branch tip. Every leg is GREEN and every leg ran at the SAME sha (7567b255), on a first-choice SECURE NVIDIA L40S with no SUPPLY_CONSTRAINT and no fallback. Git-LFS: `git lfs pull --include='crates/jammi-kernels/tests/fixtures/**'` was run in the source worktree BEFORE the push and verified with `git lfs ls-files` (all 224 flash_reference *.npy listed as materialized, `*` not `-`; b1_s512_q.npy is 1048704 bytes on the pod, not a ~130-byte pointer) — so unlike the superseded artifact, no on-pod re-materialization step was needed and no reproducibility caveat attaches. Without it flash_torch_parity/flash_torch_parity_f16 fail CLOSED on the pointer bytes. PROVENANCE: git_sha 7567b255 is the tip of fix/446-v049-blocker that these legs actually ran on — the pod tree was rsynced from a CLEAN worktree at that commit (the pod-side push stamp records laptop_head=7567b255655029d0cc90e77bcf9d878f055a43c5 with empty porcelain and empty diff-HEAD digests, so JAMMI_BUILD_SHA resolved rather than baking \"unknown\"), and `git merge-base --is-ancestor 7567b255 fix/446-v049-blocker` holds. The train PR must land as a MERGE COMMIT for this git_sha to become an ancestor of main's HEAD.",
+ "legs": [
+  {
+   "name": "jammi-encoders flash_arm_padded_matches_block_arm_on_real_rows_cuda (real ModernBERT-large checkpoint, 8 seeds) — the per-arch producer",
+   "command": "JAMMI_REQUIRE_CUDA=1 JAMMI_REQUIRE_FLASH=1 JAMMI_REQUIRE_FLASH_ORACLE=1 JAMMI_FLASH_ORACLE_MODEL_DIR=/root/checkpoints/ModernBERT-large cargo test -p jammi-encoders --lib --features cuda,flash-attn -- --exact modernbert::tests::flash_arm_padded_matches_block_arm_on_real_rows_cuda --nocapture",
+   "status": "ok",
+   "exit": 0,
+   "wall_seconds": 173,
+   "failed": 0,
+   "note": "1 passed; 0 failed; 187 filtered out."
+  },
+  {
+   "name": "jammi-kernels full suite (cuda,flash-attn) — flash + cuda parity incl. the previously-RED f16 softmax dscores oracle at all six row-length regimes",
+   "command": "cargo test -p jammi-kernels --features cuda,flash-attn -- --test-threads=1",
+   "status": "ok",
+   "exit": 0,
+   "wall_seconds": 421,
+   "failed": 0,
+   "note": "cuda_parity: 135 passed; 0 failed; 1 ignored. flash_torch_parity: 3 passed (9.35s) and flash_torch_parity_f16: 4 passed (11.61s) — both against MATERIALIZED .npy fixtures, not lfs pointers. flash_smoke: 16 passed. 456-test lib suite green; every other binary green."
+  },
+  {
+   "name": "jammi-ai gpu_capability capability_surface, STRICT (JAMMI_KERNELS_STRICT=1) — the prove lane's own capability leg, incl. its zero-test guard",
+   "command": "JAMMI_KERNELS_STRICT=1 cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability capability_surface -- --nocapture",
+   "status": "ok",
+   "exit": 0,
+   "wall_seconds": 172,
+   "failed": 0,
+   "note": "2 passed; 0 failed; 24 filtered out — a non-zero test count, so not a false green under runpod_gpu_prove.sh's own zero-test guard."
+  },
+  {
+   "name": "jammi-ai gpu_capability generic sweep, capability_surface name-excluded (it requires strict mode, which the fallback-path tests here cannot run under)",
+   "command": "cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability -- --nocapture --test-threads=1 --skip capability_surface",
+   "status": "ok",
+   "exit": 0,
+   "wall_seconds": 170,
+   "failed": 0,
+   "note": "24 passed; 0 failed; 2 filtered out."
+  }
+ ]
+}

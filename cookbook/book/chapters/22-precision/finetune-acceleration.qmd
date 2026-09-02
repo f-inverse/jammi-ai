@@ -15,7 +15,9 @@ exponent is the dtype the original mixed-precision-training recipe *did* need lo
 [@micikevicius2018mixedprecision] — and FlashAttention fuses the whole attention block into one
 IO-aware kernel rather than fusing a single primitive [@dao2022flashattention] · **Rail:**
 measurement (a live fine-tune submitted over the remote `grpc://` client, its per-job
-acceleration report read back through `pending` → `determined`, both dtypes' outcomes asserted)
+acceleration report read back through `pending` — byte-exact and stable, against a live server
+configured not to claim — → `determined` under a claiming successor process that opens the same
+catalog, both dtypes' outcomes asserted)
 + the honest arc (real GPU-only facts — FlashAttention-2's own `f16` admission, and a real
 memory limit that was root-caused and closed, not fabricated shut — cited rather than
 recomputed here).
@@ -44,8 +46,11 @@ source (`crates/jammi-kernels/third_party/flash-attention`), gated behind the `f
 feature, and only the CUDA release lanes (the tarball, the `cu12` wheel, the container image)
 compile it in. The `jammi-server` this render's own `grpc://` cell talks to is **not** one of
 those builds — it is a plain `cargo build --release -p jammi-server`, no `cuda` feature, no
-`flash-attn` feature (the same binary `cookbook-book.yml` / `cookbook-render.yml` build via
-`setup-jammi-py`'s `build-server: "true"` input) — because neither this book's PR gate nor its
+`flash-attn` feature (the same binary this book's CI provisions through `setup-jammi-py`'s
+`build-server: "true"` input, which is exactly that bare `cargo build --release -p jammi-server`:
+the nightly full-book render always builds it — `cookbook-render.yml` — and the PR book gate
+builds it when its chapter selector picks a chapter that needs a live server, as this one always
+does when it is selected at all) — because neither this book's PR gate nor its
 nightly render ever has a CUDA device to hand a compiled kernel to. That is a fact about *this
 render's own CI machine*, not a gap in the report mechanism: everything below through the
 `## Measured on real GPU hardware, not here` heading is a live, real submission against a live,
@@ -76,32 +81,64 @@ assert TINY_MODERNBERT.exists(), f"missing engine fixture: {TINY_MODERNBERT}"
 print(f"encoder: {TINY_MODERNBERT}  (tiny ModernBERT architecture, hidden_size=32)")
 ```
 
-## Standing up the remote server
+## Standing up the remote servers — one artifact directory, two processes in sequence
 
 The same `LiveServer` shape [the model-catalog cache emit](lifecycle.qmd) uses: a real
-`jammi-server` on a free loopback port, readiness-polled via a client handshake, torn down on
-exit. `jammi-server` must already be on `PATH` — the render harness places the freshly built
-binary there before invoking `quarto render`, exactly as `cookbook-render.yml` documents.
+`jammi-server` on a loopback port **the kernel assigns to the child itself**, readiness-polled via
+a client handshake, torn down on exit. `jammi-server` must already be on `PATH` — the render
+harness places the freshly built binary there before invoking `quarto render`, exactly as
+`cookbook-render.yml` documents.
+
+This chapter runs **two** such servers, one after the other, over the **same artifact
+directory** — which is why the artifact directory is a constructor *parameter* here rather than
+something the harness invents per instance. Server **A** mounts the training surface but is
+configured not to claim; server **B** is today's ordinary all-in-one. They are strictly
+sequential, never concurrent, because this render's catalog is SQLite and SQLite is a
+single-process store: the first server must have really exited before the second may open the
+same directory. The section below the submission cell says what that buys and what the knob
+actually is.
+
+One detail worth naming, because it is the difference between a chapter that renders and a
+chapter that flakes: this cell never *picks* a port. Binding a socket in this process to learn a
+free port, closing it, and handing the number to the child opens a release-then-rebind window —
+any other process on the machine (a parallel render, another test) can take that port in between,
+and the server dies on a bind error that looks like a chapter bug. Instead both listeners are
+configured `127.0.0.1:0`, so the **child** holds each binding from the instant the kernel assigns
+it, and the child announces the addresses it actually got on stdout in a fixed, machine-parseable
+line (`jammi-server listening flight=<addr> health=<addr>`, printed after bind and before serve —
+the engine's own subprocess harnesses read exactly this banner). The reader below keeps draining
+that pipe for the process's whole life, not just until the banner: a full stdout pipe would block
+the child's own logging.
 
 ```{python}
 import os
+import queue
 import shutil
-import socket
 import subprocess
 import tempfile
+import threading
 import time
 
 import jammi
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 class LiveServer:
-    """A real `jammi-server` on a free port — readiness-polled, torn down on exit."""
+    """A real `jammi-server` on kernel-assigned ports — announced, readiness-polled, torn down."""
+
+    # The server's own fixed startup banner, printed between bind and serve.
+    BANNER = "jammi-server listening "
+
+    def __init__(self, artifact_dir: str, *, run_worker: bool = True) -> None:
+        # The artifact directory is a PARAMETER, not something this harness
+        # invents: the two servers below open the SAME directory in sequence,
+        # which is what makes the job queue observably outlive a process.
+        self._artifact_dir = artifact_dir
+        # `[training] run_worker` — configuration, not a code path. `False`
+        # still mounts and serves the training surface (submissions are
+        # accepted); it only declines to run the claim loop.
+        self._run_worker = run_worker
+        # Set by `__exit__` from the awaited child exit; `None` while running.
+        self.returncode = None
 
     def __enter__(self) -> "LiveServer":
         server_bin = shutil.which("jammi-server")
@@ -109,22 +146,54 @@ class LiveServer:
             "jammi-server is not on PATH — this chapter needs a real server binary "
             "the render harness builds and places on PATH (see cookbook-render.yml)"
         )
-        self._artifact_dir = tempfile.mkdtemp(prefix="jammi_srv_ftaccel_")
-        flight_port, health_port = _free_port(), _free_port()
         env = dict(os.environ)
         env["JAMMI_ARTIFACT_DIR"] = self._artifact_dir
-        env["JAMMI_SERVER__FLIGHT_LISTEN"] = f"127.0.0.1:{flight_port}"
-        env["JAMMI_SERVER__HEALTH_LISTEN"] = f"127.0.0.1:{health_port}"
+        env["JAMMI_TRAINING__RUN_WORKER"] = "true" if self._run_worker else "false"
+        # `:0` on BOTH listeners — the child binds, the kernel assigns, nothing
+        # here ever holds-and-releases a port number.
+        env["JAMMI_SERVER__FLIGHT_LISTEN"] = "127.0.0.1:0"
+        env["JAMMI_SERVER__HEALTH_LISTEN"] = "127.0.0.1:0"
         env["JAMMI_SERVER__SERVICES"] = "all"
         self.proc = subprocess.Popen(
-            [server_bin], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+            [server_bin],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
         )
-        self.port = flight_port
+        announced: queue.Queue = queue.Queue(maxsize=1)
+        self._log: list = []
+
+        def drain() -> None:
+            reported = False
+            for line in self.proc.stdout:
+                self._log.append(line)
+                if not reported and line.startswith(self.BANNER):
+                    fields = dict(
+                        tok.split("=", 1)
+                        for tok in line[len(self.BANNER):].split()
+                        if "=" in tok
+                    )
+                    announced.put(int(fields["flight"].rsplit(":", 1)[1]))
+                    reported = True  # announced once; keep draining regardless
+
+        self._drain_thread = threading.Thread(target=drain, daemon=True)
+        self._drain_thread.start()
+        try:
+            self.port = announced.get(timeout=30)
+        except queue.Empty:
+            self.proc.terminate()
+            raise RuntimeError(
+                "jammi-server never announced its listening ports (did it fail to "
+                f"bind?):\n{''.join(self._log)}"
+            ) from None
+        # Bound is not yet serving — the banner prints before `serve()` — so
+        # still poll a real client handshake before handing the server out.
         deadline = time.time() + 30
         while time.time() < deadline:
             if self.proc.poll() is not None:
-                out = self.proc.stdout.read().decode(errors="replace") if self.proc.stdout else ""
-                raise RuntimeError(f"jammi-server exited early:\n{out}")
+                raise RuntimeError(f"jammi-server exited early:\n{''.join(self._log)}")
             try:
                 handshake = jammi.connect(f"grpc://127.0.0.1:{self.port}")
                 handshake.get_server_info()
@@ -136,19 +205,29 @@ class LiveServer:
         raise RuntimeError("jammi-server did not become ready within 30s")
 
     def __exit__(self, *exc) -> None:
+        """Stop the child and AWAIT its real exit — the release point itself.
+
+        No `kill` fallback and no sidecar poll of the catalog file: a server
+        that will not close on request is a finding, and a successor's
+        successful open is what proves the single-process catalog was released.
+        """
         self.proc.terminate()
-        try:
-            self.proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
+        self.proc.wait(timeout=30)
+        self.returncode = self.proc.returncode
 
 
-server = LiveServer().__enter__()
+# One artifact directory, opened by BOTH servers below, in sequence.
+ARTIFACT_DIR = tempfile.mkdtemp(prefix="jammi_srv_ftaccel_")
+
+# Server A: the training surface is mounted and accepts submissions, but this
+# process never claims — `[training] run_worker = false`.
+server_a = LiveServer(ARTIFACT_DIR, run_worker=False).__enter__()
 # The literal `grpc://` target — the same public front door every other
 # remote-transport chapter in this book opens, over a real live server this
 # render itself just started.
-remote = jammi.connect(f"grpc://127.0.0.1:{server.port}")
-print(f"remote jammi-server up at grpc://127.0.0.1:{server.port}")
+remote_a = jammi.connect(f"grpc://127.0.0.1:{server_a.port}")
+print(f"server A (run_worker=false) up at grpc://127.0.0.1:{server_a.port}")
+print(f"  artifact dir: {ARTIFACT_DIR}")
 ```
 
 ```{python}
@@ -166,19 +245,55 @@ _work = tempfile.mkdtemp(prefix="jammi_ftaccel_corpus_")
 _corpus_path = f"{_work}/pairs.parquet"
 pq.write_table(pa.table(PAIRS), _corpus_path)
 
-remote.add_source("ftaccel_pairs", url=f"file://{_corpus_path}", format="parquet")
+remote_a.add_source("ftaccel_pairs", url=f"file://{_corpus_path}", format="parquet")
 print("registered a 12-row (anchor, positive) pairs source")
 ```
 
-## Submitting an `f16` fine-tune, and reading its report before it is known
+## Submitting an `f16` fine-tune, and reading its report across the job's lifecycle
 
 `fine_tune`'s `backbone_dtype` only takes effect on the LoRA-adapter arm (`target_modules`
 non-empty) — that is the arm that actually materializes a dtype-typed encoder to run the
-acceleration probe against. Right after submission the report is `{"state": "pending"}`: the job
-exists, but no worker has claimed it yet, so no device is even known. The SAME handle's
-`wait()` blocks until the run finishes; by then the claiming worker has long since resolved a
-device and recorded a `"determined"` report — read back through the exact call a mid-training
-status poll would make.
+acceleration probe against. Submission itself writes `{"state": "pending"}` into the job's report
+column: the job exists, but no worker has claimed it yet, so no device is even known. That marker
+is an **explicit written state**, not an empty column: an unset report is `None` on this surface
+(an honest absence of information, deliberately distinguishable from `pending`), so a
+just-submitted job is never `None` — the tri-state is `None` / `pending` / `determined`, and the
+cell below pins the middle one exactly.
+
+**What this section used to concede, and what changed.** Until recently the server this chapter
+started was necessarily an all-in-one deployment: mounting the `train` tier is what makes
+`fine_tune` callable at all, and that same tier ran the claiming worker *inside the very process
+that accepted the submission*. Between the submit RPC returning and the status RPC landing, that
+worker's claim loop could already have claimed the job, resolved the device and replaced the
+marker with a `"determined"` report — a genuine race, not a flake, and one a slower (2-vCPU)
+render machine lost more often than a fast one. So this section asserted the race-free fact
+(never `None`) plus *whichever of the two legal live states it caught*, byte-exactly inside that
+state's own branch. That two-branch form was the honest previous state, and it is worth saying
+why: it never loosened an assertion, it conceded only the **choice** between two assertions,
+because a state the chapter could not deterministically observe is a state it must not claim to
+have measured.
+
+What changed is not a code path — it is **configuration**. `TrainingConfig::run_worker`
+(`crates/jammi-db/src/config.rs`) is a runtime setting that answers exactly one question: does
+THIS process run the training claim loop? With `[training] run_worker = false` (or the
+environment override `JAMMI_TRAINING__RUN_WORKER=false`) the process still mounts and serves the
+training surface and still accepts submissions — it simply never claims, and submitted jobs stay
+`queued`. Submission and claiming, previously welded together by the tier mount, are separable by
+a deployment knob; and because it is one key read by whatever arm decides whether to spawn the
+loop, the same knob is honored identically by a server over the wire and by the embedded,
+in-process arm — not two settings that have to be kept in agreement. The race below is therefore
+not *widened*, it is **removed**: with no claimant in the process, `pending` is not a window to be
+caught, it is the job's steady state. The two-branch concession is deleted rather than loosened,
+and what replaces it is strictly stronger — one byte-exact dict and one byte-exact status string,
+asserted on **every** poll of a multi-poll window that outlasts a claiming worker's own idle poll.
+
+Sleeping is precisely what the previous version refused to do, so it is worth being exact about
+why it is correct here. A sleep that widens a race window is a way of *making a flaky assertion
+pass*; a sleep that spans more than the interval a claimant would have woken on is a way of
+*demonstrating that nothing claims*. The first hides a state the chapter cannot observe; the
+second measures one it can. `TrainingConfig`'s default `idle_poll_secs = 1` — the interval an idle
+worker polls for a queued job on — is the number that has to be exceeded, and the span below
+exceeds it.
 
 ```{python}
 import json
@@ -186,7 +301,7 @@ import json
 BASE_MODEL = f"local:{TINY_MODERNBERT}"
 TARGET_MODULES = ["Wqkv", "Wo", "Wi"]  # ModernBERT's own LoRA-eligible linear names
 
-job_f16 = remote.fine_tune(
+job_a = remote_a.fine_tune(
     source="ftaccel_pairs",
     base_model=BASE_MODEL,
     columns=["anchor", "positive"],
@@ -198,14 +313,117 @@ job_f16 = remote.fine_tune(
     backbone_dtype="f16",
     target_modules=TARGET_MODULES,
 )
+JOB_A_ID, JOB_A_MODEL_ID = job_a.job_id, job_a.model_id
+print(f"submitted job {JOB_A_ID} to a server that does not claim")
 
-# Read the report BEFORE waiting — this is the submission-time state every job
-# carries, an explicit marker rather than SQL NULL (esc-075's own contract).
-pending = job_f16.acceleration_report()
-print("immediately after submit:", pending)
-assert pending == {"state": "pending"}, pending
+# `TrainingConfig`'s own default idle poll — the interval a CLAIMING process
+# wakes on to look for a queued job. The observation span below must EXCEED it,
+# or "still pending" would prove nothing about claiming.
+WORKER_IDLE_POLL_SECONDS = 1.0
+POLL_COUNT = 4
+POLL_GAP_SECONDS = 0.5
 
+observed = []
+t0 = time.monotonic()
+for i in range(POLL_COUNT):
+    if i:
+        time.sleep(POLL_GAP_SECONDS)
+    report, status = job_a.acceleration_report(), job_a.status()
+    observed.append((time.monotonic() - t0, report, status))
+    # Byte-exact on the PARSED dict and the status string, EVERY poll. One
+    # value each, no branch: with no claimant in this process there is exactly
+    # one legal answer, and a `determined` report here would be a real bug.
+    assert report == {"state": "pending"}, report
+    assert status == "queued", status
+
+for at, report, status in observed:
+    print(f"  t+{at:>4.2f}s  acceleration_report()={report}  status()={status!r}")
+
+span = observed[-1][0]
+assert len(observed) >= 3, observed
+assert span > WORKER_IDLE_POLL_SECONDS, span
+print(
+    f"\nstable: {len(observed)} polls spanning {span:.2f}s > the {WORKER_IDLE_POLL_SECONDS}s "
+    "worker idle poll — pending is this job's steady state, not a window"
+)
+```
+
+## Handing the queue to a claiming process
+
+Server A has done everything a submission-only deployment can do: the job is real, queued, and
+recorded in the catalog. To determine anything about it, something has to *claim* it — and the
+claim is what computes the `"determined"` report the rest of this chapter measures.
+
+The order below is forced by the store, not chosen for convenience. This render's catalog is
+SQLite, a single-process store, so server A must have really exited before server B may open the
+same artifact directory — and the successor's successful open is itself the proof that the
+predecessor released the catalog, rather than a sidecar poll of a lock file or a sleep-and-hope.
+On Postgres the same knob composes differently and better: a multi-process catalog lets a
+`run_worker = false` submission front end and a `run_worker = true` worker run **concurrently**,
+which is the deployment shape the flag exists for. The strict sequencing here is SQLite's
+constraint showing through, not the flag's.
+
+What survives the process boundary is the queue itself. Server B is today's ordinary all-in-one —
+no override, `run_worker` at its default `true` — and it claims a job it never accepted, submitted
+by a process that no longer exists, because the job lives in the catalog rather than in either
+server's memory. On SQLite that is the rule in general: a queued job is claimed by the next
+claiming process that opens the directory.
+
+```{python}
+# Server A closes FIRST, and the close is AWAITED — a single-process store is
+# not released until the process is really gone.
+remote_a.close()
+server_a.__exit__(None, None, None)
+assert server_a.returncode is not None, "server A did not exit"
+print(f"server A closed (returncode={server_a.returncode})")
+
+# Server B: today's all-in-one, no override, `run_worker` at its default. That
+# this open SUCCEEDS on the same directory is the release proof.
+server_b = LiveServer(ARTIFACT_DIR).__enter__()
+remote = jammi.connect(f"grpc://127.0.0.1:{server_b.port}")
+print(f"server B (default run_worker) up at grpc://127.0.0.1:{server_b.port}, same artifact dir")
+```
+
+A job handle is **re-attachable across connections**, on both arms: `db.training_job(job_id)`
+hands back a handle to a job this session never submitted — the same
+`jammi.RemoteTrainingJob` here that `fine_tune` returns, and the embedded arm's own
+`TrainingJob` there. That is what makes the sequence below expressible through the public
+surface at all: server A's handle died with server A's channel, and the id is the only thing
+that crosses. Existence is resolved at attach time, by one `TrainingStatus` call, rather
+than left for the first read to discover: a job id with no row visible to this session's
+tenant raises the typed `jammi.errors.BackendError` — the same class on both transports —
+instead of handing back a handle that fails later.
+
+`TrainingStatusResponse.model_id` reads the same on both arms at every lifecycle state —
+queued, running, completed, failed — not only once the job completes: the server resolves
+it via `resolve_model_id` (`crates/jammi-server/src/grpc/training.rs:110`) into that field
+(`crates/jammi-wire/proto/jammi/v1/training.proto:433-444`), and the embedded attach calls
+the SAME engine function, so this client duplicates no naming rule of its own. (What DOES
+stay empty until completion, on both arms, is a different column: `list_training_jobs()`'s
+`output_model_id` relays `training_jobs.output_model_id` verbatim — "has the output row
+landed" — where `model_id` answers "what will this model be called".) Nothing about server
+B's claim loop is asserted at attach time here regardless — whether it has already finished
+this job by then is a race, and a race is exactly what this chapter refuses to assert into.
+The re-attach *after* `wait()` in the cell below is the deterministic read once the job is
+terminal, and it recovers the very id server A was handed at submit — over a connection to
+a process that never accepted the submission.
+
+```{python}
+# Job A, over server B's connection, through the public verb. Same job id —
+# nothing is resubmitted.
+job_f16 = remote.training_job(JOB_A_ID)
+assert job_f16.job_id == JOB_A_ID
+
+# The queue outlived the process that accepted it: a job server B never saw
+# submitted leaves `queued` under server B's own claim loop.
 job_f16.wait()
+assert job_f16.status() == "completed", job_f16.status()
+
+# A second attach, now that the job is terminal — the deterministic `model_id`
+# read. Server B recovers the exact output id server A was handed at submit,
+# from the catalog alone.
+assert remote.training_job(JOB_A_ID).model_id == JOB_A_MODEL_ID
+
 report_f16 = job_f16.acceleration_report()
 print(json.dumps(report_f16, indent=2, sort_keys=True))
 
@@ -216,13 +434,26 @@ assert report_f16["device"] == "cpu"  # this render's server has no CUDA device
 
 ## Reading `Holds` and `Miss` — the real vocabulary, on a real (CPU) job
 
-The report's `ops` map is one entry per fused primitive this job's own probe forward pass
-exercised, each `{"holds": bool, "reason": str}` — `holds: true` means the SAME dispatch
-registry the kernel's own admission gate maintains actually recorded a fused hit for THIS job;
-`holds: false` carries the exact domain-check `reason` key the admission predicate itself
-produced, never a re-derived one. This one CPU job Holds on six of the seven `ops` entries and
-Misses on the seventh (`attention_block`); `flash` (a separate field, discussed below) Misses
-too — each Miss teaches a different, independent limit:
+The report's `ops` map is one entry per fused primitive this job's own probe exercised — a real
+forward pass **plus one backward and one optimizer step**, which is what makes the epilogue and
+optimizer kernels below observable at all — each `{"holds": bool, "reason": str}`. `holds: true`
+means the SAME dispatch registry the kernel's own admission gate maintains actually recorded a
+fused hit for THIS job; `holds: false` carries the exact domain-check `reason` key the admission
+predicate itself produced, never a re-derived one — and, since campaign #446, read out of *this
+job's own probe window* rather than a process-lifetime warning list, so a repeated miss can never
+be attributed some other job's predicate.
+
+The report keys are **dtype-neutral**: `cast_scale` and `cast_add` name a cast boundary whose
+actual registry key is resolved from the job's backbone dtype at probe time (this `f16` job's
+`cast_scale_f16_f32` / `cast_add_f16`; a `bf16` job's `cast_scale_bf16_f32` / `cast_add_bf16` —
+the same two report keys either way). This one CPU job `Hold`s on all nine of the primitives its
+probe attributed a clean dispatch to — `layer_norm`, `rope`, `softmax`, `geglu`, `dropout`,
+`low_rank_residual_linear`, `cast_scale`, `cast_add`, `adamw_step` — and `Miss`es on the one
+remaining entry, `attention_block`; `flash` (a separate field, discussed below) `Miss`es too. The
+map's *membership* is itself a measured fact, not a fixed-size table: an op whose before/after
+dispatch counters show no clean single-arm signal is omitted entirely rather than guessed at (the
+mechanism, and a GPU report that omits more, are discussed further down). Each `Miss` teaches a
+different, independent limit:
 
 ```{python}
 for op in sorted(report_f16["ops"]):
@@ -232,6 +463,30 @@ for op in sorted(report_f16["ops"]):
 
 print(f"\n  {'flash':<24s} {'Hold' if report_f16['flash']['holds'] else 'Miss':<5s} "
       f"reason={report_f16['flash']['reason']}")
+
+# Measured, per op — the verdicts and reason keys the prose below explains, each
+# asserted individually so a widened probe (a new attributed op appearing in the
+# map) cannot quietly invalidate any claim made here.
+HOLDING = (
+    # forward-pass encoder + LoRA kernels
+    "layer_norm", "rope", "softmax", "geglu", "dropout", "low_rank_residual_linear",
+    # backward-pass cast boundary — dtype-neutral report keys, f16 registry keys here
+    "cast_scale", "cast_add",
+    # optimizer step
+    "adamw_step",
+)
+for op in HOLDING:
+    assert report_f16["ops"][op] == {"holds": True, "reason": "domain_ok"}, report_f16["ops"][op]
+
+assert report_f16["ops"]["attention_block"] == {
+    "holds": False,
+    "reason": "dtype_f32_matching_between_qkv_and_mask_on_cpu",
+}, report_f16["ops"]["attention_block"]
+assert report_f16["flash"] == {"holds": False, "reason": "cuda_not_compiled"}, report_f16["flash"]
+
+n_hold = sum(1 for e in report_f16["ops"].values() if e["holds"])
+print(f"\n  attributed ops: {len(report_f16['ops'])}   Hold: {n_hold}   "
+      f"Miss: {len(report_f16['ops']) - n_hold}")
 ```
 
 - **`layer_norm` / `rope` / `softmax` / `geglu` / `dropout` / `low_rank_residual_linear` →
@@ -247,6 +502,27 @@ print(f"\n  {'flash':<24s} {'Hold' if report_f16['flash']['holds'] else 'Miss':<
   benefit (one rounding point instead of several) is real on CPU too, even though the *wall-clock*
   benefit is a CUDA-only property. A CPU render `Hold`ing these is therefore not a mistake; it is
   the honest, correct value of a domain check whose domain never mentioned the device.
+- **`cast_scale` / `cast_add` → `Hold`, `domain_ok`.** The LoRA residual's **backward-pass** cast
+  boundary: the gradient arrives in the backbone's reduced-precision dtype and has to reach `f32`
+  (`cast_scale`), and the base and LoRA gradient paths have to be added back across that same
+  boundary (`cast_add`). Both are two-kernel chains a fused kernel collapses into one, which is
+  also why they exist **only** for a reduced-precision backbone — an `f32` job takes a
+  structurally different, admission-free branch and these keys are simply absent from its report,
+  not `Miss`ing. They are the reason this chapter's probe runs a backward and an optimizer step
+  rather than a forward pass alone: a forward-only probe could not honestly claim to have measured
+  either. That these appear here **at all** on an `f16` job is itself recent: the probed-op table
+  used to hard-code the `bf16` registry keys, so an `f16` job's cast epilogue dispatched for real
+  and was then reported as nothing at all — a silent-eager blind spot on the headline dtype,
+  closed by making the report key dtype-neutral and resolving the registry key from the job's own
+  backbone dtype.
+- **`adamw_step` → `Hold`, `domain_ok`.** The fused multi-tensor AdamW step — the optimizer, not
+  the model. Worth stating plainly because it is the one op whose domain is on a *different axis*
+  than everything else in this list: its own predicate requires `theta`/`first_moment`/
+  `second_moment`/`grad` to be `F32`, contiguous and co-located, and that stays true no matter
+  what `backbone_dtype` the job declared — a mixed-precision recipe keeps `f32` master weights and
+  moments precisely so the update step is not the thing that loses precision. So `adamw_step`
+  `Hold`s here for the same reason it would `Hold` on an `f32` or `bf16` job: the op's dtype
+  DOMAIN is not the job's dtype CLASS.
 - **`attention_block` → `Miss`, `dtype_f32_matching_between_qkv_and_mask_on_cpu`.** This is the
   op's fused kernel's OWN per-device dtype domain, not a re-derivation: its `cpu_fwd` arm
   implements `F32` only (no `F16`/`BF16` `MatMul` on CPU), so an `F16` job's qkv tensor fails this
@@ -286,6 +562,7 @@ try:
         backbone_dtype="bf16",
         target_modules=TARGET_MODULES,
     )
+    JOB_BF16_ID = job_bf16.job_id
     job_bf16.wait()
     raise RuntimeError("bf16 must be refused on this CPU-only build — it completed instead")
 except jammi.errors.TrainingError as exc:
@@ -298,10 +575,51 @@ print("\nbf16 fine-tuning was refused loud, with the typed remedy message pointi
       "never a silent downgrade, never a silently-eager bf16 run.")
 ```
 
+## Both outcomes, from the catalog — `list_training_jobs`
+
+Two jobs have now run through this artifact directory, submitted by two different processes over
+two different connections: the `f16` one server A accepted and server B claimed and completed,
+and the `bf16` one server B refused. Neither handle is needed to see them. `db.list_training_jobs()`
+is the tenant-scoped listing peer of `training_job(job_id)` — the same `TrainingJobSummary` field
+set on both arms (`job_id`, `kind`, `status`, `base_model_id`, `output_model_id`, `created_at`,
+`error`), most recent first, with `output_model_id` empty until a job completes and `error` empty
+unless it failed. Neither arm maps either onto `None`, so a caller branches on one thing on both
+transports. There is no progress surface here by construction: the engine records run metrics only
+at finalization, so a listing shows terminal facts, not a percentage.
+
+```{python}
+jobs = remote.list_training_jobs()
+for j in jobs:
+    print(f"  {j['job_id']}  status={j['status']:<10s} "
+          f"output_model_id={j['output_model_id']!r} error={j['error'][:40]!r}")
+
+by_id = {j["job_id"]: j for j in jobs}
+assert set(by_id) == {JOB_A_ID, JOB_BF16_ID}, sorted(by_id)
+# Most recent first — the bf16 submission is the later of the two.
+assert jobs[0]["job_id"] == JOB_BF16_ID, jobs[0]["job_id"]
+
+# The completed job carries its output id; the refused one carries its error —
+# and each carries the empty string, not `None`, where the other carries a value.
+done, refused = by_id[JOB_A_ID], by_id[JOB_BF16_ID]
+assert done["status"] == "completed", done["status"]
+assert done["output_model_id"] == JOB_A_MODEL_ID, done["output_model_id"]
+assert done["error"] == "", repr(done["error"])
+assert refused["status"] == "failed", refused["status"]
+assert refused["output_model_id"] == "", repr(refused["output_model_id"])
+assert "bf16" in refused["error"], refused["error"]
+
+# The field set is the wire's, exactly — no arm adds or drops a key.
+SUMMARY_KEYS = {
+    "job_id", "kind", "status", "base_model_id", "output_model_id", "created_at", "error",
+}
+for j in jobs:
+    assert set(j) == SUMMARY_KEYS, sorted(set(j) ^ SUMMARY_KEYS)
+```
+
 ```{python}
 # | echo: false
 remote.close()
-server.__exit__(None, None, None)
+server_b.__exit__(None, None, None)
 ```
 
 ## Measured on real GPU hardware, not here
@@ -406,10 +724,16 @@ proof; that oracle is the numerics proof, and the two are deliberately separate 
 
 Two honest observations about what a GPU report for this job looks like. First, on real A100
 hardware the LoRA epilogue genuinely dispatches fused at `f16` — the engine's own committed
-A/B provenance for this exact fixture records `lora_linear_fused` firing on every training
-forward of an `f16` run with **zero** eager fallbacks (`docs/plans/63-how-well/measurements/`
-carries the raw per-leg reports), so a GPU report shows `low_rank_residual_linear` `Hold`ing
-just as the CPU cells above do. Second, a GPU report's `ops` map may omit `rope`, `softmax`,
+A/B provenance for the reporter's own checkpoint — ModernBERT-large, not this render's tiny
+fixture — records `lora_linear_fused` firing on every training forward of an `f16` run with
+**zero** eager fallbacks: all sixteen committed legs of that `f16` sweep report
+`lora_linear_fused_dispatches = 13104` against `lora_linear_eager_dispatches = 0`
+(`docs/plans/63-how-well/measurements/f16-sweep/raw/`). One honesty note on that citation: the
+sweep's own artifact is stamped `INVALID` as an **A/B verdict** (its merge-time premise
+pre-registered the flash-cascade differential as `BF16`-only, so every `f16` leg violated it and
+no sign test ran) — the dispatch counters cited here are raw recorded per-leg facts that verdict
+does not touch, and nothing about the A/B comparison is claimed from them. So a GPU report shows
+`low_rank_residual_linear` `Hold`ing just as the CPU cells above do. Second, a GPU report's `ops` map may omit `rope`, `softmax`,
 and `attention_block` entirely rather than reporting them: `two_arm_holds` (the mechanism that
 turns a before/after dispatch-counter delta into a report entry) declines to fabricate an entry
 for an op whose counters show no clean single-arm signal, and once FlashAttention itself owns
@@ -441,10 +765,16 @@ honest "no independent signal", never a smoothed-over claim.
 > determination has to be *computed and read back*, not assumed — `{"state": "pending"}` at
 > submission, `{"state": "determined", "ops": {...}, "flash": {...}}` once a worker resolves a
 > device, each entry carrying the SAME `Hold`/`Miss` + `reason` vocabulary the kernel's own
-> admission gate produces. On this render's CPU-only server every `ops` entry this chapter
-> measured is real (six of seven primitives genuinely `Hold` — a portable, dtype-only domain
-> check `f16` now clears everywhere it is dtype-eligible — while `attention_block`'s per-device
-> dtype gate genuinely `Miss`es, for the reason this chapter names exactly), and `flash` is always
+> admission gate produces. Both halves are observed here over live servers because submission and
+> claiming are separable by **configuration** (`TrainingConfig::run_worker`), not by a second code
+> path: one process accepts and never claims, a second opens the same catalog and claims what the
+> first accepted — which also makes the queue's survival across a process boundary a measured
+> fact rather than a design claim. On this render's CPU-only server every `ops` entry this chapter
+> measured is real (the nine named primitives genuinely `Hold` — a portable, dtype-only domain
+> check `f16` now clears everywhere it is dtype-eligible, including the backward-pass cast
+> boundary its report key names dtype-neutrally and the `f32`-domain optimizer step — while
+> `attention_block`'s per-device dtype gate genuinely `Miss`es, for the reason this chapter names
+> exactly), and `flash` is always
 > the honest compiled-away floor. The numbers only a real CUDA server can produce —
 > FlashAttention-2's own `f16` admission actually `Hold`ing, and the memory story's honest arc (a
 > real limit, root-caused to this campaign's own earlier fix leaking onto the eval path, and

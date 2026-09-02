@@ -7,6 +7,7 @@ use datafusion_federation::{FederatedQueryPlanner, FederationOptimizerRule};
 
 use crate::audit::{EnvSigningKeyStore, SigningKeyStore};
 use crate::catalog::backend::BackendImpl;
+use crate::catalog::segment_repo::IndexSegment;
 use crate::catalog::topic_repo::TopicRepo;
 use crate::catalog::Catalog;
 use crate::config::{BrokerConfig, CatalogConfig, JammiConfig, SigningKeyConfig};
@@ -720,6 +721,40 @@ impl JammiSession {
         Ok(df.collect().await?)
     }
 
+    /// Every ANN index segment of `table_name`, ordered by `segment_id`.
+    ///
+    /// A result table's ANN index is a *set* of immutable segments (migration
+    /// 025), one `index_segments` catalog row each. This is the reader for that
+    /// set: the same rows the merge path loads, reached through the session
+    /// rather than through the catalog file. The catalog's own tables are not
+    /// registered in the DataFusion federation [`Self::sql`] runs over (that
+    /// federates result tables and external sources), so this typed verb — not
+    /// a `SELECT` — is the surface.
+    ///
+    /// **Tenant scope is a row predicate here, enforced by the parent.** The
+    /// `index_segments` row is reached only *after* `table_name` resolves
+    /// through the tenant-filtered
+    /// [`Catalog::get_result_table`](crate::catalog::Catalog::get_result_table)
+    /// (`WHERE table_name = $1 AND (tenant_id = $2 OR tenant_id IS NULL)`), the
+    /// same predicate every other read of that row uses. A table this session's
+    /// tenant cannot resolve returns an **empty** listing — byte-identical to
+    /// the answer an unknown table gets, so the verb is not an existence oracle
+    /// for a peer's table names. `Catalog::list_index_segments` is itself not
+    /// independently tenant-filtered, which is exactly why the resolve happens
+    /// here and not there.
+    ///
+    /// An empty result is therefore three states at once — no such table, no
+    /// table *for you*, or a table whose index is flat (unsegmented). A caller
+    /// that must distinguish "the table exists" asks the result-table surface
+    /// (`describe_source`'s embedded result tables), which is the verb for that
+    /// question.
+    pub async fn list_index_segments(&self, table_name: &str) -> Result<Vec<IndexSegment>> {
+        if self.catalog.get_result_table(table_name).await?.is_none() {
+            return Ok(Vec::new());
+        }
+        self.catalog.list_index_segments(table_name).await
+    }
+
     /// Shared handle to the trigger broker the session was constructed with.
     pub fn trigger_broker(&self) -> Arc<dyn TriggerBroker> {
         Arc::clone(&self.trigger_broker)
@@ -847,6 +882,37 @@ impl JammiSession {
     /// Return a reference to the artifact catalog.
     pub fn catalog(&self) -> &Arc<Catalog> {
         &self.catalog
+    }
+
+    /// Release this session's hold on the catalog file.
+    ///
+    /// Closes the catalog's connection pool and waits for every connection to
+    /// shut down. Takes `&self`, so it works on the `Arc<JammiSession>` shape
+    /// every embedding host holds, and is idempotent.
+    ///
+    /// **Dropping a session is not a release point.** `sqlx` closes returned
+    /// connections from a background task, so after the last handle drops the
+    /// pool's connections — and, for the SQLite backend, the process-exclusive
+    /// file lock and the `catalog.db-wal` sidecar they keep alive — persist for
+    /// an unbounded time. Anything that hands the catalog *directory* to
+    /// another party must await this first:
+    ///
+    /// * a process that seeds a catalog and then spawns a second process on
+    ///   the same directory (the second process is otherwise refused — see
+    ///   [`crate::catalog::backend_sqlite`]);
+    /// * an embedding host (e.g. the Python extension) whose caller then
+    ///   writes the same file through a *different* SQLite library instance.
+    ///   That topology is out of contract in any case, but it is only
+    ///   *harmless* once the engine has actually let go: while the engine holds
+    ///   the file its WAL index lives in heap memory that no other library
+    ///   instance can see, so a foreign connection opened before this returns
+    ///   reads and writes a divergent image of the database.
+    ///
+    /// Awaiting this waits for outstanding checkouts, so a caller holding a
+    /// live transaction on another task will wait for it to finish. Every
+    /// subsequent catalog operation on this session fails.
+    pub async fn close(&self) {
+        self.catalog.backend_arc().close().await;
     }
 
     /// Shared handle to the storage registry. Components that write

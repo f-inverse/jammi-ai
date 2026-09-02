@@ -1,5 +1,5 @@
-//! CPU↔CUDA parity oracle for `Axpy` — this is the landing proof the
-//! lead's pod session runs, not a smoke test.
+//! CPU↔CUDA parity oracle for every fused op in this crate — this is the
+//! landing proof the lead's pod session runs, not a smoke test.
 //!
 //! Compiles and links ONLY with the `cuda` feature (`required-features =
 //! ["cuda"]` in `Cargo.toml` — a plain `cargo test -p jammi-kernels` never
@@ -17,15 +17,15 @@
 //! here in the one file whose entire job is to be that failure mode's
 //! landing proof.
 //!
-//! Covers exactly the divergence-prone classes this crate's own review
-//! found bugs in: a contiguous case, a NARROWED tensor with a nonzero
-//! `start_offset` (the missing-offset bug: the CUDA arm used to read the
-//! base buffer's first `n` elements instead of the tensor's real range),
-//! an empty tensor (the illegal `(0, 1, 1)` launch grid), a size that is
-//! an exact multiple of the launch's 1024-thread block, a size that is
-//! NOT a multiple of it (exercises the kernel's `if (i < n)` bounds check
-//! on a partial last block), both supported dtypes (f32, bf16), and both
-//! forward AND backward.
+//! Every op's suite covers the same divergence-prone classes this
+//! crate's own review found real bugs in: a contiguous case, a NARROWED
+//! tensor with a nonzero `start_offset` (the missing-offset bug: a CUDA
+//! arm reading the base buffer's first `n` elements instead of the
+//! tensor's real range), an empty tensor (the illegal `(0, 1, 1)` launch
+//! grid), a size that is an exact multiple of the launch's 1024-thread
+//! block, a size that is NOT a multiple of it (exercises a kernel's
+//! `if (i < n)` bounds check on a partial last block), every supported
+//! dtype, and both forward AND backward.
 
 #![cfg(feature = "cuda")]
 
@@ -40,17 +40,13 @@ use jammi_kernels::ops::{
     adamw_step_fused_t, apply1, apply2, apply3, apply_inplace2, bwd_gradient_gemm_layouts,
     cast_add_bf16_into, cast_scale_bf16_f32_into, mem_efficient_attention, quant_matmul_grad,
     AdamMomentUpdate, AdamMomentUpdateFmaContractedRedControl, AdamWParams, AttentionBlockFused,
-    Axpy, BwdGemmLayoutsParams, CastAddBf16, CastAddF16, CastScaleBf16F32, CastScaleF16F32,
-    DropoutFused, DropoutKey, FullyMaskedPolicy, GegluFused, GeluVariant, LayerNormFused,
-    LowRankResidualLinear, MemEfficientAttention, PhiloxKatProbe, RopeFused, ScaledCastAdd,
-    SoftmaxLastDimFused, ATTENTION_BLOCK_WINDOW_MASKED_VALUE, MEM_EFFICIENT_WINDOW_MASKED_VALUE,
+    BwdGemmLayoutsParams, CastAddBf16, CastAddF16, CastScaleBf16F32, CastScaleF16F32, DropoutFused,
+    DropoutKey, FullyMaskedPolicy, GegluFused, GeluVariant, LayerNormFused, LowRankResidualLinear,
+    MemEfficientAttention, PhiloxKatProbe, RopeFused, ScaledCastAdd, SoftmaxLastDimFused,
+    ATTENTION_BLOCK_WINDOW_MASKED_VALUE, MAX_LAST_DIM, MEM_EFFICIENT_WINDOW_MASKED_VALUE,
 };
 use std::borrow::Cow;
 use std::sync::Arc;
-
-fn axpy(alpha: f64, x: &Tensor, y: &Tensor) -> candle_core::Result<Tensor> {
-    apply2(x, y, Axpy::new(alpha))
-}
 
 /// F32 forward/backward CPU-vs-CUDA absolute tolerance. nvcc's default
 /// `--fmad=true` may contract `alpha*x+y` into a single-rounding hardware
@@ -314,8 +310,8 @@ const F32_CANCELLATION_ULPS: f32 = 24.0;
 
 /// The `k_abs` term for every [`f32_two_term_bound`] call belonging to a
 /// PURELY ELEMENTWISE op with no reduction and therefore no cancellation
-/// to produce a near-zero, ill-conditioned reference: `axpy` (`alpha*x +
-/// y`), `rope` f32 (`x*cos + rotate_half(x)*sin`), `geglu` f32 (`gelu(gate) *
+/// to produce a near-zero, ill-conditioned reference:
+/// `rope` f32 (`x*cos + rotate_half(x)*sin`), `geglu` f32 (`gelu(gate) *
 /// up`), `scaled_cast_add` f32 (`base + lora*scaling`), `dropout` f32
 /// (`x / (1-p)` at a kept position). Each of these composes at most a
 /// small, fixed number of `f32` roundings/fmad-contractions per output
@@ -338,7 +334,7 @@ const F32_ELEMENTWISE_CANCELLATION_ULPS: f32 = 3.0;
 /// intrinsic (`src/cuda/geglu.cu`'s `gelu_erf_cdf`, whose own comment
 /// documents this: "match the CPU arm's `libm::erff`-based formula to
 /// within ordinary cross-platform libm ULP" — i.e. an acknowledged,
-/// independent-implementation gap, unlike `axpy`/`rope`/`scaled_cast_add`,
+/// independent-implementation gap, unlike `rope`/`scaled_cast_add`,
 /// whose two arms compute the IDENTICAL arithmetic expression with no
 /// special-function call at all). Pod-measured: at
 /// `F32_ELEMENTWISE_CANCELLATION_ULPS` (3.0) `geglu f32 fwd` landed at
@@ -347,6 +343,52 @@ const F32_ELEMENTWISE_CANCELLATION_ULPS: f32 = 3.0;
 /// tight for this leg's genuine extra divergence source; re-measured at
 /// this value with real headroom (see this branch's hand-off report).
 const F32_GELU_ERF_LIBM_ULPS: f32 = 8.0;
+
+/// GeGLU's 16-bit FORWARD parity `k`, DERIVED (campaign #446) from the
+/// kernel's rounding-point STRUCTURE rather than from its rounding-point
+/// COUNT — `no-producer: derived`.
+///
+/// `geglu_fwd_f16`/`geglu_fwd_bf16` have two rounding points
+/// (`cuda/geglu_f16.cu:57` ROUND 1, `:59` ROUND 2), and the guide's §3.10
+/// row records exactly that ("2 fwd"). The pre-#446 `k = 2` read the count
+/// off that row directly — which undercounts, because ROUND 1 is UPSTREAM
+/// of a multiply:
+///
+/// * ROUND 1 rounds `act = gate·Φ(gate)` to 16-bit. The two arms compute
+///   `Φ` with different libraries (CUDA `erff` vs the CPU reference's
+///   `erf`), so their `act` differs by ~1 f32 ULP — enough to land on
+///   opposite sides of a 16-bit round-to-nearest midpoint. Measured on
+///   this file's own `n_out = 1024` fixture: 384 of 1024 elements sit
+///   within one f32 ULP of such a midpoint. So `|Δact| <= 1 ulp(act)`.
+/// * That is a RELATIVE perturbation of up to `2^-10` (f16) / `2^-7`
+///   (bf16), and `out = act · up` carries it through unattenuated:
+///   `|Δout| <= |out| · 2^-mantissa`, which is `>= 1` and `< 2` ULPs of
+///   `out` (`ulp(|out|)` itself lies in `[|out|·2^-(m+1), |out|·2^-m]`).
+/// * ROUND 2 then adds each arm's own <=0.5-ULP rounding: <=1 more ULP of
+///   difference.
+///
+/// Total `< 1 + 2 = 3` ULPs of the output. `k = 3`.
+///
+/// This is NOT an ad-hoc widening: at `k = 2` the a100 (`compute_cap 8.0`)
+/// and l40s (`8.9`) arch-set artifacts BOTH measure worst `Δ/bound`
+/// EXACTLY `1.0` on `geglu_parity_multi_block_exact_multiple_of_block_size`
+/// — a bound sitting precisely on its own worst case, i.e. one library
+/// revision from a false RED — and the 2-ULP delta they measure is the
+/// ROUND-1-flip term above, reproduced independently in numpy from a
+/// +/-1-f32-ULP `erf` perturbation (worst element `gate = -3.1855`,
+/// `up = 5.8125`, the two candidate `act_f16` values `-0.0023021698` and
+/// `-0.0023002625`, one f16 ULP apart, giving `|Δout| = 1.5259e-5` =
+/// 2 ULPs of `out = -0.0133820`). Headroom at `k = 3` is 1.5x BY
+/// CONSTRUCTION: this is a worst-case-derived bound measured against a
+/// near-worst-case sample, and raising `k` further to manufacture a 2x
+/// ratio would abandon the derivation that justifies it.
+///
+/// Both 16-bit arms take it: `geglu.cu`'s bf16 forward has the identical
+/// two-rounding-point structure, so the same derivation applies — its
+/// observed ratios are lower only because bf16's coarser step makes both
+/// the flip and the allowance 8x larger, not because the mechanism is
+/// absent.
+const GEGLU_FWD_ROUND1_PROPAGATION_ULPS: f32 = 3.0;
 
 /// A Higham-style, PER-ELEMENT `f32` bound made of two ADDITIVE terms —
 /// see this section's header comment for why this replaces the
@@ -379,15 +421,25 @@ fn f32_two_term_bound(reference: f32, operand_amplitude: f32, k_rel: f32, k_abs:
 /// per-element allowance, OR `actual` is non-finite (guide §3.7: a
 /// non-finite actual must count as a violation, never silently pass a
 /// naive `>` comparison).
-fn count_bound_violations(
+///
+/// Index-aware, and index-aware ONLY: a leg whose allowance depends on
+/// THIS element's own operands — not just on the reference VALUE — needs
+/// the index to reach them (see
+/// [`softmax_f16_dscores_propagation_terms`], whose per-element term is
+/// `|dy_i - dot|·|Δy_i| + |Δdot|·|y_i|`). A value-only caller passes
+/// `|_, c| bound_fn(c)`; that one-line adapter is cheaper than a wrapper
+/// function, and keeping a single definition of "violation" (including
+/// guide §3.7's non-finite rule) is the point.
+fn count_bound_violations_indexed(
     reference: &[f32],
     actual: &[f32],
-    bound_fn: impl Fn(f32) -> f32,
+    bound_fn: impl Fn(usize, f32) -> f32,
 ) -> usize {
     reference
         .iter()
         .zip(actual.iter())
-        .filter(|(c, g)| !(g.is_finite() && (**c - **g).abs() <= bound_fn(**c)))
+        .enumerate()
+        .filter(|(i, (c, g))| !(g.is_finite() && (**c - **g).abs() <= bound_fn(*i, **c)))
         .count()
 }
 
@@ -407,12 +459,25 @@ fn assert_relative_bound(
     actual: &[f32],
     bound_fn: impl Fn(f32) -> f32,
 ) -> f32 {
+    assert_relative_bound_indexed(label, reference, actual, |_, c| bound_fn(c))
+}
+
+/// [`assert_relative_bound`]'s index-aware form — see
+/// [`count_bound_violations_indexed`] for why an index-aware allowance
+/// exists at all. Identical reporting (the worst `|Δ|/bound` ratio is
+/// still printed for the pod log).
+fn assert_relative_bound_indexed(
+    label: &str,
+    reference: &[f32],
+    actual: &[f32],
+    bound_fn: impl Fn(usize, f32) -> f32,
+) -> f32 {
     assert_eq!(reference.len(), actual.len(), "{label}: length mismatch");
     let mut max_delta = 0f32;
     let mut max_bound = 0f32;
     let mut worst_ratio = 0f32;
     for (i, (c, g)) in reference.iter().zip(actual.iter()).enumerate() {
-        let bd = bound_fn(*c);
+        let bd = bound_fn(i, *c);
         assert!(
             g.is_finite() && (*c - *g).abs() <= bd,
             "{label}[{i}]: cpu {c} vs cuda {g} (bound {bd:e})"
@@ -444,17 +509,33 @@ fn assert_forced_defect_exceeds_bound(
     defect: &[f32],
     bound_fn: impl Fn(f32) -> f32,
 ) {
+    assert_forced_defect_exceeds_bound_indexed(label, reference, defect, |_, c| bound_fn(c))
+}
+
+/// [`assert_forced_defect_exceeds_bound`]'s index-aware form. The
+/// discriminating half must use the SAME closure the green path used, so
+/// a leg with an index-aware allowance needs an index-aware control too —
+/// otherwise the control would be checked against a DIFFERENT (tighter)
+/// bound than the one that actually admitted the clean run, which is
+/// exactly the vacuous-control shape guide §3.7 forbids.
+fn assert_forced_defect_exceeds_bound_indexed(
+    label: &str,
+    reference: &[f32],
+    defect: &[f32],
+    bound_fn: impl Fn(usize, f32) -> f32,
+) {
     assert_eq!(
         reference.len(),
         defect.len(),
         "{label}: forced-defect length mismatch"
     );
-    let violations = count_bound_violations(reference, defect, &bound_fn);
+    let violations = count_bound_violations_indexed(reference, defect, &bound_fn);
     let worst_ratio = reference
         .iter()
         .zip(defect.iter())
-        .map(|(c, d)| {
-            let bd = bound_fn(*c).max(f32::MIN_POSITIVE);
+        .enumerate()
+        .map(|(i, (c, d))| {
+            let bd = bound_fn(i, *c).max(f32::MIN_POSITIVE);
             if d.is_finite() {
                 (*c - *d).abs() / bd
             } else {
@@ -474,349 +555,10 @@ fn assert_forced_defect_exceeds_bound(
     );
 }
 
-/// `k = 4`: `alpha*x + y` is a single fmad-class op, no reduction — see
-/// `assert_scaled_cast_add_parity_f32_f32`'s identical rationale for the
-/// same-shaped `base + lora*scaling` formula.
-const AXPY_K_REL: f32 = 4.0;
-
-fn assert_parity_f32(cuda: &Device, alpha: f64, xv: &[f32], yv: &[f32]) {
-    let cpu = Device::Cpu;
-    let n = xv.len();
-
-    let x_cpu = Var::from_tensor(&Tensor::from_slice(xv, (n,), &cpu).unwrap()).unwrap();
-    let y_cpu = Var::from_tensor(&Tensor::from_slice(yv, (n,), &cpu).unwrap()).unwrap();
-    let out_cpu = axpy(alpha, &x_cpu, &y_cpu).unwrap();
-
-    let x_gpu = Var::from_tensor(&Tensor::from_slice(xv, (n,), cuda).unwrap()).unwrap();
-    let y_gpu = Var::from_tensor(&Tensor::from_slice(yv, (n,), cuda).unwrap()).unwrap();
-    let out_gpu = axpy(alpha, &x_gpu, &y_gpu).unwrap();
-
-    let out_cpu_v: Vec<f32> = out_cpu.to_vec1().unwrap();
-    let out_gpu_v: Vec<f32> = out_gpu.to_device(&cpu).unwrap().to_vec1().unwrap();
-    assert_eq!(out_cpu_v.len(), n);
-    // A short (or empty) `out_gpu_v` would make the `zip` below stop early
-    // and pass VACUOUSLY — asserting the length explicitly is what turns
-    // "the kernel silently produced fewer elements than requested" into a
-    // failure instead of a no-op comparison.
-    assert_eq!(
-        out_gpu_v.len(),
-        n,
-        "GPU forward output length mismatch (got {}, expected {n})",
-        out_gpu_v.len()
-    );
-    let out_floor = max_abs(xv).max(max_abs(yv));
-    let out_bound =
-        |r: f32| f32_two_term_bound(r, out_floor, AXPY_K_REL, F32_ELEMENTWISE_CANCELLATION_ULPS);
-    assert_relative_bound("axpy f32 fwd", &out_cpu_v, &out_gpu_v, out_bound);
-    // Forced defect: a plausible "dropped scale" bug — dispatch the SAME
-    // kernel on the SAME inputs but with `alpha` replaced by `1.0`
-    // (`0.0` if the real `alpha` IS `1.0`, so the mutant is guaranteed
-    // distinct) — a real semantic mutant reached through this op's own
-    // public knob (`alpha`), never by editing the correct `out_gpu_v`
-    // array (item 3).
-    let wrong_alpha = if alpha == 1.0 { 0.0 } else { 1.0 };
-    let out_defect: Vec<f32> = axpy(wrong_alpha, &x_gpu, &y_gpu)
-        .unwrap()
-        .to_device(&cpu)
-        .unwrap()
-        .to_vec1()
-        .unwrap();
-    assert_forced_defect_exceeds_bound("axpy f32 fwd", &out_cpu_v, &out_defect, out_bound);
-
-    // Sign-mixed, production-amplitude cotangent, never the implicit ones
-    // `.backward()` assigns — under `dy == 1`, `dx == alpha` and `dy_grad
-    // == 1.0` are the SAME constant at EVERY index (`d(alpha*x+y)/dx ==
-    // alpha`, `d(alpha*x+y)/dy == 1`), so a misindexed/shuffled read would
-    // still pass undetected (family F, same hazard `scaled_cast_add`'s
-    // own doc names) — this file's discriminating-backward toolkit header
-    // doc.
-    let dyv = cotangent_fixture(n, 0xA9F1_1D5E_2000_0001, 3.0);
-    let dy_cpu = Tensor::from_slice(&dyv, (n,), &cpu).unwrap();
-    let dy_gpu = Tensor::from_slice(&dyv, (n,), cuda).unwrap();
-    let grads_cpu = (&out_cpu * &dy_cpu)
-        .unwrap()
-        .sum_all()
-        .unwrap()
-        .backward()
-        .unwrap();
-    let grads_gpu = (&out_gpu * &dy_gpu)
-        .unwrap()
-        .sum_all()
-        .unwrap()
-        .backward()
-        .unwrap();
-
-    let dx_cpu: Vec<f32> = grads_cpu.get(&x_cpu).unwrap().to_vec1().unwrap();
-    let dx_gpu: Vec<f32> = grads_gpu
-        .get(&x_gpu)
-        .unwrap()
-        .to_device(&cpu)
-        .unwrap()
-        .to_vec1()
-        .unwrap();
-    let dy_out_cpu: Vec<f32> = grads_cpu.get(&y_cpu).unwrap().to_vec1().unwrap();
-    let dy_out_gpu: Vec<f32> = grads_gpu
-        .get(&y_gpu)
-        .unwrap()
-        .to_device(&cpu)
-        .unwrap()
-        .to_vec1()
-        .unwrap();
-    // Same vacuous-pass hazard as the forward output above, for both
-    // gradient vectors.
-    assert_eq!(dx_cpu.len(), n);
-    assert_eq!(
-        dx_gpu.len(),
-        n,
-        "dx GPU length mismatch (got {}, expected {n})",
-        dx_gpu.len()
-    );
-    assert_eq!(dy_out_cpu.len(), n);
-    assert_eq!(
-        dy_out_gpu.len(),
-        n,
-        "dy GPU length mismatch (got {}, expected {n})",
-        dy_out_gpu.len()
-    );
-    let dx_floor = max_abs(xv).max(max_abs(yv)).max(max_abs(&dyv));
-    let dx_bound =
-        |r: f32| f32_two_term_bound(r, dx_floor, AXPY_K_REL, F32_ELEMENTWISE_CANCELLATION_ULPS);
-    assert_relative_bound("axpy f32 dx", &dx_cpu, &dx_gpu, dx_bound);
-    let dx_defect: Vec<f32> = {
-        // Same "dropped scale" mutant (`alpha` replaced by `wrong_alpha`
-        // through the op's own public knob), differentiated through the
-        // same non-uniform cotangent — `dx = alpha * dy_out`, so a
-        // dropped/wrong `alpha` is directly visible in `dx` too.
-        let grads_defect = (&axpy(wrong_alpha, &x_gpu, &y_gpu).unwrap() * &dy_gpu)
-            .unwrap()
-            .sum_all()
-            .unwrap()
-            .backward()
-            .unwrap();
-        grads_defect
-            .get(&x_gpu)
-            .unwrap()
-            .to_device(&cpu)
-            .unwrap()
-            .to_vec1()
-            .unwrap()
-    };
-    assert_forced_defect_exceeds_bound("axpy f32 dx", &dx_cpu, &dx_defect, dx_bound);
-
-    let dy_bound =
-        |r: f32| f32_two_term_bound(r, dx_floor, AXPY_K_REL, F32_ELEMENTWISE_CANCELLATION_ULPS);
-    assert_relative_bound("axpy f32 dy", &dy_out_cpu, &dy_out_gpu, dy_bound);
-}
-
-fn assert_parity_bf16(cuda: &Device, alpha: f64, xv: &[f32], yv: &[f32]) {
-    let cpu = Device::Cpu;
-    let n = xv.len();
-    let xb: Vec<bf16> = xv.iter().map(|&v| bf16::from_f32(v)).collect();
-    let yb: Vec<bf16> = yv.iter().map(|&v| bf16::from_f32(v)).collect();
-
-    let x_cpu = Tensor::from_slice(&xb, (n,), &cpu).unwrap();
-    let y_cpu = Tensor::from_slice(&yb, (n,), &cpu).unwrap();
-    let out_cpu: Vec<f32> = axpy(alpha, &x_cpu, &y_cpu)
-        .unwrap()
-        .to_dtype(DType::F32)
-        .unwrap()
-        .to_vec1()
-        .unwrap();
-
-    let x_gpu = Tensor::from_slice(&xb, (n,), cuda).unwrap();
-    let y_gpu = Tensor::from_slice(&yb, (n,), cuda).unwrap();
-    let out_gpu: Vec<f32> = axpy(alpha, &x_gpu, &y_gpu)
-        .unwrap()
-        .to_dtype(DType::F32)
-        .unwrap()
-        .to_device(&cpu)
-        .unwrap()
-        .to_vec1()
-        .unwrap();
-
-    assert_eq!(out_cpu.len(), n);
-    assert_eq!(
-        out_gpu.len(),
-        n,
-        "bf16 GPU forward output length mismatch (got {}, expected {n})",
-        out_gpu.len()
-    );
-
-    // Same accumulation semantics on both devices (f32-accumulate, round
-    // to bf16 once) — this should be tighter than the CPU fused-vs-eager
-    // bf16 bound (`tests/oracles.rs`), which compares two DIFFERENT
-    // rounding paths; here both paths are the same kernel semantics on
-    // different hardware, so fmad-class ~1-ULP-at-bf16 differences are
-    // the only expected source of divergence. `bf16_relative_bound` keys
-    // each element's allowance to ITS OWN reference magnitude (floored
-    // only for a near-zero reference, at a value measured from this run's
-    // own data) — never a `max(1.0)`-keyed absolute floor that charges
-    // every element the largest reference's allowance (guide §3.8; this
-    // was the last surviving `k * ulp * c.abs().max(g).max(1.0)` leg in
-    // this file — esc-045 class 2 round-3 audit).
-    let out_floor = measured_near_zero_floor(&out_cpu);
-    let out_bound = |r: f32| bf16_relative_bound(r, out_floor, 2.0);
-    assert_relative_bound("axpy bf16 fwd", &out_cpu, &out_gpu, out_bound);
-    // Forced defect: same "dropped scale" public-knob mutant as the f32
-    // leg above.
-    let wrong_alpha = if alpha == 1.0 { 0.0 } else { 1.0 };
-    let out_defect: Vec<f32> = axpy(wrong_alpha, &x_gpu, &y_gpu)
-        .unwrap()
-        .to_dtype(DType::F32)
-        .unwrap()
-        .to_device(&cpu)
-        .unwrap()
-        .to_vec1()
-        .unwrap();
-    assert_forced_defect_exceeds_bound("axpy bf16 fwd", &out_cpu, &out_defect, out_bound);
-}
-
-#[test]
-fn parity_contiguous_small() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
-    let x = fixture(8, 1.0);
-    let y = fixture(8, 2.0);
-    assert_parity_f32(&cuda, 1.75, &x, &y);
-    assert_parity_bf16(&cuda, 1.75, &x, &y);
-}
-
-#[test]
-fn parity_narrowed_with_nonzero_offset() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
-    // Build a [3, 8] tensor and narrow to the middle row: contiguous but
-    // start_offset == 8 (nonzero) — exactly the case the CUDA arm used to
-    // get wrong (it ignored `start_offset` and read the base buffer's
-    // first `n` elements instead of the narrowed row's own data).
-    let base_x = fixture(24, 3.0);
-    let base_y = fixture(24, 4.0);
-    let cpu = Device::Cpu;
-
-    let xt_cpu = Tensor::from_slice(&base_x, (3, 8), &cpu)
-        .unwrap()
-        .narrow(0, 1, 1)
-        .unwrap()
-        .flatten_all()
-        .unwrap();
-    let yt_cpu = Tensor::from_slice(&base_y, (3, 8), &cpu)
-        .unwrap()
-        .narrow(0, 1, 1)
-        .unwrap()
-        .flatten_all()
-        .unwrap();
-    assert!(xt_cpu.is_contiguous());
-    assert_ne!(xt_cpu.layout().start_offset(), 0);
-
-    let xt_gpu = Tensor::from_slice(&base_x, (3, 8), &cuda)
-        .unwrap()
-        .narrow(0, 1, 1)
-        .unwrap()
-        .flatten_all()
-        .unwrap();
-    let yt_gpu = Tensor::from_slice(&base_y, (3, 8), &cuda)
-        .unwrap()
-        .narrow(0, 1, 1)
-        .unwrap()
-        .flatten_all()
-        .unwrap();
-    assert!(xt_gpu.is_contiguous());
-    assert_ne!(xt_gpu.layout().start_offset(), 0);
-
-    let out_cpu: Vec<f32> = axpy(2.0, &xt_cpu, &yt_cpu).unwrap().to_vec1().unwrap();
-    let out_gpu: Vec<f32> = axpy(2.0, &xt_gpu, &yt_gpu)
-        .unwrap()
-        .to_device(&cpu)
-        .unwrap()
-        .to_vec1()
-        .unwrap();
-    // Assert lengths BEFORE the zip below: a short (or empty) `out_gpu` —
-    // e.g. if the offset fix regressed and the kernel launched over the
-    // wrong (possibly zero) element count — would otherwise make the zip
-    // stop early and the per-element comparison pass vacuously.
-    assert_eq!(out_cpu.len(), 8);
-    assert_eq!(
-        out_gpu.len(),
-        8,
-        "narrowed GPU forward output length mismatch (got {}, expected 8)",
-        out_gpu.len()
-    );
-    for (i, (c, g)) in out_cpu.iter().zip(out_gpu.iter()).enumerate() {
-        assert!(
-            ((*c - *g).abs() as f64) <= F32_TOL,
-            "narrowed fwd[{i}]: cpu {c} vs cuda {g}"
-        );
-    }
-    // And both must equal the middle row's own values, not the base
-    // buffer's first 8 elements (the exact bug this test exists for).
-    let expected: Vec<f32> = base_x[8..16]
-        .iter()
-        .zip(base_y[8..16].iter())
-        .map(|(&x, &y)| 2.0 * x + y)
-        .collect();
-    for (i, (g, e)) in out_gpu.iter().zip(expected.iter()).enumerate() {
-        assert!(
-            ((*g - *e).abs() as f64) <= F32_TOL,
-            "narrowed fwd[{i}] vs hand-computed: cuda {g} vs {e}"
-        );
-    }
-}
-
-#[test]
-fn parity_empty() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
-    let cpu = Device::Cpu;
-    let x_cpu = Tensor::from_slice(&[] as &[f32], (0,), &cpu).unwrap();
-    let y_cpu = Tensor::from_slice(&[] as &[f32], (0,), &cpu).unwrap();
-    let x_gpu = Tensor::from_slice(&[] as &[f32], (0,), &cuda).unwrap();
-    let y_gpu = Tensor::from_slice(&[] as &[f32], (0,), &cuda).unwrap();
-
-    let out_cpu: Vec<f32> = axpy(1.0, &x_cpu, &y_cpu).unwrap().to_vec1().unwrap();
-    // This must not attempt an illegal (0, 1, 1) launch grid.
-    let out_gpu: Vec<f32> = axpy(1.0, &x_gpu, &y_gpu)
-        .unwrap()
-        .to_device(&cpu)
-        .unwrap()
-        .to_vec1()
-        .unwrap();
-    assert!(out_cpu.is_empty());
-    assert!(out_gpu.is_empty());
-}
-
-#[test]
-fn parity_multi_block_exact_multiple_of_block_size() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
-    // 4096 == 4 * 1024 (the launch's block_dim) — a clean multi-block
-    // boundary, every block fully occupied.
-    let x = fixture(4096, 5.0);
-    let y = fixture(4096, 6.0);
-    assert_parity_f32(&cuda, 0.5, &x, &y);
-}
-
-#[test]
-fn parity_multi_block_not_a_multiple_of_block_size() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
-    // 2000 spans 2 blocks (grid = ceil(2000/1024) = 2) with a PARTIAL last
-    // block — exercises the kernel's `if (i < n)` bounds check for threads
-    // past the real element count.
-    let x = fixture(2000, 7.0);
-    let y = fixture(2000, 8.0);
-    assert_parity_f32(&cuda, -2.25, &x, &y);
-    assert_parity_bf16(&cuda, -2.25, &x, &y);
-}
-
 // =======================================================================
 // LayerNormFused CPU<->CUDA parity: fwd + BOTH backward outputs (dx,
-// dgamma). Covers the same divergence-prone classes as Axpy's suite above
-// (contiguous, narrowed-with-nonzero-offset, empty, a block-size boundary)
+// dgamma). Covers the divergence-prone classes this file's module doc
+// names (contiguous, narrowed-with-nonzero-offset, empty, a block-size boundary)
 // PLUS the LN-specific dimensions this op actually varies over: hidden
 // 1024 (ModernBERT-large) and a non-1024 hidden, and multiple rows per
 // launch (one CUDA thread block per row).
@@ -836,7 +578,7 @@ fn ln_forward(
 /// independently, in plain `f64`-accumulated Rust, from the SAME `xv`
 /// fixture — never by editing the correct `out_gpu_v` array (item 3). LN
 /// has no public knob that reaches this defect (unlike RoPE's
-/// `negate_sin` or `axpy`'s `alpha`), so this and every other LN forced
+/// `negate_sin`), so this and every other LN forced
 /// defect below is an independently-computed wrong formula rather than a
 /// mutated call argument.
 fn ln_fwd_no_gamma_defect(xv: &[f32], rows: usize, hidden: usize, eps: f64) -> Vec<f32> {
@@ -1381,9 +1123,10 @@ fn ln_parity_narrowed_with_nonzero_offset() {
     };
     // A [3, rows, hidden] tensor narrowed to its middle "batch" slab: the
     // resulting [rows, hidden] view is contiguous but has a nonzero
-    // `start_offset` — the same class of bug `Axpy`'s CUDA arm had
-    // (reading the base buffer's first elements instead of the tensor's
-    // real range) reproduced for LN's own `contiguous_offsets()` slicing.
+    // `start_offset` — the missing-offset class this file's module doc
+    // names (reading the base buffer's first elements instead of the
+    // tensor's real range) reproduced for LN's own `contiguous_offsets()`
+    // slicing.
     let rows = 2;
     let hidden = 16;
     let base_x = fixture(3 * rows * hidden, 5.0);
@@ -1487,7 +1230,7 @@ fn ln_parity_empty_batch() {
 
 // =======================================================================
 // RopeFused CPU<->CUDA parity: fwd + bwd (dx). Covers the same
-// divergence-prone classes as Axpy's/LayerNormFused's suites above
+// divergence-prone classes as LayerNormFused's suite above
 // (contiguous, narrowed-with-nonzero-offset, empty, a block-size
 // boundary) PLUS the RoPE-specific dimension this op varies over:
 // head_dim 64 (ModernBERT-large's) and a non-power-of-two EVEN head_dim
@@ -1858,41 +1601,147 @@ fn assert_rope_parity_f16(cuda: &Device, batch: usize, seq: usize, hidden: usize
 }
 
 /// Behavioral boundary oracle: `rope_f16.cu` accumulates `x*cos +
-/// rotate_half(x)*sin*sign` in f32 and rounds to F16 exactly once — a
-/// `cos` table scaled well beyond `1.0` (a synthetic, non-unit-circle
-/// fixture; this op's real call site always uses genuine `cos`/`sin`
-/// values in `[-1, 1]`) pushes that final rounding beyond `F16_MAX`, which
-/// must saturate to `±inf`, never a silently clamped finite value.
+/// rotate_half(x)*sin*sign` in f32 and rounds to F16 exactly once, so an
+/// f32 accumulator that is FINITE but past `F16_OVERFLOW_TIE` must
+/// saturate to `±inf` at that one rounding — never a silently clamped
+/// finite value.
+///
+/// REWRITTEN, campaign #446 finding 7: the previous version built its
+/// `cos` table as `f16::from_f32(100_000.0)`. `100_000 > F16_MAX`, so the
+/// TABLE ITSELF was already `+inf` before the kernel ever read it, and
+/// `inf * x` is `inf` under any implementation — the assertion could not
+/// fail, and in particular could not distinguish "the final `__float2half`
+/// saturates correctly" (the thing under test) from "an infinity was
+/// propagated" (a different thing entirely, and not a property of this
+/// kernel). Every input here is now finite by construction and CHECKED to
+/// be, which is the vacuous-control guard: re-widening the fixture back
+/// past `F16_MAX` fails the fixture assertions instead of silently
+/// re-vacating the oracle.
+///
+/// The construction, stated: `cos[i] = F16_MAX` (65504.0 — the LARGEST
+/// FINITE f16, exactly representable, so the table is at the top of the
+/// finite range without leaving it) and `sin = 0` (isolating the `x*cos`
+/// term). The two arms straddle the rounding boundary using nothing but
+/// the `x` value:
+///
+///   * SATURATING arm, `x = 2`: the f32 accumulator is `2 * 65504 =
+///     131008` — finite in f32, and at/above `F16_OVERFLOW_TIE` (65520),
+///     so the final `__float2half` must produce `+inf`.
+///   * FINITE CONTROL arm, `x = 1`: the accumulator is exactly `65504` —
+///     `F16_MAX` itself, which rounds to a finite f16. This is what makes
+///     the saturating arm non-vacuous: a kernel (or harness) that
+///     returned `inf` unconditionally, or that had lost its inputs, fails
+///     HERE. The two arms differ in one scalar and nothing else.
+///
+/// Both arms are also compared against the SAME op's CPU f16 arm, which is
+/// an independent implementation of the same round-once contract, not a
+/// restatement of the CUDA one.
 #[test]
 fn rope_parity_f16_output_saturates_to_infinity_beyond_f16_max() {
     let Some(cuda) = cuda_device() else {
         return;
     };
+    let cpu = Device::Cpu;
     let hidden = 4;
     let period = 1;
-    let xv = [1.0f32, 2.0, 3.0, 4.0];
-    let xh: Vec<f16> = xv.iter().map(|&v| f16::from_f32(v)).collect();
-    // cos scaled so x*cos alone overflows F16_MAX (even at x's smallest
-    // value, 1.0) — 100_000 * 1.0 = 100_000 > F16_MAX; sin = 0 isolates
-    // the cos term.
-    let ch = vec![f16::from_f32(100_000.0); hidden * period];
+
+    // The cos table: FINITE, and at the very top of f16's finite range.
+    let cos_scale = F16_MAX;
+    let ch = vec![f16::from_f32(cos_scale); hidden * period];
     let sh = vec![f16::ZERO; hidden * period];
-    let x_gpu = Tensor::from_slice(&xh, (1, 1, period, hidden), &cuda).unwrap();
-    let cos_gpu = Tensor::from_slice(&ch, (1, 1, period, hidden), &cuda).unwrap();
-    let sin_gpu = Tensor::from_slice(&sh, (1, 1, period, hidden), &cuda).unwrap();
-    let out_gpu: Vec<f16> = rope(false, &x_gpu, &cos_gpu, &sin_gpu)
-        .unwrap()
-        .to_device(&Device::Cpu)
-        .unwrap()
-        .flatten_all()
-        .unwrap()
-        .to_vec1()
-        .unwrap();
-    assert!(
-        out_gpu.iter().all(|h| h.is_infinite()),
-        "expected every output element to saturate to +/-inf beyond F16_MAX ({F16_MAX}); \
-         got {out_gpu:?}"
+    // VACUOUS-CONTROL GUARD (the whole point of the rewrite): if this
+    // table is ever non-finite again, the oracle below proves nothing, so
+    // fail here rather than pass there.
+    for (i, c) in ch.iter().enumerate() {
+        assert_finite_f16(*c, &format!("rope f16 saturation fixture cos[{i}]"));
+    }
+    assert_eq!(
+        ch[0].to_f32(),
+        F16_MAX,
+        "fixture invariant: F16_MAX must round-trip through f16 exactly, so the table is \
+         EXACTLY the largest finite f16 and not something rounded"
     );
+
+    for (x_value, must_saturate) in [(2.0f32, true), (1.0f32, false)] {
+        let xh = vec![f16::from_f32(x_value); hidden];
+        for (i, x) in xh.iter().enumerate() {
+            assert_finite_f16(*x, &format!("rope f16 saturation fixture x[{i}]"));
+        }
+        // The f32 accumulator the kernel forms, computed here
+        // independently. It must be FINITE either way — that is what makes
+        // this a test of the final ROUNDING rather than of infinity
+        // propagation.
+        let accumulator = xh[0].to_f32() * ch[0].to_f32();
+        assert!(
+            accumulator.is_finite(),
+            "fixture invariant: the f32 accumulator ({accumulator}) must be finite, or this \
+             oracle degenerates into the inf-propagation test the rewrite exists to remove"
+        );
+        if must_saturate {
+            // KO-8 independent reference: `half::f16::from_f32` — the same
+            // conversion `__float2half` performs — really does saturate at
+            // this magnitude (and this call itself refuses a magnitude
+            // below `F16_OVERFLOW_TIE`, so the fixture cannot drift into
+            // the round-back-down band unnoticed).
+            assert_saturates_to_infinity(accumulator);
+        } else {
+            assert_eq!(
+                accumulator, F16_MAX,
+                "fixture invariant: the control arm's accumulator must land exactly on \
+                 F16_MAX, the largest finite f16"
+            );
+            assert_finite_f16(
+                f16::from_f32(accumulator),
+                "rope f16 saturation control-arm reference",
+            );
+        }
+
+        let run = |device: &Device| -> Vec<f16> {
+            let x_t = Tensor::from_slice(&xh, (1, 1, period, hidden), device).unwrap();
+            let cos_t = Tensor::from_slice(&ch, (1, 1, period, hidden), device).unwrap();
+            let sin_t = Tensor::from_slice(&sh, (1, 1, period, hidden), device).unwrap();
+            rope(false, &x_t, &cos_t, &sin_t)
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap()
+        };
+        let out_gpu = run(&cuda);
+        let out_cpu = run(&cpu);
+        assert_eq!(out_gpu.len(), hidden, "rope f16 GPU output length mismatch");
+
+        if must_saturate {
+            for (i, h) in out_gpu.iter().enumerate() {
+                assert!(
+                    h.is_infinite() && !h.is_sign_negative(),
+                    "x = {x_value}: the f32 accumulator ({accumulator}) is finite and at or \
+                     beyond F16_OVERFLOW_TIE, so element {i} must saturate to +inf at the \
+                     kernel's single f16 rounding; a finite answer here is a confident WRONG \
+                     number at the boundary. got {out_gpu:?}"
+                );
+            }
+        } else {
+            for (i, h) in out_gpu.iter().enumerate() {
+                assert_finite_f16(*h, &format!("rope f16 finite-control out[{i}]"));
+                assert_eq!(
+                    h.to_f32(),
+                    F16_MAX,
+                    "x = {x_value}: element {i} must be exactly F16_MAX -- if the kernel \
+                     saturated HERE too, the saturating arm above would be vacuous \
+                     (everything is inf) rather than a boundary oracle. got {out_gpu:?}"
+                );
+            }
+        }
+        assert_eq!(
+            out_gpu, out_cpu,
+            "x = {x_value}: the CUDA and CPU f16 arms must agree bit-for-bit at this \
+             boundary -- both are documented as accumulating in f32 and rounding to f16 \
+             exactly once"
+        );
+    }
 }
 
 /// Mirror-image boundary oracle (family D, the small-magnitude end):
@@ -1983,7 +1832,7 @@ fn rope_parity_narrowed_with_nonzero_offset() {
     };
     // A [3, batch, seq, hidden] tensor narrowed to its middle "batch"
     // slab: contiguous but nonzero `start_offset` — the same class of bug
-    // `Axpy`'s/`LayerNormFused`'s CUDA arms had (reading the base buffer's
+    // `LayerNormFused`'s CUDA arm had (reading the base buffer's
     // first elements instead of the tensor's real range).
     let batch = 2;
     let seq = 4;
@@ -2364,13 +2213,244 @@ fn assert_softmax_parity_bf16(cuda: &Device, rows: usize, last: usize, sv: &[f32
     assert_forced_defect_exceeds_bound("softmax bf16 dscores", &dx_cpu_v, &dx_defect, dx_bound);
 }
 
+/// The PROPAGATED-INPUT term of the f16 `dscores` allowance — campaign
+/// #446's `softmax_parity_f16_row_length_regimes` RED, root-caused.
+///
+/// `dscores_i = (dy_i - dot)·y_i`, `dot = Σ_j dy_j·y_j`, and the two arms
+/// of this comparison do NOT run the backward on the same `y`: each runs
+/// it on ITS OWN forward output. Those two forward outputs are legitimately
+/// allowed to differ — the forward leg above certifies `|Δy| <= 2` f16
+/// ULPs and, at `last = 257`, an L40S measures `Δy/bound = 0.5` (one f16
+/// ULP at two of the row's 257 positions) because the CUDA forward's f32
+/// row-sum is folded as a 256-way strided partial plus a shared-memory
+/// tree while `softmax_row_f16` folds it sequentially in ascending index
+/// order. That f32 fold difference (≈3e-7 relative) is far below f16's
+/// step, but it pushes `e_i / sum` across an f16 round-to-nearest midpoint
+/// for whichever elements happen to sit within it — an unavoidable,
+/// non-defective 1-ULP quantization flip.
+///
+/// A 1-ULP flip in a LARGE `y_j` is worth `dy_j · ulp16(y_j)` in `dot`
+/// (measured at `last = 257`: `|Δdot| = 1.46e-4`, a hundredfold jump over
+/// the ≈1e-6 the bwd kernel's OWN fold order contributes), and `dscores_i`
+/// is a DIFFERENCE of two same-scale quantities, so a cancelled element
+/// amplifies it without bound (at `last = 257`, `i = 35`: `|dy_i| = 7.83`
+/// against `|dy_i - dot| = 0.0247`, a 317x cancellation, turning `1.46e-4`
+/// into 6 f16 ULPs of the 1.06e-3 result).
+///
+/// This is the SAME failure this file already diagnosed and fixed for its
+/// `f32` legs with [`f32_two_term_bound`] (see that function's doc and the
+/// floor design note above [`measured_near_zero_floor`]: "an OUTPUT/gradient
+/// value orders of magnitude smaller than the operands that computed it —
+/// via ordinary cancellation, not a defect"). The f16 legs never received
+/// it because until campaign #446's finding 7 the only f16 softmax shape in
+/// this file was `last = 8`, where there is no room for a flip to land.
+///
+/// The term below is NOT a widened `k`. It is the exact triangle-inequality
+/// bound on the algebraic identity
+///
+/// ```text
+/// dscores_i^gpu - dscores_i^cpu = (dy_i - dot)·Δy_i - Δdot·(y_i + Δy_i)
+/// ```
+///
+/// evaluated on THIS run's own MEASURED `Δy = y_gpu - y_cpu` (guide §3.2's
+/// measured-not-hardcoded rule). It cannot mask a backward-kernel defect:
+/// `Δy` is the FORWARD's output difference, asserted separately and
+/// independently by the forward leg, and a broken `softmax_bwd_dscores_f16`
+/// changes neither `y_cpu` nor `y_gpu`. `Δdot` is accumulated in `f64` so
+/// the term itself has no fold-order ambiguity of its own.
+///
+/// The backward's OWN `dot` fold order is a separate mechanism and gets its
+/// own separate term — see [`softmax_f16_dscores_dot_fold_terms`]. Keeping
+/// the two apart is what lets this one carry the strong property its
+/// control asserts: it is EXACTLY zero when the two forwards agree bitwise.
+///
+/// Returns one allowance per element of the flattened `[rows, last]` array.
+fn softmax_f16_dscores_propagation_terms(
+    y_cpu: &[f32],
+    y_gpu: &[f32],
+    dy: &[f32],
+    rows: usize,
+    last: usize,
+) -> Vec<f32> {
+    assert_eq!(y_cpu.len(), rows * last);
+    assert_eq!(y_gpu.len(), rows * last);
+    assert_eq!(dy.len(), rows * last);
+    let mut out = vec![0f32; rows * last];
+    for r in 0..rows {
+        let span = r * last..(r + 1) * last;
+        // `dot` as the CPU reference forms it, and `Δdot` as the measured
+        // forward difference propagates into it. Both in f64 so this
+        // allowance is itself fold-order-independent (family J).
+        let dot: f64 = (0..last)
+            .map(|i| dy[span.start + i] as f64 * y_cpu[span.start + i] as f64)
+            .sum();
+        let ddot: f64 = (0..last)
+            .map(|i| {
+                dy[span.start + i] as f64
+                    * (y_gpu[span.start + i] as f64 - y_cpu[span.start + i] as f64)
+            })
+            .sum();
+        for i in span {
+            let dyi = dy[i] as f64;
+            let yi = y_cpu[i] as f64;
+            let dyi_y = (y_gpu[i] as f64 - yi).abs();
+            out[i] = ((dyi - dot).abs() * dyi_y + ddot.abs() * (yi.abs() + dyi_y)) as f32;
+        }
+    }
+    out
+}
+
+/// The `dscores` allowance's fold-order term — the SECOND of the two
+/// mechanisms [`softmax_f16_dscores_propagation_terms`] separates.
+///
+/// `dot = Σ_j dy_j·y_j` is an f32 reduction, and the two arms fold it
+/// differently: `dscores_row_f16` sums sequentially in ascending index
+/// order (its own doc says so — family J), while
+/// `softmax_bwd_dscores_f16` sums a 256-way strided per-thread partial
+/// into a shared-memory tree. Higham Thm 4.2 bounds each arm's departure
+/// from the exact sum by `γ_n · Σ_j |dy_j·y_j|`, so the two arms differ by
+/// at most that (the tree's own depth is far shallower, so charging the
+/// sequential arm's `γ_n` to both is conservative), and that difference
+/// reaches `dscores_i = (dy_i - dot)·y_i` scaled by `|y_i|`.
+///
+/// Why this is not left to the `k = 2` term it was implicitly riding on:
+/// `k` ULPs are ULPs of the RESULT, and `dscores_i` is a cancelled
+/// difference — an element with a large `y_i` and a near-zero
+/// `(dy_i - dot)` gets a large absolute contribution and a tiny ULP
+/// allowance, which is the same shape as the RED this whole change
+/// root-causes. Device evidence that the term is small in practice, not an
+/// excuse for slack: at `last = 512` the forward is bit-identical, so this
+/// is the ONLY active source, and the worst observed `Δ/bound` there is
+/// 0.5 — one f16 ULP.
+///
+/// Depends only on `y_cpu`/`dy`, never on the CUDA arm's output, so it can
+/// no more mask a kernel defect than the propagation term can.
+fn softmax_f16_dscores_dot_fold_terms(
+    y_cpu: &[f32],
+    dy: &[f32],
+    rows: usize,
+    last: usize,
+) -> Vec<f32> {
+    assert_eq!(y_cpu.len(), rows * last);
+    assert_eq!(dy.len(), rows * last);
+    // `u = 2^-24` is f32's unit roundoff; `last <= MAX_LAST_DIM` (4096)
+    // keeps `n·u <= 2.4e-4`, so `γ_n` is within a rounding of `n·u` — the
+    // `(1 - n·u)` denominator is kept because it is the theorem's own
+    // form, not an approximation of it.
+    let nu = last as f64 * 2f64.powi(-24);
+    let gamma = nu / (1.0 - nu);
+    let mut out = vec![0f32; rows * last];
+    for r in 0..rows {
+        let span = r * last..(r + 1) * last;
+        let terms_abs: f64 = span
+            .clone()
+            .map(|i| (dy[i] as f64 * y_cpu[i] as f64).abs())
+            .sum();
+        let ddot_fold = gamma * terms_abs;
+        for i in span {
+            out[i] = (ddot_fold * (y_cpu[i] as f64).abs()) as f32;
+        }
+    }
+    out
+}
+
+/// Non-vacuity control for [`softmax_f16_dscores_propagation_terms`]
+/// (family F). Needs no GPU — it runs on any host that builds this target,
+/// device or not, because it pins the new allowance's OWN behavior against
+/// hand-computed values rather than against a measurement. The term can
+/// therefore never quietly become a blanket widening.
+///
+/// Two independent claims, both of which a "just make the bound bigger"
+/// implementation would fail:
+///
+/// 1. **Inert where it is not needed.** When the two arms' forward outputs
+///    are BIT-IDENTICAL the term is EXACTLY zero at every element, so this
+///    leg's bound is bit-for-bit the `k = 2` bound it has always been.
+///    (That is the case at `last` 255/256/300/512, where the L40S measures
+///    the f16 forward `max|Δ| = 0`.)
+/// 2. **Row-local and correctly sized where it is.** A one-f16-ULP
+///    perturbation of a single element of row 0 produces the exact
+///    triangle-inequality values below at BOTH elements of row 0 and
+///    leaves row 1 at exactly zero — a term that leaked across rows would
+///    hand every row the worst row's allowance.
+#[test]
+fn softmax_f16_dscores_propagation_term_is_inert_without_a_forward_divergence() {
+    let (rows, last) = (2, 2);
+    // A softmax-shaped `y` (positive, each row sums to 1) and a
+    // non-uniform `dy`, chosen so every quantity below is a short exact
+    // binary fraction and the expected terms are computable by hand.
+    let y_cpu = [0.25f32, 0.75, 0.5, 0.5];
+    let dy = [1.0f32, -1.0, 2.0, -2.0];
+
+    let inert = softmax_f16_dscores_propagation_terms(&y_cpu, &y_cpu, &dy, rows, last);
+    assert_eq!(
+        inert,
+        vec![0f32; rows * last],
+        "a bit-identical forward must leave the dscores allowance at exactly the k=2 bound"
+    );
+
+    // One f16 ULP at 0.75 is 2^-1 * 2^-10 = 2^-11.
+    let d = 2f32.powi(-11);
+    let y_gpu = [0.25f32, 0.75 + d, 0.5, 0.5];
+    let active = softmax_f16_dscores_propagation_terms(&y_cpu, &y_gpu, &dy, rows, last);
+    // Row 0: dot = 1*0.25 + (-1)*0.75 = -0.5, Δdot = (-1)*d = -d.
+    //   i=0: |dy0-dot|*0     + |Δdot|*(0.25 + 0) = 0.25*d
+    //   i=1: |dy1-dot|*d     + |Δdot|*(0.75 + d) = 0.5*d + 0.75*d + d^2
+    let expect_0 = 0.25f64 * d as f64;
+    let expect_1 = 0.5f64 * d as f64 + 0.75f64 * d as f64 + (d as f64) * (d as f64);
+    assert_eq!(active[0], expect_0 as f32);
+    assert_eq!(active[1], expect_1 as f32);
+    // Row 1 is untouched by row 0's divergence.
+    assert_eq!(
+        &active[2..4],
+        &[0f32, 0f32],
+        "the propagation term must be row-local — `dot` is a per-row reduction"
+    );
+    // And the active term really is the thing that matters at a cancelled
+    // element: at `i = 1` it dwarfs the k=2 rounding allowance it is added
+    // to (2 f16 ULPs at the row-1 dscores scale), which is exactly why the
+    // pre-#446 single-term bound false-failed.
+    assert!(
+        active[1] > 2.0 * f16_ulp_size_at(0.25),
+        "expected the propagated term ({}) to exceed the k=2 term it supplements",
+        active[1]
+    );
+
+    // The fold-order term is the OTHER mechanism, and it is deliberately
+    // NOT a function of the CUDA arm's output at all — same hand-computed
+    // treatment. Row 0: Σ|dy_j·y_j| = 0.25 + 0.75 = 1; row 1: 0.5 + 0.5 =
+    // 1... times |dy| 2, so 2. γ = 2·2^-24 / (1 - 2·2^-24).
+    let fold = softmax_f16_dscores_dot_fold_terms(&y_cpu, &dy, rows, last);
+    let nu = 2.0f64 * 2f64.powi(-24);
+    let gamma = nu / (1.0 - nu);
+    assert_eq!(fold[0], (gamma * 1.0 * 0.25) as f32);
+    assert_eq!(fold[1], (gamma * 1.0 * 0.75) as f32);
+    assert_eq!(fold[2], (gamma * 2.0 * 0.5) as f32);
+    assert_eq!(fold[3], (gamma * 2.0 * 0.5) as f32);
+    // Non-vacuous the other way too: it is strictly positive (a term that
+    // silently evaluated to zero would leave the mechanism uncovered) and
+    // far SMALLER than the propagation term it sits beside, so it cannot
+    // be what admits a genuinely divergent element.
+    assert!(fold.iter().all(|t| *t > 0.0), "fold terms: {fold:?}");
+    assert!(
+        fold[1] < active[1] / 1000.0,
+        "the f32 fold-order term ({}) must stay orders below the f16 flip term ({})",
+        fold[1],
+        active[1]
+    );
+}
+
 /// [`assert_softmax_parity_bf16`]'s F16 twin (campaign #443 W2b): compares
 /// the SAME op's two device arms (CPU `CpuStorage::F16` vs CUDA
 /// `softmax_f16.cu`). Per the per-op f16 regime table
 /// (`docs/maintainer/cuda-kernel-guide.md` §3.10) this op is
 /// DTYPE-NATIVE at the scale-multiply and mask-add — `k = 2`, mirroring
 /// the bf16 leg's own citation (both devices independently compute
-/// `exp()`/`expf()`), derived from f16's own quantization step.
+/// `exp()`/`expf()`), derived from f16's own quantization step. The
+/// `dscores` leg additionally carries
+/// [`softmax_f16_dscores_propagation_terms`] — see that function for why a
+/// rounding-point count alone is not a parity allowance when the two arms
+/// feed the backward DIFFERENT (each within-bound) forward outputs.
 fn assert_softmax_parity_f16(cuda: &Device, rows: usize, last: usize, sv: &[f32]) {
     let cpu = Device::Cpu;
     let n = rows * last;
@@ -2452,8 +2532,19 @@ fn assert_softmax_parity_f16(cuda: &Device, rows: usize, last: usize, sv: &[f32]
         assert_finite_f16(*h, &format!("softmax f16 dscores[{i}]"));
     }
     let dx_floor = measured_near_zero_floor_f16(&dx_cpu_v);
-    let dx_bound = |r: f32| f16_relative_bound(r, dx_floor, 2.0);
-    assert_relative_bound("softmax f16 dscores", &dx_cpu_v, &dx_gpu_v, dx_bound);
+    // Three additive terms, one per mechanism, none of them a widened `k`:
+    // `k = 2` for this leg's own rounding (each arm's single final cast to
+    // f16, guide §3.10's "dscores bwd is 1"), plus the FORWARD's own
+    // within-bound `Δy` after this op's cancellation amplifies it, plus the
+    // `dot` reduction's fold-order difference between the two arms. See
+    // [`softmax_f16_dscores_propagation_terms`] and
+    // [`softmax_f16_dscores_dot_fold_terms`].
+    let dx_prop =
+        softmax_f16_dscores_propagation_terms(&out_cpu_v, &out_gpu_v, &dy_seed_f, rows, last);
+    let dx_fold = softmax_f16_dscores_dot_fold_terms(&out_cpu_v, &dy_seed_f, rows, last);
+    let dx_bound =
+        |i: usize, r: f32| f16_relative_bound(r, dx_floor, 2.0) + dx_prop[i] + dx_fold[i];
+    assert_relative_bound_indexed("softmax f16 dscores", &dx_cpu_v, &dx_gpu_v, dx_bound);
     let zero_mask_gpu = Tensor::from_slice(&vec![f16::ZERO; last], (1, last), cuda).unwrap();
     let dx_defect: Vec<f32> = {
         let loss_defect = (&softmax(&s_gpu, &zero_mask_gpu).unwrap() * &dy_gpu)
@@ -2470,7 +2561,12 @@ fn assert_softmax_parity_f16(cuda: &Device, rows: usize, last: usize, sv: &[f32]
                 .unwrap(),
         )
     };
-    assert_forced_defect_exceeds_bound("softmax f16 dscores", &dx_cpu_v, &dx_defect, dx_bound);
+    assert_forced_defect_exceeds_bound_indexed(
+        "softmax f16 dscores",
+        &dx_cpu_v,
+        &dx_defect,
+        dx_bound,
+    );
 }
 
 /// Behavioral boundary oracle: `softmax_f16.cu`'s scale-multiply
@@ -2566,6 +2662,11 @@ fn softmax_parity_long_row_seq_512_class() {
     let sv = fixture(rows * last, 2.0);
     assert_softmax_parity_f32(&cuda, rows, last, &sv);
     assert_softmax_parity_bf16(&cuda, rows, last, &sv);
+    // Campaign #446, finding 7: the f16 leg was MISSING here while
+    // production reaches exactly this `last` on the f16 arm (ModernBERT's
+    // `attention_block` f16 path), so the shipped long-row f16 kernel had
+    // no parity oracle at all above `last = 8`.
+    assert_softmax_parity_f16(&cuda, rows, last, &sv);
 }
 
 #[test]
@@ -2580,6 +2681,68 @@ fn softmax_parity_non_power_of_two_last_dim() {
     let sv = fixture(rows * last, 3.0);
     assert_softmax_parity_f32(&cuda, rows, last, &sv);
     assert_softmax_parity_bf16(&cuda, rows, last, &sv);
+    // f16 leg added with the same finding-7 rationale as
+    // `softmax_parity_long_row_seq_512_class` above.
+    assert_softmax_parity_f16(&cuda, rows, last, &sv);
+}
+
+/// F16 coverage of EVERY row-length regime `softmax_f16.cu` actually has,
+/// on BOTH sides of each boundary (campaign #446, finding 7 — before this,
+/// the only f16 softmax parity shape in this file was `last = 8`).
+///
+/// The kernel has exactly one row-length structure: one block of
+/// `SM_BLOCK = 256` threads per row, with every pass over the row written
+/// as `for (i = threadIdx.x; i < last; i += blockDim.x)` (the fully-masked
+/// scan, the max pass, the sum pass, and the normalize pass — all four).
+/// So `SM_BLOCK` is the only boundary, and it splits three ways:
+///
+///   * `last < 256` — some threads NEVER enter the loop and carry their
+///     initialiser into the block reduction (`-INFINITY` for the max pass,
+///     `0.0` for the sum pass). A wrong initialiser is invisible at any
+///     larger `last`.
+///   * `last == 256` — every thread runs exactly one iteration; no idle
+///     lane, no tail.
+///   * `last > 256` — each thread ACCUMULATES across iterations before the
+///     block reduction, and unless `last` is a multiple of 256 some
+///     threads run one fewer iteration than others (the intra-row tail).
+///
+/// The shapes below cover: below (255, which is also a tail), exactly at
+/// (256), the first multi-iteration count (257, the most extreme tail —
+/// only thread 0 iterates twice), an exact multiple (1024 = 4x), a
+/// multiple-plus-tail (513), and `ops::MAX_LAST_DIM` itself (4096, the
+/// largest `last` the CUDA domain check admits — the legal side of the
+/// admission boundary). `last = 512` and `last = 300` are deliberately NOT
+/// repeated here; they are covered by the two named tests above.
+///
+/// **What this test found (campaign #446).** At `last = 257` — the FIRST
+/// shape here where a thread accumulates across iterations — the L40S
+/// measures a forward `Δy/bound` of 0.5: the CUDA forward's f32 row sum,
+/// folded as a strided partial plus a shared-memory tree, differs from
+/// `softmax_row_f16`'s sequential ascending fold by ≈3e-7 relative, which
+/// is enough to push `e_i / sum` across an f16 round-to-nearest midpoint
+/// at two of the row's 257 positions. That within-bound 1-ULP forward
+/// divergence is then amplified 317x by the backward's own cancellation
+/// and lands as 6 f16 ULPs of `dscores[35]`. The kernel is NOT at fault
+/// (`softmax_bwd_dscores_f16` keeps every step in f32 through one rounding
+/// point, exactly as §3.10 specifies, and its own block-reduction fold
+/// order is device-measured at <=1 ULP wherever `Δy` is bit-zero); the
+/// pre-#446 `dscores` bound was, for omitting the propagated-input term.
+/// See [`softmax_f16_dscores_propagation_terms`].
+#[test]
+fn softmax_parity_f16_row_length_regimes() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let rows = 2;
+    for last in [255usize, 256, 257, 513, 1024, MAX_LAST_DIM] {
+        assert!(
+            last <= MAX_LAST_DIM,
+            "fixture invariant: last={last} must be inside the CUDA domain \
+             (MAX_LAST_DIM={MAX_LAST_DIM})"
+        );
+        let sv = fixture(rows * last, 1.0 + last as f32 * 0.001);
+        assert_softmax_parity_f16(&cuda, rows, last, &sv);
+    }
 }
 
 #[test]
@@ -3354,8 +3517,14 @@ fn assert_geglu_parity_bf16(cuda: &Device, rows: usize, intermediate: usize, wv:
             .to_vec1()
             .unwrap()
     };
-    // `k = 2`: both sides of THIS comparison run the identical fused
-    // single-rounding kernel on different hardware/compilers — ordinary
+    // The FORWARD's `k` is [`GEGLU_FWD_ROUND1_PROPAGATION_ULPS`] (3) —
+    // see that constant for the derivation, and for why the
+    // rounding-point COUNT (2) is not the parity `k` when the first of
+    // those roundings sits upstream of a multiply. The `dwi_out` backward
+    // keeps `k = 2`: its two rounding points are the two INDEPENDENT
+    // final casts of `d_gate`/`d_up`, neither of which feeds the other, so
+    // nothing propagates. Both sides of THIS comparison otherwise run the
+    // identical fused kernel on different hardware/compilers — ordinary
     // rounding-order/`--fmad=true` contraction, the same class every
     // other op's parity leg in this file bounds this way. (Not
     // `geglu_oracles.rs`'s wider fused-vs-EAGER absolute floor — that
@@ -3382,7 +3551,7 @@ fn assert_geglu_parity_bf16(cuda: &Device, rows: usize, intermediate: usize, wv:
     assert_eq!(out_cpu_v.len(), n_out);
     assert_eq!(out_gpu_v.len(), n_out, "geglu bf16 GPU fwd length mismatch");
     let out_floor = max_abs(wv) * 2f32.powi(-10); // no-producer: 2^-10 is bf16's ulp fraction at normal magnitude, derived not measured.
-    let out_bound = |r: f32| bf16_relative_bound(r, out_floor, 2.0);
+    let out_bound = |r: f32| bf16_relative_bound(r, out_floor, GEGLU_FWD_ROUND1_PROPAGATION_ULPS);
     assert_relative_bound("geglu bf16 fwd", &out_cpu_v, &out_gpu_v, out_bound);
     let out_defect = geglu_identity_activation_defect(wv, rows, intermediate);
     assert_forced_defect_exceeds_bound("geglu bf16 fwd", &out_cpu_v, &out_defect, out_bound);
@@ -3418,8 +3587,9 @@ fn assert_geglu_parity_bf16(cuda: &Device, rows: usize, intermediate: usize, wv:
 
 /// [`assert_geglu_parity_bf16`]'s F16 twin (campaign #443 W2b): compares
 /// the SAME op's two device arms (CPU `CpuStorage::F16` vs CUDA
-/// `geglu_f16.cu`). `k = 2`, same rationale as the bf16 leg (identical
-/// fused single-rounding-per-op-step kernel on different hardware).
+/// `geglu_f16.cu`). Same `k` as the bf16 leg and for the same reason:
+/// [`GEGLU_FWD_ROUND1_PROPAGATION_ULPS`] (3) forward, `k = 2` for the
+/// `dwi_out` backward's two independent, non-feeding rounding points.
 fn assert_geglu_parity_f16(cuda: &Device, rows: usize, intermediate: usize, wv: &[f32]) {
     let cpu = Device::Cpu;
     let n_out = rows * intermediate;
@@ -3457,7 +3627,7 @@ fn assert_geglu_parity_f16(cuda: &Device, rows: usize, intermediate: usize, wv: 
     // documents above, re-derived from f16's own quantization step
     // instead of copying bf16's `2^-10` input-fraction constant).
     let out_floor = f16_ulp_size_at(max_abs(wv));
-    let out_bound = |r: f32| f16_relative_bound(r, out_floor, 2.0);
+    let out_bound = |r: f32| f16_relative_bound(r, out_floor, GEGLU_FWD_ROUND1_PROPAGATION_ULPS);
     assert_relative_bound("geglu f16 fwd", &out_cpu_v, &out_gpu_v, out_bound);
     let out_defect = geglu_identity_activation_defect(wv, rows, intermediate);
     assert_forced_defect_exceeds_bound("geglu f16 fwd", &out_cpu_v, &out_defect, out_bound);
@@ -3641,12 +3811,19 @@ fn geglu_parity_non_power_of_two_intermediate() {
         return;
     };
     // 300 is not a power of two and not a multiple of GEGLU_BLOCK (256) --
-    // exercises the grid-stride tail.
+    // exercises the grid-stride tail: n_out = 3*300 = 900 = 3 full blocks
+    // plus a 132-element tail.
     let rows = 3;
     let intermediate = 300;
     let wv = fixture(rows * 2 * intermediate, 3.0);
     assert_geglu_parity_f32(&cuda, rows, intermediate, &wv);
     assert_geglu_parity_bf16(&cuda, rows, intermediate, &wv);
+    // Campaign #446, finding 7: the f16 leg was MISSING on every geglu
+    // shape except `geglu_parity_contiguous_small` (n_out = 32, a SINGLE
+    // partial block), so the shipped f16 kernel's grid-stride TAIL — the
+    // `idx` values a launch's last block does not cover uniformly — had no
+    // oracle. This is the tail half of that gap.
+    assert_geglu_parity_f16(&cuda, rows, intermediate, &wv);
 }
 
 #[test]
@@ -3660,6 +3837,14 @@ fn geglu_parity_multi_block_exact_multiple_of_block_size() {
     let intermediate = 512;
     let wv = fixture(rows * 2 * intermediate, 4.0);
     assert_geglu_parity_f32(&cuda, rows, intermediate, &wv);
+    // Finding-7's multi-block half (see the tail half in
+    // `geglu_parity_non_power_of_two_intermediate`): four full blocks, so
+    // every thread of every block does exactly one iteration and the
+    // row/col decomposition `row = idx / intermediate` crosses a block
+    // boundary — the case a single-partial-block fixture cannot reach.
+    // bf16 already has multi-block coverage via
+    // `geglu_parity_production_width_modernbert_large` (n_out = 5248).
+    assert_geglu_parity_f16(&cuda, rows, intermediate, &wv);
 }
 
 #[test]
@@ -3779,7 +3964,7 @@ fn geglu_parity_empty_last_dim() {
 // ScaledCastAdd CPU<->CUDA parity: fwd + BOTH backward outputs (d_base,
 // d_lora), at the two dtype combinations `jammi-lora`'s admission
 // predicate actually reaches (`F32`/`F32` and `BF16` base /`F32` lora).
-// Covers the same divergence-prone classes as Axpy's suite above
+// Covers the same divergence-prone classes as LayerNormFused's suite above
 // (contiguous, narrowed-with-nonzero-offset, empty, a block-size boundary).
 // =======================================================================
 
@@ -4012,7 +4197,7 @@ fn scaled_cast_add_parity_narrowed_with_nonzero_offset() {
         return;
     };
     // Build a [3, 8] tensor and narrow to the middle row — the missing-
-    // offset class this crate's own review found in `Axpy`'s CUDA arm.
+    // offset class this crate's own review found (this file's module doc).
     let base_all = fixture(24, 3.0);
     let lora_all = fixture(24, 4.0);
     let cpu = Device::Cpu;
@@ -4212,7 +4397,7 @@ fn dropout(
 
 /// `k = 4`: dropout's applied value is `x / (1-p)` at a kept position
 /// (zero at a dropped one) — a single scale op, no reduction, same
-/// fmad-class allowance as `axpy`/`scaled_cast_add`.
+/// fmad-class allowance as `scaled_cast_add`.
 const DROPOUT_K_REL: f32 = 4.0;
 
 /// Decision + applied-value parity, fwd AND bwd, for a fixed
@@ -4277,8 +4462,9 @@ fn assert_dropout_parity_f32(
     // Sign-mixed, production-amplitude cotangent, never the implicit ones
     // `.backward()` assigns a non-scalar root (this file's discriminating-
     // backward toolkit header doc) — even though dropout's own KEEP/DROP
-    // pattern is already index-varying (unlike axpy's uniform-constant
-    // gradient), a non-uniform `dy` still exercises the real `dx = dy *
+    // pattern is already index-varying (unlike a plain elementwise
+    // scale's uniform-constant gradient), a non-uniform `dy` still
+    // exercises the real `dx = dy *
     // mask / (1-p)` multiply rather than `dx = mask / (1-p)` alone.
     let dyv = cotangent_fixture(n, 0xD40F_1D5E_2000_0001, 3.0);
     let dy_cpu = Tensor::from_slice(&dyv, (n,), &cpu).unwrap();
@@ -4904,8 +5090,8 @@ fn lora_linear_parity_f32_narrowed_with_nonzero_offset() {
     let cpu = Device::Cpu;
     let (rows, inf, outf, r) = (4usize, 6usize, 5usize, 2usize);
     // Build a [3*rows, inf] tensor and narrow to the middle `rows` block —
-    // the missing-offset class this crate's own review found in `Axpy`'s
-    // CUDA arm, exercised on this op's `x` argument.
+    // the missing-offset class this crate's own review found (this
+    // file's module doc), exercised on this op's `x` argument.
     let x_all = fixture(3 * rows * inf, 5.0);
     let w = fixture(outf * inf, 6.0);
     let a = fixture(r * inf, 7.0);
@@ -10751,7 +10937,7 @@ fn assert_mem_efficient_fwd_parity_sweep(
 /// stated honestly rather than left silently uncorrected).** `cuBLAS`
 /// (CUDA `matmul`) and the CPU `gemm` crate reduce in a DIFFERENT order
 /// than each other (both correct, esc-044's own lesson) — the SAME jitter
-/// class `F32_TOL` (this file's own `Axpy`-fmad bound) already prices for
+/// class `F32_TOL` (this file's own elementwise-fmad bound) already prices for
 /// a single fused op; this op chains several GEMMs (`QKᵀ`, `PV`) plus an
 /// online-softmax recurrence per chunk. `2026-08-28-m2-memeff-cuda-84e98ac-a100-sxm4.json`
 /// (this branch's own landing artifact, cited by filename — the FIRST
@@ -11962,146 +12148,12 @@ fn quantized_cuda_canary_passes_on_a_healthy_build_and_device() {
 }
 
 // =======================================================================
-// Campaign #443 W2c — f16 kernels, batch 2: `rope_positions`, `axpy`,
+// Campaign #443 W2c — f16 kernels, batch 2: `rope_positions`,
 // `dropout`, `scaled_cast_add`, `cast_scale`/`cast_add`'s NEW F16 analogs.
 // Per-op tolerances derived from the §3.10 regime table (each op is
 // f32-internal, single-fmad-class or bit-exact per its own kernel's use
 // of `__fmul_rn`/`__fadd_rn`/no-multiply-at-all — cited per leg below).
 // =======================================================================
-
-/// `k = 2.0`, mirroring `axpy_bf16`'s own choice for the identical
-/// `alpha*x + y` fmad-prone shape (a single multiply-add, no reduction):
-/// nvcc's `--fmad=true` default may contract this into one hardware FMA
-/// (rounding the true product once, before the add) vs the CPU's two
-/// separately-rounded f32 operations — a sub-f32-ULP gap that F16's own
-/// (far coarser, 2^-10-relative) rounding grain absorbs at `k = 2` with
-/// margin, same as every other elementwise f16 leg in this file.
-const AXPY_F16_K_REL: f32 = 2.0;
-
-fn assert_axpy_parity_f16(cuda: &Device, alpha: f64, xv: &[f32], yv: &[f32]) {
-    let cpu = Device::Cpu;
-    let n = xv.len();
-    let xh: Vec<f16> = xv.iter().map(|&v| f16::from_f32(v)).collect();
-    let yh: Vec<f16> = yv.iter().map(|&v| f16::from_f32(v)).collect();
-
-    let x_cpu = Tensor::from_slice(&xh, (n,), &cpu).unwrap();
-    let y_cpu = Tensor::from_slice(&yh, (n,), &cpu).unwrap();
-    let out_cpu: Vec<f32> = axpy(alpha, &x_cpu, &y_cpu)
-        .unwrap()
-        .to_dtype(DType::F32)
-        .unwrap()
-        .to_vec1()
-        .unwrap();
-
-    let x_gpu = Tensor::from_slice(&xh, (n,), cuda).unwrap();
-    let y_gpu = Tensor::from_slice(&yh, (n,), cuda).unwrap();
-    let out_gpu: Vec<f32> = axpy(alpha, &x_gpu, &y_gpu)
-        .unwrap()
-        .to_dtype(DType::F32)
-        .unwrap()
-        .to_device(&cpu)
-        .unwrap()
-        .to_vec1()
-        .unwrap();
-
-    assert_eq!(out_cpu.len(), n);
-    assert_eq!(
-        out_gpu.len(),
-        n,
-        "f16 GPU forward output length mismatch (got {}, expected {n})",
-        out_gpu.len()
-    );
-    assert_floor_below_f16_gradient_band(2, max_abs(xv).max(max_abs(yv)));
-    let out_floor = measured_near_zero_floor_f16(&out_cpu);
-    let out_bound = |r: f32| f16_relative_bound(r, out_floor, AXPY_F16_K_REL);
-    assert_relative_bound("axpy f16 fwd", &out_cpu, &out_gpu, out_bound);
-    // Forced defect: same "dropped scale" public-knob mutant as the
-    // f32/bf16 legs above.
-    let wrong_alpha = if alpha == 1.0 { 0.0 } else { 1.0 };
-    let out_defect: Vec<f32> = axpy(wrong_alpha, &x_gpu, &y_gpu)
-        .unwrap()
-        .to_dtype(DType::F32)
-        .unwrap()
-        .to_device(&cpu)
-        .unwrap()
-        .to_vec1()
-        .unwrap();
-    assert_forced_defect_exceeds_bound("axpy f16 fwd", &out_cpu, &out_defect, out_bound);
-}
-
-#[test]
-fn axpy_parity_f16_contiguous_small() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
-    let xv = fixture(37, 1.0);
-    let yv = fixture(37, 5.0);
-    assert_axpy_parity_f16(&cuda, 1.75, &xv, &yv);
-}
-
-#[test]
-fn axpy_parity_f16_production_width() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
-    let xv = fixture(12_288, 1.0);
-    let yv = fixture(12_288, 9.0);
-    assert_axpy_parity_f16(&cuda, -2.25, &xv, &yv);
-}
-
-/// Boundary/degenerate contract (family D, `docs/maintainer/cuda-kernel-
-/// guide.md`'s per-op f16 checklist + `f16_oracle`'s own checklist):
-/// empty input, and the two out-of-range bands — saturation and
-/// (correctly-fixed-boundary) underflow — run through the shared
-/// `f16_oracle` helpers directly against a REAL CUDA `axpy_f16` output,
-/// not merely a standalone `f16::from_f32` conversion.
-#[test]
-fn axpy_parity_f16_empty_tensor_is_a_no_op_not_an_error() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
-    let x = Tensor::from_slice(&[] as &[f16], (0,), &cuda).unwrap();
-    let y = Tensor::from_slice(&[] as &[f16], (0,), &cuda).unwrap();
-    let out: Vec<f16> = axpy(2.0, &x, &y).unwrap().to_vec1().unwrap();
-    assert!(out.is_empty());
-}
-
-#[test]
-fn axpy_parity_f16_boundary_saturates_and_underflows() {
-    let Some(cuda) = cuda_device() else {
-        return;
-    };
-    // Saturation: alpha*x alone is far beyond F16_MAX.
-    let xv = [F16_MAX, -F16_MAX];
-    let yv = [0.0f32, 0.0];
-    let xh: Vec<f16> = xv.iter().map(|&v| f16::from_f32(v)).collect();
-    let yh: Vec<f16> = yv.iter().map(|&v| f16::from_f32(v)).collect();
-    let x = Tensor::from_slice(&xh, (2,), &cuda).unwrap();
-    let y = Tensor::from_slice(&yh, (2,), &cuda).unwrap();
-    let out: Vec<f16> = axpy(1000.0, &x, &y).unwrap().to_vec1().unwrap();
-    assert!(out[0].is_infinite() && out[0].is_sign_positive());
-    assert!(out[1].is_infinite() && out[1].is_sign_negative());
-    // Round-2 audit F2 reconciliation: `1000.0 * F16_MAX` = 65_504_000.0,
-    // far above `f16_oracle::F16_OVERFLOW_TIE` (65_520.0) -- this call
-    // sits in the corrected domain, not merely "beyond F16_MAX".
-    assert_saturates_to_infinity(1000.0 * F16_MAX);
-
-    // Underflow: a tiny alpha applied to a tiny x, added to an exact zero
-    // y, sits at or below the corrected tie (f16_oracle::F16_UNDERFLOW_TIE
-    // — see that constant's own doc for why this is HALF of
-    // F16_MIN_POSITIVE_SUBNORMAL, not the full value).
-    let tiny = f16::from_f32(F16_MIN_POSITIVE_SUBNORMAL);
-    let zero = f16::ZERO;
-    let x2 = Tensor::from_slice(&[tiny], (1,), &cuda).unwrap();
-    let y2 = Tensor::from_slice(&[zero], (1,), &cuda).unwrap();
-    let out2: Vec<f16> = axpy(0.4, &x2, &y2).unwrap().to_vec1().unwrap();
-    assert_eq!(
-        out2[0],
-        f16::ZERO,
-        "expected underflow to exact zero at 0.4 * F16_MIN_POSITIVE_SUBNORMAL"
-    );
-    assert_underflows_to_zero(0.4 * F16_MIN_POSITIVE_SUBNORMAL);
-}
 
 // ---- dropout f16 ----
 
@@ -12548,7 +12600,7 @@ fn scaled_cast_add_parity_f16_empty_tensor_is_a_no_op_not_an_error() {
 /// EACH dtype independently is otherwise supported. This must refuse
 /// IDENTICALLY at `n == 0` and `n > 0` — a shape-dependent split here would
 /// reproduce the exact `alloc_empty` hazard campaign #443's D1 audit named
-/// for `axpy`/`dropout`/`rope_positions` before this wave widened their
+/// for `dropout`/`rope_positions` before this wave widened their
 /// own dispatch (`crate::cuda::mod`'s `alloc_empty`/`alloc_zeros` doc).
 #[test]
 fn scaled_cast_add_bf16_f16_pair_is_refused_identically_empty_and_nonempty() {
@@ -12743,7 +12795,7 @@ fn cast_add_f16_empty_tensor_is_a_no_op_not_an_error() {
 /// refusal on F16 input EXPLICITLY at BOTH `n > 0` and `n == 0` — these two
 /// ops' own `cuda_fwd` functions check `s1.dtype() != DType::BF16`
 /// UNCONDITIONALLY, before their `n == 0` fast path, so no shape-dependent
-/// accept/refuse split exists here (unlike `axpy`/`dropout`/
+/// accept/refuse split exists here (unlike `dropout`/
 /// `rope_positions`'s pre-W2c hazard) — this test makes that fact an
 /// asserted invariant, not merely an implication of reading the source.
 #[test]

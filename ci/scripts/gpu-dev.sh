@@ -36,8 +36,10 @@
 #                      [--replace]                   replace an alias's existing record
 #   gpu-dev.sh target  [session] <name>              clone the pod's build-substrate seed
 #                      [--verify] [--with-cutlass]    into a fresh CARGO_TARGET_DIR
-#                                                      (`/root/target-<name>`) for a tree that
-#                                                      already exists — `push` to <name> FIRST
+#                      [--adopt]                       (`/root/target-<name>`) for a tree that
+#                                                      already exists — `push` to <name> FIRST;
+#                                                      --adopt instead stamps the marker on an
+#                                                      already-WARM dir that carries none
 #   gpu-dev.sh attach  [session] [--tree T]           shell into a surviving session
 #   gpu-dev.sh run     [session] [--tree T] <cmd...>  run <cmd> detached under tmux — REFUSES
 #                      [--wave W]                      (esc-077) unless <tree>'s CARGO_TARGET_DIR
@@ -125,8 +127,12 @@ gpu-dev.sh — GPU development on RunPod
                                           unless --replace is given (see --replace below)
   target  [session] <name>                clone the pod's build-substrate seed into a fresh
           [--verify] [--with-cutlass]     CARGO_TARGET_DIR (/root/target-<name>) for a tree
-                                          that already exists — push to <name> FIRST
-                                          (pod_target_clone.sh)
+          [--adopt]                       that already exists — push to <name> FIRST
+                                          (pod_target_clone.sh). --adopt does NOT clone: it
+                                          re-checks an EXISTING warm dir's own content and
+                                          stamps the seed-clone marker on it — the remedy
+                                          for run's UNMARKED_WARM refusal, which a clone
+                                          cannot serve (it refuses an existing destination)
   attach  [session] [--tree T]            join a surviving session's running job
                                           (--shell for a plain prompt instead)
   run     [session] [--tree T] <cmd...>   run <cmd> detached under tmux, in <tree> — REFUSES
@@ -311,6 +317,7 @@ RESEED=0
 TREE=jammi-ai
 TARGET_NAME=""
 TARGET_VERIFY=0
+TARGET_ADOPT=0
 TARGET_WITH_CUTLASS=0
 case "$CMD" in
   shell|up)
@@ -361,7 +368,7 @@ case "$CMD" in
     ARCH="${ARCH:-a100}"; SESSION="${RP_SESSION:-$ARCH}"
     ;;
   target)
-    # target [session] <name> [--verify] [--with-cutlass]
+    # target [session] <name> [--verify|--adopt] [--with-cutlass]
     # `<name>` is the TREE being created/verified, never `--tree` — there is
     # nothing to select yet; this verb is what CREATES a tree.
     ARG=""
@@ -377,6 +384,7 @@ case "$CMD" in
     while [ $# -gt 0 ]; do
       case "$1" in
         --verify) TARGET_VERIFY=1; shift ;;
+        --adopt) TARGET_ADOPT=1; shift ;;
         --with-cutlass) TARGET_WITH_CUTLASS=1; shift ;;
         -h|--help) usage 0 ;;
         -*) echo "::error::unknown option '$1' for target"; usage 2 ;;
@@ -386,6 +394,7 @@ case "$CMD" in
       esac
     done
     [ -n "$TARGET_NAME" ] || [ "$TARGET_VERIFY" = "1" ] || { echo "::error::target: need a tree name (or --verify against an existing one)"; usage 2; }
+    [ "$TARGET_VERIFY" = "1" ] && [ "$TARGET_ADOPT" = "1" ] && { echo "::error::target: --verify and --adopt are different operations; pass at most one"; usage 2; }
     ;;
   wait-seed|wait-job)
     # wait-seed [session] [--timeout SECS]
@@ -589,6 +598,14 @@ source "$DIR/runpod_lib.sh"
 # site joins — see rp_tree_name_check's own doc). The default "jammi-ai"
 # passes trivially; only a caller-supplied --tree can fail this.
 RP_TREE_CHECK_VALUE="$TREE" rp_tree_name_check || exit 2
+# `target`'s POSITIONAL name is a tree name too — it is what rp_target_dir/
+# rp_tree_dir resolve for that verb (:1148), and both results go straight
+# into a remote heredoc. It never passes through $TREE, so the check above
+# does not cover it: `target a100 '<injection>'` reached the pod unchecked.
+# Empty is the "no name given" state `target --verify` legitimately has, so
+# only a non-empty value is checked here; the verb's own
+# "need a tree name" refusal still handles the empty case.
+[ -z "$TARGET_NAME" ] || { RP_TREE_CHECK_VALUE="$TARGET_NAME" rp_tree_name_check || exit 2; }
 
 # Resolved once, here, so every verb below (attach/run/logs/push/pull/target)
 # reads the SAME directories for the SAME --tree value — the one place
@@ -622,6 +639,12 @@ TMUX_SESSION="jammi-${TREE}"
 # operator can set ONE `--wave`/RP_WAVE across a whole push-then-run
 # sequence without either verb rejecting it.
 WAVE="${RP_WAVE:-$TREE}"
+# Same rule as --tree, for the same reason: WAVE is written into the pod's
+# active-wave claim and compared as a literal inside the concurrency
+# preflight's generated text, so an unvalidated value is remote shell text.
+# The `${RP_WAVE:-$TREE}` default inherits an already-checked tree name;
+# only a caller-supplied --wave/RP_WAVE can fail this.
+RP_WAVE_CHECK_VALUE="$WAVE" rp_wave_name_check || exit 2
 
 # The ref rules live with the code that sends the ref to the pod, so they are
 # applied here as soon as that code is available — before anything is rented.
@@ -899,8 +922,20 @@ EOF
           echo "remedy: $(basename "$0") target ${SESSION} ${TREE} --with-cutlass   (or set RP_ALLOW_COLD_TARGET=1 to proceed cold deliberately)" >&2
           exit 1
           ;;
-        *GPU_DEV_TARGET_STATE=UNMARKED*)
-          echo "::error::run refused: CARGO_TARGET_DIR ${TARGET_DIR} exists but carries no seed-clone marker (.jammi-clone-of-seed) — it was never provisioned via pod_target_clone.sh (the \`target\` verb), so this job would pay a COLD full workspace build." >&2
+        *GPU_DEV_TARGET_STATE=UNMARKED_WARM*)
+          # A dir that predates the marker scheme, or was built by any path
+          # other than the `target` verb: it is genuinely WARM (it carries
+          # this workspace's own member fingerprints), so the refusal is
+          # about PROVENANCE, not a cold build — and the remedy has to be
+          # one that can actually run, which a clone cannot: it refuses to
+          # write over an existing destination.
+          echo "::error::run refused: CARGO_TARGET_DIR ${TARGET_DIR} carries workspace-member build artifacts (it is WARM) but no seed-clone marker (.jammi-clone-of-seed) — it predates the marker scheme or was built outside the \`target\` verb, so its provenance is unverified. This is NOT a cold-build refusal." >&2
+          echo "remedy: $(basename "$0") target ${SESSION} ${TREE} --adopt   (re-checks the dir's own content and stamps the marker; nothing is copied or deleted)" >&2
+          echo "   or:  set RP_ALLOW_COLD_TARGET=1 to proceed without the marker" >&2
+          exit 1
+          ;;
+        *GPU_DEV_TARGET_STATE=UNMARKED_COLD*)
+          echo "::error::run refused: CARGO_TARGET_DIR ${TARGET_DIR} exists but contains no workspace-member build artifacts and no seed-clone marker (.jammi-clone-of-seed) — it is a COLD target dir, so this job would pay a full workspace build (~20-40min) instead of the seeded clone's ~80s incremental build." >&2
           echo "remedy: $(basename "$0") target ${SESSION} ${TREE} --with-cutlass   (or set RP_ALLOW_COLD_TARGET=1 to proceed cold deliberately)" >&2
           exit 1
           ;;
@@ -942,7 +977,7 @@ EOF
           BUSY_WAVE="${BUSY_REST%%:*}"
           BUSY_SESSION="${BUSY_REST#*:}"
           if [ "$BUSY_WAVE" = "UNKNOWN" ]; then
-            echo "::error::run refused: this pod already has a live job (tmux session ${BUSY_SESSION}) but its wave identity could not be determined (no readable /root/.jammi-active-wave claim) — one-pod-per-wave fails CLOSED on an unknown wave." >&2
+            echo "::error::run refused: this pod already has a live job (tmux session ${BUSY_SESSION}) but its wave identity could not be determined (no readable claim in /root/.jammi-active-wave.d) — one-pod-per-wave fails CLOSED on an unknown wave." >&2
           else
             echo "::error::run refused: this pod already has a live job for wave '${BUSY_WAVE}' (tmux session ${BUSY_SESSION}) — one-pod-per-wave, wave-scoped. Pass --wave ${BUSY_WAVE} (or RP_WAVE=${BUSY_WAVE}) if this job is really part of that same wave." >&2
           fi
@@ -994,7 +1029,7 @@ set -uo pipefail
 cat > '${TREE_DIR}'/.jammi-job.sh <<'JOBEOF'
 $(rp_job_wrapper_with_marker_lines "$TREE_DIR" "$TARGET_DIR" "$JOB" "$RUN_TOKEN" "$TIMING" "$WAVE" "$TREE")
 JOBEOF
-tmux kill-session -t "=${TMUX_SESSION}" 2>/dev/null # tripwire-ok: idempotent best-effort cleanup of a session that may legitimately not exist yet (first `run` for this tree/session) — the new-session command right below is unconditional
+tmux kill-session -t "=${TMUX_SESSION}" 2>/dev/null # tripwire-ok: idempotent best-effort cleanup of a session that may legitimately not exist yet (first \`run\` for this tree/session) — the new-session command right below is unconditional; the backticks around \`run\` are ESCAPED because this heredoc's delimiter is UNQUOTED (it must expand \${TMUX_SESSION}/\${LAUNCH}) — an unescaped backtick pair in an unquoted heredoc body is LIVE command substitution, run on the LAPTOP, which printed 'run: command not found' and spliced the word away before the text ever reached the pod
 tmux new-session -d -s "${TMUX_SESSION}" "${LAUNCH}"
 tmux set-option -w -t "=${TMUX_SESSION}:" remain-on-exit off
 echo "started (tree=${TREE}, timing-locked=${TIMING}, token=${RUN_TOKEN}): ${JOB}"
@@ -1159,10 +1194,23 @@ EOF
       exit $?
     fi
     [ -n "$TARGET_NAME" ] || { echo "target: need a tree name"; exit 2; }
-    rp_run_remote <<EOF
+    # `--adopt` stamps the clone marker on an already-warm target dir that
+    # carries none, after re-checking its content (pod_target_clone.sh's
+    # own --adopt doc has the rule) — the executable remedy for `run`'s
+    # UNMARKED_WARM refusal. Nothing is cloned, copied, or deleted; the
+    # ONLY difference here is the flag, so both paths keep the identical
+    # staging, cutlass, and reporting behavior.
+    if [ "$TARGET_ADOPT" = "1" ]; then
+      rp_run_remote <<EOF
+set -uo pipefail
+bash ${STAGE_DIR}/pod_target_clone.sh /root/.jammi-seed '${NAME_TARGET_DIR}' --adopt
+EOF
+    else
+      rp_run_remote <<EOF
 set -uo pipefail
 bash ${STAGE_DIR}/pod_target_clone.sh /root/.jammi-seed '${NAME_TARGET_DIR}'
 EOF
+    fi
     rc=$?
     if [ "$rc" -eq 0 ] && [ "$TARGET_WITH_CUTLASS" = "1" ]; then
       # round-5 audit A1: this logic used to be inlined as heredoc TEXT
@@ -1187,7 +1235,11 @@ bash ${STAGE_DIR}/pod_provision_cutlass.sh '${NAME_SOURCE_TREE_DIR}' /root/jammi
 EOF
       rc=$?
     fi
-    echo "=== target '${TARGET_NAME}' — clone at ${NAME_TARGET_DIR}, cutlass ${TARGET_WITH_CUTLASS}: exit ${rc} ==="
+    if [ "$TARGET_ADOPT" = "1" ]; then
+      echo "=== target '${TARGET_NAME}' — ADOPTED existing dir ${NAME_TARGET_DIR}, cutlass ${TARGET_WITH_CUTLASS}: exit ${rc} ==="
+    else
+      echo "=== target '${TARGET_NAME}' — clone at ${NAME_TARGET_DIR}, cutlass ${TARGET_WITH_CUTLASS}: exit ${rc} ==="
+    fi
     exit "$rc"
     ;;
 

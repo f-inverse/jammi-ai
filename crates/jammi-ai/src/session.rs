@@ -13,7 +13,7 @@ use jammi_db::store::{ArtifactStore, ResultStore};
 use crate::concurrency::GpuScheduler;
 use crate::eval::runner::EvalRunner;
 use crate::fine_tune::spec::{TrainingCommon, TrainingSpec};
-use crate::fine_tune::training_job::TrainingJob;
+use crate::fine_tune::training_job::{fine_tuned_model_id, TrainingJob};
 use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
 use crate::inference::observer::InferenceObserver;
 use crate::model::backend::DeviceConfig;
@@ -189,6 +189,18 @@ impl InferenceSession {
     /// Execute a SQL query.
     pub async fn sql(&self, query: &str) -> Result<Vec<RecordBatch>> {
         self.inner.sql(query).await
+    }
+
+    /// Every ANN index segment of `table_name`, ordered by `segment_id`.
+    /// Forwarded to
+    /// [`jammi_db::session::JammiSession::list_index_segments`], which owns the
+    /// tenant gate (the table is resolved through the tenant-filtered
+    /// result-table read first, so an unresolvable table lists nothing).
+    pub async fn list_index_segments(
+        &self,
+        table_name: &str,
+    ) -> Result<Vec<jammi_db::catalog::segment_repo::IndexSegment>> {
+        self.inner.list_index_segments(table_name).await
     }
 
     /// Access the catalog.
@@ -1170,7 +1182,7 @@ impl InferenceSession {
         spec: TrainingSpec,
     ) -> Result<TrainingJob> {
         let job_id = uuid::Uuid::new_v4().to_string();
-        let output_model_id = format!("jammi:fine-tuned:{job_id}");
+        let output_model_id = fine_tuned_model_id(&job_id);
 
         // Parse model source to get the canonical name (what ModelCache uses for
         // registration).

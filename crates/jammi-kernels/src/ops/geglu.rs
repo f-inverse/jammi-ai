@@ -454,8 +454,8 @@ impl CustomOp1 for GegluFused {
     /// See the module doc's "no save-for-backward" section. `dwi_out`'s
     /// slot is ALWAYS `Some` — `arg` (`wi_out`) may be an INTERMEDIATE on
     /// a path to a `Var` (`Tensor::is_variable() == false` does not mean
-    /// "no gradient needed" — the same hazard `Axpy`'s doc, and every
-    /// other op in this crate, document), so this never gates on it.
+    /// "no gradient needed" — see `ops`'s module doc, "`is_variable()` is
+    /// NOT a "does this need a gradient?" gate"), so this never gates on it.
     fn bwd(&self, arg: &Tensor, _res: &Tensor, grad_res: &Tensor) -> Result<Option<Tensor>> {
         let dwi_out = super::apply2(
             arg,

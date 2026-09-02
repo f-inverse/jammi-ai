@@ -57,11 +57,15 @@
 //!    process-wide `OnceLock` for who initializes it first — see that
 //!    function's own doc and `crates/jammi-bench/tests/finetune_step_kernel_disable.rs`'s
 //!    identical concern, resolved there by spawning a child process
-//!    instead). This file's own tests are safe to run concurrently in the
-//!    SAME process (cargo's default) precisely BECAUSE every one of them
-//!    sets the identical value `"all"` — the `OnceLock` race the doc above
-//!    would matter for is between DIFFERENT disable configurations, never
-//!    between two writers agreeing on the same one. [`assert_ran_eager`]
+//!    instead). That `OnceLock` specifically is safe under concurrency
+//!    here precisely BECAUSE every test sets the identical value `"all"` —
+//!    the race the doc above would matter for is between DIFFERENT disable
+//!    configurations, never between two writers agreeing on the same one.
+//!    CORRECTED (campaign #446, finding 9): an earlier revision of this
+//!    paragraph generalized that one env var's safety into "this file's
+//!    own tests are safe to run concurrently in the SAME process", which
+//!    is FALSE for the part of these oracles that matters — see
+//!    [`SerialGpu`] and the section below. [`assert_ran_eager`]
 //!    reads [`jammi_encoders::ln_dispatch_snapshot`] (this crate's own
 //!    published counter, the same `LayerNormFused`/eager-fallback pair
 //!    every other dispatch-count oracle in this crate's own test suite
@@ -88,6 +92,18 @@
 //!    `run_leg(DType::BF16, ..)` and `run_leg(DType::F16, ..)` drive the
 //!    IDENTICAL pipeline (same weights file, same synthetic token ids,
 //!    same margin-loss/backward shape), differing ONLY in `backbone_dtype`.
+//!
+//! ## One test at a time, structurally
+//!
+//! This file has THREE `#[test]` fns (two run by default; the pre-fix RED
+//! reproduction is `#[ignore]`d), and every one of them measures
+//! DEVICE-GLOBAL free memory. Concurrency between them is not a style
+//! question: two legs sampling `cuMemGetInfo` while a third holds tens of
+//! GB of eager activations read each other's allocations as their own.
+//! [`SerialGpu`] makes single-test-at-a-time a property of the ONLY way
+//! this file can obtain a `Device`, so it holds for tests that do not
+//! exist yet. It replaces a comment that asserted the opposite and a
+//! `--test-threads=1` expectation nothing in CI supplies.
 //!
 //! ## Reading the verdict
 //!
@@ -231,6 +247,7 @@ use jammi_encoders::{ModernBert, ModernBertConfig, Pooling};
 use jammi_lora::LoraBuildConfig;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 
 /// The escape's own measured failing shape (`esc-076`'s `observable`
 /// field: "f16 fine-tune ... terminates rc=1 ... Backward:
@@ -273,9 +290,142 @@ fn esc076_trace_gate(context: &str) {
     }
 }
 
-fn cuda_device() -> Option<Device> {
+/// This process's single GPU slot. See [`SerialGpu`] for why it exists and
+/// why it is STRUCTURAL rather than a convention.
+static GPU_SERIAL: Mutex<()> = Mutex::new(());
+
+/// A CUDA device that cannot be held without also holding [`GPU_SERIAL`].
+///
+/// Campaign #446, finding 9. This file's oracles read DEVICE-GLOBAL free
+/// memory (`cuda_free_mib` -> `cuMemGetInfo`), and it has THREE `#[test]`
+/// fns, two of which run by default. `cargo test` runs the tests of one
+/// binary CONCURRENTLY, so two legs measuring the same device's free
+/// memory while a third is allocating tens of GB of eager activations
+/// attribute each other's allocations to their own trace -- a false RED
+/// (or, worse, a false GREEN when the interleaving happens to cancel
+/// out).
+///
+/// The remedy is structural, not documentary: `cuda_device` is the ONLY
+/// source of a `Device` in this file, and it now hands back this wrapper,
+/// which holds the process-wide lock for as long as the caller holds the
+/// device. A test added tomorrow cannot forget to serialize, because it
+/// cannot obtain a device without doing so -- whereas a comment asking
+/// for `--test-threads=1` (nothing in CI passes it) is exactly the kind
+/// of instruction a new test silently does not read.
+///
+/// # Why there is no `Deref<Target = Device>`
+///
+/// This type used to `impl Deref<Target = Device>`, which kept every
+/// `&device` call site working unchanged -- and let
+/// `let d = (*cuda_device().unwrap()).clone();` type-check. That one-liner
+/// ENDS the serialization: the temporary guard (and with it the slot) is
+/// dropped at the end of the statement, while `d` is a live, owned
+/// `Device` the caller then measures device-global free memory on with no
+/// slot held -- the exact escape this wrapper exists to prevent, spelled
+/// as ordinary deref usage. Mirrors `jammi-ai`'s
+/// `tests/gpu_capability/harness.rs` fix of the same shape.
+///
+/// [`SerialGpu::device`] replaces it: the borrow it returns is tied to
+/// `&self`, so no `&Device` can outlive the guard. Every call site passes
+/// `device.device()` where it used to pass `&device`.
+///
+/// **What is still open, stated rather than implied.** `candle_core::Device`
+/// is `Clone`, so `guard.device().clone()` compiles and always will --
+/// nothing an API of this shape can do prevents cloning a `Clone` type
+/// reachable by reference (a `&DeviceRef` newtype does not help: if it
+/// derefs to `Device` the clone resolves straight through it by autoderef,
+/// and if it does not, no call site can pass it where `&Device` is
+/// wanted). What changed is that the escape is now an EXPLICIT, greppable
+/// `.device().clone()` rather than an incidental consequence of deref, and
+/// no call site in this file needs it.
+///
+/// A poisoned lock is recovered with `into_inner` rather than unwrapped:
+/// one leg panicking must fail THAT leg, not turn every sibling into a
+/// confusing poison error that buries the original diagnosis.
+struct SerialGpu {
+    device: Device,
+    /// Held, never read -- dropping it at the end of the test body is the
+    /// entire mechanism.
+    _slot: MutexGuard<'static, ()>,
+}
+
+impl SerialGpu {
+    /// This guard's device, borrowed for no longer than the guard itself --
+    /// the ONLY way to reach it, and the reason there is no `Deref` (see
+    /// the type doc). Deliberately NOT `into_device`/`to_device`: nothing
+    /// in this file has a legitimate reason to hold a `Device` past the
+    /// slot.
+    fn device(&self) -> &Device {
+        &self.device
+    }
+}
+
+/// Take this file's one-at-a-time GPU slot, recovering a poisoned lock
+/// rather than unwrapping it (see [`SerialGpu`]'s doc for why).
+///
+/// Split out from [`cuda_device`] so the exclusion property itself is
+/// testable without a DEVICE, where no [`SerialGpu`] can ever be
+/// constructed: [`gpu_slot_is_exclusive_while_held`] is the non-vacuous
+/// control that the slot is a real mutex and not a decorative field.
+fn take_gpu_slot() -> MutexGuard<'static, ()> {
+    GPU_SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The slot is a real mutual exclusion -- the property every device-global
+/// memory oracle in this file leans on.
+///
+/// The assertion is made while THIS test provably owns the slot
+/// ([`take_gpu_slot`] blocks until it does), and `std::sync::Mutex` is not
+/// reentrant, so `try_lock` failing here is evidence that `GPU_SERIAL` is a
+/// real mutex actually held by the value [`take_gpu_slot`] returns -- which
+/// is the same value [`SerialGpu`]'s `_slot` field stores. A decorative,
+/// always-available field fails this.
+///
+/// # Two things this deliberately does NOT assert, and why
+///
+/// **The release half.** `jammi-ai`'s `tests/gpu_capability/harness.rs`
+/// twin also asserts `try_lock().is_ok()` after the guard drops. That
+/// assertion is sound THERE because it runs on the CPU lane, where no
+/// sibling can take the slot. Here it is not: this file is
+/// `#![cfg(feature = "cuda")]` in its entirety, so the control only ever
+/// runs alongside legs that hold the slot for MINUTES, and `cargo test`
+/// runs a binary's tests concurrently -- a sibling holding the slot at that
+/// instant is CORRECT behavior, not a leak, and asserting on it is a
+/// coin-flip. (Measured, not predicted: the first version of this control
+/// asserted it and failed on an L40S pod for exactly that reason, with
+/// `esc076_variable_shape_bucketed_completes_with_bounded_memory` holding
+/// the slot.) Release is `MutexGuard`'s own `Drop`, which is not this
+/// file's code; exclusion is the part that is.
+///
+/// **CPU-lane coverage.** Unlike the `jammi-ai` twin, this control cannot
+/// run without the `cuda` feature -- that lane compiles none of this file.
+/// What it does buy is that it needs no DEVICE: every `cuda`-featured lane
+/// runs it, including one where `Device::new_cuda` fails and no
+/// [`SerialGpu`] can be constructed at all, which is exactly where this
+/// file's other tests skip out.
+#[test]
+fn gpu_slot_is_exclusive_while_held() {
+    let slot = take_gpu_slot();
+    assert!(
+        GPU_SERIAL.try_lock().is_err(),
+        "a second holder must not be able to take the slot while this test holds it -- \
+         without a real mutex behind `GPU_SERIAL`, `SerialGpu` would serialize nothing"
+    );
+    drop(slot);
+}
+
+fn cuda_device() -> Option<SerialGpu> {
+    // Taken BEFORE `Device::new_cuda`, so even device ACQUISITION (which
+    // allocates a context on the device) is serialized against a sibling
+    // leg's memory trace.
+    let slot = take_gpu_slot();
     match Device::new_cuda(0) {
-        Ok(d) => Some(d),
+        Ok(device) => Some(SerialGpu {
+            device,
+            _slot: slot,
+        }),
         Err(e) => {
             if std::env::var_os("JAMMI_REQUIRE_CUDA").is_some() {
                 panic!(
@@ -1097,10 +1247,10 @@ fn esc076_variable_shape_unbucketed_reproduces_the_pre_fix_oom() {
     write_synthetic_checkpoint(&config, &weights_path);
 
     let variable_outcome = assert_ran_eager("variable_shape_bf16", || {
-        run_leg_variable_shape(DType::BF16, &config, &weights_path, &device)
+        run_leg_variable_shape(DType::BF16, &config, &weights_path, device.device())
     });
     let fixed_outcome = assert_ran_eager("fixed_shape_bf16_same_step_count", || {
-        run_leg_fixed_shape_same_step_count(DType::BF16, &config, &weights_path, &device)
+        run_leg_fixed_shape_same_step_count(DType::BF16, &config, &weights_path, device.device())
     });
 
     println!(
@@ -1227,11 +1377,16 @@ fn esc076_variable_shape_bucketed_completes_with_bounded_memory() {
     write_synthetic_checkpoint(&config, &weights_path);
 
     let bucketed_outcome = assert_ran_eager("variable_shape_bucketed_bf16", || {
-        run_leg_variable_shape_bucketed(DType::BF16, &config, &weights_path, &device)
+        run_leg_variable_shape_bucketed(DType::BF16, &config, &weights_path, device.device())
     });
     let fixed_outcome =
         assert_ran_eager("fixed_shape_bf16_same_step_count_bucketed_control", || {
-            run_leg_fixed_shape_same_step_count(DType::BF16, &config, &weights_path, &device)
+            run_leg_fixed_shape_same_step_count(
+                DType::BF16,
+                &config,
+                &weights_path,
+                device.device(),
+            )
         });
 
     println!(
@@ -1340,10 +1495,15 @@ fn assert_ran_eager<T>(label: &str, f: impl FnOnce() -> T) -> T {
 #[test]
 fn esc076_fully_eager_bf16_vs_f16_at_reporter_shape() {
     // SAFETY-of-test: this file is Cargo-autodiscovered as its OWN test
-    // binary/process (no `tests/it/`-style shared harness, no other
-    // `#[test]` in this file) and this is the FIRST statement that could
-    // touch `jammi_kernels::admission`'s process-wide `OnceLock` --
-    // see this file's own module doc, control 1.
+    // binary/process (no `tests/it/`-style shared harness), and this is
+    // the FIRST statement that could touch `jammi_kernels::admission`'s
+    // process-wide `OnceLock` -- see this file's own module doc, control
+    // 1. CORRECTED (campaign #446, finding 9): this comment used to also
+    // claim there was "no other `#[test]` in this file". There are THREE,
+    // and they set the identical `"all"` value, which is what actually
+    // makes the `OnceLock` safe here. Mutual exclusion for the
+    // DEVICE-GLOBAL memory oracles is a separate concern, handled
+    // structurally by `SerialGpu` rather than by this comment.
     std::env::set_var("JAMMI_KERNELS_DISABLE", "all");
 
     let Some(device) = cuda_device() else {
@@ -1359,7 +1519,7 @@ fn esc076_fully_eager_bf16_vs_f16_at_reporter_shape() {
     // so a broken OOM-classification path is caught before either real
     // leg's outcome is trusted.
     let witness = assert_ran_eager("oom_capability_witness", || {
-        oom_capability_witness_leg(&config, &weights_path, &device)
+        oom_capability_witness_leg(&config, &weights_path, device.device())
     });
     match &witness {
         LegOutcome::CudaOutOfMemory { message, .. } => {
@@ -1379,10 +1539,10 @@ fn esc076_fully_eager_bf16_vs_f16_at_reporter_shape() {
     }
 
     let bf16_outcome = assert_ran_eager("bf16_reporter_shape", || {
-        run_leg(DType::BF16, &config, &weights_path, &device)
+        run_leg(DType::BF16, &config, &weights_path, device.device())
     });
     let f16_outcome = assert_ran_eager("f16_reporter_shape", || {
-        run_leg(DType::F16, &config, &weights_path, &device)
+        run_leg(DType::F16, &config, &weights_path, device.device())
     });
 
     for (label, outcome) in [("bf16", &bf16_outcome), ("f16", &f16_outcome)] {

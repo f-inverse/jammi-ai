@@ -800,10 +800,17 @@ ALTER TABLE result_tables DROP COLUMN index_path;
 ///   - **absent / SQL `NULL`** — a legacy row written before this migration,
 ///     or (should it ever occur) a row this code never touched. Read back as
 ///     "unknown", never fabricated as any producer state.
-///   - **`{"state":"pending"}`** — the ONE payload the catalog itself writes,
-///     stamped by [`Catalog::create_training_job`] at submission time: the
-///     job exists and is queued/running, but no claimant has yet recorded a
-///     determination.
+///   - **`{"state":"pending"}`** — stamped by
+///     [`Catalog::create_training_job`] at submission time: the job exists and
+///     is queued/running, but no claimant has yet recorded a determination.
+///     That sentence stops being true the instant the row goes terminal, so
+///     each of the three terminal writes retires this exact marker to its own
+///     `{"state":"undetermined","reason":…}` inside the SAME UPDATE that flips
+///     the status, and the reclaim requeue arm resets it. Those four are the
+///     only payloads the catalog itself writes;
+///     [`crate::catalog::training_repo::TrainingJobRecord::acceleration_report`]
+///     states the whole lifecycle in one place and is the sole place it is
+///     stated.
 ///
 /// Every other payload — most commonly `{"state":"determined", ...}`,
 /// written by [`Catalog::record_acceleration_report`] once the claiming

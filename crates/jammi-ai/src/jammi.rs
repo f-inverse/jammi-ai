@@ -6,7 +6,7 @@
 //! engine the config built.
 //!
 //! This is purely a constructor over existing pieces: it threads
-//! [`InferenceSession::open`] → [`Session::with_embedded_worker`]. No
+//! [`InferenceSession::open`] → [`Session::with_configured_worker`]. No
 //! construction logic is duplicated here. The remote transport is a separate
 //! crate (`jammi-client`'s `DataClient` / `jammi-admin`'s `CatalogClient`),
 //! which speaks the same request/result vocabulary over gRPC; an embedded
@@ -36,14 +36,33 @@ impl Jammi {
     /// Open a [`Session`] against `target`.
     ///
     /// [`Target::Local`] builds an in-process [`InferenceSession`] from the
-    /// config and wraps it as an embedded [`Session`]. The front-door embedded
-    /// session owns the training worker (RAII): it both submits training jobs
-    /// and runs them, and the worker stops when the session drops.
+    /// config and wraps it as an embedded [`Session`].
+    ///
+    /// # `training.run_worker` — whether this process claims
+    ///
+    /// The front-door embedded session owns the training worker (RAII) **when
+    /// the config asks this process to claim**. That is one key,
+    /// [`jammi_db::config::TrainingConfig::run_worker`] (default `true`), read
+    /// off the `JammiConfig` the caller passed in — the SAME key the server
+    /// binary's `train` tier and the Python `Database` read, so a deployment
+    /// setting `JAMMI_TRAINING__RUN_WORKER=false` (or the `[training]` TOML key)
+    /// reaches the Rust SDK arm exactly as it reaches the other two:
+    ///
+    /// * `true` (the default) — the session both submits training jobs and runs
+    ///   them; the worker stops when the session drops.
+    /// * `false` — no worker is spawned. The session still submits training jobs
+    ///   and serves their status; it just never claims one, so on a
+    ///   single-process catalog a submitted job stays `queued` until a process
+    ///   configured to claim opens the directory.
+    ///
+    /// See [`Session::with_configured_worker`] for the constructor this threads
+    /// to, and [`Session::with_embedded_worker`] for the explicit
+    /// spawn-regardless form.
     pub async fn open(target: Target) -> Result<Session> {
         match target {
             Target::Local(config) => {
                 let engine = InferenceSession::open(config).await?;
-                Session::with_embedded_worker(engine)
+                Session::with_configured_worker(engine)
             }
         }
     }

@@ -19,9 +19,11 @@
 // on `result`'s side), adds in f32, and only THEN casts back down once via
 // `.to(torch_result_dtype)` — ONE round point, not two. An earlier revision
 // of this kernel rounded the scaled delta to bf16 FIRST (an extra round
-// point never present in the PEFT reference); `Axpy`'s "f32-accumulate,
-// round once" precedent is the one this op now follows too, not an
-// exception to it.
+// point never present in the PEFT reference); this crate's
+// "f32-accumulate, round once" convention (see `../ops/mod.rs` and the
+// per-op f16 reference-regime table in
+// `docs/maintainer/cuda-kernel-guide.md`) is the one this op now follows
+// too, not an exception to it.
 //
 // esc-046 audit round 2 (finding 2): PEFT computes the scaled delta
 // (`lora_B(...) * scaling`) as its OWN separate kernel launch (one f32

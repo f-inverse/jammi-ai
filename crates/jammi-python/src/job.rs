@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use pyo3::prelude::*;
 
-use jammi_ai::fine_tune::spec::TrainingSpec;
 use jammi_ai::fine_tune::training_job::TrainingJob;
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::status::TrainingJobStatus;
@@ -199,11 +198,18 @@ impl PyTrainingJob {
     /// before migration 026, or one this code never touched — maps to Python
     /// `None`, an honest absence of information, never silently coerced to
     /// `{}` or read as any particular acceleration state. A present value
-    /// decodes to a dict whose vocabulary the payload's *producer* owns; the
-    /// catalog itself writes only `{"state": "pending"}` at submission time,
-    /// before any claimant has recorded a determination, and the claiming
-    /// worker typically replaces it with `{"state": "determined", ...}` once
-    /// the device/dtype/kernel-admission probe for this attempt has run.
+    /// decodes to a dict whose `"state"` is one of four values: `"pending"` —
+    /// the submission-time marker, meaning the job exists and no claimant has
+    /// computed a determination yet — or one of the three determination
+    /// outcomes `"determined"`, `"not_applicable"`, and `"undetermined"`, the
+    /// last of which always carries a `"reason"` string. `"pending"` is a
+    /// transient marker, not a resting state: a job that reaches a terminal
+    /// status without a determination has its marker retired to
+    /// `"undetermined"` with a reason naming the edge that retired it, and a
+    /// requeued job is reset to `"pending"` for its next attempt — so a read
+    /// can legitimately land on any of the four. Everything beside `"state"`
+    /// is the payload producer's to define; this binding decodes the blob
+    /// as-is and never inspects it.
     ///
     /// Raises `jammi.errors.BackendError` if the column IS present but fails
     /// to parse as JSON — a catalog data-integrity fault, matching
@@ -264,46 +270,20 @@ async fn poll_until_terminal(
 /// row alone — no in-memory carryover from a submit call, because attach never
 /// had one.
 ///
-/// Once the job has completed, `record.output_model_id` (stamped by the
-/// worker's finalize) is authoritative and used directly. Before that, the
-/// value is re-derived from the persisted `training_spec` by the SAME rule
-/// [`InferenceSession::submit_fine_tune_spec`] /
-/// [`InferenceSession::train_context_predictor`] apply at submit time: the two
-/// LoRA fine-tune kinds mint the deterministic `jammi:fine-tuned:{job_id}`
-/// (checked directly against `record.kind`, no spec decode needed — the value
-/// depends only on `job_id`); the context-predictor kind carries a
-/// caller-chosen id inside `predictor_spec.model_id`, which is NOT derivable
-/// from `job_id` alone, so that one arm does decode the persisted spec.
+/// A thin adapter over
+/// [`jammi_ai::fine_tune::training_job::resolve_model_id`], which owns the
+/// rule: the stamped `output_model_id` once the job has completed, and before
+/// then the same re-derivation the submit path applies (the two LoRA
+/// fine-tune kinds mint the deterministic
+/// [`jammi_ai::fine_tune::training_job::fine_tuned_model_id`]; the
+/// context-predictor kind's id is caller-chosen and read out of the persisted
+/// `training_spec`). This function adds ONLY the conversion into the Python
+/// error taxonomy — no second copy of the naming rule, so this binding cannot
+/// drift from the `TrainingStatus` handler that answers the REMOTE peer of
+/// this very handle. That one shared call is what makes
+/// `EmbeddedBackend.training_job(id).model_id` and
+/// `RemoteDatabase.training_job(id).model_id` equal at every lifecycle state —
+/// equal by construction, not by two implementations that happen to agree.
 fn resolve_attach_model_id(job_id: &str, record: &TrainingJobRecord) -> PyResult<String> {
-    if let Some(model_id) = &record.output_model_id {
-        return Ok(model_id.clone());
-    }
-    match record.kind.as_str() {
-        "fine_tune" | "graph_fine_tune" => Ok(format!("jammi:fine-tuned:{job_id}")),
-        "context_predictor" => {
-            let raw = record.training_spec.as_deref().ok_or_else(|| {
-                to_pyerr(JammiError::Catalog(format!(
-                    "training job {job_id}: missing persisted training_spec; \
-                     cannot resolve model_id before completion"
-                )))
-            })?;
-            let spec: TrainingSpec = serde_json::from_str(raw).map_err(|parse_err| {
-                to_pyerr(JammiError::Catalog(format!(
-                    "training job {job_id}: training_spec failed to parse as JSON: {parse_err}"
-                )))
-            })?;
-            match spec {
-                TrainingSpec::ContextPredictor { predictor_spec, .. } => {
-                    Ok(predictor_spec.model_id)
-                }
-                _ => Err(to_pyerr(JammiError::Catalog(format!(
-                    "training job {job_id}: persisted training_spec kind does not match \
-                     catalog kind 'context_predictor'"
-                )))),
-            }
-        }
-        other => Err(to_pyerr(JammiError::Catalog(format!(
-            "training job {job_id}: unrecognised training job kind '{other}'"
-        )))),
-    }
+    jammi_ai::fine_tune::training_job::resolve_model_id(job_id, record).map_err(to_pyerr)
 }

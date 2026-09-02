@@ -169,6 +169,43 @@ def _source_descriptor_to_dict(d: catalog_pb2.SourceDescriptor) -> Dict[str, Any
     }
 
 
+def _training_job_summary_to_dict(j: training_pb2.TrainingJobSummary) -> Dict[str, Any]:
+    """Project a wire `TrainingJobSummary` into the job dict a caller reads.
+
+    Every field the message carries and nothing else — the embedded
+    `list_training_jobs` builds the same seven keys at its FFI boundary from the
+    catalog record, applying the same two conventions this message documents:
+    `output_model_id` is the empty string until the job completes, `error` is
+    empty unless it failed. Neither arm maps either onto `None`, so a caller
+    branches on one thing on both transports.
+    """
+    return {
+        "job_id": j.job_id,
+        "kind": j.kind,
+        "status": j.status,
+        "base_model_id": j.base_model_id,
+        "output_model_id": j.output_model_id,
+        "created_at": j.created_at,
+        "error": j.error,
+    }
+
+
+def _index_segment_to_dict(s: catalog_pb2.IndexSegment) -> Dict[str, Any]:
+    """Project a wire `IndexSegment` into the segment dict a caller reads.
+
+    The whole row and nothing else — `segment_id`, `index_path`, `row_count` —
+    the same three keys, spelled the same way, that the embedded
+    `list_index_segments` builds at its FFI boundary. `row_count` rides the wire
+    as a `uint64` and lands as a plain Python `int`, which is unbounded, so the
+    widening the engine does on the send side has no narrowing peer here.
+    """
+    return {
+        "segment_id": s.segment_id,
+        "index_path": s.index_path,
+        "row_count": s.row_count,
+    }
+
+
 def _model_to_dict(m: catalog_pb2.Model) -> Dict[str, Any]:
     """Project a wire `Model` into the model dict a caller reads.
 
@@ -751,21 +788,28 @@ class RemoteTrainingJob:
         The remote peer of the embedded `TrainingJob.acceleration_report`:
         parses the `TrainingStatusResponse.acceleration_report_json` field the
         server fills verbatim from the catalog's
-        `training_jobs.acceleration_report` column — computed by the claiming
-        worker at device-resolution time, before the training loop's first
-        step, so a poll mid-training (or after completion) always finds
-        either the submission-time ``{"state": "pending"}`` marker (no
-        claimant has computed a determination yet) or a ``{"state":
-        "determined", ...}`` payload carrying ``dtype``, ``cuda_compiled``,
-        ``flash_compiled``, a per-op ``ops`` map, and a ``flash`` field. Each
-        ``ops``/``flash`` entry is ``{"holds": bool, "reason": str}`` —
+        `training_jobs.acceleration_report` column. Its ``"state"`` is one of
+        four values: ``"pending"`` — the submission-time marker, meaning the
+        job exists and no claimant has computed a determination yet — or one
+        of the three determination outcomes ``"determined"``,
+        ``"not_applicable"``, and ``"undetermined"``, the last of which always
+        carries a ``"reason"`` string. ``"pending"`` is a transient marker,
+        not a resting state: a job that reaches a terminal status without a
+        determination has its marker retired to ``"undetermined"`` with a
+        reason naming the edge that retired it, and a requeued job is reset to
+        ``"pending"`` for its next attempt — so a poll mid-training, or after
+        completion, can legitimately land on any of the four. A
+        ``"determined"`` payload is computed by the claiming worker at
+        device-resolution time, before the training loop's first step, and
+        carries ``dtype``, ``cuda_compiled``, ``flash_compiled``, a per-op
+        ``ops`` map, and a ``flash`` field. Each ``ops``/``flash`` entry is
+        ``{"holds": bool, "reason": str}`` —
         ``holds: true`` means the real fused kernel dispatched for this job's
         own probe forward pass; ``holds: false`` carries the SAME domain-check
         ``reason`` key the kernel's own admission predicate recorded, never a
-        re-derived one. A non-fine-tune job kind or a pre-device-resolution
-        failure may record a different ``"state"`` (``"not_applicable"`` /
-        ``"undetermined"``) — the vocabulary is owned by the producer, not
-        enumerated here.
+        re-derived one. Everything beside ``"state"`` is the payload
+        producer's to define; this client decodes the blob as-is and never
+        inspects it.
 
         Returns ``None`` for a legacy row predating the column (`optional`
         unset on the wire, mirroring SQL `NULL`) — an honest absence of
@@ -839,11 +883,38 @@ class RemoteDatabase:
         # Flight SQL and the typed gRPC services on one Tonic port); built lazily
         # on first `sql` so a connection that never queries SQL pays nothing.
         self._flight = None
+        # Set exactly once, by `close()`. Every transport entry point checks it
+        # first (`_check_open`) — the peer of the embedded engine's FFI-boundary
+        # guard, so a closed session behaves the SAME on both transports.
+        self._closed = False
 
     @property
     def session_id(self) -> str:
         """The opaque session id the server keys this connection's tenant by."""
         return self._session_id
+
+    # --- The closed-session guard -----------------------------------------------
+
+    def _check_open(self) -> None:
+        """Raise the typed :class:`BackendError` once :meth:`close` has run.
+
+        The remote peer of the embedded engine's FFI-boundary guard
+        (`_NativeDatabase::check_open`), and the reason a closed
+        :class:`~jammi.Session` behaves identically on both transports. Without
+        it, a verb on a closed channel escaped the taxonomy entirely: grpcio
+        raises a bare ``ValueError("Cannot invoke RPC on closed channel!")``,
+        which no ``except JammiError`` catches — so the one program a caller
+        writes against `Session` needed two different `except` clauses depending
+        on the transport it happened to be pointed at.
+
+        Called from every transport ENTRY point rather than from each verb: the
+        unary choke point :meth:`_call`, the streaming
+        :meth:`subscribe_collect`, and the separate Flight SQL lane
+        :meth:`sql`. A verb reaches the wire through one of those three or not at
+        all, so there is no per-verb list to drift.
+        """
+        if self._closed:
+            raise BackendError("Database is closed")
 
     # --- The single wire choke point --------------------------------------------
 
@@ -857,6 +928,7 @@ class RemoteDatabase:
         per-verb try/excepts. Call-sites that special-case ``NOT_FOUND`` catch the
         mapped exception and branch on its ``.code`` (carried from the status).
         """
+        self._check_open()
         try:
             return method(request, metadata=self._metadata)
         except grpc.RpcError as exc:
@@ -864,14 +936,19 @@ class RemoteDatabase:
 
     # --- Capability contract ----------------------------------------------------
     #
-    # The remote transport carries `close` (real gRPC teardown) and `session_id`
-    # (the per-connection scoping key); it does NOT carry the embedded-only
-    # in-process primitives (`audit`, `ephemeral_session`, `preload_model`).
-    # `supports()` answers the divergence, and the one-sided members raise a typed
-    # `NotSupportedOnBackend` rather than a bare `AttributeError`, so a caller that
-    # ignores `supports()` still gets a legible error naming the capability.
+    # The remote transport carries `session_id` (the per-connection scoping key);
+    # it does NOT carry the embedded-only in-process primitives (`audit`,
+    # `ephemeral_session`, `preload_model`). `supports()` answers the divergence,
+    # and the one-sided members raise a typed `NotSupportedOnBackend` rather than
+    # a bare `AttributeError`, so a caller that ignores `supports()` still gets a
+    # legible error naming the capability.
+    #
+    # `close` is NOT here (and no longer a `Capability` at all): the embedded arm
+    # carries a real `close()` too — the catalog-file release — so the flag
+    # described no divergence, only a primitive the public client could not
+    # reach.
 
-    _CAPABILITIES = frozenset({Capability.CLOSE, Capability.SESSION_ID})
+    _CAPABILITIES = frozenset({Capability.SESSION_ID})
 
     def supports(self, capability: Capability) -> bool:
         """Whether this (remote) backend carries `capability`."""
@@ -1021,6 +1098,26 @@ class RemoteDatabase:
                 return None
             raise
         return _source_descriptor_to_dict(d)
+
+    def list_index_segments(self, table_name: str) -> List[Dict[str, Any]]:
+        """The ANN index segments of one result table, in ``segment_id`` order.
+
+        Maps to `CatalogService.ListIndexSegments`; same dict shape per entry as
+        the embedded :meth:`jammi.EmbeddedBackend.list_index_segments` —
+        ``segment_id`` / ``index_path`` / ``row_count``, the whole
+        `index_segments` row and nothing re-shaped in between.
+
+        Empty for a table with no segments, a table whose index is flat
+        (unsegmented), an unknown table, and a table this session's tenant
+        cannot resolve. The last two answer identically by design, so the verb
+        is not an existence oracle for a peer tenant's table names — never an
+        error for any of the four.
+        """
+        resp = self._call(
+            self._catalog.ListIndexSegments,
+            catalog_pb2.ListIndexSegmentsRequest(table_name=table_name),
+        )
+        return [_index_segment_to_dict(s) for s in resp.segments]
 
     def list_models(self) -> List[Dict[str, Any]]:
         """A record for every model in the current tenant's catalog.
@@ -1264,6 +1361,9 @@ class RemoteDatabase:
         server-side; `from_offset` starts the replay at an offset (unset == live
         tail only). Maps to `TriggerService.Subscribe`.
         """
+        # The streaming lane opens its call directly rather than through `_call`,
+        # so the closed-session guard is applied here explicitly.
+        self._check_open()
         request = trigger_pb2.SubscribeRequest(
             topic=trigger_pb2.TopicName(name=topic),
             predicate=predicate or "",
@@ -2252,6 +2352,65 @@ class RemoteDatabase:
         resp = self._call(self._catalog.DerivesFrom, request)
         return _derives_from_edges_to_list(resp)
 
+    def training_job(self, job_id: str) -> RemoteTrainingJob:
+        """Attach to an existing training job by id.
+
+        The handle a `fine_tune` call returns is bound to the channel that made
+        it and dies with it; this is how a session that never submitted the job
+        — a later process, a different client — reaches it. The peer of
+        :meth:`jammi.EmbeddedBackend.training_job`; every read verb works on the
+        result (`status()`, `metrics()`, `acceleration_report()`, `wait()`),
+        each of which re-fetches over the wire per call, so the handle carries
+        no snapshot to go stale.
+
+        Existence is resolved HERE, with one `TrainingStatus` call, rather than
+        handing back a handle that fails on its first read: a `job_id` with no
+        row visible to this session's tenant raises the typed
+        :class:`~jammi.errors.BackendError`, the same class the embedded arm
+        raises for the same miss.
+
+        `model_id` reads the same on both arms at EVERY lifecycle state —
+        queued, running, completed, failed — not only once the job has
+        finished. It is the id the server resolved for this row
+        (`TrainingStatusResponse.model_id`): the stamped `output_model_id` once
+        the job completes, and before then the engine's own re-derivation from
+        the persisted spec, which is exactly what the embedded attach reports
+        because both call the SAME engine function. This client re-derives
+        nothing — the naming rule belongs to the engine, and a second
+        implementation here is the drift the conformance suite exists to catch.
+
+        Note that `list_training_jobs()`'s `output_model_id` is a DIFFERENT
+        question and is still empty until completion on both arms: it relays
+        the catalog column verbatim ("has the output row landed"), where
+        `model_id` answers "what will this model be called".
+        """
+        resp = self._call(
+            self._training.TrainingStatus,
+            training_pb2.TrainingStatusRequest(job_id=job_id),
+        )
+        return RemoteTrainingJob(
+            self._training,
+            self._metadata,
+            job_id=job_id,
+            model_id=resp.model_id,
+        )
+
+    def list_training_jobs(self) -> List[Dict[str, Any]]:
+        """Training jobs visible to the current tenant, most recent first.
+
+        Maps to `TrainingService.ListTrainingJobs`; same dict shape per entry as
+        the embedded :meth:`jammi.EmbeddedBackend.list_training_jobs` — the
+        wire's `TrainingJobSummary` field set, with ``output_model_id`` empty
+        until the job completes and ``error`` empty unless it failed. A listing
+        of :meth:`training_job` answers plus the submit-time identity; there is
+        no progress surface, because the engine records run metrics only at
+        finalization.
+        """
+        resp = self._call(
+            self._training.ListTrainingJobs, training_pb2.ListTrainingJobsRequest()
+        )
+        return [_training_job_summary_to_dict(j) for j in resp.jobs]
+
     def _start_training(
         self, request: training_pb2.StartTrainingRequest
     ) -> RemoteTrainingJob:
@@ -2393,6 +2552,10 @@ class RemoteDatabase:
         `pyarrow.Table`. The embedded `Database.sql` is the in-process peer of
         this verb — same SQL, same `annotate` function, transport apart.
         """
+        # The Flight SQL lane does not pass through `_call`, so the closed-session
+        # guard is applied here explicitly — a closed session must fail the same
+        # way on both of the remote arm's transports.
+        self._check_open()
         client = self._flight_client()
         options = self._flight_options()
         # The Flight SQL lane is a separate transport whose faults surface as
@@ -2432,11 +2595,27 @@ class RemoteDatabase:
     # --- Lifecycle ---------------------------------------------------------------
 
     def close(self) -> None:
-        """Close the underlying channel. Idempotent."""
+        """Close the underlying channels. Idempotent.
+
+        A TRANSPORT release, and only that: the remote arm holds no catalog
+        file. The server owns the catalog and whatever single-process lock its
+        backend takes, so this frees the gRPC and Flight channels and touches
+        nothing on the local filesystem — unlike the embedded
+        :meth:`~jammi.EmbeddedBackend.close`, which is the catalog-FILE release
+        point (after it returns, another process, or a foreign in-process SQLite
+        instance, may open the artifact directory).
+
+        Both transports carry `close()`, so it is an ordinary member of the
+        :class:`~jammi.Session` surface, not a :class:`~jammi.Capability`. What
+        each one releases differs; the CONTRACT does not — both are idempotent,
+        and afterwards every verb on either transport raises
+        :class:`~jammi.errors.BackendError`.
+        """
         if self._flight is not None:
             self._flight.close()
             self._flight = None
         self._channel.close()
+        self._closed = True
 
     def __enter__(self) -> "RemoteDatabase":
         return self

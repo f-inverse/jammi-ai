@@ -25,6 +25,7 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use jammi_db::catalog::model_repo::ModelDescriptor;
+use jammi_db::catalog::segment_repo::IndexSegment;
 use jammi_db::catalog::source_repo::SourceDescriptor;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::trigger::ids::TopicId;
@@ -467,6 +468,42 @@ pub fn derives_from_edge_from_proto(
         input: edge.input,
         derived: edge.derived,
         kind: anchor_kind_from_proto(edge.kind)?,
+    })
+}
+
+// === index segments =======================================================
+
+/// Map an engine [`IndexSegment`] onto its proto message — the send side of a
+/// `ListIndexSegments` response. Total: the wire message carries exactly the
+/// engine row's three fields, so nothing is dropped or synthesized.
+///
+/// `row_count` widens `usize` → `uint64`, which is lossless on every target the
+/// engine builds for (`usize` is at most 64 bits).
+pub fn index_segment_to_proto(segment: &IndexSegment) -> pb::IndexSegment {
+    pb::IndexSegment {
+        segment_id: segment.segment_id,
+        index_path: segment.index_path.clone(),
+        row_count: segment.row_count as u64,
+    }
+}
+
+/// Reconstruct an engine [`IndexSegment`] from the wire message — the inverse
+/// of [`index_segment_to_proto`], for the remote client receive side.
+///
+/// The `uint64` → `usize` narrowing is checked rather than cast: on a 32-bit
+/// target a row count the local `usize` cannot hold is a faithful
+/// `invalid_argument`, never a silently truncated segment size.
+pub fn index_segment_from_proto(segment: pb::IndexSegment) -> Result<IndexSegment, Status> {
+    let row_count = usize::try_from(segment.row_count).map_err(|_| {
+        Status::invalid_argument(format!(
+            "index segment {} row_count {} exceeds this platform's usize",
+            segment.segment_id, segment.row_count
+        ))
+    })?;
+    Ok(IndexSegment {
+        segment_id: segment.segment_id,
+        index_path: segment.index_path,
+        row_count,
     })
 }
 

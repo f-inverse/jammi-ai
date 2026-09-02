@@ -834,7 +834,7 @@ ARTIFACTS: dict[str, Artifact] = {
         produced_by="unified_client",
         note="The one-front-door client contract measured LIVE on CPU, hermetic (no "
         "server socket): the capability contract (supports(Capability.X) is a hard "
-        "boolean per backend — the CLOSED-five sets are exactly complementary across "
+        "boolean per backend — the CLOSED-four sets are exactly complementary across "
         "the embedded Database and the remote RemoteDatabase — and a one-sided feature "
         "on the wrong backend raises the typed NotSupportedOnBackend); the JammiError "
         "taxonomy two-sided (one except JammiError catches a failure on BOTH transports, "
@@ -917,8 +917,10 @@ ARTIFACTS: dict[str, Artifact] = {
         kind="model_id",
         filename="catalog_segment0.json",
         produced_by="segmented_ann",
-        note="The freshly-built table's `index_segments` catalog row, read directly off "
-        "the embedded engine's own SQLite catalog file (never reimplemented): segment "
+        note="The freshly-built table's `index_segments` catalog row, read through the "
+        "public `db.list_index_segments(table_name)` verb on the LIVE embedded engine "
+        "(the engine answering for its own catalog, never a reimplementation and never "
+        "a second SQLite library instance beside it): segment "
         "count, segment id, row count, whether the `{table}__seg0.idx` naming convention "
         "held, and whether the three sidecar files (`.usearch` / `.rowmap` / "
         "`.manifest.json`) exist on disk.",

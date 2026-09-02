@@ -265,7 +265,7 @@ ExerciseEntry = DirectCell | CacheLane | WrapperLane | Deferred
 # Python dict-literal semantics silently keeping only the last entry (the
 # same discipline `check_gpu_parity_matrix.py`'s SILICON_ACCOUNTING uses).
 #
-# 47 of the 48 REQUIRED / MODULE_FUNCTIONS surfaces are exercised today; the
+# 50 of the 51 REQUIRED / MODULE_FUNCTIONS surfaces are exercised today; the
 # lone gap (`encode_query`) is a reviewed, dated Deferred row — see the
 # module docstring's "Three exercise LANES" section for how each row below
 # was verified (grep, not assumption) at authoring time (2026-08-31).
@@ -328,6 +328,12 @@ ACCOUNTING: list[tuple[str, ExerciseEntry]] = [
     )),
     # -- point-in-time -------------------------------------------------------- #
     ("asof_join", DirectCell("19-point-in-time/point-in-time.qmd", "db.asof_join(")),
+    # The segmented-ANN producer asks the LIVE engine for the table's segment
+    # set through the public verb; the chapter reads that committed answer.
+    ("list_index_segments", CacheLane(
+        "build_segmented_ann_cache.py", "db.list_index_segments(",
+        "23-segmented-ann/segmented-ann.qmd", 'load_artifact("segmented_ann.catalog_segment0"',
+    )),
     # -- fine-tuning ----------------------------------------------------------- #
     ("fine_tune", CacheLane(
         "build_finetune_cache.py", "db.fine_tune(",
@@ -340,6 +346,15 @@ ACCOUNTING: list[tuple[str, ExerciseEntry]] = [
     ("infer", CacheLane(
         "build_finetune_regression_cache.py", "db.infer(",
         "15-finetune-regression/finetune-regression.qmd", 'load_artifact("finetune_regression.',
+    )),
+    # Re-attach + listing, both live in chapter 22 against a real server: the
+    # job outlives the connection that submitted it, and the catalog is what
+    # remembers both outcomes.
+    ("training_job", DirectCell(
+        "22-precision/finetune-acceleration.qmd", "remote.training_job(",
+    )),
+    ("list_training_jobs", DirectCell(
+        "22-precision/finetune-acceleration.qmd", "remote.list_training_jobs(",
     )),
     # -- evaluation ------------------------------------------------------------ #
     ("eval_embeddings", CacheLane(

@@ -235,54 +235,71 @@ class Graph:
             return None
 
         activate(root, root_features, with_default=False)
-        while work:
-            pkg, feat = work.pop()
-            if pkg not in self.pkgs or feat in enabled[pkg]:
-                continue
-            specs = self.pkgs[pkg]["features"].get(feat)
-            if specs is None:
-                # `feat` names an implicit optional-dependency feature
-                # (`dep = { optional = true }` without `dep:` syntax).
-                d = dep_by_key(pkg, feat)
-                if d is not None and d["optional"]:
-                    enabled[pkg].add(feat)
-                    active_optional[pkg].add(d["key"])
-                    activate(d["pkg"], d["features"], d["default"])
-                continue
-            enabled[pkg].add(feat)
-            for spec in specs:
-                if spec.startswith("dep:"):
-                    d = dep_by_key(pkg, spec[4:])
-                    if d is not None:
+        # Two-phase fixpoint. Phase 1 drains `work` to exhaustion; phase 2
+        # promotes every deferred weak edge (`dep?/feat`) whose dep became
+        # active during that drain, and the pair repeats until a drain
+        # promotes nothing. The promotion scan MUST live outside the item
+        # loop: several item paths end in `continue` (an unknown package, an
+        # already-enabled feature, and — the one that bites — an implicit
+        # optional-dependency feature, which ACTIVATES an optional dep and
+        # then continues), so a scan at the bottom of the loop body is
+        # skipped exactly on the paths that make a deferred edge fireable
+        # and the walk silently drops it, reporting a leak-free closure for
+        # a graph that leaks. Terminates: each promotion removes an entry
+        # from `deferred`, which only ever grows while a feature is being
+        # enabled for the first time.
+        while True:
+            while work:
+                pkg, feat = work.pop()
+                if pkg not in self.pkgs or feat in enabled[pkg]:
+                    continue
+                specs = self.pkgs[pkg]["features"].get(feat)
+                if specs is None:
+                    # `feat` names an implicit optional-dependency feature
+                    # (`dep = { optional = true }` without `dep:` syntax).
+                    d = dep_by_key(pkg, feat)
+                    if d is not None and d["optional"]:
+                        enabled[pkg].add(feat)
                         active_optional[pkg].add(d["key"])
                         activate(d["pkg"], d["features"], d["default"])
-                elif "/" in spec:
-                    key, sub = spec.split("/", 1)
-                    weak = key.endswith("?")
-                    key = key.rstrip("?")
-                    d = dep_by_key(pkg, key)
-                    if d is None:
-                        continue
-                    if d["optional"] and not weak:
-                        active_optional[pkg].add(d["key"])
-                        activate(d["pkg"], d["features"], d["default"])
-                    if (not d["optional"]) or (d["key"] in active_optional[pkg]):
-                        work.append((d["pkg"], sub))
-                    elif weak:
-                        # Deferred: if the dep is activated later the
-                        # feature must follow. Re-queue via a sentinel scan
-                        # at the end (simple fixpoint below).
-                        deferred.append((pkg, d, sub))
-                else:
-                    work.append((pkg, spec))
-            # Weak edges whose dep became active since they were seen.
+                    continue
+                enabled[pkg].add(feat)
+                for spec in specs:
+                    if spec.startswith("dep:"):
+                        d = dep_by_key(pkg, spec[4:])
+                        if d is not None:
+                            active_optional[pkg].add(d["key"])
+                            activate(d["pkg"], d["features"], d["default"])
+                    elif "/" in spec:
+                        key, sub = spec.split("/", 1)
+                        weak = key.endswith("?")
+                        key = key.rstrip("?")
+                        d = dep_by_key(pkg, key)
+                        if d is None:
+                            continue
+                        if d["optional"] and not weak:
+                            active_optional[pkg].add(d["key"])
+                            activate(d["pkg"], d["features"], d["default"])
+                        if (not d["optional"]) or (d["key"] in active_optional[pkg]):
+                            work.append((d["pkg"], sub))
+                        elif weak:
+                            # Deferred: if the dep is activated later the
+                            # feature must follow (phase 2 below).
+                            deferred.append((pkg, d, sub))
+                    else:
+                        work.append((pkg, spec))
+            # Phase 2: weak edges whose dep became active during the drain.
+            promoted = False
             still: list[tuple[str, dict, str]] = []
             for (p2, d2, sub2) in deferred:
                 if d2["key"] in active_optional[p2]:
                     work.append((d2["pkg"], sub2))
+                    promoted = True
                 else:
                     still.append((p2, d2, sub2))
             deferred[:] = still
+            if not promoted:
+                break
         return enabled
 
     def all_features(self, pkg: str) -> list[str]:
@@ -551,6 +568,39 @@ def self_test() -> int:
         "the widened per-member --all-features loop must catch the leak "
         "jammi-server's own selections cannot see"
     )
+
+    # Order-dependence control for the weak-edge fixpoint: a deferred
+    # `dep?/feat` edge whose optional dep is activated by the LAST work item,
+    # on a path that ends in `continue` (an implicit optional-dependency
+    # feature: `extra` named bare, with no `[features]` entry of its own).
+    # `jammi-ai`'s spec order puts `extra` on the BOTTOM of the LIFO work
+    # stack, so it is popped after every other item, and no package in this
+    # graph declares `default`, so nothing is queued behind it. Cargo
+    # activates `extra` here, so `extra?/flash-attn` MUST fire and ROOT's
+    # plain `cuda` selection genuinely reaches jammi-kernels/flash-attn.
+    # A walker that re-scans deferred edges only at the bottom of the item
+    # loop never re-scans after that final `continue` and reports a
+    # flash-free closure — an order-dependent FALSE PASS on a real leak.
+    meta = _synthetic(["jammi-kernels/cuda"])
+    del meta["packages"][1]["features"]["default"]
+    del meta["packages"][2]["features"]["default"]
+    meta["packages"][1]["features"]["cuda"] = [
+        "extra", "jammi-kernels/cuda", "extra?/flash-attn",
+    ]
+    meta["packages"][1]["dependencies"].append(
+        {"name": "jammi-kernels", "rename": "extra", "optional": True,
+         "uses_default_features": False, "features": []}
+    )
+    g = Graph(meta)
+    deferred.clear()
+    enabled = g.closure(ROOT, [CONTROL_FEATURE])
+    assert FORBIDDEN_FEATURE in enabled.get(TARGET_PKG, set()), (
+        "a weak edge whose optional dep is activated by the final work item "
+        "(an implicit optional-dependency feature, a `continue` path) must "
+        "still fire — the deferred re-scan is a fixpoint outside the item "
+        "loop, not a per-item scan the `continue` paths skip"
+    )
+    assert not deferred, "every deferred weak edge must be resolved on exit"
 
     # --- Manifest-derived per-lane checks, including the synthetic
     # `flash_compiled: false` lane the negative-polarity branch needs to be

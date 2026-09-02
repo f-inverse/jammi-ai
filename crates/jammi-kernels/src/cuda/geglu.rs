@@ -6,7 +6,7 @@ use half::{bf16, f16};
 use super::{PTX_GEGLU, PTX_GEGLU_F16};
 use crate::ops::geglu::{check_variant, geglu_dims, output_shape, GeluVariant};
 
-/// See `../axpy.rs`'s identical constant for the module-name rationale —
+/// See `crate::cuda`'s module doc for the module-name rationale —
 /// arbitrary but stable and unique to this op's PTX module.
 const MODULE_NAME: &str = "jammi_kernels_geglu";
 
@@ -15,21 +15,17 @@ const MODULE_NAME: &str = "jammi_kernels_geglu";
 /// module name from [`MODULE_NAME`].
 const MODULE_NAME_F16: &str = "jammi_kernels_geglu_f16";
 
-/// Grid-stride block size (see `geglu.cu`'s module doc for why this op is
-/// purely elementwise, with no per-row block reduction).
-const GEGLU_BLOCK: u32 = 256;
-
-/// A conservative 1-D grid cap; the kernel's own grid-stride loop covers
-/// any `n_out` beyond `GEGLU_BLOCK * GEGLU_MAX_GRID` correctly (unlike
-/// `Axpy`'s single-pass `if (i < n)` kernel, this one does not need the
-/// grid to cover `n_out` in a single pass).
-const GEGLU_MAX_GRID: u32 = 65_535;
-
+/// The grid-stride block size and the 1-D grid this op launches (see
+/// `geglu.cu`'s module doc for why this op is purely elementwise, with no
+/// per-row block reduction). Both come from `ops::launch_domain` rather
+/// than being declared here, so the CPU lane's model of this loop
+/// (`launch_domain::tests::the_geglu_grid_stride_loop_wraps_at_32_bits_and_terminates_at_64`)
+/// walks the SAME stride this launch actually produces — a re-typed
+/// literal in the test would model a loop nobody runs.
 fn launch_config(n: u32) -> LaunchConfig {
-    let blocks = n.div_ceil(GEGLU_BLOCK).clamp(1, GEGLU_MAX_GRID);
     LaunchConfig {
-        grid_dim: (blocks, 1, 1),
-        block_dim: (GEGLU_BLOCK, 1, 1),
+        grid_dim: (super::geglu_grid_blocks(n), 1, 1),
+        block_dim: (super::GEGLU_BLOCK, 1, 1),
         shared_mem_bytes: 0,
     }
 }

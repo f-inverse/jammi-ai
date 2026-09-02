@@ -877,8 +877,9 @@ def find_floor_hits(lines: list[str], file_label: str = "") -> list[FloorHit]:
             # named `expected` — silently swallowing an unrelated `let
             # ratio = [num[0] / den[0].max(1e-30)];` (an ordinary indexing
             # convenience, not a hand-computed expected-value fixture).
-            # `and` narrows this back to exactly the axpy.rs:200 shape the
-            # exclusion was written for.
+            # `and` narrows this back to exactly the shape the exclusion was
+            # written for: a kernel unit test's `let expected = [ ... ]`
+            # hand-computed expected-value array.
             if name == "expected" and rhs.lstrip().startswith("["):
                 continue
             lit = _first_float_floor_literal(rhs)
@@ -1561,7 +1562,7 @@ fn t() {
     )
     clean(
         "round-3 item 5: a `let expected = [ ... ]`-shaped hand-computed "
-        "EXPECTED VALUE array (axpy.rs:200 shape) is excluded — its "
+        "EXPECTED VALUE array (the kernel-unit-test shape) is excluded — its "
         "arithmetic computes a truth value, not a floor",
         """
 fn t() {
@@ -1626,7 +1627,8 @@ fn ctl(num: [f64;3], den: [f64;3]) -> bool {
     )
     clean(
         "round-4: the 'let expected = [...]' exclusion still holds for its "
-        "OWN motivating shape (axpy.rs:200) after the K4 narrowing",
+        "OWN motivating shape (a kernel unit test's hand-computed expected "
+        "array) after the K4 narrowing",
         """
 fn t() {
     let expected = [f(2.0 * 1.5 + 0.25)];

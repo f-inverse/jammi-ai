@@ -88,9 +88,23 @@ A working copy of this file ships at
 | --- | --- | --- |
 | Operational footprint | One file under `artifact_dir`. No daemon. | Externally-managed Postgres cluster. |
 | Concurrent writers | One; WAL mode lets many readers run alongside one writer. | Many. |
-| Multi-process deployment | Single-process only — sharing the file across `jammi-server` replicas corrupts WAL. | Multi-replica safe. |
+| Multi-process deployment | Single-process only, and enforced on unix: the catalog opens through SQLite's `unix-excl` VFS, which holds a process-scoped exclusive lock on the file. A second process opening the same `artifact_dir` is refused with a typed `backend unavailable` error naming this contract after the 5 s busy timeout — it never corrupts the WAL and never hangs. Handing the directory to another process is an awaited event (`Catalog::close().await` / `JammiSession::close().await`), not a drop. | Multi-replica safe. |
 | Failure recovery | File restore from backup. | Standard Postgres point-in-time-recovery. |
 | Pool tuning | None — opens one pool of 8 connections. | `pool_size` + `max_lifetime_secs` honour `sqlx::PgPool` knobs. |
+
+The single-process guarantee stops at the process boundary. A second SQLite
+*library instance* inside the same process — the shape a Python caller reaches
+by using the stdlib `sqlite3` module against a live engine's catalog — shares
+this process's `fcntl` locks and so cannot be arbitrated: it can read a stale
+image or corrupt the file. Close the engine first (`close()`), then touch the
+file. On Windows the contract is documentation-only: `unix-excl` does not
+exist there.
+
+One operator knob exists and is diagnostic only: `JAMMI_SQLITE_VFS=default`
+restores the platform default VFS on every target, re-arming exactly the
+corruption the seam removes, so that the fix can be falsified by re-running
+the escape's oracle against it and observing the RED; engaging it logs a
+`WARN`, and it is never set in production.
 
 For laptop / single-tenant deployments, SQLite is the right answer; the
 trade-off table tilts to Postgres the moment a second `jammi-server`

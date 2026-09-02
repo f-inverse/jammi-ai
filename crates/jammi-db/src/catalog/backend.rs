@@ -66,6 +66,27 @@ pub trait CatalogBackend: Send + Sync {
     /// [`BackendError::Unavailable`] via [`classify`].
     fn ping(&self) -> Pin<Box<dyn Future<Output = Result<(), BackendError>> + Send + '_>>;
 
+    /// Close the connection pool and wait for every connection to be returned
+    /// and shut down. **Idempotent**, and the only deterministic release
+    /// point.
+    ///
+    /// Dropping a catalog handle is NOT a release: `sqlx` hands a returned
+    /// connection to a background task to close, so after `drop(catalog)` the
+    /// pool's connections — and, for SQLite, the OS file locks and the
+    /// `catalog.db-wal` sidecar they keep alive — outlive the drop for an
+    /// unbounded time (measured: still held after blocking indefinitely,
+    /// released after a single 50 ms await). Under the process-exclusive VFS
+    /// the SQLite backend uses (see
+    /// [`super::backend_sqlite`]) that matters to correctness and not just to
+    /// tidiness: the exclusive lock is what refuses a second process, so a
+    /// process that seeds a catalog and then hands the directory to another
+    /// process MUST await this before spawning it.
+    ///
+    /// Awaiting this future waits for outstanding checkouts, so a caller that
+    /// holds a live `Transaction` across it will wait for that transaction to
+    /// finish.
+    fn close(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+
     /// Backend identity for telemetry and dialect-conditional code paths.
     fn backend_kind(&self) -> BackendKind;
 }
@@ -114,6 +135,16 @@ impl BackendImpl {
         match self {
             BackendImpl::Sqlite(b) => b.ping(),
             BackendImpl::Postgres(b) => b.ping(),
+        }
+    }
+
+    /// Dispatch [`CatalogBackend::close`] to the inner backend. Same
+    /// contract: idempotent, and the only deterministic release point for the
+    /// pool's connections and (for SQLite) the file locks they hold.
+    pub fn close(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        match self {
+            BackendImpl::Sqlite(b) => b.close(),
+            BackendImpl::Postgres(b) => b.close(),
         }
     }
 
@@ -680,6 +711,65 @@ pub enum BackendError {
     },
     #[error("sqlx backend error: {0}")]
     Sqlx(#[from] sqlx::Error),
+}
+
+/// Ceiling on the post-`close` drain. Reaching it means a connection never
+/// finished closing; the drain gives up and warns rather than hanging the
+/// caller's shutdown forever.
+pub(crate) const CLOSE_DRAIN_CEILING: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One step of a shutdown wait.
+///
+/// Deliberately not `yield_now` in a tight loop: the work being waited for is
+/// a *spawned* connection-return task plus a driver thread's `sqlite3_close`,
+/// and a `yield_now` spin from inside `block_on` pins the calling core and
+/// starves exactly that work (measured: a close that resolves in ~3 ms when
+/// waited on politely took ~2 s when spun on). Deliberately not
+/// `tokio::time::sleep` either: that requires the runtime's time driver, which
+/// an embedding host is free not to enable, and a shutdown path must not panic
+/// on a `Builder::new_current_thread()` runtime. Sleeping on a blocking-pool
+/// thread needs neither.
+pub(crate) async fn shutdown_wait_step() {
+    let _ = tokio::task::spawn_blocking(|| {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    })
+    .await;
+}
+
+/// Close `pool` and wait until it holds **no** live connections.
+///
+/// `sqlx`'s own `Pool::close` is not that barrier. A `PoolConnection` returns
+/// itself to the pool from a task spawned in its `Drop`, so a connection
+/// dropped shortly before the close can still be mid-return when `close()`
+/// resolves; the driver-level close then lands afterwards. For SQLite that is
+/// the difference between a release point and a race: the final
+/// `sqlite3_close` is what drops the process-exclusive lock and deletes
+/// `catalog.db-wal`, and it was measured landing *after* `Pool::close()`
+/// returned roughly one open/close cycle in seven.
+///
+/// `Pool::size()` is decremented by each connection's `DecrementSizeGuard`,
+/// which is dropped only after that connection's driver-level close has
+/// completed, so waiting for `size() == 0` covers the connections the pool's
+/// own accounting knows about. It was measured **not sufficient on its own**
+/// for SQLite — the `-wal` still outlived it by ~3 ms once every few cycles —
+/// so the SQLite backend follows this with a wait on SQLite's own release
+/// evidence. The loop waits through [`shutdown_wait_step`], which leaves the
+/// runtime free to actually run the return tasks it is waiting on.
+pub(crate) async fn close_pool_and_drain<DB: sqlx::Database>(pool: &sqlx::Pool<DB>) {
+    pool.close().await;
+    let deadline = std::time::Instant::now() + CLOSE_DRAIN_CEILING;
+    while pool.size() > 0 {
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                remaining = pool.size(),
+                ceiling_secs = CLOSE_DRAIN_CEILING.as_secs(),
+                "catalog pool close timed out with connections still open; the backing file may \
+                 still be held"
+            );
+            return;
+        }
+        shutdown_wait_step().await;
+    }
 }
 
 /// Classify a raw `sqlx::Error` into the engine-owned [`BackendError`]

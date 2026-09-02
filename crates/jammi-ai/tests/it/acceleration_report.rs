@@ -36,7 +36,7 @@ use jammi_ai::fine_tune::worker::EmbeddedWorker;
 use jammi_ai::fine_tune::{ComputePrecision, FineTuneConfig, FineTuneMethod, LrSchedule};
 use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
-use jammi_db::catalog::training_repo::CreateTrainingJobParams;
+use jammi_db::catalog::training_repo::{CreateTrainingJobParams, FinalizeTrainingJobParams};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
 use crate::common;
@@ -121,6 +121,14 @@ async fn wait_for_terminal(
 /// converge or diverge on this tiny fixture over a handful of eager-composed
 /// batches — an orthogonal training-stability question this file does not
 /// own.
+///
+/// **Runs the tri-state oracle on the way out** — every job this suite polls
+/// to a terminal state passes [`assert_terminal_report_is_not_pending`] here,
+/// whatever its terminal status and whatever state its report carries, so the
+/// campaign #446 finding-1 property is checked on EVERY terminal row the
+/// suite produces rather than only on the failure paths that assert it
+/// explicitly. The `job.wait()`-based tests reach the same oracle through
+/// [`terminal_record`].
 async fn wait_for_any_terminal(
     catalog: &jammi_db::catalog::Catalog,
     job_id: &str,
@@ -128,10 +136,34 @@ async fn wait_for_any_terminal(
     loop {
         let record = catalog.get_training_job(job_id).await.unwrap();
         match record.status.as_str() {
-            "completed" | "failed" => return record,
+            "completed" | "failed" => {
+                assert_terminal_report_is_not_pending(&record, job_id);
+                return record;
+            }
             _ => tokio::time::sleep(Duration::from_millis(50)).await,
         }
     }
+}
+
+/// Read a job's record and run the tri-state oracle on it — the
+/// already-terminal peer of [`wait_for_any_terminal`], for the tests that
+/// awaited a [`jammi_ai::fine_tune::training_job::TrainingJob`] handle
+/// (`job.wait()`) rather than polling the row themselves. Every terminal
+/// record this file reads goes through one of these two functions, so no job
+/// in the suite escapes the oracle.
+async fn terminal_record(
+    catalog: &jammi_db::catalog::Catalog,
+    job_id: &str,
+    label: &str,
+) -> jammi_db::catalog::training_repo::TrainingJobRecord {
+    let record = catalog.get_training_job(job_id).await.unwrap();
+    assert!(
+        matches!(record.status.as_str(), "completed" | "failed"),
+        "{label}: expected an already-terminal row, got status {:?}",
+        record.status
+    );
+    assert_terminal_report_is_not_pending(&record, label);
+    record
 }
 
 /// esc-075 control (iii): reads a catalog record's `acceleration_report` as a
@@ -347,11 +379,7 @@ async fn f32_positive_control_reports_ops_holds() {
         .await
         .unwrap();
     job.wait().await.unwrap();
-    let record = session
-        .catalog()
-        .get_training_job(&job.job_id)
-        .await
-        .unwrap();
+    let record = terminal_record(session.catalog(), &job.job_id, "f32 positive control").await;
     let report = expect_determined_report(record.acceleration_report.as_deref());
 
     // `attention_block` is intentionally excluded from the strict `Holds`
@@ -433,11 +461,12 @@ async fn submission_writes_pending_then_claim_overwrites_with_determined() {
     let _worker = EmbeddedWorker::spawn(&session).expect("default worker intervals are valid");
     job.wait().await.unwrap();
 
-    let post_claim = session
-        .catalog()
-        .get_training_job(&job.job_id)
-        .await
-        .unwrap();
+    let post_claim = terminal_record(
+        session.catalog(),
+        &job.job_id,
+        "pending→determined transition, post-claim",
+    )
+    .await;
     let post_claim_report = expect_determined_report(post_claim.acceleration_report.as_deref());
     assert_eq!(
         post_claim_report["attempt"],
@@ -483,11 +512,12 @@ async fn embedded_and_raw_transports_produce_the_same_report_shape() {
         .await
         .unwrap();
     job_a.wait().await.unwrap();
-    let record_a = session
-        .catalog()
-        .get_training_job(&job_a.job_id)
-        .await
-        .unwrap();
+    let record_a = terminal_record(
+        session.catalog(),
+        &job_a.job_id,
+        "K4 transport A (embedded SDK)",
+    )
+    .await;
     let report_a = expect_determined_report(record_a.acceleration_report.as_deref());
 
     // Transport B: a raw catalog write — job A already registered the base
@@ -621,6 +651,324 @@ async fn projection_head_arm_reports_no_probe_attempted_not_a_fabricated_failure
         );
     }
     assert_eq!(report["flash"]["holds"], serde_json::json!(false));
+}
+
+/// This test's `ComputePrecision` as the dtype class
+/// `jammi_kernels::admission::PROBED_OPS` resolves registry keys against —
+/// mirrors `crates/jammi-ai/src/fine_tune/worker.rs`'s own `dtype_class_of`.
+fn dtype_class(p: ComputePrecision) -> jammi_kernels::admission::DtypeClass {
+    match p {
+        ComputePrecision::F32 => jammi_kernels::admission::DtypeClass::F32,
+        ComputePrecision::BF16 => jammi_kernels::admission::DtypeClass::Bf16,
+        ComputePrecision::F16 => jammi_kernels::admission::DtypeClass::F16,
+    }
+}
+
+/// The report keys `jammi_kernels::admission::PROBED_OPS` says a job at this
+/// dtype class CAN produce a measurement for — the report's candidate `ops`
+/// key set, a pure function of the dtype class.
+fn candidate_report_keys(p: ComputePrecision) -> std::collections::BTreeSet<&'static str> {
+    let dtype = dtype_class(p);
+    jammi_kernels::admission::PROBED_OPS
+        .iter()
+        .filter(|op| op.kind == jammi_kernels::admission::ProbedOpKind::TwoArm)
+        .filter(|op| op.registry_keys_for(dtype).next().is_some())
+        .map(|op| op.report_key)
+        .collect()
+}
+
+fn ops_keys(report: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    report["ops"]
+        .as_object()
+        .expect("a determined report's `ops` is an object")
+        .keys()
+        .cloned()
+        .collect()
+}
+
+/// Campaign #446 finding 2 — the f16 report's missing cast epilogue, and the
+/// process-history-dependent key set behind it. THREE jobs in ONE process
+/// (f16, f16, f32) prove all four halves the finding names:
+///
+/// **(c) the table binds to the REAL registry, measured live.** `cast_scale`
+/// and `cast_add` are not asserted from the table's own say-so: an f16 job's
+/// report carries them `holds: true`, which can only happen if the
+/// before/after delta on `cast_scale_f16_f32` / `cast_add_f16` — the exact
+/// registry keys the table names for `DtypeClass::F16` — actually moved,
+/// i.e. if some workspace call site really does pass those literals to
+/// `admit()` (`crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:814`,
+/// `:911`, reached from `LowRankResidualLinear::bwd` during the probe's
+/// backward pass). Before the fix the shipped table named only
+/// `cast_add_bf16`, so an f16 job's report could not contain either key at
+/// any value.
+///
+/// **CPU-runnable vs CUDA-only arms.** This suite is CPU-only, so the F16
+/// cast-boundary keys are the ones proven live here — `low_rank_residual_
+/// linear.rs`'s own `cpu_f16_bwd_dispatches_both_new_cast_boundary_kernels`
+/// pins the same two keys at the kernel level. The **`Bf16` arms
+/// (`cast_scale_bf16_f32` / `cast_add_bf16`) cannot execute on CPU at all**:
+/// `bwd`'s bf16 branch runs `dx_base_2d = dy_base_2d.matmul(w)` in bf16, and
+/// candle's CPU matmul has no BF16 implementation (pinned by this crate's own
+/// `cpu_matmul_still_cannot_do_bf16`), so a bf16 backbone is refused before
+/// training on CPU (`validate_backbone_precision`). Those two keys are
+/// exercised only on the CUDA lane, by
+/// `crates/jammi-ai/tests/gpu_capability/capability_surface.rs`'s per-dtype
+/// two-arm assertions, which derive from the SAME table.
+///
+/// **(d) the key set is deterministic per dtype class, regardless of process
+/// history.** The two f16 jobs run back to back in one process — the second
+/// after the first has already burned the process-wide warn dedup and already
+/// populated every registry entry — and must produce IDENTICAL `ops` key
+/// sets. A key set derived from `jammi_kernels::admission::snapshot_all()`
+/// (which reflects only ops looked up at least once) could not guarantee
+/// this: the first job in a fresh process would see a strictly smaller table
+/// than the second.
+///
+/// **The K4 report-vocabulary change.** No report may carry a dtype-SUFFIXED
+/// key: `"cast_add_bf16"` was a REGISTRY key spelled into the report's
+/// dtype-neutral vocabulary, and its removal in favour of `"cast_add"` is a
+/// consumer-visible surface change asserted here explicitly, not left
+/// implicit.
+///
+/// **The f32 negative control is real, not vacuous.** An f32 backbone takes
+/// `bwd`'s `admit()`-free "nothing to fuse" branch, so `cast_scale`/`cast_add`
+/// must be ABSENT from its report — not present-and-false. An implementation
+/// that emitted every table key unconditionally (the obvious way to make (d)
+/// pass) fails here.
+// `jammi_kernels::admission`'s dispatch registries are process-wide — same
+// `#[serial]` rationale as the other tests in this file.
+#[serial(esc075_acceleration_report)]
+#[tokio::test(flavor = "multi_thread")]
+async fn probed_ops_bind_to_the_real_registry_and_key_sets_are_dtype_deterministic() {
+    let (session, _dir) = session_with_training_data().await;
+    let _worker = EmbeddedWorker::spawn(&session).expect("default worker intervals are valid");
+
+    let mut reports = Vec::new();
+    for precision in [
+        ComputePrecision::F16,
+        ComputePrecision::F16,
+        ComputePrecision::F32,
+    ] {
+        let job = session
+            .fine_tune(
+                "training",
+                &tiny_modernbert_model(),
+                &training_columns(),
+                FineTuneMethod::Lora,
+                ModelTask::TextEmbedding,
+                Some(encoder_adapters_config(precision)),
+            )
+            .await
+            .unwrap();
+        // Tolerant of either terminal outcome: the report is written before
+        // the first training step, so f16's own numeric stability on this
+        // tiny fixture is irrelevant to what is asserted here.
+        let record = wait_for_any_terminal(session.catalog(), &job.job_id).await;
+        reports.push((
+            precision,
+            expect_determined_report(record.acceleration_report.as_deref()),
+        ));
+    }
+
+    // Every realized key must be a candidate for that job's own dtype class —
+    // no fabricated key, and (the direct finding-2 guard) no dtype-suffixed
+    // registry key leaking into the report vocabulary.
+    for (precision, report) in &reports {
+        let candidates = candidate_report_keys(*precision);
+        for key in ops_keys(report) {
+            assert!(
+                candidates.contains(key.as_str()),
+                "report key {key:?} at {precision} is not a PROBED_OPS two-arm row with a \
+                 registry key for that dtype class (candidates: {candidates:?}) — the report \
+                 must never name an op it cannot attribute to a real dispatch decision. \
+                 Report: {report}"
+            );
+            for suffix in ["_bf16", "_f16", "_f32"] {
+                assert!(
+                    !key.ends_with(suffix),
+                    "report key {key:?} carries a dtype suffix — report keys are dtype-NEUTRAL \
+                     (campaign #446 finding 2's K4 vocabulary change: `cast_add_bf16` became \
+                     `cast_add`, with the registry key resolved from the backbone dtype). \
+                     Report: {report}"
+                );
+            }
+        }
+    }
+
+    let (_, f16_first) = &reports[0];
+    let (_, f16_second) = &reports[1];
+    let (_, f32_report) = &reports[2];
+
+    // (d): same dtype, same process, different position in process history →
+    // identical key sets.
+    assert_eq!(
+        ops_keys(f16_first),
+        ops_keys(f16_second),
+        "two f16 jobs in ONE process must produce IDENTICAL `ops` key sets — a key set that \
+         depends on which job ran first is a report shape derived from process history, not \
+         from the job. first={f16_first} second={f16_second}"
+    );
+
+    // (c): the F16 cast-boundary keys the pre-#446 table could not name, and
+    // the live proof they bind to real `admit()` sites.
+    for (label, report) in [("first", f16_first), ("second", f16_second)] {
+        for key in ["cast_scale", "cast_add"] {
+            assert_eq!(
+                report["ops"][key]["holds"],
+                serde_json::json!(true),
+                "the {label} f16 job's report must carry {key:?} as `holds: true` — \
+                 LowRankResidualLinear::bwd dispatches its F16 cast-boundary kernels fused on \
+                 CPU (low_rank_residual_linear.rs:814,911). Before campaign #446 the probed-op \
+                 table named only `cast_add_bf16`, so an f16 job's report was structurally \
+                 unable to contain this key at all. Report: {report}"
+            );
+        }
+        assert!(
+            !ops_keys(report).contains("cast_add_bf16"),
+            "the retired dtype-suffixed report key must be gone. Report: {report}"
+        );
+    }
+
+    // The f32 negative control: absent, never present-and-false.
+    for key in ["cast_scale", "cast_add"] {
+        assert!(
+            !ops_keys(f32_report).contains(key),
+            "an f32 backbone takes LowRankResidualLinear::bwd's admit()-free \"nothing to \
+             fuse\" branch — there is no registry key for {key:?} at f32, so the report must \
+             OMIT it rather than claim a determination. Report: {f32_report}"
+        );
+    }
+    // Non-vacuity: the f32 job did measure something, so the absence above is
+    // a real dtype-resolved absence and not an empty report.
+    assert_eq!(
+        f32_report["ops"]["layer_norm"]["holds"],
+        serde_json::json!(true),
+        "the f32 control must still report layer_norm as genuinely admitted — otherwise the \
+         cast_scale/cast_add absence above would be vacuous. Report: {f32_report}"
+    );
+
+    // `adamw_step` (campaign #446 scope item 2): the fused multi-tensor AdamW
+    // step admits and dispatches on CPU at F32 — `adamw_step.rs` ships real
+    // `cpu_fwd` arms for both `AdamMomentUpdate` (InplaceOp2) and
+    // `AdamThetaUpdate` (InplaceOp3), and `jammi_kernels::admission::
+    // device_is_supported` accepts CPU — so this assertion is a genuine live
+    // binding of the table's `adamw_step_fused` key on THIS lane, not a
+    // CUDA-only claim taken on trust.
+    //
+    // Asserted on ALL THREE jobs, including the two f16 ones, because that is
+    // the load-bearing half: the op's own predicate is F32-ONLY
+    // (`fused_admission_predicate`'s `dtype_f32`), but that is a fact about
+    // the TRAINABLE VARS, which are F32 on every backbone (`jammi-lora`
+    // refuses a non-F32 adapter via `lora_ab_dtype_f32`; the trainer's
+    // `VarBuilder` is built at `DType::F32` regardless of `backbone_dtype`).
+    // The dtype CLASS the table resolves on is the JOB's BACKBONE dtype — a
+    // different axis. Had the row been encoded `DtypeClass::F32`, the two f16
+    // reports below would OMIT `adamw_step` while the op demonstrably
+    // dispatched: a silent-eager invisibility on the headline dtype, i.e. a
+    // fresh instance of the very defect this table retired. These two f16
+    // assertions are what make that concrete rather than argued.
+    for (precision, report) in &reports {
+        assert_eq!(
+            report["ops"]["adamw_step"]["holds"],
+            serde_json::json!(true),
+            "the {precision} job must report adamw_step as genuinely admitted — the fused \
+             AdamW step dispatches on CPU at F32 trainable vars on EVERY backbone dtype, so a \
+             missing (or false) entry here means either the probe's optimizer step never ran \
+             or the table gated this row on the wrong dtype axis. Report: {report}"
+        );
+    }
+}
+
+/// Campaign #446 finding 3 — FABRICATED MISS REASONS. Four jobs in ONE
+/// process, all reading the SAME registry key (`attention_block_fused`), at
+/// two DIFFERENT failing predicates:
+///
+/// - `f32` on CPU clears the dtype gate and declines at the head-dim check →
+///   `head_dim_is_attention_block_fixed_head_dim` (`tiny_modernbert`'s head
+///   dim is nowhere near the kernel's fixed 64).
+/// - `f16` on CPU declines at the DTYPE check itself → `dtype_f32_matching_
+///   between_qkv_and_mask_on_cpu` (the round-2 device split: BF16/F16 are
+///   CUDA-only, matching `cpu_fwd`'s real domain), so the head-dim check
+///   below it is never reached.
+///
+/// **Why the order f32, f16, f32, f32 and not just two jobs.** The pre-fix
+/// `reason_for_registry_key` read the process-lifetime
+/// `fallback_warnings_emitted()` list and took the most recent entry for the
+/// op. That list is populated INSIDE `warn_fallback_once_with_message`'s
+/// `seen.insert((op, predicate))` guard (`crates/jammi-kernels/src/
+/// admission.rs`), so it records each `(op, predicate)` pair AT MOST ONCE per
+/// process. Jobs 1 and 2 therefore each push a fresh pair and read back
+/// correctly even pre-fix; job 3 is where it breaks: its `head_dim` pair is
+/// already in `seen`, nothing is pushed, and the most recent entry for
+/// `attention_block_fused` is still job 2's `dtype_...` — a different
+/// predicate, for a different dtype, persisted durably as THIS job's reason.
+/// Job 3 is the deterministic RED. (Verified by running this test against the
+/// unmodified `worker.rs`: job 3 reported `dtype_f32_matching_between_qkv_and_
+/// mask_on_cpu` for an f32 backbone.)
+///
+/// Job 4 is the SAME-predicate repeat (the dedupe case the naive
+/// "before/after window over `fallback_warnings_emitted()`" fix cannot serve
+/// either — that window is EMPTY for job 4, because the dedupe is upstream of
+/// the record). It must still carry its own predicate, never
+/// `reason_unavailable`.
+///
+/// Every job must also keep `holds: false` — the bug was never about the
+/// determination, only about the verbatim key attached to it.
+// `jammi_kernels::admission`'s dispatch registries and its warn-dedup set are
+// process-wide — same `#[serial]` rationale as the other tests in this file.
+#[serial(esc075_acceleration_report)]
+#[tokio::test(flavor = "multi_thread")]
+async fn each_job_reports_its_own_miss_predicate_not_the_most_recent_different_one() {
+    const HEAD_DIM_MISS: &str = "head_dim_is_attention_block_fixed_head_dim";
+    const CPU_DTYPE_MISS: &str = "dtype_f32_matching_between_qkv_and_mask_on_cpu";
+
+    let (session, _dir) = session_with_training_data().await;
+    let _worker = EmbeddedWorker::spawn(&session).expect("default worker intervals are valid");
+
+    let plan = [
+        (ComputePrecision::F32, HEAD_DIM_MISS, "job 1 (f32, first)"),
+        (ComputePrecision::F16, CPU_DTYPE_MISS, "job 2 (f16)"),
+        (
+            ComputePrecision::F32,
+            HEAD_DIM_MISS,
+            "job 3 (f32, after f16 burned the dedup for a DIFFERENT predicate)",
+        ),
+        (
+            ComputePrecision::F32,
+            HEAD_DIM_MISS,
+            "job 4 (f32, SAME predicate as job 3 — the dedupe case)",
+        ),
+    ];
+
+    for (precision, expected_reason, label) in plan {
+        let job = session
+            .fine_tune(
+                "training",
+                &tiny_modernbert_model(),
+                &training_columns(),
+                FineTuneMethod::Lora,
+                ModelTask::TextEmbedding,
+                Some(encoder_adapters_config(precision)),
+            )
+            .await
+            .unwrap();
+        let record = wait_for_any_terminal(session.catalog(), &job.job_id).await;
+        let report = expect_determined_report(record.acceleration_report.as_deref());
+        let ab = &report["ops"]["attention_block"];
+        assert_eq!(
+            ab["holds"],
+            serde_json::json!(false),
+            "{label}: attention_block_fused must decline on CPU at {precision}, got: {report}"
+        );
+        assert_eq!(
+            ab["reason"],
+            serde_json::json!(expected_reason),
+            "{label}: the miss reason must be the verbatim predicate key THIS job's own probe \
+             window recorded, never the most recent DIFFERENT predicate some earlier job left \
+             in the process-lifetime warn list (campaign #446 finding 3), and never a \
+             placeholder for a miss that really did record a predicate. Report: {report}"
+        );
+    }
 }
 
 /// Phase-4 adversarial-audit finding 4 ("PENDING-FOREVER"), `ContextPredictor`
@@ -786,11 +1134,7 @@ async fn pre_device_resolution_failure_reports_undetermined_acceleration() {
         .await
         .unwrap();
     seed_job.wait().await.unwrap();
-    let seed_record = session
-        .catalog()
-        .get_training_job(&seed_job.job_id)
-        .await
-        .unwrap();
+    let seed_record = terminal_record(session.catalog(), &seed_job.job_id, "seed job").await;
 
     // A raw job carrying a deliberately undeserialisable `training_spec` —
     // fails in `run_claimed_job` before `run_spec`/`run_fine_tune_blocking`
@@ -832,5 +1176,486 @@ async fn pre_device_resolution_failure_reports_undetermined_acceleration() {
     assert_eq!(
         report["reason"],
         serde_json::json!("failed_before_device_resolution")
+    );
+}
+
+/// The three terminal states an `acceleration_report` may carry once its job
+/// row is terminal — the CLOSED vocabulary
+/// [`assert_terminal_report_is_not_pending`] checks against. Listing them
+/// (rather than only asserting `!= "pending"`) makes a fourth, unrecognised
+/// state fail here too: a consumer that must branch on this field has no
+/// reading for a value outside this set, so "not pending" alone is too weak a
+/// property to be the whole oracle.
+const TERMINAL_REPORT_STATES: [&str; 3] = ["determined", "not_applicable", "undetermined"];
+
+/// The tri-state oracle for campaign #446 finding 1: once a job's status is
+/// TERMINAL, its `acceleration_report` may never still read
+/// `{"state":"pending"}` — "pending" asserts that no claimant has computed a
+/// determination YET, and "yet" is false the moment the row can no longer
+/// reach the probe.
+///
+/// **Runs on EVERY terminal row this suite produces**, not only the failure
+/// paths: [`wait_for_any_terminal`] and [`terminal_record`] are the only two
+/// ways this file reads a terminal record, and both call this. That matters
+/// because the finding is not failure-specific — a job that runs to
+/// `completed` while its probe report write is swallowed
+/// (`worker.rs`'s `persist_acceleration_report` logs and continues on a
+/// lease-guard miss or a catalog error) reaches the same forbidden state by a
+/// SUCCESS path, which
+/// [`completed_job_with_a_swallowed_report_write_is_never_left_pending`]
+/// drives directly.
+///
+/// Asserts the property and returns the parsed report so a caller can assert
+/// more; [`assert_terminal_report_is_undetermined`] is the stricter wrapper
+/// for a path whose exact marker is known.
+fn assert_terminal_report_is_not_pending(
+    record: &jammi_db::catalog::training_repo::TrainingJobRecord,
+    label: &str,
+) -> serde_json::Value {
+    assert!(
+        matches!(record.status.as_str(), "completed" | "failed"),
+        "{label}: this oracle only speaks about a TERMINAL row, got status {:?}",
+        record.status
+    );
+    let raw = record.acceleration_report.as_deref().unwrap_or_else(|| {
+        panic!(
+            "{label}: esc-075 control (iii) — a missing report is a FAILURE, never read as \
+             \"no misses\""
+        )
+    });
+    let report: serde_json::Value =
+        serde_json::from_str(raw).unwrap_or_else(|e| panic!("{label}: report must be JSON: {e}"));
+    assert_ne!(
+        report["state"],
+        serde_json::json!("pending"),
+        "{label}: a terminal job must never still carry the submission-time pending marker \
+         (campaign #446 finding 1) — got: {report}"
+    );
+    let state = report["state"].as_str().unwrap_or_else(|| {
+        panic!("{label}: a terminal report's `state` must be a string, got: {report}")
+    });
+    assert!(
+        TERMINAL_REPORT_STATES.contains(&state),
+        "{label}: a terminal report's state must be one of {TERMINAL_REPORT_STATES:?} — a \
+         consumer has no reading for anything else. Got: {report}"
+    );
+    report
+}
+
+/// [`assert_terminal_report_is_not_pending`] plus the specific
+/// self-describing marker a known pre-probe path must carry: `undetermined`
+/// with a reason that names WHERE it stopped.
+fn assert_terminal_report_is_undetermined(
+    record: &jammi_db::catalog::training_repo::TrainingJobRecord,
+    expected_reason: &str,
+    label: &str,
+) -> serde_json::Value {
+    let report = assert_terminal_report_is_not_pending(record, label);
+    assert_eq!(
+        report["state"],
+        serde_json::json!("undetermined"),
+        "{label}: a job that never ran the probe must carry the self-describing undetermined \
+         marker, got: {report}"
+    );
+    assert_eq!(
+        report["reason"],
+        serde_json::json!(expected_reason),
+        "{label}: the undetermined reason must name WHERE it stopped, got: {report}"
+    );
+    report
+}
+
+/// Campaign #446 finding 1, worker side — the tri-state oracle driven through
+/// the PUBLIC surface (submit → force the failure → read the durable record),
+/// for every failure path between the claim and the acceleration probe that a
+/// CPU-only, in-process suite can actually force.
+///
+/// The catalog-edge mechanism this leans on is jammi-db's
+/// (`Catalog::fail_training_job` retires a still-`pending` report to
+/// `{"state":"undetermined","reason":"failed_before_probe"}` in the SAME
+/// lease-guarded UPDATE). What is asserted HERE is the worker's half: that
+/// each of these paths genuinely reaches `record_failed`, so the catalog-edge
+/// rule covers it. A path that bailed without a terminal write would leave
+/// the row `running` and this test would hang in `wait_for_any_terminal`
+/// rather than pass — the failure mode is loud, not silent.
+///
+/// Paths covered here (numbering matches `FineTuneWorker::run_claimed_job`'s
+/// own audit table):
+/// - **4 — base-model load error (missing artifact).** A raw job whose
+///   `training_spec` names a `local:` path that does not exist; the FK target
+///   is a real model row (minted by the seed job) so the failure lands where
+///   intended, inside `train_fine_tune`'s `model_cache().get_or_load`, AFTER
+///   the claim and well before any probe.
+/// - **3 — loader reconstruction error.** A job whose spec names a source
+///   table this session never registered, so `read_source_columns`'s SQL
+///   fails.
+/// - **1/2 — no / undeserialisable `training_spec`.** Covered by
+///   [`pre_device_resolution_failure_reports_undetermined_acceleration`]
+///   above, which additionally pins the MORE specific
+///   `failed_before_device_resolution` reason the worker pre-marks and the
+///   catalog edge preserves.
+///
+/// Paths deliberately NOT forced here, each with where it IS proven:
+/// - **9 — `spawn_blocking` panic / join error.** `crates/jammi-ai/src/
+///   fine_tune/worker.rs`'s `panicking_training_job_lands_failed_with_
+///   recorded_error` drives the exact `catch_unwind` → `panic_message` →
+///   `classify` → `record_failed` pipeline against a real catalog row. There
+///   is no public API that injects a panic into the trainer.
+/// - **6/7 — device-select and head/adapter construction errors.** Same
+///   `Err(Failed)` → `record_failed` arm as 3/4 (they differ only in where
+///   inside `run_fine_tune_blocking` they originate, all before the probe
+///   call); forcing 6 needs a device this CPU-only lane does not have.
+/// - **Cancelled / reclaim exhaustion.** Not a `record_failed` path at all
+///   by design — the OTHER half of the catalog-edge rule owns it, and
+///   `crates/jammi-db/tests/it/fine_tune_queue.rs` asserts both reclaim arms
+///   directly (exhausted → `lease_expired_attempts_exhausted`; requeue →
+///   reset to `pending`).
+// `jammi_kernels::admission`'s dispatch registries are process-wide — same
+// `#[serial]` rationale as the other tests in this file.
+#[serial(esc075_acceleration_report)]
+#[tokio::test(flavor = "multi_thread")]
+async fn every_pre_probe_failure_path_leaves_a_terminal_non_pending_report() {
+    let (session, _dir) = session_with_training_data().await;
+    let _worker = EmbeddedWorker::spawn(&session).expect("default worker intervals are valid");
+
+    // A real job first, purely to mint a valid `base_model_id` FK target —
+    // the same reuse pattern
+    // `pre_device_resolution_failure_reports_undetermined_acceleration` uses
+    // rather than re-deriving `ModelSource` resolution in a test.
+    let seed_job = session
+        .fine_tune(
+            "training",
+            &tiny_modernbert_model(),
+            &training_columns(),
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(encoder_adapters_config(ComputePrecision::F32)),
+        )
+        .await
+        .unwrap();
+    seed_job.wait().await.unwrap();
+    let seed_record = terminal_record(session.catalog(), &seed_job.job_id, "seed job").await;
+    // Control: the seed job DID reach the probe, so the marker asserted below
+    // is a real state transition and not "every job is undetermined".
+    let seed_report = expect_determined_report(seed_record.acceleration_report.as_deref());
+    assert_eq!(seed_report["state"], serde_json::json!("determined"));
+
+    let spec_for = |source: &str, base_model: &str| {
+        serde_json::to_string(&TrainingSpec::FineTune {
+            source: source.to_string(),
+            columns: training_columns(),
+            method: FineTuneMethod::Lora,
+            task: ModelTask::TextEmbedding,
+            common: TrainingCommon {
+                base_model: base_model.to_string(),
+                config: encoder_adapters_config(ComputePrecision::F32),
+            },
+        })
+        .unwrap()
+    };
+
+    let cases = [
+        (
+            "esc446-f1-missing-artifact",
+            spec_for(
+                "training",
+                "local:/nonexistent/esc446/f1/no-such-checkpoint",
+            ),
+            "path 4 (base-model artifact missing)",
+        ),
+        (
+            "esc446-f1-unknown-source",
+            spec_for("no_such_table_esc446", &tiny_modernbert_model()),
+            "path 3 (source SQL / loader reconstruction)",
+        ),
+    ];
+
+    for (job_id, spec_json, label) in cases {
+        session
+            .catalog()
+            .create_training_job(CreateTrainingJobParams {
+                job_id,
+                base_model_id: &seed_record.base_model_id,
+                training_source: "training",
+                loss_type: "cosent",
+                hyperparams: "{}",
+                kind: "fine_tune",
+                training_spec: &spec_json,
+            })
+            .await
+            .unwrap();
+
+        let record = wait_for_any_terminal(session.catalog(), job_id).await;
+        assert_eq!(
+            record.status, "failed",
+            "{label}: the job must land terminal `failed`, never wedged `running` — got {} \
+             (error: {:?})",
+            record.status, record.error_message
+        );
+        assert!(
+            record.error_message.is_some(),
+            "{label}: record_failed must have surfaced the cause on the row"
+        );
+        assert_terminal_report_is_undetermined(&record, "failed_before_probe", label);
+    }
+}
+
+/// Campaign #446 finding 1, the **SUCCESS half** — the gap the round-1
+/// adversarial audit named in this file's own oracle: every existing caller
+/// of [`assert_terminal_report_is_not_pending`] was a FAILURE path, so
+/// "terminal ⇒ not pending" was only ever proven for jobs that died before
+/// the probe. A job can reach the same forbidden state by SUCCEEDING:
+/// `worker.rs`'s `persist_acceleration_report` logs and SWALLOWS both a
+/// lease-guard miss (`Ok(false)`) and a catalog error (`Err`), by design —
+/// "this attempt's eventual finalize/fail is governed entirely by the
+/// training loop that follows, unaffected by whether this write landed". A
+/// swallowed probe write followed by a successful finalize therefore lands
+/// `completed` with the submission-time `{"state":"pending"}` marker still on
+/// the row, forever, which the tri-state contract has no reading for.
+///
+/// # Is the swallowed-write branch reachable from a test without a hook?
+///
+/// **Not end-to-end through `session.fine_tune`, and this test does not
+/// pretend otherwise.** Both halves of the branch are closed to an in-process
+/// integration test:
+///
+/// - The **lease-guard miss** needs the row's `claimed_by`/`attempts` to
+///   differ from what the running worker holds. Both are threaded from the
+///   very record that worker claimed (`run_claimed_job`'s `let attempt =
+///   record.attempts`), and the only public mechanism that moves either one
+///   under a running worker is lease expiry + `reclaim_expired_training_jobs`
+///   — which also cancels that worker's run (`WorkerJobError::Cancelled`),
+///   and the cancelled arm deliberately writes NO terminal status at all. So
+///   the shape "this worker's report write missed AND this worker's finalize
+///   landed" cannot be produced by driving the worker.
+/// - The **catalog-error** branch needs an injected backend failure, and the
+///   catalog exposes no fault-injection seam.
+///
+/// The alternative would be a test-only hook in production `worker.rs`, which
+/// this does not add. Instead the branch is reproduced at the SAME public
+/// catalog surface `persist_acceleration_report` itself calls: a STALE
+/// `attempt` into [`jammi_db::catalog::Catalog::record_acceleration_report`]
+/// returns exactly the `Ok(false)` that function swallows, with the row still
+/// `running` and still owned by this worker — after which the ordinary
+/// lease-guarded finalize runs and the job completes. That is the real
+/// mechanism (the `attempts = $6` clause of the report write's guard, which
+/// `finalize_training_job`'s CAS deliberately does not carry), not a
+/// simulation of its effect.
+///
+/// # The controls
+///
+/// - **The ordinary completed job keeps `determined`** (leg 1): a real
+///   `session.fine_tune` job that reaches the probe. Without it, a
+///   `finalize_training_job` that stamped `undetermined` over EVERY report
+///   would pass leg 2.
+/// - **The mechanism is traced, not asserted** (leg 3): a second raw job,
+///   identical in every way except that the report write carries the CORRECT
+///   attempt. It returns `Ok(true)`, the row reads `determined`, and the same
+///   finalize preserves it byte-for-byte. Remove the claimed cause (the stale
+///   attempt) and the number moves — so leg 2's `undetermined` is caused by
+///   the swallowed write and not by the finalize itself.
+// `jammi_kernels::admission`'s dispatch registries are process-wide — same
+// `#[serial]` rationale as the other tests in this file.
+#[serial(esc075_acceleration_report)]
+#[tokio::test(flavor = "multi_thread")]
+async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
+    /// The `claimed_by` identity the raw legs below claim under — a real
+    /// lease holder, just not an `EmbeddedWorker`.
+    const WORKER: &str = "esc446-f1-success-path-worker";
+    /// A determined payload of the shape `build_acceleration_report_json`
+    /// produces. Only its `"state"` is load-bearing here: what is under test
+    /// is WHETHER the write lands, not what it measures.
+    const DETERMINED: &str = r#"{"state":"determined","attempt":1,"ops":{}}"#;
+
+    let (session, _dir) = session_with_training_data().await;
+    let worker = EmbeddedWorker::spawn(&session).expect("default worker intervals are valid");
+
+    // ── Leg 1: the ordinary completed job keeps `determined` ──────────────
+    let job = session
+        .fine_tune(
+            "training",
+            &tiny_modernbert_model(),
+            &training_columns(),
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(encoder_adapters_config(ComputePrecision::F32)),
+        )
+        .await
+        .unwrap();
+    job.wait().await.unwrap();
+    let seed_record = terminal_record(
+        session.catalog(),
+        &job.job_id,
+        "leg 1 (ordinary completed job)",
+    )
+    .await;
+    assert_eq!(seed_record.status, "completed");
+    let seed_report = expect_determined_report(seed_record.acceleration_report.as_deref());
+    assert_eq!(
+        seed_report["state"],
+        serde_json::json!("determined"),
+        "leg 1: a job that reached the probe and completed must keep its measured report — \
+         otherwise legs 2/3 below would be asserting a marker every job gets, got: {seed_report}"
+    );
+
+    // Stop the worker (gracefully, awaiting quiescence) before minting the
+    // raw rows below, so nothing claims them out from under this test. The
+    // legs that follow ARE the claimant.
+    worker
+        .stop_and_join()
+        .await
+        .expect("the embedded worker loop must stop cleanly");
+
+    let spec_json = serde_json::to_string(&TrainingSpec::FineTune {
+        source: "training".to_string(),
+        columns: training_columns(),
+        method: FineTuneMethod::Lora,
+        task: ModelTask::TextEmbedding,
+        common: TrainingCommon {
+            base_model: tiny_modernbert_model(),
+            config: encoder_adapters_config(ComputePrecision::F32),
+        },
+    })
+    .unwrap();
+
+    // Claim a freshly created raw job under `WORKER`, returning its record.
+    // The claim is what makes the row `running` + owned, which is the state
+    // both the report write's guard and the finalize CAS are checked against.
+    let catalog = session.catalog();
+    let claim = |job_id: &'static str| {
+        let base_model_id = seed_record.base_model_id.clone();
+        let spec_json = spec_json.clone();
+        async move {
+            catalog
+                .create_training_job(CreateTrainingJobParams {
+                    job_id,
+                    base_model_id: &base_model_id,
+                    training_source: "training",
+                    loss_type: "cosent",
+                    hyperparams: "{}",
+                    kind: "fine_tune",
+                    training_spec: &spec_json,
+                })
+                .await
+                .unwrap();
+            let claimed = catalog
+                .claim_next_training_job(WORKER, Duration::from_secs(300))
+                .await
+                .unwrap()
+                .expect("the worker is stopped, so this row is the only claimable one");
+            assert_eq!(
+                claimed.job_id, job_id,
+                "the claim must have taken THIS row (the worker is stopped and no other job \
+                 is queued)"
+            );
+            assert_eq!(
+                claimed.attempts, 1,
+                "a first claim runs under attempt 1 — the stale-attempt arithmetic below \
+                 depends on it"
+            );
+            claimed
+        }
+    };
+
+    // `finalize_training_job` with an output model NAME that matches no
+    // `models` row: the model-row UPDATE inside the same transaction then
+    // touches zero rows (not an error), which keeps this leg from clobbering
+    // leg 1's real output model. The `training_jobs` CAS — the only thing
+    // under test — is unaffected.
+    let finalize = |job_id: &'static str| async move {
+        catalog
+            .finalize_training_job(FinalizeTrainingJobParams {
+                job_id,
+                worker_id: WORKER,
+                output_model_id: "esc446-f1-no-such-output-model",
+                output_model_version: 1,
+                artifact_path: "esc446-f1/unused/",
+                metrics: None,
+                epoch_checkpoints: &[],
+            })
+            .await
+            .unwrap()
+    };
+
+    // ── Leg 2: the swallowed probe write, then a successful finalize ──────
+    let swallowed = "esc446-f1-swallowed-report-write";
+    let claimed = claim(swallowed).await;
+    // THE SWALLOWED WRITE. `persist_acceleration_report` calls exactly this,
+    // and logs-and-continues on the `false` it returns. A stale attempt is
+    // the reachable spelling of that miss (see this test's doc).
+    let landed = session
+        .catalog()
+        .record_acceleration_report(swallowed, WORKER, claimed.attempts - 1, DETERMINED)
+        .await
+        .unwrap();
+    assert!(
+        !landed,
+        "the stale-attempt write must MISS record_acceleration_report's lease guard — if it \
+         landed, this leg is not reproducing the swallowed-write branch at all and everything \
+         below it is vacuous"
+    );
+    let mid_run = session.catalog().get_training_job(swallowed).await.unwrap();
+    assert_eq!(
+        mid_run.status, "running",
+        "the missed write must leave the row RUNNING and claimable-by-nobody-else — the \
+         swallow is silent by design"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(mid_run.acceleration_report.as_deref().unwrap())
+            .unwrap()["state"],
+        serde_json::json!("pending"),
+        "after the swallowed write the row still carries the submission-time pending marker — \
+         this is the state the finalize below must not let survive"
+    );
+    assert!(
+        finalize(swallowed).await,
+        "the finalize CAS is guarded on claimed_by + status only (NOT on attempts), so this \
+         worker still finalizes the job it could not report on — that asymmetry is the whole \
+         defect"
+    );
+    let record = terminal_record(
+        session.catalog(),
+        swallowed,
+        "leg 2 (completed, report write swallowed)",
+    )
+    .await;
+    assert_eq!(
+        record.status, "completed",
+        "leg 2's job must genuinely COMPLETE — the swallowed report write never fails training"
+    );
+    assert_terminal_report_is_undetermined(
+        &record,
+        "finalized_without_determination",
+        "leg 2 (completed, report write swallowed)",
+    );
+
+    // ── Leg 3: the mechanism trace — same shape, correct attempt ──────────
+    let landed_ok = "esc446-f1-report-write-landed";
+    let claimed = claim(landed_ok).await;
+    let landed = session
+        .catalog()
+        .record_acceleration_report(landed_ok, WORKER, claimed.attempts, DETERMINED)
+        .await
+        .unwrap();
+    assert!(
+        landed,
+        "removing the ONE difference (the stale attempt) must make the same write LAND — \
+         otherwise leg 2's miss is explained by a broken fixture, not by the guard"
+    );
+    assert!(finalize(landed_ok).await);
+    let record = terminal_record(
+        session.catalog(),
+        landed_ok,
+        "leg 3 (completed, report write landed)",
+    )
+    .await;
+    assert_eq!(record.status, "completed");
+    let report = expect_determined_report(record.acceleration_report.as_deref());
+    assert_eq!(
+        report["state"],
+        serde_json::json!("determined"),
+        "a report that WAS determined is the last true thing known about the job — the \
+         terminal write must preserve it byte-for-byte, never overwrite it with the \
+         undetermined marker leg 2 asserts, got: {report}"
     );
 }

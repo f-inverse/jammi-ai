@@ -91,8 +91,9 @@
 //! differently in a future nvcc version if this expression ever grew a
 //! neighboring add) so the pinning is stated in the kernel text itself,
 //! not merely inferred from "there happens to be no add nearby" — the same
-//! doctrine C1 established for `Axpy`'s FMA-contraction disclosure, applied
-//! here as a POSITIVE guarantee instead of a disclosed gap.
+//! doctrine C1 established for this crate's FMA-contraction disclosure
+//! (`build.rs`'s PINNED FLAGS comment), applied here as a POSITIVE
+//! guarantee instead of a disclosed gap.
 //!
 //! ## No save-for-backward (candle 0.11): bwd IS fwd
 //!
@@ -422,8 +423,9 @@ fn dropout_f32(params: &DropoutFused, x: &[f32]) -> Vec<f32> {
 }
 
 /// BF16: widen to `f32`, apply the same lone multiply, round to `bf16`
-/// once — this crate's usual single-rounding convention (`Axpy`'s bf16
-/// arm), and there is only ever ONE rounding point here regardless (unlike
+/// once — this crate's usual single-rounding convention
+/// (f32-accumulate, round once), and there is only ever ONE rounding
+/// point here regardless (unlike
 /// `ScaledCastAdd`'s two-round PEFT-matching model): a KEPT element is
 /// `bf16::from_f32(x_i_as_f32 * scale)`, a DROPPED element is an exact
 /// `bf16::ZERO`, never a rounded quantity.
@@ -441,10 +443,18 @@ fn dropout_bf16(params: &DropoutFused, x: &[bf16]) -> Vec<bf16> {
 }
 
 /// [`dropout_bf16`]'s exact twin, substituting `half::f16` — this op's
-/// CPU-only F16 oracle-reference arm (no CUDA/Metal F16 dispatch arm
-/// exists yet, see `docs/maintainer/cuda-kernel-guide.md`'s per-op f16
-/// reference-regime table). Byte-identical KEEP/DROP decision (the mask
-/// is dtype-independent), one rounding point on a KEPT element.
+/// F16 CPU arm, which doubles as the reference the CUDA F16 arm is
+/// compared against. CORRECTION (campaign #446, finding 14): an earlier
+/// revision of this comment said "no CUDA/Metal F16 dispatch arm exists
+/// yet". That is false for CUDA and has been since campaign #443 W2c —
+/// `cuda/dropout.rs`'s `cuda_fwd` has a real `DType::F16` arm dispatching
+/// `dropout_fwd_f16` from the separate `cuda/dropout_f16.cu` translation
+/// unit (this module's own doc, "supports ... `F16`", was already
+/// correct; only this line lagged). It remains true for METAL: `metal_fwd`
+/// deliberately admits `F32`/`BF16` only — see its own `DType::F32 |
+/// DType::BF16 => {}` gate and the "deliberately NOT widened to F16"
+/// note there. Byte-identical KEEP/DROP decision (the mask is
+/// dtype-independent), one rounding point on a KEPT element.
 fn dropout_f16(params: &DropoutFused, x: &[f16]) -> Vec<f16> {
     x.iter()
         .enumerate()

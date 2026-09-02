@@ -128,10 +128,16 @@ class EmbeddedBackend:
     #
     # The embedded engine carries the in-process primitives (`audit`,
     # `ephemeral_session`, `preload_model`); it does NOT carry the remote-only
-    # `close` (it releases on drop — RAII) or `session_id` (no per-connection
-    # scoping key). `supports()` answers the divergence, and the remote-only
-    # members raise a typed `NotSupportedOnBackend` rather than a bare
-    # `AttributeError`, so parity with the remote capability surface holds.
+    # `session_id` (no per-connection scoping key). `supports()` answers the
+    # divergence, and the remote-only member raises a typed
+    # `NotSupportedOnBackend` rather than a bare `AttributeError`, so parity with
+    # the remote capability surface holds.
+    #
+    # `close` is NOT a capability: both transports carry it (see
+    # `EmbeddedBackend.close`). It used to be listed as remote-only on the claim
+    # that the embedded engine "releases on drop"; it does not — under the
+    # engine's `unix-excl` catalog seam the release is an awaited event, and
+    # `close()` is the only bounded point at which it happens.
 
     _CAPABILITIES = frozenset(
         {Capability.AUDIT, Capability.EPHEMERAL_SESSION, Capability.PRELOAD_MODEL}
@@ -160,15 +166,52 @@ class EmbeddedBackend:
         raise NotSupportedOnBackend(Capability.SESSION_ID)
 
     def close(self) -> None:
-        """Remote-only: the embedded engine releases its resources on drop (RAII)."""
-        raise NotSupportedOnBackend(Capability.CLOSE)
+        """Stop this session's training worker and RELEASE the catalog file.
+
+        The embedded peer of :meth:`~jammi.RemoteDatabase.close`, and the only
+        bounded point at which the artifact directory becomes somebody else's to
+        open. It is a delegation to the engine's own release handshake
+        (`_NativeDatabase.close`), never a weaker private notion of "closed":
+        the embedded training worker is stopped first, then the catalog
+        connection pool is closed and awaited.
+
+        Dropping the session is NOT equivalent. The catalog opens through
+        SQLite's `unix-excl` VFS, which holds a process-scoped exclusive lock for
+        as long as any connection in this process has the file open, and `sqlx`
+        returns pooled connections from a background task — so a dropped handle
+        releases nothing at any bounded moment (in the limit, not until the
+        pool's idle reaper runs). Until `close()` returns, a successor PROCESS
+        opening the same directory is refused with
+        :class:`~jammi.errors.BackendError`, and a foreign in-process SQLite
+        instance (e.g. the stdlib `sqlite3`) reads a divergent image of the
+        database. After it returns, both succeed.
+
+        The release is CONNECTION-WIDE by design: handles derived from this
+        session share the pool, so their catalog operations fail too, and the
+        pool is never silently reopened. `close()` is idempotent — a second call
+        is a no-op — and every other verb afterwards raises the typed
+        :class:`~jammi.errors.BackendError` the engine's boundary guard raises,
+        never a silent no-op.
+
+        With ``training.run_worker = false`` there is no worker to stop, so only
+        the catalog release runs — promptly, with no idle-poll wait and no
+        in-flight run to finish. That is the point of the setting on a SQLite
+        catalog: this session submits jobs and holds them ``"queued"``, and this
+        call is the moment its directory, queued jobs and all, becomes a
+        claiming process's to open. See :func:`jammi.connect`.
+        """
+        self._native.close()
 
     def __enter__(self) -> "EmbeddedBackend":
         return self
 
     def __exit__(self, *exc: object) -> bool:
-        # RAII: the engine releases on drop, so block exit needs no explicit
-        # teardown. Does not suppress exceptions raised in the block.
+        # Block exit releases the catalog, exactly as the remote arm's `__exit__`
+        # releases the channel: a `with` block that reads as a scoped resource
+        # has to be one. Drop is NOT a release here (see `close`), so leaving
+        # this a no-op would hold the artifact directory for the process
+        # lifetime. Does not suppress exceptions raised in the block.
+        self.close()
         return False
 
     # --- Tenant scope + handshake ----------------------------------------------
@@ -207,6 +250,16 @@ class EmbeddedBackend:
     def describe_source(self, source_id: str) -> Optional[Dict[str, Any]]:
         """Describe one registered source by id, or ``None`` if not visible."""
         return self._native.describe_source(source_id)
+
+    def list_index_segments(self, table_name: str) -> List[Dict[str, Any]]:
+        """The ANN index segments of one result table, in ``segment_id`` order.
+
+        Each entry carries ``segment_id`` / ``index_path`` / ``row_count``.
+        Empty for a table with no segments, a flat (unsegmented) index, an
+        unknown table, and a table this tenant cannot resolve — the last two by
+        design, so the verb is not an existence oracle.
+        """
+        return self._native.list_index_segments(table_name)
 
     def list_models(self) -> List[Dict[str, Any]]:
         """A record for every model in the current tenant's catalog."""
@@ -376,6 +429,36 @@ class EmbeddedBackend:
     ) -> List[Tuple[str, float]]:
         """Fuse several ranked retrieval lists by reciprocal-rank fusion."""
         return self._native.rrf_fuse(ranked_lists, k_rrf=k_rrf)
+
+    def training_job(self, job_id: str) -> Any:
+        """Attach to an existing training job by id.
+
+        The handle a `fine_tune` call returns is bound to the session that made
+        it; this is how a session that never submitted the job reaches it — the
+        peer of :meth:`jammi.RemoteDatabase.training_job`, and the reason a job
+        outlives its submitting connection. Every read verb works on the
+        result: `status()`, `metrics()`, `acceleration_report()`, `wait()`.
+
+        A `job_id` with no row VISIBLE TO THIS TENANT raises the typed
+        :class:`~jammi.errors.BackendError` — the same class the remote arm
+        raises for the same miss, and the same class every other catalog miss
+        raises here. There is no separate existence check to drift from the
+        catalog read itself.
+        """
+        return self._native.training_job(job_id)
+
+    def list_training_jobs(self) -> List[Dict[str, Any]]:
+        """Training jobs visible to the current tenant, most recent first.
+
+        Each entry carries the wire's `TrainingJobSummary` field set —
+        ``job_id``, ``kind``, ``status``, ``base_model_id``,
+        ``output_model_id``, ``created_at``, ``error`` — with
+        ``output_model_id`` empty until the job completes and ``error`` empty
+        unless it failed. A listing of :meth:`training_job` answers plus the
+        submit-time identity; there is no progress surface here, because the
+        engine records run metrics only at finalization.
+        """
+        return self._native.list_training_jobs()
 
     def fine_tune(
         self,
@@ -1205,7 +1288,17 @@ def _open_embedded(artifact_dir: str, *, config: Optional[str] = None) -> Embedd
     (among every other deployment default) through — every embedding table this
     session later creates (`generate_embeddings` / `import_embeddings`) is
     stamped with whatever `storage_precision` was in effect at the moment of
-    its creation. ``None`` reproduces the engine's built-in defaults.
+    its creation. ``None`` leaves the engine to resolve a config the way the
+    server binary does (``JAMMI_CONFIG`` / ``./jammi.toml`` / the platform config
+    dir, then the ``JAMMI_*`` environment overrides), falling back to the
+    built-in defaults when there is none — the `artifact_dir` passed here is
+    applied after that load and always wins.
+
+    One key that resolution carries is `training.run_worker`
+    (``JAMMI_TRAINING__RUN_WORKER``): with it `false`, this session accepts
+    training submissions but never claims one, so on a SQLite catalog a
+    submitted job stays ``"queued"`` until this session is closed and a claiming
+    process opens the directory. See :func:`jammi.connect`.
 
     This is the ONE site that imports `jammi_native`, and it does so LAZILY (at
     call time, not module load): `import jammi` and `import

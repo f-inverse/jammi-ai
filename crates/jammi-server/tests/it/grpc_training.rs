@@ -37,6 +37,10 @@ use jammi_server::grpc::proto::training::{
 use jammi_test_utils::{cookbook_fixture, fixture_url};
 use tonic::transport::Channel;
 
+#[cfg(feature = "train")]
+use super::common::grpc::start_engine_server_with_run_worker;
+#[cfg(feature = "train")]
+use super::common::grpc::start_engine_server_worker_quiesced;
 use super::common::grpc::{
     channel, start_engine_server, tenant_a, with_session, EngineServer, TENANT_A,
 };
@@ -845,11 +849,146 @@ async fn register_acceleration_test_model(catalog: &jammi_db::catalog::Catalog, 
 
 /// K4 (esc-075): a submitted job's `TrainingStatus.acceleration_report_json`
 /// matches the catalog's `training_jobs.acceleration_report` column
-/// byte-for-byte, immediately post-submission — the explicit `{"state":
+/// byte-for-byte, in the submission-time state — the explicit `{"state":
 /// "pending"}` marker `create_training_job` writes, never `NULL`. This is the
 /// divergence-prone tri-state field, not a single-scalar happy path.
+///
+/// THE READ POINT IS QUIESCED BY CONSTRUCTION (#446 finding 8): this fixture is
+/// [`start_engine_server_worker_quiesced`], whose embedded training worker has
+/// been stopped AND joined before the fixture returns, so between the submit and
+/// the two reads below there is NO claimant that could move the marker off
+/// `pending`. Reading the pre-claim state under the production fixture (worker
+/// running) is a TOCTOU: the worker claims a `queued` row on its first tick with
+/// no initial sleep, so on a slow runner the claim lands first — see
+/// `an_eagerly_running_worker_moves_the_acceleration_marker_off_pending` below,
+/// the control that demonstrates the mutation is real. The fix is the quiesced
+/// read point, NOT a weaker "pending-or-terminal" assertion: the byte-exact
+/// marker IS the K4 oracle and stays byte-exact.
+///
+/// Then the worker is released and the SAME parity assertion is re-run at the
+/// second quiesced point — the job's terminal state, with the worker stopped
+/// again — so the wire↔embedded byte-equality is pinned on both ends of the
+/// job's life, each read where nothing can mutate the row.
+#[cfg(feature = "train")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn training_status_acceleration_report_pending_state_matches_the_catalog_record() {
+    let server = start_engine_server_worker_quiesced().await;
+    add_training_source(
+        channel(server.addr).await,
+        None::<fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>>,
+    )
+    .await;
+    let mut client = TrainingServiceClient::new(channel(server.addr).await);
+
+    let start = client
+        .start_training(start_request())
+        .await
+        .expect("start_training")
+        .into_inner();
+
+    // Quiesced read point #1 — post-submission, pre-claim: no worker exists in
+    // this process and the catalog is the fixture's own temp dir, so no other
+    // claimant can exist either. The wire field and the embedded catalog read
+    // must carry the identical pending marker.
+    let resp = client
+        .training_status(TrainingStatusRequest {
+            job_id: start.job_id.clone(),
+        })
+        .await
+        .expect("training_status")
+        .into_inner();
+    let embedded = server
+        .engine
+        .catalog()
+        .get_training_job(&start.job_id)
+        .await
+        .expect("get_training_job");
+    // The fixture's quiescence is itself asserted, so this test can never pass
+    // vacuously against a job that was already claimed: a claimed row's status
+    // is `running`/terminal, never `queued`.
+    assert_eq!(
+        resp.status, "queued",
+        "the quiesced fixture must leave the submitted job unclaimed — a \
+         non-`queued` status here means a claimant ran and the read below is \
+         no longer a pre-claim read"
+    );
+    assert_eq!(
+        resp.acceleration_report_json.as_deref(),
+        Some(r#"{"state":"pending"}"#),
+        "a freshly submitted job's wire acceleration_report_json must carry the \
+         explicit pending marker, never absent or empty"
+    );
+    assert_eq!(
+        resp.acceleration_report_json, embedded.acceleration_report,
+        "TrainingStatus.acceleration_report_json must BYTE-EQUAL the embedded \
+         catalog record's acceleration_report column for the SAME job"
+    );
+
+    // Release the worker: the identical `EmbeddedWorker` the `train` tier
+    // spawns, over the identical engine session the server drives. The job now
+    // runs, and its terminal state is awaited through the PUBLIC wire surface.
+    let worker = server.spawn_training_worker();
+    let terminal = poll_until_terminal(&mut client, &start.job_id).await;
+    assert_eq!(
+        terminal.status, "completed",
+        "the released worker must run the submitted job to completion, got '{}' \
+         (error: {})",
+        terminal.status, terminal.error
+    );
+
+    // Quiesced read point #2 — the job is terminal AND the worker is stopped and
+    // joined again, so nothing can write the row between the two reads below.
+    worker
+        .stop_and_join()
+        .await
+        .expect("stop the released training worker");
+    let after = client
+        .training_status(TrainingStatusRequest {
+            job_id: start.job_id.clone(),
+        })
+        .await
+        .expect("training_status")
+        .into_inner();
+    let embedded_after = server
+        .engine
+        .catalog()
+        .get_training_job(&start.job_id)
+        .await
+        .expect("get_training_job");
+    assert_eq!(
+        after.acceleration_report_json, embedded_after.acceleration_report,
+        "at the job's terminal state the wire acceleration_report_json must \
+         still BYTE-EQUAL the embedded catalog record's column"
+    );
+    assert_eq!(
+        acceleration_state(after.acceleration_report_json.as_deref()),
+        Some("determined".to_string()),
+        "a completed job's report must have moved off the pending marker to the \
+         determined state, got {:?}",
+        after.acceleration_report_json
+    );
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// NON-VACUITY CONTROL for the quiesced fixture above (#446 finding 8): under
+/// the PRODUCTION fixture — `start_engine_server`, whose `train` tier spawns and
+/// keeps an embedded worker — the submission-time `{"state":"pending"}` marker
+/// is a TRANSIENT observable, not a stable one. This test submits the same job,
+/// lets the running worker claim it, and shows that once the job is observed
+/// claimed-and-terminal the very same field no longer reads `pending`.
+///
+/// That is exactly the mutation the old assertion shape raced: a byte-exact
+/// `pending` assert placed after the submit, against a fixture with a live
+/// worker, is asserting a value the worker is concurrently overwriting. This
+/// control fails if that mutation ever stops happening — which would make the
+/// quiesced read point above pointless — so the fix cannot rot into a no-op.
+#[cfg(feature = "train")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_eagerly_running_worker_moves_the_acceleration_marker_off_pending() {
+    // The production fixture: the `train` tier's embedded worker is running and
+    // claims `queued` rows on its first tick.
     let server = start_engine_server().await;
     add_training_source(
         channel(server.addr).await,
@@ -864,35 +1003,52 @@ async fn training_status_acceleration_report_pending_state_matches_the_catalog_r
         .expect("start_training")
         .into_inner();
 
-    // Immediately post-submission, before any completion race: the wire field
-    // and the embedded catalog read must carry the identical pending marker.
-    let resp = client
-        .training_status(TrainingStatusRequest {
-            job_id: start.job_id.clone(),
-        })
-        .await
-        .expect("training_status")
-        .into_inner();
-    let embedded = server
-        .engine
-        .catalog()
-        .get_training_job(&start.job_id)
-        .await
-        .expect("get_training_job");
+    // Observe the job past the claim, at a terminal state (the one point that IS
+    // stable under a running worker).
+    let terminal = poll_until_terminal(&mut client, &start.job_id).await;
     assert_eq!(
-        resp.acceleration_report_json.as_deref(),
+        terminal.status, "completed",
+        "the eager worker must run the submitted job to completion, got '{}' \
+         (error: {})",
+        terminal.status, terminal.error
+    );
+    assert_ne!(
+        terminal.acceleration_report_json.as_deref(),
         Some(r#"{"state":"pending"}"#),
-        "a freshly submitted job's wire acceleration_report_json must carry the \
-         explicit pending marker, never absent or empty"
+        "CONTROL: a claimed-and-run job's report must NOT still read the \
+         submission-time pending marker — if it did, the pending marker would \
+         be stable and the quiesced fixture unnecessary"
     );
     assert_eq!(
-        resp.acceleration_report_json, embedded.acceleration_report,
-        "TrainingStatus.acceleration_report_json must BYTE-EQUAL the embedded \
-         catalog record's acceleration_report column for the SAME job"
+        acceleration_state(terminal.acceleration_report_json.as_deref()),
+        Some("determined".to_string()),
+        "CONTROL: the claiming worker overwrites the pending marker with the \
+         determined report, got {:?}",
+        terminal.acceleration_report_json
     );
 
     let _ = server.shutdown.send(());
     let _ = server.handle.await;
+}
+
+/// The `state` discriminant of an `acceleration_report_json` field, or `None`
+/// for the field-absent (legacy `NULL`) case. Panics on a present-but-malformed
+/// payload — a report that is not valid JSON with a string `state` is its own
+/// loud failure, never folded into "absent".
+fn acceleration_state(field: Option<&str>) -> Option<String> {
+    let raw = field?;
+    let value: serde_json::Value = serde_json::from_str(raw).unwrap_or_else(|e| {
+        panic!("acceleration_report_json is not valid JSON: {e} (raw={raw:?})")
+    });
+    Some(
+        value
+            .get("state")
+            .and_then(|s| s.as_str())
+            .unwrap_or_else(|| {
+                panic!("acceleration_report_json carries no string `state`: {value}")
+            })
+            .to_string(),
+    )
 }
 
 /// K4 (esc-075), the determined-state and legacy-NULL halves: a claiming
@@ -998,18 +1154,15 @@ async fn remote_caller_distinguishes_acceleration_report_tri_state_purely_from_t
     }
 
     /// Classify purely off the wire response — no catalog / engine access.
+    /// Reads the `state` discriminant through the one shared
+    /// [`acceleration_state`] decoder, so this control and the pending/terminal
+    /// assertions above cannot drift into two different notions of "the state".
     fn classify(field: Option<&str>) -> AccelerationState {
-        match field {
+        match acceleration_state(field).as_deref() {
             None => AccelerationState::LegacyUnknown,
-            Some(raw) => {
-                let value: serde_json::Value =
-                    serde_json::from_str(raw).expect("acceleration_report_json is valid JSON");
-                match value.get("state").and_then(|s| s.as_str()) {
-                    Some("pending") => AccelerationState::Pending,
-                    Some("determined") => AccelerationState::Determined,
-                    other => panic!("unrecognized acceleration_report state: {other:?}"),
-                }
-            }
+            Some("pending") => AccelerationState::Pending,
+            Some("determined") => AccelerationState::Determined,
+            other => panic!("unrecognized acceleration_report state: {other:?}"),
         }
     }
 
@@ -1086,6 +1239,599 @@ async fn remote_caller_distinguishes_acceleration_report_tri_state_purely_from_t
     assert_eq!(
         classify(read(&mut client, "acc-vis-determined").await.as_deref()),
         AccelerationState::Determined
+    );
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+// ---------------------------------------------------------------------------
+// GAP-A-2 (#446): `[training] run_worker` — whether THIS process claims.
+//
+// The `train` tier mounts `TrainingService` unconditionally; whether the same
+// process ALSO runs the claim loop is a configuration key, not a second code
+// path and not a build feature. The three tests below drive that key through
+// the real `jammi.toml` → `JammiConfig::load` path the binary uses (the
+// `start_engine_server_with_run_worker` fixture), never through
+// `ChainParts::train_worker` — the seam a downstream owns, which would prove
+// only that stopping a worker stops it.
+// ---------------------------------------------------------------------------
+
+/// Read `TrainingStatus` over the wire and the SAME job's catalog record in
+/// process, returning both. The K4 cross-transport pair: whatever the remote
+/// surface reports for the acceleration marker must byte-equal the embedded
+/// read of the identical row.
+#[cfg(feature = "train")]
+async fn wire_and_embedded(
+    client: &mut TrainingServiceClient<Channel>,
+    server: &EngineServer,
+    job_id: &str,
+) -> (
+    jammi_server::grpc::proto::training::TrainingStatusResponse,
+    jammi_db::catalog::training_repo::TrainingJobRecord,
+) {
+    let wire = client
+        .training_status(TrainingStatusRequest {
+            job_id: job_id.to_string(),
+        })
+        .await
+        .expect("training_status")
+        .into_inner();
+    let embedded = server
+        .engine
+        .catalog()
+        .get_training_job(job_id)
+        .await
+        .expect("get_training_job");
+    (wire, embedded)
+}
+
+/// THE BINDING ORACLE for `run_worker = false`: a server whose `train` tier is
+/// mounted from a `jammi.toml` carrying `run_worker = false` accepts a
+/// submission over `TrainingService` and then never claims it — the job's
+/// `queued` status and its byte-exact `{"state":"pending"}` acceleration marker
+/// are STABLE, not merely observed once.
+///
+/// Stability is what makes this an oracle rather than a lucky read. The polls
+/// span strictly MORE than the config's own `idle_poll_secs` (the interval at
+/// which a claim loop, if one existed in this process, would tick and claim a
+/// `queued` row — its first tick has no initial sleep at all), so a spawned
+/// worker could not hide inside the observation window. Both fields are
+/// re-asserted at EVERY poll, so a claim landing at any point in the span fails
+/// the test.
+///
+/// Cross-transport (K4) at every poll: the remotely-read
+/// `acceleration_report_json` byte-equals the embedded catalog read of the same
+/// row, and the two surfaces agree on the status. A pending marker that the wire
+/// reported but the embedded read did not (or vice versa) is a divergence even
+/// while the value itself is "right".
+///
+/// The control that this is caused by the KNOB and not by a server that never
+/// runs anything is
+/// `train_tier_with_run_worker_true_lets_the_submitted_job_leave_queued`, which
+/// runs the identical body against the identical fixture with the key flipped.
+#[cfg(feature = "train")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn train_tier_with_run_worker_false_leaves_the_job_queued_and_pending_stable() {
+    let server = start_engine_server_with_run_worker(false).await;
+    add_training_source(
+        channel(server.addr).await,
+        None::<fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>>,
+    )
+    .await;
+    let mut client = TrainingServiceClient::new(channel(server.addr).await);
+
+    // The submission surface is unaffected by the key: `TrainingService` is
+    // mounted and `StartTraining` succeeds exactly as it does with a worker.
+    let start = client
+        .start_training(start_request())
+        .await
+        .expect(
+            "start_training must succeed with run_worker = false — the \
+                 train tier still MOUNTS TrainingService; only claiming is off",
+        )
+        .into_inner();
+    assert!(
+        !start.job_id.is_empty(),
+        "StartTraining returns a job id regardless of run_worker"
+    );
+
+    // Span strictly more than one idle poll interval, read off the server's OWN
+    // config so the window follows the knob's timing rather than a magic number.
+    let idle_poll =
+        Duration::from_secs(server.engine.inner_config().training.idle_poll_secs.max(1));
+    const POLLS: u32 = 6;
+    let step = (idle_poll * 2) / POLLS;
+    let began = std::time::Instant::now();
+
+    for poll in 0..POLLS {
+        let (wire, embedded) = wire_and_embedded(&mut client, &server, &start.job_id).await;
+        assert_eq!(
+            wire.status, "queued",
+            "poll {poll}: with run_worker = false NOTHING in this process may \
+             claim the job — it must still read `queued`"
+        );
+        assert_eq!(
+            embedded.status, "queued",
+            "poll {poll}: the embedded catalog read must agree the job is still \
+             queued"
+        );
+        assert_eq!(
+            embedded.claimed_by, None,
+            "poll {poll}: an unclaimed job carries no claimant — a `claimed_by` \
+             here means a claim loop ran despite run_worker = false"
+        );
+        assert_eq!(
+            wire.acceleration_report_json.as_deref(),
+            Some(r#"{"state":"pending"}"#),
+            "poll {poll}: the submission-time acceleration marker must be STABLE \
+             byte-for-byte under run_worker = false"
+        );
+        assert_eq!(
+            wire.acceleration_report_json, embedded.acceleration_report,
+            "poll {poll}: K4 — the remotely-read acceleration_report_json must \
+             BYTE-EQUAL the embedded catalog read of the same row"
+        );
+        if poll + 1 < POLLS {
+            tokio::time::sleep(step).await;
+        }
+    }
+
+    assert!(
+        began.elapsed() > idle_poll,
+        "the observation window ({:?}) must exceed one idle_poll_secs ({idle_poll:?}) — \
+         otherwise a claim loop could have been hiding between the polls",
+        began.elapsed()
+    );
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// THE CONTROL for the oracle above: the same fixture, the same submission, the
+/// same tier set — with `run_worker = true` (the default) in the `jammi.toml`.
+/// The job LEAVES `queued`.
+///
+/// Without this, the stable-`queued` assertion above would pass just as well
+/// against a server that could never run anything at all (a broken train tier, a
+/// wedged catalog), so it proves the knob is the cause. It also pins the default
+/// direction: an unconfigured deployment is a whole one.
+///
+/// Deliberately NO per-poll wire↔embedded parity assertion here, unlike the
+/// `run_worker = false` oracle: with a live claimant the row is being mutated
+/// between the two reads, so a per-poll byte-equality would be asserting against
+/// a moving target (exactly the TOCTOU the quiesced fixture exists to remove).
+/// The cross-transport leg is asserted at the job's TERMINAL state instead —
+/// `completed`/`failed` is absorbing, so a wire read of it cannot be overtaken
+/// by the embedded read that follows.
+#[cfg(feature = "train")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn train_tier_with_run_worker_true_lets_the_submitted_job_leave_queued() {
+    let server = start_engine_server_with_run_worker(true).await;
+    add_training_source(
+        channel(server.addr).await,
+        None::<fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>>,
+    )
+    .await;
+    let mut client = TrainingServiceClient::new(channel(server.addr).await);
+
+    let start = client
+        .start_training(start_request())
+        .await
+        .expect("start_training")
+        .into_inner();
+
+    // Bounded well past the window the run_worker = false test held the job
+    // `queued` across, so "left queued" here is a real difference in behaviour
+    // and not a difference in patience.
+    let mut left_queued = None;
+    for _ in 0..600 {
+        let wire = client
+            .training_status(TrainingStatusRequest {
+                job_id: start.job_id.clone(),
+            })
+            .await
+            .expect("training_status")
+            .into_inner();
+        if wire.status != "queued" {
+            left_queued = Some(wire);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let observed = left_queued.expect(
+        "CONTROL: with run_worker = true the train tier's worker must claim the \
+         submitted job — it never left `queued`, which would make the \
+         run_worker = false oracle vacuous",
+    );
+    assert_ne!(
+        observed.status, "queued",
+        "the claimed job has left the queue"
+    );
+
+    // Cross-transport at the one point that is stable under a live worker: the
+    // terminal state. `completed` is absorbing, so the embedded read taken after
+    // the wire read cannot have moved on to something else.
+    let terminal = poll_until_terminal(&mut client, &start.job_id).await;
+    assert_eq!(
+        terminal.status, "completed",
+        "the claimed job runs to completion, got '{}' (error: {})",
+        terminal.status, terminal.error
+    );
+    let embedded = server
+        .engine
+        .catalog()
+        .get_training_job(&start.job_id)
+        .await
+        .expect("get_training_job");
+    assert_eq!(
+        terminal.status, embedded.status,
+        "K4: at the terminal state the remote status and the embedded catalog \
+         status must agree for the same job"
+    );
+    assert_ne!(
+        terminal.acceleration_report_json.as_deref(),
+        Some(r#"{"state":"pending"}"#),
+        "CONTROL: a claimed-and-run job's marker must have moved off the \
+         submission-time pending value — that mutation is precisely what \
+         run_worker = false suppresses"
+    );
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// Shutting a `run_worker = false` server down must not await a worker that was
+/// never started: no hang, no panic.
+///
+/// `assemble_grpc_chain` leaves `AssembledChain`'s worker slot `None` in this
+/// configuration, so the serve loop's teardown has nothing extra to drop or
+/// join. The bound below is what makes the assertion an assertion — a teardown
+/// that waited on a never-spawned worker would sit here until the timeout
+/// rather than returning, and the serve task's join result is unwrapped so a
+/// panic inside the drop path surfaces as a failure instead of a silent
+/// `JoinError`.
+///
+/// A job is submitted first, so the queue is non-empty at shutdown: the
+/// "nothing to wait for" property must hold with work outstanding, which is the
+/// state a `run_worker = false` process is normally in.
+#[cfg(feature = "train")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_worker_false_shutdown_does_not_await_a_worker_that_never_started() {
+    let server = start_engine_server_with_run_worker(false).await;
+    add_training_source(
+        channel(server.addr).await,
+        None::<fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>>,
+    )
+    .await;
+    let mut client = TrainingServiceClient::new(channel(server.addr).await);
+
+    let start = client
+        .start_training(start_request())
+        .await
+        .expect("start_training")
+        .into_inner();
+    let (wire, _) = wire_and_embedded(&mut client, &server, &start.job_id).await;
+    assert_eq!(
+        wire.status, "queued",
+        "the job is outstanding at shutdown — that is the state this teardown \
+         must handle"
+    );
+    // Drop the client (and its channel) so the graceful drain has no live
+    // connection to wait on; what remains is the worker slot, which is `None`.
+    drop(client);
+
+    let _ = server.shutdown.send(());
+    let joined = tokio::time::timeout(Duration::from_secs(30), server.handle)
+        .await
+        .expect(
+            "shutdown with run_worker = false must not hang — nothing spawned a \
+             worker, so teardown has no worker to await",
+        );
+    joined.expect("the serve task must end cleanly, not by panicking, when no worker was spawned");
+}
+
+// ---------------------------------------------------------------------------
+// `TrainingStatus.model_id` ⇄ the embedded attach handle (K4, #446).
+//
+// The divergence these close: attaching to a job by id, the EMBEDDED handle
+// reports the deterministic output model id re-derived from the persisted row
+// (the engine's naming rule), while the remote handle read `""` because
+// `TrainingStatus` relayed the catalog's `output_model_id` column, which is
+// stamped only at completion. Both surfaces now resolve through the ONE engine
+// function, so the pre-completion states — the divergence-prone ones, not the
+// terminal happy path — carry a byte-identical id on both transports.
+//
+// The embedded-arm oracle in each test is
+// `jammi_ai::fine_tune::training_job::resolve_model_id` applied to the embedded
+// catalog read of the SAME row: exactly the call (and the value) the embedded
+// attach handle reports. It is triangulated against the id `StartTraining`
+// itself returned — the value the in-process submit handle carries — so the
+// assertion cannot pass by both sides sharing one wrong answer.
+// ---------------------------------------------------------------------------
+
+/// The id an ATTACHED embedded handle would report for this job: the engine's
+/// own resolution over the embedded catalog read of the same row.
+async fn embedded_attach_model_id(server: &EngineServer, job_id: &str) -> String {
+    let record = server
+        .engine
+        .catalog()
+        .get_training_job(job_id)
+        .await
+        .expect("get_training_job");
+    jammi_ai::fine_tune::training_job::resolve_model_id(job_id, &record)
+        .expect("the embedded arm resolves this job's model id")
+}
+
+/// K4: a `fine_tune` job that has NOT completed reports the same `model_id`
+/// over the wire that the embedded attach handle derives — byte-for-byte, at
+/// the pre-completion state, which is precisely where the two surfaces diverged
+/// (`""` remotely vs the derived id in process).
+///
+/// The read point is quiesced by construction (the fixture's worker is stopped
+/// AND joined before it returns), so `queued` here is a state nothing can move
+/// underneath the two reads — the same discipline the acceleration-marker
+/// parity tests use.
+///
+/// Non-vacuity is asserted three ways: the wire status really is `queued` (a
+/// pre-completion read, not a terminal one), the catalog column really is
+/// unstamped (`output_model_id IS NULL` — so the wire value is DERIVED, not
+/// relayed), and the value equals the non-empty id `StartTraining` returned.
+///
+/// The terminal leg is then re-asserted after the worker is released: at
+/// `completed` the wire id must still equal both the catalog's now-stamped
+/// column and the submit-time id, so closing the pre-completion gap does not
+/// disturb the state that already agreed.
+#[cfg(feature = "train")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn training_status_model_id_matches_the_embedded_derived_id_before_completion() {
+    let server = start_engine_server_worker_quiesced().await;
+    add_training_source(
+        channel(server.addr).await,
+        None::<fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>>,
+    )
+    .await;
+    let mut client = TrainingServiceClient::new(channel(server.addr).await);
+
+    let start = client
+        .start_training(start_request())
+        .await
+        .expect("start_training")
+        .into_inner();
+    assert!(
+        !start.model_id.is_empty(),
+        "StartTraining returns the deterministic output model id — the value the \
+         embedded submit handle carries"
+    );
+
+    // Quiesced read point: post-submission, pre-claim.
+    let (wire, embedded) = wire_and_embedded(&mut client, &server, &start.job_id).await;
+    assert_eq!(
+        wire.status, "queued",
+        "the quiesced fixture must leave the job unclaimed — a non-`queued` \
+         status means this is no longer a pre-completion read"
+    );
+    assert_eq!(
+        embedded.output_model_id, None,
+        "the catalog has NOT stamped output_model_id before completion — without \
+         this the wire value below could be a plain column relay and the test \
+         would prove nothing"
+    );
+    assert_eq!(
+        wire.model_id,
+        embedded_attach_model_id(&server, &start.job_id).await,
+        "K4: TrainingStatus.model_id must BYTE-EQUAL the id the embedded attach \
+         handle derives for the same job at the same pre-completion state"
+    );
+    assert_eq!(
+        wire.model_id, start.model_id,
+        "the pre-completion wire id is the SAME deterministic id StartTraining \
+         returned at submit time"
+    );
+
+    // Release the worker and re-assert at the terminal state: the leg that
+    // already agreed must stay green.
+    let worker = server.spawn_training_worker();
+    let terminal = poll_until_terminal(&mut client, &start.job_id).await;
+    assert_eq!(
+        terminal.status, "completed",
+        "the released worker must run the job to completion, got '{}' (error: {})",
+        terminal.status, terminal.error
+    );
+    worker
+        .stop_and_join()
+        .await
+        .expect("stop the released training worker");
+
+    let (after, embedded_after) = wire_and_embedded(&mut client, &server, &start.job_id).await;
+    assert_eq!(
+        embedded_after.output_model_id.as_deref(),
+        Some(after.model_id.as_str()),
+        "at completion the wire id is the catalog's stamped output_model_id"
+    );
+    assert_eq!(
+        after.model_id, start.model_id,
+        "a completed job's wire id is still the submit-time id — the terminal \
+         parity is unchanged by the pre-completion fix"
+    );
+    assert_eq!(
+        after.model_id,
+        embedded_attach_model_id(&server, &start.job_id).await,
+        "K4 at the terminal state: the wire id and the embedded attach id agree"
+    );
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// K4 across the REST of the lifecycle: a `running` row and a `failed` row —
+/// neither of which ever stamps `output_model_id` — report the embedded attach
+/// handle's derived id over the wire, not the empty string.
+///
+/// A `failed` job is the sharp case: it is TERMINAL yet has no stamped column,
+/// so a "populated once terminal" reading of the old contract would still leave
+/// it empty on the wire while the embedded handle names the model the job would
+/// have produced.
+///
+/// The rows are seeded directly (never passing through `queued`), so they are
+/// race-free against the fixture's own running worker, which claims exclusively
+/// `WHERE status = 'queued'`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn training_status_model_id_is_derived_for_running_and_failed_rows() {
+    let server = start_engine_server().await;
+    let catalog = server.engine.catalog();
+    register_acceleration_test_model(catalog, "model-id-base").await;
+
+    seed_training_job_row(
+        catalog,
+        "model-id-running",
+        "model-id-base::1",
+        "running",
+        Some("model-id-worker"),
+        1,
+        Some(r#"{"state":"pending"}"#),
+    )
+    .await;
+    seed_training_job_row(
+        catalog,
+        "model-id-failed",
+        "model-id-base::1",
+        "failed",
+        None,
+        1,
+        None,
+    )
+    .await;
+
+    let mut client = TrainingServiceClient::new(channel(server.addr).await);
+
+    for (job_id, status) in [
+        ("model-id-running", "running"),
+        ("model-id-failed", "failed"),
+    ] {
+        let resp = client
+            .training_status(TrainingStatusRequest {
+                job_id: job_id.to_string(),
+            })
+            .await
+            .expect("training_status")
+            .into_inner();
+        let embedded = catalog
+            .get_training_job(job_id)
+            .await
+            .expect("get_training_job");
+        assert_eq!(
+            resp.status, status,
+            "the seeded row must be read back in the state it was seeded in"
+        );
+        assert_eq!(
+            embedded.output_model_id, None,
+            "'{job_id}' has no stamped output_model_id — the wire value below is \
+             a derivation, not a relay"
+        );
+        assert_eq!(
+            resp.model_id,
+            embedded_attach_model_id(&server, job_id).await,
+            "K4: a '{status}' job's TrainingStatus.model_id must BYTE-EQUAL the \
+             embedded attach handle's derived id"
+        );
+        assert!(
+            !resp.model_id.is_empty(),
+            "a '{status}' job names the model it produces (or would have \
+             produced); the empty string was the divergence"
+        );
+    }
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// K4 for the OTHER derivation arm: a `context_predictor` job's model id is
+/// caller-chosen (it rides inside the persisted `training_spec`), NOT derivable
+/// from the job id, so the pre-completion wire read must decode the persisted
+/// spec exactly as the embedded attach does. A handler that assumed the
+/// fine-tune format would pass the fine-tune tests above and be wrong here.
+///
+/// Tenant-scoped throughout — the predictor's source and embedding table are
+/// stamped `tenant_id = A`, so both the submit and the embedded record read run
+/// inside A's scope.
+#[cfg(feature = "train")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn training_status_model_id_decodes_the_predictor_spec_before_completion() {
+    use jammi_server::grpc::proto::catalog::catalog_service_client::CatalogServiceClient;
+    use jammi_server::grpc::proto::catalog::{SetTenantRequest, Tenant};
+
+    let server = start_engine_server_worker_quiesced().await;
+    seed_predictor_dataset_under_tenant_a(&server).await;
+
+    let session_iface = with_session("predictor-model-id-tenant-a");
+    let mut session_client =
+        CatalogServiceClient::with_interceptor(channel(server.addr).await, session_iface.clone());
+    session_client
+        .set_tenant(SetTenantRequest {
+            tenant: Some(Tenant {
+                id: TENANT_A.into(),
+            }),
+        })
+        .await
+        .expect("set_tenant");
+    let mut client =
+        TrainingServiceClient::with_interceptor(channel(server.addr).await, session_iface);
+
+    let start = client
+        .start_training(predictor_start_request())
+        .await
+        .expect("start_training(context_predictor) under tenant scope")
+        .into_inner();
+    assert_eq!(
+        start.model_id, "ctx-predictor-wire",
+        "the predictor's model id is the caller-chosen id inside its spec"
+    );
+
+    let resp = client
+        .training_status(TrainingStatusRequest {
+            job_id: start.job_id.clone(),
+        })
+        .await
+        .expect("training_status")
+        .into_inner();
+    assert_eq!(
+        resp.status, "queued",
+        "the quiesced fixture must leave the predictor job unclaimed — this is a \
+         pre-completion read"
+    );
+
+    // The embedded arm's own answer, resolved inside tenant A's scope (the job
+    // row is stamped to A).
+    let (embedded_record, embedded_model_id) = server
+        .engine
+        .with_tenant_scoped(tenant_a(), |_scope| async {
+            let record = server
+                .engine
+                .catalog()
+                .get_training_job(&start.job_id)
+                .await
+                .expect("get_training_job under tenant A");
+            let model_id =
+                jammi_ai::fine_tune::training_job::resolve_model_id(&start.job_id, &record)
+                    .expect("the embedded arm resolves the predictor job's model id");
+            (record, model_id)
+        })
+        .await;
+    assert_eq!(
+        embedded_record.output_model_id, None,
+        "the predictor row has not stamped output_model_id before completion"
+    );
+    assert_eq!(
+        resp.model_id, embedded_model_id,
+        "K4: the predictor job's wire model_id must BYTE-EQUAL the id the \
+         embedded attach handle decodes out of the persisted training_spec"
+    );
+    assert_eq!(
+        resp.model_id, "ctx-predictor-wire",
+        "and that id is the caller-chosen one, never a jammi:fine-tuned: id \
+         derived from the job id"
     );
 
     let _ = server.shutdown.send(());

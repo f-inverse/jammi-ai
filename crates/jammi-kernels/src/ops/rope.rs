@@ -56,8 +56,9 @@
 //! `cos`/`sin`'s literal shape — could in principle let the op walk a
 //! transposed layout's strides directly and remove that copy; not done
 //! here (this commit's scope is the rotate-half math, not a strided
-//! index walk on top of it — see `layout_walk.rs`'s `Axpy`-only precedent
-//! for why that is a deliberate, separate design decision).
+//! index walk on top of it — `layout_walk.rs`'s `StridedOffsets` exists
+//! for exactly that, and the ops that use it do so on their CPU arms only;
+//! adopting it here is a deliberate, separate design decision).
 //!
 //! ## `bwd`: RoPE with the sign of `sin` flipped
 //!
@@ -87,7 +88,7 @@
 //! time) and computes a REAL gradient — via ordinary `Tensor` composition,
 //! not a further fused kernel, since this path is provably dead in every
 //! call site today (the same "correctness over micro-optimization" choice
-//! `Axpy::bwd` documents) — rather than hardcoding `None` forever and
+//! `ops`'s module doc documents) — rather than hardcoding `None` forever and
 //! risking the exact silent-missing-gradient landmine `LayerNormFused`'s
 //! doc warns a hardcoded `dgamma_needed = false` would have been.
 //! `track_op()`, NOT `is_variable()` alone: an earlier version of this
@@ -374,8 +375,8 @@ impl CustomOp3 for RopeFused {
     }
 
     /// `dx` is ALWAYS `Some` (same rule as `LayerNormFused`'s `dx` slot —
-    /// `x` may be an intermediate on a path to a `Var`, see `Axpy`'s doc on
-    /// this exact hazard) — computed by reusing THIS op with `sin`
+    /// `x` may be an intermediate on a path to a `Var`, see `ops`'s module
+    /// doc on this exact hazard) — computed by reusing THIS op with `sin`
     /// negated (module doc). `dcos`/`dsin` check `track_op()` (NOT
     /// `is_variable()` alone — module doc's "`bwd`: RoPE with the sign of
     /// `sin` flipped" section explains why the narrower check is a real
@@ -875,7 +876,7 @@ mod tests {
 
     /// Chain-rule oracle: `x` is an INTERMEDIATE (`w.affine(2, 0)`) on a
     /// path to a `Var` — `is_variable() == false`, exactly the case
-    /// `Axpy`'s own regression test exercises. `dx`'s slot must still be
+    /// `ops`'s module doc names as the shared hazard. `dx`'s slot must still be
     /// populated and correctly chain through the `affine`.
     #[test]
     fn bwd_chains_through_an_intermediate_non_variable_x() {

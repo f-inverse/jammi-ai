@@ -42,6 +42,33 @@ def _scratch_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *_GIT_NO_BACKGROUND_MAINTENANCE, *args], cwd=cwd, check=True)
 
 
+# A minimal, CORRECTLY wired stand-in for `.github/workflows/cookbook-book.yml`:
+# selector first, `build-server` bound to that selector's output, render step
+# putting `target/release` on PATH. Synthetic on purpose — a fixture that read
+# the real workflow would stop proving anything the day the real workflow's
+# shape changed, the same reason `select_render_chapters.py`'s own self-test
+# never reads the real book. Each RED-proof below mutates exactly one of the
+# three facts and asserts the checker reddens naming that one.
+WELL_WIRED_BOOK_WORKFLOW = """name: book
+jobs:
+  book:
+    steps:
+      - name: Select the chapters this diff must render
+        id: select
+        run: |
+          echo "needs_server=true" >> "$GITHUB_OUTPUT"
+      - name: Build + install the HEAD wheels
+        uses: ./.github/actions/setup-jammi-py
+        with:
+          mode: wheel
+          build-server: ${{ steps.select.outputs.needs_server }}
+      - name: Render this diff's selected chapters
+        run: |
+          export PATH="$GITHUB_WORKSPACE/target/release:$PATH"
+          quarto render
+"""
+
+
 class GuardWiringFixture(unittest.TestCase):
     """Base class: builds an isolated throwaway repo per test and patches
     the module's path constants onto it. `_run_main` drives the REAL `main()`
@@ -69,6 +96,16 @@ class GuardWiringFixture(unittest.TestCase):
         cgw.WORKFLOWS_DIR = self.root / ".github" / "workflows"
         cgw.ALLOWLIST_PATH = cgw.SCRIPTS_DIR / "ci_guard_wiring_allowlist.txt"
         self.addCleanup(self._restore)
+
+        # `main()` also asserts the Book gate's provisioning wiring, and it
+        # treats a MISSING `cookbook-book.yml` as a violation rather than as
+        # a skip (fail-closed: a gate that passes when its subject disappears
+        # is the fail-open shape the checker exists to close). So every
+        # fixture starts from a WELL-WIRED copy — the tests below that care
+        # about that property mutate it, and the tests that do not are
+        # isolated from it exactly as they are from this repo's real gate
+        # inventory.
+        self._write(".github/workflows/cookbook-book.yml", WELL_WIRED_BOOK_WORKFLOW)
 
     def _restore(self):
         for k, v in self._orig.items():
@@ -336,6 +373,130 @@ class NoGitCheckoutSurfacesLoudly(GuardWiringFixture):
         # deliberately no self._git_add_all() here
         suites = {p.name for p in cgw.tracked_test_suites()}
         self.assertNotIn("test_untracked.py", suites)
+
+
+class BookProvisioningWiringTests(GuardWiringFixture):
+    """RED-proofs for the second property: the Book gate's step ORDER and its
+    input BINDINGS, each broken one at a time on a temp copy of the workflow.
+
+    Every case drives the real `main()` and asserts BOTH the exit code and
+    that the finding names the fact that was broken — a checker that reddens
+    for some other reason would pass an exit-code-only assertion while
+    proving nothing about the pin under test.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # `main()` refuses a repo with NO gate scripts at all before it ever
+        # reaches the Book pins, so without this every case below would exit
+        # 1 for the wrong reason — the RED assertions would pass on the
+        # empty-inventory message and prove nothing. One wired gate script,
+        # in a SEPARATE workflow file so `cookbook-book.yml` stays exactly the
+        # shape under test (and so the deletion case below still has a wired
+        # script to find).
+        self._write("ci/scripts/check_present.py", "print('gate')\n")
+        self._write(
+            ".github/workflows/guard.yml",
+            "name: guard\njobs:\n  guard:\n    steps:\n"
+            "      - run: python3 ci/scripts/check_present.py\n",
+        )
+        self._git_add_all()
+
+    def _mutate_book(self, old: str, new: str):
+        path = self.root / ".github/workflows/cookbook-book.yml"
+        text = path.read_text()
+        assert text.count(old) == 1, f"fixture drift: {old!r} appears {text.count(old)}x"
+        path.write_text(text.replace(old, new))
+        self._git_add_all()
+
+    def test_well_wired_workflow_passes(self):
+        """The GREEN control. Without it, every RED below could be reddening
+        on the fixture rather than on the mutation."""
+        self._git_add_all()
+        code, out, err = self._run_main()
+        self.assertEqual(code, 0, f"stdout={out!r} stderr={err!r}")
+        self.assertIn("cookbook-book.yml provisioning]: OK", out)
+
+    def test_selector_after_the_wheel_build_is_red(self):
+        """The order fact: a selector that runs after the build cannot tell
+        the build whether to produce a server."""
+        path = self.root / ".github/workflows/cookbook-book.yml"
+        lines = path.read_text().splitlines(keepends=True)
+        # Located by CONTENT, not by a hardcoded index: a fixture edit that
+        # shifted the step would otherwise silently turn this into a test of
+        # some other mutation.
+        start = next(i for i, l in enumerate(lines) if l.lstrip().startswith("- name: Select"))
+        end = next(i for i, l in enumerate(lines) if l.lstrip().startswith("- name: Build"))
+        select_step = lines[start:end]
+        self.assertIn("        id: select\n", select_step)
+        path.write_text("".join(lines[:start] + lines[end:] + select_step))
+        self._git_add_all()
+
+        code, out, err = self._run_main()
+
+        self.assertEqual(code, 1, f"stdout={out!r} stderr={err!r}")
+        self.assertIn("runs AFTER setup-jammi-py", err)
+
+    def test_build_server_hardcoded_false_is_red(self):
+        """The binding fact, in its most dangerous direction: a literal
+        `false` still LOOKS wired and silently drops every grpc:// chapter's
+        proof."""
+        self._mutate_book(
+            "build-server: ${{ steps.select.outputs.needs_server }}",
+            "build-server: false",
+        )
+        code, out, err = self._run_main()
+        self.assertEqual(code, 1, f"stdout={out!r} stderr={err!r}")
+        self.assertIn("build-server:", err)
+        self.assertIn("steps.select.outputs.needs_server", err)
+
+    def test_build_server_bound_to_a_different_step_output_is_red(self):
+        """A near miss the pin must still catch: bound to an output, but not
+        to the SELECTOR's — the flag stops tracking the selected set."""
+        self._mutate_book(
+            "build-server: ${{ steps.select.outputs.needs_server }}",
+            "build-server: ${{ steps.other.outputs.needs_server }}",
+        )
+        code, out, err = self._run_main()
+        self.assertEqual(code, 1, f"stdout={out!r} stderr={err!r}")
+        self.assertIn("steps.select.outputs.needs_server", err)
+
+    def test_missing_target_release_on_path_is_red(self):
+        """The reachability fact: a `jammi-server` built into
+        `target/release` and never put on PATH was not built."""
+        self._mutate_book(
+            'export PATH="$GITHUB_WORKSPACE/target/release:$PATH"',
+            'export PATH="$GITHUB_WORKSPACE/target/debug:$PATH"',
+        )
+        code, out, err = self._run_main()
+        self.assertEqual(code, 1, f"stdout={out!r} stderr={err!r}")
+        self.assertIn("target/release", err)
+        self.assertIn("PATH", err)
+
+    def test_wiring_described_only_in_a_comment_does_not_satisfy_the_pins(self):
+        """THE fail-open this check exists to refuse, and the reason it is a
+        comment-STRIPPED scan rather than a raw-text one: the real workflow
+        already carries a comment saying `target/release` goes on PATH. If
+        prose could satisfy a pin, this gate would assert that somebody once
+        DESCRIBED the wiring — exactly the discipline-only state it replaces.
+        """
+        self._mutate_book(
+            '          export PATH="$GITHUB_WORKSPACE/target/release:$PATH"\n',
+            '          # export PATH="$GITHUB_WORKSPACE/target/release:$PATH" goes here\n',
+        )
+        code, out, err = self._run_main()
+        self.assertEqual(code, 1, f"stdout={out!r} stderr={err!r}")
+        self.assertIn("target/release", err)
+
+    def test_missing_workflow_file_is_red_not_skipped(self):
+        """Fail-closed on absence. A gate that passes when its subject is
+        deleted or renamed enforces nothing."""
+        (self.root / ".github/workflows/cookbook-book.yml").unlink()
+        self._git_add_all()
+        code, out, err = self._run_main()
+        self.assertEqual(code, 1, f"stdout={out!r} stderr={err!r}")
+        self.assertIn("is missing from", err)
+        self.assertIn("BOOK_WORKFLOW_NAME", err)
 
 
 if __name__ == "__main__":

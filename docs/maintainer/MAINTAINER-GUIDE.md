@@ -302,7 +302,7 @@ RPCs (it also covers module functions `open_local`/`connect`, the pure-Python
 | `CatalogService` | `ListModels`/`DescribeModel`/`DeleteModel` | `grpc/catalog.rs` |
 | `CatalogService` | `RegisterChannel`/`AddChannelColumns`/`ListChannels` | `grpc/catalog.rs` |
 | `CatalogService` | `VerifyMaterialization` | `grpc/catalog.rs` (`CatalogService::verify_materialization`) |
-| `CatalogService` | `Staleness`/`DerivesFrom` | `grpc/catalog.rs` |
+| `CatalogService` | `Staleness`/`DerivesFrom`/`ListIndexSegments` | `grpc/catalog.rs` |
 | `CatalogService` | `CreateMutableTable`/`DropMutableTable`/`ListMutableTables` | `grpc/catalog.rs` |
 | `CatalogService` | `RegisterTopic`/`DropTopic`/`ListTopics` | `grpc/catalog.rs` |
 | `EmbeddingService` | `GenerateEmbeddings`/`EncodeQuery`/`Search` | `grpc/embedding.rs` |
@@ -488,22 +488,45 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
 
 - **`Jammi::open(target) -> Result<Session>`** — `crates/jammi-ai/src/jammi.rs`
   (`Jammi::open`). Pure constructor: `Target::Local(config)` →
-  `InferenceSession::open(config)` → `Session::with_embedded_worker(engine)`. `Target`
+  `InferenceSession::open(config)` → `Session::with_configured_worker(engine)`
+  (`with_configured_worker` (`crates/jammi-ai/src/local_session.rs:156`)) — the
+  worker is spawned only when the loaded config's `[training] run_worker` is
+  `true` (default `true`); **not** the unconditional `with_embedded_worker`
+  form. This is the SAME key the server `train` tier and the Python embedded
+  arm read before deciding whether THEIR process claims —
+  `training.run_worker` (`crates/jammi-server/src/runtime.rs:1020`) and
+  `training.run_worker` (`crates/jammi-python/src/database.rs:98`) — so a wire
+  deployment and an in-process one answer "does THIS process claim?"
+  identically rather than by three private conventions. `Target`
   is **Local-only** (`crates/jammi-ai/src/jammi.rs`, the `Target` enum); remote is
   reached through `jammi-client`'s `DataClient`, *not* this front door [§7].
 - **`Session`** — `crates/jammi-ai/src/local_session.rs` (the `Session` struct). A
   thin `Arc<InferenceSession>` wrapper (re-exported as `crate::Session`,
-  `crates/jammi-ai/src/lib.rs`). Two constructors with a load-bearing distinction:
+  `crates/jammi-ai/src/lib.rs`). Three constructors with a load-bearing distinction:
+  - `Session::with_configured_worker(engine) -> Result<Self>`
+    (`with_configured_worker` (`crates/jammi-ai/src/local_session.rs:156`)):
+    the **front-door** form (`Jammi::open` threads to this one, not to
+    `with_embedded_worker`). Reads `TrainingConfig::run_worker` (default
+    `true`) off `engine`'s loaded config: `true` spawns the worker
+    (`Some(worker)`, RAII; stops on drop) by calling into
+    `with_embedded_worker` below; `false` spawns nothing and the session
+    carries `None`, same as `Session::new`. Must run inside a tokio runtime
+    when a worker is spawned. Returns `JammiError::Config` if `[training]`
+    timing violates worker invariants.
   - `Session::with_embedded_worker(engine) -> Result<Self>`
-    (`crates/jammi-ai/src/local_session.rs`): the **front-door** form — carries
-    `Some(worker)`, spawns the training worker (RAII; stops on drop). Must run
-    inside a tokio runtime. Returns `JammiError::Config` if `[training]` timing
-    violates worker invariants.
+    (`with_embedded_worker` (`crates/jammi-ai/src/local_session.rs:120`)):
+    the **explicit, spawn-regardless** form — carries `Some(worker)`
+    **unconditionally**, whatever `[training] run_worker` says. For a caller
+    that owns the claim decision itself out of band (test harnesses that must
+    have a claimant); the front door does not call this directly. Same
+    runtime/`Config`-error contract as `with_configured_worker`.
   - `Session::new(engine) -> Self` (`crates/jammi-ai/src/local_session.rs`):
     carries `None` — used by **every per-request wrapper** (gRPC handlers, Python
-    `Database`), so a worker is **not** spawned per call.
-  - **Invariant:** only the front-door session owns a worker; spawning one per
-    request would multiply training claimants [§5].
+    `Database`'s internal session), so a worker is **not** spawned per call.
+  - **Invariant:** whether a front-door session's worker exists at all is one
+    configuration key, not a code-path choice; a per-request wrapper never
+    owns a worker regardless, so spawning one per request would still
+    multiply training claimants [§5].
 - **`DataClient` / `CatalogClient`** — the remote mirror of `Session`'s data and
   control planes (`crates/jammi-client/src/lib.rs`, the `DataClient` struct;
   `crates/jammi-admin/src/lib.rs`, the `CatalogClient` struct). **Contract for
@@ -2098,9 +2121,10 @@ disclosed choice against a named upstream reference, not this crate's own
   scaled delta is rounded to `base`'s dtype, then added and rounded once more —
   matching PEFT's reference (`peft/tuners/lora/layer.py`,
   `Linear.forward`: the delta casts down to the base result's dtype *before*
-  the add), the opposite rounding-order choice from `Axpy`'s own "f32-
-  accumulate, round once" precedent, made explicitly because here the thing
-  being matched itself rounds twice.
+  the add), the opposite rounding-order choice from the "f32-accumulate, round
+  once" convention the f32-internal ops otherwise follow (`ops/layer_norm.rs`,
+  `ops/rope.rs` — see the CUDA kernel guide's §3.10 regime table), made
+  explicitly because here the thing being matched itself rounds twice.
 - **Policy is construction data, never a runtime predicate re-derived from
   tensor state at call time inside the op.** `FullyMaskedPolicy`
   (`SoftmaxLastDimFused::fully_masked`), `GeluVariant`
@@ -2108,8 +2132,9 @@ disclosed choice against a named upstream reference, not this crate's own
   `check_variant`, not an unimplemented path), and `dgamma_needed`
   (`LayerNormFused`, frozen in at construction from the *call site's*
   `weight.is_variable()`, re-evaluated per call but never inspected by the op
-  itself) all follow this rule: the op stays exactly as stateless as `Axpy`
-  (see `ops`'s module doc's `Copy` discussion), and a caller whose masking/
+  itself) all follow this rule: the op stays exactly as stateless as every
+  other `KernelOp` (the family's `Copy` bound — see `ops`'s module doc's
+  `Copy` discussion), and a caller whose masking/
   activation convention does not match a policy's premise simply never
   requests it, rather than the op silently guessing.
 - **`SoftmaxLastDimFused::scale` — construction data with a numeric domain,
@@ -2487,8 +2512,12 @@ describing a removed surface.
    `new` builds the artifact store, model resolver, model cache (one shared
    `Arc<GpuScheduler>`), result store, ANN cache. **`ResultStore::recover` runs here,
    before `load_existing_tables`** [§3.7].
-3. → `Session::with_embedded_worker(engine)` — spawns `EmbeddedWorker::spawn`, stores it
-   in `_worker` (RAII).
+3. → `Session::with_configured_worker(engine)`
+   (`with_configured_worker` (`crates/jammi-ai/src/local_session.rs:156`)) —
+   spawns via `with_embedded_worker` → `EmbeddedWorker::spawn`, storing it in
+   `_worker` (RAII), only when `training.run_worker`
+   (`crates/jammi-ai/src/local_session.rs:157`) reads `true` (default `true`);
+   `false` leaves `_worker` as `None` and nothing is spawned.
 4. A verb, e.g. `session.search(req)` — `crates/jammi-ai/src/local_session.rs`
    (`Session::search`): destructures `SearchRequest`, picks `engine.search` vs
    `engine.search_by_id`, applies `.filter`/`.select` on the internal `QueryBuilder`,

@@ -19,8 +19,8 @@ use crate::layout_walk::StridedOffsets;
 /// sites that make it `F32` today). The eager composition this replaces is
 /// `[mul, cast, add]` — three tape nodes, one `CustomOp2` here.
 ///
-/// STATELESS BY CONSTRUCTION: `Copy`, same argument as [`Axpy`](super::Axpy)
-/// — `scaling` is construction data, not runtime state.
+/// STATELESS BY CONSTRUCTION: `Copy`, the argument `ops`'s module doc
+/// makes — `scaling` is construction data, not runtime state.
 ///
 /// ## Domain (family D)
 ///
@@ -40,11 +40,11 @@ use crate::layout_walk::StridedOffsets;
 ///
 /// ## The bf16 rounding model: f32-accumulate, round ONCE (esc-046 fix)
 ///
-/// This now follows [`Axpy`](super::Axpy)'s "f32-accumulate, round once"
-/// precedent after all — an EARLIER revision of this doc claimed PEFT
+/// This now follows this crate's "f32-accumulate, round once" convention
+/// after all — an EARLIER revision of this doc claimed PEFT
 /// rounds the scaled delta to the base dtype BEFORE the add (two round
 /// points) and cited that as the reason this op deliberately diverged from
-/// `Axpy`. That claim was never checked at PEFT source and is FALSE
+/// that convention. That claim was never checked at PEFT source and is FALSE
 /// (esc-046, GH#374): `peft/tuners/lora/layer.py`'s `Linear.forward`
 /// (`peft==0.20.0`, lines 1044-1069, re-read at source on pod a100e
 /// 2026-08-26) computes
@@ -202,7 +202,7 @@ impl CustomOp2 for ScaledCastAdd {
     /// is `F32` in every reachable configuration).
     ///
     /// ALWAYS returns `Some` for both slots — `Tensor::is_variable()` is
-    /// NOT a safe gate here (see [`Axpy::bwd`](super::Axpy)'s doc for the
+    /// NOT a safe gate here (see `ops`'s module doc for the
     /// full argument: it cannot distinguish a true frozen leaf from an
     /// INTERMEDIATE on a path to a `Var`, and candle's own backward walk
     /// requires a populated gradient for the latter regardless).

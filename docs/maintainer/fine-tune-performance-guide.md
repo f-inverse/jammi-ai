@@ -281,7 +281,7 @@ Round-to-nearest-even is monotone, so two pre-rounding f32 values less than one 
 ### Smaller facts that bite
 
 - FMA contraction is ~1 f32 ULP and fatal to a bit-identity claim; pin with `__fmul_rn`/`__fadd_rn`.
-- libm `erff` vs hardware `erff`: GeGLU's two arms compute the error function differently, unlike axpy/RoPE/casts; its parity leg needs 8 cancellation ULPs where pure-arithmetic legs need 3.
+- libm `erff` vs hardware `erff`: GeGLU's two arms compute the error function differently, unlike RoPE/casts and every other pure-arithmetic op; its parity leg needs 8 cancellation ULPs where pure-arithmetic legs need 3.
 - `half::bf16::from_f64` truncates to 32 bits before rounding and disagrees with `from_f32(x as f32)` on some inputs; never call a `from_f64` reference "single-rounding".
 - Exact-integer fixtures (values in −4..4) make a cross-device GEMM bit-exact regardless of summation order.
 

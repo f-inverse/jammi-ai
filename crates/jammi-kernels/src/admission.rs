@@ -176,6 +176,7 @@
 //! [`snapshot_all`]'s per-op `eager` counts directly, not lean on `"all"`
 //! coming back matched as if it were evidence for the whole registry.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock, RwLock};
@@ -612,6 +613,301 @@ pub fn fallback_warnings_emitted() -> Vec<FallbackWarning> {
         .clone()
 }
 
+// =============================================================================
+// The probe-window capture sink (campaign #446 finding 3)
+// =============================================================================
+//
+// [`fallback_warnings_emitted`] above is a LOG-ONCE record: every entry is
+// pushed inside `warn_fallback_once_with_message`'s
+// `seen.insert((op, predicate))` guard, so a given `(op, predicate)` pair
+// appears AT MOST ONCE per process. That makes it a fine oracle for "did this
+// process ever warn about X", and a WRONG source for "why did THIS job's
+// probe miss": a job whose miss repeats a pair some earlier job already
+// burned pushes nothing, and a reader taking the most recent entry for the op
+// gets the most recent DIFFERENT predicate — a fabricated reason, persisted
+// durably on the job record.
+//
+// A naive before/after window over `fallback_warnings_emitted()` cannot fix
+// that either: the dedupe is UPSTREAM of the record, so the window is empty
+// in exactly the repeat case that needs it. The sink below is therefore a
+// SECOND, independent channel: while armed, `admit_inner`'s miss path ALWAYS
+// records `(op, predicate)` here, whatever the log-once dedupe decides (which
+// stays exactly as it is, for logging).
+
+/// The predicate key `warn_disabled_once` logs and the sink records for a
+/// `JAMMI_KERNELS_DISABLE`-forced eager arm. Hoisted to a `const` so the two
+/// producers cannot drift: a consumer distinguishing "deliberate instruction"
+/// from "domain-predicate failure" compares against this ONE spelling.
+pub const DISABLED_PREDICATE_KEY: &str = "disabled_by_JAMMI_KERNELS_DISABLE";
+
+/// One captured miss: `(op, predicate_key)` — the same two fields
+/// [`fallback_warnings_emitted`] carries, without the formatted message
+/// (a consumer reading this wants the verbatim key, not log prose).
+pub type ProbeMiss = (&'static str, &'static str);
+
+thread_local! {
+    /// The armed probe window for THIS thread, or `None` when unarmed.
+    ///
+    /// **Thread-local, not process-wide, on purpose**: a process-wide sink
+    /// would mix a concurrently-probing second worker's misses into this
+    /// job's window, which is the same misattribution the process-lifetime
+    /// warn list already commits. Thread-local means a window captures
+    /// exactly the misses raised by the thread that armed it.
+    ///
+    /// `None` when unarmed — the hot path pays one TLS access plus an
+    /// `Option` check and allocates nothing (pinned by
+    /// `unarmed_admit_records_nothing_and_keeps_the_sink_none`).
+    static PROBE_CAPTURE: RefCell<Option<Vec<ProbeMiss>>> = const { RefCell::new(None) };
+
+    /// The identity of the window currently armed on this thread, or
+    /// [`NO_WINDOW`] when unarmed — the token a [`ProbeCaptureGuard`] checks
+    /// itself against before it restores anything (campaign #446 round-1
+    /// advisory: nested windows finished OUT OF ORDER would otherwise
+    /// misattribute entries; see [`ProbeCaptureGuard::restore`]).
+    ///
+    /// Read and written ONLY by `probe_capture_begin`/`ProbeCaptureGuard` —
+    /// never by `record_probe_miss`, so the armed and unarmed hot paths are
+    /// byte-for-byte what they were.
+    static ARMED_WINDOW: Cell<u64> = const { Cell::new(NO_WINDOW) };
+
+    /// This thread's monotonic window-token source. Per-thread and
+    /// deterministic (never an RNG, family J): tokens are only ever compared
+    /// for equality against a guard armed on the SAME thread, so two threads
+    /// minting the same number is not a collision.
+    static NEXT_WINDOW_TOKEN: Cell<u64> = const { Cell::new(FIRST_WINDOW) };
+}
+
+/// The [`ARMED_WINDOW`] value meaning "no window armed on this thread". Never
+/// minted as a token, so a guard can never match it.
+const NO_WINDOW: u64 = 0;
+
+/// The first token [`NEXT_WINDOW_TOKEN`] mints.
+const FIRST_WINDOW: u64 = 1;
+
+/// The refusal message [`ProbeCaptureGuard`] panics with when a window is
+/// finished or dropped out of order. Hoisted so the `finish` and `Drop`
+/// spellings cannot drift, and so the test that pins the shape asserts
+/// against the one text.
+const OUT_OF_ORDER_WINDOW: &str =
+    "jammi-kernels: probe-capture windows must be finished innermost-first — this guard armed a \
+     window that is no longer the one armed on this thread, so restoring it would hand a NESTED \
+     window's entries to the wrong probe (and destroy the inner window's own). Finish or drop \
+     the inner ProbeCaptureGuard first.";
+
+/// Records `(op, predicate)` into this thread's armed probe window, if one is
+/// armed. A no-op (and non-allocating) otherwise.
+///
+/// **Bounded by DISTINCT pairs, not by miss COUNT** (family E: bound the term
+/// that grows). The number of miss EVENTS in a window is caller-controlled —
+/// it scales with the probed model's layer count, which comes from the job
+/// spec. The number of DISTINCT `(op, predicate)` pairs does not: both fields
+/// are `&'static str` literals from a finite, compile-time set of admission
+/// call sites, so deduplicating on insert bounds the sink by the workspace's
+/// own op/predicate cardinality regardless of how large a model a caller
+/// submits. Duplicates carry no information for the consumer either — it asks
+/// "which predicate failed for this op", not "how many times".
+///
+/// The linear `contains` scan is over that same tiny set (single-digit
+/// entries in every real window); a `HashSet` would cost more to allocate
+/// than it saves, and would lose the insertion order
+/// [`probe_capture_reason_for`] resolves ties with.
+fn record_probe_miss(op: &'static str, predicate: &'static str) {
+    PROBE_CAPTURE.with(|slot| {
+        if let Ok(mut slot) = slot.try_borrow_mut() {
+            if let Some(sink) = slot.as_mut() {
+                if !sink.contains(&(op, predicate)) {
+                    sink.push((op, predicate));
+                }
+            }
+        }
+    });
+}
+
+/// Whether this thread currently has an armed probe window — the oracle a
+/// test asserts the hot path stays clean against (`None` when unarmed), and
+/// the honest answer to "would a miss right now be captured".
+pub fn probe_capture_is_armed() -> bool {
+    PROBE_CAPTURE.with(|slot| slot.borrow().is_some())
+}
+
+/// Arms a probe-window capture sink on THIS thread and returns the guard that
+/// owns it. While armed, EVERY [`admit`] miss on this thread records its
+/// `(op, predicate)` pair into the window, independent of the log-once dedupe
+/// [`fallback_warnings_emitted`] applies (which is left exactly as it is —
+/// this does not change what gets logged).
+///
+/// **Thread-locality is a real constraint on the caller.** The window
+/// captures only misses raised on the arming thread. `jammi-ai`'s esc-075
+/// probe satisfies this: `run_fine_tune_blocking` runs inside one
+/// `tokio::task::spawn_blocking` closure, and the probe's encoder forward,
+/// `Tensor::backward()` graph walk and `AdamW::step` are all synchronous
+/// calls on that single thread — candle's own intra-kernel parallelism sits
+/// BELOW the `admit()` call sites (inside gemm/rayon kernels), never around
+/// them. It would break if a future caller (a) armed the window and then
+/// awaited across a runtime yield point, so the probe resumed on a different
+/// worker thread, or (b) dispatched an admission-gated op from inside a
+/// `rayon`/`std::thread::spawn` closure — a data-parallel or multi-GPU arm is
+/// the realistic shape. Either case degrades HONESTLY, not silently: the
+/// window simply has no entry for that op and the consumer writes its own
+/// "reason unavailable" marker rather than a guess.
+///
+/// Dropping the guard without calling [`ProbeCaptureGuard::finish`] disarms
+/// and discards the window.
+///
+/// **Windows nest strictly.** Each call mints a fresh per-thread token and
+/// records it as this thread's armed window; the returned guard restores only
+/// while it still owns that token. Finishing or dropping guards out of order
+/// is REFUSED with a panic rather than silently misattributing entries — see
+/// [`ProbeCaptureGuard::finish`], and `ProbeCaptureGuard::restore` (private)
+/// for why restoring out of order would misattribute twice over.
+#[must_use = "the window is disarmed as soon as the guard drops; bind it for the probe's \
+              duration and call finish() to read it"]
+pub fn probe_capture_begin() -> ProbeCaptureGuard {
+    let token = NEXT_WINDOW_TOKEN.with(|next| {
+        let token = next.get();
+        // Saturating, not wrapping: a wrap could re-mint a token an
+        // outer guard still holds, which is exactly the aliasing the token
+        // exists to detect. `u64::MAX` windows on one thread is not a
+        // reachable count, and pinning at the ceiling degrades to "every
+        // further window shares one token" — loud (an inner guard would then
+        // wrongly pass the check) only in a scenario that cannot occur, and
+        // never silently wrong for the first 2^64 - 1 windows.
+        next.set(token.saturating_add(1));
+        token
+    });
+    let previous = PROBE_CAPTURE.with(|slot| slot.borrow_mut().replace(Vec::new()));
+    let previous_token = ARMED_WINDOW.with(|armed| armed.replace(token));
+    ProbeCaptureGuard {
+        previous,
+        previous_token,
+        token,
+        restored: false,
+    }
+}
+
+/// The RAII owner of an armed probe window — see [`probe_capture_begin`].
+pub struct ProbeCaptureGuard {
+    /// Whatever window was armed on this thread when this guard armed its own
+    /// (`None` in every real use — nested windows are not a shape this
+    /// codebase has). Restored on `finish`/drop so a nested window cannot
+    /// silently destroy its parent's; an inner window's entries are NOT
+    /// merged into the outer one (the inner probe's misses are the inner
+    /// probe's, not the outer's).
+    previous: Option<Vec<ProbeMiss>>,
+    /// The [`ARMED_WINDOW`] token in force when this guard armed its own —
+    /// restored alongside `previous`, so the token and the sink always move
+    /// together.
+    previous_token: u64,
+    /// This guard's own window identity, minted by [`probe_capture_begin`].
+    /// A restore is legal only while [`ARMED_WINDOW`] still equals this.
+    token: u64,
+    /// Set by the first `restore` so `finish` followed by `drop` restores
+    /// once, not twice (a second restore would clobber `previous` back to
+    /// `None` after `finish` had just put it back). Also set by a REFUSED
+    /// restore, so a refusal cannot repeat from `Drop` during its own unwind.
+    restored: bool,
+}
+
+impl ProbeCaptureGuard {
+    /// Whether the window this guard armed is still the one armed on this
+    /// thread — false exactly in the out-of-order shape (an inner window was
+    /// armed after this one and has not been finished/dropped yet).
+    fn owns_the_armed_window(&self) -> bool {
+        ARMED_WINDOW.with(|armed| armed.get()) == self.token
+    }
+
+    /// Disarms this window and returns its entries, or `None` if already
+    /// disarmed.
+    ///
+    /// # Panics
+    ///
+    /// Panics with [`OUT_OF_ORDER_WINDOW`] when this guard no longer owns the
+    /// window armed on this thread — i.e. a nested window was armed after it
+    /// and is still live. Restoring here would take the INNER window's
+    /// entries (the sink holds the innermost window, not this guard's) and
+    /// then overwrite the sink with this guard's `previous`, destroying the
+    /// inner window outright: two misattributions in one move. The advisory
+    /// that prompted this is not reachable today — `jammi-ai`'s esc-075 probe
+    /// is the only caller and never nests — so this is a REFUSAL that makes
+    /// the shape impossible to introduce silently, not a recovery from a live
+    /// bug. The sink is deliberately left untouched on refusal: the inner
+    /// window keeps its own entries and its own guard still restores
+    /// correctly.
+    fn restore(&mut self) -> Option<Vec<ProbeMiss>> {
+        if self.restored {
+            return None;
+        }
+        // Marked spent BEFORE the refusal, so this guard's own `Drop` (which
+        // runs during the panic's unwind) finds nothing to do rather than
+        // panicking a second time — a panic-in-panic aborts the process,
+        // which would replace a legible refusal with a bare SIGABRT.
+        self.restored = true;
+        assert!(self.owns_the_armed_window(), "{OUT_OF_ORDER_WINDOW}");
+        ARMED_WINDOW.with(|armed| armed.set(self.previous_token));
+        PROBE_CAPTURE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let taken = slot.take();
+            *slot = self.previous.take();
+            taken
+        })
+    }
+
+    /// Disarms the window and returns every DISTINCT `(op, predicate)` miss
+    /// recorded on this thread while it was armed, in first-occurrence order.
+    ///
+    /// # Panics
+    ///
+    /// Panics when this window is not the innermost one armed on this thread:
+    /// the sink holds the INNER window, so restoring here would hand the
+    /// inner probe's entries to this one and destroy the inner window in the
+    /// same move. The refusal touches nothing (see the private
+    /// `ProbeCaptureGuard::restore`).
+    pub fn finish(mut self) -> Vec<ProbeMiss> {
+        self.restore().unwrap_or_default()
+    }
+}
+
+impl Drop for ProbeCaptureGuard {
+    /// Restores this thread's window, refusing the out-of-order shape the
+    /// same way [`ProbeCaptureGuard::finish`] does — with one concession the
+    /// `finish` path does not need: a `Drop` that is ALREADY running inside
+    /// someone else's unwind cannot panic (that aborts the process), so it
+    /// refuses silently there. Refusing means leaving the sink alone, which
+    /// is the fail-safe direction in both cases.
+    fn drop(&mut self) {
+        if self.restored {
+            return;
+        }
+        if !self.owns_the_armed_window() {
+            self.restored = true;
+            if std::thread::panicking() {
+                return;
+            }
+            panic!("{OUT_OF_ORDER_WINDOW}");
+        }
+        let _ = self.restore();
+    }
+}
+
+/// The verbatim predicate key `window` recorded for `op`, or `None` if this
+/// window has no entry for it.
+///
+/// **First occurrence, not last.** A window CAN in principle hold more than
+/// one distinct predicate for one op (heterogeneous layers reaching different
+/// branches of the same predicate); the earliest miss is the one this
+/// reports, deterministically, and this fn never invents a summary key for
+/// the multi-predicate case. `None` is the honest answer a caller must
+/// surface as its own "unavailable" marker rather than filling in — the
+/// realistic causes are the thread-locality limits in
+/// [`probe_capture_begin`]'s doc and a concurrent thread's dispatch moving
+/// the counter this window's owner then attributed to itself.
+pub fn probe_capture_reason_for(window: &[ProbeMiss], op: &str) -> Option<&'static str> {
+    window
+        .iter()
+        .find(|(recorded_op, _)| *recorded_op == op)
+        .map(|&(_, predicate)| predicate)
+}
+
 /// Emits a `tracing::warn!` at most once per process for a given
 /// `(op, predicate)` pair, with `message` as the log line — split out from
 /// [`warn_fallback_once`] so [`warn_disabled_once`] can share the SAME
@@ -907,7 +1203,7 @@ struct AdmitDecision {
 fn warn_disabled_once(op: &'static str) -> FallbackReason {
     warn_fallback_once_with_message(
         op,
-        "disabled_by_JAMMI_KERNELS_DISABLE",
+        DISABLED_PREDICATE_KEY,
         "op disabled via JAMMI_KERNELS_DISABLE",
     );
     FallbackReason::Disabled
@@ -946,6 +1242,11 @@ fn admit_inner(
         // forced eager while every OTHER op passing through this same
         // function is still strictly proven fused.
         counters.record(DispatchOutcome::Eager);
+        // Campaign #446 finding 3: the probe window records EVERY miss,
+        // independent of `warn_disabled_once`'s log-once dedupe below — a
+        // repeat of an already-warned `(op, predicate)` pair still belongs to
+        // the job whose window is armed right now.
+        record_probe_miss(op, DISABLED_PREDICATE_KEY);
         let reason = warn_disabled_once(op);
         return Ok(AdmitDecision {
             outcome: DispatchOutcome::Eager,
@@ -960,6 +1261,11 @@ fn admit_inner(
         });
     }
     counters.record(DispatchOutcome::Eager);
+    // Recorded BEFORE the mode match, so a `Strict` run's hard error is
+    // captured too: `Strict` returns before `warn_predicate_failed_once` is
+    // ever reached, and a window that saw the counter move but has no entry
+    // for why would be exactly the blind spot this sink exists to close.
+    record_probe_miss(op, predicate_name);
     match mode {
         AdmissionMode::Fallback => {
             let reason = warn_predicate_failed_once(op, predicate_name);
@@ -1270,6 +1576,296 @@ pub fn snapshot_all() -> std::collections::BTreeMap<&'static str, DispatchSnapsh
         .iter()
         .map(|(&op, counters)| (op, counters.snapshot()))
         .collect()
+}
+
+// =============================================================================
+// The probed-op table (campaign #446 finding 2)
+// =============================================================================
+//
+// ONE static fact about which ops a per-job acceleration report / capability
+// probe can attribute to a real dispatch decision, and under which registry
+// key. Before this table the same facts were hand-encoded in five unsynced
+// places (`crates/jammi-ai/src/fine_tune/worker.rs`'s
+// `PROBED_ACCELERATION_OPS` + its `AdmissionProbeSnapshot` struct fields +
+// its `two_arm` match, and `crates/jammi-ai/tests/gpu_capability/
+// capability_surface.rs`'s `TWO_ARM_OPS` + `KNOWN_NO_DISPATCH_SITE_OPS`),
+// which is exactly how the f16 cast-epilogue keys came to be missing from
+// the shipped report on the headline dtype.
+//
+// **Why not `snapshot_all`.** `snapshot_all()` reflects only ops that have
+// been looked up via `counters_for` AT LEAST ONCE in this process (its own
+// doc says so), so a key set derived from it varies with process history: a
+// job that happens to run first in a fresh process would report a strictly
+// smaller `ops` key set than the identical job running second. A durable
+// per-job artifact whose SHAPE depends on what else the process did is not a
+// measurement (family F). This table is a compile-time constant instead, so
+// the candidate key set is a pure function of the job's dtype class.
+
+/// The dtype family a [`ProbedOp`]'s registry key is resolved under.
+///
+/// A probed op's REPORT key is deliberately dtype-NEUTRAL (`"cast_scale"`,
+/// never `"cast_scale_bf16_f32"`) because it names the *capability* a
+/// consumer asks about; the registry key the kernel's own `admit()` call
+/// site passes is NOT dtype-neutral, because each 16-bit cast-boundary
+/// kernel is a genuinely independent type (`CastScaleBf16F32` vs
+/// `CastScaleF16F32` — see `crate::ops::cast_scale`'s module doc on why an
+/// `F16` analog is real kernel authoring, not a reinterpretation), dispatched
+/// under its OWN key so `JAMMI_KERNELS_DISABLE` can force each back to its
+/// two-kernel chain independently. The registry key is therefore RESOLVED
+/// from the job's backbone dtype at probe time, never spelled into the
+/// report.
+///
+/// [`DtypeClass::Any`] on a table ENTRY means "this op dispatches under one
+/// key regardless of dtype"; passing `Any` as the QUERY dtype to
+/// [`ProbedOp::registry_keys_for`] therefore matches only the dtype-neutral
+/// entries — see that method's doc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum DtypeClass {
+    /// One registry key covering every backbone dtype.
+    Any,
+    /// `f32` backbones only.
+    F32,
+    /// `bf16` backbones only.
+    Bf16,
+    /// `f16` backbones only.
+    F16,
+}
+
+/// How a [`ProbedOp`]'s dispatch decision is (or is not) observable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProbedOpKind {
+    /// A two-arm [`admit`] site: [`counters_for`]'s `fused`/`eager` split is
+    /// the observable, and a miss carries a verbatim predicate key.
+    TwoArm,
+    /// An [`admit_cascade`] site: [`cascade_counters_for`]'s
+    /// `fused`/`declined` split is the observable. `admit_cascade` has NO
+    /// `fallback_warnings`-shaped reason channel, so a decline can only ever
+    /// be reported at the coarse `capability_or_domain_miss` grain.
+    Cascade,
+    /// A kernel with NO admission gate of its own: it is launched
+    /// unconditionally from INSIDE `parent`'s already-admitted fused arm (a
+    /// bare launcher call at the storage level, not a tracked `Tensor` op),
+    /// so it has no registry key and no probe can read a delta for it. Its
+    /// execution is implied by `parent` dispatching fused — which is what
+    /// makes it provable at all, and why it must never be claimed as an
+    /// independently-admitting op.
+    InternalSubkernel {
+        /// The [`ProbedOp::report_key`] of the op whose fused arm launches
+        /// this kernel.
+        parent: &'static str,
+    },
+}
+
+/// One row of [`PROBED_OPS`]: a dtype-neutral report key, how its dispatch
+/// is observable, and the registry key(s) its kernel's own `admit()` /
+/// `admit_cascade()` call site passes, per dtype class.
+#[derive(Debug, Clone, Copy)]
+pub struct ProbedOp {
+    /// The dtype-NEUTRAL key this op appears under in a durable acceleration
+    /// report and in `ci/release-feature-manifest.json`'s capability lists.
+    pub report_key: &'static str,
+    /// How (or whether) this op's dispatch decision can be observed.
+    pub kind: ProbedOpKind,
+    /// `(dtype class, registry key)` — the key the kernel's own call site
+    /// passes to [`admit`]/[`admit_cascade`], reused VERBATIM. Empty for a
+    /// [`ProbedOpKind::InternalSubkernel`], which has no key at all.
+    pub registry: &'static [(DtypeClass, &'static str)],
+}
+
+impl ProbedOp {
+    /// The registry key(s) this op dispatches under for a job whose backbone
+    /// dtype is `dtype`: every entry whose class is [`DtypeClass::Any`] or
+    /// exactly `dtype`.
+    ///
+    /// Passing [`DtypeClass::Any`] yields ONLY the dtype-neutral entries —
+    /// the honest reading of "this caller has no concrete dtype in hand", not
+    /// a wildcard that would silently claim both 16-bit keys at once. Use
+    /// [`ProbedOp::all_registry_keys`] for the every-dtype enumeration.
+    ///
+    /// Today every [`ProbedOpKind::TwoArm`]/[`ProbedOpKind::Cascade`] row
+    /// yields AT MOST ONE key for any concrete dtype class — pinned by
+    /// `probed_ops_resolve_to_at_most_one_registry_key_per_dtype_class`, not
+    /// assumed.
+    pub fn registry_keys_for(&self, dtype: DtypeClass) -> impl Iterator<Item = &'static str> + '_ {
+        self.registry
+            .iter()
+            .filter(move |(class, _)| *class == DtypeClass::Any || *class == dtype)
+            .map(|&(_, key)| key)
+    }
+
+    /// Every registry key this op can dispatch under, across all dtype
+    /// classes — the enumeration a "is this table's key set closed over the
+    /// workspace's real call sites" audit reads.
+    pub fn all_registry_keys(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.registry.iter().map(|&(_, key)| key)
+    }
+}
+
+/// The ONE static fact about which ops an acceleration report / capability
+/// probe can attribute, and under which registry key.
+///
+/// **Populated by reading every `counters_for("...")` /
+/// `cascade_counters_for("...")` / `admit_cast_boundary("...")` literal in
+/// `crates/jammi-kernels`, `crates/jammi-encoders`, `crates/jammi-lora` and
+/// `crates/jammi-ai` — never from memory.** Row-by-row provenance:
+///
+/// | report key | kind | registry key(s) | call site |
+/// |---|---|---|---|
+/// | `layer_norm` | TwoArm | `layer_norm_fused` | `crates/jammi-encoders/src/layer_norm.rs:103` |
+/// | `rope` | TwoArm | `rope_fused` | `crates/jammi-encoders/src/modernbert.rs:190` |
+/// | `softmax` | TwoArm | `softmax_last_dim_fused` | `crates/jammi-encoders/src/modernbert.rs:204` |
+/// | `geglu` | TwoArm | `geglu_fused` | `crates/jammi-encoders/src/modernbert.rs:1888` |
+/// | `attention_block` | TwoArm | `attention_block_fused` | `crates/jammi-encoders/src/modernbert.rs:684` |
+/// | `dropout` | TwoArm | `lora_linear_fused` | `crates/jammi-lora/src/lora_linear.rs:205` (`admit` at `:799`) |
+/// | `low_rank_residual_linear` | TwoArm | `lora_linear_fused` | `crates/jammi-lora/src/lora_linear.rs:205` (`admit` at `:799`) |
+/// | `cast_scale` | TwoArm | bf16 → `cast_scale_bf16_f32`, f16 → `cast_scale_f16_f32` | `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:800`, `:814` |
+/// | `cast_add` | TwoArm | bf16 → `cast_add_bf16`, f16 → `cast_add_f16` | `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:899`, `:911` |
+/// | `adamw_step` | TwoArm | `adamw_step_fused` | `crates/jammi-ai/src/fine_tune/adamw.rs:33` (`admit` at `:257`) |
+/// | `mem_efficient_attention` | Cascade | `mem_efficient_attention` | `crates/jammi-encoders/src/modernbert.rs:1303` |
+/// | `rope_positions` | InternalSubkernel(`attention_block_flash`) | — | `crates/jammi-kernels/src/ops/flash_attention.rs:645` |
+/// | `scaled_cast_add` | InternalSubkernel(`low_rank_residual_linear`) | — | `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:693` (CPU), `crates/jammi-kernels/src/cuda/low_rank_residual_linear.rs:131` (CUDA) |
+///
+/// **`adamw_step`: the optimizer's dtype DOMAIN is not a dtype CLASS.**
+/// `adamw_step_fused`'s own admission predicate requires
+/// `theta`/`first_moment`/`second_moment`/`grad` to be `F32`
+/// (`crates/jammi-ai/src/fine_tune/adamw.rs`'s `fused_admission_predicate`,
+/// `dtype_f32`), and `crates/jammi-kernels/src/ops/adamw_step.rs`'s module
+/// doc names `F32` as the op's only implemented dtype. It is tempting to
+/// encode that as `(DtypeClass::F32, "adamw_step_fused")`. **That would be
+/// wrong**, and wrong in exactly finding 2's own shape.
+///
+/// [`DtypeClass`] selects on the JOB'S BACKBONE dtype — it is what a caller
+/// resolves a registry key WITH (`crates/jammi-ai/src/fine_tune/worker.rs`'s
+/// `dtype_class_of(config.backbone_dtype)`). The optimizer's `F32` domain is
+/// a fact about a DIFFERENT tensor set: the TRAINABLE variables, which are
+/// `F32` on every backbone. `jammi-lora` refuses a non-`F32` adapter outright
+/// (`lora_linear.rs`'s `lora_ab_dtype_f32` predicate), and the trainer builds
+/// its `VarBuilder` at `DType::F32` regardless of `backbone_dtype`. So an
+/// `f16`- or `bf16`-backbone job's optimizer step admits and dispatches
+/// `adamw_step_fused` exactly as an `f32` job's does.
+///
+/// Gating the row on `DtypeClass::F32` would therefore OMIT `adamw_step` from
+/// every `bf16`/`f16` job's report while the op demonstrably dispatched —
+/// a silent-eager invisibility on the headline dtype, which is the defect
+/// this whole table exists to retire. `Any` is the honest encoding: one
+/// registry key covering every backbone dtype. The `F32`-only domain still
+/// shows up where it belongs — as this op's own admission PREDICATE, whose
+/// failure would be reported as `holds: false` with the verbatim `dtype_f32`
+/// key, never as an absent row.
+///
+/// **Registry keys that exist but are deliberately NOT rows** (each read at
+/// the cited call site during this population, and excluded for a stated
+/// reason — an omission with no reason is how finding 2 happened):
+///
+/// - `attention_block_flash` (`crates/jammi-encoders/src/modernbert.rs:1259`,
+///   `:1556`) — a real cascade, but the esc-075 report surfaces it through
+///   its OWN dedicated top-level `flash` field (with the compiled/device
+///   short-circuit reasons a plain `ops` entry cannot express), and
+///   `ci/release-feature-manifest.json` declares it as `flash_compiled` +
+///   `flash_dtypes`, not as a `fused_op_admission` entry. Adding it here
+///   would make the same fact appear twice in one artifact.
+/// - `lora_dropout` (`crates/jammi-lora/src/lora_linear.rs:37`) and
+///   `lora_epilogue` (`:66`) — registry entries with NO `admit()` call site
+///   anywhere: both are documented as "permanently `{fused: 0, eager: 0}`",
+///   superseded by `lora_linear_fused`, and kept only for snapshot-schema
+///   compatibility. A row for either would put a permanently-unmoving
+///   counter in the report.
+///
+/// **`registry` is empty for a [`ProbedOpKind::InternalSubkernel`] row on
+/// purpose**: `rope_positions` and `scaled_cast_add` are launched by a bare
+/// call into `crate::cuda::rope_positions::cuda_fwd` /
+/// `ScaledCastAdd::{cpu_fwd,cuda_fwd}` from INSIDE an already-admitted parent
+/// arm, deliberately bypassing the tracked-`Tensor` op path (and therefore
+/// [`admit`]) — see `FlashVarlenAttentionRope`'s own doc for why (candle's
+/// tape would otherwise retain the rotated buffer for the whole backward
+/// pass). They have no key for any probe to read a delta from; their
+/// execution is proven by the PARENT dispatching fused, and must never be
+/// claimed as an independent admission.
+pub const PROBED_OPS: &[ProbedOp] = &[
+    ProbedOp {
+        report_key: "layer_norm",
+        kind: ProbedOpKind::TwoArm,
+        registry: &[(DtypeClass::Any, "layer_norm_fused")],
+    },
+    ProbedOp {
+        report_key: "rope",
+        kind: ProbedOpKind::TwoArm,
+        registry: &[(DtypeClass::Any, "rope_fused")],
+    },
+    ProbedOp {
+        report_key: "softmax",
+        kind: ProbedOpKind::TwoArm,
+        registry: &[(DtypeClass::Any, "softmax_last_dim_fused")],
+    },
+    ProbedOp {
+        report_key: "geglu",
+        kind: ProbedOpKind::TwoArm,
+        registry: &[(DtypeClass::Any, "geglu_fused")],
+    },
+    ProbedOp {
+        report_key: "attention_block",
+        kind: ProbedOpKind::TwoArm,
+        registry: &[(DtypeClass::Any, "attention_block_fused")],
+    },
+    ProbedOp {
+        report_key: "dropout",
+        kind: ProbedOpKind::TwoArm,
+        registry: &[(DtypeClass::Any, "lora_linear_fused")],
+    },
+    ProbedOp {
+        report_key: "low_rank_residual_linear",
+        kind: ProbedOpKind::TwoArm,
+        registry: &[(DtypeClass::Any, "lora_linear_fused")],
+    },
+    ProbedOp {
+        report_key: "cast_scale",
+        kind: ProbedOpKind::TwoArm,
+        registry: &[
+            (DtypeClass::Bf16, "cast_scale_bf16_f32"),
+            (DtypeClass::F16, "cast_scale_f16_f32"),
+        ],
+    },
+    ProbedOp {
+        report_key: "cast_add",
+        kind: ProbedOpKind::TwoArm,
+        registry: &[
+            (DtypeClass::Bf16, "cast_add_bf16"),
+            (DtypeClass::F16, "cast_add_f16"),
+        ],
+    },
+    ProbedOp {
+        report_key: "adamw_step",
+        kind: ProbedOpKind::TwoArm,
+        // `DtypeClass::Any`, NOT `F32` — see this table's "the optimizer's
+        // dtype domain is not a dtype CLASS" note. The op's own tensors are
+        // F32-only; the JOB's backbone dtype is a different axis, and it is
+        // the job's that `DtypeClass` selects on.
+        registry: &[(DtypeClass::Any, "adamw_step_fused")],
+    },
+    ProbedOp {
+        report_key: "mem_efficient_attention",
+        kind: ProbedOpKind::Cascade,
+        registry: &[(DtypeClass::Any, "mem_efficient_attention")],
+    },
+    ProbedOp {
+        report_key: "rope_positions",
+        kind: ProbedOpKind::InternalSubkernel {
+            parent: "attention_block_flash",
+        },
+        registry: &[],
+    },
+    ProbedOp {
+        report_key: "scaled_cast_add",
+        kind: ProbedOpKind::InternalSubkernel {
+            parent: "low_rank_residual_linear",
+        },
+        registry: &[],
+    },
+];
+
+/// The [`PROBED_OPS`] row with this `report_key`, or `None`.
+pub fn probed_op(report_key: &str) -> Option<&'static ProbedOp> {
+    PROBED_OPS.iter().find(|op| op.report_key == report_key)
 }
 
 #[cfg(test)]
@@ -2575,6 +3171,573 @@ mod tests {
         assert_eq!(
             out_a,
             vec!["alpha".to_string(), "mu".to_string(), "zeta".to_string()]
+        );
+    }
+
+    /// Every concrete dtype class. [`DtypeClass::Any`] is deliberately NOT
+    /// here: it is a table-ENTRY class ("one key for every dtype"), never a
+    /// job's resolved backbone dtype.
+    const CONCRETE_DTYPE_CLASSES: &[DtypeClass] =
+        &[DtypeClass::F32, DtypeClass::Bf16, DtypeClass::F16];
+
+    /// The invariant [`ProbedOp::registry_keys_for`]'s doc claims and every
+    /// consumer relies on: for a CONCRETE dtype class, a two-arm/cascade row
+    /// resolves to at most one registry key, so "the key for this op at this
+    /// dtype" is well defined and a consumer never has to guess which of two
+    /// counters is the op's real dispatch signal.
+    #[test]
+    fn probed_ops_resolve_to_at_most_one_registry_key_per_dtype_class() {
+        for op in PROBED_OPS {
+            if matches!(op.kind, ProbedOpKind::InternalSubkernel { .. }) {
+                continue;
+            }
+            for &dtype in CONCRETE_DTYPE_CLASSES {
+                let keys: Vec<&str> = op.registry_keys_for(dtype).collect();
+                assert!(
+                    keys.len() <= 1,
+                    "PROBED_OPS row {:?} resolves to {} registry keys at {dtype:?} ({keys:?}) — \
+                     a report/capability consumer would have to guess which one is this op's \
+                     dispatch signal",
+                    op.report_key,
+                    keys.len()
+                );
+            }
+        }
+    }
+
+    /// A report key must be dtype-NEUTRAL and unique. The `!key.ends_with`
+    /// checks are the direct regression guard on finding 2's root cause: the
+    /// shipped table spelled a bf16-specific REGISTRY key (`cast_add_bf16`)
+    /// into the report's dtype-neutral vocabulary, which is what made the f16
+    /// job's report structurally unable to name its own cast epilogue.
+    #[test]
+    fn probed_ops_report_keys_are_dtype_neutral_and_unique() {
+        let mut seen = HashSet::new();
+        for op in PROBED_OPS {
+            assert!(
+                seen.insert(op.report_key),
+                "duplicate PROBED_OPS report key {:?}",
+                op.report_key
+            );
+            for suffix in ["_bf16", "_f16", "_f32", "_bf16_f32", "_f16_f32"] {
+                assert!(
+                    !op.report_key.ends_with(suffix),
+                    "PROBED_OPS report key {:?} carries a dtype suffix {suffix:?} — report keys \
+                     are dtype-neutral (campaign #446 finding 2); the dtype lives in the \
+                     `registry` column, resolved at probe time",
+                    op.report_key
+                );
+            }
+        }
+    }
+
+    /// An internal-subkernel row has NO registry key (there is no `admit()`
+    /// site to read a delta from) and names a PARENT that is itself either a
+    /// probed row or the flash cascade the acceleration report surfaces
+    /// through its own `flash` field — a parent no consumer can resolve would
+    /// make "proven via the parent's dispatch" unprovable.
+    #[test]
+    fn internal_subkernel_rows_have_no_registry_key_and_a_resolvable_parent() {
+        for op in PROBED_OPS {
+            let ProbedOpKind::InternalSubkernel { parent } = op.kind else {
+                continue;
+            };
+            assert!(
+                op.registry.is_empty(),
+                "internal subkernel {:?} must have no registry key — it is launched from inside \
+                 {parent:?}'s already-admitted arm, never through admit()",
+                op.report_key
+            );
+            let resolvable = probed_op(parent).is_some() || parent == "attention_block_flash";
+            assert!(
+                resolvable,
+                "internal subkernel {:?} names parent {parent:?}, which is neither a PROBED_OPS \
+                 row nor the flash cascade — its execution would be unprovable",
+                op.report_key
+            );
+        }
+    }
+
+    /// Every two-arm/cascade row DOES carry at least one registry key (the
+    /// mirror of the test above: a probed row with no key is a row a probe
+    /// silently drops — exactly the shape `lora_dropout`/`lora_epilogue`
+    /// have, which is why neither is a row at all; see this constant's own
+    /// doc for that exclusion).
+    #[test]
+    fn two_arm_and_cascade_rows_all_carry_a_registry_key() {
+        for op in PROBED_OPS {
+            if matches!(op.kind, ProbedOpKind::InternalSubkernel { .. }) {
+                continue;
+            }
+            assert!(
+                !op.registry.is_empty(),
+                "PROBED_OPS row {:?} is {:?} but names no registry key — a probe would silently \
+                 drop it",
+                op.report_key,
+                op.kind
+            );
+        }
+    }
+
+    /// [`DtypeClass::Any`] as the QUERY dtype yields only the dtype-neutral
+    /// entries, never both 16-bit keys at once — the documented, non-wildcard
+    /// reading. A wildcard here would let a caller with no dtype in hand
+    /// snapshot `cast_add_bf16` AND `cast_add_f16` and then report whichever
+    /// moved, which is the fabrication this table exists to prevent.
+    #[test]
+    fn registry_keys_for_any_yields_only_dtype_neutral_entries() {
+        let cast_add = probed_op("cast_add").expect("cast_add is a PROBED_OPS row");
+        assert_eq!(
+            cast_add.registry_keys_for(DtypeClass::Any).count(),
+            0,
+            "cast_add has no dtype-neutral key, so an Any query must yield none"
+        );
+        assert_eq!(
+            cast_add
+                .registry_keys_for(DtypeClass::F16)
+                .collect::<Vec<_>>(),
+            vec!["cast_add_f16"]
+        );
+        assert_eq!(
+            cast_add
+                .registry_keys_for(DtypeClass::Bf16)
+                .collect::<Vec<_>>(),
+            vec!["cast_add_bf16"]
+        );
+        assert_eq!(
+            cast_add.registry_keys_for(DtypeClass::F32).count(),
+            0,
+            "an f32 backbone takes low_rank_residual_linear's admit()-free \"nothing to fuse\" \
+             branch — there is no cast_add key for it, and the report must omit the op rather \
+             than claim a miss"
+        );
+
+        let layer_norm = probed_op("layer_norm").expect("layer_norm is a PROBED_OPS row");
+        for &dtype in CONCRETE_DTYPE_CLASSES {
+            assert_eq!(
+                layer_norm.registry_keys_for(dtype).collect::<Vec<_>>(),
+                vec!["layer_norm_fused"],
+                "a dtype-neutral row resolves to the same key at every dtype"
+            );
+        }
+    }
+
+    /// (iv) The hot path must not grow: with no window armed, `admit()`
+    /// records nothing and the sink stays `None` — no `Vec` is ever
+    /// allocated for the overwhelming majority of dispatches (every
+    /// production forward outside a probe). Asserting `probe_capture_is_armed
+    /// () == false` AFTER a real miss is the non-vacuous form: a naive
+    /// implementation that lazily created the sink on first miss would leave
+    /// it `Some` here.
+    #[test]
+    fn unarmed_admit_records_nothing_and_keeps_the_sink_none() {
+        assert!(
+            !probe_capture_is_armed(),
+            "no window may be armed on a fresh thread"
+        );
+        let counters = DispatchCounters::new();
+        let decision = admit_inner(
+            AdmissionMode::Fallback,
+            "probe_sink_unarmed_op",
+            "probe_sink_unarmed_predicate",
+            false,
+            false,
+            &counters,
+        )
+        .expect("Fallback mode never errors on a predicate miss");
+        assert_eq!(decision.outcome, DispatchOutcome::Eager);
+        assert!(
+            !probe_capture_is_armed(),
+            "an unarmed admit() miss must NOT lazily create a sink — the hot path allocates \
+             nothing"
+        );
+        // And a window armed AFTERWARDS is empty: the earlier miss was
+        // genuinely dropped, not buffered somewhere and replayed.
+        let window = probe_capture_begin().finish();
+        assert!(
+            window.is_empty(),
+            "a window armed after an unarmed miss must be empty, got {window:?}"
+        );
+    }
+
+    /// An armed window records the miss AND survives the log-once dedupe: the
+    /// SAME `(op, predicate)` pair captured twice, in two successive windows,
+    /// even though `fallback_warnings_emitted()` records it only the first
+    /// time. This is finding 3's whole mechanism in one test — the second
+    /// window is exactly the case a before/after diff of the warn list
+    /// reports as empty.
+    #[test]
+    fn armed_window_records_a_miss_even_when_the_log_once_dedupe_suppresses_it() {
+        let counters = DispatchCounters::new();
+        let miss = || {
+            admit_inner(
+                AdmissionMode::Fallback,
+                "probe_sink_dedupe_op",
+                "probe_sink_dedupe_predicate",
+                false,
+                false,
+                &counters,
+            )
+            .expect("Fallback mode never errors on a predicate miss");
+        };
+
+        let first_guard = probe_capture_begin();
+        miss();
+        let first = first_guard.finish();
+        assert_eq!(
+            first,
+            vec![("probe_sink_dedupe_op", "probe_sink_dedupe_predicate")]
+        );
+
+        let warns_after_first = fallback_warnings_emitted()
+            .into_iter()
+            .filter(|(op, _, _)| *op == "probe_sink_dedupe_op")
+            .count();
+        assert_eq!(
+            warns_after_first, 1,
+            "the log-once record holds exactly one entry for this pair"
+        );
+
+        let second_guard = probe_capture_begin();
+        miss();
+        let second = second_guard.finish();
+        assert_eq!(
+            second,
+            vec![("probe_sink_dedupe_op", "probe_sink_dedupe_predicate")],
+            "the SECOND window must carry the pair too — the log-once dedupe governs logging \
+             only, never what a probe window may attribute to its own job"
+        );
+        assert_eq!(
+            fallback_warnings_emitted()
+                .into_iter()
+                .filter(|(op, _, _)| *op == "probe_sink_dedupe_op")
+                .count(),
+            warns_after_first,
+            "and the dedupe itself is UNCHANGED — the sink is a second channel, not a \
+             relaxation of the log-once contract"
+        );
+    }
+
+    /// Distinct pairs only, in first-occurrence order: the sink is bounded by
+    /// the workspace's finite `(op, predicate)` cardinality, not by the
+    /// caller-controlled number of miss EVENTS (family E). Ten misses over
+    /// two pairs yield two entries.
+    #[test]
+    fn armed_window_deduplicates_pairs_and_keeps_first_occurrence_order() {
+        let counters = DispatchCounters::new();
+        let guard = probe_capture_begin();
+        for i in 0..10 {
+            let predicate = if i % 2 == 0 {
+                "probe_sink_bound_predicate_a"
+            } else {
+                "probe_sink_bound_predicate_b"
+            };
+            admit_inner(
+                AdmissionMode::Fallback,
+                "probe_sink_bound_op",
+                predicate,
+                false,
+                false,
+                &counters,
+            )
+            .expect("Fallback mode never errors on a predicate miss");
+        }
+        let window = guard.finish();
+        assert_eq!(
+            window,
+            vec![
+                ("probe_sink_bound_op", "probe_sink_bound_predicate_a"),
+                ("probe_sink_bound_op", "probe_sink_bound_predicate_b"),
+            ],
+            "the sink must grow with DISTINCT (op, predicate) pairs, not with miss events"
+        );
+        assert_eq!(
+            probe_capture_reason_for(&window, "probe_sink_bound_op"),
+            Some("probe_sink_bound_predicate_a"),
+            "first occurrence wins, deterministically"
+        );
+        assert_eq!(
+            probe_capture_reason_for(&window, "an_op_this_window_never_saw"),
+            None,
+            "an op with no entry must be None — the caller's cue to write its own honest \
+             \"unavailable\" marker, never a guess"
+        );
+    }
+
+    /// (iii) Two threads with concurrent windows do not mix: each captures
+    /// only the misses raised on its OWN thread. A process-wide sink would
+    /// put both ops in both windows.
+    #[test]
+    fn concurrent_windows_on_two_threads_do_not_mix() {
+        use std::sync::mpsc;
+
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+
+        let handle = std::thread::spawn(move || {
+            let counters = DispatchCounters::new();
+            let guard = probe_capture_begin();
+            admit_inner(
+                AdmissionMode::Fallback,
+                "probe_sink_thread_b_op",
+                "probe_sink_thread_b_predicate",
+                false,
+                false,
+                &counters,
+            )
+            .expect("Fallback mode never errors on a predicate miss");
+            // Signal that B's window is armed AND populated, then hold it
+            // open until A has done its own miss — so the two windows really
+            // are concurrent, not merely sequential.
+            ready_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            guard.finish()
+        });
+
+        let counters = DispatchCounters::new();
+        let guard = probe_capture_begin();
+        ready_rx.recv().unwrap();
+        admit_inner(
+            AdmissionMode::Fallback,
+            "probe_sink_thread_a_op",
+            "probe_sink_thread_a_predicate",
+            false,
+            false,
+            &counters,
+        )
+        .expect("Fallback mode never errors on a predicate miss");
+        let a = guard.finish();
+        go_tx.send(()).unwrap();
+        let b = handle.join().expect("thread B must not panic");
+
+        assert_eq!(
+            a,
+            vec![("probe_sink_thread_a_op", "probe_sink_thread_a_predicate")],
+            "thread A's window must hold ONLY A's miss, got {a:?}"
+        );
+        assert_eq!(
+            b,
+            vec![("probe_sink_thread_b_op", "probe_sink_thread_b_predicate")],
+            "thread B's window must hold ONLY B's miss, got {b:?}"
+        );
+    }
+
+    /// Dropping the guard without `finish` disarms the window — a probe that
+    /// panics or returns early must not leave a sink armed for whatever runs
+    /// next on this thread (which would then attribute unrelated misses to a
+    /// job that is already over).
+    #[test]
+    fn dropping_the_guard_without_finish_disarms() {
+        {
+            let _guard = probe_capture_begin();
+            assert!(probe_capture_is_armed());
+        }
+        assert!(
+            !probe_capture_is_armed(),
+            "the window must be disarmed by Drop, not only by finish()"
+        );
+    }
+
+    /// The POSITIVE control for the out-of-order refusal below: properly
+    /// nested windows (inner finished first) still work exactly as
+    /// documented. Without this, a `restore` that refused unconditionally
+    /// would "pass" the refusal test while breaking every real caller.
+    ///
+    /// Also pins the nesting semantics the guard's own doc states: the
+    /// inner window's entries are the INNER probe's (never merged upward),
+    /// and the outer window's own entries survive the nested window intact.
+    #[test]
+    fn properly_nested_windows_finish_innermost_first_and_keep_their_own_entries() {
+        std::thread::spawn(|| {
+            let counters = DispatchCounters::new();
+            let miss = |op: &'static str| {
+                admit_inner(
+                    AdmissionMode::Fallback,
+                    op,
+                    "probe_sink_nesting_predicate",
+                    false,
+                    false,
+                    &counters,
+                )
+                .expect("Fallback mode never errors on a predicate miss");
+            };
+
+            let outer = probe_capture_begin();
+            miss("probe_sink_nesting_outer_op");
+            let inner = probe_capture_begin();
+            miss("probe_sink_nesting_inner_op");
+            assert_eq!(
+                inner.finish(),
+                vec![(
+                    "probe_sink_nesting_inner_op",
+                    "probe_sink_nesting_predicate"
+                )],
+                "the inner window holds ONLY the misses raised while it was armed"
+            );
+            assert!(
+                probe_capture_is_armed(),
+                "finishing the inner window must restore the OUTER one, not disarm the thread"
+            );
+            miss("probe_sink_nesting_outer_op_again");
+            assert_eq!(
+                outer.finish(),
+                vec![
+                    (
+                        "probe_sink_nesting_outer_op",
+                        "probe_sink_nesting_predicate"
+                    ),
+                    (
+                        "probe_sink_nesting_outer_op_again",
+                        "probe_sink_nesting_predicate"
+                    ),
+                ],
+                "the outer window keeps its pre-nesting entries AND records again after the \
+                 inner window closed; the inner probe's miss is never merged into it"
+            );
+            assert!(!probe_capture_is_armed());
+        })
+        .join()
+        .expect("the properly nested shape must not panic");
+    }
+
+    /// Campaign #446 round-1 advisory: a window finished OUT OF ORDER (an
+    /// outer guard finished while an inner one is still armed) must be
+    /// REFUSED, loudly, rather than handing the inner window's entries to the
+    /// outer probe and destroying the inner window in the same move.
+    ///
+    /// Not reachable from today's callers — `jammi-ai`'s esc-075 probe is the
+    /// only one and never nests — so this test constructs the shape directly.
+    /// It runs on its OWN thread for two reasons: the sink is thread-local,
+    /// and the refusal deliberately leaves this thread's sink ARMED (the
+    /// fail-safe: it touches nothing), which must not leak into a sibling
+    /// test sharing the harness thread.
+    #[test]
+    fn out_of_order_window_finish_is_refused_and_leaves_the_inner_window_intact() {
+        std::thread::spawn(|| {
+            let counters = DispatchCounters::new();
+            let outer = probe_capture_begin();
+            let inner = probe_capture_begin();
+            admit_inner(
+                AdmissionMode::Fallback,
+                "probe_sink_out_of_order_op",
+                "probe_sink_out_of_order_predicate",
+                false,
+                false,
+                &counters,
+            )
+            .expect("Fallback mode never errors on a predicate miss");
+
+            // Silence the default hook for the expected panic only, so a
+            // refusal this test EXPECTS does not print a scary backtrace
+            // while a genuinely unexpected panic elsewhere still does.
+            let previous_hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let refused =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || outer.finish()));
+            std::panic::set_hook(previous_hook);
+
+            let payload = refused.expect_err(
+                "finishing the OUTER window while the inner one is still armed must be refused \
+                 — silently restoring would hand the inner probe's entries to the outer one",
+            );
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("<non-string panic payload>");
+            assert!(
+                message.contains("innermost-first"),
+                "the refusal must say WHAT is wrong and HOW to fix it, got: {message}"
+            );
+
+            // The refusal touched nothing: the inner window is still armed
+            // and still owns its entry, so the inner probe's own `finish`
+            // remains correct.
+            assert!(
+                probe_capture_is_armed(),
+                "a refused restore must leave the sink alone, not disarm the inner window"
+            );
+            assert_eq!(
+                inner.finish(),
+                vec![(
+                    "probe_sink_out_of_order_op",
+                    "probe_sink_out_of_order_predicate"
+                )],
+                "the inner window keeps its own entries through the outer guard's refusal"
+            );
+        })
+        .join()
+        .expect("the refusal must be a catchable panic on the guard, not a thread-killing one");
+    }
+
+    /// The `JAMMI_KERNELS_DISABLE` arm records too, under the ONE hoisted
+    /// [`DISABLED_PREDICATE_KEY`] spelling — so a consumer can tell "you
+    /// disabled this op" apart from "the domain check failed" without
+    /// comparing log prose.
+    #[test]
+    fn disabled_arm_records_the_hoisted_disabled_predicate_key() {
+        let counters = DispatchCounters::new();
+        let guard = probe_capture_begin();
+        admit_inner(
+            AdmissionMode::Strict,
+            "probe_sink_disabled_op",
+            "a_predicate_that_holds",
+            true,
+            true,
+            &counters,
+        )
+        .expect("disable wins over Strict");
+        let window = guard.finish();
+        assert_eq!(
+            probe_capture_reason_for(&window, "probe_sink_disabled_op"),
+            Some(DISABLED_PREDICATE_KEY),
+            "a deliberate disable must be recorded as such, never as a domain-predicate failure"
+        );
+    }
+
+    /// A `Strict`-mode predicate failure records into the window even though
+    /// it returns `Err` before any warn helper runs — the arm that has NO
+    /// entry in `fallback_warnings_emitted()` at all.
+    #[test]
+    fn strict_mode_predicate_failure_still_records_into_the_window() {
+        let counters = DispatchCounters::new();
+        let guard = probe_capture_begin();
+        let err = admit_inner(
+            AdmissionMode::Strict,
+            "probe_sink_strict_op",
+            "probe_sink_strict_predicate",
+            false,
+            false,
+            &counters,
+        )
+        .expect_err("Strict turns a predicate miss into a hard error");
+        assert!(matches!(err, KernelError::StrictModeFallback { .. }));
+        let window = guard.finish();
+        assert_eq!(
+            probe_capture_reason_for(&window, "probe_sink_strict_op"),
+            Some("probe_sink_strict_predicate"),
+            "Strict returns before warn_predicate_failed_once, so the warn list has nothing — \
+             the window must still know why"
+        );
+        assert!(
+            !fallback_warnings_emitted()
+                .into_iter()
+                .any(|(op, _, _)| op == "probe_sink_strict_op"),
+            "control: the warn list genuinely has no entry for this op, so the assertion above \
+             is not passing through the old channel by accident"
+        );
+    }
+
+    /// `all_registry_keys` is the every-dtype enumeration (distinct from
+    /// `registry_keys_for`): a "does this table's key set cover the
+    /// workspace's real call sites" audit reads it, and it must not collapse
+    /// the two 16-bit keys into one.
+    #[test]
+    fn all_registry_keys_enumerates_every_dtype_variant() {
+        let cast_scale = probed_op("cast_scale").expect("cast_scale is a PROBED_OPS row");
+        assert_eq!(
+            cast_scale.all_registry_keys().collect::<Vec<_>>(),
+            vec!["cast_scale_bf16_f32", "cast_scale_f16_f32"]
         );
     }
 }

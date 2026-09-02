@@ -37,11 +37,12 @@ class InvalidArgument(JammiError, ValueError):
 class NotSupportedOnBackend(JammiError):
     """A one-sided operation was invoked on a backend that does not carry it.
 
-    Some capabilities exist on only one transport — an in-process audit log or
-    ephemeral session on the embedded engine, an explicit channel ``close`` or
-    connection ``session_id`` on the remote client. Invoking the wrong one raises
-    this typed error rather than a bare ``AttributeError``, and
-    :meth:`Session.supports` answers the same question before the call.
+    Some capabilities exist on only one transport — an in-process audit log,
+    ephemeral session or model preload on the embedded engine, a per-connection
+    ``session_id`` on the remote client. Invoking the wrong one raises this typed
+    error rather than a bare ``AttributeError``, and :meth:`Session.supports`
+    answers the same question before the call. (``close`` is deliberately NOT
+    among them: both transports carry it, so it is an ordinary Session verb.)
 
     Constructed one of two ways: with the :class:`~jammi.Capability` a
     caller invoked on the wrong backend (the local, capability-shaped case), or

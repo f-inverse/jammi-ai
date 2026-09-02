@@ -44,6 +44,9 @@ RPC CatalogService/DropTopic
 RPC CatalogService/GetServerInfo
 RPC CatalogService/GetTenant
 RPC CatalogService/ListChannels
+# ADDED (additive, minor-compatible): the per-result-table ANN index-segment
+# listing. `index_segments` was readable through no public surface before it.
+RPC CatalogService/ListIndexSegments
 RPC CatalogService/ListModels
 RPC CatalogService/ListMutableTables
 RPC CatalogService/ListSources

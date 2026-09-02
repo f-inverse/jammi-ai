@@ -173,8 +173,8 @@ extern "C" __global__ void layer_norm_bwd_dgamma_f16(
     const float* invvar, float* dgamma_f32, const unsigned int rows,
     const unsigned int hidden
 ) {
-    for (unsigned int col = blockIdx.x * blockDim.x + threadIdx.x; col < hidden;
-         col += blockDim.x * gridDim.x) {
+    for (size_t col = (size_t)blockIdx.x * blockDim.x + threadIdx.x; col < hidden;
+         col += (size_t)blockDim.x * gridDim.x) {
         float acc = 0.0f;
         for (unsigned int r = 0; r < rows; r++) {
             float xhat =

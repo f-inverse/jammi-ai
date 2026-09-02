@@ -154,32 +154,58 @@ RP_REPO_URL="${RP_REPO_URL:-https://github.com/f-inverse/jammi-ai}"
 # a path separator or a `.`/`..` segment could point RP_WORK — and therefore
 # that `rm -rf` — OUTSIDE RP_SESSION_ROOT entirely (`RP_SESSION=../../etc`).
 #
-# A CONTAINMENT blacklist, not a character WHITELIST (round-3 audit on
-# #388): the previous `[A-Za-z0-9_-]+` whitelist rejected every session
-# name containing a `.` — including one gpu-dev.sh's OWN dispatch is happy
-# to create, e.g. `RP_SESSION=bench.1 gpu-dev.sh up` — so EVERY verb
-# refused against a session that had already rented a real pod, stranding
-# it for its full deadline with no `down` able to reach it. Only the shapes
-# that actually let RP_SESSION resolve outside RP_SESSION_ROOT are refused:
-# empty, `.`, or `..` (this function only ever runs for a NAMED session —
-# see the RP_SESSION_VALIDATE_SESSION gate below — so an empty value here
-# is a caller bug, never `shell`'s own genuinely anonymous RP_SESSION="",
-# which never reaches this check at all); anything containing a `/` (a
-# multi-segment path); and a leading `-` (reads as an option to any tool
-# RP_SESSION is later passed to positionally). Every OTHER shape — a dot
-# anywhere but as the WHOLE name included — is a legitimate session name.
-rp_session_name_check() {
-  case "$RP_SESSION" in
+# The ONE name rule every operator-supplied identifier in this tooling must
+# satisfy — session, tree, and wave alike. All three end up in the same two
+# dangerous positions: a LOCAL path (RP_WORK, and the unconditional
+# `rm -rf "$RP_WORK"` in rp_cleanup/rp_session_forget below — `RP_SESSION=
+# ../../etc` would point that removal outside RP_SESSION_ROOT entirely) and
+# REMOTE shell text (a tree name reaches `run`'s `.jammi-job.sh` dispatch,
+# `target --with-cutlass`, and `wait-job`'s check script; a wave and a tree
+# reach the active-wave claim write), where a quote, a backtick, a `$(...)`,
+# or a `%` in a printf format position is arbitrary code or a corrupted
+# claim on the pod.
+#
+# Refused, in this order so each shape gets its OWN diagnosis:
+#   empty / `.` / `..`   — resolve outside their own root (this function
+#                          only ever runs for a NAMED session, see the
+#                          RP_SESSION_VALIDATE_SESSION gate below, so an
+#                          empty value here is a caller bug, never
+#                          `shell`'s genuinely anonymous RP_SESSION="")
+#   contains `/`         — a multi-segment path
+#   leading `-`          — reads as an option to any tool the name is later
+#                          passed positionally
+#   anything outside `[A-Za-z0-9._-]` — the allowlist proper
+#
+# `.` is INSIDE the allowlist, deliberately: a dotted name (`bench.1`,
+# `a100.2`, `fix.443`) is a legitimate, in-use shape, and a rule that
+# refused it would refuse every verb against a session that had already
+# rented a real pod — stranding that pod for its full deadline with no
+# `down` able to reach it. `_` and `-` are in for the same reason (every
+# arch/tree/wave name in use). Nothing outside those four classes has ever
+# named a real session, tree, or wave in this repo, and each excluded
+# character is exactly what makes the two dangerous positions dangerous.
+# $1=the label to name in the error (e.g. RP_SESSION, --tree, --wave)
+# $2=the value.
+rp_name_allowlist_check() {
+  local label="${1:?rp_name_allowlist_check needs a label}" value="${2-}"
+  case "$value" in
     ''|.|..)
-      echo "::error::RP_SESSION may not be empty, '.', or '..' (got '${RP_SESSION}')" >&2
+      echo "::error::${label} may not be empty, '.', or '..' (got '${value}')" >&2
       return 2 ;;
     */*)
-      echo "::error::RP_SESSION may not contain '/' (got '${RP_SESSION}')" >&2
+      echo "::error::${label} may not contain '/' (got '${value}')" >&2
       return 2 ;;
     -*)
-      echo "::error::RP_SESSION may not start with '-' (got '${RP_SESSION}')" >&2
+      echo "::error::${label} may not start with '-' (got '${value}')" >&2
+      return 2 ;;
+    *[!A-Za-z0-9._-]*)
+      echo "::error::${label} may contain only letters, digits, '.', '_' and '-' (got '${value}') — it is embedded in remote shell text and in a printf argument" >&2
       return 2 ;;
   esac
+}
+
+rp_session_name_check() {
+  rp_name_allowlist_check RP_SESSION "$RP_SESSION"
 }
 # Gated on RP_SESSION_VALIDATE_SESSION, set by gpu-dev.sh only for the verbs
 # that actually RESOLVE a named session (up/attach/run/logs/push/pull/down)
@@ -580,25 +606,24 @@ rp_session_forget() {
 # break out of that heredoc and inject commands into the remote shell
 # (round-N audit: "closing the class your new heredoc site joins" — the
 # class was already reachable via `run`/`target`, `wait-job` is simply one
-# more instance of it). Mirrors rp_session_name_check's OWN containment
-# blacklist EXACTLY (never a whitelist — see that function's own doc for
-# why): a tree name is a directory-name-shaped string with the identical
-# legal shapes a session name has, so the identical rule applies for the
-# identical reason. Reads `$RP_TREE_CHECK_VALUE` (the same "check a global,
-# not a parameter" shape rp_session_name_check itself uses, so a caller
-# resolves it exactly the same way both times).
+# more instance of it). Applies rp_name_allowlist_check, the SAME rule
+# rp_session_name_check applies: a tree name is a directory-name-shaped
+# string with the identical legal shapes a session name has, so the
+# identical rule applies for the identical reason. Reads
+# `$RP_TREE_CHECK_VALUE` (the same "check a global, not a parameter" shape
+# rp_session_name_check itself uses, so a caller resolves it exactly the
+# same way both times).
 rp_tree_name_check() {
-  case "$RP_TREE_CHECK_VALUE" in
-    ''|.|..)
-      echo "::error::--tree may not be empty, '.', or '..' (got '${RP_TREE_CHECK_VALUE}')" >&2
-      return 2 ;;
-    */*)
-      echo "::error::--tree may not contain '/' (got '${RP_TREE_CHECK_VALUE}')" >&2
-      return 2 ;;
-    -*)
-      echo "::error::--tree may not start with '-' (got '${RP_TREE_CHECK_VALUE}')" >&2
-      return 2 ;;
-  esac
+  rp_name_allowlist_check --tree "$RP_TREE_CHECK_VALUE"
+}
+
+# A wave id reaches the pod as TEXT in the active-wave claim
+# (rp_job_wrapper_with_marker_lines) and as a literal in the concurrency
+# preflight's own comparison (rp_concurrency_preflight_lines), so it carries
+# the same exposure a tree name does and gets the same rule. Reads
+# `$RP_WAVE_CHECK_VALUE`, matching rp_tree_name_check's own shape.
+rp_wave_name_check() {
+  rp_name_allowlist_check --wave "$RP_WAVE_CHECK_VALUE"
 }
 
 # Tree name -> plain SOURCE checkout directory on the pod. "jammi-ai" is the
@@ -665,28 +690,71 @@ EOF
 }
 
 # esc-077: the shell TEXT that classifies $1 (a CARGO_TARGET_DIR path, e.g.
-# TARGET_DIR from rp_target_dir) as MISSING, UNMARKED, or a genuine seed-clone
-# (OK) — `.jammi-clone-of-seed` is the marker `pod_target_clone.sh` stamps on
-# every successful clone. A plain function, not inlined by hand into
-# gpu-dev.sh's `run` heredoc, so it is directly testable: source this file,
-# call it with a real local directory, and run the printed text (`bash <
+# TARGET_DIR from rp_target_dir) — `.jammi-clone-of-seed` is the marker
+# `pod_target_clone.sh` stamps on every successful clone or adoption. A
+# plain function, not inlined by hand into gpu-dev.sh's `run` heredoc, so
+# it is directly testable: source this file, call it with a real local
+# directory, and run the printed text (`bash <
 # <(rp_target_preflight_lines "$dir")`) against real fixture directories —
 # no ssh, no pod, no mocking. Prints exactly one line,
-# `GPU_DEV_TARGET_STATE=<MISSING|UNMARKED|OK>`, so the caller's remote
-# execution of this same text (over `rp_run_remote`) is trivially parsed by
-# a `case` at the call site. $1=target_dir.
+# `GPU_DEV_TARGET_STATE=<MISSING|UNMARKED_COLD|UNMARKED_WARM|OK>`, so the
+# caller's remote execution of this same text (over `rp_run_remote`) is
+# trivially parsed by a `case` at the call site. $1=target_dir.
+#
+# The two UNMARKED states are DIFFERENT facts and get different diagnoses
+# and different remedies at the call site. "No marker" was reported as "it
+# was never provisioned via pod_target_clone.sh, so this job would pay a
+# COLD full workspace build" — false for a target dir that predates the
+# marker scheme (or was built by any path other than the `target` verb):
+# such a dir is genuinely WARM, the job would NOT rebuild the workspace,
+# and the offered remedy (`target ... --with-cutlass`) cannot even run,
+# since pod_target_clone.sh refuses to clone over an existing destination.
+# WARM is decided on the ONE piece of evidence that actually answers "would
+# this build be incremental": workspace-member fingerprints under a cargo
+# profile directory. It is a cheap, structural signal for the DIAGNOSIS
+# only — `target --adopt`, the executable remedy, re-checks the same
+# content with pod_seed_assert_member_free (the authoritative scan, off the
+# real workspace member list) before it stamps anything.
 rp_target_preflight_lines() {
   local target_dir="${1:?rp_target_preflight_lines needs a target dir}"
   cat <<EOF
 if [ ! -d '${target_dir}' ]; then
   echo GPU_DEV_TARGET_STATE=MISSING
 elif [ ! -f '${target_dir}/.jammi-clone-of-seed' ]; then
-  echo GPU_DEV_TARGET_STATE=UNMARKED
+  if ls '${target_dir}/debug/.fingerprint' '${target_dir}/release/.fingerprint' 2>/dev/null | grep -q '^jammi'; then # tripwire-ok: a missing debug//release/ .fingerprint dir is a real, checked state -- it IS the cold answer this if/else selects, never a silent pass
+    echo GPU_DEV_TARGET_STATE=UNMARKED_WARM
+  else
+    echo GPU_DEV_TARGET_STATE=UNMARKED_COLD
+  fi
 else
   echo GPU_DEV_TARGET_STATE=OK
 fi
 EOF
 }
+
+# The pod-global one-pod-per-wave claim store, named ONCE here and
+# interpolated into every generated remote script that touches it (the
+# reader below, the writer in rp_job_wrapper_with_marker_lines).
+#
+# A DIRECTORY of per-holder claims, never one shared file: same-wave
+# co-tenancy is the sanctioned shape (a wave's sub-units sharing one warm
+# seed), so N holders are live at once and a single file can only ever
+# record the last writer. With one file, holder B's launch overwrote
+# holder A's claim and holder A's completion then deleted the claim B was
+# still relying on — after which the pod, still genuinely busy, read as
+# "no claim" to the next `run`. One file per holder, keyed by the holder's
+# TREE (the pod runs at most one job per tree: `run` kills any existing
+# `jammi-<tree>` session before starting a new one, so a same-tree re-run
+# refreshes its own claim in place rather than colliding), makes every
+# holder independently visible and independently removable.
+#
+# Every write and every removal happens inside a flock on RP_CLAIM_LOCK, so
+# a reader never observes a half-written claim and two launching holders
+# never race on the store's creation. RP_CLAIM_LOCK is a separate lock from
+# `/root/.jammi-timing.lock` (which serialises whole JOBS for `--timing`);
+# this one is held only for the length of a single claim write or removal.
+RP_CLAIM_DIR='/root/.jammi-active-wave.d'
+RP_CLAIM_LOCK='/root/.jammi-active-wave.lock'
 
 # esc-077-class (one-pod-per-wave, WAVE-scoped): the shell TEXT that checks
 # whether this pod is genuinely BUSY with a DIFFERENT wave's job —
@@ -698,31 +766,34 @@ EOF
 # one warm seed). Two signals, tmux liveness PRIMARY:
 #   1. Is any OTHER jammi-* tmux JOB session alive at all (`jammi-seed`, the
 #      boot-time build-substrate seed, and this tree's OWN session are
-#      excluded — same exclusions as before)? If not, CLEAR — regardless of
-#      whatever `/root/.jammi-active-wave` happens to still say (a claim
-#      whose session already ended is definitionally stale: the wrapper
-#      that wrote it, rp_job_wrapper_with_marker_lines, removes it at BOTH
-#      of its own exit paths, so a leftover claim with no live session can
-#      only mean the wrapper's own cleanup was interrupted — SIGKILL/pod
-#      death — never a job that finished normally. Failing OPEN on that
-#      staleness, rather than refusing forever on an orphaned file, is the
-#      deliberate choice here: tmux's own liveness check is what actually
-#      answers "is the pod busy right now", and a stale claim answers
-#      nothing).
-#   2. Only if another session IS alive: read that claim's WAVE field. The
-#      SAME wave on a DIFFERENT tree is exactly the sanctioned shape (a
-#      wave's own sub-units sharing one pod) -> CLEAR; a DIFFERENT wave (or
-#      no readable claim at all, e.g. a job launched by tooling that
-#      predates this wave-scoping, or a session started outside `run`
-#      entirely) -> BUSY, failing CLOSED (the old tree-scoped behavior) on
-#      that ambiguity rather than guessing it is safe to share.
+#      excluded)? If not, CLEAR — regardless of what any claim file happens
+#      to still say (a claim whose session already ended is definitionally
+#      stale: the wrapper that wrote it, rp_job_wrapper_with_marker_lines,
+#      removes it at BOTH of its own exit paths, so a leftover claim with
+#      no live session can only mean the wrapper's own cleanup was
+#      interrupted — SIGKILL/pod death — never a job that finished
+#      normally. Failing OPEN on that staleness, rather than refusing
+#      forever on an orphaned file, is the deliberate choice here: tmux's
+#      own liveness check is what actually answers "is the pod busy right
+#      now", and a stale claim answers nothing).
+#   2. Only if another session IS alive: aggregate EVERY holder's claim in
+#      RP_CLAIM_DIR, skipping this session's own and skipping any holder
+#      whose own `jammi-<TREE>` session is no longer alive (per-holder
+#      staleness, the same liveness rule signal 1 applies to the pod as a
+#      whole). Same-wave co-tenancy is sanctioned, so ALL surviving holders
+#      must name THIS wave for CLEAR; the FIRST holder naming a different
+#      wave is reported BUSY, naming that holder's own wave and session
+#      rather than an arbitrary "some other session". No surviving holder
+#      at all (a job launched by tooling that predates the claim store, or
+#      a session started outside `run` entirely) -> BUSY:UNKNOWN, failing
+#      CLOSED on the ambiguity rather than guessing it is safe to share.
 # $1=this tree's own tmux session name (e.g. "jammi-mywork", TMUX_SESSION
 # at the call site) $2=this run's own wave id (WAVE at the call site,
 # defaults to the tree name — see gpu-dev.sh's own WAVE resolution). A
 # plain function, directly testable the same way rp_target_preflight_lines
-# is (source this file, run the printed text against a faked `tmux` +a
-# fixture `/root/.jammi-active-wave`-shaped file on PATH/disk — no ssh, no
-# pod). Prints exactly one line:
+# is (source this file, run the printed text against a faked `tmux` + a
+# fixture claim store on PATH/disk — no ssh, no pod). Prints exactly one
+# line:
 #   GPU_DEV_CONCURRENCY_STATE=CLEAR
 #   GPU_DEV_CONCURRENCY_STATE=BUSY:<owning-wave-or-UNKNOWN>:<other-session>
 # NOTE on the heredoc body below: this is TEXT generated for REMOTE
@@ -736,25 +807,54 @@ EOF
 # backticks appear anywhere in the heredoc body itself — an unquoted
 # heredoc treats a literal backtick as old-style command substitution,
 # which would corrupt the generated text.
+#
+# Both session exclusions are `grep -Fvx -e` — a LITERAL, whole-line,
+# option-safe match — never a bare `grep -vx PATTERN`. A session name is a
+# tree name (`jammi-<tree>`), and a tree name legitimately contains `.`
+# (rp_tree_name_check's containment blacklist permits it, deliberately:
+# `bench.1`-shaped names are real). Read as a BRE, `jammi-fix.443` also
+# matches ANOTHER wave's `jammi-fixX443` — the own-session exclusion then
+# deletes the very session it exists to detect and the gate reports CLEAR:
+# a concurrency gate that fails OPEN. `*` mis-excludes a sibling the same
+# way, and an unbalanced `[` makes grep exit 2 with NO output at all,
+# emptying `other` and failing open for every session on the pod. `-e`
+# additionally keeps a name that begins with `-` from being read as an
+# option. This robustness is the FUNCTION's own, independent of the
+# entrypoint allowlist that also refuses the exotic shapes.
 rp_concurrency_preflight_lines() {
   local own_session="${1:?rp_concurrency_preflight_lines needs its own tmux session name}" \
         own_wave="${2:?rp_concurrency_preflight_lines needs its own wave id}"
   cat <<EOF
-other="\$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^jammi-' | grep -vx 'jammi-seed' | grep -vx '${own_session}' | head -1)" # tripwire-ok: tmux list-sessions exits non-zero with no server/sessions at all -- a real, expected, checked state (an empty \$other, handled by the if/else right below), never a silent pass on a real error this remote script would otherwise need to escalate
+live="\$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^jammi-')" # tripwire-ok: tmux list-sessions exits non-zero with no server/sessions at all -- a real, expected, checked state (an empty \$live, which makes \$other empty and lands on the CLEAR branch below), never a silent pass on a real error this remote script would otherwise need to escalate
+other="\$(printf '%s\\n' "\$live" | grep -Fvx -e 'jammi-seed' | grep -Fvx -e '${own_session}' | head -1)" # tripwire-ok: grep -v legitimately matches nothing when this tree's own session is the only one -- the empty \$other IS the CLEAR state, handled by the if/else right below
 # shellcheck disable=SC2157
 if [ -z "\$other" ]; then
   echo "GPU_DEV_CONCURRENCY_STATE=CLEAR"
 else
-  claim_wave=""
-  if [ -f /root/.jammi-active-wave ]; then
-    claim_wave="\$(grep '^WAVE=' /root/.jammi-active-wave 2>/dev/null | head -1 | cut -d= -f2-)" # tripwire-ok: an absent/unreadable/malformed claim file is a real, checked state (empty claim_wave, handled by the elif chain right below as the fail-closed UNKNOWN case), never a silent pass
-  fi
-  if [ -z "\$claim_wave" ]; then
+  busy_wave=""
+  busy_session=""
+  holders=0
+  for claim in ${RP_CLAIM_DIR}/*.claim; do
+    [ -f "\$claim" ] || continue
+    claim_wave="\$(grep '^WAVE=' "\$claim" 2>/dev/null | head -1 | cut -d= -f2-)" # tripwire-ok: an unreadable/malformed claim file is a real, checked state (the empty-field guard on the next line drops it, and a store with no readable holder at all lands on the fail-closed UNKNOWN branch below), never a silent pass
+    claim_tree="\$(grep '^TREE=' "\$claim" 2>/dev/null | head -1 | cut -d= -f2-)" # tripwire-ok: same as claim_wave above -- both fields are required, and a claim missing either is dropped by the guard on the next line
+    [ -n "\$claim_wave" ] && [ -n "\$claim_tree" ] || continue
+    claim_session="jammi-\$claim_tree"
+    [ "\$claim_session" = '${own_session}' ] && continue
+    printf '%s\\n' "\$live" | grep -Fxq -e "\$claim_session" || continue
+    holders=\$((holders + 1))
+    if [ "\$claim_wave" != '${own_wave}' ]; then
+      busy_wave="\$claim_wave"
+      busy_session="\$claim_session"
+      break
+    fi
+  done
+  if [ -n "\$busy_wave" ]; then
+    echo "GPU_DEV_CONCURRENCY_STATE=BUSY:\$busy_wave:\$busy_session"
+  elif [ "\$holders" -eq 0 ]; then
     echo "GPU_DEV_CONCURRENCY_STATE=BUSY:UNKNOWN:\$other"
-  elif [ "\$claim_wave" = '${own_wave}' ]; then
-    echo "GPU_DEV_CONCURRENCY_STATE=CLEAR"
   else
-    echo "GPU_DEV_CONCURRENCY_STATE=BUSY:\$claim_wave:\$other"
+    echo "GPU_DEV_CONCURRENCY_STATE=CLEAR"
   fi
 fi
 EOF
@@ -773,6 +873,80 @@ rp_job_env_lines() {
   printf '[ -f /root/.jammi_env ] && . /root/.jammi_env\n'
   printf "export CARGO_TARGET_DIR='%s'\n" "$target_dir"
   printf "cd '%s'\n" "$tree_dir"
+  rp_job_build_sha_lines "$tree_dir"
+}
+
+# The pod-side default for `JAMMI_BUILD_SHA`, emitted as shell text into the
+# job wrapper (rp_job_env_lines above) and evaluated ON THE POD, where the
+# push stamp actually lives.
+#
+# WHY THIS EXISTS: `push` rsyncs the working tree WITHOUT `.git` (the exclude
+# set is pod_push_stamp.sh's own `pod_push_excludes`), so a `cargo build` on a
+# pushed tree has no repository for `crates/jammi-bench/build.rs`'s
+# `git rev-parse` fallback to read and bakes `build_sha="unknown"`. Every
+# producer that cross-checks provenance then refuses the binary's own output,
+# which is correct — the binary genuinely could not say what it was built
+# from — but it makes an otherwise valid measurement unrecordable, and the
+# operator's only recourse was to remember to type the sha by hand on every
+# build. `<tree>/.jammi-push-stamp.json` already records exactly the missing
+# fact (`laptop_head`, written by the same `push` that sent the bytes), so the
+# default reads it from there.
+#
+# CLEAN-ONLY, and that restriction is the whole safety argument. `push` sends
+# uncommitted work too, so `laptop_head` names the commit the pushed tree was
+# BASED on, not necessarily the commit it IS. Naming a commit whose tree is
+# not the built bytes is a FABRICATED provenance — strictly worse than
+# "unknown", because it is a false claim a downstream reader cannot detect.
+# So the stamp's own `porcelain_sha256`/`diff_head_sha256` must BOTH equal the
+# digest of the empty string (a clean `git status --porcelain` and a clean
+# `git diff HEAD` at push time — the emitted python computes that digest
+# rather than hardcoding it, so the comparison cannot rot into a stale
+# literal). Anything else leaves the variable UNSET: build.rs bakes
+# "unknown", the producer refuses loudly, and the message says why.
+#
+# A caller-supplied `JAMMI_BUILD_SHA` always wins and is never overwritten —
+# the manual escape hatch stays exactly as it was for the dirty-tree case.
+#
+# Cost: `cargo:rerun-if-env-changed=JAMMI_BUILD_SHA` means the first job after
+# a push at a NEW commit re-runs jammi-bench's build script and relinks that
+# one binary. That is the price of the binary knowing what it is.
+#
+# $1=tree_dir.
+rp_job_build_sha_lines() {
+  local tree_dir="${1:?rp_job_build_sha_lines needs a tree dir}"
+  printf "__jammi_push_stamp='%s/.jammi-push-stamp.json'\n" "$tree_dir"
+  cat <<'BUILDSHAEOF'
+if [ -z "${JAMMI_BUILD_SHA:-}" ]; then
+  JAMMI_BUILD_SHA="$(python3 - "$__jammi_push_stamp" <<'JAMMIPUSHSTAMPEOF'
+import hashlib, json, re, sys
+
+try:
+    stamp = json.load(open(sys.argv[1]))
+except Exception:
+    # No stamp, or an unreadable one: print nothing. The caller's own
+    # empty-result branch says what that means; a traceback here would only
+    # bury it.
+    sys.exit(0)
+head = stamp.get("laptop_head") or ""
+clean = hashlib.sha256(b"").hexdigest()
+if (
+    re.fullmatch(r"[0-9a-f]{40}", head)
+    and stamp.get("porcelain_sha256") == clean
+    and stamp.get("diff_head_sha256") == clean
+):
+    print(head)
+JAMMIPUSHSTAMPEOF
+)"
+  if [ -n "${JAMMI_BUILD_SHA:-}" ]; then
+    export JAMMI_BUILD_SHA
+    echo "jammi: JAMMI_BUILD_SHA=${JAMMI_BUILD_SHA} (from ${__jammi_push_stamp} — the pushed tree was CLEAN at that commit)" >&2
+  else
+    unset JAMMI_BUILD_SHA
+    echo "::warning::JAMMI_BUILD_SHA left UNSET — ${__jammi_push_stamp} is absent or unreadable, or records a push whose working tree was DIRTY (its bytes are not any one commit). A binary built here bakes build_sha=\"unknown\" and every provenance cross-check will refuse its output. Commit and re-push, or set JAMMI_BUILD_SHA=<the 40-hex tip the pushed tree actually is> yourself — never a sha these bytes are not." >&2
+  fi
+fi
+unset __jammi_push_stamp
+BUILDSHAEOF
 }
 
 # Builds the per-tree job wrapper script body (`<tree>/.jammi-job.sh`,
@@ -832,18 +1006,23 @@ rp_job_wrapper_lines() {
 # checkout path).
 #
 # Wave-scoped one-pod-per-wave claim (folded into this SAME start/end
-# lifecycle `.jammi.exit` already uses, per that marker's own idiom):
-# `/root/.jammi-active-wave` (one file, POD-global — a pod hosts one job at
-# a time regardless of tree) is WRITTEN at the very START, before the job
-# ever runs, so a concurrent `run` on another tree sees the claim the
-# instant this one launches; it is REMOVED whenever this wrapper's own
-# execution ends — normal completion AND the lock-refused (timing) early
-# exit both clear it, so a stale claim can only ever be "wrapper cleanup
-# was interrupted" (SIGKILL/pod death), never "a job finished and cleanup
-# was forgotten". `rp_concurrency_preflight_lines` (below) reads this file
-# and, per this campaign's own instruction, treats a claim with NO matching
-# live tmux session as CLEAR (fail OPEN on staleness) rather than refusing
-# forever on an orphaned file — tmux liveness stays the PRIMARY signal.
+# lifecycle `.jammi.exit` already uses, per that marker's own idiom): THIS
+# holder's own claim file in RP_CLAIM_DIR (see that constant's doc for why
+# the store is a directory of per-holder files and not one shared file) is
+# WRITTEN before the job runs, so a concurrent `run` sees this holder the
+# instant it launches, and REMOVED whenever this wrapper's execution ends —
+# normal completion AND the lock-refused (timing) early exit both clear it,
+# so a stale claim can only ever be "wrapper cleanup was interrupted"
+# (SIGKILL/pod death), never "a job finished and cleanup was forgotten".
+# Every write and removal runs inside a flock on RP_CLAIM_LOCK (fd 8).
+#
+# Under `timing=1` the claim write comes AFTER the timing lock is acquired,
+# never before: a run whose `flock -n 9` is REFUSED never became a holder
+# at all, and writing its claim first meant a refused run touched the store
+# on behalf of a job that never ran. `rp_concurrency_preflight_lines`
+# (above) reads the store and treats a holder with NO matching live tmux
+# session as absent (fail OPEN on staleness) rather than refusing forever
+# on an orphaned file — tmux liveness stays the PRIMARY signal.
 rp_job_wrapper_with_marker_lines() {
   local tree_dir="${1:?rp_job_wrapper_with_marker_lines needs a tree dir}" \
         target_dir="${2:?rp_job_wrapper_with_marker_lines needs a target dir}" \
@@ -853,18 +1032,30 @@ rp_job_wrapper_with_marker_lines() {
         wave="${6:?rp_job_wrapper_with_marker_lines needs a wave id}" \
         tree_name="${7:?rp_job_wrapper_with_marker_lines needs a tree name}"
   printf "rm -f '%s/.jammi.exit'\n" "$tree_dir"
-  printf 'printf "WAVE=%s\\nTREE=%s\\nTS=%s\\n" > /root/.jammi-active-wave\n' \
-    "$wave" "$tree_name" "$(date -u +%FT%TZ)"
+  # This holder's own claim file, and the write/removal statements that
+  # maintain it — built ONCE here and emitted on every path below, so the
+  # three sites can never drift apart. Both statements run inside a flock
+  # on RP_CLAIM_LOCK (fd 8): a reader never sees a half-written claim, and
+  # two holders launching at once never race on the store's creation.
+  local claim_file="${RP_CLAIM_DIR}/${tree_name}.claim" claim_write claim_clear
+  claim_write="$(printf "mkdir -p %s\n( flock 8; printf '%%s\\\\n' 'WAVE=%s' 'TREE=%s' 'TS=%s' > '%s' ) 8>%s" \
+    "$RP_CLAIM_DIR" "$wave" "$tree_name" "$(date -u +%FT%TZ)" "$claim_file" "$RP_CLAIM_LOCK")"
+  claim_clear="$(printf "( flock 8; rm -f '%s' ) 8>%s" "$claim_file" "$RP_CLAIM_LOCK")"
   if [ "$timing" = "1" ]; then
+    # The timing lock FIRST, this holder's claim only once it is held: a
+    # refused run never ran a job, so it must never appear in the store.
+    # Its own claim is still cleared on the refusal path, which reaps a
+    # claim an EARLIER, SIGKILLed run on this same tree may have left.
     cat <<FLOCKEOF
 exec 9>/root/.jammi-timing.lock
 if ! flock -n 9; then
   printf '{"token":"${token}","rc":75,"lock_refused":true}' > '${tree_dir}/.jammi.exit'
-  rm -f /root/.jammi-active-wave
+${claim_clear}
   exit 75
 fi
 FLOCKEOF
   fi
+  printf '%s\n' "$claim_write"
   rp_job_env_lines "$tree_dir" "$target_dir"
   # `( job )` — a SUBSHELL, never the bare job text directly in this script
   # — so a job command that happens to invoke the shell's own `exit` builtin
@@ -879,7 +1070,7 @@ FLOCKEOF
   cat <<MARKEREOF
 __jammi_job_rc=\$?
 printf '{"token":"${token}","rc":'"\$__jammi_job_rc"',"lock_refused":false}' > '${tree_dir}/.jammi.exit'
-rm -f /root/.jammi-active-wave
+${claim_clear}
 exit "\$__jammi_job_rc"
 MARKEREOF
 }

@@ -17,6 +17,25 @@
 //   gate = wi_out[row*2*intermediate + col]
 //   up   = wi_out[row*2*intermediate + intermediate + col]
 //
+// INDEXING CONTRACT (campaign #446, finding 4 — see
+// `../ops/launch_domain.rs`'s module doc for the whole rule and the CPU
+// lane that enforces it): `idx`, `row` and the stride are `size_t`, while
+// `intermediate`/`n_out` stay 32-bit `unsigned int` PARAMETERS. This
+// asymmetry is deliberate. These loops used to declare `unsigned int idx`;
+// the stride is `GEGLU_BLOCK * GEGLU_MAX_GRID == 16'776'960`, so a 32-bit
+// lane could only ever hold values congruent to its own start modulo
+// `gcd(stride, 2^32) == 256`. Above `n_out == UINT_MAX - 255` the exit
+// window `[n_out, 2^32)` is narrower than 256 and cannot contain one
+// value of every residue class, so every lane whose class is missing
+// spins FOREVER (at `n_out == UINT_MAX`, 255 of every 256 threads); just
+// below that window the loop escapes only after re-walking its whole
+// orbit (65'537 visits where 257 was the job). A 64-bit induction
+// variable makes both impossible for EVERY `n_out` the host admits. The parameters stay 32-bit because the Rust
+// glue pushes them by value (`builder.arg(&n_out_u32)`): widening one
+// side without the other would make this kernel read 8 bytes where 4 were
+// pushed. `cuda/geglu.rs`'s `check_elem_count_fits_u32` is the single
+// place that bounds `n_out` to what a 32-bit parameter can carry.
+//
 // `kAlpha`/`kBeta` mirror ATen's `ActivationGeluKernel.cu` erf-mode
 // `gelu_backward` constants exactly (see `../ops/geglu.rs`'s module doc):
 // `kAlpha = 1/sqrt(2)`, `kBeta = (2/sqrt(pi))*(1/sqrt(2))*0.5 ==
@@ -46,11 +65,11 @@ extern "C" __global__ void geglu_fwd_f32(
     const float* wi_out, float* out,
     const unsigned int intermediate, const unsigned int n_out
 ) {
-    for (unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n_out;
-         idx += blockDim.x * gridDim.x) {
-        unsigned int row = idx / intermediate;
-        unsigned int col = idx % intermediate;
-        size_t base = (size_t)row * 2 * (size_t)intermediate;
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < n_out;
+         idx += (size_t)blockDim.x * gridDim.x) {
+        size_t row = idx / intermediate;
+        unsigned int col = (unsigned int)(idx % intermediate);
+        size_t base = row * 2 * (size_t)intermediate;
         float gate = wi_out[base + col];
         float up = wi_out[base + intermediate + col];
         out[idx] = gate * gelu_erf_cdf(gate) * up;
@@ -66,11 +85,11 @@ extern "C" __global__ void geglu_fwd_bf16(
     const __nv_bfloat16* wi_out, __nv_bfloat16* out,
     const unsigned int intermediate, const unsigned int n_out
 ) {
-    for (unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n_out;
-         idx += blockDim.x * gridDim.x) {
-        unsigned int row = idx / intermediate;
-        unsigned int col = idx % intermediate;
-        size_t base = (size_t)row * 2 * (size_t)intermediate;
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < n_out;
+         idx += (size_t)blockDim.x * gridDim.x) {
+        size_t row = idx / intermediate;
+        unsigned int col = (unsigned int)(idx % intermediate);
+        size_t base = row * 2 * (size_t)intermediate;
         float gate = __bfloat162float(wi_out[base + col]);
         float up = __bfloat162float(wi_out[base + intermediate + col]);
         float act_f32 = gate * gelu_erf_cdf(gate);
@@ -90,11 +109,11 @@ extern "C" __global__ void geglu_bwd_dwi_out_f32(
     const float* wi_out, const float* dy, float* dwi_out,
     const unsigned int intermediate, const unsigned int n_out
 ) {
-    for (unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n_out;
-         idx += blockDim.x * gridDim.x) {
-        unsigned int row = idx / intermediate;
-        unsigned int col = idx % intermediate;
-        size_t base = (size_t)row * 2 * (size_t)intermediate;
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < n_out;
+         idx += (size_t)blockDim.x * gridDim.x) {
+        size_t row = idx / intermediate;
+        unsigned int col = (unsigned int)(idx % intermediate);
+        size_t base = row * 2 * (size_t)intermediate;
         float gate = wi_out[base + col];
         float up = wi_out[base + intermediate + col];
         float dyi = dy[idx];
@@ -115,11 +134,11 @@ extern "C" __global__ void geglu_bwd_dwi_out_bf16(
     const __nv_bfloat16* wi_out, const __nv_bfloat16* dy, __nv_bfloat16* dwi_out,
     const unsigned int intermediate, const unsigned int n_out
 ) {
-    for (unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n_out;
-         idx += blockDim.x * gridDim.x) {
-        unsigned int row = idx / intermediate;
-        unsigned int col = idx % intermediate;
-        size_t base = (size_t)row * 2 * (size_t)intermediate;
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < n_out;
+         idx += (size_t)blockDim.x * gridDim.x) {
+        size_t row = idx / intermediate;
+        unsigned int col = (unsigned int)(idx % intermediate);
+        size_t base = row * 2 * (size_t)intermediate;
         float gate = __bfloat162float(wi_out[base + col]);
         float up = __bfloat162float(wi_out[base + intermediate + col]);
         float dyi = __bfloat162float(dy[idx]);

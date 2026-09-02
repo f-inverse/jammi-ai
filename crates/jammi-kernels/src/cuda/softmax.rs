@@ -18,7 +18,7 @@ fn policy_flag(policy: FullyMaskedPolicy) -> u32 {
     }
 }
 
-/// See `../../cuda/axpy.rs`'s identical constant for the module-name
+/// See `crate::cuda`'s module doc for the module-name
 /// rationale — arbitrary but stable and unique to this op's PTX module.
 const MODULE_NAME: &str = "jammi_kernels_softmax";
 
@@ -33,8 +33,8 @@ const SM_BLOCK: u32 = 256;
 /// `last > MAX_LAST_DIM`: refused above a conservative, VALIDATED ceiling —
 /// NOT a hardware limit (see `ops::softmax::MAX_LAST_DIM`'s doc). `n >
 /// u32::MAX`: the launch grid and the kernel's own indices are 32-bit,
-/// exactly the guard `axpy.rs`/`layer_norm.rs` document for the same
-/// reason.
+/// exactly the guard `ops::launch_domain::check_elem_count_fits_u32`
+/// documents for the same reason.
 fn check_last_and_n(op: &'static str, n: usize, last: usize) -> Result<()> {
     if last > MAX_LAST_DIM {
         return Err(Error::Msg(format!(

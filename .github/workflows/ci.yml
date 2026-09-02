@@ -221,6 +221,23 @@ jobs:
       - name: Compile-check GPU-capability suite
         run: cargo test -p jammi-ai --features live-gpu-tests --test gpu_capability --no-run
 
+      # Not every test in that suite needs a device. The manifest↔PROBED_OPS
+      # cross-check is a pure data comparison between
+      # `ci/release-feature-manifest.json` and the in-crate `PROBED_OPS`
+      # table, and is deliberately NOT GPU-gated — but `--no-run` above meant
+      # it compiled on every PR and EXECUTED on none of them, so its proof
+      # arrived only on the GPU-host lane, after merge. That gap is not
+      # covered by anything else: `check_release_manifest.py` is an
+      # internal-consistency floor over the manifest ALONE (the three lanes
+      # agree, every op sits in exactly one category, every sub-kernel's
+      # parent/launch-site citation resolves), so a bogus op present in all
+      # THREE lanes passes it and is caught only here, where the manifest is
+      # compared against the table of ops the engine actually probes. Runs on
+      # this CPU runner with an exact name filter: the step reddens if the
+      # test is renamed, rather than silently matching nothing and passing.
+      - name: Manifest ↔ PROBED_OPS cross-check (CPU)
+        run: cargo test -p jammi-ai --features live-gpu-tests --test gpu_capability manifest_capability
+
   test-live:
     name: Test (live)
     runs-on: ubuntu-latest
@@ -919,6 +936,25 @@ jobs:
           # the single `ci-summary` gate covers it.
           - name: doc↔enum parity
             cmd: python3 ci/scripts/check_doc_parity.py
+          # `ci/release-feature-manifest.json` states one capability surface
+          # three times (once per CUDA release lane), and classifies every op
+          # it names by HOW that op is proven. The category set is CLOSED at
+          # TWO proof mechanisms — an observed dispatch-registry delta, or an
+          # admitted parent's delta — so an op that neither dispatches nor has
+          # an admitted parent has no category to sit in at all. This guard is
+          # the internal-consistency floor: the three lanes must agree, every
+          # op must sit in exactly one category (two categories = two
+          # contradictory proof claims), and every internal sub-kernel's
+          # parent + launch-site citation must resolve. It reads the manifest
+          # ALONE, so it cannot see an op the manifest names that the engine
+          # never probes — that is the `Manifest ↔ PROBED_OPS cross-check
+          # (CPU)` step's job, in `compile-check`. Whether a declared
+          # capability HOLDS on a real device stays with capability_surface.rs
+          # and the flash-attn closure guard.
+          - name: release manifest consistency
+            cmd: python3 ci/scripts/check_release_manifest.py
+          - name: release manifest consistency (self-test)
+            cmd: python3 ci/scripts/check_release_manifest.py --self-test
           # Every measurement-shaped number (an N/M element count with M >= 64,
           # an X%/X.Y%, or a bare 2-6-decimal cosine) with a trigger word
           # ANYWHERE in its enclosing doc-comment BLOCK, in a kernel/test doc

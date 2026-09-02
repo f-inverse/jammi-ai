@@ -40,11 +40,18 @@ pub struct PyDatabase {
     /// Guards spawning the ephemeral timeout scanner exactly once per
     /// connection, on the first `ephemeral_session` call.
     ephemeral_scanner: std::sync::Once,
-    /// The embedded training worker this connection owns. An embedded `Database`
-    /// both submits training jobs and runs them; the worker stops when the
-    /// `Database` drops (RAII), OR gracefully and deterministically on `close()`
-    /// via `EmbeddedWorker::stop_and_join`.
-    _worker: jammi_ai::fine_tune::worker::EmbeddedWorker,
+    /// The embedded training worker this connection owns, when this process is
+    /// configured to run one. An embedded `Database` both submits training jobs
+    /// and runs them; the worker stops when the `Database` drops (RAII), OR
+    /// gracefully and deterministically on `close()` via
+    /// `EmbeddedWorker::stop_and_join`.
+    ///
+    /// `None` when `training.run_worker` is `false`: this connection still
+    /// mounts the whole training surface and still accepts submissions, it just
+    /// never claims. The absence is represented by the `Option` rather than by a
+    /// spawned-but-idle worker, so "no claim loop exists" is a state the type
+    /// carries instead of a behaviour a reader has to infer.
+    _worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker>,
     /// Set exactly once, by [`PyDatabase::close`]. Every other pymethod calls
     /// [`PyDatabase::check_open`] first and raises the typed `BackendError`
     /// once this is set — the FFI-boundary guard making "a call against an
@@ -60,15 +67,41 @@ impl PyDatabase {
     /// layer built on top of this crate) call it directly so
     /// the resulting database shares the tokio runtime that drives every
     /// `InferenceSession` future.
+    ///
+    /// # `training.run_worker` — whether this process claims
+    ///
+    /// The embedded engine both accepts training submissions and runs them, so
+    /// it is the arm that has to be able to stop running them. `config`'s
+    /// [`jammi_db::config::TrainingConfig::run_worker`] decides, and it is read
+    /// here from the SAME configuration the server binary reads (the
+    /// `#[pyfunction] open_local` wrapper builds it with `JammiConfig::load`, so
+    /// `JAMMI_TRAINING__RUN_WORKER=false` reaches an embedded process exactly as
+    /// it reaches a server process):
+    ///
+    /// * `true` (the default) — the claim loop runs here, on the shared runtime.
+    /// * `false` — no worker is spawned at all. This connection still accepts
+    ///   `fine_tune` (and every other training) submission and still serves
+    ///   their status, but never claims one. On a SQLite catalog — single-process
+    ///   by the `unix-excl` contract — a submitted job therefore stays `queued`,
+    ///   with its `{"state":"pending"}` acceleration report, until this process
+    ///   `close()`s the directory (the pymethod below) and a process configured
+    ///   to claim opens it. On a multi-process catalog (Postgres) a claiming
+    ///   process can run concurrently, so the job is picked up without waiting
+    ///   for this one.
     pub fn open(config: JammiConfig) -> Result<Self, JammiError> {
         let runtime = Arc::new(tokio::runtime::Runtime::new()?);
         let session = runtime.block_on(InferenceSession::open(config))?;
-        // Spawn the embedded training worker on the shared runtime. The spawn
-        // must happen inside the runtime context; the worker holds a `Weak` to
-        // the session so it never keeps it alive, and the guard stops it on drop.
-        let worker = {
+        // Spawn the embedded training worker on the shared runtime, if this
+        // process is configured to run one. The spawn must happen inside the
+        // runtime context; the worker holds a `Weak` to the session so it never
+        // keeps it alive, and the guard stops it on drop.
+        let worker = if session.inner_config().training.run_worker {
             let _enter = runtime.enter();
-            jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)?
+            Some(jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(
+                &session,
+            )?)
+        } else {
+            None
         };
         Ok(Self {
             session,
@@ -127,42 +160,139 @@ impl PyDatabase {
 
 #[pymethods]
 impl PyDatabase {
-    /// Gracefully close this connection.
+    /// Gracefully close this connection and RELEASE the catalog file.
     ///
-    /// Signals the embedded training worker to stop and blocks until it
-    /// actually has (`EmbeddedWorker::stop_and_join` — the GIL is released
-    /// while blocking, so other Python threads keep running). Per that
-    /// method's own documented bound, this returns immediately if the worker
-    /// is idle between claim attempts (at most the configured
-    /// `idle_poll`, 1s by default), or after the remaining duration of a job
-    /// already claimed and running when `close()` is called — an in-flight
-    /// run is never force-cancelled, it always finishes and finalizes before
-    /// this returns.
+    /// Two awaited steps, in this order, with the GIL released across both
+    /// (`py.detach`, so other Python threads keep running):
     ///
-    /// This is a DETERMINISTIC teardown point, not merely a request to stop:
-    /// once `close()` returns, the worker this connection owned has made no
-    /// further catalog writes and never will again, and this connection's own
-    /// clone of the shared session is released. A caller that also holds
-    /// derived handles from this connection (a `TrainingJob`, the `audit`
-    /// handle, an `EphemeralSession`) must drop those too before every engine
-    /// connection this `Database` is responsible for is actually gone — each
-    /// carries its own clone of the same shared session, by design, so it
-    /// keeps working independently of this connection's lifetime. This is the
-    /// primitive a caller needing to do something that races a live
-    /// connection to the same catalog file — e.g. write to it through a
-    /// separate raw connection — reaches for; ordinary usage needs no explicit
-    /// `close()`, since the embedded engine otherwise releases on drop (RAII),
-    /// which is why the higher-level `jammi.EmbeddedBackend.close()` wrapper
-    /// still raises `NotSupportedOnBackend` today.
+    /// 1. **Stop the embedded training worker**, when this connection has one.
+    ///    Signals it to stop and blocks until it actually has
+    ///    (`EmbeddedWorker::stop_and_join`). Per that
+    ///    method's own documented bound, this returns immediately if the
+    ///    worker is idle between claim attempts (at most the configured
+    ///    `idle_poll`, 1s by default), or after the remaining duration of a job
+    ///    already claimed and running when `close()` is called — an in-flight
+    ///    run is never force-cancelled, it always finishes and finalizes before
+    ///    this returns.
+    /// 2. **Close the catalog connection pool** — the same release handshake
+    ///    [`jammi_db::session::JammiSession::close`] performs, reached here
+    ///    through this session's shared catalog backend
+    ///    (`Catalog::backend_arc().close()`), so the embedded binding and the
+    ///    native session agree on what "closed" means rather than the binding
+    ///    having a weaker private notion of it. It closes the pool, drains its
+    ///    connection accounting to zero, and waits for SQLite's own evidence of
+    ///    release (`catalog.db-wal` gone).
     ///
-    /// Idempotent — calling `close()` again is a no-op. Every OTHER method on
-    /// this handle raises `jammi.errors.BackendError` once this has run.
+    /// **The order is load-bearing.** The worker is the one component that
+    /// takes new catalog connections on a schedule this call does not control,
+    /// so it is stopped FIRST: after step 1 nothing will check a connection out
+    /// again, and the pool therefore drains monotonically to a bounded release.
+    /// Closing the pool first would leave a live worker acquiring against a
+    /// closing pool — its in-flight run's finalize write would fail with a
+    /// pool-closed error instead of committing, turning an orderly teardown
+    /// into a partial write, and the drain would be racing a party still
+    /// handing connections back. Step 2 runs unconditionally, even when the
+    /// worker's join reports an error (a task panic): a failed teardown is
+    /// exactly when leaving the catalog file locked would be worst, so the
+    /// release is never made conditional on it, and the join error is
+    /// propagated afterwards.
+    ///
+    /// # With `training.run_worker = false`
+    ///
+    /// Step 1 has nothing to do — no claim loop was ever started (see
+    /// [`PyDatabase::open`]) — so it is skipped rather than joining a worker
+    /// that does not exist, and step 2 runs exactly as it does for a
+    /// worker-bearing connection. The release is therefore prompt (no idle-poll
+    /// wait, no in-flight run to finish) and complete, which is precisely what
+    /// that configuration is for on a SQLite catalog: this process submits and
+    /// holds the jobs `queued`, and `close()` is the moment its directory —
+    /// with those queued jobs in it — becomes a claiming process's to open.
+    ///
+    /// # What "released" buys the caller
+    ///
+    /// The SQLite catalog opens through the `unix-excl` VFS (see
+    /// [`jammi_db::catalog::backend_sqlite`]): a *process-scoped* exclusive
+    /// lock is held while ANY connection in this process has the file open, and
+    /// the WAL index lives in heap memory rather than in a `-shm` file. So
+    /// while this connection's pool is open:
+    ///
+    /// * another OS PROCESS opening the same catalog directory is refused with
+    ///   a typed `jammi.errors.BackendError` naming the single-process
+    ///   contract; and
+    /// * a foreign SQLite LIBRARY INSTANCE inside this same process (CPython's
+    ///   `sqlite3` module alongside this extension's statically bundled
+    ///   amalgamation) sees a *divergent* image of the database — heap memory
+    ///   is not shareable, so reads are stale and writes are invisible to the
+    ///   engine.
+    ///
+    /// Once `close()` returns, both are over: the catalog file is released to
+    /// other processes (a successor process opens the directory immediately,
+    /// without waiting out a busy timeout) and to a foreign in-process SQLite
+    /// instance. A plain drop is NOT that point — `sqlx` returns a connection
+    /// to the pool from a background task, so dropping the handle releases
+    /// nothing at any bounded moment. This is the primitive a caller needing to
+    /// touch the catalog file through a separate raw connection reaches for,
+    /// and the two sanctioned raw-`sqlite3` touch points in this crate's test
+    /// suite depend on exactly it.
+    ///
+    /// # Scope of the release
+    ///
+    /// The pool is SHARED by every handle derived from this connection, by
+    /// design (a `TrainingJob`, the `audit` handle, an `EphemeralSession` each
+    /// carry a clone of the same session). Releasing the file therefore has to
+    /// be, and is, connection-wide: after `close()` those derived handles'
+    /// catalog operations fail too, and the pool is never silently reopened —
+    /// re-taking the exclusive lock behind the caller's back would undo the
+    /// very handover they just asked for. A caller that still needs them must
+    /// finish with them before closing, and open a fresh connection afterwards.
+    ///
+    /// # The public surface
+    ///
+    /// `jammi.EmbeddedBackend.close()` — what a caller of
+    /// `jammi.connect("file://…")` actually holds — delegates straight to this
+    /// method, and its `__exit__` calls the same, so a `with` block releases
+    /// the catalog on exit. The wrapper adds no private notion of "closed": the
+    /// binding, the native session and the client all mean this handshake by
+    /// the word.
+    ///
+    /// `close` is therefore an ordinary member of the client's `Session`
+    /// surface on BOTH transports, not a `jammi.Capability` — the enum member
+    /// `CLOSE` no longer exists. It was there while the wrapper raised
+    /// `NotSupportedOnBackend` on the claim that the embedded engine "releases
+    /// on drop"; that claim is exactly what the `unix-excl` seam falsifies (see
+    /// above — a drop releases nothing at any bounded moment), so the flag was
+    /// hiding a primitive that existed rather than describing a divergence.
+    ///
+    /// What each transport releases still differs, and the remote arm is
+    /// unaffected in every respect: `jammi.RemoteDatabase.close()` closes a
+    /// gRPC channel and a Flight client, and holds no catalog file at all — the
+    /// file this releases exists only on the embedded arm. The CONTRACT is
+    /// shared, though: both are idempotent, and after either one every verb
+    /// raises `jammi.errors.BackendError`.
+    ///
+    /// Idempotent — calling `close()` again is a no-op that returns `None`,
+    /// never an error. Every OTHER method on this handle raises
+    /// `jammi.errors.BackendError` once this has run.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         if self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return Ok(());
         }
-        py.detach(|| self.runtime.block_on(self._worker.stop_and_join()))
-            .map_err(to_pyerr)
+        py.detach(|| {
+            self.runtime.block_on(async {
+                let stopped = match &self._worker {
+                    Some(worker) => worker.stop_and_join().await,
+                    // `training.run_worker = false`: there is no claim loop to
+                    // stop. The pool close below still runs — the catalog
+                    // release is what a caller closes for, and it must not
+                    // depend on this connection having happened to own a worker.
+                    None => Ok(()),
+                };
+                let backend = self.session.catalog().backend_arc();
+                backend.close().await;
+                stopped
+            })
+        })
+        .map_err(to_pyerr)
     }
 
     /// Attach to an existing training job by id, on a freshly-opened
@@ -183,6 +313,48 @@ impl PyDatabase {
             Arc::clone(&self.runtime),
             Arc::clone(&self.session),
         )
+    }
+
+    /// List every training job visible to the current tenant, most recent
+    /// first. Each entry is a dict carrying the SAME field set the wire's
+    /// `TrainingJobSummary` carries — `job_id`, `kind`, `status`,
+    /// `base_model_id`, `output_model_id`, `created_at`, `error` — so a caller
+    /// reads one vocabulary regardless of transport. A listing of
+    /// `TrainingJob.status()` answers plus the submit-time identity, not a
+    /// progress surface: the engine persists run metrics only at finalization,
+    /// so there is no mid-run metric here to expose.
+    ///
+    /// `output_model_id` is the empty string until the job completes and
+    /// `error` is empty unless it failed — the same two conventions
+    /// `TrainingService.ListTrainingJobs` relays, reproduced here rather than
+    /// mapping absence onto `None` on one transport only.
+    ///
+    /// Tenant-scoped by the catalog read itself
+    /// (`WHERE tenant_id = $1 OR tenant_id IS NULL`), which is the same call —
+    /// `Catalog::list_training_jobs` — the server's own handler makes, so the
+    /// two arms cannot drift on which rows are visible.
+    fn list_training_jobs(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
+        let records = self
+            .runtime
+            .block_on(self.session.catalog().list_training_jobs())
+            .map_err(to_pyerr)?;
+        let list = PyList::empty(py);
+        for record in &records {
+            let entry = PyDict::new(py);
+            entry.set_item("job_id", &record.job_id)?;
+            entry.set_item("kind", &record.kind)?;
+            entry.set_item("status", &record.status)?;
+            entry.set_item("base_model_id", &record.base_model_id)?;
+            entry.set_item(
+                "output_model_id",
+                record.output_model_id.as_deref().unwrap_or(""),
+            )?;
+            entry.set_item("created_at", &record.created_at)?;
+            entry.set_item("error", record.error_message.as_deref().unwrap_or(""))?;
+            list.append(entry)?;
+        }
+        Ok(list.into_any().unbind())
     }
 
     /// Set the sticky tenant scope on this connection.
@@ -322,6 +494,45 @@ impl PyDatabase {
         descriptor
             .map(|d| serializable_to_pydict(py, &d))
             .transpose()
+    }
+
+    /// List the ANN index segments of one result table, ordered by
+    /// `segment_id`. Each entry is a dict carrying exactly `segment_id`
+    /// (`int`), `index_path` (`str`) and `row_count` (`int`) — the whole
+    /// `index_segments` row a reader needs to locate and size a segment, the
+    /// same three fields the remote transport returns. The segment-set peer of
+    /// `list_sources` on a result table's own index; registry introspection,
+    /// not a SQL query (the catalog's own tables are not in the federation
+    /// `sql` runs over).
+    ///
+    /// Returns an EMPTY list — never an error — for a table with no segments,
+    /// a table whose index is flat (unsegmented), an unknown table, and a table
+    /// this session's tenant cannot resolve. The last two answer identically by
+    /// design, so the verb is not an existence oracle for a peer tenant's table
+    /// names; the tenant gate itself is
+    /// [`jammi_db::session::JammiSession::list_index_segments`]'s, reached here
+    /// through the same `Session` abstraction every other verb uses rather than
+    /// through the un-gated catalog read underneath it.
+    ///
+    /// The dict is built field-by-field here rather than serialized from the
+    /// engine struct: the key set a Python caller sees is then stated at the
+    /// boundary, and an engine-side field added later cannot leak into it
+    /// silently.
+    fn list_index_segments(&self, py: Python<'_>, table_name: &str) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
+        let segments = self
+            .runtime
+            .block_on(self.local_session().list_index_segments(table_name))
+            .map_err(to_pyerr)?;
+        let list = PyList::empty(py);
+        for segment in &segments {
+            let entry = PyDict::new(py);
+            entry.set_item("segment_id", segment.segment_id)?;
+            entry.set_item("index_path", &segment.index_path)?;
+            entry.set_item("row_count", segment.row_count)?;
+            list.append(entry)?;
+        }
+        Ok(list.into_any().unbind())
     }
 
     /// List a descriptor for every model registered to the current tenant. Each

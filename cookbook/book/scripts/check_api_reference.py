@@ -30,6 +30,10 @@ REQUIRED: dict[str, list[str]] = {
     # setup / sources
     "add_source": ["url", "format"],
     "list_sources": [],
+    # the per-table ANN segment listing (campaign #446) — `table_name` is
+    # positional-or-keyword on both arms, which this probe accepts as a real
+    # parameter of the verb.
+    "list_index_segments": ["table_name"],
     "get_server_info": [],
     "set_tenant": [],
     "tenant_scope": [],
@@ -72,6 +76,10 @@ REQUIRED: dict[str, list[str]] = {
         "base_model",
         "edge_provenance",
     ],
+    # attach-by-id + the tenant-scoped listing (campaign #446): a job handle
+    # outlives the connection that submitted it, on both arms.
+    "training_job": ["job_id"],
+    "list_training_jobs": [],
     "eval_embeddings": ["source", "golden_source"],
     "eval_compare": ["embedding_tables", "source", "golden_source"],
     "eval_inference": ["model", "source", "columns", "task", "golden_source", "label_column"],

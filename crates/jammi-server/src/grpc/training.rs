@@ -14,7 +14,12 @@
 //! handler carries both into the response. `TrainingStatus` reads the job record
 //! back and returns its status, output model id, and — when the job failed — the
 //! error message, so a remote `wait()` can retrieve the result and a failure
-//! reason. `ListTrainingJobs` reads the same lifecycle projection for every job
+//! reason. The output model id is resolved through the engine's
+//! [`jammi_ai::fine_tune::training_job::resolve_model_id`] — the SAME call the
+//! embedded attach-by-id handle makes — so it is the stamped id once the job
+//! completes and the deterministic derived id before then, byte-identical to
+//! what the embedded surface reports at every lifecycle state.
+//! `ListTrainingJobs` reads the same lifecycle projection for every job
 //! visible to the session tenant, most recent first — a listing of
 //! `TrainingStatus` answers plus each job's submit-time identity, never a
 //! progress surface. There is no progress stream — the abstraction exposes
@@ -28,7 +33,7 @@
 use std::sync::Arc;
 
 use jammi_ai::fine_tune::spec::TrainingSpec;
-use jammi_ai::fine_tune::training_job::TrainingJob;
+use jammi_ai::fine_tune::training_job::{resolve_model_id, TrainingJob};
 use jammi_ai::session::InferenceSession;
 use jammi_ai::wire::training_spec_from_proto;
 use tonic::{Request, Response, Status};
@@ -93,11 +98,20 @@ impl TrainingService for TrainingServer {
         .await
         .map_err(map_engine_error)?;
 
+        // The output model id, resolved from the row by the ENGINE's own rule
+        // ([`resolve_model_id`]) — the same call the embedded attach handle
+        // makes, never a second spelling of the naming rule here. Once the job
+        // has completed, that is the catalog's stamped `output_model_id`;
+        // before then (queued / running, or a failed row that never stamped
+        // one) it re-derives the deterministic id the submit call itself
+        // returned. So a remote handle attached mid-run reports the byte-
+        // identical id its embedded peer does, at every lifecycle state — the
+        // K4 divergence this closes was a `""` here against a derived id there.
+        let model_id = resolve_model_id(&req.job_id, &record).map_err(map_engine_error)?;
+
         Ok(Response::new(pb::TrainingStatusResponse {
             status: record.status,
-            // The output model id is set once the job completes; a queued /
-            // running job carries the empty string here.
-            model_id: record.output_model_id.unwrap_or_default(),
+            model_id,
             // The failure message is surfaced only on a failed job; empty
             // otherwise so a remote `wait()` reads it exactly when status is
             // "failed".
@@ -141,7 +155,13 @@ impl TrainingService for TrainingServer {
                     kind: record.kind,
                     status: record.status,
                     base_model_id: record.base_model_id,
-                    // Empty until the job completes, matching `TrainingStatus`.
+                    // The catalog column verbatim: empty until the job
+                    // completes and stamps it. Deliberately NOT
+                    // `TrainingStatus.model_id`'s contract, which resolves the
+                    // id the job WILL register under at every state — this
+                    // summary field answers "has the output row landed yet",
+                    // and the embedded `list_training_jobs` projection relays
+                    // the same column the same way, so the two arms agree.
                     output_model_id: record.output_model_id.unwrap_or_default(),
                     created_at: record.created_at,
                     // Non-empty exactly when status is "failed", matching

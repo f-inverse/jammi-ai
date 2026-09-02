@@ -7,10 +7,15 @@
 // `layer_norm_f16.cu`'s identical note: this is a SEPARATE translation
 // unit from `geglu.cu`, with its own copy of the `gelu_erf_cdf`/
 // `gelu_erf_pdf` helpers and its own `#include <cuda_fp16.h>` — NOT a
-// shared `.cuh`. `geglu.cu` is byte-untouched.
+// shared `.cuh`. That campaign added this file WITHOUT touching
+// `geglu.cu` at all; the two have since been edited in lockstep exactly
+// once, by campaign #446's finding-4 indexing fix below, which is a
+// property of the shared loop shape rather than of either dtype.
 //
-// Domain and the purely-elementwise indexing are IDENTICAL to `geglu.cu`'s
-// module doc. Per the per-op f16 reference-regime table
+// Domain, the purely-elementwise indexing, and the INDEXING CONTRACT
+// (`size_t` induction variable, 32-bit scalar parameters — campaign #446
+// finding 4) are IDENTICAL to `geglu.cu`'s module doc; that file states
+// the contract and why each half of it needs the other. Per the per-op f16 reference-regime table
 // (`docs/maintainer/cuda-kernel-guide.md` §3.10), this op is DTYPE-NATIVE,
 // TWO rounding points in forward (round the activation to f16 immediately
 // — ROUND 1 — matching the upstream two-op reference's own
@@ -41,11 +46,11 @@ extern "C" __global__ void geglu_fwd_f16(
     const __half* wi_out, __half* out,
     const unsigned int intermediate, const unsigned int n_out
 ) {
-    for (unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n_out;
-         idx += blockDim.x * gridDim.x) {
-        unsigned int row = idx / intermediate;
-        unsigned int col = idx % intermediate;
-        size_t base = (size_t)row * 2 * (size_t)intermediate;
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < n_out;
+         idx += (size_t)blockDim.x * gridDim.x) {
+        size_t row = idx / intermediate;
+        unsigned int col = (unsigned int)(idx % intermediate);
+        size_t base = row * 2 * (size_t)intermediate;
         float gate = __half2float(wi_out[base + col]);
         float up = __half2float(wi_out[base + intermediate + col]);
         float act_f32 = gate * gelu_erf_cdf(gate);
@@ -63,11 +68,11 @@ extern "C" __global__ void geglu_bwd_dwi_out_f16(
     const __half* wi_out, const __half* dy, __half* dwi_out,
     const unsigned int intermediate, const unsigned int n_out
 ) {
-    for (unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n_out;
-         idx += blockDim.x * gridDim.x) {
-        unsigned int row = idx / intermediate;
-        unsigned int col = idx % intermediate;
-        size_t base = (size_t)row * 2 * (size_t)intermediate;
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < n_out;
+         idx += (size_t)blockDim.x * gridDim.x) {
+        size_t row = idx / intermediate;
+        unsigned int col = (unsigned int)(idx % intermediate);
+        size_t base = row * 2 * (size_t)intermediate;
         float gate = __half2float(wi_out[base + col]);
         float up = __half2float(wi_out[base + intermediate + col]);
         float dyi = __half2float(dy[idx]);

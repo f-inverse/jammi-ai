@@ -173,7 +173,8 @@ pub struct JammiConfig {
     pub embedding: EmbeddingConfig,
     /// Fine-tuning hyperparameter defaults.
     pub fine_tuning: FineTuningConfig,
-    /// Training-worker lease/heartbeat/poll timing.
+    /// Training-worker settings: whether this process runs the claim loop, and
+    /// the lease/heartbeat/poll timing it runs it with.
     pub training: TrainingConfig,
     /// Cache layer settings (ANN cache, embedding cache).
     pub cache: CacheConfig,
@@ -655,18 +656,21 @@ pub struct FineTuningConfig {
     pub checkpoint_fraction: f64,
 }
 
-/// Training-worker timing: how long a claim leases a job, how often the worker
+/// Training-worker settings: whether this process runs the claim loop at all,
+/// and — when it does — how long a claim leases a job, how often the worker
 /// renews that lease, and how often an idle worker polls for new work.
 ///
-/// All three are seconds. Defaults reproduce the engine's built-in timing
-/// (30 s lease, 10 s heartbeat, 1 s idle poll), so a config without a
-/// `[training]` section behaves identically to one that omits it. Short values
-/// let a deployment (or a test) drive lease-expiry and reclaim quickly.
+/// The three timings are seconds. Defaults reproduce the engine's built-in
+/// timing (30 s lease, 10 s heartbeat, 1 s idle poll) with the claim loop on,
+/// so a config without a `[training]` section behaves identically to one that
+/// omits it. Short values let a deployment (or a test) drive lease-expiry and
+/// reclaim quickly.
 ///
 /// # TOML
 ///
 /// ```toml
 /// [training]
+/// run_worker = true
 /// lease_duration_secs = 30
 /// heartbeat_interval_secs = 10
 /// idle_poll_secs = 1
@@ -674,6 +678,29 @@ pub struct FineTuningConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct TrainingConfig {
+    /// Whether THIS process runs the training claim loop at all. Default: `true`.
+    ///
+    /// `true` — the process opens the catalog and drives the loop: it claims
+    /// queued jobs, renews the lease while they run, and reclaims leases that
+    /// expired under a dead claimant.
+    ///
+    /// `false` — the process still mounts and serves the training surface and
+    /// still accepts submissions, but never claims. Submitted jobs stay
+    /// `queued` until some process configured with `run_worker = true` opens
+    /// the catalog. On a single-process catalog (SQLite) that means this
+    /// process must close the catalog first; a multi-process catalog
+    /// (Postgres) can run both concurrently.
+    ///
+    /// This is a runtime/driver setting, not a build feature and not a separate
+    /// code path: whatever arm decides whether to spawn a claim loop reads this
+    /// same key, so a deployment that serves over the wire and one that runs
+    /// in-process answer the question identically. Turning it off never
+    /// removes the submission surface — only the claiming.
+    ///
+    /// The timings below describe the loop this flag gates; they are validated
+    /// by [`Self::worker_intervals`] regardless of `run_worker`, so a config
+    /// that switches the loop on later cannot smuggle in bad timing.
+    pub run_worker: bool,
     /// How long a claim leases a job before it is considered orphaned and
     /// reclaimable. Default: 30.
     pub lease_duration_secs: u64,
@@ -689,6 +716,9 @@ pub struct TrainingConfig {
 impl Default for TrainingConfig {
     fn default() -> Self {
         Self {
+            // Default on: an unconfigured deployment is a whole one — it both
+            // accepts jobs and works them. Opting out is the explicit act.
+            run_worker: true,
             lease_duration_secs: 30,
             heartbeat_interval_secs: 10,
             idle_poll_secs: 1,
@@ -1035,7 +1065,7 @@ impl JammiConfig {
             }
             None => Self::default(),
         };
-        config.apply_env_overrides();
+        config.apply_env_overrides()?;
         // Catch a partial cloud-credential set (e.g. an R2 `access_key_id`
         // without its `secret_access_key`) at load time rather than deep
         // inside the first object-store request.
@@ -1079,7 +1109,15 @@ impl JammiConfig {
         None
     }
 
-    fn apply_env_overrides(&mut self) {
+    /// Layer `JAMMI_*` environment overrides onto the parsed file.
+    ///
+    /// Most arms are lenient: an unparsable numeric or enum value is dropped
+    /// (with a warning for the enums) and the file's value survives, because a
+    /// bad batch size degrades throughput at worst. The `run_worker` arm is
+    /// not: it decides whether this process takes work at all, so an
+    /// unparsable value is a hard [`JammiError::Config`] rather than a silent
+    /// fall-back to the opposite of what the operator asked for.
+    fn apply_env_overrides(&mut self) -> Result<()> {
         if let Ok(v) = std::env::var("JAMMI_ARTIFACT_DIR") {
             self.artifact_dir = PathBuf::from(v);
         }
@@ -1142,6 +1180,11 @@ impl JammiConfig {
             }
         }
 
+        // Training
+        if let Ok(v) = std::env::var("JAMMI_TRAINING__RUN_WORKER") {
+            self.training.run_worker = parse_env_bool("JAMMI_TRAINING__RUN_WORKER", &v)?;
+        }
+
         // Logging
         if let Ok(v) = std::env::var("JAMMI_LOGGING__LEVEL") {
             self.logging.level = v;
@@ -1177,6 +1220,33 @@ impl JammiConfig {
                 )
             };
         }
+
+        Ok(())
+    }
+}
+
+/// Parse a boolean environment-variable override.
+///
+/// Accepts `true`/`false` and the numeric spellings `1`/`0`, case-insensitively
+/// and with surrounding whitespace trimmed — the four spellings a shell,
+/// a container manifest, or an orchestrator template actually emits.
+///
+/// Everything else is a [`JammiError::Config`] naming the variable, the
+/// rejected value, and the accepted set. A boolean override answers a
+/// yes/no question about what the process will do, and there is no safe
+/// direction to guess in: dropping the value silently would leave the process
+/// doing the opposite of what the operator wrote, with nothing in the config
+/// file to explain it. `env_var=maybe` is outside the domain, so nothing is
+/// computed from it.
+fn parse_env_bool(var: &str, raw: &str) -> Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        // Report the operator's literal string, not the normalized one, so a
+        // stray quote or trailing character is visible in the message.
+        _ => Err(JammiError::Config(format!(
+            "Invalid boolean '{raw}' for {var}. Expected: true, false, 1, 0"
+        ))),
     }
 }
 
@@ -1276,6 +1346,23 @@ fn is_valid_env_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `JAMMI_TRAINING__RUN_WORKER` has a fixed name, so the tests that set it
+    /// cannot dodge each other with per-test names the way the interpolation
+    /// tests do — and `JammiConfig::load` reads it, so a parallel `load` test
+    /// would otherwise see whatever a neighbour left behind. Every test that
+    /// mutates that variable, and every test that calls `load`, takes this lock.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take [`ENV_LOCK`], ignoring poisoning: a panicking test leaves the guard
+    /// poisoned, but the env it touched is still the env the next test must
+    /// serialize against, so refusing the lock would turn one failure into a
+    /// cascade of unrelated ones.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn catalog_config_round_trip_sqlite_default() {
@@ -1479,6 +1566,7 @@ mod tests {
 
     #[test]
     fn load_rejects_partial_r2_credentials() {
+        let _guard = env_lock();
         // account_id + access_key_id but no secret — the fail-closed
         // CloudConfig::validate must reject this at load time.
         let dir = tempfile::tempdir().unwrap();
@@ -1509,6 +1597,7 @@ mod tests {
         // config without a `[training]` section behaves identically. These three
         // values are the contract; the worker derives its `Duration`s from them.
         let t = TrainingConfig::default();
+        assert!(t.run_worker);
         assert_eq!(t.lease_duration_secs, 30);
         assert_eq!(t.heartbeat_interval_secs, 10);
         assert_eq!(t.idle_poll_secs, 1);
@@ -1538,6 +1627,9 @@ mod tests {
         assert_eq!(
             cfg.training,
             TrainingConfig {
+                // Not spelled in the TOML above: the container-level
+                // `#[serde(default)]` must fill it from `Default`, on.
+                run_worker: true,
                 lease_duration_secs: 8,
                 heartbeat_interval_secs: 2,
                 idle_poll_secs: 1,
@@ -1548,6 +1640,199 @@ mod tests {
         assert_eq!(intervals.heartbeat, std::time::Duration::from_secs(2));
     }
 
+    // ── `run_worker`: whether THIS process runs the claim loop ──────────────
+
+    #[test]
+    fn training_config_default_runs_the_worker() {
+        // An unconfigured deployment is a whole one: it accepts jobs AND works
+        // them. Opting out has to be an explicit act, so the default is on.
+        assert!(TrainingConfig::default().run_worker);
+    }
+
+    #[test]
+    fn training_config_toml_without_run_worker_defaults_to_true() {
+        // A `[training]` section that predates the key — the shape every
+        // already-deployed config file has — still parses, and parses to on.
+        let toml_src = r#"
+            [training]
+            lease_duration_secs = 30
+            heartbeat_interval_secs = 10
+            idle_poll_secs = 1
+        "#;
+        let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
+        assert!(cfg.training.run_worker);
+        assert_eq!(cfg.training, TrainingConfig::default());
+
+        // And a file with no `[training]` section at all.
+        let bare: JammiConfig = toml::from_str("artifact_dir = \"/tmp/jammi\"").unwrap();
+        assert!(bare.training.run_worker);
+    }
+
+    #[test]
+    fn training_config_toml_run_worker_false_parses_to_false() {
+        let toml_src = r#"
+            [training]
+            run_worker = false
+        "#;
+        let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
+        assert!(!cfg.training.run_worker);
+        // Switching the loop off leaves the timings at their defaults — and
+        // they are still validated, so a config that switches the loop back on
+        // later cannot smuggle in timing that was never checked.
+        assert_eq!(cfg.training.lease_duration_secs, 30);
+        assert_eq!(cfg.training.heartbeat_interval_secs, 10);
+        assert_eq!(cfg.training.idle_poll_secs, 1);
+        assert!(cfg.training.worker_intervals().is_ok());
+    }
+
+    #[test]
+    fn training_config_equality_distinguishes_run_worker() {
+        // The derived `PartialEq`/`Eq` must actually see the new field: two
+        // configs identical but for `run_worker` are NOT equal. Without this,
+        // the `assert_eq!(cfg.training, ...)` assertions above would hold
+        // vacuously for a field equality ignored.
+        let on = TrainingConfig::default();
+        let off = TrainingConfig {
+            run_worker: false,
+            ..TrainingConfig::default()
+        };
+        assert_ne!(on, off);
+        assert_eq!(off, off.clone());
+        assert_eq!(on, TrainingConfig::default());
+    }
+
+    #[test]
+    fn parse_env_bool_accepts_the_four_spellings() {
+        // Every spelling a shell, a container manifest, or an orchestrator
+        // template actually emits — case-insensitive, whitespace-trimmed.
+        for raw in ["true", "TRUE", "True", "1", " true ", "\ttrue\n"] {
+            assert!(
+                parse_env_bool("JAMMI_TEST__BOOL", raw).unwrap(),
+                "raw = {raw:?}"
+            );
+        }
+        for raw in ["false", "FALSE", "False", "0", " false ", "\tfalse\n"] {
+            assert!(
+                !parse_env_bool("JAMMI_TEST__BOOL", raw).unwrap(),
+                "raw = {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_env_bool_rejects_everything_outside_the_domain() {
+        // The control: each of these is a real thing an operator types, and
+        // every one must be a typed error rather than a silent guess. The empty
+        // and whitespace-only cases matter most — `export VAR=` is the classic
+        // accidental "unset", and reading it as `false` would stop a process
+        // claiming work with nothing in the config file to explain it.
+        for raw in [
+            "",
+            " ",
+            "\t",
+            "yes",
+            "no",
+            "on",
+            "off",
+            "y",
+            "n",
+            "2",
+            "-1",
+            "0.0",
+            "01",
+            "truee",
+            "true false",
+            "null",
+            "none",
+            "\"true\"",
+        ] {
+            let err = parse_env_bool("JAMMI_TRAINING__RUN_WORKER", raw).unwrap_err();
+            match err {
+                JammiError::Config(msg) => {
+                    assert!(
+                        msg.contains("JAMMI_TRAINING__RUN_WORKER"),
+                        "message must name the variable; raw = {raw:?}, msg = {msg}"
+                    );
+                    assert!(
+                        msg.contains("true, false, 1, 0"),
+                        "message must name the accepted set; raw = {raw:?}, msg = {msg}"
+                    );
+                }
+                other => panic!("expected JammiError::Config for {raw:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn env_override_run_worker_flips_the_file_in_both_directions() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let on_path = dir.path().join("on.toml");
+        std::fs::write(&on_path, "[training]\nrun_worker = true\n").unwrap();
+        let off_path = dir.path().join("off.toml");
+        std::fs::write(&off_path, "[training]\nrun_worker = false\n").unwrap();
+
+        // true in the file, false in the env → the env wins.
+        std::env::set_var("JAMMI_TRAINING__RUN_WORKER", "false");
+        let cfg = JammiConfig::load(Some(&on_path)).unwrap();
+        assert!(
+            !cfg.training.run_worker,
+            "env `false` must override file `true`"
+        );
+
+        // false in the file, true in the env → the env wins the other way.
+        // Spelled `1` so the numeric form is proven through `load`, not only in
+        // the parser's own unit test.
+        std::env::set_var("JAMMI_TRAINING__RUN_WORKER", "1");
+        let cfg = JammiConfig::load(Some(&off_path)).unwrap();
+        assert!(
+            cfg.training.run_worker,
+            "env `1` must override file `false`"
+        );
+
+        // Unset → the file's value stands, in both directions. Without this
+        // leg an arm that unconditionally wrote `true` would still pass above.
+        std::env::remove_var("JAMMI_TRAINING__RUN_WORKER");
+        assert!(
+            !JammiConfig::load(Some(&off_path))
+                .unwrap()
+                .training
+                .run_worker
+        );
+        assert!(
+            JammiConfig::load(Some(&on_path))
+                .unwrap()
+                .training
+                .run_worker
+        );
+    }
+
+    #[test]
+    fn env_override_run_worker_unparsable_is_a_typed_load_error() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jammi.toml");
+        std::fs::write(&path, "[training]\nrun_worker = false\n").unwrap();
+
+        std::env::set_var("JAMMI_TRAINING__RUN_WORKER", "maybe");
+        let err = JammiConfig::load(Some(&path)).unwrap_err();
+        std::env::remove_var("JAMMI_TRAINING__RUN_WORKER");
+
+        match err {
+            JammiError::Config(msg) => {
+                assert!(msg.contains("JAMMI_TRAINING__RUN_WORKER"), "msg = {msg}");
+                assert!(msg.contains("maybe"), "msg = {msg}");
+            }
+            other => panic!("expected JammiError::Config, got {other:?}"),
+        }
+
+        // With the variable removed the same file loads cleanly — the error
+        // came from the override, not from the file.
+        assert!(!JammiConfig::load(Some(&path)).unwrap().training.run_worker);
+    }
+
     #[test]
     fn training_config_rejects_heartbeat_without_margin() {
         // heartbeat == lease (no margin) — a live worker's lease would expire
@@ -1556,6 +1841,7 @@ mod tests {
             lease_duration_secs: 10,
             heartbeat_interval_secs: 10,
             idle_poll_secs: 1,
+            ..Default::default()
         };
         let err = equal.worker_intervals().unwrap_err();
         assert!(
@@ -1568,6 +1854,7 @@ mod tests {
             lease_duration_secs: 19,
             heartbeat_interval_secs: 10,
             idle_poll_secs: 1,
+            ..Default::default()
         };
         assert!(matches!(
             too_close.worker_intervals(),
@@ -1579,6 +1866,7 @@ mod tests {
             lease_duration_secs: 5,
             heartbeat_interval_secs: 30,
             idle_poll_secs: 1,
+            ..Default::default()
         };
         assert!(matches!(
             inverted.worker_intervals(),
@@ -1591,6 +1879,7 @@ mod tests {
             lease_duration_secs: 20,
             heartbeat_interval_secs: 10,
             idle_poll_secs: 1,
+            ..Default::default()
         };
         assert!(
             matches!(exact.worker_intervals(), Err(JammiError::Config(_))),
@@ -1602,6 +1891,7 @@ mod tests {
             lease_duration_secs: 21,
             heartbeat_interval_secs: 10,
             idle_poll_secs: 1,
+            ..Default::default()
         };
         assert!(strict.worker_intervals().is_ok());
     }
@@ -1615,6 +1905,7 @@ mod tests {
             lease_duration_secs: 30,
             heartbeat_interval_secs: u64::MAX / 2 + 1,
             idle_poll_secs: 1,
+            ..Default::default()
         };
         assert!(
             matches!(absurd.worker_intervals(), Err(JammiError::Config(_))),
@@ -1628,6 +1919,7 @@ mod tests {
             lease_duration_secs: 30,
             heartbeat_interval_secs: 10,
             idle_poll_secs: 0,
+            ..Default::default()
         };
         let err = cfg.worker_intervals().unwrap_err();
         assert!(
@@ -1642,12 +1934,14 @@ mod tests {
             lease_duration_secs: 30,
             heartbeat_interval_secs: 0,
             idle_poll_secs: 1,
+            ..Default::default()
         };
         assert!(matches!(cfg.worker_intervals(), Err(JammiError::Config(_))));
     }
 
     #[test]
     fn load_rejects_invalid_training_timing() {
+        let _guard = env_lock();
         // The load path enforces the invariant: a heartbeat with no margin in
         // the TOML is a hard load error.
         let dir = tempfile::tempdir().unwrap();
@@ -1722,6 +2016,7 @@ mod tests {
 
     #[test]
     fn load_interpolates_before_parse() {
+        let _guard = env_lock();
         std::env::set_var("JAMMI_TEST_LOAD_URL", "postgres://u:p@h/db");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("jammi.toml");

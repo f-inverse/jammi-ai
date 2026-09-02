@@ -13,10 +13,12 @@
       "test segment::append_does_not_rebuild_prior_segments ... ok",
       "test segment::concurrent_append_never_collides_and_cascades::sqlite ... ok",
       "test segment::migration_025_creates_an_empty_index_segments_table ... ok",
-      "test segment::search_vectors_over_two_int8_segments_equals_brute_force ... ok"
+      "test segment::search_vectors_over_two_int8_segments_equals_brute_force ... ok",
+      "test segment::session_hides_another_tenants_segments_and_an_unknown_table_alike ... ok",
+      "test segment::session_lists_a_tables_segments_in_segment_id_order ... ok"
     ],
     "tests_failed": 0,
-    "tests_passed": 4
+    "tests_passed": 6
   },
   "n1": {
     "mismatches": [],

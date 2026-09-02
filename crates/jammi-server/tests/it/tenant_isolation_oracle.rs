@@ -929,6 +929,19 @@ fn cases() -> Vec<IsolationCase> {
         case!("CatalogService", "DerivesFrom", CaseKind::Hermetic, None, {
             assert_derives_from_isolated().await;
         }),
+        // `list_index_segments` rides the same resolution gate: the
+        // `index_segments` rows are scoped by their parent `result_tables` row,
+        // so the session resolves the table through the tenant-filtered
+        // `get_result_table` before listing. A peer lists nothing.
+        case!(
+            "CatalogService",
+            "ListIndexSegments",
+            CaseKind::Hermetic,
+            None,
+            {
+                assert_list_index_segments_isolated().await;
+            }
+        ),
         // --- audit (tenant-scoped — NOT allowlisted) -------------------------
         case!("AuditService", "AuditLog", CaseKind::Hermetic, None, {
             assert_audit_isolated().await;
@@ -1844,6 +1857,80 @@ async fn assert_derives_from_isolated() {
     assert!(
         b_result.is_err(),
         "CROSS-TENANT LEAK: tenant B read tenant A's lineage: {b_result:?}"
+    );
+}
+
+/// `list_index_segments` is the segment-set peer of the sensing verbs: the
+/// `index_segments` rows are NOT independently tenant-filtered at the catalog
+/// layer (they are scoped by their parent `result_tables` row), so the session
+/// verb resolves the table through the tenant-filtered `get_result_table`
+/// FIRST. Tenant B naming A's table therefore lists nothing — and lists the
+/// same nothing an unknown table lists, so an empty response is not an
+/// existence oracle for a peer's table names.
+///
+/// The stated positive is A's own read: A sees its own segment, so the empty
+/// answer B gets is the gate working, not the fixture being empty.
+async fn assert_list_index_segments_isolated() {
+    let (engine, session, table_name, _dir) = materialize_table_for_tenant_a().await;
+
+    // One segment on A's table, stamped with A's tenant (the parent's owner).
+    assert!(
+        engine
+            .catalog()
+            .insert_index_segment(&table_name, Some(tenant_a()), 0, "file:///idx/a-seg-0", 3,)
+            .await
+            .expect("insert index segment"),
+        "the segment row must land"
+    );
+
+    let a_seen = engine
+        .with_tenant_scoped(tenant_a(), |_scope| {
+            session.list_index_segments(&table_name)
+        })
+        .await
+        .expect("tenant A must list its own table's segments");
+    assert_eq!(
+        a_seen.len(),
+        1,
+        "tenant A must see its own segment (the positive that makes B's empty answer meaningful)"
+    );
+
+    let b_seen = engine
+        .with_tenant_scoped(tenant_b(), |_scope| {
+            session.list_index_segments(&table_name)
+        })
+        .await
+        .expect("the verb answers B rather than erroring");
+    assert!(
+        b_seen.is_empty(),
+        "CROSS-TENANT READ LEAK: tenant B listed tenant A's index segments: {b_seen:?}"
+    );
+
+    let b_unknown = engine
+        .with_tenant_scoped(tenant_b(), |_scope| {
+            session.list_index_segments("no-such-result-table")
+        })
+        .await
+        .expect("an unknown table lists nothing");
+    assert_eq!(
+        b_seen, b_unknown,
+        "a peer's table and an unknown table must be indistinguishable through this verb"
+    );
+
+    // The gate is the session's, not the catalog's: the bare catalog read still
+    // returns A's row under B's scope. Pinning it keeps the reason the session
+    // resolves the parent first visible if the catalog layer ever changes.
+    let unscoped = engine
+        .with_tenant_scoped(tenant_b(), |_scope| {
+            engine.catalog().list_index_segments(&table_name)
+        })
+        .await
+        .expect("catalog read");
+    assert_eq!(
+        unscoped.len(),
+        1,
+        "the catalog-level read is parent-scoped, not independently tenant-filtered — \
+         which is exactly why the session verb resolves the parent row first"
     );
 }
 

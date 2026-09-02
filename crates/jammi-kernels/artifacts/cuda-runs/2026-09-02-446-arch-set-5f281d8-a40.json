@@ -1,0 +1,79 @@
+{
+ "schema_version": 1,
+ "unit": "446-w3b-arch-set-a40",
+ "git_sha": "5f281d81ba9d68342b94cbd7cbd728a80db7c30d",
+ "date": "2026-09-02T01:30:00Z",
+ "box": "jammi-a40 (NVIDIA A40, driver 570.195.03, compute_cap 8.6)",
+ "driver": "570.195.03",
+ "gpu": "NVIDIA A40",
+ "features": "cuda,flash-attn",
+ "status": "RED",
+ "env": {
+  "JAMMI_REQUIRE_CUDA": "1",
+  "JAMMI_REQUIRE_FLASH": "1",
+  "JAMMI_REQUIRE_FLASH_ORACLE": "1",
+  "JAMMI_FLASH_ORACLE_MODEL_DIR": "/root/checkpoints/ModernBERT-large",
+  "CUDA_COMPUTE_CAP": "86",
+  "CARGO_TARGET_DIR": "/root/target-w3"
+ },
+ "producer": {
+  "path": "crates/jammi-encoders/src/modernbert.rs",
+  "kind": "cargo-test",
+  "invocation": "JAMMI_REQUIRE_CUDA=1 JAMMI_REQUIRE_FLASH=1 JAMMI_REQUIRE_FLASH_ORACLE=1 JAMMI_FLASH_ORACLE_MODEL_DIR=<checkpoint> cargo test -p jammi-encoders --lib --features cuda,flash-attn -- --exact modernbert::tests::flash_arm_padded_matches_block_arm_on_real_rows_cuda",
+  "gating": "env:JAMMI_REQUIRE_CUDA"
+ },
+ "observed": {
+  "flash_arm_padded_real_row_ratio_per_seed": {
+   "201": 0.12697,
+   "202": 0.11979,
+   "203": 0.23006,
+   "204": 0.12003,
+   "205": 0.11312,
+   "206": 0.13894,
+   "207": 0.20803,
+   "208": 0.13804
+  },
+  "mean": 0.149374,
+  "max": 0.230063,
+  "bound_at_run": 0.5,
+  "note": "sm86 per-seed ratios reproduce the 2026-08-28 m3-arch-set-80a451a-a40 artifact's own eight values DIGIT-FOR-DIGIT at this campaign's tip — the bf16/f32 flash-arm behaviour those artifacts witness is unchanged by campaign #443/#446's fp16 addition, measured rather than argued. Checkpoint model.safetensors sha256 44510fec5d3a81a1877f225637b869495f18e55f6f23a09abb9be0acc030295f (matches the pinned digest)."
+ },
+ "note": "Campaign #446 W3-B fresh per-arch validation for compute_cap 8.6, run against the CURRENT flash surface (the arch-freshness gate reported all four VALIDATED_SMS entries stale against this campaign's flash-surface edits). NOT GREEN: the jammi-kernels cuda,flash-attn leg FAILS on `softmax_parity_f16_row_length_regimes` (crates/jammi-kernels/tests/cuda_parity.rs). That failure is NOT arch-specific — sm_86 (this artifact), sm_89 and sm_90 all panic on the SAME test, the SAME element index, with BYTE-IDENTICAL cpu/cuda/bound values, so it is a defect in this campaign's own new f16 oracle (added at c8612300, campaign-only — not on main), not a property of this device. This artifact therefore CANNOT satisfy check_arch_validation_freshness.py Rule 1 (which requires status == \"GREEN\") and does NOT clear arch 86's Rule-2 staleness; the allowlist waiver row for 86 stays LIVE. It is committed as the honest record that the arch WAS exercised at this tip — the device, driver, checkpoint and every other leg are proven — and that exactly one leg is red for a reason the arch does not own. PROVENANCE: branch sha on fix/446-v049-blocker; the train PR must land as a MERGE COMMIT for this git_sha to become an ancestor of HEAD.",
+ "legs": [
+  {
+   "name": "jammi-encoders flash_arm_padded_matches_block_arm_on_real_rows_cuda (real ModernBERT-large checkpoint, 8 seeds)",
+   "command": "JAMMI_REQUIRE_CUDA=1 JAMMI_REQUIRE_FLASH=1 JAMMI_REQUIRE_FLASH_ORACLE=1 JAMMI_FLASH_ORACLE_MODEL_DIR=/root/checkpoints/ModernBERT-large cargo test -p jammi-encoders --lib --features cuda,flash-attn -- --exact modernbert::tests::flash_arm_padded_matches_block_arm_on_real_rows_cuda --nocapture",
+   "status": "ok",
+   "exit": 0,
+   "wall_seconds": 185,
+   "failed": 0,
+   "note": "1 passed; 0 failed; 187 filtered out"
+  },
+  {
+   "name": "jammi-kernels full suite (cuda,flash-attn) — flash + cuda parity incl. this wave's new f16 oracles",
+   "command": "cargo test -p jammi-kernels --features cuda,flash-attn -- --test-threads=1",
+   "status": "FAILED",
+   "exit": 101,
+   "wall_seconds": 245,
+   "failed": 1,
+   "note": "cuda_parity: 133 passed; 1 failed; 1 ignored. Verbatim: thread 'softmax_parity_f16_row_length_regimes' panicked at crates/jammi-kernels/tests/cuda_parity.rs:412:9: softmax f16 dscores[35]: cpu -0.0010614395 vs cuda -0.0010671616 (bound 1.9073486e-6). Reached at row length n=514 (the >512 multi-block regime); the n=510 and n=512 regimes are clean (max|delta|=0) and every FORCED-DEFECT control fires far above bound, so the oracle discriminates — the bound is what the n=514 dscores arm exceeds. Identical on sm_89 and sm_90."
+  },
+  {
+   "name": "jammi-ai gpu_capability capability_surface, STRICT (JAMMI_KERNELS_STRICT=1) — the prove lane's own capability leg, incl. its zero-test guard",
+   "command": "JAMMI_KERNELS_STRICT=1 cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability capability_surface -- --nocapture",
+   "status": "ok",
+   "exit": 0,
+   "wall_seconds": 174,
+   "failed": 0,
+   "note": "matched a non-zero test count (a 0-test run is refused as a false green, per runpod_gpu_prove.sh's own guard)"
+  },
+  {
+   "name": "jammi-ai gpu_capability generic sweep, capability_surface name-excluded (it requires strict mode, which the fallback-path tests here cannot run under)",
+   "command": "cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability -- --nocapture --test-threads=1 --skip capability_surface",
+   "status": "ok",
+   "exit": 0,
+   "wall_seconds": 153,
+   "failed": 0
+  }
+ ]
+}

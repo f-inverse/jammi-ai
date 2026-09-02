@@ -226,8 +226,10 @@ def test_eval_embeddings_and_per_query_round_trip_matches_embedded(
         assert _shape(per_query_rows["remote"]) == _shape(per_query_rows["embedded"])
         _assert_values_close(per_query_rows["remote"], per_query_rows["embedded"])
     finally:
-        # The embedded engine releases its resources on drop (RAII); only the
-        # remote client holds a gRPC channel that needs an explicit close.
+        # Only the remote client's gRPC channel needs an explicit close in a
+        # `finally`. The embedded arm carries a real `close()` too (the catalog
+        # release), but this test opens a fresh per-test directory no successor
+        # ever reopens, so letting the handle drop is enough here.
         remote.close()
 
 
@@ -273,8 +275,10 @@ def test_eval_compare_round_trip_matches_embedded(live_server, tmp_path):
                 assert sig["ci_lower"] == 0.0 == sig["ci_upper"], (name, metric)
                 assert sig["p_value"] > 0.99, (name, metric)
     finally:
-        # The embedded engine releases its resources on drop (RAII); only the
-        # remote client holds a gRPC channel that needs an explicit close.
+        # Only the remote client's gRPC channel needs an explicit close in a
+        # `finally`. The embedded arm carries a real `close()` too (the catalog
+        # release), but this test opens a fresh per-test directory no successor
+        # ever reopens, so letting the handle drop is enough here.
         remote.close()
 
 

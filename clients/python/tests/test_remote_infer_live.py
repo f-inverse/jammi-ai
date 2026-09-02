@@ -80,8 +80,10 @@ def test_infer_round_trip_matches_embedded(live_server, tmp_path):
         # Every row came back ok through the deterministic fixture model.
         assert set(remote_table.column("_status").to_pylist()) == {"ok"}
     finally:
-        # The embedded engine releases its resources on drop (RAII); only the
-        # remote client holds a gRPC channel that needs an explicit close.
+        # Only the remote client's gRPC channel needs an explicit close in a
+        # `finally`. The embedded arm carries a real `close()` too (the catalog
+        # release), but this test opens a fresh per-test directory no successor
+        # ever reopens, so letting the handle drop is enough here.
         remote.close()
 
 
@@ -121,6 +123,8 @@ def test_infer_empty_source_is_a_schema_less_empty_table(live_server, tmp_path):
             assert table.num_columns == 0, name
         assert results["remote"].schema == results["embedded"].schema
     finally:
-        # The embedded engine releases its resources on drop (RAII); only the
-        # remote client holds a gRPC channel that needs an explicit close.
+        # Only the remote client's gRPC channel needs an explicit close in a
+        # `finally`. The embedded arm carries a real `close()` too (the catalog
+        # release), but this test opens a fresh per-test directory no successor
+        # ever reopens, so letting the handle drop is enough here.
         remote.close()

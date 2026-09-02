@@ -14,9 +14,9 @@ artifact_dir = "/var/lib/jammi"
 [server]
 # HTTP side-channel: `/healthz`, `/readyz`, `/metrics`.
 health_listen = "0.0.0.0:8080"
-# gRPC + Flight SQL surface. The core tier (SessionService, EmbeddingService,
-# InferenceService, MutableTableService, ChannelService, AuditService) and
-# Flight SQL are always mounted; the optional tiers below are runtime-selectable.
+# gRPC + Flight SQL surface. The core tier (CatalogService, EmbeddingService,
+# InferenceService, PipelineService, AuditService) and Flight SQL are always
+# mounted; the optional tiers below are runtime-selectable.
 flight_listen = "0.0.0.0:8081"
 # Models to preload into memory at startup. Empty by default.
 preload_models = []
@@ -25,13 +25,13 @@ preload_models = []
 #
 #   services = "all"             # all-in-one: every tier compiled in (default)
 #   services = ["event"]         # serve + event box (TriggerService)
-#   services = ["train"]         # serve + training box (FineTuneService)
+#   services = ["train"]         # serve + training box (TrainingService)
 #   services = ["eval"]          # serve + eval tooling (EvalService)
 #   services = []                # serve-only: core tier only
 #
 # A tier requested here whose feature is compiled out (e.g. `train` on a
 # `--no-default-features` build) is a startup error, not a silent drop. The
-# mounted set is reported over the wire via `SessionService.GetServerInfo`
+# mounted set is reported over the wire via `CatalogService.GetServerInfo`
 # (`services`), so a client knows which verbs are reachable. Defaults to "all".
 services = "all"
 
@@ -39,13 +39,18 @@ services = "all"
 level = "info"
 format = "json"
 
-# Training-worker lease/heartbeat/poll timing (used by the `train` tier).
-# Defaults reproduce the engine's built-in timing, so this section is optional.
+# Training-worker settings for the `train` tier: whether this process runs the
+# claim loop, and the lease/heartbeat/poll timing it runs it with.
+# Defaults reproduce the engine's built-in behaviour, so this section is optional.
 # The heartbeat must leave a real margin under the lease
 # (heartbeat_interval_secs * 2 < lease_duration_secs) so a live worker renews
 # strictly before the lease expires; a config that does not is rejected at
 # startup, never silently clamped. idle_poll_secs must be > 0.
 [training]
+# Whether THIS process runs the claim loop. `false` still mounts and serves
+# TrainingService (submissions are accepted and stay `queued`); it only stops
+# this process from claiming, so another process configured `true` works them.
+run_worker = true
 # How long a claim leases a job before it is reclaimable.
 lease_duration_secs = 30
 # How often the worker renews the lease while a job runs.
@@ -53,16 +58,27 @@ heartbeat_interval_secs = 10
 # How often an idle worker polls for a queued job (and reclaims expired leases).
 idle_poll_secs = 1
 
-# ─── Coming in v0.9 (S4 catalog/broker config) ──────────────────────
+# ─── Catalog and broker selection ───────────────────────────────────
 #
-# After the S4 work lands, the OSS server will accept first-class
-# catalog and broker selection. Until then the SQLite catalog +
-# in-memory broker defaults apply.
+# Both are first-class config. Omitted, they default to a SQLite catalog
+# under artifact_dir and the in-process trigger broker — the laptop / dev
+# shape. `kind` selects the variant; the remaining keys belong to it.
+#
+# [catalog]
+# kind = "sqlite"                # default; path defaults to {artifact_dir}/catalog.db
+# path = "/var/lib/jammi/catalog.db"
 #
 # [catalog]
 # kind = "postgres"
 # url = "postgres://jammi:secret@postgres:5432/jammi"
+# pool_size = 16                 # sqlx max_connections; default 8
+# max_lifetime_secs = 1800       # optional; omitted leaves the pool default
 #
 # [broker]
-# kind = "jetstream"
+# kind = "in_memory"             # default; the in-process broker
+#
+# [broker]
+# kind = "jet_stream"            # needs jammi-db's `jetstream-broker` feature
 # url = "nats://nats:4222"
+# retention_seconds = 604800     # per-stream default; default 7 days
+# credentials_path = "/var/run/secrets/nats.creds"   # optional; omitted connects anonymously

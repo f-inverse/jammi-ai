@@ -6,6 +6,142 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+### Added
+- **`CatalogService/ListIndexSegments` — a result table's ANN index-segment
+  set reaches the public surface.** The `index_segments` rows (migration
+  025) were readable through no public surface: not `db.sql()`'s federation,
+  not any `Session` verb, not any `jammi.v1` rpc — a caller had to close the
+  engine and read its SQLite catalog file. Now `Session::list_index_segments`,
+  a 1:1 `CatalogService` rpc, and a `CatalogClient` wrapper, tenant-scoped by
+  resolving the table through the tenant-filtered `result_tables` read first;
+  a table the caller cannot resolve lists exactly what an unknown table
+  lists, so the verb is not an existence oracle. Additive
+  (`api_freeze_baseline.txt` updated).
+- **An explicit catalog release handshake, at every layer.**
+  `CatalogBackend::close` (`crates/jammi-db/src/catalog/backend.rs:88`),
+  `Catalog::close` (`crates/jammi-db/src/catalog/mod.rs:93`), and
+  `JammiSession::close` (`crates/jammi-db/src/session.rs:914`) close the
+  catalog connection pool and await the drain. Dropping a handle is not a
+  release point: `sqlx` returns pooled connections from a background task,
+  so the pool's connections — and, for SQLite, the process-exclusive file
+  lock and the `catalog.db-wal` sidecar they keep alive — outlive the drop
+  for an unbounded time. Anything that hands the catalog *directory* to
+  another party (a seed-then-spawn handoff, or an embedding host whose
+  caller opens the same file through a different SQLite library instance)
+  awaits `close()` first.
+- **`close()` on the Python client's embedded transport**
+  (`clients/python/jammi/_embedded.py:168`, `c3dbddbd`) — a delegation to
+  that same engine handshake: the training worker is stopped, then the
+  catalog pool is closed and awaited. `EmbeddedBackend.__exit__` calls it,
+  so a `with` block is a scoped resource on both transports rather than on
+  one.
+- **The `unix-excl` SQLite seam.** On unix the catalog pool opens through
+  SQLite's `unix-excl` VFS
+  (`crates/jammi-db/src/catalog/backend_sqlite.rs:124`, `catalog_vfs`), so a
+  second process on the same catalog directory is refused with a typed error
+  rather than faulting. `JAMMI_SQLITE_VFS` (`SQLITE_VFS_ENV`, same file
+  `:116`) is the one operator knob and is diagnostic only: unset selects the
+  seam, `default` restores the platform VFS and re-arms the failure the seam
+  closes. Engaging it logs a `WARN`; it is never set in production.
+- **`[training] run_worker` / `JAMMI_TRAINING__RUN_WORKER` — whether THIS
+  process runs the training claim loop.** The `run_worker` field
+  (`crates/jammi-db/src/config.rs:703`, `TrainingConfig`) defaults to
+  `true`; the `JAMMI_TRAINING__RUN_WORKER` environment override is parsed by
+  the fail-closed `parse_env_bool` (`crates/jammi-db/src/config.rs:1241`) —
+  an unparsable value is a typed load error, never a silently ignored
+  override. Read by the server runtime's `assemble_grpc_chain`
+  (`crates/jammi-server/src/runtime.rs:879`), the Python embedded arm's
+  `PyDatabase::open` (`crates/jammi-python/src/database.rs:91`), and the
+  Rust SDK front door's `Session::with_configured_worker`
+  (`crates/jammi-ai/src/local_session.rs:156`): with `run_worker = false` a
+  process still mounts and serves `TrainingService` and still accepts
+  submissions, but never claims. Submitted jobs stay `queued` until some
+  process configured with `run_worker = true` opens the catalog; on SQLite
+  (a single-process catalog) a queued job is claimed by the next claiming
+  process that opens the directory, not necessarily the one that submitted
+  it.
+- **Python `training_job(job_id)` and `list_training_jobs()`, on both
+  client arms.** A training job handle now survives its submitting
+  connection: `training_job` attaches to an existing job by id and
+  `list_training_jobs` lists every job visible to the current tenant, most
+  recent first — both on the embedded arm
+  (`clients/python/jammi/_embedded.py:433`, `:450`) and the remote arm
+  (`clients/python/jammi/_database.py:2348`, `:2391`). A `job_id` with no
+  row visible to this tenant raises the same typed `BackendError` every
+  other catalog miss raises; there is no separate existence check to drift
+  from the catalog read itself.
+
+### Changed
+- **Embedded `Session.close()` is an awaited release, not a documented RAII
+  no-op.** It previously raised `NotSupportedOnBackend` on the claim that the
+  embedded engine released its resources on drop; under the `unix-excl` seam
+  that claim was false, and `close()` is now the one bounded point at which
+  the artifact directory becomes somebody else's to open. Idempotent, and
+  every verb on the session afterwards raises `BackendError` — never a
+  silent no-op.
+- **Use-after-close raises `BackendError` on the remote transport too**, so
+  the two arms carry one contract (`clients/python/jammi/_backend.py:83`).
+  What each releases still differs — the gRPC and Flight channels remote,
+  the catalog file embedded — the contract does not.
+- **BEHAVIOUR CHANGE: the embedded Python arm now resolves configuration
+  exactly like the server binary.** `open_local`
+  (`crates/jammi-python/src/lib.rs:78`) builds its `JammiConfig` through the
+  same `JammiConfig::load` (`crates/jammi-db/src/config.rs:1058`) call
+  `jammi-server`'s `main` makes, with the same precedence: the explicit
+  `config` path, else `JAMMI_CONFIG`, else `./jammi.toml`, else the platform
+  config dir, and then every `JAMMI_*` environment override layered on top.
+  Previously the embedded arm used defaults and no `JAMMI_*` override
+  reached an embedded process — a key only one arm honoured was a
+  server-only feature masquerading as a deployment setting. The explicit
+  keyword arguments `open_local` accepts are still applied AFTER the load
+  and still win: a config file or `JAMMI_ARTIFACT_DIR` never overrides an
+  `artifact_dir` passed explicitly.
+- **WIRE SEMANTICS CHANGE (shape-compatible, `api_freeze` unaffected):
+  `TrainingStatusResponse.model_id` is now populated at every lifecycle
+  status.** `model_id`
+  (`crates/jammi-wire/proto/jammi/v1/training.proto:445`) previously stayed
+  empty until the job completed; it now carries the engine's derived id at
+  `queued`, `running`, `completed`, and `failed` alike, resolved by
+  `resolve_model_id`
+  (`crates/jammi-ai/src/fine_tune/training_job.rs:117`) from the persisted
+  job row. An integrator that used a non-empty `model_id` as a completion
+  test must use `status` instead — the embedded and remote attaches now
+  agree on `model_id` at every state, not only at completion.
+
+### Removed
+- **`Capability.CLOSE`, from the Python client `jammi`.** A public API
+  break: `Capability.CLOSE` no longer exists, so `supports(Capability.CLOSE)`
+  and any `except NotSupportedOnBackend` guarding a `close()` call have
+  nothing to reference. Migration: call `close()` unconditionally, or use the
+  session as a context manager. A capability names a feature that genuinely
+  diverges between the two transports, and a flag every backend sets is a
+  predicate that never discriminates — the closed set is now FOUR members:
+  `AUDIT`, `EPHEMERAL_SESSION`, `PRELOAD_MODEL` (embedded only) and
+  `SESSION_ID` (remote only) (`clients/python/jammi/_capability.py:30`).
+- **The `axpy` fused kernel (`jammi-kernels`), and the compiled-only
+  capability category that held it.** The op had real CUDA kernels and
+  dispatch arms but no `admit()` call site and no admitted parent launching
+  it, so nothing a shipped build could say about it went beyond "it
+  compiled". A pre-registered rule — wire it iff its share reaches 2% of
+  per-step GPU time on some shipped leg *and* one dispatch site covers at
+  least half of that share — measured 0.007% / 0.026% / 0.027% across the
+  three shipped dtype legs of a ModernBERT-large fine-tune, with the only
+  axpy-shaped work coming from a third-party autograd accumulation rather
+  than any jammi call site
+  (`crates/jammi-kernels/artifacts/cuda-runs/2026-09-01-axpy-census-bdeb80c-a100-pcie.json`).
+  `ci/release-feature-manifest.json`'s `fused_kernels_compiled` category
+  went with it: a proof category whose only content is "it compiled" is an
+  empty slot the next unwired kernel gets filed into, so a kernel with no
+  admission site and no admitted parent now has no manifest category at
+  all — it is wired or deleted in the same unit as its authoring.
+
+### Breaking
+- `CatalogBackend` trait grew a new required method `close`
+  (`crates/jammi-db/src/catalog/backend.rs:88`). Any out-of-tree implementor
+  must add it; the workspace has no such callers. Migration: return a future
+  that closes the backend's pool and awaits the drain — a backend with
+  nothing to release returns an immediately-ready future.
+
 ## [0.48.0] - 2026-08-30
 
 The eager and fused numeric paths now round the way torch/PEFT/HF round —

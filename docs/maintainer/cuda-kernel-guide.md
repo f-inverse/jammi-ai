@@ -173,7 +173,7 @@ over `crates/jammi-kernels/{src,tests}`, `crates/jammi-encoders/src`, `crates/ja
 required — currently 33/69 = 47.8% real, 36/69 = 52.2% noise (see
 `ci/doc_number_allowlist_classification.md`).
 
-## 3.10 f16 per-op reference-regime table (campaign #443, Part 3 / W2a)
+## 3.10 f16 per-op reference-regime table
 
 **Why this table exists before any f16 tolerance is written (KO-8, "match the eager reference's
 operand form").** The eager reference's own arithmetic is NOT uniform across ops: some upcast to
@@ -187,31 +187,102 @@ genuinely rounds mid-loop needs a *behavioral* boundary oracle, not a tolerance 
 campaign #443's numerics contract). Every row below states: (a) the eager reference's regime
 (`f32-internal` = upcasts to F32, computes, rounds back once; `dtype-native` = computes in the
 tensor's own 16-bit type at the stated step, matching what candle's un-fused ops would do), (b) the
-rounding-POINT count (how many times a value crosses a 16-bit rounding boundary), and (c) the CPU
-F16 reference-arm status this wave (W2a) leaves the op in.
+rounding-POINT count (how many times a value crosses a 16-bit rounding boundary), and (c) whether
+the op has a CPU F16 reference arm today, and what backs it.
 
-| Op | Eager regime | Rounding points | CPU F16 arm (W2a) |
+| Op | Eager regime | Rounding points | CPU F16 arm |
 |---|---|---|---|
-| `layer_norm` (`LayerNormFused`/`LayerNormBwdDx`/`LayerNormBwdDgamma`) | f32-internal (mean/var/xhat accumulate in f32; `jammi-encoders/src/layer_norm.rs:353-370`'s `LayerNorm::slow` upcasts F16\|BF16→F32, casts back once) | 1 (final cast to f16) | **Added** — `ln_fwd_f16`/`ln_bwd_dx_f16`/`ln_bwd_dgamma_f16`, `crates/jammi-kernels/src/ops/layer_norm.rs` |
-| `softmax_last_dim` (`SoftmaxLastDimFused`/`SoftmaxBwdDScores`) | dtype-native at two steps (the scale-multiply and the mask-add each round to the 16-bit dtype immediately, matching `candle_nn::ops::softmax`'s native `broadcast_add` and `Tensor::affine`'s own rounding point — `cuda/softmax.cu:75-101`'s `bf16_mul_rounded`/`bf16_add_rounded`); every step AFTER the mask add (max/exp/sum/normalize) stays f32 | 2 (scale-mul, mask-add); `dscores` bwd is 1 (final cast) | **Added** — `softmax_row_f16`/`softmax_fwd_f16`/`dscores_row_f16`/`dscores_f16`, `crates/jammi-kernels/src/ops/softmax.rs` |
-| `geglu` (`GegluFused`/`GegluBwdDWiOut`) | dtype-native, two-op eager shape reproduced deliberately (candle's own `GeluErf::f16` arm ALSO computes in f64, mirroring its `bf16` arm exactly — `candle-core-0.11.0/src/op.rs:1002-1009` — but this op's OWN activation is computed in f32, matching the upstream HF/`kernels-community` "fp32 opmath" reference more closely than candle's f64 arm; see the module doc's "bf16 boundary-rounding" section) | 2 fwd (round activation, round product); 2 bwd (round `d_gate`, round `d_up`, each independently, f32-accumulated) | **Added** — `geglu_fwd_row_f16`/`geglu_fwd_f16`/`geglu_bwd_row_f16`/`geglu_bwd_f16`, `crates/jammi-kernels/src/ops/geglu.rs` |
-| `rope`/`rope_positions` (`RopeFused`/`RopePositionsFused`) | f32-internal (accumulate in f32, matching `layer_norm`'s BF16 arms and the CUDA kernel) | 1 (final cast) | **Added** — `rope_fwd_row_f16`/`rope_fwd_f16` (`ops/rope.rs`), `rope_positions_fwd_f16` (`ops/rope_positions.rs`) |
-| `axpy` | f32-internal | 1 | **Added** — `axpy_f16`, `crates/jammi-kernels/src/ops/axpy.rs` |
-| `dropout` | dtype-independent decision (Philox mask is a pure function of position, not value) + f32-internal scale multiply on a KEPT element | 1 (KEPT element only; a DROPPED element is exact zero, no rounding) | **Added** — `dropout_f16`, `crates/jammi-kernels/src/ops/dropout.rs` (Metal host-fallback arm deliberately NOT widened — out of this campaign's CUDA-only scope) |
-| `scaled_cast_add` (`ScaledCastAdd`) | f32-internal (esc-046 fix: widen `base` to f32, add the already-f32 scaled `lora`, round the sum once — matches PEFT's own promote-add-cast-once model) | 1 | **Added** — `scaled_cast_add_f16_f32`/`scaled_cast_add_f32_f16`/`scaled_cast_add_f16_f16`, `crates/jammi-kernels/src/ops/scaled_cast_add.rs` (mirrors the existing 4-combo F32/BF16 matrix with 3 new F16 combos) |
-| `cast_scale`/`cast_add` (`CastScaleBf16F32`/`CastAddBf16`) | N/A — **structurally BF16-monomorphic, not dtype-generic** | N/A | **Deferred to W2c.** These two types are named and domain-restricted to BF16 by construction (`CastScaleBf16F32`'s own doc: "this op's domain is BF16-only rather than accepting F32 too — nothing to fuse there"); an F16 analog is a NEW pair of types (`CastScaleF16F32`/`CastAddF16`), each with its own double-rounding-safety argument (F16's 11-bit significand vs F32's 24-bit: `24 >= 2*11+2` holds with equality, at the boundary rather than "far past" it the way BF16's 16-bit margin is — worth an explicit check when authored, not assumed), not a match-arm widening of an existing generic op. This is genuine kernel-authoring, scheduled with W2c's other new-type work, not W2a's groundwork. |
-| `attention_block` (`AttentionBlockFused`) | f32-only on CPU by a **real, disclosed candle limitation for BF16** (candle-core 0.11's CPU backend has no BF16 `MatMul` impl) — **but this limitation does NOT extend to F16**: `candle-core-0.11.0/src/cpu_backend/mod.rs:1382-1385`'s `MatMul::f` accepts `DType::F16 \| F32 \| F64` (the `gemm` crate ships a real `gemm-f16` backend, confirmed present in this workspace's own dependency tree), so an F16 CPU matmul arm is architecturally possible where a BF16 one never was. Rounding regime unstated (`f32 accumulate throughout` per the module doc's own F32-only CPU domain — an F16 arm would need to decide de novo whether QK^T/PV GEMMs run in f16-native or f32-accumulated precision, i.e. this is a fresh design decision, not a mechanical copy) | N/A (not yet designed) | **Deferred to W2c.** The CPU forward is a ~500-line monomorphic `attention_fwd_f32` (with its own `AttentionFwdF32Params` struct, RoPE-packing, mask-broadcast, and paired `bwd_core`/gradient-GEMM-layout machinery) — duplicating it for F16 is genuine kernel authoring, not a match-arm extension, and belongs with this op's CUDA f16 kernel in the same wave (W2c) per the campaign's own wave split. |
-| `mem_efficient_attention` (`MemEfficientAttentionFused`) | Same F32-only-CPU-by-BF16-matmul-limitation shape as `attention_block`; F16 matmul is architecturally possible for the same `gemm-f16` reason above | N/A (not yet designed) | **Deferred to W2c** — same reasoning as `attention_block` (chunked/flash-style CPU forward, ~2900 lines, its own GEMM-layout oracle machinery). |
-| `low_rank_residual_linear`/`lora_linear` (`LowRankResidualLinear`) | Same F32-only-CPU-by-BF16-matmul-limitation shape; F16 matmul is architecturally possible for the same `gemm-f16` reason above | N/A (not yet designed) | **Deferred to W2c** — same reasoning; this op's own module doc (`low_rank_residual_linear.rs:1729-1751`) is where the BF16 CPU-matmul limitation is documented in the most detail and is the right place to add the parallel F16-is-different-from-BF16-here disclosure when W2c lands the F16 arm. |
+| `layer_norm` (`LayerNormFused`/`LayerNormBwdDx`/`LayerNormBwdDgamma`) | f32-internal (mean/var/xhat accumulate in f32; `fn slow(&self, x: &Tensor)` (`crates/jammi-encoders/src/layer_norm.rs:336`) upcasts through `DType::BF16 => DType::F32` (`crates/jammi-encoders/src/layer_norm.rs:360`) and casts back once) | 1 (final cast to f16) | **Present** — `ln_fwd_f16`/`ln_bwd_dx_f16`/`ln_bwd_dgamma_f16`, `crates/jammi-kernels/src/ops/layer_norm.rs` |
+| `softmax_last_dim` (`SoftmaxLastDimFused`/`SoftmaxBwdDScores`) | dtype-native at two steps (the scale-multiply and the mask-add each round to the 16-bit dtype immediately, matching `candle_nn::ops::softmax`'s native `broadcast_add` and `Tensor::affine`'s own rounding point — `cuda/softmax.cu:75-101`'s `bf16_mul_rounded`/`bf16_add_rounded`); every step AFTER the mask add (max/exp/sum/normalize) stays f32 | 2 (scale-mul, mask-add); `dscores` bwd is 1 (final cast) | **Present** — `softmax_row_f16`/`softmax_fwd_f16`/`dscores_row_f16`/`dscores_f16`, `crates/jammi-kernels/src/ops/softmax.rs` |
+| `geglu` (`GegluFused`/`GegluBwdDWiOut`) | dtype-native, two-op eager shape reproduced deliberately (candle's own `GeluErf::f16` arm ALSO computes in f64, mirroring its `bf16` arm exactly — `candle-core-0.11.0/src/op.rs:1002-1009` — but this op's OWN activation is computed in f32, matching the upstream HF/`kernels-community` "fp32 opmath" reference more closely than candle's f64 arm; see the module doc's "bf16 boundary-rounding" section) | 2 fwd (round activation, round product); 2 bwd (round `d_gate`, round `d_up`, each independently, f32-accumulated) | **Present** — `geglu_fwd_row_f16`/`geglu_fwd_f16`/`geglu_bwd_row_f16`/`geglu_bwd_f16`, `crates/jammi-kernels/src/ops/geglu.rs` |
+| `rope`/`rope_positions` (`RopeFused`/`RopePositionsFused`) | f32-internal (accumulate in f32, matching `layer_norm`'s BF16 arms and the CUDA kernel) | 1 (final cast) | **Present** — `rope_fwd_row_f16`/`rope_fwd_f16` (`ops/rope.rs`), `rope_positions_fwd_f16` (`ops/rope_positions.rs`) |
+| `dropout` | dtype-independent decision (Philox mask is a pure function of position, not value) + f32-internal scale multiply on a KEPT element | 1 (KEPT element only; a DROPPED element is exact zero, no rounding) | **Present** — `dropout_f16`, `crates/jammi-kernels/src/ops/dropout.rs` (Metal host-fallback arm deliberately NOT widened — out of this campaign's CUDA-only scope) |
+| `scaled_cast_add` (`ScaledCastAdd`) | f32-internal (esc-046 fix: widen `base` to f32, add the already-f32 scaled `lora`, round the sum once — matches PEFT's own promote-add-cast-once model) | 1 | **Present** — `scaled_cast_add_f16_f32`/`scaled_cast_add_f32_f16`/`scaled_cast_add_f16_f16`, `crates/jammi-kernels/src/ops/scaled_cast_add.rs` (mirrors the existing 4-combo F32/BF16 matrix with 3 new F16 combos) |
+| `cast_scale`/`cast_add` (`CastScaleBf16F32`/`CastAddBf16`; F16: `CastScaleF16F32`/`CastAddF16`) | N/A — **each type is structurally dtype-monomorphic, not dtype-generic** | N/A | **Present, as a SEPARATE pair of types** — `CastScaleF16F32` (`crates/jammi-kernels/src/ops/cast_scale.rs:427`) and `CastAddF16` (`crates/jammi-kernels/src/ops/cast_scale.rs:508`), each with its own CPU arm and its own CUDA arm in `cast_scale_f16.cu` (`crates/jammi-kernels/src/cuda/cast_scale_f16.cu:1`). They are not match arms on the BF16 types: those are domain-restricted to BF16 by construction (`CastScaleBf16F32`'s own doc: "this op's domain is BF16-only rather than accepting F32 too — nothing to fuse there"), so the F16 analogs carry their own double-rounding-safety argument at F16's 11-bit significand (`24 >= 2*11+2` holds with EQUALITY — at the boundary, not far past it the way BF16's margin is; each type's doc states this explicitly rather than inheriting BF16's). `low_rank_residual_linear`'s F16 backward admits both, once for the upcast `dy` and once for the F16 arm itself — `admit_cast_boundary` (`crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:814`) and `admit_cast_boundary` (`crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:911`), and both are pinned bit-identical to the eager two-kernel chain by `cast_scale_f16_bit_identical_to_the_eager_two_kernel_chain_on_cuda_across_scales` (`crates/jammi-kernels/tests/cuda_parity.rs:12634`) and `cast_add_f16_bit_identical_to_the_eager_two_kernel_chain_on_cuda_with_red_control` (`crates/jammi-kernels/tests/cuda_parity.rs:12714`) — cited by TEST NAME first, line second: a line number alone rots the moment a neighbouring test is added or deleted, a name does not. |
+| `attention_block` (`AttentionBlockFused`) | f32-only on CPU by a **real, disclosed candle limitation for BF16** (candle-core 0.11's CPU backend has no BF16 `MatMul` impl) — **but this limitation does NOT extend to F16**: `candle-core-0.11.0/src/cpu_backend/mod.rs:1382-1385`'s `MatMul::f` accepts `DType::F16 \| F32 \| F64` (the `gemm` crate ships a real `gemm-f16` backend, confirmed present in this workspace's own dependency tree), so an F16 CPU matmul arm is architecturally possible where a BF16 one never was. Rounding regime unstated (`f32 accumulate throughout` per the module doc's own F32-only CPU domain — an F16 arm would need to decide de novo whether QK^T/PV GEMMs run in f16-native or f32-accumulated precision, i.e. this is a fresh design decision, not a mechanical copy) | N/A (none designed) | **None.** The CPU forward matches only `(CpuStorage::F32(qkv), CpuStorage::F32(mask))` (`crates/jammi-kernels/src/ops/attention_block.rs:779`) — a ~500-line monomorphic `attention_fwd_f32` with its own `AttentionFwdF32Params` struct, RoPE-packing, mask-broadcast, and paired `bwd_core`/gradient-GEMM-layout machinery. An F16 arm is a second monomorphic forward, not a match-arm extension, and would have to decide de novo whether the QK^T/PV GEMMs run f16-native or f32-accumulated. |
+| `mem_efficient_attention` (`MemEfficientAttentionFused`) | Same F32-only-CPU-by-BF16-matmul-limitation shape as `attention_block`; F16 matmul is architecturally possible for the same `gemm-f16` reason above | N/A (none designed) | **None.** Same shape as `attention_block`: the CPU forward matches only `(CpuStorage::F32(qkv), CpuStorage::F32(mask))` (`crates/jammi-kernels/src/ops/mem_efficient_attention.rs:834`), a chunked/flash-style forward of ~2900 lines with its own GEMM-layout oracle machinery. |
+| `low_rank_residual_linear`/`lora_linear` (`LowRankResidualLinear`) | f32-internal for the LoRA branch (x upcast to F32 once, both GEMMs and the dropout in f32, `ScaledCastAdd` epilogue rounds once); the BASE GEMM runs in the tensor's own dtype, so on CPU it is exactly candle's `gemm-f16` matmul for F16 — where BF16 has no CPU `MatMul` impl at all | 1 (the epilogue's cast of the scaled LoRA delta into `base`'s dtype) | **Present, and dtype-generic rather than a hand-written arm** — the CPU dtype gate admits F32, BF16 and F16 alike — `matches!(s1.dtype(), DType::F32` (`crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:620`) and every step is composed from candle ops that are themselves dtype-generic, so F16 needed no monomorphic forward of its own. This is the asymmetry the structural finding below names: the same gate admits BF16, but a BF16 base fails inside candle's own `matmul` with a typed error, while F16 runs and is pinned bit-exact against the manual composition by `cpu_f16_matches_manual_composition_bit_exact` (`crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1193`). |
 
-**Structural finding for W2c (family K, "diagnose the structure before reaching for a tool"):**
+**Structural finding (family K, "diagnose the structure before reaching for a tool"):**
 candle-core 0.11's CPU backend refuses `BF16` for `matmul` (no `gemm-bf16` backend exists in the
-`gemm` crate) but DOES accept `F16` (`gemm-f16` is a real, present dependency — verified by this
-wave's `cargo test -p jammi-kernels axpy::` build pulling in `gemm-f16 v0.19.0`). Every "CPU
-F32-only" domain comment in `attention_block.rs`/`mem_efficient_attention.rs`/
-`low_rank_residual_linear.rs` that cites the BF16 matmul gap as the reason does NOT automatically
-apply to F16 — W2c should read this as "F16 CPU matmul is possible, unlike BF16," not assume the
-same refusal transfers.
+`gemm` crate) but DOES accept `F16` (`gemm-f16` is a real, present dependency of this workspace —
+it resolves in `Cargo.lock`). Every "CPU F32-only" domain comment in `attention_block.rs`/
+`mem_efficient_attention.rs`/`low_rank_residual_linear.rs` that cites the BF16 matmul gap as its
+reason does NOT automatically apply to F16: F16 CPU matmul is possible where BF16's is not, and
+`low_rank_residual_linear`'s own F16 CPU arm is what that possibility already bought. Whether an
+op has an F16 CPU arm today therefore tracks whether its CPU forward is composed from
+dtype-generic ops (it does) or is a monomorphic `_f32` function (it does not) — never the BF16
+matmul gap.
+
+### 3.10.0 A rounding-point COUNT is not a parity tolerance
+
+The `Rounding points` column above answers "how many times does a value cross a 16-bit rounding
+boundary". It does **not** answer "how far apart may two correct arms of this op land", and reading
+it as if it did is what produced both of campaign #446's f16 bound findings. The count is only the
+*local* allowance; a rounding point also **propagates** whenever its result is afterwards
+multiplied, or is consumed by a later step whose own condition number is large. Two rules,
+each with a live instance in `crates/jammi-kernels/tests/cuda_parity.rs`:
+
+1. **A rounding point UPSTREAM of a multiply contributes its own full relative ULP to the
+   product, not a fraction of one.** `geglu`'s forward rounds the activation (ROUND 1) and then
+   multiplies by `up` (ROUND 2). The two arms' pre-ROUND-1 activations differ by ~1 f32 ULP
+   (CUDA `erff` vs the CPU reference's `erf`), which is enough to straddle a 16-bit midpoint —
+   measured, 384 of 1024 elements do on this file's own fixture — so `|Δact| <= 1 ulp(act)`, a
+   relative `2^-mantissa`, which `act·up` carries into `out` as up to **2** ULPs of `out`, on top
+   of ROUND 2's own <=1. Derived `k = 3`, not the column's 2; see
+   `GEGLU_FWD_ROUND1_PROPAGATION_ULPS`. At `k = 2` both the sm_80 and sm_89 arch-set artifacts
+   measured worst `Δ/bound` of exactly `1.0` — a bound resting on its own worst case.
+2. **When an op's two arms are fed DIFFERENT (each individually within-bound) inputs, the output
+   allowance must include those inputs' difference times the op's own sensitivity.** A CPU-vs-CUDA
+   *backward* parity leg does exactly this whenever it takes each arm's own forward output as `y`.
+   `softmax`'s `dscores = (dy - Σ dy·y)·y` has one rounding point and is bit-tight given identical
+   `y` — but the CUDA forward's f32 row sum is a strided partial plus a shared-memory tree while
+   `softmax_row_f16` folds sequentially, and although that ≈3e-7 relative difference is far below
+   f16's step it flips `e_i / sum` by one f16 ULP wherever the exact quotient sits within it. A
+   1-ULP flip in a large `y_j` moves `dot` by `dy_j·ulp(y_j)`, and `dscores_i` is a difference of
+   two same-scale quantities, so a cancelled element amplifies it without limit (measured at
+   `last = 257`: 317x, turning `|Δdot| = 1.46e-4` into 6 f16 ULPs of a 1.06e-3 result). The fix is
+   the propagated term, not a bigger `k`: see `softmax_f16_dscores_propagation_terms`, which
+   evaluates the exact triangle-inequality expansion on the run's own measured `Δy`. The identical
+   trap for `f32` legs was already closed by `f32_two_term_bound`; the 16-bit legs simply never met
+   it while their only softmax fixture was `last = 8`.
+
+Neither finding is a kernel defect, and neither is a reason to narrow an f16 admission domain:
+`softmax_f16.cu` and `geglu_f16.cu` both meet the regimes this table states, at every admitted
+`last`/`intermediate`. What they are is a reason to derive a 16-bit parity `k` from the rounding
+STRUCTURE — where each rounding sits relative to the op's multiplies and reductions — rather than
+from the count.
+
+### 3.10.1 Dispatch status of the table's non-admitted-looking rows
+
+Having an f16 arm is not the same as being *provable* on a device. Two different proof
+mechanisms exist, and `ci/release-feature-manifest.json` is the single source of truth for
+which one applies to which op — that file's `_schema_doc` defines each mechanism; this
+subsection only states where the rows above land, so a reader of the table does not have
+to guess.
+
+| Op | Status | What proves it |
+|---|---|---|
+| `cast_scale` | **Admitted**, under dtype-keyed registry keys `cast_scale_bf16_f32` / `cast_scale_f16_f32` | A dispatch-registry delta on those keys in the `capability_surface` probe. The manifest names it dtype-neutrally as `cast_scale` in `fused_op_admission`; the name→key mapping is `jammi-kernels`'s own static table. |
+| `cast_add` | **Admitted**, under `cast_add_bf16` / `cast_add_f16` | Same mechanism; both admit through `admit_cast_boundary` in `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs`, called from that op's BF16 and F16 backward arms. |
+| `rope_positions` | **Internal sub-kernel** of the flash-attention op | No `admit()` of its own: `crates/jammi-kernels/src/ops/flash_attention.rs` launches `crate::cuda::rope_positions::cuda_fwd` directly. It is proven by compiling in the lane's build *and* by its parent's admitted dispatch being observed (a delta on the flash cascade's key) — never by a counter of its own, which does not exist. |
+| `scaled_cast_add` | **Internal sub-kernel** of `low_rank_residual_linear` | Same mechanism: `ScaledCastAdd::new` is constructed bare in that op's epilogue, so the parent's observed dispatch is the proof. |
+
+The distinction is load-bearing when reading a capability report: an internal sub-kernel
+is neither "unreachable" nor "independently admitted" — it runs exactly when its parent
+does. Wiring a real `admit()` call site (or an admitted parent that launches it) is what
+moves an op between these rows, in the same unit as that code edit.
+
+There is no third, compiled-only status, and a kernel that would need one does not stay.
+A kernel with no `admit()` site and no admitted parent has no row here and no manifest
+category: the only thing a shipped build says about it is that it compiled, which no
+capability report can act on. Such a kernel is wired or deleted in the same unit as its
+authoring, decided by measuring its share of shipped-leg GPU time against a threshold
+fixed before the numbers are seen — see
+`crates/jammi-kernels/artifacts/cuda-runs/2026-09-01-axpy-census-bdeb80c-a100-pcie.json`,
+where a pre-registered rule (wire iff the share reaches 2% of per-step GPU time on some
+shipped leg *and* one dispatch site covers at least half of it) measured 0.007% / 0.026% /
+0.027% across the three shipped dtype legs and the kernel was deleted.
 
 ## 4. Benchmarking
 

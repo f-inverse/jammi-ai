@@ -33,8 +33,9 @@ use jammi_db::trigger::ids::TopicId;
 use jammi_db::trigger::TriggerError;
 use jammi_db::TenantId;
 use jammi_wire::{
-    channel_to_proto, definition_to_proto, derives_from_edge_to_proto, match_verdict_to_proto,
-    model_to_proto, parse_table_id, source_type_from_proto, staleness_to_proto, topic_to_proto,
+    channel_to_proto, definition_to_proto, derives_from_edge_to_proto, index_segment_to_proto,
+    match_verdict_to_proto, model_to_proto, parse_table_id, source_type_from_proto,
+    staleness_to_proto, topic_to_proto,
 };
 use tonic::{Request, Response, Status};
 
@@ -409,6 +410,32 @@ impl CatalogService for CatalogServer {
 
         Ok(Response::new(pb::DerivesFromResponse {
             edges: edges.into_iter().map(derives_from_edge_to_proto).collect(),
+        }))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
+    async fn list_index_segments(
+        &self,
+        request: Request<pb::ListIndexSegmentsRequest>,
+    ) -> Result<Response<pb::ListIndexSegmentsResponse>, Status> {
+        let tenant = session_tenant_traced(&request);
+        let req = request.into_inner();
+        require_nonempty(&req.table_name, "table_name")?;
+        let session = self.local()?;
+
+        // Tenant-scoped by the abstraction: `list_index_segments` resolves the
+        // table through the tenant-filtered result-table read before it lists
+        // segments, so a table this tenant cannot resolve yields an empty
+        // listing here — the same answer an unknown table gets. The handler
+        // adds no predicate of its own and fakes no NotFound.
+        let segments = scoped(self.engine()?, tenant, || {
+            session.list_index_segments(&req.table_name)
+        })
+        .await
+        .map_err(map_engine_error)?;
+
+        Ok(Response::new(pb::ListIndexSegmentsResponse {
+            segments: segments.iter().map(index_segment_to_proto).collect(),
         }))
     }
 

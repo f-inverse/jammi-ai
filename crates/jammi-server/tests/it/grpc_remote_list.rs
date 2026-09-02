@@ -25,11 +25,16 @@ use jammi_ai::Session;
 use jammi_client::DataClient;
 use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
 use jammi_db::catalog::model_repo::RegisterModelParams;
+use jammi_db::catalog::result_repo::{CreateResultTableParams, ResultTableKind};
+use jammi_db::catalog::segment_repo::IndexSegment;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::mutable::MutableTableDefinitionBuilder;
 use jammi_db::ModelTask;
+use jammi_wire::index_segment_to_proto;
+use jammi_wire::proto::catalog::ListIndexSegmentsResponse;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
+use prost::Message;
 use tempfile::TempDir;
 use tonic::transport::Endpoint;
 
@@ -273,6 +278,227 @@ async fn remote_list_mutable_tables_matches_local() {
     assert!(
         remote_ids.iter().any(|id| id == "feature_store"),
         "registered mutable table must surface remotely: {remote_ids:?}"
+    );
+
+    server.shutdown.send(()).ok();
+}
+
+// ---------------------------------------------------------------------------
+// `ListIndexSegments` — embedded ⇄ remote byte parity
+// ---------------------------------------------------------------------------
+
+/// Seed a `result_tables` row named `table` (GLOBAL — no tenant bound on the
+/// server's engine) plus one `index_segments` row per `(segment_id, path,
+/// rows)`, inserting them in the given order so the listing's ordering is the
+/// query's, not the insertion's.
+async fn seed_segmented_table(server: &EngineServer, table: &str, segments: &[(i64, &str, usize)]) {
+    server
+        .engine
+        .catalog()
+        .create_result_table(CreateResultTableParams {
+            table_name: table,
+            source_id: "seg_src",
+            model_id: "seg_model",
+            task: ModelTask::TextEmbedding,
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            parquet_path: "file:///tmp/seg.parquet",
+            dimensions: Some(4),
+            key_column: Some("id"),
+            text_columns: None,
+            storage_precision: jammi_db::config::StoragePrecision::F32,
+            oversample: 4,
+            created_at: jammi_db::catalog::backend::now_sortable(),
+        })
+        .await
+        .expect("create result table");
+    for (id, path, rows) in segments {
+        assert!(
+            server
+                .engine
+                .catalog()
+                .insert_index_segment(table, None, *id, path, *rows)
+                .await
+                .expect("insert segment"),
+            "segment {id} must land"
+        );
+    }
+}
+
+/// The serialized wire form of a segment listing: the exact
+/// `ListIndexSegmentsResponse` bytes the surface carries. Comparing THESE
+/// (rather than a field-by-field spot check) is what makes the parity assertion
+/// byte-for-byte — a divergence in any field, in the ordering, or in the
+/// `usize` → `uint64` widening shows up as a byte diff.
+fn segment_wire_bytes(segments: &[IndexSegment]) -> Vec<u8> {
+    ListIndexSegmentsResponse {
+        segments: segments.iter().map(index_segment_to_proto).collect(),
+    }
+    .encode_to_vec()
+}
+
+/// Remote `ListIndexSegments` equals the embedded `Session::list_index_segments`
+/// BYTE-FOR-BYTE on the divergence-prone input: a MULTI-SEGMENT table whose
+/// segments were inserted out of order. A single-segment table would pass even
+/// if the ordering or the repeated-field encoding diverged, so the multi-segment
+/// case is the one that is exercised.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_list_index_segments_matches_local_byte_for_byte() {
+    let server = start_engine_server().await;
+    seed_segmented_table(
+        &server,
+        "segmented_rt",
+        &[
+            (2, "file:///idx/segmented_rt-2", 11),
+            (0, "file:///idx/segmented_rt-0", 3),
+            (1, "file:///idx/segmented_rt-1", 7),
+        ],
+    )
+    .await;
+
+    let remote_segments = remote(&server)
+        .await
+        .catalog()
+        .list_index_segments("segmented_rt")
+        .await
+        .expect("remote list_index_segments");
+    let local_segments = local(&server)
+        .list_index_segments("segmented_rt")
+        .await
+        .expect("local list_index_segments");
+
+    assert_eq!(
+        segment_wire_bytes(&remote_segments),
+        segment_wire_bytes(&local_segments),
+        "remote ListIndexSegments must equal the embedded verb byte-for-byte on a \
+         multi-segment table (remote={remote_segments:?}, local={local_segments:?})"
+    );
+    assert_eq!(
+        local_segments,
+        vec![
+            IndexSegment {
+                segment_id: 0,
+                index_path: "file:///idx/segmented_rt-0".to_string(),
+                row_count: 3,
+            },
+            IndexSegment {
+                segment_id: 1,
+                index_path: "file:///idx/segmented_rt-1".to_string(),
+                row_count: 7,
+            },
+            IndexSegment {
+                segment_id: 2,
+                index_path: "file:///idx/segmented_rt-2".to_string(),
+                row_count: 11,
+            },
+        ],
+        "both transports must carry every segment, ordered by segment_id"
+    );
+
+    server.shutdown.send(()).ok();
+}
+
+/// The boundary cases of the same parity: a table that exists with ZERO
+/// segments (a flat, unsegmented index) and a table that does not exist at all.
+/// Both are empty listings on both transports — the empty case is where a
+/// remote arm that faked a NotFound (or a local arm that errored) would diverge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_list_index_segments_matches_local_on_the_empty_cases() {
+    let server = start_engine_server().await;
+    seed_segmented_table(&server, "flat_rt", &[]).await;
+
+    for table in ["flat_rt", "no_such_result_table"] {
+        let remote_segments = remote(&server)
+            .await
+            .catalog()
+            .list_index_segments(table)
+            .await
+            .unwrap_or_else(|e| panic!("remote list_index_segments({table}): {e}"));
+        let local_segments = local(&server)
+            .list_index_segments(table)
+            .await
+            .unwrap_or_else(|e| panic!("local list_index_segments({table}): {e}"));
+
+        assert!(
+            remote_segments.is_empty(),
+            "{table}: a segment-less table must list nothing remotely: {remote_segments:?}"
+        );
+        assert_eq!(
+            segment_wire_bytes(&remote_segments),
+            segment_wire_bytes(&local_segments),
+            "{table}: the empty listing must be byte-identical across transports"
+        );
+    }
+
+    server.shutdown.send(()).ok();
+}
+
+/// Cross-tenant denial over the REAL wire, on top of the hermetic oracle case:
+/// a remote session bound to tenant B cannot see the segments of a table owned
+/// by tenant A — and gets the same empty listing an unknown table gives, so the
+/// verb is not an existence oracle for a peer's table names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_list_index_segments_denies_a_peer_tenants_table() {
+    let server = start_engine_server().await;
+    let owner = tenant_a();
+    // Create the table UNDER TENANT A (the engine's sticky binding is unset, so
+    // the scope is entered explicitly — the same task-local the server's
+    // per-request `scoped(..)` installs).
+    server
+        .engine
+        .with_tenant_scoped(owner, |scope| async move {
+            scope
+                .catalog()
+                .create_result_table(CreateResultTableParams {
+                    table_name: "a_owned_rt",
+                    source_id: "seg_src",
+                    model_id: "seg_model",
+                    task: ModelTask::TextEmbedding,
+                    kind: ResultTableKind::Model,
+                    derived_from: None,
+                    parquet_path: "file:///tmp/seg.parquet",
+                    dimensions: Some(4),
+                    key_column: Some("id"),
+                    text_columns: None,
+                    storage_precision: jammi_db::config::StoragePrecision::F32,
+                    oversample: 4,
+                    created_at: jammi_db::catalog::backend::now_sortable(),
+                })
+                .await
+        })
+        .await
+        .expect("create tenant A's result table");
+    assert!(
+        server
+            .engine
+            .catalog()
+            .insert_index_segment("a_owned_rt", Some(owner), 0, "file:///idx/a-0", 5)
+            .await
+            .expect("insert segment"),
+        "tenant A's segment must land"
+    );
+
+    let peer = remote(&server).await;
+    peer.bind_tenant(tenant_b()).await.expect("bind tenant B");
+    let seen = peer
+        .catalog()
+        .list_index_segments("a_owned_rt")
+        .await
+        .expect("remote list_index_segments");
+    assert!(
+        seen.is_empty(),
+        "CROSS-TENANT READ LEAK: tenant B saw tenant A's index segments over the wire: {seen:?}"
+    );
+
+    let unknown = peer
+        .catalog()
+        .list_index_segments("no_such_result_table")
+        .await
+        .expect("remote list_index_segments");
+    assert_eq!(
+        segment_wire_bytes(&seen),
+        segment_wire_bytes(&unknown),
+        "a peer's table and an unknown table must be indistinguishable on the wire"
     );
 
     server.shutdown.send(()).ok();

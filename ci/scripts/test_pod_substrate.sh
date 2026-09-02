@@ -261,6 +261,80 @@ print("OK" if ok else "MISMATCH: " + json.dumps(m))
     bad "(b/N2) expected a poisoned seed's clone to be refused and removed (rc=$rc, dest exists=$([ -e "$POISON_DEST" ] && echo yes || echo no)): $(cat "$SANDBOX/b6.out")"
   fi
 
+  # --adopt (the executable remedy for `run`'s UNMARKED_WARM refusal): a
+  # target dir that is already WARM but carries no marker — one built
+  # before the marker scheme existed, or by any path other than the
+  # `target` verb — is stamped in place. The clone path cannot serve this
+  # case at all: it refuses an existing destination (pinned right above),
+  # which is exactly why the old refusal's remedy could not execute.
+  #
+  # Adoption is CHECKED, not a rubber stamp: it runs the SAME content
+  # validation every clone runs (pod_seed_assert_member_free, off the real
+  # workspace member list resolved from REPO_ROOT) and demands the OPPOSITE
+  # answer — member artifacts MUST be present, because those artifacts are
+  # the warmth being claimed.
+  ADOPT_WARM="$SANDBOX/b_adopt_warm"
+  rm -rf "$ADOPT_WARM"
+  mkdir -p "$ADOPT_WARM/debug/.fingerprint/jammi-bench-deadbeef"
+  echo x > "$ADOPT_WARM/debug/.fingerprint/jammi-bench-deadbeef/lib-jammi-bench.json"
+  bash "$CLONE_SH" "$SEED" "$ADOPT_WARM" "$REPO_ROOT" --adopt > "$SANDBOX/b7.out" 2>&1
+  rc=$?
+  if [ "$rc" -eq 0 ] && [ -f "$ADOPT_WARM/.jammi-clone-of-seed" ]; then
+    ok "(b/adopt) --adopt stamps the marker on an EXISTING warm target dir the clone path refuses outright"
+  else
+    bad "(b/adopt) expected --adopt to accept and stamp a warm dir (rc=$rc): $(cat "$SANDBOX/b7.out")"
+  fi
+  # The marker is HONEST about what it is: an adoption, with no seed
+  # provenance to claim (an adopted dir came from no seed).
+  adopt_marker_check="$(python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    m = json.load(f)
+print("OK" if (m.get("adopted") is True and m.get("seed_dir") is None
+                and m.get("dest_dir") == sys.argv[2]
+                and bool(m.get("adopted_timestamp"))) else "MISMATCH: " + json.dumps(m))
+' "$ADOPT_WARM/.jammi-clone-of-seed" "$ADOPT_WARM" 2>&1)"
+  [ "$adopt_marker_check" = "OK" ] \
+    && ok "(b/adopt) the adoption marker records adopted=true with NO fabricated seed provenance" \
+    || bad "(b/adopt) adoption marker content is wrong: $adopt_marker_check"
+  # The warm dir's own content is untouched — adoption copies and deletes
+  # nothing.
+  [ -f "$ADOPT_WARM/debug/.fingerprint/jammi-bench-deadbeef/lib-jammi-bench.json" ] \
+    && ok "(b/adopt) adoption leaves the warm dir's own artifacts in place (nothing copied, nothing deleted)" \
+    || bad "(b/adopt) adoption must not disturb the warm dir's existing artifacts"
+  # A genuinely COLD dir (a real cargo profile tree with no member
+  # artifacts) is still refused — --adopt can never launder cold into
+  # marked.
+  ADOPT_COLD="$SANDBOX/b_adopt_cold"
+  rm -rf "$ADOPT_COLD"
+  mkdir -p "$ADOPT_COLD/debug/.fingerprint/serde-1234abcd"
+  bash "$CLONE_SH" "$SEED" "$ADOPT_COLD" "$REPO_ROOT" --adopt > "$SANDBOX/b8.out" 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ] && [ ! -f "$ADOPT_COLD/.jammi-clone-of-seed" ] && grep -q 'NO workspace-member artifacts' "$SANDBOX/b8.out"; then
+    ok "(b/adopt) a COLD dir (no workspace-member artifacts) is refused and left unmarked"
+  else
+    bad "(b/adopt) expected a cold dir to be refused unmarked (rc=$rc): $(cat "$SANDBOX/b8.out")"
+  fi
+  # A dir that is not a built CARGO_TARGET_DIR at all (no debug/, no
+  # release/) is a structural refusal, not a silent stamp.
+  ADOPT_EMPTY="$SANDBOX/b_adopt_empty"
+  rm -rf "$ADOPT_EMPTY"; mkdir -p "$ADOPT_EMPTY"
+  bash "$CLONE_SH" "$SEED" "$ADOPT_EMPTY" "$REPO_ROOT" --adopt > "$SANDBOX/b9.out" 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ] && [ ! -f "$ADOPT_EMPTY/.jammi-clone-of-seed" ]; then
+    ok "(b/adopt) a dir with neither debug/ nor release/ is refused (structurally not a target dir), never stamped"
+  else
+    bad "(b/adopt) expected a structural refusal for a non-target dir (rc=$rc): $(cat "$SANDBOX/b9.out")"
+  fi
+  # A missing dir is refused too (there is nothing warm to adopt).
+  bash "$CLONE_SH" "$SEED" "$SANDBOX/b_adopt_absent" "$REPO_ROOT" --adopt > "$SANDBOX/b10.out" 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ] && [ ! -e "$SANDBOX/b_adopt_absent" ]; then
+    ok "(b/adopt) --adopt against a MISSING dir is refused and creates nothing"
+  else
+    bad "(b/adopt) expected --adopt to refuse a missing dir and create nothing (rc=$rc): $(cat "$SANDBOX/b10.out")"
+  fi
+
   # --verify: a log WITHOUT a Fresh jammi-* line passes.
   CLEAN_LOG="$SANDBOX/b_clean.log"
   { echo "   Compiling jammi-kernels v0.47.0"; echo "   Compiling jammi-bench v0.47.0"; echo "    Finished release"; } > "$CLEAN_LOG"
@@ -827,10 +901,46 @@ DRV
   # (esc-077-class one-pod-per-wave) the active-wave claim is written with
   # the caller's wave/tree at the very START (alongside .jammi.exit removal)
   # and removed again at the NORMAL-completion exit path.
-  printf '%s\n' "$marker_wrapper_text" | grep -qF 'printf "WAVE=mywave\nTREE=mytree\nTS=' \
+  printf '%s\n' "$marker_wrapper_text" | grep -qF "printf '%s\\n' 'WAVE=mywave' 'TREE=mytree' 'TS=" \
     && ok "(i/one-pod-per-wave) rp_job_wrapper_with_marker_lines writes the active-wave claim (wave+tree) up front" \
     || bad "(i/one-pod-per-wave) rp_job_wrapper_with_marker_lines did not write the expected active-wave claim — got: $marker_wrapper_text"
-  clear_count="$(printf '%s\n' "$marker_wrapper_text" | grep -cF 'rm -f /root/.jammi-active-wave')"
+  # Every claim write and every claim removal is inside a flock critical
+  # section (fd 8 on RP_CLAIM_LOCK) — a reader never sees a half-written
+  # claim, and two holders launching at once never race on the store.
+  unlocked="$(printf '%s\n' "$marker_wrapper_text" | grep -F '.jammi-active-wave.d/' | grep -vc 'flock 8')"
+  [ "$unlocked" -eq 0 ] \
+    && ok "(i/one-pod-per-wave) every claim-store statement runs inside the flock critical section" \
+    || bad "(i/one-pod-per-wave) $unlocked claim-store statement(s) run OUTSIDE the flock — got: $marker_wrapper_text"
+  # The claim write puts caller-supplied values in the remote printf's
+  # ARGUMENT position, never its FORMAT position. With the value
+  # interpolated into the format string, `--wave '%d'` made the pod's own
+  # printf consume a missing argument and write `WAVE=0` (a claim for a
+  # wave nobody asked for), and a `"` closed the format string, turning the
+  # remainder of the generated line into remote shell code. Driven with the
+  # exotic values directly, BELOW the entrypoint allowlist, so the
+  # generator is pinned independently of it.
+  marker_wrapper_fmt="$(bash "$RUNPOD_DRIVER" rp_job_wrapper_with_marker_lines "/root/trees/t" "/root/target-t" "cargo test" "tok123" "0" '%d' 'a"b')"
+  claim_line="$(printf '%s\n' "$marker_wrapper_fmt" | grep -F ".claim'" | grep -vF 'rm -f')"
+  case "$claim_line" in
+    "( flock 8; printf '%s\n' 'WAVE=%d' 'TREE=a\"b' 'TS="*)
+      ok "(i/one-pod-per-wave) a '%d' wave and a quote-bearing tree stay INERT DATA in the claim write (argument position, single-quoted)" ;;
+    *)
+      bad "(i/one-pod-per-wave) caller-supplied wave/tree must not reach the remote printf's format position — got: $claim_line" ;;
+  esac
+  # And the generated text, executed, writes those values VERBATIM — the
+  # end-to-end form of the same property (no format expansion, no escape,
+  # and the claim FILENAME the tree name lands in stays inert too).
+  claim_sandbox="$SANDBOX/i_claimfmt"; rm -rf "$claim_sandbox"; mkdir -p "$claim_sandbox"
+  printf '%s\n' "$marker_wrapper_fmt" | grep -F '.jammi-active-wave' | grep -vF 'rm -f' \
+    | sed "s#/root/.jammi-active-wave#$claim_sandbox/.jammi-active-wave#g" > "$claim_sandbox/write.sh"
+  bash "$claim_sandbox/write.sh"
+  claim_head="$(head -2 "$claim_sandbox/.jammi-active-wave.d/a\"b.claim" 2>/dev/null)"
+  if [ "$claim_head" = "$(printf 'WAVE=%%d\nTREE=a"b')" ]; then
+    ok "(i/one-pod-per-wave) executing the claim write records the %d wave and the quote-bearing tree VERBATIM — no format expansion, no injection"
+  else
+    bad "(i/one-pod-per-wave) the executed claim write mangled its values — got: $claim_head"
+  fi
+  clear_count="$(printf '%s\n' "$marker_wrapper_text" | grep -cF "rm -f '/root/.jammi-active-wave.d/mytree.claim'")"
   [ "$clear_count" -ge 1 ] \
     && ok "(i/one-pod-per-wave) rp_job_wrapper_with_marker_lines clears the active-wave claim on normal completion" \
     || bad "(i/one-pod-per-wave) rp_job_wrapper_with_marker_lines never clears the active-wave claim — got: $marker_wrapper_text"
@@ -846,10 +956,169 @@ DRV
   # though the actual job command never ran) — two `rm -f` occurrences
   # total in the timing=1 text: one on the lock-refused arm, one on normal
   # completion.
-  clear_count_timing="$(printf '%s\n' "$marker_wrapper_timing" | grep -cF 'rm -f /root/.jammi-active-wave')"
+  clear_count_timing="$(printf '%s\n' "$marker_wrapper_timing" | grep -cF "rm -f '/root/.jammi-active-wave.d/mytree.claim'")"
   [ "$clear_count_timing" -ge 2 ] \
-    && ok "(i/one-pod-per-wave) timing=1's lock-refused early exit ALSO clears the active-wave claim, not only normal completion" \
+    && ok "(i/one-pod-per-wave) timing=1's lock-refused early exit ALSO clears this holder's claim, not only normal completion" \
     || bad "(i/one-pod-per-wave) expected the claim cleared on BOTH the lock-refused and normal-completion paths (got $clear_count_timing occurrence(s)) — got: $marker_wrapper_timing"
+  # Ordering: under --timing the claim is written only AFTER the timing
+  # lock is held. A run whose `flock -n 9` is REFUSED never ran a job, so
+  # it must never have appeared in the store on behalf of that job.
+  flock_ln="$(printf '%s\n' "$marker_wrapper_timing" | grep -n 'flock -n 9' | head -1 | cut -d: -f1)"
+  claim_ln="$(printf '%s\n' "$marker_wrapper_timing" | grep -nF "> '/root/.jammi-active-wave.d/mytree.claim'" | head -1 | cut -d: -f1)"
+  { [ -n "$flock_ln" ] && [ -n "$claim_ln" ] && [ "$claim_ln" -gt "$flock_ln" ]; } \
+    && ok "(i/one-pod-per-wave) timing=1 writes the claim only AFTER acquiring the timing lock (claim line $claim_ln > flock line $flock_ln)" \
+    || bad "(i/one-pod-per-wave) the claim write must follow the timing-lock acquisition (flock line '$flock_ln', claim line '$claim_ln') — got: $marker_wrapper_timing"
+
+  # Co-tenancy, executed: TWO same-wave holders on different trees each
+  # write their OWN claim file, both survive, and the first holder's own
+  # completion path removes ONLY its own — the second holder stays visible
+  # to the concurrency gate. With one shared claim file, holder B's launch
+  # overwrote holder A's claim and holder A's completion deleted the claim
+  # B was still relying on, leaving a busy pod reading as unclaimed.
+  cot="$SANDBOX/i_cotenancy"; rm -rf "$cot"; mkdir -p "$cot"
+  rebase_claim_store() { # $1=generated text -> the same text against $cot
+    printf '%s\n' "${1//\/root\/.jammi-active-wave/$cot/.jammi-active-wave}"
+  }
+  hold_a="$(bash "$RUNPOD_DRIVER" rp_job_wrapper_with_marker_lines "/root/trees/tree-a" "/root/target-a" ":" "tokA" "0" "wave-A" "tree-a")"
+  hold_b="$(bash "$RUNPOD_DRIVER" rp_job_wrapper_with_marker_lines "/root/trees/tree-b" "/root/target-b" ":" "tokB" "0" "wave-A" "tree-b")"
+  rebase_claim_store "$hold_a" | grep -F '.jammi-active-wave' | grep -vF 'rm -f' > "$cot/write-a.sh"
+  rebase_claim_store "$hold_b" | grep -F '.jammi-active-wave' | grep -vF 'rm -f' > "$cot/write-b.sh"
+  rebase_claim_store "$hold_a" | grep -F '.jammi-active-wave' | grep -F 'rm -f' > "$cot/clear-a.sh"
+  bash "$cot/write-a.sh"; bash "$cot/write-b.sh"
+  claims_after_both="$(find "$cot/.jammi-active-wave.d" -name '*.claim' 2>/dev/null | wc -l | tr -d ' ')"
+  [ "$claims_after_both" = "2" ] \
+    && ok "(i/one-pod-per-wave) two same-wave holders on different trees BOTH hold a claim (neither clobbers the other)" \
+    || bad "(i/one-pod-per-wave) expected 2 surviving claims for two same-wave holders (got $claims_after_both)"
+  bash "$cot/clear-a.sh"
+  if [ ! -f "$cot/.jammi-active-wave.d/tree-a.claim" ] && [ -f "$cot/.jammi-active-wave.d/tree-b.claim" ]; then
+    ok "(i/one-pod-per-wave) a holder's completion removes ONLY its own claim — the co-tenant's claim survives"
+  else
+    bad "(i/one-pod-per-wave) holder A's completion must remove exactly its own claim (a=$([ -f "$cot/.jammi-active-wave.d/tree-a.claim" ] && echo present || echo gone), b=$([ -f "$cot/.jammi-active-wave.d/tree-b.claim" ] && echo present || echo gone))"
+  fi
+  [ "$(cat "$cot/.jammi-active-wave.d/tree-b.claim" 2>/dev/null | head -2)" = "$(printf 'WAVE=wave-A\nTREE=tree-b')" ] \
+    && ok "(i/one-pod-per-wave) the surviving co-tenant's claim still names ITS own wave and tree" \
+    || bad "(i/one-pod-per-wave) the surviving claim's content is wrong — got: $(cat "$cot/.jammi-active-wave.d/tree-b.claim" 2>/dev/null)"
+
+  # ── (i/build-sha) JAMMI_BUILD_SHA defaults from the push stamp, and ONLY
+  # from a CLEAN one ─────────────────────────────────────────────────────
+  # `push` rsyncs the working tree WITHOUT `.git`, so a bench binary built
+  # on a pushed tree has no repository for build.rs's `git rev-parse`
+  # fallback and bakes build_sha="unknown" — every producer's provenance
+  # cross-check then refuses its output. `<tree>/.jammi-push-stamp.json`
+  # already records the missing fact, so rp_job_env_lines emits a default
+  # that reads it.
+  #
+  # The property under test is not "a sha appears" but WHICH trees get one:
+  # `push` sends uncommitted work too, so `laptop_head` names the commit
+  # the tree was BASED on. Exporting it for a DIRTY push would fabricate a
+  # provenance — a false claim no downstream reader can detect, strictly
+  # worse than "unknown". The generated text is EXECUTED here (not merely
+  # grepped) against real fixture stamps, because a grep cannot tell the
+  # clean branch from the dirty one.
+  bsha="$SANDBOX/i_buildsha"; rm -rf "$bsha"; mkdir -p "$bsha"
+  bsha_clean_digest="$(python3 -c 'import hashlib; print(hashlib.sha256(b"").hexdigest())')"
+  bsha_head40="0123456789abcdef0123456789abcdef01234567"
+  bsha_write_stamp() { # $1=tree_dir $2=laptop_head $3=porcelain $4=diff
+    mkdir -p "$1"
+    python3 - "$1/.jammi-push-stamp.json" "$2" "$3" "$4" <<'BSHAPY'
+import json, sys
+json.dump(
+    {
+        "laptop_head": sys.argv[2],
+        "porcelain_sha256": sys.argv[3],
+        "diff_head_sha256": sys.argv[4],
+        "manifest_sha256": "fixture",
+        "cutlass_gitlink": None,
+        "ts": "fixture",
+        "session": "fixture",
+    },
+    open(sys.argv[1], "w"),
+)
+BSHAPY
+  }
+  # Run the emitted preamble and report what JAMMI_BUILD_SHA ended up as.
+  # $1=tree_dir; $2 (optional) = a pre-set JAMMI_BUILD_SHA the caller brings.
+  bsha_resolve() {
+    local text
+    text="$(bash "$RUNPOD_DRIVER" rp_job_build_sha_lines "$1")"
+    if [ -n "${2:-}" ]; then
+      JAMMI_BUILD_SHA="$2" bash -c "${text}; printf '%s' \"\${JAMMI_BUILD_SHA:-}\"" 2>/dev/null # tripwire-ok: the emitted text writes an intentional ::warning:: to stderr on every refusal branch; this helper reports the RESOLVED VALUE only, and each caller below asserts that value explicitly — a discarded warning is never a silent pass
+    else
+      bash -c "${text}; printf '%s' \"\${JAMMI_BUILD_SHA:-}\"" 2>/dev/null # tripwire-ok: same as the branch above
+    fi
+  }
+
+  bsha_write_stamp "$bsha/clean" "$bsha_head40" "$bsha_clean_digest" "$bsha_clean_digest"
+  [ "$(bsha_resolve "$bsha/clean")" = "$bsha_head40" ] \
+    && ok "(i/build-sha) a CLEAN push stamp's laptop_head becomes the job's JAMMI_BUILD_SHA (no hand-typed sha, no build_sha=unknown)" \
+    || bad "(i/build-sha) a clean push stamp did not yield its laptop_head — got: '$(bsha_resolve "$bsha/clean")'"
+
+  # Dirty on EITHER hash: the pushed bytes are not that commit.
+  bsha_write_stamp "$bsha/dirty_status" "$bsha_head40" "0000000000000000000000000000000000000000000000000000000000000000" "$bsha_clean_digest"
+  [ -z "$(bsha_resolve "$bsha/dirty_status")" ] \
+    && ok "(i/build-sha) a push stamp with a DIRTY working tree (porcelain) exports nothing — a fabricated provenance is worse than \"unknown\"" \
+    || bad "(i/build-sha) a dirty-porcelain stamp fabricated a sha — got: '$(bsha_resolve "$bsha/dirty_status")'"
+  bsha_write_stamp "$bsha/dirty_diff" "$bsha_head40" "$bsha_clean_digest" "1111111111111111111111111111111111111111111111111111111111111111"
+  [ -z "$(bsha_resolve "$bsha/dirty_diff")" ] \
+    && ok "(i/build-sha) a push stamp with unstaged diff content exports nothing either (both hashes are load-bearing)" \
+    || bad "(i/build-sha) a dirty-diff stamp fabricated a sha — got: '$(bsha_resolve "$bsha/dirty_diff")'"
+
+  # `laptop_head` is the literal "unknown" when the pushed repo-root was
+  # not a git checkout — the one value that is shaped like a field but is
+  # not a sha.
+  bsha_write_stamp "$bsha/unknown_head" "unknown" "$bsha_clean_digest" "$bsha_clean_digest"
+  [ -z "$(bsha_resolve "$bsha/unknown_head")" ] \
+    && ok "(i/build-sha) laptop_head=\"unknown\" is not shaped like a sha and exports nothing" \
+    || bad "(i/build-sha) laptop_head=unknown leaked into JAMMI_BUILD_SHA — got: '$(bsha_resolve "$bsha/unknown_head")'"
+
+  # No stamp at all, and a corrupt one: both refuse quietly-valued (empty),
+  # loudly-messaged — never a traceback, never a partial value.
+  mkdir -p "$bsha/no_stamp"
+  [ -z "$(bsha_resolve "$bsha/no_stamp")" ] \
+    && ok "(i/build-sha) a tree with no push stamp exports nothing (build.rs bakes \"unknown\" and the producer refuses, as it should)" \
+    || bad "(i/build-sha) a stampless tree produced a sha — got: '$(bsha_resolve "$bsha/no_stamp")'"
+  mkdir -p "$bsha/corrupt"; printf 'not json' > "$bsha/corrupt/.jammi-push-stamp.json"
+  [ -z "$(bsha_resolve "$bsha/corrupt")" ] \
+    && ok "(i/build-sha) a corrupt push stamp exports nothing (and does not abort the job with a traceback)" \
+    || bad "(i/build-sha) a corrupt push stamp produced a sha — got: '$(bsha_resolve "$bsha/corrupt")'"
+
+  # The manual escape hatch still wins: an operator who KNOWS the pushed
+  # tip (the dirty-tree case) types it and is never overridden.
+  [ "$(bsha_resolve "$bsha/dirty_status" "ffffffffffffffffffffffffffffffffffffffff")" = "ffffffffffffffffffffffffffffffffffffffff" ] \
+    && ok "(i/build-sha) a caller-supplied JAMMI_BUILD_SHA is never overwritten by the stamp default" \
+    || bad "(i/build-sha) the stamp default clobbered a caller-supplied JAMMI_BUILD_SHA"
+
+  # Wired into the preamble EVERY job runs through, not merely defined —
+  # the same single-source discipline the CARGO_TARGET_DIR assertions above
+  # check for their own line.
+  printf '%s\n' "$marker_wrapper_text" | grep -qF "__jammi_push_stamp='/root/trees/mytree/.jammi-push-stamp.json'" \
+    && ok "(i/build-sha) the real job wrapper carries the stamp-derived JAMMI_BUILD_SHA default (rp_job_env_lines, one definition)" \
+    || bad "(i/build-sha) rp_job_wrapper_with_marker_lines does not carry the build-sha default — got: $marker_wrapper_text"
+
+  # revert-RED: neuter rp_job_build_sha_lines on a SCRATCH copy of
+  # runpod_lib.sh and confirm the clean-stamp case stops resolving. Without
+  # this the assertions above could pass against a tree where the default
+  # came from somewhere else entirely (or from the ambient environment).
+  bsha_scratch_lib="$bsha/runpod_lib_neutered.sh"
+  python3 - "$RUNPOD_LIB_SH" "$bsha_scratch_lib" <<'BSHAREVERTPY'
+import re
+import sys
+
+src = open(sys.argv[1]).read()
+# Replace the function BODY with a no-op emitter — the pre-change shape,
+# where the job preamble said nothing about JAMMI_BUILD_SHA at all.
+start = src.index("rp_job_build_sha_lines() {")
+end = src.index("\nBUILDSHAEOF\n}", start) + len("\nBUILDSHAEOF\n}")
+neutered = "rp_job_build_sha_lines() {\n  : \"${1:?needs a tree dir}\"\n}"
+open(sys.argv[2], "w").write(src[:start] + neutered + src[end:])
+BSHAREVERTPY
+  bsha_scratch_driver="$bsha/probe_neutered.sh"
+  sed "s#^\. \"$RUNPOD_LIB_SH\"\$#. \"$bsha_scratch_lib\"#" "$RUNPOD_DRIVER" > "$bsha_scratch_driver"
+  bsha_reverted_text="$(bash "$bsha_scratch_driver" rp_job_build_sha_lines "$bsha/clean")"
+  bsha_reverted_value="$(bash -c "${bsha_reverted_text}; printf '%s' \"\${JAMMI_BUILD_SHA:-}\"" 2>/dev/null)" # tripwire-ok: the neutered emitter is EXPECTED to produce nothing at all; the empty resolved value is the assertion right below, never a silent pass
+  [ -z "$bsha_reverted_value" ] \
+    && ok "(i/build-sha revert-RED) neutering rp_job_build_sha_lines on a scratch copy reproduces the ORIGINAL gap — the same CLEAN stamp now resolves nothing, so the default is genuinely load-bearing" \
+    || bad "(i/build-sha revert-RED) the neutered copy still resolved a sha ('$bsha_reverted_value') — this leg is not testing what it claims"
 
   # target-then-push composition, end to end, on a LOCAL fixture pod
   # filesystem (real pod_target_clone.sh, real rsync, real exclude list —

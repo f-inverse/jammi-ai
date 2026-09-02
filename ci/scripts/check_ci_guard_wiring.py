@@ -66,6 +66,51 @@ Self-inclusive: this script (`check_ci_guard_wiring.py`) is itself a
 `check_*.py` script under `ci/scripts/`, so it is required to find its own
 name in some workflow file just like every other gate.
 
+## Second property: the Book gate's server provisioning is WIRED, not read
+
+"Is this script's name mentioned by some workflow" is the right question for
+a gate script, because a gate script's whole contract is "run me". It is the
+WRONG question for a multi-step job whose correctness lives in the ORDER of
+its steps and in which value feeds which input — the name-mention scan reads
+green on such a job no matter how its steps are rearranged.
+
+`.github/workflows/cookbook-book.yml`'s forward render gate is exactly that
+shape. Three facts have to hold together or the job silently under-proves:
+
+  1. the chapter SELECTOR step (`id: select`) runs BEFORE the wheel build
+     (`uses: ./.github/actions/setup-jammi-py`). The selector emits
+     `needs_server`, the LANE CAPABILITY the selected set asks for; a build
+     that runs first cannot be told to produce a server, and the only repair
+     left at that point is to trim the render set to what the job happens to
+     have — the exact backwards direction the gate exists to refuse.
+  2. `build-server:` is bound to `${{ steps.select.outputs.needs_server }}`,
+     never to a literal. A hardcoded `false` silently drops every grpc://
+     chapter's proof; a hardcoded `true` pays a server build on every diff
+     and, worse, makes the flag stop tracking the selection at all.
+  3. the render step puts `target/release` on `PATH`, which is where a built
+     `jammi-server` lands. A server built and never reachable is a server
+     that was not built.
+
+All three were discipline only: true today, held by nothing, and each one is
+a single-line edit away from being false with every existing check still
+green. `book_provisioning_violations()` below pins them.
+
+Deliberately a comment-STRIPPED line scan (`workflow_run_text`'s own
+comment-vs-code rule, reused rather than reinvented), not a YAML parse. Two
+reasons, and the first is not the convenience one: that workflow ALREADY
+carries a comment reading "`target/release` goes on PATH exactly as
+`cookbook-render.yml` does". A scan over raw text would be satisfied by that
+sentence — it would assert that somebody once DESCRIBED the wiring, which is
+precisely the "discipline only" state this check exists to end, dressed up as
+a gate. Only a line that is part of a step body may satisfy a pin. The second
+reason is that no gate in this repo imports PyYAML today, and a gate that
+fails closed on a missing third-party import is a gate that fails closed for
+the wrong reason.
+
+Fail-closed on absence: if the workflow file is gone (renamed, deleted), that
+is a violation, not a skip. A gate that silently passes when its subject
+disappears is the fail-open shape this whole file exists to close.
+
 Run: `python3 ci/scripts/check_ci_guard_wiring.py`
 Hermetic: reads only files in the working tree via `git ls-files` (no
 network, no build) — requires running inside a git checkout.
@@ -101,6 +146,27 @@ ALLOWLIST_PATH = SCRIPTS_DIR / "ci_guard_wiring_allowlist.txt"
 # larger change than this advisory asked for, and would risk false-reddening
 # jobs that are demonstrably already running those suites today).
 _CRATES_REFERENCE_RE = re.compile(r"^crates/[^/]+/reference/")
+
+# The workflow whose step ORDER and input BINDINGS this file's second property
+# pins (see the module doc). Named once, so a rename is a one-line edit here
+# rather than a silently-skipped check — `book_provisioning_violations()`
+# treats a missing file as a violation, never as "nothing to do".
+BOOK_WORKFLOW_NAME = "cookbook-book.yml"
+
+# `build-server:` must take the SELECTOR's output, not a literal. Whitespace
+# inside the `${{ }}` expression is normalized by the alternation on spaces
+# because GitHub accepts `${{x}}` and `${{ x }}` alike; a literal `true`,
+# `false`, or any other `steps.*.outputs.*` fails to match, which is the
+# point.
+_BUILD_SERVER_BINDING_RE = re.compile(
+    r"^build-server:\s*\$\{\{\s*steps\.select\.outputs\.needs_server\s*\}\}\s*$"
+)
+
+# The render step's PATH export. Requires all three of: an `export PATH=`, the
+# `target/release` directory, and a `$PATH` back-reference — so a line that
+# REPLACES PATH rather than prepending to it, or that names some other
+# directory, does not satisfy this.
+_RELEASE_ON_PATH_RE = re.compile(r"export\s+PATH=.*target/release.*\$PATH")
 
 
 def _tracked_files() -> list[str]:
@@ -211,6 +277,73 @@ def workflow_run_text() -> str:
     return "\n".join(lines)
 
 
+def _code_lines(path: Path) -> list[str]:
+    """A workflow file's lines with every comment-only line dropped — the
+    same comment-vs-code rule `workflow_run_text()` applies, so a sentence in
+    a comment can never satisfy a wiring pin (see this module's own doc for
+    the concrete sentence in `cookbook-book.yml` that would otherwise do it).
+    """
+    return [line for line in path.read_text().splitlines() if not line.strip().startswith("#")]
+
+
+def book_provisioning_violations() -> list[str]:
+    """The three step-order/binding facts `cookbook-book.yml`'s forward
+    render gate needs — see this module's doc for what each one buys and how
+    a one-line edit breaks it. Returns a (possibly empty) list of findings.
+    """
+    path = WORKFLOWS_DIR / BOOK_WORKFLOW_NAME
+    if not path.exists():
+        return [
+            f"{BOOK_WORKFLOW_NAME} is missing from {WORKFLOWS_DIR.name}/ — the forward render "
+            "gate's provisioning wiring cannot be asserted. If the workflow was renamed, update "
+            "BOOK_WORKFLOW_NAME here in the same commit."
+        ]
+
+    lines = _code_lines(path)
+    findings: list[str] = []
+
+    select_idx = next((i for i, l in enumerate(lines) if l.strip() == "id: select"), None)
+    setup_idx = next(
+        (i for i, l in enumerate(lines) if l.strip() == "uses: ./.github/actions/setup-jammi-py"),
+        None,
+    )
+
+    if select_idx is None:
+        findings.append(
+            f"{BOOK_WORKFLOW_NAME}: no step carries `id: select` — the chapter selector is what "
+            "emits `needs_server`, and nothing downstream can read an output that is never named."
+        )
+    if setup_idx is None:
+        findings.append(
+            f"{BOOK_WORKFLOW_NAME}: no step `uses: ./.github/actions/setup-jammi-py` — the wheel "
+            "build this job's server provisioning rides on is gone."
+        )
+    if select_idx is not None and setup_idx is not None and select_idx > setup_idx:
+        findings.append(
+            f"{BOOK_WORKFLOW_NAME}: the `id: select` step (line {select_idx + 1} of the "
+            f"comment-stripped file) runs AFTER setup-jammi-py (line {setup_idx + 1}). The "
+            "selector must run FIRST so the build can be told whether to produce a server — "
+            "otherwise the only repair left is trimming the render set to what the job already "
+            "has, which is the backwards direction this gate exists to refuse."
+        )
+
+    if not any(_BUILD_SERVER_BINDING_RE.match(l.strip()) for l in lines):
+        findings.append(
+            f"{BOOK_WORKFLOW_NAME}: no step body binds `build-server:` to "
+            "`${{ steps.select.outputs.needs_server }}`. A literal `true`/`false` there stops "
+            "tracking the selection: `false` silently drops every grpc:// chapter's proof, `true` "
+            "pays a server build on every diff and hides the same drift."
+        )
+
+    if not any(_RELEASE_ON_PATH_RE.search(l) for l in lines):
+        findings.append(
+            f"{BOOK_WORKFLOW_NAME}: no step body exports `target/release` onto `PATH`. A "
+            "`jammi-server` built there and never reachable is a server that was not built."
+        )
+
+    return findings
+
+
 def main() -> int:
     scripts = gate_scripts() + tracked_test_suites()
     if not scripts:
@@ -226,7 +359,9 @@ def main() -> int:
         script for script in scripts if script.name not in corpus and script.name not in allowlisted
     ]
 
-    if unwired:
+    book_findings = book_provisioning_violations()
+
+    if unwired or book_findings:
         print("ci-guard-wiring: FAIL", file=sys.stderr)
         for script in unwired:
             print(
@@ -236,7 +371,11 @@ def main() -> int:
                 "with a reason.",
                 file=sys.stderr,
             )
+        for finding in book_findings:
+            print(f"  - {finding}", file=sys.stderr)
         return 1
+
+    print(f"ci-guard-wiring[{BOOK_WORKFLOW_NAME} provisioning]: OK")
 
     for script in scripts:
         tag = "ALLOWLISTED" if script.name in allowlisted and script.name not in corpus else "OK"

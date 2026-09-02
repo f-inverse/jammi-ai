@@ -191,6 +191,18 @@ impl InferenceSession {
         self.inner.sql(query).await
     }
 
+    /// Every ANN index segment of `table_name`, ordered by `segment_id`.
+    /// Forwarded to
+    /// [`jammi_db::session::JammiSession::list_index_segments`], which owns the
+    /// tenant gate (the table is resolved through the tenant-filtered
+    /// result-table read first, so an unresolvable table lists nothing).
+    pub async fn list_index_segments(
+        &self,
+        table_name: &str,
+    ) -> Result<Vec<jammi_db::catalog::segment_repo::IndexSegment>> {
+        self.inner.list_index_segments(table_name).await
+    }
+
     /// Access the catalog.
     pub fn catalog(&self) -> &jammi_db::catalog::Catalog {
         self.inner.catalog()

@@ -140,6 +140,18 @@ service CatalogService {
   // it transitively. Peer of the abstraction's `derives_from`. Tenant-scoped.
   rpc DerivesFrom(DerivesFromRequest) returns (DerivesFromResponse);
 
+  // List the ANN index segments of one result table, ordered by `segment_id`.
+  // A table's ANN index is a *set* of immutable segments (one catalog row
+  // each), so this is the segment-set peer of `ListSources` on the
+  // result-table's own index. Peer of the abstraction's
+  // `list_index_segments`; registry introspection, not a SQL query.
+  // Tenant-scoped: the table is resolved through the tenant-filtered
+  // result-table read first, so a peer that cannot resolve the table gets an
+  // empty listing rather than another tenant's segment paths — the same
+  // answer an unknown table gets, so the verb is not an existence oracle. A
+  // table whose index is flat (unsegmented) likewise lists nothing.
+  rpc ListIndexSegments(ListIndexSegmentsRequest) returns (ListIndexSegmentsResponse);
+
   // --- mutable tables ----------------------------------------------------
 
   // Register a mutable companion table. After this returns the table is
@@ -491,6 +503,34 @@ message DerivesFromEdge {
 
 message DerivesFromResponse {
   repeated DerivesFromEdge edges = 1;
+}
+
+message ListIndexSegmentsRequest {
+  // The result table whose ANN index segments are listed. Resolved through the
+  // tenant-filtered result-table read first; a table the caller cannot resolve
+  // yields an empty response, indistinguishable from an unknown table.
+  string table_name = 1;
+}
+
+// One ANN index segment of a result table. Mirrors the engine's `IndexSegment`
+// (`index_segments`): a table's index is a set of immutable segments, one row
+// per segment, and this is the whole row a reader needs to locate and size it.
+message IndexSegment {
+  // Per-table segment sequence position, starting at `0`. Unique within the
+  // table; the response is ordered by it.
+  int64 segment_id = 1;
+  // The sidecar-bundle base URL for this segment, with no extension — the
+  // layout helpers append `.usearch` / `.rowmap` / `.manifest.json` / ….
+  string index_path = 2;
+  // The number of rows this segment indexes.
+  uint64 row_count = 3;
+}
+
+message ListIndexSegmentsResponse {
+  // One entry per segment of the requested table, ordered by `segment_id`.
+  // Empty when the table has no segments, when its index is flat
+  // (unsegmented), or when the caller's tenant cannot resolve the table.
+  repeated IndexSegment segments = 1;
 }
 
 message ListChannelsRequest {}

@@ -20,6 +20,7 @@ use std::str::FromStr;
 
 use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelSpec};
 use jammi_db::catalog::model_repo::ModelDescriptor;
+use jammi_db::catalog::segment_repo::IndexSegment;
 use jammi_db::catalog::source_repo::SourceDescriptor;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::source::{SourceConnection, SourceType};
@@ -31,9 +32,9 @@ use jammi_wire::proto::catalog::catalog_service_client::CatalogServiceClient;
 use jammi_wire::proto::catalog::{
     AddChannelColumnsRequest, AddSourceRequest, CreateMutableTableRequest, DeleteModelRequest,
     DescribeModelRequest, DescribeSourceRequest, DropMutableTableRequest, DropTopicRequest,
-    ListChannelsRequest, ListModelsRequest, ListMutableTablesRequest, ListSourcesRequest,
-    ListTopicsRequest, RegisterChannelRequest, RegisterTopicRequest, RemoveSourceRequest,
-    SetTenantRequest, Tenant,
+    ListChannelsRequest, ListIndexSegmentsRequest, ListModelsRequest, ListMutableTablesRequest,
+    ListSourcesRequest, ListTopicsRequest, RegisterChannelRequest, RegisterTopicRequest,
+    RemoveSourceRequest, SetTenantRequest, Tenant,
 };
 use jammi_wire::proto::training::training_service_client::TrainingServiceClient;
 use jammi_wire::proto::training::{
@@ -41,9 +42,9 @@ use jammi_wire::proto::training::{
 };
 use jammi_wire::{
     channel_from_proto, columns_to_proto, definition_list_from_proto, definition_to_proto,
-    encode_ipc_stream, error_from_status, model_from_proto, source_descriptor_from_proto,
-    source_type_to_proto, topic_from_proto, trigger_error_from_status, SessionChannel,
-    SessionTransport,
+    encode_ipc_stream, error_from_status, index_segment_from_proto, model_from_proto,
+    source_descriptor_from_proto, source_type_to_proto, topic_from_proto,
+    trigger_error_from_status, SessionChannel, SessionTransport,
 };
 use tonic::transport::Endpoint;
 
@@ -321,6 +322,31 @@ impl CatalogClient {
         resp.definitions
             .into_iter()
             .map(|d| definition_list_from_proto(d).map_err(|s| error_from_status(&s)))
+            .collect()
+    }
+
+    // --- index segments ---------------------------------------------------
+
+    /// Every ANN index segment of `table_name`, ordered by `segment_id` — the
+    /// same [`IndexSegment`] rows the embedded `Session::list_index_segments`
+    /// returns, so a caller reads identical fields regardless of transport.
+    ///
+    /// Tenant-scoped server-side: the table is resolved through the
+    /// tenant-filtered result-table read first, so an empty listing is returned
+    /// for a table the session's tenant cannot resolve — the same answer an
+    /// unknown table (or a table whose index is flat) gets.
+    pub async fn list_index_segments(&self, table_name: &str) -> Result<Vec<IndexSegment>> {
+        let resp = self
+            .client()
+            .list_index_segments(ListIndexSegmentsRequest {
+                table_name: table_name.to_string(),
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        resp.segments
+            .into_iter()
+            .map(|s| index_segment_from_proto(s).map_err(|s| error_from_status(&s)))
             .collect()
     }
 

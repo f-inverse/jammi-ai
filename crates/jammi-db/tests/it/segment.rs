@@ -11,7 +11,8 @@ use datafusion::prelude::SessionContext;
 use jammi_db::catalog::backend::{BackendImpl, BackendKind};
 use jammi_db::catalog::backend_postgres::PostgresBackend;
 use jammi_db::catalog::backend_sqlite::SqliteBackend;
-use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
+use jammi_db::catalog::result_repo::{CreateResultTableParams, ResultTableKind, ResultTableRecord};
+use jammi_db::catalog::segment_repo::IndexSegment;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::index::sidecar::SidecarIndex;
@@ -320,5 +321,178 @@ async fn migration_025_creates_an_empty_index_segments_table() {
     assert_eq!(
         catalog.max_index_segment_id("nonexistent").await.unwrap(),
         None
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The session verb: `JammiSession::list_index_segments`
+// ---------------------------------------------------------------------------
+//
+// The `index_segments` rows were readable through no public surface: `sql()`
+// federates result tables and external sources, not the catalog's own tables,
+// and no session verb reached them. These pin the verb that closes that gap and
+// — the part that matters — its tenant gate. `Catalog::list_index_segments` is
+// NOT independently tenant-filtered (its rows are scoped by their parent), so
+// the session resolves `table_name` through the tenant-filtered
+// `get_result_table` first. An unresolvable table lists nothing, and it lists
+// nothing IDENTICALLY whether it is unknown or simply another tenant's — the
+// verb is not an existence oracle for a peer's table names.
+
+/// A fresh per-test tenant id; never a fixed literal (sibling tests share a
+/// catalog on the Postgres lane).
+fn segment_tenant() -> jammi_db::TenantId {
+    jammi_db::TenantId::from_uuid(uuid::Uuid::new_v4()).unwrap()
+}
+
+/// Create a `result_tables` row named `table` under whatever tenant the calling
+/// session is bound to (the repo stamps `tenant_id` from the binding).
+async fn seed_result_table(session: &jammi_db::session::JammiSession, table: &str) {
+    session
+        .catalog()
+        .create_result_table(CreateResultTableParams {
+            table_name: table,
+            source_id: "seg_src",
+            model_id: "seg_model",
+            task: ModelTask::TextEmbedding,
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            parquet_path: "file:///tmp/seg.parquet",
+            dimensions: Some(4),
+            key_column: Some("id"),
+            text_columns: None,
+            storage_precision: StoragePrecision::F32,
+            oversample: 4,
+            created_at: jammi_db::catalog::backend::now_sortable(),
+        })
+        .await
+        .unwrap();
+}
+
+/// Two segments on one table list in `segment_id` order through the session
+/// verb — including when they were inserted out of order, so the ordering is
+/// the query's, not the insertion's.
+#[tokio::test]
+async fn session_lists_a_tables_segments_in_segment_id_order() {
+    let dir = tempdir().unwrap();
+    let tenant = segment_tenant();
+    let session = jammi_test_utils::make_test_session(BackendKind::Sqlite, dir.path())
+        .await
+        .expect("sqlite session")
+        .with_tenant(tenant);
+
+    seed_result_table(&session, "seg_table").await;
+    // Inserted 1-then-0: the listing must still come back 0, 1.
+    for (id, path, rows) in [
+        (1_i64, "file:///idx/seg-1", 7_usize),
+        (0, "file:///idx/seg-0", 3),
+    ] {
+        assert!(session
+            .catalog()
+            .insert_index_segment("seg_table", Some(tenant), id, path, rows)
+            .await
+            .unwrap());
+    }
+
+    let listed = session.list_index_segments("seg_table").await.unwrap();
+    assert_eq!(
+        listed,
+        vec![
+            IndexSegment {
+                segment_id: 0,
+                index_path: "file:///idx/seg-0".to_string(),
+                row_count: 3,
+            },
+            IndexSegment {
+                segment_id: 1,
+                index_path: "file:///idx/seg-1".to_string(),
+                row_count: 7,
+            },
+        ],
+        "the session verb must return every segment of the table, ordered by segment_id"
+    );
+
+    // The verb reads the same rows the catalog-level API does — the session
+    // adds the tenant gate, never a different projection.
+    assert_eq!(
+        listed,
+        session
+            .catalog()
+            .list_index_segments("seg_table")
+            .await
+            .unwrap(),
+        "the session verb must not reshape the catalog's rows"
+    );
+}
+
+/// A table the session's tenant cannot resolve lists NOTHING — and lists the
+/// same nothing an unknown table lists, so the verb cannot be used to probe
+/// which table names a peer tenant owns. The CROSS-TENANT DENIAL case for this
+/// verb.
+#[tokio::test]
+async fn session_hides_another_tenants_segments_and_an_unknown_table_alike() {
+    let dir = tempdir().unwrap();
+    let tenant_a = segment_tenant();
+    let tenant_b = segment_tenant();
+    let session = jammi_test_utils::make_test_session(BackendKind::Sqlite, dir.path())
+        .await
+        .expect("sqlite session")
+        .with_tenant(tenant_a);
+
+    seed_result_table(&session, "a_only_table").await;
+    assert!(session
+        .catalog()
+        .insert_index_segment("a_only_table", Some(tenant_a), 0, "file:///idx/a-0", 5)
+        .await
+        .unwrap());
+
+    // A sees its own segment.
+    assert_eq!(
+        session
+            .list_index_segments("a_only_table")
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "tenant A must see the segment of its own table"
+    );
+
+    // B — scoped on the same session, the same path a gRPC request takes —
+    // sees nothing.
+    let b_view = session
+        .with_tenant_scoped(tenant_b, |scope| async move {
+            scope.list_index_segments("a_only_table").await
+        })
+        .await
+        .unwrap();
+    assert!(
+        b_view.is_empty(),
+        "CROSS-TENANT READ LEAK: tenant B saw tenant A's index segments: {b_view:?}"
+    );
+
+    // And the unknown-table answer is byte-identical, so the empty listing
+    // leaks no existence signal.
+    let unknown = session
+        .with_tenant_scoped(tenant_b, |scope| async move {
+            scope.list_index_segments("no_such_table_at_all").await
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        b_view, unknown,
+        "a peer's table and an unknown table must be indistinguishable through this verb"
+    );
+
+    // The bare catalog read is NOT gated — which is precisely why the session
+    // resolves the parent row first. Pinning it here keeps the gate's reason
+    // visible if the catalog layer ever changes.
+    assert_eq!(
+        session
+            .catalog()
+            .list_index_segments("a_only_table")
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the catalog-level read is parent-scoped, not independently tenant-filtered"
     );
 }

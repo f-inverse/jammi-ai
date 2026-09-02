@@ -38,6 +38,7 @@ use futures::Stream;
 use jammi_db::catalog::eval_repo::PerQueryEvalRecord;
 use jammi_db::catalog::model_repo::ModelDescriptor;
 use jammi_db::catalog::result_repo::ResultTableRecord;
+use jammi_db::catalog::segment_repo::IndexSegment;
 use jammi_db::catalog::source_repo::SourceDescriptor;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::source::{SourceConnection, SourceType};
@@ -441,6 +442,21 @@ impl Session {
             .result_store()
             .derives_from(&record.table_name)
             .await
+    }
+
+    /// Every ANN index segment of a result table, ordered by `segment_id` — the
+    /// per-table segment set (`index_segments`) a reader needs to locate and
+    /// size each immutable segment bundle. Registry introspection, not a SQL
+    /// query: the catalog's own tables are not registered in the DataFusion
+    /// federation [`Self::sql`] runs over.
+    ///
+    /// Tenant-scoped: the table is resolved through the tenant-filtered
+    /// result-table read before its segments are listed, so a peer that cannot
+    /// resolve the table gets an **empty** listing — the same answer an unknown
+    /// table gets, so the verb is not an existence oracle. A table whose index
+    /// is flat (unsegmented) likewise lists nothing.
+    pub async fn list_index_segments(&self, table_name: &str) -> Result<Vec<IndexSegment>> {
+        self.engine.list_index_segments(table_name).await
     }
 
     /// Re-invoke a result table's recorded producer over the inputs' *current*

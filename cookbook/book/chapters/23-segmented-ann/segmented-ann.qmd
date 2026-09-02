@@ -7,7 +7,7 @@ title: "The ANN index as a set of segments: incremental append, never a rebuild"
 import jammi_cookbook
 ```
 
-**Recipe:** `generate_embeddings` · `search` · the catalog's `index_segments` table ·
+**Recipe:** `generate_embeddings` · `search` · `list_index_segments` ·
 **Theory:** append-only immutable segments merged at read time — the same shape as an
 LSM-tree's SSTables, never rewritten in place, only ever added to and later compacted
 [@kleppmann2017ddia] — built over a per-segment HNSW proximity graph [@malkov2020hnsw] ·
@@ -33,9 +33,10 @@ surface is narrower than its engine surface:
   `generate_embeddings` pass over the engine's public 20-row `patents` fixture (embedded
   with the deterministic `tiny_modernbert` encoder — the same pairing the engine's own
   `storage_precision` integration tests use) writes exactly one segment. This chapter reads
-  that fact back off the embedded engine's own SQLite catalog file — a real artifact the
-  running wheel wrote, never reimplemented, read **after the engine handle was closed**
-  (see the catalog-ownership note below) — and recomputes the exact brute-force cosine
+  that fact back through the public `db.list_index_segments(table_name)` verb on the LIVE
+  embedded engine — the engine answering for its own catalog, never a reimplementation and
+  never a raw handle on the file (see the catalog-ownership note below) — and recomputes
+  the exact brute-force cosine
   ranking over the SAME vectors the table holds, live, right here, asserting it against the
   engine's own recorded `search` hits. "A freshly-built single-segment table's search is
   the exact top-k" is what "byte-identical to the pre-existing single-index behavior"
@@ -55,7 +56,7 @@ surface is narrower than its engine surface:
   `every_catalog_model_is_referenced` uses; it is never a fabricated number, and never a
   Python reimplementation of `SegmentedIndex`'s merge.
 
-## The freshly-built table's segment set — read off the real catalog
+## The freshly-built table's segment set — asked of the engine itself
 
 ```{python}
 from jammi_cookbook import contracts
@@ -69,35 +70,46 @@ print("sidecar files:  ", catalog["sidecar_files_present"])
 ```
 
 A single `generate_embeddings` pass over the 20-row `patents` fixture writes **exactly one**
-`index_segments` row — read directly off the embedded engine's own SQLite catalog file, not
-asserted by fiat. Its bundle carries the documented `{table}__seg0.*` naming (the dot-free
+`index_segments` row — read back from the live engine through
+`db.list_index_segments(table_name)`, not asserted by fiat. Its bundle carries the
+documented `{table}__seg0.*` naming (the dot-free
 discriminator the engine's own `segment::append_does_not_rebuild_prior_segments` test
 checks) and all three sidecar files an `F32` (no-rescore) segment writes.
 
-::: {.callout-important title="The catalog belongs to the engine while the engine is open"}
-Two facts about that read are worth copying, because the obvious shortcut is wrong.
+::: {.callout-important title="Ask the engine for its own catalog — never open the file"}
+**A public verb answers this question, on both arms.**
+`db.list_index_segments(table_name)` returns one dict per segment — `segment_id` /
+`index_path` / `row_count`, the whole `index_segments` row, in `segment_id` order — over the
+embedded engine and, as `CatalogService.ListIndexSegments`, over `grpc://`. This chapter's
+producer calls it on the LIVE engine: no close first, no reopen, nothing in the emitting
+process touching `catalog.db`. `db.sql(...)` is still not the surface (it is the DataFusion
+federation over Parquet result tables and external sources — the catalog's own tables are
+not registered in it), which is exactly why a typed verb exists instead.
 
-**One: there is no public surface for `index_segments` today.** Neither `db.sql(...)` (that
-is the DataFusion federation over Parquet result tables and external sources — the catalog's
-own SQLite tables are not registered in it) nor any `list_*` / `describe_*` verb nor any RPC
-exposes a table's segment set. `Catalog::list_index_segments` is a Rust-crate-level API with
-no SDK or wire binding. That is a real engine-surface gap, reported as one — the same honest
-negative this chapter applies to `append_segment`, not a hole papered over.
+Read the empty answer carefully, because it means four things at once: no segments, a flat
+(unsegmented) index, an unknown table, or a table this session's tenant cannot resolve. It
+is never an error, and the last two are deliberately indistinguishable — the verb is not an
+existence oracle for a peer tenant's table names. A caller that must distinguish "this table
+exists" asks the result-table surface. The producer asserts a non-empty answer of exactly
+one segment, so that fan-in cannot read as a pass.
 
-**Two: so the cache reads the file — but only after closing the engine.** The engine's
-SQLite catalog opens through the `unix-excl` VFS with a heap-resident wal-index and no
-`-shm` file. A second SQLite *library instance in the same process* — which is exactly what
-CPython's separately-linked `sqlite3` module is — cannot see the engine's locks or its
-wal-index: its reads can be stale, and its close can checkpoint and truncate the `-wal` the
-engine still tracks. No engine-side seam can arbitrate locks it cannot see, so the contract
-is the caller's to keep: **close the engine, then touch the file.** This chapter's producer
-does exactly that, and then opens a read-only handle. The handover needs no second proof:
-the engine's `close()` is an *awaited* release — it drains the catalog pool and waits out
-SQLite's own evidence before returning — so `close()` returning is what "released" means.
-(Do not re-derive it from the sidecar files: a `catalog.db-wal` can legitimately outlive a
-completed release when the last close's passive checkpoint declines, so a caller-side
-`-wal` check fails on a perfectly healthy catalog.) Reaching for `sqlite3.connect(...)`
-beside a live engine is the bug this callout exists to stop you writing.
+**Why that matters more than a convenience.** The shortcut a reader reaches for the moment a
+catalog file is in sight — `sqlite3.connect(...)` on `catalog.db` — is *deterministically*
+wrong beside a live embedded engine. That catalog opens through the `unix-excl` VFS with a
+heap-resident wal-index and no `-shm` file, so a second SQLite *library instance in the same
+process* (which is exactly what CPython's separately-linked `sqlite3` module is) cannot see
+the engine's locks or its wal-index: its reads can be stale, and its close can checkpoint and
+truncate the `-wal` the engine still tracks. No engine-side seam can arbitrate locks it
+cannot see. The verb removes that dilemma rather than sequencing around it.
+
+The producer does still call `close()` — once, at the end of the handle's life, before the
+temporary artifact directory goes away — and it is worth knowing what that buys, because it
+is the engine's only documented release point: `close()` is an *awaited* release, draining
+the catalog pool and waiting out SQLite's own evidence before returning, so `close()`
+returning is what "released" means. (Do not re-derive it from the sidecar files: a
+`catalog.db-wal` can legitimately outlive a completed release when the last close's passive
+checkpoint declines, so a caller-side `-wal` check fails on a perfectly healthy catalog.)
+Nothing in this chapter's read depends on it any more.
 :::
 
 ```{python}

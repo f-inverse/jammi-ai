@@ -15,11 +15,10 @@ never a Python reimplementation of the merge:
 * **`N = 1` byte-identity (the SDK-reachable half).** A single
   `generate_embeddings` pass over the engine's public `patents` fixture (embedded
   with the deterministic `tiny_modernbert` encoder) writes exactly one segment.
-  This script reads that fact back off the embedded engine's own catalog
-  (`<artifact_dir>/catalog.db`, a real SQLite file the running wheel wrote — not a
-  reimplementation of the schema) **after closing the engine handle**, never
-  alongside a live one (see "Why the catalog read happens after `close()`" below),
-  and confirms `segment_id = 0` with the
+  This script reads that fact back through the public verb
+  `db.list_index_segments(table)` on the LIVE engine (see "Reading the segment
+  set" below) — the engine answering for its own catalog, never a
+  reimplementation of the schema — and confirms `segment_id = 0` with the
   documented `{table}__seg0.*` sidecar naming. It then runs `db.search(...)`
   LIVE for a spread of `(query row, k)` pairs and records the hits; the chapter
   independently recomputes the exact brute-force cosine ranking over the SAME
@@ -51,46 +50,49 @@ never a Python reimplementation of the merge:
   is never a fabricated number, and never a Python reimplementation of
   `SegmentedIndex`'s merge.
 
-Why the catalog read happens after `close()`
---------------------------------------------
-This script needs one fact the engine keeps only in its SQLite catalog: the
-`index_segments` rows for the table it just built. **No public surface exposes
-them** — not `db.sql(...)` (that is the DataFusion federation over Parquet result
-tables and external sources; the SQLite catalog's own tables are not registered
-there), not any `list_*` / `describe_*` verb on `jammi.Session`, and not any RPC
-in `crates/jammi-wire/proto/jammi/v1/` (`Catalog::list_index_segments` is a
-Rust-crate-level API with no SDK or wire binding). That missing surface is
-reported as an engine gap in this book's hand-off, never worked around by
-pretending the file is a public API.
+Reading the segment set
+-----------------------
+This script needs one fact the engine keeps in its catalog: the `index_segments`
+rows for the table it just built. **A public verb answers that question on both
+arms** — `db.list_index_segments(table_name)`, backed by
+`CatalogService.ListIndexSegments` on the wire and by
+`jammi_db::session::JammiSession::list_index_segments` under both. It returns one
+dict per segment (`segment_id` / `index_path` / `row_count`) in `segment_id`
+order — the whole `index_segments` row, nothing re-shaped in between — and it is
+called here on the LIVE engine, before any close, because the engine reading its
+own catalog is the in-contract topology.
 
-Until it exists, the only honest route is the one
-`docs/guide/src/catalog-and-broker.md` documents: **close the engine first, then
-touch the file.** Opening a raw CPython `sqlite3` connection on `catalog.db` while
-the embedded engine still holds it is an out-of-contract topology, and since the
-esc-073 seam (`crates/jammi-db/src/catalog/backend_sqlite.rs` module docs) it is a
-*deterministically* wrong one: the engine's pool opens through the `unix-excl` VFS
-with a HEAP-resident wal-index and no `-shm` file, so CPython's separately-linked
-`libsqlite3` — a second SQLite **library instance in the same process** — cannot
-see the engine's locks or its wal-index. Its reads can be stale, and its
-`sqlite3_close` believes it holds the last connection and will checkpoint and
-truncate the `-wal` the engine still tracks. No engine-side seam can arbitrate
-locks it cannot see; the caller has to not create the topology. So `emit()` closes
-the engine and only then opens a **read-only** handle on the file.
+`db.sql(...)` is still not the surface for this: that is the DataFusion
+federation over Parquet result tables and external sources, and the catalog's own
+tables are not registered in it. A typed verb is, which is why one exists.
 
-The AWAITED close is the proof — this script adds no second one. The public
-`Session.close()` (both arms carry it; the embedded arm's delegates to
-`PyDatabase::close`, `crates/jammi-python/src/database.rs`) stops the training worker, then awaits
-`CatalogBackend::close`, which drains the pool and waits out SQLite's own release
-evidence across a settle window before returning. "`close()` returned" therefore
-already MEANS "released"; re-deriving that here from the presence of a sidecar file
-would be both redundant and wrong. A `catalog.db-wal` can legitimately survive a
-fully completed release when the last close's passive checkpoint declines (measured:
-1 in 40 runs), and the engine's own census deliberately warns-and-returns rather than
-failing in that case — so a producer-side `-wal` poll would raise on a correctly
-released catalog. The read below is a `mode=ro` open, which cannot itself checkpoint
-or truncate anything, and it raises on its own if the file is not openable; no
-lock-state assertion is made, because a foreign in-process reader cannot observe the
-engine's locks in the first place.
+An empty list is the answer for a table with no segments, a flat (unsegmented)
+index, an unknown table, and a table this session's tenant cannot resolve — never
+an error, and the last two deliberately indistinguishable so the verb is not an
+existence oracle for a peer tenant's table names. This emit asserts a non-empty
+answer of exactly one segment, so that fan-in never silently reads as a pass.
+
+What this script no longer does — and the reason is worth keeping, because it is
+the shortcut a reader will reach for the moment a catalog file is in sight — is
+open a raw CPython `sqlite3` handle on `catalog.db`. Beside a live embedded
+engine that is out of contract, and since the esc-073 seam
+(`crates/jammi-db/src/catalog/backend_sqlite.rs` module docs) *deterministically*
+wrong: the engine's pool opens through the `unix-excl` VFS with a HEAP-resident
+wal-index and no `-shm` file, so CPython's separately-linked `libsqlite3` — a
+second SQLite **library instance in the same process** — cannot see the engine's
+locks or its wal-index. Its reads can be stale, and its `sqlite3_close` believes
+it holds the last connection and will checkpoint and truncate the `-wal` the
+engine still tracks. The public verb removes the dilemma rather than sequencing
+around it: nothing in this emit opens the catalog file at all.
+
+`close()` is still called, once, for the ordinary reason a handle is closed — the
+engine's own lifecycle, before the temporary artifact directory goes away. It is
+no longer a precondition for reading anything. The close remains an AWAITED
+release (`Session.close()` on both arms; the embedded arm's delegates to
+`PyDatabase::close`, `crates/jammi-python/src/database.rs`): it stops the training
+worker, then awaits `CatalogBackend::close`, which drains the pool and waits out
+SQLite's own release evidence across a settle window before returning. "`close()`
+returned" MEANS "released", and this script adds no second proof of that.
 
 Names no consumer: a generic 20-row `patents` fixture and the engine's own
 public `tiny_modernbert` encoder, both already used by the engine's own
@@ -114,7 +116,6 @@ import hashlib
 import json
 import os
 import re
-import sqlite3
 import subprocess
 import tempfile
 from pathlib import Path
@@ -217,59 +218,54 @@ def _run_n1_property(db, fixtures_root: Path) -> dict:
     }
 
 
+def _read_segment_catalog(db, table_name: str) -> dict:
+    """Ask the LIVE engine for `table_name`'s segment set through the public verb.
+
+    `db.list_index_segments(table_name)` is the surface (both arms carry it; the
+    remote one maps to `CatalogService.ListIndexSegments`). It hands back one
+    dict per segment — `segment_id` / `index_path` / `row_count`, the whole
+    `index_segments` row and nothing re-shaped — already in `segment_id` order,
+    so this function sorts nothing and renames nothing.
+
+    No close, no reopen, no second SQLite library instance: the engine reads its
+    own catalog. An empty list is a legal answer (unknown table, another
+    tenant's table, a flat index, a table with no segments — never an error), and
+    `emit()` refuses one, so that fan-in cannot read as a pass here.
+    """
+    segments = [
+        {
+            "segment_id": s["segment_id"],
+            "index_path": s["index_path"],
+            "row_count": s["row_count"],
+        }
+        for s in db.list_index_segments(table_name)
+    ]
+    return {"segments": segments, "segment_count": len(segments)}
+
+
 def _close_engine(db) -> None:
-    """Release the engine's catalog file. An AWAITED event, not a drop.
+    """Close the handle at the end of its life. An AWAITED event, not a drop.
 
-    Under the `unix-excl` VFS the catalog pool holds a process-scoped exclusive
-    lock for as long as ANY connection in this process has the file open, and
-    dropping the handle is not observable (`sqlx` returns connections from a
-    background task). `close()` is the release point the engine documents, and it
-    AWAITS the handshake: stop the training worker, close and drain the pool, then
-    wait out SQLite's own release evidence over a settle window. When it returns,
-    the catalog is released — so its return is this script's proof, and the caller
-    below adds no second check of its own.
+    Nothing below depends on this any more — the segment set was read through
+    the public verb while the engine was live. It stays because a handle that
+    opened an artifact directory closes it before that directory goes away, and
+    because `close()` is the only release point the engine documents: under the
+    `unix-excl` VFS the catalog pool holds a process-scoped exclusive lock for as
+    long as ANY connection in this process has the file open, and dropping the
+    handle is not observable (`sqlx` returns connections from a background task).
+    `close()` AWAITS the handshake: stop the training worker, close and drain the
+    pool, then wait out SQLite's own release evidence over a settle window. When
+    it returns, the catalog is released — its return is the proof, and this
+    script adds no second check.
 
-    This goes through the PUBLIC front door and nothing else. `close()` is now a
-    real member of the `jammi.Session` surface on BOTH arms — the embedded arm
+    This goes through the PUBLIC front door and nothing else. `close()` is a real
+    member of the `jammi.Session` surface on BOTH arms — the embedded arm
     releases the catalog file, the remote arm closes a channel — so `Capability`
     no longer carries a `CLOSE` flag (a flag every backend sets discriminates
-    nothing) and this script no longer reaches for the compiled handle. The
-    earlier fallback to `db._native.close()` existed only while
-    `EmbeddedBackend.close()` still raised `NotSupportedOnBackend`; that gap is
-    closed, so the fallback is gone rather than left in as dead cover.
+    nothing) and this script never reaches for the compiled handle.
     """
     db.close()
     print("  engine closed via the public Session.close()", flush=True)
-
-
-def _read_segment_catalog(artifact_dir: Path, table_name: str) -> dict:
-    """Read `index_segments` for `table_name` off the engine's own SQLite catalog
-    file — a real artifact the running wheel wrote, never reimplemented or guessed.
-
-    PRECONDITION: the engine handle that wrote this file is CLOSED — call
-    `_close_engine` first. Its awaited `close()` IS the release (see this module's
-    docstring); there is nothing further to verify here, and nothing this side of
-    the process could verify anyway. There is no public surface for
-    `index_segments` today (module docstring), and until there is, "close the
-    engine first, then touch the file" is the only in-contract way to read it.
-
-    The handle is opened `mode=ro`: a read-only SQLite connection cannot
-    checkpoint or truncate the `-wal`, so even a mistake in that ordering cannot
-    damage a catalog the engine still tracks. A file it cannot open raises here on
-    its own — no lock-state assertion is made or possible.
-    """
-    db_path = artifact_dir / "catalog.db"
-    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    try:
-        rows = con.execute(
-            "SELECT segment_id, index_path, row_count FROM index_segments "
-            "WHERE table_name = ? ORDER BY segment_id",
-            (table_name,),
-        ).fetchall()
-    finally:
-        con.close()
-    segments = [{"segment_id": r[0], "index_path": r[1], "row_count": r[2]} for r in rows]
-    return {"segments": segments, "segment_count": len(segments)}
 
 
 def _seg0_sidecar_files_present(index_path: str) -> dict:
@@ -353,13 +349,11 @@ def emit(fixtures_root: Path) -> None:
         db = jammi.connect(f"file://{artifact_dir}")
         print("== embedded engine: N=1 segmented-index property ==", flush=True)
         n1 = _run_n1_property(db, fixtures_root)
-        # Everything that needs the ENGINE is done; everything below needs the
-        # engine's FILES. Those two never overlap: a second SQLite library
-        # instance beside a live engine is out of contract (module docstring),
-        # so the handle is released first — and the awaited close IS the proof.
-        print("== releasing the catalog before reading it ==", flush=True)
-        _close_engine(db)
-        catalog = _read_segment_catalog(Path(artifact_dir), n1["table_name"])
+        # The segment set, through the public verb, on the LIVE engine — the
+        # engine reads its own catalog and nothing in this process opens the
+        # file (module docstring).
+        print("== the segment set, via db.list_index_segments ==", flush=True)
+        catalog = _read_segment_catalog(db, n1["table_name"])
         if catalog["segment_count"] != 1:
             raise RuntimeError(
                 f"expected exactly 1 segment for a freshly-built table, "
@@ -368,6 +362,10 @@ def emit(fixtures_root: Path) -> None:
         seg0 = catalog["segments"][0]
         naming_ok = seg0["index_path"].endswith(f"{n1['table_name']}__seg0.idx")
         sidecar = _seg0_sidecar_files_present(seg0["index_path"])
+        # Everything that needs the engine is done; close the handle before the
+        # temporary artifact directory it opened goes away.
+        print("== releasing the catalog ==", flush=True)
+        _close_engine(db)
 
     print("== jammi-db it-suite: append/no-rebuild property (live) ==", flush=True)
     append_suite = _run_append_suite(fixtures_root)

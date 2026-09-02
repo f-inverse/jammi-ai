@@ -917,12 +917,10 @@ ARTIFACTS: dict[str, Artifact] = {
         kind="model_id",
         filename="catalog_segment0.json",
         produced_by="segmented_ann",
-        note="The freshly-built table's `index_segments` catalog row, read off the "
-        "embedded engine's own SQLite catalog file (never reimplemented) AFTER the "
-        "engine handle's awaited close() returned (that return IS the release) — no "
-        "public surface exposes "
-        "`index_segments`, and a raw SQLite handle beside a live engine is out of "
-        "contract: segment "
+        note="The freshly-built table's `index_segments` catalog row, read through the "
+        "public `db.list_index_segments(table_name)` verb on the LIVE embedded engine "
+        "(the engine answering for its own catalog, never a reimplementation and never "
+        "a second SQLite library instance beside it): segment "
         "count, segment id, row count, whether the `{table}__seg0.idx` naming convention "
         "held, and whether the three sidecar files (`.usearch` / `.rowmap` / "
         "`.manifest.json`) exist on disk.",

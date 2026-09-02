@@ -394,15 +394,19 @@ than left for the first read to discover: a job id with no row visible to this s
 tenant raises the typed `jammi.errors.BackendError` — the same class on both transports —
 instead of handing back a handle that fails later.
 
-One value differs between the two arms, and it differs because the wire says so:
-`TrainingStatusResponse.model_id` is empty until the job *completes*, so a remote attach
-made before then carries an empty `model_id` (the embedded attach re-derives the
-deterministic id from the persisted spec; this client does not duplicate a naming rule the
-engine owns). Nothing is asserted about it at attach time here — whether server B's claim
-loop has already finished this job by then is a race, and a race is exactly what this
-chapter refuses to assert into. The re-attach *after* `wait()` in the cell below is the
-deterministic read, and it recovers the very id server A was handed at submit — over a
-connection to a process that never accepted the submission.
+`TrainingStatusResponse.model_id` reads the same on both arms at every lifecycle state —
+queued, running, completed, failed — not only once the job completes: the server resolves
+it via `resolve_model_id` (`crates/jammi-server/src/grpc/training.rs:110`) into that field
+(`crates/jammi-wire/proto/jammi/v1/training.proto:433-444`), and the embedded attach calls
+the SAME engine function, so this client duplicates no naming rule of its own. (What DOES
+stay empty until completion, on both arms, is a different column: `list_training_jobs()`'s
+`output_model_id` relays `training_jobs.output_model_id` verbatim — "has the output row
+landed" — where `model_id` answers "what will this model be called".) Nothing about server
+B's claim loop is asserted at attach time here regardless — whether it has already finished
+this job by then is a race, and a race is exactly what this chapter refuses to assert into.
+The re-attach *after* `wait()` in the cell below is the deterministic read once the job is
+terminal, and it recovers the very id server A was handed at submit — over a connection to
+a process that never accepted the submission.
 
 ```{python}
 # Job A, over server B's connection, through the public verb. Same job id —

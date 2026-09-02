@@ -616,8 +616,12 @@ fn the_first_process_to_open_wins_whichever_it_is() {
     // holder must be reported as hung, not misread as "died with a signal".
     if holder_cap.hung {
         panic!(
-            "esc-073 seam: the holder hung past {CHILD_CEILING:?} after the parent released it — \
-             releasing a catalog must be bounded, never a hang. Both streams:\n{}",
+            "esc-073 seam: the holder process did not exit within {CHILD_CEILING:?} after the \
+             parent wrote `stop` — this harness asserts that its OWN subprocess exit is bounded, \
+             not an engine release guarantee (the holder's body is `drop(catalog)` then \
+             `process::exit`; `drop` is documented as NOT a release point, only \
+             `Catalog::close().await` is). A kill here is a harness-observed hang; its evidence \
+             follows. Both streams:\n{}",
             rendered_log(&holder_cap)
         );
     }

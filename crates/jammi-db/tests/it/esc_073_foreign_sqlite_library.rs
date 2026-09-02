@@ -729,9 +729,11 @@ fn spawn_engine_load(
 // ── Synthetic roles (esc-078/esc-079 harness-drain oracle) ──────────────────
 
 /// One 64-byte flood line: `[child] flood <012-digit n>` right-padded with
-/// spaces to 63 bytes, plus a trailing newline. Mirrors
-/// `jammi_test_utils::child`'s own flood-line shape (round 5 of the plan) so
-/// this harness's flood body is independently reproducible from its spec.
+/// spaces to 63 bytes, plus a trailing newline. Deliberately the same
+/// fixed-width-line shape `jammi_test_utils::child`'s own flood child uses
+/// (64 bytes per line, so line count times 64 is the exact byte total) —
+/// matched by construction rather than by sharing code with it, so each
+/// harness's flood body is independently reproducible from this one spec.
 fn synthetic_flood_line(n: u32) -> [u8; 64] {
     let mut line = [b' '; 64];
     let text = format!("[child] flood {n:012}");
@@ -1273,11 +1275,23 @@ fn incompleteness_reason(cap: &Capture) -> Option<String> {
 }
 
 /// Classify a settled (non-hung) [`Capture`] into an [`Attempt`], applying the
-/// per-role terminus / per-code evidence check (see the W2 design's "Scoring"
-/// table). Any capture whose evidence is not fully trustworthy
-/// ([`incompleteness_reason`]) is classified [`Attempt::Incomplete`] instead
-/// of a content-dependent class, regardless of what its exit code would
-/// otherwise imply.
+/// per-role terminus / per-code evidence check below. Any capture whose
+/// evidence is not fully trustworthy ([`incompleteness_reason`]) is
+/// classified [`Attempt::Incomplete`] instead of a content-dependent class,
+/// regardless of what its exit code would otherwise imply.
+///
+/// Scoring, by exit disposition:
+/// - exit 0 → [`Attempt::Survived`] iff [`terminus_satisfied`], else
+///   [`Attempt::Truncated`]`{ code: 0 }`;
+/// - exit [`EXIT_TRIPPED`]/[`EXIT_STALE`]/[`EXIT_CORRUPT`] (66/67/68) →
+///   [`Attempt::Tripped`]/[`Attempt::Stale`]/[`Attempt::Corrupt`] iff stderr's
+///   last non-empty line starts with `[child] TRIPPED(<code>):`, else
+///   [`Attempt::Truncated`]`{ code }`;
+/// - exit [`EXIT_NO_FOREIGN_LIB`] (77) → [`Attempt::Skipped`] iff stderr
+///   contains `[child] SKIP:`, else [`Attempt::Truncated`]`{ code: 77 }`;
+/// - any other exit code → [`Attempt::ExitCode`];
+/// - a signal death (`status.signal()`) → [`Attempt::Signal`];
+/// - `cap.hung` → [`Attempt::Hung`].
 fn classify(cap: &Capture, role: Role) -> Attempt {
     // `hung` is now `true` iff `wait_bounded` issued a `kill()` and the
     // reaped status is a signal death or a reap give-up — a genuine
@@ -1418,9 +1432,13 @@ fn rendered_log(cap: &Capture) -> String {
 }
 
 /// Shared formatting for a hung child's diagnostic text — used both by
-/// `drive_with`'s panic and by `wedge_role_is_hung_with_its_last_phase_marker`
-/// (which asserts on the formatted text WITHOUT panicking, per the plan's
-/// acceptance criterion for the Wedge role).
+/// `drive_with`'s panic and by `wedge_role_is_hung_with_its_last_phase_marker`,
+/// which calls this SAME function directly and asserts on the returned
+/// `String` without panicking: [`Role::Wedge`] must classify `Hung` with its
+/// last phase marker equal to `"[child] phase: b"`, and that marker text must
+/// be present in whatever this function formats — proving the diagnostic
+/// `drive_with` would actually panic with carries the evidence, without
+/// having to trigger and catch a real panic to check it.
 fn hung_diagnostic(
     role: Role,
     attempt_no: usize,

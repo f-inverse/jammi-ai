@@ -169,6 +169,13 @@ const CLOSE_SETTLE_STEPS: usize = 25;
 /// file behind legitimately. Waiting minutes for a file that is never coming
 /// would turn a shutdown into a stall; two seconds is three orders of
 /// magnitude above the measured straggler window and still imperceptible.
+///
+/// This ceiling is also the *whole* cost of closing one pool while a second
+/// pool in this process still holds the same file: the `-wal` belongs to the
+/// file, not to a pool, so it cannot disappear while the survivor is live and
+/// the settle loop necessarily runs to the deadline. Bounded, once, on a
+/// shutdown path — see [`CatalogBackend::close`]'s "evidence about the FILE"
+/// section.
 const CLOSE_SIDECAR_CEILING: Duration = Duration::from_secs(2);
 
 /// SQLite's primary result code `SQLITE_BUSY`. `sqlx` surfaces the *extended*
@@ -407,6 +414,27 @@ impl CatalogBackend for SqliteBackend {
     /// hanging if it expires — SQLite deletes the `-wal` only when its
     /// close-time checkpoint completes, so the wait is best-effort by
     /// construction.
+    ///
+    /// # The `-wal` is evidence about the FILE, not about this pool
+    ///
+    /// `-wal` disappearance is evidence that the LAST connection to this
+    /// database in this process closed — not that *these* connections did. The
+    /// seam is single-*process*, so a second pool on the same file inside this
+    /// process is legal and supported (two [`super::Catalog`] handles on one
+    /// directory), and while that second pool is live the `-wal` cannot go
+    /// away. Closing the first pool therefore observes the `-wal` for the whole
+    /// `CLOSE_SIDECAR_CEILING` and then warns, even though that pool's own
+    /// connections were released promptly and nothing is wrong.
+    ///
+    /// That is a cost and a misleading log line, not a correctness defect: the
+    /// wait is bounded by construction, the surviving pool keeps working, and
+    /// the caller's connections are already gone when the settle loop starts
+    /// (`close_pool_and_drain` has returned). Callers that close one of several
+    /// live pools should expect this close to take up to the ceiling. A
+    /// per-pool release signal would need evidence SQLite does not expose at
+    /// this layer, so the mechanism is deliberately unchanged; the warning
+    /// below names this as an expected cause so an operator reading it is not
+    /// sent hunting for a leak that is not there.
     fn close(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             super::backend::close_pool_and_drain(&self.pool).await;
@@ -444,8 +472,13 @@ impl CatalogBackend for SqliteBackend {
                 if std::time::Instant::now() >= deadline {
                     tracing::warn!(
                         path = %self.path.display(),
-                        "SQLite catalog close timed out with `-wal` still present; the file may \
-                         still be held by this process"
+                        ceiling_secs = CLOSE_SIDECAR_CEILING.as_secs(),
+                        "SQLite catalog close: this pool's connections are released, but `-wal` \
+                         is still present after the bounded settle wait. Expected when ANOTHER \
+                         live pool in this process still holds the same file (the seam is \
+                         single-PROCESS, so that is legal) or when SQLite's close-time PASSIVE \
+                         checkpoint declined to complete. The wait is bounded and the close is \
+                         done; this is not a hang and not a lost write."
                     );
                     return;
                 }

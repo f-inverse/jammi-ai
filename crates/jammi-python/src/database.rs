@@ -40,11 +40,18 @@ pub struct PyDatabase {
     /// Guards spawning the ephemeral timeout scanner exactly once per
     /// connection, on the first `ephemeral_session` call.
     ephemeral_scanner: std::sync::Once,
-    /// The embedded training worker this connection owns. An embedded `Database`
-    /// both submits training jobs and runs them; the worker stops when the
-    /// `Database` drops (RAII), OR gracefully and deterministically on `close()`
-    /// via `EmbeddedWorker::stop_and_join`.
-    _worker: jammi_ai::fine_tune::worker::EmbeddedWorker,
+    /// The embedded training worker this connection owns, when this process is
+    /// configured to run one. An embedded `Database` both submits training jobs
+    /// and runs them; the worker stops when the `Database` drops (RAII), OR
+    /// gracefully and deterministically on `close()` via
+    /// `EmbeddedWorker::stop_and_join`.
+    ///
+    /// `None` when `training.run_worker` is `false`: this connection still
+    /// mounts the whole training surface and still accepts submissions, it just
+    /// never claims. The absence is represented by the `Option` rather than by a
+    /// spawned-but-idle worker, so "no claim loop exists" is a state the type
+    /// carries instead of a behaviour a reader has to infer.
+    _worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker>,
     /// Set exactly once, by [`PyDatabase::close`]. Every other pymethod calls
     /// [`PyDatabase::check_open`] first and raises the typed `BackendError`
     /// once this is set — the FFI-boundary guard making "a call against an
@@ -60,15 +67,41 @@ impl PyDatabase {
     /// layer built on top of this crate) call it directly so
     /// the resulting database shares the tokio runtime that drives every
     /// `InferenceSession` future.
+    ///
+    /// # `training.run_worker` — whether this process claims
+    ///
+    /// The embedded engine both accepts training submissions and runs them, so
+    /// it is the arm that has to be able to stop running them. `config`'s
+    /// [`jammi_db::config::TrainingConfig::run_worker`] decides, and it is read
+    /// here from the SAME configuration the server binary reads (the
+    /// `#[pyfunction] open_local` wrapper builds it with `JammiConfig::load`, so
+    /// `JAMMI_TRAINING__RUN_WORKER=false` reaches an embedded process exactly as
+    /// it reaches a server process):
+    ///
+    /// * `true` (the default) — the claim loop runs here, on the shared runtime.
+    /// * `false` — no worker is spawned at all. This connection still accepts
+    ///   `fine_tune` (and every other training) submission and still serves
+    ///   their status, but never claims one. On a SQLite catalog — single-process
+    ///   by the `unix-excl` contract — a submitted job therefore stays `queued`,
+    ///   with its `{"state":"pending"}` acceleration report, until this process
+    ///   `close()`s the directory (the pymethod below) and a process configured
+    ///   to claim opens it. On a multi-process catalog (Postgres) a claiming
+    ///   process can run concurrently, so the job is picked up without waiting
+    ///   for this one.
     pub fn open(config: JammiConfig) -> Result<Self, JammiError> {
         let runtime = Arc::new(tokio::runtime::Runtime::new()?);
         let session = runtime.block_on(InferenceSession::open(config))?;
-        // Spawn the embedded training worker on the shared runtime. The spawn
-        // must happen inside the runtime context; the worker holds a `Weak` to
-        // the session so it never keeps it alive, and the guard stops it on drop.
-        let worker = {
+        // Spawn the embedded training worker on the shared runtime, if this
+        // process is configured to run one. The spawn must happen inside the
+        // runtime context; the worker holds a `Weak` to the session so it never
+        // keeps it alive, and the guard stops it on drop.
+        let worker = if session.inner_config().training.run_worker {
             let _enter = runtime.enter();
-            jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)?
+            Some(jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(
+                &session,
+            )?)
+        } else {
+            None
         };
         Ok(Self {
             session,
@@ -132,8 +165,9 @@ impl PyDatabase {
     /// Two awaited steps, in this order, with the GIL released across both
     /// (`py.detach`, so other Python threads keep running):
     ///
-    /// 1. **Stop the embedded training worker.** Signals it to stop and blocks
-    ///    until it actually has (`EmbeddedWorker::stop_and_join`). Per that
+    /// 1. **Stop the embedded training worker**, when this connection has one.
+    ///    Signals it to stop and blocks until it actually has
+    ///    (`EmbeddedWorker::stop_and_join`). Per that
     ///    method's own documented bound, this returns immediately if the
     ///    worker is idle between claim attempts (at most the configured
     ///    `idle_poll`, 1s by default), or after the remaining duration of a job
@@ -162,6 +196,17 @@ impl PyDatabase {
     /// exactly when leaving the catalog file locked would be worst, so the
     /// release is never made conditional on it, and the join error is
     /// propagated afterwards.
+    ///
+    /// # With `training.run_worker = false`
+    ///
+    /// Step 1 has nothing to do — no claim loop was ever started (see
+    /// [`PyDatabase::open`]) — so it is skipped rather than joining a worker
+    /// that does not exist, and step 2 runs exactly as it does for a
+    /// worker-bearing connection. The release is therefore prompt (no idle-poll
+    /// wait, no in-flight run to finish) and complete, which is precisely what
+    /// that configuration is for on a SQLite catalog: this process submits and
+    /// holds the jobs `queued`, and `close()` is the moment its directory —
+    /// with those queued jobs in it — becomes a claiming process's to open.
     ///
     /// # What "released" buys the caller
     ///
@@ -234,7 +279,14 @@ impl PyDatabase {
         }
         py.detach(|| {
             self.runtime.block_on(async {
-                let stopped = self._worker.stop_and_join().await;
+                let stopped = match &self._worker {
+                    Some(worker) => worker.stop_and_join().await,
+                    // `training.run_worker = false`: there is no claim loop to
+                    // stop. The pool close below still runs — the catalog
+                    // release is what a caller closes for, and it must not
+                    // depend on this connection having happened to own a worker.
+                    None => Ok(()),
+                };
                 let backend = self.session.catalog().backend_arc();
                 backend.close().await;
                 stopped

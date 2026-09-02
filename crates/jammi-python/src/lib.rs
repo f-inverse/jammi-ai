@@ -56,6 +56,23 @@ fn jammi_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
 /// this for a `file://` target and delegates a remote target to the pure-Python
 /// `jammi` remote client. All parameters are optional keyword-only arguments that
 /// override the default or file-based configuration.
+///
+/// # One configuration surface, both deployments
+///
+/// The `JammiConfig` is built by [`JammiConfig::load`] — the SAME call
+/// `jammi-server`'s `main` makes, with the same precedence: the explicit
+/// `config` path when given, else `JAMMI_CONFIG`, else `./jammi.toml`, else the
+/// platform config dir, and then the `JAMMI_*` environment overrides layered on
+/// top (and the load-time validation of the training timing that comes with
+/// it). An embedded process therefore answers every deployment key — notably
+/// `training.run_worker` (`JAMMI_TRAINING__RUN_WORKER`), which decides whether
+/// THIS process runs the training claim loop — exactly the way a server process
+/// does. A key only one arm honoured would be a server-only feature, i.e. a
+/// deployment-shaped divergence rather than a setting.
+///
+/// The explicit kwargs are applied AFTER the load and still win, so the
+/// `artifact_dir` `jammi.connect("file://…")` derives from the target is never
+/// overridden by a config file or by `JAMMI_ARTIFACT_DIR`.
 #[pyfunction]
 #[pyo3(signature = (*, config=None, artifact_dir=None, gpu_device=None, inference_batch_size=None))]
 fn open_local(
@@ -74,10 +91,12 @@ fn open_local(
         .with_writer(std::io::stderr)
         .try_init();
 
-    let mut cfg = match config {
-        Some(path) => JammiConfig::load(Some(std::path::Path::new(&path))).map_err(to_pyerr)?,
-        None => JammiConfig::default(),
-    };
+    // One call, whether or not a path was given (`load` falls back to
+    // `JAMMI_CONFIG` / `./jammi.toml` / the platform config dir and then applies
+    // the `JAMMI_*` overrides) — the server's own resolution, not a private
+    // embedded variant that would silently ignore the operator's environment.
+    let mut cfg =
+        JammiConfig::load(config.as_deref().map(std::path::Path::new)).map_err(to_pyerr)?;
 
     if let Some(dir) = artifact_dir {
         cfg.artifact_dir = dir.into();

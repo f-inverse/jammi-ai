@@ -192,6 +192,13 @@ class EmbeddedBackend:
         is a no-op — and every other verb afterwards raises the typed
         :class:`~jammi.errors.BackendError` the engine's boundary guard raises,
         never a silent no-op.
+
+        With ``training.run_worker = false`` there is no worker to stop, so only
+        the catalog release runs — promptly, with no idle-poll wait and no
+        in-flight run to finish. That is the point of the setting on a SQLite
+        catalog: this session submits jobs and holds them ``"queued"``, and this
+        call is the moment its directory, queued jobs and all, becomes a
+        claiming process's to open. See :func:`jammi.connect`.
         """
         self._native.close()
 
@@ -1241,7 +1248,17 @@ def _open_embedded(artifact_dir: str, *, config: Optional[str] = None) -> Embedd
     (among every other deployment default) through — every embedding table this
     session later creates (`generate_embeddings` / `import_embeddings`) is
     stamped with whatever `storage_precision` was in effect at the moment of
-    its creation. ``None`` reproduces the engine's built-in defaults.
+    its creation. ``None`` leaves the engine to resolve a config the way the
+    server binary does (``JAMMI_CONFIG`` / ``./jammi.toml`` / the platform config
+    dir, then the ``JAMMI_*`` environment overrides), falling back to the
+    built-in defaults when there is none — the `artifact_dir` passed here is
+    applied after that load and always wins.
+
+    One key that resolution carries is `training.run_worker`
+    (``JAMMI_TRAINING__RUN_WORKER``): with it `false`, this session accepts
+    training submissions but never claims one, so on a SQLite catalog a
+    submitted job stays ``"queued"`` until this session is closed and a claiming
+    process opens the directory. See :func:`jammi.connect`.
 
     This is the ONE site that imports `jammi_native`, and it does so LAZILY (at
     call time, not module load): `import jammi` and `import

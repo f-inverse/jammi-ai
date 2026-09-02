@@ -119,11 +119,27 @@ def connect(
     the deployment-default knob a caller sets (e.g. `embedding.ann.storage_precision`
     / `embedding.ann.oversample`, among every other deployment default) through
     the public front door rather than only the lower-level native handle.
-    ``None`` reproduces the engine's built-in defaults. Meaningless against a
-    REMOTE target — a deployment's own config is the server's concern, never a
-    client-side passthrough — so a remote target opened *with* `config` is a
-    caller error, rejected as an :class:`InvalidArgument` before any channel is
-    opened.
+    ``None`` does not mean "no configuration": the engine resolves one exactly
+    as the server binary does — ``JAMMI_CONFIG``, else ``./jammi.toml``, else the
+    platform config dir, with the ``JAMMI_*`` environment overrides layered on
+    top — and falls back to the built-in defaults only when none of those exist.
+    Meaningless against a REMOTE target — a deployment's own config is the
+    server's concern, never a client-side passthrough — so a remote target
+    opened *with* `config` is a caller error, rejected as an
+    :class:`InvalidArgument` before any channel is opened.
+
+    **`training.run_worker` on a `file://` target.** An embedded session both
+    accepts training submissions and RUNS them; ``training.run_worker = false``
+    (env ``JAMMI_TRAINING__RUN_WORKER=false``) keeps the first and drops the
+    second, through the same configuration a server reads. Such a session still
+    accepts `fine_tune` et al. and still serves their status, but never claims a
+    job. On a SQLite catalog — single-process, so exactly one process holds the
+    directory — a submitted job therefore stays ``"queued"`` (its
+    `acceleration_report()` still the submission-time ``{"state": "pending"}``)
+    until this session :meth:`~jammi.EmbeddedBackend.close`s the directory and a
+    claiming process opens it. That is the whole handoff: submission here,
+    claiming there, serialised by `close()`. A multi-process catalog (Postgres)
+    needs no such serialisation — a claiming process runs concurrently.
 
     Scaling local→remote is an env flip (``connect(os.environ["JAMMI_TARGET"])``)
     with no code change; the embed build and this lean build are one package,

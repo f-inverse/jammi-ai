@@ -138,22 +138,24 @@ def test_remote_and_embedded_attach_and_list_agree(tmp_path, monkeypatch, live_s
     assert embedded_report == {"state": "pending"}
 
 
-def test_remote_attach_model_id_is_empty_until_completion(
+def test_remote_and_embedded_attach_model_id_agree_before_completion(
     tmp_path, monkeypatch, live_server_on
 ):
-    """The ONE stated difference between the two attach paths, pinned so it
-    cannot drift silently.
+    """`model_id` on an attach to a NOT-YET-COMPLETED job is byte-identical on
+    both arms — the divergence this module once recorded as a stated difference
+    is closed, and this is the equality that keeps it closed.
 
-    `TrainingStatusResponse.model_id` is empty until the job completes — the
-    wire's own documented contract — so a remote attach to a QUEUED job has no
-    output model id to carry. The embedded attach re-derives the deterministic
-    id from the persisted spec, which is an ENGINE rule; the client does not
-    reimplement it, because a second implementation of a naming scheme the
-    server owns is exactly the drift this conformance suite exists to prevent.
+    Pre-completion is the whole point: `training_jobs.output_model_id` is
+    stamped only at finalization, so a queued row has no column to relay. Both
+    arms therefore report a DERIVED id, and they report the same one because
+    they make the same call — `jammi_ai::fine_tune::training_job::
+    resolve_model_id`, which the embedded attach binding and the server's
+    `TrainingStatus` handler each delegate to rather than re-spelling the
+    naming rule. An equality that held only after completion would prove
+    nothing here: it would just be two relays of one stamped column.
 
-    Closing the difference is a server/wire change (have `TrainingStatus` carry
-    the derived id pre-completion, as the embedded attach does), not a client
-    one — so it is recorded here as a difference with a reason, not hidden.
+    The final assertion is the non-vacuity check — the shared value is the real
+    `jammi:fine-tuned:{job_id}` mint, not two empty strings agreeing.
     """
     artifact_dir = tmp_path / "engine"
     artifact_dir.mkdir()
@@ -170,7 +172,7 @@ def test_remote_attach_model_id_is_empty_until_completion(
     with live_server_on(artifact_dir, env_overrides=_NO_CLAIM) as endpoint:
         remote = jammi.connect(endpoint)
         try:
-            assert remote.training_job(job_id).model_id == ""
+            assert remote.training_job(job_id).model_id == embedded_model_id
         finally:
             remote.close()
 

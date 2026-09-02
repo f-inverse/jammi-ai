@@ -2362,14 +2362,20 @@ class RemoteDatabase:
         :class:`~jammi.errors.BackendError`, the same class the embedded arm
         raises for the same miss.
 
-        `model_id` is the one value that differs from the embedded attach, and
-        it differs because the wire says so: `TrainingStatusResponse.model_id`
-        is empty until the job completes (its own documented contract), whereas
-        the embedded attach re-derives the deterministic id from the persisted
-        spec. This client does NOT re-derive it — that rule belongs to the
-        engine, and duplicating it here would be a second implementation of a
-        naming scheme the server owns. Read `model_id` on a completed job, or
-        keep the id the submit call returned.
+        `model_id` reads the same on both arms at EVERY lifecycle state —
+        queued, running, completed, failed — not only once the job has
+        finished. It is the id the server resolved for this row
+        (`TrainingStatusResponse.model_id`): the stamped `output_model_id` once
+        the job completes, and before then the engine's own re-derivation from
+        the persisted spec, which is exactly what the embedded attach reports
+        because both call the SAME engine function. This client re-derives
+        nothing — the naming rule belongs to the engine, and a second
+        implementation here is the drift the conformance suite exists to catch.
+
+        Note that `list_training_jobs()`'s `output_model_id` is a DIFFERENT
+        question and is still empty until completion on both arms: it relays
+        the catalog column verbatim ("has the output row landed"), where
+        `model_id` answers "what will this model be called".
         """
         resp = self._call(
             self._training.TrainingStatus,

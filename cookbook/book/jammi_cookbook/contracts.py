@@ -919,7 +919,8 @@ ARTIFACTS: dict[str, Artifact] = {
         produced_by="segmented_ann",
         note="The freshly-built table's `index_segments` catalog row, read off the "
         "embedded engine's own SQLite catalog file (never reimplemented) AFTER the "
-        "engine handle was closed and the release proven — no public surface exposes "
+        "engine handle's awaited close() returned (that return IS the release) — no "
+        "public surface exposes "
         "`index_segments`, and a raw SQLite handle beside a live engine is out of "
         "contract: segment "
         "count, segment id, row count, whether the `{table}__seg0.idx` naming convention "

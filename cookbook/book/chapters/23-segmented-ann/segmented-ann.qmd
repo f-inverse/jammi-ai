@@ -91,9 +91,13 @@ CPython's separately-linked `sqlite3` module is — cannot see the engine's lock
 wal-index: its reads can be stale, and its close can checkpoint and truncate the `-wal` the
 engine still tracks. No engine-side seam can arbitrate locks it cannot see, so the contract
 is the caller's to keep: **close the engine, then touch the file.** This chapter's producer
-does exactly that, and proves the handover (`catalog.db-wal` gone) before it opens a
-read-only handle. Reaching for `sqlite3.connect(...)` beside a live engine is the bug this
-callout exists to stop you writing.
+does exactly that, and then opens a read-only handle. The handover needs no second proof:
+the engine's `close()` is an *awaited* release — it drains the catalog pool and waits out
+SQLite's own evidence before returning — so `close()` returning is what "released" means.
+(Do not re-derive it from the sidecar files: a `catalog.db-wal` can legitimately outlive a
+completed release when the last close's passive checkpoint declines, so a caller-side
+`-wal` check fails on a perfectly healthy catalog.) Reaching for `sqlite3.connect(...)`
+beside a live engine is the bug this callout exists to stop you writing.
 :::
 
 ```{python}

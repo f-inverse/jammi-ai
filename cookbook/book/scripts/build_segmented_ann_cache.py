@@ -75,8 +75,21 @@ see the engine's locks or its wal-index. Its reads can be stale, and its
 `sqlite3_close` believes it holds the last connection and will checkpoint and
 truncate the `-wal` the engine still tracks. No engine-side seam can arbitrate
 locks it cannot see; the caller has to not create the topology. So `emit()` closes
-the engine, proves the release (`catalog.db-wal` is gone — SQLite's own evidence
-that the engine let go), and only then opens a **read-only** handle on the file.
+the engine and only then opens a **read-only** handle on the file.
+
+The AWAITED close is the proof — this script adds no second one. `PyDatabase::close`
+(`crates/jammi-python/src/database.rs`) stops the training worker, then awaits
+`CatalogBackend::close`, which drains the pool and waits out SQLite's own release
+evidence across a settle window before returning. "`close()` returned" therefore
+already MEANS "released"; re-deriving that here from the presence of a sidecar file
+would be both redundant and wrong. A `catalog.db-wal` can legitimately survive a
+fully completed release when the last close's passive checkpoint declines (measured:
+1 in 40 runs), and the engine's own census deliberately warns-and-returns rather than
+failing in that case — so a producer-side `-wal` poll would raise on a correctly
+released catalog. The read below is a `mode=ro` open, which cannot itself checkpoint
+or truncate anything, and it raises on its own if the file is not openable; no
+lock-state assertion is made, because a foreign in-process reader cannot observe the
+engine's locks in the first place.
 
 Names no consumer: a generic 20-row `patents` fixture and the engine's own
 public `tiny_modernbert` encoder, both already used by the engine's own
@@ -103,7 +116,6 @@ import re
 import sqlite3
 import subprocess
 import tempfile
-import time
 from pathlib import Path
 
 import jammi
@@ -211,7 +223,11 @@ def _close_engine(db) -> None:
     Under the `unix-excl` VFS the catalog pool holds a process-scoped exclusive
     lock for as long as ANY connection in this process has the file open, and
     dropping the handle is not observable (`sqlx` returns connections from a
-    background task). `close()` is the release point the engine documents.
+    background task). `close()` is the release point the engine documents, and it
+    AWAITS the handshake: stop the training worker, close and drain the pool, then
+    wait out SQLite's own release evidence over a settle window. When it returns,
+    the catalog is released — so its return is this script's proof, and the caller
+    below adds no second check of its own.
 
     The public `jammi.Session` surface does not carry it on the embedded arm yet:
     `EmbeddedBackend.close()` raises `NotSupportedOnBackend(Capability.CLOSE)`
@@ -237,49 +253,22 @@ def _close_engine(db) -> None:
         )
 
 
-def _await_catalog_released(artifact_dir: Path, timeout_s: float = 5.0) -> None:
-    """Prove the engine let go of `catalog.db` before any other SQLite library
-    instance opens it.
-
-    The evidence is SQLite's own: a WAL database with no live connection has no
-    `catalog.db-wal` beside it. `close()` already absorbs the settle window for
-    the straggler connection-return task, so this normally passes on the first
-    look; the bounded poll only keeps the producer from being timing-fragile.
-    A `-wal` that never goes away means the engine did NOT release the file, and
-    the read that follows would be exactly the out-of-contract topology this
-    script exists to avoid — so it raises rather than reading stale rows.
-    """
-    wal = artifact_dir / "catalog.db-wal"
-    deadline = time.monotonic() + timeout_s
-    while True:
-        if not wal.exists():
-            print(f"  catalog released: {wal.name} is gone", flush=True)
-            return
-        if time.monotonic() >= deadline:
-            raise RuntimeError(
-                f"{wal} still present {timeout_s}s after close(): the engine has "
-                f"NOT released catalog.db, so reading it from a second SQLite "
-                f"library instance would be out of contract (see this module's "
-                f"docstring and crates/jammi-db/src/catalog/backend_sqlite.rs)"
-            )
-        time.sleep(0.05)
-
-
 def _read_segment_catalog(artifact_dir: Path, table_name: str) -> dict:
     """Read `index_segments` for `table_name` off the engine's own SQLite catalog
     file — a real artifact the running wheel wrote, never reimplemented or guessed.
 
-    PRECONDITION: the engine handle that wrote this file is CLOSED. Call
-    `_close_engine` + `_await_catalog_released` first; this function re-checks the
-    release itself so the ordering cannot silently rot. There is no public surface
-    for `index_segments` today (module docstring), and until there is, "close the
+    PRECONDITION: the engine handle that wrote this file is CLOSED — call
+    `_close_engine` first. Its awaited `close()` IS the release (see this module's
+    docstring); there is nothing further to verify here, and nothing this side of
+    the process could verify anyway. There is no public surface for
+    `index_segments` today (module docstring), and until there is, "close the
     engine first, then touch the file" is the only in-contract way to read it.
 
     The handle is opened `mode=ro`: a read-only SQLite connection cannot
-    checkpoint or truncate the `-wal`, so even a mistake in the ordering above
-    cannot damage a catalog the engine still tracks.
+    checkpoint or truncate the `-wal`, so even a mistake in that ordering cannot
+    damage a catalog the engine still tracks. A file it cannot open raises here on
+    its own — no lock-state assertion is made or possible.
     """
-    _await_catalog_released(artifact_dir)
     db_path = artifact_dir / "catalog.db"
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
@@ -378,7 +367,7 @@ def emit(fixtures_root: Path) -> None:
         # Everything that needs the ENGINE is done; everything below needs the
         # engine's FILES. Those two never overlap: a second SQLite library
         # instance beside a live engine is out of contract (module docstring),
-        # so the handle is released — and the release is proven — first.
+        # so the handle is released first — and the awaited close IS the proof.
         print("== releasing the catalog before reading it ==", flush=True)
         _close_engine(db)
         catalog = _read_segment_catalog(Path(artifact_dir), n1["table_name"])

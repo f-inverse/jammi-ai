@@ -1,0 +1,67 @@
+{
+  "arch": "sm_86",
+  "box": "NVIDIA A40",
+  "disposition": {
+    "evidence": {
+      "job_id": "100173672107",
+      "last_output_at": "2026-09-02T09:02:52.0077755Z"
+    },
+    "kind": "slow-host"
+  },
+  "driver": "570.195.03",
+  "git_sha": "c80e8f8bd2a4c17f0e016e64c2ee79fa4d486fa4",
+  "groups": [
+    {
+      "name": "device",
+      "rc": null,
+      "wall_s": 0.025
+    },
+    {
+      "name": "capability-surface-build",
+      "rc": null,
+      "wall_s": 1671.572
+    },
+    {
+      "name": "capability-surface-proof",
+      "rc": null,
+      "wall_s": 12.328
+    },
+    {
+      "name": "served-client-server-proof",
+      "rc": null,
+      "wall_s": 209.324
+    },
+    {
+      "name": "engine-core-sweep",
+      "rc": null,
+      "wall_s": 183.153
+    },
+    {
+      "name": "bench",
+      "rc": null,
+      "wall_s": 358.366
+    },
+    {
+      "name": "kernels-default",
+      "rc": null,
+      "wall_s": 130.203
+    },
+    {
+      "name": "kernels-cuda",
+      "rc": null,
+      "wall_s": 368.306
+    }
+  ],
+  "job_id": "100173672107",
+  "max_silent_gap_after": "capability-surface-build",
+  "max_silent_gap_s": 160.306,
+  "outcome": "budget-cut",
+  "run_id": "33607161412",
+  "schema_version": 1,
+  "source": "run-metadata",
+  "surface": {
+    "expected_id": null,
+    "kind": "legacy-pre-d1"
+  },
+  "wall_lower_bound_s": 3000.014
+}

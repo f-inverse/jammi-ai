@@ -52,6 +52,18 @@ real device. That is `capability_surface.rs`'s job (a live registry-delta
 probe) and `check_flash_attn_closure.py`'s (the feature-graph closure). This
 gate is the internal-consistency floor underneath both.
 
+  5. (esc-081) The top-level key set is CLOSED at exactly `{_schema_doc,
+     lanes, server_only_cargo_features, prove_lane}` -- an extra top-level
+     key is a FINDING, never silently ignored (the same "closed set, not a
+     denylist" discipline `capabilities` already gets, one level up).
+  6. `prove_lane.crates` -- the proof-surface-equals-shipped-surface
+     declaration `check_flash_attn_closure.py` enforces set-equality
+     against: every crate the prove script invokes must be present with a
+     non-empty `kinds` list; every crate's `prove_only` features must each
+     be DECLARED by that crate (`ci/scripts/prove_surface.py`'s own
+     `declared()`, stdlib `tomllib`, no `cargo metadata`); no extra crate
+     beyond the four the prove lane actually runs.
+
 Usage:
     python3 ci/scripts/check_release_manifest.py
     python3 ci/scripts/check_release_manifest.py --self-test
@@ -64,6 +76,20 @@ import json
 import re
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import prove_surface  # noqa: E402
+
+# The top-level key set is CLOSED -- see module doc point 5. A new top-level
+# section needs this constant widened in the SAME unit that adds it, never a
+# silent extra key nobody validates.
+TOP_LEVEL_KEYS = frozenset({"_schema_doc", "lanes", "server_only_cargo_features", "prove_lane"})
+
+# The exact crates `ci/scripts/runpod_gpu_prove.sh` invokes today -- an entry
+# here for a crate the prove lane does not run is itself a finding (dead
+# manifest state that `check_flash_attn_closure.py`'s set-equality rule
+# would never be exercised for).
+PROVE_LANE_CRATES = frozenset({"jammi-server", "jammi-ai", "jammi-bench", "jammi-kernels"})
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 assert (REPO_ROOT / "Cargo.toml").is_file(), (
@@ -155,9 +181,70 @@ def _category_ops(caps: dict, lane_name: str, problems: list[str]) -> dict[str, 
     return ops
 
 
+def _check_prove_lane(manifest: dict, repo_root: Path, problems: list[str]) -> None:
+    """(6) `prove_lane.crates` -- every `prove_only` feature must be
+    declared by that crate; every crate the prove script runs must be
+    present with a non-empty `kinds`; no extra crate. Never calls `cargo
+    metadata` -- `prove_surface.declared()` is stdlib `tomllib` only."""
+    prove_lane = manifest.get("prove_lane")
+    if not isinstance(prove_lane, dict):
+        problems.append("manifest has no `prove_lane` object")
+        return
+    crates = prove_lane.get("crates")
+    if not isinstance(crates, dict) or not crates:
+        problems.append("`prove_lane` has no (or an empty) `crates` object")
+        return
+    for crate in PROVE_LANE_CRATES:
+        if crate not in crates:
+            problems.append(f"`prove_lane.crates` is missing required crate `{crate}`")
+    for crate_name, spec in crates.items():
+        if crate_name not in PROVE_LANE_CRATES:
+            problems.append(
+                f"`prove_lane.crates.{crate_name}`: not one of the prove lane's own "
+                f"crates {sorted(PROVE_LANE_CRATES)} -- an extra, unenforced entry"
+            )
+        if not isinstance(spec, dict):
+            problems.append(f"`prove_lane.crates.{crate_name}` must be an object")
+            continue
+        kinds = spec.get("kinds")
+        if not isinstance(kinds, list) or not kinds:
+            problems.append(f"`prove_lane.crates.{crate_name}` has no (or an empty) `kinds` list")
+        else:
+            for kind in kinds:
+                if kind not in prove_surface.KINDS:
+                    problems.append(
+                        f"`prove_lane.crates.{crate_name}.kinds` names unknown kind "
+                        f"`{kind}` (want one of {prove_surface.KINDS})"
+                    )
+        prove_only = spec.get("prove_only")
+        if not isinstance(prove_only, list):
+            problems.append(f"`prove_lane.crates.{crate_name}.prove_only` must be a list")
+            continue
+        try:
+            declared_feats = prove_surface.declared(crate_name, repo_root)
+        except Exception as e:  # noqa: BLE001 - report, never crash the gate
+            problems.append(f"`prove_lane.crates.{crate_name}`: cannot read its Cargo.toml: {e}")
+            continue
+        for feat in prove_only:
+            if feat not in declared_feats:
+                problems.append(
+                    f"`prove_lane.crates.{crate_name}.prove_only` names `{feat}`, which "
+                    f"`crates/{crate_name}/Cargo.toml` does not declare under `[features]`"
+                )
+
+
 def check_manifest(manifest: dict, repo_root: Path = REPO_ROOT) -> list[str]:
     """Return every finding (empty == green)."""
     problems: list[str] = []
+
+    # (5) Top-level key set is CLOSED.
+    extra_top = set(manifest.keys()) - TOP_LEVEL_KEYS
+    for key in sorted(extra_top):
+        problems.append(
+            f"unknown top-level key `{key}` -- the closed set is {sorted(TOP_LEVEL_KEYS)}"
+        )
+
+    _check_prove_lane(manifest, repo_root, problems)
 
     lanes = manifest.get("lanes")
     if not isinstance(lanes, dict) or not lanes:
@@ -275,7 +362,15 @@ def _fixture_manifest() -> dict:
         "lanes": {
             "a": {"capabilities": json.loads(json.dumps(caps))},
             "b": {"capabilities": json.loads(json.dumps(caps))},
-        }
+        },
+        "prove_lane": {
+            "crates": {
+                "jammi-server": {"kinds": ["release", "test"], "prove_only": ["live-gpu-tests"]},
+                "jammi-ai": {"kinds": ["test"], "prove_only": ["live-gpu-tests"]},
+                "jammi-bench": {"kinds": ["release"], "prove_only": []},
+                "jammi-kernels": {"kinds": ["default", "test"], "prove_only": []},
+            }
+        },
     }
 
 
@@ -422,6 +517,32 @@ def _self_test() -> int:
     # 7. An empty/absent `lanes` object can never pass vacuously.
     probs = check_manifest({"lanes": {}}, REPO_ROOT)
     check("empty-lanes-object-caught", probs != [], f"{probs}")
+
+    # 9. (esc-081) An extra top-level key is caught -- the closed-set rule.
+    m = _fixture_manifest()
+    m["some_new_section"] = {"whatever": True}
+    probs = check_manifest(m, REPO_ROOT)
+    check("extra-top-level-key-caught", any("unknown top-level key `some_new_section`" in p for p in probs), f"{probs}")
+
+    # 9b. `prove_lane` naming an UNDECLARED `prove_only` feature is caught.
+    m = _fixture_manifest()
+    m["prove_lane"]["crates"]["jammi-bench"]["prove_only"] = ["this-feature-does-not-exist"]
+    probs = check_manifest(m, REPO_ROOT)
+    check(
+        "undeclared-prove-only-caught",
+        any("does not declare" in p and "this-feature-does-not-exist" in p for p in probs),
+        f"{probs}",
+    )
+
+    # 9c. A missing prove_lane crate is caught.
+    m = _fixture_manifest()
+    del m["prove_lane"]["crates"]["jammi-kernels"]
+    probs = check_manifest(m, REPO_ROOT)
+    check(
+        "missing-prove-lane-crate-caught",
+        any("missing required crate `jammi-kernels`" in p for p in probs),
+        f"{probs}",
+    )
 
     # 8. The registry-key scan is non-vacuous against the real tree.
     keys = registry_key_literals(REPO_ROOT)

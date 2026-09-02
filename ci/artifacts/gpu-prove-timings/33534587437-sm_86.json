@@ -1,0 +1,66 @@
+{
+  "arch": "sm_86",
+  "box": "NVIDIA RTX A6000",
+  "disposition": null,
+  "driver": "570.133.07",
+  "git_sha": "d94fb6b54629a56264eef6a84bb9cd0702e3f5b0",
+  "groups": [
+    {
+      "name": "device",
+      "rc": null,
+      "wall_s": 0.048
+    },
+    {
+      "name": "capability-surface-build",
+      "rc": null,
+      "wall_s": 1310.744
+    },
+    {
+      "name": "capability-surface-proof",
+      "rc": null,
+      "wall_s": 13.456
+    },
+    {
+      "name": "served-client-server-proof",
+      "rc": null,
+      "wall_s": 205.075
+    },
+    {
+      "name": "engine-core-sweep",
+      "rc": null,
+      "wall_s": 149.102
+    },
+    {
+      "name": "bench",
+      "rc": null,
+      "wall_s": 358.654
+    },
+    {
+      "name": "kernels-default",
+      "rc": null,
+      "wall_s": 149.924
+    },
+    {
+      "name": "kernels-cuda",
+      "rc": null,
+      "wall_s": 431.119
+    },
+    {
+      "name": "kernels-clippy-legacy",
+      "rc": null,
+      "wall_s": 164.264
+    }
+  ],
+  "job_id": "99945668048",
+  "max_silent_gap_after": "kernels-cuda",
+  "max_silent_gap_s": 153.473,
+  "outcome": "healthy",
+  "run_id": "33534587437",
+  "schema_version": 1,
+  "source": "run-metadata",
+  "surface": {
+    "expected_id": null,
+    "kind": "legacy-pre-d1"
+  },
+  "wall_s": 2848.079
+}

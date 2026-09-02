@@ -332,9 +332,11 @@ or tail `/root/.jammi-seed.log` directly.
    provisions it first —
    `git submodule update --init --force --checkout --depth 1`
    (`ci/scripts/pod_seed_target.sh:825`).
-7. **T2** — `cargo test --no-run` for the exact crates/features
-   `runpod_gpu_prove.sh`'s own CI suites use, kept in lockstep by naming
-   the same `-p`/`--features`/`--test` here:
+7. **T2** — `cargo test --no-run` for a FIXED, pre-esc-081 crates/features/
+   `--test` selection — a dev-loop compile-cache seed, never asserted to be
+   tuple-for-tuple in lockstep with `runpod_gpu_prove.sh`'s own
+   `PROVE_TUPLE`-declared invocations, several of which esc-081 widened
+   (`cuda,flash-attn,...`) independently of this seed:
    `cargo test -p jammi-server --features cuda,live-gpu-tests --test it --no-run`
    (`ci/scripts/pod_seed_target.sh:853`) through
    `cargo test -p jammi-kernels --features cuda --no-run`

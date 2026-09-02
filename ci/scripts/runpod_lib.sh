@@ -44,6 +44,15 @@
 #                 launch a detached tmux session, which daemonizes and outlives
 #                 the timeout entirely. It is NOT a cost guard — RP_TTL_HOURS and
 #                 rp_sweep are.
+#   RP_INACTIVITY seconds of silent (no new output byte) remote stdout+stderr
+#                 before `rp_run_remote_watched` (esc-080) kills the ssh
+#                 session as a hang, rather than waiting out the full
+#                 RP_TIMEOUT budget (default 600). This is a DIFFERENT axis
+#                 from RP_TIMEOUT: a hung leg (e.g. a genuinely stuck test)
+#                 goes silent well before any wall-clock budget expires, and
+#                 a bare `timeout` has no notion of "still running but dead"
+#                 vs "still running and busy" -- only `rp_run_remote` (no
+#                 watchdog) is unaffected by this variable.
 #   RP_SESSION    named session. Persists pod coordinates AND the SSH key under
 #                 RP_SESSION_ROOT so a *different* terminal can reattach. Unset =
 #                 throwaway temp dir, wiped on exit.
@@ -141,6 +150,23 @@ esac
 [ "${#RP_SSH_WAIT_SECS}" -le 9 ] || { echo "::error::RP_SSH_WAIT_SECS has too many digits (got '${RP_SSH_WAIT_SECS}')" >&2; exit 2; }
 RP_SSH_WAIT_SECS=$((10#$RP_SSH_WAIT_SECS))
 [ "$RP_SSH_WAIT_SECS" -gt 0 ] || { echo "::error::RP_SSH_WAIT_SECS must be > 0" >&2; exit 2; }
+# Inactivity watchdog threshold for `rp_run_remote_watched` (esc-080): a
+# silent-output span this long (seconds, no NEW bytes on the remote's
+# stdout+stderr stream) is read as a genuine hang, not merely a slow
+# command, and kills the ssh session rather than waiting out the full
+# RP_TIMEOUT budget. Default 600s -- >= 3x the longest silent gap any
+# healthy prove-lane leg has shown (161s, `ci/artifacts/gpu-prove-timings/`),
+# per `check_gpu_prove_timings.py`'s own R2 rule, which re-demands this
+# margin every time a fresh artifact lands. Validated here, not at use, same
+# reasoning as RP_SSH_WAIT_SECS above: it drives arithmetic with no `-e` set
+# anywhere in this file.
+RP_INACTIVITY="${RP_INACTIVITY:-600}"
+case "$RP_INACTIVITY" in
+  ''|*[!0-9]*) echo "::error::RP_INACTIVITY must be a positive integer (got '${RP_INACTIVITY}')" >&2; exit 2 ;;
+esac
+[ "${#RP_INACTIVITY}" -le 9 ] || { echo "::error::RP_INACTIVITY has too many digits (got '${RP_INACTIVITY}')" >&2; exit 2; }
+RP_INACTIVITY=$((10#$RP_INACTIVITY))
+[ "$RP_INACTIVITY" -gt 0 ] || { echo "::error::RP_INACTIVITY must be > 0" >&2; exit 2; }
 RP_SESSION_ROOT="${RP_SESSION_ROOT:-${HOME}/.config/runpod/sessions}"
 # An ssh config this tooling owns outright, so ~/.ssh/config is never rewritten.
 RP_SSH_CONFIG="${RP_SSH_CONFIG:-${HOME}/.config/runpod/ssh_config}"
@@ -1418,6 +1444,161 @@ rp_deploy_live_a100() { rp_deploy_arch a100; }
 rp_run_remote() {
   { printf '%s\n' "$RP_ENV_PREAMBLE"; cat; } \
     | ssh "${RP_SSHO[@]}" -p "$RP_PORT" "root@${RP_HOST}" "timeout ${RP_TIMEOUT:-3000} bash -s"
+}
+
+# Like `rp_run_remote`, plus an INACTIVITY watchdog (esc-080): RP_INACTIVITY
+# seconds of silent (no new output byte) remote stdout+stderr kills the ssh
+# session as a hang, rather than waiting out the full RP_TIMEOUT budget --
+# the two axes are independent (a leg can be busy-but-slow, which only
+# RP_TIMEOUT should catch, or silent-and-stuck, which this watchdog catches
+# far earlier). File-backed streaming (never a `$(...)` capture, which would
+# buffer the ENTIRE output in memory and print nothing until the process
+# exits) so a caller sees the same bytes live, exactly as `rp_run_remote`'s
+# direct pipe does.
+#
+# This is a GENERIC primitive: it knows the `::group::`/`PROVE_GROUP_RC
+# name=<n> rc=<v>` marker SHAPE (to name a hung/cut group in its own
+# diagnostic), but nothing about which group names are meaningful, which
+# are gating, or the bench-cut exception -- deciding whether a leg PASSES
+# from those markers is the CALLER's job (e.g. `runpod_gpu_prove.sh`'s own
+# `PROVE_GROUPS` array and driver rule), never this shared function's.
+#
+# Returns:
+#   * 76, after printing a "NO PROGRESS" diagnostic naming the last-opened
+#     group and every `PROVE_GROUP_RC` marker seen so far, if RP_INACTIVITY
+#     seconds pass with no new output byte. This is NOT the remote script's
+#     own exit status -- it never got to choose one; the watchdog killed it.
+#   * the remote script's own status, VERBATIM, whenever ssh itself exits on
+#     its own (0, 1, 97, 255, an in-suite 124/76 the remote script chose to
+#     exit with -- anything ssh reports as ITS OWN status) -- ALWAYS taken
+#     from `wait $pid` after the FINAL drain to EOF, never guessed early. A
+#     status-124 exit additionally gets a "BUDGET" diagnostic (same
+#     group/marker naming), printed WITHOUT changing the exit code, but
+#     ONLY when the drained output carries no `PROVE_EXIT=` line -- the 124
+#     discriminator: an in-suite 124 (the remote script's OWN exit, with
+#     `PROVE_EXIT=124` already printed) is a different case, indistinguishable
+#     from a real budget cut by exit code alone, and gets no extra line.
+rp_run_remote_watched() {
+  local out; out="$(mktemp)"
+  local preamble; preamble="$RP_ENV_PREAMBLE"
+  { printf '%s\n' "$preamble"; cat; } \
+    | ssh "${RP_SSHO[@]}" -p "$RP_PORT" "root@${RP_HOST}" "timeout ${RP_TIMEOUT:-3000} bash -s" \
+    > "$out" 2>&1 &
+  local pid=$!
+  local printed=0 last_growth=$SECONDS last_group="" parse_carry=""
+  local group_names=() group_rcs_assoc_keys=() group_rcs_assoc_vals=()
+
+  _rrw_group_list() {
+    local i out_str=""
+    for i in "${!group_names[@]}"; do
+      [ -n "$out_str" ] && out_str+=","
+      out_str+="${group_names[$i]}:${group_rcs_assoc_vals[$i]}"
+    done
+    printf '[%s]' "$out_str"
+  }
+
+  _rrw_record_rc() {
+    # `$1` = a `PROVE_GROUP_RC name=<n> rc=<v>` line (already validated to
+    # contain that literal substring by the caller).
+    local rest="${1#*PROVE_GROUP_RC }"
+    local gname="${rest#name=}"; gname="${gname%% *}"
+    local grcv="${rest##*rc=}"; grcv="${grcv%% *}"
+    local i found=0
+    for i in "${!group_names[@]}"; do
+      if [ "${group_names[$i]}" = "$gname" ]; then
+        group_rcs_assoc_vals[$i]="$grcv"
+        found=1
+        break
+      fi
+    done
+    [ "$found" -eq 1 ] || { group_names+=("$gname"); group_rcs_assoc_vals+=("$grcv"); }
+  }
+
+  # Sets `_RRW_CHUNK` (a plain global, NOT a `$(...)`-captured return value
+  # -- a caller doing `x="$(_rrw_read_chunk ...)"` would immediately lose
+  # the fix below to ITS OWN command-substitution newline-stripping): `$(...)`
+  # unconditionally strips ALL trailing newlines from whatever it captures,
+  # which would make every chunk look "complete" to the partial-line carry
+  # logic below even when the real bytes end mid-line -- append a sentinel
+  # byte, capture, then strip exactly that sentinel, so any REAL trailing
+  # newline(s) in the chunk survive intact.
+  _rrw_read_chunk() {
+    local from="$1"
+    _RRW_CHUNK="$(tail -c "+${from}" "$out"; printf 'X')"
+    _RRW_CHUNK="${_RRW_CHUNK%X}"
+  }
+
+  _rrw_scan_new_text() {
+    # Parse only COMPLETE (newline-terminated) lines out of `parse_carry +
+    # $1`; the trailing incomplete remainder (if `$1` does not itself end in
+    # a newline) is carried forward to the NEXT poll tick rather than
+    # mis-parsed as a whole line.
+    local combined="${parse_carry}$1"
+    parse_carry=""
+    if [ "${combined: -1}" != $'\n' ]; then
+      parse_carry="${combined##*$'\n'}"
+      combined="${combined%"$parse_carry"}"
+    fi
+    [ -z "$combined" ] && return
+    local line
+    while IFS= read -r line; do
+      case "$line" in
+        *"::group::"*) last_group="${line#*::group::}" ;;
+        *"PROVE_GROUP_RC "*"name="*"rc="*) _rrw_record_rc "$line" ;;
+      esac
+    done <<< "$combined"
+  }
+
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 5
+    local size; size=$(wc -c < "$out" 2>/dev/null || echo 0)
+    if [ "$size" -gt "$printed" ]; then
+      _rrw_read_chunk "$((printed + 1))"
+      printf '%s' "$_RRW_CHUNK"
+      _rrw_scan_new_text "$_RRW_CHUNK"
+      printed=$size
+      last_growth=$SECONDS
+    elif [ $((SECONDS - last_growth)) -ge "${RP_INACTIVITY:-600}" ]; then
+      kill -TERM "$pid" 2>/dev/null
+      sleep 1
+      kill -KILL "$pid" 2>/dev/null
+      wait "$pid" 2>/dev/null
+      wait 2>/dev/null || true  # reap the `{ preamble; cat; }` pipeline head
+      local size2; size2=$(wc -c < "$out" 2>/dev/null || echo 0)
+      if [ "$size2" -gt "$printed" ]; then
+        _rrw_read_chunk "$((printed + 1))"
+        printf '%s' "$_RRW_CHUNK"
+        _rrw_scan_new_text "$_RRW_CHUNK"
+      fi
+      echo "=== GPU prove: NO PROGRESS for ${RP_INACTIVITY:-600}s in group \"${last_group}\"; groups: $(_rrw_group_list) ===" >&2
+      rm -f "$out"
+      return 76
+    fi
+  done
+  wait "$pid"; local rc=$?
+  # Final drain to EOF after `wait $pid`, BEFORE the 124-discriminator check
+  # below reads the file -- the last group's marker and `PROVE_EXIT=` line
+  # can land milliseconds before ssh's own exit, inside what would otherwise
+  # be the NEXT poll window.
+  local final_size; final_size=$(wc -c < "$out" 2>/dev/null || echo 0)
+  if [ "$final_size" -gt "$printed" ]; then
+    _rrw_read_chunk "$((printed + 1))"
+    printf '%s' "$_RRW_CHUNK"
+    _rrw_scan_new_text "$_RRW_CHUNK"
+    printed=$final_size
+  fi
+  # Force any still-carried partial final line (no trailing newline in the
+  # remote's own output, e.g. an abrupt kill mid-write) into the marker scan
+  # too -- a `PROVE_EXIT=<n>` or `PROVE_GROUP_RC` line the remote never
+  # newline-terminated before dying must still count.
+  if [ -n "$parse_carry" ]; then
+    _rrw_scan_new_text "$parse_carry"$'\n'
+  fi
+  if [ "$rc" -eq 124 ] && ! grep -q '^PROVE_EXIT=' "$out"; then
+    echo "=== GPU prove: BUDGET (RP_TIMEOUT=${RP_TIMEOUT:-3000}s) cut group \"${last_group}\"; groups: $(_rrw_group_list) ===" >&2
+  fi
+  rm -f "$out"
+  return "$rc"
 }
 
 # Runs `$2...` (stdin inherited unchanged — a caller pipes into this

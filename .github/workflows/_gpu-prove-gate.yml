@@ -76,8 +76,18 @@ jobs:
       group: gpu-prove-gate-${{ inputs.git_ref }}-${{ matrix.arch }}
       cancel-in-progress: false
     # Bounded retry is up to 3 prove attempts with 300s between; this caps the
-    # job well under the 360m default, since a job-timeout kill bypasses the trap.
-    timeout-minutes: 200
+    # job well under the 360m GitHub default, since a job-timeout kill
+    # bypasses the trap. Derivation (esc-080/esc-083): the first two attempts
+    # can each cost up to a full deploy-exhaustion cycle before returning 75
+    # (worst-case candidate count across the matrix, 8 for l4_l40s/h100, ×
+    # 600s RP_SSH_WAIT_SECS = 80m) plus per-attempt overhead (sweep +
+    # checkout, ~5m); the FINAL attempt additionally pays the full RP_TIMEOUT
+    # job budget (100m, this workflow's own arms per `gpu-prove.yml`'s
+    # comment) if it actually runs: 2 × 80m + 2 × 5m + 180m = 350m, +5m
+    # margin = 355m (under the 360m GitHub ceiling). Alternative if this ever
+    # needs to shrink: `max_attempts: 2` -> 1 × 80m + 1 × 5m + 180m = 265m,
+    # +15m margin = 280m.
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
       - name: Prove the release commit on a real device (retry on capacity, fail closed)

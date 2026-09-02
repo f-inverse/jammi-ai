@@ -486,6 +486,30 @@ bills — until it finishes or the pod's deadline fires. Lowering `RP_TIMEOUT`
 protects nothing about a `run` job; `RP_TTL_HOURS` and the sweep are what stop
 one.
 
+`ci/scripts/runpod_gpu_prove.sh` exports its own `RP_TIMEOUT` (default 6000s)
+rather than relying on `runpod_lib.sh`'s 3000s default — the prove lane's own
+budget, never shared with `run`/`shell`/`gpu-perf-ab.sh`, which still see the
+library default. `check_gpu_prove_timings.py`'s R3 re-derives the floor this
+value must clear from COMMITTED evidence
+(`ci/artifacts/gpu-prove-timings/*.json`) on every CI run: `RP_TIMEOUT >= 1.5 ×
+the largest HEALTHY leg's wall` AND `RP_TIMEOUT >= that wall + 3 × RP_INACTIVITY`
+— raising either the healthy walls or `RP_INACTIVITY` tightens this floor, and
+the gate goes vacuously RED (never a silent pass) if any shipped arch has zero
+healthy evidence at all.
+
+### `RP_INACTIVITY` — the hang detector `RP_TIMEOUT` cannot be
+
+`RP_TIMEOUT` bounds total wall time; it cannot tell "busy and slow" from "dead
+and silent" — a genuinely hung leg pays the FULL budget before `timeout` ever
+fires. `rp_run_remote_watched` (`runpod_lib.sh`, used by
+`runpod_gpu_prove.sh` only) layers an inactivity watchdog on top: `RP_INACTIVITY`
+seconds (default 600) of silent remote stdout+stderr kills the ssh session and
+returns 76, well before `RP_TIMEOUT` would ever have expired.
+`check_gpu_prove_timings.py`'s R2 re-demands `RP_INACTIVITY >= 3 ×` the largest
+silent gap any healthy (or `slow-host`-disposed) leg has shown, on every run —
+the same "re-checked, not one-time-derived" discipline R3 applies to
+`RP_TIMEOUT`.
+
 ## Verbs that deliberately do not exist
 
 Two are absent that a reader will look for. Both were considered and refused;
@@ -528,6 +552,21 @@ The `gpu-prove` workflow (`_gpu-prove-gate.yml`) runs `grpc_embedding_gpu` +
 (`ci/scripts/runpod_lib.sh`), gating every CUDA release (build → prove →
 promote). Trigger it per-PR with the `run-gpu` label, or it runs nightly. CI pods
 are always throwaway and always terminate.
+
+**Standing operator cost (R5, `check_gpu_prove_timings.py`):** proof surface ==
+shipped surface is enforced by fingerprinting the exact `(crate, kind) →
+features` pairs `runpod_gpu_prove.sh` proves (`ci/scripts/prove_surface.py`'s
+`expected_id`) and demanding a fresh, matching, healthy artifact per shipped
+arch. That fingerprint — and therefore this gate — moves the moment: a lane
+feature is added to or removed from `ci/release-feature-manifest.json`'s
+`cu12-tarball` lane; a `prove_lane.crates.<c>.prove_only` entry changes; or a
+crate starts or stops declaring a feature the lane already carries. None of
+those are prove-lane edits — they can land in an ordinary PR — but each one
+reds this gate until a fresh 4-pod `gpu-prove.yml` dispatch lands new
+`ci/artifacts/gpu-prove-timings/*.json` evidence for every arch. A waiver row
+in `ci/scripts/gpu_prove_timings_allowlist.txt` is for a genuinely reviewed,
+time-boxed exception on ONE arch — never a standing substitute for that
+dispatch.
 
 ### Cross-pod seed cache — not yet built
 

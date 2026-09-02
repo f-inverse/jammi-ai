@@ -55,17 +55,34 @@ cargo build --release -p jammi-bench --features cuda,jammi-kernels/flash-attn	T1
 cargo test -p jammi-server --features cuda,live-gpu-tests --test it --no-run	T2 (pod_seed_target.sh) — compile-checks jammi-server's cuda,live-gpu-tests test binary. ci.yml's "Compile-check (gated lanes)" job compile-checks jammi-ai's gpu_capability suite but never jammi-server's `it` suite with the cuda feature; genuinely off the merge path today, not merely mis-normalized.
 cargo test -p jammi-ai --features cuda,live-gpu-tests --test gpu_capability --no-run	T2 (pod_seed_target.sh) — the SAME suite ci.yml's "Compile-check GPU-capability suite" step compile-checks, but WITHOUT `cuda` (that step's own comment: "Compile-checked without `cuda`... this stays a CPU-runner step"). The cuda-enabled compile-check has no merge-path twin.
 cargo test -p jammi-kernels --features cuda --no-run	T2 (pod_seed_target.sh) — compile-checks jammi-kernels' `cuda_parity` test target (`required-features = ["cuda"]`), the one target ci.yml's own module doc names as uncoverable on the hermetic runner ("CANNOT be covered here... linted instead in runpod_gpu_prove.sh").
-cargo clippy -p jammi-kernels --all-targets --features cuda -- -D warnings	T3 (pod_seed_target.sh) — the exact esc-051 tuple. runpod_gpu_prove.sh carries a byte-identical twin, but see the HONEST RESIDUAL note above: neither of that script's two invocation chains is merge-path — green "wiring", dead on the path that gates merges.
+cargo clippy -p jammi-kernels --all-targets --features cuda -- -D warnings	T3 (pod_seed_target.sh) — the exact esc-051 tuple. `runpod_gpu_prove.sh` carried a byte-identical twin at the time esc-051 was filed; esc-081 REMOVED that twin from the prove lane entirely (the lane never needed a GPU to run clippy — `ci.yml`'s own hermetic `Clippy jammi-kernels --features flash-attn --all-targets` step is the merge-path twin today, see `check_lint_surface_closure.py`'s module doc). This row's own subject — the pod-seed T3 tuple itself — is unaffected and still off the merge path on its own terms (no hermetic runner carries the CUDA/CUTLASS toolchain it needs).
+
+# --- ci/scripts/runpod_gpu_prove.sh's own capability-surface build/proof
+# invocations (esc-081): these carried a SHELL-VARIABLE `--features` value
+# (`${cu12_features}`/`${ai_features}`) before esc-081, so they were
+# invisible to this gate's registry (a variable reference is not a gated
+# literal); esc-081 made every prove-lane invocation carry a LITERAL
+# `--features` tuple instead (proof surface == shipped surface,
+# `check_flash_attn_closure.py`'s own set-equality rule), which makes these
+# three tuples newly REGISTERED. Same off-merge-path residual as the LIVE
+# suites section below — see the HONEST RESIDUAL note above. ---
+cargo build --release -p jammi-server --bin jammi-server --features cuda,flash-attn,jetstream-broker,storage-cloud	runpod_gpu_prove.sh's capability-surface-build group — the shipped cu12-tarball server release build, now a literal tuple (esc-081) instead of a manifest-read shell variable.
+cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability --no-run	runpod_gpu_prove.sh's capability-surface-build group — compile-checks the jammi-ai capability-surface test binary at the full lane surface, now a literal tuple (esc-081).
+cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability capability_surface -- --nocapture 2>&1)"	runpod_gpu_prove.sh's capability-surface-proof group — the RAGGED normalization of a `cap_out="$(JAMMI_KERNELS_STRICT=1 cargo test ... 2>&1)"` command-substitution line: the extractor's env-assignment stripper consumes `cap_out="$(JAMMI_KERNELS_STRICT=1 ` as its fallback (non-quoted) branch (the surrounding `"..."` never closes before end-of-line with trailing content, so the quoted branch cannot match) and the trailing `2>&1)"` is NOT stripped by anything else — this exact ragged string, not the "obvious" clean reading, is what the registry actually holds.
 
 # --- ci/scripts/runpod_gpu_prove.sh's own LIVE suites (distinct from the
 # --no-run compile-checks above: these actually execute on the rented A100,
 # not merely compile). See the HONEST RESIDUAL note above for this script's
 # own two-caller chain (gpu-prove.yml directly, and _gpu-prove-gate.yml via
-# three release-tag-scoped workflows) — neither is merge-path. ---
-cargo test -p jammi-server --features cuda,live-gpu-tests --test it grpc_embedding_gpu -- --nocapture --test-threads=1	runpod_gpu_prove.sh's served client/server GPU proof — needs a real A100.
-cargo test -p jammi-ai --features cuda,live-gpu-tests --test gpu_capability -- --nocapture --test-threads=1 --skip capability_surface	runpod_gpu_prove.sh's engine-core GPU correctness suite (campaign #443: skips capability_surface here — that test hard-requires JAMMI_KERNELS_STRICT=1 and runs in the script's own dedicated strict capability group instead) — same residual as the row above.
-cargo run -p jammi-bench --release --features cuda -- gpu-inference-scale	runpod_gpu_prove.sh's recorded-observability GPU embedding perf run (own comment: "non-gating") — same residual; this row exists for completeness, not because it was ever meant to gate a merge.
-cargo test -p jammi-kernels --features cuda -- --nocapture --test-threads=1	runpod_gpu_prove.sh's live `cuda_parity` run — same residual as the T2/`--no-run` compile-check row above, but the executed (not merely compiled) form.
+# three release-tag-scoped workflows) — neither is merge-path. Every literal
+# below is esc-081's widened prove_lane surface (K4: the served proof now
+# runs the shipped attention surface; the kernels/engine-core suites widen
+# to `cuda,flash-attn` per the manifest's own `prove_lane.crates` declared
+# pairs). ---
+cargo test -p jammi-server --features cuda,flash-attn,jetstream-broker,live-gpu-tests,storage-cloud --test it grpc_embedding_gpu -- --nocapture --test-threads=1	runpod_gpu_prove.sh's served client/server GPU proof — needs a real A100.
+cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability -- --nocapture --test-threads=1 --skip capability_surface	runpod_gpu_prove.sh's engine-core GPU correctness suite (campaign #443: skips capability_surface here — that test hard-requires JAMMI_KERNELS_STRICT=1 and runs in the script's own dedicated strict capability group instead) — same residual as the row above.
+cargo run -p jammi-bench --release --features cuda,flash-attn -- gpu-inference-scale	runpod_gpu_prove.sh's recorded-observability GPU embedding perf run (own comment: "non-gating") — same residual; this row exists for completeness, not because it was ever meant to gate a merge.
+cargo test -p jammi-kernels --features cuda,flash-attn -- --nocapture --test-threads=1	runpod_gpu_prove.sh's live `cuda_parity` run — same residual as the T2/`--no-run` compile-check row above, but the executed (not merely compiled) form; also the only lane that can compile the flash-gated `cuda_parity` items and the `flash_smoke` target now that this tuple carries `flash-attn`.
 
 # --- ci/scripts/perf/pod_build_timings.sh — the A2 pod-build-timings
 # artifact producer (docs/maintainer/pod-build-guide.md §6). Operator-run on

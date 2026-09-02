@@ -77,12 +77,47 @@ Exit 0 = property holds; 1 = a leak/mismatch (or a broken control); 2 = usage/me
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import prove_surface  # noqa: E402
+from check_execution_surface_reachability import (  # noqa: E402
+    _drop_comment_lines,
+    _join_line_continuations,
+    discover_all_tuples,
+    extract_tuples_from_line,
+    is_gated,
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MANIFEST_PATH = REPO_ROOT / "ci" / "release-feature-manifest.json"
+
+# esc-081 scope map (ENUMERATED, never open-ended): every cuda-bearing
+# (`is_gated`) tuple discovered anywhere under `ci/scripts/**` must live in
+# exactly one of these two sets, or the gate FAILS it as unlisted.
+PROVE_SCOPE = frozenset({"ci/scripts/runpod_gpu_prove.sh"})
+
+_PERF_PRODUCER_REASON = "perf producer, not a proof lane"
+EXEMPT_SCOPE: dict[str, str] = {
+    "ci/scripts/pod_seed_target.sh": (
+        "seed cache lane: T1 precedes CUTLASS provisioning, T1/T1b main-only "
+        "split — a dedicated tuple-lockstep follow-up is tracked separately, "
+        "not this gate's job to resolve"
+    ),
+    "ci/scripts/perf/finetune_ab.sh": _PERF_PRODUCER_REASON,
+    "ci/scripts/perf/finetune_run_ab.sh": _PERF_PRODUCER_REASON,
+    "ci/scripts/perf/encode_ab.sh": _PERF_PRODUCER_REASON,
+    "ci/scripts/perf/gpu_inference_ab.sh": _PERF_PRODUCER_REASON,
+    "ci/scripts/perf/fa2_ab.sh": _PERF_PRODUCER_REASON,
+    "ci/scripts/perf/clip_artifact_producer.sh": _PERF_PRODUCER_REASON,
+    "ci/scripts/perf/pod_build_timings.sh": _PERF_PRODUCER_REASON,
+    "ci/scripts/perf/stacked_sweep.sh": _PERF_PRODUCER_REASON,
+}
+
+_PROVE_TUPLE_RE = re.compile(r'^echo\s+"PROVE_TUPLE crate=(\S+) kind=(\S+) features=(.*)"\s*$')
 
 ROOT = "jammi-server"
 TARGET_PKG = "jammi-kernels"
@@ -480,6 +515,170 @@ def verdict(graph: Graph, lanes: dict[str, dict], verbose: bool = True) -> int:
     return rc
 
 
+# --------------------------------------------------------------------------- #
+# esc-081: proof surface == shipped surface.
+#
+# The manifest's `prove_lane.crates.<c>.kinds` DECLARES the exact
+# `(crate, kind)` pairs `ci/scripts/runpod_gpu_prove.sh` must invoke; this
+# section asserts SET EQUALITY between that declaration and the script's own
+# `PROVE_TUPLE crate=<c> kind=<k> features=<literal>`-echoed invocations, and
+# separately enforces the closed cuda-tuple scope map (PROVE_SCOPE /
+# EXEMPT_SCOPE) over EVERY gated tuple `discover_all_tuples` finds anywhere
+# under `ci/scripts/**`.
+# --------------------------------------------------------------------------- #
+
+
+def _scan_prove_tuple_pairs(path: Path) -> list[dict]:
+    """Every `(PROVE_TUPLE echo, cargo invocation)` pairing in `path`: walks
+    logical lines (the SAME comment-stripped, continuation-joined pipeline
+    `discover_all_tuples` uses, so "what counts as an invocation line" can
+    never silently diverge between the two), remembering the LAST-seen
+    `PROVE_TUPLE` echo and pairing it with the very NEXT cargo invocation
+    line. A cargo invocation with no unconsumed preceding echo pairs with
+    `crate=None` (an UNLISTED pair)."""
+    text = path.read_text(encoding="utf-8")
+    pending: tuple[str, str, str] | None = None
+    out: list[dict] = []
+    for lineno, logical in _join_line_continuations(_drop_comment_lines(text)):
+        stripped = logical.strip()
+        m = _PROVE_TUPLE_RE.match(stripped)
+        if m:
+            pending = (m.group(1), m.group(2), m.group(3))
+            continue
+        for t in extract_tuples_from_line(logical):
+            actual_m = re.search(r"(?:--features|-F)[=\s]+(\S+)", t)
+            actual_features = actual_m.group(1).strip("\"'") if actual_m else ""
+            out.append(
+                {
+                    "crate": pending[0] if pending else None,
+                    "kind": pending[1] if pending else None,
+                    "echoed_features": pending[2] if pending else None,
+                    "actual_features": actual_features,
+                    "tuple": t,
+                    "lineno": lineno,
+                }
+            )
+            pending = None
+    return out
+
+
+def check_prove_surface(manifest: dict, repo_root: Path = REPO_ROOT, verbose: bool = True) -> int:
+    """Returns 0 (property holds) or 1 (a scope-map or set-equality
+    violation)."""
+    rc = 0
+    registry = discover_all_tuples(repo_root)
+
+    # --- scope map: every GATED tuple's every origin must be PROVE_SCOPE or
+    # EXEMPT_SCOPE; an exempt entry with no gated tuple left is DEAD.
+    exempt_hit: dict[str, bool] = {p: False for p in EXEMPT_SCOPE}
+    for tuple_text, rec in registry.items():
+        if not is_gated(tuple_text):
+            continue
+        for origin in rec.origins:
+            origin_path = origin.rsplit(":", 1)[0]
+            if origin_path in PROVE_SCOPE:
+                continue
+            if origin_path in EXEMPT_SCOPE:
+                exempt_hit[origin_path] = True
+                continue
+            if verbose:
+                print(
+                    f"FAIL: {origin} carries a cuda-bearing tuple (`{tuple_text}`) that is "
+                    f"neither in PROVE_SCOPE nor EXEMPT_SCOPE — exempt by decision, never by "
+                    f"silence",
+                    file=sys.stderr,
+                )
+            rc = 1
+    for path_str, hit in exempt_hit.items():
+        if not hit:
+            if verbose:
+                print(
+                    f"FAIL: EXEMPT_SCOPE entry `{path_str}` no longer carries any cuda-bearing "
+                    f"tuple — dead exempt entry, delete the row",
+                    file=sys.stderr,
+                )
+            rc = 1
+
+    # --- set equality: declared (crate, kind) pairs vs. the prove script's
+    # own PROVE_TUPLE-paired invocations.
+    declared = prove_surface.declared_pairs(manifest)
+    if not declared:
+        if verbose:
+            print("FAIL: manifest has no `prove_lane.crates` pairs to prove", file=sys.stderr)
+        return 1
+
+    seen_pairs: dict[tuple[str, str], str] = {}
+    for prove_file in sorted(PROVE_SCOPE):
+        fpath = repo_root / prove_file
+        if not fpath.is_file():
+            if verbose:
+                print(f"FAIL: PROVE_SCOPE names `{prove_file}`, which does not exist", file=sys.stderr)
+            rc = 1
+            continue
+        for pair in _scan_prove_tuple_pairs(fpath):
+            crate, kind = pair["crate"], pair["kind"]
+            if crate is None:
+                if is_gated(pair["tuple"]):
+                    if verbose:
+                        print(
+                            f"FAIL: {prove_file}:{pair['lineno']}: cuda-bearing invocation "
+                            f"`{pair['tuple']}` has no preceding PROVE_TUPLE echo — an "
+                            f"unlisted pair",
+                            file=sys.stderr,
+                        )
+                    rc = 1
+                continue
+            if pair["echoed_features"] != pair["actual_features"]:
+                if verbose:
+                    print(
+                        f"FAIL: {prove_file}:{pair['lineno']}: PROVE_TUPLE echo says "
+                        f"features={pair['echoed_features']!r} but the invocation's own "
+                        f"--features is {pair['actual_features']!r} — echo/tuple disagree",
+                        file=sys.stderr,
+                    )
+                rc = 1
+            try:
+                expected_feats = prove_surface.expected(crate, kind, manifest, repo_root)
+            except ValueError as e:
+                if verbose:
+                    print(f"FAIL: {prove_file}:{pair['lineno']}: {e}", file=sys.stderr)
+                rc = 1
+                continue
+            expected_text = prove_surface.feature_text(expected_feats)
+            if pair["actual_features"] != expected_text:
+                if verbose:
+                    print(
+                        f"FAIL: {prove_file}:{pair['lineno']}: ({crate}, {kind}) carries "
+                        f"features={pair['actual_features']!r} but the manifest-declared "
+                        f"expected surface is {expected_text!r}",
+                        file=sys.stderr,
+                    )
+                rc = 1
+            key = (crate, kind)
+            if key in seen_pairs and seen_pairs[key] != pair["actual_features"]:
+                if verbose:
+                    print(
+                        f"FAIL: {prove_file}:{pair['lineno']}: ({crate}, {kind}) appears with "
+                        f"a DIFFERENT literal ({pair['actual_features']!r}) than an earlier "
+                        f"invocation of the SAME pair ({seen_pairs[key]!r})",
+                        file=sys.stderr,
+                    )
+                rc = 1
+            seen_pairs[key] = pair["actual_features"]
+
+    missing = declared - set(seen_pairs)
+    extra = set(seen_pairs) - declared
+    if missing:
+        if verbose:
+            print(f"FAIL: declared prove_lane pair(s) never invoked: {sorted(missing)}", file=sys.stderr)
+        rc = 1
+    if extra:
+        if verbose:
+            print(f"FAIL: invoked (crate, kind) pair(s) the manifest never declared: {sorted(extra)}", file=sys.stderr)
+        rc = 1
+    return rc
+
+
 def _synthetic(ai_cuda: list[str], kernels_extra: dict | None = None) -> dict:
     kernels_features = {
         "default": [],
@@ -752,8 +951,200 @@ def self_test() -> int:
         "must not be silently exempted"
     )
 
+    _self_test_prove_surface()
+
     print("self-test: ok")
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# esc-081 self-test (F5): a `git init`'d ephemeral fixture repo -- NEVER this
+# checkout -- carrying the real jammi-{server,ai,bench,kernels} `[features]`
+# tables (so `prove_surface.declared()` reads real shapes) plus a minimal
+# `runpod_gpu_prove.sh` twin covering the six declared pairs, and every
+# EXEMPT_SCOPE path (each with one cuda-bearing tuple, so a clean fixture
+# never trips the dead-exempt-entry rule).
+# --------------------------------------------------------------------------- #
+
+_FIXTURE_CRATE_FEATURES = {
+    "jammi-server": ["cuda", "flash-attn", "jetstream-broker", "storage-cloud", "live-gpu-tests", "train"],
+    "jammi-ai": ["cuda", "flash-attn", "live-gpu-tests"],
+    "jammi-bench": ["cuda", "flash-attn"],
+    "jammi-kernels": ["cuda", "flash-attn", "default"],
+}
+
+_FIXTURE_MANIFEST = {
+    "lanes": {
+        "cu12-tarball": {
+            "cargo_features": ["cuda", "flash-attn", "jetstream-broker", "storage-cloud"],
+        }
+    },
+    "server_only_cargo_features": {"features": ["jetstream-broker", "storage-cloud"]},
+    "prove_lane": {
+        "crates": {
+            "jammi-server": {"kinds": ["release", "test"], "prove_only": ["live-gpu-tests"]},
+            "jammi-ai": {"kinds": ["test"], "prove_only": ["live-gpu-tests"]},
+            "jammi-bench": {"kinds": ["release"], "prove_only": []},
+            "jammi-kernels": {"kinds": ["default", "test"], "prove_only": []},
+        }
+    },
+}
+
+
+def _fixture_good_prove_script() -> str:
+    lines = [
+        "#!/usr/bin/env bash",
+        'echo "PROVE_TUPLE crate=jammi-server kind=release features=cuda,flash-attn,jetstream-broker,storage-cloud"',
+        "cargo build --release -p jammi-server --bin jammi-server --features cuda,flash-attn,jetstream-broker,storage-cloud",
+        'echo "PROVE_TUPLE crate=jammi-ai kind=test features=cuda,flash-attn,live-gpu-tests"',
+        "cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability --no-run",
+        'echo "PROVE_TUPLE crate=jammi-server kind=test features=cuda,flash-attn,jetstream-broker,live-gpu-tests,storage-cloud"',
+        "cargo test -p jammi-server --features cuda,flash-attn,jetstream-broker,live-gpu-tests,storage-cloud --test it grpc_embedding_gpu -- --nocapture",
+        'echo "PROVE_TUPLE crate=jammi-ai kind=test features=cuda,flash-attn,live-gpu-tests"',
+        "cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability -- --nocapture --skip capability_surface",
+        'echo "PROVE_TUPLE crate=jammi-kernels kind=default features="',
+        "cargo test -p jammi-kernels -- --nocapture",
+        'echo "PROVE_TUPLE crate=jammi-kernels kind=test features=cuda,flash-attn"',
+        "cargo test -p jammi-kernels --features cuda,flash-attn -- --nocapture",
+        'echo "PROVE_TUPLE crate=jammi-bench kind=release features=cuda,flash-attn"',
+        "cargo run -p jammi-bench --release --features cuda,flash-attn -- gpu-inference-scale",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _write_prove_surface_fixture(root: Path, script_body: str, manifest: dict | None = None) -> None:
+    manifest = manifest if manifest is not None else json.loads(json.dumps(_FIXTURE_MANIFEST))
+    (root / "ci" / "scripts" / "perf").mkdir(parents=True, exist_ok=True)
+    (root / "ci" / "release-feature-manifest.json").write_text(json.dumps(manifest))
+    (root / "ci" / "scripts" / "runpod_gpu_prove.sh").write_text(script_body)
+    (root / "ci" / "scripts" / "pod_seed_target.sh").write_text(
+        "#!/usr/bin/env bash\ncargo build --release -p jammi-bench --features cuda\n"
+    )
+    for perf_name in (
+        "finetune_ab.sh",
+        "finetune_run_ab.sh",
+        "encode_ab.sh",
+        "gpu_inference_ab.sh",
+        "fa2_ab.sh",
+        "clip_artifact_producer.sh",
+        "pod_build_timings.sh",
+        "stacked_sweep.sh",
+    ):
+        (root / "ci" / "scripts" / "perf" / perf_name).write_text(
+            "#!/usr/bin/env bash\ncargo build --release -p jammi-bench --features cuda\n"
+        )
+    for crate, feats in _FIXTURE_CRATE_FEATURES.items():
+        crate_dir = root / "crates" / crate
+        crate_dir.mkdir(parents=True, exist_ok=True)
+        feat_lines = "\n".join(f'{f} = []' for f in feats)
+        (crate_dir / "Cargo.toml").write_text(f"[package]\nname = \"{crate}\"\nversion = \"0.1.0\"\n\n[features]\n{feat_lines}\n")
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+
+
+def _run_prove_surface_fixture(script_body: str, manifest: dict | None = None) -> int:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _write_prove_surface_fixture(root, script_body, manifest)
+        m = manifest if manifest is not None else _FIXTURE_MANIFEST
+        return check_prove_surface(m, root, verbose=False)
+
+
+def _self_test_prove_surface() -> None:
+    good = _fixture_good_prove_script()
+
+    assert _run_prove_surface_fixture(good) == 0, "a well-formed fixture must be green"
+
+    # Lane minus flash-attn changes the verdict: the manifest's own lane no
+    # longer carries flash-attn, so every pair's expected surface shrinks --
+    # the UNCHANGED script now disagrees with the manifest.
+    m = json.loads(json.dumps(_FIXTURE_MANIFEST))
+    m["lanes"]["cu12-tarball"]["cargo_features"] = ["cuda", "jetstream-broker", "storage-cloud"]
+    assert _run_prove_surface_fixture(good, m) == 1, "lane minus flash-attn must change the verdict"
+
+    # Reverted literal: jammi-ai test invocation (both echo AND actual
+    # --features, kept mutually consistent) reverted to the pre-esc-081
+    # `cuda,live-gpu-tests` shape -- disagrees with the manifest-declared
+    # expected surface (cuda,flash-attn,live-gpu-tests).
+    reverted = good.replace(
+        'echo "PROVE_TUPLE crate=jammi-ai kind=test features=cuda,flash-attn,live-gpu-tests"\n'
+        "cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability --no-run",
+        'echo "PROVE_TUPLE crate=jammi-ai kind=test features=cuda,live-gpu-tests"\n'
+        "cargo test -p jammi-ai --features cuda,live-gpu-tests --test gpu_capability --no-run",
+    )
+    assert _run_prove_surface_fixture(reverted) == 1, "a reverted literal must FAIL"
+
+    # Echo/tuple disagree: the echo claims one literal, the invocation
+    # itself carries another.
+    disagree = good.replace(
+        'echo "PROVE_TUPLE crate=jammi-kernels kind=test features=cuda,flash-attn"\n'
+        "cargo test -p jammi-kernels --features cuda,flash-attn -- --nocapture",
+        'echo "PROVE_TUPLE crate=jammi-kernels kind=test features=cuda"\n'
+        "cargo test -p jammi-kernels --features cuda,flash-attn -- --nocapture",
+    )
+    assert _run_prove_surface_fixture(disagree) == 1, "echo/tuple disagreement must FAIL"
+
+    # New bare cargo line: an extra cuda-bearing invocation with no
+    # preceding PROVE_TUPLE echo at all -- an unlisted pair.
+    unlisted = good + "cargo test -p jammi-ai --features cuda -- --nocapture\n"
+    assert _run_prove_surface_fixture(unlisted) == 1, "a new bare unechoed cuda invocation must FAIL"
+
+    # Emptied manifest: prove_lane.crates has nothing to prove.
+    m2 = json.loads(json.dumps(_FIXTURE_MANIFEST))
+    m2["prove_lane"]["crates"] = {}
+    assert _run_prove_surface_fixture(good, m2) == 1, "an emptied prove_lane.crates must FAIL"
+
+    # Missing declared pair: drop the kernels-default invocation entirely --
+    # the manifest still declares it.
+    missing_pair = good.replace(
+        'echo "PROVE_TUPLE crate=jammi-kernels kind=default features="\n'
+        "cargo test -p jammi-kernels -- --nocapture\n",
+        "",
+    )
+    assert _run_prove_surface_fixture(missing_pair) == 1, "a declared pair the script never invokes must FAIL"
+
+    # Unlisted cuda-bearing script: a NEW ci/scripts/foo.sh (outside both
+    # PROVE_SCOPE and EXEMPT_SCOPE) carries a gated tuple.
+    with_stray_script = good  # base script unchanged; extra file added below
+
+    def _with_extra_file(rel: str, body: str):
+        def _augmented(root: Path, script_body: str, manifest):
+            _write_prove_surface_fixture(root, script_body, manifest)
+            p = root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(body)
+            subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+
+        return _augmented
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _with_extra_file("ci/scripts/foo.sh", "#!/usr/bin/env bash\ncargo test -p jammi-ai --features cuda\n")(
+            root, with_stray_script, None
+        )
+        rc = check_prove_surface(_FIXTURE_MANIFEST, root, verbose=False)
+        assert rc == 1, "a cuda tuple in an unlisted ci/scripts/foo.sh must FAIL"
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _with_extra_file(
+            "ci/scripts/perf/bar.sh", "#!/usr/bin/env bash\ncargo test -p jammi-ai --features cuda\n"
+        )(root, with_stray_script, None)
+        rc = check_prove_surface(_FIXTURE_MANIFEST, root, verbose=False)
+        assert rc == 1, "a cuda tuple in an unlisted ci/scripts/perf/bar.sh must FAIL (never silently exempt)"
+
+    # Dead exempt entry: pod_seed_target.sh loses its own cuda tuple.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _write_prove_surface_fixture(root, good, None)
+        (root / "ci" / "scripts" / "pod_seed_target.sh").write_text("#!/usr/bin/env bash\necho hi\n")
+        subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+        rc = check_prove_surface(_FIXTURE_MANIFEST, root, verbose=False)
+        assert rc == 1, "a dead EXEMPT_SCOPE entry (no cuda tuple left) must FAIL"
 
 
 def load_manifest_lanes_rejects_empty() -> bool:
@@ -793,6 +1184,8 @@ def main(argv: list[str]) -> int:
         return 2
     lanes = load_manifest_lanes()
     rc = verdict(graph, lanes)
+    full_manifest = prove_surface.load_manifest(MANIFEST_PATH)
+    rc |= check_prove_surface(full_manifest, REPO_ROOT)
     print("check_flash_attn_closure: " + ("PASS" if rc == 0 else "FAIL"))
     return rc
 

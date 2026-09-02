@@ -1,0 +1,33 @@
+# GPU-prove-timings R5 (surface-freshness) waiver allowlist
+# (check_gpu_prove_timings.py)
+#
+# Format: one row per line, `<arch><TAB><reviewed_up_to_sha><TAB><reason>` (a
+# literal TAB character). `#`-prefixed and blank lines are ignored.
+#
+# A row records "arch `<arch>` is deliberately accepted as carrying a STALE
+# `prove-lane` surface — its evidence's `expected_id` was last reviewed as
+# still sufficient through `<reviewed_up_to_sha>`, for `<reason>`". Scoped to
+# R5 (surface freshness) only — never R1-R4.
+#
+# Rot, checked mechanically on every run, all hard FAILs (same rot/dead-
+# waiver shape as `ci/scripts/arch_validation_freshness_allowlist.txt`):
+#   - `arch` is not one of `crates/jammi-kernels/build.rs`'s current
+#     `GENCODE_ARCHES`.
+#   - `reviewed_up_to_sha` is malformed, or not an ancestor of HEAD.
+#   - `arch` is NOT currently R5-stale at all (a DEAD waiver — delete the
+#     row once a fresh same-surface healthy artifact lands, or the surface
+#     reverts).
+#   - the prove-lane surface changed AGAIN after `reviewed_up_to_sha` (the
+#     waiver's own range no longer covers HEAD — bump `reviewed_up_to_sha`
+#     after re-review, or drop the arch and re-dispatch instead).
+#
+# Empty today, deliberately: no `prove-lane`-kind artifact exists yet for
+# ANY arch (esc-081 has not had its post-merge 4-pod dispatch run) — R5 is
+# EXPECTED RED until that dispatch lands the first four current-surface
+# healthy artifacts (see docs/maintainer/dev-gpu.md's own note on this
+# gate's standing operator cost: `expected_id` moves, and this gate reds
+# again, every time a lane feature is added/removed, a `prove_only` entry
+# changes, or a crate stops/starts declaring a lane feature). A waiver row
+# is the wrong tool for THAT gap — it exists for a genuinely reviewed,
+# time-boxed acceptance of staleness on ONE arch, never as a standing
+# substitute for the dispatch.

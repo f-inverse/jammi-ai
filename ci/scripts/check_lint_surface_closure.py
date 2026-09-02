@@ -12,10 +12,15 @@ compiled under nobody's `cargo clippy -D warnings` on the merge path: the
 one merge-path job that DID compile CUDA-feature code
 (`flash-attn-compile` in `ci.yml`) ran `cargo check`, not `clippy`, and
 never passed `--all-targets`/`--tests`, so it never even reached
-`cuda_parity.rs`; the one place that DID run the right `clippy` invocation
-(`runpod_gpu_prove.sh:78`) is wired only behind `gpu-prove.yml`'s
-`workflow_dispatch` / `pull_request: types: [labeled]` / nightly `schedule`
-triggers — never a trigger that fires on every PR-to-main. Four
+`cuda_parity.rs`; the one place that DID run the right `clippy` invocation —
+`runpod_gpu_prove.sh`'s own byte-identical twin — was wired only behind
+`gpu-prove.yml`'s `workflow_dispatch` / `pull_request: types: [labeled]` /
+nightly `schedule` triggers — never a trigger that fires on every
+PR-to-main. That twin has since been REMOVED from `runpod_gpu_prove.sh`
+entirely (esc-081: the prove lane never needed a GPU to run clippy); the
+merge-path coverage this gate's own module doc describes below (`ci.yml`'s
+hermetic `Clippy jammi-kernels --features flash-attn --all-targets` step) is
+now the ONLY place this exact invocation runs, never a second copy. Four
 `clippy::doc_lazy_continuation` lints landed in `cuda_parity.rs` (M2 audit
 round 6, commit b0c16192) and sat on `main` — every required merge-path
 check green — until they broke all four pods on the very next fresh-seed

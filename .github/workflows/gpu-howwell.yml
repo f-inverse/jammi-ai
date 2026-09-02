@@ -67,9 +67,12 @@ jobs:
     concurrency:
       group: gpu-howwell-${{ github.ref }}
       cancel-in-progress: false
-    # Mirrors gpu-prove.yml's own timeout derivation: RP_TIMEOUT (50m) plus
-    # up to 4 deploy candidates at RP_SSH_WAIT_SECS (600s) each = 40m worst
-    # case, well under this ceiling.
+    # This workflow sources runpod_lib.sh's own RP_TIMEOUT default directly
+    # (never runpod_gpu_prove.sh's esc-080 export, which raises that default
+    # to 100m for the prove lane specifically) -- own derivation, no longer a
+    # mirror of gpu-prove.yml's: RP_TIMEOUT (50m, library default) plus up to
+    # 4 deploy candidates (a100's own candidate-list length) at
+    # RP_SSH_WAIT_SECS (600s) each = 40m worst case, well under this ceiling.
     timeout-minutes: 100
     steps:
       - uses: actions/checkout@v4

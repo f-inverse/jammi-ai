@@ -34,7 +34,8 @@ surface is narrower than its engine surface:
   with the deterministic `tiny_modernbert` encoder — the same pairing the engine's own
   `storage_precision` integration tests use) writes exactly one segment. This chapter reads
   that fact back off the embedded engine's own SQLite catalog file — a real artifact the
-  running wheel wrote, never reimplemented — and recomputes the exact brute-force cosine
+  running wheel wrote, never reimplemented, read **after the engine handle was closed**
+  (see the catalog-ownership note below) — and recomputes the exact brute-force cosine
   ranking over the SAME vectors the table holds, live, right here, asserting it against the
   engine's own recorded `search` hits. "A freshly-built single-segment table's search is
   the exact top-k" is what "byte-identical to the pre-existing single-index behavior"
@@ -72,6 +73,28 @@ A single `generate_embeddings` pass over the 20-row `patents` fixture writes **e
 asserted by fiat. Its bundle carries the documented `{table}__seg0.*` naming (the dot-free
 discriminator the engine's own `segment::append_does_not_rebuild_prior_segments` test
 checks) and all three sidecar files an `F32` (no-rescore) segment writes.
+
+::: {.callout-important title="The catalog belongs to the engine while the engine is open"}
+Two facts about that read are worth copying, because the obvious shortcut is wrong.
+
+**One: there is no public surface for `index_segments` today.** Neither `db.sql(...)` (that
+is the DataFusion federation over Parquet result tables and external sources — the catalog's
+own SQLite tables are not registered in it) nor any `list_*` / `describe_*` verb nor any RPC
+exposes a table's segment set. `Catalog::list_index_segments` is a Rust-crate-level API with
+no SDK or wire binding. That is a real engine-surface gap, reported as one — the same honest
+negative this chapter applies to `append_segment`, not a hole papered over.
+
+**Two: so the cache reads the file — but only after closing the engine.** The engine's
+SQLite catalog opens through the `unix-excl` VFS with a heap-resident wal-index and no
+`-shm` file. A second SQLite *library instance in the same process* — which is exactly what
+CPython's separately-linked `sqlite3` module is — cannot see the engine's locks or its
+wal-index: its reads can be stale, and its close can checkpoint and truncate the `-wal` the
+engine still tracks. No engine-side seam can arbitrate locks it cannot see, so the contract
+is the caller's to keep: **close the engine, then touch the file.** This chapter's producer
+does exactly that, and proves the handover (`catalog.db-wal` gone) before it opens a
+read-only handle. Reaching for `sqlite3.connect(...)` beside a live engine is the bug this
+callout exists to stop you writing.
+:::
 
 ```{python}
 assert catalog["segment_count"] == 1, "a freshly-built table has exactly one segment"

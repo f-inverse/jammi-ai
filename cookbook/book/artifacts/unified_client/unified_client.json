@@ -96,10 +96,12 @@
       "import_embeddings",
       "infer",
       "list_channels",
+      "list_index_segments",
       "list_models",
       "list_mutable_tables",
       "list_sources",
       "list_topics",
+      "list_training_jobs",
       "predict_with_context_predictor",
       "propagate_embeddings",
       "publish_topic",
@@ -116,9 +118,10 @@
       "tenant",
       "tenant_scope",
       "train_context_predictor",
+      "training_job",
       "verify_materialization"
     ],
-    "verb_count": 50
+    "verb_count": 53
   },
   "taxonomy": {
     "embedded_bad_arg": {

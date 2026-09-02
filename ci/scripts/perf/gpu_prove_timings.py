@@ -277,6 +277,7 @@ def build_artifact(
     outcome: str | None = None,
     box: str | None = None,
     driver: str | None = None,
+    allow_incomplete: bool = False,
 ) -> dict:
     parsed = parse_log(log_text, legacy)
     git_sha = git_sha or parsed["git_sha"]
@@ -301,16 +302,62 @@ def build_artifact(
         source = "job-log"
         groups = parsed["groups"]
         if outcome is None:
+            # BLOCK B audit fix: the original `else` arm labelled EVERY
+            # "PROVE_EXIT absent" case `budget-cut`, even a genuinely
+            # healthy log whose gating rc's just happened to be 0 with no
+            # PROVE_EXIT line for some other reason, and a log whose
+            # gating groups were simply never populated (a truncated log,
+            # not a cut) -- neither is actually a budget-cut. The real
+            # discriminators are: did the remote reach its own final
+            # `PROVE_EXIT=` line at all, do EVERY gating group's markers
+            # exist, do they all read rc=0, and does the log carry the
+            # driver's own BUDGET diagnostic (`rp_run_remote_watched`'s
+            # own 124-cut evidence, printed only on a genuine ssh-status-124
+            # cut with no PROVE_EXIT reached).
+            gating_names = CURRENT_GROUP_NAMES - {"device", "bench"}
             group_names = {g["name"] for g in groups}
-            gating_ok = CURRENT_GROUP_NAMES - {"device", "bench"} <= group_names and all(
-                g["rc"] == 0 for g in groups if g["name"] in CURRENT_GROUP_NAMES - {"device", "bench"}
+            all_gating_present = gating_names <= group_names
+            all_gating_pass = all_gating_present and all(
+                g["rc"] == 0 for g in groups if g["name"] in gating_names
             )
-            if parsed["prove_exit"] == 0 and gating_ok:
-                outcome = "healthy"
-            elif parsed["prove_exit"] not in (None, 0):
-                outcome = "suite-fail"
+            has_prove_exit = parsed["prove_exit"] is not None
+            has_budget_evidence = "BUDGET" in log_text
+            has_no_progress_evidence = "NO PROGRESS" in log_text
+
+            if has_prove_exit:
+                if parsed["prove_exit"] == 0 and all_gating_present and all_gating_pass:
+                    outcome = "healthy"
+                elif not all_gating_present:
+                    # PROVE_EXIT was reached, but at least one gating group
+                    # never got its own marker -- the log is TRUNCATED
+                    # (missing content), not a real suite outcome. Never a
+                    # silent guess: refuse without an explicit opt-in.
+                    if not allow_incomplete:
+                        raise ValueError(
+                            "PROVE_EXIT is present but at least one gating group's marker is "
+                            "missing -- the log looks TRUNCATED/incomplete, not a real outcome; "
+                            "pass --allow-incomplete to write it as `log-incomplete` anyway, or "
+                            "pass a real --outcome"
+                        )
+                    outcome = "log-incomplete"
+                else:
+                    # PROVE_EXIT present, every gating group has a marker,
+                    # but at least one is non-zero (or PROVE_EXIT itself is
+                    # non-zero) -- a genuine in-suite failure.
+                    outcome = "suite-fail"
+            elif has_budget_evidence:
+                outcome = "budget-cut"
+            elif has_no_progress_evidence:
+                outcome = "watchdog-kill"
             else:
-                outcome = "budget-cut"  # a cut/kill with no PROVE_EXIT observed
+                # No PROVE_EXIT, no BUDGET line, no NO-PROGRESS line -- the
+                # log gives no honest basis to pick an outcome. Refuse
+                # rather than default to a specific guess.
+                raise ValueError(
+                    "cannot auto-derive an outcome: no PROVE_EXIT= line, and neither a BUDGET "
+                    "nor a NO PROGRESS driver diagnostic was found in the log -- pass --outcome "
+                    "explicitly"
+                )
 
     artifact: dict = {
         "schema_version": SCHEMA_VERSION,
@@ -323,7 +370,14 @@ def build_artifact(
             "group and the short post-job cleanup tail after the driver's",
             "own exit echo, neither of which belongs to the prove lane's",
             "own wall or silence accounting. `max_silent_gap_s` is computed",
-            "over the SAME window.",
+            "over the SAME window -- EXCEPT on a `watchdog-kill` outcome,",
+            "where the observed silence is, BY DEFINITION, right-censored",
+            "at RP_INACTIVITY (the kill fires the moment that threshold is",
+            "crossed, so the TRUE gap the process would have gone on to",
+            "produce is unknown and >= this value): recorded as",
+            "`silent_gap_lower_bound_s` instead, never as `max_silent_gap_s`",
+            "-- R2 (check_gpu_prove_timings.py) consumes HEALTHY artifacts",
+            "ONLY for exactly this reason, never a kill's own censored value.",
         ],
         "arch": arch,
         "box": box,
@@ -334,11 +388,14 @@ def build_artifact(
         "source": source,
         "surface": surface,
         "outcome": outcome,
-        "max_silent_gap_s": parsed["max_silent_gap_s"],
         "max_silent_gap_after": parsed["max_silent_gap_after"],
         "groups": groups,
         "disposition": None,
     }
+    if outcome == "watchdog-kill":
+        artifact["silent_gap_lower_bound_s"] = parsed["max_silent_gap_s"]
+    else:
+        artifact["max_silent_gap_s"] = parsed["max_silent_gap_s"]
     if outcome == "healthy":
         artifact["wall_s"] = parsed["wall_s"]
     else:
@@ -369,9 +426,36 @@ def _synth_log(lines: list[str]) -> str:
     return "\n".join(out) + "\n"
 
 
+# The manifest's own `prove_lane.crates` declared (crate, kind) -> literal
+# feature-text pairs, used to emit the SEVEN real PROVE_TUPLE echoes a
+# healthy leg actually carries (round-2 audit advisory #3: the self-test's
+# healthy log must carry them and assert `expected_id ==
+# prove_surface.current_expected_id()`, never a bare synthetic sha).
+_SELF_TEST_TUPLES = [
+    ("jammi-server", "release"),
+    ("jammi-ai", "test"),
+    ("jammi-server", "test"),
+    ("jammi-ai", "test"),  # engine-core-sweep -- same (crate,kind), same literal
+    ("jammi-kernels", "default"),
+    ("jammi-kernels", "test"),
+    ("jammi-bench", "release"),
+]
+_SELF_TEST_GROUP_FOR_TUPLE = [
+    "capability-surface-build",
+    "capability-surface-build",
+    "served-client-server-proof",
+    "engine-core-sweep",
+    "kernels-default",
+    "kernels-cuda",
+    "bench",
+]
+
+
 def _healthy_synth_log() -> str:
+    manifest = prove_surface.load_manifest()
     lines = ["##[group]device", "name, compute_cap, driver_version", "NVIDIA A100 80GB PCIe, 8.0, 570.195.03", "CUDA_COMPUTE_CAP=80", "##[endgroup]"]
     lines += ["PROVE_SHA=" + "a" * 40]
+    tuple_idx = 0
     for name in (
         "capability-surface-build",
         "capability-surface-proof",
@@ -381,9 +465,17 @@ def _healthy_synth_log() -> str:
         "kernels-cuda",
     ):
         lines.append(f"##[group]{name}")
+        while tuple_idx < len(_SELF_TEST_GROUP_FOR_TUPLE) and _SELF_TEST_GROUP_FOR_TUPLE[tuple_idx] == name:
+            crate, kind = _SELF_TEST_TUPLES[tuple_idx]
+            feats = prove_surface.feature_text(prove_surface.expected(crate, kind, manifest))
+            lines.append(f"PROVE_TUPLE crate={crate} kind={kind} features={feats}")
+            tuple_idx += 1
         lines.append(f"PROVE_GROUP_RC name={name} rc=0")
         lines.append("##[endgroup]")
     lines.append("##[group]bench")
+    crate, kind = _SELF_TEST_TUPLES[tuple_idx]
+    feats = prove_surface.feature_text(prove_surface.expected(crate, kind, manifest))
+    lines.append(f"PROVE_TUPLE crate={crate} kind={kind} features={feats}")
     lines.append("BENCH_EXIT=1")
     lines.append("PROVE_GROUP_RC name=bench rc=1")
     lines.append("##[endgroup]")
@@ -402,6 +494,53 @@ def _cut_synth_log() -> str:
     # engine-core-sweep is cut mid-flight -- opened, never closed, no marker.
     lines.append("##[group]engine-core-sweep")
     lines.append("Compiling jammi-kernels v0.48.0")
+    # The driver's own BUDGET diagnostic (rp_run_remote_watched's real
+    # output on a genuine ssh-status-124 cut with no PROVE_EXIT reached) --
+    # BLOCK B audit fix: without this evidence in the log, `budget-cut` can
+    # no longer be auto-derived at all (the producer now refuses to guess).
+    lines.append('=== GPU prove: BUDGET (RP_TIMEOUT=6000s) cut group "engine-core-sweep"; groups: [capability-surface-build:0,capability-surface-proof:0,served-client-server-proof:0] ===')
+    return _synth_log(lines)
+
+
+def _suite_fail_synth_log() -> str:
+    lines = ["##[group]device", "name, compute_cap, driver_version", "NVIDIA A100 80GB PCIe, 8.0, 570.195.03", "CUDA_COMPUTE_CAP=80", "##[endgroup]"]
+    lines += ["PROVE_SHA=" + "c" * 40]
+    for name, rc in (
+        ("capability-surface-build", 0),
+        ("capability-surface-proof", 0),
+        ("served-client-server-proof", 1),
+        ("engine-core-sweep", 0),
+        ("kernels-default", 0),
+        ("kernels-cuda", 0),
+    ):
+        lines.append(f"##[group]{name}")
+        lines.append(f"PROVE_GROUP_RC name={name} rc={rc}")
+        lines.append("##[endgroup]")
+    lines.append("PROVE_EXIT=1")
+    lines.append("=== GPU prove suites exit=1 (raw=1) ===")
+    return _synth_log(lines)
+
+
+def _log_incomplete_synth_log() -> str:
+    # PROVE_EXIT was reached, but kernels-cuda's own marker never landed --
+    # a TRUNCATED log (e.g. a producer bug, a partial download), never a
+    # genuine outcome to guess at.
+    lines = ["##[group]device", "name, compute_cap, driver_version", "NVIDIA A100 80GB PCIe, 8.0, 570.195.03", "CUDA_COMPUTE_CAP=80", "##[endgroup]"]
+    lines += ["PROVE_SHA=" + "d" * 40]
+    for name in ("capability-surface-build", "capability-surface-proof", "served-client-server-proof", "engine-core-sweep", "kernels-default"):
+        lines.append(f"##[group]{name}")
+        lines.append(f"PROVE_GROUP_RC name={name} rc=0")
+        lines.append("##[endgroup]")
+    lines.append("PROVE_EXIT=0")
+    return _synth_log(lines)
+
+
+def _watchdog_kill_synth_log() -> str:
+    lines = ["##[group]device", "name, compute_cap, driver_version", "NVIDIA A100 80GB PCIe, 8.0, 570.195.03", "CUDA_COMPUTE_CAP=80", "##[endgroup]"]
+    lines += ["PROVE_SHA=" + "e" * 40]
+    lines.append("##[group]kernels-cuda")
+    lines.append("Compiling jammi-kernels v0.48.0")
+    lines.append('=== GPU prove: NO PROGRESS for 600s in group "kernels-cuda"; groups: [] ===')
     return _synth_log(lines)
 
 
@@ -430,6 +569,15 @@ def _self_test() -> int:
     )
     bench_group = next(g for g in healthy_artifact["groups"] if g["name"] == "bench")
     check("healthy-bench-rc-recorded-non-gating", bench_group["rc"] == 1, f"{bench_group}")
+    # Round-2 audit advisory #3: the healthy self-test log carries the real
+    # PROVE_TUPLE echoes, and the resulting expected_id must equal the
+    # CURRENT manifest's own canonicalization -- never a bare synthetic sha
+    # standing in for a real surface fingerprint.
+    check(
+        "healthy-expected-id-matches-current-manifest",
+        healthy_artifact["surface"]["expected_id"] == prove_surface.current_expected_id(),
+        f"{healthy_artifact['surface']['expected_id']} vs {prove_surface.current_expected_id()}",
+    )
 
     cut_artifact = build_artifact(arch="sm_80", run_id="2", job_id="2", log_text=_cut_synth_log(), legacy=False)
     check("cut-outcome", cut_artifact["outcome"] == "budget-cut", f"{cut_artifact['outcome']}")
@@ -437,6 +585,23 @@ def _self_test() -> int:
     check("cut-no-wall-s", "wall_s" not in cut_artifact, "")
     cut_names = {g["name"] for g in cut_artifact["groups"]}
     check("cut-engine-core-sweep-not-closed", "engine-core-sweep" not in cut_names, f"{cut_names}")
+
+    # BLOCK B audit fix -- the three-way `else`-arm split.
+    suite_fail_artifact = build_artifact(arch="sm_80", run_id="3", job_id="3", log_text=_suite_fail_synth_log(), legacy=False)
+    check("suite-fail-outcome", suite_fail_artifact["outcome"] == "suite-fail", f"{suite_fail_artifact['outcome']}")
+
+    try:
+        build_artifact(arch="sm_80", run_id="4", job_id="4", log_text=_log_incomplete_synth_log(), legacy=False)
+        check("log-incomplete-refused-without-flag", False, "expected a ValueError")
+    except ValueError:
+        check("log-incomplete-refused-without-flag", True)
+    incomplete_artifact = build_artifact(
+        arch="sm_80", run_id="4", job_id="4", log_text=_log_incomplete_synth_log(), legacy=False, allow_incomplete=True
+    )
+    check("log-incomplete-outcome-with-flag", incomplete_artifact["outcome"] == "log-incomplete", f"{incomplete_artifact['outcome']}")
+
+    watchdog_artifact = build_artifact(arch="sm_80", run_id="5", job_id="5", log_text=_watchdog_kill_synth_log(), legacy=False)
+    check("watchdog-kill-outcome", watchdog_artifact["outcome"] == "watchdog-kill", f"{watchdog_artifact['outcome']}")
 
     if failures:
         print(f"self-test: FAIL ({len(failures)}/{total} failing): {failures}", file=sys.stderr)
@@ -454,10 +619,20 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--run-id", required=True)
     ap.add_argument("--job-id", required=True)
     ap.add_argument("--git-sha")
-    ap.add_argument("--outcome", choices=["healthy", "budget-cut", "watchdog-kill", "suite-fail", "capacity"])
+    ap.add_argument(
+        "--outcome",
+        choices=["healthy", "budget-cut", "watchdog-kill", "suite-fail", "capacity", "log-incomplete"],
+    )
     ap.add_argument("--box")
     ap.add_argument("--driver")
     ap.add_argument("--legacy", action="store_true")
+    ap.add_argument(
+        "--allow-incomplete",
+        action="store_true",
+        help="Permit writing a `log-incomplete` artifact (PROVE_EXIT reached but a gating "
+        "group's marker is missing) -- refused by default so a truncated log is never "
+        "silently written as if it were a real outcome.",
+    )
     ap.add_argument("--out", type=Path)
     args = ap.parse_args(argv)
 
@@ -473,6 +648,7 @@ def main(argv: list[str]) -> int:
             outcome=args.outcome,
             box=args.box,
             driver=args.driver,
+            allow_incomplete=args.allow_incomplete,
         )
     except ValueError as e:
         print(f"ERROR: {e}", file=sys.stderr)

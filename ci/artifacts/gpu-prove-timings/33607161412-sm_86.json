@@ -14,6 +14,7 @@
   "box": "NVIDIA A40",
   "disposition": {
     "evidence": {
+      "followup_run_id": "33534587437",
       "job_id": "100173672107",
       "last_output_at": "2026-09-02T09:02:52.0077755Z"
     },

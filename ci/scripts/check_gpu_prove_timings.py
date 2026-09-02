@@ -83,13 +83,20 @@ RUNPOD_PROVE_REL = "ci/scripts/runpod_gpu_prove.sh"
 # `--outcome` argparse `choices`) -- an unrecognized value (a typo, a
 # renamed value on one side only) is a schema FAIL, never silently ignored.
 # Of these, only `budget-cut`/`watchdog-kill` need an R4 disposition
-# (a genuine cut/kill whose cause is undetermined without one); `healthy`
-# needs none by definition, and `suite-fail`/`capacity` need none EITHER --
-# a suite failure names its own cause in the leg's own suite output, and a
-# capacity skip (exit 75) is a supply condition, not a hang/cut requiring a
-# hand-reviewed disposition.
-OUTCOME_VALUES = frozenset({"healthy", "budget-cut", "watchdog-kill", "suite-fail", "capacity"})
+# (a genuine cut/kill whose cause is undetermined without one); `healthy`,
+# `suite-fail`, `capacity`, and `log-incomplete` need NONE, and a
+# `disposition` present on any of those four is ITSELF a schema FINDING
+# (round-2 audit fix: a disposition exists to explain an UNDETERMINED
+# cut/kill cause -- attaching one to an outcome that already has a
+# determined, self-explaining cause is either a bug in the producer or a
+# hand-edited artifact papering over a real finding). `suite-fail` names its
+# own cause in the leg's own suite output; `capacity` (exit 75) is a supply
+# condition, not a hang/cut; `log-incomplete` (BLOCK B) is a truncated log,
+# not a real outcome to disposition at all -- it needs a fresh run, not a
+# reviewed explanation.
+OUTCOME_VALUES = frozenset({"healthy", "budget-cut", "watchdog-kill", "suite-fail", "capacity", "log-incomplete"})
 OUTCOMES_NEEDING_DISPOSITION = frozenset({"budget-cut", "watchdog-kill"})
+OUTCOMES_FORBIDDING_DISPOSITION = OUTCOME_VALUES - OUTCOMES_NEEDING_DISPOSITION
 
 _GIT_NO_BACKGROUND_MAINTENANCE = ("-c", "gc.auto=0", "-c", "gc.autoDetach=false", "-c", "maintenance.auto=false")
 
@@ -127,11 +134,16 @@ def _tracked_files(repo_root: Path) -> list[str]:
     return out.stdout.splitlines()
 
 
-def scan_setters(repo_root: Path = REPO_ROOT) -> list[tuple[str, str, int]]:
-    """Every `(relpath, var, lineno)` matching the setter predicate,
-    REGARDLESS of the allowlist -- callers filter against
-    `ALLOWED_SETTER_SITES`."""
-    found: list[tuple[str, str, int]] = []
+def scan_setters(repo_root: Path = REPO_ROOT) -> list[tuple[str, str, int, str]]:
+    """Every `(relpath, var, lineno, line_text)` matching the setter
+    predicate, REGARDLESS of the allowlist -- callers filter against
+    `ALLOWED_SETTER_SITES`. `line_text` (the comment-stripped line itself)
+    lets a caller distinguish a genuine DEFAULT-setting assignment
+    (`VAR="${VAR:-N}"`) from a same-variable NORMALIZATION reassignment
+    (`VAR=$((10#$VAR))`, this file's own established base-10-parse
+    convention for every numeric env var it validates) -- the latter is not
+    a second source of truth for the default and must not count as one."""
+    found: list[tuple[str, str, int, str]] = []
     for rel in _tracked_files(repo_root):
         if rel.startswith("ci/scripts/"):
             regex = _SHELL_SETTER_RE
@@ -149,7 +161,7 @@ def scan_setters(repo_root: Path = REPO_ROOT) -> list[tuple[str, str, int]]:
         for lineno, line in enumerate(stripper(text).splitlines(), start=1):
             m = regex.match(line)
             if m:
-                found.append((rel, m.group(1), lineno))
+                found.append((rel, m.group(1), lineno, line))
     return found
 
 
@@ -208,11 +220,33 @@ def check_r1(repo_root: Path = REPO_ROOT) -> tuple[list[str], dict[str, int]]:
     else:
         defaults["rp_timeout"] = int(prove_m.group(1))
 
-    for rel, var, lineno in scan_setters(repo_root):
+    allowed_site_counts: dict[tuple[str, str], int] = {}
+    for rel, var, lineno, line_text in scan_setters(repo_root):
         if (rel, var) not in ALLOWED_SETTER_SITES:
             problems.append(
                 f"R1: {rel}:{lineno}: a committed RP_{var} setter outside the two allowed "
                 f"sites ({sorted(ALLOWED_SETTER_SITES)}) -- a hidden second source of truth"
+            )
+            continue
+        # Only a genuine DEFAULT-setting shape (`VAR="${VAR:-N}"` or
+        # `export VAR="${VAR:-N}"`) counts as an "assignment" for the
+        # count==1 rule below -- a same-variable NORMALIZATION reassignment
+        # (`VAR=$((10#$VAR))`, this file's own established base-10-parse
+        # convention, e.g. RP_TTL_HOURS/RP_SSH_WAIT_SECS/RP_INACTIVITY all
+        # do this) sets NO competing default and must not be miscounted as
+        # a second source of truth.
+        if re.search(rf'RP_{var}="\$\{{RP_{var}:-', line_text):
+            allowed_site_counts[(rel, var)] = allowed_site_counts.get((rel, var), 0) + 1
+
+    # A SECOND default-setting assignment of the same var in an otherwise-
+    # allowed file is itself a hidden second source of truth (round-2 audit
+    # fix): the allowlist names exactly ONE legitimate default-setting site
+    # per (file, var), not "as many as happen to live in that file".
+    for (rel, var), count in allowed_site_counts.items():
+        if count != 1:
+            problems.append(
+                f"R1: {rel} has {count} RP_{var} DEFAULT-setting assignment(s) (expected "
+                f"exactly 1) -- a second one is still a hidden second source of truth"
             )
 
     return problems, defaults
@@ -256,6 +290,30 @@ def check_schema(artifacts: list[dict]) -> list[str]:
                 f"schema: run {a.get('run_id')}/{a.get('arch')}: healthy outcome must not carry "
                 f"`wall_lower_bound_s`"
             )
+        if outcome in OUTCOMES_FORBIDDING_DISPOSITION and a.get("disposition") is not None:
+            problems.append(
+                f"schema: run {a.get('run_id')}/{a.get('arch')}: outcome={outcome!r} carries a "
+                f"`disposition`, but only {sorted(OUTCOMES_NEEDING_DISPOSITION)} outcomes may -- "
+                f"a determined-cause outcome does not need (or accept) one"
+            )
+        if outcome == "watchdog-kill":
+            if "max_silent_gap_s" in a:
+                problems.append(
+                    f"schema: run {a.get('run_id')}/{a.get('arch')}: watchdog-kill carries "
+                    f"`max_silent_gap_s`, but its own silence is right-censored at RP_INACTIVITY "
+                    f"-- must be recorded as `silent_gap_lower_bound_s` instead"
+                )
+            if "silent_gap_lower_bound_s" not in a:
+                problems.append(
+                    f"schema: run {a.get('run_id')}/{a.get('arch')}: watchdog-kill is missing "
+                    f"`silent_gap_lower_bound_s`"
+                )
+        elif "silent_gap_lower_bound_s" in a:
+            problems.append(
+                f"schema: run {a.get('run_id')}/{a.get('arch')}: outcome={outcome!r} carries "
+                f"`silent_gap_lower_bound_s`, which only a watchdog-kill's right-censored "
+                f"silence may use"
+            )
         surface = a.get("surface", {})
         if surface.get("kind") == "prove-lane" and a.get("git_sha") and surface.get("expected_id"):
             seen = by_sha.setdefault(a["git_sha"], set())
@@ -270,20 +328,26 @@ def check_schema(artifacts: list[dict]) -> list[str]:
 # R2 / R3
 # --------------------------------------------------------------------------- #
 def check_r2(artifacts: list[dict], defaults: dict[str, int]) -> list[str]:
+    # Round-2 audit fix: R2 consumes HEALTHY artifacts ONLY. A
+    # `watchdog-kill`'s own `silent_gap_lower_bound_s` is, by definition,
+    # right-censored at RP_INACTIVITY (the kill fires exactly when that
+    # threshold is crossed) -- feeding it back into the rule that SETS
+    # RP_INACTIVITY would be circular, and a `slow-host` disposition's own
+    # claim ("the host is just slow, not hung") is validated by its own
+    # required follow-up healthy artifact (see R4 below), which is what
+    # actually re-enters this margin -- never the kill's own censored value.
     problems: list[str] = []
     gaps = [
         a["max_silent_gap_s"]
         for a in artifacts
-        if "_load_error" not in a
-        and "max_silent_gap_s" in a
-        and (a.get("outcome") == "healthy" or (a.get("disposition") or {}).get("kind") == "slow-host")
+        if "_load_error" not in a and a.get("outcome") == "healthy" and "max_silent_gap_s" in a
     ]
     if not gaps:
         # VACUOUS, exactly like R3's own arch-coverage check -- a margin
         # with nothing to bound it against is never silently accepted as
-        # clean; it is a FAIL demanding at least one healthy or
-        # slow-host-disposed artifact before this rule can mean anything.
-        problems.append("R2: VACUOUS -- no healthy or slow-host-disposed artifact to bound RP_INACTIVITY against")
+        # clean; it is a FAIL demanding at least one healthy artifact
+        # before this rule can mean anything.
+        problems.append("R2: VACUOUS -- no healthy artifact to bound RP_INACTIVITY against")
         return problems
     max_gap = max(gaps)
     inactivity = defaults.get("rp_inactivity")
@@ -291,7 +355,7 @@ def check_r2(artifacts: list[dict], defaults: dict[str, int]) -> list[str]:
         return problems  # R1 already reported the missing default
     if inactivity < 3 * max_gap:
         problems.append(
-            f"R2: RP_INACTIVITY={inactivity} is below 3x the largest observed healthy/slow-host "
+            f"R2: RP_INACTIVITY={inactivity} is below 3x the largest observed HEALTHY "
             f"silent gap ({max_gap}s, need >= {3 * max_gap})"
         )
     return problems
@@ -345,6 +409,9 @@ def check_r3(artifacts: list[dict], defaults: dict[str, int], repo_root: Path = 
 # --------------------------------------------------------------------------- #
 def check_r4(artifacts: list[dict]) -> list[str]:
     problems: list[str] = []
+    healthy_run_ids = {
+        a.get("run_id") for a in artifacts if "_load_error" not in a and a.get("outcome") == "healthy"
+    }
     for a in artifacts:
         if "_load_error" in a:
             continue
@@ -363,6 +430,23 @@ def check_r4(artifacts: list[dict]) -> list[str]:
                 problems.append(f"R4: {label}: disposition.evidence missing `last_output_at`")
             if disp.get("kind") == "hang" and not evidence.get("issue"):
                 problems.append(f"R4: {label}: a 'hang' disposition requires disposition.evidence.issue")
+            if disp.get("kind") == "slow-host":
+                # Round-2 audit advisory: "the host is just slow, not hung"
+                # is a CLAIM about that host's real behavior -- it must cite
+                # the follow-up run that actually RE-MEASURED it healthy,
+                # never asserted on its own say-so.
+                followup = evidence.get("followup_run_id")
+                if not followup:
+                    problems.append(
+                        f"R4: {label}: a 'slow-host' disposition requires "
+                        f"disposition.evidence.followup_run_id naming the healthy artifact that "
+                        f"re-measured this host"
+                    )
+                elif followup not in healthy_run_ids:
+                    problems.append(
+                        f"R4: {label}: disposition.evidence.followup_run_id={followup!r} does not "
+                        f"name any committed HEALTHY artifact's run_id"
+                    )
     return problems
 
 
@@ -694,6 +778,20 @@ def _self_test() -> int:
             f"{r1}",
         )
 
+    # --- RP_WATCH_POLL_S (runpod_gpu_prove.sh's fixture/diagnostic-only
+    # poll-interval escape hatch) is NOT in the RP_(TIMEOUT|INACTIVITY)
+    # alternation and must never be flagged as a committed setter, even
+    # when assigned right next to a real one. ---
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        prove_with_poll = _GOOD_PROVE + 'rp_run_remote_watched "" "${RP_WATCH_POLL_S:-5}" <<REMOTE\nREMOTE\n'
+        _write_fixture_repo(root, lib_body=_GOOD_LIB, prove_body=prove_with_poll)
+        setters = scan_setters(root)
+        poll_hits = [s for s in setters if "WATCH_POLL" in s[1]]
+        check("rp_watch_poll_s_never_flagged", poll_hits == [], f"{setters}")
+        r1, _ = check_r1(root)
+        check("rp_watch_poll_s_r1_clean", not any("WATCH_POLL" in p for p in r1), f"{r1}")
+
     # --- deleted export (allowed site missing). ---
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -712,6 +810,72 @@ def _self_test() -> int:
     a2 = _healthy_artifact("sm_86", 2000.0, 100.0, git_sha="b" * 40, expected_id="id-two")
     schema_problems2 = check_schema([a1, a2])
     check("same-sha-disagreeing-expected-id-caught", any("DISAGREEING expected_id" in p for p in schema_problems2), f"{schema_problems2}")
+
+    # --- round-2 audit: a SECOND assignment of the same var in an
+    # otherwise-allowed file is still a hidden second source of truth. ---
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        double_lib = _GOOD_LIB + 'RP_INACTIVITY="${RP_INACTIVITY:-700}"\n'
+        _write_fixture_repo(root, lib_body=double_lib, prove_body=_GOOD_PROVE)
+        r1, _ = check_r1(root)
+        check(
+            "second-assignment-in-allowed-file-caught",
+            any("has 2 RP_INACTIVITY DEFAULT-setting assignment(s)" in p for p in r1),
+            f"{r1}",
+        )
+
+    # --- round-2 audit: outcome typo rejection. ---
+    typo = _healthy_artifact("sm_80", 2000.0, 100.0)
+    typo["outcome"] = "helthy"
+    typo_problems = check_schema([typo])
+    check("outcome-typo-rejected", any("is not one of the closed set" in p for p in typo_problems), f"{typo_problems}")
+
+    # --- round-2 audit: R2 vacuity arm (no HEALTHY artifact at all --
+    # only a budget-cut one, which R2 no longer consumes). ---
+    only_cut = _healthy_artifact("sm_80", 2000.0, 100.0)
+    only_cut["outcome"] = "budget-cut"
+    del only_cut["wall_s"]
+    only_cut["wall_lower_bound_s"] = 2000.0
+    r2_vacuous = check_r2([only_cut], {"rp_inactivity": 600})
+    check("r2-vacuous-with-no-healthy-artifact", any("VACUOUS" in p for p in r2_vacuous), f"{r2_vacuous}")
+
+    # --- round-2 audit: a disposition on a healthy/suite-fail/capacity/
+    # log-incomplete outcome is itself a schema finding. ---
+    for bad_outcome in ("healthy", "suite-fail", "capacity", "log-incomplete"):
+        art = _healthy_artifact("sm_80", 2000.0, 100.0)
+        art["outcome"] = bad_outcome
+        if bad_outcome != "healthy":
+            del art["wall_s"]
+            art["wall_lower_bound_s"] = 2000.0
+        art["disposition"] = {"kind": "slow-host", "evidence": {"job_id": "1", "last_output_at": "x", "followup_run_id": "1"}}
+        probs = check_schema([art])
+        check(
+            f"disposition-on-{bad_outcome}-rejected",
+            any("carries a `disposition`" in p for p in probs),
+            f"{probs}",
+        )
+
+    # --- round-2 audit: a slow-host disposition must cite a followup_run_id
+    # naming a committed HEALTHY artifact. ---
+    kill_no_followup = _healthy_artifact("sm_86", 2000.0, 100.0)
+    kill_no_followup["outcome"] = "watchdog-kill"
+    del kill_no_followup["wall_s"]
+    kill_no_followup["wall_lower_bound_s"] = 2000.0
+    del kill_no_followup["max_silent_gap_s"]
+    kill_no_followup["silent_gap_lower_bound_s"] = 600.0
+    kill_no_followup["disposition"] = {"kind": "slow-host", "evidence": {"job_id": "1", "last_output_at": "x"}}
+    r4_no_followup = check_r4([kill_no_followup])
+    check("slow-host-missing-followup-caught", any("followup_run_id" in p for p in r4_no_followup), f"{r4_no_followup}")
+
+    followup_healthy = _healthy_artifact("sm_86", 1900.0, 90.0)
+    followup_healthy["run_id"] = "followup-1"
+    kill_with_followup = dict(kill_no_followup)
+    kill_with_followup["disposition"] = {
+        "kind": "slow-host",
+        "evidence": {"job_id": "1", "last_output_at": "x", "followup_run_id": "followup-1"},
+    }
+    r4_with_followup = check_r4([kill_with_followup, followup_healthy])
+    check("slow-host-with-real-followup-clean", not any("followup_run_id" in p for p in r4_with_followup), f"{r4_with_followup}")
 
     if failures:
         print(f"self-test: FAIL ({len(failures)}/{total} failing): {failures}", file=sys.stderr)

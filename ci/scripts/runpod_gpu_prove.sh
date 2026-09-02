@@ -200,7 +200,17 @@ rp_deploy_arch "$RP_DEPLOY_ARCH" || exit $?
 
 echo "=== running GPU prove suites on ${RP_HOST}:${RP_PORT} ==="
 LOG="$(mktemp)"
-rp_run_remote_watched <<REMOTE | tee "$LOG"
+# RP_WATCH_POLL_S: FIXTURE/DIAGNOSTIC-ONLY escape hatch for
+# rp_run_remote_watched's own poll-interval parameter (default 5s). A real
+# leg never sets it (defaults to 5); test_gpu_prove_lane.sh's F7 sets it to
+# a sub-second value so the REAL executed exit path stays fast and
+# deterministic under its own watchdog scenarios, exactly like every other
+# fixture's own fast-poll argument. Deliberately named OUTSIDE
+# check_gpu_prove_timings.py's R1 setter-predicate alternation
+# (RP_(TIMEOUT|INACTIVITY) only) -- it is not a second source of truth for
+# either committed default, and R1's own self-test pins that it is never
+# flagged.
+rp_run_remote_watched "" "${RP_WATCH_POLL_S:-5}" <<REMOTE | tee "$LOG"
 export CARGO_TERM_COLOR=never
 export CARGO_BUILD_RUSTC_WRAPPER=  # wrapper-off (ledger row 17: no cross-target-dir reuse, ~+33% wall on this image)
 # Override the image's baked CUDA_COMPUTE_CAP with this leg's NATIVE arch.
@@ -326,7 +336,7 @@ echo "::endgroup::"
 # under JAMMI_KERNELS_STRICT=1. Never weaken capability_surface's own guard
 # and never set strict mode on this generic sweep to work around it — do the
 # opposite (name-exclude it from the one group that cannot satisfy its
-# precondition). Widened to include flash-attn (prove_lane's jammi-ai `test`
+# precondition). Widened to include flash-attn (prove_lane's jammi-ai \`test\`
 # pair) — this leg now also exercises the shipped flash cascade through the
 # engine-core suite, not only the dedicated capability-surface probe.
 echo "::group::engine-core-sweep"
@@ -341,7 +351,7 @@ echo "::endgroup::"
 # the x86_64 Linux run this pod is the only artifact for). prove_lane's own
 # \`default\` kind for jammi-kernels -- canonicalizes to no \`--features\` flag
 # at all, so it carries no gated tuple and needs no PROVE_TUPLE echo for
-# `is_gated` purposes, but one is still emitted (features=<empty>) so the
+# \`is_gated\` purposes, but one is still emitted (features=<empty>) so the
 # set-equality rule in check_flash_attn_closure.py has a uniform (crate,
 # kind) -> literal pairing for EVERY declared prove_lane entry, gated or not.
 echo "::group::kernels-default"

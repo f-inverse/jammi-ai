@@ -78,6 +78,39 @@ else
 fi
 
 # --------------------------------------------------------------------------
+# Unescaped-backtick guard (real bug found live): the `<<REMOTE` heredoc is
+# UNQUOTED (by design -- the local shell must expand `${GIT_REF}` etc. into
+# the remote script text), which means the local shell ALSO evaluates any
+# bare `` `...` `` pair as a command substitution AT HEREDOC-CONSTRUCTION
+# TIME, on the CI RUNNER, before a single byte reaches ssh -- an escaped
+# `\`...\`` inside a comment survives as literal text; an unescaped pair
+# either silently deletes text (`` `test` `` runs the `test` builtin, exit
+# 1, empty stdout) or prints "command not found" to the runner's own
+# stderr (`` `is_gated` ``, an undefined command) and STILL deletes the
+# text. A STATIC scan over the heredoc body catches this class before it
+# ever reaches a real pod; F7 (below) independently proves the REAL
+# heredoc expansion produces no such stderr end to end.
+heredoc_start="$(grep -n '<<REMOTE' "$PROVE_SH" | head -1 | cut -d: -f1)"
+heredoc_end="$(grep -n '^REMOTE$' "$PROVE_SH" | head -1 | cut -d: -f1)"
+unescaped_backticks="$(python3 -c "
+import re
+lines = open('$PROVE_SH').read().splitlines()
+body = lines[$heredoc_start:$heredoc_end - 1]
+bad = []
+for i, line in enumerate(body, start=$heredoc_start + 1):
+    if len(re.findall(r'(?<!\\\\)\`', line)) % 2 != 0 or len(re.findall(r'(?<!\\\\)\`', line)) >= 2:
+        if re.findall(r'(?<!\\\\)\`', line):
+            bad.append(f'{i}: {line}')
+for b in bad:
+    print(b)
+")"
+if [ -z "$unescaped_backticks" ]; then
+  ok "unescaped-backtick guard: no unescaped backtick pair in the <<REMOTE heredoc body"
+else
+  bad "unescaped-backtick guard: found unescaped backtick(s) in the heredoc body (would be evaluated as a LOCAL command substitution): $unescaped_backticks"
+fi
+
+# --------------------------------------------------------------------------
 # helper: build a log fixture from a marker spec, run rp_prove_verdict, and
 # report the resulting rc plus stderr.
 # --------------------------------------------------------------------------
@@ -98,7 +131,7 @@ ssh() {
   cat >/dev/null
   echo "::group::served-client-server-proof"
   echo "PROVE_GROUP_RC name=capability-surface-build rc=0"
-  sleep 30
+  exec sleep 30
   return 0
 }
 export -f ssh
@@ -108,7 +141,7 @@ RP_SSHO=(); RP_PORT=22; RP_HOST=localhost
 # py's R1 setter-predicate scan would -- correctly -- flag as a second
 # source of truth for the real default) -- see rp_run_remote_watched's own
 # `$1` doc.
-out="$(rp_run_remote_watched 3 <<< "noop" 2>&1)"
+out="$(rp_run_remote_watched 3 0.2 <<< "noop" 2>&1)"
 rc=$?
 if [ "$rc" -eq 76 ] \
   && echo "$out" | grep -q 'NO PROGRESS' \
@@ -129,7 +162,7 @@ ssh() {
   return 124
 }
 export -f ssh
-out="$(rp_run_remote_watched <<< "noop" 2>&1)"
+out="$(rp_run_remote_watched "" 0.2 <<< "noop" 2>&1)"
 rc=$?
 if [ "$rc" -eq 124 ] && echo "$out" | grep -q 'BUDGET' && echo "$out" | grep -q 'groups: \[kernels-default:0\]'; then
   ok "F2: budget cut -> 124, lists [name:rc...]"
@@ -143,7 +176,7 @@ ssh() {
   return 124
 }
 export -f ssh
-out="$(rp_run_remote_watched <<< "noop" 2>&1)"
+out="$(rp_run_remote_watched "" 0.2 <<< "noop" 2>&1)"
 rc=$?
 if [ "$rc" -eq 124 ] && echo "$out" | grep -q 'groups: \[\]'; then
   ok "F2: N=0 groups renders as []"
@@ -156,7 +189,7 @@ fi
 # ============================================================================
 ssh() { cat >/dev/null; return 255; }
 export -f ssh
-rp_run_remote_watched <<< "noop" >/dev/null 2>&1
+rp_run_remote_watched "" 0.2 <<< "noop" >/dev/null 2>&1
 [ $? -eq 255 ] && ok "F3: ssh 255 passes through verbatim" || bad "F3: expected 255"
 
 ssh() {
@@ -166,7 +199,7 @@ ssh() {
   return 124
 }
 export -f ssh
-out="$(rp_run_remote_watched <<< "noop" 2>&1)"
+out="$(rp_run_remote_watched "" 0.2 <<< "noop" 2>&1)"
 rc=$?
 if [ "$rc" -eq 124 ] && ! echo "$out" | grep -q 'BUDGET'; then
   ok "F3: in-suite 124 (PROVE_EXIT=124 present) -> 124 verbatim, no BUDGET line"
@@ -180,7 +213,7 @@ ssh() {
   return 76
 }
 export -f ssh
-out="$(rp_run_remote_watched <<< "noop" 2>&1)"
+out="$(rp_run_remote_watched "" 0.2 <<< "noop" 2>&1)"
 rc=$?
 if [ "$rc" -eq 76 ] && ! echo "$out" | grep -q 'NO PROGRESS'; then
   ok "F3: in-suite 76 (PROVE_EXIT=76 present) passes through unchanged, no watchdog diagnostic"
@@ -190,7 +223,7 @@ fi
 
 ssh() { cat >/dev/null; return 97; }
 export -f ssh
-out="$(rp_run_remote_watched <<< "noop" 2>&1)"
+out="$(rp_run_remote_watched "" 0.2 <<< "noop" 2>&1)"
 rc=$?
 if [ "$rc" -eq 97 ] && ! echo "$out" | grep -qE 'NO PROGRESS|BUDGET'; then
   ok "F3: an early exit 97 with no markers passes through verbatim"
@@ -283,19 +316,204 @@ rp_prove_verdict 0 "$log"
 [ $? -eq 0 ] && ok "F4: a marker landing last in the log still credits" || bad "F4: late marker did not credit"
 
 # ============================================================================
-# partial-line-at-poll-boundary: a marker split across two 5s polls is still
-# reassembled by rp_run_remote_watched's own carry logic.
+# esc-082 behavior-pinning: EXECUTES the real <<REMOTE heredoc BODY locally
+# (fix-verifier finding on 19fca3c1: reverting bench_rc's own fold back into
+# `rc` left the whole 24/24-green suite unchanged, because F7's ssh stub
+# discards the heredoc via `cat >/dev/null` and every F4 case feeds
+# hand-authored logs straight to rp_prove_verdict -- neither ever RUNS the
+# heredoc's own shell logic). Extracts the heredoc's literal text (the SAME
+# bytes the real driver sends over ssh) and runs it as an ordinary bash
+# script -- `\$rc`/`\${grc}` (escaped in the source so the LOCAL/CI-runner
+# shell never touches them when building the real heredoc) become literal
+# `$rc`/`${grc}` once run this way, read as ITS OWN locals exactly as the
+# REMOTE bash would; `${NATIVE_COMPUTE_CAP}`/`${GIT_REF}`/`${GIT_REPO}`
+# (unescaped in the source, meant for LOCAL expansion) are supplied by this
+# fixture's own environment instead of the real driver's. `cargo`/
+# `nvidia-smi`/`git` are PATH-shimmed (git's own `clone` copies this
+# checkout's real `ci/`+`crates/` into the fake clone target so the
+# heredoc's own manifest read is genuine, not faked); `cd /root` is
+# substituted for a sandbox-local workdir -- the ONLY adaptation, disclosed
+# here, everything else is the file's own unmodified bytes.
+# ============================================================================
+ESC082_BIN="$SANDBOX/esc082-bin"
+mkdir -p "$ESC082_BIN"
+
+cat > "$ESC082_BIN/cargo" <<'CARGOSTUB'
+#!/usr/bin/env bash
+args="$*"
+if [ -n "${ESC082_FAIL_MATCH:-}" ] && [[ "$args" == *"$ESC082_FAIL_MATCH"* ]]; then
+  echo "esc082 stub cargo: FAILING ($args)" >&2
+  exit 1
+fi
+echo "esc082 stub cargo: ok ($args)"
+echo "test result: ok. 1 passed; 0 failed; 0 ignored"
+exit 0
+CARGOSTUB
+chmod +x "$ESC082_BIN/cargo"
+
+cat > "$ESC082_BIN/nvidia-smi" <<'NVSTUB'
+#!/usr/bin/env bash
+case "$*" in
+  *"name,compute_cap,driver_version"*)
+    echo "name, compute_cap, driver_version"
+    echo "NVIDIA A100 80GB PCIe, 8.0, 570.195.03"
+    ;;
+  *"compute_cap --format=csv,noheader"*) echo "8.0" ;;
+  *) echo "" ;;
+esac
+NVSTUB
+chmod +x "$ESC082_BIN/nvidia-smi"
+
+cat > "$ESC082_BIN/git" <<'GITSTUB'
+#!/usr/bin/env bash
+case "$1" in
+  clone)
+    dest="${@: -1}"
+    mkdir -p "$dest"
+    cp -r "${ESC082_REAL_ROOT:?unset}/ci" "$dest/ci"
+    cp -r "$ESC082_REAL_ROOT/crates" "$dest/crates"
+    ;;
+  rev-parse) echo "0000000000000000000000000000000000000000" ;;
+  *) : ;;
+esac
+exit 0
+GITSTUB
+chmod +x "$ESC082_BIN/git"
+
+# Extracts the heredoc's literal body (between `<<REMOTE` and the closing
+# `REMOTE`), substitutes the ONE sandbox-workdir adaptation, and writes it
+# as a runnable script -- never a hand-copied re-transcription of the
+# script's own logic.
+esc082_extract_heredoc() {
+  local out="$1"
+  local start end
+  start="$(grep -n '<<REMOTE' "$PROVE_SH" | head -1 | cut -d: -f1)"
+  end="$(grep -n '^REMOTE$' "$PROVE_SH" | head -1 | cut -d: -f1)"
+  local raw_text
+  raw_text="$(sed -n "$((start + 1)),$((end - 1))p" "$PROVE_SH" \
+    | sed 's#^cd /root && rm -rf jammi-ai#cd "$ESC082_WORKDIR" \&\& rm -rf jammi-ai#')"
+  # Two-phase expansion, mirroring what actually happens on the wire: phase
+  # 1 (this `eval`) reproduces the LOCAL/CI-runner's own UNQUOTED-heredoc
+  # construction -- `\$`/`` \` ``/`\\` de-escaped, `${NATIVE_COMPUTE_CAP}`/
+  # `${GIT_REF}`/`${GIT_REPO}` expanded using THIS fixture's own env --
+  # producing the EXACT text the real driver would send over ssh. Feeding
+  # `$raw_text` through a SECOND, genuinely unquoted heredoc via `eval`
+  # (which re-parses its argument as fresh source, so `<<ESC082_RAW...`
+  # below is a REAL heredoc redirect at that point, not inert text) gets
+  # this right without hand-reimplementing heredoc-expansion rules; a
+  # naive `\$` -> `$` sed substitution was tried FIRST and produced a
+  # bash syntax error (`json.load(open(` unparseable) because it never
+  # reproduced `$(...)`'s own nested-quote "island" parsing -- an escaped
+  # `\$(` is never treated as a command-substitution island, so the
+  # embedded double quotes inside the manifest-read python snippet would
+  # otherwise close the OUTER assignment's string early. Phase 2 is just
+  # running the resulting (already-expanded) text as an ordinary script.
+  echo '#!/usr/bin/env bash' > "$out"
+  eval "cat <<ESC082_RAW_9f8a3c
+$raw_text
+ESC082_RAW_9f8a3c" >> "$out"
+}
+
+# Runs the extracted heredoc script with `$1`=the cargo invocation substring
+# to FAIL (empty = everything succeeds), writing the emitted log to `$2`.
+# Returns the script's own exit code (mirrors `raw_rc` in the real driver,
+# since this IS the remote script the driver's own `wait $pid` would see).
+esc082_run() {
+  local fail_match="$1" outlog="$2"
+  local script="$SANDBOX/esc082-heredoc.sh"
+  local workdir="$SANDBOX/esc082-workdir-$$-$RANDOM"
+  rm -rf "$workdir"; mkdir -p "$workdir"
+  # Phase-1 expansion (inside esc082_extract_heredoc's own `eval`) needs
+  # NATIVE_COMPUTE_CAP/GIT_REF/GIT_REPO/ESC082_WORKDIR ALREADY set in THIS
+  # shell -- it runs at EXTRACTION time, not at the later `env ... bash`
+  # run time below, so exporting them only on that later line would be too
+  # late for the `${...}` references the extraction step must resolve.
+  export NATIVE_COMPUTE_CAP=80 GIT_REF=test-ref GIT_REPO=unused ESC082_WORKDIR="$workdir"
+  esc082_extract_heredoc "$script"
+  env PATH="$ESC082_BIN:$PATH" \
+    ESC082_FAIL_MATCH="$fail_match" \
+    ESC082_REAL_ROOT="$REPO_ROOT" \
+    ESC082_WORKDIR="$workdir" \
+    bash "$script" > "$outlog" 2>&1
+  local rc=$?
+  rm -rf "$workdir"
+  return "$rc"
+}
+
+# --- positive case: only the bench invocation (gpu-inference-scale) fails. ---
+esc082_log="$SANDBOX/esc082-bench-fail.log"
+esc082_run "gpu-inference-scale" "$esc082_log"
+esc082_raw_rc=$?
+esc082_ok=1
+grep -q '^BENCH_EXIT=1$' "$esc082_log" || esc082_ok=0
+grep -q '^PROVE_EXIT=0$' "$esc082_log" || esc082_ok=0
+for g in "${PROVE_GROUPS[@]}"; do
+  grep -q "^PROVE_GROUP_RC name=${g} rc=0\$" "$esc082_log" || esc082_ok=0
+done
+if [ "$esc082_ok" -eq 1 ]; then
+  ok "esc-082 (heredoc execution): a bench-only cargo failure -> BENCH_EXIT=1, PROVE_EXIT=0, every gating group rc=0"
+else
+  bad "esc-082 (heredoc execution): expected BENCH_EXIT=1/PROVE_EXIT=0/all-gating-rc=0; raw_rc=$esc082_raw_rc log=$(cat "$esc082_log")"
+fi
+esc082_verdict_rc=1
+rp_prove_verdict "$esc082_raw_rc" "$esc082_log"
+esc082_verdict_rc=$?
+if [ "$esc082_verdict_rc" -eq 0 ]; then
+  ok "esc-082 (heredoc execution): rp_prove_verdict over the EXECUTED heredoc's own log yields lane rc 0 (bench is genuinely non-gating in production code, not only in hand-authored fixtures)"
+else
+  bad "esc-082 (heredoc execution): expected lane rc 0 from the executed heredoc's own log; got $esc082_verdict_rc"
+fi
+
+# --- negative control: the SAME shim, but the served-proof invocation
+# (grpc_embedding_gpu) fails instead -- this must NOT be swallowed. ---
+esc082_neg_log="$SANDBOX/esc082-served-fail.log"
+esc082_run "grpc_embedding_gpu" "$esc082_neg_log"
+esc082_neg_raw_rc=$?
+rp_prove_verdict "$esc082_neg_raw_rc" "$esc082_neg_log"
+esc082_neg_verdict_rc=$?
+if [ "$esc082_neg_verdict_rc" -ne 0 ] && grep -q '^PROVE_GROUP_RC name=served-client-server-proof rc=[1-9]' "$esc082_neg_log"; then
+  ok "esc-082 negative control (heredoc execution): a served-proof cargo failure -> lane rc != 0, marker names served-client-server-proof"
+else
+  bad "esc-082 negative control (heredoc execution): expected a nonzero lane rc naming served-client-server-proof; got $esc082_neg_verdict_rc log=$(cat "$esc082_neg_log")"
+fi
+
+# --- bench opens strictly AFTER every gating group's own marker (the
+# "runs LAST" comment, now checked against the EXECUTED log's own line
+# order, not prose). ---
+esc082_bench_open_line="$(grep -n '^::group::bench$' "$esc082_log" | head -1 | cut -d: -f1)"
+esc082_last_gating_marker_line=0
+for g in "${PROVE_GROUPS[@]}"; do
+  l="$(grep -n "^PROVE_GROUP_RC name=${g} rc=" "$esc082_log" | tail -1 | cut -d: -f1)"
+  [ -n "$l" ] && [ "$l" -gt "$esc082_last_gating_marker_line" ] && esc082_last_gating_marker_line="$l"
+done
+if [ -n "$esc082_bench_open_line" ] && [ "$esc082_bench_open_line" -gt "$esc082_last_gating_marker_line" ]; then
+  ok "esc-082 (heredoc execution): ::group::bench opens AFTER every gating group's own marker in the executed log (runs LAST, not only by comment)"
+else
+  bad "esc-082 (heredoc execution): expected bench's own group-open line ($esc082_bench_open_line) after the last gating marker ($esc082_last_gating_marker_line)"
+fi
+
+# ============================================================================
+# partial-line-at-poll-boundary: a marker split across multiple 0.2s polls
+# is still reassembled by rp_run_remote_watched's own carry logic. Round-2
+# audit fix: the ORIGINAL version used a fixed 5s poll with a 3s threshold
+# and a 6s inter-part delay -- numbers with essentially no safety margin
+# (threshold < poll), which made the outcome depend on scheduling jitter
+# rather than the declared threshold. Now: threshold=1s, poll=0.2s, and the
+# inter-part delay (0.3s) is > the poll interval (so it genuinely spans
+# multiple poll ticks, exercising the carry) but < threshold/3 (0.33s, so
+# it can never be mistaken for real inactivity) -- the same >=3x-both-
+# directions discipline every other fixture in this file now uses.
 # ============================================================================
 ssh() {
   cat >/dev/null
   printf 'PROVE_GROUP_RC name=engine'
-  sleep 6
+  sleep 0.3
   printf -- '-core-sweep rc=0\n'
-  sleep 30
+  exec sleep 30
   return 0
 }
 export -f ssh
-out="$(rp_run_remote_watched 6 <<< "noop" 2>&1)"
+out="$(rp_run_remote_watched 1 0.2 <<< "noop" 2>&1)"
 rc=$?
 if [ "$rc" -eq 76 ] && echo "$out" | grep -q 'groups: \[engine-core-sweep:0\]'; then
   ok "partial-line-at-poll-boundary: a marker split across two polls is reassembled correctly"
@@ -320,7 +538,7 @@ ssh() {
   return 124
 }
 export -f ssh
-out="$(rp_run_remote_watched <<< "noop" 2>&1)"
+out="$(rp_run_remote_watched "" 0.2 <<< "noop" 2>&1)"
 rc=$?
 if [ "$rc" -eq 124 ] \
   && echo "$out" | grep -q 'group "kernels-cuda"' \
@@ -338,7 +556,7 @@ ssh() {
   return 124
 }
 export -f ssh
-out="$(rp_run_remote_watched <<< "noop" 2>&1)"
+out="$(rp_run_remote_watched "" 0.2 <<< "noop" 2>&1)"
 rc=$?
 if [ "$rc" -eq 124 ] && echo "$out" | grep -q 'groups: \[kernels-cuda:0\]'; then
   ok "final-drain carry: an unterminated last PROVE_GROUP_RC marker is still parsed (not dropped, not doubled)"
@@ -347,9 +565,54 @@ else
 fi
 
 # ============================================================================
+# Round-2 audit BLOCK A fix: the SAME two cases, but through the
+# INACTIVITY-KILL arm (76), not the normal-exit arm (124) above. The B.2 fix
+# only patched the normal-exit arm's final flush; the kill arm drained
+# remaining bytes but never called the shared carry-flush, so an
+# unterminated final line landing right as the kill fired was silently
+# dropped or attributed to whatever group was open BEFORE it (demonstrated
+# live: `NO PROGRESS ... in group "kernels-default"` for a cut genuinely
+# inside `kernels-cuda`; `groups: []` for an unterminated final marker).
+# Both terminal arms now share ONE `_rrw_flush_carry` function.
+# ============================================================================
+ssh() {
+  cat >/dev/null
+  echo "PROVE_GROUP_RC name=kernels-default rc=0"
+  printf '::group::kernels-cuda'   # no trailing newline; then goes silent -- kill fires
+  exec sleep 30
+}
+export -f ssh
+out="$(rp_run_remote_watched 1 0.2 <<< "noop" 2>&1)"
+rc=$?
+if [ "$rc" -eq 76 ] \
+  && echo "$out" | grep -q 'group "kernels-cuda"' \
+  && ! echo "$out" | grep -q 'kernels-default"; groups: \[\]' \
+  && echo "$out" | grep -q 'groups: \[kernels-default:0\]'; then
+  ok "kill-arm final-drain carry: an unterminated last ::group:: line names the CORRECT (newly-opened) group, never the stale previous one"
+else
+  bad "kill-arm final-drain carry: unterminated ::group:: line mishandled under the 76 path; rc=$rc out=$out"
+fi
+
+ssh() {
+  cat >/dev/null
+  echo "::group::kernels-cuda"
+  printf 'PROVE_GROUP_RC name=kernels-cuda rc=0'   # no trailing newline; then goes silent
+  exec sleep 30
+}
+export -f ssh
+out="$(rp_run_remote_watched 1 0.2 <<< "noop" 2>&1)"
+rc=$?
+if [ "$rc" -eq 76 ] && echo "$out" | grep -q 'groups: \[kernels-cuda:0\]'; then
+  ok "kill-arm final-drain carry: an unterminated last PROVE_GROUP_RC marker is still parsed under the 76 path (not dropped)"
+else
+  bad "kill-arm final-drain carry: unterminated PROVE_GROUP_RC marker mishandled under the 76 path; rc=$rc out=$out"
+fi
+
+# ============================================================================
 # BLOCK 3 audit fix -- cross-parser fixture: the SAME unterminated-final-
 # marker log content, fed independently to (a) rp_run_remote_watched
-# (already exercised above), (b) rp_prove_verdict (the log-file path), and
+# (both terminal arms -- the normal-exit case above and the inactivity-kill
+# case immediately above it), (b) rp_prove_verdict (the log-file path), and
 # (c) the Python producer's parse_log/PROVE_GROUP_RC_RE -- all three must
 # extract the identical (name, rc) pair, never drop/double it.
 # ============================================================================
@@ -420,6 +683,47 @@ else
   bad "cross-parser (python producer): expected a MATCH on the unterminated marker; got $xp_py_out"
 fi
 
+# --------------------------------------------------------------------------
+# Round-2 audit advisory: the 8 divergent-grammar inputs the auditor used to
+# probe rp_parse_prove_marker vs prove_surface.PROVE_GROUP_RC_RE, fed to
+# BOTH parsers, asserting identical (name, rc) OR identical NOMATCH.
+# --------------------------------------------------------------------------
+xp_div_python() {
+  python3 -c "
+import sys
+sys.path.insert(0, 'ci/scripts')
+import prove_surface
+m = prove_surface.PROVE_GROUP_RC_RE.search('''$1''')
+print(m.group('name') + ' ' + m.group('rc') if m else 'NOMATCH')
+"
+}
+xp_div_bash() {
+  if rp_parse_prove_marker "$1"; then
+    echo "${RP_PARSED_MARKER_NAME} ${RP_PARSED_MARKER_RC}"
+  else
+    echo "NOMATCH"
+  fi
+}
+xp_div_check() {
+  local label="$1" input="$2"
+  local b p
+  b="$(xp_div_bash "$input")"
+  p="$(xp_div_python "$input")"
+  if [ "$b" = "$p" ]; then
+    ok "cross-parser divergent input ($label): bash and python agree ($b)"
+  else
+    bad "cross-parser divergent input ($label): bash='$b' python='$p' -- grammars disagree on input: $input"
+  fi
+}
+xp_div_check "rc=abc (non-numeric)"        "PROVE_GROUP_RC name=x rc=abc"
+xp_div_check "two markers on one line"     "PROVE_GROUP_RC name=a rc=0 PROVE_GROUP_RC name=b rc=1"
+xp_div_check "double space"                "PROVE_GROUP_RC name=x  rc=0"
+xp_div_check "empty rc"                    "PROVE_GROUP_RC name=x rc="
+xp_div_check "empty name"                  "PROVE_GROUP_RC name= rc=0"
+xp_div_check "CRLF"                        $'PROVE_GROUP_RC name=x rc=0\r'
+xp_div_check "leading junk"                "some prefix junk PROVE_GROUP_RC name=x rc=0"
+xp_div_check "trailing junk"               "PROVE_GROUP_RC name=x rc=0 trailing junk here"
+
 # ============================================================================
 # PROVE_EXIT disagreeing with its own markers -> FAIL (never trusted blindly).
 # ============================================================================
@@ -488,13 +792,13 @@ case "$last" in
     cat >/dev/null
     if [ "${F7_SCENARIO:-}" = "watchdog" ]; then
       echo "::group::capability-surface-build"
-      sleep 30
+      exec sleep 30
     else
       for g in capability-surface-build capability-surface-proof served-client-server-proof engine-core-sweep kernels-default kernels-cuda; do
         echo "PROVE_GROUP_RC name=${g} rc=0"
       done
       echo "::group::bench"
-      sleep 30
+      exec sleep 30
     fi
     ;;
   *) exit 0 ;;
@@ -513,12 +817,26 @@ f7_case() {
   # line, which a bare `RP_INACTIVITY=3 \` continuation line would satisfy
   # -- this is a plain per-invocation env-var override, not a second
   # committed default, and must not be misread as one.
-  env RUNPOD_API_KEY=test-dummy-key PATH="$F7_STUBBIN:$PATH" F7_TERMINATE_MARKER="$marker" F7_SCENARIO="$mode" GPU_PROVE_ARCH=sm_80 RP_INACTIVITY=3 RP_SSH_WAIT_SECS=10 bash "$PROVE_SH" > "$SANDBOX/f7-$mode.out" 2>&1
+  # RP_WATCH_POLL_S=0.2 (fixture/diagnostic-only, see runpod_gpu_prove.sh's
+  # own doc) keeps this REAL executed subprocess's own watchdog poll fast,
+  # the same >=3x-separated-from-the-stub's-own-timing discipline every
+  # other fixture in this file uses (RP_INACTIVITY=3 vs the stub's own
+  # `sleep 30` silence is a 10x margin).
+  env RUNPOD_API_KEY=test-dummy-key PATH="$F7_STUBBIN:$PATH" F7_TERMINATE_MARKER="$marker" F7_SCENARIO="$mode" GPU_PROVE_ARCH=sm_80 RP_INACTIVITY=3 RP_WATCH_POLL_S=0.2 RP_SSH_WAIT_SECS=10 bash "$PROVE_SH" > "$SANDBOX/f7-$mode.out" 2>&1
   local rc=$?
-  if [ "$rc" -eq "$want_rc" ] && [ -f "$marker" ]; then
-    ok "F7 ($mode): the real executed exit path returns $want_rc AND rp_cleanup's own podTerminate call fired (marker recorded)"
+  local heredoc_stderr_ok=1
+  # The unescaped-backtick class (real bug, fixed live) manifests as a
+  # command-substitution error on the RUNNER's own stderr the moment the
+  # LOCAL shell expands the <<REMOTE heredoc -- F7 ALREADY captures that
+  # exact expansion end to end, so re-check its own output here rather than
+  # building a second mechanism.
+  if grep -qE 'command not found|unexpected EOF while looking for matching' "$SANDBOX/f7-$mode.out"; then
+    heredoc_stderr_ok=0
+  fi
+  if [ "$rc" -eq "$want_rc" ] && [ -f "$marker" ] && [ "$heredoc_stderr_ok" -eq 1 ]; then
+    ok "F7 ($mode): the real executed exit path returns $want_rc, rp_cleanup's own podTerminate call fired (marker recorded), and the <<REMOTE heredoc's own expansion produced no command-substitution stderr"
   else
-    bad "F7 ($mode): expected rc=$want_rc with a recorded podTerminate call; got rc=$rc marker-present=$([ -f "$marker" ] && echo yes || echo no); out=$(cat "$SANDBOX/f7-$mode.out")"
+    bad "F7 ($mode): expected rc=$want_rc with a recorded podTerminate call and no heredoc-expansion stderr; got rc=$rc marker-present=$([ -f "$marker" ] && echo yes || echo no) heredoc_stderr_ok=$heredoc_stderr_ok; out=$(cat "$SANDBOX/f7-$mode.out")"
   fi
 }
 # Every earlier F1-F4/cross-parser case above did `export -f ssh` with a

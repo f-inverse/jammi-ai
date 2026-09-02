@@ -68,7 +68,7 @@ use jammi_db::catalog::backend::{BackendError, SqlValue, TxOptions};
 use jammi_db::catalog::backend_sqlite::{catalog_vfs, SQLITE_VFS_ENV};
 use jammi_db::catalog::Catalog;
 use jammi_db::error::JammiError;
-use jammi_test_utils::child::{render, Capture, DrainedChild, Epoch, DEFAULT_HEAD_CAP};
+use jammi_test_utils::child::{Capture, DrainedChild, Epoch};
 
 /// Env var carrying a child's role. Absent ⇒ this process is the parent.
 const ROLE_ENV: &str = "JAMMI_SEAM_ROLE";
@@ -192,13 +192,12 @@ fn sidecars(dir: &Path) -> (bool, bool) {
 // ── Children ────────────────────────────────────────────────────────────────
 
 /// Render both of a [`Capture`]'s streams (stdout then stderr) for a
-/// panic/failure message.
+/// panic/failure message. Prefers `Capture::render_stdout`/`render_stderr`
+/// over the free `render` function: they always use the head-retention cap
+/// the capture was actually built with, so they cannot be called with a
+/// mismatched cap.
 fn rendered_log(cap: &Capture) -> String {
-    format!(
-        "{}{}",
-        render(&cap.stdout, cap.stdout_truncated, DEFAULT_HEAD_CAP),
-        render(&cap.stderr, cap.stderr_truncated, DEFAULT_HEAD_CAP),
-    )
+    format!("{}{}", cap.render_stdout(), cap.render_stderr())
 }
 
 /// Re-execute this binary running only `test_name`, in `role`, with `envs`

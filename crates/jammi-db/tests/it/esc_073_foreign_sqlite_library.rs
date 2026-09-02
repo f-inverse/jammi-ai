@@ -70,7 +70,7 @@ use std::time::Duration;
 
 use jammi_db::catalog::backend::{SqlValue, TxOptions};
 use jammi_db::catalog::Catalog;
-use jammi_test_utils::child::{render, Capture, DrainedChild, Epoch, DEFAULT_HEAD_CAP};
+use jammi_test_utils::child::{Capture, Completeness, DrainedChild, Epoch};
 
 /// Env var carrying the child's role. Absent ⇒ this process is the parent.
 const ROLE_ENV: &str = "JAMMI_ESC073_ROLE";
@@ -1066,6 +1066,17 @@ enum Attempt {
     /// panic in `drive_with` and the classification tests derive them the
     /// same way, via [`last_phase_marker`] and `Capture::silence`).
     Hung,
+    /// The capture's own evidence cannot be trusted for a content-dependent
+    /// classification: `Capture::complete != Completeness::Complete` (the
+    /// drained reader threads never reached EOF within the settle bound —
+    /// e.g. an fd-inheriting grandchild) or `Capture::wait_error.is_some()`
+    /// (an OS-level error while producing the capture). Distinct from
+    /// [`Attempt::Truncated`]: `Truncated` means the evidence IS trustworthy
+    /// but the class's own required line is missing; `Incomplete` means the
+    /// evidence itself is not fully collected, so no content-dependent class
+    /// (`Survived`/`Tripped`/`Stale`/`Corrupt`/`Skipped`) may ever be
+    /// reported. Carries the reason text.
+    Incomplete(String),
 }
 
 /// Last stderr line matching `^\[child\] phase:`, or `None` if there is none.
@@ -1117,9 +1128,36 @@ fn terminus_satisfied(stderr: &[u8], role: Role) -> bool {
     }
 }
 
+/// `Some(reason)` when `cap`'s evidence cannot be trusted for a
+/// content-dependent classification (`Survived`/`Tripped`/`Stale`/`Corrupt`/
+/// `Skipped` — every one of them decides its outcome by reading `cap.stderr`)
+/// — either the drained reader threads never reached EOF within the settle
+/// bound (`Capture::complete != Completeness::Complete`), or an OS-level
+/// error occurred while producing the capture (`Capture::wait_error`).
+/// `None` when the capture is fully trustworthy. `Attempt::Signal`/`Hung`/
+/// `ExitCode` never consult this: they classify from `cap.status` alone, not
+/// from stderr content, so an incomplete log does not make them unreliable.
+fn incompleteness_reason(cap: &Capture) -> Option<String> {
+    if cap.complete != Completeness::Complete {
+        return Some(format!(
+            "capture incomplete ({:?}) — its stderr content cannot be trusted for classification",
+            cap.complete
+        ));
+    }
+    if let Some(err) = &cap.wait_error {
+        return Some(format!(
+            "an OS-level error occurred while producing this capture: {err}"
+        ));
+    }
+    None
+}
+
 /// Classify a settled (non-hung) [`Capture`] into an [`Attempt`], applying the
 /// per-role terminus / per-code evidence check (see the W2 design's "Scoring"
-/// table).
+/// table). Any capture whose evidence is not fully trustworthy
+/// ([`incompleteness_reason`]) is classified [`Attempt::Incomplete`] instead
+/// of a content-dependent class, regardless of what its exit code would
+/// otherwise imply.
 fn classify(cap: &Capture, role: Role) -> Attempt {
     if cap.hung {
         return Attempt::Hung;
@@ -1131,8 +1169,12 @@ fn classify(cap: &Capture, role: Role) -> Attempt {
         last_nonempty_line(&cap.stderr)
             .is_some_and(|l| l.starts_with(&format!("[child] TRIPPED({code}):")))
     };
+    let incomplete = incompleteness_reason(cap);
     match cap.status.and_then(|s| s.code()) {
         Some(0) => {
+            if let Some(reason) = incomplete {
+                return Attempt::Incomplete(reason);
+            }
             if terminus_satisfied(&cap.stderr, role) {
                 Attempt::Survived
             } else {
@@ -1140,6 +1182,9 @@ fn classify(cap: &Capture, role: Role) -> Attempt {
             }
         }
         Some(EXIT_TRIPPED) => {
+            if let Some(reason) = incomplete {
+                return Attempt::Incomplete(reason);
+            }
             if has_tripped_line(EXIT_TRIPPED) {
                 Attempt::Tripped
             } else {
@@ -1147,6 +1192,9 @@ fn classify(cap: &Capture, role: Role) -> Attempt {
             }
         }
         Some(EXIT_STALE) => {
+            if let Some(reason) = incomplete {
+                return Attempt::Incomplete(reason);
+            }
             if has_tripped_line(EXIT_STALE) {
                 Attempt::Stale
             } else {
@@ -1154,6 +1202,9 @@ fn classify(cap: &Capture, role: Role) -> Attempt {
             }
         }
         Some(EXIT_CORRUPT) => {
+            if let Some(reason) = incomplete {
+                return Attempt::Incomplete(reason);
+            }
             if has_tripped_line(EXIT_CORRUPT) {
                 Attempt::Corrupt
             } else {
@@ -1161,6 +1212,9 @@ fn classify(cap: &Capture, role: Role) -> Attempt {
             }
         }
         Some(EXIT_NO_FOREIGN_LIB) => {
+            if let Some(reason) = incomplete {
+                return Attempt::Incomplete(reason);
+            }
             if String::from_utf8_lossy(&cap.stderr).contains("[child] SKIP:") {
                 Attempt::Skipped
             } else {
@@ -1224,13 +1278,12 @@ fn run_child(role: Role, test_name: &str, ceiling: Duration) -> (Attempt, Captur
 }
 
 /// Render both of a [`Capture`]'s streams (stdout then stderr, matching the
-/// pre-drain harness's own `log` shape) for a panic/failure message.
+/// pre-drain harness's own `log` shape) for a panic/failure message. Prefers
+/// `Capture::render_stdout`/`render_stderr` over the free `render` function:
+/// they always use the head-retention cap the capture was actually built
+/// with, so they cannot be called with a mismatched cap.
 fn rendered_log(cap: &Capture) -> String {
-    format!(
-        "{}{}",
-        render(&cap.stdout, cap.stdout_truncated, DEFAULT_HEAD_CAP),
-        render(&cap.stderr, cap.stderr_truncated, DEFAULT_HEAD_CAP),
-    )
+    format!("{}{}", cap.render_stdout(), cap.render_stderr())
 }
 
 /// Shared formatting for a hung child's diagnostic text — used both by
@@ -1265,6 +1318,25 @@ fn truncated_diagnostic(
     format!(
         "esc-073 [{}]: attempt {attempt_no}/{total} exited {code} without its expected terminus \
          (evidence lost or malformed); last phase marker={:?} silence={:?}. Both streams:\n{}",
+        role.as_str(),
+        last_phase_marker(&cap.stderr),
+        cap.silence(),
+        rendered_log(cap),
+    )
+}
+
+/// Shared formatting for an `Incomplete` (untrustworthy-evidence) diagnostic.
+fn incomplete_diagnostic(
+    role: Role,
+    attempt_no: usize,
+    total: usize,
+    reason: &str,
+    cap: &Capture,
+) -> String {
+    format!(
+        "esc-073 [{}]: attempt {attempt_no}/{total} produced an INCOMPLETE capture ({reason}) — \
+         it can never be scored Survived/Tripped/Stale/Corrupt/Skipped from untrustworthy \
+         evidence; last phase marker={:?} silence={:?}. Both streams:\n{}",
         role.as_str(),
         last_phase_marker(&cap.stderr),
         cap.silence(),
@@ -1372,6 +1444,12 @@ fn drive_with(role: Role, test_name: &str, stop_at_first_failure: bool) -> Summa
                 panic!(
                     "{}",
                     hung_diagnostic(role, attempt_no, ATTEMPTS, CHILD_CEILING, &cap)
+                )
+            }
+            Attempt::Incomplete(reason) => {
+                panic!(
+                    "{}",
+                    incomplete_diagnostic(role, attempt_no, ATTEMPTS, &reason, &cap)
                 )
             }
         };

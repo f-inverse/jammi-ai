@@ -25,13 +25,16 @@
     "that builds it and the closure gate that guards it both move in the",
     "same unit (no separate lane-by-lane edit to keep in sync).",
     "",
-    "`capabilities.fused_op_admission` vs `capabilities.internal_subkernels`",
-    "vs `capabilities.fused_kernels_compiled` (campaign #443 Phase-4",
-    "adversarial-audit finding 2, esc-074 follow-up): these are THREE",
-    "DIFFERENT proof mechanisms, not one list split by convenience. Every op",
-    "named across the three appears in EXACTLY ONE of them \u2014",
-    "`ci/scripts/check_release_manifest.py` enforces that, and that every",
-    "lane's `capabilities` block is identical to every other lane's.",
+    "`capabilities.fused_op_admission` vs `capabilities.internal_subkernels`:",
+    "these are TWO DIFFERENT PROOF MECHANISMS, not one list split by",
+    "convenience, and they are the ONLY two a capability block may carry.",
+    "Every op named across them appears in EXACTLY ONE \u2014 `ci/scripts/",
+    "check_release_manifest.py` enforces that, that neither category is",
+    "present but EMPTY, that no capability key outside the closed set below",
+    "appears at all, and that every lane's `capabilities` block is identical",
+    "to every other lane's. The non-category capability keys are exactly",
+    "`cuda_compiled`, `flash_compiled` and `flash_dtypes`: build facts about",
+    "the lane, naming no op.",
     "",
     "`fused_op_admission` is ONLY ops",
     "`crates/jammi-ai/tests/gpu_capability/capability_surface.rs` can attribute",
@@ -67,7 +70,7 @@
     "optimizer step, which is exactly why that probe runs backward + one AdamW",
     "step rather than a forward alone.",
     "",
-    "`internal_subkernels` is a DIFFERENT mechanism: an op with real CUDA",
+    "`internal_subkernels` is the DIFFERENT mechanism: an op with real CUDA",
     "kernels and dispatch arms that is launched DIRECTLY by an admitted PARENT",
     "op and has no `admit()`/`admit_cascade()` call of its own \u2014",
     "`rope_positions` (launched bare as `crate::cuda::rope_positions::cuda_fwd`",
@@ -88,18 +91,22 @@
     "`flash_dtypes` describe that lane), and `low_rank_residual_linear` is a",
     "`fused_op_admission` op above (registry key `lora_linear_fused`).",
     "",
-    "`fused_kernels_compiled` is the residual case: an op W2c gave real f16",
-    "CUDA kernels and dispatch arms (`crates/jammi-kernels/src/cuda/*_f16.cu`)",
-    "that has NO admission call site AND no admitted parent launching it \u2014",
-    "today exactly `axpy`, which has ZERO call sites anywhere in the workspace.",
-    "No dispatch-registry counter exists for any probe, forward or backward, to",
-    "read a delta from, and no parent's delta implies it ran. It is proven ONLY",
-    "by its dispatch arms compiling as part of this lane's own build (this",
-    "file's `cargo_features` list, exercised by `runpod_gpu_prove.sh`'s",
-    "capability-surface build group and CI's `flash-attn-compile` clippy job)",
-    "\u2014 NEVER by a claim that it dispatched. `axpy`'s wire-a-dispatch-site-or-",
-    "delete decision is a scope item of this same release unit; whichever way",
-    "it goes, this category moves in the same unit as that code edit.",
+    "THERE IS NO COMPILED-ONLY CATEGORY. A kernel with no `admit()`/",
+    "`admit_cascade()` call site AND no admitted parent that launches it has NO",
+    "category here at all: the only thing a shipped build could say about it is",
+    "\"it compiled\", which is not a capability a consumer can act on, and a",
+    "category holding exactly that is an empty proof slot the next unwired",
+    "kernel gets filed into instead of being decided. Such a kernel is either",
+    "WIRED \u2014 given a real dispatch site, which lands it in",
+    "`fused_op_admission` \u2014 or DELETED, in the same unit as its authoring. The",
+    "decision is a measurement against a threshold fixed BEFORE the numbers are",
+    "seen, not a judgement call at review time; see `crates/jammi-kernels/",
+    "artifacts/cuda-runs/2026-09-01-axpy-census-bdeb80c-a100-pcie.json` for the",
+    "precedent, where a pre-registered rule (wire iff the op's share reaches 2%",
+    "of per-step GPU time on some shipped leg AND one dispatch site covers at",
+    "least half of that share) measured 0.007% / 0.026% / 0.027% across the",
+    "three shipped dtype legs and the kernel was deleted rather than kept as a",
+    "compiled-only row.",
     "",
     "Promotion is always a code edit and a manifest edit in ONE unit: wiring a",
     "real `admit()`/`admit_cascade()` call site (and its `PROBED_OPS` row)",
@@ -147,10 +154,7 @@
             "parent": "low_rank_residual_linear",
             "launch_site": "crates/jammi-kernels/src/ops/low_rank_residual_linear.rs"
           }
-        },
-        "fused_kernels_compiled": [
-          "axpy"
-        ]
+        }
       }
     },
     "cu12-wheel": {
@@ -192,10 +196,7 @@
             "parent": "low_rank_residual_linear",
             "launch_site": "crates/jammi-kernels/src/ops/low_rank_residual_linear.rs"
           }
-        },
-        "fused_kernels_compiled": [
-          "axpy"
-        ]
+        }
       }
     },
     "cu12-image": {
@@ -237,10 +238,7 @@
             "parent": "low_rank_residual_linear",
             "launch_site": "crates/jammi-kernels/src/ops/low_rank_residual_linear.rs"
           }
-        },
-        "fused_kernels_compiled": [
-          "axpy"
-        ]
+        }
       }
     }
   },

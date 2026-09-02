@@ -11,21 +11,33 @@ failure mode: a reviewer editing one lane's `capabilities` and missing the
 other two ships a manifest that claims three different surfaces for three
 builds of the same feature list. And because a category IS a proof mechanism
 (`fused_op_admission` = an observed dispatch-registry delta;
-`internal_subkernels` = an admitted parent's observed delta;
-`fused_kernels_compiled` = compiled-only, never a dispatch claim — see the
+`internal_subkernels` = an admitted parent's observed delta — see the
 manifest's own `_schema_doc`), an op named in two categories is a
 contradiction: it cannot both have and not have its own admission site.
+
+The set of categories is CLOSED at those two, and each must be non-empty.
+Both halves of that are load-bearing. A kernel with no `admit()` site and no
+admitted parent is provable only as "it compiled", which is not a capability
+a consumer can act on; a category holding exactly that is an empty proof
+slot, and an empty proof slot is where the next unwired kernel gets filed
+instead of being wired or deleted. So a third, op-bearing capability key is a
+FINDING here (not a new mechanism this gate silently tolerates), and a
+category that has drained to `[]`/`{}` is a FINDING too — the manifest must
+either name ops under a mechanism or not carry the mechanism at all.
 
 Checks (hermetic: reads the manifest and the tracked Rust sources, no
 network, no build, no toolchain):
 
   1. The file parses; `lanes` exists and is non-empty; every lane carries a
-     `capabilities` object with all three category keys present. Fail-closed:
-     a missing/renamed key is a FINDING, never a silently skipped check.
+     `capabilities` object with both category keys present, each non-empty,
+     and NO capability key outside the closed set (the two categories plus
+     the non-op build facts `cuda_compiled`/`flash_compiled`/`flash_dtypes`).
+     Fail-closed: a missing/renamed/extra key is a FINDING, never a silently
+     skipped check.
   2. Every lane's `capabilities` block is IDENTICAL to every other lane's,
      compared as canonical JSON (key order included, so the file stays
      reviewable as three literally-equal blocks).
-  3. Every op named across the three categories appears in EXACTLY ONE of
+  3. Every op named across the two categories appears in EXACTLY ONE of
      them, and at most once within its own category.
   4. Every `internal_subkernels` entry carries a `parent` and a
      `launch_site`; the `launch_site` must RESOLVE to a file that exists
@@ -62,11 +74,20 @@ assert (REPO_ROOT / "Cargo.toml").is_file(), (
 
 MANIFEST_PATH = REPO_ROOT / "ci" / "release-feature-manifest.json"
 
-# The three proof mechanisms, in the manifest's own order. A LIST category
+# The two proof mechanisms, in the manifest's own order. A LIST category
 # names ops directly; the OBJECT category is keyed by op.
-LIST_CATEGORIES = ("fused_op_admission", "fused_kernels_compiled")
+LIST_CATEGORIES = ("fused_op_admission",)
 OBJECT_CATEGORIES = ("internal_subkernels",)
-CATEGORIES = ("fused_op_admission", "internal_subkernels", "fused_kernels_compiled")
+CATEGORIES = ("fused_op_admission", "internal_subkernels")
+
+# The capability keys that are NOT proof mechanisms: build facts about the
+# lane that name no op. Together with CATEGORIES these close the set of keys
+# a `capabilities` block may carry — anything else is a finding, so a third
+# op-bearing category cannot be introduced by a manifest-only edit (see this
+# module's doc).
+NON_CATEGORY_CAPABILITY_KEYS = frozenset(
+    {"cuda_compiled", "flash_compiled", "flash_dtypes"}
+)
 
 # `counters_for("<key>")` / `cascade_counters_for("<key>")` — the only two
 # ways a dispatch-registry key is named in this workspace.
@@ -107,6 +128,30 @@ def _category_ops(caps: dict, lane_name: str, problems: list[str]) -> dict[str, 
             problems.append(f"lane `{lane_name}`: `{cat}` must be an object keyed by op name")
             continue
         ops[cat] = list(value.keys())
+    # A category that is present but names no op is an EMPTY PROOF SLOT: it
+    # asserts a mechanism the lane exercises for nothing, and it is where the
+    # next unwired kernel gets parked instead of being wired or deleted. The
+    # manifest must drop the mechanism rather than carry it empty.
+    for cat, named in ops.items():
+        if not named:
+            problems.append(
+                f"lane `{lane_name}`: `{cat}` is present but EMPTY — a proof mechanism "
+                f"that names no op is an empty slot the next unwired kernel gets filed "
+                f"into; name an op under it or remove the category"
+            )
+    # The category set is CLOSED. An unrecognized capability key is either a
+    # new proof mechanism (which needs this gate and `capability_surface.rs`
+    # to define how it is proven, in the same unit) or a resurrected
+    # compiled-only bucket. Either way it is a finding, never tolerated.
+    for key in caps:
+        if key in CATEGORIES or key in NON_CATEGORY_CAPABILITY_KEYS:
+            continue
+        problems.append(
+            f"lane `{lane_name}`: unknown capability key `{key}` — the proof mechanisms "
+            f"are exactly {list(CATEGORIES)} and the non-op build facts are exactly "
+            f"{sorted(NON_CATEGORY_CAPABILITY_KEYS)}; a key naming ops under any other "
+            f"mechanism has no defined proof, so it cannot be added by a manifest-only edit"
+        )
     return ops
 
 
@@ -225,7 +270,6 @@ def _fixture_manifest() -> dict:
                 "launch_site": "Cargo.toml",
             }
         },
-        "fused_kernels_compiled": ["axpy"],
     }
     return {
         "lanes": {
@@ -253,18 +297,26 @@ def _self_test() -> int:
 
     # 1. A lane whose capability block diverges from its siblings.
     m = _fixture_manifest()
-    m["lanes"]["b"]["capabilities"]["fused_kernels_compiled"] = ["axpy", "sneaked_in"]
+    m["lanes"]["b"]["capabilities"]["fused_op_admission"] = [
+        "layer_norm",
+        "low_rank_residual_linear",
+        "sneaked_in",
+    ]
     probs = check_manifest(m, REPO_ROOT)
     check("divergent-lane-capability-block-caught", any("differs from lane" in p for p in probs), f"{probs}")
 
     # 2. An op in two categories at once — the two mechanisms contradict.
+    #    Here an ADMITTED op is also claimed as a parentless sub-kernel.
     m = _fixture_manifest()
-    m["lanes"]["a"]["capabilities"]["fused_kernels_compiled"] = ["axpy", "layer_norm"]
-    m["lanes"]["b"]["capabilities"]["fused_kernels_compiled"] = ["axpy", "layer_norm"]
+    for lane in m["lanes"].values():
+        lane["capabilities"]["internal_subkernels"]["layer_norm"] = {
+            "parent": "low_rank_residual_linear",
+            "launch_site": "Cargo.toml",
+        }
     probs = check_manifest(m, REPO_ROOT)
     check("op-in-two-categories-caught", any("appears in both" in p for p in probs), f"{probs}")
 
-    # 2b. Including the list/object category pair (a sub-kernel that ALSO
+    # 2b. The other direction of the same overlap (a sub-kernel that ALSO
     #     claims its own admission site).
     m = _fixture_manifest()
     for lane in m["lanes"].values():
@@ -312,6 +364,60 @@ def _self_test() -> int:
         del lane["capabilities"]["internal_subkernels"]
     probs = check_manifest(m, REPO_ROOT)
     check("missing-category-key-caught", any("has no `internal_subkernels` key" in p for p in probs), f"{probs}")
+
+    # 6b. A category that has DRAINED to empty is caught — the shape this
+    #     manifest would have had if the last compiled-only op were deleted
+    #     while its category stayed. Both the list and the object category.
+    m = _fixture_manifest()
+    for lane in m["lanes"].values():
+        # Re-point the sub-kernel's parent at a real REGISTRY KEY first, so
+        # draining the admission list does not ALSO orphan the parent
+        # citation — the property under test is the emptiness alone.
+        lane["capabilities"]["internal_subkernels"]["scaled_cast_add"]["parent"] = (
+            "attention_block_flash"
+        )
+        lane["capabilities"]["fused_op_admission"] = []
+    probs = check_manifest(m, REPO_ROOT)
+    check(
+        "empty-list-category-caught",
+        any("`fused_op_admission` is present but EMPTY" in p for p in probs),
+        f"{probs}",
+    )
+
+    m = _fixture_manifest()
+    for lane in m["lanes"].values():
+        lane["capabilities"]["internal_subkernels"] = {}
+    probs = check_manifest(m, REPO_ROOT)
+    check(
+        "empty-object-category-caught",
+        any("`internal_subkernels` is present but EMPTY" in p for p in probs),
+        f"{probs}",
+    )
+
+    # 6c. A THIRD, op-bearing capability category is caught — a proof
+    #     mechanism nothing defines cannot be introduced by a manifest-only
+    #     edit, whatever it is named.
+    for extra_key, extra_value in (
+        ("fused_kernels_compiled", ["some_kernel"]),
+        ("some_new_mechanism", {"some_kernel": {"parent": "low_rank_residual_linear"}}),
+    ):
+        m = _fixture_manifest()
+        for lane in m["lanes"].values():
+            lane["capabilities"][extra_key] = json.loads(json.dumps(extra_value))
+        probs = check_manifest(m, REPO_ROOT)
+        check(
+            f"unknown-op-bearing-category-caught[{extra_key}]",
+            any(f"unknown capability key `{extra_key}`" in p for p in probs),
+            f"{probs}",
+        )
+
+    # 6d. The non-category build facts are NOT mistaken for a category (a
+    #     closed-set check that reds on `flash_dtypes` would be unusable).
+    m = _fixture_manifest()
+    for lane in m["lanes"].values():
+        lane["capabilities"]["flash_dtypes"] = ["bf16", "f16"]
+    probs = check_manifest(m, REPO_ROOT)
+    check("non-category-build-facts-accepted", probs == [], f"{probs}")
 
     # 7. An empty/absent `lanes` object can never pass vacuously.
     probs = check_manifest({"lanes": {}}, REPO_ROOT)

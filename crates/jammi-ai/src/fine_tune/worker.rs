@@ -1056,7 +1056,7 @@ impl TrainingWorker {
             common,
             loader,
         } = run;
-        let output_model_id = format!("jammi:fine-tuned:{job_id}");
+        let output_model_id = crate::fine_tune::training_job::fine_tuned_model_id(job_id);
         let model_source = ModelSource::parse(&common.base_model);
 
         // Load the base model under the task being fine-tuned so the right tower

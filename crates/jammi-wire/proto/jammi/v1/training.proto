@@ -430,7 +430,18 @@ message TrainingStatusRequest {
 message TrainingStatusResponse {
   // Current lifecycle status: "queued", "running", "completed", or "failed".
   string status = 1;
-  // The output model id the trained artifact registers under.
+  // The output model id the trained artifact registers under — populated at
+  // EVERY lifecycle status, never empty because the job has not finished. Once
+  // the job completes this is the id the catalog stamped; before then it is the
+  // same deterministic id `StartTraining` returned at submit time, re-derived
+  // by the engine's own naming rule from the persisted job row. A caller that
+  // attaches to a running job by id therefore reads the identical id the
+  // in-process (embedded) surface reports for that job.
+  //
+  // This is deliberately NOT the contract of `TrainingJobSummary
+  // .output_model_id`, which reports the catalog column verbatim and so IS
+  // empty until completion: that field answers "has this job stamped its
+  // output row yet", this one answers "what will this job's model be called".
   string model_id = 2;
   // The failure message when `status` is "failed"; empty otherwise.
   string error = 3;

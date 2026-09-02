@@ -1531,3 +1531,309 @@ async fn run_worker_false_shutdown_does_not_await_a_worker_that_never_started() 
         );
     joined.expect("the serve task must end cleanly, not by panicking, when no worker was spawned");
 }
+
+// ---------------------------------------------------------------------------
+// `TrainingStatus.model_id` ⇄ the embedded attach handle (K4, #446).
+//
+// The divergence these close: attaching to a job by id, the EMBEDDED handle
+// reports the deterministic output model id re-derived from the persisted row
+// (the engine's naming rule), while the remote handle read `""` because
+// `TrainingStatus` relayed the catalog's `output_model_id` column, which is
+// stamped only at completion. Both surfaces now resolve through the ONE engine
+// function, so the pre-completion states — the divergence-prone ones, not the
+// terminal happy path — carry a byte-identical id on both transports.
+//
+// The embedded-arm oracle in each test is
+// `jammi_ai::fine_tune::training_job::resolve_model_id` applied to the embedded
+// catalog read of the SAME row: exactly the call (and the value) the embedded
+// attach handle reports. It is triangulated against the id `StartTraining`
+// itself returned — the value the in-process submit handle carries — so the
+// assertion cannot pass by both sides sharing one wrong answer.
+// ---------------------------------------------------------------------------
+
+/// The id an ATTACHED embedded handle would report for this job: the engine's
+/// own resolution over the embedded catalog read of the same row.
+async fn embedded_attach_model_id(server: &EngineServer, job_id: &str) -> String {
+    let record = server
+        .engine
+        .catalog()
+        .get_training_job(job_id)
+        .await
+        .expect("get_training_job");
+    jammi_ai::fine_tune::training_job::resolve_model_id(job_id, &record)
+        .expect("the embedded arm resolves this job's model id")
+}
+
+/// K4: a `fine_tune` job that has NOT completed reports the same `model_id`
+/// over the wire that the embedded attach handle derives — byte-for-byte, at
+/// the pre-completion state, which is precisely where the two surfaces diverged
+/// (`""` remotely vs the derived id in process).
+///
+/// The read point is quiesced by construction (the fixture's worker is stopped
+/// AND joined before it returns), so `queued` here is a state nothing can move
+/// underneath the two reads — the same discipline the acceleration-marker
+/// parity tests use.
+///
+/// Non-vacuity is asserted three ways: the wire status really is `queued` (a
+/// pre-completion read, not a terminal one), the catalog column really is
+/// unstamped (`output_model_id IS NULL` — so the wire value is DERIVED, not
+/// relayed), and the value equals the non-empty id `StartTraining` returned.
+///
+/// The terminal leg is then re-asserted after the worker is released: at
+/// `completed` the wire id must still equal both the catalog's now-stamped
+/// column and the submit-time id, so closing the pre-completion gap does not
+/// disturb the state that already agreed.
+#[cfg(feature = "train")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn training_status_model_id_matches_the_embedded_derived_id_before_completion() {
+    let server = start_engine_server_worker_quiesced().await;
+    add_training_source(
+        channel(server.addr).await,
+        None::<fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>>,
+    )
+    .await;
+    let mut client = TrainingServiceClient::new(channel(server.addr).await);
+
+    let start = client
+        .start_training(start_request())
+        .await
+        .expect("start_training")
+        .into_inner();
+    assert!(
+        !start.model_id.is_empty(),
+        "StartTraining returns the deterministic output model id — the value the \
+         embedded submit handle carries"
+    );
+
+    // Quiesced read point: post-submission, pre-claim.
+    let (wire, embedded) = wire_and_embedded(&mut client, &server, &start.job_id).await;
+    assert_eq!(
+        wire.status, "queued",
+        "the quiesced fixture must leave the job unclaimed — a non-`queued` \
+         status means this is no longer a pre-completion read"
+    );
+    assert_eq!(
+        embedded.output_model_id, None,
+        "the catalog has NOT stamped output_model_id before completion — without \
+         this the wire value below could be a plain column relay and the test \
+         would prove nothing"
+    );
+    assert_eq!(
+        wire.model_id,
+        embedded_attach_model_id(&server, &start.job_id).await,
+        "K4: TrainingStatus.model_id must BYTE-EQUAL the id the embedded attach \
+         handle derives for the same job at the same pre-completion state"
+    );
+    assert_eq!(
+        wire.model_id, start.model_id,
+        "the pre-completion wire id is the SAME deterministic id StartTraining \
+         returned at submit time"
+    );
+
+    // Release the worker and re-assert at the terminal state: the leg that
+    // already agreed must stay green.
+    let worker = server.spawn_training_worker();
+    let terminal = poll_until_terminal(&mut client, &start.job_id).await;
+    assert_eq!(
+        terminal.status, "completed",
+        "the released worker must run the job to completion, got '{}' (error: {})",
+        terminal.status, terminal.error
+    );
+    worker
+        .stop_and_join()
+        .await
+        .expect("stop the released training worker");
+
+    let (after, embedded_after) = wire_and_embedded(&mut client, &server, &start.job_id).await;
+    assert_eq!(
+        embedded_after.output_model_id.as_deref(),
+        Some(after.model_id.as_str()),
+        "at completion the wire id is the catalog's stamped output_model_id"
+    );
+    assert_eq!(
+        after.model_id, start.model_id,
+        "a completed job's wire id is still the submit-time id — the terminal \
+         parity is unchanged by the pre-completion fix"
+    );
+    assert_eq!(
+        after.model_id,
+        embedded_attach_model_id(&server, &start.job_id).await,
+        "K4 at the terminal state: the wire id and the embedded attach id agree"
+    );
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// K4 across the REST of the lifecycle: a `running` row and a `failed` row —
+/// neither of which ever stamps `output_model_id` — report the embedded attach
+/// handle's derived id over the wire, not the empty string.
+///
+/// A `failed` job is the sharp case: it is TERMINAL yet has no stamped column,
+/// so a "populated once terminal" reading of the old contract would still leave
+/// it empty on the wire while the embedded handle names the model the job would
+/// have produced.
+///
+/// The rows are seeded directly (never passing through `queued`), so they are
+/// race-free against the fixture's own running worker, which claims exclusively
+/// `WHERE status = 'queued'`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn training_status_model_id_is_derived_for_running_and_failed_rows() {
+    let server = start_engine_server().await;
+    let catalog = server.engine.catalog();
+    register_acceleration_test_model(catalog, "model-id-base").await;
+
+    seed_training_job_row(
+        catalog,
+        "model-id-running",
+        "model-id-base::1",
+        "running",
+        Some("model-id-worker"),
+        1,
+        Some(r#"{"state":"pending"}"#),
+    )
+    .await;
+    seed_training_job_row(
+        catalog,
+        "model-id-failed",
+        "model-id-base::1",
+        "failed",
+        None,
+        1,
+        None,
+    )
+    .await;
+
+    let mut client = TrainingServiceClient::new(channel(server.addr).await);
+
+    for (job_id, status) in [
+        ("model-id-running", "running"),
+        ("model-id-failed", "failed"),
+    ] {
+        let resp = client
+            .training_status(TrainingStatusRequest {
+                job_id: job_id.to_string(),
+            })
+            .await
+            .expect("training_status")
+            .into_inner();
+        let embedded = catalog
+            .get_training_job(job_id)
+            .await
+            .expect("get_training_job");
+        assert_eq!(
+            resp.status, status,
+            "the seeded row must be read back in the state it was seeded in"
+        );
+        assert_eq!(
+            embedded.output_model_id, None,
+            "'{job_id}' has no stamped output_model_id — the wire value below is \
+             a derivation, not a relay"
+        );
+        assert_eq!(
+            resp.model_id,
+            embedded_attach_model_id(&server, job_id).await,
+            "K4: a '{status}' job's TrainingStatus.model_id must BYTE-EQUAL the \
+             embedded attach handle's derived id"
+        );
+        assert!(
+            !resp.model_id.is_empty(),
+            "a '{status}' job names the model it produces (or would have \
+             produced); the empty string was the divergence"
+        );
+    }
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// K4 for the OTHER derivation arm: a `context_predictor` job's model id is
+/// caller-chosen (it rides inside the persisted `training_spec`), NOT derivable
+/// from the job id, so the pre-completion wire read must decode the persisted
+/// spec exactly as the embedded attach does. A handler that assumed the
+/// fine-tune format would pass the fine-tune tests above and be wrong here.
+///
+/// Tenant-scoped throughout — the predictor's source and embedding table are
+/// stamped `tenant_id = A`, so both the submit and the embedded record read run
+/// inside A's scope.
+#[cfg(feature = "train")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn training_status_model_id_decodes_the_predictor_spec_before_completion() {
+    use jammi_server::grpc::proto::catalog::catalog_service_client::CatalogServiceClient;
+    use jammi_server::grpc::proto::catalog::{SetTenantRequest, Tenant};
+
+    let server = start_engine_server_worker_quiesced().await;
+    seed_predictor_dataset_under_tenant_a(&server).await;
+
+    let session_iface = with_session("predictor-model-id-tenant-a");
+    let mut session_client =
+        CatalogServiceClient::with_interceptor(channel(server.addr).await, session_iface.clone());
+    session_client
+        .set_tenant(SetTenantRequest {
+            tenant: Some(Tenant {
+                id: TENANT_A.into(),
+            }),
+        })
+        .await
+        .expect("set_tenant");
+    let mut client =
+        TrainingServiceClient::with_interceptor(channel(server.addr).await, session_iface);
+
+    let start = client
+        .start_training(predictor_start_request())
+        .await
+        .expect("start_training(context_predictor) under tenant scope")
+        .into_inner();
+    assert_eq!(
+        start.model_id, "ctx-predictor-wire",
+        "the predictor's model id is the caller-chosen id inside its spec"
+    );
+
+    let resp = client
+        .training_status(TrainingStatusRequest {
+            job_id: start.job_id.clone(),
+        })
+        .await
+        .expect("training_status")
+        .into_inner();
+    assert_eq!(
+        resp.status, "queued",
+        "the quiesced fixture must leave the predictor job unclaimed — this is a \
+         pre-completion read"
+    );
+
+    // The embedded arm's own answer, resolved inside tenant A's scope (the job
+    // row is stamped to A).
+    let (embedded_record, embedded_model_id) = server
+        .engine
+        .with_tenant_scoped(tenant_a(), |_scope| async {
+            let record = server
+                .engine
+                .catalog()
+                .get_training_job(&start.job_id)
+                .await
+                .expect("get_training_job under tenant A");
+            let model_id =
+                jammi_ai::fine_tune::training_job::resolve_model_id(&start.job_id, &record)
+                    .expect("the embedded arm resolves the predictor job's model id");
+            (record, model_id)
+        })
+        .await;
+    assert_eq!(
+        embedded_record.output_model_id, None,
+        "the predictor row has not stamped output_model_id before completion"
+    );
+    assert_eq!(
+        resp.model_id, embedded_model_id,
+        "K4: the predictor job's wire model_id must BYTE-EQUAL the id the \
+         embedded attach handle decodes out of the persisted training_spec"
+    );
+    assert_eq!(
+        resp.model_id, "ctx-predictor-wire",
+        "and that id is the caller-chosen one, never a jammi:fine-tuned: id \
+         derived from the job id"
+    );
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}

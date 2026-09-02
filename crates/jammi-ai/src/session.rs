@@ -13,7 +13,7 @@ use jammi_db::store::{ArtifactStore, ResultStore};
 use crate::concurrency::GpuScheduler;
 use crate::eval::runner::EvalRunner;
 use crate::fine_tune::spec::{TrainingCommon, TrainingSpec};
-use crate::fine_tune::training_job::TrainingJob;
+use crate::fine_tune::training_job::{fine_tuned_model_id, TrainingJob};
 use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
 use crate::inference::observer::InferenceObserver;
 use crate::model::backend::DeviceConfig;
@@ -1182,7 +1182,7 @@ impl InferenceSession {
         spec: TrainingSpec,
     ) -> Result<TrainingJob> {
         let job_id = uuid::Uuid::new_v4().to_string();
-        let output_model_id = format!("jammi:fine-tuned:{job_id}");
+        let output_model_id = fine_tuned_model_id(&job_id);
 
         // Parse model source to get the canonical name (what ModelCache uses for
         // registration).

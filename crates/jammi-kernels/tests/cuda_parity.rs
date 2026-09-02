@@ -344,6 +344,52 @@ const F32_ELEMENTWISE_CANCELLATION_ULPS: f32 = 3.0;
 /// this value with real headroom (see this branch's hand-off report).
 const F32_GELU_ERF_LIBM_ULPS: f32 = 8.0;
 
+/// GeGLU's 16-bit FORWARD parity `k`, DERIVED (campaign #446) from the
+/// kernel's rounding-point STRUCTURE rather than from its rounding-point
+/// COUNT — `no-producer: derived`.
+///
+/// `geglu_fwd_f16`/`geglu_fwd_bf16` have two rounding points
+/// (`cuda/geglu_f16.cu:57` ROUND 1, `:59` ROUND 2), and the guide's §3.10
+/// row records exactly that ("2 fwd"). The pre-#446 `k = 2` read the count
+/// off that row directly — which undercounts, because ROUND 1 is UPSTREAM
+/// of a multiply:
+///
+/// * ROUND 1 rounds `act = gate·Φ(gate)` to 16-bit. The two arms compute
+///   `Φ` with different libraries (CUDA `erff` vs the CPU reference's
+///   `erf`), so their `act` differs by ~1 f32 ULP — enough to land on
+///   opposite sides of a 16-bit round-to-nearest midpoint. Measured on
+///   this file's own `n_out = 1024` fixture: 384 of 1024 elements sit
+///   within one f32 ULP of such a midpoint. So `|Δact| <= 1 ulp(act)`.
+/// * That is a RELATIVE perturbation of up to `2^-10` (f16) / `2^-7`
+///   (bf16), and `out = act · up` carries it through unattenuated:
+///   `|Δout| <= |out| · 2^-mantissa`, which is `>= 1` and `< 2` ULPs of
+///   `out` (`ulp(|out|)` itself lies in `[|out|·2^-(m+1), |out|·2^-m]`).
+/// * ROUND 2 then adds each arm's own <=0.5-ULP rounding: <=1 more ULP of
+///   difference.
+///
+/// Total `< 1 + 2 = 3` ULPs of the output. `k = 3`.
+///
+/// This is NOT an ad-hoc widening: at `k = 2` the a100 (`compute_cap 8.0`)
+/// and l40s (`8.9`) arch-set artifacts BOTH measure worst `Δ/bound`
+/// EXACTLY `1.0` on `geglu_parity_multi_block_exact_multiple_of_block_size`
+/// — a bound sitting precisely on its own worst case, i.e. one library
+/// revision from a false RED — and the 2-ULP delta they measure is the
+/// ROUND-1-flip term above, reproduced independently in numpy from a
+/// +/-1-f32-ULP `erf` perturbation (worst element `gate = -3.1855`,
+/// `up = 5.8125`, the two candidate `act_f16` values `-0.0023021698` and
+/// `-0.0023002625`, one f16 ULP apart, giving `|Δout| = 1.5259e-5` =
+/// 2 ULPs of `out = -0.0133820`). Headroom at `k = 3` is 1.5x BY
+/// CONSTRUCTION: this is a worst-case-derived bound measured against a
+/// near-worst-case sample, and raising `k` further to manufacture a 2x
+/// ratio would abandon the derivation that justifies it.
+///
+/// Both 16-bit arms take it: `geglu.cu`'s bf16 forward has the identical
+/// two-rounding-point structure, so the same derivation applies — its
+/// observed ratios are lower only because bf16's coarser step makes both
+/// the flip and the allowance 8x larger, not because the mechanism is
+/// absent.
+const GEGLU_FWD_ROUND1_PROPAGATION_ULPS: f32 = 3.0;
+
 /// A Higham-style, PER-ELEMENT `f32` bound made of two ADDITIVE terms —
 /// see this section's header comment for why this replaces the
 /// predecessor single-term, `max`-keyed `f32_relative_bound(r, floor, k)`
@@ -3478,8 +3524,14 @@ fn assert_geglu_parity_bf16(cuda: &Device, rows: usize, intermediate: usize, wv:
             .to_vec1()
             .unwrap()
     };
-    // `k = 2`: both sides of THIS comparison run the identical fused
-    // single-rounding kernel on different hardware/compilers — ordinary
+    // The FORWARD's `k` is [`GEGLU_FWD_ROUND1_PROPAGATION_ULPS`] (3) —
+    // see that constant for the derivation, and for why the
+    // rounding-point COUNT (2) is not the parity `k` when the first of
+    // those roundings sits upstream of a multiply. The `dwi_out` backward
+    // keeps `k = 2`: its two rounding points are the two INDEPENDENT
+    // final casts of `d_gate`/`d_up`, neither of which feeds the other, so
+    // nothing propagates. Both sides of THIS comparison otherwise run the
+    // identical fused kernel on different hardware/compilers — ordinary
     // rounding-order/`--fmad=true` contraction, the same class every
     // other op's parity leg in this file bounds this way. (Not
     // `geglu_oracles.rs`'s wider fused-vs-EAGER absolute floor — that
@@ -3506,7 +3558,7 @@ fn assert_geglu_parity_bf16(cuda: &Device, rows: usize, intermediate: usize, wv:
     assert_eq!(out_cpu_v.len(), n_out);
     assert_eq!(out_gpu_v.len(), n_out, "geglu bf16 GPU fwd length mismatch");
     let out_floor = max_abs(wv) * 2f32.powi(-10); // no-producer: 2^-10 is bf16's ulp fraction at normal magnitude, derived not measured.
-    let out_bound = |r: f32| bf16_relative_bound(r, out_floor, 2.0);
+    let out_bound = |r: f32| bf16_relative_bound(r, out_floor, GEGLU_FWD_ROUND1_PROPAGATION_ULPS);
     assert_relative_bound("geglu bf16 fwd", &out_cpu_v, &out_gpu_v, out_bound);
     let out_defect = geglu_identity_activation_defect(wv, rows, intermediate);
     assert_forced_defect_exceeds_bound("geglu bf16 fwd", &out_cpu_v, &out_defect, out_bound);
@@ -3542,8 +3594,9 @@ fn assert_geglu_parity_bf16(cuda: &Device, rows: usize, intermediate: usize, wv:
 
 /// [`assert_geglu_parity_bf16`]'s F16 twin (campaign #443 W2b): compares
 /// the SAME op's two device arms (CPU `CpuStorage::F16` vs CUDA
-/// `geglu_f16.cu`). `k = 2`, same rationale as the bf16 leg (identical
-/// fused single-rounding-per-op-step kernel on different hardware).
+/// `geglu_f16.cu`). Same `k` as the bf16 leg and for the same reason:
+/// [`GEGLU_FWD_ROUND1_PROPAGATION_ULPS`] (3) forward, `k = 2` for the
+/// `dwi_out` backward's two independent, non-feeding rounding points.
 fn assert_geglu_parity_f16(cuda: &Device, rows: usize, intermediate: usize, wv: &[f32]) {
     let cpu = Device::Cpu;
     let n_out = rows * intermediate;
@@ -3581,7 +3634,7 @@ fn assert_geglu_parity_f16(cuda: &Device, rows: usize, intermediate: usize, wv: 
     // documents above, re-derived from f16's own quantization step
     // instead of copying bf16's `2^-10` input-fraction constant).
     let out_floor = f16_ulp_size_at(max_abs(wv));
-    let out_bound = |r: f32| f16_relative_bound(r, out_floor, 2.0);
+    let out_bound = |r: f32| f16_relative_bound(r, out_floor, GEGLU_FWD_ROUND1_PROPAGATION_ULPS);
     assert_relative_bound("geglu f16 fwd", &out_cpu_v, &out_gpu_v, out_bound);
     let out_defect = geglu_identity_activation_defect(wv, rows, intermediate);
     assert_forced_defect_exceeds_bound("geglu f16 fwd", &out_cpu_v, &out_defect, out_bound);

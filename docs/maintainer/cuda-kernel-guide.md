@@ -218,12 +218,21 @@ matmul gap.
 
 The `Rounding points` column above answers "how many times does a value cross a 16-bit rounding
 boundary". It does **not** answer "how far apart may two correct arms of this op land", and reading
-it as if it did is what produced campaign #446's `softmax_parity_f16_row_length_regimes` RED. The
-count is only the *local* allowance; a rounding point also **propagates** whenever its result is
-afterwards multiplied, or is consumed by a later step whose own condition number is large. The
-rule, with a live instance in `crates/jammi-kernels/tests/cuda_parity.rs`:
+it as if it did is what produced both of campaign #446's f16 bound findings. The count is only the
+*local* allowance; a rounding point also **propagates** whenever its result is afterwards
+multiplied, or is consumed by a later step whose own condition number is large. Two rules,
+each with a live instance in `crates/jammi-kernels/tests/cuda_parity.rs`:
 
-1. **When an op's two arms are fed DIFFERENT (each individually within-bound) inputs, the output
+1. **A rounding point UPSTREAM of a multiply contributes its own full relative ULP to the
+   product, not a fraction of one.** `geglu`'s forward rounds the activation (ROUND 1) and then
+   multiplies by `up` (ROUND 2). The two arms' pre-ROUND-1 activations differ by ~1 f32 ULP
+   (CUDA `erff` vs the CPU reference's `erf`), which is enough to straddle a 16-bit midpoint —
+   measured, 384 of 1024 elements do on this file's own fixture — so `|Δact| <= 1 ulp(act)`, a
+   relative `2^-mantissa`, which `act·up` carries into `out` as up to **2** ULPs of `out`, on top
+   of ROUND 2's own <=1. Derived `k = 3`, not the column's 2; see
+   `GEGLU_FWD_ROUND1_PROPAGATION_ULPS`. At `k = 2` both the sm_80 and sm_89 arch-set artifacts
+   measured worst `Δ/bound` of exactly `1.0` — a bound resting on its own worst case.
+2. **When an op's two arms are fed DIFFERENT (each individually within-bound) inputs, the output
    allowance must include those inputs' difference times the op's own sensitivity.** A CPU-vs-CUDA
    *backward* parity leg does exactly this whenever it takes each arm's own forward output as `y`.
    `softmax`'s `dscores = (dy - Σ dy·y)·y` has one rounding point and is bit-tight given identical
@@ -238,11 +247,11 @@ rule, with a live instance in `crates/jammi-kernels/tests/cuda_parity.rs`:
    trap for `f32` legs was already closed by `f32_two_term_bound`; the 16-bit legs simply never met
    it while their only softmax fixture was `last = 8`.
 
-This is not a kernel defect and it is not a reason to narrow an f16 admission domain:
-`softmax_f16.cu` meets the regime this table states, at every admitted `last`. What it is is a
-reason to derive a 16-bit parity `k` from the rounding STRUCTURE — where each rounding sits
-relative to the op's multiplies and reductions, and whether the two arms are even fed the same
-inputs — rather than from the count.
+Neither finding is a kernel defect, and neither is a reason to narrow an f16 admission domain:
+`softmax_f16.cu` and `geglu_f16.cu` both meet the regimes this table states, at every admitted
+`last`/`intermediate`. What they are is a reason to derive a 16-bit parity `k` from the rounding
+STRUCTURE — where each rounding sits relative to the op's multiplies and reductions — rather than
+from the count.
 
 ### 3.10.1 Dispatch status of the table's non-admitted-looking rows
 

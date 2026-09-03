@@ -1,0 +1,77 @@
+{
+  "_doc": [
+    "wall_s (healthy) / wall_lower_bound_s (cut/kill) is the WINDOW",
+    "from the first `::group::` open to the last of {an",
+    "`::endgroup::`, a `PROVE_EXIT=` line, a \"GPU prove suites",
+    "exit=\" driver line} -- it deliberately EXCLUDES the GitHub",
+    "runner's own provisioning/checkout overhead before the first",
+    "group and the short post-job cleanup tail after the driver's",
+    "own exit echo, neither of which belongs to the prove lane's",
+    "own wall or silence accounting. `max_silent_gap_s` is computed",
+    "over the SAME window."
+  ],
+  "arch": "sm_90",
+  "box": "NVIDIA H100 PCIe",
+  "disposition": null,
+  "driver": "580.159.04",
+  "git_sha": "c80e8f8bd2a4c17f0e016e64c2ee79fa4d486fa4",
+  "groups": [
+    {
+      "name": "device",
+      "rc": null,
+      "wall_s": 0.042
+    },
+    {
+      "name": "capability-surface-build",
+      "rc": null,
+      "wall_s": 1004.052
+    },
+    {
+      "name": "capability-surface-proof",
+      "rc": null,
+      "wall_s": 19.363
+    },
+    {
+      "name": "served-client-server-proof",
+      "rc": null,
+      "wall_s": 235.463
+    },
+    {
+      "name": "engine-core-sweep",
+      "rc": null,
+      "wall_s": 207.214
+    },
+    {
+      "name": "bench",
+      "rc": null,
+      "wall_s": 286.412
+    },
+    {
+      "name": "kernels-default",
+      "rc": null,
+      "wall_s": 122.949
+    },
+    {
+      "name": "kernels-cuda",
+      "rc": null,
+      "wall_s": 373.405
+    },
+    {
+      "name": "kernels-clippy-legacy",
+      "rc": null,
+      "wall_s": 129.864
+    }
+  ],
+  "job_id": "100173677048",
+  "max_silent_gap_after": "engine-core-sweep",
+  "max_silent_gap_s": 129.081,
+  "outcome": "healthy",
+  "run_id": "33607161412",
+  "schema_version": 1,
+  "source": "run-metadata",
+  "surface": {
+    "expected_id": null,
+    "kind": "legacy-pre-d1"
+  },
+  "wall_s": 2442.321
+}

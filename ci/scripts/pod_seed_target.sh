@@ -23,9 +23,14 @@
 #        additionally compiles the vendored FlashAttention-2 CUTLASS
 #        kernels, real nvcc minutes, so it is not paid on every branch's
 #        seed)
-#   T2  cargo test --no-run for the exact crates/features
-#       runpod_gpu_prove.sh's own suites use (kept in lockstep with that
-#       script by naming the same -p/--features/--test here)
+#   T2  cargo test --no-run for a FIXED, pre-esc-081 crates/features/--test
+#       selection (jammi-server/jammi-ai/jammi-kernels, `cuda`/
+#       `cuda,live-gpu-tests`) — seeds the dependency-artifact compile these
+#       suites need regardless of which literal feature list
+#       runpod_gpu_prove.sh's own PROVE_TUPLE-declared invocations carry
+#       today (esc-081 widened several of those to `cuda,flash-attn,...`);
+#       T2 is a dev-loop compile-cache seed, not a tuple-for-tuple twin of
+#       the prove lane, and is never asserted to be in lockstep with it
 #   T3  cargo clippy -p jammi-kernels --all-targets --features cuda
 #
 # After all tuples build: capture every build script's stdout (the announced

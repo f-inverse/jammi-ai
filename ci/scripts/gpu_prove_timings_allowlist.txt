@@ -1,0 +1,38 @@
+# GPU-prove-timings R5 (surface-freshness) waiver allowlist
+# (check_gpu_prove_timings.py)
+#
+# Format: one row per line, `<arch><TAB><reviewed_up_to_sha><TAB><reason>` (a
+# literal TAB character). `#`-prefixed and blank lines are ignored.
+#
+# A row records "arch `<arch>` is deliberately accepted as carrying a STALE
+# `prove-lane` surface — its evidence's `expected_id` was last reviewed as
+# still sufficient through `<reviewed_up_to_sha>`, for `<reason>`". Scoped to
+# R5 (surface freshness) only — never R1-R4.
+#
+# Rot, checked mechanically on every run, all hard FAILs (same rot/dead-
+# waiver shape as `ci/scripts/arch_validation_freshness_allowlist.txt`):
+#   - `arch` is not one of `crates/jammi-kernels/build.rs`'s current
+#     `GENCODE_ARCHES`.
+#   - `reviewed_up_to_sha` is malformed, or not an ancestor of HEAD.
+#   - `arch` is NOT currently R5-stale at all (a DEAD waiver — delete the
+#     row once a fresh same-surface healthy artifact lands, or the surface
+#     reverts).
+#   - the prove-lane surface changed AGAIN after `reviewed_up_to_sha` (the
+#     waiver's own range no longer covers HEAD — bump `reviewed_up_to_sha`
+#     after re-review, or drop the arch and re-dispatch instead).
+#
+# Empty today, deliberately: no `prove-lane`-kind artifact exists yet for
+# ANY arch. This is a PRE-MERGE red, not a merge-time one: the unit's own
+# sequence dispatches `gpu-prove.yml`'s 4-arch matrix ON THIS BRANCH and
+# commits the four resulting current-surface healthy artifacts BEFORE the
+# PR merges — R5 (and therefore `ci-summary`) is expected to go green on
+# THIS SAME branch once that dispatch lands, never merged red and fixed up
+# afterward. A row in this file is never the way to get past that gap —
+# it exists for a genuinely reviewed, time-boxed acceptance of staleness on
+# ONE arch after evidence already exists, not a standing substitute for the
+# branch's own dispatch. (See docs/maintainer/dev-gpu.md's own note on this
+# gate's ONGOING operator cost after that first dispatch: `expected_id`
+# moves, and this gate reds again, every time a lane feature is added or
+# removed, a `prove_only` entry changes, or a crate stops or starts
+# declaring a lane feature — each such change needs its OWN fresh
+# 4-pod dispatch, the same pre-merge sequence, never a waiver.)

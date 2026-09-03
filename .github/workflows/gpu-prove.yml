@@ -86,15 +86,17 @@ jobs:
       group: gpu-prove-${{ matrix.arch }}-${{ github.ref }}
       cancel-in-progress: false
     # A job-timeout kill is another trap bypass. The remote job is capped by
-    # RP_TIMEOUT (50m); deploy itself is capped by RP_SSH_WAIT_SECS (default
-    # 600s) PER CANDIDATE, and every arch fails over across up to 4 candidates
-    # (SECURE/COMMUNITY × PCIe/SXM4, or fewer for archs with a shorter
-    # candidate list — see `rp_deploy_arch` in runpod_lib.sh) before returning
-    # 75 — so the worst case (every candidate rents but none becomes
-    # reachable) is 4 × 600s = 40m of deploy on top of the 50m job cap, well
-    # under this ceiling but no longer under the previous 75m one (raised here
-    # for exactly that reason — see runpod_lib.sh's own RP_SSH_WAIT_SECS doc).
-    timeout-minutes: 100
+    # RP_TIMEOUT (esc-080/esc-083: 100m by default, `runpod_gpu_prove.sh`'s
+    # own export — up from the library's 50m default, to give the inactivity
+    # watchdog room to detect a genuine hang before the hard budget would
+    # anyway); deploy itself is capped by RP_SSH_WAIT_SECS (default 600s) PER
+    # CANDIDATE, and every arch fails over across its own candidate list
+    # (SECURE/COMMUNITY × PCIe/SXM4/fallback siblings — see `rp_deploy_arch`
+    # in runpod_lib.sh); the WORST-case candidate count across the matrix is
+    # 8 (l4_l40s, h100), so the worst case (every candidate rents but none
+    # becomes reachable) is 8 × 600s = 80m of deploy on top of the 100m job
+    # cap = 180m, +10m margin = 190m.
+    timeout-minutes: 190
     steps:
       - uses: actions/checkout@v4
 
@@ -107,7 +109,16 @@ jobs:
       # night FAILS this leg red — fail-closed, a leg with no capacity is a
       # leg with no proof, never a silent green. The `::warning::` step below
       # annotates that red as a provider-capacity condition (not a code
-      # regression); operator recovery is a re-run once capacity returns.
+      # regression); operator recovery is a re-run once capacity returns. A
+      # `76` exit (esc-080) means `rp_run_remote_watched`'s own inactivity
+      # watchdog killed the leg with a `PROVE_GROUPS` member still
+      # unresolved — a genuine hang, not a capacity condition; the
+      # `::warning::` step below names it separately so the two causes are
+      # never conflated at a glance. A cut/hang that lands entirely inside
+      # the non-gating `bench` group with every proof group already at
+      # rc=0 does NOT reach either arm here — `runpod_gpu_prove.sh`'s own
+      # driver rule already turns that case into exit 0 plus its own
+      # inline `::warning::` (esc-082), so this step's `rc` output is `0`.
       - name: Prove GPU suites on a real ${{ matrix.arch }} device
         id: prove
         env:
@@ -125,3 +136,7 @@ jobs:
       - name: Annotate a capacity failure
         if: always() && steps.prove.outputs.rc == '75'
         run: echo "::warning::GPU prove FAILED for capacity — no ${{ matrix.arch }} device on RunPod (SUPPLY_CONSTRAINT), not a code regression. The run stays red (nothing was proven); re-run once capacity returns."
+
+      - name: Annotate an inactivity-watchdog kill
+        if: always() && steps.prove.outputs.rc == '76'
+        run: echo "::warning::GPU prove FAILED for inactivity — rp_run_remote_watched's own RP_INACTIVITY watchdog killed this leg with a gating PROVE_GROUPS member still unresolved (a genuine hang, not a capacity condition). Produce the artifact with ci/scripts/perf/gpu_prove_timings.py and add a disposition via check_gpu_prove_timings.py's R4 before re-running."

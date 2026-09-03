@@ -338,6 +338,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
 
+      # A bare `git` in a container `run:` step hits "fatal: detected
+      # dubious ownership" (exit 128) — same trap as `ci.yml`'s "Run tests"
+      # step and `flash-attn-compile`'s submodule init above (see those
+      # comment blocks for the full story). Since esc-081, this job's own
+      # `check_prove_surface` calls `discover_all_tuples`, which shells out
+      # to `git ls-files` to enumerate tracked files — this is that job's
+      # first git call, so it is the first place this trap can fire here.
+      - name: Mark the checkout safe for git (container UID != checkout UID)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       # `jammi-kernels/flash-attn` vendors CUTLASS + a multi-minute `nvcc`
       # build; it must depend on `cuda` but never be IMPLIED by it, or the
       # release lane (`release-binaries.yml`'s `cuda,jetstream-broker,
@@ -505,17 +515,18 @@ jobs:
       # `cuda`-required `tests/cuda_parity.rs`) and `check` never runs
       # clippy's lints at all. `flash-attn` forwards to `cuda`
       # (crates/jammi-kernels/Cargo.toml), so `--features flash-attn
-      # --all-targets` is the SAME feature surface this crate's
-      # `runpod_gpu_prove.sh:78` GPU-pod clippy line already exercises
-      # (`cargo clippy -p jammi-kernels --all-targets --features cuda --
-      # -D warnings`) — but THAT lane is `gpu-prove.yml`'s
+      # --all-targets` is the SAME feature surface a `runpod_gpu_prove.sh`
+      # GPU-pod clippy line used to exercise (`cargo clippy -p jammi-kernels
+      # --all-targets --features cuda -- -D warnings`) before esc-081
+      # removed it from that script entirely (the prove lane never needed a
+      # GPU to run clippy — that lane was `gpu-prove.yml`'s
       # `workflow_dispatch`/`pull_request: types: [labeled]`/nightly-cron
-      # trigger, never a lane that fires on every PR. This step is the
-      # hermetic, always-required twin: clippy is type-check-only (no GPU
-      # needed, same nvcc/CUTLASS toolchain this job's image already has),
-      # so it closes the class without renting hardware. `ci/scripts/
-      # check_lint_surface_closure.py` asserts this coverage holds
-      # mechanically, not just by this comment's say-so.
+      # trigger anyway, never a lane that fires on every PR). This step is
+      # now the ONLY place this exact invocation runs: hermetic,
+      # always-required, no GPU needed (same nvcc/CUTLASS toolchain this
+      # job's image already has). `ci/scripts/check_lint_surface_closure.py`
+      # asserts this coverage holds mechanically, not just by this comment's
+      # say-so.
       - name: Clippy jammi-kernels --features flash-attn --all-targets (nvcc, no GPU)
         run: cargo clippy -p jammi-kernels --features flash-attn --all-targets -- -D warnings
 
@@ -1215,6 +1226,44 @@ jobs:
           # fine (and its CI green on the shallow runner proves it).
           - name: pod build timings self-test
             cmd: python3 ci/scripts/check_pod_build_timings.py --self-test
+          # GPU-prove-timings gate (esc-080/esc-082/esc-083): re-demands the
+          # watchdog defaults (RP_INACTIVITY/RP_TIMEOUT) and the two-term
+          # RP_TIMEOUT backstop against COMMITTED evidence
+          # (ci/artifacts/gpu-prove-timings/*.json) on every run — R1
+          # (defaults actually set, no rogue second setter), R2 (inactivity
+          # margin), R3 (backstop over healthy walls, vacuous unless every
+          # shipped arch has evidence), R4 (every cut/kill dispositioned),
+          # R5 (per-arch surface freshness, keyed on
+          # ci/scripts/prove_surface.py's expected_id). Toolchain-free
+          # (stdlib tomllib via prove_surface.py; reuses
+          # check_gpu_parity_matrix.py's own GENCODE_ARCHES parse — no
+          # cargo metadata). fetch_depth "0" for the same ancestor-sha
+          # reason as "pod build timings"/"arch validation freshness" above.
+          - name: gpu prove timings
+            cmd: python3 ci/scripts/check_gpu_prove_timings.py
+            fetch_depth: "0"
+          # No fetch_depth here: the self-test drives every rule against
+          # ephemeral `git init`'d fixture repos, never this checkout's
+          # history.
+          - name: gpu prove timings self-test
+            cmd: python3 ci/scripts/check_gpu_prove_timings.py --self-test
+          # The gpu-prove-timings PRODUCER's own self-test (BLOCK 1 audit
+          # fix): pins the current-mode marker-attribution path (a
+          # PROVE_GROUP_RC marker precedes its own ::endgroup:: by design,
+          # so it must be attributed by its own name= field, never by
+          # membership in the already-closed list) against a synthetic
+          # fully-healthy log (outcome healthy, wall_s set, all six gating
+          # groups rc=0) and a synthetic budget-cut log — the exact bug
+          # shape that silently mislabeled every healthy leg as budget-cut.
+          - name: gpu prove timings producer self-test
+            cmd: python3 ci/scripts/perf/gpu_prove_timings.py --self-test
+          # The prove-lane fixture suite (F1-F7, esc-080/esc-082): drives the
+          # REAL `rp_run_remote_watched`/driver-rule mechanism in
+          # runpod_gpu_prove.sh against a STUBBED ssh — no RunPod account, no
+          # GPU, no network. See that script's own header for the exact case
+          # list.
+          - name: gpu prove lane suite
+            cmd: bash ci/scripts/test_gpu_prove_lane.sh
           # Completeness tripwire for this very guard class: every
           # ci/scripts/check_*.py|.sh gate script must be referenced by at
           # least one workflow (this file included), so a new check script

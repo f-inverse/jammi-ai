@@ -1,0 +1,79 @@
+{
+  "_doc": [
+    "wall_s (healthy) / wall_lower_bound_s (cut/kill) is the WINDOW",
+    "from the first `::group::` open to the last of {an",
+    "`::endgroup::`, a `PROVE_EXIT=` line, a \"GPU prove suites",
+    "exit=\" driver line} -- it deliberately EXCLUDES the GitHub",
+    "runner's own provisioning/checkout overhead before the first",
+    "group and the short post-job cleanup tail after the driver's",
+    "own exit echo, neither of which belongs to the prove lane's",
+    "own wall or silence accounting. `max_silent_gap_s` is computed",
+    "over the SAME window -- EXCEPT on a `watchdog-kill` outcome,",
+    "where the observed silence is, BY DEFINITION, right-censored",
+    "at RP_INACTIVITY (the kill fires the moment that threshold is",
+    "crossed, so the TRUE gap the process would have gone on to",
+    "produce is unknown and >= this value): recorded as",
+    "`silent_gap_lower_bound_s` instead, never as `max_silent_gap_s`",
+    "-- R2 (check_gpu_prove_timings.py) consumes HEALTHY artifacts",
+    "ONLY for exactly this reason, never a kill's own censored value."
+  ],
+  "arch": "sm_86",
+  "box": "NVIDIA A40",
+  "disposition": null,
+  "driver": "570.195.03",
+  "git_sha": "4e978f7f3e7055c1602fa444690418abb1596cb3",
+  "groups": [
+    {
+      "name": "device",
+      "rc": null,
+      "wall_s": 0.0
+    },
+    {
+      "name": "capability-surface-build",
+      "rc": 0,
+      "wall_s": 1356.397
+    },
+    {
+      "name": "capability-surface-proof",
+      "rc": 0,
+      "wall_s": 10.011
+    },
+    {
+      "name": "served-client-server-proof",
+      "rc": 0,
+      "wall_s": 210.206
+    },
+    {
+      "name": "engine-core-sweep",
+      "rc": 0,
+      "wall_s": 150.194
+    },
+    {
+      "name": "kernels-default",
+      "rc": 0,
+      "wall_s": 120.202
+    },
+    {
+      "name": "kernels-cuda",
+      "rc": 0,
+      "wall_s": 600.728
+    },
+    {
+      "name": "bench",
+      "rc": 0,
+      "wall_s": 335.332
+    }
+  ],
+  "job_id": "100394694890",
+  "max_silent_gap_after": "kernels-cuda",
+  "max_silent_gap_s": 135.101,
+  "outcome": "healthy",
+  "run_id": "33674156137",
+  "schema_version": 1,
+  "source": "job-log",
+  "surface": {
+    "expected_id": "7e4205ecdcbd3174fa0c7c242d24864ac94ed84f85e9695e0c10d9038b873428",
+    "kind": "prove-lane"
+  },
+  "wall_s": 2898.357
+}

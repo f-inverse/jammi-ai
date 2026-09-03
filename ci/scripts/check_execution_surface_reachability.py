@@ -21,9 +21,14 @@ NOTHING on the actual merge path ever runs it. That is exactly the esc-050 /
 esc-051 escape shape: `pod_seed_target.sh:859`'s
 `cargo clippy -p jammi-kernels --all-targets --features cuda -- -D warnings`
 went red on a fresh pod's seed the SAME day #389 merged, because clippy's
-only workflow-level twin (`runpod_gpu_prove.sh:78`, byte-identical) lives
-behind `gpu-prove.yml`'s label/dispatch/schedule-only trigger — green
-"wiring", dead on the path that gates merges.
+only workflow-level twin was `runpod_gpu_prove.sh`'s own byte-identical
+clippy invocation, itself living behind `gpu-prove.yml`'s label/dispatch/
+schedule-only trigger — green "wiring", dead on the path that gates merges.
+That twin was REMOVED from `runpod_gpu_prove.sh` entirely by esc-081 (the
+lane never needed a GPU to run clippy); `ci.yml`'s own hermetic `Clippy
+jammi-kernels --features flash-attn --all-targets` step (no GPU, no
+`gpu-prove.yml` dependency) is the merge-path clippy coverage today — see
+`check_lint_surface_closure.py`'s own module doc.
 
 ## Rule 1 — reachability
 

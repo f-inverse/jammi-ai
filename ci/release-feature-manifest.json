@@ -242,6 +242,49 @@
       }
     }
   },
+  "prove_lane": {
+    "_doc": [
+      "Proof surface == shipped surface (esc-081): the DECLARED set of",
+      "`(crate, kind)` pairs `ci/scripts/runpod_gpu_prove.sh` must invoke on a",
+      "real device. `kind` is one of `release` (a `cargo build --release`/",
+      "`cargo run --release` invocation), `test` (a `cargo test` invocation",
+      "carrying a `--features` tuple, with or without `--no-run`), or",
+      "`default` (a `cargo test` invocation with NO `--features` flag at all",
+      "-- canonicalizes to an empty feature list). `ci/scripts/",
+      "prove_surface.py` computes, for a declared pair, `expected(crate,",
+      "kind) = (this file's own `lanes.cu12-tarball.cargo_features` ∩",
+      "crate's OWN `[features]` table keys) ∪ (this entry's `prove_only`,",
+      "iff kind == test)` -- read hermetically via stdlib `tomllib`, never a",
+      "second hardcoded copy of a crate's feature list. `check_flash_attn_",
+      "closure.py` asserts SET EQUALITY between THIS declared pair set and",
+      "the script's own invocations (one literal tuple text per pair,",
+      "preceded by a `PROVE_TUPLE` echo) -- a dropped `--features`, a",
+      "deleted proof invocation, or an unlisted pair each FAIL. `prove_only`",
+      "names a feature the shipped lane does not itself require but the",
+      "PROOF needs to actually exercise the gated suite (`live-gpu-tests`",
+      "gates every real-device `#[test]` in this workspace) -- it is added",
+      "only to a `test`-kind pair, never to `release` (a release build ships",
+      "exactly the lane's own features, nothing test-only)."
+    ],
+    "crates": {
+      "jammi-server": {
+        "kinds": ["release", "test"],
+        "prove_only": ["live-gpu-tests"]
+      },
+      "jammi-ai": {
+        "kinds": ["test"],
+        "prove_only": ["live-gpu-tests"]
+      },
+      "jammi-bench": {
+        "kinds": ["release"],
+        "prove_only": []
+      },
+      "jammi-kernels": {
+        "kinds": ["default", "test"],
+        "prove_only": []
+      }
+    }
+  },
   "server_only_cargo_features": {
     "_doc": [
       "Features that exist on `jammi-server` with no `jammi-ai` equivalent",

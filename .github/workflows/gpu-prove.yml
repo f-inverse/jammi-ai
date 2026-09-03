@@ -39,12 +39,17 @@ name: GPU prove (RunPod)
 # this by name), so nothing ever auto-starts it and nothing may `uses:` it.
 # Needs the `RUNPOD_API_KEY` repo secret.
 #
-# Every CUDA release lane (server image, release binaries, cu12 wheel)
-# gates its promotion on the SUMMARY of a prove run already on record for
-# the commit it promotes — `ci/scripts/gpu_prove_verdict.py`, consumed via
-# `_gpu-proof-required.yml`, never a fresh rental of its own. A dev
-# dispatches THIS workflow by hand before tagging a release (see
-# docs/maintainer/dev-gpu.md and MAINTAINER-GUIDE.md's release runbook).
+# EVERY release-publishing workflow — CUDA and non-CUDA alike (crates.io,
+# npm, every PyPI dist, the server image, the release binaries) — gates its
+# promotion on the SUMMARY of a prove run already on record for the commit
+# it promotes — `ci/scripts/gpu_prove_verdict.py`, consumed via
+# `_gpu-proof-required.yml`, never a fresh rental of its own, and never a
+# wait: the check is a single, immediate, fail-loud lookup (no poll, no
+# deadline). A dev dispatches THIS workflow by hand before tagging a release
+# (see docs/maintainer/dev-gpu.md and MAINTAINER-GUIDE.md's release
+# runbook) — a tag push on a commit whose prove is not already green fails
+# every release workflow immediately, by design: prove first, then tag,
+# because a tag push commits the version number.
 #
 # BUDGET, ref-type-conditional (esc-080/esc-083 derivation, kept in this ONE
 # place — never copied into a publisher's own comment): a `workflow_dispatch`

@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""Tests for `gpu_prove_verdict.py` (esc-084, issue #454).
+"""Tests for `gpu_prove_verdict.py` (esc-084, issue #454; check-once/
+fail-loud, operator direction 2026-09-03).
 
 Pure Python, no network: every test drives the real `run()`/`evaluate()`/
 `list_runs()`/`collect_measurements()` entry points against an injected fake
-`fetch` (and, for the poll/wait state machine, a fake clock/`sleep`) — never
-a hand-rolled stand-in for the verdict logic itself.
+`fetch` — never a hand-rolled stand-in for the verdict logic itself.
 
 Covers esc-084 control (b): every degenerate record DENIES, individually;
 the positive record set PASSES and prints run/job ids per arch; the
 recency/revocation rule (a later red measurement revokes an earlier green,
-by `completed_at` with a run-id tiebreak); the wait state machine (green
-most-recent wins immediately even with newer in-progress runs; no
-appearance grace, per operator direction 2026-09-03); pagination; and that
-any HTTP/JSON error DENIES (never vacuously passes).
+by `completed_at` with a run-id tiebreak); check-once semantics (an
+in-progress run at this sha is invisible — it never delays or satisfies the
+check; a missing measurement DENIES immediately with the dispatch remedy,
+no grace window, no poll); pagination; and that any HTTP/JSON error DENIES
+(never vacuously passes).
 
 Run directly: `python3 ci/scripts/test_gpu_prove_verdict.py`
 """
@@ -66,25 +67,13 @@ def run_obj(run_id: int, status: str = "completed", sha: str = SHA, path=_DEFAUL
 class World:
     """A tiny fake GitHub REST surface: `runs` and `jobs_by_run` are served
     paginated (honoring `gpu_prove_verdict.PER_PAGE`, which a test may
-    monkeypatch smaller to exercise pagination without 100+ fixture rows).
-    `sleep` is injectable per-test so a poll tick can mutate the world
-    in-place (simulating "the leg finished while we were waiting")."""
+    monkeypatch smaller to exercise pagination without 100+ fixture rows)."""
 
     def __init__(self):
         self.runs: list[dict] = []
         self.jobs_by_run: dict[int, list[dict]] = {}
         self.fetch_calls: list[str] = []
-        self.now_val = 0.0
         self.fail_urls: set[str] = set()
-        self.on_sleep = None  # optional callable(world) -> None
-
-    def now(self) -> float:
-        return self.now_val
-
-    def sleep(self, seconds: float) -> None:
-        self.now_val += seconds
-        if self.on_sleep is not None:
-            self.on_sleep(self)
 
     def fetch(self, url: str, token: str) -> dict:
         self.fetch_calls.append(url)
@@ -110,14 +99,9 @@ def _run_once(world: World, arches=ARCHES, **kwargs):
         repo=REPO,
         sha=SHA,
         workflow=WORKFLOW,
-        deadline_minutes=kwargs.pop("deadline_minutes", 10.0),
-        poll_seconds=kwargs.pop("poll_seconds", 1.0),
-        no_wait=kwargs.pop("no_wait", False),
         fetch=world.fetch,
         token="tok",
         arches=arches,
-        sleep=world.sleep,
-        now=world.now,
         out=out,
         err=err,
         **kwargs,
@@ -304,9 +288,9 @@ class DegenerateRecordsDenyEachOwnTest(unittest.TestCase):
 
         out, err = io.StringIO(), io.StringIO()
         rc = gpv.run(
-            repo=REPO, sha=SHA, workflow=WORKFLOW, deadline_minutes=1.0, poll_seconds=1.0,
-            no_wait=True, fetch=LatestFailsFetch(), token="tok", arches=ARCHES,
-            sleep=lambda s: None, now=lambda: 0.0, out=out, err=err,
+            repo=REPO, sha=SHA, workflow=WORKFLOW,
+            fetch=LatestFailsFetch(), token="tok", arches=ARCHES,
+            out=out, err=err,
         )
         self.assertEqual(rc, 1, "the consumer must read ONLY the filter=latest view, never the all-attempts one")
 
@@ -360,9 +344,9 @@ class DegenerateRecordsDenyEachOwnTest(unittest.TestCase):
 
         out, err = io.StringIO(), io.StringIO()
         rc = gpv.run(
-            repo=REPO, sha=SHA, workflow=WORKFLOW, deadline_minutes=1.0, poll_seconds=1.0,
-            no_wait=False, fetch=BadFetch(), token="tok", arches=ARCHES,
-            sleep=lambda s: None, now=lambda: 0.0, out=out, err=err,
+            repo=REPO, sha=SHA, workflow=WORKFLOW,
+            fetch=BadFetch(), token="tok", arches=ARCHES,
+            out=out, err=err,
         )
         self.assertEqual(rc, 1)
 
@@ -438,13 +422,14 @@ class RevocationAndRecencyTest(unittest.TestCase):
         self.assertIn("run=2", out)
 
 
-class WaitStateMachineTest(unittest.TestCase):
-    """The wait rule (operator direction 2026-09-03: no appearance grace,
-    nothing here ever starts a prove run): green most-recent wins
-    immediately even with newer in-progress runs; red-most-recent-plus-in-
-    progress polls; no candidate denies immediately (no grace); all-
-    completed-with-a-red-leg fails fast (never polls); a deadline is
-    honored; `--no-wait` never polls."""
+class CheckOnceSemanticsTest(unittest.TestCase):
+    """Check-once, fail-loud (operator direction 2026-09-03 — supersedes the
+    earlier poll/wait design): green most-recent measurement passes
+    immediately; an in-progress run is invisible to the check and never
+    delays or satisfies it; no measurement at all DENIES immediately with
+    the dispatch remedy; an all-completed red leg DENIES with the rerun
+    remedy. There is exactly one lookup per run — never a second call to
+    check whether something changed."""
 
     def test_green_most_recent_passes_immediately_even_with_a_newer_in_progress_run(self):
         w = World()
@@ -455,54 +440,35 @@ class WaitStateMachineTest(unittest.TestCase):
         }
         rc, out, err = _run_once(w)
         self.assertEqual(rc, 0, err)
-        self.assertEqual(len(w.fetch_calls), 1 + 2, "no poll: one runs-list call plus one jobs call per run, no more")
+        self.assertEqual(len(w.fetch_calls), 1 + 2, "exactly one runs-list call plus one jobs call per run, no more")
 
-    def test_red_most_recent_plus_in_progress_polls_then_resolves(self):
+    def test_in_progress_run_does_not_delay_or_satisfy_the_check(self):
+        # A run still in_progress at this sha contributes no measurement for
+        # any arch and must never be waited on -- the check-once contract
+        # means this DENIES on the first (and only) lookup, not after some
+        # poll interval.
         w = World()
         w.runs = [run_obj(1, status="in_progress")]
         w.jobs_by_run = {1: [job("sm_80", "failure", "2026-01-01T00:00:00Z"), job("sm_86", "success", "2026-01-01T00:00:00Z")]}
-
-        def on_sleep(world: World) -> None:
-            world.runs = [run_obj(1, status="completed")]
-            world.jobs_by_run = {1: [job("sm_80", "success", "2026-01-01T00:10:00Z"), job("sm_86", "success", "2026-01-01T00:00:00Z")]}
-
-        w.on_sleep = on_sleep
-        rc, out, err = _run_once(w, deadline_minutes=10.0, poll_seconds=1.0)
-        self.assertEqual(rc, 0, err)
-        self.assertIn("run=1", out)
-
-    def test_no_candidate_denies_immediately_no_grace(self):
-        w = World()
-        # completely empty world: no runs at all, nothing in progress.
-        rc, out, err = _run_once(w, deadline_minutes=10.0, poll_seconds=1.0)
+        rc, out, err = _run_once(w)
         self.assertEqual(rc, 1)
-        self.assertEqual(w.now_val, 0.0, "no sleep must ever be called for the no-candidate case (no grace, per S)")
-        self.assertIn("dispatch the prove lane", err)
+        self.assertIn("sm_80", err)
 
-    def test_all_completed_with_a_red_leg_fails_fast_never_polls(self):
+    def test_no_measurement_denies_immediately_with_the_dispatch_remedy(self):
+        w = World()
+        # completely empty world: no runs at all.
+        rc, out, err = _run_once(w)
+        self.assertEqual(rc, 1)
+        self.assertIn("dispatch the prove lane", err)
+        self.assertIn("gh workflow run", err)
+
+    def test_all_completed_with_a_red_leg_denies_with_the_rerun_remedy(self):
         w = World()
         w.runs = [run_obj(1, status="completed")]
         w.jobs_by_run = {1: [job("sm_80", "failure", "2026-01-01T00:00:00Z"), job("sm_86", "success", "2026-01-01T00:00:00Z")]}
-        rc, out, err = _run_once(w, deadline_minutes=10.0, poll_seconds=1.0)
+        rc, out, err = _run_once(w)
         self.assertEqual(rc, 1)
-        self.assertEqual(w.now_val, 0.0, "an all-completed red leg must never poll")
         self.assertIn("gh run rerun 1 --failed", err)
-
-    def test_deadline_reached_denies(self):
-        w = World()
-        w.runs = [run_obj(1, status="in_progress")]
-        w.jobs_by_run = {1: []}
-        rc, out, err = _run_once(w, deadline_minutes=0.01, poll_seconds=1.0)  # 0.6s deadline, 1s poll
-        self.assertEqual(rc, 1)
-        self.assertGreaterEqual(w.now_val, 1.0, "at least one poll tick must have elapsed before the deadline broke the loop")
-
-    def test_no_wait_never_polls(self):
-        w = World()
-        w.runs = [run_obj(1, status="in_progress")]
-        w.jobs_by_run = {1: [job("sm_80", "failure", "2026-01-01T00:00:00Z")]}
-        rc, out, err = _run_once(w, no_wait=True, deadline_minutes=10.0, poll_seconds=1.0)
-        self.assertEqual(rc, 1)
-        self.assertEqual(w.now_val, 0.0, "--no-wait must never sleep")
 
 
 class PaginationTest(unittest.TestCase):

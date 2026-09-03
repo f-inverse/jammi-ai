@@ -106,14 +106,29 @@ jobs:
   # Windows wheel disabled: usearch 2.24.0 uses POSIX mmap APIs
   # (MAP_FAILED) that MSVC does not support.
 
+  gpu-proof:
+    name: GPU proof required
+    # Any `py-v*` TAG ref — a tag push, or a recovery dispatch run on the
+    # tag — requires the release commit's already-recorded GPU-prove
+    # verdict before the native wheel is published (#454 follow-up,
+    # operator direction: every release publisher gates on the prove
+    # verdict, all-or-nothing, not only the CUDA lanes).
+    if: startsWith(github.ref, 'refs/tags/py-v')
+    uses: ./.github/workflows/_gpu-proof-required.yml
+    permissions:
+      contents: read
+      actions: read
+    secrets: inherit
+
   publish:
     name: Publish to PyPI
     # Publishes ONLY from a `py-v*` tag ref (tag push, or a dispatch run on
-    # the tag) — see the workflow_dispatch comment above. Without the guard a
-    # branch dispatch could first-publish an untagged, unreleased build,
-    # which PyPI cannot undo.
-    if: startsWith(github.ref, 'refs/tags/py-v')
-    needs: [build-native-linux, build-native-macos]
+    # the tag) whose commit's GPU-prove verdict is green — see the
+    # workflow_dispatch comment above. Without the guard a branch dispatch
+    # could first-publish an untagged, unreleased build, which PyPI cannot
+    # undo. PURE conjunction (no `||`).
+    if: always() && startsWith(github.ref, 'refs/tags/py-v') && needs.build-native-linux.result == 'success' && needs.build-native-macos.result == 'success' && needs.gpu-proof.result == 'success'
+    needs: [build-native-linux, build-native-macos, gpu-proof]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

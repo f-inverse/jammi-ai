@@ -6,6 +6,35 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+### Changed
+- **Every release-publishing job gates on the commit's GPU-prove verdict, all-or-nothing — not only
+  the CUDA lanes (#454 follow-up).** `crates.yml`'s `publish` (and `github-release`, chained off it),
+  `npm.yml`'s `publish` (gated at its `Publish` step, so the build+test dry run still runs
+  unconditionally), and every PyPI dist (`pypi.yml`, `pypi-client.yml`, `pypi-server.yml`,
+  `pypi-server-cuda.yml`) now call `_gpu-proof-required.yml` the same way the CUDA lanes already did.
+  `server-image.yml`'s CPU image job is split into an ungated `build-and-push-main` (the rolling
+  `:latest` refresh on every merge to `main`, unchanged) and a prove-gated `build-and-push` (the `v*`
+  tag promotion). `release-binaries.yml`'s CLI matrix and CPU tarball are each split into an ungated
+  build leg (always runs, artifact-only) and a prove-gated promote leg (`promote-binaries`,
+  `server-cpu-promote`), mirroring the CUDA tarball's existing `server-cu12-build`/
+  `server-cu12-promote` split. A tag push on a commit whose prove is not already green now publishes
+  NOTHING — every release workflow fails immediately.
+- **The GPU-prove verdict check is CHECK-ONCE and FAIL-LOUD, not a poll (#454 follow-up, operator
+  direction).** `ci/scripts/gpu_prove_verdict.py` no longer waits for an in-progress prove run to
+  finish — a run that has not completed contributes no measurement and is simply invisible to the
+  check. A missing or red measurement for any shipped arch denies immediately, naming the remedy (a
+  fresh dispatch, or `gh run rerun <run_id> --failed` for one red leg). `_gpu-proof-required.yml`
+  drops its `--deadline-minutes`/`--poll-seconds` inputs accordingly (`timeout-minutes: 15`, bounding a
+  single REST lookup, not a wait). The release order is unchanged: prove → green → tag, because a tag
+  push commits the version number.
+- **`ci/scripts/check_gpu_prove_once.py` replaces its CUDA-only `LANE_TABLE` with a reviewed
+  `PROMOTION_TABLE` covering every release-publishing job in the tree**, plus a new discovery rule
+  (P6): any job, in a workflow whose `push:` trigger carries `tags:`, that invokes a publishing
+  primitive (`pypa/gh-action-pypi-publish`, `npm publish`, `ci/scripts/publish_crates.sh`,
+  `./.github/actions/release-upload`, `./.github/actions/docker-publish` with `push: "true"`, `gh
+  release create`/`upload`) and is not listed in `PROMOTION_TABLE` fails by name — closing the
+  "new promoting job is invisible" limitation the module previously disclosed.
+
 ## [0.49.1] - 2026-09-03
 
 A release-engineering patch, shipped in lockstep across the workspace: CUDA

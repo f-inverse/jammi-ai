@@ -6,9 +6,15 @@ name: Release Binaries
 # independent job set: a failure here cannot wedge the crates.io publish, and vice
 # versa.
 #
-# Three asset families ship:
-#   - the CPU `jammi` CLI (the `build` matrix: x86_64-linux + aarch64-darwin),
-#   - the CPU `jammi-server` tarball (`server-cpu`, x86_64-linux), and
+# Three asset families ship, each split into a build leg (runs on every ref,
+# artifact-only, never consults the verdict) and a promote leg (tag-only,
+# gated on the shared GPU-prove verdict — #454 follow-up, operator
+# direction: every release publisher gates on the prove verdict,
+# all-or-nothing, not only the CUDA lanes):
+#   - the CPU `jammi` CLI (`build` matrix: x86_64-linux + aarch64-darwin
+#     builds it, `promote-binaries` matrix uploads it),
+#   - the CPU `jammi-server` tarball (`server-cpu` builds it, x86_64-linux;
+#     `server-cpu-promote` uploads it), and
 #   - the CUDA `jammi-server` tarball (`server-cu12-build` builds it,
 #     `server-cu12-promote` uploads it, x86_64-linux) — the binary plus the
 #     CUDA runtime `.so`s it links and an `LD_LIBRARY_PATH` launcher, so it
@@ -17,19 +23,20 @@ name: Release Binaries
 # (`server-image.yml`) and the `jammi-server-cu12` PyPI wheel (`pypi-server-cuda.yml`).
 #
 # `workflow_dispatch` has two modes, keyed on the REF the dispatch runs on:
-#   - a branch: every job's BUILD half is a no-release exercise — assets are
-#     uploaded as workflow artifacts only; no release is touched. The CUDA
-#     leg's `server-cu12-promote` half does not run at all on a branch ref
-#     (its `if:` requires a `v*` tag) — there is no release to promote onto
-#     and no verdict lookup to make on a ref that can never own one.
-#   - the `v*` tag itself: identical to the tag push — every job rebuilds
-#     from the tag's own commit and re-attaches its asset to that release
-#     (the CUDA leg's promote step requires the tag commit's already-
-#     recorded GPU-prove verdict — see `gpu-proof` below; nothing here
-#     starts a new prove run). This recovers a release whose assets are
-#     missing without re-cutting the tag, and an asset attached to release
-#     vX is thereby always built from vX's commit — a caller-chosen branch
-#     tip can never be promoted onto a release.
+#   - a branch: every BUILD leg is a no-release exercise — assets are
+#     uploaded as workflow artifacts only; no release is touched. Every
+#     PROMOTE leg (`promote-binaries`, `server-cpu-promote`,
+#     `server-cu12-promote`) does not run at all on a branch ref (its `if:`
+#     requires a `v*` tag) — there is no release to promote onto and no
+#     verdict lookup to make on a ref that can never own one.
+#   - the `v*` tag itself: identical to the tag push — every build leg
+#     rebuilds from the tag's own commit, and every promote leg re-attaches
+#     its asset to that release (gated on the tag commit's already-recorded
+#     GPU-prove verdict — see `gpu-proof` below; nothing here starts a new
+#     prove run). This recovers a release whose assets are missing without
+#     re-cutting the tag, and an asset attached to release vX is thereby
+#     always built from vX's commit — a caller-chosen branch tip can never
+#     be promoted onto a release.
 # On a `v*` tag push the assets always go to the release named by the tag.
 #
 # The release these assets attach to is created idempotently by whichever leg
@@ -64,8 +71,17 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     permissions:
-      # `gh release create` / `gh release upload` (the release-upload action).
-      contents: write
+      contents: read
+    outputs:
+      # BLOCK: GitHub Actions matrix-job outputs are ambiguous across legs
+      # (the last matrix leg to finish wins for ALL legs) -- this output is
+      # informational parity with the non-matrixed legs only; `promote-
+      # binaries` below never reads it, and instead recomputes the exact
+      # asset filename by locating the one file its own downloaded artifact
+      # contains (deterministic: `package_release_bin.sh`'s name is
+      # `<bin>-<version>-<triple>.tar.gz`, and the version comes from the
+      # SAME checked-out commit both jobs share).
+      asset: ${{ steps.package.outputs.asset }}
     strategy:
       fail-fast: false
       matrix:
@@ -134,12 +150,64 @@ jobs:
         shell: bash
         run: bash ci/scripts/package_release_bin.sh jammi "${{ matrix.target }}"
 
-      # Release attach (any `v*` tag ref) or workflow-artifact upload (branch
-      # dispatch) — the shared release-upload action decides which, and owns
-      # the idempotent `gh release create` + bounded retry.
+      # ALWAYS a workflow artifact -- on every ref (branch dispatch OR a
+      # `v*` tag push). This job never consults the GPU-prove verdict (it
+      # never promotes anything on its own); `promote-binaries` below is the
+      # ONLY job that attaches this asset to a release, and it does so only
+      # on a proven tag ref. A unique per-target artifact name is required
+      # -- GitHub rejects two artifacts of the same name in one run, and
+      # this matrix has two legs.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jammi-${{ matrix.target }}
+          path: ${{ steps.package.outputs.asset }}
+
+  promote-binaries:
+    name: Promote ${{ matrix.target }} to the release
+    # build → proof → promote: attaches to the release ONLY on a `v*` tag ref
+    # (push or dispatch-on-tag) whose commit's GPU-prove verdict is green
+    # (#454 follow-up, operator direction: every release publisher gates on
+    # the prove verdict, all-or-nothing, not only the CUDA lanes). `build`
+    # above already exercises the packaging loop on every dispatch as an
+    # artifact-only rehearsal; a branch dispatch never reaches this job at
+    # all (the `if:` requires a tag ref) — there is no release to promote
+    # onto and no verdict lookup to make on a ref that can never own one.
+    # The `if:` is a PURE conjunction (no `||`).
+    needs: [build, gpu-proof]
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.build.result == 'success' && needs.gpu-proof.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+          - target: aarch64-apple-darwin
+    runs-on: ubuntu-latest
+    permissions:
+      # `gh release create` / `gh release upload` (the release-upload action).
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: jammi-${{ matrix.target }}
+
+      # Deterministic recompute (see `build`'s own `outputs.asset` comment
+      # above for why this is not read cross-matrix): the downloaded
+      # artifact's directory holds exactly one file, packaged by
+      # `package_release_bin.sh` as `jammi-<version>-${{ matrix.target }}
+      # .tar.gz` from this same checked-out commit's Cargo.toml.
+      - name: Locate the downloaded asset
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="$(ls "jammi-"*"-${{ matrix.target }}.tar.gz")"
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
       - uses: ./.github/actions/release-upload
         with:
-          asset: ${{ steps.package.outputs.asset }}
+          asset: ${{ steps.locate.outputs.asset }}
 
   # ---- CPU jammi-server tarball ----
   # Mirrors the CPU `jammi` CLI job above: x86_64-linux, built in the CI base
@@ -150,8 +218,9 @@ jobs:
     runs-on: ubuntu-latest
     container: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
     permissions:
-      # `gh release create` / `gh release upload` (the release-upload action).
-      contents: write
+      contents: read
+    outputs:
+      asset: ${{ steps.package.outputs.asset }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
@@ -168,12 +237,40 @@ jobs:
         shell: bash
         run: bash ci/scripts/package_release_bin.sh jammi-server x86_64-unknown-linux-gnu
 
-      # Release attach (any `v*` tag ref) or workflow-artifact upload (branch
-      # dispatch) — the shared release-upload action decides which, and owns
-      # the idempotent `gh release create` + bounded retry.
+      # ALWAYS a workflow artifact -- this job never consults the GPU-prove
+      # verdict (it never promotes anything on its own); `server-cpu-
+      # promote` below is the only job that attaches this asset to a
+      # release, and only on a proven tag ref.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jammi-server-cpu-tarball
+          path: ${{ steps.package.outputs.asset }}
+
+  server-cpu-promote:
+    name: Promote jammi-server (CPU) to the release
+    # build → proof → promote: uploads to the release ONLY on a `v*` tag ref
+    # (push or dispatch-on-tag) whose commit's GPU-prove verdict is green
+    # (#454 follow-up, operator direction: every release publisher gates on
+    # the prove verdict, all-or-nothing, not only the CUDA lanes). The `if:`
+    # is a PURE conjunction (no `||`) — no non-tag branch-dispatch escape
+    # hatch: `server-cpu` above already exercises the packaging loop on
+    # every dispatch as an artifact-only rehearsal.
+    needs: [server-cpu, gpu-proof]
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.server-cpu.result == 'success' && needs.gpu-proof.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      # `gh release create` / `gh release upload` (the release-upload action).
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: jammi-server-cpu-tarball
+
       - uses: ./.github/actions/release-upload
         with:
-          asset: ${{ steps.package.outputs.asset }}
+          asset: ${{ needs.server-cpu.outputs.asset }}
 
   # ---- CUDA jammi-server tarball ----
   # Built in the CUDA CI base image (CUDA 12.6 toolkit). The tarball is

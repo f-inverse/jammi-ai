@@ -57,17 +57,15 @@ env:
   IMAGE_NAME_CU12: ${{ github.repository_owner }}/jammi-ai-server-cu12
 
 jobs:
-  # CPU image: pushed from `v*` tag refs (semver tags) and from the default
-  # branch (`latest` + sha) — a tag push, or a recovery dispatch run on the
-  # tag or on main. A feature-branch dispatch pushes nothing: the
-  # `latest`/semver scheme is a promotion channel, the same rationale the
-  # CUDA job below states, minus the A100 gate (the CPU path is exercised by
-  # the workspace's regular CI on every merge). Never runs on pull_request
-  # (PRs must not push to GHCR).
-  build-and-push:
-    if: >-
-      github.event_name != 'pull_request' &&
-      (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main')
+  # CPU image, main-branch arm: pushed from the default branch (`latest` +
+  # sha) only — a merge to `main`, or a recovery dispatch run on main. This
+  # arm is UNGATED: it never promotes a `v*`/semver tag (see `build-and-push`
+  # below for that), only the rolling `:latest`/`:sha-...` channel a merge to
+  # main always refreshes, the same way it always has — the GPU-prove gate
+  # (#454 follow-up) applies to a RELEASE tag, not to every merge. Never runs
+  # on pull_request (PRs must not push to GHCR).
+  build-and-push-main:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -81,6 +79,31 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags-spec: |
             type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long
+          push: "true"
+
+  # CPU image, tag arm: pushed from `v*` tag refs (semver tags) only — a tag
+  # push, or a recovery dispatch run on the tag — behind the shared
+  # GPU-prove verdict (#454 follow-up, operator direction: every release
+  # publisher gates on the prove verdict, all-or-nothing, not only the CUDA
+  # lanes). Split from the main-branch arm above so the ungated rolling
+  # `:latest` refresh on every merge is never blocked by, or conflated with,
+  # a release-tag promotion's gate.
+  build-and-push:
+    needs: [gpu-proof]
+    if: always() && github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v') && needs.gpu-proof.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/docker-publish
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags-spec: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,format=long

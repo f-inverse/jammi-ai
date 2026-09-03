@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """GPU-prove-lane timing/outcome artifact producer (esc-080/esc-083).
 
-Parses a `gpu-prove.yml`/`_gpu-prove-gate.yml` job log (the raw, tab-
+Parses a `gpu-prove.yml` job log (the raw, tab-
 separated `<job>\\t<step>\\t<ISO8601 timestamp> <message>` form `gh run view
 --log` emits) and writes one `ci/artifacts/gpu-prove-timings/<run_id>-
 <arch>.json` artifact — the evidence `ci/scripts/check_gpu_prove_timings.py`
@@ -104,7 +104,22 @@ _ENDGROUP_RE = re.compile(r"##\[endgroup\]\s*$")
 # prove_surface.py rather than compiled here a second time, so this and the
 # bash-side `rp_parse_prove_marker` (runpod_lib.sh) cannot silently drift.
 _GROUP_RC_RE = prove_surface.PROVE_GROUP_RC_RE
-_PROVE_SHA_RE = re.compile(r"PROVE_SHA=(?P<sha>[0-9a-f]+)")
+_PROVE_SHA_RE = prove_surface.PROVE_SHA_RE
+# esc-084/#454: the driver's own `WRONG TREE` diagnostic
+# (`runpod_lib.sh`'s `rp_run_remote_watched`) names the sha it expected and
+# the sha it actually saw (or the literal token `none` when no `PROVE_SHA=`
+# line was ever observed by session end). Checked against the WHOLE log
+# text (like `_DRIVER_EXIT_LINE_RE`'s BUDGET/NO PROGRESS siblings below),
+# never per-line inside the measured window. BLOCK B9 audit fix: the
+# diagnostic does NOT only fire before any proof group opens or after the
+# window has closed with nothing else in the log -- the driver's final-
+# flush and absence arms can (and do) leave a `PROVE_EXIT=0` line and every
+# gating group green in the SAME log as this diagnostic, when the remote
+# script itself ran to completion believing it succeeded and the driver
+# only caught the wrong tree in its own final flush. `build_artifact` below
+# therefore tests THIS match before `has_prove_exit`, not after -- the
+# driver's 77 wins regardless of which other markers are present.
+_WRONG_TREE_RE = re.compile(r"WRONG TREE expected=(?P<expected>\S+) got=(?P<got>\S+)")
 _PROVE_TUPLE_RE = re.compile(r"PROVE_TUPLE crate=(?P<crate>\S+) kind=(?P<kind>\S+) features=(?P<features>\S*)")
 _PROVE_EXIT_RE = re.compile(r"PROVE_EXIT=(?P<rc>-?\d+)")
 _DEVICE_CSV_RE = re.compile(r"^(?P<name>[^,]+),\s*[\d.]+,\s*(?P<driver>[\d.]+)\s*$")
@@ -326,7 +341,16 @@ def build_artifact(
     allow_incomplete: bool = False,
 ) -> dict:
     parsed = parse_log(log_text, legacy)
-    git_sha = git_sha or parsed["git_sha"]
+    # Computed unconditionally (legacy or current, explicit or auto-derived
+    # --outcome): the WRONG TREE diagnostic can land in either log shape,
+    # and an explicit `--outcome wrong-tree` still needs it below to
+    # recover `expected`/`got` for the artifact's own `git_sha`/`proved_sha`.
+    # A wrong-tree leg that never observed ANY `PROVE_SHA=` line (`got=none`)
+    # has no `parsed["git_sha"]` at all -- its own `expected=` is the ONLY
+    # honest source of `git_sha` short of an explicit `--git-sha`, so it is
+    # tried BEFORE the "no git_sha derivable" refusal below, not after.
+    wrong_tree_match = _WRONG_TREE_RE.search(log_text)
+    git_sha = git_sha or parsed["git_sha"] or (wrong_tree_match.group("expected") if wrong_tree_match else None)
     box = box or parsed["box"]
     driver = driver or parsed["driver"]
     if not git_sha:
@@ -370,7 +394,22 @@ def build_artifact(
             has_budget_evidence = "BUDGET" in log_text
             has_no_progress_evidence = "NO PROGRESS" in log_text
 
-            if has_prove_exit:
+            # BLOCK B9 audit fix: the driver's own WRONG TREE diagnostic is
+            # tested FIRST, before `has_prove_exit` -- the bash-side final-
+            # flush and absence arms (runpod_lib.sh's `rp_run_remote_watched`)
+            # both leave a `PROVE_EXIT=0` line (and every gating marker
+            # green) on a leg the driver itself refused as rc 77: the remote
+            # script ran to completion believing it succeeded, but the
+            # driver detected the wrong tree only in its OWN final flush,
+            # AFTER the remote had already printed everything. Testing
+            # `has_prove_exit` first would commit that leg as `healthy` at
+            # the WRONG sha. The driver's 77 wins regardless of which
+            # markers landed, exactly like `rp_run_remote_watched` itself:
+            # the wrong-tree check runs unconditionally at exit and wins
+            # over the remote's own reported success.
+            if wrong_tree_match is not None:
+                outcome = "wrong-tree"
+            elif has_prove_exit:
                 if parsed["prove_exit"] == 0 and all_gating_present and all_gating_pass:
                     outcome = "healthy"
                 elif not all_gating_present:
@@ -396,14 +435,34 @@ def build_artifact(
             elif has_no_progress_evidence:
                 outcome = "watchdog-kill"
             else:
-                # No PROVE_EXIT, no BUDGET line, no NO-PROGRESS line -- the
-                # log gives no honest basis to pick an outcome. Refuse
-                # rather than default to a specific guess.
+                # No WRONG TREE line, no PROVE_EXIT, no BUDGET line, no
+                # NO-PROGRESS line -- the log gives no honest basis to pick
+                # an outcome. Refuse rather than default to a specific
+                # guess.
                 raise ValueError(
-                    "cannot auto-derive an outcome: no PROVE_EXIT= line, and neither a BUDGET "
-                    "nor a NO PROGRESS driver diagnostic was found in the log -- pass --outcome "
-                    "explicitly"
+                    "cannot auto-derive an outcome: no PROVE_EXIT= line, and neither a BUDGET, "
+                    "NO PROGRESS, nor WRONG TREE driver diagnostic was found in the log -- pass "
+                    "--outcome explicitly"
                 )
+
+    # esc-084/#454: a wrong-tree leg proved nothing -- record
+    # the sha it EXPECTED as `git_sha` (the identity check happens outside
+    # any proof group, so `parsed["git_sha"]` -- the observed `PROVE_SHA=`
+    # line, if the mismatch itself was echoed -- is a `proved_sha`, never
+    # this artifact's own `git_sha`). No SCHEMA_VERSION bump: `proved_sha`
+    # is an additive optional key and `check_gpu_prove_timings.py` never
+    # rejects an unrecognized key, only a recognized one in the wrong shape.
+    proved_sha: str | None = None
+    if outcome == "wrong-tree":
+        if wrong_tree_match is not None:
+            git_sha = wrong_tree_match.group("expected")
+            got = wrong_tree_match.group("got")
+            proved_sha = None if got == "none" else got
+        elif not git_sha:
+            raise ValueError(
+                "outcome=wrong-tree but no WRONG TREE diagnostic was found in the log and no "
+                "--git-sha was given to supply the expected sha"
+            )
 
     artifact: dict = {
         "schema_version": SCHEMA_VERSION,
@@ -438,6 +497,8 @@ def build_artifact(
         "groups": groups,
         "disposition": None,
     }
+    if outcome == "wrong-tree":
+        artifact["proved_sha"] = proved_sha
     if outcome == "watchdog-kill":
         artifact["silent_gap_lower_bound_s"] = parsed["max_silent_gap_s"]
     else:
@@ -636,6 +697,49 @@ def _watchdog_kill_synth_log() -> str:
     return _synth_log(lines)
 
 
+def _wrong_tree_synth_log(observed_prove_sha: str | None) -> str:
+    """`device` opens/closes first (the real driver's own group order --
+    it runs before the clone), THEN the identity check fires -- outside any
+    proof group, matching `runpod_gpu_prove.sh`'s own heredoc order.
+    `observed_prove_sha=None` reproduces the "absence" case (session ended
+    with no `PROVE_SHA=` line at all)."""
+    lines = [
+        "##[group]device",
+        "name, compute_cap, driver_version",
+        "NVIDIA A100 80GB PCIe, 8.0, 570.195.03",
+        "CUDA_COMPUTE_CAP=80",
+        "##[endgroup]",
+    ]
+    if observed_prove_sha is not None:
+        lines.append(f"PROVE_SHA={observed_prove_sha}")
+    got = observed_prove_sha or "none"
+    lines.append(f'=== GPU prove: WRONG TREE expected={"f" * 40} got={got} ===')
+    return _synth_log(lines)
+
+
+def _wrong_tree_healthy_synth_log(observed_prove_sha: str | None) -> str:
+    """BLOCK B9 audit fix regression fixture: the WRONG-TREE-in-the-final-
+    flush shape -- the remote script ran ALL THE WAY to a self-reported
+    healthy finish (every gating group green, `PROVE_EXIT=0`) and the
+    driver's own identity check only caught the mismatch (or the absence)
+    in its final flush, AFTER the remote had already printed its own
+    success. `observed_prove_sha=None` reproduces the absence sub-case: no
+    `PROVE_SHA=` line was ever echoed, yet the rest of the leg still looks
+    entirely healthy on its own terms. Either way `build_artifact` must
+    still resolve `wrong-tree`, never `healthy` -- the driver's 77 wins
+    regardless of which markers landed."""
+    lines = list(_healthy_lines())
+    if observed_prove_sha is None:
+        # Drop the PROVE_SHA= echo the base healthy log carries -- the
+        # absence sub-case never observed one at all.
+        lines = [ln for ln in lines if not ln.startswith("PROVE_SHA=")]
+        got = "none"
+    else:
+        got = observed_prove_sha
+    lines.append(f'=== GPU prove: WRONG TREE expected={"f" * 40} got={got} ===')
+    return _synth_log(lines)
+
+
 def _self_test() -> int:
     failures: list[str] = []
     total = 0
@@ -694,6 +798,68 @@ def _self_test() -> int:
 
     watchdog_artifact = build_artifact(arch="sm_80", run_id="5", job_id="5", log_text=_watchdog_kill_synth_log(), legacy=False)
     check("watchdog-kill-outcome", watchdog_artifact["outcome"] == "watchdog-kill", f"{watchdog_artifact['outcome']}")
+
+    # esc-084/#454: wrong-tree, both shapes -- a real (wrong)
+    # PROVE_SHA was observed, and the absence case (no PROVE_SHA at all).
+    wrong_tree_artifact = build_artifact(
+        arch="sm_80", run_id="6", job_id="6", log_text=_wrong_tree_synth_log("a" * 40), legacy=False
+    )
+    check("wrong-tree-outcome", wrong_tree_artifact["outcome"] == "wrong-tree", f"{wrong_tree_artifact['outcome']}")
+    check("wrong-tree-git-sha-is-expected", wrong_tree_artifact["git_sha"] == "f" * 40, wrong_tree_artifact["git_sha"])
+    check("wrong-tree-proved-sha-is-got", wrong_tree_artifact["proved_sha"] == "a" * 40, wrong_tree_artifact.get("proved_sha"))
+    check("wrong-tree-has-wall-lower-bound", "wall_lower_bound_s" in wrong_tree_artifact, "")
+
+    wrong_tree_absent_artifact = build_artifact(
+        arch="sm_86", run_id="7", job_id="7", log_text=_wrong_tree_synth_log(None), legacy=False
+    )
+    check("wrong-tree-absent-outcome", wrong_tree_absent_artifact["outcome"] == "wrong-tree", f"{wrong_tree_absent_artifact['outcome']}")
+    check("wrong-tree-absent-git-sha-is-expected", wrong_tree_absent_artifact["git_sha"] == "f" * 40, wrong_tree_absent_artifact["git_sha"])
+    check("wrong-tree-absent-proved-sha-is-none", wrong_tree_absent_artifact["proved_sha"] is None, wrong_tree_absent_artifact.get("proved_sha"))
+
+    # BLOCK B9 audit fix regression: a log that ALSO carries PROVE_EXIT=0
+    # and every gating group green (the final-flush shape) must still
+    # resolve `wrong-tree`, never `healthy` -- the driver's 77 wins
+    # regardless of which other markers landed in the same log.
+    wrong_tree_healthy_artifact = build_artifact(
+        arch="sm_80", run_id="8", job_id="8", log_text=_wrong_tree_healthy_synth_log("a" * 40), legacy=False
+    )
+    check(
+        "wrong-tree-wins-over-healthy-markers-outcome",
+        wrong_tree_healthy_artifact["outcome"] == "wrong-tree",
+        f"{wrong_tree_healthy_artifact['outcome']}",
+    )
+    check(
+        "wrong-tree-wins-over-healthy-markers-git-sha-is-expected",
+        wrong_tree_healthy_artifact["git_sha"] == "f" * 40,
+        wrong_tree_healthy_artifact["git_sha"],
+    )
+    check(
+        "wrong-tree-wins-over-healthy-markers-proved-sha-is-got",
+        wrong_tree_healthy_artifact["proved_sha"] == "a" * 40,
+        wrong_tree_healthy_artifact.get("proved_sha"),
+    )
+
+    # Same shape, absence sub-case: PROVE_EXIT=0 and every gating group
+    # green, but NO PROVE_SHA= line was ever echoed -- still `wrong-tree`,
+    # `proved_sha` null.
+    wrong_tree_healthy_absent_artifact = build_artifact(
+        arch="sm_86", run_id="9", job_id="9", log_text=_wrong_tree_healthy_synth_log(None), legacy=False
+    )
+    check(
+        "wrong-tree-healthy-absent-outcome",
+        wrong_tree_healthy_absent_artifact["outcome"] == "wrong-tree",
+        f"{wrong_tree_healthy_absent_artifact['outcome']}",
+    )
+    check(
+        "wrong-tree-healthy-absent-git-sha-is-expected",
+        wrong_tree_healthy_absent_artifact["git_sha"] == "f" * 40,
+        wrong_tree_healthy_absent_artifact["git_sha"],
+    )
+    check(
+        "wrong-tree-healthy-absent-proved-sha-is-none",
+        wrong_tree_healthy_absent_artifact["proved_sha"] is None,
+        wrong_tree_healthy_absent_artifact.get("proved_sha"),
+    )
 
     # D5 measurement-scope fix: a runner preamble (provisioning/checkout
     # groups + a 500+s SSH-wait gap) BEFORE `::group::device` must not move
@@ -759,7 +925,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--git-sha")
     ap.add_argument(
         "--outcome",
-        choices=["healthy", "budget-cut", "watchdog-kill", "suite-fail", "capacity", "log-incomplete"],
+        choices=["healthy", "budget-cut", "watchdog-kill", "suite-fail", "capacity", "log-incomplete", "wrong-tree"],
     )
     ap.add_argument("--box")
     ap.add_argument("--driver")

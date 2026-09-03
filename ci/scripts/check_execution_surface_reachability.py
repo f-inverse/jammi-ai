@@ -6,12 +6,14 @@
 `ci/scripts/pod_seed_target.sh` runs a fixed set of CUDA/CUTLASS-toolchain-
 gated `cargo` invocations (its own T1/T1b/T2/T3 tuples) on every fresh pod's
 auto-seed — a leg reds the WHOLE seed the moment its own tuple regresses.
-`ci/scripts/runpod_gpu_prove.sh` (invoked by `gpu-prove.yml`, itself
-`workflow_dispatch` / `pull_request: types: [labeled]` / nightly `schedule`
-— NEVER a trigger that fires on every PR-to-main or push-to-main; also
-invoked by the reusable `_gpu-prove-gate.yml`, itself only reachable from
-release-tag-scoped callers, see the allowlist's own notes) carries a
-byte-identical twin of several of those same tuples.
+`ci/scripts/runpod_gpu_prove.sh` (invoked from exactly ONE place,
+`gpu-prove.yml` — `workflow_dispatch` / `pull_request: types: [labeled]` /
+nightly `schedule`, NEVER a trigger that fires on every PR-to-main or
+push-to-main, and never `push:`/`workflow_call:`-able either
+(`check_gpu_prove_once.py`'s P1 rule pins this by name); every CUDA release
+lane consumes its already-recorded verdict instead of invoking it a second
+time — see the allowlist's own notes) carries a byte-identical twin of
+several of those same tuples.
 
 `check_ci_guard_wiring.py` (the gate this one supersedes-in-part for this
 class) answers ONE question: does a script's NAME appear in SOME workflow's
@@ -239,7 +241,7 @@ origin bookkeeping) before any tuple is extracted.
 ### disclosed narrowness, not silently assumed
 
 `workflow_call`-only workflows (reusable workflows with no direct trigger
-of their own, e.g. `_gpu-prove-gate.yml`, `_pypi-server.yml`) are never
+of their own, e.g. `_gpu-proof-required.yml`, `_pypi-server.yml`) are never
 evaluated TRANSITIVELY through a caller's `uses:` — a cargo invocation
 living inside a reusable workflow's own body would not be credited even if
 its caller is genuinely merge-path, because nothing in this class currently
@@ -369,14 +371,16 @@ enforces for a different artifact class.
 ## Honest residual — CUDA tuples force a written choice
 
 Every tuple this class registers needs a REAL CUDA/CUTLASS toolchain to run
-meaningfully; the only lane that has one (`gpu-prove.yml` and the reusable
-`_gpu-prove-gate.yml` it shares its `runpod_gpu_prove.sh` driver-script with
-— see the allowlist's own notes for the full invocation chain) is, by this
-repo's own design, never a merge-path trigger for this class's own scripts.
-That leaves exactly two honest choices per tuple, never a silent third:
+meaningfully; the only lane that has one (`gpu-prove.yml`, the single
+`runpod_gpu_prove.sh` producer — see the allowlist's own notes) is, by this
+repo's own design, never a merge-path trigger for this class's own scripts,
+and never in the critical path of an automated workflow at all — see that
+workflow's own header for the canonical statement of why; every CUDA
+release lane instead consumes its already-recorded verdict via
+`_gpu-proof-required.yml`. That leaves exactly two honest choices per
+tuple, never a silent third:
 
-  (a) `gpu-prove.yml` (or the release-lane chain through
-      `_gpu-prove-gate.yml`) is promoted to a REQUIRED merge-path check.
+  (a) `gpu-prove.yml` is promoted to a REQUIRED merge-path check.
       This is a GitHub branch-protection ruleset setting, not committed
       workflow YAML — nothing in this checkout can mechanically prove or
       disprove it, so this gate can never credit it automatically.

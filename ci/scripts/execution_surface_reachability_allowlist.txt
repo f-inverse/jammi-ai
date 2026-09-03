@@ -20,26 +20,26 @@
 # HONEST RESIDUAL (see the gate's own module doc "Honest residual" section):
 # every row below needs a real CUDA/CUTLASS toolchain to run meaningfully.
 # `runpod_gpu_prove.sh` (the driver script several rows below reference) is
-# invoked from TWO places, not one: directly by `gpu-prove.yml`
+# invoked from exactly ONE workflow, `gpu-prove.yml`
 # (`workflow_dispatch` / `pull_request: types: [labeled]` / nightly
-# `schedule`), and by the reusable `_gpu-prove-gate.yml` (a release gate
-# `uses:`-called from `_pypi-server.yml` — itself called by BOTH
-# `pypi-server.yml` (`with: run_gpu_prove: false` — never triggers this
-# gate) and `pypi-server-cuda.yml` (`with: run_gpu_prove: true`) — and from
-# `server-image.yml` and `release-binaries.yml`).
-# NEITHER chain is merge-path: `gpu-prove.yml`'s own triggers are label/
-# dispatch/schedule-only; the three `_gpu-prove-gate.yml` callers are each
-# scoped to `push: tags: [...]` and/or `workflow_dispatch` (release lanes),
-# and where any of them ALSO carries a `pull_request` trigger
-# (`pypi-server-cuda.yml`, `server-image.yml`), that trigger's own `paths:`
-# filter is scoped to packaging/Dockerfile changes, never `ci/scripts/**`.
-# The residual survives via tag/dispatch-gating and path-filter narrowness,
-# not via "only one caller" — promoting ANY of these chains to a REQUIRED
-# merge-path check is a GitHub branch-protection ruleset setting, not
-# committed workflow YAML, so nothing in this checkout can verify it —
-# `GPU_PROVE_PROMOTED_TO_REQUIRED` in the gate script stays `False` until a
-# human flips it (with a comment recording how the promotion was verified).
-# Until then every row below is the honest, written, non-silent choice: each
+# `schedule` — deliberately no `push:`/`workflow_call:` trigger and no
+# workflow may `uses:` it, `check_gpu_prove_once.py`'s P1 rule pins this by
+# name). Every CUDA release lane (`server-image.yml`, `release-binaries.yml`,
+# `pypi-server-cuda.yml` — the last calls `_gpu-proof-required.yml` DIRECTLY;
+# `_pypi-server.yml` carries no gate at all, only the build/package steps)
+# instead consumes that commit's already-recorded verdict through
+# `_gpu-proof-required.yml` — a hermetic API read, never a second invocation
+# of this driver script.
+# NOT merge-path: `gpu-prove.yml`'s own triggers are label/dispatch/
+# schedule-only, and it is never `push:`-triggered by a tag either (a dev
+# dispatches it by hand before tagging). The residual survives via that
+# trigger scoping alone, not via "only one caller" — promoting this
+# workflow to a REQUIRED merge-path check is a GitHub branch-protection
+# ruleset setting, not committed workflow YAML, so nothing in this checkout
+# can verify it — `GPU_PROVE_PROMOTED_TO_REQUIRED` in the gate script stays
+# `False` until a human flips it (with a comment recording how the
+# promotion was verified). Until then every row below is the honest,
+# written, non-silent choice: each
 # tuple stays off the merge path BY NAME, not by omission.
 
 # --- ci/scripts/pod_seed_target.sh's own T1/T1b/T2/T3 (esc-050/esc-051) ---
@@ -73,8 +73,8 @@ cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capa
 # --- ci/scripts/runpod_gpu_prove.sh's own LIVE suites (distinct from the
 # --no-run compile-checks above: these actually execute on the rented A100,
 # not merely compile). See the HONEST RESIDUAL note above for this script's
-# own two-caller chain (gpu-prove.yml directly, and _gpu-prove-gate.yml via
-# three release-tag-scoped workflows) — neither is merge-path. Every literal
+# single invocation chain (gpu-prove.yml, dispatch/label/schedule only) —
+# never merge-path. Every literal
 # below is esc-081's widened prove_lane surface (K4: the served proof now
 # runs the shipped attention surface; the kernels/engine-core suites widen
 # to `cuda,flash-attn` per the manifest's own `prove_lane.crates` declared

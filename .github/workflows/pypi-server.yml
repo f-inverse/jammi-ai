@@ -47,7 +47,6 @@ jobs:
       package_dir: packaging/server-cpu
       artifact_prefix: server-cpu
       platform_tag: manylinux_2_28_x86_64
-      run_gpu_prove: false
     secrets: inherit
 
   publish:
@@ -57,9 +56,9 @@ jobs:
     # an existing version, so re-running the tag is idempotent). A branch
     # dispatch or PR is an artifact-only dry run and can never publish. Same
     # recovery contract as `pypi.yml`/`pypi-client.yml` on this lockstep
-    # surface. The implicit success() on this `if` requires the WHOLE called
-    # workflow (build -> package; gpu-prove is a no-op skip on this ungated
-    # leg, which does not fail the calling job) to have succeeded.
+    # surface. This leg has no GPU gate at all: the CPU wheel's called
+    # workflow is build -> package only, so the implicit success() on this
+    # `if` requires just that to have succeeded.
     if: startsWith(github.ref, 'refs/tags/py-v')
     needs: server-cpu
     runs-on: ubuntu-latest

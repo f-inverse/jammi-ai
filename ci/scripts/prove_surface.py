@@ -79,6 +79,21 @@ KINDS = (KIND_RELEASE, KIND_TEST, KIND_DEFAULT)
 # asserts identical (name, rc) extraction.
 PROVE_GROUP_RC_RE = re.compile(r"PROVE_GROUP_RC name=(?P<name>\S+) rc=(?P<rc>-?\d+)")
 
+# The ONE grammar for the `PROVE_SHA=<sha>` marker (esc-084/#454):
+# `runpod_gpu_prove.sh` echoes it right after clone. One parser PER
+# LANGUAGE, not one shared import across languages -- bash cannot `import` a
+# Python module. `ci/scripts/perf/gpu_prove_timings.py` imports THIS
+# constant directly (both are Python), so that pairing can never drift.
+# `runpod_lib.sh`'s `rp_parse_prove_sha` is the bash-side twin: it MIRRORS
+# this exact shape (`[0-9a-f]+` after the `PROVE_SHA=` literal, first match
+# only, no anchors) by hand, since bash has no cross-language import.
+# `test_gpu_prove_lane.sh`'s `xp_sha_div_check` cross-parser fixture is what
+# actually pins the two mirrored grammars to agreement: it feeds both
+# parsers the identical set of inputs and asserts identical (sha) or
+# identical NOMATCH -- the same discipline `PROVE_GROUP_RC_RE` above already
+# established for `PROVE_GROUP_RC`.
+PROVE_SHA_RE = re.compile(r"PROVE_SHA=(?P<sha>[0-9a-f]+)")
+
 
 def declared(crate: str, repo_root: Path = REPO_ROOT) -> set[str]:
     """`crates/<crate>/Cargo.toml`'s own `[features]` table keys."""

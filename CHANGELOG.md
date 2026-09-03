@@ -6,6 +6,38 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+### Changed
+- **A release commit is proven once, and every CUDA release lane shares that verdict (#454, esc-084).**
+  `gpu-prove.yml` is the single prove producer — off the merge path, never in the critical path of an
+  automated workflow (deliberately no `push:`/`workflow_call:` trigger; a dev dispatches it by hand
+  before tagging a release). The server image, release binaries, and cu12 wheel lanes no longer rent a
+  GPU of their own: each calls the new reusable `_gpu-proof-required.yml`, which reads the promoted
+  commit's already-recorded per-arch verdict (`ci/scripts/gpu_prove_verdict.py`) and fails the
+  promotion closed on any missing or non-`success` measurement. A later red measurement revokes an
+  earlier green until a re-run succeeds; recovery from a flaky leg is `gh run rerun <run_id> --failed`
+  on the one affected leg, never a fresh four-pod rental. The reusable `_gpu-prove-gate.yml` (three
+  independent renting callers per release) is deleted; `ci/scripts/check_gpu_prove_once.py` pins the
+  exactly-once-producer, no-renting-reusable, and every-CUDA-lane-gates-on-the-shared-verdict
+  properties by name.
+- **`runpod_lib.sh`'s prove-lane session asserts the tree it proved.** `gpu-prove.yml` passes
+  `PROVE_EXPECT_SHA`; a `PROVE_SHA=` line that disagrees (or never arrives at all) fails the leg with a
+  new distinct exit code, 77, before any proof group counts — the ref moved under the clone, or a tag
+  was moved, is never a silent green. `ci/scripts/perf/gpu_prove_timings.py` and
+  `check_gpu_prove_timings.py` gained the `wrong-tree` outcome to record it.
+
+### Fixed
+- **The prove lane's remote ssh session had no keepalive, so a healthy pod could be torn down by a NAT
+  idle-TCP window during the clone/build phase (#453, esc-085).** The sm_90 leg on v0.49.0 dropped twice
+  on the same host with `client_loop: send disconnect: Broken pipe`, 4-5 minutes into a silent clone —
+  the transport died on healthy silence, not a real fault. `RP_SSHO` now carries
+  `-oServerAliveInterval=30 -oServerAliveCountMax=6`, covering both the prove session and the lane's own
+  reachability probe: the client keeps NAT state alive across silent phases and still declares a
+  genuinely dead connection within ~3 minutes (surfacing as ssh's own exit 255, reported verbatim).
+  Keepalives do not mask hangs — the inactivity watchdog measures remote *output*, never TCP liveness.
+  `rp_wait_poll`'s own tighter liveness probe (10s/3-try, wanting to fail fast rather than survive a
+  long silence) now PREPENDS its options ahead of the shared array so it still wins by ssh's first-wins
+  option precedence, unaffected by the looser session default.
+
 ## [0.49.0] - 2026-09-02
 
 Quantized (GGUF/k-quant) serving and QLoRA land on the existing encoder

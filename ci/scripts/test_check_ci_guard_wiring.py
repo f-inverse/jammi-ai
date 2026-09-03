@@ -250,6 +250,23 @@ class RootGeneralizationTests(GuardWiringFixture):
         suites = {p.name for p in cgw.tracked_test_suites()}
         self.assertNotIn("helper_not_a_suite.py", suites)
 
+    def test_script_wired_only_from_a_yaml_workflow_counts_as_wired(self):
+        """BLOCK B7 audit fix (same class as `check_gpu_prove_once.py`'s own):
+        GitHub Actions runs BOTH `.yml` and `.yaml` workflow files -- a script
+        mentioned ONLY in a `.yaml` workflow (never a `.yml` one) must still
+        read as wired, not structurally invisible to a `*.yml`-only glob.
+        """
+        self._write("ci/scripts/check_something.py")
+        self._write(
+            ".github/workflows/fake.yaml",
+            self._workflow_wiring_all("ci/scripts/check_something.py"),
+        )
+        self._git_add_all()
+        text = cgw.workflow_run_text()
+        self.assertIn("ci/scripts/check_something.py", text)
+        code, out, err = self._run_main()
+        self.assertEqual(code, 0, f"stdout={out!r} stderr={err!r}")
+
 
 class ShSuiteWideningTests(GuardWiringFixture):
     """Round-2 audit on PR #387: `tracked_test_suites()` widened from

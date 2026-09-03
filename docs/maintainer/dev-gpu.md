@@ -399,10 +399,14 @@ days, consuming ~$187.
 
 Three guards, in order of when they act:
 
-1. **The workflows never cancel a run that rents hardware.** Concurrency on both
-   `gpu-prove.yml` and `_gpu-prove-gate.yml` sits on the *job* (so a run whose
-   job is skipped by the label gate never enters the group) and sets
-   `cancel-in-progress: false`. Superseded runs queue instead of dying mid-rent.
+1. **The workflow never cancels a run that rents hardware.** Concurrency on
+   `gpu-prove.yml` sits on the *job* (so a run whose job is skipped by the
+   label gate never enters the group) and sets `cancel-in-progress: false`.
+   Superseded runs queue instead of dying mid-rent. `_gpu-proof-required.yml`
+   — the reusable every CUDA release lane calls to read the commit's
+   already-recorded verdict — never rents anything and carries no
+   concurrency group at all; there is nothing there for a superseded run to
+   orphan.
 
 2. **A deadline armed inside the pod's own entrypoint**, before the container
    does anything else — including its package install, which reaches the network
@@ -549,13 +553,33 @@ exists to remove, so a verb that reintroduces it is not a convenience.
 `up` therefore refuses a `--ref` against a live pod rather than acting on it. The
 answer is `down` then `up <arch> --ref <ref>`: a boot, for a tree you can trust.
 
-## Automated proof — CI
+## GPU proof and the release gate
 
-The `gpu-prove` workflow (`_gpu-prove-gate.yml`) runs `grpc_embedding_gpu` +
-`gpu_capability` on a real A100 via the same shared primitive
-(`ci/scripts/runpod_lib.sh`), gating every CUDA release (build → prove →
-promote). Trigger it per-PR with the `run-gpu` label, or it runs nightly. CI pods
-are always throwaway and always terminate.
+`gpu-prove.yml` runs `grpc_embedding_gpu` + `gpu_capability` on a real device
+(matrixed over every shipped CUDA arch) via the same shared primitive
+(`ci/scripts/runpod_lib.sh`). It is **never in the critical path of an
+automated workflow**: its only triggers are the `run-gpu` PR label, the
+nightly cron, and manual dispatch — it never fires on a push or a tag, and no
+other workflow may `uses:` it (`ci/scripts/check_gpu_prove_once.py` pins
+both by name).
+
+Every CUDA release lane (the server image, the release binaries, the cu12
+wheel) gates its promotion on the **summary** of a prove run already on
+record for the commit it is promoting, not on a fresh rental of its own:
+`_gpu-proof-required.yml` calls `ci/scripts/gpu_prove_verdict.py`, which asks
+the GitHub API whether every shipped arch's job at that commit's `head_sha`
+most recently concluded `success`. Nothing here starts a prove run — a red
+or missing verdict fails the promotion closed, with the exact remedy
+(`gh workflow run gpu-prove.yml --ref <ref>`, or `gh run rerun <run_id>
+--failed` for one red leg) printed in the job log.
+
+**Release order:** before tagging, dispatch `gpu-prove.yml` on the commit to
+be released (`--ref main` at the tip, or on the pushed tag once it exists);
+once every shipped arch is green, push `v*` and `py-v*` together, on the
+same commit — the publishers consume that verdict and rent nothing new. See
+MAINTAINER-GUIDE.md's release runbook for the exact sequencing.
+
+CI pods are always throwaway and always terminate.
 
 **Standing operator cost (R5, `check_gpu_prove_timings.py`):** proof surface ==
 shipped surface is enforced by fingerprinting the exact `(crate, kind) →

@@ -508,7 +508,19 @@ rp_init() {
   # Confirmed 2026-08-26 on a kept candidate: sshd was up and
   # `-o IdentitiesOnly=yes` connected cleanly while the agent held 12
   # identities (ledger row 328).
-  RP_SSHO=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o IdentitiesOnly=yes -i "$RP_SSH_KEY")
+  # esc-085/#453: -oServerAliveInterval=30 -oServerAliveCountMax=6 (attached
+  # form) keep the client's NAT state alive across long, LEGITIMATELY
+  # silent remote phases (clone/build) — a healthy session must not be torn
+  # down by an idle-TCP window, and a genuinely dead connection is still
+  # declared within ~3 minutes (surfacing as ssh's own exit 255, reported
+  # verbatim by every caller). Keepalives do NOT mask hangs: the inactivity
+  # watchdog (`rp_run_remote_watched`) measures remote OUTPUT bytes, never
+  # TCP liveness, so a session that stays connected but produces nothing
+  # still trips 76 on schedule. `rp_wait_poll` (below) PREPENDS its own
+  # tighter probe options ahead of this array, so its liveness contract
+  # (10s/3 tries — a probe wants to fail FAST, not survive a long silence)
+  # is unaffected by this shared, looser session-liveness default.
+  RP_SSHO=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o IdentitiesOnly=yes -oServerAliveInterval=30 -oServerAliveCountMax=6 -i "$RP_SSH_KEY")
 }
 
 # Create the work dir on first write. Split out so read-only commands against a
@@ -1529,6 +1541,25 @@ rp_parse_prove_marker() {
   return 1
 }
 
+# ONE grammar, hand-mirrored across languages (esc-084/#454) -- bash cannot
+# `import` `ci/scripts/prove_surface.py`'s `PROVE_SHA_RE`, so
+# this function's `[0-9a-f]+`-after-`PROVE_SHA=`, first-match-only, no-
+# anchors shape is a BY-HAND copy of it, the same discipline
+# `rp_parse_prove_marker` above already established for `PROVE_GROUP_RC`.
+# `test_gpu_prove_lane.sh`'s `xp_sha_div_check` cross-parser fixture is what
+# actually pins the two mirrored grammars to agreement: it feeds both
+# parsers the identical set of inputs and asserts identical (sha) or
+# identical NOMATCH.
+rp_parse_prove_sha() {
+  unset RP_PARSED_PROVE_SHA
+  local line="${1%$'\r'}"
+  if [[ "$line" =~ PROVE_SHA=([0-9a-f]+) ]]; then
+    RP_PARSED_PROVE_SHA="${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
 rp_run_remote_watched() {
   local inactivity="${1:-$RP_INACTIVITY}"
   # `$2` = the poll interval in seconds (default 5; the real caller in
@@ -1552,6 +1583,16 @@ rp_run_remote_watched() {
   local pid=$!
   local printed=0 last_growth=$SECONDS last_group="" parse_carry=""
   local group_names=() group_rcs_assoc_keys=() group_rcs_assoc_vals=()
+  # esc-084/#454: when PROVE_EXPECT_SHA is set (a workflow
+  # run, never a hand run), a disagreeing PROVE_SHA marker, or (when the
+  # session's own rc is 0) an absent one, is a
+  # wrong-tree failure -- the ref moved between run creation and clone, or
+  # a tag was moved. `wrong_tree`/`wrong_tree_got` are set by
+  # `_rrw_scan_new_text` below (a closure over these, same as
+  # `last_group`/`group_names`); `prove_sha_seen` distinguishes "saw a
+  # matching sha" from "never saw any sha at all" for the absence check at
+  # normal exit.
+  local wrong_tree=0 wrong_tree_got="" prove_sha_seen=0
 
   _rrw_group_list() {
     local i out_str=""
@@ -1611,6 +1652,13 @@ rp_run_remote_watched() {
       if rp_parse_prove_marker "$line"; then
         _rrw_record_rc "$RP_PARSED_MARKER_NAME" "$RP_PARSED_MARKER_RC"
       fi
+      if [ -n "${PROVE_EXPECT_SHA:-}" ] && rp_parse_prove_sha "$line"; then
+        prove_sha_seen=1
+        if [ "$RP_PARSED_PROVE_SHA" != "$PROVE_EXPECT_SHA" ]; then
+          wrong_tree=1
+          wrong_tree_got="$RP_PARSED_PROVE_SHA"
+        fi
+      fi
     done <<< "$combined"
   }
 
@@ -1644,6 +1692,13 @@ rp_run_remote_watched() {
     fi
   }
 
+  # Shared diagnostic (esc-084/#454) -- STDERR, like the 76/124
+  # arms, so it reaches the job log regardless of which terminal arm fires
+  # it. `$1` is the observed sha, or empty for the absence case.
+  _rrw_wrong_tree_diag() {
+    echo "=== GPU prove: WRONG TREE expected=${PROVE_EXPECT_SHA} got=${1:-none} ===" >&2
+  }
+
   while kill -0 "$pid" 2>/dev/null; do
     sleep "$poll_interval"
     local size; size=$(wc -c < "$out" 2>/dev/null || echo 0)
@@ -1653,6 +1708,20 @@ rp_run_remote_watched() {
       _rrw_scan_new_text "$_RRW_CHUNK"
       printed=$size
       last_growth=$SECONDS
+      # Wrong-tree kill (esc-084/#454): checked EVERY tick right after a scan
+      # sees new bytes, so a disagreeing PROVE_SHA= line is caught within
+      # ONE poll tick of arriving -- never deferred to the inactivity arm or
+      # the normal exit, which could be minutes away.
+      if [ "$wrong_tree" = "1" ]; then
+        kill -TERM "$pid" 2>/dev/null
+        sleep 1
+        kill -KILL "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null
+        _rrw_flush_carry
+        _rrw_wrong_tree_diag "$wrong_tree_got"
+        rm -f "$out"
+        return 77
+      fi
     elif [ $((SECONDS - last_growth)) -ge "$inactivity" ]; then
       kill -TERM "$pid" 2>/dev/null
       sleep 1
@@ -1674,8 +1743,35 @@ rp_run_remote_watched() {
   # Final drain to EOF after `wait $pid`, BEFORE the 124-discriminator check
   # below reads the file -- the last group's marker and `PROVE_EXIT=` line
   # can land milliseconds before ssh's own exit, inside what would otherwise
-  # be the NEXT poll window.
+  # be the NEXT poll window. The wrong-tree check below runs AFTER this
+  # flush (esc-084/#454: "a mismatching PROVE_SHA= landing only in the final
+  # flush" must still be caught). A MISMATCH wins regardless of `$rc` or
+  # which markers landed -- a session that explicitly asserted the WRONG
+  # identity proved nothing, whatever its own exit code claims. ABSENCE is
+  # narrower (BLOCK B10 audit fix): it wins ONLY when the session's own rc
+  # is 0 (it claimed success without ever asserting identity); when rc is
+  # non-zero the absence of a `PROVE_SHA=` marker is exactly what a
+  # transport death (esc-085's own signature, rc 255) or a genuine budget
+  # cut (rc 124) looks like -- the session never got far enough to echo it
+  # -- so it falls through UNCHANGED to the existing 124/255 handling below,
+  # never relabeled as wrong-tree and never suppressing the BUDGET
+  # diagnostic.
   _rrw_flush_carry
+  if [ -n "${PROVE_EXPECT_SHA:-}" ]; then
+    if [ "$wrong_tree" = "1" ]; then
+      _rrw_wrong_tree_diag "$wrong_tree_got"
+      rm -f "$out"
+      return 77
+    fi
+    if [ "$prove_sha_seen" != "1" ] && [ "$rc" -eq 0 ]; then
+      # Absence-with-a-claimed-success is a failure, same doctrine as P1's
+      # zero-producers: identity was never asserted, so this leg proved
+      # nothing about the tree it ran on even though it reports success.
+      _rrw_wrong_tree_diag ""
+      rm -f "$out"
+      return 77
+    fi
+  fi
   if [ "$rc" -eq 124 ] && ! grep -q '^PROVE_EXIT=' "$out"; then
     echo "=== GPU prove: BUDGET (RP_TIMEOUT=${RP_TIMEOUT:-3000}s) cut group \"${last_group}\"; groups: $(_rrw_group_list) ===" >&2
   fi
@@ -1767,12 +1863,20 @@ rp_wait_poll() {
   # instead of hanging on one; `-oServerAliveInterval=10
   # -oServerAliveCountMax=3` makes the CLIENT itself detect a connection
   # that has gone silent after connecting and give up within ~30s, rather
-  # than waiting on channel data that may never arrive. Scoped to THIS
-  # ssh invocation only (a local array, never folded into the shared
-  # RP_SSHO every OTHER call site also uses) — an interactive `attach`/
-  # `shell` session has a different, deliberately looser liveness contract
-  # this function has no business changing.
-  local -a wait_sshopts=("${RP_SSHO[@]}" -oBatchMode=yes -oServerAliveInterval=10 -oServerAliveCountMax=3)
+  # than waiting on channel data that may never arrive.
+  #
+  # esc-085/#453: ssh options are first-wins (verified with `ssh -G`).
+  # `RP_SSHO` (see its own doc above) carries its own, LOOSER
+  # ServerAliveInterval/CountMax (30s/6) for the session-liveness contract:
+  # long silent phases like a clone/build must survive a NAT idle window;
+  # the inactivity watchdog, not TCP, is what detects a genuine hang. This
+  # probe's own, TIGHTER options are PREPENDED ahead of `"${RP_SSHO[@]}"`
+  # below, so THIS invocation's 10s/3-try liveness contract wins by
+  # ordering regardless of what the shared array carries — a probe wants to
+  # fail FAST on a genuinely silent connection, a different, deliberately
+  # TIGHTER contract than an interactive `attach`/`shell` session (or the
+  # prove lane's own long clone/build phases) has any business inheriting.
+  local -a wait_sshopts=(-oBatchMode=yes -oServerAliveInterval=10 -oServerAliveCountMax=3 "${RP_SSHO[@]}")
   # A SECOND, portable backstop UNDER the ssh-option hardening above (round-N
   # audit B1's "AND/OR" — this repo applies both): `_rp_bounded_capture`
   # runs the ssh invocation in the BACKGROUND and kills it if it exceeds

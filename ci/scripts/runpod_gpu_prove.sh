@@ -58,10 +58,11 @@ source "$DIR/runpod_lib.sh"
 # watchdog is the hang detector, so the backstop only needs to outlast the
 # slowest healthy leg plus a late-detected hang, not a from-scratch multiple
 # of it. `check_gpu_prove_timings.py`'s R3 re-checks this rule against every
-# committed healthy artifact on every run. Platform ceiling: with 3 retry
-# attempts (`_gpu-prove-gate.yml`), `3 * 80m deploy-worst-case + 2 * 5m
-# overhead + RP_TIMEOUT/60 <= 360m` bounds RP_TIMEOUT well above 6000s, so
-# this value is not yet constrained by the job-timeout ceiling.
+# committed healthy artifact on every run. Platform ceiling: with the tag-ref
+# 3-attempt retry budget (`gpu-prove.yml`'s own header), `3 * 80m deploy-
+# worst-case + 2 * 5m overhead + RP_TIMEOUT/60 <= 360m` bounds RP_TIMEOUT
+# well above 6000s, so this value is not yet constrained by the job-timeout
+# ceiling.
 export RP_TIMEOUT="${RP_TIMEOUT:-6000}"
 
 GIT_REPO="${GIT_REPO:-https://github.com/${GITHUB_REPOSITORY:-f-inverse/jammi-ai}.git}"

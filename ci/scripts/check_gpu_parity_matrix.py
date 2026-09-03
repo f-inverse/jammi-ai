@@ -240,32 +240,35 @@ SiliconAccountingEntry = ProvenBy | Deferred
 # literal semantics silently keeping only the last entry.
 #
 # sm_80/sm_86/sm_89/sm_90 are each proven by their own matrix leg of
-# `gpu-prove.yml` (opt-in-PR/nightly/dispatch) and the reusable release gate
-# `_gpu-prove-gate.yml` (every CUDA artifact promotion) — both drive
-# `ci/scripts/runpod_gpu_prove.sh` with `GPU_PROVE_ARCH=<arch>`, which rents
-# the matching device via `rp_deploy_arch` (runpod_lib.sh) and runs the same
-# gated GPU suites (`grpc_embedding_gpu`, `gpu_capability`) real hardware ran
-# for sm_80 alone before the #351 GPU-validation review widened this to all
-# four shipped SASS targets.
+# `gpu-prove.yml` (opt-in-PR/nightly/dispatch by a dev, or before a release
+# tag — never auto-started) — drives `ci/scripts/runpod_gpu_prove.sh` with
+# `GPU_PROVE_ARCH=<arch>`, which rents the matching device via
+# `rp_deploy_arch` (runpod_lib.sh) and runs the same gated GPU suites
+# (`grpc_embedding_gpu`, `gpu_capability`) real hardware ran for sm_80 alone
+# before the #351 GPU-validation review widened this to all four shipped
+# SASS targets. Every CUDA artifact promotion (server image, release
+# binaries, cu12 wheel) gates on that SAME recorded verdict, proven once per
+# commit and shared (`ci/scripts/gpu_prove_verdict.py`, consumed via
+# `_gpu-proof-required.yml`), never a second rental of its own.
 SILICON_ACCOUNTING: list[tuple[str, SiliconAccountingEntry]] = [
     (
         "sm_80",
         ProvenBy(
-            "gpu-prove.yml / _gpu-prove-gate.yml matrix leg sm_80 "
+            "gpu-prove.yml matrix leg sm_80 "
             "(ci/scripts/runpod_gpu_prove.sh GPU_PROVE_ARCH=sm_80 on a rented A100)"
         ),
     ),
     (
         "sm_86",
         ProvenBy(
-            "gpu-prove.yml / _gpu-prove-gate.yml matrix leg sm_86 "
+            "gpu-prove.yml matrix leg sm_86 "
             "(ci/scripts/runpod_gpu_prove.sh GPU_PROVE_ARCH=sm_86 on a rented A40)"
         ),
     ),
     (
         "sm_89",
         ProvenBy(
-            "gpu-prove.yml / _gpu-prove-gate.yml matrix leg sm_89 "
+            "gpu-prove.yml matrix leg sm_89 "
             "(ci/scripts/runpod_gpu_prove.sh GPU_PROVE_ARCH=sm_89 on a rented "
             "L4 (L40S fallback))"
         ),
@@ -273,7 +276,7 @@ SILICON_ACCOUNTING: list[tuple[str, SiliconAccountingEntry]] = [
     (
         "sm_90",
         ProvenBy(
-            "gpu-prove.yml / _gpu-prove-gate.yml matrix leg sm_90 "
+            "gpu-prove.yml matrix leg sm_90 "
             "(ci/scripts/runpod_gpu_prove.sh GPU_PROVE_ARCH=sm_90 on a rented H100)"
         ),
     ),

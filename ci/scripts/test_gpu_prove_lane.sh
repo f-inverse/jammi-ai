@@ -630,9 +630,9 @@ PROVE_EXPECT_SHA="$GOOD_SHA"
 out="$(rp_run_remote_watched 3 0.2 <<< "noop" 2>&1)"
 rc=$?
 if [ "$rc" -eq 77 ] && echo "$out" | grep -q "WRONG TREE expected=${GOOD_SHA} got=${BAD_SHA}"; then
-  ok "wrong-tree (M/T): a disagreeing PROVE_SHA on a growth tick -> 77 within one poll tick"
+  ok "wrong-tree: a disagreeing PROVE_SHA on a growth tick -> 77 within one poll tick"
 else
-  bad "wrong-tree (M/T): expected 77 + WRONG TREE diagnostic on a growth tick; got rc=$rc out=$out"
+  bad "wrong-tree: expected 77 + WRONG TREE diagnostic on a growth tick; got rc=$rc out=$out"
 fi
 unset PROVE_EXPECT_SHA
 
@@ -651,9 +651,9 @@ PROVE_EXPECT_SHA="$GOOD_SHA"
 out="$(rp_run_remote_watched "" 0.2 <<< "noop" 2>&1)"
 rc=$?
 if [ "$rc" -eq 77 ] && echo "$out" | grep -q "WRONG TREE expected=${GOOD_SHA} got=${BAD_SHA}"; then
-  ok "wrong-tree (M/T): a mismatching PROVE_SHA landing only in the final flush -> 77"
+  ok "wrong-tree: a mismatching PROVE_SHA landing only in the final flush -> 77"
 else
-  bad "wrong-tree (M/T): expected 77 + WRONG TREE diagnostic from the final flush; got rc=$rc out=$out"
+  bad "wrong-tree: expected 77 + WRONG TREE diagnostic from the final flush; got rc=$rc out=$out"
 fi
 unset PROVE_EXPECT_SHA
 
@@ -671,9 +671,9 @@ PROVE_EXPECT_SHA="$GOOD_SHA"
 out="$(rp_run_remote_watched "" 0.2 <<< "noop" 2>&1)"
 rc=$?
 if [ "$rc" -eq 77 ] && echo "$out" | grep -q "WRONG TREE expected=${GOOD_SHA} got=none"; then
-  ok "wrong-tree (M/T): PROVE_EXPECT_SHA set but no PROVE_SHA= line ever observed -> 77 (absence is a failure)"
+  ok "wrong-tree: PROVE_EXPECT_SHA set but no PROVE_SHA= line ever observed -> 77 (absence is a failure)"
 else
-  bad "wrong-tree (M/T): expected 77 + got=none; got rc=$rc out=$out"
+  bad "wrong-tree: expected 77 + got=none; got rc=$rc out=$out"
 fi
 unset PROVE_EXPECT_SHA
 
@@ -690,9 +690,9 @@ PROVE_EXPECT_SHA="$GOOD_SHA"
 out="$(rp_run_remote_watched "" 0.2 <<< "noop" 2>&1)"
 rc=$?
 if [ "$rc" -eq 0 ]; then
-  ok "wrong-tree (M/T): a matching PROVE_SHA -> the normal verdict (rc=0), never 77"
+  ok "wrong-tree: a matching PROVE_SHA -> the normal verdict (rc=0), never 77"
 else
-  bad "wrong-tree (M/T): a matching PROVE_SHA should never trip 77; got rc=$rc out=$out"
+  bad "wrong-tree: a matching PROVE_SHA should never trip 77; got rc=$rc out=$out"
 fi
 unset PROVE_EXPECT_SHA
 
@@ -711,9 +711,9 @@ unset PROVE_EXPECT_SHA
 out="$(rp_run_remote_watched "" 0.2 <<< "noop" 2>&1)"
 rc=$?
 if [ "$rc" -eq 0 ] && ! echo "$out" | grep -q "WRONG TREE"; then
-  ok "wrong-tree (M/T): PROVE_EXPECT_SHA unset -> no check even on a mismatching PROVE_SHA (hand runs have no record to protect)"
+  ok "wrong-tree: PROVE_EXPECT_SHA unset -> no check even on a mismatching PROVE_SHA (hand runs have no record to protect)"
 else
-  bad "wrong-tree (M/T): PROVE_EXPECT_SHA unset should never check identity; got rc=$rc out=$out"
+  bad "wrong-tree: PROVE_EXPECT_SHA unset should never check identity; got rc=$rc out=$out"
 fi
 
 # ============================================================================
@@ -1177,7 +1177,7 @@ rm -f "$WT_MARKER"
 env RUNPOD_API_KEY=test-dummy-key PATH="$F7_STUBBIN:$PATH" F7_TERMINATE_MARKER="$WT_MARKER" F7_SCENARIO="wrong-tree" GPU_PROVE_ARCH=sm_80 RP_INACTIVITY=3 RP_WATCH_POLL_S=0.2 RP_SSH_WAIT_SECS=10 PROVE_EXPECT_SHA="cccccccccccccccccccccccccccccccccccccc" bash "$PROVE_SH" > "$SANDBOX/f7-wrong-tree.out" 2>&1
 wt_rc=$?
 if [ "$wt_rc" -eq 77 ] && [ -f "$WT_MARKER" ] && grep -q 'WRONG TREE' "$SANDBOX/f7-wrong-tree.out"; then
-  ok "F7 (wrong-tree, esc-084/#454 M/T): the real executed exit path returns 77, rp_cleanup's own podTerminate call fired (marker recorded), and the WRONG TREE diagnostic is present"
+  ok "F7 (wrong-tree, esc-084/#454): the real executed exit path returns 77, rp_cleanup's own podTerminate call fired (marker recorded), and the WRONG TREE diagnostic is present"
 else
   bad "F7 (wrong-tree): expected rc=77 with a recorded podTerminate call and a WRONG TREE diagnostic; got rc=$wt_rc marker-present=$([ -f "$WT_MARKER" ] && echo yes || echo no); out=$(cat "$SANDBOX/f7-wrong-tree.out")"
 fi

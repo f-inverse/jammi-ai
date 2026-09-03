@@ -39,7 +39,7 @@ here ever starts a prove run):
      start — this bounds the wait).
   2. Else, while any candidate run at this sha is queued/in_progress, poll
      (`--poll-seconds`) until `--deadline-minutes` elapses. This serves the
-     tag-then-dispatch overlap (Z): a dev's dispatch that began just before
+     tag-then-dispatch overlap: a dev's dispatch that began just before
      the publisher's first poll is still picked up.
   3. Else, if no measurement exists for some arch at all, DENY immediately
      (no grace — nothing auto-starts the prove; the remedy is a dispatch).

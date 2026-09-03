@@ -508,7 +508,19 @@ rp_init() {
   # Confirmed 2026-08-26 on a kept candidate: sshd was up and
   # `-o IdentitiesOnly=yes` connected cleanly while the agent held 12
   # identities (ledger row 328).
-  RP_SSHO=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o IdentitiesOnly=yes -i "$RP_SSH_KEY")
+  # esc-085/#453: -oServerAliveInterval=30 -oServerAliveCountMax=6 (attached
+  # form) keep the client's NAT state alive across long, LEGITIMATELY
+  # silent remote phases (clone/build) — a healthy session must not be torn
+  # down by an idle-TCP window, and a genuinely dead connection is still
+  # declared within ~3 minutes (surfacing as ssh's own exit 255, reported
+  # verbatim by every caller). Keepalives do NOT mask hangs: the inactivity
+  # watchdog (`rp_run_remote_watched`) measures remote OUTPUT bytes, never
+  # TCP liveness, so a session that stays connected but produces nothing
+  # still trips 76 on schedule. `rp_wait_poll` (below) PREPENDS its own
+  # tighter probe options ahead of this array, so its liveness contract
+  # (10s/3 tries — a probe wants to fail FAST, not survive a long silence)
+  # is unaffected by this shared, looser session-liveness default.
+  RP_SSHO=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o IdentitiesOnly=yes -oServerAliveInterval=30 -oServerAliveCountMax=6 -i "$RP_SSH_KEY")
 }
 
 # Create the work dir on first write. Split out so read-only commands against a
@@ -1838,12 +1850,21 @@ rp_wait_poll() {
   # instead of hanging on one; `-oServerAliveInterval=10
   # -oServerAliveCountMax=3` makes the CLIENT itself detect a connection
   # that has gone silent after connecting and give up within ~30s, rather
-  # than waiting on channel data that may never arrive. Scoped to THIS
-  # ssh invocation only (a local array, never folded into the shared
-  # RP_SSHO every OTHER call site also uses) — an interactive `attach`/
-  # `shell` session has a different, deliberately looser liveness contract
-  # this function has no business changing.
-  local -a wait_sshopts=("${RP_SSHO[@]}" -oBatchMode=yes -oServerAliveInterval=10 -oServerAliveCountMax=3)
+  # than waiting on channel data that may never arrive.
+  #
+  # esc-085/#453: the ACTUAL rule (ssh options are first-wins, verified with
+  # `ssh -G`) is not "never folded into the shared RP_SSHO" — RP_SSHO NOW
+  # carries its own ServerAliveInterval/CountMax too (the session-liveness
+  # contract: long silent phases like a clone/build must survive a NAT idle
+  # window; the inactivity watchdog, not TCP, is what detects a genuine
+  # hang). This probe's own options are PREPENDED ahead of `"${RP_SSHO[@]}"`
+  # below, so THIS invocation's tighter 10s/3-try liveness contract still
+  # wins by ordering, regardless of what the shared array now carries — a
+  # probe wants to fail FAST on a genuinely silent connection, a different,
+  # deliberately looser contract than an interactive `attach`/`shell`
+  # session (or the prove lane's own long clone/build phases) has any
+  # business inheriting.
+  local -a wait_sshopts=(-oBatchMode=yes -oServerAliveInterval=10 -oServerAliveCountMax=3 "${RP_SSHO[@]}")
   # A SECOND, portable backstop UNDER the ssh-option hardening above (round-N
   # audit B1's "AND/OR" — this repo applies both): `_rp_bounded_capture`
   # runs the ssh invocation in the BACKGROUND and kills it if it exceeds

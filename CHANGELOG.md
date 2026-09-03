@@ -25,6 +25,19 @@ workspace ships every publishable crate at the same
   was moved, is never a silent green. `ci/scripts/perf/gpu_prove_timings.py` and
   `check_gpu_prove_timings.py` gained the `wrong-tree` outcome to record it.
 
+### Fixed
+- **The prove lane's remote ssh session had no keepalive, so a healthy pod could be torn down by a NAT
+  idle-TCP window during the clone/build phase (#453, esc-085).** The sm_90 leg on v0.49.0 dropped twice
+  on the same host with `client_loop: send disconnect: Broken pipe`, 4-5 minutes into a silent clone —
+  the transport died on healthy silence, not a real fault. `RP_SSHO` now carries
+  `-oServerAliveInterval=30 -oServerAliveCountMax=6`, covering both the prove session and the lane's own
+  reachability probe: the client keeps NAT state alive across silent phases and still declares a
+  genuinely dead connection within ~3 minutes (surfacing as ssh's own exit 255, reported verbatim).
+  Keepalives do not mask hangs — the inactivity watchdog measures remote *output*, never TCP liveness.
+  `rp_wait_poll`'s own tighter liveness probe (10s/3-try, wanting to fail fast rather than survive a
+  long silence) now PREPENDS its options ahead of the shared array so it still wins by ssh's first-wins
+  option precedence, unaffected by the looser session default.
+
 ## [0.49.0] - 2026-09-02
 
 Quantized (GGUF/k-quant) serving and QLoRA land on the existing encoder

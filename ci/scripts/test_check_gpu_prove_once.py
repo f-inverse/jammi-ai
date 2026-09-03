@@ -83,7 +83,7 @@ jobs:
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
-      - name: Check the commit's GPU-prove verdict (gpu-prove.yml, rule Q/V)
+      - name: Check the commit's GPU-prove verdict (gpu-prove.yml job conclusions at github.sha)
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
@@ -463,6 +463,117 @@ class ProofRequiredConsultsVerdictTest(unittest.TestCase):
         self.assertTrue(any("workflow_call`-only" in f for f in findings), findings)
 
 
+def _proof_required_with_step(step_text: str) -> str:
+    """A `_gpu-proof-required.yml`-shaped fixture whose SECOND step (the
+    one that should invoke gpu_prove_verdict.py) is `step_text` verbatim --
+    used to drive the seven round-2 F1 fail shapes through `check_p5`."""
+    return (
+        "name: _gpu-proof-required\n\non:\n  workflow_call: {}\n\n"
+        "permissions:\n  contents: read\n  actions: read\n\n"
+        "jobs:\n  proof-required:\n    name: GPU proof required\n"
+        "    runs-on: ubuntu-latest\n    timeout-minutes: 360\n    steps:\n"
+        "      - uses: actions/checkout@v4\n" + step_text
+    )
+
+
+class ProofRequiredMechanismEvasionTest(unittest.TestCase):
+    """Round-2 adversarial audit (F1): P5 used to be a whole-file substring
+    check plus a FIRST-`--sha`-match regex -- each of these seven shapes
+    used to pass with zero findings while the job no longer really
+    depended on the verdict. Every one must FAIL under the mechanism fix
+    (parse the reusable's job -> steps; the invocation must be the actual
+    `run:` command of some step, with no trailing control operator, no
+    `continue-on-error:`/`if:` on that step or its job, and the LAST
+    `--sha` on that command's line must be commit-bound)."""
+
+    def test_invocation_named_only_in_step_name_fails(self):
+        step = (
+            "      - name: Check the commit's GPU-prove verdict via python3 ci/scripts/gpu_prove_verdict.py\n"
+            "        run: echo ok\n"
+        )
+        findings = cgo.check_p5({"_gpu-proof-required.yml": _proof_required_with_step(step)})
+        self.assertTrue(findings, findings)
+        self.assertTrue(any("does not invoke" in f for f in findings), findings)
+
+    def test_invocation_inside_quoted_echo_string_fails(self):
+        step = (
+            "      - name: Check the commit's GPU-prove verdict (gpu-prove.yml job conclusions at github.sha)\n"
+            "        run: |\n"
+            "          echo 'python3 ci/scripts/gpu_prove_verdict.py --sha \"$GITHUB_SHA\"'\n"
+        )
+        findings = cgo.check_p5({"_gpu-proof-required.yml": _proof_required_with_step(step)})
+        self.assertTrue(findings, findings)
+        self.assertTrue(any("does not invoke" in f for f in findings), findings)
+
+    def test_real_invocation_followed_by_or_true_fails(self):
+        step = (
+            "      - name: Check the commit's GPU-prove verdict (gpu-prove.yml job conclusions at github.sha)\n"
+            "        env:\n          GITHUB_TOKEN: ${{ github.token }}\n"
+            "        run: |\n"
+            "          python3 ci/scripts/gpu_prove_verdict.py \\\n"
+            "            --repo \"$GITHUB_REPOSITORY\" \\\n"
+            "            --sha \"$GITHUB_SHA\" \\\n"
+            "            --deadline-minutes 355 || true\n"
+        )
+        findings = cgo.check_p5({"_gpu-proof-required.yml": _proof_required_with_step(step)})
+        self.assertTrue(any("control operator" in f for f in findings), findings)
+
+    def test_continue_on_error_step_fails(self):
+        step = (
+            "      - name: Check the commit's GPU-prove verdict (gpu-prove.yml job conclusions at github.sha)\n"
+            "        continue-on-error: true\n"
+            "        env:\n          GITHUB_TOKEN: ${{ github.token }}\n"
+            "        run: |\n"
+            "          python3 ci/scripts/gpu_prove_verdict.py \\\n"
+            "            --repo \"$GITHUB_REPOSITORY\" \\\n"
+            "            --sha \"$GITHUB_SHA\" \\\n"
+            "            --deadline-minutes 355\n"
+        )
+        findings = cgo.check_p5({"_gpu-proof-required.yml": _proof_required_with_step(step)})
+        self.assertTrue(any("continue-on-error" in f for f in findings), findings)
+
+    def test_if_false_step_fails(self):
+        step = (
+            "      - name: Check the commit's GPU-prove verdict (gpu-prove.yml job conclusions at github.sha)\n"
+            "        if: false\n"
+            "        env:\n          GITHUB_TOKEN: ${{ github.token }}\n"
+            "        run: |\n"
+            "          python3 ci/scripts/gpu_prove_verdict.py \\\n"
+            "            --repo \"$GITHUB_REPOSITORY\" \\\n"
+            "            --sha \"$GITHUB_SHA\" \\\n"
+            "            --deadline-minutes 355\n"
+        )
+        findings = cgo.check_p5({"_gpu-proof-required.yml": _proof_required_with_step(step)})
+        self.assertTrue(any("if:" in f and "continue-on-error" in f for f in findings), findings)
+
+    def test_second_trailing_sha_last_wins_fails(self):
+        step = (
+            "      - name: Check the commit's GPU-prove verdict (gpu-prove.yml job conclusions at github.sha)\n"
+            "        env:\n          GITHUB_TOKEN: ${{ github.token }}\n"
+            "        run: |\n"
+            "          python3 ci/scripts/gpu_prove_verdict.py \\\n"
+            "            --repo \"$GITHUB_REPOSITORY\" \\\n"
+            "            --sha \"$GITHUB_SHA\" \\\n"
+            "            --deadline-minutes 355 \\\n"
+            "            --sha v1.2.3\n"
+        )
+        findings = cgo.check_p5({"_gpu-proof-required.yml": _proof_required_with_step(step)})
+        self.assertTrue(any("not bound to" in f and "v1.2.3" in f for f in findings), findings)
+
+    def test_sha_in_step_name_body_has_tag_fails(self):
+        step = (
+            "      - name: \"Check the commit's GPU-prove verdict --sha $GITHUB_SHA\"\n"
+            "        env:\n          GITHUB_TOKEN: ${{ github.token }}\n"
+            "        run: |\n"
+            "          python3 ci/scripts/gpu_prove_verdict.py \\\n"
+            "            --repo \"$GITHUB_REPOSITORY\" \\\n"
+            "            --sha v1.2.3 \\\n"
+            "            --deadline-minutes 355\n"
+        )
+        findings = cgo.check_p5({"_gpu-proof-required.yml": _proof_required_with_step(step)})
+        self.assertTrue(any("not bound to" in f and "v1.2.3" in f for f in findings), findings)
+
+
 class YamlExtensionTest(unittest.TestCase):
     """BLOCK B7 audit fix: GitHub Actions runs BOTH `.yml` and `.yaml`
     workflow files -- a `*.yml`-only glob is blind to a second producer, a
@@ -497,6 +608,28 @@ class YamlExtensionTest(unittest.TestCase):
             )
             findings = cgo.run_gate(wf_dir, manifest_path)
             self.assertTrue(any("_gpu-prove-gate.yaml" in f and "must be deleted" in f for f in findings), findings)
+
+    def test_gpu_prove_yaml_named_caller_of_the_real_producer_fails(self):
+        """F2 (round-2 adversarial audit): the `uses:` scan used to skip
+        EVERY workflow whose file NAME matched a producer-name spelling
+        (`gpu-prove.yml`/`gpu-prove.yaml`), not just the resolved producer
+        itself -- so a sibling file literally named `gpu-prove.yaml` that
+        `uses: ./.github/workflows/gpu-prove.yml` passed with zero
+        findings, because its OWN name matched the skip set."""
+        caller_named_like_the_producer = (
+            "name: not-actually-the-prover\n\non:\n  workflow_dispatch:\n\n"
+            "jobs:\n  x:\n    uses: ./.github/workflows/gpu-prove.yml\n"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            wf_dir, manifest_path = write_tree(
+                Path(td),
+                {**positive_workflows(), "gpu-prove.yaml": caller_named_like_the_producer},
+                MANIFEST_GOOD,
+            )
+            findings = cgo.run_gate(wf_dir, manifest_path)
+            self.assertTrue(
+                any("gpu-prove.yaml" in f and "gpu-prove.yml" in f for f in findings), findings
+            )
 
 
 class NeedsMultilineFormTest(unittest.TestCase):

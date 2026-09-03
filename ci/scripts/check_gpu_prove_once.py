@@ -403,8 +403,21 @@ def check_p1_p2(workflow_texts: dict[str, str]) -> list[str]:
     prove_producer_variants = set(_workflow_name_variants(PROVE_PRODUCER_WORKFLOW))
     gate_workflow_variants = _workflow_name_variants(GATE_WORKFLOW)
 
+    # F2 audit fix (issue #454 round-2): the skip below used to exempt EVERY
+    # workflow whose file NAME matched a producer-name spelling
+    # (`gpu-prove.yml`/`gpu-prove.yaml`) from the `uses:` scan -- so a
+    # sibling file literally named `gpu-prove.yaml` that itself `uses:
+    # ./.github/workflows/gpu-prove.yml` passed with zero findings, because
+    # ITS OWN name matched the skip set even though it is not the resolved
+    # producer. The skip must exempt only the resolved producer file that
+    # actually invokes `runpod_gpu_prove.sh` (computed above as
+    # `producers`), never both name spellings unconditionally. The real
+    # `gpu-prove.yml`'s only `uses:` is `actions/checkout@v4`, so it never
+    # self-matches these patterns and needs no skip at all in practice.
+    resolved_producer = producers[0] if len(producers) == 1 and producers[0] == PROVE_PRODUCER_WORKFLOW else None
+
     for name, text in workflow_texts.items():
-        if name in prove_producer_variants:
+        if resolved_producer is not None and name == resolved_producer:
             continue
         stripped = drop_comment_lines(text)
         for m in _USES_LOCAL_RE.finditer(stripped):
@@ -562,9 +575,13 @@ def check_p4(workflow_texts: dict[str, str], shipped_arches: set[str]) -> list[s
 
 
 # --------------------------------------------------------------------------- #
-# P5 (BLOCK B8 audit fix): the reusable actually CONSULTS the verdict.
+# P5 (BLOCK B8 audit fix, round-2 F1 hardening): the reusable actually
+# CONSULTS the verdict, as an un-bypassable step -- never a whole-file
+# substring check.
 # --------------------------------------------------------------------------- #
 _SHA_ARG_RE = re.compile(r'--sha\s+(?:"(?P<q>[^"]*)"|(?P<u>\$\{\{[^}]*\}\}|\S+))')
+_GPU_PROVE_VERDICT_INVOCATION = "python3 ci/scripts/gpu_prove_verdict.py"
+_CONTROL_OPERATOR_RE = re.compile(r"\|\||;|&&")
 
 
 def _sha_arg_is_commit_bound(value: str) -> bool:
@@ -583,22 +600,164 @@ def _sha_arg_is_commit_bound(value: str) -> bool:
     return False
 
 
+def _find_step_ranges(lines: list[str], job_start: int, job_end: int) -> list[tuple[int, int]]:
+    """Raw 0-based (start, end_exclusive) line ranges for each `- ` list
+    item directly under this job's `steps:` key. Bullet column is taken
+    from the FIRST bullet found after `steps:`; a dedent below that column
+    (or a non-bullet line at that column) ends the list."""
+    steps_line = None
+    for i in range(job_start, job_end):
+        if re.match(r"^\s*steps:\s*(#.*)?$", lines[i]):
+            steps_line = i
+            break
+    if steps_line is None:
+        return []
+    bullet_col: int | None = None
+    starts: list[int] = []
+    end_of_list = job_end
+    for i in range(steps_line + 1, job_end):
+        line = lines[i]
+        if line.strip() == "" or line.strip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        stripped = line.lstrip(" ")
+        if bullet_col is None:
+            bullet_col = indent
+        if indent < bullet_col:
+            end_of_list = i
+            break
+        if indent == bullet_col:
+            if not stripped.startswith("-"):
+                end_of_list = i
+                break
+            starts.append(i)
+    if not starts:
+        return []
+    ranges: list[tuple[int, int]] = []
+    for idx, s in enumerate(starts):
+        e = starts[idx + 1] if idx + 1 < len(starts) else end_of_list
+        ranges.append((s, e))
+    return ranges
+
+
+def _parse_step_keys(lines: list[str], s: int, e: int) -> dict[str, str]:
+    """{key: value_text} of every top-level key directly inside this one
+    step (the `- ` list item spanning [s, e)), whether the first key sits
+    inline on the dash line (`- name: Foo`) or the dash is bare and the
+    first key follows on its own line. A block-scalar value (`>`/`>-`/
+    `|`/`|-`) is expanded to its full joined body (newline-separated, each
+    physical line's own indentation stripped) so a multi-line `run:` is
+    inspected whole, not just its `run: |` header line."""
+    dash_line = lines[s]
+    bullet_col = len(dash_line) - len(dash_line.lstrip(" "))
+    after_dash = dash_line[bullet_col + 1 :]
+    after_dash_stripped = after_dash.lstrip(" ")
+    scan: list[tuple[int, str]] = []
+    if after_dash_stripped.strip() != "":
+        scan.append((s, after_dash_stripped))
+    for i in range(s + 1, e):
+        scan.append((i, lines[i]))
+
+    # Key column: either the inline dash-line key's own column, or the
+    # first subsequent line's indentation (bare-dash form).
+    if after_dash_stripped.strip() != "":
+        key_col = bullet_col + 1 + (len(after_dash) - len(after_dash_stripped))
+    else:
+        key_col = None
+        for li, text in scan:
+            if text.strip() == "" or text.strip().startswith("#"):
+                continue
+            key_col = len(text) - len(text.lstrip(" "))
+            break
+        if key_col is None:
+            return {}
+
+    results: dict[str, str] = {}
+    idx = 0
+    n = len(scan)
+    while idx < n:
+        li, text = scan[idx]
+        is_inline_dash = li == s and after_dash_stripped.strip() != ""
+        if text.strip() == "" or text.strip().startswith("#"):
+            idx += 1
+            continue
+        if is_inline_dash:
+            content = text
+        else:
+            indent = len(text) - len(text.lstrip(" "))
+            if indent != key_col:
+                idx += 1
+                continue
+            content = text.strip()
+        m = re.match(r"^([A-Za-z0-9_.-]+):\s*(.*)$", content)
+        if not m:
+            idx += 1
+            continue
+        key, val = m.group(1), m.group(2).strip()
+        if val in _BLOCK_SCALAR_HEADS:
+            body: list[str] = []
+            j = idx + 1
+            while j < n:
+                bli, btext = scan[j]
+                if btext.strip() == "":
+                    j += 1
+                    continue
+                bindent = len(btext) - len(btext.lstrip(" "))
+                if bindent <= key_col:
+                    break
+                if not btext.strip().startswith("#"):
+                    body.append(btext.strip())
+                j += 1
+            results[key] = "\n".join(body)
+            idx = j
+            continue
+        results[key] = val
+        idx += 1
+    return results
+
+
+def _join_shell_continuations(text: str) -> list[str]:
+    """Logical (backslash-continuation-joined) lines of a shell `run:`
+    body -- each physical line ending in a trailing `\\` is folded onto the
+    next, so a multi-line invocation's arguments become one line to scan
+    for a trailing control operator or the LAST `--sha`."""
+    logical: list[str] = []
+    buf = ""
+    for line in text.splitlines():
+        piece = line.strip()
+        buf = f"{buf} {piece}".strip() if buf else piece
+        if buf.endswith("\\"):
+            buf = buf[:-1].rstrip()
+            continue
+        logical.append(buf)
+        buf = ""
+    if buf:
+        logical.append(buf)
+    return logical
+
+
 def check_p5(workflow_texts: dict[str, str]) -> list[str]:
     """P3 only checks a gate job's `uses:` line -- gutting
     `_gpu-proof-required.yml` to `run: echo ok` would leave P1-P4 green
     while no promotion is actually conditioned on a real verdict lookup.
     P5 asserts the reusable ITSELF: it must exist, its `on:` block must be
     `workflow_call`-only (the same never-independently-starts doctrine P1
-    holds the producer to), and its comment-stripped step body must invoke
-    `python3 ci/scripts/gpu_prove_verdict.py` with `--sha` bound to the
-    commit being promoted (`github.sha`/`$GITHUB_SHA`) -- never a literal
-    sha or a tag name."""
+    holds the producer to), and it must contain a real STEP -- not a
+    `name:`/`env:` mention, not a quoted echo string -- whose `run:` body
+    invokes `python3 ci/scripts/gpu_prove_verdict.py` as an actual shell
+    command, with no `||`/`;`/`&&` after the invocation on its
+    continuation-joined logical line (a trailing `|| true` or a `--sha`
+    that never runs would fail open), no `continue-on-error:`/`if:` on
+    either that step or its job (either would let the verdict check be
+    skipped or silenced), and whose LAST `--sha` argument (argparse's own
+    last-wins semantics, never a first-match regex) is bound to the commit
+    being promoted (`github.sha`/`$GITHUB_SHA`) -- never a literal sha or a
+    tag name."""
     findings: list[str] = []
     resolved = resolve_workflow(workflow_texts, PROOF_REQUIRED_WORKFLOW)
     if resolved is None:
         return [f"P5: {PROOF_REQUIRED_WORKFLOW} is missing from the workflow tree"]
     text = workflow_texts[resolved]
-    stripped = drop_comment_lines(text)
 
     keys, err = read_top_level_on_block(text)
     if err is not None:
@@ -609,24 +768,68 @@ def check_p5(workflow_texts: dict[str, str]) -> list[str]:
             "must never independently start anything"
         )
 
-    if "python3 ci/scripts/gpu_prove_verdict.py" not in stripped:
-        findings.append(f"P5: {resolved} does not invoke python3 ci/scripts/gpu_prove_verdict.py at all")
-        return findings
+    stripped_text = drop_comment_lines(text)
+    lines = stripped_text.splitlines()
+    jobs = split_top_level_jobs(stripped_text)
 
-    # A `run: |` block scalar's own shell continuations (`\` + newline) are
-    # joined into one line before the `--sha` argument is located -- the
-    # real file spreads its argv across several continuation lines.
-    joined = re.sub(r"\\\s*\n", " ", stripped)
-    sha_m = _SHA_ARG_RE.search(joined)
-    if sha_m is None:
-        findings.append(f"P5: {resolved} invokes gpu_prove_verdict.py with no --sha argument at all")
-    else:
-        raw = sha_m.group("q") if sha_m.group("q") is not None else sha_m.group("u")
-        if not _sha_arg_is_commit_bound(raw):
-            findings.append(
-                f"P5: {resolved}'s --sha argument is `{raw}`, not bound to `github.sha`/`$GITHUB_SHA` -- "
-                "a literal sha or a tag name would key the verdict by the wrong identity"
+    valid_found = False
+    for job_start, job_end in jobs.values():
+        job_if_present = any(
+            re.match(r"^    if:", lines[i]) for i in range(job_start, job_end)
+        )
+        job_coe_present = any(
+            re.match(r"^    continue-on-error:", lines[i]) for i in range(job_start, job_end)
+        )
+        for step_start, step_end in _find_step_ranges(lines, job_start, job_end):
+            step_keys = _parse_step_keys(lines, step_start, step_end)
+            run_text = step_keys.get("run")
+            if run_text is None or _GPU_PROVE_VERDICT_INVOCATION not in run_text:
+                continue
+            logical_lines = _join_shell_continuations(run_text)
+            invocation_line = next(
+                (ll for ll in logical_lines if ll.startswith(_GPU_PROVE_VERDICT_INVOCATION)), None
             )
+            if invocation_line is None:
+                # The invocation text is present in this step's `run:` body
+                # (e.g. inside a quoted `echo '...'`) but is not itself the
+                # command that runs -- not a real invocation site.
+                continue
+            remainder = invocation_line[len(_GPU_PROVE_VERDICT_INVOCATION) :]
+            if _CONTROL_OPERATOR_RE.search(remainder):
+                findings.append(
+                    f"P5: {resolved} invokes gpu_prove_verdict.py but a shell control operator "
+                    f"(`||`/`;`/`&&`) follows it on its logical line (`{invocation_line}`) -- the "
+                    "verdict check could fail open"
+                )
+                continue
+            if "if" in step_keys or "continue-on-error" in step_keys or job_if_present or job_coe_present:
+                findings.append(
+                    f"P5: {resolved}'s step invoking gpu_prove_verdict.py (or its job) carries "
+                    "`if:`/`continue-on-error:` -- the verdict check could be skipped or its "
+                    "failure silenced"
+                )
+                continue
+            sha_matches = list(_SHA_ARG_RE.finditer(invocation_line))
+            if not sha_matches:
+                findings.append(f"P5: {resolved} invokes gpu_prove_verdict.py with no --sha argument at all")
+                continue
+            # LAST occurrence wins, matching argparse's own last-flag-wins
+            # semantics -- never the first match a naive regex would find.
+            sha_m = sha_matches[-1]
+            raw = sha_m.group("q") if sha_m.group("q") is not None else sha_m.group("u")
+            if not _sha_arg_is_commit_bound(raw):
+                findings.append(
+                    f"P5: {resolved}'s --sha argument is `{raw}`, not bound to `github.sha`/`$GITHUB_SHA` -- "
+                    "a literal sha or a tag name would key the verdict by the wrong identity"
+                )
+                continue
+            valid_found = True
+
+    if not valid_found and not findings:
+        findings.append(
+            f"P5: {resolved} does not invoke {_GPU_PROVE_VERDICT_INVOCATION} as a real step's `run:` "
+            "command (a mention in `name:`/`env:`/a quoted echo string does not count)"
+        )
     return findings
 
 

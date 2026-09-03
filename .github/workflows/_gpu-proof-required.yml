@@ -47,7 +47,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check the commit's GPU-prove verdict (gpu-prove.yml, rule Q/V)
+      - name: Check the commit's GPU-prove verdict (gpu-prove.yml job conclusions at github.sha)
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |

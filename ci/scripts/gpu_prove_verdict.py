@@ -27,6 +27,16 @@ for a different label never touched this arch). A run that has not yet
 completed contributes NO measurement for any arch — it is simply invisible
 to this check, never a reason to wait: this script checks ONCE and returns.
 
+When an arch's LATEST ATTEMPT in a given run is itself still in progress
+(no `completed_at` yet), `filter=latest` would otherwise hide an EARLIER,
+already-completed attempt of that same run entirely — including a red one
+mid-rerun. `collect_measurements` closes this: it falls back to that one
+run's own most recent COMPLETED attempt for the arch (a `filter=all`
+re-query, lazy and cached per run), and a red completed attempt there still
+denies; only a run with no completed attempt at all for the arch
+contributes no measurement. This is still never a wait — the fallback reads
+what has already completed, once, and returns.
+
 Recency: the MOST RECENT measurement per arch is the one with
 the greatest job `completed_at` — never run id alone, because
 `gh run rerun <id> --failed` re-runs an EXISTING (possibly numerically
@@ -188,11 +198,15 @@ def list_runs(fetch: FetchFn, token: str, repo: str, workflow: str, sha: str) ->
     return runs
 
 
-def list_jobs(fetch: FetchFn, token: str, repo: str, run_id: int) -> list[dict]:
-    """`filter=latest` -- the latest ATTEMPT of each job in the run, so a
-    `gh run rerun <id> --failed` supersedes a stale attempt in place rather
-    than leaving a first-attempt failure to be read as a fresh one."""
-    url = f"{API_BASE}/repos/{repo}/actions/runs/{run_id}/jobs?filter=latest"
+def list_jobs(fetch: FetchFn, token: str, repo: str, run_id: int, filter_mode: str = "latest") -> list[dict]:
+    """`filter=latest` (the default) -- the latest ATTEMPT of each job in the
+    run, so a `gh run rerun <id> --failed` supersedes a stale attempt in
+    place rather than leaving a first-attempt failure to be read as a fresh
+    one. `filter_mode="all"` is used by `collect_measurements`'s F5 fallback
+    below -- ONLY when the latest attempt is itself still in progress -- to
+    recover that run's own most recent COMPLETED attempt for one arch,
+    never to second-guess a completed latest attempt."""
+    url = f"{API_BASE}/repos/{repo}/actions/runs/{run_id}/jobs?filter={filter_mode}"
     return _paginated(fetch, token, url, "jobs")
 
 
@@ -211,30 +225,68 @@ def collect_measurements(
     `completed_at` is still running -- this is a check-once, fail-loud
     consumer, so an incomplete job simply contributes no measurement; it is
     never a reason to wait, same as a run whose own `status` is not yet
-    `"completed"`)."""
+    `"completed"`).
+
+    F5 audit fix (fail-open window): `filter=latest` returns ONLY the latest
+    attempt of each job. When that latest attempt is itself still running
+    (`completed_at` is `None`), `filter=latest` hides any EARLIER,
+    already-COMPLETED attempt of the same arch's job in this SAME run
+    entirely -- including a red one -- so without this fallback an older
+    run's stale green could read as "most recent completed" while a newer,
+    contradicting red attempt sits invisible mid-rerun. When the latest
+    attempt is running, this run is re-queried with `filter=all` (once,
+    lazily, only for runs that actually need it) and the run's OWN most
+    recent COMPLETED (non-`skipped`) attempt for that arch is used instead
+    -- a red one there still denies. Only when the run has NO completed
+    attempt at all for that arch (e.g. its first and only attempt is still
+    in progress) does the run contribute no measurement for it -- never a
+    wait, never a poll."""
     by_arch: dict[str, list[Measurement]] = {a: [] for a in required_arches}
     name_to_arch = {JOB_NAME_TEMPLATE.format(arch=a): a for a in required_arches}
     for run in runs:
         run_id = run.get("id")
-        jobs = list_jobs(fetch, token, repo, run_id)
-        for job in jobs:
+        latest_jobs = list_jobs(fetch, token, repo, run_id, filter_mode="latest")
+        all_jobs_cache: list[dict] | None = None
+        for job in latest_jobs:
             arch = name_to_arch.get(job.get("name"))
             if arch is None:
                 continue
             conclusion = job.get("conclusion")
+            completed_at = job.get("completed_at")
+            job_id = job.get("id")
+            html_url = job.get("html_url") or ""
+            if completed_at is None:
+                # F5 fallback: the latest attempt is still in flight -- fetch
+                # (and cache, once per run) the unfiltered attempt list, and
+                # use THIS run's own most recent completed attempt for this
+                # arch instead. A run whose fallback also finds nothing
+                # completed contributes no measurement, exactly like today.
+                if all_jobs_cache is None:
+                    all_jobs_cache = list_jobs(fetch, token, repo, run_id, filter_mode="all")
+                completed_attempts = [
+                    j
+                    for j in all_jobs_cache
+                    if name_to_arch.get(j.get("name")) == arch
+                    and j.get("conclusion") != "skipped"
+                    and j.get("completed_at") is not None
+                ]
+                if not completed_attempts:
+                    continue  # no completed attempt in this run for this arch -- no measurement, never a wait
+                job = max(completed_attempts, key=lambda j: (j.get("completed_at") or "", j.get("id", 0)))
+                conclusion = job.get("conclusion")
+                completed_at = job.get("completed_at")
+                job_id = job.get("id")
+                html_url = job.get("html_url") or ""
             if conclusion == "skipped":
                 continue  # no measurement was made (rule F)
-            completed_at = job.get("completed_at")
-            if completed_at is None:
-                continue  # still running -- no measurement, never a wait
             by_arch[arch].append(
                 Measurement(
                     arch=arch,
                     run_id=run_id,
-                    job_id=job.get("id"),
+                    job_id=job_id,
                     conclusion=conclusion,
                     completed_at=completed_at,
-                    html_url=job.get("html_url") or "",
+                    html_url=html_url,
                 )
             )
     return by_arch

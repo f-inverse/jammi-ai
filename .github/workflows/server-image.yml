@@ -58,14 +58,20 @@ env:
 
 jobs:
   # CPU image, main-branch arm: pushed from the default branch (`latest` +
-  # sha) only — a merge to `main`, or a recovery dispatch run on main. This
-  # arm is UNGATED: it never promotes a `v*`/semver tag (see `build-and-push`
-  # below for that), only the rolling `:latest`/`:sha-...` channel a merge to
-  # main always refreshes, the same way it always has — the GPU-prove gate
-  # (#454 follow-up) applies to a RELEASE tag, not to every merge. Never runs
-  # on pull_request (PRs must not push to GHCR).
+  # sha) via a `workflow_dispatch` run on `main` only -- this workflow
+  # carries NO `push: branches:` trigger (F8 audit fix: unlike `image.yml`/
+  # `image-cuda.yml`, which do), so this arm never fires automatically on a
+  # mere merge; it is a manual `:latest`/`:sha-...` refresh. This arm is
+  # UNGATED: it never promotes a `v*`/semver tag (see `build-and-push`
+  # below for that) — the GPU-prove gate (#454 follow-up) applies to a
+  # RELEASE tag, not to this manual refresh. Never runs on pull_request
+  # (PRs must not push to GHCR).
   build-and-push-main:
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    # `&& github.ref_type != 'tag'` (F3 audit fix, #454 follow-up round 2):
+    # a `gate_kind='none'` row must structurally PROVE it can never fire on
+    # a release tag ref, never merely happen to never mention one --
+    # `check_gpu_prove_once.py`'s P3 rule pins this exact conjunct.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.ref_type != 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -86,9 +92,9 @@ jobs:
   # push, or a recovery dispatch run on the tag — behind the shared
   # GPU-prove verdict (#454 follow-up, operator direction: every release
   # publisher gates on the prove verdict, all-or-nothing, not only the CUDA
-  # lanes). Split from the main-branch arm above so the ungated rolling
-  # `:latest` refresh on every merge is never blocked by, or conflated with,
-  # a release-tag promotion's gate.
+  # lanes). Split from the main-branch arm above so the ungated manual
+  # `:latest` refresh is never blocked by, or conflated with, a
+  # release-tag promotion's gate.
   build-and-push:
     needs: [gpu-proof]
     if: always() && github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v') && needs.gpu-proof.result == 'success'
@@ -118,7 +124,14 @@ jobs:
   # variant builds from the CPU `builder` stage, not `builder-cuda`, so it
   # never carries a CUDA feature to source from the manifest.
   build-and-push-selfcontained:
-    if: github.event_name == 'workflow_dispatch' && inputs.selfcontained
+    # `&& github.ref_type != 'tag'` (F3 audit fix, #454 follow-up round 2):
+    # closes a real leak an adversarial audit found here -- without a ref-
+    # type restriction, a workflow_dispatch run against a `v*` tag ref with
+    # `selfcontained=true` pushed this image entirely ungated (this row is
+    # gate_kind='none' by design, so it never even had a GPU-prove verdict
+    # to bypass). `check_gpu_prove_once.py`'s P3 rule pins the exact
+    # conjunct `github.ref_type != 'tag'` on every gate_kind='none' row.
+    if: github.event_name == 'workflow_dispatch' && inputs.selfcontained && github.ref_type != 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: read

@@ -351,6 +351,92 @@ class DegenerateRecordsDenyEachOwnTest(unittest.TestCase):
         self.assertEqual(rc, 1)
 
 
+class RunningLatestAttemptFallsBackToRunCompletedAttemptTest(unittest.TestCase):
+    """F5 audit fixture (BLOCK B6b): `filter=latest` hides an earlier,
+    already-COMPLETED attempt of the same run entirely whenever the arch's
+    latest attempt is itself still in progress -- a red completed attempt
+    sitting right behind an in-flight rerun must still deny; a green
+    completed attempt behind an in-flight rerun must still pass."""
+
+    class TwoRunFetch:
+        """Run 1 is a plain completed run (both arches green). Run 2 is the
+        newer run under test: its `/jobs?filter=latest` view exposes ONLY
+        the currently in-flight attempt for sm_80 (`completed_at=None`) plus
+        a stable green sm_86, while `/jobs?filter=all` additionally exposes
+        sm_80's own earlier, already-completed attempt -- the one this
+        fixture's assertion turns on."""
+
+        def __init__(self, run2_completed_sm80):
+            self.run2_completed_sm80 = run2_completed_sm80
+            self.calls: list[str] = []
+
+        def __call__(self, url, token):
+            self.calls.append(url)
+            if "/actions/runs/1/jobs" in url:
+                return {
+                    "jobs": [
+                        job("sm_80", "success", "2026-01-01T00:00:00Z", job_id=1),
+                        job("sm_86", "success", "2026-01-01T00:00:00Z", job_id=2),
+                    ]
+                }
+            if "/actions/runs/2/jobs" in url:
+                sm80_latest = job("sm_80", None, None, job_id=21)  # attempt 2, still running
+                sm86_stable = job("sm_86", "success", "2026-01-02T00:00:00Z", job_id=22)
+                if "filter=latest" in url:
+                    return {"jobs": [sm80_latest, sm86_stable]}
+                if "filter=all" in url:
+                    return {"jobs": [self.run2_completed_sm80, sm80_latest, sm86_stable]}
+                raise AssertionError(f"unexpected filter in {url}")
+            return {"workflow_runs": [run_obj(1), run_obj(2, status="in_progress")]}
+
+    def test_red_completed_attempt_behind_an_in_progress_rerun_denies(self):
+        # attempt 1 (job_id=20) already completed RED, attempt 2 is running.
+        completed_attempt = job("sm_80", "failure", "2026-01-02T00:00:00Z", job_id=20)
+        fetch = self.TwoRunFetch(completed_attempt)
+        out, err = io.StringIO(), io.StringIO()
+        rc = gpv.run(repo=REPO, sha=SHA, workflow=WORKFLOW, fetch=fetch, token="tok", arches=ARCHES, out=out, err=err)
+        self.assertEqual(rc, 1, "a red completed attempt hidden behind filter=latest must still deny")
+        self.assertIn("sm_80", err.getvalue())
+        self.assertTrue(any("/actions/runs/2/jobs" in u and "filter=all" in u for u in fetch.calls))
+
+    def test_green_completed_attempt_behind_an_in_progress_rerun_passes(self):
+        # attempt 1 (job_id=20) already completed GREEN, attempt 2 is running.
+        completed_attempt = job("sm_80", "success", "2026-01-02T00:00:00Z", job_id=20)
+        fetch = self.TwoRunFetch(completed_attempt)
+        out, err = io.StringIO(), io.StringIO()
+        rc = gpv.run(repo=REPO, sha=SHA, workflow=WORKFLOW, fetch=fetch, token="tok", arches=ARCHES, out=out, err=err)
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertIn("run=2", out.getvalue(), "must be proven on run 2's own completed attempt 1, not run 1's older green")
+
+    def test_no_completed_attempt_at_all_contributes_no_measurement_falls_back_to_older_run(self):
+        # Run 2 has only ONE attempt for sm_80, and it is still running --
+        # filter=all shows nothing more completed than filter=latest already
+        # did. Run 2 must contribute NO measurement for sm_80, and the
+        # verdict must fall back to run 1's green.
+        class NoCompletedAttemptFetch:
+            def __call__(self, url, token):
+                if "/actions/runs/1/jobs" in url:
+                    return {
+                        "jobs": [
+                            job("sm_80", "success", "2026-01-01T00:00:00Z", job_id=1),
+                            job("sm_86", "success", "2026-01-01T00:00:00Z", job_id=2),
+                        ]
+                    }
+                if "/actions/runs/2/jobs" in url:
+                    running = job("sm_80", None, None, job_id=21)
+                    stable = job("sm_86", "success", "2026-01-02T00:00:00Z", job_id=22)
+                    return {"jobs": [running, stable]}  # identical for both filter values
+                return {"workflow_runs": [run_obj(1), run_obj(2, status="in_progress")]}
+
+        out, err = io.StringIO(), io.StringIO()
+        rc = gpv.run(
+            repo=REPO, sha=SHA, workflow=WORKFLOW, fetch=NoCompletedAttemptFetch(), token="tok",
+            arches=ARCHES, out=out, err=err,
+        )
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertIn("run=1", out.getvalue())
+
+
 class PositiveCaseTest(unittest.TestCase):
     def test_all_arches_success_passes_and_prints_ids(self):
         w = World()

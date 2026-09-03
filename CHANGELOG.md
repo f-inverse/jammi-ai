@@ -8,6 +8,11 @@ workspace ships every publishable crate at the same
 
 ## [0.49.1] - 2026-09-03
 
+A release-engineering patch, shipped in lockstep across the workspace: CUDA
+release lanes gate on one shared GPU-prove verdict per commit instead of
+renting pods per lane, and the prove lane's ssh session survives silent
+clone/build phases.
+
 ### Changed
 - **A release commit is proven once, and every CUDA release lane shares that verdict (#454, esc-084).**
   `gpu-prove.yml` is the single prove producer — off the merge path, never in the critical path of an

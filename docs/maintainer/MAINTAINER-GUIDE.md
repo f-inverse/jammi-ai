@@ -3373,19 +3373,36 @@ list): `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`, `pyproject.toml`, `clients/py
 `clients/typescript/package.json`, `packaging/server-cpu/pyproject.toml`,
 `packaging/server-cu12/pyproject.toml`. On merge, **prove before tagging**: dispatch
 `.github/workflows/gpu-prove.yml` on the commit to be released (`--ref main` at the tip, or on the
-pushed tag once it exists) and wait for all four shipped arches to go green — the CUDA release lanes
-below gate on that recorded verdict rather than proving anything themselves (`ci/scripts/
-gpu_prove_verdict.py`, consumed via `_gpu-proof-required.yml`); a red leg is re-run by hand
-(`gh run rerun <run_id> --failed`) in that same prove run. Then tag both `v*` and `py-v*`
+pushed tag once it exists) and wait for all four shipped arches to go green — **EVERY** release
+publishing job (#454 follow-up, all-or-nothing: not only the CUDA lanes) gates on that recorded
+verdict rather than proving anything themselves (`ci/scripts/gpu_prove_verdict.py`, consumed via
+`_gpu-proof-required.yml`); a red leg is re-run by hand (`gh run rerun <run_id> --failed`) in that
+same prove run. The verdict check is CHECK-ONCE and FAIL-LOUD — no poll, no deadline: a tag push on a
+commit whose prove is not ALREADY green fails every release workflow immediately, publishing nothing.
+The order is still prove → green → tag, because a tag push commits the version number and nothing
+here can retroactively un-push a tag. Then tag both `v*` and `py-v*`
 **lightweight, on the same commit, pushed together**:
-- **`v*`** → `.github/workflows/crates.yml` (validate → publish in topological order, skip
-  already-published, block on sparse-index propagation) + `.github/workflows/npm.yml` +
-  `.github/workflows/server-image.yml` (GHCR images, CUDA image gated on the verdict) +
-  `.github/workflows/release-binaries.yml` (CUDA tarball's promote step gated on the verdict).
-- **`py-v*`** → `.github/workflows/pypi.yml` (embed wheel) + `.github/workflows/pypi-client.yml`
-  (pure-Python client) + `.github/workflows/pypi-server.yml` +
-  `.github/workflows/pypi-server-cuda.yml` (auditwheel deliberately skipped; publish gated on the
-  same verdict — same commit, same tag family, so it reuses `v*`'s dispatch with no extra prove).
+- **`v*`** → `.github/workflows/crates.yml` (validate → perf-gate → prove-gated `publish` in
+  topological order, skip already-published, block on sparse-index propagation; `github-release`
+  chains off `publish`) + `.github/workflows/npm.yml` (build+test unconditional; the `Publish` step
+  itself is prove-gated) + `.github/workflows/server-image.yml` (the manual `:latest` CPU refresh via
+  `workflow_dispatch` on `main` is intentionally ungated — `build-and-push-main`; `server-image.yml`
+  carries no `push: branches:` trigger, so this never fires on a mere merge; the CPU and CUDA TAG
+  promotions — `build-and-push` and `build-and-push-cu12` — are both prove-gated) +
+  `.github/workflows/release-binaries.yml` (every asset family — the CLI matrix, the CPU tarball, the
+  CUDA tarball — is split into an ungated build leg that always runs and a prove-gated promote leg
+  that only attaches to the release on a tag).
+- **`py-v*`** → `.github/workflows/pypi.yml` (native wheel) + `.github/workflows/pypi-client.yml`
+  (pure-Python client) + `.github/workflows/pypi-server.yml` (CPU wheel — prove-gated too, even
+  though it never touches CUDA itself, because it ships in the SAME all-or-nothing lockstep release)
+  + `.github/workflows/pypi-server-cuda.yml` (auditwheel deliberately skipped) — all four gated on
+  the same verdict, same commit, same tag family, reusing `v*`'s dispatch with no extra prove.
+
+`ci/scripts/check_gpu_prove_once.py`'s `PROMOTION_TABLE` is the reviewed cross-check for every one of
+these promotion jobs (workflow, promoting job, gate job); its P6 discovery rule scans EVERY workflow
+file (no trigger filtering) and fails by name if a NEW promoting job — one whose steps invoke a
+publishing primitive by pattern, directly or via a `uses:`-called local reusable that itself does — is
+ever added without a table row.
 
 **Disk pressure is a recurring real failure** — keep `CARGO_TARGET_DIR` on NVMe; the separate
 `compile-check-gated` job and `crates.yml --no-verify` exist for this reason.

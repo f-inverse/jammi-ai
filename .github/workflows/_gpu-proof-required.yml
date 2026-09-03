@@ -1,9 +1,12 @@
 name: _gpu-proof-required
 
-# Reusable "proof required" gate (issue #454, esc-084): every CUDA release
-# lane calls this instead of renting hardware itself. It asks the GitHub
-# REST API, for the commit THIS caller is promoting (`github.sha`), whether
-# `gpu-prove.yml` already has a green measurement (`ci/scripts/
+# Reusable "proof required" gate (issue #454, esc-084): EVERY release-
+# publishing workflow calls this instead of renting hardware itself (or, for
+# a non-CUDA publisher, instead of publishing on no evidence at all) —
+# crates.io, npm, every PyPI dist, the server image, and the release
+# binaries all gate on the same commit's recorded verdict. It asks the
+# GitHub REST API, for the commit THIS caller is promoting (`github.sha`),
+# whether `gpu-prove.yml` already has a green measurement (`ci/scripts/
 # gpu_prove_verdict.py`'s most-recent-measurement-wins rule) for every
 # shipped CUDA arch (`crates/jammi-kernels/build.rs` GENCODE_ARCHES).
 #
@@ -14,19 +17,24 @@ name: _gpu-proof-required
 # MAINTAINER-GUIDE.md's release runbook. This job only READS the verdict
 # already on record for the promoted commit.
 #
-# Fail-closed: no measurement for some shipped arch, or the most recent
-# measurement for some arch is not `success`, denies — this job's own
-# result becomes non-success and the caller's promoting job (gated on
-# `needs.<this job>.result == 'success'`) never runs (#432 non-goal:
-# nothing promotes unproven). The bounded poll inside `gpu_prove_verdict.py`
-# only serves the "tag, then dispatch gpu-prove.yml on the tag" ordering —
-# it waits for an ALREADY-STARTED prove run to finish, it never starts one.
+# CHECK ONCE, FAIL LOUD (operator direction, 2026-09-03 — supersedes an
+# earlier polling design): `gpu_prove_verdict.py` makes exactly one pass
+# over the commit's recorded runs and returns. There is no deadline, no
+# poll, no grace window — an in-progress prove run at this sha is simply
+# invisible to the check, never a reason to wait. A tag push on a commit
+# whose prove is not ALREADY green fails every release workflow
+# immediately, by design: prove first, then tag, because a tag push commits
+# the version number. Fail-closed: no measurement for some shipped arch, or
+# the most recent measurement for some arch is not `success`, denies — this
+# job's own result becomes non-success and the caller's promoting job
+# (gated on `needs.<this job>.result == 'success'`) never runs (#432
+# non-goal: nothing promotes unproven).
 #
-# `timeout-minutes: 360` / `--deadline-minutes 355` (5m margin) is the SAME
-# release-tag budget `gpu-prove.yml`'s own header derives (esc-080/esc-083)
-# — kept in that ONE place; this comment states the corresponding number,
-# never a second derivation. No concurrency group: this job never rents
-# anything, so nothing here can orphan a pod or need serialization.
+# `timeout-minutes: 15` bounds a single REST lookup, not a wait — this is
+# not a release-tag hardware budget (contrast `gpu-prove.yml`'s own
+# derivation, which this job never inherits: it never rents anything). No
+# concurrency group: this job never rents anything, so nothing here can
+# orphan a pod or need serialization.
 
 on:
   workflow_call: {}
@@ -43,7 +51,7 @@ jobs:
   proof-required:
     name: GPU proof required
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -53,5 +61,4 @@ jobs:
         run: |
           python3 ci/scripts/gpu_prove_verdict.py \
             --repo "$GITHUB_REPOSITORY" \
-            --sha "$GITHUB_SHA" \
-            --deadline-minutes 355
+            --sha "$GITHUB_SHA"

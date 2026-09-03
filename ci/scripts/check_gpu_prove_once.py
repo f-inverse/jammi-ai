@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""GPU-prove-once guard (esc-084, issue #454) — hermetic, static, no build,
-no GPU, no PyYAML.
+"""GPU-prove-once guard (esc-084, issue #454; #454 follow-up, operator
+direction 2026-09-03: every release publisher, not only the CUDA lanes) —
+hermetic, static, no build, no GPU, no PyYAML.
 
 **Guarded property**: a release commit is proven ONCE per shipped arch, and
-every CUDA release lane consumes that SAME verdict, never renting hardware
-of its own. The prove lane itself is a manual dev run, never in the
-critical path of any automated workflow -- see `gpu-prove.yml`'s own header
-for the canonical statement of why; a publisher gates on the SUMMARY of a
-prove execution already on record for the commit it promotes.
+EVERY release-publishing workflow — CUDA and non-CUDA alike (crates.io, npm,
+every PyPI dist, the server image, the release binaries) — gates its
+promotion on that SAME recorded verdict, all-or-nothing: a tag push
+publishes NOTHING until the commit's prove is green. The prove lane itself
+is a manual dev run, never in the critical path of any automated workflow --
+see `gpu-prove.yml`'s own header for the canonical statement of why; a
+publisher gates on the SUMMARY of a prove execution already on record for
+the commit it promotes.
 
-Five positive-and-negative rules (F7, ask-6 — every rule has a fixture that
+Six positive-and-negative rules (F7, ask-6 — every rule has a fixture that
 must PASS as well as fixtures that must FAIL, never a grep for one known-bad
 string):
 
@@ -25,17 +29,47 @@ string):
   P2 (no renting reusable): no workflow `uses:` a `_gpu-prove-gate.yml`
      (any path), and that file must not exist in the tree at all.
 
-  P3 (manifest lane -> promotion chain, reconciled both ways): every
-     `ci/release-feature-manifest.json` lane whose `cargo_features` declares
-     `cuda` has a reviewed row in `LANE_TABLE` naming (workflow, promoting
-     job, gate job); the gate job `uses: ./.github/workflows/
-     _gpu-proof-required.yml`; the promoting job's `needs:` lists the gate
-     job; and the promoting job's `if:` is a PURE top-level conjunction
+  P3 (PROMOTION_TABLE, every row reconciled): every reviewed row in
+     `PROMOTION_TABLE` (workflow, promoting job, gate job/kind, tag family)
+     is structurally sound. A `"direct"` row's gate job must `uses:
+     ./.github/workflows/_gpu-proof-required.yml`; a `"chained"` row's gate
+     job must itself be some OTHER row's promoting job in the SAME workflow
+     (e.g. `crates.yml`'s `github-release` chains off `publish`, which is
+     itself a `"direct"` row); a `"none"` row is a reviewed, deliberately
+     UNGATED promotion (e.g. `image.yml`/`image-cuda.yml`'s CI base-image
+     rebuild on every merge to `main`, or `server-image.yml`'s manual
+     `:latest` refresh on a `workflow_dispatch` against `main` -- neither is
+     ever a release-tag promotion) and must structurally prove it
+     can NEVER fire on a release tag ref: its job `if:` must be a PURE
+     top-level conjunction containing the EXACT conjunct
+     `github.ref_type != 'tag'` (F3 audit fix -- a `refs/tags/`-substring-
+     absence check used to pass an `if:` that merely never MENTIONED a tag
+     pattern, which a `workflow_dispatch` on a tag ref trivially satisfies
+     without ever excluding one; a missing `if:` at all on a `"none"` row is
+     the same failure). For `"direct"`/`"chained"` rows: the promoting job's
+     `needs:` lists the gate job, and the promoting job's `if:` — or, when
+     the row names a `step_name`, that ONE step's `if:` (npm.yml's `publish`
+     job also runs build+test unconditionally, so the gate lives on its
+     "Publish" step, not the job) — is a PURE top-level conjunction
      (parenthesis- and quote-aware structural scan, never a substring check)
-     containing the exact conjunct `needs.<gate>.result == 'success'` and NO
-     depth-0 `||` anywhere. A table row naming a lane the manifest no longer
-     declares, a lane with no row, or a missing workflow file are each a
-     FAIL, never a silent skip.
+     containing the exact conjunct `needs.<gate>.result == 'success'`, the
+     exact conjunct `startsWith(github.ref, 'refs/tags/<family>')` for the
+     row's own `tag_family` (F7 audit fix -- the tag guard itself used to be
+     unpinned; a `"direct"` row's own gate job `if:` is held to the SAME
+     exact conjunct, since a gate job usable off a tag ref for the wrong
+     family, or off no tag ref restriction at all, would let the verdict be
+     consulted -- and satisfied -- outside the release-tag path it exists
+     to gate), and NO depth-0 `||` anywhere. When the row names a
+     `step_name`, every OTHER step in that same job must NOT itself invoke a
+     publishing primitive (F4 audit fix -- a step-gated row only pinned the
+     NAMED step's `if:`; a second, ungated publishing step in the same job
+     used to sail through unseen). A missing workflow file, job, or step
+     named by a row is a FAIL, never a silent skip. `ci/release-feature-
+     manifest.json`'s own CUDA lane set is reconciled against the table as a
+     SUBSET check: every manifest CUDA lane's promoting job must have a
+     table row (the reverse direction — a table row naming no manifest
+     lane — is expected and fine, since most rows promote a non-CUDA,
+     non-manifest surface).
 
   P4 (consumer/producer name agreement): `gpu_prove_verdict.py`'s
      `JOB_NAME_TEMPLATE` matches `gpu-prove.yml`'s own matrix job `name:`
@@ -44,14 +78,55 @@ string):
      workflow's own matrix `arch:` list — never a hand-typed list on either
      side.
 
-  P5 (the reusable actually consults the verdict, BLOCK B8 audit fix): P3
-     only checks a gate job's `uses:` line, so gutting
+  P5 (the reusable actually consults the verdict, BLOCK B8 audit fix,
+     hardened by F6): P3 only checks a gate job's `uses:` line, so gutting
      `_gpu-proof-required.yml` to `run: echo ok` would otherwise leave P1-P4
      green with no real promotion gate behind it. `_gpu-proof-required.yml`
      must exist, its `on:` block must be `workflow_call`-only, and its
      comment-stripped step body must invoke `python3 ci/scripts/
      gpu_prove_verdict.py` with `--sha` bound to the commit being promoted
-     (`github.sha`/`$GITHUB_SHA`) — a literal sha or a tag name FAILS.
+     (`github.sha`/`$GITHUB_SHA`) — a literal sha or a tag name FAILS — and
+     (F6 audit fix) `--repo` bound to `github.repository`/
+     `$GITHUB_REPOSITORY` — a literal/foreign repo would key the verdict
+     lookup at the wrong repo — with any `--workflow` override forbidden
+     from naming anything other than `gpu-prove.yml` itself (a pointed-
+     elsewhere consumer could read a DIFFERENT, unrelated workflow's runs as
+     if they proved this one).
+
+  P6 (DISCOVERY: an unlisted publishing job FAILS by name, F1+F2 hardened).
+     P3 only reconciles the rows already IN `PROMOTION_TABLE` — the
+     disclosed limit this module used to carry was that a brand-new
+     promoting job could be invisible to it. P6 closes that: EVERY workflow
+     file is scanned (F2 audit fix — no `push:`/`tags:` trigger filtering at
+     all; a publishing primitive anywhere in the tree must be in the table,
+     regardless of what triggers the file; an unreadable `on:`/`jobs:` block
+     is itself a FAIL, never a silent skip, same fail-loud doctrine as P1).
+     Every job whose comment-stripped body matches a `PRIMITIVE_PATTERNS`
+     entry (F1 audit fix — a regex list over comment-stripped step bodies
+     and `uses:` lines, whitespace-tolerant, never five literal marker
+     strings: `cargo publish`, `npm publish`, `twine upload`, `maturin
+     upload`, `docker push`, `gh release create`/`upload`, `pypa/gh-action-
+     pypi-publish`, `softprops/action-gh-release`, `docker/build-push-
+     action` — any `push:` value that is not literally `false`/`"false"`,
+     including an unquoted `true`, `'true'`, or any `${{ }}` expression —
+     `./.github/actions/docker-publish` and its cross-repo form under the
+     SAME push rule, `./.github/actions/release-upload` and its cross-repo
+     form, `ci/scripts/publish_crates.sh`) must be listed as SOME row's
+     `(workflow, promoting_job)` in `PROMOTION_TABLE`. RECURSIVE: a job that
+     merely `uses:` a LOCAL reusable workflow (job-level `uses: ./.github/
+     workflows/<X>.yml`) whose OWN jobs match a primitive is itself a
+     promoting job too — e.g. `_ci-base-image.yml`'s `build-and-push` job
+     pushes to GHCR, so `image.yml`/`image-cuda.yml`'s `build` jobs (which
+     each `uses:` it) are discovered and tabled (`gate_kind="none"`, proven
+     structurally unreachable from a tag ref per F3's own rule — never
+     reachable via `workflow_dispatch` on a tag ref, since neither image is
+     part of any release). A workflow whose OWN `on:` block is
+     `workflow_call`-only (the same "never independently starts" doctrine
+     P1/P5 hold `gpu-prove.yml`/`_gpu-proof-required.yml` to) is skipped by
+     the DIRECT scan — it is inert without a caller and is reached only via
+     that caller's recursive check above, never double-tabled against
+     itself. An unlisted match FAILS, naming the workflow and job — it can
+     never again silently promote ungated.
 
 Mechanism: comment-stripped line scan plus a minimal indentation-based
 `jobs:` block splitter (no PyYAML, this repo's own gate convention). Every
@@ -60,12 +135,11 @@ check function takes an explicit `workflows_dir`/`manifest_path` so
 trees, including a fixture reproducing the PRE-FIX shape (esc-084: three
 publishers `uses:` a renting reusable).
 
-Disclosed limit (advisory A8): `LANE_TABLE` is a hand-REVIEWED table, not
-derived from the workflow tree — P3 reconciles it against the manifest's
-own CUDA lane set both ways, but a brand-NEW promoting job added inside an
-EXISTING lane's workflow (rather than replacing the lane's one reviewed
-row) is invisible to P3 unless `LANE_TABLE` is updated by hand alongside
-it. This gate is a reviewed cross-check, not a discovery mechanism.
+`PROMOTION_TABLE` is still a hand-REVIEWED table, not derived from the
+workflow tree — P3 checks each row's own internal structure, and P6 (above)
+is what now catches a row that was never added at all, closing the "new
+promoting job is invisible" gap the previous revision of this module
+disclosed as an open limit.
 
 Run: `python3 ci/scripts/check_gpu_prove_once.py`
 Self-test: `python3 ci/scripts/test_check_gpu_prove_once.py`
@@ -76,6 +150,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -91,13 +166,92 @@ PROVE_PRODUCER_WORKFLOW = "gpu-prove.yml"
 GATE_WORKFLOW = "_gpu-prove-gate.yml"  # the DELETED renting reusable -- must stay gone.
 PROOF_REQUIRED_WORKFLOW = "_gpu-proof-required.yml"
 
-# P3's reviewed table -- WHICH job promotes WHICH manifest lane is a design
-# decision, never recoverable from the YAML alone, so this is hand-
-# maintained and reconciled against the manifest both ways by check_p3().
-LANE_TABLE: dict[str, tuple[str, str, str]] = {
-    "cu12-image": ("server-image.yml", "build-and-push-cu12", "gpu-proof"),
-    "cu12-tarball": ("release-binaries.yml", "server-cu12-promote", "gpu-proof"),
-    "cu12-wheel": ("pypi-server-cuda.yml", "publish", "gpu-proof"),
+
+@dataclass(frozen=True)
+class PromotionRow:
+    """One reviewed row of `PROMOTION_TABLE`.
+
+    `gate_kind`:
+      - `"direct"`: `gate_job` is a job in THIS workflow that itself
+        `uses: _gpu-proof-required.yml` — the promoting job's `needs:`/
+        `if:` conjunct names it directly.
+      - `"chained"`: `gate_job` is ANOTHER row's `promoting_job` in the
+        SAME workflow (already itself gated, directly or chained) — e.g.
+        `crates.yml`'s `github-release` chains off `publish`.
+      - `"none"`: a reviewed, deliberately UNGATED promotion (e.g.
+        `image.yml`/`image-cuda.yml`'s CI base-image rebuild on a merge to
+        `main` — never a release tag promotion). `gate_job` is `None`; P3
+        (F3 audit fix) instead asserts the promoting job's `if:` is a PURE
+        top-level conjunction carrying the EXACT conjunct
+        `github.ref_type != 'tag'`, so it can structurally never fire on a
+        release tag ref (a substring-absence check on `refs/tags/` used to
+        pass an `if:` with no ref restriction at all).
+
+    `step_name`: `None` for the common case (the gate conjunct lives on the
+    promoting JOB's own `if:`). When set, the gate conjunct instead lives on
+    that ONE named step's `if:` — npm.yml's `publish` job runs build+test
+    unconditionally (so a branch dispatch keeps its build-and-test dry run),
+    with the actual publish gated at the step level.
+
+    `tag_family` (F7 audit fix): the exact `refs/tags/<family>` prefix this
+    row's release tag uses (`"v"` for the default/`crates.io`/`npm`/server-
+    image/binaries surface, `"py-v"` for the lockstep Python dist surface).
+    For `"direct"`/`"chained"` rows, P3 requires the promoting job's (or
+    gated step's) `if:` — and, for `"direct"` rows, the gate job's own
+    `if:` too — to carry the exact top-level conjunct
+    `startsWith(github.ref, 'refs/tags/<family>')`. Not consulted for
+    `"none"` rows, which instead prove unreachability via `github.ref_type
+    != 'tag'` (see the module doc's P3 entry).
+    """
+
+    workflow: str
+    promoting_job: str
+    gate_job: str | None
+    gate_kind: str  # "direct" | "chained" | "none"
+    step_name: str | None = None
+    tag_family: str = "v"
+
+
+# P3's reviewed table -- WHICH job promotes WHAT, and how it is gated, is a
+# design decision, never recoverable from the YAML alone, so this is
+# hand-maintained. P6 (module doc above) is the DISCOVERY backstop: a
+# publishing job with no row here fails by name instead of going unnoticed.
+PROMOTION_TABLE: dict[str, PromotionRow] = {
+    # ---- CUDA lanes (also the ci/release-feature-manifest.json CUDA lanes) ----
+    "cu12-image": PromotionRow("server-image.yml", "build-and-push-cu12", "gpu-proof", "direct"),
+    "cu12-tarball": PromotionRow("release-binaries.yml", "server-cu12-promote", "gpu-proof", "direct"),
+    "cu12-wheel": PromotionRow("pypi-server-cuda.yml", "publish", "gpu-proof", "direct", tag_family="py-v"),
+    # ---- server-image.yml's other arms ----
+    "cpu-image-tag": PromotionRow("server-image.yml", "build-and-push", "gpu-proof", "direct"),
+    "cpu-image-main": PromotionRow(
+        "server-image.yml", "build-and-push-main", None, "none"
+    ),  # manual :latest refresh via workflow_dispatch on main (F8 audit fix: server-image.yml carries
+    # no push: branches: trigger, so this never fires on a mere merge) -- never a release tag promotion.
+    "cpu-image-selfcontained": PromotionRow(
+        "server-image.yml", "build-and-push-selfcontained", None, "none"
+    ),  # manual dispatch-only opt-in image (Cloudflare Containers) -- pre-existing behavior, out of this unit's scope.
+    # ---- image.yml / image-cuda.yml: CI base images (F1 audit fix -- P6's
+    # recursion discovers these two `build` jobs BECAUSE they `uses:` the
+    # LOCAL reusable `_ci-base-image.yml`, whose own `build-and-push` job
+    # pushes to GHCR). Both are reviewed UNGATED rows: they publish the
+    # toolchain LAYER the release lanes build inside, on a merge to `main`,
+    # never a release tag -- and (F3) each `build` job's own `if:` carries
+    # the exact `github.ref_type != 'tag'` conjunct so a workflow_dispatch
+    # on a tag ref can never reach them either.
+    "ci-image-cpu": PromotionRow("image.yml", "build", None, "none"),
+    "ci-image-cuda": PromotionRow("image-cuda.yml", "build", None, "none"),
+    # ---- release-binaries.yml's remaining lanes ----
+    "cli-binaries": PromotionRow("release-binaries.yml", "promote-binaries", "gpu-proof", "direct"),
+    "server-cpu-tarball": PromotionRow("release-binaries.yml", "server-cpu-promote", "gpu-proof", "direct"),
+    # ---- crates.io ----
+    "crates-publish": PromotionRow("crates.yml", "publish", "gpu-proof", "direct"),
+    "crates-github-release": PromotionRow("crates.yml", "github-release", "publish", "chained"),
+    # ---- npm ----
+    "npm-publish": PromotionRow("npm.yml", "publish", "gpu-proof", "direct", step_name="Publish"),
+    # ---- PyPI (lockstep "py-v*" tag family) ----
+    "native-wheel": PromotionRow("pypi.yml", "publish", "gpu-proof", "direct", tag_family="py-v"),
+    "client-wheel": PromotionRow("pypi-client.yml", "publish", "gpu-proof", "direct", tag_family="py-v"),
+    "server-cpu-wheel": PromotionRow("pypi-server.yml", "publish", "gpu-proof", "direct", tag_family="py-v"),
 }
 
 _USES_LOCAL_RE = re.compile(r"uses:\s*\./\.github/workflows/([A-Za-z0-9_.-]+)")
@@ -157,8 +311,12 @@ def split_top_level_jobs(text: str) -> dict[str, tuple[int, int]]:
     before the next 2-space-indented key, or EOF."""
     lines = text.splitlines()
     jobs_line = None
+    # F2 audit fix: comment-tolerant (`jobs:  # comment` reads identically
+    # to a bare `jobs:`) -- an exact `== "jobs:"` match used to miss this
+    # and silently read the file as having zero jobs.
+    jobs_header_re = re.compile(r"^jobs:\s*(#.*)?$")
     for i, line in enumerate(lines):
-        if line.rstrip() == "jobs:":
+        if jobs_header_re.match(line):
             jobs_line = i
             break
     if jobs_line is None:
@@ -181,24 +339,64 @@ def split_top_level_jobs(text: str) -> dict[str, tuple[int, int]]:
     return jobs
 
 
+def read_jobs_block_or_fail(text: str) -> tuple[dict[str, tuple[int, int]] | None, str | None]:
+    """(jobs, error). F2 audit fix: P6 scans EVERY workflow file (no
+    trigger filter), so a `jobs:` block it cannot read must FAIL LOUD --
+    the same doctrine `read_top_level_on_block` already holds `on:` to --
+    never silently read as "this file has zero jobs". A quoted `"jobs":`/
+    `'jobs':` key or a flow-style `jobs: {...}` is unreadable outright; a
+    `jobs:` header that IS found but under which `split_top_level_jobs`
+    recognizes zero job entries (e.g. every job header shifted to a
+    non-canonical 4-space indent) is refused too -- a real workflow file
+    always has at least one job, so an empty result here means "could not
+    be parsed", never "legitimately zero jobs"."""
+    lines = text.splitlines()
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r'^"jobs":', stripped) or re.match(r"^'jobs':", stripped):
+            return None, 'jobs: block is quoted ("jobs": / \'jobs\':) -- cannot read'
+    jobs_header_found = False
+    for line in lines:
+        if re.match(r"^jobs:\s*(\{|\[)", line):
+            return None, "jobs: is flow-style -- cannot read"
+        if re.match(r"^jobs:\s*(#.*)?$", line):
+            jobs_header_found = True
+            break
+    if not jobs_header_found:
+        return None, "no top-level jobs: block found"
+    jobs = split_top_level_jobs(text)
+    if not jobs:
+        return None, "jobs: block found but no job entries recognized under it (non-canonical indentation?)"
+    return jobs, None
+
+
 # --------------------------------------------------------------------------- #
 # `if:` expression reconstitution + top-level conjunction scanner (P3's
 # structural, parenthesis- and quote-aware rule -- never a substring check).
 # --------------------------------------------------------------------------- #
-_IF_KEY_RE = re.compile(r"^    if:(.*)$")
 _BLOCK_SCALAR_HEADS = {">", ">-", "|", "|-"}
 
 
-def reconstruct_if_expr(lines: list[str], job_start: int, job_end: int) -> tuple[str | None, str | None]:
-    """(expr, error). `expr` is `None` with `error` `None` when the job
+def reconstruct_if_expr(
+    lines: list[str], job_start: int, job_end: int, indent: int = 4
+) -> tuple[str | None, str | None]:
+    """(expr, error). `expr` is `None` with `error` `None` when the range
     carries no `if:` at all (not itself an error). `error` is set (expr
     `None`) when a found `if:` cannot be read in full -- an unterminated
-    block scalar, an empty inline value with no recognized block form."""
+    block scalar, an empty inline value with no recognized block form.
+
+    `indent` is the exact column an `if:` key must sit at to count --
+    4 for a JOB-level `if:` (2-space `jobs:` + 2-space job name), or the
+    step's own key column for a STEP-level `if:` (`find_step_key_indent`
+    below). This is never a `\\s*`-style loose match: an `if:` at the wrong
+    depth (e.g. inside a nested `with:` block, or on a DIFFERENT step) must
+    never be mistaken for this range's own condition."""
+    if_key_re = re.compile(r"^" + " " * indent + r"if:(.*)$")
     for i in range(job_start, job_end):
         line = lines[i]
         if line.strip().startswith("#"):
             continue
-        m = _IF_KEY_RE.match(line)
+        m = if_key_re.match(line)
         if not m:
             continue
         rest = m.group(1).strip()
@@ -210,8 +408,8 @@ def reconstruct_if_expr(lines: list[str], job_start: int, job_end: int) -> tuple
                 if bl.strip() == "":
                     j += 1
                     continue
-                indent = len(bl) - len(bl.lstrip(" "))
-                if indent <= 4:
+                bl_indent = len(bl) - len(bl.lstrip(" "))
+                if bl_indent <= indent:
                     break
                 if not bl.strip().startswith("#"):
                     body.append(bl.strip())
@@ -294,6 +492,7 @@ def split_top_level(expr: str) -> tuple[list[str], bool]:
 def normalize_conjunct(c: str) -> str:
     c = re.sub(r"\s+", " ", c.strip())
     c = re.sub(r"\s*==\s*", " == ", c)
+    c = re.sub(r"\s*!=\s*", " != ", c)
     return c
 
 
@@ -301,12 +500,48 @@ def gate_conjunct(gate_job: str) -> str:
     return f"needs.{gate_job}.result == 'success'"
 
 
-def check_promoting_if(expr: str, gate_job: str) -> list[str]:
-    """The pure-top-level-conjunction rule for one promoting job's already-
-    reconstituted `if:` expression. Returns a (possibly empty) findings
-    list -- never raises on a malformed-but-parseable expression (a
-    genuinely unreadable one is handled by the caller via
-    `reconstruct_if_expr`'s own error return)."""
+def tag_guard_conjunct(family: str) -> str:
+    """F7 audit fix: the exact top-level conjunct a `"direct"`/`"chained"`
+    row's promoting job/step `if:` (and, for `"direct"` rows, the gate
+    job's own `if:`) must carry -- pinned by `family` (`PromotionRow.
+    tag_family`), never a hand-typed literal at each call site."""
+    return f"startsWith(github.ref, 'refs/tags/{family}')"
+
+
+NONE_ROW_REF_TYPE_CONJUNCT = "github.ref_type != 'tag'"
+
+
+def check_top_level_conjunct_present(expr: str, want: str, what: str) -> list[str]:
+    """Shared structural rule behind P3's `needs.<gate>.result == 'success'`
+    check, F3's `github.ref_type != 'tag'` check, and F7's
+    `startsWith(github.ref, 'refs/tags/<family>')` check: `expr` must be a
+    parenthesis-/quote-aware PURE top-level conjunction (no depth-0 `||`)
+    containing `want` as one of its (whitespace/`==`/`!=`-normalized)
+    conjuncts. `what` names the missing/violated conjunct in the finding for
+    the caller to prefix with its own row/location context."""
+    tokens, balanced = split_top_level(expr)
+    if not balanced:
+        return [f"if: `{expr}` has unbalanced parens/an unterminated string -- refusing to analyze a truncated expression"]
+    operators = [t for t in tokens if t in ("&&", "||")]
+    conjuncts = [t for t in tokens if t not in ("&&", "||")]
+    if "||" in operators:
+        return [f"if: `{expr}` carries a depth-0 `||` -- {what} must be a PURE conjunction"]
+    normalized = [normalize_conjunct(c) for c in conjuncts]
+    want_normalized = normalize_conjunct(want)
+    if want_normalized not in normalized:
+        return [f"if: `{expr}` has no top-level conjunct equal to `{want}`"]
+    return []
+
+
+def check_promoting_if(expr: str, gate_job: str, tag_family: str | None = None) -> list[str]:
+    """The pure-top-level-conjunction rule for one promoting job's (or gated
+    step's) already-reconstituted `if:` expression: contains the exact
+    `needs.<gate>.result == 'success'` conjunct and, when `tag_family` is
+    given (F7 audit fix), the exact `startsWith(github.ref,
+    'refs/tags/<family>')` conjunct too, with NO depth-0 `||` anywhere.
+    Returns a (possibly empty) findings list -- never raises on a
+    malformed-but-parseable expression (a genuinely unreadable one is
+    handled by the caller via `reconstruct_if_expr`'s own error return)."""
     tokens, balanced = split_top_level(expr)
     if not balanced:
         return [f"if: `{expr}` has unbalanced parens/an unterminated string -- refusing to analyze a truncated expression"]
@@ -314,11 +549,16 @@ def check_promoting_if(expr: str, gate_job: str) -> list[str]:
     conjuncts = [t for t in tokens if t not in ("&&", "||")]
     if "||" in operators:
         return [f"if: `{expr}` carries a depth-0 `||` -- a promoting job's condition must be a PURE conjunction"]
-    want = gate_conjunct(gate_job)
     normalized = [normalize_conjunct(c) for c in conjuncts]
-    if want not in normalized:
-        return [f"if: `{expr}` has no top-level conjunct equal to `{want}`"]
-    return []
+    findings: list[str] = []
+    want_gate = gate_conjunct(gate_job)
+    if want_gate not in normalized:
+        findings.append(f"if: `{expr}` has no top-level conjunct equal to `{want_gate}`")
+    if tag_family is not None:
+        want_tag = tag_guard_conjunct(tag_family)
+        if normalize_conjunct(want_tag) not in normalized:
+            findings.append(f"if: `{expr}` has no top-level conjunct equal to `{want_tag}` (F7 tag guard)")
+    return findings
 
 
 # --------------------------------------------------------------------------- #
@@ -337,7 +577,12 @@ def read_top_level_on_block(text: str) -> tuple[list[str] | None, str | None]:
             return None, 'on: block is quoted ("on": / \'on\':) -- cannot read'
         if not line.startswith("on:"):
             continue
-        rest = line[len("on:") :].strip()
+        # F2 audit fix: strip a trailing inline comment (`on:  # comment`)
+        # before deciding whether the line carries an inline value -- a
+        # bare `on:` with a trailing comment must be read exactly like a
+        # bare `on:` (look at the child keys below), never misread as a
+        # single literal trigger key of `"# comment"`.
+        rest = re.sub(r"\s*#.*$", "", line[len("on:") :]).strip()
         if rest == "":
             keys: list[str] = []
             for j in range(i + 1, len(lines)):
@@ -447,7 +692,7 @@ def check_gate_file_absent(workflows_dir: Path) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
-# P3
+# P3 (PROMOTION_TABLE reconciliation) + P6 (discovery)
 # --------------------------------------------------------------------------- #
 def cuda_lanes(manifest: dict) -> set[str]:
     return {
@@ -457,89 +702,417 @@ def cuda_lanes(manifest: dict) -> set[str]:
     }
 
 
-def check_p3(workflow_texts: dict[str, str], manifest: dict) -> list[str]:
+def _parse_needs_names(job_body: str) -> list[str]:
+    """The job-body's `needs:` list, single-line (`needs: a` / `needs: [a,
+    b]`) or multi-line (`needs:` then `- a` / `- b` items). `job_body` must
+    already be comment-stripped."""
+    needs_names: list[str] = []
+    # Advisory A7 fix: `[ \t]*`, never `\s*`, right after `needs:` -- `\s`
+    # matches `\n` too, so `\s*` would swallow the newline AND the next
+    # line's leading whitespace when `needs:` carries no inline value,
+    # landing the cursor on the multi-line list's FIRST `- item` and
+    # letting `(.*)$` capture `- gpu-proof` as a bogus single literal
+    # "needs name" (dash and all) instead of falling through to the
+    # multi-line-list branch below.
+    needs_m = re.search(r"^[ \t]*needs:[ \t]*(.*)$", job_body, re.MULTILINE)
+    if needs_m and needs_m.group(1).strip():
+        rest = needs_m.group(1).strip()
+        if rest.startswith("["):
+            needs_names = [x.strip() for x in rest.strip("[]").split(",") if x.strip()]
+        else:
+            needs_names = [rest]
+    elif needs_m:
+        job_lines = job_body.splitlines()
+        for idx, l2 in enumerate(job_lines):
+            if re.match(r"^\s*needs:\s*$", l2):
+                for l3 in job_lines[idx + 1 :]:
+                    m3 = re.match(r"^\s*-\s*([A-Za-z0-9_.-]+)\s*$", l3)
+                    if m3:
+                        needs_names.append(m3.group(1))
+                    else:
+                        break
+                break
+    return needs_names
+
+
+def _step_key_column(lines: list[str], s: int, e: int) -> int | None:
+    """The indentation column every top-level key of the step spanning
+    [s, e) sits at -- the same computation `_parse_step_keys` makes
+    internally, exposed standalone so a step-scoped `if:` can be
+    reconstituted at the RIGHT depth (see `find_step_if_by_name`)."""
+    dash_line = lines[s]
+    bullet_col = len(dash_line) - len(dash_line.lstrip(" "))
+    after_dash = dash_line[bullet_col + 1 :]
+    after_dash_stripped = after_dash.lstrip(" ")
+    if after_dash_stripped.strip() != "":
+        return bullet_col + 1 + (len(after_dash) - len(after_dash_stripped))
+    for i in range(s + 1, e):
+        text = lines[i]
+        if text.strip() == "" or text.strip().startswith("#"):
+            continue
+        return len(text) - len(text.lstrip(" "))
+    return None
+
+
+def find_step_if_by_name(
+    lines: list[str], job_start: int, job_end: int, step_name: str
+) -> tuple[str | None, str | None, bool]:
+    """(expr, error, found). Locates the ONE step directly under this job's
+    `steps:` whose `name:` value equals `step_name` exactly, and
+    reconstitutes ITS OWN `if:` at that step's own key column -- never a
+    job-level `if:` or a different step's. `found` is `False` when no step
+    with that name exists in this job at all (its own P3 finding, distinct
+    from an unreadable `if:`)."""
+    for s, e in _find_step_ranges(lines, job_start, job_end):
+        keys = _parse_step_keys(lines, s, e)
+        name = _step_display_name(keys)
+        if name != step_name:
+            continue
+        key_col = _step_key_column(lines, s, e)
+        if key_col is None:
+            return None, f"step `{step_name}`: could not determine its key column", True
+        expr, err = reconstruct_if_expr(lines, s, e, indent=key_col)
+        return expr, err, True
+    return None, None, False
+
+
+def _step_display_name(keys: dict[str, str]) -> str:
+    name = keys.get("name", "").strip()
+    if len(name) >= 2 and name[0] == name[-1] and name[0] in ("'", '"'):
+        name = name[1:-1]
+    return name
+
+
+def _other_publishing_steps(
+    lines: list[str], job_start: int, job_end: int, gated_step_name: str
+) -> list[tuple[str, str]]:
+    """F4 audit fix: `[(step_name, matched_primitive), ...]` for every step
+    in this job OTHER than `gated_step_name` whose own (comment-stripped)
+    body itself invokes a publishing primitive -- a step-gated row (P3)
+    only ever pinned the NAMED step's `if:`; a second, ungated publishing
+    step in the SAME job used to sail through unseen."""
+    out: list[tuple[str, str]] = []
+    for s, e in _find_step_ranges(lines, job_start, job_end):
+        keys = _parse_step_keys(lines, s, e)
+        name = _step_display_name(keys)
+        if name == gated_step_name:
+            continue
+        step_body = drop_comment_lines("\n".join(lines[s:e]))
+        primitive = job_invokes_publish_primitive(step_body)
+        if primitive is not None:
+            out.append((name or "<unnamed step>", primitive))
+    return out
+
+
+def check_promotion_table(workflow_texts: dict[str, str], manifest: dict) -> list[str]:
     findings: list[str] = []
+
+    # Subset check (both directions collapsed to one, per the module doc):
+    # every manifest CUDA lane must have SOME row promoting it; the reverse
+    # (a table row naming no manifest lane) is expected -- most rows promote
+    # a non-CUDA, non-manifest surface (crates.io, npm, the CPU wheel/image).
     manifest_lanes = cuda_lanes(manifest)
-    table_lanes = set(LANE_TABLE)
-
+    table_lanes = set(PROMOTION_TABLE)
     for lane in sorted(manifest_lanes - table_lanes):
-        findings.append(f"P3: manifest CUDA lane `{lane}` has no LANE_TABLE row (no promotion chain wired)")
-    for lane in sorted(table_lanes - manifest_lanes):
-        findings.append(f"P3: LANE_TABLE row `{lane}` names a lane absent from the manifest")
+        findings.append(f"P3: manifest CUDA lane `{lane}` has no PROMOTION_TABLE row (no promotion chain wired)")
 
-    for lane in sorted(table_lanes & manifest_lanes):
-        workflow, promoting_job, gate_job = LANE_TABLE[lane]
-        # BLOCK B7 audit fix: LANE_TABLE's workflow name is a canonical
-        # `.yml` literal; resolve either spelling against what was actually
-        # discovered on disk.
-        resolved_name = resolve_workflow(workflow_texts, workflow)
+    # promoting_job -> [row keys] per workflow, needed by "chained" rows to
+    # confirm their gate_job is itself some OTHER row's promoting job in the
+    # SAME workflow.
+    promoting_jobs_by_workflow: dict[str, set[str]] = {}
+    for row in PROMOTION_TABLE.values():
+        promoting_jobs_by_workflow.setdefault(row.workflow, set()).add(row.promoting_job)
+
+    for key in sorted(PROMOTION_TABLE):
+        row = PROMOTION_TABLE[key]
+        # BLOCK B7 audit fix (carried over from LANE_TABLE): the table's
+        # workflow name is a canonical `.yml` literal; resolve either
+        # spelling against what was actually discovered on disk.
+        resolved_name = resolve_workflow(workflow_texts, row.workflow)
         text = workflow_texts.get(resolved_name) if resolved_name is not None else None
         if text is None:
-            findings.append(f"P3: lane `{lane}`: workflow file {workflow} is missing")
+            findings.append(f"P3: row `{key}`: workflow file {row.workflow} is missing")
             continue
         jobs = split_top_level_jobs(text)
         lines = text.splitlines()
 
-        gate_range = jobs.get(gate_job)
-        if gate_range is None:
-            findings.append(f"P3: lane `{lane}`: {workflow} has no job `{gate_job}`")
-        else:
-            gate_body = drop_comment_lines("\n".join(lines[gate_range[0] : gate_range[1]]))
-            if f"uses: ./.github/workflows/{PROOF_REQUIRED_WORKFLOW}" not in gate_body:
-                findings.append(
-                    f"P3: lane `{lane}`: {workflow}'s gate job `{gate_job}` does not "
-                    f"`uses: ./.github/workflows/{PROOF_REQUIRED_WORKFLOW}`"
-                )
-
-        promo_range = jobs.get(promoting_job)
+        promo_range = jobs.get(row.promoting_job)
         if promo_range is None:
-            findings.append(f"P3: lane `{lane}`: {workflow} has no job `{promoting_job}`")
+            findings.append(f"P3: row `{key}`: {row.workflow} has no job `{row.promoting_job}`")
             continue
         promo_body = drop_comment_lines("\n".join(lines[promo_range[0] : promo_range[1]]))
-        needs_names: list[str] = []
-        # Advisory A7 fix: `[ \t]*`, never `\s*`, right after `needs:` --
-        # `\s` matches `\n` too, so `\s*` would swallow the newline AND the
-        # next line's leading whitespace when `needs:` carries no inline
-        # value, landing the cursor on the multi-line list's FIRST `- item`
-        # and letting `(.*)$` capture `- gpu-proof` as a bogus single
-        # literal "needs name" (dash and all) instead of falling through to
-        # the multi-line-list branch below.
-        needs_m = re.search(r"^[ \t]*needs:[ \t]*(.*)$", promo_body, re.MULTILINE)
-        if needs_m and needs_m.group(1).strip():
-            rest = needs_m.group(1).strip()
-            if rest.startswith("["):
-                needs_names = [x.strip() for x in rest.strip("[]").split(",") if x.strip()]
+
+        if row.gate_kind == "none":
+            # F3 audit fix: a reviewed, deliberately UNGATED promotion must
+            # structurally PROVE it can never fire on a release tag ref --
+            # its job-level `if:` must be a PURE top-level conjunction
+            # carrying the EXACT conjunct `github.ref_type != 'tag'`. A
+            # substring-absence check ("no `refs/tags/` mentioned") used to
+            # pass an `if:` with no ref restriction at all -- exactly the
+            # shape a `workflow_dispatch` on a tag ref can reach.
+            expr, err = reconstruct_if_expr(lines, promo_range[0], promo_range[1])
+            if err is not None:
+                findings.append(f"P3: row `{key}`: {row.workflow}'s promoting job `{row.promoting_job}`: {err}")
+            elif expr is None:
+                findings.append(
+                    f"P3: row `{key}`: {row.workflow}'s promoting job `{row.promoting_job}` is marked "
+                    "gate_kind='none' (deliberately ungated) but carries no `if:` at all -- it must "
+                    f"structurally exclude a tag ref via the exact conjunct `{NONE_ROW_REF_TYPE_CONJUNCT}`"
+                )
             else:
-                needs_names = [rest]
-        elif needs_m:
-            # multi-line `needs:` list form (`- x` items right after the key,
-            # with no value on the `needs:` line itself).
-            promo_lines = promo_body.splitlines()
-            for idx, l2 in enumerate(promo_lines):
-                if re.match(r"^\s*needs:\s*$", l2):
-                    for l3 in promo_lines[idx + 1 :]:
-                        m3 = re.match(r"^\s*-\s*([A-Za-z0-9_.-]+)\s*$", l3)
-                        if m3:
-                            needs_names.append(m3.group(1))
-                        else:
-                            break
-                    break
+                findings.extend(
+                    f"P3: row `{key}`: {row.workflow}'s promoting job `{row.promoting_job}` is marked "
+                    f"gate_kind='none' (deliberately ungated): {f}"
+                    for f in check_top_level_conjunct_present(
+                        expr, NONE_ROW_REF_TYPE_CONJUNCT, "a gate_kind='none' row's condition"
+                    )
+                )
+            continue
+
+        assert row.gate_job is not None  # gate_kind in {"direct", "chained"} always carries a gate_job.
+        gate_job = row.gate_job
+
+        if row.gate_kind == "direct":
+            gate_range = jobs.get(gate_job)
+            if gate_range is None:
+                findings.append(f"P3: row `{key}`: {row.workflow} has no gate job `{gate_job}`")
+            else:
+                gate_body = drop_comment_lines("\n".join(lines[gate_range[0] : gate_range[1]]))
+                if f"uses: ./.github/workflows/{PROOF_REQUIRED_WORKFLOW}" not in gate_body:
+                    findings.append(
+                        f"P3: row `{key}`: {row.workflow}'s gate job `{gate_job}` does not "
+                        f"`uses: ./.github/workflows/{PROOF_REQUIRED_WORKFLOW}`"
+                    )
+                # F7 audit fix: the gate job's OWN `if:` must also carry the
+                # row's exact tag-family conjunct -- a gate job reachable
+                # off no tag restriction (or the wrong family) would let the
+                # verdict be consulted, and satisfied, outside the
+                # release-tag path this row exists to gate.
+                gate_expr, gate_err = reconstruct_if_expr(lines, gate_range[0], gate_range[1])
+                if gate_err is not None:
+                    findings.append(f"P3: row `{key}`: {row.workflow}'s gate job `{gate_job}`: {gate_err}")
+                elif gate_expr is None:
+                    findings.append(
+                        f"P3: row `{key}`: {row.workflow}'s gate job `{gate_job}` has no `if:` at all -- "
+                        f"F7 tag guard: must carry `{tag_guard_conjunct(row.tag_family)}`"
+                    )
+                else:
+                    findings.extend(
+                        f"P3: row `{key}`: {row.workflow}'s gate job `{gate_job}`: {f} (F7 tag guard)"
+                        for f in check_top_level_conjunct_present(
+                            gate_expr, tag_guard_conjunct(row.tag_family), "a gate job's condition"
+                        )
+                    )
+        else:  # "chained"
+            if gate_job not in (promoting_jobs_by_workflow.get(row.workflow, set()) - {row.promoting_job}):
+                findings.append(
+                    f"P3: row `{key}`: gate_job `{gate_job}` (gate_kind='chained') is not some OTHER "
+                    f"row's promoting_job in {row.workflow}"
+                )
+
+        needs_names = _parse_needs_names(promo_body)
         if gate_job not in needs_names:
             findings.append(
-                f"P3: lane `{lane}`: {workflow}'s promoting job `{promoting_job}` does not `needs:` `{gate_job}` "
-                f"(found needs={needs_names})"
+                f"P3: row `{key}`: {row.workflow}'s promoting job `{row.promoting_job}` does not `needs:` "
+                f"`{gate_job}` (found needs={needs_names})"
             )
 
-        expr, err = reconstruct_if_expr(lines, promo_range[0], promo_range[1])
+        if row.step_name is None:
+            expr, err = reconstruct_if_expr(lines, promo_range[0], promo_range[1])
+            where = f"promoting job `{row.promoting_job}`"
+        else:
+            expr, err, step_found = find_step_if_by_name(lines, promo_range[0], promo_range[1], row.step_name)
+            where = f"promoting job `{row.promoting_job}`'s step `{row.step_name}`"
+            if not step_found:
+                findings.append(f"P3: row `{key}`: {row.workflow}'s {where} does not exist")
+                continue
+            # F4 audit fix: a step-gated row only pins the NAMED step's
+            # `if:` -- a second, ungated step in the SAME job that itself
+            # invokes a publishing primitive used to sail through unseen.
+            findings.extend(
+                f"P3: row `{key}`: {row.workflow}'s promoting job `{row.promoting_job}` has a SECOND "
+                f"step (`{other_name}`) that also invokes a publishing primitive ({primitive}) but is "
+                f"not the gated step `{row.step_name}`"
+                for other_name, primitive in _other_publishing_steps(
+                    lines, promo_range[0], promo_range[1], row.step_name
+                )
+            )
+
         if err is not None:
-            findings.append(f"P3: lane `{lane}`: {workflow}'s promoting job `{promoting_job}`: {err}")
+            findings.append(f"P3: row `{key}`: {row.workflow}'s {where}: {err}")
         elif expr is None:
-            findings.append(f"P3: lane `{lane}`: {workflow}'s promoting job `{promoting_job}` has no `if:` at all")
+            findings.append(f"P3: row `{key}`: {row.workflow}'s {where} has no `if:` at all")
         else:
             findings.extend(
-                f"P3: lane `{lane}`: {workflow}'s promoting job `{promoting_job}`: {f}"
-                for f in check_promoting_if(expr, gate_job)
+                f"P3: row `{key}`: {row.workflow}'s {where}: {f}"
+                for f in check_promoting_if(expr, gate_job, tag_family=row.tag_family)
             )
+
+    return findings
+
+
+# Publishing-primitive detection (P6's discovery rule, F1 audit fix: a
+# regex list over comment-stripped step bodies and `uses:` lines,
+# whitespace-tolerant, never five literal marker strings -- a `cargo
+# publish` invocation with two spaces, or a brand-new `twine upload` step,
+# used to be entirely invisible).
+#
+# Simple substring-shaped primitives: any occurrence anywhere in a
+# comment-stripped job body is itself a promotion, unconditionally.
+_SIMPLE_PRIMITIVE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("cargo publish", re.compile(r"cargo\s+publish")),
+    ("npm publish", re.compile(r"npm\s+publish")),
+    ("twine upload", re.compile(r"twine\s+upload")),
+    ("maturin upload", re.compile(r"maturin\s+upload")),
+    ("docker push", re.compile(r"docker\s+push")),
+    ("gh release create/upload", re.compile(r"gh\s+release\s+(create|upload)")),
+    ("pypa/gh-action-pypi-publish", re.compile(r"pypa/gh-action-pypi-publish")),
+    ("softprops/action-gh-release", re.compile(r"softprops/action-gh-release")),
+    ("ci/scripts/publish_crates.sh", re.compile(r"ci/scripts/publish_crates\.sh")),
+)
+
+# `push:`-conditional primitives: matching the marker is not enough on its
+# own -- these are ALSO used for build-only verification (`push: "false"`),
+# so the marker only counts when the SAME job body also carries a `push:`
+# value that is not literally `false`/`"false"`/`'false'` (an unquoted
+# `true`, a quoted `'true'`, or any `${{ }}` expression all count, since any
+# of these MAY resolve to a push at runtime -- only a literal false
+# structurally never can).
+_DOCKER_BUILD_PUSH_ACTION_RE = re.compile(r"docker/build-push-action(?:@|\b)")
+_LOCAL_DOCKER_PUBLISH_RE = re.compile(r"uses:\s*\./\.github/actions/docker-publish\b")
+_CROSS_REPO_DOCKER_PUBLISH_RE = re.compile(r"uses:\s*[\w.-]+/[\w.-]+/\.github/actions/docker-publish@")
+_PUSH_VALUE_RE = re.compile(r"^[ \t]*push:[ \t]*(.+?)[ \t]*$", re.MULTILINE)
+
+# `release-upload`: unconditional (unlike docker-publish, this action has no
+# `push: "false"`-shaped build-only mode -- every call is a real upload).
+_LOCAL_RELEASE_UPLOAD_RE = re.compile(r"uses:\s*\./\.github/actions/release-upload\b")
+_CROSS_REPO_RELEASE_UPLOAD_RE = re.compile(r"uses:\s*[\w.-]+/[\w.-]+/\.github/actions/release-upload@")
+
+
+def _push_value_is_promoting(job_body: str) -> bool:
+    for m in _PUSH_VALUE_RE.finditer(job_body):
+        val = m.group(1).strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        if val.strip().lower() == "false":
+            continue
+        return True
+    return False
+
+
+def job_invokes_publish_primitive(job_body: str) -> str | None:
+    """`job_body` must already be comment-stripped. Returns the matched
+    primitive's display name, or `None`. A job whose body invokes ANY
+    listed primitive is a "promotion job" for P6's purposes -- it must be
+    listed in `PROMOTION_TABLE` (any row, any gate_kind) or this gate fails
+    by name. DIRECT match only -- see `job_invokes_publish_primitive_
+    recursive` for the "delegates to a local reusable that itself pushes"
+    case."""
+    for label, pattern in _SIMPLE_PRIMITIVE_PATTERNS:
+        if pattern.search(job_body):
+            return label
+    if _DOCKER_BUILD_PUSH_ACTION_RE.search(job_body) and _push_value_is_promoting(job_body):
+        return "docker/build-push-action (push != false)"
+    if (
+        _LOCAL_DOCKER_PUBLISH_RE.search(job_body) or _CROSS_REPO_DOCKER_PUBLISH_RE.search(job_body)
+    ) and _push_value_is_promoting(job_body):
+        return "./.github/actions/docker-publish (push != false)"
+    if _LOCAL_RELEASE_UPLOAD_RE.search(job_body) or _CROSS_REPO_RELEASE_UPLOAD_RE.search(job_body):
+        return "./.github/actions/release-upload"
+    return None
+
+
+def _local_reusable_workflow_targets(job_body: str) -> list[str]:
+    """Job-level `uses: ./.github/workflows/<X>.yml` targets referenced
+    directly in this job's body (never a step-level action `uses:`, which
+    `job_invokes_publish_primitive` already covers by pattern)."""
+    return [m.group(1) for m in _USES_LOCAL_RE.finditer(job_body)]
+
+
+def _workflow_job_bodies(text: str) -> dict[str, str]:
+    stripped = drop_comment_lines(text)
+    lines = stripped.splitlines()
+    jobs = split_top_level_jobs(stripped)
+    return {name: "\n".join(lines[s:e]) for name, (s, e) in jobs.items()}
+
+
+def job_invokes_publish_primitive_recursive(
+    job_body: str,
+    workflow_texts: dict[str, str],
+    _visited: frozenset[str] = frozenset(),
+) -> str | None:
+    """F1 audit fix (RECURSIVE discovery): a direct match first; if none,
+    and this job's body itself `uses:` a LOCAL reusable workflow (job-level
+    `uses: ./.github/workflows/<X>.yml` -- e.g. `image.yml`'s `build` job
+    calling `_ci-base-image.yml`), recurse into THAT workflow's own jobs.
+    `_ci-base-image.yml` itself pushes to GHCR (`docker/build-push-action`,
+    `push: true`); a job that merely delegates to it is still a promoting
+    job for P6's purposes. `_visited` guards a workflow-`uses:`-cycle from
+    recursing forever (never expected in this repo's tree, but a guard, not
+    an assumption)."""
+    direct = job_invokes_publish_primitive(job_body)
+    if direct is not None:
+        return direct
+    for target in _local_reusable_workflow_targets(job_body):
+        resolved = resolve_workflow(workflow_texts, target)
+        if resolved is None or resolved in _visited:
+            continue
+        target_text = workflow_texts[resolved]
+        for sub_body in _workflow_job_bodies(target_text).values():
+            found = job_invokes_publish_primitive_recursive(
+                sub_body, workflow_texts, _visited=_visited | {resolved}
+            )
+            if found is not None:
+                return f"{found} (via {resolved})"
+    return None
+
+
+def check_p6_discovery(workflow_texts: dict[str, str]) -> list[str]:
+    findings: list[str] = []
+    listed = {(row.workflow, row.promoting_job) for row in PROMOTION_TABLE.values()}
+    # Every table row's workflow may be discovered under either the `.yml`
+    # or `.yaml` spelling actually on disk (BLOCK B7 discipline) -- widen
+    # the listed set to both spellings so a row naming the canonical `.yml`
+    # form still matches a `.yaml` file discovered on disk.
+    listed_resolved: set[tuple[str, str]] = set()
+    for workflow, job in listed:
+        resolved = resolve_workflow(workflow_texts, workflow)
+        listed_resolved.add((resolved if resolved is not None else workflow, job))
+
+    for name, text in sorted(workflow_texts.items()):
+        # F2 audit fix: NO trigger filtering at all -- every workflow file
+        # is in scope; a publishing primitive anywhere must be in the
+        # table, regardless of what triggers the file. A workflow whose OWN
+        # `on:` block is `workflow_call`-only (the same "never independently
+        # starts" doctrine P1/P5 hold `gpu-prove.yml`/`_gpu-proof-
+        # required.yml` to) is inert without a caller and is reached only
+        # via the recursive check below on that caller's job -- it is
+        # skipped here so it is never double-tabled against itself. An
+        # unreadable `on:`/`jobs:` block is a FAIL LOUD, never a silent
+        # skip (same doctrine P1 already holds `gpu-prove.yml`'s `on:` to).
+        on_keys, on_err = read_top_level_on_block(text)
+        if on_err is not None:
+            findings.append(f"P6: {name}: {on_err}")
+            continue
+        if on_keys == ["workflow_call"]:
+            continue
+        jobs, jobs_err = read_jobs_block_or_fail(text)
+        if jobs_err is not None:
+            findings.append(f"P6: {name}: {jobs_err}")
+            continue
+        assert jobs is not None
+        lines = text.splitlines()
+        for job_name, (start, end) in jobs.items():
+            body = drop_comment_lines("\n".join(lines[start:end]))
+            primitive = job_invokes_publish_primitive_recursive(body, workflow_texts)
+            if primitive is None:
+                continue
+            if (name, job_name) not in listed_resolved:
+                findings.append(
+                    f"P6: {name}'s job `{job_name}` invokes a publishing primitive ({primitive}) but is "
+                    "not listed in PROMOTION_TABLE -- an unlisted promoting job is invisible to the "
+                    "gpu-prove-once guarantee; add a reviewed row for it"
+                )
 
     return findings
 
@@ -580,6 +1153,8 @@ def check_p4(workflow_texts: dict[str, str], shipped_arches: set[str]) -> list[s
 # substring check.
 # --------------------------------------------------------------------------- #
 _SHA_ARG_RE = re.compile(r'--sha\s+(?:"(?P<q>[^"]*)"|(?P<u>\$\{\{[^}]*\}\}|\S+))')
+_REPO_ARG_RE = re.compile(r'--repo\s+(?:"(?P<q>[^"]*)"|(?P<u>\$\{\{[^}]*\}\}|\S+))')
+_WORKFLOW_ARG_RE = re.compile(r'--workflow\s+(?:"(?P<q>[^"]*)"|(?P<u>\$\{\{[^}]*\}\}|\S+))')
 _GPU_PROVE_VERDICT_INVOCATION = "python3 ci/scripts/gpu_prove_verdict.py"
 _CONTROL_OPERATOR_RE = re.compile(r"\|\||;|&&")
 
@@ -598,6 +1173,26 @@ def _sha_arg_is_commit_bound(value: str) -> bool:
     if value.startswith("${{") and value.endswith("}}"):
         return value[3:-2].strip() == "github.sha"
     return False
+
+
+def _repo_arg_is_bound(value: str) -> bool:
+    """F6 audit fix: `True` only for the two shapes that key the verdict
+    lookup at THIS repo: `$GITHUB_REPOSITORY`, or `${{ github.repository
+    }}`. A literal/foreign `owner/repo` would read a DIFFERENT repository's
+    runs as if they proved this commit."""
+    value = value.strip()
+    if value == "$GITHUB_REPOSITORY":
+        return True
+    if value.startswith("${{") and value.endswith("}}"):
+        return value[3:-2].strip() == "github.repository"
+    return False
+
+
+def _unquote(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        value = value[1:-1]
+    return value
 
 
 def _find_step_ranges(lines: list[str], job_start: int, job_end: int) -> list[tuple[int, int]]:
@@ -823,6 +1418,37 @@ def check_p5(workflow_texts: dict[str, str]) -> list[str]:
                     "a literal sha or a tag name would key the verdict by the wrong identity"
                 )
                 continue
+            # F6 audit fix: --repo must be pinned to THIS repo too -- a
+            # literal/foreign owner/repo would read a different
+            # repository's runs as if they proved this commit.
+            repo_matches = list(_REPO_ARG_RE.finditer(invocation_line))
+            if not repo_matches:
+                findings.append(f"P5: {resolved} invokes gpu_prove_verdict.py with no --repo argument at all")
+                continue
+            repo_m = repo_matches[-1]
+            repo_raw = repo_m.group("q") if repo_m.group("q") is not None else repo_m.group("u")
+            if not _repo_arg_is_bound(repo_raw):
+                findings.append(
+                    f"P5: {resolved}'s --repo argument is `{repo_raw}`, not bound to `github.repository`/"
+                    "`$GITHUB_REPOSITORY` -- a literal/foreign repo would key the verdict lookup at the "
+                    "wrong repo"
+                )
+                continue
+            # F6 audit fix: a --workflow override, if present at all, may
+            # never name anything other than gpu-prove.yml itself -- a
+            # pointed-elsewhere consumer could read a DIFFERENT, unrelated
+            # workflow's runs as if they proved this one.
+            workflow_matches = list(_WORKFLOW_ARG_RE.finditer(invocation_line))
+            if workflow_matches:
+                wf_m = workflow_matches[-1]
+                wf_raw = wf_m.group("q") if wf_m.group("q") is not None else wf_m.group("u")
+                wf_val = _unquote(wf_raw)
+                if wf_val != gpu_prove_verdict.DEFAULT_WORKFLOW:
+                    findings.append(
+                        f"P5: {resolved} overrides --workflow to `{wf_val}` -- only "
+                        f"`{gpu_prove_verdict.DEFAULT_WORKFLOW}` may ever be consulted"
+                    )
+                    continue
             valid_found = True
 
     if not valid_found and not findings:
@@ -847,9 +1473,10 @@ def run_gate(
     findings: list[str] = []
     findings += check_p1_p2(workflow_texts)
     findings += check_gate_file_absent(workflows_dir)
-    findings += check_p3(workflow_texts, manifest)
+    findings += check_promotion_table(workflow_texts, manifest)
     findings += check_p4(workflow_texts, gpu_parity_matrix.load_shipped_cuda_silicon())
     findings += check_p5(workflow_texts)
+    findings += check_p6_discovery(workflow_texts)
     return findings
 
 
@@ -860,9 +1487,10 @@ def main() -> int:
         for f in findings:
             print(f"  - {f}", file=sys.stderr)
         return 1
-    print("gpu-prove-once: OK -- exactly one prove producer, no renting reusable, every CUDA lane's "
-          "promotion gates on the shared verdict, consumer/producer names agree, and the reusable "
-          "actually consults the verdict keyed by the promoted commit.")
+    print("gpu-prove-once: OK -- exactly one prove producer, no renting reusable, every release "
+          "publisher's promotion gates on the shared verdict (all-or-nothing, not only the CUDA "
+          "lanes), consumer/producer names agree, the reusable actually consults the verdict keyed "
+          "by the promoted commit, and no publishing job in the tree is unlisted.")
     return 0
 
 

@@ -30,6 +30,17 @@ permissions:
 
 jobs:
   build:
+    # `github.ref_type != 'tag'` (F1/F3 audit fix, #454 follow-up round 2):
+    # this job `uses:` the LOCAL reusable `_ci-base-image.yml`, whose own
+    # `build-and-push` job pushes to GHCR unconditionally -- P6 discovery
+    # (`check_gpu_prove_once.py`) therefore tables this job too
+    # (`ci-image-cuda`, gate_kind='none'), and a `"none"` row must
+    # structurally PROVE it can never fire on a release tag ref. Without
+    # this, a `workflow_dispatch` against a `v*` tag ref would still
+    # rebuild and push the CI base image, ungated, on a ref this workflow
+    # was never meant to reach (`on:` above carries only `push: branches:
+    # [main]` and `workflow_dispatch`, never `tags:`).
+    if: github.ref_type != 'tag'
     permissions:
       contents: read
       packages: write

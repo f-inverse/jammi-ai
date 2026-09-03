@@ -111,16 +111,36 @@ jobs:
       - name: Run the CPU-hermetic scale tiers (measured-rate gate)
         run: bash ci/scripts/perf/run_scale_tiers.sh
 
+  gpu-proof:
+    name: GPU proof required
+    # Any `v*` TAG ref — a tag push, or a recovery dispatch run on the tag —
+    # requires the release commit's already-recorded GPU-prove verdict
+    # before ANY crate is published (#454 follow-up, operator direction:
+    # every release publisher gates on the prove verdict, all-or-nothing,
+    # not only the CUDA lanes). The tag guard (not an event guard) is what
+    # keeps every promotion arm proven: an event-keyed guard would let a
+    # dispatch publish unproven.
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/_gpu-proof-required.yml
+    permissions:
+      contents: read
+      actions: read
+    secrets: inherit
+
   publish:
     name: Publish to crates.io
-    # A release ships only if BOTH the workspace validates AND the performance
-    # gate holds — a structural perf regression blocks the tag.
+    # A release ships only if the workspace validates, the performance gate
+    # holds, AND the commit's GPU-prove verdict is green — a structural perf
+    # regression, or a commit that was never proven, blocks the tag.
     # Publishes ONLY from a `v*` tag ref (tag push, or a recovery dispatch run
     # on the tag — crates.io publishes are irreversible, so a branch dispatch
     # must never be able to first-publish an untagged workspace). A branch
-    # dispatch runs validate + perf-gate as a dry run and stops here.
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [validate, perf-gate]
+    # dispatch runs validate + perf-gate as a dry run and stops here. The
+    # `if:` is a PURE conjunction (no `||`) — `check_gpu_prove_once.py`'s
+    # PROMOTION_TABLE rule asserts this shape holds for every promotion job
+    # in the tree.
+    needs: [validate, perf-gate, gpu-proof]
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.validate.result == 'success' && needs.perf-gate.result == 'success' && needs.gpu-proof.result == 'success'
     runs-on: ubuntu-latest
     container:
       image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
@@ -222,11 +242,15 @@ jobs:
   github-release:
     name: GitHub Release
     needs: publish
-    # Any `v*` tag ref — `publish` above is tag-guarded, so a recovery
-    # dispatch run on the tag reaches here with the same tag ref a push has,
-    # and the recovery creates the release too instead of publishing crates
-    # while leaving the release missing.
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Any `v*` tag ref — `publish` above is tag-guarded (and itself gates on
+    # the GPU-prove verdict), so a recovery dispatch run on the tag reaches
+    # here with the same tag ref a push has, and the recovery creates the
+    # release too instead of publishing crates while leaving the release
+    # missing. `publish` already transitively gates this job on the prove
+    # verdict via `needs.publish.result == 'success'`; the explicit conjunct
+    # here (rather than relying on the implicit needs-success default) reads
+    # uniformly with every other promotion job's `if:` in the tree.
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.publish.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write

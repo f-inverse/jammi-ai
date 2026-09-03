@@ -49,18 +49,34 @@ jobs:
       platform_tag: manylinux_2_28_x86_64
     secrets: inherit
 
+  gpu-proof:
+    name: GPU proof required
+    # Any `py-v*` TAG ref — a tag push, or a recovery dispatch run on the
+    # tag — requires the release commit's already-recorded GPU-prove
+    # verdict before the CPU wheel is published (#454 follow-up, operator
+    # direction: every release publisher gates on the prove verdict,
+    # all-or-nothing — this leg used to have no GPU gate at all because the
+    # CPU wheel itself never touches CUDA, but the CPU wheel still ships in
+    # the SAME all-or-nothing lockstep release as the CUDA lanes, so it must
+    # not promote ahead of an unproven commit either).
+    if: startsWith(github.ref, 'refs/tags/py-v')
+    uses: ./.github/workflows/_gpu-proof-required.yml
+    permissions:
+      contents: read
+      actions: read
+    secrets: inherit
+
   publish:
     name: Publish to PyPI
     # Publishes ONLY from a `py-v*` tag ref — a tag push, or a
     # workflow_dispatch run on the tag (recovery: PyPI rejects a re-upload of
-    # an existing version, so re-running the tag is idempotent). A branch
-    # dispatch or PR is an artifact-only dry run and can never publish. Same
-    # recovery contract as `pypi.yml`/`pypi-client.yml` on this lockstep
-    # surface. This leg has no GPU gate at all: the CPU wheel's called
-    # workflow is build -> package only, so the implicit success() on this
-    # `if` requires just that to have succeeded.
-    if: startsWith(github.ref, 'refs/tags/py-v')
-    needs: server-cpu
+    # an existing version, so re-running the tag is idempotent) — whose
+    # commit's GPU-prove verdict is green. A branch dispatch or PR is an
+    # artifact-only dry run and can never publish. Same recovery contract as
+    # `pypi.yml`/`pypi-client.yml` on this lockstep surface. PURE conjunction
+    # (no `||`).
+    if: always() && startsWith(github.ref, 'refs/tags/py-v') && needs.server-cpu.result == 'success' && needs.gpu-proof.result == 'success'
+    needs: [server-cpu, gpu-proof]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

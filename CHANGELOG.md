@@ -6,6 +6,56 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+### Changed
+- **Every release-publishing job gates on the commit's GPU-prove verdict, all-or-nothing — not only
+  the CUDA lanes (#454 follow-up).** `crates.yml`'s `publish` (and `github-release`, chained off it),
+  `npm.yml`'s `publish` (gated at its `Publish` step, so the build+test dry run still runs
+  unconditionally), and every PyPI dist (`pypi.yml`, `pypi-client.yml`, `pypi-server.yml`,
+  `pypi-server-cuda.yml`) now call `_gpu-proof-required.yml` the same way the CUDA lanes already did.
+  `server-image.yml`'s CPU image job is split into an ungated `build-and-push-main` (a
+  `workflow_dispatch` run on `main` refreshes `:latest`; `server-image.yml` carries no `push:
+  branches:` trigger, so this never fires on a mere merge) and a prove-gated `build-and-push` (the
+  `v*` tag promotion). `release-binaries.yml`'s CLI matrix and CPU tarball are each split into an ungated
+  build leg (always runs, artifact-only) and a prove-gated promote leg (`promote-binaries`,
+  `server-cpu-promote`), mirroring the CUDA tarball's existing `server-cu12-build`/
+  `server-cu12-promote` split. A tag push on a commit whose prove is not already green now publishes
+  NOTHING — every release workflow fails immediately.
+- **The GPU-prove verdict check is CHECK-ONCE and FAIL-LOUD, not a poll (#454 follow-up, operator
+  direction).** `ci/scripts/gpu_prove_verdict.py` no longer waits for an in-progress prove run to
+  finish — a run that has not completed contributes no measurement and is simply invisible to the
+  check. A missing or red measurement for any shipped arch denies immediately, naming the remedy (a
+  fresh dispatch, or `gh run rerun <run_id> --failed` for one red leg). `_gpu-proof-required.yml`
+  drops its `--deadline-minutes`/`--poll-seconds` inputs accordingly (`timeout-minutes: 15`, bounding a
+  single REST lookup, not a wait). The release order is unchanged: prove → green → tag, because a tag
+  push commits the version number.
+- **`ci/scripts/check_gpu_prove_once.py` replaces its CUDA-only `LANE_TABLE` with a reviewed
+  `PROMOTION_TABLE` covering every release-publishing job in the tree**, plus a discovery rule (P6)
+  that scans EVERY workflow file (no trigger filtering) for a job whose comment-stripped body matches
+  a `PRIMITIVE_PATTERNS` regex — `cargo publish`, `npm publish`, `twine upload`, `maturin upload`,
+  `docker push`, `gh release create`/`upload`, `pypa/gh-action-pypi-publish`,
+  `softprops/action-gh-release`, `docker/build-push-action`/`./.github/actions/docker-publish` (any
+  `push:` value that is not literally `false`), `./.github/actions/release-upload`,
+  `ci/scripts/publish_crates.sh` — directly or, RECURSIVELY, via a `uses:`-called local reusable
+  workflow that itself does; an unlisted match fails by name — closing the "new promoting job is
+  invisible" limitation the module previously disclosed.
+- **`check_gpu_prove_once.py`'s publisher guard closes six audit-found fail-open windows
+  (#454 follow-up round 2).** A `gate_kind="none"` row's job `if:` must now carry the EXACT structural
+  conjunct `github.ref_type != 'tag'` (a substring-absence check on `refs/tags/` used to pass an
+  `if:` with no ref restriction at all — the real leak this closes: `server-image.yml`'s
+  `build-and-push-selfcontained` gained the conjunct, since a `workflow_dispatch` against a `v*` tag
+  ref with `selfcontained=true` used to push that image entirely ungated; `build-and-push-main` and
+  `image.yml`/`image-cuda.yml`'s CI base-image `build` jobs — newly tabled by P6's recursive discovery
+  — gained it too). A step-gated row now also asserts every OTHER step in the same job is NOT itself
+  an ungated publishing primitive (F4). `_gpu-proof-required.yml`'s consulting step must pin `--repo`
+  to `github.repository`/`$GITHUB_REPOSITORY` and forbid a `--workflow` override other than
+  `gpu-prove.yml` (F6). Every `"direct"`/`"chained"` row's promoting job/step `if:` — and, for
+  `"direct"` rows, the gate job's own `if:` — must carry the exact
+  `startsWith(github.ref, 'refs/tags/<family>')` conjunct for the row's own tag family (`v` or
+  `py-v`) (F7). `gpu_prove_verdict.py`'s `collect_measurements` closes a `filter=latest` fail-open
+  window: when an arch's latest attempt is itself still in progress, it now falls back to that run's
+  own most recent COMPLETED attempt for the arch (`filter=all`, lazy, cached per run) — a red
+  completed attempt sitting behind an in-flight rerun still denies (F5).
+
 ## [0.49.1] - 2026-09-03
 
 A release-engineering patch, shipped in lockstep across the workspace: CUDA

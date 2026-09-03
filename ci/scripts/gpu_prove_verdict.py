@@ -1,27 +1,41 @@
 #!/usr/bin/env python3
-"""GPU-prove verdict consumer (esc-084, issue #454).
+"""GPU-prove verdict consumer (esc-084, issue #454; check-once/fail-loud,
+operator direction 2026-09-03).
 
 **Guarded property**: proof surface == shipped surface, proven ONCE per
-commit and SHARED. Every CUDA release lane (server image, release binaries,
-cu12 wheel) calls the `_gpu-proof-required.yml` reusable, which runs this
+commit and SHARED. Every release-publishing workflow (CUDA and non-CUDA
+alike — server image, release binaries, cu12 wheel, crates.io, npm, every
+PyPI dist) calls the `_gpu-proof-required.yml` reusable, which runs this
 script instead of renting hardware itself. `gpu-prove.yml` is never
 triggered from here -- see that workflow's own header for the canonical
 statement of why; a publisher gates on the SUMMARY of a prove execution
 already recorded against the commit it is promoting, never on a fresh
 measurement it starts.
 
-## The rule (esc-084 control b, most-recent-measurement-wins)
+## The rule (esc-084 control b, most-recent-measurement-wins, CHECK ONCE)
 
 For each required arch (the shipped `GENCODE_ARCHES` silicon axis,
 `check_gpu_parity_matrix.py`'s own parser — never a hand-typed list): a
-"measurement" is a completed (non-`skipped`) conclusion of the job named
+"measurement" is a COMPLETED (non-`skipped`) conclusion of the job named
 exactly `GPU prove on RunPod (<arch>)` (`JOB_NAME_TEMPLATE` below — the ONE
 string `check_gpu_prove_once.py`'s P4 rule pins against `gpu-prove.yml`'s
 own matrix `name:` line), taken from the LATEST ATTEMPT of that job
 (`filter=latest`, so a `gh run rerun --failed` supersedes a stale attempt in
 place) on a run of `gpu-prove.yml` whose `head_sha` is the commit this
 caller promotes. `skipped` is not a measurement (e.g. a labeled-event run
-for a different label never touched this arch).
+for a different label never touched this arch). A run that has not yet
+completed contributes NO measurement for any arch — it is simply invisible
+to this check, never a reason to wait: this script checks ONCE and returns.
+
+When an arch's LATEST ATTEMPT in a given run is itself still in progress
+(no `completed_at` yet), `filter=latest` would otherwise hide an EARLIER,
+already-completed attempt of that same run entirely — including a red one
+mid-rerun. `collect_measurements` closes this: it falls back to that one
+run's own most recent COMPLETED attempt for the arch (a `filter=all`
+re-query, lazy and cached per run), and a red completed attempt there still
+denies; only a run with no completed attempt at all for the arch
+contributes no measurement. This is still never a wait — the fallback reads
+what has already completed, once, and returns.
 
 Recency: the MOST RECENT measurement per arch is the one with
 the greatest job `completed_at` — never run id alone, because
@@ -31,33 +45,33 @@ finish before an older one is rerun. Ties break on run id (higher wins). A
 later red measurement REVOKES an earlier green until a re-run succeeds
 (fail-closed).
 
-Wait state (operator direction, 2026-09-03 — no appearance grace; nothing
-here ever starts a prove run):
-  1. If every required arch's most recent measurement is `success`, exit 0
-     immediately, even if a newer run is queued/in progress at this sha (a
-     publisher that already started consumes the verdict as of its own
-     start — this bounds the wait).
-  2. Else, while any candidate run at this sha is queued/in_progress, poll
-     (`--poll-seconds`) until `--deadline-minutes` elapses. This serves the
-     tag-then-dispatch overlap: a dev's dispatch that began just before
-     the publisher's first poll is still picked up.
-  3. Else, if no measurement exists for some arch at all, DENY immediately
-     (no grace — nothing auto-starts the prove; the remedy is a dispatch).
-  4. Else DENY naming every arch whose most recent measurement is not
-     `success`, each with its own `gh run rerun <run_id> --failed` remedy
-     (re-running one failed leg is one GPU pod, not a fresh whole-workflow
-     dispatch).
+Check-once, fail-loud (operator direction, 2026-09-03 — supersedes the
+earlier polling design; nothing here ever starts a prove run, and nothing
+here ever waits for one):
+  1. If every required arch's most recent COMPLETED measurement is
+     `success`, exit 0 immediately.
+  2. Else DENY immediately (no poll, no deadline, no grace window — an
+     in-progress run at this sha is not a measurement and never delays or
+     satisfies this check): every arch with no completed measurement at
+     all, or whose most recent completed measurement is not `success`, is
+     named in the error, each with its own remedy — `gh workflow run
+     gpu-prove.yml --ref <sha-or-tag>` for a missing measurement, `gh run
+     rerun <run_id> --failed` for a red one (re-running one failed leg is
+     one GPU pod, not a fresh whole-workflow dispatch) — then re-run this
+     workflow's failed jobs once every arch is green. Prove first, then
+     tag: a tag push on a commit whose prove is not already green fails
+     every release workflow immediately, by design.
 
 Any HTTP/JSON error is a hard DENY (exit 1) — never vacuous: a network
 hiccup must never read as "nothing to prove" and let something silently
 promote.
 
 `fetch(url, token) -> dict` is injected so `test_gpu_prove_verdict.py` can
-drive every branch above with a fake clock and a fake API, no network.
+drive every branch above with a fake API, no network.
 
 Run (real use, inside `_gpu-proof-required.yml`):
   GITHUB_TOKEN=<token> python3 ci/scripts/gpu_prove_verdict.py \\
-      --repo owner/repo --sha <sha> --deadline-minutes 355
+      --repo owner/repo --sha <sha>
 """
 
 from __future__ import annotations
@@ -66,7 +80,6 @@ import argparse
 import json
 import os
 import sys
-import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -185,11 +198,15 @@ def list_runs(fetch: FetchFn, token: str, repo: str, workflow: str, sha: str) ->
     return runs
 
 
-def list_jobs(fetch: FetchFn, token: str, repo: str, run_id: int) -> list[dict]:
-    """`filter=latest` -- the latest ATTEMPT of each job in the run, so a
-    `gh run rerun <id> --failed` supersedes a stale attempt in place rather
-    than leaving a first-attempt failure to be read as a fresh one."""
-    url = f"{API_BASE}/repos/{repo}/actions/runs/{run_id}/jobs?filter=latest"
+def list_jobs(fetch: FetchFn, token: str, repo: str, run_id: int, filter_mode: str = "latest") -> list[dict]:
+    """`filter=latest` (the default) -- the latest ATTEMPT of each job in the
+    run, so a `gh run rerun <id> --failed` supersedes a stale attempt in
+    place rather than leaving a first-attempt failure to be read as a fresh
+    one. `filter_mode="all"` is used by `collect_measurements`'s F5 fallback
+    below -- ONLY when the latest attempt is itself still in progress -- to
+    recover that run's own most recent COMPLETED attempt for one arch,
+    never to second-guess a completed latest attempt."""
+    url = f"{API_BASE}/repos/{repo}/actions/runs/{run_id}/jobs?filter={filter_mode}"
     return _paginated(fetch, token, url, "jobs")
 
 
@@ -199,43 +216,80 @@ def collect_measurements(
     repo: str,
     runs: list[dict],
     required_arches: list[str],
-) -> tuple[dict[str, list[Measurement]], bool]:
-    """Returns `({arch: [Measurement, ...]}, any_in_progress)`.
+) -> dict[str, list[Measurement]]:
+    """Returns `{arch: [Measurement, ...]}`.
 
     A job is a measurement for its arch iff its name matches
     `JOB_NAME_TEMPLATE` for a required arch, its conclusion is present and
     not `"skipped"`, and it has a `completed_at` (a job with no
-    `completed_at` is still running -- excluded as a measurement and folds
-    into `any_in_progress`, same as a run whose own `status` is not yet
-    `"completed"`)."""
+    `completed_at` is still running -- this is a check-once, fail-loud
+    consumer, so an incomplete job simply contributes no measurement; it is
+    never a reason to wait, same as a run whose own `status` is not yet
+    `"completed"`).
+
+    F5 audit fix (fail-open window): `filter=latest` returns ONLY the latest
+    attempt of each job. When that latest attempt is itself still running
+    (`completed_at` is `None`), `filter=latest` hides any EARLIER,
+    already-COMPLETED attempt of the same arch's job in this SAME run
+    entirely -- including a red one -- so without this fallback an older
+    run's stale green could read as "most recent completed" while a newer,
+    contradicting red attempt sits invisible mid-rerun. When the latest
+    attempt is running, this run is re-queried with `filter=all` (once,
+    lazily, only for runs that actually need it) and the run's OWN most
+    recent COMPLETED (non-`skipped`) attempt for that arch is used instead
+    -- a red one there still denies. Only when the run has NO completed
+    attempt at all for that arch (e.g. its first and only attempt is still
+    in progress) does the run contribute no measurement for it -- never a
+    wait, never a poll."""
     by_arch: dict[str, list[Measurement]] = {a: [] for a in required_arches}
     name_to_arch = {JOB_NAME_TEMPLATE.format(arch=a): a for a in required_arches}
-    any_in_progress = any(r.get("status") != "completed" for r in runs)
     for run in runs:
         run_id = run.get("id")
-        jobs = list_jobs(fetch, token, repo, run_id)
-        for job in jobs:
+        latest_jobs = list_jobs(fetch, token, repo, run_id, filter_mode="latest")
+        all_jobs_cache: list[dict] | None = None
+        for job in latest_jobs:
             arch = name_to_arch.get(job.get("name"))
             if arch is None:
                 continue
             conclusion = job.get("conclusion")
+            completed_at = job.get("completed_at")
+            job_id = job.get("id")
+            html_url = job.get("html_url") or ""
+            if completed_at is None:
+                # F5 fallback: the latest attempt is still in flight -- fetch
+                # (and cache, once per run) the unfiltered attempt list, and
+                # use THIS run's own most recent completed attempt for this
+                # arch instead. A run whose fallback also finds nothing
+                # completed contributes no measurement, exactly like today.
+                if all_jobs_cache is None:
+                    all_jobs_cache = list_jobs(fetch, token, repo, run_id, filter_mode="all")
+                completed_attempts = [
+                    j
+                    for j in all_jobs_cache
+                    if name_to_arch.get(j.get("name")) == arch
+                    and j.get("conclusion") != "skipped"
+                    and j.get("completed_at") is not None
+                ]
+                if not completed_attempts:
+                    continue  # no completed attempt in this run for this arch -- no measurement, never a wait
+                job = max(completed_attempts, key=lambda j: (j.get("completed_at") or "", j.get("id", 0)))
+                conclusion = job.get("conclusion")
+                completed_at = job.get("completed_at")
+                job_id = job.get("id")
+                html_url = job.get("html_url") or ""
             if conclusion == "skipped":
                 continue  # no measurement was made (rule F)
-            completed_at = job.get("completed_at")
-            if completed_at is None:
-                any_in_progress = True
-                continue
             by_arch[arch].append(
                 Measurement(
                     arch=arch,
                     run_id=run_id,
-                    job_id=job.get("id"),
+                    job_id=job_id,
                     conclusion=conclusion,
                     completed_at=completed_at,
-                    html_url=job.get("html_url") or "",
+                    html_url=html_url,
                 )
             )
-    return by_arch, any_in_progress
+    return by_arch
 
 
 def most_recent(measurements: list[Measurement]) -> Measurement | None:
@@ -286,10 +340,10 @@ def check_once(
     workflow: str,
     sha: str,
     required_arches: list[str],
-) -> tuple[Verdict, bool]:
+) -> Verdict:
     runs = list_runs(fetch, token, repo, workflow, sha)
-    by_arch, any_in_progress = collect_measurements(fetch, token, repo, runs, required_arches)
-    return evaluate(by_arch, required_arches), any_in_progress
+    by_arch = collect_measurements(fetch, token, repo, runs, required_arches)
+    return evaluate(by_arch, required_arches)
 
 
 def required_arches() -> list[str]:
@@ -301,47 +355,34 @@ def run(
     repo: str,
     sha: str,
     workflow: str,
-    deadline_minutes: float,
-    poll_seconds: float,
-    no_wait: bool,
     fetch: FetchFn,
     token: str,
     arches: list[str],
-    sleep: Callable[[float], None] = time.sleep,
-    now: Callable[[], float] = time.monotonic,
     out=sys.stdout,
     err=sys.stderr,
 ) -> int:
-    deadline = now() + deadline_minutes * 60.0
-    verdict: Verdict
-    any_in_progress = False
-    while True:
-        try:
-            verdict, any_in_progress = check_once(fetch, token, repo, workflow, sha, arches)
-        except VerdictError as e:
-            print(f"::error::gpu-prove-verdict: {e}", file=err)
-            return 1
-        if verdict.ok:
-            for arch in sorted(verdict.proofs):
-                m = verdict.proofs[arch]
-                print(f"PROVEN {arch}: run={m.run_id} job={m.job_id} {m.html_url}", file=out)
-            return 0
-        if no_wait:
-            break
-        if any_in_progress and now() < deadline:
-            sleep(poll_seconds)
-            continue
-        break
+    """Check-once, fail-loud (operator direction, 2026-09-03): exactly one
+    lookup, no poll, no deadline, no grace window. An in-progress run at
+    this sha is invisible to this check -- it is never a measurement and
+    never delays or satisfies the verdict."""
+    try:
+        verdict = check_once(fetch, token, repo, workflow, sha, arches)
+    except VerdictError as e:
+        print(f"::error::gpu-prove-verdict: {e}", file=err)
+        return 1
 
-    # DENY -- operator direction (2026-09-03): the "no candidate" case never
-    # waits for a grace window (nothing auto-starts a prove run); a
-    # red/revoked arch re-runs its OWN failed leg, not the whole workflow.
+    if verdict.ok:
+        for arch in sorted(verdict.proofs):
+            m = verdict.proofs[arch]
+            print(f"PROVEN {arch}: run={m.run_id} job={m.job_id} {m.html_url}", file=out)
+        return 0
+
     if verdict.missing:
         print(
             f"::error::gpu-prove-verdict: DENY -- no GPU-prove measurement for "
             f"{', '.join(verdict.missing)} at {sha} -- dispatch the prove lane: "
-            f"gh workflow run {workflow} --ref <tag-or-branch-to-prove>, then re-run "
-            f"this workflow's failed jobs.",
+            f"gh workflow run {workflow} --ref <tag-or-branch-to-prove>, wait for green, "
+            f"then re-run this workflow's failed jobs. Prove first, then tag.",
             file=err,
         )
     for arch in sorted(verdict.failing):
@@ -360,13 +401,6 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--repo", required=True, help="owner/repo")
     ap.add_argument("--sha", required=True, help="The exact commit this caller is promoting.")
     ap.add_argument("--workflow", default=DEFAULT_WORKFLOW)
-    ap.add_argument("--deadline-minutes", type=float, default=340.0)
-    ap.add_argument("--poll-seconds", type=float, default=60.0)
-    ap.add_argument(
-        "--no-wait",
-        action="store_true",
-        help="Check once and return immediately -- never polls. For hand use.",
-    )
     return ap
 
 
@@ -381,9 +415,6 @@ def main(argv: list[str]) -> int:
         repo=args.repo,
         sha=args.sha,
         workflow=args.workflow,
-        deadline_minutes=args.deadline_minutes,
-        poll_seconds=args.poll_seconds,
-        no_wait=args.no_wait,
         fetch=default_fetch,
         token=token,
         arches=required_arches(),

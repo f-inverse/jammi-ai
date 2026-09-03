@@ -6,6 +6,25 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+### Changed
+- **A release commit is proven once, and every CUDA release lane shares that verdict (#454, esc-084).**
+  `gpu-prove.yml` is the single prove producer — off the merge path, never in the critical path of an
+  automated workflow (deliberately no `push:`/`workflow_call:` trigger; a dev dispatches it by hand
+  before tagging a release). The server image, release binaries, and cu12 wheel lanes no longer rent a
+  GPU of their own: each calls the new reusable `_gpu-proof-required.yml`, which reads the promoted
+  commit's already-recorded per-arch verdict (`ci/scripts/gpu_prove_verdict.py`) and fails the
+  promotion closed on any missing or non-`success` measurement. A later red measurement revokes an
+  earlier green until a re-run succeeds; recovery from a flaky leg is `gh run rerun <run_id> --failed`
+  on the one affected leg, never a fresh four-pod rental. The reusable `_gpu-prove-gate.yml` (three
+  independent renting callers per release) is deleted; `ci/scripts/check_gpu_prove_once.py` pins the
+  exactly-once-producer, no-renting-reusable, and every-CUDA-lane-gates-on-the-shared-verdict
+  properties by name.
+- **`runpod_lib.sh`'s prove-lane session asserts the tree it proved.** `gpu-prove.yml` passes
+  `PROVE_EXPECT_SHA`; a `PROVE_SHA=` line that disagrees (or never arrives at all) fails the leg with a
+  new distinct exit code, 77, before any proof group counts — the ref moved under the clone, or a tag
+  was moved, is never a silent green. `ci/scripts/perf/gpu_prove_timings.py` and
+  `check_gpu_prove_timings.py` gained the `wrong-tree` outcome to record it.
+
 ## [0.49.0] - 2026-09-02
 
 Quantized (GGUF/k-quant) serving and QLoRA land on the existing encoder

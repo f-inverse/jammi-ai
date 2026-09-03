@@ -3371,13 +3371,21 @@ a gate: no CI job asserts against it.
 lockstep version files (`docs/plans/50-open-core-hardening-roadmap/ROADMAP.md`, the version-bump file
 list): `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`, `pyproject.toml`, `clients/python/pyproject.toml`,
 `clients/typescript/package.json`, `packaging/server-cpu/pyproject.toml`,
-`packaging/server-cu12/pyproject.toml`. On merge, tag both:
+`packaging/server-cu12/pyproject.toml`. On merge, **prove before tagging**: dispatch
+`.github/workflows/gpu-prove.yml` on the commit to be released (`--ref main` at the tip, or on the
+pushed tag once it exists) and wait for all four shipped arches to go green — the CUDA release lanes
+below gate on that recorded verdict rather than proving anything themselves (`ci/scripts/
+gpu_prove_verdict.py`, consumed via `_gpu-proof-required.yml`); a red leg is re-run by hand
+(`gh run rerun <run_id> --failed`) in that same prove run. Then tag both `v*` and `py-v*`
+**lightweight, on the same commit, pushed together**:
 - **`v*`** → `.github/workflows/crates.yml` (validate → publish in topological order, skip
   already-published, block on sparse-index propagation) + `.github/workflows/npm.yml` +
-  `.github/workflows/server-image.yml` (GHCR images) + `.github/workflows/release-binaries.yml`.
+  `.github/workflows/server-image.yml` (GHCR images, CUDA image gated on the verdict) +
+  `.github/workflows/release-binaries.yml` (CUDA tarball's promote step gated on the verdict).
 - **`py-v*`** → `.github/workflows/pypi.yml` (embed wheel) + `.github/workflows/pypi-client.yml`
   (pure-Python client) + `.github/workflows/pypi-server.yml` +
-  `.github/workflows/pypi-server-cuda.yml` (auditwheel deliberately skipped).
+  `.github/workflows/pypi-server-cuda.yml` (auditwheel deliberately skipped; publish gated on the
+  same verdict — same commit, same tag family, so it reuses `v*`'s dispatch with no extra prove).
 
 **Disk pressure is a recurring real failure** — keep `CARGO_TARGET_DIR` on NVMe; the separate
 `compile-check-gated` job and `crates.yml --no-verify` exist for this reason.

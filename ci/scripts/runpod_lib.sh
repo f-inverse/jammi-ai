@@ -1529,6 +1529,22 @@ rp_parse_prove_marker() {
   return 1
 }
 
+# ONE grammar for the `PROVE_SHA=<sha>` marker (esc-084/#454, amendment T) --
+# mirrors `ci/scripts/prove_surface.py`'s `PROVE_SHA_RE` exactly, the same
+# discipline `rp_parse_prove_marker` above already established for
+# `PROVE_GROUP_RC`. `test_gpu_prove_lane.sh`'s cross-parser fixture feeds
+# both parsers the identical set of inputs and asserts identical (sha) or
+# identical NOMATCH.
+rp_parse_prove_sha() {
+  unset RP_PARSED_PROVE_SHA
+  local line="${1%$'\r'}"
+  if [[ "$line" =~ PROVE_SHA=([0-9a-f]+) ]]; then
+    RP_PARSED_PROVE_SHA="${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
 rp_run_remote_watched() {
   local inactivity="${1:-$RP_INACTIVITY}"
   # `$2` = the poll interval in seconds (default 5; the real caller in
@@ -1552,6 +1568,15 @@ rp_run_remote_watched() {
   local pid=$!
   local printed=0 last_growth=$SECONDS last_group="" parse_carry=""
   local group_names=() group_rcs_assoc_keys=() group_rcs_assoc_vals=()
+  # esc-084/#454 amendment M/T: when PROVE_EXPECT_SHA is set (a workflow
+  # run, never a hand run), a disagreeing (or absent) PROVE_SHA marker is a
+  # wrong-tree failure -- the ref moved between run creation and clone, or
+  # a tag was moved. `wrong_tree`/`wrong_tree_got` are set by
+  # `_rrw_scan_new_text` below (a closure over these, same as
+  # `last_group`/`group_names`); `prove_sha_seen` distinguishes "saw a
+  # matching sha" from "never saw any sha at all" for the absence check at
+  # normal exit.
+  local wrong_tree=0 wrong_tree_got="" prove_sha_seen=0
 
   _rrw_group_list() {
     local i out_str=""
@@ -1611,6 +1636,13 @@ rp_run_remote_watched() {
       if rp_parse_prove_marker "$line"; then
         _rrw_record_rc "$RP_PARSED_MARKER_NAME" "$RP_PARSED_MARKER_RC"
       fi
+      if [ -n "${PROVE_EXPECT_SHA:-}" ] && rp_parse_prove_sha "$line"; then
+        prove_sha_seen=1
+        if [ "$RP_PARSED_PROVE_SHA" != "$PROVE_EXPECT_SHA" ]; then
+          wrong_tree=1
+          wrong_tree_got="$RP_PARSED_PROVE_SHA"
+        fi
+      fi
     done <<< "$combined"
   }
 
@@ -1644,6 +1676,13 @@ rp_run_remote_watched() {
     fi
   }
 
+  # Shared diagnostic (esc-084/#454 amendment T) -- STDERR, like the 76/124
+  # arms, so it reaches the job log regardless of which terminal arm fires
+  # it. `$1` is the observed sha, or empty for the absence case.
+  _rrw_wrong_tree_diag() {
+    echo "=== GPU prove: WRONG TREE expected=${PROVE_EXPECT_SHA} got=${1:-none} ===" >&2
+  }
+
   while kill -0 "$pid" 2>/dev/null; do
     sleep "$poll_interval"
     local size; size=$(wc -c < "$out" 2>/dev/null || echo 0)
@@ -1653,6 +1692,20 @@ rp_run_remote_watched() {
       _rrw_scan_new_text "$_RRW_CHUNK"
       printed=$size
       last_growth=$SECONDS
+      # Wrong-tree kill (amendment T): checked EVERY tick right after a scan
+      # sees new bytes, so a disagreeing PROVE_SHA= line is caught within
+      # ONE poll tick of arriving -- never deferred to the inactivity arm or
+      # the normal exit, which could be minutes away.
+      if [ "$wrong_tree" = "1" ]; then
+        kill -TERM "$pid" 2>/dev/null
+        sleep 1
+        kill -KILL "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null
+        _rrw_flush_carry
+        _rrw_wrong_tree_diag "$wrong_tree_got"
+        rm -f "$out"
+        return 77
+      fi
     elif [ $((SECONDS - last_growth)) -ge "$inactivity" ]; then
       kill -TERM "$pid" 2>/dev/null
       sleep 1
@@ -1674,8 +1727,26 @@ rp_run_remote_watched() {
   # Final drain to EOF after `wait $pid`, BEFORE the 124-discriminator check
   # below reads the file -- the last group's marker and `PROVE_EXIT=` line
   # can land milliseconds before ssh's own exit, inside what would otherwise
-  # be the NEXT poll window.
+  # be the NEXT poll window. The wrong-tree check below runs AFTER this
+  # flush (amendment T: "a mismatching PROVE_SHA= landing only in the final
+  # flush" must still be caught) and WINS regardless of `$rc` or which
+  # markers landed -- identity is asserted before anything else counts.
   _rrw_flush_carry
+  if [ -n "${PROVE_EXPECT_SHA:-}" ]; then
+    if [ "$wrong_tree" = "1" ]; then
+      _rrw_wrong_tree_diag "$wrong_tree_got"
+      rm -f "$out"
+      return 77
+    fi
+    if [ "$prove_sha_seen" != "1" ]; then
+      # Absence is a failure, same doctrine as P1's zero-producers: identity
+      # was never asserted, so this leg proved nothing about the tree it
+      # ran on, whatever the remote's own exit code claims.
+      _rrw_wrong_tree_diag ""
+      rm -f "$out"
+      return 77
+    fi
+  fi
   if [ "$rc" -eq 124 ] && ! grep -q '^PROVE_EXIT=' "$out"; then
     echo "=== GPU prove: BUDGET (RP_TIMEOUT=${RP_TIMEOUT:-3000}s) cut group \"${last_group}\"; groups: $(_rrw_group_list) ===" >&2
   fi

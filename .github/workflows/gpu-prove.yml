@@ -31,9 +31,33 @@ name: GPU prove (RunPod)
 # billed and independently subject to the same $187 cancel-in-progress
 # lesson (see the concurrency comment below) if a run is superseded.
 #
-# Off the merge path by default — GPU minutes cost money and capacity is
-# intermittent. It fires on: the `run-gpu` PR label (opt-in per PR), a nightly
-# cron, and manual dispatch. Needs the `RUNPOD_API_KEY` repo secret.
+# Off the merge path by default, and NEVER in the critical path of an
+# automated workflow (operator direction, 2026-09-03): GPU minutes cost
+# money and capacity is intermittent. It fires on: the `run-gpu` PR label
+# (opt-in per PR), a nightly cron, and manual dispatch — deliberately NO
+# `push:`/`workflow_call:` trigger (`check_gpu_prove_once.py`'s P1 rule pins
+# this by name), so nothing ever auto-starts it and nothing may `uses:` it.
+# Needs the `RUNPOD_API_KEY` repo secret.
+#
+# Every CUDA release lane (server image, release binaries, cu12 wheel)
+# gates its promotion on the SUMMARY of a prove run already on record for
+# the commit it promotes — `ci/scripts/gpu_prove_verdict.py`, consumed via
+# `_gpu-proof-required.yml`, never a fresh rental of its own. A dev
+# dispatches THIS workflow by hand before tagging a release (see
+# docs/maintainer/dev-gpu.md and MAINTAINER-GUIDE.md's release runbook).
+#
+# BUDGET, ref-type-conditional (esc-080/esc-083 derivation, kept in this ONE
+# place — never copied into a publisher's own comment): a `workflow_dispatch`
+# run ON A TAG REF gets the release budget (a dev proving the exact commit
+# about to ship deserves the same retry margin the old release-only gate
+# had): `max_attempts` 3, `timeout-minutes` 355 — derivation: 2 retried
+# attempts can each cost up to a full deploy-exhaustion cycle before
+# returning 75 (worst case 8 candidates × 600s RP_SSH_WAIT_SECS = 80m) plus
+# ~5m overhead, and the FINAL attempt additionally pays the full RP_TIMEOUT
+# job budget (100m) if it actually runs: 2 × 85m + 180m = 350m, +5m margin =
+# 355m. Every OTHER ref (a branch dispatch, the `run-gpu` label, the nightly
+# schedule) keeps the original single-attempt budget: `max_attempts` 1,
+# `timeout-minutes` 190 (80m worst-case deploy + 100m job cap + 10m margin).
 
 on:
   workflow_dispatch:
@@ -85,18 +109,11 @@ jobs:
     concurrency:
       group: gpu-prove-${{ matrix.arch }}-${{ github.ref }}
       cancel-in-progress: false
-    # A job-timeout kill is another trap bypass. The remote job is capped by
-    # RP_TIMEOUT (esc-080/esc-083: 100m by default, `runpod_gpu_prove.sh`'s
-    # own export — up from the library's 50m default, to give the inactivity
-    # watchdog room to detect a genuine hang before the hard budget would
-    # anyway); deploy itself is capped by RP_SSH_WAIT_SECS (default 600s) PER
-    # CANDIDATE, and every arch fails over across its own candidate list
-    # (SECURE/COMMUNITY × PCIe/SXM4/fallback siblings — see `rp_deploy_arch`
-    # in runpod_lib.sh); the WORST-case candidate count across the matrix is
-    # 8 (l4_l40s, h100), so the worst case (every candidate rents but none
-    # becomes reachable) is 8 × 600s = 80m of deploy on top of the 100m job
-    # cap = 180m, +10m margin = 190m.
-    timeout-minutes: 190
+    # A job-timeout kill is another trap bypass. See this file's own header
+    # for the ref-type-conditional budget derivation (one place, not copied
+    # into a publisher). A `workflow_dispatch` on a tag ref gets the release
+    # budget (355m); every other ref keeps the original 190m.
+    timeout-minutes: ${{ github.ref_type == 'tag' && 355 || 190 }}
     steps:
       - uses: actions/checkout@v4
 
@@ -119,19 +136,46 @@ jobs:
       # rc=0 does NOT reach either arm here — `runpod_gpu_prove.sh`'s own
       # driver rule already turns that case into exit 0 plus its own
       # inline `::warning::` (esc-082), so this step's `rc` output is `0`.
-      - name: Prove GPU suites on a real ${{ matrix.arch }} device
+      # Bounded retry PER ARCH on capacity (75), ref-type-conditional (see
+      # this file's own header): `MAX_ATTEMPTS`/the `sleep` between attempts
+      # only ever fire on a tag-ref dispatch; every other ref's loop body
+      # runs at most once, byte-identical to the pre-#454 single-attempt
+      # behavior. `echo "rc=$rc" >> "$GITHUB_OUTPUT"` runs on EVERY exit
+      # path (never only the terminal one) so the 75/76/77 annotation steps
+      # below always see a real value, including a mid-retry capacity exit.
+      - name: Prove GPU suites on a real ${{ matrix.arch }} device (retry on capacity, fail closed)
         id: prove
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
           GIT_REPO: https://github.com/${{ github.repository }}.git
           GIT_REF: ${{ github.head_ref || github.ref_name }}
           GPU_PROVE_ARCH: ${{ matrix.arch }}
+          # esc-084 amendment B/M/T: the pod echoes PROVE_SHA after clone;
+          # rp_run_remote_watched compares it against this and fails 77
+          # ("wrong tree") rather than letting a moved ref silently prove
+          # the wrong commit. Unset on a hand run of the script (never
+          # checked then).
+          PROVE_EXPECT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          MAX_ATTEMPTS: ${{ github.ref_type == 'tag' && 3 || 1 }}
         run: |
           set +e
-          bash ci/scripts/runpod_gpu_prove.sh
-          rc=$?
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
-          exit $rc
+          attempt=1
+          while :; do
+            bash ci/scripts/runpod_gpu_prove.sh
+            rc=$?
+            if [ "$rc" -ne 75 ]; then
+              echo "rc=$rc" >> "$GITHUB_OUTPUT"
+              exit "$rc"
+            fi
+            if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+              echo "::error::${GPU_PROVE_ARCH} capacity unavailable (SUPPLY_CONSTRAINT) after ${attempt} attempt(s) — this leg is NOT GPU-proven for ${GPU_PROVE_ARCH}. Operator action: re-run this workflow's failed jobs once ${GPU_PROVE_ARCH} capacity returns."
+              echo "rc=$rc" >> "$GITHUB_OUTPUT"
+              exit "$rc"
+            fi
+            echo "::warning::${GPU_PROVE_ARCH} capacity unavailable (SUPPLY_CONSTRAINT), attempt ${attempt}/${MAX_ATTEMPTS} — retrying in 300s."
+            sleep 300
+            attempt=$((attempt + 1))
+          done
 
       - name: Annotate a capacity failure
         if: always() && steps.prove.outputs.rc == '75'
@@ -140,3 +184,7 @@ jobs:
       - name: Annotate an inactivity-watchdog kill
         if: always() && steps.prove.outputs.rc == '76'
         run: echo "::warning::GPU prove FAILED for inactivity — rp_run_remote_watched's own RP_INACTIVITY watchdog killed this leg with a gating PROVE_GROUPS member still unresolved (a genuine hang, not a capacity condition). Produce the artifact with ci/scripts/perf/gpu_prove_timings.py and add a disposition via check_gpu_prove_timings.py's R4 before re-running."
+
+      - name: Annotate a wrong-tree failure
+        if: always() && steps.prove.outputs.rc == '77'
+        run: echo "::warning::GPU prove FAILED for wrong tree — the pod's own PROVE_SHA disagreed with PROVE_EXPECT_SHA (the ref moved between run creation and clone, or a tag was moved), or no PROVE_SHA was ever observed. Nothing was proven for ${{ matrix.arch }} at the expected commit; re-run once the ref is stable."

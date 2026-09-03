@@ -93,8 +93,12 @@ RUNPOD_PROVE_REL = "ci/scripts/runpod_gpu_prove.sh"
 # own cause in the leg's own suite output; `capacity` (exit 75) is a supply
 # condition, not a hang/cut; `log-incomplete` (BLOCK B) is a truncated log,
 # not a real outcome to disposition at all -- it needs a fresh run, not a
-# reviewed explanation.
-OUTCOME_VALUES = frozenset({"healthy", "budget-cut", "watchdog-kill", "suite-fail", "capacity", "log-incomplete"})
+# reviewed explanation. `wrong-tree` (esc-084/#454 amendment N/U) is
+# likewise a DETERMINED cause -- the ref moved under the clone, or a tag was
+# moved -- self-explaining exactly like `capacity`, never dispositioned.
+OUTCOME_VALUES = frozenset(
+    {"healthy", "budget-cut", "watchdog-kill", "suite-fail", "capacity", "log-incomplete", "wrong-tree"}
+)
 OUTCOMES_NEEDING_DISPOSITION = frozenset({"budget-cut", "watchdog-kill"})
 OUTCOMES_FORBIDDING_DISPOSITION = OUTCOME_VALUES - OUTCOMES_NEEDING_DISPOSITION
 
@@ -841,7 +845,7 @@ def _self_test() -> int:
 
     # --- round-2 audit: a disposition on a healthy/suite-fail/capacity/
     # log-incomplete outcome is itself a schema finding. ---
-    for bad_outcome in ("healthy", "suite-fail", "capacity", "log-incomplete"):
+    for bad_outcome in ("healthy", "suite-fail", "capacity", "log-incomplete", "wrong-tree"):
         art = _healthy_artifact("sm_80", 2000.0, 100.0)
         art["outcome"] = bad_outcome
         if bad_outcome != "healthy":

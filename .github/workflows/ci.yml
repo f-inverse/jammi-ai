@@ -423,9 +423,10 @@ jobs:
   # currently run nowhere in CI; they exist only as ad-hoc `JAMMI_REQUIRE_
   # CUDA=1 cargo test -p jammi-kernels --features flash-attn --test
   # flash_smoke` pod sessions (see the P6 stage-A artifact commit). Closing
-  # THAT gap needs a self-hosted GPU runner wired the way `_gpu-prove-gate.yml`
-  # already does for the release lane — out of scope here; do not read a green
-  # run of this job as evidence the kernels compute the right numbers.
+  # THAT gap needs a self-hosted GPU runner wired into the merge path the way
+  # `gpu-prove.yml` proves the release lane today (off the merge path,
+  # dispatched by hand) — out of scope here; do not read a green run of this
+  # job as evidence the kernels compute the right numbers.
   #
   # `cargo check` (not `cargo build`) is enough: build scripts run in full —
   # unconditionally compiled AND executed — for `cargo check` exactly as for
@@ -1264,6 +1265,20 @@ jobs:
           # list.
           - name: gpu prove lane suite
             cmd: bash ci/scripts/test_gpu_prove_lane.sh
+          # esc-084/#454 (prove once per commit, share the verdict): P1-P4
+          # static rules (exactly-one producer + the never-in-the-critical-
+          # path doctrine, no renting reusable, every manifest CUDA lane's
+          # promotion chain, consumer/producer name agreement) — no build,
+          # no GPU, no network.
+          - name: gpu prove once
+            cmd: python3 ci/scripts/check_gpu_prove_once.py
+          - name: gpu prove once suite
+            cmd: python3 ci/scripts/test_check_gpu_prove_once.py
+          # The verdict CONSUMER's own suite: every esc-084 control (b)
+          # degenerate record, the recency/revocation rule, and the wait
+          # state machine, driven with a fake fetch/clock — no network.
+          - name: gpu prove verdict suite
+            cmd: python3 ci/scripts/test_gpu_prove_verdict.py
           # Completeness tripwire for this very guard class: every
           # ci/scripts/check_*.py|.sh gate script must be referenced by at
           # least one workflow (this file included), so a new check script

@@ -4,10 +4,13 @@ name: _pypi-server
 # image, at the given container/feature set) -> package + relabel the wheel to
 # its real manylinux platform tag (NO auditwheel — the CUDA leg's CUDA `.so`s
 # are deliberately left unvendored, arriving instead via the `nvidia-*-cu12`
-# dependency wheels at install time; the CPU leg has nothing to vendor either)
-# -> optionally prove on a real A100 (`run_gpu_prove`). One reusable, two thin
-# callers (pypi-server.yml / pypi-server-cuda.yml) instead of two
-# near-identical workflows.
+# dependency wheels at install time; the CPU leg has nothing to vendor either).
+# One reusable, two thin callers (pypi-server.yml / pypi-server-cuda.yml)
+# instead of two near-identical workflows. This reusable carries no notion of
+# GPU proof at all: the CPU caller never needed one, and the CUDA caller
+# (`pypi-server-cuda.yml`) hoists its own `gpu-proof` job directly (amendment
+# E) so all three CUDA release lanes share one identical (build, promote,
+# gate) shape.
 #
 # The PyPI publish step deliberately lives in each CALLER, not here: PyPI
 # trusted publishing matches the OIDC token's `job_workflow_ref` (the CALLED
@@ -56,11 +59,6 @@ on:
           Run `${package_dir}/verify_link_set.py` against the stripped binary —
           the CUDA leg's DT_NEEDED-coverage check (the CPU leg carries no such
           script and leaves this false).
-        type: boolean
-        required: false
-        default: false
-      run_gpu_prove:
-        description: "Gate publish behind the shared A100 prove-gate (build -> prove -> promote)."
         type: boolean
         required: false
         default: false
@@ -171,19 +169,3 @@ jobs:
         with:
           name: ${{ inputs.artifact_prefix }}-dist
           path: ${{ inputs.package_dir }}/dist/
-
-  gpu-prove:
-    name: GPU prove-gate (A100)
-    # Only a `py-v*` TAG ref proves-for-promotion — a tag push, or a
-    # workflow_dispatch RUN ON THE TAG (the recovery path). The tag guard is
-    # what makes `git_ref` below an immutable identity: the pod clones the
-    # same commit build-wheel built, never a branch tip that may have moved
-    # (a branch dispatch would prove one sha and publish another). A branch
-    # dispatch or PR is build-only and never proves. A no-op (skipped) leg
-    # when the caller doesn't request the gate (CPU).
-    if: inputs.run_gpu_prove && startsWith(github.ref, 'refs/tags/py-v')
-    needs: build-wheel
-    uses: ./.github/workflows/_gpu-prove-gate.yml
-    with:
-      git_ref: ${{ github.ref_name }}
-    secrets: inherit

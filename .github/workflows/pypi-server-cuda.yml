@@ -4,10 +4,11 @@ name: PyPI (jammi-server-cu12, CUDA)
 # the SAME lockstep tag as the CPU `jammi-server`, the base client `jammi-ai`,
 # and the `jammi-ai-native` engine wheels. Thin caller of the shared
 # `_pypi-server` reusable; unlike the CPU leg, this leg carries the CUDA
-# DT_NEEDED link-set verification and gates publish behind the shared A100
-# prove-gate (build -> prove -> promote) — the binary is proven on a real GPU
-# before it is promoted to PyPI. The publish job lives HERE, not in the
-# reusable — PyPI's token exchange and its attestation verification match
+# DT_NEEDED link-set verification and gates publish behind the commit's
+# already-recorded GPU-prove verdict (build -> proof -> promote; `gpu-proof`
+# below reads it, never starts a new prove run) — the binary was proven on a
+# real GPU before it is promoted to PyPI. The publish job lives HERE, not in
+# the reusable — PyPI's token exchange and its attestation verification match
 # different workflow-ref claims for a reusable-workflow publish and can never
 # both pass (see `_pypi-server.yml`'s header). The PyPI trusted publisher for
 # `jammi-server-cu12` is registered under THIS file's name (workflow
@@ -78,17 +79,19 @@ jobs:
       # `flash-attn` is now in the manifest's cu12-wheel feature list, which
       # needs the vendored CUTLASS submodule at build time.
       init_cutlass_submodule: true
-      # Already gates publish behind the shared A100 prove-gate
-      # (`_gpu-prove-gate.yml`, the SAME reusable `release-binaries.yml`'s
-      # `server-cu12` tarball job calls) — `publish` below `needs:
-      # server-cu12`, and a reusable-workflow-call job's result reflects
-      # the WHOLE called workflow's outcome, so a failed `gpu-prove` leg
-      # inside `_pypi-server.yml` fails this job and `publish` never runs.
-      # `_gpu-prove-gate.yml`'s own concurrency group is keyed on
-      # `(git_ref, arch)` — shared across every caller — so a re-run of
-      # this same tag never rents a second GPU for an arch already proven
-      # (or in flight) for that ref.
-      run_gpu_prove: true
+    secrets: inherit
+
+  # Hoisted to THIS caller (amendment E): `_pypi-server.yml` no longer knows
+  # about GPU proof at all (its CPU caller, `pypi-server.yml`, never needed
+  # it). Runs concurrently with `server-cu12` above — it never needed the
+  # wheel build to finish first, only to be checked before `publish` below.
+  gpu-proof:
+    name: GPU proof required
+    if: startsWith(github.ref, 'refs/tags/py-v')
+    uses: ./.github/workflows/_gpu-proof-required.yml
+    permissions:
+      contents: read
+      actions: read
     secrets: inherit
 
   publish:
@@ -96,16 +99,14 @@ jobs:
     # Publishes ONLY from a `py-v*` tag ref — a tag push, or a
     # workflow_dispatch run on the tag (recovery: PyPI rejects a re-upload of
     # an existing version, so re-running the tag is idempotent; a re-run
-    # re-proves on the A100 first, same as the first run). A branch dispatch
-    # or PR is an artifact-only dry run and can never publish. Same recovery
-    # contract as `pypi.yml`/`pypi-client.yml` on this lockstep surface. The
-    # implicit success() on this `if` requires the WHOLE called workflow —
-    # build -> package -> A100 prove-gate (`run_gpu_prove: true` above, and
-    # on a `py-v*` tag the gate genuinely runs rather than no-op skipping) —
-    # to have succeeded: a failed prove fails the calling job and this job
-    # never runs, preserving build -> prove -> promote.
-    if: startsWith(github.ref, 'refs/tags/py-v')
-    needs: server-cu12
+    # reuses the commit's already-recorded GPU-prove verdict — it never
+    # re-proves). A branch dispatch or PR is an artifact-only dry run and can
+    # never publish. Same recovery contract as `pypi.yml`/`pypi-client.yml`
+    # on this lockstep surface. The `if:` is a PURE conjunction (no `||`):
+    # both `server-cu12` (build+package) and `gpu-proof` (the commit's
+    # verdict) must have succeeded before this job runs.
+    if: always() && startsWith(github.ref, 'refs/tags/py-v') && needs.server-cu12.result == 'success' && needs.gpu-proof.result == 'success'
+    needs: [server-cu12, gpu-proof]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

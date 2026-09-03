@@ -79,6 +79,16 @@ KINDS = (KIND_RELEASE, KIND_TEST, KIND_DEFAULT)
 # asserts identical (name, rc) extraction.
 PROVE_GROUP_RC_RE = re.compile(r"PROVE_GROUP_RC name=(?P<name>\S+) rc=(?P<rc>-?\d+)")
 
+# The ONE grammar for the `PROVE_SHA=<sha>` marker (esc-084/#454, amendment
+# T): `runpod_gpu_prove.sh` echoes it right after clone; `runpod_lib.sh`'s
+# `rp_parse_prove_sha` (the bash-side twin) and `ci/scripts/perf/
+# gpu_prove_timings.py`'s own parser both import THIS constant rather than
+# compiling an independent copy, the same discipline `PROVE_GROUP_RC_RE`
+# above already established. `test_gpu_prove_lane.sh`'s cross-parser
+# fixture feeds both parsers the identical set of inputs and asserts
+# identical (sha) or identical NOMATCH.
+PROVE_SHA_RE = re.compile(r"PROVE_SHA=(?P<sha>[0-9a-f]+)")
+
 
 def declared(crate: str, repo_root: Path = REPO_ROOT) -> set[str]:
     """`crates/<crate>/Cargo.toml`'s own `[features]` table keys."""

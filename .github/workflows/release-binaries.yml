@@ -9,21 +9,27 @@ name: Release Binaries
 # Three asset families ship:
 #   - the CPU `jammi` CLI (the `build` matrix: x86_64-linux + aarch64-darwin),
 #   - the CPU `jammi-server` tarball (`server-cpu`, x86_64-linux), and
-#   - the CUDA `jammi-server` tarball (`server-cu12`, x86_64-linux) — the binary
-#     plus the CUDA runtime `.so`s it links and an `LD_LIBRARY_PATH` launcher,
-#     so it runs on any host with an NVIDIA driver and no system CUDA install.
+#   - the CUDA `jammi-server` tarball (`server-cu12-build` builds it,
+#     `server-cu12-promote` uploads it, x86_64-linux) — the binary plus the
+#     CUDA runtime `.so`s it links and an `LD_LIBRARY_PATH` launcher, so it
+#     runs on any host with an NVIDIA driver and no system CUDA install.
 # The same GPU build also ships as the `jammi-ai-server-cu12` container image
 # (`server-image.yml`) and the `jammi-server-cu12` PyPI wheel (`pypi-server-cuda.yml`).
 #
 # `workflow_dispatch` has two modes, keyed on the REF the dispatch runs on:
-#   - a branch: every job is a no-release exercise — assets are uploaded as
-#     workflow artifacts only; no release is touched.
-#   - the `v*` tag itself: identical to the tag push — every job rebuilds from
-#     the tag's own commit and re-attaches its asset to that release (the CUDA
-#     leg re-proves on the A100 first). This recovers a release whose assets
-#     are missing without re-cutting the tag, and an asset attached to release
-#     vX is thereby always built from vX's commit — a caller-chosen branch tip
-#     can never be promoted onto a release.
+#   - a branch: every job's BUILD half is a no-release exercise — assets are
+#     uploaded as workflow artifacts only; no release is touched. The CUDA
+#     leg's `server-cu12-promote` half does not run at all on a branch ref
+#     (its `if:` requires a `v*` tag) — there is no release to promote onto
+#     and no verdict lookup to make on a ref that can never own one.
+#   - the `v*` tag itself: identical to the tag push — every job rebuilds
+#     from the tag's own commit and re-attaches its asset to that release
+#     (the CUDA leg's promote step requires the tag commit's already-
+#     recorded GPU-prove verdict — see `gpu-proof` below; nothing here
+#     starts a new prove run). This recovers a release whose assets are
+#     missing without re-cutting the tag, and an asset attached to release
+#     vX is thereby always built from vX's commit — a caller-chosen branch
+#     tip can never be promoted onto a release.
 # On a `v*` tag push the assets always go to the release named by the tag.
 #
 # The release these assets attach to is created idempotently by whichever leg
@@ -178,32 +184,32 @@ jobs:
   # DT_NEEDED entries for those libraries, so it will not exec without them on the
   # loader path; bundling makes the tarball run on any host with only an NVIDIA
   # driver. A GPU-less runner is fine — nothing runs the binary here.
-  gpu-prove-cu12:
-    name: GPU prove-gate (A100)
+  gpu-proof:
+    name: GPU proof required
     # Any `v*` TAG ref — a tag push, or a recovery dispatch run on the tag —
-    # proves the release commit on a real A100 before the CUDA tarball is
-    # uploaded to the release. The tag guard (not an event guard) is what
-    # keeps every release-upload arm proven: an event-keyed guard would let a
-    # dispatch promote unproven.
+    # requires the release commit's already-recorded GPU-prove verdict
+    # before the CUDA tarball is uploaded to the release. The tag guard (not
+    # an event guard) is what keeps every release-upload arm proven: an
+    # event-keyed guard would let a dispatch promote unproven.
     if: startsWith(github.ref, 'refs/tags/v')
-    uses: ./.github/workflows/_gpu-prove-gate.yml
-    with:
-      git_ref: ${{ github.ref_name }}
+    uses: ./.github/workflows/_gpu-proof-required.yml
+    permissions:
+      contents: read
+      actions: read
     secrets: inherit
 
-  server-cu12:
+  # Build and proof-check run CONCURRENTLY (amendment P/W): the build never
+  # needed the verdict to compile, only to be UPLOADED to a release, so
+  # splitting it from the promote step below overlaps the build with
+  # `gpu-proof`'s verdict lookup/wait instead of serializing after it.
+  server-cu12-build:
     name: Build jammi-server (CUDA)
-    # build → prove → promote: on a `v*` tag ref (push or dispatch-on-tag),
-    # upload only after the A100 gate passes; a branch dispatch is an
-    # artifacts-only exercise (the release-upload action never touches a
-    # release from a non-tag ref) and is ungated.
-    needs: [gpu-prove-cu12]
-    if: always() && (!startsWith(github.ref, 'refs/tags/v') || needs.gpu-prove-cu12.result == 'success')
     runs-on: ubuntu-latest
     container: ${{ vars.JAMMI_CI_IMAGE_CUDA || 'ghcr.io/f-inverse/jammi-ai-ci-cuda:latest' }}
     permissions:
-      # `gh release create` / `gh release upload` (the release-upload action).
-      contents: write
+      contents: read
+    outputs:
+      asset: ${{ steps.package.outputs.asset }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -305,9 +311,44 @@ jobs:
           tar -czf "$asset" "$stage"
           echo "asset=$asset" >> "$GITHUB_OUTPUT"
 
+      # A workflow artifact, never `release-upload` directly (amendment W):
+      # this job runs on EVERY dispatch/tag push regardless of the GPU-prove
+      # verdict (it never needed the verdict to compile), so promoting the
+      # tarball straight to a release from here would bypass `gpu-proof`
+      # entirely. `server-cu12-promote` below downloads this artifact only
+      # after the verdict is confirmed.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jammi-server-cu12-tarball
+          path: ${{ steps.package.outputs.asset }}
+
+  server-cu12-promote:
+    name: Promote jammi-server (CUDA) to the release
+    # build → proof → promote: uploads to the release ONLY on a `v*` tag ref
+    # (push or dispatch-on-tag) whose commit's GPU-prove verdict is green.
+    # The `if:` is a PURE conjunction (no `||`) — the non-tag branch-dispatch
+    # escape hatch this job used to carry is gone: `server-cu12-build` above
+    # already exercises the CUDA packaging loop on every dispatch as an
+    # artifact-only rehearsal, and an ad-hoc branch build was never a proof
+    # of anything this job needs to promote from.
+    needs: [server-cu12-build, gpu-proof]
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.server-cu12-build.result == 'success' && needs.gpu-proof.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      # `gh release create` / `gh release upload` (the release-upload action).
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: jammi-server-cu12-tarball
+
       # Release attach (any `v*` tag ref) or workflow-artifact upload (branch
       # dispatch) — the shared release-upload action decides which, and owns
-      # the idempotent `gh release create` + bounded retry.
+      # the idempotent `gh release create` + bounded retry. This job only
+      # ever reaches here on a tag ref (the `if:` above), so the branch-
+      # dispatch arm is inert but kept for the action's own uniform contract.
       - uses: ./.github/actions/release-upload
         with:
-          asset: ${{ steps.package.outputs.asset }}
+          asset: ${{ needs.server-cu12-build.outputs.asset }}

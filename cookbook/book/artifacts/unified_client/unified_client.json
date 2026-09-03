@@ -45,7 +45,7 @@
   "install": {
     "embedded_extra_name": "embedded",
     "embedded_extra_pins": [
-      "jammi-ai-native==0.48.0"
+      "jammi-ai-native==0.49.0"
     ],
     "extras": [
       "dev",

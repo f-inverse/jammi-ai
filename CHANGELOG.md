@@ -6,7 +6,58 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## [0.49.0] - 2026-09-02
+
+Quantized (GGUF/k-quant) serving and QLoRA land on the existing encoder
+towers; FlashAttention-2 ships in every CUDA release artifact, with f16
+acceleration end to end and a per-job acceleration report; and the SQLite
+catalog gains an explicit single-process seam plus a release handshake at
+every layer. Every shipped CUDA arch is now proven on its own device before a
+release promotes.
+
 ### Added
+- **Quantized (GGUF/k-quant) model serving and QLoRA (`jammi-numerics`,
+  `jammi-kernels`, `jammi-lora`, `jammi-encoders`, `jammi-ai`; #430, closes
+  #351).** The existing encoder towers (BERT-family, DistilBERT, ModernBERT)
+  load from a model directory or HF repo carrying a literal `model.gguf` plus
+  its sidecar `config.json`; the existing safetensors/onnx precedence is
+  unchanged. `WeightQuantization` names the supported GGUF weight-storage
+  dtypes and is derived from the artifact, never a user knob — no wire
+  change. `QuantMatMulGrad` is the workspace's one quantized-matmul entry
+  point and is always differentiable: its backward computes the input
+  gradient against the dequantized weight and never returns a missing
+  gradient, so the silent-backward-truncation class of esc-037 is
+  unreachable for a quantized weight. `FrozenBase { Dense, Quantized }` lets
+  every trainable LoRA linear carry a quantized frozen base.
+  `ModelIdentity.quantization` distinguishes a quantized run's definition
+  hash while every existing hash is byte-preserved. Admission uses a
+  header-only, conservative residency estimate for GGUF weights.
+- **FlashAttention-2 ships in every CUDA release artifact (esc-074; #444,
+  closes #443).** The cu12 tarball, the `jammi-server-cu12` wheel, and the
+  container image all build from one shared `ci/release-feature-manifest.json`
+  with the CUTLASS checkout the vendored FA2 build needs; `flash-attn`
+  feature chains exist on `jammi-ai`, `jammi-server`, and `jammi-bench`.
+  Previously no shipped selection reached the flash path.
+- **f16 acceleration end to end (`jammi-kernels`; #444).** Eight fused-op
+  families gained f16 CUDA kernels or composition paths in separate
+  monomorphic translation units, with the bf16 sources untouched; the FA2
+  fp16 kernels are compiled, wired, and admitted alongside bf16. Per-op
+  oracles carry regime-derived tolerances and overflow/underflow boundary
+  contracts.
+- **Per-job acceleration report (esc-075; #444).** A claim-time acceleration
+  report, measured by a real probe forward+backward, persists on the
+  training-job record (append-only migration 026) and surfaces
+  byte-identically on every transport: the wire, `jammi-client`,
+  `jammi-admin`, the CLI, and both Python arms.
+- **Per-epoch training/validation loss curves (#441, via #435).**
+  `metrics_json` on the training status reaches embedded
+  `TrainingJob.metrics()`, `TrainingStatusResponse.metrics_json`,
+  `DataClient::fine_tune_metrics`, `RemoteTrainingJob.metrics()`, and
+  `jammi-admin`'s `TrainingStatusInfo`, with a three-state (absent / valid /
+  malformed → typed refusal) contract on both Python surfaces.
+- **Load-time quantized CUDA canary (`jammi-kernels`; #435).** A known-answer
+  check per device ordinal runs at load; `set_force_dmmv` is the fallback
+  seam.
 - **`CatalogService/ListIndexSegments` — a result table's ANN index-segment
   set reaches the public surface.** The `index_segments` rows (migration
   025) were readable through no public surface: not `db.sql()`'s federation,
@@ -72,6 +123,11 @@ workspace ships every publishable crate at the same
   from the catalog read itself.
 
 ### Changed
+- **Release promotion proves every shipped CUDA arch (#432).** The tag-path
+  prove gate (`_gpu-prove-gate.yml`) and the nightly `gpu-prove.yml` are
+  matrixed over `sm_80 / sm_86 / sm_89 / sm_90`, fail-closed per leg;
+  `check_gpu_parity_matrix.py` gained a silicon axis parsed from `build.rs`,
+  so an added arch or backend trips the gate by itself.
 - **Embedded `Session.close()` is an awaited release, not a documented RAII
   no-op.** It previously raised `NotSupportedOnBackend` on the claim that the
   embedded engine released its resources on drop; under the `unix-excl` seam
@@ -107,6 +163,58 @@ workspace ships every publishable crate at the same
   job row. An integrator that used a non-empty `model_id` as a completion
   test must use `status` instead — the embedded and remote attaches now
   agree on `model_id` at every state, not only at completion.
+
+### Fixed
+- **Quantized inference produced garbage on sm_90 / H100 (#434, esc-069).**
+  Root-caused to arch packaging and unchecked launches, not math: the release
+  ships SASS for all four shipped arches with each proved on its own device,
+  every prove leg asserts the rented device's compute capability matches the
+  arch it builds for, and the load-time canary above catches a mis-packaged
+  kernel before it serves.
+- **`DropoutFused` was dead on Metal (#433, esc-070).** A byte-identical
+  host-fallback forward with Philox masks identical across CPU, CUDA, and
+  Metal; the seven-conjunct spec is literal and fix-verified.
+- **f16 fine-tuning ran out of memory on the eager path (esc-076; #444).**
+  Unbounded distinct-shape churn fragmented the non-caching allocator; the
+  training path now buckets sequence lengths to powers of two (output
+  invariance proven), with eval exempt on its deterministic one-time shape
+  set. The un-bucketed reproduction is kept as an explicit-run RED oracle.
+- **Cross-surface float drift from serde_json's default lossy float parse
+  (#435).** Fixed workspace-wide with `float_roundtrip`; caught by the
+  hermetic bit-identity oracle.
+- **The safetensors residency estimate was dtype-blind (#431).** Header-parsed,
+  widest-dtype cost, typed refusals including overflow-shaped headers.
+- **Zero-before-contiguity one-shot across the CUDA glue (#436)**, including
+  the `[hidden]`-shaped dgamma zeros.
+- **64-bit grid-stride indexing** across the fused kernels' loops, with a host
+  guard (#447).
+- **esc-073 child harness no longer hangs CI on an undrained pipe
+  (`jammi-test-utils`, `jammi-db`; #449, esc-078/esc-079).** The harness
+  children that prove the SQLite two-library coexistence seam wrote more
+  than a pipe's worth of diagnostics while the parent waited on exit, so a
+  refusing child parked in `write(2)` until the ceiling killed it with an
+  empty log. `jammi_test_utils::child::DrainedChild` drains both streams
+  from the moment of spawn, treats an idle descriptor as done only once the
+  child is confirmed reaped, caps retention to a head-and-tail window, and
+  reports completeness, truncation, hang, kill, and silence as separate
+  axes; every attempt is scored against a per-role terminal line, and an
+  untrustworthy capture is classified `Incomplete`, never `Survived`. A
+  standing differential keeps the undrained driver in the tree and
+  reproduces the hang on every run.
+- **GPU prove lane: proof surface equals shipped surface, and the ceilings
+  are measured (#450, esc-080..esc-083).** The tag-path four-arch prove
+  lane reported a budget kill as a proof failure after every proof had
+  passed. The served, capability-surface, and kernel proofs are now derived
+  from the release manifest's declared `prove_lane` kinds and a closure
+  guard fails when an invocation is not on the manifest; each proof group
+  emits its own return-code marker and a final exit line so a partial log
+  names the group that was cut; the remote stream carries an inactivity
+  watchdog and a budget cut is reported as a budget cut; and a producer
+  turns each job log into a committed per-arch timing artifact that rules
+  R1–R5 check on every run, so the inactivity window (900 s, three times
+  the largest healthy silence observed) and the timeout backstop are
+  derived from evidence rather than guessed. Bench is not proof and never
+  gates.
 
 ### Removed
 - **`Capability.CLOSE`, from the Python client `jammi`.** A public API

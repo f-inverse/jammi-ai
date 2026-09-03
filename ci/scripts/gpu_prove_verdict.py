@@ -5,12 +5,12 @@
 commit and SHARED. Every CUDA release lane (server image, release binaries,
 cu12 wheel) calls the `_gpu-proof-required.yml` reusable, which runs this
 script instead of renting hardware itself. `gpu-prove.yml` is never
-triggered from here (operator direction, 2026-09-03): the prove lane is a
-manual dev run, off the critical path of every automated workflow; a
-publisher gates on the SUMMARY of a prove execution already recorded
-against the commit it is promoting, never on a fresh measurement it starts.
+triggered from here -- see that workflow's own header for the canonical
+statement of why; a publisher gates on the SUMMARY of a prove execution
+already recorded against the commit it is promoting, never on a fresh
+measurement it starts.
 
-## The rule (amendment F, corrected by V, restated by Q/S)
+## The rule (esc-084 control b, most-recent-measurement-wins)
 
 For each required arch (the shipped `GENCODE_ARCHES` silicon axis,
 `check_gpu_parity_matrix.py`'s own parser — never a hand-typed list): a
@@ -23,7 +23,7 @@ place) on a run of `gpu-prove.yml` whose `head_sha` is the commit this
 caller promotes. `skipped` is not a measurement (e.g. a labeled-event run
 for a different label never touched this arch).
 
-Recency (amendment V): the MOST RECENT measurement per arch is the one with
+Recency: the MOST RECENT measurement per arch is the one with
 the greatest job `completed_at` — never run id alone, because
 `gh run rerun <id> --failed` re-runs an EXISTING (possibly numerically
 older) run id with a fresh completed_at, and a numerically newer run id can
@@ -31,8 +31,8 @@ finish before an older one is rerun. Ties break on run id (higher wins). A
 later red measurement REVOKES an earlier green until a re-run succeeds
 (fail-closed).
 
-Wait state (amendment Q, restated by S — no appearance grace; nothing here
-ever starts a prove run):
+Wait state (operator direction, 2026-09-03 — no appearance grace; nothing
+here ever starts a prove run):
   1. If every required arch's most recent measurement is `success`, exit 0
      immediately, even if a newer run is queued/in progress at this sha (a
      publisher that already started consumes the verdict as of its own
@@ -45,8 +45,8 @@ ever starts a prove run):
      (no grace — nothing auto-starts the prove; the remedy is a dispatch).
   4. Else DENY naming every arch whose most recent measurement is not
      `success`, each with its own `gh run rerun <run_id> --failed` remedy
-     (amendment L — re-running one failed leg is one GPU pod, not a fresh
-     whole-workflow dispatch).
+     (re-running one failed leg is one GPU pod, not a fresh whole-workflow
+     dispatch).
 
 Any HTTP/JSON error is a hard DENY (exit 1) — never vacuous: a network
 hiccup must never read as "nothing to prove" and let something silently
@@ -162,7 +162,7 @@ def _paginated(fetch: FetchFn, token: str, url: str, key: str) -> list[dict]:
 
 def list_runs(fetch: FetchFn, token: str, repo: str, workflow: str, sha: str) -> list[dict]:
     """Every run of `workflow` at `head_sha == sha`, all pages, explicitly
-    sorted by run id descending -- never trusting API order (amendment Q).
+    sorted by run id descending -- never trusting API order.
 
     Defense in depth (esc-084 control b): the `head_sha`/workflow-path
     query params ask the SERVER to scope the result, but this never TRUSTS
@@ -170,14 +170,17 @@ def list_runs(fetch: FetchFn, token: str, repo: str, workflow: str, sha: str) ->
     with what was asked for, or whose own `path` names a different workflow
     file, is dropped client-side too, so a proxy/cache bug or a malformed
     fixture can never smuggle a foreign commit's or a foreign workflow's
-    green measurement into this commit's verdict."""
+    green measurement into this commit's verdict.
+
+    Advisory A5 fix: `path` must be PRESENT and equal the exact repo-
+    relative path `.github/workflows/<workflow>` -- never `"path" not in r`
+    (a record with no `path` key at all is REFUSED, not vacuously
+    accepted) and never a bare `endswith` (which a nested path like
+    `vendor/.github/workflows/<workflow>` would also satisfy)."""
     url = f"{API_BASE}/repos/{repo}/actions/workflows/{workflow}/runs?head_sha={sha}"
     runs = _paginated(fetch, token, url, "workflow_runs")
-    runs = [
-        r
-        for r in runs
-        if r.get("head_sha") == sha and ("path" not in r or str(r["path"]).endswith(f"/{workflow}"))
-    ]
+    want_path = f".github/workflows/{workflow}"
+    runs = [r for r in runs if r.get("head_sha") == sha and r.get("path") == want_path]
     runs.sort(key=lambda r: r.get("id", 0), reverse=True)
     return runs
 
@@ -236,7 +239,9 @@ def collect_measurements(
 
 
 def most_recent(measurements: list[Measurement]) -> Measurement | None:
-    """Greatest `completed_at`, run id as the tiebreak -- amendment V.
+    """Greatest `completed_at`, run id as the tiebreak (a `gh run rerun
+    <id> --failed` re-runs an EXISTING, possibly numerically older, run id
+    with a fresh `completed_at`, so recency by run id alone would be wrong).
     ISO8601 UTC (`Z`) timestamps compare correctly as plain strings."""
     if not measurements:
         return None
@@ -252,6 +257,13 @@ class Verdict:
 
 
 def evaluate(by_arch: dict[str, list[Measurement]], required_arches: list[str]) -> Verdict:
+    # Advisory A6 fix -- an arity floor: `not missing and not failing` is
+    # vacuously `True` when `required_arches` is empty (`not [] and not
+    # {}`), which would report a verdict as PROVEN for a caller that asked
+    # about nothing. A caller with zero required arches asked a malformed
+    # question; refuse rather than silently promote it as satisfied.
+    if not required_arches:
+        raise VerdictError("evaluate() called with zero required arches -- refusing a vacuous verdict")
     proofs: dict[str, Measurement] = {}
     missing: list[str] = []
     failing: dict[str, Measurement] = {}
@@ -321,9 +333,9 @@ def run(
             continue
         break
 
-    # DENY -- amendment S: the "no candidate" case never waits for a grace
-    # window (nothing auto-starts a prove run); amendment L: a red/revoked
-    # arch re-runs its OWN failed leg, not the whole workflow.
+    # DENY -- operator direction (2026-09-03): the "no candidate" case never
+    # waits for a grace window (nothing auto-starts a prove run); a
+    # red/revoked arch re-runs its OWN failed leg, not the whole workflow.
     if verdict.missing:
         print(
             f"::error::gpu-prove-verdict: DENY -- no GPU-prove measurement for "

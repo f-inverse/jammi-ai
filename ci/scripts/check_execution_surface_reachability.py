@@ -374,10 +374,11 @@ Every tuple this class registers needs a REAL CUDA/CUTLASS toolchain to run
 meaningfully; the only lane that has one (`gpu-prove.yml`, the single
 `runpod_gpu_prove.sh` producer — see the allowlist's own notes) is, by this
 repo's own design, never a merge-path trigger for this class's own scripts,
-and never in the critical path of an automated workflow at all (operator
-direction; every CUDA release lane instead consumes its already-recorded
-verdict via `_gpu-proof-required.yml`). That leaves exactly two honest
-choices per tuple, never a silent third:
+and never in the critical path of an automated workflow at all — see that
+workflow's own header for the canonical statement of why; every CUDA
+release lane instead consumes its already-recorded verdict via
+`_gpu-proof-required.yml`. That leaves exactly two honest choices per
+tuple, never a silent third:
 
   (a) `gpu-prove.yml` is promoted to a REQUIRED merge-path check.
       This is a GitHub branch-protection ruleset setting, not committed

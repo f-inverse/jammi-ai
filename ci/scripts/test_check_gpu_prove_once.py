@@ -5,8 +5,9 @@ Drives the real `run_gate()`/`check_p1_p2()`/`check_p3()`/`check_p4()`/
 `check_promoting_if()`/`reconstruct_if_expr()`/`split_top_level()`/
 `read_top_level_on_block()` entry points against synthetic fixture trees
 (never a hand-built stand-in for the parsers themselves) — including a
-fixture reproducing TODAY's (pre-#454) tree shape, which must fail naming
-every offending site, and a positive fixture that must pass clean.
+fixture reproducing the PRE-FIX shape (esc-084: three publishers `uses:` a
+renting reusable), which must fail naming every offending site, and a
+positive fixture that must pass clean.
 
 Run directly: `python3 ci/scripts/test_check_gpu_prove_once.py`
 """
@@ -65,6 +66,34 @@ jobs:
 """
 
 
+PROOF_REQUIRED_YML_GOOD = """\
+name: _gpu-proof-required
+
+on:
+  workflow_call: {}
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  proof-required:
+    name: GPU proof required
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the commit's GPU-prove verdict (gpu-prove.yml, rule Q/V)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 ci/scripts/gpu_prove_verdict.py \\
+            --repo "$GITHUB_REPOSITORY" \\
+            --sha "$GITHUB_SHA" \\
+            --deadline-minutes 355
+"""
+
+
 def _gate_job(gate_name: str = "gpu-proof") -> str:
     return f"""\
   {gate_name}:
@@ -112,6 +141,7 @@ def write_tree(root: Path, workflows: dict[str, str], manifest: dict) -> tuple[P
 def positive_workflows() -> dict[str, str]:
     return {
         "gpu-prove.yml": PROVE_YML_GOOD,
+        "_gpu-proof-required.yml": PROOF_REQUIRED_YML_GOOD,
         "server-image.yml": _publisher_yml("build-and-push-cu12"),
         "release-binaries.yml": _publisher_yml("server-cu12-promote"),
         "pypi-server-cuda.yml": _publisher_yml("publish"),
@@ -126,12 +156,12 @@ class RunGatePositiveTest(unittest.TestCase):
             self.assertEqual(findings, [])
 
 
-class TodaysShapeFixtureTest(unittest.TestCase):
-    """Reproduces the pre-#454 tree: three publishers `uses:` a renting
-    `_gpu-prove-gate.yml` which itself invokes `runpod_gpu_prove.sh` --
-    must FAIL naming all three publisher sites."""
+class PreFixShapeFixtureTest(unittest.TestCase):
+    """Reproduces the PRE-FIX shape (esc-084's own wording): three
+    publishers `uses:` a renting `_gpu-prove-gate.yml` which itself invokes
+    `runpod_gpu_prove.sh` -- must FAIL naming all three publisher sites."""
 
-    def test_todays_shape_fails_naming_all_three_publishers(self):
+    def test_pre_fix_shape_fails_naming_all_three_publishers(self):
         gate_renting = (
             "name: _gpu-prove-gate\n\non:\n  workflow_call:\n    inputs:\n      git_ref:\n"
             "        type: string\n        required: true\n\njobs:\n  prove:\n    runs-on: ubuntu-latest\n"
@@ -380,6 +410,113 @@ class SplitTopLevelTest(unittest.TestCase):
     def test_escaped_quote_inside_string(self):
         tokens, ok = cgo.split_top_level("contains('it''s', 'x') && b")
         self.assertTrue(ok)
+
+
+class ProofRequiredConsultsVerdictTest(unittest.TestCase):
+    """BLOCK B8 audit fix: P5 -- nothing pinned that
+    `_gpu-proof-required.yml` actually CONSULTS the verdict; P3 only checks
+    the gate job's `uses:` line, so gutting the reusable to `run: echo ok`
+    left the gate green."""
+
+    def test_real_file_passes(self):
+        findings = cgo.check_p5({"_gpu-proof-required.yml": PROOF_REQUIRED_YML_GOOD})
+        self.assertEqual(findings, [])
+
+    def test_missing_reusable_fails(self):
+        findings = cgo.check_p5({})
+        self.assertTrue(any("is missing" in f for f in findings))
+
+    def test_gutted_body_fails(self):
+        gutted = (
+            "name: _gpu-proof-required\n\non:\n  workflow_call: {}\n\n"
+            "jobs:\n  proof-required:\n    runs-on: ubuntu-latest\n"
+            "    steps:\n      - run: echo ok\n"
+        )
+        findings = cgo.check_p5({"_gpu-proof-required.yml": gutted})
+        self.assertTrue(any("does not invoke" in f for f in findings))
+
+    def test_literal_tag_sha_fails(self):
+        bad = PROOF_REQUIRED_YML_GOOD.replace('--sha "$GITHUB_SHA"', "--sha v1.2.3")
+        findings = cgo.check_p5({"_gpu-proof-required.yml": bad})
+        self.assertTrue(any("not bound to" in f for f in findings), findings)
+
+    def test_literal_hex_sha_fails(self):
+        bad = PROOF_REQUIRED_YML_GOOD.replace('--sha "$GITHUB_SHA"', f"--sha {'a' * 40}")
+        findings = cgo.check_p5({"_gpu-proof-required.yml": bad})
+        self.assertTrue(any("not bound to" in f for f in findings), findings)
+
+    def test_no_sha_argument_at_all_fails(self):
+        bad = PROOF_REQUIRED_YML_GOOD.replace('--sha "$GITHUB_SHA" \\\n', "")
+        findings = cgo.check_p5({"_gpu-proof-required.yml": bad})
+        self.assertTrue(any("no --sha argument" in f for f in findings), findings)
+
+    def test_workflow_call_expression_form_passes(self):
+        good = PROOF_REQUIRED_YML_GOOD.replace('--sha "$GITHUB_SHA"', "--sha ${{ github.sha }}")
+        findings = cgo.check_p5({"_gpu-proof-required.yml": good})
+        self.assertEqual(findings, [])
+
+    def test_not_workflow_call_only_fails(self):
+        bad = PROOF_REQUIRED_YML_GOOD.replace(
+            "on:\n  workflow_call: {}\n", "on:\n  workflow_call: {}\n  workflow_dispatch:\n"
+        )
+        findings = cgo.check_p5({"_gpu-proof-required.yml": bad})
+        self.assertTrue(any("workflow_call`-only" in f for f in findings), findings)
+
+
+class YamlExtensionTest(unittest.TestCase):
+    """BLOCK B7 audit fix: GitHub Actions runs BOTH `.yml` and `.yaml`
+    workflow files -- a `*.yml`-only glob is blind to a second producer, a
+    `uses:` reference, or a resurrected renting reusable hiding under the
+    `.yaml` spelling."""
+
+    def test_yaml_second_producer_fails(self):
+        second = PROVE_YML_GOOD.replace("name: GPU prove (RunPod)", "name: second-prover")
+        with tempfile.TemporaryDirectory() as td:
+            wf_dir, manifest_path = write_tree(
+                Path(td), {**positive_workflows(), "second-prover.yaml": second}, MANIFEST_GOOD
+            )
+            findings = cgo.run_gate(wf_dir, manifest_path)
+            self.assertTrue(any("second-prover.yaml" in f for f in findings), findings)
+
+    def test_yaml_uses_of_the_prove_workflow_fails(self):
+        caller = (
+            "name: x\n\non:\n  workflow_dispatch:\n\njobs:\n  x:\n"
+            "    uses: ./.github/workflows/gpu-prove.yaml\n"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            wf_dir, manifest_path = write_tree(
+                Path(td), {**positive_workflows(), "some-caller.yml": caller}, MANIFEST_GOOD
+            )
+            findings = cgo.run_gate(wf_dir, manifest_path)
+            self.assertTrue(any("gpu-prove.yaml" in f for f in findings), findings)
+
+    def test_resurrected_yaml_gate_file_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            wf_dir, manifest_path = write_tree(
+                Path(td), {**positive_workflows(), "_gpu-prove-gate.yaml": "name: x\n"}, MANIFEST_GOOD
+            )
+            findings = cgo.run_gate(wf_dir, manifest_path)
+            self.assertTrue(any("_gpu-prove-gate.yaml" in f and "must be deleted" in f for f in findings), findings)
+
+
+class NeedsMultilineFormTest(unittest.TestCase):
+    """Advisory A7 fix: `[ \\t]*`, never `\\s*`, right after `needs:` -- the
+    multi-line `needs:` list form (key alone on its line, `- item` entries
+    below it) must PASS, not be misread as a single literal `- gate` name."""
+
+    def test_multiline_needs_list_passes(self):
+        wf = (
+            "name: publisher\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+            "  gpu-proof:\n    uses: ./.github/workflows/_gpu-proof-required.yml\n"
+            "  server-cu12-promote:\n"
+            "    needs:\n      - gpu-proof\n"
+            "    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.gpu-proof.result == 'success'\n"
+            "    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n"
+        )
+        texts = _positive_texts()
+        texts["release-binaries.yml"] = wf
+        findings = cgo.check_p3(texts, MANIFEST_GOOD)
+        self.assertEqual(findings, [])
 
 
 if __name__ == "__main__":

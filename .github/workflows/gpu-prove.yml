@@ -49,8 +49,8 @@ name: GPU prove (RunPod)
 # BUDGET, ref-type-conditional (esc-080/esc-083 derivation, kept in this ONE
 # place — never copied into a publisher's own comment): a `workflow_dispatch`
 # run ON A TAG REF gets the release budget (a dev proving the exact commit
-# about to ship deserves the same retry margin the old release-only gate
-# had): `max_attempts` 3, `timeout-minutes` 355 — derivation: 2 retried
+# about to ship deserves the full retry margin a release promotion needs):
+# `max_attempts` 3, `timeout-minutes` 355 — derivation: 2 retried
 # attempts can each cost up to a full deploy-exhaustion cycle before
 # returning 75 (worst case 8 candidates × 600s RP_SSH_WAIT_SECS = 80m) plus
 # ~5m overhead, and the FINAL attempt additionally pays the full RP_TIMEOUT
@@ -139,8 +139,8 @@ jobs:
       # Bounded retry PER ARCH on capacity (75), ref-type-conditional (see
       # this file's own header): `MAX_ATTEMPTS`/the `sleep` between attempts
       # only ever fire on a tag-ref dispatch; every other ref's loop body
-      # runs at most once, byte-identical to the pre-#454 single-attempt
-      # behavior. `echo "rc=$rc" >> "$GITHUB_OUTPUT"` runs on EVERY exit
+      # runs at most once (a single unretried attempt).
+      # `echo "rc=$rc" >> "$GITHUB_OUTPUT"` runs on EVERY exit
       # path (never only the terminal one) so the 75/76/77 annotation steps
       # below always see a real value, including a mid-retry capacity exit.
       - name: Prove GPU suites on a real ${{ matrix.arch }} device (retry on capacity, fail closed)
@@ -150,7 +150,7 @@ jobs:
           GIT_REPO: https://github.com/${{ github.repository }}.git
           GIT_REF: ${{ github.head_ref || github.ref_name }}
           GPU_PROVE_ARCH: ${{ matrix.arch }}
-          # esc-084 amendment B/M/T: the pod echoes PROVE_SHA after clone;
+          # esc-084: the pod echoes PROVE_SHA after clone; runpod_lib.sh's
           # rp_run_remote_watched compares it against this and fails 77
           # ("wrong tree") rather than letting a moved ref silently prove
           # the wrong commit. Unset on a hand run of the script (never

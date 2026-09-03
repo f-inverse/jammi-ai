@@ -8,9 +8,9 @@ name: _pypi-server
 # One reusable, two thin callers (pypi-server.yml / pypi-server-cuda.yml)
 # instead of two near-identical workflows. This reusable carries no notion of
 # GPU proof at all: the CPU caller never needed one, and the CUDA caller
-# (`pypi-server-cuda.yml`) hoists its own `gpu-proof` job directly (amendment
-# E) so all three CUDA release lanes share one identical (build, promote,
-# gate) shape.
+# (`pypi-server-cuda.yml`) hoists its own `gpu-proof` job directly so all
+# three CUDA release lanes (server image, release binaries, cu12 wheel)
+# share one identical (build, promote, gate) shape.
 #
 # The PyPI publish step deliberately lives in each CALLER, not here: PyPI
 # trusted publishing matches the OIDC token's `job_workflow_ref` (the CALLED
@@ -98,8 +98,8 @@ jobs:
       # needs the vendored CUTLASS submodule at build time (`build.rs::
       # build_flash_attn`). Scoped to this job's own checkout only, same
       # idiom as `ci.yml`'s `flash-attn-compile` job and `release-binaries.
-      # yml`'s `server-cu12` job. A no-op when `init_cutlass_submodule` is
-      # false (the CPU wheel lane never sets it).
+      # yml`'s `server-cu12-build` job. A no-op when `init_cutlass_submodule`
+      # is false (the CPU wheel lane never sets it).
       - name: Init the CUTLASS submodule (scoped to this job's checkout only)
         if: inputs.init_cutlass_submodule
         run: |

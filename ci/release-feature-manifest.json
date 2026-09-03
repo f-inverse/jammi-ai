@@ -117,7 +117,7 @@
   "lanes": {
     "cu12-tarball": {
       "_doc": "The self-contained CUDA `jammi-server` tarball (binary + bundled CUDA runtime .so's + LD_LIBRARY_PATH launcher).",
-      "workflow": ".github/workflows/release-binaries.yml:server-cu12",
+      "workflow": ".github/workflows/release-binaries.yml:server-cu12-promote",
       "package": "jammi-server",
       "cargo_features": [
         "cuda",
@@ -159,7 +159,7 @@
     },
     "cu12-wheel": {
       "_doc": "The `jammi-server-cu12` PyPI wheel, built through `_pypi-server.yml` (reusable) by `.github/workflows/pypi-server-cuda.yml`.",
-      "workflow": ".github/workflows/pypi-server-cuda.yml (via _pypi-server.yml)",
+      "workflow": ".github/workflows/pypi-server-cuda.yml:publish",
       "package": "jammi-server",
       "cargo_features": [
         "cuda",

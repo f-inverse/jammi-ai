@@ -198,10 +198,10 @@ jobs:
       actions: read
     secrets: inherit
 
-  # Build and proof-check run CONCURRENTLY (amendment P/W): the build never
-  # needed the verdict to compile, only to be UPLOADED to a release, so
-  # splitting it from the promote step below overlaps the build with
-  # `gpu-proof`'s verdict lookup/wait instead of serializing after it.
+  # Build and proof-check run CONCURRENTLY: the build never needed the
+  # verdict to compile, only to be UPLOADED to a release, so splitting it
+  # from the promote step below (`server-cu12-promote`) overlaps the build
+  # with `gpu-proof`'s verdict lookup/wait instead of serializing after it.
   server-cu12-build:
     name: Build jammi-server (CUDA)
     runs-on: ubuntu-latest
@@ -311,12 +311,12 @@ jobs:
           tar -czf "$asset" "$stage"
           echo "asset=$asset" >> "$GITHUB_OUTPUT"
 
-      # A workflow artifact, never `release-upload` directly (amendment W):
-      # this job runs on EVERY dispatch/tag push regardless of the GPU-prove
-      # verdict (it never needed the verdict to compile), so promoting the
-      # tarball straight to a release from here would bypass `gpu-proof`
-      # entirely. `server-cu12-promote` below downloads this artifact only
-      # after the verdict is confirmed.
+      # A workflow artifact, never `release-upload` directly: this job runs
+      # on EVERY dispatch/tag push regardless of the GPU-prove verdict (it
+      # never needed the verdict to compile), so promoting the tarball
+      # straight to a release from here would bypass `gpu-proof` entirely.
+      # `server-cu12-promote` below downloads this artifact only after the
+      # verdict is confirmed.
       - uses: actions/upload-artifact@v4
         with:
           name: jammi-server-cu12-tarball
@@ -326,10 +326,10 @@ jobs:
     name: Promote jammi-server (CUDA) to the release
     # build → proof → promote: uploads to the release ONLY on a `v*` tag ref
     # (push or dispatch-on-tag) whose commit's GPU-prove verdict is green.
-    # The `if:` is a PURE conjunction (no `||`) — the non-tag branch-dispatch
-    # escape hatch this job used to carry is gone: `server-cu12-build` above
-    # already exercises the CUDA packaging loop on every dispatch as an
-    # artifact-only rehearsal, and an ad-hoc branch build was never a proof
+    # The `if:` is a PURE conjunction (no `||`) — there is no non-tag
+    # branch-dispatch escape hatch here: `server-cu12-build` above already
+    # exercises the CUDA packaging loop on every dispatch as an
+    # artifact-only rehearsal, and an ad-hoc branch build is never a proof
     # of anything this job needs to promote from.
     needs: [server-cu12-build, gpu-proof]
     if: always() && startsWith(github.ref, 'refs/tags/v') && needs.server-cu12-build.result == 'success' && needs.gpu-proof.result == 'success'

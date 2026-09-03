@@ -8,9 +8,11 @@ a hand-rolled stand-in for the verdict logic itself.
 
 Covers esc-084 control (b): every degenerate record DENIES, individually;
 the positive record set PASSES and prints run/job ids per arch; the
-recency/revocation rule (amendments F/V); the wait state machine
-(amendments Q/S); pagination; and that any HTTP/JSON error DENIES (never
-vacuously passes).
+recency/revocation rule (a later red measurement revokes an earlier green,
+by `completed_at` with a run-id tiebreak); the wait state machine (green
+most-recent wins immediately even with newer in-progress runs; no
+appearance grace, per operator direction 2026-09-03); pagination; and that
+any HTTP/JSON error DENIES (never vacuously passes).
 
 Run directly: `python3 ci/scripts/test_gpu_prove_verdict.py`
 """
@@ -42,9 +44,21 @@ def job(arch: str, conclusion, completed_at, job_id: int = 1, html_url: str = "h
     }
 
 
-def run_obj(run_id: int, status: str = "completed", sha: str = SHA, path: str | None = None):
+# Advisory A5 fix: `list_runs` now requires `path` to be PRESENT and equal
+# the exact `.github/workflows/<workflow>` path, so `run_obj`'s default
+# stamps a REAL, correct path -- exactly what every production API record
+# carries -- so every pre-existing fixture keeps passing that filter
+# without having to spell it out. `path=None` explicitly (rather than
+# omitted) reproduces the "no `path` key at all" degenerate case A5 adds a
+# test for; any other string reproduces a wrong/nested path.
+_DEFAULT_PATH = object()
+
+
+def run_obj(run_id: int, status: str = "completed", sha: str = SHA, path=_DEFAULT_PATH):
     o = {"id": run_id, "status": status, "head_sha": sha}
-    if path is not None:
+    if path is _DEFAULT_PATH:
+        o["path"] = f".github/workflows/{WORKFLOW}"
+    elif path is not None:
         o["path"] = path
     return o
 
@@ -229,6 +243,26 @@ class DegenerateRecordsDenyEachOwnTest(unittest.TestCase):
         rc, _, err = _run_once(w)
         self.assertEqual(rc, 1)
 
+    def test_run_with_no_path_key_at_all_is_dropped(self):
+        # Advisory A5 fix: `"path" not in r` used to be a VACUOUS accept --
+        # a run record missing the `path` key entirely must be REFUSED, not
+        # trusted just because it also carries the right head_sha.
+        w = World()
+        w.runs = [run_obj(1, path=None)]
+        w.jobs_by_run = self._good_jobs(1)
+        rc, _, err = _run_once(w)
+        self.assertEqual(rc, 1, "a run record with no path key at all must never supply a measurement")
+
+    def test_run_with_nested_path_is_dropped(self):
+        # Advisory A5 fix: `endswith` used to accept a path like
+        # `vendor/.github/workflows/<workflow>` -- the match must be EXACT
+        # equality against `.github/workflows/<workflow>`, not a suffix.
+        w = World()
+        w.runs = [run_obj(1, path=f"vendor/.github/workflows/{WORKFLOW}")]
+        w.jobs_by_run = self._good_jobs(1)
+        rc, _, err = _run_once(w)
+        self.assertEqual(rc, 1, "a nested path must never satisfy the exact-path check via endswith")
+
     def test_latest_attempt_wins_over_an_earlier_attempt_in_same_run(self):
         # filter=latest semantics: our fake jobs endpoint only ever returns
         # the CALLER-supplied (i.e. already-latest) job list, so an arch
@@ -241,6 +275,68 @@ class DegenerateRecordsDenyEachOwnTest(unittest.TestCase):
         w.jobs_by_run = {1: [job("sm_80", "success", "2026-01-01T00:05:00Z"), job("sm_86", "success", "2026-01-01T00:05:00Z")]}
         rc, _, _ = _run_once(w)
         self.assertEqual(rc, 0)
+
+    def test_latest_attempt_fails_in_same_run_denies(self):
+        # BLOCK B6 audit fix (esc-084 control b): the DENY direction of the
+        # SAME filter=latest semantics the PASS-direction test above
+        # covers -- "the arch's latest attempt failed after an earlier
+        # attempt succeeded within the same run" MUST deny. The fake
+        # `fetch` returns a FAILED job list whenever the request URL
+        # carries `filter=latest` and a SUCCESS list otherwise -- proving
+        # the consumer never reads the (unfiltered) all-attempts view.
+        class LatestFailsFetch:
+            def __call__(self, url, token):
+                if "/jobs?" in url:
+                    if "filter=latest" in url:
+                        return {
+                            "jobs": [
+                                job("sm_80", "failure", "2026-01-01T00:05:00Z"),
+                                job("sm_86", "failure", "2026-01-01T00:05:00Z"),
+                            ]
+                        }
+                    return {
+                        "jobs": [
+                            job("sm_80", "success", "2026-01-01T00:00:00Z"),
+                            job("sm_86", "success", "2026-01-01T00:00:00Z"),
+                        ]
+                    }
+                return {"workflow_runs": [run_obj(1)]}
+
+        out, err = io.StringIO(), io.StringIO()
+        rc = gpv.run(
+            repo=REPO, sha=SHA, workflow=WORKFLOW, deadline_minutes=1.0, poll_seconds=1.0,
+            no_wait=True, fetch=LatestFailsFetch(), token="tok", arches=ARCHES,
+            sleep=lambda s: None, now=lambda: 0.0, out=out, err=err,
+        )
+        self.assertEqual(rc, 1, "the consumer must read ONLY the filter=latest view, never the all-attempts one")
+
+    def test_list_jobs_requests_filter_latest(self):
+        # BLOCK B6 audit fix: a direct assertion that `list_jobs` requests
+        # `?filter=latest` -- the fake records the URL it was actually
+        # called with, rather than inferring the semantics from behavior.
+        w = World()
+        w.runs = [run_obj(1)]
+        w.jobs_by_run = self._good_jobs(1)
+        gpv.list_jobs(w.fetch, "tok", REPO, 1)
+        jobs_urls = [u for u in w.fetch_calls if "/jobs?" in u]
+        self.assertTrue(jobs_urls, "list_jobs made no /jobs? request at all")
+        self.assertTrue(
+            all("filter=latest" in u for u in jobs_urls),
+            f"list_jobs must request filter=latest on every page; got {jobs_urls}",
+        )
+
+    def test_zero_required_arches_denies_never_vacuous(self):
+        # Advisory A6 fix: `evaluate(by_arch, [])` used to return `ok=True`
+        # (`not [] and not {}` is vacuously True) -- a caller with zero
+        # required arches asked a malformed question and must be denied,
+        # never silently treated as "everything proven".
+        with self.assertRaises(gpv.VerdictError):
+            gpv.evaluate({}, [])
+        w = World()
+        w.runs = [run_obj(1)]
+        w.jobs_by_run = self._good_jobs(1)
+        rc, _, err = _run_once(w, arches=[])
+        self.assertEqual(rc, 1)
 
     def test_no_runs_at_all(self):
         w = World()
@@ -291,7 +387,8 @@ class PositiveCaseTest(unittest.TestCase):
 
 
 class RevocationAndRecencyTest(unittest.TestCase):
-    """Amendment F/V: recency by completed_at with a run-id tiebreak."""
+    """esc-084 control (b): recency by completed_at with a run-id tiebreak;
+    a later red measurement revokes an earlier green."""
 
     def test_later_completed_run_revokes_an_earlier_green(self):
         w = World()
@@ -342,10 +439,12 @@ class RevocationAndRecencyTest(unittest.TestCase):
 
 
 class WaitStateMachineTest(unittest.TestCase):
-    """Amendments Q/S: green most-recent wins immediately even with newer
-    in-progress runs; red-most-recent-plus-in-progress polls; no candidate
-    denies immediately (no grace); all-completed-with-a-red-leg fails fast
-    (never polls); a deadline is honored; `--no-wait` never polls."""
+    """The wait rule (operator direction 2026-09-03: no appearance grace,
+    nothing here ever starts a prove run): green most-recent wins
+    immediately even with newer in-progress runs; red-most-recent-plus-in-
+    progress polls; no candidate denies immediately (no grace); all-
+    completed-with-a-red-leg fails fast (never polls); a deadline is
+    honored; `--no-wait` never polls."""
 
     def test_green_most_recent_passes_immediately_even_with_a_newer_in_progress_run(self):
         w = World()

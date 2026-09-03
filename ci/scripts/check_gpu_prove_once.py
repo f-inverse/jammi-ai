@@ -4,12 +4,12 @@ no GPU, no PyYAML.
 
 **Guarded property**: a release commit is proven ONCE per shipped arch, and
 every CUDA release lane consumes that SAME verdict, never renting hardware
-of its own. Operator direction (2026-09-03): the prove lane itself is a
-manual dev run and must never sit in the critical path of any automated
-workflow; a publisher gates on the SUMMARY of a prove execution already on
-record for the commit it promotes.
+of its own. The prove lane itself is a manual dev run, never in the
+critical path of any automated workflow -- see `gpu-prove.yml`'s own header
+for the canonical statement of why; a publisher gates on the SUMMARY of a
+prove execution already on record for the commit it promotes.
 
-Four positive-and-negative rules (F7, ask-6 — every rule has a fixture that
+Five positive-and-negative rules (F7, ask-6 — every rule has a fixture that
 must PASS as well as fixtures that must FAIL, never a grep for one known-bad
 string):
 
@@ -31,7 +31,7 @@ string):
      job, gate job); the gate job `uses: ./.github/workflows/
      _gpu-proof-required.yml`; the promoting job's `needs:` lists the gate
      job; and the promoting job's `if:` is a PURE top-level conjunction
-     (amendment O/X: parenthesis- and quote-aware, never a substring check)
+     (parenthesis- and quote-aware structural scan, never a substring check)
      containing the exact conjunct `needs.<gate>.result == 'success'` and NO
      depth-0 `||` anywhere. A table row naming a lane the manifest no longer
      declares, a lane with no row, or a missing workflow file are each a
@@ -44,11 +44,28 @@ string):
      workflow's own matrix `arch:` list — never a hand-typed list on either
      side.
 
+  P5 (the reusable actually consults the verdict, BLOCK B8 audit fix): P3
+     only checks a gate job's `uses:` line, so gutting
+     `_gpu-proof-required.yml` to `run: echo ok` would otherwise leave P1-P4
+     green with no real promotion gate behind it. `_gpu-proof-required.yml`
+     must exist, its `on:` block must be `workflow_call`-only, and its
+     comment-stripped step body must invoke `python3 ci/scripts/
+     gpu_prove_verdict.py` with `--sha` bound to the commit being promoted
+     (`github.sha`/`$GITHUB_SHA`) — a literal sha or a tag name FAILS.
+
 Mechanism: comment-stripped line scan plus a minimal indentation-based
 `jobs:` block splitter (no PyYAML, this repo's own gate convention). Every
 check function takes an explicit `workflows_dir`/`manifest_path` so
 `test_check_gpu_prove_once.py` can drive them against synthetic fixture
-trees, including a fixture reproducing TODAY's (pre-fix) shape.
+trees, including a fixture reproducing the PRE-FIX shape (esc-084: three
+publishers `uses:` a renting reusable).
+
+Disclosed limit (advisory A8): `LANE_TABLE` is a hand-REVIEWED table, not
+derived from the workflow tree — P3 reconciles it against the manifest's
+own CUDA lane set both ways, but a brand-NEW promoting job added inside an
+EXISTING lane's workflow (rather than replacing the lane's one reviewed
+row) is invisible to P3 unless `LANE_TABLE` is updated by hand alongside
+it. This gate is a reviewed cross-check, not a discovery mechanism.
 
 Run: `python3 ci/scripts/check_gpu_prove_once.py`
 Self-test: `python3 ci/scripts/test_check_gpu_prove_once.py`
@@ -96,9 +113,38 @@ def drop_comment_lines(text: str) -> str:
 
 
 def load_workflow_texts(workflows_dir: Path) -> dict[str, str]:
+    # BLOCK B7 audit fix: GitHub Actions runs BOTH `.yml` and `.yaml`
+    # workflow files -- a `*.yml`-only glob is blind to a second producer, a
+    # renting reusable, or a `uses:` reference hiding under the `.yaml`
+    # spelling. Glob both, deduplicated, sorted for deterministic iteration
+    # (the same discipline `check_execution_surface_reachability.py`
+    # already applies to its own workflow scan).
     if not workflows_dir.is_dir():
         return {}
-    return {p.name: p.read_text(encoding="utf-8") for p in sorted(workflows_dir.glob("*.yml"))}
+    paths = sorted(set(workflows_dir.glob("*.yml")) | set(workflows_dir.glob("*.yaml")))
+    return {p.name: p.read_text(encoding="utf-8") for p in paths}
+
+
+def _workflow_name_variants(name: str) -> list[str]:
+    """GitHub treats `.yml` and `.yaml` as the same workflow-file family;
+    `LANE_TABLE` and `GATE_WORKFLOW` are hand-maintained with a canonical
+    `.yml` spelling, so a lookup against the actually-discovered
+    `workflow_texts` (BLOCK B7) must try both spellings rather than assume
+    the file on disk matches the constant's own extension literally."""
+    if name.endswith(".yml"):
+        return [name, name[: -len(".yml")] + ".yaml"]
+    if name.endswith(".yaml"):
+        return [name, name[: -len(".yaml")] + ".yml"]
+    return [name]
+
+
+def resolve_workflow(workflow_texts: dict[str, str], name: str) -> str | None:
+    """The discovered key in `workflow_texts` matching `name` under either
+    the `.yml` or `.yaml` spelling, or `None` if neither is present."""
+    for variant in _workflow_name_variants(name):
+        if variant in workflow_texts:
+            return variant
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -136,8 +182,8 @@ def split_top_level_jobs(text: str) -> dict[str, tuple[int, int]]:
 
 
 # --------------------------------------------------------------------------- #
-# `if:` expression reconstitution + top-level conjunction scanner
-# (amendment O/X).
+# `if:` expression reconstitution + top-level conjunction scanner (P3's
+# structural, parenthesis- and quote-aware rule -- never a substring check).
 # --------------------------------------------------------------------------- #
 _IF_KEY_RE = re.compile(r"^    if:(.*)$")
 _BLOCK_SCALAR_HEADS = {">", ">-", "|", "|-"}
@@ -276,11 +322,11 @@ def check_promoting_if(expr: str, gate_job: str) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
-# on: block reader (amendment Y).
+# on: block reader (P1's fail-loud-on-unreadable rule).
 # --------------------------------------------------------------------------- #
 def read_top_level_on_block(text: str) -> tuple[list[str] | None, str | None]:
     """(trigger_keys, error). A quoted `"on":`/`'on':` or flow-style
-    `on: {...}` is a "cannot read" FAIL, never a silent pass (amendment Y).
+    `on: {...}` is a "cannot read" FAIL, never a silent pass.
     """
     lines = text.splitlines()
     for i, line in enumerate(lines):
@@ -346,34 +392,45 @@ def check_p1_p2(workflow_texts: dict[str, str]) -> list[str]:
             bad_triggers = [k for k in (keys or []) if k in ("push", "workflow_call")]
             if bad_triggers:
                 findings.append(
-                    f"P1: {PROVE_PRODUCER_WORKFLOW}'s on: block carries {bad_triggers} -- the prove lane "
-                    "must never auto-start on a push or be `uses:`-callable (operator direction: never in "
-                    "the critical path of an automated workflow)"
+                    f"P1: {PROVE_PRODUCER_WORKFLOW}'s on: block carries {bad_triggers} -- the RULE this "
+                    f"gate holds {PROVE_PRODUCER_WORKFLOW} to: the prove workflow carries no push:/"
+                    "workflow_call: trigger and no workflow uses: it"
                 )
 
+    # BLOCK B7 audit fix: a `uses:` (or a bare GATE_WORKFLOW reference) can
+    # name either the `.yml` or the `.yaml` spelling of the target file --
+    # both must be caught, never just the constant's own literal extension.
+    prove_producer_variants = set(_workflow_name_variants(PROVE_PRODUCER_WORKFLOW))
+    gate_workflow_variants = _workflow_name_variants(GATE_WORKFLOW)
+
     for name, text in workflow_texts.items():
-        if name == PROVE_PRODUCER_WORKFLOW:
+        if name in prove_producer_variants:
             continue
         stripped = drop_comment_lines(text)
         for m in _USES_LOCAL_RE.finditer(stripped):
-            if m.group(1) == PROVE_PRODUCER_WORKFLOW:
-                findings.append(f"P1: {name} `uses:` {PROVE_PRODUCER_WORKFLOW} -- nothing may call the prove lane")
+            if m.group(1) in prove_producer_variants:
+                findings.append(f"P1: {name} `uses:` {m.group(1)} -- nothing may call the prove lane")
         for m in _USES_CROSS_REPO_RE.finditer(stripped):
-            if m.group(1) == PROVE_PRODUCER_WORKFLOW:
+            if m.group(1) in prove_producer_variants:
                 findings.append(
-                    f"P1: {name} `uses:` a cross-repo reference to {PROVE_PRODUCER_WORKFLOW} -- "
+                    f"P1: {name} `uses:` a cross-repo reference to {m.group(1)} -- "
                     "nothing may call the prove lane"
                 )
-        if GATE_WORKFLOW in stripped:
-            findings.append(f"P2: {name} references the deleted renting reusable {GATE_WORKFLOW}")
+        for gate_variant in gate_workflow_variants:
+            if gate_variant in stripped:
+                findings.append(f"P2: {name} references the deleted renting reusable {gate_variant}")
 
     return findings
 
 
 def check_gate_file_absent(workflows_dir: Path) -> list[str]:
-    if (workflows_dir / GATE_WORKFLOW).exists():
-        return [f"P2: {GATE_WORKFLOW} still exists -- the renting reusable must be deleted, not merely unused"]
-    return []
+    # BLOCK B7 audit fix: check both spellings -- a resurrected
+    # `_gpu-prove-gate.yaml` is exactly as real to GitHub as the `.yml` form.
+    findings: list[str] = []
+    for variant in _workflow_name_variants(GATE_WORKFLOW):
+        if (workflows_dir / variant).exists():
+            findings.append(f"P2: {variant} still exists -- the renting reusable must be deleted, not merely unused")
+    return findings
 
 
 # --------------------------------------------------------------------------- #
@@ -399,7 +456,11 @@ def check_p3(workflow_texts: dict[str, str], manifest: dict) -> list[str]:
 
     for lane in sorted(table_lanes & manifest_lanes):
         workflow, promoting_job, gate_job = LANE_TABLE[lane]
-        text = workflow_texts.get(workflow)
+        # BLOCK B7 audit fix: LANE_TABLE's workflow name is a canonical
+        # `.yml` literal; resolve either spelling against what was actually
+        # discovered on disk.
+        resolved_name = resolve_workflow(workflow_texts, workflow)
+        text = workflow_texts.get(resolved_name) if resolved_name is not None else None
         if text is None:
             findings.append(f"P3: lane `{lane}`: workflow file {workflow} is missing")
             continue
@@ -423,7 +484,14 @@ def check_p3(workflow_texts: dict[str, str], manifest: dict) -> list[str]:
             continue
         promo_body = drop_comment_lines("\n".join(lines[promo_range[0] : promo_range[1]]))
         needs_names: list[str] = []
-        needs_m = re.search(r"^\s*needs:\s*(.*)$", promo_body, re.MULTILINE)
+        # Advisory A7 fix: `[ \t]*`, never `\s*`, right after `needs:` --
+        # `\s` matches `\n` too, so `\s*` would swallow the newline AND the
+        # next line's leading whitespace when `needs:` carries no inline
+        # value, landing the cursor on the multi-line list's FIRST `- item`
+        # and letting `(.*)$` capture `- gpu-proof` as a bogus single
+        # literal "needs name" (dash and all) instead of falling through to
+        # the multi-line-list branch below.
+        needs_m = re.search(r"^[ \t]*needs:[ \t]*(.*)$", promo_body, re.MULTILINE)
         if needs_m and needs_m.group(1).strip():
             rest = needs_m.group(1).strip()
             if rest.startswith("["):
@@ -494,6 +562,75 @@ def check_p4(workflow_texts: dict[str, str], shipped_arches: set[str]) -> list[s
 
 
 # --------------------------------------------------------------------------- #
+# P5 (BLOCK B8 audit fix): the reusable actually CONSULTS the verdict.
+# --------------------------------------------------------------------------- #
+_SHA_ARG_RE = re.compile(r'--sha\s+(?:"(?P<q>[^"]*)"|(?P<u>\$\{\{[^}]*\}\}|\S+))')
+
+
+def _sha_arg_is_commit_bound(value: str) -> bool:
+    """`True` only for the two shapes that key the verdict by the exact
+    commit a caller promotes: the bash env var `$GITHUB_SHA`, or the GitHub
+    expression `${{ github.sha }}` (any internal whitespace). A literal sha
+    or a tag name (`v1.2.3`, `${{ github.ref_name }}`, ...) is REFUSED --
+    proof surface == shipped surface (esc-081/esc-084) means the verdict
+    lookup itself must be bound to the identity being promoted, never a
+    sibling ref."""
+    value = value.strip()
+    if value == "$GITHUB_SHA":
+        return True
+    if value.startswith("${{") and value.endswith("}}"):
+        return value[3:-2].strip() == "github.sha"
+    return False
+
+
+def check_p5(workflow_texts: dict[str, str]) -> list[str]:
+    """P3 only checks a gate job's `uses:` line -- gutting
+    `_gpu-proof-required.yml` to `run: echo ok` would leave P1-P4 green
+    while no promotion is actually conditioned on a real verdict lookup.
+    P5 asserts the reusable ITSELF: it must exist, its `on:` block must be
+    `workflow_call`-only (the same never-independently-starts doctrine P1
+    holds the producer to), and its comment-stripped step body must invoke
+    `python3 ci/scripts/gpu_prove_verdict.py` with `--sha` bound to the
+    commit being promoted (`github.sha`/`$GITHUB_SHA`) -- never a literal
+    sha or a tag name."""
+    findings: list[str] = []
+    resolved = resolve_workflow(workflow_texts, PROOF_REQUIRED_WORKFLOW)
+    if resolved is None:
+        return [f"P5: {PROOF_REQUIRED_WORKFLOW} is missing from the workflow tree"]
+    text = workflow_texts[resolved]
+    stripped = drop_comment_lines(text)
+
+    keys, err = read_top_level_on_block(text)
+    if err is not None:
+        findings.append(f"P5: {resolved}: {err}")
+    elif keys != ["workflow_call"]:
+        findings.append(
+            f"P5: {resolved}'s on: block must be `workflow_call`-only (found {keys}) -- the reusable "
+            "must never independently start anything"
+        )
+
+    if "python3 ci/scripts/gpu_prove_verdict.py" not in stripped:
+        findings.append(f"P5: {resolved} does not invoke python3 ci/scripts/gpu_prove_verdict.py at all")
+        return findings
+
+    # A `run: |` block scalar's own shell continuations (`\` + newline) are
+    # joined into one line before the `--sha` argument is located -- the
+    # real file spreads its argv across several continuation lines.
+    joined = re.sub(r"\\\s*\n", " ", stripped)
+    sha_m = _SHA_ARG_RE.search(joined)
+    if sha_m is None:
+        findings.append(f"P5: {resolved} invokes gpu_prove_verdict.py with no --sha argument at all")
+    else:
+        raw = sha_m.group("q") if sha_m.group("q") is not None else sha_m.group("u")
+        if not _sha_arg_is_commit_bound(raw):
+            findings.append(
+                f"P5: {resolved}'s --sha argument is `{raw}`, not bound to `github.sha`/`$GITHUB_SHA` -- "
+                "a literal sha or a tag name would key the verdict by the wrong identity"
+            )
+    return findings
+
+
+# --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
 def run_gate(
@@ -509,6 +646,7 @@ def run_gate(
     findings += check_gate_file_absent(workflows_dir)
     findings += check_p3(workflow_texts, manifest)
     findings += check_p4(workflow_texts, gpu_parity_matrix.load_shipped_cuda_silicon())
+    findings += check_p5(workflow_texts)
     return findings
 
 
@@ -520,7 +658,8 @@ def main() -> int:
             print(f"  - {f}", file=sys.stderr)
         return 1
     print("gpu-prove-once: OK -- exactly one prove producer, no renting reusable, every CUDA lane's "
-          "promotion gates on the shared verdict, consumer/producer names agree.")
+          "promotion gates on the shared verdict, consumer/producer names agree, and the reusable "
+          "actually consults the verdict keyed by the promoted commit.")
     return 0
 
 

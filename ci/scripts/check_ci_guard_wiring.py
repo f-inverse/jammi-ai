@@ -3,10 +3,11 @@
 wired into some workflow.
 
 A `check_*.py` / `check_*.sh` gate script that compiles and passes locally but
-is never invoked from any `.github/workflows/*.yml` is dead weight that looks
-like coverage but enforces nothing — the author wrote the gate, and stopped one
-step short of making CI run it. This check is the completeness tripwire for
-that class: it is deliberately mechanical (a name-appears-in-workflow-text
+is never invoked from any `.github/workflows/*.yml` or `*.yaml` file is dead
+weight that looks like coverage but enforces nothing — the author wrote the
+gate, and stopped one step short of making CI run it. This check is the
+completeness tripwire for that class: it is deliberately mechanical (a
+name-appears-in-workflow-text
 scan), not a semantic understanding of what each gate does, because the
 property being enforced is purely "is this script's name mentioned by some
 workflow file" — anything richer would be checking a different thing.
@@ -268,8 +269,15 @@ def workflow_run_text() -> str:
     reproduction: a script named ONLY in a `#` comment must not count as
     wired.
     """
+    # BLOCK B7 audit fix (same class as check_gpu_prove_once.py's own):
+    # GitHub Actions runs BOTH `.yml` and `.yaml` workflow files -- a
+    # `*.yml`-only glob is structurally blind to a script wired ONLY from a
+    # `.yaml` workflow, exactly the F6 "invisible to the glob" class this
+    # module's own doc already warns about for a different dimension
+    # (directory depth). Glob both, deduplicated, sorted.
     lines: list[str] = []
-    for path in sorted(WORKFLOWS_DIR.glob("*.yml")):
+    workflow_paths = sorted(set(WORKFLOWS_DIR.glob("*.yml")) | set(WORKFLOWS_DIR.glob("*.yaml")))
+    for path in workflow_paths:
         for line in path.read_text().splitlines():
             if line.strip().startswith("#"):
                 continue
@@ -366,7 +374,7 @@ def main() -> int:
         for script in unwired:
             print(
                 f"  - {script.relative_to(REPO_ROOT)} is not referenced by any "
-                ".github/workflows/*.yml file's run:/cmd: step body (comments do not count) — "
+                ".github/workflows/*.yml or *.yaml file's run:/cmd: step body (comments do not count) — "
                 f"wire it into a job, delete it, or add it to {ALLOWLIST_PATH.relative_to(REPO_ROOT)} "
                 "with a reason.",
                 file=sys.stderr,

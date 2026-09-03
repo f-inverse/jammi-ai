@@ -25,9 +25,11 @@
 # `schedule` — deliberately no `push:`/`workflow_call:` trigger and no
 # workflow may `uses:` it, `check_gpu_prove_once.py`'s P1 rule pins this by
 # name). Every CUDA release lane (`server-image.yml`, `release-binaries.yml`,
-# `pypi-server-cuda.yml` via `_pypi-server.yml`) instead consumes that
-# commit's already-recorded verdict through `_gpu-proof-required.yml` —
-# a hermetic API read, never a second invocation of this driver script.
+# `pypi-server-cuda.yml` — the last calls `_gpu-proof-required.yml` DIRECTLY;
+# `_pypi-server.yml` carries no gate at all, only the build/package steps)
+# instead consumes that commit's already-recorded verdict through
+# `_gpu-proof-required.yml` — a hermetic API read, never a second invocation
+# of this driver script.
 # NOT merge-path: `gpu-prove.yml`'s own triggers are label/dispatch/
 # schedule-only, and it is never `push:`-triggered by a tag either (a dev
 # dispatches it by hand before tagging). The residual survives via that

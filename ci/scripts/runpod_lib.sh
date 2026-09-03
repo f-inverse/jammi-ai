@@ -1541,11 +1541,14 @@ rp_parse_prove_marker() {
   return 1
 }
 
-# ONE grammar for the `PROVE_SHA=<sha>` marker (esc-084/#454, amendment T) --
-# mirrors `ci/scripts/prove_surface.py`'s `PROVE_SHA_RE` exactly, the same
-# discipline `rp_parse_prove_marker` above already established for
-# `PROVE_GROUP_RC`. `test_gpu_prove_lane.sh`'s cross-parser fixture feeds
-# both parsers the identical set of inputs and asserts identical (sha) or
+# ONE grammar, hand-mirrored across languages (esc-084/#454) -- bash cannot
+# `import` `ci/scripts/prove_surface.py`'s `PROVE_SHA_RE`, so
+# this function's `[0-9a-f]+`-after-`PROVE_SHA=`, first-match-only, no-
+# anchors shape is a BY-HAND copy of it, the same discipline
+# `rp_parse_prove_marker` above already established for `PROVE_GROUP_RC`.
+# `test_gpu_prove_lane.sh`'s `xp_sha_div_check` cross-parser fixture is what
+# actually pins the two mirrored grammars to agreement: it feeds both
+# parsers the identical set of inputs and asserts identical (sha) or
 # identical NOMATCH.
 rp_parse_prove_sha() {
   unset RP_PARSED_PROVE_SHA
@@ -1580,8 +1583,9 @@ rp_run_remote_watched() {
   local pid=$!
   local printed=0 last_growth=$SECONDS last_group="" parse_carry=""
   local group_names=() group_rcs_assoc_keys=() group_rcs_assoc_vals=()
-  # esc-084/#454 amendment M/T: when PROVE_EXPECT_SHA is set (a workflow
-  # run, never a hand run), a disagreeing (or absent) PROVE_SHA marker is a
+  # esc-084/#454: when PROVE_EXPECT_SHA is set (a workflow
+  # run, never a hand run), a disagreeing PROVE_SHA marker, or (when the
+  # session's own rc is 0) an absent one, is a
   # wrong-tree failure -- the ref moved between run creation and clone, or
   # a tag was moved. `wrong_tree`/`wrong_tree_got` are set by
   # `_rrw_scan_new_text` below (a closure over these, same as
@@ -1688,7 +1692,7 @@ rp_run_remote_watched() {
     fi
   }
 
-  # Shared diagnostic (esc-084/#454 amendment T) -- STDERR, like the 76/124
+  # Shared diagnostic (esc-084/#454) -- STDERR, like the 76/124
   # arms, so it reaches the job log regardless of which terminal arm fires
   # it. `$1` is the observed sha, or empty for the absence case.
   _rrw_wrong_tree_diag() {
@@ -1704,7 +1708,7 @@ rp_run_remote_watched() {
       _rrw_scan_new_text "$_RRW_CHUNK"
       printed=$size
       last_growth=$SECONDS
-      # Wrong-tree kill (amendment T): checked EVERY tick right after a scan
+      # Wrong-tree kill (esc-084/#454): checked EVERY tick right after a scan
       # sees new bytes, so a disagreeing PROVE_SHA= line is caught within
       # ONE poll tick of arriving -- never deferred to the inactivity arm or
       # the normal exit, which could be minutes away.
@@ -1740,9 +1744,18 @@ rp_run_remote_watched() {
   # below reads the file -- the last group's marker and `PROVE_EXIT=` line
   # can land milliseconds before ssh's own exit, inside what would otherwise
   # be the NEXT poll window. The wrong-tree check below runs AFTER this
-  # flush (amendment T: "a mismatching PROVE_SHA= landing only in the final
-  # flush" must still be caught) and WINS regardless of `$rc` or which
-  # markers landed -- identity is asserted before anything else counts.
+  # flush (esc-084/#454: "a mismatching PROVE_SHA= landing only in the final
+  # flush" must still be caught). A MISMATCH wins regardless of `$rc` or
+  # which markers landed -- a session that explicitly asserted the WRONG
+  # identity proved nothing, whatever its own exit code claims. ABSENCE is
+  # narrower (BLOCK B10 audit fix): it wins ONLY when the session's own rc
+  # is 0 (it claimed success without ever asserting identity); when rc is
+  # non-zero the absence of a `PROVE_SHA=` marker is exactly what a
+  # transport death (esc-085's own signature, rc 255) or a genuine budget
+  # cut (rc 124) looks like -- the session never got far enough to echo it
+  # -- so it falls through UNCHANGED to the existing 124/255 handling below,
+  # never relabeled as wrong-tree and never suppressing the BUDGET
+  # diagnostic.
   _rrw_flush_carry
   if [ -n "${PROVE_EXPECT_SHA:-}" ]; then
     if [ "$wrong_tree" = "1" ]; then
@@ -1750,10 +1763,10 @@ rp_run_remote_watched() {
       rm -f "$out"
       return 77
     fi
-    if [ "$prove_sha_seen" != "1" ]; then
-      # Absence is a failure, same doctrine as P1's zero-producers: identity
-      # was never asserted, so this leg proved nothing about the tree it
-      # ran on, whatever the remote's own exit code claims.
+    if [ "$prove_sha_seen" != "1" ] && [ "$rc" -eq 0 ]; then
+      # Absence-with-a-claimed-success is a failure, same doctrine as P1's
+      # zero-producers: identity was never asserted, so this leg proved
+      # nothing about the tree it ran on even though it reports success.
       _rrw_wrong_tree_diag ""
       rm -f "$out"
       return 77
@@ -1852,18 +1865,17 @@ rp_wait_poll() {
   # that has gone silent after connecting and give up within ~30s, rather
   # than waiting on channel data that may never arrive.
   #
-  # esc-085/#453: the ACTUAL rule (ssh options are first-wins, verified with
-  # `ssh -G`) is not "never folded into the shared RP_SSHO" — RP_SSHO NOW
-  # carries its own ServerAliveInterval/CountMax too (the session-liveness
-  # contract: long silent phases like a clone/build must survive a NAT idle
-  # window; the inactivity watchdog, not TCP, is what detects a genuine
-  # hang). This probe's own options are PREPENDED ahead of `"${RP_SSHO[@]}"`
-  # below, so THIS invocation's tighter 10s/3-try liveness contract still
-  # wins by ordering, regardless of what the shared array now carries — a
-  # probe wants to fail FAST on a genuinely silent connection, a different,
-  # deliberately looser contract than an interactive `attach`/`shell`
-  # session (or the prove lane's own long clone/build phases) has any
-  # business inheriting.
+  # esc-085/#453: ssh options are first-wins (verified with `ssh -G`).
+  # `RP_SSHO` (see its own doc above) carries its own, LOOSER
+  # ServerAliveInterval/CountMax (30s/6) for the session-liveness contract:
+  # long silent phases like a clone/build must survive a NAT idle window;
+  # the inactivity watchdog, not TCP, is what detects a genuine hang. This
+  # probe's own, TIGHTER options are PREPENDED ahead of `"${RP_SSHO[@]}"`
+  # below, so THIS invocation's 10s/3-try liveness contract wins by
+  # ordering regardless of what the shared array carries — a probe wants to
+  # fail FAST on a genuinely silent connection, a different, deliberately
+  # TIGHTER contract than an interactive `attach`/`shell` session (or the
+  # prove lane's own long clone/build phases) has any business inheriting.
   local -a wait_sshopts=(-oBatchMode=yes -oServerAliveInterval=10 -oServerAliveCountMax=3 "${RP_SSHO[@]}")
   # A SECOND, portable backstop UNDER the ssh-option hardening above (round-N
   # audit B1's "AND/OR" — this repo applies both): `_rp_bounded_capture`

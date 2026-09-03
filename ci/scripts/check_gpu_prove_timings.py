@@ -93,9 +93,9 @@ RUNPOD_PROVE_REL = "ci/scripts/runpod_gpu_prove.sh"
 # own cause in the leg's own suite output; `capacity` (exit 75) is a supply
 # condition, not a hang/cut; `log-incomplete` (BLOCK B) is a truncated log,
 # not a real outcome to disposition at all -- it needs a fresh run, not a
-# reviewed explanation. `wrong-tree` (esc-084/#454 amendment N/U) is
-# likewise a DETERMINED cause -- the ref moved under the clone, or a tag was
-# moved -- self-explaining exactly like `capacity`, never dispositioned.
+# reviewed explanation. `wrong-tree` (esc-084/#454) is likewise a DETERMINED
+# cause -- the ref moved under the clone, or a tag was moved -- self-
+# explaining exactly like `capacity`, never dispositioned.
 OUTCOME_VALUES = frozenset(
     {"healthy", "budget-cut", "watchdog-kill", "suite-fail", "capacity", "log-incomplete", "wrong-tree"}
 )

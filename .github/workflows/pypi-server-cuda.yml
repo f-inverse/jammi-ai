@@ -81,10 +81,10 @@ jobs:
       init_cutlass_submodule: true
     secrets: inherit
 
-  # Hoisted to THIS caller (amendment E): `_pypi-server.yml` no longer knows
-  # about GPU proof at all (its CPU caller, `pypi-server.yml`, never needed
-  # it). Runs concurrently with `server-cu12` above — it never needed the
-  # wheel build to finish first, only to be checked before `publish` below.
+  # Hoisted to THIS caller: `_pypi-server.yml` carries no notion of GPU
+  # proof at all (its CPU caller, `pypi-server.yml`, has no need of it).
+  # Runs concurrently with `server-cu12` above — it never needed the wheel
+  # build to finish first, only to be checked before `publish` below.
   gpu-proof:
     name: GPU proof required
     if: startsWith(github.ref, 'refs/tags/py-v')

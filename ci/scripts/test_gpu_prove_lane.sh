@@ -609,7 +609,7 @@ else
 fi
 
 # ============================================================================
-# esc-084/#454 wrong-tree (amendments M/T): PROVE_EXPECT_SHA identity check,
+# esc-084/#454 wrong-tree: PROVE_EXPECT_SHA identity check,
 # direct rp_run_remote_watched calls (real function, stubbed ssh -- rp_
 # cleanup's own podTerminate call on this path is proven separately by the
 # F7 "wrong-tree" scenario further below, the same way F1-F4's in-process
@@ -715,6 +715,70 @@ if [ "$rc" -eq 0 ] && ! echo "$out" | grep -q "WRONG TREE"; then
 else
   bad "wrong-tree (M/T): PROVE_EXPECT_SHA unset should never check identity; got rc=$rc out=$out"
 fi
+
+# ============================================================================
+# BLOCK B10 audit fix -- wrong-tree taxonomy: a MISMATCH is 77 regardless of
+# the remote's own rc; ABSENCE is 77 ONLY when the session's own rc is 0 (it
+# claimed success without ever asserting identity) -- otherwise it falls
+# through UNCHANGED to the existing 124/255 handling and BUDGET diagnostic,
+# never relabeling a transport death (esc-085's own signature, rc 255) or a
+# genuine budget cut (rc 124) as wrong-tree, and never suppressing BUDGET.
+# ============================================================================
+
+# ABSENCE + remote rc 255 (a transport death) -> 255 verbatim, never 77.
+ssh() {
+  cat >/dev/null
+  echo "::group::device"
+  echo "::endgroup::"
+  return 255
+}
+export -f ssh
+PROVE_EXPECT_SHA="$GOOD_SHA"
+out="$(rp_run_remote_watched "" 0.2 <<< "noop" 2>&1)"
+rc=$?
+if [ "$rc" -eq 255 ] && ! echo "$out" | grep -q "WRONG TREE"; then
+  ok "wrong-tree (B10): absence + remote rc 255 -> 255 verbatim, never relabeled 77"
+else
+  bad "wrong-tree (B10): expected 255 with no WRONG TREE diagnostic; got rc=$rc out=$out"
+fi
+unset PROVE_EXPECT_SHA
+
+# ABSENCE + rc 124 with no PROVE_EXIT (a genuine budget cut) -> 124, AND the
+# BUDGET diagnostic still fires -- never suppressed by the identity check.
+ssh() {
+  cat >/dev/null
+  echo "::group::kernels-cuda"
+  echo "PROVE_GROUP_RC name=kernels-default rc=0"
+  return 124
+}
+export -f ssh
+PROVE_EXPECT_SHA="$GOOD_SHA"
+out="$(rp_run_remote_watched "" 0.2 <<< "noop" 2>&1)"
+rc=$?
+if [ "$rc" -eq 124 ] && echo "$out" | grep -q 'BUDGET' && ! echo "$out" | grep -q "WRONG TREE"; then
+  ok "wrong-tree (B10): absence + rc 124 with no PROVE_EXIT -> 124 AND the BUDGET diagnostic still fires"
+else
+  bad "wrong-tree (B10): expected 124 + BUDGET, no WRONG TREE; got rc=$rc out=$out"
+fi
+unset PROVE_EXPECT_SHA
+
+# MISMATCH + rc 255 -> still 77 (a mismatch wins regardless of the remote's
+# own rc, even a transport-death-shaped one).
+ssh() {
+  cat >/dev/null
+  echo "PROVE_SHA=${BAD_SHA}"
+  return 255
+}
+export -f ssh
+PROVE_EXPECT_SHA="$GOOD_SHA"
+out="$(rp_run_remote_watched "" 0.2 <<< "noop" 2>&1)"
+rc=$?
+if [ "$rc" -eq 77 ] && echo "$out" | grep -q "WRONG TREE expected=${GOOD_SHA} got=${BAD_SHA}"; then
+  ok "wrong-tree (B10): mismatch + rc 255 -> still 77 (mismatch wins regardless of rc)"
+else
+  bad "wrong-tree (B10): expected 77 despite rc 255; got rc=$rc out=$out"
+fi
+unset PROVE_EXPECT_SHA
 
 # ============================================================================
 # BLOCK 3 audit fix -- cross-parser fixture: the SAME unterminated-final-
@@ -832,6 +896,56 @@ xp_div_check "CRLF"                        $'PROVE_GROUP_RC name=x rc=0\r'
 xp_div_check "leading junk"                "some prefix junk PROVE_GROUP_RC name=x rc=0"
 xp_div_check "trailing junk"               "PROVE_GROUP_RC name=x rc=0 trailing junk here"
 
+# --------------------------------------------------------------------------
+# BLOCK 2 audit fix (esc-082 class: comment vs mechanism) -- the cross-
+# parser fixture `prove_surface.py`/`runpod_lib.sh`'s own comments PROMISE
+# for `PROVE_SHA`, mirroring the `xp_div_check` discipline immediately
+# above: `rp_parse_prove_sha` (bash) and `prove_surface.PROVE_SHA_RE`
+# (python) fed the identical input, asserting identical sha or identical
+# NOMATCH. Makes the comments true BY MECHANISM, never by softened wording.
+# --------------------------------------------------------------------------
+xp_sha_div_python() {
+  python3 -c "
+import sys
+sys.path.insert(0, 'ci/scripts')
+import prove_surface
+m = prove_surface.PROVE_SHA_RE.search('''$1''')
+print(m.group('sha') if m else 'NOMATCH')
+"
+}
+xp_sha_div_bash() {
+  if rp_parse_prove_sha "$1"; then
+    echo "${RP_PARSED_PROVE_SHA}"
+  else
+    echo "NOMATCH"
+  fi
+}
+xp_sha_div_check() {
+  local label="$1" input="$2"
+  local b p
+  b="$(xp_sha_div_bash "$input")"
+  p="$(xp_sha_div_python "$input")"
+  if [ "$b" = "$p" ]; then
+    ok "cross-parser PROVE_SHA divergent input ($label): bash and python agree (${b:-NOMATCH})"
+  else
+    bad "cross-parser PROVE_SHA divergent input ($label): bash='$b' python='$p' -- grammars disagree on input: $input"
+  fi
+}
+XP_SHA40_LOWER="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+XP_SHA40_UPPER="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+xp_sha_div_check "valid 40-hex sha"            "PROVE_SHA=${XP_SHA40_LOWER}"
+xp_sha_div_check "uppercase hex"               "PROVE_SHA=${XP_SHA40_UPPER}"
+xp_sha_div_check "mixed case"                  "PROVE_SHA=aAbBcC0123456789"
+xp_sha_div_check "empty value"                 "PROVE_SHA="
+xp_sha_div_check "non-hex"                     "PROVE_SHA=zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+xp_sha_div_check "leading junk"                "some prefix junk PROVE_SHA=${XP_SHA40_LOWER}"
+xp_sha_div_check "trailing junk"               "PROVE_SHA=${XP_SHA40_LOWER} trailing junk here"
+xp_sha_div_check "two markers on one line"     "PROVE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa PROVE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+xp_sha_div_check "CRLF"                        $'PROVE_SHA='"${XP_SHA40_LOWER}"$'\r'
+xp_sha_div_check "g-suffixed truncation"       "PROVE_SHA=abc123g"
+xp_sha_div_check "PROVE_SHA= abc (space)"      "PROVE_SHA= abc"
+xp_sha_div_check "no marker at all"            "nothing to see here"
+
 # ============================================================================
 # PROVE_EXIT disagreeing with its own markers -> FAIL (never trusted blindly).
 # ============================================================================
@@ -917,7 +1031,7 @@ case "$last" in
         exec sleep 30
         ;;
       wrong-tree)
-        # esc-084/#454 amendment M/T: a mismatching PROVE_SHA, then hangs --
+        # esc-084/#454: a mismatching PROVE_SHA, then hangs --
         # the growth-tick kill path must fire (77) well before RP_INACTIVITY.
         echo "PROVE_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
         echo "::group::capability-surface-build"
@@ -1052,7 +1166,7 @@ f7_assert_keepalive_argv "$SANDBOX/f7-sshargv-session-bench-cut" "bench-cut scen
 f7_assert_keepalive_argv "$SANDBOX/f7-sshargv-probe-bench-cut" "bench-cut scenario, true reachability probe"
 
 # ============================================================================
-# esc-084/#454 wrong-tree (amendments M/T), F7-style subprocess execution:
+# esc-084/#454 wrong-tree, F7-style subprocess execution:
 # proves rp_cleanup's own podTerminate call fires on the 77 path too, the
 # same real-executed-exit-path proof F7's watchdog/bench-cut scenarios give
 # 76/0 above. PROVE_EXPECT_SHA is set to a DIFFERENT sha than the stub's own

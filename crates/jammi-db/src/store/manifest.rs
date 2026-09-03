@@ -1182,16 +1182,35 @@ mod tests {
     /// may just update the literal to match a new computed value; that would
     /// silently rubber-stamp a migration. A migration is a new
     /// `MANIFEST_VERSION` and a fresh golden recomputed at the NEW base.
+    ///
+    /// `cpu_env()` stamps `engine_version` from `CARGO_PKG_VERSION` (see
+    /// `MaterializationEnv::new`), and `engine_version` is a hash input BY
+    /// DESIGN — `different_engine_version_changes_the_hash` below pins
+    /// exactly that sensitivity. The golden literal was therefore computed
+    /// against whatever `CARGO_PKG_VERSION` was at base commit `309d1a10`,
+    /// which was `0.48.0` (`git show 309d1a10:Cargo.toml | grep -m1
+    /// '^version'`) — NOT against "whatever version this crate happens to
+    /// build as today". Left as `cpu_env()` hands it back, this test would
+    /// red on every single-crate-untouched lockstep version bump (e.g. the
+    /// 0.48.0 -> 0.49.0 release bump), which is not the migration this golden
+    /// exists to catch. So this test — and ONLY this test, never `cpu_env()`
+    /// itself, which other tests rely on for the CURRENT engine version —
+    /// overrides `engine_version` back to the `309d1a10` value before
+    /// hashing, pinning the golden against version drift while still
+    /// exercising the real `definition_hash` end-to-end and still leaving the
+    /// literal itself immovable.
     #[test]
     fn definition_hash_golden_is_preserved_across_the_quantization_fold() {
         let d = embedding_descriptor();
-        let env = cpu_env();
+        let mut env = cpu_env();
+        env.engine_version = "0.48.0".into();
         let hash = definition_hash(&d, &env).unwrap();
         assert_eq!(
             hash.as_str(),
             "bb0bb2f37aa2dcde1a2244d6e37f6ca9e8e73c04961c5009164eef72b426ecaa",
-            "definition_hash for the embedding_descriptor()/cpu_env() fixture drifted from \
-             the golden value computed at base commit 309d1a10 — the \
+            "definition_hash for the embedding_descriptor()/cpu_env() fixture (pinned to \
+             engine_version 0.48.0, the CARGO_PKG_VERSION at base commit 309d1a10) drifted from \
+             the golden value computed at that base commit — the \
              `quantization: None` fold must be byte-identical to the pre-feature shape, \
              not a silent migration"
         );

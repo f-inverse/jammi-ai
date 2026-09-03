@@ -6,6 +6,8 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## [0.49.1] - 2026-09-03
+
 ### Changed
 - **A release commit is proven once, and every CUDA release lane shares that verdict (#454, esc-084).**
   `gpu-prove.yml` is the single prove producer — off the merge path, never in the critical path of an

@@ -7021,9 +7021,38 @@ fn lora_linear_parity_bf16_bias_base_production_width() {
 /// both backends"): unlike the CPU<->CUDA legs above (which compare TWO
 /// DIFFERENT devices' rounding, hence the derived tolerance), this
 /// compares the fused kernel against a hand-built eager composition on
-/// the IDENTICAL device — no cross-device rounding-order question at all,
-/// so this genuinely is `assert_eq!`, on a REALISTIC (non-integer)
-/// fixture.
+/// the IDENTICAL device — no cross-device rounding-order question at all.
+///
+/// Uses [`exact_fixture`], NOT the realistic [`fixture`] — "same device"
+/// alone does not license a `tol == 0` claim here. This file's own bit-
+/// exactness contract (module doc above, roughly `:20-60`; see also
+/// [`exact_fixture`]'s doc) is that a `tol == 0` claim requires every
+/// partial sum on EVERY compared path to be a small exact integer, so
+/// that the sum is identical regardless of summation order. That
+/// requirement is about the GEMM's OPERAND FORM, not about which device
+/// runs it: `pack_ab_with_bias` packs `a`/`b` into the fused op's `ab`
+/// operand as row-packed `A^T [in, r]` / `B [out, r]` slices — an N-form
+/// GEMM operand `LowRankResidualLinear`'s CUDA kernel consumes directly —
+/// while the eager reference below instead calls `x32.matmul(&a.t())` /
+/// `.matmul(&b.t())`, a T-form TRANSPOSED VIEW of `a`/`b`'s original
+/// `[r, inf]` / `[outf, r]` storage. cuBLAS picks a different
+/// kernel/tiling (and therefore a different f32 accumulation order) for
+/// those two operand forms even on one identical device, so a REALISTIC
+/// (non-integer) fixture's rounding can and did diverge between the two
+/// arms here — the A100 landing run for this leg and its `F16` twin
+/// failed their `assert_eq!` deep in the output on exactly that fixture
+/// (esc-044's "correct but different order" lesson, applied to a same-
+/// device pair rather than a cross-device one). Switching to
+/// `exact_fixture` closes the gap by construction: every partial sum on
+/// BOTH operand forms is a small exact integer, and an exact-integer sum
+/// is identical regardless of which valid summation order either GEMM
+/// path picks — so the shared f32 value each arm rounds to `bf16` once is
+/// bit-identical REGARDLESS of operand form, making `tol == 0` true by
+/// construction rather than by (incorrectly) assuming operand form cannot
+/// matter same-device. What this leg pins, concretely: same-device
+/// bit-exactness of the BIAS ARM — the base GEMM, the storage-level
+/// `broadcast_add`, and the shared `ScaledCastAdd` epilogue kernel the
+/// fused op and this eager reference both dispatch to.
 #[test]
 fn lora_linear_bias_bf16_fused_matches_eager_composition_bit_exact_on_cuda() {
     let Some(cuda) = cuda_device() else {
@@ -7031,13 +7060,13 @@ fn lora_linear_bias_bf16_fused_matches_eager_composition_bit_exact_on_cuda() {
     };
     let cpu = Device::Cpu;
     let (rows, inf, outf, r) = (32usize, 256usize, 384usize, 8usize);
-    let scale = 0.5f32;
+    let scale = 0.5f32; // exact in binary.
 
-    let xv = fixture(rows * inf, 1.0);
-    let wv = fixture(outf * inf, 2.0);
-    let av = fixture(r * inf, 3.0);
-    let bv = fixture(outf * r, 4.0);
-    let bias_v = fixture(outf, 5.0);
+    let xv = exact_fixture(rows * inf, 1);
+    let wv = exact_fixture(outf * inf, 2);
+    let av = exact_fixture(r * inf, 3);
+    let bv = exact_fixture(outf * r, 4);
+    let bias_v = exact_fixture(outf, 9);
     let x_bf16: Vec<bf16> = xv.iter().map(|&v| bf16::from_f32(v)).collect();
     let w_bf16: Vec<bf16> = wv.iter().map(|&v| bf16::from_f32(v)).collect();
     let bias_bf16: Vec<bf16> = bias_v.iter().map(|&v| bf16::from_f32(v)).collect();
@@ -7149,7 +7178,19 @@ fn lora_linear_bias_bf16_fused_matches_eager_composition_bit_exact_on_cuda() {
 }
 
 /// The `F16` counterpart to
-/// `lora_linear_bias_bf16_fused_matches_eager_composition_bit_exact_on_cuda`.
+/// `lora_linear_bias_bf16_fused_matches_eager_composition_bit_exact_on_cuda`
+/// — see that test's doc for the full derivation of why this leg uses
+/// [`exact_fixture`] rather than the realistic [`fixture`]: the fused
+/// kernel's `ab` operand is `pack_ab_with_bias`'s N-form `A^T [in, r]` /
+/// `B [out, r]` slices while this test's eager reference calls
+/// `.matmul(&a.t())` / `.matmul(&b.t())` (a T-form transposed view), and
+/// cuBLAS's differing kernel/tiling choice for those two operand forms —
+/// even on one identical device — makes a realistic fixture's rounding
+/// arm-dependent (this leg's own A100 landing-run failure was the second
+/// confirmation of that gap, alongside its `bf16` twin). An exact-integer
+/// fixture makes every partial sum on both operand forms a small exact
+/// integer, so the shared f32 value both arms round to `f16` once is
+/// bit-identical regardless of operand form — `tol == 0` by construction.
 #[test]
 fn lora_linear_bias_f16_fused_matches_eager_composition_bit_exact_on_cuda() {
     let Some(cuda) = cuda_device() else {
@@ -7157,13 +7198,13 @@ fn lora_linear_bias_f16_fused_matches_eager_composition_bit_exact_on_cuda() {
     };
     let cpu = Device::Cpu;
     let (rows, inf, outf, r) = (32usize, 256usize, 384usize, 8usize);
-    let scale = 0.5f32;
+    let scale = 0.5f32; // exact in binary.
 
-    let xv = fixture(rows * inf, 1.0);
-    let wv = fixture(outf * inf, 2.0);
-    let av = fixture(r * inf, 3.0);
-    let bv = fixture(outf * r, 4.0);
-    let bias_v = fixture(outf, 5.0);
+    let xv = exact_fixture(rows * inf, 1);
+    let wv = exact_fixture(outf * inf, 2);
+    let av = exact_fixture(r * inf, 3);
+    let bv = exact_fixture(outf * r, 4);
+    let bias_v = exact_fixture(outf, 9);
     let x_f16: Vec<f16> = xv.iter().map(|&v| f16::from_f32(v)).collect();
     let w_f16: Vec<f16> = wv.iter().map(|&v| f16::from_f32(v)).collect();
     let bias_f16: Vec<f16> = bias_v.iter().map(|&v| f16::from_f32(v)).collect();

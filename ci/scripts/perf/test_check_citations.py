@@ -32,13 +32,28 @@ class CheckCitationsFixture(unittest.TestCase):
         self._orig_known_files = cc._KNOWN_FILES
         self._orig_roots = cc._SEARCH_ROOTS
         self._orig_doc_roots = cc._DOC_SEARCH_ROOTS
+        self._orig_perf_full_path_roots = cc._PERF_FULL_PATH_ROOTS
+        self._orig_perf_full_path_exclude = cc._PERF_FULL_PATH_EXCLUDE
+        self._orig_crate_comment_roots = cc._CRATE_COMMENT_ROOTS
         self._orig_repo_root = cc.REPO_ROOT
+        # `_CRATE_COMMENT_ROOTS` defaults to the REAL `crates/` tree (module
+        # scope), which every OTHER root here is protected from by an
+        # explicit per-test monkeypatch onto a throwaway fixture -- reset
+        # to empty by default so a test that calls `cc.main()` without
+        # itself opting into the new crate-comment scope is never silently
+        # coupled to this repo's own (still-drifting, not-yet-fixed) real
+        # crate citations. A test exercising the new scope explicitly
+        # re-points this at its own fixture directory.
+        cc._CRATE_COMMENT_ROOTS = ()
         self.addCleanup(self._restore)
 
     def _restore(self):
         cc._KNOWN_FILES = self._orig_known_files
         cc._SEARCH_ROOTS = self._orig_roots
         cc._DOC_SEARCH_ROOTS = self._orig_doc_roots
+        cc._PERF_FULL_PATH_ROOTS = self._orig_perf_full_path_roots
+        cc._PERF_FULL_PATH_EXCLUDE = self._orig_perf_full_path_exclude
+        cc._CRATE_COMMENT_ROOTS = self._orig_crate_comment_roots
         cc.REPO_ROOT = self._orig_repo_root
 
     def _write(self, rel: str, content: str) -> Path:
@@ -604,12 +619,18 @@ class ShallowCheckoutRefusalTests(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self._orig_known_files = cc._KNOWN_FILES
         self._orig_roots = cc._SEARCH_ROOTS
+        self._orig_crate_comment_roots = cc._CRATE_COMMENT_ROOTS
         self._orig_git_repo_root = cc._GIT_REPO_ROOT
+        # Same isolation `CheckCitationsFixture` applies -- see its own
+        # comment for why `_CRATE_COMMENT_ROOTS` needs an explicit reset
+        # where every other root here is already reset by construction.
+        cc._CRATE_COMMENT_ROOTS = ()
         self.addCleanup(self._restore)
 
     def _restore(self):
         cc._KNOWN_FILES = self._orig_known_files
         cc._SEARCH_ROOTS = self._orig_roots
+        cc._CRATE_COMMENT_ROOTS = self._orig_crate_comment_roots
         cc._GIT_REPO_ROOT = self._orig_git_repo_root
 
     def test_shallow_clone_refuses_sha_relative_resolution(self):
@@ -808,6 +829,164 @@ class LegacyNonAncestorExemptionTests(GitFixture):
         self.assertEqual(exemptions, [])
         self.assertEqual(len(violations), 1)
         self.assertIn("recorded git_sha", violations[0].message)
+
+
+class PerfScriptFullPathTests(CheckCitationsFixture):
+    """(a) `ci/scripts/perf/**`'s own `.sh`/`.py` full-path coverage
+    extension (module doc's "The full-path form's coverage extension"
+    section, `_PERF_FULL_PATH_ROOTS`). Same throwaway-fixture discipline
+    `MaintainerGuideFullPathTests` uses for `_DOC_SEARCH_ROOTS` — a fixture
+    root, never this repo's real `ci/scripts/perf/**` inventory.
+    """
+
+    def _perf_fixture(self, target_body: str, script_body: str) -> Path:
+        self._write("ci/scripts/lib.sh", target_body)
+        script = self._write("ci/scripts/perf/producer.sh", script_body)
+        self._write("target/unrelated.rs", "nothing\n")
+        cc._KNOWN_FILES = {"unrelated.rs": self.root / "target" / "unrelated.rs"}
+        cc.REPO_ROOT = self.root
+        cc._SEARCH_ROOTS = ()
+        cc._DOC_SEARCH_ROOTS = ()
+        cc._PERF_FULL_PATH_ROOTS = (self.root / "ci" / "scripts" / "perf",)
+        return script
+
+    def test_a_resolving_sh_comment_citation_passes(self):
+        script = self._perf_fixture(
+            "first line\nrp_tree_dir() {\n",
+            "# the tree resolver `rp_tree_dir` (`ci/scripts/lib.sh:2`) does it\n",
+        )
+        self.assertEqual(cc.check_file(script), [])
+
+    def test_a_stale_sh_comment_citation_fails(self):
+        """THE REPRODUCTION this coverage extension exists to catch: a
+        `.sh` comment citation whose target line has drifted — in-bounds,
+        pointing at unrelated code."""
+        script = self._perf_fixture(
+            "first line\nsomething_else_entirely() {\n",
+            "# the tree resolver `rp_tree_dir` (`ci/scripts/lib.sh:2`) does it\n",
+        )
+        violations = cc.check_file(script)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("STALE", violations[0].message)
+
+    def test_the_perf_full_path_form_excludes_this_checkers_own_test_file(self):
+        """`_PERF_FULL_PATH_EXCLUDE` names `check_citations.py`/
+        `test_check_citations.py` themselves — a synthetic, deliberately
+        broken citation living in a file at exactly that excluded path
+        must NOT be scanned at all (this pins the exclusion mechanism
+        itself, independent of the real repo's own two files)."""
+        self._write("ci/scripts/lib.sh", "first line\nsomething_else_entirely() {\n")
+        self._write("target/unrelated.rs", "nothing\n")
+        cc._KNOWN_FILES = {"unrelated.rs": self.root / "target" / "unrelated.rs"}
+        excluded = self._write(
+            "ci/scripts/perf/test_check_citations.py",
+            "# `rp_tree_dir` (`ci/scripts/lib.sh:2`)\n",
+        )
+        cc.REPO_ROOT = self.root
+        cc._SEARCH_ROOTS = ()
+        cc._DOC_SEARCH_ROOTS = ()
+        cc._PERF_FULL_PATH_ROOTS = (self.root / "ci" / "scripts" / "perf",)
+        cc._PERF_FULL_PATH_EXCLUDE = (self.root / "ci" / "scripts" / "perf" / "test_check_citations.py",)
+        # A STALE citation that WOULD fail if scanned -- zero violations
+        # proves the exclusion actually engaged, not that the citation
+        # happened to resolve.
+        self.assertEqual(cc.check_file(excluded), [])
+
+
+class CrateCommentFullPathTests(CheckCitationsFixture):
+    """(b) `crates/**/*.rs` doc/comment-line full-path coverage extension
+    (`_CRATE_COMMENT_ROOTS`, `"comments"` mode) — a `path:line` citation is
+    in scope ONLY inside a `//`/`///`/`//!` line comment, never inside a
+    string literal or executable code.
+    """
+
+    def _crate_fixture(self, target_body: str, source_body: str) -> Path:
+        self._write("crates/jammi-other/src/target.rs", target_body)
+        source = self._write("crates/jammi-some/src/lib.rs", source_body)
+        self._write("unrelated.rs", "nothing\n")
+        cc._KNOWN_FILES = {"unrelated.rs": self.root / "unrelated.rs"}
+        cc.REPO_ROOT = self.root
+        cc._SEARCH_ROOTS = ()
+        cc._DOC_SEARCH_ROOTS = ()
+        cc._CRATE_COMMENT_ROOTS = (self.root / "crates",)
+        return source
+
+    def test_a_resolving_doc_comment_citation_passes(self):
+        source = self._crate_fixture(
+            "line one\nfn real_thing() {}\n",
+            "/// `real_thing` (`crates/jammi-other/src/target.rs:2`)\n",
+        )
+        self.assertEqual(cc.check_file(source), [])
+
+    def test_a_stale_doc_comment_citation_fails(self):
+        """THE REPRODUCTION this coverage extension exists to catch: a
+        `///` doc-comment citation whose target line has drifted."""
+        source = self._crate_fixture(
+            "line one\nfn totally_different() {}\n",
+            "/// `real_thing` (`crates/jammi-other/src/target.rs:2`)\n",
+        )
+        violations = cc.check_file(source)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("STALE", violations[0].message)
+
+    def test_a_plain_line_comment_citation_also_resolves(self):
+        """`//` (not just `///`/`//!`) is in scope too — the module doc's
+        "never string literals or code" rule names all three uniformly."""
+        source = self._crate_fixture(
+            "line one\nfn real_thing() {}\n",
+            "// see `real_thing` (`crates/jammi-other/src/target.rs:2`)\n",
+        )
+        self.assertEqual(cc.check_file(source), [])
+
+    def test_a_path_line_inside_a_rust_string_literal_is_ignored(self):
+        """A `path:line` citation-shaped token sitting inside an ordinary
+        Rust string literal (even one that itself contains a `//`-looking
+        fragment, and even with a well-formed backtick-quoted identifier
+        right next to it) is NEVER a citation -- only comment text is in
+        scope. Proven the STRICT way: the embedded identifier does NOT
+        match `target.rs`'s real line 2, so if the string literal's
+        content leaked into the comment scan, this would resolve as a
+        STALE `Violation`, not silently pass for an unrelated reason.
+        """
+        source = self._crate_fixture(
+            "line one\nfn totally_unrelated() {}\n",
+            'let s = "call `some_fake_identifier` at '
+            '`crates/jammi-other/src/target.rs:2` -- embedded in a string, '
+            'not a real citation // even this looks like a comment but is not";\n',
+        )
+        self.assertEqual(cc.check_file(source), [])
+
+    def test_a_crate_relative_shorthand_citation_resolves(self):
+        """The SECOND full-path shape this scope recognizes,
+        `_crate_relative_citation_re` (`jammi-<name>/src/...:<n>`, no
+        `crates/` prefix — the shape a crate's own doc comment uses to
+        name a SIBLING crate by its published name). Deliberately uses a
+        `jammi-`-prefixed crate name (`jammi-other`), matching the REAL
+        convention (`jammi-encoders`, `jammi-lora`, ...) this shorthand
+        form is scoped to.
+        """
+        source = self._crate_fixture(
+            "line one\nfn real_thing() {}\n",
+            "/// `real_thing` (`jammi-other/src/target.rs:2`)\n",
+        )
+        self.assertEqual(cc.check_file(source), [])
+
+    def test_a_stale_crate_relative_shorthand_citation_fails(self):
+        source = self._crate_fixture(
+            "line one\nfn totally_different() {}\n",
+            "/// `real_thing` (`jammi-other/src/target.rs:2`)\n",
+        )
+        violations = cc.check_file(source)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("STALE", violations[0].message)
+
+    def test_real_crate_comment_roots_include_the_crates_directory(self):
+        """Drives the REAL (non-monkeypatched) `_CRATE_COMMENT_ROOTS` —
+        confirms this addition actually registered, not just a
+        fixture-only code path."""
+        crates_dir = cc.REPO_ROOT / "crates"
+        self.assertIn(crates_dir, self._orig_crate_comment_roots)
+        self.assertTrue(crates_dir.is_dir())
 
 
 if __name__ == "__main__":

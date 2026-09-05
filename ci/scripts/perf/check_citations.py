@@ -169,7 +169,7 @@ make the map ambiguous the first time two directories hold a same-named file
 
 Citing files under `_DOC_SEARCH_ROOTS` (the maintainer guides) therefore get
 a SECOND, additional citation form: a repo-root-relative FULL PATH, e.g.
-`` `rp_tree_dir` (`ci/scripts/runpod_lib.sh:644`) ``. The full-path form is
+`rp_tree_dir` (`ci/scripts/runpod_lib.sh:687`). The full-path form is
 resolved directly against the working tree, and the loud-failure property
 the basename map provides is preserved by a DIFFERENT mechanism rather than
 dropped: a full path that does not exist under `REPO_ROOT` is a
@@ -188,17 +188,55 @@ component happens to be a registered basename — the FULL-PATH match wins and
 the basename match nested inside it is dropped, so one citation is never
 reported twice.
 
-DOCUMENTED RESIDUAL, stated rather than implied: the full-path form is
-enabled for `_DOC_SEARCH_ROOTS` citing files ONLY, not for the
-`_SEARCH_ROOTS` files above. Those roots do carry full-path citations of
-their own (in `ci/scripts/perf/finetune_ab.sh`, `gpu_inference_ab.sh`,
-`test_finetune_ab_disable_op_keys.py`, and three `cuda-runs` artifacts),
-and a survey run at the time this form was added found roughly twenty of
-them bare or stale. Turning the form on for those roots is a real coverage
-extension and a real fix-up unit — it is NOT done here silently as a side
-effect of a docs change, and this paragraph exists so the gap is a named
-scope boundary rather than an accidental blind spot a later reader mistakes
-for coverage.
+## The full-path form's coverage extension: `ci/scripts/perf/**` and crate comments
+
+The full-path form was originally `_DOC_SEARCH_ROOTS`-only; a DOCUMENTED
+RESIDUAL paragraph here used to name two real gaps this left open (found by
+a survey when the form was first added). Both are now closed, each by its
+own scope, never by widening `_DOC_SEARCH_ROOTS` itself (that tuple stays
+"the maintainer guides", a distinct citing-audience from either extension
+below):
+
+  * **`_PERF_FULL_PATH_ROOTS`** (`ci/scripts/perf/**`, `.sh`/`.py` files
+    only — not the `.json` fixtures or `.md` provenance notes living
+    alongside them, which are not citation-bearing prose): the SAME
+    whole-file-text scan `_DOC_SEARCH_ROOTS` gets, since a real, resolvable
+    full-path citation in this scope lives in ordinary comment prose OR a
+    module/class docstring (a Python docstring is not syntactically a
+    comment, but it is the SAME kind of load-bearing prose a maintainer
+    guide's Markdown is — `test_finetune_ab_disable_op_keys.py`'s own
+    module docstring cites real call sites this way). `check_citations.py`
+    (this file) and `test_check_citations.py` are excluded from this scope
+    (`_PERF_FULL_PATH_EXCLUDE`): the former's own module doc and the
+    latter's fixtures construct `path:line`-shaped EXAMPLE/TEST-INPUT text
+    ABOUT this convention (or deliberately-broken citations exercising its
+    failure paths) — never a real citation about this repo's own code —
+    and mechanically re-checking prose or test data that is DESCRIBING or
+    EXERCISING the rule, rather than USING it, is the same category error
+    the "Committed artifacts are append-only evidence" section above
+    already names for a different case.
+  * **`_CRATE_COMMENT_ROOTS`** (`crates/**/*.rs`, comment text ONLY): a
+    `path:line`-shaped token inside an ordinary Rust string literal or in
+    executable code is NEVER a citation — only text inside a `//`/`///`/
+    `//!` line comment is in scope, via `_rust_comment_line_spans`'s
+    lightweight lexical scan (tracks string/raw-string/block-comment state
+    just precisely enough to keep a `//`-shaped substring INSIDE one of
+    those from being misread as a real line comment; deliberately does NOT
+    track char literals/lifetimes — see that function's own doc for why).
+    Unlike the two scopes above, this one is `"comments"` MODE, not
+    `"text"` mode: `_full_path_citation_re` only ever sees the extracted
+    comment substrings, never a whole file's text. This scope ALSO
+    recognizes a SECOND full-path shape unique to crate-internal doc
+    comments, `_crate_relative_citation_re` (`jammi-<name>/src/...:<n>`,
+    no `crates/` prefix — a crate names a sibling by its published crate
+    name, not by this workspace's own directory layout, which is invisible
+    from a crate's own doc-comment perspective): see that function's own
+    doc for how it coexists with, and never double-counts against, the
+    `crates/`-rooted form.
+
+Both new scopes are subject to the IDENTICAL adjacent-identifier rule and
+in-bounds check the original `_DOC_SEARCH_ROOTS` form uses — the extension
+buys coverage, never a weaker check.
 
 Run: `python3 ci/scripts/perf/check_citations.py`
 Hermetic for every non-artifact citation (reads only files in the working
@@ -288,6 +326,44 @@ _SEARCH_ROOTS = (
 # exactly what it meant before.
 _DOC_SEARCH_ROOTS = (
     REPO_ROOT / "docs" / "maintainer",
+)
+
+# The coverage extension named in the module doc's "The full-path form's
+# coverage extension" section: `ci/scripts/perf/**`'s own `.sh`/`.py`
+# scripts get the SAME whole-file-text full-path scan `_DOC_SEARCH_ROOTS`
+# does (never the `.json` fixtures or `.md` provenance notes also living
+# under this root -- those are not citation-bearing prose). A separate
+# tuple from `_DOC_SEARCH_ROOTS` (never appended to it) so `_DOC_SEARCH_
+# ROOTS` keeps meaning exactly "the maintainer guides" for every existing
+# test that monkeypatches it, and so this root's suffix restriction can be
+# enforced independently of that tuple's (which allows any suffix).
+_PERF_FULL_PATH_ROOTS = (
+    REPO_ROOT / "ci" / "scripts" / "perf",
+)
+_PERF_FULL_PATH_SUFFIXES = (".sh", ".py")
+
+# `check_citations.py` (this file) and `test_check_citations.py` are the
+# ONE named exception inside `_PERF_FULL_PATH_ROOTS`: this file's own
+# module doc constructs `path:line`-shaped EXAMPLE text describing the
+# convention, and `test_check_citations.py`'s fixtures construct
+# deliberately-synthetic (often deliberately-BROKEN) `path:line` text as
+# PYTHON STRING LITERAL test input -- never a real citation about this
+# repo's own code. Mechanically re-checking prose or test data that is
+# DESCRIBING or EXERCISING this rule, rather than USING it, is the same
+# category error the module doc's "Committed artifacts are append-only
+# evidence" section already names for a different case.
+_PERF_FULL_PATH_EXCLUDE = (
+    REPO_ROOT / "ci" / "scripts" / "perf" / "check_citations.py",
+    REPO_ROOT / "ci" / "scripts" / "perf" / "test_check_citations.py",
+)
+
+# The OTHER coverage extension: `crates/**/*.rs` doc/comment lines
+# (`//!`/`///`/`//` only -- see `_rust_comment_line_spans`). `.rs` only
+# (not every suffix `_ALL_SCAN_SUFFIXES` allows for the other roots) --
+# this scope exists specifically for Rust source comments, not for a
+# crate's `Cargo.toml`/README/fixtures.
+_CRATE_COMMENT_ROOTS = (
+    REPO_ROOT / "crates",
 )
 
 # A full-path citation must start with one of these — the roots this repo's
@@ -442,25 +518,218 @@ def _full_path_citation_re() -> re.Pattern:
     )
 
 
+def _crate_relative_citation_re() -> re.Pattern:
+    """The CRATE-RELATIVE shorthand full-path form `_CRATE_COMMENT_ROOTS`
+    (comments-mode) ALSO recognizes, alongside `_full_path_citation_re`'s
+    `crates/...`-rooted form: a crate's own doc comment routinely names a
+    SIBLING crate by its published crate name (`jammi-encoders/src/
+    layer_norm.rs:353-370`), never by this workspace's `crates/` directory
+    layout, which is a repo-layout implementation detail invisible from a
+    crate's own doc-comment perspective (`admission.rs`'s own module doc
+    uses exactly this shape, e.g. `` `"layer_norm_fused"` (`jammi-encoders/
+    src/layer_norm.rs:189`) ``, right alongside its OTHER doc comments that
+    spell the same crate out fully-qualified as `crates/jammi-encoders/
+    src/...` — both shapes coexist in this repo's real crate comments, so
+    both must resolve). A match is resolved by treating `crates/` as
+    implicitly prepended. Built fresh from `_FULL_PATH_SUFFIXES` on every
+    call, same reason `_full_path_citation_re` is. The SAME leading
+    negative-lookbehind guard `_full_path_citation_re` uses keeps this from
+    matching in the MIDDLE of a longer path -- in particular, the tail of
+    an ALREADY-`crates/`-rooted citation (`crates/jammi-encoders/src/
+    layer_norm.rs:91` literally contains `jammi-encoders/src/
+    layer_norm.rs:91` as a substring); `_cited_targets` additionally drops
+    any crate-relative match whose span nests inside a `crates/`-rooted
+    match on the same segment, so a fully-qualified citation is never
+    double-reported by this shorthand form too.
+    """
+    suffixes = "|".join(re.escape(s) for s in _FULL_PATH_SUFFIXES)
+    return re.compile(
+        r"(?<![A-Za-z0-9_./-])`?(?P<path>jammi-[A-Za-z0-9_-]+/(?:src|tests)/[A-Za-z0-9_./-]+\.(?:"
+        + suffixes + r")):(?P<line>\d+)`?"
+    )
+
+
+def _rust_string_prefix_len(text: str, i: int, n: int) -> int:
+    """Length (0, 1, or 2) of a string-literal prefix (`r`, `b`, `br`, `rb`)
+    starting at `text[i]`, without consuming the hashes or the opening
+    quote -- the caller decides what follows. `0` means "no such prefix
+    here" (the caller falls through to treating `text[i]` as an ordinary
+    character, e.g. an identifier that merely happens to start with `r`/
+    `b`, like `result`).
+    """
+    if i >= n or text[i] not in ("r", "b"):
+        return 0
+    if text[i] == "b" and i + 1 < n and text[i + 1] == "r":
+        return 2
+    if text[i] == "r" and i + 1 < n and text[i + 1] == "b":
+        return 2
+    return 1
+
+
+def _rust_comment_line_spans(text: str) -> list[tuple[int, int]]:
+    """Character-offset `(start, end)` ranges in `text` that are Rust LINE
+    comment content ("//", "///", "//!") -- the substring strictly AFTER
+    the leading slashes, up to (not including) the newline.
+
+    A lightweight structural scan, not a full parser: it tracks just enough
+    Rust lexical state -- ordinary string literals, raw strings (`r"..."`,
+    `r#"..."#`, `br"..."`, `rb"..."`, any hash count), and block comments
+    (nested) -- to keep a `//`-shaped substring INSIDE any of those from
+    being misread as a real line comment (the module doc's "never string
+    literals or code" requirement for `_CRATE_COMMENT_ROOTS`). Character
+    literals and lifetimes (`'a'`, `'static`) are deliberately NOT
+    tracked: neither can legitimately carry a `path:line` citation, and
+    unlike a string a lifetime has no closing quote to pair against, so
+    treating every `'` as entering a string-like state would swallow
+    arbitrary trailing, unrelated code as "not code" instead of the
+    narrow, correct thing this function exists to do.
+    """
+    spans: list[tuple[int, int]] = []
+    n = len(text)
+    i = 0
+    NORMAL, STRING, RAW_STRING, BLOCK = range(4)
+    state = NORMAL
+    raw_hashes = 0
+    block_depth = 0
+    while i < n:
+        c = text[i]
+        if state == NORMAL:
+            if c == "/" and i + 1 < n and text[i + 1] == "/":
+                start = i + 2
+                nl = text.find("\n", start)
+                end = nl if nl != -1 else n
+                spans.append((start, end))
+                i = end
+                continue
+            if c == "/" and i + 1 < n and text[i + 1] == "*":
+                state = BLOCK
+                block_depth = 1
+                i += 2
+                continue
+            if c == '"':
+                state = STRING
+                i += 1
+                continue
+            plen = _rust_string_prefix_len(text, i, n)
+            if plen:
+                j = i + plen
+                hashes = 0
+                k = j
+                while k < n and text[k] == "#":
+                    hashes += 1
+                    k += 1
+                if k < n and text[k] == '"':
+                    is_raw = text[i] == "r" or plen == 2
+                    if is_raw:
+                        state = RAW_STRING
+                        raw_hashes = hashes
+                    else:
+                        state = STRING
+                    i = k + 1
+                    continue
+            i += 1
+        elif state == STRING:
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                state = NORMAL
+            i += 1
+        elif state == RAW_STRING:
+            if c == '"':
+                k = i + 1
+                cnt = 0
+                while k < n and cnt < raw_hashes and text[k] == "#":
+                    cnt += 1
+                    k += 1
+                if cnt == raw_hashes:
+                    state = NORMAL
+                    i = k
+                    continue
+            i += 1
+        else:  # BLOCK
+            if c == "/" and i + 1 < n and text[i + 1] == "*":
+                block_depth += 1
+                i += 2
+                continue
+            if c == "*" and i + 1 < n and text[i + 1] == "/":
+                block_depth -= 1
+                i += 2
+                if block_depth == 0:
+                    state = NORMAL
+                continue
+            i += 1
+    return spans
+
+
+def _full_path_mode(path: Path) -> str | None:
+    """Which full-path citation scanning mode applies to `path`, or `None`
+    if the full-path form is disabled for it entirely (module doc's "The
+    full-path form's coverage extension" section):
+
+      - `"text"`: the ENTIRE file text is scanned -- `_DOC_SEARCH_ROOTS`
+        (any suffix; the original scope) and `_PERF_FULL_PATH_ROOTS`
+        (`.sh`/`.py` only, excluding this checker's own implementation and
+        test file, `_PERF_FULL_PATH_EXCLUDE`).
+      - `"comments"`: only Rust LINE-comment text is scanned (via
+        `_rust_comment_line_spans`) -- `_CRATE_COMMENT_ROOTS` (`.rs` only).
+      - `None`: the full-path form does not apply; only the basename form
+        (`_citation_re`, always on) does.
+    """
+    if _is_under(path, _DOC_SEARCH_ROOTS):
+        return "text"
+    if (
+        path.suffix in _PERF_FULL_PATH_SUFFIXES
+        and path not in _PERF_FULL_PATH_EXCLUDE
+        and _is_under(path, _PERF_FULL_PATH_ROOTS)
+    ):
+        return "text"
+    if path.suffix == ".rs" and _is_under(path, _CRATE_COMMENT_ROOTS):
+        return "comments"
+    return None
+
+
 def _cited_targets(path: Path, text: str) -> list[tuple[int, str, Path, int]]:
     """Every citation in `text`, as `(match_start, label, target_path,
     cited_line)`, ordered by position.
 
-    The basename form always applies; the full-path form applies only when
-    the CITING file lives under `_DOC_SEARCH_ROOTS` (module doc's
-    "resolved by FULL PATH" section, including its documented residual).
-    Where a full-path match SPANS a basename match — a path whose last
-    component is a registered `_KNOWN_FILES` name — the nested basename
-    match is dropped, so one citation is reported once, by its more
-    specific form.
+    The basename form always applies; the full-path form applies only per
+    `_full_path_mode` (module doc's "resolved by FULL PATH" / "coverage
+    extension" sections). Where a full-path match SPANS a basename match —
+    a path whose last component is a registered `_KNOWN_FILES` name — the
+    nested basename match is dropped, so one citation is reported once, by
+    its more specific form.
     """
     spans: list[tuple[int, int, str, Path, int]] = []
-    if _is_under(path, _DOC_SEARCH_ROOTS):
+    mode = _full_path_mode(path)
+    if mode == "text":
         for m in _full_path_citation_re().finditer(text):
             rel = m.group("path")
             spans.append(
                 (m.start(), m.end(), f"{rel}:{m.group('line')}", REPO_ROOT / rel, int(m.group("line")))
             )
+    elif mode == "comments":
+        for c_start, c_end in _rust_comment_line_spans(text):
+            segment = text[c_start:c_end]
+            seg_spans: list[tuple[int, int, str, Path, int]] = []
+            for m in _full_path_citation_re().finditer(segment):
+                rel = m.group("path")
+                seg_spans.append(
+                    (m.start(), m.end(), f"{rel}:{m.group('line')}", REPO_ROOT / rel, int(m.group("line")))
+                )
+            seg_full_ranges = [(s, e) for (s, e, _l, _t, _n) in seg_spans]
+            for m in _crate_relative_citation_re().finditer(segment):
+                if any(s <= m.start() and m.end() <= e for (s, e) in seg_full_ranges):
+                    continue
+                rel = m.group("path")
+                seg_spans.append(
+                    (
+                        m.start(), m.end(), f"{rel}:{m.group('line')}",
+                        REPO_ROOT / "crates" / rel, int(m.group("line")),
+                    )
+                )
+            for s, e, label, target, n in seg_spans:
+                spans.append((c_start + s, c_start + e, label, target, n))
     full_spans = [(s, e) for (s, e, _l, _t, _n) in spans]
     for m in _citation_re().finditer(text):
         if any(s <= m.start() and m.end() <= e for (s, e) in full_spans):
@@ -592,15 +861,31 @@ class Exemption:
         return f"{rel}:{self.line_no}: {self.message}"
 
 
+_ALL_SCAN_SUFFIXES = (".py", ".json", ".md", ".rs", ".sh")
+
+
 def _iter_source_files():
+    """Every file this script scans, deduplicated across roots. `_SEARCH_
+    ROOTS`/`_DOC_SEARCH_ROOTS` keep their original any-of-`_ALL_SCAN_
+    SUFFIXES` breadth; `_CRATE_COMMENT_ROOTS` is `.rs`-only (module doc's
+    "coverage extension" section) -- a SEPARATE per-root suffix filter,
+    not a blanket one, so `crates/**` is walked once for its `.rs` files
+    without also pulling in every `Cargo.toml`/README/fixture the rest of
+    a crate tree carries (keeping the runtime this adds bounded to what
+    the new scope actually needs).
+    """
     seen = set()
-    for root in (*_SEARCH_ROOTS, *_DOC_SEARCH_ROOTS):
+    scoped_roots: list[tuple[Path, tuple[str, ...]]] = [
+        (root, _ALL_SCAN_SUFFIXES) for root in (*_SEARCH_ROOTS, *_DOC_SEARCH_ROOTS)
+    ]
+    scoped_roots += [(root, (".rs",)) for root in _CRATE_COMMENT_ROOTS]
+    for root, suffixes in scoped_roots:
         if not root.is_dir():
             continue
         for path in sorted(root.rglob("*")):
             if not path.is_file():
                 continue
-            if path.suffix not in (".py", ".json", ".md", ".rs", ".sh"):
+            if path.suffix not in suffixes:
                 continue
             if path in seen:
                 continue

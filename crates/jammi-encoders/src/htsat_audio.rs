@@ -1536,6 +1536,14 @@ mod tests {
     /// block 1 is SW-MSA (`shift_size=1`, masked).
     #[test]
     fn training_true_rel_bias_table_grad_is_some_for_every_block() {
+        // `run_stage_backward` forwards each block's `layernorm_before`/
+        // `layernorm_after` (biased, training mode) — a counter bumper on
+        // `crate::layer_norm::LN_DISPATCH_COUNTERS` even though this test
+        // never reads that counter itself (see
+        // `crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK`'s doc).
+        let _guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
         let varmap = VarMap::new();
         let mut stage = build_tiny_stage(&varmap, &device);
@@ -1661,6 +1669,15 @@ mod tests {
     /// cannot.
     #[test]
     fn training_true_full_forward_reaches_every_parameter() {
+        // Full-tower forward through the patch-embed norm, every stage's
+        // `layernorm_before`/`layernorm_after`/`PatchMerging::norm`, and the
+        // encoder's final norm at `training=true` bumps
+        // `crate::layer_norm::LN_DISPATCH_COUNTERS` even though this test
+        // never reads it (see `crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK`'s
+        // doc).
+        let _guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
         let varmap = VarMap::new();
         let (mut tower, cfg, input) = build_full_tower_and_input(&varmap, &device, 101);
@@ -1865,6 +1882,13 @@ mod tests {
             "layers.0.blocks.0.layernorm_after.weight",
         ] {
             let training_grad = {
+                // Full-tower forward at `training=true` bumps
+                // `crate::layer_norm::LN_DISPATCH_COUNTERS` even though this
+                // block never reads it — same lock discipline as the other
+                // training-forward tests in this module.
+                let _guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 let varmap = VarMap::new();
                 let (mut tower, cfg, input) = build_full_tower_and_input(&varmap, &device, 303);
                 tower.set_training(true);
@@ -1920,6 +1944,14 @@ mod tests {
     /// was even reached.
     #[test]
     fn mel_conv2d_backward_reaches_conv_weight_through_the_fused_patch_embed_path() {
+        // `patch_embed.forward` below ends in `self.norm.forward(&flat)`
+        // (biased, training mode) — a counter bumper on
+        // `crate::layer_norm::LN_DISPATCH_COUNTERS` even though this test
+        // never reads that counter itself (see
+        // `crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK`'s doc).
+        let _guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
         let varmap = VarMap::new();
         let (mut tower, cfg, input) = build_full_tower_and_input(&varmap, &device, 202);

@@ -577,6 +577,14 @@ mod tests {
     /// against V's ~7.5, never exactly `0.0` the way eval's are.
     #[test]
     fn training_true_backward_gives_nonzero_grad_to_q_k_and_v_slices() {
+        // `block0_backward` forwards through `ln_1`/`ln_2` (biased, training
+        // mode) — a counter bumper on `crate::layer_norm::LN_DISPATCH_COUNTERS`
+        // even though this test never reads that counter itself. Same lock
+        // discipline as `clip_text_training_ln_dispatch_is_now_counted` below
+        // (see `crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK`'s doc).
+        let _guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let cfg = tiny_config();
         let device = Device::Cpu;
         let varmap = VarMap::new();
@@ -662,6 +670,14 @@ mod tests {
     /// layers.
     #[test]
     fn training_true_full_forward_reaches_every_parameter() {
+        // Full-tower forward through `ln_1`/`ln_2`/`ln_final` at
+        // `training=true` bumps `crate::layer_norm::LN_DISPATCH_COUNTERS`
+        // even though this test never reads it — same lock discipline as
+        // `training_true_backward_gives_nonzero_grad_to_q_k_and_v_slices`
+        // above.
+        let _guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let cfg = tiny_config();
         let device = Device::Cpu;
         let varmap = VarMap::new();
@@ -776,6 +792,13 @@ mod tests {
             deterministic_fill_varmap(&varmap, &device);
             model.set_training(true);
 
+            // Full-tower forward at `training=true` bumps
+            // `crate::layer_norm::LN_DISPATCH_COUNTERS` even though this
+            // closure never reads it — same lock discipline as the other
+            // training-forward tests in this module.
+            let _guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let (input_ids, mask) = fixed_batch(&cfg, &device);
             let out = model.forward(&input_ids, &mask).unwrap();
             let loss = nonuniform_loss(&out, cfg.embed_dim, &device);
@@ -817,6 +840,43 @@ mod tests {
                  BackpropOp::none() on every operand, including its own weight)"
             );
         }
+    }
+
+    /// #460 (C-LN): CLIP-text's LayerNorms (`ln_1`/`ln_2` per block,
+    /// `ln_final`) are ALL biased (`LayerNorm::new(.., with_bias: true,
+    /// ..)`) and reachable at `training == true` through
+    /// `AnyEncoder::set_training` (see `any::tests::
+    /// any_encoder_set_training_reaches_clip_text_q_k_gradient`, which
+    /// proves the SAME `set_training` wiring for its attention gradient).
+    /// Before this unit, every one of them fell through `slow()` with no
+    /// `admit()` call at all — the same `ln` `0/0` gap BERT/DistilBERT
+    /// had. This is the one NEW assertion #460 adds here: the training
+    /// dispatch is now COUNTED, on top of the gradient oracles above
+    /// (which stay green, unmodified, proving this doesn't change their
+    /// correctness claim).
+    #[test]
+    fn clip_text_training_ln_dispatch_is_now_counted() {
+        let _guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cfg = tiny_config();
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mut model = ClipText::load(vb, &cfg).unwrap();
+        deterministic_fill_varmap(&varmap, &device);
+        model.set_training(true);
+
+        let (input_ids, mask) = fixed_batch(&cfg, &device);
+        let before = crate::ln_dispatch_snapshot();
+        let _ = model.forward(&input_ids, &mask).unwrap();
+        let after = crate::ln_dispatch_snapshot();
+        assert!(
+            after.fused > before.fused && after.eager == before.eager,
+            "CLIP-text's biased LayerNorms must dispatch the fused `layer_norm_fused` key \
+             at training=true, not fall through slow() uncounted, and must never fall back \
+             to eager (before={before:?}, after={after:?})"
+        );
     }
 
     /// Eval output is unaffected by ever having toggled training on and back

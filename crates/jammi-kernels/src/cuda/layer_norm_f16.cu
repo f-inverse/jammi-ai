@@ -196,3 +196,55 @@ extern "C" __global__ void layer_norm_cast_f32_to_f16(
         dst[i] = __float2half(src[i]);
     }
 }
+
+// ---------------------------------------------------------------------
+// #460 (C-LN): bias-carrying forward, F16. APPEND-ONLY — see
+// `layer_norm.cu`'s identical comment above this block's F32/BF16 twin for
+// the full design rationale: ATen citation, `--fmad=true` form, and why
+// this NEW `template <bool HAS_BETA>` row body is a SEPARATE, textually
+// duplicated copy of the pre-existing bias-free F16 row body above this
+// comment (NOT a shared definition the bias-free kernel also calls) — an
+// accepted drift surface, the direct cost of keeping the bias-free
+// kernel's bytes provably untouched. Every kernel ABOVE this comment in
+// THIS file is byte-for-byte unchanged by this addition.
+// ---------------------------------------------------------------------
+
+template <bool HAS_BETA>
+__device__ __forceinline__ void ln_fwd_row_body_f16(
+    const __half* xr, const __half* gamma, const __half* beta, __half* yr,
+    const unsigned int hidden, const float eps, float* scratch
+) {
+    float sum = 0.0f;
+    for (unsigned int i = threadIdx.x; i < hidden; i += blockDim.x) {
+        sum += __half2float(xr[i]);
+    }
+    sum = block_reduce_sum(sum, scratch);
+    float mean = sum / (float)hidden;
+
+    float sumsq = 0.0f;
+    for (unsigned int i = threadIdx.x; i < hidden; i += blockDim.x) {
+        float d = __half2float(xr[i]) - mean;
+        sumsq += d * d;
+    }
+    sumsq = block_reduce_sum(sumsq, scratch);
+    float invvar = rsqrtf(sumsq / (float)hidden + eps);
+
+    for (unsigned int i = threadIdx.x; i < hidden; i += blockDim.x) {
+        float xhat = (__half2float(xr[i]) - mean) * invvar;
+        float scaled = xhat * __half2float(gamma[i]);
+        float outv = HAS_BETA ? (scaled + __half2float(beta[i])) : scaled;
+        yr[i] = __float2half(outv);
+    }
+}
+
+extern "C" __global__ void layer_norm_fwd_f16_biased(
+    const __half* x, const __half* gamma, const __half* beta, __half* y,
+    const unsigned int hidden, const float eps
+) {
+    __shared__ float scratch[LN_BLOCK];
+    size_t row = blockIdx.x;
+    ln_fwd_row_body_f16<true>(
+        x + row * (size_t)hidden, gamma, beta, y + row * (size_t)hidden,
+        hidden, eps, scratch
+    );
+}

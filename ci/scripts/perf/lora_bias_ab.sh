@@ -18,14 +18,41 @@
 # Both arms pass `--arm fused` to the binary -- CONTRACT: `finetune_run.rs`'s
 # `Arm::Fused` makes no `JAMMI_KERNELS_DISABLE` claim of its own (only
 # `Arm::Alloff` hard-pins a disable set and cross-checks it); the eager arm
-# here is manufactured entirely via `JAMMI_KERNELS_DISABLE=lora_linear_fused`
-# under `JAMMI_KERNELS_STRICT=1` (disable wins over Strict --
+# here is manufactured entirely via `JAMMI_KERNELS_DISABLE=<this op's disable
+# key>` under `JAMMI_KERNELS_STRICT=1` (disable wins over Strict --
 # `crate::admission::admit_inner`'s own doc), which is what turns a SINGLE
-# build into a one-op A/B: `lora_linear_fused` is forced eager while every
+# build into a one-op A/B: the op under test is forced eager while every
 # other op the same run touches is still strictly proven fused. The leg's
-# arm label (`fused` / `lora_eager` / `control`) is OUR OWN bookkeeping,
-# recorded in every manifest row and independently recoverable downstream
-# from `kernels_disabled_requested` (the merger's own dispatch-proof check).
+# arm label (`fused` / `<this op's eager-arm label>` / `control`) is OUR OWN
+# bookkeeping, recorded in every manifest row and independently recoverable
+# downstream from `kernels_disabled_requested` (the merger's own
+# dispatch-proof check).
+#
+# `AB_OP` (#460): this driver is a per-op same-box A/B, not a `lora_linear`-
+# only one -- `AB_OP` selects which single admission key gets forced eager,
+# from a small fixed table:
+#
+#   AB_OP=lora_linear (default) -- disable key `lora_linear_fused`, eager-arm
+#     label `lora_eager`, counter base `lora_linear` (the #428 P2b contract;
+#     every leg id, manifest field, and artifact this produces is BYTE-FOR-
+#     BYTE what it was before #460 -- this is the reproducibility floor the
+#     dry-run tests pin).
+#   AB_OP=ln (#460) -- disable key `layer_norm_fused`, eager-arm label
+#     `ln_eager`, counter base `ln`. Isolates the bias-carrying fused
+#     LayerNorm site landed by #460's engine half: the SAME admit key BERT/
+#     DistilBERT's own (previously always-eager, bias-carrying) LayerNorm
+#     now also routes through. `lora_linear_fused` is deliberately left
+#     enabled on BOTH arms of an `AB_OP=ln` sweep -- the LoRA-linear site
+#     stays fused throughout so the fused/eager differential isolates the
+#     LayerNorm site alone; the merger's own dispatch proof cross-checks
+#     this (`lora_linear` reads fused>0/eager==0 on every leg of an `ln`
+#     sweep, regardless of that leg's own arm).
+#
+# Every manifest row records its own `ab_op` -- the merger reads it back
+# (or takes `--op` explicitly) to select the counter base and the cross-op
+# invariant. Nothing about the STRICT pre-flight, the negative-control
+# series, or the corpus-provisioning mechanism changes per op -- only which
+# single key gets named in `JAMMI_KERNELS_DISABLE` on the eager arm.
 #
 # NEGATIVE CONTROL: one extra fused-vs-fused series per model at
 # `b8/W512/f32` (arm label "control", same underlying config as that
@@ -68,6 +95,10 @@
 # `finetune_run_ab.sh`'s own "a missed bar is data" doctrine.
 #
 # Env vars (all required for a real run; DRY_RUN relaxes all but OUT_DIR):
+#   AB_OP                  which single admission key this sweep forces
+#                          eager: `lora_linear` (default, #428, byte-for-byte
+#                          unchanged) or `ln` (#460, the biased fused
+#                          LayerNorm site). See the module doc above.
 #   MODEL_DIR_BERT         bert-base-uncased checkpoint dir.
 #   MODEL_DIR_DISTILBERT   distilbert-base-uncased checkpoint dir.
 #   BENCH_BIN              path to the jammi-bench binary (default:
@@ -113,6 +144,27 @@ LORA_BIAS_AB_EXTRA_DISABLE="${LORA_BIAS_AB_EXTRA_DISABLE:-}"
 LORA_BIAS_AB_LEGS_ONLY="${LORA_BIAS_AB_LEGS_ONLY:-}"
 LORA_BIAS_AB_DRY_RUN_FAIL_OP="${LORA_BIAS_AB_DRY_RUN_FAIL_OP:-}"
 LORA_BIAS_AB_DRY_RUN_FAIL_PREDICATE="${LORA_BIAS_AB_DRY_RUN_FAIL_PREDICATE:-dry_run_synthetic_capability_miss}"
+
+# --- AB_OP table (#460): the single admission key this sweep forces eager,
+# this op's own eager-arm label, and the counter-field base the merger reads
+# back -- see the module doc's "AB_OP" section. `AB_OP=lora_linear` is the
+# default and reproduces #428 byte-for-byte (same disable key, same eager-arm
+# label `lora_eager` it always used).
+AB_OP="${AB_OP:-lora_linear}"
+case "$AB_OP" in
+  lora_linear)
+    AB_DISABLE_KEY="lora_linear_fused"
+    AB_EAGER_ARM="lora_eager"
+    ;;
+  ln)
+    AB_DISABLE_KEY="layer_norm_fused"
+    AB_EAGER_ARM="ln_eager"
+    ;;
+  *)
+    echo "::error::lora_bias_ab: AB_OP must be 'lora_linear' or 'ln' (got '$AB_OP')" >&2
+    exit 2
+    ;;
+esac
 
 TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
 BENCH_BIN="${BENCH_BIN:-$TARGET_DIR/release/jammi-bench}"
@@ -213,9 +265,13 @@ HELDOUT_JSONL="$HELDOUT_DIR/heldout_pairs.jsonl"
 # GPU-pod run uses. `$1`=steps `$2`=model `$3`=batch `$4`=width `$5`=dtype.
 # Reads `JAMMI_KERNELS_DISABLE`/`JAMMI_KERNELS_STRICT` off ITS OWN
 # environment -- the same env this driver exports for the real binary --
-# and derives fused/eager dispatch counters from whether
-# `lora_linear_fused` is named in `JAMMI_KERNELS_DISABLE`, exactly the real
-# admission lattice's own "disable wins" rule.
+# and derives BOTH ops' fused/eager dispatch counters (`lora_linear_*` and
+# `ln_*`, unconditionally, regardless of this sweep's own `$AB_OP`) from
+# whether `lora_linear_fused`/`layer_norm_fused` is named in
+# `JAMMI_KERNELS_DISABLE`, exactly the real admission lattice's own
+# "disable wins" rule -- reporting both counter families always is what
+# lets the merger's `AB_OP=ln` cross-op invariant check (lora_linear stays
+# fused on every leg) hold hermetically too.
 # `LORA_BIAS_AB_DRY_RUN_FAIL_OP` (if set) makes it refuse unconditionally
 # with the exact Strict-mode-fallback text
 # `crate::error::KernelError::StrictModeFallback` renders, for
@@ -242,8 +298,16 @@ batch = int(batch)
 width = int(width)
 disable_raw = os.environ.get("JAMMI_KERNELS_DISABLE", "")
 requested = sorted({x for x in disable_raw.split(",") if x})
+# Generalized over BOTH ops the real admission lattice knows about here
+# (#460) -- "all" wins over everything, same as the real lattices own
+# disable-wins-over-Strict rule. Reporting BOTH counter families
+# unconditionally (never only the one this sweeps own AB_OP names) is what
+# lets the mergers cross-op invariant check (AB_OP=ln: lora_linear must
+# stay fused>0/eager==0 on every leg) hold on the dry-run fixture exactly
+# like it would on a real binarys report.
 lora_disabled = "lora_linear_fused" in requested or "all" in requested
-fired = ["lora_linear_fused"] if lora_disabled else []
+ln_disabled = "layer_norm_fused" in requested or "all" in requested
+fired = (["lora_linear_fused"] if lora_disabled else []) + (["layer_norm_fused"] if ln_disabled else [])
 
 target_modules = {
     "bert": ["query", "key", "value", "dense"],
@@ -297,6 +361,8 @@ tier = {
     "train_run_wall_s": 0.01 * steps,
     "lora_linear_fused_dispatches": 0 if lora_disabled else 1,
     "lora_linear_eager_dispatches": 1 if lora_disabled else 0,
+    "ln_fused_dispatches": 0 if ln_disabled else 1,
+    "ln_eager_dispatches": 1 if ln_disabled else 0,
 }
 report = {"tool": "dry-run", "lora_bias_ab_dry_run": True, "tiers": {"finetune_run": tier}}
 json.dump(report, sys.stdout)
@@ -356,15 +422,17 @@ with open(path, "w") as f:
 export MANIFEST_PATH="$MANIFEST"
 
 # Comma-joined `JAMMI_KERNELS_DISABLE` value for a given arm label --
-# `lora_eager` always names `lora_linear_fused`; `fused`/`control` never
-# do. `$LORA_BIAS_AB_EXTRA_DISABLE` (the preflight's own remedy channel) is
+# `$AB_EAGER_ARM` (this sweep's own op eager-arm label -- `lora_eager` for
+# `AB_OP=lora_linear`, `ln_eager` for `AB_OP=ln`) always names
+# `$AB_DISABLE_KEY`; `fused`/`control` never do.
+# `$LORA_BIAS_AB_EXTRA_DISABLE` (the preflight's own remedy channel) is
 # appended identically on every arm -- symmetry the merger's own dispatch
 # proof checks for.
 _disable_for_arm() {
   local arm="$1"
   local base=""
-  if [ "$arm" = "lora_eager" ]; then
-    base="lora_linear_fused"
+  if [ "$arm" = "$AB_EAGER_ARM" ]; then
+    base="$AB_DISABLE_KEY"
   fi
   if [ -n "$base" ] && [ -n "$LORA_BIAS_AB_EXTRA_DISABLE" ]; then
     printf '%s,%s' "$base" "$LORA_BIAS_AB_EXTRA_DISABLE"
@@ -448,7 +516,7 @@ preflight_probe() {
 for model_spec in "bert:$BERT_FULL" "distilbert:$DISTIL_FULL"; do
   model="${model_spec%%:*}"
   target_modules="${model_spec#*:}"
-  for arm in fused lora_eager; do
+  for arm in fused "$AB_EAGER_ARM"; do
     preflight_probe "$model" "$target_modules" "$arm"
   done
 done
@@ -563,7 +631,7 @@ run_leg() {
   row_json="$(python3 -c '
 import json, sys
 (leg_id, model, shape_id, batch, width, dtype, arm, steps, repeat, disable, extra_disable_json,
- argv_json, rc, wall, status, reason, git_sha, box, dry_run, out_json, err_file) = sys.argv[1:]
+ argv_json, rc, wall, status, reason, git_sha, box, dry_run, out_json, err_file, ab_op) = sys.argv[1:]
 row = {
     "leg_id": leg_id,
     "model": model,
@@ -574,6 +642,7 @@ row = {
     "arm": arm,
     "steps": int(steps),
     "repeat": int(repeat),
+    "ab_op": ab_op,
     "env": {"JAMMI_KERNELS_STRICT": "1", "JAMMI_KERNELS_DISABLE": disable},
     "extra_disable": json.loads(extra_disable_json),
     "argv": json.loads(argv_json),
@@ -591,7 +660,7 @@ print(json.dumps(row))
 ' "$leg_id" "$model" "$shape_id" "$batch" "$width" "$dtype" "$arm" "$steps" "$repeat" \
     "$disable" "$extra_disable_json" "$argv_json" "$rc" "$wall" "$status" "$reason" \
     "$SHA" "$BOX" "$([ "$LORA_BIAS_AB_DRY_RUN" = "1" ] && echo true || echo false)" \
-    "$out_json" "$err_file")"
+    "$out_json" "$err_file" "$AB_OP")"
 
   if ! _append_manifest_row "$row_json"; then
     echo "::error::$leg_id: could not append to $MANIFEST -- this leg's result is unrecoverable; aborting the sweep now rather than continuing silently unrecorded." >&2
@@ -630,7 +699,7 @@ for model_spec in "bert:$BERT_FULL" "distilbert:$DISTIL_FULL"; do
   model="${model_spec%%:*}"
   for shape_spec in "$SHAPE_WIRE" "$SHAPE_CHAPTER"; do
     shape_id="${shape_spec%%:*}"
-    for arm in fused lora_eager; do
+    for arm in fused "$AB_EAGER_ARM"; do
       for r in $(seq 1 "$LORA_BIAS_AB_REPEATS"); do
         KNOWN_CELL_IDS+=("${model}-${shape_id}-${arm}-r${r}")
       done
@@ -657,7 +726,7 @@ if [ -n "$LORA_BIAS_AB_LEGS_ONLY" ]; then
 fi
 
 # =====================================================================
-# The sweep: main fused/lora_eager cells (order-balanced across repeats),
+# The sweep: main fused/$AB_EAGER_ARM cells (order-balanced across repeats),
 # then the per-model negative-control series.
 # =====================================================================
 for model_spec in "bert:$BERT_FULL" "distilbert:$DISTIL_FULL"; do
@@ -676,9 +745,9 @@ for model_spec in "bert:$BERT_FULL" "distilbert:$DISTIL_FULL"; do
 
     for r in $(seq 1 "$LORA_BIAS_AB_REPEATS"); do
       if [ $(( r % 2 )) -eq 1 ]; then
-        order=(fused lora_eager)
+        order=(fused "$AB_EAGER_ARM")
       else
-        order=(lora_eager fused)
+        order=("$AB_EAGER_ARM" fused)
       fi
       for arm in "${order[@]}"; do
         cell_id="${model}-${shape_id}-${arm}-r${r}"

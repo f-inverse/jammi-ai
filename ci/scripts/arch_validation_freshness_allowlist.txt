@@ -22,7 +22,7 @@
 # see check_arch_validation_freshness.py's own module doc, "SCOPE,
 # deliberately" paragraph under "Rule 3 — waiver".
 #
-# Empty today, deliberately (the honest baseline): every VALIDATED_SMS entry
+# Historically empty (the honest baseline): every VALIDATED_SMS entry
 # (sm80/86/89/90) has fresh, non-doc evidence at the M2/M3 train tip. An
 # earlier revision of this gate treated `third_party/flash-attention/
 # VENDORED.md` as fully in-surface and carried four waiver rows here for a
@@ -32,3 +32,13 @@
 # fatigue); the gate itself now excludes pure documentation (`*.md`) from
 # Rule 2's trigger instead, so no waiver was ever needed for that class of
 # change. See the gate's own module doc for the full reasoning.
+#
+# The four rows below are the first genuine use of Rule 3: `.rs` files are
+# never pure documentation by this gate's own design (see the module doc),
+# so a comment-only re-point of citations inside admission.rs's doc comments
+# still trips Rule 2 even though zero non-comment bytes moved — the honest
+# resolution is a reviewed, expiring waiver, not a scope carve-out.
+80	b1f048ed9b0d99e4ed65e939584d3bdab1cb75d1	comment-only re-point of path:line citations in crates/jammi-kernels/src/admission.rs for the citation gate (#460/#459, PR #461); non-comment bytes identical to 7567b255 (comment-stripped diff empty); compiled SASS and runtime fences untouched — delete this row when the next per-arch pod-parity artifact lands
+86	b1f048ed9b0d99e4ed65e939584d3bdab1cb75d1	comment-only re-point of path:line citations in crates/jammi-kernels/src/admission.rs for the citation gate (#460/#459, PR #461); non-comment bytes identical to 7567b255 (comment-stripped diff empty); compiled SASS and runtime fences untouched — delete this row when the next per-arch pod-parity artifact lands
+89	b1f048ed9b0d99e4ed65e939584d3bdab1cb75d1	comment-only re-point of path:line citations in crates/jammi-kernels/src/admission.rs for the citation gate (#460/#459, PR #461); non-comment bytes identical to 7567b255 (comment-stripped diff empty); compiled SASS and runtime fences untouched — delete this row when the next per-arch pod-parity artifact lands
+90	b1f048ed9b0d99e4ed65e939584d3bdab1cb75d1	comment-only re-point of path:line citations in crates/jammi-kernels/src/admission.rs for the citation gate (#460/#459, PR #461); non-comment bytes identical to 7567b255 (comment-stripped diff empty); compiled SASS and runtime fences untouched — delete this row when the next per-arch pod-parity artifact lands

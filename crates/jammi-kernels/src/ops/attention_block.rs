@@ -227,9 +227,8 @@
 //! already-contiguous tensor is a no-op clone), so
 //! `matmul_grad_rhs`/`matmul_grad_lhs` see the identical operand shapes
 //! either way. `dqs`/`dkr` do NOT get that for free: production's forward
-//! for the `scores` GEMM (`crate::contiguous_matmul`,
-//! `crates/jammi-encoders/src/lib.rs:139-141`, called from
-//! `modernbert.rs:1016`) materializes BOTH operands, unlike `fwd`'s own
+//! for the `scores` GEMM — `contiguous_matmul`, `crates/jammi-encoders/src/lib.rs:170`,
+//! called from `modernbert.rs:1198` — materializes BOTH operands, unlike `fwd`'s own
 //! view-based `scores` GEMM this op recomputes above — so `bwd` builds a
 //! SEPARATE materialized `kt_contig` specifically for the `dqs`/`dkr`
 //! gradient GEMMs (never for the `scores` recompute, which keeps `fwd`'s

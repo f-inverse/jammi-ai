@@ -1,10 +1,19 @@
-//! Fused, bias-free LayerNorm forward + backward.
+//! Fused LayerNorm forward + backward, bias-free and bias-carrying.
 //!
-//! `y = ((x - mean) * invvar) * gamma`, reduced over the LAST dimension
-//! ("hidden"); `x` is `[rows, hidden]` (any leading batch shape, flattened
-//! to `rows`), `gamma` is `[hidden]`. This is the bias-free variant only —
-//! BERT/DistilBERT's biased LayerNorm keeps its existing (unfused) path;
-//! see `jammi-encoders`' call site for why.
+//! `y = ((x - mean) * invvar) * gamma [+ beta]`, reduced over the LAST
+//! dimension ("hidden"); `x` is `[rows, hidden]` (any leading batch shape,
+//! flattened to `rows`), `gamma`/`beta` are `[hidden]`. Two sibling ops
+//! cover the two populations: [`LayerNormFused`] (`CustomOp2`: `x`,
+//! `gamma`) for the bias-free case (ModernBERT — no `norm_bias` field
+//! exists in its config at all), and `LayerNormBiasedFused` (`CustomOp3`:
+//! `x`, `gamma`, `beta`) for the bias-carrying case (#460, C-LN —
+//! BERT/DistilBERT/CLIP-text, whose LayerNorms all carry a bias). Until
+//! #460, every biased LayerNorm trained through `jammi-encoders`'
+//! `slow()` eager composition with no `admit()` and no dispatch counter at
+//! all; see `jammi-encoders`' call site (`LayerNorm::forward`) for the ONE
+//! admission key (`"layer_norm_fused"`) both variants share — bias
+//! presence is TENSOR STATE decided at the call site, never a model-family
+//! special case.
 //!
 //! ## No save-for-backward (candle 0.11)
 //!
@@ -16,7 +25,9 @@
 //! which would also violate the `Copy`/stateless requirement every op in
 //! this crate is held to (see `ops`'s module doc).
 //!
-//! ## Three kernels, one call site
+//! ## Three kernels, one call site (bias-free; see `LayerNormBiasedFused`'s
+//! own doc for the bias-carrying sibling, which reuses two of these three
+//! helpers unchanged)
 //!
 //! - [`LayerNormFused`] (`CustomOp2`: `x`, `gamma`) — the forward. Its
 //!   `bwd` does not compose ordinary `Tensor` ops (the way
@@ -111,7 +122,8 @@
 //! f16 oracle suites need (`docs/maintainer/cuda-kernel-guide.md`'s per-op
 //! f16 reference-regime table names this op's regime as f32-internal,
 //! round-once, matching `jammi_encoders::layer_norm::LayerNorm::slow`'s
-//! F16 upcast at `jammi-encoders/src/layer_norm.rs:353-370`); campaign
+//! F16 upcast — `DType::F16 | DType::BF16 => DType::F32`, `jammi-encoders/src/layer_norm.rs:750` —
+//! inside `fn slow`, `crates/jammi-encoders/src/layer_norm.rs:726`); campaign
 //! #443 W2b added the matching CUDA F16 dispatch arm
 //! (`crate::cuda::layer_norm`'s `(DType::F16, DType::F16)` arms, backed by
 //! the SEPARATE `cuda/layer_norm_f16.cu` translation unit — see that
@@ -124,6 +136,12 @@
 //! fast-path, since `elem_count == 0` follows fromm `hidden == 0` (a
 //! zero-length dimension implies zero elements) and the same is true in
 //! reverse whenever the last dim is genuinely 0.
+//!
+//! `LayerNormBiasedFused` shares this ENTIRE domain (same dtype set, same
+//! contiguity requirement, same `MAX_HIDDEN` ceiling on CUDA, same
+//! `hidden == 0` degenerate path) and adds exactly one more check: `beta`
+//! must be `[hidden]`-shaped and share `x`'s dtype, the identical rule
+//! this file already applies to `gamma` — see that op's own doc.
 
 use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, CustomOp2, CustomOp3, Error, Layout, Result, Shape, Tensor};
@@ -497,6 +515,254 @@ impl CustomOp2 for LayerNormBwdDgamma {
     // No `bwd` override — see `LayerNormBwdDx`'s identical note.
 }
 
+/// #460 (C-LN): bias-carrying LayerNorm forward — `y = xhat * gamma +
+/// beta`, `CustomOp3(x, gamma, beta)`. The sibling of [`LayerNormFused`]
+/// (bias-free): every BERT/DistilBERT LayerNorm carries a bias, so this is
+/// the op that actually fuses their training-mode forward — see
+/// `jammi-encoders`' call site (`LayerNorm::forward_fused_or_fallback`)
+/// for the ONE admission key (`"layer_norm_fused"`) both variants share:
+/// bias presence is TENSOR STATE, not a model-family special case (one
+/// common architecture — the operator's own framing for #460).
+///
+/// ## `beta` is REQUIRED, not nullable
+///
+/// Unlike ATen's own `layer_norm_kernel.cu` (which takes a nullable
+/// `gamma`/`beta` pointer pair and skips the affine entirely when both are
+/// null), this op's `beta` slot is a genuine, non-`Option` `CustomOp3`
+/// operand: the bias-FREE case already has its own dedicated op
+/// ([`LayerNormFused`]) with its own dispatch key, so there is no call
+/// site that would ever construct this one with an absent beta. The CUDA
+/// kernels this op dispatches to (`layer_norm_fwd_{f32,bf16,f16}_biased`
+/// in `cuda/layer_norm.cu`/`cuda/layer_norm_f16.cu`) each define their OWN
+/// `template <bool HAS_BETA>` row body — a SEPARATE, textually duplicated
+/// copy of the pre-existing bias-free kernel's row math, not a shared
+/// definition the bias-free kernel also calls (that kernel's bytes are
+/// append-only-preserved, byte-for-byte, by this addition — see those
+/// files' own module docs for the accepted-drift-surface rationale). The
+/// template's `bool` parameter COULD serve a future nullable-beta caller
+/// without a kernel-body rewrite, but only the `HAS_BETA = true`
+/// instantiation is ever emitted as a kernel today.
+///
+/// ## `bwd`: three independent slots, three independent gates
+///
+/// - `dx` — ALWAYS `Some`, via the EXISTING `LayerNormBwdDx` (`x`,
+///   `gamma`, `grad_output`) — `dx` does not depend on `beta` at all
+///   (`d(xhat*gamma+beta)/dx` has no `beta` term), so this is the exact
+///   same helper `LayerNormFused`'s own `bwd` already calls, re-dispatched
+///   through the same `apply3` seam. No new kernel, no new op.
+/// - `dgamma` — `Some` via the EXISTING `LayerNormBwdDgamma` (`x`,
+///   `grad_output`) exactly when `self.dgamma_needed`, `None` otherwise —
+///   again the identical helper the bias-free op already uses; `dgamma`
+///   has no `beta` dependence either (`dgamma_i = sum_rows(dy_i *
+///   xhat_i)`).
+/// - `dbeta` — `Some(dbeta_from_grad(grad_res, beta_dtype))` exactly
+///   when `self.dbeta_needed`, `None` otherwise. `dbeta_from_grad` is an
+///   ORDINARY `Tensor` composition (`sum` over every dim but the last),
+///   not a further fused kernel — see that function's own doc for why a
+///   combined γ+β reduction kernel would be strictly worse in the
+///   dbeta-only cell this gate can reach, and why no shipped path trains a
+///   LayerNorm's `beta` today (so there is no measured workload to fuse
+///   this against yet).
+///
+/// `dgamma_needed`/`dbeta_needed` are construction data, frozen into this
+/// `Copy` instance before `apply3` ever runs, exactly like
+/// [`LayerNormFused::dgamma_needed`] — see that field's doc for the full
+/// "construction data, evaluated from tensor state at the call site"
+/// discussion; `jammi-encoders`' call site gates BOTH slots with the same
+/// three-way (`Var` / untracked leaf / tracked-non-`Var`) policy
+/// `jammi_lora::lora_linear::frozen_weight_gate` uses for a LoRA base's
+/// own weight/bias, rather than a bare `is_variable()` (which cannot tell
+/// a true external constant apart from an intermediate on a path to a
+/// `Var` for an ARBITRARY tensor — sound for gamma/beta specifically only
+/// because they are structurally leaf module parameters, but the
+/// three-way gate makes that soundness a checked invariant rather than an
+/// assumption, closing the exact silent-`None` landmine
+/// [`LayerNormFused`]'s own module doc discusses).
+#[derive(Debug, Clone, Copy)]
+pub struct LayerNormBiasedFused {
+    pub eps: f64,
+    /// See [`LayerNormFused::dgamma_needed`]'s doc — identical contract,
+    /// applied to this op's own `gamma` slot.
+    pub dgamma_needed: bool,
+    /// The `beta` analog of `dgamma_needed`, gated the same way at the
+    /// call site (family D: bias is tensor state, gated identically to
+    /// gamma, never a model-family special case).
+    pub dbeta_needed: bool,
+}
+
+impl LayerNormBiasedFused {
+    pub fn new(eps: f64, dgamma_needed: bool, dbeta_needed: bool) -> Self {
+        Self {
+            eps,
+            dgamma_needed,
+            dbeta_needed,
+        }
+    }
+}
+
+impl super::sealed::Sealed for LayerNormBiasedFused {}
+
+impl CustomOp3 for LayerNormBiasedFused {
+    fn name(&self) -> &'static str {
+        "layer_norm_biased_fused"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+        s3: &CpuStorage,
+        l3: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        let hidden = hidden_of(l1, l2, self.name())?;
+        // `beta` (`s3`/`l3`) gets its OWN domain check, mirroring
+        // `LayerNormBwdDx::cpu_fwd`'s existing `l3`-vs-`l1` shape check
+        // and `s1`-vs-`s3` dtype check for its `dy` slot: a `CustomOp3`'s
+        // third operand is never "free" just because the first two
+        // already agree. `beta` is `[hidden]`-shaped, like `gamma` —
+        // NOT `x`-shaped like `LayerNormBwdDx`'s `dy` slot.
+        if l3.dims() != [hidden] {
+            return Err(Error::ShapeMismatchBinaryOp {
+                lhs: l1.shape().clone(),
+                rhs: l3.shape().clone(),
+                op: self.name(),
+            });
+        }
+        if s1.dtype() != s3.dtype() {
+            return Err(Error::DTypeMismatchBinaryOp {
+                lhs: s1.dtype(),
+                rhs: s3.dtype(),
+                op: self.name(),
+            });
+        }
+        if hidden == 0 {
+            return empty_like(s1, s2, l1, self.name());
+        }
+        let rows = l1.shape().elem_count() / hidden;
+        let (o1, o2) = l1
+            .contiguous_offsets()
+            .ok_or(Error::RequiresContiguous { op: self.name() })?;
+        let (g1, g2) = l2
+            .contiguous_offsets()
+            .ok_or(Error::RequiresContiguous { op: self.name() })?;
+        let (b1, b2) = l3
+            .contiguous_offsets()
+            .ok_or(Error::RequiresContiguous { op: self.name() })?;
+        match (s1, s2, s3) {
+            (CpuStorage::F32(x), CpuStorage::F32(g), CpuStorage::F32(b)) => {
+                let out = ln_fwd_f32_biased(
+                    &x[o1..o2],
+                    &g[g1..g2],
+                    &b[b1..b2],
+                    rows,
+                    hidden,
+                    self.eps as f32,
+                );
+                Ok((CpuStorage::F32(out), l1.shape().clone()))
+            }
+            (CpuStorage::BF16(x), CpuStorage::BF16(g), CpuStorage::BF16(b)) => {
+                let out = ln_fwd_bf16_biased(
+                    &x[o1..o2],
+                    &g[g1..g2],
+                    &b[b1..b2],
+                    rows,
+                    hidden,
+                    self.eps as f32,
+                );
+                Ok((CpuStorage::BF16(out), l1.shape().clone()))
+            }
+            (CpuStorage::F16(x), CpuStorage::F16(g), CpuStorage::F16(b)) => {
+                let out = ln_fwd_f16_biased(
+                    &x[o1..o2],
+                    &g[g1..g2],
+                    &b[b1..b2],
+                    rows,
+                    hidden,
+                    self.eps as f32,
+                );
+                Ok((CpuStorage::F16(out), l1.shape().clone()))
+            }
+            (s1, s2, _) if s1.dtype() != s2.dtype() => Err(Error::DTypeMismatchBinaryOp {
+                lhs: s1.dtype(),
+                rhs: s2.dtype(),
+                op: self.name(),
+            }),
+            (s1, _, _) => Err(Error::UnsupportedDTypeForOp(s1.dtype(), self.name())),
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        s1: &candle_core::CudaStorage,
+        l1: &Layout,
+        s2: &candle_core::CudaStorage,
+        l2: &Layout,
+        s3: &candle_core::CudaStorage,
+        l3: &Layout,
+    ) -> Result<(candle_core::CudaStorage, Shape)> {
+        crate::cuda::layer_norm::cuda_fwd_biased(self.eps, s1, l1, s2, l2, s3, l3)
+    }
+
+    /// `dx` is beta-independent — via the EXISTING `LayerNormBwdDx`, the
+    /// same helper [`LayerNormFused::bwd`] uses. `dgamma`/`dbeta` are each
+    /// gated independently — see this struct's own doc.
+    fn bwd(
+        &self,
+        arg1: &Tensor,
+        arg2: &Tensor,
+        arg3: &Tensor,
+        _res: &Tensor,
+        grad_res: &Tensor,
+    ) -> Result<(Option<Tensor>, Option<Tensor>, Option<Tensor>)> {
+        let dx = super::apply3(arg1, arg2, grad_res, LayerNormBwdDx { eps: self.eps })?;
+        let dgamma = if self.dgamma_needed {
+            Some(super::apply2(
+                arg1,
+                grad_res,
+                LayerNormBwdDgamma { eps: self.eps },
+            )?)
+        } else {
+            None
+        };
+        let dbeta = if self.dbeta_needed {
+            Some(dbeta_from_grad(grad_res, arg3.dtype())?)
+        } else {
+            None
+        };
+        Ok((Some(dx), dgamma, dbeta))
+    }
+}
+
+/// `dbeta = sum_rows(dy)`, f32-accumulate, one rounding — ATen's
+/// `GammaBetaBackwardSimpleCUDAKernel`'s own `db` reduction (`db[j] =
+/// Σ_i dY` in `T_ACC`; see `layer_norm_kernel.cu:513-540` in the ATen
+/// citation this file's module doc and `jammi_encoders::layer_norm::
+/// LayerNorm::slow`'s doc both pin). An ORDINARY `Tensor` composition
+/// (`to_dtype`, `sum`), not a further fused kernel — deliberately: no
+/// shipped path trains a LayerNorm's `beta` today (BERT/DistilBERT's
+/// affine parameters are frozen `VarBuilder` leaves in every production
+/// checkpoint this workspace loads), so there is no measured workload
+/// this composition costs anything relative to; and a combined γ+β
+/// reduction kernel would be STRICTLY WORSE in the one lattice cell that
+/// actually needs `dbeta` without `dgamma` (`beta` trainable, `gamma`
+/// frozen) — it would compute a whole extra column-tiled `dgamma` launch
+/// nobody asked for. `sum` over every dim but the last, rather than a
+/// hand-rolled row loop, works identically on CPU and CUDA because it
+/// composes ordinary candle ops, not this crate's own kernels — the same
+/// reason `ops::softmax`'s own `mask_grad` helper needs no CUDA arm of its
+/// own either.
+fn dbeta_from_grad(grad_res: &Tensor, beta_dtype: candle_core::DType) -> Result<Tensor> {
+    let rank = grad_res.rank();
+    let batch_dims: Vec<usize> = (0..rank.saturating_sub(1)).collect();
+    let summed = grad_res
+        .to_dtype(candle_core::DType::F32)?
+        .sum(batch_dims)?;
+    summed.to_dtype(beta_dtype)
+}
+
 // -----------------------------------------------------------------------
 // CPU math. Fixed fold order throughout (family J): every reduction below
 // walks its row in plain ascending index order, so a given `(x, gamma)`
@@ -617,6 +883,105 @@ fn ln_fwd_f16(x: &[f16], gamma: &[f16], rows: usize, hidden: usize, eps: f32) ->
         let lo = r * hidden;
         let hi = lo + hidden;
         ln_fwd_row_f16(&x[lo..hi], gamma, eps, &mut out[lo..hi]);
+    }
+    out
+}
+
+// -----------------------------------------------------------------------
+// #460 (C-LN): bias-carrying forward row math. Each `_biased` function
+// below shares its row's mean/variance computation with its bias-free
+// twin above via the SAME [`mean_var_f32`]/[`mean_var_bf16`]/[`mean_var_f16`]
+// helpers — the bias-free row functions (`ln_fwd_row_f32` etc.) are not
+// touched by this addition at all, so their own output is bit-identical
+// by construction (same discipline the CUDA `.cu` files' append-only
+// addition documents). `y = xhat * gamma + beta`, matching ATen's
+// `LayerNormForwardCUDAKernel` (T_ACC accumulate, one cast at the end —
+// see `jammi_encoders::layer_norm::LayerNorm::slow`'s own citation) and
+// `LayerNormFused`'s bias-free epilogue's rounding placement exactly,
+// with one extra term.
+// -----------------------------------------------------------------------
+
+fn ln_fwd_row_f32_biased(x: &[f32], gamma: &[f32], beta: &[f32], eps: f32, out: &mut [f32]) {
+    let hidden = x.len();
+    let (mean, var) = mean_var_f32(x, hidden);
+    let invvar = 1.0 / (var + eps).sqrt();
+    for i in 0..hidden {
+        let xhat = (x[i] - mean) * invvar;
+        out[i] = xhat * gamma[i] + beta[i];
+    }
+}
+
+fn ln_fwd_f32_biased(
+    x: &[f32],
+    gamma: &[f32],
+    beta: &[f32],
+    rows: usize,
+    hidden: usize,
+    eps: f32,
+) -> Vec<f32> {
+    let mut out = vec![0f32; rows * hidden];
+    for r in 0..rows {
+        let lo = r * hidden;
+        let hi = lo + hidden;
+        ln_fwd_row_f32_biased(&x[lo..hi], gamma, beta, eps, &mut out[lo..hi]);
+    }
+    out
+}
+
+/// F32-accumulate, round-once — [`ln_fwd_row_bf16`]'s biased twin.
+fn ln_fwd_row_bf16_biased(x: &[bf16], gamma: &[bf16], beta: &[bf16], eps: f32, out: &mut [bf16]) {
+    let hidden = x.len();
+    let (mean, var) = mean_var_bf16(x, hidden);
+    let invvar = 1.0 / (var + eps).sqrt();
+    for i in 0..hidden {
+        let xhat = (x[i].to_f32() - mean) * invvar;
+        let scaled = xhat * gamma[i].to_f32() + beta[i].to_f32();
+        out[i] = bf16::from_f32(scaled);
+    }
+}
+
+fn ln_fwd_bf16_biased(
+    x: &[bf16],
+    gamma: &[bf16],
+    beta: &[bf16],
+    rows: usize,
+    hidden: usize,
+    eps: f32,
+) -> Vec<bf16> {
+    let mut out = vec![bf16::ZERO; rows * hidden];
+    for r in 0..rows {
+        let lo = r * hidden;
+        let hi = lo + hidden;
+        ln_fwd_row_bf16_biased(&x[lo..hi], gamma, beta, eps, &mut out[lo..hi]);
+    }
+    out
+}
+
+/// [`ln_fwd_row_bf16_biased`]'s exact twin, substituting `half::f16`.
+fn ln_fwd_row_f16_biased(x: &[f16], gamma: &[f16], beta: &[f16], eps: f32, out: &mut [f16]) {
+    let hidden = x.len();
+    let (mean, var) = mean_var_f16(x, hidden);
+    let invvar = 1.0 / (var + eps).sqrt();
+    for i in 0..hidden {
+        let xhat = (x[i].to_f32() - mean) * invvar;
+        let scaled = xhat * gamma[i].to_f32() + beta[i].to_f32();
+        out[i] = f16::from_f32(scaled);
+    }
+}
+
+fn ln_fwd_f16_biased(
+    x: &[f16],
+    gamma: &[f16],
+    beta: &[f16],
+    rows: usize,
+    hidden: usize,
+    eps: f32,
+) -> Vec<f16> {
+    let mut out = vec![f16::ZERO; rows * hidden];
+    for r in 0..rows {
+        let lo = r * hidden;
+        let hi = lo + hidden;
+        ln_fwd_row_f16_biased(&x[lo..hi], gamma, beta, eps, &mut out[lo..hi]);
     }
     out
 }
@@ -805,7 +1170,7 @@ fn ln_bwd_dgamma_f16(x: &[f16], dy: &[f16], rows: usize, hidden: usize, eps: f32
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::{DType, Device};
+    use candle_core::{DType, Device, Var};
 
     fn ln(eps: f64, dgamma_needed: bool, x: &Tensor, gamma: &Tensor) -> Result<Tensor> {
         crate::ops::apply2(x, gamma, LayerNormFused::new(eps, dgamma_needed))
@@ -1294,6 +1659,491 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------
+    // #460 (C-LN): `LayerNormBiasedFused` oracles.
+    // -----------------------------------------------------------------
+
+    fn ln_biased(
+        eps: f64,
+        dgamma_needed: bool,
+        dbeta_needed: bool,
+        x: &Tensor,
+        gamma: &Tensor,
+        beta: &Tensor,
+    ) -> Result<Tensor> {
+        crate::ops::apply3(
+            x,
+            gamma,
+            beta,
+            LayerNormBiasedFused::new(eps, dgamma_needed, dbeta_needed),
+        )
+    }
+
+    /// Hand-computed f64 reference, same fixture as
+    /// `cpu_fwd_f32_matches_hand_computed_values` plus a non-zero `beta`:
+    /// `x = [1,2,3,4]`, `gamma = [1,1,1,1]`, `beta = [0.5,-0.5,1.0,-1.0]`.
+    /// `y_i = xhat_i * gamma_i + beta_i`.
+    #[test]
+    fn cpu_fwd_f32_biased_matches_hand_computed_values() {
+        let device = Device::Cpu;
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], (1, 4), &device).unwrap();
+        let gamma = Tensor::from_slice(&[1.0f32, 1.0, 1.0, 1.0], (4,), &device).unwrap();
+        let beta = Tensor::from_slice(&[0.5f32, -0.5, 1.0, -1.0], (4,), &device).unwrap();
+        let out = ln_biased(1e-5, false, false, &x, &gamma, &beta)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        let mean = 2.5f32;
+        let var = 1.25f32;
+        let invvar = 1.0 / (var + 1e-5f32).sqrt();
+        let beta_v = [0.5f32, -0.5, 1.0, -1.0];
+        let expected: Vec<f32> = [1.0f32, 2.0, 3.0, 4.0]
+            .iter()
+            .zip(beta_v.iter())
+            .map(|(&v, &b)| (v - mean) * invvar + b)
+            .collect();
+        for (o, e) in out[0].iter().zip(expected.iter()) {
+            assert!((o - e).abs() < 1e-5, "{o} vs {e}");
+        }
+    }
+
+    /// Regression pin (K4-style, applied at the op level): `beta = 0`
+    /// must reduce `LayerNormBiasedFused`'s output to EXACTLY
+    /// `LayerNormFused`'s own output, bitwise — `v + 0.0 == v` exactly in
+    /// IEEE-754 for any finite, non-negative-zero `v`, so this is not a
+    /// tolerance claim. This is the "bias-free op output bitwise
+    /// unchanged" oracle: the reference here IS the pre-existing
+    /// [`LayerNormFused`] op itself (never touched by this file's #460
+    /// addition), not a hand-rolled duplicate.
+    #[test]
+    fn beta_all_zero_is_bitwise_identical_to_the_bias_free_op() {
+        let device = Device::Cpu;
+        let hidden = 6;
+        let rows = 3;
+        let xv: Vec<f32> = (0..rows * hidden)
+            .map(|i| (i as f32 * 0.53 - 2.1).sin() * 4.0)
+            .collect();
+        let gv: Vec<f32> = (0..hidden).map(|i| 0.6 + i as f32 * 0.15).collect();
+        let x = Tensor::from_slice(&xv, (rows, hidden), &device).unwrap();
+        let gamma = Tensor::from_slice(&gv, (hidden,), &device).unwrap();
+        let beta = Tensor::zeros((hidden,), DType::F32, &device).unwrap();
+
+        let out_biased: Vec<f32> = ln_biased(1e-5, false, false, &x, &gamma, &beta)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let out_bias_free: Vec<f32> = ln(1e-5, false, &x, &gamma)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(
+            out_biased, out_bias_free,
+            "beta = 0 must be bitwise identical to the bias-free op's own output"
+        );
+    }
+
+    /// BF16 forward bound derived over `|xhat*gamma| + |beta|` (beta can
+    /// cancel the scaled term, so the bound must not assume the two terms
+    /// add in magnitude) — same independent f64 reference discipline as
+    /// `bf16_forward_matches_f32_accumulation_rounded_once` above, plus
+    /// the affine `beta` term.
+    #[test]
+    fn bf16_forward_biased_matches_f32_accumulation_rounded_once() {
+        let device = Device::Cpu;
+        let xv = [1.0f32, 2.0, 3.0, 4.0];
+        let xb: Vec<bf16> = xv.iter().map(|&v| bf16::from_f32(v)).collect();
+        let gb = [bf16::from_f32(1.0); 4];
+        let bv = [0.3f32, -0.7, 1.1, -1.5];
+        let bb: Vec<bf16> = bv.iter().map(|&v| bf16::from_f32(v)).collect();
+        let x = Tensor::from_slice(&xb, (1, 4), &device).unwrap();
+        let gamma = Tensor::from_slice(&gb, (4,), &device).unwrap();
+        let beta = Tensor::from_slice(&bb, (4,), &device).unwrap();
+        let out: Vec<bf16> = ln_biased(1e-5, false, false, &x, &gamma, &beta)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        let xf: Vec<f64> = xb.iter().map(|v| v.to_f32() as f64).collect();
+        let mean: f64 = xf.iter().sum::<f64>() / xf.len() as f64;
+        let var: f64 = xf.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / xf.len() as f64;
+        let invvar = 1.0 / (var + 1e-5).sqrt();
+        let expected: Vec<f32> = xf
+            .iter()
+            .zip(bb.iter())
+            .map(|(&v, &b)| (((v - mean) * invvar) as f32) + b.to_f32())
+            .collect();
+
+        for (i, (o, e)) in out.iter().zip(expected.iter()).enumerate() {
+            // Bound derived over `|xhat*gamma| + |beta|` (rule: beta can
+            // CANCEL the scaled term, so the bound must sum the two terms'
+            // magnitudes rather than assume the output magnitude itself
+            // bounds the error) — a generous relative-plus-absolute slack
+            // on a hand-picked, non-adversarial fixture.
+            let xhat_g = (((xf[i] - mean) * invvar) as f32).abs();
+            let beta_abs = bb[i].to_f32().abs();
+            let bound = (xhat_g + beta_abs) * 2e-2 + 1e-2;
+            assert!(
+                o.to_f32().is_finite() && (o.to_f32() - e).abs() < bound,
+                "{o} vs {e} (bound {bound})"
+            );
+        }
+    }
+
+    /// [`bf16_forward_biased_matches_f32_accumulation_rounded_once`]'s F16
+    /// twin. F16 has MORE mantissa bits than bf16 (10 vs 7), so this bound
+    /// must be TIGHTER than bf16's, not merely reused: bf16's own
+    /// coefficients (`2e-2`/`1e-2`) are a half-bf16-ulp relative error
+    /// (`2^-8 ≈ 3.9e-3`) scaled up by this op's round-once-epilogue slack;
+    /// f16's half-ulp relative error is `2^-11 ≈ 4.9e-4`, exactly `1/8` of
+    /// bf16's (`2^(11-8) = 8`, the same BF16-to-F16 ULP ratio
+    /// `jammi_kernels::f16_oracle::assert_floor_below_f16_gradient_band`
+    /// derives), so applying the SAME epilogue-slack multiplier to that
+    /// smaller per-element error and scaling bf16's own coefficients down
+    /// by that `1/8` ratio gives f16's bound: `2e-2 / 8 = 2.5e-3`, `1e-2 /
+    /// 8 = 1.25e-3` — the identical derivation
+    /// `tests/layer_norm_oracles.rs`'s `f16_biased_fwd_bwd_bound_at_
+    /// production_width` uses at production width.
+    #[test]
+    fn f16_forward_biased_matches_f32_accumulation_rounded_once() {
+        let device = Device::Cpu;
+        let xv = [1.0f32, 2.0, 3.0, 4.0];
+        let xh: Vec<f16> = xv.iter().map(|&v| f16::from_f32(v)).collect();
+        let gh = [f16::from_f32(1.0); 4];
+        let bv = [0.3f32, -0.7, 1.1, -1.5];
+        let bh: Vec<f16> = bv.iter().map(|&v| f16::from_f32(v)).collect();
+        let x = Tensor::from_slice(&xh, (1, 4), &device).unwrap();
+        let gamma = Tensor::from_slice(&gh, (4,), &device).unwrap();
+        let beta = Tensor::from_slice(&bh, (4,), &device).unwrap();
+        let out: Vec<f16> = ln_biased(1e-5, false, false, &x, &gamma, &beta)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        let xf: Vec<f64> = xh.iter().map(|v| v.to_f32() as f64).collect();
+        let mean: f64 = xf.iter().sum::<f64>() / xf.len() as f64;
+        let var: f64 = xf.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / xf.len() as f64;
+        let invvar = 1.0 / (var + 1e-5).sqrt();
+        let expected: Vec<f32> = xf
+            .iter()
+            .zip(bh.iter())
+            .map(|(&v, &b)| (((v - mean) * invvar) as f32) + b.to_f32())
+            .collect();
+
+        let mut max_rel: f32 = 0.0;
+        for (i, (o, e)) in out.iter().zip(expected.iter()).enumerate() {
+            let xhat_g = (((xf[i] - mean) * invvar) as f32).abs();
+            let beta_abs = bh[i].to_f32().abs();
+            let bound = (xhat_g + beta_abs) * 2.5e-3 + 1.25e-3;
+            assert!(
+                o.to_f32().is_finite() && (o.to_f32() - e).abs() < bound,
+                "{o} vs {e} (bound {bound})"
+            );
+            if *e != 0.0 {
+                max_rel = max_rel.max((o.to_f32() - e).abs() / e.abs());
+            }
+        }
+        println!("f16_forward_biased_matches_f32_accumulation_rounded_once: max_rel={max_rel}");
+    }
+
+    /// `beta` shape mismatch (rank-1, wrong length) is refused, not
+    /// broadcast — mirrors `gamma_shape_mismatch_is_refused_not_broadcast`.
+    #[test]
+    fn beta_shape_mismatch_is_refused_not_broadcast() {
+        let device = Device::Cpu;
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], (1, 4), &device).unwrap();
+        let gamma = Tensor::from_slice(&[1.0f32; 4], (4,), &device).unwrap();
+        let beta = Tensor::from_slice(&[0.0f32, 0.0, 0.0], (3,), &device).unwrap();
+        let err = ln_biased(1e-5, false, false, &x, &gamma, &beta)
+            .expect_err("beta hidden-size mismatch must be refused");
+        assert!(matches!(err, Error::ShapeMismatchBinaryOp { .. }));
+    }
+
+    /// `beta` dtype mismatch (vs `x`) is refused, not silently upcast.
+    #[test]
+    fn beta_dtype_mismatch_is_refused() {
+        let device = Device::Cpu;
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], (1, 4), &device).unwrap();
+        let gamma = Tensor::from_slice(&[1.0f32; 4], (4,), &device).unwrap();
+        let beta = Tensor::from_slice(&[bf16::from_f32(0.0); 4], (4,), &device).unwrap();
+        let err = ln_biased(1e-5, false, false, &x, &gamma, &beta)
+            .expect_err("beta dtype mismatch must be refused");
+        assert!(matches!(err, Error::DTypeMismatchBinaryOp { .. }));
+    }
+
+    /// A non-contiguous `beta` (a transposed view) is refused, not
+    /// silently misread — the same domain restriction `x`/`gamma` are
+    /// already held to.
+    #[test]
+    fn non_contiguous_beta_is_refused_not_silently_misread() {
+        let device = Device::Cpu;
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], (1, 4), &device).unwrap();
+        let gamma = Tensor::from_slice(&[1.0f32; 4], (4,), &device).unwrap();
+        // Column 0 of a `[4, 2]` tensor: a `[4]`-shaped view with stride 2
+        // (never contiguous), the same "strided VIEW, never reshaped
+        // afterward" shape `non_contiguous_x_is_refused_not_silently_
+        // misread` above uses via `.t()`.
+        let base = Tensor::from_slice(
+            &[1.0f32, 0.0, 2.0, 0.0, 3.0, 0.0, 4.0, 0.0],
+            (4, 2),
+            &device,
+        )
+        .unwrap();
+        let beta = base.narrow(1, 0, 1).unwrap().squeeze(1).unwrap();
+        assert!(!beta.is_contiguous());
+        assert_eq!(beta.dims(), &[4]);
+        let err = ln_biased(1e-5, false, false, &x, &gamma, &beta)
+            .expect_err("non-contiguous beta must be refused");
+        assert!(matches!(err, Error::RequiresContiguous { .. }));
+    }
+
+    /// The bias-free twin of [`hidden_zero_biased_f16_is_a_no_op_not_an_error`]
+    /// below: `(F16, hidden == 0)` through the PRE-EXISTING [`LayerNormFused`]
+    /// op (not `LayerNormBiasedFused`) — the SAME `empty_like` CPU/CUDA
+    /// domain gap #460 closes (see `ops::mod`'s own
+    /// `empty_like_f16_hidden_zero_matches_f32_and_bf16_shape` for the
+    /// helper-level unit), exercised end-to-end through this bias-free
+    /// op's real `cpu_fwd` on CPU: must return an EMPTY output, not an
+    /// error.
+    #[test]
+    fn hidden_zero_f16_is_a_no_op_not_an_error() {
+        let device = Device::Cpu;
+        let x = Tensor::from_slice(&[] as &[f16], (3, 0), &device).unwrap();
+        let gamma = Tensor::from_slice(&[] as &[f16], (0,), &device).unwrap();
+        let out = ln(1e-5, false, &x, &gamma)
+            .unwrap()
+            .to_vec2::<f16>()
+            .unwrap();
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|row| row.is_empty()));
+    }
+
+    /// `hidden == 0` is a no-op on F16 too (the CPU/CUDA domain gap #460
+    /// closes in `empty_like` — see `ops::mod`'s own test for the
+    /// `empty_like` unit itself; this is the SAME gap exercised through
+    /// this op's real `cpu_fwd`).
+    #[test]
+    fn hidden_zero_biased_f16_is_a_no_op_not_an_error() {
+        let device = Device::Cpu;
+        let x = Tensor::from_slice(&[] as &[f16], (3, 0), &device).unwrap();
+        let gamma = Tensor::from_slice(&[] as &[f16], (0,), &device).unwrap();
+        let beta = Tensor::from_slice(&[] as &[f16], (0,), &device).unwrap();
+        let out = ln_biased(1e-5, false, false, &x, &gamma, &beta)
+            .unwrap()
+            .to_vec2::<f16>()
+            .unwrap();
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|row| row.is_empty()));
+    }
+
+    /// Beta-independence (K4-style): `dx`/`dgamma` from
+    /// `LayerNormBiasedFused::bwd` must be BITWISE IDENTICAL to
+    /// `LayerNormFused::bwd`'s own, given the same `x`/`gamma` and the
+    /// same upstream gradient — `dx`/`dgamma`'s math has no `beta` term at
+    /// all (see this op's own doc). `.sum_all()` makes the upstream
+    /// gradient into each op's `grad_res` a tensor of all-`1.0`s
+    /// regardless of the forward VALUES (which do differ, by `beta`), so
+    /// this isolates exactly the beta-independence claim, not a
+    /// coincidental numeric agreement.
+    #[test]
+    fn biased_bwd_dx_and_dgamma_are_bitwise_identical_to_the_bias_free_op() {
+        let device = Device::Cpu;
+        let hidden = 4;
+        let rows = 2;
+        let xv: Vec<f32> = (0..rows * hidden)
+            .map(|i| (i as f32 * 0.37 - 1.1).sin() * 2.0)
+            .collect();
+        let gv: Vec<f32> = (0..hidden).map(|i| 0.7 + i as f32 * 0.2).collect();
+        let bv: Vec<f32> = (0..hidden).map(|i| -0.3 + i as f32 * 0.05).collect();
+
+        let x1 =
+            Var::from_tensor(&Tensor::from_slice(&xv, (rows, hidden), &device).unwrap()).unwrap();
+        let g1 = Var::from_tensor(&Tensor::from_slice(&gv, (hidden,), &device).unwrap()).unwrap();
+        let out1 = ln(1e-5, true, x1.as_tensor(), g1.as_tensor()).unwrap();
+        let grads1 = out1.sum_all().unwrap().backward().unwrap();
+        let dx1: Vec<f32> = grads1
+            .get(&x1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let dg1: Vec<f32> = grads1.get(&g1).unwrap().to_vec1().unwrap();
+
+        let x2 =
+            Var::from_tensor(&Tensor::from_slice(&xv, (rows, hidden), &device).unwrap()).unwrap();
+        let g2 = Var::from_tensor(&Tensor::from_slice(&gv, (hidden,), &device).unwrap()).unwrap();
+        let b2 = Tensor::from_slice(&bv, (hidden,), &device).unwrap();
+        let out2 = ln_biased(1e-5, true, false, x2.as_tensor(), g2.as_tensor(), &b2).unwrap();
+        let grads2 = out2.sum_all().unwrap().backward().unwrap();
+        let dx2: Vec<f32> = grads2
+            .get(&x2)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let dg2: Vec<f32> = grads2.get(&g2).unwrap().to_vec1().unwrap();
+
+        assert_eq!(dx1, dx2, "dx must be beta-independent, bitwise");
+        assert_eq!(dg1, dg2, "dgamma must be beta-independent, bitwise");
+    }
+
+    /// `dbeta_needed = false` must leave `beta`'s gradient slot
+    /// unpopulated (candle's own backward walk then either skips it or
+    /// panics if something downstream demanded it — see this op's own
+    /// module doc); `dbeta_needed = true` must populate it with EXACT
+    /// column sums of `dy` (an integer fixture makes the sum exact in
+    /// f32, no rounding-tolerance judgment call needed at all).
+    #[test]
+    fn dbeta_needed_gates_the_beta_gradient_slot_exact_on_integer_dy() {
+        let device = Device::Cpu;
+        let hidden = 3;
+        let rows = 2;
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (rows, hidden), &device)
+            .unwrap();
+        let gamma = Tensor::from_slice(&[1.0f32; 3], (hidden,), &device).unwrap();
+
+        // dbeta_needed = false: beta must get no gradient at all.
+        let x1 = Var::from_tensor(&x).unwrap();
+        let beta1 =
+            Var::from_tensor(&Tensor::zeros((hidden,), DType::F32, &device).unwrap()).unwrap();
+        let out1 = ln_biased(
+            1e-5,
+            false,
+            false,
+            x1.as_tensor(),
+            &gamma,
+            beta1.as_tensor(),
+        )
+        .unwrap();
+        let grads1 = out1.sum_all().unwrap().backward().unwrap();
+        assert!(
+            grads1.get(&beta1).is_none(),
+            "dbeta_needed = false must leave beta's gradient slot unpopulated"
+        );
+
+        // dbeta_needed = true: exact column sums of dy. `.sum_all()`'s own
+        // upstream gradient is all-1.0, so `dbeta_i = sum_rows(1.0) =
+        // rows` for every column exactly — an integer result in f32.
+        let x2 = Var::from_tensor(&x).unwrap();
+        let beta2 =
+            Var::from_tensor(&Tensor::zeros((hidden,), DType::F32, &device).unwrap()).unwrap();
+        let out2 = ln_biased(1e-5, false, true, x2.as_tensor(), &gamma, beta2.as_tensor()).unwrap();
+        let grads2 = out2.sum_all().unwrap().backward().unwrap();
+        let dbeta2: Vec<f32> = grads2
+            .get(&beta2)
+            .expect("dbeta_needed = true must populate beta's gradient")
+            .to_vec1()
+            .unwrap();
+        assert_eq!(dbeta2, vec![rows as f32; hidden]);
+    }
+
+    /// The `(dgamma_needed, dbeta_needed) = (true, true)` lattice cell —
+    /// every other `ln_biased` call site above exercises `(false, false)`,
+    /// `(true, false)`, or `(false, true)`, but none exercises BOTH slots
+    /// `Some` in the SAME `bwd` call. A construction bug that only shows up
+    /// when both gates fire together (e.g. one slot's computation
+    /// clobbering shared state the other reads) would be invisible to
+    /// every other test in this file. `dy = 1` (via `.sum_all()`) makes
+    /// `dbeta_i = rows` exactly (same fixture discipline as
+    /// `dbeta_needed_gates_the_beta_gradient_slot_exact_on_integer_dy`);
+    /// `dgamma_i = sum_rows(xhat_i)` is checked against an independently
+    /// computed f64 reference (not integer-exact, since it depends on
+    /// `sqrt`, hence a tight tolerance rather than `assert_eq!`).
+    #[test]
+    fn dgamma_needed_and_dbeta_needed_both_true_populates_both_slots_correctly_in_one_bwd() {
+        let device = Device::Cpu;
+        let hidden = 3;
+        let rows = 2;
+        let xv = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let x =
+            Var::from_tensor(&Tensor::from_slice(&xv, (rows, hidden), &device).unwrap()).unwrap();
+        let gamma =
+            Var::from_tensor(&Tensor::from_slice(&[1.0f32; 3], (hidden,), &device).unwrap())
+                .unwrap();
+        let beta =
+            Var::from_tensor(&Tensor::zeros((hidden,), DType::F32, &device).unwrap()).unwrap();
+
+        let out = ln_biased(
+            1e-5,
+            true,
+            true,
+            x.as_tensor(),
+            gamma.as_tensor(),
+            beta.as_tensor(),
+        )
+        .unwrap();
+        let grads = out.sum_all().unwrap().backward().unwrap();
+
+        let dbeta: Vec<f32> = grads
+            .get(&beta)
+            .expect("dbeta_needed = true must populate beta's gradient")
+            .to_vec1()
+            .unwrap();
+        assert_eq!(
+            dbeta,
+            vec![rows as f32; hidden],
+            "dbeta must stay exact-integer even with dgamma_needed also true"
+        );
+
+        let dgamma: Vec<f32> = grads
+            .get(&gamma)
+            .expect("dgamma_needed = true must populate gamma's gradient")
+            .to_vec1()
+            .unwrap();
+        let mut expected_dgamma = vec![0f64; hidden];
+        for r in 0..rows {
+            let row = &xv[r * hidden..(r + 1) * hidden];
+            let mean: f64 = row.iter().map(|&v| v as f64).sum::<f64>() / hidden as f64;
+            let var: f64 =
+                row.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / hidden as f64;
+            let invvar = 1.0 / (var + 1e-5).sqrt();
+            for (i, &v) in row.iter().enumerate() {
+                // dy == 1.0 uniformly (via `.sum_all()`), so the `dy_i`
+                // factor in `dgamma_i = sum_rows(dy_i * xhat_i)` drops out.
+                expected_dgamma[i] += (v as f64 - mean) * invvar;
+            }
+        }
+        for (i, (&got, &exp)) in dgamma.iter().zip(expected_dgamma.iter()).enumerate() {
+            assert!(
+                (got as f64 - exp).abs() < 1e-4,
+                "dgamma[{i}] = {got} vs expected {exp} (dbeta_needed also true must not perturb \
+                 dgamma's own value)"
+            );
+        }
+    }
+
+    /// `dbeta_from_grad` in isolation, with a NON-uniform `dy` (so a
+    /// broadcast/order bug in the reduction can't hide behind every
+    /// column being equal) — exact column sums on an integer fixture.
+    #[test]
+    fn dbeta_from_grad_is_exact_column_sums_on_integer_dy() {
+        let device = Device::Cpu;
+        // dy: [rows=3, hidden=2] = [[1,2],[3,4],[5,6]] -> column sums
+        // [1+3+5, 2+4+6] = [9, 12].
+        let dy = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (3, 2), &device).unwrap();
+        let dbeta: Vec<f32> = dbeta_from_grad(&dy, DType::F32).unwrap().to_vec1().unwrap();
+        assert_eq!(dbeta, vec![9.0f32, 12.0]);
+    }
+
+    /// `dbeta_from_grad` on a rank-1 `dy` (no batch dim at all — a single
+    /// "row") must be the identity: `dbeta = dy` itself, exactly.
+    #[test]
+    fn dbeta_from_grad_rank1_is_the_identity() {
+        let device = Device::Cpu;
+        let dy = Tensor::from_slice(&[1.0f32, -2.0, 3.5], (3,), &device).unwrap();
+        let dbeta: Vec<f32> = dbeta_from_grad(&dy, DType::F32).unwrap().to_vec1().unwrap();
+        assert_eq!(dbeta, vec![1.0f32, -2.0, 3.5]);
+    }
+
     /// Cosmetic `name()` survivors (this file's three ops). What the
     /// snapshot pins: `name()` is the `op` payload of every typed refusal
     /// an op here raises on its CPU arm (`hidden_of(.., self.name())`,
@@ -1318,6 +2168,10 @@ mod tests {
             LayerNormBwdDgamma { eps: 1e-5 }.name(),
             "layer_norm_fused_bwd_dgamma"
         );
+        assert_eq!(
+            LayerNormBiasedFused::new(1e-5, false, false).name(),
+            "layer_norm_biased_fused"
+        );
     }
 
     /// The CUDA arm fills the SAME `op` payload field from a fn-local
@@ -1335,6 +2189,7 @@ mod tests {
             LayerNormFused::new(1e-5, false).name(),
             LayerNormBwdDx { eps: 1e-5 }.name(),
             LayerNormBwdDgamma { eps: 1e-5 }.name(),
+            LayerNormBiasedFused::new(1e-5, false, false).name(),
         ];
         let cuda_src = include_str!("../cuda/layer_norm.rs");
         assert_eq!(

@@ -36,10 +36,12 @@
 //! `SOFTMAX_DISPATCH_COUNTERS`, `GEGLU_DISPATCH_COUNTERS`) have SINCE been
 //! migrated onto this registry themselves — each is now a
 //! `LazyLock<&'static DispatchCounters>` that calls `counters_for(..)`
-//! under the hood (`crates/jammi-encoders/src/layer_norm.rs:91-92`,
-//! `crates/jammi-encoders/src/modernbert.rs:149-150,163-164,1220-1221`;
-//! `ATTENTION_BLOCK_DISPATCH_COUNTERS` at `modernbert.rs:579-580` is a
-//! fifth, added the same way rather than as a sixth hand-declared static).
+//! under the hood: `LN_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/layer_norm.rs:128`;
+//! `ROPE_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/modernbert.rs:189`;
+//! `SOFTMAX_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/modernbert.rs:203`;
+//! `GEGLU_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/modernbert.rs:1899`
+//! (`ATTENTION_BLOCK_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/modernbert.rs:683`
+//! is a fifth, added the same way rather than as a sixth hand-declared static).
 //! The paragraph above is kept for its historical rationale (why the
 //! registry exists at all), not as a description of the current state —
 //! there are no hand-declared `DispatchCounters::new()` statics left
@@ -83,10 +85,10 @@
 //! unmatched rather than silently accepted).
 //!
 //! **Live standalone** (reachable directly, own call site, own predicate):
-//! `"layer_norm_fused"` (`jammi-encoders/src/layer_norm.rs:189`),
-//! `"geglu_fused"` (`jammi-encoders/src/modernbert.rs:1259`),
-//! `"lora_linear_fused"` (`jammi-lora/src/lora_linear.rs:642-644`), and
-//! `"attention_block_fused"` itself (`modernbert.rs:930`).
+//! `"layer_norm_fused"` (`jammi-encoders/src/layer_norm.rs:582`),
+//! `"geglu_fused"` (`jammi-encoders/src/modernbert.rs:1944`),
+//! `"lora_linear_fused"` (`jammi-lora/src/lora_linear.rs:958`), and
+//! `"attention_block_fused"` (`jammi-encoders/src/modernbert.rs:1348`) itself.
 //!
 //! **Subsumed** (reachable ONLY when `"attention_block_fused"` is ALSO
 //! disabled, forcing `forward_training_attention` into
@@ -97,11 +99,11 @@
 //! (`modernbert.rs:1188`).
 //!
 //! **Subsumed by `"lora_linear_fused"`** (reachable ONLY when
-//! `"lora_linear_fused"` itself admits Fused — `crate::ops::
-//! LowRankResidualLinear::bwd` is the sole call site that ever passes
-//! either key to [`admit`], and `LowRankResidualLinear` is only
-//! constructed on the branch where `lora_linear_fused` already admitted;
-//! see `jammi-lora/src/lora_linear.rs:642-644` and `ops::cast_scale`'s
+//! `"lora_linear_fused"` (`jammi-lora/src/lora_linear.rs:958`) itself
+//! admits Fused — `crate::ops::LowRankResidualLinear::bwd` is the sole
+//! call site that ever passes either key to [`admit`], and
+//! `LowRankResidualLinear` is only constructed on the branch where
+//! `lora_linear_fused` already admitted; see `ops::cast_scale`'s
 //! module doc's "cast-boundary lever"): `"cast_scale_bf16_f32"` and
 //! `"cast_add_bf16"` (`ops/low_rank_residual_linear.rs`'s
 //! `admit_cast_boundary`, called at its B1/B3 sites). Each ALSO has its
@@ -1711,19 +1713,19 @@ impl ProbedOp {
 ///
 /// | report key | kind | registry key(s) | call site |
 /// |---|---|---|---|
-/// | `layer_norm` | TwoArm | `layer_norm_fused` | `crates/jammi-encoders/src/layer_norm.rs:103` |
-/// | `rope` | TwoArm | `rope_fused` | `crates/jammi-encoders/src/modernbert.rs:190` |
-/// | `softmax` | TwoArm | `softmax_last_dim_fused` | `crates/jammi-encoders/src/modernbert.rs:204` |
-/// | `geglu` | TwoArm | `geglu_fused` | `crates/jammi-encoders/src/modernbert.rs:1888` |
-/// | `attention_block` | TwoArm | `attention_block_fused` | `crates/jammi-encoders/src/modernbert.rs:684` |
-/// | `dropout` | TwoArm | `lora_linear_fused` | `crates/jammi-lora/src/lora_linear.rs:205` (`admit` at `:799`) |
-/// | `low_rank_residual_linear` | TwoArm | `lora_linear_fused` | `crates/jammi-lora/src/lora_linear.rs:205` (`admit` at `:799`) |
-/// | `cast_scale` | TwoArm | bf16 → `cast_scale_bf16_f32`, f16 → `cast_scale_f16_f32` | `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:800`, `:814` |
-/// | `cast_add` | TwoArm | bf16 → `cast_add_bf16`, f16 → `cast_add_f16` | `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:899`, `:911` |
-/// | `adamw_step` | TwoArm | `adamw_step_fused` | `crates/jammi-ai/src/fine_tune/adamw.rs:33` (`admit` at `:257`) |
-/// | `mem_efficient_attention` | Cascade | `mem_efficient_attention` | `crates/jammi-encoders/src/modernbert.rs:1303` |
-/// | `rope_positions` | InternalSubkernel(`attention_block_flash`) | — | `crates/jammi-kernels/src/ops/flash_attention.rs:645` |
-/// | `scaled_cast_add` | InternalSubkernel(`low_rank_residual_linear`) | — | `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:693` (CPU), `crates/jammi-kernels/src/cuda/low_rank_residual_linear.rs:131` (CUDA) |
+/// | `layer_norm` | TwoArm | `layer_norm_fused` | `layer_norm_fused`, `crates/jammi-encoders/src/layer_norm.rs:129` |
+/// | `rope` | TwoArm | `rope_fused` | `rope_fused`, `crates/jammi-encoders/src/modernbert.rs:190` |
+/// | `softmax` | TwoArm | `softmax_last_dim_fused` | `softmax_last_dim_fused`, `crates/jammi-encoders/src/modernbert.rs:204` |
+/// | `geglu` | TwoArm | `geglu_fused` | `geglu_fused`, `crates/jammi-encoders/src/modernbert.rs:1900` |
+/// | `attention_block` | TwoArm | `attention_block_fused` | `attention_block_fused`, `crates/jammi-encoders/src/modernbert.rs:684` |
+/// | `dropout` | TwoArm | `lora_linear_fused` | `lora_linear_fused`, `crates/jammi-lora/src/lora_linear.rs:958` (`admit` call site) |
+/// | `low_rank_residual_linear` | TwoArm | `lora_linear_fused` | `lora_linear_fused`, `crates/jammi-lora/src/lora_linear.rs:958` (`admit` call site) |
+/// | `cast_scale` | TwoArm | bf16 → `cast_scale_bf16_f32`, f16 → `cast_scale_f16_f32` | `cast_scale_bf16_f32`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1054`; `cast_scale_f16_f32`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1068` |
+/// | `cast_add` | TwoArm | bf16 → `cast_add_bf16`, f16 → `cast_add_f16` | `cast_add_bf16`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1153`; `cast_add_f16`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1165` |
+/// | `adamw_step` | TwoArm | `adamw_step_fused` | `adamw_step_fused`, `crates/jammi-ai/src/fine_tune/adamw.rs:33` (`admit`, `crates/jammi-ai/src/fine_tune/adamw.rs:257`) |
+/// | `mem_efficient_attention` | Cascade | `mem_efficient_attention` | `mem_efficient_attention`, `crates/jammi-encoders/src/modernbert.rs:1311` |
+/// | `rope_positions` | InternalSubkernel(`attention_block_flash`) | — | `rope_positions`, `crates/jammi-kernels/src/ops/flash_attention.rs:645` |
+/// | `scaled_cast_add` | InternalSubkernel(`low_rank_residual_linear`) | — | `ScaledCastAdd`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:946` (CPU), `ScaledCastAdd`, `crates/jammi-kernels/src/cuda/low_rank_residual_linear.rs:142` (CUDA) |
 ///
 /// **`adamw_step`: the optimizer's dtype DOMAIN is not a dtype CLASS.**
 /// `adamw_step_fused`'s own admission predicate requires
@@ -1757,8 +1759,8 @@ impl ProbedOp {
 /// the cited call site during this population, and excluded for a stated
 /// reason — an omission with no reason is how finding 2 happened):
 ///
-/// - `attention_block_flash` (`crates/jammi-encoders/src/modernbert.rs:1259`,
-///   `:1556`) — a real cascade, but the esc-075 report surfaces it through
+/// - `attention_block_flash` (`crates/jammi-encoders/src/modernbert.rs:1267`,
+///   `:1564`) — a real cascade, but the esc-075 report surfaces it through
 ///   its OWN dedicated top-level `flash` field (with the compiled/device
 ///   short-circuit reasons a plain `ops` entry cannot express), and
 ///   `ci/release-feature-manifest.json` declares it as `flash_compiled` +

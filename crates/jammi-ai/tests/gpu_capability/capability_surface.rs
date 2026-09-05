@@ -242,8 +242,8 @@ fn dtype_class(p: ComputePrecision) -> DtypeClass {
 ///
 /// `"dropout"` and `"low_rank_residual_linear"` both resolve to
 /// `lora_linear_fused` — that is a fact of the table now, not of this file
-/// (`crates/jammi-lora/src/lora_linear.rs:37`'s own doc: the separate
-/// `lora_dropout` counter is "Permanently `{fused: 0, eager: 0}` today";
+/// (the separate `lora_dropout` counter is permanently `{fused: 0, eager: 0}`,
+/// `crates/jammi-lora/src/lora_linear.rs:22`, per that counter's own doc;
 /// dropout is consumed directly inside `LowRankResidualLinear`'s own
 /// fused-or-eager arm, folded into the SAME dispatch decision).
 ///

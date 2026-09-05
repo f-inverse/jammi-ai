@@ -575,3 +575,69 @@ fn distilbert_lora_bias_site_eval_matches_a_hand_composed_eager_reference_at_non
          still reproduces plain LoRA math exactly"
     );
 }
+
+/// #460 (C-LN): DistilBERT's twin of
+/// `bert::bert_biased_layer_norm_counter_threading_gates_the_ln_dispatch_counters`
+/// — before this unit, every DistilBERT LayerNorm (also all biased) fell
+/// through `slow()` with no `admit()` call at all, so its own `ln`
+/// dispatch-counter pair read `0/0` on a real training run too.
+#[test]
+fn distilbert_biased_layer_norm_counter_threading_gates_the_ln_dispatch_counters() {
+    let _guard = crate::modernbert::DISPATCH_COUNTER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let device = Device::Cpu;
+    let config = tiny_config();
+    let (_dir, weights_path) = write_synthetic_weights(&config, &device);
+
+    let varmap = VarMap::new();
+    let mut encoder = DistilBert::builder()
+        .pooling(Pooling::Mean)
+        .lora(LoraBuildConfig::frozen())
+        .backbone_dtype(DType::F32)
+        .adapter(None)
+        .build(&[weights_path.as_path()], &config, &device, &varmap)
+        .expect("builder succeeds on synthetic weights");
+
+    let input_ids = Tensor::new(&[[1u32, 2, 3, 4, 5]], &device).unwrap();
+    let mask = Tensor::new(&[[1u32, 1, 1, 1, 1]], &device).unwrap();
+
+    encoder.set_training(false);
+    let before_eval = jammi_encoders::ln_dispatch_snapshot();
+    let _ = encoder
+        .forward_hidden(&input_ids, &mask)
+        .expect("eval forward");
+    let after_eval = jammi_encoders::ln_dispatch_snapshot();
+    assert_eq!(
+        (after_eval.fused, after_eval.eager),
+        (before_eval.fused, before_eval.eager),
+        "eval-mode forward must never touch the `ln` dispatch counters at all \
+         (before={before_eval:?}, after={after_eval:?})"
+    );
+
+    encoder.set_training(true);
+    let before_train = jammi_encoders::ln_dispatch_snapshot();
+    let _ = encoder
+        .forward_hidden(&input_ids, &mask)
+        .expect("training forward");
+    let after_train = jammi_encoders::ln_dispatch_snapshot();
+    assert!(
+        after_train.fused > before_train.fused && after_train.eager == before_train.eager,
+        "training-mode forward on an all-biased DistilBERT must dispatch the fused \
+         LayerNorm kernel at least once and never fall back to the eager path \
+         (before={before_train:?}, after={after_train:?})"
+    );
+
+    encoder.set_training(false);
+    let before_eval2 = jammi_encoders::ln_dispatch_snapshot();
+    let _ = encoder
+        .forward_hidden(&input_ids, &mask)
+        .expect("eval forward again");
+    let after_eval2 = jammi_encoders::ln_dispatch_snapshot();
+    assert_eq!(
+        (after_eval2.fused, after_eval2.eager),
+        (before_eval2.fused, before_eval2.eager),
+        "set_training(false) must restore the eval-only path -- neither counter advances \
+         (before={before_eval2:?}, after={after_eval2:?})"
+    );
+}

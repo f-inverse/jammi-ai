@@ -352,3 +352,127 @@ extern "C" __global__ void layer_norm_cast_f32_to_bf16(
         dst[i] = __float2bfloat16(src[i]);
     }
 }
+
+// ---------------------------------------------------------------------
+// #460 (C-LN): bias-carrying forward, F32/BF16. APPEND-ONLY from here —
+// every kernel ABOVE this comment is byte-for-byte unchanged by this
+// addition (a `git diff` restricted to the lines above this block, at the
+// #460 unit's tip vs its base, is empty); the bias-free symbols
+// (`layer_norm_fwd_f32`/`layer_norm_fwd_bf16`) are therefore bit-identical
+// by construction, not merely "not intended to change" — nothing below
+// this line is reachable from them.
+//
+// `y = ((x - mean) * invvar) * gamma + beta`, matching ATen's
+// `vectorized_layer_norm_kernel_impl`/`LayerNormForwardCUDAKernel` (torch
+// v2.8.0 `aten/src/ATen/native/cuda/layer_norm_kernel.cu:93-112`, pinned by
+// `jammi_encoders::layer_norm::LayerNorm::slow`'s own doc citation):
+// "Computation is performed in T_ACC ... result is implicitly cast to T" —
+// gamma AND beta both applied in the f32 accumulator, ONE cast to the
+// output dtype at the very end. `--fmad=true` is on for this crate's build
+// (see `../../build.rs`), so this is written as the literal
+// `xhat * gamma[i] + beta[i]` expression (an FMA-eligible form), never a
+// `+ 0.0f` sentinel that would defeat fusion into the mul.
+//
+// Each per-dtype row body below is its OWN `template <bool HAS_BETA>`
+// `__device__ __forceinline__` definition, specialised at COMPILE TIME
+// (never a runtime null-pointer branch) — NOT shared with the pre-existing
+// bias-free row body above this comment block. Because the bias-free
+// kernels above are byte-untouched (this block's own opening claim), their
+// mean/var reduction is a SEPARATE, textually duplicated copy from this
+// template's `HAS_BETA = false` arithmetic path — an accepted drift
+// surface: a future change to one row-math body (e.g. a different
+// reduction order) will NOT automatically propagate to the other, and
+// nothing here enforces they stay in sync beyond this file's own review
+// and the CPU<->CUDA parity suite (`cuda_parity.rs`) exercising both. This
+// duplication is the direct, deliberate cost of the bit-identity-by-
+// construction guarantee this block's opening comment makes: keeping the
+// pre-existing kernel bytes untouched (provable via `git diff`) requires
+// NOT refactoring it into a shared template the new kernel also
+// instantiates. Only the `HAS_BETA = true` instantiation of this NEW
+// template is ever emitted as a kernel below — `LayerNormBiasedFused`
+// (`../ops/layer_norm.rs`) is a `CustomOp3` with a REQUIRED (non-nullable)
+// `beta` tensor, so a `HAS_BETA = false` instantiation has no caller
+// today; the template stays generic (not hand-monomorphised to `true`) so
+// a future nullable-beta caller costs no kernel-body rewrite, only a new
+// `extern "C"` wrapper — it would NOT, by itself, deduplicate the two row
+// bodies, since the bias-free kernel above would still need to be
+// rewritten to call this template instead of its own inline arithmetic.
+// ---------------------------------------------------------------------
+
+template <bool HAS_BETA>
+__device__ __forceinline__ void ln_fwd_row_body_f32(
+    const float* xr, const float* gamma, const float* beta, float* yr,
+    const unsigned int hidden, const float eps, float* scratch
+) {
+    float sum = 0.0f;
+    for (unsigned int i = threadIdx.x; i < hidden; i += blockDim.x) sum += xr[i];
+    sum = block_reduce_sum(sum, scratch);
+    float mean = sum / (float)hidden;
+
+    float sumsq = 0.0f;
+    for (unsigned int i = threadIdx.x; i < hidden; i += blockDim.x) {
+        float d = xr[i] - mean;
+        sumsq += d * d;
+    }
+    sumsq = block_reduce_sum(sumsq, scratch);
+    float invvar = rsqrtf(sumsq / (float)hidden + eps);
+
+    for (unsigned int i = threadIdx.x; i < hidden; i += blockDim.x) {
+        float xhat = (xr[i] - mean) * invvar;
+        yr[i] = HAS_BETA ? (xhat * gamma[i] + beta[i]) : (xhat * gamma[i]);
+    }
+}
+
+extern "C" __global__ void layer_norm_fwd_f32_biased(
+    const float* x, const float* gamma, const float* beta, float* y,
+    const unsigned int hidden, const float eps
+) {
+    __shared__ float scratch[LN_BLOCK];
+    size_t row = blockIdx.x;
+    ln_fwd_row_body_f32<true>(
+        x + row * (size_t)hidden, gamma, beta, y + row * (size_t)hidden,
+        hidden, eps, scratch
+    );
+}
+
+template <bool HAS_BETA>
+__device__ __forceinline__ void ln_fwd_row_body_bf16(
+    const __nv_bfloat16* xr, const __nv_bfloat16* gamma,
+    const __nv_bfloat16* beta, __nv_bfloat16* yr, const unsigned int hidden,
+    const float eps, float* scratch
+) {
+    float sum = 0.0f;
+    for (unsigned int i = threadIdx.x; i < hidden; i += blockDim.x) {
+        sum += __bfloat162float(xr[i]);
+    }
+    sum = block_reduce_sum(sum, scratch);
+    float mean = sum / (float)hidden;
+
+    float sumsq = 0.0f;
+    for (unsigned int i = threadIdx.x; i < hidden; i += blockDim.x) {
+        float d = __bfloat162float(xr[i]) - mean;
+        sumsq += d * d;
+    }
+    sumsq = block_reduce_sum(sumsq, scratch);
+    float invvar = rsqrtf(sumsq / (float)hidden + eps);
+
+    for (unsigned int i = threadIdx.x; i < hidden; i += blockDim.x) {
+        float xhat = (__bfloat162float(xr[i]) - mean) * invvar;
+        float scaled = xhat * __bfloat162float(gamma[i]);
+        float outv = HAS_BETA ? (scaled + __bfloat162float(beta[i])) : scaled;
+        yr[i] = __float2bfloat16(outv);
+    }
+}
+
+extern "C" __global__ void layer_norm_fwd_bf16_biased(
+    const __nv_bfloat16* x, const __nv_bfloat16* gamma,
+    const __nv_bfloat16* beta, __nv_bfloat16* y, const unsigned int hidden,
+    const float eps
+) {
+    __shared__ float scratch[LN_BLOCK];
+    size_t row = blockIdx.x;
+    ln_fwd_row_body_bf16<true>(
+        x + row * (size_t)hidden, gamma, beta, y + row * (size_t)hidden,
+        hidden, eps, scratch
+    );
+}

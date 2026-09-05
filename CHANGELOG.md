@@ -7,6 +7,32 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Added
+- **The fused LayerNorm site admits a bias-carrying affine (#460).** `LayerNormBiasedFused`
+  (`jammi_kernels::ops::LayerNormBiasedFused`) is a new public export — BERT, DistilBERT, and
+  CLIP-text all carry a bias on their LayerNorms, and each now trains through the fused site instead
+  of falling back to the eager, unfused composition. The biased and bias-free forwards dispatch
+  through the SAME `layer_norm_fused` admit key and the SAME `ln` dispatch counters — a biased run is
+  not a second, parallel accounting lane. `dbeta` is an ordinary `to_dtype` + column-sum composition
+  over the upstream gradient, not a fused reduction kernel of its own (see the mechanism correction
+  below). Three new CUDA symbols back the forward: `layer_norm_fwd_f32_biased`,
+  `layer_norm_fwd_bf16_biased`, `layer_norm_fwd_f16_biased`. The per-op A/B driver
+  (`ci/scripts/perf/lora_bias_ab.sh`) gains an `AB_OP=ln` mode to isolate this site's own fused-vs-eager
+  difference. Measured on an A100 (#460, `crates/jammi-kernels/artifacts/cuda-runs/2026-09-05-ln-bias-460-6c6d79c-a100-pcie.json`):
+  per-step wall gains of 9–25% across both BERT and DistilBERT and both activating shapes, with the
+  LoRA site already fused on both arms of the sweep; the site lands by architectural direction (one
+  common LayerNorm path) rather than a pre-registered activation bar, so the ACTIVATE verdicts are the
+  measured classification only.
+- **The citation checker resolves cites in `ci/scripts/perf/**` and Rust crate comments; sha-pinned
+  cites resolve sha-relatively (#459).** `check_citations.py` gained a full-path citation form for
+  `ci/scripts/perf/**`'s own `.sh`/`.py` files and for `//`/`///`/`//!` line comments, doc block
+  comments (`/** */`/`/*! */`), and `#[doc = "..."]` attributes across `crates/**/*.rs` — a citation in
+  either scope now resolves (or fails) exactly like a maintainer-guide citation already did. An inline
+  `at HEAD `<sha>`` / `at `<sha>`` / `as of `<sha7+>`` pin on a citation in either new scope resolves
+  against that commit's own tree, append-only, the same discipline an artifact's own `git_sha` field
+  already gets. The Rust comment lexer also now models char literals (`'x'`, escapes, byte forms) and
+  raw strings correctly — an unmodeled `'"'` char literal previously opened a phantom string that
+  silently dropped every real comment line after it from the scan until the next unrelated `"`. Every
+  citation this drift left stale under `ci/**`/`docs/**` is re-pointed at this tip.
 - **The fused LoRA site admits a bias-carrying frozen base (#428).** `LowRankResidualLinear`
   (`jammi_kernels::ops::LowRankResidualLinear`) no longer refuses a base linear layer that carries a
   bias — every BERT/DistilBERT LoRA site (both carry a bias on every frozen `Linear`) now takes the
@@ -26,6 +52,15 @@ workspace ships every publishable crate at the same
   table and mechanism in `docs/maintainer/fine-tune-performance-guide.md` §4).
 
 ### Changed
+- **The affine three-way gate now applies to the bias-free LayerNorm arm too.** A tracked-but-not-
+  `Var` `gamma` is now a typed error on the bias-free path (previously it ran fused with `dgamma`
+  silently dropped) — the same gate the bias-carrying site already enforces on `gamma`/`beta`
+  independently.
+- **Under `JAMMI_KERNELS_STRICT=1`, a biased LayerNorm on Metal, or with a dtype-mismatched bias, is
+  now a typed error** — previously it silently took the slow (eager) path instead of admitting the
+  Strict-mode failure it actually hit.
+- **`empty_like` gains an `F16` arm** — `(F16, hidden == 0)` now produces an empty output on CPU,
+  matching the existing CUDA behavior for the same shape.
 - **Every release-publishing job gates on the commit's GPU-prove verdict, all-or-nothing — not only
   the CUDA lanes (#454 follow-up).** `crates.yml`'s `publish` (and `github-release`, chained off it),
   `npm.yml`'s `publish` (gated at its `Publish` step, so the build+test dry run still runs

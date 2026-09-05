@@ -819,6 +819,40 @@ mod tests {
         }
     }
 
+    /// #460 (C-LN): CLIP-text's LayerNorms (`ln_1`/`ln_2` per block,
+    /// `ln_final`) are ALL biased (`LayerNorm::new(.., with_bias: true,
+    /// ..)`) and reachable at `training == true` through
+    /// `AnyEncoder::set_training` (see `any::tests::
+    /// any_encoder_set_training_reaches_clip_text_q_k_gradient`, which
+    /// proves the SAME `set_training` wiring for its attention gradient).
+    /// Before this unit, every one of them fell through `slow()` with no
+    /// `admit()` call at all — the same `ln` `0/0` gap BERT/DistilBERT
+    /// had. This is the one NEW assertion #460 adds here: the training
+    /// dispatch is now COUNTED, on top of the gradient oracles above
+    /// (which stay green, unmodified, proving this doesn't change their
+    /// correctness claim).
+    #[test]
+    fn clip_text_training_ln_dispatch_is_now_counted() {
+        let cfg = tiny_config();
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mut model = ClipText::load(vb, &cfg).unwrap();
+        deterministic_fill_varmap(&varmap, &device);
+        model.set_training(true);
+
+        let (input_ids, mask) = fixed_batch(&cfg, &device);
+        let before = crate::ln_dispatch_snapshot();
+        let _ = model.forward(&input_ids, &mask).unwrap();
+        let after = crate::ln_dispatch_snapshot();
+        assert!(
+            after.fused > before.fused,
+            "CLIP-text's biased LayerNorms must dispatch the fused `layer_norm_fused` key \
+             at training=true, not fall through slow() uncounted (before={before:?}, \
+             after={after:?})"
+        );
+    }
+
     /// Eval output is unaffected by ever having toggled training on and back
     /// off: the two arms are only wired into the *backward* path, so the
     /// eval-mode forward is byte-identical before any `set_training` call and

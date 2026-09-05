@@ -163,6 +163,157 @@ pub(crate) fn cuda_fwd(
     }
 }
 
+/// #460 (C-LN): bias-carrying forward. `beta` is a THIRD, REQUIRED
+/// `[hidden]` operand (no nullable-pointer branch here — see
+/// `layer_norm.cu`'s `template <bool HAS_BETA>` doc for why the row math
+/// itself is already generic to a future nullable caller even though this
+/// one is not). Structurally identical to [`cuda_fwd`] above (same
+/// `hidden == 0` / contiguity / `n == 0` ordering — see that function's
+/// comments for the full rationale), plus one extra shape/dtype check on
+/// `beta` up front, mirroring [`cuda_bwd_dx`]'s existing `s1` vs `s3`
+/// dtype check for the same reason: a `CustomOp3`'s third slot needs its
+/// own domain check, not just the first two.
+pub(crate) fn cuda_fwd_biased(
+    eps: f64,
+    s1: &CudaStorage,
+    l1: &Layout,
+    s2: &CudaStorage,
+    l2: &Layout,
+    s3: &CudaStorage,
+    l3: &Layout,
+) -> Result<(CudaStorage, Shape)> {
+    const OP: &str = "layer_norm_biased_fused";
+    let hidden = hidden_of(l1, l2, OP)?;
+    if l3.dims() != [hidden] {
+        return Err(Error::ShapeMismatchBinaryOp {
+            lhs: l1.shape().clone(),
+            rhs: l3.shape().clone(),
+            op: OP,
+        });
+    }
+    if s1.dtype() != s3.dtype() {
+        return Err(Error::DTypeMismatchBinaryOp {
+            lhs: s1.dtype(),
+            rhs: s3.dtype(),
+            op: OP,
+        });
+    }
+    let shape = l1.shape().clone();
+    let device = s1.device().clone();
+    let n = l1.shape().elem_count();
+
+    // See `cuda_fwd`'s identical comment: `hidden == 0` is checked on its
+    // own, matching `ops::layer_norm::LayerNormBiasedFused::cpu_fwd`'s
+    // domain (its own early `empty_like` return, before
+    // `contiguous_offsets()`).
+    if hidden == 0 {
+        if s1.dtype() != s2.dtype() {
+            return Err(Error::DTypeMismatchBinaryOp {
+                lhs: s1.dtype(),
+                rhs: s2.dtype(),
+                op: OP,
+            });
+        }
+        return Ok((super::alloc_empty(&device, s1.dtype(), OP)?, shape));
+    }
+
+    let (o1, o2) = l1
+        .contiguous_offsets()
+        .ok_or(Error::RequiresContiguous { op: OP })?;
+    let (g1, g2) = l2
+        .contiguous_offsets()
+        .ok_or(Error::RequiresContiguous { op: OP })?;
+    let (b1, b2) = l3
+        .contiguous_offsets()
+        .ok_or(Error::RequiresContiguous { op: OP })?;
+
+    if n == 0 {
+        if s1.dtype() != s2.dtype() {
+            return Err(Error::DTypeMismatchBinaryOp {
+                lhs: s1.dtype(),
+                rhs: s2.dtype(),
+                op: OP,
+            });
+        }
+        return Ok((super::alloc_empty(&device, s1.dtype(), OP)?, shape));
+    }
+    check_cuda_domain(OP, n, hidden)?;
+    let rows = n / hidden;
+
+    let cfg = LaunchConfig {
+        grid_dim: (rows as u32, 1, 1),
+        block_dim: (LN_BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let hidden_u32 = hidden as u32;
+    let eps_f32 = eps as f32;
+
+    match (s1.dtype(), s2.dtype()) {
+        (DType::F32, DType::F32) => {
+            let x = s1.as_cuda_slice::<f32>()?.slice(o1..o2);
+            let g = s2.as_cuda_slice::<f32>()?.slice(g1..g2);
+            let b = s3.as_cuda_slice::<f32>()?.slice(b1..b2);
+            let func = device.get_or_load_custom_func(
+                "layer_norm_fwd_f32_biased",
+                MODULE_NAME,
+                PTX_LAYER_NORM,
+            )?;
+            let out = unsafe { device.alloc::<f32>(n) }?;
+            let mut builder = func.builder();
+            builder.arg(&x);
+            builder.arg(&g);
+            builder.arg(&b);
+            builder.arg(&out);
+            builder.arg(&hidden_u32);
+            builder.arg(&eps_f32);
+            unsafe { builder.launch(cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
+            Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
+        }
+        (DType::BF16, DType::BF16) => {
+            let x = s1.as_cuda_slice::<bf16>()?.slice(o1..o2);
+            let g = s2.as_cuda_slice::<bf16>()?.slice(g1..g2);
+            let b = s3.as_cuda_slice::<bf16>()?.slice(b1..b2);
+            let func = device.get_or_load_custom_func(
+                "layer_norm_fwd_bf16_biased",
+                MODULE_NAME,
+                PTX_LAYER_NORM,
+            )?;
+            let out = unsafe { device.alloc::<bf16>(n) }?;
+            let mut builder = func.builder();
+            builder.arg(&x);
+            builder.arg(&g);
+            builder.arg(&b);
+            builder.arg(&out);
+            builder.arg(&hidden_u32);
+            builder.arg(&eps_f32);
+            unsafe { builder.launch(cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
+            Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
+        }
+        (DType::F16, DType::F16) => {
+            let x = s1.as_cuda_slice::<f16>()?.slice(o1..o2);
+            let g = s2.as_cuda_slice::<f16>()?.slice(g1..g2);
+            let b = s3.as_cuda_slice::<f16>()?.slice(b1..b2);
+            let func = device.get_or_load_custom_func(
+                "layer_norm_fwd_f16_biased",
+                MODULE_NAME_F16,
+                PTX_LAYER_NORM_F16,
+            )?;
+            let out = unsafe { device.alloc::<f16>(n) }?;
+            let mut builder = func.builder();
+            builder.arg(&x);
+            builder.arg(&g);
+            builder.arg(&b);
+            builder.arg(&out);
+            builder.arg(&hidden_u32);
+            builder.arg(&eps_f32);
+            unsafe { builder.launch(cfg) }.map_err(|e| Error::Cuda(Box::new(e)))?;
+            Ok((CudaStorage::wrap_cuda_slice(out, device), shape))
+        }
+        (lhs, rhs) if lhs != rhs => Err(Error::DTypeMismatchBinaryOp { lhs, rhs, op: OP }),
+        (dtype, _) => Err(Error::UnsupportedDTypeForOp(dtype, OP)),
+    }
+}
+
 pub(crate) fn cuda_bwd_dx(
     eps: f64,
     s1: &CudaStorage,

@@ -152,8 +152,8 @@
 //!
 //! **Where the ~19GB BASE offset comes from (jammi-encoders' own share).**
 //! The eager composition materialises MORE simultaneously-live, separately-
-//! allocated tensors per op than the fused kernels do (e.g. `LayerNorm::
-//! slow`'s upcast-compute-cast-back, `layer_norm.rs:353-370`, and the
+//! allocated tensors per op than the fused kernels do (e.g. `fn slow`'s
+//! upcast-compute-cast-back — `fn slow`, `jammi-encoders/src/layer_norm.rs:682` — and the
 //! analogous multi-step compositions in `softmax`/`geglu`'s own eager
 //! fallbacks) — each such intermediate is its own `cuMemAlloc`, at its OWN
 //! (upcast, often F32) size, on top of whatever the fused kernel would

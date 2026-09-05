@@ -689,9 +689,8 @@ mod tests {
     use super::*;
     use candle_core::{DType, Device};
 
-    /// The literal eager chain `AdamW::step` runs
-    /// (`crates/jammi-ai/src/fine_tune/adamw.rs:81-107` at HEAD `2c1a68d`),
-    /// reproduced here as an independent oracle using plain `candle_core`
+    /// The literal eager chain, `fn step`, `crates/jammi-ai/src/fine_tune/adamw.rs:81-107`
+    /// at HEAD `2c1a68d`, reproduced here as an independent oracle using plain `candle_core`
     /// tensor ops (NOT this crate's fused op) — this is the numpy-first-style
     /// reference this op's bit-identity claim is measured against (family
     /// F), not a re-statement of the fused kernel's own code.
@@ -988,9 +987,9 @@ mod tests {
 
     /// MUT-triage: `eps=1e-8` in every other test in this file is far
     /// below `v_hat.sqrt()`'s magnitude at `f32` precision, so `+ eps` and
-    /// a mutated `- eps` round to the SAME bits — the mutant on
-    /// `crates/jammi-kernels/src/ops/adamw_step.rs:234` (`+` -> `-` in
-    /// `let denom = v_hat.sqrt() + eps;`) survived every bit-identity test
+    /// a mutated `- eps` round to the SAME bits — the mutant on the line
+    /// `let denom = v_hat.sqrt() + eps;`, `crates/jammi-kernels/src/ops/adamw_step.rs:338`
+    /// (`+` -> `-`) survived every bit-identity test
     /// for exactly this reason. `eps` here is large enough, relative to a
     /// small `v`, that `+`/`-` produce OBSERVABLY different `f32` bits.
     #[test]

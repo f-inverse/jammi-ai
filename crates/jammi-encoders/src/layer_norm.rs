@@ -9,34 +9,46 @@
 //! The fast path is only entered when `bias.is_some()` and the input is
 //! contiguous, matching `candle_nn::LayerNorm`'s own entry conditions.
 //!
-//! ## The bias-free training path: `jammi_kernels::ops::LayerNormFused`
+//! ## The training path: `jammi_kernels::ops::LayerNormFused` /
+//! `LayerNormBiasedFused` (#460, C-LN)
 //!
-//! A THIRD path exists, gated on `bias.is_none() && training`: every
-//! ModernBERT LayerNorm (`ModernBertConfig` cannot even express a biased
-//! LayerNorm — no `norm_bias` field exists) dispatches to the fused
-//! CUDA/CPU kernel instead of the `~12`-op eager composition below, when
-//! the fused kernel's own domain holds (`x`'s device is CPU or CUDA —
-//! `LayerNormFused` has no `metal_fwd`, and candle's default `metal_fwd`
-//! ERRORS rather than falling back, so a Metal tensor is refused by this
-//! predicate rather than reaching `apply2` and hard-erroring; dtype
+//! A THIRD path exists, gated on `training == true`: every ModernBERT
+//! LayerNorm (`ModernBertConfig` cannot even express a biased LayerNorm —
+//! no `norm_bias` field exists) dispatches to the bias-free fused
+//! CUDA/CPU kernel (`LayerNormFused`), and — since #460 — every
+//! BERT/DistilBERT/CLIP-text LayerNorm (all of which carry a bias)
+//! dispatches to the bias-carrying sibling (`LayerNormBiasedFused`),
+//! instead of the `~12`-op eager composition below, when the respective
+//! fused kernel's own domain holds (`x`'s device is CPU or CUDA — neither
+//! op has a `metal_fwd`, and candle's default `metal_fwd` ERRORS rather
+//! than falling back, so a Metal tensor is refused by this predicate
+//! rather than reaching `apply2`/`apply3` and hard-erroring; dtype
 //! F32/BF16/F16 matching between `x` and `weight` — F16 widened in
 //! campaign #443 W2b, exactly where `jammi_kernels::cuda::layer_norm`
 //! gained a compiled F16 dispatch arm (K2's no-Hold-without-dispatch
-//! rule); both contiguous; `hidden`
-//! within the kernel's ceiling). Outside that domain — or on the
-//! `parity-test`/BERT/DistilBERT paths, which are BIASED and so never
-//! reach this arm at all — `slow()` runs exactly as before. This is a K2
-//! "validate, don't silently degrade" admission check: the fused/eager
-//! decision is recorded ([`LN_DISPATCH_COUNTERS`]) and a failed predicate
-//! either falls back with a log-once WARN or, in `Strict` mode
+//! rule); both contiguous; `hidden` within the kernel's ceiling; for the
+//! biased case, `bias` ADDITIONALLY matching `x`'s dtype, contiguous, and
+//! `[hidden]`-shaped — see [`fused_admission_predicate_biased`]). BOTH
+//! variants dispatch through the SAME admission key
+//! (`"layer_norm_fused"`) and the SAME [`LN_DISPATCH_COUNTERS`] pair —
+//! one LayerNorm-site capability, bias presence is tensor STATE decided
+//! at the call site, never a model-family branch. Outside the respective
+//! domain — or on the `parity-test` path, or in eval — `slow()` runs
+//! exactly as before. This is a K2 "validate, don't silently degrade"
+//! admission check: the fused/eager decision is recorded and a failed
+//! predicate either falls back with a log-once WARN or, in `Strict` mode
 //! ([`admission_mode`]), errors instead of silently falling back.
 //!
-//! Eval (`training == false`) NEVER reaches the fused arm regardless of
-//! `bias` — the match below only adds a NEW arm for `(None, true)`; every
-//! other `(bias, training)` combination is byte-for-byte the same code
-//! PATH this file had before the fused kernel existed. Eval/serving
-//! numerics are therefore bit-identical before/after THIS ARM'S ADDITION
-//! (see this module's own
+//! Before #460, every biased LayerNorm (BERT, DistilBERT, CLIP-text)
+//! trained through `slow()` unconditionally, with NO `admit()` call and NO
+//! dispatch counter at all — a BERT finetune run's own `ln` counter pair
+//! read `0/0` regardless of how many LayerNorms it actually ran. #460's
+//! ONLY change to the eval path's own call SHAPE is none at all: eval
+//! (`training == false`) still NEVER reaches the fused arm for ANY value
+//! of `bias` — the `forward` match's `(Some(bias), false) if
+//! x.is_contiguous()` and catch-all `_ => self.slow(x)` arms are
+//! byte-for-byte the pre-#460 code. Eval/serving numerics are therefore
+//! bit-identical before/after THIS ARM'S ADDITION (see this module's own
 //! `tests::eval_mode_forward_is_bit_identical_regardless_of_fused_eligibility`).
 //! This is NOT the same claim as "eval/serving output is unaffected by
 //! every change in this file": eval structurally falls through to
@@ -47,26 +59,24 @@
 //! backbones and at F32 respectively, precisely BECAUSE eval reaches the
 //! same (changed) `slow()` code path, not in spite of it.
 //!
-//! `dgamma_needed` is `self.weight.is_variable()`, evaluated fresh on
-//! every fused-path call — NOT a hardcoded `false`. `is_variable()` is
-//! unsound as a general "does this need a gradient" predicate (see
+//! `dgamma_needed`/`dbeta_needed` are computed via [`affine_needed_gate`]
+//! at every fused-path call — NOT a hardcoded `false`, and (since #460)
+//! NOT a bare `is_variable()` either. `is_variable()` alone is unsound as
+//! a general "does this need a gradient" predicate (see
 //! `jammi_kernels::ops::layer_norm`'s module doc: it is two-state over a
 //! three-state lattice, and cannot tell a true external constant apart
-//! from an INTERMEDIATE on a path to a `Var`) — but that hazard is
-//! ONE-DIRECTIONAL and does not apply to `weight` here. `weight` is a
-//! `LayerNorm`'s own leaf module parameter — loaded straight from a
-//! `VarBuilder` with no upstream op — never an intermediate produced by
-//! composing other tensors, so the only two real states are "is a `Var`"
-//! (today: never, in this crate — only LoRA A/B are trainable; a future
-//! trainable-gamma mode would make this `true`) and "is a true frozen
-//! leaf" (today's actual state, `VarBuilder::from_mmaped_safetensors` —
-//! see `modernbert.rs`). `is_variable() == true` is therefore a SUFFICIENT
-//! (not merely convenient) condition here: if `weight` somehow were an
-//! intermediate despite never being constructed that way, `is_variable()
-//! == false` would make this `false`, and if that later turned out to be
-//! the wrong call, candle's own backward walk panics loudly (`grad not
-//! populated`, `backprop.rs:175`) rather than silently training a
-//! grad-less parameter — a safe failure mode, not a silent-wrong one.
+//! from an INTERMEDIATE on a path to a `Var`) — that hazard does not
+//! apply to `weight`/`bias` here in PRACTICE (both are a `LayerNorm`'s own
+//! leaf module parameters, loaded straight from a `VarBuilder` with no
+//! upstream op, never an intermediate produced by composing other
+//! tensors — today: never a `Var`, in this crate; only LoRA A/B are
+//! trainable), but [`affine_needed_gate`] makes that a CHECKED invariant
+//! (a typed refusal on the one state that WOULD be ambiguous — a tracked,
+//! non-`Var` intermediate) rather than an assumption relying on
+//! candle's own backward walk to panic loudly (`grad not populated`,
+//! `backprop.rs:175`) if the assumption were ever wrong — the same
+//! three-way policy `jammi_lora::lora_linear::frozen_weight_gate` applies
+//! to a LoRA base's own weight/bias.
 
 use std::sync::LazyLock;
 
@@ -75,7 +85,7 @@ use candle_nn::{Init, VarBuilder};
 use jammi_kernels::admission::{
     admission_mode, admit, counters_for, device_is_supported, DispatchCounters, DispatchOutcome,
 };
-use jammi_kernels::ops::{apply2, LayerNormFused, MAX_HIDDEN};
+use jammi_kernels::ops::{apply2, apply3, LayerNormBiasedFused, LayerNormFused, MAX_HIDDEN};
 
 use crate::error::EncoderError;
 
@@ -140,6 +150,81 @@ fn fused_admission_predicate(x: &Tensor, weight: &Tensor) -> (bool, &'static str
         return (false, "hidden_within_kernel_max_hidden");
     }
     (true, "domain_ok")
+}
+
+/// #460 (C-LN): the bias-carrying sibling of [`fused_admission_predicate`].
+/// `x`/`weight` share the identical domain [`fused_admission_predicate`]
+/// already checks (reused here, not re-derived — a single definition of
+/// "does this `x`/`weight` pair admit"), plus `bias`'s OWN checks: dtype
+/// matching `x` (the SAME F32/BF16/F16 restriction), contiguous, and
+/// `[hidden]`-shaped — the identical rule this file already applies to
+/// `weight`. Distinct predicate REASON strings for the `bias`-specific
+/// checks (`..._bias` suffixes) so a Fallback-mode log line or a
+/// Strict-mode error names exactly which operand failed, never conflating
+/// a `weight` domain failure with a `bias` one.
+fn fused_admission_predicate_biased(
+    x: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+) -> (bool, &'static str) {
+    let (holds, predicate) = fused_admission_predicate(x, weight);
+    if !holds {
+        return (holds, predicate);
+    }
+    if bias.dtype() != x.dtype() {
+        return (false, "dtype_f32_bf16_or_f16_matching_between_x_and_bias");
+    }
+    if !bias.is_contiguous() {
+        return (false, "bias_contiguous");
+    }
+    let Some(&hidden) = x.dims().last() else {
+        return (false, "x_rank_at_least_1");
+    };
+    if bias.dims() != [hidden] {
+        return (false, "bias_rank1_matches_x_last_dim");
+    }
+    (true, "domain_ok")
+}
+
+/// #460 (C-LN): the three-way gate `jammi-encoders`' call site uses for
+/// BOTH a `LayerNorm`'s `weight` and (when present) its `bias` — the same
+/// policy `jammi_lora::lora_linear::frozen_weight_gate` applies to a LoRA
+/// base's own weight/bias: `is_variable()` (tried FIRST — a `Var` also
+/// reports `track_op() == true`, candle-core 0.11's `Tensor::track_op` is
+/// `is_variable() || op.is_some()`) means the parameter is a genuine
+/// trainable `Var`; an UNTRACKED leaf (`!track_op()`, a parameter loaded
+/// straight from a `VarBuilder` with no upstream op) means it is a true
+/// frozen leaf; a TRACKED non-`Var` — neither definitely frozen nor
+/// definitely trainable — is a typed refusal rather than a silent
+/// `false`.
+///
+/// This replaces a bare `weight.is_variable()`/`bias.is_variable()` at the
+/// call site with a CHECKED invariant instead of an assumption: both
+/// `weight` and `bias` are structurally leaf module parameters (loaded
+/// straight from a `VarBuilder`, never produced by composing other
+/// tensors) in every production path this crate ships today, so
+/// `is_variable() == false` always meant "true frozen leaf" in practice —
+/// but `LayerNormFused`'s own module doc names exactly the silent-`None`
+/// landmine a bare `is_variable()` leaves open for the future (a
+/// tracked-but-not-`Var` intermediate would silently read as "frozen",
+/// and `bwd` would return `None` for a slot candle's own backward walk
+/// later expects populated, panicking loudly at `grad not populated`
+/// rather than training a grad-less parameter — a safe failure mode, but
+/// only because that panic exists; this gate makes the refusal typed and
+/// immediate instead of waiting on that downstream panic).
+fn affine_needed_gate(t: &Tensor, which: &'static str) -> Result<bool, EncoderError> {
+    if t.is_variable() {
+        Ok(true)
+    } else if !t.track_op() {
+        Ok(false)
+    } else {
+        Err(EncoderError::Config(format!(
+            "LayerNorm: {which} is a TRACKED tensor (carries an Op) but is not a Var -- a \
+             LayerNorm affine parameter must be either a true frozen leaf or an explicitly \
+             trainable Var; a tracked non-Var {which} would silently lose its own gradient \
+             contribution"
+        )))
+    }
 }
 
 /// Layer normalisation over the last dimension with optional affine bias.
@@ -408,6 +493,15 @@ impl LayerNorm {
     }
 
     /// `[..., hidden] -> [..., hidden]`.
+    ///
+    /// #460 (C-LN): the `(Some(bias), true)` arm — every BERT/DistilBERT/
+    /// CLIP-text LayerNorm — now ALSO dispatches through
+    /// [`Self::forward_fused_or_fallback`], exactly like the bias-free
+    /// `(None, true)` arm already did: bias presence is tensor STATE
+    /// passed down to the fused-or-fallback decision, never a
+    /// model-family branch in `forward` itself. Only `(_, false)` (eval)
+    /// and `(None, false)` bias-free eval fall through to the pre-existing
+    /// arms, byte-for-byte unchanged.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
         match (&self.bias, self.training) {
             (Some(bias), false) if x.is_contiguous() => Ok(candle_nn::ops::layer_norm(
@@ -416,18 +510,30 @@ impl LayerNorm {
                 bias,
                 self.eps as f32,
             )?),
-            (None, true) => self.forward_fused_or_fallback(x),
+            (None, true) => self.forward_fused_or_fallback(x, None),
+            (Some(bias), true) => self.forward_fused_or_fallback(x, Some(bias)),
             _ => self.slow(x),
         }
     }
 
-    /// The bias-free, training-mode arm: dispatches to
-    /// [`LayerNormFused`] when its domain holds, else falls back to
-    /// [`Self::slow`] (recording which happened either way). See this
-    /// module's doc for the full design and why `dgamma_needed` is
-    /// `self.weight.is_variable()`, not a hardcoded `false`.
-    fn forward_fused_or_fallback(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
-        let (holds, predicate) = fused_admission_predicate(x, &self.weight);
+    /// The training-mode arm, bias-free OR bias-carrying: dispatches to
+    /// [`LayerNormFused`] (`bias.is_none()`) or `LayerNormBiasedFused`
+    /// (`bias.is_some()`) when the respective domain holds, else falls
+    /// back to [`Self::slow`] (recording which happened either way, under
+    /// the SAME admission key `"layer_norm_fused"` — one LayerNorm-site
+    /// capability, bias is tensor state, not a second key). See this
+    /// module's doc for the full design and [`affine_needed_gate`] for why
+    /// `dgamma_needed`/`dbeta_needed` are no longer a bare
+    /// `is_variable()`.
+    fn forward_fused_or_fallback(
+        &self,
+        x: &Tensor,
+        bias: Option<&Tensor>,
+    ) -> Result<Tensor, EncoderError> {
+        let (holds, predicate) = match bias {
+            None => fused_admission_predicate(x, &self.weight),
+            Some(b) => fused_admission_predicate_biased(x, &self.weight, b),
+        };
         let outcome = admit(
             admission_mode(),
             "layer_norm_fused",
@@ -436,11 +542,23 @@ impl LayerNorm {
             *LN_DISPATCH_COUNTERS,
         )?;
         match outcome {
-            DispatchOutcome::Fused => Ok(apply2(
-                x,
-                &self.weight,
-                LayerNormFused::new(self.eps, self.weight.is_variable()),
-            )?),
+            DispatchOutcome::Fused => match bias {
+                None => Ok(apply2(
+                    x,
+                    &self.weight,
+                    LayerNormFused::new(self.eps, affine_needed_gate(&self.weight, "weight")?),
+                )?),
+                Some(b) => Ok(apply3(
+                    x,
+                    &self.weight,
+                    b,
+                    LayerNormBiasedFused::new(
+                        self.eps,
+                        affine_needed_gate(&self.weight, "weight")?,
+                        affine_needed_gate(b, "bias")?,
+                    ),
+                )?),
+            },
             DispatchOutcome::Eager => self.slow(x),
         }
     }
@@ -664,6 +782,179 @@ mod tests {
         assert_eq!(predicate, "domain_ok");
     }
 
+    // -----------------------------------------------------------------
+    // #460 (C-LN): `fused_admission_predicate_biased` oracles.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn fused_admission_predicate_biased_accepts_a_valid_fixture() {
+        let device = Device::Cpu;
+        let hidden = 4;
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], (1, hidden), &device).unwrap();
+        let weight = Tensor::from_slice(&[1.0f32; 4], (hidden,), &device).unwrap();
+        let bias = Tensor::from_slice(&[0.5f32; 4], (hidden,), &device).unwrap();
+        let (holds, predicate) = fused_admission_predicate_biased(&x, &weight, &bias);
+        assert!(holds, "{predicate}");
+        assert_eq!(predicate, "domain_ok");
+    }
+
+    #[test]
+    fn fused_admission_predicate_biased_refuses_a_mismatched_bias_dtype() {
+        let device = Device::Cpu;
+        let hidden = 4;
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], (1, hidden), &device).unwrap();
+        let weight = Tensor::from_slice(&[1.0f32; 4], (hidden,), &device).unwrap();
+        let bias = Tensor::from_slice(&[bf16::from_f32(0.5); 4], (hidden,), &device).unwrap();
+        let (holds, predicate) = fused_admission_predicate_biased(&x, &weight, &bias);
+        assert!(!holds);
+        assert_eq!(
+            predicate,
+            "dtype_f32_bf16_or_f16_matching_between_x_and_bias"
+        );
+    }
+
+    #[test]
+    fn fused_admission_predicate_biased_refuses_a_bias_shape_mismatch() {
+        let device = Device::Cpu;
+        let hidden = 4;
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], (1, hidden), &device).unwrap();
+        let weight = Tensor::from_slice(&[1.0f32; 4], (hidden,), &device).unwrap();
+        let bias = Tensor::from_slice(&[0.5f32; 3], (3,), &device).unwrap();
+        let (holds, predicate) = fused_admission_predicate_biased(&x, &weight, &bias);
+        assert!(!holds);
+        assert_eq!(predicate, "bias_rank1_matches_x_last_dim");
+    }
+
+    #[test]
+    fn fused_admission_predicate_biased_refuses_a_non_contiguous_bias() {
+        let device = Device::Cpu;
+        let hidden = 4;
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], (1, hidden), &device).unwrap();
+        let weight = Tensor::from_slice(&[1.0f32; 4], (hidden,), &device).unwrap();
+        let base = Tensor::from_slice(
+            &[0.1f32, 0.0, 0.2, 0.0, 0.3, 0.0, 0.4, 0.0],
+            (4, 2),
+            &device,
+        )
+        .unwrap();
+        let bias = base.narrow(1, 0, 1).unwrap().squeeze(1).unwrap();
+        assert!(!bias.is_contiguous());
+        let (holds, predicate) = fused_admission_predicate_biased(&x, &weight, &bias);
+        assert!(!holds);
+        assert_eq!(predicate, "bias_contiguous");
+    }
+
+    /// A `weight`/`bias` domain failure (from the reused
+    /// `fused_admission_predicate` call) is reported with THAT check's own
+    /// reason, not silently swallowed into a `bias`-specific one — proves
+    /// the early-return-on-`!holds` composition actually short-circuits.
+    #[test]
+    fn fused_admission_predicate_biased_propagates_the_weight_domain_failure_reason() {
+        let device = Device::Cpu;
+        let hidden = 4;
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], (1, hidden), &device).unwrap();
+        // weight dtype mismatched against x -- a `fused_admission_predicate`
+        // failure, not a bias-specific one.
+        let weight = Tensor::from_slice(&[bf16::from_f32(1.0); 4], (hidden,), &device).unwrap();
+        let bias = Tensor::from_slice(&[0.5f32; 4], (hidden,), &device).unwrap();
+        let (holds, predicate) = fused_admission_predicate_biased(&x, &weight, &bias);
+        assert!(!holds);
+        assert_eq!(
+            predicate,
+            "dtype_f32_bf16_or_f16_matching_between_x_and_weight"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // #460 (C-LN): `affine_needed_gate` — the three-way lattice.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn affine_needed_gate_untracked_leaf_is_false() {
+        let device = Device::Cpu;
+        let t = Tensor::from_slice(&[1.0f32; 4], (4,), &device).unwrap();
+        assert!(!t.is_variable());
+        assert!(!t.track_op());
+        assert!(!affine_needed_gate(&t, "weight").unwrap());
+    }
+
+    #[test]
+    fn affine_needed_gate_var_is_true() {
+        let device = Device::Cpu;
+        let v =
+            Var::from_tensor(&Tensor::from_slice(&[1.0f32; 4], (4,), &device).unwrap()).unwrap();
+        assert!(affine_needed_gate(v.as_tensor(), "weight").unwrap());
+    }
+
+    /// A tracked-but-not-`Var` intermediate is a typed refusal, not a
+    /// silent `false` — the exact landmine a bare `is_variable()` would
+    /// leave open, mirroring `jammi_lora::lora_linear::frozen_weight_gate`'s
+    /// own `tracked_non_var_is_a_typed_refusal` test. `BackpropOp::new1`
+    /// (candle-core 0.11's `op.rs`) only attaches an `Op` when its OWN
+    /// argument already `track_op()`s — a plain leaf's `to_dtype` would
+    /// just produce another untracked leaf, not the ambiguous state this
+    /// test targets; starting from a `Var` and casting to a DIFFERENT
+    /// dtype produces a tensor that IS tracked (inherits `track_op()` from
+    /// its `Var` input) but is itself NOT a `Var`.
+    #[test]
+    fn affine_needed_gate_tracked_non_var_is_a_typed_refusal_not_a_panic() {
+        let device = Device::Cpu;
+        let v =
+            Var::from_tensor(&Tensor::from_slice(&[1.0f32; 4], (4,), &device).unwrap()).unwrap();
+        let tracked = v.as_tensor().to_dtype(DType::F64).unwrap();
+        assert!(!tracked.is_variable());
+        assert!(tracked.track_op(), "fixture must actually be tracked");
+        let err = affine_needed_gate(&tracked, "weight")
+            .expect_err("a tracked non-Var affine parameter must be a typed refusal");
+        assert!(matches!(err, EncoderError::Config(_)));
+    }
+
+    /// End-to-end: a trainable `Var` bias on a bias-carrying, otherwise
+    /// fused-eligible training LayerNorm must populate a real `dbeta`
+    /// gradient AND be counted on the SAME `ln` fused counter the
+    /// bias-free path uses.
+    #[test]
+    fn biased_training_with_a_var_bias_counts_fused_and_populates_dbeta() {
+        let device = Device::Cpu;
+        let hidden = 4;
+        let rows = 2;
+        let xv: Vec<f32> = (0..rows * hidden)
+            .map(|i| (i as f32 * 0.29 - 0.7).sin() * 1.5)
+            .collect();
+        let x =
+            Var::from_tensor(&Tensor::from_slice(&xv, (rows, hidden), &device).unwrap()).unwrap();
+        let weight = Tensor::from_slice(&[1.1f32, 0.9, 1.0, 1.2], (hidden,), &device).unwrap();
+        let bias = Var::from_tensor(
+            &Tensor::from_slice(&[0.1f32, -0.1, 0.2, -0.2], (hidden,), &device).unwrap(),
+        )
+        .unwrap();
+
+        let ln = LayerNorm {
+            weight,
+            bias: Some(bias.as_tensor().clone()),
+            eps: 1e-5,
+            training: true,
+        };
+        let before = LN_DISPATCH_COUNTERS.snapshot();
+        let out = ln.forward(x.as_tensor()).unwrap();
+        let after = LN_DISPATCH_COUNTERS.snapshot();
+        assert!(
+            after.fused > before.fused,
+            "a Var bias must not prevent the fused biased dispatch (before={before:?}, \
+             after={after:?})"
+        );
+
+        let grads = out.sum_all().unwrap().backward().unwrap();
+        let dbeta: Vec<f32> = grads
+            .get(&bias)
+            .expect("dbeta_needed must be true for a trainable Var bias")
+            .to_vec1()
+            .unwrap();
+        // `.sum_all()`'s upstream gradient is all-1.0, so `dbeta_i =
+        // sum_rows(1.0) = rows` for every column, exactly.
+        assert_eq!(dbeta, vec![rows as f32; hidden]);
+    }
+
     /// The NEGATIVE half: a Metal device must be REJECTED. This IS
     /// hermetically testable with no `metal` feature on this crate at
     /// all: `candle_core` re-exports a `MetalDevice` type at its crate
@@ -744,22 +1035,28 @@ mod tests {
         assert_eq!(before, via_slow);
     }
 
-    /// The biased path (BERT/DistilBERT) never reaches the fused arm:
-    /// `(Some(bias), _)` never matches `(None, true)`, structurally, for
-    /// ANY value of `training` — `forward`'s match has exactly one arm
-    /// that calls [`Self::forward_fused_or_fallback`], and it requires
-    /// `bias` to be `None`. This test pins the OBSERVABLE consequence:
-    /// a biased LayerNorm's output (both training and eval) is exactly
-    /// the eager composition's, matching the pre-existing behavior this
-    /// commit does not touch. (A global dispatch-counter assertion is
-    /// deliberately NOT used here — `LN_DISPATCH_COUNTERS` is one
-    /// process-wide static shared with every other test in this binary,
-    /// so a snapshot-delta check would be racy under `cargo test`'s
-    /// default parallel execution; the "assert their call sites don't
-    /// switch" claim is instead a property of `forward`'s match itself,
-    /// exercised here via its actual output.)
+    /// #460 (C-LN): the biased path (BERT/DistilBERT) now DOES reach the
+    /// fused arm in training mode — `forward`'s `(Some(bias), true)` arm
+    /// dispatches through [`Self::forward_fused_or_fallback`] exactly like
+    /// the bias-free `(None, true)` arm always has (one common
+    /// architecture; bias presence is tensor state, not a model-family
+    /// carve-out). This fixture (F32, contiguous, `hidden = 8`) satisfies
+    /// [`fused_admission_predicate_biased`]'s domain, so `out_training`
+    /// must be the FUSED kernel's own output — close to, but no longer
+    /// bit-identical to, `slow()`'s (rule 15: the CPU biased fused row
+    /// loop's reduction order differs from `slow()`'s candle-composed
+    /// fold) — proved by a monotonic `LN_DISPATCH_COUNTERS` delta rather
+    /// than an exact-equality claim (see
+    /// `fused_training_path_matches_slow_within_tolerance_fwd_and_bwd`'s
+    /// identical rationale for why `LN_DISPATCH_COUNTERS` is a
+    /// process-wide static under parallel `cargo test`).
+    ///
+    /// EVAL is UNCHANGED: `(Some(bias), false)` still matches `forward`'s
+    /// first arm (`candle_nn::ops::layer_norm` directly), byte-for-byte
+    /// the pre-#460 code path — pinned here exactly, not within a
+    /// tolerance.
     #[test]
-    fn biased_layer_norm_output_is_unaffected_in_training_and_eval() {
+    fn biased_layer_norm_training_now_dispatches_fused_eval_is_unaffected() {
         let device = Device::Cpu;
         let hidden = 8;
         let weight = Tensor::from_slice(&[1.3f32; 8], (hidden,), &device).unwrap();
@@ -777,6 +1074,13 @@ mod tests {
             eps: 1e-5,
             training: true,
         };
+        let (holds, predicate) = fused_admission_predicate_biased(&x, &weight, &bias);
+        assert!(
+            holds,
+            "fixture must satisfy the biased fused domain: {predicate}"
+        );
+
+        let before = LN_DISPATCH_COUNTERS.snapshot();
         let out_training: Vec<f32> = ln
             .forward(&x)
             .unwrap()
@@ -784,6 +1088,13 @@ mod tests {
             .unwrap()
             .to_vec1()
             .unwrap();
+        let after = LN_DISPATCH_COUNTERS.snapshot();
+        assert!(
+            after.fused > before.fused,
+            "biased training must dispatch the fused kernel, not fall back to slow() \
+             (before={before:?}, after={after:?})"
+        );
+
         let expected_training: Vec<f32> = ln
             .slow(&x)
             .unwrap()
@@ -791,7 +1102,17 @@ mod tests {
             .unwrap()
             .to_vec1()
             .unwrap();
-        assert_eq!(out_training, expected_training);
+        for (i, (o, e)) in out_training
+            .iter()
+            .zip(expected_training.iter())
+            .enumerate()
+        {
+            assert!(
+                (o - e).abs() < 1e-4,
+                "fused[{i}] = {o} vs slow()[{i}] = {e} (rule 15: fold-order divergence, \
+                 not a defect — must stay within a tight tolerance, not bit-exact)"
+            );
+        }
 
         ln.set_training(false);
         let out_eval: Vec<f32> = ln
@@ -807,7 +1128,10 @@ mod tests {
             .unwrap()
             .to_vec1()
             .unwrap();
-        assert_eq!(out_eval, expected_eval);
+        assert_eq!(
+            out_eval, expected_eval,
+            "eval must remain byte-for-byte candle_nn::ops::layer_norm — unaffected by #460"
+        );
     }
 
     /// Oracle 2 at the encoder level (per the fused-kernels plan's scope

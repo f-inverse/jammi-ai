@@ -150,21 +150,222 @@ pub struct LayerNorm {
     training: bool,
 }
 
+/// True when `prefix`'s last `.`-separated segment is literally
+/// `LayerNorm` — candle-nn 0.11.0's `VarBuilder::prefix()` is
+/// `self.path.join(".")` (`var_builder.rs:124-126`), so this checks the
+/// segment after the final `.` (or the whole string when there is no
+/// `.` at all — a `LayerNorm` loaded at a `VarBuilder`'s own root; no
+/// in-tree call site does this today, but the boundary is the same
+/// either way). This is the ONLY gate on whether [`LayerNorm::new`]
+/// ever consults the legacy `gamma`/`beta` names: a prefix ending in
+/// `...gamma_scale` or `...LayerNormX` does not match, and a
+/// `<parent>.gamma` tensor sitting one level ABOVE a `<parent>.LayerNorm`
+/// prefix is never probed by a `VarBuilder` rooted at `<parent>.LayerNorm`
+/// (candle probes the full joined path, never a parent of it) — see
+/// `esc-086`'s boundary arm.
+fn is_layer_norm_keyed(prefix: &str) -> bool {
+    prefix.rsplit('.').next() == Some("LayerNorm")
+}
+
+/// Resolves which literal tensor name each affine axis should be read
+/// from, given which of the modern (`weight`/`bias`) and legacy
+/// (`gamma`/`beta`) names [`LayerNorm::new`] found present at a
+/// confirmed `LayerNorm`-keyed prefix (see [`is_layer_norm_keyed`]).
+/// Pure and table-testable: no `VarBuilder`, no tensor I/O — just the
+/// four presence booleans a caller already probed via
+/// `VarBuilder::contains_tensor`.
+///
+/// Mirrors HF transformers v4.51.3's `_fix_state_dict_key_on_load`
+/// (`modeling_utils.py:4504-4511`: a key ending `LayerNorm.beta` is
+/// rewritten to end `LayerNorm.bias`, `LayerNorm.gamma` to
+/// `LayerNorm.weight`, logged) and transformers `main`'s `"legacy"`
+/// `WeightRenaming` block (`conversion_mapping.py:1399-1408`, the same
+/// two literal suffix patterns) — narrowed here to a KEY-SCOPED alias
+/// (only consulted when the prefix itself ends in `LayerNorm`) rather
+/// than HF's whole-state-dict key rewrite, since this crate loads one
+/// module at a time under an already-`.pp()`-scoped `VarBuilder`.
+///
+/// Compare candle-nn `main`'s own `layer_norm` (`candle-nn/src/layer_norm.rs:153-166`
+/// as of this writing), which has a MODULE-scoped fallback: it prefers
+/// `weight` when present and falls back to `gamma` only on load
+/// failure, with no refusal if a checkpoint happens to carry both.
+/// jammi deliberately diverges on two points: the narrower KEY scope
+/// (mirroring HF's own suffix-anchored rule exactly, rather than a
+/// bare "try weight, then try gamma" at module scope) and a LOUD
+/// collision refusal (a checkpoint carrying both names is almost
+/// always a corrupted or half-converted checkpoint, not a legitimate
+/// ambiguity to silently resolve).
+///
+/// The weight axis is resolved FIRST — a double collision (both the
+/// weight axis AND the bias axis carrying both their modern and legacy
+/// names) therefore always reports the weight axis, deterministically,
+/// never the bias axis. `with_bias == false` callers pass `has_b =
+/// has_beta = false` (see [`LayerNorm::new`]) — this function then
+/// never returns a bias name, matching `with_bias`'s pre-existing
+/// `with_bias.then(..)` gate.
+fn resolve_affine_names(
+    prefix: &str,
+    has_w: bool,
+    has_g: bool,
+    has_b: bool,
+    has_beta: bool,
+    with_bias: bool,
+) -> Result<(&'static str, Option<&'static str>), EncoderError> {
+    if has_w && has_g {
+        return Err(EncoderError::Config(format!(
+            "LayerNorm::new: prefix `{prefix}` carries BOTH `weight` and \
+             the legacy `gamma` for its weight axis -- refusing the \
+             collision rather than guessing which is authoritative; drop \
+             one of the two tensors from the checkpoint (see \
+             ci/scripts/perf/convert_legacy_bert_checkpoint.py, which has \
+             the same output-name collision property)"
+        )));
+    }
+    let name_w = if has_g { "gamma" } else { "weight" };
+
+    let name_b = if with_bias {
+        if has_b && has_beta {
+            return Err(EncoderError::Config(format!(
+                "LayerNorm::new: prefix `{prefix}` carries BOTH `bias` and \
+                 the legacy `beta` for its bias axis -- refusing the \
+                 collision rather than guessing which is authoritative; \
+                 drop one of the two tensors from the checkpoint (see \
+                 ci/scripts/perf/convert_legacy_bert_checkpoint.py, which \
+                 has the same output-name collision property)"
+            )));
+        }
+        Some(if has_beta { "beta" } else { "bias" })
+    } else {
+        None
+    };
+
+    Ok((name_w, name_b))
+}
+
 impl LayerNorm {
     /// Load a LayerNorm under `vb`'s current prefix. `weight` and (when
     /// `with_bias` is true) `bias` are read from the safetensors layout
-    /// expected at that prefix; if absent, they are initialised to ones and
-    /// zeros respectively.
+    /// expected at that prefix; for a `VarMap`/`Zeros`-backed builder that
+    /// has never seen the name before, absent tensors are initialised to
+    /// ones and zeros respectively (`Init::Const`) — this is NOT true for
+    /// the frozen `VarBuilder::from_mmaped_safetensors` builder every
+    /// production loader uses (`bert.rs`, `distilbert.rs`, `modernbert.rs`,
+    /// `clip_text.rs`, `open_clip_vision.rs`, `htsat_audio.rs`), whose
+    /// `SafeTensorWithRouting`/mmaped backend has no such fallback and
+    /// hard-errors instead — see `esc-086`.
+    ///
+    /// ## Legacy `LayerNorm.gamma`/`LayerNorm.beta` names (`esc-086`)
+    ///
+    /// Google's original BERT checkpoints (and any checkpoint still
+    /// carrying those names) name a LayerNorm's affine parameters
+    /// `gamma`/`beta` rather than the modern `weight`/`bias`. When `vb`'s
+    /// own prefix's LAST `.`-segment is literally `LayerNorm` (see
+    /// [`is_layer_norm_keyed`] — e.g. `bert.rs`'s
+    /// `vb.pp("LayerNorm")`/`vb.pp("attention.output.LayerNorm")`/
+    /// `vb.pp("output.LayerNorm")`, `distilbert.rs`'s analogous
+    /// `emb_vb.pp("LayerNorm")`), this constructor also probes for
+    /// `gamma`/`beta` and aliases them onto the same weight/bias slots
+    /// (see [`resolve_affine_names`] for the full name-resolution
+    /// lattice, including the loud collision refusal when a checkpoint
+    /// carries both a modern and a legacy name for the same axis).
+    ///
+    /// EVERY OTHER call site — every `LayerNorm::new` whose prefix does
+    /// NOT end in a literal `LayerNorm` segment: DistilBERT's
+    /// `sa_layer_norm`/`output_layer_norm`, ModernBERT's
+    /// `emb_norm`/`mlp_norm`/`final_norm`/`attn_norm`, CLIP's
+    /// `ln_1`/`ln_2`/`ln_final`, open_clip's `ln_pre`/`ln_post`, HTSAT's
+    /// `norm`/`layernorm_before`/`layernorm_after` — is BYTE-FOR-BYTE
+    /// today's pre-existing code path: no `gamma`/`beta` probe, no
+    /// `contains_tensor` call at all, only ever `weight`/`bias`. This is
+    /// a CHECKED invariant, not an assumption: every production
+    /// `LayerNorm::new` call site passes a distinct `.pp(<name>)`
+    /// sub-prefix (17 sites across 6 encoder families); the only
+    /// bare-`vb` call sites are `VarMap`-backed test fixtures
+    /// (`modernbert.rs:4216`, `9421-9423`), which never reach the
+    /// `LayerNorm`-keyed branch either (their prefix is the `VarMap`'s
+    /// own root, not `...LayerNorm`) and additionally could not use the
+    /// alias safely if they did: `VarBuilder::zeros()`'s backend reports
+    /// `contains_tensor` as unconditionally `true` for every name
+    /// (`var_builder.rs:283-285`), which this constructor would read as
+    /// a `weight`+`gamma` (or `bias`+`beta`) collision — a further
+    /// reason no in-tree site ever constructs a `LayerNorm` from a
+    /// `Zeros`-backed builder.
+    ///
+    /// A `<parent>.gamma` tensor sitting one level ABOVE a
+    /// `<parent>.LayerNorm` prefix is never aliased into it (candle
+    /// probes the full joined path, never a parent of it — a legacy
+    /// name under a non-`LayerNorm`-keyed prefix is likewise never
+    /// aliased, matching HF's own suffix-anchored scoping).
+    ///
+    /// Compare candle-nn `main`'s own `layer_norm` helper
+    /// (`candle-nn/src/layer_norm.rs:153-166` as of this writing): it
+    /// has a MODULE-scoped fallback (no `LayerNorm`-suffix gate) that
+    /// prefers `weight` and falls back to `gamma` on load failure, with
+    /// no refusal when both are present. jammi's narrower key scope
+    /// mirrors HF's own rule exactly; its loud collision refusal never
+    /// silently picks a winner. See [`resolve_affine_names`]'s own doc
+    /// for the full citation set (HF transformers `v4.51.3`
+    /// `modeling_utils.py:4504-4511`; transformers `main`'s `"legacy"`
+    /// `WeightRenaming`, `conversion_mapping.py:1399-1408`).
     pub fn new(
         hidden_size: usize,
         eps: f64,
         with_bias: bool,
         vb: VarBuilder,
     ) -> Result<Self, EncoderError> {
-        let weight = vb.get_with_hints(hidden_size, "weight", Init::Const(1.0))?;
-        let bias = with_bias
-            .then(|| vb.get_with_hints(hidden_size, "bias", Init::Const(0.0)))
-            .transpose()?;
+        let prefix = vb.prefix();
+        if !is_layer_norm_keyed(&prefix) {
+            // Byte-for-byte with pre-existing behavior: no `contains_tensor`
+            // probe at all, no alias -- only a prefix whose last segment is
+            // literally `LayerNorm` ever consults `gamma`/`beta` (see this
+            // fn's own doc for the full list of untouched call sites).
+            let weight = vb.get_with_hints(hidden_size, "weight", Init::Const(1.0))?;
+            let bias = with_bias
+                .then(|| vb.get_with_hints(hidden_size, "bias", Init::Const(0.0)))
+                .transpose()?;
+            return Ok(Self {
+                weight,
+                bias,
+                eps,
+                training: false,
+            });
+        }
+
+        // `with_bias == false` never even calls `contains_tensor("beta")`
+        // -- not merely "ignores the result" -- matching the pre-existing
+        // `with_bias.then(..)` gate below.
+        let has_w = vb.contains_tensor("weight");
+        let has_g = vb.contains_tensor("gamma");
+        let (has_b, has_beta) = if with_bias {
+            (vb.contains_tensor("bias"), vb.contains_tensor("beta"))
+        } else {
+            (false, false)
+        };
+        let (name_w, name_b) =
+            resolve_affine_names(&prefix, has_w, has_g, has_b, has_beta, with_bias)?;
+
+        let weight = vb
+            .get_with_hints(hidden_size, name_w, Init::Const(1.0))
+            .map_err(|e| {
+                EncoderError::Config(format!(
+                    "LayerNorm::new: failed to load the weight axis at prefix \
+                     `{prefix}` (tried modern `weight` and legacy `gamma`): {e}"
+                ))
+            })?;
+        let bias = match name_b {
+            None => None,
+            Some(name_b) => Some(
+                vb.get_with_hints(hidden_size, name_b, Init::Const(0.0))
+                    .map_err(|e| {
+                        EncoderError::Config(format!(
+                            "LayerNorm::new: failed to load the bias axis at \
+                             prefix `{prefix}` (tried modern `bias` and legacy \
+                             `beta`): {e}"
+                        ))
+                    })?,
+            ),
+        };
+
         Ok(Self {
             weight,
             bias,
@@ -1780,6 +1981,200 @@ mod tests {
             ),
             "SOFTMAX_DISPATCH_COUNTERS is keyed by a literal that drifted from \
              SoftmaxLastDimFused::name()"
+        );
+    }
+
+    // -- esc-086: legacy `LayerNorm.gamma`/`.beta` name resolution --------
+
+    /// [`is_layer_norm_keyed`]'s positive/negative boundary, pinned
+    /// directly against a table of prefixes rather than only indirectly
+    /// through a full `LayerNorm::new` call: every production prefix that
+    /// SHOULD alias, every family that must NOT, and the two literal
+    /// boundary shapes `esc-086` names (`LayerNormX`, and no `.` at all).
+    #[test]
+    fn is_layer_norm_keyed_matches_only_a_trailing_layer_norm_segment() {
+        let cases: &[(&str, bool)] = &[
+            ("embeddings.LayerNorm", true),
+            ("encoder.layer.0.attention.output.LayerNorm", true),
+            ("encoder.layer.0.output.LayerNorm", true),
+            ("LayerNorm", true), // root-level, no `.` at all.
+            ("embeddings.LayerNormX", false),
+            ("embeddings.gamma_scale", false),
+            ("sa_layer_norm", false),
+            ("layernorm_before", false),
+            ("layernorm_after", false),
+            ("emb_norm", false),
+            ("mlp_norm", false),
+            ("final_norm", false),
+            ("ln_1", false),
+            ("ln_2", false),
+            ("ln_final", false),
+            ("ln_pre", false),
+            ("ln_post", false),
+            ("norm", false),
+        ];
+        for (prefix, expected) in cases {
+            assert_eq!(
+                is_layer_norm_keyed(prefix),
+                *expected,
+                "prefix `{prefix}` expected is_layer_norm_keyed == {expected}"
+            );
+        }
+    }
+
+    /// The full [`resolve_affine_names`] lattice, table-tested: both
+    /// biased and bias-free axes, every presence combination, both
+    /// collision arms (weight axis reported first on a double collision),
+    /// and `with_bias == false` never returning a bias name regardless of
+    /// what `has_b`/`has_beta` the (hypothetical, never-probed) caller
+    /// would have passed.
+    #[test]
+    fn resolve_affine_names_lattice() {
+        // (has_w, has_g, has_b, has_beta, with_bias) -> expected Ok((name_w, name_b)) or Err.
+        struct Case {
+            has_w: bool,
+            has_g: bool,
+            has_b: bool,
+            has_beta: bool,
+            with_bias: bool,
+            expect: Option<(&'static str, Option<&'static str>)>,
+        }
+        let cases = [
+            // Modern-only, biased: today's shape, unchanged.
+            Case {
+                has_w: true,
+                has_g: false,
+                has_b: true,
+                has_beta: false,
+                with_bias: true,
+                expect: Some(("weight", Some("bias"))),
+            },
+            // Legacy-only, biased: the esc-086 alias arm.
+            Case {
+                has_w: false,
+                has_g: true,
+                has_b: false,
+                has_beta: true,
+                with_bias: true,
+                expect: Some(("gamma", Some("beta"))),
+            },
+            // Neither present, biased: falls through to the modern names
+            // (today's `get_with_hints` call still fires and errors --
+            // this function itself only picks the NAME, it does not know
+            // whether the tensor actually exists beyond the two booleans).
+            Case {
+                has_w: false,
+                has_g: false,
+                has_b: false,
+                has_beta: false,
+                with_bias: true,
+                expect: Some(("weight", Some("bias"))),
+            },
+            // Weight-axis collision: both `weight` and `gamma` present.
+            Case {
+                has_w: true,
+                has_g: true,
+                has_b: false,
+                has_beta: false,
+                with_bias: true,
+                expect: None,
+            },
+            // Bias-axis collision only: both `bias` and `beta` present,
+            // weight axis clean.
+            Case {
+                has_w: true,
+                has_g: false,
+                has_b: true,
+                has_beta: true,
+                with_bias: true,
+                expect: None,
+            },
+            // Double collision: both axes carry both names -- must report
+            // the WEIGHT axis (this test can't directly observe "which
+            // axis" from `Err(EncoderError::Config(String))` alone, so the
+            // message-content assertion below checks it names `weight`
+            // terms, not `bias`/`beta` terms).
+            Case {
+                has_w: true,
+                has_g: true,
+                has_b: true,
+                has_beta: true,
+                with_bias: true,
+                expect: None,
+            },
+            // Legacy-then-missing (esc-086 arm 5): gamma present, neither
+            // bias nor beta present at all.
+            Case {
+                has_w: false,
+                has_g: true,
+                has_b: false,
+                has_beta: false,
+                with_bias: true,
+                expect: Some(("gamma", Some("bias"))),
+            },
+            // Bias-free: `with_bias == false` never returns a bias name,
+            // even when the (never-real) inputs claim both bias names are
+            // present -- a caller that honors the "never consult beta"
+            // rule always passes `has_b = has_beta = false` here, but this
+            // pins the function's OWN behavior independent of that.
+            Case {
+                has_w: true,
+                has_g: false,
+                has_b: true,
+                has_beta: true,
+                with_bias: false,
+                expect: Some(("weight", None)),
+            },
+            Case {
+                has_w: false,
+                has_g: true,
+                has_b: false,
+                has_beta: false,
+                with_bias: false,
+                expect: Some(("gamma", None)),
+            },
+        ];
+
+        for (i, c) in cases.iter().enumerate() {
+            let result = resolve_affine_names(
+                "test.prefix",
+                c.has_w,
+                c.has_g,
+                c.has_b,
+                c.has_beta,
+                c.with_bias,
+            );
+            match c.expect {
+                Some(expected) => {
+                    let (name_w, name_b) =
+                        result.unwrap_or_else(|e| panic!("case {i}: expected Ok, got Err({e:?})"));
+                    assert_eq!((name_w, name_b), expected, "case {i}");
+                }
+                None => {
+                    result.expect_err(&format!("case {i}: expected Err (collision)"));
+                }
+            }
+        }
+    }
+
+    /// The double-collision determinism arm, isolated: when BOTH axes
+    /// carry both names, the error message names the WEIGHT axis's
+    /// candidate names (`weight`/`gamma`), never the bias axis's
+    /// (`bias`/`beta`) -- pinned as its own test since the lattice test
+    /// above only checks `Err`-ness, not message content.
+    #[test]
+    fn resolve_affine_names_double_collision_reports_weight_axis() {
+        let err = resolve_affine_names("embeddings.LayerNorm", true, true, true, true, true)
+            .expect_err("double collision must be Err");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("weight") && msg.contains("gamma"),
+            "double collision message must name the weight axis's own \
+             candidates: {msg}"
+        );
+        assert!(
+            msg.contains("embeddings.LayerNorm"),
+            "message must name the prefix: {msg}"
         );
     }
 }

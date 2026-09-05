@@ -310,10 +310,13 @@ fn training_mode_on_a_supported_dtype_dispatches_fused_and_is_counted() {
     )
     .unwrap();
 
-    // `>` rather than `== +1`: the counters are process-wide and shared
-    // with every other test in this binary running concurrently — see
-    // `eval_mode_never_dispatches_the_fused_kernel`'s doc for why an exact
-    // delta would be racy.
+    // `>` rather than `== +1`: the counters are process-wide, but every
+    // counter-touching test in this binary now holds
+    // `DISPATCH_COUNTER_PAIR_LOCK` (acquired above), which serialises them
+    // against each other. `>` is kept here because this assertion only
+    // claims "did dispatch"; wherever a test also claims exclusivity (that
+    // the OTHER arm's counter did NOT move), it asserts `== before` on that
+    // counter directly — see the cross-arm bias oracle above.
     let before = lora_linear_fused_dispatch_snapshot();
     // `lora_epilogue`'s OWN counter, unchanged by this forward: the P2
     // fused LoRA site never calls `ScaledCastAdd` through `admit` (it
@@ -1209,8 +1212,8 @@ fn bias_carrying_base_fuses_and_matches_the_noncontiguous_w_eager_fallback_bit_e
     let y_f = lora_f.forward(&x).unwrap();
     let after_f = lora_linear_fused_dispatch_snapshot();
     assert!(
-        after_f.fused > before_f.fused,
-        "a biased-but-contiguous base must dispatch Fused: before={before_f:?} \
+        after_f.fused > before_f.fused && after_f.eager == before_f.eager,
+        "a biased-but-contiguous base must dispatch Fused-only: before={before_f:?} \
          after={after_f:?}"
     );
 
@@ -1246,8 +1249,8 @@ fn bias_carrying_base_fuses_and_matches_the_noncontiguous_w_eager_fallback_bit_e
     let y_e = lora_e.forward(&x).unwrap();
     let after_e = lora_linear_fused_dispatch_snapshot();
     assert!(
-        after_e.eager > before_e.eager,
-        "the non-contiguous-w base must dispatch Eager: before={before_e:?} \
+        after_e.eager > before_e.eager && after_e.fused == before_e.fused,
+        "the non-contiguous-w base must dispatch Eager-only: before={before_e:?} \
          after={after_e:?}"
     );
 

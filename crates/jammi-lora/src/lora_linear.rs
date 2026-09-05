@@ -189,11 +189,23 @@ fn wider_float_dtype(a: DType, b: DType) -> Result<DType, LoraError> {
 /// `production_path_retains_fewer_tape_nodes_fused_vs_eager_fallback_with_bias`:
 /// the frozen bias contributes no tape node of its own on either arm at
 /// this measurement's granularity (the fused arm's `ab` pack merely gains
-/// a third, still-single-node `Tensor::cat` argument; the eager arm's own
-/// bias add is absorbed inside `candle_nn::Linear::forward`'s existing
-/// reshape/matmul node rather than adding a new one) — stated as the
-/// MEASURED fact, not assumed equal to the bias-free pair without
-/// checking it. Every op-carrying node is one
+/// a third, still-single-node `Tensor::cat` argument). The eager arm's own
+/// bias add is NOT absorbed into an existing node — `candle-nn` 0.11.0's
+/// `Linear::forward` (`linear.rs:73-76`) ends with a separate
+/// `x.broadcast_add(bias)`, which IS its own tracked node whenever its
+/// inputs track (the op-level oracle in
+/// `jammi_kernels::ops::low_rank_residual_linear` measures exactly that
+/// case directly: 10 eager tape nodes bias-free vs 11 with a bias, see
+/// `fused_site_with_bias_retains_fewer_tape_nodes_than_the_eager_biased_composition`).
+/// The reason THIS harness measures the identical 5/11 pair with and
+/// without a bias is that here `x` (a plain `Tensor::randn`,
+/// `crates/jammi-lora/tests/fused_epilogue.rs`'s `rand_input`, used by both
+/// the bias-free and bias-carrying production harnesses) and this
+/// harness's `w`/bias are all untracked leaves, so the entire base branch —
+/// the matmul AND the bias add — is off the tape on both arms; only the
+/// `A`/`B` LoRA branch is tracked at all, and it is unaffected by the
+/// bias. Stated as the MEASURED fact, not assumed equal to the bias-free
+/// pair without checking it. Every op-carrying node is one
 /// `GradStore::or_insert` (`backprop.rs`) full-size `zeros_like` + `add`
 /// at backward time — `A.t()`/the `ab` pack are the two this op's own
 /// `CustomOp3` collapse does NOT eliminate (they still cost their own

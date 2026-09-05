@@ -157,8 +157,10 @@ pub struct LayerNorm {
 /// `.` at all — a `LayerNorm` loaded at a `VarBuilder`'s own root; no
 /// PRODUCTION call site does this today (the seam test below,
 /// `tests::layer_norm_new_call_sites_are_pinned_to_the_known_set`'s
-/// sibling seam test, constructs one deliberately, at a bare root `vb`),
-/// but the boundary is the same either way). This is the ONLY gate on
+/// sibling seam test, constructs one deliberately: `vb.pp("LayerNorm")` on
+/// a root `VarBuilder` — a dotless prefix, `"LayerNorm"` with no `.`
+/// segment before it — not a `.pp`-less builder), but the boundary is the
+/// same either way). This is the ONLY gate on
 /// whether [`LayerNorm::new`]
 /// ever consults the legacy `gamma`/`beta` names: a prefix ending in
 /// `...gamma_scale` or `...LayerNormX` does not match, and a

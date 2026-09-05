@@ -7054,30 +7054,42 @@ fn lora_linear_bias_bf16_fused_matches_eager_composition_bit_exact_on_cuda() {
         .with_bias(true);
     let fused = x.apply_op3(&w, &ab, op).unwrap();
 
-    // The eager reference is EXACTLY `LoraLinear::forward_composed`'s math
-    // (`crates/jammi-lora/src/lora_linear.rs`), not a hand-rolled
-    // approximation of it: `base_out = self.base.forward(x)` is
-    // `candle_nn::Linear::forward` with a bias, i.e.
-    // `x.matmul(&w.t()) + bias` AT `x`'s (here, bf16) dtype — never
-    // widened; the LoRA sub-linears run on `x` cast to `F32`
-    // (`forward_composed`'s `x_lora`/`ScaledCastAdd`'s own module doc:
-    // "today, always F32 in this workspace"); and the epilogue is
-    // `apply2(base_out, lora_out, ScaledCastAdd::new(scaling))` — the SAME
-    // call `eager_epilogue`'s doc says the fused op's step 6 "reuses
-    // directly" as its own internal storage-level epilogue. Mixing `x`
-    // (bf16) directly into a matmul with `a`/`b` (F32) — as an earlier
-    // revision of this test did — is not what `forward_composed` computes
-    // and panics on a candle dtype mismatch; casting to F32 first
-    // (`x32`) is required and is what step 2 of
-    // `ops::low_rank_residual_linear`'s "Every rounding point, forward"
-    // module doc documents.
+    // The eager reference is NOT "EXACTLY `LoraLinear::forward_composed`'s
+    // math": `forward_composed`'s own epilogue is `eager_epilogue`
+    // (`crates/jammi-lora/src/lora_linear.rs:127-147` — the `[mul, cast,
+    // add]` composition with the widen-to-wider-dtype rule its own doc
+    // describes), but this reference instead calls
+    // `apply2(base_out, lora_out, ScaledCastAdd::new(scaling))` directly —
+    // the fused op's own step-6 kernel, invoked through `apply2` here
+    // rather than `eager_epilogue`. That substitution is deliberate: it
+    // isolates the BIAS leg (the base GEMM plus the storage-level
+    // `broadcast_add`) under bit-exact same-device comparison, which is
+    // this test's whole point. `base_out = self.base.forward(x)` is still
+    // `candle_nn::Linear::forward` with a bias, i.e. `x.matmul(&w.t()) +
+    // bias` AT `x`'s (here, bf16) dtype — never widened; the LoRA
+    // sub-linears run on `x` cast to `F32` (`forward_composed`'s
+    // `x_lora`/`ScaledCastAdd`'s own module doc: "today, always F32 in
+    // this workspace"). Mixing `x` (bf16) directly into a matmul with
+    // `a`/`b` (F32) — as an earlier revision of this test did — is not
+    // what `forward_composed` computes and panics on a candle dtype
+    // mismatch; casting to F32 first (`x32`) is required and is what step
+    // 2 of `ops::low_rank_residual_linear`'s "Every rounding point,
+    // forward" module doc documents.
     //
-    // Same-device bit-exactness holds because the fused op issues the
-    // SAME cuBLAS `(1, m, out=out_features, k=in_features)` config with
-    // the same transposed-weight layout `Linear::forward` uses for the
-    // base GEMM (steps 1/1b), and calls the identical `scaled_cast_add`
-    // CUDA kernel for the epilogue (step 6) that `apply2`/`ScaledCastAdd`
-    // dispatches to here — not merely an analogous kernel, the SAME one.
+    // Because the reference calls the fused kernel's own epilogue rather
+    // than `eager_epilogue`, this leg (and its `F16` twin below) CANNOT
+    // detect a divergence between `eager_epilogue` and the fused op's
+    // epilogue — that comparison is covered elsewhere, by the CPU
+    // cross-arm oracles in `crates/jammi-lora/tests/fused_epilogue.rs` and
+    // by `ScaledCastAdd`'s own CPU<->CUDA parity oracles in this file.
+    // What this leg DOES prove, same-device: the fused op issues the SAME
+    // cuBLAS `(1, m, out=out_features, k=in_features)` config with the
+    // same transposed-weight layout `Linear::forward` uses for the base
+    // GEMM (steps 1/1b), and calls the identical `scaled_cast_add` CUDA
+    // kernel for the epilogue (step 6) that `apply2`/`ScaledCastAdd`
+    // dispatches to here — not merely an analogous kernel, the SAME one
+    // (the "reuses ... directly" claim is `lora_epilogue_counters`'s doc,
+    // `crates/jammi-lora/src/lora_linear.rs:59-64` — not `eager_epilogue`'s).
     let base_out = x
         .matmul(&w.t().unwrap())
         .unwrap()
@@ -7169,12 +7181,17 @@ fn lora_linear_bias_f16_fused_matches_eager_composition_bit_exact_on_cuda() {
     let fused = x.apply_op3(&w, &ab, op).unwrap();
 
     // See `lora_linear_bias_bf16_fused_matches_eager_composition_bit_exact_on_cuda`'s
-    // doc for the full derivation — this reference is EXACTLY
-    // `LoraLinear::forward_composed`'s math at `F16`: base at `x`'s own
-    // dtype (`x.matmul(&w.t()) + bias`), the LoRA sub-linears on `x` cast
-    // to `F32`, and the epilogue is the SAME `apply2(base_out, lora_out,
-    // ScaledCastAdd::new(scaling))` call the fused op's step 6 reuses
-    // directly on this device.
+    // doc for the full derivation — this is NOT `LoraLinear::forward_composed`'s
+    // math (that epilogue is `eager_epilogue`, `lora_linear.rs:127-147`);
+    // this reference calls `apply2(base_out, lora_out,
+    // ScaledCastAdd::new(scaling))` directly — the fused op's own step-6
+    // kernel — at `F16`: base at `x`'s own dtype (`x.matmul(&w.t()) +
+    // bias`), the LoRA sub-linears on `x` cast to `F32`. As at bf16, this
+    // leg isolates the bias leg and cannot detect an epilogue divergence
+    // (see the bf16 test's doc for what covers that); "reuses ...
+    // directly" is `lora_epilogue_counters`'s doc claim
+    // (`lora_linear.rs:59-64`), about the SAME kernel this leg also calls
+    // on this device.
     let base_out = x
         .matmul(&w.t().unwrap())
         .unwrap()

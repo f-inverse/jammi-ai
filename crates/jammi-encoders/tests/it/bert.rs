@@ -880,3 +880,78 @@ fn bert_rejects_a_weight_source_hit_with_mismatched_geometry() {
         other => panic!("expected EncoderError::Config, got {other:?}"),
     }
 }
+
+/// #460 (C-LN): before this unit, EVERY BERT LayerNorm carried a bias, so
+/// a real BERT training run's `ln` dispatch-counter pair read `0/0`
+/// regardless of how many LayerNorms it actually ran (no `admit()` call
+/// site at all — see `jammi_kernels::ops::layer_norm`'s module doc). This
+/// pins the fix, end to end, on a real (non-LoRA) BERT build: training
+/// must dispatch the fused `layer_norm_fused` key at least once, eval
+/// must never touch it at all.
+#[test]
+fn bert_biased_layer_norm_counter_threading_gates_the_ln_dispatch_counters() {
+    let _guard = crate::modernbert::DISPATCH_COUNTER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let device = Device::Cpu;
+    let config = load_config();
+    let varmap = VarMap::new();
+    let weights = weights_path();
+
+    let mut bert = Bert::builder()
+        .pooling(Pooling::Mean)
+        .lora(LoraBuildConfig::frozen())
+        .backbone_dtype(DType::F32)
+        .adapter(None)
+        .build(&[weights.as_path()], &config, &device, &varmap)
+        .expect("build BERT");
+
+    let input_ids = Tensor::new(&[[1u32, 2, 3, 4, 5]], &device).unwrap();
+    let mask = Tensor::new(&[[1u32, 1, 1, 1, 1]], &device).unwrap();
+
+    // Eval: every BERT LayerNorm is biased, so `forward`'s first arm
+    // (`candle_nn::ops::layer_norm`) runs directly -- the `ln` counter
+    // pair must not move at all.
+    bert.set_training(false);
+    let before_eval = jammi_encoders::ln_dispatch_snapshot();
+    let _ = bert
+        .forward_hidden(&input_ids, &mask)
+        .expect("eval forward");
+    let after_eval = jammi_encoders::ln_dispatch_snapshot();
+    assert_eq!(
+        (after_eval.fused, after_eval.eager),
+        (before_eval.fused, before_eval.eager),
+        "eval-mode forward must never touch the `ln` dispatch counters at all \
+         (before={before_eval:?}, after={after_eval:?})"
+    );
+
+    // Training: every biased LayerNorm in this fixture is F32, contiguous,
+    // well within MAX_HIDDEN -- the fused biased kernel's domain holds, so
+    // the fused counter must advance (this is the exact `0/0` bug #460
+    // fixes: before it, this assertion would fail with fused == before).
+    bert.set_training(true);
+    let before_train = jammi_encoders::ln_dispatch_snapshot();
+    let _ = bert
+        .forward_hidden(&input_ids, &mask)
+        .expect("training forward");
+    let after_train = jammi_encoders::ln_dispatch_snapshot();
+    assert!(
+        after_train.fused > before_train.fused,
+        "training-mode forward on an all-biased BERT must dispatch the fused LayerNorm \
+         kernel at least once (before={before_train:?}, after={after_train:?})"
+    );
+
+    // Back to eval: dispatch stops again.
+    bert.set_training(false);
+    let before_eval2 = jammi_encoders::ln_dispatch_snapshot();
+    let _ = bert
+        .forward_hidden(&input_ids, &mask)
+        .expect("eval forward again");
+    let after_eval2 = jammi_encoders::ln_dispatch_snapshot();
+    assert_eq!(
+        (after_eval2.fused, after_eval2.eager),
+        (before_eval2.fused, before_eval2.eager),
+        "set_training(false) must restore the eval-only path -- neither counter advances \
+         (before={before_eval2:?}, after={after_eval2:?})"
+    );
+}

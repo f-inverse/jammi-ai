@@ -255,7 +255,7 @@ pub use flash_attention::{
     flash_attention_varlen_with_rope_test_only_bwd_window_override,
 };
 pub use geglu::{GegluFused, GeluVariant};
-pub use layer_norm::{LayerNormFused, MAX_HIDDEN};
+pub use layer_norm::{LayerNormBiasedFused, LayerNormFused, MAX_HIDDEN};
 pub use low_rank_residual_linear::{DropoutKey, LowRankResidualLinear};
 pub use mem_efficient_attention::{
     mem_efficient_attention, MemEfficientAttention, MAX_SEQ as MEM_EFFICIENT_MAX_SEQ,
@@ -393,9 +393,9 @@ pub fn apply_inplace3<T: KernelOp + InplaceOp3>(
 /// - Every call site in this crate constructs a fresh instance and passes
 ///   it BY VALUE into [`apply_stateful1`] (mirroring [`apply1`]/[`apply2`]/
 ///   [`apply3`]'s own by-value shape and every existing op's inline
-///   `::new()`-at-the-call-site convention — e.g. `AttentionBlockFused::new`
-///   at `crates/jammi-encoders/src/modernbert.rs:960`, `DropoutFused::new`
-///   at `crates/jammi-lora/src/lora_linear.rs:690`); nothing in this crate
+///   `::new()`-at-the-call-site convention — e.g. `AttentionBlockFused::new`,
+///   `crates/jammi-encoders/src/modernbert.rs:1374`; `DropoutFused::new`,
+///   `crates/jammi-lora/src/lora_linear.rs:1022`); nothing in this crate
 ///   ever clones an op value, stateful or not.
 /// - If a stateful op were `Clone`, a caller could hold one instance in a
 ///   struct field (`struct Layer { op: FlashVarlenAttention }`) and reuse
@@ -561,11 +561,57 @@ pub(crate) fn empty_like(
         (CpuStorage::BF16(_), CpuStorage::BF16(_)) => {
             Ok((CpuStorage::BF16(Vec::new()), l1.shape().clone()))
         }
+        // #460: F16 was missing here even though `cuda::alloc_empty`
+        // (the CUDA arm's own empty-storage builder) already handles it —
+        // a real CPU/CUDA domain divergence at `(F16, <reduction axis ==
+        // 0>)`, reachable from any of this function's six callers. See
+        // `empty_like_f16_hidden_zero_matches_f32_and_bf16_shape` below.
+        (CpuStorage::F16(_), CpuStorage::F16(_)) => {
+            Ok((CpuStorage::F16(Vec::new()), l1.shape().clone()))
+        }
         (s1, s2) if s1.dtype() != s2.dtype() => Err(Error::DTypeMismatchBinaryOp {
             lhs: s1.dtype(),
             rhs: s2.dtype(),
             op,
         }),
         (s1, _) => Err(Error::UnsupportedDTypeForOp(s1.dtype(), op)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Shape;
+    use half::f16;
+
+    /// #460: the F16 gap this function's own doc names. Before this fix,
+    /// an `(F16, F16)` pair fell through to `_ => UnsupportedDTypeForOp`
+    /// here even though every F16 CPU arm this crate ships (`ln_fwd_f16`,
+    /// `softmax_fwd_f16`, `rope_fwd_f16`, …) already supports F16 at a
+    /// non-degenerate reduction axis, and `cuda::alloc_empty` already
+    /// admits `DType::F16` for the identical degenerate case on CUDA — a
+    /// device-dependent refusal with no oracle covering it. This pins the
+    /// fix: F16 now returns the SAME shape/emptiness `empty_like` already
+    /// gives F32/BF16 on the identical `l1` layout, not an error.
+    #[test]
+    fn empty_like_f16_hidden_zero_matches_f32_and_bf16_shape() {
+        let l1 = Layout::contiguous(Shape::from((3usize, 0usize)));
+        let s1_f16 = CpuStorage::F16(Vec::<f16>::new());
+        let s2_f16 = CpuStorage::F16(Vec::<f16>::new());
+        let (out, shape) = empty_like(&s1_f16, &s2_f16, &l1, "test_op")
+            .expect("F16/F16 at a zero-length reduction axis must be admitted, not refused");
+        assert_eq!(shape.dims(), &[3, 0]);
+        match out {
+            CpuStorage::F16(v) => assert!(v.is_empty()),
+            other => panic!("expected an empty F16 storage, got {other:?}"),
+        }
+
+        // Same layout, F32/BF16: the pre-existing arms this fix must not
+        // disturb, used here as the "matches" comparator the test name
+        // promises rather than an independent assertion.
+        let s1_f32 = CpuStorage::F32(Vec::new());
+        let s2_f32 = CpuStorage::F32(Vec::new());
+        let (_, shape_f32) = empty_like(&s1_f32, &s2_f32, &l1, "test_op").unwrap();
+        assert_eq!(shape.dims(), shape_f32.dims());
     }
 }

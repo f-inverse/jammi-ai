@@ -52,11 +52,28 @@
 //! `tests/cuda_parity.rs`, gated the same way every other op's is.
 
 use candle_core::{DType, Device, Tensor, Var, D};
-use half::bf16;
-use jammi_kernels::ops::{apply2, LayerNormFused};
+use half::{bf16, f16};
+use jammi_kernels::ops::{apply2, apply3, LayerNormBiasedFused, LayerNormFused};
 
 fn fused(eps: f64, dgamma_needed: bool, x: &Tensor, gamma: &Tensor) -> candle_core::Result<Tensor> {
     apply2(x, gamma, LayerNormFused::new(eps, dgamma_needed))
+}
+
+/// #460 (C-LN): the bias-carrying sibling of [`fused`] above.
+fn fused_biased(
+    eps: f64,
+    dgamma_needed: bool,
+    dbeta_needed: bool,
+    x: &Tensor,
+    gamma: &Tensor,
+    beta: &Tensor,
+) -> candle_core::Result<Tensor> {
+    apply3(
+        x,
+        gamma,
+        beta,
+        LayerNormBiasedFused::new(eps, dgamma_needed, dbeta_needed),
+    )
 }
 
 /// The bias-free formula composition `jammi-encoders::layer_norm::slow()`
@@ -99,6 +116,36 @@ fn formula(eps: f64, x: &Tensor, gamma: &Tensor) -> candle_core::Result<Tensor> 
     let gamma_internal = gamma.to_dtype(internal_dtype)?;
     let scaled_internal = normalized.broadcast_mul(&gamma_internal)?;
     scaled_internal.to_dtype(x_dtype)
+}
+
+/// #460 (C-LN): [`formula`]'s bias-carrying twin — `beta` upcast to
+/// `internal_dtype` and added THERE (never rounded to `x`'s dtype first),
+/// matching `jammi-encoders::layer_norm::LayerNorm::slow`'s biased arm and
+/// `LayerNormBiasedFused`'s own CPU/CUDA epilogue (`xhat * gamma + beta`,
+/// one rounding at the very end).
+fn formula_biased(
+    eps: f64,
+    x: &Tensor,
+    gamma: &Tensor,
+    beta: &Tensor,
+) -> candle_core::Result<Tensor> {
+    let x_dtype = x.dtype();
+    let internal_dtype = match x_dtype {
+        DType::F16 | DType::BF16 => DType::F32,
+        d => d,
+    };
+    let hidden = x.dim(D::Minus1)?;
+    let x_internal = x.to_dtype(internal_dtype)?;
+    let mean = (x_internal.sum_keepdim(D::Minus1)? / hidden as f64)?;
+    let centered = x_internal.broadcast_sub(&mean)?;
+    let variance = (centered.sqr()?.sum_keepdim(D::Minus1)? / hidden as f64)?;
+    let rstd = (variance + eps)?.sqrt()?.recip()?;
+    let normalized = centered.broadcast_mul(&rstd)?;
+    let gamma_internal = gamma.to_dtype(internal_dtype)?;
+    let scaled_internal = normalized.broadcast_mul(&gamma_internal)?;
+    let beta_internal = beta.to_dtype(internal_dtype)?;
+    let out_internal = scaled_internal.broadcast_add(&beta_internal)?;
+    out_internal.to_dtype(x_dtype)
 }
 
 // ---------------------------------------------------------------------
@@ -512,4 +559,297 @@ fn dgamma_needed_false_on_a_frozen_leaf_gamma_neither_panics_nor_emits_a_gamma_g
         grads.get(&gamma).is_none(),
         "dgamma_needed=false must mean gamma's gradient is never populated"
     );
+}
+
+// ---------------------------------------------------------------------
+// #460 (C-LN): `LayerNormBiasedFused` oracles — the same three-oracle
+// shape as the bias-free op above, plus `dbeta`.
+// ---------------------------------------------------------------------
+
+#[test]
+fn gradcheck_dbeta_f32() {
+    let device = Device::Cpu;
+    let x0: [f32; 8] = [-2.0, -0.75, -0.1, 0.3, 1.2, 4.0, 0.6, -1.3];
+    let gamma0: [f32; 4] = [1.5, 0.5, -0.75, 2.0];
+    let beta0: [f32; 4] = [0.2, -0.3, 0.5, -0.1];
+    let eps = 1e-5;
+    let hidden = gamma0.len();
+    let rows = x0.len() / hidden;
+
+    let x = Tensor::from_slice(&x0, (rows, hidden), &device).unwrap();
+    let gamma = Tensor::from_slice(&gamma0, (hidden,), &device).unwrap();
+    let beta = Var::from_tensor(&Tensor::from_slice(&beta0, (hidden,), &device).unwrap()).unwrap();
+
+    // A non-uniform loss weight, matching `fused_vs_formula_bf16_bwd_is_
+    // bit_exact_after_the_one_rounding_fix`'s rationale: `backward()`
+    // seeds an all-ones upstream gradient, which would make every
+    // `dbeta_i` trivially equal `rows` regardless of a real bug in the
+    // reduction's per-element wiring (a permutation of columns would
+    // still sum to the same total). Weighting breaks that degeneracy.
+    let w0: [f32; 8] = [0.3, -1.1, 2.2, 0.7, -0.4, 1.6, -2.3, 0.9];
+    let w = Tensor::from_slice(&w0, (rows, hidden), &device).unwrap();
+
+    let out = fused_biased(eps, false, true, &x, &gamma, beta.as_tensor()).unwrap();
+    let loss = (&out * &w).unwrap().sum_all().unwrap();
+    let grads = loss.backward().unwrap();
+    let dbeta: Vec<f32> = grads.get(&beta).unwrap().to_vec1().unwrap();
+
+    let sum_fwd = |beta: &Tensor| -> f64 {
+        (fused_biased(eps, false, false, &x, &gamma, beta).unwrap() * &w)
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap() as f64
+    };
+
+    let fd_eps = 2e-3f32;
+    let tol = 5e-2f64;
+    for i in 0..beta0.len() {
+        let mut bp = beta0;
+        bp[i] += fd_eps;
+        let mut bm = beta0;
+        bm[i] -= fd_eps;
+        let bp_t = Tensor::from_slice(&bp, (hidden,), &device).unwrap();
+        let bm_t = Tensor::from_slice(&bm, (hidden,), &device).unwrap();
+        let numeric = (sum_fwd(&bp_t) - sum_fwd(&bm_t)) / (2.0 * fd_eps as f64);
+        assert!(
+            (numeric - dbeta[i] as f64).abs() < tol,
+            "dbeta[{i}]: numeric {numeric} vs analytic {}",
+            dbeta[i]
+        );
+    }
+}
+
+#[test]
+fn fused_vs_formula_biased_f32_fwd_and_bwd_match_within_stated_tolerance() {
+    let device = Device::Cpu;
+    let x0: [f32; 8] = [1.0, -2.0, 3.5, -0.25, 0.1, 2.2, -1.1, 0.75];
+    let gamma0: [f32; 4] = [1.25, -0.5, 2.0, 0.75];
+    let beta0: [f32; 4] = [0.3, -0.2, 0.1, -0.4];
+    let eps = 1e-5;
+    let hidden = gamma0.len();
+    let rows = x0.len() / hidden;
+
+    let x_f = Var::from_tensor(&Tensor::from_slice(&x0, (rows, hidden), &device).unwrap()).unwrap();
+    let g_f = Var::from_tensor(&Tensor::from_slice(&gamma0, (hidden,), &device).unwrap()).unwrap();
+    let b_f = Var::from_tensor(&Tensor::from_slice(&beta0, (hidden,), &device).unwrap()).unwrap();
+    let x_e = Var::from_tensor(&Tensor::from_slice(&x0, (rows, hidden), &device).unwrap()).unwrap();
+    let g_e = Var::from_tensor(&Tensor::from_slice(&gamma0, (hidden,), &device).unwrap()).unwrap();
+    let b_e = Var::from_tensor(&Tensor::from_slice(&beta0, (hidden,), &device).unwrap()).unwrap();
+
+    let out_f = fused_biased(eps, true, true, &x_f, &g_f, b_f.as_tensor()).unwrap();
+    let out_e = formula_biased(eps, &x_e, &g_e, b_e.as_tensor()).unwrap();
+    let vf: Vec<f32> = out_f.flatten_all().unwrap().to_vec1().unwrap();
+    let ve: Vec<f32> = out_e.flatten_all().unwrap().to_vec1().unwrap();
+    for (i, (f, e)) in vf.iter().zip(ve.iter()).enumerate() {
+        assert!((f - e).abs() < 1e-4, "fwd[{i}]: fused {f} vs formula {e}");
+    }
+
+    let grads_f = out_f.backward().unwrap();
+    let grads_e = out_e.backward().unwrap();
+    let dxf: Vec<f32> = grads_f
+        .get(&x_f)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let dxe: Vec<f32> = grads_e
+        .get(&x_e)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    for (i, (f, e)) in dxf.iter().zip(dxe.iter()).enumerate() {
+        assert!((f - e).abs() < 1e-3, "dx[{i}]: fused {f} vs formula {e}");
+    }
+    let dgf: Vec<f32> = grads_f.get(&g_f).unwrap().to_vec1().unwrap();
+    let dge: Vec<f32> = grads_e.get(&g_e).unwrap().to_vec1().unwrap();
+    for (i, (f, e)) in dgf.iter().zip(dge.iter()).enumerate() {
+        assert!(
+            (f - e).abs() < 1e-3,
+            "dgamma[{i}]: fused {f} vs formula {e}"
+        );
+    }
+    let dbf: Vec<f32> = grads_f.get(&b_f).unwrap().to_vec1().unwrap();
+    let dbe: Vec<f32> = grads_e.get(&b_e).unwrap().to_vec1().unwrap();
+    for (i, (f, e)) in dbf.iter().zip(dbe.iter()).enumerate() {
+        assert!((f - e).abs() < 1e-3, "dbeta[{i}]: fused {f} vs formula {e}");
+    }
+}
+
+/// A deterministic (LCG-seeded) fixture generator, reused across the
+/// production-width tests below — no external RNG dependency, and the
+/// same seed always yields the same fixture (family J: reproducible
+/// numerics).
+fn lcg_f32(seed: &mut u32, half_width: f32) -> f32 {
+    *seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+    let u = (*seed >> 8) as f32 / (1u32 << 24) as f32; // [0, 1)
+    (u * 2.0 - 1.0) * half_width
+}
+
+/// Production-width (rule 3.4 of the kernel guide): `hidden` in
+/// `{768, 1024}` (BERT-base/ModernBERT-large), non-uniform `dy`, `beta`
+/// present. bf16 bound derived over `|xhat*gamma| + |beta|` — beta can
+/// CANCEL the scaled term, so the bound sums the two magnitudes rather
+/// than assuming the output's own magnitude bounds the error (the same
+/// derivation `ops::layer_norm`'s own `bf16_forward_biased_matches_f32_
+/// accumulation_rounded_once` unit test uses, at production scale here).
+#[test]
+fn bf16_biased_fwd_bwd_bound_at_production_width() {
+    let device = Device::Cpu;
+    for &hidden in &[768usize, 1024usize] {
+        let rows = 4;
+        let mut seed = 0xC0FFEEu32 ^ (hidden as u32);
+        let xv: Vec<f32> = (0..rows * hidden)
+            .map(|_| lcg_f32(&mut seed, 6.0))
+            .collect();
+        let gv: Vec<f32> = (0..hidden).map(|_| 0.5 + lcg_f32(&mut seed, 1.0)).collect();
+        let bv: Vec<f32> = (0..hidden).map(|_| lcg_f32(&mut seed, 1.5)).collect();
+        let dyv: Vec<f32> = (0..rows * hidden)
+            .map(|_| lcg_f32(&mut seed, 3.0))
+            .collect();
+
+        let xb: Vec<bf16> = xv.iter().map(|&v| bf16::from_f32(v)).collect();
+        let gb: Vec<bf16> = gv.iter().map(|&v| bf16::from_f32(v)).collect();
+        let bb: Vec<bf16> = bv.iter().map(|&v| bf16::from_f32(v)).collect();
+        let dyb: Vec<bf16> = dyv.iter().map(|&v| bf16::from_f32(v)).collect();
+
+        let x_f =
+            Var::from_tensor(&Tensor::from_slice(&xb, (rows, hidden), &device).unwrap()).unwrap();
+        let g_f = Var::from_tensor(&Tensor::from_slice(&gb, (hidden,), &device).unwrap()).unwrap();
+        let b_f = Var::from_tensor(&Tensor::from_slice(&bb, (hidden,), &device).unwrap()).unwrap();
+        let dy = Tensor::from_slice(&dyb, (rows, hidden), &device).unwrap();
+
+        let out = fused_biased(
+            1e-5,
+            true,
+            true,
+            x_f.as_tensor(),
+            g_f.as_tensor(),
+            b_f.as_tensor(),
+        )
+        .unwrap();
+        let out_v: Vec<bf16> = out.flatten_all().unwrap().to_vec1().unwrap();
+
+        // Independent f64 reference: mean/var over the bf16-rounded
+        // inputs, gamma/beta applied in f64, one final rounding to bf16.
+        let mut max_rel: f32 = 0.0;
+        for r in 0..rows {
+            let row: Vec<f64> = xb[r * hidden..(r + 1) * hidden]
+                .iter()
+                .map(|v| v.to_f32() as f64)
+                .collect();
+            let mean: f64 = row.iter().sum::<f64>() / hidden as f64;
+            let var: f64 = row.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / hidden as f64;
+            let invvar = 1.0 / (var + 1e-5).sqrt();
+            for c in 0..hidden {
+                let xhat = (row[c] - mean) * invvar;
+                let g = gb[c].to_f32() as f64;
+                let b = bb[c].to_f32() as f64;
+                let expected = (xhat * g + b) as f32;
+                let got = out_v[r * hidden + c].to_f32();
+                let bound = ((xhat * g).abs() as f32 + b.abs() as f32) * 2e-2 + 1e-2;
+                assert!(
+                    got.is_finite() && (got - expected).abs() < bound,
+                    "hidden={hidden} row={r} col={c}: got {got} vs expected {expected} \
+                     (bound {bound})"
+                );
+                if expected != 0.0 {
+                    max_rel = max_rel.max((got - expected).abs() / expected.abs());
+                }
+            }
+        }
+        println!(
+            "bf16_biased_fwd_bwd_bound_at_production_width: hidden={hidden} max_rel={max_rel}"
+        );
+
+        let loss = (&out * &dy).unwrap().sum_all().unwrap();
+        let grads = loss.backward().unwrap();
+        assert!(grads.get(&x_f).is_some());
+        assert!(grads.get(&g_f).is_some());
+        let dbeta: Vec<bf16> = grads.get(&b_f).unwrap().to_vec1().unwrap();
+        assert!(
+            dbeta.iter().any(|v| v.to_f32() != 0.0),
+            "hidden={hidden}: dbeta must be a live (non-vacuous) signal, not all-zero"
+        );
+    }
+}
+
+/// [`bf16_biased_fwd_bwd_bound_at_production_width`]'s F16 twin — F16's
+/// narrower 10-bit mantissa needs its own (tighter-magnitude, wider
+/// relative) bound; same fixture generator, same beta-cancellation
+/// derivation.
+#[test]
+fn f16_biased_fwd_bwd_bound_at_production_width() {
+    let device = Device::Cpu;
+    for &hidden in &[768usize, 1024usize] {
+        let rows = 4;
+        let mut seed = 0xF16Bu32 ^ (hidden as u32);
+        let xv: Vec<f32> = (0..rows * hidden)
+            .map(|_| lcg_f32(&mut seed, 4.0))
+            .collect();
+        let gv: Vec<f32> = (0..hidden).map(|_| 0.5 + lcg_f32(&mut seed, 0.8)).collect();
+        let bv: Vec<f32> = (0..hidden).map(|_| lcg_f32(&mut seed, 1.0)).collect();
+        let dyv: Vec<f32> = (0..rows * hidden)
+            .map(|_| lcg_f32(&mut seed, 2.0))
+            .collect();
+
+        let xh: Vec<f16> = xv.iter().map(|&v| f16::from_f32(v)).collect();
+        let gh: Vec<f16> = gv.iter().map(|&v| f16::from_f32(v)).collect();
+        let bh: Vec<f16> = bv.iter().map(|&v| f16::from_f32(v)).collect();
+        let dyh: Vec<f16> = dyv.iter().map(|&v| f16::from_f32(v)).collect();
+
+        let x_f =
+            Var::from_tensor(&Tensor::from_slice(&xh, (rows, hidden), &device).unwrap()).unwrap();
+        let g_f = Var::from_tensor(&Tensor::from_slice(&gh, (hidden,), &device).unwrap()).unwrap();
+        let b_f = Var::from_tensor(&Tensor::from_slice(&bh, (hidden,), &device).unwrap()).unwrap();
+        let dy = Tensor::from_slice(&dyh, (rows, hidden), &device).unwrap();
+
+        let out = fused_biased(
+            1e-5,
+            true,
+            true,
+            x_f.as_tensor(),
+            g_f.as_tensor(),
+            b_f.as_tensor(),
+        )
+        .unwrap();
+        let out_v: Vec<f16> = out.flatten_all().unwrap().to_vec1().unwrap();
+
+        for r in 0..rows {
+            let row: Vec<f64> = xh[r * hidden..(r + 1) * hidden]
+                .iter()
+                .map(|v| v.to_f32() as f64)
+                .collect();
+            let mean: f64 = row.iter().sum::<f64>() / hidden as f64;
+            let var: f64 = row.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / hidden as f64;
+            let invvar = 1.0 / (var + 1e-5).sqrt();
+            for c in 0..hidden {
+                let xhat = (row[c] - mean) * invvar;
+                let g = gh[c].to_f32() as f64;
+                let b = bh[c].to_f32() as f64;
+                let expected = (xhat * g + b) as f32;
+                let got = out_v[r * hidden + c].to_f32();
+                let bound = ((xhat * g).abs() as f32 + b.abs() as f32) * 6e-2 + 3e-2;
+                assert!(
+                    got.is_finite() && (got - expected).abs() < bound,
+                    "hidden={hidden} row={r} col={c}: got {got} vs expected {expected} \
+                     (bound {bound})"
+                );
+            }
+        }
+
+        let loss = (&out * &dy).unwrap().sum_all().unwrap();
+        let grads = loss.backward().unwrap();
+        assert!(grads.get(&x_f).is_some());
+        assert!(grads.get(&g_f).is_some());
+        let dbeta: Vec<f16> = grads.get(&b_f).unwrap().to_vec1().unwrap();
+        assert!(
+            dbeta.iter().any(|v| v.to_f32() != 0.0),
+            "hidden={hidden}: dbeta must be a live (non-vacuous) signal, not all-zero"
+        );
+    }
 }

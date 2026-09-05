@@ -41,9 +41,10 @@ use jammi_kernels::ops::{
     cast_add_bf16_into, cast_scale_bf16_f32_into, mem_efficient_attention, quant_matmul_grad,
     AdamMomentUpdate, AdamMomentUpdateFmaContractedRedControl, AdamWParams, AttentionBlockFused,
     BwdGemmLayoutsParams, CastAddBf16, CastAddF16, CastScaleBf16F32, CastScaleF16F32, DropoutFused,
-    DropoutKey, FullyMaskedPolicy, GegluFused, GeluVariant, LayerNormFused, LowRankResidualLinear,
-    MemEfficientAttention, PhiloxKatProbe, RopeFused, ScaledCastAdd, SoftmaxLastDimFused,
-    ATTENTION_BLOCK_WINDOW_MASKED_VALUE, MAX_LAST_DIM, MEM_EFFICIENT_WINDOW_MASKED_VALUE,
+    DropoutKey, FullyMaskedPolicy, GegluFused, GeluVariant, LayerNormBiasedFused, LayerNormFused,
+    LowRankResidualLinear, MemEfficientAttention, PhiloxKatProbe, RopeFused, ScaledCastAdd,
+    SoftmaxLastDimFused, ATTENTION_BLOCK_WINDOW_MASKED_VALUE, MAX_LAST_DIM,
+    MEM_EFFICIENT_WINDOW_MASKED_VALUE,
 };
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -1217,6 +1218,480 @@ fn ln_parity_empty_batch() {
         .unwrap();
     // Must not attempt an illegal zero-block launch.
     let out_gpu: Vec<f32> = ln_forward(1e-5, false, &x_gpu, &g_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert!(out_cpu.is_empty());
+    assert!(out_gpu.is_empty());
+}
+
+// =======================================================================
+// #460 (C-LN): LayerNormBiasedFused CPU<->CUDA parity. Same divergence-
+// prone classes and same `k`-derivation discipline as `LayerNormFused`'s
+// suite above (this module's own comments cite the identical `rsqrtf()`-
+// vs-`1.0/sqrt()` cross-device divergence for the `k=2` 16-bit bound), plus
+// `dbeta` (exact on an integer fixture — an ordinary `Tensor::sum`
+// composition, not a further kernel, so its own CPU/CUDA agreement is
+// governed by candle's own reduction, not this crate's kernel code) and
+// two regression pins: the bias-free kernels' own output must be
+// UNCHANGED by this addition (append-only `.cu` edits — see those files'
+// own module docs), and same-device fused-vs-`slow()`-style composition
+// bound (NOT bit-exact: the composition folds via `broadcast_*`/`sum_
+// keepdim` in a different order than the fused kernel's own row loop).
+//
+// NARROWER than `LayerNormFused`'s own suite in one respect: this block
+// does not carry a forced-defect (KO-1) leg for fwd/dx/dgamma/dbeta
+// individually — `dx`/`dgamma` are proven identical BY CONSTRUCTION (the
+// SAME `LayerNormBwdDx`/`LayerNormBwdDgamma` kernels the bias-free suite's
+// own forced-defect legs already cover), so a forced defect there would
+// only re-prove what that suite already proves; `dbeta`'s own forced-
+// defect coverage (e.g. a dropped-row or transposed-reduction bug) is a
+// gap worth closing in a follow-up unit, noted here rather than silently
+// omitted.
+// =======================================================================
+
+fn ln_forward_biased(
+    eps: f64,
+    dgamma_needed: bool,
+    dbeta_needed: bool,
+    x: &Tensor,
+    gamma: &Tensor,
+    beta: &Tensor,
+) -> candle_core::Result<Tensor> {
+    apply3(
+        x,
+        gamma,
+        beta,
+        LayerNormBiasedFused::new(eps, dgamma_needed, dbeta_needed),
+    )
+}
+
+/// F32 leg: fwd + dx + dgamma (the file's standard two-term bound, same
+/// derivation as `assert_ln_parity_f32`) + dbeta EXACT on an integer `dy`
+/// fixture (family F: no rounding-tolerance judgment call needed at all —
+/// `.sum_all()`'s upstream gradient is all-`1.0`, so `dbeta_i = rows`
+/// exactly, on both devices, in f32).
+fn assert_ln_parity_biased_f32(
+    cuda: &Device,
+    eps: f64,
+    rows: usize,
+    hidden: usize,
+    xv: &[f32],
+    gv: &[f32],
+    bv: &[f32],
+) {
+    let cpu = Device::Cpu;
+    let n = rows * hidden;
+
+    let x_cpu = Var::from_tensor(&Tensor::from_slice(xv, (rows, hidden), &cpu).unwrap()).unwrap();
+    let g_cpu = Var::from_tensor(&Tensor::from_slice(gv, (hidden,), &cpu).unwrap()).unwrap();
+    let b_cpu = Var::from_tensor(&Tensor::from_slice(bv, (hidden,), &cpu).unwrap()).unwrap();
+    let out_cpu = ln_forward_biased(eps, true, true, &x_cpu, &g_cpu, b_cpu.as_tensor()).unwrap();
+
+    let x_gpu = Var::from_tensor(&Tensor::from_slice(xv, (rows, hidden), cuda).unwrap()).unwrap();
+    let g_gpu = Var::from_tensor(&Tensor::from_slice(gv, (hidden,), cuda).unwrap()).unwrap();
+    let b_gpu = Var::from_tensor(&Tensor::from_slice(bv, (hidden,), cuda).unwrap()).unwrap();
+    let out_gpu = ln_forward_biased(eps, true, true, &x_gpu, &g_gpu, b_gpu.as_tensor()).unwrap();
+
+    let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
+    let out_gpu_v: Vec<f32> = out_gpu
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out_cpu_v.len(), n);
+    assert_eq!(out_gpu_v.len(), n, "biased LN GPU fwd length mismatch");
+    let out_floor = max_abs(xv).max(max_abs(gv)).max(max_abs(bv));
+    let out_bound =
+        |r: f32| f32_two_term_bound(r, out_floor, 2.0 * hidden as f32, F32_CANCELLATION_ULPS);
+    assert_relative_bound("biased ln f32 fwd", &out_cpu_v, &out_gpu_v, out_bound);
+
+    // `dy` = all-ones via `.sum_all()`, deliberately: this is what makes
+    // `dbeta` exact-integer (`dbeta_i = rows`) — see this fn's own doc.
+    // `dx`/`dgamma` under an all-ones `dy` are the SAME analytically-zero
+    // degenerate case `assert_ln_parity_f32`'s own doc names, so those two
+    // are checked under the sign-mixed cotangent fixture in a SEPARATE
+    // pass below, mirroring that function's two-pass shape.
+    let grads_ones_cpu = out_cpu.sum_all().unwrap().backward().unwrap();
+    let grads_ones_gpu = out_gpu.sum_all().unwrap().backward().unwrap();
+    let db_cpu: Vec<f32> = grads_ones_cpu.get(&b_cpu).unwrap().to_vec1().unwrap();
+    let db_gpu: Vec<f32> = grads_ones_gpu
+        .get(&b_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(
+        db_cpu,
+        vec![rows as f32; hidden],
+        "biased ln f32 dbeta (cpu) must be exact"
+    );
+    assert_eq!(
+        db_gpu,
+        vec![rows as f32; hidden],
+        "biased ln f32 dbeta (cuda) must be exact"
+    );
+
+    // Second pass: sign-mixed cotangent for dx/dgamma (dbeta re-checked
+    // for cross-device agreement too, though it is no longer the
+    // exact-integer leg above once dy is non-uniform).
+    let x_cpu2 = Var::from_tensor(&Tensor::from_slice(xv, (rows, hidden), &cpu).unwrap()).unwrap();
+    let g_cpu2 = Var::from_tensor(&Tensor::from_slice(gv, (hidden,), &cpu).unwrap()).unwrap();
+    let b_cpu2 = Var::from_tensor(&Tensor::from_slice(bv, (hidden,), &cpu).unwrap()).unwrap();
+    let out_cpu2 =
+        ln_forward_biased(eps, true, true, &x_cpu2, &g_cpu2, b_cpu2.as_tensor()).unwrap();
+    let x_gpu2 = Var::from_tensor(&Tensor::from_slice(xv, (rows, hidden), cuda).unwrap()).unwrap();
+    let g_gpu2 = Var::from_tensor(&Tensor::from_slice(gv, (hidden,), cuda).unwrap()).unwrap();
+    let b_gpu2 = Var::from_tensor(&Tensor::from_slice(bv, (hidden,), cuda).unwrap()).unwrap();
+    let out_gpu2 =
+        ln_forward_biased(eps, true, true, &x_gpu2, &g_gpu2, b_gpu2.as_tensor()).unwrap();
+
+    let dyv = cotangent_fixture(n, 0xDA57_1D5E_2000_0004, 3.0);
+    let dy_cpu = Tensor::from_slice(&dyv, (rows, hidden), &cpu).unwrap();
+    let dy_gpu = Tensor::from_slice(&dyv, (rows, hidden), cuda).unwrap();
+    let grads_cpu = (&out_cpu2 * &dy_cpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
+    let grads_gpu = (&out_gpu2 * &dy_gpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
+
+    let dx_cpu: Vec<f32> = grads_cpu
+        .get(&x_cpu2)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let dx_gpu: Vec<f32> = grads_gpu
+        .get(&x_gpu2)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let dx_floor = max_abs(xv).max(max_abs(gv));
+    let dx_bound =
+        |r: f32| f32_two_term_bound(r, dx_floor, 2.0 * hidden as f32, F32_CANCELLATION_ULPS);
+    assert_relative_bound("biased ln f32 dx", &dx_cpu, &dx_gpu, dx_bound);
+
+    let dg_cpu: Vec<f32> = grads_cpu.get(&g_cpu2).unwrap().to_vec1().unwrap();
+    let dg_gpu: Vec<f32> = grads_gpu
+        .get(&g_gpu2)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let dg_floor = max_abs(xv).max(max_abs(gv));
+    let dg_bound =
+        |r: f32| f32_two_term_bound(r, dg_floor, 2.0 * rows as f32, F32_CANCELLATION_ULPS);
+    assert_relative_bound("biased ln f32 dgamma", &dg_cpu, &dg_gpu, dg_bound);
+}
+
+/// bf16/f16 legs: fwd only (dx/dgamma's 16-bit parity is already covered
+/// by the bias-free suite's own `assert_ln_parity_bf16`/`_f16` — beta is
+/// additive and beta-independent per this op's own doc, so `dx`/`dgamma`
+/// carry no NEW 16-bit divergence risk beta could introduce); `dbeta`
+/// checked for cross-device agreement (not exact at 16-bit — `sum` itself
+/// rounds mid-reduction on a real accumulate, so this is a relative bound,
+/// not the f32 leg's exact-integer claim).
+fn assert_ln_parity_biased_16bit<T, F>(
+    cuda: &Device,
+    eps: f64,
+    rows: usize,
+    hidden: usize,
+    xv: &[f32],
+    gv: &[f32],
+    bv: &[f32],
+    to_t: F,
+    k: f32,
+    label: &str,
+) where
+    T: candle_core::WithDType + Copy,
+    F: Fn(f32) -> T,
+{
+    let cpu = Device::Cpu;
+    let n = rows * hidden;
+    let xt: Vec<T> = xv.iter().map(|&v| to_t(v)).collect();
+    let gt: Vec<T> = gv.iter().map(|&v| to_t(v)).collect();
+    let bt: Vec<T> = bv.iter().map(|&v| to_t(v)).collect();
+
+    let x_cpu = Var::from_tensor(&Tensor::from_slice(&xt, (rows, hidden), &cpu).unwrap()).unwrap();
+    let g_cpu = Var::from_tensor(&Tensor::from_slice(&gt, (hidden,), &cpu).unwrap()).unwrap();
+    let b_cpu = Var::from_tensor(&Tensor::from_slice(&bt, (hidden,), &cpu).unwrap()).unwrap();
+    let out_cpu = ln_forward_biased(eps, false, true, &x_cpu, &g_cpu, b_cpu.as_tensor()).unwrap();
+
+    let x_gpu = Var::from_tensor(&Tensor::from_slice(&xt, (rows, hidden), cuda).unwrap()).unwrap();
+    let g_gpu = Var::from_tensor(&Tensor::from_slice(&gt, (hidden,), cuda).unwrap()).unwrap();
+    let b_gpu = Var::from_tensor(&Tensor::from_slice(&bt, (hidden,), cuda).unwrap()).unwrap();
+    let out_gpu = ln_forward_biased(eps, false, true, &x_gpu, &g_gpu, b_gpu.as_tensor()).unwrap();
+
+    let to_f32 = |t: &Tensor| -> Vec<f32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    };
+    let out_cpu_v = to_f32(&out_cpu);
+    let out_gpu_v = to_f32(&out_gpu.to_device(&cpu).unwrap());
+    assert_eq!(out_cpu_v.len(), n);
+    assert_eq!(
+        out_gpu_v.len(),
+        n,
+        "{label} biased LN GPU fwd length mismatch"
+    );
+    let out_floor = measured_near_zero_floor(&out_cpu_v);
+    let out_bound = |r: f32| bf16_relative_bound(r, out_floor, k);
+    assert_relative_bound(
+        &format!("biased ln {label} fwd"),
+        &out_cpu_v,
+        &out_gpu_v,
+        out_bound,
+    );
+
+    let dyv_f = cotangent_fixture(n, 0xDA57_1D5E_2000_0005, 3.0);
+    let dyt: Vec<T> = dyv_f.iter().map(|&v| to_t(v)).collect();
+    let dy_cpu = Tensor::from_slice(&dyt, (rows, hidden), &cpu).unwrap();
+    let dy_gpu = Tensor::from_slice(&dyt, (rows, hidden), cuda).unwrap();
+    let grads_cpu = (&out_cpu * &dy_cpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
+    let grads_gpu = (&out_gpu * &dy_gpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
+    let db_cpu_v = to_f32(&grads_cpu.get(&b_cpu).unwrap().clone());
+    let db_gpu_v = to_f32(&grads_gpu.get(&b_gpu).unwrap().to_device(&cpu).unwrap());
+    assert_eq!(db_cpu_v.len(), hidden);
+    assert_eq!(
+        db_gpu_v.len(),
+        hidden,
+        "{label} biased LN GPU dbeta length mismatch"
+    );
+    let db_floor = measured_near_zero_floor(&db_cpu_v);
+    let db_bound = |r: f32| bf16_relative_bound(r, db_floor, k);
+    assert_relative_bound(
+        &format!("biased ln {label} dbeta"),
+        &db_cpu_v,
+        &db_gpu_v,
+        db_bound,
+    );
+}
+
+/// Regression pin: the bias-free kernels' own output must be UNCHANGED by
+/// this addition — same-device (CUDA vs CUDA, before/after is not
+/// meaningful within one test run; the real "before" is the pre-#460 tip,
+/// which this compares against via the bias-free `LayerNormFused` op's own
+/// output, run on the SAME device the biased kernel now also runs on) pin
+/// against a hand-computed reference, at a shape and seed independent of
+/// every other test above.
+#[test]
+fn ln_parity_bias_free_kernels_unchanged_by_the_460_addition() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let rows = 2;
+    let hidden = 16;
+    let x = fixture(rows * hidden, 11.0);
+    let g = fixture(hidden, 12.0);
+    let x_gpu = Tensor::from_slice(&x, (rows, hidden), &cuda).unwrap();
+    let g_gpu = Tensor::from_slice(&g, (hidden,), &cuda).unwrap();
+    let out_gpu: Vec<f32> = ln_forward(1e-5, false, &x_gpu, &g_gpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    for r in 0..rows {
+        let row = &x[r * hidden..(r + 1) * hidden];
+        let mean: f32 = row.iter().sum::<f32>() / hidden as f32;
+        let var: f32 = row.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / hidden as f32;
+        let invvar = 1.0 / (var + 1e-5f32).sqrt();
+        for i in 0..hidden {
+            let expected = (row[i] - mean) * invvar * g[i];
+            let got = out_gpu[r * hidden + i];
+            assert!(
+                (got - expected).abs() <= F32_TOL as f32,
+                "bias-free ln fwd[{r},{i}] must be unchanged by #460: cuda {got} vs {expected}"
+            );
+        }
+    }
+}
+
+/// Same-device biased-fused vs a `slow()`-style composition bound (NOT
+/// bit-exact — the composition folds via `broadcast_*`/`sum_keepdim` in a
+/// DIFFERENT order than the fused kernel's own ascending-index row loop;
+/// rule 15's pre-registered exposure, derived here rather than assumed).
+#[test]
+fn ln_parity_biased_fused_vs_composition_bound_same_device() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let rows = 4;
+    let hidden = 1024;
+    let x = fixture(rows * hidden, 13.0);
+    let g = fixture(hidden, 14.0);
+    let b = fixture(hidden, 15.0);
+
+    let x_t = Tensor::from_slice(&x, (rows, hidden), &cuda).unwrap();
+    let g_t = Tensor::from_slice(&g, (hidden,), &cuda).unwrap();
+    let b_t = Tensor::from_slice(&b, (hidden,), &cuda).unwrap();
+    let fused_out: Vec<f32> = ln_forward_biased(1e-5, false, false, &x_t, &g_t, &b_t)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    // The composition: mean/center/variance/normalize in f32 throughout
+    // (this fixture is already F32, so `internal_dtype == x_dtype` and
+    // every `to_dtype` below is a same-dtype no-op — this bound isolates
+    // the reduction-ORDER divergence alone, not a dtype-upcast one).
+    let mean = (x_t.sum_keepdim(D::Minus1).unwrap() / hidden as f64).unwrap();
+    let centered = x_t.broadcast_sub(&mean).unwrap();
+    let variance =
+        (centered.sqr().unwrap().sum_keepdim(D::Minus1).unwrap() / hidden as f64).unwrap();
+    let rstd = (variance + 1e-5).unwrap().sqrt().unwrap().recip().unwrap();
+    let normalized = centered.broadcast_mul(&rstd).unwrap();
+    let scaled = normalized.broadcast_mul(&g_t).unwrap();
+    let comp_out: Vec<f32> = scaled
+        .broadcast_add(&b_t)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let floor = max_abs(&x).max(max_abs(&g)).max(max_abs(&b));
+    let bound = |r: f32| f32_two_term_bound(r, floor, 2.0 * hidden as f32, F32_CANCELLATION_ULPS);
+    assert_relative_bound(
+        "biased ln fused-vs-composition (same device)",
+        &fused_out,
+        &comp_out,
+        bound,
+    );
+}
+
+#[test]
+fn ln_parity_biased_contiguous_hidden_1024_modernbert_shape() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let rows = 4;
+    let hidden = 1024;
+    let x = fixture(rows * hidden, 16.0);
+    let g = fixture(hidden, 17.0);
+    let b = fixture(hidden, 18.0);
+    assert_ln_parity_biased_f32(&cuda, 1e-5, rows, hidden, &x, &g, &b);
+    assert_ln_parity_biased_16bit(
+        &cuda,
+        1e-5,
+        rows,
+        hidden,
+        &x,
+        &g,
+        &b,
+        bf16::from_f32,
+        2.0,
+        "bf16",
+    );
+    assert_ln_parity_biased_16bit(
+        &cuda,
+        1e-5,
+        rows,
+        hidden,
+        &x,
+        &g,
+        &b,
+        f16::from_f32,
+        2.0,
+        "f16",
+    );
+}
+
+#[test]
+fn ln_parity_biased_contiguous_non_1024_hidden() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let rows = 3;
+    let hidden = 300;
+    let x = fixture(rows * hidden, 19.0);
+    let g = fixture(hidden, 20.0);
+    let b = fixture(hidden, 21.0);
+    assert_ln_parity_biased_f32(&cuda, 1e-5, rows, hidden, &x, &g, &b);
+    assert_ln_parity_biased_16bit(
+        &cuda,
+        1e-5,
+        rows,
+        hidden,
+        &x,
+        &g,
+        &b,
+        bf16::from_f32,
+        2.0,
+        "bf16",
+    );
+    assert_ln_parity_biased_16bit(
+        &cuda,
+        1e-5,
+        rows,
+        hidden,
+        &x,
+        &g,
+        &b,
+        f16::from_f32,
+        2.0,
+        "f16",
+    );
+}
+
+#[test]
+fn ln_parity_biased_empty_batch() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let hidden = 8;
+    let x_cpu = Tensor::from_slice(&[] as &[f32], (0, hidden), &cpu).unwrap();
+    let x_gpu = Tensor::from_slice(&[] as &[f32], (0, hidden), &cuda).unwrap();
+    let g = fixture(hidden, 22.0);
+    let b = fixture(hidden, 23.0);
+    let g_cpu = Tensor::from_slice(&g, (hidden,), &cpu).unwrap();
+    let g_gpu = Tensor::from_slice(&g, (hidden,), &cuda).unwrap();
+    let b_cpu = Tensor::from_slice(&b, (hidden,), &cpu).unwrap();
+    let b_gpu = Tensor::from_slice(&b, (hidden,), &cuda).unwrap();
+
+    let out_cpu: Vec<f32> = ln_forward_biased(1e-5, false, false, &x_cpu, &g_cpu, &b_cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let out_gpu: Vec<f32> = ln_forward_biased(1e-5, false, false, &x_gpu, &g_gpu, &b_gpu)
         .unwrap()
         .to_device(&cpu)
         .unwrap()
@@ -7117,8 +7592,8 @@ fn lora_linear_bias_bf16_fused_matches_eager_composition_bit_exact_on_cuda() {
     // GEMM (steps 1/1b), and calls the identical `scaled_cast_add` CUDA
     // kernel for the epilogue (step 6) that `apply2`/`ScaledCastAdd`
     // dispatches to here — not merely an analogous kernel, the SAME one
-    // (the "reuses ... directly" claim is `lora_epilogue_counters`'s doc,
-    // `crates/jammi-lora/src/lora_linear.rs:59-64` — not `eager_epilogue`'s).
+    // (the "reuses ... directly" claim is `lora_epilogue_counters`,
+    // `crates/jammi-lora/src/lora_linear.rs:65` — not `eager_epilogue`'s).
     let base_out = x
         .matmul(&w.t().unwrap())
         .unwrap()

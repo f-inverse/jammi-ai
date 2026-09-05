@@ -7054,15 +7054,39 @@ fn lora_linear_bias_bf16_fused_matches_eager_composition_bit_exact_on_cuda() {
         .with_bias(true);
     let fused = x.apply_op3(&w, &ab, op).unwrap();
 
+    // The eager reference is EXACTLY `LoraLinear::forward_composed`'s math
+    // (`crates/jammi-lora/src/lora_linear.rs`), not a hand-rolled
+    // approximation of it: `base_out = self.base.forward(x)` is
+    // `candle_nn::Linear::forward` with a bias, i.e.
+    // `x.matmul(&w.t()) + bias` AT `x`'s (here, bf16) dtype — never
+    // widened; the LoRA sub-linears run on `x` cast to `F32`
+    // (`forward_composed`'s `x_lora`/`ScaledCastAdd`'s own module doc:
+    // "today, always F32 in this workspace"); and the epilogue is
+    // `apply2(base_out, lora_out, ScaledCastAdd::new(scaling))` — the SAME
+    // call `eager_epilogue`'s doc says the fused op's step 6 "reuses
+    // directly" as its own internal storage-level epilogue. Mixing `x`
+    // (bf16) directly into a matmul with `a`/`b` (F32) — as an earlier
+    // revision of this test did — is not what `forward_composed` computes
+    // and panics on a candle dtype mismatch; casting to F32 first
+    // (`x32`) is required and is what step 2 of
+    // `ops::low_rank_residual_linear`'s "Every rounding point, forward"
+    // module doc documents.
+    //
+    // Same-device bit-exactness holds because the fused op issues the
+    // SAME cuBLAS `(1, m, out=out_features, k=in_features)` config with
+    // the same transposed-weight layout `Linear::forward` uses for the
+    // base GEMM (steps 1/1b), and calls the identical `scaled_cast_add`
+    // CUDA kernel for the epilogue (step 6) that `apply2`/`ScaledCastAdd`
+    // dispatches to here — not merely an analogous kernel, the SAME one.
     let base_out = x
         .matmul(&w.t().unwrap())
         .unwrap()
         .broadcast_add(&bias)
         .unwrap();
-    let after_a = x.matmul(&a.t().unwrap()).unwrap();
+    let x32 = x.to_dtype(DType::F32).unwrap();
+    let after_a = x32.matmul(&a.t().unwrap()).unwrap();
     let lora_out = after_a.matmul(&b.t().unwrap()).unwrap();
-    let scaled = (&lora_out * f64::from(scale)).unwrap();
-    let eager = (&base_out + &scaled).unwrap();
+    let eager = apply2(&base_out, &lora_out, ScaledCastAdd::new(f64::from(scale))).unwrap();
 
     let fused_v: Vec<bf16> = fused
         .flatten_all()
@@ -7082,6 +7106,33 @@ fn lora_linear_bias_bf16_fused_matches_eager_composition_bit_exact_on_cuda() {
         fused_v, eager_v,
         "bf16 bias: the fused site must be bit-identical to the eager composition on the SAME \
          device"
+    );
+
+    // RED CONTROL: prove the assertion above actually bites on a missing
+    // bias rather than passing vacuously. Guard non-vacuity first — the
+    // control is meaningless if the bias fixture happens to be all zero.
+    assert!(
+        bias_v.iter().any(|&v| v != 0.0),
+        "red-control guard: bias fixture must carry a non-zero element"
+    );
+    let base_out_no_bias = x.matmul(&w.t().unwrap()).unwrap();
+    let eager_no_bias = apply2(
+        &base_out_no_bias,
+        &lora_out,
+        ScaledCastAdd::new(f64::from(scale)),
+    )
+    .unwrap();
+    let eager_no_bias_v: Vec<bf16> = eager_no_bias
+        .flatten_all()
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_ne!(
+        fused_v, eager_no_bias_v,
+        "red control: an eager reference with the bias OMITTED must NOT be bit-equal to the \
+         (bias-carrying) fused output — otherwise the positive assertion above is vacuous"
     );
 }
 
@@ -7117,15 +7168,22 @@ fn lora_linear_bias_f16_fused_matches_eager_composition_bit_exact_on_cuda() {
         .with_bias(true);
     let fused = x.apply_op3(&w, &ab, op).unwrap();
 
+    // See `lora_linear_bias_bf16_fused_matches_eager_composition_bit_exact_on_cuda`'s
+    // doc for the full derivation — this reference is EXACTLY
+    // `LoraLinear::forward_composed`'s math at `F16`: base at `x`'s own
+    // dtype (`x.matmul(&w.t()) + bias`), the LoRA sub-linears on `x` cast
+    // to `F32`, and the epilogue is the SAME `apply2(base_out, lora_out,
+    // ScaledCastAdd::new(scaling))` call the fused op's step 6 reuses
+    // directly on this device.
     let base_out = x
         .matmul(&w.t().unwrap())
         .unwrap()
         .broadcast_add(&bias)
         .unwrap();
-    let after_a = x.matmul(&a.t().unwrap()).unwrap();
+    let x32 = x.to_dtype(DType::F32).unwrap();
+    let after_a = x32.matmul(&a.t().unwrap()).unwrap();
     let lora_out = after_a.matmul(&b.t().unwrap()).unwrap();
-    let scaled = (&lora_out * f64::from(scale)).unwrap();
-    let eager = (&base_out + &scaled).unwrap();
+    let eager = apply2(&base_out, &lora_out, ScaledCastAdd::new(f64::from(scale))).unwrap();
 
     let fused_v: Vec<f16> = fused
         .flatten_all()
@@ -7145,6 +7203,34 @@ fn lora_linear_bias_f16_fused_matches_eager_composition_bit_exact_on_cuda() {
         fused_v, eager_v,
         "f16 bias: the fused site must be bit-identical to the eager composition on the SAME \
          device"
+    );
+
+    // RED CONTROL: mirrors the bf16 test's own — an eager reference with
+    // the bias OMITTED must NOT be bit-equal to the (bias-carrying) fused
+    // output, guarded against vacuity by requiring a non-zero bias
+    // fixture element.
+    assert!(
+        bias_v.iter().any(|&v| v != 0.0),
+        "red-control guard: bias fixture must carry a non-zero element"
+    );
+    let base_out_no_bias = x.matmul(&w.t().unwrap()).unwrap();
+    let eager_no_bias = apply2(
+        &base_out_no_bias,
+        &lora_out,
+        ScaledCastAdd::new(f64::from(scale)),
+    )
+    .unwrap();
+    let eager_no_bias_v: Vec<f16> = eager_no_bias
+        .flatten_all()
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_ne!(
+        fused_v, eager_no_bias_v,
+        "red control: an eager reference with the bias OMITTED must NOT be bit-equal to the \
+         (bias-carrying) fused output — otherwise the positive assertion above is vacuous"
     );
 }
 

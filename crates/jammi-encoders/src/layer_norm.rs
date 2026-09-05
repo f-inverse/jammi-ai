@@ -272,24 +272,38 @@ impl LayerNorm {
     /// EVERY OTHER call site — every `LayerNorm::new` whose prefix does
     /// NOT end in a literal `LayerNorm` segment: DistilBERT's
     /// `sa_layer_norm`/`output_layer_norm`, ModernBERT's
-    /// `emb_norm`/`mlp_norm`/`final_norm`/`attn_norm`, CLIP's
-    /// `ln_1`/`ln_2`/`ln_final`, open_clip's `ln_pre`/`ln_post`, HTSAT's
-    /// `norm`/`layernorm_before`/`layernorm_after` — is BYTE-FOR-BYTE
-    /// today's pre-existing code path: no `gamma`/`beta` probe, no
-    /// `contains_tensor` call at all, only ever `weight`/`bias`. This is
-    /// a CHECKED invariant, not an assumption: every production
-    /// `LayerNorm::new` call site passes a distinct `.pp(<name>)`
-    /// sub-prefix (17 sites across 6 encoder families); the only
-    /// bare-`vb` call sites are `VarMap`-backed test fixtures
-    /// (`modernbert.rs:4216`, `9421-9423`), which never reach the
-    /// `LayerNorm`-keyed branch either (their prefix is the `VarMap`'s
-    /// own root, not `...LayerNorm`) and additionally could not use the
-    /// alias safely if they did: `VarBuilder::zeros()`'s backend reports
-    /// `contains_tensor` as unconditionally `true` for every name
-    /// (`var_builder.rs:283-285`), which this constructor would read as
-    /// a `weight`+`gamma` (or `bias`+`beta`) collision — a further
-    /// reason no in-tree site ever constructs a `LayerNorm` from a
-    /// `Zeros`-backed builder.
+    /// `attn_norm`/`mlp_norm`/`model.embeddings.norm`/`model.final_norm`,
+    /// CLIP's `ln_1`/`ln_2`/`ln_final`, open_clip's `ln_1`/`ln_2`/`ln_pre`/
+    /// `ln_post`, HTSAT's `norm`/`layernorm_before`/`layernorm_after` — is
+    /// BYTE-FOR-BYTE today's pre-existing code path: no `gamma`/`beta`
+    /// probe, no `contains_tensor` call at all, only ever `weight`/`bias`.
+    ///
+    /// This is a CHECKED invariant (test:
+    /// `tests::layer_norm_new_call_sites_are_pinned_to_the_known_set`), not
+    /// an assumption written by hand into this comment and left to drift:
+    /// that test scans this crate's own `src/**/*.rs` for every literal
+    /// `LayerNorm::new(` occurrence and pins the exact set. As of this
+    /// writing there are 26 occurrences total — 22 production call sites
+    /// (`bert.rs` 3, `distilbert.rs` 3, `modernbert.rs` 4, `clip_text.rs` 3,
+    /// `open_clip_vision.rs` 4, `htsat_audio.rs` 5) plus 4 inside
+    /// `#[cfg(test)]` modules — of which exactly 4 PRODUCTION sites are
+    /// `LayerNorm`-keyed: `bert.rs`'s `.pp("LayerNorm")`,
+    /// `.pp("attention.output.LayerNorm")`, `.pp("output.LayerNorm")`, and
+    /// `distilbert.rs`'s `.pp("LayerNorm")`. The ONLY bare-`vb` call site
+    /// (no `.pp(..)` at all) anywhere in the crate is
+    /// `modernbert.rs:4216`, a `#[cfg(test)]`-gated `VarMap`-backed fixture
+    /// (`final_norm_of_an_all_zero_row_is_exactly_zero`); `modernbert.rs`'s
+    /// OTHER three test-mod sites (`9421`–`9423`) are `.pp("emb_norm")`/
+    /// `.pp("final_norm")`/`.pp("mlp_norm")`, not bare — none of the four
+    /// are `LayerNorm`-keyed, and none reach the alias branch. No
+    /// `VarBuilder::zeros()` construction exists anywhere in this
+    /// workspace today — the `VarMap`-backed test fixtures above are the
+    /// only non-frozen builders in the crate, and they are safe from a
+    /// `weight`+`gamma` collision for the mundane reason their prefixes are
+    /// never `LayerNorm`-keyed in the first place, not because of any
+    /// `Zeros`-backend `contains_tensor` behavior (a previous version of
+    /// this doc cited that as the reason; it does not apply to any
+    /// in-tree builder).
     ///
     /// A `<parent>.gamma` tensor sitting one level ABOVE a
     /// `<parent>.LayerNorm` prefix is never aliased into it (candle
@@ -1986,175 +2000,593 @@ mod tests {
 
     // -- esc-086: legacy `LayerNorm.gamma`/`.beta` name resolution --------
 
-    /// [`is_layer_norm_keyed`]'s positive/negative boundary, pinned
-    /// directly against a table of prefixes rather than only indirectly
-    /// through a full `LayerNorm::new` call: every production prefix that
-    /// SHOULD alias, every family that must NOT, and the two literal
-    /// boundary shapes `esc-086` names (`LayerNormX`, and no `.` at all).
+    // -- B2 (`#423` narrow-fix round 2): a hermetic, source-scanning proof
+    // of this file's own call-site-inventory claim (see `LayerNorm::new`'s
+    // doc, "EVERY OTHER call site" paragraph) rather than a hand-copied
+    // comment that can silently drift. --------------------------------
+
+    /// One statically-recognised shape for the LAST (`VarBuilder`) argument
+    /// of a `LayerNorm::new(..)` call, as extracted by
+    /// [`scan_layer_norm_new_call_sites`]. Any OTHER shape (a
+    /// `.pp(format!(..))` runtime-formatted prefix, a multi-step method
+    /// chain, etc.) makes the scan panic rather than silently skip the call
+    /// site -- see that function's own doc.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum VbArgShape {
+        /// `<ident>.pp("<literal>")` -- the literal segment appended to
+        /// whatever prefix `<ident>` already carries. A `.pp()` call only
+        /// ever APPENDS a segment (never splits or reinterprets its
+        /// argument), so the full joined prefix's last `.`-segment is
+        /// always this literal's OWN last `.`-segment, independent of
+        /// whatever prefix `<ident>` already had -- which is what makes
+        /// checking [`is_layer_norm_keyed`] directly on the bare literal
+        /// (rather than reconstructing the full joined path) sound.
+        PpLiteral(String),
+        /// A bare `VarBuilder` identifier, no `.pp(..)` at all -- the
+        /// builder's own existing prefix is consulted unchanged.
+        Bare,
+    }
+
+    /// One `LayerNorm::new(..)` occurrence found by
+    /// [`scan_layer_norm_new_call_sites`].
+    #[derive(Debug, Clone)]
+    struct LayerNormNewCallSite {
+        /// Path relative to `src/`, e.g. `"bert.rs"`.
+        file: String,
+        /// 1-indexed line of the `LayerNorm::new(` token itself (NOT the
+        /// `.pp(..)` argument, which may be several lines later) --
+        /// informational only; every hard assertion in
+        /// [`layer_norm_new_call_sites_are_pinned_to_the_known_set`] is
+        /// keyed on `(file, shape)` content, not on this line number, so a
+        /// reformat that shifts line numbers without changing any call
+        /// site's shape does not fail the pin (the audit's own directive:
+        /// "close the class... not the named lines").
+        line: usize,
+        shape: VbArgShape,
+        /// Whether this occurrence sits at or after this file's own
+        /// `#[cfg(test)] mod tests {` boundary (see
+        /// [`find_mod_tests_boundary_line`]).
+        is_test: bool,
+    }
+
+    /// Recursively collects every `*.rs` path under `dir`, in a fixed,
+    /// deterministic (sorted) order (family J) -- so
+    /// [`scan_layer_norm_new_call_sites`]'s output order does not depend on
+    /// the host filesystem's directory-listing order.
+    fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries =
+            std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
+        for entry in entries {
+            let entry = entry.unwrap_or_else(|e| panic!("dir entry in {}: {e}", dir.display()));
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// The 1-indexed line number of a file's own `mod tests {` boundary,
+    /// gated on the line immediately above it (ignoring blank lines) being
+    /// literally `#[cfg(test)]` -- the exact shape every test module in
+    /// this crate uses. `None` when the file has no such module at all
+    /// (`bert.rs`/`distilbert.rs` today) -- every occurrence in such a file
+    /// is then treated as production.
+    fn find_mod_tests_boundary_line(content: &str) -> Option<usize> {
+        let lines: Vec<&str> = content.lines().collect();
+        let mut prev_non_blank: Option<&str> = None;
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed == "mod tests {" && prev_non_blank == Some("#[cfg(test)]") {
+                return Some(i + 1);
+            }
+            if !trimmed.is_empty() {
+                prev_non_blank = Some(trimmed);
+            }
+        }
+        None
+    }
+
+    /// Balanced-paren extraction (string-literal-aware, so a `"` inside a
+    /// tracked string can never desynchronise the depth count) of the
+    /// argument-list text between the `(` at `open_paren_idx` and its
+    /// matching `)`, EXCLUSIVE of both parens. `open_paren_idx` must point
+    /// at the `(` byte itself. Byte-indexed rather than char-indexed: every
+    /// tracked byte (`"`, `\`, `(`, `)`) is ASCII, and ASCII bytes can never
+    /// be mistaken for a continuation/lead byte of a multi-byte UTF-8
+    /// sequence (those are always `>= 0x80`), so scanning by byte value
+    /// alone is safe even though the surrounding source text is not
+    /// ASCII-only (e.g. an em dash in a doc comment) -- and both `start`
+    /// and every returned slice boundary sit immediately after an ASCII
+    /// byte, which is always a valid `str` char boundary.
+    fn extract_balanced_args(content: &str, open_paren_idx: usize) -> String {
+        let bytes = content.as_bytes();
+        assert_eq!(
+            bytes[open_paren_idx], b'(',
+            "expected '(' at byte {open_paren_idx}"
+        );
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let mut escape = false;
+        let start = open_paren_idx + 1;
+        let mut i = open_paren_idx;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_string {
+                if escape {
+                    escape = false;
+                } else if b == b'\\' {
+                    escape = true;
+                } else if b == b'"' {
+                    in_string = false;
+                }
+            } else {
+                match b {
+                    b'"' => in_string = true,
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return content[start..i].to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        panic!("unbalanced parens scanning LayerNorm::new( starting at byte {open_paren_idx}");
+    }
+
+    /// Splits `args_text` on top-level (paren-depth-0, outside any string
+    /// literal) commas -- the same string/paren-aware scan
+    /// [`extract_balanced_args`] uses, so a `format!("{n}")`-style nested
+    /// call's own internal commas (none exist in this crate's
+    /// `LayerNorm::new` call sites today, but a future one might) never
+    /// get mistaken for an argument separator.
+    fn split_top_level_commas(args_text: &str) -> Vec<String> {
+        let bytes = args_text.as_bytes();
+        let mut parts = Vec::new();
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let mut escape = false;
+        let mut start = 0usize;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_string {
+                if escape {
+                    escape = false;
+                } else if b == b'\\' {
+                    escape = true;
+                } else if b == b'"' {
+                    in_string = false;
+                }
+            } else {
+                match b {
+                    b'"' => in_string = true,
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    b',' if depth == 0 => {
+                        parts.push(args_text[start..i].to_string());
+                        start = i + 1;
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        parts.push(args_text[start..].to_string());
+        parts
+    }
+
+    /// Parses `<ident>.pp("<literal>")` exactly (no other punctuation
+    /// permitted before/after), returning the literal. `None` for anything
+    /// else, including a superficially similar `.pp("...")foo` or a
+    /// non-identifier receiver.
+    fn parse_pp_literal(text: &str) -> Option<String> {
+        let idx = text.find(".pp(\"")?;
+        let recv = &text[..idx];
+        let mut recv_chars = recv.chars();
+        match recv_chars.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+            _ => return None,
+        }
+        if !recv_chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        let after = &text[idx + 5..];
+        let end_quote = after.find('"')?;
+        let literal = &after[..end_quote];
+        if after[end_quote + 1..].trim() != ")" {
+            return None;
+        }
+        Some(literal.to_string())
+    }
+
+    /// True for a bare identifier (`vb`, `frozen_vb`, ...) with no
+    /// trailing `.pp(..)` (or any other punctuation) at all.
+    fn is_bare_ident(text: &str) -> bool {
+        let mut chars = text.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+            _ => return false,
+        }
+        chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+
+    /// Scans this crate's own `src/**/*.rs` files (via
+    /// `env!("CARGO_MANIFEST_DIR")`) for every literal `LayerNorm::new(`
+    /// occurrence and classifies the LAST (`VarBuilder`) argument passed at
+    /// each one. Comment-only mentions are skipped (the occurrence's own
+    /// source line, trimmed, must not start with `//`) -- none exist in
+    /// this crate today, but a future doc comment quoting the call
+    /// literally must not be double-counted as a real call site.
+    ///
+    /// Three argument shapes are recognised, explicitly:
+    ///  * `<ident>.pp("<literal>")` — [`VbArgShape::PpLiteral`].
+    ///  * a bare `VarBuilder` identifier — [`VbArgShape::Bare`].
+    ///  * `<ident>.pp(format!(..))` — NOT resolvable to a static literal;
+    ///    this scan panics rather than silently treating it as non-keyed
+    ///    (no in-tree call site takes this shape today).
+    ///
+    /// Any OTHER shape also panics, naming the file/line and raw text —
+    /// silently skipping an unrecognised call site would let a future
+    /// keyed-or-not site go unchecked by the pinned invariant this scan
+    /// backs.
+    fn scan_layer_norm_new_call_sites() -> Vec<LayerNormNewCallSite> {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        collect_rs_files(&src_dir, &mut files);
+        files.sort();
+
+        let mut sites = Vec::new();
+        let pattern = "LayerNorm::new(";
+        for path in &files {
+            // This file (`layer_norm.rs` itself, the definition site) is
+            // excluded: it can never contain a real call site, and its own
+            // source text necessarily spells out the search pattern above
+            // plus every diagnostic message this scan prints -- both of
+            // which are literal `LayerNorm::new(`-shaped substrings that
+            // would otherwise self-match (the pattern string itself, and
+            // every panic!/println! message quoting it, would each look
+            // like a malformed call site to this same scan).
+            if path.file_name().and_then(|n| n.to_str()) == Some("layer_norm.rs") {
+                continue;
+            }
+            let content = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let rel_name = path
+                .strip_prefix(&src_dir)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .into_owned();
+            let test_boundary_line = find_mod_tests_boundary_line(&content);
+
+            let mut search_from = 0usize;
+            while let Some(rel_idx) = content[search_from..].find(pattern) {
+                let idx = search_from + rel_idx;
+                search_from = idx + pattern.len();
+
+                let line_start = content[..idx].rfind('\n').map(|p| p + 1).unwrap_or(0);
+                if content[line_start..idx].trim_start().starts_with("//") {
+                    continue;
+                }
+
+                let line = 1 + content[..idx].matches('\n').count();
+                let open_paren_idx = idx + "LayerNorm::new".len();
+                let args_text = extract_balanced_args(&content, open_paren_idx);
+                let last_arg = split_top_level_commas(&args_text)
+                    .into_iter()
+                    .map(|s| s.trim().to_string())
+                    .rfind(|s| !s.is_empty())
+                    .unwrap_or_else(|| {
+                        panic!("{rel_name}:{line}: LayerNorm::new(..) has no arguments at all")
+                    });
+
+                let shape = if let Some(literal) = parse_pp_literal(&last_arg) {
+                    VbArgShape::PpLiteral(literal)
+                } else if is_bare_ident(&last_arg) {
+                    VbArgShape::Bare
+                } else if last_arg.contains(".pp(format!(") {
+                    panic!(
+                        "{rel_name}:{line}: found a `.pp(format!(...))` LayerNorm::new(..) \
+                         VarBuilder argument (`{last_arg}`) -- this scan cannot statically \
+                         resolve a runtime-formatted prefix's literal segment; manually verify \
+                         whether this site is LayerNorm-keyed and extend this scan (rather than \
+                         silently skipping it) before trusting the pinned invariant"
+                    );
+                } else {
+                    panic!(
+                        "{rel_name}:{line}: unrecognised LayerNorm::new(..) VarBuilder-argument \
+                         shape: `{last_arg}` -- this scan only recognises \
+                         `<ident>.pp(\"<literal>\")` and a bare VarBuilder identifier; update \
+                         this scan (and its pinned expectations) rather than silently skipping \
+                         this call site"
+                    );
+                };
+
+                let is_test = test_boundary_line.is_some_and(|b| line >= b);
+                sites.push(LayerNormNewCallSite {
+                    file: rel_name.clone(),
+                    line,
+                    shape,
+                    is_test,
+                });
+            }
+        }
+        sites
+    }
+
+    /// [`is_layer_norm_keyed`]'s positive/negative boundary, pinned against
+    /// REAL per-site literals harvested by [`scan_layer_norm_new_call_sites`]
+    /// (not a hand-typed table that can silently drift -- a previous
+    /// version of this test carried a PHANTOM `"emb_norm"` case that no
+    /// in-tree call site ever actually writes; the real ModernBERT
+    /// embeddings-norm prefix is `"model.embeddings.norm"`,
+    /// `modernbert.rs:3358`), plus the two SYNTHETIC boundary strings
+    /// `esc-086` names (`LayerNormX`, and a substring-but-not-suffix
+    /// `gamma_scale`) that no in-tree site writes and therefore cannot be
+    /// harvested.
     #[test]
     fn is_layer_norm_keyed_matches_only_a_trailing_layer_norm_segment() {
-        let cases: &[(&str, bool)] = &[
-            ("embeddings.LayerNorm", true),
-            ("encoder.layer.0.attention.output.LayerNorm", true),
-            ("encoder.layer.0.output.LayerNorm", true),
-            ("LayerNorm", true), // root-level, no `.` at all.
+        let sites = scan_layer_norm_new_call_sites();
+        let mut harvested_literals: Vec<String> = sites
+            .iter()
+            .filter_map(|s| match &s.shape {
+                VbArgShape::PpLiteral(lit) => Some(lit.clone()),
+                VbArgShape::Bare => None,
+            })
+            .collect();
+        harvested_literals.sort();
+        harvested_literals.dedup();
+        assert!(
+            !harvested_literals.is_empty(),
+            "the scan harvested zero literals -- it is almost certainly broken, not that this \
+             crate suddenly has no LayerNorm::new(..) call sites"
+        );
+
+        // Ground truth: exactly these DISTINCT literal shapes are
+        // `LayerNorm`-keyed among everything this crate's source actually
+        // writes today (see `layer_norm_new_call_sites_are_pinned_to_the_known_set`
+        // for the full file-scoped pin).
+        let known_keyed: &[&str] = &[
+            "LayerNorm",
+            "attention.output.LayerNorm",
+            "output.LayerNorm",
+        ];
+
+        for literal in &harvested_literals {
+            let expected = known_keyed.contains(&literal.as_str());
+            assert_eq!(
+                is_layer_norm_keyed(literal),
+                expected,
+                "harvested real literal `{literal}` expected is_layer_norm_keyed == {expected}"
+            );
+        }
+
+        let synthetic_cases: &[(&str, bool)] = &[
             ("embeddings.LayerNormX", false),
             ("embeddings.gamma_scale", false),
-            ("sa_layer_norm", false),
-            ("layernorm_before", false),
-            ("layernorm_after", false),
-            ("emb_norm", false),
-            ("mlp_norm", false),
-            ("final_norm", false),
-            ("ln_1", false),
-            ("ln_2", false),
-            ("ln_final", false),
-            ("ln_pre", false),
-            ("ln_post", false),
-            ("norm", false),
         ];
-        for (prefix, expected) in cases {
+        for (prefix, expected) in synthetic_cases {
             assert_eq!(
                 is_layer_norm_keyed(prefix),
                 *expected,
-                "prefix `{prefix}` expected is_layer_norm_keyed == {expected}"
+                "synthetic boundary prefix `{prefix}` expected is_layer_norm_keyed == {expected}"
             );
         }
     }
 
-    /// The full [`resolve_affine_names`] lattice, table-tested: both
-    /// biased and bias-free axes, every presence combination, both
-    /// collision arms (weight axis reported first on a double collision),
-    /// and `with_bias == false` never returning a bias name regardless of
-    /// what `has_b`/`has_beta` the (hypothetical, never-probed) caller
-    /// would have passed.
+    /// B2 (`#423` narrow-fix round 2): CHECKS, not merely documents, this
+    /// module's own call-site-inventory claim (see `LayerNorm::new`'s doc).
+    /// A previous version of that doc claimed "17 sites ... the only
+    /// bare-`vb` call sites are `modernbert.rs:4216`, `9421-9423`" — every
+    /// part of that was wrong: there are 26 occurrences, not 17;
+    /// `9421`-`9423` are `.pp(..)`-scoped, not bare; and the single
+    /// bare-`vb` site is `4216` alone. This test makes a future silent
+    /// drift (a new `.pp("LayerNorm")` site, a newly-bare production call,
+    /// a changed total count) fail loudly instead of re-drifting the doc.
+    #[test]
+    fn layer_norm_new_call_sites_are_pinned_to_the_known_set() {
+        let sites = scan_layer_norm_new_call_sites();
+        for s in &sites {
+            println!(
+                "LayerNorm::new(..) site: {}:{} is_test={} shape={:?}",
+                s.file, s.line, s.is_test, s.shape
+            );
+        }
+
+        assert_eq!(
+            sites.len(),
+            26,
+            "total LayerNorm::new(..) occurrence count drifted from the pinned 26 -- a call \
+             site was added or removed; update this pin only after reviewing whether the \
+             new/removed site is LayerNorm-keyed"
+        );
+
+        let production: Vec<&LayerNormNewCallSite> = sites.iter().filter(|s| !s.is_test).collect();
+        let test_only: Vec<&LayerNormNewCallSite> = sites.iter().filter(|s| s.is_test).collect();
+        assert_eq!(
+            production.len(),
+            22,
+            "production call-site count drifted from the pinned 22"
+        );
+        assert_eq!(
+            test_only.len(),
+            4,
+            "#[cfg(test)]-mod call-site count drifted from the pinned 4"
+        );
+
+        // The LayerNorm-keyed SET, checked via the REAL `is_layer_norm_keyed`
+        // predicate (not a re-implementation) -- a future `.pp("LayerNorm")`
+        // (or any other literal whose last `.`-segment is `LayerNorm`) site
+        // fails this pin until reviewed.
+        let mut keyed_files_and_literals: Vec<(String, String)> = production
+            .iter()
+            .filter_map(|s| match &s.shape {
+                VbArgShape::PpLiteral(lit) if is_layer_norm_keyed(lit) => {
+                    Some((s.file.clone(), lit.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        keyed_files_and_literals.sort();
+
+        let mut expected_keyed: Vec<(String, String)> = vec![
+            ("bert.rs".to_string(), "LayerNorm".to_string()),
+            (
+                "bert.rs".to_string(),
+                "attention.output.LayerNorm".to_string(),
+            ),
+            ("bert.rs".to_string(), "output.LayerNorm".to_string()),
+            ("distilbert.rs".to_string(), "LayerNorm".to_string()),
+        ];
+        expected_keyed.sort();
+        assert_eq!(
+            keyed_files_and_literals, expected_keyed,
+            "the LayerNorm-keyed call-site SET drifted from the pinned 4 (bert.rs's \
+             `LayerNorm`/`attention.output.LayerNorm`/`output.LayerNorm`, distilbert.rs's \
+             `LayerNorm`) -- review whether a newly-added or newly-renamed site should \
+             legitimately alias legacy gamma/beta before updating this pin"
+        );
+
+        // No PRODUCTION site may be a bare-`vb` call (no `.pp(..)` at all)
+        // -- only a `#[cfg(test)]`-gated fixture does that today, and it is
+        // deliberately NOT LayerNorm-keyed (a fresh `VarBuilder::from_varmap`'s
+        // own root prefix is empty).
+        let production_bare: Vec<&&LayerNormNewCallSite> = production
+            .iter()
+            .filter(|s| s.shape == VbArgShape::Bare)
+            .collect();
+        assert!(
+            production_bare.is_empty(),
+            "a PRODUCTION LayerNorm::new(..) call site now uses a bare VarBuilder with no \
+             `.pp(..)` at all: {production_bare:?} -- review this site by hand before trusting \
+             the pin above (this scan's is_layer_norm_keyed reasoning assumes every production \
+             site scopes its own segment via `.pp(\"<literal>\")`)"
+        );
+
+        let test_bare_files: Vec<&str> = test_only
+            .iter()
+            .filter(|s| s.shape == VbArgShape::Bare)
+            .map(|s| s.file.as_str())
+            .collect();
+        assert_eq!(
+            test_bare_files,
+            vec!["modernbert.rs"],
+            "the single bare-vb call site drifted from the pinned single modernbert.rs test \
+             fixture"
+        );
+    }
+
+    /// Independent, separately-authored reference for
+    /// [`resolve_affine_names`]'s full name-resolution lattice (family F: a
+    /// second derivation, not the same code re-run): collision on either
+    /// read axis reports that axis as `None` (Err), weight axis checked
+    /// first so a double collision always reports weight; otherwise each
+    /// axis independently prefers its legacy name only when present
+    /// without its modern counterpart, and `with_bias == false` never
+    /// returns a bias name.
+    fn resolve_affine_names_reference(
+        has_w: bool,
+        has_g: bool,
+        has_b: bool,
+        has_beta: bool,
+        with_bias: bool,
+    ) -> Option<(&'static str, Option<&'static str>)> {
+        if has_w && has_g {
+            return None;
+        }
+        let name_w = if has_g { "gamma" } else { "weight" };
+        if !with_bias {
+            return Some((name_w, None));
+        }
+        if has_b && has_beta {
+            return None;
+        }
+        let name_b = if has_beta { "beta" } else { "bias" };
+        Some((name_w, Some(name_b)))
+    }
+
+    /// The full [`resolve_affine_names`] lattice (B3, `#423` narrow-fix
+    /// round 2): ALL 16 `(has_w, has_g, has_b, has_beta)` cells for
+    /// `with_bias == true`, and all 4 `(has_w, has_g)` cells for
+    /// `with_bias == false` -- generated by looping over the bool lattice
+    /// rather than hand-picking 7 of the 16 cells (a previous version of
+    /// this test covered only 7), with the expected outcome computed by
+    /// [`resolve_affine_names_reference`], a SEPARATE tiny reimplementation
+    /// (not the same code re-run).
     #[test]
     fn resolve_affine_names_lattice() {
-        // (has_w, has_g, has_b, has_beta, with_bias) -> expected Ok((name_w, name_b)) or Err.
-        struct Case {
-            has_w: bool,
-            has_g: bool,
-            has_b: bool,
-            has_beta: bool,
-            with_bias: bool,
-            expect: Option<(&'static str, Option<&'static str>)>,
-        }
-        let cases = [
-            // Modern-only, biased: today's shape, unchanged.
-            Case {
-                has_w: true,
-                has_g: false,
-                has_b: true,
-                has_beta: false,
-                with_bias: true,
-                expect: Some(("weight", Some("bias"))),
-            },
-            // Legacy-only, biased: the esc-086 alias arm.
-            Case {
-                has_w: false,
-                has_g: true,
-                has_b: false,
-                has_beta: true,
-                with_bias: true,
-                expect: Some(("gamma", Some("beta"))),
-            },
-            // Neither present, biased: falls through to the modern names
-            // (today's `get_with_hints` call still fires and errors --
-            // this function itself only picks the NAME, it does not know
-            // whether the tensor actually exists beyond the two booleans).
-            Case {
-                has_w: false,
-                has_g: false,
-                has_b: false,
-                has_beta: false,
-                with_bias: true,
-                expect: Some(("weight", Some("bias"))),
-            },
-            // Weight-axis collision: both `weight` and `gamma` present.
-            Case {
-                has_w: true,
-                has_g: true,
-                has_b: false,
-                has_beta: false,
-                with_bias: true,
-                expect: None,
-            },
-            // Bias-axis collision only: both `bias` and `beta` present,
-            // weight axis clean.
-            Case {
-                has_w: true,
-                has_g: false,
-                has_b: true,
-                has_beta: true,
-                with_bias: true,
-                expect: None,
-            },
-            // Double collision: both axes carry both names -- must report
-            // the WEIGHT axis (this test can't directly observe "which
-            // axis" from `Err(EncoderError::Config(String))` alone, so the
-            // message-content assertion below checks it names `weight`
-            // terms, not `bias`/`beta` terms).
-            Case {
-                has_w: true,
-                has_g: true,
-                has_b: true,
-                has_beta: true,
-                with_bias: true,
-                expect: None,
-            },
-            // Legacy-then-missing (esc-086 arm 5): gamma present, neither
-            // bias nor beta present at all.
-            Case {
-                has_w: false,
-                has_g: true,
-                has_b: false,
-                has_beta: false,
-                with_bias: true,
-                expect: Some(("gamma", Some("bias"))),
-            },
-            // Bias-free: `with_bias == false` never returns a bias name,
-            // even when the (never-real) inputs claim both bias names are
-            // present -- a caller that honors the "never consult beta"
-            // rule always passes `has_b = has_beta = false` here, but this
-            // pins the function's OWN behavior independent of that.
-            Case {
-                has_w: true,
-                has_g: false,
-                has_b: true,
-                has_beta: true,
-                with_bias: false,
-                expect: Some(("weight", None)),
-            },
-            Case {
-                has_w: false,
-                has_g: true,
-                has_b: false,
-                has_beta: false,
-                with_bias: false,
-                expect: Some(("gamma", None)),
-            },
-        ];
-
-        for (i, c) in cases.iter().enumerate() {
-            let result = resolve_affine_names(
-                "test.prefix",
-                c.has_w,
-                c.has_g,
-                c.has_b,
-                c.has_beta,
-                c.with_bias,
-            );
-            match c.expect {
-                Some(expected) => {
-                    let (name_w, name_b) =
-                        result.unwrap_or_else(|e| panic!("case {i}: expected Ok, got Err({e:?})"));
-                    assert_eq!((name_w, name_b), expected, "case {i}");
-                }
-                None => {
-                    result.expect_err(&format!("case {i}: expected Err (collision)"));
+        const BOOLS: [bool; 2] = [false, true];
+        let mut cases_checked = 0usize;
+        for has_w in BOOLS {
+            for has_g in BOOLS {
+                for with_bias in BOOLS {
+                    let bias_axis: &[(bool, bool)] = if with_bias {
+                        &[(false, false), (false, true), (true, false), (true, true)]
+                    } else {
+                        &[(false, false)]
+                    };
+                    for &(has_b, has_beta) in bias_axis {
+                        cases_checked += 1;
+                        let expected = resolve_affine_names_reference(
+                            has_w, has_g, has_b, has_beta, with_bias,
+                        );
+                        let result = resolve_affine_names(
+                            "test.prefix",
+                            has_w,
+                            has_g,
+                            has_b,
+                            has_beta,
+                            with_bias,
+                        );
+                        let case_desc = format!(
+                            "has_w={has_w} has_g={has_g} has_b={has_b} has_beta={has_beta} \
+                             with_bias={with_bias}"
+                        );
+                        match expected {
+                            Some(exp) => {
+                                let got = result.unwrap_or_else(|e| {
+                                    panic!("{case_desc}: expected Ok, got Err({e:?})")
+                                });
+                                assert_eq!(got, exp, "{case_desc}");
+                            }
+                            None => {
+                                result
+                                    .expect_err(&format!("{case_desc}: expected Err (collision)"));
+                            }
+                        }
+                    }
                 }
             }
         }
+        // 2*2*4 (with_bias=true) + 2*2*1 (with_bias=false) = 16 + 4 = 20.
+        assert_eq!(
+            cases_checked, 20,
+            "the lattice loop's own case count drifted from the pinned 16 + 4 = 20"
+        );
+    }
+
+    /// Preserves a specific edge check the lattice loop above does NOT
+    /// cover (it fixes `has_b = has_beta = false` for every `with_bias ==
+    /// false` cell, matching how every real caller invokes this function):
+    /// `with_bias == false` must ignore `has_b`/`has_beta` even when a
+    /// (never-real) caller passes them as `true` -- pinning the function's
+    /// OWN robustness, independent of every real call site already
+    /// honoring the "never consult beta when bias-free" rule.
+    #[test]
+    fn resolve_affine_names_with_bias_false_ignores_bogus_bias_presence() {
+        assert_eq!(
+            resolve_affine_names("test.prefix", true, false, true, true, false).unwrap(),
+            ("weight", None)
+        );
+        assert_eq!(
+            resolve_affine_names("test.prefix", false, true, true, true, false).unwrap(),
+            ("gamma", None)
+        );
     }
 
     /// The double-collision determinism arm, isolated: when BOTH axes
@@ -2176,5 +2608,86 @@ mod tests {
             msg.contains("embeddings.LayerNorm"),
             "message must name the prefix: {msg}"
         );
+    }
+
+    /// B1b (`#423` narrow-fix round 2): arm6b's replacement, a DIRECT seam
+    /// test (no in-tree model ever builds a `VarBuilder` at a synthetic
+    /// `embeddings.LayerNormX`-style prefix, so this exercises a REAL
+    /// production non-keyed prefix instead). A temp safetensors file
+    /// carries ONLY `sa_layer_norm.gamma`/`.beta` (DistilBERT's own actual
+    /// prefix, `distilbert.rs`'s `layer_vb.pp("sa_layer_norm")`) plus the
+    /// SAME values under `LayerNorm.gamma`/`.beta`, in the SAME file.
+    /// `sa_layer_norm` merely CONTAINS the substring "layer_norm" (matching
+    /// "LayerNorm" case-insensitively) but its last `.`-segment is not
+    /// literally `LayerNorm` -- a `starts_with`/`contains`/case-insensitive
+    /// mutant of [`is_layer_norm_keyed`] would alias it (and find `gamma`/
+    /// `beta` genuinely present, so it would succeed); the real, exact
+    /// suffix check must refuse it, even though the SAME file's genuinely
+    /// `LayerNorm`-keyed prefix (proving the fixture's tensors ARE readable
+    /// at all, not merely that `sa_layer_norm` is malformed) does alias.
+    #[test]
+    fn direct_seam_non_layer_norm_keyed_prefix_containing_layer_norm_substring_is_not_aliased() {
+        let device = Device::Cpu;
+        let hidden = 4usize;
+        let eps = 1e-5f64;
+        let gamma_vals = [0.7f32, 1.3, -0.2, 2.1];
+        let beta_vals = [0.05f32, -0.3, 0.9, -1.1];
+        let gamma = Tensor::from_slice(&gamma_vals, (hidden,), &device).unwrap();
+        let beta = Tensor::from_slice(&beta_vals, (hidden,), &device).unwrap();
+
+        let mut tensors: std::collections::HashMap<String, Tensor> =
+            std::collections::HashMap::new();
+        tensors.insert("sa_layer_norm.gamma".to_string(), gamma.clone());
+        tensors.insert("sa_layer_norm.beta".to_string(), beta.clone());
+        tensors.insert("LayerNorm.gamma".to_string(), gamma.clone());
+        tensors.insert("LayerNorm.beta".to_string(), beta.clone());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sa_layer_norm_direct_seam.safetensors");
+        candle_core::safetensors::save(&tensors, &path).unwrap();
+
+        let vb =
+            unsafe { VarBuilder::from_mmaped_safetensors(&[&path], DType::F32, &device).unwrap() };
+
+        // `sa_layer_norm` must NOT be aliased: no `weight` there, and the
+        // non-keyed branch never even probes `gamma`.
+        let err = LayerNorm::new(hidden, eps, true, vb.pp("sa_layer_norm"))
+            .err()
+            .expect(
+                "a non-LayerNorm-keyed prefix carrying only gamma/beta must be Err, not aliased",
+            );
+        assert!(
+            matches!(err, EncoderError::Tensor(_)),
+            "expected the non-keyed branch's plain `?`-propagated candle CannotFindTensor \
+             error (EncoderError::Tensor), got {err:?}"
+        );
+
+        // The SAME values, at a genuinely LayerNorm-keyed prefix in the
+        // SAME file, DO alias -- and match bitwise.
+        let ln = LayerNorm::new(hidden, eps, true, vb.pp("LayerNorm"))
+            .expect("a genuinely LayerNorm-keyed prefix must alias gamma/beta");
+        let got_weight: Vec<f32> = ln.weight.flatten_all().unwrap().to_vec1().unwrap();
+        let got_bias: Vec<f32> = ln
+            .bias
+            .as_ref()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        for (i, (g, w)) in gamma_vals.iter().zip(got_weight.iter()).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "weight[{i}] must equal legacy gamma bitwise"
+            );
+        }
+        for (i, (b, w)) in beta_vals.iter().zip(got_bias.iter()).enumerate() {
+            assert_eq!(
+                b.to_bits(),
+                w.to_bits(),
+                "bias[{i}] must equal legacy beta bitwise"
+            );
+        }
     }
 }

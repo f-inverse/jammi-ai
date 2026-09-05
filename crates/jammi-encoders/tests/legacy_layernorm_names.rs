@@ -380,10 +380,35 @@ fn arm5_legacy_weight_with_no_bias_or_beta_is_refused_and_names_both() {
     );
 }
 
-/// Arm 6a (boundary): a parent-level `embeddings.gamma` (no `LayerNorm`
-/// segment at all) plus NO `embeddings.LayerNorm.{weight,gamma}` must NOT
-/// be aliased -- `build` is `Err` (the modern name is still probed for and
-/// missing; the parent-level `gamma` is never reached).
+/// Arm 6a (boundary, non-vacuous -- `#423` narrow-fix round 2 / B1a): a
+/// parent-level `embeddings.gamma` (one segment ABOVE `embeddings.LayerNorm`,
+/// no `LayerNorm` segment in ITS OWN name at all) must NOT be aliased into
+/// `embeddings.LayerNorm`'s weight axis, even though `embeddings.LayerNorm`
+/// itself is genuinely `LayerNorm`-keyed and its `bias` axis is genuinely
+/// present and readable.
+///
+/// `embeddings.LayerNorm.bias` is deliberately KEPT here (only `.weight` is
+/// removed): the ORIGINAL version of this arm deleted BOTH axes, which made
+/// `build` return `Err` under EVERY implementation -- including a
+/// PARENT-PROBING one that (incorrectly) falls back to a tensor one level up
+/// when the exact prefix has neither `weight` nor `gamma` -- so it could
+/// never actually distinguish correct code from that bug. Keeping `bias`
+/// present means a parent-probing implementation would have succeeded
+/// (`build` returns `Ok`) here, and this arm now catches that.
+///
+/// Proved by hand once (not shipped, restored after observing the failure):
+/// temporarily made `LayerNorm::new`'s weight-axis load fall back to
+/// `vb.root().set_prefix(<prefix's parent>).get_with_hints(hidden_size,
+/// "gamma", ..)` whenever `gamma` is absent at the exact prefix but present
+/// one level up (`VarBuilder::root`/`set_prefix` make this directly
+/// expressible with no signature change, since a `VarBuilder` carries a
+/// `data: Arc<..>` shared across `root()`/`pp()`/`set_prefix()` calls --
+/// candle-nn-0.11.0's `var_builder.rs:129-146`). With that mutation in
+/// place, this test turned RED:
+/// `arm6a_parent_level_gamma_is_not_aliased: a parent-level \`embeddings.gamma\`
+/// must not be aliased into \`embeddings.LayerNorm\`: got Ok(Bert), expected Err`
+/// -- confirming the arm bites a parent-probing implementation, not just an
+/// always-Err one.
 #[test]
 fn arm6a_parent_level_gamma_is_not_aliased() {
     let config = fixture_config();
@@ -391,36 +416,181 @@ fn arm6a_parent_level_gamma_is_not_aliased() {
     let mut tensors = perturbed_fixture_tensors();
 
     let w = tensors.remove("embeddings.LayerNorm.weight").unwrap();
-    tensors.remove("embeddings.LayerNorm.bias");
+    assert!(
+        tensors.contains_key("embeddings.LayerNorm.bias"),
+        "the bias axis must stay present -- deleting it too would make this arm vacuous again \
+         (every implementation errors when BOTH axes are missing, correct or not)"
+    );
     // Re-home the removed weight one level UP, as a parent-level `gamma`.
     tensors.insert("embeddings.gamma".to_string(), w);
 
     let path = save_tensors(&tensors, tmp.path(), "parent_level_gamma.safetensors");
-    expect_build_err(
+    let err = expect_build_err(
         build_bert(&path, &config),
         "a parent-level `embeddings.gamma` must not be aliased into `embeddings.LayerNorm`",
     );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("embeddings.LayerNorm"),
+        "message must name the prefix: {msg}"
+    );
+    assert!(
+        msg.contains("weight") && msg.contains("gamma"),
+        "message must name the weight axis's own candidates -- \
+         `embeddings.LayerNorm.gamma` is genuinely absent (the only `gamma` tensor in this \
+         checkpoint sits one level UP, at `embeddings.gamma`, which a correct alias must never \
+         consult): {msg}"
+    );
 }
 
-/// Arm 6b (boundary): a modern-named checkpoint whose
-/// `embeddings.LayerNorm.weight` is instead named
-/// `embeddings.LayerNormX.weight` (a non-`LayerNorm` last segment that
-/// merely CONTAINS `LayerNorm` as a substring, plus carries `gamma`
-/// nowhere) must not be aliased -- `build` is `Err`.
+// Arm 6b (boundary) moved into `crate::layer_norm`'s own `#[cfg(test)]`
+// module as a DIRECT seam test (B1b): no in-tree model ever builds a
+// `VarBuilder` at a synthetic `embeddings.LayerNormX`-style prefix, so that
+// boundary is now exercised against a REAL non-`LayerNorm`-keyed production
+// prefix (DistilBERT's `sa_layer_norm`) instead -- see
+// `layer_norm::tests::direct_seam_non_layer_norm_keyed_prefix_containing_layer_norm_substring_is_not_aliased`.
+
+/// Arm 7 (MIXED, B3): each of the fixture's three `LayerNorm` sites uses a
+/// DIFFERENT per-site/per-axis naming -- `embeddings.LayerNorm` is FULLY
+/// legacy (`gamma`+`beta`), `encoder.layer.0.attention.output.LayerNorm` is
+/// left FULLY modern (untouched), and `encoder.layer.0.output.LayerNorm` is
+/// PER-AXIS mixed (`gamma` for the weight axis, the modern `bias` for the
+/// bias axis). `resolve_affine_names` resolves each axis of each site
+/// INDEPENDENTLY (see its own doc's presence lattice) -- this is the
+/// realistic shape a half-converted or partially-migrated checkpoint takes,
+/// not every site (or even every axis within one site) necessarily renamed
+/// together. Values are untouched by the rename, so a correct build's
+/// forward must be bitwise identical to the all-modern control.
 #[test]
-fn arm6b_non_layer_norm_suffix_segment_is_not_aliased() {
+fn arm7_mixed_per_site_and_per_axis_naming_builds_and_matches_all_modern() {
     let config = fixture_config();
     let tmp = tempfile::tempdir().unwrap();
-    let mut tensors = perturbed_fixture_tensors();
+    let perturbed = perturbed_fixture_tensors();
 
-    let w = tensors.remove("embeddings.LayerNorm.weight").unwrap();
-    let b = tensors.remove("embeddings.LayerNorm.bias").unwrap();
-    tensors.insert("embeddings.LayerNormX.weight".to_string(), w);
-    tensors.insert("embeddings.LayerNormX.bias".to_string(), b);
-
-    let path = save_tensors(&tensors, tmp.path(), "layer_norm_x_suffix.safetensors");
-    expect_build_err(
-        build_bert(&path, &config),
-        "a `LayerNormX`-suffixed prefix must not be treated as `LayerNorm`-keyed",
+    let mut ln_prefixes: Vec<String> = perturbed
+        .keys()
+        .filter(|k| is_layer_norm_weight(k))
+        .map(|k| k.strip_suffix(".weight").unwrap().to_string())
+        .collect();
+    ln_prefixes.sort();
+    assert_eq!(
+        ln_prefixes.len(),
+        3,
+        "expected exactly 3 LayerNorm sites, got {ln_prefixes:?}"
     );
+    let site1 = &ln_prefixes[0]; // "embeddings.LayerNorm" -- fully legacy.
+    let site3 = &ln_prefixes[2]; // "encoder.layer.0.output.LayerNorm" -- mixed.
+                                 // site2 ("encoder.layer.0.attention.output.LayerNorm") is left untouched.
+
+    let mut mixed = perturbed.clone();
+
+    let w1 = mixed.remove(&format!("{site1}.weight")).unwrap();
+    let b1 = mixed.remove(&format!("{site1}.bias")).unwrap();
+    mixed.insert(format!("{site1}.gamma"), w1);
+    mixed.insert(format!("{site1}.beta"), b1);
+
+    let w3 = mixed.remove(&format!("{site3}.weight")).unwrap();
+    mixed.insert(format!("{site3}.gamma"), w3);
+    // `{site3}.bias` is left in place -- the modern name, on purpose: this
+    // site's TWO axes are named inconsistently with each other.
+
+    let modern_path = save_tensors(&perturbed, tmp.path(), "modern.safetensors");
+    let mixed_path = save_tensors(&mixed, tmp.path(), "mixed.safetensors");
+
+    let modern_bert = build_bert(&modern_path, &config).expect("modern build Ok");
+    let mixed_bert =
+        build_bert(&mixed_path, &config).expect("mixed per-site/per-axis naming build must be Ok");
+
+    let (input_ids, mask) = fixed_inputs();
+    let modern_out = modern_bert
+        .forward_hidden(&input_ids, &mask)
+        .expect("modern forward");
+    let mixed_out = mixed_bert
+        .forward_hidden(&input_ids, &mask)
+        .expect("mixed forward");
+
+    assert_eq!(modern_out.dims(), mixed_out.dims());
+    let modern_v: Vec<f32> = modern_out.flatten_all().unwrap().to_vec1().unwrap();
+    let mixed_v: Vec<f32> = mixed_out.flatten_all().unwrap().to_vec1().unwrap();
+    assert!(
+        modern_v.iter().all(|v| v.is_finite()),
+        "modern output must be all-finite before any bit compare"
+    );
+    assert!(
+        mixed_v.iter().all(|v| v.is_finite()),
+        "mixed output must be all-finite before any bit compare"
+    );
+    assert_eq!(modern_v.len(), mixed_v.len());
+    for (i, (m, x)) in modern_v.iter().zip(mixed_v.iter()).enumerate() {
+        assert_eq!(
+            m.to_bits(),
+            x.to_bits(),
+            "element {i}: modern {m} (bits {:#x}) vs mixed {x} (bits {:#x}) -- must be \
+             EXACTLY bitwise identical, not merely close",
+            m.to_bits(),
+            x.to_bits()
+        );
+    }
+}
+
+/// Arm 8 (coverage gap (i)): the layout the real stock `bert-base-uncased`
+/// checkpoint actually ships -- every tensor re-keyed under a `bert.`
+/// prefix (`bert.rs:526-535` probes `bert.embeddings.word_embeddings.weight`
+/// and selects that prefix over the root-level layout). Building from a
+/// LEGACY-named checkpoint wrapped this way must be `Ok`, and its forward
+/// must be bitwise identical to the root-level (unwrapped) legacy build --
+/// the `bert.` wrapper is purely a naming layer, orthogonal to the
+/// legacy-name alias this whole file proves.
+#[test]
+fn arm8_bert_wrapped_legacy_layout_matches_root_level_legacy_build() {
+    let config = fixture_config();
+    let tmp = tempfile::tempdir().unwrap();
+    let perturbed = perturbed_fixture_tensors();
+    let legacy = to_legacy_names(&perturbed);
+
+    let root_legacy_path = save_tensors(&legacy, tmp.path(), "root_legacy.safetensors");
+    let wrapped_legacy: HashMap<String, Tensor> = legacy
+        .iter()
+        .map(|(name, t)| (format!("bert.{name}"), t.clone()))
+        .collect();
+    let wrapped_path = save_tensors(
+        &wrapped_legacy,
+        tmp.path(),
+        "bert_wrapped_legacy.safetensors",
+    );
+
+    let root_bert = build_bert(&root_legacy_path, &config).expect("root-level legacy build Ok");
+    let wrapped_bert =
+        build_bert(&wrapped_path, &config).expect("bert.-wrapped legacy build must be Ok");
+
+    let (input_ids, mask) = fixed_inputs();
+    let root_out = root_bert
+        .forward_hidden(&input_ids, &mask)
+        .expect("root forward");
+    let wrapped_out = wrapped_bert
+        .forward_hidden(&input_ids, &mask)
+        .expect("wrapped forward");
+
+    assert_eq!(root_out.dims(), wrapped_out.dims());
+    let root_v: Vec<f32> = root_out.flatten_all().unwrap().to_vec1().unwrap();
+    let wrapped_v: Vec<f32> = wrapped_out.flatten_all().unwrap().to_vec1().unwrap();
+    assert!(
+        root_v.iter().all(|v| v.is_finite()),
+        "root output must be all-finite before any bit compare"
+    );
+    assert!(
+        wrapped_v.iter().all(|v| v.is_finite()),
+        "wrapped output must be all-finite before any bit compare"
+    );
+    assert_eq!(root_v.len(), wrapped_v.len());
+    for (i, (r, w)) in root_v.iter().zip(wrapped_v.iter()).enumerate() {
+        assert_eq!(
+            r.to_bits(),
+            w.to_bits(),
+            "element {i}: root {r} (bits {:#x}) vs bert.-wrapped {w} (bits {:#x}) -- must be \
+             EXACTLY bitwise identical, not merely close",
+            r.to_bits(),
+            w.to_bits()
+        );
+    }
 }

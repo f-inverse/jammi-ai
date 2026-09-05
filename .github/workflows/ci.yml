@@ -1585,6 +1585,22 @@ jobs:
           # executed.
           - name: profile_356_legs.sh dry-run smoke
             cmd: python3 ci/scripts/perf/test_profile_356_legs_dry_run.py
+          # `lora_bias_ab_merge.py`'s own suite (#428 P2b, docs-ci): drives
+          # the REAL dispatch-proof/identity/differencing/verdict functions
+          # (and `main` itself, end to end, at least once) against synthetic
+          # raw-leg fixtures covering ACTIVATE/NEUTRAL/REGRESSION/INVALID —
+          # never a re-implementation of the merge math. No GPU, no network.
+          - name: lora_bias_ab_merge suite
+            cmd: python3 ci/scripts/perf/test_lora_bias_ab_merge.py
+          # Hermetic `LORA_BIAS_AB_DRY_RUN=1` smoke test for `lora_bias_ab.sh`
+          # itself (#428 P2b) — mirrors `profile_356_legs.sh dry-run
+          # smoke`'s own "the shell PRODUCER itself must run in CI at least
+          # once, zero-execution is RED not a skip" doctrine: drives the REAL
+          # subprocess end to end (leg-table construction, per-arm env,
+          # order-balanced repeats, the STRICT preflight's own refusal path),
+          # no GPU, no real jammi-bench, no real checkpoint, no network.
+          - name: lora_bias_ab.sh dry-run smoke
+            cmd: python3 ci/scripts/perf/test_lora_bias_ab_sh_dry_run.py
     steps:
       - uses: actions/checkout@v4
         with:

@@ -27,6 +27,13 @@ Two independent test surfaces:
   BEFORE any leg runs (an empty `manifest.json`, never a partially-run
   sweep) and names the offending op key plus the pre-registered remedy.
 
+  `AbOpLnTests` (#460): drives `AB_OP=ln` -- the disable key becomes
+  `layer_norm_fused`, the eager-arm label becomes `ln_eager`, and every
+  manifest row records `ab_op == "ln"`. `AB_OP=lora_linear` (every test
+  above, run with no `AB_OP` set at all) is byte-for-byte what it always
+  was; `AbOpLnTests` also pins that an unrecognized `AB_OP` refuses before
+  any manifest is even created.
+
 Run: `python3 ci/scripts/perf/test_lora_bias_ab_sh_dry_run.py`
 """
 
@@ -227,6 +234,96 @@ class PreflightRefusalTests(unittest.TestCase):
                 "LORA_BIAS_AB_EXTRA_DISABLE=already_disabled_op,newly_found_op",
                 result.stderr,
             )
+
+
+class AbOpLnTests(unittest.TestCase):
+    """#460: `AB_OP=ln` forces `layer_norm_fused` eager instead of
+    `lora_linear_fused` -- same driver, same STRICT/negative-control/corpus
+    mechanism, only the disable key and the eager-arm label change. Every
+    test here uses `LORA_BIAS_AB_LEGS_ONLY` to keep the sweep itself small
+    (the KNOWN_CELL_IDS table and the STRICT preflight -- 4 probes,
+    unconditional -- still run in full either way, exactly like every
+    `DryRunSmokeTests` case above)."""
+
+    def test_manifest_rows_record_ab_op_ln_and_the_ln_eager_arm_label(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            legs_only = "bert-b8W512f32-fused-r1,bert-b8W512f32-ln_eager-r1"
+            result = run_dry(out_dir, {"AB_OP": "ln", "LORA_BIAS_AB_LEGS_ONLY": legs_only})
+            self.assertEqual(result.returncode, 0, _fail_msg(result))
+            rows = load_manifest(out_dir)
+            self.assertEqual(len(rows), 4, [r["leg_id"] for r in rows])  # 2 cells x (N, M)
+            arms_seen = {r["arm"] for r in rows}
+            self.assertEqual(arms_seen, {"fused", "ln_eager"}, rows)
+            for row in rows:
+                self.assertEqual(row["ab_op"], "ln", row)
+                self.assertEqual(row["status"], "ok", row)
+
+    def test_env_is_strict_on_every_arm_and_disable_only_on_ln_eager(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            legs_only = "bert-b8W512f32-fused-r1,bert-b8W512f32-ln_eager-r1"
+            result = run_dry(out_dir, {"AB_OP": "ln", "LORA_BIAS_AB_LEGS_ONLY": legs_only})
+            self.assertEqual(result.returncode, 0, _fail_msg(result))
+            rows = load_manifest(out_dir)
+            for row in rows:
+                self.assertEqual(row["env"]["JAMMI_KERNELS_STRICT"], "1", row)
+                if row["arm"] == "ln_eager":
+                    self.assertEqual(row["env"]["JAMMI_KERNELS_DISABLE"], "layer_norm_fused", row)
+                else:
+                    self.assertEqual(row["env"]["JAMMI_KERNELS_DISABLE"], "", row)
+
+    def test_control_cell_still_works_under_ab_op_ln(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            result = run_dry(
+                out_dir, {"AB_OP": "ln", "LORA_BIAS_AB_LEGS_ONLY": "bert-control-r1"}
+            )
+            self.assertEqual(result.returncode, 0, _fail_msg(result))
+            rows = load_manifest(out_dir)
+            self.assertEqual(len(rows), 2, rows)
+            for row in rows:
+                self.assertEqual(row["model"], "bert")
+                self.assertEqual(row["arm"], "control")
+                self.assertEqual(row["ab_op"], "ln", row)
+                self.assertEqual(row["env"]["JAMMI_KERNELS_DISABLE"], "", row)
+
+    def test_extra_disable_lands_symmetrically_under_ab_op_ln(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            legs_only = "bert-b8W512f32-fused-r1,bert-b8W512f32-ln_eager-r1"
+            result = run_dry(
+                out_dir,
+                {
+                    "AB_OP": "ln",
+                    "LORA_BIAS_AB_LEGS_ONLY": legs_only,
+                    "LORA_BIAS_AB_EXTRA_DISABLE": "some_bad_op",
+                },
+            )
+            self.assertEqual(result.returncode, 0, _fail_msg(result))
+            rows = load_manifest(out_dir)
+            for row in rows:
+                self.assertEqual(row["extra_disable"], ["some_bad_op"], row)
+                disable = row["env"]["JAMMI_KERNELS_DISABLE"]
+                self.assertIn("some_bad_op", disable, row)
+                if row["arm"] == "ln_eager":
+                    self.assertEqual(disable, "layer_norm_fused,some_bad_op", row)
+                else:
+                    self.assertEqual(disable, "some_bad_op", row)
+
+    def test_known_cell_ids_use_the_ln_eager_label_not_lora_eager(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            # `lora_eager` is not a known arm label for an AB_OP=ln sweep --
+            # the cell-id table is built from THIS sweep's own eager-arm
+            # label, never the other op's.
+            result = run_dry(
+                out_dir, {"AB_OP": "ln", "LORA_BIAS_AB_LEGS_ONLY": "bert-b8W512f32-lora_eager-r1"}
+            )
+            self.assertNotEqual(result.returncode, 0, _fail_msg(result))
+            self.assertIn("unknown cell id", result.stderr)
+
+    def test_unrecognized_ab_op_refuses_before_any_manifest_is_created(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            result = run_dry(out_dir, {"AB_OP": "bogus_op"})
+            self.assertNotEqual(result.returncode, 0, _fail_msg(result))
+            self.assertIn("AB_OP must be", result.stderr)
+            self.assertFalse(os.path.exists(os.path.join(out_dir, "manifest.json")))
 
 
 if __name__ == "__main__":

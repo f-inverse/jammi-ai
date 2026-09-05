@@ -314,7 +314,17 @@ _TORCH_ARGS_LEVEL_FIELDS = frozenset({"seed", "lora_alpha", "margin", "warmup"})
 #       - `ln`: dispatches inside every layer's own norm call, never folded
 #         into a whole-attention or whole-MLP kernel, and
 #         `finetune_step.rs`'s own counter-delta test already asserts its
-#         (fused+eager) total is nonzero on every run.
+#         (fused+eager) total is nonzero on every run. Before #460, this
+#         pair's `fused > 0` half held only for architectures whose
+#         LayerNorm carries no bias (ModernBERT) — a BERT-family leg's own
+#         LayerNorm is biased, so `LN_DISPATCH_COUNTERS` always read
+#         `fused == 0` for it (`jammi-encoders/src/layer_norm.rs`'s own
+#         module doc: "the parity-test/BERT/DistilBERT paths ... never
+#         reach this arm at all"), meaning a BERT-family leg could never
+#         satisfy this pair. #460 lands a bias-carrying fused LayerNorm
+#         site routed through the SAME `layer_norm_fused` admit key, so a
+#         BERT-family leg now satisfies this pair exactly like ModernBERT
+#         already did.
 #       - `geglu`: same reasoning as `ln` — `ModernBertMlp::forward`'s
 #         training arm calls `geglu_apply_training` unconditionally for
 #         every layer's MLP (see that function's own doc); its admission

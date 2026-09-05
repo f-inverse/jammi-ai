@@ -64,6 +64,25 @@ plan-428-p2b.md`'s v1-amendment "bar met -> guide row; missed-but-not-slower
      fired and at least one activating shape's own cell is invalid (not
      enough coverage to honestly assert NEUTRAL either).
 
+## Per-op generalization (#460)
+
+This merger is no longer `lora_linear_fused`-only: `OPS` names every op
+`lora_bias_ab.sh` can drive (`lora_linear` -- the #428 default, unchanged;
+`ln` -- #460's bias-carrying fused LayerNorm site), and `--op` (or a
+manifest's own `ab_op` field, read back automatically when `--op` is
+omitted) selects which one this merge run classifies. Everything above this
+section (cell model, floor, verdict priority) is IDENTICAL across ops --
+only the dispatch-proof's counter-field base and disable key change. `ln`
+additionally carries a `cross_check` onto `lora_linear`: since #428 already
+made the LoRA-linear site fused-by-default on BOTH models, an `AB_OP=ln`
+sweep pins `lora_linear` fused on EVERY leg regardless of that leg's own
+arm, so the fused/eager differential it measures isolates the LayerNorm
+site alone -- `dispatch_violations` checks this unconditionally when an
+op's own config names a `cross_check`. `ln`'s fusion ships regardless of
+its measured gain (no activation bar, pre-registered as such) -- the
+artifact's own `notes.landing_rule` states this for a reader who only has
+the JSON, never only in this docstring.
+
 Run: `python3 ci/scripts/perf/lora_bias_ab_merge.py RAW_DIR OUT.json`
 (`RAW_DIR` is the sweep's own `$OUT_DIR` -- the directory holding
 `manifest.json` and `raw/*.json`, exactly what `lora_bias_ab.sh` writes).
@@ -97,6 +116,32 @@ MODELS = ("bert", "distilbert")
 STEPS_N = 100
 STEPS_M = 600
 GAIN_BAR = 0.05
+
+# #460 — per-op generalization. Each entry: which single admission key this
+# op's own A/B forces eager (`op_key`), the counter-field base its report
+# carries (`<base>_fused_dispatches` / `<base>_eager_dispatches`), the arm
+# label `lora_bias_ab.sh` gives that op's own eager arm, and — ONLY for an op
+# whose fusion ships regardless of gain (no activation bar) — the OTHER op
+# whose own dispatch proof must ALSO hold fused>0/eager==0 on every leg of
+# THIS op's sweep (`cross_check`, `None` for `lora_linear`: nothing else is
+# pinned fused for its own sweep). `lora_linear` is this table's pre-#460
+# entry, unchanged — every default-arg call site below that omits an
+# explicit op config resolves to `OPS["lora_linear"]`, which is what keeps
+# `AB_OP=lora_linear` byte-for-byte identical to the #428 contract.
+OPS = {
+    "lora_linear": {
+        "op_key": LORA_OP,
+        "counter_base": "lora_linear",
+        "eager_arm": "lora_eager",
+        "cross_check": None,
+    },
+    "ln": {
+        "op_key": "layer_norm_fused",
+        "counter_base": "ln",
+        "eager_arm": "ln_eager",
+        "cross_check": "lora_linear",
+    },
+}
 
 
 def _is_finite_real(x):
@@ -142,27 +187,47 @@ def wall_violations(leg_id, tier):
     return []
 
 
-def dispatch_violations(row, tier):
-    """The single-op (`lora_linear_fused`) dispatch proof (CONTRACT):
-      * `fused`/`control` legs: `fused > 0`, `eager == 0`, and
-        `lora_linear_fused` NOT in `kernels_disabled_requested` (the fused
-        arm makes no disable claim at all -- see `finetune_run.rs`'s own
-        `Arm::Fused` doc).
-      * `lora_eager` legs: `fused == 0`, `eager > 0`, and
-        `lora_linear_fused` present in BOTH `kernels_disabled_requested`
-        AND `kernels_disabled_fired` (disable wins over Strict --
+def dispatch_violations(row, tier, op_cfg=None):
+    """The single-op dispatch proof (CONTRACT), generalized over `OPS` (#460)
+    -- defaults to `OPS["lora_linear"]` (the #428 contract, unchanged) when
+    `op_cfg` is omitted, which is what keeps every pre-#460 call site (and
+    every pre-#460 test) byte-for-byte identical:
+      * `fused`/`control` legs: `fused > 0`, `eager == 0`, and this op's own
+        `op_key` NOT in `kernels_disabled_requested` (the fused arm makes no
+        disable claim at all -- see `finetune_run.rs`'s own `Arm::Fused`
+        doc).
+      * this op's own eager-arm-label legs (`op_cfg["eager_arm"]` -- e.g.
+        `lora_eager`/`ln_eager`): `fused == 0`, `eager > 0`, and `op_key`
+        present in BOTH `kernels_disabled_requested` AND
+        `kernels_disabled_fired` (disable wins over Strict --
         `crate::admission::admit_inner`'s own doc -- so a genuine eager leg
         must show the op both requested-disabled and actually fired).
     Plus the EXTRA_DISABLE symmetry check every leg carries regardless of
-    arm: `kernels_disabled_requested` minus `{lora_linear_fused}` must equal
-    the leg's OWN recorded `extra_disable` set -- an asymmetric
-    `JAMMI_KERNELS_DISABLE` (extra entries on one arm only) would silently
-    change which op each arm's numbers actually describe.
+    arm: `kernels_disabled_requested` minus `{op_key}` must equal the leg's
+    OWN recorded `extra_disable` set -- an asymmetric `JAMMI_KERNELS_DISABLE`
+    (extra entries on one arm only) would silently change which op each
+    arm's numbers actually describe.
+
+    Plus (#460), ONLY when `op_cfg["cross_check"]` names another op: the
+    CROSS-op invariant this op's own sweep pins for every leg regardless of
+    ITS OWN arm -- the cross-check op must independently read `fused > 0`,
+    `eager == 0`, and its own `op_key` NOT in `kernels_disabled_requested`.
+    `AB_OP=ln` uses this to state, mechanically, that the LoRA-linear site
+    stays fused on BOTH arms of an `ln` sweep -- the fused/eager
+    differential this sweep measures isolates the LayerNorm site alone,
+    never a confound from the LoRA site also flipping arms.
     """
+    op_cfg = op_cfg or OPS["lora_linear"]
+    op_key = op_cfg["op_key"]
+    base = op_cfg["counter_base"]
+    eager_arm = op_cfg["eager_arm"]
+    fused_field = f"{base}_fused_dispatches"
+    eager_field = f"{base}_eager_dispatches"
+
     leg_id = row.get("leg_id")
     arm = row.get("arm")
-    fused = tier.get("lora_linear_fused_dispatches")
-    eager = tier.get("lora_linear_eager_dispatches")
+    fused = tier.get(fused_field)
+    eager = tier.get(eager_field)
     requested = tier.get("kernels_disabled_requested")
     fired = tier.get("kernels_disabled_fired")
 
@@ -176,33 +241,69 @@ def dispatch_violations(row, tier):
     if not isinstance(fused, (int, float)) or isinstance(fused, bool) or not isinstance(
         eager, (int, float)
     ) or isinstance(eager, bool):
-        v.append(f"{leg_id}: lora_linear_{{fused,eager}}_dispatches missing or not numeric")
+        v.append(f"{leg_id}: {base}_{{fused,eager}}_dispatches missing or not numeric")
         return v
 
     if arm in ("fused", "control"):
-        if not (fused > 0 and eager == 0 and LORA_OP not in requested):
+        if not (fused > 0 and eager == 0 and op_key not in requested):
             v.append(
                 f"{leg_id}: fused/control dispatch proof failed "
-                f"(fused={fused}, eager={eager}, {LORA_OP!r} in requested={LORA_OP in requested})"
+                f"(fused={fused}, eager={eager}, {op_key!r} in requested={op_key in requested})"
             )
-    elif arm == "lora_eager":
-        if not (fused == 0 and eager > 0 and LORA_OP in requested and LORA_OP in fired):
+    elif arm == eager_arm:
+        if not (fused == 0 and eager > 0 and op_key in requested and op_key in fired):
             v.append(
-                f"{leg_id}: lora_eager dispatch proof failed "
+                f"{leg_id}: {eager_arm} dispatch proof failed "
                 f"(fused={fused}, eager={eager}, requested={requested!r}, fired={fired!r})"
             )
     else:
         v.append(f"{leg_id}: unrecognized arm label {arm!r}")
 
     extra_recorded = set(row.get("extra_disable") or [])
-    requested_minus_op = set(requested) - {LORA_OP}
+    requested_minus_op = set(requested) - {op_key}
     if requested_minus_op != extra_recorded:
         v.append(
-            f"{leg_id}: kernels_disabled_requested minus {{{LORA_OP}}} = "
+            f"{leg_id}: kernels_disabled_requested minus {{{op_key}}} = "
             f"{sorted(requested_minus_op)!r} != this leg's own recorded extra_disable "
             f"{sorted(extra_recorded)!r} (asymmetric JAMMI_KERNELS_DISABLE)"
         )
+
+    cross_base = op_cfg.get("cross_check")
+    if cross_base:
+        cross_cfg = OPS[cross_base]
+        cross_key = cross_cfg["op_key"]
+        cross_fused_field = f"{cross_base}_fused_dispatches"
+        cross_eager_field = f"{cross_base}_eager_dispatches"
+        cross_fused = tier.get(cross_fused_field)
+        cross_eager = tier.get(cross_eager_field)
+        if not isinstance(cross_fused, (int, float)) or isinstance(cross_fused, bool) or (
+            not isinstance(cross_eager, (int, float)) or isinstance(cross_eager, bool)
+        ):
+            v.append(
+                f"{leg_id}: cross-op invariant fields missing or not numeric "
+                f"({cross_fused_field}={cross_fused!r}, {cross_eager_field}={cross_eager!r})"
+            )
+        elif not (cross_fused > 0 and cross_eager == 0 and cross_key not in requested):
+            v.append(
+                f"{leg_id}: cross-op invariant failed -- an {base} A/B requires {cross_base} "
+                f"to stay fused on every leg regardless of arm "
+                f"({cross_fused_field}={cross_fused}, {cross_eager_field}={cross_eager}, "
+                f"{cross_key!r} in requested={cross_key in requested})"
+            )
     return v
+
+
+def op_cfg_for_row(row):
+    """Resolves the `OPS` entry a manifest row's own `ab_op` field names --
+    `"lora_linear"` (the #428 default) for any row that carries no `ab_op`
+    field at all (every pre-#460 fixture/manifest), so `build_legs`'s own
+    per-leg dispatch proof stays exactly the #428 one unless a row
+    explicitly opts into a different op. Returns `(op_cfg, op_name)`;
+    `op_cfg` is `None` when `op_name` is not a name `OPS` recognizes (an
+    unrecognized `ab_op` is a leg-level violation, not a crash).
+    """
+    op_name = row.get("ab_op") or "lora_linear"
+    return OPS.get(op_name), op_name
 
 
 def build_legs(raw_dir, rows):
@@ -224,7 +325,11 @@ def build_legs(raw_dir, rows):
                 violations.append(err)
         if tier is not None:
             violations.extend(wall_violations(row.get("leg_id"), tier))
-            violations.extend(dispatch_violations(row, tier))
+            op_cfg, op_name = op_cfg_for_row(row)
+            if op_cfg is None:
+                violations.append(f"{row.get('leg_id')}: unrecognized ab_op {op_name!r}")
+            else:
+                violations.extend(dispatch_violations(row, tier, op_cfg))
         legs.append({"row": row, "tier": tier, "violations": violations})
     return legs
 
@@ -364,7 +469,9 @@ def compute_buckets(legs):
     return results
 
 
-def compute_model_verdict(model, buckets):
+def compute_model_verdict(model, buckets, op_cfg=None):
+    op_cfg = op_cfg or OPS["lora_linear"]
+    eager_arm = op_cfg["eager_arm"]
     control = buckets.get(("control", model))
     wire = buckets.get(("measurement", model, WIRE_SHAPE))
     chapter = buckets.get(("measurement", model, CHAPTER_SHAPE))
@@ -396,7 +503,7 @@ def compute_model_verdict(model, buckets):
             missing_shapes.append(shape)
             continue
         fused_m = cell["per_arm"].get("fused")
-        eager_m = cell["per_arm"].get("lora_eager")
+        eager_m = cell["per_arm"].get(eager_arm)
         if fused_m is None or eager_m is None or fused_m["median"] == 0:
             missing_shapes.append(shape)
             continue
@@ -446,14 +553,15 @@ def _resolve_git_sha(explicit):
         raise SystemExit(f"::error::lora_bias_ab_merge: could not resolve git sha (pass --git-sha): {e}")
 
 
-def print_table(model_verdicts, buckets):
+def print_table(model_verdicts, buckets, op_cfg=None):
+    op_cfg = op_cfg or OPS["lora_linear"]
     print(f"{'model':<12} {'shape':<12} {'arm':<12} {'n':>3} {'median s/step':>16}")
     for model in MODELS:
         for shape in (WIRE_SHAPE, CHAPTER_SHAPE):
             cell = buckets.get(("measurement", model, shape))
             if cell is None:
                 continue
-            for arm in ("fused", "lora_eager"):
+            for arm in ("fused", op_cfg["eager_arm"]):
                 stats = cell["per_arm"].get(arm)
                 n = stats["n"] if stats else 0
                 median = f"{stats['median']:.6f}" if stats else "n/a"
@@ -471,7 +579,49 @@ def print_table(model_verdicts, buckets):
         print(f"{model}: {verdict['verdict']} (floor={floor_str}, gain={{{gain_str}}})")
 
 
-def build_artifact(git_sha, box, invocation, model_verdicts, legs, buckets):
+NOTES_WHAT = {
+    "lora_linear": (
+        "GH #428 P2b: same-box fused-vs-eager per-step wall A/B for BERT/DistilBERT at "
+        "the two shapes issue #356's own close-out profile ACTIVATED the C-LORA port on, "
+        "proving out the bias-carrying-base widening once it lands."
+    ),
+    "ln": (
+        "GH #460: same-box fused-vs-eager per-step wall A/B for BERT/DistilBERT, isolating "
+        "the bias-carrying fused LayerNorm site (the same layer_norm_fused admit key "
+        "ModernBERT's own bias-free LayerNorm already used) at the two shapes issue #356's "
+        "own close-out profile activated the C-LORA port on; lora_linear stays fused on "
+        "both arms of this sweep so the differential isolates the LayerNorm site alone."
+    ),
+}
+NOTES_METHOD = {
+    "lora_linear": (
+        "per-repeat differencing s_per_step = (wall_600 - wall_100) / 500; "
+        "gain = 1 - fused_median / eager_median; "
+        "floor = |fused_median_wire - control_median| / fused_median_wire (one per model); "
+        "activation_bar: gain >= 0.05 and gain > floor on >= 1 activating shape."
+    ),
+    "ln": (
+        "per-repeat differencing s_per_step = (wall_600 - wall_100) / 500; "
+        "gain = 1 - fused_median / eager_median; "
+        "floor = |fused_median_wire - control_median| / fused_median_wire (one per model); "
+        "the ACTIVATE/NEUTRAL/REGRESSION verdict below is the measured classification "
+        "only -- it is not this fusion's ship/no-ship bar, see notes.landing_rule."
+    ),
+}
+# #460: an op whose fusion ships regardless of measured gain (no activation
+# bar, pre-registered as such) still gets an honest, published
+# ACTIVATE/NEUTRAL/REGRESSION classification -- `landing_rule` states, in the
+# artifact itself, why a NEUTRAL (or even a small REGRESSION within the
+# floor) result does not mean the fusion is reverted.
+LANDING_RULES = {
+    "ln": (
+        "no activation bar -- lands by architectural direction (one common LayerNorm "
+        "path); ACTIVATE/NEUTRAL/REGRESSION are the measured classification only"
+    ),
+}
+
+
+def build_artifact(git_sha, box, invocation, model_verdicts, legs, buckets, ab_op="lora_linear"):
     legs_out = []
     for leg in legs:
         row = leg["row"]
@@ -483,15 +633,24 @@ def build_artifact(git_sha, box, invocation, model_verdicts, legs, buckets):
                 "arm": row.get("arm"),
                 "steps": row.get("steps"),
                 "repeat": row.get("repeat"),
+                "ab_op": row.get("ab_op") or "lora_linear",
                 "valid": not leg["violations"],
                 "violations": leg["violations"],
                 "wall_s": (leg["tier"] or {}).get("train_run_wall_s") if leg["tier"] else None,
             }
         )
+    notes = {
+        "what": NOTES_WHAT[ab_op],
+        "method": NOTES_METHOD[ab_op],
+        "verdicts": model_verdicts,
+    }
+    if ab_op in LANDING_RULES:
+        notes["landing_rule"] = LANDING_RULES[ab_op]
     return {
         "schema_version": SCHEMA_VERSION,
         "git_sha": git_sha,
         "box": box,
+        "ab_op": ab_op,
         "producer": {
             "path": "ci/scripts/perf/lora_bias_ab.sh",
             "kind": "script",
@@ -499,22 +658,26 @@ def build_artifact(git_sha, box, invocation, model_verdicts, legs, buckets):
             "gating": "none",
         },
         "status": "GREEN",
-        "notes": {
-            "what": (
-                "GH #428 P2b: same-box fused-vs-eager per-step wall A/B for BERT/DistilBERT at "
-                "the two shapes issue #356's own close-out profile ACTIVATED the C-LORA port on, "
-                "proving out the bias-carrying-base widening once it lands."
-            ),
-            "method": (
-                "per-repeat differencing s_per_step = (wall_600 - wall_100) / 500; "
-                "gain = 1 - fused_median / eager_median; "
-                "floor = |fused_median_wire - control_median| / fused_median_wire (one per model); "
-                "activation_bar: gain >= 0.05 and gain > floor on >= 1 activating shape."
-            ),
-            "verdicts": model_verdicts,
-        },
+        "notes": notes,
         "legs": legs_out,
     }
+
+
+def _infer_ab_op(rows):
+    """Resolves the whole sweep's own `ab_op` from its manifest rows when
+    `--op` is not passed explicitly -- every row of one sweep shares one
+    `AB_OP` (`lora_bias_ab.sh` never mixes ops within a run), so this is a
+    consistency check as much as an inference: rows disagreeing on `ab_op`
+    means two different sweeps' manifests were concatenated into one
+    `OUT_DIR`, which this refuses rather than silently merging.
+    """
+    seen = {(row.get("ab_op") or "lora_linear") for row in rows}
+    if len(seen) > 1:
+        raise SystemExit(
+            f"::error::lora_bias_ab_merge: manifest rows disagree on ab_op: {sorted(seen)} "
+            "-- refusing to merge two different ops' legs as one sweep"
+        )
+    return next(iter(seen), "lora_linear")
 
 
 def main(argv=None):
@@ -523,6 +686,12 @@ def main(argv=None):
     ap.add_argument("out_json", help="where to write the merged cuda-runs artifact")
     ap.add_argument("--git-sha", default=None, help="40-hex sha (default: resolve HEAD)")
     ap.add_argument("--box", default="unknown", help="the physical/pod box identifier")
+    ap.add_argument(
+        "--op",
+        default=None,
+        choices=sorted(OPS),
+        help="which op this sweep measured (default: inferred from the manifest's own ab_op field)",
+    )
     ap.add_argument(
         "--producer-invocation",
         default=None,
@@ -534,17 +703,20 @@ def main(argv=None):
     invocation = args.producer_invocation or "ci/scripts/perf/lora_bias_ab.sh"
 
     rows = load_manifest(args.raw_dir)
+    ab_op = args.op or _infer_ab_op(rows)
+    op_cfg = OPS[ab_op]
+
     legs = build_legs(args.raw_dir, rows)
     apply_identity_checks(legs)
     buckets = compute_buckets(legs)
 
-    model_verdicts = {model: compute_model_verdict(model, buckets) for model in MODELS}
+    model_verdicts = {model: compute_model_verdict(model, buckets, op_cfg) for model in MODELS}
 
-    artifact = build_artifact(git_sha, args.box, invocation, model_verdicts, legs, buckets)
+    artifact = build_artifact(git_sha, args.box, invocation, model_verdicts, legs, buckets, ab_op)
     with open(args.out_json, "w") as f:
         json.dump(artifact, f, indent=1)
 
-    print_table(model_verdicts, buckets)
+    print_table(model_verdicts, buckets, op_cfg)
     print(f"\n=== merged artifact: {args.out_json} ===")
     return 0
 

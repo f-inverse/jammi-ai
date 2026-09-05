@@ -85,7 +85,7 @@ def base_provenance(steps, requested, fired):
 
 
 def make_tier(*, batch, width, dtype, steps, requested, fired, wall, fused_disp, eager_disp,
-              identity_overrides=None):
+              identity_overrides=None, ln_fused_disp=1, ln_eager_disp=0):
     tier = {}
     tier.update(base_identity(batch, width, dtype))
     if identity_overrides:
@@ -94,7 +94,22 @@ def make_tier(*, batch, width, dtype, steps, requested, fired, wall, fused_disp,
     tier["train_run_wall_s"] = wall
     tier["lora_linear_fused_dispatches"] = fused_disp
     tier["lora_linear_eager_dispatches"] = eager_disp
+    # A real report always carries the `ln_*` counters too (#460) --
+    # defaulting to fused=1/eager=0 (the ModernBERT-already-fused shape)
+    # keeps every pre-#460 `lora_linear` fixture below unaffected, since
+    # `dispatch_violations(row, tier)` (its 2-arg default) never reads
+    # these fields at all.
+    tier["ln_fused_dispatches"] = ln_fused_disp
+    tier["ln_eager_dispatches"] = ln_eager_disp
     return tier
+
+
+# Op tables mirroring `lora_bias_ab_merge.OPS`/`lora_bias_ab.sh`'s own AB_OP
+# table (#460) -- kept as a small local literal (never imported from `m.OPS`)
+# so this fixture module stays an independent check on the module under
+# test, not a mirror that could drift in lockstep with a bug in it.
+_OP_DISABLE_KEY = {"lora_linear": "lora_linear_fused", "ln": "layer_norm_fused"}
+_OP_EAGER_ARM = {"lora_linear": "lora_eager", "ln": "ln_eager"}
 
 
 def add_leg(
@@ -119,6 +134,9 @@ def add_leg(
     status="ok",
     reason="",
     write_report=True,
+    ab_op="lora_linear",
+    ln_fused_disp=1,
+    ln_eager_disp=0,
 ):
     leg_id = f"{model}-{shape}-{arm}-{steps}-r{repeat}"
     tier = make_tier(
@@ -132,6 +150,8 @@ def add_leg(
         fused_disp=fused_disp,
         eager_disp=eager_disp,
         identity_overrides=identity_overrides,
+        ln_fused_disp=ln_fused_disp,
+        ln_eager_disp=ln_eager_disp,
     )
     report_path = None
     if write_report:
@@ -151,6 +171,7 @@ def add_leg(
         "arm": arm,
         "steps": steps,
         "repeat": repeat,
+        "ab_op": ab_op,
         "env": {"JAMMI_KERNELS_STRICT": "1", "JAMMI_KERNELS_DISABLE": ",".join(requested)},
         "extra_disable": list(extra_disable),
         "argv": [],
@@ -169,25 +190,46 @@ def add_leg(
 
 
 def add_cell(root, rows, model, shape, arm, *, repeats, walls_n, walls_m, batch, width, dtype,
-             extra_disable=()):
-    """Adds `repeats` complete (N, M) leg pairs for one (model, shape, arm)."""
-    requested = ["lora_linear_fused"] if arm == "lora_eager" else []
+             extra_disable=(), ab_op="lora_linear"):
+    """Adds `repeats` complete (N, M) leg pairs for one (model, shape, arm).
+
+    `ab_op="lora_linear"` (default) is byte-for-byte the pre-#460 fixture
+    shape. `ab_op="ln"` forces `layer_norm_fused` eager instead, on the
+    `ln_eager` arm, and PINS `lora_linear` fused>0/eager==0 on EVERY leg
+    regardless of arm -- the same cross-op invariant `lora_bias_ab.sh`'s own
+    fake-bench stub and the real admission lattice both hold for an
+    `AB_OP=ln` sweep.
+    """
+    eager_arm_label = _OP_EAGER_ARM[ab_op]
+    disable_key = _OP_DISABLE_KEY[ab_op]
+    is_eager_arm = arm == eager_arm_label
+    requested = [disable_key] if is_eager_arm else []
     requested = list(requested) + list(extra_disable)
-    fired = ["lora_linear_fused"] if arm == "lora_eager" else []
-    fused_disp = 0 if arm == "lora_eager" else 1
-    eager_disp = 1 if arm == "lora_eager" else 0
+    fired = [disable_key] if is_eager_arm else []
+    if ab_op == "lora_linear":
+        fused_disp = 0 if is_eager_arm else 1
+        eager_disp = 1 if is_eager_arm else 0
+        ln_fused_disp, ln_eager_disp = 1, 0
+    else:
+        # `ln`: lora_linear stays fused on EVERY leg of this sweep (the
+        # cross-check invariant), regardless of this leg's own arm.
+        fused_disp, eager_disp = 1, 0
+        ln_fused_disp = 0 if is_eager_arm else 1
+        ln_eager_disp = 1 if is_eager_arm else 0
     for r in range(1, repeats + 1):
         add_leg(
             root, rows, model=model, shape=shape, arm=arm, steps=m.STEPS_N, repeat=r,
             wall=walls_n[r - 1], fused_disp=fused_disp, eager_disp=eager_disp,
             requested=requested, fired=fired, extra_disable=extra_disable,
-            batch=batch, width=width, dtype=dtype,
+            batch=batch, width=width, dtype=dtype, ab_op=ab_op,
+            ln_fused_disp=ln_fused_disp, ln_eager_disp=ln_eager_disp,
         )
         add_leg(
             root, rows, model=model, shape=shape, arm=arm, steps=m.STEPS_M, repeat=r,
             wall=walls_m[r - 1], fused_disp=fused_disp, eager_disp=eager_disp,
             requested=requested, fired=fired, extra_disable=extra_disable,
-            batch=batch, width=width, dtype=dtype,
+            batch=batch, width=width, dtype=dtype, ab_op=ab_op,
+            ln_fused_disp=ln_fused_disp, ln_eager_disp=ln_eager_disp,
         )
 
 
@@ -581,6 +623,205 @@ class EndToEndVerdictTests(unittest.TestCase):
         # reported, INVALID, never silently omitted from the notes.
         self.assertIn("distilbert", artifact["notes"]["verdicts"])
         self.assertEqual(artifact["notes"]["verdicts"]["distilbert"]["verdict"], "INVALID")
+
+
+class AbOpLnTests(unittest.TestCase):
+    """#460: `AB_OP=ln` -- the per-op generalization's second table entry.
+    Dispatch-proof shape, the `ln_eager` arm label, the cross-op invariant
+    pinning `lora_linear` fused on every leg of an `ln` sweep, and the
+    artifact's own `landing_rule` note. Every `lora_linear`-op test above
+    this class is untouched and still passes with `dispatch_violations`'s
+    2-arg default / `compute_model_verdict`'s 2-arg default / `main`'s
+    manifest-inferred `ab_op` default."""
+
+    def test_ln_fused_leg_clean_is_no_violation(self):
+        row = {"leg_id": "x", "arm": "fused", "extra_disable": []}
+        tier = {
+            "ln_fused_dispatches": 1, "ln_eager_dispatches": 0,
+            "lora_linear_fused_dispatches": 1, "lora_linear_eager_dispatches": 0,
+            "kernels_disabled_requested": [], "kernels_disabled_fired": [],
+        }
+        self.assertEqual(m.dispatch_violations(row, tier, m.OPS["ln"]), [])
+
+    def test_ln_eager_leg_clean_is_no_violation(self):
+        row = {"leg_id": "x", "arm": "ln_eager", "extra_disable": []}
+        tier = {
+            "ln_fused_dispatches": 0, "ln_eager_dispatches": 4,
+            "lora_linear_fused_dispatches": 1, "lora_linear_eager_dispatches": 0,
+            "kernels_disabled_requested": ["layer_norm_fused"],
+            "kernels_disabled_fired": ["layer_norm_fused"],
+        }
+        self.assertEqual(m.dispatch_violations(row, tier, m.OPS["ln"]), [])
+
+    def test_ln_eager_leg_naming_lora_linear_fused_is_still_clean(self):
+        # An AB_OP=ln leg's own requested set only ever names
+        # layer_norm_fused -- lora_linear_fused never appears in it (the
+        # cross-check below is about the COUNTER, not about requested).
+        row = {"leg_id": "x", "arm": "ln_eager", "extra_disable": []}
+        tier = {
+            "ln_fused_dispatches": 0, "ln_eager_dispatches": 4,
+            "lora_linear_fused_dispatches": 1, "lora_linear_eager_dispatches": 0,
+            "kernels_disabled_requested": ["layer_norm_fused"],
+            "kernels_disabled_fired": ["layer_norm_fused"],
+        }
+        self.assertEqual(m.dispatch_violations(row, tier, m.OPS["ln"]), [])
+
+    def test_cross_check_lora_linear_not_fused_on_ln_fused_arm_is_a_violation(self):
+        row = {"leg_id": "x", "arm": "fused", "extra_disable": []}
+        tier = {
+            "ln_fused_dispatches": 1, "ln_eager_dispatches": 0,
+            "lora_linear_fused_dispatches": 0, "lora_linear_eager_dispatches": 3,
+            "kernels_disabled_requested": ["lora_linear_fused"],
+            "kernels_disabled_fired": ["lora_linear_fused"],
+        }
+        vs = m.dispatch_violations(row, tier, m.OPS["ln"])
+        self.assertTrue(any("cross-op invariant failed" in v for v in vs), vs)
+
+    def test_cross_check_lora_linear_not_fused_on_ln_eager_arm_is_a_violation(self):
+        row = {"leg_id": "x", "arm": "ln_eager", "extra_disable": []}
+        tier = {
+            "ln_fused_dispatches": 0, "ln_eager_dispatches": 2,
+            "lora_linear_fused_dispatches": 0, "lora_linear_eager_dispatches": 1,
+            "kernels_disabled_requested": ["layer_norm_fused", "lora_linear_fused"],
+            "kernels_disabled_fired": ["layer_norm_fused", "lora_linear_fused"],
+        }
+        vs = m.dispatch_violations(row, tier, m.OPS["ln"])
+        self.assertTrue(any("cross-op invariant failed" in v for v in vs), vs)
+
+    def test_cross_check_missing_lora_linear_fields_is_a_violation(self):
+        row = {"leg_id": "x", "arm": "fused", "extra_disable": []}
+        tier = {
+            "ln_fused_dispatches": 1, "ln_eager_dispatches": 0,
+            "kernels_disabled_requested": [], "kernels_disabled_fired": [],
+        }
+        vs = m.dispatch_violations(row, tier, m.OPS["ln"])
+        self.assertTrue(any("cross-op invariant fields missing" in v for v in vs), vs)
+
+    def test_ab_op_lora_linear_default_never_runs_the_cross_check(self):
+        # OPS["lora_linear"]'s own cross_check is None -- a leg with no ln_*
+        # fields at all (every pre-#460 fixture) must still be clean.
+        row = {"leg_id": "x", "arm": "fused", "extra_disable": []}
+        tier = {"lora_linear_fused_dispatches": 1, "lora_linear_eager_dispatches": 0,
+                "kernels_disabled_requested": [], "kernels_disabled_fired": []}
+        self.assertEqual(m.dispatch_violations(row, tier, m.OPS["lora_linear"]), [])
+        self.assertEqual(m.dispatch_violations(row, tier), [])
+
+    def test_op_cfg_for_row_defaults_missing_ab_op_to_lora_linear(self):
+        cfg, name = m.op_cfg_for_row({"leg_id": "x"})
+        self.assertEqual(name, "lora_linear")
+        self.assertIs(cfg, m.OPS["lora_linear"])
+
+    def test_op_cfg_for_row_unrecognized_ab_op_returns_none(self):
+        cfg, name = m.op_cfg_for_row({"leg_id": "x", "ab_op": "bogus_op"})
+        self.assertIsNone(cfg)
+        self.assertEqual(name, "bogus_op")
+
+
+class AbOpLnEndToEndTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        os.makedirs(os.path.join(self.root, "raw"), exist_ok=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, rows):
+        write_manifest(self.root, rows)
+        legs = m.build_legs(self.root, rows)
+        m.apply_identity_checks(legs)
+        buckets = m.compute_buckets(legs)
+        return legs, buckets
+
+    def _ln_activate_rows(self):
+        rows = []
+        add_cell(self.root, rows, "bert", m.CONTROL_SHAPE, "control",
+                 repeats=3, walls_n=[1.0, 1.0, 1.0], walls_m=[52.0, 51.0, 51.0],
+                 batch=8, width=512, dtype="f32", ab_op="ln")
+        add_cell(self.root, rows, "bert", m.WIRE_SHAPE, "fused",
+                 repeats=3, walls_n=[1.0, 1.0, 1.0], walls_m=[51.0, 50.0, 51.0],
+                 batch=8, width=512, dtype="f32", ab_op="ln")
+        add_cell(self.root, rows, "bert", m.WIRE_SHAPE, "ln_eager",
+                 repeats=3, walls_n=[1.0, 1.0, 1.0], walls_m=[66.0, 65.0, 65.0],
+                 batch=8, width=512, dtype="f32", ab_op="ln")
+        add_cell(self.root, rows, "bert", m.CHAPTER_SHAPE, "fused",
+                 repeats=3, walls_n=[1.0, 1.0, 1.0], walls_m=[26.0, 25.0, 25.0],
+                 batch=32, width=64, dtype="bf16", ab_op="ln")
+        add_cell(self.root, rows, "bert", m.CHAPTER_SHAPE, "ln_eager",
+                 repeats=3, walls_n=[1.0, 1.0, 1.0], walls_m=[36.0, 35.0, 35.0],
+                 batch=32, width=64, dtype="bf16", ab_op="ln")
+        return rows
+
+    def test_ln_activate_reads_the_same_as_lora_linear_would(self):
+        # `add_cell`'s `ab_op="ln"` walls mirror `EndToEndVerdictTests.
+        # test_activate`'s own `lora_linear` walls exactly -- the verdict
+        # math is IDENTICAL across ops, only the counter base/arm label
+        # differ.
+        rows = self._ln_activate_rows()
+        legs, buckets = self._run(rows)
+        for row in rows:
+            self.assertEqual(row["ab_op"], "ln", row)
+        arms_seen = {leg["row"]["arm"] for leg in legs}
+        self.assertEqual(arms_seen, {"fused", "ln_eager", "control"}, arms_seen)
+        verdict = m.compute_model_verdict("bert", buckets, m.OPS["ln"])
+        self.assertEqual(verdict["verdict"], "ACTIVATE", verdict)
+        for leg in legs:
+            self.assertEqual(leg["violations"], [], leg)
+
+    def test_end_to_end_main_infers_ln_from_the_manifest_and_writes_landing_rule(self):
+        rows = self._ln_activate_rows()
+        write_manifest(self.root, rows)
+        out_path = os.path.join(self.root, "out.json")
+        rc = m.main([self.root, out_path, "--git-sha", "b" * 40, "--box", "unit-test-box"])
+        self.assertEqual(rc, 0)
+        with open(out_path) as f:
+            artifact = json.load(f)
+        self.assertEqual(artifact["ab_op"], "ln")
+        self.assertIn("landing_rule", artifact["notes"])
+        self.assertIn("no activation bar", artifact["notes"]["landing_rule"])
+        self.assertEqual(artifact["notes"]["verdicts"]["bert"]["verdict"], "ACTIVATE")
+        for leg in artifact["legs"]:
+            self.assertEqual(leg["ab_op"], "ln", leg)
+
+    def test_end_to_end_main_explicit_op_flag_matches_inference(self):
+        rows = self._ln_activate_rows()
+        write_manifest(self.root, rows)
+        out_path = os.path.join(self.root, "out.json")
+        rc = m.main([self.root, out_path, "--git-sha", "c" * 40, "--op", "ln"])
+        self.assertEqual(rc, 0)
+        with open(out_path) as f:
+            artifact = json.load(f)
+        self.assertEqual(artifact["ab_op"], "ln")
+
+    def test_lora_linear_artifact_carries_no_landing_rule(self):
+        rows = []
+        add_cell(self.root, rows, "bert", m.CONTROL_SHAPE, "control",
+                 repeats=1, walls_n=[1.0], walls_m=[51.0], batch=8, width=512, dtype="f32")
+        add_cell(self.root, rows, "bert", m.WIRE_SHAPE, "fused",
+                 repeats=1, walls_n=[1.0], walls_m=[51.0], batch=8, width=512, dtype="f32")
+        add_cell(self.root, rows, "bert", m.WIRE_SHAPE, "lora_eager",
+                 repeats=1, walls_n=[1.0], walls_m=[66.0], batch=8, width=512, dtype="f32")
+        write_manifest(self.root, rows)
+        out_path = os.path.join(self.root, "out.json")
+        rc = m.main([self.root, out_path, "--git-sha", "d" * 40])
+        self.assertEqual(rc, 0)
+        with open(out_path) as f:
+            artifact = json.load(f)
+        self.assertEqual(artifact["ab_op"], "lora_linear")
+        self.assertNotIn("landing_rule", artifact["notes"])
+
+    def test_manifest_disagreeing_on_ab_op_refuses(self):
+        rows = []
+        add_cell(self.root, rows, "bert", m.CONTROL_SHAPE, "control",
+                 repeats=1, walls_n=[1.0], walls_m=[51.0], batch=8, width=512, dtype="f32",
+                 ab_op="lora_linear")
+        add_cell(self.root, rows, "bert", m.WIRE_SHAPE, "fused",
+                 repeats=1, walls_n=[1.0], walls_m=[51.0], batch=8, width=512, dtype="f32",
+                 ab_op="ln")
+        write_manifest(self.root, rows)
+        out_path = os.path.join(self.root, "out.json")
+        with self.assertRaises(SystemExit):
+            m.main([self.root, out_path, "--git-sha", "e" * 40])
 
 
 if __name__ == "__main__":

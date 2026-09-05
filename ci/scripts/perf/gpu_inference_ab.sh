@@ -36,8 +36,9 @@
 #
 # ## WHY TWO FULL CLONES, NOT ONE CHECKOUT SWITCHING REFS
 #
-# `ModelInferenceSpec::embed_model_dir`/`::classifier_model_dir`
-# (`crates/jammi-bench/src/model_inference.rs:165-175`) bake
+# `ModelInferenceSpec`'s `embed_model_dir`
+# (`crates/jammi-bench/src/model_inference.rs:165`) and
+# `classifier_model_dir` (`crates/jammi-bench/src/model_inference.rs:172`) bake
 # `env!("CARGO_MANIFEST_DIR")` -- a COMPILE-TIME constant -- into the fixture
 # path each binary reads its committed `config.json`/`model.safetensors`/
 # `tokenizer.json` from, joined against a RELATIVE `../../cookbook/

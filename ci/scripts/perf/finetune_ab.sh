@@ -41,7 +41,7 @@
 #   1. jammi eager   — tip binary, fused ops forced eager (see above).
 #      `JAMMI_KERNELS_STRICT=1` PLUS `--expect-kernels-disabled
 #      $JAMMI_EAGER_DISABLE_OP_KEYS` — the negative control: disable wins
-#      over Strict (`crates/jammi-kernels/src/admission.rs:60-62`), and
+#      over `Strict` (`crates/jammi-kernels/src/admission.rs:60-62`), and
 #      `--expect-kernels-disabled` hard-errors before a single step runs if
 #      `JAMMI_KERNELS_DISABLE` was dropped, mistyped, or not forwarded to
 #      this process — `params.expect_kernels_disabled` (`finetune_step.rs:692-699`)
@@ -176,7 +176,7 @@
 # expectation, checked via the SAME exact-SET-equality
 # `params.expect_kernels_disabled` (`finetune_step.rs:692-699`) machinery
 # the eager leg's own nonempty list uses —
-# `parse_disable_list` (`crates/jammi-kernels/src/admission.rs:684-693`)
+# `parse_disable_list` (`crates/jammi-kernels/src/admission.rs:980-988`)
 # is the empty set for `Some("")`, so
 # this hard-fails the run if `JAMMI_KERNELS_DISABLE` carries ANYTHING at
 # all when this process starts, catching an AMBIENT/leaked env var (a
@@ -326,20 +326,22 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 # nine LIVE, STANDALONE `admit()`/`admit_cascade()`/`op_disabled()` op keys
 # this crate's fused finetune-step call graph actually reaches on a real
 # training step (confirmed at this contract's tip: `layer_norm_fused`
-# `crates/jammi-encoders/src/layer_norm.rs:197`, `geglu_fused`
-# `crates/jammi-encoders/src/modernbert.rs:1862`, `attention_block_flash`
-# `crates/jammi-encoders/src/modernbert.rs:2523` (`op_disabled`, the
+# `crates/jammi-encoders/src/layer_norm.rs:433`, `geglu_fused`
+# `crates/jammi-encoders/src/modernbert.rs:1944`, `attention_block_flash`
+# `crates/jammi-encoders/src/modernbert.rs:2626` (`op_disabled`, the
 # cascade's own capability gate), `attention_block_fused`
-# `crates/jammi-encoders/src/modernbert.rs:1270`, `rope_fused`
-# `crates/jammi-encoders/src/modernbert.rs:566`, `softmax_last_dim_fused`
-# `crates/jammi-encoders/src/modernbert.rs:1791`, `lora_linear_fused`
-# `crates/jammi-lora/src/lora_linear.rs:722`, `adamw_step_fused`
-# `crates/jammi-ai/src/fine_tune/adamw.rs:257`, `mem_efficient_attention`
-# `crates/jammi-encoders/src/modernbert.rs:1233` (`admit_cascade`, the
+# `crates/jammi-encoders/src/modernbert.rs:1348`, `rope_fused`
+# `crates/jammi-encoders/src/modernbert.rs:581`, `softmax_last_dim_fused`
+# `crates/jammi-encoders/src/modernbert.rs:1869`, `lora_linear_fused`
+# `crates/jammi-lora/src/lora_linear.rs:958`, `adamw_step_fused`
+# `crates/jammi-ai/src/fine_tune/adamw.rs:259`, `mem_efficient_attention`
+# `crates/jammi-encoders/src/modernbert.rs:1311` (`admit_cascade`, the
 # per-layer memeff cascade — consulted on EVERY training-mode attention
 # layer once the flash cascade has declined, BEFORE the block arm's own
-# `admit()`) and `:2872` (`op_disabled`, the once-per-forward gate that
-# suppresses the block/eager mask bundle when memeff is going to fire).
+# `admit()`) and `op_disabled`
+# (`crates/jammi-encoders/src/modernbert.rs:2976`) is the once-per-forward
+# gate that suppresses the block/eager mask bundle when memeff is going to
+# fire.
 # `mem_efficient_attention` is the NINTH key, added by adversarial-audit
 # fold-in F4: an EARLIER 8-key version of this constant went undetected
 # because every `finetune_ab.sh` sweep config (`CONFIGS` below) has
@@ -372,7 +374,7 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 # each time this constant changes, the documented manual-sweep protocol
 # the mechanical test's own doc names as its complement.
 #
-#   * NOT `all` — `crates/jammi-kernels/src/admission.rs:169-177`
+#   * NOT `all` (`crates/jammi-kernels/src/admission.rs:169-177`)
 #     disclaims it as whole-registry evidence: `unmatched_disables()`
 #     coming back empty for `JAMMI_KERNELS_DISABLE=all` proves only that AT
 #     LEAST ONE op reached `admit` and was forced eager, never that EVERY
@@ -391,7 +393,8 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 #     `--expect-kernels-disabled`'s own hard check) refuses the run rather
 #     than accepting a name that never fired.
 #   * NOT `lora_epilogue`/`lora_dropout`/`cast_scale_bf16_f32`/
-#     `cast_add_bf16` — `crates/jammi-kernels/src/admission.rs:99-126`:
+#     `cast_add_bf16` — subsumed by `lora_linear_fused`
+#     (`crates/jammi-kernels/src/admission.rs:99-126`):
 #     `lora_epilogue`/`lora_dropout` are REGISTERED but PERMANENTLY DEAD
 #     (their stand-alone call sites were superseded by the fused LoRA
 #     site's single `CustomOp3`, which never calls `admit` for either name
@@ -401,10 +404,10 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 #     caller that wants the whole LoRA site eager. Naming any of the four
 #     directly ABORTS the run — a real, present-in-the-registry op name
 #     that nonetheless never reaches `admit`/`op_disabled` is exactly as
-#     unmatched as a typo
-#     (`crates/jammi-bench/tests/finetune_step_kernel_disable.rs:113`'s
+#     unmatched as a typo —
 #     `kernel_disable_of_a_registered_but_dead_op_name_invalidates_the_run`
-#     proves this against the real CLI).
+#     (`crates/jammi-bench/tests/finetune_step_kernel_disable.rs:112`)
+#     proves this against the real CLI.
 JAMMI_EAGER_DISABLE_OP_KEYS="layer_norm_fused,geglu_fused,attention_block_flash,attention_block_fused,rope_fused,softmax_last_dim_fused,lora_linear_fused,adamw_step_fused,mem_efficient_attention"
 
 AB_DRY_RUN="${AB_DRY_RUN:-0}"

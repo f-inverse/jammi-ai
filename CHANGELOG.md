@@ -56,6 +56,15 @@ workspace ships every publishable crate at the same
   own most recent COMPLETED attempt for the arch (`filter=all`, lazy, cached per run) — a red
   completed attempt sitting behind an in-flight rerun still denies (F5).
 
+### Fixed
+- **BERT-family loader accepts the original Google LayerNorm tensor names (`…LayerNorm.gamma`/
+  `…LayerNorm.beta`) the stock `bert-base-uncased` checkpoint carries (#423).** `LayerNorm::new`
+  (`crates/jammi-encoders/src/layer_norm.rs`) now aliases `gamma`->`weight` and `beta`->`bias` at
+  load time whenever the `VarBuilder` prefix's last `.`-segment is literally `LayerNorm`, matching
+  HF `transformers`' own rule (`modeling_utils.py:4504-4511`), and refuses loudly on a `weight`+
+  `gamma` or `bias`+`beta` collision rather than silently preferring one. Every other LayerNorm call
+  site — any prefix not keyed on a literal `LayerNorm` segment — is unchanged.
+
 ## [0.49.1] - 2026-09-03
 
 A release-engineering patch, shipped in lockstep across the workspace: CUDA

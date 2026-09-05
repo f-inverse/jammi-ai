@@ -8,9 +8,18 @@ LayerNorm affine parameters under the ORIGINAL Google BERT naming --
 `...LayerNorm.gamma` / `...LayerNorm.beta` -- not the `weight`/`bias`
 names every other tensor (and every OTHER framework's loader) uses. HF
 `transformers` silently aliases `gamma`->`weight` and `beta`->`bias` on
-load; jammi's own loader does not (that engine-side gap is filed
-separately -- this script is the tracked, deterministic workaround so a
-stock checkpoint can be loaded at all, never a fix to the loader itself).
+load. jammi's own loader now does too: `LayerNorm::new`
+(`crates/jammi-encoders/src/layer_norm.rs`, GH #423) aliases the legacy
+names at load time, matching HF's own rule
+(`modeling_utils.py:4504-4511`) and refusing loudly on a `weight`+`gamma`
+or `bias`+`beta` collision. This script remains the OFFLINE normalizer --
+for tools that read the safetensors file directly rather than through
+jammi's loader, and for producing a modern-named copy on disk. The two
+differ at their boundary: this script renames ANY tensor name ending in
+the literal suffix `.gamma`/`.beta` regardless of its prefix, while the
+loader's alias only fires at a prefix whose LAST `.`-segment is literally
+`LayerNorm` (HF's own rule) -- a narrower, load-time-only condition this
+script does not replicate.
 
 Renames every tensor name ending in the literal suffix `.gamma`
 (-> `.weight`) or `.beta` (-> `.bias`) -- `str.endswith`, suffix-anchored:

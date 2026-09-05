@@ -373,17 +373,30 @@ extern "C" __global__ void layer_norm_cast_f32_to_bf16(
 // `xhat * gamma[i] + beta[i]` expression (an FMA-eligible form), never a
 // `+ 0.0f` sentinel that would defeat fusion into the mul.
 //
-// Each per-dtype row body is a `template <bool HAS_BETA>` — ONE shared
-// `__device__ __forceinline__` definition per dtype family, specialised at
-// COMPILE TIME (never a runtime null-pointer branch) so the biased and
-// bias-free kernel families share one row-math definition per dtype
-// without either paying for the other's branch. Only the `HAS_BETA = true`
-// instantiation is ever emitted as a kernel below — `LayerNormBiasedFused`
+// Each per-dtype row body below is its OWN `template <bool HAS_BETA>`
+// `__device__ __forceinline__` definition, specialised at COMPILE TIME
+// (never a runtime null-pointer branch) — NOT shared with the pre-existing
+// bias-free row body above this comment block. Because the bias-free
+// kernels above are byte-untouched (this block's own opening claim), their
+// mean/var reduction is a SEPARATE, textually duplicated copy from this
+// template's `HAS_BETA = false` arithmetic path — an accepted drift
+// surface: a future change to one row-math body (e.g. a different
+// reduction order) will NOT automatically propagate to the other, and
+// nothing here enforces they stay in sync beyond this file's own review
+// and the CPU<->CUDA parity suite (`cuda_parity.rs`) exercising both. This
+// duplication is the direct, deliberate cost of the bit-identity-by-
+// construction guarantee this block's opening comment makes: keeping the
+// pre-existing kernel bytes untouched (provable via `git diff`) requires
+// NOT refactoring it into a shared template the new kernel also
+// instantiates. Only the `HAS_BETA = true` instantiation of this NEW
+// template is ever emitted as a kernel below — `LayerNormBiasedFused`
 // (`../ops/layer_norm.rs`) is a `CustomOp3` with a REQUIRED (non-nullable)
-// `beta` tensor, so a `HAS_BETA = false` instantiation of these templates
-// has no caller today; the template stays generic (not hand-monomorphised
-// to `true`) so a future nullable-beta caller costs no kernel-body rewrite,
-// only a new `extern "C"` wrapper.
+// `beta` tensor, so a `HAS_BETA = false` instantiation has no caller
+// today; the template stays generic (not hand-monomorphised to `true`) so
+// a future nullable-beta caller costs no kernel-body rewrite, only a new
+// `extern "C"` wrapper — it would NOT, by itself, deduplicate the two row
+// bodies, since the bias-free kernel above would still need to be
+// rewritten to call this template instead of its own inline arithmetic.
 // ---------------------------------------------------------------------
 
 template <bool HAS_BETA>

@@ -833,6 +833,9 @@ mod tests {
     /// correctness claim).
     #[test]
     fn clip_text_training_ln_dispatch_is_now_counted() {
+        let _guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let cfg = tiny_config();
         let device = Device::Cpu;
         let varmap = VarMap::new();
@@ -846,10 +849,10 @@ mod tests {
         let _ = model.forward(&input_ids, &mask).unwrap();
         let after = crate::ln_dispatch_snapshot();
         assert!(
-            after.fused > before.fused,
+            after.fused > before.fused && after.eager == before.eager,
             "CLIP-text's biased LayerNorms must dispatch the fused `layer_norm_fused` key \
-             at training=true, not fall through slow() uncounted (before={before:?}, \
-             after={after:?})"
+             at training=true, not fall through slow() uncounted, and must never fall back \
+             to eager (before={before:?}, after={after:?})"
         );
     }
 

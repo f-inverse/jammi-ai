@@ -39,6 +39,22 @@
 //! predicate either falls back with a log-once WARN or, in `Strict` mode
 //! ([`admission_mode`]), errors instead of silently falling back.
 //!
+//! **Advisory (round 1 of #460's fix, pressure-test finding):** under
+//! `Strict` mode, a Metal `x` tensor now surfaces as a typed
+//! `EncoderError::Kernel(StrictModeFallback)` from `forward()` itself,
+//! where it previously (in the only mode this crate exercised end-to-end
+//! before this round) silently took `slow()` — Metal fails
+//! `device_is_supported` unconditionally, so its own admission predicate
+//! never holds, and `Strict` mode's whole POINT is to refuse a
+//! non-holding predicate rather than degrade quietly. This was always
+//! `admit()`'s documented behavior, but nothing end-to-end (through
+//! `LayerNorm::forward`, not `admit()` directly) proved it until
+//! `tests::layer_norm_forward_biased_strict_mode_surfaces_a_typed_error_in_a_fresh_process`
+//! — a maintainer adding real Metal support to this op later should
+//! expect `Strict` mode to reject it exactly like any other failed
+//! predicate, not to silently fall back the way `Fallback` mode (the
+//! default) does.
+//!
 //! Before #460, every biased LayerNorm (BERT, DistilBERT, CLIP-text)
 //! trained through `slow()` unconditionally, with NO `admit()` call and NO
 //! dispatch counter at all — a BERT finetune run's own `ln` counter pair
@@ -111,6 +127,18 @@ use crate::error::EncoderError;
 /// durable job record or a bench report uses.
 pub static LN_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
     LazyLock::new(|| counters_for("layer_norm_fused"));
+
+/// Test-only serialization for two-sided (`fused` advanced AND `eager`
+/// unchanged) assertions against [`LN_DISPATCH_COUNTERS`]: it is one
+/// process-wide static shared by every `#[test]` in this crate's unit-test
+/// binary (`src/layer_norm.rs`'s own `mod tests` and `src/clip_text.rs`'s),
+/// so an exact-equality read of its `eager` half is racy under the default
+/// parallel test runner unless the read is exclusive. Mirrors
+/// `crate::modernbert::DISPATCH_COUNTER_TEST_LOCK`'s SAME rationale for the
+/// SEPARATE `tests/it` integration binary — that lock lives in a different
+/// process and cannot serialize this one.
+#[cfg(test)]
+pub(crate) static DISPATCH_COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The fused kernel's domain, checked at the call site (family D / K2):
 /// `x` and `weight` live on a device [`device_is_supported`] accepts,
@@ -534,6 +562,21 @@ impl LayerNorm {
             None => fused_admission_predicate(x, &self.weight),
             Some(b) => fused_admission_predicate_biased(x, &self.weight, b),
         };
+        // Gate ordering (family D / adversarial advisory 6): evaluate
+        // `affine_needed_gate` for weight (and bias, when present) BEFORE
+        // `admit()`. A tracked-but-not-`Var` affine parameter is a typed
+        // refusal (`EncoderError::Config`, not a panic) — if that refusal
+        // fired AFTER `admit()` already recorded a `Fused` dispatch, the
+        // `ln` fused counter would advance for a call that never actually
+        // ran the kernel: a phantom dispatch a counter-based dispatch
+        // assertion cannot distinguish from a real one. Evaluating first
+        // and propagating via `?` means a refusal here never touches
+        // [`LN_DISPATCH_COUNTERS`] at all.
+        let dgamma_needed = affine_needed_gate(&self.weight, "weight")?;
+        let dbeta_needed = match bias {
+            Some(b) => Some(affine_needed_gate(b, "bias")?),
+            None => None,
+        };
         let outcome = admit(
             admission_mode(),
             "layer_norm_fused",
@@ -546,7 +589,7 @@ impl LayerNorm {
                 None => Ok(apply2(
                     x,
                     &self.weight,
-                    LayerNormFused::new(self.eps, affine_needed_gate(&self.weight, "weight")?),
+                    LayerNormFused::new(self.eps, dgamma_needed),
                 )?),
                 Some(b) => Ok(apply3(
                     x,
@@ -554,8 +597,9 @@ impl LayerNorm {
                     b,
                     LayerNormBiasedFused::new(
                         self.eps,
-                        affine_needed_gate(&self.weight, "weight")?,
-                        affine_needed_gate(b, "bias")?,
+                        dgamma_needed,
+                        dbeta_needed
+                            .expect("bias.is_some() above means dbeta_needed was computed as Some"),
                     ),
                 )?),
             },
@@ -909,12 +953,87 @@ mod tests {
         assert!(matches!(err, EncoderError::Config(_)));
     }
 
+    /// End-to-end (adversarial F5 / gate-ordering advisory 6): a
+    /// tracked-but-not-`Var` gamma reaches [`LayerNorm::forward`]'s
+    /// bias-free `(None, true)` fused-or-fallback arm on a fixture that
+    /// WOULD satisfy the fused admission domain (bf16, contiguous, hidden
+    /// well within `MAX_HIDDEN`) — the domain predicate alone would say
+    /// "fused". The refusal must still surface as a typed
+    /// `EncoderError::Config` from `LayerNorm::forward` itself, AND
+    /// [`LN_DISPATCH_COUNTERS`] must be UNTOUCHED (both `fused` and
+    /// `eager`) — proving `affine_needed_gate` is evaluated, and its error
+    /// propagated, strictly BEFORE `admit()` ever runs, not merely that
+    /// the call fails somewhere before returning a tensor. Before the
+    /// gate-ordering fix this test proves, `admit()` ran FIRST and would
+    /// have already recorded a `Fused` dispatch that never actually
+    /// produced an output — a phantom dispatch this counter-based
+    /// assertion is built to catch.
+    #[test]
+    fn tracked_non_var_gamma_through_forward_is_a_typed_refusal_with_counters_untouched() {
+        let _guard = DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let hidden = 8;
+        let gv: Vec<bf16> = (0..hidden)
+            .map(|i| bf16::from_f32(1.0 + i as f32 * 0.05))
+            .collect();
+        let xv: Vec<bf16> = (0..hidden)
+            .map(|i| bf16::from_f32(i as f32 * 0.37 - 1.2))
+            .collect();
+        let x = Tensor::from_slice(&xv, (1, hidden), &device).unwrap();
+
+        // The SAME "cast to a DIFFERENT dtype, then back" idiom as
+        // `affine_needed_gate_tracked_non_var_is_a_typed_refusal_not_a_panic`,
+        // round-tripped back to bf16 so the RESULT dtype matches `x` and
+        // the fused domain predicate reports eligible — isolating the
+        // affine gate as the ONLY reason this call can fail.
+        let weight_var =
+            Var::from_tensor(&Tensor::from_slice(&gv, (hidden,), &device).unwrap()).unwrap();
+        let tracked_f32 = weight_var.as_tensor().to_dtype(DType::F32).unwrap();
+        let tracked_bf16 = tracked_f32.to_dtype(DType::BF16).unwrap();
+        assert!(!tracked_bf16.is_variable(), "fixture must not be a Var");
+        assert!(tracked_bf16.track_op(), "fixture must actually be tracked");
+        assert_eq!(tracked_bf16.dtype(), DType::BF16);
+
+        let (holds, predicate) = fused_admission_predicate(&x, &tracked_bf16);
+        assert!(
+            holds,
+            "fixture must satisfy the fused domain: {predicate} -- the test proves the \
+             affine gate refuses it anyway, not that the domain predicate happens to fail"
+        );
+
+        let mut ln = LayerNorm {
+            weight: tracked_bf16,
+            bias: None,
+            eps: 1e-5,
+            training: true,
+        };
+        ln.set_training(true);
+
+        let before = LN_DISPATCH_COUNTERS.snapshot();
+        let err = ln
+            .forward(&x)
+            .expect_err("a tracked non-Var gamma must be a typed refusal, not a silent dispatch");
+        let after = LN_DISPATCH_COUNTERS.snapshot();
+        assert!(matches!(err, EncoderError::Config(_)));
+        assert_eq!(
+            (after.fused, after.eager),
+            (before.fused, before.eager),
+            "the typed refusal must never touch either dispatch counter \
+             (before={before:?}, after={after:?})"
+        );
+    }
+
     /// End-to-end: a trainable `Var` bias on a bias-carrying, otherwise
     /// fused-eligible training LayerNorm must populate a real `dbeta`
     /// gradient AND be counted on the SAME `ln` fused counter the
     /// bias-free path uses.
     #[test]
     fn biased_training_with_a_var_bias_counts_fused_and_populates_dbeta() {
+        let _guard = DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
         let hidden = 4;
         let rows = 2;
@@ -939,9 +1058,9 @@ mod tests {
         let out = ln.forward(x.as_tensor()).unwrap();
         let after = LN_DISPATCH_COUNTERS.snapshot();
         assert!(
-            after.fused > before.fused,
-            "a Var bias must not prevent the fused biased dispatch (before={before:?}, \
-             after={after:?})"
+            after.fused > before.fused && after.eager == before.eager,
+            "a Var bias must not prevent the fused biased dispatch, and must never fall back \
+             to eager (before={before:?}, after={after:?})"
         );
 
         let grads = out.sum_all().unwrap().backward().unwrap();
@@ -1057,6 +1176,9 @@ mod tests {
     /// tolerance.
     #[test]
     fn biased_layer_norm_training_now_dispatches_fused_eval_is_unaffected() {
+        let _guard = DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
         let hidden = 8;
         let weight = Tensor::from_slice(&[1.3f32; 8], (hidden,), &device).unwrap();
@@ -1090,8 +1212,8 @@ mod tests {
             .unwrap();
         let after = LN_DISPATCH_COUNTERS.snapshot();
         assert!(
-            after.fused > before.fused,
-            "biased training must dispatch the fused kernel, not fall back to slow() \
+            after.fused > before.fused && after.eager == before.eager,
+            "biased training must dispatch the fused kernel, and never fall back to eager \
              (before={before:?}, after={after:?})"
         );
 
@@ -1102,6 +1224,32 @@ mod tests {
             .unwrap()
             .to_vec1()
             .unwrap();
+        // Bound derivation (acceptance advisory, family J): `1e-4` is not a
+        // round hand-picked number — it is a generous (~5x) margin over an
+        // f32-fold-order bound derived from Higham (2002) Thm 4.2 for this
+        // EXACT fixture. Thm 4.2: summing `n` floating-point terms in ANY
+        // fixed order (fused's ascending-index row loop vs `slow()`'s
+        // candle-composed `sum_keepdim`/`broadcast_*` tree — a DIFFERENT
+        // fold order, not a wider/narrower one) bounds the computed sum's
+        // absolute error by `(n-1) * u * Σ|x_i| + O(u²)`, `u` = f32 unit
+        // roundoff ≈ 1.1921e-7 (`2^-23`). Two independent `n = hidden = 8`
+        // reductions feed this op: `mean = Σx_i / 8` over `Σ|x_i| = 8.5`
+        // (this fixture's own `x`), giving `(8-1) * 1.1921e-7 * 8.5 ≈
+        // 7.09e-6`; and `var = Σ(x_i-mean)² / 8` over `Σ(x_i-mean)² ≈
+        // 12.09` (this fixture's own deviations), giving `(8-1) * 1.1921e-7
+        // * 12.09 ≈ 1.01e-5`. The variance error propagates through
+        // `invvar = 1/sqrt(var+eps)` with local sensitivity `|d(invvar)/
+        // d(var)| = 0.5*(var+eps)^-1.5 ≈ 0.5 * 1.512^-1.5 ≈ 0.269` here,
+        // contributing `≈ 0.269 * 1.01e-5 ≈ 2.7e-6` to `invvar`'s own
+        // error; that then scales `xhat * gamma` (`|xhat| ≤ 1.48`, `gamma =
+        // 1.3` on this fixture) by roughly `1.48 * 1.3 * 2.7e-6 ≈ 5.2e-6`.
+        // Summing every term (mean's own propagated contribution through
+        // `xhat`, plus the two above) stays on the order of `1e-5` for
+        // THIS fixture's magnitude — `1e-4` is therefore a ~5-10x safety
+        // margin over the derived bound, tight enough to still catch a
+        // real defect (every forced-defect leg in `cuda_parity.rs` diverges
+        // by orders of magnitude more than this), not a number chosen to
+        // make the test pass.
         for (i, (o, e)) in out_training
             .iter()
             .zip(expected_training.iter())
@@ -1110,7 +1258,8 @@ mod tests {
             assert!(
                 (o - e).abs() < 1e-4,
                 "fused[{i}] = {o} vs slow()[{i}] = {e} (rule 15: fold-order divergence, \
-                 not a defect — must stay within a tight tolerance, not bit-exact)"
+                 not a defect — see this loop's own bound-derivation comment above; must \
+                 stay within a tight tolerance, not bit-exact)"
             );
         }
 
@@ -2294,6 +2443,99 @@ mod tests {
                 predicate: "x_contiguous"
             }
         ));
+    }
+
+    /// #460 round-1 item 5b: `JAMMI_KERNELS_STRICT`-mode driven through
+    /// [`LayerNorm::forward`] ITSELF (not `admit()` directly, unlike
+    /// [`strict_mode_errors_instead_of_falling_back_on_a_failed_predicate`]
+    /// above) on the BIASED arm, with a mismatched-dtype bias making the
+    /// fused domain predicate fail. `admission_mode()` memoizes into a
+    /// process-wide `OnceLock` inside `jammi_kernels` (the exact hazard
+    /// that test's own doc names) — mirroring `jammi_kernels::admission`'s
+    /// own `admission_mode_reads_strict_from_the_real_env_var_in_a_fresh_process`,
+    /// this spawns a fresh CHILD process of this ALREADY-COMPILED test
+    /// binary, `--exact`-targeted at
+    /// [`layer_norm_forward_biased_strict_mode_child_process_body`] below,
+    /// which is the only way to observe a real `JAMMI_KERNELS_STRICT=1`
+    /// env var read deterministically rather than racing every other test
+    /// in this binary for who initializes the `OnceLock` first.
+    #[test]
+    fn layer_norm_forward_biased_strict_mode_surfaces_a_typed_error_in_a_fresh_process() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(exe)
+            .args([
+                "layer_norm::tests::layer_norm_forward_biased_strict_mode_child_process_body",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("JAMMI_KERNELS_STRICT", "1")
+            .env("LN_FORWARD_STRICT_CHILD", "1")
+            .output()
+            .expect("spawn child test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "child process assertion failed: stdout={stdout}\nstderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Non-vacuity (family F): a filter matching zero tests still exits
+        // 0 — assert the child actually ran (and passed) exactly the one
+        // test it was told to run.
+        assert!(
+            stdout.contains("1 passed"),
+            "the child process must have actually run (and passed) exactly one test -- \
+             stdout={stdout}"
+        );
+    }
+
+    /// Only meaningful inside the child process the test above spawns
+    /// (`LN_FORWARD_STRICT_CHILD` set) — a silent no-op otherwise, so a
+    /// stray direct `cargo test` run of this exact name (without the real
+    /// `JAMMI_KERNELS_STRICT=1` env var already having won the `OnceLock`
+    /// race) never produces a false pass OR a false fail.
+    #[test]
+    fn layer_norm_forward_biased_strict_mode_child_process_body() {
+        // Positive-condition guard, no early `return` — mirrors
+        // `jammi_kernels::admission::tests::admission_mode_child_process_body`'s
+        // exact idiom (a stray direct run of this exact test name outside
+        // the child process above is then simply a no-op assertion-free
+        // pass, never a false RED).
+        if std::env::var_os("LN_FORWARD_STRICT_CHILD").is_some() {
+            let device = Device::Cpu;
+            let hidden = 8;
+            let x = Tensor::from_slice(&[0.1f32; 8], (1, hidden), &device).unwrap();
+            let weight = Tensor::from_slice(&[1.0f32; 8], (hidden,), &device).unwrap();
+            // Mismatched dtype vs x/weight (bf16 bias against an F32
+            // x/weight pair) fails the fused domain predicate
+            // (`dtype_f32_bf16_or_f16_matching_between_x_and_bias`); in
+            // Strict mode that failure must surface as a typed error
+            // through `forward()` itself rather than silently falling
+            // back to `slow()`.
+            let bias_bf16 =
+                Tensor::from_slice(&[bf16::from_f32(0.2); 8], (hidden,), &device).unwrap();
+            let (holds, predicate) = fused_admission_predicate_biased(&x, &weight, &bias_bf16);
+            assert!(!holds, "fixture must actually fail the domain: {predicate}");
+
+            let mut ln = LayerNorm {
+                weight,
+                bias: Some(bias_bf16),
+                eps: 1e-5,
+                training: true,
+            };
+            ln.set_training(true);
+            let err = ln
+                .forward(&x)
+                .expect_err("Strict mode must error on a failed predicate, not silently fall back");
+            assert!(
+                matches!(
+                    err,
+                    EncoderError::Kernel(
+                        jammi_kernels::error::KernelError::StrictModeFallback { .. }
+                    )
+                ),
+                "expected a typed StrictModeFallback wrapped in EncoderError::Kernel, got {err:?}"
+            );
+        }
     }
 
     /// The admission/counter key this crate dispatches a fused path under

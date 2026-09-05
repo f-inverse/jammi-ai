@@ -50,7 +50,7 @@ modernbert.rs:2571/2582/2748`, can never be mistaken for a real attribute
 either — and balance braces from there to the item's own close; the audit
 named two REAL, in-scope test call sites this excludes,
 `strict_mode_errors_instead_of_falling_back_on_a_failed_predicate`
-(`crates/jammi-encoders/src/layer_norm.rs:1945`) and
+(`crates/jammi-encoders/src/layer_norm.rs:2418`) and
 `attention_block_strict_mode_errors_instead_of_falling_back_on_a_failed_predicate`
 (`crates/jammi-encoders/src/modernbert.rs:11170`), both `admit(AdmissionMode::Strict, "<a key
 already found at its own production site>", ...)` calls that exist purely

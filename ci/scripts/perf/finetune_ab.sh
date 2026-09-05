@@ -41,7 +41,7 @@
 #   1. jammi eager   — tip binary, fused ops forced eager (see above).
 #      `JAMMI_KERNELS_STRICT=1` PLUS `--expect-kernels-disabled
 #      $JAMMI_EAGER_DISABLE_OP_KEYS` — the negative control: disable wins
-#      over `Strict` (`crates/jammi-kernels/src/admission.rs:60-62`), and
+#      over `Strict` (`crates/jammi-kernels/src/admission.rs:62-64`), and
 #      `--expect-kernels-disabled` hard-errors before a single step runs if
 #      `JAMMI_KERNELS_DISABLE` was dropped, mistyped, or not forwarded to
 #      this process — `params.expect_kernels_disabled` (`finetune_step.rs:692-699`)
@@ -176,7 +176,7 @@
 # expectation, checked via the SAME exact-SET-equality
 # `params.expect_kernels_disabled` (`finetune_step.rs:692-699`) machinery
 # the eager leg's own nonempty list uses —
-# `parse_disable_list` (`crates/jammi-kernels/src/admission.rs:980-988`)
+# `parse_disable_list` (`crates/jammi-kernels/src/admission.rs:982-990`)
 # is the empty set for `Some("")`, so
 # this hard-fails the run if `JAMMI_KERNELS_DISABLE` carries ANYTHING at
 # all when this process starts, catching an AMBIENT/leaked env var (a
@@ -326,7 +326,7 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 # nine LIVE, STANDALONE `admit()`/`admit_cascade()`/`op_disabled()` op keys
 # this crate's fused finetune-step call graph actually reaches on a real
 # training step (confirmed at this contract's tip: `layer_norm_fused`
-# `crates/jammi-encoders/src/layer_norm.rs:433`, `geglu_fused`
+# `crates/jammi-encoders/src/layer_norm.rs:582`, `geglu_fused`
 # `crates/jammi-encoders/src/modernbert.rs:1944`, `attention_block_flash`
 # `crates/jammi-encoders/src/modernbert.rs:2626` (`op_disabled`, the
 # cascade's own capability gate), `attention_block_fused`
@@ -394,7 +394,7 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 #     than accepting a name that never fired.
 #   * NOT `lora_epilogue`/`lora_dropout`/`cast_scale_bf16_f32`/
 #     `cast_add_bf16` — subsumed by `lora_linear_fused`
-#     (`crates/jammi-kernels/src/admission.rs:99-126`):
+#     (`crates/jammi-kernels/src/admission.rs:101-115`):
 #     `lora_epilogue`/`lora_dropout` are REGISTERED but PERMANENTLY DEAD
 #     (their stand-alone call sites were superseded by the fused LoRA
 #     site's single `CustomOp3`, which never calls `admit` for either name

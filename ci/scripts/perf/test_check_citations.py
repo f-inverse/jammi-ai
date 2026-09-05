@@ -36,14 +36,25 @@ class CheckCitationsFixture(unittest.TestCase):
         self._orig_perf_full_path_exclude = cc._PERF_FULL_PATH_EXCLUDE
         self._orig_crate_comment_roots = cc._CRATE_COMMENT_ROOTS
         self._orig_repo_root = cc.REPO_ROOT
-        # `_CRATE_COMMENT_ROOTS` defaults to the REAL `crates/` tree (module
-        # scope), which every OTHER root here is protected from by an
-        # explicit per-test monkeypatch onto a throwaway fixture -- reset
-        # to empty by default so a test that calls `cc.main()` without
-        # itself opting into the new crate-comment scope is never silently
-        # coupled to this repo's own (still-drifting, not-yet-fixed) real
-        # crate citations. A test exercising the new scope explicitly
-        # re-points this at its own fixture directory.
+        # Every root-scanning tuple defaults to the REAL repo tree (module
+        # scope) -- reset ALL FIVE of them to empty here, not just
+        # `_CRATE_COMMENT_ROOTS`: a test driving `cc.main()` (a full
+        # `_iter_source_files()` walk, never a single `check_file(path)`
+        # call) is otherwise silently coupled to this repo's OWN
+        # (constantly drifting) real citation inventory the moment it
+        # forgets to override one of these tuples -- `_set_target` only
+        # ever repointed `_SEARCH_ROOTS`, leaving `_DOC_SEARCH_ROOTS`/
+        # `_PERF_FULL_PATH_ROOTS` aimed at this repo's real
+        # `docs/maintainer`/`ci/scripts/perf` trees, so a real stale cite
+        # anywhere in either one failed 3 unrelated `main()`-driving tests
+        # in this suite that were never about that scope at all. This
+        # suite must be green regardless of what this repo's own citations
+        # currently say. A test exercising one of these scopes explicitly
+        # re-points its own tuple at its own throwaway fixture directory
+        # (see `_repo_fixture`/`_perf_fixture`/`_crate_fixture` below).
+        cc._SEARCH_ROOTS = ()
+        cc._DOC_SEARCH_ROOTS = ()
+        cc._PERF_FULL_PATH_ROOTS = ()
         cc._CRATE_COMMENT_ROOTS = ()
         self.addCleanup(self._restore)
 
@@ -619,17 +630,23 @@ class ShallowCheckoutRefusalTests(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self._orig_known_files = cc._KNOWN_FILES
         self._orig_roots = cc._SEARCH_ROOTS
+        self._orig_doc_roots = cc._DOC_SEARCH_ROOTS
+        self._orig_perf_full_path_roots = cc._PERF_FULL_PATH_ROOTS
         self._orig_crate_comment_roots = cc._CRATE_COMMENT_ROOTS
         self._orig_git_repo_root = cc._GIT_REPO_ROOT
         # Same isolation `CheckCitationsFixture` applies -- see its own
-        # comment for why `_CRATE_COMMENT_ROOTS` needs an explicit reset
-        # where every other root here is already reset by construction.
+        # comment for why ALL FIVE root-scanning tuples need an explicit
+        # reset, not just `_SEARCH_ROOTS`.
+        cc._DOC_SEARCH_ROOTS = ()
+        cc._PERF_FULL_PATH_ROOTS = ()
         cc._CRATE_COMMENT_ROOTS = ()
         self.addCleanup(self._restore)
 
     def _restore(self):
         cc._KNOWN_FILES = self._orig_known_files
         cc._SEARCH_ROOTS = self._orig_roots
+        cc._DOC_SEARCH_ROOTS = self._orig_doc_roots
+        cc._PERF_FULL_PATH_ROOTS = self._orig_perf_full_path_roots
         cc._CRATE_COMMENT_ROOTS = self._orig_crate_comment_roots
         cc._GIT_REPO_ROOT = self._orig_git_repo_root
 
@@ -987,6 +1004,241 @@ class CrateCommentFullPathTests(CheckCitationsFixture):
         crates_dir = cc.REPO_ROOT / "crates"
         self.assertIn(crates_dir, self._orig_crate_comment_roots)
         self.assertTrue(crates_dir.is_dir())
+
+
+class RustCommentLexerShapeTests(CheckCitationsFixture):
+    """`_rust_comment_line_spans`'s char-literal / raw-string / block-
+    comment / doc-attribute modeling — the adversarial-lexer fix round.
+    Every "must be scanned" case is proven the STRICT way (a STALE
+    `Violation`, never a silent zero), so a lexer regression that goes back
+    to simply not scanning the line at all cannot misread as "passing"
+    here — the exact class of bug this fix round closes (a `'"'` char
+    literal opening a phantom string that silently swallowed every real
+    comment line after it until the next unrelated `"`, dozens of lines at
+    a time in this repo's own `crates/jammi-encoders/src/layer_norm.rs`).
+    """
+
+    def _crate_fixture(self, target_body: str, source_body: str) -> Path:
+        self._write("crates/jammi-other/src/target.rs", target_body)
+        source = self._write("crates/jammi-some/src/lib.rs", source_body)
+        self._write("unrelated.rs", "nothing\n")
+        cc._KNOWN_FILES = {"unrelated.rs": self.root / "unrelated.rs"}
+        cc.REPO_ROOT = self.root
+        cc._SEARCH_ROOTS = ()
+        cc._DOC_SEARCH_ROOTS = ()
+        cc._CRATE_COMMENT_ROOTS = (self.root / "crates",)
+        return source
+
+    def test_a_char_literal_double_quote_does_not_open_a_phantom_string(self):
+        """THE REGRESSION this fix closes: `'"'` has no closing `"` inside
+        it to pair against, so treating it as an ordinary string-open left
+        the lexer "inside a string" until the next unrelated `"` anywhere
+        later in the file -- silently dropping every real comment line in
+        between from the scan entirely."""
+        source = self._crate_fixture(
+            "line one\nfn totally_different() {}\n",
+            "fn f() {\n    let c = '\"';\n    /// `real_thing` (`crates/jammi-other/src/target.rs:2`)\n}\n",
+        )
+        violations = cc.check_file(source)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("STALE", violations[0].message)
+
+    def test_a_byte_char_literal_double_quote_does_not_open_a_phantom_string(self):
+        """The `b'"'` byte-char form hits the identical phantom-string
+        hazard -- the `b` prefix must not change the char-literal
+        detection."""
+        source = self._crate_fixture(
+            "line one\nfn totally_different() {}\n",
+            "fn f() {\n    let c = b'\"';\n    // `real_thing` (`crates/jammi-other/src/target.rs:2`)\n}\n",
+        )
+        violations = cc.check_file(source)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("STALE", violations[0].message)
+
+    def test_a_citation_after_a_char_literal_still_resolves_when_true(self):
+        """The positive control for the two tests above: the SAME shape,
+        but with a citation that IS true -- proving the fix does not just
+        fail loudly on a stale citation, it correctly resolves a true one
+        too, round-tripping through the real lexer end to end."""
+        source = self._crate_fixture(
+            "line one\nfn real_thing() {}\n",
+            "fn f() {\n    let c = '\"';\n    /// `real_thing` (`crates/jammi-other/src/target.rs:2`)\n}\n",
+        )
+        self.assertEqual(cc.check_file(source), [])
+
+    def test_a_path_line_inside_a_raw_string_is_ignored(self):
+        """A `path:line`-shaped, backtick-quoted citation living inside a
+        `r#"..."#` raw string is NEVER a citation -- proven the STRICT way:
+        the embedded identifier does not match `target.rs`'s real content,
+        so if the raw string's content leaked into the comment scan this
+        would resolve as a STALE `Violation`, not silently pass for an
+        unrelated reason."""
+        source = self._crate_fixture(
+            "line one\nfn totally_unrelated() {}\n",
+            'let s = r#"see `real_thing` (`crates/jammi-other/src/target.rs:2`)"#;\n',
+        )
+        self.assertEqual(cc.check_file(source), [])
+
+    def test_an_outer_doc_block_comment_content_is_scanned(self):
+        """`/** ... */` (exactly two asterisks opening) is a doc comment --
+        its content is scanned exactly like a `///` line."""
+        source = self._crate_fixture(
+            "line one\nfn totally_different() {}\n",
+            "/** `real_thing` (`crates/jammi-other/src/target.rs:2`) */\n",
+        )
+        violations = cc.check_file(source)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("STALE", violations[0].message)
+
+    def test_an_inner_doc_block_comment_content_is_scanned(self):
+        """`/*! ... */` (inner doc) is scanned exactly like `//!`."""
+        source = self._crate_fixture(
+            "line one\nfn totally_different() {}\n",
+            "/*! `real_thing` (`crates/jammi-other/src/target.rs:2`) */\n",
+        )
+        violations = cc.check_file(source)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("STALE", violations[0].message)
+
+    def test_a_plain_block_comment_content_is_not_scanned(self):
+        """An ordinary `/* ... */` (no `!`, exactly one leading `*`, i.e.
+        not a doc comment) is NOT scanned -- proven the STRICT way: the
+        embedded citation is stale, so silence here proves it was never
+        read, not that it happened to resolve."""
+        source = self._crate_fixture(
+            "line one\nfn totally_different() {}\n",
+            "/* `real_thing` (`crates/jammi-other/src/target.rs:2`) */\n",
+        )
+        self.assertEqual(cc.check_file(source), [])
+
+    def test_a_triple_star_block_comment_is_not_a_doc_comment(self):
+        """`/***` (three or more asterisks) mirrors `////` for line
+        comments -- a regular, non-doc block comment by Rust's own rule,
+        never scanned."""
+        source = self._crate_fixture(
+            "line one\nfn totally_different() {}\n",
+            "/*** `real_thing` (`crates/jammi-other/src/target.rs:2`) */\n",
+        )
+        self.assertEqual(cc.check_file(source), [])
+
+    def test_an_empty_block_comment_does_not_crash_or_misparse(self):
+        """`/**/` (four characters -- no room for both a 3-char `/**`
+        marker and a distinct 2-char `*/` closer) is the ordinary, empty,
+        non-doc block comment, never a doc comment with malformed
+        (negative-length) span arithmetic."""
+        source = self._crate_fixture(
+            "line one\nfn real_thing() {}\n",
+            "/**/\n// `real_thing` (`crates/jammi-other/src/target.rs:2`)\n",
+        )
+        self.assertEqual(cc.check_file(source), [])
+
+    def test_a_doc_attribute_string_is_scanned(self):
+        """`#[doc = "..."]` -- the desugared form `///` compiles to -- has
+        its string content scanned as doc text."""
+        source = self._crate_fixture(
+            "line one\nfn totally_different() {}\n",
+            '#[doc = "`real_thing` (`crates/jammi-other/src/target.rs:2`)"]\nfn f() {}\n',
+        )
+        violations = cc.check_file(source)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("STALE", violations[0].message)
+
+    def test_an_inner_doc_attribute_string_is_scanned(self):
+        """`#![doc = "..."]` -- the desugared form `//!` compiles to."""
+        source = self._crate_fixture(
+            "line one\nfn totally_different() {}\n",
+            '#![doc = "`real_thing` (`crates/jammi-other/src/target.rs:2`)"]\n',
+        )
+        violations = cc.check_file(source)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("STALE", violations[0].message)
+
+    def test_a_lifetime_does_not_open_a_char_literal(self):
+        """`'a` (a lifetime, no closing quote) must not be mistaken for an
+        unterminated char literal that swallows the rest of the file -- a
+        real citation shortly after must still resolve normally."""
+        source = self._crate_fixture(
+            "line one\nfn real_thing() {}\n",
+            "fn f<'a>(x: &'a str) -> &'a str { x }\n"
+            "// `real_thing` (`crates/jammi-other/src/target.rs:2`)\n",
+        )
+        self.assertEqual(cc.check_file(source), [])
+
+    def test_a_label_does_not_open_a_char_literal(self):
+        """`'outer:` (a loop label) hits the identical lifetime-vs-char-
+        literal disambiguation as a plain lifetime."""
+        source = self._crate_fixture(
+            "line one\nfn real_thing() {}\n",
+            "fn f() { 'outer: loop { break 'outer; } }\n"
+            "// `real_thing` (`crates/jammi-other/src/target.rs:2`)\n",
+        )
+        self.assertEqual(cc.check_file(source), [])
+
+
+class RustCommentLexerCoverageTests(unittest.TestCase):
+    """The coverage proof named in the module doc's crate-comment-roots
+    section: `_rust_comment_line_spans` run over EVERY real `.rs` file
+    under this repo's own `crates/` tree, asserting every line a NAIVE
+    (lexically-blind) scan would call comment-only (`line.lstrip()` starts
+    with `//`) is covered by at least one span the real lexer returns.
+    This is the exact regression class the char-literal fix closes --
+    before it, dozens of real comment lines in
+    `crates/jammi-encoders/src/layer_norm.rs`,
+    `crates/jammi-kernels/src/ops/launch_domain.rs`, and
+    `crates/jammi-kernels/tests/feature_table.rs` were silently dropped
+    from the scan by a phantom string opened on a `'"'`/`b'"'` char
+    literal. Drives the REAL, non-monkeypatched `crates/` tree
+    deliberately (this net exists to catch a real, repo-wide regression,
+    not a fixture-only code path) -- `_rust_comment_line_spans` itself
+    takes no module-level root as an argument, so this needs no
+    monkeypatching to stay isolated.
+    """
+
+    def test_every_naive_comment_only_line_is_covered_by_the_real_lexer(self):
+        crates_dir = cc.REPO_ROOT / "crates"
+        missed: list[str] = []
+        for path in sorted(crates_dir.rglob("*.rs")):
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            spans = cc._rust_comment_line_spans(text)
+            covered_line_nos = {text.count("\n", 0, start) + 1 for start, _end in spans}
+            for line_no, line in enumerate(text.splitlines(), start=1):
+                if line.lstrip().startswith("//") and line_no not in covered_line_nos:
+                    missed.append(f"{path.relative_to(cc.REPO_ROOT)}:{line_no}")
+        self.assertEqual(
+            missed, [], f"{len(missed)} naive comment-only line(s) not covered by the real lexer: {missed[:20]}"
+        )
+
+
+class ShaPinDistanceCapTests(unittest.TestCase):
+    """Direct unit coverage for `_SHA_PIN_MAX_DISTANCE_CHARS` (120 chars):
+    a pin phrase closer than the cap resolves; one exactly two characters
+    further away does not -- the cap this repo's own `ab_merge.py`
+    determinant-table row shape needed (module doc / `_find_pin_sha`'s own
+    docstring), pinned at its own boundary rather than left to drift.
+    """
+
+    def test_a_pin_at_119_chars_resolves(self):
+        # Padding must be non-word characters (spaces, not e.g. `x`) so
+        # `_SHA_PIN_RE`'s `\b` word-boundary anchor actually sees a
+        # boundary right before "at" -- padding with a word character
+        # would glue onto "at" and make the phrase fail to match at all,
+        # which would prove nothing about the distance cap specifically.
+        sha = "a" * 40
+        text = (" " * 119) + f"at HEAD `{sha}`"
+        self.assertEqual(cc._find_pin_sha(text, 0), sha)
+
+    def test_a_pin_at_121_chars_does_not_resolve(self):
+        sha = "a" * 40
+        text = (" " * 121) + f"at HEAD `{sha}`"
+        self.assertIsNone(cc._find_pin_sha(text, 0))
+
+    def test_a_pin_exactly_at_the_cap_resolves(self):
+        """The cap itself (`_SHA_PIN_MAX_DISTANCE_CHARS`, 120) is
+        inclusive -- `char_distance > cap` is the rejection test, so a
+        distance exactly equal to the cap must still resolve."""
+        sha = "b" * 40
+        text = (" " * cc._SHA_PIN_MAX_DISTANCE_CHARS) + f"at HEAD `{sha}`"
+        self.assertEqual(cc._find_pin_sha(text, 0), sha)
 
 
 class InlineCommitPinResolutionTests(GitFixture):

@@ -215,17 +215,51 @@ below):
     EXERCISING the rule, rather than USING it, is the same category error
     the "Committed artifacts are append-only evidence" section above
     already names for a different case.
-  * **`_CRATE_COMMENT_ROOTS`** (`crates/**/*.rs`, comment text ONLY): a
+  * **`_CRATE_COMMENT_ROOTS`** (`crates/**/*.rs`, comment/doc text ONLY): a
     `path:line`-shaped token inside an ordinary Rust string literal or in
-    executable code is NEVER a citation — only text inside a `//`/`///`/
-    `//!` line comment is in scope, via `_rust_comment_line_spans`'s
-    lightweight lexical scan (tracks string/raw-string/block-comment state
-    just precisely enough to keep a `//`-shaped substring INSIDE one of
-    those from being misread as a real line comment; deliberately does NOT
-    track char literals/lifetimes — see that function's own doc for why).
+    executable code is NEVER a citation — only text that a reader would
+    recognize as documentation prose is in scope, via
+    `_rust_comment_line_spans`'s lightweight lexical scan. That scan tracks
+    ordinary/raw string literals, CHAR LITERALS (`'x'`, an escaped quote
+    or backslash, a `\\x` byte escape, a `\\u` unicode escape, and the
+    byte forms `b'x'`/`b'\\xFF'` — every one consumed whole so an
+    escaped or literal `"`/`'` inside one can never be
+    misread as opening a real string), and LIFETIMES/LABELS (`'a`,
+    `'static`, `'_`, `'outer:`) — disambiguated from a char literal by
+    whether a matching closing `'` immediately follows a single character
+    or a recognized escape (a lifetime/label has no closing quote at all,
+    by grammar, so this is never actually ambiguous in valid Rust; on a
+    non-match the lone `'` is consumed as an ordinary character and the
+    identifier after it is left for normal processing, since it triggers no
+    further lexical state on its own). Getting char-literal handling right
+    here is not cosmetic: BEFORE this fix, an unhandled `'"'`/`b'"'` char
+    literal opened a phantom ordinary-string state on its embedded `"` that
+    was never closed until the NEXT unrelated `"` anywhere later in the
+    file — silently swallowing every real `//`/`///`/`//!` comment line in
+    between as unscanned "string content" (measured: dozens of lines lost
+    in this repo's own `crates/jammi-encoders/src/layer_norm.rs` and
+    `crates/jammi-kernels/src/ops/launch_domain.rs`).
+
+    Block comments (`/* ... */`) are tracked (including nesting) so a
+    `//`-shaped substring inside one is never misread as a line comment,
+    but their CONTENT is added to the scanned spans only when the block is
+    itself a doc comment — `/** ... */` (exactly two asterisks opening, not
+    `/***` or more — mirrors the same "exactly N, no more" rule `///`
+    vs. `////` already uses for line comments) or `/*! ... */` (inner doc).
+    An ordinary `/* ... */` block comment's content is deliberately NOT
+    scanned: it is not doc prose a maintainer reads as documentation, and
+    treating it as citation-bearing would be scanning code commentary this
+    convention was never meant to reach. `#[doc = "..."]` / `#![doc =
+    "..."]` attributes (the desugared form `///`/`//!` themselves compile
+    to) are ALSO scanned — the attribute's string literal content (plain or
+    raw `r#"..."#`) is doc text exactly like a `///` line, found by a
+    separate whole-text regex pass (`_DOC_ATTR_RE`) independent of the main
+    lexical scan, since attribute syntax is not itself string/comment
+    lexical state.
+
     Unlike the two scopes above, this one is `"comments"` MODE, not
     `"text"` mode: `_full_path_citation_re` only ever sees the extracted
-    comment substrings, never a whole file's text. This scope ALSO
+    comment/doc substrings, never a whole file's text. This scope ALSO
     recognizes a SECOND full-path shape unique to crate-internal doc
     comments, `_crate_relative_citation_re` (`jammi-<name>/src/...:<n>`,
     no `crates/` prefix — a crate names a sibling by its published crate
@@ -233,6 +267,13 @@ below):
     from a crate's own doc-comment perspective): see that function's own
     doc for how it coexists with, and never double-counts against, the
     `crates/`-rooted form.
+
+    `test_check_citations.py`'s `RustCommentLexerCoverageTests` is the
+    coverage proof for this scope: it runs `_rust_comment_line_spans` over
+    every real `.rs` file under `crates/**` and asserts every line that a
+    NAIVE (lexically-blind) scan would call comment-only (`line.lstrip()`
+    starts with `//`) is covered by at least one real span — the exact
+    regression class the char-literal fix above closes.
 
 Both new scopes are subject to the IDENTICAL adjacent-identifier rule and
 in-bounds check the original `_DOC_SEARCH_ROOTS` form uses — the extension
@@ -490,6 +531,21 @@ def _lines_at_sha(sha: str, relpath: str) -> list[str] | None:
 # the artifacts/ arm's own module doc section already names, just for a
 # citation that carries its own pin inline instead of via a sibling
 # `git_sha` JSON field.
+#
+# An unresolvable pin sha (unknown to this checkout's object database, per
+# `_require_history`'s shallow guard aside) EXEMPTS by design -- it is
+# never treated as a `Violation`, and never silently re-resolved against
+# HEAD instead. This is deliberate, not a gap: a FABRICATED sha (typo'd, or
+# copy-pasted wrong) is a reviewer-visible artefact the moment a human
+# reads the diff introducing it -- exactly the same reviewability argument
+# the artifacts/ arm's own `git_sha` field already rests on (see "Committed
+# artifacts are append-only evidence" above). Mechanically distinguishing
+# "genuinely bad sha" from "valid sha this shallow-relative clone simply
+# doesn't have yet" would need the exact object-presence check the
+# ancestry arm's own module doc section already rules out as
+# environment-dependent and fails-open; EXEMPT is the honest, fails-closed
+# answer for a signal this script cannot compute reliably, with the human
+# review step (not this script) catching a fabricated pin.
 # --------------------------------------------------------------------------- #
 _SHA_PIN_RE = re.compile(
     r"\b(?:at(?:\s+HEAD)?|as\s+of)\s*`([0-9a-f]{7,40})`", re.IGNORECASE
@@ -653,23 +709,73 @@ def _rust_string_prefix_len(text: str, i: int, n: int) -> int:
     return 1
 
 
+# A Rust CHAR (or byte-char, `b'...'`) literal, anchored at its opening
+# `'` via `re.match(text, pos=i)`: a `\u{..}` unicode escape (1-6 hex
+# digits), a `\x..` byte escape (exactly 2 hex digits), any OTHER
+# single-character escape (`\n`, `\r`, `\t`, `\0`, `\\`, `\'`, `\"`, ...,
+# via the catch-all `\\.`), or one ordinary (non-quote, non-backslash,
+# non-newline) character -- always followed by the closing `'`. A `'` that
+# does NOT match this (a lifetime like `'a`/`'static`/`'_`, or a label like
+# `'outer:`) never has a closing quote at all by Rust's own grammar, so
+# there is no real ambiguity between the two shapes: if this matches, it IS
+# a char literal; if it does not, the `'` is a lifetime/label sigil.
+_CHAR_LITERAL_RE = re.compile(
+    r"'(?:\\u\{[0-9a-fA-F]{1,6}\}|\\x[0-9a-fA-F]{2}|\\.|[^'\\\n])'"
+)
+
+# `#[doc = "..."]` / `#![doc = "..."]` attributes -- the desugared form
+# `///`/`//!` doc comments themselves compile down to. Matched over the
+# WHOLE file text independently of the main lexical scan below (attribute
+# syntax is not itself string/comment lexical state): `raw`/`hashes` cover
+# the `r#"..."#` raw-string form (any hash count, via the `(?P=hashes)`
+# backreference so the closing hash run must match the opening one
+# exactly), `content` covers the plain `"..."` form (ordinary escapes
+# tolerated via the `(?:[^"\\]|\\.)*` body so an escaped `"` inside the
+# attribute string never prematurely closes the match).
+_DOC_ATTR_RE = re.compile(
+    r'#!?\s*\[\s*doc\s*=\s*(?:r(?P<hashes>#*)"(?P<raw>.*?)"(?P=hashes)|"(?P<content>(?:[^"\\]|\\.)*)")\s*\]',
+    re.DOTALL,
+)
+
+
 def _rust_comment_line_spans(text: str) -> list[tuple[int, int]]:
-    """Character-offset `(start, end)` ranges in `text` that are Rust LINE
-    comment content ("//", "///", "//!") -- the substring strictly AFTER
-    the leading slashes, up to (not including) the newline.
+    """Character-offset `(start, end)` ranges in `text` that are Rust
+    DOC/COMMENT prose: line comment content ("//", "///", "//!" -- the
+    substring strictly after the leading slashes, up to the newline), the
+    content of a DOC block comment (`/** ... */`, `/*! ... */` -- never an
+    ordinary `/* ... */`, see below), and the string content of a `#[doc =
+    "..."]`/`#![doc = "..."]` attribute.
 
     A lightweight structural scan, not a full parser: it tracks just enough
     Rust lexical state -- ordinary string literals, raw strings (`r"..."`,
-    `r#"..."#`, `br"..."`, `rb"..."`, any hash count), and block comments
-    (nested) -- to keep a `//`-shaped substring INSIDE any of those from
-    being misread as a real line comment (the module doc's "never string
-    literals or code" requirement for `_CRATE_COMMENT_ROOTS`). Character
-    literals and lifetimes (`'a'`, `'static`) are deliberately NOT
-    tracked: neither can legitimately carry a `path:line` citation, and
-    unlike a string a lifetime has no closing quote to pair against, so
-    treating every `'` as entering a string-like state would swallow
-    arbitrary trailing, unrelated code as "not code" instead of the
-    narrow, correct thing this function exists to do.
+    `r#"..."#`, `br"..."`, `rb"..."`, any hash count), CHAR LITERALS
+    (`_CHAR_LITERAL_RE` -- consumed whole, so an escaped or literal
+    `"`/`'` inside one can never be misread as opening or closing a real
+    string), LIFETIMES/LABELS (a `'` that is not a char literal -- consumed
+    as a single ordinary character; the identifier after it needs no
+    special handling since it triggers no further lexical state on its
+    own), and block comments (nested) -- to keep a `//`-shaped substring
+    inside any of those from being misread as a real line comment (the
+    module doc's "never string literals or code" requirement for
+    `_CRATE_COMMENT_ROOTS`).
+
+    Getting the char-literal case right is load-bearing, not cosmetic: an
+    unhandled `'"'`/`b'"'` char literal's embedded `"` used to be misread
+    as OPENING an ordinary string, which then stayed open (there is no
+    closing `"` inside the char literal to pair against) until the NEXT
+    unrelated `"` anywhere later in the file -- silently swallowing every
+    real comment line in between as unscanned "string content".
+
+    Block comments are ALWAYS tracked (so their `//`-shaped or `"`-shaped
+    content never confuses the rest of this scan) but their CONTENT is
+    only added to the returned spans when the block is a DOC comment --
+    `/**` (exactly two asterisks opening; `/***` or more is a regular,
+    non-doc comment, mirroring `///` vs. `////` for line comments) or
+    `/*!` (inner doc). A bare `/**/` (four characters total) has no room
+    for both a 3-char `/**` marker and a 2-char `*/` closer without
+    overlapping the same `*`, so it is unambiguously the ordinary, empty,
+    non-doc `/*` + `*/` -- handled as a special case rather than by the
+    general marker arithmetic below.
     """
     spans: list[tuple[int, int]] = []
     n = len(text)
@@ -678,6 +784,8 @@ def _rust_comment_line_spans(text: str) -> list[tuple[int, int]]:
     state = NORMAL
     raw_hashes = 0
     block_depth = 0
+    block_is_doc = False
+    block_doc_start = 0
     while i < n:
         c = text[i]
         if state == NORMAL:
@@ -689,9 +797,38 @@ def _rust_comment_line_spans(text: str) -> list[tuple[int, int]]:
                 i = end
                 continue
             if c == "/" and i + 1 < n and text[i + 1] == "*":
+                if text[i : i + 4] == "/**/":
+                    # See docstring: not enough room for a 3-char `/**`
+                    # marker plus a distinct 2-char `*/` closer -- always
+                    # the ordinary, empty, non-doc block comment.
+                    i += 4
+                    continue
+                is_doc_outer = (
+                    i + 2 < n and text[i + 2] == "*" and not (i + 3 < n and text[i + 3] == "*")
+                )
+                is_doc_inner = i + 2 < n and text[i + 2] == "!"
+                is_doc = is_doc_outer or is_doc_inner
                 state = BLOCK
                 block_depth = 1
-                i += 2
+                block_is_doc = is_doc
+                if is_doc:
+                    block_doc_start = i + 3
+                    i += 3
+                else:
+                    i += 2
+                continue
+            if c == "'":
+                m = _CHAR_LITERAL_RE.match(text, i)
+                if m:
+                    i = m.end()
+                    continue
+                # Not a char literal -- a lifetime (`'a`) or label
+                # (`'outer:`) instead (see module doc: never actually
+                # ambiguous, since neither has a closing quote to match
+                # against). Consumed as a single ordinary character; the
+                # following identifier is left for NORMAL to process
+                # untouched.
+                i += 1
                 continue
             if c == '"':
                 state = STRING
@@ -743,9 +880,18 @@ def _rust_comment_line_spans(text: str) -> list[tuple[int, int]]:
                 block_depth -= 1
                 i += 2
                 if block_depth == 0:
+                    if block_is_doc:
+                        spans.append((block_doc_start, i - 2))
                     state = NORMAL
                 continue
             i += 1
+
+    for m in _DOC_ATTR_RE.finditer(text):
+        if m.group("raw") is not None:
+            spans.append((m.start("raw"), m.end("raw")))
+        else:
+            spans.append((m.start("content"), m.end("content")))
+    spans.sort()
     return spans
 
 

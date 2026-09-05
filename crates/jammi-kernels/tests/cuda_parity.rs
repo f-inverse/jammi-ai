@@ -1472,7 +1472,11 @@ fn assert_ln_parity_biased_f32(
 /// bf16, so an `f16` call sharing bf16's coarser floor/bound would silently
 /// mask an `f16`-scale divergence bf16's own wider allowance hides). No
 /// default: passing the wrong pair for `T` is a caller bug this signature
-/// makes impossible to do by omission.
+/// makes impossible to do by omission. This deliberate positionality is
+/// also why this signature carries `#[allow(clippy::too_many_arguments)]`:
+/// bundling `floor_fn`/`bound_fn` into a params struct would reintroduce a
+/// defaultable field.
+#[allow(clippy::too_many_arguments)]
 fn assert_ln_parity_biased_16bit<T, F>(
     cuda: &Device,
     eps: f64,

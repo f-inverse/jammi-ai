@@ -530,6 +530,14 @@ mod tests {
     /// HTSAT's `BatchNorm` running stats).
     #[test]
     fn training_true_backward_reaches_qk_through_softmax() {
+        // Full-tower forward through `ln_1`/`ln_2`/`ln_pre`/`ln_post`
+        // (biased, training mode) bumps
+        // `crate::layer_norm::LN_DISPATCH_COUNTERS` even though this test
+        // never reads that counter itself (see
+        // `crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK`'s doc).
+        let _guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let config = tiny_config();
         let width = config.width;
         let device = Device::Cpu;
@@ -693,6 +701,13 @@ mod tests {
             "transformer.resblocks.0.ln_2.weight",
         ] {
             let training_grad = {
+                // Full-tower forward at `training=true` bumps
+                // `crate::layer_norm::LN_DISPATCH_COUNTERS` even though this
+                // block never reads it — same lock discipline as the other
+                // training-forward tests in this module.
+                let _guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 let varmap = VarMap::new();
                 let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
                 let mut model = OpenClipVisionTransformer::load(vb.pp("visual"), &config).unwrap();

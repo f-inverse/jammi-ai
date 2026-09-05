@@ -255,6 +255,17 @@ mod tests {
         let mut any = AnyEncoder::ClipText(clip);
         any.set_training(true);
 
+        // `AnyEncoder::ClipText`'s forward reaches `crate::layer_norm`'s
+        // process-wide `LN_DISPATCH_COUNTERS` (ln_1/ln_2/ln_final, all
+        // biased) at `training=true` — this test never reads that counter
+        // itself, but the forward below still bumps it, so it must take
+        // the SAME lock the asserting tests in `clip_text.rs`/`layer_norm.rs`
+        // hold, or its bump can land inside one of those tests' own
+        // before/after window under parallel `cargo test` (see
+        // `crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK`'s doc).
+        let _guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (input_ids, mask) = fixed_batch(&cfg, &device);
         let out = any.forward(&input_ids, &mask).unwrap();
         let loss = nonuniform_loss(&out, cfg.embed_dim, &device);

@@ -47,6 +47,19 @@ use jammi_lora::{
     LoraLinear, MaybeLoraLinear,
 };
 
+/// Serializes the dispatch-count assertions in this file that check BOTH
+/// halves of the process-wide `lora_linear_fused` counter pair (one side
+/// advances, the OTHER stays EXACTLY equal) — mirrors
+/// `crate::modernbert::DISPATCH_COUNTER_TEST_LOCK` in `jammi-encoders`'
+/// own integration-test binary. A bare `>` proof (every OTHER
+/// dispatch-count assertion in this file) tolerates a concurrently
+/// running test in this SAME binary incrementing the same counter between
+/// this test's own `before`/`after` snapshots — an `==` proof cannot: a
+/// concurrent increment on the "must stay equal" side would make an
+/// otherwise-correct assertion fail spuriously. Held for the DURATION of
+/// any test that reads BOTH counters and asserts one is unchanged.
+static DISPATCH_COUNTER_PAIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn cpu() -> Device {
     Device::Cpu
 }
@@ -142,6 +155,9 @@ fn exact_fixture(n: usize, phase: i64) -> Vec<f32> {
 
 #[test]
 fn fused_epilogue_matches_manual_eager_reconstruction_bit_exactly() {
+    let _guard = DISPATCH_COUNTER_PAIR_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let device = cpu();
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
@@ -221,6 +237,9 @@ fn fused_epilogue_matches_manual_eager_reconstruction_bit_exactly() {
 /// ran) deltas.
 #[test]
 fn eval_mode_never_dispatches_the_fused_kernel() {
+    let _guard = DISPATCH_COUNTER_PAIR_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let device = cpu();
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
@@ -268,6 +287,9 @@ fn eval_mode_never_dispatches_the_fused_kernel() {
 
 #[test]
 fn training_mode_on_a_supported_dtype_dispatches_fused_and_is_counted() {
+    let _guard = DISPATCH_COUNTER_PAIR_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let device = cpu();
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
@@ -316,6 +338,9 @@ fn training_mode_on_a_supported_dtype_dispatches_fused_and_is_counted() {
 
 #[test]
 fn training_mode_on_a_mismatched_dtype_pair_falls_back_and_is_counted() {
+    let _guard = DISPATCH_COUNTER_PAIR_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let device = cpu();
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
@@ -374,6 +399,9 @@ fn training_mode_on_a_mismatched_dtype_pair_falls_back_and_is_counted() {
 /// here.
 #[test]
 fn training_mode_on_an_f16_backbone_dispatches_fused_and_is_counted() {
+    let _guard = DISPATCH_COUNTER_PAIR_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let device = cpu();
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
@@ -417,6 +445,9 @@ fn training_mode_on_an_f16_backbone_dispatches_fused_and_is_counted() {
 /// test still being green.
 #[test]
 fn esc_031_golden_holds_through_the_fused_path_with_dispatch_proof() {
+    let _guard = DISPATCH_COUNTER_PAIR_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let device = cpu();
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
@@ -463,8 +494,11 @@ fn esc_031_golden_holds_through_the_fused_path_with_dispatch_proof() {
 /// call site, or a divergence between the fused-site key and the
 /// eager-fallback key, could have slipped through). `dispatch_fused`
 /// selects which arm dispatches (`true`: F32 backbone, no bias -> fused;
-/// `false`: a bias-carrying base -> eager fallback), so this proves the
-/// SAME resume invariant on BOTH arms independently.
+/// `false`: a non-contiguous-`w` base -> eager fallback, #428 P2b's own
+/// lever — see `build_base_with_noncontiguous_w`'s doc; a zero/untracked-
+/// leaf bias no longer forces eager since #428 P2b made a bias-carrying
+/// contiguous base FUSE), so this proves the SAME resume invariant on
+/// BOTH arms independently.
 fn resume_reproduces_the_uninterrupted_dropout_stream(dispatch_fused: bool) {
     let device = cpu();
     const N: usize = 6;
@@ -472,18 +506,30 @@ fn resume_reproduces_the_uninterrupted_dropout_stream(dispatch_fused: bool) {
 
     let build = |seed: u64, varmap: &VarMap, vb: &VarBuilder| -> LoraLinear {
         let (in_features, out_features) = (8, 16);
-        let mut row = Vec::with_capacity(in_features * out_features);
-        for i in 0..out_features {
-            for j in 0..in_features {
-                row.push(((i * 7 + j * 3) as f32).sin());
-            }
-        }
-        let w = Tensor::from_vec(row, (out_features, in_features), &device).unwrap();
         let base = if dispatch_fused {
+            let mut row = Vec::with_capacity(in_features * out_features);
+            for i in 0..out_features {
+                for j in 0..in_features {
+                    row.push(((i * 7 + j * 3) as f32).sin());
+                }
+            }
+            let w = Tensor::from_vec(row, (out_features, in_features), &device).unwrap();
             Linear::new(w, None)
         } else {
-            let bias = Tensor::zeros((out_features,), DType::F32, &device).unwrap();
-            Linear::new(w, Some(bias))
+            let mut wide = Vec::with_capacity(2 * in_features * out_features);
+            for i in 0..out_features {
+                for j in 0..in_features {
+                    wide.push(((i * 7 + j * 3) as f32).sin());
+                }
+                wide.extend(std::iter::repeat_n(0.0f32, in_features)); // filler, never read.
+            }
+            let w_wide = Tensor::from_vec(wide, (out_features, 2 * in_features), &device).unwrap();
+            let w = w_wide.narrow(1, 0, in_features).unwrap();
+            assert!(
+                !w.is_contiguous(),
+                "fixture must actually be non-contiguous"
+            );
+            Linear::new(w, None)
         };
         LoraLinear::new(
             base,
@@ -571,11 +617,17 @@ fn resume_reproduces_the_uninterrupted_dropout_stream(dispatch_fused: bool) {
 
 #[test]
 fn fused_arm_production_path_resume_reproduces_the_uninterrupted_dropout_stream() {
+    let _guard = DISPATCH_COUNTER_PAIR_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     resume_reproduces_the_uninterrupted_dropout_stream(true);
 }
 
 #[test]
 fn eager_arm_production_path_resume_reproduces_the_uninterrupted_dropout_stream() {
+    let _guard = DISPATCH_COUNTER_PAIR_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     resume_reproduces_the_uninterrupted_dropout_stream(false);
 }
 
@@ -585,6 +637,9 @@ fn eager_arm_production_path_resume_reproduces_the_uninterrupted_dropout_stream(
 /// uninterrupted run's continuation.
 #[test]
 fn fused_arm_production_path_would_catch_an_off_by_one_resume_position() {
+    let _guard = DISPATCH_COUNTER_PAIR_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let device = cpu();
     const N: usize = 5;
     const K: u64 = 2;
@@ -649,6 +704,9 @@ fn fused_arm_production_path_would_catch_an_off_by_one_resume_position() {
 /// bit-identical `forward` output.
 #[test]
 fn resume_at_a_huge_position_is_correct_at_the_production_path() {
+    let _guard = DISPATCH_COUNTER_PAIR_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let device = cpu();
     let base_a = build_base(8, 16, &device, DType::F32);
     let base_b = build_base(8, 16, &device, DType::F32);
@@ -708,6 +766,9 @@ fn resume_at_a_huge_position_is_correct_at_the_production_path() {
 /// wrongly correlated) counter value.
 #[test]
 fn resume_past_the_forward_counter_ceiling_is_a_typed_refusal_at_the_production_path() {
+    let _guard = DISPATCH_COUNTER_PAIR_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let device = cpu();
     let base = build_base(8, 16, &device, DType::F32);
     let x = Tensor::ones((2, 5, 8), DType::F32, &device).unwrap();
@@ -754,6 +815,9 @@ fn resume_past_the_forward_counter_ceiling_is_a_typed_refusal_at_the_production_
 /// forward never diverge.
 #[test]
 fn fused_and_eager_arms_draw_the_bit_identical_dropout_stream_at_the_same_resume_state() {
+    let _guard = DISPATCH_COUNTER_PAIR_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let device = cpu();
     let (in_features, out_features, rank) = (8usize, 16usize, 4usize);
     let seed = 999u64;
@@ -841,7 +905,7 @@ fn fused_and_eager_arms_draw_the_bit_identical_dropout_stream_at_the_same_resume
     let after_e = lora_linear_fused_dispatch_snapshot();
     assert!(
         after_e.eager > before_e.eager,
-        "the zero-bias fixture must actually dispatch the eager-fallback arm"
+        "the non-contiguous-w fixture must actually dispatch the eager-fallback arm"
     );
 
     assert_eq!(
@@ -862,6 +926,9 @@ fn fused_and_eager_arms_draw_the_bit_identical_dropout_stream_at_the_same_resume
 /// exists to catch.
 #[test]
 fn fused_and_eager_arms_with_different_seeds_do_not_coincidentally_match() {
+    let _guard = DISPATCH_COUNTER_PAIR_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let device = cpu();
     let (in_features, out_features, rank) = (8usize, 16usize, 4usize);
     let x_v: Vec<f32> = (0..2 * 5 * in_features)
@@ -925,6 +992,9 @@ fn fused_and_eager_arms_with_different_seeds_do_not_coincidentally_match() {
 /// `add` for.
 #[test]
 fn production_path_retains_fewer_tape_nodes_fused_vs_eager_fallback() {
+    let _guard = DISPATCH_COUNTER_PAIR_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let device = cpu();
     let (in_features, out_features, rank) = (8usize, 16usize, 4usize);
 
@@ -996,6 +1066,99 @@ fn production_path_retains_fewer_tape_nodes_fused_vs_eager_fallback() {
     assert_eq!(nodes_eager, 11, "measured production-path EAGER node count");
 }
 
+/// #428 P2b: the bias-carrying sibling of
+/// `production_path_retains_fewer_tape_nodes_fused_vs_eager_fallback` —
+/// same harness (rank-3 `x`, `F32`, `dropout = 0.3`), but both bases now
+/// carry a real, untracked-leaf bias (the overwhelmingly common case —
+/// see `bias_gate`'s own doc). MEASURED separately because
+/// `lora_linear_fused_counters`'s own doc (`jammi_lora::lora_linear`)
+/// pins its headline node counts against the BIAS-FREE harness only —
+/// this test is the harness that doc's bias-carrying figure cites beside
+/// it.
+#[test]
+fn production_path_retains_fewer_tape_nodes_fused_vs_eager_fallback_with_bias() {
+    let _guard = DISPATCH_COUNTER_PAIR_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let device = cpu();
+    let (in_features, out_features, rank) = (8usize, 16usize, 4usize);
+    let bias_v: Vec<f32> = (0..out_features).map(|i| (i as f32 * 0.13).cos()).collect();
+
+    // FUSED arm: a real, frozen (untracked-leaf) bias on a CONTIGUOUS `w`.
+    let varmap_f = VarMap::new();
+    let vb_f = VarBuilder::from_varmap(&varmap_f, DType::F32, &device);
+    let base_f_no_bias = build_base(in_features, out_features, &device, DType::F32);
+    let bias_f = Tensor::from_slice(&bias_v, out_features, &device).unwrap();
+    let base_f = Linear::new(base_f_no_bias.weight().clone(), Some(bias_f));
+    let lora_f = LoraLinear::new(
+        base_f,
+        rank,
+        8.0,
+        false,
+        LoraInitMode::Gaussian,
+        Some(0.3),
+        7,
+        &varmap_f,
+        &vb_f,
+    )
+    .unwrap();
+    let x_f = rand_input(&device);
+    let before_f = lora_linear_fused_dispatch_snapshot();
+    let y_f = lora_f.forward(&x_f).unwrap();
+    let after_f = lora_linear_fused_dispatch_snapshot();
+    assert!(
+        after_f.fused > before_f.fused,
+        "must actually dispatch fused"
+    );
+    let nodes_fused = y_f.sorted_nodes().len();
+
+    // EAGER-FALLBACK arm: the SAME bias, non-contiguous `w` forces
+    // fallback, same shapes/config.
+    let varmap_e = VarMap::new();
+    let vb_e = VarBuilder::from_varmap(&varmap_e, DType::F32, &device);
+    let base_e_no_bias =
+        build_base_with_noncontiguous_w(in_features, out_features, &device, DType::F32);
+    let bias_e = Tensor::from_slice(&bias_v, out_features, &device).unwrap();
+    let base_e = Linear::new(base_e_no_bias.weight().clone(), Some(bias_e));
+    let lora_e = LoraLinear::new(
+        base_e,
+        rank,
+        8.0,
+        false,
+        LoraInitMode::Gaussian,
+        Some(0.3),
+        7,
+        &varmap_e,
+        &vb_e,
+    )
+    .unwrap();
+    let x_e = rand_input(&device);
+    let before_e = lora_linear_fused_dispatch_snapshot();
+    let y_e = lora_e.forward(&x_e).unwrap();
+    let after_e = lora_linear_fused_dispatch_snapshot();
+    assert!(
+        after_e.eager > before_e.eager,
+        "must actually dispatch eager"
+    );
+    let nodes_eager = y_e.sorted_nodes().len();
+
+    assert!(
+        nodes_fused < nodes_eager,
+        "the fused arm must retain FEWER tape nodes than the eager-fallback arm even with a \
+         bias: fused={nodes_fused} eager={nodes_eager}"
+    );
+    // Pin the MEASURED constants directly (not just "fewer than") — cited
+    // by `lora_linear_fused_counters`'s own doc beside the bias-free pair.
+    assert_eq!(
+        nodes_fused, 5,
+        "measured production-path FUSED node count (bias-carrying)"
+    );
+    assert_eq!(
+        nodes_eager, 11,
+        "measured production-path EAGER node count (bias-carrying)"
+    );
+}
+
 /// #428 P2b: the bias-carrying cross-arm oracle this contract calls for —
 /// a REAL (non-zero, non-`Var`) base bias FUSES (unlike every test above
 /// this file's "Migrated" note predates, which used a bias-free or
@@ -1009,6 +1172,9 @@ fn production_path_retains_fewer_tape_nodes_fused_vs_eager_fallback() {
 /// make the bit-exact comparison compare the SAME arm against itself).
 #[test]
 fn bias_carrying_base_fuses_and_matches_the_noncontiguous_w_eager_fallback_bit_exactly() {
+    let _guard = DISPATCH_COUNTER_PAIR_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let device = cpu();
     let (in_features, out_features, rank) = (8usize, 16usize, 4usize);
     let w_v = exact_fixture(out_features * in_features, 31);
@@ -1093,57 +1259,101 @@ fn bias_carrying_base_fuses_and_matches_the_noncontiguous_w_eager_fallback_bit_e
     );
 }
 
-/// #428 P2b: a TRAINABLE `Var` base bias is a COUNTED eager refusal
-/// (`bias_is_frozen_leaf`, `jammi_lora::lora_linear`'s private `bias_gate` —
-/// this test proves the OBSERVABLE behaviour through the public
-/// dispatch-counter API, not by calling that private function directly).
-/// Distinguishes this state from "no bias at all" (which is ALSO an
+/// #428 P2b round-2 fix: a TRAINABLE `Var` base bias is a COUNTED eager
+/// refusal (`bias_is_frozen_leaf`, `jammi_lora::lora_linear`'s private
+/// `bias_gate` — this test proves the OBSERVABLE behaviour through the
+/// public dispatch-counter API, not by calling that private function
+/// directly) — but ONLY relative to the SAME base with an UNTRACKED-LEAF
+/// bias, which must dispatch FUSED. The PRIOR version of this test
+/// asserted only the eager half, against a base built with
+/// `base_has_no_bias`-shaped semantics: at main (before #428), EVERY
+/// bias-carrying base was an unconditional eager refusal regardless of
+/// Var-vs-leaf, so that half-a-test would have passed unconditionally,
+/// with or without #428's own `bias_is_frozen_leaf` discrimination. The
+/// LEAF half below is the one that is actually RED at main (hand-mutation
+/// verified: restoring the blanket `if base_has_bias { .. }` refusal in
+/// `lora_linear_admission_predicate` turns the leaf-half assertion RED —
+/// see this crate's narrow-fix-round report for the exact failure text).
+/// Distinguishes the Var state from "no bias at all" (which is ALSO an
 /// eager-uninvolved `None` from `bias_gate`, but for a completely
 /// different, non-refusal reason) — see `lora_linear_admission_predicate`'s
 /// own doc for why `base_has_bias && !bias_pack_is_some` is the ONLY
 /// remaining bias-shaped refusal.
 #[test]
 fn trainable_var_bias_is_a_counted_eager_refusal() {
+    let _guard = DISPATCH_COUNTER_PAIR_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let device = cpu();
     let (in_features, out_features, rank) = (8usize, 16usize, 4usize);
-    let varmap = VarMap::new();
-    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-    let w = Tensor::from_slice(
-        &exact_fixture(out_features * in_features, 41),
-        (out_features, in_features),
-        &device,
-    )
-    .unwrap();
-    let bias_var = Var::from_tensor(
-        &Tensor::from_slice(&exact_fixture(out_features, 42), out_features, &device).unwrap(),
-    )
-    .unwrap();
-    let base = Linear::new(w, Some(bias_var.as_tensor().clone()));
+    let w_v = exact_fixture(out_features * in_features, 41);
+    let bias_v = exact_fixture(out_features, 42);
+
+    // LEAF half: the SAME weight/bias VALUES, bias as an untracked leaf
+    // (a plain `Tensor`, no `Var` wrapper) — must dispatch FUSED only.
+    let varmap_leaf = VarMap::new();
+    let vb_leaf = VarBuilder::from_varmap(&varmap_leaf, DType::F32, &device);
+    let w_leaf = Tensor::from_slice(&w_v, (out_features, in_features), &device).unwrap();
+    let bias_leaf = Tensor::from_slice(&bias_v, out_features, &device).unwrap();
     assert!(
-        bias_var.as_tensor().is_variable(),
-        "fixture's bias must actually be a trainable Var"
+        !bias_leaf.track_op(),
+        "fixture's bias must actually be an untracked leaf"
     );
-    let lora = LoraLinear::new(
-        base,
+    let base_leaf = Linear::new(w_leaf, Some(bias_leaf));
+    let lora_leaf = LoraLinear::new(
+        base_leaf,
         rank,
         8.0,
         false,
         LoraInitMode::Gaussian,
         None,
         1,
-        &varmap,
-        &vb,
+        &varmap_leaf,
+        &vb_leaf,
     )
     .unwrap();
-    let x = rand_input(&device);
-
-    let before = lora_linear_fused_dispatch_snapshot();
-    let _ = lora.forward(&x).unwrap();
-    let after = lora_linear_fused_dispatch_snapshot();
+    let x_leaf = rand_input(&device);
+    let before_leaf = lora_linear_fused_dispatch_snapshot();
+    let _ = lora_leaf.forward(&x_leaf).unwrap();
+    let after_leaf = lora_linear_fused_dispatch_snapshot();
     assert!(
-        after.eager > before.eager,
-        "a trainable Var bias must be a COUNTED eager refusal, not a silent (uncounted) \
-         miss: before={before:?} after={after:?}"
+        after_leaf.fused > before_leaf.fused && after_leaf.eager == before_leaf.eager,
+        "an untracked-leaf bias must dispatch Fused only (fused advances, eager unchanged): \
+         before={before_leaf:?} after={after_leaf:?}"
+    );
+
+    // Var half: the SAME weight/bias VALUES, bias as a trainable Var —
+    // must dispatch Eager only (`bias_is_frozen_leaf`).
+    let varmap_var = VarMap::new();
+    let vb_var = VarBuilder::from_varmap(&varmap_var, DType::F32, &device);
+    let w_var = Tensor::from_slice(&w_v, (out_features, in_features), &device).unwrap();
+    let bias_var =
+        Var::from_tensor(&Tensor::from_slice(&bias_v, out_features, &device).unwrap()).unwrap();
+    assert!(
+        bias_var.as_tensor().is_variable(),
+        "fixture's bias must actually be a trainable Var"
+    );
+    let base_var = Linear::new(w_var, Some(bias_var.as_tensor().clone()));
+    let lora_var = LoraLinear::new(
+        base_var,
+        rank,
+        8.0,
+        false,
+        LoraInitMode::Gaussian,
+        None,
+        1,
+        &varmap_var,
+        &vb_var,
+    )
+    .unwrap();
+    let x_var = rand_input(&device);
+    let before_var = lora_linear_fused_dispatch_snapshot();
+    let _ = lora_var.forward(&x_var).unwrap();
+    let after_var = lora_linear_fused_dispatch_snapshot();
+    assert!(
+        after_var.eager > before_var.eager && after_var.fused == before_var.fused,
+        "a trainable Var bias must be a COUNTED eager refusal only (eager advances, fused \
+         unchanged), not a silent (uncounted) miss: before={before_var:?} after={after_var:?}"
     );
 }
 
@@ -1169,6 +1379,9 @@ fn trainable_var_bias_is_a_counted_eager_refusal() {
 /// itself), rather than leaving it assumed from reading the source alone.
 #[test]
 fn rslora_irrational_scaling_agrees_between_fused_and_eager_arms_at_f32() {
+    let _guard = DISPATCH_COUNTER_PAIR_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let device = cpu();
     let (in_features, out_features, rank) = (8usize, 16usize, 8usize);
     let alpha = 8.0;

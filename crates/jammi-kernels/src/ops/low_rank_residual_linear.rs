@@ -104,7 +104,16 @@
 //! and "Bias: packed into `ab`'s trailing rows" below for the pack layout
 //! and the full rounding-point enumeration this reproduces). One rounding
 //! point when `base`'s dtype is `BF16`/`F16` (candle's `Add` never widens);
-//! none at `F32`.
+//! none at `F32`. Also one ALLOCATION cost per site per forward,
+//! independent of that rounding question: [`LowRankResidualLinear::apply_bias_if_present`]'s
+//! own `ab_storage.to_dtype(&bias_l, base_dtype)` call always materializes
+//! a FRESH, offset-0 gather-copy of the bias slice — `to_dtype` never
+//! special-cases a same-dtype pair into a no-op — so this extra buffer is
+//! paid even at `F32`, not only when the bias slice is actually widened
+//! from `BF16`/`F16`. Negligible next to the three real GEMMs, stated
+//! honestly here rather than folded silently into "no extra cost" (the
+//! same disclosure register "Every rounding point, backward"'s own
+//! per-site `zeros_like` bullet uses, below).
 //!
 //! ## Every rounding point, backward
 //!
@@ -683,11 +692,22 @@ impl LowRankResidualLinear {
     /// `ab_storage`/`ab_l` are the CALLER's `ab` argument (`s3`/`l3` in
     /// both `cpu_fwd` and `cuda_fwd`) — `check_w_and_ab` has already
     /// verified `ab`'s shape and `F32` dtype by the time either forward
-    /// reaches this call. The bias slots occupy `ab`'s trailing
-    /// `bias_rows * rank` elements, row-major-flattened; only the first
-    /// `out_features` of those are ever read (the module doc's "Bias"
-    /// section states why the zero-padded remainder needs no special
-    /// handling here).
+    /// reaches this call. `check_w_and_ab` does NOT check `ab`'s
+    /// contiguity — that is a SEPARATE `RequiresContiguous` loop
+    /// (`for (l, what) in [(l2, "w"), (l3, "ab")] { ... }`) both
+    /// `cpu_fwd` and `cuda_fwd` run before calling this function, which
+    /// is why `bias_start` below can safely derive an absolute offset
+    /// from `ab_l.start_offset()`: that derivation is only valid against
+    /// a genuinely contiguous layout. This function re-checks the same
+    /// fact independently rather than trusting either caller's loop
+    /// (family D: an op trusts no caller for its own domain — the same
+    /// doctrine `materialize_contiguous_if_needed`'s own doc states),
+    /// since it is `pub(crate)` and therefore reachable from a test
+    /// calling it directly, bypassing both loops. The bias slots occupy
+    /// `ab`'s trailing `bias_rows * rank` elements, row-major-flattened;
+    /// only the first `out_features` of those are ever read (the module
+    /// doc's "Bias" section states why the zero-padded remainder needs no
+    /// special handling here).
     pub(crate) fn apply_bias_if_present<S: BackendStorage>(
         &self,
         base_storage: S,
@@ -699,6 +719,11 @@ impl LowRankResidualLinear {
     ) -> Result<S> {
         if !self.has_bias {
             return Ok(base_storage);
+        }
+        if ab_l.contiguous_offsets().is_none() {
+            return Err(Error::RequiresContiguous {
+                op: "low_rank_residual_linear(ab)",
+            });
         }
         let outf = self.out_features;
         let bias_start = ab_l.start_offset() + (self.in_features + outf) * self.rank;
@@ -1194,7 +1219,7 @@ impl CustomOp3 for LowRankResidualLinear {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::{Device, Var};
+    use candle_core::{Device, Storage, Var};
     use half::bf16;
 
     /// Small-integer-valued, deterministic fixture (`{-4, .., 4}`, no
@@ -3306,6 +3331,73 @@ mod tests {
         match err {
             Error::Msg(msg) => assert!(msg.contains("ab must be"), "got: {msg}"),
             other => panic!("expected Error::Msg, got {other:?}"),
+        }
+    }
+
+    /// #428 P2b round-2 fix: `apply_bias_if_present` re-checks `ab`'s
+    /// contiguity itself rather than trusting `cpu_fwd`/`cuda_fwd`'s own
+    /// `RequiresContiguous` loop (see that function's own doc) — this
+    /// test calls it DIRECTLY, bypassing both loops entirely (unlike
+    /// every other test in this file, which only reaches this function
+    /// through `fused_forward`), to prove the defense-in-depth check is
+    /// real, not merely documented: a non-contiguous `ab` reaching the
+    /// helper is a TYPED refusal (`RequiresContiguous`), never a wrong
+    /// number silently read off the wrong `bias_start` offset.
+    #[test]
+    fn apply_bias_if_present_refuses_a_non_contiguous_ab_directly() {
+        let device = Device::Cpu;
+        let (m, inf, outf, r) = (3usize, 3usize, 4usize, 2usize);
+        let op = LowRankResidualLinear::new(1.0, inf, outf, r, None, false)
+            .unwrap()
+            .with_bias(true);
+        let bias_rows = op.bias_rows();
+        assert_eq!(bias_rows, outf.div_ceil(r));
+
+        let a_v = exact_fixture(r * inf, 1);
+        let b_v = exact_fixture(outf * r, 2);
+        let bias_v = exact_fixture(outf, 3);
+        let ab_contig = pack_ab_with_bias(&a_v, inf, &b_v, outf, r, &bias_v, &device);
+        let ab_rows = inf + outf + bias_rows;
+        // Widen each row and narrow back to `r` columns — the SAME
+        // wide-then-narrow non-contiguity lever
+        // `fused_epilogue.rs`'s `build_base_with_noncontiguous_w` uses
+        // (jammi-lora): identical VALUES, a row stride that no longer
+        // equals the column count.
+        let ab_v = ab_contig.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let mut wide_v = Vec::with_capacity(ab_rows * 2 * r);
+        for row in 0..ab_rows {
+            wide_v.extend_from_slice(&ab_v[row * r..(row + 1) * r]);
+            wide_v.extend(std::iter::repeat_n(0.0f32, r));
+        }
+        let wide = Tensor::from_slice(&wide_v, (ab_rows, 2 * r), &device).unwrap();
+        let ab_noncontig = wide.narrow(1, 0, r).unwrap();
+        assert!(
+            !ab_noncontig.is_contiguous(),
+            "fixture must actually be non-contiguous"
+        );
+
+        let base_v = exact_fixture(m * outf, 4);
+        let base = Tensor::from_slice(&base_v, (m, outf), &device).unwrap();
+
+        let (base_guard, base_l) = base.storage_and_layout();
+        let base_storage = match &*base_guard {
+            Storage::Cpu(s) => s.clone(),
+            _ => panic!("expected CPU storage"),
+        };
+        let (ab_guard, ab_l) = ab_noncontig.storage_and_layout();
+        let ab_storage = match &*ab_guard {
+            Storage::Cpu(s) => s,
+            _ => panic!("expected CPU storage"),
+        };
+
+        let err = op
+            .apply_bias_if_present(base_storage, base_l, ab_storage, ab_l, DType::F32, m)
+            .expect_err("a non-contiguous ab must be refused, not read at the wrong offset");
+        match err {
+            Error::RequiresContiguous { op: op_label } => {
+                assert_eq!(op_label, "low_rank_residual_linear(ab)");
+            }
+            other => panic!("expected RequiresContiguous{{op: \"...(ab)\"}}, got {other:?}"),
         }
     }
 

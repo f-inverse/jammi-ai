@@ -6,12 +6,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use candle_core::quantized::{GgmlDType, QTensor};
-use candle_core::{DType, Device, Tensor};
-use candle_nn::VarMap;
+use candle_core::{DType, Device, Tensor, D};
+use candle_nn::{Embedding, Linear, Module, VarMap};
 use jammi_encoders::bert::BertConfig;
 use jammi_encoders::{Bert, EncoderError, Pooling};
 use jammi_lora::{
-    lora_linear_fused_dispatch_snapshot, FrozenBase, LoraBuildConfig, LoraInitMode, QuantizedLinear,
+    lora_linear_fused_dispatch_snapshot, lora_scaling, FrozenBase, LoraBuildConfig, LoraInitMode,
+    QuantizedLinear,
 };
 
 fn fixture_dir() -> PathBuf {
@@ -90,6 +91,32 @@ fn bert_loads_with_target_modules() {
     );
 }
 
+/// Non-vacuity (#428 P2b round-2 fix): read `tiny_bert`'s OWN safetensors
+/// header rather than merely stating in prose that its LoRA-eligible
+/// sites carry a bias — every test in this file that claims to exercise
+/// the bias-carrying fused site depends on this fixture fact staying
+/// true, and a future fixture regeneration that dropped these biases
+/// would otherwise leave those tests silently exercising the bias-FREE
+/// path while still claiming to prove the bias-carrying one.
+fn assert_tiny_bert_lora_sites_carry_a_bias(
+    device: &Device,
+    config: &BertConfig,
+    weights: &std::path::Path,
+) {
+    let raw = candle_core::safetensors::load(weights, device)
+        .expect("load tiny_bert safetensors for the bias non-vacuity check");
+    for layer in 0..config.num_hidden_layers {
+        for site in ["query", "value"] {
+            let key = format!("encoder.layer.{layer}.attention.self.{site}.bias");
+            assert!(
+                raw.contains_key(&key),
+                "tiny_bert fixture regressed: `{key}` must exist for this file's tests to \
+                 actually exercise the bias-carrying fused site (non-vacuity)"
+            );
+        }
+    }
+}
+
 fn build_bert_with_lora_on_biased_sites(
     device: &Device,
     config: &BertConfig,
@@ -99,7 +126,10 @@ fn build_bert_with_lora_on_biased_sites(
     // BERT's `query`/`value` sites (like every other linear this encoder
     // builds — `LoraSite::resolve_base`'s own `linear(..)` call) carry a
     // bias: #428 P2b's fused-with-bias pack applies here directly, not
-    // the eager fallback every prior release forced.
+    // the eager fallback every prior release forced. Non-vacuity checked
+    // at runtime, not merely stated — see
+    // `assert_tiny_bert_lora_sites_carry_a_bias`'s own doc.
+    assert_tiny_bert_lora_sites_carry_a_bias(device, config, weights);
     let targets: Vec<String> = vec!["query".into(), "value".into()];
     let no_layers: Option<Vec<usize>> = None;
     let empty_pattern: HashMap<String, usize> = HashMap::new();
@@ -178,9 +208,9 @@ fn bert_lora_bias_site_counter_threading_gates_the_fused_lora_linear_dispatch_co
         .expect("training forward");
     let after_train = lora_linear_fused_dispatch_snapshot();
     assert!(
-        after_train.fused > before_train.fused,
+        after_train.fused > before_train.fused && after_train.eager == before_train.eager,
         "training-mode forward on a biased base must dispatch the fused LoRA site at least \
-         once (before={before_train:?}, after={after_train:?})"
+         once and never touch the eager counter (before={before_train:?}, after={after_train:?})"
     );
 
     // Back to eval: dispatch stops again.
@@ -198,59 +228,330 @@ fn bert_lora_bias_site_counter_threading_gates_the_fused_lora_linear_dispatch_co
     );
 }
 
+/// Hand-composed eager reference for `tiny_bert`'s ONE encoder layer,
+/// built entirely from plain `candle_nn`/`candle_core` PUBLIC ops plus the
+/// fixture's own raw safetensors weights and the model's own (read-back,
+/// not re-derived) LoRA `A`/`B` tensors — used only by
+/// `bert_lora_bias_site_eval_matches_a_hand_composed_eager_reference_at_nonzero_ab`
+/// below. Nothing here calls back into `jammi_lora`'s or
+/// `jammi_encoders::bert`'s own forward machinery except the two PUBLIC
+/// leaf primitives those modules themselves compose from
+/// (`candle_nn::ops::layer_norm` — see `LayerNorm::forward`'s eval-mode
+/// `(Some(bias), false)` arm in `jammi_encoders::layer_norm`, which
+/// dispatches to this exact function; `jammi_encoders::contiguous_matmul`)
+/// — neither takes a `LoraLinear`/`Bert` value as an argument, so nothing
+/// about the LoRA dispatch decision this test exists to prove is
+/// exercised a second time by calling them here. The additive attention
+/// mask is deliberately NOT reconstructed: the test below uses an
+/// all-valid mask (no padding), so `extended_attention_mask` would add
+/// the zero tensor — omitting it is bit-exact against that, not an
+/// approximation.
+#[allow(clippy::too_many_arguments)]
+fn hand_composed_reference_forward(
+    device: &Device,
+    config: &BertConfig,
+    raw: &HashMap<String, Tensor>,
+    lora_weights: &HashMap<String, Tensor>,
+    scaling: f64,
+    input_ids: &Tensor,
+) -> Tensor {
+    let get = |name: &str| -> Tensor {
+        raw.get(name)
+            .unwrap_or_else(|| panic!("tiny_bert fixture missing `{name}`"))
+            .clone()
+    };
+    let hidden_size = config.hidden_size;
+    let heads = config.num_attention_heads;
+    let head_dim = hidden_size / heads;
+    let (_batch, seq) = input_ids.dims2().unwrap();
+
+    let word_emb = Embedding::new(get("embeddings.word_embeddings.weight"), hidden_size)
+        .forward(input_ids)
+        .unwrap();
+    let token_type_ids = Tensor::zeros(input_ids.shape(), DType::U32, device).unwrap();
+    let token_type_emb =
+        Embedding::new(get("embeddings.token_type_embeddings.weight"), hidden_size)
+            .forward(&token_type_ids)
+            .unwrap();
+    let embeddings = (&word_emb + token_type_emb).unwrap();
+    let position_ids = Tensor::arange(0u32, seq as u32, device).unwrap();
+    let position_emb = Embedding::new(get("embeddings.position_embeddings.weight"), hidden_size)
+        .forward(&position_ids)
+        .unwrap();
+    let embeddings = embeddings.broadcast_add(&position_emb).unwrap();
+    let mut hidden = candle_nn::ops::layer_norm(
+        &embeddings,
+        &get("embeddings.LayerNorm.weight"),
+        &get("embeddings.LayerNorm.bias"),
+        config.layer_norm_eps as f32,
+    )
+    .unwrap();
+
+    let transpose_for_scores = |x: &Tensor| -> Tensor {
+        let mut new_shape = x.dims().to_vec();
+        new_shape.pop();
+        new_shape.push(heads);
+        new_shape.push(head_dim);
+        x.reshape(new_shape.as_slice())
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap()
+            .contiguous()
+            .unwrap()
+    };
+
+    for n in 0..config.num_hidden_layers {
+        let p = format!("encoder.layer.{n}");
+        let q_a = lora_weights
+            .get(&format!("layer.{n}.query.lora_a"))
+            .unwrap_or_else(|| panic!("missing layer.{n}.query.lora_a"));
+        let q_b_lora = lora_weights
+            .get(&format!("layer.{n}.query.lora_b"))
+            .unwrap_or_else(|| panic!("missing layer.{n}.query.lora_b"));
+        let v_a = lora_weights
+            .get(&format!("layer.{n}.value.lora_a"))
+            .unwrap_or_else(|| panic!("missing layer.{n}.value.lora_a"));
+        let v_b_lora = lora_weights
+            .get(&format!("layer.{n}.value.lora_b"))
+            .unwrap_or_else(|| panic!("missing layer.{n}.value.lora_b"));
+
+        let base_q = Linear::new(
+            get(&format!("{p}.attention.self.query.weight")),
+            Some(get(&format!("{p}.attention.self.query.bias"))),
+        )
+        .forward(&hidden)
+        .unwrap();
+        let lora_q_after_a = Linear::new(q_a.clone(), None).forward(&hidden).unwrap();
+        let lora_q_out = Linear::new(q_b_lora.clone(), None)
+            .forward(&lora_q_after_a)
+            .unwrap();
+        let q = (&base_q + &(&lora_q_out * scaling).unwrap()).unwrap();
+
+        let k = Linear::new(
+            get(&format!("{p}.attention.self.key.weight")),
+            Some(get(&format!("{p}.attention.self.key.bias"))),
+        )
+        .forward(&hidden)
+        .unwrap();
+
+        let base_v = Linear::new(
+            get(&format!("{p}.attention.self.value.weight")),
+            Some(get(&format!("{p}.attention.self.value.bias"))),
+        )
+        .forward(&hidden)
+        .unwrap();
+        let lora_v_after_a = Linear::new(v_a.clone(), None).forward(&hidden).unwrap();
+        let lora_v_out = Linear::new(v_b_lora.clone(), None)
+            .forward(&lora_v_after_a)
+            .unwrap();
+        let v = (&base_v + &(&lora_v_out * scaling).unwrap()).unwrap();
+
+        let q = transpose_for_scores(&q);
+        let k = transpose_for_scores(&k);
+        let v = transpose_for_scores(&v);
+
+        let scores = jammi_encoders::contiguous_matmul(&q, &k.t().unwrap()).unwrap();
+        let scores = (scores / (head_dim as f64).sqrt()).unwrap();
+        let probs = candle_nn::ops::softmax(&scores, D::Minus1).unwrap();
+        let context = jammi_encoders::contiguous_matmul(&probs, &v).unwrap();
+        let context = context.transpose(1, 2).unwrap().contiguous().unwrap();
+        let context = context.flatten_from(D::Minus2).unwrap();
+
+        let attn_dense = Linear::new(
+            get(&format!("{p}.attention.output.dense.weight")),
+            Some(get(&format!("{p}.attention.output.dense.bias"))),
+        )
+        .forward(&context)
+        .unwrap();
+        let attn_out = candle_nn::ops::layer_norm(
+            &(attn_dense + &hidden).unwrap(),
+            &get(&format!("{p}.attention.output.LayerNorm.weight")),
+            &get(&format!("{p}.attention.output.LayerNorm.bias")),
+            config.layer_norm_eps as f32,
+        )
+        .unwrap();
+
+        let inter = Linear::new(
+            get(&format!("{p}.intermediate.dense.weight")),
+            Some(get(&format!("{p}.intermediate.dense.bias"))),
+        )
+        .forward(&attn_out)
+        .unwrap()
+        .gelu_erf()
+        .unwrap();
+        let out_dense = Linear::new(
+            get(&format!("{p}.output.dense.weight")),
+            Some(get(&format!("{p}.output.dense.bias"))),
+        )
+        .forward(&inter)
+        .unwrap();
+        hidden = candle_nn::ops::layer_norm(
+            &(out_dense + &attn_out).unwrap(),
+            &get(&format!("{p}.output.LayerNorm.weight")),
+            &get(&format!("{p}.output.LayerNorm.bias")),
+            config.layer_norm_eps as f32,
+        )
+        .unwrap();
+    }
+
+    hidden
+}
+
 /// The eval-bytes half of rule 9 (a counter assertion alone is not
-/// falsifiable against a numerically-silent regression): a LoRA-wrapped
-/// BERT with `B` zero-initialised (`LoraInitMode::ZerosB`) must produce
-/// BIT-IDENTICAL eval output to a fully `LoraBuildConfig::frozen()` model
-/// — LoRA's own contribution is exactly zero at `B == 0`, and eval never
-/// dispatches the fused site at all (frozen or not), so the two models'
-/// forward paths must agree byte-for-byte.
+/// falsifiable against a numerically-silent regression) — K4 pin (#428
+/// P2b round-2 fix): the PRIOR version of this test used
+/// `LoraInitMode::ZerosB`, which makes LoRA's own contribution exactly
+/// zero — comparing against a fully frozen model was TAUTOLOGICAL there
+/// (it passed at main, before #428's fused-with-bias site existed at
+/// all, unconditionally: eval never dispatches the fused site regardless,
+/// and `B == 0` means the adapter adds nothing either way). `Gaussian`
+/// init (seeded, deterministic) gives BOTH `A` and `B` non-zero values,
+/// so this comparison genuinely exercises LoRA's own contribution: the
+/// eval-mode output of a LoRA-wrapped, non-zero-`A`/`B` BERT must equal a
+/// [`hand_composed_reference_forward`] built independently, from plain
+/// tensor ops, off the SAME weights (base `Linear` with bias + `A`/`B` +
+/// scaling, no dropout) — bitwise — after an explicit `is_finite` scan
+/// over both sides (rule F: `NaN == NaN` is `false`, so a bare
+/// `assert_eq!` on non-finite data can pass by both sides independently
+/// producing NaN in the same positions without proving anything).
 #[test]
-fn bert_lora_bias_site_eval_matches_a_frozen_model_bit_exact_at_zero_b() {
+fn bert_lora_bias_site_eval_matches_a_hand_composed_eager_reference_at_nonzero_ab() {
+    let _guard = crate::modernbert::DISPATCH_COUNTER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let device = Device::Cpu;
     let config = load_config();
     let weights = weights_path();
+    assert_tiny_bert_lora_sites_carry_a_bias(&device, &config, &weights);
 
-    let varmap_lora = VarMap::new();
-    let mut bert_lora =
-        build_bert_with_lora_on_biased_sites(&device, &config, &weights, &varmap_lora);
-    // `LoraLinear::new_with_base` defaults `training: true` — an EVAL
-    // comparison needs this explicit `false` (see the counter-threading
-    // test above's identical note), both for correctness (this test's
-    // OWN claim is about eval bytes specifically) and to avoid leaving a
-    // live training-mode fused dispatch running that could race the
-    // process-wide `lora_linear_fused` counter against a concurrently
-    // running counter-threading assertion elsewhere in this binary.
-    bert_lora.set_training(false);
+    // Non-vacuity (round-2 fix, prove-bite finding): `tiny_bert`'s OWN
+    // `query`/`value` biases are all EXACTLY zero (a fact of this
+    // fixture, verified by hand-mutating the eager reference's own bias
+    // argument to `None` and observing NO output change at all — the
+    // fixture's real bias contributes nothing regardless). A bit-exact
+    // comparison against a hand-composed reference would therefore stop
+    // proving the bias's own contribution the moment the ONE differing
+    // operand (`Some(bias)` vs a hypothetically dropped one) happened to
+    // be zero everywhere — silently vacuous on the bias axis even though
+    // `A`/`B` are genuinely non-zero. Patch in NON-zero, deterministic
+    // bias values for every LoRA-eligible site, write the patched
+    // tensors to a temp safetensors file, and build BOTH the production
+    // model and the hand-composed reference off THAT file — never the
+    // original, zero-bias one.
+    let mut raw = candle_core::safetensors::load(&weights, &device)
+        .expect("load tiny_bert's raw weights to patch in non-zero biases");
+    for layer in 0..config.num_hidden_layers {
+        for (site, phase) in [("query", 51i64), ("value", 52i64)] {
+            let key = format!("encoder.layer.{layer}.attention.self.{site}.bias");
+            let existing = raw
+                .get(&key)
+                .unwrap_or_else(|| panic!("tiny_bert fixture missing `{key}`"));
+            let n = existing.dims1().unwrap();
+            let patched_v: Vec<f32> = (0..n)
+                .map(|i| (((i as i64 + phase + layer as i64) as f32) * 0.037).sin() * 0.5)
+                .collect();
+            assert!(
+                patched_v.iter().any(|x| *x != 0.0),
+                "the patched bias fixture must itself be non-zero"
+            );
+            let patched = Tensor::from_slice(&patched_v, n, &device).unwrap();
+            raw.insert(key, patched);
+        }
+    }
+    let patched_dir = tempfile::tempdir().expect("tempdir for the non-zero-bias fixture");
+    let patched_path = patched_dir
+        .path()
+        .join("tiny_bert_nonzero_bias.safetensors");
+    candle_core::safetensors::save(&raw, &patched_path)
+        .expect("save the non-zero-bias-patched tiny_bert fixture");
 
-    let varmap_frozen = VarMap::new();
-    let bert_frozen = Bert::builder()
+    let varmap = VarMap::new();
+    let targets: Vec<String> = vec!["query".into(), "value".into()];
+    let no_layers: Option<Vec<usize>> = None;
+    let empty_pattern: HashMap<String, usize> = HashMap::new();
+    let lora_alpha = 8.0;
+    let lora_rank = 4;
+    let lora = LoraBuildConfig {
+        target_modules: &targets,
+        layers_to_transform: &no_layers,
+        lora_rank,
+        lora_alpha,
+        use_rslora: false,
+        lora_dropout: None,
+        rank_pattern: &empty_pattern,
+        init_mode: LoraInitMode::Gaussian,
+        seed: 7,
+    };
+    let mut bert = Bert::builder()
         .pooling(Pooling::Mean)
-        .lora(LoraBuildConfig::frozen())
+        .lora(lora)
         .backbone_dtype(DType::F32)
         .adapter(None)
-        .build(&[weights.as_path()], &config, &device, &varmap_frozen)
-        .expect("build frozen BERT on tiny_bert");
+        .build(&[patched_path.as_path()], &config, &device, &varmap)
+        .expect("build LoRA-targeted BERT on the non-zero-bias-patched tiny_bert (non-zero A/B)");
+    // `LoraLinear::new_with_base` defaults `training: true` — an EVAL
+    // comparison needs this explicit `false` (see the counter-threading
+    // test's identical note).
+    bert.set_training(false);
 
+    // Every position is valid (no padding): `extended_attention_mask`
+    // adds the zero tensor, so `hand_composed_reference_forward` (which
+    // does not reconstruct that add at all) stays bit-exact against it.
     let input_ids = Tensor::new(&[[1u32, 2, 3, 4, 5], [6, 7, 8, 9, 10]], &device).unwrap();
-    let mask = Tensor::new(&[[1u32, 1, 1, 1, 1], [1, 1, 1, 1, 0]], &device).unwrap();
+    let mask = Tensor::new(&[[1u32, 1, 1, 1, 1], [1, 1, 1, 1, 1]], &device).unwrap();
 
-    let hidden_lora = bert_lora
+    let before = lora_linear_fused_dispatch_snapshot();
+    let eval_out = bert
         .forward_hidden(&input_ids, &mask)
-        .expect("LoRA (B=0) eval forward");
-    let hidden_frozen = bert_frozen
-        .forward_hidden(&input_ids, &mask)
-        .expect("frozen eval forward");
-
+        .expect("eval forward on the non-zero-A/B model");
+    let after = lora_linear_fused_dispatch_snapshot();
     assert_eq!(
-        hidden_lora.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-        hidden_frozen
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap(),
-        "eval output must be bit-identical between a ZerosB-initialised LoRA model and a \
-         fully frozen model, regardless of the fused-with-bias site's own existence"
+        (after.fused, after.eager),
+        (before.fused, before.eager),
+        "eval-mode forward must never touch the fused LoRA site's dispatch counters at all, \
+         even with non-zero A/B (before={before:?}, after={after:?})"
+    );
+
+    let lora_weights = bert
+        .named_trainable_weights()
+        .expect("read back the model's own A/B tensors for the reference");
+    assert!(
+        !lora_weights.is_empty(),
+        "the model must actually carry LoRA A/B tensors for this comparison to be non-vacuous"
+    );
+    for (name, t) in &lora_weights {
+        let v = t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(
+            v.iter().any(|x| *x != 0.0),
+            "`{name}` must be non-zero (Gaussian init) — a zero A or B would make this test's \
+             LoRA contribution vacuous again"
+        );
+    }
+    // `raw` (built above, with the non-zero-patched biases) is reused
+    // directly here — the reference must be built from the EXACT SAME
+    // weights the production model above was built from, not the
+    // original zero-bias fixture.
+    let scaling = lora_scaling(lora_alpha, lora_rank, false).expect("compute LoRA scaling");
+    let reference =
+        hand_composed_reference_forward(&device, &config, &raw, &lora_weights, scaling, &input_ids);
+
+    let eval_vec = eval_out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let reference_vec = reference.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    assert!(
+        eval_vec.iter().all(|x| x.is_finite()),
+        "the model's eval output must be entirely finite before it is trusted as a comparison \
+         operand: {eval_vec:?}"
+    );
+    assert!(
+        reference_vec.iter().all(|x| x.is_finite()),
+        "the hand-composed reference output must be entirely finite before it is trusted as a \
+         comparison operand: {reference_vec:?}"
+    );
+    assert_eq!(
+        eval_vec, reference_vec,
+        "eval output must be bit-identical to the hand-composed eager reference built from the \
+         SAME weights (non-zero A/B), proving the bias-carrying fused-with-bias site's eval arm \
+         still reproduces plain LoRA math exactly"
     );
 }
 

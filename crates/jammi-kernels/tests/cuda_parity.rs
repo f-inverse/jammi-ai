@@ -6602,7 +6602,16 @@ fn lora_linear_parity_bf16_exact_integer_fixture_is_bit_exact() {
 /// `ops::low_rank_residual_linear`'s module doc's "Bias" section and
 /// `lora_linear_oracles.rs`'s identically-named helper (this file needs
 /// its own copy: it is a separate compilation unit with no shared `tests`
-/// support module).
+/// support module). `bias` may legitimately arrive `BF16`/`F16` (every
+/// half-dtype bias leg in this file passes one) — cast to `F32` BEFORE
+/// reading it out, matching the production pack exactly (`bias_gate`,
+/// `jammi_lora::lora_linear`, widens a half-dtype bias to `F32` before
+/// building its own pack): `Tensor::to_vec1::<f32>()` does NOT implicitly
+/// cast — it is a typed refusal on a dtype mismatch — so reading a
+/// half-dtype `bias` straight into `to_vec1::<f32>()` without this cast
+/// first panicked every `BF16`/`F16` bias leg at construction, before the
+/// op under test ever ran (round-2 fix; a measured RED on an A100 pod,
+/// not a theoretical concern).
 fn pack_ab_with_bias(
     a: &Tensor,
     b: &Tensor,
@@ -6612,7 +6621,8 @@ fn pack_ab_with_bias(
 ) -> candle_core::Result<Tensor> {
     let ab_no_bias = pack_ab(a, b)?;
     let bias_rows = out_features.div_ceil(rank);
-    let bias_v: Vec<f32> = bias.flatten_all()?.to_vec1()?;
+    let bias_f32 = bias.to_dtype(DType::F32)?;
+    let bias_v: Vec<f32> = bias_f32.flatten_all()?.to_vec1()?;
     let mut bias_padded = vec![0.0f32; bias_rows * rank];
     bias_padded[..out_features].copy_from_slice(&bias_v);
     let bias_tensor = Tensor::from_slice(&bias_padded, (bias_rows, rank), bias.device())?;

@@ -155,8 +155,11 @@ pub struct LayerNorm {
 /// `self.path.join(".")` (`var_builder.rs:124-126`), so this checks the
 /// segment after the final `.` (or the whole string when there is no
 /// `.` at all — a `LayerNorm` loaded at a `VarBuilder`'s own root; no
-/// in-tree call site does this today, but the boundary is the same
-/// either way). This is the ONLY gate on whether [`LayerNorm::new`]
+/// PRODUCTION call site does this today (the seam test below,
+/// `tests::layer_norm_new_call_sites_are_pinned_to_the_known_set`'s
+/// sibling seam test, constructs one deliberately, at a bare root `vb`),
+/// but the boundary is the same either way). This is the ONLY gate on
+/// whether [`LayerNorm::new`]
 /// ever consults the legacy `gamma`/`beta` names: a prefix ending in
 /// `...gamma_scale` or `...LayerNormX` does not match, and a
 /// `<parent>.gamma` tensor sitting one level ABOVE a `<parent>.LayerNorm`
@@ -282,7 +285,15 @@ impl LayerNorm {
     /// `tests::layer_norm_new_call_sites_are_pinned_to_the_known_set`), not
     /// an assumption written by hand into this comment and left to drift:
     /// that test scans this crate's own `src/**/*.rs` for every literal
-    /// `LayerNorm::new(` occurrence and pins the exact set. As of this
+    /// `LayerNorm::new(` occurrence — EXCLUDING this file (`layer_norm.rs`)
+    /// itself, whose own source text spells out that search pattern and
+    /// this scan's own diagnostic messages (see
+    /// `scan_layer_norm_new_call_sites`'s own doc for why: this file's 3
+    /// `#[cfg(test)]`-module seam-test call sites (all three inside
+    /// `direct_seam_non_layer_norm_keyed_prefix_containing_layer_norm_substring_is_not_aliased`
+    /// — `vb.pp("sa_layer_norm")`, `.pp("LayerNormX")`, `.pp("LayerNorm")`)
+    /// are therefore NOT part of the 26-occurrence count below — and pins
+    /// the exact set. As of this
     /// writing there are 26 occurrences total — 22 production call sites
     /// (`bert.rs` 3, `distilbert.rs` 3, `modernbert.rs` 4, `clip_text.rs` 3,
     /// `open_clip_vision.rs` 4, `htsat_audio.rs` 5) plus 4 inside
@@ -2616,15 +2627,25 @@ mod tests {
     /// production non-keyed prefix instead). A temp safetensors file
     /// carries ONLY `sa_layer_norm.gamma`/`.beta` (DistilBERT's own actual
     /// prefix, `distilbert.rs`'s `layer_vb.pp("sa_layer_norm")`) plus the
-    /// SAME values under `LayerNorm.gamma`/`.beta`, in the SAME file.
-    /// `sa_layer_norm` merely CONTAINS the substring "layer_norm" (matching
-    /// "LayerNorm" case-insensitively) but its last `.`-segment is not
-    /// literally `LayerNorm` -- a `starts_with`/`contains`/case-insensitive
-    /// mutant of [`is_layer_norm_keyed`] would alias it (and find `gamma`/
-    /// `beta` genuinely present, so it would succeed); the real, exact
-    /// suffix check must refuse it, even though the SAME file's genuinely
-    /// `LayerNorm`-keyed prefix (proving the fixture's tensors ARE readable
-    /// at all, not merely that `sa_layer_norm` is malformed) does alias.
+    /// SAME values under `LayerNorm.gamma`/`.beta` AND under
+    /// `LayerNormX.gamma`/`.beta`, all in the SAME file. `sa_layer_norm`
+    /// is NOT aliased by a `starts_with`/`contains`/case-insensitive
+    /// mutant of [`is_layer_norm_keyed`] (round-2 fix: the ORIGINAL text
+    /// here claimed otherwise, which is false for all three) — it
+    /// neither starts with nor contains the literal `LayerNorm` (the
+    /// underscore breaks both: `"sa_layer_norm"` vs `"LayerNorm"`), and
+    /// lower-casing either side still leaves `"sa_layer_norm" !=
+    /// "layernorm"`; only an ALWAYS-TRUE mutant, or one that strips/
+    /// normalizes underscores before comparing, would alias `sa_layer_norm`
+    /// specifically. The `starts_with`/`contains` mutant family is instead
+    /// killed end to end by this SAME fixture's `LayerNormX.gamma`/`.beta`
+    /// pair (below): `"LayerNormX"` DOES start with and contain the
+    /// literal `LayerNorm`, so a `starts_with`/`contains` mutant WOULD
+    /// (wrongly) alias it and find `gamma`/`beta` genuinely present — the
+    /// real, exact-segment check must refuse it instead, even though the
+    /// SAME file's genuinely `LayerNorm`-keyed prefix (proving the
+    /// fixture's tensors ARE readable at all, not merely that
+    /// `sa_layer_norm`/`LayerNormX` are malformed) does alias.
     #[test]
     fn direct_seam_non_layer_norm_keyed_prefix_containing_layer_norm_substring_is_not_aliased() {
         let device = Device::Cpu;
@@ -2641,6 +2662,8 @@ mod tests {
         tensors.insert("sa_layer_norm.beta".to_string(), beta.clone());
         tensors.insert("LayerNorm.gamma".to_string(), gamma.clone());
         tensors.insert("LayerNorm.beta".to_string(), beta.clone());
+        tensors.insert("LayerNormX.gamma".to_string(), gamma.clone());
+        tensors.insert("LayerNormX.beta".to_string(), beta.clone());
 
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("sa_layer_norm_direct_seam.safetensors");
@@ -2660,6 +2683,23 @@ mod tests {
             matches!(err, EncoderError::Tensor(_)),
             "expected the non-keyed branch's plain `?`-propagated candle CannotFindTensor \
              error (EncoderError::Tensor), got {err:?}"
+        );
+
+        // `LayerNormX` is what actually kills the `starts_with`/`contains`
+        // mutant family end to end through this seam (see this test's own
+        // doc): it DOES start with and contain the literal `LayerNorm`, so
+        // either mutant would (wrongly) alias it — the real, exact-segment
+        // check must refuse it just like `sa_layer_norm` above.
+        let err_x = LayerNorm::new(hidden, eps, true, vb.pp("LayerNormX"))
+            .err()
+            .expect(
+                "a `LayerNormX` prefix (starts-with/contains `LayerNorm` but not equal to it) \
+                 carrying only gamma/beta must be Err, not aliased",
+            );
+        assert!(
+            matches!(err_x, EncoderError::Tensor(_)),
+            "expected the non-keyed branch's plain `?`-propagated candle CannotFindTensor \
+             error (EncoderError::Tensor), got {err_x:?}"
         );
 
         // The SAME values, at a genuinely LayerNorm-keyed prefix in the

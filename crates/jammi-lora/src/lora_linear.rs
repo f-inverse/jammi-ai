@@ -174,16 +174,26 @@ fn wider_float_dtype(a: DType, b: DType) -> Result<DType, LoraError> {
 /// Per-op fused/eager dispatch counts for the fused LoRA SITE
 /// (`jammi_kernels::ops::LowRankResidualLinear`, the whole-site fusion),
 /// read from the same op-keyed registry `lora_epilogue_counters` uses.
-/// MEASURED (not estimated) at the production `LoraLinear::forward` path
-/// (`rank`-3 `x`, `F32`, `dropout = 0.3`, a frozen `w`) via
-/// `Tensor::sorted_nodes().len()`: the fused arm retains 5 tape nodes end
-/// to end (3 OP-CARRYING — `A.t()`, the `ab` pack `Op::Cat`, and this
-/// op's own `CustomOp3` call — plus the 2 `Var` leaves, `A`/`B`) versus
-/// 9 op-carrying nodes (11 total) for the eager composition
-/// `eager_epilogue` and its own `A`/`B`/dropout sub-linears build —
-/// see `crates/jammi-lora/tests/fused_epilogue.rs`'s
+/// MEASURED (not estimated) at the production `LoraLinear::forward` path,
+/// on the BIAS-FREE harness (`rank`-3 `x`, `F32`, `dropout = 0.3`, a
+/// frozen, bias-free `w`) via `Tensor::sorted_nodes().len()`: the fused
+/// arm retains 5 tape nodes end to end (3 OP-CARRYING — `A.t()`, the `ab`
+/// pack `Op::Cat`, and this op's own `CustomOp3` call — plus the 2 `Var`
+/// leaves, `A`/`B`) versus 9 op-carrying nodes (11 total) for the eager
+/// composition `eager_epilogue` and its own `A`/`B`/dropout sub-linears
+/// build — see `crates/jammi-lora/tests/fused_epilogue.rs`'s
 /// `production_path_retains_fewer_tape_nodes_fused_vs_eager_fallback` for
-/// the harness these numbers come from. Every op-carrying node is one
+/// the harness these numbers come from. **The SAME bias-free harness with
+/// a real, untracked-leaf bias added to `w` (#428 P2b) measures the
+/// IDENTICAL pair, 5 fused / 11 eager** — see that test's own sibling,
+/// `production_path_retains_fewer_tape_nodes_fused_vs_eager_fallback_with_bias`:
+/// the frozen bias contributes no tape node of its own on either arm at
+/// this measurement's granularity (the fused arm's `ab` pack merely gains
+/// a third, still-single-node `Tensor::cat` argument; the eager arm's own
+/// bias add is absorbed inside `candle_nn::Linear::forward`'s existing
+/// reshape/matmul node rather than adding a new one) — stated as the
+/// MEASURED fact, not assumed equal to the bias-free pair without
+/// checking it. Every op-carrying node is one
 /// `GradStore::or_insert` (`backprop.rs`) full-size `zeros_like` + `add`
 /// at backward time — `A.t()`/the `ab` pack are the two this op's own
 /// `CustomOp3` collapse does NOT eliminate (they still cost their own

@@ -10,7 +10,9 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::VarMap;
 use jammi_encoders::bert::BertConfig;
 use jammi_encoders::{Bert, EncoderError, Pooling};
-use jammi_lora::{FrozenBase, LoraBuildConfig, LoraInitMode, QuantizedLinear};
+use jammi_lora::{
+    lora_linear_fused_dispatch_snapshot, FrozenBase, LoraBuildConfig, LoraInitMode, QuantizedLinear,
+};
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cookbook/fixtures/tiny_bert")
@@ -85,6 +87,170 @@ fn bert_loads_with_target_modules() {
         bert.trainable_params().len(),
         expected,
         "expected {expected} trainable tensors with target_modules=[query, value]",
+    );
+}
+
+fn build_bert_with_lora_on_biased_sites(
+    device: &Device,
+    config: &BertConfig,
+    weights: &std::path::Path,
+    varmap: &VarMap,
+) -> Bert {
+    // BERT's `query`/`value` sites (like every other linear this encoder
+    // builds — `LoraSite::resolve_base`'s own `linear(..)` call) carry a
+    // bias: #428 P2b's fused-with-bias pack applies here directly, not
+    // the eager fallback every prior release forced.
+    let targets: Vec<String> = vec!["query".into(), "value".into()];
+    let no_layers: Option<Vec<usize>> = None;
+    let empty_pattern: HashMap<String, usize> = HashMap::new();
+    let lora = LoraBuildConfig {
+        target_modules: &targets,
+        layers_to_transform: &no_layers,
+        lora_rank: 4,
+        lora_alpha: 8.0,
+        use_rslora: false,
+        lora_dropout: None,
+        rank_pattern: &empty_pattern,
+        init_mode: LoraInitMode::ZerosB,
+        seed: 0,
+    };
+    Bert::builder()
+        .pooling(Pooling::Mean)
+        .lora(lora)
+        .backbone_dtype(DType::F32)
+        .adapter(None)
+        .build(&[weights], config, device, varmap)
+        .expect("build LoRA-targeted BERT on tiny_bert (biased sites)")
+}
+
+/// #428 P2b: BERT's LoRA-eligible sites (`query`/`value`, like every
+/// other linear this encoder builds) carry a bias — the fused LoRA site
+/// now FUSES a biased base instead of taking the eager fallback every
+/// prior release forced (`base_has_no_bias`, DELETED). Counter-threading
+/// (mirrors `modernbert.rs`'s own RoPE/softmax `set_training` gate
+/// tests, `crate::modernbert::DISPATCH_COUNTER_TEST_LOCK` — this
+/// integration-test binary's ONE process-wide dispatch-counter lock,
+/// shared across every file that reads a fused-dispatch snapshot): a
+/// training forward must dispatch the fused LoRA site (`fused` advances,
+/// `eager` does not); an eval forward must touch NEITHER counter at all —
+/// `LoraLinear::forward`'s own doc states eval never even reaches
+/// `admit` (the load-bearing rule-9 assertion this test is: a byte
+/// comparison alone would not catch eval accidentally routing through
+/// `admit` with a domain-holds-but-training-false miswiring).
+#[test]
+fn bert_lora_bias_site_counter_threading_gates_the_fused_lora_linear_dispatch_counters() {
+    let _guard = crate::modernbert::DISPATCH_COUNTER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let device = Device::Cpu;
+    let config = load_config();
+    let varmap = VarMap::new();
+    let weights = weights_path();
+
+    let mut bert = build_bert_with_lora_on_biased_sites(&device, &config, &weights, &varmap);
+    // `LoraLinear::new_with_base` defaults `training: true` (a freshly
+    // built LoRA-wrapped model is NOT eval-mode by default — unlike the
+    // frozen-only models `modernbert.rs`'s own counter-threading tests
+    // build, which have no `LoraLinear` at all to default anything on).
+    // Establish the real eval baseline explicitly before measuring it.
+    bert.set_training(false);
+    let input_ids = Tensor::new(&[[1u32, 2, 3, 4, 5]], &device).unwrap();
+    let mask = Tensor::new(&[[1u32, 1, 1, 1, 1]], &device).unwrap();
+
+    // Eval: forward must touch NEITHER dispatch counter.
+    let before_eval = lora_linear_fused_dispatch_snapshot();
+    let _ = bert
+        .forward_hidden(&input_ids, &mask)
+        .expect("eval forward");
+    let after_eval = lora_linear_fused_dispatch_snapshot();
+    assert_eq!(
+        (after_eval.fused, after_eval.eager),
+        (before_eval.fused, before_eval.eager),
+        "eval-mode forward must never touch the fused LoRA site's dispatch counters at all \
+         (before={before_eval:?}, after={after_eval:?})"
+    );
+
+    // Training: 2 sites (query, value) per layer must each dispatch fused.
+    bert.set_training(true);
+    let before_train = lora_linear_fused_dispatch_snapshot();
+    let _ = bert
+        .forward_hidden(&input_ids, &mask)
+        .expect("training forward");
+    let after_train = lora_linear_fused_dispatch_snapshot();
+    assert!(
+        after_train.fused > before_train.fused,
+        "training-mode forward on a biased base must dispatch the fused LoRA site at least \
+         once (before={before_train:?}, after={after_train:?})"
+    );
+
+    // Back to eval: dispatch stops again.
+    bert.set_training(false);
+    let before_eval2 = lora_linear_fused_dispatch_snapshot();
+    let _ = bert
+        .forward_hidden(&input_ids, &mask)
+        .expect("eval forward again");
+    let after_eval2 = lora_linear_fused_dispatch_snapshot();
+    assert_eq!(
+        (after_eval2.fused, after_eval2.eager),
+        (before_eval2.fused, before_eval2.eager),
+        "set_training(false) must restore the eval-only path — neither counter advances \
+         (before={before_eval2:?}, after={after_eval2:?})"
+    );
+}
+
+/// The eval-bytes half of rule 9 (a counter assertion alone is not
+/// falsifiable against a numerically-silent regression): a LoRA-wrapped
+/// BERT with `B` zero-initialised (`LoraInitMode::ZerosB`) must produce
+/// BIT-IDENTICAL eval output to a fully `LoraBuildConfig::frozen()` model
+/// — LoRA's own contribution is exactly zero at `B == 0`, and eval never
+/// dispatches the fused site at all (frozen or not), so the two models'
+/// forward paths must agree byte-for-byte.
+#[test]
+fn bert_lora_bias_site_eval_matches_a_frozen_model_bit_exact_at_zero_b() {
+    let device = Device::Cpu;
+    let config = load_config();
+    let weights = weights_path();
+
+    let varmap_lora = VarMap::new();
+    let mut bert_lora =
+        build_bert_with_lora_on_biased_sites(&device, &config, &weights, &varmap_lora);
+    // `LoraLinear::new_with_base` defaults `training: true` — an EVAL
+    // comparison needs this explicit `false` (see the counter-threading
+    // test above's identical note), both for correctness (this test's
+    // OWN claim is about eval bytes specifically) and to avoid leaving a
+    // live training-mode fused dispatch running that could race the
+    // process-wide `lora_linear_fused` counter against a concurrently
+    // running counter-threading assertion elsewhere in this binary.
+    bert_lora.set_training(false);
+
+    let varmap_frozen = VarMap::new();
+    let bert_frozen = Bert::builder()
+        .pooling(Pooling::Mean)
+        .lora(LoraBuildConfig::frozen())
+        .backbone_dtype(DType::F32)
+        .adapter(None)
+        .build(&[weights.as_path()], &config, &device, &varmap_frozen)
+        .expect("build frozen BERT on tiny_bert");
+
+    let input_ids = Tensor::new(&[[1u32, 2, 3, 4, 5], [6, 7, 8, 9, 10]], &device).unwrap();
+    let mask = Tensor::new(&[[1u32, 1, 1, 1, 1], [1, 1, 1, 1, 0]], &device).unwrap();
+
+    let hidden_lora = bert_lora
+        .forward_hidden(&input_ids, &mask)
+        .expect("LoRA (B=0) eval forward");
+    let hidden_frozen = bert_frozen
+        .forward_hidden(&input_ids, &mask)
+        .expect("frozen eval forward");
+
+    assert_eq!(
+        hidden_lora.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        hidden_frozen
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap(),
+        "eval output must be bit-identical between a ZerosB-initialised LoRA model and a \
+         fully frozen model, regardless of the fused-with-bias site's own existence"
     );
 }
 

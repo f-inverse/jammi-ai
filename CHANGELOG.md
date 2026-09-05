@@ -20,10 +20,10 @@ workspace ships every publishable crate at the same
   public `has_bias: bool` field and a `with_bias` builder (additive; a downstream struct-literal
   construction of `LowRankResidualLinear` must add the field to keep compiling — oracle advisory, not
   a breaking API removal). A new pod A/B driver, `ci/scripts/perf/lora_bias_ab.sh`, plus its merger,
-  measures the bias-carrying fused site against the eager composition it replaces; the measured
-  result lands with its own cuda-runs artifact commit (see `docs/maintainer/fine-tune-performance-guide.md`
-  §4 for the mechanism, node counts, and rounding enumeration — the number itself is not restated
-  here).
+  measures the bias-carrying fused site against the eager composition it replaces on an A100 80GB
+  PCIe: BERT and DistilBERT both ACTIVATE at both measured shapes, per-step wall gains 17.23–30.77%
+  (artifact `crates/jammi-kernels/artifacts/cuda-runs/2026-09-05-lora-bias-428-c69dbd7-a100-pcie.json`;
+  table and mechanism in `docs/maintainer/fine-tune-performance-guide.md` §4).
 
 ### Changed
 - **Every release-publishing job gates on the commit's GPU-prove verdict, all-or-nothing — not only

@@ -16,7 +16,7 @@ workspace ships every publishable crate at the same
   over the upstream gradient, not a fused reduction kernel of its own (see the mechanism correction
   below). Three new CUDA symbols back the forward: `layer_norm_fwd_f32_biased`,
   `layer_norm_fwd_bf16_biased`, `layer_norm_fwd_f16_biased`. The per-op A/B driver
-  (`ci/scripts/perf/finetune_ab.sh`) gains an `AB_OP=ln` mode to isolate this site's own fused-vs-eager
+  (`ci/scripts/perf/lora_bias_ab.sh`) gains an `AB_OP=ln` mode to isolate this site's own fused-vs-eager
   difference. Measured on an A100 (#460, `crates/jammi-kernels/artifacts/cuda-runs/2026-09-05-ln-bias-460-6c6d79c-a100-pcie.json`):
   per-step wall gains of 9–25% across both BERT and DistilBERT and both activating shapes, with the
   LoRA site already fused on both arms of the sweep; the site lands by architectural direction (one

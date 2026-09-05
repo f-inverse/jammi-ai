@@ -112,7 +112,7 @@ LORA_BIAS_AB_REPEATS="${LORA_BIAS_AB_REPEATS:-3}"
 LORA_BIAS_AB_EXTRA_DISABLE="${LORA_BIAS_AB_EXTRA_DISABLE:-}"
 LORA_BIAS_AB_LEGS_ONLY="${LORA_BIAS_AB_LEGS_ONLY:-}"
 LORA_BIAS_AB_DRY_RUN_FAIL_OP="${LORA_BIAS_AB_DRY_RUN_FAIL_OP:-}"
-LORA_BIAS_AB_DRY_RUN_FAIL_PREDICATE="${LORA_BIAS_AB_DRY_RUN_FAIL_PREDICATE:-base_has_no_bias}"
+LORA_BIAS_AB_DRY_RUN_FAIL_PREDICATE="${LORA_BIAS_AB_DRY_RUN_FAIL_PREDICATE:-dry_run_synthetic_capability_miss}"
 
 TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
 BENCH_BIN="${BENCH_BIN:-$TARGET_DIR/release/jammi-bench}"
@@ -230,7 +230,7 @@ if [ "$LORA_BIAS_AB_DRY_RUN" = "1" ]; then
 set -euo pipefail
 echo "fake_bench: chatty stdout noise on purpose, mirroring real bench progress output" >&2
 if [ -n "${LORA_BIAS_AB_DRY_RUN_FAIL_OP:-}" ]; then
-  echo "finetune-run failed: fused op \`${LORA_BIAS_AB_DRY_RUN_FAIL_OP}\` refused in STRICT admission mode: predicate \`${LORA_BIAS_AB_DRY_RUN_FAIL_PREDICATE:-base_has_no_bias}\` failed" >&2
+  echo "finetune-run failed: fused op \`${LORA_BIAS_AB_DRY_RUN_FAIL_OP}\` refused in STRICT admission mode: predicate \`${LORA_BIAS_AB_DRY_RUN_FAIL_PREDICATE:-dry_run_synthetic_capability_miss}\` failed" >&2
   exit 1
 fi
 python3 -c '

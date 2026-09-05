@@ -6,6 +6,25 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+### Added
+- **The fused LoRA site admits a bias-carrying frozen base (#428).** `LowRankResidualLinear`
+  (`jammi_kernels::ops::LowRankResidualLinear`) no longer refuses a base linear layer that carries a
+  bias — every BERT/DistilBERT LoRA site (both carry a bias on every frozen `Linear`) now takes the
+  fused op instead of falling back to the eager, ~11-node composition. A bias-carrying base packs into
+  the SAME `ab` tensor as a third block: `ceil(out_features/rank)` zero-padded `F32` rows appended
+  after `Aᵀ`/`B` along the existing dim-0 stack, so every GEMM slice stays a zero-copy `narrow`
+  regardless of whether the block exists. The ONLY refusal left in this shape is `bias_is_frozen_leaf`
+  — a trainable `Var` bias, which the eager composition already tracks correctly and which the fused
+  kernel has no slot for — a COUNTED domain miss, never a silent misread. The fused-with-bias forward
+  is bit-identical to eager `Linear::forward` on both backends. `LowRankResidualLinear` gains a new
+  public `has_bias: bool` field and a `with_bias` builder (additive; a downstream struct-literal
+  construction of `LowRankResidualLinear` must add the field to keep compiling — oracle advisory, not
+  a breaking API removal). A new pod A/B driver, `ci/scripts/perf/lora_bias_ab.sh`, plus its merger,
+  measures the bias-carrying fused site against the eager composition it replaces; the measured
+  result lands with its own cuda-runs artifact commit (see `docs/maintainer/fine-tune-performance-guide.md`
+  §4 for the mechanism, node counts, and rounding enumeration — the number itself is not restated
+  here).
+
 ### Changed
 - **Every release-publishing job gates on the commit's GPU-prove verdict, all-or-nothing — not only
   the CUDA lanes (#454 follow-up).** `crates.yml`'s `publish` (and `github-release`, chained off it),

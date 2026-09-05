@@ -122,8 +122,8 @@
 //! f16 oracle suites need (`docs/maintainer/cuda-kernel-guide.md`'s per-op
 //! f16 reference-regime table names this op's regime as f32-internal,
 //! round-once, matching `jammi_encoders::layer_norm::LayerNorm::slow`'s
-//! F16 upcast — `DType::F16 | DType::BF16 => DType::F32`, `jammi-encoders/src/layer_norm.rs:706` —
-//! inside `fn slow`, `crates/jammi-encoders/src/layer_norm.rs:682`); campaign
+//! F16 upcast — `DType::F16 | DType::BF16 => DType::F32`, `jammi-encoders/src/layer_norm.rs:750` —
+//! inside `fn slow`, `crates/jammi-encoders/src/layer_norm.rs:726`); campaign
 //! #443 W2b added the matching CUDA F16 dispatch arm
 //! (`crate::cuda::layer_norm`'s `(DType::F16, DType::F16)` arms, backed by
 //! the SEPARATE `cuda/layer_norm_f16.cu` translation unit — see that

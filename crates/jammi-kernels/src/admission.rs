@@ -36,7 +36,7 @@
 //! `SOFTMAX_DISPATCH_COUNTERS`, `GEGLU_DISPATCH_COUNTERS`) have SINCE been
 //! migrated onto this registry themselves — each is now a
 //! `LazyLock<&'static DispatchCounters>` that calls `counters_for(..)`
-//! under the hood: `LN_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/layer_norm.rs:112`;
+//! under the hood: `LN_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/layer_norm.rs:128`;
 //! `ROPE_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/modernbert.rs:189`;
 //! `SOFTMAX_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/modernbert.rs:203`;
 //! `GEGLU_DISPATCH_COUNTERS`, `crates/jammi-encoders/src/modernbert.rs:1899`
@@ -85,7 +85,7 @@
 //! unmatched rather than silently accepted).
 //!
 //! **Live standalone** (reachable directly, own call site, own predicate):
-//! `"layer_norm_fused"` (`jammi-encoders/src/layer_norm.rs:539`),
+//! `"layer_norm_fused"` (`jammi-encoders/src/layer_norm.rs:582`),
 //! `"geglu_fused"` (`jammi-encoders/src/modernbert.rs:1944`),
 //! `"lora_linear_fused"` (`jammi-lora/src/lora_linear.rs:958`), and
 //! `"attention_block_fused"` (`jammi-encoders/src/modernbert.rs:1348`) itself.
@@ -1713,7 +1713,7 @@ impl ProbedOp {
 ///
 /// | report key | kind | registry key(s) | call site |
 /// |---|---|---|---|
-/// | `layer_norm` | TwoArm | `layer_norm_fused` | `layer_norm_fused`, `crates/jammi-encoders/src/layer_norm.rs:113` |
+/// | `layer_norm` | TwoArm | `layer_norm_fused` | `layer_norm_fused`, `crates/jammi-encoders/src/layer_norm.rs:129` |
 /// | `rope` | TwoArm | `rope_fused` | `rope_fused`, `crates/jammi-encoders/src/modernbert.rs:190` |
 /// | `softmax` | TwoArm | `softmax_last_dim_fused` | `softmax_last_dim_fused`, `crates/jammi-encoders/src/modernbert.rs:204` |
 /// | `geglu` | TwoArm | `geglu_fused` | `geglu_fused`, `crates/jammi-encoders/src/modernbert.rs:1900` |

@@ -989,5 +989,150 @@ class CrateCommentFullPathTests(CheckCitationsFixture):
         self.assertTrue(crates_dir.is_dir())
 
 
+class InlineCommitPinResolutionTests(GitFixture):
+    """The lead's ruling on the design question this fix round raised
+    (addendum to #459): a citation explicitly pinned to a commit IN ITS
+    OWN TEXT ("at HEAD `<sha>`" / "at `<sha>`" / "as of `<sha7+>`") is
+    sha-relative evidence -- the SAME append-only-evidence carve-out the
+    `artifacts/` arm already gets for a whole citing FILE's own `git_sha`
+    field, extended to an INLINE pin. Scoped to the TWO NEW full-path
+    coverage-extension scopes only (`_PERF_FULL_PATH_ROOTS`/
+    `_CRATE_COMMENT_ROOTS`) -- never `_DOC_SEARCH_ROOTS`, which keeps its
+    original HEAD-only behaviour.
+
+    Every fixture commits TWO revisions of `target.rs` into a throwaway
+    repo (`GitFixture`, never this checkout): `good_sha` (where
+    `real_thing` sits at line 2) and a later HEAD (where line 2 is
+    something else) -- proving resolution reads the PINNED tree, never
+    the working tree, exactly the discipline `ArtifactShaRelativeResolutionTests`
+    already established for the whole-file `git_sha` field.
+    """
+
+    def _two_revisions(self) -> str:
+        self._write("crates/other-crate/src/target.rs", "line one\nfn real_thing() {}\nline three\n")
+        good_sha = self._commit("good revision")
+        self._write(
+            "crates/other-crate/src/target.rs",
+            "inserted prefix\nline one\nfn real_thing() {}\nline three\nextra tail\n",
+        )
+        self._commit("code moved on")
+        cc.REPO_ROOT = self.root
+        cc._CRATE_COMMENT_ROOTS = (self.root / "crates",)
+        return good_sha
+
+    def test_a_pin_stale_at_head_but_correct_at_the_pinned_sha_resolves(self):
+        """RED proof (a): true at the citation's own pinned commit, stale
+        at HEAD -- must PASS."""
+        good_sha = self._two_revisions()
+        source = self._write(
+            "crates/some-crate/src/lib.rs",
+            f"/// `real_thing` (`crates/other-crate/src/target.rs:2` at HEAD `{good_sha}`)\n",
+        )
+        self._commit("add citing source")
+        violations = cc.check_file(source)
+        self.assertEqual(violations, [], [str(v) for v in violations])
+
+    def test_head_relative_resolution_of_the_same_citation_would_have_failed(self):
+        """Positive control for (a): the SAME citation, at the SAME line,
+        with NO pin phrase, resolves against HEAD (where the code moved)
+        and genuinely fails -- proving the PASS above comes from
+        sha-relative resolution actually engaging, not from the citation
+        being trivially fine at HEAD too."""
+        self._two_revisions()
+        source = self._write(
+            "crates/some-crate/src/lib.rs",
+            "/// `real_thing` (`crates/other-crate/src/target.rs:2`)\n",
+        )
+        self._commit("add citing source, no pin")
+        violations = cc.check_file(source)
+        self.assertEqual(len(violations), 1)
+        self.assertIn("STALE", violations[0].message)
+
+    def test_b_pin_wrong_even_at_its_own_pinned_sha_is_stale(self):
+        """RED proof (b): the identifier is NOT present at the citation's
+        own pinned commit either -- must FAIL as STALE (the lead's own
+        wording), attributed to the pinned sha, never silently passed."""
+        good_sha = self._two_revisions()
+        source = self._write(
+            "crates/some-crate/src/lib.rs",
+            f"/// `totally_wrong_identifier` (`crates/other-crate/src/target.rs:2` at HEAD `{good_sha}`)\n",
+        )
+        self._commit("add citing source with a wrong identifier")
+        violations = cc.check_file(source)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("STALE", violations[0].message)
+        self.assertIn(good_sha, violations[0].message)
+
+    def test_c_unknown_sha_is_exempt_not_stale(self):
+        """RED proof (c): a well-formed sha this throwaway repo's object
+        database genuinely does not contain -- EXEMPT, never a
+        `Violation` (never silently dropped either -- its presence is
+        asserted directly)."""
+        self._two_revisions()
+        unknown_sha = "0123456789abcdef0123456789abcdef01234567"
+        # Guard: this made-up sha must genuinely not resolve in this
+        # throwaway repo -- otherwise the test proves nothing.
+        show = _run_git(["show", f"{unknown_sha}:crates/other-crate/src/target.rs"], self.root)
+        self.assertNotEqual(show.returncode, 0)
+        source = self._write(
+            "crates/some-crate/src/lib.rs",
+            f"/// `real_thing` (`crates/other-crate/src/target.rs:2` at HEAD `{unknown_sha}`)\n",
+        )
+        self._commit("add citing source with an unknown pin")
+        violations, exemptions = cc._check_file_impl(source)
+        self.assertEqual(violations, [], [str(v) for v in violations])
+        self.assertEqual(len(exemptions), 1)
+        self.assertIn("EXEMPT", str(exemptions[0]))
+        self.assertIn(unknown_sha, str(exemptions[0]))
+        # `check_file` (every existing caller's entry point) never
+        # surfaces an Exemption as a Violation.
+        self.assertEqual(cc.check_file(source), [])
+
+    def test_d_a_nearby_sha_not_in_a_pin_phrase_is_still_checked_at_head(self):
+        """RED proof (d): a WELL-FORMED pin phrase ("at `<sha>`") sitting
+        two lines away from the citation (outside the same-line-or-
+        adjacent-line window) must NOT be read as pinning THIS citation --
+        it stays on the ordinary HEAD-relative path and fails normally
+        against HEAD's drifted content, never silently EXEMPTED by an
+        unrelated pin elsewhere in the same comment block.
+        """
+        good_sha = self._two_revisions()
+        source = self._write(
+            "crates/some-crate/src/lib.rs",
+            (
+                f"/// (unrelated) fixed at `{good_sha}`, two lines above, for a\n"
+                "/// different bug entirely --\n"
+                "///\n"
+                "/// `real_thing` (`crates/other-crate/src/target.rs:2`)\n"
+            ),
+        )
+        self._commit("add citing source with a nearby but out-of-range pin")
+        violations = cc.check_file(source)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("STALE", violations[0].message)
+        self.assertNotIn(good_sha, violations[0].message)
+
+    def test_the_pin_carve_out_is_off_for_maintainer_guide_citations(self):
+        """The carve-out is scoped to `_PERF_FULL_PATH_ROOTS`/
+        `_CRATE_COMMENT_ROOTS` ONLY -- a `_DOC_SEARCH_ROOTS` citing file
+        (the maintainer guides) keeps its ORIGINAL HEAD-only behaviour:
+        the SAME pin phrase next to the SAME citation is simply prose to
+        that scope, and the citation still resolves (or fails) against
+        HEAD.
+        """
+        good_sha = self._two_revisions()
+        cc._CRATE_COMMENT_ROOTS = ()
+        cc._DOC_SEARCH_ROOTS = (self.root / "docs" / "maintainer",)
+        source = self._write(
+            "docs/maintainer/guide.md",
+            f"`real_thing` (`crates/other-crate/src/target.rs:2` at HEAD `{good_sha}`)\n",
+        )
+        self._commit("add a maintainer-guide citation with a pin phrase")
+        violations = cc.check_file(source)
+        self.assertEqual(len(violations), 1, [str(v) for v in violations])
+        self.assertIn("STALE", violations[0].message)
+        self.assertIn("code moved since this was written", violations[0].message)
+
+
 if __name__ == "__main__":
     unittest.main()

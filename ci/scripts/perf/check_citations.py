@@ -475,6 +475,93 @@ def _lines_at_sha(sha: str, relpath: str) -> list[str] | None:
     return proc.stdout.splitlines()
 
 
+# --------------------------------------------------------------------------- #
+# Inline commit-pinned citations -- "at HEAD `<sha>`" / "at `<sha>`" / "as of
+# `<sha7+>`" in the SAME sentence as a citation, scoped to the two full-path
+# coverage-extension scopes this fix round adds (`_PERF_FULL_PATH_ROOTS`/
+# `_CRATE_COMMENT_ROOTS`), never the original `_DOC_SEARCH_ROOTS` scope --
+# see `_sha_pin_eligible`. This is the SAME "committed evidence is
+# append-only, not living prose" principle the artifacts/ arm above already
+# applies, extended to an INLINE pin rather than a whole citing FILE's own
+# `git_sha` field: `adamw_step.rs`'s own `crates/jammi-ai/src/fine_tune/
+# adamw.rs:81-107` citation is explicit about which commit its claim is
+# true at ("at HEAD `2c1a68d`") -- re-resolving it against a later HEAD the
+# moment ANY unrelated commit moves that line is the exact category error
+# the artifacts/ arm's own module doc section already names, just for a
+# citation that carries its own pin inline instead of via a sibling
+# `git_sha` JSON field.
+# --------------------------------------------------------------------------- #
+_SHA_PIN_RE = re.compile(
+    r"\b(?:at(?:\s+HEAD)?|as\s+of)\s*`([0-9a-f]{7,40})`", re.IGNORECASE
+)
+
+
+def _sha_pin_eligible(path: Path) -> bool:
+    """Whether `path` is one of the TWO NEW full-path coverage-extension
+    scopes (module doc's "coverage extension" section) where an inline
+    commit pin gets sha-relative resolution -- `_PERF_FULL_PATH_ROOTS`
+    (`ci/scripts/perf/**`'s `.sh`/`.py`, excluding this checker's own
+    implementation/test file) and `_CRATE_COMMENT_ROOTS` (`crates/**/*.rs`
+    comment text). Deliberately excludes the ORIGINAL `_DOC_SEARCH_ROOTS`
+    scope (the maintainer guides): that scope's citations describe the
+    system as it IS today, never a historically-pinned claim, and keeps
+    its existing HEAD-only behaviour completely unchanged by this.
+    """
+    return (
+        path.suffix in _PERF_FULL_PATH_SUFFIXES
+        and path not in _PERF_FULL_PATH_EXCLUDE
+        and _is_under(path, _PERF_FULL_PATH_ROOTS)
+    ) or (path.suffix == ".rs" and _is_under(path, _CRATE_COMMENT_ROOTS))
+
+
+# The character-distance cap `_find_pin_sha` additionally applies, ON TOP
+# OF the same-line-or-adjacent-line rule -- found necessary against this
+# repo's own text: `ab_merge.py`'s determinant table packs an entire row
+# (many unrelated citations, each in its own `|`-delimited cell) onto ONE
+# physical text line, so "same line" alone let an unrelated "landed on
+# `main` at `c0f0e98`" provenance aside -- INCHES away in line-count terms
+# but HUNDREDS of characters away in the same giant row -- read as if it
+# pinned a completely different cell's citation. The real, intended shape
+# (`adamw_step.rs`'s own `at HEAD `2c1a68d`` immediately after its
+# citation) sits well under 100 characters away; this cap is set generously
+# above that (still far below the false-positive's ~180-290 characters) so
+# a genuine pin is never rejected while a same-line-but-unrelated mention
+# in a different table cell is.
+_SHA_PIN_MAX_DISTANCE_CHARS = 120
+
+
+def _find_pin_sha(text: str, citation_start: int) -> str | None:
+    """The commit sha pinning the citation starting at `citation_start`
+    (a character offset into `text`), or `None` if no pin phrase
+    (`_SHA_PIN_RE`) is BOTH (a) on the citation's own line or an
+    immediately preceding/following line, AND (b) within
+    `_SHA_PIN_MAX_DISTANCE_CHARS` characters of it -- a sha mentioned
+    further away, mentioned without one of the recognized pin phrases
+    immediately before it (e.g. a commit named in unrelated prose), or
+    sitting in a DIFFERENT cell of the same physical (giant, table-row-
+    shaped) line, is NOT a pin and leaves the citation on the ordinary
+    HEAD-relative path. Ties (more than one pin phrase within range)
+    resolve to whichever is CLOSEST (by character distance) to the
+    citation itself -- there is no real case in this repo's own text
+    where two different pins compete for the same citation, but "closest
+    wins" is the least surprising tie-break if one ever appears.
+    """
+    citation_line_no = text.count("\n", 0, citation_start) + 1
+    best_sha: str | None = None
+    best_distance: int | None = None
+    for m in _SHA_PIN_RE.finditer(text):
+        pin_line_no = text.count("\n", 0, m.start()) + 1
+        if abs(pin_line_no - citation_line_no) > 1:
+            continue
+        char_distance = abs(m.start() - citation_start)
+        if char_distance > _SHA_PIN_MAX_DISTANCE_CHARS:
+            continue
+        if best_distance is None or char_distance < best_distance:
+            best_distance = char_distance
+            best_sha = m.group(1)
+    return best_sha
+
+
 # A known filename, a colon, and a line number -- optionally wrapped in a
 # matched pair of backticks around the whole citation (both forms are used
 # across this repo's own docs; see this script's own module doc for an
@@ -931,6 +1018,20 @@ def _check_file_impl(path: Path) -> tuple[list[Violation], list[Exemption]]:
         cited_file = cited_label.rsplit(":", 1)[0]
         source_line_no = text.count("\n", 0, citation_start) + 1
 
+        # An inline commit pin ("at HEAD `<sha>`"/"at `<sha>`"/"as of
+        # `<sha7+>`") on this exact citation's own line or an immediately
+        # adjacent one -- computed PER CITATION (unlike `artifact_sha`,
+        # which is one verdict for the whole file): two citations in the
+        # SAME file can carry two DIFFERENT pins, or one pinned and one
+        # not. Mutually exclusive with `artifact_sha` by construction
+        # (`_sha_pin_eligible` and `_artifact_git_sha`'s own qualifying
+        # conditions -- `.rs`/`.sh`/`.py` under the two NEW coverage-
+        # extension scopes vs `.json` under an `artifacts/` path segment --
+        # never overlap on the same file).
+        pin_sha = None
+        if artifact_sha is None and _sha_pin_eligible(path):
+            pin_sha = _find_pin_sha(text, citation_start)
+
         if artifact_sha is not None and not sha_is_ancestor:
             # Case 3: the artifact's own git_sha is NOT an ancestor of
             # HEAD -- historical evidence off this branch's history line,
@@ -991,6 +1092,56 @@ def _check_file_impl(path: Path) -> tuple[list[Violation], list[Exemption]]:
                     )
                 )
                 continue
+        elif pin_sha is not None:
+            # This citation's OWN text pins it to a specific commit --
+            # sha-relative resolve against THAT commit's tree, never
+            # against HEAD (the same append-only-evidence principle the
+            # artifacts/ arm applies, just keyed off an inline phrase
+            # instead of a sibling `git_sha` JSON field). No ancestry
+            # check here (unlike the artifacts/ arm): a `git show` that
+            # fails is classified EXEMPT directly -- "the sha is unknown
+            # to this clone" covers both a genuinely bad/typo'd sha and a
+            # perfectly valid one this checkout's object database simply
+            # does not (yet) contain, and this repository line cannot
+            # mechanically tell those apart without deeper history than a
+            # citation check should require.
+            relpath = _git_relpath(target_path)
+            if relpath is None:
+                violations.append(
+                    Violation(
+                        path, source_line_no,
+                        f"cites {cited_file} sha-relative to a commit pin ({pin_sha}) in this "
+                        f"citation's own text, but {target_path} does not resolve under "
+                        f"{_GIT_REPO_ROOT} for `git show`",
+                    )
+                )
+                continue
+            target_lines = _lines_at_sha(pin_sha, relpath)
+            if target_lines is None:
+                exemptions.append(
+                    Exemption(
+                        path, source_line_no,
+                        f"cites {cited_file}:{cited_line} sha-relative to a commit pin ({pin_sha}) in "
+                        "this citation's own text (an 'at HEAD `<sha>`'/'at `<sha>`'/'as of `<sha>`' "
+                        f"phrase), but `git show {pin_sha}:{relpath}` cannot read that file at that sha "
+                        "in this checkout. EXEMPT: the sha is unknown to this clone (a shallow fetch "
+                        "depth would raise before reaching here instead -- see `_require_history`), so "
+                        "this citation is historical prose that cannot be mechanically verified from "
+                        "this repository line; never resolved against HEAD instead, which would "
+                        "silently reintroduce the exact 'code moved since' false positive an explicit "
+                        "commit pin exists to avoid.",
+                    )
+                )
+                continue
+            if cited_line < 1 or cited_line > len(target_lines):
+                violations.append(
+                    Violation(
+                        path, source_line_no,
+                        f"cites {cited_file}:{cited_line} but that file only has "
+                        f"{len(target_lines)} lines at the pinned commit {pin_sha}",
+                    )
+                )
+                continue
         else:
             if not target_path.exists():
                 violations.append(
@@ -1033,6 +1184,17 @@ def _check_file_impl(path: Path) -> tuple[list[Violation], list[Exemption]]:
                         "describes (committed artifacts are append-only, sha-relative evidence -- "
                         "never re-resolve this class of citation against HEAD; the citation's line "
                         "number, or the sha it should have cited, is wrong and needs a hand fix)",
+                    )
+                )
+            elif pin_sha is not None:
+                violations.append(
+                    Violation(
+                        path, source_line_no,
+                        f"cites {cited_file}:{cited_line} for identifier {ident!r}, but that line "
+                        f"reads {cited_line_text.strip()!r} at the pinned commit {pin_sha} -- the "
+                        "citation is STALE even at its own pinned commit (a wrong line number, or the "
+                        "wrong sha was pinned); never re-resolved against HEAD instead, which would "
+                        "misattribute this as ordinary code drift rather than a wrong pin",
                     )
                 )
             else:

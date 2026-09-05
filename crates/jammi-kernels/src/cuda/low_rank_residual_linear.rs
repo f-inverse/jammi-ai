@@ -8,14 +8,18 @@
 //! `cuda_fwd` methods called directly for dropout and the epilogue —
 //! exactly the same launchers `crate::cuda::dropout`/
 //! `crate::cuda::scaled_cast_add` already ship, reused rather than
-//! duplicated. `ab`'s row-packed `[in + out, rank]` layout (see
-//! `ops::low_rank_residual_linear`'s module doc) means the `A^T`/`B` slices below are
-//! zero-copy `Layout::narrow(0, ..)` views, not materialized buffers —
-//! this file no longer issues its own `to_dtype` gather-copy for them (an
-//! EARLIER, column-packed layout required one; it failed cuBLAS's
-//! `gemm_config` admissibility check on-device — `MatMulNonContiguous` —
-//! which is exactly why the pack layout changed, not merely a style
-//! preference).
+//! duplicated. `ab`'s row-packed `[in + out + bias_rows, rank]` layout
+//! (see `ops::low_rank_residual_linear`'s module doc) means the `A^T`/`B`
+//! slices below are zero-copy `Layout::narrow(0, ..)` views, not
+//! materialized buffers — this file no longer issues its own `to_dtype`
+//! gather-copy for them (an EARLIER, column-packed layout required one;
+//! it failed cuBLAS's `gemm_config` admissibility check on-device —
+//! `MatMulNonContiguous` — which is exactly why the pack layout changed,
+//! not merely a style preference). When `op.has_bias`, `ab`'s THIRD block
+//! (the module doc's "Bias" section) is added to `base` at storage level
+//! via `LowRankResidualLinear::apply_bias_if_present`, the SAME generic
+//! helper `cpu_fwd` calls — instantiated here over `CudaStorage` rather
+//! than reimplemented.
 
 use candle_core::backend::BackendStorage;
 use candle_core::{
@@ -93,6 +97,13 @@ pub(crate) fn cuda_fwd(
     let w_t_l = l2.transpose(0, 1)?;
     let base_storage = s1.matmul(s2, (1, m, outf, inf), &x2d_l, &w_t_l)?;
     let base_l = Layout::contiguous((m, outf));
+
+    // Step 1b: base = base + bias (only when op.has_bias) — the SAME
+    // storage-level helper `cpu_fwd` calls, `LowRankResidualLinear::apply_bias_if_present`
+    // (see its own doc and `ops::low_rank_residual_linear`'s module doc's
+    // "Bias" section), instantiated over `CudaStorage` here — one
+    // implementation, not a second CUDA-only copy of the same logic.
+    let base_storage = op.apply_bias_if_present(base_storage, &base_l, s3, l3, s1.dtype(), m)?;
 
     // Step 2: x32 = to_dtype(x, F32).
     let x32_storage = s1.to_dtype(&x2d_l, DType::F32)?;

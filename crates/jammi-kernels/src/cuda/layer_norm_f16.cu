@@ -200,9 +200,13 @@ extern "C" __global__ void layer_norm_cast_f32_to_f16(
 // ---------------------------------------------------------------------
 // #460 (C-LN): bias-carrying forward, F16. APPEND-ONLY — see
 // `layer_norm.cu`'s identical comment above this block's F32/BF16 twin for
-// the full design rationale (ATen citation, `--fmad=true` form, the
-// `template <bool HAS_BETA>` shared-row-body shape). Every kernel ABOVE
-// this comment in THIS file is byte-for-byte unchanged by this addition.
+// the full design rationale: ATen citation, `--fmad=true` form, and why
+// this NEW `template <bool HAS_BETA>` row body is a SEPARATE, textually
+// duplicated copy of the pre-existing bias-free F16 row body above this
+// comment (NOT a shared definition the bias-free kernel also calls) — an
+// accepted drift surface, the direct cost of keeping the bias-free
+// kernel's bytes provably untouched. Every kernel ABOVE this comment in
+// THIS file is byte-for-byte unchanged by this addition.
 // ---------------------------------------------------------------------
 
 template <bool HAS_BETA>

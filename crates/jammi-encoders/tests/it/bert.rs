@@ -936,9 +936,10 @@ fn bert_biased_layer_norm_counter_threading_gates_the_ln_dispatch_counters() {
         .expect("training forward");
     let after_train = jammi_encoders::ln_dispatch_snapshot();
     assert!(
-        after_train.fused > before_train.fused,
+        after_train.fused > before_train.fused && after_train.eager == before_train.eager,
         "training-mode forward on an all-biased BERT must dispatch the fused LayerNorm \
-         kernel at least once (before={before_train:?}, after={after_train:?})"
+         kernel at least once and never fall back to the eager path \
+         (before={before_train:?}, after={after_train:?})"
     );
 
     // Back to eval: dispatch stops again.

@@ -533,10 +533,15 @@ impl CustomOp2 for LayerNormBwdDgamma {
 /// ([`LayerNormFused`]) with its own dispatch key, so there is no call
 /// site that would ever construct this one with an absent beta. The CUDA
 /// kernels this op dispatches to (`layer_norm_fwd_{f32,bf16,f16}_biased`
-/// in `cuda/layer_norm.cu`/`cuda/layer_norm_f16.cu`) share their row math
-/// with a `template <bool HAS_BETA>` that COULD serve a future
-/// nullable-beta caller, but only the `HAS_BETA = true` instantiation is
-/// ever emitted as a kernel today — see those files' own module docs.
+/// in `cuda/layer_norm.cu`/`cuda/layer_norm_f16.cu`) each define their OWN
+/// `template <bool HAS_BETA>` row body — a SEPARATE, textually duplicated
+/// copy of the pre-existing bias-free kernel's row math, not a shared
+/// definition the bias-free kernel also calls (that kernel's bytes are
+/// append-only-preserved, byte-for-byte, by this addition — see those
+/// files' own module docs for the accepted-drift-surface rationale). The
+/// template's `bool` parameter COULD serve a future nullable-beta caller
+/// without a kernel-body rewrite, but only the `HAS_BETA = true`
+/// instantiation is ever emitted as a kernel today.
 ///
 /// ## `bwd`: three independent slots, three independent gates
 ///
@@ -1841,6 +1846,27 @@ mod tests {
         assert!(matches!(err, Error::RequiresContiguous { .. }));
     }
 
+    /// The bias-free twin of [`hidden_zero_biased_f16_is_a_no_op_not_an_error`]
+    /// below: `(F16, hidden == 0)` through the PRE-EXISTING [`LayerNormFused`]
+    /// op (not `LayerNormBiasedFused`) — the SAME `empty_like` CPU/CUDA
+    /// domain gap #460 closes (see `ops::mod`'s own
+    /// `empty_like_f16_hidden_zero_matches_f32_and_bf16_shape` for the
+    /// helper-level unit), exercised end-to-end through this bias-free
+    /// op's real `cpu_fwd` on CPU: must return an EMPTY output, not an
+    /// error.
+    #[test]
+    fn hidden_zero_f16_is_a_no_op_not_an_error() {
+        let device = Device::Cpu;
+        let x = Tensor::from_slice(&[] as &[f16], (3, 0), &device).unwrap();
+        let gamma = Tensor::from_slice(&[] as &[f16], (0,), &device).unwrap();
+        let out = ln(1e-5, false, &x, &gamma)
+            .unwrap()
+            .to_vec2::<f16>()
+            .unwrap();
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|row| row.is_empty()));
+    }
+
     /// `hidden == 0` is a no-op on F16 too (the CPU/CUDA domain gap #460
     /// closes in `empty_like` — see `ops::mod`'s own test for the
     /// `empty_like` unit itself; this is the SAME gap exercised through
@@ -1960,6 +1986,81 @@ mod tests {
             .to_vec1()
             .unwrap();
         assert_eq!(dbeta2, vec![rows as f32; hidden]);
+    }
+
+    /// The `(dgamma_needed, dbeta_needed) = (true, true)` lattice cell —
+    /// every other `ln_biased` call site above exercises `(false, false)`,
+    /// `(true, false)`, or `(false, true)`, but none exercises BOTH slots
+    /// `Some` in the SAME `bwd` call. A construction bug that only shows up
+    /// when both gates fire together (e.g. one slot's computation
+    /// clobbering shared state the other reads) would be invisible to
+    /// every other test in this file. `dy = 1` (via `.sum_all()`) makes
+    /// `dbeta_i = rows` exactly (same fixture discipline as
+    /// `dbeta_needed_gates_the_beta_gradient_slot_exact_on_integer_dy`);
+    /// `dgamma_i = sum_rows(xhat_i)` is checked against an independently
+    /// computed f64 reference (not integer-exact, since it depends on
+    /// `sqrt`, hence a tight tolerance rather than `assert_eq!`).
+    #[test]
+    fn dgamma_needed_and_dbeta_needed_both_true_populates_both_slots_correctly_in_one_bwd() {
+        let device = Device::Cpu;
+        let hidden = 3;
+        let rows = 2;
+        let xv = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let x =
+            Var::from_tensor(&Tensor::from_slice(&xv, (rows, hidden), &device).unwrap()).unwrap();
+        let gamma =
+            Var::from_tensor(&Tensor::from_slice(&[1.0f32; 3], (hidden,), &device).unwrap())
+                .unwrap();
+        let beta =
+            Var::from_tensor(&Tensor::zeros((hidden,), DType::F32, &device).unwrap()).unwrap();
+
+        let out = ln_biased(
+            1e-5,
+            true,
+            true,
+            x.as_tensor(),
+            gamma.as_tensor(),
+            beta.as_tensor(),
+        )
+        .unwrap();
+        let grads = out.sum_all().unwrap().backward().unwrap();
+
+        let dbeta: Vec<f32> = grads
+            .get(&beta)
+            .expect("dbeta_needed = true must populate beta's gradient")
+            .to_vec1()
+            .unwrap();
+        assert_eq!(
+            dbeta,
+            vec![rows as f32; hidden],
+            "dbeta must stay exact-integer even with dgamma_needed also true"
+        );
+
+        let dgamma: Vec<f32> = grads
+            .get(&gamma)
+            .expect("dgamma_needed = true must populate gamma's gradient")
+            .to_vec1()
+            .unwrap();
+        let mut expected_dgamma = vec![0f64; hidden];
+        for r in 0..rows {
+            let row = &xv[r * hidden..(r + 1) * hidden];
+            let mean: f64 = row.iter().map(|&v| v as f64).sum::<f64>() / hidden as f64;
+            let var: f64 =
+                row.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / hidden as f64;
+            let invvar = 1.0 / (var + 1e-5).sqrt();
+            for (i, &v) in row.iter().enumerate() {
+                // dy == 1.0 uniformly (via `.sum_all()`), so the `dy_i`
+                // factor in `dgamma_i = sum_rows(dy_i * xhat_i)` drops out.
+                expected_dgamma[i] += (v as f64 - mean) * invvar;
+            }
+        }
+        for (i, (&got, &exp)) in dgamma.iter().zip(expected_dgamma.iter()).enumerate() {
+            assert!(
+                (got as f64 - exp).abs() < 1e-4,
+                "dgamma[{i}] = {got} vs expected {exp} (dbeta_needed also true must not perturb \
+                 dgamma's own value)"
+            );
+        }
     }
 
     /// `dbeta_from_grad` in isolation, with a NON-uniform `dy` (so a

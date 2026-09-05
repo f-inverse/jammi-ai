@@ -1243,15 +1243,21 @@ fn ln_parity_empty_batch() {
 // bound (NOT bit-exact: the composition folds via `broadcast_*`/`sum_
 // keepdim` in a different order than the fused kernel's own row loop).
 //
-// NARROWER than `LayerNormFused`'s own suite in one respect: this block
-// does not carry a forced-defect (KO-1) leg for fwd/dx/dgamma/dbeta
-// individually — `dx`/`dgamma` are proven identical BY CONSTRUCTION (the
-// SAME `LayerNormBwdDx`/`LayerNormBwdDgamma` kernels the bias-free suite's
-// own forced-defect legs already cover), so a forced defect there would
-// only re-prove what that suite already proves; `dbeta`'s own forced-
-// defect coverage (e.g. a dropped-row or transposed-reduction bug) is a
-// gap worth closing in a follow-up unit, noted here rather than silently
-// omitted.
+// KO-1 forced-defect coverage in THIS block (round 1 of #460's fix):
+// fwd carries its own forced-defect leg on every dtype (f32/bf16/f16) —
+// the bias-free `LayerNormFused` op run on the SAME x/gamma IS the defect
+// (beta silently dropped is the one plausible bug this new bias-carrying
+// arm introduces that the bias-free suite's own forced-defect legs cannot
+// exercise), guarded by a non-zero-beta fixture assertion so the mutant is
+// never accidentally equivalent to the correct output. `dbeta`'s
+// exact-integer f32 leg carries its own forced-defect (a mutated column
+// sum with row 0 dropped, off by exactly `1` in every column against the
+// exact-integer reference). `dx`/`dgamma` carry NO forced-defect leg here
+// deliberately — they are proven identical BY CONSTRUCTION (the SAME
+// `LayerNormBwdDx`/`LayerNormBwdDgamma` kernels the bias-free suite's own
+// `assert_ln_parity_f32`/`_bf16`/`_f16` forced-defect legs already cover
+// end-to-end), so a forced defect on them here would only re-prove what
+// that suite already proves against the identical kernel code.
 // =======================================================================
 
 fn ln_forward_biased(
@@ -1286,6 +1292,15 @@ fn assert_ln_parity_biased_f32(
 ) {
     let cpu = Device::Cpu;
     let n = rows * hidden;
+    // KO-1 fixture guard: the forced-defect legs below drop beta entirely
+    // (the natural "bias-free op on the same x/gamma" mutant) and expect
+    // the output to diverge. An all-zero beta would make that mutant
+    // EQUIVALENT to the correct op, not discriminating — assert the
+    // fixture actually carries a nonzero bias term.
+    assert!(
+        bv.iter().any(|&b| b != 0.0),
+        "fixture beta must be non-zero, or dropping it is not a genuine defect"
+    );
 
     let x_cpu = Var::from_tensor(&Tensor::from_slice(xv, (rows, hidden), &cpu).unwrap()).unwrap();
     let g_cpu = Var::from_tensor(&Tensor::from_slice(gv, (hidden,), &cpu).unwrap()).unwrap();
@@ -1311,6 +1326,29 @@ fn assert_ln_parity_biased_f32(
     let out_bound =
         |r: f32| f32_two_term_bound(r, out_floor, 2.0 * hidden as f32, F32_CANCELLATION_ULPS);
     assert_relative_bound("biased ln f32 fwd", &out_cpu_v, &out_gpu_v, out_bound);
+    // KO-1 forced defect (fwd): the bias-free op run on the SAME x/gamma is
+    // the natural "beta dropped" defect for a bias-carrying kernel — no
+    // hand-written mutant formula needed, the real `LayerNormFused` op IS
+    // the defect here. Must diverge from the biased CPU reference outside
+    // this leg's own bound (the guard above rules out an equivalent
+    // all-zero-beta fixture making this vacuous).
+    let bias_free_defect: Vec<f32> = ln_forward(
+        eps,
+        false,
+        &Tensor::from_slice(xv, (rows, hidden), &cpu).unwrap(),
+        &Tensor::from_slice(gv, (hidden,), &cpu).unwrap(),
+    )
+    .unwrap()
+    .flatten_all()
+    .unwrap()
+    .to_vec1()
+    .unwrap();
+    assert_forced_defect_exceeds_bound(
+        "biased ln f32 fwd (bias-free op run on the same x/gamma)",
+        &out_cpu_v,
+        &bias_free_defect,
+        out_bound,
+    );
 
     // `dy` = all-ones via `.sum_all()`, deliberately: this is what makes
     // `dbeta` exact-integer (`dbeta_i = rows`) — see this fn's own doc.
@@ -1337,6 +1375,19 @@ fn assert_ln_parity_biased_f32(
         db_gpu,
         vec![rows as f32; hidden],
         "biased ln f32 dbeta (cuda) must be exact"
+    );
+    // KO-1 forced defect (dbeta): a mutated column sum that drops row 0
+    // entirely (a plausible off-by-one-row reduction bug) — independently
+    // computed from the SAME all-ones `dy` this exact-integer leg uses,
+    // never by editing `db_cpu`. `dbeta_i = rows` exactly for every column
+    // above; dropping one row makes it `rows - 1` exactly, so this must
+    // exceed the exact (zero-tolerance) bound in every column.
+    let db_row_dropped_defect: Vec<f32> = vec![(rows.saturating_sub(1)) as f32; hidden];
+    assert_forced_defect_exceeds_bound(
+        "biased ln f32 dbeta (row 0 dropped from the column sum)",
+        &db_cpu,
+        &db_row_dropped_defect,
+        |_reference| 0.0,
     );
 
     // Second pass: sign-mixed cotangent for dx/dgamma (dbeta re-checked
@@ -1428,6 +1479,13 @@ fn assert_ln_parity_biased_16bit<T, F>(
 {
     let cpu = Device::Cpu;
     let n = rows * hidden;
+    // KO-1 fixture guard: see `assert_ln_parity_biased_f32`'s identical
+    // rationale — an all-zero beta would make the "bias-free op on the
+    // same x/gamma" mutant below equivalent, not discriminating.
+    assert!(
+        bv.iter().any(|&b| b != 0.0),
+        "{label} fixture beta must be non-zero, or dropping it is not a genuine defect"
+    );
     let xt: Vec<T> = xv.iter().map(|&v| to_t(v)).collect();
     let gt: Vec<T> = gv.iter().map(|&v| to_t(v)).collect();
     let bt: Vec<T> = bv.iter().map(|&v| to_t(v)).collect();
@@ -1466,6 +1524,24 @@ fn assert_ln_parity_biased_16bit<T, F>(
         &out_gpu_v,
         out_bound,
     );
+    // KO-1 forced defect (fwd): the bias-free op run on the SAME x/gamma
+    // (same dtype, same `to_t` cast) — see `assert_ln_parity_biased_f32`'s
+    // identical rationale.
+    let bias_free_defect: Vec<f32> = to_f32(
+        &ln_forward(
+            eps,
+            false,
+            &Tensor::from_slice(&xt, (rows, hidden), &cpu).unwrap(),
+            &Tensor::from_slice(&gt, (hidden,), &cpu).unwrap(),
+        )
+        .unwrap(),
+    );
+    assert_forced_defect_exceeds_bound(
+        &format!("biased ln {label} fwd (bias-free op run on the same x/gamma)"),
+        &out_cpu_v,
+        &bias_free_defect,
+        out_bound,
+    );
 
     let dyv_f = cotangent_fixture(n, 0xDA57_1D5E_2000_0005, 3.0);
     let dyt: Vec<T> = dyv_f.iter().map(|&v| to_t(v)).collect();
@@ -1501,13 +1577,22 @@ fn assert_ln_parity_biased_16bit<T, F>(
     );
 }
 
-/// Regression pin: the bias-free kernels' own output must be UNCHANGED by
-/// this addition — same-device (CUDA vs CUDA, before/after is not
-/// meaningful within one test run; the real "before" is the pre-#460 tip,
-/// which this compares against via the bias-free `LayerNormFused` op's own
-/// output, run on the SAME device the biased kernel now also runs on) pin
-/// against a hand-computed reference, at a shape and seed independent of
-/// every other test above.
+/// What this test actually is: a `±F32_TOL` tolerance spot-check of the
+/// CURRENT tip's bias-free CUDA `layer_norm_fwd` output against a
+/// hand-computed f32 reference, at a shape/seed independent of every other
+/// test above. It does NOT run the pre-#460 binary and cannot, by
+/// construction, prove bit-identity with it — `F32_TOL` (1e-4) is wide
+/// enough to hide a change far smaller than any real bug this file's other
+/// forced-defect legs are built to catch. The actual bit-identity proof for
+/// "the bias-free kernels are unchanged by #460" is NOT a runtime test at
+/// all: it is that `src/cuda/layer_norm.cu` and `layer_norm_f16.cu`'s
+/// pre-#460 bias-free translation units were edited APPEND-ONLY (see those
+/// files' own module docs) — no existing line in either file was touched,
+/// so the bias-free kernels' compiled bytes are provably identical to the
+/// pre-#460 tip's, independent of any test run's numeric tolerance. This
+/// test is a live sanity check that the (unchanged) bias-free kernel still
+/// computes the right answer, not the mechanism that proves it is
+/// unchanged.
 #[test]
 fn ln_parity_bias_free_kernels_unchanged_by_the_460_addition() {
     let Some(cuda) = cuda_device() else {

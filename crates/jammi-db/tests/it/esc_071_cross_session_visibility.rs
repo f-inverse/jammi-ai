@@ -1,18 +1,19 @@
 //! esc-071 RED oracle (`closes_escape: esc-071`) — cross-session catalog read
 //! visibility on ONE SQLite catalog file.
 //!
-//! Contract under test (`docs/guide/src/catalog-and-broker.md:90` "many readers
-//! alongside one writer"; two-sessions-per-process supported per
-//! `docs/guide/src/multi-tenant.md:17,228`): on one SQLite catalog file in one
+//! Contract under test (`many readers run alongside one writer`, docs/guide/src/catalog-and-broker.md:90;
+//! two-sessions-per-process supported per `two sessions on the same process see disjoint rows`, docs/guide/src/multi-tenant.md:17,228):
+//! on one SQLite catalog file in one
 //! process, a catalog read through ANY engine session must observe every write
 //! another session has already committed — on that pooled connection's Nth
 //! read, not only its first.
 //!
 //! The gate this closes: the only pre-existing two-sessions-one-file catalog
 //! test (`tenant_scope.rs:65-125`) is tenant-DISJOINT, so a stale read passes it
-//! vacuously; the single-pool read-after-write coverage
-//! (`crates/jammi-ai/tests/it/fine_tune.rs:1078-1165`) never opens a second
-//! pool at all (`backend_sqlite.rs:24-41` builds one pool per session).
+//! vacuously; the single-pool read-after-write coverage in
+//! `fine_tune_job_catalog_crud`, crates/jammi-ai/tests/it/fine_tune.rs:1079-1165
+//! never opens a second pool at all (`backend_sqlite.rs:24-41` builds one pool
+//! per session).
 //!
 //! Oracle shape (verbatim from the row's `symptom_spec.observable`): two
 //! `JammiSession`s built by `make_test_session(Sqlite, dir)` on ONE tempdir =>

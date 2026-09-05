@@ -62,8 +62,16 @@ workspace ships every publishable crate at the same
   (`crates/jammi-encoders/src/layer_norm.rs`) now aliases `gamma`->`weight` and `beta`->`bias` at
   load time whenever the `VarBuilder` prefix's last `.`-segment is literally `LayerNorm`, matching
   HF `transformers`' own rule (`modeling_utils.py:4504-4511`), and refuses loudly on a `weight`+
-  `gamma` or `bias`+`beta` collision rather than silently preferring one. Every other LayerNorm call
-  site — any prefix not keyed on a literal `LayerNorm` segment — is unchanged.
+  `gamma` or `bias`+`beta` collision rather than silently preferring one. This collision refusal is a
+  deliberate behaviour change, not a pure bug fix: a checkpoint that today loads carrying BOTH
+  `…LayerNorm.weight` and `…LayerNorm.gamma` silently takes `weight` and drops `gamma` on the floor;
+  such a checkpoint is now refused outright, since no in-tree or known public checkpoint carries both
+  names and an ambiguous one is far more likely corrupted or half-converted than intentional — the
+  remedy is to drop one of the two tensors. A failed load at a `LayerNorm`-keyed prefix now surfaces
+  as an `EncoderError::Config` naming both the modern and legacy candidate tensor names it tried,
+  replacing the bare candle `Tensor` error a missing-tensor lookup previously produced. Every other
+  LayerNorm call site — any prefix not
+  keyed on a literal `LayerNorm` segment — is unchanged.
 
 ## [0.49.1] - 2026-09-03
 

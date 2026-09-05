@@ -6,6 +6,25 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+### Added
+- **The fused LoRA site admits a bias-carrying frozen base (#428).** `LowRankResidualLinear`
+  (`jammi_kernels::ops::LowRankResidualLinear`) no longer refuses a base linear layer that carries a
+  bias — every BERT/DistilBERT LoRA site (both carry a bias on every frozen `Linear`) now takes the
+  fused op instead of falling back to the eager, ~11-node composition. A bias-carrying base packs into
+  the SAME `ab` tensor as a third block: `ceil(out_features/rank)` zero-padded `F32` rows appended
+  after `Aᵀ`/`B` along the existing dim-0 stack, so every GEMM slice stays a zero-copy `narrow`
+  regardless of whether the block exists. The ONLY refusal left in this shape is `bias_is_frozen_leaf`
+  — a trainable `Var` bias, which the eager composition already tracks correctly and which the fused
+  kernel has no slot for — a COUNTED domain miss, never a silent misread. The fused-with-bias forward
+  is bit-identical to eager `Linear::forward` on both backends. `LowRankResidualLinear` gains a new
+  public `has_bias: bool` field and a `with_bias` builder (additive; a downstream struct-literal
+  construction of `LowRankResidualLinear` must add the field to keep compiling — oracle advisory, not
+  a breaking API removal). A new pod A/B driver, `ci/scripts/perf/lora_bias_ab.sh`, plus its merger,
+  measures the bias-carrying fused site against the eager composition it replaces on an A100 80GB
+  PCIe: BERT and DistilBERT both ACTIVATE at both measured shapes, per-step wall gains 17.23–30.77%
+  (artifact `crates/jammi-kernels/artifacts/cuda-runs/2026-09-05-lora-bias-428-c69dbd7-a100-pcie.json`;
+  table and mechanism in `docs/maintainer/fine-tune-performance-guide.md` §4).
+
 ### Changed
 - **Every release-publishing job gates on the commit's GPU-prove verdict, all-or-nothing — not only
   the CUDA lanes (#454 follow-up).** `crates.yml`'s `publish` (and `github-release`, chained off it),
@@ -55,6 +74,23 @@ workspace ships every publishable crate at the same
   window: when an arch's latest attempt is itself still in progress, it now falls back to that run's
   own most recent COMPLETED attempt for the arch (`filter=all`, lazy, cached per run) — a red
   completed attempt sitting behind an in-flight rerun still denies (F5).
+
+### Fixed
+- **BERT-family loader accepts the original Google LayerNorm tensor names (`…LayerNorm.gamma`/
+  `…LayerNorm.beta`) the stock `bert-base-uncased` checkpoint carries (#423).** `LayerNorm::new`
+  (`crates/jammi-encoders/src/layer_norm.rs`) now aliases `gamma`->`weight` and `beta`->`bias` at
+  load time whenever the `VarBuilder` prefix's last `.`-segment is literally `LayerNorm`, matching
+  HF `transformers`' own rule (`modeling_utils.py:4504-4511`), and refuses loudly on a `weight`+
+  `gamma` or `bias`+`beta` collision rather than silently preferring one. This collision refusal is a
+  deliberate behaviour change, not a pure bug fix: a checkpoint that today loads carrying BOTH
+  `…LayerNorm.weight` and `…LayerNorm.gamma` silently takes `weight` and drops `gamma` on the floor;
+  such a checkpoint is now refused outright, since no in-tree or known public checkpoint carries both
+  names and an ambiguous one is far more likely corrupted or half-converted than intentional — the
+  remedy is to drop one of the two tensors. A failed load at a `LayerNorm`-keyed prefix now surfaces
+  as an `EncoderError::Config` naming both the modern and legacy candidate tensor names it tried,
+  replacing the bare candle `Tensor` error a missing-tensor lookup previously produced. Every other
+  LayerNorm call site — any prefix not
+  keyed on a literal `LayerNorm` segment — is unchanged.
 
 ## [0.49.1] - 2026-09-03
 

@@ -34,22 +34,31 @@
 //!   this op's `.cu`-kernel-free composition follows its callees'
 //!   (`DropoutFused`/`ScaledCastAdd`) compiled dispatch arms).
 //! - `w`: `[out, in]`, the FROZEN base weight, same dtype as `x`.
-//! - `ab`: `F32` `[in + out, rank]`, THE pack layout — row 0 through
-//!   `in - 1` holds `A^T` (`[in, rank]`), row `in` through `in + out - 1`
-//!   holds `B` AS-IS (`[out, rank]`, no pre-transpose): `Tensor::cat([A.t(),
-//!   B], 0)`, built at the call site fresh every forward. See "the packed-
-//!   `ab` GEMM eligibility problem" below for why THIS orientation (stack
-//!   along the ROW axis, dim 0) rather than the column axis is what makes
-//!   both slices GEMM-eligible with zero copies. `Tensor::cat`'s own
-//!   backward (`Op::Cat`, `backprop.rs:469`) splits this op's `dab`
-//!   gradient back into `dA^T`/`dB` via two cheap `narrow`s — tiny (`rank`
-//!   columns), not the concern this op addresses. The row-stacked layout
-//!   also leaves room for a future bias block to be appended as EXTRA
-//!   leading or trailing dim-0 rows without disturbing either existing
-//!   slice's own stride (a dim-0 narrow's stride is invariant to how many
-//!   OTHER rows exist elsewhere in the buffer) — noted for the record, not
-//!   implemented: see "Bias: a domain refusal" below for why this op still
-//!   refuses a bias today.
+//! - `ab`: `F32` `[in + out + bias_rows, rank]`, THE pack layout — row 0
+//!   through `in - 1` holds `A^T` (`[in, rank]`), row `in` through
+//!   `in + out - 1` holds `B` AS-IS (`[out, rank]`, no pre-transpose), and
+//!   — only when `self.has_bias` (`bias_rows =
+//!   out_features.div_ceil(rank)`, else `bias_rows == 0` and this third
+//!   block is entirely absent) — row `in + out` through
+//!   `in + out + bias_rows - 1` holds the FROZEN base bias, flattened
+//!   row-major into `bias_rows * rank` slots and zero-padded past
+//!   `out_features`: `Tensor::cat([A.t(), B, bias_pack], 0)`, built at the
+//!   call site fresh every forward (see `crate::lora_linear`'s
+//!   `LoraLinear::forward`, the fused arm's `ab` assembly). See "the
+//!   packed-`ab` GEMM eligibility problem" below for why THIS orientation
+//!   (stack along the ROW axis, dim 0) rather than the column axis is what
+//!   makes every GEMM-bound slice GEMM-eligible with zero copies; the bias
+//!   block is never itself a GEMM operand (it is read as a flat `[out]`
+//!   slice — "Every rounding point, forward", step 1b, below), so it
+//!   carries no eligibility question of its own. `Tensor::cat`'s own
+//!   backward (`Op::Cat`, `backprop.rs:469`) splits this op's `d_ab`
+//!   gradient back into `dA^T`/`dB`/(a discarded, all-zero bias-block
+//!   gradient) via cheap `narrow`s. The row-stacked layout is what makes
+//!   appending this bias block possible at all without disturbing either
+//!   existing slice's own stride (a dim-0 narrow's stride is invariant to
+//!   how many OTHER rows exist elsewhere in the buffer) — the layout the
+//!   "Bias" section below anticipated, and this revision actually
+//!   implements.
 //!
 //! ## Every rounding point, forward
 //!
@@ -88,6 +97,23 @@
 //!    round-the-delta-first model an earlier revision of this doc and
 //!    [`super::ScaledCastAdd`]'s module doc both claimed without checking
 //!    PEFT source).
+//!
+//! Step 1b (only when `self.has_bias`, inserted immediately after step 1,
+//! before step 2): `base = base.broadcast_add(bias)` at the STORAGE level
+//! — `bias` is `ab`'s trailing `[out]` slice (see the `ab` bullet above
+//! and "Bias: packed into `ab`'s trailing rows" below for the pack layout
+//! and the full rounding-point enumeration this reproduces). One rounding
+//! point when `base`'s dtype is `BF16`/`F16` (candle's `Add` never widens);
+//! none at `F32`. Also one ALLOCATION cost per site per forward,
+//! independent of that rounding question: [`LowRankResidualLinear::apply_bias_if_present`]'s
+//! own `ab_storage.to_dtype(&bias_l, base_dtype)` call always materializes
+//! a FRESH, offset-0 gather-copy of the bias slice — `to_dtype` never
+//! special-cases a same-dtype pair into a no-op — so this extra buffer is
+//! paid even at `F32`, not only when the bias slice is actually widened
+//! from `BF16`/`F16`. Negligible next to the three real GEMMs, stated
+//! honestly here rather than folded silently into "no extra cost" (the
+//! same disclosure register "Every rounding point, backward"'s own
+//! per-site `zeros_like` bullet uses, below).
 //!
 //! ## Every rounding point, backward
 //!
@@ -136,6 +162,17 @@
 //!    `BF16`, exact for `F32`).
 //! 8. `dW = dy^T @ x` (only when `self.dweight_needed`) — same `F32`/`BF16`
 //!    GEMM rounding as step 6, no cast.
+//! 9. `d_ab = cat([dA^T, dB, zeros(bias_rows, rank)])` (only when
+//!    `self.has_bias`, else the two-argument `cat([dA^T, dB])` unchanged) —
+//!    the frozen bias contributes no gradient of its own (it is not an
+//!    input this op differentiates with respect to), but `Tensor::cat`'s
+//!    backward (`Op::Cat`, `backprop.rs:469-478`) narrows `d_ab` per
+//!    FORWARD argument and `or_insert`s every one of them — the bias
+//!    block's slot must exist, at the full `[bias_rows, rank]` shape, or
+//!    that narrow has nothing to read. One `zeros_like([bias_rows, rank])`
+//!    per site per backward — negligible next to the three real GEMMs,
+//!    stated honestly here rather than folded silently into "no extra
+//!    cost".
 //!
 //! ## The packed-`ab` GEMM eligibility problem (and its fix)
 //!
@@ -226,23 +263,94 @@
 //! op constructs directly, e.g. `check_w_and_ab`'s refusals, is never
 //! passed through `.bt()` and needs no peeling).
 //!
-//! ## Bias: a domain refusal, not packed into `ab`
+//! ## Bias: packed into `ab`'s trailing rows, not a domain refusal
 //!
 //! A frozen linear base MAY carry a bias (`candle_nn::linear`'s
-//! `bias.is_some()`); this op has no bias slot. Packing a bias
-//! contribution into a single augmented matmul was evaluated and
-//! rejected: turning `y = x @ w^T + b` into a single matmul over an
-//! AUGMENTED input
-//! requires appending a constant `1` COLUMN to `x` itself (the classic
-//! bias-as-augmented-feature trick) — which changes `x`'s own domain
-//! (`in` -> `in + 1`) and, worse, would need that constant column
-//! EXCLUDED from dropout's per-element Bernoulli draw (a bias term is
-//! never dropped), breaking the clean "every element of `x32` is an
-//! independent dropout draw" domain this op (and `DropoutFused`) is built
-//! on. That is not a clean fusion — a real structural change to `x`'s
-//! shape and dropout's own domain — so `bias.is_some()` stays a domain
-//! refusal (counted eager fallback at the call site), matching the
-//! contract's explicit escape hatch for this evaluation.
+//! `bias.is_some()`) — `has_bias` (construction data, `Copy`, set ONCE by
+//! the call site via [`LowRankResidualLinear::with_bias`]) tells this op
+//! whether `ab` carries the third block described above. An EARLIER
+//! revision of this op refused a biased base outright (a domain miss,
+//! counted eager fallback at the call site) on the theory that folding a
+//! bias into a single augmented matmul requires appending a constant `1`
+//! COLUMN to `x` itself (the classic bias-as-augmented-feature trick) —
+//! true for THAT fusion strategy (it would change `x`'s own domain and
+//! need the constant column excluded from dropout's per-element Bernoulli
+//! draw), but a bias can instead be added as a SEPARATE storage-level step
+//! (forward step 1b below) entirely outside the GEMM and entirely outside
+//! dropout's own domain — `x`'s shape and every element of `x32`'s
+//! independent per-element dropout draw are both untouched. The earlier
+//! rejection targeted the wrong fusion shape, not a genuine impossibility.
+//!
+//! ### The three-variant rounding-point enumeration (rules 1-2)
+//!
+//! 1. **torch / PEFT.** PEFT v0.17.0 `src/peft/tuners/lora/layer.py:755-778`:
+//!    `result = self.base_layer(x)` is `F.linear`, whose bf16/CUDA path
+//!    folds the bias into the cuBLASLt epilogue in `f32` compute and
+//!    rounds ONCE — torch v2.8.0
+//!    `aten/src/ATen/native/cuda/Blas.cpp:373-383`'s `useLtInterface`
+//!    (a 1-D bias, `beta == 1`, dtype in `{double, float, half, bf16}`)
+//!    selects `:472`'s `gemm_and_bias`, which issues
+//!    `aten/src/ATen/cuda/CUDABlas.cpp:1577`'s `CUBLAS_COMPUTE_32F` GEMM
+//!    with `:1639`'s `CUBLASLT_EPILOGUE_BIAS` — the bias is added inside
+//!    the `f32` accumulator, one rounding when the result narrows to the
+//!    base dtype. Then `result + lora_B(lora_A(dropout(x))) * scaling`
+//!    (after `_cast_input_dtype`) promotes to `f32` and
+//!    `result.to(torch_result_dtype)` rounds a SECOND time.
+//! 2. **candle eager** (`candle_nn::Linear::forward`, the composition this
+//!    op replaces): the GEMM itself emits `base`-dtype output (rounding
+//!    1), `x.broadcast_add(bias)` (`candle-nn/src/linear.rs:76`) rounds a
+//!    SECOND time (`bf16 + bf16 -> bf16`, no `f32` accumulator — candle's
+//!    CPU/CUDA `Add` never widens), and this op's own `ScaledCastAdd`
+//!    epilogue rounds a THIRD time (see "Every rounding point, forward",
+//!    step 6, below).
+//! 3. **A hypothetical `f32`-epilogue fold** (bias added inside an `f32`
+//!    accumulator this op does not have access to, mirroring variant 1's
+//!    mechanism but INSIDE `ScaledCastAdd`'s own epilogue rather than
+//!    inside the base GEMM) would round only ONCE overall — MORE accurate
+//!    than torch, and not what either torch or candle-eager actually
+//!    computes. candle-core 0.11's `BackendStorage::matmul` never exposes
+//!    an `f32` accumulator to the caller (its `MatMul` impl returns
+//!    storage already narrowed to the GEMM's own output dtype) — torch's
+//!    exact rounding order is therefore UNREACHABLE from any composition
+//!    candle can express, fused or eager.
+//!
+//! **jammi picks variant 2 — bit-exact parity with candle-eager, not
+//! variant 1 or 3 — because torch's own order is unreachable from candle
+//! and matching jammi's OWN eager composition (the thing this op is a
+//! drop-in replacement for) is the contract every other cross-arm oracle
+//! in this crate already holds fused ops to** (the same doctrine
+//! `cpu_f32_matches_manual_composition_bit_exact` states, restated here
+//! at the bias block): forward step 1b below issues the SAME
+//! `binary_impl::<candle_core::op::Add>` storage call `Tensor::broadcast_add`
+//! makes (`tensor.rs:137-156`'s `broadcast_binary_op` macro, specialized:
+//! `base`'s shape `(m, out)` already equals the broadcast result, so only
+//! `bias` broadcasts — the macro's own `(false, true)` arm,
+//! `lhs.add(&rhs.broadcast_as(&shape)?)`), so the fused-with-bias forward
+//! is BIT-IDENTICAL to eager `Linear::forward` on both backends. The real,
+//! disclosed accuracy difference from torch is documented here, not
+//! silently introduced (family D: a confident wrong number is worse than
+//! a documented divergence), and it is PRE-EXISTING in jammi-eager (the
+//! ordinary, non-fused `LoraLinear::forward_composed` / `eager_epilogue`
+//! path already rounds this way), not a regression this fusion
+//! introduces.
+//!
+//! ### The pack layout and the forward/backward mechanics
+//!
+//! See the module doc's `ab` bullet above for the three-block pack layout
+//! (`A^T`, `B`, the bias block) and "Every rounding point, forward"/
+//! "backward" below for step 1b and the `d_ab` padding. `bias_rows =
+//! out_features.div_ceil(rank)` (`LowRankResidualLinear::bias_rows`,
+//! private, derived — never a second stored copy of this count): the
+//! smallest row count whose `bias_rows * rank` element budget can hold
+//! `out_features` values, zero-padded past `out_features`. The padding is
+//! never read: forward step 1b only ever takes the first `out_features`
+//! of the `bias_rows * rank`-element block, and backward's `d_ab` supplies
+//! an all-zero block of the exact same `[bias_rows, rank]` shape so
+//! `Tensor::cat`'s own per-argument split (`Op::Cat`'s backward,
+//! `backprop.rs:469-478`) has something the right shape to narrow out —
+//! this op never needs to know or reconstruct the padding's own values.
+//! `out_features < rank` (`bias_rows == 1`, the minimum) is a normal,
+//! covered case, not a boundary special-case.
 //!
 //! ## The `w` x `dweight_needed` lattice (family D, rule 3: full state
 //! ## enumeration for every guard on `w`'s tracked state)
@@ -276,13 +384,18 @@
 //!
 //! ## Domain (family D / K2)
 //!
-//! `x` rank 2 or 3, `w` rank 2 `[out, in]`, `ab` rank 2 `[in+out, rank]`
-//! (see "the packed-`ab` GEMM eligibility problem" above for why THIS
-//! orientation, not `[rank, in+out]`); dtype pairs `(F32, F32, F32)` and
-//! `(BF16, BF16, F32)` (base dtype must match between `x`/`w`; `ab` is
-//! always `F32` by this op's own domain requirement, regardless of the
-//! base dtype — see [`super::ScaledCastAdd`]'s own doc for the analogous
-//! epilogue requirement);
+//! `x` rank 2 or 3, `w` rank 2 `[out, in]`, `ab` rank 2
+//! `[in+out+bias_rows, rank]` (`bias_rows == 0` unless `self.has_bias`;
+//! see "the packed-`ab` GEMM eligibility problem" above for why THIS
+//! orientation, not `[rank, in+out(+bias_rows)]`); dtype pairs
+//! `(F32, F32, F32)`, `(BF16, BF16, F32)`, and `(F16, F16, F32)` (campaign
+//! #443 D1 widens the CUDA arm's — and, per `cpu_f16_matches_manual_composition_bit_exact`,
+//! the CPU arm's — admitted dtype set to include `F16`; the stale two-row
+//! version of this table predates that widening) (base dtype must match
+//! between `x`/`w`; `ab` is always `F32` by this op's own domain
+//! requirement, regardless of the base dtype — see
+//! [`super::ScaledCastAdd`]'s own doc for the analogous epilogue
+//! requirement);
 //! `w`/`ab` contiguous (`Layout::is_contiguous`) — a hard refusal, since
 //! the call site is expected to control their layout by construction
 //! (a `VarBuilder`-loaded weight, a freshly `Tensor::cat`-ed `ab`); `x` MAY
@@ -366,6 +479,20 @@ pub struct LowRankResidualLinear {
     /// `dweight_needed` lattice" in the module doc for the full state
     /// table both gates jointly cover.
     pub dweight_needed: bool,
+    /// Whether `ab` carries a third, trailing block of `bias_rows =
+    /// out_features.div_ceil(rank)` rows holding the frozen base bias
+    /// (see the module doc's "Bias: packed into `ab`'s trailing rows"
+    /// section) — another semantic choice frozen into this `Copy`
+    /// instance as construction data (the same "`dgamma_needed`"/
+    /// `dweight_needed` idiom this crate uses throughout, never a prose
+    /// convention the call site and this op could silently disagree
+    /// about). `false` by default ([`Self::new`]'s signature is unchanged
+    /// — every existing call site stays bias-free unless it explicitly
+    /// opts in via [`Self::with_bias`]). Read only through this type's own
+    /// private `bias_rows` accessor — never re-derived ad hoc at a second
+    /// call site — by `check_w_and_ab`, `cpu_fwd`, `cuda_fwd`, and `bwd`
+    /// alike.
+    pub has_bias: bool,
 }
 
 impl LowRankResidualLinear {
@@ -417,7 +544,47 @@ impl LowRankResidualLinear {
             rank,
             dropout,
             dweight_needed,
+            has_bias: false,
         })
+    }
+
+    /// Opt into the bias-carrying pack (see the module doc's "Bias: packed
+    /// into `ab`'s trailing rows" section) — the ONLY way `has_bias`
+    /// becomes `true`; [`Self::new`]'s own 6-argument signature is left
+    /// unchanged so every one of this crate's ~50 existing call sites
+    /// keeps constructing a bias-free op without modification. Consuming
+    /// `self` and returning `Self` (rather than `&mut self`) matches this
+    /// `Copy` type's usual builder-free construction style — a call site
+    /// writes `LowRankResidualLinear::new(..)?.with_bias(pack.is_some())`
+    /// (`crate::lora_linear`'s fused arm) as one expression.
+    pub fn with_bias(mut self, has_bias: bool) -> Self {
+        self.has_bias = has_bias;
+        self
+    }
+
+    /// The bias block's row count within `ab` — `0` unless `self.has_bias`,
+    /// else the smallest row count whose `bias_rows * rank` element budget
+    /// can hold `out_features` values (`out_features.div_ceil(rank)`,
+    /// zero-padded past `out_features` — see the module doc's "Bias" and
+    /// `ab` sections). Private and derived on every call rather than
+    /// stored a second time: `has_bias`/`out_features`/`rank` are already
+    /// this `Copy` instance's own single source of truth, and a cached
+    /// second copy of their derived product is exactly the kind of
+    /// drifting duplicate state this crate's "construction data, never a
+    /// second copy" doctrine (see `dweight_needed`'s own field doc) warns
+    /// against. Shared by `check_w_and_ab`, `cpu_fwd`, `cuda_fwd`, and
+    /// `bwd` — every one of them calls this, none of them recomputes
+    /// `out_features.div_ceil(rank)` inline. `pub(crate)`, not fully
+    /// private, for the same reason `flatten_x`/`check_w_and_ab`/
+    /// `output_shape` already are: `crate::cuda::low_rank_residual_linear::cuda_fwd`
+    /// lives in a sibling module and needs the identical derivation, not a
+    /// second copy of it.
+    pub(crate) fn bias_rows(&self) -> usize {
+        if self.has_bias {
+            self.out_features.div_ceil(self.rank)
+        } else {
+            0
+        }
     }
 
     /// `[.., in_features]` -> `(rows, in_features)`, where `rows` is the
@@ -470,11 +637,19 @@ impl LowRankResidualLinear {
                 l2.dims()
             )));
         }
-        if ab_dims != [self.in_features + self.out_features, self.rank] {
+        let bias_rows = self.bias_rows();
+        let expected_rows = self.in_features + self.out_features + bias_rows;
+        if ab_dims != [expected_rows, self.rank] {
             return Err(Error::Msg(format!(
-                "low_rank_residual_linear: ab must be [{}, {}], got {:?}",
-                self.in_features + self.out_features,
+                "low_rank_residual_linear: ab must be [{expected_rows}, {}] ({} a {bias_rows}-row \
+                 bias block, has_bias={}), got {:?}",
                 self.rank,
+                if self.has_bias {
+                    "expecting"
+                } else {
+                    "not expecting"
+                },
+                self.has_bias,
                 ab_dims
             )));
         }
@@ -498,6 +673,77 @@ impl LowRankResidualLinear {
             .last_mut()
             .expect("flatten_x already checked rank >= 2") = self.out_features;
         Shape::from(dims)
+    }
+
+    /// Forward step 1b (see the module doc's "Every rounding point,
+    /// forward" and "Bias: packed into `ab`'s trailing rows" sections): a
+    /// no-op returning `base_storage` unchanged when `!self.has_bias`;
+    /// otherwise adds `ab`'s trailing bias block to `base_storage` via
+    /// candle's OWN `broadcast_add` storage call, bit-identical to eager
+    /// `candle_nn::Linear::forward`'s `x.broadcast_add(bias)`
+    /// (`candle-nn/src/linear.rs:76`). `pub(crate)`, generic over
+    /// `S: BackendStorage` — shared verbatim by `cpu_fwd` (this file) and
+    /// `crate::cuda::low_rank_residual_linear::cuda_fwd` (a sibling
+    /// module), the same "one CPU/CUDA-generic helper" shape
+    /// `materialize_contiguous_if_needed` already uses below, so this
+    /// storage-level bias add has exactly one implementation, not two that
+    /// could drift.
+    ///
+    /// `ab_storage`/`ab_l` are the CALLER's `ab` argument (`s3`/`l3` in
+    /// both `cpu_fwd` and `cuda_fwd`) — `check_w_and_ab` has already
+    /// verified `ab`'s shape and `F32` dtype by the time either forward
+    /// reaches this call. `check_w_and_ab` does NOT check `ab`'s
+    /// contiguity — that is a SEPARATE `RequiresContiguous` loop
+    /// (`for (l, what) in [(l2, "w"), (l3, "ab")] { ... }`) both
+    /// `cpu_fwd` and `cuda_fwd` run before calling this function, which
+    /// is why `bias_start` below can safely derive an absolute offset
+    /// from `ab_l.start_offset()`: that derivation is only valid against
+    /// a genuinely contiguous layout. This function re-checks the same
+    /// fact independently rather than trusting either caller's loop
+    /// (family D: an op trusts no caller for its own domain — the same
+    /// doctrine `materialize_contiguous_if_needed`'s own doc states),
+    /// since it is `pub(crate)` and therefore reachable from a test
+    /// calling it directly, bypassing both loops. The bias slots occupy
+    /// `ab`'s trailing `bias_rows * rank` elements, row-major-flattened;
+    /// only the first `out_features` of those are ever read (the module
+    /// doc's "Bias" section states why the zero-padded remainder needs no
+    /// special handling here).
+    pub(crate) fn apply_bias_if_present<S: BackendStorage>(
+        &self,
+        base_storage: S,
+        base_l: &Layout,
+        ab_storage: &S,
+        ab_l: &Layout,
+        base_dtype: DType,
+        m: usize,
+    ) -> Result<S> {
+        if !self.has_bias {
+            return Ok(base_storage);
+        }
+        if ab_l.contiguous_offsets().is_none() {
+            return Err(Error::RequiresContiguous {
+                op: "low_rank_residual_linear(ab)",
+            });
+        }
+        let outf = self.out_features;
+        let bias_start = ab_l.start_offset() + (self.in_features + outf) * self.rank;
+        let bias_l = Layout::contiguous_with_offset((outf,), bias_start);
+        // A FRESH, offset-0 storage: `to_dtype` always materializes a new
+        // buffer regardless of the dtype pair (the same idiom
+        // `materialize_contiguous_if_needed`'s doc and this file's own
+        // `s3.to_dtype` calls elsewhere use) — never reuse `bias_l`'s own
+        // offset against the RESULT (rule 11: the offset trap; the result
+        // is its own fresh allocation, `Layout::contiguous((outf,))`, not
+        // a view into `ab_storage` at `bias_l`'s offset).
+        let bias_storage = ab_storage.to_dtype(&bias_l, base_dtype)?;
+        let bias_l_fresh = Layout::contiguous((outf,));
+        let broadcast_l = bias_l_fresh.broadcast_as((m, outf))?;
+        // The EXACT storage call `Tensor::broadcast_add` makes
+        // (`tensor.rs:137-156`'s `broadcast_binary_op` macro): `base`'s
+        // shape `(m, outf)` already equals the broadcast result (so `base`
+        // itself never broadcasts, only `bias` does), matching that
+        // macro's own `(false, true)` arm.
+        base_storage.binary_impl::<candle_core::op::Add>(&bias_storage, base_l, &broadcast_l)
     }
 }
 
@@ -653,6 +899,13 @@ impl CustomOp3 for LowRankResidualLinear {
         let w_t_l = l2.transpose(0, 1)?;
         let base_storage = s1.matmul(s2, (1, m, outf, inf), &x2d_l, &w_t_l)?;
         let base_l = Layout::contiguous((m, outf));
+
+        // Step 1b: base = base + bias (only when self.has_bias) — see
+        // `apply_bias_if_present`'s own doc and the module doc's "Bias"
+        // section for the full rounding-point enumeration this reproduces
+        // bit-exactly against eager `Linear::forward`.
+        let base_storage =
+            self.apply_bias_if_present(base_storage, &base_l, s3, l3, s1.dtype(), m)?;
 
         // Step 2: x32 = to_dtype(x, F32) — a layout-aware gather, exact
         // when x is already F32.
@@ -944,7 +1197,20 @@ impl CustomOp3 for LowRankResidualLinear {
             None
         };
 
-        let d_ab = Tensor::cat(&[&d_a_t, &d_b], 0)?;
+        // `d_ab` at the FULL padded shape (see the module doc's backward
+        // enumeration, step 9): a frozen bias contributes no gradient of
+        // its own, but `Tensor::cat`'s own backward (`Op::Cat`,
+        // `backprop.rs:469-478`) narrows `d_ab` per FORWARD argument and
+        // `or_insert`s every one of them, so the bias block's slot must
+        // exist at the full `[bias_rows, rank]` shape or that narrow has
+        // nothing to read.
+        let bias_rows = self.bias_rows();
+        let d_ab = if bias_rows > 0 {
+            let d_bias = Tensor::zeros((bias_rows, self.rank), DType::F32, x.device())?;
+            Tensor::cat(&[&d_a_t, &d_b, &d_bias], 0)?
+        } else {
+            Tensor::cat(&[&d_a_t, &d_b], 0)?
+        };
 
         Ok((Some(dx), dw, Some(d_ab)))
     }
@@ -953,7 +1219,7 @@ impl CustomOp3 for LowRankResidualLinear {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::{Device, Var};
+    use candle_core::{Device, Storage, Var};
     use half::bf16;
 
     /// Small-integer-valued, deterministic fixture (`{-4, .., 4}`, no
@@ -2615,5 +2881,624 @@ mod tests {
             ),
             other => panic!("expected RequiresContiguous{{op: \"...(w)\"}}, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // #428 P2b: the bias-carrying pack. `pack_ab`'s sibling
+    // (`pack_ab_with_bias`) and `reference_forward`'s sibling
+    // (`reference_forward_with_bias`) below are the shared fixtures every
+    // test in this section builds on.
+    // -----------------------------------------------------------------
+
+    /// `pack_ab`'s bias-carrying sibling: appends the FROZEN bias's own
+    /// `bias_rows = outf.div_ceil(r)` rows, flattened row-major and
+    /// zero-padded past `outf` — the exact layout `check_w_and_ab`/
+    /// `apply_bias_if_present` expect when `has_bias == true` (see the
+    /// module doc's "Bias" section).
+    fn pack_ab_with_bias(
+        a: &[f32],
+        inf: usize,
+        b: &[f32],
+        outf: usize,
+        r: usize,
+        bias: &[f32],
+        device: &Device,
+    ) -> Tensor {
+        assert_eq!(bias.len(), outf, "bias must have exactly outf elements");
+        let ab_no_bias = pack_ab(a, inf, b, outf, r, device);
+        let bias_rows = outf.div_ceil(r);
+        let mut bias_padded = vec![0.0f32; bias_rows * r];
+        bias_padded[..outf].copy_from_slice(bias);
+        let bias_tensor = Tensor::from_slice(&bias_padded, (bias_rows, r), device).unwrap();
+        Tensor::cat(&[&ab_no_bias, &bias_tensor], 0).unwrap()
+    }
+
+    /// [`reference_forward`] plus the frozen bias, added per output column
+    /// — an independent, closed-form `f64` extension of the SAME oracle
+    /// (family F: computed with no shared code path with the op under
+    /// test).
+    #[allow(clippy::too_many_arguments)]
+    fn reference_forward_with_bias(
+        x: &[f32],
+        rows: usize,
+        inf: usize,
+        w: &[f32],
+        outf: usize,
+        a: &[f32],
+        r: usize,
+        b: &[f32],
+        scale: f32,
+        dropout_mask: Option<&[f32]>,
+        bias: &[f32],
+    ) -> Vec<f32> {
+        let mut out = reference_forward(x, rows, inf, w, outf, a, r, b, scale, dropout_mask);
+        for i in 0..rows {
+            for o in 0..outf {
+                out[i * outf + o] += bias[o];
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn cpu_f32_bias_matches_a_closed_form_reference() {
+        let device = Device::Cpu;
+        let rows = 6;
+        let inf = 5;
+        let outf = 7;
+        let r = 3; // bias_rows = 7.div_ceil(3) = 3: a multi-row bias block.
+        let scale = 1.7f32;
+
+        let x_v: Vec<f32> = (0..rows * inf).map(|i| ((i as f32) * 0.31).sin()).collect();
+        let w_v: Vec<f32> = (0..outf * inf).map(|i| ((i as f32) * 0.17).cos()).collect();
+        let a_v: Vec<f32> = (0..r * inf)
+            .map(|i| ((i as f32) * 0.11 + 0.4).sin())
+            .collect();
+        let b_v: Vec<f32> = (0..outf * r)
+            .map(|i| ((i as f32) * 0.23 - 0.2).cos())
+            .collect();
+        let bias_v: Vec<f32> = (0..outf)
+            .map(|i| ((i as f32) * 0.53 + 0.1).sin() * 0.5)
+            .collect();
+
+        let x = Tensor::from_slice(&x_v, (rows, inf), &device).unwrap();
+        let w = Tensor::from_slice(&w_v, (outf, inf), &device).unwrap();
+        let ab = pack_ab_with_bias(&a_v, inf, &b_v, outf, r, &bias_v, &device);
+
+        let op = LowRankResidualLinear::new(scale, inf, outf, r, None, false)
+            .unwrap()
+            .with_bias(true);
+        let got = fused_forward(&x, &w, &ab, op)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        let got_flat: Vec<f32> = got.into_iter().flatten().collect();
+
+        let expected = reference_forward_with_bias(
+            &x_v, rows, inf, &w_v, outf, &a_v, r, &b_v, scale, None, &bias_v,
+        );
+        for i in 0..rows * outf {
+            let diff = (got_flat[i] - expected[i]).abs();
+            assert!(
+                diff < 1e-4,
+                "index {i}: got {} expected {} diff {diff}",
+                got_flat[i],
+                expected[i]
+            );
+        }
+    }
+
+    #[test]
+    fn cpu_f32_bias_rank3_matches_the_reshape_flattened_reference() {
+        let device = Device::Cpu;
+        let (b, s, inf, outf, r) = (2usize, 3usize, 4usize, 6usize, 2usize);
+        let rows = b * s;
+        let scale = 0.9f32;
+
+        let x_v: Vec<f32> = (0..rows * inf).map(|i| ((i as f32) * 0.13).sin()).collect();
+        let w_v: Vec<f32> = (0..outf * inf).map(|i| ((i as f32) * 0.07).cos()).collect();
+        let a_v: Vec<f32> = (0..r * inf).map(|i| ((i as f32) * 0.05).sin()).collect();
+        let b_v: Vec<f32> = (0..outf * r).map(|i| ((i as f32) * 0.09).cos()).collect();
+        let bias_v: Vec<f32> = (0..outf)
+            .map(|i| ((i as f32) * 0.61 + 0.2).cos() * 0.3)
+            .collect();
+
+        let x = Tensor::from_slice(&x_v, (b, s, inf), &device).unwrap();
+        let w = Tensor::from_slice(&w_v, (outf, inf), &device).unwrap();
+        let ab = pack_ab_with_bias(&a_v, inf, &b_v, outf, r, &bias_v, &device);
+
+        let op = LowRankResidualLinear::new(scale, inf, outf, r, None, false)
+            .unwrap()
+            .with_bias(true);
+        let got = fused_forward(&x, &w, &ab, op).unwrap();
+        assert_eq!(got.dims(), &[b, s, outf]);
+        let got_flat: Vec<f32> = got.flatten_all().unwrap().to_vec1().unwrap();
+
+        let expected = reference_forward_with_bias(
+            &x_v, rows, inf, &w_v, outf, &a_v, r, &b_v, scale, None, &bias_v,
+        );
+        for i in 0..rows * outf {
+            assert!((got_flat[i] - expected[i]).abs() < 1e-4, "index {i}");
+        }
+    }
+
+    #[test]
+    fn cpu_f32_bias_matches_manual_composition_bit_exact() {
+        // Exact-integer fixtures (see `exact_fixture`'s own doc): every
+        // internal GEMM/add sum stays an exact integer, so this must be
+        // bit-exact on ANY architecture.
+        let device = Device::Cpu;
+        let (rows, inf, outf, r) = (4usize, 3usize, 5usize, 2usize);
+        let scale = 2.0f32; // exact in binary: no epilogue rounding either.
+
+        let x_v = exact_fixture(rows * inf, 1);
+        let w_v = exact_fixture(outf * inf, 2);
+        let a_v = exact_fixture(r * inf, 3);
+        let b_v = exact_fixture(outf * r, 4);
+        let bias_v = exact_fixture(outf, 9);
+
+        let x = Tensor::from_slice(&x_v, (rows, inf), &device).unwrap();
+        let w = Tensor::from_slice(&w_v, (outf, inf), &device).unwrap();
+        let a = Tensor::from_slice(&a_v, (r, inf), &device).unwrap();
+        let b = Tensor::from_slice(&b_v, (outf, r), &device).unwrap();
+        let bias = Tensor::from_slice(&bias_v, (outf,), &device).unwrap();
+        let ab = pack_ab_with_bias(&a_v, inf, &b_v, outf, r, &bias_v, &device);
+
+        let op = LowRankResidualLinear::new(scale, inf, outf, r, None, false)
+            .unwrap()
+            .with_bias(true);
+        let fused = fused_forward(&x, &w, &ab, op).unwrap();
+
+        // Manual eager reconstruction WITH the bias, mirroring
+        // `candle_nn::Linear::forward`'s own `x.broadcast_add(bias)`
+        // literally (the module doc's "Bias" section cites that call).
+        let base_out = x
+            .matmul(&w.t().unwrap())
+            .unwrap()
+            .broadcast_add(&bias)
+            .unwrap();
+        let after_a = x.matmul(&a.t().unwrap()).unwrap();
+        let lora_out = after_a.matmul(&b.t().unwrap()).unwrap();
+        let scaled = (&lora_out * f64::from(scale)).unwrap();
+        let manual = (&base_out + &scaled).unwrap();
+
+        assert_eq!(
+            fused.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            manual.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            "F32, no dropout, WITH bias: must be bit-exact against the eager composition"
+        );
+    }
+
+    /// `out_features < rank` (`bias_rows == 1`, the minimum non-zero
+    /// value) is a normal, covered case — not a boundary special-case
+    /// (the module doc's own claim, pinned here).
+    #[test]
+    fn out_less_than_rank_bias_rows_one_matches_manual_composition_bit_exact() {
+        let device = Device::Cpu;
+        let (rows, inf, outf, r) = (3usize, 4usize, 2usize, 8usize);
+        assert_eq!(outf.div_ceil(r), 1, "fixture must exercise bias_rows == 1");
+        let scale = 2.0f32;
+
+        let x_v = exact_fixture(rows * inf, 1);
+        let w_v = exact_fixture(outf * inf, 2);
+        let a_v = exact_fixture(r * inf, 3);
+        let b_v = exact_fixture(outf * r, 4);
+        let bias_v = exact_fixture(outf, 9);
+
+        let x = Tensor::from_slice(&x_v, (rows, inf), &device).unwrap();
+        let w = Tensor::from_slice(&w_v, (outf, inf), &device).unwrap();
+        let a = Tensor::from_slice(&a_v, (r, inf), &device).unwrap();
+        let b = Tensor::from_slice(&b_v, (outf, r), &device).unwrap();
+        let bias = Tensor::from_slice(&bias_v, (outf,), &device).unwrap();
+        let ab = pack_ab_with_bias(&a_v, inf, &b_v, outf, r, &bias_v, &device);
+
+        let op = LowRankResidualLinear::new(scale, inf, outf, r, None, false)
+            .unwrap()
+            .with_bias(true);
+        let fused = fused_forward(&x, &w, &ab, op).unwrap();
+
+        let base_out = x
+            .matmul(&w.t().unwrap())
+            .unwrap()
+            .broadcast_add(&bias)
+            .unwrap();
+        let after_a = x.matmul(&a.t().unwrap()).unwrap();
+        let lora_out = after_a.matmul(&b.t().unwrap()).unwrap();
+        let scaled = (&lora_out * f64::from(scale)).unwrap();
+        let manual = (&base_out + &scaled).unwrap();
+
+        assert_eq!(
+            fused.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            manual.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            "out < rank (bias_rows == 1): must be bit-exact against the eager composition"
+        );
+    }
+
+    /// Central-finite-difference gradcheck WITH a bias present (the same
+    /// discipline `gradcheck_cpu_f32_no_dropout` uses, non-uniform `dy`)
+    /// PLUS the assertion that `d_ab`'s bias rows come back EXACTLY zero
+    /// straight out of `bwd` — the frozen bias contributes no gradient of
+    /// its own (module doc's backward enumeration, step 9), checked by
+    /// calling `bwd` DIRECTLY rather than trusting `Tensor::backward`'s
+    /// own `Op::Cat` narrow-and-discard to have silently done the right
+    /// thing.
+    #[test]
+    fn gradcheck_cpu_f32_bias_no_dropout_and_d_ab_bias_rows_are_zero() {
+        let device = Device::Cpu;
+        let (rows, inf, outf, r) = (3usize, 3usize, 4usize, 2usize);
+        let scale = 1.1f32;
+        let eps = 1e-3f32;
+
+        let x_v: Vec<f32> = (0..rows * inf)
+            .map(|i| ((i as f32) * 0.27).sin() * 0.5)
+            .collect();
+        let w_v: Vec<f32> = (0..outf * inf)
+            .map(|i| ((i as f32) * 0.19).cos() * 0.5)
+            .collect();
+        let a_v: Vec<f32> = (0..r * inf)
+            .map(|i| ((i as f32) * 0.31).sin() * 0.5)
+            .collect();
+        let b_v: Vec<f32> = (0..outf * r)
+            .map(|i| ((i as f32) * 0.23).cos() * 0.5)
+            .collect();
+        let bias_v: Vec<f32> = (0..outf).map(|i| ((i as f32) * 0.41).sin() * 0.3).collect();
+        let dy_v: Vec<f32> = (0..rows * outf)
+            .map(|i| ((i as f32) * 0.71).sin())
+            .collect();
+
+        let loss = |x_v: &[f32], a_v: &[f32], b_v: &[f32]| -> f32 {
+            let out = reference_forward_with_bias(
+                x_v, rows, inf, &w_v, outf, a_v, r, b_v, scale, None, &bias_v,
+            );
+            out.iter().zip(dy_v.iter()).map(|(&o, &g)| o * g).sum()
+        };
+
+        let x = Var::from_tensor(&Tensor::from_slice(&x_v, (rows, inf), &device).unwrap()).unwrap();
+        let w = Tensor::from_slice(&w_v, (outf, inf), &device).unwrap();
+        let a_var =
+            Var::from_tensor(&Tensor::from_slice(&a_v, (r, inf), &device).unwrap()).unwrap();
+        let b_var =
+            Var::from_tensor(&Tensor::from_slice(&b_v, (outf, r), &device).unwrap()).unwrap();
+        let a_t = a_var.as_tensor().t().unwrap();
+        let bias_rows = outf.div_ceil(r);
+        let mut bias_padded = vec![0.0f32; bias_rows * r];
+        bias_padded[..outf].copy_from_slice(&bias_v);
+        let bias_tensor = Tensor::from_slice(&bias_padded, (bias_rows, r), &device).unwrap();
+        let ab = Tensor::cat(&[&a_t, b_var.as_tensor(), &bias_tensor], 0).unwrap();
+
+        let op = LowRankResidualLinear::new(scale, inf, outf, r, None, false)
+            .unwrap()
+            .with_bias(true);
+        let out = x.as_tensor().apply_op3(&w, &ab, op).unwrap();
+        let dy = Tensor::from_slice(&dy_v, (rows, outf), &device).unwrap();
+        let total = (&out * &dy).unwrap().sum_all().unwrap();
+        let grads = total.backward().unwrap();
+
+        let da_analytic: Vec<f32> = grads
+            .get(&a_var)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let db_analytic: Vec<f32> = grads
+            .get(&b_var)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let dx_analytic: Vec<f32> = grads
+            .get(&x)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        for i in 0..rows * inf {
+            let mut xp = x_v.clone();
+            xp[i] += eps;
+            let mut xm = x_v.clone();
+            xm[i] -= eps;
+            let numeric = (loss(&xp, &a_v, &b_v) - loss(&xm, &a_v, &b_v)) / (2.0 * eps);
+            assert!(
+                (numeric - dx_analytic[i]).abs() < 5e-2,
+                "dx[{i}] with bias: numeric {numeric} vs analytic {}",
+                dx_analytic[i]
+            );
+        }
+        for i in 0..r * inf {
+            let mut ap = a_v.clone();
+            ap[i] += eps;
+            let mut am = a_v.clone();
+            am[i] -= eps;
+            let numeric = (loss(&x_v, &ap, &b_v) - loss(&x_v, &am, &b_v)) / (2.0 * eps);
+            assert!(
+                (numeric - da_analytic[i]).abs() < 5e-2,
+                "dA[{i}] with bias: numeric {numeric} vs analytic {}",
+                da_analytic[i]
+            );
+        }
+        for idx in 0..outf * r {
+            let mut bp = b_v.clone();
+            bp[idx] += eps;
+            let mut bm = b_v.clone();
+            bm[idx] -= eps;
+            let numeric = (loss(&x_v, &a_v, &bp) - loss(&x_v, &a_v, &bm)) / (2.0 * eps);
+            assert!(
+                (numeric - db_analytic[idx]).abs() < 5e-2,
+                "dB[{idx}] with bias: numeric {numeric} vs analytic {}",
+                db_analytic[idx]
+            );
+        }
+
+        // `bwd` DIRECTLY (bypassing `Tensor::backward`'s own `Op::Cat`
+        // narrow-and-discard): the bias rows of `d_ab` must be EXACTLY
+        // zero straight out of the op's own return value.
+        let res = x.as_tensor().apply_op3(&w, &ab, op).unwrap();
+        let grad_res = Tensor::ones_like(&res).unwrap();
+        let (_dx, _dw, d_ab) = op.bwd(x.as_tensor(), &w, &ab, &res, &grad_res).unwrap();
+        let d_ab = d_ab.unwrap();
+        let d_ab_bias_rows_v: Vec<f32> = d_ab
+            .narrow(0, inf + outf, bias_rows)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert!(
+            d_ab_bias_rows_v.iter().all(|&v| v == 0.0),
+            "d_ab's bias rows must be exactly zero, got {d_ab_bias_rows_v:?}"
+        );
+    }
+
+    #[test]
+    fn has_bias_true_with_a_bias_free_shaped_ab_is_refused() {
+        let device = Device::Cpu;
+        let (rows, inf, outf, r) = (3usize, 3usize, 4usize, 2usize);
+        let x = Tensor::from_slice(&exact_fixture(rows * inf, 1), (rows, inf), &device).unwrap();
+        let w = Tensor::from_slice(&exact_fixture(outf * inf, 2), (outf, inf), &device).unwrap();
+        // `ab` has NO bias block (the bias-free `[in+out, r]` shape) but
+        // `has_bias == true` expects `[in+out+bias_rows, r]`.
+        let ab = pack_ab(
+            &exact_fixture(r * inf, 3),
+            inf,
+            &exact_fixture(outf * r, 4),
+            outf,
+            r,
+            &device,
+        );
+        let op = LowRankResidualLinear::new(1.0, inf, outf, r, None, false)
+            .unwrap()
+            .with_bias(true);
+        let err = fused_forward(&x, &w, &ab, op)
+            .expect_err("has_bias=true with a bias-free ab must be refused");
+        match err {
+            Error::Msg(msg) => assert!(msg.contains("ab must be"), "got: {msg}"),
+            other => panic!("expected Error::Msg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn has_bias_false_with_a_bias_shaped_ab_is_refused() {
+        let device = Device::Cpu;
+        let (rows, inf, outf, r) = (3usize, 3usize, 4usize, 2usize);
+        let x = Tensor::from_slice(&exact_fixture(rows * inf, 1), (rows, inf), &device).unwrap();
+        let w = Tensor::from_slice(&exact_fixture(outf * inf, 2), (outf, inf), &device).unwrap();
+        let bias_v = exact_fixture(outf, 9);
+        // `ab` carries a bias block, but `has_bias == false` expects the
+        // two-block, bias-free shape.
+        let ab = pack_ab_with_bias(
+            &exact_fixture(r * inf, 3),
+            inf,
+            &exact_fixture(outf * r, 4),
+            outf,
+            r,
+            &bias_v,
+            &device,
+        );
+        let op = LowRankResidualLinear::new(1.0, inf, outf, r, None, false).unwrap();
+        assert!(!op.has_bias);
+        let err = fused_forward(&x, &w, &ab, op)
+            .expect_err("has_bias=false with a bias-shaped ab must be refused");
+        match err {
+            Error::Msg(msg) => assert!(msg.contains("ab must be"), "got: {msg}"),
+            other => panic!("expected Error::Msg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bias_block_off_by_one_row_count_is_refused() {
+        let device = Device::Cpu;
+        let (rows, inf, outf, r) = (3usize, 3usize, 7usize, 3usize); // bias_rows = 3
+        let bias_rows = outf.div_ceil(r);
+        assert_eq!(bias_rows, 3);
+        let x = Tensor::from_slice(&exact_fixture(rows * inf, 1), (rows, inf), &device).unwrap();
+        let w = Tensor::from_slice(&exact_fixture(outf * inf, 2), (outf, inf), &device).unwrap();
+        let a_v = exact_fixture(r * inf, 3);
+        let b_v = exact_fixture(outf * r, 4);
+        let ab_no_bias = pack_ab(&a_v, inf, &b_v, outf, r, &device);
+        // ONE ROW SHORT of the expected `bias_rows`-row bias block.
+        let short_bias_v = exact_fixture((bias_rows - 1) * r, 5);
+        let short_bias = Tensor::from_slice(&short_bias_v, (bias_rows - 1, r), &device).unwrap();
+        let ab = Tensor::cat(&[&ab_no_bias, &short_bias], 0).unwrap();
+        let op = LowRankResidualLinear::new(1.0, inf, outf, r, None, false)
+            .unwrap()
+            .with_bias(true);
+        let err = fused_forward(&x, &w, &ab, op)
+            .expect_err("an off-by-one bias row count must be refused");
+        match err {
+            Error::Msg(msg) => assert!(msg.contains("ab must be"), "got: {msg}"),
+            other => panic!("expected Error::Msg, got {other:?}"),
+        }
+    }
+
+    /// #428 P2b round-2 fix: `apply_bias_if_present` re-checks `ab`'s
+    /// contiguity itself rather than trusting `cpu_fwd`/`cuda_fwd`'s own
+    /// `RequiresContiguous` loop (see that function's own doc) — this
+    /// test calls it DIRECTLY, bypassing both loops entirely (unlike
+    /// every other test in this file, which only reaches this function
+    /// through `fused_forward`), to prove the defense-in-depth check is
+    /// real, not merely documented: a non-contiguous `ab` reaching the
+    /// helper is a TYPED refusal (`RequiresContiguous`), never a wrong
+    /// number silently read off the wrong `bias_start` offset.
+    #[test]
+    fn apply_bias_if_present_refuses_a_non_contiguous_ab_directly() {
+        let device = Device::Cpu;
+        let (m, inf, outf, r) = (3usize, 3usize, 4usize, 2usize);
+        let op = LowRankResidualLinear::new(1.0, inf, outf, r, None, false)
+            .unwrap()
+            .with_bias(true);
+        let bias_rows = op.bias_rows();
+        assert_eq!(bias_rows, outf.div_ceil(r));
+
+        let a_v = exact_fixture(r * inf, 1);
+        let b_v = exact_fixture(outf * r, 2);
+        let bias_v = exact_fixture(outf, 3);
+        let ab_contig = pack_ab_with_bias(&a_v, inf, &b_v, outf, r, &bias_v, &device);
+        let ab_rows = inf + outf + bias_rows;
+        // Widen each row and narrow back to `r` columns — the SAME
+        // wide-then-narrow non-contiguity lever
+        // `fused_epilogue.rs`'s `build_base_with_noncontiguous_w` uses
+        // (jammi-lora): identical VALUES, a row stride that no longer
+        // equals the column count.
+        let ab_v = ab_contig.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let mut wide_v = Vec::with_capacity(ab_rows * 2 * r);
+        for row in 0..ab_rows {
+            wide_v.extend_from_slice(&ab_v[row * r..(row + 1) * r]);
+            wide_v.extend(std::iter::repeat_n(0.0f32, r));
+        }
+        let wide = Tensor::from_slice(&wide_v, (ab_rows, 2 * r), &device).unwrap();
+        let ab_noncontig = wide.narrow(1, 0, r).unwrap();
+        assert!(
+            !ab_noncontig.is_contiguous(),
+            "fixture must actually be non-contiguous"
+        );
+
+        let base_v = exact_fixture(m * outf, 4);
+        let base = Tensor::from_slice(&base_v, (m, outf), &device).unwrap();
+
+        let (base_guard, base_l) = base.storage_and_layout();
+        let base_storage = match &*base_guard {
+            Storage::Cpu(s) => s.clone(),
+            _ => panic!("expected CPU storage"),
+        };
+        let (ab_guard, ab_l) = ab_noncontig.storage_and_layout();
+        let ab_storage = match &*ab_guard {
+            Storage::Cpu(s) => s,
+            _ => panic!("expected CPU storage"),
+        };
+
+        let err = op
+            .apply_bias_if_present(base_storage, base_l, ab_storage, ab_l, DType::F32, m)
+            .expect_err("a non-contiguous ab must be refused, not read at the wrong offset");
+        match err {
+            Error::RequiresContiguous { op: op_label } => {
+                assert_eq!(op_label, "low_rank_residual_linear(ab)");
+            }
+            other => panic!("expected RequiresContiguous{{op: \"...(ab)\"}}, got {other:?}"),
+        }
+    }
+
+    /// MEMORY ORACLE, the bias-carrying sibling of
+    /// `fused_site_retains_fewer_tape_nodes_than_the_eager_composition`
+    /// (KO-6/guide-§3.5, restated at the bias block): the frozen bias is
+    /// an UNTRACKED plain leaf on both arms, so it contributes NOTHING to
+    /// either count directly — but the EAGER composition's own bias add
+    /// (`base_out.broadcast_add(&bias)`) is itself a NEW tracked
+    /// intermediate (its lhs, `base_out`, is tracked), one MORE node than
+    /// the bias-free eager composition; the FUSED arm's `ab` pack simply
+    /// gains a third `Tensor::cat` argument (still ONE `Op::Cat` node,
+    /// same as the bias-free fused site) and this op's own `CustomOp3`
+    /// call absorbs the bias add entirely at the storage level (no new
+    /// tape node at all) — so the fused site's node count is UNCHANGED by
+    /// adding a bias while the eager composition's grows by one.
+    #[test]
+    fn fused_site_with_bias_retains_fewer_tape_nodes_than_the_eager_biased_composition() {
+        let device = Device::Cpu;
+        let (rows, inf, outf, r) = (4usize, 5usize, 3usize, 2usize);
+        let scale = 1.3f32;
+
+        let x_v: Vec<f32> = (0..rows * inf).map(|i| ((i as f32) * 0.29).sin()).collect();
+        let w_v: Vec<f32> = (0..outf * inf).map(|i| ((i as f32) * 0.19).cos()).collect();
+        let a_v: Vec<f32> = (0..r * inf).map(|i| ((i as f32) * 0.37).sin()).collect();
+        let b_v: Vec<f32> = (0..outf * r).map(|i| ((i as f32) * 0.41).cos()).collect();
+        let bias_v: Vec<f32> = (0..outf).map(|i| ((i as f32) * 0.53).sin()).collect();
+
+        // EAGER, WITH bias: the frozen bias is a plain, untracked leaf —
+        // `broadcast_add` still produces a NEW tracked node because its
+        // lhs (`base_out`) is tracked.
+        let x_eager =
+            Var::from_tensor(&Tensor::from_slice(&x_v, (rows, inf), &device).unwrap()).unwrap();
+        let w_plain = Tensor::from_slice(&w_v, (outf, inf), &device).unwrap();
+        let bias_plain = Tensor::from_slice(&bias_v, (outf,), &device).unwrap();
+        let a_eager =
+            Var::from_tensor(&Tensor::from_slice(&a_v, (r, inf), &device).unwrap()).unwrap();
+        let b_eager =
+            Var::from_tensor(&Tensor::from_slice(&b_v, (outf, r), &device).unwrap()).unwrap();
+        assert!(!bias_plain.is_variable() && !bias_plain.track_op());
+
+        let base_matmul = x_eager.as_tensor().matmul(&w_plain.t().unwrap()).unwrap();
+        let base_out = base_matmul.broadcast_add(&bias_plain).unwrap();
+        let after_a = x_eager
+            .as_tensor()
+            .matmul(&a_eager.as_tensor().t().unwrap())
+            .unwrap();
+        let lora_out = after_a.matmul(&b_eager.as_tensor().t().unwrap()).unwrap();
+        let scaled = (&lora_out * f64::from(scale)).unwrap();
+        let y_eager = (&base_out + &scaled).unwrap();
+        let nodes_eager = y_eager.sorted_nodes().len();
+
+        // FUSED, WITH bias: `ab`'s third `Tensor::cat` argument.
+        let x_fused =
+            Var::from_tensor(&Tensor::from_slice(&x_v, (rows, inf), &device).unwrap()).unwrap();
+        let a_fused =
+            Var::from_tensor(&Tensor::from_slice(&a_v, (r, inf), &device).unwrap()).unwrap();
+        let b_fused =
+            Var::from_tensor(&Tensor::from_slice(&b_v, (outf, r), &device).unwrap()).unwrap();
+        // Built from the tracked `Var`s directly (NOT `pack_ab_with_bias`,
+        // which would build a fresh, untracked `ab`) — the way
+        // `LoraLinear::forward`'s real fused arm assembles it, so the node
+        // count measured here reflects the real call site.
+        let bias_rows = outf.div_ceil(r);
+        let mut bias_padded = vec![0.0f32; bias_rows * r];
+        bias_padded[..outf].copy_from_slice(&bias_v);
+        let bias_tensor = Tensor::from_slice(&bias_padded, (bias_rows, r), &device).unwrap();
+        let ab_fused = Tensor::cat(
+            &[
+                &a_fused.as_tensor().t().unwrap(),
+                b_fused.as_tensor(),
+                &bias_tensor,
+            ],
+            0,
+        )
+        .unwrap();
+        let op = LowRankResidualLinear::new(scale, inf, outf, r, None, false)
+            .unwrap()
+            .with_bias(true);
+        let y_fused = x_fused
+            .as_tensor()
+            .apply_op3(&w_plain, &ab_fused, op)
+            .unwrap();
+        let nodes_fused = y_fused.sorted_nodes().len();
+
+        assert!(
+            nodes_fused < nodes_eager,
+            "the fused-with-bias site must retain FEWER tape nodes than the eager biased \
+             composition: eager={nodes_eager} fused={nodes_fused}"
+        );
+        assert_eq!(
+            nodes_eager, 11,
+            "measured EAGER-WITH-BIAS node count: x, A, B (3 leaves) + A.t(), base_matmul, \
+             base_out (broadcast_add), after_a, B.t(), lora_out, scaled, out (8 tracked \
+             intermediates/output) — w and the frozen bias contribute 0 (both untracked leaves)"
+        );
+        assert_eq!(
+            nodes_fused, 6,
+            "measured FUSED-WITH-BIAS node count: x, A, B (3 leaves) + A.t(), ab (Op::Cat, now \
+             3 arguments), out (CustomOp3) (3 tracked intermediates/output) — w and the frozen \
+             bias contribute 0; UNCHANGED from the bias-free fused count"
+        );
     }
 }

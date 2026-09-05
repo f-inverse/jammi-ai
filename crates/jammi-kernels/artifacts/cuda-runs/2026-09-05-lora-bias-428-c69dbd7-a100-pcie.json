@@ -1,0 +1,700 @@
+{
+ "schema_version": 1,
+ "git_sha": "c69dbd795d3c8e13990d5487a6428963915e2c02",
+ "box": "NVIDIA A100 80GB PCIe, driver 570.172.08, RunPod pod f8pflfnhmuorsg",
+ "producer": {
+  "path": "ci/scripts/perf/lora_bias_ab.sh",
+  "kind": "script",
+  "invocation": "MODEL_DIR_BERT=/root/checkpoints/bert-base-uncased MODEL_DIR_DISTILBERT=/root/checkpoints/distilbert-base-uncased BENCH_BIN=/root/target-jammi-ai/release/jammi-bench OUT_DIR=/root/lora-bias-ab/20260905T125749Z bash ci/scripts/perf/lora_bias_ab.sh (tree c69dbd79, stock unconverted checkpoints, 3 repeats, no EXTRA_DISABLE)",
+  "gating": "none"
+ },
+ "status": "GREEN",
+ "notes": {
+  "what": "GH #428 P2b: same-box fused-vs-eager per-step wall A/B for BERT/DistilBERT at the two shapes issue #356's own close-out profile ACTIVATED the C-LORA port on, proving out the bias-carrying-base widening once it lands.",
+  "method": "per-repeat differencing s_per_step = (wall_600 - wall_100) / 500; gain = 1 - fused_median / eager_median; floor = |fused_median_wire - control_median| / fused_median_wire (one per model); activation_bar: gain >= 0.05 and gain > floor on >= 1 activating shape.",
+  "verdicts": {
+   "bert": {
+    "verdict": "ACTIVATE",
+    "floor": 0.003502571027177312,
+    "fused_median_wire_s_per_step": 0.7635580946820001,
+    "control_median_s_per_step": 0.766232511142,
+    "gain_by_shape": {
+     "b8W512f32": 0.18182124088366114,
+     "b32W64bf16": 0.3077338085069342
+    }
+   },
+   "distilbert": {
+    "verdict": "ACTIVATE",
+    "floor": 0.0011996685215591829,
+    "fused_median_wire_s_per_step": 0.388349026108,
+    "control_median_s_per_step": 0.38788313600600005,
+    "gain_by_shape": {
+     "b8W512f32": 0.17226356831105138,
+     "b32W64bf16": 0.289110917059306
+    }
+   }
+  }
+ },
+ "legs": [
+  {
+   "leg_id": "bert-b8W512f32-fused-100-r1",
+   "model": "bert",
+   "shape": "b8W512f32",
+   "arm": "fused",
+   "steps": 100,
+   "repeat": 1,
+   "valid": true,
+   "violations": [],
+   "wall_s": 75.863673314
+  },
+  {
+   "leg_id": "bert-b8W512f32-fused-600-r1",
+   "model": "bert",
+   "shape": "b8W512f32",
+   "arm": "fused",
+   "steps": 600,
+   "repeat": 1,
+   "valid": true,
+   "violations": [],
+   "wall_s": 458.320059673
+  },
+  {
+   "leg_id": "bert-b8W512f32-lora_eager-100-r1",
+   "model": "bert",
+   "shape": "b8W512f32",
+   "arm": "lora_eager",
+   "steps": 100,
+   "repeat": 1,
+   "valid": true,
+   "violations": [],
+   "wall_s": 93.373961564
+  },
+  {
+   "leg_id": "bert-b8W512f32-lora_eager-600-r1",
+   "model": "bert",
+   "shape": "b8W512f32",
+   "arm": "lora_eager",
+   "steps": 600,
+   "repeat": 1,
+   "valid": true,
+   "violations": [],
+   "wall_s": 559.994541831
+  },
+  {
+   "leg_id": "bert-b8W512f32-lora_eager-100-r2",
+   "model": "bert",
+   "shape": "b8W512f32",
+   "arm": "lora_eager",
+   "steps": 100,
+   "repeat": 2,
+   "valid": true,
+   "violations": [],
+   "wall_s": 93.303126306
+  },
+  {
+   "leg_id": "bert-b8W512f32-lora_eager-600-r2",
+   "model": "bert",
+   "shape": "b8W512f32",
+   "arm": "lora_eager",
+   "steps": 600,
+   "repeat": 2,
+   "valid": true,
+   "violations": [],
+   "wall_s": 560.526274643
+  },
+  {
+   "leg_id": "bert-b8W512f32-fused-100-r2",
+   "model": "bert",
+   "shape": "b8W512f32",
+   "arm": "fused",
+   "steps": 100,
+   "repeat": 2,
+   "valid": true,
+   "violations": [],
+   "wall_s": 76.459039038
+  },
+  {
+   "leg_id": "bert-b8W512f32-fused-600-r2",
+   "model": "bert",
+   "shape": "b8W512f32",
+   "arm": "fused",
+   "steps": 600,
+   "repeat": 2,
+   "valid": true,
+   "violations": [],
+   "wall_s": 458.212904141
+  },
+  {
+   "leg_id": "bert-b8W512f32-fused-100-r3",
+   "model": "bert",
+   "shape": "b8W512f32",
+   "arm": "fused",
+   "steps": 100,
+   "repeat": 3,
+   "valid": true,
+   "violations": [],
+   "wall_s": 76.465082942
+  },
+  {
+   "leg_id": "bert-b8W512f32-fused-600-r3",
+   "model": "bert",
+   "shape": "b8W512f32",
+   "arm": "fused",
+   "steps": 600,
+   "repeat": 3,
+   "valid": true,
+   "violations": [],
+   "wall_s": 458.244130283
+  },
+  {
+   "leg_id": "bert-b8W512f32-lora_eager-100-r3",
+   "model": "bert",
+   "shape": "b8W512f32",
+   "arm": "lora_eager",
+   "steps": 100,
+   "repeat": 3,
+   "valid": true,
+   "violations": [],
+   "wall_s": 93.296585233
+  },
+  {
+   "leg_id": "bert-b8W512f32-lora_eager-600-r3",
+   "model": "bert",
+   "shape": "b8W512f32",
+   "arm": "lora_eager",
+   "steps": 600,
+   "repeat": 3,
+   "valid": true,
+   "violations": [],
+   "wall_s": 559.904352969
+  },
+  {
+   "leg_id": "bert-b32W64bf16-fused-100-r1",
+   "model": "bert",
+   "shape": "b32W64bf16",
+   "arm": "fused",
+   "steps": 100,
+   "repeat": 1,
+   "valid": true,
+   "violations": [],
+   "wall_s": 16.831209922
+  },
+  {
+   "leg_id": "bert-b32W64bf16-fused-600-r1",
+   "model": "bert",
+   "shape": "b32W64bf16",
+   "arm": "fused",
+   "steps": 600,
+   "repeat": 1,
+   "valid": true,
+   "violations": [],
+   "wall_s": 99.211608362
+  },
+  {
+   "leg_id": "bert-b32W64bf16-lora_eager-100-r1",
+   "model": "bert",
+   "shape": "b32W64bf16",
+   "arm": "lora_eager",
+   "steps": 100,
+   "repeat": 1,
+   "valid": true,
+   "violations": [],
+   "wall_s": 23.793506381
+  },
+  {
+   "leg_id": "bert-b32W64bf16-lora_eager-600-r1",
+   "model": "bert",
+   "shape": "b32W64bf16",
+   "arm": "lora_eager",
+   "steps": 600,
+   "repeat": 1,
+   "valid": true,
+   "violations": [],
+   "wall_s": 143.227339553
+  },
+  {
+   "leg_id": "bert-b32W64bf16-lora_eager-100-r2",
+   "model": "bert",
+   "shape": "b32W64bf16",
+   "arm": "lora_eager",
+   "steps": 100,
+   "repeat": 2,
+   "valid": true,
+   "violations": [],
+   "wall_s": 23.951496919
+  },
+  {
+   "leg_id": "bert-b32W64bf16-lora_eager-600-r2",
+   "model": "bert",
+   "shape": "b32W64bf16",
+   "arm": "lora_eager",
+   "steps": 600,
+   "repeat": 2,
+   "valid": true,
+   "violations": [],
+   "wall_s": 142.828182885
+  },
+  {
+   "leg_id": "bert-b32W64bf16-fused-100-r2",
+   "model": "bert",
+   "shape": "b32W64bf16",
+   "arm": "fused",
+   "steps": 100,
+   "repeat": 2,
+   "valid": true,
+   "violations": [],
+   "wall_s": 16.905227504
+  },
+  {
+   "leg_id": "bert-b32W64bf16-fused-600-r2",
+   "model": "bert",
+   "shape": "b32W64bf16",
+   "arm": "fused",
+   "steps": 600,
+   "repeat": 2,
+   "valid": true,
+   "violations": [],
+   "wall_s": 99.199538155
+  },
+  {
+   "leg_id": "bert-b32W64bf16-fused-100-r3",
+   "model": "bert",
+   "shape": "b32W64bf16",
+   "arm": "fused",
+   "steps": 100,
+   "repeat": 3,
+   "valid": true,
+   "violations": [],
+   "wall_s": 16.746736408
+  },
+  {
+   "leg_id": "bert-b32W64bf16-fused-600-r3",
+   "model": "bert",
+   "shape": "b32W64bf16",
+   "arm": "fused",
+   "steps": 600,
+   "repeat": 3,
+   "valid": true,
+   "violations": [],
+   "wall_s": 98.839365729
+  },
+  {
+   "leg_id": "bert-b32W64bf16-lora_eager-100-r3",
+   "model": "bert",
+   "shape": "b32W64bf16",
+   "arm": "lora_eager",
+   "steps": 100,
+   "repeat": 3,
+   "valid": true,
+   "violations": [],
+   "wall_s": 23.860399899
+  },
+  {
+   "leg_id": "bert-b32W64bf16-lora_eager-600-r3",
+   "model": "bert",
+   "shape": "b32W64bf16",
+   "arm": "lora_eager",
+   "steps": 600,
+   "repeat": 3,
+   "valid": true,
+   "violations": [],
+   "wall_s": 142.049567568
+  },
+  {
+   "leg_id": "bert-b8W512f32-control-100-r1",
+   "model": "bert",
+   "shape": "b8W512f32",
+   "arm": "control",
+   "steps": 100,
+   "repeat": 1,
+   "valid": true,
+   "violations": [],
+   "wall_s": 76.367952348
+  },
+  {
+   "leg_id": "bert-b8W512f32-control-600-r1",
+   "model": "bert",
+   "shape": "b8W512f32",
+   "arm": "control",
+   "steps": 600,
+   "repeat": 1,
+   "valid": true,
+   "violations": [],
+   "wall_s": 459.484207919
+  },
+  {
+   "leg_id": "bert-b8W512f32-control-100-r2",
+   "model": "bert",
+   "shape": "b8W512f32",
+   "arm": "control",
+   "steps": 100,
+   "repeat": 2,
+   "valid": true,
+   "violations": [],
+   "wall_s": 76.625431222
+  },
+  {
+   "leg_id": "bert-b8W512f32-control-600-r2",
+   "model": "bert",
+   "shape": "b8W512f32",
+   "arm": "control",
+   "steps": 600,
+   "repeat": 2,
+   "valid": true,
+   "violations": [],
+   "wall_s": 458.722860989
+  },
+  {
+   "leg_id": "bert-b8W512f32-control-100-r3",
+   "model": "bert",
+   "shape": "b8W512f32",
+   "arm": "control",
+   "steps": 100,
+   "repeat": 3,
+   "valid": true,
+   "violations": [],
+   "wall_s": 76.622913697
+  },
+  {
+   "leg_id": "bert-b8W512f32-control-600-r3",
+   "model": "bert",
+   "shape": "b8W512f32",
+   "arm": "control",
+   "steps": 600,
+   "repeat": 3,
+   "valid": true,
+   "violations": [],
+   "wall_s": 459.782113964
+  },
+  {
+   "leg_id": "distilbert-b8W512f32-fused-100-r1",
+   "model": "distilbert",
+   "shape": "b8W512f32",
+   "arm": "fused",
+   "steps": 100,
+   "repeat": 1,
+   "valid": true,
+   "violations": [],
+   "wall_s": 39.161925868
+  },
+  {
+   "leg_id": "distilbert-b8W512f32-fused-600-r1",
+   "model": "distilbert",
+   "shape": "b8W512f32",
+   "arm": "fused",
+   "steps": 600,
+   "repeat": 1,
+   "valid": true,
+   "violations": [],
+   "wall_s": 233.937507822
+  },
+  {
+   "leg_id": "distilbert-b8W512f32-lora_eager-100-r1",
+   "model": "distilbert",
+   "shape": "b8W512f32",
+   "arm": "lora_eager",
+   "steps": 100,
+   "repeat": 1,
+   "valid": true,
+   "violations": [],
+   "wall_s": 47.391362648
+  },
+  {
+   "leg_id": "distilbert-b8W512f32-lora_eager-600-r1",
+   "model": "distilbert",
+   "shape": "b8W512f32",
+   "arm": "lora_eager",
+   "steps": 600,
+   "repeat": 1,
+   "valid": true,
+   "violations": [],
+   "wall_s": 281.976317013
+  },
+  {
+   "leg_id": "distilbert-b8W512f32-lora_eager-100-r2",
+   "model": "distilbert",
+   "shape": "b8W512f32",
+   "arm": "lora_eager",
+   "steps": 100,
+   "repeat": 2,
+   "valid": true,
+   "violations": [],
+   "wall_s": 47.122992726
+  },
+  {
+   "leg_id": "distilbert-b8W512f32-lora_eager-600-r2",
+   "model": "distilbert",
+   "shape": "b8W512f32",
+   "arm": "lora_eager",
+   "steps": 600,
+   "repeat": 2,
+   "valid": true,
+   "violations": [],
+   "wall_s": 281.556708543
+  },
+  {
+   "leg_id": "distilbert-b8W512f32-fused-100-r2",
+   "model": "distilbert",
+   "shape": "b8W512f32",
+   "arm": "fused",
+   "steps": 100,
+   "repeat": 2,
+   "valid": true,
+   "violations": [],
+   "wall_s": 38.93405081
+  },
+  {
+   "leg_id": "distilbert-b8W512f32-fused-600-r2",
+   "model": "distilbert",
+   "shape": "b8W512f32",
+   "arm": "fused",
+   "steps": 600,
+   "repeat": 2,
+   "valid": true,
+   "violations": [],
+   "wall_s": 232.732421352
+  },
+  {
+   "leg_id": "distilbert-b8W512f32-fused-100-r3",
+   "model": "distilbert",
+   "shape": "b8W512f32",
+   "arm": "fused",
+   "steps": 100,
+   "repeat": 3,
+   "valid": true,
+   "violations": [],
+   "wall_s": 38.898807511
+  },
+  {
+   "leg_id": "distilbert-b8W512f32-fused-600-r3",
+   "model": "distilbert",
+   "shape": "b8W512f32",
+   "arm": "fused",
+   "steps": 600,
+   "repeat": 3,
+   "valid": true,
+   "violations": [],
+   "wall_s": 233.073320565
+  },
+  {
+   "leg_id": "distilbert-b8W512f32-lora_eager-100-r3",
+   "model": "distilbert",
+   "shape": "b8W512f32",
+   "arm": "lora_eager",
+   "steps": 100,
+   "repeat": 3,
+   "valid": true,
+   "violations": [],
+   "wall_s": 46.974940057
+  },
+  {
+   "leg_id": "distilbert-b8W512f32-lora_eager-600-r3",
+   "model": "distilbert",
+   "shape": "b8W512f32",
+   "arm": "lora_eager",
+   "steps": 600,
+   "repeat": 3,
+   "valid": true,
+   "violations": [],
+   "wall_s": 281.584090686
+  },
+  {
+   "leg_id": "distilbert-b32W64bf16-fused-100-r1",
+   "model": "distilbert",
+   "shape": "b32W64bf16",
+   "arm": "fused",
+   "steps": 100,
+   "repeat": 1,
+   "valid": true,
+   "violations": [],
+   "wall_s": 8.784482616
+  },
+  {
+   "leg_id": "distilbert-b32W64bf16-fused-600-r1",
+   "model": "distilbert",
+   "shape": "b32W64bf16",
+   "arm": "fused",
+   "steps": 600,
+   "repeat": 1,
+   "valid": true,
+   "violations": [],
+   "wall_s": 53.263293448
+  },
+  {
+   "leg_id": "distilbert-b32W64bf16-lora_eager-100-r1",
+   "model": "distilbert",
+   "shape": "b32W64bf16",
+   "arm": "lora_eager",
+   "steps": 100,
+   "repeat": 1,
+   "valid": true,
+   "violations": [],
+   "wall_s": 12.23268385
+  },
+  {
+   "leg_id": "distilbert-b32W64bf16-lora_eager-600-r1",
+   "model": "distilbert",
+   "shape": "b32W64bf16",
+   "arm": "lora_eager",
+   "steps": 600,
+   "repeat": 1,
+   "valid": true,
+   "violations": [],
+   "wall_s": 73.106837471
+  },
+  {
+   "leg_id": "distilbert-b32W64bf16-lora_eager-100-r2",
+   "model": "distilbert",
+   "shape": "b32W64bf16",
+   "arm": "lora_eager",
+   "steps": 100,
+   "repeat": 2,
+   "valid": true,
+   "violations": [],
+   "wall_s": 12.295497628
+  },
+  {
+   "leg_id": "distilbert-b32W64bf16-lora_eager-600-r2",
+   "model": "distilbert",
+   "shape": "b32W64bf16",
+   "arm": "lora_eager",
+   "steps": 600,
+   "repeat": 2,
+   "valid": true,
+   "violations": [],
+   "wall_s": 73.802696462
+  },
+  {
+   "leg_id": "distilbert-b32W64bf16-fused-100-r2",
+   "model": "distilbert",
+   "shape": "b32W64bf16",
+   "arm": "fused",
+   "steps": 100,
+   "repeat": 2,
+   "valid": true,
+   "violations": [],
+   "wall_s": 8.842521824
+  },
+  {
+   "leg_id": "distilbert-b32W64bf16-fused-600-r2",
+   "model": "distilbert",
+   "shape": "b32W64bf16",
+   "arm": "fused",
+   "steps": 600,
+   "repeat": 2,
+   "valid": true,
+   "violations": [],
+   "wall_s": 52.372906881
+  },
+  {
+   "leg_id": "distilbert-b32W64bf16-fused-100-r3",
+   "model": "distilbert",
+   "shape": "b32W64bf16",
+   "arm": "fused",
+   "steps": 100,
+   "repeat": 3,
+   "valid": true,
+   "violations": [],
+   "wall_s": 8.998843271
+  },
+  {
+   "leg_id": "distilbert-b32W64bf16-fused-600-r3",
+   "model": "distilbert",
+   "shape": "b32W64bf16",
+   "arm": "fused",
+   "steps": 600,
+   "repeat": 3,
+   "valid": true,
+   "violations": [],
+   "wall_s": 52.247554277
+  },
+  {
+   "leg_id": "distilbert-b32W64bf16-lora_eager-100-r3",
+   "model": "distilbert",
+   "shape": "b32W64bf16",
+   "arm": "lora_eager",
+   "steps": 100,
+   "repeat": 3,
+   "valid": true,
+   "violations": [],
+   "wall_s": 12.36702539
+  },
+  {
+   "leg_id": "distilbert-b32W64bf16-lora_eager-600-r3",
+   "model": "distilbert",
+   "shape": "b32W64bf16",
+   "arm": "lora_eager",
+   "steps": 600,
+   "repeat": 3,
+   "valid": true,
+   "violations": [],
+   "wall_s": 73.600748205
+  },
+  {
+   "leg_id": "distilbert-b8W512f32-control-100-r1",
+   "model": "distilbert",
+   "shape": "b8W512f32",
+   "arm": "control",
+   "steps": 100,
+   "repeat": 1,
+   "valid": true,
+   "violations": [],
+   "wall_s": 38.755886178
+  },
+  {
+   "leg_id": "distilbert-b8W512f32-control-600-r1",
+   "model": "distilbert",
+   "shape": "b8W512f32",
+   "arm": "control",
+   "steps": 600,
+   "repeat": 1,
+   "valid": true,
+   "violations": [],
+   "wall_s": 232.697454181
+  },
+  {
+   "leg_id": "distilbert-b8W512f32-control-100-r2",
+   "model": "distilbert",
+   "shape": "b8W512f32",
+   "arm": "control",
+   "steps": 100,
+   "repeat": 2,
+   "valid": true,
+   "violations": [],
+   "wall_s": 38.959916629
+  },
+  {
+   "leg_id": "distilbert-b8W512f32-control-600-r2",
+   "model": "distilbert",
+   "shape": "b8W512f32",
+   "arm": "control",
+   "steps": 600,
+   "repeat": 2,
+   "valid": true,
+   "violations": [],
+   "wall_s": 232.534448343
+  },
+  {
+   "leg_id": "distilbert-b8W512f32-control-100-r3",
+   "model": "distilbert",
+   "shape": "b8W512f32",
+   "arm": "control",
+   "steps": 100,
+   "repeat": 3,
+   "valid": true,
+   "violations": [],
+   "wall_s": 39.189490641
+  },
+  {
+   "leg_id": "distilbert-b8W512f32-control-600-r3",
+   "model": "distilbert",
+   "shape": "b8W512f32",
+   "arm": "control",
+   "steps": 600,
+   "repeat": 3,
+   "valid": true,
+   "violations": [],
+   "wall_s": 233.88491071
+  }
+ ]
+}

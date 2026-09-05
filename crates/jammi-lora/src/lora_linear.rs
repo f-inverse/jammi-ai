@@ -174,16 +174,38 @@ fn wider_float_dtype(a: DType, b: DType) -> Result<DType, LoraError> {
 /// Per-op fused/eager dispatch counts for the fused LoRA SITE
 /// (`jammi_kernels::ops::LowRankResidualLinear`, the whole-site fusion),
 /// read from the same op-keyed registry `lora_epilogue_counters` uses.
-/// MEASURED (not estimated) at the production `LoraLinear::forward` path
-/// (`rank`-3 `x`, `F32`, `dropout = 0.3`, a frozen `w`) via
-/// `Tensor::sorted_nodes().len()`: the fused arm retains 5 tape nodes end
-/// to end (3 OP-CARRYING — `A.t()`, the `ab` pack `Op::Cat`, and this
-/// op's own `CustomOp3` call — plus the 2 `Var` leaves, `A`/`B`) versus
-/// 9 op-carrying nodes (11 total) for the eager composition
-/// `eager_epilogue` and its own `A`/`B`/dropout sub-linears build —
-/// see `crates/jammi-lora/tests/fused_epilogue.rs`'s
+/// MEASURED (not estimated) at the production `LoraLinear::forward` path,
+/// on the BIAS-FREE harness (`rank`-3 `x`, `F32`, `dropout = 0.3`, a
+/// frozen, bias-free `w`) via `Tensor::sorted_nodes().len()`: the fused
+/// arm retains 5 tape nodes end to end (3 OP-CARRYING — `A.t()`, the `ab`
+/// pack `Op::Cat`, and this op's own `CustomOp3` call — plus the 2 `Var`
+/// leaves, `A`/`B`) versus 9 op-carrying nodes (11 total) for the eager
+/// composition `eager_epilogue` and its own `A`/`B`/dropout sub-linears
+/// build — see `crates/jammi-lora/tests/fused_epilogue.rs`'s
 /// `production_path_retains_fewer_tape_nodes_fused_vs_eager_fallback` for
-/// the harness these numbers come from. Every op-carrying node is one
+/// the harness these numbers come from. **The SAME bias-free harness with
+/// a real, untracked-leaf bias added to `w` (#428 P2b) measures the
+/// IDENTICAL pair, 5 fused / 11 eager** — see that test's own sibling,
+/// `production_path_retains_fewer_tape_nodes_fused_vs_eager_fallback_with_bias`:
+/// the frozen bias contributes no tape node of its own on either arm at
+/// this measurement's granularity (the fused arm's `ab` pack merely gains
+/// a third, still-single-node `Tensor::cat` argument). The eager arm's own
+/// bias add is NOT absorbed into an existing node — `candle-nn` 0.11.0's
+/// `Linear::forward` (`linear.rs:73-76`) ends with a separate
+/// `x.broadcast_add(bias)`, which IS its own tracked node whenever its
+/// inputs track (the op-level oracle in
+/// `jammi_kernels::ops::low_rank_residual_linear` measures exactly that
+/// case directly: 10 eager tape nodes bias-free vs 11 with a bias, see
+/// `fused_site_with_bias_retains_fewer_tape_nodes_than_the_eager_biased_composition`).
+/// The reason THIS harness measures the identical 5/11 pair with and
+/// without a bias is that here `x` (a plain `Tensor::randn`,
+/// `crates/jammi-lora/tests/fused_epilogue.rs`'s `rand_input`, used by both
+/// the bias-free and bias-carrying production harnesses) and this
+/// harness's `w`/bias are all untracked leaves, so the entire base branch —
+/// the matmul AND the bias add — is off the tape on both arms; only the
+/// `A`/`B` LoRA branch is tracked at all, and it is unaffected by the
+/// bias. Stated as the MEASURED fact, not assumed equal to the bias-free
+/// pair without checking it. Every op-carrying node is one
 /// `GradStore::or_insert` (`backprop.rs`) full-size `zeros_like` + `add`
 /// at backward time — `A.t()`/the `ab` pack are the two this op's own
 /// `CustomOp3` collapse does NOT eliminate (they still cost their own
@@ -237,10 +259,12 @@ pub fn lora_linear_fused_dispatch_snapshot() -> DispatchSnapshot {
 /// OOM — this predicate's own domain-coverage gap is the only thing
 /// measured and fixed by this change; `w`
 /// contiguous (`x` is NOT required to be — the op materializes a
-/// non-contiguous `x` internally; see the op's own domain doc); the base
-/// weight carries no bias (see
-/// [`jammi_kernels::ops::low_rank_residual_linear`]'s module doc for why a bias is a
-/// domain refusal here rather than packed into `ab`). `out_features >= 1`
+/// non-contiguous `x` internally; see the op's own domain doc). A base
+/// bias is no longer a domain refusal (#428 P2b): a bias-carrying base
+/// FUSES whenever [`bias_gate`] produced a `bias_pack` for it (an
+/// untracked leaf, the overwhelmingly common case) — the ONLY bias-shaped
+/// refusal left is a trainable `Var` bias, `bias_is_frozen_leaf`, a
+/// COUNTED miss checked FIRST, below. `out_features >= 1`
 /// and `rank >= 1` are guaranteed by construction (`LoraLinear::new`
 /// refuses `rank == 0`, and a real `Linear`'s weight always has
 /// `out_features >= 1`) — not re-checked here, but re-validated
@@ -252,10 +276,20 @@ fn lora_linear_admission_predicate(
     x: &Tensor,
     w: &Tensor,
     lora_dtype: DType,
-    has_bias: bool,
+    base_has_bias: bool,
+    bias_pack_is_some: bool,
 ) -> (bool, &'static str) {
-    if has_bias {
-        return (false, "base_has_no_bias");
+    // #428 P2b: a bias-carrying base is no longer an unconditional domain
+    // miss (`base_has_no_bias` is DELETED) — a bias packs into `ab`'s
+    // trailing rows whenever [`bias_gate`] produced one. The ONLY
+    // remaining bias-shaped refusal is the case `bias_gate` deliberately
+    // returns `None` for despite a bias being PRESENT on the base: a
+    // trainable `Var` bias, which the eager composition already tracks
+    // correctly and the fused kernel has no slot for (a frozen-only pack).
+    // COUNTED (not a silent "no bias" misread) — see `bias_gate`'s own doc
+    // for why this state needs its own named reason.
+    if base_has_bias && !bias_pack_is_some {
+        return (false, "bias_is_frozen_leaf");
     }
     // [`jammi_kernels::ops::LowRankResidualLinear`]'s own domain requires `ab`
     // to be `F32` (checked again by the op itself, family D — this is a
@@ -336,6 +370,92 @@ pub(crate) fn frozen_weight_gate(w: &Tensor) -> Result<bool, LoraError> {
                 .into(),
         ))
     }
+}
+
+/// The bias three-way gate (#428 P2b), mirroring [`frozen_weight_gate`]'s
+/// own shape: `bias` is the base weight's OWN bias (`None` for a bias-free
+/// base — the ordinary `linear_no_bias` case). `rank`/`out_features` are
+/// the LoRA site's own construction data (needed to compute `bias_rows =
+/// out_features.div_ceil(rank)`, matching
+/// [`jammi_kernels::ops::LowRankResidualLinear::bias_rows`]'s own
+/// derivation bit-for-bit — this function and that private method must
+/// never independently drift).
+///
+/// - **No bias** (`bias.is_none()`): `Ok(None)` — the ordinary,
+///   overwhelmingly common case.
+/// - **Untracked leaf** (`!bias.track_op()`, a bias loaded straight from a
+///   `VarBuilder`): `Ok(Some(pack))`, the padded `[bias_rows, rank]` block
+///   — widened to `F32` (lossless from `BF16`/`F16`, exact identity from
+///   `F32`), zero-padded past `out_features` via `Tensor::pad_with_zeros`
+///   (dim 0), then reshaped. Built on an untracked leaf: `pad_with_zeros`'s
+///   own `Tensor::zeros`/`Tensor::cat` never attach a tracked `Op` unless
+///   an argument already `track_op()`s (candle-core 0.11.0's
+///   `BackpropOp::new` family), so the returned pack is itself untracked —
+///   packing it into `ab` costs no MORE tape nodes than the bias-free
+///   `ab` pack already does.
+/// - **A trainable `Var`** (`bias.is_variable()`): `Ok(None)` — the eager
+///   composition already tracks a `Var` bias correctly (it is a genuine
+///   `candle_nn::Linear` argument there), so no pack is built; unlike the
+///   "no bias" case above, THIS `None` must still surface as a bias
+///   PRESENT on the base to `lora_linear_admission_predicate` (that
+///   predicate reads `base_linear.bias().is_some()` independently — see
+///   its own doc), which turns it into a COUNTED `bias_is_frozen_leaf`
+///   refusal rather than silently reading identically to "no bias at
+///   all".
+/// - **Tracked, non-`Var`** (`bias.track_op() && !bias.is_variable()`):
+///   a typed [`LoraError::Config`] refusal — the SAME ambiguous-tracked-
+///   state policy `frozen_weight_gate` applies to `w` (a tracked
+///   intermediate is neither definitely frozen nor definitely trainable;
+///   silently choosing either would risk losing its gradient or
+///   miscounting a "frozen" site as a Var).
+///
+/// Also validates (family D: an op trusts no caller for its own domain,
+/// checked HERE rather than only inside
+/// `LowRankResidualLinear::check_w_and_ab`) that `bias` is exactly
+/// `[out_features]` and shares `w`'s dtype — both guaranteed by
+/// `candle_nn::Linear`'s own construction in every path this workspace
+/// exercises today, but re-checked rather than assumed.
+fn bias_gate(
+    bias: Option<&Tensor>,
+    w_dtype: DType,
+    out_features: usize,
+    rank: usize,
+) -> Result<Option<Tensor>, LoraError> {
+    let Some(bias) = bias else {
+        return Ok(None);
+    };
+    if bias.dims() != [out_features] {
+        return Err(LoraError::Config(format!(
+            "LoraLinear: base bias must be [{out_features}], got {:?}",
+            bias.dims()
+        )));
+    }
+    if bias.dtype() != w_dtype {
+        return Err(LoraError::Config(format!(
+            "LoraLinear: base bias dtype {:?} must match the base weight's dtype {w_dtype:?}",
+            bias.dtype()
+        )));
+    }
+    if bias.is_variable() {
+        return Ok(None);
+    }
+    if bias.track_op() {
+        return Err(LoraError::Config(
+            "LoraLinear: base bias is a TRACKED tensor (carries an Op) but is not a Var — a \
+             LoRA base bias must be either a true frozen leaf or an explicitly trainable Var; \
+             a tracked non-Var bias would silently lose its own gradient contribution"
+                .into(),
+        ));
+    }
+    let bias_rows = out_features.div_ceil(rank);
+    let bias_f32 = if bias.dtype() == DType::F32 {
+        bias.clone()
+    } else {
+        bias.to_dtype(DType::F32)?
+    };
+    let pad = bias_rows * rank - out_features;
+    let padded = bias_f32.pad_with_zeros(0, 0, pad)?;
+    Ok(Some(padded.reshape((bias_rows, rank))?))
 }
 
 /// The effective LoRA scaling factor `γ_r` applied to `B @ A @ x` before it is
@@ -427,6 +547,21 @@ pub struct LoraLinear {
     /// status cannot change over a `LoraLinear`'s lifetime — nothing in
     /// this crate ever swaps out `self.base`).
     dweight_needed: bool,
+    /// The frozen base bias, pre-packed into
+    /// [`jammi_kernels::ops::LowRankResidualLinear`]'s `[bias_rows,
+    /// rank]` block (`F32`, zero-padded past `out_features` — see that
+    /// op's own module doc, "Bias: packed into `ab`'s trailing rows"),
+    /// computed ONCE by [`bias_gate`] at construction — never re-derived
+    /// per forward. `None` in THREE distinct cases, all handled by
+    /// `forward`'s own admission logic: the base carries no bias at all;
+    /// the base bias is itself a trainable `Var` (the eager composition
+    /// already tracks it correctly, so no pack is needed — but the fused
+    /// site must then be a COUNTED refusal, `bias_is_frozen_leaf`, not a
+    /// silent eager fallback that looks the same as "no bias"); or the
+    /// base is `FrozenBase::Quantized` (module doc consumer 6: the fused
+    /// kernel is Dense-only, so a Quantized base's bias — if any — never
+    /// gets a pack at all, by construction, not by a failed gate check).
+    bias_pack: Option<Tensor>,
 }
 
 impl LoraLinear {
@@ -585,6 +720,14 @@ impl LoraLinear {
             .map(|_| DropoutMasks::new(seed, &vb.prefix()));
 
         let dweight_needed = base.dweight_needed()?;
+        // #428 P2b: only a `Dense` base ever gets a `bias_pack` — the
+        // fused kernel is Dense-only (module doc consumer 6), so a
+        // `Quantized` base's bias (if any) is left entirely to its own
+        // `QuantizedLinear::forward` composition.
+        let bias_pack = match &base {
+            FrozenBase::Dense(l) => bias_gate(l.bias(), l.weight().dtype(), out_features, rank)?,
+            FrozenBase::Quantized(_) => None,
+        };
 
         Ok(Self {
             base,
@@ -598,6 +741,7 @@ impl LoraLinear {
             out_features,
             rank,
             dweight_needed,
+            bias_pack,
         })
     }
 
@@ -664,6 +808,10 @@ impl LoraLinear {
         let in_features = base.in_features()?;
         let out_features = base.out_features()?;
         let dweight_needed = base.dweight_needed()?;
+        let bias_pack = match &base {
+            FrozenBase::Dense(l) => bias_gate(l.bias(), l.weight().dtype(), out_features, rank)?,
+            FrozenBase::Quantized(_) => None,
+        };
         Ok(Self {
             base,
             lora_a,
@@ -676,6 +824,7 @@ impl LoraLinear {
             out_features,
             rank,
             dweight_needed,
+            bias_pack,
         })
     }
 
@@ -723,14 +872,17 @@ impl LoraLinear {
     /// this collapse does NOT eliminate (both still cost their own node;
     /// disclosed, not folded silently into "one node"). MEASURED (not
     /// estimated) — see [`lora_linear_fused_dispatch_snapshot`]'s own doc
-    /// for the exact harness. Outside the fused kernel's domain (a bias-carrying
-    /// base, an unsupported dtype/device, a non-contiguous view, an
-    /// unsupported rank), the training arm falls back to the SAME `[base
-    /// matmul, dropout, A-matmul, B-matmul, epilogue]` eager composition
-    /// eval uses — see `eager_epilogue` — so a domain miss reproduces
-    /// eval's own math exactly, just still gated to `training == true`
-    /// (dropout still applies on this fallback, which eval's own path
-    /// never runs).
+    /// for the exact harness. A bias-carrying base FUSES (#428 P2b) via
+    /// `bias_pack`'s trailing block in `ab`, unless the base bias is
+    /// itself a trainable `Var` (`bias_is_frozen_leaf`, a COUNTED refusal
+    /// — see `bias_gate`'s doc). Outside the fused kernel's domain (that
+    /// one bias case, an unsupported dtype/device, a non-contiguous `w`,
+    /// an unsupported rank), the training arm falls back to the SAME
+    /// `[base matmul, dropout, A-matmul, B-matmul, epilogue]` eager
+    /// composition eval uses — see `eager_epilogue` — so a domain miss
+    /// reproduces eval's own math exactly, just still gated to `training
+    /// == true` (dropout still applies on this fallback, which eval's own
+    /// path never runs).
     ///
     /// **Dropout key reservation.** `DropoutMasks::next_key` is called
     /// EXACTLY ONCE per training forward, BEFORE the admission decision —
@@ -793,9 +945,14 @@ impl LoraLinear {
             return self.forward_composed(x, dropout_key);
         };
 
-        let has_bias = base_linear.bias().is_some();
-        let (holds, predicate) =
-            lora_linear_admission_predicate(x, base_linear.weight(), self.lora_a.dtype(), has_bias);
+        let base_has_bias = base_linear.bias().is_some();
+        let (holds, predicate) = lora_linear_admission_predicate(
+            x,
+            base_linear.weight(),
+            self.lora_a.dtype(),
+            base_has_bias,
+            self.bias_pack.is_some(),
+        );
         let outcome = admit(
             admission_mode(),
             "lora_linear_fused",
@@ -809,14 +966,22 @@ impl LoraLinear {
                 // Row-packed layout (`jammi_kernels::ops::low_rank_residual_linear`'s
                 // module doc, "the packed-`ab` GEMM eligibility problem"):
                 // `A^T` (`self.lora_a.t()`) stacked over `B`
-                // (`self.lora_b`, no pre-transpose needed) along dim 0 —
-                // `[in + out, rank]`. `self.lora_a.t()` is a non-contiguous
-                // VIEW; `Tensor::cat`'s dim-0 path (`cat0`) copies via each
-                // arg's own `Layout` regardless (`copy_strided_src`), so no
+                // (`self.lora_b`, no pre-transpose needed) along dim 0,
+                // followed — only when `self.bias_pack` is `Some` (#428
+                // P2b) — by the pre-packed, zero-padded `[bias_rows,
+                // rank]` bias block [`bias_gate`] built ONCE at
+                // construction: `[in + out(+bias_rows), rank]`.
+                // `self.lora_a.t()` is a non-contiguous VIEW;
+                // `Tensor::cat`'s dim-0 path (`cat0`) copies via each arg's
+                // own `Layout` regardless (`copy_strided_src`), so no
                 // `.contiguous()` call is needed before packing (unlike the
                 // column-packed layout this replaced, which needed one for
                 // `B^T`).
-                let ab = Tensor::cat(&[&self.lora_a.t()?, &self.lora_b], 0)?;
+                let lora_a_t = self.lora_a.t()?;
+                let ab = match &self.bias_pack {
+                    Some(pack) => Tensor::cat(&[&lora_a_t, &self.lora_b, pack], 0)?,
+                    None => Tensor::cat(&[&lora_a_t, &self.lora_b], 0)?,
+                };
                 let op = LowRankResidualLinear::new(
                     self.scaling as f32,
                     self.in_features,
@@ -824,7 +989,8 @@ impl LoraLinear {
                     self.rank,
                     dropout_key,
                     self.dweight_needed,
-                )?;
+                )?
+                .with_bias(self.bias_pack.is_some());
                 Ok(apply3(x, base_linear.weight(), &ab, op)?)
             }
             DispatchOutcome::Eager => self.forward_composed(x, dropout_key),
@@ -949,6 +1115,97 @@ mod frozen_weight_gate_tests {
         assert!(tracked.track_op(), "fixture must actually be tracked");
         let err = frozen_weight_gate(&tracked).unwrap_err();
         assert!(matches!(err, crate::error::LoraError::Config(_)));
+    }
+}
+
+/// #428 P2b: [`bias_gate`]'s own three-way (plus "no bias") lattice —
+/// mirrors `frozen_weight_gate_tests`'s shape, one test per cell.
+#[cfg(test)]
+mod bias_gate_tests {
+    use super::bias_gate;
+    use candle_core::{DType, Device, Tensor, Var};
+
+    #[test]
+    fn no_bias_is_none() {
+        assert!(bias_gate(None, DType::F32, 4, 2).unwrap().is_none());
+    }
+
+    /// An untracked leaf (loaded straight from a `VarBuilder`) produces
+    /// `Some(pack)`, `[bias_rows, rank]`, zero-padded past `out_features`.
+    #[test]
+    fn untracked_leaf_produces_a_zero_padded_pack() {
+        let device = Device::Cpu;
+        let (out_features, rank) = (5usize, 2usize); // bias_rows = 3.
+        let bias =
+            Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0], out_features, &device).unwrap();
+        assert!(!bias.is_variable() && !bias.track_op());
+        let pack = bias_gate(Some(&bias), DType::F32, out_features, rank)
+            .unwrap()
+            .expect("an untracked leaf must produce a pack");
+        assert_eq!(pack.dims(), &[3, rank]);
+        let flat: Vec<f32> = pack.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(flat, vec![1.0, 2.0, 3.0, 4.0, 5.0, 0.0]);
+    }
+
+    /// A trainable `Var` bias produces `None` — NOT because there is no
+    /// bias (the caller must distinguish these two `None`s via
+    /// `base_linear.bias().is_some()`, per `lora_linear_admission_predicate`'s
+    /// own doc), but because the eager composition already tracks it
+    /// correctly and the fused kernel has no trainable-bias slot.
+    #[test]
+    fn trainable_var_is_none() {
+        let device = Device::Cpu;
+        let bias = Var::from_tensor(&Tensor::from_slice(&[1.0f32, 2.0, 3.0], 3, &device).unwrap())
+            .unwrap();
+        assert!(bias_gate(Some(bias.as_tensor()), DType::F32, 3, 2)
+            .unwrap()
+            .is_none());
+    }
+
+    /// Tracked-but-not-`Var` (the same ambiguous state
+    /// `frozen_weight_gate` refuses for `w`) is a typed refusal.
+    #[test]
+    fn tracked_non_var_is_a_typed_refusal() {
+        let device = Device::Cpu;
+        let bias_var =
+            Var::from_tensor(&Tensor::from_slice(&[1.0f32, 2.0, 3.0], 3, &device).unwrap())
+                .unwrap();
+        let tracked = bias_var.as_tensor().to_dtype(DType::F64).unwrap();
+        assert!(!tracked.is_variable() && tracked.track_op());
+        let err = bias_gate(Some(&tracked), DType::F64, 3, 2).unwrap_err();
+        assert!(matches!(err, crate::error::LoraError::Config(_)));
+    }
+
+    #[test]
+    fn wrong_shape_is_a_typed_refusal() {
+        let device = Device::Cpu;
+        let bias = Tensor::from_slice(&[1.0f32, 2.0], 2, &device).unwrap();
+        let err = bias_gate(Some(&bias), DType::F32, 3, 2).unwrap_err();
+        assert!(matches!(err, crate::error::LoraError::Config(_)));
+    }
+
+    #[test]
+    fn mismatched_dtype_is_a_typed_refusal() {
+        let device = Device::Cpu;
+        let bias = Tensor::from_slice(&[1.0f32, 2.0, 3.0], 3, &device).unwrap();
+        let err = bias_gate(Some(&bias), DType::F64, 3, 2).unwrap_err();
+        assert!(matches!(err, crate::error::LoraError::Config(_)));
+    }
+
+    /// `out_features` an exact multiple of `rank` (`bias_rows * rank ==
+    /// out_features`, `pad == 0`) is a normal, covered case —
+    /// `Tensor::pad_with_zeros`'s own `left == 0 && right == 0` fast path.
+    #[test]
+    fn exact_multiple_of_rank_needs_no_padding() {
+        let device = Device::Cpu;
+        let (out_features, rank) = (4usize, 2usize); // bias_rows = 2, no padding.
+        let bias = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], out_features, &device).unwrap();
+        let pack = bias_gate(Some(&bias), DType::F32, out_features, rank)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pack.dims(), &[2, rank]);
+        let flat: Vec<f32> = pack.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(flat, vec![1.0, 2.0, 3.0, 4.0]);
     }
 }
 

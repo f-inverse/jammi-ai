@@ -6570,6 +6570,728 @@ fn lora_linear_parity_bf16_exact_integer_fixture_is_bit_exact() {
     );
 }
 
+// =======================================================================
+// #428 P2b: the bias-carrying pack. CPU<->CUDA parity, forward + all three
+// backward outputs (dx, dw/da/db — `dw` only where `dweight_needed` is
+// exercised elsewhere in this file; the bias-carrying legs below keep the
+// SAME `w`-frozen convention as `lora_linear_parity_bf16_base_backward_
+// production_width`), at `F32`, `BF16`, and `F16` — mirroring this
+// section's own `lora_linear_parity_*_exact_integer_fixture_is_bit_exact`
+// discipline: EXACT-INTEGER fixtures make a `tol == 0.0` claim
+// architecture-independent BY CONSTRUCTION (every partial sum, INCLUDING
+// the bias add, stays a small exact integer within each dtype's own
+// exact-integer range), so those legs carry a real `assert_eq!` — never
+// on a REALISTIC (non-integer) fixture, where the BF16 leg below uses the
+// SAME `bf16_round_bound`-derived tolerance
+// `lora_linear_parity_bf16_base_production_width` uses (rule 5:
+// relative-with-floor). See `ops::low_rank_residual_linear`'s module doc,
+// "Bias: packed into `ab`'s trailing rows", for the pack layout and the
+// three-rounding-point (base-store, bias-add, epilogue) enumeration these
+// tests reproduce.
+//
+// **PENDING-ARTIFACT**: authored on a CPU-only development host (no
+// `nvcc`) — compiles and type-checks under `cargo check --features cuda`
+// (this file's usual standard), but has never actually RUN against a CUDA
+// device. The lead's pod session must run this block on an A100 (or
+// wider, per this file's existing per-arch floor idioms) before it is
+// trusted as a real proof; a `cuda_device() == None` skip on this host is
+// expected, not a green signal.
+// =======================================================================
+
+/// `pack_ab`'s bias-carrying sibling — see
+/// `ops::low_rank_residual_linear`'s module doc's "Bias" section and
+/// `lora_linear_oracles.rs`'s identically-named helper (this file needs
+/// its own copy: it is a separate compilation unit with no shared `tests`
+/// support module). `bias` may legitimately arrive `BF16`/`F16` (every
+/// half-dtype bias leg in this file passes one) — cast to `F32` BEFORE
+/// reading it out, matching the production pack exactly (`bias_gate`,
+/// `jammi_lora::lora_linear`, widens a half-dtype bias to `F32` before
+/// building its own pack): `Tensor::to_vec1::<f32>()` does NOT implicitly
+/// cast — it is a typed refusal on a dtype mismatch — so reading a
+/// half-dtype `bias` straight into `to_vec1::<f32>()` without this cast
+/// first panicked every `BF16`/`F16` bias leg at construction, before the
+/// op under test ever ran (round-2 fix; a measured RED on an A100 pod,
+/// not a theoretical concern).
+fn pack_ab_with_bias(
+    a: &Tensor,
+    b: &Tensor,
+    bias: &Tensor,
+    out_features: usize,
+    rank: usize,
+) -> candle_core::Result<Tensor> {
+    let ab_no_bias = pack_ab(a, b)?;
+    let bias_rows = out_features.div_ceil(rank);
+    let bias_f32 = bias.to_dtype(DType::F32)?;
+    let bias_v: Vec<f32> = bias_f32.flatten_all()?.to_vec1()?;
+    let mut bias_padded = vec![0.0f32; bias_rows * rank];
+    bias_padded[..out_features].copy_from_slice(&bias_v);
+    let bias_tensor = Tensor::from_slice(&bias_padded, (bias_rows, rank), bias.device())?;
+    Tensor::cat(&[&ab_no_bias, &bias_tensor], 0)
+}
+
+/// Bit-exact (`tol == 0.0`) CPU<->CUDA parity for the bias-carrying pack
+/// at `F32` — the bias-carrying sibling of
+/// [`assert_lora_linear_parity_f32_bit_exact`]. `biasv` must be an
+/// [`exact_fixture`]-style small-integer fixture for the bit-exactness
+/// claim to hold (the same discipline every OTHER argument here already
+/// requires).
+#[allow(clippy::too_many_arguments)]
+fn assert_lora_linear_parity_f32_bias_bit_exact(
+    cuda: &Device,
+    rows: usize,
+    inf: usize,
+    outf: usize,
+    r: usize,
+    scale: f32,
+    xv: &[f32],
+    wv: &[f32],
+    av: &[f32],
+    bv: &[f32],
+    biasv: &[f32],
+) {
+    let cpu = Device::Cpu;
+
+    let x_cpu = Var::from_tensor(&Tensor::from_slice(xv, (rows, inf), &cpu).unwrap()).unwrap();
+    let w_cpu = Var::from_tensor(&Tensor::from_slice(wv, (outf, inf), &cpu).unwrap()).unwrap();
+    let a_cpu = Var::from_tensor(&Tensor::from_slice(av, (r, inf), &cpu).unwrap()).unwrap();
+    let b_cpu = Var::from_tensor(&Tensor::from_slice(bv, (outf, r), &cpu).unwrap()).unwrap();
+    let bias_cpu = Tensor::from_slice(biasv, outf, &cpu).unwrap();
+    let ab_cpu =
+        pack_ab_with_bias(a_cpu.as_tensor(), b_cpu.as_tensor(), &bias_cpu, outf, r).unwrap();
+    let op_cpu = LowRankResidualLinear::new(scale, inf, outf, r, None, true)
+        .unwrap()
+        .with_bias(true);
+    let out_cpu = x_cpu
+        .as_tensor()
+        .apply_op3(w_cpu.as_tensor(), &ab_cpu, op_cpu)
+        .unwrap();
+    let grads_cpu = out_cpu.sum_all().unwrap().backward().unwrap();
+
+    let x_gpu = Var::from_tensor(&Tensor::from_slice(xv, (rows, inf), cuda).unwrap()).unwrap();
+    let w_gpu = Var::from_tensor(&Tensor::from_slice(wv, (outf, inf), cuda).unwrap()).unwrap();
+    let a_gpu = Var::from_tensor(&Tensor::from_slice(av, (r, inf), cuda).unwrap()).unwrap();
+    let b_gpu = Var::from_tensor(&Tensor::from_slice(bv, (outf, r), cuda).unwrap()).unwrap();
+    let bias_gpu = Tensor::from_slice(biasv, outf, cuda).unwrap();
+    let ab_gpu =
+        pack_ab_with_bias(a_gpu.as_tensor(), b_gpu.as_tensor(), &bias_gpu, outf, r).unwrap();
+    let op_gpu = LowRankResidualLinear::new(scale, inf, outf, r, None, true)
+        .unwrap()
+        .with_bias(true);
+    let out_gpu = x_gpu
+        .as_tensor()
+        .apply_op3(w_gpu.as_tensor(), &ab_gpu, op_gpu)
+        .unwrap();
+    let grads_gpu = out_gpu.sum_all().unwrap().backward().unwrap();
+
+    let check = |name: &str, cpu_t: &Tensor, gpu_t: &Tensor| {
+        let c: Vec<f32> = cpu_t.flatten_all().unwrap().to_vec1().unwrap();
+        let g: Vec<f32> = gpu_t
+            .flatten_all()
+            .unwrap()
+            .to_device(&cpu)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(
+            c, g,
+            "{name}: exact-integer bias fixture must be bit-exact CPU vs CUDA"
+        );
+    };
+    check(
+        "fwd",
+        &out_cpu.flatten_all().unwrap(),
+        &out_gpu.flatten_all().unwrap(),
+    );
+    check(
+        "dx",
+        grads_cpu.get(&x_cpu).unwrap(),
+        grads_gpu.get(&x_gpu).unwrap(),
+    );
+    check(
+        "dw",
+        grads_cpu.get(&w_cpu).unwrap(),
+        grads_gpu.get(&w_gpu).unwrap(),
+    );
+    check(
+        "da",
+        grads_cpu.get(&a_cpu).unwrap(),
+        grads_gpu.get(&a_gpu).unwrap(),
+    );
+    check(
+        "db",
+        grads_cpu.get(&b_cpu).unwrap(),
+        grads_gpu.get(&b_gpu).unwrap(),
+    );
+}
+
+#[test]
+fn lora_linear_parity_f32_bias_exact_integer_fixture_is_bit_exact() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let (rows, inf, outf, r) = (24usize, 1024usize, 3072usize, 16usize);
+    let x = exact_fixture(rows * inf, 1);
+    let w = exact_fixture(outf * inf, 2);
+    let a = exact_fixture(r * inf, 3);
+    let b = exact_fixture(outf * r, 4);
+    let bias = exact_fixture(outf, 9);
+    // scale = 2.0: exact in binary, so the epilogue's own multiply
+    // introduces no rounding of its own either.
+    assert_lora_linear_parity_f32_bias_bit_exact(
+        &cuda, rows, inf, outf, r, 2.0, &x, &w, &a, &b, &bias,
+    );
+}
+
+/// The `bf16` counterpart to
+/// `lora_linear_parity_f32_bias_exact_integer_fixture_is_bit_exact` and the
+/// bias-carrying sibling of `lora_linear_parity_bf16_exact_integer_fixture_is_bit_exact`:
+/// small-integer `x`/`w`/`bias` (each exactly `bf16`-representable), so
+/// the true base sum is exact in `f32` and every rounding this leg pays is
+/// the ONE the op's own module doc names at each step — base-store
+/// (rounding 1), the bias `broadcast_add` (rounding 2, native `bf16`
+/// add — candle never widens the storage dtype for it), and the
+/// epilogue's own once-rounded `base + delta*scale` (rounding 3). This is
+/// BIT-EXACT (`assert_eq!`) because the fixture is exact-integer, NOT
+/// because BF16 arithmetic is being trusted loosely — the realistic-
+/// fixture leg below carries a derived tolerance instead (rule 5).
+#[test]
+fn lora_linear_parity_bf16_bias_exact_integer_fixture_is_bit_exact() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let (rows, inf, outf, r) = (8usize, 1024usize, 12usize, 4usize);
+    let scale = 2.0f32; // exact in binary.
+
+    let xv = exact_fixture(rows * inf, 1);
+    let wv = exact_fixture(outf * inf, 2);
+    let av = exact_fixture(r * inf, 3);
+    let bv = exact_fixture(outf * r, 4);
+    let bias_v = exact_fixture(outf, 9);
+    let x_bf16: Vec<bf16> = xv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let w_bf16: Vec<bf16> = wv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let bias_bf16: Vec<bf16> = bias_v.iter().map(|&v| bf16::from_f32(v)).collect();
+
+    // The exact (i64-accumulated, then losslessly narrowed to f32)
+    // reference, computed independently of candle's own GEMM (family F).
+    let mut base_bf16_expected = vec![bf16::from_f32(0.0); rows * outf];
+    let mut delta_f32_exact = vec![0.0f32; rows * outf];
+    for i in 0..rows {
+        for o in 0..outf {
+            let mut base_acc = 0i64;
+            for k in 0..inf {
+                base_acc += (xv[i * inf + k] as i64) * (wv[o * inf + k] as i64);
+            }
+            // Rounding 1 (base GEMM store) then rounding 2 (the bias
+            // `broadcast_add`, a native bf16 add — both operands are
+            // already exactly bf16-representable, so this is a single
+            // correctly-rounded addition, not a further widening).
+            let base_bf16 = bf16::from_f32(base_acc as f32);
+            base_bf16_expected[i * outf + o] =
+                bf16::from_f32(base_bf16.to_f32() + bias_bf16[o].to_f32());
+
+            let mut delta_acc = 0i64;
+            for j in 0..r {
+                let mut h_acc = 0i64;
+                for k in 0..inf {
+                    h_acc += (xv[i * inf + k] as i64) * (av[j * inf + k] as i64);
+                }
+                delta_acc += h_acc * (bv[o * r + j] as i64);
+            }
+            delta_f32_exact[i * outf + o] = delta_acc as f32;
+        }
+    }
+    let expected: Vec<bf16> = base_bf16_expected
+        .iter()
+        .zip(delta_f32_exact.iter())
+        .map(|(&base_plus_bias, &delta)| {
+            // Rounding 3 (the epilogue): widen to f32, add the f32-scaled
+            // delta, round ONCE — esc-046's own order.
+            bf16::from_f32(base_plus_bias.to_f32() + delta * scale)
+        })
+        .collect();
+
+    let x_gpu = Tensor::from_slice(&x_bf16, (rows, inf), &cuda).unwrap();
+    let w_gpu = Tensor::from_slice(&w_bf16, (outf, inf), &cuda).unwrap();
+    let bias_gpu = Tensor::from_slice(&bias_bf16, outf, &cuda).unwrap();
+    let a_gpu = Tensor::from_slice(&av, (r, inf), &cuda).unwrap();
+    let b_gpu = Tensor::from_slice(&bv, (outf, r), &cuda).unwrap();
+    let ab_gpu = pack_ab_with_bias(&a_gpu, &b_gpu, &bias_gpu, outf, r).unwrap();
+    let op = LowRankResidualLinear::new(scale, inf, outf, r, None, false)
+        .unwrap()
+        .with_bias(true);
+    let out_gpu = x_gpu.apply_op3(&w_gpu, &ab_gpu, op).unwrap();
+    let got: Vec<bf16> = out_gpu
+        .flatten_all()
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    assert_eq!(
+        got, expected,
+        "exact-integer bf16 bias fixture must be bit-exact against a reference built from the \
+         SAME three rounding points the op's own module doc documents"
+    );
+}
+
+/// The `F16` counterpart to the two exact-integer bias legs above
+/// (campaign #443 D1 widened this op's dtype domain to `F16` end to end;
+/// the bias pack rides the SAME three rounding points, just at `F16`'s
+/// narrower — but still exact-integer-capable up to `2^11 = 2048` —
+/// mantissa).
+#[test]
+fn lora_linear_parity_f16_bias_exact_integer_fixture_is_bit_exact() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let (rows, inf, outf, r) = (8usize, 1024usize, 12usize, 4usize);
+    let scale = 2.0f32;
+
+    let xv = exact_fixture(rows * inf, 1);
+    let wv = exact_fixture(outf * inf, 2);
+    let av = exact_fixture(r * inf, 3);
+    let bv = exact_fixture(outf * r, 4);
+    let bias_v = exact_fixture(outf, 9);
+    let x_f16: Vec<f16> = xv.iter().map(|&v| f16::from_f32(v)).collect();
+    let w_f16: Vec<f16> = wv.iter().map(|&v| f16::from_f32(v)).collect();
+    let bias_f16: Vec<f16> = bias_v.iter().map(|&v| f16::from_f32(v)).collect();
+
+    let mut base_f16_expected = vec![f16::from_f32(0.0); rows * outf];
+    let mut delta_f32_exact = vec![0.0f32; rows * outf];
+    for i in 0..rows {
+        for o in 0..outf {
+            let mut base_acc = 0i64;
+            for k in 0..inf {
+                base_acc += (xv[i * inf + k] as i64) * (wv[o * inf + k] as i64);
+            }
+            let base_f16 = f16::from_f32(base_acc as f32);
+            base_f16_expected[i * outf + o] =
+                f16::from_f32(base_f16.to_f32() + bias_f16[o].to_f32());
+
+            let mut delta_acc = 0i64;
+            for j in 0..r {
+                let mut h_acc = 0i64;
+                for k in 0..inf {
+                    h_acc += (xv[i * inf + k] as i64) * (av[j * inf + k] as i64);
+                }
+                delta_acc += h_acc * (bv[o * r + j] as i64);
+            }
+            delta_f32_exact[i * outf + o] = delta_acc as f32;
+        }
+    }
+    let expected: Vec<f16> = base_f16_expected
+        .iter()
+        .zip(delta_f32_exact.iter())
+        .map(|(&base_plus_bias, &delta)| f16::from_f32(base_plus_bias.to_f32() + delta * scale))
+        .collect();
+
+    let x_gpu = Tensor::from_slice(&x_f16, (rows, inf), &cuda).unwrap();
+    let w_gpu = Tensor::from_slice(&w_f16, (outf, inf), &cuda).unwrap();
+    let bias_gpu = Tensor::from_slice(&bias_f16, outf, &cuda).unwrap();
+    let a_gpu = Tensor::from_slice(&av, (r, inf), &cuda).unwrap();
+    let b_gpu = Tensor::from_slice(&bv, (outf, r), &cuda).unwrap();
+    let ab_gpu = pack_ab_with_bias(&a_gpu, &b_gpu, &bias_gpu, outf, r).unwrap();
+    let op = LowRankResidualLinear::new(scale, inf, outf, r, None, false)
+        .unwrap()
+        .with_bias(true);
+    let out_gpu = x_gpu.apply_op3(&w_gpu, &ab_gpu, op).unwrap();
+    let got: Vec<f16> = out_gpu
+        .flatten_all()
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    assert_eq!(
+        got, expected,
+        "exact-integer f16 bias fixture must be bit-exact against a reference built from the \
+         SAME three rounding points the op's own module doc documents"
+    );
+}
+
+/// The REALISTIC (non-integer) `bf16` bias leg — mirrors
+/// `lora_linear_parity_bf16_base_production_width`'s own relative-with-
+/// floor discipline (rule 5), extended with a THIRD additive term (the
+/// bias `broadcast_add`) each bounded by its OWN [`bf16_round_bound`],
+/// never an unqualified `assert_eq!` on a realistic fixture (rule 5's own
+/// non-vacuity requirement, restated at the bias block per this
+/// contract's explicit instruction).
+#[test]
+fn lora_linear_parity_bf16_bias_base_production_width() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let (rows, inf, outf, r) = (256usize, 1024usize, 3072usize, 16usize);
+    let scale = 0.5f32;
+
+    let xv = fixture(rows * inf, 1.0);
+    let wv = fixture(outf * inf, 2.0);
+    let av = fixture(r * inf, 3.0);
+    let bv = fixture(outf * r, 4.0);
+    let bias_v = fixture(outf, 5.0);
+    let x_bf16: Vec<bf16> = xv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let w_bf16: Vec<bf16> = wv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let bias_bf16: Vec<bf16> = bias_v.iter().map(|&v| bf16::from_f32(v)).collect();
+    let x_requantized: Vec<f32> = x_bf16.iter().map(|v| v.to_f32()).collect();
+    let w_requantized: Vec<f32> = w_bf16.iter().map(|v| v.to_f32()).collect();
+    let bias_requantized: Vec<f32> = bias_bf16.iter().map(|v| v.to_f32()).collect();
+
+    let x_cpu = Tensor::from_slice(&x_requantized, (rows, inf), &cpu).unwrap();
+    let w_cpu = Tensor::from_slice(&w_requantized, (outf, inf), &cpu).unwrap();
+    let bias_cpu = Tensor::from_slice(&bias_requantized, outf, &cpu).unwrap();
+    let a_cpu = Tensor::from_slice(&av, (r, inf), &cpu).unwrap();
+    let b_cpu = Tensor::from_slice(&bv, (outf, r), &cpu).unwrap();
+    let ab_cpu = pack_ab_with_bias(&a_cpu, &b_cpu, &bias_cpu, outf, r).unwrap();
+    let op_cpu = LowRankResidualLinear::new(scale, inf, outf, r, None, false)
+        .unwrap()
+        .with_bias(true);
+    let out_cpu = x_cpu.apply_op3(&w_cpu, &ab_cpu, op_cpu).unwrap();
+
+    let base_only_cpu: Vec<f32> = x_cpu
+        .matmul(&w_cpu.t().unwrap())
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let base_plus_bias_cpu: Vec<f32> = x_cpu
+        .matmul(&w_cpu.t().unwrap())
+        .unwrap()
+        .broadcast_add(&bias_cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let delta_scaled_cpu: Vec<f32> = x_cpu
+        .matmul(&a_cpu.t().unwrap())
+        .unwrap()
+        .matmul(&b_cpu.t().unwrap())
+        .unwrap()
+        .affine(f64::from(scale), 0.0)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let x_gpu = Tensor::from_slice(&x_bf16, (rows, inf), &cuda).unwrap();
+    let w_gpu = Tensor::from_slice(&w_bf16, (outf, inf), &cuda).unwrap();
+    let bias_gpu = Tensor::from_slice(&bias_bf16, outf, &cuda).unwrap();
+    let a_gpu = Tensor::from_slice(&av, (r, inf), &cuda).unwrap();
+    let b_gpu = Tensor::from_slice(&bv, (outf, r), &cuda).unwrap();
+    let ab_gpu = pack_ab_with_bias(&a_gpu, &b_gpu, &bias_gpu, outf, r).unwrap();
+    let op_gpu = LowRankResidualLinear::new(scale, inf, outf, r, None, false)
+        .unwrap()
+        .with_bias(true);
+    let out_gpu = x_gpu.apply_op3(&w_gpu, &ab_gpu, op_gpu).unwrap();
+
+    let out_cpu_v: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
+    let out_gpu_v: Vec<f32> = out_gpu
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out_gpu_v.len(), rows * outf, "GPU forward length mismatch");
+    let abs_floor = 1e-1f64;
+    for (i, (c, g)) in out_cpu_v.iter().zip(out_gpu_v.iter()).enumerate() {
+        let bound = bf16_round_bound(f64::from(base_only_cpu[i]))
+            + bf16_round_bound(f64::from(base_plus_bias_cpu[i]))
+            + bf16_round_bound(f64::from(delta_scaled_cpu[i]))
+            + abs_floor;
+        assert!(
+            f64::from(*c - *g).abs() <= bound,
+            "bf16-bias fwd[{i}]: cpu(f32 ref) {c} vs cuda(bf16) {g} (bound {bound})"
+        );
+    }
+}
+
+/// SAME-DEVICE (CUDA-only) fused-vs-eager bit-exactness at `BF16`, the
+/// claim the module doc's "Bias" section makes explicitly ("the
+/// fused-with-bias forward is BIT-IDENTICAL to eager `Linear::forward` on
+/// both backends"): unlike the CPU<->CUDA legs above (which compare TWO
+/// DIFFERENT devices' rounding, hence the derived tolerance), this
+/// compares the fused kernel against a hand-built eager composition on
+/// the IDENTICAL device — no cross-device rounding-order question at all.
+///
+/// Uses [`exact_fixture`], NOT the realistic [`fixture`] — "same device"
+/// alone does not license a `tol == 0` claim here. This file's own bit-
+/// exactness contract (module doc above, roughly `:20-60`; see also
+/// [`exact_fixture`]'s doc) is that a `tol == 0` claim requires every
+/// partial sum on EVERY compared path to be a small exact integer, so
+/// that the sum is identical regardless of summation order. That
+/// requirement is about the GEMM's OPERAND FORM, not about which device
+/// runs it: `pack_ab_with_bias` packs `a`/`b` into the fused op's `ab`
+/// operand as row-packed `A^T [in, r]` / `B [out, r]` slices — an N-form
+/// GEMM operand `LowRankResidualLinear`'s CUDA kernel consumes directly —
+/// while the eager reference below instead calls `x32.matmul(&a.t())` /
+/// `.matmul(&b.t())`, a T-form TRANSPOSED VIEW of `a`/`b`'s original
+/// `[r, inf]` / `[outf, r]` storage. cuBLAS picks a different
+/// kernel/tiling (and therefore a different f32 accumulation order) for
+/// those two operand forms even on one identical device, so a REALISTIC
+/// (non-integer) fixture's rounding can and did diverge between the two
+/// arms here — the A100 landing run for this leg and its `F16` twin
+/// failed their `assert_eq!` deep in the output on exactly that fixture
+/// (esc-044's "correct but different order" lesson, applied to a same-
+/// device pair rather than a cross-device one). Switching to
+/// `exact_fixture` closes the gap by construction: every partial sum on
+/// BOTH operand forms is a small exact integer, and an exact-integer sum
+/// is identical regardless of which valid summation order either GEMM
+/// path picks — so the shared f32 value each arm rounds to `bf16` once is
+/// bit-identical REGARDLESS of operand form, making `tol == 0` true by
+/// construction rather than by (incorrectly) assuming operand form cannot
+/// matter same-device. What this leg pins, concretely: same-device
+/// bit-exactness of the BIAS ARM — the base GEMM, the storage-level
+/// `broadcast_add`, and the shared `ScaledCastAdd` epilogue kernel the
+/// fused op and this eager reference both dispatch to.
+#[test]
+fn lora_linear_bias_bf16_fused_matches_eager_composition_bit_exact_on_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let (rows, inf, outf, r) = (32usize, 256usize, 384usize, 8usize);
+    let scale = 0.5f32; // exact in binary.
+
+    let xv = exact_fixture(rows * inf, 1);
+    let wv = exact_fixture(outf * inf, 2);
+    let av = exact_fixture(r * inf, 3);
+    let bv = exact_fixture(outf * r, 4);
+    let bias_v = exact_fixture(outf, 9);
+    let x_bf16: Vec<bf16> = xv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let w_bf16: Vec<bf16> = wv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let bias_bf16: Vec<bf16> = bias_v.iter().map(|&v| bf16::from_f32(v)).collect();
+
+    let x = Tensor::from_slice(&x_bf16, (rows, inf), &cuda).unwrap();
+    let w = Tensor::from_slice(&w_bf16, (outf, inf), &cuda).unwrap();
+    let bias = Tensor::from_slice(&bias_bf16, outf, &cuda).unwrap();
+    let a = Tensor::from_slice(&av, (r, inf), &cuda).unwrap();
+    let b = Tensor::from_slice(&bv, (outf, r), &cuda).unwrap();
+    let ab = pack_ab_with_bias(&a, &b, &bias, outf, r).unwrap();
+
+    let op = LowRankResidualLinear::new(scale, inf, outf, r, None, false)
+        .unwrap()
+        .with_bias(true);
+    let fused = x.apply_op3(&w, &ab, op).unwrap();
+
+    // The eager reference is NOT "EXACTLY `LoraLinear::forward_composed`'s
+    // math": `forward_composed`'s own epilogue is `eager_epilogue`
+    // (`crates/jammi-lora/src/lora_linear.rs:127-147` — the `[mul, cast,
+    // add]` composition with the widen-to-wider-dtype rule its own doc
+    // describes), but this reference instead calls
+    // `apply2(base_out, lora_out, ScaledCastAdd::new(scaling))` directly —
+    // the fused op's own step-6 kernel, invoked through `apply2` here
+    // rather than `eager_epilogue`. That substitution is deliberate: it
+    // isolates the BIAS leg (the base GEMM plus the storage-level
+    // `broadcast_add`) under bit-exact same-device comparison, which is
+    // this test's whole point. `base_out = self.base.forward(x)` is still
+    // `candle_nn::Linear::forward` with a bias, i.e. `x.matmul(&w.t()) +
+    // bias` AT `x`'s (here, bf16) dtype — never widened; the LoRA
+    // sub-linears run on `x` cast to `F32` (`forward_composed`'s
+    // `x_lora`/`ScaledCastAdd`'s own module doc: "today, always F32 in
+    // this workspace"). Mixing `x` (bf16) directly into a matmul with
+    // `a`/`b` (F32) — as an earlier revision of this test did — is not
+    // what `forward_composed` computes and panics on a candle dtype
+    // mismatch; casting to F32 first (`x32`) is required and is what step
+    // 2 of `ops::low_rank_residual_linear`'s "Every rounding point,
+    // forward" module doc documents.
+    //
+    // Because the reference calls the fused kernel's own epilogue rather
+    // than `eager_epilogue`, this leg (and its `F16` twin below) CANNOT
+    // detect a divergence between `eager_epilogue` and the fused op's
+    // epilogue — that comparison is covered elsewhere, by the CPU
+    // cross-arm oracles in `crates/jammi-lora/tests/fused_epilogue.rs` and
+    // by `ScaledCastAdd`'s own CPU<->CUDA parity oracles in this file.
+    // What this leg DOES prove, same-device: the fused op issues the SAME
+    // cuBLAS `(1, m, out=out_features, k=in_features)` config with the
+    // same transposed-weight layout `Linear::forward` uses for the base
+    // GEMM (steps 1/1b), and calls the identical `scaled_cast_add` CUDA
+    // kernel for the epilogue (step 6) that `apply2`/`ScaledCastAdd`
+    // dispatches to here — not merely an analogous kernel, the SAME one
+    // (the "reuses ... directly" claim is `lora_epilogue_counters`'s doc,
+    // `crates/jammi-lora/src/lora_linear.rs:59-64` — not `eager_epilogue`'s).
+    let base_out = x
+        .matmul(&w.t().unwrap())
+        .unwrap()
+        .broadcast_add(&bias)
+        .unwrap();
+    let x32 = x.to_dtype(DType::F32).unwrap();
+    let after_a = x32.matmul(&a.t().unwrap()).unwrap();
+    let lora_out = after_a.matmul(&b.t().unwrap()).unwrap();
+    let eager = apply2(&base_out, &lora_out, ScaledCastAdd::new(f64::from(scale))).unwrap();
+
+    let fused_v: Vec<bf16> = fused
+        .flatten_all()
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let eager_v: Vec<bf16> = eager
+        .flatten_all()
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(
+        fused_v, eager_v,
+        "bf16 bias: the fused site must be bit-identical to the eager composition on the SAME \
+         device"
+    );
+
+    // RED CONTROL: prove the assertion above actually bites on a missing
+    // bias rather than passing vacuously. Guard non-vacuity first — the
+    // control is meaningless if the bias fixture happens to be all zero.
+    assert!(
+        bias_v.iter().any(|&v| v != 0.0),
+        "red-control guard: bias fixture must carry a non-zero element"
+    );
+    let base_out_no_bias = x.matmul(&w.t().unwrap()).unwrap();
+    let eager_no_bias = apply2(
+        &base_out_no_bias,
+        &lora_out,
+        ScaledCastAdd::new(f64::from(scale)),
+    )
+    .unwrap();
+    let eager_no_bias_v: Vec<bf16> = eager_no_bias
+        .flatten_all()
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_ne!(
+        fused_v, eager_no_bias_v,
+        "red control: an eager reference with the bias OMITTED must NOT be bit-equal to the \
+         (bias-carrying) fused output — otherwise the positive assertion above is vacuous"
+    );
+}
+
+/// The `F16` counterpart to
+/// `lora_linear_bias_bf16_fused_matches_eager_composition_bit_exact_on_cuda`
+/// — see that test's doc for the full derivation of why this leg uses
+/// [`exact_fixture`] rather than the realistic [`fixture`]: the fused
+/// kernel's `ab` operand is `pack_ab_with_bias`'s N-form `A^T [in, r]` /
+/// `B [out, r]` slices while this test's eager reference calls
+/// `.matmul(&a.t())` / `.matmul(&b.t())` (a T-form transposed view), and
+/// cuBLAS's differing kernel/tiling choice for those two operand forms —
+/// even on one identical device — makes a realistic fixture's rounding
+/// arm-dependent (this leg's own A100 landing-run failure was the second
+/// confirmation of that gap, alongside its `bf16` twin). An exact-integer
+/// fixture makes every partial sum on both operand forms a small exact
+/// integer, so the shared f32 value both arms round to `f16` once is
+/// bit-identical regardless of operand form — `tol == 0` by construction.
+#[test]
+fn lora_linear_bias_f16_fused_matches_eager_composition_bit_exact_on_cuda() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let (rows, inf, outf, r) = (32usize, 256usize, 384usize, 8usize);
+    let scale = 0.5f32; // exact in binary.
+
+    let xv = exact_fixture(rows * inf, 1);
+    let wv = exact_fixture(outf * inf, 2);
+    let av = exact_fixture(r * inf, 3);
+    let bv = exact_fixture(outf * r, 4);
+    let bias_v = exact_fixture(outf, 9);
+    let x_f16: Vec<f16> = xv.iter().map(|&v| f16::from_f32(v)).collect();
+    let w_f16: Vec<f16> = wv.iter().map(|&v| f16::from_f32(v)).collect();
+    let bias_f16: Vec<f16> = bias_v.iter().map(|&v| f16::from_f32(v)).collect();
+
+    let x = Tensor::from_slice(&x_f16, (rows, inf), &cuda).unwrap();
+    let w = Tensor::from_slice(&w_f16, (outf, inf), &cuda).unwrap();
+    let bias = Tensor::from_slice(&bias_f16, outf, &cuda).unwrap();
+    let a = Tensor::from_slice(&av, (r, inf), &cuda).unwrap();
+    let b = Tensor::from_slice(&bv, (outf, r), &cuda).unwrap();
+    let ab = pack_ab_with_bias(&a, &b, &bias, outf, r).unwrap();
+
+    let op = LowRankResidualLinear::new(scale, inf, outf, r, None, false)
+        .unwrap()
+        .with_bias(true);
+    let fused = x.apply_op3(&w, &ab, op).unwrap();
+
+    // See `lora_linear_bias_bf16_fused_matches_eager_composition_bit_exact_on_cuda`'s
+    // doc for the full derivation — this is NOT `LoraLinear::forward_composed`'s
+    // math (that epilogue is `eager_epilogue`, `lora_linear.rs:127-147`);
+    // this reference calls `apply2(base_out, lora_out,
+    // ScaledCastAdd::new(scaling))` directly — the fused op's own step-6
+    // kernel — at `F16`: base at `x`'s own dtype (`x.matmul(&w.t()) +
+    // bias`), the LoRA sub-linears on `x` cast to `F32`. As at bf16, this
+    // leg isolates the bias leg and cannot detect an epilogue divergence
+    // (see the bf16 test's doc for what covers that); "reuses ...
+    // directly" is `lora_epilogue_counters`'s doc claim
+    // (`lora_linear.rs:59-64`), about the SAME kernel this leg also calls
+    // on this device.
+    let base_out = x
+        .matmul(&w.t().unwrap())
+        .unwrap()
+        .broadcast_add(&bias)
+        .unwrap();
+    let x32 = x.to_dtype(DType::F32).unwrap();
+    let after_a = x32.matmul(&a.t().unwrap()).unwrap();
+    let lora_out = after_a.matmul(&b.t().unwrap()).unwrap();
+    let eager = apply2(&base_out, &lora_out, ScaledCastAdd::new(f64::from(scale))).unwrap();
+
+    let fused_v: Vec<f16> = fused
+        .flatten_all()
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let eager_v: Vec<f16> = eager
+        .flatten_all()
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(
+        fused_v, eager_v,
+        "f16 bias: the fused site must be bit-identical to the eager composition on the SAME \
+         device"
+    );
+
+    // RED CONTROL: mirrors the bf16 test's own — an eager reference with
+    // the bias OMITTED must NOT be bit-equal to the (bias-carrying) fused
+    // output, guarded against vacuity by requiring a non-zero bias
+    // fixture element.
+    assert!(
+        bias_v.iter().any(|&v| v != 0.0),
+        "red-control guard: bias fixture must carry a non-zero element"
+    );
+    let base_out_no_bias = x.matmul(&w.t().unwrap()).unwrap();
+    let eager_no_bias = apply2(
+        &base_out_no_bias,
+        &lora_out,
+        ScaledCastAdd::new(f64::from(scale)),
+    )
+    .unwrap();
+    let eager_no_bias_v: Vec<f16> = eager_no_bias
+        .flatten_all()
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_ne!(
+        fused_v, eager_no_bias_v,
+        "red control: an eager reference with the bias OMITTED must NOT be bit-equal to the \
+         (bias-carrying) fused output — otherwise the positive assertion above is vacuous"
+    );
+}
+
 // -----------------------------------------------------------------------
 // AttentionBlockFused — CPU<->CUDA parity, forward AND backward. Compiles
 // and type-checks under `cargo check --features cuda` (no `nvcc` in this

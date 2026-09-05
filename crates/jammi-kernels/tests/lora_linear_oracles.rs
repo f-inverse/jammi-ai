@@ -91,6 +91,47 @@ fn pack_ab(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     Tensor::cat(&[&a.t()?, b], 0)
 }
 
+/// #428 P2b: `pack_ab`'s bias-carrying sibling — appends the frozen
+/// bias's own `bias_rows = out_features.div_ceil(rank)` rows, flattened
+/// row-major and zero-padded past `out_features` (see
+/// `jammi_kernels::ops::low_rank_residual_linear`'s module doc, "Bias:
+/// packed into `ab`'s trailing rows"). `bias` is `[out_features]`.
+fn pack_ab_with_bias(
+    a: &Tensor,
+    b: &Tensor,
+    bias: &Tensor,
+    out_features: usize,
+    rank: usize,
+) -> Result<Tensor> {
+    let ab_no_bias = pack_ab(a, b)?;
+    let bias_rows = out_features.div_ceil(rank);
+    let bias_v: Vec<f32> = bias.flatten_all()?.to_vec1()?;
+    let mut bias_padded = vec![0.0f32; bias_rows * rank];
+    bias_padded[..out_features].copy_from_slice(&bias_v);
+    let bias_tensor = Tensor::from_slice(&bias_padded, (bias_rows, rank), bias.device())?;
+    Tensor::cat(&[&ab_no_bias, &bias_tensor], 0)
+}
+
+/// [`eager_forward`]'s bias-carrying sibling: `base_out.broadcast_add(bias)`
+/// added to `scale * (x @ A^T @ B^T)` — the SAME `x.broadcast_add(bias)`
+/// call `candle_nn::Linear::forward` makes (see the op's own module doc's
+/// "Bias" section for the full rounding-point citation trail this
+/// reproduces).
+fn eager_forward_with_bias(
+    x: &Tensor,
+    w: &Tensor,
+    bias: &Tensor,
+    a: &Tensor,
+    b: &Tensor,
+    scale: f64,
+) -> Result<Tensor> {
+    let base_out = x.matmul(&w.t()?)?.broadcast_add(bias)?;
+    let after_a = x.matmul(&a.t()?)?;
+    let lora_out = after_a.matmul(&b.t()?)?;
+    let scaled = (&lora_out * scale)?;
+    &base_out + &scaled
+}
+
 fn fused_forward(x: &Tensor, w: &Tensor, ab: &Tensor, op: LowRankResidualLinear) -> Result<Tensor> {
     x.apply_op3(w, ab, op)
 }
@@ -730,5 +771,180 @@ fn f16_base_on_cpu_matches_the_f32_eager_reference_bit_exact() {
         &expected.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
         0.0,
         "f16_base_on_cpu_matches_the_f32_eager_reference_bit_exact",
+    );
+}
+
+/// #428 P2b: every BERT-base / DistilBERT projection width the bias-
+/// carrying pack must run at — `768x768` (self-attention Q/K/V/O),
+/// `768x3072` (the MLP up-projection), `3072x768` (the MLP
+/// down-projection) — `rank = 8` (a realistic LoRA rank), bit-exact
+/// (`tol == 0.0`, exact-integer fixtures — see the module doc's "oracle
+/// contract" section) against the eager-with-bias composition
+/// [`eager_forward_with_bias`].
+#[test]
+fn bert_family_bias_widths_forward_matches_the_eager_biased_composition_bit_exact() {
+    let device = Device::Cpu;
+    let r = 8usize;
+    let scale = 8.0 / (r as f64);
+    let rows = 32usize;
+
+    for (idx, &(inf, outf)) in [(768usize, 768usize), (768, 3072), (3072, 768)]
+        .iter()
+        .enumerate()
+    {
+        let phase = idx as i64 * 5;
+        let x = Tensor::from_slice(&exact_fixture(rows * inf, 1 + phase), (rows, inf), &device)
+            .unwrap();
+        let w = Tensor::from_slice(&exact_fixture(outf * inf, 2 + phase), (outf, inf), &device)
+            .unwrap();
+        let a = Tensor::from_slice(&exact_fixture(r * inf, 3 + phase), (r, inf), &device).unwrap();
+        let b =
+            Tensor::from_slice(&exact_fixture(outf * r, 4 + phase), (outf, r), &device).unwrap();
+        let bias = Tensor::from_slice(&exact_fixture(outf, 5 + phase), outf, &device).unwrap();
+        let ab = pack_ab_with_bias(&a, &b, &bias, outf, r).unwrap();
+
+        let op = LowRankResidualLinear::new(scale as f32, inf, outf, r, None, false)
+            .unwrap()
+            .with_bias(true);
+        let fused = fused_forward(&x, &w, &ab, op).unwrap();
+        let eager = eager_forward_with_bias(&x, &w, &bias, &a, &b, scale).unwrap();
+
+        let fused_v: Vec<f32> = fused.flatten_all().unwrap().to_vec1().unwrap();
+        let eager_v: Vec<f32> = eager.flatten_all().unwrap().to_vec1().unwrap();
+        assert_close(
+            &fused_v,
+            &eager_v,
+            0.0,
+            &format!("bert_family_bias[{inf}x{outf}]"),
+        );
+    }
+}
+
+/// The bias-carrying pack's backward, at BERT's widest MLP projection
+/// (`768 -> 3072`, `rank = 8`), a NON-UNIFORM `dy` (a deterministic
+/// cosine pattern, never all-ones — rule 8) — vs candle's own autograd
+/// walk of the eager-with-bias composition. The frozen bias needs no
+/// gradient of its own on EITHER side (it is a plain, non-`Var` leaf in
+/// both the fused and the eager reconstruction), so only `dx`/`dA`/`dB`
+/// are compared here; `d_ab`'s own bias-row-zero property is pinned
+/// directly against `LowRankResidualLinear::bwd` in
+/// `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs`'s own
+/// `#[cfg(test)]` module
+/// (`gradcheck_cpu_f32_bias_no_dropout_and_d_ab_bias_rows_are_zero`), not
+/// duplicated here.
+#[test]
+fn bert_family_bias_backward_matches_candle_autograd_of_the_eager_biased_composition() {
+    let device = Device::Cpu;
+    let (rows, inf, outf, r) = (32usize, 768usize, 3072usize, 8usize);
+    let scale = 8.0 / (r as f64);
+
+    let x_v = fixture(rows * inf, 0.13);
+    let w_v = fixture(outf * inf, 0.23);
+    let a_v = fixture(r * inf, 0.33);
+    let b_v = fixture(outf * r, 0.43);
+    let bias_v = fixture(outf, 0.53);
+    let dy_v: Vec<f32> = (0..rows * outf).map(|i| (i as f32 * 0.071).cos()).collect();
+
+    // Fused side.
+    let x_fused =
+        Var::from_tensor(&Tensor::from_slice(&x_v, (rows, inf), &device).unwrap()).unwrap();
+    let w_plain = Tensor::from_slice(&w_v, (outf, inf), &device).unwrap();
+    let a_fused = Var::from_tensor(&Tensor::from_slice(&a_v, (r, inf), &device).unwrap()).unwrap();
+    let b_fused = Var::from_tensor(&Tensor::from_slice(&b_v, (outf, r), &device).unwrap()).unwrap();
+    let bias_plain = Tensor::from_slice(&bias_v, (outf,), &device).unwrap();
+    let ab_fused = pack_ab_with_bias(
+        a_fused.as_tensor(),
+        b_fused.as_tensor(),
+        &bias_plain,
+        outf,
+        r,
+    )
+    .unwrap();
+    let dy = Tensor::from_slice(&dy_v, (rows, outf), &device).unwrap();
+
+    let op = LowRankResidualLinear::new(scale as f32, inf, outf, r, None, false)
+        .unwrap()
+        .with_bias(true);
+    let out_fused = x_fused
+        .as_tensor()
+        .apply_op3(&w_plain, &ab_fused, op)
+        .unwrap();
+    let loss_fused = (&out_fused * &dy).unwrap().sum_all().unwrap();
+    let grads_fused = loss_fused.backward().unwrap();
+
+    // Eager side: an independent set of leaves with the SAME values,
+    // through candle's own autograd over the unfused, biased composition.
+    let x_eager =
+        Var::from_tensor(&Tensor::from_slice(&x_v, (rows, inf), &device).unwrap()).unwrap();
+    let w_eager = Tensor::from_slice(&w_v, (outf, inf), &device).unwrap();
+    let a_eager = Var::from_tensor(&Tensor::from_slice(&a_v, (r, inf), &device).unwrap()).unwrap();
+    let b_eager = Var::from_tensor(&Tensor::from_slice(&b_v, (outf, r), &device).unwrap()).unwrap();
+    let bias_eager = Tensor::from_slice(&bias_v, (outf,), &device).unwrap();
+    let out_eager = eager_forward_with_bias(
+        x_eager.as_tensor(),
+        &w_eager,
+        &bias_eager,
+        a_eager.as_tensor(),
+        b_eager.as_tensor(),
+        scale,
+    )
+    .unwrap();
+    let loss_eager = (&out_eager * &dy).unwrap().sum_all().unwrap();
+    let grads_eager = loss_eager.backward().unwrap();
+
+    let tol = 1e-3f32;
+    assert_close(
+        &grads_fused
+            .get(&x_fused)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap(),
+        &grads_eager
+            .get(&x_eager)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap(),
+        tol,
+        "dx_bias",
+    );
+    assert_close(
+        &grads_fused
+            .get(&a_fused)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap(),
+        &grads_eager
+            .get(&a_eager)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap(),
+        tol,
+        "da_bias",
+    );
+    assert_close(
+        &grads_fused
+            .get(&b_fused)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap(),
+        &grads_eager
+            .get(&b_eager)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap(),
+        tol,
+        "db_bias",
     );
 }

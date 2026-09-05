@@ -2549,7 +2549,7 @@ impl AdmissionProbeSnapshot {
     /// kernels' own `admit()` sites accumulate into (the
     /// `jammi_encoders::ln_dispatch_snapshot()`-style accessors this used to
     /// call are themselves `counters_for("layer_norm_fused")`,
-    /// `crates/jammi-encoders/src/layer_norm.rs:103`, under the hood).
+    /// `crates/jammi-encoders/src/layer_norm.rs:129`, under the hood).
     fn capture(dtype: jammi_kernels::admission::DtypeClass) -> Self {
         let two_arm = probed_report_keys(dtype)
             .into_iter()

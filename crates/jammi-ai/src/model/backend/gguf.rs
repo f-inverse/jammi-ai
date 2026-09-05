@@ -462,13 +462,13 @@ fn read_gguf_header(path: &Path, model_id: &str) -> Result<gguf_file::Content> {
 /// `candle.rs`'s `per_model_precision.unwrap_or(device_config.compute_precision)`
 /// falls back to whenever neither `config.json` nor `DeviceConfig` overrides
 /// it is produced not by `ComputePrecision`'s own `#[default]` arm
-/// (`jammi_numerics::precision.rs:38-41`) but by `GpuConfig`'s manual
-/// `impl Default` hardcoding `compute_precision:
-/// jammi_numerics::ComputePrecision::F32` at `jammi-db/src/config.rs:931`
-/// — reached via `device_config.compute_precision` (`DeviceConfig::from_config`,
-/// `backend/mod.rs:47`) ← `config.gpu.compute_precision`, whose
-/// missing-field fallback is routed by `GpuConfig`'s container-level
-/// `#[serde(default)]` (`jammi-db/src/config.rs:384`) to
+/// (`jammi_numerics::precision.rs:38-41`) but by `GpuConfig`'s manual `impl
+/// Default` hardcoding
+/// `compute_precision: jammi_numerics::ComputePrecision::F32`,
+/// `jammi-db/src/config.rs:961` — reached via `device_config.compute_precision`
+/// (`DeviceConfig::from_config`, `backend/mod.rs:47`) ← `config.gpu.compute_precision`,
+/// whose missing-field fallback is routed by `GpuConfig`'s container-level
+/// `#[serde(default)]`, `jammi-db/src/config.rs:385`, to
 /// `GpuConfig::default()`, never to `ComputePrecision::default()`, making
 /// it a second hand-written `F32` default independent of `precision.rs:40`
 /// and thus able to drift from it).

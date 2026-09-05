@@ -17,7 +17,11 @@ workspace ships every publishable crate at the same
   below). Three new CUDA symbols back the forward: `layer_norm_fwd_f32_biased`,
   `layer_norm_fwd_bf16_biased`, `layer_norm_fwd_f16_biased`. The per-op A/B driver
   (`ci/scripts/perf/finetune_ab.sh`) gains an `AB_OP=ln` mode to isolate this site's own fused-vs-eager
-  difference. The measured A100 number lands with the artifact commit that records it, not this entry.
+  difference. Measured on an A100 (#460, `crates/jammi-kernels/artifacts/cuda-runs/2026-09-05-ln-bias-460-6c6d79c-a100-pcie.json`):
+  per-step wall gains of 9–25% across both BERT and DistilBERT and both activating shapes, with the
+  LoRA site already fused on both arms of the sweep; the site lands by architectural direction (one
+  common LayerNorm path) rather than a pre-registered activation bar, so the ACTIVATE verdicts are the
+  measured classification only.
 - **The citation checker resolves cites in `ci/scripts/perf/**` and Rust crate comments; sha-pinned
   cites resolve sha-relatively (#459).** `check_citations.py` gained a full-path citation form for
   `ci/scripts/perf/**`'s own `.sh`/`.py` files and for `//`/`///`/`//!` line comments, doc block

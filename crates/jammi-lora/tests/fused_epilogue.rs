@@ -40,7 +40,7 @@
 //! additionally pins that `lora_epilogue`'s own counter stays untouched by
 //! a fused-site dispatch (documented, not silently left stale).
 
-use candle_core::{DType, Device, Tensor};
+use candle_core::{DType, Device, Tensor, Var};
 use candle_nn::{Linear, Module, VarBuilder, VarMap};
 use jammi_lora::{
     lora_epilogue_dispatch_snapshot, lora_linear_fused_dispatch_snapshot, FrozenBase, LoraInitMode,
@@ -72,24 +72,44 @@ fn rand_input(device: &Device) -> Tensor {
     Tensor::randn(0f32, 1.0, (2, 5, 8), device).unwrap()
 }
 
-/// Same weight VALUES as [`build_base`], but with an EXACTLY-ZERO bias —
-/// `bias.is_some()` alone is enough to force `LoraLinear::forward`'s
-/// eager-fallback arm (see `lora_linear_admission_predicate`'s
-/// `base_has_no_bias` check), while a zero bias adds NOTHING numerically
-/// to the base output — so this is the "same math, forced-eager" fixture
-/// the fused-vs-eager cross-arm oracles below need: any output difference
-/// between a fused-arm and an eager-arm instance built with this vs
-/// [`build_base`] is attributable ONLY to which arm dispatched, never to
-/// the bias term itself.
-fn build_base_with_zero_bias(
+/// Same weight VALUES as [`build_base`], but as a NON-CONTIGUOUS `w` — a
+/// dim-1 narrow of a wider, untracked-leaf matrix. #428 P2b made a
+/// bias-carrying base FUSE (see this file's own module doc's "Migrated"
+/// note for the prior lever this replaces): `bias.is_some()` alone no
+/// longer forces `LoraLinear::forward`'s eager-fallback arm, so
+/// `lora_linear_admission_predicate`'s `w_contiguous` refusal is the new
+/// forced-eager lever instead — a domain miss with NOTHING to do with
+/// bias, so this is still the "same math, forced-eager" fixture the
+/// cross-arm oracles below need: any output difference between a
+/// fused-arm and an eager-arm instance built with this vs [`build_base`]
+/// is attributable ONLY to which arm dispatched. `w` remains a true
+/// untracked leaf here (`frozen_weight_gate` still passes; ONLY the
+/// contiguity changes) — the wider buffer's second `in_features` columns
+/// are pure filler, never read by any GEMM this file issues.
+fn build_base_with_noncontiguous_w(
     in_features: usize,
     out_features: usize,
     device: &Device,
     dtype: DType,
 ) -> Linear {
-    let base = build_base(in_features, out_features, device, dtype);
-    let bias = Tensor::zeros((out_features,), dtype, device).unwrap();
-    Linear::new(base.weight().clone(), Some(bias))
+    let mut wide = Vec::with_capacity(2 * in_features * out_features);
+    for i in 0..out_features {
+        for j in 0..in_features {
+            wide.push(((i * 7 + j * 3) as f32).sin());
+        }
+        wide.extend(std::iter::repeat_n(0.0f32, in_features)); // filler, never read.
+    }
+    let w_wide = Tensor::from_vec(wide, (out_features, 2 * in_features), device)
+        .unwrap()
+        .to_dtype(dtype)
+        .unwrap();
+    let w = w_wide.narrow(1, 0, in_features).unwrap();
+    assert!(
+        !w.is_contiguous(),
+        "fixture must actually be non-contiguous — a dim-1 narrow of a wider row-major \
+         matrix has row stride 2*in_features, wider than its own logical width"
+    );
+    Linear::new(w, None)
 }
 
 /// A fixed, deterministic, SMALL-INTEGER `f32` fixture (`{-4, .., 4}`) —
@@ -723,9 +743,11 @@ fn resume_past_the_forward_counter_ceiling_is_a_typed_refusal_at_the_production_
 /// construction call) would survive the whole suite. This test closes
 /// that gap directly: SAME `ResumeState` (both fresh, position 0), SAME
 /// seed/prefix/config (hence identical seeded `A`/`B` AND identical
-/// `layer_id`), SAME input — one instance forced fused (bias-free base),
-/// one forced eager (a `build_base_with_zero_bias` base, which changes
-/// NOTHING numerically) — their outputs must be BIT-IDENTICAL. This is
+/// `layer_id`), SAME input — one instance forced fused (a contiguous
+/// base), one forced eager (the SAME weight values as a NON-CONTIGUOUS
+/// `w` — #428 P2b's forced-eager lever, `build_base_with_noncontiguous_w`'s
+/// own doc explains why a zero bias no longer works) — their outputs must
+/// be BIT-IDENTICAL. This is
 /// the strongest form of "the same key produces the same result" this
 /// crate can state: not merely that resuming reproduces a FIXED arm's own
 /// earlier run, but that the two DIFFERENT arms of the SAME logical
@@ -776,9 +798,21 @@ fn fused_and_eager_arms_draw_the_bit_identical_dropout_stream_at_the_same_resume
 
     let varmap_e = VarMap::new();
     let vb_e = VarBuilder::from_varmap(&varmap_e, DType::F32, &device);
-    let w_for_eager = Tensor::from_slice(&w_v, (out_features, in_features), &device).unwrap();
-    let zero_bias = Tensor::zeros((out_features,), DType::F32, &device).unwrap();
-    let base_e = Linear::new(w_for_eager, Some(zero_bias));
+    // Non-contiguous `w`, carrying the SAME `w_v` values as `base_f`'s —
+    // #428 P2b's forced-eager lever (`build_base_with_noncontiguous_w`'s
+    // own doc explains why a zero bias no longer forces eager at all).
+    let mut w_wide_v = Vec::with_capacity(2 * in_features * out_features);
+    for row in 0..out_features {
+        w_wide_v.extend_from_slice(&w_v[row * in_features..(row + 1) * in_features]);
+        w_wide_v.extend(std::iter::repeat_n(0.0f32, in_features));
+    }
+    let w_wide = Tensor::from_slice(&w_wide_v, (out_features, 2 * in_features), &device).unwrap();
+    let w_for_eager = w_wide.narrow(1, 0, in_features).unwrap();
+    assert!(
+        !w_for_eager.is_contiguous(),
+        "fixture must be non-contiguous"
+    );
+    let base_e = Linear::new(w_for_eager, None);
     let mut lora_e = LoraLinear::new(
         base_e,
         rank,
@@ -853,7 +887,7 @@ fn fused_and_eager_arms_with_different_seeds_do_not_coincidentally_match() {
 
     let varmap_e = VarMap::new();
     let vb_e = VarBuilder::from_varmap(&varmap_e, DType::F32, &device);
-    let base_e = build_base_with_zero_bias(in_features, out_features, &device, DType::F32);
+    let base_e = build_base_with_noncontiguous_w(in_features, out_features, &device, DType::F32);
     let lora_e = LoraLinear::new(
         base_e,
         rank,
@@ -925,10 +959,11 @@ fn production_path_retains_fewer_tape_nodes_fused_vs_eager_fallback() {
     );
     let nodes_fused = y_f.sorted_nodes().len();
 
-    // EAGER-FALLBACK arm: zero-bias base forces fallback, same shapes/config.
+    // EAGER-FALLBACK arm: non-contiguous-w base forces fallback (#428
+    // P2b's lever), same shapes/config.
     let varmap_e = VarMap::new();
     let vb_e = VarBuilder::from_varmap(&varmap_e, DType::F32, &device);
-    let base_e = build_base_with_zero_bias(in_features, out_features, &device, DType::F32);
+    let base_e = build_base_with_noncontiguous_w(in_features, out_features, &device, DType::F32);
     let lora_e = LoraLinear::new(
         base_e,
         rank,
@@ -959,6 +994,157 @@ fn production_path_retains_fewer_tape_nodes_fused_vs_eager_fallback() {
     // Pin the MEASURED constants directly (not just "fewer than").
     assert_eq!(nodes_fused, 5, "measured production-path FUSED node count");
     assert_eq!(nodes_eager, 11, "measured production-path EAGER node count");
+}
+
+/// #428 P2b: the bias-carrying cross-arm oracle this contract calls for —
+/// a REAL (non-zero, non-`Var`) base bias FUSES (unlike every test above
+/// this file's "Migrated" note predates, which used a bias-free or
+/// zero-bias base): fused arm (a biased, contiguous base) vs eager arm
+/// (the SAME biased base, forced eager via the non-contiguous-`w` lever —
+/// `build_base_with_noncontiguous_w`'s own doc) must agree bit-for-bit on
+/// exact-integer fixtures (the SAME architecture-independence argument
+/// `exact_fixture`'s own doc makes), with an explicit counter proof that
+/// the fused arm actually dispatched Fused-only and the eager arm
+/// actually dispatched Eager-only (a dispatch-count omission here would
+/// make the bit-exact comparison compare the SAME arm against itself).
+#[test]
+fn bias_carrying_base_fuses_and_matches_the_noncontiguous_w_eager_fallback_bit_exactly() {
+    let device = cpu();
+    let (in_features, out_features, rank) = (8usize, 16usize, 4usize);
+    let w_v = exact_fixture(out_features * in_features, 31);
+    let bias_v = exact_fixture(out_features, 32);
+    let a_v = exact_fixture(rank * in_features, 33);
+    let b_v = exact_fixture(out_features * rank, 34);
+    let x_v = exact_fixture(2 * 5 * in_features, 35);
+    let x = Tensor::from_slice(&x_v, (2, 5, in_features), &device).unwrap();
+
+    // FUSED arm: a real, frozen (non-`Var`) bias on a CONTIGUOUS `w`.
+    let varmap_f = VarMap::new();
+    let vb_f = VarBuilder::from_varmap(&varmap_f, DType::F32, &device);
+    let w_f = Tensor::from_slice(&w_v, (out_features, in_features), &device).unwrap();
+    let bias_f = Tensor::from_slice(&bias_v, out_features, &device).unwrap();
+    let base_f = Linear::new(w_f, Some(bias_f));
+    let mut lora_f = LoraLinear::new(
+        base_f,
+        rank,
+        8.0,
+        false,
+        LoraInitMode::Gaussian,
+        None,
+        1,
+        &varmap_f,
+        &vb_f,
+    )
+    .unwrap();
+    lora_f.lora_a = Tensor::from_slice(&a_v, (rank, in_features), &device).unwrap();
+    lora_f.lora_b = Tensor::from_slice(&b_v, (out_features, rank), &device).unwrap();
+
+    let before_f = lora_linear_fused_dispatch_snapshot();
+    let y_f = lora_f.forward(&x).unwrap();
+    let after_f = lora_linear_fused_dispatch_snapshot();
+    assert!(
+        after_f.fused > before_f.fused,
+        "a biased-but-contiguous base must dispatch Fused: before={before_f:?} \
+         after={after_f:?}"
+    );
+
+    // EAGER arm: the SAME bias values, but `w` forced non-contiguous.
+    let varmap_e = VarMap::new();
+    let vb_e = VarBuilder::from_varmap(&varmap_e, DType::F32, &device);
+    let mut w_wide_v = Vec::with_capacity(2 * in_features * out_features);
+    for row in 0..out_features {
+        w_wide_v.extend_from_slice(&w_v[row * in_features..(row + 1) * in_features]);
+        w_wide_v.extend(std::iter::repeat_n(0.0f32, in_features));
+    }
+    let w_wide = Tensor::from_slice(&w_wide_v, (out_features, 2 * in_features), &device).unwrap();
+    let w_e = w_wide.narrow(1, 0, in_features).unwrap();
+    assert!(!w_e.is_contiguous(), "fixture must be non-contiguous");
+    let bias_e = Tensor::from_slice(&bias_v, out_features, &device).unwrap();
+    let base_e = Linear::new(w_e, Some(bias_e));
+    let mut lora_e = LoraLinear::new(
+        base_e,
+        rank,
+        8.0,
+        false,
+        LoraInitMode::Gaussian,
+        None,
+        1,
+        &varmap_e,
+        &vb_e,
+    )
+    .unwrap();
+    lora_e.lora_a = Tensor::from_slice(&a_v, (rank, in_features), &device).unwrap();
+    lora_e.lora_b = Tensor::from_slice(&b_v, (out_features, rank), &device).unwrap();
+
+    let before_e = lora_linear_fused_dispatch_snapshot();
+    let y_e = lora_e.forward(&x).unwrap();
+    let after_e = lora_linear_fused_dispatch_snapshot();
+    assert!(
+        after_e.eager > before_e.eager,
+        "the non-contiguous-w base must dispatch Eager: before={before_e:?} \
+         after={after_e:?}"
+    );
+
+    assert_eq!(
+        y_f.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        y_e.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        "a biased base: the FUSED arm and the (SAME bias, non-contiguous-w) EAGER \
+         arm must agree bit-for-bit on an exact-integer fixture"
+    );
+}
+
+/// #428 P2b: a TRAINABLE `Var` base bias is a COUNTED eager refusal
+/// (`bias_is_frozen_leaf`, `jammi_lora::lora_linear`'s private `bias_gate` —
+/// this test proves the OBSERVABLE behaviour through the public
+/// dispatch-counter API, not by calling that private function directly).
+/// Distinguishes this state from "no bias at all" (which is ALSO an
+/// eager-uninvolved `None` from `bias_gate`, but for a completely
+/// different, non-refusal reason) — see `lora_linear_admission_predicate`'s
+/// own doc for why `base_has_bias && !bias_pack_is_some` is the ONLY
+/// remaining bias-shaped refusal.
+#[test]
+fn trainable_var_bias_is_a_counted_eager_refusal() {
+    let device = cpu();
+    let (in_features, out_features, rank) = (8usize, 16usize, 4usize);
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    let w = Tensor::from_slice(
+        &exact_fixture(out_features * in_features, 41),
+        (out_features, in_features),
+        &device,
+    )
+    .unwrap();
+    let bias_var = Var::from_tensor(
+        &Tensor::from_slice(&exact_fixture(out_features, 42), out_features, &device).unwrap(),
+    )
+    .unwrap();
+    let base = Linear::new(w, Some(bias_var.as_tensor().clone()));
+    assert!(
+        bias_var.as_tensor().is_variable(),
+        "fixture's bias must actually be a trainable Var"
+    );
+    let lora = LoraLinear::new(
+        base,
+        rank,
+        8.0,
+        false,
+        LoraInitMode::Gaussian,
+        None,
+        1,
+        &varmap,
+        &vb,
+    )
+    .unwrap();
+    let x = rand_input(&device);
+
+    let before = lora_linear_fused_dispatch_snapshot();
+    let _ = lora.forward(&x).unwrap();
+    let after = lora_linear_fused_dispatch_snapshot();
+    assert!(
+        after.eager > before.eager,
+        "a trainable Var bias must be a COUNTED eager refusal, not a silent (uncounted) \
+         miss: before={before:?} after={after:?}"
+    );
 }
 
 /// (Round-2 audit A3): the fused arm's `self.scaling as f32` (a plain Rust

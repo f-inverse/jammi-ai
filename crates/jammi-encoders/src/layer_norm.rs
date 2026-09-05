@@ -1114,6 +1114,14 @@ mod tests {
     /// fail the domain check.
     #[test]
     fn eval_mode_forward_is_bit_identical_regardless_of_fused_eligibility() {
+        // The `set_training(true)` forward below (see "Exercise the fused
+        // arm" further down) bumps `LN_DISPATCH_COUNTERS` even though this
+        // test never reads it — same lock discipline as every other
+        // training-forward test in this module (see
+        // `DISPATCH_COUNTER_TEST_LOCK`'s own doc).
+        let _guard = DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
         let hidden = 8;
         let xv: Vec<bf16> = (0..hidden)

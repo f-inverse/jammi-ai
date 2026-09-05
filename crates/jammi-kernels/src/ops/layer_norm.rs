@@ -1795,6 +1795,64 @@ mod tests {
         }
     }
 
+    /// [`bf16_forward_biased_matches_f32_accumulation_rounded_once`]'s F16
+    /// twin. F16 has MORE mantissa bits than bf16 (10 vs 7), so this bound
+    /// must be TIGHTER than bf16's, not merely reused: bf16's own
+    /// coefficients (`2e-2`/`1e-2`) are a half-bf16-ulp relative error
+    /// (`2^-8 ≈ 3.9e-3`) scaled up by this op's round-once-epilogue slack;
+    /// f16's half-ulp relative error is `2^-11 ≈ 4.9e-4`, exactly `1/8` of
+    /// bf16's (`2^(11-8) = 8`, the same BF16-to-F16 ULP ratio
+    /// `jammi_kernels::f16_oracle::assert_floor_below_f16_gradient_band`
+    /// derives), so applying the SAME epilogue-slack multiplier to that
+    /// smaller per-element error and scaling bf16's own coefficients down
+    /// by that `1/8` ratio gives f16's bound: `2e-2 / 8 = 2.5e-3`, `1e-2 /
+    /// 8 = 1.25e-3` — the identical derivation
+    /// `tests/layer_norm_oracles.rs`'s `f16_biased_fwd_bwd_bound_at_
+    /// production_width` uses at production width.
+    #[test]
+    fn f16_forward_biased_matches_f32_accumulation_rounded_once() {
+        let device = Device::Cpu;
+        let xv = [1.0f32, 2.0, 3.0, 4.0];
+        let xh: Vec<f16> = xv.iter().map(|&v| f16::from_f32(v)).collect();
+        let gh = [f16::from_f32(1.0); 4];
+        let bv = [0.3f32, -0.7, 1.1, -1.5];
+        let bh: Vec<f16> = bv.iter().map(|&v| f16::from_f32(v)).collect();
+        let x = Tensor::from_slice(&xh, (1, 4), &device).unwrap();
+        let gamma = Tensor::from_slice(&gh, (4,), &device).unwrap();
+        let beta = Tensor::from_slice(&bh, (4,), &device).unwrap();
+        let out: Vec<f16> = ln_biased(1e-5, false, false, &x, &gamma, &beta)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        let xf: Vec<f64> = xh.iter().map(|v| v.to_f32() as f64).collect();
+        let mean: f64 = xf.iter().sum::<f64>() / xf.len() as f64;
+        let var: f64 = xf.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / xf.len() as f64;
+        let invvar = 1.0 / (var + 1e-5).sqrt();
+        let expected: Vec<f32> = xf
+            .iter()
+            .zip(bh.iter())
+            .map(|(&v, &b)| (((v - mean) * invvar) as f32) + b.to_f32())
+            .collect();
+
+        let mut max_rel: f32 = 0.0;
+        for (i, (o, e)) in out.iter().zip(expected.iter()).enumerate() {
+            let xhat_g = (((xf[i] - mean) * invvar) as f32).abs();
+            let beta_abs = bh[i].to_f32().abs();
+            let bound = (xhat_g + beta_abs) * 2.5e-3 + 1.25e-3;
+            assert!(
+                o.to_f32().is_finite() && (o.to_f32() - e).abs() < bound,
+                "{o} vs {e} (bound {bound})"
+            );
+            if *e != 0.0 {
+                max_rel = max_rel.max((o.to_f32() - e).abs() / e.abs());
+            }
+        }
+        println!("f16_forward_biased_matches_f32_accumulation_rounded_once: max_rel={max_rel}");
+    }
+
     /// `beta` shape mismatch (rank-1, wrong length) is refused, not
     /// broadcast — mirrors `gamma_shape_mismatch_is_refused_not_broadcast`.
     #[test]

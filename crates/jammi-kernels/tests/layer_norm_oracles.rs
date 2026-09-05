@@ -778,10 +778,19 @@ fn bf16_biased_fwd_bwd_bound_at_production_width() {
     }
 }
 
-/// [`bf16_biased_fwd_bwd_bound_at_production_width`]'s F16 twin — F16's
-/// narrower 10-bit mantissa needs its own (tighter-magnitude, wider
-/// relative) bound; same fixture generator, same beta-cancellation
-/// derivation.
+/// [`bf16_biased_fwd_bwd_bound_at_production_width`]'s F16 twin. F16 has
+/// MORE mantissa bits than bf16 (10 vs 7), so this bound must be TIGHTER
+/// than bf16's, not wider: bf16's own coefficients (`2e-2`/`1e-2`) are
+/// derived from a half-bf16-ulp relative error (`2^-8 ≈ 3.9e-3`) scaled up
+/// by this op's own n-term reduction slack (the same "round-once epilogue"
+/// derivation `ops::layer_norm`'s `bf16_forward_biased_matches_f32_
+/// accumulation_rounded_once` unit test uses). F16's half-ulp relative
+/// error is `2^-11 ≈ 4.9e-4` — exactly `1/8` of bf16's `2^-8` (11 vs 8
+/// mantissa+implicit bits, `2^(11-8) = 8`) — so applying the SAME
+/// reduction-slack multiplier to the smaller per-element error and scaling
+/// bf16's own coefficients down by that same `1/8` ulp ratio gives F16's
+/// bound: `2e-2 / 8 = 2.5e-3`, `1e-2 / 8 = 1.25e-3`. Reports `max_rel`
+/// exactly like the bf16 twin so the slack is visible.
 #[test]
 fn f16_biased_fwd_bwd_bound_at_production_width() {
     let device = Device::Cpu;
@@ -819,6 +828,7 @@ fn f16_biased_fwd_bwd_bound_at_production_width() {
         .unwrap();
         let out_v: Vec<f16> = out.flatten_all().unwrap().to_vec1().unwrap();
 
+        let mut max_rel: f32 = 0.0;
         for r in 0..rows {
             let row: Vec<f64> = xh[r * hidden..(r + 1) * hidden]
                 .iter()
@@ -833,14 +843,18 @@ fn f16_biased_fwd_bwd_bound_at_production_width() {
                 let b = bh[c].to_f32() as f64;
                 let expected = (xhat * g + b) as f32;
                 let got = out_v[r * hidden + c].to_f32();
-                let bound = ((xhat * g).abs() as f32 + b.abs() as f32) * 6e-2 + 3e-2;
+                let bound = ((xhat * g).abs() as f32 + b.abs() as f32) * 2.5e-3 + 1.25e-3;
                 assert!(
                     got.is_finite() && (got - expected).abs() < bound,
                     "hidden={hidden} row={r} col={c}: got {got} vs expected {expected} \
                      (bound {bound})"
                 );
+                if expected != 0.0 {
+                    max_rel = max_rel.max((got - expected).abs() / expected.abs());
+                }
             }
         }
+        println!("f16_biased_fwd_bwd_bound_at_production_width: hidden={hidden} max_rel={max_rel}");
 
         let loss = (&out * &dy).unwrap().sum_all().unwrap();
         let grads = loss.backward().unwrap();

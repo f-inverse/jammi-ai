@@ -4350,6 +4350,15 @@ mod tests {
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // `forward_hidden` below runs every layer's `attn_norm`/`mlp_norm`
+        // (biased, training mode) — a counter bumper on
+        // `crate::layer_norm::LN_DISPATCH_COUNTERS`, a SEPARATE registry
+        // from the attention-block/flash-cascade counters this test already
+        // locks above (see `crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK`'s
+        // doc).
+        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/tiny_modernbert_head64");
@@ -4447,6 +4456,14 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _d2h_guard = FLASH_D2H_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // `forward_hidden` below runs every layer's `attn_norm`/`mlp_norm`
+        // (biased, training mode) — a counter bumper on
+        // `crate::layer_norm::LN_DISPATCH_COUNTERS`, a SEPARATE registry
+        // from the attention-block/flash-cascade counters this test already
+        // locks above.
+        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -4587,6 +4604,15 @@ mod tests {
         let _d2h_guard = FLASH_D2H_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // `forward_hidden_forcing_flash_decision` below still runs the
+        // model's own `attn_norm`/`mlp_norm` at `training=true` up to the
+        // point each arm errors — a counter bumper on
+        // `crate::layer_norm::LN_DISPATCH_COUNTERS`, a SEPARATE registry
+        // from the attention-block/flash-cascade counters this test already
+        // locks above.
+        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/tiny_modernbert_head64");
@@ -4672,6 +4698,15 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _d2h_guard = FLASH_D2H_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // `forward_hidden_forcing_flash_decision` below still runs the
+        // model's own `attn_norm`/`mlp_norm` at `training=true` up to the
+        // point the ragged arm errors — a counter bumper on
+        // `crate::layer_norm::LN_DISPATCH_COUNTERS`, a SEPARATE registry
+        // from the attention-block/flash-cascade counters this test already
+        // locks above.
+        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
@@ -7391,6 +7426,14 @@ mod tests {
         let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // The three `forward_hidden`/`forward_hidden_with_lengths` calls
+        // below run every layer's `attn_norm`/`mlp_norm` at `training=true`
+        // — a counter bumper on `crate::layer_norm::LN_DISPATCH_COUNTERS`,
+        // a SEPARATE registry from the attention-block counter this test
+        // already locks above.
+        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/tiny_modernbert_head64");
@@ -9498,6 +9541,15 @@ mod tests {
         let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // `tiny_full_model_fixture` bakes `training: true` into `emb_norm`/
+        // `mlp_norm`/`final_norm` (all real `crate::layer_norm::LayerNorm`
+        // instances), and the forward below runs them — a counter bumper on
+        // `crate::layer_norm::LN_DISPATCH_COUNTERS`, a SEPARATE registry
+        // from the attention-block/memeff-cascade counters this test
+        // already locks above/reads below.
+        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
         let model = tiny_full_model_fixture(&device, DType::F32, false);
         let seq = ATTENTION_BLOCK_MAX_SEQ + 1;
@@ -9545,6 +9597,14 @@ mod tests {
     #[test]
     fn forward_hidden_f16_long_seq_does_not_suppress_the_bundle_and_falls_through_to_eager() {
         let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // `tiny_full_model_fixture` bakes `training: true` into `emb_norm`/
+        // `mlp_norm`/`final_norm`, and the forward below runs them — a
+        // counter bumper on `crate::layer_norm::LN_DISPATCH_COUNTERS`, a
+        // SEPARATE registry from the memeff-cascade counter this test
+        // already locks above/reads below.
+        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
@@ -9603,6 +9663,14 @@ mod tests {
     fn forward_hidden_full_forward_local_layer_suppresses_the_bundle_and_dispatches_memeff_at_long_seq(
     ) {
         let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // `tiny_full_model_fixture` bakes `training: true` into `emb_norm`/
+        // `mlp_norm`/`final_norm`, and the forward below runs them — a
+        // counter bumper on `crate::layer_norm::LN_DISPATCH_COUNTERS`, a
+        // SEPARATE registry from the attention-block/memeff-cascade
+        // counters this test already locks above/reads below.
+        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
@@ -10655,6 +10723,14 @@ mod tests {
     #[test]
     fn forward_hidden_reaches_the_fused_attention_block_on_a_head_dim_64_checkpoint() {
         let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // The `forward_hidden` calls below (both eval and, further down,
+        // `training=true`) run every layer's `attn_norm`/`mlp_norm` — a
+        // counter bumper on `crate::layer_norm::LN_DISPATCH_COUNTERS` at
+        // the `training=true` call, a SEPARATE registry from the
+        // attention-block counter this test already locks above.
+        let _ln_guard = crate::layer_norm::DISPATCH_COUNTER_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;

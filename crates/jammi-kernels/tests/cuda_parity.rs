@@ -1462,6 +1462,17 @@ fn assert_ln_parity_biased_f32(
 /// checked for cross-device agreement (not exact at 16-bit — `sum` itself
 /// rounds mid-reduction on a real accumulate, so this is a relative bound,
 /// not the f32 leg's exact-integer claim).
+///
+/// `floor_fn`/`bound_fn` are the CALLER-selected, dtype-OWN pair (D4:
+/// `measured_near_zero_floor`/`bf16_relative_bound` for a `T = bf16` call,
+/// `measured_near_zero_floor_f16`/`f16_relative_bound` for `T = f16`) —
+/// this function is generic over `T` (the tensor dtype) but a bound
+/// DERIVED from the wrong dtype's own quantization step is a confident
+/// wrong number, not merely a loose one (f16 has MORE mantissa bits than
+/// bf16, so an `f16` call sharing bf16's coarser floor/bound would silently
+/// mask an `f16`-scale divergence bf16's own wider allowance hides). No
+/// default: passing the wrong pair for `T` is a caller bug this signature
+/// makes impossible to do by omission.
 fn assert_ln_parity_biased_16bit<T, F>(
     cuda: &Device,
     eps: f64,
@@ -1473,6 +1484,8 @@ fn assert_ln_parity_biased_16bit<T, F>(
     to_t: F,
     k: f32,
     label: &str,
+    floor_fn: fn(&[f32]) -> f32,
+    bound_fn: fn(f32, f32, f32) -> f32,
 ) where
     T: candle_core::WithDType + Copy,
     F: Fn(f32) -> T,
@@ -1516,8 +1529,8 @@ fn assert_ln_parity_biased_16bit<T, F>(
         n,
         "{label} biased LN GPU fwd length mismatch"
     );
-    let out_floor = measured_near_zero_floor(&out_cpu_v);
-    let out_bound = |r: f32| bf16_relative_bound(r, out_floor, k);
+    let out_floor = floor_fn(&out_cpu_v);
+    let out_bound = |r: f32| bound_fn(r, out_floor, k);
     assert_relative_bound(
         &format!("biased ln {label} fwd"),
         &out_cpu_v,
@@ -1567,8 +1580,8 @@ fn assert_ln_parity_biased_16bit<T, F>(
         hidden,
         "{label} biased LN GPU dbeta length mismatch"
     );
-    let db_floor = measured_near_zero_floor(&db_cpu_v);
-    let db_bound = |r: f32| bf16_relative_bound(r, db_floor, k);
+    let db_floor = floor_fn(&db_cpu_v);
+    let db_bound = |r: f32| bound_fn(r, db_floor, k);
     assert_relative_bound(
         &format!("biased ln {label} dbeta"),
         &db_cpu_v,
@@ -1702,6 +1715,8 @@ fn ln_parity_biased_contiguous_hidden_1024_modernbert_shape() {
         bf16::from_f32,
         2.0,
         "bf16",
+        measured_near_zero_floor,
+        bf16_relative_bound,
     );
     assert_ln_parity_biased_16bit(
         &cuda,
@@ -1714,6 +1729,8 @@ fn ln_parity_biased_contiguous_hidden_1024_modernbert_shape() {
         f16::from_f32,
         2.0,
         "f16",
+        measured_near_zero_floor_f16,
+        f16_relative_bound,
     );
 }
 
@@ -1739,6 +1756,8 @@ fn ln_parity_biased_contiguous_non_1024_hidden() {
         bf16::from_f32,
         2.0,
         "bf16",
+        measured_near_zero_floor,
+        bf16_relative_bound,
     );
     assert_ln_parity_biased_16bit(
         &cuda,
@@ -1751,6 +1770,8 @@ fn ln_parity_biased_contiguous_non_1024_hidden() {
         f16::from_f32,
         2.0,
         "f16",
+        measured_near_zero_floor_f16,
+        f16_relative_bound,
     );
 }
 

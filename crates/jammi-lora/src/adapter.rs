@@ -79,7 +79,15 @@ pub struct AdapterConfig {
     /// a legacy `adapter_config.json` with no `tower` key deserialises
     /// unchanged (asserted by
     /// `tests::legacy_adapter_json_without_tower_round_trips`).
-    #[serde(default)]
+    ///
+    /// `skip_serializing_if = "Option::is_none"` omits the key entirely for
+    /// a single-tower family: without it, every already-shipped BERT-family
+    /// `adapter_config.json` would gain a `"tower":null` key it never had,
+    /// changing the persisted adapter bytes (folded into the content digest,
+    /// see K7) for no semantic reason. A dual/triple-tower adapter still
+    /// emits `"tower":"text"` / `"vision"` / `"audio"` because the value is
+    /// `Some`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tower: Option<Tower>,
 }
 
@@ -167,5 +175,103 @@ mod tests {
             let back: Tower = serde_json::from_str(wire).unwrap();
             assert_eq!(back, tower);
         }
+    }
+
+    /// A minimal `LoraBuildConfig` for the `from_build` byte-shape tests
+    /// below. Only the fields `AdapterConfig::from_build` reads matter; the
+    /// borrowed fields point at locals owned by the caller.
+    struct TextFamilyBuildFixture {
+        target_modules: Vec<String>,
+        layers_to_transform: Option<Vec<usize>>,
+        rank_pattern: HashMap<String, usize>,
+    }
+
+    impl TextFamilyBuildFixture {
+        fn new() -> Self {
+            Self {
+                target_modules: vec!["query".to_string(), "value".to_string()],
+                layers_to_transform: None,
+                rank_pattern: HashMap::new(),
+            }
+        }
+
+        fn build_config(&self) -> LoraBuildConfig<'_> {
+            LoraBuildConfig {
+                target_modules: &self.target_modules,
+                layers_to_transform: &self.layers_to_transform,
+                lora_rank: 8,
+                lora_alpha: 16.0,
+                use_rslora: false,
+                lora_dropout: None,
+                rank_pattern: &self.rank_pattern,
+                init_mode: crate::init::LoraInitMode::default(),
+                seed: 7,
+            }
+        }
+    }
+
+    /// K7 (a): a single-tower family's `from_build(..)` output serialises
+    /// WITHOUT a `tower` key at all — byte-equal to the pre-unit JSON shape,
+    /// constructed here explicitly rather than by re-deriving it from the
+    /// struct (which would not catch a regression back to emitting the key).
+    #[test]
+    fn from_build_for_text_family_omits_tower_key_and_matches_pre_unit_shape() {
+        let fixture = TextFamilyBuildFixture::new();
+        let cfg = AdapterConfig::from_build("bert", &fixture.build_config(), ComputePrecision::F32);
+        assert_eq!(cfg.tower, None);
+
+        let json = serde_json::to_string(&cfg).expect("serialize adapter config");
+        assert!(
+            !json.contains("tower"),
+            "a single-tower family must not serialise a `tower` key at all: {json}"
+        );
+
+        let expected = serde_json::json!({
+            "model_type": "bert",
+            "lora_rank": 8,
+            "lora_alpha": 16.0,
+            "use_rslora": false,
+            "target_modules": ["query", "value"],
+            "layers_to_transform": null,
+            "rank_pattern": {},
+            "backbone_dtype": "f32",
+        });
+        let actual: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            actual, expected,
+            "pre-unit JSON shape must be preserved byte-for-byte (as JSON values)"
+        );
+    }
+
+    /// K7 (b): `with_tower(Tower::Vision)` serialises `"tower":"vision"` —
+    /// the `Some` branch is unaffected by `skip_serializing_if`.
+    #[test]
+    fn with_tower_vision_serialises_the_tower_key() {
+        let fixture = TextFamilyBuildFixture::new();
+        let cfg =
+            AdapterConfig::from_build("open_clip", &fixture.build_config(), ComputePrecision::F32)
+                .with_tower(Tower::Vision);
+        let json = serde_json::to_string(&cfg).expect("serialize adapter config");
+        assert!(
+            json.contains("\"tower\":\"vision\""),
+            "a stamped tower must serialise its value: {json}"
+        );
+    }
+
+    /// K7 (c): both shapes round-trip through `AdapterConfig` deserialize —
+    /// the key-absent (single-tower) and key-present (`Some`) forms.
+    #[test]
+    fn tower_key_absent_and_present_both_round_trip() {
+        let fixture = TextFamilyBuildFixture::new();
+        let no_tower =
+            AdapterConfig::from_build("bert", &fixture.build_config(), ComputePrecision::F32);
+        let json = serde_json::to_string(&no_tower).unwrap();
+        let back: AdapterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tower, None);
+
+        let with_tower = no_tower.with_tower(Tower::Audio);
+        let json = serde_json::to_string(&with_tower).unwrap();
+        let back: AdapterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tower, Some(Tower::Audio));
     }
 }

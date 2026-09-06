@@ -687,3 +687,131 @@ the two RED tests above):
 No skip, no `xfail`, and no `TODO` marker gates on this — the two affected
 `GoldenProducerAnchoredFieldSetTests` cases are left genuinely RED,
 recorded here in prose, not silently patched around.
+
+## `modernbert_fused.json`/`modernbert_alloff.json` regenerated (2026-09-06, #463) — remediation (a) taken
+
+Remediation (a) from the section immediately above is DISCHARGED: a real
+A100 rerun of the campaign's `fused`/`alloff` legs, built at a tip carrying
+the `gelu_*` pair (#463), now exists, and both files are REPLACED (not
+patched — every field, whole-file) with that rerun's own two legs, copied
+byte-for-byte. Remediation (b)'s hand-added `gelu_{fused,eager}_dispatches:
+0` was NOT taken; both values below are the compiled producer's own
+emission, never hand-typed.
+
+**Source run.** `finetune_run_ab.sh` (`FINETUNE_RUN_AB_SEEDS=1`,
+`MODEL_DIR=/root/models/ModernBERT-large` = `answerdotai/ModernBERT-large`),
+built `--features cuda,jammi-encoders/flash-attn` (CUTLASS provisioned,
+`flash_compiled: true` on both legs). Box: RunPod pod `qpvv7iv4wn8owy`
+(NVIDIA A100 80GB PCIe, driver 595.91.07, `x86_64-unknown-linux-gnu`) — a
+DIFFERENT physical A100 SKU than the round-6 supersession's own box
+(`NVIDIA A100-SXM4-80GB`), and both goldens' own `tiers.finetune_run.
+device_name` now independently read `"NVIDIA A100 80GB PCIe"`, the real,
+measured value for this box (never carried over from the superseded file).
+`JAMMI_BUILD_SHA` was set to the tree run against: `git_sha`
+(each leg's own `provenance.build_sha`) `869c65f92aea21c6aa6a3ef12cc77f1132e3be80`.
+
+**Seed and repeat.** Seed `1` — `finetune_run_ab_report.json::per_seed["1"]`
+reads `legs: {fused_r1: OK, fused_r2: OK, alloff_r1: OK, alloff_r2: OK}`,
+`leg_premise_violations: []`, `r1_r2_delta: {fused: 0.0, alloff: 0.0}`
+(`determinism_floor.max_delta: 0.0`, both arms) — r1 and r2 are bit-identical
+for this seed, so `r1` (the first repeat, same convention the round-6
+supersession used) is an equally valid representative leg as `r2`. Evidence
+path (files copied verbatim):
+`raw/seed1__fused__r1.json` -> `modernbert_fused.json`;
+`raw/seed1__alloff__r1.json` -> `modernbert_alloff.json` (pulled from the
+producing pod to
+`/private/tmp/claude-501/-Users-vijaychakilam-git-f-inverse-jammi-ai/603bf965-740c-4156-8bad-6973659317e4/scratchpad/cb-pull/golden-legs-r5/raw/`
+in the regenerating agent's own scratchpad; not a repo-relative path).
+
+**Verbatim-copy proof** (sha256 of the golden file == sha256 of the source
+evidence-path file, byte-for-byte — the raw legs pulled off the pod are
+already `json.dumps(..., indent=2)`-shaped, the same 2-space convention this
+fixture directory already uses, so no reformatting was applied):
+
+| golden file | sha256 | source file (same sha256) |
+|---|---|---|
+| `modernbert_fused.json` | `0f3a0cdefb0494136fbb2ae7a73660c693680c0e1b1b62dafa9f505cfdc1d412` | `raw/seed1__fused__r1.json` |
+| `modernbert_alloff.json` | `66131ef2705f8681f0acf036bc997bc3170ff7f15f42b1b0467d8c7515b57e98` | `raw/seed1__alloff__r1.json` |
+
+**Field-name diff vs. the previous (round-6) goldens** (flattened key sets,
+dotted paths; ADDED-ONLY — no field name present in the round-6 files was
+removed by this replacement):
+
+  * `tiers.finetune_run.gelu_fused_dispatches` / `..._gelu_eager_dispatches`
+    — both `0` on BOTH legs. `ab_merge.py`'s own `OPTIONAL_NON_CASCADE_PAIRS`
+    doc states a ModernBERT leg "legitimately reads `gelu_{fused,eager} ==
+    (0, 0)` forever" (`ModernBertMlp`'s GeGLU MLP never routes through the
+    dense erf-GELU seam, `gelu_erf_fused` — that seam is BERT's/DistilBERT's
+    FFN, already fully covered by ModernBERT's own `geglu` pair, which reads
+    `3276` fused / `0` eager on both legs here, unchanged in shape from the
+    round-6 files). This confirms the architectural prediction that section
+    made with "high confidence" — the value is now the compiled producer's
+    own measured emission, not the hand-added exception remediation (b)
+    would have been.
+  * `tiers.finetune_run.layers_to_transform` — `null` on both legs (an
+    identity field `FinetuneRunTier` now unconditionally serializes,
+    unrelated to the `gelu_*` pair; not an `ab_merge.ALL_BASES` member, not
+    read by `GoldenProducerAnchoredFieldSetTests`).
+  * `tiers.finetune_run.train_run_wall_s` — a wall-clock measurement field
+    (`27.409387711` fused / `35.826046558` alloff); likewise not an
+    `ALL_BASES` member.
+
+  No other field name was added or removed. Every OTHER field's VALUE
+  differs from the round-6 files (different box, different wall-clock
+  measurements, different checkpoint/train-pair hashes for this campaign's
+  own synthetic triplet set, etc.) because this is a full, real,
+  independent leg pair — not a patch — exactly as the round-6 supersession's
+  own files were a full replacement of the pre-round-6 composite, never a
+  diff against it.
+
+**Required counters, verified present on both legs** (read directly off the
+committed files, no compositing): `provenance.build_sha ==
+869c65f92aea21c6aa6a3ef12cc77f1132e3be80` on both; `flash_compiled: true` on
+both; fused leg `attention_block_flash_fused_dispatches: 3276` (> 0),
+`attention_block_fused_dispatches: 0` (absorbed by the flash cascade, same
+shape the round-6 fused file carried); alloff leg
+`attention_block_fused_dispatches: 3276` (> 0 — the disabled flash cascade's
+own fallthrough, this arm's positive training-path proof, same shape the
+round-6 alloff file carried), `attention_block_flash_declined_dispatches:
+3276`. `adamw_fused_dispatches: 26208` / `adamw_eager_dispatches: 0` on the
+fused leg, `0` / `26208` on the alloff leg (`kernels_disabled_requested ==
+kernels_disabled_fired == ["adamw_step_fused", "attention_block_flash"]` on
+the alloff leg only).
+
+**Why the campaign report reads `INVALID`.** The pulled
+`finetune_run_ab_report.json` (`status: "INVALID"`, `wrong_seed_count:
+true`) is about the A/B DECISION, not about either leg's own validity as a
+producer emission. The pre-registered decision rule (`decision.rule`,
+CONTRACT 63 Frame / PLAN.md v2 delta 3-4) requires exactly
+`clean_seed_count == 12` premise-clean seeds before it will render a
+GREEN/RED/RED_FOR_INVESTIGATION verdict at all — "a premise-clean seed count
+other than exactly 12 -> status INVALID naming the count (the rule is
+pre-registered FOR 12 seeds; never rescaled silently)". This run is
+DELIBERATELY `FINETUNE_RUN_AB_SEEDS=1` (an n=1 sign test, `decision.
+clean_seed_count: 1`, `decision.threshold: 11`, `sign_test.n: 1`) — a
+single-seed producer probe run specifically to source this golden
+regeneration, never an attempt at the full 12-seed campaign the decision
+rule gates on. Every leg in the pulled report reads `OK`
+(`per_seed["1"].legs`), the seed's own premise reads `clean`
+(`leg_premise_violations: []`), and `determinism_floor.max_delta == 0.0`
+(`max_r1_r2_delta` in `finetune_run_ab_table.txt`, r1/r2 bit-identical both
+arms) — nothing about the `INVALID` campaign-level status casts any doubt on
+either individual leg's own validity as a real, producer-emitted
+`finetune-run` report; it only means this pulled report can never be read as
+a 12-seed A/B verdict, which this task never asked it to be.
+
+**Purpose of this regeneration.** The ONLY reason `modernbert_fused.json`/
+`modernbert_alloff.json` needed replacing at all was the new
+`gelu_fused_dispatches`/`gelu_eager_dispatches` pair #463 added to
+`FinetuneRunTier` (see "NOT regenerated" section above) — both
+`GoldenProducerAnchoredFieldSetTests::
+test_golden_dispatch_pair_bases_equal_all_bases` and
+`test_golden_dispatch_pairs_classify_cleanly_via_dispatch_pairs`, which were
+RED against the round-6 files for missing that pair, are green against the
+replacement (`python3 -m unittest ci/scripts/perf/test_ab_merge.py`, 276
+tests, all green, reported in this unit's own hand-off). No other change
+this task made to either golden was intentional beyond what a full,
+real-leg replacement necessarily carries (device/box/wall-clock/hash
+differences, documented above) — the two new required fields
+(`layers_to_transform`, `train_run_wall_s`) are incidental schema growth on
+the same producer tip, not a second purpose for this regeneration.

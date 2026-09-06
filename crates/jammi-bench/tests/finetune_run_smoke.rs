@@ -3,11 +3,12 @@
 //! subcommand — never `finetune_run::run` in-process (this crate is
 //! `[[bin]]`-only, see `finetune_step_kernel_disable.rs`'s own doc for why a
 //! fresh child process is this crate's convention) — over a TINY generic
-//! fixture (`jammi-test-utils`' committed `tiny_bert`, BERT architecture,
-//! real tokenizer) and a hand-written 2-batch synthetic triplet set, proving
-//! this tier actually drives `TrainingLoopBuilder` + the public
+//! fixture and a hand-written 2-batch synthetic triplet set, proving this
+//! tier actually drives `TrainingLoopBuilder` + the public
 //! `evaluate_held_out` seam end to end and emits a well-formed report with
-//! every identity field non-null.
+//! every identity field non-null. Every assertion in this file is about the
+//! TIER's own mechanics (identity/provenance field presence, trajectory
+//! shape, probe-series length) — none of it is BERT-specific.
 //!
 //! `--epochs 2 --eval-cadence 1` deliberately exercises this tier's
 //! resume-cycle TWICE (not just once), so a smoke run that only worked for a
@@ -16,15 +17,24 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// `cookbook/fixtures/tiny_bert` — the SAME generic, committed fixture
-/// `jammi_test_utils::cookbook_fixture("tiny_bert")` resolves to
-/// (`workspace_root().join("cookbook").join("fixtures")`), spelled as a
-/// relative path here (mirroring `finetune_step_kernel_disable.rs`'s own
-/// `model_dir()`) rather than adding `jammi-test-utils` as a dev-dependency
-/// of this `[[bin]]`-only crate — BERT architecture, real `tokenizer.json`,
-/// no `1_Pooling/` (falls back to mean pooling), no consumer shape.
+/// `cookbook/fixtures/tiny_modernbert_classifier` — a TINY, generic,
+/// committed ModernBert fixture (real `tokenizer.json`, no consumer shape),
+/// not `tiny_bert` (C-ATTN unit, campaign #462/#463): `finetune_run::run`'s
+/// `fused_dispatch_proof_gate` now refuses ANY architecture's leg that took
+/// a real optimizer step with all four training-mode attention/flash
+/// dispatch counters at `0`, and classic BERT's attention forward does not
+/// dispatch through `jammi_kernels::admission::admit` at all until
+/// `jammi_encoders`' companion C-ATTN seam lands — so `tiny_bert` alone
+/// cannot satisfy the widened gate yet. This file's own assertions (see the
+/// module doc) are architecture-agnostic, so it moved to the SAME
+/// already-wired ModernBert fixture `finetune_run.rs`'s own
+/// `non_perturbation_test_params_modernbert` test helper and
+/// `finetune_run_kernel_disable.rs`'s `model_dir` use, with the matching
+/// `--target-modules Wqkv` selector below (`jammi_encoders::modernbert`'s
+/// LoRA-site naming).
 fn model_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cookbook/fixtures/tiny_bert")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../cookbook/fixtures/tiny_modernbert_classifier")
 }
 
 /// Write `n` synthetic (anchor, positive, negative) triplets as JSONL, using
@@ -122,7 +132,7 @@ fn base_command(work_dir: &Path, fixtures_dir: &Path, objective: &str) -> Comman
             "--lora-dropout",
             "0.0",
             "--target-modules",
-            "query,value",
+            "Wqkv",
             "--backbone-dtype",
             "f32",
             "--max-seq-length",

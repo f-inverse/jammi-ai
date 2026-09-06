@@ -167,10 +167,20 @@ fn clip_invocations_snapshot() -> u64 {
 
 /// Attention-base op keys whose presence in `JAMMI_KERNELS_DISABLE`
 /// (`kernels_disabled_requested`) means the OPERATOR asked for the eager
-/// attention arm: the fused whole-attention-block CustomOp, the FA2 cascade
-/// key that absorbs it on the flash branch, or the `"all"` wildcard
-/// (`jammi_kernels::admission`'s module doc).
-const ATTENTION_DISABLE_KEYS: [&str; 3] = ["attention_block", "attention_block_flash", "all"];
+/// attention arm: the fused whole-attention-block CustomOp's admit key
+/// (`"attention_block_fused"` — the C-ATTN unit's addition, the literal
+/// key `jammi_encoders::modernbert`'s `admit(..., "attention_block_fused",
+/// ...)` call site checks against `JAMMI_KERNELS_DISABLE`, now shared by
+/// BERT/DistilBERT's tensor-state-admitted attention block too), its
+/// legacy shorthand (`"attention_block"`, kept for callers already using
+/// it), the FA2 cascade key that absorbs it on the flash branch, or the
+/// `"all"` wildcard (`jammi_kernels::admission`'s module doc).
+const ATTENTION_DISABLE_KEYS: [&str; 4] = [
+    "attention_block",
+    "attention_block_fused",
+    "attention_block_flash",
+    "all",
+];
 
 /// The attention REFERENCE CLASS the operator ASKED this run to measure —
 /// the value `FinetuneStepTier::attention_arm` carries into the shared
@@ -820,6 +830,12 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     let softmax_dispatch_before = jammi_encoders::softmax_dispatch_snapshot();
     // Same mechanism, for the C5 fused GeGLU kernel.
     let geglu_dispatch_before = jammi_encoders::geglu_dispatch_snapshot();
+    // Same mechanism, for the C-MLP fused GELU-erf activation kernel
+    // (BERT's/DistilBERT's FFN, admit key `gelu_erf_fused`). No
+    // `jammi_encoders`-side snapshot wrapper exists for this one (unlike
+    // the ops above): the process-wide registry is read directly, the
+    // same shape `adamw_dispatch_before` below already uses.
+    let gelu_dispatch_before = jammi_kernels::admission::counters_for("gelu").snapshot();
     // Same mechanism, for the C6 fused LoRA-site epilogue.
     let lora_epilogue_dispatch_before = jammi_lora::lora_epilogue_dispatch_snapshot();
     // Same mechanism, for the P2 fused LoRA SITE (base matmul + dropout +
@@ -874,6 +890,7 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     let rope_dispatch_after = jammi_encoders::rope_dispatch_snapshot();
     let softmax_dispatch_after = jammi_encoders::softmax_dispatch_snapshot();
     let geglu_dispatch_after = jammi_encoders::geglu_dispatch_snapshot();
+    let gelu_dispatch_after = jammi_kernels::admission::counters_for("gelu").snapshot();
     let lora_epilogue_dispatch_after = jammi_lora::lora_epilogue_dispatch_snapshot();
     let lora_linear_fused_dispatch_after = jammi_lora::lora_linear_fused_dispatch_snapshot();
     let attention_block_dispatch_after = jammi_encoders::attention_block_dispatch_snapshot();
@@ -997,6 +1014,12 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
         geglu_eager_dispatches: geglu_dispatch_after
             .eager
             .saturating_sub(geglu_dispatch_before.eager),
+        gelu_fused_dispatches: gelu_dispatch_after
+            .fused
+            .saturating_sub(gelu_dispatch_before.fused),
+        gelu_eager_dispatches: gelu_dispatch_after
+            .eager
+            .saturating_sub(gelu_dispatch_before.eager),
         lora_epilogue_fused_dispatches: lora_epilogue_dispatch_after
             .fused
             .saturating_sub(lora_epilogue_dispatch_before.fused),
@@ -1700,6 +1723,26 @@ mod tests {
         assert_eq!(attention_arm(&s(&["all"])), "eager");
         assert_eq!(
             attention_arm(&s(&["geglu_fused", "attention_block"])),
+            "eager"
+        );
+    }
+
+    /// C-ATTN unit (campaign #462/#463): `ATTENTION_DISABLE_KEYS` gains the
+    /// fused whole-attention-block kernel's OWN admit key
+    /// (`"attention_block_fused"` — what `jammi_encoders`' `admit(..)` call
+    /// site actually checks against `JAMMI_KERNELS_DISABLE`, distinct from
+    /// the legacy `"attention_block"` shorthand this const already carried),
+    /// so `attention_arm` must record `"eager"` when THAT key — not just its
+    /// legacy shorthand — is the one requested. RED at base: this key was
+    /// absent from `ATTENTION_DISABLE_KEYS`, so `JAMMI_KERNELS_DISABLE=attention_block_fused`
+    /// read back as `"fused"` here even though it disables the fused
+    /// whole-attention-block kernel by name.
+    #[test]
+    fn attention_arm_reads_eager_for_the_fused_kernels_own_admit_key() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(attention_arm(&s(&["attention_block_fused"])), "eager");
+        assert_eq!(
+            attention_arm(&s(&["attention_block_fused", "layer_norm_fused"])),
             "eager"
         );
     }
@@ -2458,7 +2501,7 @@ mod tests {
 
     /// F1 REGRESSION (audit finding on PR #372): `peak_vram_bytes` is
     /// `VramSampler::finish`'s `peak.saturating_sub(baseline)`
-    /// (`finetune_step.rs:266` at the time of writing). `saturating_sub`
+    /// (`finetune_step.rs:276` at the time of writing). `saturating_sub`
     /// FLOORS at zero rather than wrapping — so if `baseline` is ever
     /// captured AT (or above) the run's own high-water mark, the reported
     /// delta collapses to zero even though the run legitimately allocated

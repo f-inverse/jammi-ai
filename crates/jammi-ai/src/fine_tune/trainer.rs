@@ -1905,15 +1905,15 @@ impl TrainingLoop {
     /// `[group_rows, hidden]` tensor per group — the media peer of
     /// [`Self::encode_groups`].
     ///
-    /// A media triplet used to cost THREE forwards (one per group) while the
-    /// text triplet path already cost one, so the two modalities' training
-    /// steps were not comparable and the media path paid a 3x front-end and
-    /// kernel-launch bill for nothing. Joining is exact here for a stronger
-    /// reason than in the text case: media rows are FIXED-shape (a fusion
-    /// spectrogram is `[4, chunk_frames, n_mels]`, a pixel batch is
-    /// `[3, side, side]`), so joining introduces no padding at all and the
-    /// concatenated batch is element-for-element the three separate batches
-    /// stacked.
+    /// Joining keeps a media triplet at ONE forward across all three groups, not
+    /// THREE (one per group) — matching the text triplet path, which already
+    /// costs one, so the two modalities' training steps are cost-comparable
+    /// rather than the media path paying a 3x front-end and kernel-launch bill
+    /// for the same information. Joining is exact here for a stronger reason
+    /// than in the text case: media rows are FIXED-shape (a fusion spectrogram
+    /// is `[4, chunk_frames, n_mels]`, a pixel batch is `[3, side, side]`), so
+    /// joining introduces no padding at all and the concatenated batch is
+    /// element-for-element the three separate batches stacked.
     fn encode_media_groups(&self, groups: &[&Vec<Vec<u8>>]) -> Result<Vec<Tensor>> {
         let rows: Vec<usize> = groups.iter().map(|g| g.len()).collect();
         let joined: Vec<Vec<u8>> = groups.iter().flat_map(|g| g.iter().cloned()).collect();

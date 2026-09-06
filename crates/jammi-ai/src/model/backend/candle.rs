@@ -2524,12 +2524,12 @@ impl ModelBackend for CandleBackend {
         // The raw `model_type` SPELLING the text arm below dispatches on and
         // every refusal message names, read through the ONE shared reader
         // (`crate::model::arch::config_model_type`) rather than this site's own
-        // `unwrap_or("bert")`. Behaviour here is unchanged for every string a
-        // config can carry; what the shared reader buys is that the
-        // absent-key default and `EncoderFamily::from_config`'s answer for the
-        // same file are now the same rule, so a `config.json` without a
-        // `model_type` can no longer serve as BERT here while the fine-tune
-        // worker refuses it (issue #421 D7).
+        // `unwrap_or("bert")`: for a declared string the shared reader answers
+        // with that string unchanged; for an absent (or non-string) key it
+        // answers `UNDECLARED_MODEL_TYPE_FAMILY`'s id, the SAME rule
+        // `EncoderFamily::from_config` applies. A `config.json` without a
+        // `model_type` therefore resolves to the same family here as it does
+        // at the fine-tune worker (issue #421 D7) — the two can never diverge.
         let model_type = crate::model::arch::config_model_type(&resolved.model_config);
 
         // Per-model `compute_precision` in `config.json` wins over the global
@@ -2792,9 +2792,10 @@ impl ModelBackend for CandleBackend {
         //
         // 1. Does this adapter belong to this base at all? A `clap_audio_model`
         //    adapter installed on an OpenCLIP checkpoint, or an `open_clip`
-        //    adapter on a BERT one, would previously have been resolved and
-        //    then silently DISCARDED — the fine-tuning dropped with no signal,
-        //    serving the unadapted base under the fine-tuned model's id.
+        //    adapter on a BERT one, is a cross-family mismatch: without this
+        //    check it would resolve and load, then get silently DISCARDED —
+        //    the fine-tuning dropped with no signal, serving the unadapted
+        //    base under the fine-tuned model's id.
         //    `EncoderFamily::from_adapter_model_type` maps every legacy/alias
         //    text id onto `Bert` on purpose (see its doc), so this refusal
         //    fires only on genuine cross-family mismatches and never on an
@@ -3385,9 +3386,10 @@ impl ModelBackend for CandleBackend {
 /// Detect an HF-CLAP audio checkpoint (`ClapAudioModelWithProjection`
 /// lineage) from its config.
 ///
-/// The RULES moved to [`EncoderFamily::from_config`] (issue #421 D7) — this
-/// is the one-line shim the digest-slot predicate below still reads through,
-/// so there is exactly one CLAP-detection body in the crate.
+/// Delegates to [`EncoderFamily::from_config`] (issue #421 D7), the ONE
+/// owner of the CLAP rules; this is the one-line shim the digest-slot
+/// predicate below still reads through, so there is exactly one
+/// CLAP-detection body in the crate.
 fn is_hf_clap_config(config: &serde_json::Value) -> bool {
     EncoderFamily::from_config(config) == Some(EncoderFamily::ClapAudio)
 }

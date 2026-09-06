@@ -3172,9 +3172,9 @@ fn build_encoder_adapters(
     // record's stored `config_json` when it has one, else the first existing
     // candidate on disk walking the shared frozen chain (`config.json`, then
     // the OpenCLIP `open_clip_config.json`). Reading `config.json` off disk
-    // unconditionally — the pre-#421 shape — could not see an OpenCLIP
-    // checkpoint at all, and disagreed with the resolver whenever the catalog
-    // carried a config the directory did not.
+    // unconditionally would miss an OpenCLIP checkpoint entirely (its config
+    // lives only in `open_clip_config.json`) and would disagree with the
+    // resolver whenever the catalog carries a config the directory does not.
     let model_config: serde_json::Value = match model_record.config_json.as_deref() {
         Some(json) => serde_json::from_str(json).map_err(|e| {
             JammiError::FineTune(format!(

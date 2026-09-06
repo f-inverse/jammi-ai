@@ -17,8 +17,8 @@
 //!    adapted, fails here.
 //! 2. **Non-vacuity** — the served embedding differs from the BASE model's for
 //!    the same input. A zero LoRA delta, or an adapter serving dropped, fails
-//!    here. (Serving an adapter it silently ignored is exactly the pre-#421
-//!    behaviour on these three towers.)
+//!    here — the exact failure mode this assertion exists to catch on these
+//!    three towers: an adapter loaded but silently ignored.
 //! 3. **Mechanism, bit-for-bit** — the served embedding is bit-equal to an
 //!    INDEPENDENTLY constructed tower: the base checkpoint plus the saved
 //!    `adapter.safetensors`, built through `jammi-encoders`' own public

@@ -4,23 +4,24 @@
 //! # Why this module exists
 //!
 //! "Which architecture is this checkpoint?" and "which file in this directory
-//! is its config / its weights?" were previously answered independently at
-//! eight sites: the serving loader's `is_clap`/`is_open_clip` pair, the
+//! is its config / its weights?" each have exactly ONE answer in this crate,
+//! owned here and consumed everywhere else the question comes up: the serving
+//! loader's `is_clap`/`is_open_clip` pair, the
 //! [`ModelDimensions`](super::ModelDimensions) geometry parser, the
 //! resolver's catalog-lookup / local / hub chains, the esc-058 fingerprint's
-//! tracked-candidate lists, and the fine-tune worker's own on-disk read. Eight
-//! independent answers to one question is eight chances for two of them to
-//! disagree — and a disagreement here is silent: a checkpoint routed to the
-//! wrong family builds the wrong tower, and a weights chain that disagrees
-//! with the identity chain makes a file whose appearance flips the loaded
-//! bytes invisible to the staleness probe.
+//! tracked-candidate lists, and the fine-tune worker's own on-disk read all
+//! route through here. Answering the same question independently at each of
+//! those sites would be that many chances for two of them to disagree — and a
+//! disagreement here is silent: a checkpoint routed to the wrong family
+//! builds the wrong tower, and a weights chain that disagrees with the
+//! identity chain makes a file whose appearance flips the loaded bytes
+//! invisible to the staleness probe.
 //!
-//! Everything here is a MOVE, not a redesign. [`EncoderFamily::from_config`]'s
-//! CLAP rules are the ones the serving loader has always applied; its answer
-//! for a config that declares no `model_type` at all is the one every reader
-//! it replaced gave ([`UNDECLARED_MODEL_TYPE_FAMILY`]); the candidate-name
-//! lists are in the precedence the resolver froze (issue #351) and the
-//! fingerprint tracks.
+//! [`EncoderFamily::from_config`]'s CLAP rules are the ones the serving
+//! loader applies; its answer for a config that declares no `model_type` at
+//! all is [`UNDECLARED_MODEL_TYPE_FAMILY`], the one answer every reader in
+//! this workspace gives; the candidate-name lists are in the precedence the
+//! resolver freezes (issue #351) and the fingerprint tracks.
 //!
 //! # The two candidate lists are NOT one list
 //!
@@ -97,16 +98,16 @@ pub enum EncoderFamily {
     ClapAudio,
 }
 
-/// The family a checkpoint whose config declares NO `model_type` at all
-/// resolves to, and the ONE owner of that rule.
-///
-/// Every reader of a `model_type` in this workspace predating
-/// [`EncoderFamily`] — the serving loader's own read, the fine-tune worker's
-/// on-disk read, and the benchmark harness's `model_type_of` — defaulted an
-/// ABSENT key to `"bert"` and loaded such a directory as BERT. Answering
-/// `None` here instead would make this module the SOURCE of the divergence it
-/// exists to eliminate: serving would keep loading the checkpoint while the
-/// fine-tune worker refused the identical bytes.
+/// The family an ABSENT (or non-string) `model_type` — with no OpenCLIP
+/// `model_cfg` and no CLAP marker in the same config — resolves to, and the
+/// ONE owner of that rule: serving (`model::backend::candle`), the fine-tune
+/// worker, GGUF residency (`model::backend::gguf`) and jammi-bench all read
+/// this constant (or [`config_model_type`], which answers with its id)
+/// rather than each defaulting an absent key on their own. Two sites
+/// defaulting an absent key independently is how serving keeps loading a
+/// checkpoint the fine-tune worker refuses on the identical bytes; routing
+/// every reader through this one constant makes that divergence structurally
+/// impossible.
 ///
 /// The default is not a guess about an architecture that said something else:
 /// it is the only architecture a config that says nothing can be here.
@@ -117,9 +118,10 @@ pub enum EncoderFamily {
 /// `BertConfig` and its tensors have to carry BERT's names, and both fail
 /// loudly at build time rather than producing a wrong number.
 ///
-/// A `model_type` that IS declared and names an architecture this crate has no
-/// loader for stays a typed refusal ([`EncoderFamily::from_config`] -> `None`)
-/// — that coercion is the one issue #421 removed, and it is unaffected.
+/// This is the ABSENT case only. A `model_type` that IS declared and names an
+/// architecture this crate has no loader for is a DIFFERENT case: it is a
+/// typed refusal ([`EncoderFamily::from_config`] -> `None`) at every
+/// consumer, never coerced to this default.
 pub const UNDECLARED_MODEL_TYPE_FAMILY: EncoderFamily = EncoderFamily::Bert;
 
 impl EncoderFamily {

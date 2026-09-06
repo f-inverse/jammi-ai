@@ -271,10 +271,10 @@ impl ModelResolver {
         let config: serde_json::Value =
             serde_json::from_reader(std::fs::File::open(&config_path)?)?;
 
-        // Every name comes from `arch` (issue #421 D7); the PRECEDENCE below
-        // is unchanged — `weights_candidates` returns the two safetensors
-        // names before `model.gguf`, so a non-GGUF hit is exactly the old
-        // `has_safetensors` predicate.
+        // Every name comes from `arch` (issue #421 D7): `weights_candidates`
+        // returns the two safetensors names before `model.gguf`, so a
+        // non-GGUF hit is exactly the `has_safetensors` predicate — true
+        // whenever either safetensors name is present.
         let candle_weights = arch::weights_candidates(path);
         let has_safetensors = candle_weights
             .as_ref()

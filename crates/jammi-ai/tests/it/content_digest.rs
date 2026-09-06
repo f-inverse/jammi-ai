@@ -429,7 +429,7 @@ async fn missing_adapter_files_under_some_adapter_path_refuses_to_load() {
 // A6 (issue #421): the D7 architecture/candidate-path extraction must not move
 // a single identity byte.
 //
-// `model::arch` now owns the CLAP/OpenCLIP/text predicates and the frozen
+// `model::arch` owns the CLAP/OpenCLIP/text predicates and the frozen
 // config/weights candidate-NAME lists that `compute_model_content_digest` and
 // `compute_model_fingerprint` hash and stat. That is exactly the class of
 // refactor that silently re-orders or re-names a hashed input: a digest is a

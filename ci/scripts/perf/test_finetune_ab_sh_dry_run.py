@@ -122,23 +122,23 @@ class DryRunSmokeTests(unittest.TestCase):
                     "--expect-kernels-disabled ''", line,
                     f"jammi-fused leg must pass an EMPTY --expect-kernels-disabled: {line!r}",
                 )
-                # And it must NOT ALSO carry JAMMI_KERNELS_DISABLE=<9 keys>
+                # And it must NOT ALSO carry JAMMI_KERNELS_DISABLE=<10 keys>
                 # -- that would defeat the whole point of a "fused" leg.
                 self.assertNotIn("layer_norm_fused", line)
 
-    def test_jammi_eager_leg_passes_all_nine_disable_keys(self):
+    def test_jammi_eager_leg_passes_all_ten_disable_keys(self):
         with tempfile.TemporaryDirectory() as out_dir:
             result = run_dry(out_dir)
             self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
             eager_lines = [line for line in result.stdout.splitlines() if "/ jammi-eager:" in line]
             self.assertTrue(eager_lines, f"no jammi-eager leg lines found\nstdout={result.stdout}")
-            nine_keys = [
-                "layer_norm_fused", "geglu_fused", "attention_block_flash", "attention_block_fused",
-                "rope_fused", "softmax_last_dim_fused", "lora_linear_fused", "adamw_step_fused",
-                "mem_efficient_attention",
+            ten_keys = [
+                "layer_norm_fused", "geglu_fused", "gelu_erf_fused", "attention_block_flash",
+                "attention_block_fused", "rope_fused", "softmax_last_dim_fused", "lora_linear_fused",
+                "adamw_step_fused", "mem_efficient_attention",
             ]
             for line in eager_lines:
-                for key in nine_keys:
+                for key in ten_keys:
                     self.assertIn(key, line, f"jammi-eager leg line missing {key!r}: {line!r}")
 
     def test_bar_legs_appear_in_the_a_b_b_a_order_per_config(self):

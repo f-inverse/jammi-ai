@@ -25,6 +25,14 @@ committed raw-run reports from that branch
 dict standing in for what that branch's own `finetune-step` binary actually
 emitted.
 
+`OptionalNonCascadePairFixtureTests` (#463) covers `ab_merge.py`'s
+`OPTIONAL_NON_CASCADE_PAIRS` classification (`gelu`): a `(0, 0)` reading is
+legitimate (the dense erf-GELU seam is never called on a ModernBERT leg,
+whose GeGLU MLP is a different, already-covered pair), a live `(n, 0)`
+reading validates like any ordinary pair, a genuine `(0, n)` eager fallback
+still hard-fails, and a wholly separate unclassified base still raises the
+loud schema-drift error `dispatch_pairs` always has.
+
 Run directly: `python3 ci/scripts/perf/test_ab_merge.py`
 """
 
@@ -949,6 +957,118 @@ class CascadePairFixtureTests(unittest.TestCase):
         self.assertIn("ERROR", proof)
         self.assertIn("mystery_cascade_eager_dispatches", proof)
         self.assertTrue(merged["configs"]["b8-s128-mystery-cascade"]["verdict"].startswith("INVALID"))
+        self.assertEqual(rc, 1)
+
+
+class OptionalNonCascadePairFixtureTests(unittest.TestCase):
+    """#463: `gelu_fused_dispatches`/`gelu_eager_dispatches` (an ORDINARY
+    pair — a plain `_eager_dispatches` fallback, never the `CASCADE_BASES`
+    `_declined_dispatches` shape) is now unconditionally serialized by
+    `FinetuneStepTier`, but its `fused > 0` half is architecture-conditional
+    (`OPTIONAL_NON_CASCADE_PAIRS` — see that set's own module-level doc):
+    the dense erf-GELU seam it counts is BERT's/DistilBERT's FFN only, and a
+    ModernBERT leg's GeGLU MLP (already covered by the separate `geglu`
+    REQUIRED_PAIRS member) never reaches it at all. Before this fix,
+    `dispatch_pairs` raised `KeyError('gelu' ... not classified in
+    ALL_BASES)` the instant a real `finetune_ab.sh` leg's report carried
+    this pair — reproduced directly below via `jammi_fs`'s own
+    `_CLEAN_YES_DISPATCHES`-shaped fixture plus the two `gelu_*` keys
+    (`gelu` is deliberately NOT a member of this file's own local
+    `ALL_BASES` tuple, so `jammi_fs` never adds it by default — every test
+    here adds it explicitly via `overrides`, exactly mirroring how a real
+    `FinetuneStepTier` report carries it alongside every other pair).
+
+    Admission here is by THIS LEG'S OWN COUNTERS (tensor state), never a
+    model-identity/architecture-name branch — no test below reads or
+    fabricates a `"backbone"`/model-name field; a `(0, 0)` reading and an
+    `(n, 0)` reading are both exercised purely via the counter VALUES.
+    """
+
+    def run_merge(self, raw_dir):
+        out_dir = tempfile.mkdtemp()
+        rc = ab_merge.main([raw_dir, out_dir, "25", "5", "0.9"])
+        with open(os.path.join(out_dir, "finetune_ab_report.json")) as fh:
+            merged = json.load(fh)
+        return rc, merged
+
+    def write_jammi_fused_only(self, raw_dir, slug, report):
+        write_leg(raw_dir, slug, "jammi-eager", report=jammi_fs({}))
+        write_leg(raw_dir, slug, "jammi-fused", report=report)
+
+    def test_gelu_pair_reading_zero_zero_is_not_invalid(self):
+        """(a) A `FinetuneStepTier`-shaped fixture carrying the `gelu_*`
+        pair at `(0, 0)` (the ModernBERT shape — the dense erf-GELU seam
+        never called) must clear `dispatch_pairs` without raising, and the
+        leg's own `fused_proof` must NOT be dragged down to `False`/INVALID
+        by that reading alone — every OTHER pair in `_CLEAN_YES_DISPATCHES`
+        already independently proves the leg.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            report = jammi_fs(_CLEAN_YES_DISPATCHES, gelu_fused_dispatches=0, gelu_eager_dispatches=0)
+            self.write_jammi_fused_only(raw_dir, "b8-s128-gelu-zero", report)
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-gelu-zero"]
+        self.assertNotIsInstance(cfg["jammi_fused_dispatch_proof"], str, cfg["jammi_fused_dispatch_proof"])
+        self.assertIs(cfg["jammi_fused_dispatch_proof"], True, cfg["jammi_fused_dispatch_proof"])
+        self.assertFalse(str(cfg["verdict"]).startswith("INVALID"), cfg["verdict"])
+        self.assertEqual(rc, 0)
+        fs = report["tiers"]["finetune_step"]
+        pairs = dict((base, (fused, fallback)) for base, fused, fallback in ab_merge.dispatch_pairs(fs))
+        self.assertEqual(pairs["gelu"], (0, 0))
+
+    def test_gelu_pair_reading_live_validates_like_an_ordinary_pair(self):
+        """(b) A BERT-family leg where the dense erf-GELU seam actually
+        fired (`gelu_fused_dispatches > 0`, `gelu_eager_dispatches == 0`)
+        validates cleanly — a live pair is not somehow rejected merely
+        because this base's presence-with-zero reading is also tolerated.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            report = jammi_fs(_CLEAN_YES_DISPATCHES, gelu_fused_dispatches=12, gelu_eager_dispatches=0)
+            self.write_jammi_fused_only(raw_dir, "b8-s128-gelu-live", report)
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-gelu-live"]
+        self.assertIs(cfg["jammi_fused_dispatch_proof"], True, cfg["jammi_fused_dispatch_proof"])
+        self.assertFalse(str(cfg["verdict"]).startswith("INVALID"), cfg["verdict"])
+        self.assertEqual(rc, 0)
+        fs = report["tiers"]["finetune_step"]
+        pairs = dict((base, (fused, fallback)) for base, fused, fallback in ab_merge.dispatch_pairs(fs))
+        self.assertEqual(pairs["gelu"], (12, 0))
+
+    def test_gelu_live_pair_eager_fallback_still_hard_fails(self):
+        """Rule 1 is NOT relaxed for this base: a genuine
+        `gelu_eager_dispatches > 0` (the admitted seam actually fell back)
+        is a hard fail exactly like any ordinary pair's eager fallback —
+        `OPTIONAL_NON_CASCADE_PAIRS` only tolerates `(0, 0)`, never a
+        counted, nonzero fallback.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            report = jammi_fs(_CLEAN_YES_DISPATCHES, gelu_fused_dispatches=0, gelu_eager_dispatches=3)
+            self.write_jammi_fused_only(raw_dir, "b8-s128-gelu-fallback", report)
+            rc, merged = self.run_merge(raw_dir)
+        cfg = merged["configs"]["b8-s128-gelu-fallback"]
+        self.assertIs(cfg["jammi_fused_dispatch_proof"], False, cfg["jammi_fused_dispatch_proof"])
+        self.assertTrue(str(cfg["verdict"]).startswith("INVALID"), cfg["verdict"])
+        self.assertEqual(rc, 1)
+
+    def test_unknown_base_distinct_from_gelu_still_raises(self):
+        """(c) RED control: adding the OPTIONAL_NON_CASCADE_PAIRS
+        classification for `gelu` must not have widened `ALL_BASES` into a
+        silent catch-all — a WHOLLY DIFFERENT, still-unclassified base
+        (`swiglu`, a plausible next real op, picked precisely because it is
+        NOT `gelu`) landing in the same report as a legitimate `gelu` pair
+        must still raise the loud, per-leg schema-drift error.
+        """
+        with tempfile.TemporaryDirectory() as raw_dir:
+            report = jammi_fs(_CLEAN_YES_DISPATCHES, gelu_fused_dispatches=0, gelu_eager_dispatches=0)
+            report["tiers"]["finetune_step"]["swiglu_fused_dispatches"] = 4
+            report["tiers"]["finetune_step"]["swiglu_eager_dispatches"] = 0
+            self.write_jammi_fused_only(raw_dir, "b8-s128-swiglu-unknown", report)
+            rc, merged = self.run_merge(raw_dir)
+        proof = merged["configs"]["b8-s128-swiglu-unknown"]["jammi_fused_dispatch_proof"]
+        self.assertIsInstance(proof, str)
+        self.assertIn("ERROR", proof)
+        self.assertIn("swiglu", proof)
+        self.assertTrue(merged["configs"]["b8-s128-swiglu-unknown"]["verdict"].startswith("INVALID"))
         self.assertEqual(rc, 1)
 
 

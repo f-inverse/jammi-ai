@@ -43,6 +43,7 @@ pub(crate) mod attention_block;
 pub(crate) mod cast_scale;
 pub(crate) mod dropout;
 pub(crate) mod geglu;
+pub(crate) mod gelu_erf;
 pub(crate) mod layer_norm;
 pub(crate) mod low_rank_residual_linear;
 pub(crate) mod rope;
@@ -64,6 +65,10 @@ pub(crate) const PTX_DROPOUT: &str = include_str!(concat!(env!("OUT_DIR"), "/dro
 /// per the W2b idiom this file continues).
 pub(crate) const PTX_DROPOUT_F16: &str = include_str!(concat!(env!("OUT_DIR"), "/dropout_f16.ptx"));
 pub(crate) const PTX_GEGLU: &str = include_str!(concat!(env!("OUT_DIR"), "/geglu.ptx"));
+pub(crate) const PTX_GELU_ERF: &str = include_str!(concat!(env!("OUT_DIR"), "/gelu_erf.ptx"));
+/// F16 monomorphic arm — see `gelu_erf_f16.cu`'s module doc.
+pub(crate) const PTX_GELU_ERF_F16: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/gelu_erf_f16.ptx"));
 pub(crate) const PTX_LAYER_NORM: &str = include_str!(concat!(env!("OUT_DIR"), "/layer_norm.ptx"));
 /// F16 monomorphic arm — see `layer_norm_f16.cu`'s module doc for why this
 /// is a SEPARATE `.cu` file (and thus a separate PTX module) rather than

@@ -152,6 +152,10 @@ pub(crate) mod flash_attention;
 // carrying an independently-maintained CUDA-side copy — one definition per
 // op's domain check, not two that could silently drift apart.
 pub(crate) mod geglu;
+// `pub(crate)`, mirroring `geglu`'s own rationale: `crate::cuda::gelu_erf`
+// imports `check_domain` directly from here rather than carrying an
+// independently-maintained CUDA-side copy.
+pub(crate) mod gelu_erf;
 pub(crate) mod layer_norm;
 // NOT an op module (the only one in this list): the CUDA launch-domain
 // facts every op's CUDA glue shares — the `u32::MAX` element-count
@@ -255,6 +259,7 @@ pub use flash_attention::{
     flash_attention_varlen_with_rope_test_only_bwd_window_override,
 };
 pub use geglu::{GegluFused, GeluVariant};
+pub use gelu_erf::GeluErfFused;
 pub use layer_norm::{LayerNormBiasedFused, LayerNormFused, MAX_HIDDEN};
 pub use low_rank_residual_linear::{DropoutKey, LowRankResidualLinear};
 pub use mem_efficient_attention::{

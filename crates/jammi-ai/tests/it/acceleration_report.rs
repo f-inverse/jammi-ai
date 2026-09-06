@@ -672,31 +672,34 @@ fn tiny_bert_head64_model() -> String {
             .unwrap()
 }
 
-/// esc-075's `flash` field for a BERT-family job (issue #462 follow-up).
+/// esc-075's `flash` field for a BERT-family job (issue #462/#463
+/// follow-up).
 ///
 /// **What this test can and cannot prove, stated up front**: on THIS suite's
 /// CPU-only build, [`flash_compiled_device_reason`] (`crates/jammi-ai/src/
 /// fine_tune/worker.rs`) short-circuits on the compiled/device fact BEFORE
-/// the `attention_block_flash` cascade delta is ever consulted — so this test
-/// can only observe `"cuda_not_compiled"` (no `cuda` feature) or
+/// the `attention_block_flash` cascade delta — and the probe-capture window
+/// it now reads (`flash_cascade_decline_reason`) — is ever consulted, so this
+/// test can only observe `"cuda_not_compiled"` (no `cuda` feature) or
 /// `"device_is_cpu_or_metal_not_cuda"` (`cuda` feature compiled, but this
 /// session never resolves a real CUDA device), exactly like every OTHER
-/// architecture on the same build. It CANNOT observe the coarse
-/// `"capability_or_domain_miss"` the cascade delta would report on a real
-/// CUDA+flash-compiled build, and — per this module's doc's "The BERT/
-/// DistilBERT case, named honestly" paragraph — even THAT build could never
-/// report the more specific `"flash_transport_not_wired"` BERT's own
-/// `FlashDecision::Declined` always carries: `admit_cascade`
-/// (`crates/jammi-kernels/src/admission.rs:391-421`) records a decline only
-/// as an atomic counter increment (`CascadeDispatchCounters`, no reason
-/// field — `admission.rs:317-321`), never through the `record_probe_miss`
-/// channel plain `admit` uses (`admission.rs:732`, reached only via
-/// `admit_inner`, `admission.rs:1244,1267,1286`). This test therefore proves
-/// the one thing THIS build can prove — a BERT-family job produces a
+/// architecture on the same build. `admit_cascade`
+/// (`crates/jammi-kernels/src/admission.rs:403-453`) now records every
+/// decline — including BERT's own `"flash_transport_not_wired"` — into the
+/// SAME thread-local probe-capture sink `admit_inner` uses
+/// (`record_probe_miss`, `admission.rs:416,427,437`), and
+/// `flash_cascade_decline_reason` reads it back verbatim on a real
+/// CUDA+flash-compiled build; that mechanism is proven directly, without
+/// needing a CUDA device, by
+/// `flash_cascade_decline_reason_reads_bert_familys_verbatim_predicate_from_the_window`
+/// in `crates/jammi-ai/src/fine_tune/worker.rs`'s own unit tests. THIS
+/// integration test still cannot reach that branch on a CPU-only build — the
+/// device-level short-circuit fires first for every architecture — so it
+/// proves the one thing THIS build can prove: a BERT-family job produces a
 /// well-formed, honestly-labelled `flash: {holds: false, reason: ..}` at all,
 /// through the SAME encoder-adapters path the ModernBERT tests above already
-/// cover — not the specific-reason claim, which needs a real CUDA+flash build
-/// this suite does not have.
+/// cover, and that this build's device-level reason is never overridden by a
+/// fabricated `"flash_transport_not_wired"` it cannot actually observe.
 #[serial(esc075_acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
 async fn bert_family_job_reports_flash_decline_honestly() {

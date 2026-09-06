@@ -2675,34 +2675,24 @@ mod tests {
         }
     }
 
-    /// The other side of the same predicate, and a CHANGE this unit records
-    /// rather than hides: a config with NO `model_type` key at all is now
-    /// REFUSED, where the tier's old private `model_type_of` silently
-    /// defaulted it to `"bert"`.
-    ///
-    /// The workspace's one architecture predicate
-    /// (`jammi_ai::model::arch::EncoderFamily::from_config`) returns `None`
-    /// for an absent `model_type`, and this tier now consumes that predicate
-    /// instead of keeping a private one — a bench that defaulted where
-    /// serving refuses would be the exact silent disagreement D7 exists to
-    /// remove. Every committed fixture this tier drives (`tiny_bert`,
-    /// `tiny_modernbert_local`, `htsat_clap_tiny`) declares its
-    /// `model_type`, and OpenCLIP is discriminated structurally, so no
-    /// existing leg is affected.
+    /// The other side of the same predicate: a config with NO `model_type`
+    /// key at all resolves as BERT, per
+    /// `jammi_ai::model::arch::UNDECLARED_MODEL_TYPE_FAMILY` — the one owner
+    /// of the "undeclared -> bert" rule every reader in this workspace
+    /// (serving's own load, the fine-tune worker, and now this tier) applies.
+    /// A config that DECLARES an unrecognised string is a different case and
+    /// stays a typed refusal (`checkpoint_resolve_rejects_unknown_model_type_and_names_every_family`
+    /// above).
     #[test]
-    fn checkpoint_resolve_refuses_a_config_with_no_model_type() {
+    fn checkpoint_resolve_resolves_an_absent_model_type_as_bert() {
         let dir = write_config_only_model_dir(serde_json::json!({
             "hidden_size": 32,
             "num_hidden_layers": 1,
         }));
-        let err = match Checkpoint::resolve(dir.path()) {
-            Ok(_) => panic!("an absent model_type must be refused, not defaulted to bert"),
-            Err(e) => e.to_string(),
-        };
-        assert!(
-            err.contains("<absent>"),
-            "the refusal must say the key was absent rather than name a made-up type: {err}"
-        );
+        let checkpoint = Checkpoint::resolve(dir.path()).unwrap_or_else(|e| {
+            panic!("an absent model_type must resolve as bert, not refuse: {e}")
+        });
+        assert_eq!(checkpoint.family, EncoderFamily::Bert);
     }
 
     /// A BERT config-compatible alias resolves to BERT — the alias set the
@@ -3685,16 +3675,13 @@ mod tests {
     /// tower ONLY where a checkpoint genuinely has more than one.
     ///
     /// MEASURED, not assumed, on the wire: `jammi_lora::AdapterConfig::tower`
-    /// carries `#[serde(default)]` but NOT `skip_serializing_if`, so a BERT
-    /// adapter's `adapter_config.json` now serialises an explicit
-    /// `"tower":null` key that adapters written before this unit do not
-    /// have. Round-tripping is unaffected in BOTH directions (a legacy file
-    /// with no key deserialises to `None`; this file deserialises to `None`
-    /// too), which is what this test pins. The BYTES of a freshly saved
-    /// BERT adapter config do change by one key — a `jammi-lora`-owned
-    /// decision this crate records rather than papers over, so that a
-    /// reader comparing two adapter bundles across this unit is not
-    /// surprised by a diff no test mentioned.
+    /// carries `#[serde(default, skip_serializing_if = "Option::is_none")]`,
+    /// so a BERT adapter's `adapter_config.json` OMITS the `tower` key
+    /// entirely rather than serialising an explicit `"tower":null` — the
+    /// pre-`#421` shape every already-shipped single-tower bundle has. This
+    /// pins that the key is genuinely absent from the emitted bytes (not
+    /// merely `None` after a round trip), so a bundle produced by this tier
+    /// is byte-identical to one from before this unit.
     #[test]
     fn a_bert_adapter_carries_no_tower_stamp() {
         let varmap = VarMap::new();
@@ -3720,10 +3707,9 @@ mod tests {
         );
         let json = serde_json::to_string(&adapter_cfg).expect("serialize adapter config");
         assert!(
-            json.contains("\"tower\":null"),
-            "a single-tower family must serialise a NULL tower, never a tower value — the \
-             emitted key itself is jammi-lora's serde shape, recorded here so a bundle diff \
-             across this unit is expected, not a surprise: {json}"
+            !json.contains("tower"),
+            "a single-tower family must OMIT the tower key entirely (skip_serializing_if), not \
+             emit a null value — the pre-#421 wire shape: {json}"
         );
         for stamped in ["\"text\"", "\"vision\"", "\"audio\""] {
             assert!(
@@ -3734,14 +3720,7 @@ mod tests {
         let reparsed: AdapterConfig =
             serde_json::from_str(&json).expect("the emitted config must round-trip");
         assert_eq!(reparsed.tower, None);
-        // The other direction, the one that matters for already-shipped
-        // bundles: a legacy config with NO `tower` key still loads.
-        let legacy = json.replace(",\"tower\":null", "");
-        assert!(!legacy.contains("tower"));
-        let legacy: AdapterConfig =
-            serde_json::from_str(&legacy).expect("a legacy adapter config must still load");
-        assert_eq!(legacy.tower, None);
-        assert_eq!(legacy.model_type, "bert");
+        assert_eq!(reparsed.model_type, "bert");
     }
 
     /// Negative control on the `(family, task)` pairing: a task with no

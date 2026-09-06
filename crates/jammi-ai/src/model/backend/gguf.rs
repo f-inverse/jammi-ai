@@ -501,10 +501,13 @@ pub(crate) fn estimate_gguf_residency(
     let target_dtype_bytes = widest_compute_precision_byte_size();
     let content = read_gguf_header(path, model_id)?;
 
-    let model_type = model_config
-        .get("model_type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("bert");
+    // The SAME shared reader `CandleBackend::load` and the fine-tune worker's
+    // GGUF arm dispatch on (`crate::model::arch::config_model_type`): the
+    // absent-`model_type` default is owned once, in `model::arch`, alongside
+    // the FAMILY answer `EncoderFamily::from_config` gives for the identical
+    // config — never re-typed as a local `unwrap_or("bert")` here, which could
+    // drift from it.
+    let model_type = crate::model::arch::config_model_type(model_config);
     // ONLY matmul-site WEIGHT names — never `.bias` — per
     // [`load_gguf_backbone`]'s own branches (this function's doc, category
     // parity): a matmul-site WEIGHT stored at a genuinely block-quantized
@@ -1269,16 +1272,16 @@ mod tests {
         );
     }
 
-    /// A GGUF `config.json` LACKING `model_type` entirely: this fn's own
-    /// `model_config.get("model_type").and_then(..).unwrap_or("bert")`
-    /// (matching `CandleBackend::load`'s identical default at its own
-    /// `model_type` read, candle.rs) silently defaults to `"bert"` — a
-    /// SUPPORTED architecture, so this does NOT hit the `None`-architecture
-    /// all-dense fallback branch. Previously untested: a config missing
-    /// BOTH `model_type` and the BERT-standard layer-count field must still
-    /// refuse via the SAME typed error the sibling test above pins for an
-    /// EXPLICIT `model_type: "distilbert"`, never silently succeed on a
-    /// `0`-layer / empty-`matmul_site_weights` estimate.
+    /// A GGUF `config.json` LACKING `model_type` entirely: the shared reader
+    /// (`crate::model::arch::config_model_type`, the same one
+    /// `CandleBackend::load` and the fine-tune worker's GGUF arm read through)
+    /// answers with `crate::model::arch::UNDECLARED_MODEL_TYPE_FAMILY`'s id,
+    /// `"bert"` — a SUPPORTED architecture, so this does NOT hit the
+    /// `None`-architecture all-dense fallback branch. Previously untested: a
+    /// config missing BOTH `model_type` and the BERT-standard layer-count
+    /// field must still refuse via the SAME typed error the sibling test above
+    /// pins for an EXPLICIT `model_type: "distilbert"`, never silently
+    /// succeed on a `0`-layer / empty-`matmul_site_weights` estimate.
     #[test]
     fn gguf_residency_estimate_refuses_a_config_lacking_model_type_entirely() {
         let device = Device::Cpu;

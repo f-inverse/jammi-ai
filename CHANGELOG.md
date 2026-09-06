@@ -7,6 +7,56 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Added
+- **LoRA fine-tuning for the CLIP-text, OpenCLIP-vision and HTSAT-CLAP audio towers (#421).** All
+  three carry LoRA sites on the same `jammi_lora::MaybeLoraLinear` seam the BERT family uses,
+  reached through their own builders (`ClipText::builder`, `OpenClipVisionTransformer::builder`,
+  `HtsatAudio::builder`) with the same `.lora()`/`.backbone_dtype()`/`.adapter()` knobs, so a
+  multi-tower checkpoint can be adapted one tower at a time (the sibling builds
+  `LoraBuildConfig::frozen()`). Selector/adapter-key site names are the checkpoint's own: CLIP-text
+  and OpenCLIP-vision `in_proj` (fused QKV, one site), `out_proj`, `c_fc`, `c_proj`; HTSAT `query`,
+  `key`, `value`, `attention_output`, `intermediate_dense`, `output_dense`, plus `reduction`
+  (patch-merging) and `linear1`/`linear2` (projection head); `all-linear` selects every site on any
+  tower. The two OpenCLIP towers get DISJOINT adapter namespaces from one shared block
+  implementation — vision keys carry the checkpoint's own `visual.` prefix — because both towers
+  build into one `VarMap` and candle's `VarBuilder::get` returns the already-registered `Var` for a
+  name it has seen; `LoraLinear::new_with_base` additionally refuses a training `VarMap` that
+  already holds the keys it is about to claim, so the alias fails loudly rather than halving the
+  trainable set. `AnyEncoder` gains `OpenClipVision` and `Htsat` variants and REAL training hooks on
+  every variant, plus `EncoderInput`/`OwnedEncoderInput`/`Modality`, `forward_input` (a modality
+  mismatch is a typed refusal), `probe_input` (the smallest shape-valid batch, at the tower's own
+  dtype, so the claim-time acceleration probe does not degrade to `probe_forward_failed` on a media
+  tower), `dtype`, `image_size`, `preprocess_mean`, `preprocess_std`, and `num_mel_bins`. Attention
+  masks are built ONCE at load in the frozen backbone's dtype — CLIP-text at that dtype's own
+  most-negative finite value (`f32::MIN`/`f16::MIN`/`bf16::MIN`), HTSAT keeping HF
+  `ClapAudioLayer`'s `-100.0` (output-affecting: `exp(-100)` is an f32 denormal) — so no forward
+  casts a mask and F32 eval bytes are unchanged by construction. Site-name tables, adapter key
+  layout and the `layers_to_transform` semantics are in
+  `docs/maintainer/MAINTAINER-GUIDE.md` §2.5/§2.6.
+- **Image and audio triplet fine-tuning, end to end (#421).** `TrainingFormat::MediaTriplet` reads
+  three BINARY columns (`anchor`, `positive`, `negative`) holding encoded files — PNG/JPEG/… or
+  WAV/FLAC/MP3/Ogg — with the modality taken from the job's declared task
+  (`task=image_embedding` / `task=audio_embedding`), never sniffed from the bytes. The three groups
+  are encoded as ONE joined forward pass and then split, the shape the text path already used.
+  `AdapterConfig` gains `tower: Option<Tower>` (`Tower::{Text, Vision, Audio}`, serialised
+  `"text"`/`"vision"`/`"audio"`) naming which tower of a multi-tower checkpoint the adapter installs
+  on, and `model_type` gains the values `open_clip` (this workspace's canonical id for a checkpoint
+  family that ships no `model_type`) and `clap_audio_model` (HuggingFace's own). At serving load the
+  adapter and the base must agree on architecture FAMILY: a cross-family adapter, or a `tower` the
+  base checkpoint does not have, is a typed refusal instead of a silently discarded adapter; an
+  OpenCLIP adapter that names no tower is refused rather than guessed. Both OpenCLIP towers build at
+  the adapter's own `backbone_dtype` — one model, one identity, one precision — while an unadapted
+  base keeps its previous `compute_dtype` construction, so base-model served bytes are unchanged.
+- **`jammi-bench finetune-run --task`, and two fixed-shape media corpus producers (#421).**
+  `--task {text_embedding,image_embedding,audio_embedding}` (default `text_embedding`, so existing
+  invocations are unchanged) drives the corresponding tower and sets the trainer's media front end;
+  `--train-jsonl`/`--heldout-jsonl` carry `{anchor,positive,negative}_path` rows under a media task,
+  resolved relative to the JSONL's own directory, and a triplet whose three members are not three
+  distinct files is refused. `ci/scripts/perf/gen_fixed_shape_image_corpus.py` emits N PNGs of
+  exactly `--size x --size` RGB through a minimal stdlib zlib encoder at a fixed compression level
+  and filter byte; `ci/scripts/perf/gen_fixed_length_audio_corpus.py` emits N 16-bit mono PCM WAVs
+  of exactly `round(--seconds * --sample-rate)` frames through the stdlib `wave` module. Both draw
+  per-family structure plus seeded per-instance jitter in one fixed order, so the same inputs
+  reproduce byte-identical trees and `--rows` consumes no RNG at all.
 - **A shared attention cascade seam brings BERT and DistilBERT through the fused attention block
   (#462).** The per-layer cascade (`mem_efficient_attention` → `attention_block_fused` →
   eager, with `softmax_last_dim_fused` admission on the eager composition) that ModernBERT already
@@ -87,6 +137,34 @@ workspace ships every publishable crate at the same
   table and mechanism in `docs/maintainer/fine-tune-performance-guide.md` §4).
 
 ### Changed
+- **Audio encoder-adapters fine-tuning is supported; the refusal is gone (#421).** An
+  `audio_embedding` encoder-adapters job on an HF-CLAP checkpoint trains the HTSAT tower instead of
+  failing with "LoRA injected inside the audio encoder is not supported. Leave `target_modules`
+  empty for audio tasks." — the projection-head arm is unchanged and still available by leaving
+  `target_modules` empty. Media triplets encode as one joined forward
+  pass rather than three separate ones, removing the audio path's 3x asymmetry with the text path.
+  An `image_embedding` triplet job over binary columns trains the OpenCLIP vision tower rather than
+  dying in a UTF-8 cast; relatedly, `extract_string_column` now refuses a binary-family column
+  outright and refuses a cast that would introduce nulls, instead of letting the cast fallback
+  fabricate an empty string for a row it could not read.
+- **One architecture chain for every checkpoint-identity question, and an unknown `model_type` is
+  now a typed refusal (#421).** `jammi_ai::model::arch` (`EncoderFamily`, `config_candidates`,
+  `weights_candidates`, `CONFIG_CANDIDATE_NAMES`, `WEIGHTS_CANDIDATE_NAMES` vs
+  `CANDLE_WEIGHTS_CANDIDATE_NAMES`, `UNDECLARED_MODEL_TYPE_FAMILY`, `config_model_type`) replaces
+  the per-call-site `config.json`/`model.safetensors` reads the serving loader, the resolver, the
+  fine-tune worker and the benchmark harness each carried separately. The fine-tune worker now
+  dispatches on `(family, task)` with NO default arm: the previous `_ => BERT` coercion trained a
+  BERT tower over foreign weights whenever a config merely happened to deserialize as a
+  `BertConfig` (a GPT-2 config does) and published an adapter claiming that architecture. A config
+  that declares NO `model_type` at all is a different question with a different answer and keeps
+  loading as BERT, the family every reader in this workspace has always loaded such a directory as
+  — answering "unknown" there would make serving and fine-tuning disagree about identical bytes. An
+  OpenCLIP checkpoint (`open_clip_config.json` / `open_clip_model.safetensors`) is now visible to
+  the benchmark tier, which previously hardcoded the BERT-family filenames. The esc-058 fingerprint
+  arms keep their bytes, pinned by a content-digest test on the tiny fixtures.
+- **`jammi-encoders` depends on `half` (#421).** Promoted from a dev-dependency: `half::f16::MIN` /
+  `half::bf16::MIN` are the dtype-following additive-mask sentinels, and candle-core 0.11 does not
+  re-export `half`. Same workspace version, no new crate enters the dependency graph.
 - **The bench report gains a `gelu_fused_dispatches`/`gelu_eager_dispatches` counter pair, and
   `attention_block_fused` joins the attention family's disable-key mapping (#462/#463).**
   `crates/jammi-bench`'s `FinetuneRunTier`/`FinetuneStepTier` carry the new GELU counter pair
@@ -176,6 +254,34 @@ workspace ships every publishable crate at the same
   replacing the bare candle `Tensor` error a missing-tensor lookup previously produced. Every other
   LayerNorm call site — any prefix not
   keyed on a literal `LayerNorm` segment — is unchanged.
+
+### Breaking
+- `jammi_encoders::{AnyAudioEncoder, AudioEncoder}` are removed
+  (`crates/jammi-encoders/src/lib.rs`). The audio-only dispatcher and its trait had no callers
+  anywhere in the workspace, and audio is now a first-class `AnyEncoder` variant with real training
+  hooks; a second, parallel audio dispatcher would be the family-erasure duplication `AnyEncoder`
+  exists to avoid. Migration: hold an `AnyEncoder::Htsat(..)` and call `forward_input` with
+  `EncoderInput::Audio { input_features, is_longer }`.
+- `jammi_lora::should_apply_lora` takes a fourth parameter `layer_idx: Option<usize>`
+  (`crates/jammi-lora/src/config.rs:91`), where it previously took `layer_idx: usize`. `None` names a
+  site that belongs to no numbered repeating unit (a projection head), and — matching PEFT's own
+  `check_target_module_exists` — can never satisfy an active `layers_to_transform` filter.
+  Migration: an existing caller inside a numbered layer passes `Some(n)`; behaviour is unchanged
+  for every such caller.
+- `jammi_encoders::AnyEncoder::max_seq_length` returns `Result<usize, EncoderError>` rather than
+  `usize` (`crates/jammi-encoders/src/any.rs`). A vision or audio tower has no token-sequence
+  capacity at all, and every plausible filler value would flow into a caller's `min()` as a
+  confidently wrong sequence bound. Migration: `?` or `unwrap_or` at the call site; the BERT-family
+  and CLIP-text arms always answer `Ok`.
+- `jammi_encoders::AnyEncoder` gains the variants `OpenClipVision(OpenClipVisionTransformer)` and
+  `Htsat(Box<HtsatAudio>)` (`crates/jammi-encoders/src/any.rs`). The enum is a closed, exhaustively
+  matched dispatcher by design, so an out-of-tree `match` over it must add the two arms; the audio
+  payload is boxed so a small BERT variant does not carry the audio tower's footprint.
+- `jammi_ai::fine_tune::data::TrainingFormat::AudioTriplet` is renamed `MediaTriplet`
+  (`crates/jammi-ai/src/fine_tune/data.rs`), with the matching `TextChunk` and `UnderlyingFormat`
+  variants. The shape is unchanged (three binary columns) and the modality is now taken from the
+  job's declared `ModelTask`, so the same variant covers image and audio. The format is
+  column-detected rather than serialized, so nothing on the wire or on disk changes.
 
 ## [0.49.1] - 2026-09-03
 

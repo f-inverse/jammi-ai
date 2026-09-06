@@ -63,18 +63,43 @@ impl LoraBuildConfig<'static> {
 /// should receive a LoRA adapter.
 ///
 /// Semantics (mirroring HuggingFace PEFT):
-/// - If `layers_to_transform` is `Some(ids)`, `layer_idx` must appear in it.
+/// - If `layers_to_transform` is `Some(ids)`, `layer_idx` must be `Some(i)`
+///   with `i` in `ids`.
 /// - If `target_modules` contains `"all-linear"`, match every layer name.
 /// - Otherwise `module_name` must equal or end with one of the target strings.
+///
+/// # `layer_idx: None` — an UNINDEXED site
+///
+/// Not every LoRA-wrappable linear sits inside a numbered repeating unit. A
+/// tower's head-side projections (e.g. a CLAP audio projection's
+/// `linear1`/`linear2`) live outside the block stack and have no layer index
+/// at all. PEFT models exactly this case and refuses such a site whenever a
+/// layer filter is active: `check_target_module_exists`
+/// (`peft/src/peft/tuners/tuners_utils.py:2353-2389`) extracts the index with
+/// `re.match(r".*?\.[^.]*\.(?P<idx>\d+)\.", key)` and, when the key has no
+/// numbered segment, sets `layer_index = None` and then
+/// `target_module_found = False` — i.e. "restrict to layers `[0, 2]`" cannot
+/// be satisfied by a module that belongs to no layer.
+///
+/// This function follows that rule exactly:
+/// - `(None, Some(_))` → `false`: a layer filter is active and this site has
+///   no index to test against it. Answering `true` would silently widen a
+///   caller's explicit "only these layers" restriction to also cover every
+///   unindexed head site.
+/// - `(None, None)` → fall through to the ordinary selector match: with no
+///   filter active there is nothing for the missing index to fail.
 pub fn should_apply_lora(
     module_name: &str,
     target_modules: &[String],
-    layer_idx: usize,
+    layer_idx: Option<usize>,
     layers_to_transform: &Option<Vec<usize>>,
 ) -> bool {
     if let Some(indices) = layers_to_transform {
-        if !indices.contains(&layer_idx) {
-            return false;
+        // `None` (an unindexed site) can never satisfy an active layer
+        // filter — see this function's own doc for the PEFT citation.
+        match layer_idx {
+            Some(idx) if indices.contains(&idx) => {}
+            _ => return false,
         }
     }
 

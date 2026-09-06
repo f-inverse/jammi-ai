@@ -1805,11 +1805,99 @@ staleness→recompute loop — that is the platform's, not the engine's
 ### 2.5 Encoders (`jammi-encoders`)
 
 - **`AnyEncoder`** — `crates/jammi-encoders/src/any.rs` (the `AnyEncoder` enum): a
-  hand-written closed enum `{ Bert, DistilBert, ModernBert, ClipText }`, **not a
-  trait**. Forwards each method to the active variant. The compiler forces a match arm
-  in every method — that is the point of the closed enum (no trait-object overhead).
-  **ClipText is a second-class citizen:** `forward_hidden` returns `Err`,
-  `trainable_params` is empty, all training-mode methods are no-ops (frozen, no LoRA).
+  hand-written closed enum `{ Bert, DistilBert, ModernBert, ClipText, OpenClipVision,
+  Htsat }`, **not a trait**. Forwards each method to the active variant. The compiler
+  forces a match arm in every method — that is the point of the closed enum (no
+  trait-object overhead). `Htsat` carries a `Box<HtsatAudio>`
+  (`clippy::large_enum_variant`): the audio tower is roughly four times the next-largest
+  variant, and an unboxed payload would make *every* `AnyEncoder` — a small BERT one
+  included — carry that footprint. **All six variants are first-class:**
+  `trainable_params`, `named_trainable_weights`, `set_training`, `load_weights`,
+  `dropout_positions`/`restore_dropout_positions` are real on every one, so any of the
+  six can be LoRA-fine-tuned and resumed.
+- **`Modality` / `EncoderInput` / `OwnedEncoderInput`** —
+  `crates/jammi-encoders/src/any.rs` (`Modality`, `EncoderInput`): `Modality` is
+  `{ Text, Image, Audio }`; `EncoderInput` is the borrowed batch vocabulary
+  (`Text { input_ids, attention_mask }`, `Image { pixel_values }`,
+  `Audio { input_features, is_longer }`) that `AnyEncoder::forward_input` dispatches on,
+  and `OwnedEncoderInput` is its owning twin for a caller that must materialise a batch
+  (borrow it back with `as_input`). Feeding an input whose modality is not the encoder's
+  own is a typed refusal, never a reshape. `forward(input_ids, mask)` remains the text
+  convenience and is exactly `forward_input(EncoderInput::Text { .. })`.
+- **What is defined per variant, and what refuses** — `hidden_size` and `dtype` are
+  total (every variant produces a pooled embedding and reads its dtype off a real
+  backbone weight). `forward_hidden` and `max_seq_length` are token-sequence properties:
+  the BERT family answers, `ClipText` answers `max_seq_length` with the OpenCLIP
+  `context_length` and refuses `forward_hidden`, and the two media towers refuse both.
+  `max_seq_length` returns `Result` for exactly that reason — every plausible filler
+  (`0`, `usize::MAX`, a patch count) would flow into a caller's `min()` as a confidently
+  wrong sequence bound. `image_size`/`preprocess_mean`/`preprocess_std` are vision-only
+  and `num_mel_bins` audio-only, each a typed refusal elsewhere.
+- **`AnyEncoder::probe_input`** — `crates/jammi-encoders/src/any.rs` (the
+  `probe_input` fn): the smallest shape-VALID batch for the variant's own geometry
+  (text `1 × TEXT_PROBE_TOKENS` ids; image `1 × 3 × image_size²`; audio
+  `1 × CLAP_FUSION_CHANNELS × AUDIO_PROBE_TIME_FRAMES × num_mel_bins` with
+  `is_longer = [true]`,
+  the branch that exercises the AFF fusion path as well as the plain patch-conv). Read
+  off the built tower, never a caller-side table, and at the tower's OWN `dtype()` —
+  the LoRA/linear seam casts its input to the weight dtype but the media front ends do
+  not (candle's `conv2d` refuses an F32 batch against an F16 kernel; HTSAT's leading
+  `BatchNorm` refuses it in its centring subtraction), so a probe manufactured at a
+  hardcoded `F32` only ever worked for an F32 backbone. This is what keeps the
+  fine-tune worker's claim-time acceleration-report probe
+  (`crates/jammi-ai/src/fine_tune/worker.rs`, `build_acceleration_report_json`) from
+  degrading to `probe_forward_failed` on a media tower — an empty `ops` map there is the
+  esc-075 "absence must fail, never read as clean" case (`.jammi/escapes.jsonl`).
+- **The three cross-modal towers and their LoRA sites** — each tower has its own
+  builder (`ClipText::builder`, `OpenClipVisionTransformer::builder`,
+  `HtsatAudio::builder`) with the same knobs the BERT family uses
+  (`.lora()`, `.backbone_dtype()`, `.adapter()`), so "LoRA the text tower only" is
+  expressible: the sibling is built `LoraBuildConfig::frozen()`. Every wrappable linear
+  is a `jammi_lora::MaybeLoraLinear`; an unselected site is
+  `Frozen(FrozenBase::Dense(..))` whose forward is `Linear::forward` bit-for-bit, so one
+  struct serves inference and training.
+
+  | tower | indexed unit → `layer_idx` | site names (= `target_modules` selector = adapter subpath leaf) | unindexed sites |
+  |---|---|---|---|
+  | CLIP-text (`clip_text.rs`) | `transformer.resblocks.{n}` → `Some(n)` | `in_proj` (fused QKV, ONE site over the flat `attn.in_proj_weight`/`in_proj_bias`), `out_proj`, `c_fc`, `c_proj` | none (`text_projection` is a bare tensor) |
+  | OpenCLIP-vision (`open_clip_vision.rs`) | `transformer.resblocks.{n}` → `Some(n)` | the same four | none (`proj` bare, `conv1` is a conv) |
+  | HTSAT-CLAP audio (`htsat_audio.rs`) | `layers.{s}.blocks.{b}` → `Some(s)` (the STAGE) | `query`, `key`, `value`, `attention_output`, `intermediate_dense`, `output_dense` | `reduction` (`layers.{s}.downsample`, `Some(s)`, bias-free); `linear1`, `linear2` (`audio_projection`, `None`) |
+
+  `"all-linear"` selects every site on any tower. A selector that matches nothing (e.g.
+  `q_proj` on CLIP) reaches the existing zero-trainable refusal, whose message names the
+  selected tower's real site names.
+- **`lora_site.rs` WRAPS, the tower loader RESOLVES** —
+  `crates/jammi-encoders/src/lora_site.rs` (the `LoraSite` struct), crate-private: it
+  holds the trainable `VarBuilder` scoped to the indexed unit, the unit's `layer_idx`,
+  the `LoraBuildConfig` and the `VarMap`, and its `wrap` runs
+  `should_apply_lora` → `effective_rank` → `LoraLinear::new_with_base`, else
+  `MaybeLoraLinear::Frozen(base)`. Base-tensor *resolution* stays with each tower's
+  loader (which alone knows the checkpoint layout — CLIP's flat `in_proj_weight` is not
+  addressable by a generic helper). The selector name, the adapter subpath and the base
+  locator are therefore three independent axes.
+- **`open_clip_block.rs` is ONE block, TWO namespaces** —
+  `crates/jammi-encoders/src/open_clip_block.rs` (the `ResidualAttentionBlock` struct),
+  crate-private: the text and vision towers load the identical
+  `LN → fused-QKV MHSA → residual → LN → QuickGelu MLP → residual` architecture under
+  the identical checkpoint path, so they share one implementation parameterised by three
+  arguments — MLP width, `Option<causal mask>`, and the **adapter key root**. That third
+  argument is load-bearing: `jammi-ai` holds ONE `VarMap` per run, candle's
+  `VarBuilder::get` returns the already-registered `Var` for a name it has seen, so two
+  towers emitting the same key would silently alias one another's `Var`s (half the
+  trainable parameters, one gradient stream feeding two towers, an exported "vision"
+  adapter that is literally the text weights). The fix is the checkpoint's own
+  namespace: vision keys are `visual.resblocks.{n}.{site}`, text keys are
+  `resblocks.{n}.{site}`.
+- **Mask sentinels are built once at load, in the backbone dtype** — a mask is
+  constructed at load in the frozen backbone's dtype, so no forward ever casts one.
+  CLIP-text's causal mask uses that dtype's own most-negative FINITE value
+  (`crates/jammi-encoders/src/clip_text.rs`, the `dtype_min_sentinel` fn: `f32::MIN`,
+  `half::f16::MIN`, `half::bf16::MIN`) — at F32 that is byte-for-byte the tensor it has
+  always been, and a non-floating dtype is refused rather than coerced. HTSAT's
+  shift-window mask keeps `-100.0` and must NOT be "improved" to a dtype minimum: it is
+  HF `ClapAudioLayer`'s own value and `exp(-100) ≈ 3.7e-44` is a denormal in F32, i.e.
+  output-affecting. `-100.0` is exact in F32/F16/BF16 alike, and at F32 the `to_dtype`
+  is candle's same-dtype early return (`self.clone()`).
 - **The de-facto BERT-family contract** — no Rust trait; the three encoders expose an
   *identical inherent-method surface* (`builder`, `forward`, `forward_hidden`,
   `hidden_size`, `max_seq_length`, `trainable_params`, `named_trainable_weights`,
@@ -1839,10 +1927,18 @@ staleness→recompute loop — that is the platform's, not the engine's
   *This dual-path behavior is the single subtlest contract in the crate.*
 - **`MaybeLoraLinear`** — `crates/jammi-lora/src/wrapper.rs` (the `MaybeLoraLinear`
   enum): closed enum `{ Frozen(FrozenBase), Lora(LoraLinear) }`, decided **once at
-  construction** (`LoraSite::build`). `Frozen.forward` delegates to
-  `FrozenBase::forward`; all other methods are no-ops on `Frozen`. This is the
-  static-dispatch LoRA injection point — used by `jammi-encoders` to hold
-  attention/MLP linears (e.g. `crates/jammi-encoders/src/bert.rs`).
+  construction** (each encoder's own `LoraSite`-shaped helper — the BERT family's
+  in-file one, `crates/jammi-encoders/src/lora_site.rs` for the three cross-modal
+  towers). `Frozen.forward` delegates to `FrozenBase::forward`; all other methods are
+  no-ops on `Frozen`. `MaybeLoraLinear::base()` reaches the frozen base under either
+  arm. This is the static-dispatch LoRA injection point — used by `jammi-encoders` to
+  hold attention/MLP linears (e.g. `crates/jammi-encoders/src/bert.rs`).
+  **One site, one adapter key:** on the training path (`VarMap`-backed `vb`)
+  `LoraLinear::new_with_base` snapshots — *before* registering anything — whether the
+  `VarMap` already holds `{prefix}.lora_a`/`.lora_b`, and a pre-existing key is a typed
+  `LoraError::Config` refusal rather than a silent alias of the first site's `Var`s. That
+  is what makes the two-towers-into-one-`VarMap` aliasing §2.5 describes fail loudly. The
+  inference path (mmaped-adapter-backed `vb`) registers nothing and is unaffected.
 - **`FrozenBase` + `QuantizedLinear`** — `crates/jammi-lora/src/frozen_base.rs`:
   the closed enum naming what a frozen base weight (`MaybeLoraLinear::Frozen`'s
   layer, or `LoraLinear`'s base) is stored as — `Dense(candle_nn::Linear)`
@@ -1917,6 +2013,19 @@ staleness→recompute loop — that is the platform's, not the engine's
   `should_apply_lora` uses **suffix** match (`ends_with`); `effective_rank` uses
   **substring** match (`contains`) — *different semantics, do not conflate*.
   `LoraBuildConfig::frozen()` is the no-LoRA default.
+- **`layers_to_transform` and the UNINDEXED site** — `crates/jammi-lora/src/config.rs`
+  (the `should_apply_lora` fn) takes `layer_idx: Option<usize>`, the single authority for
+  both halves of the selection. `None` means the site belongs to no numbered repeating
+  unit (a CLAP `audio_projection.linear{1,2}` head, say). PEFT's own
+  `check_target_module_exists` (`peft/src/peft/tuners/tuners_utils.py:2353-2389`)
+  extracts the index with `re.match(r".*?\.[^.]*\.(?P<idx>\d+)\.", key)` — the FIRST
+  numbered segment — and sets `target_module_found = False` when there is none, and this
+  function follows that rule exactly: `(None, Some(filter))` → `false` (a caller's
+  explicit "only these layers" must not silently widen to cover every head site),
+  `(None, None)` → fall through to the ordinary selector match. Two consequences worth
+  stating: for HTSAT's `layers.{s}.blocks.{b}.…` keys the extracted index is the **stage**
+  `s`, not the block `b`; and setting `layers_to_transform` therefore **excludes** every
+  unindexed site on that tower.
 - **`LoraInitMode`** — `crates/jammi-lora/src/init.rs` (the `LoraInitMode` enum):
   `ZerosB` (default; identity at construction) or `Gaussian`.
 - **Persistence** — `AdapterConfig` (`crates/jammi-lora/src/adapter.rs`) +
@@ -1926,10 +2035,63 @@ staleness→recompute loop — that is the platform's, not the engine's
   deliberately not persisted**. Higher-level `SavedAdapter`
   (`crates/jammi-ai/src/fine_tune/target.rs`) is the on-disk discriminator between
   `ProjectionHead` and `EncoderAdapters` targets.
+- **Adapter identity: `model_type` + `tower`, one meaning each** —
+  `crates/jammi-lora/src/adapter.rs` (the `AdapterConfig` struct and the `Tower` enum).
+  `model_type` is the base ARCHITECTURE id as the shared predicate spells it:
+  `bert` | `distilbert` | `modernbert` | `open_clip` | `clap_audio_model`. Three are
+  HuggingFace's own values, `clap_audio_model` is HF's id for a CLAP audio config, and
+  `open_clip` is this workspace's canonical id for a checkpoint family that ships no
+  `model_type` field at all. `tower: Option<Tower>` (`Tower::{Text, Vision, Audio}`,
+  serialised `"text"`/`"vision"`/`"audio"`) says WHICH tower of a multi-tower checkpoint
+  the adapter installs on, added by `AdapterConfig::with_tower`. It is
+  `#[serde(default, skip_serializing_if = "Option::is_none")]`: an adapter with no tower
+  emits **no `tower` key at all**, so a single-tower family's `adapter_config.json` is
+  byte-identical to what it has always been, and an adapter written without the field
+  deserialises unchanged. Adapter/base agreement is checked FAMILY-to-FAMILY, never
+  string-to-string (§2.7 / §5).
+- **Adapter key layout** — the `named_trainable_weights` keys ARE the adapter
+  safetensors keys, per tower:
+  - BERT-family: `layer.{n}.{site}.lora_{a,b}`
+  - CLIP-text: `resblocks.{n}.{site}.lora_{a,b}`
+  - OpenCLIP-vision: `visual.resblocks.{n}.{site}.lora_{a,b}` (the checkpoint's own
+    `visual.` namespace — §2.5's "two namespaces")
+  - HTSAT: `layers.{s}.blocks.{b}.{site}.lora_{a,b}`,
+    `layers.{s}.downsample.reduction.lora_{a,b}`,
+    `audio_projection.{linear1,linear2}.lora_{a,b}`
+
+  See §5's "site-name strings are a persistence ABI" gotcha before renaming any of them.
 - **`TrainingTarget`** — `crates/jammi-ai/src/fine_tune/target.rs` (the `TrainingTarget`
   enum): `ProjectionHead { head: LoraModel }` or `EncoderAdapters(...)`. Uniform trainer
   surface (`trainable_params`, `set_training`, `named_trainable_weights`, `load_weights`,
   dropout positions, `saved_adapter`).
+- **`TrainingFormat::MediaTriplet` — one media shape, keyed by TASK** —
+  `crates/jammi-ai/src/fine_tune/data.rs` (the `TrainingFormat` enum): `anchor`,
+  `positive`, `negative` columns carrying encoded binary blobs — audio clips
+  (WAV/FLAC/MP3/Ogg bytes) or images (PNG/JPEG/… bytes). The modality is **not** carried
+  by the variant and is **not** sniffed from the bytes: it is the job's own `ModelTask`
+  (`audio_embedding` / `image_embedding`), which the caller already supplies and the
+  trainer dispatches its front end on. An encoded WAV and an encoded PNG are both
+  `Vec<u8>`, so the column shape genuinely cannot tell them apart and the declared task is
+  the authority rather than a byte-header guess. The trainer decodes and forwards the
+  three groups as **one joined batch** and then splits it
+  (`crates/jammi-ai/src/fine_tune/trainer.rs`, `encode_media_groups`) — the same shape the
+  text path already used. A text task over binary columns, or a media task with no binary
+  triplet, is the existing typed schema error, with a message naming the expected columns
+  per task; `extract_string_column` (`crates/jammi-ai/src/fine_tune/worker.rs`) refuses a
+  binary-family column outright, and refuses a cast that would introduce nulls, rather
+  than letting the cast fallback fabricate an empty string for a row it could not read.
+- **Serving installs a tower adapter, and identity stays single-valued** —
+  `crates/jammi-ai/src/model/backend/candle.rs` (`CandleBackend::load`). With an
+  encoder adapter present, the OpenCLIP and CLAP arms build through the §2.5 builders with
+  `.lora().backbone_dtype(encoder_backbone_dtype).adapter(..)`, exactly as the BERT arms
+  already did; `adapter_cfg.tower` picks which tower receives the LoRA and the sibling is
+  built frozen. **Both** OpenCLIP towers build at the adapter's own
+  `encoder_backbone_dtype`: a fine-tuned model's backbone precision is its adapter's, that
+  precision is folded into `ModelIdentity`, and a checkpoint cannot honestly report two.
+  With NO adapter both towers keep their root-`vb`-at-`compute_dtype` construction, so an
+  unadapted base's served bytes are unchanged. An OpenCLIP adapter that names no tower is
+  a typed refusal — a checkpoint with two towers has no defensible default, and guessing
+  installs the weights on the wrong one.
 - **`FineTuneConfig::validate()`** — `crates/jammi-wire/src/fine_tune.rs`
   (`FineTuneConfig::validate`): the gate (rank>0, alpha>0, dropout∈[0,1), pinball
   ascending levels, …). `seed` defaults to `DEFAULT_FINE_TUNE_SEED = 42` — a constant,
@@ -2255,6 +2417,54 @@ note below.
 - **`ResolvedModel`** — `crates/jammi-ai/src/model/mod.rs` (the `ResolvedModel` struct):
   the frozen "files located, backend chosen, not loaded" struct (resolver → backend
   contract).
+
+**Architecture identity — the ONE chain (`jammi-ai/src/model/arch.rs`)**
+
+Every "what architecture is this checkpoint, and which files hold it" question in the
+workspace goes through this module. Before it, the serving loader, the resolver, the
+fine-tune worker and the benchmark harness each carried their own copy of the rules, and
+the copies disagreed.
+
+- **`EncoderFamily`** — `crates/jammi-ai/src/model/arch.rs` (the `EncoderFamily` enum):
+  `{ Bert, DistilBert, ModernBert, OpenClip, ClapAudio }`. `EncoderFamily::from_config`
+  classifies a parsed config in a stated order — CLAP first (its structural signal is the
+  most specific), then OpenCLIP (`model_cfg` present), then the text families keyed on
+  `model_type` (`bert`/`roberta`/`camembert`/`xlm-roberta` → `Bert`; `distilbert`;
+  `modernbert`). `EncoderFamily::towers()` names a family's towers for refusal messages;
+  `has_tower(Option<Tower>)` answers whether the checkpoint actually has the tower an
+  adapter claims.
+- **A DECLARED-but-unknown `model_type` is `None`, i.e. a typed refusal.** There is no
+  `_ => Bert` arm: a config that merely happens to deserialize as a `BertConfig` (a GPT-2
+  config does) would otherwise train and serve a confidently wrong architecture over
+  foreign weights and publish an adapter claiming that architecture. Every caller must
+  handle `None` as a refusal.
+- **An ABSENT `model_type` is a different question with a different answer** —
+  `crates/jammi-ai/src/model/arch.rs` (the `UNDECLARED_MODEL_TYPE_FAMILY` constant),
+  which is `Bert`, and the ONE owner of that rule; `config_model_type` reports the same
+  id for refusal messages. A non-string `model_type` value counts as undeclared. Every
+  reader in the workspace has always loaded such a directory as BERT (they are older
+  sentence-transformers exports and hand-written bare BERT configs; HF's own
+  `PretrainedConfig` always serialises the key), so answering `None` here would make this
+  module the *source* of the train/serve divergence it exists to remove — serving would
+  keep loading the checkpoint while the fine-tune worker refused the identical bytes. A
+  non-BERT checkpoint that omitted the field still cannot mis-load silently: its geometry
+  must deserialize as a `BertConfig` and its tensors must carry BERT's names.
+- **Two candidate-name lists, two questions** — `WEIGHTS_CANDIDATE_NAMES` (4 names,
+  including `model.onnx`) is the IDENTITY list: every file name that can BE a model's
+  weights, used for digest/fingerprint slots. `CANDLE_WEIGHTS_CANDIDATE_NAMES` (3, no
+  ONNX) is the RESOLUTION list `weights_candidates` walks in the frozen precedence.
+  `config_candidates` walks `CONFIG_CANDIDATE_NAMES` (`config.json`,
+  `open_clip_config.json`). Hardcoding `config.json` / `model.safetensors` instead of
+  walking these lists is exactly how an OpenCLIP checkpoint — whose files are
+  `open_clip_config.json` / `open_clip_model.safetensors` — becomes invisible to a
+  consumer.
+- **Where the config comes from is part of the contract:** the resolver prefers the
+  catalog record's stored `config_json` over disk and the fine-tune worker follows the
+  same order, so a job and a serve of the same catalog row can never classify the same
+  model differently.
+- **The esc-058 fingerprint arms consume this module without changing their BYTES** —
+  `crates/jammi-ai/src/model/backend/candle.rs` (the config and weights fingerprint
+  arms); a test pins the fingerprint/digest on the tiny fixtures across the extraction.
 
 **GGUF/k-quant weight loading (`jammi-ai/model/resolver.rs` + `model/backend/gguf.rs`)**
 
@@ -2594,9 +2804,17 @@ each tick: `reclaim_expired_training_jobs` → `claim_next_training_job` (takes 
 ORDER BY <full tuple>` for deterministic order) → `build_training_data_loader` →
 `train_fine_tune` → `run_fine_tune_blocking` (on the blocking pool, `catch_unwind`-wrapped):
 builds the `TrainingTarget` (empty `target_modules` → projection head; non-empty →
-`build_encoder_adapters` which resolves the backbone, parses `model_type`, builds the
-encoder via `jammi_encoders::{Bert,DistilBert,ModernBert}::builder().lora(...)` — **where
-injection happens via `LoraSite::build`, `crates/jammi-encoders/src/bert.rs`**), then
+`build_encoder_adapters`, which resolves the backbone through `model::arch` (§2.7) and
+dispatches on **`(family, task)` with no default arm**: BERT/DistilBERT/ModernBERT ×
+text-embedding/classification/NER/regression → the text towers; `open_clip` ×
+`text_embedding` → `ClipText`; `open_clip` × `image_embedding` →
+`OpenClipVisionTransformer`; `clap_audio_model` × `audio_embedding` → `HtsatAudio`. Every
+other pairing — and every config this crate has no loader for — is a typed refusal naming
+both halves and the family's real towers, never a silent fallback onto a family's
+"default" tower. The chosen tower is stamped into the saved `AdapterConfig` via
+`with_tower`. Each arm calls that tower's own `builder().lora(...)` — **where injection
+happens, `crates/jammi-encoders/src/lora_site.rs` and each tower's in-file site
+helper**), then
 `TrainingLoop::run` (`crates/jammi-ai/src/fine_tune/trainer.rs`). The loop snapshots
 `varmap.all_vars()` once, builds AdamW, runs epochs with grad-accum, cooperative
 cancellation at epoch boundaries, durable resume checkpoints, early stopping, saves `best`,
@@ -3063,19 +3281,28 @@ default in `crates/jammi-db/src/index/sidecar.rs`.)
    holding `MaybeLoraLinear` + `crate::layer_norm::LayerNorm`, `Foo` + `FooBuilder` with the
    four builder knobs (`.pooling()`, `.lora()`, `.backbone_dtype()`, `.adapter()`). `build`
    opens `frozen_vb` via `VarBuilder::from_mmaped_safetensors` and `lora_vb` (always **F32**);
-   use a `LoraSite`-style helper calling `should_apply_lora` + `effective_rank` +
-   `LoraLinear::new`. Implement the full §2.5 method surface. End `forward` with
-   `pool_and_normalize`. **Pick & document your safetensors key prefix.**
+   resolve each base tensor in the loader, then hand it to
+   `crates/jammi-encoders/src/lora_site.rs`'s `LoraSite::wrap` (or the BERT family's
+   in-file equivalent), which runs `should_apply_lora` + `effective_rank` +
+   `LoraLinear::new_with_base`. Implement the full §2.5 method surface. End `forward` with
+   `pool_and_normalize`. **Pick & document your safetensors key prefix** — and if the
+   checkpoint holds more than one tower, give each tower its own adapter key root (§2.5).
 2. Register `pub mod foo;` + `pub use foo::{Foo, FooConfig};` in
    `crates/jammi-encoders/src/lib.rs`.
 3. Add the `Foo(Foo)` variant to `AnyEncoder` (`crates/jammi-encoders/src/any.rs`) — the
-   compiler forces a match arm in every method.
+   compiler forces a match arm in every method, including `modality`, `forward_input`,
+   `probe_input` and `dtype`.
 4. Tests: `crates/jammi-encoders/tests/it/foo.rs` + register in
    `crates/jammi-encoders/tests/it/main.rs`; add a golden/parity fixture if one exists.
-5. Wire into the parent crate (same PR): inference arm in
-   `crates/jammi-ai/src/model/backend/candle.rs` (box behind that file's `CandleTextForward`,
-   add `"foo"` to the supported-architectures error string); fine-tune arm in
-   `crates/jammi-ai/src/fine_tune/worker.rs`.
+5. Wire into the parent crate (same PR): an `EncoderFamily` variant plus its
+   `from_config` / `from_adapter_model_type` / `adapter_model_type` / `has_tower` /
+   `towers` arms in `crates/jammi-ai/src/model/arch.rs` (§2.7) — that module, not a
+   per-call-site `match`, is where the architecture becomes known; then the inference arm
+   in `crates/jammi-ai/src/model/backend/candle.rs` (box behind that file's
+   `CandleTextForward`, add `"foo"` to the supported-architectures error string) and the
+   `(family, task)` arm in `crates/jammi-ai/src/fine_tune/worker.rs`
+   (`build_encoder_adapters`). There is no default arm in either dispatch: an unhandled
+   pairing must stay a typed refusal.
 
 (A **new pooling strategy** instead: `Pooling` variant
 (`crates/jammi-encoders/src/pooling.rs`) + match arm in `pool_and_normalize` + a `*_pool` fn;
@@ -3238,9 +3465,22 @@ auto-available to every encoder.)
 - **Site-name strings are a persistence ABI.** `named_trainable_weights` keys are the adapter
   safetensors keys; the `…lora_sites` helper names (used by dropout-resume) and the inlined
   `named_weights`/`load_weights` prefixes are maintained **independently** — a rename must be
-  applied in both places or it silently orphans saved adapters.
-- **ClipText is asymmetric** inside `AnyEncoder` (errors `forward_hidden`, no-ops training
-  methods, ignores the attention mask, pools via EOT-argmax).
+  applied in both places or it silently orphans saved adapters. The same string is also the
+  `target_modules` selector a caller writes, so a rename is a user-visible config break too.
+- **The cross-modal towers are asymmetric** inside `AnyEncoder`, but only where the
+  modality genuinely differs: all three carry real training hooks, and it is the
+  *token-sequence* methods that refuse (`forward_hidden` on all three, `max_seq_length` on
+  the two media towers). `ClipText` ignores the attention mask (its causal mask is the
+  whole story) and pools via EOT-argmax.
+- **Two towers of one checkpoint must never share an adapter key root.** `jammi-ai` holds
+  one `VarMap` per run and candle's `VarBuilder::get` hands back the already-registered
+  `Var` for a name it has seen, so identical keys alias rather than duplicate — half the
+  trainable parameters and one gradient stream feeding both towers. The refusal in
+  `LoraLinear::new_with_base` (§2.6) is the mechanical guard; the disjoint
+  `visual.`-prefixed vision namespace (§2.5) is the design that keeps it from firing.
+- **An OpenCLIP adapter must name its tower.** `adapter_config.json` omits the `tower` key
+  entirely for a single-tower family (so those files are byte-unchanged), but a
+  two-tower checkpoint with `tower: None` is refused at load rather than defaulted.
 
 **LoRA / training**
 

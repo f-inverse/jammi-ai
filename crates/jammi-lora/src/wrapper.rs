@@ -39,6 +39,19 @@ impl MaybeLoraLinear {
         }
     }
 
+    /// The frozen base weight underneath EITHER arm — the `Frozen` arm's own
+    /// base, or the base a `Lora` arm wraps. One accessor for both, so a
+    /// consumer that needs the site's base tensor (a test inspecting a fused
+    /// QKV weight's gradient, a geometry check) does not have to re-derive
+    /// the arm split at every call site and cannot accidentally handle only
+    /// the unadapted case.
+    pub fn base(&self) -> &FrozenBase {
+        match self {
+            Self::Frozen(base) => base,
+            Self::Lora(l) => l.base(),
+        }
+    }
+
     /// Trainable parameters of this layer. Empty for `Frozen`; the LoRA A and
     /// B tensors for `Lora`.
     pub fn trainable_params(&self) -> Vec<&Tensor> {

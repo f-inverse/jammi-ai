@@ -20,7 +20,8 @@ use jammi_lora::{
 use tempfile::tempdir;
 
 /// Hand-rolled synthetic config matching the spec's exit criteria for test 6.
-fn tiny_config() -> jammi_encoders::distilbert::DistilBertConfig {
+/// `pub(crate)` for the same reason as [`write_synthetic_weights`].
+pub(crate) fn tiny_config() -> jammi_encoders::distilbert::DistilBertConfig {
     serde_json::from_value(serde_json::json!({
         "dim": 32,
         "n_layers": 1,
@@ -51,7 +52,11 @@ fn head64_config() -> jammi_encoders::distilbert::DistilBertConfig {
 /// Construct a random F32 safetensors archive containing every key the
 /// DistilBert builder requires for the supplied config, returning the file
 /// path and the owning [`tempfile::TempDir`] (kept alive by the caller).
-fn write_synthetic_weights(
+///
+/// `pub(crate)` so the sibling `lora_site_names` module can build a real
+/// DistilBERT on the SAME synthetic checkpoint this module's own oracles
+/// use, rather than keeping a second, drift-prone copy of the key layout.
+pub(crate) fn write_synthetic_weights(
     config: &jammi_encoders::distilbert::DistilBertConfig,
     device: &Device,
 ) -> (tempfile::TempDir, std::path::PathBuf) {

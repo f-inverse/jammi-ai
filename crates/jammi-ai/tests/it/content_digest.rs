@@ -424,3 +424,120 @@ async fn missing_adapter_files_under_some_adapter_path_refuses_to_load() {
          never silently serve the unadapted base model (F-1)"
     );
 }
+
+// =============================================================================
+// A6 (issue #421): the D7 architecture/candidate-path extraction must not move
+// a single identity byte.
+//
+// `model::arch` owns the CLAP/OpenCLIP/text predicates and the frozen
+// config/weights candidate-NAME lists that `compute_model_content_digest` and
+// `compute_model_fingerprint` hash and stat. That is exactly the class of
+// refactor that silently re-orders or re-names a hashed input: a digest is a
+// fold over an ORDERED candidate set, so swapping two slot names, or adding a
+// fourth, changes every downstream `DefinitionHash` and invalidates every
+// materialized embedding table in the field.
+//
+// These pins are LITERAL values computed at the unit's base commit
+// (main 3a3010d5, before any of this unit's edits) and are not this suite's to
+// recompute: a test that re-derives its expected value from the code under
+// test proves nothing. If one of these fails, the extraction moved an identity
+// byte and the extraction is wrong — never the constant.
+// =============================================================================
+
+/// `tiny_bert`'s digest at base — the BERT-family text arm (`config.json` +
+/// `model.safetensors` + `tokenizer.json`, no `1_Pooling/`, no
+/// `preprocessor_config.json`).
+const TINY_BERT_DIGEST: &str = "0c61f4c9066989eb921cb36b3c5cfe7a0d1debf189a8027b4b3dc578fedeae62";
+
+/// `tiny_open_clip`'s digest at base — the arm that exercises the OpenCLIP
+/// candidate NAMES (`open_clip_config.json` / `open_clip_model.safetensors`),
+/// i.e. the SECOND arm of each candidate slot rather than the first.
+const TINY_OPEN_CLIP_DIGEST: &str =
+    "d72c3236749e82a68b0d80860f957080e326f23f122f700e2e6bd9e12ec00bbd";
+
+/// `htsat_clap_tiny`'s digest at base — the arm that additionally folds in
+/// `preprocessor_config.json`, whose REQUIRED-vs-OPTIONAL classification is
+/// itself derived from the CLAP predicate this unit moved into `model::arch`.
+const HTSAT_CLAP_TINY_DIGEST: &str =
+    "7f1c76f2f952d2b404360c816c8576dc6b9a0460104175f37fe8d2d3e1427528";
+
+/// Resolve + load a fixture directory for `task` through the SAME live
+/// `ModelResolver` -> `CandleBackend::load` path `resolve_and_load` uses,
+/// generalised over the task so the two media fixtures can be loaded at all
+/// (an OpenCLIP image load and a CLAP audio load never resolve under
+/// `TextEmbedding`).
+async fn resolve_and_load_for_task(dir: &Path, task: ModelTask) -> LoadedModel {
+    let catalog_dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
+    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let resolved = resolver
+        .resolve(&ModelSource::local(dir), task, None)
+        .await
+        .unwrap();
+    let backend = CandleBackend;
+    let device_config = DeviceConfig {
+        gpu_device: -1,
+        memory_fraction: 1.0,
+        require_gpu: false,
+        compute_precision: jammi_numerics::ComputePrecision::F32,
+    };
+    backend.load(&resolved, &device_config).unwrap()
+}
+
+/// Assert a fixture's live `content_digest()` equals `expected_hex`. The
+/// digest's own `Debug` form is `Sha256("<hex>")`, so the comparison is made
+/// on that rendering rather than on a re-parse.
+async fn assert_content_digest(dir: &Path, task: ModelTask, expected_hex: &str, label: &str) {
+    let model = resolve_and_load_for_task(dir, task).await;
+    let digest = model
+        .content_digest()
+        .expect("the Candle backend always reports a Sha256 content digest");
+    assert_eq!(
+        format!("{digest:?}"),
+        format!("Sha256(\"{expected_hex}\")"),
+        "{label}: the D7 architecture/candidate extraction must not change any \
+         identity byte — this constant was computed at the unit's base commit and \
+         is not this test's to update"
+    );
+}
+
+/// A6, arm 1: the BERT-family fixture.
+#[tokio::test(flavor = "multi_thread")]
+async fn tiny_bert_content_digest_is_unchanged_by_the_arch_extraction() {
+    assert_content_digest(
+        &jammi_test_utils::cookbook_fixture("tiny_bert"),
+        ModelTask::TextEmbedding,
+        TINY_BERT_DIGEST,
+        "tiny_bert",
+    )
+    .await;
+}
+
+/// A6, arm 2: the OpenCLIP fixture, under BOTH tasks it resolves for. One
+/// digest, two tasks — the digest folds the model DIRECTORY's bytes, never the
+/// task, so a task-dependent digest here would itself be the defect.
+#[tokio::test(flavor = "multi_thread")]
+async fn tiny_open_clip_content_digest_is_unchanged_under_both_tasks() {
+    let fixture = jammi_test_utils::fixture("tiny_open_clip");
+    for task in [ModelTask::TextEmbedding, ModelTask::ImageEmbedding] {
+        assert_content_digest(
+            &fixture,
+            task,
+            TINY_OPEN_CLIP_DIGEST,
+            &format!("tiny_open_clip ({task})"),
+        )
+        .await;
+    }
+}
+
+/// A6, arm 3: the HF-CLAP audio fixture.
+#[tokio::test(flavor = "multi_thread")]
+async fn htsat_clap_tiny_content_digest_is_unchanged_by_the_arch_extraction() {
+    assert_content_digest(
+        &jammi_test_utils::cookbook_fixture("htsat_clap_tiny"),
+        ModelTask::AudioEmbedding,
+        HTSAT_CLAP_TINY_DIGEST,
+        "htsat_clap_tiny",
+    )
+    .await;
+}

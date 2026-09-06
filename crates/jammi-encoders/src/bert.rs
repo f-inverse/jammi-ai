@@ -388,6 +388,16 @@ impl Bert {
         self.max_position_embeddings
     }
 
+    /// Dtype the FROZEN BACKBONE weights are materialised at — read off a
+    /// real weight (the word-embedding table), never a remembered builder
+    /// setting, so it stays true for a model built through `load` from an
+    /// arbitrary `VarBuilder` as well as one built through the builder's
+    /// `backbone_dtype`. See `crate::AnyEncoder::dtype` for the one caller
+    /// class this exists for.
+    pub fn dtype(&self) -> candle_core::DType {
+        self.embeddings.word_embeddings.embeddings().dtype()
+    }
+
     /// Raw `[batch, seq, hidden]` output before pooling. Eval (the default,
     /// `self.training == false`) is BYTE-FOR-BYTE UNCHANGED — the very same
     /// `for layer in &self.layers { hidden = layer.forward(..) }` loop this
@@ -597,6 +607,37 @@ impl Bert {
         Ok(())
     }
 }
+
+/// The selector names a caller may write in `target_modules` to reach this
+/// family's LoRA sites — exactly the `module_name` arguments
+/// `BertBuilder::build` passes to `LoraSite::build`, which is what
+/// [`jammi_lora::should_apply_lora`] matches against.
+///
+/// These are NOT `lora_sites`' names. That helper's `"query"` /
+/// `"intermediate_dense"` / … strings are the ADAPTER-KEY leaves
+/// (`named_trainable_weights`, `lora_subpath` — axis 2 of
+/// `crate::lora_site`'s module doc); the SELECTOR is axis 1, and for this
+/// family alone it is the checkpoint's dotted path. The two coincide for
+/// every other family, which is exactly why the difference is easy to
+/// mis-state: `"intermediate_dense"` selects NOTHING here, because the site
+/// is offered as `"intermediate.dense"`.
+///
+/// `should_apply_lora` also matches any SUFFIX of these, which is why the
+/// short `["query", "value"]` form every existing config writes works — so
+/// this is the canonical, exact-match vocabulary, not the set of accepted
+/// strings. `"output.dense"` therefore reaches BOTH the attention-output
+/// and the MLP-output site; both are listed because both are names a site
+/// is really built under. `AnyEncoder::lora_site_names` returns this, and a
+/// test asserts every entry selects at least one real site on a fixture
+/// while the union of all of them is exactly what `all-linear` selects.
+pub(crate) const LORA_SITE_NAMES: &[&str] = &[
+    "attention.self.query",
+    "attention.self.key",
+    "attention.self.value",
+    "attention.output.dense",
+    "intermediate.dense",
+    "output.dense",
+];
 
 /// The six LoRA-wrappable linear sites of one encoder layer paired with their
 /// `named_trainable_weights` site names — the single source of the site→name
@@ -842,7 +883,11 @@ impl LoraSite<'_, '_> {
         if should_apply_lora(
             module_name,
             self.lora.target_modules,
-            self.layer_idx,
+            // A BERT-family site always belongs to a numbered encoder layer,
+            // so the index is always present — see `should_apply_lora`'s own
+            // doc for the `None` (unindexed-site) case this family never
+            // reaches and the towers with head-side projections do.
+            Some(self.layer_idx),
             self.lora.layers_to_transform,
         ) {
             let rank = effective_rank(module_name, self.lora.lora_rank, self.lora.rank_pattern);

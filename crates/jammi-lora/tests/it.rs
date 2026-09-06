@@ -6,7 +6,7 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder, VarMap};
 use jammi_lora::{
     effective_rank, load_adapter, save_adapter, should_apply_lora, AdapterConfig, ComputePrecision,
-    FrozenBase, LoraBuildConfig, LoraError, LoraInitMode, LoraLinear, MaybeLoraLinear,
+    FrozenBase, LoraBuildConfig, LoraError, LoraInitMode, LoraLinear, MaybeLoraLinear, Tower,
 };
 
 fn cpu() -> Device {
@@ -259,6 +259,166 @@ fn new_and_from_loaded_pin_bit_equal_scaling() {
     }
 }
 
+/// Two LoRA sites under the SAME `VarBuilder` prefix, into the same
+/// `VarMap`, is a typed refusal — not a silent alias.
+///
+/// Candle's `VarMap::get` returns the ALREADY-REGISTERED `Var` for a name it
+/// has seen, so without this gate the second construction hands back the
+/// FIRST site's `Var`s: half the intended trainable parameters, one gradient
+/// stream feeding two sites, and an exported adapter whose two entries are
+/// byte-identical. Every one of those is a confidently wrong number, never an
+/// error — exactly the class this refusal exists for (it is what the two
+/// OpenCLIP towers did to each other before they were given disjoint adapter
+/// key roots).
+#[test]
+fn a_second_site_on_the_same_varmap_key_is_a_typed_refusal() {
+    let device = cpu();
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+
+    let first = LoraLinear::new(
+        build_base(8, 16, &device),
+        4,
+        8.0,
+        false,
+        LoraInitMode::Gaussian,
+        None,
+        7,
+        &varmap,
+        &vb.pp("site"),
+    );
+    assert!(
+        first.is_ok(),
+        "the FIRST site under a fresh prefix must construct"
+    );
+
+    let second = LoraLinear::new(
+        build_base(8, 16, &device),
+        4,
+        8.0,
+        false,
+        LoraInitMode::Gaussian,
+        None,
+        7,
+        &varmap,
+        &vb.pp("site"),
+    );
+    // `LoraLinear` intentionally doesn't derive `Debug`; match instead.
+    let err = match second {
+        Ok(_) => panic!("a second site on `site.lora_a`/`site.lora_b` must be refused"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, LoraError::Config(_)),
+        "the collision must be a typed Config refusal, got {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("site.lora_a") && msg.contains("site.lora_b"),
+        "the refusal must name BOTH colliding keys so the caller can find them, got: {msg}"
+    );
+
+    // Negative control on the same `VarMap`: a DISTINCT prefix is fine, so
+    // the refusal above is about the key collision and not about the varmap
+    // having been written to at all.
+    assert!(
+        LoraLinear::new(
+            build_base(8, 16, &device),
+            4,
+            8.0,
+            false,
+            LoraInitMode::Gaussian,
+            None,
+            7,
+            &varmap,
+            &vb.pp("other_site"),
+        )
+        .is_ok(),
+        "a distinct prefix in the same VarMap must still construct"
+    );
+}
+
+/// The INFERENCE path is untouched by the collision gate: an adapter-file
+/// `VarBuilder` never registers anything in `varmap`, so building two towers
+/// from the same saved adapter into the same (unused) `VarMap` still works.
+///
+/// Without this control the gate above could be over-broad — refusing the
+/// legitimate "serve two copies" case — and the positive test alone would not
+/// notice.
+#[test]
+fn loading_the_same_adapter_twice_into_one_varmap_is_not_a_collision() {
+    let device = cpu();
+    let dir = tempfile::tempdir().unwrap();
+
+    // Train one site, save it.
+    let train_map = VarMap::new();
+    let train_vb = VarBuilder::from_varmap(&train_map, DType::F32, &device);
+    let trained = LoraLinear::new(
+        build_base(8, 16, &device),
+        4,
+        8.0,
+        false,
+        LoraInitMode::Gaussian,
+        None,
+        11,
+        &train_map,
+        &train_vb.pp("site"),
+    )
+    .unwrap();
+    let wrapped = MaybeLoraLinear::Lora(trained);
+    let weights = wrapped.named_weights("site").unwrap();
+    let targets: Vec<String> = vec!["site".into()];
+    let layers = None;
+    let rank_pattern = HashMap::new();
+    let build_cfg = LoraBuildConfig {
+        target_modules: &targets,
+        layers_to_transform: &layers,
+        lora_rank: 4,
+        lora_alpha: 8.0,
+        use_rslora: false,
+        lora_dropout: None,
+        rank_pattern: &rank_pattern,
+        init_mode: LoraInitMode::Gaussian,
+        seed: 11,
+    };
+    save_adapter(
+        dir.path(),
+        &weights,
+        &AdapterConfig::from_build("bert", &build_cfg, ComputePrecision::F32),
+    )
+    .unwrap();
+
+    // Two constructions from that file, sharing ONE VarMap.
+    let serve_map = VarMap::new();
+    let file = dir.path().join("adapter.safetensors");
+    for attempt in 0..2 {
+        let serve_vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&[file.as_path()], DType::F32, &device).unwrap()
+        };
+        let built = LoraLinear::new(
+            build_base(8, 16, &device),
+            4,
+            8.0,
+            false,
+            LoraInitMode::Gaussian,
+            None,
+            11,
+            &serve_map,
+            &serve_vb.pp("site"),
+        );
+        assert!(
+            built.is_ok(),
+            "inference construction #{attempt} from an adapter file must not trip the \
+             training-path collision gate"
+        );
+    }
+    assert!(
+        serve_map.data().lock().unwrap().is_empty(),
+        "the inference path must not register anything in the VarMap — if it did, the \
+         control above would be passing for the wrong reason"
+    );
+}
+
 /// Domain boundary (family D / K2): both constructors must typed-refuse
 /// `rank == 0` rather than let it reach `alpha / 0`.
 #[test]
@@ -346,32 +506,70 @@ fn maybe_lora_linear_named_weights_only_for_lora() {
 #[test]
 fn should_apply_lora_exact_match() {
     let targets = vec!["query".to_string()];
-    assert!(should_apply_lora("query", &targets, 0, &None));
+    assert!(should_apply_lora("query", &targets, Some(0), &None));
     assert!(should_apply_lora(
         "attention.self.query",
         &targets,
-        0,
+        Some(0),
         &None
     ));
-    assert!(!should_apply_lora("key", &targets, 0, &None));
-    assert!(!should_apply_lora("queryless", &targets, 0, &None));
+    assert!(!should_apply_lora("key", &targets, Some(0), &None));
+    assert!(!should_apply_lora("queryless", &targets, Some(0), &None));
 }
 
 #[test]
 fn should_apply_lora_all_linear() {
     let targets = vec!["all-linear".to_string()];
-    assert!(should_apply_lora("query", &targets, 0, &None));
-    assert!(should_apply_lora("anything.at.all", &targets, 7, &None));
+    assert!(should_apply_lora("query", &targets, Some(0), &None));
+    assert!(should_apply_lora(
+        "anything.at.all",
+        &targets,
+        Some(7),
+        &None
+    ));
 }
 
 #[test]
 fn should_apply_lora_layer_filter() {
     let targets = vec!["all-linear".to_string()];
     let layers = Some(vec![2usize, 5]);
-    assert!(should_apply_lora("query", &targets, 2, &layers));
-    assert!(should_apply_lora("query", &targets, 5, &layers));
-    assert!(!should_apply_lora("query", &targets, 0, &layers));
-    assert!(!should_apply_lora("query", &targets, 3, &layers));
+    assert!(should_apply_lora("query", &targets, Some(2), &layers));
+    assert!(should_apply_lora("query", &targets, Some(5), &layers));
+    assert!(!should_apply_lora("query", &targets, Some(0), &layers));
+    assert!(!should_apply_lora("query", &targets, Some(3), &layers));
+}
+
+/// The UNINDEXED site (`layer_idx == None`) — a linear that belongs to no
+/// numbered block at all, e.g. a CLAP audio-projection `linear1`. PEFT's own
+/// `check_target_module_exists` (`peft/src/peft/tuners/tuners_utils.py:
+/// 2353-2389`) sets `layer_index = None` for a key with no numbered segment
+/// and then `target_module_found = False` whenever `layers_to_transform` is
+/// set, so:
+///
+/// - with a layer filter active, an unindexed site is NEVER adapted —
+///   including under `all-linear`, which is a NAME wildcard, not a layer
+///   one (the negative control that a naive "no index, so nothing to
+///   reject" implementation would silently fail);
+/// - with no filter, the ordinary selector match decides, exactly as for an
+///   indexed site.
+#[test]
+fn should_apply_lora_unindexed_site_obeys_the_layer_filter() {
+    let all_linear = vec!["all-linear".to_string()];
+    let by_name = vec!["linear1".to_string()];
+    let layers = Some(vec![0usize]);
+
+    // Filter active + no index => never applied, on either selector form.
+    assert!(!should_apply_lora("linear1", &all_linear, None, &layers));
+    assert!(!should_apply_lora("linear1", &by_name, None, &layers));
+    // Same site, same selectors, WITH an index inside the filter => applied
+    // (proving the refusal above is the missing index, not the selector).
+    assert!(should_apply_lora("linear1", &all_linear, Some(0), &layers));
+    assert!(should_apply_lora("linear1", &by_name, Some(0), &layers));
+
+    // No filter => the selector alone decides, index or not.
+    assert!(should_apply_lora("linear1", &all_linear, None, &None));
+    assert!(should_apply_lora("linear1", &by_name, None, &None));
+    assert!(!should_apply_lora("linear2", &by_name, None, &None));
 }
 
 #[test]
@@ -399,10 +597,12 @@ fn adapter_config_json_roundtrip() {
         layers_to_transform: Some(vec![0, 2]),
         rank_pattern,
         backbone_dtype: ComputePrecision::BF16,
+        tower: Some(Tower::Vision),
     };
 
     let json = serde_json::to_string(&cfg).unwrap();
     let decoded: AdapterConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded.tower, cfg.tower);
     assert_eq!(decoded.model_type, cfg.model_type);
     assert_eq!(decoded.lora_rank, cfg.lora_rank);
     assert_eq!(decoded.lora_alpha, cfg.lora_alpha);
@@ -449,6 +649,7 @@ fn save_load_adapter_roundtrip() {
         layers_to_transform: None,
         rank_pattern: HashMap::new(),
         backbone_dtype: ComputePrecision::F32,
+        tower: None,
     };
 
     save_adapter(dir.path(), &tensors, &cfg).unwrap();
@@ -478,7 +679,7 @@ fn lora_build_config_frozen_is_no_op() {
     assert!(!should_apply_lora(
         "query",
         cfg.target_modules,
-        0,
+        Some(0),
         cfg.layers_to_transform
     ));
 }

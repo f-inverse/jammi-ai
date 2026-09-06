@@ -5,6 +5,7 @@ use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::store::ArtifactStore;
 
+use super::arch;
 use super::backend::gguf::estimate_gguf_residency;
 use super::backend::safetensors_residency::estimate_safetensors_residency;
 use super::{
@@ -18,7 +19,11 @@ use super::{
 /// sniffed by extension. A directory carrying some OTHER `*.gguf` filename
 /// is a typed refusal naming the file(s) found and this convention — see
 /// `ModelResolver::resolve_local`/`ModelResolver::resolve_hf_hub`.
-const GGUF_WEIGHTS_FILENAME: &str = "model.gguf";
+///
+/// Re-exported from [`crate::model::arch`] (issue #421 D7) so the resolver's
+/// chains, the fine-tune worker's on-disk read and the esc-058
+/// tracked-candidate list share ONE spelling of every weights file name.
+const GGUF_WEIGHTS_FILENAME: &str = arch::GGUF_WEIGHTS_FILENAME;
 
 /// Resolves a `ModelSource` to file paths and backend selection.
 pub struct ModelResolver {
@@ -156,17 +161,11 @@ impl ModelResolver {
             None => return Ok(None),
         };
 
-        // Try standard config.json first, then OpenCLIP open_clip_config.json
-        let config_path = {
-            let standard = artifact_dir.join("config.json");
-            let open_clip = artifact_dir.join("open_clip_config.json");
-            if standard.exists() {
-                standard
-            } else if open_clip.exists() {
-                open_clip
-            } else {
-                return Ok(None);
-            }
+        // The shared config chain (`config.json`, then the OpenCLIP
+        // `open_clip_config.json`) — issue #421 D7's single frozen
+        // precedence, not a third local copy of it.
+        let Some(config_path) = arch::config_candidates(&artifact_dir) else {
+            return Ok(None);
         };
 
         // Use stored config_json if available, otherwise re-read from disk
@@ -183,21 +182,18 @@ impl ModelResolver {
         // Reconstruct weights paths from the artifact directory
         let (weights_paths, weights_format): (Vec<PathBuf>, WeightsFormat) = match backend {
             BackendType::Candle => {
-                let standard = artifact_dir.join("model.safetensors");
-                let open_clip = artifact_dir.join("open_clip_model.safetensors");
-                let gguf = artifact_dir.join(GGUF_WEIGHTS_FILENAME);
-                if standard.exists() {
-                    (vec![standard], WeightsFormat::Safetensors)
-                } else if open_clip.exists() {
-                    (vec![open_clip], WeightsFormat::Safetensors)
-                } else if gguf.exists() {
-                    (vec![gguf], WeightsFormat::Gguf)
-                } else {
-                    return Ok(None);
+                // `arch::weights_candidates` walks the FROZEN Candle chain
+                // (`model.safetensors` -> `open_clip_model.safetensors` ->
+                // `model.gguf`); the format label follows from which name
+                // won, so the chain and the label cannot disagree.
+                match arch::weights_candidates(&artifact_dir) {
+                    Some(p) if p.ends_with(GGUF_WEIGHTS_FILENAME) => (vec![p], WeightsFormat::Gguf),
+                    Some(p) => (vec![p], WeightsFormat::Safetensors),
+                    None => return Ok(None),
                 }
             }
             BackendType::Ort => {
-                let p = artifact_dir.join("model.onnx");
+                let p = artifact_dir.join(arch::ONNX_WEIGHTS_FILENAME);
                 if p.exists() {
                     (vec![p], WeightsFormat::Onnx)
                 } else {
@@ -264,28 +260,26 @@ impl ModelResolver {
             });
         }
 
-        // Try standard config.json first, then OpenCLIP open_clip_config.json
-        let config_path = {
-            let standard = path.join("config.json");
-            let open_clip = path.join("open_clip_config.json");
-            if standard.exists() {
-                standard
-            } else if open_clip.exists() {
-                open_clip
-            } else {
-                return Err(JammiError::Model {
-                    model_id: source.to_string(),
-                    message: "Missing config.json or open_clip_config.json in model directory"
-                        .into(),
-                });
-            }
+        // The shared config chain (issue #421 D7) — same frozen precedence
+        // as the catalog-lookup arm above and the hub arm below.
+        let Some(config_path) = arch::config_candidates(path) else {
+            return Err(JammiError::Model {
+                model_id: source.to_string(),
+                message: "Missing config.json or open_clip_config.json in model directory".into(),
+            });
         };
         let config: serde_json::Value =
             serde_json::from_reader(std::fs::File::open(&config_path)?)?;
 
-        let has_safetensors = path.join("model.safetensors").exists()
-            || path.join("open_clip_model.safetensors").exists();
-        let has_onnx = path.join("model.onnx").exists();
+        // Every name comes from `arch` (issue #421 D7): `weights_candidates`
+        // returns the two safetensors names before `model.gguf`, so a
+        // non-GGUF hit is exactly the `has_safetensors` predicate — true
+        // whenever either safetensors name is present.
+        let candle_weights = arch::weights_candidates(path);
+        let has_safetensors = candle_weights
+            .as_ref()
+            .is_some_and(|p| !p.ends_with(GGUF_WEIGHTS_FILENAME));
+        let has_onnx = path.join(arch::ONNX_WEIGHTS_FILENAME).exists();
         let has_gguf = path.join(GGUF_WEIGHTS_FILENAME).exists();
 
         // Precedence FROZEN (issue #351): safetensors-or-onnx wins, byte-for-
@@ -311,24 +305,18 @@ impl ModelResolver {
         });
 
         let (weights_paths, weights_format) = match backend {
-            BackendType::Candle => {
-                let standard = path.join("model.safetensors");
-                let open_clip = path.join("open_clip_model.safetensors");
-                if standard.exists() {
-                    (vec![standard], WeightsFormat::Safetensors)
-                } else if open_clip.exists() {
-                    (vec![open_clip], WeightsFormat::Safetensors)
-                } else if has_gguf {
-                    (vec![path.join(GGUF_WEIGHTS_FILENAME)], WeightsFormat::Gguf)
-                } else {
+            BackendType::Candle => match candle_weights {
+                Some(p) if p.ends_with(GGUF_WEIGHTS_FILENAME) => (vec![p], WeightsFormat::Gguf),
+                Some(p) => (vec![p], WeightsFormat::Safetensors),
+                None => {
                     return Err(JammiError::Model {
                         model_id: source.to_string(),
                         message: "No safetensors weights found for Candle backend".into(),
                     });
                 }
-            }
+            },
             BackendType::Ort => {
-                let p = path.join("model.onnx");
+                let p = path.join(arch::ONNX_WEIGHTS_FILENAME);
                 if p.exists() {
                     (vec![p], WeightsFormat::Onnx)
                 } else {
@@ -395,10 +383,13 @@ impl ModelResolver {
     ) -> Result<ResolvedModel> {
         let repo = self.hf_api.model(repo_id.to_string());
 
-        // Try standard config.json first, then OpenCLIP open_clip_config.json
+        // NETWORK order, not disk order: a hub repo cannot be stat-ed, so
+        // this stays a `repo.get` chain. The NAMES and their order come from
+        // the shared list (issue #421 D7), so the hub arm can never look for
+        // a config file the local/catalog arms do not.
         let config_path = repo
-            .get("config.json")
-            .or_else(|_| repo.get("open_clip_config.json"))
+            .get(arch::CONFIG_CANDIDATE_NAMES[0])
+            .or_else(|_| repo.get(arch::CONFIG_CANDIDATE_NAMES[1]))
             .map_err(|e| JammiError::Model {
                 model_id: source.to_string(),
                 message: format!("Failed to download config: {e}"),
@@ -583,11 +574,12 @@ impl ModelResolver {
         repo: &hf_hub::api::sync::ApiRepo,
         source: &ModelSource,
     ) -> Result<Vec<PathBuf>> {
-        // Try standard naming first, then OpenCLIP naming
-        if let Ok(path) = repo.get("model.safetensors") {
+        // Try standard naming first, then OpenCLIP naming — the same two
+        // names, in the same order, the local chain walks (issue #421 D7).
+        if let Ok(path) = repo.get(arch::CANDLE_WEIGHTS_CANDIDATE_NAMES[0]) {
             return Ok(vec![path]);
         }
-        if let Ok(path) = repo.get("open_clip_model.safetensors") {
+        if let Ok(path) = repo.get(arch::CANDLE_WEIGHTS_CANDIDATE_NAMES[1]) {
             return Ok(vec![path]);
         }
         if let Ok(info) = repo.info() {
@@ -612,7 +604,7 @@ impl ModelResolver {
         repo: &hf_hub::api::sync::ApiRepo,
         source: &ModelSource,
     ) -> Result<Vec<PathBuf>> {
-        repo.get("model.onnx")
+        repo.get(arch::ONNX_WEIGHTS_FILENAME)
             .map(|p| vec![p])
             .map_err(|e| JammiError::Model {
                 model_id: source.to_string(),

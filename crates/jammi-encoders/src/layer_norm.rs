@@ -407,11 +407,12 @@ impl LayerNorm {
     /// `#[cfg(test)]`-module seam-test call sites (all three inside
     /// `direct_seam_non_layer_norm_keyed_prefix_containing_layer_norm_substring_is_not_aliased`
     /// — `vb.pp("sa_layer_norm")`, `.pp("LayerNormX")`, `.pp("LayerNorm")`)
-    /// are therefore NOT part of the 26-occurrence count below — and pins
+    /// are therefore NOT part of the 24-occurrence count below — and pins
     /// the exact set. As of this
-    /// writing there are 26 occurrences total — 22 production call sites
-    /// (`bert.rs` 3, `distilbert.rs` 3, `modernbert.rs` 4, `clip_text.rs` 3,
-    /// `open_clip_vision.rs` 4, `htsat_audio.rs` 5) plus 4 inside
+    /// writing there are 24 occurrences total — 20 production call sites
+    /// (`bert.rs` 3, `distilbert.rs` 3, `modernbert.rs` 4, `clip_text.rs` 1,
+    /// `open_clip_block.rs` 2, `open_clip_vision.rs` 2, `htsat_audio.rs` 5)
+    /// plus 4 inside
     /// `#[cfg(test)]` modules — of which exactly 4 PRODUCTION sites are
     /// `LayerNorm`-keyed: `bert.rs`'s `.pp("LayerNorm")`,
     /// `.pp("attention.output.LayerNorm")`, `.pp("output.LayerNorm")`, and
@@ -2970,7 +2971,7 @@ mod tests {
     /// module's own call-site-inventory claim (see `LayerNorm::new`'s doc).
     /// A previous version of that doc claimed "17 sites ... the only
     /// bare-`vb` call sites are `modernbert.rs:4216`, `9421-9423`" — every
-    /// part of that was wrong: there are 26 occurrences, not 17;
+    /// part of that was wrong: there are 24 occurrences, not 17;
     /// `9421`-`9423` are `.pp(..)`-scoped, not bare; and the single
     /// bare-`vb` site is `4216` alone. This test makes a future silent
     /// drift (a new `.pp("LayerNorm")` site, a newly-bare production call,
@@ -2985,10 +2986,15 @@ mod tests {
             );
         }
 
+        // 24, down from 26 at #421 W1: the two OpenCLIP towers' near-verbatim
+        // `ResidualAttentionBlock` copies (each with its own `ln_1`/`ln_2`
+        // pair) were collapsed into the single `crate::open_clip_block`, so
+        // two DUPLICATE sites disappeared. No site was added, removed from
+        // the model, or re-keyed.
         assert_eq!(
             sites.len(),
-            26,
-            "total LayerNorm::new(..) occurrence count drifted from the pinned 26 -- a call \
+            24,
+            "total LayerNorm::new(..) occurrence count drifted from the pinned 24 -- a call \
              site was added or removed; update this pin only after reviewing whether the \
              new/removed site is LayerNorm-keyed"
         );
@@ -2997,8 +3003,8 @@ mod tests {
         let test_only: Vec<&LayerNormNewCallSite> = sites.iter().filter(|s| s.is_test).collect();
         assert_eq!(
             production.len(),
-            22,
-            "production call-site count drifted from the pinned 22"
+            20,
+            "production call-site count drifted from the pinned 20"
         );
         assert_eq!(
             test_only.len(),

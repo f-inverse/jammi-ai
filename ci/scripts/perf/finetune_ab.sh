@@ -326,7 +326,7 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 # ten LIVE, STANDALONE `admit()`/`admit_cascade()`/`op_disabled()` op keys
 # this crate's fused finetune-step call graph actually reaches on a real
 # training step (confirmed at this contract's tip: `layer_norm_fused`
-# `crates/jammi-encoders/src/layer_norm.rs:582`, `geglu_fused`
+# `crates/jammi-encoders/src/layer_norm.rs:583`, `geglu_fused`
 # `crates/jammi-encoders/src/modernbert.rs:1424`, `gelu_erf_fused`
 # `crates/jammi-encoders/src/activations.rs:132`, `attention_block_flash`
 # `crates/jammi-encoders/src/modernbert.rs:1990` (`op_disabled`, the
@@ -336,13 +336,13 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 # `crates/jammi-encoders/src/modernbert.rs:484`, `softmax_last_dim_fused`
 # `crates/jammi-encoders/src/attention_cascade.rs:654` (moved out of
 # `crate::modernbert`, issue #462), `lora_linear_fused`
-# `crates/jammi-lora/src/lora_linear.rs:958`, `adamw_step_fused`
+# `crates/jammi-lora/src/lora_linear.rs:1007`, `adamw_step_fused`
 # `crates/jammi-ai/src/fine_tune/adamw.rs:259`, `mem_efficient_attention`
 # `crates/jammi-encoders/src/attention_cascade.rs:868` (`admit_cascade`, the
 # per-layer memeff cascade — consulted on EVERY training-mode attention
 # layer once the flash cascade has declined, BEFORE the block arm's own
 # `admit()`) and `op_disabled`
-# (`crates/jammi-encoders/src/modernbert.rs:2340`) is the once-per-forward
+# (`crates/jammi-encoders/src/modernbert.rs:2350`) is the once-per-forward
 # gate that suppresses the block/eager mask bundle when memeff is going to
 # fire.
 # `mem_efficient_attention` is the NINTH key, added by adversarial-audit

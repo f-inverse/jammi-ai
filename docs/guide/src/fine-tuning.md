@@ -239,14 +239,54 @@ job = db.fine_tune(
 
 Pick `target_modules` per the architecture you're fine-tuning:
 
-| Architecture | Common target_modules |
-|---|---|
-| BERT / RoBERTa / CamemBERT / XLM-RoBERTa | `["query", "value"]` (recommended) or `["query", "key", "value", "dense"]` |
-| DistilBERT | `["q_lin", "v_lin"]` or `["q_lin", "k_lin", "v_lin", "out_lin"]` |
-| ModernBERT | `["Wqkv", "Wo"]` (fused QKV + output) |
-| Any encoder | `["all-linear"]` — every linear layer gets an adapter (largest capacity) |
+| Architecture | Task | Common target_modules |
+|---|---|---|
+| BERT / RoBERTa / CamemBERT / XLM-RoBERTa | text | `["query", "value"]` (recommended) or `["query", "key", "value", "dense"]` |
+| DistilBERT | text | `["q_lin", "v_lin"]` or `["q_lin", "k_lin", "v_lin", "out_lin"]` |
+| ModernBERT | text | `["Wqkv", "Wo"]` (fused QKV + output) |
+| OpenCLIP text tower | `text_embedding` | `["in_proj", "out_proj"]` (attention) or `["in_proj", "out_proj", "c_fc", "c_proj"]` |
+| OpenCLIP vision tower | `image_embedding` | the same four names |
+| HTSAT-CLAP audio tower | `audio_embedding` | `["query", "value"]` or `["query", "key", "value", "attention_output", "intermediate_dense", "output_dense"]`; plus `["reduction"]` (patch-merging) and `["linear1", "linear2"]` (projection head) |
+| Any encoder | any | `["all-linear"]` — every linear layer gets an adapter (largest capacity) |
 
 Names match the trailing module-name segment in the HuggingFace weight layout. Suffix matching is the rule, so `"query"` matches `"attention.self.query"`.
+
+`in_proj` on the two OpenCLIP towers is the **fused QKV** projection — one site covering
+query, key and value, the way `Wqkv` does on ModernBERT.
+
+A `target_modules` list that matches nothing on the selected tower fails the job with an
+error naming that tower's real site names, rather than training an adapter with zero
+parameters.
+
+### Fine-tuning an image or audio tower
+
+The tower is selected by the job's **task**, not by a separate flag: an
+`image_embedding` job on an OpenCLIP checkpoint fine-tunes its vision tower, a
+`text_embedding` job on the same checkpoint fine-tunes its text tower, and an
+`audio_embedding` job on an HF-CLAP checkpoint fine-tunes its HTSAT audio tower. A task
+the base checkpoint has no tower for is refused before training starts, with a message
+naming the towers it does have.
+
+Media jobs read **triplets of encoded bytes** — three binary columns
+`anchor`, `positive`, `negative` holding whole files (PNG/JPEG/… for images, WAV/FLAC/
+MP3/Ogg for audio). The modality comes from the declared task and is never sniffed from
+the bytes, so passing an image corpus to an `audio_embedding` job is a decoding error,
+not a silently mis-encoded run. The three groups are encoded as one joined forward pass
+and then split.
+
+```python
+job = db.fine_tune(
+    source="image_triplets",
+    base_model="local:/models/open_clip_vit_b32",
+    columns=["anchor", "positive", "negative"],
+    method="lora",
+    task="image_embedding",
+    target_modules=["in_proj", "out_proj"],
+)
+```
+
+What makes a blob a "positive" — an augmentation of the anchor, a co-occurring item — is
+your data's concern; the triplet loss only separates whatever pairs you supply.
 
 ### Layer ranges and per-module ranks
 
@@ -254,6 +294,14 @@ Two optional refinements:
 
 - **`layers_to_transform`** — restrict injection to specific 0-based layer indices. `None` (default) applies to every layer.
 - **`rank_pattern`** — override `lora_rank` for individual modules. Keys are substring matches against the module name; values are the override rank.
+
+`layers_to_transform` indexes the **first numbered segment** of the weight name, matching
+PEFT's own rule. On the BERT family and the two OpenCLIP towers that is the transformer
+layer. On the HTSAT audio tower, whose blocks are named `layers.{stage}.blocks.{block}`,
+it is the **stage** index. A site that sits in no numbered unit at all — the CLAP audio
+projection head's `linear1`/`linear2` — is **excluded** whenever `layers_to_transform` is
+set, again matching PEFT: a restriction to specific layers cannot be satisfied by a module
+that belongs to no layer.
 
 ```rust,no_run
 # extern crate jammi_ai;
@@ -306,11 +354,44 @@ Projection-head example:
 }
 ```
 
+`model_type` records the base architecture the adapter was trained on — one of
+`bert`, `distilbert`, `modernbert`, `open_clip` (an OpenCLIP checkpoint, which ships no
+`model_type` field of its own) or `clap_audio_model`.
+
+A checkpoint that holds more than one tower carries one extra key, `tower`, naming which
+one the adapter installs on:
+
+```json
+{
+  "adapter_type": "encoder_adapters",
+  "model_type": "open_clip",
+  "lora_rank": 8,
+  "lora_alpha": 16.0,
+  "use_rslora": false,
+  "target_modules": ["in_proj", "out_proj"],
+  "layers_to_transform": null,
+  "rank_pattern": {},
+  "backbone_dtype": "f32",
+  "tower": "vision"
+}
+```
+
+The key is written only when it applies: a single-tower adapter's
+`adapter_config.json` carries no `tower` key at all.
+
 The Candle inference backend reads `adapter_config.json` on model load and
 dispatches on `adapter_type`: `encoder_adapters` rebuilds the encoder with
 frozen backbone weights plus the LoRA A/B from `adapter.safetensors`;
 `projection_head` loads the saved projection weights as a `LoraLinear`
 applied after pooling.
+
+Before any of that, the backend checks the adapter and the base agree on
+**architecture family**: an `open_clip` adapter on a CLAP base, a `clap_audio_model`
+adapter on a BERT base, or a `tower` the base checkpoint does not have, is refused with a
+typed error rather than loaded onto whatever the base happens to be. On an OpenCLIP base
+the adapted tower is rebuilt with the adapter's weights and the sibling tower is rebuilt
+frozen at the same backbone precision — a fine-tuned model has one identity and one
+precision.
 
 ### When to use each
 

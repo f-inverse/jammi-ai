@@ -611,6 +611,16 @@ impl LoraLinear {
     /// then this function); a quantized base (wave-3 GGUF loading) calls
     /// this directly with `FrozenBase::Quantized(..)`. See [`Self::new`]'s
     /// own doc for the rank/init/seed/dropout semantics, identical here.
+    ///
+    /// # One site, one adapter key
+    ///
+    /// On the TRAINING path (`vb` `VarMap`-backed), `varmap` must not
+    /// already hold `{vb.prefix()}.lora_a` / `.lora_b`: a second site under
+    /// the same prefix is a typed [`LoraError::Config`] refusal rather than
+    /// a silent alias of the first site's `Var`s. See the refusal's own
+    /// comment in the body for why a pre-existing key is never a legitimate
+    /// resume. The INFERENCE path (`vb` backed by an mmaped adapter file) is
+    /// unaffected — it never registers anything in `varmap`.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_base(
         base: FrozenBase,
@@ -630,17 +640,6 @@ impl LoraLinear {
         let out_features = base.out_features()?;
         let device = vb.device().clone();
 
-        // Fetch (or, in the training path, allocate + register) the A/B tensors.
-        // `Init::Const(0.0)` is deterministic so candle's RNG is never invoked.
-        // In the TRAINING path the `VarBuilder` is VarMap-backed: this registers
-        // fresh trainable `Var`s, which we then overwrite with the seeded draw.
-        // In the INFERENCE path the `VarBuilder` is mmaped-safetensors-backed:
-        // `get_with_hints` returns the SAVED adapter tensors and nothing is in
-        // the (dummy) VarMap — so the seeded fill is correctly skipped and the
-        // loaded weights stand.
-        let lora_a = vb.get_with_hints((rank, in_features), "lora_a", Init::Const(0.0))?;
-        let lora_b = vb.get_with_hints((out_features, rank), "lora_b", Init::Const(0.0))?;
-
         // Fully-qualified parameter names — the stable per-parameter draw key.
         // Built exactly as candle's `VarBuilder::path` joins them (no leading
         // dot when the prefix is empty) so they match the registered `Var` keys.
@@ -655,6 +654,29 @@ impl LoraLinear {
         let a_name = qualify("lora_a");
         let b_name = qualify("lora_b");
 
+        // Snapshot, BEFORE anything is registered, whether `varmap` already
+        // knows these names. Sampled here rather than after `get_with_hints`
+        // because that call is exactly what makes them present on the
+        // training path — see the collision refusal below.
+        let preexisting = {
+            let data = varmap
+                .data()
+                .lock()
+                .map_err(|_| LoraError::Config("seeded init: VarMap mutex poisoned".into()))?;
+            data.contains_key(&a_name) || data.contains_key(&b_name)
+        };
+
+        // Fetch (or, in the training path, allocate + register) the A/B tensors.
+        // `Init::Const(0.0)` is deterministic so candle's RNG is never invoked.
+        // In the TRAINING path the `VarBuilder` is VarMap-backed: this registers
+        // fresh trainable `Var`s, which we then overwrite with the seeded draw.
+        // In the INFERENCE path the `VarBuilder` is mmaped-safetensors-backed:
+        // `get_with_hints` returns the SAVED adapter tensors and nothing is in
+        // the (dummy) VarMap — so the seeded fill is correctly skipped and the
+        // loaded weights stand.
+        let lora_a = vb.get_with_hints((rank, in_features), "lora_a", Init::Const(0.0))?;
+        let lora_b = vb.get_with_hints((out_features, rank), "lora_b", Init::Const(0.0))?;
+
         // Only seed-init the parameters that were just registered as trainable
         // `Var`s in `varmap`. If they are absent, this is the load-from-adapter
         // inference path and the values `get_with_hints` returned are the saved
@@ -666,6 +688,33 @@ impl LoraLinear {
                 .map_err(|_| LoraError::Config("seeded init: VarMap mutex poisoned".into()))?;
             data.contains_key(&a_name) && data.contains_key(&b_name)
         };
+
+        // TRAINING PATH + a name this `VarMap` already held = two LoRA sites
+        // claiming one adapter key. `registered && preexisting` is the exact
+        // conjunction: `registered` says the `VarBuilder` above is
+        // `VarMap`-backed (the inference path reads an mmaped adapter file and
+        // never touches `varmap`), and `preexisting` says the name was there
+        // BEFORE this call registered anything.
+        //
+        // This can never be a resume. Candle's `VarMap::get` returns the
+        // ALREADY-REGISTERED `Var` for a name it has seen, so the second site
+        // would not get its own parameters at all — it would silently ALIAS
+        // the first site's, halving the trainable parameter count, feeding one
+        // gradient stream from two places, and exporting an adapter whose two
+        // sites are byte-identical. Every one of those is a confidently wrong
+        // number rather than an error, which is why this is a typed refusal at
+        // the construction edge instead of a doc note. A caller that genuinely
+        // wants to RESTORE saved values passes the adapter file through the
+        // `VarBuilder` (the inference path, untouched here) or calls
+        // `MaybeLoraLinear::load_weights` after construction.
+        if registered && preexisting {
+            return Err(LoraError::Config(format!(
+                "LoRA adapter key collision: `{a_name}` / `{b_name}` were already registered in \
+                 this VarMap before this site was built. Two sites cannot share an adapter key \
+                 — the second would alias the first's Vars instead of getting its own. Give \
+                 each site a distinct VarBuilder prefix."
+            )));
+        }
 
         if registered {
             let (a_values, b_values): (Vec<f32>, Vec<f32>) = match init_mode {
@@ -1035,6 +1084,16 @@ impl LoraLinear {
     /// References to the two trainable LoRA parameter tensors.
     pub fn trainable_params(&self) -> Vec<&Tensor> {
         vec![&self.lora_a, &self.lora_b]
+    }
+
+    /// The FROZEN base weight this layer wraps — read access only (a
+    /// `LoraLinear`'s base is immutable after construction, matching
+    /// `candle_nn::Linear`'s own convention). Reached from outside this
+    /// crate through [`crate::MaybeLoraLinear::base`], which is what a
+    /// consumer that must inspect a site's base tensor regardless of
+    /// whether an adapter is installed on it actually calls.
+    pub(crate) fn base(&self) -> &FrozenBase {
+        &self.base
     }
 
     /// This layer's dropout forward counter — the number of TRAINING

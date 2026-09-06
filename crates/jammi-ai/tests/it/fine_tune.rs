@@ -858,7 +858,7 @@ fn write_audio_corpus_and_golden(
 /// each clip, pair it with a same-family sibling (positive) and a
 /// different-family clip (negative). The "meaning" of the pairing is the
 /// caller's — the trainer only minimizes the contrastive objective.
-fn write_audio_triplets(dir: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn write_audio_triplets(dir: &std::path::Path) -> std::path::PathBuf {
     use arrow::array::{ArrayRef, BinaryArray, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;

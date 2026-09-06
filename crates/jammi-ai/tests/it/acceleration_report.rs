@@ -1768,3 +1768,105 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
          undetermined marker leg 2 asserts, got: {report}"
     );
 }
+
+/// A7 (issue #421): a MEDIA encoder-adapters job's acceleration report is a
+/// real measurement, not a probe failure.
+///
+/// RED at this unit's base commit, on BOTH assertions. `probe_acceleration`
+/// used to hand-build a `[1, 4]` token-id batch and call
+/// `AnyEncoder::forward` on it — which, on an audio (or vision) tower, is a
+/// modality mismatch that returns `Err`. The probe closure then degraded to
+/// `probe_ok = false`, so `ops` came back EMPTY and `flash.reason` came back
+/// `"probe_forward_failed"`: a job whose real training forward is perfectly
+/// healthy was recorded, durably and per-job, as having failed its
+/// acceleration probe. That is a fabricated negative — the exact
+/// never-fabricate contract esc-075 exists to hold — and it is invisible
+/// unless a test asserts the media arm specifically, because every BERT-family
+/// job in this file passes either way.
+///
+/// The fix is `AnyEncoder::probe_input`: the encoder builds the smallest
+/// shape-VALID batch for its own geometry, so the probe drives a real forward
+/// on every variant.
+///
+/// The two assertions are independent: `ops` non-empty proves the forward
+/// actually reached instrumented kernels, and the `flash` reason proves the
+/// report never labels this job with the failure sentinel. A build that
+/// silently reverted to a token-only probe fails both.
+#[serial(esc075_acceleration_report)]
+#[tokio::test(flavor = "multi_thread")]
+async fn media_encoder_adapters_job_probes_its_own_modality() {
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let _worker = EmbeddedWorker::spawn(&session).expect("default worker intervals are valid");
+
+    let triplets = crate::fine_tune::write_audio_triplets(dir.path());
+    session
+        .add_source(
+            "audio_triplets",
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", triplets.display())),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let job = session
+        .fine_tune(
+            "audio_triplets",
+            &("local:".to_string()
+                + common::cookbook_fixture("htsat_clap_tiny")
+                    .to_str()
+                    .unwrap()),
+            &[
+                "anchor".to_string(),
+                "positive".to_string(),
+                "negative".to_string(),
+            ],
+            FineTuneMethod::Lora,
+            ModelTask::AudioEmbedding,
+            Some(FineTuneConfig {
+                epochs: 1,
+                batch_size: 4,
+                lora_rank: 4,
+                warmup_steps: 0,
+                lr_schedule: LrSchedule::Constant,
+                validation_fraction: 0.0,
+                early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,
+                // Non-empty target_modules: the encoder-adapters arm, the only
+                // one that builds an encoder and runs the esc-075 probe.
+                target_modules: vec!["query".to_string(), "value".to_string()],
+                backbone_dtype: ComputePrecision::F32,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let record = wait_for_any_terminal(session.catalog(), &job.job_id).await;
+    let report = expect_determined_report(record.acceleration_report.as_deref());
+
+    let ops = report["ops"]
+        .as_object()
+        .unwrap_or_else(|| panic!("ops must be an object, got: {report}"));
+    assert!(
+        !ops.is_empty(),
+        "an audio encoder-adapters job's probe must DRIVE a real forward through the \
+         audio tower and measure at least one instrumented op — an empty ops map here \
+         means the probe never ran the tower at all, got: {report}"
+    );
+
+    let reason = report["flash"]["reason"]
+        .as_str()
+        .unwrap_or_else(|| panic!("flash.reason must be a string, got: {report}"));
+    assert_ne!(
+        reason, "probe_forward_failed",
+        "the probe forward succeeded (ops is non-empty), so the flash field must never \
+         report the probe-failure sentinel, got: {report}"
+    );
+}

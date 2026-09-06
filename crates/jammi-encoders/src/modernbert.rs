@@ -2139,6 +2139,16 @@ impl ModernBert {
         self.max_position_embeddings
     }
 
+    /// Dtype the FROZEN BACKBONE weights are materialised at — read off a
+    /// real weight (the word-embedding table), never a remembered builder
+    /// setting, so it stays true for a model built through `load` from an
+    /// arbitrary `VarBuilder` as well as one built through the builder's
+    /// `backbone_dtype`. See `crate::AnyEncoder::dtype` for the one caller
+    /// class this exists for.
+    pub fn dtype(&self) -> candle_core::DType {
+        self.word_embeddings.embeddings().dtype()
+    }
+
     /// Run the encoder and pool + L2-normalise the output, returning
     /// `[batch, hidden]`.
     pub fn forward(&self, input_ids: &Tensor, mask: &Tensor) -> Result<Tensor, EncoderError> {
@@ -2580,6 +2590,26 @@ impl ModernBert {
     }
 }
 
+/// The selector names a caller may write in `target_modules` to reach this
+/// family's LoRA sites — exactly the `module_name` arguments
+/// `ModernBertBuilder::build` passes to `LoraSite::build`, which is what
+/// [`jammi_lora::should_apply_lora`] matches against.
+///
+/// Same list, same order, as `modern_lora_sites`' names, which for THIS
+/// family coincide with the selectors (ModernBERT's adapter-key leaves are
+/// `attn.Wqkv` / `attn.Wo` / `mlp.Wi` / `mlp.Wo` — see the builder's own
+/// `site.build(module_name, lora_subpath, ..)` pairs, and `crate::bert`'s
+/// `LORA_SITE_NAMES` for a family where the two axes genuinely diverge).
+///
+/// `Wo` and `mlp.Wo` overlap by design: `should_apply_lora` matches
+/// `module_name.ends_with(target)`, so the bare `Wo` reaches BOTH sites
+/// while `mlp.Wo` reaches only the MLP one. Both are listed because both
+/// are names a site is really offered under. `AnyEncoder::lora_site_names`
+/// returns this, and a test asserts every entry selects at least one real
+/// site on a fixture while the union of all of them is exactly what
+/// `all-linear` selects.
+pub(crate) const LORA_SITE_NAMES: &[&str] = &["Wqkv", "Wo", "Wi", "mlp.Wo"];
+
 /// The four LoRA-wrappable linear sites of one ModernBERT layer paired with their
 /// `named_trainable_weights` site names.
 fn modern_lora_sites(layer: &ModernBertLayer) -> [(&'static str, &MaybeLoraLinear); 4] {
@@ -2893,7 +2923,9 @@ impl<'a, 'b> LoraSite<'a, 'b> {
         if should_apply_lora(
             target_name,
             self.lora.target_modules,
-            self.layer_idx,
+            // Always a numbered encoder layer — see `bert.rs`'s sibling note
+            // and `should_apply_lora`'s own doc.
+            Some(self.layer_idx),
             self.lora.layers_to_transform,
         ) {
             let rank = effective_rank(target_name, self.lora.lora_rank, self.lora.rank_pattern);

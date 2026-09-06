@@ -22,6 +22,7 @@ use crate::inference::adapter::BackendOutput;
 use crate::inference::{
     arrow_to_audio, arrow_to_images, arrow_to_texts, audio_preprocess, image_preprocess,
 };
+use crate::model::arch::EncoderFamily;
 use crate::model::tokenizer::{BatchEncoding, TokenizerWrapper};
 use crate::model::{
     LoadedModel, ModelDimensions, ModelTask, ResolvedModel, TokenizerSource, WeightsFormat,
@@ -1015,7 +1016,7 @@ fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestSlot>> {
     // alternate exists: a reload can only succeed while AT LEAST ONE of the
     // two is present.
     slots.push(RawSlot {
-        arms: ["config.json", "open_clip_config.json"]
+        arms: crate::model::arch::CONFIG_CANDIDATE_NAMES
             .into_iter()
             .map(|name| {
                 let path = model_dir.join(name);
@@ -1191,13 +1192,11 @@ fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestSlot>> {
     // appearing alongside an existing `model.safetensors` is exactly the
     // shape the resolver's own FROZEN precedence (safetensors wins) makes
     // invisible to a cold resolve, so it must be just as tracked here.
-    let known_weight_names = [
-        "model.safetensors",
-        "open_clip_model.safetensors",
-        "model.onnx",
-        "model.gguf",
-    ];
-    let weight_arms: Vec<RawArm> = known_weight_names
+    // Sourced from `model::arch` (issue #421 D7) so the tracked-candidate
+    // list and every resolution chain in the crate name the same files. The
+    // ORDER and CONTENT are unchanged, so the emitted digests are unchanged
+    // (pinned by `tests/it/content_digest.rs`).
+    let weight_arms: Vec<RawArm> = crate::model::arch::WEIGHTS_CANDIDATE_NAMES
         .into_iter()
         .map(|name| {
             let path = model_dir.join(name);
@@ -1236,7 +1235,7 @@ fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestSlot>> {
     // (b)-stale/(c)-refuse decision, which is keyed on the WRONG set of
     // arms for a conjunctive requirement.
     for weights in &resolved.weights_paths {
-        if known_weight_names
+        if crate::model::arch::WEIGHTS_CANDIDATE_NAMES
             .iter()
             .all(|name| weights != &model_dir.join(name))
         {
@@ -1741,6 +1740,22 @@ impl CandleModel {
     /// Convert token ID vectors into a candle Tensor on this model's device.
     pub(crate) fn tokens_to_tensor(&self, vecs: &[Vec<u32>]) -> Result<Tensor> {
         tokens_to_tensor(vecs, &self.device)
+    }
+
+    /// The CLAP fusion front-end geometry this model was loaded with (sample
+    /// rate, FFT size, hop, mel band), read off the checkpoint's own
+    /// `preprocessor_config.json` at load time. `None` for every non-audio
+    /// model.
+    ///
+    /// Exposed (issue #421 D8) so an encoder-adapters AUDIO fine-tune runs
+    /// the byte→spectrogram front end through the SAME geometry the serving
+    /// path uses. The trainer forwards the LoRA-wrapped tower directly rather
+    /// than through `forward_audio_embedding`, so without this accessor it
+    /// would have to construct a front-end config of its own — and a
+    /// front-end that differs from serving's by one mel filter trains an
+    /// embedding that serving can never reproduce.
+    pub(crate) fn audio_frontend(&self) -> Option<&audio_preprocess::ClapFrontendConfig> {
+        self.audio_frontend.as_ref()
     }
 
     /// The pooling strategy the text-embedding forward path ACTUALLY resolved
@@ -2506,11 +2521,16 @@ impl ModelBackend for CandleBackend {
         // exact input set, ordering invariant, and why it matters.
         let (fingerprint, content_digest) = compute_model_identity_facets(resolved)?;
 
-        let model_type = resolved
-            .model_config
-            .get("model_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("bert");
+        // The raw `model_type` SPELLING the text arm below dispatches on and
+        // every refusal message names, read through the ONE shared reader
+        // (`crate::model::arch::config_model_type`) rather than this site's own
+        // `unwrap_or("bert")`: for a declared string the shared reader answers
+        // with that string unchanged; for an absent (or non-string) key it
+        // answers `UNDECLARED_MODEL_TYPE_FAMILY`'s id, the SAME rule
+        // `EncoderFamily::from_config` applies. A `config.json` without a
+        // `model_type` therefore resolves to the same family here as it does
+        // at the fine-tune worker (issue #421 D7) — the two can never diverge.
+        let model_type = crate::model::arch::config_model_type(&resolved.model_config);
 
         // Per-model `compute_precision` in `config.json` wins over the global
         // `DeviceConfig` default; both default to `F32`. Read the same
@@ -2570,8 +2590,13 @@ impl ModelBackend for CandleBackend {
         // `ClapConfig`), and/or list `ClapModel`/`ClapAudioModelWithProjection`
         // in `architectures`. OpenCLIP vision checkpoints carry `model_cfg`.
         // The two are disjoint, so the audio branch is checked first.
-        let is_clap = is_hf_clap_config(&resolved.model_config);
-        let is_open_clip = !is_clap && resolved.model_config.get("model_cfg").is_some();
+        // The ONE architecture predicate (issue #421 D7): the same
+        // `EncoderFamily` the fine-tune worker dispatches on and the adapter
+        // load-seam below validates against, so a checkpoint can never be
+        // "CLAP" to one of them and "OpenCLIP" to the other.
+        let base_family = EncoderFamily::from_config(&resolved.model_config);
+        let is_clap = base_family == Some(EncoderFamily::ClapAudio);
+        let is_open_clip = base_family == Some(EncoderFamily::OpenClip);
 
         // Normalize DistilBERT config fields to standard BERT names — the
         // SAME normalization authority `gguf::gguf_num_layers` (below, and
@@ -2759,6 +2784,67 @@ impl ModelBackend for CandleBackend {
                 None
             }
         });
+        // Adapter IDENTITY validation (issue #421 D9), at the one seam where
+        // the saved adapter is read.
+        //
+        // Two questions, both answered FAMILY-to-FAMILY rather than
+        // string-to-string:
+        //
+        // 1. Does this adapter belong to this base at all? A `clap_audio_model`
+        //    adapter installed on an OpenCLIP checkpoint, or an `open_clip`
+        //    adapter on a BERT one, is a cross-family mismatch: without this
+        //    check it would resolve and load, then get silently DISCARDED —
+        //    the fine-tuning dropped with no signal, serving the unadapted
+        //    base under the fine-tuned model's id.
+        //    `EncoderFamily::from_adapter_model_type` maps every legacy/alias
+        //    text id onto `Bert` on purpose (see its doc), so this refusal
+        //    fires only on genuine cross-family mismatches and never on an
+        //    already-shipped BERT-family adapter.
+        //
+        // 2. Does the base actually HAVE the tower the adapter names? A
+        //    `vision` adapter on a single-tower text checkpoint has nowhere to
+        //    install. `tower: None` (every adapter written before the field
+        //    existed) is accepted everywhere; the multi-tower arms below
+        //    additionally require it to be present, because "which of two
+        //    towers" has no defensible default.
+        if let Some((cfg, _)) = &encoder_adapter {
+            // `None` means the architecture itself is one this backend has no
+            // loader for; the branch below refuses by name, which is strictly
+            // more informative than anything this check could add.
+            if let Some(base) = base_family {
+                let adapter_family = EncoderFamily::from_adapter_model_type(&cfg.model_type);
+                if adapter_family != base {
+                    return Err(JammiError::Model {
+                        model_id: resolved.model_id.0.clone(),
+                        message: format!(
+                            "saved adapter targets architecture family {adapter_family:?} \
+                             (adapter_config.json model_type '{}') but the base model is \
+                             {base:?} (model_type '{model_type}'); refusing to load an \
+                             adapter trained on a different architecture",
+                            cfg.model_type
+                        ),
+                    });
+                }
+                if !base.has_tower(cfg.tower) {
+                    return Err(JammiError::Model {
+                        model_id: resolved.model_id.0.clone(),
+                        message: format!(
+                            "saved adapter names tower {:?}, which a {base:?} base model does \
+                             not have (its towers: {})",
+                            cfg.tower,
+                            base.towers()
+                        ),
+                    });
+                }
+            }
+        }
+        // Which tower of a multi-tower checkpoint the adapter installs on.
+        // `None` here means either "no adapter at all" or "an adapter that
+        // did not say"; the multi-tower arms below distinguish the two.
+        let adapter_tower: Option<jammi_lora::Tower> =
+            encoder_adapter.as_ref().and_then(|(cfg, _)| cfg.tower);
+        let has_encoder_adapter = encoder_adapter.is_some();
+
         let encoder_owned = encoder_adapter.as_ref().map(|(cfg, _)| {
             (
                 cfg.target_modules.clone(),
@@ -2834,14 +2920,36 @@ impl ModelBackend for CandleBackend {
                     message: format!("Failed to parse CLAP audio config: {e}"),
                 })?;
             // HF-CLAP safetensors keys are rooted at `audio_model.audio_encoder.*`
-            // and `audio_projection.*`, so the tower loads from the root VarBuilder.
-            let audio_inner =
+            // and `audio_projection.*`, so the tower loads from the root
+            // VarBuilder (the builder scopes the same way).
+            //
+            // With a saved adapter, the tower is built through the SAME
+            // builder the BERT-family arms use — LoRA sites wrapped, A/B
+            // tensors read from `adapter.safetensors`, backbone materialised
+            // at the adapter's OWN persisted `backbone_dtype` (a fine-tuned
+            // model's backbone precision is its adapter's). With NO adapter
+            // the historical `load(vb, ..)` call is kept verbatim, so an
+            // unadapted base model's served bytes are unchanged (K4).
+            let audio_inner = if has_encoder_adapter {
+                HtsatAudio::builder()
+                    .lora(lora_build)
+                    .backbone_dtype(encoder_backbone_dtype)
+                    .adapter(encoder_adapter_file)
+                    .build(&weights_paths_ref, &audio_config, &device, &dummy_varmap)
+                    .map_err(|e| JammiError::Model {
+                        model_id: resolved.model_id.0.clone(),
+                        message: format!(
+                            "Failed to construct LoRA-adapted HTSAT-Swin CLAP audio tower: {e}"
+                        ),
+                    })?
+            } else {
                 HtsatAudio::load(vb.clone(), &audio_config, &device).map_err(|e| {
                     JammiError::Model {
                         model_id: resolved.model_id.0.clone(),
                         message: format!("Failed to construct HTSAT-Swin CLAP audio tower: {e}"),
                     }
-                })?;
+                })?
+            };
             (
                 None,
                 None,
@@ -2853,22 +2961,88 @@ impl ModelBackend for CandleBackend {
                     model_id: resolved.model_id.0.clone(),
                     message: format!("Failed to parse OpenCLIP vision config: {e}"),
                 })?;
-            let vision_inner = OpenClipVisionTransformer::load(vb.pp("visual"), &vision_config)
-                .map_err(|e| JammiError::Model {
-                    model_id: resolved.model_id.0.clone(),
-                    message: format!("Failed to construct OpenCLIP ViT: {e}"),
-                })?;
-
             let text_config = ClipTextConfig::from_open_clip_config(&resolved.model_config)
                 .map_err(|e| JammiError::Model {
                     model_id: resolved.model_id.0.clone(),
                     message: format!("Failed to parse OpenCLIP text config: {e}"),
                 })?;
-            let text_inner =
-                ClipText::load(vb.clone(), &text_config).map_err(|e| JammiError::Model {
-                    model_id: resolved.model_id.0.clone(),
-                    message: format!("Failed to construct OpenCLIP text tower: {e}"),
-                })?;
+
+            // An OpenCLIP checkpoint carries TWO independently adaptable
+            // towers under one architecture id, so `adapter_cfg.tower`
+            // decides which one receives the LoRA; the sibling is built
+            // frozen. Both are built at the SAME `encoder_backbone_dtype` —
+            // one model, one identity, one precision, the rule the
+            // BERT-family arms already follow — because that precision is
+            // folded into `ModelIdentity` and a checkpoint cannot honestly
+            // report two.
+            //
+            // With NO adapter both towers keep today's root-`vb`-at-
+            // `compute_dtype` construction verbatim, so an unadapted
+            // OpenCLIP base's served bytes are unchanged (K4).
+            let (vision_inner, text_inner) = if has_encoder_adapter {
+                let build_vision =
+                    |lora: jammi_lora::LoraBuildConfig<'_>, adapter: Option<&std::path::Path>| {
+                        OpenClipVisionTransformer::builder()
+                            .lora(lora)
+                            .backbone_dtype(encoder_backbone_dtype)
+                            .adapter(adapter)
+                            .build(&weights_paths_ref, &vision_config, &device, &dummy_varmap)
+                            .map_err(|e| JammiError::Model {
+                                model_id: resolved.model_id.0.clone(),
+                                message: format!("Failed to construct OpenCLIP ViT: {e}"),
+                            })
+                    };
+                let build_text =
+                    |lora: jammi_lora::LoraBuildConfig<'_>, adapter: Option<&std::path::Path>| {
+                        ClipText::builder()
+                            .lora(lora)
+                            .backbone_dtype(encoder_backbone_dtype)
+                            .adapter(adapter)
+                            .build(&weights_paths_ref, &text_config, &device, &dummy_varmap)
+                            .map_err(|e| JammiError::Model {
+                                model_id: resolved.model_id.0.clone(),
+                                message: format!("Failed to construct OpenCLIP text tower: {e}"),
+                            })
+                    };
+                match adapter_tower {
+                    Some(jammi_lora::Tower::Vision) => (
+                        build_vision(lora_build, encoder_adapter_file)?,
+                        build_text(jammi_lora::LoraBuildConfig::frozen(), None)?,
+                    ),
+                    Some(jammi_lora::Tower::Text) => (
+                        build_vision(jammi_lora::LoraBuildConfig::frozen(), None)?,
+                        build_text(lora_build, encoder_adapter_file)?,
+                    ),
+                    // `Some(Audio)` was already refused by the tower check at
+                    // the adapter seam; `None` is an adapter that names no
+                    // tower on a checkpoint that HAS two — there is no
+                    // defensible default, and guessing would install the
+                    // weights on the wrong tower.
+                    other => {
+                        return Err(JammiError::Model {
+                            model_id: resolved.model_id.0.clone(),
+                            message: format!(
+                                "saved adapter for an OpenCLIP checkpoint must name which \
+                                 tower it installs on (\"text\" or \"vision\") in \
+                                 adapter_config.json; found {other:?}"
+                            ),
+                        })
+                    }
+                }
+            } else {
+                (
+                    OpenClipVisionTransformer::load(vb.pp("visual"), &vision_config).map_err(
+                        |e| JammiError::Model {
+                            model_id: resolved.model_id.0.clone(),
+                            message: format!("Failed to construct OpenCLIP ViT: {e}"),
+                        },
+                    )?,
+                    ClipText::load(vb.clone(), &text_config).map_err(|e| JammiError::Model {
+                        model_id: resolved.model_id.0.clone(),
+                        message: format!("Failed to construct OpenCLIP text tower: {e}"),
+                    })?,
+                )
+            };
 
             (
                 Some(Box::new(OpenClipTextForward(text_inner)) as Box<dyn CandleTextForward>),
@@ -3209,31 +3383,15 @@ impl ModelBackend for CandleBackend {
     }
 }
 
-/// Detect an HF-CLAP audio checkpoint (`ClapAudioModelWithProjection` lineage)
-/// from its config: `model_type == "clap_audio_model"` at the top level (flat
-/// `ClapAudioConfig`) or under a nested `audio_config` (top-level `ClapConfig`),
-/// or `architectures` listing `ClapModel` / `ClapAudioModelWithProjection`.
+/// Detect an HF-CLAP audio checkpoint (`ClapAudioModelWithProjection`
+/// lineage) from its config.
+///
+/// Delegates to [`EncoderFamily::from_config`] (issue #421 D7), the ONE
+/// owner of the CLAP rules; this is the one-line shim the digest-slot
+/// predicate below still reads through, so there is exactly one
+/// CLAP-detection body in the crate.
 fn is_hf_clap_config(config: &serde_json::Value) -> bool {
-    let model_type_is_clap = |v: &serde_json::Value| {
-        v.get("model_type").and_then(|m| m.as_str()) == Some("clap_audio_model")
-    };
-    if model_type_is_clap(config) {
-        return true;
-    }
-    if config.get("audio_config").is_some_and(model_type_is_clap) {
-        return true;
-    }
-    config
-        .get("architectures")
-        .and_then(|a| a.as_array())
-        .is_some_and(|arch| {
-            arch.iter().any(|a| {
-                matches!(
-                    a.as_str(),
-                    Some("ClapModel") | Some("ClapAudioModelWithProjection")
-                )
-            })
-        })
+    EncoderFamily::from_config(config) == Some(EncoderFamily::ClapAudio)
 }
 
 /// Whether `preprocessor_config.json` is a REQUIRED digest candidate for

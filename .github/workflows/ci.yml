@@ -132,6 +132,12 @@ jobs:
           # python3-unavailable skip (KO-7 gate, see ci/kernel-oracle-helpers.txt)
           # must never fire silently here — a skip on this lane is a defect.
           JAMMI_REQUIRE_MEDIA_SMOKE: "1"
+          # This job's image is x86_64 Linux on an AMD EPYC 7763 — a PINNED
+          # platform for bits_snapshot.rs's K4 bit snapshot (KO-7 gate, see
+          # ci/kernel-oracle-helpers.txt), so its no-pinned-row skip must
+          # never fire silently here; a different runner CPU/ISA must add a
+          # lead-computed row, never skip.
+          JAMMI_REQUIRE_K4_SNAPSHOT: "1"
         run: cargo test --workspace --exclude jammi-python
 
       # Unification contract §6 F3 (round-2 audit B5): the designated

@@ -152,10 +152,17 @@ pub(crate) mod flash_attention;
 // carrying an independently-maintained CUDA-side copy — one definition per
 // op's domain check, not two that could silently drift apart.
 pub(crate) mod geglu;
-// `pub(crate)`, mirroring `geglu`'s own rationale: `crate::cuda::gelu_erf`
-// imports `check_domain` directly from here rather than carrying an
-// independently-maintained CUDA-side copy.
-pub(crate) mod gelu_erf;
+// FULLY `pub` (not `pub(crate)` like `geglu`/`layer_norm`'s own CUDA-glue
+// rationale): `crate::cuda::gelu_erf` still imports `check_domain`
+// directly from here (that fn itself stays `pub(crate)`, so this widening
+// changes nothing about ITS visibility), but this module ALSO carries
+// `COND_AWARE_TOL`/`COND_AWARE_ABS_FLOOR` — this crate's own design
+// constants for the condition-aware backward bound — which `jammi-encoders`'
+// gradcheck oracle for its `gelu_erf` seam (`activations::gelu_erf`) needs
+// to import (`jammi_kernels::ops::gelu_erf::{COND_AWARE_TOL,
+// COND_AWARE_ABS_FLOOR}`) rather than hand-copying, so those two crates'
+// bounds cannot silently drift apart.
+pub mod gelu_erf;
 pub(crate) mod layer_norm;
 // NOT an op module (the only one in this list): the CUDA launch-domain
 // facts every op's CUDA glue shares — the `u32::MAX` element-count

@@ -388,6 +388,18 @@ pub fn op_disabled(op: &'static str) -> bool {
 /// precedent to [`admit`]): the predicate is not even consulted, `Strict`
 /// does not turn it into an error, and the decline is recorded in
 /// `declined` (not `eager` — see [`CascadeDispatchCounters`]'s doc).
+///
+/// **Every decline also records `(op, predicate)` into the SAME
+/// probe-capture window `admit_inner` uses** (`record_probe_miss`, this
+/// module's "probe-window capture sink" section) — a channel this function
+/// used to leave closed, recording declines as counter increments only.
+/// The disabled branch records [`DISABLED_PREDICATE_KEY`]; `DomainMiss` and
+/// `CapabilityMiss` record `predicate_name`, `CapabilityMiss` BEFORE the
+/// `mode` match so a `Strict`-mode hard error still lands an entry (mirrors
+/// `admit_inner`'s own placement). A caller with an armed
+/// [`probe_capture_begin`] window can therefore read
+/// [`probe_capture_reason_for`] for a cascade op exactly as it would for a
+/// two-arm [`admit`] op.
 pub fn admit_cascade(
     mode: AdmissionMode,
     op: &'static str,
@@ -398,6 +410,10 @@ pub fn admit_cascade(
 ) -> Result<CascadeOutcome> {
     if op_is_disabled(disabled_ops(), fired_disables(), op) {
         counters.declined.fetch_add(1, Ordering::Relaxed);
+        // Campaign #446 finding 3's channel, closed here too (audit round,
+        // item 3): the SAME probe-capture window `admit_inner` records
+        // into, independent of `warn_disabled_once`'s log-once dedupe.
+        record_probe_miss(op, DISABLED_PREDICATE_KEY);
         warn_disabled_once(op);
         return Ok(CascadeOutcome::Declined);
     }
@@ -408,10 +424,17 @@ pub fn admit_cascade(
         }
         PredicateOutcome::DomainMiss => {
             counters.declined.fetch_add(1, Ordering::Relaxed);
+            record_probe_miss(op, predicate_name);
             Ok(CascadeOutcome::Declined)
         }
         PredicateOutcome::CapabilityMiss => {
             counters.declined.fetch_add(1, Ordering::Relaxed);
+            // Recorded BEFORE the `mode` match, mirroring `admit_inner`'s
+            // own placement: a `Strict`-mode hard error returns from the
+            // arm below without ever reaching a log call, and a window
+            // that saw `declined` move but has no entry for why would be
+            // exactly the blind spot this sink exists to close.
+            record_probe_miss(op, predicate_name);
             match mode {
                 AdmissionMode::Fallback => Ok(CascadeOutcome::Declined),
                 AdmissionMode::Strict => {
@@ -651,6 +674,22 @@ pub fn fallback_warnings_emitted() -> Vec<FallbackWarning> {
 // SECOND, independent channel: while armed, `admit_inner`'s miss path ALWAYS
 // records `(op, predicate)` here, whatever the log-once dedupe decides (which
 // stays exactly as it is, for logging).
+//
+// **`admit_cascade`'s decline path uses this SAME sink (audit round,
+// jammi-kernels item 3).** `admit_cascade` used to record a decline as a
+// counter increment only — `probe_capture_reason_for` had no entry for a
+// cascade op at all, so a caller (e.g. `jammi-ai`'s esc-075 probe) could see
+// `attention_block_flash`'s `declined` counter move but never learn WHY.
+// Every one of `admit_cascade`'s three decline shapes (disabled,
+// `DomainMiss`, `CapabilityMiss` — including the `Strict`+`CapabilityMiss`
+// hard-error case, recorded BEFORE the mode match for the same reason
+// `admit_inner` records before ITS mode match) now calls
+// [`record_probe_miss`] with the identical `(op, predicate)` shape, so
+// `probe_capture_reason_for("attention_block_flash")` reads
+// `flash_transport_not_wired` for a BERT-family forward exactly the way it
+// reads a two-arm op's predicate name. The counters this closes NOTHING
+// about: `CascadeDispatchCounters`'s `fused`/`declined` fields are
+// unchanged, byte-identical to before this addition.
 
 /// The predicate key `warn_disabled_once` logs and the sink records for a
 /// `JAMMI_KERNELS_DISABLE`-forced eager arm. Hoisted to a `const` so the two
@@ -1733,7 +1772,7 @@ impl ProbedOp {
 /// | `rope` | TwoArm | `rope_fused` | `rope_fused`, `crates/jammi-encoders/src/modernbert.rs:190` |
 /// | `softmax` | TwoArm | `softmax_last_dim_fused` | `softmax_last_dim_fused`, `crates/jammi-encoders/src/modernbert.rs:204` |
 /// | `geglu` | TwoArm | `geglu_fused` | `geglu_fused`, `crates/jammi-encoders/src/modernbert.rs:1900` |
-/// | `gelu_erf` | TwoArm | `gelu_erf_fused` | `gelu_erf_fused`, `crates/jammi-kernels/src/ops/gelu_erf.rs`'s `GeluErfFused::name()` — the KERNEL side of this row lands in this same commit; its `admit()` CALL SITE (`jammi-encoders::activations::gelu_erf`, wired at `bert.rs:192`/`distilbert.rs:142`) is a COMPANION branch of this same contract (#462/#463's shared unit), landing in a separate commit the lead merges alongside this one — recorded here now (rather than only once that branch merges) so the two branches' `PROBED_OPS` enumeration is the SAME static fact from either branch's point of view, per this contract's own inter-branch sequencing. Until that companion branch merges, this row's registry key is real (`GeluErfFused::name()` returns it) but UNREACHABLE — no `admit()` call in the tree passes it yet, so a probe run before that merge reads `{fused: 0, eager: 0}` for it, same as any other never-yet-dispatched op. |
+/// | `gelu_erf` | TwoArm | `gelu_erf_fused` | `gelu_erf_fused`, `crates/jammi-kernels/src/ops/gelu_erf.rs`'s `GeluErfFused::name()`; the `admit()` CALL SITE is `crates/jammi-encoders/src/activations.rs`'s `gelu_erf(x, training)`, reachable on every training-mode erf-GELU call for a head_dim-agnostic BERT-family MLP — `BertIntermediate::forward` (`bert.rs:296`) and `DistilBertFfn::forward` (`distilbert.rs:211`) both call it. |
 /// | `attention_block` | TwoArm | `attention_block_fused` | `attention_block_fused`, `crates/jammi-encoders/src/modernbert.rs:684` |
 /// | `dropout` | TwoArm | `lora_linear_fused` | `lora_linear_fused`, `crates/jammi-lora/src/lora_linear.rs:958` (`admit` call site) |
 /// | `low_rank_residual_linear` | TwoArm | `lora_linear_fused` | `lora_linear_fused`, `crates/jammi-lora/src/lora_linear.rs:958` (`admit` call site) |
@@ -3118,6 +3157,126 @@ mod tests {
         .expect("undisabled Holds never errors");
         assert_eq!(outcome, CascadeOutcome::Fused);
         assert_eq!(counters.snapshot().fused, 1);
+    }
+
+    /// Audit round, item 3: `admit_cascade`'s decline path used to be a
+    /// counter-increment-only channel — `probe_capture_reason_for` had no
+    /// entry for a cascade op at all, however armed the window was.
+    /// Mirrors `armed_window_records_a_miss_even_when_the_log_once_dedupe_
+    /// suppresses_it`'s shape for `admit_inner`, one level up: window OPEN
+    /// -> a `DomainMiss` decline -> the reason is readable afterward;
+    /// window CLOSED -> a later decline records nowhere (the same "hot
+    /// path allocates/records nothing while unarmed" property
+    /// `unarmed_admit_records_nothing_and_keeps_the_sink_none` pins for
+    /// `admit_inner`).
+    #[test]
+    fn cascade_decline_feeds_the_same_probe_capture_window_admit_inner_uses() {
+        let counters = CascadeDispatchCounters::new();
+
+        // Window OPEN.
+        let guard = probe_capture_begin();
+        let outcome = admit_cascade(
+            AdmissionMode::Fallback,
+            "cascade_probe_test_op",
+            "cascade_probe_test_predicate",
+            PredicateOutcome::DomainMiss,
+            false,
+            &counters,
+        )
+        .expect("DomainMiss never errors under Fallback");
+        assert_eq!(outcome, CascadeOutcome::Declined);
+        let window = guard.finish();
+        assert_eq!(
+            probe_capture_reason_for(&window, "cascade_probe_test_op"),
+            Some("cascade_probe_test_predicate"),
+            "an armed window must capture a cascade decline's (op, predicate) pair exactly \
+             the way it captures admit_inner's"
+        );
+
+        // Window CLOSED: a decline with no window armed must not leak into
+        // a window armed afterward.
+        assert!(!probe_capture_is_armed());
+        let outcome = admit_cascade(
+            AdmissionMode::Fallback,
+            "cascade_probe_test_op_unarmed",
+            "cascade_probe_test_predicate",
+            PredicateOutcome::CapabilityMiss,
+            true,
+            &counters,
+        )
+        .expect("CapabilityMiss with next_arm_can_run never errors under Fallback");
+        assert_eq!(outcome, CascadeOutcome::Declined);
+        let later_window = probe_capture_begin().finish();
+        assert!(
+            later_window.is_empty(),
+            "a decline recorded with no window armed must not resurface in a window armed \
+             afterward, got {later_window:?}"
+        );
+    }
+
+    /// The disabled branch records `DISABLED_PREDICATE_KEY`, not
+    /// `predicate_name` — mirrors `admit_inner`'s own disabled-path record
+    /// (`record_probe_miss(op, DISABLED_PREDICATE_KEY)`), so a probe
+    /// reader distinguishes "deliberately disabled" from "domain predicate
+    /// failed" for a cascade op the identical way it does for a two-arm
+    /// one. Hermetic like `cascade_disabled_wins_over_holds_and_over_strict`
+    /// above: cannot drive the REAL disabled branch without the env var, so
+    /// this proves the reachable half (`op_disabled` is false, `Holds`
+    /// records nothing into the window) and leaves the disabled-record
+    /// line's correctness to code inspection plus `admit_inner`'s own
+    /// identically-shaped, already-tested call.
+    #[test]
+    fn cascade_holds_records_nothing_into_an_armed_probe_window() {
+        let counters = CascadeDispatchCounters::new();
+        let guard = probe_capture_begin();
+        let outcome = admit_cascade(
+            AdmissionMode::Strict,
+            "cascade_probe_test_op_holds",
+            "cascade_probe_test_predicate_holds",
+            PredicateOutcome::Holds,
+            true,
+            &counters,
+        )
+        .expect("Holds never errors");
+        assert_eq!(outcome, CascadeOutcome::Fused);
+        let window = guard.finish();
+        assert!(
+            window.is_empty(),
+            "a Holds outcome (this arm fires) must not record a miss, got {window:?}"
+        );
+    }
+
+    /// `CapabilityMiss` under `Strict` with no next arm returns `Err` --
+    /// this cell proves the probe window still captures the reason BEFORE
+    /// that error propagates, matching this function's own doc ("recorded
+    /// BEFORE the mode match, mirroring `admit_inner`'s own placement").
+    #[test]
+    fn cascade_strict_capability_miss_hard_error_still_records_into_the_probe_window() {
+        let counters = CascadeDispatchCounters::new();
+        let guard = probe_capture_begin();
+        let err = admit_cascade(
+            AdmissionMode::Strict,
+            "cascade_probe_test_op_strict_err",
+            "cascade_probe_test_predicate_strict_err",
+            PredicateOutcome::CapabilityMiss,
+            false,
+            &counters,
+        )
+        .expect_err("Strict CapabilityMiss with no next arm must hard-error");
+        assert!(matches!(
+            err,
+            KernelError::StrictModeFallback {
+                op: "cascade_probe_test_op_strict_err",
+                predicate: "cascade_probe_test_predicate_strict_err"
+            }
+        ));
+        let window = guard.finish();
+        assert_eq!(
+            probe_capture_reason_for(&window, "cascade_probe_test_op_strict_err"),
+            Some("cascade_probe_test_predicate_strict_err"),
+            "a Strict-mode hard error must not skip the probe-capture record — the window \
+             would otherwise see `declined` move (via the counter) with no entry for why"
+        );
     }
 
     #[test]

@@ -246,6 +246,53 @@ fn bf16_relative_bound(reference: f32, floor: f32, k: f32) -> f32 {
     k * bf16_ulp(reference.abs().max(floor))
 }
 
+/// [`f32_two_term_bound`]'s bf16 analogue — a per-element RELATIVE term
+/// (`k_rel * bf16_ulp(|reference|)`, bf16-scale — this is a comparison of
+/// two bf16-rounded outputs) plus an ADDITIVE, POD-MEASURED absolute term
+/// at the OPERANDS' own scale, but at F32 granularity
+/// (`k_abs * f32_ulp(operand_amplitude)`) — see the "why F32, not bf16"
+/// paragraph below.
+///
+/// Exists for exactly the case [`bf16_relative_bound`]'s single
+/// `max`-keyed floor cannot cover (guide §3.8's objection, reproduced one
+/// level up for bf16): `GeluErfFused`'s forward/backward at a genuinely
+/// LARGE `|x|` (not a tiny one) can still land on a genuinely TINY
+/// `Phi(x)` (or `Phi(x)+x*phi(x)`) — the mathematical CDF decays toward
+/// 0/1 in the tails — and this crate's two independent CDF routines
+/// (`libm::erff`'s polynomial vs CUDA's hardware `normcdff`, `ops::
+/// gelu_erf`'s module doc's "three cdf formulations", items 1/2) do not
+/// suffer the SAME catastrophic-cancellation loss at the SAME `x`: one can
+/// round the CDF all the way to an exact `0.0`/`1.0` while the other
+/// retains a nonzero residual. `measured_near_zero_floor` keys its floor
+/// to "the smallest nonzero reference value ANYWHERE in this run's
+/// fixture" — a property of whatever else happens to be in the array, not
+/// of the OPERAND that produced this particular tiny output — so it can
+/// under-floor exactly this element.
+///
+/// **Why the absolute term is `f32_ulp(operand_amplitude)`, not
+/// `bf16_ulp(operand_amplitude)`, even though this leg compares bf16
+/// outputs**: the divergence this term covers is generated BEFORE any
+/// bf16 rounding — both `erff` and `normcdff` compute the CDF at F32
+/// precision on `f32(x)` (module doc: CUDA's own `cdf16 =
+/// round16(normcdff(f32(x)))` rounds to bf16 only AFTER computing at
+/// F32), so the cross-library gap this term bounds is itself an F32-scale
+/// quantity, `|Δout| ~= |x| * |Δcdf|_{f32}`. An audit-round pod run
+/// confirmed this empirically: `bf16_ulp(operand_amplitude)` (one bf16
+/// ULP at the input's own ~10-magnitude scale, `~0.0625`) over-floors by
+/// ~4-5 orders of magnitude relative to the observed divergence
+/// (`~1e-8`-`1e-7`), inflating `assert_relative_bound`'s bound enough to
+/// make the KO-1 forced-defect control (`gelu_erf bf16 dx (KO-1)`) stop
+/// discriminating on the smallest fixture (`gelu_erf_parity_contiguous_small`,
+/// `n=32`: 0 violations, worst `Δ/bound = 0.67`) — exactly guide §3.8's
+/// failure mode from the OTHER direction (a floor so generous it hides
+/// the very defect the control exists to catch). `f32_ulp` fixed both
+/// legs simultaneously: still >= 2x headroom on the real divergence, and
+/// the KO-1 control discriminates again on every fixture width (see this
+/// branch's hand-off report for the re-run's per-leg ratios).
+fn bf16_two_term_bound(reference: f32, operand_amplitude: f32, k_rel: f32, k_abs: f32) -> f32 {
+    k_rel * bf16_ulp(reference) + k_abs * f32_ulp(operand_amplitude)
+}
+
 /// [`measured_near_zero_floor`]'s F16 twin: the smallest STRICTLY POSITIVE
 /// `|reference|` this run's own comparison array produced, or (all-zero)
 /// f16's own smallest representable positive (subnormal) magnitude —
@@ -4632,6 +4679,18 @@ fn gelu_erf_correct_bwd_f64(xv: &[f32], dyv: &[f32]) -> Vec<f32> {
 /// headroom on every leg below (this crate's own campaign convention) and
 /// tighten or widen this constant from that measurement, per this crate's
 /// process for every OTHER `k_abs`/`k` constant in this file.
+///
+/// **Re-derivation protocol (audit round, item 4): read it off the pod
+/// log, do not re-measure by hand.** `assert_relative_bound`/
+/// `assert_relative_bound_indexed` (this file, above) already `eprintln!`s
+/// `"{label}: n=.. max|Δ|=.. max_bound=.. worst Δ/bound=.."` for EVERY leg
+/// that calls them — including `"gelu_erf f32 dx"` and
+/// `"gelu_erf f32 dx vs f64 closed-form truth"`, the two legs this
+/// constant gates. A pod run of `cuda_parity` captures both lines; the
+/// printed `worst Δ/bound` ratio (which must be `<= 0.5` for >=2x
+/// headroom under this constant's current value) is the number a
+/// follow-on commit tightens or widens this constant from — never a
+/// number re-derived by hand outside that log.
 const F32_GELU_ERF_NORMCDF_ULPS: f32 = 8.0;
 
 /// The BF16/F16 leg's own `k`, for the SAME "not yet pod-measured" reason
@@ -4640,7 +4699,48 @@ const F32_GELU_ERF_NORMCDF_ULPS: f32 = 8.0;
 /// two-rounding-point structure GeGLU's own derivation covers: round the
 /// CDF, then round the product), pending the pod's own re-derivation from
 /// a real measured worst-case ratio.
+///
+/// **Re-derivation protocol: the SAME printed readout
+/// [`F32_GELU_ERF_NORMCDF_ULPS`]'s doc describes**, one dtype down: this
+/// constant gates `"gelu_erf bf16 fwd vs f32 truth"` (as the `k_rel` term
+/// of [`bf16_two_term_bound`] — see [`GELU_ERF_BF16_FWD_ABS_ULPS`] for the
+/// separate `k_abs` term that same leg needs), `"gelu_erf bf16 dx vs f32
+/// truth"`, `"gelu_erf bf16 dx truth vs f64 closed-form"`, `"gelu_erf f16
+/// fwd vs f32 truth"`, and `"gelu_erf f16 dx vs f32 truth"` — five printed
+/// `worst Δ/bound` lines per pod run, one per leg, each independently
+/// re-derivable from its own printed ratio.
 const GELU_ERF_16BIT_ULPS: f32 = 3.0;
+
+/// The bf16 FORWARD-vs-f32-truth leg's own `k_abs` (see
+/// [`bf16_two_term_bound`]'s doc for the mechanism this term covers: a
+/// genuinely-tiny `Phi(x)` in the tails, where the CPU's `erff`-based
+/// formula and CUDA's `normcdff` intrinsic do not cancel identically).
+/// Seeded at the SAME order of magnitude as
+/// [`F32_GELU_ERF_NORMCDF_ULPS`]'s own cross-CDF-library gap, one dtype
+/// down (`no-producer: derived by analogy, not yet an independent
+/// measurement`) pending pod re-derivation — an A100 pod run (audit
+/// round, `fix/463-audit-kernels`, `ssh jammi-cam`) exercised the three
+/// `gelu_erf_parity_*` legs that call this constant
+/// (`gelu_erf_parity_contiguous_small`, `_production_width`,
+/// `_non_multiple_of_launch_block`) and confirmed this value fixes the
+/// leg with real headroom; see [`F32_GELU_ERF_NORMCDF_ULPS`]'s doc for the
+/// general re-derivation protocol (read `assert_relative_bound`'s printed
+/// `worst Δ/bound` off the pod log — the `"gelu_erf bf16 fwd vs f32
+/// truth"` line is this constant's own).
+const GELU_ERF_BF16_FWD_ABS_ULPS: f32 = 8.0;
+
+/// The bf16 BACKWARD-vs-f32-truth leg's own `k_abs` — the SAME mechanism
+/// [`GELU_ERF_BF16_FWD_ABS_ULPS`]'s doc describes, one derivative deeper:
+/// `Phi(x)+x*phi(x)` decays in the tails exactly like `Phi(x)` alone does,
+/// so this leg's `dx` can ALSO land on a genuinely-tiny gradient at a
+/// large `|x|`, where the two CDF/PDF routines' own tail rounding does
+/// not cancel identically. Pod-confirmed (audit round,
+/// `fix/463-audit-kernels`) to fix the leg (previously a hard failure at
+/// [`measured_near_zero_floor`]'s max-keyed floor — guide §3.8) with real
+/// headroom; see [`F32_GELU_ERF_NORMCDF_ULPS`]'s doc for the general
+/// re-derivation protocol (`"gelu_erf bf16 dx vs f32 truth"`'s printed
+/// `worst Δ/bound` is this constant's own readout).
+const GELU_ERF_BF16_DX_ABS_ULPS: f32 = 8.0;
 
 fn assert_gelu_erf_parity_f32(cuda: &Device, n: usize, xv: &[f32]) {
     let cpu = Device::Cpu;
@@ -4809,9 +4909,24 @@ fn assert_gelu_erf_parity_bf16(cuda: &Device, n: usize, xv: &[f32]) {
              bit-identical"
         );
     }
+    // Leg 2: forward vs the F32 truth, within a TWO-TERM bound (guide
+    // §3.8's max-keyed-floor objection, applied to bf16): the relative
+    // term stays [`GELU_ERF_16BIT_ULPS`] bf16 ULPs of `reference`, but the
+    // absolute floor is keyed to the INPUT fixture's own amplitude
+    // (`max_abs(xv)`), not to "whatever else this run's array happens to
+    // contain" the way [`measured_near_zero_floor`] is — see
+    // [`bf16_two_term_bound`]'s own doc for why a large `|x|` landing on a
+    // genuinely-tiny, tail-decayed `Phi(x)` needs exactly this shape.
     let out_gpu_v: Vec<f32> = out_gpu_bits.iter().map(|v| v.to_f32()).collect();
-    let out_floor = measured_near_zero_floor(&out_truth_v);
-    let out_bound = |r: f32| bf16_relative_bound(r, out_floor, GELU_ERF_16BIT_ULPS);
+    let out_amplitude = max_abs(xv);
+    let out_bound = |r: f32| {
+        bf16_two_term_bound(
+            r,
+            out_amplitude,
+            GELU_ERF_16BIT_ULPS,
+            GELU_ERF_BF16_FWD_ABS_ULPS,
+        )
+    };
     assert_relative_bound(
         "gelu_erf bf16 fwd vs f32 truth",
         &out_truth_v,
@@ -4838,8 +4953,24 @@ fn assert_gelu_erf_parity_bf16(cuda: &Device, n: usize, xv: &[f32]) {
         .to_vec1()
         .unwrap();
     assert_eq!(dx_gpu_v.len(), n, "gelu_erf bf16 GPU dx length mismatch");
-    let dx_floor = measured_near_zero_floor(&dx_truth);
-    let dx_bound = |r: f32| bf16_relative_bound(r, dx_floor, GELU_ERF_16BIT_ULPS);
+    // Same TWO-TERM shape as the forward leg above, for the identical
+    // reason (a pod run first surfaced this leg failing the SAME way): the
+    // backward's own `Phi(x)+x*phi(x)` term decays in the tails exactly
+    // like the forward's `Phi(x)` does, so a `measured_near_zero_floor`
+    // (keyed to whatever else this run's `dx_truth` array contains) can
+    // under-floor an element whose OWN `x` is large but whose gradient has
+    // decayed to near-zero. Floored at the INPUT fixture's own amplitude
+    // instead, mirroring the f32 leg's `dx_floor = max_abs(xv)` above one
+    // level up in `assert_gelu_erf_parity_f32`.
+    let dx_amplitude = max_abs(&xv_from_bf16);
+    let dx_bound = |r: f32| {
+        bf16_two_term_bound(
+            r,
+            dx_amplitude,
+            GELU_ERF_16BIT_ULPS,
+            GELU_ERF_BF16_DX_ABS_ULPS,
+        )
+    };
     assert_relative_bound(
         "gelu_erf bf16 dx vs f32 truth",
         &dx_truth,

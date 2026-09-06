@@ -32,6 +32,21 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+/// KO-7 require-gate helper for every `python3`-unavailable skip below (to
+/// be registered in `ci/kernel-oracle-helpers.txt`): a lane that
+/// specifically wants to prove the media end-to-end legs (the hermetic CI
+/// runner, which has `python3`) sets `JAMMI_REQUIRE_MEDIA_SMOKE` — if that
+/// lane's box unexpectedly cannot launch `python3` (so the producer, and
+/// therefore the whole leg, cannot be observed), this is a hard failure,
+/// never a silent skip.
+fn media_producer_require_gate() {
+    if std::env::var_os("JAMMI_REQUIRE_MEDIA_SMOKE").is_some() {
+        panic!(
+            "finetune_run_media_smoke: python3 is not runnable but JAMMI_REQUIRE_MEDIA_SMOKE is set; a silent skip is not acceptable"
+        );
+    }
+}
+
 /// Run one committed producer into `out_dir`. Returns `false` (having said
 /// so on stderr) when `python3` cannot be launched at all; panics when the
 /// producer itself fails, which is a real regression, not an environment gap.
@@ -215,6 +230,7 @@ fn image_embedding_leg_runs_end_to_end_over_the_committed_producer() {
         // fixed-shape premise this producer exists for.
         &["--size", "8"],
     ) {
+        media_producer_require_gate();
         return;
     }
     let work_dir = tmp.path().join("work");
@@ -255,6 +271,7 @@ fn audio_embedding_leg_runs_end_to_end_over_the_committed_producer() {
         8,
         &["--seconds", "0.1", "--sample-rate", "16000"],
     ) {
+        media_producer_require_gate();
         return;
     }
     let work_dir = tmp.path().join("work");
@@ -304,6 +321,7 @@ fn text_embedding_leg_selects_the_clip_text_tower_of_the_same_checkpoint() {
         Ok(o) => o,
         Err(e) => {
             eprintln!("python3 is not runnable here ({e}); the CLIP-text leg was NOT exercised");
+            media_producer_require_gate();
             return;
         }
     };

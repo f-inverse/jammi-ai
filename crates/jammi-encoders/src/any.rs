@@ -224,36 +224,61 @@ impl AnyEncoder {
     /// `[batch, 3, h, w]` pixel tensor are both "just tensors" to a
     /// downstream matmul).
     pub fn forward_input(&self, input: &EncoderInput<'_>) -> Result<Tensor, EncoderError> {
-        match (self, input) {
-            (
-                Self::Bert(_) | Self::DistilBert(_) | Self::ModernBert(_) | Self::ClipText(_),
-                EncoderInput::Text {
-                    input_ids,
-                    attention_mask,
-                },
-            ) => match self {
-                Self::Bert(e) => e.forward(input_ids, attention_mask),
-                Self::DistilBert(e) => e.forward(input_ids, attention_mask),
-                Self::ModernBert(e) => e.forward(input_ids, attention_mask),
-                Self::ClipText(e) => e.forward(input_ids, attention_mask),
-                _ => unreachable!("the outer pattern already narrowed self to a text variant"),
-            },
-            (Self::OpenClipVision(e), EncoderInput::Image { pixel_values }) => {
-                e.forward(pixel_values)
+        // Each arm narrows on the INPUT, then asks `self` once whether it
+        // can serve that modality; a `None`/non-matching `self` falls
+        // through to the one typed refusal below. No arm asserts a
+        // narrowing the compiler cannot see, so a seventh `AnyEncoder`
+        // variant is a compile error in `Self::text_forward` (a
+        // non-exhaustive match) rather than a runtime panic on some input
+        // shape nobody tested.
+        match input {
+            EncoderInput::Text {
+                input_ids,
+                attention_mask,
+            } => {
+                if let Some(out) = self.text_forward(input_ids, attention_mask) {
+                    return out;
+                }
             }
-            (
-                Self::Htsat(e),
-                EncoderInput::Audio {
-                    input_features,
-                    is_longer,
-                },
-            ) => e.forward(input_features, is_longer),
-            (encoder, input) => Err(EncoderError::Config(format!(
-                "encoder modality mismatch: this encoder consumes {} input, but a {} batch was \
-                 supplied",
-                encoder.modality().name(),
-                input.modality().name()
-            ))),
+            EncoderInput::Image { pixel_values } => {
+                if let Self::OpenClipVision(e) = self {
+                    return e.forward(pixel_values);
+                }
+            }
+            EncoderInput::Audio {
+                input_features,
+                is_longer,
+            } => {
+                if let Self::Htsat(e) = self {
+                    return e.forward(input_features, is_longer);
+                }
+            }
+        }
+        Err(EncoderError::Config(format!(
+            "encoder modality mismatch: this encoder consumes {} input, but a {} batch was \
+             supplied",
+            self.modality().name(),
+            input.modality().name()
+        )))
+    }
+
+    /// Token-ids forward for the four TEXT variants, `None` for the two
+    /// media ones — the single exhaustive match over `AnyEncoder` that
+    /// [`Self::forward_input`]'s text arm delegates to. Returning
+    /// `Option<Result<..>>` keeps "this variant does not consume text"
+    /// (structural, `None`) distinct from "it does, and the forward
+    /// failed" (`Some(Err)`).
+    fn text_forward(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: &Tensor,
+    ) -> Option<Result<Tensor, EncoderError>> {
+        match self {
+            Self::Bert(e) => Some(e.forward(input_ids, attention_mask)),
+            Self::DistilBert(e) => Some(e.forward(input_ids, attention_mask)),
+            Self::ModernBert(e) => Some(e.forward(input_ids, attention_mask)),
+            Self::ClipText(e) => Some(e.forward(input_ids, attention_mask)),
+            Self::OpenClipVision(_) | Self::Htsat(_) => None,
         }
     }
 
@@ -331,6 +356,35 @@ impl AnyEncoder {
         }
     }
 
+    /// Dtype this encoder's FROZEN BACKBONE weights are materialised at.
+    ///
+    /// Every variant derives it from a real weight tensor it holds (the
+    /// word/token-embedding table for the four text variants, the
+    /// patch-embedding kernel for vision and audio), so it is the dtype an
+    /// input actually meets rather than a builder setting somebody
+    /// remembered to record. Always defined — there is no encoder without
+    /// weights.
+    ///
+    /// This is what makes [`Self::probe_input`]'s "every field is derived
+    /// from the encoder" claim true for the FLOATING batches. The dense
+    /// LoRA/linear seam (`jammi_lora::FrozenBase::Dense::forward`) casts its
+    /// input to the weight dtype, but the media towers' front ends do not:
+    /// candle's `conv2d` refuses an F32 batch against an F16 kernel
+    /// (`dtype mismatch in conv2d`) and HTSAT's leading `BatchNorm` refuses
+    /// it in its centring subtraction (`dtype mismatch in sub`). A probe
+    /// batch manufactured at a hardcoded `F32` therefore worked only for an
+    /// F32 backbone.
+    pub fn dtype(&self) -> DType {
+        match self {
+            Self::Bert(e) => e.dtype(),
+            Self::DistilBert(e) => e.dtype(),
+            Self::ModernBert(e) => e.dtype(),
+            Self::ClipText(e) => e.dtype(),
+            Self::OpenClipVision(e) => e.dtype(),
+            Self::Htsat(e) => e.dtype(),
+        }
+    }
+
     /// Square input side an image batch must carry — vision variants only.
     pub fn image_size(&self) -> Result<usize, EncoderError> {
         match self {
@@ -368,7 +422,8 @@ impl AnyEncoder {
     /// above share.
     fn not_a_media_accessor(&self, accessor: &str, needs: Modality) -> EncoderError {
         EncoderError::Config(format!(
-            "{accessor} is a {} -preprocessing property and this encoder consumes {} input",
+            "{accessor} is a preprocessing property of {} encoders and this encoder consumes \
+             {} input",
             needs.name(),
             self.modality().name()
         ))
@@ -390,6 +445,11 @@ impl AnyEncoder {
     /// uses `is_longer = [true]`, the branch that exercises the AFF fusion
     /// path as well as the plain patch-conv (the `false` branch computes a
     /// strict subset of it).
+    ///
+    /// The DTYPE is derived too, via [`Self::dtype`] — see that method for
+    /// why a hardcoded `F32` is not a harmless default on a media tower.
+    /// The text batch is integer (`U32` ids and mask) and carries no
+    /// floating dtype at all.
     pub fn probe_input(&self, device: &Device) -> Result<OwnedEncoderInput, EncoderError> {
         Ok(match self {
             Self::Bert(_) | Self::DistilBert(_) | Self::ModernBert(_) | Self::ClipText(_) => {
@@ -401,7 +461,7 @@ impl AnyEncoder {
             Self::OpenClipVision(e) => {
                 let side = e.image_size();
                 OwnedEncoderInput::Image {
-                    pixel_values: Tensor::zeros((1, 3, side, side), DType::F32, device)?,
+                    pixel_values: Tensor::zeros((1, 3, side, side), e.dtype(), device)?,
                 }
             }
             Self::Htsat(e) => OwnedEncoderInput::Audio {
@@ -412,7 +472,7 @@ impl AnyEncoder {
                         AUDIO_PROBE_TIME_FRAMES,
                         e.num_mel_bins(),
                     ),
-                    DType::F32,
+                    e.dtype(),
                     device,
                 )?,
                 is_longer: vec![true],

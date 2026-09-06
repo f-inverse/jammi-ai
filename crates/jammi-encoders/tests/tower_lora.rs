@@ -586,6 +586,201 @@ fn a7_probe_input_forward_succeeds_on_every_tower() {
     }
 }
 
+/// A7 at a REDUCED-PRECISION backbone — the oracle the F32-only A7 above
+/// could not have failed.
+///
+/// `probe_input` builds the media batches itself, so the dtype it picks is
+/// the whole claim: a media tower's front end is a `Conv2d` (and, for HTSAT,
+/// a leading `BatchNorm`), and candle does NOT cast a conv/`sub` input up to
+/// the weight dtype the way `jammi_lora::FrozenBase::Dense` does. A batch
+/// manufactured at a hardcoded `F32` against an F16 backbone is a hard
+/// `dtype mismatch in conv2d` / `... in sub`, so this test is exactly the
+/// negative control the hardcoded version lacked. All three towers are built
+/// through their BUILDERS at `backbone_dtype = F16` (the only construction
+/// path that can produce a non-F32 backbone).
+///
+/// BF16 is absent for the same reason A5 omits it: candle-core 0.11's CPU
+/// matmul supports F16/F32/F64 only.
+#[test]
+fn a7_probe_input_forward_succeeds_at_an_f16_backbone() {
+    use jammi_encoders::AnyEncoder;
+    let device = Device::Cpu;
+    let dt = DType::F16;
+    let ocp = open_clip_dir().join("open_clip_model.safetensors");
+    let hp = htsat_dir().join("model.safetensors");
+    let frozen = LoraFixture::new(&[]);
+
+    let tcfg = ClipTextConfig::from_open_clip_config(&open_clip_json()).unwrap();
+    let vcfg = OpenClipVisionConfig::from_open_clip_config(&open_clip_json()).unwrap();
+    let acfg = HtsatAudioConfig::from_hf_clap_config(&htsat_json()).unwrap();
+
+    let tvm = VarMap::new();
+    let vvm = VarMap::new();
+    let avm = VarMap::new();
+    let encoders = [
+        (
+            "clip_text",
+            AnyEncoder::ClipText(
+                ClipText::builder()
+                    .lora(frozen.config(LoraInitMode::ZerosB))
+                    .backbone_dtype(dt)
+                    .build(&[ocp.as_path()], &tcfg, &device, &tvm)
+                    .unwrap(),
+            ),
+            tcfg.embed_dim,
+        ),
+        (
+            "open_clip_vision",
+            AnyEncoder::OpenClipVision(
+                OpenClipVisionTransformer::builder()
+                    .lora(frozen.config(LoraInitMode::ZerosB))
+                    .backbone_dtype(dt)
+                    .build(&[ocp.as_path()], &vcfg, &device, &vvm)
+                    .unwrap(),
+            ),
+            vcfg.embed_dim,
+        ),
+        (
+            "htsat_audio",
+            AnyEncoder::Htsat(Box::new(
+                HtsatAudio::builder()
+                    .lora(frozen.config(LoraInitMode::ZerosB))
+                    .backbone_dtype(dt)
+                    .build(&[hp.as_path()], &acfg, &device, &avm)
+                    .unwrap(),
+            )),
+            acfg.projection_dim,
+        ),
+    ];
+
+    for (name, encoder, out_dim) in encoders {
+        assert_eq!(
+            encoder.dtype(),
+            dt,
+            "{name}: dtype() must report the backbone weights' OWN dtype"
+        );
+        let probe = encoder.probe_input(&device).unwrap();
+        match probe.as_input() {
+            // The text batch is integer ids + mask; it carries no floating
+            // dtype to get wrong.
+            jammi_encoders::EncoderInput::Text { input_ids, .. } => {
+                assert_eq!(input_ids.dtype(), DType::U32, "{name}");
+            }
+            jammi_encoders::EncoderInput::Image { pixel_values } => {
+                assert_eq!(
+                    pixel_values.dtype(),
+                    dt,
+                    "{name}: the probe pixels must carry the backbone dtype"
+                );
+            }
+            jammi_encoders::EncoderInput::Audio { input_features, .. } => {
+                assert_eq!(
+                    input_features.dtype(),
+                    dt,
+                    "{name}: the probe spectrogram must carry the backbone dtype"
+                );
+            }
+        }
+        let out = encoder
+            .forward_input(&probe.as_input())
+            .unwrap_or_else(|e| panic!("{name}: F16 probe forward failed: {e}"));
+        assert_eq!(out.dims(), &[1, out_dim], "{name}");
+        assert_eq!(out.dtype(), dt, "{name}");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Two towers, one VarMap
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The two OpenCLIP towers built from ONE checkpoint into ONE `VarMap` — the
+/// shape a caller that fine-tunes both sides of a CLIP model has — must get
+/// TWO independent adapter sets.
+///
+/// Both towers load the identical `transformer.resblocks.{n}` block shape
+/// with the identical four site names, so before the vision tower was moved
+/// onto its checkpoint's own `visual.` namespace both emitted the same
+/// `resblocks.{n}.{site}.lora_{a,b}` keys. Candle's `VarMap::get` returns the
+/// ALREADY-REGISTERED `Var` for a name it has seen, so the second tower did
+/// not error — it silently ALIASED the first's parameters: 8 `Var`s where 16
+/// were intended, one gradient stream feeding two towers, and an exported
+/// vision adapter that is byte-for-byte the text adapter.
+///
+/// Asserted on `Var` IDENTITY (`Tensor::id`), not only on key text: two
+/// distinct keys mapping to one aliased tensor would still pass a key-set
+/// check.
+#[test]
+fn both_open_clip_towers_share_one_varmap_without_aliasing() {
+    use std::collections::{BTreeSet, HashSet};
+
+    let device = Device::Cpu;
+    let ocp = open_clip_dir().join("open_clip_model.safetensors");
+    let tcfg = ClipTextConfig::from_open_clip_config(&open_clip_json()).unwrap();
+    let vcfg = OpenClipVisionConfig::from_open_clip_config(&open_clip_json()).unwrap();
+    let fixture = LoraFixture::new(&["all-linear"]);
+
+    let varmap = VarMap::new();
+    let text = ClipText::builder()
+        .lora(fixture.config(LoraInitMode::Gaussian))
+        .build(&[ocp.as_path()], &tcfg, &device, &varmap)
+        .unwrap();
+    let vision = OpenClipVisionTransformer::builder()
+        .lora(fixture.config(LoraInitMode::Gaussian))
+        .build(&[ocp.as_path()], &vcfg, &device, &varmap)
+        .unwrap();
+
+    let expected = clip_expected_params(tcfg.layers) + clip_expected_params(vcfg.layers);
+    assert_eq!(
+        varmap.all_vars().len(),
+        expected,
+        "one VarMap holding both towers must carry {expected} Vars (it carried half that when \
+         the two key namespaces collided)"
+    );
+
+    let text_keys: BTreeSet<String> = text
+        .named_trainable_weights()
+        .unwrap()
+        .into_keys()
+        .collect();
+    let vision_keys: BTreeSet<String> = vision
+        .named_trainable_weights()
+        .unwrap()
+        .into_keys()
+        .collect();
+    assert_eq!(text_keys.len(), clip_expected_params(tcfg.layers));
+    assert_eq!(vision_keys.len(), clip_expected_params(vcfg.layers));
+    assert!(
+        text_keys.is_disjoint(&vision_keys),
+        "the two towers' adapter key sets must be disjoint; text={text_keys:?} \
+         vision={vision_keys:?}"
+    );
+    assert!(
+        vision_keys.iter().all(|k| k.starts_with("visual.")),
+        "every vision key must carry the checkpoint's own `visual.` prefix, got {vision_keys:?}"
+    );
+
+    let varmap_keys: BTreeSet<String> = varmap.data().lock().unwrap().keys().cloned().collect();
+    let union: BTreeSet<String> = text_keys.union(&vision_keys).cloned().collect();
+    assert_eq!(
+        varmap_keys, union,
+        "the VarMap must hold exactly the union of the two towers' declared keys"
+    );
+
+    let text_params = text.trainable_params();
+    let vision_params = vision.trainable_params();
+    let ids: HashSet<_> = text_params
+        .iter()
+        .chain(vision_params.iter())
+        .map(|t| t.id())
+        .collect();
+    assert_eq!(
+        ids.len(),
+        expected,
+        "the {expected} trainable tensors must be {expected} DISTINCT Vars, not two views of \
+         the same ones"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Adapter round trip
 // ─────────────────────────────────────────────────────────────────────────────
@@ -601,6 +796,18 @@ fn a7_probe_input_forward_succeeds_on_every_tower() {
 /// `VarBuilder` scoping would show up here as `lora_a` silently falling back
 /// to its `Init::Const(0.0)` default — i.e. a different (unadapted) output —
 /// rather than as an error.
+///
+/// # Why one `Var` is PERTURBED before saving
+///
+/// Both sides of this round trip are built with the SAME seed, so a rebuild
+/// that read nothing at all from the file — and merely re-derived the seeded
+/// draw — would reproduce the reference bits exactly. That is a real failure
+/// mode (a silently-renamed key falls back to `Init::Const(0.0)` and then
+/// gets re-seeded on the training path) which the oracle could not see.
+/// Overwriting one `Var` with a value the seeded initialiser can never
+/// produce breaks the tie: after the perturbation the reference output is
+/// reachable ONLY by reading the saved file. The `assert_ne!` below is the
+/// non-vacuity control on the perturbation itself.
 fn adapter_round_trip<T, B, F>(name: &str, build: B, forward: F, model_type: &str)
 where
     B: Fn(Option<&Path>, &VarMap, LoraBuildConfig<'_>) -> T,
@@ -612,6 +819,9 @@ where
 
     let varmap = VarMap::new();
     let trained = build(None, &varmap, fixture.config(LoraInitMode::Gaussian));
+
+    let seeded_only = bits(&forward(&trained));
+    let perturbed_key = perturb_one_var(&varmap);
     let weights = trained.named_weights();
     assert_eq!(
         weights.len(),
@@ -619,6 +829,11 @@ where
         "{name}: every trainable Var must be exported by name"
     );
     let reference = bits(&forward(&trained));
+    assert_ne!(
+        reference, seeded_only,
+        "{name}: perturbing `{perturbed_key}` must move the output — otherwise the round trip \
+         below could pass on a re-derived seeded draw alone"
+    );
 
     let cfg = AdapterConfig::from_build(
         model_type,
@@ -638,6 +853,31 @@ where
         reference,
         "{name}: a tower rebuilt from the saved adapter must be bit-equal at eval"
     );
+}
+
+/// Overwrite exactly ONE trainable `Var` in `varmap` with a fixed ramp the
+/// seeded `Gaussian` initialiser cannot produce, and return its key.
+///
+/// The `Var` is chosen by SORTED key, not by `HashMap` iteration order: a
+/// `VarMap`'s map has no stable order, and a run-to-run-varying choice would
+/// make the round-trip oracle non-reproducible (family J). `Var::set` writes
+/// the storage in place, so the tower's own `lora_a`/`lora_b` tensors — which
+/// share that storage — see the new values without rebuilding anything.
+fn perturb_one_var(varmap: &VarMap) -> String {
+    let data = varmap.data().lock().unwrap();
+    let mut keys: Vec<&String> = data.keys().collect();
+    keys.sort();
+    let key = keys
+        .first()
+        .expect("perturb_one_var: the VarMap is empty, so the round trip is vacuous")
+        .to_string();
+    let var = &data[&key];
+    let values: Vec<f32> = (0..var.elem_count())
+        .map(|i| 0.5 + (i % 8) as f32 * 0.125)
+        .collect();
+    let replacement = Tensor::from_vec(values, var.shape().clone(), var.device()).unwrap();
+    var.set(&replacement).unwrap();
+    key
 }
 
 /// The two hooks [`adapter_round_trip`] needs from a tower, so the helper
@@ -857,6 +1097,32 @@ fn adapter_key_layout_is_exactly_the_checkpoint_shaped_set() {
     }
     want.sort();
     assert_eq!(got, want, "clip_text adapter key set");
+
+    // OpenCLIP vision: the SAME four sites per block, under the
+    // checkpoint's own `visual.` prefix so the two towers can share one
+    // VarMap (see `both_open_clip_towers_share_one_varmap_without_aliasing`).
+    let vcfg = OpenClipVisionConfig::from_open_clip_config(&open_clip_json()).unwrap();
+    let varmap = VarMap::new();
+    let vision = OpenClipVisionTransformer::builder()
+        .lora(fixture.config(LoraInitMode::Gaussian))
+        .build(&[ocp.as_path()], &vcfg, &device, &varmap)
+        .unwrap();
+    let mut got: Vec<String> = vision
+        .named_trainable_weights()
+        .unwrap()
+        .into_keys()
+        .collect();
+    got.sort();
+    let mut want: Vec<String> = Vec::new();
+    for n in 0..vcfg.layers {
+        for site in ["in_proj", "out_proj", "c_fc", "c_proj"] {
+            for ab in ["lora_a", "lora_b"] {
+                want.push(format!("visual.resblocks.{n}.{site}.{ab}"));
+            }
+        }
+    }
+    want.sort();
+    assert_eq!(got, want, "open_clip_vision adapter key set");
 
     // HTSAT: 6 per block, one reduction per non-final stage, two head sites.
     let acfg = HtsatAudioConfig::from_hf_clap_config(&htsat_json()).unwrap();

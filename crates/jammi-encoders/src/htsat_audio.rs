@@ -836,19 +836,37 @@ struct SwinBlock {
     attn_mask: Option<Tensor>,
 }
 
+/// The three load-time values EVERY level of this tower's loader threads
+/// unchanged from the root down to an individual Swin block, bundled so each
+/// signature carries one context instead of three parallel arguments that a
+/// call site could reorder (`config`/`device` are both references; a swapped
+/// pair of same-shaped arguments is exactly the class a bundle removes).
+///
+/// `mask_dtype` is NOT re-derivable from `vb` at every level and is not the
+/// same thing as "whatever dtype this `VarBuilder` happens to hand back": it
+/// is the FROZEN BACKBONE dtype every load-time shift-window mask is
+/// materialised in, so the forward path never casts one. An additive
+/// attention mask must be representable in the dtype the scores are computed
+/// in — see `crate::clip_text::dtype_min_sentinel` for the same family-D
+/// argument on the CLIP side.
+#[derive(Clone, Copy)]
+struct HtsatLoadCtx<'a> {
+    config: &'a HtsatAudioConfig,
+    device: &'a candle_core::Device,
+    mask_dtype: DType,
+}
+
 impl SwinBlock {
-    #[allow(clippy::too_many_arguments)]
     fn load_with(
         vb: VarBuilder,
-        config: &HtsatAudioConfig,
+        ctx: HtsatLoadCtx<'_>,
         dim: usize,
         num_heads: usize,
         input_resolution: (usize, usize),
         block_index: usize,
-        device: &candle_core::Device,
-        mask_dtype: DType,
         site: &LoraSite<'_>,
     ) -> Result<Self, EncoderError> {
+        let config = ctx.config;
         let eps = config.layer_norm_eps;
         // `with_bias=true`: no `remove_mean=false` variant exists in this
         // config — see `HtsatPatchEmbed::load`'s note on the same class.
@@ -900,8 +918,8 @@ impl SwinBlock {
                 input_resolution.1,
                 window_size,
                 shift_size,
-                device,
-                mask_dtype,
+                ctx.device,
+                ctx.mask_dtype,
             )?)
         } else {
             None
@@ -1141,17 +1159,25 @@ impl SwinStage {
     /// which for `layers.{s}.blocks.{b}.…` is `s`. `downsample_site` is the
     /// stage's own patch-merging site (subpath `layers.{s}.downsample`, same
     /// stage index).
+    ///
+    /// Still `#[allow(clippy::too_many_arguments)]` after the
+    /// [`HtsatLoadCtx`] bundle absorbed `config`/`device`/`mask_dtype`: the
+    /// five that remain (`dim`, `num_heads`, `depth`, `input_resolution`,
+    /// `has_downsample`) are the stage's own GEOMETRY, each derived
+    /// differently from the stage index by the caller
+    /// (`patch_embeds_hidden_size << i`, `num_attention_heads[i]`,
+    /// `depths[i]`, `grid >> i`, `i < num_stages - 1`). Bundling them would
+    /// only move that derivation behind a constructor with the same five
+    /// fields, not remove a single one.
     #[allow(clippy::too_many_arguments)]
     fn load_with<'a>(
         vb: VarBuilder,
-        config: &HtsatAudioConfig,
+        ctx: HtsatLoadCtx<'_>,
         dim: usize,
         num_heads: usize,
         depth: usize,
         input_resolution: (usize, usize),
         has_downsample: bool,
-        device: &candle_core::Device,
-        mask_dtype: DType,
         site_for: &dyn Fn(usize) -> LoraSite<'a>,
         downsample_site: &LoraSite<'_>,
     ) -> Result<Self, EncoderError> {
@@ -1160,20 +1186,18 @@ impl SwinStage {
         for i in 0..depth {
             blocks.push(SwinBlock::load_with(
                 blocks_vb.pp(i),
-                config,
+                ctx,
                 dim,
                 num_heads,
                 input_resolution,
                 i,
-                device,
-                mask_dtype,
                 &site_for(i),
             )?);
         }
         let downsample = if has_downsample {
             Some(PatchMerging::load_with(
                 vb.pp("downsample"),
-                config,
+                ctx.config,
                 dim,
                 input_resolution,
                 downsample_site,
@@ -1234,6 +1258,14 @@ pub struct FrontHalf {
 }
 
 impl HtsatAudioEncoder {
+    /// Dtype the frozen backbone weights are materialised at, read off the
+    /// patch-embedding `proj` convolution kernel — the first WEIGHT any
+    /// input meets after the batch-norm, and one that exists in every HTSAT
+    /// checkpoint.
+    pub fn dtype(&self) -> DType {
+        self.patch_embed.proj.weight().dtype()
+    }
+
     /// Build the front-half encoder from an `audio_encoder`-scoped
     /// [`VarBuilder`] (i.e. `root.pp("audio_model").pp("audio_encoder")`),
     /// fully frozen. Routed through `Self::load_with` with a
@@ -1245,15 +1277,14 @@ impl HtsatAudioEncoder {
         device: &candle_core::Device,
     ) -> Result<Self, EncoderError> {
         let holder = FrozenSiteHolder::new();
-        let dtype = vb.dtype();
-        Self::load_with(
-            vb.clone(),
+        let ctx = HtsatLoadCtx {
             config,
             device,
-            dtype,
-            &|_s, _b| holder.site(&vb),
-            &|_s| holder.site(&vb),
-        )
+            mask_dtype: vb.dtype(),
+        };
+        Self::load_with(vb.clone(), ctx, &|_s, _b| holder.site(&vb), &|_s| {
+            holder.site(&vb)
+        })
     }
 
     /// The one loader. `block_site(stage, block)` yields the [`LoraSite`]
@@ -1261,17 +1292,16 @@ impl HtsatAudioEncoder {
     /// stage's patch-merging downsample — two closures rather than one with
     /// a sentinel index, because a downsample genuinely has no block index
     /// (both carry `layer_idx == Some(stage)`; see [`SwinStage::load_with`]'s
-    /// doc for the PEFT rule that makes the STAGE the index). `mask_dtype`
-    /// is the dtype every load-time shift-window mask is materialised in.
-    #[allow(clippy::too_many_arguments)]
+    /// doc for the PEFT rule that makes the STAGE the index). `ctx` carries
+    /// the config, device and the dtype every load-time shift-window mask is
+    /// materialised in (see [`HtsatLoadCtx`]).
     fn load_with<'a>(
         vb: VarBuilder,
-        config: &HtsatAudioConfig,
-        device: &candle_core::Device,
-        mask_dtype: DType,
+        ctx: HtsatLoadCtx<'_>,
         block_site: &dyn Fn(usize, usize) -> LoraSite<'a>,
         downsample_site: &dyn Fn(usize) -> LoraSite<'a>,
     ) -> Result<Self, EncoderError> {
+        let HtsatLoadCtx { config, device, .. } = ctx;
         let bn_cfg = BatchNormConfig {
             eps: config.layer_norm_eps,
             ..Default::default()
@@ -1295,14 +1325,12 @@ impl HtsatAudioEncoder {
             let input_resolution = (grid.0 >> i, grid.1 >> i);
             stages.push(SwinStage::load_with(
                 layers_vb.pp(i),
-                config,
+                ctx,
                 dim,
                 config.num_attention_heads[i],
                 config.depths[i],
                 input_resolution,
                 i < num_stages - 1,
-                device,
-                mask_dtype,
                 &|b| block_site(i, b),
                 &downsample_site(i),
             )?);
@@ -1619,12 +1647,14 @@ impl HtsatAudio {
         device: &candle_core::Device,
     ) -> Result<Self, EncoderError> {
         let holder = FrozenSiteHolder::new();
-        let dtype = vb.dtype();
-        Self::load_with(
-            vb.clone(),
+        let ctx = HtsatLoadCtx {
             config,
             device,
-            dtype,
+            mask_dtype: vb.dtype(),
+        };
+        Self::load_with(
+            vb.clone(),
+            ctx,
             &|_s, _b| holder.site(&vb),
             &|_s| holder.site(&vb),
             &holder.site(&vb),
@@ -1634,21 +1664,17 @@ impl HtsatAudio {
     /// The one loader — see [`HtsatAudioEncoder::load_with`] for the two
     /// stage-scoped site closures; `projection_site` is the UNINDEXED
     /// (`layer_idx == None`) site for the `audio_projection.*` head.
-    #[allow(clippy::too_many_arguments)]
     fn load_with<'a>(
         vb: VarBuilder,
-        config: &HtsatAudioConfig,
-        device: &candle_core::Device,
-        mask_dtype: DType,
+        ctx: HtsatLoadCtx<'_>,
         block_site: &dyn Fn(usize, usize) -> LoraSite<'a>,
         downsample_site: &dyn Fn(usize) -> LoraSite<'a>,
         projection_site: &LoraSite<'_>,
     ) -> Result<Self, EncoderError> {
+        let config = ctx.config;
         let encoder = HtsatAudioEncoder::load_with(
             vb.pp("audio_model").pp("audio_encoder"),
-            config,
-            device,
-            mask_dtype,
+            ctx,
             block_site,
             downsample_site,
         )?;
@@ -1671,6 +1697,23 @@ impl HtsatAudio {
     /// Number of mel bins the input fusion spectrogram must carry.
     pub fn num_mel_bins(&self) -> usize {
         self.num_mel_bins
+    }
+
+    /// Dtype the FROZEN BACKBONE weights are materialised at — read off a
+    /// real weight (the patch-embedding `proj` convolution kernel, via
+    /// [`HtsatAudioEncoder::dtype`]), never a remembered builder setting,
+    /// so it stays true for a tower built through `load` from an arbitrary
+    /// `VarBuilder` as well as one built through the builder's
+    /// `backbone_dtype`.
+    ///
+    /// A caller that must MANUFACTURE a floating input for this tower (a
+    /// probe batch, a warm-up) needs it: this tower's front half is a
+    /// `BatchNorm` followed by a `Conv2d`, and neither casts its input to
+    /// the weight dtype the way `jammi_lora::FrozenBase::Dense` does — an
+    /// F32 batch fed to an F16 backbone is a hard `dtype mismatch in sub`
+    /// error, not a silent promotion.
+    pub fn dtype(&self) -> DType {
+        self.encoder.dtype()
     }
 
     /// Borrow the underlying encoder (for boundary-level parity checks).
@@ -1903,11 +1946,14 @@ impl<'a> HtsatAudioBuilder<'a> {
             .map(|s| trainable_vb.pp(format!("layers.{s}.downsample")))
             .collect();
         let projection_vb = trainable_vb.pp("audio_projection");
-        HtsatAudio::load_with(
-            frozen_vb,
+        let ctx = HtsatLoadCtx {
             config,
             device,
-            self.backbone_dtype,
+            mask_dtype: self.backbone_dtype,
+        };
+        HtsatAudio::load_with(
+            frozen_vb,
+            ctx,
             &|s, b| LoraSite {
                 lora_vb: &block_vbs[s][b],
                 // The STAGE index, not the block index — PEFT's rule; see
@@ -1995,16 +2041,19 @@ mod tests {
         // Frozen (adapter-free) construction, through the same decline-
         // everything site the towers' own `load` entry points use.
         let holder = FrozenSiteHolder::new();
+        let ctx = HtsatLoadCtx {
+            config: &cfg,
+            device,
+            mask_dtype: DType::F32,
+        };
         SwinStage::load_with(
             vb.clone(),
-            &cfg,
+            ctx,
             8,
             2,
             2,
             (4, 4),
             false,
-            device,
-            DType::F32,
             &|_b| holder.site(&vb),
             &holder.site(&vb),
         )

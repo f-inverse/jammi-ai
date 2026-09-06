@@ -388,6 +388,16 @@ impl Bert {
         self.max_position_embeddings
     }
 
+    /// Dtype the FROZEN BACKBONE weights are materialised at — read off a
+    /// real weight (the word-embedding table), never a remembered builder
+    /// setting, so it stays true for a model built through `load` from an
+    /// arbitrary `VarBuilder` as well as one built through the builder's
+    /// `backbone_dtype`. See `crate::AnyEncoder::dtype` for the one caller
+    /// class this exists for.
+    pub fn dtype(&self) -> candle_core::DType {
+        self.embeddings.word_embeddings.embeddings().dtype()
+    }
+
     /// Raw `[batch, seq, hidden]` output before pooling. Eval (the default,
     /// `self.training == false`) is BYTE-FOR-BYTE UNCHANGED — the very same
     /// `for layer in &self.layers { hidden = layer.forward(..) }` loop this

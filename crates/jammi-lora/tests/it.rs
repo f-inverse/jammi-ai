@@ -259,6 +259,166 @@ fn new_and_from_loaded_pin_bit_equal_scaling() {
     }
 }
 
+/// Two LoRA sites under the SAME `VarBuilder` prefix, into the same
+/// `VarMap`, is a typed refusal — not a silent alias.
+///
+/// Candle's `VarMap::get` returns the ALREADY-REGISTERED `Var` for a name it
+/// has seen, so without this gate the second construction hands back the
+/// FIRST site's `Var`s: half the intended trainable parameters, one gradient
+/// stream feeding two sites, and an exported adapter whose two entries are
+/// byte-identical. Every one of those is a confidently wrong number, never an
+/// error — exactly the class this refusal exists for (it is what the two
+/// OpenCLIP towers did to each other before they were given disjoint adapter
+/// key roots).
+#[test]
+fn a_second_site_on_the_same_varmap_key_is_a_typed_refusal() {
+    let device = cpu();
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+
+    let first = LoraLinear::new(
+        build_base(8, 16, &device),
+        4,
+        8.0,
+        false,
+        LoraInitMode::Gaussian,
+        None,
+        7,
+        &varmap,
+        &vb.pp("site"),
+    );
+    assert!(
+        first.is_ok(),
+        "the FIRST site under a fresh prefix must construct"
+    );
+
+    let second = LoraLinear::new(
+        build_base(8, 16, &device),
+        4,
+        8.0,
+        false,
+        LoraInitMode::Gaussian,
+        None,
+        7,
+        &varmap,
+        &vb.pp("site"),
+    );
+    // `LoraLinear` intentionally doesn't derive `Debug`; match instead.
+    let err = match second {
+        Ok(_) => panic!("a second site on `site.lora_a`/`site.lora_b` must be refused"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, LoraError::Config(_)),
+        "the collision must be a typed Config refusal, got {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("site.lora_a") && msg.contains("site.lora_b"),
+        "the refusal must name BOTH colliding keys so the caller can find them, got: {msg}"
+    );
+
+    // Negative control on the same `VarMap`: a DISTINCT prefix is fine, so
+    // the refusal above is about the key collision and not about the varmap
+    // having been written to at all.
+    assert!(
+        LoraLinear::new(
+            build_base(8, 16, &device),
+            4,
+            8.0,
+            false,
+            LoraInitMode::Gaussian,
+            None,
+            7,
+            &varmap,
+            &vb.pp("other_site"),
+        )
+        .is_ok(),
+        "a distinct prefix in the same VarMap must still construct"
+    );
+}
+
+/// The INFERENCE path is untouched by the collision gate: an adapter-file
+/// `VarBuilder` never registers anything in `varmap`, so building two towers
+/// from the same saved adapter into the same (unused) `VarMap` still works.
+///
+/// Without this control the gate above could be over-broad — refusing the
+/// legitimate "serve two copies" case — and the positive test alone would not
+/// notice.
+#[test]
+fn loading_the_same_adapter_twice_into_one_varmap_is_not_a_collision() {
+    let device = cpu();
+    let dir = tempfile::tempdir().unwrap();
+
+    // Train one site, save it.
+    let train_map = VarMap::new();
+    let train_vb = VarBuilder::from_varmap(&train_map, DType::F32, &device);
+    let trained = LoraLinear::new(
+        build_base(8, 16, &device),
+        4,
+        8.0,
+        false,
+        LoraInitMode::Gaussian,
+        None,
+        11,
+        &train_map,
+        &train_vb.pp("site"),
+    )
+    .unwrap();
+    let wrapped = MaybeLoraLinear::Lora(trained);
+    let weights = wrapped.named_weights("site").unwrap();
+    let targets: Vec<String> = vec!["site".into()];
+    let layers = None;
+    let rank_pattern = HashMap::new();
+    let build_cfg = LoraBuildConfig {
+        target_modules: &targets,
+        layers_to_transform: &layers,
+        lora_rank: 4,
+        lora_alpha: 8.0,
+        use_rslora: false,
+        lora_dropout: None,
+        rank_pattern: &rank_pattern,
+        init_mode: LoraInitMode::Gaussian,
+        seed: 11,
+    };
+    save_adapter(
+        dir.path(),
+        &weights,
+        &AdapterConfig::from_build("bert", &build_cfg, ComputePrecision::F32),
+    )
+    .unwrap();
+
+    // Two constructions from that file, sharing ONE VarMap.
+    let serve_map = VarMap::new();
+    let file = dir.path().join("adapter.safetensors");
+    for attempt in 0..2 {
+        let serve_vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&[file.as_path()], DType::F32, &device).unwrap()
+        };
+        let built = LoraLinear::new(
+            build_base(8, 16, &device),
+            4,
+            8.0,
+            false,
+            LoraInitMode::Gaussian,
+            None,
+            11,
+            &serve_map,
+            &serve_vb.pp("site"),
+        );
+        assert!(
+            built.is_ok(),
+            "inference construction #{attempt} from an adapter file must not trip the \
+             training-path collision gate"
+        );
+    }
+    assert!(
+        serve_map.data().lock().unwrap().is_empty(),
+        "the inference path must not register anything in the VarMap — if it did, the \
+         control above would be passing for the wrong reason"
+    );
+}
+
 /// Domain boundary (family D / K2): both constructors must typed-refuse
 /// `rank == 0` rather than let it reach `alpha / 0`.
 #[test]

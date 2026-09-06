@@ -49,6 +49,11 @@ mod frozen_weight_source;
 mod layer_norm;
 mod lora_site;
 mod mask;
+// The ONE OpenCLIP residual-attention block (`Mlp`, `ResidualAttentionBlock`,
+// the site table and the key-prefixed traversals), shared by the `clip_text`
+// and `open_clip_vision` towers — see its own module doc, including why the
+// two towers must NOT share an adapter key namespace.
+mod open_clip_block;
 mod pooling;
 #[cfg(test)]
 mod test_support;

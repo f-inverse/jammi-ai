@@ -43,7 +43,10 @@ thiserror.workspace = true
 [dev-dependencies]
 candle-transformers.workspace = true
 hf-hub.workspace = true
-half.workspace = true
+# NO `half` here: it is a regular dependency above (the dtype-following mask
+# sentinels), and a `[dependencies]` entry is already visible to tests,
+# benches and examples. A duplicate `[dev-dependencies]` line only invites
+# the two to drift apart on features or version.
 serde_json.workspace = true
 tempfile = "3"
 

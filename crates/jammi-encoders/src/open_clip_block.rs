@@ -19,21 +19,19 @@
 //! # Two towers, two namespaces
 //!
 //! An OpenCLIP checkpoint holds BOTH towers, and `jammi-ai` holds ONE
-//! `VarMap` per run. Before this module existed each tower emitted the
-//! identical adapter/`VarMap` key `resblocks.{n}.{site}.lora_{a,b}`, so
-//! building both into one `VarMap` did not produce two adapters — candle's
-//! `VarBuilder::get` returns the ALREADY-REGISTERED `Var` for a name it has
-//! seen, so the second tower silently ALIASED the first tower's `Var`s: half
-//! the intended trainable parameters, one gradient stream feeding two towers,
-//! and an exported adapter whose vision weights are literally its text
-//! weights.
-//!
-//! The fix is the checkpoint's OWN namespace, not an invented one: the
-//! vision tower's weights live under `visual.` in every OpenCLIP
-//! safetensors file, so its adapter keys are `visual.resblocks.{n}.{site}`
-//! and the text tower — which lives at the checkpoint root — keeps
-//! `resblocks.{n}.{site}`. Each tower passes its own root as
-//! `adapter_root`; the two key sets are then disjoint by construction.
+//! `VarMap` per run. The two towers' adapter key namespaces are disjoint by
+//! construction: the text tower lives at the checkpoint root and keys its
+//! adapters `resblocks.{n}.{site}.lora_{a,b}`, while the vision tower's
+//! weights live under `visual.` in every OpenCLIP safetensors file, so its
+//! adapter keys are `visual.resblocks.{n}.{site}.lora_{a,b}`. Each tower
+//! passes its own root as `adapter_root`, so building both into one
+//! `VarMap` registers two independent sets of `Var`s rather than aliasing
+//! one tower's weights onto the other — candle's `VarBuilder::get` returns
+//! the ALREADY-REGISTERED `Var` for a name it has seen, so a shared key
+//! namespace would silently collapse the second tower's adapter into the
+//! first's: half the intended trainable parameters, one gradient stream
+//! feeding two towers, and an exported adapter whose vision weights are
+//! literally its text weights. Disjoint namespaces are what rules that out.
 
 use std::collections::HashMap;
 

@@ -1,7 +1,7 @@
 # jammi-lora
 
 Static-dispatch PEFT-style LoRA primitives for [candle][candle]. Closed-enum
-dispatch, immutable construction, native to candle `0.9.x`.
+dispatch, immutable construction, native to candle `0.11`.
 
 `jammi-lora` gives you everything you need to add LoRA adapters to a candle
 model — `LoraLinear`, a `MaybeLoraLinear` wrapper, build helpers, adapter
@@ -41,12 +41,27 @@ let _y = layer.forward(&x).unwrap();
 ## Public API
 
 - [`LoraLinear`] — single LoRA-augmented linear layer.
-- [`MaybeLoraLinear`] — `enum { Frozen(Linear), Lora(LoraLinear) }`. Match on it
-  in your model so dispatch stays compile-time-inlined.
+- [`MaybeLoraLinear`] — `enum { Frozen(FrozenBase), Lora(LoraLinear) }`.
+  `FrozenBase` names what the frozen base weight is stored as: a plain dense
+  `candle_nn::Linear` or a GGUF-quantized weight. Match on
+  `MaybeLoraLinear` in your model so dispatch stays compile-time-inlined.
 - [`LoraBuildConfig`] — borrowed-reference build configuration.
 - [`should_apply_lora`] / [`effective_rank`] — module-name matching helpers
   that mirror HuggingFace PEFT's `target_modules` / `rank_pattern` semantics.
-- [`AdapterConfig`] / [`BackboneDtype`] — persisted adapter metadata.
+  `should_apply_lora` takes a `layer_idx: Option<usize>`: a `None` (an
+  UNINDEXED site, e.g. a tower's head-side projection outside the numbered
+  block stack) can never satisfy an active `layers_to_transform` filter and
+  is excluded whenever one is set — matching PEFT's own
+  `check_target_module_exists` rule exactly.
+- [`AdapterConfig`] / [`Tower`] / [`ComputePrecision`] — persisted adapter
+  metadata (`ComputePrecision` is the backbone dtype's candle-free
+  vocabulary, re-exported from `jammi-numerics`).
+  `AdapterConfig` carries an optional `tower: Option<Tower>` field naming
+  which tower of a multi-tower checkpoint (`Tower::Text` / `Vision` /
+  `Audio`) an adapter installs on; it is `None` for a single-tower family
+  (BERT, DistilBERT, ModernBERT) and omitted from the serialised JSON
+  entirely when `None`, so a single-tower `adapter_config.json` is
+  byte-unchanged.
 - [`save_adapter`] / [`load_adapter`] — safetensors-based directory
   persistence.
 - [`LoraInitMode`] — A/B init strategy (`ZerosB` default, `Gaussian`).
@@ -54,7 +69,7 @@ let _y = layer.forward(&x).unwrap();
 
 ## When to use this crate
 
-Use `jammi-lora` when you need LoRA adapters on candle `0.9.x` with:
+Use `jammi-lora` when you need LoRA adapters on candle `0.11` with:
 
 - compile-time dispatch (no `Box<dyn …>` in the forward path),
 - a small, focused surface (one enum, one struct, a builder helper),

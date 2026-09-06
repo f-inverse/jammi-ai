@@ -653,6 +653,110 @@ async fn projection_head_arm_reports_no_probe_attempted_not_a_fabricated_failure
     assert_eq!(report["flash"]["holds"], serde_json::json!(false));
 }
 
+/// `tiny_bert_head64` (`hidden_size=64, num_attention_heads=1`) — a real BERT
+/// checkpoint, not ModernBERT: BERT's training forward reaches the shared
+/// `attention_cascade::training_attention_cascade` (issue #462) but always
+/// supplies `flash: &FlashDecision::Declined { outcome: CapabilityMiss,
+/// reason: "flash_transport_not_wired" }` (`crates/jammi-encoders/src/
+/// bert.rs:418-420` — BERT never wires the encoder-boundary flash transport
+/// protocol). `head64`, not plain `tiny_bert`, only because the fixture
+/// happens to share the SAME 256-token vocab this suite's `training_pairs.csv`
+/// already tokenizes against (`tests/fixtures/generate_tiny_bert_head64.py`'s
+/// own doc: "the SAME 256-token WordPiece vocab as `tiny_bert`") — the shape
+/// difference (`head_dim == 64` vs `16`) is irrelevant to this test, which
+/// asserts the `flash` field, never `attention_block`.
+fn tiny_bert_head64_model() -> String {
+    "local:".to_string()
+        + common::cookbook_fixture("tiny_bert_head64")
+            .to_str()
+            .unwrap()
+}
+
+/// esc-075's `flash` field for a BERT-family job (issue #462 follow-up).
+///
+/// **What this test can and cannot prove, stated up front**: on THIS suite's
+/// CPU-only build, [`flash_compiled_device_reason`] (`crates/jammi-ai/src/
+/// fine_tune/worker.rs`) short-circuits on the compiled/device fact BEFORE
+/// the `attention_block_flash` cascade delta is ever consulted — so this test
+/// can only observe `"cuda_not_compiled"` (no `cuda` feature) or
+/// `"device_is_cpu_or_metal_not_cuda"` (`cuda` feature compiled, but this
+/// session never resolves a real CUDA device), exactly like every OTHER
+/// architecture on the same build. It CANNOT observe the coarse
+/// `"capability_or_domain_miss"` the cascade delta would report on a real
+/// CUDA+flash-compiled build, and — per this module's doc's "The BERT/
+/// DistilBERT case, named honestly" paragraph — even THAT build could never
+/// report the more specific `"flash_transport_not_wired"` BERT's own
+/// `FlashDecision::Declined` always carries: `admit_cascade`
+/// (`crates/jammi-kernels/src/admission.rs:391-421`) records a decline only
+/// as an atomic counter increment (`CascadeDispatchCounters`, no reason
+/// field — `admission.rs:317-321`), never through the `record_probe_miss`
+/// channel plain `admit` uses (`admission.rs:732`, reached only via
+/// `admit_inner`, `admission.rs:1244,1267,1286`). This test therefore proves
+/// the one thing THIS build can prove — a BERT-family job produces a
+/// well-formed, honestly-labelled `flash: {holds: false, reason: ..}` at all,
+/// through the SAME encoder-adapters path the ModernBERT tests above already
+/// cover — not the specific-reason claim, which needs a real CUDA+flash build
+/// this suite does not have.
+#[serial(esc075_acceleration_report)]
+#[tokio::test(flavor = "multi_thread")]
+async fn bert_family_job_reports_flash_decline_honestly() {
+    let (session, _dir) = session_with_training_data().await;
+    let _worker = EmbeddedWorker::spawn(&session).expect("default worker intervals are valid");
+
+    let job = session
+        .fine_tune(
+            "training",
+            &tiny_bert_head64_model(),
+            &training_columns(),
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(FineTuneConfig {
+                epochs: 1,
+                batch_size: 4,
+                lora_rank: 4,
+                warmup_steps: 0,
+                lr_schedule: LrSchedule::Constant,
+                // Non-empty target_modules: the encoder-adapters arm, which
+                // DOES build an encoder and run the esc-075 probe (unlike the
+                // projection-head arm covered above).
+                target_modules: vec!["query".to_string(), "value".to_string()],
+                backbone_dtype: ComputePrecision::F32,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let record = wait_for_any_terminal(session.catalog(), &job.job_id).await;
+    let report = expect_determined_report(record.acceleration_report.as_deref());
+
+    assert_eq!(
+        report["flash"]["holds"],
+        serde_json::json!(false),
+        "BERT never wires the flash transport -- its own FlashDecision is always Declined, \
+         got: {report}"
+    );
+    let reason = report["flash"]["reason"]
+        .as_str()
+        .unwrap_or_else(|| panic!("flash.reason must be a string, got: {report}"));
+    if cfg!(feature = "cuda") {
+        assert_eq!(
+            reason, "device_is_cpu_or_metal_not_cuda",
+            "cuda compiled but this test session resolves no real CUDA device, got: {report}"
+        );
+    } else {
+        assert_eq!(
+            reason, "cuda_not_compiled",
+            "this build does not compile CUDA at all -- the device-level short-circuit must \
+             fire before the cascade delta is ever consulted, got: {report}"
+        );
+    }
+    assert_ne!(
+        reason, "flash_transport_not_wired",
+        "this report has no channel to name BERT's specific decline reason -- it must never \
+         fabricate one, got: {report}"
+    );
+}
+
 /// This test's `ComputePrecision` as the dtype class
 /// `jammi_kernels::admission::PROBED_OPS` resolves registry keys against —
 /// mirrors `crates/jammi-ai/src/fine_tune/worker.rs`'s own `dtype_class_of`.

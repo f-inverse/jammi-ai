@@ -4723,6 +4723,24 @@ fn assert_gelu_erf_parity_f32(cuda: &Device, n: usize, xv: &[f32]) {
     let dx_bound = |r: f32| f32_two_term_bound(r, dx_floor, 4.0, F32_GELU_ERF_NORMCDF_ULPS);
     assert_relative_bound("gelu_erf f32 dx", &dx_cpu, &dx_gpu, dx_bound);
 
+    // F64 TRUTH (family F): leg 2 above only proves `dx_cpu` (this crate's
+    // OWN `GeluErfFused::bwd`, walked through a real `.backward()` call)
+    // agrees with `dx_gpu` (the SAME crate's OWN CUDA arm) — a systematic
+    // error shared by both arms (e.g. the wrong closed-form derivative)
+    // would pass that check while BOTH are wrong. `gelu_erf_correct_bwd_f64`
+    // is an independently-derived F64 closed form (`dy*(Phi(x)+x*phi(x))`,
+    // built from `libm::erf`, never from this crate's own kernel code),
+    // so anchoring `dx_cpu` against it here is this leg's "the bound must
+    // still ADMIT the correct answer" half of the KO-1 pair below (which
+    // proves the SAME bound REJECTS the dropped-term defect).
+    let dx_f64_truth = gelu_erf_correct_bwd_f64(xv, &dyv);
+    assert_relative_bound(
+        "gelu_erf f32 dx vs f64 closed-form truth",
+        &dx_f64_truth,
+        &dx_cpu,
+        dx_bound,
+    );
+
     // Leg 3 (KO-1): the dropped-x*phi(x) defect must fail the SAME bound
     // the green path just used, measured against the CUDA-computed
     // reference (not CPU's — this leg's whole point is proving the bound
@@ -4829,6 +4847,22 @@ fn assert_gelu_erf_parity_bf16(cuda: &Device, n: usize, xv: &[f32]) {
         dx_bound,
     );
 
+    // F64 TRUTH (family F), mirroring the F32 leg's own: `dx_truth` above
+    // is STILL this crate's OWN `GeluErfFused::bwd` (run at F32 on the
+    // bf16-rounded inputs), so leg 2's check only proves internal
+    // self-consistency between the truth arm and the CUDA arm, never that
+    // the truth arm itself is correct. Anchor `dx_truth` against the
+    // independent F64 closed form too — this is the KO-1 leg's own "the
+    // bound must still ADMIT the correct answer" half, paired with the
+    // "REJECTS the defect" half right below.
+    let dx_f64_truth = gelu_erf_correct_bwd_f64(&xv_from_bf16, &dyv_from_bf16);
+    assert_relative_bound(
+        "gelu_erf bf16 dx truth vs f64 closed-form",
+        &dx_f64_truth,
+        &dx_truth,
+        dx_bound,
+    );
+
     // Leg 3 (KO-1), against the F32 truth.
     let defect = gelu_erf_dropped_x_phi_defect(&xv_from_bf16, &dyv_from_bf16);
     assert_forced_defect_exceeds_bound("gelu_erf bf16 dx (KO-1)", &dx_truth, &defect, dx_bound);
@@ -4924,6 +4958,20 @@ fn assert_gelu_erf_parity_f16(cuda: &Device, n: usize, xv: &[f32]) {
         "gelu_erf f16 dx vs f32 truth",
         &dx_truth,
         &dx_gpu_v,
+        dx_bound,
+    );
+
+    // F64 TRUTH (family F), mirroring the F32/BF16 legs' own: `dx_truth`
+    // above is STILL this crate's OWN `GeluErfFused::bwd` (run at F32 on
+    // the f16-rounded inputs) — anchor it against the independent F64
+    // closed form too, the KO-1 leg's own "the bound must still ADMIT the
+    // correct answer" half, paired with the "REJECTS the defect" half
+    // right below.
+    let dx_f64_truth = gelu_erf_correct_bwd_f64(&xv_from_f16, &dyv_from_f16);
+    assert_relative_bound(
+        "gelu_erf f16 dx truth vs f64 closed-form",
+        &dx_f64_truth,
+        &dx_truth,
         dx_bound,
     );
 

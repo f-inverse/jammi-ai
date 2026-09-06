@@ -30,21 +30,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-// `tiny_modernbert_classifier`, not `tiny_bert` (C-ATTN unit, campaign
-// #462/#463): `fused_dispatch_proof_gate` (`finetune_run.rs`) now refuses
-// ANY architecture's leg that took a real optimizer step with all four
-// training-mode attention/flash dispatch counters at `0`, and classic
-// BERT's attention forward does not dispatch through
-// `jammi_kernels::admission::admit` at all until `jammi_encoders`'
-// companion C-ATTN seam lands — so `tiny_bert` alone cannot satisfy the
-// widened gate yet. This file's own claim (the `--arm alloff`
-// two-op-set check) is architecture-agnostic, so it moved to the SAME
-// already-wired ModernBert fixture `crate::finetune_run`'s own
-// `non_perturbation_test_params_modernbert` test helper uses, with the
-// matching `--target-modules Wqkv` selector below.
 fn model_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../cookbook/fixtures/tiny_modernbert_classifier")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cookbook/fixtures/tiny_bert")
 }
 
 fn write_triplets_jsonl(dir: &Path, name: &str, n: usize, offset: usize) -> PathBuf {
@@ -131,7 +118,7 @@ fn base_command(work_dir: &Path, fixtures_dir: &Path, arm: &str) -> Command {
             "--lora-dropout",
             "0.0",
             "--target-modules",
-            "Wqkv",
+            "query,value",
             "--backbone-dtype",
             "f32",
             "--max-seq-length",

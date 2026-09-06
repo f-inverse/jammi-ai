@@ -1155,7 +1155,7 @@ fn run_impl(
     // directly off the process-wide registry, the same shape
     // `adamw_dispatch_before` below already uses, since this counter has
     // no `jammi_encoders`-side snapshot wrapper of its own.
-    let gelu_dispatch_before = jammi_kernels::admission::counters_for("gelu").snapshot();
+    let gelu_dispatch_before = jammi_kernels::admission::counters_for("gelu_erf_fused").snapshot();
     let lora_epilogue_dispatch_before = jammi_lora::lora_epilogue_dispatch_snapshot();
     let lora_linear_fused_dispatch_before = jammi_lora::lora_linear_fused_dispatch_snapshot();
     let attention_block_dispatch_before = jammi_encoders::attention_block_dispatch_snapshot();
@@ -1276,7 +1276,7 @@ fn run_impl(
     let rope_dispatch_after = jammi_encoders::rope_dispatch_snapshot();
     let softmax_dispatch_after = jammi_encoders::softmax_dispatch_snapshot();
     let geglu_dispatch_after = jammi_encoders::geglu_dispatch_snapshot();
-    let gelu_dispatch_after = jammi_kernels::admission::counters_for("gelu").snapshot();
+    let gelu_dispatch_after = jammi_kernels::admission::counters_for("gelu_erf_fused").snapshot();
     let lora_epilogue_dispatch_after = jammi_lora::lora_epilogue_dispatch_snapshot();
     let lora_linear_fused_dispatch_after = jammi_lora::lora_linear_fused_dispatch_snapshot();
     let attention_block_dispatch_after = jammi_encoders::attention_block_dispatch_snapshot();
@@ -1509,33 +1509,6 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cookbook/fixtures/tiny_bert")
     }
 
-    /// `cookbook/fixtures/tiny_modernbert_classifier` — the same generic,
-    /// committed, real-tokenizer ModernBert fixture
-    /// `finetune_step.rs`'s own `tiny_model_dir` drives, resolved the same
-    /// way [`tiny_bert_model_dir`] is. Used (via
-    /// [`non_perturbation_test_params_modernbert`]) by the handful of
-    /// architecture-agnostic tests below whose claim is about `run_impl`'s
-    /// own mechanics (init-probe non-perturbation, wall-clock measurement,
-    /// JSON emission, mutant-provenance stamping) rather than about BERT
-    /// specifically: those tests need SOME architecture whose training-mode
-    /// attention path actually dispatches through
-    /// `jammi_kernels::admission::admit` today, because
-    /// [`fused_dispatch_proof_gate`] refuses ANY architecture's leg that
-    /// took a real optimizer step with all four attention/flash counters at
-    /// `0` (C-ATTN unit, campaign #462/#463) — `tiny_bert`'s classic-BERT
-    /// attention forward does not reach `admit` at all until
-    /// `jammi_encoders`' companion C-ATTN seam lands, so `tiny_bert` alone
-    /// cannot satisfy the widened gate yet. `[bert]`/`[distilbert]`-SPECIFIC
-    /// tests (`dropout_forward_counter_is_live_..`,
-    /// `build_encoder_adapters_supports_distilbert`, and everything under
-    /// `build_encoder_adapters_*`) are UNCHANGED and still use `tiny_bert`/
-    /// `tiny_distilbert`-shaped fixtures directly, because their claims are
-    /// genuinely about those architectures.
-    fn tiny_modernbert_model_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../cookbook/fixtures/tiny_modernbert_classifier")
-    }
-
     /// Build the tiny, CPU-hermetic, deterministic [`FinetuneRunParams`] the
     /// non-perturbation test below drives — 4 synthetic train triplets (2
     /// batches at `batch_size 2`), 2 held-out triplets (1 batch), 2 epochs,
@@ -1626,22 +1599,6 @@ mod tests {
             mutant_id: None,
             mutant_base_sha: None,
             mutant_patch_sha256: None,
-        }
-    }
-
-    /// [`non_perturbation_test_params`], over
-    /// [`tiny_modernbert_model_dir`] with that architecture's own LoRA
-    /// selector (`"Wqkv"` — `jammi_encoders::modernbert`'s naming, see
-    /// [`tiny_modernbert_model_dir`]'s own doc for why the tests below need
-    /// an architecture whose attention path already dispatches through
-    /// `admit`). Every OTHER field is [`non_perturbation_test_params`]'s
-    /// unchanged value via struct-update syntax, so this stays a single
-    /// source of truth for the shared knobs (seed, epochs, LoRA rank, etc.).
-    fn non_perturbation_test_params_modernbert(work_dir: PathBuf) -> FinetuneRunParams {
-        FinetuneRunParams {
-            model_dir: tiny_modernbert_model_dir(),
-            target_modules: vec!["Wqkv".to_string()],
-            ..non_perturbation_test_params(work_dir)
         }
     }
 
@@ -2227,10 +2184,8 @@ mod tests {
     async fn init_probe_does_not_perturb_the_training_trajectory_bitwise() {
         let work_dir_with = tempfile::tempdir().expect("tempdir with");
         let work_dir_without = tempfile::tempdir().expect("tempdir without");
-        let params_with =
-            non_perturbation_test_params_modernbert(work_dir_with.path().to_path_buf());
-        let params_without =
-            non_perturbation_test_params_modernbert(work_dir_without.path().to_path_buf());
+        let params_with = non_perturbation_test_params(work_dir_with.path().to_path_buf());
+        let params_without = non_perturbation_test_params(work_dir_without.path().to_path_buf());
 
         let (tier_with, varmap_with) =
             tokio::task::spawn_blocking(move || run_impl(&params_with, true))
@@ -2294,7 +2249,7 @@ mod tests {
     #[tokio::test]
     async fn train_run_wall_s_is_measured_and_strictly_less_than_the_outer_wall_clock() {
         let work_dir = tempfile::tempdir().expect("tempdir");
-        let params = non_perturbation_test_params_modernbert(work_dir.path().to_path_buf());
+        let params = non_perturbation_test_params(work_dir.path().to_path_buf());
         let outer_t0 = Instant::now();
         let (tier, _varmap) = tokio::task::spawn_blocking(move || run_impl(&params, true))
             .await
@@ -2358,7 +2313,7 @@ mod tests {
     #[tokio::test]
     async fn finetune_run_tier_json_actually_emits_layers_to_transform_and_train_run_wall_s() {
         let work_dir = tempfile::tempdir().expect("tempdir");
-        let params = non_perturbation_test_params_modernbert(work_dir.path().to_path_buf());
+        let params = non_perturbation_test_params(work_dir.path().to_path_buf());
         let (tier, _varmap) = tokio::task::spawn_blocking(move || run_impl(&params, true))
             .await
             .expect("join run_impl task")
@@ -2691,7 +2646,7 @@ mod tests {
     #[tokio::test]
     async fn mutant_provenance_valid_trio_is_stamped_trimmed() {
         let work_dir = tempfile::tempdir().expect("tempdir");
-        let mut params = non_perturbation_test_params_modernbert(work_dir.path().to_path_buf());
+        let mut params = non_perturbation_test_params(work_dir.path().to_path_buf());
         params.mutant_id = Some("  eps-0.10  ".to_string());
         params.mutant_base_sha = Some(format!("  {}  ", "f".repeat(40)));
         params.mutant_patch_sha256 = Some(format!("\t{}\n", "a".repeat(64)));
@@ -2809,5 +2764,45 @@ mod tests {
         // production-computed (`TrainingResult::total_steps`, summed), not
         // something this gate re-derives.
         assert!(fused_dispatch_proof_gate("bert", 0, 0, 0, 0, 0).is_ok());
+    }
+
+    /// The `"bert"` counted-eager head16 shape, dedicated (C-ATTN unit,
+    /// campaign #462/#463 fix round): `(attention_block_fused_dispatches,
+    /// attention_block_eager_dispatches) == (0, 2)` are the EXACT counts
+    /// `tests/finetune_run_smoke.rs`'s `tiny_bert` (`hidden_size: 32,
+    /// num_attention_heads: 2` — `head_dim == 16 != 64`) end-to-end run
+    /// measures for a 1-epoch, 2-batch leg: every training-mode attention
+    /// forward reaches `admit("attention_block_fused", ..)` (the C-ATTN
+    /// seam) and is DECLINED by the `head_dim == 64` domain predicate, so
+    /// it counts as eager, never fused — the flash cascade is consulted
+    /// first and also declines (`attention_block_flash_declined_dispatches
+    /// == 2`), never fires. This is the widened gate's headline claim made
+    /// concrete for the SPECIFIC architecture/shape this fix round
+    /// restored `tiny_bert` coverage for: `bert` at `head_dim != 64` no
+    /// longer reads all-zero forever (pre-C-ATTN premise this gate's own
+    /// doc used to state), it reads `(0, >0)`, and the gate must accept
+    /// that shape, not refuse it.
+    #[test]
+    fn fused_dispatch_proof_gate_passes_bert_counted_eager_head16_shape() {
+        assert!(fused_dispatch_proof_gate("bert", 2, 0, 2, 0, 2).is_ok());
+    }
+
+    /// The complementary `"bert"` fused-arm shape, dedicated (C-ATTN unit,
+    /// campaign #462/#463 fix round): `(attention_block_fused_dispatches,
+    /// attention_block_eager_dispatches) == (>0, 0)` is what a `bert` leg
+    /// at `head_dim == 64` (the tensor-state predicate
+    /// `jammi_encoders::attention_cascade`'s own doc names, not this
+    /// fixture) reads: the fused whole-attention-block
+    /// kernel dispatches on every training-mode forward, the eager
+    /// composition never runs. Boundary-value coverage alongside
+    /// [`fused_dispatch_proof_gate_passes_bert_counted_eager_head16_shape`]'s
+    /// `(0, >0)` case and
+    /// [`fused_dispatch_proof_gate_refuses_all_zero_attention_for_every_supported_model_type`]'s
+    /// `(0, 0)` refusal — all three shapes a `bert` leg's own counters can
+    /// legitimately read, checked for `model_type == "bert"` specifically
+    /// (not merely folded into the multi-architecture loop above).
+    #[test]
+    fn fused_dispatch_proof_gate_passes_bert_fused_head64_shape() {
+        assert!(fused_dispatch_proof_gate("bert", 2, 2, 0, 0, 0).is_ok());
     }
 }

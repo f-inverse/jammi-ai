@@ -835,7 +835,7 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     // `jammi_encoders`-side snapshot wrapper exists for this one (unlike
     // the ops above): the process-wide registry is read directly, the
     // same shape `adamw_dispatch_before` below already uses.
-    let gelu_dispatch_before = jammi_kernels::admission::counters_for("gelu").snapshot();
+    let gelu_dispatch_before = jammi_kernels::admission::counters_for("gelu_erf_fused").snapshot();
     // Same mechanism, for the C6 fused LoRA-site epilogue.
     let lora_epilogue_dispatch_before = jammi_lora::lora_epilogue_dispatch_snapshot();
     // Same mechanism, for the P2 fused LoRA SITE (base matmul + dropout +
@@ -890,7 +890,7 @@ pub fn run(params: &FinetuneStepParams) -> Result<FinetuneStepTier, Box<dyn std:
     let rope_dispatch_after = jammi_encoders::rope_dispatch_snapshot();
     let softmax_dispatch_after = jammi_encoders::softmax_dispatch_snapshot();
     let geglu_dispatch_after = jammi_encoders::geglu_dispatch_snapshot();
-    let gelu_dispatch_after = jammi_kernels::admission::counters_for("gelu").snapshot();
+    let gelu_dispatch_after = jammi_kernels::admission::counters_for("gelu_erf_fused").snapshot();
     let lora_epilogue_dispatch_after = jammi_lora::lora_epilogue_dispatch_snapshot();
     let lora_linear_fused_dispatch_after = jammi_lora::lora_linear_fused_dispatch_snapshot();
     let attention_block_dispatch_after = jammi_encoders::attention_block_dispatch_snapshot();

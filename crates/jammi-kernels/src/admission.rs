@@ -256,11 +256,27 @@ pub enum PredicateOutcome {
     /// field, incremented internally by [`admit_cascade`]).
     DomainMiss,
     /// The BUILD, DEVICE, or ENVIRONMENT cannot run this arm regardless of
-    /// the data (the feature was not compiled, the GPU architecture does
-    /// not match, the device is not CUDA at all). [`admit_cascade`]
-    /// declines to the next arm; under [`AdmissionMode::Strict`] this is a
-    /// typed error UNLESS the caller asserts the next arm can run
-    /// (`next_arm_can_run`) — see [`admit_cascade`]'s doc.
+    /// the data. Four named classes, each reported with its own reason
+    /// string (never collapsed into one generic "capability" text, so a
+    /// probe/report reader can tell them apart): the feature was not
+    /// compiled; the GPU architecture does not match; the device is not
+    /// CUDA at all; or — the fourth class, added for the `attention_block_flash`
+    /// cascade's BERT/DistilBERT callers — **the CALLING FORWARD has not
+    /// wired this arm's transport protocol** (reason string
+    /// `flash_transport_not_wired`): the arm's DEVICE and BUILD are both
+    /// capable, but the caller's own forward function has not implemented
+    /// the rank-2/unpadded transport this arm's dense path requires (BERT's
+    /// and DistilBERT's per-layer forward stays rank-4 `[batch, seq, ...]`
+    /// throughout, unlike ModernBERT's `forward_padded_transport_attention`
+    /// — see `crates/jammi-encoders/src/attention_cascade.rs`'s module doc
+    /// and the plan's R1'/R2' rulings). This is a caller-side gap, not a
+    /// device/build fact, so it is counted on the SAME `declined` counter
+    /// the other three classes use (never silent — R1' names this as the
+    /// unit's own remaining scope gap, not swept under a coarser miss).
+    /// [`admit_cascade`] declines to the next arm for every one of these
+    /// four; under [`AdmissionMode::Strict`] this is a typed error UNLESS
+    /// the caller asserts the next arm can run (`next_arm_can_run`) — see
+    /// [`admit_cascade`]'s doc.
     CapabilityMiss,
 }
 
@@ -1717,6 +1733,7 @@ impl ProbedOp {
 /// | `rope` | TwoArm | `rope_fused` | `rope_fused`, `crates/jammi-encoders/src/modernbert.rs:190` |
 /// | `softmax` | TwoArm | `softmax_last_dim_fused` | `softmax_last_dim_fused`, `crates/jammi-encoders/src/modernbert.rs:204` |
 /// | `geglu` | TwoArm | `geglu_fused` | `geglu_fused`, `crates/jammi-encoders/src/modernbert.rs:1900` |
+/// | `gelu_erf` | TwoArm | `gelu_erf_fused` | `gelu_erf_fused`, `crates/jammi-kernels/src/ops/gelu_erf.rs`'s `GeluErfFused::name()` — the KERNEL side of this row lands in this same commit; its `admit()` CALL SITE (`jammi-encoders::activations::gelu_erf`, wired at `bert.rs:192`/`distilbert.rs:142`) is a COMPANION branch of this same contract (#462/#463's shared unit), landing in a separate commit the lead merges alongside this one — recorded here now (rather than only once that branch merges) so the two branches' `PROBED_OPS` enumeration is the SAME static fact from either branch's point of view, per this contract's own inter-branch sequencing. Until that companion branch merges, this row's registry key is real (`GeluErfFused::name()` returns it) but UNREACHABLE — no `admit()` call in the tree passes it yet, so a probe run before that merge reads `{fused: 0, eager: 0}` for it, same as any other never-yet-dispatched op. |
 /// | `attention_block` | TwoArm | `attention_block_fused` | `attention_block_fused`, `crates/jammi-encoders/src/modernbert.rs:684` |
 /// | `dropout` | TwoArm | `lora_linear_fused` | `lora_linear_fused`, `crates/jammi-lora/src/lora_linear.rs:958` (`admit` call site) |
 /// | `low_rank_residual_linear` | TwoArm | `lora_linear_fused` | `lora_linear_fused`, `crates/jammi-lora/src/lora_linear.rs:958` (`admit` call site) |
@@ -1803,6 +1820,11 @@ pub const PROBED_OPS: &[ProbedOp] = &[
         report_key: "geglu",
         kind: ProbedOpKind::TwoArm,
         registry: &[(DtypeClass::Any, "geglu_fused")],
+    },
+    ProbedOp {
+        report_key: "gelu_erf",
+        kind: ProbedOpKind::TwoArm,
+        registry: &[(DtypeClass::Any, "gelu_erf_fused")],
     },
     ProbedOp {
         report_key: "attention_block",

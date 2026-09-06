@@ -95,7 +95,15 @@
 //! impl calls internally (`crate::cpu::erf::erf_f32`, `op.rs`), which
 //! candle-core does not re-export publicly (see this crate's `Cargo.toml`
 //! for why `libm` is a direct dependency here rather than a re-derived,
-//! different-precision erf). Note this is NOT bit-identical to candle's
+//! different-precision erf). This CPU F32 formula happens to numerically
+//! match [`crate::ops::gelu_erf::GeluErfFused`]'s OWN CPU F32 arm (same
+//! `erff` call, same algebraic identity) — but the two ops deliberately
+//! track DIFFERENT upstream references on CUDA (this op's `erff`-based
+//! `kernels-community` formula vs. that op's `normcdff`-based candle-CUDA
+//! formula) and are never asserted bit-identical to each other anywhere in
+//! this crate; see that module's doc, "three cdf formulations", for the
+//! full comparison and why each op tracks the reference its own real
+//! caller needs. Note this crate's own `gelu_erf_f32` above is NOT bit-identical to candle's
 //! own eager `gelu_erf()?` on a BF16 tensor specifically: candle's `bf16`
 //! arm of `GeluErf` computes in **f64** (`bf16::from_f64(Self::f64(v.to_f64()))`,
 //! `op.rs`), not f32 — a real, disclosed precision difference (this op

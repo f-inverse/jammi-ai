@@ -39,7 +39,11 @@
 //! The negative tests pin the K2 boundary this unit installs: an unsupported
 //! `model_type` (RED at base — the worker's `_ => BERT` arm coerced it and
 //! trained), an unsupported `(family, task)` pair, a cross-family adapter at
-//! load time, and the two task/column-shape mismatches.
+//! load time, the two task/column-shape mismatches, and — the freeze fix
+//! round's addition — a `target_modules` list that selects NO site on the
+//! tower the dispatch picked, on two towers with disjoint site vocabularies.
+//! Beside them sits the audio front end's mel-bin guard, which pins the
+//! trainer to the SAME refusal the serving audio path already made.
 //!
 //! Beside them sits the one POSITIVE case that boundary must NOT swallow: a
 //! checkpoint whose config declares no `model_type` at all, which has to
@@ -1057,5 +1061,210 @@ async fn text_task_on_binary_triplets_refuses_naming_the_media_tasks() {
         msg.contains("text_embedding") && msg.contains("image_embedding"),
         "the refusal must name the submitted task AND the media task the caller wants, \
          got: {msg}"
+    );
+}
+
+/// A4(e), arm 1: a `target_modules` list that selects NOTHING on the tower the
+/// job's `(family, task)` picked must FAIL the job.
+///
+/// `q_proj` is a real selector on plenty of decoder checkpoints and on nothing
+/// in an OpenCLIP tower, whose four sites are `in_proj` / `out_proj` / `c_fc` /
+/// `c_proj` — exactly the plausible-but-wrong string an operator carries over
+/// from another architecture's recipe.
+///
+/// RED at 5bf8abdb, and not by a missing symbol: `build_encoder_adapters` never
+/// consulted `trainable_params()` there, `optimizer::clip_and_step` treats an
+/// EMPTY trainable set as the one unambiguously benign reading and does not
+/// even warn, so the job ran its epoch over an empty `GradStore`, published an
+/// `adapter.safetensors` with no A/B tensors and reported SUCCESS — `job.wait()`
+/// returned `Ok`, so this test's `expect_err` panics there. Traced to the
+/// mechanism rather than asserted: with the new `trainable_params().is_empty()`
+/// refusal removed at this tip, both arms fail exactly that way
+/// (`expect_err(..): ()`), which is the base behaviour restored.
+///
+/// The message assertion is the non-vacuous half (family F): "the job failed"
+/// alone would also pass on a decode error, an OOM, or a missing fixture, so
+/// the text must carry this tower's OWN site vocabulary — `in_proj` and
+/// `c_proj`, which no other tower in this workspace offers.
+#[tokio::test(flavor = "multi_thread")]
+async fn unmatched_target_modules_refuse_instead_of_training_nothing() {
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+    session
+        .add_source(
+            "text_triplets",
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("training_triplets.csv")),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let job = session
+        .fine_tune(
+            "text_triplets",
+            &tiny_open_clip_model(),
+            &triplet_columns(),
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(tower_config(&["q_proj"], 1, 1e-3)),
+        )
+        .await
+        .unwrap();
+    let err = job.wait().await.expect_err(
+        "a target_modules list matching no site on the CLIP text tower must fail the job, \
+         never publish an empty adapter under a fine-tuned model id",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("q_proj") && msg.contains("in_proj") && msg.contains("c_proj"),
+        "the refusal must echo the submitted selector AND name this tower's real site \
+         names, got: {msg}"
+    );
+}
+
+/// A4(e), arm 2: the same refusal on a BERT-family tower, whose site
+/// vocabulary is the DOTTED checkpoint path (`attention.self.query`, …) rather
+/// than the short suffix form the guide's recipe table shows. A caller who
+/// reads the message must be able to paste a name straight out of it, so the
+/// dotted form is what the message has to print — the short `["query",
+/// "value"]` form works only because `should_apply_lora` also accepts a
+/// suffix.
+///
+/// RED at 5bf8abdb for the identical reason as arm 1: the job succeeded there.
+#[tokio::test(flavor = "multi_thread")]
+async fn unmatched_target_modules_on_bert_name_the_dotted_site_paths() {
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+    session
+        .add_source(
+            "training",
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("training_pairs.csv")),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let job = session
+        .fine_tune(
+            "training",
+            &format!("local:{}", common::cookbook_fixture("tiny_bert").display()),
+            &[
+                "text_a".to_string(),
+                "text_b".to_string(),
+                "score".to_string(),
+            ],
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(tower_config(&["not_a_module"], 1, 1e-3)),
+        )
+        .await
+        .unwrap();
+    let err = job
+        .wait()
+        .await
+        .expect_err("a nonsense selector on a BERT tower must fail the job");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not_a_module") && msg.contains("attention.self.query"),
+        "the refusal must echo the submitted selector AND name the BERT tower's real \
+         (dotted) site names, got: {msg}"
+    );
+}
+
+/// The training audio front end applies serving's own mel-bin guard.
+///
+/// The front-end geometry and the tower's input contract come from two
+/// INDEPENDENT files in the checkpoint (`preprocessor_config.json`'s
+/// `feature_size`, `config.json`'s `num_mel_bins`), so nothing but an explicit
+/// comparison stops a `[B, 4, time, 33]` batch reaching a tower built for 32
+/// mel bins. `CandleModel::embed_audio` has refused exactly this since the
+/// audio serving path landed; the trainer's `audio_encoder_input` did not, so
+/// the same misconfigured checkpoint served a typed error and trained a
+/// silently mis-binned spectrogram.
+///
+/// One deterministic fixture: a byte-for-byte `htsat_clap_tiny` copy with ONE
+/// field changed (`feature_size` 32 → 33), the same one-field-mutation shape
+/// [`unsupported_model_type_refuses_instead_of_coercing_to_bert`] uses.
+#[tokio::test(flavor = "multi_thread")]
+async fn audio_training_refuses_a_mel_bin_mismatch_like_serving_does() {
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+    let triplets = crate::fine_tune::write_audio_triplets(dir.path());
+    session
+        .add_source(
+            "audio_triplets",
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", triplets.display())),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let fixture = htsat_clap_tiny_dir();
+    let model_dir = dir.path().join("htsat_wrong_mels");
+    std::fs::create_dir_all(&model_dir).unwrap();
+    for name in ["model.safetensors", "config.json"] {
+        std::fs::copy(fixture.join(name), model_dir.join(name)).unwrap();
+    }
+    let mut prep: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(fixture.join("preprocessor_config.json")).unwrap(),
+    )
+    .unwrap();
+    let good = prep["feature_size"].as_u64().unwrap();
+    prep["feature_size"] = serde_json::json!(good + 1);
+    std::fs::write(
+        model_dir.join("preprocessor_config.json"),
+        serde_json::to_string(&prep).unwrap(),
+    )
+    .unwrap();
+
+    let job = session
+        .fine_tune(
+            "audio_triplets",
+            &format!("local:{}", model_dir.display()),
+            &triplet_columns(),
+            FineTuneMethod::Lora,
+            ModelTask::AudioEmbedding,
+            Some(tower_config(&["query", "value"], 1, 1e-3)),
+        )
+        .await
+        .unwrap();
+    let err = job.wait().await.expect_err(
+        "a feature_size that disagrees with the tower's num_mel_bins must fail the job",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("num_mel_bins") && msg.contains(&(good + 1).to_string()),
+        "the refusal must name the mismatched quantity and echo the front end's own \
+         feature_size, got: {msg}"
     );
 }

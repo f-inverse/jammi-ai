@@ -1846,7 +1846,12 @@ fn build_training_data_loader(
                 .and_then(|c| extract_string_column(c.as_ref()))
                 .ok_or_else(|| {
                     JammiError::FineTune(format!(
-                        "Missing/invalid 'anchor' column. Batch schema: [{}]",
+                        "Missing/invalid 'anchor' column: task {task} expects text columns, and \
+                         this source has the anchor/positive PAIR shape, which is read as text \
+                         for every task. Image/audio training reads encoded media bytes only \
+                         from the anchor/positive/negative TRIPLET shape under \
+                         task=image_embedding/audio_embedding — add a 'negative' column. \
+                         Batch schema: [{}]",
                         schema_info()
                     ))
                 })?;
@@ -1855,7 +1860,12 @@ fn build_training_data_loader(
                 .and_then(|c| extract_string_column(c.as_ref()))
                 .ok_or_else(|| {
                     JammiError::FineTune(format!(
-                        "Missing/invalid 'positive' column. Batch schema: [{}]",
+                        "Missing/invalid 'positive' column: task {task} expects text columns, \
+                         and this source has the anchor/positive PAIR shape, which is read as \
+                         text for every task. Image/audio training reads encoded media bytes \
+                         only from the anchor/positive/negative TRIPLET shape under \
+                         task=image_embedding/audio_embedding — add a 'negative' column. \
+                         Batch schema: [{}]",
                         schema_info()
                     ))
                 })?;
@@ -2523,8 +2533,8 @@ fn validate_backbone_precision(
 // Declined { outcome: CapabilityMiss, reason: "flash_transport_not_wired" }`
 // — the ONE reason value either family's `FlashDecision::Declined` ever
 // carries, because neither wires the encoder-boundary flash transport
-// protocol — see `BERT never wires the encoder-boundary flash transport` (`crates/jammi-encoders/src/bert.rs:428-420`)
-// and the sibling `FlashDecision::Declined` (`crates/jammi-encoders/src/distilbert.rs:331-324`). `admit_cascade`
+// protocol — see `BERT never wires the encoder-boundary flash transport` (`crates/jammi-encoders/src/bert.rs:428-430`)
+// and the sibling `FlashDecision::Declined` (`crates/jammi-encoders/src/distilbert.rs:331-334`). `admit_cascade`
 // (`crates/jammi-kernels/src/admission.rs:403-453`) now records every decline
 // — disabled, `DomainMiss`, and `CapabilityMiss` alike — into the SAME
 // thread-local probe-capture sink `admit_inner` uses
@@ -3086,6 +3096,16 @@ fn compute_and_persist_acceleration_report(
 /// deserialize as a `BertConfig` (a GPT-2 config does) trained a BERT tower
 /// over foreign weights and published an adapter claiming that architecture.
 /// Refusing is the only honest answer — there is no BERT here to adapt.
+///
+/// # Zero trainable sites is a refusal, never a run
+///
+/// A `target_modules` list that selects NOTHING on the tower this dispatch
+/// picked is refused right after the tower is built, naming the tower, the
+/// submitted selectors and that tower's own
+/// [`lora_site_names`](jammi_encoders::AnyEncoder::lora_site_names). Without
+/// that check the job trains zero parameters, publishes an empty adapter and
+/// reports success — see the refusal's own comment for why nothing
+/// downstream catches it.
 fn build_encoder_adapters(
     base_model_id: &str,
     catalog: &Arc<Catalog>,
@@ -3473,6 +3493,63 @@ fn build_encoder_adapters(
         }
     };
 
+    // A selector that matched NOTHING is a hard refusal, not a run.
+    //
+    // This arm is reached only when `config.target_modules` is non-empty (see
+    // `classify_training_oom`'s doc for that split), so an encoder with zero
+    // trainable `Var`s here means the caller ASKED for adapters and got none.
+    // Nothing downstream notices: candle's backward pass differentiates only
+    // through `is_variable()` nodes, so `loss.backward()` populates an empty
+    // `GradStore`; `optimizer::clip_and_step` treats an EMPTY `trainable_vars`
+    // as the one unambiguously benign reading and does not even warn; the run
+    // then completes, publishes an `adapter.safetensors` holding no A/B
+    // tensors, reports SUCCESS, and serves the BASE bytes under a fine-tuned
+    // model id. A typo'd selector must fail the job instead — the same
+    // conclusion `jammi-bench`'s own training tier reached
+    // (`finetune_run.rs`'s zero-trainable refusal), installed here at the one
+    // seam every encoder-adapters job passes through.
+    //
+    // TWO producers land here and the message must not blame the wrong one:
+    // `target_modules` matching no site on THIS tower's vocabulary, or a
+    // `layers_to_transform` restriction excluding every layer the selectors
+    // would otherwise have matched (an off-by-one layer index on a fixture
+    // with fewer layers). The restriction is therefore named whenever it is
+    // `Some`, never silently folded into "correct the selectors".
+    if encoder.trainable_params().is_empty() {
+        // The tower this job actually built, as the caller named it: the
+        // adapter's own `tower` for a multi-tower checkpoint, and the
+        // family's single tower otherwise (BERT-family adapters carry
+        // `tower: None` because there is nothing to discriminate).
+        let tower = match adapter_cfg.tower {
+            Some(Tower::Text) => "text",
+            Some(Tower::Vision) => "vision",
+            Some(Tower::Audio) => "audio",
+            None => family.towers(),
+        };
+        let restriction = match &config.layers_to_transform {
+            Some(layers) => format!(" restricted to layers {layers:?}"),
+            None => String::new(),
+        };
+        return Err(JammiError::FineTune(format!(
+            "target_modules {:?}{restriction} matched no LoRA site on the '{}' {tower} tower \
+             (base model '{base_model_id}', model_type '{model_type}'), so this job would \
+             train zero parameters and publish an adapter that changes nothing. This \
+             tower's own LoRA site names are: {:?} — a selector matches a site name \
+             exactly or as a suffix of it (so 'query' selects 'attention.self.query' on a \
+             BERT-family tower, whose sites are named by their full dotted checkpoint \
+             path), and 'all-linear' selects every site.{}",
+            config.target_modules,
+            family.adapter_model_type(),
+            encoder.lora_site_names(),
+            if restriction.is_empty() {
+                ""
+            } else {
+                " If the selectors are right for this architecture, check \
+                 layers_to_transform for an out-of-range or off-by-one layer index."
+            },
+        )));
+    }
+
     Ok((encoder, adapter_cfg))
 }
 
@@ -3538,8 +3615,8 @@ mod tests {
     /// (never a fabricated window entry) with BERT/DistilBERT's own verbatim
     /// predicate — `"flash_transport_not_wired"`, the ONE reason value either
     /// family's `FlashDecision::Declined` ever carries — see
-    /// `BERT never wires the encoder-boundary flash transport` (`crates/jammi-encoders/src/bert.rs:428-420`)
-    /// and the sibling `FlashDecision::Declined` (`crates/jammi-encoders/src/distilbert.rs:331-324`) — for a
+    /// `BERT never wires the encoder-boundary flash transport` (`crates/jammi-encoders/src/bert.rs:428-430`)
+    /// and the sibling `FlashDecision::Declined` (`crates/jammi-encoders/src/distilbert.rs:331-334`) — for a
     /// `CapabilityMiss` outcome on the `"attention_block_flash"` op, exactly
     /// as `attention_cascade::training_attention_cascade` does for a
     /// BERT-family training forward (`crates/jammi-encoders/src/

@@ -1797,7 +1797,7 @@ impl TrainingLoop {
             TrainingTarget::EncoderAdapters(state) => {
                 let encoder = &state.encoder;
                 let input = match self.task {
-                    ModelTask::AudioEmbedding => self.audio_encoder_input(base, items)?,
+                    ModelTask::AudioEmbedding => self.audio_encoder_input(base, encoder, items)?,
                     ModelTask::ImageEmbedding => self.image_encoder_input(encoder, items)?,
                     other => {
                         return Err(JammiError::FineTune(format!(
@@ -1824,9 +1824,26 @@ impl TrainingLoop {
     /// base model that carries no such config is a typed refusal — there is
     /// no defaulted geometry that would be anything but a guess, and a
     /// guessed mel filterbank is a silently wrong spectrogram.
+    ///
+    /// Because those two halves come from INDEPENDENT files (the front-end
+    /// geometry from `preprocessor_config.json`, the tower's input contract
+    /// from `config.json`), the mel-bin count is checked against the tower
+    /// before any spectrogram is built — the SAME guard serving applies
+    /// (`CandleModel::embed_audio`'s `frontend.n_mels != audio.
+    /// num_mel_bins()` refusal). Without it a mismatched checkpoint reaches
+    /// the tower as a `[B, 4, time, n_mels]` batch whose last dim is not the
+    /// one the patch embedding was built for. Measured with this guard
+    /// removed, on the one-field-mutated `htsat_clap_tiny` fixture
+    /// `tower_adapters.rs`'s
+    /// `audio_training_refuses_a_mel_bin_mismatch_like_serving_does` builds:
+    /// `Encoder forward: Tensor: shape mismatch in reshape, lhs: [32], rhs:
+    /// [1, 33, 1, 1]` — a raw driver string from deep inside the tower that
+    /// names neither file nor cause, and only because THIS tower's spectral
+    /// projection happens to be shape-strict.
     fn audio_encoder_input(
         &self,
         base: &Arc<LoadedModel>,
+        encoder: &jammi_encoders::AnyEncoder,
         clips: &[Vec<u8>],
     ) -> Result<jammi_encoders::OwnedEncoderInput> {
         use crate::inference::audio_preprocess;
@@ -1847,6 +1864,24 @@ impl TrainingLoop {
                     .into(),
             )
         })?;
+
+        // Serving's guard, applied at the training edge too: the
+        // feature-extractor's mel-filter count IS the tower's input contract.
+        let num_mel_bins = encoder.num_mel_bins().map_err(|e| {
+            JammiError::FineTune(format!(
+                "Audio training needs the tower's num_mel_bins: {e}"
+            ))
+        })?;
+        if frontend.n_mels != num_mel_bins {
+            return Err(JammiError::FineTune(format!(
+                "Audio feature-extractor feature_size ({}) does not match the tower's \
+                 num_mel_bins ({num_mel_bins}) — the base model's \
+                 preprocessor_config.json and config.json disagree; a spectrogram built \
+                 on the wrong mel filterbank would train this adapter on silently wrong \
+                 features",
+                frontend.n_mels
+            )));
+        }
 
         let mut decoded = Vec::with_capacity(clips.len());
         for (i, clip) in clips.iter().enumerate() {

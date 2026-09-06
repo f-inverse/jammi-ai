@@ -2455,38 +2455,35 @@ fn validate_backbone_precision(
 // `flash_not_compiled` / `device_is_cpu_or_metal_not_cuda` /
 // `no_encoder_to_probe_projection_head_arm`) whenever the cascade admission
 // path cannot even be reached, or no encoder was built to probe at all
-// (Phase-4 finding 3: distinct from a probe that WAS attempted and failed);
-// the cascade's own `admit_cascade` has no `fallback_warnings`-shaped reason
-// channel at all (verified by reading `crates/jammi-kernels/src/
-// admission.rs`), so a reached-but-declined cascade reports the coarser,
-// honestly-labelled `"capability_or_domain_miss"` rather than a fabricated
-// verbatim key that does not exist on any public surface today.
+// (Phase-4 finding 3: distinct from a probe that WAS attempted and failed); a
+// reached-but-declined cascade reads its verbatim predicate key back out of
+// THIS probe's own probe-capture window — see the next paragraph — falling
+// back to the coarser, honestly-labelled `"capability_or_domain_miss"` only
+// when that window carries no entry for the decline.
 //
-// **The BERT/DistilBERT case, named honestly (issue #462 follow-up):** both
-// families' training forward always calls
+// **The BERT/DistilBERT case, named honestly (issue #462/#463 follow-up):**
+// both families' training forward always calls
 // `attention_cascade::training_attention_cascade` with `flash: &FlashDecision::
 // Declined { outcome: CapabilityMiss, reason: "flash_transport_not_wired" }`
 // — the ONE reason value either family's `FlashDecision::Declined` ever
 // carries, because neither wires the encoder-boundary flash transport
 // protocol (`crates/jammi-encoders/src/bert.rs:418-420`,
-// `crates/jammi-encoders/src/distilbert.rs:315-317`). That means a
-// BERT-family job's `"capability_or_domain_miss"` on this report's `flash`
-// field is, today, ALWAYS specifically a `"flash_transport_not_wired"`
-// decline — but this module still cannot say so: `admit_cascade`
-// (`crates/jammi-kernels/src/admission.rs:391-421`) records the decline only
-// as an atomic increment on `CascadeDispatchCounters` (`fused`/`eager`/
-// `declined`, `crates/jammi-kernels/src/admission.rs:317-321` — no reason
-// field at all), and never calls `record_probe_miss`
-// (`crates/jammi-kernels/src/admission.rs:732`), which is reached ONLY from
-// `admit_inner` (`crates/jammi-kernels/src/admission.rs:1244,1267,1286`) —
-// the function backing plain `admit`, not `admit_cascade`. So the
-// `predicate_name` a cascade caller passes (`flash.reason()`,
-// `crates/jammi-encoders/src/attention_cascade.rs:599-604`) reaches NO probe-
-// capture window a caller outside `jammi-encoders` can read back — jammi-ai
-// has no channel to thread `"flash_transport_not_wired"` through, and this
-// report does not invent one. A future `admit_cascade` that also records into
-// the probe-capture sink would close this gap without changing anything on
-// this side.
+// `crates/jammi-encoders/src/distilbert.rs:315-317`). `admit_cascade`
+// (`crates/jammi-kernels/src/admission.rs:403-453`) now records every decline
+// — disabled, `DomainMiss`, and `CapabilityMiss` alike — into the SAME
+// thread-local probe-capture sink `admit_inner` uses
+// (`record_probe_miss(op, predicate_name)`,
+// `crates/jammi-kernels/src/admission.rs:416,427,437`), not just an atomic
+// increment on `CascadeDispatchCounters`. [`flash_report`] reads that entry
+// back through `jammi_kernels::admission::probe_capture_reason_for(window,
+// "attention_block_flash")` on a decline, exactly the way
+// [`reason_from_probe_window`] reads it for a two-arm op — so a BERT/
+// DistilBERT job's `flash` field now reads back verbatim as
+// `"flash_transport_not_wired"` instead of the coarse
+// `"capability_or_domain_miss"`. The coarse value survives only as
+// [`flash_report`]'s fallback for a decline whose window happens to carry no
+// entry (the window-attribution causes [`REASON_UNAVAILABLE`] already
+// documents) — never fabricated in its place.
 //
 // **Single-worker-per-process attribution precondition** (advisory 6): the
 // before/after dispatch-registry delta this probe reads is attributed to
@@ -2696,17 +2693,22 @@ fn flash_report_no_probe_attempted(device: &candle_core::Device) -> serde_json::
 /// means the probe's forward pass itself errored (`"probe_forward_failed"` —
 /// a real attempt that failed, never confused with
 /// [`flash_report_no_probe_attempted`]'s "never even tried"); otherwise it
-/// reads the `attention_block_flash` cascade delta, which can only report the
-/// coarse `"capability_or_domain_miss"` on a decline — `admit_cascade` has no
-/// `fallback_warnings`-shaped reason channel a caller can read a verbatim
-/// predicate key back from (see this section's module doc). For a BERT/
-/// DistilBERT job specifically, that coarse value is always, today, a
-/// `"flash_transport_not_wired"` decline — see this section's module doc's
-/// "The BERT/DistilBERT case, named honestly" paragraph for why this
-/// function still cannot say so.
+/// reads the `attention_block_flash` cascade delta. On a decline, `window` —
+/// THIS probe's own `jammi_kernels::admission::probe_capture_begin()` capture
+/// (the same one [`reason_from_probe_window`] reads for the two-arm `ops`
+/// map) — is read back through
+/// [`jammi_kernels::admission::probe_capture_reason_for`] for the
+/// `"attention_block_flash"` cascade key: `admit_cascade` now records every
+/// decline into that SAME sink (see this section's module doc's "The BERT/
+/// DistilBERT case, named honestly" paragraph), so a BERT/DistilBERT job's
+/// decline reads back verbatim as `"flash_transport_not_wired"`. The coarse
+/// `"capability_or_domain_miss"` is kept ONLY as the fallback for a decline
+/// whose window has no entry (the same causes [`REASON_UNAVAILABLE`]
+/// documents for a two-arm op) — never a re-derived guess in its place.
 fn flash_report(
     device: &candle_core::Device,
     probe_ok: bool,
+    window: &[jammi_kernels::admission::ProbeMiss],
     before: jammi_kernels::admission::CascadeDispatchSnapshot,
     after: jammi_kernels::admission::CascadeDispatchSnapshot,
 ) -> serde_json::Value {
@@ -2720,9 +2722,30 @@ fn flash_report(
     let declined_moved = after.declined > before.declined;
     match (fused_moved, declined_moved) {
         (true, false) => serde_json::json!({"holds": true, "reason": "domain_ok"}),
-        (false, true) => serde_json::json!({"holds": false, "reason": "capability_or_domain_miss"}),
+        (false, true) => {
+            serde_json::json!({"holds": false, "reason": flash_cascade_decline_reason(window)})
+        }
         _ => serde_json::json!({"holds": false, "reason": "flash_not_exercised_by_probe"}),
     }
+}
+
+/// The reason [`flash_report`] writes for a `holds: false` `attention_block_
+/// flash` cascade delta: THIS probe's own capture window, read back for the
+/// `"attention_block_flash"` registry key exactly the way
+/// [`reason_from_probe_window`] reads a two-arm op's — through
+/// [`jammi_kernels::admission::probe_capture_reason_for`], never a re-derived
+/// guess.
+///
+/// Deliberately its OWN fallback, not [`REASON_UNAVAILABLE`]: the counter
+/// delta already confirms a decline genuinely happened here (unlike a
+/// two-arm op's `holds: false`, which can ALSO mean "never reached" —
+/// [`two_arm_holds`]'s `None` case, which never calls this at all), so the
+/// honest fallback for a decline whose window carries no entry is the
+/// coarser-but-still-true `"capability_or_domain_miss"`, never a claim that
+/// nothing can be said.
+fn flash_cascade_decline_reason(window: &[jammi_kernels::admission::ProbeMiss]) -> &'static str {
+    jammi_kernels::admission::probe_capture_reason_for(window, "attention_block_flash")
+        .unwrap_or("capability_or_domain_miss")
 }
 
 /// A human-readable label for the resolved device: the CUDA driver's device
@@ -2908,6 +2931,7 @@ fn probe_acceleration(
     let flash = flash_report(
         device,
         probe_ok,
+        &window,
         before.attention_block_flash,
         after.attention_block_flash,
     );
@@ -3274,6 +3298,78 @@ mod tests {
             reason_from_probe_window(&[], "attention_block_fused"),
             REASON_UNAVAILABLE,
             "an empty window says so"
+        );
+    }
+
+    /// Issue #462/#463 follow-up: `admit_cascade`'s decline path now records
+    /// `(op, predicate)` into the SAME probe-capture window `admit_inner`
+    /// uses (`crates/jammi-kernels/src/admission.rs:416-437`), which is what
+    /// lets [`flash_cascade_decline_reason`] — the function [`flash_report`]
+    /// itself calls on a decline — read a verbatim reason back for the
+    /// `"attention_block_flash"` cascade key instead of the coarse
+    /// `"capability_or_domain_miss"` fallback.
+    ///
+    /// This drives the REAL `jammi_kernels::admission::admit_cascade` call
+    /// (never a fabricated window entry) with BERT/DistilBERT's own verbatim
+    /// predicate — `"flash_transport_not_wired"`, the ONE reason value either
+    /// family's `FlashDecision::Declined` ever carries
+    /// (`crates/jammi-encoders/src/bert.rs:418-420`,
+    /// `crates/jammi-encoders/src/distilbert.rs:315-317`) — for a
+    /// `CapabilityMiss` outcome on the `"attention_block_flash"` op, exactly
+    /// as `attention_cascade::training_attention_cascade` does for a
+    /// BERT-family training forward (`crates/jammi-encoders/src/
+    /// attention_cascade.rs:599-604`).
+    ///
+    /// This is the CPU-buildable half of the story
+    /// `bert_family_job_reports_flash_decline_honestly`
+    /// (`tests/it/acceleration_report.rs`) cannot reach: that integration
+    /// test's build short-circuits on `flash_compiled_device_reason` (no CUDA
+    /// device/feature) BEFORE the cascade delta — and this window — is ever
+    /// consulted, so it can only pin the device-level reason. This test
+    /// isolates the window-read mechanism itself, which needs no CUDA device
+    /// at all: only the thread-local probe-capture sink, which is a plain
+    /// `Vec` regardless of build features.
+    #[test]
+    fn flash_cascade_decline_reason_reads_bert_familys_verbatim_predicate_from_the_window() {
+        let capture = jammi_kernels::admission::probe_capture_begin();
+        let counters = jammi_kernels::admission::cascade_counters_for("attention_block_flash");
+        let outcome = jammi_kernels::admission::admit_cascade(
+            jammi_kernels::admission::AdmissionMode::Fallback,
+            "attention_block_flash",
+            "flash_transport_not_wired",
+            jammi_kernels::admission::PredicateOutcome::CapabilityMiss,
+            true,
+            counters,
+        )
+        .expect("Fallback mode's CapabilityMiss decline never errors");
+        assert_eq!(
+            outcome,
+            jammi_kernels::admission::CascadeOutcome::Declined,
+            "a CapabilityMiss outcome must decline, never fuse"
+        );
+        let window = capture.finish();
+
+        assert_eq!(
+            flash_cascade_decline_reason(&window),
+            "flash_transport_not_wired",
+            "admit_cascade's decline must thread verbatim into the SAME probe-capture window \
+             flash_report reads back — never the coarse capability_or_domain_miss fallback when \
+             a specific reason WAS captured"
+        );
+    }
+
+    /// The fallback half of the same mechanism: an `"attention_block_flash"`
+    /// decline whose window carries NO entry for it (e.g. captured on a
+    /// different thread, or never captured at all) must still get the
+    /// honest, coarser `"capability_or_domain_miss"` — never
+    /// [`REASON_UNAVAILABLE`], which would wrongly cast doubt on whether a
+    /// decline happened at all (the counter delta already confirms it did;
+    /// see [`flash_cascade_decline_reason`]'s doc).
+    #[test]
+    fn flash_cascade_decline_reason_falls_back_to_the_coarse_reason_on_an_empty_window() {
+        assert_eq!(
+            flash_cascade_decline_reason(&[]),
+            "capability_or_domain_miss"
         );
     }
 

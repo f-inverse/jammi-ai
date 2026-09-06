@@ -99,9 +99,9 @@ fn dispatch_gelu_erf_fused(x: &Tensor) -> Result<Tensor, EncoderError> {
 /// `gelu_erf_fused` on [`gelu_admission_predicate`]'s domain and dispatches
 /// to [`dispatch_gelu_erf_fused`] (the real `GeluErfFused` `CustomOp1` — see
 /// that function's own doc) or the same unchanged eager call, recording
-/// which happened either way. Wired at `bert.rs:295`
+/// which happened either way. Wired at `bert.rs:296`
 /// (`BertIntermediate::forward`'s `activations::gelu_erf(&hidden,
-/// training)`) and `distilbert.rs:212` (`DistilBertFfn::forward`'s
+/// training)`) and `distilbert.rs:213` (`DistilBertFfn::forward`'s
 /// `activations::gelu_erf(&mid, training)`) only — as of this fix round
 /// (item 6) both receive `training` as a call-chain PARAMETER sourced
 /// from `Bert::training`/`DistilBert::training`, not a per-sub-struct

@@ -406,7 +406,7 @@ pub fn apply_inplace3<T: KernelOp + InplaceOp3>(
 ///   it BY VALUE into [`apply_stateful1`] (mirroring [`apply1`]/[`apply2`]/
 ///   [`apply3`]'s own by-value shape and every existing op's inline
 ///   `::new()`-at-the-call-site convention — e.g. `AttentionBlockFused::new`,
-///   `crates/jammi-encoders/src/modernbert.rs:1374`; `DropoutFused::new`,
+///   `crates/jammi-encoders/src/attention_cascade.rs:936`; `DropoutFused::new`,
 ///   `crates/jammi-lora/src/lora_linear.rs:1022`); nothing in this crate
 ///   ever clones an op value, stateful or not.
 /// - If a stateful op were `Clone`, a caller could hold one instance in a

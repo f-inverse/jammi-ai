@@ -228,7 +228,7 @@
 //! `matmul_grad_rhs`/`matmul_grad_lhs` see the identical operand shapes
 //! either way. `dqs`/`dkr` do NOT get that for free: production's forward
 //! for the `scores` GEMM — `contiguous_matmul`, `crates/jammi-encoders/src/lib.rs:174`,
-//! called from `modernbert.rs:1198` — materializes BOTH operands, unlike `fwd`'s own
+//! called from `raw_scores = crate::contiguous_matmul`, `crates/jammi-encoders/src/attention_cascade.rs:749` — materializes BOTH operands, unlike `fwd`'s own
 //! view-based `scores` GEMM this op recomputes above — so `bwd` builds a
 //! SEPARATE materialized `kt_contig` specifically for the `dqs`/`dkr`
 //! gradient GEMMs (never for the `scores` recompute, which keeps `fwd`'s

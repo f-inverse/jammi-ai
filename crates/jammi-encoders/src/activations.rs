@@ -97,9 +97,18 @@ fn dispatch_gelu_erf_fused(x: &Tensor) -> Result<Tensor, EncoderError> {
 /// `gelu_erf_fused` on [`gelu_admission_predicate`]'s domain and dispatches
 /// to [`dispatch_gelu_erf_fused`] (the real `GeluErfFused` `CustomOp1` — see
 /// that function's own doc) or the same unchanged eager call, recording
-/// which happened either way. Wired at `bert.rs:192`
-/// (`BertIntermediate::forward`) and `distilbert.rs:142`
-/// (`DistilBertFfn::forward`) only.
+/// which happened either way. Wired at `bert.rs:295`
+/// (`BertIntermediate::forward`'s `activations::gelu_erf(&hidden,
+/// training)`) and `distilbert.rs:212` (`DistilBertFfn::forward`'s
+/// `activations::gelu_erf(&mid, training)`) only — as of this fix round
+/// (item 6) both receive `training` as a call-chain PARAMETER sourced
+/// from `Bert::training`/`DistilBert::training`, not a per-sub-struct
+/// stored copy, so this seam always sees the SAME value the encoder's own
+/// `forward_hidden` dispatched on (these two line numbers are NOT tracked
+/// by `ci/scripts/perf/check_citations.py`, which only resolves
+/// `finetune_step.rs`/`grad_oracle.rs` under `jammi-bench` — a future edit
+/// to either call site's surrounding code can silently drift this
+/// citation; verify by name if in doubt).
 ///
 /// **Not wired** (recorded here, per plan v2 R5', rather than silently
 /// excluded): `crate::htsat_audio`'s two GELU sites (`SwinBlock`,
@@ -184,6 +193,65 @@ mod tests {
         assert_eq!(predicate, "non_empty");
     }
 
+    /// Strict mode on a refused domain (family K2, audit round item 7): a
+    /// CPU `BF16` input fails [`gelu_admission_predicate`]'s
+    /// `dtype_f32_only_on_cpu` check, so under `Strict` `gelu_erf`'s own
+    /// `admit()` call must return `KernelError::StrictModeFallback`
+    /// instead of silently falling back to the eager `gelu_erf()` call —
+    /// mirroring `crate::bert::tests::bert_strict_mode_on_a_refused_domain_is_a_typed_error_in_a_fresh_process`'s
+    /// shape exactly, including the fresh-child-process isolation
+    /// `JAMMI_KERNELS_STRICT`'s process-wide `OnceLock` requires.
+    #[test]
+    fn gelu_erf_strict_mode_on_a_refused_domain_is_a_typed_error_in_a_fresh_process() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(exe)
+            .args([
+                "activations::tests::strict_mode_child_process_body",
+                "--exact",
+                "--nocapture",
+                "--ignored",
+            ])
+            .env("JAMMI_KERNELS_STRICT", "1")
+            .output()
+            .expect("spawn child test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "child process assertion failed: stdout={stdout}\nstderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the child process must have actually run (and passed) exactly one test -- \
+             stdout={stdout}"
+        );
+    }
+
+    /// Only meaningful inside the child process the test above spawns.
+    /// `#[ignore]`d so the NORMAL (non-Strict) test run never executes it
+    /// directly — only the `--ignored --exact` child-process invocation
+    /// does.
+    #[test]
+    #[ignore]
+    fn strict_mode_child_process_body() {
+        let device = Device::Cpu;
+        let x = Tensor::zeros((2, 4), DType::BF16, &device).unwrap();
+        let before = GELU_DISPATCH_COUNTERS.snapshot();
+        let err = gelu_erf(&x, true)
+            .expect_err("CPU BF16 under Strict must be a typed refusal, not a silent eager");
+        let after = GELU_DISPATCH_COUNTERS.snapshot();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("gelu_erf_fused") && msg.contains("dtype_f32_only_on_cpu"),
+            "expected a StrictModeFallback naming the refused op/predicate: {msg}"
+        );
+        assert_eq!(
+            after.fused, before.fused,
+            "the fused counter must stay UNTOUCHED under Strict -- a Strict refusal never \
+             dispatches fused, it errors instead of falling back"
+        );
+    }
+
     /// Training's fused arm is a COUNTED dispatch through the real
     /// `GeluErfFused` `CustomOp1` (see [`dispatch_gelu_erf_fused`]'s own
     /// doc) — CPU F32 is bit-identical to the eager call it replaces, so
@@ -191,6 +259,14 @@ mod tests {
     /// proof.
     #[test]
     fn gelu_erf_training_admits_fused_on_a_supported_shape_and_matches_eager_value() {
+        // Two-sided under the crate-shared counter lock (audit round item
+        // 8): this test reads the SAME process-wide `gelu_erf_fused`
+        // registry every other GELU/attention counter test in this crate
+        // reads, so it must serialize against them the same way
+        // `bert`/`distilbert`/`modernbert`'s own counter tests do.
+        let _guard = crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
         let x = Tensor::from_slice(&[-2.0f32, -0.5, 0.0, 0.5, 2.0], (5,), &device).unwrap();
         let before = GELU_DISPATCH_COUNTERS.snapshot();
@@ -201,6 +277,10 @@ mod tests {
         assert!(
             after.fused > before.fused,
             "a supported F32/contiguous/non-empty CPU tensor must dispatch fused"
+        );
+        assert_eq!(
+            after.eager, before.eager,
+            "a supported shape must NOT also bump the eager count -- only the fused arm ran"
         );
     }
 
@@ -218,14 +298,20 @@ mod tests {
     /// other tolerance oracles (e.g. `bert::tests::
     /// bert_head64_fused_attention_matches_eager_composition_within_tolerance`)
     /// isolate the eager arm without touching any process-wide admission
-    /// switch (`JAMMI_KERNELS_DISABLE`).
+    /// switch (`JAMMI_KERNELS_DISABLE`). Two-sided under the crate-shared
+    /// counter lock (audit round item 8).
     #[test]
     fn gelu_erf_training_fused_forward_is_bit_identical_to_eager_on_head64_fixture() {
+        let _guard = crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
         // head64-shaped fixture: b=2, s=5, h=2, d=64 attention output width
         // (hd=128), fed through a 4x FFN blow-up (intermediate=512) — the
         // real `BertIntermediate`/`DistilBertFfn` shape this seam is wired
-        // at (`bert.rs:192`, `distilbert.rs:142`).
+        // at (`bert.rs`'s `BertIntermediate::forward`, `distilbert.rs`'s
+        // `DistilBertFfn::forward` — see `gelu_erf`'s own doc for the
+        // current line numbers).
         let (b, s, h, d) = (2usize, 5usize, 2usize, 64usize);
         let intermediate = 4 * h * d;
         let n = b * s * intermediate;
@@ -248,6 +334,10 @@ mod tests {
         assert!(
             after.fused > before.fused,
             "a supported F32/contiguous/non-empty CPU tensor must dispatch fused"
+        );
+        assert_eq!(
+            after.eager, before.eager,
+            "a supported shape must NOT also bump the eager count -- only the fused arm ran"
         );
 
         let eager_direct: Vec<f32> = x
@@ -335,6 +425,11 @@ mod tests {
         use candle_nn::{Linear, VarBuilder, VarMap};
         use jammi_lora::{FrozenBase, LoraInitMode, LoraLinear};
 
+        // Two-sided under the crate-shared counter lock (audit round item
+        // 8) — same rationale as the sibling tests above.
+        let _guard = crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let device = Device::Cpu;
         let hd = 6usize; // "intermediate.dense"/"lin1" out_features stand-in.
         let varmap = VarMap::new();
@@ -377,6 +472,10 @@ mod tests {
         assert!(
             after.fused > before.fused,
             "must dispatch fused at this shape"
+        );
+        assert_eq!(
+            after.eager, before.eager,
+            "a supported shape must NOT also bump the eager count -- only the fused arm ran"
         );
         let grads_fused = out_fused
             .sum_all()

@@ -24,11 +24,12 @@ use jammi_lora::{
 };
 
 use crate::activations;
-use crate::attention_cascade::{self, FusedAttentionMasks, RopeCtx, TrainingMaskInputs};
+use crate::attention_cascade::{
+    self, FlashDecision, FusedAttentionMasks, RopeCtx, TrainingMaskInputs,
+};
 use crate::error::EncoderError;
 use crate::frozen_weight_source::{validate_frozen_base_geometry, FrozenWeightLookup};
 use crate::layer_norm::LayerNorm;
-use crate::modernbert::FlashDecision;
 use crate::pooling::{pool_and_normalize, Pooling};
 
 /// DistilBERT architecture configuration.
@@ -92,8 +93,6 @@ struct DistilBertSelfAttention {
     out_lin: MaybeLoraLinear,
     num_attention_heads: usize,
     attention_head_size: usize,
-    /// Same status as `crate::bert::BertSelfAttention::training`.
-    training: bool,
     /// Same status as `crate::bert::BertSelfAttention::rope_placeholder`.
     rope_placeholder: Tensor,
 }
@@ -153,10 +152,11 @@ impl DistilBertSelfAttention {
         fused: &FusedAttentionMasks,
         flash: &FlashDecision,
     ) -> Result<Tensor, EncoderError> {
-        debug_assert!(
-            self.training,
-            "DistilBertSelfAttention::forward_training called outside training mode"
-        );
+        // No `self.training` field to assert against (audit round item 6,
+        // mirroring `crate::bert::BertSelfAttention::forward_training`'s
+        // identical fix): this method is private with exactly one call
+        // site, itself only reachable from `DistilBert::forward_hidden`'s
+        // `self.training` branch.
         let q = self.q_lin.forward(hidden)?;
         let k = self.k_lin.forward(hidden)?;
         let v = self.v_lin.forward(hidden)?;
@@ -169,10 +169,8 @@ impl DistilBertSelfAttention {
             local_band: None,
             fused: Some(fused),
         };
-        let rope = RopeCtx {
-            pack: &self.rope_placeholder,
-            enabled: false,
-            apply: None,
+        let rope = RopeCtx::Disabled {
+            placeholder: &self.rope_placeholder,
         };
         let context = attention_cascade::training_attention_cascade(
             &qkv,
@@ -183,7 +181,8 @@ impl DistilBertSelfAttention {
             masks,
             flash,
             &rope,
-            None,
+            None, // window: DistilBERT has no sliding-window concept.
+            None, // half_window: same reason — no scalar to pass memeff.
             FullyMaskedPolicy::Propagate,
             |_admission| {
                 Err(EncoderError::Config(
@@ -201,14 +200,17 @@ impl DistilBertSelfAttention {
 struct DistilBertFfn {
     lin1: MaybeLoraLinear,
     lin2: MaybeLoraLinear,
-    /// Same status as `crate::bert::BertIntermediate::training`.
-    training: bool,
 }
 
 impl DistilBertFfn {
-    fn forward(&self, hidden: &Tensor) -> Result<Tensor, EncoderError> {
+    /// `training` is a PARAMETER, not a stored copy — same fix and
+    /// rationale as `crate::bert::BertIntermediate::forward` (audit round
+    /// item 6): [`DistilBert::training`] is the single source, threaded
+    /// down through [`DistilBertLayer::forward`]/
+    /// [`DistilBertLayer::forward_training`].
+    fn forward(&self, hidden: &Tensor, training: bool) -> Result<Tensor, EncoderError> {
         let mid = self.lin1.forward(hidden)?;
-        let activated = activations::gelu_erf(&mid, self.training)?;
+        let activated = activations::gelu_erf(&mid, training)?;
         Ok(self.lin2.forward(&activated)?)
     }
 }
@@ -228,17 +230,21 @@ impl DistilBertLayer {
         let attn_normed = self.sa_layer_norm.forward(&attn_residual)?;
 
         // Post-LN FFN: residual then LayerNorm.
-        let ffn_out = self.ffn.forward(&attn_normed)?;
+        let ffn_out = self.ffn.forward(&attn_normed, false)?;
         let ffn_residual = (ffn_out + &attn_normed)?;
         self.output_layer_norm.forward(&ffn_residual)
     }
 
+    /// `training` is threaded down to [`DistilBertFfn::forward`] as a
+    /// parameter (audit round item 6) — [`DistilBert::forward_hidden`]
+    /// passes its own `self.training` here, the single source.
     fn forward_training(
         &self,
         hidden: &Tensor,
         extended_mask: &Tensor,
         fused: &FusedAttentionMasks,
         flash: &FlashDecision,
+        training: bool,
     ) -> Result<Tensor, EncoderError> {
         let attn_out = self
             .attention
@@ -246,7 +252,7 @@ impl DistilBertLayer {
         let attn_residual = (attn_out + hidden)?;
         let attn_normed = self.sa_layer_norm.forward(&attn_residual)?;
 
-        let ffn_out = self.ffn.forward(&attn_normed)?;
+        let ffn_out = self.ffn.forward(&attn_normed, training)?;
         let ffn_residual = (ffn_out + &attn_normed)?;
         self.output_layer_norm.forward(&ffn_residual)
     }
@@ -317,7 +323,8 @@ impl DistilBert {
                 reason: "flash_transport_not_wired",
             };
             for layer in &self.layers {
-                hidden = layer.forward_training(&hidden, &extended, &fused, &flash)?;
+                hidden =
+                    layer.forward_training(&hidden, &extended, &fused, &flash, self.training)?;
             }
         } else {
             for layer in &self.layers {
@@ -391,13 +398,11 @@ impl DistilBert {
         self.training = training;
         self.embeddings.layer_norm.set_training(training);
         for layer in &mut self.layers {
-            layer.attention.training = training;
             layer.attention.q_lin.set_training(training);
             layer.attention.k_lin.set_training(training);
             layer.attention.v_lin.set_training(training);
             layer.attention.out_lin.set_training(training);
             layer.sa_layer_norm.set_training(training);
-            layer.ffn.training = training;
             layer.ffn.lin1.set_training(training);
             layer.ffn.lin2.set_training(training);
             layer.output_layer_norm.set_training(training);
@@ -677,15 +682,10 @@ impl<'a> DistilBertBuilder<'a> {
                     out_lin,
                     num_attention_heads: config.num_attention_heads,
                     attention_head_size,
-                    training: false,
                     rope_placeholder,
                 },
                 sa_layer_norm,
-                ffn: DistilBertFfn {
-                    lin1,
-                    lin2,
-                    training: false,
-                },
+                ffn: DistilBertFfn { lin1, lin2 },
                 output_layer_norm,
             });
         }
@@ -817,7 +817,6 @@ mod tests {
             out_lin: MaybeLoraLinear::Frozen(FrozenBase::Dense(seeded_linear(hd, hd, 4.0, device))),
             num_attention_heads: h,
             attention_head_size: d,
-            training: true,
             rope_placeholder: Tensor::zeros((2, 1, 1, 64), DType::F32, device).unwrap(),
         }
     }
@@ -852,15 +851,18 @@ mod tests {
             after.fused > before.fused,
             "head64 must actually dispatch the fused arm (before={before:?}, after={after:?})"
         );
+        assert_eq!(
+            after.eager, before.eager,
+            "head64 must NOT also bump the eager count -- only the fused arm ran \
+             (before={before:?}, after={after:?})"
+        );
 
         let q = attn.q_lin.forward(&hidden).unwrap();
         let k = attn.k_lin.forward(&hidden).unwrap();
         let v = attn.v_lin.forward(&hidden).unwrap();
         let qkv = Tensor::cat(&[&q, &k, &v], D::Minus1).unwrap();
-        let rope = RopeCtx {
-            pack: &attn.rope_placeholder,
-            enabled: false,
-            apply: None,
+        let rope = RopeCtx::Disabled {
+            placeholder: &attn.rope_placeholder,
         };
         let ctx = attention_cascade::forward_eager_training_attention_composition(
             &qkv,
@@ -893,7 +895,9 @@ mod tests {
         );
     }
 
-    /// Same shape as `crate::bert::tests::bert_head64_all_padding_row_propagate_fused_matches_eager_within_tolerance`.
+    /// Same shape as `crate::bert::tests::bert_head64_all_padding_row_propagate_fused_matches_eager_within_tolerance`
+    /// (see that test's doc for the mask-sign audit finding this rewrite
+    /// fixes and the negative control's rationale).
     #[test]
     fn distilbert_head64_all_padding_row_propagate_fused_matches_eager_within_tolerance() {
         let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
@@ -907,13 +911,8 @@ mod tests {
             .map(|i| ((i as f32) * 0.027).cos() * 0.3)
             .collect();
         let hidden = Tensor::from_vec(hidden_v, (b, s, h * d), &device).unwrap();
-        let mask = Tensor::from_slice(
-            &[1.0f32, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
-            (b, 1, 1, s),
-            &device,
-        )
-        .unwrap();
-        let extended = mask.affine(-10_000.0_f64, 10_000.0).unwrap();
+        let mask_u32 = Tensor::from_slice(&[1u32, 1, 1, 1, 0, 0, 0, 0], (b, s), &device).unwrap();
+        let extended = crate::mask::extended_attention_mask(&mask_u32).unwrap();
         let fused_masks = FusedAttentionMasks::build(&extended, None, DType::F32).unwrap();
         let flash = declined_flash();
 
@@ -925,10 +924,8 @@ mod tests {
         let k = attn.k_lin.forward(&hidden).unwrap();
         let v = attn.v_lin.forward(&hidden).unwrap();
         let qkv = Tensor::cat(&[&q, &k, &v], D::Minus1).unwrap();
-        let rope = RopeCtx {
-            pack: &attn.rope_placeholder,
-            enabled: false,
-            apply: None,
+        let rope = RopeCtx::Disabled {
+            placeholder: &attn.rope_placeholder,
         };
         let ctx = attention_cascade::forward_eager_training_attention_composition(
             &qkv,
@@ -957,6 +954,55 @@ mod tests {
         assert!(
             max_diff < 1e-4,
             "all-padding-row Propagate: fused vs eager diverged beyond tolerance: max|Δ|={max_diff}"
+        );
+
+        // NEGATIVE CONTROL (see the BERT sibling test's doc): the SAME
+        // fused forward, at the pre-`out_lin` cascade level (so a bias in
+        // `out_lin` cannot mask an exact-zero row), with
+        // `FullyMaskedPolicy::Zeros` in place of `Propagate`. Batch row 1
+        // must come out EXACTLY zero, and must differ from the
+        // `Propagate` eager `ctx` computed above on that same row.
+        let masks_for_zeros = TrainingMaskInputs {
+            extended: &extended,
+            local_band: None,
+            fused: Some(&fused_masks),
+        };
+        let ctx_zeros = attention_cascade::training_attention_cascade(
+            &qkv,
+            b,
+            s,
+            h,
+            d,
+            masks_for_zeros,
+            &flash,
+            &rope,
+            None,
+            None,
+            FullyMaskedPolicy::Zeros,
+            |_admission| {
+                unreachable!("DistilBERT always supplies FlashDecision::Declined in this fixture")
+            },
+        )
+        .expect("fused training forward with FullyMaskedPolicy::Zeros on an all-padding row");
+
+        let zv: Vec<f32> = ctx_zeros.flatten_all().unwrap().to_vec1().unwrap();
+        let cv: Vec<f32> = ctx.flatten_all().unwrap().to_vec1().unwrap();
+        let row_len = s * h * d;
+        let zeros_row1 = &zv[row_len..2 * row_len];
+        let eager_row1 = &cv[row_len..2 * row_len];
+        assert!(
+            zeros_row1.iter().all(|&x| x == 0.0),
+            "FullyMaskedPolicy::Zeros must zero the fully-masked row EXACTLY: {zeros_row1:?}"
+        );
+        let row_diff = zeros_row1
+            .iter()
+            .zip(eager_row1)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            row_diff > 1e-3,
+            "Zeros and Propagate must diverge on the fully-masked row -- max|Δ|={row_diff} this \
+             small would mean the fully-masked branch was never actually reached"
         );
     }
 
@@ -1006,7 +1052,6 @@ mod tests {
             ))),
             num_attention_heads: h,
             attention_head_size: d,
-            training: true,
             rope_placeholder: Tensor::zeros((2, 1, 1, 64), DType::F32, &device).unwrap(),
         };
 
@@ -1025,6 +1070,10 @@ mod tests {
             .expect("fused training forward");
         let after = crate::attention_block_dispatch_snapshot();
         assert!(after.fused > before.fused, "must dispatch fused at head64");
+        assert_eq!(
+            after.eager, before.eager,
+            "head64 must NOT also bump the eager count -- only the fused arm ran"
+        );
 
         let loss = out.sum_all().unwrap();
         let grads = loss
@@ -1108,7 +1157,6 @@ mod tests {
             ))),
             num_attention_heads: h,
             attention_head_size: d,
-            training: true,
             rope_placeholder: Tensor::zeros((2, 1, 1, 64), DType::F32, &device).unwrap(),
         };
 
@@ -1130,6 +1178,10 @@ mod tests {
             .expect("fused training forward");
         let after = crate::attention_block_dispatch_snapshot();
         assert!(after.fused > before.fused, "must dispatch fused at head64");
+        assert_eq!(
+            after.eager, before.eager,
+            "head64 must NOT also bump the eager count -- only the fused arm ran"
+        );
         let loss_fused = (&out_fused * &dy).unwrap().sum_all().unwrap();
         let grads_fused = loss_fused
             .backward()
@@ -1139,10 +1191,8 @@ mod tests {
         let k = attn.k_lin.forward(&hidden).unwrap();
         let v = attn.v_lin.forward(&hidden).unwrap();
         let qkv = Tensor::cat(&[&q, &k, &v], D::Minus1).unwrap();
-        let rope = RopeCtx {
-            pack: &attn.rope_placeholder,
-            enabled: false,
-            apply: None,
+        let rope = RopeCtx::Disabled {
+            placeholder: &attn.rope_placeholder,
         };
         let ctx = attention_cascade::forward_eager_training_attention_composition(
             &qkv,

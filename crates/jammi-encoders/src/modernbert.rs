@@ -44,8 +44,8 @@ use jammi_lora::{
 };
 
 use crate::attention_cascade::{
-    self, mem_efficient_attention_predicate, FusedAttentionMasks, LocalWindow, RopeCtx,
-    TrainingMaskInputs,
+    self, mem_efficient_attention_predicate, CompactedBatch, FlashDecision, FusedAttentionMasks,
+    LocalWindow, RopeCtx, TrainingMaskInputs,
 };
 // `attention_block_admission_predicate`/`softmax_admission_predicate` are
 // used only by this module's own `#[cfg(test)]` unit tests now (production
@@ -865,16 +865,27 @@ impl ModernBertAttention {
         masks: TrainingMaskInputs<'_>,
         flash: &FlashDecision,
     ) -> Result<Tensor, EncoderError> {
-        let rope_pack = self.rope.cached_rope_pack(qkv.dtype())?;
+        // `rope.pack()` is NOT called here — a `RopeCtx::Enabled` provider
+        // closure, materialized only where the cascade actually reaches
+        // the memeff or block-fused arm (audit round item 5: restores
+        // main's own placement, which never paid for `cached_rope_pack`
+        // on a flash dispatch or the eager arm).
+        let dtype = qkv.dtype();
+        let pack = || self.rope.cached_rope_pack(dtype);
         let apply = |x: &Tensor| self.rope_apply(x);
-        let rope = RopeCtx {
-            pack: &rope_pack,
-            enabled: true,
-            apply: Some(&apply),
+        let rope = RopeCtx::Enabled {
+            pack: &pack,
+            apply: &apply,
         };
-        let window = self.is_local.then_some(LocalWindow {
-            half_window: self.half_window.unwrap_or(0),
-        });
+        // `window` (is-local marker) and `half_window` (the memeff arm's
+        // raw scalar) are two SEPARATE values, not one derived from the
+        // other (audit round item 3) — see `training_attention_cascade`'s
+        // doc for why `self.is_local.then_some(LocalWindow { half_window:
+        // self.half_window.unwrap_or(0) })` was wrong: it silently turned
+        // a `None` `half_window` into `Some(0)` whenever `is_local` was
+        // true. `self.half_window` is passed straight through, exactly as
+        // main's own `forward_memeff_attention` read it.
+        let window = self.is_local.then_some(LocalWindow);
         attention_cascade::training_attention_cascade(
             qkv,
             batch,
@@ -885,6 +896,7 @@ impl ModernBertAttention {
             flash,
             &rope,
             window,
+            self.half_window,
             FullyMaskedPolicy::Zeros,
             |admission| self.forward_flash_dense_attention(qkv, batch, seq, h, d, admission),
         )
@@ -924,11 +936,16 @@ impl ModernBertAttention {
         d: usize,
         extended_mask_f32: &Tensor,
     ) -> Result<Tensor, EncoderError> {
-        let rope_pack = self.rope.cached_rope_pack(qkv.dtype())?;
-        let rope = RopeCtx {
-            pack: &rope_pack,
-            enabled: true,
-            apply: None,
+        // `RopeCtx::Enabled` always carries `apply` (audit round item 2:
+        // `enabled: true, apply: None` is no longer representable) even
+        // though this arm's own [`attention_cascade::forward_memeff_attention`]
+        // never calls it — a closure literal costs nothing to construct.
+        let dtype = qkv.dtype();
+        let pack = || self.rope.cached_rope_pack(dtype);
+        let apply = |x: &Tensor| self.rope_apply(x);
+        let rope = RopeCtx::Enabled {
+            pack: &pack,
+            apply: &apply,
         };
         attention_cascade::forward_memeff_attention(
             qkv,
@@ -1185,16 +1202,21 @@ impl ModernBertAttention {
         extended_mask: &Tensor,
         local_band: Option<&Tensor>,
     ) -> Result<Tensor, EncoderError> {
-        let rope_pack = self.rope.cached_rope_pack(qkv.dtype())?;
+        // This arm never calls `rope.pack()` at all (the eager composition
+        // rotates Q/K directly via `apply`) — the provider closure is
+        // still required by `RopeCtx::Enabled`'s shape, but is never
+        // invoked, proving laziness here costs nothing even when unused.
+        let dtype = qkv.dtype();
+        let pack = || self.rope.cached_rope_pack(dtype);
         let apply = |x: &Tensor| self.rope_apply(x);
-        let rope = RopeCtx {
-            pack: &rope_pack,
-            enabled: true,
-            apply: Some(&apply),
+        let rope = RopeCtx::Enabled {
+            pack: &pack,
+            apply: &apply,
         };
-        let window = self.is_local.then_some(LocalWindow {
-            half_window: self.half_window.unwrap_or(0),
-        });
+        // `window` is a bare is-local marker (audit round item 3) — see
+        // `training_attention_cascade`'s doc for why `half_window` is
+        // never derived from it.
+        let window = self.is_local.then_some(LocalWindow);
         attention_cascade::forward_eager_training_attention_composition(
             qkv,
             batch,
@@ -1567,135 +1589,19 @@ pub(crate) fn flash_d2h_syncs() -> u64 {
     FLASH_D2H_SYNCS.load(Ordering::Relaxed)
 }
 
-/// The once-per-forward flash-cascade decision (contract v4 §3.2), decided
-/// ONCE in [`ModernBert::forward_hidden`] (mirroring [`FusedAttentionMasks`])
-/// and threaded per layer. Owns the compacted batch's row `lengths` and the
-/// `[total]` unpad gather indices — see [`unpad_gather_indices`] — but
-/// deliberately NOT a constructed `jammi_kernels::flash::CuSeqlens`: that
-/// type is feature-gated behind `jammi-kernels`'s `flash-attn` (not
-/// forwarded by this crate's `Cargo.toml` yet), and `CuSeqlens::from_lengths`
-/// is cheap enough to construct on demand, once, at the real flash call
-/// site B1 adds — holding a `CuSeqlens` across a whole forward buys
-/// nothing today and would force a premature feature dependency.
-pub(crate) struct CompactedBatch {
-    /// One length per batch element, `lengths[b] <= seq`. Consumed by
-    /// [`ModernBertAttention::forward_flash_dense_attention`]
-    /// (`CuSeqlens::from_lengths`) and
-    /// [`ModernBertAttention::forward_flash_ragged_attention`]
-    /// (`flash_attention_varlen_with_rope_ragged`'s own `lengths`
-    /// parameter) under the `flash-attn` feature; on a plain build the
-    /// field is only read by this module's own tests, so
-    /// `#[allow(dead_code)]` stays even though it is no longer
-    /// unconditionally dead.
-    #[allow(dead_code)]
-    lengths: Vec<usize>,
-    /// `[total]` gather indices into the flattened `[batch * seq]` row
-    /// axis — every REAL (non-pad) row, batch-then-seq order. Consumed by
-    /// [`ModernBert::forward_hidden_with_lengths`]'s encoder-boundary
-    /// transport (P6 Stage B B3-padded, contract v4 §3.5): [`unpad_rows`]
-    /// once before layer 0, [`repad_rows`] once after the last layer — the
-    /// DENSE arm never reads this field (dense skips compaction entirely,
-    /// see [`Self::is_dense`]/`decide_flash_admission`'s doc).
-    gather_indices: Tensor,
-    /// Same status as `lengths`: the padded/ragged arm's own production
-    /// consumer, `#[allow(dead_code)]` on a plain (non-`flash-attn`) build.
-    #[allow(dead_code)]
-    total: usize,
-    /// The batch's own (padded) sequence length — `mask.dim(1)` at the
-    /// point [`decide_flash_admission`] decided this batch. NOT
-    /// `lengths.iter().max()`: a shorter `seq` would silently narrow the
-    /// RoPE table [`ModernBertAttention::forward_flash_ragged_attention`]
-    /// gathers from below what a full-length row actually needs. Same
-    /// `#[allow(dead_code)]` status as `lengths`/`total`.
-    #[allow(dead_code)]
-    seq: usize,
-    /// `lengths.iter().all(|&l| l == seq)` (contract v4 delta 4's
-    /// discriminator — NEVER `total == batch * seq`, which a genuinely
-    /// padded-but-numerically-coincidental batch could also satisfy),
-    /// computed ONCE at construction (see [`build_flash_forward_decision`])
-    /// rather than re-derived at each of this field's several call sites
-    /// (`FlashDecision::reason`, `ModernBertAttention::forward`'s transport
-    /// branch, `ModernBert::forward_hidden_with_lengths`'s own transport
-    /// decision) — one source of truth for a fact three different call
-    /// sites need to agree on.
-    is_dense: bool,
-}
-
-/// The full once-per-forward flash-cascade decision, decided ONCE in
-/// [`ModernBert::forward_hidden`] (mirroring [`FusedAttentionMasks`]) and
-/// threaded per layer — every LAYER's own [`admit_cascade`] call reports
-/// against it (contract v4 §3.2: "the counters are per-dispatch, not
-/// per-forward" — this type is what makes that per-layer call cheap: no
-/// layer re-derives the outcome/reason).
-///
-/// Two variants, not a `CompactedBatch`/`outcome`/`reason` struct with the
-/// first field optional: the prior shape let `outcome == Holds` and
-/// `admission == None` be constructed simultaneously — an invalid state
-/// [`ModernBertAttention::forward_training_attention`]'s own dispatch code
-/// had to guard with a RUNTIME `ok_or_else` (a string-message fallback for
-/// a state the type itself should have refused to represent). This enum
-/// makes that state a COMPILE ERROR instead: [`Self::Fused`] always
-/// carries its [`CompactedBatch`], [`Self::Declined`] never does — no
-/// runtime check stands between "the cascade decided Fused" and "a
-/// `CompactedBatch` exists".
-///
-/// [`Self::outcome`]/[`Self::reason`] recover the [`PredicateOutcome`] /
-/// reason string every `admit_cascade` call site still needs (`Fused`
-/// always reports `Holds`, and — contract v4 delta 4 — a PER-VARIANT
-/// truthful reason: `"domain_ok_dense"` when [`CompactedBatch::is_dense`],
-/// `"domain_ok_padded"` otherwise; see [`Self::reason`]), so callers built
-/// around the old struct's two bare fields keep exactly the same call
-/// shape.
-pub(crate) enum FlashDecision {
-    /// The batch is flash-eligible — `attention_block_flash` dispatches
-    /// `Fused`. DENSE (`admission.is_dense`,
-    /// [`ModernBertAttention::forward_flash_dense_attention`] runs, hidden
-    /// stays `[batch, seq, hidden]`, no transport) or genuinely PADDED
-    /// (`!admission.is_dense`, [`ModernBertAttention::forward_flash_ragged_attention`]
-    /// runs, [`ModernBert::forward_hidden_with_lengths`] unpads hidden to
-    /// `[total, hidden]` once before layer 0 and repads it once after the
-    /// last — P6 Stage B B3-padded, contract v4 §3.1's item 1). Either way
-    /// this variant always carries its `CompactedBatch` — see
-    /// [`build_flash_forward_decision`], the only constructor.
-    Fused(CompactedBatch),
-    /// The cascade declines — `outcome`/`reason` are whatever
-    /// [`flash_admission_predicate`] (or [`decide_flash_admission`]'s own
-    /// `op_disabled` short-circuit) determined. NEVER carries a
-    /// `CompactedBatch`: that batch is out of THIS decision's scope once
-    /// declined, so `ModernBert::forward_hidden_with_lengths` never
-    /// transports and every layer runs the padded `[batch, seq, hidden]`
-    /// block/eager arm exactly as before this seam existed.
-    Declined {
-        outcome: PredicateOutcome,
-        reason: &'static str,
-    },
-}
-
-impl FlashDecision {
-    /// The [`PredicateOutcome`] every `admit_cascade` call site reports —
-    /// `Holds` for [`Self::Fused`] (the only outcome that variant can mean),
-    /// whatever [`Self::Declined`] itself carries otherwise.
-    pub(crate) fn outcome(&self) -> PredicateOutcome {
-        match self {
-            FlashDecision::Fused(_) => PredicateOutcome::Holds,
-            FlashDecision::Declined { outcome, .. } => *outcome,
-        }
-    }
-
-    /// The reason string every `admit_cascade` call site reports —
-    /// per-variant truthful for [`Self::Fused`] (contract v4 delta 4:
-    /// `"domain_ok_dense"` must not describe a padded dispatch, and vice
-    /// versa): `"domain_ok_dense"` when the carried `CompactedBatch` is
-    /// dense, `"domain_ok_padded"` when it is genuinely padded. Whatever
-    /// [`Self::Declined`] itself carries otherwise.
-    pub(crate) fn reason(&self) -> &'static str {
-        match self {
-            FlashDecision::Fused(batch) if batch.is_dense => "domain_ok_dense",
-            FlashDecision::Fused(_) => "domain_ok_padded",
-            FlashDecision::Declined { reason, .. } => reason,
-        }
-    }
-}
+// `CompactedBatch`/`FlashDecision` moved to `crate::attention_cascade`
+// (issue #462 fix round, item 10): the flash cascade's OUTCOME vocabulary
+// (what a caller reports to `admit_cascade`) is generic — the shared seam's
+// own `flash: &FlashDecision` parameter and `training_attention_cascade`'s
+// dispatch already live there — even though only ModernBERT constructs a
+// real `Fused` variant today (BERT/DistilBERT always supply `Declined`).
+// The TRANSPORT that actually populates a `Fused(CompactedBatch)`
+// (`build_flash_forward_decision`, `decide_flash_admission`,
+// `unpad_gather_indices`/`unpad_rows`/`repad_rows`, the dense/ragged call
+// sites below) stays here — an encoder-boundary concern this module's doc
+// (see `crate::attention_cascade`'s own module doc) already draws the line
+// around. Both types are re-imported below under their original bare names
+// so every existing call site in this module keeps compiling unmodified.
 
 /// Row indices of every REAL (non-pad) row of a `[batch, seq, ..]` tensor,
 /// flattened to `[total]`, in batch-then-seq order — `padded[b, s]`'s flat
@@ -2887,6 +2793,20 @@ impl<'a> ModernBertBuilder<'a> {
                     is_local,
                     num_heads: config.num_attention_heads,
                     head_dim,
+                    // `is_local`/`half_window` are set in LOCKSTEP here —
+                    // the one production constructor site where the
+                    // invariant "`half_window.is_some() == is_local`"
+                    // actually holds (audit round item 3). Neither field
+                    // is DERIVED from the other anywhere downstream any
+                    // more: `crate::attention_cascade::training_attention_cascade`
+                    // takes `window: Option<LocalWindow>` (built from
+                    // `is_local` alone) and `half_window: Option<usize>`
+                    // (this field, read directly) as two independent
+                    // parameters, so a hypothetical future desync between
+                    // this pair could never silently corrupt either arm —
+                    // it would just mean the two parameters no longer
+                    // agree, each still computing exactly what its own
+                    // value says.
                     half_window: is_local.then(|| config.half_window()),
                     training: false,
                 },

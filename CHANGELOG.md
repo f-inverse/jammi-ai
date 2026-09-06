@@ -7,6 +7,35 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Added
+- **A shared attention cascade seam brings BERT and DistilBERT through the fused attention block
+  (#462).** The per-layer cascade (`mem_efficient_attention` → `attention_block_fused` →
+  eager, with `softmax_last_dim_fused` admission on the eager composition) that ModernBERT already
+  trained through is extracted into a model-agnostic seam BERT/DistilBERT now share; the flash
+  TRANSPORT itself stays a ModernBERT-only encoder-boundary protocol — BERT/DistilBERT construct a
+  `FlashDecision::Declined` from their own `forward_hidden`, counted on the `attention_block_flash`
+  cascade counters with the new reason `flash_transport_not_wired`, never silently. `rope` is `false`
+  at this seam for BERT/DistilBERT (a per-module `[2,1,1,64]` cached placeholder, allocated once,
+  never read); the fully-masked policy is `Propagate` (exact-arithmetic-equivalent to main's own
+  eager composition on an all-padding row at f32; DISCLOSED as a divergent case at bf16, the same way
+  ModernBERT's own `Zeros` divergence already is). The bridge from BERT/DistilBERT's separate q/k/v
+  tensors to the block's packed `qkv` input is `Tensor::cat` — a real, stated cost on BOTH arms of the
+  A/B (a forward copy plus three backward zero-fills/adds per layer), never hidden inside either
+  arm's own number. Measurement pending the A/B artifact commit (`ci/scripts/perf/lora_bias_ab.sh
+  AB_OP=attn`); mechanism in `docs/maintainer/fine-tune-performance-guide.md` §4.
+- **`GeluErfFused`, a fused erf-form GELU for the dense-encoder FFN site (#463).** New admit key
+  `gelu_erf_fused` (CPU F32 only; F32/BF16/F16 on CUDA). Forward is bit-identical to candle's own
+  `gelu_erf()` at every dtype it covers, including the CUDA 16-bit arms' double rounding
+  (`cdf16 = round16(normcdf(f32(x)))`, `out = round16(f32(x)·f32(cdf16))`) — a deliberately DIFFERENT
+  cdf formulation from this crate's existing `GegluFused` (which tracks the `erff`-based
+  `kernels-community` reference instead), documented in both ops as two formulations of the same
+  mathematical function this crate intentionally keeps apart rather than sharing. Backward is one
+  kernel per dtype family, the ATen closed form `dx = dy·(Φ(x) + x·φ(x))`, proven against candle's own
+  12-op composition through a condition-aware bound (the two terms cross zero near `x ≈ −0.7518`,
+  where a result-relative bound is meaningless) with a KO-1 control that fails without the `x·φ` term.
+  Wired at `bert.rs:192`/`distilbert.rs:142` only, behind a `training` flag on `activations::gelu_erf`
+  — eval-mode serving numerics are unchanged. Measurement pending the A/B artifact commit
+  (`ci/scripts/perf/lora_bias_ab.sh AB_OP=gelu`); mechanism in
+  `docs/maintainer/fine-tune-performance-guide.md` §4.
 - **The fused LayerNorm site admits a bias-carrying affine (#460).** `LayerNormBiasedFused`
   (`jammi_kernels::ops::LayerNormBiasedFused`) is a new public export — BERT, DistilBERT, and
   CLIP-text all carry a bias on their LayerNorms, and each now trains through the fused site instead
@@ -52,6 +81,21 @@ workspace ships every publishable crate at the same
   table and mechanism in `docs/maintainer/fine-tune-performance-guide.md` §4).
 
 ### Changed
+- **The bench report gains a `gelu_fused_dispatches`/`gelu_eager_dispatches` counter pair, and
+  `attention_block_fused` joins the attention family's disable-key mapping (#462/#463).**
+  `crates/jammi-bench`'s `FinetuneRunTier`/`FinetuneStepTier` carry the new GELU counter pair
+  alongside the existing `ln`/`geglu` pairs; `ATTENTION_DISABLE_KEYS` (`finetune_step.rs`) now also
+  covers `attention_block_fused`, so `attention_arm` correctly reads `eager` when a caller forces that
+  key off directly (not only via the `attention_block_flash`/`all` keys it already covered). The
+  bench's all-zero-attention validity gate no longer conditions on `model_type == "modernbert"` —
+  admission is by the counters themselves (every relevant fused/eager/flash pair reading zero),
+  never by which architecture's config the run happened to load — and its message now names both the
+  attention-block and attention-block-flash keys. The A/B driver (`ci/scripts/perf/lora_bias_ab.sh`)
+  gains `AB_OP=attn` and `AB_OP=gelu` modes alongside the existing `lora_linear`/`ln`; its merger
+  (`lora_bias_ab_merge.py`) generalizes to a multi-key-per-op dispatch proof and a list-form cross-op
+  invariant covering both the existing strong `fused>0 && eager==0` form (`ln`'s `lora_linear`
+  cross-check) and a pair-identity form for cascade-absorbed/declined keys
+  (`attention_block_flash`'s declined count, identical across the fused and eager arms of one cell).
 - **The affine three-way gate now applies to the bias-free LayerNorm arm too.** A tracked-but-not-
   `Var` `gamma` is now a typed error on the bias-free path (previously it ran fused with `dgamma`
   silently dropped) — the same gate the bias-carrying site already enforces on `gamma`/`beta`

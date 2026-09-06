@@ -135,15 +135,41 @@
 //! Gated like the rest of the suite: `live-gpu-tests` + a meaningful run also
 //! needs `cuda` + a visible GPU; without them it skips loudly via
 //! `skip_without_gpu!` (never `#[ignore]`).
+//!
+//! ## `gelu_erf` needs its OWN architecture, not ModernBERT's (issue #463
+//! follow-up)
+//!
+//! `ModernBertMlp::forward_training`'s GeGLU composition
+//! (`crate::modernbert::geglu_apply_training`'s `gate.gelu_erf()? * up`) calls
+//! candle's plain `Tensor::gelu_erf()` directly — it never reaches
+//! `jammi_encoders::activations::gelu_erf`, the seam `gelu_erf_fused` actually
+//! admits through (wired ONLY at `BertIntermediate::forward`'s `gelu_erf(&hidden, training)` (`crates/jammi-encoders/src/bert.rs:296`) and `DistilBertFfn::forward`'s `gelu_erf(&mid, training)` (`crates/jammi-encoders/src/distilbert.rs:213`) — see
+//! `jammi_kernels::admission::PROBED_OPS`'s own `gelu_erf` row doc). So
+//! [`probe_dtype`]'s ModernBERT forward can never move `gelu_erf_fused`'s
+//! counter, regardless of dtype or Strict mode: declaring `gelu_erf` in the
+//! manifest and asserting it `Holds` through THAT probe would read
+//! `{fused: 0, eager: 0}` on a real device and red this test, not because the
+//! op is unadmitted but because nothing in this file's forward reaches its
+//! call site. [`bert_probe_dtype`] closes that gap with a SECOND, independent
+//! probe — a real `jammi_encoders::Bert` built from
+//! `cookbook/fixtures/tiny_bert_head64` (`hidden_size=64,
+//! num_attention_heads=1` → `head_dim=64`, `hidden_act: "gelu"` — a real BERT
+//! checkpoint, not a synthetic one) — run at every dtype this suite probes
+//! ModernBERT at. [`probe_dtype`] itself is UNCHANGED (byte-identical to
+//! before this follow-up): the two probes are independent forward+backward+
+//! optimizer-step windows, and `gelu_erf`'s own dispatch-registry delta is
+//! read only around the BERT probe's window, never folded into
+//! [`two_arm_ops_for`]'s generic ModernBERT-driven loop (which excludes
+//! `"gelu_erf"` for exactly this reason — see that function's own doc).
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarMap;
 use jammi_ai::fine_tune::adamw::{AdamW, ParamsAdamW};
 use jammi_ai::fine_tune::ComputePrecision;
-use jammi_encoders::{ModernBert, ModernBertConfig, Pooling};
+use jammi_encoders::{Bert, BertConfig, ModernBert, ModernBertConfig, Pooling};
 use jammi_kernels::admission::{AdmissionMode, CascadeDispatchSnapshot, DispatchSnapshot};
 use jammi_lora::{LoraBuildConfig, LoraInitMode};
 use tempfile::TempDir;
@@ -239,6 +265,12 @@ fn dtype_class(p: ComputePrecision) -> DtypeClass {
 /// - `"softmax"`/`"rope"` ([`STRICT_UNREACHABLE_OPS`]) — asserting either
 ///   `Holds` in a Strict-mode run through ModernBERT's attention path is not
 ///   merely untested but STRUCTURALLY IMPOSSIBLE; see that const's doc.
+/// - `"gelu_erf"` — ModernBERT's GeGLU MLP never reaches the
+///   `gelu_erf_fused` call site at all (see this file's module doc's
+///   "`gelu_erf` needs its OWN architecture" section), so a before/after
+///   window around [`probe_dtype`]'s ModernBERT forward can never observe it.
+///   [`capability_surface`] asserts it separately, per-dtype, around
+///   [`bert_probe_dtype`]'s own BERT-family forward instead.
 ///
 /// `"dropout"` and `"low_rank_residual_linear"` both resolve to
 /// `lora_linear_fused` — that is a fact of the table now, not of this file
@@ -266,6 +298,7 @@ fn two_arm_ops_for(dtype: DtypeClass) -> Vec<(&'static str, &'static str)> {
         .iter()
         .filter(|op| op.kind == ProbedOpKind::TwoArm)
         .filter(|op| op.report_key != "attention_block")
+        .filter(|op| op.report_key != "gelu_erf")
         .filter(|op| !STRICT_UNREACHABLE_OPS.contains(&op.report_key))
         .filter_map(|op| {
             op.registry_keys_for(dtype)
@@ -566,6 +599,114 @@ fn probe_dtype(config: &ModernBertConfig, weights: &Path, dtype: DType, device: 
     });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// The `gelu_erf` probe: a REAL BERT checkpoint, not ModernBERT (issue #463
+// follow-up — see this file's module doc's "`gelu_erf` needs its OWN
+// architecture" section for WHY a second architecture is required at all).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `cookbook/fixtures/tiny_bert_head64`, located the same way
+/// [`MANIFEST_PATH`] is (relative to this crate's manifest dir). A real BERT
+/// checkpoint (`hidden_size=64, num_attention_heads=1` → `head_dim=64`,
+/// `hidden_act: "gelu"`), not a synthetic one — no `write_synthetic_checkpoint`
+/// counterpart is needed here because this fixture's `model.safetensors`
+/// already exists and is shared with `crates/jammi-encoders/tests/it/bert.rs`
+/// and `crates/jammi-ai/tests/it/acceleration_report.rs`'s own BERT-family
+/// fixtures.
+const BERT_GELU_FIXTURE_DIR: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../cookbook/fixtures/tiny_bert_head64"
+);
+
+/// `BERT_GELU_FIXTURE_DIR/config.json`, deserialised the same way
+/// `crates/jammi-encoders/tests/it/bert.rs`'s own `load_config_head64` does —
+/// this file's ONE read of that fixture's architecture facts, never a
+/// hand-copied literal `BertConfig`.
+fn bert_gelu_probe_config() -> BertConfig {
+    let path = Path::new(BERT_GELU_FIXTURE_DIR).join("config.json");
+    let raw =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    serde_json::from_str(&raw)
+        .unwrap_or_else(|e| panic!("{} must parse as a BertConfig: {e}", path.display()))
+}
+
+/// `BERT_GELU_FIXTURE_DIR/model.safetensors`.
+fn bert_gelu_probe_weights_path() -> PathBuf {
+    Path::new(BERT_GELU_FIXTURE_DIR).join("model.safetensors")
+}
+
+/// Drives ONE training-mode forward + backward + optimizer step of a REAL
+/// `jammi_encoders::Bert` at `dtype` on `device` — the ONLY call in this file
+/// that reaches `jammi_encoders::activations::gelu_erf`
+/// (`BertIntermediate::forward`'s unconditional call site), so it is the ONLY
+/// thing that can move `gelu_erf_fused`'s dispatch-registry counter. Mirrors
+/// [`probe_dtype`]'s own shape exactly (fresh `VarMap`, real trainable LoRA
+/// adapter, one forward + backward + one `AdamW` step, whole model discarded
+/// on return) over `Bert` instead of `ModernBert`. `target_modules = ["query",
+/// "value"]` matches this suite's own established BERT-family LoRA probe
+/// shape (`crates/jammi-ai/tests/it/acceleration_report.rs`'s
+/// `tiny_bert_head64_model` fine-tune job's `target_modules`) — `gelu_erf`'s
+/// own admission fires unconditionally inside `BertIntermediate::forward`
+/// regardless of which linear carries the adapter, so no MLP-site LoRA is
+/// needed to exercise it; what IS needed is a real trainable `Var` somewhere
+/// in the graph so `loss.backward()` + `AdamW::step` have something to do
+/// (mirroring [`probe_dtype`]'s own reasoning for why a `frozen()` build is
+/// the wrong shape for this probe).
+fn bert_probe_dtype(config: &BertConfig, weights: &Path, dtype: DType, device: &Device) {
+    let varmap = VarMap::new();
+    let target_modules = vec!["query".to_string(), "value".to_string()];
+    let lora = LoraBuildConfig {
+        target_modules: &target_modules,
+        layers_to_transform: &None,
+        lora_rank: 4,
+        lora_alpha: 8.0,
+        use_rslora: false,
+        lora_dropout: Some(0.1),
+        rank_pattern: &HashMap::new(),
+        init_mode: LoraInitMode::Gaussian,
+        seed: 1,
+    };
+    let mut model = Bert::builder()
+        .pooling(Pooling::Mean)
+        .backbone_dtype(dtype)
+        .lora(lora)
+        .build(&[weights], config, device, &varmap)
+        .unwrap_or_else(|e| panic!("capability_surface: build Bert ({dtype:?}): {e}"));
+    model.set_training(true);
+
+    let input_ids = synthetic_ids(2, 8, config.vocab_size, device);
+    let mask = Tensor::ones((2, 8), DType::U32, device).unwrap();
+    let output = model.forward(&input_ids, &mask).unwrap_or_else(|e| {
+        panic!(
+            "capability_surface: the gelu_erf BERT probe forward at backbone_dtype={dtype:?} \
+             must complete under JAMMI_KERNELS_STRICT=1 — a failure here means gelu_erf_fused \
+             did NOT admit for this dtype on this device: {e}"
+        )
+    });
+
+    let loss = output
+        .to_dtype(DType::F32)
+        .and_then(|t| t.sqr())
+        .and_then(|t| t.mean_all())
+        .unwrap_or_else(|e| {
+            panic!("capability_surface: gelu_erf BERT probe loss at backbone_dtype={dtype:?}: {e}")
+        });
+    let grads = loss.backward().unwrap_or_else(|e| {
+        panic!("capability_surface: gelu_erf BERT probe backward at backbone_dtype={dtype:?}: {e}")
+    });
+    let mut opt = AdamW::new(varmap.all_vars(), ParamsAdamW::default()).unwrap_or_else(|e| {
+        panic!(
+            "capability_surface: gelu_erf BERT probe AdamW::new at backbone_dtype={dtype:?}: {e}"
+        )
+    });
+    opt.step(&grads).unwrap_or_else(|e| {
+        panic!(
+            "capability_surface: the gelu_erf BERT probe optimizer step at backbone_dtype={dtype:?} \
+             must complete under JAMMI_KERNELS_STRICT=1: {e}"
+        )
+    });
+}
+
 // The CUDA_COMPILED/FLASH_COMPILED asserts below are deliberately over a
 // compile-time constant: the point is pinning "this build's `cfg!()`-derived
 // constant matches the feature this test was actually compiled with", a
@@ -632,6 +773,16 @@ async fn capability_surface() {
     let dir = TempDir::new().unwrap();
     let weights_path = dir.path().join("model.safetensors");
     write_synthetic_checkpoint(&config, &weights_path);
+
+    // The `gelu_erf` probe's own fixture (a REAL BERT checkpoint, not a
+    // synthetic one) and registry key — see this file's module doc's
+    // "`gelu_erf` needs its OWN architecture" section and [`bert_probe_dtype`]'s
+    // own doc for why ModernBERT's probe above cannot exercise this op.
+    let bert_config = bert_gelu_probe_config();
+    let bert_weights_path = bert_gelu_probe_weights_path();
+    let gelu_erf_registry_key = jammi_kernels::admission::probed_op("gelu_erf")
+        .and_then(|op| op.registry_keys_for(DtypeClass::Any).next())
+        .expect("gelu_erf is a PROBED_OPS TwoArm row with a DtypeClass::Any registry key");
 
     let subkernel_ops = internal_subkernel_ops();
     let cascade_op_list = cascade_ops();
@@ -704,6 +855,33 @@ async fn capability_surface() {
                 "manifest-declared op {report_op:?} must not have fallen back to eager at \
                  backbone_dtype={dtype} (a real eager fallback here would already have \
                  hard-errored the probe under Strict) — before={before:?} after={after:?}"
+            );
+        }
+
+        // `gelu_erf`: genuinely exercised via a SECOND, independent probe —
+        // a real BERT-family training forward (issue #463 follow-up; see
+        // this file's module doc and [`bert_probe_dtype`]'s own doc for WHY
+        // ModernBERT's probe above can never reach this seam). The
+        // before/after window wraps ONLY [`bert_probe_dtype`]'s own call, so
+        // a measured delta is attributable to that call and nothing else
+        // (family F: trace the mechanism, never transcribe a number).
+        if declared_ops.iter().any(|d| d == "gelu_erf") {
+            let gelu_erf_before =
+                jammi_kernels::admission::counters_for(gelu_erf_registry_key).snapshot();
+            bert_probe_dtype(&bert_config, &bert_weights_path, candle_dtype, &device);
+            let gelu_erf_after =
+                jammi_kernels::admission::counters_for(gelu_erf_registry_key).snapshot();
+            assert!(
+                gelu_erf_after.fused > gelu_erf_before.fused,
+                "manifest-declared op \"gelu_erf\" (registry key {gelu_erf_registry_key:?}) must \
+                 have dispatched FUSED at least once for backbone_dtype={dtype} on the BERT-family \
+                 probe, got before={gelu_erf_before:?} after={gelu_erf_after:?}"
+            );
+            assert_eq!(
+                gelu_erf_after.eager, gelu_erf_before.eager,
+                "\"gelu_erf\" must not have fallen back to eager at backbone_dtype={dtype} (a real \
+                 eager fallback here would already have hard-errored the probe under Strict) — \
+                 before={gelu_erf_before:?} after={gelu_erf_after:?}"
             );
         }
 
@@ -973,5 +1151,49 @@ fn manifest_capability_categories_match_probed_ops_by_kind() {
          ComputePrecision dtype tokens {tokens:?} — {non_dtype:?} are not dtypes, and this \
          capability is exempt from the op-bearing check above precisely on the grounds that it \
          names dtypes"
+    );
+}
+
+/// The `gelu_erf` seam's CPU-hermetic two-sided counter proof (issue #463
+/// follow-up): [`bert_probe_dtype`]'s BERT-family training forward at CPU F32
+/// — the ONE dtype/device pair `gelu_admission_predicate`'s CPU domain admits
+/// (`crates/jammi-encoders/src/activations.rs`'s own `dtype_f32_only_on_cpu`
+/// check) — must bump `gelu_erf_fused`'s FUSED counter and leave its EAGER
+/// counter untouched.
+///
+/// Runs on every lane: no `cuda` feature or GPU needed
+/// (`Bert::builder().backbone_dtype(DType::F32)` on `Device::Cpu` is an
+/// entirely ordinary CPU build). That is exactly why the async
+/// `capability_surface` test above cannot rely on this test ALONE — it still
+/// has to repeat the same proof on a real CUDA device at bf16/f16, which only
+/// a real GPU can admit (`gelu_admission_predicate`'s CUDA arm); this test
+/// covers the CPU F32 leg the `live-gpu-tests`-gated but GPU-less CI lane can
+/// actually run. Takes [`crate::harness::ADMISSION_COUNTER_SERIAL`] — see
+/// that lock's own doc for why a process-wide registry counter needs one.
+#[test]
+fn gelu_erf_fused_bumps_on_a_bert_family_training_forward_cpu_hermetic() {
+    let _guard = crate::harness::ADMISSION_COUNTER_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let device = Device::Cpu;
+    let config = bert_gelu_probe_config();
+    let weights_path = bert_gelu_probe_weights_path();
+    let registry_key = jammi_kernels::admission::probed_op("gelu_erf")
+        .and_then(|op| op.registry_keys_for(DtypeClass::Any).next())
+        .expect("gelu_erf is a PROBED_OPS TwoArm row with a DtypeClass::Any registry key");
+
+    let before = jammi_kernels::admission::counters_for(registry_key).snapshot();
+    bert_probe_dtype(&config, &weights_path, DType::F32, &device);
+    let after = jammi_kernels::admission::counters_for(registry_key).snapshot();
+
+    assert!(
+        after.fused > before.fused,
+        "a training-mode BERT-family forward at CPU F32 must dispatch gelu_erf_fused, got \
+         before={before:?} after={after:?}"
+    );
+    assert_eq!(
+        after.eager, before.eager,
+        "a training-mode BERT-family forward at CPU F32 must not ALSO fall back to eager -- \
+         only the fused arm may have run, got before={before:?} after={after:?}"
     );
 }

@@ -1564,6 +1564,22 @@ jobs:
           # `tokenizers` package required.
           - name: perf gen_fixed_width_corpus suite
             cmd: python3 ci/scripts/perf/test_gen_fixed_width_corpus.py
+          # The two MEDIA corpus producers' own suites (#421 PR B's declared
+          # workload inputs), the same doctrine as
+          # `gen_fixed_width_corpus`'s above: every shape/duration assertion
+          # is read back off the WRITTEN bytes (the PNG's own IHDR, the WAV
+          # header the stdlib `wave` module emitted) rather than off the
+          # in-memory arrays, determinism is proven by regenerating into a
+          # second directory and comparing bytes, the intra-family <
+          # inter-family separation the triplet structure claims is asserted
+          # MECHANICALLY rather than assumed, and the degenerate corners
+          # (`--jitter 0`, a duration rounding to zero frames, one family,
+          # one instance per family) are proven to refuse. Stdlib-only, no
+          # network, no image or audio package.
+          - name: perf gen_fixed_shape_image_corpus suite
+            cmd: python3 ci/scripts/perf/test_gen_fixed_shape_image_corpus.py
+          - name: perf gen_fixed_length_audio_corpus suite
+            cmd: python3 ci/scripts/perf/test_gen_fixed_length_audio_corpus.py
           # `fixture_width_report.py`'s own suite (#356 P4 Artifacts/"Width
           # pinning"): drives the real `derive_claim` pigeonhole-verdict
           # logic against a synthetic reaches_cap length table — never a

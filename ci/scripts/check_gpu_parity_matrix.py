@@ -62,14 +62,17 @@ serveable combination cannot silently ship with no GPU-parity accounting.
 ## SHIPPED architectures and verbs
 
 Architectures are parsed from the `AnyEncoder` enum
-(`crates/jammi-encoders/src/any.rs`: `Bert`, `DistilBert`, `ModernBert`,
-`ClipText` today) UNION a small, reviewed `EXTRA_ARCHITECTURES` list for the
-served architectures that dispatch a candle GPU forward but are not
-`AnyEncoder` variants — the OpenCLIP vision tower and the HTSAT-CLAP audio
-tower, each a distinct `Option<Box<dyn Candle*Forward>>` field on
-`CandleModel` (`crates/jammi-ai/src/model/backend/candle.rs`) with its own
-forward dispatch, exactly the shape the `AnyEncoder` doc comment's "if it's
-a distinct served arch" carve-out describes. Each `EXTRA_ARCHITECTURES`
+(`crates/jammi-encoders/src/any.rs`), with each variant name mapped through
+the reviewed `VARIANT_ARCHITECTURE_ALIASES` rename table (see its own
+comment: a rename onto an EXISTING row, never an exemption from one), UNION
+a small, reviewed `EXTRA_ARCHITECTURES` list. That list carries the served
+architectures reached through a distinct `Option<Box<dyn Candle*Forward>>`
+field on `CandleModel` (`crates/jammi-ai/src/model/backend/candle.rs`) with
+its own forward dispatch — exactly the shape the `AnyEncoder` doc comment's
+"if it's a distinct served arch" carve-out describes. The two lists overlap
+on purpose rather than partitioning: an architecture reachable BOTH as an
+`AnyEncoder` variant and as a `CandleModel` forward field is one row either
+way, and being named twice can never drop it. Each `EXTRA_ARCHITECTURES`
 entry is anchored to a `rust_symbol` that must still appear in the backend
 file — a rename or removal fails this gate rather than silently vanishing
 the architecture from the matrix (the same anchor-resolution discipline
@@ -202,6 +205,29 @@ EXTRA_ARCHITECTURES = [
     ),
     ExtraArchitecture("HtsatAudio", CANDLE_BACKEND, "HtsatAudio"),
 ]
+
+
+# An `AnyEncoder` VARIANT name that denotes an architecture this matrix
+# already keys on under a different name. A RENAME, never an exemption: the
+# cell still has to appear in COVERED / STRUCTURALLY_EXCLUDED / PENDING under
+# the mapped name, so mapping buys DRY bookkeeping and never a missing cell.
+# An unmapped variant keeps its own name and its own full row of verbs, so a
+# genuinely NEW architecture can never enter through this table.
+#
+# `AnyEncoder::Htsat` holds a `Box<HtsatAudio>`
+# (`crates/jammi-encoders/src/any.rs`) and is served through the SAME
+# `CandleModel` audio-tower forward that `EXTRA_ARCHITECTURES`' `HtsatAudio`
+# entry anchors by struct name — one served tower, one row. Without this the
+# same tower would occupy two rows and demand a second, duplicate set of
+# STRUCTURALLY_EXCLUDED reasons for the identical dispatch, which is the
+# contradictory bookkeeping this gate's own fail-closed contract forbids.
+# `OpenClipVision` needs no entry: its variant name and its
+# `EXTRA_ARCHITECTURES` name are already the same string.
+#
+# The mapped-to name must itself be a real architecture in the matrix
+# (asserted below), so a typo here fails loudly rather than silently deleting
+# a variant's row.
+VARIANT_ARCHITECTURE_ALIASES = {"Htsat": "HtsatAudio"}
 
 
 # --------------------------------------------------------------------------- #
@@ -471,7 +497,8 @@ def load_shipped() -> tuple[set[str], set[str]]:
     if not CANDLE_BACKEND.is_file():
         raise MatrixError(f"candle backend source not found: {CANDLE_BACKEND}")
 
-    architectures = set(parse_enum_variants(ANY_ENCODER.read_text(encoding="utf-8"), "AnyEncoder"))
+    variants = set(parse_enum_variants(ANY_ENCODER.read_text(encoding="utf-8"), "AnyEncoder"))
+    architectures = {VARIANT_ARCHITECTURE_ALIASES.get(v, v) for v in variants}
     verbs = set(parse_enum_variants(MODEL_TASK.read_text(encoding="utf-8"), "ModelTask"))
 
     candle_src = CANDLE_BACKEND.read_text(encoding="utf-8")
@@ -484,6 +511,24 @@ def load_shipped() -> tuple[set[str], set[str]]:
                 "renamed or removed; update EXTRA_ARCHITECTURES."
             )
         architectures.add(extra.name)
+
+    # Rot guard on the alias table itself (see its own comment): a source
+    # variant that no longer exists, or a target that is not a real
+    # architecture in the matrix, is a hard failure — never a silently
+    # inert row that would let a genuinely new variant slip in unaccounted.
+    for source, target in sorted(VARIANT_ARCHITECTURE_ALIASES.items()):
+        if source not in variants:
+            raise MatrixError(
+                f"VARIANT_ARCHITECTURE_ALIASES maps `{source}`, which is no longer an "
+                f"`AnyEncoder` variant in {ANY_ENCODER.relative_to(REPO_ROOT)} — the "
+                "variant was renamed or removed; update the alias table."
+            )
+        if target not in architectures:
+            raise MatrixError(
+                f"VARIANT_ARCHITECTURE_ALIASES maps `{source}` onto `{target}`, which is "
+                "not an architecture in this matrix — a mapped-to name must itself be a "
+                "real row, or the variant's cells vanish unaccounted."
+            )
 
     return architectures, verbs
 

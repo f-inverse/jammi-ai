@@ -59,11 +59,11 @@ mod pooling;
 mod test_support;
 
 pub use aggregate::{segment_aggregate, SegmentReduce};
-// `audio::{AnyAudioEncoder, AudioEncoder}` were REMOVED here (breaking):
-// the audio-only dispatcher and its trait had zero callers anywhere in the
-// workspace, and `AnyEncoder` now covers audio as a first-class variant with
-// real training hooks — keeping a second, parallel audio dispatcher would be
-// exactly the family-erasure duplication `AnyEncoder` exists to avoid.
+// There is deliberately NO second, audio-only dispatcher or trait beside
+// `AnyEncoder`: audio is a first-class `AnyEncoder` variant carrying the same
+// real training hooks every other variant does, and a parallel audio-only
+// dispatcher would be exactly the family-erasure duplication `AnyEncoder`
+// exists to avoid.
 pub use any::{AnyEncoder, EncoderInput, Modality, OwnedEncoderInput};
 pub use bert::{Bert, BertConfig};
 pub use clip_text::{ClipText, ClipTextBuilder, ClipTextConfig};

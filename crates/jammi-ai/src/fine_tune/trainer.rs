@@ -329,6 +329,14 @@ pub struct TrainingLoop {
     /// regression loss into a z-space the zero-initialised head can reach, while
     /// the head itself stays in raw space — so serving needs no de-standardisation.
     target_scaler: Option<TargetScaler>,
+    /// The task this run trains for. It is the DISCRIMINATOR for the media
+    /// paths: a `MediaTriplet` chunk carries three binary columns whose
+    /// modality the columns themselves cannot express (an encoded WAV and an
+    /// encoded PNG are both `Vec<u8>`), so [`Self::encode_media`] dispatches
+    /// on this rather than on a sniffed byte header — the caller's declared
+    /// task is authoritative, exactly as `build_training_data_loader`'s own
+    /// format detection already treats it.
+    task: ModelTask,
     device: Device,
     /// Cooperative-cancellation flag the worker's heartbeat task sets when the
     /// lease is lost. Checked at every epoch boundary; once set the loop bails
@@ -386,6 +394,11 @@ pub struct TrainingLoopBuilder {
     attempt: String,
     catalog: Option<Arc<Catalog>>,
     artifact_dir: Option<PathBuf>,
+    /// See [`TrainingLoop::task`]. Defaults to
+    /// [`ModelTask::TextEmbedding`] — the shape every trainer-internal test
+    /// that never calls [`Self::task`] trains; the production worker always
+    /// sets it from the job record.
+    task: ModelTask,
     device: Device,
     cancel: Arc<AtomicBool>,
     artifact_store: Option<Arc<ArtifactStore>>,
@@ -409,6 +422,7 @@ impl TrainingLoopBuilder {
             attempt: "0".to_string(),
             catalog: None,
             artifact_dir: None,
+            task: ModelTask::TextEmbedding,
             device: Device::Cpu,
             cancel: Arc::new(AtomicBool::new(false)),
             artifact_store: None,
@@ -428,6 +442,16 @@ impl TrainingLoopBuilder {
     /// persisted epoch boundary instead of starting fresh.
     pub fn resume(mut self, restored: RestoredCheckpoint) -> Self {
         self.resume = Some(restored);
+        self
+    }
+
+    /// Set the task this run trains for — the modality discriminator for
+    /// the media (image/audio) triplet paths. See `TrainingLoop::task`
+    /// (private field).
+    /// Omit it for a text run (defaults to
+    /// [`ModelTask::TextEmbedding`]).
+    pub fn task(mut self, task: ModelTask) -> Self {
+        self.task = task;
         self
     }
 
@@ -524,6 +548,7 @@ impl TrainingLoopBuilder {
             training_mode: false,
             divergence_count: 0,
             target_scaler: None,
+            task: self.task,
             device: self.device,
             cancel: self.cancel,
             artifact_store: self.artifact_store,
@@ -1670,7 +1695,16 @@ impl TrainingLoop {
                     )),
                 };
 
-                let effective_max = self.config.max_seq_length.min(encoder.max_seq_length());
+                // `AnyEncoder::max_seq_length` refuses on a media tower
+                // (W1: no token-sequence capacity exists there, and every
+                // filler would flow into this `min()` as a confidently wrong
+                // bound). This arm is text-only by construction — it is
+                // reached from `encode_texts` — so the refusal is surfaced
+                // as the typed fine-tune error rather than absorbed.
+                let encoder_max = encoder
+                    .max_seq_length()
+                    .map_err(|e| JammiError::FineTune(format!("{e}")))?;
+                let effective_max = self.config.max_seq_length.min(encoder_max);
                 // esc-076 amendment (adversarial-audit round 2, campaign
                 // #443, item 3; r3 finding B4 corrected the bound below —
                 // see `tokenize_natural_width`'s own doc for the full
@@ -1728,40 +1762,179 @@ impl TrainingLoop {
         }
     }
 
-    /// Encode a slice of audio clips into a `[batch, hidden]` embedding
-    /// tensor through the frozen audio base model and the LoRA projection
-    /// head.
+    /// Encode a slice of encoded MEDIA items (audio clips or images) into a
+    /// `[batch, hidden]` embedding tensor.
     ///
-    /// Each clip is encoded audio bytes (WAV/FLAC/MP3/Ogg); the base model
-    /// owns decode → resample → log-mel → audio-tower forward, exactly as the
-    /// `encode_audio_query` inference path does. Only the `ProjectionHead`
-    /// target trains an audio adapter — LoRA injected *inside* an audio
-    /// encoder is not supported, so `EncoderAdapters` here is a typed error
-    /// rather than a silent wrong path.
-    fn encode_audio(&self, clips: &[Vec<u8>]) -> Result<Tensor> {
+    /// Each item is one encoded blob — audio bytes (WAV/FLAC/MP3/Ogg) for
+    /// [`ModelTask::AudioEmbedding`], an encoded image (PNG/JPEG/…) for
+    /// [`ModelTask::ImageEmbedding`]. The blob type is NOT sniffed: the
+    /// run's own [`TrainingLoop::task`] is the discriminator, so a caller
+    /// that submits images under `task=audio_embedding` gets a typed decode
+    /// refusal rather than a confidently wrong spectrogram.
+    ///
+    /// Two targets, one shape:
+    /// - `ProjectionHead`: the frozen base model owns the whole front end
+    ///   (decode → resample → log-mel / pad-resize-normalize → tower
+    ///   forward), and the head projects its pooled output. Unchanged.
+    /// - `EncoderAdapters`: the LoRA-wrapped tower is forwarded DIRECTLY, so
+    ///   this method owns the front end — the SAME `audio_preprocess` /
+    ///   `image_preprocess` functions the serving path
+    ///   (`CandleModel::forward_audio_embedding` /
+    ///   `forward_image_embedding`) runs, with the tower's own geometry read
+    ///   off the encoder, so a trained embedding and a served one can never
+    ///   disagree about preprocessing.
+    fn encode_media(&self, items: &[Vec<u8>]) -> Result<Tensor> {
         let base = self
             .base_model
             .as_ref()
-            .ok_or_else(|| JammiError::FineTune("encode_audio requires a base model".into()))?;
+            .ok_or_else(|| JammiError::FineTune("encode_media requires a base model".into()))?;
         match &self.target {
             TrainingTarget::ProjectionHead { .. } => {
-                let clip_refs: Vec<&[u8]> = clips.iter().map(|c| c.as_slice()).collect();
-                let arr = Arc::new(BinaryArray::from(clip_refs)) as ArrayRef;
-                self.project_frozen_embedding(base, arr, ModelTask::AudioEmbedding)
+                let refs: Vec<&[u8]> = items.iter().map(|c| c.as_slice()).collect();
+                let arr = Arc::new(BinaryArray::from(refs)) as ArrayRef;
+                self.project_frozen_embedding(base, arr, self.task)
             }
-            TrainingTarget::EncoderAdapters(_) => Err(JammiError::FineTune(
-                "Audio fine-tuning trains a projection head on a frozen audio encoder; \
-                 LoRA injected inside the audio encoder is not supported. \
-                 Leave `target_modules` empty for audio tasks."
-                    .into(),
-            )),
+            TrainingTarget::EncoderAdapters(state) => {
+                let encoder = &state.encoder;
+                let input = match self.task {
+                    ModelTask::AudioEmbedding => self.audio_encoder_input(base, items)?,
+                    ModelTask::ImageEmbedding => self.image_encoder_input(encoder, items)?,
+                    other => {
+                        return Err(JammiError::FineTune(format!(
+                            "task {other} expects text columns; the training data supplied \
+                             binary (image/audio) triplet columns. For image/audio triplets \
+                             submit task=image_embedding/audio_embedding."
+                        )))
+                    }
+                };
+                encoder
+                    .forward_input(&input.as_input())
+                    .map_err(|e| JammiError::FineTune(format!("Encoder forward: {e}")))
+            }
         }
+    }
+
+    /// Turn encoded audio bytes into the CLAP fusion batch the HTSAT tower
+    /// consumes, through the SAME front end the serving audio path runs.
+    ///
+    /// The front-end GEOMETRY (sample rate, FFT size, hop, mel band) belongs
+    /// to the checkpoint's `preprocessor_config.json`, not to the tower, so
+    /// it is read off the loaded base model
+    /// ([`crate::model::backend::candle::CandleModel::audio_frontend`]). A
+    /// base model that carries no such config is a typed refusal — there is
+    /// no defaulted geometry that would be anything but a guess, and a
+    /// guessed mel filterbank is a silently wrong spectrogram.
+    fn audio_encoder_input(
+        &self,
+        base: &Arc<LoadedModel>,
+        clips: &[Vec<u8>],
+    ) -> Result<jammi_encoders::OwnedEncoderInput> {
+        use crate::inference::audio_preprocess;
+
+        let candle = match base.as_ref() {
+            LoadedModel::Candle(m) => m,
+            _ => {
+                return Err(JammiError::FineTune(
+                    "Encoder-adapters audio training requires a Candle base model".into(),
+                ))
+            }
+        };
+        let frontend = candle.audio_frontend().ok_or_else(|| {
+            JammiError::FineTune(
+                "Encoder-adapters audio training requires the base model's CLAP \
+                 feature-extractor geometry (preprocessor_config.json); the loaded base \
+                 model carries none"
+                    .into(),
+            )
+        })?;
+
+        let mut decoded = Vec::with_capacity(clips.len());
+        for (i, clip) in clips.iter().enumerate() {
+            decoded.push(
+                audio_preprocess::decode_audio_bytes(clip)
+                    .map_err(|e| JammiError::FineTune(format!("Decode audio row {i}: {e}")))?,
+            );
+        }
+        let (input_features, is_longer) =
+            audio_preprocess::preprocess_clap_fusion(&decoded, frontend, &self.device)
+                .map_err(|e| JammiError::FineTune(format!("CLAP fusion front end: {e}")))?;
+        Ok(jammi_encoders::OwnedEncoderInput::Audio {
+            input_features,
+            is_longer,
+        })
+    }
+
+    /// Turn encoded image bytes into the normalized pixel batch the vision
+    /// tower consumes, through the SAME front end the serving image path
+    /// runs. Side length and per-channel mean/std come from the ENCODER (the
+    /// tower's own config), never a caller-side table.
+    fn image_encoder_input(
+        &self,
+        encoder: &jammi_encoders::AnyEncoder,
+        images: &[Vec<u8>],
+    ) -> Result<jammi_encoders::OwnedEncoderInput> {
+        use crate::inference::image_preprocess;
+
+        let geometry = |what: &str, e: jammi_encoders::EncoderError| {
+            JammiError::FineTune(format!("Image training needs the tower's {what}: {e}"))
+        };
+        let side = encoder
+            .image_size()
+            .map_err(|e| geometry("image_size", e))? as u32;
+        let mean = encoder
+            .preprocess_mean()
+            .map_err(|e| geometry("preprocess_mean", e))?;
+        let std = encoder
+            .preprocess_std()
+            .map_err(|e| geometry("preprocess_std", e))?;
+
+        let mut decoded = Vec::with_capacity(images.len());
+        for (i, bytes) in images.iter().enumerate() {
+            decoded.push(
+                image::load_from_memory(bytes)
+                    .map_err(|e| JammiError::FineTune(format!("Decode image row {i}: {e}")))?,
+            );
+        }
+        let pixel_values =
+            image_preprocess::preprocess_image_batch(&decoded, side, &mean, &std, &self.device)
+                .map_err(|e| JammiError::FineTune(format!("Image front end: {e}")))?;
+        Ok(jammi_encoders::OwnedEncoderInput::Image { pixel_values })
+    }
+
+    /// Encode several MEDIA groups in ONE forward, returning one
+    /// `[group_rows, hidden]` tensor per group — the media peer of
+    /// [`Self::encode_groups`].
+    ///
+    /// A media triplet used to cost THREE forwards (one per group) while the
+    /// text triplet path already cost one, so the two modalities' training
+    /// steps were not comparable and the media path paid a 3x front-end and
+    /// kernel-launch bill for nothing. Joining is exact here for a stronger
+    /// reason than in the text case: media rows are FIXED-shape (a fusion
+    /// spectrogram is `[4, chunk_frames, n_mels]`, a pixel batch is
+    /// `[3, side, side]`), so joining introduces no padding at all and the
+    /// concatenated batch is element-for-element the three separate batches
+    /// stacked.
+    fn encode_media_groups(&self, groups: &[&Vec<Vec<u8>>]) -> Result<Vec<Tensor>> {
+        let rows: Vec<usize> = groups.iter().map(|g| g.len()).collect();
+        let joined: Vec<Vec<u8>> = groups.iter().flat_map(|g| g.iter().cloned()).collect();
+        let all = self.encode_media(&joined)?;
+
+        let mut out = Vec::with_capacity(groups.len());
+        let mut offset = 0usize;
+        for n in rows {
+            out.push(
+                all.narrow(0, offset, n)
+                    .map_err(|e| JammiError::FineTune(format!("split encoded groups: {e}")))?,
+            );
+            offset += n;
+        }
+        Ok(out)
     }
 
     /// Run a content column through the frozen base model for `task`, then
     /// project the pooled embeddings through the projection head's first LoRA
-    /// layer. Shared by the text and audio projection-head paths — the only
-    /// difference between modalities is the Arrow array type and the
+    /// layer. Shared by the text, image and audio projection-head paths — the
+    /// only difference between modalities is the Arrow array type and the
     /// `ModelTask`, both supplied by the caller.
     fn project_frozen_embedding(
         &self,
@@ -1873,17 +2046,23 @@ impl TrainingLoop {
                     negative: proj_n,
                 })
             }
-            TextChunk::AudioTriplet {
+            TextChunk::MediaTriplet {
                 anchors,
                 positives,
                 negatives,
             } => {
-                // Audio triplets reuse the triplet contrastive objective
-                // verbatim — only the encode step differs (audio bytes →
-                // frozen audio tower → projection head, vs text → text tower).
-                let proj_a = self.encode_audio(anchors)?;
-                let proj_p = self.encode_audio(positives)?;
-                let proj_n = self.encode_audio(negatives)?;
+                // Media triplets reuse the triplet contrastive objective
+                // verbatim — only the encode step differs (encoded blobs →
+                // the run's own modality front end → tower, vs text → text
+                // tower). Encoded as ONE joined batch and split, exactly as
+                // `TextChunk::Triplet` above does through `encode_groups`;
+                // see `encode_media_groups` for why joining is exact here.
+                let mut e = self
+                    .encode_media_groups(&[anchors, positives, negatives])?
+                    .into_iter();
+                let proj_a = e.next().expect("group 0");
+                let proj_p = e.next().expect("group 1");
+                let proj_n = e.next().expect("group 2");
                 Ok(super::data::TrainingBatch::Triplet {
                     anchor: proj_a,
                     positive: proj_p,

@@ -44,7 +44,7 @@
 #      over `Strict` (`crates/jammi-kernels/src/admission.rs:62-64`), and
 #      `--expect-kernels-disabled` hard-errors before a single step runs if
 #      `JAMMI_KERNELS_DISABLE` was dropped, mistyped, or not forwarded to
-#      this process — `params.expect_kernels_disabled` (`finetune_step.rs:692-699`)
+#      this process — `params.expect_kernels_disabled` (`finetune_step.rs:702-715`)
 #      checks it FIRST, before any device/checkpoint/tensor work — so a
 #      silently-clean env var can never masquerade as a real eager leg.
 #      `kernels_disabled_requested`/`kernels_disabled_fired` are surfaced on
@@ -174,9 +174,9 @@
 # happened to notice it. Both `jammi-fused` legs additionally pass
 # `--expect-kernels-disabled ""` (F5, adversarial audit): an EMPTY
 # expectation, checked via the SAME exact-SET-equality
-# `params.expect_kernels_disabled` (`finetune_step.rs:692-699`) machinery
+# `params.expect_kernels_disabled` (`finetune_step.rs:702-715`) machinery
 # the eager leg's own nonempty list uses —
-# `parse_disable_list` (`crates/jammi-kernels/src/admission.rs:982-990`)
+# `parse_disable_list` (`crates/jammi-kernels/src/admission.rs:1037-1046`)
 # is the empty set for `Some("")`, so
 # this hard-fails the run if `JAMMI_KERNELS_DISABLE` carries ANYTHING at
 # all when this process starts, catching an AMBIENT/leaked env var (a
@@ -323,23 +323,26 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 
 # The named constant this script's jammi-eager leg disables — EXACTLY the
-# nine LIVE, STANDALONE `admit()`/`admit_cascade()`/`op_disabled()` op keys
+# ten LIVE, STANDALONE `admit()`/`admit_cascade()`/`op_disabled()` op keys
 # this crate's fused finetune-step call graph actually reaches on a real
 # training step (confirmed at this contract's tip: `layer_norm_fused`
 # `crates/jammi-encoders/src/layer_norm.rs:582`, `geglu_fused`
-# `crates/jammi-encoders/src/modernbert.rs:1944`, `attention_block_flash`
-# `crates/jammi-encoders/src/modernbert.rs:2626` (`op_disabled`, the
+# `crates/jammi-encoders/src/modernbert.rs:1424`, `gelu_erf_fused`
+# `crates/jammi-encoders/src/activations.rs:132`, `attention_block_flash`
+# `crates/jammi-encoders/src/modernbert.rs:1990` (`op_disabled`, the
 # cascade's own capability gate), `attention_block_fused`
-# `crates/jammi-encoders/src/modernbert.rs:1348`, `rope_fused`
-# `crates/jammi-encoders/src/modernbert.rs:581`, `softmax_last_dim_fused`
-# `crates/jammi-encoders/src/modernbert.rs:1869`, `lora_linear_fused`
+# `crates/jammi-encoders/src/attention_cascade.rs:914` (moved out of
+# `crate::modernbert`, issue #462), `rope_fused`
+# `crates/jammi-encoders/src/modernbert.rs:484`, `softmax_last_dim_fused`
+# `crates/jammi-encoders/src/attention_cascade.rs:654` (moved out of
+# `crate::modernbert`, issue #462), `lora_linear_fused`
 # `crates/jammi-lora/src/lora_linear.rs:958`, `adamw_step_fused`
 # `crates/jammi-ai/src/fine_tune/adamw.rs:259`, `mem_efficient_attention`
-# `crates/jammi-encoders/src/modernbert.rs:1311` (`admit_cascade`, the
+# `crates/jammi-encoders/src/attention_cascade.rs:868` (`admit_cascade`, the
 # per-layer memeff cascade — consulted on EVERY training-mode attention
 # layer once the flash cascade has declined, BEFORE the block arm's own
 # `admit()`) and `op_disabled`
-# (`crates/jammi-encoders/src/modernbert.rs:2976`) is the once-per-forward
+# (`crates/jammi-encoders/src/modernbert.rs:2340`) is the once-per-forward
 # gate that suppresses the block/eager mask bundle when memeff is going to
 # fire.
 # `mem_efficient_attention` is the NINTH key, added by adversarial-audit
@@ -352,8 +355,14 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 # whether it is named here, a domain-miss coincidence that hid the gap
 # from every real sweep this script has ever run, not a proof the key was
 # unneeded.
+# `gelu_erf_fused` is the TENTH key, issue #463's fused GELU-erf
+# activation (`crate::activations::gelu_erf`, a live standalone `admit`
+# site reached on every training-mode BERT/DistilBERT FFN forward) — this
+# script's own `test_finetune_ab_disable_op_keys.py` suite caught its
+# absence mechanically the moment the op landed: the all-eager leg would
+# otherwise silently leave this site fused.
 #
-# SWEEP METHOD (so a TENTH addition gets caught, not merely this ninth):
+# SWEEP METHOD (so an ELEVENTH addition gets caught, not merely this tenth):
 # every entry above was found by grepping `crates/jammi-encoders/src/`,
 # `crates/jammi-lora/src/`, and `crates/jammi-ai/src/fine_tune/` for a
 # direct `admit(`/`admit_cascade(`/`op_disabled(` call and reading off its
@@ -381,12 +390,13 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 #     registered op was — exactly the wrong guarantee for a leg whose whole
 #     job is to certify every fused op ran eager.
 #   * NOT the report's `..._fused_dispatches`/`..._eager_dispatches`
-#     COUNTER base-names (`ln`, `rope`, `softmax`, `geglu`,
+#     COUNTER base-names (`ln`, `rope`, `softmax`, `geglu`, `gelu`,
 #     `attention_block`, `lora_epilogue`, `lora_linear`, `adamw`) — a
 #     DIFFERENT vocabulary from the `admit`/`op_disabled` OP KEYS this
 #     env var actually consumes (e.g. the counter base is `ln`, the admit
 #     op key is `layer_norm_fused`; the counter base is `attention_block`,
-#     the admit op key for its own site is `attention_block_fused`).
+#     the admit op key for its own site is `attention_block_fused`; the
+#     counter base is `gelu`, the admit op key is `gelu_erf_fused`).
 #     Naming a counter base directly in `JAMMI_KERNELS_DISABLE` is a
 #     silent no-op — it never matches any real `admit`/`op_disabled` call,
 #     so `unmatched_disables()` (or, on this leg,
@@ -408,7 +418,7 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 #     `kernel_disable_of_a_registered_but_dead_op_name_invalidates_the_run`
 #     (`crates/jammi-bench/tests/finetune_step_kernel_disable.rs:112`)
 #     proves this against the real CLI.
-JAMMI_EAGER_DISABLE_OP_KEYS="layer_norm_fused,geglu_fused,attention_block_flash,attention_block_fused,rope_fused,softmax_last_dim_fused,lora_linear_fused,adamw_step_fused,mem_efficient_attention"
+JAMMI_EAGER_DISABLE_OP_KEYS="layer_norm_fused,geglu_fused,gelu_erf_fused,attention_block_flash,attention_block_fused,rope_fused,softmax_last_dim_fused,lora_linear_fused,adamw_step_fused,mem_efficient_attention"
 
 AB_DRY_RUN="${AB_DRY_RUN:-0}"
 AB_CUDA_ORDINAL="${AB_CUDA_ORDINAL:-0}"

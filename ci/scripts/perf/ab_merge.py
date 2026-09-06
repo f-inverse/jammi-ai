@@ -26,28 +26,28 @@ jammi-vs-torch comparator this repo carries:
 
 | field | class | jammi emit site | torch emit site |
 |---|---|---|---|
-| `seed` | identity | `report.rs:FinetuneStepTier::seed` field; `seed: params.seed,` (`finetune_step.rs:936`) | `"seed": args.seed,` (`torch_finetune_step.py:1260`) |
-| `batch` | identity | `batch: params.batch,` (`finetune_step.rs:941`) | `"batch": args.batch,` (`torch_finetune_step.py:1278`) |
-| `seq` | identity | `seq: params.seq,` (`finetune_step.rs:942`) | `"seq": args.seq,` (`torch_finetune_step.py:1279`) |
-| `lora_rank` | identity | `lora_rank: params.lora_rank,` (`finetune_step.rs:943`) | `"lora_rank": args.lora_rank,` (`torch_finetune_step.py:1280`) |
-| `lora_alpha` | identity — input was already threaded through `FinetuneStepParams::lora_alpha`, just never emitted before this round | `lora_alpha: params.lora_alpha,` (`finetune_step.rs:944`) | `"lora_alpha": args.lora_alpha,` (`torch_finetune_step.py:1253`) |
-| `lora_dropout` | identity | `lora_dropout: params.lora_dropout` (`finetune_step.rs:945`) | `"lora_dropout": args.lora_dropout,` (`torch_finetune_step.py:1281`) |
-| `margin` | identity, but jammi HARDCODES `0.3` (no `--margin` CLI flag — the call site's own literal, `let loss = triplet_loss(&a, &p, &n, 0.3)?;` (`finetune_step.rs:602`)) | `margin: 0.3,` (`finetune_step.rs:952`) | `"margin": args.margin,` (`torch_finetune_step.py:1262`) — `--margin` default `0.3` |
-| `target_modules` | identity | `target_modules: params.target_modules.clone(),` (`finetune_step.rs:953`) | `"target_modules": [` (`torch_finetune_step.py:1284`) |
-| `batched_forward` | identity | `batched_forward: params.batched_forward,` (`finetune_step.rs:954`) | `"batched_forward": args.batched_forward,` (`torch_finetune_step.py:1287`) |
-| `backbone_dtype` | identity | `backbone_dtype: format!("{:?}", params.backbone_dtype)` (`finetune_step.rs:937`) | `"backbone_dtype": args.dtype,` (`torch_finetune_step.py:1269`) |
-| `steps_measured` | identity — the reachable divergence this table used to miss entirely: two legs measured at a DIFFERENT step count (e.g. a mismatched `--steps`/`--warmup` override) still merged to a "clean" ratio before this field was compared | `steps_measured: times.len(),` (`finetune_step.rs:972`) | `"steps_measured": len(times),` (`torch_finetune_step.py:1320`) |
-| `checkpoint_config_sha256` | identity — same base-checkpoint CONTENT identity `grad_oracle.rs`'s tier already carries, added to THIS tier too | `let (checkpoint_config_sha256, _config_len) =` (`finetune_step.rs:717`), via the SHARED streaming `pub(crate) fn sha256_and_len` (`finetune_step.rs:1091`) | `checkpoint_identity_fields = checkpoint_identity(args.model_dir)` (`torch_finetune_step.py:1130`) |
-| `checkpoint_weights_sha256` | identity | `let (checkpoint_weights_sha256, checkpoint_weights_size_bytes) =` (`finetune_step.rs:719`) | `"checkpoint_weights_sha256": weights_sha256,` (`torch_finetune_step.py:685`) |
-| `checkpoint_weights_size_bytes` | identity | `checkpoint_weights_size_bytes) =` (`finetune_step.rs:719`) — same call as the row above, its second return value | `"checkpoint_weights_size_bytes": weights_len,` (`torch_finetune_step.py:686`) |
-| `row_lengths` | identity (K7 audit: 17 -> 18 fields) — the per-row token lengths the padded fixture fed the encoder, requested or the dense-leg default `[seq; batch]`; NO canonicalizer, per-row order is load-bearing (`[3, 6]` != `[6, 3]`), compared directly, never hashed | `row_lengths: params` (`finetune_step.rs:966`), dense fallback `vec![params.seq; params.batch]` (`finetune_step.rs:969`) | `"row_lengths": args.row_lengths` (`torch_finetune_step.py:1295`), dense fallback `else [args.seq] * args.batch,` (`torch_finetune_step.py:1297`) |
+| `seed` | identity | `report.rs:FinetuneStepTier::seed` field; `seed: params.seed,` (`finetune_step.rs:953`) | `"seed": args.seed,` (`torch_finetune_step.py:1260`) |
+| `batch` | identity | `batch: params.batch,` (`finetune_step.rs:958`) | `"batch": args.batch,` (`torch_finetune_step.py:1278`) |
+| `seq` | identity | `seq: params.seq,` (`finetune_step.rs:959`) | `"seq": args.seq,` (`torch_finetune_step.py:1279`) |
+| `lora_rank` | identity | `lora_rank: params.lora_rank,` (`finetune_step.rs:960`) | `"lora_rank": args.lora_rank,` (`torch_finetune_step.py:1280`) |
+| `lora_alpha` | identity — input was already threaded through `FinetuneStepParams::lora_alpha`, just never emitted before this round | `lora_alpha: params.lora_alpha,` (`finetune_step.rs:961`) | `"lora_alpha": args.lora_alpha,` (`torch_finetune_step.py:1253`) |
+| `lora_dropout` | identity | `lora_dropout: params.lora_dropout` (`finetune_step.rs:962`) | `"lora_dropout": args.lora_dropout,` (`torch_finetune_step.py:1281`) |
+| `margin` | identity, but jammi HARDCODES `0.3` (no `--margin` CLI flag — the call site's own literal, `let loss = triplet_loss(&a, &p, &n, 0.3)?;` (`finetune_step.rs:612`)) | `margin: 0.3,` (`finetune_step.rs:969`) | `"margin": args.margin,` (`torch_finetune_step.py:1262`) — `--margin` default `0.3` |
+| `target_modules` | identity | `target_modules: params.target_modules.clone(),` (`finetune_step.rs:970`) | `"target_modules": [` (`torch_finetune_step.py:1284`) |
+| `batched_forward` | identity | `batched_forward: params.batched_forward,` (`finetune_step.rs:971`) | `"batched_forward": args.batched_forward,` (`torch_finetune_step.py:1287`) |
+| `backbone_dtype` | identity | `backbone_dtype: format!("{:?}", params.backbone_dtype)` (`finetune_step.rs:954`) | `"backbone_dtype": args.dtype,` (`torch_finetune_step.py:1269`) |
+| `steps_measured` | identity — the reachable divergence this table used to miss entirely: two legs measured at a DIFFERENT step count (e.g. a mismatched `--steps`/`--warmup` override) still merged to a "clean" ratio before this field was compared | `steps_measured: times.len(),` (`finetune_step.rs:989`) | `"steps_measured": len(times),` (`torch_finetune_step.py:1320`) |
+| `checkpoint_config_sha256` | identity — same base-checkpoint CONTENT identity `grad_oracle.rs`'s tier already carries, added to THIS tier too | `let (checkpoint_config_sha256, _config_len) =` (`finetune_step.rs:727`), via the SHARED streaming `pub(crate) fn sha256_and_len` (`finetune_step.rs:1114`) | `checkpoint_identity_fields = checkpoint_identity(args.model_dir)` (`torch_finetune_step.py:1130`) |
+| `checkpoint_weights_sha256` | identity | `let (checkpoint_weights_sha256, checkpoint_weights_size_bytes) =` (`finetune_step.rs:729`) | `"checkpoint_weights_sha256": weights_sha256,` (`torch_finetune_step.py:685`) |
+| `checkpoint_weights_size_bytes` | identity | `checkpoint_weights_size_bytes) =` (`finetune_step.rs:729`) — same call as the row above, its second return value | `"checkpoint_weights_size_bytes": weights_len,` (`torch_finetune_step.py:686`) |
+| `row_lengths` | identity (K7 audit: 17 -> 18 fields) — the per-row token lengths the padded fixture fed the encoder, requested or the dense-leg default `[seq; batch]`; NO canonicalizer, per-row order is load-bearing (`[3, 6]` != `[6, 3]`), compared directly, never hashed | `row_lengths: params` (`finetune_step.rs:983`), dense fallback `vec![params.seq; params.batch]` (`finetune_step.rs:986`) | `"row_lengths": args.row_lengths` (`torch_finetune_step.py:1295`), dense fallback `else [args.seq] * args.batch,` (`torch_finetune_step.py:1297`) |
 | `max_grad_norm` | identity (PR #381 audit B1) — `null` (clip OFF) or the positive finite bound the PRODUCTION `clip_gradients` ran with; a clip-on leg and a clip-off leg compute a different step. `null` is a VALUE for this field (`identity_fields.FINETUNE_NULL_IS_A_VALUE_FIELDS`), never folded into MISSING | `max_grad_norm: params.max_grad_norm,` (`finetune_step.rs`'s tier literal) | `"max_grad_norm": args.max_grad_norm,` in the `finetune_step` block (`torch_finetune_step.py`) |
 | `attention_arm` | identity (PR #381 audit B1 class probe) — the attention REFERENCE CLASS the leg was ASKED to run, `"eager"` or `"fused"`; jammi's is the operator's `JAMMI_KERNELS_DISABLE` request (an attention base in `kernels_disabled_requested` ⇒ eager), NEVER the counters (a by-design domain decline is a measurement, not a premise) — see `identity_fields.FINETUNE_IDENTITY_FIELDS`'s own entry | `attention_arm: attention_arm(&kernels_disabled_requested).to_string()` (`finetune_step.rs`'s tier literal) | `"attention_arm": attention_arm_of(resolved_attn_implementation)` in the `finetune_step` block (`torch_finetune_step.py`) |
 | `warmup` | identity (PR #381 re-audit) — changes what `clip_invocations` counts (pre-step + warmup + measured) | `warmup: params.warmup,` (`finetune_step.rs`'s tier literal) | `"warmup": args.warmup,` in the `args` block (`torch_finetune_step.py`) — an `_TORCH_ARGS_LEVEL_FIELDS` member |
 | `clip_invocations` | measurement (PR #381 audit B2) — the COUNTED number of times the production clip ran this process (pre-step + warmup + measured, every `step_once`), the fact behind a clip-on row rather than a log line; recorded in `leg_provenance` per leg AND cross-checked against `max_grad_norm` by `clip_fact_violations` (clip requested ⇒ `> 0`; not requested ⇒ `== 0`) | `clip_invocations:` (`finetune_step.rs`'s tier literal, a `CLIP_INVOCATIONS` before/after delta) | `"clip_invocations": clip_counter["clip_invocations"]` (`torch_finetune_step.py`) |
 | `attn_requested` / `attn_implementation` | provenance — the RAW torch attention string (`--attn` as requested, and what HF resolved it to); the CLASS it implies is compared via `attention_arm` above, the raw string itself is recorded in `leg_provenance`, never compared (see `grad_oracle.rs`'s own table for the fuller rationale) | n/a | `"attn_requested": args.attn,` (`torch_finetune_step.py:1258`) in the `args` block; `attn_implementation` is the sibling `"attn_implementation": resolved_attn_implementation` field further down in the `finetune_step` block |
-| `kernels_disabled_requested` / `kernels_disabled_fired` | provenance (K-aux, landed on `main` at `c0f0e98`) — torch has no equivalent env var; recorded in `leg_provenance`, never compared | `let kernels_disabled_fired = jammi_kernels::admission::disabled_ops_fired();` (`finetune_step.rs:921`) | n/a |
-| `ln`/`rope`/`softmax`/`geglu`/`lora_epilogue`/`lora_linear`/`attention_block` `_fused_dispatches`/`_eager_dispatches` (14 fields) | measurement — this IS the fused-dispatch proof `fused_proof`/`dispatch_pairs` gate on, and `leg_provenance` additionally records the raw counters per config | `finetune_step.rs`'s own `*_fused_dispatches`/`*_eager_dispatches` fields | n/a |
+| `kernels_disabled_requested` / `kernels_disabled_fired` | provenance (K-aux, landed on `main` at `c0f0e98`) — torch has no equivalent env var; recorded in `leg_provenance`, never compared | `let kernels_disabled_fired = jammi_kernels::admission::disabled_ops_fired();` (`finetune_step.rs:938`) | n/a |
+| `ln`/`rope`/`softmax`/`geglu`/`gelu`/`lora_epilogue`/`lora_linear`/`attention_block` `_fused_dispatches`/`_eager_dispatches` (16 fields) | measurement — this IS the fused-dispatch proof `fused_proof`/`dispatch_pairs` gate on, and `leg_provenance` additionally records the raw counters per config. `gelu` (`OPTIONAL_NON_CASCADE_PAIRS`, #463) is unconditionally SERIALIZED by `FinetuneStepTier`/`FinetuneRunTier` alike, but its `fused > 0` bar is architecture-conditional — the dense erf-GELU seam (`gelu_erf_fused`, BERT's/DistilBERT's FFN) is never reached by ModernBERT's GeGLU MLP (already covered by its own `geglu` pair), so a ModernBERT leg legitimately reads `gelu_{fused,eager} == (0, 0)` forever; admission is by THIS RUN'S OWN COUNTERS (tensor state), never a model-identity branch — see that set's own module-level doc | `finetune_step.rs`'s own `*_fused_dispatches`/`*_eager_dispatches` fields | n/a |
 | `attention_block_flash_fused_dispatches` / `attention_block_flash_declined_dispatches` (P6 Stage B FA2 fold-in, since merged to `main` — `pub attention_block_flash_fused_dispatches: u64,` (`report.rs:1670`), `pub attention_block_flash_declined_dispatches: u64,` (`report.rs:1678`)) | measurement — a CASCADE-shaped pair (`CASCADE_BASES`): no `_eager_dispatches` sibling, its fallback counter is named `_declined_dispatches` instead; absorbs `attention_block` (`ABSORBABLE_BY_ATTENTION_BLOCK_FLASH`), which in turn already absorbs `rope`/`softmax` — one chain, not a second mechanism. Every current `finetune-step`/`finetune-run` leg carries both keys. unit-63 round-4 audit advisory (A1), CURRENT TRUTH (this row's own earlier "a pre-fold-in fixture predating this pair still works" claim was false on the `adamw` axis for the two committed P6 fixtures, `fixtures/p6_fa2_dense_raw_runs/s128_flash_{on,off}_1.json`): `adamw` is a `REQUIRED_PAIRS` member, and `REQUIRED_PAIRS`'s own absent-base rule is a hard fail for the WHOLE leg, not merely for the missing base's own classification — a pre-fold-in fixture predating the multi-tensor AdamW commit (carrying no `adamw_{fused,eager}_dispatches` keys at all, the SAME schema gap the cascade pair itself has for an even older fixture) therefore fails `fused_proof` outright, INVALID, never "still works". `CascadePairFixtureTests::test_real_flash_{on,off}_fixture_no_longer_keyerrors_but_predates_adamw` (`test_ab_merge.py`) are the honest, pinned record of this — both fixtures correctly read INVALID, not "clean, this base merely undiscovered" | `report.rs`'s `FinetuneStepTier::attention_block_flash_fused_dispatches`/`::attention_block_flash_declined_dispatches` fields | n/a |
 | `flash_compiled` | provenance — recorded in `leg_provenance` as `jammi_flash_compiled`, never compared; distinguishes "this build cannot run flash at all" from "flash was compiled in but declined/disabled this run", and backs `fused_proof`'s own flash-disable-consistency check (see that function's doc) | `report.rs`'s `FinetuneStepTier::flash_compiled` field, same branch as above | n/a |
 | `losses` / `loss_first` / `loss_last` | measurement — `loss_final_ratio` is printed for visibility, never gated (see that field's own note in `build_report`) | `finetune_step.rs`'s own fields | `torch_finetune_step.py`'s own fields |
@@ -337,7 +337,7 @@ _TORCH_ARGS_LEVEL_FIELDS = frozenset({"seed", "lora_alpha", "margin", "warmup"})
 #       - `adamw` (unit-63 round-3 audit, block 1): `AdamW::step`'s
 #         per-`Var` dispatch to `adamw_step_fused_t`
 #         (`report.rs`'s `adamw_fused_dispatches` field doc,
-#         `adamw_fused_dispatches: adamw_dispatch_after` (`finetune_step.rs:1018`))
+#         `adamw_fused_dispatches: adamw_dispatch_after` (`finetune_step.rs:1041`))
 #         — same reasoning class as `ln`/
 #         `geglu` again: its admission domain is device/dtype/contiguity/
 #         shape agreement across `theta`/`m`/`v`/`grad`, which holds
@@ -419,6 +419,18 @@ _TORCH_ARGS_LEVEL_FIELDS = frozenset({"seed", "lora_alpha", "margin", "warmup"})
 #     available for rule 1 (the declined-count hard-fail-unless-requested
 #     check) and for `ABSORBABLE_BY_ATTENTION_BLOCK_FLASH`/
 #     `ABSORBABLE_BY_ATTENTION_BLOCK`'s absorption conditions above.
+#   * OPTIONAL_NON_CASCADE_PAIRS (#463 fold-in) — see that set's own doc
+#     below. Its one member today, `gelu`, is an ORDINARY fused/eager pair
+#     (a plain `_eager_dispatches` fallback, not a `CASCADE_BASES` shape)
+#     that is likewise NOT a member of any "must be present" set above —
+#     unlike `CASCADE_BASES`, though, this is not about the KEYS being
+#     absent from the schema (`FinetuneStepTier`/`FinetuneRunTier` both
+#     unconditionally serialize this pair going forward); it is that its
+#     `fused > 0` half is genuinely architecture-conditional (see that
+#     set's own doc) rather than universal the way a `REQUIRED_PAIRS`
+#     base's is. Rule 1 (the fallback-count hard-fail) still applies to it
+#     exactly like any ordinary pair — a live `gelu_eager_dispatches > 0`
+#     is never exempted.
 REQUIRED_PAIRS = frozenset({"ln", "geglu", "adamw"})
 ABSORBABLE_BY_ATTENTION_BLOCK = frozenset({"rope", "softmax"})
 ABSORBABLE_BY_ATTENTION_BLOCK_FLASH = frozenset({"attention_block"})
@@ -446,8 +458,8 @@ LORA_SITE_EXCLUSIVE_GROUP = frozenset({"lora_epilogue", "lora_linear"})
 # FA2 fold-in landed on `main`.
 #   * `pub attention_block_flash_fused_dispatches: u64,` (`report.rs:1670`)
 #   * `pub attention_block_flash_declined_dispatches: u64,` (`report.rs:1678`)
-#   * `attention_block_flash_fused_dispatches: attention_block_flash_dispatch_after` (`finetune_step.rs:1031`)
-#   * `attention_block_flash_declined_dispatches: attention_block_flash_dispatch_after` (`finetune_step.rs:1034`)
+#   * `attention_block_flash_fused_dispatches: attention_block_flash_dispatch_after` (`finetune_step.rs:1054`)
+#   * `attention_block_flash_declined_dispatches: attention_block_flash_dispatch_after` (`finetune_step.rs:1057`)
 # All four populate on every real `finetune-step` (and, via
 # `FinetuneRunTier`'s own mirror of the same pair, `finetune-run`) leg —
 # this is no longer a "not yet on main" base a fresh
@@ -459,12 +471,40 @@ LORA_SITE_EXCLUSIVE_GROUP = frozenset({"lora_epilogue", "lora_linear"})
 # discovers this base on such a report, same as always.
 CASCADE_BASES = frozenset({"attention_block_flash"})
 
+# OPTIONAL_NON_CASCADE_PAIRS (#463) — an ORDINARY fused/eager pair (a plain
+# `_eager_dispatches` fallback via `_fallback_key`, never the `_declined_
+# dispatches` shape `CASCADE_BASES` documents) whose PRESENCE is
+# unconditional (`FinetuneStepTier`/`FinetuneRunTier` both always serialize
+# `gelu_fused_dispatches`/`gelu_eager_dispatches`) but whose `fused > 0`
+# requirement is genuinely ARCHITECTURE-CONDITIONAL, unlike an ordinary
+# `REQUIRED_PAIRS` base's universal one: `gelu_erf_fused` (the dense
+# erf-GELU activation admit key, `jammi-encoders/src/activations.rs`) is
+# BERT's/DistilBERT's dense-GELU FFN seam only — `ModernBertMlp::forward`'s
+# GeGLU MLP (already covered by its own `geglu` REQUIRED_PAIRS member)
+# never routes through it at all, so a real ModernBERT leg legitimately
+# reads `gelu_{fused,eager} == (0, 0)` FOREVER, never a regression to
+# investigate. Unlike `ABSORBABLE_BY_ATTENTION_BLOCK`/
+# `ABSORBABLE_BY_ATTENTION_BLOCK_FLASH`, there is no absorbing counter this
+# pair's `(0, 0)` is conditioned on — admission here is by THIS RUN'S OWN
+# COUNTERS (tensor state: what actually dispatched), never a model-identity
+# branch (no `if backbone == "modernbert"` — this module reads no such
+# field and must not grow one). A BERT-family leg (dense GELU-erf FFN)
+# reads a LIVE pair here and is held to exactly the bar an ordinary pair
+# is: rule 1 below still hard-fails any nonzero `gelu_eager_dispatches` on
+# ANY architecture — a real fallback is never exempted just because this
+# base's `fused > 0` isn't mandatory. Like `CASCADE_BASES`, the KEYS
+# themselves being entirely absent from an older report/golden fixture
+# (predating this field's addition) is ALSO tolerated — `dispatch_pairs`
+# simply never discovers this base on such a report, same mechanism.
+OPTIONAL_NON_CASCADE_PAIRS = frozenset({"gelu"})
+
 ALL_BASES = (
     REQUIRED_PAIRS
     | ABSORBABLE_BY_ATTENTION_BLOCK
     | ABSORBABLE_BY_ATTENTION_BLOCK_FLASH
     | LORA_SITE_EXCLUSIVE_GROUP
     | CASCADE_BASES
+    | OPTIONAL_NON_CASCADE_PAIRS
 )
 # Unit-63 round-16 audit advisory 1: an explicit `if`/`raise`, never a bare
 # `assert` -- `assert` is stripped entirely under `python -O`, which would
@@ -478,12 +518,14 @@ if (
     + len(ABSORBABLE_BY_ATTENTION_BLOCK_FLASH)
     + len(LORA_SITE_EXCLUSIVE_GROUP)
     + len(CASCADE_BASES)
+    + len(OPTIONAL_NON_CASCADE_PAIRS)
     != len(ALL_BASES)
 ):
     raise AssertionError(
         "REQUIRED_PAIRS / ABSORBABLE_BY_ATTENTION_BLOCK / "
         "ABSORBABLE_BY_ATTENTION_BLOCK_FLASH / LORA_SITE_EXCLUSIVE_GROUP / "
-        "CASCADE_BASES must be pairwise disjoint -- every base gets exactly ONE class"
+        "CASCADE_BASES / OPTIONAL_NON_CASCADE_PAIRS must be pairwise disjoint -- "
+        "every base gets exactly ONE class"
     )
 
 # B5 — bf16's ULP near a loss value around 0.30: 7 explicit mantissa bits,
@@ -740,8 +782,8 @@ def dispatch_pairs(fs):
     should silently skip. F5 extends the SAME loudness to a base
     `fused_proof`'s classification tables (`REQUIRED_PAIRS` /
     `ABSORBABLE_BY_ATTENTION_BLOCK` / `ABSORBABLE_BY_ATTENTION_BLOCK_FLASH` /
-    `LORA_SITE_EXCLUSIVE_GROUP` / `CASCADE_BASES`, whose union is
-    `ALL_BASES`) do not know about: a NEW fused kernel landing in
+    `LORA_SITE_EXCLUSIVE_GROUP` / `CASCADE_BASES` / `OPTIONAL_NON_CASCADE_PAIRS`,
+    whose union is `ALL_BASES`) do not know about: a NEW fused kernel landing in
     `finetune_step.rs` without this module's classification tables being
     updated in lockstep is exactly the same class of schema drift as a
     solo counter — `fused_proof` would otherwise silently never require
@@ -791,9 +833,9 @@ def dispatch_pairs(fs):
                 f"({sorted(ALL_BASES)!r}) — a NEW fused kernel landed in finetune_step.rs "
                 "without fused_proof's REQUIRED_PAIRS / ABSORBABLE_BY_ATTENTION_BLOCK / "
                 "ABSORBABLE_BY_ATTENTION_BLOCK_FLASH / LORA_SITE_EXCLUSIVE_GROUP / "
-                "CASCADE_BASES tables being updated to cover it. This is a "
-                "schema-drift bug, not a base this script should silently leave unchecked "
-                "(see F5's own fix note on the module-level classification tables)."
+                "CASCADE_BASES / OPTIONAL_NON_CASCADE_PAIRS tables being updated to cover it. "
+                "This is a schema-drift bug, not a base this script should silently leave "
+                "unchecked (see F5's own fix note on the module-level classification tables)."
             )
         pairs.append((base, fs[key], fs[fallback_key]))
     return pairs
@@ -838,23 +880,28 @@ def metrics(entry, leg):
 def fused_proof(m):
     """See the module-level `REQUIRED_PAIRS`/`ABSORBABLE_BY_ATTENTION_BLOCK`/
     `ABSORBABLE_BY_ATTENTION_BLOCK_FLASH`/`LORA_SITE_EXCLUSIVE_GROUP`/
-    `CASCADE_BASES` (union `ALL_BASES`) doc for the classification this
-    checks each pair against. Returns `True`/`False`/`None` (no
-    `dispatch_pairs` at all — not a jammi leg, or the leg itself did not
-    run) or a `str` (P6 Stage B FA2 fold-in — the flash-disable-consistency
-    check below errored; `build_report` treats a `str` return the same as
-    `False`, see its own `proof is False or isinstance(proof, str)` branch).
-    Raises (via `dispatch_pairs`, which `metrics()` already calls before
-    this function ever sees `m` — see that function's own doc) if
-    `m["dispatch_pairs"]` would ever contain a base outside `ALL_BASES`;
-    `fused_proof` itself never receives an unclassified base to begin with.
+    `CASCADE_BASES`/`OPTIONAL_NON_CASCADE_PAIRS` (union `ALL_BASES`) doc for
+    the classification this checks each pair against. Returns
+    `True`/`False`/`None` (no `dispatch_pairs` at all — not a jammi leg, or
+    the leg itself did not run) or a `str` (P6 Stage B FA2 fold-in — the
+    flash-disable-consistency check below errored; `build_report` treats a
+    `str` return the same as `False`, see its own `proof is False or
+    isinstance(proof, str)` branch). Raises (via `dispatch_pairs`, which
+    `metrics()` already calls before this function ever sees `m` — see that
+    function's own doc) if `m["dispatch_pairs"]` would ever contain a base
+    outside `ALL_BASES`; `fused_proof` itself never receives an unclassified
+    base to begin with.
 
     Rules, in order — EVERY base in `ALL_BASES` (not just `REQUIRED_PAIRS`)
     must be PRESENT in this report's pairs; absence is a hard fail for
     every classified base, never a silently-granted exemption (F5: the
     pre-fix code granted this exemption to every base except `ln`), EXCEPT
-    `CASCADE_BASES` members, which are genuinely OPTIONAL (see that set's
-    own doc):
+    `CASCADE_BASES` members (genuinely OPTIONAL PRESENCE, see that set's own
+    doc) and `OPTIONAL_NON_CASCADE_PAIRS` members (PRESENCE is unconditional
+    going forward, but `fused > 0` is architecture-conditional rather than
+    universal — see that set's own doc; a `(0, 0)` reading there is never
+    itself a failure, so this function runs no explicit "must be present"
+    loop for it at all, unlike every set above):
       0. (P6 Stage B FA2 fold-in) `flash_compiled is False` AND
          `kernels_disabled_requested` names `attention_block_flash` is a
          hard, unconditional fail — a disable request naming an op this

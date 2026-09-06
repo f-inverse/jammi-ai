@@ -152,6 +152,17 @@ pub(crate) mod flash_attention;
 // carrying an independently-maintained CUDA-side copy — one definition per
 // op's domain check, not two that could silently drift apart.
 pub(crate) mod geglu;
+// FULLY `pub` (not `pub(crate)` like `geglu`/`layer_norm`'s own CUDA-glue
+// rationale): `crate::cuda::gelu_erf` still imports `check_domain`
+// directly from here (that fn itself stays `pub(crate)`, so this widening
+// changes nothing about ITS visibility), but this module ALSO carries
+// `COND_AWARE_TOL`/`COND_AWARE_ABS_FLOOR` — this crate's own design
+// constants for the condition-aware backward bound — which `jammi-encoders`'
+// gradcheck oracle for its `gelu_erf` seam (`activations::gelu_erf`) needs
+// to import (`jammi_kernels::ops::gelu_erf::{COND_AWARE_TOL,
+// COND_AWARE_ABS_FLOOR}`) rather than hand-copying, so those two crates'
+// bounds cannot silently drift apart.
+pub mod gelu_erf;
 pub(crate) mod layer_norm;
 // NOT an op module (the only one in this list): the CUDA launch-domain
 // facts every op's CUDA glue shares — the `u32::MAX` element-count
@@ -255,6 +266,7 @@ pub use flash_attention::{
     flash_attention_varlen_with_rope_test_only_bwd_window_override,
 };
 pub use geglu::{GegluFused, GeluVariant};
+pub use gelu_erf::GeluErfFused;
 pub use layer_norm::{LayerNormBiasedFused, LayerNormFused, MAX_HIDDEN};
 pub use low_rank_residual_linear::{DropoutKey, LowRankResidualLinear};
 pub use mem_efficient_attention::{
@@ -394,7 +406,7 @@ pub fn apply_inplace3<T: KernelOp + InplaceOp3>(
 ///   it BY VALUE into [`apply_stateful1`] (mirroring [`apply1`]/[`apply2`]/
 ///   [`apply3`]'s own by-value shape and every existing op's inline
 ///   `::new()`-at-the-call-site convention — e.g. `AttentionBlockFused::new`,
-///   `crates/jammi-encoders/src/modernbert.rs:1374`; `DropoutFused::new`,
+///   `crates/jammi-encoders/src/attention_cascade.rs:936`; `DropoutFused::new`,
 ///   `crates/jammi-lora/src/lora_linear.rs:1022`); nothing in this crate
 ///   ever clones an op value, stateful or not.
 /// - If a stateful op were `Clone`, a caller could hold one instance in a

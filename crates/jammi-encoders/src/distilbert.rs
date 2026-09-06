@@ -17,10 +17,16 @@ use std::path::Path;
 
 use candle_core::{DType, Device, Module, Tensor, D};
 use candle_nn::{Embedding, VarBuilder, VarMap};
+use jammi_kernels::admission::PredicateOutcome;
+use jammi_kernels::ops::FullyMaskedPolicy;
 use jammi_lora::{
     effective_rank, should_apply_lora, FrozenBase, LoraBuildConfig, LoraLinear, MaybeLoraLinear,
 };
 
+use crate::activations;
+use crate::attention_cascade::{
+    self, FlashDecision, FusedAttentionMasks, RopeCtx, TrainingMaskInputs,
+};
 use crate::error::EncoderError;
 use crate::frozen_weight_source::{validate_frozen_base_geometry, FrozenWeightLookup};
 use crate::layer_norm::LayerNorm;
@@ -87,6 +93,8 @@ struct DistilBertSelfAttention {
     out_lin: MaybeLoraLinear,
     num_attention_heads: usize,
     attention_head_size: usize,
+    /// Same status as `crate::bert::BertSelfAttention::rope_placeholder`.
+    rope_placeholder: Tensor,
 }
 
 impl DistilBertSelfAttention {
@@ -129,6 +137,64 @@ impl DistilBertSelfAttention {
         let context = context.flatten_from(D::Minus2)?;
         Ok(self.out_lin.forward(&context)?)
     }
+
+    /// Training's arm — same shape as `crate::bert::BertSelfAttention::forward_training`
+    /// (issue #462): `qkv = Tensor::cat(&[q, k, v], D::Minus1)`, `rope`
+    /// disabled, `window: None` (no sliding-window concept), `policy:
+    /// Propagate`, `flash` always `Declined`. `out_lin` (DistilBERT's own
+    /// attention output projection — BERT folds this into `BertSelfOutput`
+    /// instead) is applied to the cascade's `[batch, seq, hidden]` output,
+    /// exactly where [`Self::forward`] applies it to the eager context.
+    fn forward_training(
+        &self,
+        hidden: &Tensor,
+        extended_mask: &Tensor,
+        fused: &FusedAttentionMasks,
+        flash: &FlashDecision,
+    ) -> Result<Tensor, EncoderError> {
+        // No `self.training` field to assert against (audit round item 6,
+        // mirroring `crate::bert::BertSelfAttention::forward_training`'s
+        // identical fix): this method is private with exactly one call
+        // site, itself only reachable from `DistilBert::forward_hidden`'s
+        // `self.training` branch.
+        let q = self.q_lin.forward(hidden)?;
+        let k = self.k_lin.forward(hidden)?;
+        let v = self.v_lin.forward(hidden)?;
+        let qkv = Tensor::cat(&[&q, &k, &v], D::Minus1)?;
+        let (batch, seq, _) = hidden.dims3()?;
+        let h = self.num_attention_heads;
+        let d = self.attention_head_size;
+        let masks = TrainingMaskInputs {
+            extended: extended_mask,
+            local_band: None,
+            fused: Some(fused),
+        };
+        let rope = RopeCtx::Disabled {
+            placeholder: &self.rope_placeholder,
+        };
+        let context = attention_cascade::training_attention_cascade(
+            &qkv,
+            batch,
+            seq,
+            h,
+            d,
+            masks,
+            flash,
+            &rope,
+            None, // window: DistilBERT has no sliding-window concept.
+            None, // half_window: same reason — no scalar to pass memeff.
+            FullyMaskedPolicy::Propagate,
+            |_admission| {
+                Err(EncoderError::Config(
+                    "attention_block_flash dispatched Fused but DistilBERT always supplies \
+                     FlashDecision::Declined -- unreachable: admit_cascade can only report \
+                     Fused when flash.outcome() is Holds, which Declined can never be"
+                        .into(),
+                ))
+            },
+        )?;
+        Ok(self.out_lin.forward(&context)?)
+    }
 }
 
 struct DistilBertFfn {
@@ -137,9 +203,14 @@ struct DistilBertFfn {
 }
 
 impl DistilBertFfn {
-    fn forward(&self, hidden: &Tensor) -> Result<Tensor, EncoderError> {
+    /// `training` is a PARAMETER, not a stored copy — same fix and
+    /// rationale as `crate::bert::BertIntermediate::forward` (audit round
+    /// item 6): [`DistilBert::training`] is the single source, threaded
+    /// down through [`DistilBertLayer::forward`]/
+    /// [`DistilBertLayer::forward_training`].
+    fn forward(&self, hidden: &Tensor, training: bool) -> Result<Tensor, EncoderError> {
         let mid = self.lin1.forward(hidden)?;
-        let activated = mid.gelu_erf()?;
+        let activated = activations::gelu_erf(&mid, training)?;
         Ok(self.lin2.forward(&activated)?)
     }
 }
@@ -159,7 +230,29 @@ impl DistilBertLayer {
         let attn_normed = self.sa_layer_norm.forward(&attn_residual)?;
 
         // Post-LN FFN: residual then LayerNorm.
-        let ffn_out = self.ffn.forward(&attn_normed)?;
+        let ffn_out = self.ffn.forward(&attn_normed, false)?;
+        let ffn_residual = (ffn_out + &attn_normed)?;
+        self.output_layer_norm.forward(&ffn_residual)
+    }
+
+    /// `training` is threaded down to [`DistilBertFfn::forward`] as a
+    /// parameter (audit round item 6) — [`DistilBert::forward_hidden`]
+    /// passes its own `self.training` here, the single source.
+    fn forward_training(
+        &self,
+        hidden: &Tensor,
+        extended_mask: &Tensor,
+        fused: &FusedAttentionMasks,
+        flash: &FlashDecision,
+        training: bool,
+    ) -> Result<Tensor, EncoderError> {
+        let attn_out = self
+            .attention
+            .forward_training(hidden, extended_mask, fused, flash)?;
+        let attn_residual = (attn_out + hidden)?;
+        let attn_normed = self.sa_layer_norm.forward(&attn_residual)?;
+
+        let ffn_out = self.ffn.forward(&attn_normed, training)?;
         let ffn_residual = (ffn_out + &attn_normed)?;
         self.output_layer_norm.forward(&ffn_residual)
     }
@@ -177,6 +270,8 @@ pub struct DistilBert {
     pooling: Pooling,
     hidden_size: usize,
     max_position_embeddings: usize,
+    /// Same status as `crate::bert::Bert::training`.
+    training: bool,
 }
 
 impl DistilBert {
@@ -219,8 +314,22 @@ impl DistilBert {
 
         let mut hidden = self.embeddings.forward(input_ids)?;
         let extended = crate::mask::extended_attention_mask(mask)?;
-        for layer in &self.layers {
-            hidden = layer.forward(&hidden, &extended)?;
+        if self.training {
+            // DistilBERT has no local-attention layers, so `local_band_f32`
+            // is always `None` — see `FusedAttentionMasks`'s doc.
+            let fused = FusedAttentionMasks::build(&extended, None, hidden.dtype())?;
+            let flash = FlashDecision::Declined {
+                outcome: PredicateOutcome::CapabilityMiss,
+                reason: "flash_transport_not_wired",
+            };
+            for layer in &self.layers {
+                hidden =
+                    layer.forward_training(&hidden, &extended, &fused, &flash, self.training)?;
+            }
+        } else {
+            for layer in &self.layers {
+                hidden = layer.forward(&hidden, &extended)?;
+            }
         }
         Ok(hidden)
     }
@@ -286,6 +395,7 @@ impl DistilBert {
     /// eval kernel and the primitive-op composition whose backward is well-
     /// defined.
     pub fn set_training(&mut self, training: bool) {
+        self.training = training;
         self.embeddings.layer_norm.set_training(training);
         for layer in &mut self.layers {
             layer.attention.q_lin.set_training(training);
@@ -559,6 +669,11 @@ impl<'a> DistilBertBuilder<'a> {
                 layer_vb.pp("output_layer_norm"),
             )?;
 
+            // The attention cascade's `rope_pack` placeholder (issue #462)
+            // — see `crate::bert`'s identical construction site for why
+            // this literal shape is safe regardless of `attention_head_size`.
+            let rope_placeholder = Tensor::zeros((2, 1, 1, 64), DType::F32, device)?;
+
             layers.push(DistilBertLayer {
                 attention: DistilBertSelfAttention {
                     q_lin,
@@ -567,6 +682,7 @@ impl<'a> DistilBertBuilder<'a> {
                     out_lin,
                     num_attention_heads: config.num_attention_heads,
                     attention_head_size,
+                    rope_placeholder,
                 },
                 sa_layer_norm,
                 ffn: DistilBertFfn { lin1, lin2 },
@@ -580,6 +696,7 @@ impl<'a> DistilBertBuilder<'a> {
             pooling: self.pooling,
             hidden_size: config.hidden_size,
             max_position_embeddings: config.max_position_embeddings,
+            training: false,
         })
     }
 }
@@ -665,5 +782,521 @@ impl LoraSlot<'_, '_> {
         } else {
             Ok(MaybeLoraLinear::Frozen(base))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Var;
+    use jammi_kernels::ops::ATTENTION_BLOCK_HEAD_DIM;
+    use jammi_lora::LoraInitMode;
+
+    use crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK;
+
+    fn seeded_linear(rows: usize, cols: usize, phase: f32, device: &Device) -> candle_nn::Linear {
+        let v: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i as f32 + phase) * 0.0151).sin() * 0.2)
+            .collect();
+        candle_nn::Linear::new(Tensor::from_vec(v, (rows, cols), device).unwrap(), None)
+    }
+
+    fn declined_flash() -> FlashDecision {
+        FlashDecision::Declined {
+            outcome: PredicateOutcome::CapabilityMiss,
+            reason: "test_stub_flash_declined",
+        }
+    }
+
+    fn self_attention_fixture(h: usize, d: usize, device: &Device) -> DistilBertSelfAttention {
+        let hd = h * d;
+        DistilBertSelfAttention {
+            q_lin: MaybeLoraLinear::Frozen(FrozenBase::Dense(seeded_linear(hd, hd, 1.0, device))),
+            k_lin: MaybeLoraLinear::Frozen(FrozenBase::Dense(seeded_linear(hd, hd, 2.0, device))),
+            v_lin: MaybeLoraLinear::Frozen(FrozenBase::Dense(seeded_linear(hd, hd, 3.0, device))),
+            out_lin: MaybeLoraLinear::Frozen(FrozenBase::Dense(seeded_linear(hd, hd, 4.0, device))),
+            num_attention_heads: h,
+            attention_head_size: d,
+            rope_placeholder: Tensor::zeros((2, 1, 1, 64), DType::F32, device).unwrap(),
+        }
+    }
+
+    /// Same shape as `crate::bert::tests::bert_head64_fused_attention_matches_eager_composition_within_tolerance`
+    /// (contract R6', tol `1e-4`) — DistilBERT's own `out_lin` is applied to
+    /// BOTH sides identically, so it drops out of the comparison and this
+    /// still isolates the cascade's own fused-vs-eager numerics.
+    #[test]
+    fn distilbert_head64_fused_attention_matches_eager_composition_within_tolerance() {
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let (b, s, h) = (2usize, 5usize, 2usize);
+        let d = ATTENTION_BLOCK_HEAD_DIM;
+        let attn = self_attention_fixture(h, d, &device);
+        let hidden_v: Vec<f32> = (0..b * s * h * d)
+            .map(|i| ((i as f32) * 0.033).sin() * 0.4)
+            .collect();
+        let hidden = Tensor::from_vec(hidden_v, (b, s, h * d), &device).unwrap();
+        let extended = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
+        let fused_masks = FusedAttentionMasks::build(&extended, None, DType::F32).unwrap();
+        let flash = declined_flash();
+
+        let before = crate::attention_block_dispatch_snapshot();
+        let out_fused = attn
+            .forward_training(&hidden, &extended, &fused_masks, &flash)
+            .expect("fused training forward");
+        let after = crate::attention_block_dispatch_snapshot();
+        assert!(
+            after.fused > before.fused,
+            "head64 must actually dispatch the fused arm (before={before:?}, after={after:?})"
+        );
+        assert_eq!(
+            after.eager, before.eager,
+            "head64 must NOT also bump the eager count -- only the fused arm ran \
+             (before={before:?}, after={after:?})"
+        );
+
+        let q = attn.q_lin.forward(&hidden).unwrap();
+        let k = attn.k_lin.forward(&hidden).unwrap();
+        let v = attn.v_lin.forward(&hidden).unwrap();
+        let qkv = Tensor::cat(&[&q, &k, &v], D::Minus1).unwrap();
+        let rope = RopeCtx::Disabled {
+            placeholder: &attn.rope_placeholder,
+        };
+        let ctx = attention_cascade::forward_eager_training_attention_composition(
+            &qkv,
+            b,
+            s,
+            h,
+            d,
+            &extended,
+            None,
+            &rope,
+            None,
+            FullyMaskedPolicy::Propagate,
+            true,
+        )
+        .expect("eager reference composition");
+        let out_eager = attn.out_lin.forward(&ctx).unwrap();
+
+        let fv: Vec<f32> = out_fused.flatten_all().unwrap().to_vec1().unwrap();
+        let ev: Vec<f32> = out_eager.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(fv.len(), ev.len());
+        assert!(fv.iter().all(|x| x.is_finite()) && ev.iter().all(|x| x.is_finite()));
+        let max_diff = fv
+            .iter()
+            .zip(&ev)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "fused vs eager attention diverged beyond tolerance: max|Δ|={max_diff}"
+        );
+    }
+
+    /// Same shape as `crate::bert::tests::bert_head64_all_padding_row_propagate_fused_matches_eager_within_tolerance`
+    /// (see that test's doc for the mask-sign audit finding this rewrite
+    /// fixes and the negative control's rationale).
+    #[test]
+    fn distilbert_head64_all_padding_row_propagate_fused_matches_eager_within_tolerance() {
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let (b, s, h) = (2usize, 4usize, 1usize);
+        let d = ATTENTION_BLOCK_HEAD_DIM;
+        let attn = self_attention_fixture(h, d, &device);
+        let hidden_v: Vec<f32> = (0..b * s * h * d)
+            .map(|i| ((i as f32) * 0.027).cos() * 0.3)
+            .collect();
+        let hidden = Tensor::from_vec(hidden_v, (b, s, h * d), &device).unwrap();
+        let mask_u32 = Tensor::from_slice(&[1u32, 1, 1, 1, 0, 0, 0, 0], (b, s), &device).unwrap();
+        let extended = crate::mask::extended_attention_mask(&mask_u32).unwrap();
+        let fused_masks = FusedAttentionMasks::build(&extended, None, DType::F32).unwrap();
+        let flash = declined_flash();
+
+        let out_fused = attn
+            .forward_training(&hidden, &extended, &fused_masks, &flash)
+            .expect("fused training forward on an all-padding row");
+
+        let q = attn.q_lin.forward(&hidden).unwrap();
+        let k = attn.k_lin.forward(&hidden).unwrap();
+        let v = attn.v_lin.forward(&hidden).unwrap();
+        let qkv = Tensor::cat(&[&q, &k, &v], D::Minus1).unwrap();
+        let rope = RopeCtx::Disabled {
+            placeholder: &attn.rope_placeholder,
+        };
+        let ctx = attention_cascade::forward_eager_training_attention_composition(
+            &qkv,
+            b,
+            s,
+            h,
+            d,
+            &extended,
+            None,
+            &rope,
+            None,
+            FullyMaskedPolicy::Propagate,
+            true,
+        )
+        .expect("eager reference composition on an all-padding row");
+        let out_eager = attn.out_lin.forward(&ctx).unwrap();
+
+        let fv: Vec<f32> = out_fused.flatten_all().unwrap().to_vec1().unwrap();
+        let ev: Vec<f32> = out_eager.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(fv.iter().all(|x| x.is_finite()) && ev.iter().all(|x| x.is_finite()));
+        let max_diff = fv
+            .iter()
+            .zip(&ev)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "all-padding-row Propagate: fused vs eager diverged beyond tolerance: max|Δ|={max_diff}"
+        );
+
+        // NEGATIVE CONTROL (see the BERT sibling test's doc): the SAME
+        // fused forward, at the pre-`out_lin` cascade level (so a bias in
+        // `out_lin` cannot mask an exact-zero row), with
+        // `FullyMaskedPolicy::Zeros` in place of `Propagate`. Batch row 1
+        // must come out EXACTLY zero, and must differ from the
+        // `Propagate` eager `ctx` computed above on that same row.
+        let masks_for_zeros = TrainingMaskInputs {
+            extended: &extended,
+            local_band: None,
+            fused: Some(&fused_masks),
+        };
+        let ctx_zeros = attention_cascade::training_attention_cascade(
+            &qkv,
+            b,
+            s,
+            h,
+            d,
+            masks_for_zeros,
+            &flash,
+            &rope,
+            None,
+            None,
+            FullyMaskedPolicy::Zeros,
+            |_admission| {
+                unreachable!("DistilBERT always supplies FlashDecision::Declined in this fixture")
+            },
+        )
+        .expect("fused training forward with FullyMaskedPolicy::Zeros on an all-padding row");
+
+        let zv: Vec<f32> = ctx_zeros.flatten_all().unwrap().to_vec1().unwrap();
+        let cv: Vec<f32> = ctx.flatten_all().unwrap().to_vec1().unwrap();
+        let row_len = s * h * d;
+        let zeros_row1 = &zv[row_len..2 * row_len];
+        let eager_row1 = &cv[row_len..2 * row_len];
+        assert!(
+            zeros_row1.iter().all(|&x| x == 0.0),
+            "FullyMaskedPolicy::Zeros must zero the fully-masked row EXACTLY: {zeros_row1:?}"
+        );
+        let row_diff = zeros_row1
+            .iter()
+            .zip(eager_row1)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            row_diff > 1e-3,
+            "Zeros and Propagate must diverge on the fully-masked row -- max|Δ|={row_diff} this \
+             small would mean the fully-masked branch was never actually reached"
+        );
+    }
+
+    /// Same shape as `crate::bert::tests::bert_head64_fused_attention_lora_gradients_are_finite_and_nonzero`.
+    #[test]
+    fn distilbert_head64_fused_attention_lora_gradients_are_finite_and_nonzero() {
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let (b, s, h) = (2usize, 5usize, 2usize);
+        let d = ATTENTION_BLOCK_HEAD_DIM;
+        let hd = h * d;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+
+        let q_lin = LoraLinear::new_with_base(
+            FrozenBase::Dense(seeded_linear(hd, hd, 1.0, &device)),
+            4,
+            8.0,
+            false,
+            LoraInitMode::Gaussian,
+            None,
+            21,
+            &varmap,
+            &vb.pp("q_lin"),
+        )
+        .unwrap();
+        let v_lin = LoraLinear::new_with_base(
+            FrozenBase::Dense(seeded_linear(hd, hd, 3.0, &device)),
+            4,
+            8.0,
+            false,
+            LoraInitMode::Gaussian,
+            None,
+            23,
+            &varmap,
+            &vb.pp("v_lin"),
+        )
+        .unwrap();
+        let attn = DistilBertSelfAttention {
+            q_lin: MaybeLoraLinear::Lora(q_lin),
+            k_lin: MaybeLoraLinear::Frozen(FrozenBase::Dense(seeded_linear(hd, hd, 2.0, &device))),
+            v_lin: MaybeLoraLinear::Lora(v_lin),
+            out_lin: MaybeLoraLinear::Frozen(FrozenBase::Dense(seeded_linear(
+                hd, hd, 4.0, &device,
+            ))),
+            num_attention_heads: h,
+            attention_head_size: d,
+            rope_placeholder: Tensor::zeros((2, 1, 1, 64), DType::F32, &device).unwrap(),
+        };
+
+        let hidden_v: Vec<f32> = (0..b * s * hd)
+            .map(|i| ((i as f32) * 0.023).sin() * 0.3)
+            .collect();
+        let hidden =
+            Var::from_tensor(&Tensor::from_vec(hidden_v, (b, s, hd), &device).unwrap()).unwrap();
+        let extended = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
+        let fused_masks = FusedAttentionMasks::build(&extended, None, DType::F32).unwrap();
+        let flash = declined_flash();
+
+        let before = crate::attention_block_dispatch_snapshot();
+        let out = attn
+            .forward_training(hidden.as_tensor(), &extended, &fused_masks, &flash)
+            .expect("fused training forward");
+        let after = crate::attention_block_dispatch_snapshot();
+        assert!(after.fused > before.fused, "must dispatch fused at head64");
+        assert_eq!(
+            after.eager, before.eager,
+            "head64 must NOT also bump the eager count -- only the fused arm ran"
+        );
+
+        let loss = out.sum_all().unwrap();
+        let grads = loss
+            .backward()
+            .expect("backward through the fused attention block");
+
+        for (name, lin) in [("q_lin", &attn.q_lin), ("v_lin", &attn.v_lin)] {
+            let MaybeLoraLinear::Lora(l) = lin else {
+                panic!("{name} must be LoRA-wrapped in this fixture")
+            };
+            for t in l.trainable_params() {
+                let g = grads
+                    .get(t)
+                    .unwrap_or_else(|| panic!("no gradient reached {name}'s LoRA tensor"));
+                let gv: Vec<f32> = g.flatten_all().unwrap().to_vec1().unwrap();
+                assert!(
+                    gv.iter().all(|x| x.is_finite()),
+                    "{name}'s LoRA gradient must be finite: {gv:?}"
+                );
+                assert!(
+                    gv.iter().any(|x| *x != 0.0),
+                    "{name}'s LoRA gradient must be non-vacuously non-zero"
+                );
+            }
+        }
+    }
+
+    /// Same shape as
+    /// `crate::bert::tests::bert_head64_fused_attention_lora_gradients_match_eager_within_tolerance`
+    /// (contract fix-round item 2, precedent
+    /// `crate::modernbert::tests::fused_attention_block_matches_eager_lora_gradients_at_production_seq_on_head64`,
+    /// tol `1e-4`) — DistilBERT's own `out_lin` is applied to BOTH sides
+    /// identically before the loss's `dy` multiply, so it drops out of the
+    /// comparison and this still isolates the cascade's own fused-vs-eager
+    /// LoRA-gradient numerics, not merely finite/non-zero (that weaker
+    /// check is
+    /// [`distilbert_head64_fused_attention_lora_gradients_are_finite_and_nonzero`],
+    /// kept alongside as its own, narrower oracle).
+    #[test]
+    fn distilbert_head64_fused_attention_lora_gradients_match_eager_within_tolerance() {
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let (b, s, h) = (2usize, 5usize, 2usize);
+        let d = ATTENTION_BLOCK_HEAD_DIM;
+        let hd = h * d;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+
+        let q_lin = LoraLinear::new_with_base(
+            FrozenBase::Dense(seeded_linear(hd, hd, 1.0, &device)),
+            4,
+            8.0,
+            false,
+            LoraInitMode::Gaussian,
+            None,
+            21,
+            &varmap,
+            &vb.pp("q_lin"),
+        )
+        .unwrap();
+        let v_lin = LoraLinear::new_with_base(
+            FrozenBase::Dense(seeded_linear(hd, hd, 3.0, &device)),
+            4,
+            8.0,
+            false,
+            LoraInitMode::Gaussian,
+            None,
+            23,
+            &varmap,
+            &vb.pp("v_lin"),
+        )
+        .unwrap();
+        let attn = DistilBertSelfAttention {
+            q_lin: MaybeLoraLinear::Lora(q_lin),
+            k_lin: MaybeLoraLinear::Frozen(FrozenBase::Dense(seeded_linear(hd, hd, 2.0, &device))),
+            v_lin: MaybeLoraLinear::Lora(v_lin),
+            out_lin: MaybeLoraLinear::Frozen(FrozenBase::Dense(seeded_linear(
+                hd, hd, 4.0, &device,
+            ))),
+            num_attention_heads: h,
+            attention_head_size: d,
+            rope_placeholder: Tensor::zeros((2, 1, 1, 64), DType::F32, &device).unwrap(),
+        };
+
+        let hidden_v: Vec<f32> = (0..b * s * hd)
+            .map(|i| ((i as f32) * 0.023).sin() * 0.3)
+            .collect();
+        let hidden = Tensor::from_vec(hidden_v, (b, s, hd), &device).unwrap();
+        let extended = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
+        let fused_masks = FusedAttentionMasks::build(&extended, None, DType::F32).unwrap();
+        let flash = declined_flash();
+        let dy_v: Vec<f32> = (0..b * s * hd)
+            .map(|i| ((i as f32) * 0.0071).cos() * 0.6 + 0.05)
+            .collect();
+        let dy = Tensor::from_vec(dy_v, (b, s, hd), &device).unwrap();
+
+        let before = crate::attention_block_dispatch_snapshot();
+        let out_fused = attn
+            .forward_training(&hidden, &extended, &fused_masks, &flash)
+            .expect("fused training forward");
+        let after = crate::attention_block_dispatch_snapshot();
+        assert!(after.fused > before.fused, "must dispatch fused at head64");
+        assert_eq!(
+            after.eager, before.eager,
+            "head64 must NOT also bump the eager count -- only the fused arm ran"
+        );
+        let loss_fused = (&out_fused * &dy).unwrap().sum_all().unwrap();
+        let grads_fused = loss_fused
+            .backward()
+            .expect("backward through the fused attention block");
+
+        let q = attn.q_lin.forward(&hidden).unwrap();
+        let k = attn.k_lin.forward(&hidden).unwrap();
+        let v = attn.v_lin.forward(&hidden).unwrap();
+        let qkv = Tensor::cat(&[&q, &k, &v], D::Minus1).unwrap();
+        let rope = RopeCtx::Disabled {
+            placeholder: &attn.rope_placeholder,
+        };
+        let ctx = attention_cascade::forward_eager_training_attention_composition(
+            &qkv,
+            b,
+            s,
+            h,
+            d,
+            &extended,
+            None,
+            &rope,
+            None,
+            FullyMaskedPolicy::Propagate,
+            true,
+        )
+        .expect("eager reference composition");
+        let out_eager = attn.out_lin.forward(&ctx).unwrap();
+        let loss_eager = (&out_eager * &dy).unwrap().sum_all().unwrap();
+        let grads_eager = loss_eager
+            .backward()
+            .expect("backward through the eager attention composition");
+
+        const TOL: f32 = 1e-4;
+        for (name, lin) in [("q_lin", &attn.q_lin), ("v_lin", &attn.v_lin)] {
+            let MaybeLoraLinear::Lora(l) = lin else {
+                panic!("{name} must be LoRA-wrapped in this fixture")
+            };
+            for t in l.trainable_params() {
+                let gf: Vec<f32> = grads_fused
+                    .get(t)
+                    .unwrap_or_else(|| panic!("no fused-arm gradient reached {name}'s LoRA tensor"))
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap();
+                let ge: Vec<f32> = grads_eager
+                    .get(t)
+                    .unwrap_or_else(|| panic!("no eager-arm gradient reached {name}'s LoRA tensor"))
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap();
+                assert_eq!(gf.len(), ge.len());
+                assert!(
+                    gf.iter().all(|x| x.is_finite()) && ge.iter().all(|x| x.is_finite()),
+                    "{name}'s LoRA gradients must be finite on both arms: fused={gf:?} eager={ge:?}"
+                );
+                let mut max_delta = 0f32;
+                for (&f, &e) in gf.iter().zip(ge.iter()) {
+                    max_delta = max_delta.max((f - e).abs());
+                }
+                assert!(
+                    max_delta <= TOL,
+                    "{name}'s LoRA gradient: fused vs eager max|Δ|={max_delta:e} > {TOL:e}"
+                );
+            }
+        }
+    }
+
+    /// Same shape as `crate::bert::tests::bert_strict_mode_on_a_refused_domain_is_a_typed_error_in_a_fresh_process`.
+    #[test]
+    fn distilbert_strict_mode_on_a_refused_domain_is_a_typed_error_in_a_fresh_process() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(exe)
+            .args([
+                "distilbert::tests::strict_mode_child_process_body",
+                "--exact",
+                "--nocapture",
+                "--ignored",
+            ])
+            .env("JAMMI_KERNELS_STRICT", "1")
+            .output()
+            .expect("spawn child test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "child process assertion failed: stdout={stdout}\nstderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the child process must have actually run (and passed) exactly one test -- \
+             stdout={stdout}"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn strict_mode_child_process_body() {
+        let device = Device::Cpu;
+        let (b, s, h, d) = (1usize, 4usize, 1usize, 16usize);
+        let attn = self_attention_fixture(h, d, &device);
+        let hidden_v: Vec<f32> = (0..b * s * h * d).map(|i| i as f32 * 0.01).collect();
+        let hidden = Tensor::from_vec(hidden_v, (b, s, h * d), &device).unwrap();
+        let extended = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
+        let fused_masks = FusedAttentionMasks::build(&extended, None, DType::F32).unwrap();
+        let flash = declined_flash();
+
+        let err = attn
+            .forward_training(&hidden, &extended, &fused_masks, &flash)
+            .expect_err("head_dim=16 under Strict must be a typed refusal, not a silent eager");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("attention_block_fused") || msg.contains("head_dim"),
+            "expected a StrictModeFallback naming the refused op/predicate: {msg}"
+        );
     }
 }

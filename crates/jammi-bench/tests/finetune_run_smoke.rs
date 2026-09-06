@@ -254,6 +254,24 @@ fn finetune_run_smoke_end_to_end_cpu_hermetic() {
     // `--arm fused` was declared; the process made no kernel-disable claim.
     assert_eq!(obj["arm"], serde_json::json!("fused"));
 
+    // C-MLP GELU-erf positive-proof (campaign #462/#463): `tiny_bert`'s
+    // FFN (`BertIntermediate::forward`, `hidden_act: "gelu"`) calls
+    // `jammi_encoders::activations::gelu_erf` in training mode at least
+    // once per layer per forward — this run's `--arm fused` and CPU F32
+    // backbone both satisfy `gelu_admission_predicate`'s domain, so the
+    // fused arm must have actually dispatched, not merely registered a
+    // counter that stayed at zero. A wrong registry key on the read side
+    // (`jammi_kernels::admission::counters_for` keyed by exact string,
+    // never a prefix) would silently report `0` here forever even though
+    // production dispatched through the fused kernel every step — this
+    // assertion is the mechanism check that catches exactly that class of
+    // bug, not merely that the field is present in the JSON.
+    assert!(
+        obj["gelu_fused_dispatches"].as_u64().unwrap_or(0) > 0,
+        "expected gelu_fused_dispatches > 0 for a tiny_bert --arm fused CPU F32 run: {:?}",
+        obj["gelu_fused_dispatches"]
+    );
+
     // Identity-value semantics (unit 63 H4a-delta, CONTRACT amendment
     // 2026-08-28): `--objective triplet` → `embedding_loss: "triplet"`,
     // `temperature: null`, `margin` non-null (already checked above).

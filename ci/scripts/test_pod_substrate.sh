@@ -1881,8 +1881,13 @@ DRV
   fi
   N2_SEEDSH="$REPO_ROOT/ci/scripts/pod_seed_target.sh"
   N2_T1B_START="$(grep -n 'pod_seed_pkg_has_feature jammi-kernels flash-attn || feat_rc=\$?' "$N2_SEEDSH" | head -1 | cut -d: -f1)"
-  N2_T1B_ELSE="$(awk -v s="$N2_T1B_START" 'NR>s && /^      else$/{print NR; exit}' "$N2_SEEDSH")"
-  N2_T1B_FI="$(awk -v s="$N2_T1B_START" 'NR>s && /^      fi$/{print NR; exit}' "$N2_SEEDSH")"
+  # esc-050-any-branch fix: the feat_rc dispatch (if/elif/else/fi) was
+  # hoisted OUT of the (formerly enclosing) `_seed_is_main`-only block, so
+  # its own else/fi now sit at 4-space indent, one level up from the
+  # pre-fix 6 — tracks the real file's current nesting, never a
+  # hand-asserted constant.
+  N2_T1B_ELSE="$(awk -v s="$N2_T1B_START" 'NR>s && /^    else$/{print NR; exit}' "$N2_SEEDSH")"
+  N2_T1B_FI="$(awk -v s="$N2_T1B_START" 'NR>s && /^    fi$/{print NR; exit}' "$N2_SEEDSH")"
   if [ -n "$N2_T1B_ELSE" ] && [ -n "$N2_T1B_FI" ] \
      && sed -n "${N2_T1B_ELSE},${N2_T1B_FI}p" "$N2_SEEDSH" | grep -q 'exit 1'; then
     ok "(n/addendum) T1b's rc=2 else-branch genuinely contains 'exit 1' (aborts the seed subshell), not merely a warning"
@@ -3256,13 +3261,17 @@ DRV
 
   # w_build_driver <script> <clone-dir>: sed-extract the REAL provisioning
   # hunk (anchor: the `cutlass_inc=` assignment, through its closing
-  # 8-space `fi`) into a runnable driver — the same verbatim-extraction
-  # technique the (p2/A5) and (n/addendum EXECUTABLE) legs use.
+  # 6-space `fi`) into a runnable driver — the same verbatim-extraction
+  # technique the (p2/A5) and (n/addendum EXECUTABLE) legs use. The hunk
+  # was hoisted OUT of the (formerly enclosing) `_seed_is_main`-only block
+  # by the esc-050-any-branch fix, which is why the closing `fi`'s
+  # indentation is 6 spaces here rather than the pre-fix 8 — the anchor
+  # tracks the REAL file's current nesting, never a hand-asserted constant.
   w_build_driver() {
     local script="$1" clone="$2" driver="$SANDBOX/w_driver_$$_${RANDOM}.sh"
     local start end
     start="$(grep -n 'cutlass_inc="crates/jammi-kernels/third_party/cutlass/include"' "$script" | head -1 | cut -d: -f1)"
-    end="$(awk -v s="$start" 'NR>s && /^        fi$/{print NR; exit}' "$script")"
+    end="$(awk -v s="$start" 'NR>s && /^      fi$/{print NR; exit}' "$script")"
     [ -n "$start" ] && [ -n "$end" ] || return 1
     {
       echo '#!/usr/bin/env bash'
@@ -3335,8 +3344,8 @@ DRV
 import sys
 p = sys.argv[1]
 t = open(p).read()
-old = "          git submodule update --init --force --checkout --depth 1 crates/jammi-kernels/third_party/cutlass || {\n"
-new = "          true || {\n"
+old = "        git submodule update --init --force --checkout --depth 1 crates/jammi-kernels/third_party/cutlass || {\n"
+new = "        true || {\n"
 assert old in t, "revert fixture: could not locate the provisioning command to neuter"
 open(p, "w").write(t.replace(old, new, 1))
 PY
@@ -3467,6 +3476,143 @@ PY
       fi
     else
       bad "(w/esc-050 non-git skip) non-git driver fixture is broken (driver='${W_DRIVER6:-EXTRACTION FAILED}')"
+    fi
+  fi
+
+  # ---- (w/esc-050 any-branch) esc-050 GAP HIT TWICE by #462/#463's own
+  # pod rounds (pods 12qwlsflxl0a1j and qpvv7iv4wn8owy, 2026-09-06): the
+  # original esc-050 fix placed CUTLASS provisioning INSIDE the
+  # `_seed_is_main`-only block alongside T1b's own build. Every campaign
+  # pod boots on a FEATURE branch, so that placement means the fix above
+  # (proven against a main-branch clone) never actually fires on the pods
+  # that hit the incident — a sweep driver's own later flash-attn build
+  # (not this script) then panicked in build.rs. This leg drives the SAME
+  # full dispatch (feat_rc gate, the provisioning guard, and the
+  # main-only T1b-build gate together — the anchor range (n/addendum)'s
+  # N2_T1B_ELSE/FI legs already track) against a NON-main fixture (HEAD !=
+  # origin/main), asserting provisioning fires REGARDLESS, while T1b's own
+  # build still does not run. cargo is out of scope for a no-cargo suite —
+  # the one line that calls the real (cargo-backed) pod_seed_pkg_has_
+  # feature is stubbed to a preset $feat_rc in the driver harness; every
+  # OTHER byte, including the provisioning guard and the main-only gate
+  # around T1b's build, is the script's own real bytes.
+  w_build_full_driver() { # $1=script $2=clone $3=feat_rc $4=is_main
+    local script="$1" clone="$2" feat_rc="$3" is_main="$4"
+    local driver="$SANDBOX/w_full_driver_$$_${RANDOM}.sh"
+    local start end
+    start="$(grep -n '^    t1b_ran="false"$' "$script" | head -1 | cut -d: -f1)"
+    end="$(awk -v s="$start" 'NR>s && /^    fi$/{print NR; exit}' "$script")"
+    [ -n "$start" ] && [ -n "$end" ] || return 1
+    {
+      echo '#!/usr/bin/env bash'
+      echo 'set -uo pipefail'
+      echo 'export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=protocol.file.allow GIT_CONFIG_VALUE_0=always'
+      echo "cd '$clone' || exit 9"
+      echo "feat_rc=$feat_rc"
+      echo "_seed_is_main=\"$is_main\""
+      echo '_seed_main_reason="test fixture: resolved sha != origin/main"'
+      # the ONLY line neutered: the real (cargo-backed) metadata probe,
+      # replaced by a no-op that leaves the harness-preset $feat_rc alone —
+      # every other byte in the range is sed-extracted verbatim, never
+      # reimplemented.
+      sed -n "${start},${end}p" "$script" \
+        | sed 's/pod_seed_pkg_has_feature jammi-kernels flash-attn || feat_rc=\$?/: # test-stub: feat_rc preset by the harness, no cargo in this suite/'
+      echo 'echo W_HUNK_COMPLETED'
+      echo 'printf "T1B_RAN=%s T1B_REASON=%s\n" "$t1b_ran" "$t1b_reason"'
+    } > "$driver"
+    chmod +x "$driver"
+    printf '%s' "$driver"
+  }
+
+  w_branch_clone() { # $1=dest — a fresh clone checked out onto a feature
+    # branch with a commit of its own, so HEAD diverges from origin/main
+    # (every campaign pod's own provenance) rather than a same-sha detached
+    # checkout.
+    w_fresh_clone "$1"
+    w_git -C "$1" config user.email t@t; w_git -C "$1" config user.name t
+    w_git -C "$1" checkout -q -b feature/esc050-any-branch
+    echo "feature work" > "$1/feature.txt"
+    w_git -C "$1" add feature.txt
+    w_git -C "$1" commit -q -m "feature commit (diverges HEAD from origin/main)"
+  }
+
+  W_CLONE_BRANCH="$W_ROOT/clone_branch"
+  w_branch_clone "$W_CLONE_BRANCH"
+
+  W_AB_HEAD="$(w_git -C "$W_CLONE_BRANCH" rev-parse HEAD)"
+  W_AB_OMAIN="$(w_git -C "$W_CLONE_BRANCH" rev-parse --verify --quiet origin/main)"
+  W_AB_GITLINK="$(w_git -C "$W_CLONE_BRANCH" ls-tree HEAD -- "$W_SUB_REL")"
+  W_AB_FIXTURE_VALID=0
+  if git -C "$W_CLONE_BRANCH" rev-parse --git-dir >/dev/null 2>&1 \
+     && [ -n "$W_AB_HEAD" ] && [ -n "$W_AB_OMAIN" ] && [ "$W_AB_HEAD" != "$W_AB_OMAIN" ] \
+     && printf '%s' "$W_AB_GITLINK" | grep -q "^160000 commit $W_PIN_SHA" \
+     && [ ! -d "$W_CLONE_BRANCH/$W_INC_REL" ]; then
+    W_AB_FIXTURE_VALID=1
+    ok "(w/esc-050 any-branch fixture) non-vacuity: real git repo, HEAD (${W_AB_HEAD}) != origin/main (${W_AB_OMAIN}), gitlink pinned at ${W_PIN_SHA}, include/ absent — every campaign pod's own provenance"
+  else
+    bad "(w/esc-050 any-branch fixture) INVALID — head=${W_AB_HEAD:-?} origin/main=${W_AB_OMAIN:-?} same=$([ "$W_AB_HEAD" = "$W_AB_OMAIN" ] && echo yes || echo no) gitlink='${W_AB_GITLINK}' include_absent=$([ ! -d "$W_CLONE_BRANCH/$W_INC_REL" ] && echo yes || echo no); per the row's control the driven legs are aborted, not run against a vacuous fixture"
+  fi
+
+  if [ "$W_AB_FIXTURE_VALID" = 1 ]; then
+    # ---- GREEN: the fixed hunk provisions REGARDLESS of branch ----------
+    W_AB_DRIVER="$(w_build_full_driver "$SEED_TARGET_SH" "$W_CLONE_BRANCH" 0 false)" || W_AB_DRIVER=""
+    if [ -n "$W_AB_DRIVER" ] && bash -n "$W_AB_DRIVER"; then
+      wab_out="$(bash "$W_AB_DRIVER" 2>&1)"; wab_rc=$?
+      wab_sub_head="$(w_git -C "$W_CLONE_BRANCH/$W_SUB_REL" rev-parse HEAD 2>/dev/null)" # tripwire-ok: a failed provisioning leaves no submodule repo to query — the empty result already fails the sha assertion loudly just below
+      if [ "$wab_rc" -eq 0 ] \
+         && printf '%s' "$wab_out" | grep -q 'T1b prerequisite: provisioning the CUTLASS submodule' \
+         && [ -f "$W_CLONE_BRANCH/$W_INC_REL/cutlass/cutlass.h" ] \
+         && [ "$wab_sub_head" = "$W_PIN_SHA" ] \
+         && ! printf '%s' "$wab_out" | grep -q 'T1b (main only)' \
+         && printf '%s' "$wab_out" | grep -q 'T1B_RAN=false' \
+         && printf '%s' "$wab_out" | grep -q 'main-only by design'; then
+        ok "(w/esc-050 any-branch green) on a feature-branch fixture (HEAD != origin/main) the header exists and the submodule is at the pinned sha AFTER the seed's provisioning step, while T1b's own build did NOT run and is still reported skipped as main-only"
+      else
+        bad "(w/esc-050 any-branch green) expected provisioning to fire and T1b to stay skipped (rc=$wab_rc, sub_head=${wab_sub_head:-none}): $wab_out"
+      fi
+    else
+      bad "(w/esc-050 any-branch green) driver fixture is broken (driver='${W_AB_DRIVER:-EXTRACTION FAILED}')"
+    fi
+
+    # ---- RED control: the OLD main-only placement leaves the header
+    # absent on the SAME non-main fixture — reproduces the exact defect
+    # esc-050's original fix never actually closed for a feature-branch
+    # pod. Constructed by wrapping the CURRENT (fixed) provisioning guard
+    # back inside `if [ "$_seed_is_main" = "true" ]; then ... fi` in a
+    # scratch copy — the pre-this-fix shape — rather than a hand-written
+    # reimplementation.
+    W_AB_OLDPLACEMENT="$SANDBOX/w_ab_oldplacement.sh"
+    cp "$SEED_TARGET_SH" "$W_AB_OLDPLACEMENT"
+    python3 - "$W_AB_OLDPLACEMENT" <<'PY'
+import sys
+p = sys.argv[1]
+t = open(p).read()
+old = '      cutlass_inc="crates/jammi-kernels/third_party/cutlass/include"'
+new = '      if [ "$_seed_is_main" = "true" ]; then\n' + old
+assert old in t, "old-placement fixture: could not locate the cutlass_inc anchor to wrap"
+t = t.replace(old, new, 1)
+anchor = '      fi\n      if [ "$_seed_is_main" = "true" ]; then\n        echo "=== T1b (main only)'
+assert anchor in t, "old-placement fixture: could not locate the guard's closing fi to wrap"
+closer = '      fi\n' + anchor
+t = t.replace(anchor, closer, 1)
+open(p, "w").write(t)
+PY
+    # A SEPARATE fresh feature-branch clone — W_CLONE_BRANCH was already
+    # provisioned by the green leg above; the RED control needs its OWN
+    # unprovisioned fixture on the SAME (non-main) provenance.
+    W_CLONE_BRANCH2="$W_ROOT/clone_branch_red"
+    w_branch_clone "$W_CLONE_BRANCH2"
+    W_AB_OLD_DRIVER="$(w_build_full_driver "$W_AB_OLDPLACEMENT" "$W_CLONE_BRANCH2" 0 false)" || W_AB_OLD_DRIVER=""
+    if [ -n "$W_AB_OLD_DRIVER" ] && bash -n "$W_AB_OLD_DRIVER" && [ ! -d "$W_CLONE_BRANCH2/$W_INC_REL" ]; then
+      wabold_out="$(bash "$W_AB_OLD_DRIVER" 2>&1)"; wabold_rc=$?
+      if [ "$wabold_rc" -eq 0 ] && [ ! -d "$W_CLONE_BRANCH2/$W_INC_REL" ] \
+         && ! printf '%s' "$wabold_out" | grep -q 'T1b prerequisite: provisioning the CUTLASS submodule'; then
+        ok "(w/esc-050 any-branch revert-RED) the OLD main-only placement, restored in a scratch copy, SKIPS provisioning on the SAME non-main fixture (include/ stays absent) — reproduces the #462/#463 pod incident, proving the hoist is load-bearing"
+      else
+        bad "(w/esc-050 any-branch revert-RED) expected the old placement to skip provisioning (rc=$wabold_rc, include_absent=$([ ! -d "$W_CLONE_BRANCH2/$W_INC_REL" ] && echo yes || echo no)): $wabold_out"
+      fi
+    else
+      bad "(w/esc-050 any-branch revert-RED) old-placement scratch fixture is broken (driver='${W_AB_OLD_DRIVER:-EXTRACTION FAILED}', include_absent=$([ ! -d "$W_CLONE_BRANCH2/$W_INC_REL" ] && echo yes || echo no))"
     fi
   fi
 

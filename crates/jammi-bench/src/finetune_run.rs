@@ -689,6 +689,73 @@ fn base_config(params: &FinetuneRunParams, epochs: usize) -> FineTuneConfig {
     }
 }
 
+/// The all-zero-attention validity gate (unit 63 re-audit round-2 finding
+/// 2; widened by the C-ATTN unit, campaign #462/#463): `Err` iff this run
+/// took at least one optimizer step (`cumulative_steps > 0`) but every one
+/// of the four training-mode attention dispatch counters
+/// (`attention_block_fused_dispatches`, `attention_block_eager_dispatches`,
+/// `attention_block_flash_fused_dispatches`,
+/// `attention_block_flash_declined_dispatches`) reads `0`.
+///
+/// Originally scoped to `model_type == "modernbert"` on the premise that
+/// ModernBert was the ONLY architecture with a fused whole-attention-block
+/// kernel at all. That premise no longer holds: BERT and DistilBERT now
+/// admit the SAME fused whole-attention-block kernel through the SAME
+/// predicate, dispatched by TENSOR STATE (`head_dim == 64`), never by
+/// architecture name (`jammi_encoders::attention_cascade`'s doc) — so a
+/// `bert`- or `distilbert`-arch leg at `head_dim == 64` calls `admit` on
+/// exactly one of the block or flash cascade for every training-mode
+/// attention forward, exactly as a `modernbert` leg always has
+/// (`forward_training_attention`'s doc). Gating this check on the model
+/// NAME would silently let a BERT/DistilBERT leg that never called
+/// `encoder.set_training(true)` through unnoticed — admission is by
+/// COUNTERS, not by name, so this refusal is too, for every `model_type`
+/// this tier supports.
+///
+/// For ANY architecture's leg that took at least one optimizer step, all
+/// four dispatch counters reading zero at once is not a legitimate
+/// "declined by domain" outcome (that reads `N eager / 0 fused`, never
+/// `0/0/0/0`), it is proof the encoder never entered training mode at all
+/// (this finding's root cause: a fresh `builder().build(..)` starts
+/// `training: false`, and neither `build_encoder_adapters` above nor
+/// `TrainingLoop::run`'s ordinary per-batch path used to flip it via
+/// `encoder.set_training(true)`). Refusing loudly here beats silently
+/// emitting a plausible-looking report for a run that measured the eval
+/// path — this check does NOT depend on `encoder.set_training(true)` being
+/// called correctly upstream: it reads the same counters a downstream
+/// merger's fused-proof gate reads, independent of how this process got
+/// there. Extracted to a pure function (mirroring
+/// [`crate::finetune_step::attention_arm`]'s own extraction) so the widened
+/// admission-by-counters behaviour is unit-testable without a real
+/// end-to-end training run.
+pub(crate) fn fused_dispatch_proof_gate(
+    model_type: &str,
+    cumulative_steps: usize,
+    attention_block_fused_dispatches: u64,
+    attention_block_eager_dispatches: u64,
+    attention_block_flash_fused_dispatches: u64,
+    attention_block_flash_declined_dispatches: u64,
+) -> Result<(), String> {
+    if cumulative_steps > 0
+        && attention_block_fused_dispatches == 0
+        && attention_block_eager_dispatches == 0
+        && attention_block_flash_fused_dispatches == 0
+        && attention_block_flash_declined_dispatches == 0
+    {
+        return Err(format!(
+            "finetune-run: fused-dispatch-proof failure — this {model_type} run took \
+             {cumulative_steps} optimizer step(s) but the training-mode attention path never \
+             dispatched in either arm (attention_block_fused_dispatches, \
+             attention_block_eager_dispatches, attention_block_flash_fused_dispatches, and \
+             attention_block_flash_declined_dispatches are all 0). The encoder was never put \
+             into training mode via encoder.set_training(true), so this run measured the eval \
+             path, not the fine-tune step this tier claims to measure — INVALID run, not a \
+             datum."
+        ));
+    }
+    Ok(())
+}
+
 /// Run this tier: `params.epochs` resume-chained single-epoch legs over the
 /// REAL `TrainingLoopBuilder`, calling `evaluate_held_out` on the fixture at
 /// `eval_cadence` and unconditionally on the last epoch. See this module's
@@ -1083,6 +1150,12 @@ fn run_impl(
     let rope_dispatch_before = jammi_encoders::rope_dispatch_snapshot();
     let softmax_dispatch_before = jammi_encoders::softmax_dispatch_snapshot();
     let geglu_dispatch_before = jammi_encoders::geglu_dispatch_snapshot();
+    // Same mechanism, for the C-MLP fused GELU-erf activation kernel
+    // (BERT's/DistilBERT's FFN, admit key `gelu_erf_fused`) — read
+    // directly off the process-wide registry, the same shape
+    // `adamw_dispatch_before` below already uses, since this counter has
+    // no `jammi_encoders`-side snapshot wrapper of its own.
+    let gelu_dispatch_before = jammi_kernels::admission::counters_for("gelu_erf_fused").snapshot();
     let lora_epilogue_dispatch_before = jammi_lora::lora_epilogue_dispatch_snapshot();
     let lora_linear_fused_dispatch_before = jammi_lora::lora_linear_fused_dispatch_snapshot();
     let attention_block_dispatch_before = jammi_encoders::attention_block_dispatch_snapshot();
@@ -1203,6 +1276,7 @@ fn run_impl(
     let rope_dispatch_after = jammi_encoders::rope_dispatch_snapshot();
     let softmax_dispatch_after = jammi_encoders::softmax_dispatch_snapshot();
     let geglu_dispatch_after = jammi_encoders::geglu_dispatch_snapshot();
+    let gelu_dispatch_after = jammi_kernels::admission::counters_for("gelu_erf_fused").snapshot();
     let lora_epilogue_dispatch_after = jammi_lora::lora_epilogue_dispatch_snapshot();
     let lora_linear_fused_dispatch_after = jammi_lora::lora_linear_fused_dispatch_snapshot();
     let attention_block_dispatch_after = jammi_encoders::attention_block_dispatch_snapshot();
@@ -1235,6 +1309,12 @@ fn run_impl(
     let geglu_eager_dispatches = geglu_dispatch_after
         .eager
         .saturating_sub(geglu_dispatch_before.eager);
+    let gelu_fused_dispatches = gelu_dispatch_after
+        .fused
+        .saturating_sub(gelu_dispatch_before.fused);
+    let gelu_eager_dispatches = gelu_dispatch_after
+        .eager
+        .saturating_sub(gelu_dispatch_before.eager);
     let lora_epilogue_fused_dispatches = lora_epilogue_dispatch_after
         .fused
         .saturating_sub(lora_epilogue_dispatch_before.fused);
@@ -1266,45 +1346,18 @@ fn run_impl(
         .declined
         .saturating_sub(attention_block_flash_dispatch_before.declined);
 
-    // Belt-and-braces typed refusal (unit 63 re-audit round-2 finding 2):
-    // ModernBert is the ONLY architecture with a fused whole-attention-block
-    // kernel at all (`bert.rs`'s own `set_training` never touches an
-    // attention-block admission path — see that module's doc; a `bert`-arch
-    // leg legitimately reads all four counters below as `0` forever, which
-    // is why this gate is scoped to `model_type == "modernbert"` and never
-    // fires for this crate's generic CPU smoke fixture). For a ModernBert
-    // leg that took at least one optimizer step, EVERY training-mode
-    // attention forward calls `admit` on exactly one of the block or flash
-    // cascade (`ModernBertAttention::forward`'s `self.training` branch,
-    // `forward_training_attention`'s doc) — so all four dispatch counters
-    // reading zero at once is not a legitimate "declined by domain" outcome
-    // (that reads `N eager / 0 fused`, never `0/0/0/0`), it is proof the
-    // encoder never entered training mode at all (this finding's root
-    // cause: a fresh `ModernBert::builder().build(..)` starts `training:
-    // false`, and neither `build_encoder_adapters` above nor
-    // `TrainingLoop::run`'s ordinary per-batch path used to flip it).
-    // Refusing loudly here beats silently emitting a plausible-looking
-    // report for a run that measured the eval path — this check does NOT
-    // depend on `encoder.set_training(true)` above (or any trainer-side
-    // fix) being correct: it reads the same counters a downstream merger's
-    // fused-proof gate reads, independent of how this process got there.
-    if model_type == "modernbert"
-        && cumulative_steps > 0
-        && attention_block_fused_dispatches == 0
-        && attention_block_eager_dispatches == 0
-        && attention_block_flash_fused_dispatches == 0
-        && attention_block_flash_declined_dispatches == 0
-    {
-        return Err(format!(
-            "finetune-run: fused-dispatch-proof failure — this ModernBert run took \
-             {cumulative_steps} optimizer step(s) but the training-mode attention path never \
-             dispatched in either arm (attention_block_fused_dispatches, \
-             attention_block_eager_dispatches, attention_block_flash_fused_dispatches, and \
-             attention_block_flash_declined_dispatches are all 0). The encoder was never in \
-             training mode, so this run measured the eval path, not the fine-tune step this \
-             tier claims to measure — INVALID run, not a datum."
-        )
-        .into());
+    // Belt-and-braces typed refusal (unit 63 re-audit round-2 finding 2;
+    // widened by the C-ATTN unit, campaign #462/#463) — see
+    // `fused_dispatch_proof_gate`'s own doc for the full rationale.
+    if let Err(message) = fused_dispatch_proof_gate(
+        &model_type,
+        cumulative_steps,
+        attention_block_fused_dispatches,
+        attention_block_eager_dispatches,
+        attention_block_flash_fused_dispatches,
+        attention_block_flash_declined_dispatches,
+    ) {
+        return Err(message.into());
     }
 
     let held_out = last_held_out
@@ -1407,6 +1460,8 @@ fn run_impl(
         softmax_eager_dispatches,
         geglu_fused_dispatches,
         geglu_eager_dispatches,
+        gelu_fused_dispatches,
+        gelu_eager_dispatches,
         lora_epilogue_fused_dispatches,
         lora_epilogue_eager_dispatches,
         lora_linear_fused_dispatches,
@@ -2644,5 +2699,110 @@ mod tests {
              empty string are observably different `Option<String>` values, even though both \
              trim to no content"
         );
+    }
+
+    /// C-ATTN widening (campaign #462/#463): the all-zero-attention validity
+    /// gate must now refuse an all-zero-counters run at `model_type` `"bert"`
+    /// and `"distilbert"`, not just `"modernbert"` — admission by counters,
+    /// never by architecture name. RED at base (pre-#462/#463): this gate
+    /// read `model_type == "modernbert"` literally, so a `bert`/`distilbert`
+    /// leg with real optimizer steps and all-zero attention counters read
+    /// `Ok(())` here — silently passing a run that never entered training
+    /// mode.
+    #[test]
+    fn fused_dispatch_proof_gate_refuses_all_zero_attention_for_every_supported_model_type() {
+        for model_type in ["bert", "distilbert", "modernbert"] {
+            let result = fused_dispatch_proof_gate(model_type, 6, 0, 0, 0, 0);
+            let msg = match result {
+                Ok(()) => panic!(
+                    "model_type {model_type:?} with 6 optimizer steps and all-zero attention \
+                     counters must be refused, not silently accepted"
+                ),
+                Err(msg) => msg,
+            };
+            assert!(
+                msg.contains("attention_block_fused_dispatches"),
+                "error must name attention_block_fused_dispatches: {msg}"
+            );
+            assert!(
+                msg.contains("attention_block_eager_dispatches"),
+                "error must name attention_block_eager_dispatches: {msg}"
+            );
+            assert!(
+                msg.contains("set_training(true)"),
+                "error must name the set_training(true) premise that was never met: {msg}"
+            );
+            assert!(
+                msg.contains(model_type),
+                "error must name the model_type it refused: {msg}"
+            );
+        }
+    }
+
+    /// Two-sided control: the SAME gate must accept a `bert`/`distilbert`/
+    /// `modernbert` leg whose counters show real dispatch (either arm), and
+    /// must never fire when this run took zero optimizer steps at all (an
+    /// eval-only or empty-epoch invocation — not this gate's concern).
+    #[test]
+    fn fused_dispatch_proof_gate_accepts_live_dispatch_and_zero_step_runs() {
+        for model_type in ["bert", "distilbert", "modernbert"] {
+            // Fused arm fired.
+            assert!(fused_dispatch_proof_gate(model_type, 6, 3, 0, 0, 0).is_ok());
+            // Eager arm fired (a legitimate by-design domain decline, e.g.
+            // `head_dim != 64`).
+            assert!(fused_dispatch_proof_gate(model_type, 6, 0, 3, 0, 0).is_ok());
+            // Flash cascade fired.
+            assert!(fused_dispatch_proof_gate(model_type, 6, 0, 0, 3, 0).is_ok());
+            // Flash cascade declined (also a legitimate by-design outcome
+            // for THIS gate's purposes — it only refuses when ALL FOUR are
+            // zero at once).
+            assert!(fused_dispatch_proof_gate(model_type, 6, 0, 0, 0, 3).is_ok());
+        }
+        // Zero optimizer steps: this gate never fires regardless of the
+        // counters (an eval-only run, or an empty epoch count, is simply
+        // outside this gate's scope) — a real run's `cumulative_steps` is
+        // production-computed (`TrainingResult::total_steps`, summed), not
+        // something this gate re-derives.
+        assert!(fused_dispatch_proof_gate("bert", 0, 0, 0, 0, 0).is_ok());
+    }
+
+    /// The `"bert"` counted-eager head16 shape, dedicated (C-ATTN unit,
+    /// campaign #462/#463 fix round): `(attention_block_fused_dispatches,
+    /// attention_block_eager_dispatches) == (0, 2)` are the EXACT counts
+    /// `tests/finetune_run_smoke.rs`'s `tiny_bert` (`hidden_size: 32,
+    /// num_attention_heads: 2` — `head_dim == 16 != 64`) end-to-end run
+    /// measures for a 1-epoch, 2-batch leg: every training-mode attention
+    /// forward reaches `admit("attention_block_fused", ..)` (the C-ATTN
+    /// seam) and is DECLINED by the `head_dim == 64` domain predicate, so
+    /// it counts as eager, never fused — the flash cascade is consulted
+    /// first and also declines (`attention_block_flash_declined_dispatches
+    /// == 2`), never fires. This is the widened gate's headline claim made
+    /// concrete for the SPECIFIC architecture/shape this fix round
+    /// restored `tiny_bert` coverage for: `bert` at `head_dim != 64` no
+    /// longer reads all-zero forever (pre-C-ATTN premise this gate's own
+    /// doc used to state), it reads `(0, >0)`, and the gate must accept
+    /// that shape, not refuse it.
+    #[test]
+    fn fused_dispatch_proof_gate_passes_bert_counted_eager_head16_shape() {
+        assert!(fused_dispatch_proof_gate("bert", 2, 0, 2, 0, 2).is_ok());
+    }
+
+    /// The complementary `"bert"` fused-arm shape, dedicated (C-ATTN unit,
+    /// campaign #462/#463 fix round): `(attention_block_fused_dispatches,
+    /// attention_block_eager_dispatches) == (>0, 0)` is what a `bert` leg
+    /// at `head_dim == 64` (the tensor-state predicate
+    /// `jammi_encoders::attention_cascade`'s own doc names, not this
+    /// fixture) reads: the fused whole-attention-block
+    /// kernel dispatches on every training-mode forward, the eager
+    /// composition never runs. Boundary-value coverage alongside
+    /// [`fused_dispatch_proof_gate_passes_bert_counted_eager_head16_shape`]'s
+    /// `(0, >0)` case and
+    /// [`fused_dispatch_proof_gate_refuses_all_zero_attention_for_every_supported_model_type`]'s
+    /// `(0, 0)` refusal — all three shapes a `bert` leg's own counters can
+    /// legitimately read, checked for `model_type == "bert"` specifically
+    /// (not merely folded into the multi-architecture loop above).
+    #[test]
+    fn fused_dispatch_proof_gate_passes_bert_fused_head64_shape() {
+        assert!(fused_dispatch_proof_gate("bert", 2, 2, 0, 0, 0).is_ok());
     }
 }

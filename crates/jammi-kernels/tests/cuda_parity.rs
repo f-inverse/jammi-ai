@@ -41,9 +41,9 @@ use jammi_kernels::ops::{
     cast_add_bf16_into, cast_scale_bf16_f32_into, mem_efficient_attention, quant_matmul_grad,
     AdamMomentUpdate, AdamMomentUpdateFmaContractedRedControl, AdamWParams, AttentionBlockFused,
     BwdGemmLayoutsParams, CastAddBf16, CastAddF16, CastScaleBf16F32, CastScaleF16F32, DropoutFused,
-    DropoutKey, FullyMaskedPolicy, GegluFused, GeluVariant, LayerNormBiasedFused, LayerNormFused,
-    LowRankResidualLinear, MemEfficientAttention, PhiloxKatProbe, RopeFused, ScaledCastAdd,
-    SoftmaxLastDimFused, ATTENTION_BLOCK_WINDOW_MASKED_VALUE, MAX_LAST_DIM,
+    DropoutKey, FullyMaskedPolicy, GegluFused, GeluErfFused, GeluVariant, LayerNormBiasedFused,
+    LayerNormFused, LowRankResidualLinear, MemEfficientAttention, PhiloxKatProbe, RopeFused,
+    ScaledCastAdd, SoftmaxLastDimFused, ATTENTION_BLOCK_WINDOW_MASKED_VALUE, MAX_LAST_DIM,
     MEM_EFFICIENT_WINDOW_MASKED_VALUE,
 };
 use std::borrow::Cow;
@@ -244,6 +244,53 @@ fn measured_near_zero_floor(reference: &[f32]) -> f32 {
 /// site).
 fn bf16_relative_bound(reference: f32, floor: f32, k: f32) -> f32 {
     k * bf16_ulp(reference.abs().max(floor))
+}
+
+/// [`f32_two_term_bound`]'s bf16 analogue — a per-element RELATIVE term
+/// (`k_rel * bf16_ulp(|reference|)`, bf16-scale — this is a comparison of
+/// two bf16-rounded outputs) plus an ADDITIVE, POD-MEASURED absolute term
+/// at the OPERANDS' own scale, but at F32 granularity
+/// (`k_abs * f32_ulp(operand_amplitude)`) — see the "why F32, not bf16"
+/// paragraph below.
+///
+/// Exists for exactly the case [`bf16_relative_bound`]'s single
+/// `max`-keyed floor cannot cover (guide §3.8's objection, reproduced one
+/// level up for bf16): `GeluErfFused`'s forward/backward at a genuinely
+/// LARGE `|x|` (not a tiny one) can still land on a genuinely TINY
+/// `Phi(x)` (or `Phi(x)+x*phi(x)`) — the mathematical CDF decays toward
+/// 0/1 in the tails — and this crate's two independent CDF routines
+/// (`libm::erff`'s polynomial vs CUDA's hardware `normcdff`, `ops::
+/// gelu_erf`'s module doc's "three cdf formulations", items 1/2) do not
+/// suffer the SAME catastrophic-cancellation loss at the SAME `x`: one can
+/// round the CDF all the way to an exact `0.0`/`1.0` while the other
+/// retains a nonzero residual. `measured_near_zero_floor` keys its floor
+/// to "the smallest nonzero reference value ANYWHERE in this run's
+/// fixture" — a property of whatever else happens to be in the array, not
+/// of the OPERAND that produced this particular tiny output — so it can
+/// under-floor exactly this element.
+///
+/// **Why the absolute term is `f32_ulp(operand_amplitude)`, not
+/// `bf16_ulp(operand_amplitude)`, even though this leg compares bf16
+/// outputs**: the divergence this term covers is generated BEFORE any
+/// bf16 rounding — both `erff` and `normcdff` compute the CDF at F32
+/// precision on `f32(x)` (module doc: CUDA's own `cdf16 =
+/// round16(normcdff(f32(x)))` rounds to bf16 only AFTER computing at
+/// F32), so the cross-library gap this term bounds is itself an F32-scale
+/// quantity, `|Δout| ~= |x| * |Δcdf|_{f32}`. An audit-round pod run
+/// confirmed this empirically: `bf16_ulp(operand_amplitude)` (one bf16
+/// ULP at the input's own ~10-magnitude scale, `~0.0625`) over-floors by
+/// ~4-5 orders of magnitude relative to the observed divergence
+/// (`~1e-8`-`1e-7`), inflating `assert_relative_bound`'s bound enough to
+/// make the KO-1 forced-defect control (`gelu_erf bf16 dx (KO-1)`) stop
+/// discriminating on the smallest fixture (`gelu_erf_parity_contiguous_small`,
+/// `n=32`: 0 violations, worst `Δ/bound = 0.67`) — exactly guide §3.8's
+/// failure mode from the OTHER direction (a floor so generous it hides
+/// the very defect the control exists to catch). `f32_ulp` fixed both
+/// legs simultaneously: still >= 2x headroom on the real divergence, and
+/// the KO-1 control discriminates again on every fixture width (see this
+/// branch's hand-off report for the re-run's per-leg ratios).
+fn bf16_two_term_bound(reference: f32, operand_amplitude: f32, k_rel: f32, k_abs: f32) -> f32 {
+    k_rel * bf16_ulp(reference) + k_abs * f32_ulp(operand_amplitude)
 }
 
 /// [`measured_near_zero_floor`]'s F16 twin: the smallest STRICTLY POSITIVE
@@ -4543,6 +4590,652 @@ fn geglu_parity_empty_last_dim() {
         .unwrap();
     assert!(out_cpu.is_empty());
     assert!(out_gpu.is_empty());
+}
+
+// =======================================================================
+// GeluErfFused CUDA parity — NOT compilable on this Mac (no `cuda`
+// feature); written against this file's own established idioms
+// (`assert_relative_bound`/`assert_forced_defect_exceeds_bound`,
+// `f32_two_term_bound`, `bf16_relative_bound`/`f16_relative_bound`) and
+// left for the pod lane to actually run. See `ops::gelu_erf`'s module doc
+// for the op's design.
+//
+// Three legs per dtype, matching the contract's own shape:
+//   1. FORWARD `==` candle's own CUDA eager `Tensor::gelu_erf()?` — BIT
+//      EXACT, not a tolerance: this op's CUDA arm is DESIGNED to reproduce
+//      candle-kernels' `ugelu_erf_{f32,bf16,f16}` exactly (see the module
+//      doc's "three cdf formulations", item 2), so a real divergence here
+//      is this op's own bug, never expected cross-library noise.
+//   2. BACKWARD: CUDA vs CPU (f32) or CUDA vs an F32 TRUTH computed on CPU
+//      (bf16/f16 — this op's CPU arm REFUSES bf16/f16 entirely, so there
+//      is no CPU 16-bit arm to compare against; the F32 arm's own output,
+//      cast up/down, is the truth reference instead — the SAME "agreement
+//      is not accuracy, anchor with a higher-precision reference" shape
+//      guide §3.3/KO-8 states).
+//   3. KO-1: the SAME producer-injected control as the CPU-only leaf test
+//      (`tests/gelu_erf_oracles.rs`'s `ko1_*`) — a hand-built "backward
+//      with `x*phi(x)` dropped" must fail the SAME bound the green path
+//      just used.
+// =======================================================================
+
+fn gelu_erf(x: &Tensor) -> candle_core::Result<Tensor> {
+    apply1(x, GeluErfFused)
+}
+
+/// `Phi(x) = 0.5*(1+erf(x/sqrt(2)))` at F64 precision — this file's own
+/// independent ground truth, identical in spirit to
+/// `tests/gelu_erf_oracles.rs`'s `phi_f64` (a leaf-crate test cannot import
+/// from another integration-test binary, so this is a deliberate, small,
+/// exact duplicate rather than a shared dependency).
+fn gelu_erf_phi_f64(x: f64) -> f64 {
+    0.5 * (1.0 + libm::erf(x * std::f64::consts::FRAC_1_SQRT_2))
+}
+
+/// `x*phi(x)`, `phi(x) = (1/sqrt(2*pi))*exp(-x^2/2)`.
+fn gelu_erf_x_phi_f64(x: f64) -> f64 {
+    let pdf = std::f64::consts::FRAC_2_SQRT_PI
+        * std::f64::consts::FRAC_1_SQRT_2
+        * 0.5
+        * (-0.5 * x * x).exp();
+    x * pdf
+}
+
+/// The KO-1 forced defect: `dx_broken(x) = dy * Phi(x)` alone, with the
+/// `x*phi(x)` term dropped — computed independently in plain Rust from the
+/// SAME `xv`/`dyv` fixtures, never by editing a correct output array's
+/// bits (guide §3's "a real semantic mutant, not a poisoned index" rule).
+fn gelu_erf_dropped_x_phi_defect(xv: &[f32], dyv: &[f32]) -> Vec<f32> {
+    xv.iter()
+        .zip(dyv.iter())
+        .map(|(&x, &dy)| dy * gelu_erf_phi_f64(x as f64) as f32)
+        .collect()
+}
+
+/// The correct closed-form reference `dx = dy*(Phi(x)+x*phi(x))` at F64
+/// precision, cast to F32 — used both as the KO-1 leg's "what the bound
+/// must still admit" anchor and as a sanity cross-check against the real
+/// kernel's own CPU/CUDA output.
+fn gelu_erf_correct_bwd_f64(xv: &[f32], dyv: &[f32]) -> Vec<f32> {
+    xv.iter()
+        .zip(dyv.iter())
+        .map(|(&x, &dy)| {
+            (dy as f64 * (gelu_erf_phi_f64(x as f64) + gelu_erf_x_phi_f64(x as f64))) as f32
+        })
+        .collect()
+}
+
+/// The cross-implementation `k_abs` term for GeluErfFused's F32
+/// CUDA-vs-CPU parity, mirroring [`F32_GELU_ERF_LIBM_ULPS`]'s own
+/// rationale one level up: this op's CPU arm computes `Phi(x)` via
+/// `libm::erff` (a software polynomial) while its CUDA arm computes it via
+/// the hardware `normcdff` intrinsic — mathematically the identical
+/// quantity (`normcdf(x) = 0.5*(1+erf(x/sqrt(2)))`), reached by two
+/// genuinely different numerical routines, exactly the "real, disclosed
+/// cross-implementation gap" `F32_GELU_ERF_LIBM_ULPS`'s own doc names for
+/// GeGLU's `erff`-vs-`erff` case. `no-producer: NOT YET POD-MEASURED` —
+/// seeded at the SAME order of magnitude as `F32_GELU_ERF_LIBM_ULPS` (a
+/// comparable cross-library special-function gap) rather than derived from
+/// a real run; the pod lane that first runs this file must confirm >=2x
+/// headroom on every leg below (this crate's own campaign convention) and
+/// tighten or widen this constant from that measurement, per this crate's
+/// process for every OTHER `k_abs`/`k` constant in this file.
+///
+/// **Re-derivation protocol (audit round, item 4): read it off the pod
+/// log, do not re-measure by hand.** `assert_relative_bound`/
+/// `assert_relative_bound_indexed` (this file, above) already `eprintln!`s
+/// `"{label}: n=.. max|Δ|=.. max_bound=.. worst Δ/bound=.."` for EVERY leg
+/// that calls them — including `"gelu_erf f32 dx"` and
+/// `"gelu_erf f32 dx vs f64 closed-form truth"`, the two legs this
+/// constant gates. A pod run of `cuda_parity` captures both lines; the
+/// printed `worst Δ/bound` ratio (which must be `<= 0.5` for >=2x
+/// headroom under this constant's current value) is the number a
+/// follow-on commit tightens or widens this constant from — never a
+/// number re-derived by hand outside that log.
+const F32_GELU_ERF_NORMCDF_ULPS: f32 = 8.0;
+
+/// The BF16/F16 leg's own `k`, for the SAME "not yet pod-measured" reason
+/// as [`F32_GELU_ERF_NORMCDF_ULPS`] — seeded at `GEGLU_FWD_ROUND1_PROPAGATION_ULPS`'s
+/// value (3) as a starting point (this op's forward has the SAME
+/// two-rounding-point structure GeGLU's own derivation covers: round the
+/// CDF, then round the product), pending the pod's own re-derivation from
+/// a real measured worst-case ratio.
+///
+/// **Re-derivation protocol: the SAME printed readout
+/// [`F32_GELU_ERF_NORMCDF_ULPS`]'s doc describes**, one dtype down: this
+/// constant gates `"gelu_erf bf16 fwd vs f32 truth"` (as the `k_rel` term
+/// of [`bf16_two_term_bound`] — see [`GELU_ERF_BF16_FWD_ABS_ULPS`] for the
+/// separate `k_abs` term that same leg needs), `"gelu_erf bf16 dx vs f32
+/// truth"`, `"gelu_erf bf16 dx truth vs f64 closed-form"`, `"gelu_erf f16
+/// fwd vs f32 truth"`, and `"gelu_erf f16 dx vs f32 truth"` — five printed
+/// `worst Δ/bound` lines per pod run, one per leg, each independently
+/// re-derivable from its own printed ratio.
+const GELU_ERF_16BIT_ULPS: f32 = 3.0;
+
+/// The bf16 FORWARD-vs-f32-truth leg's own `k_abs` (see
+/// [`bf16_two_term_bound`]'s doc for the mechanism this term covers: a
+/// genuinely-tiny `Phi(x)` in the tails, where the CPU's `erff`-based
+/// formula and CUDA's `normcdff` intrinsic do not cancel identically).
+/// Seeded at the SAME order of magnitude as
+/// [`F32_GELU_ERF_NORMCDF_ULPS`]'s own cross-CDF-library gap, one dtype
+/// down (`no-producer: derived by analogy, not yet an independent
+/// measurement`) pending pod re-derivation — an A100 pod run (audit
+/// round, `fix/463-audit-kernels`, `ssh jammi-cam`) exercised the three
+/// `gelu_erf_parity_*` legs that call this constant
+/// (`gelu_erf_parity_contiguous_small`, `_production_width`,
+/// `_non_multiple_of_launch_block`) and confirmed this value fixes the
+/// leg with real headroom; see [`F32_GELU_ERF_NORMCDF_ULPS`]'s doc for the
+/// general re-derivation protocol (read `assert_relative_bound`'s printed
+/// `worst Δ/bound` off the pod log — the `"gelu_erf bf16 fwd vs f32
+/// truth"` line is this constant's own).
+const GELU_ERF_BF16_FWD_ABS_ULPS: f32 = 8.0;
+
+/// The bf16 BACKWARD-vs-f32-truth leg's own `k_abs` — the SAME mechanism
+/// [`GELU_ERF_BF16_FWD_ABS_ULPS`]'s doc describes, one derivative deeper:
+/// `Phi(x)+x*phi(x)` decays in the tails exactly like `Phi(x)` alone does,
+/// so this leg's `dx` can ALSO land on a genuinely-tiny gradient at a
+/// large `|x|`, where the two CDF/PDF routines' own tail rounding does
+/// not cancel identically. Pod-confirmed (audit round,
+/// `fix/463-audit-kernels`) to fix the leg (previously a hard failure at
+/// [`measured_near_zero_floor`]'s max-keyed floor — guide §3.8) with real
+/// headroom; see [`F32_GELU_ERF_NORMCDF_ULPS`]'s doc for the general
+/// re-derivation protocol (`"gelu_erf bf16 dx vs f32 truth"`'s printed
+/// `worst Δ/bound` is this constant's own readout).
+const GELU_ERF_BF16_DX_ABS_ULPS: f32 = 8.0;
+
+fn assert_gelu_erf_parity_f32(cuda: &Device, n: usize, xv: &[f32]) {
+    let cpu = Device::Cpu;
+
+    let x_cpu = Var::from_tensor(&Tensor::from_slice(xv, (n,), &cpu).unwrap()).unwrap();
+    let out_cpu = gelu_erf(&x_cpu).unwrap();
+
+    let x_gpu = Var::from_tensor(&Tensor::from_slice(xv, (n,), cuda).unwrap()).unwrap();
+    let out_gpu = gelu_erf(&x_gpu).unwrap();
+
+    // Leg 1: forward BIT-EXACT vs candle's OWN CUDA eager dispatch (never
+    // this file's CPU output — the CPU and CUDA arms deliberately compute
+    // via DIFFERENT routines, `erf_f32` vs `normcdff`; see the module
+    // doc's "three cdf formulations").
+    let eager_gpu = x_gpu.gelu_erf().unwrap();
+    let out_gpu_v: Vec<f32> = out_gpu
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let eager_gpu_v: Vec<f32> = eager_gpu
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out_gpu_v.len(), n);
+    assert_eq!(eager_gpu_v.len(), n);
+    for (i, (&f, &e)) in out_gpu_v.iter().zip(eager_gpu_v.iter()).enumerate() {
+        assert!(
+            f.to_bits() == e.to_bits(),
+            "gelu_erf f32 fwd[{i}]: fused {f} (0x{:08x}) vs candle CUDA eager {e} (0x{:08x}) \
+             must be bit-identical",
+            f.to_bits(),
+            e.to_bits()
+        );
+    }
+
+    // Leg 2: backward, CPU vs CUDA, within the two-term f32 bound.
+    let dyv = cotangent_fixture(n, 0x6765_6C75_5F65_7266, 3.0);
+    let dy_cpu = Tensor::from_slice(&dyv, (n,), &cpu).unwrap();
+    let dy_gpu = Tensor::from_slice(&dyv, (n,), cuda).unwrap();
+
+    let grads_cpu = (&out_cpu * &dy_cpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
+    let grads_gpu = (&out_gpu * &dy_gpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
+
+    let dx_cpu: Vec<f32> = grads_cpu
+        .get(&x_cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let dx_gpu: Vec<f32> = grads_gpu
+        .get(&x_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(dx_cpu.len(), n);
+    assert_eq!(dx_gpu.len(), n, "gelu_erf GPU dx length mismatch");
+
+    let dx_floor = max_abs(xv);
+    let dx_bound = |r: f32| f32_two_term_bound(r, dx_floor, 4.0, F32_GELU_ERF_NORMCDF_ULPS);
+    assert_relative_bound("gelu_erf f32 dx", &dx_cpu, &dx_gpu, dx_bound);
+
+    // F64 TRUTH (family F): leg 2 above only proves `dx_cpu` (this crate's
+    // OWN `GeluErfFused::bwd`, walked through a real `.backward()` call)
+    // agrees with `dx_gpu` (the SAME crate's OWN CUDA arm) — a systematic
+    // error shared by both arms (e.g. the wrong closed-form derivative)
+    // would pass that check while BOTH are wrong. `gelu_erf_correct_bwd_f64`
+    // is an independently-derived F64 closed form (`dy*(Phi(x)+x*phi(x))`,
+    // built from `libm::erf`, never from this crate's own kernel code),
+    // so anchoring `dx_cpu` against it here is this leg's "the bound must
+    // still ADMIT the correct answer" half of the KO-1 pair below (which
+    // proves the SAME bound REJECTS the dropped-term defect).
+    let dx_f64_truth = gelu_erf_correct_bwd_f64(xv, &dyv);
+    assert_relative_bound(
+        "gelu_erf f32 dx vs f64 closed-form truth",
+        &dx_f64_truth,
+        &dx_cpu,
+        dx_bound,
+    );
+
+    // Leg 3 (KO-1): the dropped-x*phi(x) defect must fail the SAME bound
+    // the green path just used, measured against the CUDA-computed
+    // reference (not CPU's — this leg's whole point is proving the bound
+    // would catch the defect on the DEVICE this file exists to prove).
+    let defect = gelu_erf_dropped_x_phi_defect(xv, &dyv);
+    assert_forced_defect_exceeds_bound("gelu_erf f32 dx (KO-1)", &dx_gpu, &defect, dx_bound);
+}
+
+fn assert_gelu_erf_parity_bf16(cuda: &Device, n: usize, xv: &[f32]) {
+    let cpu = Device::Cpu;
+    let xb: Vec<bf16> = xv.iter().map(|&v| bf16::from_f32(v)).collect();
+    let dyv = cotangent_fixture(n, 0x6765_6C75_5F65_7267, 3.0);
+    let dyb: Vec<bf16> = dyv.iter().map(|&v| bf16::from_f32(v)).collect();
+
+    // F32 TRUTH: this op's CPU arm refuses BF16 entirely (module doc's
+    // "forward CPU" section), so the F32 arm on the SAME (already-bf16-
+    // rounded) values is the higher-precision reference (KO-8/guide §3.3),
+    // not a CPU BF16 arm that does not exist.
+    let xv_from_bf16: Vec<f32> = xb.iter().map(|v| v.to_f32()).collect();
+    let dyv_from_bf16: Vec<f32> = dyb.iter().map(|v| v.to_f32()).collect();
+    let x_truth =
+        Var::from_tensor(&Tensor::from_slice(&xv_from_bf16, (n,), &cpu).unwrap()).unwrap();
+    let dy_truth = Tensor::from_slice(&dyv_from_bf16, (n,), &cpu).unwrap();
+    let out_truth = gelu_erf(&x_truth).unwrap();
+    let out_truth_v: Vec<f32> = out_truth.flatten_all().unwrap().to_vec1().unwrap();
+    let grads_truth = (&out_truth * &dy_truth)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
+    let dx_truth: Vec<f32> = grads_truth
+        .get(&x_truth)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let x_gpu = Var::from_tensor(&Tensor::from_slice(&xb, (n,), cuda).unwrap()).unwrap();
+    let dy_gpu = Tensor::from_slice(&dyb, (n,), cuda).unwrap();
+    let out_gpu = gelu_erf(&x_gpu).unwrap();
+
+    // Leg 1: forward BIT-EXACT vs candle's own CUDA eager BF16 dispatch.
+    let eager_gpu = x_gpu.gelu_erf().unwrap();
+    let out_gpu_bits: Vec<bf16> = out_gpu
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let eager_gpu_bits: Vec<bf16> = eager_gpu
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out_gpu_bits.len(), n);
+    for (i, (&f, &e)) in out_gpu_bits.iter().zip(eager_gpu_bits.iter()).enumerate() {
+        assert_eq!(
+            f.to_bits(),
+            e.to_bits(),
+            "gelu_erf bf16 fwd[{i}]: fused {f:?} vs candle CUDA eager {e:?} must be \
+             bit-identical"
+        );
+    }
+    // Leg 2: forward vs the F32 truth, within a TWO-TERM bound (guide
+    // §3.8's max-keyed-floor objection, applied to bf16): the relative
+    // term stays [`GELU_ERF_16BIT_ULPS`] bf16 ULPs of `reference`, but the
+    // absolute floor is keyed to the INPUT fixture's own amplitude
+    // (`max_abs(xv)`), not to "whatever else this run's array happens to
+    // contain" the way [`measured_near_zero_floor`] is — see
+    // [`bf16_two_term_bound`]'s own doc for why a large `|x|` landing on a
+    // genuinely-tiny, tail-decayed `Phi(x)` needs exactly this shape.
+    let out_gpu_v: Vec<f32> = out_gpu_bits.iter().map(|v| v.to_f32()).collect();
+    let out_amplitude = max_abs(xv);
+    let out_bound = |r: f32| {
+        bf16_two_term_bound(
+            r,
+            out_amplitude,
+            GELU_ERF_16BIT_ULPS,
+            GELU_ERF_BF16_FWD_ABS_ULPS,
+        )
+    };
+    assert_relative_bound(
+        "gelu_erf bf16 fwd vs f32 truth",
+        &out_truth_v,
+        &out_gpu_v,
+        out_bound,
+    );
+
+    // Leg 2: backward vs the SAME F32 truth.
+    let grads_gpu = (&out_gpu * &dy_gpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
+    let dx_gpu_v: Vec<f32> = grads_gpu
+        .get(&x_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(dx_gpu_v.len(), n, "gelu_erf bf16 GPU dx length mismatch");
+    // Same TWO-TERM shape as the forward leg above, for the identical
+    // reason (a pod run first surfaced this leg failing the SAME way): the
+    // backward's own `Phi(x)+x*phi(x)` term decays in the tails exactly
+    // like the forward's `Phi(x)` does, so a `measured_near_zero_floor`
+    // (keyed to whatever else this run's `dx_truth` array contains) can
+    // under-floor an element whose OWN `x` is large but whose gradient has
+    // decayed to near-zero. Floored at the INPUT fixture's own amplitude
+    // instead, mirroring the f32 leg's `dx_floor = max_abs(xv)` above one
+    // level up in `assert_gelu_erf_parity_f32`.
+    let dx_amplitude = max_abs(&xv_from_bf16);
+    let dx_bound = |r: f32| {
+        bf16_two_term_bound(
+            r,
+            dx_amplitude,
+            GELU_ERF_16BIT_ULPS,
+            GELU_ERF_BF16_DX_ABS_ULPS,
+        )
+    };
+    assert_relative_bound(
+        "gelu_erf bf16 dx vs f32 truth",
+        &dx_truth,
+        &dx_gpu_v,
+        dx_bound,
+    );
+
+    // F64 TRUTH (family F), mirroring the F32 leg's own: `dx_truth` above
+    // is STILL this crate's OWN `GeluErfFused::bwd` (run at F32 on the
+    // bf16-rounded inputs), so leg 2's check only proves internal
+    // self-consistency between the truth arm and the CUDA arm, never that
+    // the truth arm itself is correct. Anchor `dx_truth` against the
+    // independent F64 closed form too — this is the KO-1 leg's own "the
+    // bound must still ADMIT the correct answer" half, paired with the
+    // "REJECTS the defect" half right below.
+    let dx_f64_truth = gelu_erf_correct_bwd_f64(&xv_from_bf16, &dyv_from_bf16);
+    assert_relative_bound(
+        "gelu_erf bf16 dx truth vs f64 closed-form",
+        &dx_f64_truth,
+        &dx_truth,
+        dx_bound,
+    );
+
+    // Leg 3 (KO-1), against the F32 truth.
+    let defect = gelu_erf_dropped_x_phi_defect(&xv_from_bf16, &dyv_from_bf16);
+    assert_forced_defect_exceeds_bound("gelu_erf bf16 dx (KO-1)", &dx_truth, &defect, dx_bound);
+}
+
+fn assert_gelu_erf_parity_f16(cuda: &Device, n: usize, xv: &[f32]) {
+    let cpu = Device::Cpu;
+    let xh: Vec<f16> = xv.iter().map(|&v| f16::from_f32(v)).collect();
+    let dyv = cotangent_fixture(n, 0x6765_6C75_5F65_7268, 3.0);
+    let dyh: Vec<f16> = dyv.iter().map(|&v| f16::from_f32(v)).collect();
+
+    let xv_from_f16: Vec<f32> = xh.iter().map(|v| v.to_f32()).collect();
+    let dyv_from_f16: Vec<f32> = dyh.iter().map(|v| v.to_f32()).collect();
+    let x_truth = Var::from_tensor(&Tensor::from_slice(&xv_from_f16, (n,), &cpu).unwrap()).unwrap();
+    let dy_truth = Tensor::from_slice(&dyv_from_f16, (n,), &cpu).unwrap();
+    let out_truth = gelu_erf(&x_truth).unwrap();
+    let out_truth_v: Vec<f32> = out_truth.flatten_all().unwrap().to_vec1().unwrap();
+    let grads_truth = (&out_truth * &dy_truth)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
+    let dx_truth: Vec<f32> = grads_truth
+        .get(&x_truth)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let x_gpu = Var::from_tensor(&Tensor::from_slice(&xh, (n,), cuda).unwrap()).unwrap();
+    let dy_gpu = Tensor::from_slice(&dyh, (n,), cuda).unwrap();
+    let out_gpu = gelu_erf(&x_gpu).unwrap();
+
+    let eager_gpu = x_gpu.gelu_erf().unwrap();
+    let out_gpu_bits: Vec<f16> = out_gpu
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let eager_gpu_bits: Vec<f16> = eager_gpu
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out_gpu_bits.len(), n);
+    for (i, (&f, &e)) in out_gpu_bits.iter().zip(eager_gpu_bits.iter()).enumerate() {
+        assert_eq!(
+            f.to_bits(),
+            e.to_bits(),
+            "gelu_erf f16 fwd[{i}]: fused {f:?} vs candle CUDA eager {e:?} must be bit-identical"
+        );
+    }
+    for h in &out_gpu_bits {
+        assert_finite_f16(*h, "gelu_erf f16 fwd");
+    }
+    let out_gpu_v: Vec<f32> = out_gpu_bits.iter().map(|v| v.to_f32()).collect();
+    let out_floor = f16_ulp_size_at(measured_near_zero_floor_f16(&out_truth_v));
+    let out_bound = |r: f32| f16_relative_bound(r, out_floor, GELU_ERF_16BIT_ULPS);
+    assert_relative_bound(
+        "gelu_erf f16 fwd vs f32 truth",
+        &out_truth_v,
+        &out_gpu_v,
+        out_bound,
+    );
+
+    let grads_gpu = (&out_gpu * &dy_gpu)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .backward()
+        .unwrap();
+    let dx_gpu_v: Vec<f32> = grads_gpu
+        .get(&x_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(dx_gpu_v.len(), n, "gelu_erf f16 GPU dx length mismatch");
+    let dx_floor = f16_ulp_size_at(measured_near_zero_floor_f16(&dx_truth));
+    let dx_bound = |r: f32| f16_relative_bound(r, dx_floor, GELU_ERF_16BIT_ULPS);
+    assert_relative_bound(
+        "gelu_erf f16 dx vs f32 truth",
+        &dx_truth,
+        &dx_gpu_v,
+        dx_bound,
+    );
+
+    // F64 TRUTH (family F), mirroring the F32/BF16 legs' own: `dx_truth`
+    // above is STILL this crate's OWN `GeluErfFused::bwd` (run at F32 on
+    // the f16-rounded inputs) — anchor it against the independent F64
+    // closed form too, the KO-1 leg's own "the bound must still ADMIT the
+    // correct answer" half, paired with the "REJECTS the defect" half
+    // right below.
+    let dx_f64_truth = gelu_erf_correct_bwd_f64(&xv_from_f16, &dyv_from_f16);
+    assert_relative_bound(
+        "gelu_erf f16 dx truth vs f64 closed-form",
+        &dx_f64_truth,
+        &dx_truth,
+        dx_bound,
+    );
+
+    let defect = gelu_erf_dropped_x_phi_defect(&xv_from_f16, &dyv_from_f16);
+    assert_forced_defect_exceeds_bound("gelu_erf f16 dx (KO-1)", &dx_truth, &defect, dx_bound);
+}
+
+#[test]
+fn gelu_erf_parity_contiguous_small() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let n = 32;
+    let xv = fixture(n, 1.0);
+    assert_gelu_erf_parity_f32(&cuda, n, &xv);
+    assert_gelu_erf_parity_bf16(&cuda, n, &xv);
+    assert_gelu_erf_parity_f16(&cuda, n, &xv);
+}
+
+#[test]
+fn gelu_erf_parity_production_width() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    // ModernBERT-large's real `intermediate_size` x 2 rows, comfortably
+    // beyond a single 1024-thread launch block.
+    let n = 2 * 2624;
+    let xv = fixture(n, 2.0);
+    assert_gelu_erf_parity_f32(&cuda, n, &xv);
+    assert_gelu_erf_parity_bf16(&cuda, n, &xv);
+}
+
+#[test]
+fn gelu_erf_parity_non_multiple_of_launch_block() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    // 1024 is exactly one launch block (`elemwise_launch_config`'s own
+    // 1024-thread block, `cudarc`'s `LaunchConfig::for_num_elems`); 1099
+    // is not a multiple of it, exercising the kernel's `if (i < n)` bounds
+    // check on a partial last block.
+    let n = 1099;
+    let xv = fixture(n, 3.0);
+    assert_gelu_erf_parity_f32(&cuda, n, &xv);
+    assert_gelu_erf_parity_bf16(&cuda, n, &xv);
+    assert_gelu_erf_parity_f16(&cuda, n, &xv);
+}
+
+#[test]
+fn gelu_erf_parity_narrowed_with_nonzero_offset() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    // A `[3, n]` tensor narrowed to its middle row: contiguous, but with a
+    // nonzero `start_offset` — the same class of bug this crate's other
+    // CUDA arms had (reading the base buffer's first `n` elements instead
+    // of the tensor's real range).
+    let n = 64;
+    let base = fixture(3 * n, 4.0);
+    let cpu = Device::Cpu;
+
+    let x_cpu = Tensor::from_slice(&base, (3, n), &cpu)
+        .unwrap()
+        .narrow(0, 1, 1)
+        .unwrap()
+        .flatten(0, 1)
+        .unwrap();
+    assert!(x_cpu.is_contiguous());
+    assert_ne!(x_cpu.layout().start_offset(), 0);
+
+    let x_gpu = Tensor::from_slice(&base, (3, n), &cuda)
+        .unwrap()
+        .narrow(0, 1, 1)
+        .unwrap()
+        .flatten(0, 1)
+        .unwrap();
+
+    let out_cpu: Vec<f32> = gelu_erf(&x_cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let out_gpu: Vec<f32> = gelu_erf(&x_gpu)
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(out_cpu.len(), n);
+    assert_eq!(
+        out_gpu.len(),
+        n,
+        "narrowed gelu_erf GPU fwd length mismatch"
+    );
+    let floor = max_abs(&base);
+    let bound = |r: f32| f32_two_term_bound(r, floor, 4.0, F32_GELU_ERF_NORMCDF_ULPS);
+    assert_relative_bound("narrowed gelu_erf fwd", &out_cpu, &out_gpu, bound);
+
+    // And matches the middle slab's own data (`base[n..2n]`), not the base
+    // buffer's first `n` elements.
+    let expected_slab = &base[n..2 * n];
+    let expected: Vec<f32> = expected_slab
+        .iter()
+        .map(|&x| {
+            let cdf = gelu_erf_phi_f64(x as f64);
+            (x as f64 * cdf) as f32
+        })
+        .collect();
+    for (i, (g, e)) in out_gpu.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            (g - e).abs() <= bound(*e),
+            "narrowed gelu_erf fwd[{i}] vs closed-form: cuda {g} vs {e}"
+        );
+    }
+}
+
+#[test]
+fn gelu_erf_parity_empty_input_is_refused_on_both_devices() {
+    let Some(cuda) = cuda_device() else {
+        return;
+    };
+    let cpu = Device::Cpu;
+    let x_cpu = Tensor::from_slice(&[] as &[f32], (0,), &cpu).unwrap();
+    let x_gpu = Tensor::from_slice(&[] as &[f32], (0,), &cuda).unwrap();
+
+    // Domain (family D/K2): empty is a TYPED REFUSAL for this op (unlike
+    // GeGLU's `last == 0` no-op), on BOTH devices — never an illegal
+    // zero-block launch on CUDA, and never silently admitted on CPU.
+    gelu_erf(&x_cpu).expect_err("CPU: empty input must be refused, not silently accepted");
+    gelu_erf(&x_gpu).expect_err("CUDA: empty input must be refused, not silently accepted");
 }
 
 // =======================================================================

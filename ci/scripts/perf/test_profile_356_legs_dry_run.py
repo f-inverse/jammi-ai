@@ -452,10 +452,18 @@ print(json.dumps({"tool": "finetune-run", "tiers": {"finetune_run": tier}}))
       exit 0
       ;;
     wall_missing)
+      # Campaign #462/#463: `FinetuneRunTier` now unconditionally
+      # serializes `train_run_wall_s` (the committed golden fixture itself
+      # carries a real, non-omitted value), so this mode can no longer
+      # rely on the RAW golden lacking the field -- pop it explicitly,
+      # mirroring the `pass|flag_missing` arm's own explicit
+      # `steps_measured` pop above (same "honest about what this fake
+      # deliberately does not know/emit" convention).
       python3 -c '
 import json, sys
 golden = json.load(open(sys.argv[1]))
 tier = golden["tiers"]["finetune_run"]
+tier.pop("train_run_wall_s", None)
 print(json.dumps({"tool": "finetune-run", "tiers": {"finetune_run": tier}}))
 ' "$FAKE_BENCH_GOLDEN"
       exit 0

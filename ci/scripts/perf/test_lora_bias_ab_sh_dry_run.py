@@ -326,5 +326,164 @@ class AbOpLnTests(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(out_dir, "manifest.json")))
 
 
+class AbOpAttnGeluTests(unittest.TestCase):
+    """#462/#463: `AB_OP=attn` forces BOTH `attention_block_fused` and
+    `softmax_last_dim_fused` eager together (comma-joined into ONE
+    `JAMMI_KERNELS_DISABLE` entry -- a block-fused arm subsumes the
+    softmax step, so disabling either key alone would be a silent no-op on
+    the differential); `AB_OP=gelu` forces `gelu_erf_fused` eager, the same
+    single-key shape `AB_OP=ln` already uses. Same driver, same STRICT/
+    negative-control/corpus mechanism throughout -- only the disable
+    key(s) and the eager-arm label change."""
+
+    def test_attn_manifest_rows_record_ab_op_and_both_disable_keys(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            legs_only = "bert-b8W512f32-fused-r1,bert-b8W512f32-attn_eager-r1"
+            result = run_dry(out_dir, {"AB_OP": "attn", "LORA_BIAS_AB_LEGS_ONLY": legs_only})
+            self.assertEqual(result.returncode, 0, _fail_msg(result))
+            rows = load_manifest(out_dir)
+            self.assertEqual(len(rows), 4, [r["leg_id"] for r in rows])  # 2 cells x (N, M)
+            arms_seen = {r["arm"] for r in rows}
+            self.assertEqual(arms_seen, {"fused", "attn_eager"}, rows)
+            for row in rows:
+                self.assertEqual(row["ab_op"], "attn", row)
+                self.assertEqual(row["status"], "ok", row)
+                disable = row["env"]["JAMMI_KERNELS_DISABLE"]
+                if row["arm"] == "attn_eager":
+                    self.assertEqual(
+                        disable, "attention_block_fused,softmax_last_dim_fused", row
+                    )
+                else:
+                    self.assertEqual(disable, "", row)
+
+    def test_attn_dry_run_report_carries_the_expected_counter_families(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            legs_only = "bert-b8W512f32-fused-r1,bert-b8W512f32-attn_eager-r1"
+            result = run_dry(out_dir, {"AB_OP": "attn", "LORA_BIAS_AB_LEGS_ONLY": legs_only})
+            self.assertEqual(result.returncode, 0, _fail_msg(result))
+            rows = load_manifest(out_dir)
+            by_arm_steps = {(r["arm"], r["steps"]): r for r in rows}
+            fused_row = by_arm_steps[("fused", 600)]
+            eager_row = by_arm_steps[("attn_eager", 600)]
+            with open(os.path.join(out_dir, fused_row["report_path"])) as f:
+                fused_tier = json.load(f)["tiers"]["finetune_run"]
+            with open(os.path.join(out_dir, eager_row["report_path"])) as f:
+                eager_tier = json.load(f)["tiers"]["finetune_run"]
+            # fused arm: attention_block(>0,0), softmax(0,0) absorbed.
+            self.assertGreater(fused_tier["attention_block_fused_dispatches"], 0, fused_tier)
+            self.assertEqual(fused_tier["attention_block_eager_dispatches"], 0, fused_tier)
+            self.assertEqual(fused_tier["softmax_fused_dispatches"], 0, fused_tier)
+            self.assertEqual(fused_tier["softmax_eager_dispatches"], 0, fused_tier)
+            # eager arm: attention_block(0,>0), softmax(0,>0).
+            self.assertEqual(eager_tier["attention_block_fused_dispatches"], 0, eager_tier)
+            self.assertGreater(eager_tier["attention_block_eager_dispatches"], 0, eager_tier)
+            self.assertEqual(eager_tier["softmax_fused_dispatches"], 0, eager_tier)
+            self.assertGreater(eager_tier["softmax_eager_dispatches"], 0, eager_tier)
+            # attention_block_flash: declined identically on both arms
+            # (BERT/DistilBERT never wire the flash transport) -- same
+            # steps count on both legs here (600), so the pair-identity
+            # invariant the merger checks holds on this fixture too.
+            self.assertEqual(fused_tier["attention_block_flash_fused_dispatches"], 0, fused_tier)
+            self.assertEqual(eager_tier["attention_block_flash_fused_dispatches"], 0, eager_tier)
+            self.assertGreater(
+                fused_tier["attention_block_flash_declined_dispatches"], 0, fused_tier
+            )
+            self.assertEqual(
+                fused_tier["attention_block_flash_declined_dispatches"],
+                eager_tier["attention_block_flash_declined_dispatches"],
+                (fused_tier, eager_tier),
+            )
+
+    def test_attn_extra_disable_lands_symmetrically(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            legs_only = "bert-b8W512f32-fused-r1,bert-b8W512f32-attn_eager-r1"
+            result = run_dry(
+                out_dir,
+                {
+                    "AB_OP": "attn",
+                    "LORA_BIAS_AB_LEGS_ONLY": legs_only,
+                    "LORA_BIAS_AB_EXTRA_DISABLE": "some_bad_op",
+                },
+            )
+            self.assertEqual(result.returncode, 0, _fail_msg(result))
+            rows = load_manifest(out_dir)
+            for row in rows:
+                self.assertEqual(row["extra_disable"], ["some_bad_op"], row)
+                disable = row["env"]["JAMMI_KERNELS_DISABLE"]
+                self.assertIn("some_bad_op", disable, row)
+                if row["arm"] == "attn_eager":
+                    self.assertEqual(
+                        disable,
+                        "attention_block_fused,softmax_last_dim_fused,some_bad_op",
+                        row,
+                    )
+                else:
+                    self.assertEqual(disable, "some_bad_op", row)
+
+    def test_attn_control_cell_still_works(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            result = run_dry(
+                out_dir, {"AB_OP": "attn", "LORA_BIAS_AB_LEGS_ONLY": "bert-control-r1"}
+            )
+            self.assertEqual(result.returncode, 0, _fail_msg(result))
+            rows = load_manifest(out_dir)
+            self.assertEqual(len(rows), 2, rows)
+            for row in rows:
+                self.assertEqual(row["arm"], "control")
+                self.assertEqual(row["ab_op"], "attn", row)
+                self.assertEqual(row["env"]["JAMMI_KERNELS_DISABLE"], "", row)
+
+    def test_gelu_manifest_rows_record_ab_op_and_the_gelu_eager_arm_label(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            legs_only = "bert-b8W512f32-fused-r1,bert-b8W512f32-gelu_eager-r1"
+            result = run_dry(out_dir, {"AB_OP": "gelu", "LORA_BIAS_AB_LEGS_ONLY": legs_only})
+            self.assertEqual(result.returncode, 0, _fail_msg(result))
+            rows = load_manifest(out_dir)
+            self.assertEqual(len(rows), 4, [r["leg_id"] for r in rows])
+            arms_seen = {r["arm"] for r in rows}
+            self.assertEqual(arms_seen, {"fused", "gelu_eager"}, rows)
+            for row in rows:
+                self.assertEqual(row["ab_op"], "gelu", row)
+                self.assertEqual(row["status"], "ok", row)
+                disable = row["env"]["JAMMI_KERNELS_DISABLE"]
+                if row["arm"] == "gelu_eager":
+                    self.assertEqual(disable, "gelu_erf_fused", row)
+                else:
+                    self.assertEqual(disable, "", row)
+
+    def test_gelu_dry_run_report_carries_the_gelu_counter_pair(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            legs_only = "bert-b8W512f32-fused-r1,bert-b8W512f32-gelu_eager-r1"
+            result = run_dry(out_dir, {"AB_OP": "gelu", "LORA_BIAS_AB_LEGS_ONLY": legs_only})
+            self.assertEqual(result.returncode, 0, _fail_msg(result))
+            rows = load_manifest(out_dir)
+            by_arm = {r["arm"]: r for r in rows if r["steps"] == 600}
+            with open(os.path.join(out_dir, by_arm["fused"]["report_path"])) as f:
+                fused_tier = json.load(f)["tiers"]["finetune_run"]
+            with open(os.path.join(out_dir, by_arm["gelu_eager"]["report_path"])) as f:
+                eager_tier = json.load(f)["tiers"]["finetune_run"]
+            self.assertGreater(fused_tier["gelu_fused_dispatches"], 0, fused_tier)
+            self.assertEqual(fused_tier["gelu_eager_dispatches"], 0, fused_tier)
+            self.assertEqual(eager_tier["gelu_fused_dispatches"], 0, eager_tier)
+            self.assertGreater(eager_tier["gelu_eager_dispatches"], 0, eager_tier)
+
+    def test_gelu_known_cell_ids_use_the_gelu_eager_label(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            result = run_dry(
+                out_dir, {"AB_OP": "gelu", "LORA_BIAS_AB_LEGS_ONLY": "bert-b8W512f32-ln_eager-r1"}
+            )
+            self.assertNotEqual(result.returncode, 0, _fail_msg(result))
+            self.assertIn("unknown cell id", result.stderr)
+
+    def test_bad_ab_op_refuses_before_any_manifest_is_created(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            result = run_dry(out_dir, {"AB_OP": "not_a_real_op"})
+            self.assertNotEqual(result.returncode, 0, _fail_msg(result))
+            self.assertIn("AB_OP must be", result.stderr)
+            self.assertIn("attn", result.stderr)
+            self.assertIn("gelu", result.stderr)
+            self.assertFalse(os.path.exists(os.path.join(out_dir, "manifest.json")))
+
+
 if __name__ == "__main__":
     unittest.main()

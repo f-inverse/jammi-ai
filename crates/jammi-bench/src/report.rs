@@ -1531,6 +1531,35 @@ pub struct FinetuneStepTier {
     /// or because the admission predicate failed for any other stated
     /// reason.
     pub geglu_eager_dispatches: u64,
+    /// How many times BERT's/DistilBERT's training-mode fused GELU-erf
+    /// activation kernel (`jammi_kernels::ops::GeluErfFused`, admit key
+    /// `gelu_erf_fused`) actually dispatched during this run — the same
+    /// positive-proof channel as `ln_fused_dispatches` /
+    /// `rope_fused_dispatches` / `softmax_fused_dispatches` /
+    /// `geglu_fused_dispatches`, for the C-MLP fused-kernels commit (see
+    /// `jammi_encoders::activations::gelu_erf`'s doc). Read via
+    /// `jammi_kernels::admission::counters_for("gelu_erf_fused")` — the
+    /// SAME key `jammi_encoders::activations::gelu_erf`'s own `admit()`
+    /// call registers its counters under (a mismatched key here would
+    /// silently read an always-zero, never-incremented counter instead of
+    /// the one production actually dispatches through), the same
+    /// process-wide registry `adamw_fused_dispatches` reads directly
+    /// rather than through a crate-local wrapper — this counter has no
+    /// `jammi_encoders`-side snapshot function of its own, since the call
+    /// site is wired at exactly two places (`bert.rs`, `distilbert.rs`)
+    /// and both are already this crate's own dependency. Distinct from
+    /// GeGLU's INTERNAL `gelu_erf` composition step counted (as eager,
+    /// always) inside `geglu_eager_dispatches` above: ModernBERT's FFN
+    /// never calls the standalone `gelu_erf` seam this counter tracks, so
+    /// a ModernBert run reads this pair `0`/`0` by construction, not by
+    /// domain decline — see [`Self::attention_block_fused_dispatches`]'s
+    /// doc for the parallel BERT/ModernBert split on that counter.
+    pub gelu_fused_dispatches: u64,
+    /// How many times that same call site fell back to the eager
+    /// (`Tensor::gelu_erf`) composition instead — outside the fused
+    /// kernel's domain (dtype/contiguity/device), or because the
+    /// admission predicate failed for any other stated reason.
+    pub gelu_eager_dispatches: u64,
     /// How many times a LoRA-site fused epilogue
     /// (`jammi_kernels::ops::ScaledCastAdd`, `base_out + cast(lora_out *
     /// scaling)`) actually dispatched during this run — the same
@@ -2170,23 +2199,41 @@ pub struct FinetuneRunTier {
     pub softmax_eager_dispatches: u64,
     pub geglu_fused_dispatches: u64,
     pub geglu_eager_dispatches: u64,
+    /// The BERT-family GELU-erf positive-proof pair (C-MLP): mirrors
+    /// [`FinetuneStepTier::gelu_fused_dispatches`]'s own doc for the
+    /// production call site and the read API
+    /// (`jammi_kernels::admission::counters_for("gelu_erf_fused")`, taken as a
+    /// before/after delta over this run's whole resume-cycled epoch loop,
+    /// the same convention every counter in this block uses). ModernBert
+    /// never calls the standalone `gelu_erf` seam this pair tracks (its
+    /// FFN activation is GeGLU, counted above), so a `modernbert` leg
+    /// reads this pair `0`/`0` by construction, the mirror image of
+    /// [`Self::attention_block_fused_dispatches`]'s BERT-family split
+    /// below.
+    pub gelu_fused_dispatches: u64,
+    pub gelu_eager_dispatches: u64,
     pub lora_epilogue_fused_dispatches: u64,
     pub lora_epilogue_eager_dispatches: u64,
     pub lora_linear_fused_dispatches: u64,
     pub lora_linear_eager_dispatches: u64,
-    /// The positive-proof channel for THIS finding: how many times
-    /// ModernBERT's training-mode fused whole-attention-block kernel
-    /// actually dispatched across this run's whole resume-cycle. On a
-    /// `bert`-arch leg (this tier's generic CPU smoke fixture; ModernBert
-    /// is the C16 gate's real checkpoint family — see
-    /// `finetune_run::build_encoder_adapters`'s error message) this is
-    /// legitimately `0` forever: classic BERT has no fused
-    /// whole-attention-block kernel at all. On a `modernbert` leg that took
-    /// at least one optimizer step, this and the three sibling counters
-    /// below reading all-zero-at-once is the exact failure mode this
-    /// finding fixed — see `finetune_run::run`'s own belt-and-braces typed
-    /// refusal, which reads these same four counters before ever
-    /// constructing this tier.
+    /// The positive-proof channel for THIS finding: how many times a
+    /// training-mode fused whole-attention-block kernel actually
+    /// dispatched across this run's whole resume-cycle. Originally
+    /// ModernBert-only; after the C-ATTN unit, BERT and DistilBERT admit
+    /// the SAME fused kernel through the SAME predicate — by TENSOR STATE
+    /// (`head_dim == 64`), never by architecture name — so a `bert`- or
+    /// `distilbert`-arch leg at `head_dim == 64` (this tier's
+    /// `tiny_bert_head64`-shaped fixture family) dispatches this counter
+    /// `> 0` exactly like a `modernbert` leg does, and one at a different
+    /// `head_dim` (this tier's ORIGINAL generic CPU smoke fixture) reads
+    /// `0` fused / `N` eager — a domain decline, not an architecture-fixed
+    /// `0`. On ANY architecture's leg that took at least one optimizer
+    /// step, this and the three sibling counters below reading
+    /// all-zero-at-once is the exact failure mode this finding fixed — see
+    /// `finetune_run::run`'s own belt-and-braces typed refusal (widened by
+    /// the C-ATTN unit to every `model_type`, admission-by-counters rather
+    /// than admission-by-name), which reads these same four counters
+    /// before ever constructing this tier.
     pub attention_block_fused_dispatches: u64,
     pub attention_block_eager_dispatches: u64,
     pub adamw_fused_dispatches: u64,
@@ -3141,6 +3188,8 @@ mod tests {
             softmax_eager_dispatches: 0,
             geglu_fused_dispatches: 0,
             geglu_eager_dispatches: 0,
+            gelu_fused_dispatches: 0,
+            gelu_eager_dispatches: 0,
             lora_epilogue_fused_dispatches: 0,
             lora_epilogue_eager_dispatches: 0,
             lora_linear_fused_dispatches: 0,
@@ -3238,6 +3287,8 @@ mod tests {
             "flash_compiled",
             "geglu_eager_dispatches",
             "geglu_fused_dispatches",
+            "gelu_eager_dispatches",
+            "gelu_fused_dispatches",
             "kernels_disabled_fired",
             "kernels_disabled_requested",
             "ln_eager_dispatches",
@@ -3379,6 +3430,8 @@ mod tests {
             softmax_eager_dispatches: 0,
             geglu_fused_dispatches: 0,
             geglu_eager_dispatches: 0,
+            gelu_fused_dispatches: 0,
+            gelu_eager_dispatches: 0,
             lora_epilogue_fused_dispatches: 0,
             lora_epilogue_eager_dispatches: 0,
             lora_linear_fused_dispatches: 0,

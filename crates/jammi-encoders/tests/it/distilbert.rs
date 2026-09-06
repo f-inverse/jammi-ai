@@ -32,6 +32,22 @@ fn tiny_config() -> jammi_encoders::distilbert::DistilBertConfig {
     .expect("synthetic config deserialises")
 }
 
+/// `head_dim == 64` (`dim / n_heads == 64`) — the ONE shape
+/// `attention_block_admission_predicate` admits (issue #462): `dim=64,
+/// n_heads=1, hidden_dim=256`, next to [`tiny_config`] (`head_dim = 32/2 =
+/// 16`, which the predicate always refuses, a counted eager fallback).
+fn head64_config() -> jammi_encoders::distilbert::DistilBertConfig {
+    serde_json::from_value(serde_json::json!({
+        "dim": 64,
+        "n_layers": 1,
+        "n_heads": 1,
+        "hidden_dim": 256,
+        "vocab_size": 100,
+        "max_position_embeddings": 128,
+    }))
+    .expect("synthetic head64 config deserialises")
+}
+
 /// Construct a random F32 safetensors archive containing every key the
 /// DistilBert builder requires for the supplied config, returning the file
 /// path and the owning [`tempfile::TempDir`] (kept alive by the caller).
@@ -639,5 +655,302 @@ fn distilbert_biased_layer_norm_counter_threading_gates_the_ln_dispatch_counters
         (before_eval2.fused, before_eval2.eager),
         "set_training(false) must restore the eval-only path -- neither counter advances \
          (before={before_eval2:?}, after={after_eval2:?})"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Attention cascade + GELU seam (issue #462/#463)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn build_frozen_distilbert_head64(device: &Device) -> DistilBert {
+    let config = head64_config();
+    let (_dir, weights_path) = write_synthetic_weights(&config, device);
+    let varmap = VarMap::new();
+    DistilBert::builder()
+        .pooling(Pooling::Mean)
+        .lora(LoraBuildConfig::frozen())
+        .backbone_dtype(DType::F32)
+        .adapter(None)
+        .build(&[weights_path.as_path()], &config, device, &varmap)
+        .expect("build frozen DistilBert at head64")
+}
+
+/// Same shape as `bert.rs`'s
+/// `bert_head64_training_attention_block_and_softmax_two_sided_counters`.
+#[test]
+fn distilbert_head64_training_attention_block_and_softmax_two_sided_counters() {
+    let _guard = crate::modernbert::DISPATCH_COUNTER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let device = Device::Cpu;
+    let mut encoder = build_frozen_distilbert_head64(&device);
+    encoder.set_training(true);
+
+    let input_ids = Tensor::new(&[[1u32, 2, 3, 4, 5]], &device).unwrap();
+    let mask = Tensor::new(&[[1u32, 1, 1, 1, 1]], &device).unwrap();
+
+    let block_before = jammi_encoders::attention_block_dispatch_snapshot();
+    let softmax_before = jammi_encoders::softmax_dispatch_snapshot();
+    let flash_before = jammi_encoders::attention_block_flash_dispatch_snapshot();
+    let _ = encoder
+        .forward_hidden(&input_ids, &mask)
+        .expect("training forward at head64");
+    let block_after = jammi_encoders::attention_block_dispatch_snapshot();
+    let softmax_after = jammi_encoders::softmax_dispatch_snapshot();
+    let flash_after = jammi_encoders::attention_block_flash_dispatch_snapshot();
+
+    assert!(
+        block_after.fused > block_before.fused && block_after.eager == block_before.eager,
+        "head64 training forward must dispatch attention_block_fused, never eager \
+         (before={block_before:?}, after={block_after:?})"
+    );
+    assert_eq!(
+        (softmax_after.fused, softmax_after.eager),
+        (softmax_before.fused, softmax_before.eager),
+        "softmax_last_dim_fused must be untouched -- the block op absorbs it \
+         (before={softmax_before:?}, after={softmax_after:?})"
+    );
+    assert!(
+        flash_after.declined > flash_before.declined,
+        "DistilBERT never wires flash transport -- attention_block_flash must record a \
+         decline every training forward (before={flash_before:?}, after={flash_after:?})"
+    );
+}
+
+/// Same shape as `bert.rs`'s `bert_head64_training_gelu_two_sided_counters`.
+#[test]
+fn distilbert_head64_training_gelu_two_sided_counters() {
+    let _guard = crate::modernbert::DISPATCH_COUNTER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let device = Device::Cpu;
+    let mut encoder = build_frozen_distilbert_head64(&device);
+    encoder.set_training(true);
+
+    let input_ids = Tensor::new(&[[1u32, 2, 3, 4, 5]], &device).unwrap();
+    let mask = Tensor::new(&[[1u32, 1, 1, 1, 1]], &device).unwrap();
+
+    let gelu_counters = jammi_kernels::admission::counters_for("gelu_erf_fused");
+    let before = gelu_counters.snapshot();
+    let _ = encoder
+        .forward_hidden(&input_ids, &mask)
+        .expect("training forward at head64");
+    let after = gelu_counters.snapshot();
+    assert!(
+        after.fused > before.fused && after.eager == before.eager,
+        "head64 training forward must dispatch gelu_erf_fused, never eager \
+         (before={before:?}, after={after:?})"
+    );
+}
+
+/// `tiny_config` (`head_dim = 32/2 = 16`, always refused) must count a
+/// training forward as eager, never fused.
+#[test]
+fn distilbert_head16_training_attention_block_counted_eager() {
+    let _guard = crate::modernbert::DISPATCH_COUNTER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let device = Device::Cpu;
+    let config = tiny_config();
+    let (_dir, weights_path) = write_synthetic_weights(&config, &device);
+    let varmap = VarMap::new();
+    let mut encoder = DistilBert::builder()
+        .pooling(Pooling::Mean)
+        .lora(LoraBuildConfig::frozen())
+        .backbone_dtype(DType::F32)
+        .adapter(None)
+        .build(&[weights_path.as_path()], &config, &device, &varmap)
+        .expect("build frozen DistilBert at head16");
+    encoder.set_training(true);
+
+    let input_ids = Tensor::new(&[[1u32, 2, 3, 4, 5]], &device).unwrap();
+    let mask = Tensor::new(&[[1u32, 1, 1, 1, 1]], &device).unwrap();
+
+    let before = jammi_encoders::attention_block_dispatch_snapshot();
+    let _ = encoder
+        .forward_hidden(&input_ids, &mask)
+        .expect("training forward at head16");
+    let after = jammi_encoders::attention_block_dispatch_snapshot();
+    assert!(
+        after.eager > before.eager && after.fused == before.fused,
+        "head_dim=16 must always fall back to eager (before={before:?}, after={after:?})"
+    );
+}
+
+/// K4 eval pin, same shape as `bert.rs`'s
+/// `bert_head64_eval_output_is_bit_identical_regardless_of_fused_eligibility`
+/// — DistilBERT's synthetic weights are randomised per `write_synthetic_weights`
+/// call, so both legs below load from the SAME saved safetensors file
+/// rather than rebuilding from a second random draw.
+#[test]
+fn distilbert_head64_eval_output_is_bit_identical_regardless_of_fused_eligibility() {
+    let _guard = crate::modernbert::DISPATCH_COUNTER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let device = Device::Cpu;
+    let config = head64_config();
+    let (_dir, weights_path) = write_synthetic_weights(&config, &device);
+    let build = || {
+        let varmap = VarMap::new();
+        DistilBert::builder()
+            .pooling(Pooling::Mean)
+            .lora(LoraBuildConfig::frozen())
+            .backbone_dtype(DType::F32)
+            .adapter(None)
+            .build(&[weights_path.as_path()], &config, &device, &varmap)
+            .expect("build frozen DistilBert at head64")
+    };
+    let input_ids = Tensor::new(&[[1u32, 2, 3, 4, 5]], &device).unwrap();
+    let mask = Tensor::new(&[[1u32, 1, 1, 1, 1]], &device).unwrap();
+
+    let encoder_never_trained = build();
+    let out_never_trained = encoder_never_trained
+        .forward_hidden(&input_ids, &mask)
+        .expect("eval forward (never trained)");
+
+    let mut encoder_toggled = build();
+    encoder_toggled.set_training(true);
+    let _ = encoder_toggled
+        .forward_hidden(&input_ids, &mask)
+        .expect("training forward (to touch the fused arm)");
+    encoder_toggled.set_training(false);
+
+    let block_before = jammi_encoders::attention_block_dispatch_snapshot();
+    let softmax_before = jammi_encoders::softmax_dispatch_snapshot();
+    let gelu_before = jammi_kernels::admission::counters_for("gelu_erf_fused").snapshot();
+    let out_toggled = encoder_toggled
+        .forward_hidden(&input_ids, &mask)
+        .expect("eval forward (after toggling training)");
+    let block_after = jammi_encoders::attention_block_dispatch_snapshot();
+    let softmax_after = jammi_encoders::softmax_dispatch_snapshot();
+    let gelu_after = jammi_kernels::admission::counters_for("gelu_erf_fused").snapshot();
+
+    assert_eq!(
+        (block_after.fused, block_after.eager),
+        (block_before.fused, block_before.eager)
+    );
+    assert_eq!(
+        (softmax_after.fused, softmax_after.eager),
+        (softmax_before.fused, softmax_before.eager)
+    );
+    assert_eq!(
+        (gelu_after.fused, gelu_after.eager),
+        (gelu_before.fused, gelu_before.eager)
+    );
+
+    let a: Vec<f32> = out_never_trained.flatten_all().unwrap().to_vec1().unwrap();
+    let b: Vec<f32> = out_toggled.flatten_all().unwrap().to_vec1().unwrap();
+    assert_eq!(
+        a, b,
+        "eval output must be bit-identical whether or not the model was ever put into \
+         training mode"
+    );
+}
+
+/// Same shape as `bert.rs`'s
+/// `bert_head64_disabling_attention_block_and_softmax_forces_eager_in_a_fresh_process`.
+#[test]
+fn distilbert_head64_disabling_attention_block_and_softmax_forces_eager_in_a_fresh_process() {
+    let exe = std::env::current_exe().expect("test binary path");
+    let output = std::process::Command::new(exe)
+        .args([
+            "distilbert::distilbert_head64_disabled_attention_block_and_softmax_child_process_body",
+            "--exact",
+            "--nocapture",
+            "--ignored",
+        ])
+        .env(
+            "JAMMI_KERNELS_DISABLE",
+            "attention_block_fused,softmax_last_dim_fused",
+        )
+        .output()
+        .expect("spawn child test binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "child process assertion failed: stdout={stdout}\nstderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "the child process must have actually run (and passed) exactly one test -- \
+         stdout={stdout}"
+    );
+}
+
+#[test]
+#[ignore]
+fn distilbert_head64_disabled_attention_block_and_softmax_child_process_body() {
+    let device = Device::Cpu;
+    let mut encoder = build_frozen_distilbert_head64(&device);
+    encoder.set_training(true);
+    let input_ids = Tensor::new(&[[1u32, 2, 3, 4, 5]], &device).unwrap();
+    let mask = Tensor::new(&[[1u32, 1, 1, 1, 1]], &device).unwrap();
+
+    let block_before = jammi_encoders::attention_block_dispatch_snapshot();
+    let softmax_before = jammi_encoders::softmax_dispatch_snapshot();
+    let _ = encoder
+        .forward_hidden(&input_ids, &mask)
+        .expect("disabled attention_block_fused/softmax must fall back to eager, not error");
+    let block_after = jammi_encoders::attention_block_dispatch_snapshot();
+    let softmax_after = jammi_encoders::softmax_dispatch_snapshot();
+
+    assert!(
+        block_after.eager > block_before.eager && block_after.fused == block_before.fused,
+        "disabled attention_block_fused must count eager only (before={block_before:?}, \
+         after={block_after:?})"
+    );
+    assert!(
+        softmax_after.eager > softmax_before.eager && softmax_after.fused == softmax_before.fused,
+        "disabled softmax_last_dim_fused must count eager only (before={softmax_before:?}, \
+         after={softmax_after:?})"
+    );
+}
+
+/// Same shape as `bert.rs`'s `bert_head64_disabling_gelu_erf_fused_forces_eager_in_a_fresh_process`.
+#[test]
+fn distilbert_head64_disabling_gelu_erf_fused_forces_eager_in_a_fresh_process() {
+    let exe = std::env::current_exe().expect("test binary path");
+    let output = std::process::Command::new(exe)
+        .args([
+            "distilbert::distilbert_head64_disabled_gelu_erf_fused_child_process_body",
+            "--exact",
+            "--nocapture",
+            "--ignored",
+        ])
+        .env("JAMMI_KERNELS_DISABLE", "gelu_erf_fused")
+        .output()
+        .expect("spawn child test binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "child process assertion failed: stdout={stdout}\nstderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "the child process must have actually run (and passed) exactly one test -- \
+         stdout={stdout}"
+    );
+}
+
+#[test]
+#[ignore]
+fn distilbert_head64_disabled_gelu_erf_fused_child_process_body() {
+    let device = Device::Cpu;
+    let mut encoder = build_frozen_distilbert_head64(&device);
+    encoder.set_training(true);
+    let input_ids = Tensor::new(&[[1u32, 2, 3, 4, 5]], &device).unwrap();
+    let mask = Tensor::new(&[[1u32, 1, 1, 1, 1]], &device).unwrap();
+
+    let gelu_counters = jammi_kernels::admission::counters_for("gelu_erf_fused");
+    let before = gelu_counters.snapshot();
+    let _ = encoder
+        .forward_hidden(&input_ids, &mask)
+        .expect("disabled gelu_erf_fused must fall back to eager, not error");
+    let after = gelu_counters.snapshot();
+    assert!(
+        after.eager > before.eager && after.fused == before.fused,
+        "disabled gelu_erf_fused must count eager only (before={before:?}, after={after:?})"
     );
 }

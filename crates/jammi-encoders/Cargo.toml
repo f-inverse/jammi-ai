@@ -28,6 +28,14 @@ jammi-lora = { workspace = true, features = ["candle"] }
 # -legal trait impl cannot exist anywhere but `jammi-numerics` or `candle`
 # itself, and `jammi-numerics` must stay candle-free).
 jammi-numerics.workspace = true
+# `half::f16::MIN` / `half::bf16::MIN` — the dtype-following additive-mask
+# sentinels (`clip_text::dtype_min_sentinel`). candle-core 0.11 does NOT
+# re-export `half`, and these two constants are the whole reason a mask
+# built for an F16/BF16 backbone is a large finite number rather than the
+# `-inf` an `f32::MIN` cast would produce. Promoted from dev-dependencies
+# (where it was already used by the attention/layer-norm bf16 oracles) —
+# same workspace version, no new crate enters the graph.
+half.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

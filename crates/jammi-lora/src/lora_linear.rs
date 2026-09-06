@@ -1037,6 +1037,16 @@ impl LoraLinear {
         vec![&self.lora_a, &self.lora_b]
     }
 
+    /// The FROZEN base weight this layer wraps — read access only (a
+    /// `LoraLinear`'s base is immutable after construction, matching
+    /// `candle_nn::Linear`'s own convention). Reached from outside this
+    /// crate through [`crate::MaybeLoraLinear::base`], which is what a
+    /// consumer that must inspect a site's base tensor regardless of
+    /// whether an adapter is installed on it actually calls.
+    pub(crate) fn base(&self) -> &FrozenBase {
+        &self.base
+    }
+
     /// This layer's dropout forward counter — the number of TRAINING
     /// FORWARDS taken through it (NOT a draw count; see
     /// `jammi-ai/src/fine_tune/resume.rs`'s schema-version doc for the unit

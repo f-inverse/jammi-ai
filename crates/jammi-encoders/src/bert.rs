@@ -842,7 +842,11 @@ impl LoraSite<'_, '_> {
         if should_apply_lora(
             module_name,
             self.lora.target_modules,
-            self.layer_idx,
+            // A BERT-family site always belongs to a numbered encoder layer,
+            // so the index is always present — see `should_apply_lora`'s own
+            // doc for the `None` (unindexed-site) case this family never
+            // reaches and the towers with head-side projections do.
+            Some(self.layer_idx),
             self.lora.layers_to_transform,
         ) {
             let rank = effective_rank(module_name, self.lora.lora_rank, self.lora.rank_pattern);

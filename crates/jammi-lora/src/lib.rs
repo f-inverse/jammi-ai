@@ -10,8 +10,8 @@
 //! - [`LoraBuildConfig`] / [`should_apply_lora`] / [`effective_rank`] —
 //!   call-site decisions about which modules receive an adapter and at what
 //!   rank.
-//! - [`AdapterConfig`] + [`save_adapter`] / [`load_adapter`] — adapter
-//!   directory persistence.
+//! - [`AdapterConfig`] (+ [`Tower`]) + [`save_adapter`] / [`load_adapter`] —
+//!   adapter directory persistence.
 //!
 //! [candle]: https://github.com/huggingface/candle
 
@@ -40,7 +40,7 @@ mod seeded;
 #[cfg(feature = "candle")]
 mod wrapper;
 
-pub use adapter::AdapterConfig;
+pub use adapter::{AdapterConfig, Tower};
 pub use config::{effective_rank, should_apply_lora, LoraBuildConfig};
 #[cfg(feature = "candle")]
 pub use error::LoraError;

@@ -6,7 +6,7 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder, VarMap};
 use jammi_lora::{
     effective_rank, load_adapter, save_adapter, should_apply_lora, AdapterConfig, ComputePrecision,
-    FrozenBase, LoraBuildConfig, LoraError, LoraInitMode, LoraLinear, MaybeLoraLinear,
+    FrozenBase, LoraBuildConfig, LoraError, LoraInitMode, LoraLinear, MaybeLoraLinear, Tower,
 };
 
 fn cpu() -> Device {
@@ -346,32 +346,70 @@ fn maybe_lora_linear_named_weights_only_for_lora() {
 #[test]
 fn should_apply_lora_exact_match() {
     let targets = vec!["query".to_string()];
-    assert!(should_apply_lora("query", &targets, 0, &None));
+    assert!(should_apply_lora("query", &targets, Some(0), &None));
     assert!(should_apply_lora(
         "attention.self.query",
         &targets,
-        0,
+        Some(0),
         &None
     ));
-    assert!(!should_apply_lora("key", &targets, 0, &None));
-    assert!(!should_apply_lora("queryless", &targets, 0, &None));
+    assert!(!should_apply_lora("key", &targets, Some(0), &None));
+    assert!(!should_apply_lora("queryless", &targets, Some(0), &None));
 }
 
 #[test]
 fn should_apply_lora_all_linear() {
     let targets = vec!["all-linear".to_string()];
-    assert!(should_apply_lora("query", &targets, 0, &None));
-    assert!(should_apply_lora("anything.at.all", &targets, 7, &None));
+    assert!(should_apply_lora("query", &targets, Some(0), &None));
+    assert!(should_apply_lora(
+        "anything.at.all",
+        &targets,
+        Some(7),
+        &None
+    ));
 }
 
 #[test]
 fn should_apply_lora_layer_filter() {
     let targets = vec!["all-linear".to_string()];
     let layers = Some(vec![2usize, 5]);
-    assert!(should_apply_lora("query", &targets, 2, &layers));
-    assert!(should_apply_lora("query", &targets, 5, &layers));
-    assert!(!should_apply_lora("query", &targets, 0, &layers));
-    assert!(!should_apply_lora("query", &targets, 3, &layers));
+    assert!(should_apply_lora("query", &targets, Some(2), &layers));
+    assert!(should_apply_lora("query", &targets, Some(5), &layers));
+    assert!(!should_apply_lora("query", &targets, Some(0), &layers));
+    assert!(!should_apply_lora("query", &targets, Some(3), &layers));
+}
+
+/// The UNINDEXED site (`layer_idx == None`) — a linear that belongs to no
+/// numbered block at all, e.g. a CLAP audio-projection `linear1`. PEFT's own
+/// `check_target_module_exists` (`peft/src/peft/tuners/tuners_utils.py:
+/// 2353-2389`) sets `layer_index = None` for a key with no numbered segment
+/// and then `target_module_found = False` whenever `layers_to_transform` is
+/// set, so:
+///
+/// - with a layer filter active, an unindexed site is NEVER adapted —
+///   including under `all-linear`, which is a NAME wildcard, not a layer
+///   one (the negative control that a naive "no index, so nothing to
+///   reject" implementation would silently fail);
+/// - with no filter, the ordinary selector match decides, exactly as for an
+///   indexed site.
+#[test]
+fn should_apply_lora_unindexed_site_obeys_the_layer_filter() {
+    let all_linear = vec!["all-linear".to_string()];
+    let by_name = vec!["linear1".to_string()];
+    let layers = Some(vec![0usize]);
+
+    // Filter active + no index => never applied, on either selector form.
+    assert!(!should_apply_lora("linear1", &all_linear, None, &layers));
+    assert!(!should_apply_lora("linear1", &by_name, None, &layers));
+    // Same site, same selectors, WITH an index inside the filter => applied
+    // (proving the refusal above is the missing index, not the selector).
+    assert!(should_apply_lora("linear1", &all_linear, Some(0), &layers));
+    assert!(should_apply_lora("linear1", &by_name, Some(0), &layers));
+
+    // No filter => the selector alone decides, index or not.
+    assert!(should_apply_lora("linear1", &all_linear, None, &None));
+    assert!(should_apply_lora("linear1", &by_name, None, &None));
+    assert!(!should_apply_lora("linear2", &by_name, None, &None));
 }
 
 #[test]
@@ -399,10 +437,12 @@ fn adapter_config_json_roundtrip() {
         layers_to_transform: Some(vec![0, 2]),
         rank_pattern,
         backbone_dtype: ComputePrecision::BF16,
+        tower: Some(Tower::Vision),
     };
 
     let json = serde_json::to_string(&cfg).unwrap();
     let decoded: AdapterConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded.tower, cfg.tower);
     assert_eq!(decoded.model_type, cfg.model_type);
     assert_eq!(decoded.lora_rank, cfg.lora_rank);
     assert_eq!(decoded.lora_alpha, cfg.lora_alpha);
@@ -449,6 +489,7 @@ fn save_load_adapter_roundtrip() {
         layers_to_transform: None,
         rank_pattern: HashMap::new(),
         backbone_dtype: ComputePrecision::F32,
+        tower: None,
     };
 
     save_adapter(dir.path(), &tensors, &cfg).unwrap();
@@ -478,7 +519,7 @@ fn lora_build_config_frozen_is_no_op() {
     assert!(!should_apply_lora(
         "query",
         cfg.target_modules,
-        0,
+        Some(0),
         cfg.layers_to_transform
     ));
 }

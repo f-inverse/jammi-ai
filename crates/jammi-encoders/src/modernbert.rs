@@ -2893,7 +2893,9 @@ impl<'a, 'b> LoraSite<'a, 'b> {
         if should_apply_lora(
             target_name,
             self.lora.target_modules,
-            self.layer_idx,
+            // Always a numbered encoder layer — see `bert.rs`'s sibling note
+            // and `should_apply_lora`'s own doc.
+            Some(self.layer_idx),
             self.lora.layers_to_transform,
         ) {
             let rank = effective_rank(target_name, self.lora.lora_rank, self.lora.rank_pattern);

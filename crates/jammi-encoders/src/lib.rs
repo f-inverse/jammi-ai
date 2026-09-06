@@ -9,9 +9,15 @@
 //! cross-modal text↔image search. [`HtsatAudio`] is the
 //! HTSAT-Swin CLAP audio tower that produces shared-latent embeddings from a
 //! 4-channel fusion spectrogram, compatible with the CLAP text tower for
-//! cross-modal text↔audio search. [`AnyEncoder`] / [`AnyAudioEncoder`] are the
-//! closed-enum dispatchers that let a single caller hold any of the
-//! text / audio families respectively.
+//! cross-modal text↔audio search. All three towers carry LoRA sites on the
+//! same [`jammi_lora::MaybeLoraLinear`] seam the BERT family uses, reached
+//! through their own builders ([`ClipText::builder`],
+//! [`OpenClipVisionTransformer::builder`], [`HtsatAudio::builder`]).
+//!
+//! [`AnyEncoder`] is the ONE closed-enum dispatcher across all three
+//! modalities: [`EncoderInput`] (owned twin [`OwnedEncoderInput`]) names a
+//! batch for a given [`Modality`], and a mismatch between an input's
+//! modality and the encoder's own is a typed refusal.
 //!
 //! [`AnyContextPredictor`] is the amortized in-context predictor family
 //! ([`Cnp`] / [`AttnCnp`] / [`Tnp`]): given a target and its context set, it
@@ -20,7 +26,6 @@
 //! the same closed-enum pattern as the encoder families.
 
 pub mod aggregate;
-pub mod audio;
 pub mod bert;
 pub mod clip_text;
 pub mod context;
@@ -42,16 +47,21 @@ mod error;
 // shared by `bert`/`distilbert`/`modernbert` — see its own module doc.
 mod frozen_weight_source;
 mod layer_norm;
+mod lora_site;
 mod mask;
 mod pooling;
 #[cfg(test)]
 mod test_support;
 
 pub use aggregate::{segment_aggregate, SegmentReduce};
-pub use any::AnyEncoder;
-pub use audio::{AnyAudioEncoder, AudioEncoder};
+// `audio::{AnyAudioEncoder, AudioEncoder}` were REMOVED here (breaking):
+// the audio-only dispatcher and its trait had zero callers anywhere in the
+// workspace, and `AnyEncoder` now covers audio as a first-class variant with
+// real training hooks — keeping a second, parallel audio dispatcher would be
+// exactly the family-erasure duplication `AnyEncoder` exists to avoid.
+pub use any::{AnyEncoder, EncoderInput, Modality, OwnedEncoderInput};
 pub use bert::{Bert, BertConfig};
-pub use clip_text::{ClipText, ClipTextConfig};
+pub use clip_text::{ClipText, ClipTextBuilder, ClipTextConfig};
 pub use context::{
     attention_weights, multi_head_attention, AnyContextPredictor, AttnCnp, Cnp,
     ContextArchitecture, ContextEpisode, ContextPredictorConfig, Tnp,
@@ -59,9 +69,11 @@ pub use context::{
 pub use distilbert::{DistilBert, DistilBertConfig};
 pub use error::EncoderError;
 pub use frozen_weight_source::FrozenWeightLookup;
-pub use htsat_audio::{HtsatAudio, HtsatAudioConfig};
+pub use htsat_audio::{HtsatAudio, HtsatAudioBuilder, HtsatAudioConfig};
 pub use modernbert::{ModernBert, ModernBertConfig};
-pub use open_clip_vision::{OpenClipVisionConfig, OpenClipVisionTransformer};
+pub use open_clip_vision::{
+    OpenClipVisionBuilder, OpenClipVisionConfig, OpenClipVisionTransformer,
+};
 pub use pooling::{pool_and_normalize, Pooling};
 pub use precision::compute_precision_to_dtype;
 

@@ -14,12 +14,17 @@
 //! `crate::layer_norm::tests::fused_training_path_matches_slow_within_tolerance_fwd_and_bwd`);
 //! and `quick_gelu` is the single shared `crate::activations::quick_gelu`.
 
-use candle_core::{IndexOp, Module, Tensor};
-use candle_nn::{conv2d_no_bias, Conv2d, Conv2dConfig, VarBuilder};
+use std::collections::HashMap;
+use std::path::Path;
+
+use candle_core::{DType, Device, IndexOp, Module, Tensor};
+use candle_nn::{conv2d_no_bias, Conv2d, Conv2dConfig, VarBuilder, VarMap};
+use jammi_lora::{FrozenBase, LoraBuildConfig, MaybeLoraLinear};
 
 use crate::attention::MultiHeadAttention;
 use crate::error::EncoderError;
 use crate::layer_norm::LayerNorm;
+use crate::lora_site::{FrozenSiteHolder, LoraSite};
 
 /// Default CLIP normalization constants (used when preprocess_cfg is absent).
 #[allow(clippy::excessive_precision)]
@@ -126,23 +131,49 @@ fn parse_f32_array(value: Option<&serde_json::Value>, default: [f32; 3]) -> [f32
         .unwrap_or(default)
 }
 
+/// The MLP's two LoRA-wrappable sites, named as the OpenCLIP checkpoint
+/// names them — see `crate::clip_text`'s sibling pair (the two towers share
+/// the block shape and therefore the site vocabulary).
+const C_FC_SITE: &str = "c_fc";
+/// See [`C_FC_SITE`].
+const C_PROJ_SITE: &str = "c_proj";
+
 /// Feed-forward MLP with QuickGelu activation.
 struct Mlp {
-    c_fc: candle_nn::Linear,
-    c_proj: candle_nn::Linear,
+    c_fc: MaybeLoraLinear,
+    c_proj: MaybeLoraLinear,
 }
 
 impl Mlp {
-    fn load(vb: VarBuilder, width: usize, intermediate_size: usize) -> Result<Self, EncoderError> {
-        let c_fc = candle_nn::linear(width, intermediate_size, vb.pp("c_fc"))?;
-        let c_proj = candle_nn::linear(intermediate_size, width, vb.pp("c_proj"))?;
-        Ok(Self { c_fc, c_proj })
+    /// One construction path (`crate::lora_site`'s module doc): bases
+    /// resolved exactly as before, then offered to `site`, which declines
+    /// every one of them under a `LoraBuildConfig::frozen()` config.
+    fn load_with(
+        vb: VarBuilder,
+        width: usize,
+        intermediate_size: usize,
+        site: &LoraSite<'_>,
+    ) -> Result<Self, EncoderError> {
+        let c_fc = candle_nn::linear(width, intermediate_size, vb.pp(C_FC_SITE))?;
+        let c_proj = candle_nn::linear(intermediate_size, width, vb.pp(C_PROJ_SITE))?;
+        Ok(Self {
+            c_fc: site.wrap(FrozenBase::Dense(c_fc), C_FC_SITE, C_FC_SITE)?,
+            c_proj: site.wrap(FrozenBase::Dense(c_proj), C_PROJ_SITE, C_PROJ_SITE)?,
+        })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
         let x = self.c_fc.forward(x)?;
         let x = crate::activations::quick_gelu(&x)?;
         Ok(self.c_proj.forward(&x)?)
+    }
+
+    fn lora_sites(&self) -> [(&'static str, &MaybeLoraLinear); 2] {
+        [(C_FC_SITE, &self.c_fc), (C_PROJ_SITE, &self.c_proj)]
+    }
+
+    fn lora_sites_mut(&mut self) -> [(&'static str, &mut MaybeLoraLinear); 2] {
+        [(C_FC_SITE, &mut self.c_fc), (C_PROJ_SITE, &mut self.c_proj)]
     }
 }
 
@@ -155,20 +186,21 @@ struct ResidualAttentionBlock {
 }
 
 impl ResidualAttentionBlock {
-    fn load(
+    fn load_with(
         vb: VarBuilder,
         width: usize,
         heads: usize,
         mlp_ratio: f64,
+        site: &LoraSite<'_>,
     ) -> Result<Self, EncoderError> {
         let intermediate_size = (width as f64 * mlp_ratio) as usize;
         // `with_bias=true`: no `remove_mean=false` (RMSNorm-style) variant
         // exists in this tower's config — see `crate::clip_text`'s sibling
         // note on the same class.
         let ln_1 = LayerNorm::new(width, 1e-5, true, vb.pp("ln_1"))?;
-        let attn = MultiHeadAttention::load(vb.pp("attn"), width, heads)?;
+        let attn = MultiHeadAttention::load_with(vb.pp("attn"), width, heads, site)?;
         let ln_2 = LayerNorm::new(width, 1e-5, true, vb.pp("ln_2"))?;
-        let mlp = Mlp::load(vb.pp("mlp"), width, intermediate_size)?;
+        let mlp = Mlp::load_with(vb.pp("mlp"), width, intermediate_size, site)?;
         Ok(Self {
             ln_1,
             attn,
@@ -177,10 +209,32 @@ impl ResidualAttentionBlock {
         })
     }
 
+    /// Propagates to the attention module (softmax arm AND its two LoRA
+    /// sites' dropout), both residual-stream LayerNorms, and the MLP's two
+    /// LoRA sites.
     fn set_training(&mut self, training: bool) {
         self.attn.set_training(training);
         self.ln_1.set_training(training);
         self.ln_2.set_training(training);
+        for (_, site) in self.mlp.lora_sites_mut() {
+            site.set_training(training);
+        }
+    }
+
+    /// This block's four LoRA sites paired with their names — the single
+    /// source of the site→name map every [`OpenClipVisionTransformer`]
+    /// traversal walks. Same fixed order as `crate::clip_text`'s twin.
+    fn lora_sites(&self) -> [(&'static str, &MaybeLoraLinear); 4] {
+        let [in_proj, out_proj] = self.attn.lora_sites();
+        let [c_fc, c_proj] = self.mlp.lora_sites();
+        [in_proj, out_proj, c_fc, c_proj]
+    }
+
+    /// The `&mut` twin of `Self::lora_sites`, same names, same order.
+    fn lora_sites_mut(&mut self) -> [(&'static str, &mut MaybeLoraLinear); 4] {
+        let [in_proj, out_proj] = self.attn.lora_sites_mut();
+        let [c_fc, c_proj] = self.mlp.lora_sites_mut();
+        [in_proj, out_proj, c_fc, c_proj]
     }
 
     /// Unmasked (bidirectional) attention: passes `None` to the shared
@@ -212,14 +266,48 @@ pub struct OpenClipVisionTransformer {
     ln_post: LayerNorm,
     proj: Tensor,
     config: OpenClipVisionConfig,
+    /// Wired through [`Self::set_training`]; read by [`Self::is_training`].
+    training: bool,
 }
 
 impl OpenClipVisionTransformer {
-    /// Load from a VarBuilder scoped to the `visual` prefix.
+    /// Start a builder with default settings: frozen LoRA config, F32
+    /// backbone dtype, no adapter file. See [`OpenClipVisionBuilder`].
+    pub fn builder() -> OpenClipVisionBuilder<'static> {
+        OpenClipVisionBuilder {
+            lora: LoraBuildConfig::frozen(),
+            backbone_dtype: DType::F32,
+            adapter_file: None,
+        }
+    }
+
+    /// Load from a VarBuilder scoped to the `visual` prefix, fully frozen
+    /// (no LoRA sites installed).
     ///
     /// Expects the VarBuilder to be created with `vb.pp("visual")` so that
-    /// weight keys like `conv1.weight`, `class_embedding`, etc. resolve correctly.
+    /// weight keys like `conv1.weight`, `class_embedding`, etc. resolve
+    /// correctly. Routed through the SAME `Self::load_with` the builder
+    /// uses, with a decline-everything site
+    /// (`crate::lora_site::FrozenSiteHolder`), so there is one loader rather
+    /// than two that could drift — `builder().lora(frozen()).build(..)`
+    /// produces a bit-identical tower (asserted by
+    /// `tests::builder_frozen_output_bits_equal_load`).
     pub fn load(vb: VarBuilder, config: &OpenClipVisionConfig) -> Result<Self, EncoderError> {
+        let holder = FrozenSiteHolder::new();
+        Self::load_with(vb.clone(), config, &|_n| holder.site(&vb))
+    }
+
+    /// The one loader. `site_for` yields the [`LoraSite`] for block `n`
+    /// (already scoped to that block's adapter subtree and carrying
+    /// `layer_idx = Some(n)`). This tower has no additive attention mask at
+    /// all (its attention is unmasked — `MultiHeadAttention::forward`'s
+    /// `None` arm), so unlike `crate::clip_text` it carries no dtype-following
+    /// mask to build.
+    fn load_with<'a>(
+        vb: VarBuilder,
+        config: &OpenClipVisionConfig,
+        site_for: &dyn Fn(usize) -> LoraSite<'a>,
+    ) -> Result<Self, EncoderError> {
         let conv_config = Conv2dConfig {
             stride: config.patch_size,
             ..Default::default()
@@ -242,11 +330,12 @@ impl OpenClipVisionTransformer {
 
         let mut blocks = Vec::with_capacity(config.layers);
         for i in 0..config.layers {
-            let block = ResidualAttentionBlock::load(
+            let block = ResidualAttentionBlock::load_with(
                 vb.pp(format!("transformer.resblocks.{i}")),
                 config.width,
                 config.heads,
                 config.mlp_ratio,
+                &site_for(i),
             )?;
             blocks.push(block);
         }
@@ -263,6 +352,7 @@ impl OpenClipVisionTransformer {
             ln_post,
             proj,
             config: config.clone(),
+            training: false,
         })
     }
 
@@ -328,11 +418,83 @@ impl OpenClipVisionTransformer {
     /// own fast path has. Propagates to every block's attention sublayer and
     /// both norms this method doesn't own directly.
     pub fn set_training(&mut self, training: bool) {
+        self.training = training;
         self.ln_pre.set_training(training);
         for block in &mut self.blocks {
             block.set_training(training);
         }
         self.ln_post.set_training(training);
+    }
+
+    /// Whether [`Self::set_training`] last set training mode. `false` from
+    /// every constructor.
+    pub fn is_training(&self) -> bool {
+        self.training
+    }
+
+    /// Trainable tensors across every LoRA-wrapped site. Empty for a fully
+    /// frozen tower.
+    pub fn trainable_params(&self) -> Vec<&Tensor> {
+        let mut params = Vec::new();
+        for block in &self.blocks {
+            for (_, lin) in block.lora_sites() {
+                params.extend(lin.trainable_params());
+            }
+        }
+        params
+    }
+
+    /// Named LoRA A/B tensors keyed `resblocks.{n}.{site}.lora_{a,b}` —
+    /// the same layout `crate::clip_text`'s twin uses, `{site}` being the
+    /// checkpoint's own leaf name (`in_proj`, `out_proj`, `c_fc`, `c_proj`).
+    /// Note the key is NOT prefixed with `visual.`: an adapter file belongs
+    /// to ONE tower (`jammi_lora::Tower` records which), so the tower
+    /// prefix would be redundant in every key.
+    pub fn named_trainable_weights(&self) -> Result<HashMap<String, Tensor>, EncoderError> {
+        let mut out = HashMap::new();
+        for (n, block) in self.blocks.iter().enumerate() {
+            for (site, lin) in block.lora_sites() {
+                out.extend(lin.named_weights(&format!("resblocks.{n}.{site}"))?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Restore LoRA A/B tensors from a [`Self::named_trainable_weights`]-shaped
+    /// map. Missing keys are no-ops.
+    pub fn load_weights(&mut self, weights: &HashMap<String, Tensor>) -> Result<(), EncoderError> {
+        for (n, block) in self.blocks.iter_mut().enumerate() {
+            for (site, lin) in block.lora_sites_mut() {
+                lin.load_weights(weights, &format!("resblocks.{n}.{site}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Per-site dropout-stream positions keyed `{site}.dropout` under the
+    /// same site names [`Self::named_trainable_weights`] uses.
+    pub fn dropout_positions(&self) -> Result<HashMap<String, u64>, EncoderError> {
+        let mut out = HashMap::new();
+        for (n, block) in self.blocks.iter().enumerate() {
+            for (site, lin) in block.lora_sites() {
+                lin.collect_dropout_position(&format!("resblocks.{n}.{site}"), &mut out)?;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Restore each LoRA site's dropout-stream position from a
+    /// [`Self::dropout_positions`]-shaped map. Missing keys are no-ops.
+    pub fn restore_dropout_positions(
+        &self,
+        positions: &HashMap<String, u64>,
+    ) -> Result<(), EncoderError> {
+        for (n, block) in self.blocks.iter().enumerate() {
+            for (site, lin) in block.lora_sites() {
+                lin.restore_dropout_position(&format!("resblocks.{n}.{site}"), positions)?;
+            }
+        }
+        Ok(())
     }
 
     /// Return the output embedding dimension.
@@ -353,6 +515,78 @@ impl OpenClipVisionTransformer {
     /// Return the preprocessing normalization std.
     pub fn preprocess_std(&self) -> [f32; 3] {
         self.config.preprocess_std
+    }
+}
+
+/// Fluent builder for [`OpenClipVisionTransformer`]. Created via
+/// [`OpenClipVisionTransformer::builder`], on the same shape
+/// [`crate::Bert`]'s and [`crate::ClipText`]'s builders use.
+pub struct OpenClipVisionBuilder<'a> {
+    lora: LoraBuildConfig<'a>,
+    backbone_dtype: DType,
+    adapter_file: Option<&'a Path>,
+}
+
+impl<'a> OpenClipVisionBuilder<'a> {
+    /// LoRA adapter configuration: which of this tower's sites (`in_proj`,
+    /// `out_proj`, `c_fc`, `c_proj`, or `all-linear`) get wrapped, at what
+    /// rank.
+    pub fn lora(mut self, l: LoraBuildConfig<'a>) -> Self {
+        self.lora = l;
+        self
+    }
+
+    /// Dtype the frozen backbone tensors are materialised at. LoRA A/B
+    /// always live in F32.
+    pub fn backbone_dtype(mut self, d: DType) -> Self {
+        self.backbone_dtype = d;
+        self
+    }
+
+    /// Optional safetensors file to load already-trained LoRA A/B tensors
+    /// from (inference). When `None`, A/B tensors are registered in the
+    /// caller-supplied `VarMap` for training.
+    pub fn adapter(mut self, p: Option<&'a Path>) -> Self {
+        self.adapter_file = p;
+        self
+    }
+
+    /// Materialise the tower from frozen safetensors checkpoint files.
+    ///
+    /// `weights_paths` are the CHECKPOINT ROOT files; this builder applies
+    /// the `visual` scoping itself, matching
+    /// [`OpenClipVisionTransformer::load`]'s documented contract that its
+    /// `VarBuilder` is already `vb.pp("visual")`. The trainable
+    /// `VarBuilder` is NOT `visual`-scoped: an adapter file belongs to one
+    /// tower, so its keys start at `resblocks.{n}` (see
+    /// [`OpenClipVisionTransformer::named_trainable_weights`]).
+    pub fn build(
+        self,
+        weights_paths: &[&Path],
+        config: &OpenClipVisionConfig,
+        device: &Device,
+        varmap: &VarMap,
+    ) -> Result<OpenClipVisionTransformer, EncoderError> {
+        let frozen_vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(weights_paths, self.backbone_dtype, device)?
+        };
+        let trainable_vb = if let Some(adapter) = self.adapter_file {
+            unsafe { VarBuilder::from_mmaped_safetensors(&[adapter], DType::F32, device)? }
+        } else {
+            VarBuilder::from_varmap(varmap, DType::F32, device)
+        };
+        // One trainable sub-builder per block, materialised UP FRONT so each
+        // site's adapter key is `resblocks.{n}.{site}.lora_{a,b}` — the exact
+        // keys `named_trainable_weights` writes.
+        let block_vbs: Vec<VarBuilder> = (0..config.layers)
+            .map(|n| trainable_vb.pp(format!("resblocks.{n}")))
+            .collect();
+        OpenClipVisionTransformer::load_with(frozen_vb.pp("visual"), config, &|n| LoraSite {
+            lora_vb: &block_vbs[n],
+            layer_idx: Some(n),
+            lora: &self.lora,
+            varmap,
+        })
     }
 }
 

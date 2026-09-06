@@ -101,6 +101,7 @@ use jammi_ai::fine_tune::resume::load_bundle;
 use jammi_ai::fine_tune::target::{EncoderAdaptersTarget, TrainingTarget};
 use jammi_ai::fine_tune::trainer::TrainingLoopBuilder;
 use jammi_ai::fine_tune::{EarlyStoppingMetric, EmbeddingLoss, FineTuneConfig, LrSchedule};
+use jammi_ai::model::arch::{self, EncoderFamily};
 use jammi_ai::model::backend::candle::CandleBackend;
 use jammi_ai::model::backend::{DeviceConfig, ModelBackend};
 use jammi_ai::model::{BackendType, LoadedModel, ModelId, ResolvedModel, TokenizerSource};
@@ -243,6 +244,163 @@ pub struct IdTriplet {
     pub negative: String,
 }
 
+/// [`IdTriplet`]'s media twin: one (anchor, positive, negative) triplet whose
+/// three members are the RAW ENCODED BYTES of an image or audio file (a PNG,
+/// a WAV — whatever the corpus committed), keyed by a stable id.
+///
+/// The bytes, not a path, are what crosses this boundary: the trainer's media
+/// path decodes each member itself (`image::load_from_memory` for pixels, the
+/// CLAP front end for clips), exactly as the text path receives strings
+/// rather than filenames. `main.rs::load_train_media_jsonl` resolves each
+/// `*_path` against the JSONL's own directory and reads it, so a corpus tree
+/// is relocatable and this struct never carries a path that could go stale
+/// between load and use.
+///
+/// `*_sha256` are MEASURED off the bytes actually read (never transcribed
+/// from a manifest), so a leg's provenance can name its inputs' digests the
+/// way the text path's `train_pairs_file_sha256` names its file's.
+#[derive(Debug, Clone)]
+pub struct MediaTriplet {
+    /// Stable row id — the anchor's id, matching [`IdTriplet::id`]'s role.
+    pub id: String,
+    /// Encoded bytes of the anchor file.
+    pub anchor: Vec<u8>,
+    /// Encoded bytes of the positive file.
+    pub positive: Vec<u8>,
+    /// Encoded bytes of the negative file.
+    pub negative: Vec<u8>,
+    /// sha256 (hex) of `anchor`, measured off those bytes.
+    pub anchor_sha256: String,
+    /// sha256 (hex) of `positive`, measured off those bytes.
+    pub positive_sha256: String,
+    /// sha256 (hex) of `negative`, measured off those bytes.
+    pub negative_sha256: String,
+}
+
+/// A borrowed view of ONE modality's rows — the single shape every loader
+/// construction in [`run_impl`] goes through, so the train split, the
+/// held-out fixture and the train-side probe can never disagree about which
+/// modality this run is in.
+enum RowSet<'a> {
+    /// Text rows (`--task text_embedding`).
+    Text(&'a [IdTriplet]),
+    /// Media rows (`--task image_embedding` / `audio_embedding`).
+    Media(&'a [MediaTriplet]),
+}
+
+impl<'a> RowSet<'a> {
+    fn len(&self) -> usize {
+        match self {
+            RowSet::Text(rows) => rows.len(),
+            RowSet::Media(rows) => rows.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Each row's stable id, in row order — what `evaluate_held_out` keys
+    /// its per-example losses by.
+    fn ids(&self) -> Vec<String> {
+        match self {
+            RowSet::Text(rows) => rows.iter().map(|r| r.id.clone()).collect(),
+            RowSet::Media(rows) => rows.iter().map(|r| r.id.clone()).collect(),
+        }
+    }
+
+    /// Refuse a media row whose three members are not three DISTINCT files,
+    /// decided on the sha256 each member carries — MEASURED off the bytes
+    /// this run read (`main.rs::read_media_member`), never on the paths,
+    /// which two rows can spell differently for one file.
+    ///
+    /// A row whose positive IS its anchor contributes `max(0, 0 - d(a,n) +
+    /// margin)` to the triplet loss no matter what the model does with it:
+    /// a constant that moves with no gradient signal about the positive
+    /// pair at all. A row whose negative is its anchor is worse — the loss
+    /// pushes the anchor away from itself. Both are silent: they produce a
+    /// perfectly plausible number. Refusing here is what makes the measured
+    /// digests load-bearing rather than decorative provenance.
+    ///
+    /// Text rows are unaffected (`Ok`): the text corpora this tier consumes
+    /// are committed fixtures whose partition is anchored by
+    /// `heldout_ids_sha256`, and adding a new refusal on that path would
+    /// change existing legs' behaviour, which this unit does not do.
+    fn validate_media_members_are_distinct(&self, label: &str) -> Result<(), String> {
+        let RowSet::Media(rows) = self else {
+            return Ok(());
+        };
+        for (i, row) in rows.iter().enumerate() {
+            let dup = if row.anchor_sha256 == row.positive_sha256 {
+                Some(("anchor", "positive", &row.anchor_sha256))
+            } else if row.anchor_sha256 == row.negative_sha256 {
+                Some(("anchor", "negative", &row.anchor_sha256))
+            } else if row.positive_sha256 == row.negative_sha256 {
+                Some(("positive", "negative", &row.positive_sha256))
+            } else {
+                None
+            };
+            if let Some((a, b, sha)) = dup {
+                return Err(format!(
+                    "finetune-run: {label} row {i} (id {:?}) has the same file in its {a} and \
+                     {b} slots (sha256 {sha}) — a triplet whose members are not three distinct \
+                     files contributes a model-independent constant to the loss, so this run \
+                     would report a plausible number measured on a degenerate example",
+                    row.id
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The first `n` rows, in row order (the train-side probe's batch).
+    fn take(&self, n: usize) -> RowSet<'a> {
+        match self {
+            RowSet::Text(rows) => RowSet::Text(&rows[..n]),
+            RowSet::Media(rows) => RowSet::Media(&rows[..n]),
+        }
+    }
+
+    /// Build the trainer's loader for these rows under `objective`.
+    ///
+    /// Text keeps both objectives (Triplet natively, MNRL over the
+    /// (anchor, positive) projection — see [`project_to_pairs`]). Media has
+    /// only the triplet shape: `TrainingDataLoader` exposes no media PAIRS
+    /// constructor, so an MNRL media leg is a TYPED refusal rather than a
+    /// silent fallback onto the triplet loss under an MNRL label — the two
+    /// objectives are not interchangeable and a leg mislabelled that way
+    /// would be unpairable with every other MNRL leg.
+    fn loader(
+        &self,
+        objective: Objective,
+    ) -> Result<TrainingDataLoader, Box<dyn std::error::Error + Send + Sync>> {
+        match (self, objective) {
+            (RowSet::Text(rows), Objective::Triplet) => Ok(TrainingDataLoader::from_triplets(
+                rows.iter()
+                    .map(|r| (r.anchor.clone(), r.positive.clone(), r.negative.clone()))
+                    .collect(),
+            )),
+            (RowSet::Text(rows), Objective::Mnrl) => {
+                Ok(TrainingDataLoader::from_pairs(project_to_pairs(rows)))
+            }
+            (RowSet::Media(rows), Objective::Triplet) => {
+                Ok(TrainingDataLoader::from_media_triplets(
+                    rows.iter()
+                        .map(|r| (r.anchor.clone(), r.positive.clone(), r.negative.clone()))
+                        .collect(),
+                ))
+            }
+            (RowSet::Media(_), Objective::Mnrl) => Err(
+                "finetune-run: --objective mnrl is not available for a media task — the \
+                 trainer's media loader carries the (anchor, positive, negative) triplet \
+                 shape only, and running the triplet loss under an MNRL label would make this \
+                 leg unpairable with every real MNRL leg. Use --objective triplet."
+                    .into(),
+            ),
+        }
+    }
+}
+
 /// Parameters [`run`] drives the tier off. The CPU-hermetic smoke test and
 /// the real pod producer share this one shape — only which rows/checkpoint
 /// they pass differs.
@@ -254,12 +412,27 @@ pub struct FinetuneRunParams {
     pub model_dir: PathBuf,
     /// The caller-declared arm (see [`Arm`]'s own doc).
     pub arm: Arm,
-    /// Training rows (disjoint from `heldout_pairs`; see this module's doc).
+    /// Which tower of `model_dir`'s checkpoint this run trains, and hence
+    /// which of the two row vectors below carries this run's data (see
+    /// [`Task`]'s own doc). [`Task::Text`] is the default, so an
+    /// invocation written before this field existed selects exactly the
+    /// behaviour it always had.
+    pub task: Task,
+    /// Training rows for a TEXT task (disjoint from `heldout_pairs`; see
+    /// this module's doc). Empty for a media task.
     pub train_pairs: Vec<IdTriplet>,
-    /// The held-out fixture's rows, in the fixture's COMMITTED order — this
-    /// order is scoring identity (CONTRACT H1: "the batch partition IS
-    /// identity"), never re-sorted or shuffled by this tier.
+    /// The held-out fixture's rows for a TEXT task, in the fixture's
+    /// COMMITTED order — this order is scoring identity (CONTRACT H1: "the
+    /// batch partition IS identity"), never re-sorted or shuffled by this
+    /// tier. Empty for a media task.
     pub heldout_pairs: Vec<IdTriplet>,
+    /// Training rows for a MEDIA task — the decoded file BYTES of each
+    /// row's three clips/images, read by `main.rs::load_train_media_jsonl`
+    /// off the paths `--train-jsonl` named. Empty for a text task.
+    pub train_media: Vec<MediaTriplet>,
+    /// The held-out fixture's rows for a MEDIA task, in committed order.
+    /// Empty for a text task.
+    pub heldout_media: Vec<MediaTriplet>,
     /// sha256 (hex) of the `--train-jsonl` FILE's own raw bytes, MEASURED by
     /// `main.rs::load_train_jsonl` off the file this run actually opened —
     /// never a caller-transcribed digest, and NOT the same quantity as the
@@ -403,6 +576,59 @@ pub struct FinetuneRunParams {
     pub mutant_patch_sha256: Option<String>,
 }
 
+impl FinetuneRunParams {
+    /// This run's TRAIN rows, in the modality [`Self::task`] selects.
+    fn train_rows(&self) -> RowSet<'_> {
+        match self.task {
+            Task::Text => RowSet::Text(&self.train_pairs),
+            Task::Image | Task::Audio => RowSet::Media(&self.train_media),
+        }
+    }
+
+    /// This run's HELD-OUT rows, in the modality [`Self::task`] selects.
+    fn heldout_rows(&self) -> RowSet<'_> {
+        match self.task {
+            Task::Text => RowSet::Text(&self.heldout_pairs),
+            Task::Image | Task::Audio => RowSet::Media(&self.heldout_media),
+        }
+    }
+
+    /// Refuse a params value whose rows do not match its `--task`.
+    ///
+    /// The four row vectors are independent fields, so nothing in the type
+    /// stops a caller from supplying text rows under `--task
+    /// audio_embedding`. Left unchecked, the mismatched vector would simply
+    /// be EMPTY and the run would die downstream on an opaque "0 rows is not
+    /// a nonzero multiple of --batch" — naming the real cause here costs one
+    /// comparison and turns a confusing failure into a correct one. The
+    /// wrong-modality vector must be empty too: a run carrying both would
+    /// leave a reader unable to tell which set produced the reported losses.
+    fn validate_rows_match_task(&self) -> Result<(), String> {
+        let (wrong_train, wrong_heldout, wrong_name) = match self.task {
+            Task::Text => (self.train_media.len(), self.heldout_media.len(), "media"),
+            Task::Image | Task::Audio => (self.train_pairs.len(), self.heldout_pairs.len(), "text"),
+        };
+        if wrong_train > 0 || wrong_heldout > 0 {
+            return Err(format!(
+                "finetune-run: --task {} carries {wrong_name} rows it cannot train \
+                 ({wrong_train} train, {wrong_heldout} held-out) — a run that carried both \
+                 modalities' rows would leave a reader unable to tell which set produced its \
+                 reported losses",
+                self.task.as_str()
+            ));
+        }
+        if self.train_rows().is_empty() {
+            return Err(format!(
+                "finetune-run: --task {} has no train rows — --train-jsonl must carry the \
+                 {} row shape for this task (see main.rs's row structs)",
+                self.task.as_str(),
+                self.task.modality().name(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// A held-out example-mean loss point measured after one training epoch —
 /// [`crate::report::EpochHeldOut`] is the serialized shape; this pairs it
 /// with the model_type dispatch this module needs internally.
@@ -410,17 +636,197 @@ struct Trajectory {
     points: Vec<EpochHeldOut>,
 }
 
-/// Read a `config.json`'s `model_type`, defaulting to `"bert"` — the SAME
-/// default `CandleBackend::load` applies for a checkpoint that omits the
-/// field (this tier's dispatch must agree with the base-model loader's own
-/// dispatch, or the two would disagree about which architecture a directory
-/// names).
-fn model_type_of(model_config: &serde_json::Value) -> String {
-    model_config
-        .get("model_type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("bert")
-        .to_string()
+/// Which TOWER of the resolved checkpoint this run fine-tunes — the value
+/// of the `--task` flag ([`FinetuneRunParams::task`]).
+///
+/// A BERT-family checkpoint has exactly one tower and only
+/// [`Task::Text`] is meaningful for it; an OpenCLIP checkpoint has
+/// two (text and vision) and an HF-CLAP checkpoint's audio half is the one
+/// this tier trains, so for those the task is the ONLY thing that decides
+/// which tower gets the LoRA adapters. The default is
+/// [`Task::Text`], so every invocation written before this flag
+/// existed selects exactly the tower it always did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Task {
+    /// Train a text tower over `--train-jsonl`'s `*_text` columns
+    /// (`--task text_embedding`).
+    Text,
+    /// Train a vision tower over `--train-jsonl`'s `*_path` columns
+    /// (`--task image_embedding`; see `main.rs`'s media row shape).
+    Image,
+    /// Train an audio tower over `--train-jsonl`'s `*_path` columns
+    /// (`--task audio_embedding`).
+    Audio,
+}
+
+impl Task {
+    /// The CLI spelling — the same string [`std::str::FromStr`] parses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Task::Text => "text_embedding",
+            Task::Image => "image_embedding",
+            Task::Audio => "audio_embedding",
+        }
+    }
+
+    /// Which modality this task's rows carry. The single place the
+    /// task→modality mapping lives, so the row loader and the encoder
+    /// dispatch can never disagree about what a `--task` value means.
+    pub fn modality(self) -> jammi_encoders::Modality {
+        match self {
+            Task::Text => jammi_encoders::Modality::Text,
+            Task::Image => jammi_encoders::Modality::Image,
+            Task::Audio => jammi_encoders::Modality::Audio,
+        }
+    }
+
+    /// The catalog's own task enum for this run's registered model row.
+    pub fn model_task(self) -> ModelTask {
+        match self {
+            Task::Text => ModelTask::TextEmbedding,
+            Task::Image => ModelTask::ImageEmbedding,
+            Task::Audio => ModelTask::AudioEmbedding,
+        }
+    }
+}
+
+impl std::str::FromStr for Task {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "text_embedding" => Ok(Task::Text),
+            "image_embedding" => Ok(Task::Image),
+            "audio_embedding" => Ok(Task::Audio),
+            other => Err(format!(
+                "--task '{other}' is invalid: expected 'text_embedding', 'image_embedding', or \
+                 'audio_embedding'"
+            )),
+        }
+    }
+}
+
+/// Whether `family`'s TRAINING-mode attention routes through the house
+/// whole-attention-block admission cascade, and therefore whether
+/// [`fused_dispatch_proof_gate`]'s attention-counter control is meaningful
+/// for it.
+///
+/// The BERT-family encoders call `admit` on exactly one of the block or flash
+/// cascade for every training-mode attention forward
+/// (`forward_training_attention`'s doc), so all-zero counters over a run that
+/// took optimizer steps proves the encoder never left eval mode. The three
+/// cross-modal towers compose `jammi_encoders::attention_softmax` directly —
+/// a plain `softmax_last_dim`/`softmax` fork with NO admission counter behind
+/// it — so those counters read zero for a perfectly healthy tower run.
+/// Applying the attention control to a tower would refuse every valid media
+/// leg; asserting it "passes" would be worse still, a control that cannot
+/// fail. The towers get their own live control instead (the LoRA linear
+/// dispatch counters — see [`fused_dispatch_proof_gate`]).
+///
+/// A free function rather than a method because [`EncoderFamily`] is
+/// `jammi-ai`'s type (issue #421 D7: ONE architecture predicate for the
+/// workspace); this is a bench-tier fact about a measurement control, not a
+/// property of the architecture itself.
+pub(crate) fn attention_cascade_is_live(family: EncoderFamily) -> bool {
+    match family {
+        EncoderFamily::Bert | EncoderFamily::DistilBert | EncoderFamily::ModernBert => true,
+        EncoderFamily::OpenClip | EncoderFamily::ClapAudio => false,
+    }
+}
+
+/// One checkpoint directory, resolved ONCE per run: which files this tier
+/// actually reads and which architecture family they name.
+///
+/// Every consumer in this module — the base-model load, the encoder build,
+/// the reported `checkpoint_config_sha256`/`checkpoint_weights_sha256`, and
+/// the catalog row's `model_type` — reads THESE fields, so the digests a run
+/// reports are digests of the bytes it actually opened. Before this existed,
+/// three separate call sites each joined `"config.json"`/
+/// `"model.safetensors"` onto `model_dir` by hand, which silently could not
+/// see an OpenCLIP checkpoint at all.
+pub(crate) struct Checkpoint {
+    /// The architecture family, resolved from [`Self::config_json`] by the
+    /// workspace's ONE predicate (`jammi_ai::model::arch::EncoderFamily::from_config`).
+    pub(crate) family: EncoderFamily,
+    /// The config file that was actually found (one of
+    /// `jammi_ai::model::arch::CONFIG_CANDIDATE_NAMES`).
+    pub(crate) config_path: PathBuf,
+    /// Its parsed contents.
+    pub(crate) config_json: serde_json::Value,
+    /// The weights file that was actually found (one of
+    /// `jammi_ai::model::arch::CANDLE_WEIGHTS_CANDIDATE_NAMES`).
+    pub(crate) weights_path: PathBuf,
+}
+
+impl Checkpoint {
+    /// Resolve `model_dir` through the ONE chain — `jammi_ai::model::arch`'s
+    /// `config_candidates`/`weights_candidates`, the same frozen precedence
+    /// the resolver, the serving loader and the esc-058 fingerprint walk
+    /// (issue #421 D7). This tier deliberately does NOT keep a private
+    /// candidate list: a bench that disagreed with serving about which file
+    /// in a directory is "the weights" would report digests for bytes no
+    /// serving load ever reads.
+    ///
+    /// Every failure is a typed refusal naming the directory and what was
+    /// tried — never a silent fallback onto a file that does not exist.
+    pub(crate) fn resolve(
+        model_dir: &Path,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let config_path = arch::config_candidates(model_dir).ok_or_else(|| {
+            format!(
+                "finetune-run: {} holds none of {:?} — this tier needs a checkpoint config to \
+                 resolve the architecture family",
+                model_dir.display(),
+                arch::CONFIG_CANDIDATE_NAMES
+            )
+        })?;
+        let weights_path = arch::weights_candidates(model_dir).ok_or_else(|| {
+            format!(
+                "finetune-run: {} holds none of {:?} — this tier builds LoRA-injected encoders \
+                 from a Candle-loadable weights file",
+                model_dir.display(),
+                arch::CANDLE_WEIGHTS_CANDIDATE_NAMES
+            )
+        })?;
+        // The shared Candle chain's last candidate is `model.gguf`. A GGUF
+        // checkpoint resolves fine for SERVING but cannot be fine-tuned: the
+        // `jammi-encoders` builders this tier drives take safetensors paths,
+        // and quantized weights carry no trainable base to wrap. Refusing by
+        // name here beats a downstream safetensors parse error that names a
+        // `.gguf` file — and it keeps ONE chain rather than a private,
+        // silently-divergent shorter one.
+        if weights_path.file_name().and_then(|n| n.to_str()) == Some(arch::GGUF_WEIGHTS_FILENAME) {
+            return Err(format!(
+                "finetune-run: {} is a GGUF checkpoint — this training tier builds LoRA-injected \
+                 encoders from safetensors weights only (quantized weights carry no trainable \
+                 base to wrap)",
+                weights_path.display()
+            )
+            .into());
+        }
+        let config_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path)?)
+                .map_err(|e| format!("finetune-run: {}: {e}", config_path.display()))?;
+        let family = EncoderFamily::from_config(&config_json).ok_or_else(|| {
+            let named = config_json
+                .get("model_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<absent>");
+            format!(
+                "finetune-run: unsupported model_type '{named}' in {} — this tier supports \
+                 'bert' (and its config-compatible aliases roberta/camembert/xlm-roberta), \
+                 'modernbert' and 'distilbert' text checkpoints, an OpenCLIP checkpoint \
+                 (discriminated by its 'model_cfg' key; jammi calls the family 'open_clip'), \
+                 and an HF-CLAP audio checkpoint ('clap_audio_model')",
+                config_path.display()
+            )
+        })?;
+        Ok(Checkpoint {
+            family,
+            config_path,
+            config_json,
+            weights_path,
+        })
+    }
 }
 
 /// Build the frozen base model this run's `EncoderAdapters` target needs —
@@ -435,15 +841,23 @@ fn model_type_of(model_config: &serde_json::Value) -> String {
 /// through — that resolution is a job-submission/catalog concern, not
 /// something a bench tier that already knows its model path needs to
 /// replicate).
+///
+/// The tokenizer requirement is scoped to [`Task::Text`]: only the
+/// text path turns rows into token ids. A media task's rows are already
+/// encoded images/clips the tower's own front end consumes, so demanding a
+/// `tokenizer.json` there would refuse every legitimate audio checkpoint
+/// (the committed `htsat_clap_tiny` fixture ships none, and needs none).
 fn load_base_model(
+    checkpoint: &Checkpoint,
     model_dir: &Path,
+    task: Task,
     device_config: &DeviceConfig,
 ) -> Result<Arc<LoadedModel>, Box<dyn std::error::Error + Send + Sync>> {
-    let config_path = model_dir.join("config.json");
-    let model_config: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&config_path)?)?;
+    let config_path = checkpoint.config_path.clone();
+    let model_config = checkpoint.config_json.clone();
     let tokenizer_path = model_dir.join("tokenizer.json");
-    if !tokenizer_path.exists() {
+    let has_tokenizer = tokenizer_path.exists();
+    if task == Task::Text && !has_tokenizer {
         return Err(format!(
             "finetune-run: {} has no tokenizer.json — the EncoderAdapters training target \
              requires a real tokenizer to turn the fixture's text pairs into token ids (this \
@@ -461,16 +875,29 @@ fn load_base_model(
     } else {
         None
     };
+    // A media tower's front end reads its own `preprocessor_config.json`
+    // (mel-bin count, fusion window, target sample rate for CLAP) — it is
+    // OPTIONAL for the text path and supplied here whenever the checkpoint
+    // ships one, so an audio base loads with the same front-end geometry a
+    // serving `InferenceSession` would give it.
+    let preprocessor_config_path = model_dir.join("preprocessor_config.json");
+    let preprocessor_config = if preprocessor_config_path.exists() {
+        Some(serde_json::from_str(&std::fs::read_to_string(
+            &preprocessor_config_path,
+        )?)?)
+    } else {
+        None
+    };
     let resolved = ResolvedModel {
         model_id: ModelId(model_dir.display().to_string()),
         backend: BackendType::Candle,
         weights_format: jammi_ai::model::WeightsFormat::Safetensors,
-        task: ModelTask::TextEmbedding,
+        task: task.model_task(),
         config_path,
-        weights_paths: vec![model_dir.join("model.safetensors")],
-        tokenizer: Some(TokenizerSource::HuggingFaceJson(tokenizer_path)),
+        weights_paths: vec![checkpoint.weights_path.clone()],
+        tokenizer: has_tokenizer.then_some(TokenizerSource::HuggingFaceJson(tokenizer_path)),
         model_config,
-        preprocessor_config: None,
+        preprocessor_config,
         pooling_config,
         base_model_id: None,
         adapter_path: None,
@@ -489,10 +916,57 @@ fn load_base_model(
 /// overwritten by the epoch-k checkpoint restore, never needs the fresh
 /// init itself to carry any information — the restore always wins for every
 /// registered `Var` name).
+/// The LoRA site names (`--target-modules` selectors) the tower selected by
+/// `(family, task)` actually carries — quoted verbatim into the
+/// zero-trainable refusal so an operator who pointed ModernBERT selectors at
+/// an OpenCLIP checkpoint is told what to write instead of being left to
+/// guess.
+///
+/// These strings are the selector constants each tower's own loader passes
+/// to `LoraSite::wrap` (`jammi-encoders`' crate-private `IN_PROJ_SITE`,
+/// `C_FC_SITE`, `QUERY_SITE`, … — not importable from here). Because they
+/// are transcribed rather than shared, they are held honest MECHANICALLY:
+/// `tests::refusal_site_names_are_selectors_that_really_train` builds each
+/// tower with exactly the names this function returns and asserts the build
+/// yields a NON-empty trainable set, so a name that went stale fails the
+/// suite instead of misdirecting an operator.
+fn tower_site_names(family: EncoderFamily, task: Task) -> &'static str {
+    match (family, task) {
+        (EncoderFamily::Bert, _) => "query, key, value, dense",
+        (EncoderFamily::DistilBert, _) => "q_lin, k_lin, v_lin, out_lin, lin1, lin2",
+        (EncoderFamily::ModernBert, _) => "Wqkv, Wo, Wi",
+        (EncoderFamily::OpenClip, _) => "in_proj, out_proj, c_fc, c_proj",
+        (EncoderFamily::ClapAudio, _) => {
+            "query, key, value, attention_output, intermediate_dense, output_dense, reduction, \
+             linear1, linear2"
+        }
+    }
+}
+
+/// # `(family, task)` dispatch (issue #421 W2b)
+///
+/// The checkpoint's [`EncoderFamily`] says which architectures a directory
+/// can build; `task` says WHICH TOWER of it to inject LoRA into. The three
+/// BERT-family arms accept only [`Task::Text`] (they have one
+/// tower); an OpenCLIP checkpoint builds its text tower for
+/// [`Task::Text`] and its vision tower for
+/// [`Task::Image`]; an HF-CLAP checkpoint builds its HTSAT audio
+/// tower for [`Task::Audio`]. Every other pairing is a typed
+/// refusal naming both halves — never a silent fallback onto the family's
+/// "default" tower, which would train a text tower while the caller's rows
+/// were images.
+///
+/// The emitted [`AdapterConfig`] records the family's own architecture id in
+/// `model_type` AND, for the multi-tower families, `tower` — the two fields
+/// together are what a serving load needs to pick the right tower to install
+/// the adapter on (`jammi_lora::AdapterConfig::tower`'s own doc). A
+/// single-tower family leaves `tower` at `None`, so an adapter saved by an
+/// existing text leg is byte-identical to the one it produced before this
+/// flag existed.
 #[allow(clippy::too_many_arguments)]
 fn build_encoder_adapters(
-    model_dir: &Path,
-    model_type: &str,
+    checkpoint: &Checkpoint,
+    task: Task,
     target_modules: &[String],
     layers_to_transform: &Option<Vec<usize>>,
     lora_rank: usize,
@@ -503,8 +977,10 @@ fn build_encoder_adapters(
     device: &Device,
     varmap: &VarMap,
 ) -> Result<(AnyEncoder, AdapterConfig), Box<dyn std::error::Error + Send + Sync>> {
-    let config_raw = std::fs::read_to_string(model_dir.join("config.json"))?;
-    let weights = model_dir.join("model.safetensors");
+    let family = checkpoint.family;
+    let model_type = family.adapter_model_type();
+    let config_json = &checkpoint.config_json;
+    let weights = checkpoint.weights_path.clone();
     let dtype = jammi_encoders::compute_precision_to_dtype(backbone_dtype);
     let empty_ranks: HashMap<String, usize> = HashMap::new();
     let lora_dropout_opt = (lora_dropout > 0.0).then_some(lora_dropout as f32);
@@ -519,39 +995,76 @@ fn build_encoder_adapters(
         init_mode: LoraInitMode::ZerosB,
         seed,
     };
-    let mut encoder = match model_type {
-        "modernbert" => {
-            let cfg: jammi_encoders::ModernBertConfig = serde_json::from_str(&config_raw)?;
+    let (mut encoder, tower) = match (family, task) {
+        (EncoderFamily::ModernBert, Task::Text) => {
+            let cfg: jammi_encoders::ModernBertConfig =
+                serde_json::from_value(config_json.clone())?;
             let m = jammi_encoders::ModernBert::builder()
                 .pooling(jammi_encoders::Pooling::Mean)
                 .backbone_dtype(dtype)
                 .lora(lora_build_1)
                 .build(&[weights.as_path()], &cfg, device, varmap)?;
-            AnyEncoder::ModernBert(m)
+            (AnyEncoder::ModernBert(m), None)
         }
-        "bert" => {
-            let cfg: jammi_encoders::BertConfig = serde_json::from_str(&config_raw)?;
+        (EncoderFamily::Bert, Task::Text) => {
+            let cfg: jammi_encoders::BertConfig = serde_json::from_value(config_json.clone())?;
             let m = jammi_encoders::Bert::builder()
                 .pooling(jammi_encoders::Pooling::Mean)
                 .backbone_dtype(dtype)
                 .lora(lora_build_1)
                 .build(&[weights.as_path()], &cfg, device, varmap)?;
-            AnyEncoder::Bert(m)
+            (AnyEncoder::Bert(m), None)
         }
-        "distilbert" => {
-            let cfg: jammi_encoders::DistilBertConfig = serde_json::from_str(&config_raw)?;
+        (EncoderFamily::DistilBert, Task::Text) => {
+            let cfg: jammi_encoders::DistilBertConfig =
+                serde_json::from_value(config_json.clone())?;
             let m = jammi_encoders::DistilBert::builder()
                 .pooling(jammi_encoders::Pooling::Mean)
                 .backbone_dtype(dtype)
                 .lora(lora_build_1)
                 .build(&[weights.as_path()], &cfg, device, varmap)?;
-            AnyEncoder::DistilBert(m)
+            (AnyEncoder::DistilBert(m), None)
         }
-        other => {
+        (EncoderFamily::OpenClip, Task::Text) => {
+            let cfg = jammi_encoders::ClipTextConfig::from_open_clip_config(config_json)?;
+            let m = jammi_encoders::ClipText::builder()
+                .backbone_dtype(dtype)
+                .lora(lora_build_1)
+                .build(&[weights.as_path()], &cfg, device, varmap)?;
+            (AnyEncoder::ClipText(m), Some(jammi_lora::Tower::Text))
+        }
+        (EncoderFamily::OpenClip, Task::Image) => {
+            let cfg = jammi_encoders::OpenClipVisionConfig::from_open_clip_config(config_json)?;
+            let m = jammi_encoders::OpenClipVisionTransformer::builder()
+                .backbone_dtype(dtype)
+                .lora(lora_build_1)
+                .build(&[weights.as_path()], &cfg, device, varmap)?;
+            (
+                AnyEncoder::OpenClipVision(m),
+                Some(jammi_lora::Tower::Vision),
+            )
+        }
+        (EncoderFamily::ClapAudio, Task::Audio) => {
+            let cfg = jammi_encoders::HtsatAudioConfig::from_hf_clap_config(config_json)?;
+            let m = jammi_encoders::HtsatAudio::builder()
+                .backbone_dtype(dtype)
+                .lora(lora_build_1)
+                .build(&[weights.as_path()], &cfg, device, varmap)?;
+            (
+                AnyEncoder::Htsat(Box::new(m)),
+                Some(jammi_lora::Tower::Audio),
+            )
+        }
+        (family, task) => {
             return Err(format!(
-                "finetune-run: unsupported model_type '{other}' — this tier supports 'bert', \
-                 'modernbert', and 'distilbert' (the C16 gate's checkpoint family and this \
-                 crate's generic CPU test fixture)"
+                "finetune-run: --task '{}' has no tower on a '{}' checkpoint ({}). This tier \
+                 trains: 'bert'/'modernbert'/'distilbert' with --task text_embedding; \
+                 'open_clip' with --task text_embedding (the CLIP text tower) or \
+                 image_embedding (the OpenCLIP vision tower); 'clap_audio_model' with --task \
+                 audio_embedding (the HTSAT audio tower)",
+                task.as_str(),
+                family.adapter_model_type(),
+                checkpoint.config_path.display(),
             )
             .into())
         }
@@ -593,11 +1106,13 @@ fn build_encoder_adapters(
         };
         return Err(format!(
             "finetune-run: target_modules {target_modules:?}{restriction} yielded zero \
-             trainable LoRA tensors on model_type '{model_type}' — this training tier \
-             requires LoRA to actually train something. Correct the selectors for this \
+             trainable LoRA tensors on model_type '{model_type}' (--task {}) — this training \
+             tier requires LoRA to actually train something. Correct the selectors for this \
              architecture (the CLI's own default, 'Wqkv,Wo,Wi', is ModernBERT-only and \
-             matches nothing on bert/distilbert), or check layers_to_transform for an \
-             off-by-one layer index if it is set"
+             matches nothing on bert/distilbert); this tower's own LoRA site names are: {}. \
+             Or check layers_to_transform for an off-by-one layer index if it is set",
+            task.as_str(),
+            tower_site_names(family, task),
         )
         .into());
     }
@@ -623,6 +1138,24 @@ fn build_encoder_adapters(
     // `attention_block_flash_*`): a caller must not depend on either fix in
     // isolation to catch a future regression in the other.
     encoder.set_training(true);
+    // Read the flag BACK off the object (issue #421 W2b). The dispatch-
+    // counter gate below is the process-wide proof for the BERT family, but
+    // the three cross-modal towers have no attention-admission counter at
+    // all (`attention_cascade_is_live`'s doc) — for them this
+    // readback is the only place a `set_training` that silently failed to
+    // reach every block would be caught. It is a mechanism check, not a
+    // tautology: `set_training` walks each tower's blocks and sites, and
+    // `is_training` reports the state the FORWARD path will actually read.
+    if !encoder_is_training(&encoder) {
+        return Err(format!(
+            "finetune-run: the freshly built '{model_type}' encoder for --task {} did not \
+             report training mode after set_training(true) — its forward would take the eval \
+             attention-softmax arm, so this run would measure the eval path, not the fine-tune \
+             step this tier claims to measure",
+            task.as_str(),
+        )
+        .into());
+    }
     // A SECOND `LoraBuildConfig` (identical values) — `lora_build_1` above
     // was already MOVED into `.lora(...)`, and `AdapterConfig::from_build`
     // needs its own borrow; the type is a plain, cheap struct of scalars and
@@ -638,8 +1171,39 @@ fn build_encoder_adapters(
         init_mode: LoraInitMode::ZerosB,
         seed,
     };
+    // `model_type` is the base ARCHITECTURE id (`EncoderFamily::
+    // adapter_model_type`); `tower` says WHICH tower of a multi-tower
+    // checkpoint these adapters install on, and stays `None` for the
+    // single-tower BERT family — so an adapter saved by an existing text leg
+    // carries exactly the bytes it always has (`jammi_lora::AdapterConfig::
+    // tower` is `#[serde(default)]`, and `None` is skipped on the wire).
     let adapter_cfg = AdapterConfig::from_build(model_type, &lora_build_2, backbone_dtype);
+    let adapter_cfg = match tower {
+        Some(t) => adapter_cfg.with_tower(t),
+        None => adapter_cfg,
+    };
     Ok((encoder, adapter_cfg))
+}
+
+/// Whether `encoder` reports TRAINING mode — the per-variant accessor
+/// `AnyEncoder` does not (yet) expose as one method.
+///
+/// `jammi_encoders::ModernBert` and the three cross-modal towers each carry
+/// an `is_training()` of their own; `Bert`/`DistilBert` do not, and this
+/// function reports `true` for them rather than inventing a state it cannot
+/// read. That is honest, not vacuous: those two families are covered by the
+/// process-wide attention-dispatch control instead
+/// ([`fused_dispatch_proof_gate`], live for every BERT-family run), which is
+/// exactly the coverage the towers lack. Neither family is left with no
+/// control at all.
+fn encoder_is_training(encoder: &AnyEncoder) -> bool {
+    match encoder {
+        AnyEncoder::ModernBert(m) => m.is_training(),
+        AnyEncoder::ClipText(m) => m.is_training(),
+        AnyEncoder::OpenClipVision(m) => m.is_training(),
+        AnyEncoder::Htsat(m) => m.is_training(),
+        AnyEncoder::Bert(_) | AnyEncoder::DistilBert(_) => true,
+    }
 }
 
 /// Build the [`FineTuneConfig`] this run's every epoch leg shares — only
@@ -728,29 +1292,78 @@ fn base_config(params: &FinetuneRunParams, epochs: usize) -> FineTuneConfig {
 /// [`crate::finetune_step::attention_arm`]'s own extraction) so the widened
 /// admission-by-counters behaviour is unit-testable without a real
 /// end-to-end training run.
+///
+/// # Two families, two live counters (issue #421 W2b)
+///
+/// Adding the three cross-modal towers made "all four attention counters
+/// zero" ambiguous: a CLIP-text / OpenCLIP-vision / HTSAT tower composes
+/// `jammi_encoders::attention_softmax` directly — a `softmax_last_dim` vs
+/// `softmax` fork with NO admission counter behind it — so a perfectly
+/// healthy tower run reads `0/0/0/0` on every attention counter. Applying
+/// the attention control to a tower would refuse every valid media leg;
+/// exempting a tower with nothing in its place would leave the whole media
+/// half of this tier with a control that cannot fail, which is worse.
+///
+/// So the gate reads the counter that IS live per family
+/// ([`attention_cascade_is_live`]): the BERT family keeps the
+/// attention-block/flash cascade check unchanged, and a tower family is
+/// checked against the LoRA-linear dispatch counters instead. Every LoRA
+/// site on a tower calls `admit` on `lora_linear_fused` for every forward it
+/// takes, so `fused + eager == 0` over a run with `cumulative_steps > 0`
+/// proves the LoRA-injected encoder was never forwarded at all — the tower
+/// analogue of the BERT failure this gate was built for. It does NOT prove
+/// the training-mode softmax arm was taken; that is what
+/// [`build_encoder_adapters`]'s `is_training()` readback covers, and neither
+/// check is a substitute for the other.
+// Eight counters + the family + the step count is one argument over
+// clippy's default. They are a flat list of INDEPENDENT process-wide
+// readings with no natural grouping — bundling them into a struct would add
+// a type whose only job is to satisfy a lint, and would make each call site
+// read further from the counters it names. Same posture (and same allow) as
+// `build_encoder_adapters` above.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fused_dispatch_proof_gate(
-    model_type: &str,
+    family: EncoderFamily,
     cumulative_steps: usize,
     attention_block_fused_dispatches: u64,
     attention_block_eager_dispatches: u64,
     attention_block_flash_fused_dispatches: u64,
     attention_block_flash_declined_dispatches: u64,
+    lora_linear_fused_dispatches: u64,
+    lora_linear_eager_dispatches: u64,
 ) -> Result<(), String> {
-    if cumulative_steps > 0
-        && attention_block_fused_dispatches == 0
-        && attention_block_eager_dispatches == 0
-        && attention_block_flash_fused_dispatches == 0
-        && attention_block_flash_declined_dispatches == 0
-    {
+    if cumulative_steps == 0 {
+        return Ok(());
+    }
+    let model_type = family.adapter_model_type();
+    if attention_cascade_is_live(family) {
+        if attention_block_fused_dispatches == 0
+            && attention_block_eager_dispatches == 0
+            && attention_block_flash_fused_dispatches == 0
+            && attention_block_flash_declined_dispatches == 0
+        {
+            return Err(format!(
+                "finetune-run: fused-dispatch-proof failure — this {model_type} run took \
+                 {cumulative_steps} optimizer step(s) but the training-mode attention path never \
+                 dispatched in either arm (attention_block_fused_dispatches, \
+                 attention_block_eager_dispatches, attention_block_flash_fused_dispatches, and \
+                 attention_block_flash_declined_dispatches are all 0). The encoder was never put \
+                 into training mode via encoder.set_training(true), so this run measured the eval \
+                 path, not the fine-tune step this tier claims to measure — INVALID run, not a \
+                 datum."
+            ));
+        }
+        return Ok(());
+    }
+    if lora_linear_fused_dispatches == 0 && lora_linear_eager_dispatches == 0 {
         return Err(format!(
-            "finetune-run: fused-dispatch-proof failure — this {model_type} run took \
-             {cumulative_steps} optimizer step(s) but the training-mode attention path never \
-             dispatched in either arm (attention_block_fused_dispatches, \
-             attention_block_eager_dispatches, attention_block_flash_fused_dispatches, and \
-             attention_block_flash_declined_dispatches are all 0). The encoder was never put \
-             into training mode via encoder.set_training(true), so this run measured the eval \
-             path, not the fine-tune step this tier claims to measure — INVALID run, not a \
-             datum."
+            "finetune-run: lora-dispatch-proof failure — this {model_type} run took \
+             {cumulative_steps} optimizer step(s) but no LoRA site was ever forwarded \
+             (lora_linear_fused_dispatches and lora_linear_eager_dispatches are both 0). This \
+             tower family has no whole-attention-block admission counter to read \
+             (attention_cascade_is_live), so the LoRA linear cascade is the \
+             live proof that the adapted encoder took part in this run at all — INVALID run, \
+             not a datum."
         ));
     }
     Ok(())
@@ -933,13 +1546,16 @@ fn run_impl(
             .into());
         }
     }
-    if params.heldout_pairs.is_empty()
-        || !params.heldout_pairs.len().is_multiple_of(params.batch_size)
-    {
+    params.validate_rows_match_task()?;
+    let train_rows = params.train_rows();
+    let heldout_rows = params.heldout_rows();
+    train_rows.validate_media_members_are_distinct("--train-jsonl")?;
+    heldout_rows.validate_media_members_are_distinct("--heldout-jsonl")?;
+    if heldout_rows.is_empty() || !heldout_rows.len().is_multiple_of(params.batch_size) {
         return Err(format!(
             "finetune-run: {} held-out pairs is not a nonzero multiple of --batch {} (the seam \
              refuses this too, but failing here names the fixture, not an opaque trainer error)",
-            params.heldout_pairs.len(),
+            heldout_rows.len(),
             params.batch_size
         )
         .into());
@@ -956,18 +1572,26 @@ fn run_impl(
         compute_precision: params.backbone_dtype,
     };
 
-    let (checkpoint_config_sha256, _config_len) =
-        sha256_and_len(&params.model_dir.join("config.json")).map_err(sendify)?;
-    let (checkpoint_weights_sha256, checkpoint_weights_size_bytes) =
-        sha256_and_len(&params.model_dir.join("model.safetensors")).map_err(sendify)?;
+    // ONE resolution chain (issue #421 D7): which config/weights files this
+    // directory actually holds, and which architecture family they name.
+    // Every consumer below reads THESE paths, so the reported digests are
+    // digests of the bytes this run opened — an OpenCLIP checkpoint (whose
+    // files are `open_clip_config.json` / `open_clip_model.safetensors`) is
+    // resolved by the same chain as a BERT one, not missed by a hard-coded
+    // `config.json` join.
+    let checkpoint = Checkpoint::resolve(&params.model_dir)?;
+    let family = checkpoint.family;
 
-    let model_config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
-        params.model_dir.join("config.json"),
-    )?)?;
-    let model_type = model_type_of(&model_config);
+    let (checkpoint_config_sha256, _config_len) =
+        sha256_and_len(&checkpoint.config_path).map_err(sendify)?;
+    let (checkpoint_weights_sha256, checkpoint_weights_size_bytes) =
+        sha256_and_len(&checkpoint.weights_path).map_err(sendify)?;
+
+    let model_type = family.adapter_model_type().to_string();
 
     // The base model, for its tokenizer only (see `load_base_model`'s doc).
-    let base_model_arc = load_base_model(&params.model_dir, &device_config)?;
+    let base_model_arc =
+        load_base_model(&checkpoint, &params.model_dir, params.task, &device_config)?;
 
     // Local, file-backed catalog + artifact store — CPU-hermetic (a sqlite
     // file + a `file://` object-store root under `params.work_dir`), the
@@ -1015,7 +1639,11 @@ fn run_impl(
         version: 1,
         model_type: model_type.as_str(),
         backend: "candle",
-        task: ModelTask::TextEmbedding,
+        // The catalog row records the task this run actually trains, so a
+        // media leg's registered model is not filed as a text embedder. For
+        // `--task text_embedding` (the default) this is `TextEmbedding`,
+        // exactly the value this call has always passed.
+        task: params.task.model_task(),
         base_model_id: None,
         artifact_path: None,
         config_json: None,
@@ -1048,30 +1676,14 @@ fn run_impl(
     // `params.heldout_pairs` slices, so the row ORDER (and hence
     // `heldout_ids`' pairing with the loader's rows) is identical regardless
     // of which objective this run trains.
-    let train_loader = match params.objective {
-        Objective::Triplet => {
-            let train_rows: Vec<(String, String, String)> = params
-                .train_pairs
-                .iter()
-                .map(|p| (p.anchor.clone(), p.positive.clone(), p.negative.clone()))
-                .collect();
-            TrainingDataLoader::from_triplets(train_rows)
-        }
-        Objective::Mnrl => TrainingDataLoader::from_pairs(project_to_pairs(&params.train_pairs)),
-    };
+    //
+    // Both loaders go through [`RowSet::loader`], the ONE place a modality +
+    // objective becomes a `TrainingDataLoader`, so the train split and the
+    // held-out fixture can never be built in different shapes.
+    let train_loader = train_rows.loader(params.objective)?;
 
-    let heldout_ids: Vec<String> = params.heldout_pairs.iter().map(|p| p.id.clone()).collect();
-    let heldout_loader = match params.objective {
-        Objective::Triplet => {
-            let heldout_rows: Vec<(String, String, String)> = params
-                .heldout_pairs
-                .iter()
-                .map(|p| (p.anchor.clone(), p.positive.clone(), p.negative.clone()))
-                .collect();
-            TrainingDataLoader::from_triplets(heldout_rows)
-        }
-        Objective::Mnrl => TrainingDataLoader::from_pairs(project_to_pairs(&params.heldout_pairs)),
-    };
+    let heldout_ids: Vec<String> = heldout_rows.ids();
+    let heldout_loader = heldout_rows.loader(params.objective)?;
 
     // A fixed, deterministic TRAIN-side probe — one batch's worth of the
     // TRAIN rows (never the held-out fixture), scored through the SAME
@@ -1096,23 +1708,18 @@ fn run_impl(
     // `ZerosB` (deterministic from `(seed, target_modules)`), so the
     // untrained probe reads a deterministic value and an lr=0 leg's whole
     // series is constant (the floor still bites).
-    let probe_len = params.batch_size.min(params.train_pairs.len());
-    let probe_pairs = &params.train_pairs[..probe_len];
+    let probe_len = params.batch_size.min(train_rows.len());
     if probe_len == 0 || !probe_len.is_multiple_of(params.batch_size) {
         return Err(format!(
             "finetune-run: {} train pairs is fewer than --batch {} — cannot build a train-side \
              learning-happened probe batch",
-            params.train_pairs.len(),
+            train_rows.len(),
             params.batch_size
         )
         .into());
     }
-    let probe_ids: Vec<String> = probe_pairs.iter().map(|p| p.id.clone()).collect();
-    let probe_triplet_rows: Vec<(String, String, String)> = probe_pairs
-        .iter()
-        .map(|p| (p.anchor.clone(), p.positive.clone(), p.negative.clone()))
-        .collect();
-    let probe_pair_rows: Vec<(String, String)> = project_to_pairs(probe_pairs);
+    let probe_rows = train_rows.take(probe_len);
+    let probe_ids: Vec<String> = probe_rows.ids();
 
     let mut trajectory = Trajectory { points: Vec::new() };
     // Amendment 2026-08-29b: the raw probe series, index 0 = the untrained
@@ -1176,8 +1783,8 @@ fn run_impl(
         // epoch's trained weights.
         last_varmap = Some(varmap.clone());
         let (encoder, adapter_cfg) = build_encoder_adapters(
-            &params.model_dir,
-            &model_type,
+            &checkpoint,
+            params.task,
             &params.target_modules,
             &params.layers_to_transform,
             params.lora_rank,
@@ -1212,6 +1819,13 @@ fn run_impl(
 
         let mut builder = TrainingLoopBuilder::new(target, varmap, config)
             .base_model(Arc::clone(&base_model_arc))
+            // The trainer's media front end is keyed on the RUN's task, never
+            // on sniffing the blob (`TrainingLoop::encode_media`'s doc: "the
+            // blob type is NOT sniffed"), so `--task` must reach the loop
+            // itself, not only this tier's own encoder dispatch. Passing it
+            // unconditionally keeps the text default at the builder's own
+            // `ModelTask::TextEmbedding`, so no existing leg changes.
+            .task(params.task.model_task())
             .job_id(job_id.clone())
             .worker_id(worker_id.clone())
             .catalog(Arc::clone(&catalog))
@@ -1231,10 +1845,7 @@ fn run_impl(
             // init is `ZerosB`, so this is deterministic from `(seed,
             // target_modules)` alone). `probe_at_init` is test-only (see
             // `run_impl`'s own doc) — [`run`] always passes `true`.
-            let probe_loader = match params.objective {
-                Objective::Triplet => TrainingDataLoader::from_triplets(probe_triplet_rows.clone()),
-                Objective::Mnrl => TrainingDataLoader::from_pairs(probe_pair_rows.clone()),
-            };
+            let probe_loader = probe_rows.loader(params.objective)?;
             let init_probe = training_loop.evaluate_held_out(&probe_loader, &probe_ids)?;
             train_probe_series.push(init_probe.mean);
         }
@@ -1262,10 +1873,7 @@ fn run_impl(
         // the first/final) — the producer emits the RAW series, a
         // downstream merger derives the "learning happened" premise from
         // it (`init_probe - final_probe > floor`).
-        let probe_loader = match params.objective {
-            Objective::Triplet => TrainingDataLoader::from_triplets(probe_triplet_rows.clone()),
-            Objective::Mnrl => TrainingDataLoader::from_pairs(probe_pair_rows.clone()),
-        };
+        let probe_loader = probe_rows.loader(params.objective)?;
         let probe = training_loop.evaluate_held_out(&probe_loader, &probe_ids)?;
         train_probe_series.push(probe.mean);
     }
@@ -1350,12 +1958,14 @@ fn run_impl(
     // widened by the C-ATTN unit, campaign #462/#463) — see
     // `fused_dispatch_proof_gate`'s own doc for the full rationale.
     if let Err(message) = fused_dispatch_proof_gate(
-        &model_type,
+        family,
         cumulative_steps,
         attention_block_fused_dispatches,
         attention_block_eager_dispatches,
         attention_block_flash_fused_dispatches,
         attention_block_flash_declined_dispatches,
+        lora_linear_fused_dispatches,
+        lora_linear_eager_dispatches,
     ) {
         return Err(message.into());
     }
@@ -1509,6 +2119,27 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cookbook/fixtures/tiny_bert")
     }
 
+    /// The committed OpenCLIP fixture — `open_clip_config.json` +
+    /// `open_clip_model.safetensors` + `tokenizer.json`, i.e. a checkpoint
+    /// the OLD hard-coded `config.json`/`model.safetensors` joins could not
+    /// see at all.
+    fn tiny_open_clip_model_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cookbook/fixtures/tiny_open_clip")
+    }
+
+    /// The committed HF-CLAP audio fixture.
+    fn htsat_clap_tiny_model_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cookbook/fixtures/htsat_clap_tiny")
+    }
+
+    /// Resolve a model dir through the ONE chain, panicking with the real
+    /// message if it refuses (a resolution failure in a test that expects a
+    /// buildable checkpoint is a fixture problem, not the case under test).
+    fn checkpoint_of(model_dir: &Path) -> Checkpoint {
+        Checkpoint::resolve(model_dir)
+            .unwrap_or_else(|e| panic!("resolve {}: {e}", model_dir.display()))
+    }
+
     /// Build the tiny, CPU-hermetic, deterministic [`FinetuneRunParams`] the
     /// non-perturbation test below drives — 4 synthetic train triplets (2
     /// batches at `batch_size 2`), 2 held-out triplets (1 batch), 2 epochs,
@@ -1537,8 +2168,11 @@ mod tests {
         FinetuneRunParams {
             model_dir: tiny_bert_model_dir(),
             arm: Arm::Fused,
+            task: Task::Text,
             train_pairs: mk(0, 4),
             heldout_pairs: mk(100, 2),
+            train_media: Vec::new(),
+            heldout_media: Vec::new(),
             train_pairs_file_sha256: "0".repeat(64),
             heldout_ids_sha256: "1".repeat(64),
             heldout_pairs_sha256: "2".repeat(64),
@@ -1655,8 +2289,8 @@ mod tests {
     ) {
         let varmap = VarMap::new();
         let (mut encoder, _adapter_cfg) = build_encoder_adapters(
-            &tiny_bert_model_dir(),
-            "bert",
+            &checkpoint_of(&tiny_bert_model_dir()),
+            Task::Text,
             &["query".to_string(), "value".to_string()],
             &None,
             2,
@@ -1839,8 +2473,8 @@ mod tests {
         let model_dir = write_synthetic_distilbert_model_dir(1);
         let varmap = VarMap::new();
         let (mut encoder, adapter_cfg) = build_encoder_adapters(
-            model_dir.path(),
-            "distilbert",
+            &checkpoint_of(model_dir.path()),
+            Task::Text,
             &["q_lin".to_string(), "v_lin".to_string()],
             &None,
             2,
@@ -1888,8 +2522,8 @@ mod tests {
 
         let varmap_all = VarMap::new();
         let (encoder_all, _cfg_all) = build_encoder_adapters(
-            model_dir.path(),
-            "distilbert",
+            &checkpoint_of(model_dir.path()),
+            Task::Text,
             &target_modules,
             &None,
             2,
@@ -1905,8 +2539,8 @@ mod tests {
 
         let varmap_one = VarMap::new();
         let (encoder_one, _cfg_one) = build_encoder_adapters(
-            model_dir.path(),
-            "distilbert",
+            &checkpoint_of(model_dir.path()),
+            Task::Text,
             &target_modules,
             &Some(vec![0]),
             2,
@@ -1950,8 +2584,8 @@ mod tests {
         let model_dir = write_synthetic_distilbert_model_dir(2);
         let varmap = VarMap::new();
         let result = build_encoder_adapters(
-            model_dir.path(),
-            "distilbert",
+            &checkpoint_of(model_dir.path()),
+            Task::Text,
             &["q_lin".to_string(), "v_lin".to_string()],
             &Some(vec![99]),
             2,
@@ -1981,46 +2615,138 @@ mod tests {
         );
     }
 
-    /// Negative control: a `model_type` this tier does not know must still
-    /// error, and the error must honestly name every type this tier DOES
-    /// support (currently three: `"bert"`, `"modernbert"`, `"distilbert"`) —
-    /// not silently construct one of them, and not go stale as new arms are
-    /// added. Any committed `model_dir` works here (`tiny_bert`'s) because
-    /// the `other` arm never reads `config.json` at all.
+    /// Write a minimal `model_dir` whose `config.json` is `config` and whose
+    /// `model.safetensors` merely EXISTS — enough for
+    /// [`Checkpoint::resolve`]'s chain, which decides the family before any
+    /// weight tensor is read.
+    fn write_config_only_model_dir(config: serde_json::Value) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_string(&config).expect("serialize config"),
+        )
+        .expect("write config.json");
+        std::fs::write(dir.path().join("model.safetensors"), b"placeholder")
+            .expect("write model.safetensors");
+        dir
+    }
+
+    /// Negative control (moved to the resolution chain by issue #421 W2b,
+    /// where the family is now decided): a `model_type` this tier does not
+    /// know must still error, and the error must honestly name every family
+    /// this tier DOES support — not silently coerce to BERT, and not go
+    /// stale as new arms are added.
+    ///
+    /// `"gpt2"` is the sharp case the plan names: its config parses cleanly
+    /// as a `BertConfig`, so a `_ => Bert` fallthrough would build and train
+    /// something that reported plausible numbers under the wrong
+    /// architecture id.
     #[test]
-    fn build_encoder_adapters_rejects_unknown_model_type_and_names_all_three() {
-        let varmap = VarMap::new();
-        // `AnyEncoder` (the `Ok` half of this `Result`) has no `Debug` impl,
-        // so `.expect_err(..)` (which requires `T: Debug` for its own panic
-        // message) does not typecheck here — match instead.
-        let result = build_encoder_adapters(
-            &tiny_bert_model_dir(),
-            "roberta",
-            &["query".to_string(), "value".to_string()],
-            &None,
-            2,
-            4.0,
-            0.0,
-            jammi_numerics::ComputePrecision::F32,
-            7,
-            &Device::Cpu,
-            &varmap,
-        );
-        let err = match result {
+    fn checkpoint_resolve_rejects_unknown_model_type_and_names_every_family() {
+        let dir = write_config_only_model_dir(serde_json::json!({
+            "model_type": "gpt2",
+            "hidden_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "intermediate_size": 64,
+            "vocab_size": 100,
+            "max_position_embeddings": 128,
+        }));
+        let err = match Checkpoint::resolve(dir.path()) {
             Ok(_) => panic!("an unsupported model_type must be refused, not silently accepted"),
             Err(e) => e,
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("roberta"),
+            msg.contains("gpt2"),
             "error must name the rejected type: {msg}"
         );
-        for supported in ["bert", "modernbert", "distilbert"] {
+        for supported in [
+            "bert",
+            "modernbert",
+            "distilbert",
+            "open_clip",
+            "clap_audio_model",
+        ] {
             assert!(
                 msg.contains(supported),
-                "error must honestly list every supported model_type, missing {supported:?}: {msg}"
+                "error must honestly list every supported family, missing {supported:?}: {msg}"
             );
         }
+    }
+
+    /// The other side of the same predicate, and a CHANGE this unit records
+    /// rather than hides: a config with NO `model_type` key at all is now
+    /// REFUSED, where the tier's old private `model_type_of` silently
+    /// defaulted it to `"bert"`.
+    ///
+    /// The workspace's one architecture predicate
+    /// (`jammi_ai::model::arch::EncoderFamily::from_config`) returns `None`
+    /// for an absent `model_type`, and this tier now consumes that predicate
+    /// instead of keeping a private one — a bench that defaulted where
+    /// serving refuses would be the exact silent disagreement D7 exists to
+    /// remove. Every committed fixture this tier drives (`tiny_bert`,
+    /// `tiny_modernbert_local`, `htsat_clap_tiny`) declares its
+    /// `model_type`, and OpenCLIP is discriminated structurally, so no
+    /// existing leg is affected.
+    #[test]
+    fn checkpoint_resolve_refuses_a_config_with_no_model_type() {
+        let dir = write_config_only_model_dir(serde_json::json!({
+            "hidden_size": 32,
+            "num_hidden_layers": 1,
+        }));
+        let err = match Checkpoint::resolve(dir.path()) {
+            Ok(_) => panic!("an absent model_type must be refused, not defaulted to bert"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("<absent>"),
+            "the refusal must say the key was absent rather than name a made-up type: {err}"
+        );
+    }
+
+    /// A BERT config-compatible alias resolves to BERT — the alias set the
+    /// serving text arm has always accepted, now shared. Pinned here because
+    /// this tier previously refused `"roberta"` from its own private list;
+    /// consuming the shared predicate widens it, and a widening deserves a
+    /// test that says so out loud.
+    #[test]
+    fn checkpoint_resolve_accepts_the_bert_config_aliases() {
+        for alias in ["bert", "roberta", "camembert", "xlm-roberta"] {
+            let dir = write_config_only_model_dir(serde_json::json!({
+                "model_type": alias,
+                "hidden_size": 32,
+                "num_hidden_layers": 1,
+            }));
+            let checkpoint = Checkpoint::resolve(dir.path())
+                .unwrap_or_else(|e| panic!("{alias} must resolve as a BERT-family config: {e}"));
+            assert_eq!(checkpoint.family, EncoderFamily::Bert, "{alias}");
+            assert_eq!(checkpoint.family.adapter_model_type(), "bert", "{alias}");
+        }
+    }
+
+    /// A GGUF-only directory resolves through the SHARED Candle weights
+    /// chain (so the bench and serving agree about which file is "the
+    /// weights") and is then refused BY NAME as untrainable — never left to
+    /// die in a safetensors parser pointed at a `.gguf` file.
+    #[test]
+    fn checkpoint_resolve_refuses_a_gguf_checkpoint_by_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::json!({"model_type": "bert", "hidden_size": 32}).to_string(),
+        )
+        .expect("write config.json");
+        std::fs::write(dir.path().join("model.gguf"), b"placeholder").expect("write model.gguf");
+        let err = match Checkpoint::resolve(dir.path()) {
+            Ok(_) => panic!("a GGUF checkpoint cannot be fine-tuned by this tier"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("GGUF"), "{err}");
+        assert!(
+            err.contains("model.gguf"),
+            "the refusal must name the file: {err}"
+        );
     }
 
     /// Contract v2 addition (phase-1 pressure-test of the profile contract):
@@ -2037,8 +2763,8 @@ mod tests {
         let varmap = VarMap::new();
         let unmatched = ["Wqkv".to_string(), "Wo".to_string(), "Wi".to_string()];
         let result = build_encoder_adapters(
-            &tiny_bert_model_dir(),
-            "bert",
+            &checkpoint_of(&tiny_bert_model_dir()),
+            Task::Text,
             &unmatched,
             &None,
             2,
@@ -2108,8 +2834,8 @@ mod tests {
     fn build_encoder_adapters_refuses_empty_target_modules_too() {
         let varmap = VarMap::new();
         let result = build_encoder_adapters(
-            &tiny_bert_model_dir(),
-            "bert",
+            &checkpoint_of(&tiny_bert_model_dir()),
+            Task::Text,
             &[],
             &None,
             2,
@@ -2711,8 +3437,16 @@ mod tests {
     /// mode.
     #[test]
     fn fused_dispatch_proof_gate_refuses_all_zero_attention_for_every_supported_model_type() {
-        for model_type in ["bert", "distilbert", "modernbert"] {
-            let result = fused_dispatch_proof_gate(model_type, 6, 0, 0, 0, 0);
+        for family in [
+            EncoderFamily::Bert,
+            EncoderFamily::DistilBert,
+            EncoderFamily::ModernBert,
+        ] {
+            let model_type = family.adapter_model_type();
+            // LoRA counters deliberately NON-zero: this control must fire
+            // on the ATTENTION counters alone for a BERT-family leg, never
+            // borrow a pass from the tower-family branch.
+            let result = fused_dispatch_proof_gate(family, 6, 0, 0, 0, 0, 9, 9);
             let msg = match result {
                 Ok(()) => panic!(
                     "model_type {model_type:?} with 6 optimizer steps and all-zero attention \
@@ -2745,25 +3479,30 @@ mod tests {
     /// eval-only or empty-epoch invocation — not this gate's concern).
     #[test]
     fn fused_dispatch_proof_gate_accepts_live_dispatch_and_zero_step_runs() {
-        for model_type in ["bert", "distilbert", "modernbert"] {
-            // Fused arm fired.
-            assert!(fused_dispatch_proof_gate(model_type, 6, 3, 0, 0, 0).is_ok());
+        for family in [
+            EncoderFamily::Bert,
+            EncoderFamily::DistilBert,
+            EncoderFamily::ModernBert,
+        ] {
+            // Fused arm fired. LoRA counters zero throughout: a BERT-family
+            // leg is judged on its attention counters ONLY.
+            assert!(fused_dispatch_proof_gate(family, 6, 3, 0, 0, 0, 0, 0).is_ok());
             // Eager arm fired (a legitimate by-design domain decline, e.g.
             // `head_dim != 64`).
-            assert!(fused_dispatch_proof_gate(model_type, 6, 0, 3, 0, 0).is_ok());
+            assert!(fused_dispatch_proof_gate(family, 6, 0, 3, 0, 0, 0, 0).is_ok());
             // Flash cascade fired.
-            assert!(fused_dispatch_proof_gate(model_type, 6, 0, 0, 3, 0).is_ok());
+            assert!(fused_dispatch_proof_gate(family, 6, 0, 0, 3, 0, 0, 0).is_ok());
             // Flash cascade declined (also a legitimate by-design outcome
             // for THIS gate's purposes — it only refuses when ALL FOUR are
             // zero at once).
-            assert!(fused_dispatch_proof_gate(model_type, 6, 0, 0, 0, 3).is_ok());
+            assert!(fused_dispatch_proof_gate(family, 6, 0, 0, 0, 3, 0, 0).is_ok());
         }
         // Zero optimizer steps: this gate never fires regardless of the
         // counters (an eval-only run, or an empty epoch count, is simply
         // outside this gate's scope) — a real run's `cumulative_steps` is
         // production-computed (`TrainingResult::total_steps`, summed), not
         // something this gate re-derives.
-        assert!(fused_dispatch_proof_gate("bert", 0, 0, 0, 0, 0).is_ok());
+        assert!(fused_dispatch_proof_gate(EncoderFamily::Bert, 0, 0, 0, 0, 0, 0, 0).is_ok());
     }
 
     /// The `"bert"` counted-eager head16 shape, dedicated (C-ATTN unit,
@@ -2784,7 +3523,7 @@ mod tests {
     /// that shape, not refuse it.
     #[test]
     fn fused_dispatch_proof_gate_passes_bert_counted_eager_head16_shape() {
-        assert!(fused_dispatch_proof_gate("bert", 2, 0, 2, 0, 2).is_ok());
+        assert!(fused_dispatch_proof_gate(EncoderFamily::Bert, 2, 0, 2, 0, 2, 0, 0).is_ok());
     }
 
     /// The complementary `"bert"` fused-arm shape, dedicated (C-ATTN unit,
@@ -2803,6 +3542,536 @@ mod tests {
     /// (not merely folded into the multi-architecture loop above).
     #[test]
     fn fused_dispatch_proof_gate_passes_bert_fused_head64_shape() {
-        assert!(fused_dispatch_proof_gate("bert", 2, 2, 0, 0, 0).is_ok());
+        assert!(fused_dispatch_proof_gate(EncoderFamily::Bert, 2, 2, 0, 0, 0, 0, 0).is_ok());
+    }
+
+    // ── issue #421 W2b: the three towers, one resolution chain ──────────
+
+    /// The ONE-chain claim, made concrete: `tiny_open_clip` holds NEITHER
+    /// `config.json` NOR `model.safetensors` — its files are
+    /// `open_clip_config.json` / `open_clip_model.safetensors`. Before this
+    /// unit, every consumer in this module joined the two hard-coded names
+    /// onto `model_dir` by hand, so this committed checkpoint was invisible
+    /// to the tier. RED at base: `Checkpoint` did not exist and the joins
+    /// pointed at files that are not there.
+    #[test]
+    fn checkpoint_resolve_finds_the_open_clip_pair_and_names_the_family() {
+        let dir = tiny_open_clip_model_dir();
+        assert!(
+            !dir.join("config.json").exists() && !dir.join("model.safetensors").exists(),
+            "this test is only meaningful while the fixture carries the open_clip_* names"
+        );
+        let checkpoint = Checkpoint::resolve(&dir).expect("resolve tiny_open_clip");
+        assert_eq!(checkpoint.family, EncoderFamily::OpenClip);
+        assert_eq!(checkpoint.family.adapter_model_type(), "open_clip");
+        assert_eq!(
+            checkpoint.config_path.file_name().and_then(|n| n.to_str()),
+            Some("open_clip_config.json")
+        );
+        assert_eq!(
+            checkpoint.weights_path.file_name().and_then(|n| n.to_str()),
+            Some("open_clip_model.safetensors")
+        );
+    }
+
+    /// The CLAP half of the same predicate, on the committed audio fixture:
+    /// its `config.json` carries BOTH `model_type: "clap_audio_model"` and
+    /// `architectures: ["ClapAudioModelWithProjection"]`, either of which
+    /// the serving-side predicate accepts.
+    #[test]
+    fn checkpoint_resolve_names_the_clap_audio_family() {
+        let checkpoint = checkpoint_of(&htsat_clap_tiny_model_dir());
+        assert_eq!(checkpoint.family, EncoderFamily::ClapAudio);
+        assert_eq!(checkpoint.family.adapter_model_type(), "clap_audio_model");
+    }
+
+    /// `--task text_embedding` on an OpenCLIP checkpoint builds the CLIP
+    /// TEXT tower, with `in_proj`/`c_fc` (its real site names) trained and
+    /// the adapter stamped `open_clip` + `Tower::Text`.
+    #[test]
+    fn build_encoder_adapters_builds_the_clip_text_tower() {
+        let varmap = VarMap::new();
+        let (encoder, adapter_cfg) = build_encoder_adapters(
+            &checkpoint_of(&tiny_open_clip_model_dir()),
+            Task::Text,
+            &["in_proj".to_string(), "c_fc".to_string()],
+            &None,
+            2,
+            4.0,
+            0.0,
+            jammi_numerics::ComputePrecision::F32,
+            7,
+            &Device::Cpu,
+            &varmap,
+        )
+        .expect("open_clip + text_embedding must build the CLIP text tower");
+        assert!(
+            matches!(encoder, AnyEncoder::ClipText(_)),
+            "open_clip + text_embedding must select the ClipText variant"
+        );
+        assert_eq!(adapter_cfg.model_type, "open_clip");
+        assert_eq!(adapter_cfg.tower, Some(jammi_lora::Tower::Text));
+        assert!(
+            !encoder.trainable_params().is_empty(),
+            "in_proj/c_fc must select real LoRA sites on the CLIP text tower"
+        );
+        assert!(
+            encoder_is_training(&encoder),
+            "the built encoder must report training mode"
+        );
+    }
+
+    /// The SAME checkpoint under `--task image_embedding` builds the OTHER
+    /// tower — the sharp case for "the task selects the tower": one
+    /// directory, one family, two different encoders and two different
+    /// `AdapterConfig.tower` stamps.
+    #[test]
+    fn build_encoder_adapters_builds_the_open_clip_vision_tower() {
+        let varmap = VarMap::new();
+        let (encoder, adapter_cfg) = build_encoder_adapters(
+            &checkpoint_of(&tiny_open_clip_model_dir()),
+            Task::Image,
+            &["in_proj".to_string(), "c_fc".to_string()],
+            &None,
+            2,
+            4.0,
+            0.0,
+            jammi_numerics::ComputePrecision::F32,
+            7,
+            &Device::Cpu,
+            &varmap,
+        )
+        .expect("open_clip + image_embedding must build the OpenCLIP vision tower");
+        assert!(
+            matches!(encoder, AnyEncoder::OpenClipVision(_)),
+            "open_clip + image_embedding must select the OpenClipVision variant"
+        );
+        assert_eq!(adapter_cfg.model_type, "open_clip");
+        assert_eq!(adapter_cfg.tower, Some(jammi_lora::Tower::Vision));
+        assert!(!encoder.trainable_params().is_empty());
+        assert!(encoder_is_training(&encoder));
+    }
+
+    /// `--task audio_embedding` on the committed HF-CLAP fixture builds the
+    /// HTSAT audio tower, stamped `clap_audio_model` + `Tower::Audio`.
+    #[test]
+    fn build_encoder_adapters_builds_the_htsat_audio_tower() {
+        let varmap = VarMap::new();
+        let (encoder, adapter_cfg) = build_encoder_adapters(
+            &checkpoint_of(&htsat_clap_tiny_model_dir()),
+            Task::Audio,
+            &["query".to_string(), "value".to_string()],
+            &None,
+            2,
+            4.0,
+            0.0,
+            jammi_numerics::ComputePrecision::F32,
+            7,
+            &Device::Cpu,
+            &varmap,
+        )
+        .expect("clap_audio_model + audio_embedding must build the HTSAT audio tower");
+        assert!(
+            matches!(encoder, AnyEncoder::Htsat(_)),
+            "clap_audio_model + audio_embedding must select the Htsat variant"
+        );
+        assert_eq!(adapter_cfg.model_type, "clap_audio_model");
+        assert_eq!(adapter_cfg.tower, Some(jammi_lora::Tower::Audio));
+        assert!(!encoder.trainable_params().is_empty());
+        assert!(encoder_is_training(&encoder));
+    }
+
+    /// A single-tower family leaves `tower` at `None` — this tier stamps a
+    /// tower ONLY where a checkpoint genuinely has more than one.
+    ///
+    /// MEASURED, not assumed, on the wire: `jammi_lora::AdapterConfig::tower`
+    /// carries `#[serde(default)]` but NOT `skip_serializing_if`, so a BERT
+    /// adapter's `adapter_config.json` now serialises an explicit
+    /// `"tower":null` key that adapters written before this unit do not
+    /// have. Round-tripping is unaffected in BOTH directions (a legacy file
+    /// with no key deserialises to `None`; this file deserialises to `None`
+    /// too), which is what this test pins. The BYTES of a freshly saved
+    /// BERT adapter config do change by one key — a `jammi-lora`-owned
+    /// decision this crate records rather than papers over, so that a
+    /// reader comparing two adapter bundles across this unit is not
+    /// surprised by a diff no test mentioned.
+    #[test]
+    fn a_bert_adapter_carries_no_tower_stamp() {
+        let varmap = VarMap::new();
+        let (_encoder, adapter_cfg) = build_encoder_adapters(
+            &checkpoint_of(&tiny_bert_model_dir()),
+            Task::Text,
+            &["query".to_string(), "value".to_string()],
+            &None,
+            2,
+            4.0,
+            0.0,
+            jammi_numerics::ComputePrecision::F32,
+            7,
+            &Device::Cpu,
+            &varmap,
+        )
+        .expect("bert + text_embedding must build");
+        assert_eq!(adapter_cfg.model_type, "bert");
+        assert_eq!(
+            adapter_cfg.tower, None,
+            "a single-tower family must not stamp a tower — that would change every existing \
+             text leg's saved adapter bytes"
+        );
+        let json = serde_json::to_string(&adapter_cfg).expect("serialize adapter config");
+        assert!(
+            json.contains("\"tower\":null"),
+            "a single-tower family must serialise a NULL tower, never a tower value — the \
+             emitted key itself is jammi-lora's serde shape, recorded here so a bundle diff \
+             across this unit is expected, not a surprise: {json}"
+        );
+        for stamped in ["\"text\"", "\"vision\"", "\"audio\""] {
+            assert!(
+                !json.contains(stamped),
+                "a BERT adapter must never claim a tower it does not have: {json}"
+            );
+        }
+        let reparsed: AdapterConfig =
+            serde_json::from_str(&json).expect("the emitted config must round-trip");
+        assert_eq!(reparsed.tower, None);
+        // The other direction, the one that matters for already-shipped
+        // bundles: a legacy config with NO `tower` key still loads.
+        let legacy = json.replace(",\"tower\":null", "");
+        assert!(!legacy.contains("tower"));
+        let legacy: AdapterConfig =
+            serde_json::from_str(&legacy).expect("a legacy adapter config must still load");
+        assert_eq!(legacy.tower, None);
+        assert_eq!(legacy.model_type, "bert");
+    }
+
+    /// Negative control on the `(family, task)` pairing: a task with no
+    /// tower on this family must be a TYPED refusal naming both halves,
+    /// never a silent fallback onto the family's "default" tower — which
+    /// would train a text tower while the caller's rows were images.
+    #[test]
+    fn build_encoder_adapters_refuses_a_task_with_no_tower_on_this_family() {
+        let varmap = VarMap::new();
+        for (dir, task, family_id) in [
+            (tiny_bert_model_dir(), Task::Image, "bert"),
+            (tiny_bert_model_dir(), Task::Audio, "bert"),
+            (tiny_open_clip_model_dir(), Task::Audio, "open_clip"),
+            (htsat_clap_tiny_model_dir(), Task::Text, "clap_audio_model"),
+            (htsat_clap_tiny_model_dir(), Task::Image, "clap_audio_model"),
+        ] {
+            let result = build_encoder_adapters(
+                &checkpoint_of(&dir),
+                task,
+                &["query".to_string(), "in_proj".to_string()],
+                &None,
+                2,
+                4.0,
+                0.0,
+                jammi_numerics::ComputePrecision::F32,
+                7,
+                &Device::Cpu,
+                &varmap,
+            );
+            let msg = match result {
+                Ok(_) => panic!(
+                    "--task {} on a {family_id} checkpoint has no tower and must be refused",
+                    task.as_str()
+                ),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                msg.contains(task.as_str()),
+                "refusal must name the task it refused: {msg}"
+            );
+            assert!(
+                msg.contains(family_id),
+                "refusal must name the family it refused: {msg}"
+            );
+        }
+    }
+
+    /// The zero-trainable refusal on a tower must name that tower's REAL
+    /// site names. `q_proj` is a BERT-ish selector that matches nothing on
+    /// an OpenCLIP block (whose sites are `in_proj`/`out_proj`/`c_fc`/
+    /// `c_proj`), so an operator who wrote it gets told what to write
+    /// instead of "correct the selectors".
+    #[test]
+    fn zero_trainable_refusal_on_open_clip_names_the_real_sites() {
+        let varmap = VarMap::new();
+        let result = build_encoder_adapters(
+            &checkpoint_of(&tiny_open_clip_model_dir()),
+            Task::Text,
+            &["q_proj".to_string()],
+            &None,
+            2,
+            4.0,
+            0.0,
+            jammi_numerics::ComputePrecision::F32,
+            7,
+            &Device::Cpu,
+            &varmap,
+        );
+        let msg = match result {
+            Ok(_) => panic!("q_proj matches nothing on an OpenCLIP tower — this must refuse"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("q_proj"),
+            "must name the unmatched selector: {msg}"
+        );
+        assert!(msg.contains("open_clip"), "must name the family: {msg}");
+        for site in ["in_proj", "out_proj", "c_fc", "c_proj"] {
+            assert!(
+                msg.contains(site),
+                "refusal must name the tower's real site {site:?}: {msg}"
+            );
+        }
+    }
+
+    /// [`tower_site_names`] transcribes selector strings that live as
+    /// crate-private constants in `jammi-encoders`. This makes the
+    /// transcription a MEASUREMENT rather than a claim: every name the
+    /// refusal offers is fed back through `build_encoder_adapters` on a real
+    /// checkpoint of that family, and the build must yield a NON-empty
+    /// trainable set. A stale name fails here instead of silently
+    /// misdirecting an operator.
+    #[test]
+    fn refusal_site_names_are_selectors_that_really_train() {
+        let distilbert_dir = write_synthetic_distilbert_model_dir(1);
+        let modernbert_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../cookbook/fixtures/tiny_modernbert_local");
+        let cases: Vec<(PathBuf, Task)> = vec![
+            (tiny_bert_model_dir(), Task::Text),
+            (distilbert_dir.path().to_path_buf(), Task::Text),
+            (modernbert_dir, Task::Text),
+            (tiny_open_clip_model_dir(), Task::Text),
+            (tiny_open_clip_model_dir(), Task::Image),
+            (htsat_clap_tiny_model_dir(), Task::Audio),
+        ];
+        for (dir, task) in cases {
+            let checkpoint = checkpoint_of(&dir);
+            let family = checkpoint.family;
+            let selectors: Vec<String> = tower_site_names(family, task)
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            assert!(
+                !selectors.is_empty(),
+                "{family:?} must advertise at least one site name"
+            );
+            let varmap = VarMap::new();
+            let (encoder, _cfg) = build_encoder_adapters(
+                &checkpoint,
+                task,
+                &selectors,
+                &None,
+                2,
+                4.0,
+                0.0,
+                jammi_numerics::ComputePrecision::F32,
+                7,
+                &Device::Cpu,
+                &varmap,
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{family:?} + {} with its own advertised sites {selectors:?} must build: {e}",
+                    task.as_str()
+                )
+            });
+            assert!(
+                !encoder.trainable_params().is_empty(),
+                "{family:?}'s advertised site names {selectors:?} must select real LoRA sites"
+            );
+        }
+    }
+
+    /// The tower families' half of the dispatch-proof gate (issue #421
+    /// W2b). Both directions, because a control that only ever passes is not
+    /// a control:
+    ///
+    /// - all-zero ATTENTION counters must NOT refuse a tower leg (a tower
+    ///   has no whole-attention-block admission counter at all, so refusing
+    ///   there would reject every valid media run);
+    /// - all-zero LORA counters over a run that took steps MUST refuse it
+    ///   (the LoRA cascade is the live proof the adapted encoder was
+    ///   forwarded).
+    #[test]
+    fn fused_dispatch_proof_gate_judges_tower_families_on_the_lora_counters() {
+        for family in [EncoderFamily::OpenClip, EncoderFamily::ClapAudio] {
+            // Zero attention counters, live LoRA: a healthy tower run.
+            assert!(
+                fused_dispatch_proof_gate(family, 6, 0, 0, 0, 0, 4, 0).is_ok(),
+                "{family:?}: all-zero attention counters are the NORMAL reading for a tower"
+            );
+            assert!(fused_dispatch_proof_gate(family, 6, 0, 0, 0, 0, 0, 4).is_ok());
+            // Live attention counters would not rescue a run whose LoRA
+            // sites were never forwarded — the control must not be
+            // satisfiable from the wrong counter.
+            let msg = match fused_dispatch_proof_gate(family, 6, 9, 9, 9, 9, 0, 0) {
+                Ok(()) => panic!(
+                    "{family:?} with 6 optimizer steps and no LoRA dispatch at all must be \
+                     refused, not rescued by unrelated attention counters"
+                ),
+                Err(msg) => msg,
+            };
+            assert!(
+                msg.contains("lora_linear_fused_dispatches"),
+                "refusal must name the counter it read: {msg}"
+            );
+            assert!(
+                msg.contains(family.adapter_model_type()),
+                "refusal must name the family: {msg}"
+            );
+            // Zero optimizer steps: out of scope for either branch.
+            assert!(fused_dispatch_proof_gate(family, 0, 0, 0, 0, 0, 0, 0).is_ok());
+        }
+    }
+
+    /// `attention_cascade_is_live` is the one predicate that decides which
+    /// counter the gate reads; pinning it here keeps a future family from
+    /// silently inheriting the wrong branch.
+    #[test]
+    fn only_the_bert_family_has_a_live_attention_cascade() {
+        assert!(attention_cascade_is_live(EncoderFamily::Bert));
+        assert!(attention_cascade_is_live(EncoderFamily::DistilBert));
+        assert!(attention_cascade_is_live(EncoderFamily::ModernBert));
+        assert!(!attention_cascade_is_live(EncoderFamily::OpenClip));
+        assert!(!attention_cascade_is_live(EncoderFamily::ClapAudio));
+    }
+
+    /// `--task`'s CLI spelling round-trips, and an unknown value is a typed
+    /// refusal naming all three (never a silent default to text, which would
+    /// train the wrong tower on a media corpus).
+    #[test]
+    fn task_round_trips_through_its_cli_spelling() {
+        for task in [Task::Text, Task::Image, Task::Audio] {
+            assert_eq!(task.as_str().parse::<Task>(), Ok(task));
+        }
+        let err = "vision"
+            .parse::<Task>()
+            .expect_err("unknown task must refuse");
+        for expected in ["text_embedding", "image_embedding", "audio_embedding"] {
+            assert!(
+                err.contains(expected),
+                "refusal must list {expected:?}: {err}"
+            );
+        }
+    }
+
+    /// Task→modality and task→catalog-task are the two mappings the row
+    /// loader and the catalog row read; pinned so they cannot drift apart.
+    #[test]
+    fn task_maps_to_one_modality_and_one_catalog_task() {
+        assert_eq!(Task::Text.modality(), jammi_encoders::Modality::Text);
+        assert_eq!(Task::Image.modality(), jammi_encoders::Modality::Image);
+        assert_eq!(Task::Audio.modality(), jammi_encoders::Modality::Audio);
+        assert_eq!(Task::Text.model_task(), ModelTask::TextEmbedding);
+        assert_eq!(Task::Image.model_task(), ModelTask::ImageEmbedding);
+        assert_eq!(Task::Audio.model_task(), ModelTask::AudioEmbedding);
+    }
+
+    /// A media triplet whose three members are not three DISTINCT files is
+    /// refused — decided on the MEASURED sha256 of the bytes, not on the
+    /// paths (two rows can spell one file two ways). The positive case
+    /// (three distinct digests) must pass, so this is not a check that
+    /// refuses everything.
+    #[test]
+    fn media_rows_must_carry_three_distinct_files() {
+        let row = |a: &str, p: &str, n: &str| MediaTriplet {
+            id: "row-0".to_string(),
+            anchor: b"a".to_vec(),
+            positive: b"p".to_vec(),
+            negative: b"n".to_vec(),
+            anchor_sha256: a.to_string(),
+            positive_sha256: p.to_string(),
+            negative_sha256: n.to_string(),
+        };
+        let ok = vec![row("aa", "bb", "cc")];
+        RowSet::Media(&ok)
+            .validate_media_members_are_distinct("--train-jsonl")
+            .expect("three distinct digests must pass");
+
+        for (rows, slots) in [
+            (vec![row("aa", "aa", "cc")], ("anchor", "positive")),
+            (vec![row("aa", "bb", "aa")], ("anchor", "negative")),
+            (vec![row("aa", "bb", "bb")], ("positive", "negative")),
+        ] {
+            let msg =
+                match RowSet::Media(&rows).validate_media_members_are_distinct("--train-jsonl") {
+                    Ok(()) => panic!("a duplicated member in slots {slots:?} must be refused"),
+                    Err(msg) => msg,
+                };
+            assert!(msg.contains(slots.0) && msg.contains(slots.1), "{msg}");
+            assert!(msg.contains("--train-jsonl"), "must name the input: {msg}");
+        }
+
+        // Text rows are untouched by this check (see its own doc).
+        let text = vec![IdTriplet {
+            id: "t".into(),
+            anchor: "x".into(),
+            positive: "x".into(),
+            negative: "x".into(),
+        }];
+        RowSet::Text(&text)
+            .validate_media_members_are_distinct("--train-jsonl")
+            .expect("the text path keeps its existing behaviour");
+    }
+
+    /// `--task` and the row vectors must agree: a media task carrying text
+    /// rows (or the reverse) is refused by name rather than dying downstream
+    /// on an opaque "0 rows is not a nonzero multiple of --batch".
+    #[test]
+    fn params_refuse_rows_that_do_not_match_the_task() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut params = non_perturbation_test_params(tmp.path().to_path_buf());
+        // The baseline (text task, text rows) is accepted — without this the
+        // refusals below could be passing for the wrong reason.
+        params
+            .validate_rows_match_task()
+            .expect("a text task with text rows must be accepted");
+
+        params.task = Task::Audio;
+        let msg = params
+            .validate_rows_match_task()
+            .expect_err("a media task carrying text rows must be refused");
+        assert!(msg.contains("audio_embedding"), "{msg}");
+        assert!(msg.contains("text"), "{msg}");
+
+        params.train_pairs.clear();
+        params.heldout_pairs.clear();
+        let msg = params
+            .validate_rows_match_task()
+            .expect_err("a media task with no media rows must be refused");
+        assert!(msg.contains("no train rows"), "{msg}");
+    }
+
+    /// MNRL has no media loader, so an MNRL media leg is a typed refusal
+    /// rather than a silent fallback onto the triplet loss under an MNRL
+    /// label. The triplet arm of the same rows must succeed, so this is not
+    /// a blanket "media is unsupported".
+    #[test]
+    fn media_rows_refuse_mnrl_and_accept_triplet() {
+        let rows = vec![MediaTriplet {
+            id: "row-0".into(),
+            anchor: b"a".to_vec(),
+            positive: b"p".to_vec(),
+            negative: b"n".to_vec(),
+            anchor_sha256: "aa".into(),
+            positive_sha256: "bb".into(),
+            negative_sha256: "cc".into(),
+        }];
+        RowSet::Media(&rows)
+            .loader(Objective::Triplet)
+            .expect("the triplet media loader must build");
+        let err = match RowSet::Media(&rows).loader(Objective::Mnrl) {
+            Ok(_) => panic!("mnrl over media rows must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("mnrl"), "{err}");
+        assert!(
+            err.contains("triplet"),
+            "must name the usable objective: {err}"
+        );
     }
 }

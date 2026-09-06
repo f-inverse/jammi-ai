@@ -2175,11 +2175,13 @@ script's own header for the full env-var surface (`MODEL_DIR`,
 every leg — jammi-eager INCLUDED — runs off the SAME tip binary, built ONCE
 at the start (`build_binary()`, `--features cuda,jammi-encoders/flash-attn`).
 jammi-eager is the tip binary with every fused op forced eager via
-`JAMMI_KERNELS_DISABLE=$JAMMI_EAGER_DISABLE_OP_KEYS` (NINE op keys — F4
+`JAMMI_KERNELS_DISABLE=$JAMMI_EAGER_DISABLE_OP_KEYS` (TEN op keys — F4
 adversarial-audit fold-in added `mem_efficient_attention`, a live per-layer
-`admit_cascade`/once-per-forward `op_disabled` site
-`ci/scripts/perf/test_finetune_ab_disable_op_keys.py` sweeps for
-mechanically against the real call graph, catching a tenth addition the
+`admit_cascade`/once-per-forward `op_disabled` site, and issue #463 added
+`gelu_erf_fused`, a live standalone `admit` site in
+`crate::activations::gelu_erf` —
+`ci/scripts/perf/test_finetune_ab_disable_op_keys.py` sweeps for both
+mechanically against the real call graph, catching an eleventh addition the
 same way) under `JAMMI_KERNELS_STRICT=1` (disable wins over Strict) plus
 `--expect-kernels-disabled` as a negative control — never "the pre-fusion
 commit", and never a second build. Both `jammi-fused` legs ALSO pass

@@ -4,8 +4,8 @@ adversarial audit — "the scanner silently drops unresolvable sites"): the
 MECHANICAL sweep `finetune_ab.sh`'s own `JAMMI_EAGER_DISABLE_OP_KEYS`
 constant names as its own enumeration method — run this after touching any
 admission call graph in `crates/jammi-encoders/src/`, `crates/jammi-lora/
-src/`, or `crates/jammi-ai/src/fine_tune/` to catch a TENTH addition (or a
-stale entry) mechanically, never by re-reading the whole call graph by
+src/`, or `crates/jammi-ai/src/fine_tune/` to catch an ELEVENTH addition (or
+a stale entry) mechanically, never by re-reading the whole call graph by
 eye.
 
 WHY THIS EXISTS: an eight-key version of `JAMMI_EAGER_DISABLE_OP_KEYS`
@@ -18,7 +18,11 @@ and that op's own domain predicate DomainMisses unconditionally for
 `seq <= ATTENTION_BLOCK_MAX_SEQ` (4096) — a coincidence of the SWEEP's own
 shape, not proof the key was unneeded. A hand-re-read of the call graph
 missed it once; this script performs the identical sweep mechanically,
-every run.
+every run. This is exactly the mechanism that caught the TENTH key,
+issue #463's `gelu_erf_fused` (a live standalone `admit` site in
+`crates/jammi-encoders/src/activations.rs`) — this constant's own set
+went stale the moment that op landed, and this test's set-equality
+assertion REDed until `JAMMI_EAGER_DISABLE_OP_KEYS` named it too.
 
 B2 (round-2 audit): a FIRST version of this scanner's own `_STR_RE.search`
 step silently returned NOTHING (an empty discovered set, no error, no
@@ -597,16 +601,17 @@ class RealSourceParityTests(unittest.TestCase):
             + "\n  ".join(self.unresolved),
         )
 
-    def test_jammi_eager_disable_op_keys_has_exactly_nine_entries(self):
+    def test_jammi_eager_disable_op_keys_has_exactly_ten_entries(self):
         self.assertEqual(
             len(self.declared),
-            9,
-            f"JAMMI_EAGER_DISABLE_OP_KEYS ({FINETUNE_AB_SH}) must have EXACTLY 9 entries "
-            f"(F4 fold-in: the original 8 plus mem_efficient_attention) — a count other than "
-            f"9 means the constant drifted; re-derive from the real call graph, never bump "
-            f"this number to make the test pass: {sorted(self.declared)}",
+            10,
+            f"JAMMI_EAGER_DISABLE_OP_KEYS ({FINETUNE_AB_SH}) must have EXACTLY 10 entries "
+            f"(F4 fold-in: the original 8 plus mem_efficient_attention; issue #463 fold-in: "
+            f"plus gelu_erf_fused) — a count other than 10 means the constant drifted; "
+            f"re-derive from the real call graph, never bump this number to make the test "
+            f"pass: {sorted(self.declared)}",
         )
-        self.assertEqual(len(set(self.declared)), 9, "JAMMI_EAGER_DISABLE_OP_KEYS contains a duplicate entry")
+        self.assertEqual(len(set(self.declared)), 10, "JAMMI_EAGER_DISABLE_OP_KEYS contains a duplicate entry")
 
     def test_declared_set_equals_the_discovered_live_standalone_set(self):
         # SET EQUALITY, never a subset check either direction: a key

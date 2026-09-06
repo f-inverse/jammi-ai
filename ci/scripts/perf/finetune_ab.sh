@@ -44,7 +44,7 @@
 #      over `Strict` (`crates/jammi-kernels/src/admission.rs:62-64`), and
 #      `--expect-kernels-disabled` hard-errors before a single step runs if
 #      `JAMMI_KERNELS_DISABLE` was dropped, mistyped, or not forwarded to
-#      this process — `params.expect_kernels_disabled` (`finetune_step.rs:692-699`)
+#      this process — `params.expect_kernels_disabled` (`finetune_step.rs:702-715`)
 #      checks it FIRST, before any device/checkpoint/tensor work — so a
 #      silently-clean env var can never masquerade as a real eager leg.
 #      `kernels_disabled_requested`/`kernels_disabled_fired` are surfaced on
@@ -174,9 +174,9 @@
 # happened to notice it. Both `jammi-fused` legs additionally pass
 # `--expect-kernels-disabled ""` (F5, adversarial audit): an EMPTY
 # expectation, checked via the SAME exact-SET-equality
-# `params.expect_kernels_disabled` (`finetune_step.rs:692-699`) machinery
+# `params.expect_kernels_disabled` (`finetune_step.rs:702-715`) machinery
 # the eager leg's own nonempty list uses —
-# `parse_disable_list` (`crates/jammi-kernels/src/admission.rs:998-1007`)
+# `parse_disable_list` (`crates/jammi-kernels/src/admission.rs:1037-1046`)
 # is the empty set for `Some("")`, so
 # this hard-fails the run if `JAMMI_KERNELS_DISABLE` carries ANYTHING at
 # all when this process starts, catching an AMBIENT/leaked env var (a
@@ -327,19 +327,21 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 # this crate's fused finetune-step call graph actually reaches on a real
 # training step (confirmed at this contract's tip: `layer_norm_fused`
 # `crates/jammi-encoders/src/layer_norm.rs:582`, `geglu_fused`
-# `crates/jammi-encoders/src/modernbert.rs:1944`, `attention_block_flash`
-# `crates/jammi-encoders/src/modernbert.rs:2626` (`op_disabled`, the
+# `crates/jammi-encoders/src/modernbert.rs:1424`, `attention_block_flash`
+# `crates/jammi-encoders/src/modernbert.rs:1990` (`op_disabled`, the
 # cascade's own capability gate), `attention_block_fused`
-# `crates/jammi-encoders/src/modernbert.rs:1348`, `rope_fused`
-# `crates/jammi-encoders/src/modernbert.rs:581`, `softmax_last_dim_fused`
-# `crates/jammi-encoders/src/modernbert.rs:1869`, `lora_linear_fused`
+# `crates/jammi-encoders/src/attention_cascade.rs:914` (moved out of
+# `crate::modernbert`, issue #462), `rope_fused`
+# `crates/jammi-encoders/src/modernbert.rs:484`, `softmax_last_dim_fused`
+# `crates/jammi-encoders/src/attention_cascade.rs:654` (moved out of
+# `crate::modernbert`, issue #462), `lora_linear_fused`
 # `crates/jammi-lora/src/lora_linear.rs:958`, `adamw_step_fused`
 # `crates/jammi-ai/src/fine_tune/adamw.rs:259`, `mem_efficient_attention`
-# `crates/jammi-encoders/src/modernbert.rs:1311` (`admit_cascade`, the
+# `crates/jammi-encoders/src/attention_cascade.rs:868` (`admit_cascade`, the
 # per-layer memeff cascade — consulted on EVERY training-mode attention
 # layer once the flash cascade has declined, BEFORE the block arm's own
 # `admit()`) and `op_disabled`
-# (`crates/jammi-encoders/src/modernbert.rs:2976`) is the once-per-forward
+# (`crates/jammi-encoders/src/modernbert.rs:2340`) is the once-per-forward
 # gate that suppresses the block/eager mask bundle when memeff is going to
 # fire.
 # `mem_efficient_attention` is the NINTH key, added by adversarial-audit

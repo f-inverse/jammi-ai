@@ -2467,13 +2467,13 @@ fn validate_backbone_precision(
 // Declined { outcome: CapabilityMiss, reason: "flash_transport_not_wired" }`
 // — the ONE reason value either family's `FlashDecision::Declined` ever
 // carries, because neither wires the encoder-boundary flash transport
-// protocol (`crates/jammi-encoders/src/bert.rs:418-420`,
-// `crates/jammi-encoders/src/distilbert.rs:315-317`). `admit_cascade`
+// protocol — see `BERT never wires the encoder-boundary flash transport` (`crates/jammi-encoders/src/bert.rs:418-420`)
+// and the sibling `FlashDecision::Declined` (`crates/jammi-encoders/src/distilbert.rs:321-324`). `admit_cascade`
 // (`crates/jammi-kernels/src/admission.rs:403-453`) now records every decline
 // — disabled, `DomainMiss`, and `CapabilityMiss` alike — into the SAME
 // thread-local probe-capture sink `admit_inner` uses
 // (`record_probe_miss(op, predicate_name)`,
-// `crates/jammi-kernels/src/admission.rs:416,427,437`), not just an atomic
+// `crates/jammi-kernels/src/admission.rs:427,437`), not just an atomic
 // increment on `CascadeDispatchCounters`. [`flash_report`] reads that entry
 // back through `jammi_kernels::admission::probe_capture_reason_for(window,
 // "attention_block_flash")` on a decline, exactly the way
@@ -3303,7 +3303,7 @@ mod tests {
 
     /// Issue #462/#463 follow-up: `admit_cascade`'s decline path now records
     /// `(op, predicate)` into the SAME probe-capture window `admit_inner`
-    /// uses (`crates/jammi-kernels/src/admission.rs:416-437`), which is what
+    /// uses — `record_probe_miss(op, predicate_name)` (`crates/jammi-kernels/src/admission.rs:427,437`), which is what
     /// lets [`flash_cascade_decline_reason`] — the function [`flash_report`]
     /// itself calls on a decline — read a verbatim reason back for the
     /// `"attention_block_flash"` cascade key instead of the coarse
@@ -3312,9 +3312,9 @@ mod tests {
     /// This drives the REAL `jammi_kernels::admission::admit_cascade` call
     /// (never a fabricated window entry) with BERT/DistilBERT's own verbatim
     /// predicate — `"flash_transport_not_wired"`, the ONE reason value either
-    /// family's `FlashDecision::Declined` ever carries
-    /// (`crates/jammi-encoders/src/bert.rs:418-420`,
-    /// `crates/jammi-encoders/src/distilbert.rs:315-317`) — for a
+    /// family's `FlashDecision::Declined` ever carries — see
+    /// `BERT never wires the encoder-boundary flash transport` (`crates/jammi-encoders/src/bert.rs:418-420`)
+    /// and the sibling `FlashDecision::Declined` (`crates/jammi-encoders/src/distilbert.rs:321-324`) — for a
     /// `CapabilityMiss` outcome on the `"attention_block_flash"` op, exactly
     /// as `attention_cascade::training_attention_cascade` does for a
     /// BERT-family training forward (`crates/jammi-encoders/src/

@@ -1,12 +1,12 @@
 {
-  "engine_version": "0.47.0",
+  "engine_version": "0.49.1",
   "host": {
     "logical_cpus": 18,
     "total_ram_mib": 0
   },
   "subcommand": "finetune-run",
   "provenance": {
-    "build_sha": "1962891cede8b3beb73289f22de08dd4b47a99b3",
+    "build_sha": "ba80552a1345b1bb4459a33422377c10561c9a24",
     "target": "aarch64-apple-darwin",
     "profile": "release",
     "build_features": [],
@@ -25,6 +25,7 @@
         "query",
         "value"
       ],
+      "layers_to_transform": null,
       "backbone_dtype": "f32",
       "checkpoint_config_sha256": "e24733455956ab8d84ce74c77b1b6327325a8127090f9b1a76d3265927dbbfdc",
       "checkpoint_weights_sha256": "f108a730c5be905e38ff73e7cb6670694a3ee3393dee12d1c1511cdbccdb2919",
@@ -59,35 +60,32 @@
       "split_rule": "positional_fraction_split",
       "batched_forward": true,
       "steps_measured": 6,
-      "ln_fused_dispatches": 0,
+      "ln_fused_dispatches": 12,
       "ln_eager_dispatches": 0,
       "rope_fused_dispatches": 0,
       "rope_eager_dispatches": 0,
-      "softmax_fused_dispatches": 0,
+      "softmax_fused_dispatches": 4,
       "softmax_eager_dispatches": 0,
       "geglu_fused_dispatches": 0,
       "geglu_eager_dispatches": 0,
+      "gelu_fused_dispatches": 4,
+      "gelu_eager_dispatches": 0,
       "lora_epilogue_fused_dispatches": 0,
       "lora_epilogue_eager_dispatches": 0,
-      "lora_linear_fused_dispatches": 0,
-      "lora_linear_eager_dispatches": 8,
+      "lora_linear_fused_dispatches": 8,
+      "lora_linear_eager_dispatches": 0,
       "attention_block_fused_dispatches": 0,
-      "attention_block_eager_dispatches": 0,
+      "attention_block_eager_dispatches": 4,
       "adamw_fused_dispatches": 16,
       "adamw_eager_dispatches": 0,
       "attention_block_flash_fused_dispatches": 0,
-      "attention_block_flash_declined_dispatches": 0,
+      "attention_block_flash_declined_dispatches": 4,
       "admission_is_dense": false,
-      "train_probe_series": [
-        1.0,
-        0.9999,
-        0.99981689453125
-      ],
       "tie_fraction": 0.0,
       "final_epoch": 1,
       "held_out_example_mean": 0.6931476593017578,
       "held_out_count": 2,
-      "final_loss_diagnostic": 0.5950161814689636,
+      "final_loss_diagnostic": 0.5950160026550293,
       "trajectory": [
         {
           "epoch": 0,
@@ -101,7 +99,13 @@
           "held_out_tie_fraction": 0.0,
           "held_out_batch_partition_sha256": "08fc5b466295898a0d182f131d50a6f49b6644f8606b3fb27e58ba6c45d2cd37"
         }
-      ]
+      ],
+      "train_probe_series": [
+        0.5853581428527832,
+        0.585174560546875,
+        0.5849919319152832
+      ],
+      "train_run_wall_s": 0.006297334
     }
   }
 }

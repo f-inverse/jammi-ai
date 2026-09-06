@@ -20,8 +20,11 @@ workspace ships every publishable crate at the same
   ModernBERT's own `Zeros` divergence already is). The bridge from BERT/DistilBERT's separate q/k/v
   tensors to the block's packed `qkv` input is `Tensor::cat` — a real, stated cost on BOTH arms of the
   A/B (a forward copy plus three backward zero-fills/adds per layer), never hidden inside either
-  arm's own number. Measurement pending the A/B artifact commit (`ci/scripts/perf/lora_bias_ab.sh
-  AB_OP=attn`); mechanism in `docs/maintainer/fine-tune-performance-guide.md` §4.
+  arm's own number. Measured on an A100 80GB PCIe (#462,
+  `crates/jammi-kernels/artifacts/cuda-runs/2026-09-06-attn-block-462-869c65f-a100-pcie.json`): both
+  BERT and DistilBERT ACTIVATE at both measured shapes, per-step wall gains 15.30–40.67% — the largest
+  gain of the four #356 sites; mechanism and table in
+  `docs/maintainer/fine-tune-performance-guide.md` §4.
 - **`GeluErfFused`, a fused erf-form GELU for the dense-encoder FFN site (#463).** New admit key
   `gelu_erf_fused` (CPU F32 only; F32/BF16/F16 on CUDA). Forward is bit-identical to candle's own
   `gelu_erf()` at every dtype it covers, including the CUDA 16-bit arms' double rounding
@@ -33,8 +36,11 @@ workspace ships every publishable crate at the same
   12-op composition through a condition-aware bound (the two terms cross zero near `x ≈ −0.7518`,
   where a result-relative bound is meaningless) with a KO-1 control that fails without the `x·φ` term.
   Wired at `bert.rs:192`/`distilbert.rs:142` only, behind a `training` flag on `activations::gelu_erf`
-  — eval-mode serving numerics are unchanged. Measurement pending the A/B artifact commit
-  (`ci/scripts/perf/lora_bias_ab.sh AB_OP=gelu`); mechanism in
+  — eval-mode serving numerics are unchanged. Measured on an A100 80GB PCIe (#463,
+  `crates/jammi-kernels/artifacts/cuda-runs/2026-09-06-gelu-erf-463-869c65f-a100-pcie.json`): both
+  BERT and DistilBERT ACTIVATE at both measured shapes, per-step wall gains 4.68–7.56% — the wire-shape
+  gain exceeds the #356 census's own launch-count projection (the fused backward removes ~12 launches
+  and the transient temporaries that method under-weights); mechanism and table in
   `docs/maintainer/fine-tune-performance-guide.md` §4.
 - **The fused LayerNorm site admits a bias-carrying affine (#460).** `LayerNormBiasedFused`
   (`jammi_kernels::ops::LayerNormBiasedFused`) is a new public export — BERT, DistilBERT, and

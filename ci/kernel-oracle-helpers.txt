@@ -81,3 +81,4 @@ crates/jammi-kernels/tests/flash_torch_parity_f16.rs::cuda_device
 crates/jammi-encoders/src/modernbert.rs::flash_arch_gate
 crates/jammi-kernels/tests/flash_torch_parity_f16.rs::f16_fixtures_present_or_skip
 crates/jammi-encoders/tests/esc076_comparable_eager_control.rs::esc076_trace_gate
+crates/jammi-bench/tests/finetune_run_media_smoke.rs::media_producer_require_gate

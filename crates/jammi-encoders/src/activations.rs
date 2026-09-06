@@ -79,7 +79,9 @@ fn gelu_admission_predicate(x: &Tensor) -> (bool, &'static str) {
 /// kernel launch changes. Backward matches candle's own `Op::Unary(_,
 /// GeluErf)` composition within `jammi_kernels::ops::gelu_erf`'s documented
 /// condition-aware bound (see that op's module doc's "backward" section and
-/// `tests/gelu_erf_oracles.rs`'s `COND_AWARE_TOL`/`COND_AWARE_ABS_FLOOR`).
+/// its own exported `jammi_kernels::ops::gelu_erf::{COND_AWARE_TOL,
+/// COND_AWARE_ABS_FLOOR}` constants, which this crate's own gradcheck
+/// oracle imports rather than hand-copying — audit round item 4).
 fn dispatch_gelu_erf_fused(x: &Tensor) -> Result<Tensor, EncoderError> {
     // `GeluErfFused` is a unit struct — clippy's `default_constructed_unit_structs`
     // prefers the bare value over `GeluErfFused::default()` (both are
@@ -359,19 +361,21 @@ mod tests {
         }
     }
 
-    /// This file's own copy of `jammi_kernels::ops::gelu_erf`'s documented
-    /// backward CONDITION-AWARE bound (cited from that op's module doc's
-    /// "backward" section and `jammi-kernels/tests/gelu_erf_oracles.rs`'s
-    /// `COND_AWARE_TOL`/`COND_AWARE_ABS_FLOOR` constants verbatim — NOT
-    /// re-derived here). `jammi-encoders` has no `libm` dependency of its
-    /// own, so `Phi(x)` is computed via `candle_core::Tensor::erf` (the
-    /// same standard-normal-CDF identity `Phi(x) = 0.5*(1+erf(x/sqrt(2)))`)
-    /// rather than a direct `libm::erf` call — numerically equivalent for
-    /// this bound's purpose (an f32 `erf` evaluation is well within the
-    /// bound's own floor).
+    /// This file's own re-derivation of `jammi_kernels::ops::gelu_erf`'s
+    /// documented backward CONDITION-AWARE bound formula, now IMPORTING
+    /// that op's own `COND_AWARE_TOL`/`COND_AWARE_ABS_FLOOR` constants
+    /// (audit round item 4: these used to be hand-copied `f64` literals
+    /// here, a duplication the kernels crate's own audit round closed by
+    /// exporting them as `pub const` — see `gelu_erf.rs`'s own doc for
+    /// both constants' derivation; this file no longer has a second,
+    /// independently-drifting copy of either number). `jammi-encoders` has
+    /// no `libm` dependency of its own, so `Phi(x)` is computed via
+    /// `candle_core::Tensor::erf` (the same standard-normal-CDF identity
+    /// `Phi(x) = 0.5*(1+erf(x/sqrt(2)))`) rather than a direct `libm::erf`
+    /// call — numerically equivalent for this bound's purpose (an f32
+    /// `erf` evaluation is well within the bound's own floor).
     fn gelu_erf_cond_aware_bound_batch(device: &Device, xs: &[f32]) -> Vec<f64> {
-        const COND_AWARE_TOL: f64 = 4e-6;
-        const COND_AWARE_ABS_FLOOR: f64 = 2.226e-8;
+        use jammi_kernels::ops::gelu_erf::{COND_AWARE_ABS_FLOOR, COND_AWARE_TOL};
         let scaled: Vec<f32> = xs
             .iter()
             .map(|&x| x * std::f32::consts::FRAC_1_SQRT_2)

@@ -2521,11 +2521,16 @@ impl ModelBackend for CandleBackend {
         // exact input set, ordering invariant, and why it matters.
         let (fingerprint, content_digest) = compute_model_identity_facets(resolved)?;
 
-        let model_type = resolved
-            .model_config
-            .get("model_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("bert");
+        // The raw `model_type` SPELLING the text arm below dispatches on and
+        // every refusal message names, read through the ONE shared reader
+        // (`crate::model::arch::config_model_type`) rather than this site's own
+        // `unwrap_or("bert")`. Behaviour here is unchanged for every string a
+        // config can carry; what the shared reader buys is that the
+        // absent-key default and `EncoderFamily::from_config`'s answer for the
+        // same file are now the same rule, so a `config.json` without a
+        // `model_type` can no longer serve as BERT here while the fine-tune
+        // worker refuses it (issue #421 D7).
+        let model_type = crate::model::arch::config_model_type(&resolved.model_config);
 
         // Per-model `compute_precision` in `config.json` wins over the global
         // `DeviceConfig` default; both default to `F32`. Read the same

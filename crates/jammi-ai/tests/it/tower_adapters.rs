@@ -40,6 +40,10 @@
 //! `model_type` (RED at base — the worker's `_ => BERT` arm coerced it and
 //! trained), an unsupported `(family, task)` pair, a cross-family adapter at
 //! load time, and the two task/column-shape mismatches.
+//!
+//! Beside them sits the one POSITIVE case that boundary must NOT swallow: a
+//! checkpoint whose config declares no `model_type` at all, which has to
+//! resolve to the same family for training as it does for serving.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -705,6 +709,130 @@ async fn unsupported_model_type_refuses_instead_of_coercing_to_bert() {
         msg.contains("gpt2") && msg.contains("supported"),
         "the refusal must name the offending model_type and the supported set, got: {msg}"
     );
+}
+
+/// A4(a'). The COMPLEMENT of the refusal above, and the divergence W2c closed:
+/// a `tiny_bert` copy whose `config.json` OMITS `model_type` entirely (the
+/// older sentence-transformers / hand-written bare-export shape) must be ONE
+/// architecture to BOTH readers.
+///
+/// RED at W2b: `EncoderFamily::from_config` answered `None` for an absent key,
+/// so the fine-tune worker refused this directory outright while the serving
+/// loader's own `unwrap_or("bert")` was simultaneously loading the identical
+/// bytes as BERT — training and serving disagreeing on one file, which is the
+/// single thing `model::arch` exists to prevent.
+///
+/// One deterministic assertion per side of that seam:
+///
+/// * SERVING — the embedding is bit-identical to the unmodified fixture's for
+///   the same probe (K4: deleting a key the loader only reads to pick an arm
+///   changes no loaded byte; an equality that would also hold if BOTH sides
+///   silently failed is ruled out by the two `expect`s, either of which fires
+///   first on a refusal).
+/// * TRAINING — the job completes and publishes an encoder-adapters bundle
+///   recording the `bert` architecture. A run that trained a projection head
+///   instead, or that recorded some other architecture, fails here.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_absent_model_type_trains_and_serves_as_bert() {
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+    session
+        .add_source(
+            "training",
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("training_pairs.csv")),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // A byte-for-byte `tiny_bert` copy with ONE key REMOVED — the mirror of
+    // the test above, which changes that same key's VALUE.
+    let fixture = common::cookbook_fixture("tiny_bert");
+    let model_dir = dir.path().join("bert_without_model_type");
+    std::fs::create_dir_all(&model_dir).unwrap();
+    for name in ["model.safetensors", "tokenizer.json"] {
+        std::fs::copy(fixture.join(name), model_dir.join(name)).unwrap();
+    }
+    let mut config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(fixture.join("config.json")).unwrap())
+            .unwrap();
+    assert!(
+        config
+            .as_object_mut()
+            .expect("config.json is a JSON object")
+            .remove("model_type")
+            .is_some(),
+        "the fixture must DECLARE a model_type for its removal to be the thing under test"
+    );
+    std::fs::write(
+        model_dir.join("config.json"),
+        serde_json::to_string(&config).unwrap(),
+    )
+    .unwrap();
+
+    const PROBE: &str = "a short sentence about a small round object";
+    let bare_model = format!("local:{}", model_dir.display());
+    let declared_model = "local:".to_string() + fixture.to_str().unwrap();
+
+    // (1) Serving.
+    let served = session
+        .encode_text_query(&bare_model, PROBE)
+        .await
+        .expect("a checkpoint that declares no model_type still serves");
+    let reference = session
+        .encode_text_query(&declared_model, PROBE)
+        .await
+        .expect("the unmodified fixture serves");
+    assert_bit_equal(&served, &reference, "absent model_type");
+
+    // (2) Training. `query`/`value` are BERT attention site names; a run that
+    // refused the checkpoint, or routed it anywhere but the BERT text tower,
+    // never gets here.
+    let job = session
+        .fine_tune(
+            "training",
+            &bare_model,
+            &[
+                "text_a".to_string(),
+                "text_b".to_string(),
+                "score".to_string(),
+            ],
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(tower_config(&["query", "value"], 1, 1e-3)),
+        )
+        .await
+        .unwrap();
+    job.wait()
+        .await
+        .expect("a checkpoint that declares no model_type fine-tunes as BERT");
+
+    let adapter_dir = adapter_dir_for_model(&session, job.model_id()).await;
+    let raw = std::fs::read_to_string(adapter_dir.join("adapter_config.json"))
+        .expect("a published encoder-adapters bundle carries adapter_config.json");
+    let saved: SavedAdapter = serde_json::from_str(&raw).expect("adapter_config.json parses");
+    match saved {
+        // A single-tower text family records no `tower` (its adapter has
+        // exactly one place to install); the architecture id is the assertion.
+        SavedAdapter::EncoderAdapters(cfg) => assert_eq!(
+            cfg.model_type, "bert",
+            "the adapter must record the family the ONE predicate resolved, got: {raw}"
+        ),
+        SavedAdapter::ProjectionHead(_) => panic!(
+            "a run with non-empty target_modules must save an EncoderAdapters adapter, \
+             got a projection head: {raw}"
+        ),
+    }
 }
 
 /// A4(b). The OpenCLIP checkpoint has no audio tower; an `audio_embedding`

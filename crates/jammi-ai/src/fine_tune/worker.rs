@@ -3197,9 +3197,11 @@ fn build_encoder_adapters(
         }
     };
 
-    // `model_type` as the config SPELLS it — used only in refusal messages
-    // and in the GGUF architecture lookup, never as the dispatch key (that is
-    // `family`, below).
+    // `model_type` as the config SPELLS it — used ONLY in refusal messages,
+    // never as a dispatch key (that is `family`, below, and
+    // `dispatch_model_type` for the two GGUF lookups that still key on the
+    // string). `<absent>` is a message word, not an architecture: it must
+    // never reach a lookup, which is why the two are separate bindings.
     let model_type = model_config
         .get("model_type")
         .and_then(|v| v.as_str())
@@ -3215,6 +3217,14 @@ fn build_encoder_adapters(
              head on a frozen backbone instead."
         ))
     })?;
+
+    // The string the two GGUF lookups below still key on (`GgufArchitecture`
+    // and, through `gguf_num_layers`, the DistilBERT field normalization),
+    // read through the SAME shared reader serving reads — so a config that
+    // declares no `model_type` (admitted as `family` = Bert just above)
+    // reaches those lookups as `"bert"` rather than as the `<absent>` message
+    // word, which would refuse a checkpoint this function already accepted.
+    let dispatch_model_type = arch::config_model_type(&model_config);
 
     // GGUF/QLoRA (issue #351): the base artifact SELECTS this — no new
     // trainer/config knob. The FROZEN precedence lives in `model::arch`
@@ -3283,13 +3293,14 @@ fn build_encoder_adapters(
     // inference load of the same `model.gguf` can never silently disagree
     // on which tensors are matmul-site or which dtype loaded).
     let gguf_backbone = if is_gguf {
-        let arch = crate::model::backend::gguf::GgufArchitecture::from_model_type(model_type)
-            .ok_or_else(|| {
-                JammiError::FineTune(format!(
-                    "quantized serving not supported for this architecture (model_type \
-                     '{model_type}')"
-                ))
-            })?;
+        let arch =
+            crate::model::backend::gguf::GgufArchitecture::from_model_type(dispatch_model_type)
+                .ok_or_else(|| {
+                    JammiError::FineTune(format!(
+                        "quantized serving not supported for this architecture \
+                         (model_type '{model_type}')"
+                    ))
+                })?;
         // Routes through the SAME normalization + layer-count authority
         // `CandleBackend::load`'s GGUF path and `estimate_gguf_residency`
         // use (`gguf::gguf_num_layers`) — a raw, un-normalized DistilBERT
@@ -3297,12 +3308,14 @@ fn build_encoder_adapters(
         // `n_layers` name only, so reading `num_hidden_layers`/`num_layers`
         // off the raw config here previously refused every DistilBERT GGUF
         // fine-tune outright (issue #351 wave 5 audit).
-        let num_layers = crate::model::backend::gguf::gguf_num_layers(model_type, &model_config)
-            .ok_or_else(|| {
-                JammiError::FineTune(
-                    "GGUF load requires num_hidden_layers (or num_layers) in config.json".into(),
-                )
-            })?;
+        let num_layers =
+            crate::model::backend::gguf::gguf_num_layers(dispatch_model_type, &model_config)
+                .ok_or_else(|| {
+                    JammiError::FineTune(
+                        "GGUF load requires num_hidden_layers (or num_layers) in config.json"
+                            .into(),
+                    )
+                })?;
         Some(
             crate::model::backend::gguf::load_gguf_backbone(
                 &gguf_weights_path,

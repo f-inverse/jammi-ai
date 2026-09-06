@@ -16,9 +16,11 @@
 //! bytes invisible to the staleness probe.
 //!
 //! Everything here is a MOVE, not a redesign. [`EncoderFamily::from_config`]'s
-//! CLAP rules are the ones the serving loader has always applied; the
-//! candidate-name lists are in the precedence the resolver froze (issue #351)
-//! and the fingerprint tracks.
+//! CLAP rules are the ones the serving loader has always applied; its answer
+//! for a config that declares no `model_type` at all is the one every reader
+//! it replaced gave ([`UNDECLARED_MODEL_TYPE_FAMILY`]); the candidate-name
+//! lists are in the precedence the resolver froze (issue #351) and the
+//! fingerprint tracks.
 //!
 //! # The two candidate lists are NOT one list
 //!
@@ -95,9 +97,34 @@ pub enum EncoderFamily {
     ClapAudio,
 }
 
+/// The family a checkpoint whose config declares NO `model_type` at all
+/// resolves to, and the ONE owner of that rule.
+///
+/// Every reader of a `model_type` in this workspace predating
+/// [`EncoderFamily`] — the serving loader's own read, the fine-tune worker's
+/// on-disk read, and the benchmark harness's `model_type_of` — defaulted an
+/// ABSENT key to `"bert"` and loaded such a directory as BERT. Answering
+/// `None` here instead would make this module the SOURCE of the divergence it
+/// exists to eliminate: serving would keep loading the checkpoint while the
+/// fine-tune worker refused the identical bytes.
+///
+/// The default is not a guess about an architecture that said something else:
+/// it is the only architecture a config that says nothing can be here.
+/// HuggingFace's own `PretrainedConfig` always serializes `model_type`; the
+/// configs seen without it are older sentence-transformers exports and
+/// hand-written bare BERT ones. A NON-BERT checkpoint that omitted the field
+/// still cannot silently mis-load: its geometry has to deserialize as a
+/// `BertConfig` and its tensors have to carry BERT's names, and both fail
+/// loudly at build time rather than producing a wrong number.
+///
+/// A `model_type` that IS declared and names an architecture this crate has no
+/// loader for stays a typed refusal ([`EncoderFamily::from_config`] -> `None`)
+/// — that coercion is the one issue #421 removed, and it is unaffected.
+pub const UNDECLARED_MODEL_TYPE_FAMILY: EncoderFamily = EncoderFamily::Bert;
+
 impl EncoderFamily {
     /// Classify a checkpoint from its parsed config JSON, or `None` when the
-    /// config names an architecture this crate does not implement.
+    /// config NAMES an architecture this crate does not implement.
     ///
     /// Order matters and is the serving loader's own: CLAP first (its
     /// structural signal is the most specific), then OpenCLIP, then the text
@@ -106,10 +133,16 @@ impl EncoderFamily {
     /// CLAP config carries no `model_cfg` — so the order is a tiebreak that
     /// never fires, stated explicitly rather than left to chance.
     ///
-    /// `None` (rather than a defaulted family) is the whole point: a caller
-    /// that coerces an unrecognised `model_type` into BERT trains and serves
-    /// a confidently wrong architecture. Every caller must handle `None` as a
-    /// typed refusal.
+    /// `None` (rather than a defaulted family) is the whole point of the
+    /// DECLARED-but-unknown case: a caller that coerces an unrecognised
+    /// `model_type` into BERT trains and serves a confidently wrong
+    /// architecture. Every caller must handle `None` as a typed refusal.
+    ///
+    /// A config that declares NO `model_type` at all is a different question
+    /// with a different answer — [`UNDECLARED_MODEL_TYPE_FAMILY`], the family
+    /// every reader in this workspace has always loaded such a directory as.
+    /// Read that constant's doc for why answering `None` there would recreate
+    /// the exact train/serve divergence this module exists to eliminate.
     pub fn from_config(config: &serde_json::Value) -> Option<Self> {
         if is_clap_audio_config(config) {
             return Some(Self::ClapAudio);
@@ -117,13 +150,17 @@ impl EncoderFamily {
         if config.get("model_cfg").is_some() {
             return Some(Self::OpenClip);
         }
-        match config.get("model_type").and_then(|v| v.as_str())? {
+        match config.get("model_type").and_then(|v| v.as_str()) {
             // The alias set the serving text arm accepts, verbatim: these
             // four all parse as `BertConfig` and load as `Bert`.
-            "bert" | "roberta" | "camembert" | "xlm-roberta" => Some(Self::Bert),
-            "distilbert" => Some(Self::DistilBert),
-            "modernbert" => Some(Self::ModernBert),
-            _ => None,
+            Some("bert" | "roberta" | "camembert" | "xlm-roberta") => Some(Self::Bert),
+            Some("distilbert") => Some(Self::DistilBert),
+            Some("modernbert") => Some(Self::ModernBert),
+            // A DECLARED architecture with no loader here: refuse.
+            Some(_) => None,
+            // No declared architecture at all (and no structural signal, both
+            // checked above) — one rule, owned by the constant.
+            None => Some(UNDECLARED_MODEL_TYPE_FAMILY),
         }
     }
 
@@ -236,6 +273,39 @@ fn is_clap_audio_config(config: &serde_json::Value) -> bool {
         })
 }
 
+/// The `model_type` STRING, read through the one shared default — for the
+/// sites that still dispatch on the spelling rather than on the family: the
+/// serving loader's text arm, `GgufArchitecture::from_model_type`, and
+/// `gguf::normalize_model_config`'s DistilBERT field renaming.
+///
+/// TOTAL, and deliberately NOT a second classifier:
+///
+/// * A DECLARED string comes back verbatim — including the BERT aliases
+///   (`roberta` and friends each have their own dispatch arm) and including
+///   an architecture this crate cannot load: the dispatch arms at those sites
+///   and their refusal messages both want the spelling the config actually
+///   used.
+/// * A config that declares nothing (an absent key, or a `model_type` that is
+///   not a JSON string — the same "no declared architecture" to every reader
+///   here) answers with [`UNDECLARED_MODEL_TYPE_FAMILY`]'s own id instead of
+///   each call site's private `unwrap_or("bert")`, so the FAMILY answer
+///   ([`EncoderFamily::from_config`]) and the STRING answer cannot drift.
+///   Reading the id off the family rather than re-typing `"bert"` is what
+///   makes that a single owner; the three text families'
+///   [`EncoderFamily::adapter_model_type`] ids ARE their HuggingFace
+///   `model_type` values, which is what lets the family answer that question.
+///
+/// A caller that needs the FAMILY of a structural (OpenCLIP / nested-CLAP)
+/// checkpoint must call [`EncoderFamily::from_config`]: those configs declare
+/// no top-level `model_type`, so they answer with the undeclared default
+/// here, exactly as every pre-`model::arch` reader of them did.
+pub fn config_model_type(config: &serde_json::Value) -> &str {
+    config
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| UNDECLARED_MODEL_TYPE_FAMILY.adapter_model_type())
+}
+
 /// The first EXISTING config file under `dir`, walking
 /// [`CONFIG_CANDIDATE_NAMES`] in its frozen order. `None` when the directory
 /// carries neither — the caller owns the typed refusal, because the message
@@ -325,10 +395,62 @@ mod tests {
             })),
             None
         );
-        // No `model_type` and no structural signal at all.
+    }
+
+    /// A config that declares NO `model_type` — the older
+    /// sentence-transformers / hand-written bare-export shape — resolves to
+    /// the family every reader in this workspace has always loaded it as, and
+    /// the raw-STRING reader agrees with the FAMILY reader by construction.
+    ///
+    /// RED before this: `from_config` answered `None` for an absent key while
+    /// the serving loader's own `unwrap_or("bert")` was loading the identical
+    /// bytes as BERT — training and serving disagreeing on one file, which is
+    /// the single thing this module exists to prevent.
+    #[test]
+    fn an_undeclared_model_type_is_one_answer_for_both_readers() {
+        let bare = serde_json::json!({
+            "hidden_size": 32,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+        });
         assert_eq!(
-            EncoderFamily::from_config(&serde_json::json!({ "hidden_size": 32 })),
-            None
+            EncoderFamily::from_config(&bare),
+            Some(UNDECLARED_MODEL_TYPE_FAMILY),
+            "an absent model_type resolves to the one documented default family"
+        );
+        assert_eq!(EncoderFamily::from_config(&bare), Some(EncoderFamily::Bert));
+        assert_eq!(
+            config_model_type(&bare),
+            UNDECLARED_MODEL_TYPE_FAMILY.adapter_model_type(),
+            "the string reader must answer with the SAME family's id, never its own default"
+        );
+        assert_eq!(config_model_type(&bare), "bert");
+        // A `model_type` present but not a JSON string declares nothing
+        // either, and resolves identically rather than half-way.
+        let malformed = serde_json::json!({ "model_type": 7 });
+        assert_eq!(
+            EncoderFamily::from_config(&malformed),
+            Some(EncoderFamily::Bert)
+        );
+        assert_eq!(config_model_type(&malformed), "bert");
+        // A DECLARED string comes back verbatim, supported or not.
+        for declared in ["bert", "roberta", "distilbert", "modernbert", "gpt2"] {
+            assert_eq!(
+                config_model_type(&serde_json::json!({ "model_type": declared })),
+                declared
+            );
+        }
+        // The structural families are checked FIRST, so the undeclared
+        // default never swallows an OpenCLIP or a nested-CLAP config.
+        assert_eq!(
+            EncoderFamily::from_config(&serde_json::json!({ "model_cfg": { "embed_dim": 16 } })),
+            Some(EncoderFamily::OpenClip)
+        );
+        assert_eq!(
+            EncoderFamily::from_config(
+                &serde_json::json!({ "audio_config": { "model_type": "clap_audio_model" } })
+            ),
+            Some(EncoderFamily::ClapAudio)
         );
     }
 

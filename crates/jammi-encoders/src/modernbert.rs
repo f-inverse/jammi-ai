@@ -2590,6 +2590,26 @@ impl ModernBert {
     }
 }
 
+/// The selector names a caller may write in `target_modules` to reach this
+/// family's LoRA sites — exactly the `module_name` arguments
+/// `ModernBertBuilder::build` passes to `LoraSite::build`, which is what
+/// [`jammi_lora::should_apply_lora`] matches against.
+///
+/// Same list, same order, as `modern_lora_sites`' names, which for THIS
+/// family coincide with the selectors (ModernBERT's adapter-key leaves are
+/// `attn.Wqkv` / `attn.Wo` / `mlp.Wi` / `mlp.Wo` — see the builder's own
+/// `site.build(module_name, lora_subpath, ..)` pairs, and `crate::bert`'s
+/// `LORA_SITE_NAMES` for a family where the two axes genuinely diverge).
+///
+/// `Wo` and `mlp.Wo` overlap by design: `should_apply_lora` matches
+/// `module_name.ends_with(target)`, so the bare `Wo` reaches BOTH sites
+/// while `mlp.Wo` reaches only the MLP one. Both are listed because both
+/// are names a site is really offered under. `AnyEncoder::lora_site_names`
+/// returns this, and a test asserts every entry selects at least one real
+/// site on a fixture while the union of all of them is exactly what
+/// `all-linear` selects.
+pub(crate) const LORA_SITE_NAMES: &[&str] = &["Wqkv", "Wo", "Wi", "mlp.Wo"];
+
 /// The four LoRA-wrappable linear sites of one ModernBERT layer paired with their
 /// `named_trainable_weights` site names.
 fn modern_lora_sites(layer: &ModernBertLayer) -> [(&'static str, &MaybeLoraLinear); 4] {

@@ -480,6 +480,20 @@ impl DistilBert {
     }
 }
 
+/// The selector names a caller may write in `target_modules` to reach this
+/// family's LoRA sites — exactly the `module_name` arguments
+/// `DistilBertBuilder::build` passes to `LoraSlot::build_in`, which is what
+/// [`jammi_lora::should_apply_lora`] matches against. DistilBERT keeps the
+/// checkpoint's own `*_lin` / `lin{1,2}` vocabulary rather than BERT's, so
+/// the two families' lists are genuinely different strings for the same six
+/// roles.
+///
+/// Same list, same order, as `distil_lora_sites`'s names; `AnyEncoder::
+/// lora_site_names` returns it, and a test asserts every entry selects at
+/// least one real site on a fixture while the union of all of them is
+/// exactly what `all-linear` selects.
+pub(crate) const LORA_SITE_NAMES: &[&str] = &["q_lin", "k_lin", "v_lin", "out_lin", "lin1", "lin2"];
+
 /// The six LoRA-wrappable linear sites of one DistilBERT layer paired with their
 /// `named_trainable_weights` site names.
 fn distil_lora_sites(layer: &DistilBertLayer) -> [(&'static str, &MaybeLoraLinear); 6] {

@@ -55,6 +55,23 @@ const C_FC_SITE: &str = "c_fc";
 /// See [`C_FC_SITE`].
 const C_PROJ_SITE: &str = "c_proj";
 
+/// The selector names a caller may write in `target_modules` to reach
+/// EITHER OpenCLIP tower's LoRA sites — both towers load this same block,
+/// so both have exactly these four and `AnyEncoder::lora_site_names`
+/// returns this one list for `ClipText` and `OpenClipVision` alike.
+///
+/// Built from the four site-name constants themselves (two here, two in
+/// `crate::attention`), in `ResidualAttentionBlock::lora_sites`' order, so
+/// it cannot drift from the names the sites are actually wrapped under. A
+/// test asserts every entry selects at least one real site on a fixture
+/// while the union of all of them is exactly what `all-linear` selects.
+pub(crate) const LORA_SITE_NAMES: &[&str] = &[
+    crate::attention::IN_PROJ_SITE,
+    crate::attention::OUT_PROJ_SITE,
+    C_FC_SITE,
+    C_PROJ_SITE,
+];
+
 /// Feed-forward MLP with QuickGelu activation.
 struct Mlp {
     c_fc: MaybeLoraLinear,

@@ -250,13 +250,32 @@ impl OpenClipVisionTransformer {
 
     /// Forward pass: pixel values → embedding vector.
     ///
-    /// Input: `(batch, 3, image_size, image_size)` tensor.
-    /// Output: `(batch, embed_dim)` tensor.
+    /// Input: `(batch, 3, image_size, image_size)` tensor, in ANY floating
+    /// dtype. Output: `(batch, embed_dim)` tensor, in this tower's own
+    /// [`Self::dtype`].
+    ///
+    /// # Input-dtype domain: cast at the seam
+    ///
+    /// The FIRST weight a pixel batch meets is the patch-embedding `conv1`
+    /// kernel, and candle's `conv2d` does not promote a mismatched input
+    /// the way a dense linear does — an F32 batch against an F16 kernel is
+    /// a hard `dtype mismatch in conv2d`. Every production front end
+    /// (image decode → normalise → `Tensor::from_vec` of `f32`) emits F32,
+    /// so a tower built at an F16 backbone would refuse the only batch
+    /// anybody actually has.
+    ///
+    /// This edge is the ONE place that knows the backbone dtype, so it is
+    /// where the cast belongs — the same shape `jammi_lora::FrozenBase`'s
+    /// `Dense` arm already uses for a `Linear`. `Tensor::to_dtype` on the
+    /// SAME dtype is `self.clone()`, so an already-matching (F32-on-F32)
+    /// batch takes a byte-identical path: this is a widening of the
+    /// accepted input domain, never a change to any output bit.
     pub fn forward(&self, pixel_values: &Tensor) -> Result<Tensor, EncoderError> {
+        let pixel_values = pixel_values.to_dtype(self.dtype())?;
         let batch_size = pixel_values.dim(0)?;
 
         // Patch embedding: (batch, 3, H, W) -> (batch, width, grid, grid)
-        let x = self.conv1.forward(pixel_values)?;
+        let x = self.conv1.forward(&pixel_values)?;
 
         // Flatten spatial dims: (batch, width, grid*grid) -> (batch, grid*grid, width)
         let x = x.flatten_from(2)?.permute((0, 2, 1))?;
@@ -383,12 +402,13 @@ impl OpenClipVisionTransformer {
     /// [`Self::load`] from an arbitrary `VarBuilder` as well as one built
     /// through the builder's `backbone_dtype`.
     ///
-    /// A caller that must MANUFACTURE a pixel batch for this tower (a probe,
-    /// a warm-up) needs it, and this is the FIRST weight such a batch meets:
-    /// candle's `conv2d` does NOT cast its input up to the kernel's dtype
-    /// the way `jammi_lora::FrozenBase::Dense` does, so an F32 batch against
-    /// an F16 kernel is a hard `dtype mismatch in conv2d`, not a silent
-    /// promotion.
+    /// This is the dtype [`Self::forward`] casts its input TO, and the dtype
+    /// of the embedding it returns. It is NOT a precondition on the input:
+    /// candle's `conv2d` does not promote a mismatched input the way
+    /// `jammi_lora::FrozenBase::Dense` does, which is exactly why the cast
+    /// lives at that forward edge rather than in every caller. A caller that
+    /// MANUFACTURES a batch (a probe, a warm-up) can still read it here to
+    /// build one that needs no cast at all.
     pub fn dtype(&self) -> DType {
         self.conv1.weight().dtype()
     }

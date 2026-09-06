@@ -223,6 +223,23 @@ impl AnyEncoder {
     /// text tower today, but a `[batch, seq]` integer tensor and a
     /// `[batch, 3, h, w]` pixel tensor are both "just tensors" to a
     /// downstream matmul).
+    ///
+    /// # Input dtype is NOT part of the contract
+    ///
+    /// A MEDIA batch (image or audio) is accepted in any floating dtype,
+    /// on a backbone of any dtype: each tower casts at its own forward
+    /// edge (`OpenClipVisionTransformer::forward`,
+    /// `HtsatAudioEncoder::forward_front`), so the F32 batch every
+    /// production front end emits works against an F16 or BF16 backbone
+    /// without the caller knowing [`Self::dtype`]. A caller that already
+    /// holds a batch in the backbone dtype pays nothing for this: casting
+    /// to the dtype a tensor already has is a clone, so pre-cast and
+    /// not-pre-cast produce bit-identical outputs. TEXT input carries no
+    /// floating dtype at all — ids and mask are integer tensors.
+    ///
+    /// SHAPE, by contrast, IS part of the contract and is not repaired
+    /// here: a wrong image side or mel-bin count is still a refusal from
+    /// the tower's own geometry check.
     pub fn forward_input(&self, input: &EncoderInput<'_>) -> Result<Tensor, EncoderError> {
         // Each arm narrows on the INPUT, then asks `self` once whether it
         // can serve that modality; a `None`/non-matching `self` falls
@@ -366,14 +383,18 @@ impl AnyEncoder {
     /// weights.
     ///
     /// This is what makes [`Self::probe_input`]'s "every field is derived
-    /// from the encoder" claim true for the FLOATING batches. The dense
-    /// LoRA/linear seam (`jammi_lora::FrozenBase::Dense::forward`) casts its
-    /// input to the weight dtype, but the media towers' front ends do not:
-    /// candle's `conv2d` refuses an F32 batch against an F16 kernel
-    /// (`dtype mismatch in conv2d`) and HTSAT's leading `BatchNorm` refuses
-    /// it in its centring subtraction (`dtype mismatch in sub`). A probe
-    /// batch manufactured at a hardcoded `F32` therefore worked only for an
-    /// F32 backbone.
+    /// from the encoder" claim true for the FLOATING batches: a probe built
+    /// at this dtype meets the backbone with no conversion at all.
+    ///
+    /// It is a REPORT, not a precondition on [`Self::forward_input`]. The
+    /// raw candle ops in a media tower's front end do refuse a mismatched
+    /// input (candle's `conv2d` on an F32 batch against an F16 kernel is a
+    /// `dtype mismatch in conv2d`; HTSAT's leading `BatchNorm` is a `dtype
+    /// mismatch in sub`), which is precisely why each tower casts at its
+    /// own forward edge instead — the one place that knows this value. A
+    /// caller may hand [`Self::forward_input`] an F32 media batch on ANY
+    /// backbone dtype; see that method's own "Input dtype is NOT part of
+    /// the contract" section.
     pub fn dtype(&self) -> DType {
         match self {
             Self::Bert(e) => e.dtype(),
@@ -446,10 +467,14 @@ impl AnyEncoder {
     /// path as well as the plain patch-conv (the `false` branch computes a
     /// strict subset of it).
     ///
-    /// The DTYPE is derived too, via [`Self::dtype`] — see that method for
-    /// why a hardcoded `F32` is not a harmless default on a media tower.
-    /// The text batch is integer (`U32` ids and mask) and carries no
-    /// floating dtype at all.
+    /// The DTYPE is derived too, via [`Self::dtype`], so the probe reaches
+    /// the backbone with no conversion in the way — a probe is about which
+    /// code path runs, and a cast the production path would not perform is
+    /// one more thing between the caller and that path. (It is no longer
+    /// REQUIRED: [`Self::forward_input`] accepts an F32 media batch on any
+    /// backbone dtype. Derived is still the honest default.) The text batch
+    /// is integer (`U32` ids and mask) and carries no floating dtype at
+    /// all.
     pub fn probe_input(&self, device: &Device) -> Result<OwnedEncoderInput, EncoderError> {
         Ok(match self {
             Self::Bert(_) | Self::DistilBert(_) | Self::ModernBert(_) | Self::ClipText(_) => {
@@ -478,6 +503,53 @@ impl AnyEncoder {
                 is_longer: vec![true],
             },
         })
+    }
+
+    /// The LoRA SELECTOR NAMES this variant's builder can wrap — the
+    /// vocabulary a caller's `target_modules` is matched against.
+    ///
+    /// Each family names its sites in its own checkpoint's terms, and the
+    /// vocabularies genuinely differ — BERT's dotted `attention.self.query`
+    /// / … / `output.dense`, DistilBERT's `q_lin` / `k_lin` / `v_lin` /
+    /// `out_lin` / `lin1` / `lin2`, ModernBERT's fused `Wqkv` / `Wo` / `Wi`
+    /// / `mlp.Wo`, the two OpenCLIP towers' shared `in_proj` / `out_proj` /
+    /// `c_fc` / `c_proj`, and HTSAT's nine. Each list is a `pub(crate) const
+    /// LORA_SITE_NAMES` in the owning module, built from the very constants
+    /// its sites are wrapped under wherever those exist.
+    ///
+    /// This exists so a caller can tell a name that selects NOTHING from a
+    /// name that selects something BEFORE building: a `target_modules` list
+    /// of plausible-but-wrong strings produces a tower with zero trainable
+    /// parameters and no error at all, which then trains happily and
+    /// updates nothing.
+    ///
+    /// It is the EXACT-MATCH vocabulary, not the set of accepted strings:
+    /// `jammi_lora::should_apply_lora` also accepts `all-linear` and any
+    /// SUFFIX of one of these names, which is why the short `["query",
+    /// "value"]` form works against a BERT checkpoint whose sites are
+    /// offered as `attention.self.query` / `attention.self.value`. Do not
+    /// infer the short form by trimming: BERT's adapter-key leaves
+    /// (`intermediate_dense`, `output_dense`) are NOT selectors — the
+    /// selector is `intermediate.dense` / `output.dense`, and that
+    /// distinction is what this accessor exists to stop a caller
+    /// re-deriving by hand.
+    ///
+    /// Never empty for any variant: every variant carries real LoRA sites.
+    /// Asserted per variant on a real fixture — every name here selects at
+    /// least one site, and their union is exactly what `all-linear` selects
+    /// — by `tests/it/lora_site_names.rs`.
+    pub fn lora_site_names(&self) -> &'static [&'static str] {
+        match self {
+            Self::Bert(_) => crate::bert::LORA_SITE_NAMES,
+            Self::DistilBert(_) => crate::distilbert::LORA_SITE_NAMES,
+            Self::ModernBert(_) => crate::modernbert::LORA_SITE_NAMES,
+            // ONE list for both OpenCLIP towers: they load the same
+            // `crate::open_clip_block::ResidualAttentionBlock`, so their
+            // site names are the same four by construction, not by
+            // coincidence.
+            Self::ClipText(_) | Self::OpenClipVision(_) => crate::open_clip_block::LORA_SITE_NAMES,
+            Self::Htsat(_) => crate::htsat_audio::LORA_SITE_NAMES,
+        }
     }
 
     /// Trainable tensors across every LoRA-wrapped site. Empty for a fully

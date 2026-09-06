@@ -632,6 +632,30 @@ const LINEAR1_SITE: &str = "linear1";
 /// See [`LINEAR1_SITE`].
 const LINEAR2_SITE: &str = "linear2";
 
+/// The selector names a caller may write in `target_modules` to reach this
+/// tower's LoRA sites — the nine constants above, in the order the
+/// traversals visit them (the six per-block roles, then the stage
+/// downsample, then the two unindexed projection-head linears).
+///
+/// Built from the constants themselves, so it cannot drift from the names
+/// the sites are actually wrapped under; `AnyEncoder::lora_site_names`
+/// returns it, and a test asserts every entry selects at least one real
+/// site on a fixture while the union of all of them is exactly what
+/// `all-linear` selects. Two of these are UNINDEXED head sites, so an
+/// active `layers_to_transform` filter refuses them — see
+/// [`jammi_lora::should_apply_lora`]'s own doc.
+pub(crate) const LORA_SITE_NAMES: &[&str] = &[
+    QUERY_SITE,
+    KEY_SITE,
+    VALUE_SITE,
+    ATTENTION_OUTPUT_SITE,
+    INTERMEDIATE_DENSE_SITE,
+    OUTPUT_DENSE_SITE,
+    REDUCTION_SITE,
+    LINEAR1_SITE,
+    LINEAR2_SITE,
+];
+
 /// Self-attention inside a Swin window (W-MSA / SW-MSA), with the recomputed
 /// relative-position bias and an optional precomputed shift-window mask.
 struct SwinSelfAttention {
@@ -1371,11 +1395,29 @@ impl HtsatAudioEncoder {
     /// Run the front half on `input_features` `[B, 4, T, num_mel_bins]` (any T),
     /// capturing every gated boundary. `is_longer` gates the per-sample fusion in
     /// the patch embedding (`true` → AFF blend, `false` → global patch-conv only).
+    ///
+    /// # Input-dtype domain: cast at the seam
+    ///
+    /// `input_features` may arrive in ANY floating dtype. This method is
+    /// the tower's whole floating-input edge — the leading `BatchNorm` and
+    /// the patch-embedding `Conv2d` are the first weights a fusion
+    /// spectrogram meets, and neither promotes a mismatched input the way
+    /// a dense linear does (an F32 batch against an F16 backbone is a hard
+    /// `dtype mismatch in sub` inside the batch-norm centring). Every
+    /// production front end (decode → resample → log-mel →
+    /// `Tensor::from_vec` of `f32`) emits F32, so casting here — the one
+    /// place that knows
+    /// [`Self::dtype`] — is what lets an F16 backbone consume the only
+    /// batch a caller actually has. `Tensor::to_dtype` on the SAME dtype is
+    /// `self.clone()`, so an already-matching (F32-on-F32) batch takes a
+    /// byte-identical path: a widening of the accepted input domain, never
+    /// a change to any output bit.
     pub fn forward_front(
         &self,
         input_features: &Tensor,
         is_longer: &[bool],
     ) -> Result<FrontHalf, EncoderError> {
+        let input_features = input_features.to_dtype(self.dtype())?;
         // transpose(1,3) -> [B, freq, time, 4]; batch-norm over the freq axis
         // (now channel dim 1); transpose back.
         let x = input_features.transpose(1, 3)?.contiguous()?;
@@ -1706,12 +1748,14 @@ impl HtsatAudio {
     /// `VarBuilder` as well as one built through the builder's
     /// `backbone_dtype`.
     ///
-    /// A caller that must MANUFACTURE a floating input for this tower (a
-    /// probe batch, a warm-up) needs it: this tower's front half is a
-    /// `BatchNorm` followed by a `Conv2d`, and neither casts its input to
-    /// the weight dtype the way `jammi_lora::FrozenBase::Dense` does — an
-    /// F32 batch fed to an F16 backbone is a hard `dtype mismatch in sub`
-    /// error, not a silent promotion.
+    /// This is the dtype [`HtsatAudioEncoder::forward_front`] casts its
+    /// input TO, and the dtype of the embedding [`Self::forward`] returns.
+    /// It is NOT a precondition on the input: this tower's front half is a
+    /// `BatchNorm` followed by a `Conv2d`, and neither promotes its input
+    /// the way `jammi_lora::FrozenBase::Dense` does, which is exactly why
+    /// the cast lives at that one seam rather than in every caller. A
+    /// caller that MANUFACTURES a floating input (a probe batch, a warm-up)
+    /// can still read it here to build one that needs no cast at all.
     pub fn dtype(&self) -> DType {
         self.encoder.dtype()
     }
@@ -1856,9 +1900,17 @@ impl HtsatAudio {
         Ok(())
     }
 
-    /// Full forward on `input_features` `[B, 4, T, num_mel_bins]` (any T), with
-    /// the per-sample `is_longer` fusion gate, returning the L2-normalized audio
-    /// embedding `[B, projection_dim]`.
+    /// Full forward on `input_features` `[B, 4, T, num_mel_bins]` (any T,
+    /// any floating dtype), with the per-sample `is_longer` fusion gate,
+    /// returning the L2-normalized audio embedding `[B, projection_dim]` in
+    /// this tower's own [`Self::dtype`].
+    ///
+    /// The input-dtype cast is NOT repeated here: this method's whole
+    /// floating input goes to `HtsatAudioEncoder::forward_front`, which is
+    /// the one seam that owns it (see that method's "Input-dtype domain"
+    /// section). Everything downstream of it — the Swin spine, the
+    /// projection head — consumes tensors this tower produced, already in
+    /// the backbone dtype.
     pub fn forward(
         &self,
         input_features: &Tensor,

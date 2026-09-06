@@ -56,7 +56,7 @@ named two REAL, in-scope test call sites this excludes,
 `strict_mode_errors_instead_of_falling_back_on_a_failed_predicate`
 (`crates/jammi-encoders/src/layer_norm.rs:2427`) and
 `attention_block_strict_mode_errors_instead_of_falling_back_on_a_failed_predicate`
-(`crates/jammi-encoders/src/modernbert.rs:10632`), both `admit(AdmissionMode::Strict, "<a key
+(`crates/jammi-encoders/src/modernbert.rs:10652`), both `admit(AdmissionMode::Strict, "<a key
 already found at its own production site>", ...)` calls that exist purely
 to unit-test THAT op's Strict-mode error path, not a second live call
 site) — for every remaining `admit(`/`admit_cascade(`/`op_disabled(` call,

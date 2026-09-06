@@ -14,7 +14,9 @@
 //!   unadapted tower bit-for-bit.
 //! * **A5 F16** — A1 again with an F16 backbone, so the dtype-following
 //!   masks are exercised at a precision where an `f32::MIN` sentinel would
-//!   have become `-inf`.
+//!   have become `-inf`. Driven with the PRODUCTION F32 media batch, which
+//!   is what a front end actually emits; **A5b** pins that an F32 batch and
+//!   the same batch pre-cast to F16 are bit-identical.
 //! * **Adapter round trip** — train, export, save, rebuild through
 //!   `.adapter(..)`, and the rebuilt tower's eval output is bit-equal to the
 //!   trained one's.
@@ -180,26 +182,34 @@ fn clip_text_batch(device: &Device) -> (Tensor, Tensor) {
     )
 }
 
-fn vision_batch(device: &Device, dtype: DType) -> Tensor {
+/// The PRODUCTION shape of a pixel batch: `F32`, whatever the backbone is.
+/// Every real front end (decode → normalise → `Tensor::from_vec` of
+/// `f32`) emits exactly this, so an oracle that hands a tower a pre-cast
+/// batch is testing a batch no caller has. The `F32`-ness is asserted, not
+/// assumed, at the F16 call sites.
+fn vision_batch(device: &Device) -> Tensor {
     let n = 2 * 3 * 8 * 8;
     let px: Vec<f32> = (0..n)
         .map(|i| ((i as f32) * 0.017 - 1.0).sin() * 0.5)
         .collect();
-    Tensor::from_vec(px, (2, 3, 8, 8), device)
-        .unwrap()
-        .to_dtype(dtype)
-        .unwrap()
+    Tensor::from_vec(px, (2, 3, 8, 8), device).unwrap()
 }
 
-fn htsat_batch(device: &Device, dtype: DType) -> Tensor {
+/// The PRODUCTION shape of a CLAP fusion spectrogram — see
+/// [`vision_batch`]. The committed pinned input is stored at `F32`; this
+/// asserts that rather than trusting it, so the "production dtype" claim
+/// cannot quietly become "whatever the fixture happens to hold".
+fn htsat_batch(device: &Device) -> Tensor {
     let pinned =
         candle_core::safetensors::load(htsat_dir().join("pinned_input.safetensors"), device)
             .unwrap();
-    pinned
-        .get("input_features")
-        .unwrap()
-        .to_dtype(dtype)
-        .unwrap()
+    let feats = pinned.get("input_features").unwrap().clone();
+    assert_eq!(
+        feats.dtype(),
+        DType::F32,
+        "the pinned CLAP fusion input must be F32 — the dtype a production front end emits"
+    );
+    feats
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -276,11 +286,16 @@ fn open_clip_vision_reachability(backbone_dtype: DType) {
         cfg.layers
     );
 
-    // A media tower's front end is a `Conv2d` (and, for HTSAT, a
-    // `BatchNorm`): unlike `jammi_lora::FrozenBase::Dense`, candle's conv
-    // does NOT cast its input to the weight dtype, so the caller supplies
-    // the batch in the backbone's dtype.
-    let pixels = vision_batch(&device, backbone_dtype);
+    // The PRODUCTION batch, F32 regardless of the backbone: a media tower's
+    // front end is a `Conv2d` whose raw candle op refuses a mismatched
+    // input, so `OpenClipVisionTransformer::forward` casts at its own edge.
+    // Feeding the pre-cast batch here would have hidden that edge entirely.
+    let pixels = vision_batch(&device);
+    assert_eq!(
+        pixels.dtype(),
+        DType::F32,
+        "the reachability oracle must drive the tower with the production F32 batch"
+    );
     let out = tower.forward(&pixels).unwrap();
     assert_eq!(out.dtype(), backbone_dtype);
     let loss = nonuniform_loss(&out, &device);
@@ -313,7 +328,16 @@ fn htsat_reachability(backbone_dtype: DType) {
          (stages - 1) + 2)"
     );
 
-    let feats = htsat_batch(&device, backbone_dtype);
+    // The PRODUCTION batch, F32 regardless of the backbone — see the
+    // sibling note in `open_clip_vision_reachability`; for HTSAT the
+    // refusing op is the leading `BatchNorm`'s centring `sub`, and
+    // `HtsatAudioEncoder::forward_front` is the edge that casts.
+    let feats = htsat_batch(&device);
+    assert_eq!(
+        feats.dtype(),
+        DType::F32,
+        "the reachability oracle must drive the tower with the production F32 batch"
+    );
     let out = tower.forward(&feats, &[true, true]).unwrap();
     assert_eq!(out.dtype(), backbone_dtype);
     let loss = nonuniform_loss(&out, &device);
@@ -359,6 +383,106 @@ fn a5_open_clip_vision_every_lora_param_is_reachable_at_f16() {
 #[test]
 fn a5_htsat_every_lora_param_is_reachable_at_f16() {
     htsat_reachability(DType::F16);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A5b: the media towers' input-dtype domain
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The cast lives at the tower's forward edge, so the two ways a caller can
+/// arrive at an F16 backbone — hand it the production F32 batch, or pre-cast
+/// that same batch to F16 first — must be INDISTINGUISHABLE, bit for bit.
+///
+/// Both halves are load-bearing:
+///
+/// * that the F32 batch is accepted AT ALL is the fix (before the edge cast,
+///   vision raised `dtype mismatch in conv2d` and audio `dtype mismatch in
+///   sub`, so every production front end was locked out of a reduced-
+///   precision backbone);
+/// * that it is accepted with the SAME BITS is what makes the edge a cast
+///   and not a second numeric path — a tower that, say, ran the front end in
+///   F32 and only narrowed later would pass an "it runs" test and silently
+///   diverge from every pre-cast caller.
+///
+/// The dtypes are asserted rather than assumed on both sides, so the oracle
+/// cannot go vacuous if a fixture helper's dtype ever changes: an F32-vs-F32
+/// comparison would trivially match.
+#[test]
+fn a5b_media_towers_at_f16_accept_an_f32_batch_bit_identically_to_a_pre_cast_one() {
+    let device = Device::Cpu;
+    let dt = DType::F16;
+    let frozen = LoraFixture::new(&[]);
+
+    // Vision.
+    let vcfg = OpenClipVisionConfig::from_open_clip_config(&open_clip_json()).unwrap();
+    let vvm = VarMap::new();
+    let vision = OpenClipVisionTransformer::builder()
+        .lora(frozen.config(LoraInitMode::ZerosB))
+        .backbone_dtype(dt)
+        .build(
+            &[open_clip_dir()
+                .join("open_clip_model.safetensors")
+                .as_path()],
+            &vcfg,
+            &device,
+            &vvm,
+        )
+        .unwrap();
+    assert_eq!(vision.dtype(), dt, "the vision backbone must really be F16");
+
+    let pixels_f32 = vision_batch(&device);
+    assert_eq!(pixels_f32.dtype(), DType::F32);
+    let pixels_f16 = pixels_f32.to_dtype(dt).unwrap();
+    assert_eq!(pixels_f16.dtype(), dt);
+
+    let from_f32 = vision.forward(&pixels_f32).unwrap();
+    let from_f16 = vision.forward(&pixels_f16).unwrap();
+    assert_eq!(
+        from_f32.dtype(),
+        dt,
+        "an F32 pixel batch must still produce a backbone-dtype embedding"
+    );
+    assert_eq!(
+        bits(&from_f32),
+        bits(&from_f16),
+        "open_clip_vision @ F16: an F32 batch and the same batch pre-cast to F16 must produce \
+         bit-identical embeddings"
+    );
+
+    // Audio.
+    let acfg = HtsatAudioConfig::from_hf_clap_config(&htsat_json()).unwrap();
+    let avm = VarMap::new();
+    let audio = HtsatAudio::builder()
+        .lora(frozen.config(LoraInitMode::ZerosB))
+        .backbone_dtype(dt)
+        .build(
+            &[htsat_dir().join("model.safetensors").as_path()],
+            &acfg,
+            &device,
+            &avm,
+        )
+        .unwrap();
+    assert_eq!(audio.dtype(), dt, "the audio backbone must really be F16");
+
+    let feats_f32 = htsat_batch(&device);
+    assert_eq!(feats_f32.dtype(), DType::F32);
+    let feats_f16 = feats_f32.to_dtype(dt).unwrap();
+    assert_eq!(feats_f16.dtype(), dt);
+
+    let is_longer = [true, true];
+    let from_f32 = audio.forward(&feats_f32, &is_longer).unwrap();
+    let from_f16 = audio.forward(&feats_f16, &is_longer).unwrap();
+    assert_eq!(
+        from_f32.dtype(),
+        dt,
+        "an F32 spectrogram must still produce a backbone-dtype embedding"
+    );
+    assert_eq!(
+        bits(&from_f32),
+        bits(&from_f16),
+        "htsat_audio @ F16: an F32 batch and the same batch pre-cast to F16 must produce \
+         bit-identical embeddings"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -419,7 +543,7 @@ fn a2_builder_frozen_and_zerosb_adapter_are_bit_identical_to_load() {
 
     // OpenCLIP vision.
     let vcfg = OpenClipVisionConfig::from_open_clip_config(&open_clip_json()).unwrap();
-    let pixels = vision_batch(&device, DType::F32);
+    let pixels = vision_batch(&device);
     let loaded = OpenClipVisionTransformer::load(vb.pp("visual"), &vcfg).unwrap();
     let reference = bits(&loaded.forward(&pixels).unwrap());
 
@@ -448,7 +572,7 @@ fn a2_builder_frozen_and_zerosb_adapter_are_bit_identical_to_load() {
     // HTSAT audio.
     let acfg = HtsatAudioConfig::from_hf_clap_config(&htsat_json()).unwrap();
     let hp = htsat_dir().join("model.safetensors");
-    let feats = htsat_batch(&device, DType::F32);
+    let feats = htsat_batch(&device);
     let vb = unsafe {
         VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&hp), DType::F32, &device).unwrap()
     };
@@ -590,14 +714,16 @@ fn a7_probe_input_forward_succeeds_on_every_tower() {
 /// could not have failed.
 ///
 /// `probe_input` builds the media batches itself, so the dtype it picks is
-/// the whole claim: a media tower's front end is a `Conv2d` (and, for HTSAT,
-/// a leading `BatchNorm`), and candle does NOT cast a conv/`sub` input up to
-/// the weight dtype the way `jammi_lora::FrozenBase::Dense` does. A batch
-/// manufactured at a hardcoded `F32` against an F16 backbone is a hard
-/// `dtype mismatch in conv2d` / `... in sub`, so this test is exactly the
-/// negative control the hardcoded version lacked. All three towers are built
-/// through their BUILDERS at `backbone_dtype = F16` (the only construction
-/// path that can produce a non-F32 backbone).
+/// the whole claim: `probe_input`'s contract is that EVERY field is derived
+/// from the encoder, and the dtype is the one field a hardcoded `F32` would
+/// silently get wrong on a reduced-precision backbone. That claim is
+/// asserted directly below (the manufactured pixels/spectrogram must carry
+/// the backbone dtype), which is a stricter check than "the forward runs":
+/// since `forward_input` now casts at each tower's own edge (A5b), a probe
+/// that HAD regressed to a hardcoded `F32` would still forward fine — only
+/// the dtype assertions catch it. All three towers are built through their
+/// BUILDERS at `backbone_dtype = F16` (the only construction path that can
+/// produce a non-F32 backbone).
 ///
 /// BF16 is absent for the same reason A5 omits it: candle-core 0.11's CPU
 /// matmul supports F16/F32/F64 only.
@@ -939,7 +1065,7 @@ fn adapter_round_trip_open_clip_vision() {
     let device = Device::Cpu;
     let cfg = OpenClipVisionConfig::from_open_clip_config(&open_clip_json()).unwrap();
     let ocp = open_clip_dir().join("open_clip_model.safetensors");
-    let pixels = vision_batch(&device, DType::F32);
+    let pixels = vision_batch(&device);
     adapter_round_trip(
         "open_clip_vision",
         |adapter, varmap, lora| {
@@ -959,7 +1085,7 @@ fn adapter_round_trip_htsat_audio() {
     let device = Device::Cpu;
     let cfg = HtsatAudioConfig::from_hf_clap_config(&htsat_json()).unwrap();
     let hp = htsat_dir().join("model.safetensors");
-    let feats = htsat_batch(&device, DType::F32);
+    let feats = htsat_batch(&device);
     adapter_round_trip(
         "htsat_audio",
         |adapter, varmap, lora| {

@@ -1052,6 +1052,155 @@ mod tests {
         }
     }
 
+    /// Same shape as
+    /// `crate::bert::tests::bert_head64_fused_attention_lora_gradients_match_eager_within_tolerance`
+    /// (contract fix-round item 2, precedent
+    /// `crate::modernbert::tests::fused_attention_block_matches_eager_lora_gradients_at_production_seq_on_head64`,
+    /// tol `1e-4`) — DistilBERT's own `out_lin` is applied to BOTH sides
+    /// identically before the loss's `dy` multiply, so it drops out of the
+    /// comparison and this still isolates the cascade's own fused-vs-eager
+    /// LoRA-gradient numerics, not merely finite/non-zero (that weaker
+    /// check is
+    /// [`distilbert_head64_fused_attention_lora_gradients_are_finite_and_nonzero`],
+    /// kept alongside as its own, narrower oracle).
+    #[test]
+    fn distilbert_head64_fused_attention_lora_gradients_match_eager_within_tolerance() {
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let (b, s, h) = (2usize, 5usize, 2usize);
+        let d = ATTENTION_BLOCK_HEAD_DIM;
+        let hd = h * d;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+
+        let q_lin = LoraLinear::new_with_base(
+            FrozenBase::Dense(seeded_linear(hd, hd, 1.0, &device)),
+            4,
+            8.0,
+            false,
+            LoraInitMode::Gaussian,
+            None,
+            21,
+            &varmap,
+            &vb.pp("q_lin"),
+        )
+        .unwrap();
+        let v_lin = LoraLinear::new_with_base(
+            FrozenBase::Dense(seeded_linear(hd, hd, 3.0, &device)),
+            4,
+            8.0,
+            false,
+            LoraInitMode::Gaussian,
+            None,
+            23,
+            &varmap,
+            &vb.pp("v_lin"),
+        )
+        .unwrap();
+        let attn = DistilBertSelfAttention {
+            q_lin: MaybeLoraLinear::Lora(q_lin),
+            k_lin: MaybeLoraLinear::Frozen(FrozenBase::Dense(seeded_linear(hd, hd, 2.0, &device))),
+            v_lin: MaybeLoraLinear::Lora(v_lin),
+            out_lin: MaybeLoraLinear::Frozen(FrozenBase::Dense(seeded_linear(
+                hd, hd, 4.0, &device,
+            ))),
+            num_attention_heads: h,
+            attention_head_size: d,
+            training: true,
+            rope_placeholder: Tensor::zeros((2, 1, 1, 64), DType::F32, &device).unwrap(),
+        };
+
+        let hidden_v: Vec<f32> = (0..b * s * hd)
+            .map(|i| ((i as f32) * 0.023).sin() * 0.3)
+            .collect();
+        let hidden = Tensor::from_vec(hidden_v, (b, s, hd), &device).unwrap();
+        let extended = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
+        let fused_masks = FusedAttentionMasks::build(&extended, None, DType::F32).unwrap();
+        let flash = declined_flash();
+        let dy_v: Vec<f32> = (0..b * s * hd)
+            .map(|i| ((i as f32) * 0.0071).cos() * 0.6 + 0.05)
+            .collect();
+        let dy = Tensor::from_vec(dy_v, (b, s, hd), &device).unwrap();
+
+        let before = crate::attention_block_dispatch_snapshot();
+        let out_fused = attn
+            .forward_training(&hidden, &extended, &fused_masks, &flash)
+            .expect("fused training forward");
+        let after = crate::attention_block_dispatch_snapshot();
+        assert!(after.fused > before.fused, "must dispatch fused at head64");
+        let loss_fused = (&out_fused * &dy).unwrap().sum_all().unwrap();
+        let grads_fused = loss_fused
+            .backward()
+            .expect("backward through the fused attention block");
+
+        let q = attn.q_lin.forward(&hidden).unwrap();
+        let k = attn.k_lin.forward(&hidden).unwrap();
+        let v = attn.v_lin.forward(&hidden).unwrap();
+        let qkv = Tensor::cat(&[&q, &k, &v], D::Minus1).unwrap();
+        let rope = RopeCtx {
+            pack: &attn.rope_placeholder,
+            enabled: false,
+            apply: None,
+        };
+        let ctx = attention_cascade::forward_eager_training_attention_composition(
+            &qkv,
+            b,
+            s,
+            h,
+            d,
+            &extended,
+            None,
+            &rope,
+            None,
+            FullyMaskedPolicy::Propagate,
+            true,
+        )
+        .expect("eager reference composition");
+        let out_eager = attn.out_lin.forward(&ctx).unwrap();
+        let loss_eager = (&out_eager * &dy).unwrap().sum_all().unwrap();
+        let grads_eager = loss_eager
+            .backward()
+            .expect("backward through the eager attention composition");
+
+        const TOL: f32 = 1e-4;
+        for (name, lin) in [("q_lin", &attn.q_lin), ("v_lin", &attn.v_lin)] {
+            let MaybeLoraLinear::Lora(l) = lin else {
+                panic!("{name} must be LoRA-wrapped in this fixture")
+            };
+            for t in l.trainable_params() {
+                let gf: Vec<f32> = grads_fused
+                    .get(t)
+                    .unwrap_or_else(|| panic!("no fused-arm gradient reached {name}'s LoRA tensor"))
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap();
+                let ge: Vec<f32> = grads_eager
+                    .get(t)
+                    .unwrap_or_else(|| panic!("no eager-arm gradient reached {name}'s LoRA tensor"))
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap();
+                assert_eq!(gf.len(), ge.len());
+                assert!(
+                    gf.iter().all(|x| x.is_finite()) && ge.iter().all(|x| x.is_finite()),
+                    "{name}'s LoRA gradients must be finite on both arms: fused={gf:?} eager={ge:?}"
+                );
+                let mut max_delta = 0f32;
+                for (&f, &e) in gf.iter().zip(ge.iter()) {
+                    max_delta = max_delta.max((f - e).abs());
+                }
+                assert!(
+                    max_delta <= TOL,
+                    "{name}'s LoRA gradient: fused vs eager max|Δ|={max_delta:e} > {TOL:e}"
+                );
+            }
+        }
+    }
+
     /// Same shape as `crate::bert::tests::bert_strict_mode_on_a_refused_domain_is_a_typed_error_in_a_fresh_process`.
     #[test]
     fn distilbert_strict_mode_on_a_refused_domain_is_a_typed_error_in_a_fresh_process() {

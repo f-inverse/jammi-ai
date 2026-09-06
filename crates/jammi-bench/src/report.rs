@@ -1538,7 +1538,11 @@ pub struct FinetuneStepTier {
     /// `rope_fused_dispatches` / `softmax_fused_dispatches` /
     /// `geglu_fused_dispatches`, for the C-MLP fused-kernels commit (see
     /// `jammi_encoders::activations::gelu_erf`'s doc). Read via
-    /// `jammi_kernels::admission::counters_for("gelu")`, the same
+    /// `jammi_kernels::admission::counters_for("gelu_erf_fused")` — the
+    /// SAME key `jammi_encoders::activations::gelu_erf`'s own `admit()`
+    /// call registers its counters under (a mismatched key here would
+    /// silently read an always-zero, never-incremented counter instead of
+    /// the one production actually dispatches through), the same
     /// process-wide registry `adamw_fused_dispatches` reads directly
     /// rather than through a crate-local wrapper — this counter has no
     /// `jammi_encoders`-side snapshot function of its own, since the call
@@ -2198,7 +2202,7 @@ pub struct FinetuneRunTier {
     /// The BERT-family GELU-erf positive-proof pair (C-MLP): mirrors
     /// [`FinetuneStepTier::gelu_fused_dispatches`]'s own doc for the
     /// production call site and the read API
-    /// (`jammi_kernels::admission::counters_for("gelu")`, taken as a
+    /// (`jammi_kernels::admission::counters_for("gelu_erf_fused")`, taken as a
     /// before/after delta over this run's whole resume-cycled epoch loop,
     /// the same convention every counter in this block uses). ModernBert
     /// never calls the standalone `gelu_erf` seam this pair tracks (its

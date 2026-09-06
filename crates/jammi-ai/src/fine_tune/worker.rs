@@ -2462,6 +2462,32 @@ fn validate_backbone_precision(
 // honestly-labelled `"capability_or_domain_miss"` rather than a fabricated
 // verbatim key that does not exist on any public surface today.
 //
+// **The BERT/DistilBERT case, named honestly (issue #462 follow-up):** both
+// families' training forward always calls
+// `attention_cascade::training_attention_cascade` with `flash: &FlashDecision::
+// Declined { outcome: CapabilityMiss, reason: "flash_transport_not_wired" }`
+// — the ONE reason value either family's `FlashDecision::Declined` ever
+// carries, because neither wires the encoder-boundary flash transport
+// protocol (`crates/jammi-encoders/src/bert.rs:418-420`,
+// `crates/jammi-encoders/src/distilbert.rs:315-317`). That means a
+// BERT-family job's `"capability_or_domain_miss"` on this report's `flash`
+// field is, today, ALWAYS specifically a `"flash_transport_not_wired"`
+// decline — but this module still cannot say so: `admit_cascade`
+// (`crates/jammi-kernels/src/admission.rs:391-421`) records the decline only
+// as an atomic increment on `CascadeDispatchCounters` (`fused`/`eager`/
+// `declined`, `crates/jammi-kernels/src/admission.rs:317-321` — no reason
+// field at all), and never calls `record_probe_miss`
+// (`crates/jammi-kernels/src/admission.rs:732`), which is reached ONLY from
+// `admit_inner` (`crates/jammi-kernels/src/admission.rs:1244,1267,1286`) —
+// the function backing plain `admit`, not `admit_cascade`. So the
+// `predicate_name` a cascade caller passes (`flash.reason()`,
+// `crates/jammi-encoders/src/attention_cascade.rs:599-604`) reaches NO probe-
+// capture window a caller outside `jammi-encoders` can read back — jammi-ai
+// has no channel to thread `"flash_transport_not_wired"` through, and this
+// report does not invent one. A future `admit_cascade` that also records into
+// the probe-capture sink would close this gap without changing anything on
+// this side.
+//
 // **Single-worker-per-process attribution precondition** (advisory 6): the
 // before/after dispatch-registry delta this probe reads is attributed to
 // THIS job's own probe call, which is correct as long as no OTHER job's
@@ -2673,7 +2699,11 @@ fn flash_report_no_probe_attempted(device: &candle_core::Device) -> serde_json::
 /// reads the `attention_block_flash` cascade delta, which can only report the
 /// coarse `"capability_or_domain_miss"` on a decline — `admit_cascade` has no
 /// `fallback_warnings`-shaped reason channel a caller can read a verbatim
-/// predicate key back from (see this section's module doc).
+/// predicate key back from (see this section's module doc). For a BERT/
+/// DistilBERT job specifically, that coarse value is always, today, a
+/// `"flash_transport_not_wired"` decline — see this section's module doc's
+/// "The BERT/DistilBERT case, named honestly" paragraph for why this
+/// function still cannot say so.
 fn flash_report(
     device: &candle_core::Device,
     probe_ok: bool,

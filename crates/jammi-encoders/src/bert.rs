@@ -20,14 +20,19 @@ use std::path::Path;
 
 use candle_core::{DType, Device, Tensor, D};
 use candle_nn::{embedding, linear, Embedding, Linear, Module, VarBuilder, VarMap};
+use jammi_kernels::admission::PredicateOutcome;
+use jammi_kernels::ops::FullyMaskedPolicy;
 use jammi_lora::{
     effective_rank, should_apply_lora, FrozenBase, LoraBuildConfig, LoraLinear, MaybeLoraLinear,
 };
 
+use crate::activations;
+use crate::attention_cascade::{self, FusedAttentionMasks, RopeCtx, TrainingMaskInputs};
 use crate::error::EncoderError;
 use crate::frozen_weight_source::{validate_frozen_base_geometry, FrozenWeightLookup};
 use crate::layer_norm::LayerNorm;
 use crate::mask::extended_attention_mask;
+use crate::modernbert::FlashDecision;
 use crate::pooling::{pool_and_normalize, Pooling};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -120,6 +125,23 @@ struct BertSelfAttention {
     value: MaybeLoraLinear,
     num_attention_heads: usize,
     attention_head_size: usize,
+    /// Whether this module is in training mode — wired through
+    /// [`Bert::set_training`], mirroring `ModernBertAttention::training`.
+    /// Consulted only as a `debug_assert!` guard in [`Self::forward_training`]
+    /// (that method's only legitimate caller, `Bert::forward_hidden`'s
+    /// training branch, never invokes it otherwise); [`Self::forward`]
+    /// (eval) never reads it — eval's code path is byte-for-byte unchanged.
+    training: bool,
+    /// A `[2, 1, 1, 64]` placeholder handed to the shared attention
+    /// cascade's `rope_pack` argument — BERT has no RoPE at all (absolute
+    /// position embeddings are summed into the input once, in
+    /// [`BertEmbeddings::forward`], never applied per layer), so this
+    /// tensor is never read (see [`RopeCtx`]'s own doc: the fused ops only
+    /// consult `rope_pack` when `rope == true`, which BERT's cascade call
+    /// never sets). Allocated ONCE, at build time
+    /// (`tests::rope_placeholder_is_allocated_once_per_module_and_never_reallocated`),
+    /// not per forward.
+    rope_placeholder: Tensor,
 }
 
 impl BertSelfAttention {
@@ -156,6 +178,70 @@ impl BertSelfAttention {
         let context = context.transpose(1, 2)?.contiguous()?;
         Ok(context.flatten_from(D::Minus2)?)
     }
+
+    /// Training's arm: routes through the shared
+    /// [`attention_cascade::training_attention_cascade`] (issue #462) —
+    /// `qkv = Tensor::cat(&[q, k, v], D::Minus1)` (the cat bridge, `[B, S,
+    /// 3*hidden]`; see this module's doc for the forward-copy/backward-zero-fill
+    /// cost this bridge carries on BOTH the fused and eager arms of the
+    /// cascade), `rope` disabled (BERT has no RoPE), `window: None` (BERT
+    /// has no sliding-window concept — every layer is "global"), `policy:
+    /// Propagate` (reproduces `candle_nn::ops::softmax`'s own behaviour on
+    /// an all-padding row exactly, unlike ModernBERT's `Zeros` — see this
+    /// module's doc), and `flash` always `Declined { CapabilityMiss,
+    /// "flash_transport_not_wired" }` — BERT never wires the encoder-boundary
+    /// flash transport protocol (a separate line of work; the flash cascade
+    /// counter still fires, declined, on every training forward, never
+    /// silently).
+    fn forward_training(
+        &self,
+        hidden: &Tensor,
+        extended_mask: &Tensor,
+        fused: &FusedAttentionMasks,
+        flash: &FlashDecision,
+    ) -> Result<Tensor, EncoderError> {
+        debug_assert!(
+            self.training,
+            "BertSelfAttention::forward_training called outside training mode"
+        );
+        let q = self.query.forward(hidden)?;
+        let k = self.key.forward(hidden)?;
+        let v = self.value.forward(hidden)?;
+        let qkv = Tensor::cat(&[&q, &k, &v], D::Minus1)?;
+        let (batch, seq, _) = hidden.dims3()?;
+        let h = self.num_attention_heads;
+        let d = self.attention_head_size;
+        let masks = TrainingMaskInputs {
+            extended: extended_mask,
+            local_band: None,
+            fused: Some(fused),
+        };
+        let rope = RopeCtx {
+            pack: &self.rope_placeholder,
+            enabled: false,
+            apply: None,
+        };
+        attention_cascade::training_attention_cascade(
+            &qkv,
+            batch,
+            seq,
+            h,
+            d,
+            masks,
+            flash,
+            &rope,
+            None,
+            FullyMaskedPolicy::Propagate,
+            |_admission| {
+                Err(EncoderError::Config(
+                    "attention_block_flash dispatched Fused but BERT always supplies \
+                     FlashDecision::Declined -- unreachable: admit_cascade can only report \
+                     Fused when flash.outcome() is Holds, which Declined can never be"
+                        .into(),
+                ))
+            },
+        )
+    }
 }
 
 struct BertSelfOutput {
@@ -180,16 +266,34 @@ impl BertAttention {
         let self_outputs = self.self_attention.forward(hidden, extended_mask)?;
         self.self_output.forward(&self_outputs, hidden)
     }
+
+    fn forward_training(
+        &self,
+        hidden: &Tensor,
+        extended_mask: &Tensor,
+        fused: &FusedAttentionMasks,
+        flash: &FlashDecision,
+    ) -> Result<Tensor, EncoderError> {
+        let self_outputs =
+            self.self_attention
+                .forward_training(hidden, extended_mask, fused, flash)?;
+        self.self_output.forward(&self_outputs, hidden)
+    }
 }
 
 struct BertIntermediate {
     dense: MaybeLoraLinear,
+    /// Wired through [`Bert::set_training`]. `false` (eval) makes
+    /// [`Self::forward`]'s `activations::gelu_erf` call byte-for-byte
+    /// identical to the plain `hidden.gelu_erf()` this method called before
+    /// the GELU seam existed — see `activations::gelu_erf`'s own doc.
+    training: bool,
 }
 
 impl BertIntermediate {
     fn forward(&self, hidden: &Tensor) -> Result<Tensor, EncoderError> {
         let hidden = self.dense.forward(hidden)?;
-        Ok(hidden.gelu_erf()?)
+        activations::gelu_erf(&hidden, self.training)
     }
 }
 
@@ -217,6 +321,20 @@ impl BertLayer {
         let intermediate_output = self.intermediate.forward(&attention_output)?;
         self.output.forward(&intermediate_output, &attention_output)
     }
+
+    fn forward_training(
+        &self,
+        hidden: &Tensor,
+        extended_mask: &Tensor,
+        fused: &FusedAttentionMasks,
+        flash: &FlashDecision,
+    ) -> Result<Tensor, EncoderError> {
+        let attention_output =
+            self.attention
+                .forward_training(hidden, extended_mask, fused, flash)?;
+        let intermediate_output = self.intermediate.forward(&attention_output)?;
+        self.output.forward(&intermediate_output, &attention_output)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -232,6 +350,14 @@ pub struct Bert {
     pooling: Pooling,
     hidden_size: usize,
     max_position_embeddings: usize,
+    /// Wired through [`Self::set_training`]. `forward_hidden` reads this
+    /// ONCE per forward, before the layer loop, to decide which of the two
+    /// call chains to take and — in training — to build the per-forward
+    /// mask bundle and flash-cascade decision once, mirroring
+    /// `ModernBert::forward_hidden`'s own once-per-forward construction
+    /// (see [`FusedAttentionMasks`]'s doc for why per-layer would be
+    /// wasteful).
+    training: bool,
 }
 
 impl Bert {
@@ -257,7 +383,13 @@ impl Bert {
         self.max_position_embeddings
     }
 
-    /// Raw `[batch, seq, hidden]` output before pooling.
+    /// Raw `[batch, seq, hidden]` output before pooling. Eval (the default,
+    /// `self.training == false`) is BYTE-FOR-BYTE UNCHANGED — the very same
+    /// `for layer in &self.layers { hidden = layer.forward(..) }` loop this
+    /// method always ran. Training builds the per-forward mask bundle and
+    /// flash-cascade decision ONCE (mirroring `ModernBert::forward_hidden`)
+    /// and routes every layer through `BertLayer::forward_training`/
+    /// `attention_cascade::training_attention_cascade` instead.
     pub fn forward_hidden(
         &self,
         input_ids: &Tensor,
@@ -273,8 +405,27 @@ impl Bert {
         let token_type_ids = Tensor::zeros(input_ids.shape(), DType::U32, input_ids.device())?;
         let mut hidden = self.embeddings.forward(input_ids, &token_type_ids)?;
         let extended = extended_attention_mask(mask)?;
-        for layer in &self.layers {
-            hidden = layer.forward(&hidden, &extended)?;
+        if self.training {
+            // BERT has no local-attention layers at all, so the fused
+            // masks bundle only ever populates `global` — see
+            // `FusedAttentionMasks`'s own doc.
+            let fused = FusedAttentionMasks::build(&extended, None, hidden.dtype())?;
+            // BERT never wires the encoder-boundary flash transport
+            // protocol (a separate line of work — see
+            // `BertSelfAttention::forward_training`'s doc): every training
+            // forward reports `attention_block_flash` declined, counted,
+            // never silent.
+            let flash = FlashDecision::Declined {
+                outcome: PredicateOutcome::CapabilityMiss,
+                reason: "flash_transport_not_wired",
+            };
+            for layer in &self.layers {
+                hidden = layer.forward_training(&hidden, &extended, &fused, &flash)?;
+            }
+        } else {
+            for layer in &self.layers {
+                hidden = layer.forward(&hidden, &extended)?;
+            }
         }
         Ok(hidden)
     }
@@ -350,12 +501,17 @@ impl Bert {
     }
 
     /// Switch every LoRA-wrapped linear and LayerNorm into / out of training
-    /// mode. LoRA layers gate dropout; LayerNorms switch between the fused
-    /// no-bwd eval kernel and the primitive-op composition whose backward is
+    /// mode, and (issue #462) `self` itself, plus each layer's attention/FFN
+    /// sub-structs — the flags [`Self::forward_hidden`]/
+    /// `BertIntermediate::forward` consult to pick their call chain. LoRA
+    /// layers gate dropout; LayerNorms switch between the fused no-bwd eval
+    /// kernel and the primitive-op composition whose backward is
     /// well-defined.
     pub fn set_training(&mut self, training: bool) {
+        self.training = training;
         self.embeddings.layer_norm.set_training(training);
         for layer in &mut self.layers {
+            layer.attention.self_attention.training = training;
             layer.attention.self_attention.query.set_training(training);
             layer.attention.self_attention.key.set_training(training);
             layer.attention.self_attention.value.set_training(training);
@@ -365,6 +521,7 @@ impl Bert {
                 .self_output
                 .layer_norm
                 .set_training(training);
+            layer.intermediate.training = training;
             layer.intermediate.dense.set_training(training);
             layer.output.dense.set_training(training);
             layer.output.layer_norm.set_training(training);
@@ -572,6 +729,15 @@ impl<'a> BertBuilder<'a> {
                 layer_vb.pp("output.LayerNorm"),
             )?;
 
+            // The attention cascade's `rope_pack` placeholder (issue #462):
+            // `[2, 1, 1, 64]`, allocated once here, never read (BERT has no
+            // RoPE — see `BertSelfAttention`'s own doc). `64` is
+            // `ATTENTION_BLOCK_HEAD_DIM`-shaped by convention only; the
+            // fused ops never validate this tensor's shape when `rope ==
+            // false` (see `RopeCtx`'s doc), so the literal here need not
+            // track `head_dim` at all.
+            let rope_placeholder = Tensor::zeros((2, 1, 1, 64), DType::F32, device)?;
+
             layers.push(BertLayer {
                 attention: BertAttention {
                     self_attention: BertSelfAttention {
@@ -580,6 +746,8 @@ impl<'a> BertBuilder<'a> {
                         value,
                         num_attention_heads: config.num_attention_heads,
                         attention_head_size: head_dim,
+                        training: false,
+                        rope_placeholder,
                     },
                     self_output: BertSelfOutput {
                         dense: attn_output_dense,
@@ -588,6 +756,7 @@ impl<'a> BertBuilder<'a> {
                 },
                 intermediate: BertIntermediate {
                     dense: intermediate_dense,
+                    training: false,
                 },
                 output: BertOutput {
                     dense: output_dense,
@@ -602,6 +771,7 @@ impl<'a> BertBuilder<'a> {
             pooling: self.pooling,
             hidden_size: config.hidden_size,
             max_position_embeddings: config.max_position_embeddings,
+            training: false,
         })
     }
 }
@@ -687,5 +857,346 @@ impl LoraSite<'_, '_> {
         } else {
             Ok(MaybeLoraLinear::Frozen(base))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Var;
+    use jammi_kernels::ops::ATTENTION_BLOCK_HEAD_DIM;
+    use jammi_lora::LoraInitMode;
+
+    use crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK;
+
+    fn seeded_linear(rows: usize, cols: usize, phase: f32, device: &Device) -> Linear {
+        let v: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i as f32 + phase) * 0.0137).sin() * 0.2)
+            .collect();
+        Linear::new(Tensor::from_vec(v, (rows, cols), device).unwrap(), None)
+    }
+
+    fn declined_flash() -> FlashDecision {
+        FlashDecision::Declined {
+            outcome: PredicateOutcome::CapabilityMiss,
+            reason: "test_stub_flash_declined",
+        }
+    }
+
+    fn self_attention_fixture(h: usize, d: usize, device: &Device) -> BertSelfAttention {
+        let hd = h * d;
+        BertSelfAttention {
+            query: MaybeLoraLinear::Frozen(FrozenBase::Dense(seeded_linear(hd, hd, 1.0, device))),
+            key: MaybeLoraLinear::Frozen(FrozenBase::Dense(seeded_linear(hd, hd, 2.0, device))),
+            value: MaybeLoraLinear::Frozen(FrozenBase::Dense(seeded_linear(hd, hd, 3.0, device))),
+            num_attention_heads: h,
+            attention_head_size: d,
+            training: true,
+            rope_placeholder: Tensor::zeros((2, 1, 1, 64), DType::F32, device).unwrap(),
+        }
+    }
+
+    /// The encoder-level tolerance oracle (contract R6'/R2', the crate's own
+    /// precedent — `crate::modernbert::tests::fused_training_attention_block_matches_eager_composition_within_tolerance_global`,
+    /// tol `1e-4`): at head64, `BertSelfAttention::forward_training`'s fused
+    /// arm (`AttentionBlockFused`, `FullyMaskedPolicy::Propagate`) must
+    /// match the shared cascade's own eager composition
+    /// (`attention_cascade::forward_eager_training_attention_composition`,
+    /// called directly here to force the eager path without disabling any
+    /// process-wide admission switch) within `1e-4` on identical `q`/`k`/`v`.
+    #[test]
+    fn bert_head64_fused_attention_matches_eager_composition_within_tolerance() {
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let (b, s, h) = (2usize, 5usize, 2usize);
+        let d = ATTENTION_BLOCK_HEAD_DIM;
+        let attn = self_attention_fixture(h, d, &device);
+        let hidden_v: Vec<f32> = (0..b * s * h * d)
+            .map(|i| ((i as f32) * 0.031).sin() * 0.4)
+            .collect();
+        let hidden = Tensor::from_vec(hidden_v, (b, s, h * d), &device).unwrap();
+        let extended = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
+        let fused_masks = FusedAttentionMasks::build(&extended, None, DType::F32).unwrap();
+        let flash = declined_flash();
+
+        let before = crate::attention_block_dispatch_snapshot();
+        let out_fused = attn
+            .forward_training(&hidden, &extended, &fused_masks, &flash)
+            .expect("fused training forward");
+        let after = crate::attention_block_dispatch_snapshot();
+        assert!(
+            after.fused > before.fused,
+            "head64 must actually dispatch the fused arm (before={before:?}, after={after:?})"
+        );
+
+        let q = attn.query.forward(&hidden).unwrap();
+        let k = attn.key.forward(&hidden).unwrap();
+        let v = attn.value.forward(&hidden).unwrap();
+        let qkv = Tensor::cat(&[&q, &k, &v], D::Minus1).unwrap();
+        let rope = RopeCtx {
+            pack: &attn.rope_placeholder,
+            enabled: false,
+            apply: None,
+        };
+        let out_eager = attention_cascade::forward_eager_training_attention_composition(
+            &qkv,
+            b,
+            s,
+            h,
+            d,
+            &extended,
+            None,
+            &rope,
+            None,
+            FullyMaskedPolicy::Propagate,
+            true,
+        )
+        .expect("eager reference composition");
+
+        let fv: Vec<f32> = out_fused.flatten_all().unwrap().to_vec1().unwrap();
+        let ev: Vec<f32> = out_eager.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(fv.len(), ev.len());
+        assert!(fv.iter().all(|x| x.is_finite()) && ev.iter().all(|x| x.is_finite()));
+        let max_diff = fv
+            .iter()
+            .zip(&ev)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "fused vs eager attention diverged beyond tolerance: max|Δ|={max_diff}"
+        );
+    }
+
+    /// The all-padding-row case (contract R3'/R6'): one sequence entirely
+    /// masked. Under `Propagate`, the fused arm must reproduce the eager
+    /// composition's own (finite, `MASKED_LOGIT`-convention) output on that
+    /// row exactly like every other row — no `Zeros`-style third numeric
+    /// path exists for BERT (see `BertSelfAttention::forward_training`'s
+    /// doc: `Propagate` is the ONE policy this crate's BERT/DistilBERT
+    /// callers ever construct).
+    #[test]
+    fn bert_head64_all_padding_row_propagate_fused_matches_eager_within_tolerance() {
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let (b, s, h) = (2usize, 4usize, 1usize);
+        let d = ATTENTION_BLOCK_HEAD_DIM;
+        let attn = self_attention_fixture(h, d, &device);
+        let hidden_v: Vec<f32> = (0..b * s * h * d)
+            .map(|i| ((i as f32) * 0.021).cos() * 0.3)
+            .collect();
+        let hidden = Tensor::from_vec(hidden_v, (b, s, h * d), &device).unwrap();
+        // Row 0 real, row 1 entirely padding.
+        let mask = Tensor::from_slice(
+            &[1.0f32, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            (b, 1, 1, s),
+            &device,
+        )
+        .unwrap();
+        let extended = mask.affine(-10_000.0_f64, 10_000.0).unwrap();
+        let fused_masks = FusedAttentionMasks::build(&extended, None, DType::F32).unwrap();
+        let flash = declined_flash();
+
+        let out_fused = attn
+            .forward_training(&hidden, &extended, &fused_masks, &flash)
+            .expect("fused training forward on an all-padding row");
+
+        let q = attn.query.forward(&hidden).unwrap();
+        let k = attn.key.forward(&hidden).unwrap();
+        let v = attn.value.forward(&hidden).unwrap();
+        let qkv = Tensor::cat(&[&q, &k, &v], D::Minus1).unwrap();
+        let rope = RopeCtx {
+            pack: &attn.rope_placeholder,
+            enabled: false,
+            apply: None,
+        };
+        let out_eager = attention_cascade::forward_eager_training_attention_composition(
+            &qkv,
+            b,
+            s,
+            h,
+            d,
+            &extended,
+            None,
+            &rope,
+            None,
+            FullyMaskedPolicy::Propagate,
+            true,
+        )
+        .expect("eager reference composition on an all-padding row");
+
+        let fv: Vec<f32> = out_fused.flatten_all().unwrap().to_vec1().unwrap();
+        let ev: Vec<f32> = out_eager.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(fv.iter().all(|x| x.is_finite()) && ev.iter().all(|x| x.is_finite()));
+        let max_diff = fv
+            .iter()
+            .zip(&ev)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "all-padding-row Propagate: fused vs eager diverged beyond tolerance: max|Δ|={max_diff}"
+        );
+    }
+
+    /// LoRA gradients on both `query` and `value` must be finite and
+    /// non-zero after a fused-arm training forward+backward at head64 —
+    /// the fused whole-attention-block op's own backward reaches every
+    /// LoRA `A`/`B` tensor through the SAME `Wqkv`-projection chain the
+    /// eager composition would (contract R6' precedent:
+    /// `crate::modernbert::tests::fused_attention_block_matches_eager_lora_gradients_at_production_seq_on_head64`).
+    #[test]
+    fn bert_head64_fused_attention_lora_gradients_are_finite_and_nonzero() {
+        let _guard = ATTENTION_BLOCK_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let device = Device::Cpu;
+        let (b, s, h) = (2usize, 5usize, 2usize);
+        let d = ATTENTION_BLOCK_HEAD_DIM;
+        let hd = h * d;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+
+        let query = LoraLinear::new_with_base(
+            FrozenBase::Dense(seeded_linear(hd, hd, 1.0, &device)),
+            4,
+            8.0,
+            false,
+            LoraInitMode::Gaussian,
+            None,
+            11,
+            &varmap,
+            &vb.pp("query"),
+        )
+        .unwrap();
+        let value = LoraLinear::new_with_base(
+            FrozenBase::Dense(seeded_linear(hd, hd, 3.0, &device)),
+            4,
+            8.0,
+            false,
+            LoraInitMode::Gaussian,
+            None,
+            13,
+            &varmap,
+            &vb.pp("value"),
+        )
+        .unwrap();
+        let attn = BertSelfAttention {
+            query: MaybeLoraLinear::Lora(query),
+            key: MaybeLoraLinear::Frozen(FrozenBase::Dense(seeded_linear(hd, hd, 2.0, &device))),
+            value: MaybeLoraLinear::Lora(value),
+            num_attention_heads: h,
+            attention_head_size: d,
+            training: true,
+            rope_placeholder: Tensor::zeros((2, 1, 1, 64), DType::F32, &device).unwrap(),
+        };
+
+        let hidden_v: Vec<f32> = (0..b * s * hd)
+            .map(|i| ((i as f32) * 0.019).sin() * 0.3)
+            .collect();
+        let hidden =
+            Var::from_tensor(&Tensor::from_vec(hidden_v, (b, s, hd), &device).unwrap()).unwrap();
+        let extended = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
+        let fused_masks = FusedAttentionMasks::build(&extended, None, DType::F32).unwrap();
+        let flash = declined_flash();
+
+        let before = crate::attention_block_dispatch_snapshot();
+        let out = attn
+            .forward_training(hidden.as_tensor(), &extended, &fused_masks, &flash)
+            .expect("fused training forward");
+        let after = crate::attention_block_dispatch_snapshot();
+        assert!(after.fused > before.fused, "must dispatch fused at head64");
+
+        let loss = out.sum_all().unwrap();
+        let grads = loss
+            .backward()
+            .expect("backward through the fused attention block");
+
+        for (name, lin) in [("query", &attn.query), ("value", &attn.value)] {
+            let MaybeLoraLinear::Lora(l) = lin else {
+                panic!("{name} must be LoRA-wrapped in this fixture")
+            };
+            for t in l.trainable_params() {
+                let g = grads
+                    .get(t)
+                    .unwrap_or_else(|| panic!("no gradient reached {name}'s LoRA tensor"));
+                let gv: Vec<f32> = g.flatten_all().unwrap().to_vec1().unwrap();
+                assert!(
+                    gv.iter().all(|x| x.is_finite()),
+                    "{name}'s LoRA gradient must be finite: {gv:?}"
+                );
+                assert!(
+                    gv.iter().any(|x| *x != 0.0),
+                    "{name}'s LoRA gradient must be non-vacuously non-zero"
+                );
+            }
+        }
+    }
+
+    /// Strict mode on a refused domain (family K2): a `head_dim != 64`
+    /// shape is a `false` outcome from `attention_block_admission_predicate`
+    /// — `BertSelfAttention::forward_training` reaches it through `admit()`
+    /// (a two-arm dispatch: no `DomainMiss`/`CapabilityMiss` split exists at
+    /// that level, unlike the cascade arms — see `admit`'s own doc), so
+    /// under `Strict` ANY failed predicate is `KernelError::StrictModeFallback`,
+    /// unconditionally. `JAMMI_KERNELS_STRICT` is a process-wide `OnceLock`
+    /// (`admission_mode`'s own doc), so this runs in a FRESH child process —
+    /// the same pattern
+    /// `crate::modernbert::tests::strict_mode_padded_flash_dispatch_is_unchanged_in_a_fresh_process`
+    /// uses.
+    #[test]
+    fn bert_strict_mode_on_a_refused_domain_is_a_typed_error_in_a_fresh_process() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(exe)
+            .args([
+                "bert::tests::strict_mode_child_process_body",
+                "--exact",
+                "--nocapture",
+                "--ignored",
+            ])
+            .env("JAMMI_KERNELS_STRICT", "1")
+            .output()
+            .expect("spawn child test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "child process assertion failed: stdout={stdout}\nstderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the child process must have actually run (and passed) exactly one test -- \
+             stdout={stdout}"
+        );
+    }
+
+    /// Only meaningful inside the child process the test above spawns.
+    /// `#[ignore]`d so the NORMAL (non-Strict) test run never executes it
+    /// directly — only the `--ignored --exact` child-process invocation
+    /// does.
+    #[test]
+    #[ignore]
+    fn strict_mode_child_process_body() {
+        let device = Device::Cpu;
+        let (b, s, h, d) = (1usize, 4usize, 1usize, 16usize);
+        let attn = self_attention_fixture(h, d, &device);
+        let hidden_v: Vec<f32> = (0..b * s * h * d).map(|i| i as f32 * 0.01).collect();
+        let hidden = Tensor::from_vec(hidden_v, (b, s, h * d), &device).unwrap();
+        let extended = Tensor::zeros((b, 1, 1, s), DType::F32, &device).unwrap();
+        let fused_masks = FusedAttentionMasks::build(&extended, None, DType::F32).unwrap();
+        let flash = declined_flash();
+
+        let err = attn
+            .forward_training(&hidden, &extended, &fused_masks, &flash)
+            .expect_err("head_dim=16 under Strict must be a typed refusal, not a silent eager");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("attention_block_fused") || msg.contains("head_dim"),
+            "expected a StrictModeFallback naming the refused op/predicate: {msg}"
+        );
     }
 }

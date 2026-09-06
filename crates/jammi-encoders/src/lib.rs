@@ -33,6 +33,10 @@ pub mod precision;
 mod activations;
 mod any;
 mod attention;
+// The shared per-layer fused-attention cascade (flash → mem_efficient →
+// attention_block_fused → eager) — see its own module doc. Extracted from
+// `modernbert` (issue #462) so `bert`/`distilbert` can share it too.
+mod attention_cascade;
 mod error;
 // The wave-3 GGUF-quantized-weight construction seam (`FrozenWeightLookup`)
 // shared by `bert`/`distilbert`/`modernbert` — see its own module doc.

@@ -38,21 +38,38 @@ use jammi_kernels::admission::{
     flash_validated_arches, op_disabled, probe_cuda_compute_capability, CascadeOutcome,
     ComputeCapability, DispatchCounters, DispatchOutcome, PredicateOutcome,
 };
-use jammi_kernels::ops::{
-    apply1, apply2, apply3, mem_efficient_attention, AttentionBlockFused, FullyMaskedPolicy,
-    MemEfficientAttention, RopeFused, SoftmaxLastDimFused, ATTENTION_BLOCK_HEAD_DIM,
-    ATTENTION_BLOCK_MAX_SEQ, MAX_HEAD_DIM, MAX_LAST_DIM, MAX_RANK, MEM_EFFICIENT_MAX_SEQ,
-    MEM_EFFICIENT_MIN_CHUNK,
-};
+use jammi_kernels::ops::{apply1, apply3, FullyMaskedPolicy, RopeFused, MAX_HEAD_DIM};
 use jammi_lora::{
     effective_rank, should_apply_lora, FrozenBase, LoraBuildConfig, LoraLinear, MaybeLoraLinear,
 };
 
+use crate::attention_cascade::{
+    self, mem_efficient_attention_predicate, FusedAttentionMasks, LocalWindow, RopeCtx,
+    TrainingMaskInputs,
+};
+// `attention_block_admission_predicate`/`softmax_admission_predicate` are
+// used only by this module's own `#[cfg(test)]` unit tests now (production
+// reaches them through `attention_cascade::training_attention_cascade`/
+// `attention_cascade::softmax_apply_training` directly) — imported under
+// `#[cfg(test)]` so every existing `attention_block_admission_predicate(..)`/
+// `softmax_admission_predicate(..)` call in `mod tests` (via `use super::*`)
+// keeps resolving unmodified, with no unused-import warning on a plain
+// build.
+#[cfg(test)]
+use crate::attention_cascade::{attention_block_admission_predicate, softmax_admission_predicate};
+// Constants this module's own `#[cfg(test)] mod tests` still names directly
+// (`use super::*`) — production no longer names them itself (the moved
+// predicates/composition in `attention_cascade` do), so these are
+// `#[cfg(test)]`-only re-imports, same rationale as the predicates above.
 use crate::error::EncoderError;
 use crate::frozen_weight_source::{validate_frozen_base_geometry, FrozenWeightLookup};
 use crate::layer_norm::LayerNorm;
 use crate::mask::{extended_attention_mask, sliding_window_mask};
 use crate::pooling::{pool_and_normalize, Pooling};
+#[cfg(test)]
+use jammi_kernels::ops::{
+    ATTENTION_BLOCK_HEAD_DIM, ATTENTION_BLOCK_MAX_SEQ, MAX_LAST_DIM, MEM_EFFICIENT_MAX_SEQ,
+};
 
 const DEFAULT_LAYER_NORM_EPS: f64 = 1e-5;
 const DEFAULT_GLOBAL_ROPE_THETA: f64 = 160_000.0;
@@ -60,37 +77,11 @@ const DEFAULT_LOCAL_ROPE_THETA: f64 = 10_000.0;
 const DEFAULT_LOCAL_ATTENTION: usize = 128;
 const DEFAULT_GLOBAL_ATTN_EVERY_N_LAYERS: usize = 3;
 
-/// The key-chunk width [`ModernBertAttention::forward_memeff_attention`]
-/// hands [`MemEfficientAttention::new`] — a fixed default, never
-/// env-overridden in a measurement path (M2 plan v2 delta 3/v3 delta 4:
-/// `chunk_size` changes reduction order — it is numerics, family J — so it
-/// is jammi-side PROVENANCE ([`MemEfficientAttention::chunk`], read back by
-/// a caller building a job record), never a tunable this crate exposes at
-/// runtime). NUMBER PRODUCED-OR-ABSENT (adversarial audit round 3
-/// advisory): this is a floor-respecting DEFAULT, chosen to sit comfortably
-/// above [`jammi_kernels::ops::MEM_EFFICIENT_MIN_CHUNK`]'s launch-count
-/// floor (`512`) — NOT a measured crossover point. An earlier revision of
-/// this doc claimed "chosen by measurement" (echoing the plan's own v1
-/// language for a DIFFERENT, not-yet-produced number — the plan's own
-/// "Loop shape pinned" section names `MIN_CHUNK` itself as "the plan's own
-/// chosen point on this curve", not `1024` specifically); no launch-count-
-/// vs-transient-size sweep for THIS value has been run or committed. The
-/// crossover bench leg that would produce that number (M2 plan v1's own
-/// "the crossover bench leg records launch counts alongside wall time") is
-/// still pending; the identity/bench wiring that records `chunk_size`
-/// per-row is later work on this train too (M2 plan v3 delta 4's
-/// NullMeans-class provenance field) — this constant is the op-side
-/// decision alone, pending measurement.
-const MEM_EFFICIENT_CHUNK: usize = 1024;
-
-/// Pins [`MEM_EFFICIENT_CHUNK`] above [`MEM_EFFICIENT_MIN_CHUNK`]'s launch-
-/// count floor at compile time (a `const` comparison, not a runtime
-/// assertion this crate's own release build would ever pay for) — a future
-/// edit that shrinks the chosen default below the floor [`MemEfficientAttention::new`]
-/// itself enforces fails HERE, at the constant's own definition site,
-/// rather than at the first training forward that reaches
-/// [`ModernBertAttention::forward_memeff_attention`].
-const _: () = assert!(MEM_EFFICIENT_CHUNK >= MEM_EFFICIENT_MIN_CHUNK);
+// `MEM_EFFICIENT_CHUNK` (the key-chunk width `MemEfficientAttention::new`
+// takes) moved to `crate::attention_cascade` alongside
+// `forward_memeff_attention` (issue #462, R2') — see that module for the
+// constant's prior doc (unchanged: still a floor-respecting default, not a
+// measured crossover point).
 
 fn default_layer_norm_eps() -> f64 {
     DEFAULT_LAYER_NORM_EPS
@@ -140,8 +131,8 @@ pub struct ModernBertConfig {
     /// dropped: this port's `ModernBertAttention::forward` never read it at
     /// all, an escape row filed alongside the fused attention block that
     /// introduced this field) but refused if nonzero, at
-    /// [`ModernBertBuilder::build`] — see [`AttentionBlockFused`]'s own
-    /// domain, which has no dropout slot. `0.0` (the default) is ModernBERT's
+    /// [`ModernBertBuilder::build`] — see [`jammi_kernels::ops::AttentionBlockFused`]'s
+    /// own domain, which has no dropout slot. `0.0` (the default) is ModernBERT's
     /// own upstream default and the only value this port supports.
     #[serde(default = "default_attention_dropout")]
     pub attention_dropout: f64,
@@ -196,106 +187,18 @@ pub(crate) static ROPE_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
 /// Fused/eager dispatch counters for the ModernBERT attention softmax,
 /// read from the registry — mirroring `ROPE_DISPATCH_COUNTERS` /
 /// `crate::layer_norm::LN_DISPATCH_COUNTERS` — see
-/// [`softmax_apply_training`]'s doc for the training-only gate
+/// `softmax_apply_training`'s doc for the training-only gate
 /// this counts. `pub(crate)` (not `pub`) — read via
 /// [`crate::softmax_dispatch_snapshot`], the same shape
 /// [`crate::rope_dispatch_snapshot`] / [`crate::ln_dispatch_snapshot`] use.
 pub(crate) static SOFTMAX_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
     LazyLock::new(|| counters_for("softmax_last_dim_fused"));
 
-/// The fused masked-softmax kernel's domain, checked at the call site
-/// (family D / K2): `scores`'s device is one
-/// [`jammi_kernels::admission::device_is_supported`] accepts, `scores`/`mask`
-/// share a dtype the kernel implements (F32, BF16, or F16 — F16 widened in
-/// campaign #443 W2b, see [`softmax_admission_predicate`]'s own dtype
-/// check below for the compiled-arm citation), BOTH `scores` and
-/// `mask` are contiguous (`SoftmaxLastDimFused` refuses a strided view for
-/// EITHER argument — see its module doc; an earlier version of this
-/// predicate checked only `mask`, asymmetrically, an audit finding
-/// corrected here), `scores`'s rank is within [`MAX_RANK`] (the CUDA arm's
-/// fixed-arity kernel signature) and last dimension within
-/// [`MAX_LAST_DIM`] (a conservative validated ceiling, not a hardware
-/// limit — see that constant's own doc), and `mask` is within `scores`'s
-/// supported broadcast class
-/// ([`jammi_kernels::ops::mask_broadcast_class_holds`] — the SAME check
-/// the op applies internally, called directly rather than re-derived here
-/// to avoid a second, independently-maintained copy of that logic).
-///
-/// CORRECTED (an audit finding): an earlier version of this predicate
-/// deliberately did NOT check the broadcast class, reasoning that a
-/// mismatched mask shape reaching this call site would be "a bug in the
-/// caller, not an admission question" — that reasoning does not hold: this
-/// function's whole job (K2's "validate, don't silently degrade" doctrine)
-/// is to make EVERY domain failure a counted, observable eager fallback
-/// rather than an error surfacing from inside the op. Checking the
-/// broadcast class here means a mismatched mask shape on the training arm
-/// now falls back to eager (counted in [`SOFTMAX_DISPATCH_COUNTERS`]) —
-/// the SAME outcome device/dtype/rank/last-dim failures already got —
-/// instead of propagating `SoftmaxLastDimFused`'s own internal
-/// `candle_core::Error::ShapeMismatchBinaryOp`. The op's own internal
-/// check is unchanged and still the correct defense for any direct
-/// `apply2` caller that bypasses this predicate entirely.
-///
-/// `scores_divisor` is `softmax_apply_training`'s OWN `scores_divisor`
-/// argument (`sqrt(head_dim)` in production — see that function's doc), a
-/// DIVISOR — named to say so explicitly, since `SoftmaxLastDimFused::scale`
-/// (a field on a DIFFERENT type, in `jammi-kernels`) is a MULTIPLIER and
-/// the two are easy to conflate by name alone. The fused branch folds `1.0
-/// / scores_divisor` into `SoftmaxLastDimFused::scale`, and
-/// `SoftmaxLastDimFused::with_scale` has a real domain of its own (family
-/// D — finite and strictly positive, see its doc). The `scale_finite_positive`
-/// clause below checks THAT quantity (`1.0 / scores_divisor` cast to
-/// `f32`, the EXACT value the fused branch would pass to `with_scale`),
-/// not `scores_divisor` itself directly, so a `scores_divisor` that is
-/// finite and positive but produces a non-finite or non-positive
-/// reciprocal (e.g. `scores_divisor` so large `1.0 / scores_divisor`
-/// underflows to `0.0`, or `scores_divisor == 0.0` itself) is caught here
-/// — a counted eager fallback (the SAME `scores / scores_divisor`
-/// division the eager branch already performs, so this is never a numeric
-/// domain the eager branch could not also handle) rather than
-/// `with_scale` refusing deeper in the call stack.
-fn softmax_admission_predicate(
-    scores: &Tensor,
-    mask: &Tensor,
-    scores_divisor: f64,
-) -> (bool, &'static str) {
-    if !device_is_supported(scores.device()) {
-        return (false, "device_is_cpu_or_cuda");
-    }
-    // F32/BF16/F16 — F16 widened in campaign #443 W2b, exactly where
-    // `jammi_kernels::cuda::softmax` gained a compiled F16 dispatch arm
-    // backed by the SEPARATE `cuda/softmax_f16.cu` translation unit.
-    if scores.dtype() != mask.dtype()
-        || !matches!(scores.dtype(), DType::F32 | DType::BF16 | DType::F16)
-    {
-        return (
-            false,
-            "dtype_f32_bf16_or_f16_matching_between_scores_and_mask",
-        );
-    }
-    if !scores.is_contiguous() {
-        return (false, "scores_contiguous");
-    }
-    if !mask.is_contiguous() {
-        return (false, "mask_contiguous");
-    }
-    let rank = scores.dims().len();
-    if rank == 0 || rank > MAX_RANK {
-        return (false, "rank_within_kernel_max_rank");
-    }
-    let last = *scores.dims().last().unwrap_or(&0);
-    if last == 0 || last > MAX_LAST_DIM {
-        return (false, "last_dim_within_kernel_max_last_dim");
-    }
-    if !jammi_kernels::ops::mask_broadcast_class_holds(scores, mask) {
-        return (false, "mask_broadcast_class");
-    }
-    let scale_mul = (1.0 / scores_divisor) as f32;
-    if !(scale_mul.is_finite() && scale_mul > 0.0) {
-        return (false, "scale_finite_positive");
-    }
-    (true, "domain_ok")
-}
+// `crate::attention_cascade::softmax_admission_predicate` — moved there
+// verbatim (issue #462, R2'): a pure function of `(scores, mask,
+// scores_divisor)`, model-agnostic. Imported above so every existing
+// unit test in this module (`use super::*`) keeps compiling and passing
+// unmodified against the identical 3-argument signature.
 
 /// Cached, dtype-cast AND pre-broadcast-shaped (`[1, 1, max_seq_len,
 /// head_dim]`) RoPE tables — see [`RotaryEmbedding::cached_tables`].
@@ -683,326 +586,22 @@ fn rope_admission_predicate(
 pub(crate) static ATTENTION_BLOCK_DISPATCH_COUNTERS: LazyLock<&'static DispatchCounters> =
     LazyLock::new(|| counters_for("attention_block_fused"));
 
-/// [`jammi_kernels::ops::MemEfficientAttention`]'s own admission predicate
-/// (M2 part 2, contract v4 delta 1 + advisories): a pure function of
-/// `(device, dtype, seq, flash)` — ONE definition, called both PER LAYER
-/// (inside `ModernBertAttention::forward_training_attention`, to actually
-/// dispatch) and ONCE per forward (inside `ModernBert::forward_hidden_inner`,
-/// to gate the block/eager mask-bundle build) — never re-derived twice,
-/// mirroring this file's own `flash_admission_predicate`/
-/// `decide_flash_admission` precedent.
-///
-/// **Reachable admission set** (M2 plan v3 delta 1, restated): memeff is
-/// the LONG-SEQUENCE arm — `seq > ATTENTION_BLOCK_MAX_SEQ` AND flash
-/// declined THIS forward (`flash` is already the per-forward
-/// [`FlashDecision`]; when flash itself holds, `attention_block_flash`
-/// dispatches first and memeff is never even consulted for a
-/// `Holds`-worthy shape — `flash_admission_holds` below is a `DomainMiss`,
-/// not a `CapabilityMiss`: this call's DATA legitimately does not need
-/// memeff, not a build/device limitation).
-///
-/// **Device gate is `device_is_supported`** (CPU-or-CUDA), NEVER an
-/// exact-arch predicate like flash's `arch_in_flash_validated_set` (the
-/// plan's OQ ruling, advisories: this op is stock-op composition,
-/// arch-agnostic PTX-forward, not a kernel tuned to one SM target).
-///
-/// **`dtype` gate, PER-DEVICE-HONEST (adversarial audit round 3, F2 fix;
-/// widened to `F16` on CUDA by campaign #443 D1):** the op's own domain is
-/// dtype-split by device — `F32`-only on CPU (`cpu_fwd`'s own module doc;
-/// CORRECTED, campaign #446 finding 14: candle-core 0.11's CPU `MatMul`
-/// has no `BF16` impl, but it DOES accept `F16` in this workspace's
-/// default gemm build — `cpu_backend`'s `impl Map2 for MatMul` admits
-/// `F16 | F32 | F64`. `F16` is nonetheless out of this op's CPU domain
-/// because `cpu_fwd` is a hand-written `f32` raw-storage online-softmax
-/// loop with no narrower arm at all, not because candle could not
-/// multiply it), `F32`,
-/// `BF16`, OR `F16` on CUDA (`cuda_fwd`'s own module doc — `F16` upcasts to
-/// `f32` at the boundary on the SAME mechanism `BF16` already used, no new
-/// `.cu` kernel). An earlier revision had NO dtype gate here at all — the op's own
-/// `UnsupportedDTypeForOp` refusal was the only thing standing between an
-/// `F16` (or any other unsupported dtype) long-seq forward and a hard
-/// error, and by the time that refusal fired, `ModernBert::
-/// forward_hidden_inner`'s own `memeff_will_fire` suppression (this
-/// predicate's OTHER call site) had ALREADY deleted the block/eager
-/// fallback's `local_band`/`FusedAttentionMasks` bundle — an `F16`
-/// seq>`ATTENTION_BLOCK_MAX_SEQ` forward regressed from
-/// working-via-eager (this op's own baseline, before M2) to an
-/// unconditional `EncoderError::Config`. Folding the dtype domain in HERE,
-/// as a typed `DomainMiss`, repairs both call sites in one move: memeff
-/// correctly declines (never claims `Holds` for a dtype it cannot serve),
-/// so the per-layer cascade falls through to the block/eager arm AND the
-/// once-per-forward suppression never fires, exactly as it did at base.
-/// `device` (not a build-time `#[cfg]`) decides which dtype set applies —
-/// this predicate is called with the tensor's OWN device, so a CPU tensor
-/// on a `cuda`-featured build is still correctly held to the narrower CPU
-/// set.
-///
-/// `JAMMI_KERNELS_DISABLE=mem_efficient_attention` is NOT consulted here —
-/// [`admit_cascade`] itself checks `op_disabled` before ever reading this
-/// predicate's `outcome` (identical precedent: `flash_admission_predicate`
-/// doesn't check it either; `decide_flash_admission`'s OWN early
-/// `op_disabled` check exists only because IT also decides encoder-boundary
-/// transport, which this predicate never does).
-fn mem_efficient_attention_predicate(
-    device: &Device,
-    dtype: DType,
-    seq: usize,
-    flash: &FlashDecision,
-) -> (PredicateOutcome, &'static str) {
-    if matches!(flash, FlashDecision::Fused(_)) {
-        return (PredicateOutcome::DomainMiss, "flash_admission_holds");
-    }
-    if !device_is_supported(device) {
-        return (PredicateOutcome::CapabilityMiss, "device_is_cpu_or_cuda");
-    }
-    // campaign #443 D1: `F16` joins `BF16` on the CUDA side —
-    // [`jammi_kernels::ops::MemEfficientAttention`]'s own `cuda_fwd` gate
-    // now admits it too (that op's module doc's "Rounding contract"
-    // section: `F16` upcasts to `f32` once, at the boundary, the SAME
-    // mechanism `BF16` already used — no new `.cu` kernel, so this
-    // predicate's domain follows the op's own, not a build-time capability
-    // this crate would need to detect separately). The CPU side is
-    // UNCHANGED: `cpu_fwd` is `F32`-only and still refuses both `BF16` and
-    // `F16`. CORRECTED reason (campaign #446 finding 14 — an earlier
-    // revision of this comment said candle-core 0.11's CPU backend "has no
-    // `BF16`/`F16` `MatMul` impl", which is only half true): candle's
-    // default gemm CPU `MatMul` admits `F16 | F32 | F64` and refuses
-    // `BF16`. The op's CPU refusal of `F16` comes from ITS OWN `cpu_fwd`
-    // (a hand-written `f32` raw-storage loop with no 16-bit arm), not from
-    // a missing candle kernel.
-    let dtype_ok = if device.is_cuda() {
-        matches!(dtype, DType::F32 | DType::BF16 | DType::F16)
-    } else {
-        matches!(dtype, DType::F32)
-    };
-    if !dtype_ok {
-        return (
-            PredicateOutcome::DomainMiss,
-            if device.is_cuda() {
-                "dtype_f32_bf16_or_f16_on_cuda"
-            } else {
-                "dtype_f32_only_on_cpu"
-            },
-        );
-    }
-    if seq <= ATTENTION_BLOCK_MAX_SEQ {
-        return (
-            PredicateOutcome::DomainMiss,
-            "seq_within_attention_block_max_seq",
-        );
-    }
-    // The op's own UPPER seq bound (round-6 audit advisory — the F2
-    // class's last member, on the seq axis rather than dtype): `mem_eff_
-    // attention_dims` refuses `seq > MEM_EFFICIENT_MAX_SEQ` (a conservative,
-    // VALIDATED ceiling, [`jammi_kernels::ops::MemEfficientAttention`]'s own
-    // module doc — `131_072`, not a hardware limit). Without this check
-    // the predicate would claim `Holds` for a `seq` the op itself refuses,
-    // reproducing F2's exact shape one axis over: the per-layer cascade
-    // would dispatch `Fused`, `forward_memeff_attention` would call the
-    // op, and the op's own typed refusal would fire only AFTER
-    // `memeff_will_fire`'s once-per-forward suppression had already
-    // deleted the block/eager fallback's mask bundle — an unreachably
-    // long (but not IMPOSSIBLE to construct) `seq` regressing from a
-    // clean decline to a hard error, exactly like F2's dtype gap did.
-    if seq > MEM_EFFICIENT_MAX_SEQ {
-        return (
-            PredicateOutcome::DomainMiss,
-            "seq_within_mem_efficient_max_seq",
-        );
-    }
-    (PredicateOutcome::Holds, "domain_ok")
-}
+// The admission predicates that used to live here —
+// `mem_efficient_attention_predicate` ((device, dtype, seq, flash), a pure
+// function called both per-layer and once per forward to gate the
+// block/eager mask-bundle build) and `attention_block_admission_predicate`
+// (7-argument: `qkv, seq, h, d, extended_mask, is_local, local_mask`) —
+// moved verbatim to `crate::attention_cascade` (issue #462, R2'), along
+// with `FusedAttentionMasks`/`TrainingMaskInputs` (same fields, now
+// `pub(crate)` so `crate::bert`/`crate::distilbert` can construct them
+// too). All four are imported above under their original bare names, so
+// every existing unit test in this module (`use super::*`) keeps
+// compiling and passing unmodified.
 
-/// The fused whole-attention-block kernel's domain, checked at the call
-/// site (family D / K2): `qkv`'s device is one
-/// [`jammi_kernels::admission::device_is_supported`] accepts, `qkv`/`extended_mask`
-/// share a dtype the kernel implements PER-DEVICE (`F32` on either device;
-/// `BF16` or `F16` admitted ONLY on CUDA — F16 widened in campaign #443 D1,
-/// see the dtype check below for the composed-sub-kernel citation and the
-/// CPU-refusal regression this device split closes), `qkv` is contiguous
-/// (the free reshape from `Wqkv`'s own output — `AttentionBlockFused`
-/// refuses a strided `qkv`, same idiom as every other op in this crate),
-/// `head_dim` is exactly [`ATTENTION_BLOCK_HEAD_DIM`] (`AttentionBlockFused`'s
-/// own fixed domain — see that op's module doc's "Fixed domain" section),
-/// `seq` is nonzero and within [`ATTENTION_BLOCK_MAX_SEQ`], `extended_mask`
-/// (the padding mask ALONE, before any band is folded in — this op has no
-/// `window` construction data of its own; the caller combines padding and
-/// band into ONE tensor before calling it, see
-/// [`ModernBertAttention::forward_training_attention`]'s doc) is contiguous
-/// and shaped `[batch|1, 1, 1, seq]`, and — on a local layer only —
-/// `local_mask` (the per-forward padding-plus-band sum,
-/// [`FusedAttentionMasks::local`]) is present, contiguous, and shaped
-/// `[batch|1, 1, seq, seq]` — the op's own `check_mask` domain for the
-/// padding-plus-band class.
-///
-/// | `is_local` | `local_mask` | contiguous | shape | outcome |
-/// |---|---|---|---|---|
-/// | `false` | any | — | — | not consulted |
-/// | `true` | `None` | — | — | `local_mask_present` |
-/// | `true` | `Some` | no | — | `local_mask_contiguous` |
-/// | `true` | `Some` | yes | ≠ `[batch\|1, 1, seq, seq]` | `local_mask_shape_batch_or_one_1_seq_seq` |
-/// | `true` | `Some` | yes | `[batch\|1, 1, seq, seq]` | `domain_ok` |
-fn attention_block_admission_predicate(
-    qkv: &Tensor,
-    seq: usize,
-    _h: usize,
-    d: usize,
-    extended_mask: &Tensor,
-    is_local: bool,
-    local_mask: Option<&Tensor>,
-) -> (bool, &'static str) {
-    if !device_is_supported(qkv.device()) {
-        return (false, "device_is_cpu_or_cuda");
-    }
-    // campaign #443 D1, PER-DEVICE-HONEST (round-2 audit F1 fix): `F16`
-    // joins `BF16` on CUDA ONLY — `AttentionBlockFused`'s own CUDA gate
-    // (`crate::cuda::attention_block::cuda_fwd`, in `jammi-kernels`) admits
-    // it on the same basis this composition owns no `.cu` kernel, so its
-    // domain follows its two composed sub-kernels' ([`RopeFused`],
-    // [`SoftmaxLastDimFused`]) real `F16` dispatch arms, all CUDA-only.
-    // `cpu_fwd` (same file, `jammi-kernels::ops::attention_block`) has NO
-    // `BF16`/`F16` match arm at all — it hard-errors with
-    // `UnsupportedDTypeForOp` on anything but `F32`. The D1 landing widened
-    // this check to `F32 | BF16 | F16` with no device split, which made the
-    // predicate `Holds` for CPU+F16 (`BF16` was already latent-broken the
-    // same way; `F16` is the one this crate's own dtype matrix now
-    // exercises) — the per-layer cascade would then dispatch the fused arm
-    // and the op's own refusal would fire AFTER `memeff_will_fire`'s
-    // once-per-forward suppression had already deleted the block/eager
-    // fallback's mask bundle, the exact `HARD-ERROR-where-eager-used-to-run`
-    // shape `mem_efficient_attention_predicate` above was fixed against.
-    // Device-split here the same way: `BF16`/`F16` admitted ONLY when
-    // `qkv.device().is_cuda()`; CPU stays `F32`-only, matching `cpu_fwd`'s
-    // real domain exactly.
-    let dtype_ok = if qkv.dtype() != extended_mask.dtype() {
-        false
-    } else if qkv.device().is_cuda() {
-        matches!(qkv.dtype(), DType::F32 | DType::BF16 | DType::F16)
-    } else {
-        matches!(qkv.dtype(), DType::F32)
-    };
-    if !dtype_ok {
-        return (
-            false,
-            if qkv.device().is_cuda() {
-                "dtype_f32_bf16_or_f16_matching_between_qkv_and_mask_on_cuda"
-            } else {
-                "dtype_f32_matching_between_qkv_and_mask_on_cpu"
-            },
-        );
-    }
-    if !qkv.is_contiguous() {
-        return (false, "qkv_contiguous");
-    }
-    if d != ATTENTION_BLOCK_HEAD_DIM {
-        return (false, "head_dim_is_attention_block_fixed_head_dim");
-    }
-    if seq == 0 || seq > ATTENTION_BLOCK_MAX_SEQ {
-        return (false, "seq_within_attention_block_max_seq");
-    }
-    if !extended_mask.is_contiguous() {
-        return (false, "mask_contiguous");
-    }
-    let m_dims = extended_mask.dims();
-    if m_dims.len() != 4 || m_dims[1] != 1 || m_dims[2] != 1 || m_dims[3] != seq {
-        return (false, "mask_shape_batch_or_one_1_1_seq");
-    }
-    if is_local {
-        let Some(local) = local_mask else {
-            return (false, "local_mask_present");
-        };
-        if !local.is_contiguous() {
-            return (false, "local_mask_contiguous");
-        }
-        let l_dims = local.dims();
-        if l_dims.len() != 4
-            || (l_dims[0] != 1 && l_dims[0] != m_dims[0])
-            || l_dims[1] != 1
-            || l_dims[2] != seq
-            || l_dims[3] != seq
-        {
-            return (false, "local_mask_shape_batch_or_one_1_seq_seq");
-        }
-    }
-    (true, "domain_ok")
-}
-
-/// The additive masks the FUSED whole-attention-block arm consumes,
-/// built ONCE per training forward by [`ModernBert::forward_hidden`] —
-/// never per layer. An earlier revision rebuilt them inside every local
-/// layer's fused arm (`extended.to_dtype` + `band.to_dtype` +
-/// `broadcast_add`, 3 launches) and every global layer's (`to_dtype`, 1
-/// launch): on a 28-layer / 10-global / 18-local ModernBERT-large
-/// forward that is `10 + 18 * 3 = 64` mask launches per training step;
-/// this struct's [`Self::build`] issues at most 3 (`global` cast, band
-/// add, `local` cast — and the casts are storage-sharing clones, not
-/// launches, when the backbone dtype is already `F32`).
-///
-/// ## Rounding: add-in-F32-then-cast is bit-identical to cast-then-add
-///
-/// The per-layer revision cast each term to the backbone dtype and added
-/// in that dtype; this one adds in `F32` and casts the SUM. On the only
-/// values either term takes — `0.0` and [`crate::mask::MASKED_LOGIT`]
-/// (`-10_000.0`) — the two orders agree byte-for-byte at every backbone
-/// dtype the fused arm admits: at `F32` both are exact; at `BF16`
-/// (8 significand bits, spacing `64` at `2^13`) `-10_000` rounds to
-/// `-9_984` either way, and the doubly-masked `-20_000` rounds to
-/// `-19_968`, which is exactly `-9_984 + -9_984` (spacing `128` at
-/// `2^14`: `20_000` sits `32` above `19_968` and `96` below `20_096`).
-/// `tests::fused_masks_add_then_cast_is_bit_identical_to_cast_then_add_on_the_masked_logit_lattice`
-/// sweeps all four `(padding, band)` cells at both dtypes — the sweep is
-/// the claim, not this arithmetic.
-struct FusedAttentionMasks {
-    /// `[batch, 1, 1, seq]` in the backbone dtype — the padding mask
-    /// alone, what a GLOBAL layer's fused arm passes as `mask`.
-    global: Tensor,
-    /// `[batch, 1, seq, seq]` in the backbone dtype — padding plus the
-    /// sliding-window band, what a LOCAL layer's fused arm passes.
-    /// `None` iff the model has no local layer.
-    local: Option<Tensor>,
-}
-
-impl FusedAttentionMasks {
-    /// `extended_f32` is [`extended_attention_mask`]'s `[batch, 1, 1,
-    /// seq]` output, `local_band_f32` is [`sliding_window_mask`]'s
-    /// `[1, 1, seq, seq]` band (or `None` for an all-global model), and
-    /// `dtype` is the backbone dtype the attention `qkv` will carry.
-    fn build(
-        extended_f32: &Tensor,
-        local_band_f32: Option<&Tensor>,
-        dtype: DType,
-    ) -> Result<Self, EncoderError> {
-        let global = extended_f32.to_dtype(dtype)?;
-        let local = match local_band_f32 {
-            Some(band) => Some(extended_f32.broadcast_add(band)?.to_dtype(dtype)?),
-            None => None,
-        };
-        Ok(Self { global, local })
-    }
-}
-
-/// The three mask inputs [`ModernBertAttention::forward_training_attention`]
-/// takes, bundled: the `F32` padding mask and band the eager FALLBACK
-/// composition consumes verbatim (unchanged from before the fused arm
-/// existed), and the per-forward [`FusedAttentionMasks`] the BLOCK arm
-/// consumes.
-///
-/// `fused: Option<&FusedAttentionMasks>` (M2 part 2, contract v4 delta 2):
-/// the memeff arm dispatches on `extended` alone (no `[batch, 1, seq,
-/// seq]`-class bundle) and is consulted BEFORE the block arm's own
-/// requirement for `fused` — `None` here is the caller's (`ModernBert::
-/// forward_hidden_inner`'s) EXPECTED input whenever memeff will handle the
-/// whole forward, mirroring `ModernBertAttention::forward`'s pre-existing
-/// "`fused_masks` unread on the flash-transport branch" contract exactly
-/// (see that method's own doc table). `forward_training_attention` is the
-/// ONE place that turns `None` into a typed `Config` refusal — but ONLY on
-/// the fallthrough path, after both flash and memeff have declined.
-struct TrainingMaskInputs<'a> {
-    extended: &'a Tensor,
-    local_band: Option<&'a Tensor>,
-    fused: Option<&'a FusedAttentionMasks>,
-}
-
+/// The per-layer attention module: RoPE table, `Wqkv`/`Wo` projections, and
+/// the local/global window classification this layer was built with. See
+/// [`Self::forward`]'s own doc for the eval/training/flash-transport
+/// dispatch this struct's fields feed.
 struct ModernBertAttention {
     wqkv: MaybeLoraLinear,
     wo: MaybeLoraLinear,
@@ -1221,7 +820,9 @@ impl ModernBertAttention {
     /// [`jammi_kernels::ops::AttentionBlockFused`] — the WHOLE
     /// RoPE+`QKᵀ`+mask+softmax+`PV` chain as ONE tape node — when its
     /// domain holds (see [`attention_block_admission_predicate`]), else
-    /// falls back to [`Self::forward_eager_training_attention_composition`],
+    /// falls back to `Self::forward_eager_training_attention_composition`
+    /// (`#[cfg(test)]` now — production reaches the moved
+    /// `attention_cascade` free function directly),
     /// which is TODAY'S exact training-arm composition (the same partial
     /// fusion — RoPE and softmax each fused independently, everything else
     /// eager — this crate shipped before this commit), UNCHANGED. Recording
@@ -1245,6 +846,14 @@ impl ModernBertAttention {
     /// `BF16`-derived-bound validated range (`|qkv| <= 1`). The op still
     /// computes correctly there; see that section for what IS and is NOT
     /// claimed at this amplitude.
+    /// Thin wrapper over [`attention_cascade::training_attention_cascade`]
+    /// (issue #462, R2'): the per-layer cascade BODY moved there verbatim
+    /// (numerics unchanged — same flash/memeff/block/eager fallthrough
+    /// order, same counters, same error strings), parameterized by
+    /// `rope`/`window`/`policy` in place of `self.rope`/`self.is_local`+
+    /// `self.half_window`/the hardcoded `FullyMaskedPolicy::Zeros`. This
+    /// method's own signature — and therefore `Self::forward`'s call site —
+    /// is UNCHANGED, so every existing test stays byte-identical.
     #[allow(clippy::too_many_arguments)]
     fn forward_training_attention(
         &self,
@@ -1256,138 +865,29 @@ impl ModernBertAttention {
         masks: TrainingMaskInputs<'_>,
         flash: &FlashDecision,
     ) -> Result<Tensor, EncoderError> {
-        // Flash cascade (contract v4 §3.2/§3.3, wired for DENSE by P6 Stage
-        // B B3): consulted PER LAYER so the counters are per-dispatch, not
-        // per-forward, even though the eligibility decision itself was made
-        // once, above, in `ModernBert::forward_hidden`. `true`: the block
-        // arm (this function's own fallback) always can run, so Strict mode
-        // never errors on the flash arm's decline either.
-        let flash_dispatch = admit_cascade(
-            admission_mode(),
-            "attention_block_flash",
-            flash.reason(),
-            flash.outcome(),
-            true,
-            cascade_counters_for("attention_block_flash"),
-        )?;
-        if flash_dispatch == CascadeOutcome::Fused {
-            // `FlashDecision::Fused` ALWAYS carries a `CompactedBatch` — by
-            // construction, not by a runtime `Option` check (see that
-            // type's own doc): `build_flash_forward_decision` has no path
-            // that produces `Fused` without one. The `Declined` arm below
-            // is therefore reachable only if `admit_cascade` and
-            // `flash.outcome()` ever disagreed about what `flash` itself
-            // is, which would be an admission-layer bug, not a missing
-            // field — a typed refusal either way, never a silent wrong
-            // dispatch.
-            let admission = match flash {
-                FlashDecision::Fused(batch) => batch,
-                FlashDecision::Declined { outcome, reason } => {
-                    return Err(EncoderError::Config(format!(
-                        "attention_block_flash dispatched Fused but flash itself is \
-                         Declined(outcome={outcome:?}, reason={reason}) -- admit_cascade and \
-                         FlashDecision disagree"
-                    )))
-                }
-            };
-            return self.forward_flash_dense_attention(qkv, batch, seq, h, d, admission);
-        }
-
-        // Memeff cascade (M2 part 2, contract v4 delta 1's placement fix):
-        // consulted HERE, BEFORE the block arm's own `admit()` (never
-        // through it — `admit()`'s Strict arm would otherwise error on
-        // `seq > ATTENTION_BLOCK_MAX_SEQ` before memeff is ever reached,
-        // which is exactly the structurally-unreachable shape v4 delta 1
-        // documents and fixes). `mem_efficient_attention_predicate` is a
-        // pure function of `(device, seq, flash)` — reading it here (per
-        // layer) and in `ModernBert::forward_hidden_inner` (once, to gate
-        // the block/eager mask-bundle build) is the SAME "one definition,
-        // not two that could drift" discipline `flash_admission_predicate`/
-        // `decide_flash_admission` already established for the flash arm.
-        let (memeff_outcome, memeff_reason) =
-            mem_efficient_attention_predicate(qkv.device(), qkv.dtype(), seq, flash);
-        let memeff_dispatch = admit_cascade(
-            admission_mode(),
-            "mem_efficient_attention",
-            memeff_reason,
-            memeff_outcome,
-            true,
-            cascade_counters_for("mem_efficient_attention"),
-        )?;
-        if memeff_dispatch == CascadeOutcome::Fused {
-            return self.forward_memeff_attention(qkv, batch, seq, h, d, masks.extended);
-        }
-
-        if self.is_local && masks.local_band.is_none() {
-            return Err(EncoderError::Config(
-                "local-attention layer reached without a sliding-window band".into(),
-            ));
-        }
-        let Some(fused) = masks.fused else {
-            return Err(EncoderError::Config(
-                "training-mode attention fell through to the block/eager arm without the \
-                 per-forward fused masks -- ModernBert::forward_hidden builds them once per \
-                 forward whenever memeff will not handle it (mem_efficient_attention_predicate \
-                 declined here too); a direct caller in training mode must supply them on this \
-                 path"
-                    .into(),
-            ));
+        let rope_pack = self.rope.cached_rope_pack(qkv.dtype())?;
+        let apply = |x: &Tensor| self.rope_apply(x);
+        let rope = RopeCtx {
+            pack: &rope_pack,
+            enabled: true,
+            apply: Some(&apply),
         };
-
-        let (holds, predicate) = attention_block_admission_predicate(
+        let window = self.is_local.then_some(LocalWindow {
+            half_window: self.half_window.unwrap_or(0),
+        });
+        attention_cascade::training_attention_cascade(
             qkv,
+            batch,
             seq,
             h,
             d,
-            &fused.global,
-            self.is_local,
-            fused.local.as_ref(),
-        );
-        let outcome = admit(
-            admission_mode(),
-            "attention_block_fused",
-            predicate,
-            holds,
-            *ATTENTION_BLOCK_DISPATCH_COUNTERS,
-        )?;
-        match outcome {
-            DispatchOutcome::Fused => {
-                let qkv5 = qkv.reshape((batch, seq, 3, h, d))?;
-                let rope_pack = self.rope.cached_rope_pack(qkv.dtype())?;
-                // `AttentionBlockFused` has no `window` construction data
-                // (its module doc's "window is construction data at the
-                // call site" section): a local layer hands it the
-                // per-forward padding-plus-band sum, a global layer the
-                // padding mask alone. The admission predicate above
-                // already refused a local layer whose `local` bundle is
-                // missing, so the `(true, None)` arm below is a typed
-                // belt-and-braces refusal, not a reachable path.
-                let mask = match (self.is_local, fused.local.as_ref()) {
-                    (true, Some(local)) => local,
-                    (true, None) => {
-                        return Err(EncoderError::Config(
-                            "local-attention layer reached without a combined fused mask".into(),
-                        ))
-                    }
-                    (false, _) => &fused.global,
-                };
-                let op = AttentionBlockFused::new(
-                    1.0 / (d as f32).sqrt(),
-                    FullyMaskedPolicy::Zeros,
-                    true,
-                )?;
-                Ok(apply3(&qkv5, &rope_pack, mask, op)?)
-            }
-            DispatchOutcome::Eager => self.forward_eager_training_attention_composition(
-                qkv,
-                batch,
-                seq,
-                h,
-                d,
-                masks.extended,
-                masks.local_band,
-            ),
-        }
+            masks,
+            flash,
+            &rope,
+            window,
+            FullyMaskedPolicy::Zeros,
+            |admission| self.forward_flash_dense_attention(qkv, batch, seq, h, d, admission),
+        )
     }
 
     /// The memory-efficient (chunked) attention arm (M2 part 2): the
@@ -1401,6 +901,19 @@ impl ModernBertAttention {
     /// is re-derived internally from `self.half_window` (a `Copy` scalar,
     /// [`MemEfficientAttention`]'s own module doc's "the band is a `Copy`
     /// scalar" section) rather than read from a materialized tensor.
+    /// Thin wrapper over [`attention_cascade::forward_memeff_attention`]
+    /// (issue #462, R2') — moved verbatim, parameterized by `rope`/
+    /// `half_window`/`policy` in place of `self.rope`/`self.half_window`/
+    /// the hardcoded `FullyMaskedPolicy::Zeros`. Signature UNCHANGED, so
+    /// `tests::mem_efficient_attention_op_bf16_on_cpu_is_a_typed_refusal_not_a_panic`'s
+    /// direct method call keeps compiling and passing unmodified.
+    /// `#[cfg(test)]`: production now reaches
+    /// `attention_cascade::forward_memeff_attention` directly (through
+    /// [`attention_cascade::training_attention_cascade`]), never through
+    /// this method — it survives ONLY as the unit test's direct-call
+    /// surface, exactly like `crate::layer_norm`'s own test-only method
+    /// wrappers.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn forward_memeff_attention(
         &self,
@@ -1411,19 +924,23 @@ impl ModernBertAttention {
         d: usize,
         extended_mask_f32: &Tensor,
     ) -> Result<Tensor, EncoderError> {
-        let qkv5 = qkv.reshape((batch, seq, 3, h, d))?;
         let rope_pack = self.rope.cached_rope_pack(qkv.dtype())?;
-        let key_mask = extended_mask_f32.to_dtype(qkv.dtype())?;
-        let op = MemEfficientAttention::new(
-            1.0 / (d as f32).sqrt(),
-            FullyMaskedPolicy::Zeros,
-            true,
+        let rope = RopeCtx {
+            pack: &rope_pack,
+            enabled: true,
+            apply: None,
+        };
+        attention_cascade::forward_memeff_attention(
+            qkv,
+            batch,
+            seq,
+            h,
+            d,
+            extended_mask_f32,
+            &rope,
             self.half_window,
-            MEM_EFFICIENT_CHUNK,
+            FullyMaskedPolicy::Zeros,
         )
-        .map_err(|e| EncoderError::Config(format!("mem_efficient_attention: {e}")))?;
-        mem_efficient_attention(&qkv5, &rope_pack, &key_mask, op)
-            .map_err(|e| EncoderError::Config(format!("mem_efficient_attention: {e}")))
     }
 
     /// The DENSE FlashAttention-2 arm (P6 Stage B B3-dense, contract v5
@@ -1647,11 +1164,16 @@ impl ModernBertAttention {
         ))
     }
 
-    /// TODAY'S exact training-arm composition, extracted verbatim (not
-    /// rewritten) so [`Self::forward_training_attention`]'s eager fallback
-    /// is provably identical to what this crate shipped before
-    /// `AttentionBlockFused` existed — the op contract's "eager fallback ==
-    /// today's exact composition" requirement.
+    /// Thin wrapper over
+    /// [`attention_cascade::forward_eager_training_attention_composition`]
+    /// (issue #462, R2') — moved verbatim, parameterized by `rope`/
+    /// `window`/`policy`/`training` in place of `self.rope`/`self.is_local`/
+    /// the hardcoded `FullyMaskedPolicy::Zeros`/`self.training`. Signature
+    /// UNCHANGED (same 7 arguments), so every existing direct-call unit
+    /// test in this module keeps compiling and passing unmodified.
+    /// `#[cfg(test)]`: same status as `Self::forward_memeff_attention` —
+    /// production reaches the free function directly now.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn forward_eager_training_attention_composition(
         &self,
@@ -1663,89 +1185,29 @@ impl ModernBertAttention {
         extended_mask: &Tensor,
         local_band: Option<&Tensor>,
     ) -> Result<Tensor, EncoderError> {
-        let q = qkv
-            .narrow(D::Minus1, 0, h * d)?
-            .reshape((batch, seq, h, d))?
-            .transpose(1, 2)?;
-        let k = qkv
-            .narrow(D::Minus1, h * d, h * d)?
-            .reshape((batch, seq, h, d))?
-            .transpose(1, 2)?;
-        let v = qkv
-            .narrow(D::Minus1, 2 * h * d, h * d)?
-            .reshape((batch, seq, h, d))?
-            .transpose(1, 2)?;
-
-        let q = self.rope_apply(&q)?;
-        let k = self.rope_apply(&k)?;
-
-        let scale = (d as f64).sqrt();
-        // UNSCALED — the training arm folds `1/scale` into
-        // `SoftmaxLastDimFused` itself (see `softmax_apply_training`'s
-        // doc) rather than dividing here; an eager `scores / scale`
-        // division at this point would retain a full `[batch, heads, seq,
-        // seq]` `Op::Affine` tape tensor per layer, present for the
-        // training arm alone. The eval arm below still divides explicitly.
-        let raw_scores = crate::contiguous_matmul(&q, &k.transpose(D::Minus1, D::Minus2)?)?;
-        // The additive mask is always built in F32 (see `extended_attention_mask`);
-        // cast to the scores' dtype so a F16/BF16 backbone can add it (a no-op
-        // when scores are already F32).
-        let extended_mask = extended_mask.to_dtype(raw_scores.dtype())?;
-
-        let attn = if self.training {
-            // Combine the (up to two) additive masks into ONE small tensor
-            // BEFORE calling the fused kernel — `SoftmaxLastDimFused` is a
-            // `CustomOp2` (`scores`, one `mask`), and this sum is at most
-            // `[batch, 1, seq, seq]` (never `[batch, heads, seq, seq]`,
-            // since neither mask carries a `heads` axis) — see
-            // `jammi_kernels::ops::softmax`'s module doc's "why the mask
-            // is folded in BEFORE this op runs" section. This is a
-            // DIFFERENT (though algebraically equivalent) computation from
-            // eval's sequential adds below: floating-point addition is not
-            // associative, so this arm's own fused-vs-eager oracle states
-            // a tolerance rather than bit-exactness, exactly like every
-            // other fused op's training arm in this crate.
-            let mask = match (self.is_local, local_band) {
-                (true, Some(band)) => {
-                    extended_mask.broadcast_add(&band.to_dtype(raw_scores.dtype())?)?
-                }
-                (true, None) => {
-                    return Err(EncoderError::Config(
-                        "local-attention layer reached without a sliding-window band".into(),
-                    ))
-                }
-                (false, _) => extended_mask,
-            };
-            softmax_apply_training(&raw_scores, &mask, scale)?
-        } else {
-            // Eval's UNCHANGED code path, bit-identical to before this
-            // commit: divides by `scale` exactly as before (the ONE `Op::Affine`
-            // node eval always retained and still does), then two
-            // SEQUENTIAL broadcast-adds, each from its own smaller shape,
-            // never combined into one tensor (see
-            // `crate::mask::sliding_window_mask`'s doc for why — neither
-            // mask is ever materialised at `[batch, heads, seq, seq]`
-            // either way, but combining them first would round
-            // differently than adding them in this order, which eval must
-            // never do — see `tests::eval_mode_attention_softmax_is_bit_identical_regardless_of_fused_eligibility`).
-            let scores = (&raw_scores / scale)?;
-            let scores = scores.broadcast_add(&extended_mask)?;
-            let scores = match (self.is_local, local_band) {
-                (true, Some(band)) => scores.broadcast_add(&band.to_dtype(scores.dtype())?)?,
-                (true, None) => {
-                    return Err(EncoderError::Config(
-                        "local-attention layer reached without a sliding-window band".into(),
-                    ))
-                }
-                (false, _) => scores,
-            };
-            candle_nn::ops::softmax(&scores, D::Minus1)?
+        let rope_pack = self.rope.cached_rope_pack(qkv.dtype())?;
+        let apply = |x: &Tensor| self.rope_apply(x);
+        let rope = RopeCtx {
+            pack: &rope_pack,
+            enabled: true,
+            apply: Some(&apply),
         };
-
-        Ok(crate::contiguous_matmul(&attn, &v)?
-            .transpose(1, 2)?
-            .contiguous()?
-            .reshape((batch, seq, h * d))?)
+        let window = self.is_local.then_some(LocalWindow {
+            half_window: self.half_window.unwrap_or(0),
+        });
+        attention_cascade::forward_eager_training_attention_composition(
+            qkv,
+            batch,
+            seq,
+            h,
+            d,
+            extended_mask,
+            local_band,
+            &rope,
+            window,
+            FullyMaskedPolicy::Zeros,
+            self.training,
+        )
     }
 
     /// Dispatches to [`RotaryEmbedding::apply_training`] (fused-when-
@@ -1858,31 +1320,27 @@ impl ModernBertAttention {
 /// is the ONLY oracle that forces this arm and checks it fwd+bwd
 /// bit-for-bit against the inline composition this doc describes —
 /// mutation-verified (see that test's own doc).
+/// Thin wrapper over [`attention_cascade::softmax_apply_training`] (issue
+/// #462, R2') — moved verbatim, parameterized by `policy` there in place
+/// of the hardcoded `FullyMaskedPolicy::Zeros` fixed here. Signature
+/// UNCHANGED (same 3 arguments), so every existing direct-call unit test
+/// in this module keeps compiling and passing unmodified. `#[cfg(test)]`:
+/// same status as `ModernBertAttention::forward_memeff_attention` — both
+/// are `#[cfg(test)]`, so neither is a nameable rustdoc target outside a
+/// test build; production reaches `attention_cascade::softmax_apply_training`
+/// directly now, through the eager-composition arm of the shared cascade.
+#[cfg(test)]
 fn softmax_apply_training(
     scores: &Tensor,
     mask: &Tensor,
     scores_divisor: f64,
 ) -> Result<Tensor, EncoderError> {
-    let (holds, predicate) = softmax_admission_predicate(scores, mask, scores_divisor);
-    let outcome = admit(
-        admission_mode(),
-        "softmax_last_dim_fused",
-        predicate,
-        holds,
-        *SOFTMAX_DISPATCH_COUNTERS,
-    )?;
-    match outcome {
-        DispatchOutcome::Fused => Ok(apply2(
-            scores,
-            mask,
-            SoftmaxLastDimFused::new(jammi_kernels::ops::FullyMaskedPolicy::Zeros)
-                .with_scale((1.0 / scores_divisor) as f32)?,
-        )?),
-        DispatchOutcome::Eager => Ok(candle_nn::ops::softmax(
-            &(scores / scores_divisor)?.broadcast_add(mask)?,
-            D::Minus1,
-        )?),
-    }
+    attention_cascade::softmax_apply_training(
+        scores,
+        mask,
+        scores_divisor,
+        jammi_kernels::ops::FullyMaskedPolicy::Zeros,
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2119,7 +1577,7 @@ pub(crate) fn flash_d2h_syncs() -> u64 {
 /// is cheap enough to construct on demand, once, at the real flash call
 /// site B1 adds — holding a `CuSeqlens` across a whole forward buys
 /// nothing today and would force a premature feature dependency.
-struct CompactedBatch {
+pub(crate) struct CompactedBatch {
     /// One length per batch element, `lengths[b] <= seq`. Consumed by
     /// [`ModernBertAttention::forward_flash_dense_attention`]
     /// (`CuSeqlens::from_lengths`) and
@@ -2188,7 +1646,7 @@ struct CompactedBatch {
 /// `"domain_ok_padded"` otherwise; see [`Self::reason`]), so callers built
 /// around the old struct's two bare fields keep exactly the same call
 /// shape.
-enum FlashDecision {
+pub(crate) enum FlashDecision {
     /// The batch is flash-eligible — `attention_block_flash` dispatches
     /// `Fused`. DENSE (`admission.is_dense`,
     /// [`ModernBertAttention::forward_flash_dense_attention`] runs, hidden
@@ -2217,7 +1675,7 @@ impl FlashDecision {
     /// The [`PredicateOutcome`] every `admit_cascade` call site reports —
     /// `Holds` for [`Self::Fused`] (the only outcome that variant can mean),
     /// whatever [`Self::Declined`] itself carries otherwise.
-    fn outcome(&self) -> PredicateOutcome {
+    pub(crate) fn outcome(&self) -> PredicateOutcome {
         match self {
             FlashDecision::Fused(_) => PredicateOutcome::Holds,
             FlashDecision::Declined { outcome, .. } => *outcome,
@@ -2230,7 +1688,7 @@ impl FlashDecision {
     /// versa): `"domain_ok_dense"` when the carried `CompactedBatch` is
     /// dense, `"domain_ok_padded"` when it is genuinely padded. Whatever
     /// [`Self::Declined`] itself carries otherwise.
-    fn reason(&self) -> &'static str {
+    pub(crate) fn reason(&self) -> &'static str {
         match self {
             FlashDecision::Fused(batch) if batch.is_dense => "domain_ok_dense",
             FlashDecision::Fused(_) => "domain_ok_padded",
@@ -3543,18 +3001,14 @@ mod tests {
     use candle_core::Var;
     use half::{bf16, f16};
 
-    /// Serializes every test in THIS module that reads
-    /// `ATTENTION_BLOCK_DISPATCH_COUNTERS` (a process-wide, `#[cfg(test)]`-
-    /// shared static): `cargo test`'s default per-binary thread pool runs
-    /// `#[test]` fns in parallel, so an exact-equality "eval must not
-    /// advance the counter" assertion in one such test would be flaky if
-    /// another concurrently ran a training-mode `AttentionBlockFused`
-    /// dispatch — mirrors `tests/it/modernbert.rs`'s
-    /// `DISPATCH_COUNTER_TEST_LOCK` (a SEPARATE lock: that one guards the
-    /// integration-test binary's own tests reading the SAME process-wide
-    /// counters through the crate's public `attention_block_dispatch_
-    /// snapshot` API — a different binary, so a different `Mutex`).
-    static ATTENTION_BLOCK_COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Promoted to `crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK`
+    /// (issue #462, R2', crate-visible) — imported here under its original
+    /// bare name so every one of this module's existing
+    /// `ATTENTION_BLOCK_COUNTER_TEST_LOCK.lock()` call sites keeps compiling
+    /// and passing unmodified. See that static's own doc for the
+    /// serialization rationale (unchanged) and why `crate::bert`/
+    /// `crate::distilbert` now share it too.
+    use crate::attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK;
 
     /// A flash-cascade decision that always declines — the stub every
     /// pre-existing (pre-flash) test in this module passes so its call to

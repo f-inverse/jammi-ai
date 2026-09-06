@@ -801,57 +801,85 @@ pod_seed_target_main() {
     # t1b_reason below make that legible in the committed marker itself.
     t1b_ran="false"
     t1b_reason="not main (${_seed_main_reason}) — T1b is main-only by design"
-    if [ "$_seed_is_main" = "true" ]; then
-      feat_rc=0
-      pod_seed_pkg_has_feature jammi-kernels flash-attn || feat_rc=$?
-      if [ "$feat_rc" -eq 0 ]; then
-        # T1b compiles the vendored FA2 CUTLASS kernels, and jammi-kernels'
-        # build.rs hard-fails when the cutlass submodule is not checked out.
-        # A `git clone`-shaped tree (gpu-dev.sh's own bootstrap of
-        # /root/jammi-ai) carries the GITLINK but not the checkout, so a
-        # fresh pod's auto-seed on main would always die in T1b — provision
-        # it here, before spending compile time (network, like the metadata
-        # priming above; a tree whose checkout is complete skips this). A
-        # non-git tree missing the header still fails loudly in build.rs
-        # exactly as before — never a silent T1b skip.
-        cutlass_inc="crates/jammi-kernels/third_party/cutlass/include"
-        # The guard's predicate is BUILD.RS'S predicate — the same file
-        # (include/cutlass/cutlass.h, crates/jammi-kernels/build.rs:311),
-        # never a coarser dir-exists check: an include/ dir whose
-        # cutlass/cutlass.h is gone (interrupted checkout, partial copy)
-        # must count as unprovisioned, or the seed skips provisioning and
-        # T1b dies with the exact panic this arm exists to eliminate.
-        if [ ! -f "$cutlass_inc/cutlass/cutlass.h" ] && git rev-parse --git-dir >/dev/null 2>&1; then # tripwire-ok: the probe's EXIT CODE is the branch condition ("is this tree a git repo at all"); a non-git tree is a legitimate state whose only correct handling is the else-path (build.rs fails loudly on a genuinely missing include/), and git's "not a git repository" stderr would be pure noise on that ordinary path
-          echo "=== T1b prerequisite: provisioning the CUTLASS submodule (git submodule update --init --force --checkout --depth 1) ==="
-          # --force --checkout: this arm only runs when include/ is MISSING,
-          # i.e. the checkout is already broken — a half-deleted worktree
-          # whose git metadata still claims the pinned commit would make a
-          # plain `update` a silent no-op (observed live on a100.2).
-          git submodule update --init --force --checkout --depth 1 crates/jammi-kernels/third_party/cutlass || {
-            echo "::error::CUTLASS submodule provisioning failed — T1b (flash-attn) cannot build; see git's own stderr above" >&2
-            exit 1
-          }
-        fi
+    # esc-050 gap (hit TWICE by #462/#463's own pod rounds, pods
+    # 12qwlsflxl0a1j and qpvv7iv4wn8owy, 2026-09-06): the CUTLASS
+    # provisioning below used to sit INSIDE the `_seed_is_main` block
+    # alongside T1b's own build, on the theory that only T1b needs it. But
+    # T1b's build being main-only and the SUBMODULE being needed are two
+    # different questions — a pod booted on a feature branch (every
+    # campaign pod) never reached this arm, so its seed never provisioned
+    # the submodule, and the FIRST time anything else on that pod (a sweep
+    # driver like finetune_run_ab.sh, which builds jammi-encoders/
+    # flash-attn itself, not this script) ran a `cargo build ... --features
+    # ...flash-attn`, it panicked in build.rs's own "CUTLASS submodule is
+    # not checked out" check. Provisioning must run whenever jammi-kernels
+    # DECLARES the flash-attn feature, on every branch; only T1b's own
+    # COMPILE below stays main-only. The feature check therefore now runs
+    # unconditionally (never gated on `_seed_is_main`), and its rc=2
+    # ("could not determine") abort below fires on every branch too — the
+    # provisioning decision needs the same answer T1b does, and "could not
+    # determine" is exactly as unsafe a default here as it is for T1b.
+    feat_rc=0
+    pod_seed_pkg_has_feature jammi-kernels flash-attn || feat_rc=$?
+    cutlass_provisioned="false"
+    cutlass_provisioned_reason="jammi-kernels declares no flash-attn feature (cargo metadata) — CUTLASS not needed"
+    if [ "$feat_rc" -eq 0 ]; then
+      # jammi-kernels' build.rs hard-fails when the cutlass submodule is
+      # not checked out. A `git clone`-shaped tree (gpu-dev.sh's own
+      # bootstrap of /root/jammi-ai) carries the GITLINK but not the
+      # checkout, so a fresh pod's auto-seed would always die the first
+      # time ANYTHING on it builds the flash-attn feature — provision it
+      # here, before spending compile time (network, like the metadata
+      # priming above; a tree whose checkout is complete skips this). A
+      # non-git tree missing the header still fails loudly in build.rs
+      # exactly as before — never a silent skip.
+      cutlass_inc="crates/jammi-kernels/third_party/cutlass/include"
+      # The guard's predicate is BUILD.RS'S predicate — the same file
+      # (include/cutlass/cutlass.h, crates/jammi-kernels/build.rs:311),
+      # never a coarser dir-exists check: an include/ dir whose
+      # cutlass/cutlass.h is gone (interrupted checkout, partial copy)
+      # must count as unprovisioned, or the seed skips provisioning and
+      # a later flash-attn build dies with the exact panic this arm
+      # exists to eliminate.
+      if [ ! -f "$cutlass_inc/cutlass/cutlass.h" ] && git rev-parse --git-dir >/dev/null 2>&1; then # tripwire-ok: the probe's EXIT CODE is the branch condition ("is this tree a git repo at all"); a non-git tree is a legitimate state whose only correct handling is the else-path (build.rs fails loudly on a genuinely missing include/), and git's "not a git repository" stderr would be pure noise on that ordinary path
+        echo "=== T1b prerequisite: provisioning the CUTLASS submodule (git submodule update --init --force --checkout --depth 1) ==="
+        # --force --checkout: this arm only runs when include/ is MISSING,
+        # i.e. the checkout is already broken — a half-deleted worktree
+        # whose git metadata still claims the pinned commit would make a
+        # plain `update` a silent no-op (observed live on a100.2).
+        git submodule update --init --force --checkout --depth 1 crates/jammi-kernels/third_party/cutlass || {
+          echo "::error::CUTLASS submodule provisioning failed — T1b (flash-attn) cannot build; see git's own stderr above" >&2
+          exit 1
+        }
+        cutlass_provisioned="true"
+        cutlass_provisioned_reason="provisioned (git submodule update --init --force --checkout --depth 1)"
+      else
+        cutlass_provisioned="true"
+        cutlass_provisioned_reason="already present (include/cutlass/cutlass.h) or non-git tree (build.rs owns the loud failure there)"
+      fi
+      if [ "$_seed_is_main" = "true" ]; then
         echo "=== T1b (main only): release -p jammi-bench --features cuda,jammi-kernels/flash-attn ==="
         cargo build --release -p jammi-bench --features cuda,jammi-kernels/flash-attn || exit 1
         t1b_ran="true"
         t1b_reason="declared (cargo metadata) and built (${_seed_main_reason})"
-      elif [ "$feat_rc" -eq 1 ]; then
+      fi
+    elif [ "$feat_rc" -eq 1 ]; then
+      if [ "$_seed_is_main" = "true" ]; then
         echo "=== T1b skipped: jammi-kernels declares no flash-attn feature (cargo metadata) ==="
         t1b_reason="jammi-kernels declares no flash-attn feature (cargo metadata, ${_seed_main_reason})"
-      else
-        # round-4 addendum: rc=2 ("could not determine") used to be treated
-        # the SAME as rc=1 ("genuinely absent") — silently skip T1b. That is
-        # exactly the failure mode the on-pod incident hit: a broken
-        # `--frozen` metadata query read as "no flash-attn feature", the
-        # seed stamped complete WITHOUT the FA2/T1b artifacts, and nothing
-        # about the completion marker said so. "Could not determine" is not
-        # a safe default to "absent" — abort the whole seed loudly instead,
-        # naming the ambiguity, so a broken metadata query can never
-        # silently downgrade what the seed actually contains.
-        echo "::error::could not determine whether jammi-kernels declares flash-attn (cargo metadata query failed or the package was not found) — refusing to guess 'absent'; see pod_seed_cargo_metadata_frozen's own ::error:: above for the real cause" >&2
-        exit 1
       fi
+    else
+      # round-4 addendum: rc=2 ("could not determine") used to be treated
+      # the SAME as rc=1 ("genuinely absent") — silently skip T1b. That is
+      # exactly the failure mode the on-pod incident hit: a broken
+      # `--frozen` metadata query read as "no flash-attn feature", the
+      # seed stamped complete WITHOUT the FA2/T1b artifacts, and nothing
+      # about the completion marker said so. "Could not determine" is not
+      # a safe default to "absent" — abort the whole seed loudly instead,
+      # naming the ambiguity, so a broken metadata query can never
+      # silently downgrade what the seed actually contains.
+      echo "::error::could not determine whether jammi-kernels declares flash-attn (cargo metadata query failed or the package was not found) — refusing to guess 'absent'; see pod_seed_cargo_metadata_frozen's own ::error:: above for the real cause" >&2
+      exit 1
     fi
 
     echo "=== T2: cargo test --no-run for runpod_gpu_prove.sh's own suites ==="
@@ -922,8 +950,10 @@ print(json.dumps({
   "rustflags": sys.argv[4], "size_bytes": int(sys.argv[5]),
   "manifest_sha256": sys.argv[6], "seed_source": "built",
   "t1b_flash_attn_ran": t1b_ran, "t1b_flash_attn_reason": sys.argv[8],
+  "cutlass_provisioned": sys.argv[9] == "true",
+  "cutlass_provisioned_reason": sys.argv[10],
 }, indent=2))
-' "$ref" "$sha" "$(date -u +%FT%TZ)" "${RUSTFLAGS:-}" "${size_bytes:-0}" "${manifest_sha256:-}" "$t1b_ran" "$t1b_reason" \
+' "$ref" "$sha" "$(date -u +%FT%TZ)" "${RUSTFLAGS:-}" "${size_bytes:-0}" "${manifest_sha256:-}" "$t1b_ran" "$t1b_reason" "$cutlass_provisioned" "$cutlass_provisioned_reason" \
       > "$COMPLETE_MARKER"
     echo "=== seed complete: $COMPLETE_MARKER ==="
   ) > "$log" 2>&1

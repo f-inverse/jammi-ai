@@ -3529,6 +3529,7 @@ PY
     # (every campaign pod's own provenance) rather than a same-sha detached
     # checkout.
     w_fresh_clone "$1"
+    w_git -C "$1" config user.email t@t; w_git -C "$1" config user.name t
     w_git -C "$1" checkout -q -b feature/esc050-any-branch
     echo "feature work" > "$1/feature.txt"
     w_git -C "$1" add feature.txt

@@ -24,9 +24,13 @@
 //!      the negative tail, where `Phi(x) -> 0` (unlike the positive tail,
 //!      where `Phi(x) -> 1`) so the bound's own denominator shrinks toward
 //!      zero while candle's OWN backward formula computes that tiny
-//!      result as a difference of two O(1) quantities — see
-//!      `COND_AWARE_ABS_FLOOR`'s own doc for the measured floor this
-//!      collapse needs.
+//!      result as a difference of two O(1) quantities —
+//!      [`backward_matches_candles_own_composition_within_the_condition_aware_bound`]
+//!      below is the LIVE producer for the measured floor this collapse
+//!      needs: it computes the max ADDITIVE excess of `|Δ|` over the
+//!      relative term alone, and its argmax `x`, and asserts `1.5x`
+//!      headroom against `COND_AWARE_ABS_FLOOR` (`jammi_kernels::ops::
+//!      gelu_erf`'s own doc on that constant cites this exact mechanism).
 //!   3. `ko1_*` — the producer-injected control (`KO-1`): a hand-built
 //!      "backward with the `x*phi(x)` term dropped" must FAIL the SAME
 //!      bound somewhere on the pre-registered grid `x in +-[0.05, 4]`
@@ -42,6 +46,7 @@
 //!      a direct `Var` does, through the identity map's Jacobian.
 
 use candle_core::{Device, Tensor, Var};
+use jammi_kernels::ops::gelu_erf::{COND_AWARE_ABS_FLOOR, COND_AWARE_TOL};
 use jammi_kernels::ops::{apply1, GeluErfFused};
 
 fn fused(x: &Tensor) -> candle_core::Result<Tensor> {
@@ -67,27 +72,13 @@ fn x_phi_f64(x: f64) -> f64 {
     x * pdf
 }
 
-/// The condition-aware bound's own relative tolerance factor.
-/// `no-producer: a pre-registered design constant, not a measurement`
-/// (KO-9's escape hatch for a genuinely-derived, not-measured number).
-const COND_AWARE_TOL: f64 = 4e-6;
-
-/// An ADDITIVE absolute floor on top of `COND_AWARE_TOL`'s relative term —
-/// needed for a real, disclosed reason a purely relative bound cannot cover
-/// (see the module doc's item 2 and `cond_aware_bound`'s own doc): `Phi(x)`
-/// is asymmetric (`-> 1` as `x -> +inf`, `-> 0` as `x -> -inf`), so on the
-/// NEGATIVE tail the relative term's own denominator `|Phi|+|x*phi|`
-/// collapses toward zero (both terms decay) while candle's OWN backward
-/// formula (`backprop.rs`'s `0.5 + scaled_exp_arg + erf_scaled_sqrt`)
-/// computes that same tiny result as a difference of two O(1) quantities
-/// (`0.5` and `0.5*erf(...)`, the latter approaching `-0.5` in this
-/// region) — catastrophic cancellation that leaves an F32-epsilon-scale
-/// ABSOLUTE residual independent of how small the true answer is. Measured
-/// (printed by [`backward_matches_candles_own_composition_within_the_condition_aware_bound`]
-/// on every run): the worst additive excess (`|Δ| - relative-term-only`)
-/// over this file's own `[-8,8]` step-`0.02` fixture is `~1.484e-8` (at `x
-/// = -5.24`); `1.5x` headroom over that measured worst case.
-const COND_AWARE_ABS_FLOOR: f64 = 2.226e-8;
+// `COND_AWARE_TOL`/`COND_AWARE_ABS_FLOOR` themselves are NOT redefined
+// here: they are this crate's own design constants (`pub const` on
+// `jammi_kernels::ops::gelu_erf`, imported above), and this file's own
+// `backward_matches_candles_own_composition_within_the_condition_aware_bound`
+// test below is the LIVE producer their doc comments (on the canonical
+// definitions) cite for the floor's `1.5x`-headroom derivation — see that
+// doc for the full mechanism.
 
 /// `tol*(|Phi(x)|+|x*phi(x)|) + floor` — RESULT-relative alone would be
 /// meaningless at the crossing (`Phi(x)+x*phi(x) == 0` there, the reason
@@ -171,6 +162,14 @@ fn backward_matches_candles_own_composition_within_the_condition_aware_bound() {
         .unwrap();
 
     let mut max_ratio = 0.0f64;
+    // The floor's own derivation mechanism, made REAL (KO-4): the max
+    // ADDITIVE excess of `|diff|` over the RELATIVE term alone (no floor
+    // added) -- the exact residual `COND_AWARE_ABS_FLOOR` exists to cover
+    // -- and its argmax `x`. This is the quantity `COND_AWARE_ABS_FLOOR`'s
+    // own doc (`jammi_kernels::ops::gelu_erf`) cites as "measured": it must
+    // have a LIVE producer here, not a bare, unverifiable number in prose.
+    let mut max_additive_excess = f64::NEG_INFINITY;
+    let mut worst_excess_x = 0.0f64;
     for (i, ((&xv, &df), &de)) in v
         .iter()
         .zip(dx_fused.iter())
@@ -178,7 +177,9 @@ fn backward_matches_candles_own_composition_within_the_condition_aware_bound() {
         .enumerate()
     {
         let diff = (df as f64 - de as f64).abs();
-        let bound = cond_aware_bound(xv as f64);
+        let relative_term =
+            COND_AWARE_TOL * (phi_f64(xv as f64).abs() + x_phi_f64(xv as f64).abs());
+        let bound = relative_term + COND_AWARE_ABS_FLOOR;
         // Affirmative comparison (KO-2/3.7): a non-finite `diff` must FAIL,
         // never read as a vacuous pass.
         assert!(
@@ -189,6 +190,11 @@ fn backward_matches_candles_own_composition_within_the_condition_aware_bound() {
         if bound > 0.0 {
             max_ratio = f64::max(max_ratio, diff / bound);
         }
+        let additive_excess = diff - relative_term;
+        if additive_excess > max_additive_excess {
+            max_additive_excess = additive_excess;
+            worst_excess_x = xv as f64;
+        }
     }
     // Disclosure, not a pass/fail line (the assertion above is that):
     // printed by this test so the measured worst-case ratio has a real
@@ -196,6 +202,22 @@ fn backward_matches_candles_own_composition_within_the_condition_aware_bound() {
     println!(
         "backward_matches_candles_own_composition: measured max diff/bound ratio over \
          [-8,8] step 0.02 = {max_ratio}"
+    );
+    // The SAME KO-4 discipline, for the floor's own derivation specifically:
+    // print the exact quantity `COND_AWARE_ABS_FLOOR`'s doc cites, and its
+    // argmax, on EVERY run.
+    println!(
+        "backward_matches_candles_own_composition: measured max additive excess (|diff| - \
+         relative-term-only) over [-8,8] step 0.02 = {max_additive_excess} at x = \
+         {worst_excess_x}"
+    );
+    assert!(
+        max_additive_excess.is_finite() && max_additive_excess * 1.5 <= COND_AWARE_ABS_FLOOR,
+        "COND_AWARE_ABS_FLOOR ({COND_AWARE_ABS_FLOOR}) must retain >= 1.5x headroom over the \
+         measured max additive excess ({max_additive_excess} at x={worst_excess_x}) -- if this \
+         fails, the floor's own derivation (a fixed 1.5x multiple of a measured worst case) is \
+         stale and must be re-measured from this run's own printed value, never silently \
+         loosened"
     );
 }
 

@@ -717,6 +717,273 @@ class AbOpLnTests(unittest.TestCase):
         self.assertEqual(name, "bogus_op")
 
 
+class AbOpAttnGeluTests(unittest.TestCase):
+    """#462/#463: the multi-key `disable_keys`/`expected_shapes` shape and
+    the list-form `cross_check` (strong + pair_identity)."""
+
+    def test_attn_fused_leg_clean_with_softmax_absorbed_00(self):
+        # The fused-arm (0, 0) softmax shape: softmax is ABSORBED into the
+        # block op while the block admits -- never independently
+        # dispatched at all, not "eager".
+        row = {"leg_id": "x", "arm": "fused", "extra_disable": []}
+        tier = {
+            "attention_block_fused_dispatches": 1, "attention_block_eager_dispatches": 0,
+            "softmax_fused_dispatches": 0, "softmax_eager_dispatches": 0,
+            "kernels_disabled_requested": [], "kernels_disabled_fired": [],
+        }
+        self.assertEqual(m.dispatch_violations(row, tier, m.OPS["attn"]), [])
+
+    def test_attn_eager_leg_clean(self):
+        row = {"leg_id": "x", "arm": "attn_eager", "extra_disable": []}
+        tier = {
+            "attention_block_fused_dispatches": 0, "attention_block_eager_dispatches": 3,
+            "softmax_fused_dispatches": 0, "softmax_eager_dispatches": 3,
+            "kernels_disabled_requested": ["attention_block_fused", "softmax_last_dim_fused"],
+            "kernels_disabled_fired": ["attention_block_fused", "softmax_last_dim_fused"],
+        }
+        self.assertEqual(m.dispatch_violations(row, tier, m.OPS["attn"]), [])
+
+    def test_attn_eager_leg_missing_softmax_key_from_requested_is_a_violation(self):
+        # Only attention_block_fused named -- the block-fused arm subsumes
+        # softmax, so naming softmax_last_dim_fused too is REQUIRED on this
+        # ops own eager arm (disabling attention_block_fused alone would be
+        # a silent no-op on softmax's own dispatch, per admission.rs's
+        # "Standalone vs subsumed op keys" section).
+        row = {"leg_id": "x", "arm": "attn_eager", "extra_disable": []}
+        tier = {
+            "attention_block_fused_dispatches": 0, "attention_block_eager_dispatches": 3,
+            "softmax_fused_dispatches": 0, "softmax_eager_dispatches": 3,
+            "kernels_disabled_requested": ["attention_block_fused"],
+            "kernels_disabled_fired": ["attention_block_fused"],
+        }
+        vs = m.dispatch_violations(row, tier, m.OPS["attn"])
+        self.assertTrue(any("dispatch proof failed" in v for v in vs), vs)
+
+    def test_attn_eager_leg_with_softmax_fused_gt_0_is_a_red_control(self):
+        # RED CONTROL: the eager arm still shows softmax_fused_dispatches
+        # > 0 -- softmax did NOT actually run eager despite the disable
+        # claim. Must fail, never silently pass.
+        row = {"leg_id": "x", "arm": "attn_eager", "extra_disable": []}
+        tier = {
+            "attention_block_fused_dispatches": 0, "attention_block_eager_dispatches": 3,
+            "softmax_fused_dispatches": 1, "softmax_eager_dispatches": 2,
+            "kernels_disabled_requested": ["attention_block_fused", "softmax_last_dim_fused"],
+            "kernels_disabled_fired": ["attention_block_fused", "softmax_last_dim_fused"],
+        }
+        vs = m.dispatch_violations(row, tier, m.OPS["attn"])
+        self.assertTrue(
+            any("dispatch proof failed for key 'softmax'" in v for v in vs), vs
+        )
+
+    def test_attn_multi_key_symmetry_check_clean(self):
+        # Both of attn's own disable_keys plus one EXTRA_DISABLE entry,
+        # symmetrically recorded -- the symmetry check subtracts attn's
+        # WHOLE key set, not one key.
+        row = {"leg_id": "x", "arm": "attn_eager", "extra_disable": ["some_other_op"]}
+        tier = {
+            "attention_block_fused_dispatches": 0, "attention_block_eager_dispatches": 3,
+            "softmax_fused_dispatches": 0, "softmax_eager_dispatches": 3,
+            "kernels_disabled_requested": [
+                "attention_block_fused", "softmax_last_dim_fused", "some_other_op",
+            ],
+            "kernels_disabled_fired": ["attention_block_fused", "softmax_last_dim_fused"],
+        }
+        self.assertEqual(m.dispatch_violations(row, tier, m.OPS["attn"]), [])
+
+    def test_attn_multi_key_symmetry_check_asymmetric_is_a_violation(self):
+        row = {"leg_id": "x", "arm": "attn_eager", "extra_disable": []}
+        tier = {
+            "attention_block_fused_dispatches": 0, "attention_block_eager_dispatches": 3,
+            "softmax_fused_dispatches": 0, "softmax_eager_dispatches": 3,
+            "kernels_disabled_requested": [
+                "attention_block_fused", "softmax_last_dim_fused", "some_other_op",
+            ],
+            "kernels_disabled_fired": ["attention_block_fused", "softmax_last_dim_fused"],
+        }
+        vs = m.dispatch_violations(row, tier, m.OPS["attn"])
+        self.assertTrue(any("asymmetric" in v for v in vs), vs)
+
+    def test_gelu_fused_leg_clean_is_no_violation(self):
+        row = {"leg_id": "x", "arm": "fused", "extra_disable": []}
+        tier = {
+            "gelu_fused_dispatches": 1, "gelu_eager_dispatches": 0,
+            "kernels_disabled_requested": [], "kernels_disabled_fired": [],
+        }
+        self.assertEqual(m.dispatch_violations(row, tier, m.OPS["gelu"]), [])
+
+    def test_gelu_eager_leg_clean_is_no_violation(self):
+        row = {"leg_id": "x", "arm": "gelu_eager", "extra_disable": []}
+        tier = {
+            "gelu_fused_dispatches": 0, "gelu_eager_dispatches": 4,
+            "kernels_disabled_requested": ["gelu_erf_fused"],
+            "kernels_disabled_fired": ["gelu_erf_fused"],
+        }
+        self.assertEqual(m.dispatch_violations(row, tier, m.OPS["gelu"]), [])
+
+    def test_gelu_fused_leg_with_eager_dispatches_is_a_violation(self):
+        row = {"leg_id": "x", "arm": "fused", "extra_disable": []}
+        tier = {
+            "gelu_fused_dispatches": 1, "gelu_eager_dispatches": 1,
+            "kernels_disabled_requested": [], "kernels_disabled_fired": [],
+        }
+        vs = m.dispatch_violations(row, tier, m.OPS["gelu"])
+        self.assertTrue(any("dispatch proof failed" in v for v in vs), vs)
+
+    def test_op_cfg_for_row_resolves_attn_and_gelu(self):
+        cfg, name = m.op_cfg_for_row({"leg_id": "x", "ab_op": "attn"})
+        self.assertEqual(name, "attn")
+        self.assertIs(cfg, m.OPS["attn"])
+        cfg, name = m.op_cfg_for_row({"leg_id": "x", "ab_op": "gelu"})
+        self.assertEqual(name, "gelu")
+        self.assertIs(cfg, m.OPS["gelu"])
+
+
+class PairIdentityCheckTests(unittest.TestCase):
+    """`apply_pair_identity_checks` -- the pair_identity cross-check form
+    (#462): a counter family's value must read IDENTICAL between the
+    fused/control arm and this op's own eager arm of the same
+    (model, shape, steps, repeat) cell."""
+
+    def _leg(self, leg_id, model, shape, steps, repeat, arm, tier):
+        return {
+            "row": {"leg_id": leg_id, "model": model, "shape": shape, "steps": steps,
+                     "repeat": repeat, "arm": arm, "ab_op": "attn"},
+            "tier": tier,
+            "violations": [],
+        }
+
+    def test_matching_declined_counts_across_arms_is_clean(self):
+        tier_fused = {"attention_block_flash_fused_dispatches": 0,
+                      "attention_block_flash_declined_dispatches": 1200}
+        tier_eager = {"attention_block_flash_fused_dispatches": 0,
+                      "attention_block_flash_declined_dispatches": 1200}
+        legs = [
+            self._leg("f", "bert", "wire", 600, 1, "fused", tier_fused),
+            self._leg("e", "bert", "wire", 600, 1, "attn_eager", tier_eager),
+        ]
+        m.apply_pair_identity_checks(legs)
+        self.assertEqual(legs[0]["violations"], [])
+        self.assertEqual(legs[1]["violations"], [])
+
+    def test_both_zero_is_a_legitimate_reading_not_a_violation(self):
+        tier_fused = {"attention_block_flash_fused_dispatches": 0,
+                      "attention_block_flash_declined_dispatches": 0}
+        tier_eager = {"attention_block_flash_fused_dispatches": 0,
+                      "attention_block_flash_declined_dispatches": 0}
+        legs = [
+            self._leg("f", "bert", "wire", 600, 1, "fused", tier_fused),
+            self._leg("e", "bert", "wire", 600, 1, "attn_eager", tier_eager),
+        ]
+        m.apply_pair_identity_checks(legs)
+        self.assertEqual(legs[0]["violations"], [])
+        self.assertEqual(legs[1]["violations"], [])
+
+    def test_mismatched_declined_counts_voids_both_legs(self):
+        tier_fused = {"attention_block_flash_fused_dispatches": 0,
+                      "attention_block_flash_declined_dispatches": 1200}
+        tier_eager = {"attention_block_flash_fused_dispatches": 0,
+                      "attention_block_flash_declined_dispatches": 999}
+        legs = [
+            self._leg("f", "bert", "wire", 600, 1, "fused", tier_fused),
+            self._leg("e", "bert", "wire", 600, 1, "attn_eager", tier_eager),
+        ]
+        m.apply_pair_identity_checks(legs)
+        self.assertTrue(any("pair-identity check failed" in v for v in legs[0]["violations"]), legs[0])
+        self.assertTrue(any("pair-identity check failed" in v for v in legs[1]["violations"]), legs[1])
+
+    def test_different_cells_never_compared(self):
+        tier_fused = {"attention_block_flash_fused_dispatches": 0,
+                      "attention_block_flash_declined_dispatches": 1200}
+        tier_eager = {"attention_block_flash_fused_dispatches": 0,
+                      "attention_block_flash_declined_dispatches": 100}
+        legs = [
+            self._leg("f", "bert", "wire", 600, 1, "fused", tier_fused),
+            self._leg("e", "bert", "chapter", 600, 1, "attn_eager", tier_eager),
+        ]
+        m.apply_pair_identity_checks(legs)
+        self.assertEqual(legs[0]["violations"], [])
+        self.assertEqual(legs[1]["violations"], [])
+
+    def test_ops_with_no_pair_identity_keys_are_untouched(self):
+        legs = [
+            self._leg("f", "bert", "wire", 600, 1, "fused", {}),
+        ]
+        legs[0]["row"]["ab_op"] = "lora_linear"
+        m.apply_pair_identity_checks(legs)
+        self.assertEqual(legs[0]["violations"], [])
+
+    def test_list_form_invariant_with_one_live_and_one_absorbed_key(self):
+        # A synthetic op config combining BOTH cross_check kinds in one
+        # list -- the shape a real op could carry even though none of the
+        # four in `OPS` today does: a "strong" entry (a LIVE key that must
+        # stay fused>0/eager==0 throughout, like ln's own lora_linear
+        # cross-check) alongside a "pair_identity" entry (an ABSORBED/
+        # declined key that must read identically across arms, like attn's
+        # own attention_block_flash). `dispatch_violations` (single-leg)
+        # must apply ONLY the strong entry; `apply_pair_identity_checks`
+        # (cross-leg) must apply ONLY the pair_identity entry -- each
+        # ignores the other kind silently rather than mis-happing it.
+        synthetic_op = {
+            "disable_keys": ["synthetic_fused"],
+            "counter_base": "synthetic",
+            "eager_arm": "synthetic_eager",
+            "expected_shapes": {
+                "fused": {"synthetic": (">0", 0)},
+                "synthetic_eager": {"synthetic": (0, ">0")},
+            },
+            "cross_check": [
+                {"kind": "strong", "op": "lora_linear"},
+                {
+                    "kind": "pair_identity",
+                    "field_base": "attention_block_flash",
+                    "value_fields": ("fused_dispatches", "declined_dispatches"),
+                },
+            ],
+        }
+        # dispatch_violations: the strong entry alone applies.
+        row = {"leg_id": "x", "arm": "fused", "extra_disable": [], "ab_op": "synthetic"}
+        clean_tier = {
+            "synthetic_fused_dispatches": 1, "synthetic_eager_dispatches": 0,
+            "lora_linear_fused_dispatches": 1, "lora_linear_eager_dispatches": 0,
+            "kernels_disabled_requested": [], "kernels_disabled_fired": [],
+        }
+        self.assertEqual(m.dispatch_violations(row, clean_tier, synthetic_op), [])
+        broken_tier = dict(clean_tier)
+        broken_tier["lora_linear_fused_dispatches"] = 0
+        broken_tier["lora_linear_eager_dispatches"] = 1
+        vs = m.dispatch_violations(row, broken_tier, synthetic_op)
+        self.assertTrue(any("cross-op invariant failed" in v for v in vs), vs)
+
+        # apply_pair_identity_checks: the pair_identity entry alone
+        # applies, at the group level (dispatch_violations never touches
+        # attention_block_flash at all for this synthetic op).
+        legs = [
+            {
+                "row": {"leg_id": "sf", "model": "bert", "shape": "wire", "steps": 600,
+                        "repeat": 1, "arm": "fused", "ab_op": "synthetic"},
+                "tier": {"attention_block_flash_fused_dispatches": 0,
+                          "attention_block_flash_declined_dispatches": 5},
+                "violations": [],
+            },
+            {
+                "row": {"leg_id": "se", "model": "bert", "shape": "wire", "steps": 600,
+                        "repeat": 1, "arm": "synthetic_eager", "ab_op": "synthetic"},
+                "tier": {"attention_block_flash_fused_dispatches": 0,
+                          "attention_block_flash_declined_dispatches": 7},
+                "violations": [],
+            },
+        ]
+        orig_ops = dict(m.OPS)
+        try:
+            m.OPS["synthetic"] = synthetic_op
+            m.apply_pair_identity_checks(legs)
+        finally:
+            m.OPS.clear()
+            m.OPS.update(orig_ops)
+        self.assertTrue(any("pair-identity check failed" in v for v in legs[0]["violations"]), legs[0])
+        self.assertTrue(any("pair-identity check failed" in v for v in legs[1]["violations"]), legs[1])
+
+
 class AbOpLnEndToEndTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -809,6 +1076,78 @@ class AbOpLnEndToEndTests(unittest.TestCase):
             artifact = json.load(f)
         self.assertEqual(artifact["ab_op"], "lora_linear")
         self.assertNotIn("landing_rule", artifact["notes"])
+
+    def test_end_to_end_attn_activate_with_softmax_absorbed_and_flash_declined(self):
+        # A full `AB_OP=attn` pipeline: fused legs read
+        # attention_block(>0,0)/softmax(0,0) (absorbed), eager legs read
+        # attention_block(0,>0)/softmax(0,>0), and attention_block_flash is
+        # declined identically on every leg regardless of arm (BERT/
+        # DistilBERT never wire the flash transport) -- the pair-identity
+        # cross-check this sweep depends on.
+        rows = []
+
+        def attn_tier(*, steps, requested, fired, wall, block_disabled, softmax_disabled):
+            tier = {}
+            tier.update(base_identity(8, 512, "f32"))
+            tier.update(base_provenance(steps, requested, fired))
+            tier["train_run_wall_s"] = wall
+            tier["attention_block_fused_dispatches"] = 0 if block_disabled else 1
+            tier["attention_block_eager_dispatches"] = 1 if block_disabled else 0
+            if block_disabled:
+                tier["softmax_fused_dispatches"] = 0 if softmax_disabled else 1
+                tier["softmax_eager_dispatches"] = 1 if softmax_disabled else 0
+            else:
+                tier["softmax_fused_dispatches"] = 0
+                tier["softmax_eager_dispatches"] = 0
+            tier["attention_block_flash_fused_dispatches"] = 0
+            tier["attention_block_flash_declined_dispatches"] = steps * 12
+            return tier
+
+        def add_attn_leg(shape, arm, steps, repeat, wall):
+            eager = arm == "attn_eager"
+            requested = ["attention_block_fused", "softmax_last_dim_fused"] if eager else []
+            fired = list(requested)
+            leg_id = f"bert-{shape}-{arm}-{steps}-r{repeat}"
+            tier = attn_tier(
+                steps=steps, requested=requested, fired=fired, wall=wall,
+                block_disabled=eager, softmax_disabled=eager,
+            )
+            rel = f"raw/{leg_id}.json"
+            full = os.path.join(self.root, rel)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w") as f:
+                json.dump({"tool": "test", "tiers": {"finetune_run": tier}}, f)
+            rows.append({
+                "leg_id": leg_id, "model": "bert", "shape": shape, "batch": 8, "width": 512,
+                "dtype": "f32", "arm": arm, "steps": steps, "repeat": repeat, "ab_op": "attn",
+                "env": {"JAMMI_KERNELS_STRICT": "1", "JAMMI_KERNELS_DISABLE": ",".join(requested)},
+                "extra_disable": [], "argv": [], "rc": 0, "wall_s": wall, "status": "ok",
+                "reason": "", "git_sha": "0" * 40, "box": "test-box", "dry_run": True,
+                "report_path": rel, "stderr_path": f"raw/{leg_id}.stderr",
+            })
+
+        for arm, walls_m in (("fused", [51.0, 50.0, 51.0]), ("attn_eager", [66.0, 65.0, 65.0])):
+            for r, wall_m in enumerate(walls_m, start=1):
+                add_attn_leg(m.WIRE_SHAPE, arm, m.STEPS_N, r, 1.0)
+                add_attn_leg(m.WIRE_SHAPE, arm, m.STEPS_M, r, wall_m)
+        for arm, walls_m in (("fused", [26.0, 25.0, 25.0]), ("attn_eager", [36.0, 35.0, 35.0])):
+            for r, wall_m in enumerate(walls_m, start=1):
+                add_attn_leg(m.CHAPTER_SHAPE, arm, m.STEPS_N, r, 1.0)
+                add_attn_leg(m.CHAPTER_SHAPE, arm, m.STEPS_M, r, wall_m)
+        for r, wall_m in enumerate([52.0, 51.0, 51.0], start=1):
+            add_attn_leg(m.CONTROL_SHAPE, "control", m.STEPS_N, r, 1.0)
+            add_attn_leg(m.CONTROL_SHAPE, "control", m.STEPS_M, r, wall_m)
+
+        write_manifest(self.root, rows)
+        out_path = os.path.join(self.root, "out.json")
+        rc = m.main([self.root, out_path, "--git-sha", "f" * 40, "--op", "attn"])
+        self.assertEqual(rc, 0)
+        with open(out_path) as f:
+            artifact = json.load(f)
+        self.assertEqual(artifact["ab_op"], "attn")
+        self.assertEqual(artifact["notes"]["verdicts"]["bert"]["verdict"], "ACTIVATE")
+        for leg in artifact["legs"]:
+            self.assertEqual(leg["violations"], [], leg)
 
     def test_manifest_disagreeing_on_ab_op_refuses(self):
         rows = []

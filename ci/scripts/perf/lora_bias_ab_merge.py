@@ -64,24 +64,58 @@ plan-428-p2b.md`'s v1-amendment "bar met -> guide row; missed-but-not-slower
      fired and at least one activating shape's own cell is invalid (not
      enough coverage to honestly assert NEUTRAL either).
 
-## Per-op generalization (#460)
+## Per-op generalization (#460, extended #462/#463)
 
 This merger is no longer `lora_linear_fused`-only: `OPS` names every op
 `lora_bias_ab.sh` can drive (`lora_linear` -- the #428 default, unchanged;
-`ln` -- #460's bias-carrying fused LayerNorm site), and `--op` (or a
-manifest's own `ab_op` field, read back automatically when `--op` is
+`ln` -- #460's bias-carrying fused LayerNorm site; `attn` -- #462's shared
+attention cascade seam; `gelu` -- #463's fused erf-GELU site), and `--op`
+(or a manifest's own `ab_op` field, read back automatically when `--op` is
 omitted) selects which one this merge run classifies. Everything above this
 section (cell model, floor, verdict priority) is IDENTICAL across ops --
-only the dispatch-proof's counter-field base and disable key change. `ln`
-additionally carries a `cross_check` onto `lora_linear`: since #428 already
-made the LoRA-linear site fused-by-default on BOTH models, an `AB_OP=ln`
-sweep pins `lora_linear` fused on EVERY leg regardless of that leg's own
-arm, so the fused/eager differential it measures isolates the LayerNorm
-site alone -- `dispatch_violations` checks this unconditionally when an
-op's own config names a `cross_check`. `ln`'s fusion ships regardless of
-its measured gain (no activation bar, pre-registered as such) -- the
-artifact's own `notes.landing_rule` states this for a reader who only has
-the JSON, never only in this docstring.
+only the dispatch-proof's own key set/counter families change.
+
+An op's own dispatch proof is no longer single-key: `disable_keys` is a
+LIST (one entry for every op except `attn`, whose eager arm forces BOTH
+`attention_block_fused` and `softmax_last_dim_fused` together -- a
+block-fused arm SUBSUMES the softmax step, so disabling either key alone
+would be a silent no-op on the differential, `crate::admission`'s own
+"Standalone vs subsumed op keys" section), and `expected_shapes` names,
+PER ARM, every counter-family KEY that arm's own report must show a
+specific `(fused, eager)` shape for -- `attn`'s fused arm reads
+`attention_block (>0, 0)` AND `softmax (0, 0)` (softmax is absorbed into
+the block op, never independently dispatched while the block admits); its
+eager arm reads `attention_block (0, >0)` AND `softmax (0, >0)`. The
+symmetry check (`kernels_disabled_requested` minus this op's OWN key set
+must equal the leg's own recorded `extra_disable`) subtracts the whole
+`disable_keys` SET, not a single key.
+
+`cross_check` generalizes past #460's single "this other op stays fused
+throughout" form into a LIST with TWO predicate shapes:
+
+  * **strong** (`{"kind": "strong", "op": <other op name>}`) -- the #460
+    form, BYTE-FOR-BYTE: the named op's own primary counter reads
+    `fused > 0, eager == 0` and its own `disable_keys` are absent from
+    `kernels_disabled_requested`, checked on EVERY leg of this op's sweep
+    regardless of that leg's own arm. `ln`'s cross_check onto
+    `lora_linear` is exactly this, unchanged since #460.
+  * **pair_identity** (`{"kind": "pair_identity", "field_base": <name>,
+    "value_fields": (...)}`) -- new (#462): for a counter family that is a
+    CASCADE-ABSORBED/DECLINED sibling rather than a live fused/eager
+    switch (`attention_block_flash`: BERT/DistilBERT decline it by
+    construction, regardless of whether `attention_block_fused` itself is
+    forced eager), the named fields must read IDENTICAL between the
+    fused/control arm and this op's own eager arm of the SAME
+    `(model, shape, steps, repeat)` cell -- `(0, 0)` on both sides is a
+    legitimate, non-violating reading. Applied by
+    `apply_pair_identity_checks` (a group-level pass, alongside
+    `apply_identity_checks`), since it compares TWO legs, not one leg in
+    isolation the way `dispatch_violations` does.
+
+`ln`'s fusion (and, per its own `landing_rule`, `attn`'s and `gelu`'s) ships
+regardless of its measured gain (no activation bar, pre-registered as such)
+-- the artifact's own `notes.landing_rule` states this for a reader who
+only has the JSON, never only in this docstring.
 
 Run: `python3 ci/scripts/perf/lora_bias_ab_merge.py RAW_DIR OUT.json`
 (`RAW_DIR` is the sweep's own `$OUT_DIR` -- the directory holding
@@ -117,29 +151,80 @@ STEPS_N = 100
 STEPS_M = 600
 GAIN_BAR = 0.05
 
-# #460 — per-op generalization. Each entry: which single admission key this
-# op's own A/B forces eager (`op_key`), the counter-field base its report
-# carries (`<base>_fused_dispatches` / `<base>_eager_dispatches`), the arm
-# label `lora_bias_ab.sh` gives that op's own eager arm, and — ONLY for an op
-# whose fusion ships regardless of gain (no activation bar) — the OTHER op
-# whose own dispatch proof must ALSO hold fused>0/eager==0 on every leg of
-# THIS op's sweep (`cross_check`, `None` for `lora_linear`: nothing else is
-# pinned fused for its own sweep). `lora_linear` is this table's pre-#460
-# entry, unchanged — every default-arg call site below that omits an
-# explicit op config resolves to `OPS["lora_linear"]`, which is what keeps
-# `AB_OP=lora_linear` byte-for-byte identical to the #428 contract.
+# #460, extended #462/#463 — per-op generalization. Each entry:
+#   disable_keys   -- the SET of admission keys this op's own eager arm
+#                      forces off together (one entry for every op except
+#                      `attn`, whose block-fused arm subsumes the softmax
+#                      step -- see the module doc).
+#   counter_base   -- this op's own PRIMARY counter-field base
+#                      (`<base>_fused_dispatches` / `<base>_eager_dispatches`)
+#                      -- also what a `cross_check` "strong" entry reads when
+#                      ANOTHER op's sweep pins this op fused throughout.
+#   eager_arm      -- the arm label `lora_bias_ab.sh` gives this op's own
+#                      eager arm.
+#   expected_shapes -- per arm ("fused" covers both the `fused` and
+#                      `control` arm labels; the eager-arm-label key covers
+#                      that op's own eager arm), a dict of
+#                      `{counter_family_key: (fused_pred, eager_pred)}`
+#                      -- every key besides this op's own `counter_base` is
+#                      an ADDITIONAL counter family this arm's own report
+#                      must also satisfy (`attn`'s `softmax` key). A pred is
+#                      `0` (must read exactly zero) or `">0"` (must read
+#                      greater than zero).
+#   cross_check    -- a LIST of cross-leg invariants this op's OWN sweep
+#                      additionally pins on every leg (see the module doc's
+#                      "strong"/"pair_identity" shapes); `[]` for an op that
+#                      pins nothing else.
+# `lora_linear` is this table's pre-#460 entry, unchanged — every
+# default-arg call site below that omits an explicit op config resolves to
+# `OPS["lora_linear"]`, which is what keeps `AB_OP=lora_linear`
+# byte-for-byte identical to the #428 contract.
 OPS = {
     "lora_linear": {
-        "op_key": LORA_OP,
+        "disable_keys": [LORA_OP],
         "counter_base": "lora_linear",
         "eager_arm": "lora_eager",
-        "cross_check": None,
+        "expected_shapes": {
+            "fused": {"lora_linear": (">0", 0)},
+            "lora_eager": {"lora_linear": (0, ">0")},
+        },
+        "cross_check": [],
     },
     "ln": {
-        "op_key": "layer_norm_fused",
+        "disable_keys": ["layer_norm_fused"],
         "counter_base": "ln",
         "eager_arm": "ln_eager",
-        "cross_check": "lora_linear",
+        "expected_shapes": {
+            "fused": {"ln": (">0", 0)},
+            "ln_eager": {"ln": (0, ">0")},
+        },
+        "cross_check": [{"kind": "strong", "op": "lora_linear"}],
+    },
+    "attn": {
+        "disable_keys": ["attention_block_fused", "softmax_last_dim_fused"],
+        "counter_base": "attention_block",
+        "eager_arm": "attn_eager",
+        "expected_shapes": {
+            "fused": {"attention_block": (">0", 0), "softmax": (0, 0)},
+            "attn_eager": {"attention_block": (0, ">0"), "softmax": (0, ">0")},
+        },
+        "cross_check": [
+            {
+                "kind": "pair_identity",
+                "field_base": "attention_block_flash",
+                "value_fields": ("fused_dispatches", "declined_dispatches"),
+            },
+        ],
+    },
+    "gelu": {
+        "disable_keys": ["gelu_erf_fused"],
+        "counter_base": "gelu",
+        "eager_arm": "gelu_eager",
+        "expected_shapes": {
+            "fused": {"gelu": (">0", 0)},
+            "gelu_eager": {"gelu": (0, ">0")},
+        },
+        "cross_check": [],
     },
 }
 
@@ -187,47 +272,63 @@ def wall_violations(leg_id, tier):
     return []
 
 
+def _pred_ok(value, pred):
+    """`pred` is `0` (must read exactly zero) or `">0"` (must read strictly
+    positive) -- see `OPS`'s own `expected_shapes` doc."""
+    if pred == 0:
+        return value == 0
+    return value > 0
+
+
 def dispatch_violations(row, tier, op_cfg=None):
-    """The single-op dispatch proof (CONTRACT), generalized over `OPS` (#460)
-    -- defaults to `OPS["lora_linear"]` (the #428 contract, unchanged) when
-    `op_cfg` is omitted, which is what keeps every pre-#460 call site (and
-    every pre-#460 test) byte-for-byte identical:
-      * `fused`/`control` legs: `fused > 0`, `eager == 0`, and this op's own
-        `op_key` NOT in `kernels_disabled_requested` (the fused arm makes no
+    """The per-op dispatch proof (CONTRACT), generalized over `OPS`
+    (#460, extended #462/#463) -- defaults to `OPS["lora_linear"]` (the
+    #428 contract, unchanged) when `op_cfg` is omitted, which is what keeps
+    every pre-#460 call site (and every pre-#460 test) byte-for-byte
+    identical:
+      * `fused`/`control` legs: for EVERY key in `op_cfg["expected_shapes"]
+        ["fused"]`, that key's `(fused, eager)` counter pair matches its own
+        `(fused_pred, eager_pred)` -- and none of `op_cfg["disable_keys"]`
+        appear in `kernels_disabled_requested` (the fused arm makes no
         disable claim at all -- see `finetune_run.rs`'s own `Arm::Fused`
         doc).
       * this op's own eager-arm-label legs (`op_cfg["eager_arm"]` -- e.g.
-        `lora_eager`/`ln_eager`): `fused == 0`, `eager > 0`, and `op_key`
-        present in BOTH `kernels_disabled_requested` AND
-        `kernels_disabled_fired` (disable wins over Strict --
-        `crate::admission::admit_inner`'s own doc -- so a genuine eager leg
-        must show the op both requested-disabled and actually fired).
+        `lora_eager`/`ln_eager`/`attn_eager`/`gelu_eager`): for EVERY key in
+        `op_cfg["expected_shapes"][op_cfg["eager_arm"]]`, that key's own
+        shape holds -- and EVERY key in `op_cfg["disable_keys"]` is present
+        in BOTH `kernels_disabled_requested` AND `kernels_disabled_fired`
+        (disable wins over Strict -- `crate::admission::admit_inner`'s own
+        doc -- so a genuine eager leg must show every one of this op's own
+        keys both requested-disabled and actually fired; `attn`'s eager arm
+        forces BOTH `attention_block_fused` and `softmax_last_dim_fused`
+        together, never one alone, since a block-fused arm subsumes the
+        softmax step).
     Plus the EXTRA_DISABLE symmetry check every leg carries regardless of
-    arm: `kernels_disabled_requested` minus `{op_key}` must equal the leg's
-    OWN recorded `extra_disable` set -- an asymmetric `JAMMI_KERNELS_DISABLE`
-    (extra entries on one arm only) would silently change which op each
-    arm's numbers actually describe.
+    arm: `kernels_disabled_requested` minus this op's WHOLE `disable_keys`
+    SET must equal the leg's OWN recorded `extra_disable` set -- an
+    asymmetric `JAMMI_KERNELS_DISABLE` (extra entries on one arm only)
+    would silently change which op each arm's numbers actually describe.
 
-    Plus (#460), ONLY when `op_cfg["cross_check"]` names another op: the
-    CROSS-op invariant this op's own sweep pins for every leg regardless of
-    ITS OWN arm -- the cross-check op must independently read `fused > 0`,
-    `eager == 0`, and its own `op_key` NOT in `kernels_disabled_requested`.
+    Plus (#460, extended #462), for every entry in `op_cfg["cross_check"]`
+    of `"kind": "strong"`: the CROSS-op invariant this op's own sweep pins
+    for every leg regardless of ITS OWN arm -- the named op must
+    independently read `fused > 0`, `eager == 0` on its own `counter_base`,
+    and none of its own `disable_keys` in `kernels_disabled_requested`.
     `AB_OP=ln` uses this to state, mechanically, that the LoRA-linear site
     stays fused on BOTH arms of an `ln` sweep -- the fused/eager
     differential this sweep measures isolates the LayerNorm site alone,
-    never a confound from the LoRA site also flipping arms.
+    never a confound from the LoRA site also flipping arms. `"kind":
+    "pair_identity"` entries are NOT checked here (they compare two DIFFERENT
+    legs of the same cell, not one leg in isolation) -- see
+    `apply_pair_identity_checks`.
     """
     op_cfg = op_cfg or OPS["lora_linear"]
-    op_key = op_cfg["op_key"]
-    base = op_cfg["counter_base"]
+    disable_keys = op_cfg["disable_keys"]
     eager_arm = op_cfg["eager_arm"]
-    fused_field = f"{base}_fused_dispatches"
-    eager_field = f"{base}_eager_dispatches"
+    expected_shapes = op_cfg["expected_shapes"]
 
     leg_id = row.get("leg_id")
     arm = row.get("arm")
-    fused = tier.get(fused_field)
-    eager = tier.get(eager_field)
     requested = tier.get("kernels_disabled_requested")
     fired = tier.get("kernels_disabled_fired")
 
@@ -238,57 +339,80 @@ def dispatch_violations(row, tier, op_cfg=None):
     if not isinstance(fired, list):
         v.append(f"{leg_id}: kernels_disabled_fired missing or not a list")
         fired = []
-    if not isinstance(fused, (int, float)) or isinstance(fused, bool) or not isinstance(
-        eager, (int, float)
-    ) or isinstance(eager, bool):
-        v.append(f"{leg_id}: {base}_{{fused,eager}}_dispatches missing or not numeric")
-        return v
 
+    shape_key = None
     if arm in ("fused", "control"):
-        if not (fused > 0 and eager == 0 and op_key not in requested):
-            v.append(
-                f"{leg_id}: fused/control dispatch proof failed "
-                f"(fused={fused}, eager={eager}, {op_key!r} in requested={op_key in requested})"
-            )
+        shape_key = "fused"
     elif arm == eager_arm:
-        if not (fused == 0 and eager > 0 and op_key in requested and op_key in fired):
-            v.append(
-                f"{leg_id}: {eager_arm} dispatch proof failed "
-                f"(fused={fused}, eager={eager}, requested={requested!r}, fired={fired!r})"
-            )
+        shape_key = eager_arm
     else:
         v.append(f"{leg_id}: unrecognized arm label {arm!r}")
 
+    if shape_key is not None:
+        for key, (fused_pred, eager_pred) in expected_shapes[shape_key].items():
+            fused_field = f"{key}_fused_dispatches"
+            eager_field = f"{key}_eager_dispatches"
+            fused_val = tier.get(fused_field)
+            eager_val = tier.get(eager_field)
+            if not _is_finite_real(fused_val) or not _is_finite_real(eager_val):
+                v.append(f"{leg_id}: {fused_field}/{eager_field} missing or not numeric")
+                continue
+            if not (_pred_ok(fused_val, fused_pred) and _pred_ok(eager_val, eager_pred)):
+                label = "fused/control" if shape_key == "fused" else eager_arm
+                v.append(
+                    f"{leg_id}: {label} dispatch proof failed for key {key!r} "
+                    f"(fused={fused_val}, eager={eager_val})"
+                )
+        if shape_key == "fused":
+            present = sorted(k for k in disable_keys if k in requested)
+            if present:
+                v.append(
+                    f"{leg_id}: fused/control dispatch proof failed -- disable_keys {present} "
+                    f"unexpectedly present in kernels_disabled_requested"
+                )
+        else:
+            missing_req = sorted(k for k in disable_keys if k not in requested)
+            missing_fired = sorted(k for k in disable_keys if k not in fired)
+            if missing_req or missing_fired:
+                v.append(
+                    f"{leg_id}: {eager_arm} dispatch proof failed -- disable_keys {disable_keys} "
+                    f"must all be in kernels_disabled_requested and kernels_disabled_fired "
+                    f"(missing from requested={missing_req}, missing from fired={missing_fired})"
+                )
+
     extra_recorded = set(row.get("extra_disable") or [])
-    requested_minus_op = set(requested) - {op_key}
+    requested_minus_op = set(requested) - set(disable_keys)
     if requested_minus_op != extra_recorded:
         v.append(
-            f"{leg_id}: kernels_disabled_requested minus {{{op_key}}} = "
+            f"{leg_id}: kernels_disabled_requested minus {sorted(disable_keys)} = "
             f"{sorted(requested_minus_op)!r} != this leg's own recorded extra_disable "
             f"{sorted(extra_recorded)!r} (asymmetric JAMMI_KERNELS_DISABLE)"
         )
 
-    cross_base = op_cfg.get("cross_check")
-    if cross_base:
-        cross_cfg = OPS[cross_base]
-        cross_key = cross_cfg["op_key"]
+    for entry in op_cfg.get("cross_check") or []:
+        if entry.get("kind") != "strong":
+            continue
+        cross_name = entry["op"]
+        cross_cfg = OPS[cross_name]
+        cross_base = cross_cfg["counter_base"]
         cross_fused_field = f"{cross_base}_fused_dispatches"
         cross_eager_field = f"{cross_base}_eager_dispatches"
         cross_fused = tier.get(cross_fused_field)
         cross_eager = tier.get(cross_eager_field)
-        if not isinstance(cross_fused, (int, float)) or isinstance(cross_fused, bool) or (
-            not isinstance(cross_eager, (int, float)) or isinstance(cross_eager, bool)
-        ):
+        if not _is_finite_real(cross_fused) or not _is_finite_real(cross_eager):
             v.append(
                 f"{leg_id}: cross-op invariant fields missing or not numeric "
                 f"({cross_fused_field}={cross_fused!r}, {cross_eager_field}={cross_eager!r})"
             )
-        elif not (cross_fused > 0 and cross_eager == 0 and cross_key not in requested):
+            continue
+        cross_disable_keys = cross_cfg["disable_keys"]
+        present = sorted(k for k in cross_disable_keys if k in requested)
+        if not (cross_fused > 0 and cross_eager == 0 and not present):
             v.append(
-                f"{leg_id}: cross-op invariant failed -- an {base} A/B requires {cross_base} "
-                f"to stay fused on every leg regardless of arm "
+                f"{leg_id}: cross-op invariant failed -- an {op_cfg['counter_base']} A/B requires "
+                f"{cross_name} to stay fused on every leg regardless of arm "
                 f"({cross_fused_field}={cross_fused}, {cross_eager_field}={cross_eager}, "
-                f"{cross_key!r} in requested={cross_key in requested})"
+                f"disable_keys_present={present})"
             )
     return v
 
@@ -373,6 +497,60 @@ def apply_identity_checks(legs):
             if vs:
                 ref_leg["violations"].extend(vs)
                 leg["violations"].extend(vs)
+
+
+def apply_pair_identity_checks(legs):
+    """`pair_identity`-kind `cross_check` entries (#462) -- unlike
+    `apply_identity_checks` (a `FINETUNE_RUN_IDENTITY_FIELDS` cross-check,
+    always on) and `dispatch_violations` (a single-leg check), a
+    pair-identity entry compares ONE specific counter family's value pair
+    between the fused/control arm and this op's own eager arm of the SAME
+    `(model, shape, steps, repeat)` cell -- e.g. `attn`'s
+    `attention_block_flash` declined count, which does not depend on
+    whether `attention_block_fused`/`softmax_last_dim_fused` themselves ran
+    fused or eager (BERT/DistilBERT decline that cascade key by
+    construction either way), so it must read IDENTICAL across both arms
+    of the same cell -- `(0, 0)` on both sides is a legitimate, non-
+    violating reading (never "no data" the way a missing field is). A
+    mismatch voids BOTH legs.
+    """
+    groups = {}
+    for leg in legs:
+        if leg["tier"] is None:
+            continue
+        row = leg["row"]
+        op_cfg, _ = op_cfg_for_row(row)
+        if op_cfg is None:
+            continue
+        key = (row.get("model"), row.get("shape"), row.get("steps"), row.get("repeat"))
+        groups.setdefault(key, []).append((leg, op_cfg))
+
+    for entries in groups.values():
+        op_cfg = entries[0][1]
+        specs = [e for e in (op_cfg.get("cross_check") or []) if e.get("kind") == "pair_identity"]
+        if not specs:
+            continue
+        by_arm = {}
+        for leg, _cfg in entries:
+            by_arm.setdefault(leg["row"].get("arm"), leg)
+        fused_leg = by_arm.get("fused") or by_arm.get("control")
+        eager_leg = by_arm.get(op_cfg["eager_arm"])
+        if fused_leg is None or eager_leg is None:
+            continue
+        for spec in specs:
+            field_base = spec["field_base"]
+            value_fields = spec["value_fields"]
+            fused_vals = tuple(fused_leg["tier"].get(f"{field_base}_{vf}") for vf in value_fields)
+            eager_vals = tuple(eager_leg["tier"].get(f"{field_base}_{vf}") for vf in value_fields)
+            if fused_vals != eager_vals:
+                msg = (
+                    f"{fused_leg['row'].get('leg_id')}/{eager_leg['row'].get('leg_id')}: "
+                    f"pair-identity check failed for {field_base!r} -- "
+                    f"{dict(zip(value_fields, fused_vals))} (fused/control arm) != "
+                    f"{dict(zip(value_fields, eager_vals))} ({op_cfg['eager_arm']} arm)"
+                )
+                fused_leg["violations"].append(msg)
+                eager_leg["violations"].append(msg)
 
 
 def _bucket_key(row):
@@ -592,6 +770,19 @@ NOTES_WHAT = {
         "own close-out profile activated the C-LORA port on; lora_linear stays fused on "
         "both arms of this sweep so the differential isolates the LayerNorm site alone."
     ),
+    "attn": (
+        "GH #462: same-box fused-vs-eager per-step wall A/B for BERT/DistilBERT, isolating "
+        "the shared attention cascade seam (attention_block_fused, with softmax_last_dim_fused "
+        "forced eager alongside it since the block arm subsumes the softmax step) at the two "
+        "shapes issue #356's own close-out profile named for the C-ATTN branch; "
+        "attention_block_flash is declined on both arms by construction (BERT/DistilBERT never "
+        "wire the flash transport)."
+    ),
+    "gelu": (
+        "GH #463: same-box fused-vs-eager per-step wall A/B for BERT/DistilBERT, isolating "
+        "the dense-encoder erf-GELU site (gelu_erf_fused) at the two shapes issue #356's own "
+        "close-out profile named for the C-MLP branch."
+    ),
 }
 NOTES_METHOD = {
     "lora_linear": (
@@ -607,16 +798,38 @@ NOTES_METHOD = {
         "the ACTIVATE/NEUTRAL/REGRESSION verdict below is the measured classification "
         "only -- it is not this fusion's ship/no-ship bar, see notes.landing_rule."
     ),
+    "attn": (
+        "per-repeat differencing s_per_step = (wall_600 - wall_100) / 500; "
+        "gain = 1 - fused_median / eager_median; "
+        "floor = |fused_median_wire - control_median| / fused_median_wire (one per model); "
+        "the ACTIVATE/NEUTRAL/REGRESSION verdict below is the measured classification "
+        "only -- it is not this fusion's ship/no-ship bar, see notes.landing_rule."
+    ),
+    "gelu": (
+        "per-repeat differencing s_per_step = (wall_600 - wall_100) / 500; "
+        "gain = 1 - fused_median / eager_median; "
+        "floor = |fused_median_wire - control_median| / fused_median_wire (one per model); "
+        "the ACTIVATE/NEUTRAL/REGRESSION verdict below is the measured classification "
+        "only -- it is not this fusion's ship/no-ship bar, see notes.landing_rule."
+    ),
 }
-# #460: an op whose fusion ships regardless of measured gain (no activation
-# bar, pre-registered as such) still gets an honest, published
-# ACTIVATE/NEUTRAL/REGRESSION classification -- `landing_rule` states, in the
-# artifact itself, why a NEUTRAL (or even a small REGRESSION within the
-# floor) result does not mean the fusion is reverted.
+# #460, extended #462/#463: an op whose fusion ships regardless of measured
+# gain (no activation bar, pre-registered as such) still gets an honest,
+# published ACTIVATE/NEUTRAL/REGRESSION classification -- `landing_rule`
+# states, in the artifact itself, why a NEUTRAL (or even a small REGRESSION
+# within the floor) result does not mean the fusion is reverted.
 LANDING_RULES = {
     "ln": (
         "no activation bar -- lands by architectural direction (one common LayerNorm "
         "path); ACTIVATE/NEUTRAL/REGRESSION are the measured classification only"
+    ),
+    "attn": (
+        "lands by architectural direction; ACTIVATE/NEUTRAL/REGRESSION is the measured "
+        "classification only"
+    ),
+    "gelu": (
+        "lands by architectural direction; ACTIVATE/NEUTRAL/REGRESSION is the measured "
+        "classification only"
     ),
 }
 
@@ -708,6 +921,7 @@ def main(argv=None):
 
     legs = build_legs(args.raw_dir, rows)
     apply_identity_checks(legs)
+    apply_pair_identity_checks(legs)
     buckets = compute_buckets(legs)
 
     model_verdicts = {model: compute_model_verdict(model, buckets, op_cfg) for model in MODELS}

@@ -28,9 +28,9 @@
 # downstream from `kernels_disabled_requested` (the merger's own
 # dispatch-proof check).
 #
-# `AB_OP` (#460): this driver is a per-op same-box A/B, not a `lora_linear`-
-# only one -- `AB_OP` selects which single admission key gets forced eager,
-# from a small fixed table:
+# `AB_OP` (#460, extended #462/#463): this driver is a per-op same-box A/B,
+# not a `lora_linear`-only one -- `AB_OP` selects which admission key(s) get
+# forced eager, from a small fixed table:
 #
 #   AB_OP=lora_linear (default) -- disable key `lora_linear_fused`, eager-arm
 #     label `lora_eager`, counter base `lora_linear` (the #428 P2b contract;
@@ -47,6 +47,37 @@
 #     LayerNorm site alone; the merger's own dispatch proof cross-checks
 #     this (`lora_linear` reads fused>0/eager==0 on every leg of an `ln`
 #     sweep, regardless of that leg's own arm).
+#   AB_OP=attn (#462) -- disable keys `attention_block_fused,
+#     softmax_last_dim_fused` (BOTH, comma-joined into ONE
+#     `JAMMI_KERNELS_DISABLE` value on the eager arm), eager-arm label
+#     `attn_eager`, counter base `attention_block`. Both keys are disabled
+#     together on purpose, never `attention_block_fused` alone: a
+#     block-fused arm SUBSUMES the masked-softmax step internally (one
+#     `CustomOp3` performs both), so `"softmax_last_dim_fused"` is never
+#     even consulted while `attention_block_fused` admits -- disabling it
+#     alone would be a silent no-op on this differential, exactly the
+#     standalone-vs-subsumed trap `"attention_block_fused"`
+#     (`crates/jammi-kernels/src/admission.rs:70`, the "Standalone vs
+#     subsumed op keys" section spanning lines 68-100) documents for
+#     ModernBERT's own training path and which applies identically once
+#     BERT/DistilBERT route through the same shared cascade seam (#462).
+#     The eager arm therefore reads BOTH `attention_block` and `softmax`
+#     dispatch-counter pairs (fused==0, eager>0) and both keys present in
+#     `kernels_disabled_fired`; the fused arm reads `attention_block`
+#     (fused>0, eager==0) and `softmax` pinned `(0, 0)` -- absorbed into the
+#     block op, never independently dispatched at all when the block admits.
+#     `attention_block_flash` (the separate flash-transport cascade key) is
+#     declined on BOTH arms of a BERT/DistilBERT `attn` sweep by
+#     construction -- BERT/DistilBERT never wire the flash transport
+#     protocol at all (a counted `flash_transport_not_wired` capability
+#     miss, never silent), so this key's own declined count is identical
+#     across the fused and eager arms of the same cell; the merger's own
+#     pair-identity cross-check pins this.
+#   AB_OP=gelu (#463) -- disable key `gelu_erf_fused`, eager-arm label
+#     `gelu_eager`, counter base `gelu`. Isolates the dense-encoder erf-GELU
+#     site (BERT's/DistilBERT's own FFN activation) the SAME way `AB_OP=ln`
+#     isolates the biased LayerNorm site -- a single standalone admission
+#     key with its own call site, no subsumption to route around.
 #
 # Every manifest row records its own `ab_op` -- the merger reads it back
 # (or takes `--op` explicitly) to select the counter base and the cross-op
@@ -145,7 +176,9 @@ LORA_BIAS_AB_LEGS_ONLY="${LORA_BIAS_AB_LEGS_ONLY:-}"
 LORA_BIAS_AB_DRY_RUN_FAIL_OP="${LORA_BIAS_AB_DRY_RUN_FAIL_OP:-}"
 LORA_BIAS_AB_DRY_RUN_FAIL_PREDICATE="${LORA_BIAS_AB_DRY_RUN_FAIL_PREDICATE:-dry_run_synthetic_capability_miss}"
 
-# --- AB_OP table (#460): the single admission key this sweep forces eager,
+# --- AB_OP table (#460, extended #462/#463): this op's own admission
+# key(s) this sweep forces eager (comma-joined into ONE
+# `JAMMI_KERNELS_DISABLE` entry for a multi-key op -- see `attn` below),
 # this op's own eager-arm label, and the counter-field base the merger reads
 # back -- see the module doc's "AB_OP" section. `AB_OP=lora_linear` is the
 # default and reproduces #428 byte-for-byte (same disable key, same eager-arm
@@ -153,15 +186,23 @@ LORA_BIAS_AB_DRY_RUN_FAIL_PREDICATE="${LORA_BIAS_AB_DRY_RUN_FAIL_PREDICATE:-dry_
 AB_OP="${AB_OP:-lora_linear}"
 case "$AB_OP" in
   lora_linear)
-    AB_DISABLE_KEY="lora_linear_fused"
+    AB_DISABLE_KEYS="lora_linear_fused"
     AB_EAGER_ARM="lora_eager"
     ;;
   ln)
-    AB_DISABLE_KEY="layer_norm_fused"
+    AB_DISABLE_KEYS="layer_norm_fused"
     AB_EAGER_ARM="ln_eager"
     ;;
+  attn)
+    AB_DISABLE_KEYS="attention_block_fused,softmax_last_dim_fused"
+    AB_EAGER_ARM="attn_eager"
+    ;;
+  gelu)
+    AB_DISABLE_KEYS="gelu_erf_fused"
+    AB_EAGER_ARM="gelu_eager"
+    ;;
   *)
-    echo "::error::lora_bias_ab: AB_OP must be 'lora_linear' or 'ln' (got '$AB_OP')" >&2
+    echo "::error::lora_bias_ab: AB_OP must be one of lora_linear, ln, attn, gelu (got '$AB_OP')" >&2
     exit 2
     ;;
 esac
@@ -265,13 +306,14 @@ HELDOUT_JSONL="$HELDOUT_DIR/heldout_pairs.jsonl"
 # GPU-pod run uses. `$1`=steps `$2`=model `$3`=batch `$4`=width `$5`=dtype.
 # Reads `JAMMI_KERNELS_DISABLE`/`JAMMI_KERNELS_STRICT` off ITS OWN
 # environment -- the same env this driver exports for the real binary --
-# and derives BOTH ops' fused/eager dispatch counters (`lora_linear_*` and
-# `ln_*`, unconditionally, regardless of this sweep's own `$AB_OP`) from
-# whether `lora_linear_fused`/`layer_norm_fused` is named in
-# `JAMMI_KERNELS_DISABLE`, exactly the real admission lattice's own
-# "disable wins" rule -- reporting both counter families always is what
-# lets the merger's `AB_OP=ln` cross-op invariant check (lora_linear stays
-# fused on every leg) hold hermetically too.
+# and derives EVERY ops fused/eager dispatch counters (`lora_linear_*`,
+# `ln_*`, `attention_block_*`/`softmax_*`/`attention_block_flash_*`, and
+# `gelu_*`, unconditionally, regardless of this sweeps own `$AB_OP`) from
+# whether that ops own key is named in `JAMMI_KERNELS_DISABLE`, exactly
+# the real admission lattices own "disable wins" rule -- reporting every
+# counter family always is what lets the mergers cross-op/pair-identity
+# checks (AB_OP=ln lora_linear-stays-fused invariant; AB_OP=attn
+# attention_block_flash pair-identity across arms) hold hermetically too.
 # `LORA_BIAS_AB_DRY_RUN_FAIL_OP` (if set) makes it refuse unconditionally
 # with the exact Strict-mode-fallback text
 # `crate::error::KernelError::StrictModeFallback` renders, for
@@ -298,16 +340,48 @@ batch = int(batch)
 width = int(width)
 disable_raw = os.environ.get("JAMMI_KERNELS_DISABLE", "")
 requested = sorted({x for x in disable_raw.split(",") if x})
-# Generalized over BOTH ops the real admission lattice knows about here
-# (#460) -- "all" wins over everything, same as the real lattices own
-# disable-wins-over-Strict rule. Reporting BOTH counter families
-# unconditionally (never only the one this sweeps own AB_OP names) is what
-# lets the mergers cross-op invariant check (AB_OP=ln: lora_linear must
-# stay fused>0/eager==0 on every leg) hold on the dry-run fixture exactly
-# like it would on a real binarys report.
+# Generalized over every op the real admission lattice knows about here
+# (#460, extended #462/#463) -- "all" wins over everything, same as the
+# real lattices own disable-wins-over-Strict rule. Reporting every counter
+# family unconditionally (never only the one this sweeps own AB_OP names)
+# is what lets the mergers cross-op/pair-identity checks (AB_OP=ln:
+# lora_linear must stay fused>0/eager==0 on every leg; AB_OP=attn: the
+# attention_block_flash declined count must read IDENTICAL across the
+# fused and eager arms of the same cell) hold on the dry-run fixture
+# exactly like they would on a real binarys report.
 lora_disabled = "lora_linear_fused" in requested or "all" in requested
 ln_disabled = "layer_norm_fused" in requested or "all" in requested
-fired = (["lora_linear_fused"] if lora_disabled else []) + (["layer_norm_fused"] if ln_disabled else [])
+attn_block_disabled = "attention_block_fused" in requested or "all" in requested
+softmax_key_disabled = "softmax_last_dim_fused" in requested or "all" in requested
+gelu_disabled = "gelu_erf_fused" in requested or "all" in requested
+fired = (
+    (["lora_linear_fused"] if lora_disabled else [])
+    + (["layer_norm_fused"] if ln_disabled else [])
+    + (["attention_block_fused"] if attn_block_disabled else [])
+    + (["softmax_last_dim_fused"] if softmax_key_disabled else [])
+    + (["gelu_erf_fused"] if gelu_disabled else [])
+)
+# softmax_last_dim_fused is SUBSUMED by attention_block_fused -- see
+# `"attention_block_fused"` (`crates/jammi-kernels/src/admission.rs:70`),
+# the "Standalone vs subsumed op keys" section: while the block arm
+# admits, softmax is never
+# independently dispatched at all (fused==0, eager==0 -- absorbed, not
+# fused); only once the block itself is forced eager does softmax dispatch
+# on its OWN key.
+if attn_block_disabled:
+    softmax_fused_dispatches = 0 if softmax_key_disabled else 1
+    softmax_eager_dispatches = 1 if softmax_key_disabled else 0
+else:
+    softmax_fused_dispatches = 0
+    softmax_eager_dispatches = 0
+# attention_block_flash: BERT/DistilBERT never wire the flash transport
+# protocol at all (a counted flash_transport_not_wired capability miss),
+# so this is declined every forward regardless of the block/softmax arms
+# above -- a function of steps ALONE, identical across the fused and eager
+# arms of the same (model, shape, steps, repeat) cell, which is exactly
+# what the mergers pair-identity cross-check for AB_OP=attn requires.
+attention_block_flash_fused_dispatches = 0
+attention_block_flash_declined_dispatches = steps * 12
 
 target_modules = {
     "bert": ["query", "key", "value", "dense"],
@@ -363,6 +437,14 @@ tier = {
     "lora_linear_eager_dispatches": 1 if lora_disabled else 0,
     "ln_fused_dispatches": 0 if ln_disabled else 1,
     "ln_eager_dispatches": 1 if ln_disabled else 0,
+    "attention_block_fused_dispatches": 0 if attn_block_disabled else 1,
+    "attention_block_eager_dispatches": 1 if attn_block_disabled else 0,
+    "softmax_fused_dispatches": softmax_fused_dispatches,
+    "softmax_eager_dispatches": softmax_eager_dispatches,
+    "attention_block_flash_fused_dispatches": attention_block_flash_fused_dispatches,
+    "attention_block_flash_declined_dispatches": attention_block_flash_declined_dispatches,
+    "gelu_fused_dispatches": 0 if gelu_disabled else 1,
+    "gelu_eager_dispatches": 1 if gelu_disabled else 0,
 }
 report = {"tool": "dry-run", "lora_bias_ab_dry_run": True, "tiers": {"finetune_run": tier}}
 json.dump(report, sys.stdout)
@@ -423,16 +505,22 @@ export MANIFEST_PATH="$MANIFEST"
 
 # Comma-joined `JAMMI_KERNELS_DISABLE` value for a given arm label --
 # `$AB_EAGER_ARM` (this sweep's own op eager-arm label -- `lora_eager` for
-# `AB_OP=lora_linear`, `ln_eager` for `AB_OP=ln`) always names
-# `$AB_DISABLE_KEY`; `fused`/`control` never do.
+# `AB_OP=lora_linear`, `ln_eager` for `AB_OP=ln`, `attn_eager` for
+# `AB_OP=attn`, `gelu_eager` for `AB_OP=gelu`) always names
+# `$AB_DISABLE_KEYS` (this op's OWN key set -- a single key for every op
+# except `attn`, whose two keys are already comma-joined into one string by
+# the AB_OP table above); `fused`/`control` never do.
 # `$LORA_BIAS_AB_EXTRA_DISABLE` (the preflight's own remedy channel) is
-# appended identically on every arm -- symmetry the merger's own dispatch
-# proof checks for.
+# appended identically on every arm, SYMMETRICALLY onto this op's own key
+# set -- the merger's own dispatch proof checks for exactly this symmetry
+# (`kernels_disabled_requested` minus this op's whole key SET must equal
+# every leg's own recorded `extra_disable`, regardless of how many keys
+# this op's own set holds).
 _disable_for_arm() {
   local arm="$1"
   local base=""
   if [ "$arm" = "$AB_EAGER_ARM" ]; then
-    base="$AB_DISABLE_KEY"
+    base="$AB_DISABLE_KEYS"
   fi
   if [ -n "$base" ] && [ -n "$LORA_BIAS_AB_EXTRA_DISABLE" ]; then
     printf '%s,%s' "$base" "$LORA_BIAS_AB_EXTRA_DISABLE"

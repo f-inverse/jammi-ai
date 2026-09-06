@@ -312,8 +312,28 @@ or tail `/root/.jammi-seed.log` directly.
    §8, row 8.
 5. **T1** — `cargo build --release -p jammi-bench --features cuda`
    (`ci/scripts/pod_seed_target.sh:791`).
-6. **T1b** — `cargo build --release -p jammi-bench --features cuda,jammi-kernels/flash-attn`
-   (`ci/scripts/pod_seed_target.sh:836`), **main-only**, gated on the
+6. **CUTLASS provisioning + T1b** — `pod_seed_pkg_has_feature`
+   (`ci/scripts/pod_seed_target.sh:324`) detects flash-attn live via
+   `cargo metadata`, never hand-asserted, and this check now runs on
+   **every branch** — never gated on the main-only check below — because
+   the CUTLASS submodule is a prerequisite for *any* flash-attn build a
+   pod might later run (a sweep driver, not just this script's own T1b),
+   and every campaign pod boots on a feature branch. Its rc=2 ("could not
+   determine") **aborts the whole seed** rather than silently guessing
+   "absent" — the `refusing to guess 'absent'` identifier in
+   `ci/scripts/pod_seed_target.sh`'s feat_rc dispatch. A broken metadata
+   query read as "absent" is exactly how a seed once stamped complete
+   without its FA2 artifacts, and — before the esc-050-any-branch fix —
+   how a feature-branch pod's seed silently skipped CUTLASS provisioning
+   entirely, later panicking in `build.rs` the first time anything on that
+   pod built the flash-attn feature (observed live on pods 12qwlsflxl0a1j
+   and qpvv7iv4wn8owy). When the submodule checkout is missing, the seed
+   provisions it — the `git submodule update --init --force --checkout
+   --depth 1` identifier in `ci/scripts/pod_seed_target.sh`'s
+   flash-attn-declared arm — **regardless of branch**. Only the **T1b
+   build itself** — `cargo build --release -p jammi-bench --features
+   cuda,jammi-kernels/flash-attn` (the `T1b (main only)` identifier in
+   `ci/scripts/pod_seed_target.sh`) — stays **main-only**, gated on the
    checkout's *resolved sha* matching `origin/main` (or
    `JAMMI_SEED_IS_MAIN=1`), never on `abbrev-ref == "main"` — a
    checkout-by-sha always leaves a detached HEAD. The resolution is
@@ -321,17 +341,6 @@ or tail `/root/.jammi-seed.log` directly.
    (`ci/scripts/pod_seed_target.sh:740`), compared at
    `_seed_main_reason="resolved sha matches origin/main"`
    (`ci/scripts/pod_seed_target.sh:749`); see §8 row 3.
-   `pod_seed_pkg_has_feature`
-   (`ci/scripts/pod_seed_target.sh:324`) detects flash-attn live via
-   `cargo metadata`, never hand-asserted; its rc=2 ("could not determine")
-   **aborts the whole seed** rather than silently skipping T1b —
-   `refusing to guess 'absent'`
-   (`ci/scripts/pod_seed_target.sh:852`). A broken metadata query read as
-   "absent" is exactly how a seed once stamped complete without its FA2
-   artifacts. When T1b's prerequisite checkout is missing, the seed
-   provisions it first —
-   `git submodule update --init --force --checkout --depth 1`
-   (`ci/scripts/pod_seed_target.sh:825`).
 7. **T2** — `cargo test --no-run` for a FIXED crate/feature/`--test`
    selection (jammi-server/jammi-ai/jammi-kernels, `cuda`/
    `cuda,live-gpu-tests`) — a dev-loop compile-cache seed that stands on its

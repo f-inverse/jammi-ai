@@ -20,13 +20,13 @@
 //!    `(crate::cpu::erf::erf_f32(v * FRAC_1_SQRT_2) + 1.) * 0.5 * v`, where
 //!    `crate::cpu::erf::erf_f32` is a CRATE-PRIVATE wrapper (not
 //!    re-exported by candle-core) around a rational-polynomial erf
-//!    approximation. This op's OWN CPU F32 arm ([`gelu_erf_cdf_f32`] below)
+//!    approximation. This op's OWN CPU F32 arm (`gelu_erf_cdf_f32` below)
 //!    reproduces that EXACT formula via [`libm::erff`] instead — the same
 //!    substitution `ops::geglu`'s module doc documents and justifies (this
 //!    crate depends on `libm` directly precisely because candle does not
 //!    re-export its own erf), giving bit-identical CPU F32 forward output
 //!    to `Tensor::gelu_erf` (pinned by
-//!    [`tests::cpu_f32_forward_bit_identical_to_candle_gelu_erf`] and the
+//!    `tests::cpu_f32_forward_bit_identical_to_candle_gelu_erf` and the
 //!    leaf-crate oracle `tests/gelu_erf_oracles.rs`).
 //! 2. **candle CUDA (`normcdff`).** candle-kernels' `ugelu_erf_{f32,bf16,f16}`
 //!    (`unary.cu:31-34,118,174`; `cuda_utils.cuh:140-195`) computes
@@ -38,7 +38,7 @@
 //!    "16-bit CUDA forward" below) — this op exists specifically to be the
 //!    fused, single-kernel equivalent of candle's own eager CUDA dispatch,
 //!    so it tracks CUDA's reference, not CPU's, on that device.
-//! 3. **GeGLU (`erff`, `kernels-community`-derived).** [`crate::ops::geglu`]'s
+//! 3. **GeGLU (`erff`, `kernels-community`-derived).** `crate::ops::geglu`'s
 //!    own `gelu_erf_f32` computes `x * 0.5 * (1 + erff(x/sqrt(2)))` via
 //!    [`libm::erff`] directly (not through candle's polynomial at all) —
 //!    chosen there to match the upstream HF/`kernels-community`
@@ -108,8 +108,8 @@
 //! normalizing constant, `kBeta = 0.3989422804014327f`
 //! (`M_2_SQRTPI * M_SQRT1_2 * 0.5 == 1/sqrt(2*pi)`), is the exact ATen
 //! `kBeta` constant `ops::geglu`'s own backward derivation cites and uses —
-//! see that module's doc for the ATen citation; [`GELU_ERF_ALPHA_F32`]/
-//! [`GELU_ERF_BETA_F32`] below are this file's OWN copies (not shared with
+//! see that module's doc for the ATen citation; `GELU_ERF_ALPHA_F32`/
+//! `GELU_ERF_BETA_F32` below are this file's OWN copies (not shared with
 //! `ops::geglu`'s identically-valued constants — each op's `.rs`/`.cu` file
 //! is a self-contained translation unit in this crate's convention, the
 //! same "duplicate rather than share" idiom `geglu_f16.cu`'s module doc
@@ -144,8 +144,8 @@
 //! is itself pushed onto the FORWARD graph's `sorted_nodes()` (they belong
 //! to a throwaway sub-graph `backward()` never re-differentiates) — while
 //! `GeluErfFused::bwd` computes the identical closed form in ONE internal
-//! `CustomOp2` ([`GeluErfBwdDx`]) node.
-//! [`tests::bwd_helper_is_one_node_vs_the_same_closed_form_built_from_ordinary_tensor_ops`]
+//! `CustomOp2` (`GeluErfBwdDx`) node.
+//! `tests::bwd_helper_is_one_node_vs_the_same_closed_form_built_from_ordinary_tensor_ops`
 //! demonstrates this the only way `sorted_nodes()` CAN show it: by building
 //! that same closed form explicitly as an ordinary forward `Tensor`
 //! composition (candle's own backward algebra, reproduced verbatim) and
@@ -174,6 +174,48 @@
 
 use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, CustomOp1, CustomOp2, Error, Layout, Result, Shape, Tensor};
+
+/// The condition-aware backward bound's own relative tolerance factor —
+/// see `tests/gelu_erf_oracles.rs`'s
+/// `backward_matches_candles_own_composition_within_the_condition_aware_bound`
+/// (crate: `jammi-kernels`, leaf-crate integration test — a separate
+/// compilation unit from this one, so not an intra-doc-linkable item) for
+/// the live oracle this tolerance gates. `no-producer`: a pre-registered
+/// design constant, not a measurement (KO-9's escape hatch for a
+/// genuinely-derived, not-measured number). `pub`: `jammi-encoders`'
+/// gradcheck oracle for its own `gelu_erf` seam (`activations::gelu_erf`)
+/// imports this SAME value rather than hand-copying it, so the bound both
+/// crates assert against has one source of truth.
+pub const COND_AWARE_TOL: f64 = 4e-6;
+
+/// An ADDITIVE absolute floor on top of [`COND_AWARE_TOL`]'s relative
+/// term — needed for a real, disclosed reason a purely relative bound
+/// cannot cover (see the module doc's "backward" section):
+/// `Phi(x)` is asymmetric (`-> 1` as `x -> +inf`, `-> 0` as `x -> -inf`),
+/// so on the NEGATIVE tail the relative term's own denominator
+/// `|Phi(x)|+|x*phi(x)|` collapses toward zero (both terms decay) while
+/// candle's OWN backward formula (`backprop.rs`'s
+/// `0.5 + scaled_exp_arg + erf_scaled_sqrt`) computes that same tiny
+/// result as a difference of two O(1) quantities (`0.5` and
+/// `0.5*erf(...)`, the latter approaching `-0.5` in this region) —
+/// catastrophic cancellation that leaves an F32-epsilon-scale ABSOLUTE
+/// residual independent of how small the true answer is.
+///
+/// Measured, with a LIVE producer (KO-4 — no bare, unverifiable number in
+/// prose): `tests/gelu_erf_oracles.rs`'s
+/// `backward_matches_candles_own_composition_within_the_condition_aware_bound`
+/// computes, on EVERY run, the max ADDITIVE excess (`|fused - eager| -
+/// COND_AWARE_TOL*(|Phi(x)|+|x*phi(x)|)` — i.e. the residual the relative
+/// term ALONE cannot cover) over that test's own `[-8,8]` step-`0.02`
+/// fixture, and its argmax `x`; it prints both quantities and asserts
+/// `1.5 * (measured max additive excess) <= COND_AWARE_ABS_FLOOR`, i.e.
+/// this floor retains >= 1.5x headroom over the measured worst case. At
+/// the time this floor was derived, that measurement was `~1.484e-8` at
+/// `x = -5.24` (`2.226e-8 == 1.5 * 1.484e-8`). If the printed excess ever
+/// grows past `COND_AWARE_ABS_FLOOR / 1.5`, that test's own assertion
+/// fails FIRST — this constant must then be re-derived from the new
+/// measurement, never silently loosened to make the failure go away.
+pub const COND_AWARE_ABS_FLOOR: f64 = 2.226e-8;
 
 /// `1/sqrt(2)` — this file's own copy of the same ATen `kAlpha` constant
 /// `ops::geglu::GELU_ALPHA_F32` documents (see this module's doc, "backward"

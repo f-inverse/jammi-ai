@@ -198,6 +198,25 @@ fn gpu_slot_is_exclusive_while_held() {
     );
 }
 
+// ─── The one-at-a-time admission-counter slot for CPU-hermetic dispatch-counter tests ───
+
+/// This process's serialization slot for any CPU-hermetic test that reads a
+/// `jammi_kernels::admission` dispatch-registry counter as a before/after
+/// DELTA. Binary-scoped for the same reason [`GPU_SERIAL`] is (`gpu_capability`
+/// is ONE test binary with fourteen modules; a per-file static could only
+/// serialize a file against itself): `crates/jammi-encoders`'s own
+/// admission-counter tests already share ONE lock per counter family (e.g.
+/// `attention_cascade::ATTENTION_BLOCK_COUNTER_TEST_LOCK`) precisely because
+/// `cargo test` runs a binary's tests concurrently by default and a
+/// process-wide registry counter has no per-test isolation of its own — a
+/// sibling test dispatching the SAME counter mid-window would corrupt a
+/// before/after delta. This binary's first CPU-hermetic counter test
+/// (`capability_surface`'s
+/// `gelu_erf_fused_bumps_on_a_bert_family_training_forward_cpu_hermetic`,
+/// issue #463 follow-up) takes this lock; any sibling added later must take
+/// the SAME one rather than minting a second the first cannot see.
+pub static ADMISSION_COUNTER_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Early-return a test with a loud `tracing::warn` skip (never `#[ignore]`)
 /// when no GPU is usable, so the GPU-less / CPU lane runs the suite as a no-op
 /// rather than a failure. Returns `true` when the caller should skip.

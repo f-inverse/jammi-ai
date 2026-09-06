@@ -1,8 +1,13 @@
 //! The per-layer fused-attention cascade — `flash (caller-supplied) →
 //! mem_efficient_attention → attention_block_fused → eager composition
 //! (with `softmax_last_dim_fused` admission)` — shared by every encoder
-//! whose attention arm wants it, extracted from `crate::modernbert` (R1'/R2'
-//! of `plan-cattn-cmlp-v2.md`, issue #462).
+//! whose attention arm wants it, extracted from `crate::modernbert` (issue
+//! #462): every pure predicate and per-layer numeric composition moves
+//! verbatim into this module, while the flash TRANSPORT protocol (dense/
+//! ragged FlashAttention-2 call sites, `unpad_rows`/`repad_rows`,
+//! `decide_flash_admission`) stays an encoder-boundary concern owned by
+//! `crate::modernbert` — see "What moved here, and what did not" below for
+//! the exact line.
 //!
 //! ## What moved here, and what did not
 //!
@@ -12,10 +17,14 @@
 //! [`FusedAttentionMasks`]/[`TrainingMaskInputs`], `forward_memeff_attention`,
 //! `forward_eager_training_attention_composition`, and the top-level
 //! [`training_attention_cascade`] dispatcher) moved verbatim (numerics
-//! unchanged) from `crate::modernbert`. The flash TRANSPORT protocol —
-//! `FlashDecision`/`CompactedBatch` themselves, the dense/ragged/padded
-//! FlashAttention-2 call sites, `unpad_rows`/`repad_rows`, and
-//! `decide_flash_admission` — stays in `crate::modernbert`: it is an
+//! unchanged) from `crate::modernbert`, along with the flash cascade's own
+//! OUTCOME vocabulary ([`FlashDecision`]/[`CompactedBatch`] — audit round
+//! item 10: this generic vocabulary lives with the generic seam even
+//! though only `crate::modernbert` constructs a real
+//! [`FlashDecision::Fused`] today). The flash TRANSPORT protocol itself —
+//! the dense/ragged/padded FlashAttention-2 call sites, `unpad_rows`/
+//! `repad_rows`, and `decide_flash_admission` (the code that actually
+//! POPULATES a `CompactedBatch`) — stays in `crate::modernbert`: it is an
 //! encoder-BOUNDARY concern (a whole-forward compaction decision, not a
 //! per-layer arm), and cannot be delivered through a per-layer seam (R1'
 //! ruling). This module only ever *reports* the flash decision a caller
@@ -24,7 +33,7 @@
 //! that decision is `Fused`, delegates to the caller's own transport via
 //! [`training_attention_cascade`]'s `on_flash_fused` callback.
 //!
-//! ## `RopeCtx`: representing "this caller has no RoPE at all"
+//! ## `RopeCtx`: representing "this caller has no RoPE at all", and laziness
 //!
 //! [`AttentionBlockFused`]/[`MemEfficientAttention`] are `CustomOp3`s: a
 //! `rope_pack` tensor argument is REQUIRED at every call, whether or not
@@ -34,9 +43,9 @@
 //! positional-embedding table at all (BERT/DistilBERT — absolute position
 //! embeddings are baked into the embeddings sum, never applied per layer)
 //! therefore still needs SOME tensor to hand the fused arm, even though it
-//! is never read. [`RopeCtx`] represents this exactly: `enabled: false`
-//! callers set `pack` to a per-module cached placeholder (allocated ONCE,
-//! at construction, never read — see `bert::BertSelfAttention`'s own
+//! is never read. [`RopeCtx::Disabled`] represents this exactly: its
+//! `placeholder` is a per-module cached tensor (allocated ONCE, at
+//! construction, never read — see `bert::BertSelfAttention`'s own
 //! `rope_placeholder` field), never re-derived per forward. This is a
 //! narrower, type-safe restatement of plan v2's "`rope: None` with a
 //! per-module cached `[2,1,1,64]` placeholder": the cascade's own functions
@@ -44,6 +53,21 @@
 //! choice is always explicit at the call site, and the CustomOp3 arity
 //! constraint above is satisfied by construction rather than by an
 //! `Option::unwrap_or` at the one call site that would need it.
+//!
+//! [`RopeCtx::Enabled`]'s `pack` field is a PROVIDER (`&dyn Fn() -> ..`),
+//! not an already-materialized `&Tensor` (audit round item 5): main's own
+//! placement called `RotaryEmbedding::cached_rope_pack` ONLY inside the
+//! memeff arm and inside the block-fused arm's `DispatchOutcome::Fused`
+//! branch — never for a flash dispatch, never for the eager arm (which
+//! rotates Q/K directly via [`RopeCtx::Enabled`]'s `apply`, no pack tensor
+//! involved at all). Since a `RopeCtx` must be built BEFORE calling
+//! [`training_attention_cascade`] (whose flash check runs first and may
+//! return before `rope` is ever consulted), an eagerly-materialized `pack`
+//! field would force that computation — and any error or lock it can
+//! raise — onto every dispatch, including the ones that never asked for
+//! it. The provider shape restores main's exact laziness: [`RopeCtx::pack`]
+//! is called only from [`forward_memeff_attention`] and the block-fused
+//! arm, in the same order main did.
 //!
 //! ## The QKV cat bridge: a real, measured cost on BOTH arms
 //!
@@ -110,7 +134,149 @@ use jammi_kernels::ops::{
 };
 
 use crate::error::EncoderError;
-use crate::modernbert::{CompactedBatch, FlashDecision};
+
+/// The once-per-forward flash-cascade decision (contract v4 §3.2), decided
+/// ONCE by a caller's own whole-forward entry point (mirroring
+/// [`FusedAttentionMasks`]) and threaded per layer into
+/// [`training_attention_cascade`]. Owns the compacted batch's row
+/// `lengths` and the `[total]` unpad gather indices, but deliberately NOT
+/// a constructed `jammi_kernels::flash::CuSeqlens`: that type is
+/// feature-gated behind `jammi-kernels`'s `flash-attn` (not forwarded by
+/// this crate's `Cargo.toml`), and `CuSeqlens::from_lengths` is cheap
+/// enough to construct on demand, once, at the real flash call site —
+/// holding a `CuSeqlens` across a whole forward buys nothing and would
+/// force a premature feature dependency. Moved here from `crate::modernbert`
+/// (issue #462 fix round, item 10): the flash cascade's OUTCOME vocabulary
+/// is generic to the shared seam even though only `crate::modernbert`
+/// constructs a real [`FlashDecision::Fused`] today (BERT/DistilBERT
+/// always supply [`FlashDecision::Declined`]) — the fields stay
+/// `pub(crate)` so `crate::modernbert`'s own flash TRANSPORT (which stays
+/// there — an encoder-boundary concern, see this module's doc) can still
+/// construct and read them directly.
+pub(crate) struct CompactedBatch {
+    /// One length per batch element, `lengths[b] <= seq`. Consumed by
+    /// `crate::modernbert::ModernBertAttention::forward_flash_dense_attention`
+    /// (`CuSeqlens::from_lengths`) and
+    /// `crate::modernbert::ModernBertAttention::forward_flash_ragged_attention`
+    /// (`flash_attention_varlen_with_rope_ragged`'s own `lengths`
+    /// parameter) under the `flash-attn` feature; on a plain build the
+    /// field is only read by `crate::modernbert`'s own tests, so
+    /// `#[allow(dead_code)]` stays even though it is no longer
+    /// unconditionally dead.
+    #[allow(dead_code)]
+    pub(crate) lengths: Vec<usize>,
+    /// `[total]` gather indices into the flattened `[batch * seq]` row
+    /// axis — every REAL (non-pad) row, batch-then-seq order. Consumed by
+    /// `crate::modernbert::ModernBert::forward_hidden_with_lengths`'s
+    /// encoder-boundary transport (P6 Stage B B3-padded, contract v4 §3.5):
+    /// `unpad_rows` once before layer 0, `repad_rows` once after the last
+    /// layer — the DENSE arm never reads this field (dense skips
+    /// compaction entirely, see [`Self::is_dense`]/
+    /// `crate::modernbert::decide_flash_admission`'s doc).
+    pub(crate) gather_indices: Tensor,
+    /// Same status as `lengths`: the padded/ragged arm's own production
+    /// consumer, `#[allow(dead_code)]` on a plain (non-`flash-attn`) build.
+    #[allow(dead_code)]
+    pub(crate) total: usize,
+    /// The batch's own (padded) sequence length — `mask.dim(1)` at the
+    /// point `crate::modernbert::decide_flash_admission` decided this
+    /// batch. NOT `lengths.iter().max()`: a shorter `seq` would silently
+    /// narrow the RoPE table
+    /// `crate::modernbert::ModernBertAttention::forward_flash_ragged_attention`
+    /// gathers from below what a full-length row actually needs. Same
+    /// `#[allow(dead_code)]` status as `lengths`/`total`.
+    #[allow(dead_code)]
+    pub(crate) seq: usize,
+    /// `lengths.iter().all(|&l| l == seq)` (contract v4 delta 4's
+    /// discriminator — NEVER `total == batch * seq`, which a genuinely
+    /// padded-but-numerically-coincidental batch could also satisfy),
+    /// computed ONCE at construction (see
+    /// `crate::modernbert::build_flash_forward_decision`) rather than
+    /// re-derived at each of this field's several call sites
+    /// ([`FlashDecision::reason`], `crate::modernbert::ModernBertAttention::forward`'s
+    /// transport branch, `crate::modernbert::ModernBert::forward_hidden_with_lengths`'s
+    /// own transport decision) — one source of truth for a fact three
+    /// different call sites need to agree on.
+    pub(crate) is_dense: bool,
+}
+
+/// The full once-per-forward flash-cascade decision, decided ONCE by a
+/// caller's whole-forward entry point (mirroring [`FusedAttentionMasks`])
+/// and threaded per layer into [`training_attention_cascade`] — every
+/// LAYER's own `admit_cascade` call reports against it (contract v4 §3.2:
+/// "the counters are per-dispatch, not per-forward" — this type is what
+/// makes that per-layer call cheap: no layer re-derives the outcome/reason).
+///
+/// Two variants, not a `CompactedBatch`/`outcome`/`reason` struct with the
+/// first field optional: the prior shape let `outcome == Holds` and
+/// `admission == None` be constructed simultaneously — an invalid state a
+/// caller's own dispatch code had to guard with a RUNTIME `ok_or_else` (a
+/// string-message fallback for a state the type itself should have
+/// refused to represent). This enum makes that state a COMPILE ERROR
+/// instead: [`Self::Fused`] always carries its [`CompactedBatch`],
+/// [`Self::Declined`] never does — no runtime check stands between "the
+/// cascade decided Fused" and "a `CompactedBatch` exists".
+///
+/// [`Self::outcome`]/[`Self::reason`] recover the [`PredicateOutcome`] /
+/// reason string every `admit_cascade` call site still needs (`Fused`
+/// always reports `Holds`, and — contract v4 delta 4 — a PER-VARIANT
+/// truthful reason: `"domain_ok_dense"` when [`CompactedBatch::is_dense`],
+/// `"domain_ok_padded"` otherwise; see [`Self::reason`]), so callers built
+/// around the old struct's two bare fields keep exactly the same call
+/// shape.
+pub(crate) enum FlashDecision {
+    /// The batch is flash-eligible — `attention_block_flash` dispatches
+    /// `Fused`. DENSE (`admission.is_dense`,
+    /// `crate::modernbert::ModernBertAttention::forward_flash_dense_attention`
+    /// runs, hidden stays `[batch, seq, hidden]`, no transport) or
+    /// genuinely PADDED (`!admission.is_dense`,
+    /// `crate::modernbert::ModernBertAttention::forward_flash_ragged_attention`
+    /// runs, `crate::modernbert::ModernBert::forward_hidden_with_lengths`
+    /// unpads hidden to `[total, hidden]` once before layer 0 and repads
+    /// it once after the last — P6 Stage B B3-padded, contract v4 §3.1's
+    /// item 1). Either way this variant always carries its
+    /// `CompactedBatch` — see `crate::modernbert::build_flash_forward_decision`,
+    /// the only constructor.
+    Fused(CompactedBatch),
+    /// The cascade declines — `outcome`/`reason` are whatever
+    /// `crate::modernbert::flash_admission_predicate` (or
+    /// `crate::modernbert::decide_flash_admission`'s own `op_disabled`
+    /// short-circuit) determined. NEVER carries a `CompactedBatch`: that
+    /// batch is out of THIS decision's scope once declined, so
+    /// `crate::modernbert::ModernBert::forward_hidden_with_lengths` never
+    /// transports and every layer runs the padded `[batch, seq, hidden]`
+    /// block/eager arm exactly as before this seam existed.
+    Declined {
+        outcome: PredicateOutcome,
+        reason: &'static str,
+    },
+}
+
+impl FlashDecision {
+    /// The [`PredicateOutcome`] every `admit_cascade` call site reports —
+    /// `Holds` for [`Self::Fused`] (the only outcome that variant can mean),
+    /// whatever [`Self::Declined`] itself carries otherwise.
+    pub(crate) fn outcome(&self) -> PredicateOutcome {
+        match self {
+            FlashDecision::Fused(_) => PredicateOutcome::Holds,
+            FlashDecision::Declined { outcome, .. } => *outcome,
+        }
+    }
+
+    /// The reason string every `admit_cascade` call site reports —
+    /// per-variant truthful for [`Self::Fused`] (contract v4 delta 4:
+    /// `"domain_ok_dense"` must not describe a padded dispatch, and vice
+    /// versa): `"domain_ok_dense"` when the carried `CompactedBatch` is
+    /// dense, `"domain_ok_padded"` when it is genuinely padded. Whatever
+    /// [`Self::Declined`] itself carries otherwise.
+    pub(crate) fn reason(&self) -> &'static str {
+        match self {
+            FlashDecision::Fused(batch) if batch.is_dense => "domain_ok_dense",
+            FlashDecision::Fused(_) => "domain_ok_padded",
+            FlashDecision::Declined { reason, .. } => reason,
+        }
+    }
+}
 
 /// The key-chunk width [`forward_memeff_attention`] hands
 /// [`MemEfficientAttention::new`] — moved verbatim from `crate::modernbert`
@@ -124,49 +290,100 @@ const MEM_EFFICIENT_CHUNK: usize = 1024;
 /// guards.
 const _: () = assert!(MEM_EFFICIENT_CHUNK >= MEM_EFFICIENT_MIN_CHUNK);
 
-/// A local-attention layer's sliding-window half-width, bundled with the
-/// "is this layer local at all" fact `is_local: bool` used to be a
-/// separately-carried, independently-must-agree field. `Some` replaces
+/// A local-attention layer's marker — `Some(LocalWindow)` replaces
 /// `is_local == true` (ModernBERT's local layers); `None` replaces
 /// `is_local == false` (ModernBERT's global layers, and EVERY BERT/
 /// DistilBERT layer — neither architecture has a sliding-window concept).
+/// A fieldless marker, not a `half_window: usize` carrier (audit round
+/// item 3): the actual window WIDTH the block/eager arms need lives in
+/// the already-built band tensor
+/// ([`TrainingMaskInputs::local_band`]/[`FusedAttentionMasks::local`])
+/// those arms consume, never in this type — [`forward_memeff_attention`]'s
+/// own `half_window: Option<usize>` parameter is a SEPARATE,
+/// independently-sourced value (see [`training_attention_cascade`]'s doc
+/// for why the two must never be derived from each other).
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct LocalWindow {
-    pub(crate) half_window: usize,
-}
+pub(crate) struct LocalWindow;
 
-/// [`RopeCtx::apply`]'s function-pointer type, named so its own field
-/// declaration reads as one bounded-complexity type rather than the raw
-/// `Option<&dyn Fn(..) -> Result<..>>` spelled out inline (clippy's
+/// [`RopeCtx::Enabled`]'s eager-rotation function-pointer type, named so
+/// its own field declaration reads as one bounded-complexity type rather
+/// than the raw `&dyn Fn(..) -> Result<..>` spelled out inline (clippy's
 /// `type_complexity` lint).
 type RopeApplyFn<'a> = dyn Fn(&Tensor) -> Result<Tensor, EncoderError> + 'a;
 
-/// The per-layer RoPE context the cascade's fused/eager arms need — see
-/// this module's doc for why `enabled: false` still carries a `pack`
-/// tensor rather than making the whole context `Option`.
-pub(crate) struct RopeCtx<'a> {
-    /// `[2, 1, 1, seq_max, head_dim]` (or a smaller, unread placeholder
-    /// when `!enabled`) — [`AttentionBlockFused`]/[`MemEfficientAttention`]'s
-    /// shared `rope_pack` argument.
-    pub(crate) pack: &'a Tensor,
-    /// Whether RoPE is actually applied: the fused ops' own `rope: bool`
-    /// construction data, and whether the eager composition below rotates
-    /// Q/K at all.
-    pub(crate) enabled: bool,
-    /// The eager per-tensor rotation, consulted only when `enabled`.
-    /// `None` whenever `!enabled` (BERT/DistilBERT: no RoPE, so no
-    /// rotation function exists to call).
-    pub(crate) apply: Option<&'a RopeApplyFn<'a>>,
+/// [`RopeCtx::Enabled`]'s rope-PACK-materializing function-pointer type —
+/// a PROVIDER, not an already-materialized `&'a Tensor` (audit round item
+/// 5): the pack is a real per-forward computation
+/// (`RotaryEmbedding::cached_rope_pack`, memoized per dtype but still a
+/// lock + possible first-call `Tensor::stack`), and main's own placement
+/// computed it ONLY inside the arm that actually consumes it (the memeff
+/// arm, and the block-fused arm's `DispatchOutcome::Fused` branch) —
+/// never for a flash dispatch and never for the eager arm. A caller must
+/// still build a `RopeCtx` BEFORE calling [`training_attention_cascade`]
+/// (whose flash check runs first and may return before ever touching
+/// `rope`), so `pack` cannot be an already-materialized `&Tensor` without
+/// forcing that materialization ahead of the flash check every time.
+/// Wrapping it as a zero-argument provider keeps construction itself
+/// free — the provider is only ever CALLED from [`forward_memeff_attention`]
+/// and the block-fused arm inside [`training_attention_cascade`], exactly
+/// where main called `cached_rope_pack` — while [`apply_rope`] (the eager
+/// arm's own consumer) never calls it at all.
+type RopePackFn<'a> = dyn Fn() -> Result<Tensor, EncoderError> + 'a;
+
+/// The per-layer RoPE context the cascade's fused/eager arms need. Two
+/// variants, not a `pack`/`enabled`/`apply` struct with `apply: Option`
+/// (audit round item 2): the prior shape let `enabled: true, apply: None`
+/// be constructed simultaneously — an invalid state [`apply_rope`] had to
+/// silently resolve to "no rotation" at runtime rather than the type
+/// itself refusing to represent it (`crate::modernbert`'s own
+/// `forward_memeff_attention` test wrapper constructed exactly this state
+/// before this fix, since that arm never calls [`apply_rope`] at all and
+/// so never noticed). This enum makes the state a COMPILE ERROR instead:
+/// [`Self::Enabled`] always carries its `apply` function alongside `pack`,
+/// [`Self::Disabled`] carries neither.
+pub(crate) enum RopeCtx<'a> {
+    /// No RoPE at all (BERT/DistilBERT: absolute position embeddings are
+    /// summed into the input once, never applied per layer). `placeholder`
+    /// is a per-module cached tensor — allocated ONCE, at construction,
+    /// never read by the fused ops (`rope: false` there) and never
+    /// re-derived per forward; see [`Self::pack`].
+    Disabled { placeholder: &'a Tensor },
+    /// RoPE is genuinely applied. `pack` is called ONLY from
+    /// [`forward_memeff_attention`] and [`training_attention_cascade`]'s
+    /// block-fused arm (see [`RopePackFn`]'s doc for why it is a provider,
+    /// not an already-materialized tensor); `apply` rotates a Q/K tensor
+    /// in the eager composition, consulted only there.
+    Enabled {
+        pack: &'a RopePackFn<'a>,
+        apply: &'a RopeApplyFn<'a>,
+    },
+}
+
+impl<'a> RopeCtx<'a> {
+    /// The op-facing rotary pack: [`Self::Disabled`]'s placeholder
+    /// (infallible, a cheap `Tensor::clone` — candle's `Tensor` shares its
+    /// underlying storage `Arc`, so this never copies data) or
+    /// [`Self::Enabled`]'s provider, CALLED here (see [`RopePackFn`]'s
+    /// doc for why laziness matters: calling this from the flash arm or
+    /// the eager arm would materialize/error on the pack where main never
+    /// did).
+    fn pack(&self) -> Result<Tensor, EncoderError> {
+        match self {
+            RopeCtx::Disabled { placeholder } => Ok((*placeholder).clone()),
+            RopeCtx::Enabled { pack, .. } => pack(),
+        }
+    }
+
+    /// The fused ops' own `rope: bool` construction data.
+    fn enabled(&self) -> bool {
+        matches!(self, RopeCtx::Enabled { .. })
+    }
 }
 
 fn apply_rope(rope: &RopeCtx<'_>, x: &Tensor) -> Result<Tensor, EncoderError> {
-    if rope.enabled {
-        match rope.apply {
-            Some(f) => f(x),
-            None => Ok(x.clone()),
-        }
-    } else {
-        Ok(x.clone())
+    match rope {
+        RopeCtx::Disabled { .. } => Ok(x.clone()),
+        RopeCtx::Enabled { apply, .. } => apply(x),
     }
 }
 
@@ -455,7 +672,9 @@ pub(crate) fn softmax_apply_training(
 /// The memory-efficient (chunked) attention arm — moved verbatim from
 /// `crate::modernbert::ModernBertAttention::forward_memeff_attention`,
 /// parameterized by `rope`/`half_window`/`policy` in place of `self.rope`/
-/// `self.half_window`/the hardcoded `FullyMaskedPolicy::Zeros`.
+/// `self.half_window`/the hardcoded `FullyMaskedPolicy::Zeros`. `rope.pack()`
+/// is called here, matching main's own placement exactly (audit round item
+/// 5) — see [`RopePackFn`]'s doc.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn forward_memeff_attention(
     qkv: &Tensor,
@@ -469,16 +688,17 @@ pub(crate) fn forward_memeff_attention(
     policy: FullyMaskedPolicy,
 ) -> Result<Tensor, EncoderError> {
     let qkv5 = qkv.reshape((batch, seq, 3, h, d))?;
+    let rope_pack = rope.pack()?;
     let key_mask = extended_mask_f32.to_dtype(qkv.dtype())?;
     let op = MemEfficientAttention::new(
         1.0 / (d as f32).sqrt(),
         policy,
-        rope.enabled,
+        rope.enabled(),
         half_window,
         MEM_EFFICIENT_CHUNK,
     )
     .map_err(|e| EncoderError::Config(format!("mem_efficient_attention: {e}")))?;
-    mem_efficient_attention(&qkv5, rope.pack, &key_mask, op)
+    mem_efficient_attention(&qkv5, &rope_pack, &key_mask, op)
         .map_err(|e| EncoderError::Config(format!("mem_efficient_attention: {e}")))
 }
 
@@ -565,10 +785,29 @@ pub(crate) fn forward_eager_training_attention_composition(
 
 /// The shared per-layer cascade — moved verbatim (numerics unchanged) from
 /// `crate::modernbert::ModernBertAttention::forward_training_attention`'s
-/// body, parameterized by `rope`/`window`/`policy`/`flash` in place of
-/// `self.rope`/`self.is_local`+`self.half_window`/the hardcoded
+/// body, parameterized by `rope`/`window`/`half_window`/`policy`/`flash` in
+/// place of `self.rope`/`self.is_local`+`self.half_window`/the hardcoded
 /// `FullyMaskedPolicy::Zeros`/the method's own `flash: &FlashDecision`
 /// argument (already a parameter before this move).
+///
+/// `window` and `half_window` are TWO SEPARATE parameters, not one
+/// (audit round item 3): `window: Option<LocalWindow>` is consulted ONLY
+/// as `is_some()` — the block/eager arms' "is this layer local" fact,
+/// which gates whether they combine in the sliding-window band `masks`
+/// already carries. `half_window: Option<usize>` is the RAW scalar
+/// [`forward_memeff_attention`] needs, and it is passed straight through
+/// UNTOUCHED to that call below — never derived from `window` (main's own
+/// `forward_memeff_attention` read `self.half_window` directly, with no
+/// `is_local` coupling and no `unwrap_or` substitution; a caller that
+/// re-derived `half_window` from `window.map(|w| w.half_window)` here
+/// would silently turn "half_window is `None`" into "half_window is
+/// `Some(0)`" whenever `window.is_some()`, a confident-wrong scalar,
+/// or silently drop a real `half_window` whenever `window` and
+/// `half_window` briefly disagree). Every real caller keeps them in
+/// lockstep at construction (see `crate::modernbert`'s own attention
+/// constructor's doc for where `is_local`/`half_window` are set together),
+/// but this cascade never assumes that lockstep to derive one from the
+/// other.
 ///
 /// `on_flash_fused` is the ONE piece of this cascade that stays
 /// caller-specific: when the flash cascade admits `Fused`, dense/ragged
@@ -591,6 +830,7 @@ pub(crate) fn training_attention_cascade(
     flash: &FlashDecision,
     rope: &RopeCtx<'_>,
     window: Option<LocalWindow>,
+    half_window: Option<usize>,
     policy: FullyMaskedPolicy,
     on_flash_fused: impl FnOnce(&CompactedBatch) -> Result<Tensor, EncoderError>,
 ) -> Result<Tensor, EncoderError> {
@@ -640,7 +880,7 @@ pub(crate) fn training_attention_cascade(
             d,
             masks.extended,
             rope,
-            window.map(|w| w.half_window),
+            half_window,
             policy,
         );
     }
@@ -679,6 +919,11 @@ pub(crate) fn training_attention_cascade(
     match outcome {
         DispatchOutcome::Fused => {
             let qkv5 = qkv.reshape((batch, seq, 3, h, d))?;
+            // `rope.pack()` is called HERE, inside the block-fused arm,
+            // matching main's own placement exactly (audit round item 5)
+            // — see `RopePackFn`'s doc: neither the flash arm above nor
+            // the eager arm below ever materializes or errors on it.
+            let rope_pack = rope.pack()?;
             let mask = match (window.is_some(), fused.local.as_ref()) {
                 (true, Some(local)) => local,
                 (true, None) => {
@@ -688,8 +933,8 @@ pub(crate) fn training_attention_cascade(
                 }
                 (false, _) => &fused.global,
             };
-            let op = AttentionBlockFused::new(1.0 / (d as f32).sqrt(), policy, rope.enabled)?;
-            Ok(apply3(&qkv5, rope.pack, mask, op)?)
+            let op = AttentionBlockFused::new(1.0 / (d as f32).sqrt(), policy, rope.enabled())?;
+            Ok(apply3(&qkv5, &rope_pack, mask, op)?)
         }
         DispatchOutcome::Eager => forward_eager_training_attention_composition(
             qkv,

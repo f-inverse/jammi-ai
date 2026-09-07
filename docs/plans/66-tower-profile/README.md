@@ -72,7 +72,10 @@ them bought.
 
 All four candidate ports the contract named are **UNRESOLVED** — decided on BOTH the F32
 (A1) and BF16 (A2) decision legs of each tower (the pass-4 census-key fix, below, makes
-every A2 leg decision-grade; no candidate is F32-only by consequence):
+both CLIP-tower A2 legs decision-grade for attribution — `htsat-A2` stays VALID but
+non-decision-grade, see the deviation below; HTSAT has no candidate port under this
+contract, so that never blocks a candidate-port decision — no candidate is F32-only by
+consequence):
 
 - **`C-ATTN-clip-text`** — UNRESOLVED: "neither ACTIVATE (s_wall>=10% on any decision-grade
   leg) nor DECLINE (combined share <5% on every decision-grade leg) — clip-text-A1:
@@ -91,10 +94,17 @@ every A2 leg decision-grade; no candidate is F32-only by consequence):
   clip-vision-A1: s_wall+U_wall=0.0387, s_busy+U_busy=0.0680; clip-vision-A2:
   s_wall+U_wall=0.0319, s_busy+U_busy=0.0898"
 
-**No port is licensed under #421.** Every candidate sits in the 5–10 % band the contract's
-own decision rule declares UNRESOLVED rather than DECLINE or ACTIVATE — the two-sided rule
-does exactly what it was pre-registered to do: it refuses to manufacture a verdict a
-5–10 % share does not support, on either side.
+**No port is licensed under #421.** No candidate clears ACTIVATE (`s_wall>=10%` on any
+decision-grade leg) or DECLINE (both `s_wall+U_wall<5%` AND `s_busy+U_busy<5%` on every
+decision-grade leg) — the per-leg numbers are quoted verbatim above. This is not uniform
+across candidates or axes: `C-MLP`'s own measured `s_wall` (no `U` term) is only
+3.95 %/3.11 % on CLIP-text (A1/A2) and 3.36 %/2.66 % on CLIP-vision — well under the 5 %
+DECLINE floor on the wall axis, combined or not (`s_wall+U_wall` above is 4.38 %/3.56 % and
+3.87 %/3.19 %, still under 5 %) — it is the combined *busy* share (`s_busy+U_busy`,
+7.24 %/8.29 % CLIP-text, 6.80 %/8.98 % CLIP-vision) that lands in the contract's 5–10 %
+band and is what keeps DECLINE from firing. The two-sided rule does exactly what it was
+pre-registered to do: it refuses to manufacture a verdict a 5–10 % share does not support,
+on either side.
 
 ### Findings (verbatim text from the artifact's `findings`)
 
@@ -156,6 +166,9 @@ mechanism, only points at it.
 | #469 | `fix/421-driver-corpus-stdout` | esc-088: the driver's corpus tuple no longer shares stdout with its own producers |
 | #470 | `perf/421-attribution` | Post-export chain attribution (`profile_421_attribute.py`, `kernel_census.py`), the pass-4 census-key fix |
 | — (pending) | `perf/421-artifact` | **this unit**: the close-out artifact, the frozen contract copy, this README, the guide/CHANGELOG/maintainer-guide updates |
-| #471 | `perf/421-frontend` | The HTSAT/CLIP-vision front-end finding's follow-on: parallelizes the media front end across rayon's global pool |
-| — (pending) | `perf/421-followups` | Other close-out follow-ups from this profile |
+| #471 (open) | `perf/421-frontend` | The HTSAT/CLIP-vision front-end finding's follow-on: parallelizes the media front end across rayon's global pool |
+| #472 (open) | `perf/421-followups` | Other close-out follow-ups from this profile |
 | — (pending) | `cookbook/421-tower-chapter` | The cookbook chapter for the tower training-step profile |
+
+Landing status is stated as of this docs commit; an "(open)" PR that merges before this
+unit's own PR lands is updated by the lead at merge time, not backfilled here.

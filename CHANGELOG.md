@@ -187,8 +187,9 @@ workspace ships every publishable crate at the same
   answered correctly rather than by formula. Every count is per training forward only — an
   eval forward contributes `0` to both sides of the profile equation. `FinetuneRunTier` gains
   `fusible_site_census` as PROVENANCE (captured every epoch, refused if it changes;
-  `PROVENANCE_FIELDS` 11 → 12). `ci/scripts/perf/profile_421_merge.py` (53 hermetic tests)
-  reads its `calls` term from this field and checks `fused + eager == fusible_site_census ×
+  `PROVENANCE_FIELDS` 11 → 12). `ci/scripts/perf/profile_421_merge.py` (tested by the
+  hermetic `test_profile_421_merge.py` suite) reads its `calls` term from this field and
+  checks `fused + eager == fusible_site_census ×
   steps_measured` per key, `fused == 0` for every `kernels_disabled_expected` key on a D leg,
   and computes `residual = wall − front − busy` per step — a negative residual reports as
   `overlap_s` (front-end work pipelined against a prior step's kernels), never a leg
@@ -216,8 +217,11 @@ workspace ships every publishable crate at the same
   +32.6 ms (CLIP-text, 32.4 % of wall), +30.3 ms (CLIP-vision, 26.4 %), +82.9 ms (HTSAT, 5.4 %);
   C-LN +15.6 ms (CLIP-text), +20.8 ms (CLIP-vision); the joint C-LN+C-GELU-HTSAT chain +56.6 ms
   (3.6 %). Findings: the HTSAT training step is CPU front-end-bound (audio decode/resample/STFT/mel
-  ≈ 81–83 % of wall, dtype- and arm-invariant); CLIP-vision's image front end is ≈ 20–22 % of wall;
-  at batch 8 the CLIP steps are launch-bound (≈ 3.6–3.7 k launches/step; BF16 cuts GPU busy 32–41 %
+  ≈ 81–83 % of wall, dtype- and arm-invariant); CLIP-vision's image front end is ≈ 20–22 % of wall
+  (both corpora cycle only 16 distinct train clips at any row count — a page-cached working set,
+  never a realistic-corpus I/O cost — so both numbers are a real per-item CPU decode/preprocess
+  compute cost; see `docs/plans/66-tower-profile/README.md`'s deviations); at batch 8 the CLIP
+  steps are launch-bound (≈ 3.6–3.7 k launches/step; BF16 cuts GPU busy 32–41 %
   but wall only 4–5 %); `C-ATTN-HTSAT` is measured (≈ 33 % of GPU busy) and stays OUT OF TIER, a
   named-but-undecided chain, never folded into UNATTRIBUTED. See
   `docs/plans/66-tower-profile/README.md` and `CONTRACT.md` (the frozen v2.5 contract) for the full

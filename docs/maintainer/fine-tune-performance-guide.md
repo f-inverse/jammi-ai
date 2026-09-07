@@ -383,28 +383,44 @@ on HTSAT, D1 disables `layer_norm_fused` AND `gelu_erf_fused` together, so its D
 delta (+56.6 ms, 3.6 % of the A1 baseline wall) is the JOINT C-LN + C-GELU-HTSAT gain, not
 C-LN alone.
 
-**All four candidate ports are UNRESOLVED — no port is licensed under #421.** Every
-candidate sits in the contract's 5–10 % band on both the F32 and BF16 decision legs (the
-pass-4 `kernel_census.py` demangled-name fix, `docs/maintainer/MAINTAINER-GUIDE.md` §2.5,
-makes every A2 leg decision-grade, so no verdict below is F32-only): `C-ATTN-CLIP-text` —
-UNRESOLVED, "neither ACTIVATE (s_wall>=10% on any decision-grade leg) nor DECLINE (combined
-share <5% on every decision-grade leg) — clip-text-A1: s_wall+U_wall=0.1030,
-s_busy+U_busy=0.1703; clip-text-A2: s_wall+U_wall=0.0878, s_busy+U_busy=0.2045";
-`C-MLP-CLIP-text` — UNRESOLVED, "clip-text-A1: s_wall+U_wall=0.0438, s_busy+U_busy=0.0724;
-clip-text-A2: s_wall+U_wall=0.0356, s_busy+U_busy=0.0829"; `C-ATTN-CLIP-vision` —
-UNRESOLVED, "clip-vision-A1: s_wall+U_wall=0.0641, s_busy+U_busy=0.1128; clip-vision-A2:
-s_wall+U_wall=0.0501, s_busy+U_busy=0.1410"; `C-MLP-CLIP-vision` — UNRESOLVED,
-"clip-vision-A1: s_wall+U_wall=0.0387, s_busy+U_busy=0.0680; clip-vision-A2:
-s_wall+U_wall=0.0319, s_busy+U_busy=0.0898". The two-sided rule refuses to manufacture a
-verdict a 5–10 % share does not support on either side — that refusal, not a missing
-signal, is why nothing ports.
+**All four candidate ports are UNRESOLVED — no port is licensed under #421.** No candidate
+clears ACTIVATE (`s_wall>=10%` on any decision-grade leg) or DECLINE (both
+`s_wall+U_wall<5%` AND `s_busy+U_busy<5%` on every decision-grade leg); the pass-4
+`kernel_census.py` demangled-name fix (`docs/maintainer/MAINTAINER-GUIDE.md` §2.5) makes
+both CLIP-tower A2 legs decision-grade for attribution (`htsat-A2` stays non-decision-grade
+— HTSAT has no candidate port under this contract, so that never blocks a verdict; see
+`docs/plans/66-tower-profile/README.md`), so no verdict below is F32-only. This is not
+uniform across candidates or axes: `C-MLP`'s own measured `s_wall` (no `U` term) is only
+3.95 %/3.11 % on CLIP-text and 3.36 %/2.66 % on CLIP-vision — well under the 5 % DECLINE
+floor on wall, combined or not — it is the combined *busy* share (`s_busy+U_busy`,
+7.24 %/8.29 % CLIP-text, 6.80 %/8.98 % CLIP-vision) that lands in the contract's 5–10 %
+band and keeps DECLINE from firing. Verbatim reasons (artifact `candidate_decisions[]`):
+`C-ATTN-CLIP-text` — UNRESOLVED, "neither ACTIVATE (s_wall>=10% on any decision-grade leg)
+nor DECLINE (combined share <5% on every decision-grade leg) — clip-text-A1:
+s_wall+U_wall=0.1030, s_busy+U_busy=0.1703; clip-text-A2: s_wall+U_wall=0.0878,
+s_busy+U_busy=0.2045"; `C-MLP-CLIP-text` — UNRESOLVED, "…clip-text-A1:
+s_wall+U_wall=0.0438, s_busy+U_busy=0.0724; clip-text-A2: s_wall+U_wall=0.0356,
+s_busy+U_busy=0.0829" (elided prefix identical to `C-ATTN-CLIP-text`'s above; full text at
+artifact `candidate_decisions[1].reason`); `C-ATTN-CLIP-vision` — UNRESOLVED, "…
+clip-vision-A1: s_wall+U_wall=0.0641, s_busy+U_busy=0.1128; clip-vision-A2:
+s_wall+U_wall=0.0501, s_busy+U_busy=0.1410" (`candidate_decisions[2].reason`);
+`C-MLP-CLIP-vision` — UNRESOLVED, "…clip-vision-A1: s_wall+U_wall=0.0387,
+s_busy+U_busy=0.0680; clip-vision-A2: s_wall+U_wall=0.0319, s_busy+U_busy=0.0898"
+(`candidate_decisions[3].reason`). The two-sided rule refuses to manufacture a verdict a
+5–10 % share does not support on either side — that refusal, not a missing signal, is why
+nothing ports.
 
 **Findings.** The HTSAT training step is CPU front-end-bound: front-end share of wall is
 81–83 % across the F32/BF16 decision legs (audio decode/resample/STFT/mel dominating wall
 time), dtype- and arm-invariant — closed as its own follow-on unit on `perf/421-frontend`
 (parallelizing the media front end across rayon's global pool), not duplicated here.
 CLIP-vision's own image decode/preprocess front end is 20–22 % of wall on the F32/BF16
-decision legs. At batch 8 the CLIP training steps are launch-bound (3638–3722
+decision legs. Both media corpus producers cycle only 16 distinct train clips (families ×
+instances = 24 files at any `--rows`) — a page-cached working set, not a realistic-corpus
+I/O cost — so both front-end numbers are a real per-item CPU decode/preprocess compute
+cost, never disk I/O (artifact `notes.recorded_deviations`; full caveat:
+`docs/plans/66-tower-profile/README.md`). At batch 8 the CLIP training steps are
+launch-bound (3638–3722
 launches/step across the four F32/BF16 A-arm CLIP legs); BF16 cuts GPU busy 32–41 % per
 tower while wall drops only 4–5 %. `C-ATTN-HTSAT` is measured, not a candidate port: 33 %
 of GPU busy (~5 % of wall) on the F32 decision leg — HTSAT's head_dim of 24 at every stage
@@ -565,8 +581,9 @@ before it ever evaluates the equation — never silently computing a wrong `call
 product.
 
 **`profile_421_merge.py`'s role.** The merge step (`ci/scripts/perf/profile_421_merge.py`,
-tested by 53 hermetic tests in `ci/scripts/perf/test_profile_421_merge.py`) is where the
-N/M wall-differencing method above becomes checked arithmetic for the towers. Per admission
+tested by the hermetic `test_profile_421_merge.py` suite — the test count itself is not
+cited here since it drifts with every added case; run the suite for the current count) is
+where the N/M wall-differencing method above becomes checked arithmetic for the towers. Per admission
 key it re-checks `fused + eager == fusible_site_census × steps_measured` (refusing INVALID
 first on the epochs/grad-accum convention above), and on a D leg it additionally requires
 `fused == 0` for every key named in `kernels_disabled_expected`. Per step it computes `wall`,

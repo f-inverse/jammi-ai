@@ -427,6 +427,71 @@ class DryRunSmokeTests(unittest.TestCase):
                 "were not, this test would pass no matter which split the driver chose",
             )
 
+    def test_each_legs_report_satisfies_the_positive_proof_equation(self):
+        """The dry-run reports the capture path actually produces must be
+        SHAPED like a real leg's, or this whole suite proves the plumbing
+        while leaving the plumbing's payload untested.
+
+        `profile_421_merge.py` checks `fused + eager == fusible_site_census
+        x steps_measured` per key on every real leg; the same equation is
+        asserted here on what the stub emits, on both arms that matter: an A
+        leg (fused non-zero for lora/ln) and a D leg (fused exactly 0 for
+        every key it claims to have disabled). The `gelu_erf_fused` key is
+        the load-bearing one — a CLIP tower's `quick_gelu` has no fused
+        seam, so its census is 0 and its counters must read 0/0, while HTSAT
+        carries a real per-forward count.
+        """
+        keys = {
+            "lora_linear_fused": (
+                "lora_linear_fused_dispatches",
+                "lora_linear_eager_dispatches",
+                "lora_sites_wrapped",
+            ),
+            "layer_norm_fused": ("ln_fused_dispatches", "ln_eager_dispatches", "layer_norms"),
+            "gelu_erf_fused": (
+                "gelu_fused_dispatches",
+                "gelu_eager_dispatches",
+                "gelu_seam_calls_per_forward",
+            ),
+        }
+        with tempfile.TemporaryDirectory() as out_dir:
+            result = run_dry(out_dir, legs_only="clip-text-A1,htsat-A1,clip-text-D1")
+            self.assertEqual(result.returncode, 0, _fail_msg(result))
+            for leg_id, disabled in (
+                ("clip-text-A1", ()),
+                ("htsat-A1", ()),
+                ("clip-text-D1", tuple(D1_KEYS_CLIP.split(","))),
+            ):
+                for run in ("n", "m"):
+                    path = os.path.join(out_dir, leg_id, f"run_{run}.json")
+                    with open(path, encoding="utf-8") as f:
+                        tier = json.load(f)["tiers"]["finetune_run"]
+                    # The pinned convention the equation is defined under.
+                    self.assertEqual(tier["epochs"], 1, f"{leg_id} {run}")
+                    self.assertEqual(tier["grad_accum"], 1, f"{leg_id} {run}")
+                    steps = tier["steps_measured"]
+                    census = tier["fusible_site_census"]
+                    for key, (fused_f, eager_f, census_f) in keys.items():
+                        calls = census[census_f]
+                        self.assertEqual(
+                            tier[fused_f] + tier[eager_f], calls * steps,
+                            f"{leg_id} run_{run}: {key} violates fused + eager == "
+                            f"{census_f} x steps_measured",
+                        )
+                        if key in disabled:
+                            self.assertEqual(tier[fused_f], 0,
+                                             f"{leg_id} run_{run}: {key} is disabled")
+                        elif key != "gelu_erf_fused":
+                            self.assertGreater(tier[fused_f], 0,
+                                               f"{leg_id} run_{run}: {key} on a fused arm")
+                    # The one structural split the stub must mirror.
+                    expected_gelu = 0 if leg_id.startswith("clip") else 9
+                    self.assertEqual(
+                        census["gelu_seam_calls_per_forward"], expected_gelu,
+                        f"{leg_id}: a CLIP tower's quick_gelu has no fused seam (census 0); "
+                        f"HTSAT's Swin MLP does",
+                    )
+
     def test_legs_only_filter_runs_exactly_the_named_legs(self):
         with tempfile.TemporaryDirectory() as out_dir:
             result = run_dry(out_dir, legs_only="htsat-A2,clip-vision-D2")

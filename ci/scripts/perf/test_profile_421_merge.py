@@ -103,6 +103,10 @@ def make_tier(
     """
     tier: dict = {
         "steps_measured": steps,
+        # The pinned measurement convention: `batches == steps_measured`
+        # holds only here. Every leg the driver runs pins both.
+        "grad_accum": 1,
+        "epochs": 1,
         "train_run_wall_s": wall,
         "media_front_end_wall_s": front,
         "kernels_disabled_expected": sorted(disabled),
@@ -323,6 +327,39 @@ class PositiveProofTests(unittest.TestCase):
             row = only_leg(merged(out))
             self.assertEqual(row["verdict"], "VALID", reasons_text(row))
             self.assertEqual(row["positive_proof"]["run_m"]["layer_norm_fused"]["fused"], 25 * 600)
+
+    def test_a_multi_epoch_leg_is_refused_by_name_not_as_an_equation_failure(self):
+        """`steps_measured` is the equation's `batches` term only at
+        `--epochs 1`: this tier sums each resume-chained leg's own
+        `global_step`, which a resumed leg carries forward, so a 2-epoch run
+        over-counts training forwards. Reporting THAT as "the counters
+        disagree with the census" would blame the kernels for a convention
+        mismatch."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            tier_n, tier_m = a_leg_pair()
+            tier_m["epochs"] = 2
+            write_leg(out, "clip-text-A1", tier_n=tier_n, tier_m=tier_m)
+            row = only_leg(merged(out))
+            self.assertEqual(row["verdict"], "INVALID")
+            text = reasons_text(row)
+            self.assertIn("epochs=2", text)
+            self.assertIn("over-counts training forwards", text)
+            self.assertNotIn("positive proof failed", text)
+            # The equation was not even attempted for that run.
+            self.assertNotIn("run_m", row["positive_proof"] or {})
+
+    def test_a_grad_accum_above_one_is_refused_by_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            tier_n, tier_m = a_leg_pair()
+            tier_m["grad_accum"] = 4
+            write_leg(out, "clip-text-A1", tier_n=tier_n, tier_m=tier_m)
+            row = only_leg(merged(out))
+            self.assertEqual(row["verdict"], "INVALID")
+            text = reasons_text(row)
+            self.assertIn("grad_accum=4", text)
+            self.assertNotIn("positive proof failed", text)
 
     def test_a_missing_site_census_invalidates_but_still_reports_the_timings(self):
         with tempfile.TemporaryDirectory() as tmp:

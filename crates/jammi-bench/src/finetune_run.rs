@@ -1906,6 +1906,16 @@ fn run_impl(
     // site below and `crate::report::FinetuneRunTier::media_front_end_wall_s`'s
     // own doc for the measured boundary.
     let mut media_front_end_wall_s = 0.0f64;
+    // The WITNESSED per-forward fusible-seam census (contract §D4 item 1),
+    // taken off the encoder each epoch's `build_encoder_adapters` actually
+    // returned — see `crate::report::FinetuneRunTier::fusible_site_census`
+    // for what a downstream reader does with it. Captured every epoch, not
+    // only the first, and a DISAGREEMENT between epochs refuses the run:
+    // this tier's counters are a single before/after delta over the WHOLE
+    // resume-cycle, so a `calls` term that changed partway through would
+    // make `fused + eager == calls * batches` unanswerable rather than
+    // merely wrong.
+    let mut fusible_site_census: Option<jammi_encoders::FusibleSiteCensus> = None;
     let mut last_final_loss = 0.0f64;
     let mut last_held_out = None;
     // Test-only (see `run_impl`'s own doc): the final epoch's `VarMap`
@@ -1977,6 +1987,26 @@ fn run_impl(
             &device,
             &varmap,
         )?;
+        // RIGHT AFTER the build, before the encoder is moved into the
+        // training target below: a pure structural walk
+        // (`AnyEncoder::fusible_site_census` dispatches nothing, so reading
+        // it inside this run's own counter window cannot perturb the very
+        // counters it exists to explain).
+        let epoch_census = encoder.fusible_site_census();
+        match &fusible_site_census {
+            None => fusible_site_census = Some(epoch_census),
+            Some(first) if *first != epoch_census => {
+                return Err(format!(
+                    "finetune-run: internal: epoch {epoch_idx}'s built encoder witnesses a \
+                     different fusible-seam census ({epoch_census:?}) than epoch 0's \
+                     ({first:?}) — this tier's dispatch counters are one delta over the whole \
+                     resume-cycle, so a `calls` term that moved partway through makes the \
+                     positive-proof equation unanswerable"
+                )
+                .into());
+            }
+            Some(_) => {}
+        }
         let target = TrainingTarget::EncoderAdapters(Box::new(EncoderAdaptersTarget {
             encoder,
             adapter_cfg,
@@ -2342,6 +2372,15 @@ fn run_impl(
         kernels_disabled_requested,
         kernels_disabled_fired,
         kernels_disabled_expected,
+        // `epochs >= 1` is enforced upstream, so the loop above always ran
+        // at least once and this is always `Some` — but the error path is
+        // spelled out rather than unwrapped, because a fabricated all-zero
+        // census would read to a downstream merger as "this build wraps no
+        // LoRA sites and holds no LayerNorms", which is a FALSE claim about
+        // the model rather than a missing one.
+        fusible_site_census: fusible_site_census.ok_or(
+            "finetune-run: internal: no epoch ran, so no fusible-seam census was witnessed",
+        )?,
         flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
         build_features: crate::report::build_features(),
         attention_arm: resolved_attention_arm,

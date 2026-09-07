@@ -28,10 +28,31 @@ REFUSAL branch) is exercised in CI.
    | `gelu_erf_fused`   | `gelu_seam_calls_per_forward`| `gelu_fused_dispatches` / `gelu_eager_dispatches`         |
 
    and the equation is `fused + eager == census × steps_measured` (exact
-   integer equality; `batches == steps_measured` holds because every leg
-   pins `--grad-accum 1`). A census value of `0` is a real, checkable claim,
+   integer equality). A census value of `0` is a real, checkable claim,
    not a skip: a CLIP leg must then read `0`/`0`, because `quick_gelu` has
    no seam. The eager SHARE is reported either way, never hidden.
+
+   **The measurement convention is PINNED before anything is compared.**
+   `batches == steps_measured` is true only at `--grad-accum 1` AND
+   `--epochs 1`, and a leg that reports anything else is refused by NAME
+   rather than reported as an equation failure. `--grad-accum 1` is the
+   obvious half (one optimizer step is one training forward). `--epochs 1`
+   is the half that is easy to get wrong: `finetune_run::run` drives
+   `epochs` single-epoch, resume-chained `TrainingLoop::run` legs and SUMS
+   each leg's `TrainingResult::total_steps`, but that field is the leg's
+   own `global_step`, which a RESUMED leg carries forward from before the
+   resume. A 2-epoch, 2-batch-per-epoch run therefore reports
+   `steps_measured == 6` for `4` training forwards. Every #421 leg pins
+   `--epochs 1`, where the two coincide exactly — proven on real CLI output
+   by `crates/jammi-bench/tests/finetune_run_smoke.rs`'s
+   `fusible_site_census_satisfies_the_positive_proof_equation_on_a_real_run`.
+
+   EVAL forwards contribute nothing to EITHER side of any of the three
+   pairs (the LoRA site early-returns in eval, the house LayerNorm's fused
+   arm is under its training branch, and the GELU seam's eval arm is the
+   plain `Tensor::gelu_erf`), so held-out evaluations and train probes do
+   not enter the equation. It is UNDEFINED for a window that mixes forwards
+   the tier does not count as steps.
 
 2. **`fused > 0` for `lora_linear_fused` and `layer_norm_fused` on an A
    leg.** "A leg" is decided from the leg's OWN recorded arm (`kernels_
@@ -218,6 +239,38 @@ def nonneg_int(value: object, label: str, reasons: list[str]) -> int | None:
     return value
 
 
+def check_batches_convention(tier: dict, run_label: str, reasons: list[str]) -> bool:
+    """`steps_measured` is the equation's `batches` term only under the
+    convention the legs pin. Refuse by NAME when it is not met.
+
+    Reporting an equation FAILURE for a leg that simply was not run under
+    the convention the equation is defined for would be the "restored
+    coverage that dissolves when the rule is aligned" mistake in miniature:
+    the number would move for a reason that has nothing to do with what
+    dispatched.
+    """
+    ok = True
+    grad_accum = tier.get("grad_accum")
+    if grad_accum != 1:
+        reasons.append(
+            f"{run_label}: grad_accum={grad_accum!r}, but the positive-proof equation's "
+            "`batches` term is `steps_measured` only at --grad-accum 1 (one optimizer step "
+            "is one training forward)"
+        )
+        ok = False
+    epochs = tier.get("epochs")
+    if epochs != 1:
+        reasons.append(
+            f"{run_label}: epochs={epochs!r}, but the equation's `batches` term is "
+            "`steps_measured` only at --epochs 1: this tier drives one resume-chained "
+            "TrainingLoop leg per epoch and sums each leg's own `global_step`, which a "
+            "RESUMED leg carries forward from before the resume, so steps_measured "
+            "over-counts training forwards for any multi-epoch run"
+        )
+        ok = False
+    return ok
+
+
 def read_census(tier: dict, run_label: str, reasons: list[str]) -> dict[str, int] | None:
     """The WITNESSED per-forward call counts for this run's built encoder.
 
@@ -387,6 +440,11 @@ def merge_leg(leg_dir: Path) -> dict:
                 f"{run_label}: kernels_disabled_expected={expected_sorted} does not match the "
                 f"manifest's declared arm {disabled_manifest}"
             )
+            continue
+        # The convention gate comes BEFORE the equation, so a leg run
+        # outside it is refused by name rather than reported as a counter
+        # mismatch it never had.
+        if not check_batches_convention(tier, run_label, reasons):
             continue
         census = read_census(tier, run_label, reasons)
         if census is None or run_label not in steps:

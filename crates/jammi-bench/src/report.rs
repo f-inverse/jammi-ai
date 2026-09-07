@@ -2244,6 +2244,67 @@ pub struct FinetuneRunTier {
     /// disabled a live dispatch): those two are process-OBSERVED, this one
     /// is the claim they were checked against.
     pub kernels_disabled_expected: Vec<String>,
+    /// The per-forward fusible-seam census WITNESSED off the encoder this
+    /// run actually built — `jammi_encoders::AnyEncoder::fusible_site_census`
+    /// called on the value `crate::finetune_run::build_encoder_adapters`
+    /// (private to that module, so named as a code span rather than an
+    /// intra-doc link) returned, before it is moved into the training
+    /// target. Issue #421 §D4 item 1.
+    ///
+    /// ## What it is FOR: the `calls` term of the positive-proof equation
+    ///
+    /// A dispatch counter alone cannot be checked. `ln_fused_dispatches ==
+    /// 15000` is only a claim about a KERNEL if the reader also knows how
+    /// many admission decisions the run was supposed to take, and the only
+    /// honest source for that is the built model, not a formula over a
+    /// config (`2 * layers` is wrong for ModernBERT, whose layer-0 pre-norm
+    /// is absent, and for an HTSAT stage with no `downsample`). Each field
+    /// pairs with exactly one `jammi_kernels::admission` key —
+    /// `lora_sites_wrapped` ↔ `lora_linear_fused`, `layer_norms` ↔
+    /// `layer_norm_fused`, `gelu_seam_calls_per_forward` ↔ `gelu_erf_fused`
+    /// — and `ci/scripts/perf/profile_421_merge.py` reads its `calls`
+    /// straight off this struct to check `fused + eager == <field> ×
+    /// batches` per key, per run. A `0` is a real, FALSIFIABLE claim there,
+    /// not an absent one: a CLIP leg's `gelu_seam_calls_per_forward` is `0`
+    /// because `quick_gelu` has no seam, so that leg must read `0`/`0`
+    /// dispatches.
+    ///
+    /// `batches` counts TRAINING forwards ONLY. An eval forward contributes
+    /// nothing to EITHER side of any of the three pairs (the LoRA site
+    /// early-returns in eval, the house LayerNorm's fused arm is under its
+    /// training branch, and the GELU seam's eval arm is the plain
+    /// `Tensor::gelu_erf`), so held-out evaluations and train probes never
+    /// enter it. The equation is UNDEFINED for a window that mixes in
+    /// forwards this tier does not count as steps.
+    ///
+    /// [`Self::steps_measured`] is that `batches` term under EXACTLY one
+    /// convention, which the #421 legs pin and which a reader must pin
+    /// before comparing anything: `--grad-accum 1` AND `--epochs 1`. The
+    /// first is the obvious half (one optimizer step is one training
+    /// forward). The second is the half worth stating: [`crate::finetune_run::run`]
+    /// drives `epochs` resume-chained single-epoch `TrainingLoop::run` legs
+    /// and SUMS each leg's `TrainingResult::total_steps`, but that field is
+    /// the leg's own `global_step`, which a RESUMED leg carries forward
+    /// from before the resume — so a 2-epoch, 2-batch-per-epoch run reports
+    /// `steps_measured == 6` for 4 training forwards. At `--epochs 1` there
+    /// is one leg and the two coincide exactly;
+    /// `tests/finetune_run_smoke.rs`'s
+    /// `fusible_site_census_satisfies_the_positive_proof_equation_on_a_real_run`
+    /// proves it on the real CLI's own output, and
+    /// `ci/scripts/perf/profile_421_merge.py` REFUSES a leg outside the
+    /// convention by name rather than reporting a counter mismatch it never
+    /// had.
+    ///
+    /// PROVENANCE, not identity, and not a measurement. It is a structural
+    /// property of the build — the same class as [`Self::batched_forward`]
+    /// — fully determined by the identity fields that already select the
+    /// model and the adapter set (`checkpoint_weights_sha256`, `task`,
+    /// `target_modules`, `layers_to_transform`, `lora_rank`). Naming it an
+    /// identity field would add a comparison key that can never differ
+    /// between two legs whose identity already matches, while making a leg
+    /// produced by a build with no census permanently unpairable with one
+    /// that has it.
+    pub fusible_site_census: jammi_encoders::FusibleSiteCensus,
     pub flash_compiled: bool,
     pub build_features: Vec<&'static str>,
     /// The attention REFERENCE CLASS this process's `JAMMI_KERNELS_DISABLE`
@@ -2642,7 +2703,10 @@ impl FinetuneRunTier {
     /// premise) — none of the three is a genuine comparison determinant;
     /// see struct doc for the full per-field rationale. Grew 10 -> 11 with
     /// `kernels_disabled_expected` (issue #421 P1-b(i)), a CALLER-declared
-    /// claim in exactly `arm`'s sense — see that field's own doc.
+    /// claim in exactly `arm`'s sense — see that field's own doc. Grew
+    /// 11 -> 12 with `fusible_site_census` (issue #421 §D4 item 1), a
+    /// STRUCTURAL property of the build in `batched_forward`'s sense —
+    /// again, see that field's own doc.
     pub const PROVENANCE_FIELDS: &'static [(&'static str, Nullable)] = &[
         ("arm", Nullable::NonNull),
         ("device_name", Nullable::NonNull),
@@ -2652,6 +2716,11 @@ impl FinetuneRunTier {
         // claim, sorted (`[]` when unclaimed). PROVENANCE for the same
         // reason `arm` is — see `Self::kernels_disabled_expected`'s own doc.
         ("kernels_disabled_expected", Nullable::NonNull),
+        // Issue #421 §D4 item 1: the WITNESSED per-forward seam census the
+        // positive-proof equation reads `calls` off. Structural (the
+        // `batched_forward` class), never a measurement and never a
+        // comparison key — see `Self::fusible_site_census`'s own doc.
+        ("fusible_site_census", Nullable::NonNull),
         ("flash_compiled", Nullable::NonNull),
         ("build_features", Nullable::NonNull),
         ("attention_arm", Nullable::NonNull),
@@ -3622,6 +3691,16 @@ mod tests {
             kernels_disabled_requested: Vec::new(),
             kernels_disabled_fired: Vec::new(),
             kernels_disabled_expected: Vec::new(),
+            // A BERT-shaped witnessed census (2 layers x 6 wrapped arms;
+            // embeddings + 2 norms per layer; one GELU seam call per layer)
+            // — plausible values for the sample, never a claim about any
+            // real checkpoint. The per-tower EXACT-count oracles live in
+            // `jammi-encoders` beside the walk that produces them.
+            fusible_site_census: jammi_encoders::FusibleSiteCensus {
+                lora_sites_wrapped: 12,
+                layer_norms: 5,
+                gelu_seam_calls_per_forward: 2,
+            },
             flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
             build_features: build_features(),
             attention_arm: "fused".to_string(),
@@ -3783,10 +3862,11 @@ mod tests {
     /// `kernels_disabled_fired`, `flash_compiled`, `build_features`), plus
     /// the three unit-63 finding-5(c)/advisory-(d) reclassifications
     /// (`split_rule`, `batched_forward`, `steps_measured`) = 10, plus
-    /// `kernels_disabled_expected` (issue #421 P1-b(i)) = 11.
+    /// `kernels_disabled_expected` (issue #421 P1-b(i)) = 11, plus
+    /// `fusible_site_census` (issue #421 §D4 item 1) = 12.
     #[test]
-    fn finetune_run_tier_provenance_fields_cardinality_is_11() {
-        assert_eq!(FinetuneRunTier::PROVENANCE_FIELDS.len(), 11);
+    fn finetune_run_tier_provenance_fields_cardinality_is_12() {
+        assert_eq!(FinetuneRunTier::PROVENANCE_FIELDS.len(), 12);
         assert!(
             FinetuneRunTier::PROVENANCE_FIELDS
                 .iter()
@@ -3794,6 +3874,49 @@ mod tests {
                     && *nullable == Nullable::NonNull),
             "kernels_disabled_expected is a CALLER-declared claim (arm's class), recorded on              every leg as [] when unclaimed — provenance, never identity"
         );
+        assert!(
+            FinetuneRunTier::PROVENANCE_FIELDS
+                .iter()
+                .any(|(name, nullable)| *name == "fusible_site_census"
+                    && *nullable == Nullable::NonNull),
+            "fusible_site_census is a STRUCTURAL property of the build (batched_forward's              class), fully determined by the identity fields that already select the model and              the adapter set — provenance, never identity, and never a measurement"
+        );
+        assert!(
+            !FinetuneRunTier::IDENTITY_FIELDS
+                .iter()
+                .any(|(name, _)| *name == "fusible_site_census"),
+            "naming fusible_site_census on IDENTITY_FIELDS would add a comparison key that              cannot differ between two legs whose identity already matches"
+        );
+    }
+
+    /// The witnessed census reaches the emitted JSON under the EXACT three
+    /// field names `ci/scripts/perf/profile_421_merge.py` reads its `calls`
+    /// term from (`lora_sites_wrapped` ↔ `lora_linear_fused`, `layer_norms`
+    /// ↔ `layer_norm_fused`, `gelu_seam_calls_per_forward` ↔
+    /// `gelu_erf_fused`). A rename on either side silently turns every
+    /// downstream positive-proof equation into "no census recorded", which
+    /// that merger treats as a leg-INVALID refusal — correct, but it would
+    /// invalidate a whole sweep after the fact rather than here.
+    #[test]
+    fn fusible_site_census_serializes_under_the_names_the_merger_reads() {
+        let tier = sample_finetune_run_tier();
+        let value = serde_json::to_value(&tier).expect("serialize FinetuneRunTier");
+        let census = value
+            .get("fusible_site_census")
+            .and_then(|v| v.as_object())
+            .expect("fusible_site_census must serialize as a JSON object");
+        assert_eq!(census.len(), 3, "unexpected census shape: {census:?}");
+        for (field, expected) in [
+            ("lora_sites_wrapped", 12),
+            ("layer_norms", 5),
+            ("gelu_seam_calls_per_forward", 2),
+        ] {
+            assert_eq!(
+                census.get(field).and_then(|v| v.as_u64()),
+                Some(expected),
+                "{field} must serialize as a non-negative integer the merger can multiply by                  steps_measured"
+            );
+        }
     }
 
     /// Unit 63 round-7 audit, finding 1: the three mutant-provenance fields

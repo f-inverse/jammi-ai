@@ -442,18 +442,48 @@ class FinetuneRunIdentityFieldsSubsetTests(unittest.TestCase):
             "FINETUNE_RUN_IDENTITY_FIELDS contains a duplicate entry",
         )
 
-    def test_rust_provenance_fields_has_exactly_11_entries(self):
+    def test_rust_provenance_fields_has_exactly_12_entries(self):
         self.assertEqual(
             len(self.rust_provenance_fields),
-            11,
-            f"FinetuneRunTier::PROVENANCE_FIELDS ({REPORT_RS}) must have EXACTLY 11 entries "
+            12,
+            f"FinetuneRunTier::PROVENANCE_FIELDS ({REPORT_RS}) must have EXACTLY 12 entries "
             "(CONTRACT H4's original 7 -- arm, device_name, kernels_disabled_requested, "
             "kernels_disabled_fired, flash_compiled, build_features, attention_arm -- plus the "
             "unit-63 adversarial-audit finding-5(c)/advisory-(d) reclassifications split_rule, "
             "batched_forward, steps_measured, plus issue #421 P1-b(i)'s "
             "kernels_disabled_expected -- the CALLER-declared --expect-kernels-disabled claim, "
-            "provenance in exactly `arm`'s sense) — got: "
+            "provenance in exactly `arm`'s sense -- plus issue #421 §D4 item 1's "
+            "fusible_site_census, the WITNESSED per-forward seam census the tower profile's "
+            "positive-proof equation reads its `calls` term off: a STRUCTURAL property of the "
+            "build in batched_forward's sense, fully determined by the identity fields that "
+            "already select the model and the adapter set, so provenance and never identity) "
+            "— got: "
             f"{sorted(self.rust_provenance_fields)}",
+        )
+
+    def test_fusible_site_census_is_provenance_and_never_identity(self):
+        """Issue #421 §D4 item 1, per-field pin: a bare cardinality
+        assertion goes green again if one field is added while another is
+        dropped, so the new entry is named on BOTH sides of the split."""
+        self.assertIn(
+            "fusible_site_census",
+            self.rust_provenance_fields,
+            "the witnessed seam census must be recorded as PROVENANCE on every leg — a leg "
+            "without it cannot support the positive-proof equation at all",
+        )
+        self.assertNotIn(
+            "fusible_site_census",
+            self.rust_identity_fields,
+            "naming the census on IDENTITY_FIELDS would add a comparison key that cannot "
+            "differ between two legs whose identity already matches (it is derived from the "
+            "checkpoint + task + target_modules + layers_to_transform + lora_rank those "
+            "fields already pin), while making a leg from a build without the census "
+            "permanently unpairable with one that has it",
+        )
+        self.assertNotIn(
+            "fusible_site_census",
+            set(identity_fields.FINETUNE_RUN_IDENTITY_FIELDS),
+            "the Python identity mirror must not carry the census either",
         )
 
     def test_finetune_run_identity_fields_equals_the_rust_const(self):

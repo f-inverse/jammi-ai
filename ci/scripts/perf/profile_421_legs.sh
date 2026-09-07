@@ -499,6 +499,15 @@ tier = copy.deepcopy(golden["tiers"]["finetune_run"])
 # kernel_census.py is exercised as a real same-workload N<M pair would.
 tier["train_run_wall_s"] = 0.01 * steps_measured
 tier["steps_measured"] = steps_measured
+# Mirror the invocation this stub stands in for, not the golden it was
+# derived from: every leg (and the P2 pre-flight) runs `--epochs 1
+# --grad-accum 1`, which is the ONLY convention under which
+# `steps_measured` is the positive-proof equation`s `batches` term
+# (`profile_421_merge.py` refuses any other by name). The committed golden
+# was produced at `--epochs 2`, so leaving its value here would make the
+# dry-run output describe a run this driver cannot issue.
+tier["epochs"] = 1
+tier["grad_accum"] = 1
 tier["task"] = task
 tier["lora_init"] = lora_init
 tier["backbone_dtype"] = dtype
@@ -514,9 +523,39 @@ expected = sorted(k for k in disable_csv.split(",") if k)
 tier["kernels_disabled_expected"] = expected
 tier["kernels_disabled_requested"] = expected
 tier["kernels_disabled_fired"] = expected
-# A D leg is an EAGER twin: its disabled keys dispatched eager, never fused.
-tier["lora_linear_fused_dispatches"] = 0 if expected else 1
-tier["lora_linear_eager_dispatches"] = 1 if expected else 0
+# The WITNESSED per-forward seam census the real binary derives from the
+# encoder it built, and the dispatch counters DERIVED FROM IT so this
+# stub`s output satisfies the same positive-proof equation
+# `profile_421_merge.py` applies to a real leg (`fused + eager == census x
+# steps_measured`). The site counts are stand-ins -- this stub builds no
+# model and claims nothing about any checkpoint -- but the ONE
+# structurally load-bearing split is mirrored exactly: the CLIP towers`
+# MLP activation is `quick_gelu`, which has no fused seam, so their
+# `gelu_seam_calls_per_forward` is 0 and their gelu counters must read
+# 0/0, while an HTSAT leg carries a real per-forward count. A stub that
+# emitted a non-zero gelu census on a CLIP leg would make that whole arm
+# of the merger untestable from here.
+census = {
+    "lora_sites_wrapped": 48 if task != "audio_embedding" else 77,
+    "layer_norms": 25 if task != "audio_embedding" else 30,
+    "gelu_seam_calls_per_forward": 0 if task != "audio_embedding" else 9,
+}
+tier["fusible_site_census"] = census
+for key, (fused_field, eager_field, census_field) in {
+    "lora_linear_fused": (
+        "lora_linear_fused_dispatches", "lora_linear_eager_dispatches", "lora_sites_wrapped",
+    ),
+    "layer_norm_fused": ("ln_fused_dispatches", "ln_eager_dispatches", "layer_norms"),
+    "gelu_erf_fused": (
+        "gelu_fused_dispatches", "gelu_eager_dispatches", "gelu_seam_calls_per_forward",
+    ),
+}.items():
+    total = census[census_field] * steps_measured
+    # A D leg is an EAGER twin: its disabled keys dispatched eager, never fused.
+    if key in expected:
+        tier[fused_field], tier[eager_field] = 0, total
+    else:
+        tier[fused_field], tier[eager_field] = total, 0
 tier["lora_epilogue_fused_dispatches"] = 0
 tier["lora_epilogue_eager_dispatches"] = 1
 if task != "text_embedding":

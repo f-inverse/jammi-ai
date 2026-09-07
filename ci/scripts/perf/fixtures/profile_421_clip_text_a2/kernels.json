@@ -1,0 +1,391 @@
+{
+ "source": "scratchpad/pod421-run2/legs/clip-text-A2/census.json (pod p421 run 2, git_sha c1b0b0bad1f79a4ad6c298400e6ea19cc1ca633c)",
+ "gpu_kernel_us_per_step": 41449.621674,
+ "wall_s_per_step": 0.096548202412,
+ "by_kernel_and_grid": [
+  {
+   "kernel": "layer_norm_fwd_bf16_biased",
+   "grid": [
+    1848,
+    1,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "launches_per_step": 25.0,
+   "us_per_step": 316.790206,
+   "share": 0.007642776778315257
+  },
+  {
+   "kernel": "layer_norm_bwd_dx_bf16",
+   "grid": [
+    1848,
+    1,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 537.9841899999999,
+   "share": 0.012979230407245426
+  },
+  {
+   "kernel": "usigmoid_bf16",
+   "grid": [
+    3696,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 268.79141999999996,
+   "share": 0.006484773784282911
+  },
+  {
+   "kernel": "affine_bf16",
+   "grid": [
+    3696,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 406.354578,
+   "share": 0.00980357748970464
+  },
+  {
+   "kernel": "affine_bf16",
+   "grid": [
+    1112,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 155.53113000000002,
+   "share": 0.003752293114355725
+  },
+  {
+   "kernel": "bmul_bf16",
+   "grid": [
+    3696,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 60.0,
+   "us_per_step": 2330.362122,
+   "share": 0.056221553487948
+  },
+  {
+   "kernel": "fast_max_bf16",
+   "grid": [
+    14784,
+    1,
+    1
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 391.604018,
+   "share": 0.009447710309154412
+  },
+  {
+   "kernel": "fast_sum_bf16",
+   "grid": [
+    14784,
+    1,
+    1
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 36.0,
+   "us_per_step": 1165.26353,
+   "share": 0.028112766364063867
+  },
+  {
+   "kernel": "fast_sum_bf16",
+   "grid": [
+    8,
+    1,
+    1
+   ],
+   "block": [
+    512,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 41.64584,
+   "share": 0.0010047338990821979
+  },
+  {
+   "kernel": "badd_bf16",
+   "grid": [
+    1112,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 120.0,
+   "us_per_step": 1909.98773,
+   "share": 0.046079738556409386
+  },
+  {
+   "kernel": "badd_bf16",
+   "grid": [
+    924,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 301.0,
+   "us_per_step": 3776.534656,
+   "share": 0.09111143850002609
+  },
+  {
+   "kernel": "cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_nt_align1",
+   "grid": [
+    2,
+    1,
+    192
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 276.205548,
+   "share": 0.00666364460868541
+  },
+  {
+   "kernel": "cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_tn_align1",
+   "grid": [
+    2,
+    1,
+    192
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 151.605122,
+   "share": 0.0036575755309027815
+  },
+  {
+   "kernel": "cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_nn_align1",
+   "grid": [
+    2,
+    1,
+    192
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 141.29855600000002,
+   "share": 0.0034089226944291266
+  },
+  {
+   "kernel": "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+   "grid": [
+    16,
+    1,
+    10
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 580.3647199999999,
+   "share": 0.014001689196696428
+  },
+  {
+   "kernel": "cast_bf16_f32",
+   "grid": [
+    3696,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 460.190834,
+   "share": 0.011102413373501615
+  },
+  {
+   "kernel": "cast_add_bf16",
+   "grid": [
+    3696,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 286.664946,
+   "share": 0.006915984619946859
+  },
+  {
+   "kernel": "cast_scale_bf16_f32",
+   "grid": [
+    2772,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 138.184692,
+   "share": 0.0033337986311869953
+  },
+  {
+   "kernel": "cast_u8_bf16",
+   "grid": [
+    1112,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 80.77004600000001,
+   "share": 0.001948631681979004
+  },
+  {
+   "kernel": "adamw_moment_update_f32",
+   "grid": [
+    4,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 120.0,
+   "us_per_step": 287.214336,
+   "share": 0.00692923902319138
+  },
+  {
+   "kernel": "dropout_fwd_f32",
+   "grid": [
+    14784,
+    1,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "launches_per_step": 36.0,
+   "us_per_step": 1137.590016,
+   "share": 0.027445124226877404
+  },
+  {
+   "kernel": "gather_u32_bf16",
+   "grid": [
+    12,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 1.0,
+   "us_per_step": 2.940216,
+   "share": 7.093468845444979e-05
+  },
+  {
+   "kernel": "is_u32_bf16",
+   "grid": [
+    924,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 1.0,
+   "us_per_step": 13.861336,
+   "share": 0.0003344140534989434
+  },
+  {
+   "kernel": "ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_nn",
+   "grid": [
+    4,
+    15,
+    1
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 662.759864,
+   "share": 0.015989527460891825
+  }
+ ]
+}

@@ -450,18 +450,21 @@ def merge_leg(leg_dir: Path) -> dict:
         else:
             checkpoint_shas[run_label] = checkpoint_sha
 
-        # Finding F1 (unit-467 adversarial audit): an A leg (this leg's own
-        # `manifest.kernels_disabled` is empty) makes a POSITIVE claim that
-        # nothing was disabled. `kernels_disabled_expected` alone cannot
-        # catch a contaminated A leg (it stays `[]` on an unclaimed leg
-        # regardless of the real env), so this reads the PROCESS-RESOLVED
-        # `kernels_disabled_requested` — the same field the binary's own
-        # `--arm fused` refusal reads — and refuses BY NAME when it is
-        # non-empty on a leg that declared itself an A leg. `finetune-run`'s
-        # own start-of-run check (this PR's companion fix) should make this
-        # branch unreachable for a NEW run, but a leg produced by an OLDER
-        # binary build (or a manifest hand-edited after the fact) must still
-        # be caught here, independently.
+        # Finding F1 (unit-467 adversarial audit): `finetune-run --arm fused`
+        # makes NO claim about `JAMMI_KERNELS_DISABLE` at all (an operator
+        # may legitimately run it with OTHER, unrelated op keys disabled —
+        # see `FinetuneRunParams::expect_kernels_disabled`'s doc); the
+        # binary itself does not, and must not, refuse an unlabeled fused
+        # leg on this basis. This driver's manifest declares a leg an A leg
+        # (`kernels_disabled` empty) as a POSITIVE claim that nothing was
+        # disabled, and `kernels_disabled_expected` alone cannot catch a
+        # contaminated A leg (it stays `[]` on an unclaimed leg regardless
+        # of the real env), so this reads the PROCESS-RESOLVED
+        # `kernels_disabled_requested` and refuses BY NAME when it is
+        # non-empty on a leg that declared itself an A leg. This merger and
+        # `profile_421_legs.sh`'s own `_check_no_ambient_disables` are the
+        # ONLY witnesses that an A leg was genuinely unlabeled — nothing
+        # inside the binary checks this.
         requested = tier.get("kernels_disabled_requested")
         if not isinstance(requested, list):
             reasons.append(f"{run_label}: kernels_disabled_requested is absent or not a list")
@@ -484,6 +487,29 @@ def merge_leg(leg_dir: Path) -> dict:
             reasons.append(
                 f"{run_label}: kernels_disabled_expected={expected_sorted} does not match the "
                 f"manifest's declared arm {disabled_manifest}"
+            )
+            continue
+        # D-leg witness, the other side of finding F1: `kernels_disabled_requested`
+        # must equal `kernels_disabled_expected` EXACTLY, not merely be a
+        # superset of it. `_check_expected_disables` in `profile_421_legs.sh`
+        # already enforces this at driver time, but that check is a SUBSET
+        # test unless read carefully — a D leg whose real
+        # `JAMMI_KERNELS_DISABLE` carries an EXTRA ambient key beyond what it
+        # claimed would otherwise pass here too: the extra key force-eagers
+        # an op the leg assumed fused, inflating the D-leg wall and
+        # OVERSTATING the realized gain. `check_positive_proof` does not
+        # catch it either (`fused != 0` is only checked for keys IN
+        # `disabled_expected`, and `A_LEG_FUSED_REQUIRED` is gated on
+        # `is_a_leg`), so this merger refuses BY NAME before the equation
+        # ever runs.
+        if requested_sorted != expected_sorted:
+            extra = [k for k in requested_sorted if k not in expected_sorted]
+            missing = [k for k in expected_sorted if k not in requested_sorted]
+            reasons.append(
+                f"{run_label}: kernels_disabled_requested={requested_sorted} does not exactly "
+                f"equal kernels_disabled_expected={expected_sorted} (extra={extra} "
+                f"missing={missing}) — an ambient JAMMI_KERNELS_DISABLE key contaminated this D "
+                "leg's realized-gain measurement; the run is INVALID, not a datum"
             )
             continue
         # The convention gate comes BEFORE the equation, so a leg run

@@ -90,6 +90,16 @@
 #                                    about to run is refused if a manifest
 #                                    for it already exists under $OUT_DIR
 #   PROFILE_421_STEPS_N/M            override the pinned 100/600
+#   PROFILE_421_LEGS_DRY_RUN_EXTRA_REQUESTED_KEY
+#                                    TEST-ONLY (never set by a real run):
+#                                    the hermetic fake bench stub appends
+#                                    this op key to `kernels_disabled_requested`
+#                                    on top of the leg's genuine claim,
+#                                    simulating an ambient JAMMI_KERNELS_DISABLE
+#                                    contaminating a D leg (unit-467 finding
+#                                    F1's D-leg half) so
+#                                    `_check_expected_disables`'s equality
+#                                    refusal can be exercised hermetically.
 #   PROFILE_421_P2_BF16              "1" runs the BF16 PRE-FLIGHT MODE
 #                                    (contract "## P2" / v2.3 §D4 item 4)
 #                                    instead of the 12-leg sweep, and exits:
@@ -562,7 +572,7 @@ set -euo pipefail
 # driver's own readers consume, so a reader bug is exercised here rather
 # than papered over.
 python3 -c '
-import copy, json, sys
+import copy, json, os, sys
 steps_measured, golden_path, task, disable_csv, lora_init, dtype = (
     int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
 )
@@ -605,7 +615,16 @@ _p0 = 0.6
 tier["train_probe_series"] = [_p0, _p0 - 0.05] if lora_init == "gaussian" else [_p0, _p0]
 expected = sorted(k for k in disable_csv.split(",") if k)
 tier["kernels_disabled_expected"] = expected
-tier["kernels_disabled_requested"] = expected
+# Test-only contamination lever (never set by the real leg sweep): a
+# hermetic RED-side proof that this driver`s own `_check_expected_disables`
+# refuses a D leg`s report whose `kernels_disabled_requested` is a
+# SUPERSET of what it claimed -- an ambient env var reaching the process
+# beyond the declared disable list, unit-467 finding F1`s D-leg half. Left
+# unset, `requested` is exactly `expected`, the ONLY thing a genuine,
+# uncontaminated leg`s report ever carries.
+_extra_requested = os.environ.get("PROFILE_421_LEGS_DRY_RUN_EXTRA_REQUESTED_KEY", "")
+requested = sorted(expected + [_extra_requested]) if _extra_requested else list(expected)
+tier["kernels_disabled_requested"] = requested
 tier["kernels_disabled_fired"] = expected
 # The WITNESSED per-forward seam census the real binary derives from the
 # encoder it built, and the dispatch counters DERIVED FROM IT so this
@@ -701,12 +720,18 @@ print(json.dumps(tier[field]))
 
 # The D-leg eager-twin proof, read off the REPORT rather than trusted
 # because the env var was exported: `kernels_disabled_expected` must equal
-# the keys this leg claimed, and `kernels_disabled_requested` must contain
-# every one of them. The binary itself already refuses a leg that fails
-# either (that is what `--expect-kernels-disabled` IS), so this is the
-# driver's own independent record of the same fact -- and it catches the one
-# case the binary cannot: a leg whose report came from a DIFFERENT
-# invocation than the one this script believes it ran.
+# the keys this leg claimed, and `kernels_disabled_requested` must equal
+# them EXACTLY too -- not merely contain them. A SUBSET check here (claimed
+# keys present in `requested`, extras allowed) would let a D leg whose
+# `JAMMI_KERNELS_DISABLE` carries an EXTRA ambient key beyond what it
+# claimed pass silently: that extra key force-eagers an op the leg assumed
+# fused, inflating the D-leg wall and OVERSTATING the realized gain -- a
+# distinct failure mode from the missing-key case below, and just as
+# invalidating. The binary itself already refuses a leg that fails the
+# equality `--expect-kernels-disabled` check (that is what the flag IS), so
+# this is the driver's own independent record of the same fact -- and it
+# catches the one case the binary cannot: a leg whose report came from a
+# DIFFERENT invocation than the one this script believes it ran.
 _check_expected_disables() {
   python3 -c '
 import json, sys
@@ -725,27 +750,34 @@ if sorted(expected) != claimed:
     print("::error::_check_expected_disables: report claims " + repr(sorted(expected)) +
           " but this leg declared " + repr(claimed) + ": " + path, file=sys.stderr)
     sys.exit(1)
-missing = [k for k in claimed if k not in requested]
-if missing:
-    print("::error::_check_expected_disables: claimed key(s) " + repr(missing) +
-          " absent from the process-resolved JAMMI_KERNELS_DISABLE " + repr(sorted(requested)) +
-          ": " + path, file=sys.stderr)
+requested_sorted = sorted(requested)
+if requested_sorted != claimed:
+    missing = [k for k in claimed if k not in requested_sorted]
+    extra = [k for k in requested_sorted if k not in claimed]
+    print("::error::_check_expected_disables: claimed " + repr(claimed) +
+          " does not exactly equal the process-resolved JAMMI_KERNELS_DISABLE " +
+          repr(requested_sorted) + " (missing=" + repr(missing) + " extra=" + repr(extra) +
+          "): " + path, file=sys.stderr)
     sys.exit(1)
 ' "$1" "$2"
 }
 
-# The A-leg belt-and-braces witness (unit-467 finding F1): the driver's own
-# preflight ambient-var guard above already makes a contaminated A leg
-# unreachable for a FRESH invocation of this script, but the REPORT is the
-# independent witness of what the binary actually saw, regardless of how it
-# got invoked -- a leg produced by an older build of this same script (one
-# predating that guard), or a report copied in from somewhere else entirely,
-# must still be caught here. Refuses if `kernels_disabled_requested` is
-# non-empty on a leg this driver declared an A leg (no `JAMMI_KERNELS_DISABLE`,
-# no `--expect-kernels-disabled` claim) -- the binary's own start-of-run
-# refusal (this unit's companion fix) checks the SAME fact from inside the
-# process that ran; this is the driver checking it a second time, from
-# outside, off the artifact the run actually left behind.
+# The A-leg witness (unit-467 finding F1): `finetune-run --arm fused` makes
+# NO claim about `JAMMI_KERNELS_DISABLE` at all (an operator may legitimately
+# run it with OTHER, unrelated op keys disabled -- see
+# `FinetuneRunParams::expect_kernels_disabled`'s doc) -- the binary itself
+# does not, and must not, refuse an unlabeled fused leg on this basis. The
+# driver's own preflight ambient-var guard above already makes a
+# contaminated A leg unreachable for a FRESH invocation of this script, but
+# the REPORT is the independent witness of what the binary actually saw,
+# regardless of how it got invoked -- a leg produced by an older build of
+# this same script (one predating that guard), or a report copied in from
+# somewhere else entirely, must still be caught here. Refuses if
+# `kernels_disabled_requested` is non-empty on a leg this driver declared an
+# A leg (no `JAMMI_KERNELS_DISABLE`, no `--expect-kernels-disabled` claim) --
+# this driver and `profile_421_merge.py`'s own A-leg refusal are the ONLY
+# witnesses that an A leg was genuinely unlabeled; nothing inside the binary
+# checks this.
 _check_no_ambient_disables() {
   python3 -c '
 import json, sys

@@ -673,6 +673,40 @@ class AmbientDisableEnvGuardTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, _fail_msg(result))
 
 
+class DLegExpectedDisablesEqualityTests(unittest.TestCase):
+    """Unit-467 finding F1, D-leg half: `_check_expected_disables` must
+    refuse a D leg whose report's `kernels_disabled_requested` is a STRICT
+    SUPERSET of what it claimed on `--expect-kernels-disabled` -- a SUBSET
+    test (claimed keys present in `requested`, extras allowed) would let an
+    extra ambient key through, force-eagering an op the leg assumed fused
+    and OVERSTATING the realized gain. Driven through the REAL
+    `PROFILE_421_LEGS_DRY_RUN_EXTRA_REQUESTED_KEY` lever the hermetic fake
+    bench stub reads (never a re-implementation of the check), so this
+    drives the actual driver code path, not a python mirror of it."""
+
+    def test_a_d_leg_report_with_an_extra_requested_key_is_refused(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            result = run_dry(
+                out_dir, legs_only="clip-text-D2",
+                extra_env={"PROFILE_421_LEGS_DRY_RUN_EXTRA_REQUESTED_KEY": "layer_norm_fused"},
+            )
+            self.assertEqual(result.returncode, 0, _fail_msg(result))
+            manifest = _manifest(out_dir, "clip-text-D2")
+            self.assertEqual(manifest["status"], "invalid", manifest)
+            self.assertIn("layer_norm_fused", manifest["reason"])
+
+    def test_a_d_leg_report_with_exactly_the_claimed_keys_still_succeeds(self):
+        """The non-vacuity control: the SAME leg with the injection lever
+        left unset (the ordinary, uncontaminated case) must pass -- proving
+        the refusal above fires on the mismatch, not on this D leg shape in
+        general."""
+        with tempfile.TemporaryDirectory() as out_dir:
+            result = run_dry(out_dir, legs_only="clip-text-D2")
+            self.assertEqual(result.returncode, 0, _fail_msg(result))
+            manifest = _manifest(out_dir, "clip-text-D2")
+            self.assertEqual(manifest["status"], "ok", manifest)
+
+
 def _write_fake_bench_stub(path: Path, *, missing_flag: str | None = None) -> None:
     """A fake `$BENCH_BIN` answering the two subcommands the preflight uses:
     `provenance` (the driver's own build_sha cross-check, which runs BEFORE

@@ -141,11 +141,14 @@ workspace ships every publishable crate at the same
   EQUALS this process's real `JAMMI_KERNELS_DISABLE` exactly, and refuses at the end unless no
   requested disable went unmatched and every named key's fused dispatch counter read zero across
   the run; either refusal exits non-zero and writes no row. An unlabeled `--arm fused` leg (no
-  `--expect-kernels-disabled` at all) likewise refuses at start whenever `JAMMI_KERNELS_DISABLE`
-  resolves non-empty, naming the offending keys, so an ambient or leftover disable can never
-  silently contaminate a leg claiming to be fully fused. `--lora-init {zeros_b,gaussian}` selects
-  the adapter initialization — `zeros_b` is the default and byte-identical to what every prior
-  invocation produced, while `gaussian` gives a non-zero gradient into `A` at step 0, which a
+  `--expect-kernels-disabled` at all) makes NO claim about `JAMMI_KERNELS_DISABLE` — an operator
+  may legitimately run it with OTHER, unrelated op keys disabled, so this binary does not, and
+  must not, refuse it on that basis; the two-sided witness that a `#421` DECISION leg's `fused`
+  side was genuinely unlabeled lives in `ci/scripts/perf/profile_421_legs.sh`'s
+  `_check_no_ambient_disables` and `profile_421_merge.py`'s own A-leg refusal, not in this binary.
+  `--lora-init {zeros_b,gaussian}` selects the adapter initialization — `zeros_b` is the default
+  and byte-identical to what every prior invocation produced, while `gaussian` gives a non-zero
+  gradient into `A` at step 0, which a
   zero-`B` adapter cannot. The report gains `media_front_end_wall_s`: wall spent in the media
   decode/preprocess front end, read from the new
   `jammi_ai::fine_tune::TrainingResult::media_front_end_wall` and summed across a run's
@@ -378,6 +381,13 @@ workspace ships every publishable crate at the same
   reaches the DRIVER's own process environment (it must only ever be scoped, per D leg, onto a
   single child invocation via `env VAR=... cmd`), and a belt-and-braces read of each leg's own
   report additionally refuses an A leg whose `kernels_disabled_requested` came back non-empty.
+  `_check_expected_disables`'s D-leg witness is now EQUALITY, not a subset: a D leg's report
+  `kernels_disabled_requested` must equal its own `--expect-kernels-disabled` claim exactly, not
+  merely be a superset of it — an extra ambient key beyond the claim was previously undetected
+  and would force-eager an op the leg assumed fused, inflating the D-leg wall and OVERSTATING the
+  realized gain; `profile_421_merge.py` carries the same equality check, on
+  `kernels_disabled_requested` vs. `kernels_disabled_expected`, refused by name before the
+  positive-proof equation ever runs.
   A new `_checkpoint_identity_probe` refuses a `$MODEL_DIR_CLIP` carrying `config.json`/
   `model.safetensors` (`arch.rs`'s `Checkpoint::resolve` prefers those over the
   `open_clip_config.json`/`open_clip_model.safetensors` pair every CLIP leg declares, so such a

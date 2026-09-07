@@ -442,11 +442,12 @@ class PositiveProofTests(unittest.TestCase):
 class AmbientDisableContaminationTests(unittest.TestCase):
     """Unit-467 finding F1, merger half: an A leg (empty `kernels_disabled`
     on the manifest) whose report carries a NON-empty
-    `kernels_disabled_requested` is INVALID by name — the binary's own
-    start-of-run refusal (this unit's companion fix) should make this
-    unreachable for a FRESH run, but a leg produced by an older build (or a
-    report hand-edited after the fact) must still be caught here,
-    independently."""
+    `kernels_disabled_requested` is INVALID by name. `finetune-run --arm
+    fused` makes NO claim about `JAMMI_KERNELS_DISABLE` at all (an operator
+    may legitimately run it with other, unrelated op keys disabled), so the
+    binary itself never refuses this on its own — this merger and
+    `profile_421_legs.sh`'s own `_check_no_ambient_disables` are the ONLY
+    witnesses that an A leg was genuinely unlabeled."""
 
     def test_an_a_leg_with_a_contaminated_requested_field_is_invalid(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -493,6 +494,62 @@ class AmbientDisableContaminationTests(unittest.TestCase):
                                disabled=disabled)
             tier_m = make_tier(steps=600, wall=6.0, front=None, census=CENSUS_CLIP,
                                disabled=disabled)
+            write_leg(out, "clip-text-D1", disabled=disabled, tier_n=tier_n, tier_m=tier_m)
+            row = only_leg(merged(out))
+            self.assertEqual(row["verdict"], "VALID", reasons_text(row))
+
+
+class DLegAmbientDisableContaminationTests(unittest.TestCase):
+    """The other side of finding F1: a D leg's `kernels_disabled_requested`
+    being a strict SUPERSET of its `kernels_disabled_expected` claim is just
+    as invalidating as an A leg witnessing a non-empty requested set — an
+    extra ambient key force-eagers an op the leg assumed fused, inflating
+    the D-leg wall and OVERSTATING the realized gain. Neither
+    `kernels_disabled_expected` (checked only against the manifest) nor
+    `check_positive_proof` (which reads `fused` only for keys IN
+    `disabled_expected`) catches this on its own -- this class pins the
+    dedicated `requested == expected` equality check that does."""
+
+    def test_a_d_leg_with_an_extra_ambient_disable_key_is_invalid(self):
+        disabled = ("layer_norm_fused", "lora_linear_fused")
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            tier_n = make_tier(steps=100, wall=1.0, front=None, census=CENSUS_CLIP,
+                               disabled=disabled)
+            tier_m = make_tier(steps=600, wall=6.0, front=None, census=CENSUS_CLIP,
+                               disabled=disabled)
+            # An ambient JAMMI_KERNELS_DISABLE key beyond the two the leg
+            # claimed -- the process really did disable it, but the leg
+            # never declared it, so the realized-gain measurement is
+            # contaminated exactly like the A-leg case above, just on the
+            # D side.
+            tier_m["kernels_disabled_requested"] = sorted(disabled) + ["gelu_erf_fused"]
+            write_leg(out, "clip-text-D1", disabled=disabled, tier_n=tier_n, tier_m=tier_m)
+            row = only_leg(merged(out))
+            self.assertEqual(row["verdict"], "INVALID")
+            text = reasons_text(row)
+            self.assertIn("run_m", text)
+            self.assertIn("gelu_erf_fused", text)
+            self.assertIn("kernels_disabled_requested", text)
+            self.assertIn("kernels_disabled_expected", text)
+            # The equation itself was never even attempted for that run --
+            # this is a refusal by NAME, before the positive proof.
+            self.assertNotIn("run_m", row["positive_proof"] or {})
+
+    def test_a_d_leg_with_exactly_the_claimed_keys_is_unaffected(self):
+        """The non-vacuity control: the SAME leg shape with
+        `kernels_disabled_requested` equal (not a superset) to
+        `kernels_disabled_expected` must pass -- proving the check above
+        fires on the mismatch, not merely on a D leg having a non-empty
+        requested set at all."""
+        disabled = ("layer_norm_fused", "lora_linear_fused")
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            tier_n = make_tier(steps=100, wall=1.0, front=None, census=CENSUS_CLIP,
+                               disabled=disabled)
+            tier_m = make_tier(steps=600, wall=6.0, front=None, census=CENSUS_CLIP,
+                               disabled=disabled)
+            self.assertEqual(tier_m["kernels_disabled_requested"], sorted(disabled))
             write_leg(out, "clip-text-D1", disabled=disabled, tier_n=tier_n, tier_m=tier_m)
             row = only_leg(merged(out))
             self.assertEqual(row["verdict"], "VALID", reasons_text(row))

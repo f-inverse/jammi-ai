@@ -256,9 +256,9 @@ fn alloff_with_exactly_the_required_two_ops_reordered_succeeds() {
 /// negative-control half of this file's ALLOFF coverage: proves the
 /// `Arm::Alloff`-only check above is gated on `--arm alloff`, not firing
 /// unconditionally on every run. See
-/// `fused_arm_with_no_flag_refuses_an_ambient_kernels_disable_env_var` below
-/// for the companion case this control makes non-vacuous: unlike THAT case,
-/// here there is genuinely nothing disabled to name.
+/// `fused_arm_with_no_flag_and_an_unrelated_ambient_disable_still_succeeds`
+/// below for the companion case this control makes non-vacuous: unlike THAT
+/// case, here there is genuinely nothing disabled to name.
 #[test]
 fn fused_arm_never_hard_errors_on_a_missing_kernels_disable_env_var() {
     let work_dir = tempfile::tempdir().expect("tempdir");
@@ -285,37 +285,43 @@ fn fused_arm_never_hard_errors_on_a_missing_kernels_disable_env_var() {
     );
 }
 
-/// Unit-467 adversarial audit finding F1: an unlabeled `--arm fused` leg
-/// (no `--expect-kernels-disabled`) with a NON-empty ambient
-/// `JAMMI_KERNELS_DISABLE` — e.g. a hand-run `alloff` leg's env var left
-/// exported in the operator's shell — must refuse at START, naming the
-/// offending key, rather than silently running as a contaminated "fused"
-/// datum. Before this check existed, this exact invocation succeeded and
-/// emitted a report claiming `arm: "fused"` while a real op was disabled the
-/// whole time.
+/// The `Arm::Fused` "makes no claim" contract, pinned directly: an unlabeled
+/// `--arm fused` leg (no `--expect-kernels-disabled`) with a NON-empty
+/// ambient `JAMMI_KERNELS_DISABLE` naming an UNRELATED op key must still
+/// succeed — `FinetuneRunParams::expect_kernels_disabled`'s own doc states
+/// the contract: "an operator may legitimately run it with OTHER, unrelated
+/// op keys disabled". `layer_norm_fused` is used here (rather than a
+/// bogus/unused key) specifically because it DOES fire on every `tiny_bert`
+/// forward pass
+/// (`jammi-encoders/src/layer_norm.rs`'s admit call on the training arm), so
+/// this is not a vacuous "nothing was disabled anyway" pass: a real op was
+/// forced eager for the whole run, and the leg is still valid, because the
+/// fused arm never claimed that key was live in the first place. The
+/// two-sided witness that a DECISION leg's `--arm fused` run really was
+/// unlabeled lives OUTSIDE this binary, in `profile_421_legs.sh`'s
+/// `_check_no_ambient_disables` and `profile_421_merge.py`'s A-leg refusal.
 #[test]
-fn fused_arm_with_no_flag_refuses_an_ambient_kernels_disable_env_var() {
+fn fused_arm_with_no_flag_and_an_unrelated_ambient_disable_still_succeeds() {
     let work_dir = tempfile::tempdir().expect("tempdir");
     let fixtures_dir = tempfile::tempdir().expect("fixtures tempdir");
     let output = base_command(work_dir.path(), fixtures_dir.path(), "fused")
-        .env("JAMMI_KERNELS_DISABLE", "gelu_erf_fused")
+        .env("JAMMI_KERNELS_DISABLE", "layer_norm_fused")
         .output()
         .expect("spawn jammi-bench finetune-run");
 
     assert!(
-        !output.status.success(),
-        "--arm fused with no --expect-kernels-disabled and a non-empty ambient \
-         JAMMI_KERNELS_DISABLE must refuse — stdout={}",
-        String::from_utf8_lossy(&output.stdout)
+        output.status.success(),
+        "--arm fused with no --expect-kernels-disabled must make no claim about \
+         JAMMI_KERNELS_DISABLE and must not refuse an unrelated ambient key — stderr={}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("gelu_erf_fused") && stderr.contains("INVALID run"),
-        "the refusal must name the ambient key and say the leg is invalid: {stderr}"
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stdout).trim().is_empty(),
-        "an INVALID leg must emit no report at all"
+    let tier = tier_of(&String::from_utf8_lossy(&output.stdout));
+    assert_eq!(tier["arm"], serde_json::json!("fused"), "tier={tier}");
+    assert_eq!(
+        tier["kernels_disabled_requested"],
+        serde_json::json!(["layer_norm_fused"]),
+        "the report must record what was actually requested, even though the fused arm made no \
+         claim about it: tier={tier}"
     );
 }
 
@@ -518,20 +524,20 @@ fn expect_kernels_disabled_refuses_an_unmatched_disable_entry() {
     );
 }
 
-/// Finding F1's closed gap, in its most literal shape: WITHOUT
+/// The "makes no claim" contract again, in its most literal shape: WITHOUT
 /// `--expect-kernels-disabled`, an ambient `JAMMI_KERNELS_DISABLE` naming
 /// even a BOGUS, non-existent op key (`disabled_ops_requested()` is a raw
 /// parse of the env var — it does not validate keys against any known op
-/// list) must now be REFUSED at START, never silently accepted. Before
-/// finding F1's fix this exact invocation succeeded (this tier never read
-/// `disabled_ops_requested()` at all for an unlabeled `--arm fused` leg,
-/// only `unmatched_disables()`, and only when `--expect-kernels-disabled`
-/// was `Some`) — the pressure-tester's whole point: an ambient env var
-/// contaminates a leg regardless of whether the disabled key names a real
-/// kernel or a typo, and the check must not depend on the key being
-/// "real" to catch it.
+/// list) must still succeed and be recorded verbatim — this tier never
+/// reads `disabled_ops_requested()` for validation on an unlabeled `--arm
+/// fused` leg, only for the report's own `kernels_disabled_requested`
+/// field, and `unmatched_disables()` is only consulted when
+/// `--expect-kernels-disabled` is `Some`. Distinguishes this arm's honest
+/// "unchecked" posture from a check that happens to work only because the
+/// ambient key is a real op — a bogus key must be just as harmless as a
+/// real, unrelated one.
 #[test]
-fn without_the_flag_an_ambient_disable_entry_is_now_refused_even_when_bogus() {
+fn without_the_flag_an_ambient_bogus_disable_entry_still_succeeds() {
     let work_dir = tempfile::tempdir().expect("tempdir");
     let fixtures_dir = tempfile::tempdir().expect("fixtures tempdir");
     let output = base_command(work_dir.path(), fixtures_dir.path(), "fused")
@@ -543,20 +549,15 @@ fn without_the_flag_an_ambient_disable_entry_is_now_refused_even_when_bogus() {
         .expect("spawn jammi-bench finetune-run");
 
     assert!(
-        !output.status.success(),
-        "a run making no --expect-kernels-disabled claim must now refuse a non-empty ambient \
-         JAMMI_KERNELS_DISABLE (finding F1) — stdout={}",
-        String::from_utf8_lossy(&output.stdout)
+        output.status.success(),
+        "a run making no --expect-kernels-disabled claim must not refuse ANY ambient \
+         JAMMI_KERNELS_DISABLE, real or bogus — stderr={}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("lora_linear_fused")
-            && stderr.contains("not_a_real_op_key_at_all")
-            && stderr.contains("INVALID run"),
-        "the refusal must name both ambient keys and say the leg is invalid: {stderr}"
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stdout).trim().is_empty(),
-        "an INVALID leg must emit no report at all"
+    let tier = tier_of(&String::from_utf8_lossy(&output.stdout));
+    assert_eq!(
+        tier["kernels_disabled_requested"],
+        serde_json::json!(["lora_linear_fused", "not_a_real_op_key_at_all"]),
+        "the report must record what was actually requested, bogus key included: tier={tier}"
     );
 }

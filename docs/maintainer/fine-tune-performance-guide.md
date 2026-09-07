@@ -540,24 +540,40 @@ unchanged: every number in a doc names its producer, or it is not written.
 
 **The mechanism.** Two parallel stages, the same shape on both towers:
 
-1. **Decode.** A shared helper per modality (`image_preprocess::decode_image_batch`,
-   `audio_preprocess::decode_audio_batch`) used by BOTH decode loops — the trainer's
-   `image_encoder_input`/`audio_encoder_input` and serving's `arrow_to_images`/
-   `arrow_to_audio` — so training and serving run the identical decode path. A
-   path-valued Arrow column reads its bytes SEQUENTIALLY first (`std::fs::read` never
-   runs inside the pool); decoding those bytes runs in parallel across the batch.
+1. **Decode.** A shared per-item decode body per modality
+   (`image_preprocess`'s and `audio_preprocess`'s private `decode_*_results`)
+   backs two DIFFERENT public error contracts, not one. The trainer's
+   `image_encoder_input`/`audio_encoder_input` call `decode_image_batch`/
+   `decode_audio_batch`, which still hard-fail the whole job on the
+   LOWEST-INDEX decode error — a corrupt training item is a refusal, not a
+   row to skip. Serving's `arrow_to_images`/`arrow_to_audio` instead call the
+   `_per_row_indexed` variants (`decode_image_batch_per_row_indexed`,
+   `decode_audio_batch_per_row_indexed`), which return EVERY row's own
+   outcome: a corrupt row's bytes produce that Arrow row's own `Err` (surfaced
+   as that row's `_status=false` with an Arrow-row-indexed `_error` message in
+   `BackendOutput`, per `docs/guide/src/generate-image-embeddings.md`'s
+   error-handling table), the rest of the batch still embeds, and a null row
+   keeps its own `None`/"Null or missing …" treatment. Both variants decode in
+   parallel across the batch on rayon's global pool; a path-valued Arrow
+   column reads its bytes SEQUENTIALLY first (`std::fs::read` never runs
+   inside the pool).
 2. **Preprocess.** `preprocess_image_batch`/`preprocess_clap_fusion` preallocate the
    batch's output buffer once and have each item write its own disjoint, fixed-stride
    chunk via `par_chunks_mut` — filters and the STFT window are hoisted out of the
    per-item closure, and a release-mode (not `debug_assert!`) per-item length check
-   guards every chunk write.
+   guards every chunk write. Preprocess has no per-row variant: the trainer and
+   serving both call the lowest-index-hard-fail `_indexed` form (serving has already
+   dropped every decode-failed or null row before preprocessing runs, so a preprocess
+   failure there is never a corrupt-item skip either).
 
 There is no thread-count knob anywhere in this path: chunk count is always the batch
 size, so the effective parallelism is `min(pool_size, batch_size)`, emergent from
-whichever pool the process happens to run under — never configured. Errors are
-collected per item and the LOWEST-INDEX failing row is the one surfaced, mirroring the
-order the pre-unit sequential loop failed in; an empty batch is refused before any
-chunking is attempted.
+whichever pool the process happens to run under — never configured. "The LOWEST-INDEX
+failing row is the one surfaced" holds for the training path's decode AND preprocess
+stages, and for the preprocess stage on the serving path — mirroring the order the
+pre-unit sequential loop failed in — but NOT for the serving path's decode stage,
+which surfaces every row's own outcome instead of collapsing to one. An empty batch is
+refused before any chunking is attempted.
 
 **Provenance: `rayon_pool_threads`.** `FinetuneRunTier` grows a thirteenth provenance
 field, `rayon_pool_threads` (`PROVENANCE_FIELDS` 12 → 13) — `rayon::current_num_threads()`

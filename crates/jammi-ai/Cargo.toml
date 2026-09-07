@@ -52,12 +52,13 @@ symphonia = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
 # The media front end's per-item decode/preprocess parallelization (#421
 # follow-on): candle's private thread pool is never installed, so rayon's
-# GLOBAL pool is the one pool the process runs media-batch work on. Pinned to
-# the version already unified across the resolved tree (Cargo.lock); adding
-# this direct edge does not move that version. Only the embedded engine's
-# audio/image front ends and their trainer call sites use it, so it rides
-# `local` like `image` / `symphonia`.
-rayon = { version = "1.11", optional = true }
+# GLOBAL pool is the one pool the process runs media-batch work on. Hoisted
+# to `[workspace.dependencies]` (rather than a per-crate literal version) so
+# every consumer resolves the same rayon version by construction; adding
+# this direct edge does not move that version (Cargo.lock unchanged). Only
+# the embedded engine's audio/image front ends and their trainer call sites
+# use it, so it rides `local` like `image` / `symphonia`.
+rayon = { workspace = true, optional = true }
 # HTTP backend
 reqwest = { workspace = true, optional = true }
 # `#[async_trait]` for the `annotate` table function's `TableProvider` impl

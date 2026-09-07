@@ -100,6 +100,24 @@
 #                                    F1's D-leg half) so
 #                                    `_check_expected_disables`'s equality
 #                                    refusal can be exercised hermetically.
+#   PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR
+#                                    TEST-ONLY (never set by a real run;
+#                                    REFUSED at preflight, exit 2, unless
+#                                    PROFILE_421_LEGS_DRY_RUN=1 is also
+#                                    set): names one corpus output path to
+#                                    truncate to empty AFTER a reported
+#                                    SUCCESS, so the corpus post-condition
+#                                    check (`_require_corpus_paths_nonempty`)
+#                                    is proven to fire on the mechanism
+#                                    rather than assumed (esc-088). In the
+#                                    12-leg sweep, valid values are
+#                                    `run_leg`'s own path names
+#                                    (train_n/train_m/heldout_ids/
+#                                    heldout_jsonl); under
+#                                    `PROFILE_421_P2_BF16=1`, `p2_run_one`
+#                                    honours the same var over ITS OWN path
+#                                    names (train_jsonl/heldout_ids/
+#                                    heldout_jsonl -- P2 has no M run).
 #   PROFILE_421_P2_BF16              "1" runs the BF16 PRE-FLIGHT MODE
 #                                    (contract "## P2" / v2.3 §D4 item 4)
 #                                    instead of the 12-leg sweep, and exits:
@@ -228,6 +246,20 @@ D2_KEYS="lora_linear_fused"
 # `test_a_legs_carry_no_disable_env_and_make_no_claim` pins.
 if [ -n "${JAMMI_KERNELS_DISABLE:-}" ]; then
   echo "::error::JAMMI_KERNELS_DISABLE is set in this driver's own environment ('$JAMMI_KERNELS_DISABLE') -- refusing before any leg runs. Each D leg scopes this var to its own single finetune-run invocation via 'env VAR=... cmd'; an ambient value here would leak into every A leg's environment too and silently contaminate the fused-vs-disabled decision legs (unit-467 finding F1). Unset it in the calling shell before running this driver." >&2
+  exit 2
+fi
+
+# `PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR` is a TEST-ONLY lever
+# (`run_leg`'s own doc) whose action is `: > "$path"` on one of a leg's
+# corpus files -- DESTRUCTIVE if it ever reached a real run. Rather than
+# trusting every future caller to remember the DRY_RUN convention, this
+# refuses LOUDLY, by name, before any leg runs, the same posture as the
+# ambient `JAMMI_KERNELS_DISABLE` guard just above. `run_leg` also carries
+# `PROFILE_421_LEGS_DRY_RUN = 1` as a structural conjunct on the same
+# lever, so even a caller who bypassed this preflight (or a future refactor
+# that dropped it) could not make the lever fire on a real run.
+if [ -n "${PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR:-}" ] && [ "$PROFILE_421_LEGS_DRY_RUN" != "1" ]; then
+  echo "::error::PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR is set ('$PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR') without PROFILE_421_LEGS_DRY_RUN=1 -- refusing before any leg runs. This lever is TEST-ONLY: its action truncates a corpus file, which would silently corrupt a real leg's train/held-out data. Unset it, or set PROFILE_421_LEGS_DRY_RUN=1, before running this driver." >&2
   exit 2
 fi
 
@@ -441,11 +473,14 @@ preflight_probe() {
   fi
   # The held-out FILES themselves, by the exact names this driver passes to
   # `--heldout-ids`/`--heldout-jsonl`: a producer that accepted the flags
-  # but wrote them elsewhere would fail every leg at load time.
+  # but wrote them elsewhere -- or wrote them EMPTY (esc-088's own failure
+  # mode: a producer that exits 0 having written nothing) -- would fail
+  # every leg at load time. `-s`, not `-f`: a zero-byte file must probe as
+  # missing here too.
   local d
   for d in text img aud; do
-    if [ ! -f "$probe_dir/$d/heldout_ids.txt" ] || [ ! -f "$probe_dir/$d/heldout_triplets.jsonl" ]; then
-      missing+=("the $d producer did not emit heldout_ids.txt + heldout_triplets.jsonl")
+    if [ ! -s "$probe_dir/$d/heldout_ids.txt" ] || [ ! -s "$probe_dir/$d/heldout_triplets.jsonl" ]; then
+      missing+=("the $d producer did not emit a non-empty heldout_ids.txt + heldout_triplets.jsonl")
     fi
   done
   rm -rf "$probe_dir"
@@ -1139,6 +1174,36 @@ json.dump(manifest, open(os.environ["MANIFEST_OUT"], "w"), indent=1)
 '
 }
 
+# Shared corpus post-condition, used by BOTH `run_leg` (the N/M legs'
+# train_n/train_m/heldout_ids/heldout_jsonl) and `p2_run_one` (P2's
+# train_jsonl/heldout_ids/heldout_jsonl): a producer that exits 0 but
+# writes an empty (or missing) file would otherwise sail straight into
+# `finetune-run`, whose own refusal downstream would blame the BENCH
+# BINARY for something corpus provisioning should have caught itself.
+# Checked BY NAME, via nameref out-parameters, so BOTH callers' own
+# status/reason fields name exactly which path failed -- one mechanism,
+# not two copies that could drift (`p2_run_one` used to have no such
+# check at all).
+#
+# Args: $1/$2 are nameref names for the caller's own status/reason
+# variables (left untouched on success); every following arg is a
+# "name:path" pair to check.
+_require_corpus_paths_nonempty() {
+  local -n _cpn_status="$1" _cpn_reason="$2"
+  shift 2
+  local _cpn_pair _cpn_name _cpn_path
+  for _cpn_pair in "$@"; do
+    _cpn_name="${_cpn_pair%%:*}"
+    _cpn_path="${_cpn_pair#*:}"
+    if [ ! -s "$_cpn_path" ]; then
+      _cpn_status="invalid"
+      _cpn_reason="corpus provisioning returned success but $_cpn_name path is missing/empty: $_cpn_path"
+      return 1
+    fi
+  done
+  return 0
+}
+
 # One leg, start to finish. Returns 0 for every OUTCOME this leg's own
 # workload can produce -- a leg's own failure (corpus/run_traced/census/
 # report-read) lives in its `manifest.json` (`status`/`reason`), never in
@@ -1199,12 +1264,19 @@ run_leg() {
     leg_reason="corpus provisioning failed for tower $tower (see this leg's stderr above)"
   fi
 
-  # Test-only contamination lever (never set by the real leg sweep, same
-  # posture as `PROFILE_421_LEGS_DRY_RUN_EXTRA_REQUESTED_KEY` above): lets
-  # a hermetic test force a `provision_corpus` that reported SUCCESS to
-  # still leave one of its four paths empty, so the post-condition check
-  # right below is proven to fire on the mechanism rather than assumed.
-  if [ "$leg_status" = "ok" ] && [ -n "${PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR:-}" ]; then
+  # Test-only contamination lever, same posture as
+  # `PROFILE_421_LEGS_DRY_RUN_EXTRA_REQUESTED_KEY` above: lets a hermetic
+  # test force a `provision_corpus` that reported SUCCESS to still leave
+  # one of its four paths empty, so the post-condition check right below is
+  # proven to fire on the mechanism rather than assumed. Gated on
+  # `PROFILE_421_LEGS_DRY_RUN = 1` as a structural conjunct (never merely a
+  # documented convention) -- this lever's own action is `: > "$path"`,
+  # which would silently TRUNCATE A REAL LEG'S CORPUS FILE if it ever
+  # reached a real run; the preflight refusal further up this script
+  # refuses loudly, by name, before any leg runs, if it is ever set without
+  # DRY_RUN, so a caller mistake never reaches this line at all.
+  if [ "$leg_status" = "ok" ] && [ "$PROFILE_421_LEGS_DRY_RUN" = "1" ] \
+      && [ -n "${PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR:-}" ]; then
     case "$PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR" in
       train_n) : > "$train_n" ;;
       train_m) : > "$train_m" ;;
@@ -1217,24 +1289,19 @@ run_leg() {
     esac
   fi
 
-  # Post-condition on a REPORTED-success `provision_corpus`: a producer
-  # that exits 0 but writes an empty (or missing) file would otherwise sail
-  # straight into `run_traced`, and clap's own refusal downstream would
-  # blame `finetune-run` for something `provision_corpus` should have
-  # caught itself. Checked BY NAME so the manifest's reason names exactly
-  # which of the four paths failed.
+  # Post-condition on a REPORTED-success `provision_corpus`, factored into
+  # `_require_corpus_paths_nonempty` so `p2_run_one`'s P2 arm shares this
+  # exact mechanism rather than a second copy of it. `|| true`: this
+  # script runs under `set -e`, and the function's own nonzero return (on
+  # a failed check) is how it signals leg_status/leg_reason were just
+  # SET, not an error this caller needs to react to further -- without
+  # `|| true` that nonzero return would trip `set -e` and abort the WHOLE
+  # SWEEP on the very first invalid leg, exactly the "one leg's failure
+  # never discards any other leg" invariant this function exists to keep.
   if [ "$leg_status" = "ok" ]; then
-    for _corpus_check in \
+    _require_corpus_paths_nonempty leg_status leg_reason \
         "train_n:$train_n" "train_m:$train_m" \
-        "heldout_ids:$heldout_ids" "heldout_jsonl:$heldout_jsonl"; do
-      _corpus_check_name="${_corpus_check%%:*}"
-      _corpus_check_path="${_corpus_check#*:}"
-      if [ ! -s "$_corpus_check_path" ]; then
-        leg_status="invalid"
-        leg_reason="corpus provisioning returned success but $_corpus_check_name path is missing/empty: $_corpus_check_path"
-        break
-      fi
-    done
+        "heldout_ids:$heldout_ids" "heldout_jsonl:$heldout_jsonl" || true
   fi
 
   local out_n="$leg_dir/run_n.json" out_m="$leg_dir/run_m.json"
@@ -1442,6 +1509,38 @@ p2_run_one() {
   heldout_ids="$corpus_dir/heldout_ids.txt"
   heldout_jsonl="$corpus_dir/heldout_triplets.jsonl"
 
+  # Same test-only contamination lever `run_leg` carries, over P2's own
+  # path names (`train_jsonl` in place of the legs' `train_n`/`train_m` --
+  # P2 has no M run). Same structural conjunct: `PROFILE_421_LEGS_DRY_RUN
+  # = 1` is required, so this can never truncate a real P2 pre-flight's
+  # corpus; the preflight refusal above catches a caller who set the lever
+  # without DRY_RUN before either arm ever runs.
+  if [ "$PROFILE_421_LEGS_DRY_RUN" = "1" ] \
+      && [ -n "${PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR:-}" ]; then
+    case "$PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR" in
+      train_jsonl) : > "$train_jsonl" ;;
+      heldout_ids) : > "$heldout_ids" ;;
+      heldout_jsonl) : > "$heldout_jsonl" ;;
+      *)
+        echo "::error::unknown PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR '$PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR' for p2_run_one (valid: train_jsonl, heldout_ids, heldout_jsonl)" >&2
+        exit 2
+        ;;
+    esac
+  fi
+
+  # Same corpus post-condition `run_leg` applies to its N/M pair -- a
+  # producer that exits 0 but writes an empty (or missing) file must be
+  # caught HERE, by name, rather than sailing into `finetune-run` (whose
+  # own refusal would then be blamed on the bench binary). `P2_REASON` is
+  # read by `p2_bf16_sweep`, mirroring the existing `P2_EXIT` global
+  # convention this function already uses.
+  local _p2_corpus_status="ok"
+  P2_REASON=""
+  if ! _require_corpus_paths_nonempty _p2_corpus_status P2_REASON \
+      "train_jsonl:$train_jsonl" "heldout_ids:$heldout_ids" "heldout_jsonl:$heldout_jsonl"; then
+    return 1
+  fi
+
   # The full P2 command line, pinned here. Everything the legs pin is
   # repeated verbatim EXCEPT the two knobs P2 exists to vary
   # (`--backbone-dtype bf16`, `--lora-init gaussian`), so a P2 failure
@@ -1548,13 +1647,22 @@ p2_bf16_sweep() {
     local p2_dir="$root/$tower"
     local status="ok" reason=""
     P2_EXIT=1
+    P2_REASON=""
     if ! mkdir -p "$p2_dir"; then
       echo "::error::P2 $tower: could not create $p2_dir -- aborting (a pre-flight result that cannot be recorded is not a pre-flight)." >&2
       exit 1
     fi
     if ! p2_run_one "$tower" "$task" "$model_dir" "$p2_dir" "$target_modules"; then
       status="invalid"
-      reason="the P2 bf16 pre-flight run failed (exit $P2_EXIT, or its report failed envelope validation) -- see $p2_dir/run.stderr"
+      # `P2_REASON` names a corpus post-condition failure specifically
+      # (`_require_corpus_paths_nonempty`, run before P2_EXIT is ever set
+      # by this attempt); otherwise this is a real `finetune-run`/envelope
+      # failure and `P2_EXIT` carries its exit status.
+      if [ -n "$P2_REASON" ]; then
+        reason="$P2_REASON"
+      else
+        reason="the P2 bf16 pre-flight run failed (exit $P2_EXIT, or its report failed envelope validation) -- see $p2_dir/run.stderr"
+      fi
     fi
 
     if ! _write_p2_manifest "$tower" "$task" "$SHA" "$(hostname)" "$P2_BACKBONE_DTYPE" \

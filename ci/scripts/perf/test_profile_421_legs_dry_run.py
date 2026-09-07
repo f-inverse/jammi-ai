@@ -75,45 +75,26 @@ def _real_head() -> str:
     ).stdout.strip()
 
 
-# Small pinned step counts for the ordinary hermetic case: `run_corpus_cmd`
-# now runs the three real corpus producers even under DRY_RUN (esc-088), so
-# every `run_dry()` call that leaves the driver's own N=100/M=600 defaults
-# in place generates a real rows_m = BATCH * 600 = 4800-row corpus per
-# selected leg/tower -- CPU-hermetic and correct, but needlessly slow for
-# tests that only care about the CONTROL FLOW around corpus provisioning,
-# not the pinned production row counts themselves. These two are small but
-# still N < M (so N/M wall-differencing assertions that merely check
-# `front["n"] < front["m"]` still hold) and both a nonzero multiple's worth
-# of rows above the fixed `HELDOUT_ROWS = 8` (`--batch 8`), so no producer's
-# own row-count invariants are violated.
-_SMALL_STEPS_N = "2"
-_SMALL_STEPS_M = "6"
-
-
-def run_dry(out_dir, legs_only=None, extra_env=None, pin_workload_steps=False):
-    """Drive the real `profile_421_legs.sh` under `PROFILE_421_LEGS_DRY_RUN=1`.
-
-    `pin_workload_steps=True` opts OUT of the small step-count override
-    below and leaves `PROFILE_421_STEPS_N`/`_M` unset, so the driver falls
-    back to its OWN pinned production defaults (100/600) -- for the small
-    number of tests that assert on those literal, contract-pinned values
-    themselves (`DryRunSmokeTests.test_every_leg_pins_the_contracts_workload_constants`,
-    `test_the_n_and_m_corpora_differ_only_in_row_count`,
-    `test_the_text_legs_heldout_split_is_disjoint_from_BOTH_train_corpora`).
-    Every other test only exercises CONTROL FLOW that is step-count
-    agnostic, so it runs against the small values instead.
+def run_dry(out_dir, legs_only=None, extra_env=None):
+    """Drive the real `profile_421_legs.sh` under `PROFILE_421_LEGS_DRY_RUN=1`,
+    at the driver's own pinned production step counts (N=100/M=600 --
+    `PROFILE_421_STEPS_N`/`_M` are left unset, never overridden). A prior
+    revision of this helper substituted a small N=2/M=6 override to shave
+    wall time off the suite; the audited saving was noise (404 s vs 409 s
+    -- `run_corpus_cmd` runs the three real corpus producers even under
+    DRY_RUN per esc-088, and the producer wall dominates and is
+    row-invariant over that range) while it put the bulk of this suite on a
+    non-production workload and forced a `pin_workload_steps` escape hatch
+    on the few tests that needed the literal pinned values. Reverted: one
+    workload, every test, no escape hatch.
     """
     env = dict(os.environ)
     env["PROFILE_421_LEGS_DRY_RUN"] = "1"
     env["OUT_DIR"] = out_dir
     env["NSYS_BIN"] = "/nonexistent/nsys-DRY-RUN-PLACEHOLDER"
     env["BENCH_BIN"] = "/nonexistent/jammi-bench-DRY-RUN-PLACEHOLDER"
-    if not pin_workload_steps:
-        env["PROFILE_421_STEPS_N"] = _SMALL_STEPS_N
-        env["PROFILE_421_STEPS_M"] = _SMALL_STEPS_M
-    else:
-        env.pop("PROFILE_421_STEPS_N", None)
-        env.pop("PROFILE_421_STEPS_M", None)
+    env.pop("PROFILE_421_STEPS_N", None)
+    env.pop("PROFILE_421_STEPS_M", None)
     # A leftover JAMMI_KERNELS_DISABLE in the caller's environment must not
     # silently become part of what the legs measure.
     env.pop("JAMMI_KERNELS_DISABLE", None)
@@ -166,13 +147,10 @@ class DryRunSmokeTests(unittest.TestCase):
         makes `rows = 3B` on all three towers), `--lora-init zeros_b`, and a
         held-out split that is a nonzero multiple of the batch.
 
-        `pin_workload_steps=True`: this is the one test whose OWN point is
-        the literal 100/600 the contract pins, read off the driver's own
-        printout/manifest with no override in play -- every other test in
-        this suite runs against the small step-count override instead
-        (see `run_dry`'s own doc)."""
+        The literal 100/600 the contract pins, read off the driver's own
+        printout/manifest -- `run_dry` never overrides this."""
         with tempfile.TemporaryDirectory() as out_dir:
-            result = run_dry(out_dir, pin_workload_steps=True)
+            result = run_dry(out_dir)
             self.assertEqual(result.returncode, 0, _fail_msg(result))
             for leg_id in ALL_LEG_IDS:
                 manifest = _manifest(out_dir, leg_id)
@@ -231,12 +209,10 @@ class DryRunSmokeTests(unittest.TestCase):
 
     def test_the_n_and_m_corpora_differ_only_in_row_count(self):
         """The whole differencing method rests on this: `rows = batch *
-        steps`, so N asks for 800 rows and M for 4800 at the SAME seed.
-        `pin_workload_steps=True`: this asserts the literal contract-pinned
-        row counts, so it must run against the real N=100/M=600 defaults,
-        not this suite's small override."""
+        steps`, so N asks for 800 rows and M for 4800 at the SAME seed --
+        the real N=100/M=600 defaults `run_dry` always runs at."""
         with tempfile.TemporaryDirectory() as out_dir:
-            result = run_dry(out_dir, legs_only="clip-text-A1", pin_workload_steps=True)
+            result = run_dry(out_dir, legs_only="clip-text-A1")
             self.assertEqual(result.returncode, 0, _fail_msg(result))
             self.assertIn("--rows 800", result.stderr)
             self.assertIn("--rows 4800", result.stderr)
@@ -389,13 +365,12 @@ class DryRunSmokeTests(unittest.TestCase):
         the driver used to pass, so the check is demonstrably not vacuous:
         if this test could pass with either choice, it would prove nothing.
 
-        `pin_workload_steps=True`: the byte-identical-indices argument above
-        is stated in terms of the literal 100/600-step row counts, so this
-        test must run against the real defaults, not this suite's small
-        override.
+        The byte-identical-indices argument above is stated in terms of the
+        literal 100/600-step row counts -- the real defaults `run_dry`
+        always runs at.
         """
         with tempfile.TemporaryDirectory() as out_dir:
-            result = run_dry(out_dir, legs_only="clip-text-A1", pin_workload_steps=True)
+            result = run_dry(out_dir, legs_only="clip-text-A1")
             self.assertEqual(result.returncode, 0, _fail_msg(result))
 
             producer_cmds = []
@@ -858,6 +833,109 @@ class CorpusPostConditionTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, _fail_msg(result))
             manifest = _manifest(out_dir, "clip-text-A1")
             self.assertEqual(manifest["status"], "ok", manifest)
+
+    def test_the_truncate_lever_marks_the_p2_arm_invalid_by_name(self):
+        """`p2_run_one` had no corpus post-condition at all before this
+        round -- it honours the SAME lever as the 12-leg sweep above, over
+        ITS OWN path names (`train_jsonl` in place of train_n/train_m; P2
+        has no M run), proving the fix on the mechanism rather than
+        assuming `_require_corpus_paths_nonempty` is wired in everywhere it
+        needs to be."""
+        for var in ("train_jsonl", "heldout_ids", "heldout_jsonl"):
+            with self.subTest(var=var):
+                with tempfile.TemporaryDirectory() as out_dir:
+                    env = dict(os.environ)
+                    env["PROFILE_421_LEGS_DRY_RUN"] = "1"
+                    env["PROFILE_421_P2_BF16"] = "1"
+                    env["OUT_DIR"] = out_dir
+                    env["NSYS_BIN"] = "/nonexistent/nsys-DRY-RUN-PLACEHOLDER"
+                    env["BENCH_BIN"] = "/nonexistent/jammi-bench-DRY-RUN-PLACEHOLDER"
+                    env["PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR"] = var
+                    env.pop("JAMMI_KERNELS_DISABLE", None)
+                    result = subprocess.run(
+                        ["bash", SCRIPT], env=env, capture_output=True, text=True, timeout=600
+                    )
+                    self.assertEqual(result.returncode, 0, _fail_msg(result))
+                    # The lever truncates the SAME named path on every
+                    # tower's P2 run -- assert all three, not just one.
+                    for tower in ("clip-text", "clip-vision", "htsat"):
+                        manifest_path = os.path.join(out_dir, "p2-bf16", tower, "manifest.json")
+                        with open(manifest_path, encoding="utf-8") as f:
+                            manifest = json.load(f)
+                        self.assertEqual(manifest["status"], "invalid", manifest)
+                        self.assertIn(f"{var} path is missing/empty", manifest["reason"])
+
+    def test_the_lever_left_unset_is_the_ordinary_unaffected_case_for_p2(self):
+        """The non-vacuity control for the P2 arm above."""
+        with tempfile.TemporaryDirectory() as out_dir:
+            env = dict(os.environ)
+            env["PROFILE_421_LEGS_DRY_RUN"] = "1"
+            env["PROFILE_421_P2_BF16"] = "1"
+            env["OUT_DIR"] = out_dir
+            env["NSYS_BIN"] = "/nonexistent/nsys-DRY-RUN-PLACEHOLDER"
+            env["BENCH_BIN"] = "/nonexistent/jammi-bench-DRY-RUN-PLACEHOLDER"
+            env.pop("JAMMI_KERNELS_DISABLE", None)
+            result = subprocess.run(
+                ["bash", SCRIPT], env=env, capture_output=True, text=True, timeout=600
+            )
+            self.assertEqual(result.returncode, 0, _fail_msg(result))
+            for tower in ("clip-text", "clip-vision", "htsat"):
+                manifest_path = os.path.join(out_dir, "p2-bf16", tower, "manifest.json")
+                with open(manifest_path, encoding="utf-8") as f:
+                    manifest = json.load(f)
+                self.assertEqual(manifest["status"], "ok", manifest)
+
+
+class TruncateCorpusVarPreflightGuardTests(unittest.TestCase):
+    """`PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR` (`CorpusPostConditionTests`
+    above) truncates a corpus file to empty -- DESTRUCTIVE if it ever
+    reached a real run. Its guard cannot be exercised by actually driving a
+    real leg hermetically (that needs a real GPU pod, a real $BENCH_BIN,
+    and real $MODEL_DIR_*), so this instead proves the PREFLIGHT REFUSAL
+    fires, by name, before any leg runs -- with `PROFILE_421_LEGS_DRY_RUN`
+    genuinely UNSET (never merely "0") and `MODEL_DIR_CLIP`/`MODEL_DIR_CLAP`
+    ALSO left unset, so the run would refuse LATER anyway (the
+    missing-MODEL_DIR check) if this refusal did not fire FIRST -- the
+    assertion is on WHICH refusal wins."""
+
+    def test_the_lever_without_dry_run_refuses_before_any_leg_and_names_the_lever(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            env = dict(os.environ)
+            env.pop("PROFILE_421_LEGS_DRY_RUN", None)
+            env.pop("MODEL_DIR_CLIP", None)
+            env.pop("MODEL_DIR_CLAP", None)
+            env.pop("JAMMI_KERNELS_DISABLE", None)
+            env["OUT_DIR"] = out_dir
+            env["NSYS_BIN"] = "/nonexistent/nsys-DRY-RUN-PLACEHOLDER"
+            env["BENCH_BIN"] = "/nonexistent/jammi-bench-DRY-RUN-PLACEHOLDER"
+            env["PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR"] = "train_n"
+            result = subprocess.run(
+                ["bash", SCRIPT], env=env, capture_output=True, text=True, timeout=300
+            )
+            self.assertEqual(result.returncode, 2, _fail_msg(result))
+            self.assertIn(
+                "PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR", result.stderr, _fail_msg(result)
+            )
+            # WHICH refusal fires first: the MODEL_DIR check never gets a
+            # chance to run (it would have refused too, since MODEL_DIR_*
+            # are also unset here), so its own message must not appear.
+            self.assertNotIn("MODEL_DIR_CLIP", result.stderr, _fail_msg(result))
+            self.assertEqual(list(Path(out_dir).rglob("manifest.json")), [], _fail_msg(result))
+
+    def test_the_lever_with_dry_run_set_does_not_hit_this_refusal(self):
+        """The non-vacuity control: the SAME lever value, with
+        `PROFILE_421_LEGS_DRY_RUN=1` genuinely set, must NOT hit this
+        preflight refusal -- it is exercised instead by
+        `CorpusPostConditionTests`, proving this refusal fires on the
+        DRY_RUN gate specifically, not on the lever's mere presence."""
+        with tempfile.TemporaryDirectory() as out_dir:
+            result = run_dry(
+                out_dir, legs_only="clip-text-A1",
+                extra_env={"PROFILE_421_LEGS_DRY_RUN_TRUNCATE_CORPUS_VAR": "train_n"},
+            )
+            self.assertEqual(result.returncode, 0, _fail_msg(result))
+            manifest = _manifest(out_dir, "clip-text-A1")
+            self.assertEqual(manifest["status"], "invalid", manifest)
 
 
 def _write_fake_bench_stub(path: Path, *, missing_flag: str | None = None) -> None:

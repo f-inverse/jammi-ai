@@ -78,15 +78,11 @@ def _real_head() -> str:
 def run_dry(out_dir, legs_only=None, extra_env=None):
     """Drive the real `profile_421_legs.sh` under `PROFILE_421_LEGS_DRY_RUN=1`,
     at the driver's own pinned production step counts (N=100/M=600 --
-    `PROFILE_421_STEPS_N`/`_M` are left unset, never overridden). A prior
-    revision of this helper substituted a small N=2/M=6 override to shave
-    wall time off the suite; the audited saving was noise (404 s vs 409 s
-    -- `run_corpus_cmd` runs the three real corpus producers even under
-    DRY_RUN per esc-088, and the producer wall dominates and is
-    row-invariant over that range) while it put the bulk of this suite on a
-    non-production workload and forced a `pin_workload_steps` escape hatch
-    on the few tests that needed the literal pinned values. Reverted: one
-    workload, every test, no escape hatch.
+    `PROFILE_421_STEPS_N`/`_M` are left unset, never overridden). The
+    producer wall is row-invariant over the pinned range: `run_corpus_cmd`
+    runs the three real media producers even under DRY_RUN (esc-088), and
+    those producers emit a fixed family x instances pool regardless of the
+    step counts, so one workload serves every test with no override needed.
     """
     env = dict(os.environ)
     env["PROFILE_421_LEGS_DRY_RUN"] = "1"
@@ -720,7 +716,7 @@ class CheckpointIdentityPreflightTests(unittest.TestCase):
             clap_dir = Path(tmp) / "clap"
             clap_dir.mkdir()
             (clap_dir / "config.json").write_text("{}", encoding="utf-8")
-            (clap_dir / "model.safetensors").write_bytes(b"")
+            (clap_dir / "model.safetensors").write_bytes(b"\x00")
             (clap_dir / "preprocessor_config.json").write_text("{}", encoding="utf-8")
             with tempfile.TemporaryDirectory() as out_dir:
                 result = run_dry(
@@ -728,6 +724,26 @@ class CheckpointIdentityPreflightTests(unittest.TestCase):
                     extra_env={"MODEL_DIR_CLIP": str(clip_dir), "MODEL_DIR_CLAP": str(clap_dir)},
                 )
                 self.assertEqual(result.returncode, 0, _fail_msg(result))
+
+    def test_a_model_dir_clap_with_a_zero_byte_model_safetensors_is_refused(self):
+        """The negative control for the triad check's `-s` (not `-f`):
+        a REPORTED-present but zero-byte `model.safetensors` is not the
+        HTSAT/CLAP checkpoint shape either -- must refuse the same way as
+        the file being absent outright."""
+        with tempfile.TemporaryDirectory() as tmp:
+            clap_dir = Path(tmp) / "clap"
+            clap_dir.mkdir()
+            (clap_dir / "config.json").write_text("{}", encoding="utf-8")
+            (clap_dir / "model.safetensors").write_bytes(b"")
+            (clap_dir / "preprocessor_config.json").write_text("{}", encoding="utf-8")
+            with tempfile.TemporaryDirectory() as out_dir:
+                result = run_dry(
+                    out_dir, legs_only="htsat-A1",
+                    extra_env={"MODEL_DIR_CLAP": str(clap_dir)},
+                )
+                self.assertNotEqual(result.returncode, 0, _fail_msg(result))
+                self.assertIn("MODEL_DIR_CLAP", result.stderr)
+                self.assertIn("model.safetensors", result.stderr)
 
 
 class AmbientDisableEnvGuardTests(unittest.TestCase):
@@ -835,12 +851,12 @@ class CorpusPostConditionTests(unittest.TestCase):
             self.assertEqual(manifest["status"], "ok", manifest)
 
     def test_the_truncate_lever_marks_the_p2_arm_invalid_by_name(self):
-        """`p2_run_one` had no corpus post-condition at all before this
-        round -- it honours the SAME lever as the 12-leg sweep above, over
-        ITS OWN path names (`train_jsonl` in place of train_n/train_m; P2
-        has no M run), proving the fix on the mechanism rather than
-        assuming `_require_corpus_paths_nonempty` is wired in everywhere it
-        needs to be."""
+        """`p2_run_one` honours the SAME lever as the 12-leg sweep above,
+        over ITS OWN path names (`train_jsonl` in place of
+        train_n/train_m; P2 has no M run), proving the post-condition
+        fires on the mechanism rather than assuming
+        `_require_corpus_paths_nonempty` is wired in everywhere it needs
+        to be."""
         for var in ("train_jsonl", "heldout_ids", "heldout_jsonl"):
             with self.subTest(var=var):
                 with tempfile.TemporaryDirectory() as out_dir:

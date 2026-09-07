@@ -392,8 +392,8 @@ _checkpoint_identity_probe() {
   if [ -d "$MODEL_DIR_CLAP" ]; then
     local f
     for f in config.json model.safetensors preprocessor_config.json; do
-      if [ ! -f "$MODEL_DIR_CLAP/$f" ]; then
-        violations+=("MODEL_DIR_CLAP ($MODEL_DIR_CLAP) is missing $f -- the HTSAT/CLAP checkpoint shape every htsat leg declares requires config.json + model.safetensors + preprocessor_config.json all present")
+      if [ ! -s "$MODEL_DIR_CLAP/$f" ]; then
+        violations+=("MODEL_DIR_CLAP ($MODEL_DIR_CLAP) is missing or empty $f -- the HTSAT/CLAP checkpoint shape every htsat leg declares requires config.json + model.safetensors + preprocessor_config.json all present and non-empty")
       fi
     done
   fi
@@ -471,14 +471,20 @@ preflight_probe() {
       --heldout-rows 2 --heldout-batch 2 >/dev/null 2>&1; then
     missing+=("gen_fixed_length_audio_corpus.py does not support --heldout-rows/--heldout-batch")
   fi
-  # The held-out FILES themselves, by the exact names this driver passes to
-  # `--heldout-ids`/`--heldout-jsonl`: a producer that accepted the flags
-  # but wrote them elsewhere -- or wrote them EMPTY (esc-088's own failure
-  # mode: a producer that exits 0 having written nothing) -- would fail
-  # every leg at load time. `-s`, not `-f`: a zero-byte file must probe as
-  # missing here too.
-  local d
+  # The TRAIN and held-out FILES themselves, by the exact names this driver
+  # passes to `--train-jsonl`/`--heldout-ids`/`--heldout-jsonl`: a producer
+  # that accepted the flags but wrote them elsewhere -- or wrote them EMPTY
+  # (esc-088's own failure mode: a producer that exits 0 having written
+  # nothing) -- would fail every leg at load time. `-s`, not `-f`: a
+  # zero-byte file must probe as missing here too. The text producer's
+  # train file is `train.jsonl`; the two media producers' is `triplets.jsonl`.
+  local d train_name
   for d in text img aud; do
+    train_name="triplets.jsonl"
+    if [ "$d" = "text" ]; then train_name="train.jsonl"; fi
+    if [ ! -s "$probe_dir/$d/$train_name" ]; then
+      missing+=("the $d producer did not emit a non-empty $train_name")
+    fi
     if [ ! -s "$probe_dir/$d/heldout_ids.txt" ] || [ ! -s "$probe_dir/$d/heldout_triplets.jsonl" ]; then
       missing+=("the $d producer did not emit a non-empty heldout_ids.txt + heldout_triplets.jsonl")
     fi
@@ -1182,8 +1188,7 @@ json.dump(manifest, open(os.environ["MANIFEST_OUT"], "w"), indent=1)
 # BINARY for something corpus provisioning should have caught itself.
 # Checked BY NAME, via nameref out-parameters, so BOTH callers' own
 # status/reason fields name exactly which path failed -- one mechanism,
-# not two copies that could drift (`p2_run_one` used to have no such
-# check at all).
+# not two copies that could drift.
 #
 # Args: $1/$2 are nameref names for the caller's own status/reason
 # variables (left untouched on success); every following arg is a
@@ -1291,17 +1296,18 @@ run_leg() {
 
   # Post-condition on a REPORTED-success `provision_corpus`, factored into
   # `_require_corpus_paths_nonempty` so `p2_run_one`'s P2 arm shares this
-  # exact mechanism rather than a second copy of it. `|| true`: this
-  # script runs under `set -e`, and the function's own nonzero return (on
-  # a failed check) is how it signals leg_status/leg_reason were just
-  # SET, not an error this caller needs to react to further -- without
-  # `|| true` that nonzero return would trip `set -e` and abort the WHOLE
-  # SWEEP on the very first invalid leg, exactly the "one leg's failure
-  # never discards any other leg" invariant this function exists to keep.
+  # exact mechanism rather than a second copy of it. Consumed the same way
+  # `p2_run_one` below consumes it: `if ! helper ...; then`, which this
+  # script's own `set -e` exempts from aborting the sweep -- the nonzero
+  # return only signals leg_status/leg_reason were just SET; the sweep
+  # itself continues (this leg's own manifest records the failure) so one
+  # leg's INVALID never discards any other leg.
   if [ "$leg_status" = "ok" ]; then
-    _require_corpus_paths_nonempty leg_status leg_reason \
+    if ! _require_corpus_paths_nonempty leg_status leg_reason \
         "train_n:$train_n" "train_m:$train_m" \
-        "heldout_ids:$heldout_ids" "heldout_jsonl:$heldout_jsonl" || true
+        "heldout_ids:$heldout_ids" "heldout_jsonl:$heldout_jsonl"; then
+      :
+    fi
   fi
 
   local out_n="$leg_dir/run_n.json" out_m="$leg_dir/run_m.json"
@@ -1528,13 +1534,16 @@ p2_run_one() {
     esac
   fi
 
-  # Same corpus post-condition `run_leg` applies to its N/M pair -- a
-  # producer that exits 0 but writes an empty (or missing) file must be
-  # caught HERE, by name, rather than sailing into `finetune-run` (whose
-  # own refusal would then be blamed on the bench binary). `P2_REASON` is
-  # read by `p2_bf16_sweep`, mirroring the existing `P2_EXIT` global
-  # convention this function already uses.
-  local _p2_corpus_status="ok"
+  # Same corpus post-condition `run_leg` applies to its N/M pair, consumed
+  # the same way (`if ! helper ...; then`) -- a producer that exits 0 but
+  # writes an empty (or missing) file must be caught HERE, by name, rather
+  # than sailing into `finetune-run` (whose own refusal would then be
+  # blamed on the bench binary). `P2_REASON` is read by `p2_bf16_sweep`,
+  # mirroring the existing `P2_EXIT` global convention this function
+  # already uses; the status nameref is a required positional argument of
+  # the shared helper but its value is never read here (the `if !` above
+  # is what this caller actually acts on).
+  local _p2_corpus_status
   P2_REASON=""
   if ! _require_corpus_paths_nonempty _p2_corpus_status P2_REASON \
       "train_jsonl:$train_jsonl" "heldout_ids:$heldout_ids" "heldout_jsonl:$heldout_jsonl"; then

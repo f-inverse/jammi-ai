@@ -32,6 +32,24 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+/// The FULL per-tower LoRA site sets `ci/scripts/perf/profile_421_legs.sh`
+/// pins on every real pod leg (`CLIP_FULL`/`CLAP_FULL` there) — spelled out
+/// literally here, never imported (this crate is `[[bin]]`-only, mirroring
+/// every other test file in this directory's own convention of re-deriving
+/// fixture/constant values locally; see `finetune_run_kernel_disable.rs`'s
+/// own doc for the same reasoning about `ALLOFF_KEYS`).
+///
+/// Unit-467 pressure-test folded advisory: the positive-proof equation
+/// assertions below (`assert_positive_proof_equation`) are witnessed at
+/// THESE site sets specifically, not the earlier `in_proj,c_fc`/
+/// `query,value` this file used before — matching the REAL profile leg's
+/// shape is what makes this smoke test's witnessed census numbers directly
+/// comparable to a pod leg's, rather than a shape only this file has ever
+/// exercised.
+const CLIP_FULL_TARGET_MODULES: &str = "in_proj,out_proj,c_fc,c_proj";
+const CLAP_FULL_TARGET_MODULES: &str =
+    "query,key,value,attention_output,intermediate_dense,output_dense,reduction,linear1,linear2";
+
 /// KO-7 require-gate helper for every `python3`-unavailable skip below (to
 /// be registered in `ci/kernel-oracle-helpers.txt`): a lane that
 /// specifically wants to prove the media end-to-end legs (the hermetic CI
@@ -311,6 +329,106 @@ fn assert_well_formed_media_report(stdout: &str, task: &str) {
     }
 }
 
+/// The profile's POSITIVE-PROOF equation (issue #421 §D4 item 1; unit-467
+/// pressure-test folded advisory), checked LIVE on THIS leg's own real CLI
+/// output — the same assertion `finetune_run_smoke.rs`'s
+/// `fusible_site_census_satisfies_the_positive_proof_equation_on_a_real_run`
+/// applies to tiny_bert/text, extended here to the three media towers this
+/// file already drives through the real CLI: `fused + eager == <witnessed
+/// census field> × steps_measured`, per key.
+///
+/// `census`/`steps_measured` are read LIVE off this run's own report, never
+/// hardcoded — the equation is proven on whatever the committed fixture and
+/// this command's flags actually built, not on a number transcribed from a
+/// prior run. (A pressure-test run against this branch's tip measured
+/// `htsat_clap_tiny` at census `53/21/8` over `steps_measured=2` — totals
+/// `106/42/16` — and `tiny_open_clip` at `4/4/0` for the image tower and
+/// `4/3/0` for the text tower; this helper's own equation is what a future
+/// regression there would trip, not those specific numbers.)
+///
+/// `gelu_expects_zero`: OpenCLIP's MLP activation is `quick_gelu`
+/// (`jammi-encoders/src/activations.rs`, `open_clip_vision.rs`), which has
+/// no fused seam and therefore no `admit` key at all, so its
+/// `gelu_seam_calls_per_forward` census is legitimately (and checkably) `0`
+/// on BOTH OpenCLIP towers — a real, falsifiable claim, not a skip
+/// (`profile_421_merge.py`'s own `A_LEG_FUSED_REQUIRED` doc states the same
+/// convention for the pod legs). HTSAT's Swin MLP routes through the house
+/// `gelu_erf` seam, so its census (and dispatch totals) must be non-zero.
+fn assert_positive_proof_equation(stdout: &str, task: &str, gelu_expects_zero: bool) {
+    let report: serde_json::Value =
+        serde_json::from_str(stdout).unwrap_or_else(|e| panic!("{task}: report must be JSON: {e}"));
+    let tier = &report["tiers"]["finetune_run"];
+    // The convention the equation is defined under (see
+    // `finetune_run_smoke.rs`'s own doc for why `--epochs 1` is
+    // load-bearing): both are pinned by `media_command`, asserted here
+    // rather than assumed.
+    assert_eq!(tier["grad_accum"], serde_json::json!(1), "{task}");
+    assert_eq!(tier["epochs"], serde_json::json!(1), "{task}");
+    let steps = tier["steps_measured"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{task}: steps_measured must be a number"));
+    assert!(
+        steps > 0,
+        "{task}: steps_measured is 0 — nothing was measured"
+    );
+    let census = tier["fusible_site_census"]
+        .as_object()
+        .unwrap_or_else(|| panic!("{task}: fusible_site_census must serialize as an object"));
+
+    for (census_field, fused_field, eager_field, is_gelu) in [
+        (
+            "lora_sites_wrapped",
+            "lora_linear_fused_dispatches",
+            "lora_linear_eager_dispatches",
+            false,
+        ),
+        (
+            "layer_norms",
+            "ln_fused_dispatches",
+            "ln_eager_dispatches",
+            false,
+        ),
+        (
+            "gelu_seam_calls_per_forward",
+            "gelu_fused_dispatches",
+            "gelu_eager_dispatches",
+            true,
+        ),
+    ] {
+        let calls = census[census_field].as_u64().unwrap_or_else(|| {
+            panic!("{task}: census.{census_field} must be a non-negative integer")
+        });
+        if is_gelu && gelu_expects_zero {
+            assert_eq!(
+                calls, 0,
+                "{task}: census.{census_field} must read 0 on this tower (quick_gelu has no \
+                 fused seam) — a non-zero value here means the tower's activation seam changed \
+                 and this test's `gelu_expects_zero` premise no longer holds"
+            );
+        } else {
+            // Non-vacuity: on every OTHER key (and on gelu for HTSAT), the
+            // census must be genuinely non-zero, so the equality below is a
+            // real constraint rather than `0 == 0`.
+            assert!(
+                calls > 0,
+                "{task}: census.{census_field} is 0 — the equation below would be vacuous"
+            );
+        }
+        let fused = tier[fused_field]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{task}: {fused_field} must be a number"));
+        let eager = tier[eager_field]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{task}: {eager_field} must be a number"));
+        assert_eq!(
+            fused + eager,
+            calls * steps,
+            "{task}: positive proof failed: {fused_field}={fused} + {eager_field}={eager} != \
+             census.{census_field}={calls} x steps_measured={steps}"
+        );
+    }
+}
+
 /// The OpenCLIP VISION tower, end to end over the fixed-shape image corpus.
 #[test]
 fn image_embedding_leg_runs_end_to_end_over_the_committed_producer() {
@@ -336,7 +454,7 @@ fn image_embedding_leg_runs_end_to_end_over_the_committed_producer() {
         "image_embedding",
         &corpus,
         &work_dir,
-        "in_proj,c_fc",
+        CLIP_FULL_TARGET_MODULES,
         "triplet",
     )
     .output()
@@ -348,6 +466,13 @@ fn image_embedding_leg_runs_end_to_end_over_the_committed_producer() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_well_formed_media_report(&String::from_utf8_lossy(&output.stdout), "image_embedding");
+    // OpenCLIP's `quick_gelu` MLP activation has no fused seam at all, so
+    // this tower's gelu census (and dispatch totals) must read 0.
+    assert_positive_proof_equation(
+        &String::from_utf8_lossy(&output.stdout),
+        "image_embedding",
+        true,
+    );
 }
 
 /// The HTSAT AUDIO tower, end to end over the fixed-length clip corpus.
@@ -378,7 +503,7 @@ fn audio_embedding_leg_runs_end_to_end_over_the_committed_producer() {
         "audio_embedding",
         &corpus,
         &work_dir,
-        "query,value",
+        CLAP_FULL_TARGET_MODULES,
         "triplet",
     )
     .output()
@@ -390,6 +515,14 @@ fn audio_embedding_leg_runs_end_to_end_over_the_committed_producer() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_well_formed_media_report(&String::from_utf8_lossy(&output.stdout), "audio_embedding");
+    // HTSAT's Swin MLP routes through the house `gelu_erf` seam, unlike
+    // either OpenCLIP tower, so its census (and dispatch totals) must be
+    // genuinely non-zero.
+    assert_positive_proof_equation(
+        &String::from_utf8_lossy(&output.stdout),
+        "audio_embedding",
+        false,
+    );
 }
 
 /// The SAME OpenCLIP checkpoint's TEXT tower — the sharp pairing with the
@@ -441,7 +574,7 @@ fn text_embedding_leg_selects_the_clip_text_tower_of_the_same_checkpoint() {
         "text_embedding",
         &corpus,
         &work_dir,
-        "in_proj,c_fc",
+        CLIP_FULL_TARGET_MODULES,
         "triplet",
     )
     .args(["--max-seq-length", "16"])
@@ -454,6 +587,14 @@ fn text_embedding_leg_selects_the_clip_text_tower_of_the_same_checkpoint() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_well_formed_media_report(&String::from_utf8_lossy(&output.stdout), "text_embedding");
+    // The SAME checkpoint's TEXT tower is a DIFFERENT encoder than its
+    // vision tower above (different layer/site counts), but shares the
+    // same `quick_gelu` activation — no fused seam either.
+    assert_positive_proof_equation(
+        &String::from_utf8_lossy(&output.stdout),
+        "text_embedding",
+        true,
+    );
 }
 
 /// Negative control on the whole CLI path, not just the in-process dispatch:

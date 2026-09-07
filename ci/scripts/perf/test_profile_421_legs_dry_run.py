@@ -118,6 +118,7 @@ class DryRunSmokeTests(unittest.TestCase):
                     "target_modules", "kernels_disabled", "max_seq_length", "batch",
                     "objective", "lora_init", "eval_cadence", "heldout_rows",
                     "steps_declared", "steps_measured", "media_front_end_wall_s",
+                    "checkpoint_weights_sha256", "fusible_site_census",
                     "status", "reason", "census_ok", "census_exit", "dry_run",
                 ):
                     self.assertIn(key, manifest, f"{leg_id} manifest missing {key!r}: {manifest}")
@@ -527,6 +528,149 @@ class DryRunSmokeTests(unittest.TestCase):
             # A leg never yet run in this OUT_DIR is unaffected.
             third = run_dry(out_dir, legs_only="htsat-D2")
             self.assertEqual(third.returncode, 0, _fail_msg(third))
+
+    def test_checkpoint_weights_sha256_agrees_within_a_tower_and_differs_across_towers(self):
+        """Unit-467 finding R3, witnessed through the manifest: the stub
+        mirrors production`s real shape (both CLIP towers share ONE
+        checkpoint directory, HTSAT a different one), so every leg of one
+        tower must report the SAME sha and a leg of a DIFFERENT tower must
+        report a DIFFERENT one -- proving the field genuinely reaches the
+        manifest per run, not merely that the key exists."""
+        with tempfile.TemporaryDirectory() as out_dir:
+            result = run_dry(out_dir)
+            self.assertEqual(result.returncode, 0, _fail_msg(result))
+            clip_shas = set()
+            for tower in ("clip-text", "clip-vision"):
+                for leg in LEG_SUFFIXES:
+                    sha = _manifest(out_dir, f"{tower}-{leg}")["checkpoint_weights_sha256"]
+                    self.assertEqual(sha["n"], sha["m"], f"{tower}-{leg}: {sha}")
+                    clip_shas.add(sha["n"])
+            self.assertEqual(len(clip_shas), 1, f"both CLIP towers must share one sha: {clip_shas}")
+            htsat_shas = set()
+            for leg in LEG_SUFFIXES:
+                sha = _manifest(out_dir, f"htsat-{leg}")["checkpoint_weights_sha256"]
+                self.assertEqual(sha["n"], sha["m"], f"htsat-{leg}: {sha}")
+                htsat_shas.add(sha["n"])
+            self.assertEqual(len(htsat_shas), 1, f"every htsat leg must share one sha: {htsat_shas}")
+            self.assertNotEqual(
+                clip_shas, htsat_shas,
+                "CLIP and HTSAT load DIFFERENT checkpoint directories in production, so their "
+                "witnessed shas must differ",
+            )
+
+
+class CheckpointIdentityPreflightTests(unittest.TestCase):
+    """Unit-467 finding R3(i): `_checkpoint_identity_probe` refuses BEFORE
+    any leg runs when `$MODEL_DIR_CLIP`/`$MODEL_DIR_CLAP` hold the wrong
+    checkpoint shape -- exercised here against REAL temp dirs, under
+    `PROFILE_421_LEGS_DRY_RUN=1` so no GPU/nsys/bench is needed, proving the
+    probe runs even in dry-run mode (unlike the rest of the preflight,
+    which is a DRY_RUN no-op)."""
+
+    def test_a_model_dir_clip_carrying_config_json_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            clip_dir = Path(tmp) / "clip"
+            clip_dir.mkdir()
+            (clip_dir / "config.json").write_text("{}", encoding="utf-8")
+            with tempfile.TemporaryDirectory() as out_dir:
+                result = run_dry(
+                    out_dir, legs_only="clip-text-A1",
+                    extra_env={"MODEL_DIR_CLIP": str(clip_dir)},
+                )
+                self.assertNotEqual(result.returncode, 0, _fail_msg(result))
+                self.assertIn("MODEL_DIR_CLIP", result.stderr)
+                self.assertIn("config.json", result.stderr)
+                self.assertEqual(
+                    list(Path(out_dir).rglob("manifest.json")), [], _fail_msg(result),
+                )
+
+    def test_a_model_dir_clip_carrying_model_safetensors_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            clip_dir = Path(tmp) / "clip"
+            clip_dir.mkdir()
+            (clip_dir / "model.safetensors").write_bytes(b"")
+            with tempfile.TemporaryDirectory() as out_dir:
+                result = run_dry(
+                    out_dir, legs_only="clip-text-A1",
+                    extra_env={"MODEL_DIR_CLIP": str(clip_dir)},
+                )
+                self.assertNotEqual(result.returncode, 0, _fail_msg(result))
+                self.assertIn("MODEL_DIR_CLIP", result.stderr)
+                self.assertIn("model.safetensors", result.stderr)
+
+    def test_a_model_dir_clap_missing_preprocessor_config_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            clap_dir = Path(tmp) / "clap"
+            clap_dir.mkdir()
+            (clap_dir / "config.json").write_text("{}", encoding="utf-8")
+            (clap_dir / "model.safetensors").write_bytes(b"")
+            # preprocessor_config.json deliberately absent.
+            with tempfile.TemporaryDirectory() as out_dir:
+                result = run_dry(
+                    out_dir, legs_only="htsat-A1",
+                    extra_env={"MODEL_DIR_CLAP": str(clap_dir)},
+                )
+                self.assertNotEqual(result.returncode, 0, _fail_msg(result))
+                self.assertIn("MODEL_DIR_CLAP", result.stderr)
+                self.assertIn("preprocessor_config.json", result.stderr)
+                self.assertEqual(
+                    list(Path(out_dir).rglob("manifest.json")), [], _fail_msg(result),
+                )
+
+    def test_a_well_shaped_pair_of_real_temp_dirs_is_not_refused(self):
+        """The non-vacuity control: real, EXISTING directories that carry
+        the correct shape must not trip the probe -- otherwise the two
+        refusal tests above would prove nothing about which shape is
+        actually being checked for."""
+        with tempfile.TemporaryDirectory() as tmp:
+            clip_dir = Path(tmp) / "clip"
+            clip_dir.mkdir()
+            (clip_dir / "open_clip_config.json").write_text("{}", encoding="utf-8")
+            (clip_dir / "open_clip_model.safetensors").write_bytes(b"")
+            (clip_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+            clap_dir = Path(tmp) / "clap"
+            clap_dir.mkdir()
+            (clap_dir / "config.json").write_text("{}", encoding="utf-8")
+            (clap_dir / "model.safetensors").write_bytes(b"")
+            (clap_dir / "preprocessor_config.json").write_text("{}", encoding="utf-8")
+            with tempfile.TemporaryDirectory() as out_dir:
+                result = run_dry(
+                    out_dir, legs_only="clip-text-A1,htsat-A1",
+                    extra_env={"MODEL_DIR_CLIP": str(clip_dir), "MODEL_DIR_CLAP": str(clap_dir)},
+                )
+                self.assertEqual(result.returncode, 0, _fail_msg(result))
+
+
+class AmbientDisableEnvGuardTests(unittest.TestCase):
+    """Unit-467 finding F1, driver half: `JAMMI_KERNELS_DISABLE` reaching
+    this driver`s OWN environment (as opposed to being scoped, per D leg,
+    onto a single child invocation) must refuse before any leg runs -- an
+    ambient value here would otherwise leak into every A leg`s environment
+    too. Deliberately does NOT go through `run_dry` (which always pops the
+    var defensively), so the ambient value genuinely reaches the driver."""
+
+    def test_an_ambient_kernels_disable_env_var_refuses_before_any_leg_runs(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            env = dict(os.environ)
+            env["PROFILE_421_LEGS_DRY_RUN"] = "1"
+            env["OUT_DIR"] = out_dir
+            env["NSYS_BIN"] = "/nonexistent/nsys-DRY-RUN-PLACEHOLDER"
+            env["BENCH_BIN"] = "/nonexistent/jammi-bench-DRY-RUN-PLACEHOLDER"
+            env["JAMMI_KERNELS_DISABLE"] = "lora_linear_fused"
+            result = subprocess.run(
+                ["bash", SCRIPT], env=env, capture_output=True, text=True, timeout=300
+            )
+            self.assertNotEqual(result.returncode, 0, _fail_msg(result))
+            self.assertIn("JAMMI_KERNELS_DISABLE", result.stderr)
+            self.assertIn("lora_linear_fused", result.stderr)
+            self.assertEqual(list(Path(out_dir).rglob("manifest.json")), [], _fail_msg(result))
+
+    def test_an_unset_ambient_var_is_the_ordinary_unaffected_case(self):
+        """The non-vacuity control: the SAME invocation with the var
+        genuinely absent (never merely empty) must run normally."""
+        with tempfile.TemporaryDirectory() as out_dir:
+            result = run_dry(out_dir, legs_only="clip-text-A1")
+            self.assertEqual(result.returncode, 0, _fail_msg(result))
 
 
 def _write_fake_bench_stub(path: Path, *, missing_flag: str | None = None) -> None:

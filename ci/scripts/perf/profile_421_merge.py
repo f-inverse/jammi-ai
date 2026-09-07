@@ -373,6 +373,13 @@ def merge_leg(leg_dir: Path) -> dict:
         "reasons": [],
         "positive_proof": None,
         "per_step": None,
+        # Set only when BOTH runs of this leg's own N/M pair agree (unit-467
+        # finding R3) — `None` otherwise, which is what makes these safe to
+        # feed into `_check_cross_tower_identity`'s per-tower comparison
+        # without that pass having to re-derive "did this leg even agree
+        # with itself" on every read.
+        "checkpoint_weights_sha256": None,
+        "fusible_site_census": None,
     }
     reasons: list[str] = []
     try:
@@ -416,6 +423,7 @@ def merge_leg(leg_dir: Path) -> dict:
     proof: dict[str, dict] = {}
     steps: dict[str, int] = {}
     censuses: dict[str, dict[str, int]] = {}
+    checkpoint_shas: dict[str, str] = {}
     for run_label, tier in (("run_n", run_n), ("run_m", run_m)):
         # `steps_measured` is read FIRST and independently of everything
         # else: the wall/front/busy decomposition needs only it, and a leg
@@ -429,6 +437,43 @@ def merge_leg(leg_dir: Path) -> dict:
             reasons.append(f"{run_label}: steps_measured is 0 — nothing was measured")
         elif steps_measured is not None:
             steps[run_label] = steps_measured
+
+        # Checkpoint identity (unit-467 finding R3): read UNCONDITIONALLY,
+        # independent of every other check below — a wrong-checkpoint leg
+        # must be catchable even if its arm/census/equation all otherwise
+        # look fine.
+        checkpoint_sha = tier.get("checkpoint_weights_sha256")
+        if not isinstance(checkpoint_sha, str) or not checkpoint_sha:
+            reasons.append(
+                f"{run_label}: checkpoint_weights_sha256 is absent or not a non-empty string"
+            )
+        else:
+            checkpoint_shas[run_label] = checkpoint_sha
+
+        # Finding F1 (unit-467 adversarial audit): an A leg (this leg's own
+        # `manifest.kernels_disabled` is empty) makes a POSITIVE claim that
+        # nothing was disabled. `kernels_disabled_expected` alone cannot
+        # catch a contaminated A leg (it stays `[]` on an unclaimed leg
+        # regardless of the real env), so this reads the PROCESS-RESOLVED
+        # `kernels_disabled_requested` — the same field the binary's own
+        # `--arm fused` refusal reads — and refuses BY NAME when it is
+        # non-empty on a leg that declared itself an A leg. `finetune-run`'s
+        # own start-of-run check (this PR's companion fix) should make this
+        # branch unreachable for a NEW run, but a leg produced by an OLDER
+        # binary build (or a manifest hand-edited after the fact) must still
+        # be caught here, independently.
+        requested = tier.get("kernels_disabled_requested")
+        if not isinstance(requested, list):
+            reasons.append(f"{run_label}: kernels_disabled_requested is absent or not a list")
+            continue
+        requested_sorted = sorted(str(k) for k in requested)
+        if not disabled_manifest and requested_sorted:
+            reasons.append(
+                f"{run_label}: this leg declared itself an A leg (kernels_disabled=[]) but "
+                f"kernels_disabled_requested={requested_sorted} — an ambient JAMMI_KERNELS_DISABLE "
+                "contaminated this leg (finding F1); the run is INVALID, not a datum"
+            )
+            continue
 
         expected = tier.get("kernels_disabled_expected")
         if not isinstance(expected, list):
@@ -454,12 +499,23 @@ def merge_leg(leg_dir: Path) -> dict:
             tier, run_label, census, steps[run_label], expected_sorted, reasons
         )
 
+    if len(checkpoint_shas) == 2 and checkpoint_shas["run_n"] != checkpoint_shas["run_m"]:
+        reasons.append(
+            f"the pair's checkpoint_weights_sha256 differ (run_n={checkpoint_shas['run_n']}, "
+            f"run_m={checkpoint_shas['run_m']}) — the two runs did not load the same checkpoint "
+            "bytes, so differencing them is not a measurement of one workload"
+        )
+    elif len(checkpoint_shas) == 2:
+        row["checkpoint_weights_sha256"] = checkpoint_shas["run_n"]
+
     if len(censuses) == 2 and censuses["run_n"] != censuses["run_m"]:
         reasons.append(
             f"the pair's witnessed site censuses differ (run_n={censuses['run_n']}, "
             f"run_m={censuses['run_m']}) — the two runs did not build the same model, so "
             "differencing them is not a measurement of one workload"
         )
+    elif len(censuses) == 2:
+        row["fusible_site_census"] = censuses["run_n"]
 
     row["positive_proof"] = proof or None
     per_step, per_step_reasons = decompose_per_step(run_n, run_m, census_file, steps)
@@ -597,6 +653,11 @@ def merge_p2(tower_dir: Path) -> dict:
         "train_probe_series_head": None,
         "lora_linear_fused_dispatches": None,
         "ln_fused_dispatches": None,
+        # Unit-467 finding R3: fed into `_check_cross_tower_identity`
+        # alongside this tower's own A1/A2/D1/D2 legs, exactly like the
+        # matching fields on a leg row.
+        "checkpoint_weights_sha256": None,
+        "fusible_site_census": None,
     }
     reasons: list[str] = []
     try:
@@ -628,6 +689,27 @@ def merge_p2(tower_dir: Path) -> dict:
     lora_init = tier.get("lora_init")
     row["backbone_dtype"] = dtype
     row["lora_init"] = lora_init
+
+    # Checkpoint identity (unit-467 finding R3), read the same way a leg's
+    # own per-run read is — the P2 pre-flight is a SINGLE untraced run, so
+    # there is no N/M pair to cross-check within, only this tower's OTHER
+    # rows (its four legs) via `_check_cross_tower_identity`.
+    checkpoint_sha = tier.get("checkpoint_weights_sha256")
+    if not isinstance(checkpoint_sha, str) or not checkpoint_sha:
+        reasons.append(f"{tower_id}: checkpoint_weights_sha256 is absent or not a non-empty string")
+    else:
+        row["checkpoint_weights_sha256"] = checkpoint_sha
+    p2_census_reasons: list[str] = []
+    census = read_census(tier, f"{tower_id}: p2", p2_census_reasons)
+    if census is not None:
+        row["fusible_site_census"] = census
+    # Deliberately NOT folded into `reasons`/this row's own verdict: a
+    # missing census here would already make `read_census`'s caller-visible
+    # failure mode fire wherever THIS tower's real legs need it, and P2's
+    # own pass/fail is about the bf16 dtype path, not the census shape —
+    # `_check_cross_tower_identity` is the only consumer of this field and
+    # already reports its own reason when it finds a mismatch.
+
     if dtype != "bf16":
         reasons.append(f"{tower_id}: backbone_dtype={dtype!r}, but the P2 pre-flight is bf16")
     if lora_init != "gaussian":
@@ -683,6 +765,72 @@ def _leg_dirs(legs_dir: Path) -> list[Path]:
     )
 
 
+# The two fields `_check_cross_tower_identity` compares across a tower's
+# rows, paired with a human-readable label for the reason string.
+_CROSS_TOWER_FIELDS = (
+    ("checkpoint_weights_sha256", "checkpoint_weights_sha256"),
+    ("fusible_site_census", "fusible_site_census"),
+)
+
+
+def _check_cross_tower_identity(legs: list[dict], p2_rows: list[dict]) -> None:
+    """Unit-467 finding R3: every row of the SAME tower — its A1/A2/D1/D2
+    legs AND its P2 bf16 pre-flight row, when both are present in this merge
+    — must agree on `checkpoint_weights_sha256` and `fusible_site_census`.
+    Two rows of one tower that measured DIFFERENT checkpoint bytes or built
+    a DIFFERENT encoder are not comparable at all, whatever their own
+    within-row checks already found.
+
+    Mutates `legs`/`p2_rows` IN PLACE: a disagreeing row's verdict is
+    downgraded (`VALID` -> `INVALID` for a leg, `PASS` -> `FAIL` for a P2
+    row) and a reason naming the mismatch — by tower, by field, and by
+    row-id — is appended, even when every other check on that row passed.
+    A row whose own value for a field is `None` (it already failed some
+    OTHER check that field depends on) is left out of the comparison for
+    that field entirely: a row that never produced a witnessed value cannot
+    be blamed for disagreeing with one that did, and is already INVALID/FAIL
+    for the reason that made the value `None` in the first place.
+    """
+    by_tower: dict[str, list[tuple[str, dict]]] = {}
+    for row in legs:
+        tower = row.get("tower")
+        if isinstance(tower, str):
+            by_tower.setdefault(tower, []).append(("leg", row))
+    for row in p2_rows:
+        tower = row.get("tower")
+        if isinstance(tower, str):
+            by_tower.setdefault(tower, []).append(("p2", row))
+
+    for tower, kind_rows in by_tower.items():
+        for field, label in _CROSS_TOWER_FIELDS:
+            present = [(kind, row) for kind, row in kind_rows if row.get(field) is not None]
+            if len(present) < 2:
+                continue
+            # Canonicalized (`fusible_site_census` is a dict) so equality is
+            # a genuine structural comparison, not an identity check on the
+            # unhashable dict itself.
+            distinct = {json.dumps(row[field], sort_keys=True) for _kind, row in present}
+            if len(distinct) <= 1:
+                continue
+            summary = {
+                (row.get("leg_id") if kind == "leg" else f"{row.get('tower')} (P2)"): row[field]
+                for kind, row in present
+            }
+            for kind, row in present:
+                row_id = row.get("leg_id") if kind == "leg" else f"{row.get('tower')} (P2)"
+                reason = (
+                    f"{row_id}: tower {tower!r}'s rows disagree on {label} — {summary!r} — "
+                    "these rows did not measure the same checkpoint/build and are not "
+                    "comparable, whatever their own within-row checks found"
+                )
+                if kind == "leg":
+                    row["reasons"].append(reason)
+                    row["verdict"] = VERDICT_INVALID
+                else:
+                    row["reasons"].append(reason)
+                    row["verdict"] = VERDICT_FAIL
+
+
 def build_report(legs_dir: Path | None, p2_dir: Path | None) -> dict:
     report: dict[str, object] = {"tool": "profile_421_merge", "schema": 1}
     legs: list[dict] = []
@@ -700,6 +848,12 @@ def build_report(legs_dir: Path | None, p2_dir: Path | None) -> dict:
             )
         ]
         report["p2_bf16"] = p2_rows
+    # Unit-467 finding R3: a per-tower CROSS-leg (and cross-P2) identity
+    # check, run AFTER every leg/P2 row has its own within-row verdict — a
+    # row already INVALID/FAIL for its own reason can still surface a
+    # cross-tower mismatch reason too (both are true), and a row that was
+    # otherwise VALID/PASS can be downgraded by this pass alone.
+    _check_cross_tower_identity(legs, p2_rows)
     report["summary"] = {
         "legs_total": len(legs),
         "legs_valid": sum(1 for row in legs if row["verdict"] == VERDICT_VALID),

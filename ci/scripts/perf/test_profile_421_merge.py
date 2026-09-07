@@ -84,6 +84,14 @@ CENSUS_CLIP = {"lora_sites_wrapped": 48, "layer_norms": 25, "gelu_seam_calls_per
 # An HTSAT-shaped one: sum(depths) MLP dispatches plus the projection head.
 CENSUS_HTSAT = {"lora_sites_wrapped": 77, "layer_norms": 30, "gelu_seam_calls_per_forward": 9}
 
+# The default checkpoint identity `make_tier` stamps onto every synthetic
+# tier (unit-467 finding R3) unless a test overrides it via `extra` -- one
+# constant shared by every call in this file is safe because
+# `_check_cross_tower_identity` only compares WITHIN a tower group, and no
+# test in this suite that mixes towers into one merge call also relies on
+# their checkpoint shas differing.
+DEFAULT_CHECKPOINT_SHA = "c" * 64
+
 
 def make_tier(
     *,
@@ -95,11 +103,16 @@ def make_tier(
     fused_overrides: dict | None = None,
     eager_overrides: dict | None = None,
     extra: dict | None = None,
+    checkpoint_sha: str | None = DEFAULT_CHECKPOINT_SHA,
 ) -> dict:
     """A synthetic `tiers.finetune_run` that SATISFIES the positive-proof
     equation by construction: for every key, `fused = census x steps` and
     `eager = 0` on a fused arm, and the other way round for a key named in
     `disabled`. A test that wants a violation overrides exactly one counter.
+
+    `checkpoint_sha=None` omits the field entirely, for the tests that
+    specifically probe its absence; every other caller gets
+    `DEFAULT_CHECKPOINT_SHA` unless it passes its own.
     """
     tier: dict = {
         "steps_measured": steps,
@@ -107,10 +120,17 @@ def make_tier(
         # holds only here. Every leg the driver runs pins both.
         "grad_accum": 1,
         "epochs": 1,
+        # Unit-467 finding F1: an A leg's report must witness that NOTHING
+        # was disabled; a D leg's report witnesses exactly its claimed set.
+        # `disabled` is this tier's own arm, so mirroring it here is what a
+        # genuine, uncontaminated run's report actually carries.
+        "kernels_disabled_requested": sorted(disabled),
         "train_run_wall_s": wall,
         "media_front_end_wall_s": front,
         "kernels_disabled_expected": sorted(disabled),
     }
+    if checkpoint_sha is not None:
+        tier["checkpoint_weights_sha256"] = checkpoint_sha
     if census is not None:
         tier["fusible_site_census"] = dict(census)
     for key, (fused_field, eager_field, census_field) in merge.KEY_FIELDS.items():
@@ -419,6 +439,188 @@ class PositiveProofTests(unittest.TestCase):
             self.assertNotIn("Traceback", result.stderr)
 
 
+class AmbientDisableContaminationTests(unittest.TestCase):
+    """Unit-467 finding F1, merger half: an A leg (empty `kernels_disabled`
+    on the manifest) whose report carries a NON-empty
+    `kernels_disabled_requested` is INVALID by name — the binary's own
+    start-of-run refusal (this unit's companion fix) should make this
+    unreachable for a FRESH run, but a leg produced by an older build (or a
+    report hand-edited after the fact) must still be caught here,
+    independently."""
+
+    def test_an_a_leg_with_a_contaminated_requested_field_is_invalid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            tier_n, tier_m = a_leg_pair()
+            # An ambient JAMMI_KERNELS_DISABLE reached the process, but the
+            # leg still declared (and the binary still believed) itself an
+            # unclaimed A leg -- `kernels_disabled_expected` stays `[]`.
+            tier_m["kernels_disabled_requested"] = ["gelu_erf_fused"]
+            write_leg(out, "clip-text-A1", tier_n=tier_n, tier_m=tier_m)
+            row = only_leg(merged(out))
+            self.assertEqual(row["verdict"], "INVALID")
+            text = reasons_text(row)
+            self.assertIn("run_m", text)
+            self.assertIn("gelu_erf_fused", text)
+            self.assertIn("ambient", text)
+            # The equation itself was never even attempted for that run --
+            # this is a refusal by NAME, before the positive proof.
+            self.assertNotIn("run_m", row["positive_proof"] or {})
+
+    def test_a_clean_a_leg_with_an_explicitly_empty_requested_field_is_unaffected(self):
+        """The non-vacuity control: the SAME leg shape with
+        `kernels_disabled_requested=[]` (what an uncontaminated A leg's
+        report genuinely carries) must pass, proving the check above fires
+        on the CONTENT of the field, not merely its presence."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            tier_n, tier_m = a_leg_pair()
+            self.assertEqual(tier_m["kernels_disabled_requested"], [])
+            write_leg(out, "clip-text-A1", tier_n=tier_n, tier_m=tier_m)
+            row = only_leg(merged(out))
+            self.assertEqual(row["verdict"], "VALID", reasons_text(row))
+
+    def test_a_d_leg_is_unaffected_by_this_check(self):
+        """The check is A-leg-specific (`not disabled_manifest`): a D leg's
+        own non-empty `kernels_disabled_requested` is exactly what makes it
+        a genuine forced-eager twin, checked by `kernels_disabled_expected`
+        and the fused-dispatch proof instead — this check must not also
+        fire on it."""
+        disabled = ("layer_norm_fused", "lora_linear_fused")
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            tier_n = make_tier(steps=100, wall=1.0, front=None, census=CENSUS_CLIP,
+                               disabled=disabled)
+            tier_m = make_tier(steps=600, wall=6.0, front=None, census=CENSUS_CLIP,
+                               disabled=disabled)
+            write_leg(out, "clip-text-D1", disabled=disabled, tier_n=tier_n, tier_m=tier_m)
+            row = only_leg(merged(out))
+            self.assertEqual(row["verdict"], "VALID", reasons_text(row))
+
+
+class CrossTowerIdentityTests(unittest.TestCase):
+    """Unit-467 finding R3: every row of one tower — its legs and its P2
+    pre-flight row alike — must agree on `checkpoint_weights_sha256` and
+    `fusible_site_census`."""
+
+    def _two_legs_same_tower(self, out: Path, sha_a1: str, sha_a2: str):
+        tier_n1, tier_m1 = a_leg_pair()
+        tier_n1["checkpoint_weights_sha256"] = sha_a1
+        tier_m1["checkpoint_weights_sha256"] = sha_a1
+        write_leg(out, "clip-text-A1", tier_n=tier_n1, tier_m=tier_m1)
+        tier_n2, tier_m2 = a_leg_pair()
+        tier_n2["checkpoint_weights_sha256"] = sha_a2
+        tier_m2["checkpoint_weights_sha256"] = sha_a2
+        write_leg(out, "clip-text-A2", tower="clip-text", dtype="bf16",
+                  tier_n=tier_n2, tier_m=tier_m2)
+
+    def test_two_legs_of_one_tower_with_different_checkpoint_shas_are_both_invalid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            self._two_legs_same_tower(out, "a" * 64, "b" * 64)
+            report = merged(out)
+            by_id = {row["leg_id"]: row for row in report["legs"]}
+            for leg_id in ("clip-text-A1", "clip-text-A2"):
+                self.assertEqual(by_id[leg_id]["verdict"], "INVALID", by_id[leg_id])
+                text = "\n".join(by_id[leg_id]["reasons"])
+                self.assertIn("checkpoint_weights_sha256", text)
+                self.assertIn("clip-text", text)
+
+    def test_two_legs_of_one_tower_with_the_same_checkpoint_sha_are_unaffected(self):
+        """Non-vacuity control: the identical pair, at the SAME sha, must
+        both stay VALID — proving the check above fires on a genuine
+        disagreement, not on the mere presence of two legs."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            self._two_legs_same_tower(out, "a" * 64, "a" * 64)
+            report = merged(out)
+            by_id = {row["leg_id"]: row for row in report["legs"]}
+            for leg_id in ("clip-text-A1", "clip-text-A2"):
+                self.assertEqual(by_id[leg_id]["verdict"], "VALID", by_id[leg_id])
+
+    def test_legs_of_DIFFERENT_towers_disagreeing_on_checkpoint_sha_is_fine(self):
+        """The comparison is scoped to ONE tower's rows — two towers load
+        genuinely different checkpoints in production, so this must not
+        become a whole-report-wide "every leg must share one sha" rule."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            tier_n, tier_m = a_leg_pair()
+            tier_n["checkpoint_weights_sha256"] = "a" * 64
+            tier_m["checkpoint_weights_sha256"] = "a" * 64
+            write_leg(out, "clip-text-A1", tier_n=tier_n, tier_m=tier_m)
+            tier_n2, tier_m2 = a_leg_pair(CENSUS_HTSAT, front=(0.4, 2.4))
+            tier_n2["checkpoint_weights_sha256"] = "b" * 64
+            tier_m2["checkpoint_weights_sha256"] = "b" * 64
+            write_leg(out, "htsat-A1", tower="htsat", task="audio_embedding",
+                      tier_n=tier_n2, tier_m=tier_m2)
+            report = merged(out)
+            by_id = {row["leg_id"]: row for row in report["legs"]}
+            self.assertEqual(by_id["clip-text-A1"]["verdict"], "VALID", by_id["clip-text-A1"])
+            self.assertEqual(by_id["htsat-A1"]["verdict"], "VALID", by_id["htsat-A1"])
+
+    def test_a_census_mismatch_across_two_legs_of_one_tower_is_caught_too(self):
+        """The SAME check, the other field: `fusible_site_census` is a dict,
+        so this also proves the comparison canonicalizes it correctly (a
+        dict is not hashable, so a naive `set()` of raw values would crash,
+        not merely miss the mismatch)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            tier_n1, tier_m1 = a_leg_pair(CENSUS_CLIP)
+            write_leg(out, "clip-text-A1", tier_n=tier_n1, tier_m=tier_m1)
+            different_census = dict(CENSUS_CLIP)
+            different_census["layer_norms"] = 99
+            tier_n2, tier_m2 = a_leg_pair(different_census)
+            write_leg(out, "clip-text-A2", tower="clip-text", dtype="bf16",
+                      tier_n=tier_n2, tier_m=tier_m2)
+            report = merged(out)
+            by_id = {row["leg_id"]: row for row in report["legs"]}
+            for leg_id in ("clip-text-A1", "clip-text-A2"):
+                self.assertEqual(by_id[leg_id]["verdict"], "INVALID", by_id[leg_id])
+                self.assertIn("fusible_site_census",
+                              "\n".join(by_id[leg_id]["reasons"]))
+
+    def test_a_leg_and_its_towers_p2_preflight_disagreeing_is_caught(self):
+        """The P2 half of the check: a tower's P2 bf16 pre-flight row
+        (`merge_p2`) is compared against that SAME tower's legs too, and a
+        mismatch downgrades the P2 row from PASS to FAIL as well as the
+        leg from VALID to INVALID."""
+        with tempfile.TemporaryDirectory() as tmp:
+            legs_dir = Path(tmp) / "legs"
+            legs_dir.mkdir()
+            tier_n, tier_m = a_leg_pair()
+            write_leg(legs_dir, "clip-text-A1", tier_n=tier_n, tier_m=tier_m)
+            p2_dir = Path(tmp) / "p2"
+            p2_dir.mkdir()
+            tower_dir = p2_dir / "clip-text"
+            tower_dir.mkdir()
+            manifest = {
+                "mode": "p2-bf16-preflight", "tower": "clip-text", "exit": 0,
+                "status": "ok", "reason": "",
+            }
+            p2_tier = {
+                "backbone_dtype": "bf16",
+                "lora_init": "gaussian",
+                "final_loss_diagnostic": 0.581,
+                "train_probe_series": [0.60, 0.55],
+                "lora_linear_fused_dispatches": 96,
+                "ln_fused_dispatches": 50,
+                # Deliberately DIFFERENT from the leg's DEFAULT_CHECKPOINT_SHA.
+                "checkpoint_weights_sha256": "f" * 64,
+            }
+            (tower_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (tower_dir / "run.json").write_text(
+                json.dumps({"tiers": {"finetune_run": p2_tier}}), encoding="utf-8"
+            )
+            result = run_merge("--legs-dir", str(legs_dir), "--p2-dir", str(p2_dir))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(result.stdout)
+            leg_row = only_leg(report)
+            p2_row = report["p2_bf16"][0]
+            self.assertEqual(leg_row["verdict"], "INVALID", leg_row)
+            self.assertEqual(p2_row["verdict"], "FAIL", p2_row)
+            self.assertIn("checkpoint_weights_sha256", "\n".join(p2_row["reasons"]))
+
+
 class PerStepDecompositionTests(unittest.TestCase):
     def test_the_decomposition_matches_an_independent_oracle(self):
         wall_n, wall_m = 12.5, 62.5
@@ -615,6 +817,11 @@ class P2PreflightTests(unittest.TestCase):
             "train_probe_series": [0.60, 0.55],
             "lora_linear_fused_dispatches": 96,
             "ln_fused_dispatches": 50,
+            # Unit-467 finding R3: the same default `make_tier` stamps onto
+            # a leg's tier, so a P2 pre-flight fixture agrees with its
+            # tower's legs by default -- a test that wants to exercise the
+            # cross-tower mismatch overrides this explicitly.
+            "checkpoint_weights_sha256": DEFAULT_CHECKPOINT_SHA,
         }
         tier.update(tier_overrides or {})
         (tower_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")

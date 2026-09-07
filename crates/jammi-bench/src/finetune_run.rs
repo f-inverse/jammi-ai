@@ -572,25 +572,37 @@ pub struct FinetuneRunParams {
     /// the env var itself is read through, never a second one (that
     /// module's own doc records a round-3 audit where a divergent
     /// duplicate-preserving parser hard-failed a VALID leg). `None` is the
-    /// ordinary, unchecked case and the ONLY state an invocation written
-    /// before this flag existed can be in.
+    /// ordinary, unchecked case for `--arm alloff` (whose own arm-level
+    /// check below already pins `JAMMI_KERNELS_DISABLE` to an exact set)
+    /// and is REFUSED outright for `--arm fused` whenever the process's
+    /// real `JAMMI_KERNELS_DISABLE` is non-empty — see [`run`]'s "no
+    /// ambient disable on an unlabeled fused leg" check, added by the
+    /// pressure-test that closed unit-467 finding F1: an ambient/leftover
+    /// `JAMMI_KERNELS_DISABLE` (e.g. a hand-run `alloff`/mutant leg's env
+    /// var still exported in the operator's shell) previously contaminated
+    /// every unlabeled `fused` leg silently, reading as a realized fused
+    /// gain of zero with nothing red.
     ///
     /// When `Some`, [`run`] enforces THREE separate things a
     /// `JAMMI_KERNELS_DISABLE` leg can each fail independently — the leg is
     /// INVALID, never a datum, if any of them does:
     ///
-    /// 1. At START (before any device/checkpoint/tensor work): every named
-    ///    key must appear in
-    ///    [`jammi_kernels::admission::disabled_ops_requested`]. A SUBSET
-    ///    check, deliberately weaker than
-    ///    [`crate::finetune_step::FinetuneStepParams::expect_kernels_disabled`]'s
-    ///    set EQUALITY: this tier's own `--arm alloff` already requires
-    ///    `JAMMI_KERNELS_DISABLE` to carry [`ALLOFF_KEYS`], so a leg that
-    ///    disables a chain key on TOP of the alloff pair is legitimate and
-    ///    an equality check would refuse it. The failure mode the check
-    ///    exists for — a dropped, mistyped, or unforwarded env var — is
-    ///    caught either way: a dropped var makes the requested set empty,
-    ///    and a mistyped key is absent from it.
+    /// 1. At START (before any device/checkpoint/tensor work): this field
+    ///    must equal
+    ///    [`jammi_kernels::admission::disabled_ops_requested`] EXACTLY —
+    ///    the SAME set EQUALITY
+    ///    [`crate::finetune_step::FinetuneStepParams::expect_kernels_disabled`]
+    ///    uses. (Finding F1's fix: an earlier revision of this check was a
+    ///    SUBSET check, on the premise that `--arm alloff` could carry a
+    ///    "combined leg" naming a chain key on top of [`ALLOFF_KEYS`] — but
+    ///    the `--arm alloff` arm-level check below refuses anything but
+    ///    EXACT equality to `ALLOFF_KEYS`, so that combined leg can never
+    ///    exist, and the weaker subset check bought nothing while hiding
+    ///    an ambient extra key.) The failure mode the check exists for — a
+    ///    dropped, mistyped, unforwarded, or ambient-contaminated env var —
+    ///    is caught either way: a dropped var makes the requested set
+    ///    empty, a mistyped key is absent from it, and an ambient extra key
+    ///    makes the sets unequal.
     /// 2. At END: [`jammi_kernels::admission::unmatched_disables`] must be
     ///    empty — a requested key that never disabled a live `admit` call
     ///    is a typo in the disable list, not evidence the forced-eager arm
@@ -1660,10 +1672,7 @@ fn run_impl(
     // hard-error `FinetuneStepParams::expect_kernels_disabled` performs (see
     // that field's doc), turning a dropped/mistyped/unforwarded env var into
     // a failure on the SAME invocation rather than a silently-fused `alloff`
-    // leg a downstream merger would misread as the treatment arm. The fused
-    // arm makes no such claim (an operator may legitimately run it with
-    // OTHER, unrelated op keys disabled), so this check only fires for
-    // `Arm::Alloff`.
+    // leg a downstream merger would misread as the treatment arm.
     if params.arm == Arm::Alloff {
         let mut expected: Vec<String> = ALLOFF_KEYS.iter().map(|s| s.to_string()).collect();
         expected.sort();
@@ -1678,37 +1687,62 @@ fn run_impl(
             .into());
         }
     }
+    // Finding F1 (unit-467 adversarial audit): an unlabeled `--arm fused`
+    // leg is the DECISION legs' A side — the two-sided ACTIVATE/DECLINE
+    // rule that makes C-<x>'s realized gain equation meaningful fires on
+    // exactly this arm. Before this check existed, `--arm fused` made NO
+    // claim about `JAMMI_KERNELS_DISABLE` at all, so an ambient/leftover
+    // value (a hand-run `alloff`/mutant leg's env var still exported in the
+    // operator's shell) silently contaminated the leg: every OTHER check in
+    // this function stays green (the positive-proof equation `fused + eager
+    // == census * steps_measured` still holds, because the run legitimately
+    // dispatched fused everywhere the ambient disable did not reach), so a
+    // realized gain reads as zero with nothing red to explain why. Refused
+    // at START, before any device/checkpoint/tensor work, so a contaminated
+    // leg never pays for a training run it was never going to produce a
+    // valid datum from.
+    if params.arm == Arm::Fused && params.expect_kernels_disabled.is_none() {
+        let requested = jammi_kernels::admission::disabled_ops_requested();
+        if !requested.is_empty() {
+            return Err(format!(
+                "finetune-run: --arm fused (with no --expect-kernels-disabled) claims that \
+                 nothing is disabled, but this process's JAMMI_KERNELS_DISABLE resolved to \
+                 {requested:?} (INVALID run, not a datum) — either unset JAMMI_KERNELS_DISABLE \
+                 before running this leg, or declare it honestly with \
+                 --expect-kernels-disabled naming exactly {requested:?}"
+            )
+            .into());
+        }
+    }
     // `--expect-kernels-disabled`, check (1) of 3 (issue #421 P1-b(i); the
     // other two are at the END of this function, where the dispatch sites
-    // have had their chance to fire): every named key must be present in
-    // this process's real `JAMMI_KERNELS_DISABLE`. Checked HERE, at the
-    // very top, before the checkpoint is loaded or a single tensor is
-    // built — `disabled_ops_requested()` is a pure function of the env var,
+    // have had their chance to fire): this field must equal this process's
+    // real `JAMMI_KERNELS_DISABLE` EXACTLY. Checked HERE, at the very top,
+    // before the checkpoint is loaded or a single tensor is built —
+    // `disabled_ops_requested()` is a pure function of the env var,
     // resolved once at first read and never dependent on anything below,
     // so a mismatch can fail fast rather than after paying for a whole
     // training run that was never going to produce a valid leg (the same
     // posture, and the same reasoning, `finetune_step::run`'s own copy of
     // this check states).
     //
-    // A SUBSET check, not the set EQUALITY `finetune_step` uses — see
-    // `FinetuneRunParams::expect_kernels_disabled`'s doc for why (this
-    // tier's `--arm alloff` already pins two OTHER keys into the same env
-    // var, so equality would refuse a legitimate combined leg). The
-    // failure this exists to catch is unaffected: a dropped env var leaves
-    // the requested set empty and a mistyped key is absent from it, so
-    // either way at least one named key is missing here.
+    // Set EQUALITY, not a subset — see `FinetuneRunParams::expect_kernels_disabled`'s
+    // doc, finding F1, for why an earlier, weaker subset check here was
+    // wrong (the "legitimate combined leg on top of `--arm alloff`" premise
+    // it rested on cannot occur — the arm-level check above already forces
+    // `--arm alloff` to an exact set). Both `expected` and `requested` are
+    // sorted, deduplicated `Vec<String>`s built by the same
+    // `jammi_kernels::admission::parse_disable_list` (see the CLI fold in
+    // `main.rs` and `disabled_ops_requested`'s own doc), so `!=` is a
+    // genuine set comparison, not a string/order artifact.
     if let Some(expected) = &params.expect_kernels_disabled {
         let requested = jammi_kernels::admission::disabled_ops_requested();
-        let missing: Vec<&String> = expected
-            .iter()
-            .filter(|key| !requested.contains(key))
-            .collect();
-        if !missing.is_empty() {
+        if requested != *expected {
             return Err(format!(
-                "finetune-run: --expect-kernels-disabled named {missing:?}, absent from this \
-                 process's real JAMMI_KERNELS_DISABLE (which resolved to {requested:?}) — the \
-                 env var was dropped, mistyped, or not forwarded to this process (INVALID run, \
-                 not a datum)"
+                "finetune-run: --expect-kernels-disabled {expected:?} does not exactly equal \
+                 this process's real JAMMI_KERNELS_DISABLE (which resolved to {requested:?}) — \
+                 the env var was dropped, mistyped, not forwarded to this process, or carries \
+                 key(s) beyond what this leg declared (INVALID run, not a datum)"
             )
             .into());
         }

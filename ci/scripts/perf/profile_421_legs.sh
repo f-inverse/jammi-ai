@@ -198,6 +198,29 @@ D1_KEYS_CLIP="lora_linear_fused,layer_norm_fused"
 D1_KEYS_HTSAT="lora_linear_fused,layer_norm_fused,gelu_erf_fused"
 D2_KEYS="lora_linear_fused"
 
+# --- ambient-var guard (unit-467 finding F1, driver half -- "pick one and
+# say why: explicit-empty vs. preflight refusal"; this driver picks
+# REFUSAL): `JAMMI_KERNELS_DISABLE` reaching THIS driver's own process
+# environment at all would silently leak into every A leg's environment too
+# (a child process inherits its parent's environment unless a var is
+# explicitly cleared for it), turning the DECISION legs' own fused-vs-
+# disabled claim into a lie -- an ambient value here IS what a hand-run D
+# leg (or ANY prior export) left behind. `run_traced` scopes
+# `JAMMI_KERNELS_DISABLE` to a SINGLE D-leg invocation via `env VAR=...
+# cmd`, deliberately never touching this script's own environment, so this
+# check running ONCE, here, before any leg runs, is sufficient: nothing
+# below this line can make the var newly appear in this process's own
+# environment over the sweep's lifetime. Refusing here (rather than
+# stamping an explicit `JAMMI_KERNELS_DISABLE=` onto every A-leg
+# invocation) keeps an A leg's command line identical to what it always
+# was -- an operator reading `_print_cmd`'s trace sees NO disable-related
+# token on an A leg either way, which is what
+# `test_a_legs_carry_no_disable_env_and_make_no_claim` pins.
+if [ -n "${JAMMI_KERNELS_DISABLE:-}" ]; then
+  echo "::error::JAMMI_KERNELS_DISABLE is set in this driver's own environment ('$JAMMI_KERNELS_DISABLE') -- refusing before any leg runs. Each D leg scopes this var to its own single finetune-run invocation via 'env VAR=... cmd'; an ambient value here would leak into every A leg's environment too and silently contaminate the fused-vs-disabled decision legs (unit-467 finding F1). Unset it in the calling shell before running this driver." >&2
+  exit 2
+fi
+
 mkdir -p "$OUT_DIR"
 
 if [ "$PROFILE_421_LEGS_DRY_RUN" != "1" ]; then
@@ -264,6 +287,58 @@ if [ "$PROFILE_421_LEGS_DRY_RUN" != "1" ]; then
     exit 1
   fi
 fi
+
+# --- checkpoint identity (unit-467 R3 pressure-test finding): refuse
+# BEFORE any leg runs if `$MODEL_DIR_CLIP`/`$MODEL_DIR_CLAP` hold the WRONG
+# checkpoint shape. `arch.rs`'s `Checkpoint::resolve` (`arch.rs:45,64`)
+# PREFERS a `config.json`/`model.safetensors` pair over the `open_clip_*`
+# siblings whenever both are present in the same directory, so a
+# `$MODEL_DIR_CLIP` that also happens to carry a bare `config.json`/
+# `model.safetensors` (a stray HF snapshot co-located in the checkpoint
+# directory, or the wrong directory entirely) would silently mis-resolve to
+# the WRONG architecture family rather than the OpenCLIP one every CLIP leg
+# declares -- every downstream check in this driver (and in
+# `profile_421_merge.py`) would still pass, because nothing here reads
+# WHICH family actually got built, only whether the run and census agree
+# with themselves. Symmetrically, `$MODEL_DIR_CLAP` (the HF
+# `laion/clap-htsat-fused` checkpoint) MUST carry the standard HF triad --
+# `config.json` + `model.safetensors` + `preprocessor_config.json` -- a
+# directory missing any of the three is not the checkpoint shape the htsat
+# legs declare, whatever else it contains.
+#
+# Runs UNCONDITIONALLY, dry run included, but ONLY when the named directory
+# actually EXISTS on disk: a DRY_RUN caller that leaves
+# `$MODEL_DIR_CLIP`/`$MODEL_DIR_CLAP` at their non-existent placeholder
+# default (set just above) has nothing to check yet -- this is what lets
+# the hermetic dry-run test exercise BOTH refusals against real temp dirs
+# without requiring a full pod checkpoint set for every OTHER dry-run
+# assertion in this suite.
+_checkpoint_identity_probe() {
+  local violations=()
+  if [ -d "$MODEL_DIR_CLIP" ]; then
+    if [ -f "$MODEL_DIR_CLIP/config.json" ] || [ -f "$MODEL_DIR_CLIP/model.safetensors" ]; then
+      violations+=("MODEL_DIR_CLIP ($MODEL_DIR_CLIP) carries config.json and/or model.safetensors -- arch.rs's Checkpoint::resolve prefers those over the open_clip_config.json/open_clip_model.safetensors pair every CLIP leg declares, so this directory would silently resolve to the WRONG architecture family")
+    fi
+  fi
+  if [ -d "$MODEL_DIR_CLAP" ]; then
+    local f
+    for f in config.json model.safetensors preprocessor_config.json; do
+      if [ ! -f "$MODEL_DIR_CLAP/$f" ]; then
+        violations+=("MODEL_DIR_CLAP ($MODEL_DIR_CLAP) is missing $f -- the HTSAT/CLAP checkpoint shape every htsat leg declares requires config.json + model.safetensors + preprocessor_config.json all present")
+      fi
+    done
+  fi
+  if [ "${#violations[@]}" -gt 0 ]; then
+    echo "::error::_checkpoint_identity_probe: refusing before any leg runs -- checkpoint identity mismatch(es):" >&2
+    local v
+    for v in "${violations[@]}"; do
+      echo "  - $v" >&2
+    done
+    exit 2
+  fi
+}
+
+_checkpoint_identity_probe
 
 # =====================================================================
 # Preflight: every P1-b surface these legs depend on must be PRESENT in
@@ -511,6 +586,15 @@ tier["grad_accum"] = 1
 tier["task"] = task
 tier["lora_init"] = lora_init
 tier["backbone_dtype"] = dtype
+# Checkpoint identity (unit-467 finding R3), mirrored per TOWER rather than
+# left at the golden`s one inherited constant: the two CLIP towers really do
+# share ONE checkpoint directory in production (MODEL_DIR_CLIP) and HTSAT a
+# DIFFERENT one (MODEL_DIR_CLAP), so this is the one split that makes
+# profile_421_merge.py`s cross-tower identity check exercisable from this
+# stub`s own output -- a stub that left every task at the golden`s single
+# inherited value could never distinguish "every leg of a tower agrees" from
+# "this stub never varies at all".
+tier["checkpoint_weights_sha256"] = "c" * 64 if task != "audio_embedding" else "d" * 64
 # The ZerosB-vs-Gaussian PROBE SPLIT, mirrored rather than faked flat: under
 # `zeros_b` the B matrix is zero at step 0, so `dL/dA == 0` and the init
 # probe and the post-epoch probe are the SAME number by construction; under
@@ -648,6 +732,39 @@ if missing:
           ": " + path, file=sys.stderr)
     sys.exit(1)
 ' "$1" "$2"
+}
+
+# The A-leg belt-and-braces witness (unit-467 finding F1): the driver's own
+# preflight ambient-var guard above already makes a contaminated A leg
+# unreachable for a FRESH invocation of this script, but the REPORT is the
+# independent witness of what the binary actually saw, regardless of how it
+# got invoked -- a leg produced by an older build of this same script (one
+# predating that guard), or a report copied in from somewhere else entirely,
+# must still be caught here. Refuses if `kernels_disabled_requested` is
+# non-empty on a leg this driver declared an A leg (no `JAMMI_KERNELS_DISABLE`,
+# no `--expect-kernels-disabled` claim) -- the binary's own start-of-run
+# refusal (this unit's companion fix) checks the SAME fact from inside the
+# process that ran; this is the driver checking it a second time, from
+# outside, off the artifact the run actually left behind.
+_check_no_ambient_disables() {
+  python3 -c '
+import json, sys
+path = sys.argv[1]
+d = json.load(open(path))
+tier = d.get("tiers", {}).get("finetune_run") or {}
+requested = tier.get("kernels_disabled_requested")
+if requested is None:
+    print("::error::_check_no_ambient_disables: the report carries no "
+          "kernels_disabled_requested (a build predating issue #421 P1-b(i)): " + path,
+          file=sys.stderr)
+    sys.exit(1)
+if requested:
+    print("::error::_check_no_ambient_disables: this leg declared itself an A leg (no "
+          "JAMMI_KERNELS_DISABLE, no --expect-kernels-disabled claim) but the report'"'"'s "
+          "kernels_disabled_requested=" + repr(sorted(requested)) + " -- an ambient env var "
+          "contaminated this run (unit-467 finding F1): " + path, file=sys.stderr)
+    sys.exit(1)
+' "$1"
 }
 
 # One nsys-traced finetune-run: writes "$out_json" (the run's own JSON
@@ -843,7 +960,10 @@ _write_manifest() {
   MANIFEST_STATUS="${19}" MANIFEST_REASON="${20}" MANIFEST_CENSUS_OK="${21}" \
   MANIFEST_CENSUS_EXIT="${22}" MANIFEST_DRY_RUN="${23}" \
   MANIFEST_HELDOUT_ROWS="${24}" MANIFEST_MEDIA_FRONT_END_N="${25}" \
-  MANIFEST_MEDIA_FRONT_END_M="${26}" MANIFEST_OUT="${27}" \
+  MANIFEST_MEDIA_FRONT_END_M="${26}" \
+  MANIFEST_CHECKPOINT_SHA_N="${27}" MANIFEST_CHECKPOINT_SHA_M="${28}" \
+  MANIFEST_CENSUS_N="${29}" MANIFEST_CENSUS_M="${30}" \
+  MANIFEST_OUT="${31}" \
   python3 -c '
 import json, os
 
@@ -890,6 +1010,26 @@ manifest = {
     "media_front_end_wall_s": {
         "n": _json_or_none(os.environ["MANIFEST_MEDIA_FRONT_END_N"]),
         "m": _json_or_none(os.environ["MANIFEST_MEDIA_FRONT_END_M"]),
+    },
+    # Checkpoint identity (unit-467 finding R3), read off EACH run`s own
+    # report -- `null` when the run never reached the point of reporting it
+    # (an INVALID leg`s runs may not have produced a report at all). Recorded
+    # PER RUN, like `steps_measured`/`media_front_end_wall_s` above, rather
+    # than collapsed to one value here: the within-leg N/M agreement and the
+    # cross-leg (this tower`s OTHER legs) agreement are both
+    # `profile_421_merge.py`s job, and both need the raw per-run values to
+    # check, not a value this driver already decided was canonical.
+    "checkpoint_weights_sha256": {
+        "n": _json_or_none(os.environ["MANIFEST_CHECKPOINT_SHA_N"]),
+        "m": _json_or_none(os.environ["MANIFEST_CHECKPOINT_SHA_M"]),
+    },
+    # The witnessed per-forward fusible-site census (issue #421 D4 item 1),
+    # same per-run/null convention as the checkpoint sha above -- this is
+    # what `profile_421_merge.py`s cross-tower identity check compares
+    # alongside it.
+    "fusible_site_census": {
+        "n": _json_or_none(os.environ["MANIFEST_CENSUS_N"]),
+        "m": _json_or_none(os.environ["MANIFEST_CENSUS_M"]),
     },
     "status": os.environ["MANIFEST_STATUS"],
     "reason": os.environ["MANIFEST_REASON"],
@@ -945,7 +1085,7 @@ run_leg() {
         "$target_modules" "$disable_keys" "$seq_len" "$BATCH" "$OBJECTIVE" "$LORA_INIT" \
         "$EVAL_CADENCE" "$STEPS_N" "$STEPS_M" "" "" "invalid" \
         "could not create leg directory $leg_dir" "false" "" "$dry_run_flag" \
-        "$HELDOUT_ROWS" "" "" "$OUT_DIR/${leg_id}.manifest.json"; then
+        "$HELDOUT_ROWS" "" "" "" "" "" "" "$OUT_DIR/${leg_id}.manifest.json"; then
       echo "::error::$leg_id: could not write even the fallback manifest.json -- this IS sweep-fatal (results cannot be recorded); aborting." >&2
       exit 1
     fi
@@ -996,6 +1136,21 @@ run_leg() {
     fi
   fi
 
+  # A legs only, the mirror image (unit-467 finding F1): a POSITIVE claim
+  # that nothing was disabled, witnessed off BOTH reports. The preflight
+  # ambient-var guard near the top of this script already makes a
+  # contaminated A leg unreachable for a fresh run of this driver -- this is
+  # the belt-and-braces second read, off the artifact the run actually left
+  # behind, exactly as the D-leg check above is a second read of ITS claim.
+  if [ "$leg_status" = "ok" ] && [ -z "$disable_keys" ]; then
+    local no_ambient_err
+    if ! no_ambient_err="$(_check_no_ambient_disables "$out_n" 2>&1)" \
+        || ! no_ambient_err="$(_check_no_ambient_disables "$out_m" 2>&1)"; then
+      leg_status="invalid"
+      leg_reason="an ambient JAMMI_KERNELS_DISABLE contaminated this A leg: $no_ambient_err"
+    fi
+  fi
+
   local wall_n="" wall_m=""
   if [ "$leg_status" = "ok" ]; then
     if ! wall_n="$(_tier_field "$out_n" train_run_wall_s)"; then
@@ -1025,6 +1180,21 @@ run_leg() {
   if [ "$leg_status" = "ok" ]; then
     steps_measured_n="$(_tier_field "$out_n" steps_measured 2>/dev/null)" || steps_measured_n=""
     steps_measured_m="$(_tier_field "$out_m" steps_measured 2>/dev/null)" || steps_measured_m=""
+  fi
+
+  # Checkpoint identity (unit-467 finding R3), read off EACH run's own
+  # report -- "when available", same posture as `front_n`/`front_m` above:
+  # a leg already marked invalid for some other reason may not have a
+  # readable report at all, and a manifest that cannot record this yet must
+  # say so with `null` rather than fail the whole write. `_tier_field`
+  # already emits the field as a JSON-encoded string/object, so these
+  # variables carry EXACTLY what `_write_manifest`'s `_json_or_none` expects.
+  local checkpoint_sha_n="" checkpoint_sha_m="" census_n="" census_m=""
+  if [ "$leg_status" = "ok" ]; then
+    checkpoint_sha_n="$(_tier_field "$out_n" checkpoint_weights_sha256 2>/dev/null)" || checkpoint_sha_n=""
+    checkpoint_sha_m="$(_tier_field "$out_m" checkpoint_weights_sha256 2>/dev/null)" || checkpoint_sha_m=""
+    census_n="$(_tier_field "$out_n" fusible_site_census 2>/dev/null)" || census_n=""
+    census_m="$(_tier_field "$out_m" fusible_site_census 2>/dev/null)" || census_m=""
   fi
 
   local census_ok="false"
@@ -1065,7 +1235,9 @@ run_leg() {
       "$target_modules" "$disable_keys" "$seq_len" "$BATCH" "$OBJECTIVE" "$LORA_INIT" \
       "$EVAL_CADENCE" "$STEPS_N" "$STEPS_M" "$steps_measured_n" "$steps_measured_m" \
       "$leg_status" "$leg_reason" "$census_ok" "$census_exit" "$dry_run_flag" \
-      "$HELDOUT_ROWS" "$front_n" "$front_m" "$leg_dir/manifest.json"; then
+      "$HELDOUT_ROWS" "$front_n" "$front_m" \
+      "$checkpoint_sha_n" "$checkpoint_sha_m" "$census_n" "$census_m" \
+      "$leg_dir/manifest.json"; then
     echo "::error::$leg_id: could not write $leg_dir/manifest.json -- this IS sweep-fatal (this leg's result cannot be recorded); aborting the sweep now rather than continuing silently unrecorded." >&2
     exit 1
   fi

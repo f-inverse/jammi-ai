@@ -137,11 +137,17 @@ workspace ships every publishable crate at the same
   table and mechanism in `docs/maintainer/fine-tune-performance-guide.md` §4).
 - **A checkable forced-eager premise, a selectable LoRA init, and a directly measured media
   front end (#421).** `jammi-bench finetune-run --expect-kernels-disabled <keys>` turns a
-  forced-eager leg's premise into a checked one: the run refuses at start unless every named op key
-  is present in `JAMMI_KERNELS_DISABLE` (subset semantics — `--arm alloff` pins its own keys into
-  the same variable), and refuses at the end unless no requested disable went unmatched and every
-  named key's fused dispatch counter read zero across the run; either refusal exits non-zero and
-  writes no row. `--lora-init {zeros_b,gaussian}` selects the adapter initialization — `zeros_b` is
+  forced-eager leg's premise into a checked one: the run refuses at start unless this flag's value
+  EQUALS this process's real `JAMMI_KERNELS_DISABLE` exactly (unit-467 adversarial audit finding
+  F1 tightened an earlier, weaker subset check — `--arm alloff` already forces an exact-set
+  match of its own two keys, so the "combined leg" the subset check existed for can never occur,
+  and the weaker check let an ambient/leftover env var through undetected), and refuses at the end
+  unless no requested disable went unmatched and every named key's fused dispatch counter read
+  zero across the run; either refusal exits non-zero and writes no row. An unlabeled `--arm fused`
+  leg (no `--expect-kernels-disabled`) now ALSO refuses at start when `JAMMI_KERNELS_DISABLE`
+  resolves non-empty, naming the offending keys — closing the same finding's other half, where an
+  ambient disable silently contaminated a "fused" leg while every other check stayed green.
+  `--lora-init {zeros_b,gaussian}` selects the adapter initialization — `zeros_b` is
   the default and byte-identical to what every prior invocation produced, while `gaussian` gives a
   non-zero gradient into `A` at step 0, which a zero-`B` adapter cannot. The report gains
   `media_front_end_wall_s`: wall spent in the media decode/preprocess front end, read from the new
@@ -363,6 +369,27 @@ workspace ships every publishable crate at the same
   replacing the bare candle `Tensor` error a missing-tensor lookup previously produced. Every other
   LayerNorm call site — any prefix not
   keyed on a literal `LayerNorm` segment — is unchanged.
+- **The #421 profile driver and merger now witness checkpoint identity and close an ambient-env
+  contamination hole on the DECISION legs (unit-467 adversarial audit findings F1/R3).**
+  `ci/scripts/perf/profile_421_legs.sh` refuses before any leg runs if `JAMMI_KERNELS_DISABLE`
+  reaches the DRIVER's own process environment (it must only ever be scoped, per D leg, onto a
+  single child invocation via `env VAR=... cmd`), and a belt-and-braces read of each leg's own
+  report additionally refuses an A leg whose `kernels_disabled_requested` came back non-empty.
+  A new `_checkpoint_identity_probe` refuses a `$MODEL_DIR_CLIP` carrying `config.json`/
+  `model.safetensors` (`arch.rs`'s `Checkpoint::resolve` prefers those over the
+  `open_clip_config.json`/`open_clip_model.safetensors` pair every CLIP leg declares, so such a
+  directory would silently resolve to the wrong architecture family) and a `$MODEL_DIR_CLAP`
+  missing any of `config.json`/`model.safetensors`/`preprocessor_config.json`. Each leg's manifest
+  now records `checkpoint_weights_sha256`/`fusible_site_census` per run (`n`/`m`), and
+  `ci/scripts/perf/profile_421_merge.py` refuses, by name, an A leg whose report witnesses a
+  non-empty disable list, and a per-tower cross-leg (A1/A2/D1/D2, and the P2 bf16 pre-flight when
+  it carries the fields) mismatch of either value — two legs of one tower that measured different
+  checkpoint bytes or built a different encoder are not comparable, whatever their own
+  within-leg checks found. `crates/jammi-bench/tests/finetune_run_media_smoke.rs`'s three
+  real-CLI media legs now drive the SAME full per-tower LoRA site sets the pod legs use and assert
+  the positive-proof equation exactly (all three keys, non-vacuity on `calls`, the GELU seam
+  non-zero on HTSAT / zero on both OpenCLIP towers) rather than witnessing it on tiny_bert/text
+  alone.
 
 ### Breaking
 - `jammi_encoders::{AnyAudioEncoder, AudioEncoder}` are removed

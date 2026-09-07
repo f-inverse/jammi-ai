@@ -298,12 +298,12 @@ impl ClapFrontendConfig {
     /// `preprocessor_config.json` is read), never deferred to the point of
     /// failure deep inside the transform:
     ///
-    /// - `hop_length == 0` makes [`Self::chunk_frames`]'s `nb_max_samples /
+    /// - `hop_length == 0` makes `chunk_frames`'s `nb_max_samples /
     ///   hop_length` an integer-division-by-zero panic.
     /// - `sample_rate == 0` makes [`resample_linear`]'s ratio zero, so the
-    ///   resampled clip is empty and [`repeatpad`]'s `max_length / len`
+    ///   resampled clip is empty and `repeatpad`'s `max_length / len`
     ///   panics on the resulting `0 / 0`.
-    /// - `max_length_s == 0` collapses [`Self::nb_max_samples`] to zero
+    /// - `max_length_s == 0` collapses `nb_max_samples` to zero
     ///   without panicking anywhere, so every clip silently takes the
     ///   fusion-crop branch over a near-empty window instead of failing —
     ///   a confident-wrong shape, not a crash.

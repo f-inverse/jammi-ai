@@ -37,10 +37,12 @@ works the same way — OpenAI CLIP, LAION `CLIP-ViT-B-32-*`, EVA-CLIP, etc. — 
 encoder is auto-detected from the model's `open_clip_config.json`.
 
 By **default** (no env var) the recipe runs against the hermetic
-`cookbook/fixtures/tiny_open_clip` fixture so it runs offline in CI in under a
-few seconds. That fixture has random weights, so its retrieval numbers are
-meaningless — it exercises the full pipeline, not model quality. Point
-`JAMMI_IMAGE_MODEL` at any real checkpoint for real numbers.
+`cookbook/fixtures/tiny_open_clip` fixture so it runs offline in CI — about two
+seconds on a laptop, nearly all of it the tower-LoRA and refusal legs (the
+search-and-eval flow alone is a fraction of a second). That fixture has random
+weights, so its retrieval numbers are meaningless — it exercises the full
+pipeline, not model quality. Point `JAMMI_IMAGE_MODEL` at any real checkpoint
+for real numbers.
 
 ## What `example.py` does
 
@@ -92,9 +94,10 @@ meaningless — it exercises the full pipeline, not model quality. Point
   is actionable, carrying this architecture's own site vocabulary.
 - The **independently-known improvement number** — tuned retrieval quality
   beating the base by a measured margin — is not this recipe's to claim. It
-  belongs to the real-checkpoint chapter, which reads a committed cache
-  produced on a GPU. A recipe running a random-weight fixture on a laptop can
-  honestly prove mechanism; it cannot prove quality.
+  belongs to a real-checkpoint chapter (built from a committed GPU-produced
+  cache; planned under issue #421), which does not exist yet. A recipe running
+  a random-weight fixture on a laptop can honestly prove mechanism; it cannot
+  prove quality.
 
 The pairing semantics (what a "positive" *means*) are the caller's training
 data, not the trainer's: the trainer only minimizes the contrastive triplet

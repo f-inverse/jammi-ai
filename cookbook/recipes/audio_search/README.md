@@ -36,10 +36,12 @@ JAMMI_AUDIO_MODEL=<hf-repo-id-or-local-path> \
 ```
 
 By **default** (no env var) the recipe runs against the hermetic
-`cookbook/fixtures/htsat_clap_tiny` fixture so it runs offline in CI in under a
-few seconds. That fixture has random weights, so its retrieval numbers are
-meaningless — it exercises the full pipeline, not model quality. Point
-`JAMMI_AUDIO_MODEL` at a real CLAP checkpoint for real numbers.
+`cookbook/fixtures/htsat_clap_tiny` fixture so it runs offline in CI — on the
+order of ten seconds on a laptop, dominated by the three training legs (the
+projection head, the tower LoRA, and the refused job). That fixture has random
+weights, so its retrieval numbers are meaningless — it exercises the full
+pipeline, not model quality. Point `JAMMI_AUDIO_MODEL` at a real CLAP
+checkpoint for real numbers.
 
 ## What `example.py` does
 
@@ -108,10 +110,10 @@ than publishing an adapter that changes nothing, and that the message is
 actionable — it carries this architecture's own site names.
 
 The **independently-known improvement number** — tuned retrieval quality beating
-the base by a measured margin — is not this recipe's to claim. It belongs to the
-real-checkpoint chapter, which reads a committed cache produced on a GPU. A
-recipe running a random-weight fixture on a laptop can honestly prove mechanism;
-it cannot prove quality.
+the base by a measured margin — is not this recipe's to claim. It belongs to a
+real-checkpoint chapter (built from a committed GPU-produced cache; planned
+under issue #421), which does not exist yet. A recipe running a random-weight
+fixture on a laptop can honestly prove mechanism; it cannot prove quality.
 
 The pairing semantics (what a "positive" *means*) are the caller's training
 data, not the trainer's: the trainer only minimizes the contrastive triplet

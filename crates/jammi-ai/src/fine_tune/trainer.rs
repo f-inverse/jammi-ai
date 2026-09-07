@@ -95,6 +95,30 @@ pub struct TrainingResult {
     /// checkpointing was disabled (`artifact_store` unset on the builder).
     /// The worker's finalize CAS registers one catalog row per entry.
     pub epoch_checkpoints: Vec<(usize, String)>,
+    /// The wall spent in the media front end during TRAINING.
+    ///
+    /// Declared boundary: the wall around the `image_encoder_input` /
+    /// `audio_encoder_input` calls inside `TrainingLoop::encode_media` —
+    /// decode + preprocess INCLUDING the device tensor build (H2D upload)
+    /// that `preprocess_image_batch` / `preprocess_clap_fusion` perform
+    /// internally, because the upload cannot be separated without splitting
+    /// those functions; the tower forward is NOT included; accumulated
+    /// ONLY when `self.training_mode` is true (eval passes through
+    /// `evaluate_held_out` are excluded, so this is a subset of the
+    /// trainer's training wall); zero for text tasks by construction
+    /// (tokenization is not a media front end and stays in the residual).
+    /// For a `ProjectionHead` target, the same boundary applies around the
+    /// frozen-base media encode (`project_frozen_embedding`) — that call
+    /// also includes the tower forward, which cannot be separated from the
+    /// frozen base's own combined decode/preprocess/forward path there.
+    ///
+    /// Measured with a `Cell<Duration>` on the loop (`encode_media` takes
+    /// `&self`; `run` takes `&mut self`) and read into this field at the end
+    /// of [`TrainingLoop::run`]. RESET at the start of every `run` call — a
+    /// caller summing across resume legs (e.g. a bench driver) must sum this
+    /// field across those calls itself, it is never carried over from a
+    /// prior leg. `Duration::ZERO` by default.
+    pub media_front_end_wall: std::time::Duration,
 }
 
 /// Compute the learning rate for a given step.
@@ -363,6 +387,15 @@ pub struct TrainingLoop {
     /// bytes were already reclaimed. Threaded into [`TrainingResult`] at the
     /// end of [`Self::run`] for the worker's finalize to register.
     epoch_checkpoints: Vec<(usize, String)>,
+    /// Accumulates [`TrainingResult::media_front_end_wall`] across the run.
+    /// A `Cell`, not a plain field, because [`Self::encode_media`] takes
+    /// `&self` (it is called from `&self` batch-encoding helpers) while
+    /// [`Self::run`] holds `&mut self` — the `Cell` lets the `&self` method
+    /// advance the total without a `&mut self` borrow. Reset to
+    /// `Duration::ZERO` at the start of every [`Self::run`] call and read
+    /// into the returned [`TrainingResult`] at the end — see that field's
+    /// own doc for the exact boundary and the per-`run`-call reset contract.
+    media_front_end_wall: std::cell::Cell<std::time::Duration>,
     /// Test seam: runs on the gradients every optimizer step is about to
     /// consume, right after `backward` (and, on the GradCache arm, after the
     /// two-pass `gradcache_backward`), keyed by the 1-based index of that
@@ -554,6 +587,7 @@ impl TrainingLoopBuilder {
             artifact_store: self.artifact_store,
             resume: self.resume,
             epoch_checkpoints: Vec::new(),
+            media_front_end_wall: std::cell::Cell::new(std::time::Duration::ZERO),
             #[cfg(test)]
             after_backward: None,
         };
@@ -712,6 +746,12 @@ impl TrainingLoop {
     ///   model, project through LoRA, and compute loss on the projected embeddings.
     /// - Without `base_model`: precomputed tensor batches go directly to loss.
     pub fn run(&mut self, data_loader: &TrainingDataLoader) -> Result<TrainingResult> {
+        // Reset the media front-end accumulator for THIS `run` call — see
+        // `TrainingResult::media_front_end_wall`'s doc: a caller driving
+        // multiple resume legs through separate `run` calls sums this field
+        // across legs itself, it is never carried over from a prior one.
+        self.media_front_end_wall.set(std::time::Duration::ZERO);
+
         // Stamp run-start metrics under the lease guard. The claim already set
         // the status to `running`; this records `started_at` only while this
         // worker still holds the lease (`claimed_by == worker_id AND status =
@@ -1365,6 +1405,7 @@ impl TrainingLoop {
             total_steps: global_step,
             metrics_json,
             epoch_checkpoints: std::mem::take(&mut self.epoch_checkpoints),
+            media_front_end_wall: self.media_front_end_wall.get(),
         })
     }
 
@@ -1792,10 +1833,19 @@ impl TrainingLoop {
             TrainingTarget::ProjectionHead { .. } => {
                 let refs: Vec<&[u8]> = items.iter().map(|c| c.as_slice()).collect();
                 let arr = Arc::new(BinaryArray::from(refs)) as ArrayRef;
-                self.project_frozen_embedding(base, arr, self.task)
+                // The frozen base owns decode/preprocess AND the tower
+                // forward as one combined call here — unlike the
+                // `EncoderAdapters` arm below, this path has no seam between
+                // them to time separately, so the whole call is charged to
+                // `media_front_end_wall` (see that field's own doc).
+                let started = std::time::Instant::now();
+                let out = self.project_frozen_embedding(base, arr, self.task);
+                self.record_media_front_end_wall(started.elapsed());
+                out
             }
             TrainingTarget::EncoderAdapters(state) => {
                 let encoder = &state.encoder;
+                let started = std::time::Instant::now();
                 let input = match self.task {
                     ModelTask::AudioEmbedding => self.audio_encoder_input(base, encoder, items)?,
                     ModelTask::ImageEmbedding => self.image_encoder_input(encoder, items)?,
@@ -1807,10 +1857,24 @@ impl TrainingLoop {
                         )))
                     }
                 };
+                self.record_media_front_end_wall(started.elapsed());
                 encoder
                     .forward_input(&input.as_input())
                     .map_err(|e| JammiError::FineTune(format!("Encoder forward: {e}")))
             }
+        }
+    }
+
+    /// Add `elapsed` to `self.media_front_end_wall` — but only while this
+    /// run is actually training (`self.training_mode`). [`Self::encode_media`]
+    /// is also reached from `evaluate_held_out`'s eval passes
+    /// (`training_mode == false`), which must never pollute the training
+    /// wall this accumulator reports (see
+    /// [`TrainingResult::media_front_end_wall`]'s doc).
+    fn record_media_front_end_wall(&self, elapsed: std::time::Duration) {
+        if self.training_mode {
+            self.media_front_end_wall
+                .set(self.media_front_end_wall.get() + elapsed);
         }
     }
 
@@ -10903,6 +10967,333 @@ mod encoder_adapters_training_state_tests {
              encoder body INTO training mode as a side effect"
         );
         assert!(!loop_.training_mode, "mirror must agree with real state");
+    }
+}
+
+/// #421 P1-b(v): `TrainingResult::media_front_end_wall` is a MEASURED wall,
+/// never derived — these tests exercise the real mechanism (`encode_media`'s
+/// `training_mode` dispatch) rather than asserting on a fabricated number.
+///
+/// Builds a real `TrainingTarget::EncoderAdapters` over the checked-in
+/// `htsat_clap_tiny` cookbook fixture (the same 4-stage HTSAT-Swin CLAP
+/// audio tower `tests/it/tower_adapters.rs`'s `clap_audio_tower_adapter_
+/// trains_and_serves` fine-tunes end-to-end) and a real base model loaded
+/// through the SAME `ModelResolver` + `CandleBackend::load` pair the
+/// production worker path uses — needed here only so `encode_media`'s
+/// `EncoderAdapters` arm has a real `audio_frontend()` (CLAP fusion
+/// front-end geometry) to preprocess through; the base model's own tower
+/// forward is never invoked on this target.
+#[cfg(test)]
+mod media_front_end_wall_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use candle_core::{DType, Device};
+    use candle_nn::VarMap;
+    use jammi_encoders::{AnyEncoder, HtsatAudio, HtsatAudioConfig};
+    use jammi_lora::{AdapterConfig, LoraBuildConfig, LoraInitMode};
+
+    use crate::model::backend::candle::CandleBackend;
+    use crate::model::backend::{DeviceConfig, ModelBackend};
+    use crate::model::resolver::ModelResolver;
+    use crate::model::{LoadedModel, ModelSource, ModelTask};
+
+    use super::super::data::TrainingDataLoader;
+    use super::super::target::{EncoderAdaptersTarget, TrainingTarget};
+    use super::super::FineTuneConfig;
+    use super::{TrainingLoop, TrainingLoopBuilder, TrainingResult};
+
+    /// The `cookbook/fixtures/htsat_clap_tiny` dir (config.json,
+    /// model.safetensors, preprocessor_config.json) — same fixture
+    /// `tests/it/tower_adapters.rs` uses. `CARGO_MANIFEST_DIR` is
+    /// `crates/jammi-ai`; `cookbook/fixtures` sits two levels up, at the
+    /// workspace root.
+    fn htsat_clap_tiny_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("cookbook")
+            .join("fixtures")
+            .join("htsat_clap_tiny")
+    }
+
+    /// The `cookbook/fixtures/tiny_audio_corpus` dir — real WAV bytes a real
+    /// CLAP fusion front end decodes.
+    fn tiny_audio_corpus_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("cookbook")
+            .join("fixtures")
+            .join("tiny_audio_corpus")
+    }
+
+    /// Resolve + load the `htsat_clap_tiny` fixture through the SAME
+    /// `ModelResolver` / `CandleBackend::load` pair the production worker
+    /// path resolves a base model through, on a fresh in-memory catalog —
+    /// no adapter, no network. `ModelTask::AudioEmbedding` is what routes
+    /// `CandleBackend::load` to build `audio` + `audio_frontend`.
+    async fn load_htsat_base_model() -> Arc<LoadedModel> {
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(
+            jammi_db::catalog::Catalog::open(catalog_dir.path())
+                .await
+                .unwrap(),
+        );
+        let store_root = tempfile::tempdir().unwrap().keep();
+        let store_cache = tempfile::tempdir().unwrap().keep();
+        let store = Arc::new(
+            jammi_db::store::ArtifactStore::with_root(
+                jammi_db::storage::StorageUrl::parse(store_root.to_str().unwrap()).unwrap(),
+                jammi_db::storage::StorageRegistry::new(),
+                store_cache,
+            )
+            .unwrap(),
+        );
+        let resolver = ModelResolver::new(catalog, store).unwrap();
+        let resolved = resolver
+            .resolve(
+                &ModelSource::local(htsat_clap_tiny_dir()),
+                ModelTask::AudioEmbedding,
+                None,
+            )
+            .await
+            .expect("htsat_clap_tiny fixture must resolve");
+        let device_config = DeviceConfig {
+            gpu_device: -1,
+            memory_fraction: 1.0,
+            require_gpu: false,
+            compute_precision: jammi_numerics::ComputePrecision::F32,
+        };
+        Arc::new(
+            CandleBackend
+                .load(&resolved, &device_config)
+                .expect("htsat_clap_tiny fixture must load"),
+        )
+    }
+
+    /// Build a real `TrainingTarget::EncoderAdapters` over a freshly built
+    /// `AnyEncoder::Htsat` tower (LoRA injected into `query`/`value`, the
+    /// Swin blocks' attention sites) plus the base model's `audio_frontend`
+    /// — the two pieces `encode_media`'s `EncoderAdapters` arm needs for the
+    /// audio task.
+    fn build_htsat_encoder_adapters_target(device: &Device, varmap: &VarMap) -> TrainingTarget {
+        let fixture = htsat_clap_tiny_dir();
+        let model_config: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(fixture.join("config.json"))
+                .expect("htsat_clap_tiny config.json must be readable"),
+        )
+        .expect("htsat_clap_tiny config.json must parse");
+        let audio_config = HtsatAudioConfig::from_hf_clap_config(&model_config)
+            .expect("htsat_clap_tiny config.json must parse as an HtsatAudioConfig");
+
+        let target_modules = vec!["query".to_string(), "value".to_string()];
+        let empty_ranks = HashMap::new();
+        let lora = LoraBuildConfig {
+            target_modules: &target_modules,
+            layers_to_transform: &None,
+            lora_rank: 4,
+            lora_alpha: 8.0,
+            use_rslora: false,
+            lora_dropout: None,
+            rank_pattern: &empty_ranks,
+            init_mode: LoraInitMode::ZerosB,
+            seed: 7,
+        };
+        let adapter_cfg = AdapterConfig::from_build(
+            "clap_audio_model",
+            &lora,
+            jammi_numerics::ComputePrecision::default(),
+        );
+        let tower = HtsatAudio::builder()
+            .lora(lora)
+            .backbone_dtype(DType::F32)
+            .build(
+                &[&fixture.join("model.safetensors")],
+                &audio_config,
+                device,
+                varmap,
+            )
+            .expect("htsat_clap_tiny fixture must build a real HtsatAudio tower");
+
+        TrainingTarget::EncoderAdapters(Box::new(EncoderAdaptersTarget {
+            encoder: AnyEncoder::Htsat(Box::new(tower)),
+            adapter_cfg,
+        }))
+    }
+
+    /// A one-row media-triplet loader over three distinct real WAV clips
+    /// from `tiny_audio_corpus`.
+    fn one_row_audio_loader() -> TrainingDataLoader {
+        let corpus = tiny_audio_corpus_dir();
+        let read = |name: &str| std::fs::read(corpus.join(name)).expect("fixture clip readable");
+        TrainingDataLoader::from_media_triplets(vec![(
+            read("clip_sine_0.wav"),
+            read("clip_sine_1.wav"),
+            read("clip_harmonic_0.wav"),
+        )])
+    }
+
+    /// A minimal real `TrainingLoop` over the HTSAT `EncoderAdapters` target,
+    /// driven by a data loader that is EITHER precomputed tensors (a text
+    /// run that never touches `encode_media`) or the one-row audio loader
+    /// above, matching the shape `TrainingLoopBuilder`'s own doc calls the
+    /// "production path" (`base_model` + `task` set).
+    async fn minimal_audio_loop(device: &Device, varmap: VarMap) -> TrainingLoop {
+        let target = build_htsat_encoder_adapters_target(device, &varmap);
+        let base_model = load_htsat_base_model().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.keep();
+        let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
+        TrainingLoopBuilder::new(
+            target,
+            varmap,
+            FineTuneConfig {
+                epochs: 1,
+                batch_size: 1,
+                validation_fraction: 0.0,
+                early_stopping_metric: crate::fine_tune::EarlyStoppingMetric::TrainLoss,
+                warmup_steps: 0,
+                ..Default::default()
+            },
+        )
+        .device(device.clone())
+        .base_model(base_model)
+        .task(ModelTask::AudioEmbedding)
+        .job_id("media-front-end-wall-job".into())
+        .worker_id("media-front-end-wall-worker".into())
+        .catalog(catalog)
+        .artifact_dir(dir_path)
+        .build()
+        .unwrap()
+    }
+
+    /// (a) mechanism, end to end through the real `run`: a media
+    /// `EncoderAdapters` run reports a positive `media_front_end_wall`
+    /// strictly under the run's own total wall (the front end is one part
+    /// of a training step, not the whole of it — the tower forward,
+    /// backward, and optimizer step all cost real wall too), and a text run
+    /// over the SAME loop shape reports exactly zero (nothing on the text
+    /// path ever calls `encode_media`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn media_run_reports_a_positive_front_end_wall_under_total_wall_text_run_reports_zero() {
+        let device = Device::Cpu;
+        let mut audio_loop = minimal_audio_loop(&device, VarMap::new()).await;
+        let loader = one_row_audio_loader();
+
+        let started = Instant::now();
+        let result: TrainingResult = tokio::task::spawn_blocking(move || audio_loop.run(&loader))
+            .await
+            .unwrap()
+            .expect("the audio EncoderAdapters run must complete");
+        let total_wall = started.elapsed();
+
+        assert!(
+            result.media_front_end_wall > Duration::ZERO,
+            "a media EncoderAdapters run must report a positive media_front_end_wall"
+        );
+        assert!(
+            result.media_front_end_wall < total_wall,
+            "media_front_end_wall ({:?}) must be strictly under the run's own total wall \
+             ({total_wall:?}) — the tower forward/backward/optimizer step are excluded from \
+             it and must cost real wall too",
+            result.media_front_end_wall
+        );
+
+        // A text run over the SAME target shape (ModernBERT is irrelevant
+        // here — the point is that `encode_media` is never reached by a
+        // precomputed-embedding text batch) reports exactly zero: nothing
+        // touches the accumulator, so it stays at the `Duration::ZERO`
+        // `run` resets it to.
+        use candle_nn::VarBuilder;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let head = crate::fine_tune::lora::build_projection_head(
+            4,
+            &FineTuneConfig::default(),
+            &varmap,
+            &vb,
+        )
+        .unwrap();
+        let text_target = TrainingTarget::ProjectionHead { head };
+        let text_batch = super::super::data::TrainingBatch::Contrastive {
+            embeddings_a: candle_core::Tensor::ones((1, 4), DType::F32, &device).unwrap(),
+            embeddings_b: candle_core::Tensor::ones((1, 4), DType::F32, &device).unwrap(),
+            scores: candle_core::Tensor::new(&[1.0f32], &device).unwrap(),
+        };
+        let text_loader = TrainingDataLoader::from_precomputed(vec![text_batch]);
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(jammi_db::catalog::Catalog::open(dir.path()).await.unwrap());
+        let mut text_loop = TrainingLoopBuilder::new(
+            text_target,
+            varmap,
+            FineTuneConfig {
+                epochs: 1,
+                batch_size: 1,
+                validation_fraction: 0.0,
+                early_stopping_metric: crate::fine_tune::EarlyStoppingMetric::TrainLoss,
+                warmup_steps: 0,
+                ..Default::default()
+            },
+        )
+        .job_id("media-front-end-wall-text-job".into())
+        .worker_id("media-front-end-wall-text-worker".into())
+        .catalog(catalog)
+        .artifact_dir(dir.path().to_path_buf())
+        .build()
+        .unwrap();
+        let text_result = tokio::task::spawn_blocking(move || text_loop.run(&text_loader))
+            .await
+            .unwrap()
+            .expect("the precomputed text run must complete");
+        assert_eq!(
+            text_result.media_front_end_wall,
+            Duration::ZERO,
+            "a text run must never advance media_front_end_wall — nothing on that path \
+             calls encode_media"
+        );
+    }
+
+    /// (b) the dispatch itself, directly: calling `encode_media` with
+    /// `training_mode = false` (the eval state `evaluate_held_out` leaves
+    /// the loop in) must leave the accumulator at zero; flipping to
+    /// `training_mode = true` and calling it again must advance it. This is
+    /// the RED-PROOF for the `if self.training_mode` guard in
+    /// `record_media_front_end_wall` — a version that recorded
+    /// unconditionally would pass test (a) above (which never puts the loop
+    /// in eval mode) but fail here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn encode_media_advances_the_accumulator_only_while_training() {
+        let device = Device::Cpu;
+        let mut loop_ = minimal_audio_loop(&device, VarMap::new()).await;
+        let corpus = tiny_audio_corpus_dir();
+        let clip = std::fs::read(corpus.join("clip_sine_0.wav")).unwrap();
+
+        loop_.set_training(false);
+        assert_eq!(loop_.media_front_end_wall.get(), Duration::ZERO);
+        loop_
+            .encode_media(std::slice::from_ref(&clip))
+            .expect("encode_media must succeed on a real fixture-built loop");
+        assert_eq!(
+            loop_.media_front_end_wall.get(),
+            Duration::ZERO,
+            "encode_media must not advance the accumulator while training_mode is false \
+             (the evaluate_held_out state)"
+        );
+
+        loop_.set_training(true);
+        loop_
+            .encode_media(&[clip])
+            .expect("encode_media must succeed on a real fixture-built loop");
+        assert!(
+            loop_.media_front_end_wall.get() > Duration::ZERO,
+            "encode_media must advance the accumulator once training_mode is true"
+        );
     }
 }
 

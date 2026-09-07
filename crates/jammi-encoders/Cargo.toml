@@ -28,6 +28,14 @@ jammi-lora = { workspace = true, features = ["candle"] }
 # -legal trait impl cannot exist anywhere but `jammi-numerics` or `candle`
 # itself, and `jammi-numerics` must stay candle-free).
 jammi-numerics.workspace = true
+# `half::f16::MIN` / `half::bf16::MIN` — the dtype-following additive-mask
+# sentinels (`clip_text::dtype_min_sentinel`). candle-core 0.11 does NOT
+# re-export `half`, and these two constants are the whole reason a mask
+# built for an F16/BF16 backbone is a large finite number rather than the
+# `-inf` an `f32::MIN` cast would produce. A REGULAR dependency, not a
+# dev-dependency: the mask sentinels are shipped library code, not test
+# scaffolding.
+half.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -35,7 +43,10 @@ thiserror.workspace = true
 [dev-dependencies]
 candle-transformers.workspace = true
 hf-hub.workspace = true
-half.workspace = true
+# NO `half` here: it is a regular dependency above (the dtype-following mask
+# sentinels), and a `[dependencies]` entry is already visible to tests,
+# benches and examples. A duplicate `[dev-dependencies]` line only invites
+# the two to drift apart on features or version.
 serde_json.workspace = true
 tempfile = "3"
 

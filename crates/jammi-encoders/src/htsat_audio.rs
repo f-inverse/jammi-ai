@@ -24,14 +24,19 @@
 //! `audio_projection.*`, a sibling of `audio_model`. [`HtsatAudio::load`] takes
 //! the safetensors root and wires both.
 
-use candle_core::{IndexOp, Module, ModuleT, Tensor, D};
+use std::collections::HashMap;
+use std::path::Path;
+
+use candle_core::{DType, Device, IndexOp, Module, ModuleT, Tensor, D};
 use candle_nn::{
     batch_norm, conv2d, linear, linear_no_bias, BatchNorm, BatchNormConfig, Conv2d, Conv2dConfig,
-    Linear, VarBuilder,
+    VarBuilder, VarMap,
 };
+use jammi_lora::{FrozenBase, LoraBuildConfig, MaybeLoraLinear};
 
 use crate::error::EncoderError;
 use crate::layer_norm::LayerNorm;
+use crate::lora_site::{FrozenSiteHolder, LoraSite};
 
 /// Architecture configuration for the HTSAT-Swin CLAP audio tower, deserialized
 /// from a HuggingFace `ClapAudioConfig` (`config.json` or the `audio_config`
@@ -223,7 +228,15 @@ impl TimeInterp {
         }
         // out[b,c,o,f] = sum_i W[o,i] x[b,c,i,f], W = [out_len, T] built for this
         // input length. Move time to the second-last axis, contract with W^T.
-        let weights = Self::build_matrix(self.out_len, t, &self.device)?;
+        //
+        // The tap weights are computed in f32 in ATen's exact operation
+        // order (see this type's own doc — building them in f64 instead
+        // drifts the result ~2e-4 from the reference), then cast ONCE to
+        // `x`'s dtype so a reduced-precision backbone's matmul sees matching
+        // operands. For an F32 backbone that cast is `self.clone()`
+        // (candle's same-dtype early return): the f32 path's bits are
+        // unchanged.
+        let weights = Self::build_matrix(self.out_len, t, &self.device)?.to_dtype(x.dtype())?;
         // [B, C, T, F] -> [B, C, F, T] -> [B*C*F, T]
         let xt = x.transpose(2, 3)?.contiguous()?.reshape((b * c * f, t))?;
         // [B*C*F, T] @ [T, out_len] = [B*C*F, out_len]
@@ -552,7 +565,13 @@ impl HtsatPatchEmbed {
             .iter()
             .map(|&b| if b { 1.0 } else { 0.0 })
             .collect();
-        let mask = Tensor::from_vec(mask, (batch, 1, 1, 1), global.device())?;
+        // Built in the GLOBAL path's own dtype so a reduced-precision
+        // backbone can `broadcast_mul` it without a dtype mismatch. `0.0`
+        // and `1.0` are exact in every floating dtype, and for an F32
+        // backbone `to_dtype` is `self.clone()` (candle's same-dtype early
+        // return), so this tensor's bits are unchanged there.
+        let mask =
+            Tensor::from_vec(mask, (batch, 1, 1, 1), global.device())?.to_dtype(global.dtype())?;
         let patch_map = mask
             .broadcast_mul(&fused)?
             .add(&(1.0 - &mask)?.broadcast_mul(&global)?)?;
@@ -584,12 +603,65 @@ fn window_reverse(x: &Tensor, ws: usize, h: usize, w: usize) -> Result<Tensor, E
     Ok(x.reshape((x.dim(0)?, h, w, c))?)
 }
 
+/// The six per-block LoRA-wrappable sites, plus the two unindexed
+/// projection-head ones and the stage downsample. Each name is the leaf the
+/// HF CLAP checkpoint itself uses (`attention.self.query` →
+/// [`QUERY_SITE`], `attention.output.dense` → [`ATTENTION_OUTPUT_SITE`],
+/// `intermediate.dense` → [`INTERMEDIATE_DENSE_SITE`], `output.dense` →
+/// [`OUTPUT_DENSE_SITE`]) collapsed to the BERT-family site-name convention
+/// this workspace already uses for the same six roles — so a caller writes
+/// the same `target_modules` string against either family.
+const QUERY_SITE: &str = "query";
+/// See [`QUERY_SITE`].
+const KEY_SITE: &str = "key";
+/// See [`QUERY_SITE`].
+const VALUE_SITE: &str = "value";
+/// See [`QUERY_SITE`].
+const ATTENTION_OUTPUT_SITE: &str = "attention_output";
+/// See [`QUERY_SITE`].
+const INTERMEDIATE_DENSE_SITE: &str = "intermediate_dense";
+/// See [`QUERY_SITE`].
+const OUTPUT_DENSE_SITE: &str = "output_dense";
+/// The patch-merging downsample's `4C → 2C` linear (`layers.{s}.downsample.
+/// reduction` in the checkpoint). Bias-free.
+const REDUCTION_SITE: &str = "reduction";
+/// The audio projection head's two linears (`audio_projection.linear{1,2}`)
+/// — UNINDEXED sites: they belong to no Swin stage, so their
+/// `LoraSite::layer_idx` is `None`.
+const LINEAR1_SITE: &str = "linear1";
+/// See [`LINEAR1_SITE`].
+const LINEAR2_SITE: &str = "linear2";
+
+/// The selector names a caller may write in `target_modules` to reach this
+/// tower's LoRA sites — the nine constants above, in the order the
+/// traversals visit them (the six per-block roles, then the stage
+/// downsample, then the two unindexed projection-head linears).
+///
+/// Built from the constants themselves, so it cannot drift from the names
+/// the sites are actually wrapped under; `AnyEncoder::lora_site_names`
+/// returns it, and a test asserts every entry selects at least one real
+/// site on a fixture while the union of all of them is exactly what
+/// `all-linear` selects. Two of these are UNINDEXED head sites, so an
+/// active `layers_to_transform` filter refuses them — see
+/// [`jammi_lora::should_apply_lora`]'s own doc.
+pub(crate) const LORA_SITE_NAMES: &[&str] = &[
+    QUERY_SITE,
+    KEY_SITE,
+    VALUE_SITE,
+    ATTENTION_OUTPUT_SITE,
+    INTERMEDIATE_DENSE_SITE,
+    OUTPUT_DENSE_SITE,
+    REDUCTION_SITE,
+    LINEAR1_SITE,
+    LINEAR2_SITE,
+];
+
 /// Self-attention inside a Swin window (W-MSA / SW-MSA), with the recomputed
 /// relative-position bias and an optional precomputed shift-window mask.
 struct SwinSelfAttention {
-    query: Linear,
-    key: Linear,
-    value: Linear,
+    query: MaybeLoraLinear,
+    key: MaybeLoraLinear,
+    value: MaybeLoraLinear,
     /// `[(2·ws−1)², num_heads]` learned relative-position bias table, sized by
     /// the config window (HF sizes the table by `config.window_size`, not the
     /// block's effective window).
@@ -613,10 +685,19 @@ impl SwinSelfAttention {
     /// window. (Token count per window equals the effective window squared, which
     /// coincides with `ws·ws` in every reachable config since the deepest stage's
     /// grid equals the window.)
-    fn load(vb: VarBuilder, dim: usize, num_heads: usize, ws: usize) -> Result<Self, EncoderError> {
-        let query = linear(dim, dim, vb.pp("query"))?;
-        let key = linear(dim, dim, vb.pp("key"))?;
-        let value = linear(dim, dim, vb.pp("value"))?;
+    fn load_with(
+        vb: VarBuilder,
+        dim: usize,
+        num_heads: usize,
+        ws: usize,
+        site: &LoraSite<'_>,
+    ) -> Result<Self, EncoderError> {
+        let query = linear(dim, dim, vb.pp(QUERY_SITE))?;
+        let key = linear(dim, dim, vb.pp(KEY_SITE))?;
+        let value = linear(dim, dim, vb.pp(VALUE_SITE))?;
+        let query = site.wrap(FrozenBase::Dense(query), QUERY_SITE, QUERY_SITE)?;
+        let key = site.wrap(FrozenBase::Dense(key), KEY_SITE, KEY_SITE)?;
+        let value = site.wrap(FrozenBase::Dense(value), VALUE_SITE, VALUE_SITE)?;
         let table_rows = (2 * ws - 1) * (2 * ws - 1);
         let rel_bias_table = vb.get((table_rows, num_heads), "relative_position_bias_table")?;
         let rel_index = Self::build_rel_index(ws, vb.device())?;
@@ -734,8 +815,29 @@ impl SwinSelfAttention {
         Ok(ctx)
     }
 
+    /// Propagates to the softmax arm AND to the three QKV LoRA sites
+    /// (whose dropout is training-gated).
     fn set_training(&mut self, training: bool) {
         self.training = training;
+        for (_, lin) in self.lora_sites_mut() {
+            lin.set_training(training);
+        }
+    }
+
+    fn lora_sites(&self) -> [(&'static str, &MaybeLoraLinear); 3] {
+        [
+            (QUERY_SITE, &self.query),
+            (KEY_SITE, &self.key),
+            (VALUE_SITE, &self.value),
+        ]
+    }
+
+    fn lora_sites_mut(&mut self) -> [(&'static str, &mut MaybeLoraLinear); 3] {
+        [
+            (QUERY_SITE, &mut self.query),
+            (KEY_SITE, &mut self.key),
+            (VALUE_SITE, &mut self.value),
+        ]
     }
 }
 
@@ -743,10 +845,10 @@ impl SwinSelfAttention {
 struct SwinBlock {
     layernorm_before: LayerNorm,
     attention: SwinSelfAttention,
-    attention_output: Linear,
+    attention_output: MaybeLoraLinear,
     layernorm_after: LayerNorm,
-    intermediate: Linear,
-    output: Linear,
+    intermediate: MaybeLoraLinear,
+    output: MaybeLoraLinear,
     /// `(height, width)` patch resolution this block operates on.
     input_resolution: (usize, usize),
     /// Cyclic shift (0 for W-MSA, window/2 for SW-MSA; forced 0 when the grid is
@@ -758,31 +860,68 @@ struct SwinBlock {
     attn_mask: Option<Tensor>,
 }
 
+/// The three load-time values EVERY level of this tower's loader threads
+/// unchanged from the root down to an individual Swin block, bundled so each
+/// signature carries one context instead of three parallel arguments that a
+/// call site could reorder (`config`/`device` are both references; a swapped
+/// pair of same-shaped arguments is exactly the class a bundle removes).
+///
+/// `mask_dtype` is NOT re-derivable from `vb` at every level and is not the
+/// same thing as "whatever dtype this `VarBuilder` happens to hand back": it
+/// is the FROZEN BACKBONE dtype every load-time shift-window mask is
+/// materialised in, so the forward path never casts one. An additive
+/// attention mask must be representable in the dtype the scores are computed
+/// in — see `crate::clip_text::dtype_min_sentinel` for the same family-D
+/// argument on the CLIP side.
+#[derive(Clone, Copy)]
+struct HtsatLoadCtx<'a> {
+    config: &'a HtsatAudioConfig,
+    device: &'a candle_core::Device,
+    mask_dtype: DType,
+}
+
 impl SwinBlock {
-    fn load(
+    fn load_with(
         vb: VarBuilder,
-        config: &HtsatAudioConfig,
+        ctx: HtsatLoadCtx<'_>,
         dim: usize,
         num_heads: usize,
         input_resolution: (usize, usize),
         block_index: usize,
-        device: &candle_core::Device,
+        site: &LoraSite<'_>,
     ) -> Result<Self, EncoderError> {
+        let config = ctx.config;
         let eps = config.layer_norm_eps;
         // `with_bias=true`: no `remove_mean=false` variant exists in this
         // config — see `HtsatPatchEmbed::load`'s note on the same class.
         let layernorm_before = LayerNorm::new(dim, eps, true, vb.pp("layernorm_before"))?;
-        let attention = SwinSelfAttention::load(
+        let attention = SwinSelfAttention::load_with(
             vb.pp("attention").pp("self"),
             dim,
             num_heads,
             config.window_size,
+            site,
         )?;
         let attention_output = linear(dim, dim, vb.pp("attention").pp("output").pp("dense"))?;
+        let attention_output = site.wrap(
+            FrozenBase::Dense(attention_output),
+            ATTENTION_OUTPUT_SITE,
+            ATTENTION_OUTPUT_SITE,
+        )?;
         let layernorm_after = LayerNorm::new(dim, eps, true, vb.pp("layernorm_after"))?;
         let inter = (config.mlp_ratio * dim as f64) as usize;
         let intermediate = linear(dim, inter, vb.pp("intermediate").pp("dense"))?;
+        let intermediate = site.wrap(
+            FrozenBase::Dense(intermediate),
+            INTERMEDIATE_DENSE_SITE,
+            INTERMEDIATE_DENSE_SITE,
+        )?;
         let output = linear(inter, dim, vb.pp("output").pp("dense"))?;
+        let output = site.wrap(
+            FrozenBase::Dense(output),
+            OUTPUT_DENSE_SITE,
+            OUTPUT_DENSE_SITE,
+        )?;
 
         // set_shift_and_window_size: window/2 for odd blocks, forced 0 (with the
         // window clamped to the grid) when the grid is no larger than the window.
@@ -803,7 +942,8 @@ impl SwinBlock {
                 input_resolution.1,
                 window_size,
                 shift_size,
-                device,
+                ctx.device,
+                ctx.mask_dtype,
             )?)
         } else {
             None
@@ -823,13 +963,28 @@ impl SwinBlock {
         })
     }
 
-    /// Build the SW-MSA attention mask `[nW, L, L]` from the 9-region label map.
+    /// Build the SW-MSA attention mask `[nW, L, L]` from the 9-region label
+    /// map, in `dtype` — the frozen backbone's own dtype, built ONCE at load
+    /// so no forward ever casts it.
+    ///
+    /// # The `-100.0` magnitude is HF parity, not a free parameter
+    ///
+    /// This is the value HF's `ClapAudioLayer` itself adds across a
+    /// disallowed shift-window row, and `exp(-100) ≈ 3.7e-44` is a
+    /// DENORMAL in f32 — output-affecting, so it must not be "improved" to
+    /// a dtype minimum the way `crate::clip_text`'s causal sentinel is.
+    /// `-100.0` is exactly representable in F32, F16 and BF16 alike (it is
+    /// `-1.5625 × 2^6`, well inside every one of their normal ranges), so
+    /// casting the f32-built tensor with `to_dtype` is exact in all three
+    /// — and for F32 that cast is `self.clone()` (candle's same-dtype early
+    /// return), keeping this tensor byte-for-byte what it has always been.
     fn build_attn_mask(
         h: usize,
         w: usize,
         ws: usize,
         shift: usize,
         device: &candle_core::Device,
+        dtype: DType,
     ) -> Result<Tensor, EncoderError> {
         // img_mask[1, H, W, 1] labelled by the 3×3 slice regions.
         let region = |i: usize, len: usize| -> usize {
@@ -858,7 +1013,7 @@ impl SwinBlock {
         let diff = a.broadcast_sub(&b)?; // [nW, L, L]
                                          // (diff != 0) * -100.0
         let mask = (diff.ne(0f32)?.to_dtype(candle_core::DType::F32)? * -100.0)?;
-        Ok(mask)
+        Ok(mask.to_dtype(dtype)?)
     }
 
     fn forward(&self, hidden: &Tensor) -> Result<Tensor, EncoderError> {
@@ -911,10 +1066,48 @@ impl SwinBlock {
         Ok((&hidden + y)?)
     }
 
+    /// Propagates to the attention module (softmax arm + its three QKV LoRA
+    /// sites), both LayerNorms, and this block's own three LoRA sites.
     fn set_training(&mut self, training: bool) {
         self.attention.set_training(training);
         self.layernorm_before.set_training(training);
         self.layernorm_after.set_training(training);
+        for lin in [
+            &mut self.attention_output,
+            &mut self.intermediate,
+            &mut self.output,
+        ] {
+            lin.set_training(training);
+        }
+    }
+
+    /// This block's six LoRA sites paired with their names — the single
+    /// source of the site→name map every [`HtsatAudio`] traversal walks.
+    /// Fixed order: the three QKV projections, then the attention output,
+    /// then the two MLP linears.
+    fn lora_sites(&self) -> [(&'static str, &MaybeLoraLinear); 6] {
+        let [query, key, value] = self.attention.lora_sites();
+        [
+            query,
+            key,
+            value,
+            (ATTENTION_OUTPUT_SITE, &self.attention_output),
+            (INTERMEDIATE_DENSE_SITE, &self.intermediate),
+            (OUTPUT_DENSE_SITE, &self.output),
+        ]
+    }
+
+    /// The `&mut` twin of `Self::lora_sites`, same names, same order.
+    fn lora_sites_mut(&mut self) -> [(&'static str, &mut MaybeLoraLinear); 6] {
+        let [query, key, value] = self.attention.lora_sites_mut();
+        [
+            query,
+            key,
+            value,
+            (ATTENTION_OUTPUT_SITE, &mut self.attention_output),
+            (INTERMEDIATE_DENSE_SITE, &mut self.intermediate),
+            (OUTPUT_DENSE_SITE, &mut self.output),
+        ]
     }
 }
 
@@ -922,21 +1115,26 @@ impl SwinBlock {
 /// linear over the concatenated `2×2` neighbourhood.
 struct PatchMerging {
     norm: LayerNorm,
-    reduction: Linear,
+    reduction: MaybeLoraLinear,
     input_resolution: (usize, usize),
 }
 
 impl PatchMerging {
-    fn load(
+    fn load_with(
         vb: VarBuilder,
         config: &HtsatAudioConfig,
         dim: usize,
         input_resolution: (usize, usize),
+        site: &LoraSite<'_>,
     ) -> Result<Self, EncoderError> {
         // `with_bias=true`: no `remove_mean=false` variant exists in this
         // config — see `HtsatPatchEmbed::load`'s note on the same class.
         let norm = LayerNorm::new(4 * dim, config.layer_norm_eps, true, vb.pp("norm"))?;
-        let reduction = linear_no_bias(4 * dim, 2 * dim, vb.pp("reduction"))?;
+        // BIAS-FREE (`linear_no_bias`), unlike every other site in this
+        // tower — `jammi_lora`'s `bias_gate` returns `Ok(None)` for a
+        // bias-free base, so this site wraps exactly like the others.
+        let reduction = linear_no_bias(4 * dim, 2 * dim, vb.pp(REDUCTION_SITE))?;
+        let reduction = site.wrap(FrozenBase::Dense(reduction), REDUCTION_SITE, REDUCTION_SITE)?;
         Ok(Self {
             norm,
             reduction,
@@ -946,6 +1144,7 @@ impl PatchMerging {
 
     fn set_training(&mut self, training: bool) {
         self.norm.set_training(training);
+        self.reduction.set_training(training);
     }
 
     fn forward(&self, hidden: &Tensor) -> Result<Tensor, EncoderError> {
@@ -975,36 +1174,57 @@ struct SwinStage {
 }
 
 impl SwinStage {
+    /// `site_for` yields the [`LoraSite`] for block `b` of THIS stage: its
+    /// `lora_vb` is scoped to `layers.{s}.blocks.{b}` and its `layer_idx` is
+    /// `Some(s)` — the STAGE index, not the block index. That is PEFT's own
+    /// rule: `check_target_module_exists`
+    /// (`peft/src/peft/tuners/tuners_utils.py:2353-2389`) matches the FIRST
+    /// numbered segment of the key (`re.match(r".*?\.[^.]*\.(?P<idx>\d+)\.")`),
+    /// which for `layers.{s}.blocks.{b}.…` is `s`. `downsample_site` is the
+    /// stage's own patch-merging site (subpath `layers.{s}.downsample`, same
+    /// stage index).
+    ///
+    /// Still `#[allow(clippy::too_many_arguments)]` after the
+    /// [`HtsatLoadCtx`] bundle absorbed `config`/`device`/`mask_dtype`: the
+    /// five that remain (`dim`, `num_heads`, `depth`, `input_resolution`,
+    /// `has_downsample`) are the stage's own GEOMETRY, each derived
+    /// differently from the stage index by the caller
+    /// (`patch_embeds_hidden_size << i`, `num_attention_heads[i]`,
+    /// `depths[i]`, `grid >> i`, `i < num_stages - 1`). Bundling them would
+    /// only move that derivation behind a constructor with the same five
+    /// fields, not remove a single one.
     #[allow(clippy::too_many_arguments)]
-    fn load(
+    fn load_with<'a>(
         vb: VarBuilder,
-        config: &HtsatAudioConfig,
+        ctx: HtsatLoadCtx<'_>,
         dim: usize,
         num_heads: usize,
         depth: usize,
         input_resolution: (usize, usize),
         has_downsample: bool,
-        device: &candle_core::Device,
+        site_for: &dyn Fn(usize) -> LoraSite<'a>,
+        downsample_site: &LoraSite<'_>,
     ) -> Result<Self, EncoderError> {
         let blocks_vb = vb.pp("blocks");
         let mut blocks = Vec::with_capacity(depth);
         for i in 0..depth {
-            blocks.push(SwinBlock::load(
+            blocks.push(SwinBlock::load_with(
                 blocks_vb.pp(i),
-                config,
+                ctx,
                 dim,
                 num_heads,
                 input_resolution,
                 i,
-                device,
+                &site_for(i),
             )?);
         }
         let downsample = if has_downsample {
-            Some(PatchMerging::load(
+            Some(PatchMerging::load_with(
                 vb.pp("downsample"),
-                config,
+                ctx.config,
                 dim,
                 input_resolution,
+                downsample_site,
             )?)
         } else {
             None
@@ -1062,13 +1282,50 @@ pub struct FrontHalf {
 }
 
 impl HtsatAudioEncoder {
+    /// Dtype the frozen backbone weights are materialised at, read off the
+    /// patch-embedding `proj` convolution kernel — the first WEIGHT any
+    /// input meets after the batch-norm, and one that exists in every HTSAT
+    /// checkpoint.
+    pub fn dtype(&self) -> DType {
+        self.patch_embed.proj.weight().dtype()
+    }
+
     /// Build the front-half encoder from an `audio_encoder`-scoped
-    /// [`VarBuilder`] (i.e. `root.pp("audio_model").pp("audio_encoder")`).
+    /// [`VarBuilder`] (i.e. `root.pp("audio_model").pp("audio_encoder")`),
+    /// fully frozen. Routed through `Self::load_with` with a
+    /// decline-everything site, so there is one loader (see
+    /// `crate::lora_site::FrozenSiteHolder`).
     pub fn load(
         vb: VarBuilder,
         config: &HtsatAudioConfig,
         device: &candle_core::Device,
     ) -> Result<Self, EncoderError> {
+        let holder = FrozenSiteHolder::new();
+        let ctx = HtsatLoadCtx {
+            config,
+            device,
+            mask_dtype: vb.dtype(),
+        };
+        Self::load_with(vb.clone(), ctx, &|_s, _b| holder.site(&vb), &|_s| {
+            holder.site(&vb)
+        })
+    }
+
+    /// The one loader. `block_site(stage, block)` yields the [`LoraSite`]
+    /// for that Swin block and `downsample_site(stage)` the one for that
+    /// stage's patch-merging downsample — two closures rather than one with
+    /// a sentinel index, because a downsample genuinely has no block index
+    /// (both carry `layer_idx == Some(stage)`; see [`SwinStage::load_with`]'s
+    /// doc for the PEFT rule that makes the STAGE the index). `ctx` carries
+    /// the config, device and the dtype every load-time shift-window mask is
+    /// materialised in (see [`HtsatLoadCtx`]).
+    fn load_with<'a>(
+        vb: VarBuilder,
+        ctx: HtsatLoadCtx<'_>,
+        block_site: &dyn Fn(usize, usize) -> LoraSite<'a>,
+        downsample_site: &dyn Fn(usize) -> LoraSite<'a>,
+    ) -> Result<Self, EncoderError> {
+        let HtsatLoadCtx { config, device, .. } = ctx;
         let bn_cfg = BatchNormConfig {
             eps: config.layer_norm_eps,
             ..Default::default()
@@ -1090,15 +1347,16 @@ impl HtsatAudioEncoder {
         for i in 0..num_stages {
             let dim = config.patch_embeds_hidden_size << i;
             let input_resolution = (grid.0 >> i, grid.1 >> i);
-            stages.push(SwinStage::load(
+            stages.push(SwinStage::load_with(
                 layers_vb.pp(i),
-                config,
+                ctx,
                 dim,
                 config.num_attention_heads[i],
                 config.depths[i],
                 input_resolution,
                 i < num_stages - 1,
-                device,
+                &|b| block_site(i, b),
+                &downsample_site(i),
             )?);
         }
         // `with_bias=true`: no `remove_mean=false` variant exists in this
@@ -1137,11 +1395,29 @@ impl HtsatAudioEncoder {
     /// Run the front half on `input_features` `[B, 4, T, num_mel_bins]` (any T),
     /// capturing every gated boundary. `is_longer` gates the per-sample fusion in
     /// the patch embedding (`true` → AFF blend, `false` → global patch-conv only).
+    ///
+    /// # Input-dtype domain: cast at the seam
+    ///
+    /// `input_features` may arrive in ANY floating dtype. This method is
+    /// the tower's whole floating-input edge — the leading `BatchNorm` and
+    /// the patch-embedding `Conv2d` are the first weights a fusion
+    /// spectrogram meets, and neither promotes a mismatched input the way
+    /// a dense linear does (an F32 batch against an F16 backbone is a hard
+    /// `dtype mismatch in sub` inside the batch-norm centring). Every
+    /// production front end (decode → resample → log-mel →
+    /// `Tensor::from_vec` of `f32`) emits F32, so casting here — the one
+    /// place that knows
+    /// [`Self::dtype`] — is what lets an F16 backbone consume the only
+    /// batch a caller actually has. `Tensor::to_dtype` on the SAME dtype is
+    /// `self.clone()`, so an already-matching (F32-on-F32) batch takes a
+    /// byte-identical path: a widening of the accepted input domain, never
+    /// a change to any output bit.
     pub fn forward_front(
         &self,
         input_features: &Tensor,
         is_longer: &[bool],
     ) -> Result<FrontHalf, EncoderError> {
+        let input_features = input_features.to_dtype(self.dtype())?;
         // transpose(1,3) -> [B, freq, time, 4]; batch-norm over the freq axis
         // (now channel dim 1); transpose back.
         let x = input_features.transpose(1, 3)?.contiguous()?;
@@ -1295,26 +1571,60 @@ pub struct Spine {
 
 /// The CLAP audio projection head: `linear1 → act → linear2`, then L2-normalize.
 pub struct ClapAudioProjection {
-    linear1: Linear,
-    linear2: Linear,
+    linear1: MaybeLoraLinear,
+    linear2: MaybeLoraLinear,
     act: String,
 }
 
 impl ClapAudioProjection {
     /// Build from a root-scoped [`VarBuilder`] (projection lives at
-    /// `audio_projection.*`, a sibling of `audio_model`).
+    /// `audio_projection.*`, a sibling of `audio_model`), fully frozen.
     pub fn load(vb: VarBuilder, config: &HtsatAudioConfig) -> Result<Self, EncoderError> {
-        let linear1 = linear(config.hidden_size, config.projection_dim, vb.pp("linear1"))?;
+        let holder = FrozenSiteHolder::new();
+        Self::load_with(vb.clone(), config, &holder.site(&vb))
+    }
+
+    /// The one loader. `site`'s `layer_idx` is `None`: this head belongs to
+    /// no Swin stage, so an active `layers_to_transform` filter can never
+    /// select it (`jammi_lora::should_apply_lora`'s own doc — PEFT's rule
+    /// for a key with no numbered segment).
+    fn load_with(
+        vb: VarBuilder,
+        config: &HtsatAudioConfig,
+        site: &LoraSite<'_>,
+    ) -> Result<Self, EncoderError> {
+        let linear1 = linear(
+            config.hidden_size,
+            config.projection_dim,
+            vb.pp(LINEAR1_SITE),
+        )?;
         let linear2 = linear(
             config.projection_dim,
             config.projection_dim,
-            vb.pp("linear2"),
+            vb.pp(LINEAR2_SITE),
         )?;
         Ok(Self {
-            linear1,
-            linear2,
+            linear1: site.wrap(FrozenBase::Dense(linear1), LINEAR1_SITE, LINEAR1_SITE)?,
+            linear2: site.wrap(FrozenBase::Dense(linear2), LINEAR2_SITE, LINEAR2_SITE)?,
             act: config.projection_hidden_act.clone(),
         })
+    }
+
+    fn lora_sites(&self) -> [(&'static str, &MaybeLoraLinear); 2] {
+        [(LINEAR1_SITE, &self.linear1), (LINEAR2_SITE, &self.linear2)]
+    }
+
+    fn lora_sites_mut(&mut self) -> [(&'static str, &mut MaybeLoraLinear); 2] {
+        [
+            (LINEAR1_SITE, &mut self.linear1),
+            (LINEAR2_SITE, &mut self.linear2),
+        ]
+    }
+
+    fn set_training(&mut self, training: bool) {
+        for (_, lin) in self.lora_sites_mut() {
+            lin.set_training(training);
+        }
     }
 
     /// Project `[B, hidden_size]` to the unnormalized latent `[B, projection_dim]`.
@@ -1351,24 +1661,73 @@ pub struct HtsatAudio {
     projection: ClapAudioProjection,
     projection_dim: usize,
     num_mel_bins: usize,
+    /// Wired through [`Self::set_training`]; read by [`Self::is_training`].
+    training: bool,
 }
 
 impl HtsatAudio {
+    /// Start a builder with default settings: frozen LoRA config, F32
+    /// backbone dtype, no adapter file. See [`HtsatAudioBuilder`].
+    pub fn builder() -> HtsatAudioBuilder<'static> {
+        HtsatAudioBuilder {
+            lora: LoraBuildConfig::frozen(),
+            backbone_dtype: DType::F32,
+            adapter_file: None,
+        }
+    }
+
     /// Build the full tower from a root-scoped [`VarBuilder`] (the safetensors
-    /// root holding both `audio_model` and `audio_projection`).
+    /// root holding both `audio_model` and `audio_projection`), fully frozen.
+    ///
+    /// Routed through the SAME `Self::load_with` the builder uses, with a
+    /// decline-everything site, so `builder().lora(frozen()).build(..)` is
+    /// bit-identical (asserted by
+    /// `tests::builder_frozen_output_bits_equal_load`).
     pub fn load(
         vb: VarBuilder,
         config: &HtsatAudioConfig,
         device: &candle_core::Device,
     ) -> Result<Self, EncoderError> {
-        let encoder =
-            HtsatAudioEncoder::load(vb.pp("audio_model").pp("audio_encoder"), config, device)?;
-        let projection = ClapAudioProjection::load(vb.pp("audio_projection"), config)?;
+        let holder = FrozenSiteHolder::new();
+        let ctx = HtsatLoadCtx {
+            config,
+            device,
+            mask_dtype: vb.dtype(),
+        };
+        Self::load_with(
+            vb.clone(),
+            ctx,
+            &|_s, _b| holder.site(&vb),
+            &|_s| holder.site(&vb),
+            &holder.site(&vb),
+        )
+    }
+
+    /// The one loader — see [`HtsatAudioEncoder::load_with`] for the two
+    /// stage-scoped site closures; `projection_site` is the UNINDEXED
+    /// (`layer_idx == None`) site for the `audio_projection.*` head.
+    fn load_with<'a>(
+        vb: VarBuilder,
+        ctx: HtsatLoadCtx<'_>,
+        block_site: &dyn Fn(usize, usize) -> LoraSite<'a>,
+        downsample_site: &dyn Fn(usize) -> LoraSite<'a>,
+        projection_site: &LoraSite<'_>,
+    ) -> Result<Self, EncoderError> {
+        let config = ctx.config;
+        let encoder = HtsatAudioEncoder::load_with(
+            vb.pp("audio_model").pp("audio_encoder"),
+            ctx,
+            block_site,
+            downsample_site,
+        )?;
+        let projection =
+            ClapAudioProjection::load_with(vb.pp("audio_projection"), config, projection_site)?;
         Ok(Self {
             encoder,
             projection,
             projection_dim: config.projection_dim,
             num_mel_bins: config.num_mel_bins,
+            training: false,
         })
     }
 
@@ -1380,6 +1739,25 @@ impl HtsatAudio {
     /// Number of mel bins the input fusion spectrogram must carry.
     pub fn num_mel_bins(&self) -> usize {
         self.num_mel_bins
+    }
+
+    /// Dtype the FROZEN BACKBONE weights are materialised at — read off a
+    /// real weight (the patch-embedding `proj` convolution kernel, via
+    /// [`HtsatAudioEncoder::dtype`]), never a remembered builder setting,
+    /// so it stays true for a tower built through `load` from an arbitrary
+    /// `VarBuilder` as well as one built through the builder's
+    /// `backbone_dtype`.
+    ///
+    /// This is the dtype [`HtsatAudioEncoder::forward_front`] casts its
+    /// input TO, and the dtype of the embedding [`Self::forward`] returns.
+    /// It is NOT a precondition on the input: this tower's front half is a
+    /// `BatchNorm` followed by a `Conv2d`, and neither promotes its input
+    /// the way `jammi_lora::FrozenBase::Dense` does, which is exactly why
+    /// the cast lives at that one seam rather than in every caller. A
+    /// caller that MANUFACTURES a floating input (a probe batch, a warm-up)
+    /// can still read it here to build one that needs no cast at all.
+    pub fn dtype(&self) -> DType {
+        self.encoder.dtype()
     }
 
     /// Borrow the underlying encoder (for boundary-level parity checks).
@@ -1398,13 +1776,141 @@ impl HtsatAudio {
     /// output is unaffected either way; only backward through this tower's
     /// gradient (most visibly `rel_bias_table`, which otherwise gets no
     /// gradient at all) is correct in training mode.
+    /// Also propagates to every LoRA site (Swin blocks, patch-merging
+    /// downsamples, and the projection head) so their dropout is gated.
+    ///
+    /// The tower's `BatchNorm` deliberately does NOT change: it stays on
+    /// `forward_t(x, false)` — eval statistics — even at `training == true`
+    /// (`HtsatAudioEncoder::forward_front`). HF's own HTSAT pins it the
+    /// same way, and a LoRA fine-tune leaves the backbone frozen, so
+    /// recomputing batch statistics from a fine-tuning batch would silently
+    /// change the frozen base's own numerics. Asserted by
+    /// `tests::batch_norm_stays_on_eval_statistics_under_set_training`.
     pub fn set_training(&mut self, training: bool) {
+        self.training = training;
         self.encoder.set_training(training);
+        self.projection.set_training(training);
     }
 
-    /// Full forward on `input_features` `[B, 4, T, num_mel_bins]` (any T), with
-    /// the per-sample `is_longer` fusion gate, returning the L2-normalized audio
-    /// embedding `[B, projection_dim]`.
+    /// Whether [`Self::set_training`] last set training mode. `false` from
+    /// every constructor.
+    pub fn is_training(&self) -> bool {
+        self.training
+    }
+
+    /// Every LoRA site in the tower paired with its adapter key prefix, in
+    /// one fixed traversal order — the single source
+    /// [`Self::trainable_params`], [`Self::named_trainable_weights`],
+    /// [`Self::dropout_positions`] and [`Self::restore_dropout_positions`]
+    /// all walk, so a key can never be spelled two ways.
+    ///
+    /// Prefixes mirror the checkpoint's own path shape:
+    /// `layers.{s}.blocks.{b}.{site}`, `layers.{s}.downsample.reduction`,
+    /// `audio_projection.{linear1,linear2}`.
+    fn lora_sites(&self) -> Vec<(String, &MaybeLoraLinear)> {
+        let mut out = Vec::new();
+        for (s, stage) in self.encoder.stages.iter().enumerate() {
+            for (b, block) in stage.blocks.iter().enumerate() {
+                for (site, lin) in block.lora_sites() {
+                    out.push((format!("layers.{s}.blocks.{b}.{site}"), lin));
+                }
+            }
+            if let Some(ds) = &stage.downsample {
+                out.push((
+                    format!("layers.{s}.downsample.{REDUCTION_SITE}"),
+                    &ds.reduction,
+                ));
+            }
+        }
+        for (site, lin) in self.projection.lora_sites() {
+            out.push((format!("audio_projection.{site}"), lin));
+        }
+        out
+    }
+
+    /// The `&mut` twin of `Self::lora_sites`, same prefixes, same order.
+    fn lora_sites_mut(&mut self) -> Vec<(String, &mut MaybeLoraLinear)> {
+        let mut out = Vec::new();
+        for (s, stage) in self.encoder.stages.iter_mut().enumerate() {
+            for (b, block) in stage.blocks.iter_mut().enumerate() {
+                for (site, lin) in block.lora_sites_mut() {
+                    out.push((format!("layers.{s}.blocks.{b}.{site}"), lin));
+                }
+            }
+            if let Some(ds) = &mut stage.downsample {
+                out.push((
+                    format!("layers.{s}.downsample.{REDUCTION_SITE}"),
+                    &mut ds.reduction,
+                ));
+            }
+        }
+        for (site, lin) in self.projection.lora_sites_mut() {
+            out.push((format!("audio_projection.{site}"), lin));
+        }
+        out
+    }
+
+    /// Trainable tensors across every LoRA-wrapped site. Empty for a fully
+    /// frozen tower.
+    pub fn trainable_params(&self) -> Vec<&Tensor> {
+        let mut params = Vec::new();
+        for (_, lin) in self.lora_sites() {
+            params.extend(lin.trainable_params());
+        }
+        params
+    }
+
+    /// Named LoRA A/B tensors keyed `{site_prefix}.lora_{a,b}` — see
+    /// `Self::lora_sites` for the prefix layout.
+    pub fn named_trainable_weights(&self) -> Result<HashMap<String, Tensor>, EncoderError> {
+        let mut out = HashMap::new();
+        for (prefix, lin) in self.lora_sites() {
+            out.extend(lin.named_weights(&prefix)?);
+        }
+        Ok(out)
+    }
+
+    /// Restore LoRA A/B tensors from a [`Self::named_trainable_weights`]-shaped
+    /// map. Missing keys are no-ops.
+    pub fn load_weights(&mut self, weights: &HashMap<String, Tensor>) -> Result<(), EncoderError> {
+        for (prefix, lin) in self.lora_sites_mut() {
+            lin.load_weights(weights, &prefix);
+        }
+        Ok(())
+    }
+
+    /// Per-site dropout-stream positions keyed `{site_prefix}.dropout`.
+    pub fn dropout_positions(&self) -> Result<HashMap<String, u64>, EncoderError> {
+        let mut out = HashMap::new();
+        for (prefix, lin) in self.lora_sites() {
+            lin.collect_dropout_position(&prefix, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    /// Restore each LoRA site's dropout-stream position from a
+    /// [`Self::dropout_positions`]-shaped map. Missing keys are no-ops.
+    pub fn restore_dropout_positions(
+        &self,
+        positions: &HashMap<String, u64>,
+    ) -> Result<(), EncoderError> {
+        for (prefix, lin) in self.lora_sites() {
+            lin.restore_dropout_position(&prefix, positions)?;
+        }
+        Ok(())
+    }
+
+    /// Full forward on `input_features` `[B, 4, T, num_mel_bins]` (any T,
+    /// any floating dtype), with the per-sample `is_longer` fusion gate,
+    /// returning the L2-normalized audio embedding `[B, projection_dim]` in
+    /// this tower's own [`Self::dtype`].
+    ///
+    /// The input-dtype cast is NOT repeated here: this method's whole
+    /// floating input goes to `HtsatAudioEncoder::forward_front`, which is
+    /// the one seam that owns it (see that method's "Input-dtype domain"
+    /// section). Everything downstream of it — the Swin spine, the
+    /// projection head — consumes tensors this tower produced, already in
+    /// the backbone dtype.
     pub fn forward(
         &self,
         input_features: &Tensor,
@@ -1417,6 +1923,111 @@ impl HtsatAudio {
             .forward_spine(&front.patch_embed_out, frames_num)?;
         let unnorm = self.projection.forward_unnormalized(&spine.pooler_out)?;
         l2_normalize(&unnorm)
+    }
+}
+
+/// Fluent builder for [`HtsatAudio`]. Created via [`HtsatAudio::builder`],
+/// on the same shape [`crate::Bert`]'s and the OpenCLIP towers' builders use.
+pub struct HtsatAudioBuilder<'a> {
+    lora: LoraBuildConfig<'a>,
+    backbone_dtype: DType,
+    adapter_file: Option<&'a Path>,
+}
+
+impl<'a> HtsatAudioBuilder<'a> {
+    /// LoRA adapter configuration: which of this tower's sites (`query`,
+    /// `key`, `value`, `attention_output`, `intermediate_dense`,
+    /// `output_dense`, `reduction`, `linear1`, `linear2`, or `all-linear`)
+    /// get wrapped, at what rank.
+    pub fn lora(mut self, l: LoraBuildConfig<'a>) -> Self {
+        self.lora = l;
+        self
+    }
+
+    /// Dtype the frozen backbone tensors — and every load-time shift-window
+    /// mask — are materialised at. LoRA A/B always live in F32.
+    pub fn backbone_dtype(mut self, d: DType) -> Self {
+        self.backbone_dtype = d;
+        self
+    }
+
+    /// Optional safetensors file to load already-trained LoRA A/B tensors
+    /// from (inference). When `None`, A/B tensors are registered in the
+    /// caller-supplied `VarMap` for training.
+    pub fn adapter(mut self, p: Option<&'a Path>) -> Self {
+        self.adapter_file = p;
+        self
+    }
+
+    /// Materialise the tower from frozen safetensors checkpoint files, the
+    /// `VarBuilder` scoped at the checkpoint ROOT (which holds both
+    /// `audio_model` and `audio_projection`), matching
+    /// [`HtsatAudio::load`]'s own contract.
+    pub fn build(
+        self,
+        weights_paths: &[&Path],
+        config: &HtsatAudioConfig,
+        device: &Device,
+        varmap: &VarMap,
+    ) -> Result<HtsatAudio, EncoderError> {
+        let frozen_vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(weights_paths, self.backbone_dtype, device)?
+        };
+        let trainable_vb = if let Some(adapter) = self.adapter_file {
+            unsafe { VarBuilder::from_mmaped_safetensors(&[adapter], DType::F32, device)? }
+        } else {
+            VarBuilder::from_varmap(varmap, DType::F32, device)
+        };
+        // Trainable sub-builders materialised UP FRONT (so they outlive the
+        // site closures), one per Swin block / per stage downsample / one for
+        // the projection head — giving exactly the adapter keys
+        // `HtsatAudio::named_trainable_weights` writes:
+        // `layers.{s}.blocks.{b}.{site}`, `layers.{s}.downsample.reduction`,
+        // `audio_projection.{linear1,linear2}`.
+        let block_vbs: Vec<Vec<VarBuilder>> = config
+            .depths
+            .iter()
+            .enumerate()
+            .map(|(s, &depth)| {
+                (0..depth)
+                    .map(|b| trainable_vb.pp(format!("layers.{s}.blocks.{b}")))
+                    .collect()
+            })
+            .collect();
+        let downsample_vbs: Vec<VarBuilder> = (0..config.num_stages())
+            .map(|s| trainable_vb.pp(format!("layers.{s}.downsample")))
+            .collect();
+        let projection_vb = trainable_vb.pp("audio_projection");
+        let ctx = HtsatLoadCtx {
+            config,
+            device,
+            mask_dtype: self.backbone_dtype,
+        };
+        HtsatAudio::load_with(
+            frozen_vb,
+            ctx,
+            &|s, b| LoraSite {
+                lora_vb: &block_vbs[s][b],
+                // The STAGE index, not the block index — PEFT's rule; see
+                // `SwinStage::load_with`'s doc.
+                layer_idx: Some(s),
+                lora: &self.lora,
+                varmap,
+            },
+            &|s| LoraSite {
+                lora_vb: &downsample_vbs[s],
+                layer_idx: Some(s),
+                lora: &self.lora,
+                varmap,
+            },
+            &LoraSite {
+                lora_vb: &projection_vb,
+                // UNINDEXED: the projection head belongs to no stage.
+                layer_idx: None,
+                lora: &self.lora,
+                varmap,
+            },
+        )
     }
 }
 
@@ -1479,7 +2090,26 @@ mod tests {
     fn build_tiny_stage(varmap: &VarMap, device: &Device) -> SwinStage {
         let cfg = tiny_stage_config();
         let vb = VarBuilder::from_varmap(varmap, DType::F32, device);
-        SwinStage::load(vb, &cfg, 8, 2, 2, (4, 4), false, device).unwrap()
+        // Frozen (adapter-free) construction, through the same decline-
+        // everything site the towers' own `load` entry points use.
+        let holder = FrozenSiteHolder::new();
+        let ctx = HtsatLoadCtx {
+            config: &cfg,
+            device,
+            mask_dtype: DType::F32,
+        };
+        SwinStage::load_with(
+            vb.clone(),
+            ctx,
+            8,
+            2,
+            2,
+            (4, 4),
+            false,
+            &|_b| holder.site(&vb),
+            &holder.site(&vb),
+        )
+        .unwrap()
     }
 
     /// Run `stage`'s blocks sequentially on a FIXED (non-`Var`) input tensor
@@ -2375,6 +3005,104 @@ mod tests {
         );
     }
 
+    /// D10: the tower's `BatchNorm` stays pinned to EVAL statistics even
+    /// under `set_training(true)` (`forward_front`'s `forward_t(&x, false)`).
+    /// HF's own HTSAT pins it the same way, and a LoRA fine-tune leaves the
+    /// backbone frozen — recomputing batch statistics from a fine-tuning
+    /// batch would silently change the frozen base's own numerics.
+    ///
+    /// Asserted as a MECHANISM, both directions: the post-batch-norm
+    /// boundary is bit-identical with the flag on and off, AND the
+    /// train-statistics arm of the very same `BatchNorm` on the very same
+    /// input produces a DIFFERENT tensor (the non-vacuity control — without
+    /// it, "the two agree" would also hold if the two arms happened to be
+    /// the same computation on this fixture).
+    #[test]
+    fn batch_norm_stays_on_eval_statistics_under_set_training() {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let (mut tower, _cfg, input) = build_full_tower_and_input(&varmap, &device, 31);
+
+        let eval_boundary = tower
+            .encoder
+            .forward_front(&input, &[true])
+            .unwrap()
+            .post_batch_norm;
+        tower.set_training(true);
+        let training_boundary = tower
+            .encoder
+            .forward_front(&input, &[true])
+            .unwrap()
+            .post_batch_norm;
+
+        let as_bits = |t: &Tensor| -> Vec<u32> {
+            t.flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect()
+        };
+        assert_eq!(
+            as_bits(&training_boundary),
+            as_bits(&eval_boundary),
+            "the BatchNorm must stay on eval statistics under set_training(true)"
+        );
+
+        // Non-vacuity: the train-statistics arm really is a different
+        // computation on this fixture.
+        let x = input.transpose(1, 3).unwrap().contiguous().unwrap();
+        let train_arm = tower.encoder.batch_norm.forward_t(&x, true).unwrap();
+        assert_ne!(
+            as_bits(&train_arm),
+            as_bits(&eval_boundary),
+            "control: BatchNorm's train arm must differ from its eval arm here, or this test \
+             asserts nothing"
+        );
+    }
+
+    /// D6 for this tower's shift-window mask: it follows the backbone dtype
+    /// and keeps HF's own `-100.0` magnitude, which is exactly representable
+    /// in F32, F16 and BF16 alike — so the cast is lossless and the F32
+    /// tensor's bits are unchanged. Unlike `crate::clip_text`'s causal
+    /// sentinel this value must NOT become a dtype minimum: `exp(-100)` is
+    /// an f32 denormal that the reference implementation's numerics depend
+    /// on, so changing the magnitude would be an eval-bit change.
+    #[test]
+    fn shift_window_mask_follows_the_dtype_and_keeps_the_minus_100_magnitude() {
+        let device = Device::Cpu;
+        let (h, w, ws, shift) = (8usize, 8usize, 4usize, 2usize);
+
+        let f32_mask = SwinBlock::build_attn_mask(h, w, ws, shift, &device, DType::F32).unwrap();
+        assert_eq!(f32_mask.dtype(), DType::F32);
+        let f32_values: Vec<f32> = f32_mask.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(
+            f32_values.contains(&-100.0f32),
+            "the fixture must actually reach a masked entry"
+        );
+        assert!(f32_values.iter().all(|v| *v == 0.0 || *v == -100.0));
+
+        for (dtype, name) in [(DType::F16, "f16"), (DType::BF16, "bf16")] {
+            let mask = SwinBlock::build_attn_mask(h, w, ws, shift, &device, dtype).unwrap();
+            assert_eq!(mask.dtype(), dtype, "{name}: mask must carry the dtype");
+            // Widening back to f32 is exact (every f16/bf16 value is
+            // representable in f32), so an exact comparison here IS a
+            // comparison of the stored bit patterns.
+            let widened: Vec<f32> = mask
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            assert_eq!(
+                widened, f32_values,
+                "{name}: -100.0 and 0.0 are exact in this dtype, so the cast must be lossless"
+            );
+        }
+    }
+
     /// Eval output is unaffected by ever having toggled training on and back
     /// off: the two softmax arms are only wired into the *backward* path, so
     /// the eval-mode forward is byte-identical before any `set_training`
@@ -2382,8 +3110,9 @@ mod tests {
     /// VarMap-backed tower sized by the real `htsat_clap_tiny` config (not
     /// the minimal `tiny_stage_config` above) so this exercises the full
     /// front-half + all four Swin stages + patch-merging + pooling +
-    /// projection, not just one stage. Masks in this tower are hardcoded F32
-    /// (`build_attn_mask`), so this oracle stays f32-only.
+    /// projection, not just one stage. The shift-window masks follow the
+    /// backbone dtype (`build_attn_mask`); this VarMap-backed tower is F32,
+    /// so this oracle stays f32-only.
     #[test]
     fn eval_output_is_bit_identical_across_a_training_toggle_round_trip() {
         let device = Device::Cpu;

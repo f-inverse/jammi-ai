@@ -47,9 +47,11 @@
 //! caller-controlled flag rather than always taking the composed arm.
 
 use candle_core::{IndexOp, Tensor, D};
-use candle_nn::{linear, Linear, Module, VarBuilder};
+use candle_nn::{linear, Linear, VarBuilder};
+use jammi_lora::{FrozenBase, MaybeLoraLinear};
 
 use crate::error::EncoderError;
+use crate::lora_site::LoraSite;
 
 /// Dispatch the attention-probabilities softmax on the module's training
 /// flag — see this module's doc for why the two arms exist and when they
@@ -61,6 +63,14 @@ pub fn attention_softmax(scores: &Tensor, training: bool) -> Result<Tensor, Enco
         Ok(candle_nn::ops::softmax_last_dim(scores)?)
     }
 }
+
+/// The two LoRA-wrappable linear sites of [`MultiHeadAttention`], in the
+/// order their names appear in a checkpoint. Both the selector name a caller
+/// writes in `target_modules` AND the adapter subpath are this leaf name —
+/// the checkpoint's own vocabulary, never a consumer's.
+pub(crate) const IN_PROJ_SITE: &str = "in_proj";
+/// See [`IN_PROJ_SITE`].
+pub(crate) const OUT_PROJ_SITE: &str = "out_proj";
 
 /// Multi-head self-attention with a fused QKV projection (OpenCLIP's
 /// `in_proj_weight`/`in_proj_bias` plus an `out_proj` sub-module), shared by
@@ -77,8 +87,16 @@ pub fn attention_softmax(scores: &Tensor, training: bool) -> Result<Tensor, Enco
 /// implicit contiguous copy per operand, made inside the matmul primitive,
 /// not two).
 pub(crate) struct MultiHeadAttention {
-    in_proj: Linear,
-    out_proj: Linear,
+    /// The FUSED QKV projection as ONE LoRA site. Q/K/V are three row
+    /// ranges of a single `[3*width, width]` weight in the OpenCLIP
+    /// checkpoint layout, not three separate modules, so there is nothing
+    /// to split: one adapter on the fused weight adapts all three
+    /// projections jointly. `jammi_lora`'s own primitives place no
+    /// `out == in` constraint on a base (`FrozenBase` derives both from the
+    /// weight's dims), and PEFT adapts `nn.MultiheadAttention`'s
+    /// `in_proj_weight` as one parameter the same way.
+    in_proj: MaybeLoraLinear,
+    out_proj: MaybeLoraLinear,
     num_heads: usize,
     head_dim: usize,
     /// Selects the softmax arm via [`attention_softmax`]. Defaults to
@@ -87,27 +105,95 @@ pub(crate) struct MultiHeadAttention {
 }
 
 impl MultiHeadAttention {
+    /// Resolve the two frozen bases from the checkpoint. The ONE place the
+    /// base-tensor locators live (`crate::lora_site`'s module doc, axis 3):
+    /// `in_proj` is the FLAT `in_proj_weight`/`in_proj_bias` pair read
+    /// straight off `vb` — there is no `in_proj` sub-module to descend into
+    /// — while `out_proj` is an ordinary sub-module linear. Shared by
+    /// [`Self::load`] and [`Self::load_with`] so the frozen and
+    /// LoRA-capable constructions can never drift in what they read.
+    fn load_bases(vb: &VarBuilder, width: usize) -> Result<(FrozenBase, FrozenBase), EncoderError> {
+        let in_proj_weight = vb.get((width * 3, width), "in_proj_weight")?;
+        let in_proj_bias = vb.get(width * 3, "in_proj_bias")?;
+        let in_proj = Linear::new(in_proj_weight, Some(in_proj_bias));
+        let out_proj = linear(width, width, vb.pp(OUT_PROJ_SITE))?;
+        Ok((FrozenBase::Dense(in_proj), FrozenBase::Dense(out_proj)))
+    }
+
+    /// Fully frozen construction — no adapter on either site. Byte-for-byte
+    /// the module this constructor always built: routed through
+    /// [`Self::load_with`] with a [`FrozenSiteHolder`]'s decline-everything
+    /// site, so there is exactly ONE construction path and an unselected
+    /// site is `MaybeLoraLinear::Frozen(FrozenBase::Dense(linear))`, whose
+    /// forward is `Linear::forward` unchanged.
+    ///
+    /// `#[cfg(test)]`-only: both owning towers (`crate::clip_text`,
+    /// `crate::open_clip_vision`) now construct through [`Self::load_with`]
+    /// — their own frozen `load` entry points supply the
+    /// decline-everything site once, at the TOWER level, rather than each
+    /// block re-deriving one. What remains are this crate's own test
+    /// modules, which build a bare `MultiHeadAttention` directly and have
+    /// no `LoraSite` to hand it. Kept (rather than deleted) precisely so
+    /// those attention-level oracles keep exercising the same frozen
+    /// construction the towers do.
+    #[cfg(test)]
     pub(crate) fn load(
         vb: VarBuilder,
         width: usize,
         num_heads: usize,
     ) -> Result<Self, EncoderError> {
-        let head_dim = width / num_heads;
-        let in_proj_weight = vb.get((width * 3, width), "in_proj_weight")?;
-        let in_proj_bias = vb.get(width * 3, "in_proj_bias")?;
-        let in_proj = Linear::new(in_proj_weight, Some(in_proj_bias));
-        let out_proj = linear(width, width, vb.pp("out_proj"))?;
+        let holder = crate::lora_site::FrozenSiteHolder::new();
+        let site = holder.site(&vb);
+        Self::load_with(vb.clone(), width, num_heads, &site)
+    }
+
+    /// Same bases as [`Self::load`], each offered to `site` for LoRA
+    /// wrapping under its own leaf name ([`IN_PROJ_SITE`] /
+    /// [`OUT_PROJ_SITE`], used as BOTH the selector name and the adapter
+    /// subpath). With a `LoraBuildConfig::frozen()` config every site is
+    /// declined and the result is exactly [`Self::load`]'s.
+    pub(crate) fn load_with(
+        vb: VarBuilder,
+        width: usize,
+        num_heads: usize,
+        site: &LoraSite<'_>,
+    ) -> Result<Self, EncoderError> {
+        let (in_proj_base, out_proj_base) = Self::load_bases(&vb, width)?;
         Ok(Self {
-            in_proj,
-            out_proj,
+            in_proj: site.wrap(in_proj_base, IN_PROJ_SITE, IN_PROJ_SITE)?,
+            out_proj: site.wrap(out_proj_base, OUT_PROJ_SITE, OUT_PROJ_SITE)?,
             num_heads,
-            head_dim,
+            head_dim: width / num_heads,
             training: false,
         })
     }
 
+    /// Propagates to the softmax arm AND to both LoRA sites (whose dropout
+    /// is training-gated) — one call, no site left on a stale flag.
     pub(crate) fn set_training(&mut self, training: bool) {
         self.training = training;
+        for (_, site) in self.lora_sites_mut() {
+            site.set_training(training);
+        }
+    }
+
+    /// This module's LoRA sites paired with their names — the single source
+    /// of the site→name map every owning tower's weight / dropout-position /
+    /// restore traversal walks, so a tower never re-spells these leaves.
+    pub(crate) fn lora_sites(&self) -> [(&'static str, &MaybeLoraLinear); 2] {
+        [
+            (IN_PROJ_SITE, &self.in_proj),
+            (OUT_PROJ_SITE, &self.out_proj),
+        ]
+    }
+
+    /// The `&mut` twin of [`Self::lora_sites`], over the same names in the
+    /// same order.
+    pub(crate) fn lora_sites_mut(&mut self) -> [(&'static str, &mut MaybeLoraLinear); 2] {
+        [
+            (IN_PROJ_SITE, &mut self.in_proj),
+            (OUT_PROJ_SITE, &mut self.out_proj),
+        ]
     }
 
     /// The fused `[3*width, width]` QKV projection weight — Q/K/V occupy
@@ -115,12 +201,20 @@ impl MultiHeadAttention {
     /// respectively. Exposed so a caller's own tests can inspect its
     /// gradient (e.g. the Q/K-vs-V backward-truncation oracles) without
     /// this crate-private struct's fields being `pub(crate)` individually.
+    /// Reads through `MaybeLoraLinear::base`, so it returns the SAME frozen
+    /// weight whether or not an adapter is installed on the site.
     /// `#[cfg(test)]`-only: no production call site needs this, only the
     /// `open_clip_vision`/`clip_text` test modules that construct this
     /// struct directly.
     #[cfg(test)]
     pub(crate) fn in_proj_weight(&self) -> &Tensor {
-        self.in_proj.weight()
+        match self.in_proj.base() {
+            FrozenBase::Dense(l) => l.weight(),
+            FrozenBase::Quantized(_) => panic!(
+                "in_proj_weight: this tower never constructs a GGUF-quantized fused-QKV base \
+                 (no weight_source seam is wired here), so a Quantized arm is unreachable"
+            ),
+        }
     }
 
     /// `causal_mask`: `None` for unmasked (bidirectional) attention, or

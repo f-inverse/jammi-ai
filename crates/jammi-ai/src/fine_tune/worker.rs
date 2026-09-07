@@ -1529,12 +1529,35 @@ fn classify_training_error(
 // the submit path: the worker is their only consumer now).
 // =========================================================================
 
-/// Extract all string values from an Arrow column.
+/// Extract all string values from an Arrow column, or `None` when the column
+/// is not honestly readable as text.
 ///
 /// DataFusion 52+ returns Parquet string columns as `Utf8View` by default;
 /// older versions returned `Utf8` or `LargeUtf8`. Dictionary-encoded variants
 /// are also possible. Fast paths cover the three common types; the `cast`
 /// fallback handles everything else.
+///
+/// # Two refusals the cast fallback cannot be trusted to make (family D)
+///
+/// `arrow::compute::cast`'s DEFAULT options are `safe: true`, which means a
+/// value the target type cannot represent becomes NULL rather than an error.
+/// Combined with `StringArray::value(i)` — which returns `""` for a null slot
+/// rather than failing — the fallback silently turned unreadable cells into
+/// empty strings:
+///
+/// - A **binary** column (an image or audio triplet submitted under a TEXT
+///   task) cast cell-by-cell into NULLs, and every training row became the
+///   empty string. The job then completed, published an adapter, and reported
+///   success — a fine-tune of a text tower on nothing at all. Bytes are not
+///   text: the binary families are refused OUTRIGHT here, so the caller gets
+///   the typed, task-naming schema error its caller already raises.
+/// - Any OTHER column whose cast introduces a null where the source had a
+///   value is refused for the same reason — the empty string is a fabricated
+///   input, not a reading of the caller's data.
+///
+/// A column that was ALREADY null keeps its historical `""` reading: that is a
+/// pre-existing null-handling contract of the text path, not a value this
+/// function invented.
 fn extract_string_column(col: &dyn arrow::array::Array) -> Option<Vec<String>> {
     use arrow::array::{Array, LargeStringArray, StringArray, StringViewArray};
     use arrow::datatypes::DataType;
@@ -1548,8 +1571,20 @@ fn extract_string_column(col: &dyn arrow::array::Array) -> Option<Vec<String>> {
     if let Some(a) = col.as_any().downcast_ref::<LargeStringArray>() {
         return Some((0..a.len()).map(|i| a.value(i).to_string()).collect());
     }
+    if matches!(
+        col.data_type(),
+        DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView
+            | DataType::FixedSizeBinary(_)
+    ) {
+        return None;
+    }
     let casted = arrow::compute::cast(col, &DataType::Utf8).ok()?;
     let a = casted.as_any().downcast_ref::<StringArray>()?;
+    if (0..a.len()).any(|i| a.is_null(i) && !col.is_null(i)) {
+        return None;
+    }
     Some((0..a.len()).map(|i| a.value(i).to_string()).collect())
 }
 
@@ -1660,10 +1695,12 @@ fn extract_numeric_column(
 /// Build a [`TrainingDataLoader`] from query result batches.
 ///
 /// `task` selects how `anchor`/`positive`/`negative` triplet columns are read:
-/// an audio embedding task reads them as encoded-audio bytes; every other task
-/// reads them as text. The column names are identical across modalities (the
-/// triplet shape is the same) — only the cell decoding differs, so the caller's
-/// chosen task is the discriminator, not a parallel set of column names.
+/// an image or audio embedding task reads them as encoded MEDIA bytes; every
+/// other task reads them as text. The column names are identical across
+/// modalities (the triplet shape is the same) — only the cell decoding
+/// differs, so the caller's chosen task is the discriminator, not a parallel
+/// set of column names, and not a byte-header sniff (an encoded WAV and an
+/// encoded PNG are both binary blobs).
 fn build_training_data_loader(
     batches: &[RecordBatch],
     columns: &[String],
@@ -1695,8 +1732,8 @@ fn build_training_data_loader(
     // error rather than a device-side assert.
     let has_regression = col_names.contains(&"text") && col_names.contains(&"target");
 
-    if has_triplet && task == ModelTask::AudioEmbedding {
-        return build_audio_triplet_loader(batches);
+    if has_triplet && matches!(task, ModelTask::AudioEmbedding | ModelTask::ImageEmbedding) {
+        return build_media_triplet_loader(batches, task);
     }
 
     if has_contrastive {
@@ -1754,7 +1791,9 @@ fn build_training_data_loader(
                 .and_then(|c| extract_string_column(c.as_ref()))
                 .ok_or_else(|| {
                     JammiError::FineTune(format!(
-                        "Missing/invalid 'anchor' column. Batch schema: [{}]",
+                        "Missing/invalid 'anchor' column: task {task} expects text columns; for \
+                         image/audio triplets submit task=image_embedding/audio_embedding. \
+                         Batch schema: [{}]",
                         schema_info()
                     ))
                 })?;
@@ -1763,7 +1802,9 @@ fn build_training_data_loader(
                 .and_then(|c| extract_string_column(c.as_ref()))
                 .ok_or_else(|| {
                     JammiError::FineTune(format!(
-                        "Missing/invalid 'positive' column. Batch schema: [{}]",
+                        "Missing/invalid 'positive' column: task {task} expects text columns; for \
+                         image/audio triplets submit task=image_embedding/audio_embedding. \
+                         Batch schema: [{}]",
                         schema_info()
                     ))
                 })?;
@@ -1772,7 +1813,9 @@ fn build_training_data_loader(
                 .and_then(|c| extract_string_column(c.as_ref()))
                 .ok_or_else(|| {
                     JammiError::FineTune(format!(
-                        "Missing/invalid 'negative' column. Batch schema: [{}]",
+                        "Missing/invalid 'negative' column: task {task} expects text columns; for \
+                         image/audio triplets submit task=image_embedding/audio_embedding. \
+                         Batch schema: [{}]",
                         schema_info()
                     ))
                 })?;
@@ -1803,7 +1846,12 @@ fn build_training_data_loader(
                 .and_then(|c| extract_string_column(c.as_ref()))
                 .ok_or_else(|| {
                     JammiError::FineTune(format!(
-                        "Missing/invalid 'anchor' column. Batch schema: [{}]",
+                        "Missing/invalid 'anchor' column: task {task} expects text columns, and \
+                         this source has the anchor/positive PAIR shape, which is read as text \
+                         for every task. Image/audio training reads encoded media bytes only \
+                         from the anchor/positive/negative TRIPLET shape under \
+                         task=image_embedding/audio_embedding — add a 'negative' column. \
+                         Batch schema: [{}]",
                         schema_info()
                     ))
                 })?;
@@ -1812,7 +1860,12 @@ fn build_training_data_loader(
                 .and_then(|c| extract_string_column(c.as_ref()))
                 .ok_or_else(|| {
                     JammiError::FineTune(format!(
-                        "Missing/invalid 'positive' column. Batch schema: [{}]",
+                        "Missing/invalid 'positive' column: task {task} expects text columns, \
+                         and this source has the anchor/positive PAIR shape, which is read as \
+                         text for every task. Image/audio training reads encoded media bytes \
+                         only from the anchor/positive/negative TRIPLET shape under \
+                         task=image_embedding/audio_embedding — add a 'negative' column. \
+                         Batch schema: [{}]",
                         schema_info()
                     ))
                 })?;
@@ -1904,16 +1957,21 @@ fn build_training_data_loader(
             "Cannot detect training format from columns: {col_names:?}. \
              Expected contrastive (text_a, text_b, score), triplet (anchor, positive, negative), \
              pairs (anchor, positive), classification (text, label), or regression \
-             (text, target) with task=regression. For audio triplets, use the same \
-             (anchor, positive, negative) columns with task=audio_embedding."
+             (text, target) with task=regression. For image/audio triplets, use the \
+             same (anchor, positive, negative) columns with binary cells and \
+             task=image_embedding/audio_embedding."
         )))
     }
 }
 
-/// Build an audio-triplet loader: read `anchor`/`positive`/`negative` as
-/// encoded-audio byte columns. Shares the triplet column shape with the text
-/// path; only the cell type differs (binary clips vs strings).
-fn build_audio_triplet_loader(batches: &[RecordBatch]) -> Result<TrainingDataLoader> {
+/// Build a MEDIA-triplet loader: read `anchor`/`positive`/`negative` as
+/// encoded binary columns (audio clips or images, per `task`). Shares the
+/// triplet column shape with the text path; only the cell type differs
+/// (binary blobs vs strings).
+fn build_media_triplet_loader(
+    batches: &[RecordBatch],
+    task: ModelTask,
+) -> Result<TrainingDataLoader> {
     let mut rows = Vec::new();
     for batch in batches {
         let schema_info = || {
@@ -1930,7 +1988,8 @@ fn build_audio_triplet_loader(batches: &[RecordBatch]) -> Result<TrainingDataLoa
             .and_then(|c| extract_binary_column(c.as_ref()))
             .ok_or_else(|| {
                 JammiError::FineTune(format!(
-                    "Missing/invalid binary 'anchor' column for audio triplets. Batch schema: [{}]",
+                    "Missing/invalid binary 'anchor' column for media triplets (task \
+                     {task}). Batch schema: [{}]",
                     schema_info()
                 ))
             })?;
@@ -1939,7 +1998,8 @@ fn build_audio_triplet_loader(batches: &[RecordBatch]) -> Result<TrainingDataLoa
             .and_then(|c| extract_binary_column(c.as_ref()))
             .ok_or_else(|| {
                 JammiError::FineTune(format!(
-                    "Missing/invalid binary 'positive' column for audio triplets. Batch schema: [{}]",
+                    "Missing/invalid binary 'positive' column for media triplets (task \
+                     {task}). Batch schema: [{}]",
                     schema_info()
                 ))
             })?;
@@ -1948,7 +2008,8 @@ fn build_audio_triplet_loader(batches: &[RecordBatch]) -> Result<TrainingDataLoa
             .and_then(|c| extract_binary_column(c.as_ref()))
             .ok_or_else(|| {
                 JammiError::FineTune(format!(
-                    "Missing/invalid binary 'negative' column for audio triplets. Batch schema: [{}]",
+                    "Missing/invalid binary 'negative' column for media triplets (task \
+                     {task}). Batch schema: [{}]",
                     schema_info()
                 ))
             })?;
@@ -1961,7 +2022,7 @@ fn build_audio_triplet_loader(batches: &[RecordBatch]) -> Result<TrainingDataLoa
             ));
         }
     }
-    Ok(TrainingDataLoader::from_audio_triplets(rows))
+    Ok(TrainingDataLoader::from_media_triplets(rows))
 }
 
 /// Extract a human-readable message from a panic payload.
@@ -2254,6 +2315,7 @@ fn run_fine_tune_blocking(
             &catalog,
             &artifact_store,
             &config,
+            task,
             &varmap,
             &device,
         )?;
@@ -2293,6 +2355,10 @@ fn run_fine_tune_blocking(
 
     let mut builder = crate::fine_tune::trainer::TrainingLoopBuilder::new(target, varmap, config)
         .base_model(base_model_arc)
+        // The run's declared task is the trainer's MODALITY discriminator for
+        // the media paths (`TrainingLoop::task`) — the same `task` this
+        // function already gated the data loader and the encoder dispatch on.
+        .task(task)
         .job_id(job_id)
         .worker_id(worker_id)
         .attempt(attempt.to_string())
@@ -2467,8 +2533,8 @@ fn validate_backbone_precision(
 // Declined { outcome: CapabilityMiss, reason: "flash_transport_not_wired" }`
 // — the ONE reason value either family's `FlashDecision::Declined` ever
 // carries, because neither wires the encoder-boundary flash transport
-// protocol — see `BERT never wires the encoder-boundary flash transport` (`crates/jammi-encoders/src/bert.rs:418-420`)
-// and the sibling `FlashDecision::Declined` (`crates/jammi-encoders/src/distilbert.rs:321-324`). `admit_cascade`
+// protocol — see `BERT never wires the encoder-boundary flash transport` (`crates/jammi-encoders/src/bert.rs:428-430`)
+// and the sibling `FlashDecision::Declined` (`crates/jammi-encoders/src/distilbert.rs:331-334`). `admit_cascade`
 // (`crates/jammi-kernels/src/admission.rs:403-453`) now records every decline
 // — disabled, `DomainMiss`, and `CapabilityMiss` alike — into the SAME
 // thread-local probe-capture sink `admit_inner` uses
@@ -2887,17 +2953,23 @@ fn probe_acceleration(
     // and exactly where it would break (a future async yield inside the probe,
     // or an admission-gated op dispatched from a rayon/spawned worker).
     let capture = jammi_kernels::admission::probe_capture_begin();
-    // A tiny, arch-agnostic probe batch: token id `0` is valid for any
-    // non-empty vocabulary, so this never depends on the job's actual
-    // tokenizer/vocab size. A probe FAILURE (a malformed batch, an unforeseen
-    // shape constraint on some future encoder family) degrades to an empty
-    // `ops` map — never a propagated error (this function, and its caller,
-    // are infallible by construction: esc-075 requires training to be
-    // unaffected by a report-computation failure).
+    // A tiny probe batch built by the ENCODER ITSELF
+    // (`AnyEncoder::probe_input`): the smallest shape-valid batch for that
+    // variant's own geometry — 1x4 zero token ids for a text tower (id `0`
+    // is valid for any non-empty vocabulary, so this never depends on the
+    // job's tokenizer/vocab size), a `[1, 3, image_size, image_size]` pixel
+    // batch for the vision tower, a `[1, 4, T, num_mel_bins]` fusion
+    // spectrogram for the audio one. A hand-built token batch here would
+    // shape-fail on every media tower and report `probe_forward_failed` for
+    // a job whose real forward is fine — a fabricated-looking negative about
+    // acceleration that the job never earned (esc-075 / issue #421 A7). A
+    // genuine probe FAILURE still degrades to an empty `ops` map — never a
+    // propagated error (this function, and its caller, are infallible by
+    // construction: esc-075 requires training to be unaffected by a
+    // report-computation failure).
     let probe_ok = (|| -> Option<()> {
-        let input_ids = candle_core::Tensor::from_vec(vec![0u32; 4], (1, 4), device).ok()?;
-        let mask = candle_core::Tensor::from_vec(vec![1u32; 4], (1, 4), device).ok()?;
-        let output = encoder.forward(&input_ids, &mask).ok()?;
+        let probe = encoder.probe_input(device).ok()?;
+        let output = encoder.forward_input(&probe.as_input()).ok()?;
         run_backward_and_optimizer_probe(varmap, &output);
         Some(())
     })()
@@ -3010,15 +3082,43 @@ fn compute_and_persist_acceleration_report(
 /// the catalog artifact path, wrap the configured target modules with LoRA, and
 /// return both the resulting encoder and the persisted adapter metadata that
 /// pairs with the trained tensors on disk.
+///
+/// # Dispatch is `(family, task)`, and there is no default arm
+///
+/// The tower to build is decided by the checkpoint's own architecture — the
+/// SHARED [`EncoderFamily`] predicate, the same one serving branches on — and
+/// the job's declared task. Every unsupported combination, and every config
+/// this crate has no loader for, is a typed refusal naming what was found and
+/// what is supported.
+///
+/// This replaces a `_ => BERT` coercion. That arm was silent and
+/// output-affecting: a checkpoint whose `config.json` merely happened to
+/// deserialize as a `BertConfig` (a GPT-2 config does) trained a BERT tower
+/// over foreign weights and published an adapter claiming that architecture.
+/// Refusing is the only honest answer — there is no BERT here to adapt.
+///
+/// # Zero trainable sites is a refusal, never a run
+///
+/// A `target_modules` list that selects NOTHING on the tower this dispatch
+/// picked is refused right after the tower is built, naming the tower, the
+/// submitted selectors and that tower's own
+/// [`lora_site_names`](jammi_encoders::AnyEncoder::lora_site_names). Without
+/// that check the job trains zero parameters, publishes an empty adapter and
+/// reports success — see the refusal's own comment for why nothing
+/// downstream catches it.
 fn build_encoder_adapters(
     base_model_id: &str,
     catalog: &Arc<Catalog>,
     artifact_store: &Arc<ArtifactStore>,
     config: &FineTuneConfig,
+    task: ModelTask,
     varmap: &candle_nn::VarMap,
     device: &candle_core::Device,
 ) -> Result<(jammi_encoders::AnyEncoder, jammi_lora::AdapterConfig)> {
     use std::path::Path;
+
+    use crate::model::arch::{self, EncoderFamily};
+    use jammi_lora::Tower;
 
     // Interpret the base-model id through the shared `ModelSource::parse`, so the
     // catalog key here matches what the submit and load sites registered the
@@ -3088,32 +3188,89 @@ fn build_encoder_adapters(
         }
     };
 
-    let config_path = artifact_dir.join("config.json");
-    let model_config: serde_json::Value = std::fs::read_to_string(&config_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .ok_or_else(|| {
+    // Config SOURCE ORDER is the resolver's own (issue #421 D7): the catalog
+    // record's stored `config_json` when it has one, else the first existing
+    // candidate on disk walking the shared frozen chain (`config.json`, then
+    // the OpenCLIP `open_clip_config.json`). Reading `config.json` off disk
+    // unconditionally would miss an OpenCLIP checkpoint entirely (its config
+    // lives only in `open_clip_config.json`) and would disagree with the
+    // resolver whenever the catalog carries a config the directory does not.
+    let model_config: serde_json::Value = match model_record.config_json.as_deref() {
+        Some(json) => serde_json::from_str(json).map_err(|e| {
             JammiError::FineTune(format!(
-                "Cannot read config.json for base model at {config_path:?}"
+                "Cannot parse the catalog's stored config_json for base model \
+                 '{base_model_id}': {e}"
             ))
-        })?;
+        })?,
+        None => {
+            let config_path = arch::config_candidates(&artifact_dir).ok_or_else(|| {
+                JammiError::FineTune(format!(
+                    "Cannot find {} or {} for base model at {artifact_dir:?}",
+                    arch::CONFIG_CANDIDATE_NAMES[0],
+                    arch::CONFIG_CANDIDATE_NAMES[1],
+                ))
+            })?;
+            let text = std::fs::read_to_string(&config_path)
+                .map_err(|e| JammiError::FineTune(format!("Cannot read {config_path:?}: {e}")))?;
+            serde_json::from_str(&text)
+                .map_err(|e| JammiError::FineTune(format!("Cannot parse {config_path:?}: {e}")))?
+        }
+    };
 
+    // `model_type` as the config SPELLS it — used ONLY in refusal messages,
+    // never as a dispatch key (that is `family`, below, and
+    // `dispatch_model_type` for the two GGUF lookups that still key on the
+    // string). `<absent>` is a message word, not an architecture: it must
+    // never reach a lookup, which is why the two are separate bindings.
     let model_type = model_config
         .get("model_type")
         .and_then(|v| v.as_str())
-        .unwrap_or("bert");
+        .unwrap_or("<absent>");
+
+    let family = EncoderFamily::from_config(&model_config).ok_or_else(|| {
+        JammiError::FineTune(format!(
+            "unsupported model_type '{model_type}' for encoder-adapter fine-tuning \
+             (base model '{base_model_id}'); supported: bert, roberta, camembert, \
+             xlm-roberta, distilbert, modernbert, an OpenCLIP checkpoint \
+             (open_clip_config.json with model_cfg), or an HF-CLAP audio checkpoint \
+             (clap_audio_model). Leave `target_modules` empty to train a projection \
+             head on a frozen backbone instead."
+        ))
+    })?;
+
+    // The string the two GGUF lookups below still key on (`GgufArchitecture`
+    // and, through `gguf_num_layers`, the DistilBERT field normalization),
+    // read through the SAME shared reader serving reads — so a config that
+    // declares no `model_type` (admitted as `family` = Bert just above)
+    // reaches those lookups as `"bert"` rather than as the `<absent>` message
+    // word, which would refuse a checkpoint this function already accepted.
+    let dispatch_model_type = arch::config_model_type(&model_config);
 
     // GGUF/QLoRA (issue #351): the base artifact SELECTS this — no new
-    // trainer/config knob. `model.safetensors` wins when both happen to be
-    // present (mirrors the resolver's own FROZEN precedence,
-    // `model::resolver::ModelResolver::resolve_local`); only when it is
-    // ABSENT does `model.gguf` enter the picture at all.
-    let weights_path = artifact_dir.join("model.safetensors");
-    let gguf_weights_path = artifact_dir.join("model.gguf");
-    let is_gguf = !weights_path.exists();
-    if is_gguf && !gguf_weights_path.exists() {
+    // trainer/config knob. The FROZEN precedence lives in `model::arch`
+    // (`model.safetensors` -> `open_clip_model.safetensors` -> `model.gguf`),
+    // the identical chain `ModelResolver::resolve_local` walks, so a fine-tune
+    // and an inference load of the same directory can never read different
+    // weights.
+    let weights_path = arch::weights_candidates(&artifact_dir).ok_or_else(|| {
+        JammiError::FineTune(format!(
+            "No weights found at {artifact_dir:?} (need one of {:?})",
+            arch::CANDLE_WEIGHTS_CANDIDATE_NAMES
+        ))
+    })?;
+    let gguf_weights_path = artifact_dir.join(arch::GGUF_WEIGHTS_FILENAME);
+    let is_gguf = weights_path.ends_with(arch::GGUF_WEIGHTS_FILENAME);
+    if is_gguf
+        && !matches!(
+            family,
+            EncoderFamily::Bert | EncoderFamily::DistilBert | EncoderFamily::ModernBert
+        )
+    {
         return Err(JammiError::FineTune(format!(
-            "Neither model.safetensors nor model.gguf found at {artifact_dir:?}"
+            "quantized (GGUF) fine-tuning is not supported for this architecture \
+             (model_type '{model_type}') — GGUF is threaded only through the \
+             BERT-family/DistilBERT/ModernBERT text towers, matching serving's own \
+             refusal"
         )));
     }
 
@@ -3138,8 +3295,15 @@ fn build_encoder_adapters(
     validate_backbone_precision(config.backbone_dtype, device)?;
     let backbone_dtype: candle_core::DType =
         jammi_encoders::compute_precision_to_dtype(config.backbone_dtype);
-    let adapter_cfg =
-        jammi_lora::AdapterConfig::from_build(model_type, &lora, config.backbone_dtype);
+    // The adapter records the FAMILY's canonical architecture id, not the
+    // raw config string: `roberta` and `bert` are one family and must produce
+    // adapters the load seam classifies identically, and an OpenCLIP
+    // checkpoint has no `model_type` field to copy at all.
+    let adapter_cfg = jammi_lora::AdapterConfig::from_build(
+        family.adapter_model_type(),
+        &lora,
+        config.backbone_dtype,
+    );
 
     // GGUF/QLoRA (issue #351): everything the three encoder builders below
     // need to train LoRA over a `FrozenBase::Quantized` backbone — built
@@ -3149,13 +3313,14 @@ fn build_encoder_adapters(
     // inference load of the same `model.gguf` can never silently disagree
     // on which tensors are matmul-site or which dtype loaded).
     let gguf_backbone = if is_gguf {
-        let arch = crate::model::backend::gguf::GgufArchitecture::from_model_type(model_type)
-            .ok_or_else(|| {
-                JammiError::FineTune(format!(
-                    "quantized serving not supported for this architecture (model_type \
-                     '{model_type}')"
-                ))
-            })?;
+        let arch =
+            crate::model::backend::gguf::GgufArchitecture::from_model_type(dispatch_model_type)
+                .ok_or_else(|| {
+                    JammiError::FineTune(format!(
+                        "quantized serving not supported for this architecture \
+                         (model_type '{model_type}')"
+                    ))
+                })?;
         // Routes through the SAME normalization + layer-count authority
         // `CandleBackend::load`'s GGUF path and `estimate_gguf_residency`
         // use (`gguf::gguf_num_layers`) — a raw, un-normalized DistilBERT
@@ -3163,12 +3328,14 @@ fn build_encoder_adapters(
         // `n_layers` name only, so reading `num_hidden_layers`/`num_layers`
         // off the raw config here previously refused every DistilBERT GGUF
         // fine-tune outright (issue #351 wave 5 audit).
-        let num_layers = crate::model::backend::gguf::gguf_num_layers(model_type, &model_config)
-            .ok_or_else(|| {
-                JammiError::FineTune(
-                    "GGUF load requires num_hidden_layers (or num_layers) in config.json".into(),
-                )
-            })?;
+        let num_layers =
+            crate::model::backend::gguf::gguf_num_layers(dispatch_model_type, &model_config)
+                .ok_or_else(|| {
+                    JammiError::FineTune(
+                        "GGUF load requires num_hidden_layers (or num_layers) in config.json"
+                            .into(),
+                    )
+                })?;
         Some(
             crate::model::backend::gguf::load_gguf_backbone(
                 &gguf_weights_path,
@@ -3195,8 +3362,73 @@ fn build_encoder_adapters(
     };
     let weights_paths: Vec<&Path> = vec![vb_weights_path.as_path()];
 
-    let encoder = match model_type {
-        "distilbert" => {
+    let (encoder, adapter_cfg) = match (family, task) {
+        // ---- OpenCLIP text tower -------------------------------------
+        (EncoderFamily::OpenClip, ModelTask::TextEmbedding) => {
+            let text_config = jammi_encoders::ClipTextConfig::from_open_clip_config(&model_config)
+                .map_err(|e| JammiError::FineTune(format!("Parse OpenCLIP text config: {e}")))?;
+            let tower = jammi_encoders::ClipText::builder()
+                .lora(lora)
+                .backbone_dtype(backbone_dtype)
+                .build(&weights_paths, &text_config, device, varmap)
+                .map_err(|e| JammiError::FineTune(format!("Build OpenCLIP text encoder: {e}")))?;
+            (
+                jammi_encoders::AnyEncoder::ClipText(tower),
+                adapter_cfg.with_tower(Tower::Text),
+            )
+        }
+        // ---- OpenCLIP vision tower -----------------------------------
+        (EncoderFamily::OpenClip, ModelTask::ImageEmbedding) => {
+            let vision_config =
+                jammi_encoders::OpenClipVisionConfig::from_open_clip_config(&model_config)
+                    .map_err(|e| {
+                        JammiError::FineTune(format!("Parse OpenCLIP vision config: {e}"))
+                    })?;
+            let tower = jammi_encoders::OpenClipVisionTransformer::builder()
+                .lora(lora)
+                .backbone_dtype(backbone_dtype)
+                .build(&weights_paths, &vision_config, device, varmap)
+                .map_err(|e| JammiError::FineTune(format!("Build OpenCLIP vision encoder: {e}")))?;
+            (
+                jammi_encoders::AnyEncoder::OpenClipVision(tower),
+                adapter_cfg.with_tower(Tower::Vision),
+            )
+        }
+        // ---- HF-CLAP HTSAT audio tower -------------------------------
+        (EncoderFamily::ClapAudio, ModelTask::AudioEmbedding) => {
+            let audio_config = jammi_encoders::HtsatAudioConfig::from_hf_clap_config(&model_config)
+                .map_err(|e| JammiError::FineTune(format!("Parse CLAP audio config: {e}")))?;
+            let tower = jammi_encoders::HtsatAudio::builder()
+                .lora(lora)
+                .backbone_dtype(backbone_dtype)
+                .build(&weights_paths, &audio_config, device, varmap)
+                .map_err(|e| JammiError::FineTune(format!("Build CLAP audio encoder: {e}")))?;
+            (
+                jammi_encoders::AnyEncoder::Htsat(Box::new(tower)),
+                adapter_cfg.with_tower(Tower::Audio),
+            )
+        }
+        // ---- BERT-family text towers ---------------------------------
+        //
+        // Reached only for a TEXT task: the guard below refuses an
+        // image/audio task on a text checkpoint before any tower is built,
+        // so a media job can never train a text tower over tokenized bytes.
+        (
+            EncoderFamily::Bert | EncoderFamily::DistilBert | EncoderFamily::ModernBert,
+            ModelTask::ImageEmbedding | ModelTask::AudioEmbedding,
+        )
+        | (EncoderFamily::OpenClip, _)
+        | (EncoderFamily::ClapAudio, _) => {
+            return Err(JammiError::FineTune(format!(
+                "encoder-adapter fine-tuning does not support task {task} on this base \
+                 model (model_type '{model_type}', architecture family {family:?}, towers: \
+                 {}). Supported pairs: text_embedding/classification/ner/regression on a \
+                 BERT-family text tower, text_embedding or image_embedding on an OpenCLIP \
+                 checkpoint, audio_embedding on an HF-CLAP audio checkpoint.",
+                family.towers()
+            )));
+        }
+        (EncoderFamily::DistilBert, _) => {
             let distilbert_config: jammi_encoders::DistilBertConfig =
                 serde_json::from_value(model_config.clone()).map_err(|e| {
                     JammiError::FineTune(format!("Parse DistilBert config.json: {e}"))
@@ -3207,13 +3439,18 @@ fn build_encoder_adapters(
             if let Some(lookup) = &gguf_lookup {
                 builder = builder.weight_source(lookup);
             }
-            jammi_encoders::AnyEncoder::DistilBert(
-                builder
-                    .build(&weights_paths, &distilbert_config, device, varmap)
-                    .map_err(|e| JammiError::FineTune(format!("Build DistilBert encoder: {e}")))?,
+            (
+                jammi_encoders::AnyEncoder::DistilBert(
+                    builder
+                        .build(&weights_paths, &distilbert_config, device, varmap)
+                        .map_err(|e| {
+                            JammiError::FineTune(format!("Build DistilBert encoder: {e}"))
+                        })?,
+                ),
+                adapter_cfg,
             )
         }
-        "modernbert" => {
+        (EncoderFamily::ModernBert, _) => {
             let modernbert_config: jammi_encoders::ModernBertConfig =
                 serde_json::from_value(model_config.clone()).map_err(|e| {
                     JammiError::FineTune(format!("Parse ModernBert config.json: {e}"))
@@ -3224,13 +3461,18 @@ fn build_encoder_adapters(
             if let Some(lookup) = &gguf_lookup {
                 builder = builder.weight_source(lookup);
             }
-            jammi_encoders::AnyEncoder::ModernBert(
-                builder
-                    .build(&weights_paths, &modernbert_config, device, varmap)
-                    .map_err(|e| JammiError::FineTune(format!("Build ModernBert encoder: {e}")))?,
+            (
+                jammi_encoders::AnyEncoder::ModernBert(
+                    builder
+                        .build(&weights_paths, &modernbert_config, device, varmap)
+                        .map_err(|e| {
+                            JammiError::FineTune(format!("Build ModernBert encoder: {e}"))
+                        })?,
+                ),
+                adapter_cfg,
             )
         }
-        _ => {
+        (EncoderFamily::Bert, _) => {
             let bert_config: jammi_encoders::BertConfig =
                 serde_json::from_value(model_config.clone())
                     .map_err(|e| JammiError::FineTune(format!("Parse Bert config.json: {e}")))?;
@@ -3240,13 +3482,73 @@ fn build_encoder_adapters(
             if let Some(lookup) = &gguf_lookup {
                 builder = builder.weight_source(lookup);
             }
-            jammi_encoders::AnyEncoder::Bert(
-                builder
-                    .build(&weights_paths, &bert_config, device, varmap)
-                    .map_err(|e| JammiError::FineTune(format!("Build Bert encoder: {e}")))?,
+            (
+                jammi_encoders::AnyEncoder::Bert(
+                    builder
+                        .build(&weights_paths, &bert_config, device, varmap)
+                        .map_err(|e| JammiError::FineTune(format!("Build Bert encoder: {e}")))?,
+                ),
+                adapter_cfg,
             )
         }
     };
+
+    // A selector that matched NOTHING is a hard refusal, not a run.
+    //
+    // This arm is reached only when `config.target_modules` is non-empty (see
+    // `classify_training_oom`'s doc for that split), so an encoder with zero
+    // trainable `Var`s here means the caller ASKED for adapters and got none.
+    // Nothing downstream notices: candle's backward pass differentiates only
+    // through `is_variable()` nodes, so `loss.backward()` populates an empty
+    // `GradStore`; `optimizer::clip_and_step` treats an EMPTY `trainable_vars`
+    // as the one unambiguously benign reading and does not even warn; the run
+    // then completes, publishes an `adapter.safetensors` holding no A/B
+    // tensors, reports SUCCESS, and serves the BASE bytes under a fine-tuned
+    // model id. A typo'd selector must fail the job instead — the same
+    // conclusion `jammi-bench`'s own training tier reached
+    // (`finetune_run.rs`'s zero-trainable refusal), installed here at the one
+    // seam every encoder-adapters job passes through.
+    //
+    // TWO producers land here and the message must not blame the wrong one:
+    // `target_modules` matching no site on THIS tower's vocabulary, or a
+    // `layers_to_transform` restriction excluding every layer the selectors
+    // would otherwise have matched (an off-by-one layer index on a fixture
+    // with fewer layers). The restriction is therefore named whenever it is
+    // `Some`, never silently folded into "correct the selectors".
+    if encoder.trainable_params().is_empty() {
+        // The tower this job actually built, as the caller named it: the
+        // adapter's own `tower` for a multi-tower checkpoint, and the
+        // family's single tower otherwise (BERT-family adapters carry
+        // `tower: None` because there is nothing to discriminate).
+        let tower = match adapter_cfg.tower {
+            Some(Tower::Text) => "text",
+            Some(Tower::Vision) => "vision",
+            Some(Tower::Audio) => "audio",
+            None => family.towers(),
+        };
+        let restriction = match &config.layers_to_transform {
+            Some(layers) => format!(" restricted to layers {layers:?}"),
+            None => String::new(),
+        };
+        return Err(JammiError::FineTune(format!(
+            "target_modules {:?}{restriction} matched no LoRA site on the '{}' {tower} tower \
+             (base model '{base_model_id}', model_type '{model_type}'), so this job would \
+             train zero parameters and publish an adapter that changes nothing. This \
+             tower's own LoRA site names are: {:?} — a selector matches a site name \
+             exactly or as a suffix of it (so 'query' selects 'attention.self.query' on a \
+             BERT-family tower, whose sites are named by their full dotted checkpoint \
+             path), and 'all-linear' selects every site.{}",
+            config.target_modules,
+            family.adapter_model_type(),
+            encoder.lora_site_names(),
+            if restriction.is_empty() {
+                ""
+            } else {
+                " If the selectors are right for this architecture, check \
+                 layers_to_transform for an out-of-range or off-by-one layer index."
+            },
+        )));
+    }
 
     Ok((encoder, adapter_cfg))
 }
@@ -3313,8 +3615,8 @@ mod tests {
     /// (never a fabricated window entry) with BERT/DistilBERT's own verbatim
     /// predicate — `"flash_transport_not_wired"`, the ONE reason value either
     /// family's `FlashDecision::Declined` ever carries — see
-    /// `BERT never wires the encoder-boundary flash transport` (`crates/jammi-encoders/src/bert.rs:418-420`)
-    /// and the sibling `FlashDecision::Declined` (`crates/jammi-encoders/src/distilbert.rs:321-324`) — for a
+    /// `BERT never wires the encoder-boundary flash transport` (`crates/jammi-encoders/src/bert.rs:428-430`)
+    /// and the sibling `FlashDecision::Declined` (`crates/jammi-encoders/src/distilbert.rs:331-334`) — for a
     /// `CapabilityMiss` outcome on the `"attention_block_flash"` op, exactly
     /// as `attention_cascade::training_attention_cascade` does for a
     /// BERT-family training forward (`crates/jammi-encoders/src/
@@ -4443,6 +4745,7 @@ mod tests {
                 &catalog,
                 &artifact_store,
                 &training_config,
+                ModelTask::TextEmbedding,
                 &varmap,
                 &device,
             )
@@ -4559,6 +4862,7 @@ mod tests {
                 &catalog,
                 &artifact_store,
                 &training_config,
+                ModelTask::TextEmbedding,
                 &varmap,
                 &device,
             )

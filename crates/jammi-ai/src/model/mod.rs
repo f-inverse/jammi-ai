@@ -1,3 +1,4 @@
+pub mod arch;
 pub mod backend;
 pub mod cache;
 pub mod clip_bpe;
@@ -252,8 +253,13 @@ impl ModelDimensions {
             });
         }
 
-        // OpenCLIP format: model_cfg.vision_cfg with embed_dim at top level
-        if let Some(model_cfg) = config.get("model_cfg") {
+        // OpenCLIP format: `model_cfg.vision_cfg` with `embed_dim` at top
+        // level. The "is this OpenCLIP?" question is answered by the SHARED
+        // predicate (`arch::EncoderFamily::from_config`), never by a local
+        // `model_cfg` probe that could drift from the serving loader's own
+        // branch; only the dimension MATH below is this module's.
+        if arch::EncoderFamily::from_config(config) == Some(arch::EncoderFamily::OpenClip) {
+            let model_cfg = config.get("model_cfg")?;
             let vision_cfg = model_cfg.get("vision_cfg")?;
             let embed_dim = model_cfg.get("embed_dim").and_then(|v| v.as_u64())? as usize;
             let width = vision_cfg.get("width").and_then(|v| v.as_u64())? as usize;
@@ -290,10 +296,19 @@ impl ModelDimensions {
     /// the intermediate FFN size are taken from the final stage (the widest),
     /// which bounds the per-batch activation footprint.
     fn from_hf_clap_config(config: &serde_json::Value) -> Option<Self> {
-        let audio = config.get("audio_config").unwrap_or(config);
-        if audio.get("model_type").and_then(|v| v.as_str()) != Some("clap_audio_model") {
+        // Same shared predicate as the OpenCLIP arm above: the CLAP-detection
+        // RULES live in `arch`, this function owns only the geometry read.
+        // Widening note: `arch` also honours the `architectures`-listing
+        // signal the serving loader has always applied, so a `ClapConfig`
+        // that names `ClapModel` without a nested `model_type` now reaches
+        // the geometry read here instead of falling through to the text arm.
+        // It still returns `None` unless the CLAP geometry fields are
+        // actually present (`?` below), so no non-CLAP config can be
+        // mis-parsed into CLAP dimensions.
+        if arch::EncoderFamily::from_config(config) != Some(arch::EncoderFamily::ClapAudio) {
             return None;
         }
+        let audio = config.get("audio_config").unwrap_or(config);
         let projection_dim = config
             .get("projection_dim")
             .or_else(|| audio.get("projection_dim"))

@@ -127,6 +127,26 @@ jobs:
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Run tests
+        env:
+          # This container image carries python3, so finetune_run_media_smoke's
+          # python3-unavailable skip (KO-7 gate, see ci/kernel-oracle-helpers.txt)
+          # must never fire silently here — a skip on this lane is a defect.
+          JAMMI_REQUIRE_MEDIA_SMOKE: "1"
+          # The K4 literal pin (bits_snapshot.rs, KO-7 gate, see
+          # ci/kernel-oracle-helpers.txt's `k4_snapshot_require_gate` row) is a
+          # SAME-CPU-MODEL oracle: its rows are keyed by exact CPU model, not
+          # merely (target_arch, target_os) — measured fact, three
+          # `AMD EPYC 7763` runs agree with each other and a fourth run on a
+          # different x86_64 CPU class produced a different HTSAT hash on this
+          # same hosted fleet. The GitHub-hosted runner fleet is heterogeneous
+          # CPU hardware even within one (arch, os) pair, so this job does NOT
+          # set `JAMMI_REQUIRE_K4_SNAPSHOT` — every runner still runs the
+          # structural K4 checks (shapes, digest non-vacuity, the
+          # builder/load equality) unconditionally, and the literal-bits
+          # comparison only fires (and only needs to match) when the runner's
+          # CPU happens to be a pinned model. `JAMMI_REQUIRE_K4_SNAPSHOT=1` is
+          # reserved for a lane pinned to a KNOWN box — an operator's dev
+          # machine or a pod — never for this heterogeneous hosted lane.
         run: cargo test --workspace --exclude jammi-python
 
       # Unification contract §6 F3 (round-2 audit B5): the designated
@@ -1564,6 +1584,22 @@ jobs:
           # `tokenizers` package required.
           - name: perf gen_fixed_width_corpus suite
             cmd: python3 ci/scripts/perf/test_gen_fixed_width_corpus.py
+          # The two MEDIA corpus producers' own suites (#421 PR B's declared
+          # workload inputs), the same doctrine as
+          # `gen_fixed_width_corpus`'s above: every shape/duration assertion
+          # is read back off the WRITTEN bytes (the PNG's own IHDR, the WAV
+          # header the stdlib `wave` module emitted) rather than off the
+          # in-memory arrays, determinism is proven by regenerating into a
+          # second directory and comparing bytes, the intra-family <
+          # inter-family separation the triplet structure claims is asserted
+          # MECHANICALLY rather than assumed, and the degenerate corners
+          # (`--jitter 0`, a duration rounding to zero frames, one family,
+          # one instance per family) are proven to refuse. Stdlib-only, no
+          # network, no image or audio package.
+          - name: perf gen_fixed_shape_image_corpus suite
+            cmd: python3 ci/scripts/perf/test_gen_fixed_shape_image_corpus.py
+          - name: perf gen_fixed_length_audio_corpus suite
+            cmd: python3 ci/scripts/perf/test_gen_fixed_length_audio_corpus.py
           # `fixture_width_report.py`'s own suite (#356 P4 Artifacts/"Width
           # pinning"): drives the real `derive_claim` pigeonhole-verdict
           # logic against a synthetic reaches_cap length table — never a

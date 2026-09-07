@@ -4,22 +4,33 @@
 //! remapping. Supports global average pooling over patch tokens or
 //! CLS-token pooling, selected by `global_average_pool`.
 //!
+//! The residual block itself — MLP, fused-QKV attention, the four LoRA site
+//! names and the key-prefixed traversals over the stack — is the SINGLE
+//! `crate::open_clip_block`, shared verbatim with [`crate::clip_text`]'s
+//! text tower; this module owns only what is genuinely vision-specific (the
+//! patch conv, CLS token, pooling, projection, the `mlp_ratio`-derived MLP
+//! width, and its unmasked `None` attention arm). See that module's "Two
+//! towers, two namespaces" section for why this tower's ADAPTER keys carry
+//! the checkpoint's `visual.` prefix while the text tower's do not.
+//!
 //! The attention softmax goes through
-//! `crate::attention::attention_softmax`; the fused-QKV `MultiHeadAttention`
-//! is the SAME struct [`crate::clip_text`]'s text tower shares (parameterised
-//! by an optional causal mask —
-//! `crate::attention::MultiHeadAttention::forward`'s doc); every
-//! `candle_nn::LayerNorm` is `crate::layer_norm::LayerNorm` (which has its
-//! own bias-free/training gradient oracle —
+//! `crate::attention::attention_softmax`; every `candle_nn::LayerNorm` is
+//! `crate::layer_norm::LayerNorm` (which has its own bias-free/training
+//! gradient oracle —
 //! `crate::layer_norm::tests::fused_training_path_matches_slow_within_tolerance_fwd_and_bwd`);
 //! and `quick_gelu` is the single shared `crate::activations::quick_gelu`.
 
-use candle_core::{IndexOp, Module, Tensor};
-use candle_nn::{conv2d_no_bias, Conv2d, Conv2dConfig, VarBuilder};
+use std::collections::HashMap;
+use std::path::Path;
 
-use crate::attention::MultiHeadAttention;
+use candle_core::{DType, Device, IndexOp, Module, Tensor};
+use candle_nn::{conv2d_no_bias, Conv2d, Conv2dConfig, VarBuilder, VarMap};
+use jammi_lora::LoraBuildConfig;
+
 use crate::error::EncoderError;
 use crate::layer_norm::LayerNorm;
+use crate::lora_site::{FrozenSiteHolder, LoraSite};
+use crate::open_clip_block::{self as block, ResidualAttentionBlock};
 
 /// Default CLIP normalization constants (used when preprocess_cfg is absent).
 #[allow(clippy::excessive_precision)]
@@ -126,79 +137,16 @@ fn parse_f32_array(value: Option<&serde_json::Value>, default: [f32; 3]) -> [f32
         .unwrap_or(default)
 }
 
-/// Feed-forward MLP with QuickGelu activation.
-struct Mlp {
-    c_fc: candle_nn::Linear,
-    c_proj: candle_nn::Linear,
-}
-
-impl Mlp {
-    fn load(vb: VarBuilder, width: usize, intermediate_size: usize) -> Result<Self, EncoderError> {
-        let c_fc = candle_nn::linear(width, intermediate_size, vb.pp("c_fc"))?;
-        let c_proj = candle_nn::linear(intermediate_size, width, vb.pp("c_proj"))?;
-        Ok(Self { c_fc, c_proj })
-    }
-
-    fn forward(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
-        let x = self.c_fc.forward(x)?;
-        let x = crate::activations::quick_gelu(&x)?;
-        Ok(self.c_proj.forward(&x)?)
-    }
-}
-
-/// Residual attention block: LN -> MHSA -> residual -> LN -> MLP -> residual.
-struct ResidualAttentionBlock {
-    ln_1: LayerNorm,
-    attn: MultiHeadAttention,
-    ln_2: LayerNorm,
-    mlp: Mlp,
-}
-
-impl ResidualAttentionBlock {
-    fn load(
-        vb: VarBuilder,
-        width: usize,
-        heads: usize,
-        mlp_ratio: f64,
-    ) -> Result<Self, EncoderError> {
-        let intermediate_size = (width as f64 * mlp_ratio) as usize;
-        // `with_bias=true`: no `remove_mean=false` (RMSNorm-style) variant
-        // exists in this tower's config — see `crate::clip_text`'s sibling
-        // note on the same class.
-        let ln_1 = LayerNorm::new(width, 1e-5, true, vb.pp("ln_1"))?;
-        let attn = MultiHeadAttention::load(vb.pp("attn"), width, heads)?;
-        let ln_2 = LayerNorm::new(width, 1e-5, true, vb.pp("ln_2"))?;
-        let mlp = Mlp::load(vb.pp("mlp"), width, intermediate_size)?;
-        Ok(Self {
-            ln_1,
-            attn,
-            ln_2,
-            mlp,
-        })
-    }
-
-    fn set_training(&mut self, training: bool) {
-        self.attn.set_training(training);
-        self.ln_1.set_training(training);
-        self.ln_2.set_training(training);
-    }
-
-    /// Unmasked (bidirectional) attention: passes `None` to the shared
-    /// [`MultiHeadAttention::forward`] — see that method's doc for why
-    /// `None` keeps this tower's op sequence exactly what it was before it
-    /// shared the struct with the causally-masked text tower.
-    fn forward(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
-        let residual = x;
-        let x = self.ln_1.forward(x)?;
-        let x = self.attn.forward(&x, None)?;
-        let x = (residual + x)?;
-
-        let residual = &x;
-        let x = self.ln_2.forward(&x)?;
-        let x = self.mlp.forward(&x)?;
-        Ok((residual + x)?)
-    }
-}
+/// The adapter / `VarMap` key root this tower's LoRA sites live under.
+///
+/// The vision tower's weights live under `visual.` in every OpenCLIP
+/// safetensors checkpoint, and its adapter keys carry that SAME prefix. This
+/// is not decoration: the text tower's blocks are the identical
+/// `resblocks.{n}.{site}` shape, and a checkpoint holds both towers while a
+/// training run holds ONE `VarMap` — see `crate::open_clip_block`'s "Two
+/// towers, two namespaces" section for the aliasing this prefix prevents.
+/// No invented vocabulary: `visual` is the checkpoint's own segment.
+pub(crate) const ADAPTER_BLOCK_ROOT: &str = "visual.resblocks";
 
 /// OpenCLIP Vision Transformer.
 ///
@@ -212,14 +160,48 @@ pub struct OpenClipVisionTransformer {
     ln_post: LayerNorm,
     proj: Tensor,
     config: OpenClipVisionConfig,
+    /// Wired through [`Self::set_training`]; read by [`Self::is_training`].
+    training: bool,
 }
 
 impl OpenClipVisionTransformer {
-    /// Load from a VarBuilder scoped to the `visual` prefix.
+    /// Start a builder with default settings: frozen LoRA config, F32
+    /// backbone dtype, no adapter file. See [`OpenClipVisionBuilder`].
+    pub fn builder() -> OpenClipVisionBuilder<'static> {
+        OpenClipVisionBuilder {
+            lora: LoraBuildConfig::frozen(),
+            backbone_dtype: DType::F32,
+            adapter_file: None,
+        }
+    }
+
+    /// Load from a VarBuilder scoped to the `visual` prefix, fully frozen
+    /// (no LoRA sites installed).
     ///
     /// Expects the VarBuilder to be created with `vb.pp("visual")` so that
-    /// weight keys like `conv1.weight`, `class_embedding`, etc. resolve correctly.
+    /// weight keys like `conv1.weight`, `class_embedding`, etc. resolve
+    /// correctly. Routed through the SAME `Self::load_with` the builder
+    /// uses, with a decline-everything site
+    /// (`crate::lora_site::FrozenSiteHolder`), so there is one loader rather
+    /// than two that could drift — `builder().lora(frozen()).build(..)`
+    /// produces a bit-identical tower (asserted by
+    /// `tests::builder_frozen_output_bits_equal_load`).
     pub fn load(vb: VarBuilder, config: &OpenClipVisionConfig) -> Result<Self, EncoderError> {
+        let holder = FrozenSiteHolder::new();
+        Self::load_with(vb.clone(), config, &|_n| holder.site(&vb))
+    }
+
+    /// The one loader. `site_for` yields the [`LoraSite`] for block `n`
+    /// (already scoped to that block's adapter subtree and carrying
+    /// `layer_idx = Some(n)`). This tower has no additive attention mask at
+    /// all (its attention is unmasked — `MultiHeadAttention::forward`'s
+    /// `None` arm), so unlike `crate::clip_text` it carries no dtype-following
+    /// mask to build.
+    fn load_with<'a>(
+        vb: VarBuilder,
+        config: &OpenClipVisionConfig,
+        site_for: &dyn Fn(usize) -> LoraSite<'a>,
+    ) -> Result<Self, EncoderError> {
         let conv_config = Conv2dConfig {
             stride: config.patch_size,
             ..Default::default()
@@ -240,16 +222,15 @@ impl OpenClipVisionTransformer {
 
         let ln_pre = LayerNorm::new(config.width, 1e-5, true, vb.pp("ln_pre"))?;
 
-        let mut blocks = Vec::with_capacity(config.layers);
-        for i in 0..config.layers {
-            let block = ResidualAttentionBlock::load(
-                vb.pp(format!("transformer.resblocks.{i}")),
-                config.width,
-                config.heads,
-                config.mlp_ratio,
-            )?;
-            blocks.push(block);
-        }
+        let intermediate_size = (config.width as f64 * config.mlp_ratio) as usize;
+        let blocks = block::load_blocks(
+            &vb,
+            config.layers,
+            config.width,
+            config.heads,
+            intermediate_size,
+            site_for,
+        )?;
 
         let ln_post = LayerNorm::new(config.width, 1e-5, true, vb.pp("ln_post"))?;
         let proj = vb.get(&[config.width, config.embed_dim], "proj")?;
@@ -263,18 +244,38 @@ impl OpenClipVisionTransformer {
             ln_post,
             proj,
             config: config.clone(),
+            training: false,
         })
     }
 
     /// Forward pass: pixel values → embedding vector.
     ///
-    /// Input: `(batch, 3, image_size, image_size)` tensor.
-    /// Output: `(batch, embed_dim)` tensor.
+    /// Input: `(batch, 3, image_size, image_size)` tensor, in ANY floating
+    /// dtype. Output: `(batch, embed_dim)` tensor, in this tower's own
+    /// [`Self::dtype`].
+    ///
+    /// # Input-dtype domain: cast at the seam
+    ///
+    /// The FIRST weight a pixel batch meets is the patch-embedding `conv1`
+    /// kernel, and candle's `conv2d` does not promote a mismatched input
+    /// the way a dense linear does — an F32 batch against an F16 kernel is
+    /// a hard `dtype mismatch in conv2d`. Every production front end
+    /// (image decode → normalise → `Tensor::from_vec` of `f32`) emits F32,
+    /// so a tower built at an F16 backbone would refuse the only batch
+    /// anybody actually has.
+    ///
+    /// This edge is the ONE place that knows the backbone dtype, so it is
+    /// where the cast belongs — the same shape `jammi_lora::FrozenBase`'s
+    /// `Dense` arm already uses for a `Linear`. `Tensor::to_dtype` on the
+    /// SAME dtype is `self.clone()`, so an already-matching (F32-on-F32)
+    /// batch takes a byte-identical path: this is a widening of the
+    /// accepted input domain, never a change to any output bit.
     pub fn forward(&self, pixel_values: &Tensor) -> Result<Tensor, EncoderError> {
+        let pixel_values = pixel_values.to_dtype(self.dtype())?;
         let batch_size = pixel_values.dim(0)?;
 
         // Patch embedding: (batch, 3, H, W) -> (batch, width, grid, grid)
-        let x = self.conv1.forward(pixel_values)?;
+        let x = self.conv1.forward(&pixel_values)?;
 
         // Flatten spatial dims: (batch, width, grid*grid) -> (batch, grid*grid, width)
         let x = x.flatten_from(2)?.permute((0, 2, 1))?;
@@ -296,7 +297,7 @@ impl OpenClipVisionTransformer {
         // Transformer blocks
         let mut x = x;
         for block in &self.blocks {
-            x = block.forward(&x)?;
+            x = block.forward(&x, None)?;
         }
 
         // Pooling
@@ -328,11 +329,61 @@ impl OpenClipVisionTransformer {
     /// own fast path has. Propagates to every block's attention sublayer and
     /// both norms this method doesn't own directly.
     pub fn set_training(&mut self, training: bool) {
+        self.training = training;
         self.ln_pre.set_training(training);
-        for block in &mut self.blocks {
-            block.set_training(training);
-        }
+        block::set_training(&mut self.blocks, training);
         self.ln_post.set_training(training);
+    }
+
+    /// Whether [`Self::set_training`] last set training mode. `false` from
+    /// every constructor.
+    pub fn is_training(&self) -> bool {
+        self.training
+    }
+
+    /// Trainable tensors across every LoRA-wrapped site. Empty for a fully
+    /// frozen tower.
+    pub fn trainable_params(&self) -> Vec<&Tensor> {
+        block::trainable_params(&self.blocks)
+    }
+
+    /// Named LoRA A/B tensors keyed
+    /// `visual.resblocks.{n}.{site}.lora_{a,b}` — `{site}` being the
+    /// checkpoint's own leaf name (`in_proj`, `out_proj`, `c_fc`,
+    /// `c_proj`), under this tower's own `ADAPTER_BLOCK_ROOT`.
+    ///
+    /// The `visual.` prefix is load-bearing, not cosmetic: `crate::clip_text`
+    /// builds the SAME `resblocks.{n}.{site}` block shape from the SAME
+    /// checkpoint, and a caller that trains both towers holds one `VarMap`.
+    /// Without the prefix the second tower built would silently reuse the
+    /// first's registered `Var`s instead of getting its own.
+    pub fn named_trainable_weights(&self) -> Result<HashMap<String, Tensor>, EncoderError> {
+        block::named_trainable_weights(&self.blocks, ADAPTER_BLOCK_ROOT)
+    }
+
+    /// Restore LoRA A/B tensors from a [`Self::named_trainable_weights`]-shaped
+    /// map. Missing keys are no-ops.
+    pub fn load_weights(&mut self, weights: &HashMap<String, Tensor>) -> Result<(), EncoderError> {
+        block::load_weights(&mut self.blocks, weights, ADAPTER_BLOCK_ROOT);
+        Ok(())
+    }
+
+    /// Per-site dropout-stream positions keyed
+    /// `visual.resblocks.{n}.{site}.dropout` — the SAME site prefix
+    /// [`Self::named_trainable_weights`] uses, with
+    /// `jammi_lora::MaybeLoraLinear::collect_dropout_position`'s own
+    /// `.dropout` leaf appended.
+    pub fn dropout_positions(&self) -> Result<HashMap<String, u64>, EncoderError> {
+        block::dropout_positions(&self.blocks, ADAPTER_BLOCK_ROOT)
+    }
+
+    /// Restore each LoRA site's dropout-stream position from a
+    /// [`Self::dropout_positions`]-shaped map. Missing keys are no-ops.
+    pub fn restore_dropout_positions(
+        &self,
+        positions: &HashMap<String, u64>,
+    ) -> Result<(), EncoderError> {
+        block::restore_dropout_positions(&self.blocks, ADAPTER_BLOCK_ROOT, positions)
     }
 
     /// Return the output embedding dimension.
@@ -343,6 +394,23 @@ impl OpenClipVisionTransformer {
     /// Return the expected input image size.
     pub fn image_size(&self) -> usize {
         self.config.image_size
+    }
+
+    /// Dtype the FROZEN BACKBONE weights are materialised at — read off a
+    /// real weight (the patch-embedding `conv1` kernel), never a remembered
+    /// builder setting, so it stays true for a tower built through
+    /// [`Self::load`] from an arbitrary `VarBuilder` as well as one built
+    /// through the builder's `backbone_dtype`.
+    ///
+    /// This is the dtype [`Self::forward`] casts its input TO, and the dtype
+    /// of the embedding it returns. It is NOT a precondition on the input:
+    /// candle's `conv2d` does not promote a mismatched input the way
+    /// `jammi_lora::FrozenBase::Dense` does, which is exactly why the cast
+    /// lives at that forward edge rather than in every caller. A caller that
+    /// MANUFACTURES a batch (a probe, a warm-up) can still read it here to
+    /// build one that needs no cast at all.
+    pub fn dtype(&self) -> DType {
+        self.conv1.weight().dtype()
     }
 
     /// Return the preprocessing normalization mean.
@@ -356,9 +424,82 @@ impl OpenClipVisionTransformer {
     }
 }
 
+/// Fluent builder for [`OpenClipVisionTransformer`]. Created via
+/// [`OpenClipVisionTransformer::builder`], on the same shape
+/// [`crate::Bert`]'s and [`crate::ClipText`]'s builders use.
+pub struct OpenClipVisionBuilder<'a> {
+    lora: LoraBuildConfig<'a>,
+    backbone_dtype: DType,
+    adapter_file: Option<&'a Path>,
+}
+
+impl<'a> OpenClipVisionBuilder<'a> {
+    /// LoRA adapter configuration: which of this tower's sites (`in_proj`,
+    /// `out_proj`, `c_fc`, `c_proj`, or `all-linear`) get wrapped, at what
+    /// rank.
+    pub fn lora(mut self, l: LoraBuildConfig<'a>) -> Self {
+        self.lora = l;
+        self
+    }
+
+    /// Dtype the frozen backbone tensors are materialised at. LoRA A/B
+    /// always live in F32.
+    pub fn backbone_dtype(mut self, d: DType) -> Self {
+        self.backbone_dtype = d;
+        self
+    }
+
+    /// Optional safetensors file to load already-trained LoRA A/B tensors
+    /// from (inference). When `None`, A/B tensors are registered in the
+    /// caller-supplied `VarMap` for training.
+    pub fn adapter(mut self, p: Option<&'a Path>) -> Self {
+        self.adapter_file = p;
+        self
+    }
+
+    /// Materialise the tower from frozen safetensors checkpoint files.
+    ///
+    /// `weights_paths` are the CHECKPOINT ROOT files; this builder applies
+    /// the `visual` scoping itself, matching
+    /// [`OpenClipVisionTransformer::load`]'s documented contract that its
+    /// `VarBuilder` is already `vb.pp("visual")`. The trainable
+    /// `VarBuilder` is scoped by `ADAPTER_BLOCK_ROOT` instead — the same
+    /// `visual.` prefix, applied to the ADAPTER key space so this tower's
+    /// `Var`s can never collide with `crate::clip_text`'s in a shared
+    /// `VarMap` (see
+    /// [`OpenClipVisionTransformer::named_trainable_weights`]).
+    pub fn build(
+        self,
+        weights_paths: &[&Path],
+        config: &OpenClipVisionConfig,
+        device: &Device,
+        varmap: &VarMap,
+    ) -> Result<OpenClipVisionTransformer, EncoderError> {
+        let frozen_vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(weights_paths, self.backbone_dtype, device)?
+        };
+        let trainable_vb = if let Some(adapter) = self.adapter_file {
+            unsafe { VarBuilder::from_mmaped_safetensors(&[adapter], DType::F32, device)? }
+        } else {
+            VarBuilder::from_varmap(varmap, DType::F32, device)
+        };
+        // One trainable sub-builder per block, so each site's adapter key is
+        // `visual.resblocks.{n}.{site}.lora_{a,b}` — the exact keys
+        // `named_trainable_weights` writes.
+        let block_vbs = block::block_var_builders(&trainable_vb, ADAPTER_BLOCK_ROOT, config.layers);
+        OpenClipVisionTransformer::load_with(frozen_vb.pp("visual"), config, &|n| LoraSite {
+            lora_vb: &block_vbs[n],
+            layer_idx: Some(n),
+            lora: &self.lora,
+            varmap,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attention::MultiHeadAttention;
     use candle_core::{DType, Device};
     use candle_nn::VarMap;
 
@@ -553,7 +694,7 @@ mod tests {
         let loss = (output * weights).unwrap().sum_all().unwrap();
         let grads = loss.backward().unwrap();
 
-        let in_proj_weight = model.blocks[0].attn.in_proj_weight();
+        let in_proj_weight = model.blocks[0].attn().in_proj_weight();
         let grad = grads
             .get(in_proj_weight)
             .expect("in_proj_weight must have a gradient under training=true");
@@ -599,7 +740,7 @@ mod tests {
         let loss = (output * weights).unwrap().sum_all().unwrap();
         let grads = loss.backward().unwrap();
 
-        let in_proj_weight = model.blocks[0].attn.in_proj_weight();
+        let in_proj_weight = model.blocks[0].attn().in_proj_weight();
         assert!(
             grads.get(in_proj_weight).is_none(),
             "eval's own LayerNorm kernel must still truncate backward before block 0's \

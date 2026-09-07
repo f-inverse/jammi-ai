@@ -14,12 +14,28 @@
 //! Forward output is `[batch, embed_dim]` in the same latent space as
 //! [`crate::clip_text::ClipTextConfig::embed_dim`] vision-tower outputs,
 //! enabling cross-modal cosine similarity.
+//!
+//! The residual block itself — MLP, fused-QKV attention, the four LoRA site
+//! names and the key-prefixed traversals over the stack — is the SINGLE
+//! `crate::open_clip_block`, shared verbatim with
+//! [`crate::open_clip_vision`]'s tower; this module owns only what is
+//! genuinely text-specific (the token/positional embeddings, the fixed 4×
+//! MLP width, the cached causal mask, EOT pooling, `text_projection`). See
+//! that module's "Two towers, two namespaces" section for why the two
+//! towers' ADAPTER key roots must differ even though their block shape does
+//! not.
 
-use candle_core::{IndexOp, Module, Tensor, D};
-use candle_nn::{embedding, linear, Embedding, Linear, VarBuilder};
+use std::collections::HashMap;
+use std::path::Path;
+
+use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
+use candle_nn::{embedding, Embedding, VarBuilder, VarMap};
+use jammi_lora::LoraBuildConfig;
 
 use crate::error::EncoderError;
 use crate::layer_norm::LayerNorm;
+use crate::lora_site::{FrozenSiteHolder, LoraSite};
+use crate::open_clip_block::{self as block, ResidualAttentionBlock};
 
 /// Architecture configuration for the OpenCLIP text transformer.
 ///
@@ -101,80 +117,13 @@ impl ClipTextConfig {
     }
 }
 
-/// Feed-forward MLP with QuickGelu activation.
-struct Mlp {
-    c_fc: Linear,
-    c_proj: Linear,
-}
-
-impl Mlp {
-    fn load(vb: VarBuilder, width: usize, intermediate_size: usize) -> Result<Self, EncoderError> {
-        let c_fc = linear(width, intermediate_size, vb.pp("c_fc"))?;
-        let c_proj = linear(intermediate_size, width, vb.pp("c_proj"))?;
-        Ok(Self { c_fc, c_proj })
-    }
-
-    fn forward(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
-        let x = self.c_fc.forward(x)?;
-        let x = crate::activations::quick_gelu(&x)?;
-        Ok(self.c_proj.forward(&x)?)
-    }
-}
-
-/// Residual transformer block: LN → MHSA → residual → LN → MLP → residual.
-struct ResidualAttentionBlock {
-    ln_1: LayerNorm,
-    attn: crate::attention::MultiHeadAttention,
-    ln_2: LayerNorm,
-    mlp: Mlp,
-}
-
-impl ResidualAttentionBlock {
-    fn load(vb: VarBuilder, width: usize, heads: usize) -> Result<Self, EncoderError> {
-        // OpenCLIP text transformer uses a fixed 4x MLP ratio.
-        let intermediate_size = width * 4;
-        // `with_bias=true`: OpenCLIP's `ln_1`/`ln_2` are affine (weight AND
-        // bias), matching `candle_nn::layer_norm`'s `remove_mean=true,
-        // affine=true` default this call replaced — same "weight"/"bias"
-        // safetensors key names (`crate::layer_norm::LayerNorm::new`'s doc).
-        // No `remove_mean=false` (RMSNorm-style) variant exists anywhere in
-        // this tower's config, so the house class's fixed mean-removal is
-        // exactly the behavior being replaced, not a silent narrowing.
-        let ln_1 = LayerNorm::new(width, 1e-5, true, vb.pp("ln_1"))?;
-        let attn = crate::attention::MultiHeadAttention::load(vb.pp("attn"), width, heads)?;
-        let ln_2 = LayerNorm::new(width, 1e-5, true, vb.pp("ln_2"))?;
-        let mlp = Mlp::load(vb.pp("mlp"), width, intermediate_size)?;
-        Ok(Self {
-            ln_1,
-            attn,
-            ln_2,
-            mlp,
-        })
-    }
-
-    /// `causal_mask`: this tower is always causally masked (see the module
-    /// doc), so this call always passes `Some(causal_mask)` — see
-    /// [`crate::attention::MultiHeadAttention::forward`]'s doc for why the
-    /// mask is `Option<&Tensor>` on the shared struct despite that (the
-    /// OpenCLIP vision tower shares this struct unmasked).
-    fn forward(&self, x: &Tensor, causal_mask: &Tensor) -> Result<Tensor, EncoderError> {
-        let residual = x;
-        let x = self.ln_1.forward(x)?;
-        let x = self.attn.forward(&x, Some(causal_mask))?;
-        let x = (residual + x)?;
-
-        let residual = &x;
-        let x = self.ln_2.forward(&x)?;
-        let x = self.mlp.forward(&x)?;
-        Ok((residual + x)?)
-    }
-
-    fn set_training(&mut self, training: bool) {
-        self.attn.set_training(training);
-        self.ln_1.set_training(training);
-        self.ln_2.set_training(training);
-    }
-}
+/// The adapter / `VarMap` key root this tower's LoRA sites live under.
+///
+/// The OpenCLIP text tower IS the checkpoint root (vision sits under
+/// `visual.`), so its keys start at `resblocks` with no tower prefix — the
+/// checkpoint's own vocabulary. See `crate::open_clip_block`'s "Two towers,
+/// two namespaces" section for why the vision twin must NOT share this root.
+pub(crate) const ADAPTER_BLOCK_ROOT: &str = "resblocks";
 
 /// OpenCLIP text transformer.
 ///
@@ -195,39 +144,77 @@ pub struct ClipText {
     text_projection: Tensor,
     config: ClipTextConfig,
     /// Cached `[context_length, context_length]` additive causal mask
-    /// (`0.0` lower-triangular, `f32::MIN` above the diagonal). Built once
-    /// at load time so the forward path slices instead of allocating.
+    /// (`0.0` lower-triangular, the BACKBONE DTYPE's own most-negative
+    /// finite value above the diagonal — see [`build_causal_mask`]). Built
+    /// once at load time in the backbone's dtype so the forward path slices
+    /// instead of allocating AND never casts.
     causal_mask: Tensor,
+    /// Wired through [`Self::set_training`]; read by [`Self::is_training`].
+    training: bool,
 }
 
 impl ClipText {
-    /// Build the text transformer from a checkpoint-root [`VarBuilder`].
+    /// Start a builder with default settings: frozen LoRA config, F32
+    /// backbone dtype, no adapter file. See [`ClipTextBuilder`].
+    pub fn builder() -> ClipTextBuilder<'static> {
+        ClipTextBuilder {
+            lora: LoraBuildConfig::frozen(),
+            backbone_dtype: DType::F32,
+            adapter_file: None,
+        }
+    }
+
+    /// Build the text transformer from a checkpoint-root [`VarBuilder`],
+    /// fully frozen (no LoRA sites installed).
     ///
     /// Reads keys at the root level (no `text.` prefix): the OpenCLIP
     /// safetensors layout puts vision under `visual.*` and text under the
     /// root, so callers using the same checkpoint pass `vb` for text and
     /// `vb.pp("visual")` for vision.
+    ///
+    /// Routed through the SAME `Self::load_with` the builder uses, with a
+    /// decline-everything site (`crate::lora_site::FrozenSiteHolder`), so
+    /// there is one loader rather than two that could drift; the causal mask
+    /// is built in `vb`'s own dtype. `builder().lora(frozen()).build(..)`
+    /// therefore produces a bit-identical tower (asserted by
+    /// `tests::builder_frozen_output_bits_equal_load`).
     pub fn load(vb: VarBuilder, config: &ClipTextConfig) -> Result<Self, EncoderError> {
+        let holder = FrozenSiteHolder::new();
+        let dtype = vb.dtype();
+        Self::load_with(vb.clone(), config, dtype, &|_n| holder.site(&vb))
+    }
+
+    /// The one loader. `site_for` yields the [`LoraSite`] for block `n`
+    /// (already scoped to that block's adapter subtree and carrying
+    /// `layer_idx = Some(n)`); `mask_dtype` is the dtype the cached causal
+    /// mask is materialised in — always the frozen backbone's dtype, so no
+    /// forward ever casts it.
+    fn load_with<'a>(
+        vb: VarBuilder,
+        config: &ClipTextConfig,
+        mask_dtype: DType,
+        site_for: &dyn Fn(usize) -> LoraSite<'a>,
+    ) -> Result<Self, EncoderError> {
         let token_embedding = embedding(config.vocab_size, config.width, vb.pp("token_embedding"))?;
         let positional_embedding = vb.get(
             (config.context_length, config.width),
             "positional_embedding",
         )?;
 
-        let mut blocks = Vec::with_capacity(config.layers);
-        for i in 0..config.layers {
-            let block = ResidualAttentionBlock::load(
-                vb.pp(format!("transformer.resblocks.{i}")),
-                config.width,
-                config.heads,
-            )?;
-            blocks.push(block);
-        }
+        // OpenCLIP's text transformer uses a fixed 4x MLP ratio.
+        let blocks = block::load_blocks(
+            &vb,
+            config.layers,
+            config.width,
+            config.heads,
+            config.width * 4,
+            site_for,
+        )?;
 
         let ln_final = LayerNorm::new(config.width, 1e-5, true, vb.pp("ln_final"))?;
         let text_projection = vb.get((config.width, config.embed_dim), "text_projection")?;
 
-        let causal_mask = build_causal_mask(config.context_length, vb.device())?;
+        let causal_mask = build_causal_mask(config.context_length, mask_dtype, vb.device())?;
 
         Ok(Self {
             token_embedding,
@@ -237,6 +224,7 @@ impl ClipText {
             text_projection,
             config: config.clone(),
             causal_mask,
+            training: false,
         })
     }
 
@@ -274,7 +262,7 @@ impl ClipText {
         let causal = self.causal_mask.i((..seq, ..seq))?;
 
         for block in &self.blocks {
-            x = block.forward(&x, &causal)?;
+            x = block.forward(&x, Some(&causal))?;
         }
         let x = self.ln_final.forward(&x)?;
 
@@ -305,6 +293,21 @@ impl ClipText {
         self.config.context_length
     }
 
+    /// Dtype the FROZEN BACKBONE weights are materialised at — read off a
+    /// real weight (the token-embedding table), never a remembered builder
+    /// setting, so it stays true for a tower built through [`Self::load`]
+    /// from an arbitrary `VarBuilder` as well as one built through the
+    /// builder's `backbone_dtype`. It is also the dtype [`Self::forward`]
+    /// returns, and the dtype the cached causal mask was built in.
+    ///
+    /// This tower consumes INTEGER token ids, so unlike the two media towers
+    /// it has no caller-supplied floating input whose dtype could disagree —
+    /// see `crate::AnyEncoder::dtype` for the one caller class that needs a
+    /// tower's dtype and why it is not a harmless default there.
+    pub fn dtype(&self) -> DType {
+        self.token_embedding.embeddings().dtype()
+    }
+
     /// Switch every block's attention softmax AND every LayerNorm (`ln_1`,
     /// `ln_2` per block, plus `ln_final`) between the eval (no-backward) arm
     /// and the differentiable composed arm — see
@@ -319,24 +322,188 @@ impl ClipText {
     /// full end-to-end oracle. Eval output is unaffected either way; only
     /// backward through this tower's gradient is correct in training mode.
     pub fn set_training(&mut self, training: bool) {
-        for block in &mut self.blocks {
-            block.set_training(training);
-        }
+        self.training = training;
+        block::set_training(&mut self.blocks, training);
         self.ln_final.set_training(training);
+    }
+
+    /// Whether [`Self::set_training`] last set training mode. `false` from
+    /// every constructor.
+    pub fn is_training(&self) -> bool {
+        self.training
+    }
+
+    /// Trainable tensors across every LoRA-wrapped site. Empty for a fully
+    /// frozen tower.
+    pub fn trainable_params(&self) -> Vec<&Tensor> {
+        block::trainable_params(&self.blocks)
+    }
+
+    /// Named LoRA A/B tensors keyed `resblocks.{n}.{site}.lora_{a,b}` —
+    /// `{site}` being the checkpoint's own leaf name (`in_proj`, `out_proj`,
+    /// `c_fc`, `c_proj`), and `resblocks.{n}` the same subtree the builder
+    /// registered them under.
+    pub fn named_trainable_weights(&self) -> Result<HashMap<String, Tensor>, EncoderError> {
+        block::named_trainable_weights(&self.blocks, ADAPTER_BLOCK_ROOT)
+    }
+
+    /// Restore LoRA A/B tensors from a [`Self::named_trainable_weights`]-shaped
+    /// map. Missing keys are no-ops.
+    pub fn load_weights(&mut self, weights: &HashMap<String, Tensor>) -> Result<(), EncoderError> {
+        block::load_weights(&mut self.blocks, weights, ADAPTER_BLOCK_ROOT);
+        Ok(())
+    }
+
+    /// Per-site dropout-stream positions keyed
+    /// `resblocks.{n}.{site}.dropout` — the SAME site prefix
+    /// [`Self::named_trainable_weights`] uses, with
+    /// `jammi_lora::MaybeLoraLinear::collect_dropout_position`'s own
+    /// `.dropout` leaf appended. This is the resume state for the adapter's
+    /// dropout streams.
+    pub fn dropout_positions(&self) -> Result<HashMap<String, u64>, EncoderError> {
+        block::dropout_positions(&self.blocks, ADAPTER_BLOCK_ROOT)
+    }
+
+    /// Restore each LoRA site's dropout-stream position from a
+    /// [`Self::dropout_positions`]-shaped map. Missing keys are no-ops.
+    pub fn restore_dropout_positions(
+        &self,
+        positions: &HashMap<String, u64>,
+    ) -> Result<(), EncoderError> {
+        block::restore_dropout_positions(&self.blocks, ADAPTER_BLOCK_ROOT, positions)
     }
 }
 
-/// Build the `[size, size]` additive causal mask: `0.0` on and below the
-/// diagonal, `f32::MIN` above it. Constructed once at load time and sliced
-/// per forward.
-fn build_causal_mask(size: usize, device: &candle_core::Device) -> Result<Tensor, EncoderError> {
+/// Fluent builder for [`ClipText`]. Created via [`ClipText::builder`], on
+/// the same shape [`crate::Bert`]'s builder uses.
+pub struct ClipTextBuilder<'a> {
+    lora: LoraBuildConfig<'a>,
+    backbone_dtype: DType,
+    adapter_file: Option<&'a Path>,
+}
+
+impl<'a> ClipTextBuilder<'a> {
+    /// LoRA adapter configuration: which of this tower's sites (`in_proj`,
+    /// `out_proj`, `c_fc`, `c_proj`, or `all-linear`) get wrapped, at what
+    /// rank.
+    pub fn lora(mut self, l: LoraBuildConfig<'a>) -> Self {
+        self.lora = l;
+        self
+    }
+
+    /// Dtype the frozen backbone tensors — and the cached causal mask — are
+    /// materialised at. LoRA A/B always live in F32.
+    pub fn backbone_dtype(mut self, d: DType) -> Self {
+        self.backbone_dtype = d;
+        self
+    }
+
+    /// Optional safetensors file to load already-trained LoRA A/B tensors
+    /// from (inference). When `None`, A/B tensors are registered in the
+    /// caller-supplied `VarMap` for training.
+    pub fn adapter(mut self, p: Option<&'a Path>) -> Self {
+        self.adapter_file = p;
+        self
+    }
+
+    /// Materialise the tower from frozen safetensors checkpoint files.
+    ///
+    /// `weights_paths` are mmaped at [`Self::backbone_dtype`]; the trainable
+    /// `VarBuilder` is the adapter file (F32) when one was supplied, else a
+    /// `VarMap`-backed F32 builder. The frozen builder is scoped at the
+    /// checkpoint ROOT, matching [`ClipText::load`]'s own contract (OpenCLIP
+    /// puts text at the root and vision under `visual.*`).
+    pub fn build(
+        self,
+        weights_paths: &[&Path],
+        config: &ClipTextConfig,
+        device: &Device,
+        varmap: &VarMap,
+    ) -> Result<ClipText, EncoderError> {
+        let frozen_vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(weights_paths, self.backbone_dtype, device)?
+        };
+        let trainable_vb = if let Some(adapter) = self.adapter_file {
+            unsafe { VarBuilder::from_mmaped_safetensors(&[adapter], DType::F32, device)? }
+        } else {
+            VarBuilder::from_varmap(varmap, DType::F32, device)
+        };
+        // One trainable sub-builder per block, so each site's adapter key is
+        // `resblocks.{n}.{site}.lora_{a,b}` — the exact keys
+        // `ClipText::named_trainable_weights` writes.
+        let block_vbs = block::block_var_builders(&trainable_vb, ADAPTER_BLOCK_ROOT, config.layers);
+        ClipText::load_with(frozen_vb, config, self.backbone_dtype, &|n| LoraSite {
+            lora_vb: &block_vbs[n],
+            layer_idx: Some(n),
+            lora: &self.lora,
+            varmap,
+        })
+    }
+}
+
+/// Build the `[size, size]` additive causal mask in `dtype`: `0.0` on and
+/// below the diagonal, `dtype`'s own most-negative finite value above it.
+/// Constructed once at load time and sliced per forward.
+///
+/// # Why the sentinel follows the dtype (family D)
+///
+/// The mask is an ADDITIVE pre-softmax term, so it must be representable in
+/// the dtype the attention scores are computed in. `f32::MIN` written into
+/// an F16 tensor is not "a very negative number", it is `-inf` — and
+/// `-inf + finite` composed through a softmax whose row is entirely masked
+/// yields `NaN`, a confident wrong number rather than an error. Each dtype
+/// therefore contributes its OWN most-negative finite value: `f32::MIN`,
+/// `half::f16::MIN` (`-65504`), `half::bf16::MIN`. All three are exactly
+/// representable as `f32`, so the vector is built once in `f32` with the
+/// chosen sentinel and cast EXACTLY by `to_dtype` — which for `F32` is
+/// `self.clone()` (candle `tensor.rs`'s same-dtype early return), making the
+/// F32 mask byte-for-byte the tensor this function has always produced.
+///
+/// A CLIP-text row can never be fully masked (the causal diagonal is always
+/// allowed), so the composed training softmax always sees a finite row
+/// maximum and the masked entries decay to an exact zero with zero backward.
+///
+/// Integer dtypes are a typed refusal: an additive attention mask has no
+/// meaning outside the floating dtypes, and silently reinterpreting the
+/// sentinel as an integer would be exactly the confident-wrong-number
+/// failure this gate exists to prevent.
+fn build_causal_mask(
+    size: usize,
+    dtype: DType,
+    device: &candle_core::Device,
+) -> Result<Tensor, EncoderError> {
+    let sentinel = dtype_min_sentinel(dtype)?;
     let mut data = vec![0f32; size * size];
     for row in 0..size {
         for col in (row + 1)..size {
-            data[row * size + col] = f32::MIN;
+            data[row * size + col] = sentinel;
         }
     }
-    Ok(Tensor::from_vec(data, (size, size), device)?)
+    let mask = Tensor::from_vec(data, (size, size), device)?;
+    Ok(mask.to_dtype(dtype)?)
+}
+
+/// `dtype`'s most-negative FINITE value, as an `f32` (exact for all three
+/// supported floating dtypes — every `f16`/`bf16` value is exactly
+/// representable in `f32`). See [`build_causal_mask`] for why this follows
+/// the dtype and why a non-floating dtype is refused rather than coerced.
+pub(crate) fn dtype_min_sentinel(dtype: DType) -> Result<f32, EncoderError> {
+    Ok(match dtype {
+        // F64 keeps `f32::MIN` rather than `f64::MIN`: the mask vector is
+        // built in `f32` (so the F32 case stays byte-identical), and
+        // `f32::MIN` ≈ -3.4e38 is already ~36 orders of magnitude below any
+        // attention score this tower can produce. `f64::MIN` would not
+        // survive that `f32` build at all.
+        DType::F32 | DType::F64 => f32::MIN,
+        DType::F16 => half::f16::MIN.to_f32(),
+        DType::BF16 => half::bf16::MIN.to_f32(),
+        other => {
+            return Err(EncoderError::Config(format!(
+                "additive attention mask: unsupported dtype {other:?} — a mask sentinel is \
+                 only meaningful in a floating dtype (F32/F16/BF16)"
+            )))
+        }
+    })
 }
 
 /// Gather one `[width]` row per batch from `hidden` (shape `[batch, seq, width]`)
@@ -413,6 +580,116 @@ mod tests {
             heads: 2,
             embed_dim: 8,
         }
+    }
+
+    /// D6, F32 leg: the dtype-following mask is BYTE-IDENTICAL at F32 to the
+    /// hardcoded `f32::MIN` upper triangle this function built before it
+    /// took a dtype. This is the construction-level companion to
+    /// `tests/bits_snapshot.rs`'s end-to-end K4 hash — it localises a
+    /// regression to the mask rather than leaving it to a whole-tower digest.
+    #[test]
+    fn causal_mask_at_f32_is_byte_identical_to_the_hardcoded_f32_min_triangle() {
+        let device = Device::Cpu;
+        let size = 7;
+        let mut expected = vec![0f32; size * size];
+        for row in 0..size {
+            for col in (row + 1)..size {
+                expected[row * size + col] = f32::MIN;
+            }
+        }
+        let mask = build_causal_mask(size, DType::F32, &device).unwrap();
+        assert_eq!(mask.dtype(), DType::F32);
+        let got: Vec<u32> = mask
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect();
+        let want: Vec<u32> = expected.into_iter().map(f32::to_bits).collect();
+        assert_eq!(got, want);
+    }
+
+    /// D6, reduced-precision legs: at F16 and BF16 the sentinel is that
+    /// dtype's OWN most-negative finite value, and — the point of the whole
+    /// exercise — it stays FINITE. Casting `f32::MIN` into either dtype
+    /// would produce `-inf` instead, which an additive pre-softmax mask
+    /// cannot carry (an `-inf` row max composes to `NaN`). BF16 is covered
+    /// at CONSTRUCTION only: candle-core 0.11's CPU matmul refuses BF16, so
+    /// there is no honest CPU forward to assert it through.
+    #[test]
+    fn causal_mask_at_f16_and_bf16_uses_that_dtype_s_own_finite_minimum() {
+        let device = Device::Cpu;
+        let size = 5;
+
+        let f16_mask = build_causal_mask(size, DType::F16, &device).unwrap();
+        assert_eq!(f16_mask.dtype(), DType::F16);
+        let rows = f16_mask.to_vec2::<half::f16>().unwrap();
+        assert_eq!(rows[0][1], half::f16::MIN, "masked entry must be f16::MIN");
+        assert!(rows[0][1].is_finite(), "the sentinel must not be -inf");
+        assert_eq!(rows[0][0], half::f16::ZERO, "allowed entry must be 0");
+        assert_eq!(rows[4][0], half::f16::ZERO);
+
+        let bf16_mask = build_causal_mask(size, DType::BF16, &device).unwrap();
+        assert_eq!(bf16_mask.dtype(), DType::BF16);
+        let rows = bf16_mask.to_vec2::<half::bf16>().unwrap();
+        assert_eq!(
+            rows[0][1],
+            half::bf16::MIN,
+            "masked entry must be bf16::MIN"
+        );
+        assert!(rows[0][1].is_finite(), "the sentinel must not be -inf");
+        assert_eq!(rows[0][0], half::bf16::ZERO);
+
+        // The regression this guards: the OLD f32 sentinel cast into either
+        // dtype is -inf, not a large finite number.
+        let overflowed = Tensor::from_vec(vec![f32::MIN], 1, &device)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap()
+            .to_vec1::<half::f16>()
+            .unwrap();
+        assert!(
+            overflowed[0].is_infinite(),
+            "control: f32::MIN cast to f16 must indeed overflow to -inf, or this test is \
+             guarding nothing"
+        );
+    }
+
+    /// Family-D edge: a non-floating dtype has no meaningful additive-mask
+    /// sentinel, so it is a typed refusal rather than a silently
+    /// reinterpreted bit pattern.
+    #[test]
+    fn causal_mask_refuses_a_non_floating_dtype() {
+        let device = Device::Cpu;
+        let err = build_causal_mask(4, DType::U32, &device).unwrap_err();
+        assert!(
+            matches!(err, EncoderError::Config(ref m) if m.contains("U32")),
+            "expected a typed Config refusal naming the dtype, got {err:?}"
+        );
+    }
+
+    /// The frozen `load` path and the builder's `frozen()` path are ONE
+    /// loader (`ClipText::load_with`), so their outputs agree bit-for-bit —
+    /// A2-i at the unit level, on a `VarMap`-backed tower (the
+    /// fixture-backed leg lives in `tests/tower_lora.rs`). Also pins that a
+    /// frozen tower reports no trainable params.
+    #[test]
+    fn frozen_builder_config_installs_no_sites_and_leaves_training_off() {
+        let cfg = tiny_config();
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mut model = ClipText::load(vb, &cfg).unwrap();
+        deterministic_fill_varmap(&varmap, &device);
+
+        assert!(model.trainable_params().is_empty());
+        assert!(model.named_trainable_weights().unwrap().is_empty());
+        assert!(model.dropout_positions().unwrap().is_empty());
+        assert!(!model.is_training());
+        model.set_training(true);
+        assert!(model.is_training());
     }
 
     #[test]
@@ -554,7 +831,7 @@ mod tests {
         let pos_emb = model.positional_embedding.i((..seq, ..)).unwrap();
         let x = token_emb.broadcast_add(&pos_emb).unwrap();
         let causal = model.causal_mask.i((..seq, ..seq)).unwrap();
-        let block0_out = model.blocks[0].forward(&x, &causal).unwrap();
+        let block0_out = model.blocks[0].forward(&x, Some(&causal)).unwrap();
 
         let loss = nonuniform_loss(&block0_out, model.hidden_size(), device);
         let grads = loss.backward().unwrap();

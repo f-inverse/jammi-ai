@@ -59,6 +59,41 @@ fn build_frozen_bert_head64(device: &Device) -> Bert {
         .expect("build frozen BERT on tiny_bert_head64")
 }
 
+/// `Bert::dtype` (and therefore `AnyEncoder::dtype`) reports the dtype the
+/// FROZEN BACKBONE weights were actually materialised at, read off the
+/// word-embedding table — not a remembered builder setting.
+///
+/// The table-driven form is the point: a `dtype()` that returned a constant
+/// `DType::F32` would pass a single-case test. Both rows must hold, and the
+/// two must differ.
+#[test]
+fn bert_dtype_reports_the_backbone_weights_own_dtype() {
+    use jammi_encoders::AnyEncoder;
+    let device = Device::Cpu;
+    let config = load_config();
+    let weights = weights_path();
+    for backbone_dtype in [DType::F32, DType::F16] {
+        let varmap = VarMap::new();
+        let bert = Bert::builder()
+            .pooling(Pooling::Mean)
+            .lora(LoraBuildConfig::frozen())
+            .backbone_dtype(backbone_dtype)
+            .adapter(None)
+            .build(&[weights.as_path()], &config, &device, &varmap)
+            .expect("build frozen BERT");
+        assert_eq!(
+            bert.dtype(),
+            backbone_dtype,
+            "Bert::dtype must follow backbone_dtype = {backbone_dtype:?}"
+        );
+        assert_eq!(
+            AnyEncoder::Bert(bert).dtype(),
+            backbone_dtype,
+            "AnyEncoder::dtype must forward the variant's own dtype"
+        );
+    }
+}
+
 #[test]
 fn bert_loads_with_lora_frozen() {
     let device = Device::Cpu;

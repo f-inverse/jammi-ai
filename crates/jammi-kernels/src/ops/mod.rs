@@ -407,7 +407,7 @@ pub fn apply_inplace3<T: KernelOp + InplaceOp3>(
 ///   [`apply3`]'s own by-value shape and every existing op's inline
 ///   `::new()`-at-the-call-site convention — e.g. `AttentionBlockFused::new`,
 ///   `crates/jammi-encoders/src/attention_cascade.rs:936`; `DropoutFused::new`,
-///   `crates/jammi-lora/src/lora_linear.rs:1022`); nothing in this crate
+///   `crates/jammi-lora/src/lora_linear.rs:1071`); nothing in this crate
 ///   ever clones an op value, stateful or not.
 /// - If a stateful op were `Clone`, a caller could hold one instance in a
 ///   struct field (`struct Layer { op: FlashVarlenAttention }`) and reuse

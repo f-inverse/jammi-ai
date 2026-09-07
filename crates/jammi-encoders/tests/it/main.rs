@@ -6,6 +6,7 @@ mod batch_composition_invariance;
 mod bert;
 mod clip_text;
 mod distilbert;
+mod lora_site_names;
 mod modernbert;
 mod modernbert_sliding_window;
 mod pooling;

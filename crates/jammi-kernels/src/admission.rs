@@ -85,9 +85,9 @@
 //! unmatched rather than silently accepted).
 //!
 //! **Live standalone** (reachable directly, own call site, own predicate):
-//! `"layer_norm_fused"` (`jammi-encoders/src/layer_norm.rs:582`),
+//! `"layer_norm_fused"` (`jammi-encoders/src/layer_norm.rs:583`),
 //! `"geglu_fused"` (`jammi-encoders/src/modernbert.rs:1424`),
-//! `"lora_linear_fused"` (`jammi-lora/src/lora_linear.rs:958`), and
+//! `"lora_linear_fused"` (`jammi-lora/src/lora_linear.rs:1007`), and
 //! `"attention_block_fused"` (`jammi-encoders/src/attention_cascade.rs:914`) itself.
 //!
 //! **Subsumed** (reachable ONLY when `"attention_block_fused"` is ALSO
@@ -99,7 +99,7 @@
 //! (`modernbert.rs:1188`).
 //!
 //! **Subsumed by `"lora_linear_fused"`** (reachable ONLY when
-//! `"lora_linear_fused"` (`jammi-lora/src/lora_linear.rs:958`) itself
+//! `"lora_linear_fused"` (`jammi-lora/src/lora_linear.rs:1007`) itself
 //! admits Fused — `crate::ops::LowRankResidualLinear::bwd` is the sole
 //! call site that ever passes either key to [`admit`], and
 //! `LowRankResidualLinear` is only constructed on the branch where
@@ -1774,8 +1774,8 @@ impl ProbedOp {
 /// | `geglu` | TwoArm | `geglu_fused` | `geglu_fused`, `crates/jammi-encoders/src/modernbert.rs:1380` |
 /// | `gelu_erf` | TwoArm | `gelu_erf_fused` | `gelu_erf_fused`, `crates/jammi-kernels/src/ops/gelu_erf.rs`'s `GeluErfFused::name()`; the `admit()` CALL SITE is `crates/jammi-encoders/src/activations.rs`'s `gelu_erf(x, training)`, reachable on every training-mode erf-GELU call for a head_dim-agnostic BERT-family MLP — `BertIntermediate::forward` (`bert.rs:296`) and `DistilBertFfn::forward` (`distilbert.rs:211`) both call it. |
 /// | `attention_block` | TwoArm | `attention_block_fused` | `attention_block_fused`, `crates/jammi-encoders/src/attention_cascade.rs:399` |
-/// | `dropout` | TwoArm | `lora_linear_fused` | `lora_linear_fused`, `crates/jammi-lora/src/lora_linear.rs:958` (`admit` call site) |
-/// | `low_rank_residual_linear` | TwoArm | `lora_linear_fused` | `lora_linear_fused`, `crates/jammi-lora/src/lora_linear.rs:958` (`admit` call site) |
+/// | `dropout` | TwoArm | `lora_linear_fused` | `lora_linear_fused`, `crates/jammi-lora/src/lora_linear.rs:1007` (`admit` call site) |
+/// | `low_rank_residual_linear` | TwoArm | `lora_linear_fused` | `lora_linear_fused`, `crates/jammi-lora/src/lora_linear.rs:1007` (`admit` call site) |
 /// | `cast_scale` | TwoArm | bf16 → `cast_scale_bf16_f32`, f16 → `cast_scale_f16_f32` | `cast_scale_bf16_f32`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1054`; `cast_scale_f16_f32`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1068` |
 /// | `cast_add` | TwoArm | bf16 → `cast_add_bf16`, f16 → `cast_add_f16` | `cast_add_bf16`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1153`; `cast_add_f16`, `crates/jammi-kernels/src/ops/low_rank_residual_linear.rs:1165` |
 /// | `adamw_step` | TwoArm | `adamw_step_fused` | `adamw_step_fused`, `crates/jammi-ai/src/fine_tune/adamw.rs:33` (`admit`, `crates/jammi-ai/src/fine_tune/adamw.rs:257`) |

@@ -113,9 +113,27 @@ struct FinetuneRunArgs {
     /// itself before invoking this binary for the `alloff` arm.
     #[arg(long)]
     arm: String,
-    /// Training triplets — JSONL, one object per line:
+    /// Which TOWER of `--model-dir`'s checkpoint to fine-tune:
+    /// `text_embedding` (the default — every invocation written before this
+    /// flag existed keeps its exact behaviour), `image_embedding` (an
+    /// OpenCLIP vision tower), or `audio_embedding` (an HF-CLAP HTSAT audio
+    /// tower). The task also selects which ROW SHAPE `--train-jsonl` /
+    /// `--heldout-jsonl` must carry — see those flags' docs and
+    /// `finetune_run::Task`'s.
+    #[arg(long, default_value = "text_embedding")]
+    task: String,
+    /// Training triplets — JSONL, one object per line.
+    ///
+    /// For `--task text_embedding`:
     /// `{"anchor_id","anchor_text","positive_id","positive_text","negative_id","negative_text"}`,
     /// in the committed train-split's fixed order.
+    ///
+    /// For a MEDIA task (`image_embedding`/`audio_embedding`):
+    /// `{"anchor_id","anchor_path","positive_id","positive_path","negative_id","negative_path"}`,
+    /// where each `*_path` is RELATIVE TO THIS FILE'S OWN DIRECTORY and
+    /// names an encoded image/audio file this loader reads the bytes of
+    /// (the shape `ci/scripts/perf/gen_fixed_shape_image_corpus.py` and
+    /// `gen_fixed_length_audio_corpus.py` emit).
     #[arg(long)]
     train_jsonl: PathBuf,
     /// The held-out fixture's committed id list — TAB-separated
@@ -827,6 +845,7 @@ async fn main() -> std::process::ExitCode {
             let FinetuneRunArgs {
                 model_dir,
                 arm,
+                task,
                 train_jsonl,
                 heldout_ids,
                 heldout_jsonl,
@@ -875,16 +894,43 @@ async fn main() -> std::process::ExitCode {
                     return std::process::ExitCode::FAILURE;
                 }
             };
-            let (train_pairs, train_pairs_file_sha256) = match load_train_jsonl(&train_jsonl) {
-                Ok(v) => v,
+            let task = match task.parse::<finetune_run::Task>() {
+                Ok(t) => t,
                 Err(e) => {
-                    eprintln!("finetune-run: --train-jsonl {train_jsonl:?}: {e}");
+                    eprintln!("finetune-run: {e}");
                     return std::process::ExitCode::FAILURE;
                 }
             };
-            let (heldout_pairs, heldout_ids_sha256, heldout_pairs_sha256) =
-                match load_heldout_fixture(&heldout_ids, &heldout_jsonl) {
-                    Ok(v) => v,
+            // `--task` selects the ROW SHAPE, so exactly one of the two
+            // loader pairs runs and the other's vectors stay empty (the
+            // invariant `FinetuneRunParams::validate_rows_match_task`
+            // re-checks on the tier side). A text leg takes byte-identically
+            // the path it always has.
+            let is_media = task != finetune_run::Task::Text;
+            let mut train_pairs = Vec::new();
+            let mut heldout_pairs = Vec::new();
+            let mut train_media = Vec::new();
+            let mut heldout_media = Vec::new();
+            let train_pairs_file_sha256;
+            let heldout_ids_sha256;
+            let heldout_pairs_sha256;
+            if is_media {
+                match load_train_media_jsonl(&train_jsonl) {
+                    Ok((rows, sha)) => {
+                        train_media = rows;
+                        train_pairs_file_sha256 = sha;
+                    }
+                    Err(e) => {
+                        eprintln!("finetune-run: --train-jsonl {train_jsonl:?}: {e}");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                }
+                match load_heldout_media_fixture(&heldout_ids, &heldout_jsonl) {
+                    Ok((rows, ids_sha, jsonl_sha)) => {
+                        heldout_media = rows;
+                        heldout_ids_sha256 = ids_sha;
+                        heldout_pairs_sha256 = jsonl_sha;
+                    }
                     Err(e) => {
                         eprintln!(
                             "finetune-run: --heldout-ids {heldout_ids:?} / --heldout-jsonl \
@@ -892,7 +938,33 @@ async fn main() -> std::process::ExitCode {
                         );
                         return std::process::ExitCode::FAILURE;
                     }
-                };
+                }
+            } else {
+                match load_train_jsonl(&train_jsonl) {
+                    Ok((rows, sha)) => {
+                        train_pairs = rows;
+                        train_pairs_file_sha256 = sha;
+                    }
+                    Err(e) => {
+                        eprintln!("finetune-run: --train-jsonl {train_jsonl:?}: {e}");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                }
+                match load_heldout_fixture(&heldout_ids, &heldout_jsonl) {
+                    Ok((rows, ids_sha, jsonl_sha)) => {
+                        heldout_pairs = rows;
+                        heldout_ids_sha256 = ids_sha;
+                        heldout_pairs_sha256 = jsonl_sha;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "finetune-run: --heldout-ids {heldout_ids:?} / --heldout-jsonl \
+                             {heldout_jsonl:?}: {e}"
+                        );
+                        return std::process::ExitCode::FAILURE;
+                    }
+                }
+            }
             let lr_schedule = match schedule.as_str() {
                 "constant" => jammi_ai::fine_tune::LrSchedule::Constant,
                 "cosine_decay" => jammi_ai::fine_tune::LrSchedule::CosineDecay,
@@ -919,8 +991,11 @@ async fn main() -> std::process::ExitCode {
             let params = finetune_run::FinetuneRunParams {
                 model_dir,
                 arm,
+                task,
                 train_pairs,
                 heldout_pairs,
+                train_media,
+                heldout_media,
                 train_pairs_file_sha256,
                 heldout_ids_sha256,
                 heldout_pairs_sha256,
@@ -1188,6 +1263,164 @@ fn load_train_jsonl(
         });
     }
     Ok((rows, sha256))
+}
+
+/// [`TripletRow`]'s MEDIA twin, shared by `--train-jsonl` and
+/// `--heldout-jsonl` when `--task` selects a media tower: an (anchor,
+/// positive, negative) triplet of FILE PATHS, keyed by `anchor_id`.
+///
+/// Two explicit row structs selected by `--task`, deliberately NOT one
+/// `#[serde(untagged)]` enum: an untagged enum silently falls through to the
+/// second variant when the first fails to parse, so a text corpus fed to a
+/// media leg (or a single row with a typo'd `anchor_text` key) would be
+/// re-interpreted as the other shape instead of refused. The task says which
+/// shape is expected and a row that is not that shape is a parse error
+/// naming the line.
+///
+/// Every `*_path` is resolved RELATIVE TO THE JSONL'S OWN DIRECTORY (never
+/// the process's cwd), so a corpus tree stays valid wherever it is unpacked
+/// — the property the `ci/scripts/perf/gen_fixed_*_corpus.py` producers'
+/// output depends on.
+#[derive(serde::Deserialize)]
+struct MediaTripletRow {
+    anchor_id: String,
+    anchor_path: String,
+    #[serde(rename = "positive_id")]
+    _positive_id: String,
+    positive_path: String,
+    #[serde(rename = "negative_id")]
+    _negative_id: String,
+    negative_path: String,
+}
+
+/// sha256 (hex) of `bytes` — the MEASURED content anchor this crate stamps
+/// on every media member it reads (see [`finetune_run::MediaTriplet`]'s
+/// doc).
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+/// Read one media member: resolve `rel` against `base_dir` and return its
+/// bytes plus their sha256. Refuses (naming the row, the field and the
+/// resolved path) rather than substituting an empty buffer for a missing
+/// file — a silently empty clip would decode to nothing and quietly train
+/// on a degenerate batch.
+fn read_media_member(
+    base_dir: &std::path::Path,
+    rel: &str,
+    line_no: usize,
+    field: &str,
+) -> Result<(Vec<u8>, String), Box<dyn std::error::Error>> {
+    let path = base_dir.join(rel);
+    let bytes = std::fs::read(&path).map_err(|e| {
+        format!(
+            "line {line_no}: {field} {rel:?} resolved to {} — {e}",
+            path.display()
+        )
+    })?;
+    if bytes.is_empty() {
+        return Err(format!(
+            "line {line_no}: {field} {rel:?} ({}) is empty — an empty media file cannot be \
+             decoded into a training example",
+            path.display()
+        )
+        .into());
+    }
+    let sha = sha256_hex(&bytes);
+    Ok((bytes, sha))
+}
+
+/// Load a JSONL file of [`MediaTripletRow`]s, in file order, into
+/// [`finetune_run::MediaTriplet`]s keyed by `anchor_id` — the media shape
+/// `--train-jsonl` supplies under `--task image_embedding`/`audio_embedding`.
+/// Returns the rows plus the sha256 (hex) of the JSONL file's own bytes.
+///
+/// The returned digest carries the SAME meaning it does on the text path
+/// ([`load_train_jsonl`]): the bytes of the manifest this run opened. It is
+/// NOT a digest of the corpus — for media the manifest names files whose
+/// content a caller could swap without touching the JSONL, so each row's
+/// three members carry their OWN measured `*_sha256` (see
+/// [`finetune_run::MediaTriplet`]), exactly the content-anchoring the
+/// held-out text path gained in unit-63 finding 5(a).
+fn load_train_media_jsonl(
+    path: &std::path::Path,
+) -> Result<(Vec<finetune_run::MediaTriplet>, String), Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(path)?;
+    let sha256 = sha256_hex(&bytes);
+    let base_dir = path
+        .parent()
+        .ok_or("media --train-jsonl path has no parent directory to resolve *_path against")?
+        .to_path_buf();
+    let text = String::from_utf8(bytes)?;
+    let mut rows = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let line_no = i + 1;
+        let row: MediaTripletRow =
+            serde_json::from_str(line).map_err(|e| format!("line {line_no}: {e}"))?;
+        let (anchor, anchor_sha256) =
+            read_media_member(&base_dir, &row.anchor_path, line_no, "anchor_path")?;
+        let (positive, positive_sha256) =
+            read_media_member(&base_dir, &row.positive_path, line_no, "positive_path")?;
+        let (negative, negative_sha256) =
+            read_media_member(&base_dir, &row.negative_path, line_no, "negative_path")?;
+        rows.push(finetune_run::MediaTriplet {
+            id: row.anchor_id,
+            anchor,
+            positive,
+            negative,
+            anchor_sha256,
+            positive_sha256,
+            negative_sha256,
+        });
+    }
+    Ok((rows, sha256))
+}
+
+/// The media twin of [`load_heldout_fixture`]: `heldout_ids` names the
+/// COMMITTED scoring order (`anchor_id\tpositive_id\tnegative_id` per line),
+/// `heldout_jsonl` supplies the media PATHS joined to it BY `anchor_id`.
+/// Both files' own bytes are hashed here, off the files this run opened.
+fn load_heldout_media_fixture(
+    heldout_ids: &std::path::Path,
+    heldout_jsonl: &std::path::Path,
+) -> Result<(Vec<finetune_run::MediaTriplet>, String, String), Box<dyn std::error::Error>> {
+    let ids_bytes = std::fs::read(heldout_ids)?;
+    let heldout_ids_sha256 = sha256_hex(&ids_bytes);
+    let ids_text = String::from_utf8(ids_bytes)?;
+
+    let (rows, heldout_pairs_sha256) = load_train_media_jsonl(heldout_jsonl)?;
+    let mut by_anchor: std::collections::HashMap<String, finetune_run::MediaTriplet> =
+        std::collections::HashMap::new();
+    for row in rows {
+        by_anchor.insert(row.id.clone(), row);
+    }
+
+    let mut out = Vec::new();
+    for (i, line) in ids_text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let anchor_id = line
+            .split('\t')
+            .next()
+            .ok_or_else(|| format!("heldout_ids line {}: missing anchor_id", i + 1))?
+            .to_string();
+        let row = by_anchor.get(&anchor_id).cloned().ok_or_else(|| {
+            format!(
+                "heldout_ids line {}: anchor_id {anchor_id:?} has no matching row in \
+                 --heldout-jsonl",
+                i + 1
+            )
+        })?;
+        out.push(row);
+    }
+    Ok((out, heldout_ids_sha256, heldout_pairs_sha256))
 }
 
 /// Load the held-out fixture: `heldout_ids` names the COMMITTED order
@@ -2535,5 +2768,308 @@ fn emit(report: &Report) {
     match serde_json::to_string_pretty(report) {
         Ok(json) => println!("{json}"),
         Err(e) => eprintln!("failed to serialize report: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The canonical SHA-256 test vector for the message `"abc"` (NIST FIPS
+    /// 180-4, Appendix B.1) — an INDEPENDENTLY KNOWN reference, not a value
+    /// re-derived from this crate's own hasher. It is what binds
+    /// [`sha256_hex`] (and through it every measured media digest) to the
+    /// algorithm it claims to compute rather than to itself.
+    const SHA256_OF_ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    #[test]
+    fn sha256_hex_matches_the_published_test_vector() {
+        assert_eq!(sha256_hex(b"abc"), SHA256_OF_ABC);
+        // Negative control: a one-bit-different message must not collide
+        // with the vector (a stub that returned the constant would pass the
+        // assertion above).
+        assert_ne!(sha256_hex(b"abd"), SHA256_OF_ABC);
+    }
+
+    /// Write a media corpus tree: `files` (relative name -> bytes) plus a
+    /// `triplets.jsonl` in the SAME directory whose `*_path` values are
+    /// those relative names — the exact shape
+    /// `ci/scripts/perf/gen_fixed_shape_image_corpus.py` and
+    /// `gen_fixed_length_audio_corpus.py` emit.
+    fn write_media_corpus(
+        dir: &std::path::Path,
+        files: &[(&str, &[u8])],
+        rows: &[(&str, &str, &str, &str)],
+    ) -> PathBuf {
+        std::fs::create_dir_all(dir).expect("create corpus dir");
+        for (name, bytes) in files {
+            std::fs::write(dir.join(name), bytes).expect("write member");
+        }
+        let jsonl = dir.join("triplets.jsonl");
+        let mut out = String::new();
+        for (id, a, p, n) in rows {
+            out.push_str(&format!(
+                "{{\"anchor_id\":\"{id}\",\"anchor_path\":\"{a}\",\"positive_id\":\"{id}-p\",\
+                 \"positive_path\":\"{p}\",\"negative_id\":\"{id}-n\",\"negative_path\":\"{n}\"}}\n"
+            ));
+        }
+        std::fs::write(&jsonl, out).expect("write jsonl");
+        jsonl
+    }
+
+    /// The media loader reads each row's three files RELATIVE TO THE JSONL'S
+    /// OWN DIRECTORY and stamps each member's MEASURED sha256.
+    ///
+    /// The corpus lives in a tempdir that is not the process's cwd and holds
+    /// names (`a.bin`, …) that do not exist beside the test binary, so a
+    /// loader that resolved against the cwd would fail outright rather than
+    /// pass for the wrong reason. One member is literally `b"abc"`, so its
+    /// stamped digest is checked against the published vector above rather
+    /// than against another call to the same hasher.
+    #[test]
+    fn media_loader_resolves_paths_against_the_jsonl_and_measures_digests() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let corpus = tmp.path().join("nested").join("corpus");
+        let jsonl = write_media_corpus(
+            &corpus,
+            &[
+                ("a.bin", b"abc"),
+                ("p.bin", b"positive"),
+                ("n.bin", b"negative"),
+            ],
+            &[("row-0", "a.bin", "p.bin", "n.bin")],
+        );
+        let (rows, file_sha) = load_train_media_jsonl(&jsonl).expect("load media jsonl");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.id, "row-0");
+        assert_eq!(row.anchor, b"abc");
+        assert_eq!(row.positive, b"positive");
+        assert_eq!(row.negative, b"negative");
+        assert_eq!(
+            row.anchor_sha256, SHA256_OF_ABC,
+            "the stamped digest must be the sha256 of the bytes actually read"
+        );
+        assert_ne!(row.positive_sha256, row.negative_sha256);
+        assert_eq!(
+            file_sha,
+            sha256_hex(&std::fs::read(&jsonl).expect("re-read jsonl")),
+            "the returned manifest digest must be the JSONL file's own bytes"
+        );
+    }
+
+    /// A `*_path` that does not resolve is a refusal naming the LINE, the
+    /// FIELD and the resolved path — never an empty buffer that would train
+    /// on nothing.
+    #[test]
+    fn media_loader_refuses_a_missing_member() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let corpus = tmp.path().join("corpus");
+        let jsonl = write_media_corpus(
+            &corpus,
+            &[("a.bin", b"abc"), ("p.bin", b"pp")],
+            &[("row-0", "a.bin", "p.bin", "missing.bin")],
+        );
+        let err = load_train_media_jsonl(&jsonl)
+            .expect_err("a missing member must refuse")
+            .to_string();
+        assert!(err.contains("line 1"), "{err}");
+        assert!(err.contains("negative_path"), "{err}");
+        assert!(err.contains("missing.bin"), "{err}");
+    }
+
+    /// An EMPTY member file is refused too — it resolves and reads fine, so
+    /// only an explicit emptiness check catches it, and a zero-byte clip
+    /// would otherwise decode to nothing and quietly train on a degenerate
+    /// batch.
+    #[test]
+    fn media_loader_refuses_an_empty_member() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let corpus = tmp.path().join("corpus");
+        let jsonl = write_media_corpus(
+            &corpus,
+            &[("a.bin", b""), ("p.bin", b"pp"), ("n.bin", b"nn")],
+            &[("row-0", "a.bin", "p.bin", "n.bin")],
+        );
+        let err = load_train_media_jsonl(&jsonl)
+            .expect_err("an empty member must refuse")
+            .to_string();
+        assert!(err.contains("is empty"), "{err}");
+        assert!(err.contains("anchor_path"), "{err}");
+    }
+
+    /// A TEXT row fed to the media loader is a parse error naming the line —
+    /// not silently re-interpreted. This is why the two row shapes are two
+    /// explicit structs rather than one `#[serde(untagged)]` enum (see
+    /// [`MediaTripletRow`]'s doc): an untagged enum would fall through to
+    /// the other variant instead of refusing.
+    #[test]
+    fn media_loader_refuses_a_text_shaped_row() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let corpus = tmp.path().join("corpus");
+        std::fs::create_dir_all(&corpus).expect("mkdir");
+        let jsonl = corpus.join("triplets.jsonl");
+        std::fs::write(
+            &jsonl,
+            "{\"anchor_id\":\"r\",\"anchor_text\":\"a\",\"positive_id\":\"p\",\
+             \"positive_text\":\"b\",\"negative_id\":\"n\",\"negative_text\":\"c\"}\n",
+        )
+        .expect("write jsonl");
+        let err = load_train_media_jsonl(&jsonl)
+            .expect_err("a text row must not parse as a media row")
+            .to_string();
+        assert!(err.contains("line 1"), "{err}");
+        assert!(
+            err.contains("anchor_path"),
+            "the error must name the missing field: {err}"
+        );
+    }
+
+    /// The held-out media fixture is scored in the ORDER `--heldout-ids`
+    /// commits, not the order the JSONL happens to list — the same identity
+    /// rule the text path already holds (CONTRACT H1).
+    #[test]
+    fn media_heldout_fixture_follows_the_committed_id_order() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let corpus = tmp.path().join("corpus");
+        let jsonl = write_media_corpus(
+            &corpus,
+            &[
+                ("a0.bin", b"a0"),
+                ("a1.bin", b"a1"),
+                ("p.bin", b"pp"),
+                ("n.bin", b"nn"),
+            ],
+            &[
+                ("row-0", "a0.bin", "p.bin", "n.bin"),
+                ("row-1", "a1.bin", "p.bin", "n.bin"),
+            ],
+        );
+        // Ids file lists row-1 FIRST — the reverse of the JSONL's order.
+        let ids = corpus.join("heldout_ids.txt");
+        std::fs::write(&ids, "row-1\trow-1-p\trow-1-n\nrow-0\trow-0-p\trow-0-n\n")
+            .expect("write ids");
+        let (rows, ids_sha, jsonl_sha) =
+            load_heldout_media_fixture(&ids, &jsonl).expect("load media heldout");
+        assert_eq!(
+            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["row-1", "row-0"],
+            "scoring order is the ids file's, never the JSONL's"
+        );
+        assert_eq!(rows[0].anchor, b"a1");
+        assert_eq!(
+            ids_sha,
+            sha256_hex(&std::fs::read(&ids).expect("re-read ids"))
+        );
+        assert_eq!(
+            jsonl_sha,
+            sha256_hex(&std::fs::read(&jsonl).expect("re-read jsonl"))
+        );
+    }
+
+    /// An id in `--heldout-ids` with no matching row in the media JSONL is
+    /// refused by name — never silently dropped, which would shorten the
+    /// scored set without changing either committed digest.
+    #[test]
+    fn media_heldout_fixture_refuses_an_unjoined_id() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let corpus = tmp.path().join("corpus");
+        let jsonl = write_media_corpus(
+            &corpus,
+            &[("a.bin", b"aa"), ("p.bin", b"pp"), ("n.bin", b"nn")],
+            &[("row-0", "a.bin", "p.bin", "n.bin")],
+        );
+        let ids = corpus.join("heldout_ids.txt");
+        std::fs::write(&ids, "row-0\tx\ty\nrow-9\tx\ty\n").expect("write ids");
+        let err = load_heldout_media_fixture(&ids, &jsonl)
+            .expect_err("an unjoined id must refuse")
+            .to_string();
+        assert!(err.contains("row-9"), "{err}");
+    }
+
+    /// End-to-end schema binding: the committed Python producers' OUTPUT
+    /// must load through this crate's media loader unchanged.
+    ///
+    /// This is the one place the two sides of the contract meet — the
+    /// producers pin the six key names as a literal in their own suites, and
+    /// this test proves the Rust struct deserializes exactly what they
+    /// write, files and all. It runs whenever `python3` is on PATH (CI
+    /// always has it — the whole `ci/scripts/perf/test_*.py` suite depends on
+    /// it); on a machine without it the test says so loudly on stderr rather
+    /// than reporting a pass it did not earn.
+    #[test]
+    fn the_python_producers_emit_exactly_the_media_row_shape_this_loader_reads() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut ran_any = false;
+        for (script, extra) in [
+            (
+                "ci/scripts/perf/gen_fixed_shape_image_corpus.py",
+                vec!["--size".to_string(), "8".to_string()],
+            ),
+            (
+                "ci/scripts/perf/gen_fixed_length_audio_corpus.py",
+                vec![
+                    "--seconds".to_string(),
+                    "0.05".to_string(),
+                    "--sample-rate".to_string(),
+                    "16000".to_string(),
+                ],
+            ),
+        ] {
+            let out_dir = tmp.path().join(
+                std::path::Path::new(script)
+                    .file_stem()
+                    .expect("script stem"),
+            );
+            let output = match std::process::Command::new("python3")
+                .current_dir(&repo_root)
+                .arg(script)
+                .arg("--rows")
+                .arg("4")
+                .arg("--seed")
+                .arg("11")
+                .arg("--out-dir")
+                .arg(&out_dir)
+                .args(&extra)
+                .output()
+            {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!(
+                        "python3 is not runnable here ({e}); the producer/loader schema binding \
+                         was NOT exercised for {script}"
+                    );
+                    continue;
+                }
+            };
+            assert!(
+                output.status.success(),
+                "{script} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            ran_any = true;
+            let jsonl = out_dir.join("triplets.jsonl");
+            let (rows, _sha) = load_train_media_jsonl(&jsonl)
+                .unwrap_or_else(|e| panic!("{script}'s output must load through this crate: {e}"));
+            assert_eq!(rows.len(), 4, "{script}");
+            for row in &rows {
+                assert!(
+                    !row.anchor.is_empty() && !row.positive.is_empty() && !row.negative.is_empty()
+                );
+                assert_ne!(
+                    row.anchor_sha256, row.positive_sha256,
+                    "{script} must emit a positive that is a DISTINCT file from its anchor"
+                );
+                assert_ne!(row.anchor_sha256, row.negative_sha256, "{script}");
+                assert_ne!(row.positive_sha256, row.negative_sha256, "{script}");
+            }
+        }
+        if !ran_any {
+            eprintln!(
+                "WARNING: no producer was exercised — python3 was unavailable. The \
+                 producer/loader schema binding is UNVERIFIED in this run."
+            );
+        }
     }
 }

@@ -42,4 +42,5 @@ mod search_attribution;
 mod smoke;
 mod storage_precision;
 mod storage_root;
+mod tower_adapters;
 mod uat_workflows;

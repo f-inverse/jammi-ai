@@ -87,7 +87,7 @@ so this fixture exercises the SAME declared shapes
   NOT hand-listed in `KNOWN_KERNEL_NAMES` (module doc, "`BASE-GEMM`:
   GEMM-family kernel identity, by NAME").
 
-None of the 22 rows' `us_per_step`/`launches_per_step`/`share` fields are
+None of the 24 rows' `us_per_step`/`launches_per_step`/`share` fields are
 asserted as literal expected values anywhere in the test suite — only
 structural invariants (which chain a row lands in, that shares partition
 `gpu_kernel_us_per_step`, that every declared chain is present-or-absent)

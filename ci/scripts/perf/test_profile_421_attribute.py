@@ -113,6 +113,17 @@ def load_fixture_census(path: Path = FIXTURE_KERNELS) -> dict:
         return json.load(f)
 
 
+def badd_launches_at_grid0(census: dict, grid0: int) -> float:
+    """`launches_per_step` of the ONE `badd_f32` row in `census`'s own
+    `by_kernel_and_grid` whose grid's first dimension is `grid0` — used to
+    read the `badd_f32` launch-count ladder straight off a committed
+    fixture, never a transcribed literal."""
+    for row in census["by_kernel_and_grid"]:
+        if row["kernel"] == "badd_f32" and row["grid"][0] == grid0:
+            return row["launches_per_step"]
+    raise AssertionError(f"no badd_f32 row at grid0={grid0} in this census")
+
+
 def clip_text_signatures() -> attribute.TowerSignatures:
     return attribute.derive_signatures("clip-text", CLIP_TEXT_A1_MANIFEST_FIELDS)
 
@@ -867,6 +878,24 @@ class Ln1VsD2DifferentialTests(unittest.TestCase):
             load_fixture_census(FIXTURE_KERNELS_VISION_D1),
             load_fixture_census(FIXTURE_KERNELS_VISION_D2),
         )
+
+    def test_badd_ladder_launches_per_step_by_tower(self):
+        """`badd_f32`'s own `launches_per_step` at the `out` tier grid
+        forms a three-point ladder (A1 -> D2 -> D1) as fusion is
+        progressively disabled — read straight off the six committed
+        fixture cuts, never a transcribed literal. `clip-text`'s own
+        ladder point at `D1` and `clip-vision`'s own ladder point at `D1`
+        are DIFFERENT numbers (874 vs 865) — this is real, per-tower
+        architecture, never claimed identical across towers."""
+        text_a1 = badd_launches_at_grid0(load_fixture_census(FIXTURE_KERNELS), 924)
+        text_d2 = badd_launches_at_grid0(load_fixture_census(FIXTURE_KERNELS_D2), 924)
+        text_d1 = badd_launches_at_grid0(load_fixture_census(FIXTURE_KERNELS_D1), 924)
+        self.assertEqual((text_a1, text_d2, text_d1), (337.0, 633.0, 874.0))
+
+        vision_a1 = badd_launches_at_grid0(load_fixture_census(FIXTURE_KERNELS_VISION_A1), 900)
+        vision_d2 = badd_launches_at_grid0(load_fixture_census(FIXTURE_KERNELS_VISION_D2), 900)
+        vision_d1 = badd_launches_at_grid0(load_fixture_census(FIXTURE_KERNELS_VISION_D1), 900)
+        self.assertEqual((vision_a1, vision_d2, vision_d1), (337.0, 633.0, 865.0))
 
 
 class AttributeCensusD1FixtureTests(unittest.TestCase):

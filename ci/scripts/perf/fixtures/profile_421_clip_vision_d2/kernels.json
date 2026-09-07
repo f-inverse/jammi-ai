@@ -226,6 +226,22 @@
    "launches_per_step": 1.0,
    "us_per_step": 1.7345899999999999,
    "share": 1.9877146050986497e-05
+  },
+  {
+   "kernel": "affine_f32",
+   "grid": [
+    900,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 48.0,
+   "us_per_step": 309.396704,
+   "share": 0.0035454623127666126
   }
  ]
 }

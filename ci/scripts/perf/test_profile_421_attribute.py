@@ -40,6 +40,8 @@ FIXTURE_KERNELS_D2 = PERF_DIR / "fixtures" / "profile_421_clip_text_d2" / "kerne
 FIXTURE_KERNELS_VISION_A1 = PERF_DIR / "fixtures" / "profile_421_clip_vision_a1" / "kernels.json"
 FIXTURE_KERNELS_VISION_D1 = PERF_DIR / "fixtures" / "profile_421_clip_vision_d1" / "kernels.json"
 FIXTURE_KERNELS_VISION_D2 = PERF_DIR / "fixtures" / "profile_421_clip_vision_d2" / "kernels.json"
+FIXTURE_KERNELS_HTSAT_A1 = PERF_DIR / "fixtures" / "profile_421_htsat_a1" / "kernels.json"
+FIXTURE_KERNELS_HTSAT_D1 = PERF_DIR / "fixtures" / "profile_421_htsat_d1" / "kernels.json"
 
 sys.path.insert(0, str(PERF_DIR))
 import profile_421_attribute as attribute  # noqa: E402
@@ -86,6 +88,25 @@ CLIP_VISION_D1_MANIFEST_FIELDS = dict(
 )
 CLIP_VISION_D2_MANIFEST_FIELDS = dict(CLIP_VISION_A1_MANIFEST_FIELDS, kernels_disabled=["lora_linear_fused"])
 
+# The REAL `htsat-A1`/`htsat-D1` legs' own `manifest.json` fields (pod
+# `p421` run 2) — see `fixtures/profile_421_htsat_a1/PROVENANCE.md`.
+HTSAT_A1_MANIFEST_FIELDS = {
+    "tower": "htsat",
+    "dtype": "f32",
+    "batch": 8,
+    "kernels_disabled": [],
+    "census_ok": True,
+    "census_exit": 0,
+    "fusible_site_census": {
+        "n": {"lora_sites_wrapped": 77, "layer_norms": 29, "gelu_seam_calls_per_forward": 12},
+        "m": {"lora_sites_wrapped": 77, "layer_norms": 29, "gelu_seam_calls_per_forward": 12},
+    },
+}
+HTSAT_D1_MANIFEST_FIELDS = dict(
+    HTSAT_A1_MANIFEST_FIELDS,
+    kernels_disabled=["lora_linear_fused", "layer_norm_fused", "gelu_erf_fused"],
+)
+
 
 def load_fixture_census(path: Path = FIXTURE_KERNELS) -> dict:
     with path.open(encoding="utf-8") as f:
@@ -98,6 +119,10 @@ def clip_text_signatures() -> attribute.TowerSignatures:
 
 def clip_vision_signatures() -> attribute.TowerSignatures:
     return attribute.derive_signatures("clip-vision", CLIP_VISION_A1_MANIFEST_FIELDS)
+
+
+def htsat_signatures() -> attribute.HtsatSignatures:
+    return attribute.derive_signatures("htsat", HTSAT_A1_MANIFEST_FIELDS)
 
 
 class DeriveSignaturesTests(unittest.TestCase):
@@ -341,17 +366,19 @@ class ClassifyKernelUnitTests(unittest.TestCase):
         entry = {"kernel": "usqr_f32", "grid": [self.sig.ln_row_count(), 1, 1], "block": [1, 1, 1]}
         self.assertIsNone(attribute.classify_kernel(entry, self.sig, "clip-text"))
 
-    def test_ln_eager_extended_kernel_off_the_shape_falls_through_to_optimizer(self):
+    def test_ln_eager_extended_kernel_off_the_shape_falls_through_to_grad_bookkeeping(self):
         """A DIFFERENT grid for the same names (`grid=[2,1,1],
         block=[1024,1,1]`, `total_threads=2048`) happens to ALSO sit inside
         the `3*width=1536` parameter-scale tile's block-rounded range for
         `clip-text` — when `ln_disabled=False` this row legitimately falls
-        through to the `OPTIMIZER` catch-all instead of `C-LN`, an honest
-        outcome (not `UNATTRIBUTED`), not asserted as a bug."""
+        through to the `GRAD-BOOKKEEPING` catch-all instead of `C-LN`, an
+        honest outcome (not `UNATTRIBUTED`), not asserted as a bug. Pass 3
+        (finding 8): this catch-all is `GRAD-BOOKKEEPING`, NOT `OPTIMIZER`
+        — `OPTIMIZER` names `adamw_*` kernels only now."""
         entry = {"kernel": "urecip_f32", "grid": [2, 1, 1], "block": [1024, 1, 1]}
         self.assertEqual(
             attribute.classify_kernel(entry, self.sig, "clip-text", ln_disabled=False),
-            attribute.CHAIN_OPTIMIZER,
+            attribute.CHAIN_GRAD_BOOKKEEPING,
         )
 
     def test_ampere_sgemm_matches_attn_when_grid_carries_rows_times_heads_at_position_2(self):
@@ -418,6 +445,43 @@ class ClassifyKernelUnitTests(unittest.TestCase):
             attribute.classify_kernel(entry, self.sig, "clip-text"), attribute.CHAIN_BASE_GEMM
         )
 
+    def test_named_kernel_at_a_3d_tile_grid_never_lands_base_gemm_via_the_fallback(self):
+        """Pass 3, finding 4 (adversarial re-audit): the anonymous
+        grid-family fallback is restricted to `Kernel<N>`/`magma_*` names
+        ONLY — a NAMED kernel at a genuine 3-D tile grid (every dimension
+        `>1`, product well above the magnitude floor) must NOT be routed
+        here just because its grid happens to look tile-shaped. These are
+        real shapes, never observed classifying this way."""
+        for name, grid in (
+            ("badd_f32", [2, 2, 278]),
+            ("ucopy_f32", [2, 2, 231]),
+            ("usqrt_f32", [2, 2, 2]),
+        ):
+            entry = {"kernel": name, "grid": grid, "block": [1, 1, 1]}
+            result = attribute.classify_kernel(entry, self.sig, "clip-text")
+            self.assertNotEqual(result, attribute.CHAIN_BASE_GEMM, (name, grid))
+
+    def test_anonymous_kernel_below_the_magnitude_floor_is_not_base_gemm(self):
+        """Pass 3, finding 4: a magnitude floor (`GEMM_TILE_GRID_PRODUCT_
+        FLOOR`) additionally excludes a near-scalar anonymous 3-D grid —
+        `[2,2,2]` (product `8`, every dimension `>1`) is far below the
+        smallest real evidence (`[8,2,28]`, product `448`)."""
+        entry = {"kernel": "Kernel2", "grid": [2, 2, 2], "block": [1, 1, 1]}
+        self.assertIsNone(attribute.classify_kernel(entry, self.sig, "clip-text"))
+
+    def test_anonymous_grid_fallback_runs_after_the_activation_tier_check(self):
+        """Pass 3, finding 4: the anonymous grid-family fallback is placed
+        AFTER the activation-tier checks — an anonymous kernel whose
+        launch ALSO happens to cover an activation tier's own element
+        count lands the TIER bucket, never `BASE-GEMM`, even though its
+        grid is a genuine, floor-clearing 3-D tile (`[4,3,77]`,
+        product=`924`, `924*1024` covers `out_shape_elements=946,176`)."""
+        entry = {"kernel": "Kernel2", "grid": [4, 3, 77], "block": [1024, 1, 1]}
+        self.assertEqual(
+            attribute.classify_kernel(entry, self.sig, "clip-text"),
+            attribute.CHAIN_ELEMENTWISE_OTHER_OUT,
+        )
+
     def test_anonymous_kernel_with_a_degenerate_dimension_is_not_base_gemm(self):
         """Negative control for the above: a `1` in ANY position keeps an
         anonymous kernel OUT of the grid-family GEMM fallback (module doc:
@@ -464,25 +528,27 @@ class ClassifyKernelUnitTests(unittest.TestCase):
             attribute.classify_kernel(entry, self.sig, "clip-text"), attribute.CHAIN_EMBED_GATHER
         )
 
-    def test_optimizer_parameter_scale_by_shape_requires_1d_grid(self):
+    def test_grad_bookkeeping_parameter_scale_by_shape_requires_1d_grid(self):
+        """Pass 3 (finding 8): the parameter-scale catch-all is named
+        `GRAD-BOOKKEEPING`, not `OPTIMIZER` — `adamw_step_fused` is already
+        admitted on A legs by NAME, so these shape-coincident rows are NOT
+        the optimizer."""
         elements = sorted(self.sig.param_scale_elements())[0]
         entry = {"kernel": "usqrt_f32", "grid": [1, 1, 1], "block": [max(elements, 1024), 1, 1]}
         self.assertEqual(
-            attribute.classify_kernel(entry, self.sig, "clip-text"), attribute.CHAIN_OPTIMIZER
+            attribute.classify_kernel(entry, self.sig, "clip-text"), attribute.CHAIN_GRAD_BOOKKEEPING
         )
 
-    def test_optimizer_parameter_scale_negative_control_non_1d_grid(self):
+    def test_grad_bookkeeping_parameter_scale_negative_control_non_1d_grid(self):
         """Pass 3, finding 3: a kernel whose TOTAL THREAD COUNT coincides
         with a parameter-scale element count but whose grid is NOT 1-D
-        (`grid=[ceil(N/b),1,1]`) must NOT land `OPTIMIZER` — evidenced by
-        `clip-text-A2`'s anonymous `Kernel2 grid=[4,1,24]`
+        (`grid=[ceil(N/b),1,1]`) must NOT land `GRAD-BOOKKEEPING` —
+        evidenced by `clip-text-A2`'s anonymous `Kernel2 grid=[4,1,24]`
         (`total_threads=12,288 == LORA_RANK*3*width`, yet a 3-D tiled
         launch, not a bookkeeping op)."""
         elements = sorted(self.sig.param_scale_elements())[0]
         entry = {"kernel": "some_unknown_kernel", "grid": [1, 1, 4], "block": [max(elements, 1024), 1, 1]}
-        self.assertNotEqual(
-            attribute.classify_kernel(entry, self.sig, "clip-text"), attribute.CHAIN_OPTIMIZER
-        )
+        self.assertIsNone(attribute.classify_kernel(entry, self.sig, "clip-text"))
 
     def test_permute_reshape_bucket_by_name_at_any_tier_shape(self):
         """Pass 3, finding 1/2: `ucopy_*`/`copy2d_*` get their OWN bucket
@@ -737,30 +803,27 @@ class UnknownKernelGateOnRealFixtureTests(unittest.TestCase):
 
 
 class Ln1VsD2DifferentialTests(unittest.TestCase):
-    """Pass 3, finding 2's own required test: "toggling only
-    `layer_norm_fused` must move mass into `C-LN`, and the tier buckets
-    must move by less than `C-LN` does" — on the REAL fixture pair, per
-    tower. DIRECTION/ORDERING only, never a literal delta.
-
-    Scope note: "the tier buckets" is read as the buckets whose OWN
-    attribution rule is sensitive to the `ln_disabled` toggle at all —
-    `BASE-GEMM`/`C-ATTN-<tower>` are genuinely LN-orthogonal (their own
-    rules never read `ln_disabled`), so they are the honest negative
-    control here. `BIAS/RESIDUAL-<tier>` is NOT included: on the real
-    export, `badd_f32`'s own `launches_per_step` at the `out` tier differs
-    substantially between the `D1`/`D2` pair EVEN THOUGH both legs have
-    `lora_linear_fused` equally disabled (module doc's own D-leg tile-
-    variant discipline already flags run-to-run cuBLAS/launch-count
-    variance between independent nsys sessions as real, not a bug) — a
-    comparison against that bucket would conflate that variance with the
-    LN toggle's own effect. Similarly, `ELEMENTWISE-OTHER-OUT` measurably
-    grows MORE than `C-LN` itself on the real `clip-text`/`clip-vision`
-    pairs (the eager LayerNorm's own final `gamma*x_hat+beta` affine step
-    runs at the `out` tier's FULL activation width, not `ln_row_count` —
-    outside this pass's own narrow, contract-declared `C-LN` shape) — an
-    ACKNOWLEDGED under-attribution of eager LN's true cost, stated here
-    honestly rather than silently asserted away or force-fit into `C-LN`
-    without shape evidence for doing so."""
+    """Pass 3, finding 2 (adversarial re-audit — corrects the ORIGINAL pass
+    3's own "less than" claim): the module doc's own "D1-vs-D2
+    differential: the measured split" section states the MEASURED numbers
+    on the real, full census (`C-LN` `12-18%` of the `D1-D2` total delta;
+    `ELEMENTWISE-OTHER-OUT` `43-46%`; `BIAS/RESIDUAL-OUT` `33-35%`) and the
+    mechanism (eager LN's own `gamma*x_hat+beta` affine lands as an
+    ordinary `badd_f32` at the `out` tier, whose `launches_per_step` forms
+    a DETERMINISTIC `337 -> 633 -> 874` ladder identically on BOTH towers
+    as fusion is progressively disabled — NOT run-to-run cuBLAS/
+    launch-count session noise, the ORIGINAL pass 3's own dismissal, now
+    corrected). This test asserts EXACTLY what that doc section states:
+    toggling `layer_norm_fused` off (`D1`) moves MASS INTO `C-LN` relative
+    to the fused twin (`D2`) — a positive delta — and BOTH leak buckets
+    (`BIAS/RESIDUAL-OUT`, `ELEMENTWISE-OTHER-OUT`) are NAMED as also
+    moving (also positive), with NO "less than `C-LN`" claim for either
+    (they measurably move MORE). `BASE-GEMM`/`C-ATTN-<tower>` remain the
+    honest LN-ORTHOGONAL negative control (their own rules never read
+    `ln_disabled`, so their delta stays near zero relative to `C-LN`'s
+    own, non-trivial move) — this IS still a "less than" comparison, but
+    only for buckets this module's own rules guarantee are orthogonal, not
+    for the two buckets known to leak."""
 
     def _chain_busy(self, chains: dict, name: str) -> float:
         entry = chains.get(name)
@@ -768,33 +831,38 @@ class Ln1VsD2DifferentialTests(unittest.TestCase):
             return 0.0
         return entry.gpu_busy_us
 
-    def _assert_ln_moves_and_orthogonal_buckets_move_less(self, tower, sig, d1_census, d2_census):
+    def _assert_differential(self, tower, sig, d1_census, d2_census):
         d1_chains, _u1, _r1 = attribute.attribute_census(d1_census, sig, tower, ln_disabled=True)
         d2_chains, _u2, _r2 = attribute.attribute_census(d2_census, sig, tower, ln_disabled=False)
 
-        ln_delta = self._chain_busy(d1_chains, attribute.CHAIN_LN) - self._chain_busy(
-            d2_chains, attribute.CHAIN_LN
-        )
+        def delta(name: str) -> float:
+            return self._chain_busy(d1_chains, name) - self._chain_busy(d2_chains, name)
+
+        ln_delta = delta(attribute.CHAIN_LN)
         # Toggling `layer_norm_fused` off (D1) must move MASS INTO `C-LN`
         # relative to the fused twin (D2) — a positive delta.
         self.assertGreater(ln_delta, 0.0)
 
+        # The two NAMED leak buckets also move — POSITIVE, never claimed
+        # smaller than `ln_delta` (module doc: they measurably move MORE).
+        self.assertGreater(delta(attribute.CHAIN_BIAS_RESIDUAL_OUT), 0.0)
+        self.assertGreater(delta(attribute.CHAIN_ELEMENTWISE_OTHER_OUT), 0.0)
+
+        # Genuinely LN-orthogonal buckets (their own rules never read
+        # `ln_disabled`) move by LESS than `C-LN` itself.
         orthogonal_buckets = (attribute.CHAIN_BASE_GEMM, attribute.chain_attn(tower))
         for bucket in orthogonal_buckets:
-            bucket_delta = abs(
-                self._chain_busy(d1_chains, bucket) - self._chain_busy(d2_chains, bucket)
-            )
-            self.assertLess(bucket_delta, ln_delta, bucket)
+            self.assertLess(abs(delta(bucket)), ln_delta, bucket)
 
     def test_clip_text_d1_vs_d2(self):
         sig = attribute.derive_signatures("clip-text", CLIP_TEXT_D1_MANIFEST_FIELDS)
-        self._assert_ln_moves_and_orthogonal_buckets_move_less(
+        self._assert_differential(
             "clip-text", sig, load_fixture_census(FIXTURE_KERNELS_D1), load_fixture_census(FIXTURE_KERNELS_D2)
         )
 
     def test_clip_vision_d1_vs_d2(self):
         sig = attribute.derive_signatures("clip-vision", CLIP_VISION_D1_MANIFEST_FIELDS)
-        self._assert_ln_moves_and_orthogonal_buckets_move_less(
+        self._assert_differential(
             "clip-vision",
             sig,
             load_fixture_census(FIXTURE_KERNELS_VISION_D1),
@@ -916,9 +984,14 @@ class AttributeCensusVisionA1FixtureTests(unittest.TestCase):
         self.assertIn("badd_f32", chains[attribute.CHAIN_BIAS_RESIDUAL_MLP].kernel_names)
         self.assertIn("badd_f32", chains[attribute.chain_attn("clip-vision")].kernel_names)
 
-    def test_urecip_off_ln_shape_lands_optimizer_via_the_param_scale_catch_all(self):
+    def test_urecip_off_ln_shape_lands_grad_bookkeeping_via_the_param_scale_catch_all(self):
+        """Pass 3 (finding 8): the parameter-scale catch-all this
+        `urecip_f32` row (`grid=[1,1,1]`, `total_threads` inside the
+        `width=768` tier's block-rounded range) falls into is
+        `GRAD-BOOKKEEPING`, not `OPTIMIZER` — `OPTIMIZER` names `adamw_*`
+        kernels by name only now."""
         chains, _u, _r = attribute.attribute_census(self.census, self.sig, "clip-vision")
-        self.assertIn("urecip_f32", chains[attribute.CHAIN_OPTIMIZER].kernel_names)
+        self.assertIn("urecip_f32", chains[attribute.CHAIN_GRAD_BOOKKEEPING].kernel_names)
 
     def test_every_declared_chain_present_including_patch_embed(self):
         chains, _u, _r = attribute.attribute_census(self.census, self.sig, "clip-vision")
@@ -1254,6 +1327,11 @@ class ComputeRealizedGainsTests(unittest.TestCase):
         self.assertIn("slower", lora["direction"])
         self.assertEqual(lora["eager_leg_id"], "clip-text-D2")
         self.assertEqual(lora["fused_leg_id"], "clip-text-A1")
+        # `C-LORA`'s own fused leg (`A1`) IS the baseline leg — the two
+        # denominators COINCIDE (pass 3, finding 5's own convention note).
+        self.assertEqual(lora["baseline_leg_id"], "clip-text-A1")
+        self.assertAlmostEqual(lora["baseline_wall_s"], lora["fused_twin_wall_s"], places=6)
+        self.assertAlmostEqual(lora["share_of_baseline_wall"], lora["share_of_fused_twin_wall"], places=6)
 
     def test_c_ln_is_d1_minus_d2(self):
         legs = [
@@ -1269,6 +1347,42 @@ class ComputeRealizedGainsTests(unittest.TestCase):
         self.assertAlmostEqual(ln["busy_delta_us_per_step"], 10000.0, places=6)
         self.assertEqual(ln["eager_leg_id"], "clip-text-D1")
         self.assertEqual(ln["fused_leg_id"], "clip-text-D2")
+        # Pass 3, finding 5: with no `A1` leg present, `share_of_baseline_wall`
+        # cannot be computed (there is no shipped-A1 wall to divide by) — it
+        # is `None`, never silently substituted with the fused leg's (`D2`'s)
+        # own wall.
+        self.assertIsNone(ln["baseline_wall_s"])
+        self.assertIsNone(ln["share_of_baseline_wall"])
+        self.assertAlmostEqual(ln["fused_twin_wall_s"], 0.13, places=6)
+        self.assertAlmostEqual(ln["share_of_fused_twin_wall"], 0.02 / 0.13, places=6)
+
+    def test_c_ln_share_of_baseline_wall_divides_by_a1_not_d2_pass3_finding5(self):
+        """Pass 3, finding 5: `share_of_baseline_wall` is ALWAYS the
+        tower's SHIPPED `A1` wall, even for `C-LN` (whose pair is `D1` vs
+        `D2` — `D2` is NOT what ships). `fused_twin_wall_s`/
+        `share_of_fused_twin_wall` divide by `D2`'s own wall instead, and
+        the two denominators here are DELIBERATELY DIFFERENT so the test
+        actually pins which is which."""
+        legs = [
+            self._leg("clip-text-A1", "clip-text", "A", attribute.VERDICT_VALID, 60000.0),
+            self._leg("clip-text-D1", "clip-text", "D1", attribute.VERDICT_VALID, 89000.0),
+            self._leg("clip-text-D2", "clip-text", "D2", attribute.VERDICT_VALID, 79000.0),
+        ]
+        merge_by_leg_id = {
+            "clip-text-A1": _merge_row("clip-text-A1", wall_s_per_step=0.10),
+            "clip-text-D1": _merge_row("clip-text-D1", wall_s_per_step=0.15),
+            "clip-text-D2": _merge_row("clip-text-D2", wall_s_per_step=0.13),
+        }
+        gains = attribute.compute_realized_gains(legs, merge_by_leg_id)
+        ln = next(g for g in gains if g["chain"] == attribute.CHAIN_LN and g["tower"] == "clip-text")
+        wall_delta = 0.15 - 0.13
+        self.assertAlmostEqual(ln["baseline_wall_s"], 0.10, places=6)
+        self.assertEqual(ln["baseline_leg_id"], "clip-text-A1")
+        self.assertAlmostEqual(ln["share_of_baseline_wall"], wall_delta / 0.10, places=6)
+        self.assertAlmostEqual(ln["fused_twin_wall_s"], 0.13, places=6)
+        self.assertAlmostEqual(ln["share_of_fused_twin_wall"], wall_delta / 0.13, places=6)
+        # The two denominators (and therefore the two shares) are distinct.
+        self.assertNotAlmostEqual(ln["share_of_baseline_wall"], ln["share_of_fused_twin_wall"], places=6)
 
     def test_missing_twin_produces_no_entry_for_that_tower(self):
         legs = [self._leg("clip-text-A1", "clip-text", "A", attribute.VERDICT_VALID, 60000.0)]
@@ -1331,12 +1445,15 @@ class TwoSidedDecisionRuleTests(unittest.TestCase):
 
     CHAIN_KEY = "C-ATTN-clip-text"
 
-    def _leg(self, leg_id, dtype, s_wall, s_busy, u_wall, u_busy, role="A", verdict=attribute.VERDICT_VALID):
+    def _leg(
+        self, leg_id, dtype, s_wall, s_busy, u_wall, u_busy, role="A", verdict=attribute.VERDICT_VALID, reasons=None
+    ):
         return {
             "leg_id": leg_id,
             "tower": "clip-text",
             "dtype": dtype,
             "verdict": verdict,
+            "reasons": reasons if reasons is not None else [],
             "_role": role,
             "chains": {
                 self.CHAIN_KEY: _chain_result(
@@ -1437,6 +1554,70 @@ class TwoSidedDecisionRuleTests(unittest.TestCase):
         )
         self.assertEqual(decision["verdict"], "DECLINE")
         self.assertIn("F32-only", decision["reason"])
+
+    def test_f32_only_caveat_fires_when_a2_is_absent(self):
+        """Pass 3, finding 1 (adversarial re-audit): the F32-only caveat
+        must fire for ALL THREE ways A2 can be not-decision-grade, not
+        only "present but INVALID" — this is the ABSENT case (no A2 leg
+        in `legs` at all)."""
+        legs = [self._leg("clip-text-A1", "f32", s_wall=0.01, s_busy=0.01, u_wall=0.0, u_busy=0.0)]
+        decision = attribute.decide_candidate_port(
+            "C-ATTN-clip-text", self.CHAIN_KEY, "clip-text", legs, self._merge_for("clip-text-A1")
+        )
+        self.assertEqual(decision["verdict"], "DECLINE")
+        self.assertIn("F32-only", decision["reason"])
+        self.assertIn("no A2 (BF16) leg present", decision["reason"])
+
+    def test_f32_only_caveat_names_the_invalid_reason_when_a2_is_present_but_invalid(self):
+        """The SECOND way: A2 is present in `legs` but this module's own
+        `verdict` for it is INVALID — evidenced by the real
+        `clip-text-A2` (the 1%-unknown-kernel gate). The caveat must NAME
+        the actual reason, not just point at "see this leg's own
+        reasons" (pass 3, finding 1)."""
+        legs = [
+            self._leg("clip-text-A1", "f32", s_wall=0.01, s_busy=0.01, u_wall=0.0, u_busy=0.0),
+            self._leg(
+                "clip-text-A2",
+                "bf16",
+                s_wall=0.01,
+                s_busy=0.01,
+                u_wall=0.0,
+                u_busy=0.0,
+                verdict=attribute.VERDICT_INVALID,
+                reasons=["clip-text-A2: kernel 'Kernel2' (grid=[16, 1, 10]) is not a known kernel name"],
+            ),
+        ]
+        decision = attribute.decide_candidate_port(
+            "C-ATTN-clip-text",
+            self.CHAIN_KEY,
+            "clip-text",
+            legs,
+            self._merge_for("clip-text-A1", "clip-text-A2"),
+        )
+        self.assertEqual(decision["verdict"], "DECLINE")
+        self.assertIn("F32-only", decision["reason"])
+        self.assertIn("Kernel2", decision["reason"])
+        self.assertIn("is not a known kernel name", decision["reason"])
+
+    def test_f32_only_caveat_fires_when_a2_is_valid_but_has_no_merge_row(self):
+        """The THIRD way: A2 is present and this module's own `verdict` is
+        VALID, but `--merge-json` names no corresponding row for it — the
+        merge cannot certify it, so it is still not decision-grade (pass
+        3, finding 1)."""
+        legs = [
+            self._leg("clip-text-A1", "f32", s_wall=0.01, s_busy=0.01, u_wall=0.0, u_busy=0.0),
+            self._leg("clip-text-A2", "bf16", s_wall=0.01, s_busy=0.01, u_wall=0.0, u_busy=0.0),
+        ]
+        decision = attribute.decide_candidate_port(
+            "C-ATTN-clip-text",
+            self.CHAIN_KEY,
+            "clip-text",
+            legs,
+            self._merge_for("clip-text-A1"),  # no merge row for clip-text-A2
+        )
+        self.assertEqual(decision["verdict"], "DECLINE")
+        self.assertIn("F32-only", decision["reason"])
+        self.assertIn("no corresponding row in --merge-json", decision["reason"])
 
     def test_declines_only_when_every_decision_grade_leg_qualifies(self):
         legs = [
@@ -1626,6 +1807,37 @@ class AttributeLegAndReportTests(unittest.TestCase):
             self.assertFalse(row["decision_grade"])
             self.assertIn("merge", row["decision_grade_reason"].lower())
 
+    def test_manifest_less_directory_surfaces_as_invalid_not_dropped_silently(self):
+        """Pass 3 advisory (adversarial re-audit): `_leg_dirs` used to
+        SILENTLY DROP a directory with no `manifest.json` — `build_report`
+        now surfaces it as its own `INVALID` row instead, so a broken pull
+        (a leg directory whose driver crashed before writing a manifest)
+        shows up in `legs_total`/`legs_invalid`, never vanishing from the
+        report's own count."""
+        with tempfile.TemporaryDirectory() as tmp:
+            legs_dir = Path(tmp) / "legs"
+            _write_leg_dir(legs_dir, "clip-text-A1", {}, load_fixture_census())
+            (legs_dir / "clip-text-A2-broken").mkdir(parents=True)
+            report = attribute.build_report(legs_dir, _merge_report_for("clip-text-A1"))
+            self.assertEqual(report["summary"]["legs_total"], 2)
+            self.assertEqual(report["summary"]["legs_invalid"], 1)
+            by_id = {row["leg_id"]: row for row in report["legs"]}
+            broken = by_id["clip-text-A2-broken"]
+            self.assertEqual(broken["verdict"], attribute.VERDICT_INVALID)
+            self.assertTrue(any("manifest.json could not be read" in r for r in broken["reasons"]))
+
+    def test_p2_bf16_scratch_directory_is_still_excluded(self):
+        """The ONE directory `_leg_dirs` still drops on purpose — the P2b
+        BF16 driver's own scratch corpus directory, never a
+        `profile_421_legs.sh` leg at all."""
+        with tempfile.TemporaryDirectory() as tmp:
+            legs_dir = Path(tmp) / "legs"
+            _write_leg_dir(legs_dir, "clip-text-A1", {}, load_fixture_census())
+            (legs_dir / "p2-bf16").mkdir(parents=True)
+            report = attribute.build_report(legs_dir, _merge_report_for("clip-text-A1"))
+            self.assertEqual(report["summary"]["legs_total"], 1)
+            self.assertNotIn("p2-bf16", {row["leg_id"] for row in report["legs"]})
+
 
 class MemcpyMemsetInformationalTests(unittest.TestCase):
     def test_memcpy_memset_reported_but_not_in_any_chain_share(self):
@@ -1666,8 +1878,10 @@ class TableFormattingTests(unittest.TestCase):
 
 
 class HtsatStageSignatureSmokeTests(unittest.TestCase):
-    """Forward-compatibility smoke test only — no real HTSAT export exists
-    to verify these declared constants against yet (module doc)."""
+    """The name-only stage view (`htsat_stage_signatures`) — still a light
+    smoke test, but the FULL per-stage element-count derivation
+    (`derive_htsat_signatures`) is now cross-checked against the real
+    `htsat-A1`/`htsat-D1` exports below (module doc, "HTSAT")."""
 
     def test_four_stages_with_positive_window_and_heads(self):
         stages = attribute.htsat_stage_signatures()
@@ -1677,22 +1891,371 @@ class HtsatStageSignatureSmokeTests(unittest.TestCase):
             self.assertGreater(stage["heads"], 0)
             self.assertGreater(stage["window_size"], 0)
 
-    def test_htsat_has_no_declared_windowing_or_front_fusion_chain_yet(self):
+    def test_htsat_has_no_declared_windowing_or_front_fusion_chain(self):
+        """`WINDOWING`/`FRONT-FUSION` remain UNDECLARED even with real
+        HTSAT exports in hand (module doc, "HTSAT") — a window-partition
+        copy sits at the IDENTICAL element count as a generic residual
+        permute, and the one plausible front-fusion-activation candidate
+        (`urelu_f32`) cannot be told apart from the audio projection
+        head's own ReLU without a dedicated ablation. `GRAD-BOOKKEEPING`
+        is likewise undeclared for `htsat` (no evidenced parameter-scale
+        rule for its nine distinct target-module shapes)."""
         declared = attribute.declared_chains_for_tower("htsat")
         self.assertNotIn(attribute.CHAIN_WINDOWING, declared)
         self.assertNotIn(attribute.CHAIN_FRONT_FUSION, declared)
+        self.assertNotIn(attribute.CHAIN_GRAD_BOOKKEEPING, declared)
+        self.assertNotIn(attribute.CHAIN_BIAS_RESIDUAL_QKV, declared)
         self.assertIn(attribute.CHAIN_GELU_HTSAT, declared)
+        self.assertIn(attribute.CHAIN_LN, declared)
         self.assertIn(attribute.chain_attn("htsat"), declared)
 
-    def test_htsat_tower_is_invalid_no_declared_architecture_yet(self):
-        """`derive_signatures` does not support `tower="htsat"` — a leg
-        naming it becomes INVALID via `SignatureError`, never guessed."""
+
+class HtsatSignatureDerivationTests(unittest.TestCase):
+    """`derive_htsat_signatures`'s own per-stage element counts, checked
+    against the table in `fixtures/profile_421_htsat_a1/PROVENANCE.md`
+    (itself cross-checked against the real `htsat-A1` export)."""
+
+    def setUp(self):
+        self.hsig = htsat_signatures()
+
+    def test_rows_witnessed_from_batch(self):
+        self.assertEqual(self.hsig.rows.value, 24)
+
+    def test_four_stages_with_declared_dims_doubling(self):
+        dims = [s.dim for s in self.hsig.stages]
+        self.assertEqual(dims, [96, 192, 384, 768])
+
+    def test_tokens_quarter_each_stage(self):
+        tokens = [s.tokens for s in self.hsig.stages]
+        self.assertEqual(tokens, [4096, 1024, 256, 64])
+
+    def test_windows_derived_from_tokens_over_window_size_squared(self):
+        windows = [s.windows for s in self.hsig.stages]
+        self.assertEqual(windows, [64, 16, 4, 1])
+
+    def test_attn_batch_count_per_stage(self):
+        counts = [s.attn_batch_count(self.hsig.rows.value) for s in self.hsig.stages]
+        self.assertEqual(counts, [6144, 3072, 1536, 768])
+
+    def test_attn_softmax_rows_per_stage(self):
+        rows = [s.attn_softmax_rows(self.hsig.rows.value) for s in self.hsig.stages]
+        self.assertEqual(rows, [393216, 196608, 98304, 49152])
+
+    def test_mlp_shape_elements_per_stage(self):
+        elements = [s.mlp_shape_elements(self.hsig.rows.value) for s in self.hsig.stages]
+        self.assertEqual(elements, [37748736, 18874368, 9437184, 4718592])
+
+    def test_out_shape_elements_per_stage(self):
+        elements = [s.out_shape_elements(self.hsig.rows.value) for s in self.hsig.stages]
+        self.assertEqual(elements, [9437184, 4718592, 2359296, 1179648])
+
+    def test_known_collision_out_stage_equals_mlp_stage_plus_two(self):
+        """Documented, not resolved (`fixtures/profile_421_htsat_a1/
+        PROVENANCE.md`, "Known ambiguity") — `out(0)==mlp(2)` and
+        `out(1)==mlp(3)` are a mathematical identity of this architecture,
+        never an accident this module should paper over."""
+        rows = self.hsig.rows.value
+        self.assertEqual(self.hsig.stages[0].out_shape_elements(rows), self.hsig.stages[2].mlp_shape_elements(rows))
+        self.assertEqual(self.hsig.stages[1].out_shape_elements(rows), self.hsig.stages[3].mlp_shape_elements(rows))
+
+    def test_signature_error_on_non_positive_batch(self):
+        with self.assertRaises(attribute.SignatureError):
+            attribute.derive_htsat_signatures({"batch": 0})
+
+
+class HtsatAttributeCensusA1FixtureTests(unittest.TestCase):
+    """The whole-census pass against the REAL committed `htsat-A1` 21-row
+    cut (`kernels_disabled=[]`, every fusible seam admitted) — see
+    `fixtures/profile_421_htsat_a1/PROVENANCE.md`."""
+
+    def setUp(self):
+        self.census = load_fixture_census(FIXTURE_KERNELS_HTSAT_A1)
+        self.hsig = htsat_signatures()
+
+    def _chains(self):
+        return attribute.attribute_census(self.census, self.hsig, "htsat", ln_disabled=False)
+
+    def test_chains_partition_busy_exactly(self):
+        chains, _u, _r = self._chains()
+        total_in_rows = sum(r["us_per_step"] for r in self.census["by_kernel_and_grid"])
+        attributed_total = sum(c.gpu_busy_us for c in chains.values() if c.gpu_busy_us is not None)
+        self.assertAlmostEqual(attributed_total, total_in_rows, places=6)
+
+    def test_only_the_two_intentional_kernel2_rows_are_unknown(self):
+        """This fixture's own negative controls (module doc,
+        `test_anonymous_kernel2_degenerate_dims_stay_unattributed`) are the
+        ONLY unknown rows, and neither invalidates the leg (each
+        individually well under the 1% gate)."""
+        _chains, unknown, reasons = self._chains()
+        self.assertEqual({u["kernel"] for u in unknown}, {"Kernel2"})
+        for u in unknown:
+            self.assertLess(u["share_gpu_busy"], attribute.UNKNOWN_KERNEL_SHARE_LIMIT)
+        self.assertEqual(reasons, [])
+
+    def test_every_declared_chain_present_or_absent(self):
+        chains, _u, _r = self._chains()
+        for name in attribute.declared_chains_for_tower("htsat"):
+            self.assertIn(name, chains, name)
+
+    def test_ln_by_name(self):
+        chains, _u, _r = self._chains()
+        ln_names = set(chains[attribute.CHAIN_LN].kernel_names)
+        self.assertIn("layer_norm_fwd_f32_biased", ln_names)
+        self.assertIn("layer_norm_bwd_dx_f32", ln_names)
+
+    def test_gelu_erf_fused_by_name(self):
+        chains, _u, _r = self._chains()
+        gelu_names = set(chains[attribute.CHAIN_GELU_HTSAT].kernel_names)
+        self.assertIn("gelu_erf_fwd_f32", gelu_names)
+        self.assertIn("gelu_erf_bwd_dx_f32", gelu_names)
+
+    def test_attention_batched_gemm_two_different_libraries_two_stages(self):
+        """`ampere_sgemm_128x128_nt grid=[1,1,6144]` (stage 0) and
+        `magma_sgemmEx_kernel grid=[1,2,1536]` (stage 2) are TWO different
+        GEMM libraries, both carrying `grid[2] == attn_batch_count(stage)`
+        — the SAME name-independent relational rule generalizing across
+        stages."""
+        chains, _u, _r = self._chains()
+        attn_names = set(chains[attribute.chain_attn("htsat")].kernel_names)
+        self.assertIn("ampere_sgemm_128x128_nt", attn_names)
+        self.assertIn("magma_sgemmEx_kernel", attn_names)
+
+    def test_attention_elementwise_by_shape_two_stages(self):
+        chains, _u, _r = self._chains()
+        attn_names = set(chains[attribute.chain_attn("htsat")].kernel_names)
+        self.assertIn("badd_f32", attn_names)  # stage 0 attn shape
+        self.assertIn("eq_f32", attn_names)  # stage 2 attn shape
+
+    def test_attention_softmax_reduction_block_64(self):
+        chains, _u, _r = self._chains()
+        self.assertIn("fast_max_f32", chains[attribute.chain_attn("htsat")].kernel_names)
+
+    def test_bias_residual_out_unambiguous_stages(self):
+        """Stages 2/3's own `out` tier grids (`2304`/`1152`) have no
+        `mlp(stage+2)` to collide with — see PROVENANCE.md's own
+        "Known ambiguity" note for the two grids this fixture deliberately
+        avoids (`9216`/`4608`)."""
+        chains, _u, _r = self._chains()
+        self.assertIn("badd_f32", chains[attribute.CHAIN_BIAS_RESIDUAL_OUT].kernel_names)
+
+    def test_permute_reshape_by_name(self):
+        chains, _u, _r = self._chains()
+        self.assertIn("ucopy_f32", chains[attribute.CHAIN_PERMUTE_RESHAPE].kernel_names)
+
+    def test_optimizer_by_name(self):
+        chains, _u, _r = self._chains()
+        self.assertIn("adamw_moment_update_f32", chains[attribute.CHAIN_OPTIMIZER].kernel_names)
+
+    def test_embed_gather_by_name(self):
+        chains, _u, _r = self._chains()
+        self.assertIn("is_u32_f32", chains[attribute.CHAIN_EMBED_GATHER].kernel_names)
+
+    def test_patch_embed_by_name(self):
+        chains, _u, _r = self._chains()
+        self.assertIn("im2col_f32", chains[attribute.CHAIN_PATCH_EMBED].kernel_names)
+
+    def test_dropout_by_name(self):
+        chains, _u, _r = self._chains()
+        self.assertIn("dropout_fwd_f32", chains[attribute.CHAIN_DROPOUT].kernel_names)
+
+    def test_cast_at_non_attn_shape(self):
+        chains, _u, _r = self._chains()
+        self.assertIn("cast_f32_f32", chains[attribute.CHAIN_CAST].kernel_names)
+
+    def test_loss_reduce_catch_all(self):
+        chains, _u, _r = self._chains()
+        self.assertIn("fast_sum_f32", chains[attribute.CHAIN_LOSS_REDUCE].kernel_names)
+
+    def test_base_gemm_by_name(self):
+        chains, _u, _r = self._chains()
+        self.assertIn("ampere_sgemm_128x64_nn", chains[attribute.CHAIN_BASE_GEMM].kernel_names)
+
+    def test_anonymous_kernel2_degenerate_dims_stay_unattributed(self):
+        """The two `Kernel2` rows this fixture carries (`[3,1,36]`,
+        `[12,1,24]`) both have a `1` in grid position 1 — NOT a genuine
+        3-D tile grid — so the anonymous grid-family fallback does not
+        fire and they remain `UNATTRIBUTED` (counted toward the
+        unknown-kernel gate, each individually under 1% of busy on the
+        real leg — module doc)."""
+        chains, unknown, _r = self._chains()
+        self.assertIn("Kernel2", chains[attribute.CHAIN_UNATTRIBUTED].kernel_names)
+        unknown_names = {u["kernel"] for u in unknown}
+        self.assertIn("Kernel2", unknown_names)
+
+
+class HtsatAttributeCensusD1EagerTwinTests(unittest.TestCase):
+    """The whole-census pass against the REAL committed `htsat-D1` 8-row
+    cut (`layer_norm_fused`/`gelu_erf_fused`/`lora_linear_fused` all
+    disabled) — see `fixtures/profile_421_htsat_d1/PROVENANCE.md`."""
+
+    def setUp(self):
+        self.census = load_fixture_census(FIXTURE_KERNELS_HTSAT_D1)
+        self.hsig = htsat_signatures()
+
+    def _chains(self, ln_disabled=True):
+        return attribute.attribute_census(self.census, self.hsig, "htsat", ln_disabled=ln_disabled)
+
+    def test_no_unknown_kernel_names(self):
+        _chains, unknown, reasons = self._chains()
+        self.assertEqual(unknown, [])
+        self.assertEqual(reasons, [])
+
+    def test_eager_ln_reduction_lands_c_ln(self):
+        chains, _u, _r = self._chains(ln_disabled=True)
+        ln_names = set(chains[attribute.CHAIN_LN].kernel_names)
+        self.assertIn("fast_sum_f32", ln_names)
+
+    def test_ln_disabled_false_does_not_misroute_eager_reduction_to_c_ln(self):
+        """Negative control: with `ln_disabled=False` (as if this were an
+        A/D2 leg), the SAME `fast_sum_f32 grid=[98304,...] block=[128,...]`
+        row must NOT land `C-LN` (the eager LN chain literally cannot
+        exist while `layer_norm_fused` is admitted)."""
+        chains, _u, _r = self._chains(ln_disabled=False)
+        self.assertNotIn("fast_sum_f32", chains[attribute.CHAIN_LN].kernel_names)
+
+    def test_attn_softmax_reduction_block_64_not_swept_into_c_ln(self):
+        """The attention-softmax `fast_sum_f32 grid=[393216,...]
+        block=[64,...]` row is UNAFFECTED by the LN toggle — it classifies
+        `C-ATTN-htsat` regardless of `ln_disabled` (module doc,
+        `_is_attn_softmax_reduction_grid`'s own block-size discriminator),
+        even though this SAME leg's `fast_sum_f32 grid=[98304,...]
+        block=[128,...]` row (a DIFFERENT grid) legitimately lands `C-LN`
+        — checked per-ROW (`classify_htsat_kernel` directly), since
+        `kernel_names` aggregates by NAME and would show `fast_sum_f32` in
+        BOTH buckets."""
+        attn_row = {"kernel": "fast_sum_f32", "grid": [393216, 1, 1], "block": [64, 1, 1]}
+        ln_row = {"kernel": "fast_sum_f32", "grid": [98304, 1, 1], "block": [128, 1, 1]}
+        self.assertEqual(
+            attribute.classify_htsat_kernel(attn_row, self.hsig, ln_disabled=True),
+            attribute.chain_attn("htsat"),
+        )
+        self.assertEqual(
+            attribute.classify_htsat_kernel(ln_row, self.hsig, ln_disabled=True),
+            attribute.CHAIN_LN,
+        )
+        chains, _u, _r = self._chains(ln_disabled=True)
+        self.assertIn("fast_sum_f32", chains[attribute.chain_attn("htsat")].kernel_names)
+        self.assertIn("fast_sum_f32", chains[attribute.CHAIN_LN].kernel_names)
+
+    def test_eager_gelu_erf_trio_lands_c_gelu_htsat(self):
+        """`ugelu_erf_f32`/`uerf_f32`/`uneg_f32` — candle's own three-kernel
+        eager `gelu_erf` decomposition — all land `C-GELU-HTSAT`, the SAME
+        chain the FUSED `gelu_erf_fwd_f32`/`gelu_erf_bwd_dx_f32` kernels
+        land on `htsat-A1` (module doc)."""
+        chains, _u, _r = self._chains()
+        gelu_names = set(chains[attribute.CHAIN_GELU_HTSAT].kernel_names)
+        self.assertIn("ugelu_erf_f32", gelu_names)
+        self.assertIn("uerf_f32", gelu_names)
+        self.assertIn("uneg_f32", gelu_names)
+
+    def test_attention_elementwise_and_batched_gemm_still_attn(self):
+        chains, _u, _r = self._chains()
+        attn_names = set(chains[attribute.chain_attn("htsat")].kernel_names)
+        self.assertIn("badd_f32", attn_names)
+        self.assertIn("ampere_sgemm_128x128_nt", attn_names)
+
+
+class HtsatAttributeLegEndToEndTests(unittest.TestCase):
+    """`attribute_leg`/`declared_chains_for_tower` end to end for `htsat` —
+    a real leg now reaches `VALID`, never `INVALID`-by-unrecognised-tower."""
+
+    def test_htsat_a1_leg_is_valid(self):
         with tempfile.TemporaryDirectory() as tmp:
-            manifest = dict(CLIP_TEXT_A1_MANIFEST_FIELDS)
-            manifest["tower"] = "htsat"
-            leg_dir = _write_leg_dir(Path(tmp) / "legs", "htsat-A1", manifest, load_fixture_census())
+            leg_dir = _write_leg_dir(
+                Path(tmp) / "legs", "htsat-A1", HTSAT_A1_MANIFEST_FIELDS, load_fixture_census(FIXTURE_KERNELS_HTSAT_A1)
+            )
             row = attribute.attribute_leg(leg_dir)
-            self.assertEqual(row["verdict"], attribute.VERDICT_INVALID)
+            self.assertEqual(row["reasons"], [])
+            self.assertEqual(row["verdict"], attribute.VERDICT_VALID)
+            self.assertEqual(row["tower"], "htsat")
+
+    def test_htsat_d1_leg_is_valid_and_ln_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg_dir = _write_leg_dir(
+                Path(tmp) / "legs", "htsat-D1", HTSAT_D1_MANIFEST_FIELDS, load_fixture_census(FIXTURE_KERNELS_HTSAT_D1)
+            )
+            row = attribute.attribute_leg(leg_dir)
+            self.assertEqual(row["verdict"], attribute.VERDICT_VALID)
+            self.assertIn("fast_sum_f32", row["chains"][attribute.CHAIN_LN]["kernel_names"])
+
+
+class HtsatRealizedGainTests(unittest.TestCase):
+    """`compute_realized_gains` reuses the SAME machinery for `htsat` — no
+    HTSAT-specific code path — but `C-LN`'s own entry for `htsat` carries a
+    `note` since `htsat`'s `D1` disables `layer_norm_fused` AND
+    `gelu_erf_fused` together (module doc, "HTSAT")."""
+
+    def _leg(self, leg_id, role, verdict, busy, dtype="f32"):
+        return {
+            "leg_id": leg_id,
+            "tower": "htsat",
+            "dtype": dtype,
+            "verdict": verdict,
+            "reasons": [],
+            "chains": {attribute.CHAIN_LN: _chain_result(status="absent")},
+            "_role": role,
+            "_gpu_busy_us_per_step": busy,
+        }
+
+    def test_c_lora_htsat_a1_vs_d2(self):
+        legs = [
+            self._leg("htsat-A1", "A", attribute.VERDICT_VALID, 234764.5),
+            self._leg("htsat-D2", "D2", attribute.VERDICT_VALID, 260000.0),
+        ]
+        merge_by_leg_id = {
+            "htsat-A1": _merge_row("htsat-A1", wall_s_per_step=1.55),
+            "htsat-D2": _merge_row("htsat-D2", wall_s_per_step=1.65),
+        }
+        gains = attribute.compute_realized_gains(legs, merge_by_leg_id)
+        lora = next(g for g in gains if g["chain"] == attribute.CHAIN_LORA and g["tower"] == "htsat")
+        self.assertGreater(lora["busy_delta_us_per_step"], 0.0)
+        self.assertNotIn("note", lora)
+
+    def test_c_ln_htsat_d1_vs_d2_carries_joint_note(self):
+        legs = [
+            self._leg("htsat-A1", "A", attribute.VERDICT_VALID, 234764.5),
+            self._leg("htsat-D1", "D1", attribute.VERDICT_VALID, 348814.4),
+            self._leg("htsat-D2", "D2", attribute.VERDICT_VALID, 260000.0),
+        ]
+        merge_by_leg_id = {
+            "htsat-A1": _merge_row("htsat-A1", wall_s_per_step=1.55),
+            "htsat-D1": _merge_row("htsat-D1", wall_s_per_step=1.69),
+            "htsat-D2": _merge_row("htsat-D2", wall_s_per_step=1.65),
+        }
+        gains = attribute.compute_realized_gains(legs, merge_by_leg_id)
+        ln = next(g for g in gains if g["chain"] == attribute.CHAIN_LN and g["tower"] == "htsat")
+        self.assertIn("note", ln)
+        self.assertIn("JOINT", ln["note"])
+        self.assertIn("C-GELU-HTSAT", ln["note"])
+
+    def test_clip_ln_never_carries_the_joint_note(self):
+        """The `note` is scoped to `htsat` ONLY — CLIP's own `C-LN` (D1
+        disables `layer_norm_fused` alone) never carries it."""
+        legs = [
+            {
+                "leg_id": "clip-text-D1",
+                "tower": "clip-text",
+                "dtype": "f32",
+                "verdict": attribute.VERDICT_VALID,
+                "reasons": [],
+                "chains": {attribute.CHAIN_LN: _chain_result(status="absent")},
+                "_role": "D1",
+                "_gpu_busy_us_per_step": 89000.0,
+            },
+            {
+                "leg_id": "clip-text-D2",
+                "tower": "clip-text",
+                "dtype": "f32",
+                "verdict": attribute.VERDICT_VALID,
+                "reasons": [],
+                "chains": {attribute.CHAIN_LN: _chain_result(status="absent")},
+                "_role": "D2",
+                "_gpu_busy_us_per_step": 79000.0,
+            },
+        ]
+        gains = attribute.compute_realized_gains(legs, {})
+        ln = next(g for g in gains if g["chain"] == attribute.CHAIN_LN and g["tower"] == "clip-text")
+        self.assertNotIn("note", ln)
 
 
 class CliEndToEndTests(unittest.TestCase):

@@ -44,12 +44,22 @@ Read the mapping off the real `clip-text-A2` (BF16), `clip-text-D1`,
 tip `c1b0b0ba`) and named a set of EVIDENCE-BACKED buckets that absorb the
 overwhelming majority of what pass 1 left `UNATTRIBUTED`.
 
-## Pass 3 (this pass — adversarial-audit fold, 7 findings)
+## Pass 3 (adversarial-audit fold, 7 findings; this revision ALSO folds a re-audit round of the fold itself, plus the HTSAT mapping)
 
 Pass 2's own priority order over-attributed two RELATIONAL rules and
 under-split the elementwise tiers; this pass's every change is grounded in
 a specific `(kernel, grid)` row from a real export, same discipline as
-pass 1/2 — see each subsection.
+pass 1/2 — see each subsection. A SECOND, adversarial re-audit of this
+same pass found the fold's own priority order still wrong in two places
+(the F32-only caveat, the anonymous grid-family fallback), one measured
+claim not yet re-derived (the D1-vs-D2 differential's own split), one
+denominator convention left ambiguous (`share_of_baseline_wall`), one
+fixture row transcribed instead of copied byte-exact, several evidence
+paragraphs deleted out from under still-live citations, and one silent
+leg-dropping bug — every one of those is folded into the relevant
+subsection below, never a separate "pass 3.5" — plus the HTSAT
+kernel-name<->shape mapping itself (see "HTSAT" below), read off the real
+`htsat-{A1,A2,D1,D2}` exports for the first time in this revision.
 
 ### `C-ATTN-<tower>`: the pre-registered signature does not move
 
@@ -165,30 +175,44 @@ buckets by LESS than `C-LN` moves — never a literal delta.
 Any kernel name containing `"gemm"` (case-insensitive) that does NOT carry
 the attention batch count at `grid[2]` is `BASE-GEMM` (unchanged from pass
 2); `splitKreduce_kernel` is `BASE-GEMM` unconditionally (unchanged).
-**`OPTIMIZER`'s own parameter-scale rule (below) is now gated on 1-D
-launch geometry** (`grid[1]==1 and grid[2]==1`, i.e. `grid=[ceil(N/b),1,1]`
-— a genuine elementwise/bookkeeping launch never tiles a second or third
-grid dimension): evidenced by `clip-text-A2`'s anonymous `Kernel2 grid=
-[4,1,24]`, whose `total_threads=12,288` EXACTLY matches
-`LORA_RANK*3*width` (a param-scale element count) yet is plainly a 3-D
-tiled launch, not a 1-D bookkeeping op — pass 2's ungated rule would have
-(and, before this fold, silently did) swept it into `OPTIMIZER` by shape
-coincidence, hiding a row this module cannot actually explain.
+**`GRAD-BOOKKEEPING`'s own parameter-scale rule (module doc,
+"`GRAD-BOOKKEEPING`" — pass 3, finding 8 RENAMES this bucket from
+`OPTIMIZER`, since `adamw_step_fused` already covers the actual optimizer
+by name) is gated on 1-D launch geometry** (`grid[1]==1 and grid[2]==1`,
+i.e. `grid=[ceil(N/b),1,1]` — a genuine elementwise/bookkeeping launch
+never tiles a second or third grid dimension): evidenced by
+`clip-text-A2`'s anonymous `Kernel2 grid=[4,1,24]`, whose
+`total_threads=12,288` EXACTLY matches `LORA_RANK*3*width` (a param-scale
+element count) yet is plainly a 3-D tiled launch, not a 1-D bookkeeping
+op — pass 2's ungated rule would have (and, before this fold, silently
+did) swept it into the parameter-scale bucket by shape coincidence, hiding
+a row this module cannot actually explain.
 
-**Anonymous kernels (`Kernel2`, and any future unsymbolized launch) are
-classified ONLY by grid-family rules**, in this order: (1) the batched-
-attention grid rule above (`grid[2] == attn_batch_count()`); (2) otherwise
-`BASE-GEMM` ONLY if the grid is a genuine 3-D tile grid — EVERY one of its
-three dimensions `> 1` (a plausible M-tile x N-tile x batch/split-K launch
-never degenerates to size `1` in any dimension; a `1` in some position is
-a 1-D-ish bookkeeping/reduction launch, `OPTIMIZER`'s own domain, not a
-tiled matmul). Evidenced BOTH ways on `clip-text-D1`/`D2`: `Kernel2
-grid=[8,2,28]` (every dimension `>1`) -> `BASE-GEMM` on both legs
-(cuBLAS picked a different, unsymbolized algorithm once the eager
-LoRA/LN arithmetic shifted the surrounding shapes/strides — the SAME
-anonymous grid on two independent legs, corroborating); `clip-text-A2`'s
-`Kernel2 grid=[16,1,10]`/`[4,1,24]`/`[12,1,8]`/`[128,2,1]` (each has a `1`
-in some position) do NOT classify here and remain `UNATTRIBUTED`.
+**Anonymous kernels (`Kernel<N>`, `magma_*`, and any future unsymbolized
+launch) are classified ONLY by grid-family rules, LAST** (pass 3, finding
+4 — adversarial re-audit corrects the ORIGINAL pass 3's own priority,
+which ran this fallback BEFORE the attention-shape/activation-tier checks
+and was not restricted to anonymous names at all): after every named-shape
+and grid-position-2 check above has already failed to classify a row,
+`_is_anonymous_kernel_name` gates the fallback to `Kernel<N>`/`magma_*`
+names ONLY, and `_is_plausible_gemm_tile_grid` additionally requires EVERY
+one of the grid's three dimensions `> 1` AND the grid's own product to
+clear a documented magnitude floor (`GEMM_TILE_GRID_PRODUCT_FLOOR=64`,
+conservatively below the smallest real evidence, `448`) before landing
+`BASE-GEMM` — a `1` in some position is a 1-D-ish bookkeeping/reduction
+launch, `GRAD-BOOKKEEPING`'s own domain, not a tiled matmul. Evidenced
+BOTH ways on `clip-text-D1`/`D2`: `Kernel2 grid=[8,2,28]` (every dimension
+`>1`, product `448`) -> `BASE-GEMM` on both legs (cuBLAS picked a
+different, unsymbolized algorithm once the eager LoRA/LN arithmetic
+shifted the surrounding shapes/strides — the SAME anonymous grid on two
+independent legs, corroborating); `clip-text-A2`'s `Kernel2
+grid=[16,1,10]`/`[4,1,24]`/`[12,1,8]`/`[128,2,1]` (each has a `1` in some
+position) do NOT classify here and remain `UNATTRIBUTED`. NEGATIVE
+CONTROLS for the anonymous-name restriction (real shapes, never observed
+this way, but proving a NAMED kernel is never swept in by grid alone):
+`badd_f32 grid=[2,2,278]`, `ucopy_f32 grid=[2,2,231]`, `usqrt_f32
+grid=[2,2,2]` all satisfy the 3-D-tile-grid shape test yet stay OUT of
+`BASE-GEMM` — their own names already say what they are.
 
 **An anonymous or unknown-name row that no rule classifies COUNTS toward
 the 1%-of-busy unknown-kernel gate** — `KNOWN_KERNEL_NAMES` no longer
@@ -225,12 +249,30 @@ pulled so far shows), `wall_delta_s_per_step` (sourced from the NAMED
 `--merge-json` report's own `per_step.wall_s_per_step` per leg — "the run
 reports' `train_run_wall_s` differenced exactly as the merge does",
 contract; never re-derived from this module's own census-only `wall_s`),
-`share_of_baseline_wall` (the delta as a fraction of the FUSED leg's own
-wall — the shipped configuration is the baseline), and a `direction`
-string stating which leg was slower. `C-LORA` = `A1` vs `D2`; `C-LN` =
-`D2` vs `D1` (D1 additionally disables LoRA, so `D1-D2` isolates LN alone
-on CLIP — §D3). `C-GELU-HTSAT`'s realized gain is deferred to the HTSAT
-pass (no HTSAT leg is attributed by this module yet).
+`share_of_baseline_wall`, `fused_twin_wall_s`, `share_of_fused_twin_wall`,
+and a `direction` string stating which leg was slower. `C-LORA` = `A1` vs
+`D2`; `C-LN` = `D2` vs `D1` (D1 additionally disables LoRA, so `D1-D2`
+isolates LN alone on CLIP — §D3).
+
+**Denominator convention (adversarial-audit finding 5), pinned once here:**
+`share_of_baseline_wall` ALWAYS divides the wall delta by the TOWER'S OWN
+SHIPPED `A1` wall (`baseline_wall_s`/`baseline_leg_id`), regardless of
+which two legs the pair actually compares — the shipped configuration is
+always `A1` (wire-default LoRA, every fusible seam admitted), never the
+pair's own "fused" leg (`C-LN`'s pair is `D1` vs `D2`; `D2` is NOT what
+ships, it still has LoRA disabled). `fused_twin_wall_s`/
+`share_of_fused_twin_wall` are EMITTED SEPARATELY and divide by the pair's
+own fused leg's wall instead (for `C-LORA` this equals `A1`, so the two
+share numbers COINCIDE; for `C-LN` it is `D2`'s own wall, the number pass
+2 originally mislabeled `share_of_baseline_wall`). Both `None` if the
+relevant wall could not be read from `--merge-json`. `C-GELU-HTSAT`'s
+realized gain (`D1` vs `D2` on `htsat`, since `htsat`'s own `D1` disables
+`layer_norm_fused`+`gelu_erf_fused` together — module doc, "HTSAT") reuses
+this exact same `REALIZED_GAIN_SPECS`/`compute_realized_gains` machinery;
+`C-LN`+`C-GELU-HTSAT`'s joint `D1`-vs-`D2` delta on `htsat` is reported
+under the SAME `C-LN` chain-name entry (both are disabled together on that
+tower's `D1`, so this module cannot isolate them from a single leg pair —
+stated honestly, not force-split).
 
 ### `decision_grade` now REQUIRES the merge's own verdict
 
@@ -312,6 +354,271 @@ mask-adjacent on `clip-text` alone, but this module does not assert that
 either — both names are classified by SHAPE, never by an asserted
 mechanism).
 
+### Restored evidence paragraphs (adversarial-audit finding 7)
+
+Pass 3's docstring rewrite (above) DELETED several pass-2 evidence
+paragraphs that a still-live code comment keeps citing by name. Restored
+here, one per citation, corrected where pass 3 changed the underlying
+rule:
+
+**`GRAD-BOOKKEEPING` (was `OPTIMIZER` extended; renamed, adversarial-audit
+finding 8):** `adamw_moment_update_f32`/`adamw_theta_update_f32` (any
+grid) are `OPTIMIZER` by NAME — `adamw_step_fused` is already admitted on
+every A leg, so a kernel launched under that name IS the optimizer, full
+stop. Measured on the real, full `clip-text-A1` census: THIRTY-TWO other
+elementwise rows (`badd_f32`/`bmul_f32`/`bsub_f32`/`usqr_f32`/
+`cast_u8_f32`/... at the three tiny grids `4`/`16`/`12`, i.e.
+`total_threads` `4096`/`16384`/`12288` — EXACTLY `LORA_RANK*width`,
+`LORA_RANK*mlp_width`, `LORA_RANK*3*width` for `LORA_RANK=8`) carry
+`3.80` of that leg's `5.01` total unattributed-by-pass-1 percentage
+points — a MATERIAL share. These are NOT the optimizer (`adamw_step_fused`
+already covers that by name) — they sit at the trainable PARAMETER
+tensors' own element counts (LoRA A/B matrices, Linear-bias-scale
+gradient/weight-decay/grad-norm-clipping bookkeeping), a fundamentally
+DIFFERENT role from an activation-tensor elementwise op. This module
+names this family `GRAD-BOOKKEEPING` (not `OPTIMIZER`) and does not
+further split "gradient zeroing" from "weight decay" from "grad-norm
+clip" from a single leg's census (all three are plausible roles at this
+IDENTICAL element count) — an honestly-labeled catch-all, not a
+transcribed mechanism, same discipline as `ELEMENTWISE-OTHER-<tier>`.
+
+**`C-ATTN-<tower>` attention-elementwise, by SHAPE:** `badd_f32`/
+`bdiv_f32`/`bmul_f32`/`bsub_f32`/`cast_u8_f32`/`eq_f32`/`uexp_f32`/
+`usqr_f32`/`affine_f32` (and `*_bf16` twins) ALSO launch at the declared
+attention tensor's own element count, `attn = rows*heads*seq*seq`
+(`= 1,138,368` on `clip-text-A1`, `rows=24,heads=8,seq=77`; `= 720,000` on
+`clip-vision-A1`, `heads=12,seq=50`) — the additive mask, the
+`1/sqrt(head_dim)` scale, the boolean-mask cast/compare feeding it (a
+HYPOTHESIS now, see "Prose corrections" above), and the backward pass's
+own `exp`/`square` terms. Evidence: on `clip-text-A1`, all nine names
+share a row at `grid=1112` (`1112*1024=1,138,688`, the smallest multiple
+of the `1024` block covering `1,138,368` elements); on `clip-vision-A1`
+the same nine names share a row at `grid=704` (`704*1024=720,896`,
+covering `720,000`) — a SECOND tower confirming the rule generalizes by
+FORMULA (`rows*heads*seq^2`), not a hand-copied grid number.
+
+**`C-PATCH-EMBED` (`clip-vision`/`htsat` only): the conv-as-matmul
+patchify stem.** `im2col_f32`/`im2col_bf16` — OpenCLIP's ViT patch
+embedding and HTSAT's own mel-spectrogram-to-patch unfold are both a
+strided `Conv2d`, implemented as `im2col` (unfold) followed by a GEMM; the
+GEMM half is already `BASE-GEMM` (or `C-ATTN` if its grid happens to carry
+the batch count, which it does not here) via the generic gemm-name rule,
+and `im2col_f32` itself gets its own small bucket by name. Never appears
+on `clip-text` (no convolution there).
+
+**`LOSS/REDUCE`: `fast_sum`/`fast_max` at every OTHER row count.**
+Contract: "`fast_sum`/`fast_max` NOT at the softmax row count" is its own
+named bucket, not `UNATTRIBUTED`. After the softmax-row and LN-row checks
+both fail, `fast_sum_f32 grid=[1,1,1]` (`launches_per_step=96` on
+`clip-text-A1`, `1.61%` of busy) is the largest single row this bucket
+absorbs — the triplet loss's own margin/logit reductions and/or
+gradient-norm bookkeeping the optimizer needs; this module does not, and
+cannot from a single leg's census, further split "loss" from "grad-norm"
+reductions sharing the identical degenerate `grid=[1,1,1]` shape, so both
+are named `LOSS/REDUCE` together, honestly, rather than guessed apart.
+
+**`CAST`: any kernel name containing `"cast"`, at any shape OTHER than the
+attention tensor's own (pass 3, finding 1's own priority fix).**
+`cast_f32_f32`/`cast_u8_f32`/`cast_bf16_f32`/`cast_f32_bf16`/
+`cast_add_bf16`/`cast_scale_bf16_f32`/`cast_u8_bf16`/
+`scaled_cast_add_f32_f32`/`scaled_cast_add_bf16_f32` — matched by NAME,
+any OTHER grid, any tower. `scaled_cast_add_f32_f32`'s own grid pattern is
+suggestive of a LoRA-composition-adjacent op (it launches at EXACTLY the
+three activation-tier grids, one call per LoRA-wrappable site width, on
+every leg pulled so far), but this module does not claim that role
+without a dedicated ablation.
+
+**Declared per-tower architecture constants (`TOWER_ARCH`).** `width`,
+`heads`, and `mlp_ratio` for `clip-text`/`clip-vision` are DECLARED, not
+witnessed — the stock `laion2b_s34b_b79k` ViT-B-32 checkpoint's own public
+config (`width=512/heads=8` text, `width=768/heads=12` vision,
+`mlp_ratio=4` both — OpenCLIP's own `visual.transformer.width`-style
+fields). `declared_seq=50` for `clip-vision` (the ViT-B-32 patch grid,
+`(224/32)**2 + 1` CLS token) is likewise declared; `clip-text`'s own `seq`
+is WITNESSED instead (`manifest.max_seq_length`), since the text tower's
+sequence length is a wire/task parameter, not a checkpoint constant. Every
+`Signature.source` string in this module's own JSON output distinguishes
+`witnessed:...` from `declared_constant:...` so a consumer never confuses
+the two provenances.
+
+**`EMBED/GATHER`: the `u32`-typed index/token-id kernels, by name.**
+`gather_u32_f32`/`sa_u32_f32`/`ucopy_u32`/`fast_argmax_u32`/`is_u32_f32`
+(and bf16 twins where observed) are the only kernels operating on `u32`
+(token-id / index) data in this export — embedding-table gather, its
+scatter-add gradient, and the EOT-position equality check. All negligible
+(`<0.1%` combined on every CLIP leg pulled) but unambiguous by
+dtype-in-name.
+
+**Memcpy/memset: reported, never folded into the busy partition.**
+Contract §D2: "nsys memcpy rows reported separately from gpu_busy." The
+census's own `memcpy_per_step`/`memset_per_step` top-level fields (counts
+and `us`, NOT part of `by_kernel_and_grid` or `gpu_kernel_us_per_step`)
+are copied onto this module's leg row verbatim as `memcpy_memset` for
+visibility (`attribute_leg`) — they never enter any chain's
+`share_gpu_busy` denominator.
+
+### D1-vs-D2 differential: the measured split (adversarial-audit finding 2)
+
+The module doc ("split by kernel NAME-CLASS", above) already states the
+DIRECTION rule (`ln_disabled` gates `LN_EAGER_EXTENDED_KERNEL_NAMES` at
+`ln_row_count`). What follows is the MEASURED split of the real `D1-D2`
+total-busy delta on BOTH CLIP towers, re-derived from the real, full (not
+fixture-cut) `clip-{text,vision}-{D1,D2}` census exports at this tip —
+never carried as a literal expectation in any test:
+
+| bucket | clip-text share of Δ | clip-vision share of Δ |
+|---|---|---|
+| `C-LN` | `12.21%` | `17.51%` |
+| `ELEMENTWISE-OTHER-OUT` | `46.47%` | `43.20%` |
+| `BIAS/RESIDUAL-OUT` | `35.40%` | `32.56%` |
+| `BASE-GEMM` | `-0.06%` | `-0.07%` |
+| `C-ATTN-<tower>` | `-0.01%` | `0.0005%` |
+
+By-name `C-LN` therefore captures only about A SEVENTH to A SIXTH of the
+real `D1-D2` delta — it UNDER-REPORTS eager LayerNorm's true cost on a D
+leg. The realized `C-LN` gain this module reports
+(`compute_realized_gains`) is deliberately the WHOLE-CHAIN `D1-D2` busy/
+wall delta, not a re-derivation from the by-name `C-LN` bucket alone — the
+gain number is correct even though the by-name attribution under-covers
+the mechanism.
+
+**Mechanism hypothesis, evidenced identically on BOTH towers:** eager
+LayerNorm's own final affine step (`gamma * x_hat + beta`) is NOT a
+distinct named kernel — it lands as an ordinary `badd_f32` launch at the
+`out` activation tier's FULL width (`rows*seq*width`), the SAME grid the
+site's own Linear-bias-add and the residual-stream's add already share.
+`badd_f32`'s own `launches_per_step` at that grid forms a DETERMINISTIC
+three-point ladder as fusion is progressively disabled — evidenced
+IDENTICALLY on `clip-text` (`grid=[924,...]`) and `clip-vision`
+(`grid=[900,...]`): `337` launches on `A1` (LoRA+LN both fused) -> `633`
+on `D2` (LoRA disabled, LN still fused) -> `874` on `D1` (both disabled).
+The SAME three numbers on two independent, unrelated towers is
+deterministic architecture, not run-to-run cuBLAS/launch-count session
+noise — the `D1` leg's own eager LN affine step is the extra `241`
+launches (`874-633`) landing in `BIAS/RESIDUAL-OUT`, and eager LN's
+remaining mean/var/normalize steps (excluding the affine) land in
+`ELEMENTWISE-OTHER-OUT` (the true majority of the leaked delta on both
+towers). Neither leak bucket's own share is asserted as a "less than"
+bound against `C-LN`'s share anywhere in this module's tests (see
+`Ln1VsD2DifferentialTests`) — the test states what THIS section states:
+`C-LN` moves INTO on the toggle, and the two leak buckets are NAMED,
+never silently smaller.
+
+## HTSAT (pass 3 — mapping read off the real `htsat-{A1,A2,D1,D2}` exports)
+
+Pod `p421` run 2 additionally pulled all four real HTSAT legs (`htsat-A1`,
+`htsat-A2`, `htsat-D1`, `htsat-D2`) — the SAME `A1`/`A2`/`D1`/`D2` legs
+table CLIP uses, contract §D3. `derive_htsat_signatures` derives FOUR
+per-stage signatures from `manifest.batch` (witnessed) plus the public
+`laion/clap-htsat-fused` config's own declared Swin geometry
+(`HTSAT_DEPTHS=(2,2,6,2)`, `HTSAT_HEADS=(4,8,16,32)`, `HTSAT_WINDOW_SIZE=8`,
+`HTSAT_FINAL_STAGE_DIM=768`, `HTSAT_SPEC_SIZE=256`, `HTSAT_PATCH_SIZE=4`),
+cross-checked against the real export BEFORE a single classification rule
+was written (this module's own §D3 discipline, applied to itself — see
+`fixtures/profile_421_htsat_a1/PROVENANCE.md` for the full per-stage
+table and the evidence behind every element count).
+
+`classify_htsat_kernel` is a SEPARATE function from `classify_kernel`
+(not a branch inside it) because HTSAT's signature is PER-STAGE (four
+distinct widths/token/head counts) rather than CLIP's one declared shape
+per tier:
+
+- **`C-ATTN-HTSAT`**: the batched-window-attention GEMMs' grid carries
+  `grid[2] == rows*windows_s*heads_s` for SOME stage `s` (the SAME
+  name-independent, grid-position-2 rule CLIP's `C-ATTN-<tower>` uses) —
+  evidenced on TWO different GEMM libraries at TWO different stages on
+  `htsat-A1` (`ampere_sgemm_128x128_nt grid=[1,1,6144]`, stage 0;
+  `magma_sgemmEx_kernel grid=[1,2,1536]`, stage 2). The per-window
+  attention score/prob tensor's own elementwise ops (`badd`/`bdiv`/
+  `bmul`/`bsub`/`eq`/`uexp`/`usqr`/`cast_u8` — cast rows are shape-gated
+  here FIRST too, same priority as CLIP) sit at
+  `attn_batch_count(s) * (window_size**2)**2` elements (module doc,
+  `HtsatStageSignature.attn_shape_elements`) — evidenced on `htsat-A1`:
+  `badd_f32 grid=[24576,...]` (stage 0) and `eq_f32 grid=[6144,...]`
+  (stage 2). The softmax reduction (`fast_max`/`fast_sum`) launches
+  `block=[64,1,1]` EXACTLY (`window_size**2`) at
+  `rows*heads_s*tokens_s` rows for SOME stage — verified per stage on
+  `htsat-A1`: the COMBINED `fast_sum_f32`+`fast_max_f32` launches at each
+  stage's own row count (`393216`/`196608`/`98304`/`49152`) are `8`/`8`/
+  `24`/`8` — EXACTLY `4*depth_s` for `depths=[2,2,6,2]`, a clean per-block
+  reconciliation (one softmax needs a max-reduction call and a
+  sum-reduction call per block, times two — forward and backward) — OUT
+  OF TIER for the fixed-head-dim port scope (contract), still a NAMED,
+  MEASURED chain.
+- **`C-GELU-HTSAT`**: `gelu_erf_fwd_f32`/`gelu_erf_bwd_dx_f32` by NAME,
+  any grid — the FUSED kernel (evidenced on `htsat-A1`: launches sum to
+  `12` across the four stage shapes, EXACTLY `Σdepths=12`, the config's
+  own `gelu_seam_calls_per_forward`). The EAGER (`D1`) twin is candle's
+  own THREE-kernel `gelu_erf` decomposition (`ugelu_erf_f32`/`uerf_f32`/
+  `uneg_f32`), shape-gated at `mlp_shape_elements(s) = rows*tokens_s*4*
+  dim_s` for SOME stage — evidenced on `htsat-D1`: all three names share
+  the IDENTICAL four grids/launch-counts as `htsat-A1`'s fused kernel.
+- **`C-LN`**: `layer_norm_fwd_f32_biased`/`layer_norm_bwd_dx_f32` by name
+  (shared CLIP/HTSAT constant, `LN_KERNEL_NAMES`), any grid. The eager
+  (`ln_disabled`) reduction reuses `LN_EAGER_EXTENDED_KERNEL_NAMES` at
+  `ln_row_count(s) = rows*tokens_s` for SOME stage — with ONE real
+  collision this module resolves by BLOCK SIZE, not priority order: `ln_
+  row_count(stage=0) == attn_softmax_rows(stage=2) == 98,304` on this
+  checkpoint's declared constants, but the attention reduction ALWAYS
+  launches `block=[64,...]` while the eager LN reduction launches the
+  smallest power of 2 `>= dim_s` instead (`128` for `dim_0=96` — evidenced
+  on `htsat-D1`: `fast_sum_f32 grid=[98304,...]` carries BOTH a
+  `block=[64,...]` row, present on `htsat-A1` too and unaffected by the
+  toggle, AND a `block=[128,...]` row, ABSENT from `htsat-A1` entirely).
+  `_is_attn_softmax_reduction_grid` is checked FIRST (module doc) so this
+  collision resolves correctly regardless of check order.
+- **`C-LORA`**: the SAME `A1`-vs-`D2` busy/wall delta
+  `compute_realized_gains` already computes for CLIP — no HTSAT-specific
+  code, `by_tower_role` keys on `tower` generically.
+- **`BASE-GEMM`/`OPTIMIZER`/`DROPOUT`/`CAST`/`EMBED/GATHER`/
+  `LOSS/REDUCE`/`C-PATCH-EMBED`/`PERMUTE/RESHAPE`/`BIAS/RESIDUAL-<tier>`/
+  `ELEMENTWISE-OTHER-<tier>`**: the SAME by-name/by-shape/grid-family
+  rules CLIP uses, reused verbatim (`GEMM_NAME_RE`, `EMBED_GATHER_KERNEL_
+  NAMES`, `PATCH_EMBED_KERNEL_NAMES`, the anonymous grid-family fallback,
+  ...) — HTSAT has no combined-QKV tensor (`query`/`key`/`value`/
+  `attention_output`/`intermediate_dense`/`output_dense` are all separate
+  LoRA sites at the SAME `out`/`mlp` widths CLIP's `out`/`mlp` tiers
+  already key off), so only TWO tiers apply, not three.
+- **Known, DOCUMENTED, UNRESOLVED collision**: `out_shape_elements(s) ==
+  mlp_shape_elements(s+2)` for `s in {0, 1}` is a MATHEMATICAL IDENTITY of
+  this architecture (tokens quarter and dim doubles each stage) — grids
+  `9216`/`4608` cannot be told apart by shape alone.
+  `classify_htsat_kernel` checks the `out` tier before `mlp`
+  (deterministic, documented priority), so a row at either grid ALWAYS
+  resolves to the `out`-tier bucket; this module does not claim that
+  resolution is correct, only that it is DETERMINISTIC and STATED (see
+  `fixtures/profile_421_htsat_a1/PROVENANCE.md`, "Known ambiguity").
+- **`WINDOWING`/`FRONT-FUSION`: still UNDECLARED.** A window-partition/
+  reverse/roll copy sits at the IDENTICAL element count as a generic
+  residual-stream `PERMUTE/RESHAPE` copy (both are `rows*tokens_s*dim_s`)
+  — this module has no shape-only way to tell them apart. The one
+  plausible front-fusion-activation candidate observed (`urelu_f32`, rare,
+  `1-3` launches/step, NOT scaled by `depths`) cannot be distinguished
+  from the audio embedding's own projection-head ReLU (the config's
+  `hidden_act="gelu"` for the Swin MLP but a separate, undocumented act
+  for the projection head — the config's own "projection act relu" note
+  explains why `gelu_seam_calls_per_forward` exactly equals `Σdepths`
+  with no extra contribution from the projection head) without a
+  dedicated ablation. Both stay UNDECLARED (module doc, "declaring a
+  chain with no matching rule is dishonest") rather than guessed.
+- **The front end is NOT in `by_kernel_and_grid`/`gpu_kernel_us_per_step`
+  at all.** `manifest.media_front_end_wall_s` (`n`/`m`, differenced the
+  same way `wall_s_per_step` is) gives `front_s_per_step ≈ 1.251 s` on
+  `htsat-A1` — `≈80.7%` of that leg's own `wall_s_per_step` (`1.550 s`) —
+  the mel-spectrogram extraction and AFF front-end fusion run OUTSIDE the
+  profiled training-step kernel window entirely. Stated for context; this
+  module never folds it into any chain's `share_gpu_busy`/`share_wall`.
+- **`decision_grade`, reported honestly, not massaged**: on the real
+  `htsat-A1`/`A2`/`D1`/`D2` legs (see the hand-off's own pasted `main()`
+  run), `UNATTRIBUTED` is `5.76%`/`7.07%`/`4.00%`/`4.53%` of busy — `D1`
+  and `D2` clear the `<=5%` decision-grade bound, `A1`/`A2` do NOT. HTSAT
+  has no candidate port (contract), so this affects only the
+  REALIZED-GAIN reporting's own `decision_grade`/`decision_grade_reason`
+  fields, never a candidate-port verdict — `compute_realized_gains` itself
+  only requires `verdict == VALID` (not `decision_grade`), so the
+  `C-LORA`/`C-LN` numbers above are still reported for `htsat` even though
+  `A1`/`A2` are not decision-grade.
+
 Run:
   python3 ci/scripts/perf/profile_421_attribute.py --legs-dir .profile-421-legs/<ts>/legs \\
       --merge-json .profile-421-legs/<ts>/merge.json \\
@@ -364,6 +671,13 @@ CHAIN_ELEMENTWISE_OTHER_QKV = "ELEMENTWISE-OTHER-QKV"
 CHAIN_ELEMENTWISE_OTHER_OUT = "ELEMENTWISE-OTHER-OUT"
 CHAIN_ELEMENTWISE_OTHER_MLP = "ELEMENTWISE-OTHER-MLP"
 
+# Pass-3 named bucket (adversarial-audit fold, finding 8/§7): parameter-scale
+# 1-D bookkeeping launches on the trainable PARAMETER tensors themselves
+# (LoRA A/B, weight decay, grad-norm clipping) — NOT the optimizer (`adamw_*`
+# by name is the ONLY thing `OPTIMIZER` names now). See module doc,
+# "`GRAD-BOOKKEEPING`".
+CHAIN_GRAD_BOOKKEEPING = "GRAD-BOOKKEEPING"
+
 # --- HTSAT-only, declared but unverified (module doc, "HTSAT") -------------
 CHAIN_GELU_HTSAT = "C-GELU-HTSAT"
 CHAIN_WINDOWING = "WINDOWING"
@@ -389,6 +703,7 @@ CLIP_ALWAYS_DECLARED_CHAINS: tuple[str, ...] = (
     CHAIN_DROPOUT,
     CHAIN_CAST,
     CHAIN_OPTIMIZER,
+    CHAIN_GRAD_BOOKKEEPING,
     CHAIN_EMBED_GATHER,
     CHAIN_LOSS_REDUCE,
 )
@@ -423,12 +738,40 @@ def declared_chains_for_tower(tower: str) -> tuple[str, ...]:
         return CLIP_ALWAYS_DECLARED_CHAINS + (CHAIN_PATCH_EMBED, chain_attn(tower))
     if tower == "clip-text":
         return CLIP_ALWAYS_DECLARED_CHAINS + (chain_attn(tower),)
-    # HTSAT: only the two name-only chains this pass can classify without a
-    # real export (module doc, "HTSAT"); `WINDOWING`/`FRONT-FUSION` have no
-    # mapping yet and are deliberately NOT declared here (declaring a chain
-    # with no matching rule would silently report it "absent" forever,
-    # which is indistinguishable from "not yet implemented" — dishonest).
-    return (CHAIN_GELU_HTSAT, chain_attn(tower))
+    if tower == "htsat":
+        # Pass 3 (HTSAT mapping): every bucket this module has an EVIDENCED
+        # rule for on the real `htsat-{A1,A2,D1}` exports (module doc,
+        # "HTSAT"). `WINDOWING`/`FRONT-FUSION` have NO reliable shape/name
+        # discriminator yet (a window-partition/reverse copy sits at the
+        # IDENTICAL element count as a generic residual-stream permute, and
+        # the one plausible front-fusion-activation candidate, `urelu_f32`,
+        # cannot be distinguished from the audio projection head's own ReLU
+        # without a dedicated ablation) and are deliberately NOT declared
+        # here — same "declaring with no matching rule is dishonest"
+        # discipline as pass 2's original HTSAT stub. `CHAIN_GRAD_BOOKKEEPING`
+        # is likewise NOT declared for `htsat`: this module has no evidenced
+        # LoRA-parameter-scale rule for HTSAT's nine distinct target-module
+        # weight shapes (unlike CLIP's four uniform sites), so declaring it
+        # would report "absent" forever, indistinguishable from "not
+        # implemented".
+        return (
+            CHAIN_GELU_HTSAT,
+            chain_attn(tower),
+            CHAIN_LN,
+            CHAIN_BASE_GEMM,
+            CHAIN_BIAS_RESIDUAL_OUT,
+            CHAIN_BIAS_RESIDUAL_MLP,
+            CHAIN_ELEMENTWISE_OTHER_OUT,
+            CHAIN_ELEMENTWISE_OTHER_MLP,
+            CHAIN_PERMUTE_RESHAPE,
+            CHAIN_DROPOUT,
+            CHAIN_CAST,
+            CHAIN_OPTIMIZER,
+            CHAIN_EMBED_GATHER,
+            CHAIN_LOSS_REDUCE,
+            CHAIN_PATCH_EMBED,
+        )
+    raise SignatureError(f"no declared chain set for tower {tower!r}")
 
 
 # The exact kernel-name vocabulary observed across all eight real CLIP legs
@@ -507,6 +850,30 @@ KNOWN_KERNEL_NAMES: frozenset[str] = frozenset(
         "ampere_bf16_s16816gemm_bf16_128x64_ldg8_f2f_stages_64x3_tn",
         "ampere_bf16_s16816gemm_bf16_64x64_sliced1x2_ldg8_f2f_stages_64x5_nn",
         "ampere_bf16_s16816gemm_bf16_64x64_sliced1x2_ldg8_f2f_stages_64x5_tn",
+        # HTSAT (pass 3, HTSAT mapping) — hand-admitted from the real
+        # `htsat-{A1,A2,D1}` exports (pod `p421` run 2), same discipline.
+        "gelu_erf_fwd_f32",
+        "gelu_erf_bwd_dx_f32",
+        # The eager (D1) twin of `gelu_erf_fused`'s own three-kernel
+        # decomposition — `ugelu_erf_f32`/`uerf_f32`/`uneg_f32` launch at the
+        # IDENTICAL grids/launch-counts on `htsat-D1` (module doc,
+        # "`C-GELU-HTSAT`").
+        "ugelu_erf_f32",
+        "uerf_f32",
+        "uneg_f32",
+        "urelu_f32",
+        "ge_f32",
+        "ampere_sgemm_64x64_tn",
+        "ampere_sgemm_64x64_nn",
+        # BF16 GEMM tile variants, evidenced on `htsat-A2` (distinct from the
+        # CLIP set above — a different tile/stage-count family selected for
+        # HTSAT's own weight shapes).
+        "ampere_bf16_s16816gemm_bf16_128x256_ldg8_f2f_stages_64x3_nn",
+        "ampere_bf16_s16816gemm_bf16_128x256_ldg8_f2f_stages_64x3_tn",
+        "ampere_bf16_s16816gemm_bf16_64x64_ldg8_f2f_nn",
+        "ampere_bf16_s16816gemm_bf16_64x64_ldg8_f2f_tn",
+        "ampere_bf16_s1688gemm_bf16_128x128_ldg8_f2f_stages_32x1_nn",
+        "ampere_bf16_s1688gemm_bf16_128x128_ldg8_f2f_stages_32x1_tn",
     }
 )
 
@@ -574,6 +941,29 @@ GELU_EXCLUSIVE_KERNEL_NAMES: frozenset[str] = frozenset({"usigmoid_f32", "usigmo
 # Shape-gated kernels: matched only at the declared GELU element-count shape
 # (`TowerSignatures.gelu_shape_elements`, i.e. the `mlp` activation tier).
 GELU_SHAPE_KERNEL_NAMES: frozenset[str] = frozenset({"affine_f32", "bmul_f32", "affine_bf16", "bmul_bf16"})
+
+# HTSAT's own `gelu_erf_fused` seam (module doc, "`C-GELU-HTSAT`"): the
+# FUSED kernel's own names, matched by NAME at any grid, unconditionally —
+# evidenced on `htsat-A1`/`A2` (`kernels_disabled=[]`, `gelu_erf_fused`
+# admitted): `gelu_erf_fwd_f32`/`gelu_erf_bwd_dx_f32` launch EXACTLY 12
+# times each per step (`launches_per_step` sums to `2+6+2+2=12` across the
+# four stage shapes, matching `Σdepths=12` — the config's own
+# `gelu_seam_calls_per_forward`), never appearing on `htsat-D1` at all
+# (`unmatched_disables()` would refuse the leg otherwise).
+GELU_ERF_HTSAT_EXCLUSIVE_KERNEL_NAMES: frozenset[str] = frozenset(
+    {"gelu_erf_fwd_f32", "gelu_erf_bwd_dx_f32", "gelu_erf_fwd_bf16", "gelu_erf_bwd_dx_bf16"}
+)
+
+# HTSAT's EAGER twin of `gelu_erf_fused` (D1 only) — candle's own
+# `Tensor::gelu_erf()` decomposes into THREE elementwise kernels
+# (`ugelu_erf_f32`/`uerf_f32`/`uneg_f32`) that launch at the IDENTICAL four
+# per-stage grids and IDENTICAL launch counts (evidenced on `htsat-D1`:
+# all three names share `launches_per_step` of `2/6/2/2` at the four
+# `mlp_shape_elements(stage)` grids `36864/9216/18432/4608`) — shape-gated
+# like `GELU_SHAPE_KERNEL_NAMES`, never matched by name alone (candle's
+# elementwise op names are generic enough that a name-only match would be
+# too permissive without the declared HTSAT MLP-tier shape backing it).
+GELU_ERF_HTSAT_EAGER_KERNEL_NAMES: frozenset[str] = frozenset({"ugelu_erf_f32", "uerf_f32", "uneg_f32"})
 
 # `fast_sum`/`fast_max`: matched against TWO declared row counts (softmax
 # reduction rows -> C-ATTN; LN row count -> C-LN, eager only); every OTHER
@@ -648,8 +1038,8 @@ TOWER_ARCH: dict[str, dict[str, object]] = {
 
 # Wire-default LoRA rank (contract, "Wire defaults: rank 8, alpha 16, ...") —
 # used ONLY to identify parameter-scale (not activation-scale) elementwise
-# ops for the `OPTIMIZER` bucket (module doc). Never used to derive an
-# activation-tensor shape.
+# ops for the `GRAD-BOOKKEEPING` bucket (module doc). Never used to derive
+# an activation-tensor shape.
 LORA_RANK = 8
 
 # The `--task` value each tower's `finetune-run` manifest carries — used
@@ -697,8 +1087,8 @@ class TowerSignatures:
 
     def attn_shape_elements(self) -> int:
         """The attention score/prob tensor's own element count,
-        `rows*heads*seq*seq` — module doc, "the attention SCORE/PROB
-        tensor's own elementwise ops"."""
+        `rows*heads*seq*seq` — module doc, "`C-ATTN-<tower>`
+        attention-elementwise, by SHAPE"."""
         return self.rows.value * self.heads.value * self.seq.value * self.seq.value
 
     def qkv_shape_elements(self) -> int:
@@ -721,7 +1111,7 @@ class TowerSignatures:
     def param_scale_elements(self) -> frozenset[int]:
         """Element counts of the trainable PARAMETER tensors themselves
         (LoRA A/B matrices, Linear biases, LN gamma/beta) at the wire-
-        default rank — module doc, "`OPTIMIZER` extended". Distinct from
+        default rank — module doc, "`GRAD-BOOKKEEPING`". Distinct from
         every activation-tier element count above for this checkpoint's
         declared constants (checked in this module's own tests)."""
         width = self.width.value
@@ -754,11 +1144,140 @@ class SignatureError(Exception):
     this leg's INVALID reason."""
 
 
-def derive_signatures(tower: str, manifest: dict) -> TowerSignatures:
-    """Derive `TowerSignatures` for `tower` from its leg's `manifest.json`
-    (witnessed fields) plus `TOWER_ARCH`'s declared constants (see module
-    doc). Raises `SignatureError` for an unrecognised tower or a manifest
-    missing a field this tower needs witnessed."""
+# HTSAT's declared Swin geometry (module doc, "HTSAT") — read from the
+# public `laion/clap-htsat-fused` config's own `audio_config`
+# (`depths=[2,2,6,2]`, `num_attention_heads=[4,8,16,32]`, `window_size=8`,
+# `hidden_size=768` — the FINAL stage's width; `crates/jammi-encoders/src/
+# htsat_audio.rs` documents `hidden_size ==
+# patch_embeds_hidden_size << (num_stages-1)`, so the first stage's width
+# is `768 >> 3 == 96` and each later stage DOUBLES it, evidenced against
+# the real `htsat-A1` export below), `spec_size=256`, `patch_size=4` (a
+# `4x4`-stride unfold, `img_size/patch_size == 64` patches per side at
+# stage 0). Every element count `derive_signatures`/`classify_htsat_kernel`
+# use is RE-DERIVED from these constants, never a hand-copied grid number.
+HTSAT_DEPTHS: tuple[int, ...] = (2, 2, 6, 2)
+HTSAT_HEADS: tuple[int, ...] = (4, 8, 16, 32)
+HTSAT_WINDOW_SIZE = 8
+HTSAT_FINAL_STAGE_DIM = 768
+HTSAT_SPEC_SIZE = 256
+HTSAT_PATCH_SIZE = 4
+
+
+@dataclass
+class HtsatStageSignature:
+    """One Swin stage's own geometry, all four fields DERIVED from
+    `HTSAT_DEPTHS`/`HTSAT_HEADS`/`HTSAT_WINDOW_SIZE`/`HTSAT_FINAL_STAGE_DIM`
+    (module doc) — never a hand-copied per-stage literal."""
+
+    stage: int
+    depth: int
+    heads: int
+    dim: int
+    tokens: int
+    windows: int
+
+    def attn_batch_count(self, rows: int) -> int:
+        """`rows * windows * heads` — the batched-window-attention GEMMs'
+        own `grid[2]` (module doc, "`C-ATTN-HTSAT`")."""
+        return rows * self.windows * self.heads
+
+    def attn_shape_elements(self, rows: int) -> int:
+        """The per-window attention score/prob tensor's own element count.
+        Each window holds `window_size**2` tokens, and the score matrix is
+        `[tokens_per_window, tokens_per_window]` (every token in the
+        window attends to every other), so the per-(batch, window, head)
+        element count is `(window_size**2)**2`, not `window_size**2` —
+        `attn_batch_count(rows) * (window_size**2)**2`. Evidenced on
+        `htsat-A1`: `badd_f32 grid=[24576,...]` (`total_threads=
+        25,165,824`) is EXACTLY `attn_batch_count(stage=0)=6144 * 4096`
+        (module doc, "HTSAT")."""
+        ws_squared = HTSAT_WINDOW_SIZE * HTSAT_WINDOW_SIZE
+        return self.attn_batch_count(rows) * ws_squared * ws_squared
+
+    def attn_softmax_rows(self, rows: int) -> int:
+        """`rows * heads * tokens` — the softmax reduction's own row count
+        (one row per query position per head; each row reduces over
+        exactly `window_size**2` keys) — module doc, "HTSAT: the
+        attention/LN row-reduction collision"."""
+        return rows * self.heads * self.tokens
+
+    def mlp_shape_elements(self, rows: int, mlp_ratio: int = 4) -> int:
+        """`rows * tokens * mlp_ratio * dim` — the per-stage MLP
+        activation's own element count, the same shape `C-GELU-HTSAT`'s
+        eager twin keys off (module doc)."""
+        return rows * self.tokens * mlp_ratio * self.dim
+
+    def out_shape_elements(self, rows: int) -> int:
+        """`rows * tokens * dim` — the per-stage residual-stream / Linear-
+        output element count (module doc)."""
+        return rows * self.tokens * self.dim
+
+    def ln_row_count(self, rows: int) -> int:
+        """`rows * tokens` — the eager LayerNorm's own per-row
+        reduction/elementwise count for this stage (module doc)."""
+        return rows * self.tokens
+
+
+@dataclass
+class HtsatSignatures:
+    rows: Signature
+    stages: tuple[HtsatStageSignature, ...]
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "rows": {"value": self.rows.value, "source": self.rows.source},
+            "stages": [
+                {
+                    "stage": s.stage,
+                    "depth": s.depth,
+                    "heads": s.heads,
+                    "dim": s.dim,
+                    "tokens": s.tokens,
+                    "windows": s.windows,
+                }
+                for s in self.stages
+            ],
+        }
+
+
+def derive_htsat_signatures(manifest: dict) -> HtsatSignatures:
+    """Derive `HtsatSignatures` from `manifest.json`'s witnessed `batch`
+    plus the declared Swin geometry (module doc). Every per-stage element
+    count this returns was cross-checked against the real `htsat-A1`/`D1`
+    census exports (module doc, "HTSAT") before a single classification
+    rule was written — same §D3 discipline pass 1/2 used for CLIP."""
+    batch = manifest.get("batch")
+    if not isinstance(batch, int) or isinstance(batch, bool) or batch <= 0:
+        raise SignatureError(f"manifest.batch is not a positive int ({batch!r})")
+    rows = Signature(3 * batch, "witnessed:manifest.batch*3 (--objective triplet, rows=3B)")
+
+    num_stages = len(HTSAT_DEPTHS)
+    if len(HTSAT_HEADS) != num_stages:
+        raise SignatureError("HTSAT_DEPTHS/HTSAT_HEADS length mismatch")
+    patch_embeds_dim = HTSAT_FINAL_STAGE_DIM >> (num_stages - 1)
+    tokens_stage0 = (HTSAT_SPEC_SIZE // HTSAT_PATCH_SIZE) ** 2
+
+    stages = []
+    for s, (depth, heads) in enumerate(zip(HTSAT_DEPTHS, HTSAT_HEADS)):
+        dim = patch_embeds_dim << s
+        tokens = tokens_stage0 // (4**s)
+        windows = tokens // (HTSAT_WINDOW_SIZE * HTSAT_WINDOW_SIZE)
+        stages.append(
+            HtsatStageSignature(stage=s, depth=depth, heads=heads, dim=dim, tokens=tokens, windows=windows)
+        )
+    return HtsatSignatures(rows=rows, stages=tuple(stages))
+
+
+def derive_signatures(tower: str, manifest: dict) -> TowerSignatures | HtsatSignatures:
+    """Derive this leg's declared/witnessed signatures for `tower` — a
+    `TowerSignatures` for `clip-text`/`clip-vision` (from `manifest.json`'s
+    witnessed fields plus `TOWER_ARCH`'s declared constants, module doc) or
+    an `HtsatSignatures` for `htsat` (from `derive_htsat_signatures`).
+    Raises `SignatureError` for an unrecognised tower or a manifest missing
+    a field this tower needs witnessed."""
+    if tower == "htsat":
+        return derive_htsat_signatures(manifest)
+
     arch = TOWER_ARCH.get(tower)
     if arch is None:
         raise SignatureError(f"no declared architecture constants for tower {tower!r}")
@@ -814,21 +1333,15 @@ def derive_signatures(tower: str, manifest: dict) -> TowerSignatures:
 def htsat_stage_signatures() -> list[dict[str, int]]:
     """The four Swin stages' declared window/head geometry for HTSAT, read
     from the public `laion/clap-htsat-fused` config's own `audio_config`
-    (`depths=[2,2,6,2]`, `num_attention_heads=[4,8,16,32]`, `window_size=8`,
-    `hidden_size=768`, `hidden_act="gelu"`). NOT cross-checked against a
-    real KERNEL export — no HTSAT `by_kernel_and_grid` leg is attributed by
-    this module yet (pass 3 stays scoped to the eight real CLIP legs).
-    Returned for documentation/forward-compatibility; `derive_signatures`
-    does not yet support `tower="htsat"` (raises `SignatureError`) — the
-    kernel-name<->shape MAPPING is read off the first real HTSAT export,
-    never guessed ahead of it (this module's own §D3 discipline, applied
-    to itself)."""
-    depths = [2, 2, 6, 2]
-    num_heads = [4, 8, 16, 32]
-    window_size = 8
+    (`HTSAT_DEPTHS`/`HTSAT_HEADS`/`HTSAT_WINDOW_SIZE` — module doc). Kept as
+    a light, name-only view for callers that only need `(depth, heads,
+    window_size)` per stage (`derive_htsat_signatures` is the full
+    element-count derivation `classify_htsat_kernel` actually uses, and IS
+    now cross-checked against the real `htsat-A1`/`htsat-D1` exports —
+    module doc, "HTSAT")."""
     return [
-        {"stage": i, "depth": d, "heads": h, "window_size": window_size}
-        for i, (d, h) in enumerate(zip(depths, num_heads))
+        {"stage": i, "depth": d, "heads": h, "window_size": HTSAT_WINDOW_SIZE}
+        for i, (d, h) in enumerate(zip(HTSAT_DEPTHS, HTSAT_HEADS))
     ]
 
 
@@ -869,14 +1382,65 @@ def _is_one_d_launch_grid(grid: list[int]) -> bool:
     return grid[1] == 1 and grid[2] == 1
 
 
+ANONYMOUS_KERNEL_NAME_RE = re.compile(r"^(Kernel\d+|magma_)")
+
+# The smallest real, plausible-GEMM-tile 3-D grid this module has ever
+# observed for an ANONYMOUS kernel (`Kernel2 grid=[8,2,28]` on
+# `clip-text-D1`/`D2`, product `448`). A genuine GEMM tile launch is never
+# this small (a real matmul tiles at LEAST a handful of blocks per
+# dimension); `64` is a conservative floor well below the `448` evidence
+# while still ruling out a near-scalar anonymous 3-D launch (e.g. a
+# `[2,2,2]` bookkeeping grid) that happens to have every dimension `> 1`
+# without being a plausible tile grid at all — module doc, "Grid-family
+# fallback ... with a magnitude floor" (pass 3, finding 4).
+GEMM_TILE_GRID_PRODUCT_FLOOR = 64
+
+
+def _is_anonymous_kernel_name(name: str) -> bool:
+    """`True` iff `name` is an UNSYMBOLIZED launch this module has no name
+    for — `Kernel<N>` (nsys's own placeholder for a kernel it could not
+    demangle) or a `magma_*` name it has not hand-admitted. Pass 3 (finding
+    4) RESTRICTS the anonymous grid-family `BASE-GEMM` fallback to these
+    names only: a NAMED kernel (e.g. `badd_f32`) at a 3-D grid where every
+    dimension happens to be `> 1` is NOT a GEMM by construction — its name
+    already says what it is. Negative controls (real shapes, never
+    observed as GEMM): `badd_f32 grid=[2,2,278]`, `ucopy_f32
+    grid=[2,2,231]`, `usqrt_f32 grid=[2,2,2]` — all satisfy
+    `_is_plausible_gemm_tile_grid` but must NOT land `BASE-GEMM` through
+    this fallback."""
+    return bool(ANONYMOUS_KERNEL_NAME_RE.match(name))
+
+
 def _is_plausible_gemm_tile_grid(grid: list[int]) -> bool:
-    """`True` iff every one of `grid`'s three dimensions is `> 1` — module
-    doc, "Anonymous kernels ... classified ONLY by grid-family rules": a
-    genuine M-tile x N-tile x batch/split-K GEMM launch never degenerates
-    to size `1` in any dimension; a `1` in some position is a 1-D-ish
+    """`True` iff every one of `grid`'s three dimensions is `> 1` AND the
+    grid's own product clears `GEMM_TILE_GRID_PRODUCT_FLOOR` — module doc,
+    "Anonymous kernels ... classified ONLY by grid-family rules": a genuine
+    M-tile x N-tile x batch/split-K GEMM launch never degenerates to size
+    `1` in any dimension; a `1` in some position is a 1-D-ish
     bookkeeping/reduction launch instead. Evidenced BOTH ways on
-    `clip-text-D1`/`D2` (module doc)."""
-    return grid[0] > 1 and grid[1] > 1 and grid[2] > 1
+    `clip-text-D1`/`D2` (module doc). Callers MUST also gate this on
+    `_is_anonymous_kernel_name` (pass 3, finding 4) — this predicate alone
+    says nothing about whether the kernel is named."""
+    if not (grid[0] > 1 and grid[1] > 1 and grid[2] > 1):
+        return False
+    return (grid[0] * grid[1] * grid[2]) >= GEMM_TILE_GRID_PRODUCT_FLOOR
+
+
+def _is_attn_softmax_reduction_grid(entry: dict, count: int) -> bool:
+    """`True` iff `entry` is a "one block per row" launch over exactly
+    `count` rows AND its own `block[0] == 64` — HTSAT's window-attention
+    softmax reduces over exactly `window_size**2 == 64` keys per row, so
+    its own reduction kernel always launches `block=[64,1,1]` (evidenced
+    identically on `htsat-A1`/`htsat-D1`, all four stages). This
+    discriminates the attention reduction from HTSAT's EAGER LayerNorm's
+    OWN per-row reduction, which can coincide at the IDENTICAL `grid[0]`
+    for one stage pair (`ln_row_count(stage=0) ==
+    attn_softmax_rows(stage=2) == 98304` on this checkpoint's declared
+    constants) but always launches a DIFFERENT block size (the smallest
+    power of 2 `>= dim_s`, i.e. `128/256/512/1024` — evidenced on
+    `htsat-D1`) — module doc, "HTSAT: the attention/LN row-reduction
+    collision"."""
+    return _is_row_count_grid(entry, count) and entry["block"][0] == 64
 
 
 def _activation_tier(entry: dict, sig: TowerSignatures) -> str | None:
@@ -892,6 +1456,118 @@ def _activation_tier(entry: dict, sig: TowerSignatures) -> str | None:
     if _in_element_range(entry, sig.gelu_shape_elements()):
         return "mlp"
     return None
+
+
+def classify_htsat_kernel(entry: dict, hsig: HtsatSignatures, ln_disabled: bool = False) -> str | None:
+    """`classify_kernel`'s HTSAT counterpart (module doc, "HTSAT") — a
+    SEPARATE function, not a branch inside `classify_kernel`'s CLIP logic,
+    because HTSAT's signature is PER-STAGE (four distinct widths/token
+    counts/head counts) rather than CLIP's single declared shape per tier.
+    Every element-count/grid rule below was read off the real
+    `htsat-A1`/`htsat-D1` exports before being written (same §D3
+    discipline as every CLIP rule). `ln_disabled` gates the eager LN
+    reduction/elementwise rule exactly like the CLIP path."""
+    name = entry["kernel"]
+    grid = entry["grid"]
+    rows = hsig.rows.value
+    tower = "htsat"
+
+    def _any_stage(pred) -> bool:
+        return any(pred(stage) for stage in hsig.stages)
+
+    # --- `cast`-named kernels: shape-gated to C-ATTN-HTSAT first (same
+    #     priority as the CLIP path — module doc, finding 1), else CAST.
+    if "cast" in name.lower():
+        if _any_stage(lambda s: _in_element_range(entry, s.attn_shape_elements(rows))):
+            return chain_attn(tower)
+        return CHAIN_CAST
+
+    # --- Name-only chains, independent of shape (shared with CLIP).
+    if name.startswith("adamw_"):
+        return CHAIN_OPTIMIZER
+    if name in EMBED_GATHER_KERNEL_NAMES:
+        return CHAIN_EMBED_GATHER
+    if name.startswith("dropout_fwd"):
+        return CHAIN_DROPOUT
+    if name in LN_KERNEL_NAMES:
+        return CHAIN_LN
+    if name in PATCH_EMBED_KERNEL_NAMES:
+        return CHAIN_PATCH_EMBED
+    if name in GELU_ERF_HTSAT_EXCLUSIVE_KERNEL_NAMES:
+        return CHAIN_GELU_HTSAT
+
+    # --- Row-count-gated reductions: the attention softmax's OWN row
+    #     reduction always launches `block=[64,1,1]` (module doc,
+    #     "`_is_attn_softmax_reduction_grid`") — checked FIRST so it wins
+    #     the one real grid[0] collision with a LN row count on this
+    #     checkpoint's declared constants. The eager LN reduction (any
+    #     OTHER block size, `ln_disabled` only) is checked next; every
+    #     other row count is `LOSS/REDUCE`.
+    if name in ROW_REDUCTION_KERNEL_NAMES:
+        if _any_stage(lambda s: _is_attn_softmax_reduction_grid(entry, s.attn_softmax_rows(rows))):
+            return chain_attn(tower)
+        if ln_disabled and _any_stage(lambda s: _is_row_count_grid(entry, s.ln_row_count(rows))):
+            return CHAIN_LN
+        return CHAIN_LOSS_REDUCE
+
+    chain: str | None = None
+
+    # --- Eager LN's own flat mean/var/std/reciprocal steps, gated on
+    #     `ln_disabled` (mirrors the CLIP rule; HTSAT's own name set is
+    #     narrower — no `bmul`/`urecip` row observed at this shape yet).
+    if ln_disabled and name in LN_EAGER_EXTENDED_KERNEL_NAMES and _any_stage(
+        lambda s: _in_element_range(entry, s.ln_row_count(rows))
+    ):
+        chain = CHAIN_LN
+
+    # --- `C-GELU-HTSAT`'s eager (D1) twin: candle's own three-kernel
+    #     `gelu_erf` decomposition, shape-gated at the per-stage MLP tier
+    #     (module doc, "`GELU_ERF_HTSAT_EAGER_KERNEL_NAMES`").
+    if chain is None and name in GELU_ERF_HTSAT_EAGER_KERNEL_NAMES and _any_stage(
+        lambda s: _in_element_range(entry, s.mlp_shape_elements(rows))
+    ):
+        chain = CHAIN_GELU_HTSAT
+
+    # --- Batched-window-attention grid signature: relational, gated on
+    #     grid POSITION 2 carrying `rows*windows*heads` for ANY stage
+    #     (module doc, "`C-ATTN-HTSAT`").
+    if chain is None and _any_stage(lambda s: grid[2] == s.attn_batch_count(rows)):
+        chain = chain_attn(tower)
+
+    # --- GEMM-family by name (not carrying an attention batch count).
+    if chain is None and GEMM_NAME_RE.search(name):
+        chain = CHAIN_BASE_GEMM
+    if chain is None and name == "splitKreduce_kernel":
+        chain = CHAIN_BASE_GEMM
+
+    # --- The attention score/prob tensor's own elementwise ops, ANY stage.
+    if chain is None and _any_stage(lambda s: _in_element_range(entry, s.attn_shape_elements(rows))):
+        chain = chain_attn(tower)
+
+    # --- The two activation-tier buckets HTSAT reuses from CLIP (`out`/
+    #     `mlp` — HTSAT's query/key/value/attention_output sites share the
+    #     `out` width; there is no combined-QKV tensor to key a `qkv` tier
+    #     off), split by kernel NAME-CLASS exactly like the CLIP rule.
+    if chain is None:
+        tier: str | None = None
+        if _any_stage(lambda s: _in_element_range(entry, s.out_shape_elements(rows))):
+            tier = "out"
+        elif _any_stage(lambda s: _in_element_range(entry, s.mlp_shape_elements(rows))):
+            tier = "mlp"
+        if tier is not None:
+            if name in PERMUTE_RESHAPE_KERNEL_NAMES:
+                chain = CHAIN_PERMUTE_RESHAPE
+            elif name in BIAS_RESIDUAL_KERNEL_NAMES:
+                chain = BIAS_RESIDUAL_CHAIN_FOR_TIER[tier]
+            else:
+                chain = ELEMENTWISE_OTHER_CHAIN_FOR_TIER[tier]
+
+    # --- Anonymous-kernel-ONLY grid-family fallback, LAST (module doc,
+    #     "Grid-family fallback", pass 3 finding 4 — shared discipline).
+    if chain is None and _is_anonymous_kernel_name(name) and _is_plausible_gemm_tile_grid(grid):
+        chain = CHAIN_BASE_GEMM
+
+    return chain
 
 
 def classify_kernel(
@@ -910,6 +1586,9 @@ def classify_kernel(
     is shape-gated for one chain can still land in a DIFFERENT chain at a
     DIFFERENT shape instead of falling all the way through to
     `UNATTRIBUTED`."""
+    if tower == "htsat":
+        return classify_htsat_kernel(entry, sig, ln_disabled=ln_disabled)
+
     name = entry["kernel"]
     grid = entry["grid"]
 
@@ -972,25 +1651,20 @@ def classify_kernel(
         chain = CHAIN_BASE_GEMM
     if chain is None and name == "splitKreduce_kernel":
         chain = CHAIN_BASE_GEMM
-    # --- Anonymous-kernel-only grid-family fallback (pass 3, finding 3 —
-    #     module doc): a name that does NOT look GEMM-shaped by name can
-    #     still be BASE-GEMM if its own launch grid is a genuine 3-D tile
-    #     grid (every dimension `> 1`).
-    if chain is None and not GEMM_NAME_RE.search(name) and _is_plausible_gemm_tile_grid(grid):
-        chain = CHAIN_BASE_GEMM
 
     # --- Attention tensor's own elementwise ops (mask add, scale, cast,
-    #     backward exp/square, ...) — module doc, "the attention SCORE/PROB
-    #     tensor's own elementwise ops".
+    #     backward exp/square, ...) — module doc, "`C-ATTN-<tower>`
+    #     attention-elementwise, by SHAPE".
     if chain is None and _in_element_range(entry, sig.attn_shape_elements()):
         chain = chain_attn(tower)
 
-    # --- Parameter-scale bookkeeping (module doc, "OPTIMIZER extended"),
-    #     GATED on 1-D launch geometry (pass 3, finding 3).
+    # --- Parameter-scale bookkeeping (module doc, "`GRAD-BOOKKEEPING`"),
+    #     GATED on 1-D launch geometry (pass 3, finding 3) — NOT `OPTIMIZER`
+    #     (pass 3, finding 8: `OPTIMIZER` is `adamw_*` by name only now).
     if chain is None and _is_one_d_launch_grid(grid):
         for elements in sig.param_scale_elements():
             if _in_element_range(entry, elements):
-                chain = CHAIN_OPTIMIZER
+                chain = CHAIN_GRAD_BOOKKEEPING
                 break
 
     # --- The three activation-tier buckets, split by kernel NAME-CLASS
@@ -1007,6 +1681,16 @@ def classify_kernel(
                 chain = BIAS_RESIDUAL_CHAIN_FOR_TIER[tier]
             else:
                 chain = ELEMENTWISE_OTHER_CHAIN_FOR_TIER[tier]
+
+    # --- Anonymous-kernel-ONLY grid-family fallback (pass 3, finding 4 —
+    #     module doc), placed LAST (after the attention-shape AND
+    #     activation-tier checks above): an UNSYMBOLIZED name whose own
+    #     launch grid is a genuine, magnitude-floored 3-D tile grid is
+    #     `BASE-GEMM`. Restricted to `_is_anonymous_kernel_name` — a NAMED
+    #     kernel (e.g. `badd_f32`/`ucopy_f32`/`usqrt_f32`) at a 3-D grid is
+    #     NEVER routed here by this rule, no matter its grid shape.
+    if chain is None and _is_anonymous_kernel_name(name) and _is_plausible_gemm_tile_grid(grid):
+        chain = CHAIN_BASE_GEMM
 
     return chain
 
@@ -1164,7 +1848,12 @@ def leg_decision_grade(row: dict, merge_row: dict | None) -> tuple[bool, str | N
     row from a `--merge-json` report (`None` if this leg has no such row —
     treated as INVALID-by-merge, never assumed clean)."""
     if row.get("verdict") != VERDICT_VALID:
-        return False, "leg is INVALID (see this leg's own `reasons`)"
+        # Pass 3 (adversarial-audit finding 1): NAME the reason, don't just
+        # point at it — `decide_candidate_port`'s own F32-only caveat needs
+        # the actual text, not a pointer a reader has to go dig up.
+        reasons = row.get("reasons")
+        detail = "; ".join(str(r) for r in reasons) if isinstance(reasons, list) and reasons else "no reasons recorded"
+        return False, f"leg is INVALID: {detail}"
     if merge_row is None:
         return False, "no corresponding row in --merge-json — the merge cannot certify this leg"
     if merge_row.get("verdict") != MERGE_VERDICT_VALID:
@@ -1250,19 +1939,53 @@ def compute_realized_gains(legs: list[dict], merge_by_leg_id: dict[str, dict]) -
             eager_wall = _merge_wall_s_per_step(merge_by_leg_id.get(eager["leg_id"]))
             fused_wall = _merge_wall_s_per_step(merge_by_leg_id.get(fused["leg_id"]))
             wall_delta = (eager_wall - fused_wall) if (eager_wall is not None and fused_wall is not None) else None
-            share = (wall_delta / fused_wall) if (wall_delta is not None and fused_wall) else None
-            gains.append(
-                {
-                    "chain": chain_name,
-                    "tower": tower,
-                    "eager_leg_id": eager["leg_id"],
-                    "fused_leg_id": fused["leg_id"],
-                    "busy_delta_us_per_step": busy_delta,
-                    "wall_delta_s_per_step": wall_delta,
-                    "share_of_baseline_wall": share,
-                    "direction": _realized_gain_direction(chain_name, eager["leg_id"], fused["leg_id"], busy_delta),
-                }
+            # Pass 3 (adversarial-audit finding 5): `share_of_baseline_wall`
+            # ALWAYS divides by the tower's SHIPPED `A1` wall — the fused
+            # LEG in a `(eager_role, fused_role)` pair is not always `A1`
+            # (`C-LN`'s own pair is `D1` vs `D2`; `D2` is not what ships).
+            # `fused_twin_wall_s`/`share_of_fused_twin_wall` are emitted
+            # SEPARATELY and divide by the pair's own fused leg instead (the
+            # number pass 2 originally called `share_of_baseline_wall` for
+            # `C-LN` — kept, just correctly named now).
+            baseline_leg = by_tower_role.get((tower, "A"))
+            baseline_wall = (
+                _merge_wall_s_per_step(merge_by_leg_id.get(baseline_leg["leg_id"]))
+                if baseline_leg is not None
+                else None
             )
+            share_of_baseline_wall = (
+                (wall_delta / baseline_wall) if (wall_delta is not None and baseline_wall) else None
+            )
+            share_of_fused_twin_wall = (
+                (wall_delta / fused_wall) if (wall_delta is not None and fused_wall) else None
+            )
+            gain: dict[str, object] = {
+                "chain": chain_name,
+                "tower": tower,
+                "eager_leg_id": eager["leg_id"],
+                "fused_leg_id": fused["leg_id"],
+                "busy_delta_us_per_step": busy_delta,
+                "wall_delta_s_per_step": wall_delta,
+                "baseline_leg_id": baseline_leg["leg_id"] if baseline_leg is not None else None,
+                "baseline_wall_s": baseline_wall,
+                "share_of_baseline_wall": share_of_baseline_wall,
+                "fused_twin_wall_s": fused_wall,
+                "share_of_fused_twin_wall": share_of_fused_twin_wall,
+                "direction": _realized_gain_direction(chain_name, eager["leg_id"], fused["leg_id"], busy_delta),
+            }
+            if tower == "htsat" and chain_name == CHAIN_LN:
+                # `htsat`'s own `D1` disables `layer_norm_fused` AND
+                # `gelu_erf_fused` TOGETHER (module doc, "HTSAT") — this
+                # `D1-D2` delta cannot isolate `C-LN` from `C-GELU-HTSAT`
+                # from a single leg pair, so it is reported as their JOINT
+                # gain rather than force-split under one name alone.
+                gain["note"] = (
+                    "htsat's D1 disables layer_norm_fused and gelu_erf_fused together — this "
+                    "delta is the JOINT C-LN + C-GELU-HTSAT realized gain, not C-LN alone; see "
+                    "each leg's own by-name chain shares (chains.C-LN / chains.C-GELU-HTSAT) for "
+                    "how the two buckets split within a single leg's busy"
+                )
+            gains.append(gain)
     return gains
 
 
@@ -1313,11 +2036,13 @@ def decide_candidate_port(
     exercising the rule's own arithmetic on synthetic shares, must pass a
     real mapping to reach ACTIVATE/DECLINE)."""
     merge_by_leg_id = merge_by_leg_id if merge_by_leg_id is not None else {}
-    a_legs = [
-        leg
-        for leg in legs
-        if leg.get("tower") == tower and leg.get("_role") == "A" and leg.get("verdict") == VERDICT_VALID
-    ]
+    # Pass 3 (adversarial-audit finding 1): do NOT pre-filter on
+    # `verdict == VALID` here — an INVALID `A2` leg (e.g. the real
+    # `clip-text-A2`, invalidated by the 1%-unknown-kernel gate) must
+    # still be FOUND here so `leg_decision_grade` can name its actual
+    # reason below, rather than this leg silently looking "absent" the
+    # same way a truly missing leg would.
+    a_legs = [leg for leg in legs if leg.get("tower") == tower and leg.get("_role") == "A"]
     a1 = next((leg for leg in a_legs if leg.get("dtype") == "f32"), None)
     a2 = next((leg for leg in a_legs if leg.get("dtype") == "bf16"), None)
 
@@ -1336,8 +2061,13 @@ def decide_candidate_port(
     a2_grade, a2_reason = (
         leg_decision_grade(a2, merge_by_leg_id.get(a2["leg_id"])) if a2 is not None else (False, "no A2 (BF16) leg present")
     )
+    # Pass 3 (adversarial-audit finding 1): the F32-only caveat fires
+    # whenever A2 is not decision-grade for ANY reason — present but
+    # INVALID (named via `a2_reason`), present but missing a `--merge-json`
+    # row, or simply ABSENT (`a2 is None`) — never only the "present but
+    # INVALID" case pass 2 checked.
     f32_only_note = ""
-    if a2 is not None and not a2_grade:
+    if not a2_grade:
         f32_only_note = f" (F32-only: A2 not decision-grade — {a2_reason})"
 
     decision_grade_legs = [a1] + ([a2] if a2 is not None and a2_grade else [])
@@ -1426,7 +2156,10 @@ def attribute_leg(leg_dir: Path) -> dict:
         manifest = _load_json(leg_dir / "manifest.json")
     except (OSError, json.JSONDecodeError) as exc:
         row["reasons"] = [f"{leg_id}: manifest.json could not be read: {exc}"]
-        row["decision_grade_reason"] = "leg is INVALID (see this leg's own `reasons`)"
+        # Pass 3 (adversarial-audit finding 1): NAME the reason inline
+        # rather than pointing at `row["reasons"]` — the F32-only caveat
+        # `decide_candidate_port` builds needs the actual text.
+        row["decision_grade_reason"] = f"leg is INVALID: {'; '.join(str(r) for r in row['reasons'])}"
         return row
 
     tower = manifest.get("tower")
@@ -1436,7 +2169,10 @@ def attribute_leg(leg_dir: Path) -> dict:
     kernels_disabled = manifest.get("kernels_disabled")
     if not isinstance(kernels_disabled, list):
         row["reasons"] = [f"{leg_id}: manifest.kernels_disabled is not a list"]
-        row["decision_grade_reason"] = "leg is INVALID (see this leg's own `reasons`)"
+        # Pass 3 (adversarial-audit finding 1): NAME the reason inline
+        # rather than pointing at `row["reasons"]` — the F32-only caveat
+        # `decide_candidate_port` builds needs the actual text.
+        row["decision_grade_reason"] = f"leg is INVALID: {'; '.join(str(r) for r in row['reasons'])}"
         return row
     kernels_disabled_str = [str(k) for k in kernels_disabled]
     row["_role"] = leg_role(kernels_disabled_str, str(tower))
@@ -1461,7 +2197,10 @@ def attribute_leg(leg_dir: Path) -> dict:
     except (OSError, json.JSONDecodeError) as exc:
         reasons.append(f"{leg_id}: census.json could not be read: {exc}")
         row["reasons"] = reasons
-        row["decision_grade_reason"] = "leg is INVALID (see this leg's own `reasons`)"
+        # Pass 3 (adversarial-audit finding 1): NAME the reason inline
+        # rather than pointing at `row["reasons"]` — the F32-only caveat
+        # `decide_candidate_port` builds needs the actual text.
+        row["decision_grade_reason"] = f"leg is INVALID: {'; '.join(str(r) for r in row['reasons'])}"
         return row
 
     if census.get("excluded_from_chain_attribution") is True:
@@ -1471,13 +2210,19 @@ def attribute_leg(leg_dir: Path) -> dict:
             "E1 exclusion)"
         )
         row["reasons"] = reasons
-        row["decision_grade_reason"] = "leg is INVALID (see this leg's own `reasons`)"
+        # Pass 3 (adversarial-audit finding 1): NAME the reason inline
+        # rather than pointing at `row["reasons"]` — the F32-only caveat
+        # `decide_candidate_port` builds needs the actual text.
+        row["decision_grade_reason"] = f"leg is INVALID: {'; '.join(str(r) for r in row['reasons'])}"
         return row
 
     if not isinstance(tower, str):
         reasons.append(f"{leg_id}: manifest.tower is not a string ({tower!r})")
         row["reasons"] = reasons
-        row["decision_grade_reason"] = "leg is INVALID (see this leg's own `reasons`)"
+        # Pass 3 (adversarial-audit finding 1): NAME the reason inline
+        # rather than pointing at `row["reasons"]` — the F32-only caveat
+        # `decide_candidate_port` builds needs the actual text.
+        row["decision_grade_reason"] = f"leg is INVALID: {'; '.join(str(r) for r in row['reasons'])}"
         return row
 
     try:
@@ -1485,7 +2230,10 @@ def attribute_leg(leg_dir: Path) -> dict:
     except SignatureError as exc:
         reasons.append(f"{leg_id}: {exc}")
         row["reasons"] = reasons
-        row["decision_grade_reason"] = "leg is INVALID (see this leg's own `reasons`)"
+        # Pass 3 (adversarial-audit finding 1): NAME the reason inline
+        # rather than pointing at `row["reasons"]` — the F32-only caveat
+        # `decide_candidate_port` builds needs the actual text.
+        row["decision_grade_reason"] = f"leg is INVALID: {'; '.join(str(r) for r in row['reasons'])}"
         return row
     row["signatures"] = sig.as_dict()
 
@@ -1494,7 +2242,10 @@ def attribute_leg(leg_dir: Path) -> dict:
     except SignatureError as exc:
         reasons.append(f"{leg_id}: {exc}")
         row["reasons"] = reasons
-        row["decision_grade_reason"] = "leg is INVALID (see this leg's own `reasons`)"
+        # Pass 3 (adversarial-audit finding 1): NAME the reason inline
+        # rather than pointing at `row["reasons"]` — the F32-only caveat
+        # `decide_candidate_port` builds needs the actual text.
+        row["decision_grade_reason"] = f"leg is INVALID: {'; '.join(str(r) for r in row['reasons'])}"
         return row
     reasons.extend(classify_reasons)
     row["unknown_kernels"] = unknown
@@ -1525,11 +2276,16 @@ def attribute_leg(leg_dir: Path) -> dict:
 
 
 def _leg_dirs(legs_dir: Path) -> list[Path]:
-    return sorted(
-        d
-        for d in legs_dir.iterdir()
-        if d.is_dir() and d.name != "p2-bf16" and (d / "manifest.json").is_file()
-    )
+    """Every directory under `legs_dir` this module treats as a leg, EXCEPT
+    the `p2-bf16` driver's own non-leg scratch directory (a known,
+    legitimate sibling — the P2b BF16 corpus, never a
+    `profile_421_legs.sh` leg). Pass 3 (adversarial-audit advisory): a
+    directory with NO `manifest.json` is no longer silently dropped here —
+    it is now included, so `attribute_leg` (which already turns "manifest
+    could not be read" into an `INVALID` row with a reason) surfaces it
+    as a visible INVALID leg instead of a silent gap in the reported leg
+    count."""
+    return sorted(d for d in legs_dir.iterdir() if d.is_dir() and d.name != "p2-bf16")
 
 
 def _merge_legs_by_id(merge_report: dict) -> dict[str, dict]:
@@ -1618,6 +2374,68 @@ def format_table(report: dict) -> str:
     return "\n".join(lines)
 
 
+_PROVENANCE_LEG_ID_RE = re.compile(r"pod421-run2/legs/([A-Za-z0-9_-]+)/census\.json")
+
+FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
+
+
+def verify_fixtures(fixtures_dir: Path, legs_dir: Path) -> list[str]:
+    """Pass 3 (adversarial-audit finding 3): every committed fixture's
+    `kernels.json` rows must match its OWN `PROVENANCE.md`-named source
+    leg's real `census.json` byte-for-byte, whenever that real leg is
+    present under `legs_dir` — CI has no pod pull, so a fixture whose named
+    leg is absent is SKIPPED cleanly (never a failure), but this function
+    is meant to be run BY HAND against a real pulled `legs/` tree before a
+    fixture change ships (see the hand-off's own pasted run). Returns a
+    list of issue strings; empty means every checkable fixture matched
+    exactly (or none could be checked)."""
+    issues: list[str] = []
+    dirs = sorted(
+        d
+        for d in fixtures_dir.iterdir()
+        if d.is_dir() and (d / "kernels.json").is_file() and (d / "PROVENANCE.md").is_file()
+    )
+    if not dirs:
+        return [f"no fixture directories found under {fixtures_dir}"]
+    for fixture_dir in dirs:
+        provenance = (fixture_dir / "PROVENANCE.md").read_text(encoding="utf-8")
+        match = _PROVENANCE_LEG_ID_RE.search(provenance)
+        if match is None:
+            issues.append(f"{fixture_dir.name}: PROVENANCE.md names no pod421-run2/legs/<leg>/census.json source")
+            continue
+        leg_id = match.group(1)
+        real_census_path = legs_dir / leg_id / "census.json"
+        if not real_census_path.is_file():
+            # Real leg not pulled in this environment — skip cleanly.
+            continue
+        try:
+            fixture = json.loads((fixture_dir / "kernels.json").read_text(encoding="utf-8"))
+            real = json.loads(real_census_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            issues.append(f"{fixture_dir.name}: could not read fixture or real census: {exc}")
+            continue
+        for top_key in ("gpu_kernel_us_per_step", "wall_s_per_step"):
+            if top_key in fixture and fixture.get(top_key) != real.get(top_key):
+                issues.append(
+                    f"{fixture_dir.name}: top-level {top_key!r} = {fixture.get(top_key)!r}, "
+                    f"real {leg_id} has {real.get(top_key)!r}"
+                )
+        real_rows = {
+            (row["kernel"], tuple(row["grid"]), tuple(row["block"])): row for row in real.get("by_kernel_and_grid", [])
+        }
+        for row in fixture.get("by_kernel_and_grid", []):
+            key = (row["kernel"], tuple(row["grid"]), tuple(row["block"]))
+            real_row = real_rows.get(key)
+            if real_row is None:
+                issues.append(f"{fixture_dir.name}: row {key} has no match in real {leg_id}'s census.json")
+            elif real_row != row:
+                issues.append(
+                    f"{fixture_dir.name}: row {key} does not match real {leg_id} byte-for-byte "
+                    f"(fixture={row!r}, real={real_row!r})"
+                )
+    return issues
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     ap = argparse.ArgumentParser(
@@ -1625,11 +2443,11 @@ def main(argv: list[str] | None = None) -> int:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("--legs-dir", required=True, help="a profile_421_legs.sh $OUT_DIR/legs to attribute")
+    ap.add_argument("--legs-dir", help="a profile_421_legs.sh $OUT_DIR/legs to attribute")
     ap.add_argument(
         "--merge-json",
-        required=True,
-        help="the output of profile_421_merge.py over the SAME legs-dir; required (module doc)",
+        help="the output of profile_421_merge.py over the SAME legs-dir; required (module doc) "
+        "unless --verify-fixtures is given",
     )
     ap.add_argument("--out", help="write the attribution report here (default: stdout)")
     ap.add_argument(
@@ -1637,7 +2455,31 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="suppress the human-readable table on stderr (JSON output is unaffected)",
     )
+    ap.add_argument(
+        "--verify-fixtures",
+        metavar="LEGS_DIR",
+        help="verify every committed fixture's kernels.json against its PROVENANCE-named source "
+        "leg's real census.json under LEGS_DIR (skips a fixture cleanly if its leg is absent); "
+        "runs INSTEAD of the normal --legs-dir/--merge-json attribution and exits before them "
+        "(module doc, pass 3 finding 3)",
+    )
     args = ap.parse_args(argv)
+
+    if args.verify_fixtures:
+        issues = verify_fixtures(FIXTURES_DIR, Path(args.verify_fixtures))
+        if issues:
+            for issue in issues:
+                print(f"::error::profile_421_attribute --verify-fixtures: {issue}", file=sys.stderr)
+            return 1
+        print("profile_421_attribute --verify-fixtures: every checkable fixture matched byte-for-byte", file=sys.stderr)
+        return 0
+
+    if not args.legs_dir:
+        print("::error::profile_421_attribute: --legs-dir is required (unless --verify-fixtures)", file=sys.stderr)
+        return 1
+    if not args.merge_json:
+        print("::error::profile_421_attribute: --merge-json is required (unless --verify-fixtures)", file=sys.stderr)
+        return 1
 
     legs_dir = Path(args.legs_dir)
     if not legs_dir.is_dir():

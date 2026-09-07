@@ -25,8 +25,17 @@ c=(--model-dir "$MD" --lora-rank 16 --lora-alpha 32 --target-modules "Wqkv,Wo,Wi
 K=attention_block_flash
 for shape in "8 512" "8 128"; do set -- $shape
   for leg in flash block; do for r in r1 r2; do
-    if [ $leg = block ]; then JAMMI_KERNELS_STRICT=1 JAMMI_KERNELS_DISABLE=$K "$B" finetune-step "${c[@]}" --batch $1 --seq $2 > $OUT/b$1_s$2_$leg.$r.json 2> $OUT/b$1_s$2_$leg.$r.err
-    else JAMMI_KERNELS_STRICT=1 "$B" finetune-step "${c[@]}" --batch $1 --seq $2 > $OUT/b$1_s$2_$leg.$r.json 2> $OUT/b$1_s$2_$leg.$r.err; fi
+    # `--expect-kernels-disabled` is ALWAYS passed (finetune_ab.sh:582's
+    # convention): the block leg names the SAME op key it puts in
+    # JAMMI_KERNELS_DISABLE, and the flash leg passes the empty string --
+    # an exact-set-equality guard against an ambient JAMMI_KERNELS_DISABLE
+    # leaking into the "flash" leg from the calling shell, which would
+    # otherwise silently turn it back into the block leg wearing a flash
+    # label. This makes the printed req/fired line below a GATE (the
+    # binary refuses, before any step runs, if the expectation and the
+    # real env var disagree), not just an eyeballed print.
+    if [ $leg = block ]; then JAMMI_KERNELS_STRICT=1 JAMMI_KERNELS_DISABLE=$K "$B" finetune-step "${c[@]}" --batch $1 --seq $2 --expect-kernels-disabled "$K" > $OUT/b$1_s$2_$leg.$r.json 2> $OUT/b$1_s$2_$leg.$r.err
+    else JAMMI_KERNELS_STRICT=1 "$B" finetune-step "${c[@]}" --batch $1 --seq $2 --expect-kernels-disabled "" > $OUT/b$1_s$2_$leg.$r.json 2> $OUT/b$1_s$2_$leg.$r.err; fi
     python3 -c "
 import json,sys
 try:

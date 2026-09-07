@@ -253,6 +253,87 @@ class CliTests(unittest.TestCase):
             self.assertEqual(rc, 2)
 
 
+class PoolCacheTests(unittest.TestCase):
+    """`--pool-cache-dir` (esc-088 round-4 advisory: hermetic dry-run suite
+    runtime): opt-in, real runs never set it. Every assertion here drives
+    the REAL CLI (`gfi.main`), never `_build_pool`/`_load_or_build_pool`
+    directly, so a cache-path bug in argument plumbing cannot hide behind
+    a unit-level call that bypasses it."""
+
+    @staticmethod
+    def _sha256_tree(d: Path) -> dict[str, str]:
+        import hashlib
+
+        return {
+            p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sorted(d.iterdir())
+            if p.is_file()
+        }
+
+    def test_cache_hit_and_miss_are_byte_identical_to_the_uncached_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            uncached = Path(tmp) / "uncached"
+            cache_dir = Path(tmp) / "cache"
+            miss_out = Path(tmp) / "miss"
+            hit_out = Path(tmp) / "hit"
+            common = [
+                "--rows", "5", "--size", "12", "--seed", "3",
+                "--families", "4", "--instances-per-family", "3",
+            ]
+            self.assertEqual(gfi.main([*common, "--out-dir", str(uncached)]), 0)
+            # First cached call: a cache MISS (builds + populates the cache).
+            self.assertEqual(
+                gfi.main([*common, "--out-dir", str(miss_out), "--pool-cache-dir", str(cache_dir)]),
+                0,
+            )
+            # Second cached call, a DIFFERENT --rows (never part of the pool
+            # key) and --out-dir: a cache HIT (reads the pool off disk).
+            self.assertEqual(
+                gfi.main(
+                    [
+                        "--rows", "2", "--size", "12", "--seed", "3",
+                        "--families", "4", "--instances-per-family", "3",
+                        "--out-dir", str(hit_out), "--pool-cache-dir", str(cache_dir),
+                    ]
+                ),
+                0,
+            )
+            uncached_pngs = self._sha256_tree(uncached)
+            miss_pngs = {k: v for k, v in self._sha256_tree(miss_out).items() if k.endswith(".png")}
+            hit_pngs = {k: v for k, v in self._sha256_tree(hit_out).items() if k.endswith(".png")}
+            uncached_only_pngs = {k: v for k, v in uncached_pngs.items() if k.endswith(".png")}
+            self.assertTrue(uncached_only_pngs, "no PNGs found -- test is vacuous")
+            self.assertEqual(uncached_only_pngs, miss_pngs)
+            self.assertEqual(uncached_only_pngs, hit_pngs)
+
+    def test_a_different_pool_shape_gets_a_different_cache_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_dir = Path(tmp) / "cache"
+            gfi.main([
+                "--rows", "4", "--size", "10", "--seed", "1", "--families", "2",
+                "--instances-per-family", "2", "--out-dir", str(Path(tmp) / "a"),
+                "--pool-cache-dir", str(cache_dir),
+            ])
+            gfi.main([
+                "--rows", "4", "--size", "10", "--seed", "2", "--families", "2",
+                "--instances-per-family", "2", "--out-dir", str(Path(tmp) / "b"),
+                "--pool-cache-dir", str(cache_dir),
+            ])
+            subdirs = [p for p in cache_dir.iterdir() if p.is_dir()]
+            self.assertEqual(len(subdirs), 2, "two different seeds must land in two different cache keys")
+
+    def test_cache_dir_left_unset_never_touches_the_filesystem_beyond_out_dir(self):
+        """The default (no `--pool-cache-dir`, every real invocation): the
+        producer must not silently create or read any cache directory."""
+        with tempfile.TemporaryDirectory() as tmp:
+            before = set(Path(tmp).iterdir())
+            gfi.main([
+                "--rows", "3", "--size", "8", "--seed", "1", "--out-dir", str(Path(tmp) / "out"),
+            ])
+            after = set(Path(tmp).iterdir())
+            self.assertEqual(after - before, {Path(tmp) / "out"})
+
+
 class HeldOutSplitTests(unittest.TestCase):
     """`--heldout-rows` (issue #421 P1-b(iv)): the held-out split's ROW
     COUNT, its FAMILY-disjointness from the train split, its determinism,

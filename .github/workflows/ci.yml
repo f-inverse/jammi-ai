@@ -1693,6 +1693,23 @@ jobs:
           # no GPU, no real jammi-bench, no real checkpoint, no network.
           - name: lora_bias_ab.sh dry-run smoke
             cmd: python3 ci/scripts/perf/test_lora_bias_ab_sh_dry_run.py
+          # `fa2_ab.sh`'s own shape test (#421 follow-ups, re-audit
+          # advisory): before this test, the shell PRODUCER — a manual,
+          # exclusive-timing-box script with hardcoded `/root/...` paths
+          # and no `DRY_RUN` support at all — had ZERO automated coverage
+          # anywhere in this repo's CI. Rather than a dry-run execution
+          # (there is no producer pipeline downstream of it to exercise
+          # hermetically), this greps the COMMITTED command-array text for
+          # both `finetune-step` legs: the block leg must name its own
+          # `JAMMI_KERNELS_DISABLE=$K` key back via
+          # `--expect-kernels-disabled "$K"`, and the flash leg must pass
+          # `--expect-kernels-disabled ""` — an exact-set-equality guard
+          # against an ambient `JAMMI_KERNELS_DISABLE` leaking into the
+          # "flash" leg from the calling shell — plus a `bash -n` parse
+          # check and a `shellcheck -S warning` pass. No GPU, no network,
+          # no `/root` path ever touched.
+          - name: fa2_ab.sh shape
+            cmd: python3 ci/scripts/perf/test_fa2_ab_sh.py
     steps:
       - uses: actions/checkout@v4
         with:

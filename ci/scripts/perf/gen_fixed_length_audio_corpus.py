@@ -89,14 +89,25 @@ Usage:
       --seed K --out-dir DIR [--families F] [--instances-per-family I]
       [--jitter J] [--jsonl-name NAME]
       [--heldout-rows N --heldout-batch B [--heldout-families F]]
+      [--pool-cache-dir DIR]
 
-Hermetic: no network, writes only under `--out-dir`.
+Hermetic: no network, writes only under `--out-dir` (and, only when
+`--pool-cache-dir` is explicitly given, under that path too).
+
+`--pool-cache-dir` (opt-in, default unset -- see that flag's own help):
+lets many invocations sharing one `(--families, --instances-per-family,
+--seconds, --sample-rate, --jitter, --seed)` tuple synthesize the audio
+pool ONCE instead of once per invocation, with byte-identical output
+either way. A real leg sweep never sets this; it exists for a test harness
+driving ~dozens of hermetic invocations of this producer at the same pool
+shape.
 """
 
 from __future__ import annotations
 
 import argparse
 import array
+import hashlib
 import io
 import json
 import math
@@ -104,6 +115,13 @@ import random
 import sys
 import wave
 from pathlib import Path
+
+# Bumped whenever the WAVEFORM-LEVEL construction below
+# (`_instance_samples`/`encode_wav`) changes in any way that could move
+# emitted WAV bytes -- part of `--pool-cache-dir`'s own cache key (see
+# `_pool_cache_key`) so a stale on-disk pool from a PRIOR producer version
+# can never be read back as if it were this version's own output.
+_PRODUCER_VERSION = "v1"
 
 # 16-bit signed PCM, mono -- the shape every `*_path` in the emitted JSONL
 # carries. Named constants so the assertions below and the module doc's
@@ -321,6 +339,98 @@ def validate_heldout_split(
     return train_families
 
 
+def _build_pool(
+    families: int,
+    instances_per_family: int,
+    frames: int,
+    sample_rate: int,
+    jitter: int,
+    seed: int,
+) -> dict[str, bytes]:
+    """The family x instances audio pool -- a pure function of exactly
+    these six arguments (never `--rows`/`--heldout-*`/`--out-dir`/
+    `--jsonl-name`), which is what makes it safe to cache: any invocation
+    sharing this tuple, whatever it asks for downstream, gets the
+    byte-identical pool this same code would have built inline. Factored
+    out of `generate_split` so the cached and uncached paths run the EXACT
+    SAME construction, never two implementations that could drift apart."""
+    rng = random.Random(seed)
+    files: dict[str, bytes] = {}
+    for family in range(families):
+        for instance in range(instances_per_family):
+            samples = _instance_samples(family, instance, frames, sample_rate, rng, jitter)
+            files[_clip_name(family, instance)] = encode_wav(samples, sample_rate)
+    return files
+
+
+def _pool_cache_key(
+    families: int,
+    instances_per_family: int,
+    frames: int,
+    sample_rate: int,
+    jitter: int,
+    seed: int,
+) -> str:
+    """Filesystem-safe cache key over every argument `_build_pool` actually
+    reads (`frames`, not the raw `--seconds` float, since `frames` is what
+    the pool construction itself consumes -- see `frame_count`), plus
+    `_PRODUCER_VERSION` -- omitting any one of these would let two
+    genuinely different pools collide on the same cache directory."""
+    canonical = (
+        f"v={_PRODUCER_VERSION}|families={families}|instances={instances_per_family}|"
+        f"frames={frames}|sample_rate={sample_rate}|jitter={jitter}|seed={seed}"
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+
+
+_POOL_CACHE_DONE_MARKER = "_DONE"
+
+
+def _load_or_build_pool(
+    pool_cache_dir: Path | None,
+    families: int,
+    instances_per_family: int,
+    frames: int,
+    sample_rate: int,
+    jitter: int,
+    seed: int,
+) -> dict[str, bytes]:
+    """[`_build_pool`] straight through when `pool_cache_dir` is `None`
+    (real runs never set it -- see module doc's `--pool-cache-dir`) --
+    IDENTICAL bytes to every invocation before this cache existed. With a
+    cache dir given: a cache HIT reads every expected file straight off
+    disk (never re-runs the waveform synthesis loop); a cache MISS builds
+    the pool once via `_build_pool`, writes it into a fresh per-key
+    subdirectory, and only then drops the `_DONE` marker that makes it
+    visible to a later hit -- so a process that dies mid-write leaves an
+    incomplete (marker-less) subdirectory that the NEXT invocation rebuilds
+    from scratch, rather than one that reads back a partial pool.
+    """
+    if pool_cache_dir is None:
+        return _build_pool(families, instances_per_family, frames, sample_rate, jitter, seed)
+
+    key = _pool_cache_key(families, instances_per_family, frames, sample_rate, jitter, seed)
+    cache_dir = Path(pool_cache_dir) / key
+    marker = cache_dir / _POOL_CACHE_DONE_MARKER
+    expected_names = [
+        _clip_name(family, instance)
+        for family in range(families)
+        for instance in range(instances_per_family)
+    ]
+    if marker.is_file():
+        return {name: (cache_dir / name).read_bytes() for name in expected_names}
+
+    files = _build_pool(families, instances_per_family, frames, sample_rate, jitter, seed)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    for name, data in files.items():
+        (cache_dir / name).write_bytes(data)
+    marker.write_text(
+        f"families={families} instances={instances_per_family} frames={frames} "
+        f"sample_rate={sample_rate} jitter={jitter} seed={seed}\n"
+    )
+    return files
+
+
 def generate_corpus(
     rows: int,
     seconds: float,
@@ -358,6 +468,7 @@ def generate_split(
     heldout_rows: int = 0,
     heldout_families: int = _DEFAULT_HELDOUT_FAMILIES,
     heldout_batch: int | None = None,
+    pool_cache_dir: Path | None = None,
 ) -> tuple[dict[str, bytes], list[dict], list[dict]]:
     """Build the whole corpus in memory: `(files, rows, heldout_rows_list)`
     where `files` maps a relative file name to its WAV bytes, `rows` is the
@@ -365,7 +476,11 @@ def generate_split(
     (EMPTY unless `heldout_rows > 0`).
 
     Pure with respect to its arguments -- no filesystem, no clock, no
-    environment -- so determinism is testable without writing anything.
+    environment -- so determinism is testable without writing anything --
+    UNLESS `pool_cache_dir` is given (opt-in only; every real invocation
+    leaves it `None`), in which case the audio POOL (never the row lists)
+    is read from or written to that directory (see `_load_or_build_pool`)
+    but the RETURNED bytes are, by construction, identical either way.
     """
     if rows <= 0:
         raise ValueError(f"--rows must be positive, got {rows}")
@@ -404,13 +519,14 @@ def generate_split(
             families, heldout_families, heldout_rows, heldout_batch
         )
 
-    rng = random.Random(seed)
-    files: dict[str, bytes] = {}
     # Fixed draw order: family-major, instance-minor (family J).
-    for family in range(families):
-        for instance in range(instances_per_family):
-            samples = _instance_samples(family, instance, frames, sample_rate, rng, jitter)
-            files[_clip_name(family, instance)] = encode_wav(samples, sample_rate)
+    # `_build_pool` is the SAME function whether or not `pool_cache_dir`
+    # is given (see `_load_or_build_pool`'s own doc) -- caching can only
+    # skip re-running this construction, never change what it would have
+    # produced.
+    files = _load_or_build_pool(
+        pool_cache_dir, families, instances_per_family, frames, sample_rate, jitter, seed
+    )
 
     out_rows = _build_rows(rows, seed, train_families, instances_per_family, 0, "")
     heldout_out_rows: list[dict] = []
@@ -510,6 +626,20 @@ def main(argv: list[str] | None = None) -> int:
         help="required alongside --heldout-rows: the --batch the consuming finetune-run leg "
         "will use, which the held-out row count must be a nonzero multiple of",
     )
+    ap.add_argument(
+        "--pool-cache-dir",
+        type=Path,
+        default=None,
+        help="OPT-IN (default: unset). When given, the family x instances audio POOL -- a "
+        "pure function of (--families, --instances-per-family, --seconds, --sample-rate, "
+        "--jitter, --seed) that never depends on --rows/--heldout-*/--out-dir -- is read from "
+        "(or, on a first call, written to) a per-key subdirectory of this path instead of "
+        "being re-synthesized on every invocation. Emitted bytes are byte-identical with or "
+        "without this flag (see test_gen_fixed_length_audio_corpus.py); real runs never set "
+        "it -- it exists ONLY to let a test harness synthesize a shared pool once across many "
+        "invocations of this producer at the same (families, instances, seconds, sample-rate, "
+        "jitter, seed) tuple.",
+    )
     args = ap.parse_args(argv)
 
     try:
@@ -524,6 +654,7 @@ def main(argv: list[str] | None = None) -> int:
             heldout_rows=args.heldout_rows,
             heldout_families=args.heldout_families,
             heldout_batch=args.heldout_batch,
+            pool_cache_dir=args.pool_cache_dir,
         )
     except ValueError as e:
         print(f"::error::gen_fixed_length_audio_corpus: {e}", file=sys.stderr)

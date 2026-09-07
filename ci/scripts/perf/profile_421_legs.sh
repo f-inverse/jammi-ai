@@ -300,23 +300,8 @@ _print_cmd() {
   printf '\n' >&2
 }
 
-# --- state-changing command wrapper: echoes what it would run (stderr);
-# under DRY_RUN never executes. Used for invocations that need `$NSYS_BIN`/
-# `$BENCH_BIN` or otherwise cannot run hermetically (`kernel_census.py`,
-# which reads a real `nsys`-exported sqlite that only exists on a real
-# run). Corpus generation uses `run_corpus_cmd` below instead -- see
-# esc-088. `run_traced`'s own nsys/bench invocation does NOT go through
-# either wrapper.
-run_cmd() {
-  _print_cmd "$@"
-  if [ "$PROFILE_421_LEGS_DRY_RUN" = "1" ]; then
-    return 0
-  fi
-  "$@"
-}
-
-# --- corpus-producer wrapper: unlike `run_cmd`, this ALWAYS executes, even
-# under `PROFILE_421_LEGS_DRY_RUN=1` -- the three corpus producers
+# --- corpus-producer wrapper: ALWAYS executes, even under
+# `PROFILE_421_LEGS_DRY_RUN=1` -- the three corpus producers
 # (`gen_fixed_width_corpus.py` and the two media producers) are CPU-
 # hermetic (no GPU, no network, no `$NSYS_BIN`/`$BENCH_BIN`) and cheap: each
 # writes a FIXED family x instances-per-family media pool regardless of
@@ -338,6 +323,25 @@ run_corpus_cmd() {
   _print_cmd "$@"
   "$@" >&2
 }
+
+# --- media pool cache (esc-088 round-4, hermetic dry-run suite runtime):
+# OPT-IN, unset by every real leg sweep. `gen_fixed_shape_image_corpus.py`/
+# `gen_fixed_length_audio_corpus.py` each synthesize a FIXED family x
+# instances media pool per invocation regardless of `--rows` -- this
+# driver alone calls them ~10 times per full sweep, and a test harness
+# driving MANY separate subprocess invocations of this whole script (one
+# per test method) multiplies that further. `--pool-cache-dir` (those
+# producers' own flag) makes that pool synthesize once and be read back
+# off disk on every later call sharing its `(families, instances, size or
+# seconds/sample-rate, jitter, seed)` tuple -- byte-identical either way
+# (see each producer's own `PoolCacheTests`). A test harness sets
+# `PROFILE_421_LEGS_POOL_CACHE_DIR` to a SUITE-LEVEL tempdir it owns; a
+# real run never sets it, so `POOL_CACHE_ARGS` stays empty and every media
+# call below is byte-for-byte what it always was.
+POOL_CACHE_ARGS=()
+if [ -n "${PROFILE_421_LEGS_POOL_CACHE_DIR:-}" ]; then
+  POOL_CACHE_ARGS=(--pool-cache-dir "$PROFILE_421_LEGS_POOL_CACHE_DIR")
+fi
 
 # --- provenance cross-check (unification contract C5.1): refuse BEFORE any
 # leg runs if the binary's own baked identity does not match this checkout.
@@ -581,6 +585,15 @@ fi
 
 GOLDEN_FIXTURE="$REPO_ROOT/ci/scripts/perf/fixtures/finetune_run_golden/bert_fused.json"
 
+# esc-088 round-4 advisory: a committed, schema-valid nsys sqlite export
+# pair (`gen_nsys_kernel_fixture.py`'s own doc) -- exported into the
+# environment so the single-quoted `fake_nsys.sh` heredoc below (which
+# must NOT shell-expand `$1`/`$a`/etc. at HEREDOC-WRITE time) can still
+# read this path at the stub's own RUN time, from its inherited
+# environment.
+NSYS_KERNEL_FIXTURE_DIR="$DIR/fixtures/nsys_kernel_census"
+export NSYS_KERNEL_FIXTURE_DIR
+
 # Hermetic fake nsys/bench stand-ins, used ONLY under DRY_RUN -- generated
 # ONCE, reused for every leg, so the DRY_RUN sweep drives the EXACT SAME
 # capture path (the exec-wrapper, the stderr redirect, the post-write
@@ -607,7 +620,26 @@ if [ "$1" = "export" ]; then
     esac
   done
   echo "fake_nsys: export writing to '$out' (more stdout noise)"
-  if [ -n "$out" ]; then : > "$out"; fi
+  # esc-088 round-4: copy a REAL, committed, schema-valid nsys sqlite
+  # export fixture into place -- `run_traced` (this script's ONLY export
+  # call site) always names its two exports `.../run_n.sqlite` and
+  # `.../run_m.sqlite`, so the suffix alone unambiguously selects which
+  # fixture is the N-step (fewer launches) vs M-step (more launches) half
+  # of the pair `kernel_census.py` needs. Never touch-empty: a touch-empty
+  # `$out` means `kernel_census.py` refuses on a missing-kernel-table
+  # (or, run via a no-op wrapper, never runs at all) -- either way NO
+  # producer stdout/behaviour is ever exercised, which is exactly the
+  # esc-088 class this closes.
+  if [ -n "$out" ]; then
+    case "$out" in
+      *run_n.sqlite) cp "$NSYS_KERNEL_FIXTURE_DIR/n.sqlite" "$out" ;;
+      *run_m.sqlite) cp "$NSYS_KERNEL_FIXTURE_DIR/m.sqlite" "$out" ;;
+      *)
+        echo "fake_nsys: export target '$out' does not match *run_n.sqlite or *run_m.sqlite -- refusing rather than touch-emptying it silently" >&2
+        exit 1
+        ;;
+    esac
+  fi
   exit 0
 fi
 if [ "$1" = "profile" ]; then
@@ -1051,11 +1083,11 @@ provision_corpus() {
       run_corpus_cmd python3 "$DIR/gen_fixed_shape_image_corpus.py" --rows "$rows_n" \
         --size "$IMAGE_SIZE" --seed "$SEED" --out-dir "$dir_n" \
         --families "$MEDIA_FAMILIES" --heldout-families "$MEDIA_HELDOUT_FAMILIES" \
-        --heldout-rows "$HELDOUT_ROWS" --heldout-batch "$BATCH" || return 1
+        --heldout-rows "$HELDOUT_ROWS" --heldout-batch "$BATCH" "${POOL_CACHE_ARGS[@]}" || return 1
       run_corpus_cmd python3 "$DIR/gen_fixed_shape_image_corpus.py" --rows "$rows_m" \
         --size "$IMAGE_SIZE" --seed "$SEED" --out-dir "$dir_m" \
         --families "$MEDIA_FAMILIES" --heldout-families "$MEDIA_HELDOUT_FAMILIES" \
-        --heldout-rows "$HELDOUT_ROWS" --heldout-batch "$BATCH" || return 1
+        --heldout-rows "$HELDOUT_ROWS" --heldout-batch "$BATCH" "${POOL_CACHE_ARGS[@]}" || return 1
       _pc_train_n="$dir_n/triplets.jsonl"
       _pc_train_m="$dir_m/triplets.jsonl"
       _pc_heldout_ids="$dir_n/heldout_ids.txt"
@@ -1066,12 +1098,12 @@ provision_corpus() {
         --seconds "$AUDIO_SECONDS" --sample-rate "$AUDIO_SAMPLE_RATE" --seed "$SEED" \
         --out-dir "$dir_n" --families "$MEDIA_FAMILIES" \
         --heldout-families "$MEDIA_HELDOUT_FAMILIES" \
-        --heldout-rows "$HELDOUT_ROWS" --heldout-batch "$BATCH" || return 1
+        --heldout-rows "$HELDOUT_ROWS" --heldout-batch "$BATCH" "${POOL_CACHE_ARGS[@]}" || return 1
       run_corpus_cmd python3 "$DIR/gen_fixed_length_audio_corpus.py" --rows "$rows_m" \
         --seconds "$AUDIO_SECONDS" --sample-rate "$AUDIO_SAMPLE_RATE" --seed "$SEED" \
         --out-dir "$dir_m" --families "$MEDIA_FAMILIES" \
         --heldout-families "$MEDIA_HELDOUT_FAMILIES" \
-        --heldout-rows "$HELDOUT_ROWS" --heldout-batch "$BATCH" || return 1
+        --heldout-rows "$HELDOUT_ROWS" --heldout-batch "$BATCH" "${POOL_CACHE_ARGS[@]}" || return 1
       _pc_train_n="$dir_n/triplets.jsonl"
       _pc_train_m="$dir_m/triplets.jsonl"
       _pc_heldout_ids="$dir_n/heldout_ids.txt"
@@ -1415,10 +1447,20 @@ run_leg() {
     )
     if [ -n "$steps_measured_n" ]; then census_cmd+=(--steps-measured-a "$steps_measured_n"); fi
     if [ -n "$steps_measured_m" ]; then census_cmd+=(--steps-measured-b "$steps_measured_m"); fi
+    # esc-088 round-4: ALWAYS executes, even under DRY_RUN -- the
+    # DRY_RUN `nsys export` stub now copies a real, committed,
+    # schema-valid sqlite fixture into `$sqlite_n`/`$sqlite_m`
+    # (`fake_nsys.sh`'s own doc), so `kernel_census.py` can run its real
+    # query/domain-check machinery hermetically instead of being gated
+    # behind a no-op wrapper that defaulted `census_ok` to "true" without
+    # ever running it. `_print_cmd` traces it exactly like every other
+    # invocation, never silently.
+    #
     # `&&`/`||`, never a bare assignment: under `set -euo pipefail` a plain
     # command exiting nonzero (kernel_census.py legitimately REFUSING)
     # would abort the whole sweep before `census_exit` was ever set.
-    run_cmd "${census_cmd[@]}" >"$census_stdout" 2>"$census_stderr" && census_exit=0 || census_exit=$?
+    _print_cmd "${census_cmd[@]}"
+    "${census_cmd[@]}" >"$census_stdout" 2>"$census_stderr" && census_exit=0 || census_exit=$?
     cat "$census_stdout" || true
     cat "$census_stderr" >&2 || true
     if [ "$census_exit" -eq 0 ]; then
@@ -1496,7 +1538,7 @@ p2_run_one() {
       run_corpus_cmd python3 "$DIR/gen_fixed_shape_image_corpus.py" --rows "$P2_ROWS" \
         --size "$IMAGE_SIZE" --seed "$SEED" --out-dir "$corpus_dir" \
         --families "$MEDIA_FAMILIES" --heldout-families "$MEDIA_HELDOUT_FAMILIES" \
-        --heldout-rows "$P2_HELDOUT_ROWS" --heldout-batch "$BATCH" || return 1
+        --heldout-rows "$P2_HELDOUT_ROWS" --heldout-batch "$BATCH" "${POOL_CACHE_ARGS[@]}" || return 1
       train_jsonl="$corpus_dir/triplets.jsonl"
       ;;
     htsat)
@@ -1504,7 +1546,7 @@ p2_run_one() {
         --seconds "$AUDIO_SECONDS" --sample-rate "$AUDIO_SAMPLE_RATE" --seed "$SEED" \
         --out-dir "$corpus_dir" --families "$MEDIA_FAMILIES" \
         --heldout-families "$MEDIA_HELDOUT_FAMILIES" \
-        --heldout-rows "$P2_HELDOUT_ROWS" --heldout-batch "$BATCH" || return 1
+        --heldout-rows "$P2_HELDOUT_ROWS" --heldout-batch "$BATCH" "${POOL_CACHE_ARGS[@]}" || return 1
       train_jsonl="$corpus_dir/triplets.jsonl"
       ;;
     *)

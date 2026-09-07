@@ -270,6 +270,24 @@ _print_cmd() {
   printf '\n' >&2
 }
 
+# --- corpus-producer wrapper (esc-088 class, same shape as
+# profile_421_legs.sh's/profile_356_legs.sh's own `run_corpus_cmd`):
+# unlike a plain `if [ "$LORA_BIAS_AB_DRY_RUN" != "1" ]` guard, this ALWAYS
+# executes, even under `LORA_BIAS_AB_DRY_RUN=1` -- `gen_fixed_width_corpus.py`
+# is CPU-hermetic (no GPU, no network, no `$BENCH_BIN`) and cheap at every
+# row count this driver uses. Touch-emptying `$full`/`$n_file` under
+# DRY_RUN used to mean NO automated test anywhere ever exercised this
+# producer's own argv/stdout interface for real in `_corpus_for` -- a bug
+# there was invisible to the whole hermetic suite and would only surface
+# on a real pod run. The child's own stdout is forwarded to THIS SCRIPT's
+# stderr -- the same place `_print_cmd`'s trace line already goes, and for
+# the same reason: never leave it on a channel a future capture point
+# could pick up again.
+run_corpus_cmd() {
+  _print_cmd "$@"
+  "$@" >&2
+}
+
 # --- provenance cross-check (unification contract C5.1), same shape as
 # profile_356_legs.sh/finetune_run_ab.sh/fa2_ab.sh/finetune_ab.sh/
 # encode_ab.sh/stacked_sweep.sh/clip_artifact_producer.sh: refuse BEFORE any
@@ -542,13 +560,16 @@ preflight_probe() {
   local probe_dir
   probe_dir="$(mktemp -d)"
   local probe_corpus="$probe_dir/probe.jsonl"
-  if ! python3 "$DIR/gen_fixed_width_corpus.py" --rows 16 --min-wordpieces 32 --seed 1 --out "$probe_corpus" >/dev/null 2>&1; then
-    if [ "$LORA_BIAS_AB_DRY_RUN" != "1" ]; then
-      echo "::error::preflight_probe: could not generate the probe corpus." >&2
-      rm -rf "$probe_dir"
-      exit 1
-    fi
-    : > "$probe_corpus"
+  # esc-088 class: run for REAL unconditionally (both real and DRY_RUN
+  # invocations) via `run_corpus_cmd`, never a touch-empty stand-in on
+  # failure -- `gen_fixed_width_corpus.py --rows 16` is CPU-hermetic and
+  # trivially cheap, so a failure here is a genuine bug worth refusing
+  # loudly on in EITHER mode, not something DRY_RUN should silently paper
+  # over with an empty probe corpus.
+  if ! run_corpus_cmd python3 "$DIR/gen_fixed_width_corpus.py" --rows 16 --min-wordpieces 32 --seed 1 --out "$probe_corpus"; then
+    echo "::error::preflight_probe: could not generate the probe corpus." >&2
+    rm -rf "$probe_dir"
+    exit 1
   fi
 
   local disable
@@ -629,14 +650,13 @@ _corpus_for() {
   if [ ! -f "$full" ]; then
     local rows_m=$(( batch * STEPS_M ))
     local rows_n=$(( batch * STEPS_N ))
-    if [ "$LORA_BIAS_AB_DRY_RUN" != "1" ]; then
-      python3 "$DIR/gen_fixed_width_corpus.py" --rows "$rows_m" --min-wordpieces "$width" \
-        --seed 42 --out "$full" || { echo "::error::corpus generation failed for $model/$shape_id" >&2; exit 1; }
-      head -n "$rows_n" "$full" > "$n_file" || { echo "::error::corpus slicing failed for $model/$shape_id" >&2; exit 1; }
-    else
-      : > "$full"
-      : > "$n_file"
-    fi
+    # `gen_fixed_width_corpus.py` is CPU-hermetic and cheap at every row
+    # count this driver uses (esc-088: run it for REAL unconditionally --
+    # `run_corpus_cmd`, never a touch-empty stand-in -- so DRY_RUN
+    # exercises this producer's own argv/stdout interface too).
+    run_corpus_cmd python3 "$DIR/gen_fixed_width_corpus.py" --rows "$rows_m" --min-wordpieces "$width" \
+      --seed 42 --out "$full" || { echo "::error::corpus generation failed for $model/$shape_id" >&2; exit 1; }
+    head -n "$rows_n" "$full" > "$n_file" || { echo "::error::corpus slicing failed for $model/$shape_id" >&2; exit 1; }
   fi
   CORPUS_N_FILE="$n_file"
   CORPUS_FULL_FILE="$full"

@@ -1,0 +1,247 @@
+{
+ "source": "scratchpad/pod421-run2/legs/clip-text-A1/census.json (pod p421 run 2, git_sha c1b0b0bad1f79a4ad6c298400e6ea19cc1ca633c)",
+ "gpu_kernel_us_per_step": 60751.374412,
+ "wall_s_per_step": 0.100395604786,
+ "by_kernel_and_grid": [
+  {
+   "kernel": "layer_norm_fwd_f32_biased",
+   "grid": [
+    1848,
+    1,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "launches_per_step": 25.0,
+   "us_per_step": 317.87528399999997,
+   "share": 0.005232396584878106
+  },
+  {
+   "kernel": "layer_norm_bwd_dx_f32",
+   "grid": [
+    1848,
+    1,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 535.259004,
+   "share": 0.008810648469778031
+  },
+  {
+   "kernel": "usigmoid_f32",
+   "grid": [
+    3696,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 305.66891200000003,
+   "share": 0.0050314731964256985
+  },
+  {
+   "kernel": "affine_f32",
+   "grid": [
+    3696,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 36.0,
+   "us_per_step": 870.680654,
+   "share": 0.014331867590274923
+  },
+  {
+   "kernel": "bmul_f32",
+   "grid": [
+    3696,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 60.0,
+   "us_per_step": 2786.352674,
+   "share": 0.04586484998847404
+  },
+  {
+   "kernel": "badd_f32",
+   "grid": [
+    3696,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 84.0,
+   "us_per_step": 4437.5717779999995,
+   "share": 0.0730447964502917
+  },
+  {
+   "kernel": "fast_max_f32",
+   "grid": [
+    14784,
+    1,
+    1
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 389.73503000000005,
+   "share": 0.006415246301374494
+  },
+  {
+   "kernel": "fast_sum_f32",
+   "grid": [
+    14784,
+    1,
+    1
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 36.0,
+   "us_per_step": 1160.7816480000001,
+   "share": 0.01910708455956702
+  },
+  {
+   "kernel": "ampere_sgemm_128x128_nt",
+   "grid": [
+    1,
+    1,
+    192
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 897.687726,
+   "share": 0.014776418388695466
+  },
+  {
+   "kernel": "ampere_sgemm_128x128_tn",
+   "grid": [
+    1,
+    1,
+    192
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 846.4885919999999,
+   "share": 0.013933653356701608
+  },
+  {
+   "kernel": "ampere_sgemm_128x128_nn",
+   "grid": [
+    1,
+    1,
+    192
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 817.201724,
+   "share": 0.013451575901113788
+  },
+  {
+   "kernel": "ampere_sgemm_128x64_nn",
+   "grid": [
+    4,
+    29,
+    7
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 24.0,
+   "us_per_step": 4908.064938,
+   "share": 0.08078936461115731
+  },
+  {
+   "kernel": "dropout_fwd_f32",
+   "grid": [
+    3696,
+    1,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "launches_per_step": 108.0,
+   "us_per_step": 1067.538718,
+   "share": 0.017572256238356527
+  },
+  {
+   "kernel": "adamw_moment_update_f32",
+   "grid": [
+    4,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 120.0,
+   "us_per_step": 288.06699,
+   "share": 0.004741736179438586
+  },
+  {
+   "kernel": "bmul_f32",
+   "grid": [
+    1112,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 36.0,
+   "us_per_step": 792.731598,
+   "share": 0.013048784585907485
+  }
+ ]
+}

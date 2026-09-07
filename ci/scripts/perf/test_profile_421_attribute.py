@@ -2108,6 +2108,54 @@ class HtsatAttributeCensusA1FixtureTests(unittest.TestCase):
         unknown_names = {u["kernel"] for u in unknown}
         self.assertIn("Kernel2", unknown_names)
 
+    def test_ambiguous_out_mlp_collision_sums_the_real_colliding_rows(self):
+        """This fixture's own `badd_f32` rows at `grid=[9216,...]`/
+        `grid=[4608,...]` (real, byte-exact from the `htsat-A1` export —
+        `fixtures/profile_421_htsat_a1/PROVENANCE.md`, "Known ambiguity")
+        land `BIAS/RESIDUAL-OUT` via the tier fallback, at a shape that is
+        SIMULTANEOUSLY `out_shape_elements(stage)` and `mlp_shape_elements
+        (stage+2)` — `htsat_ambiguous_out_mlp_collision` sums exactly
+        these two rows' own `us_per_step`, read straight off the census,
+        never a transcribed literal."""
+        result = attribute.htsat_ambiguous_out_mlp_collision(self.census, self.hsig, ln_disabled=False)
+        expected_busy_us = sum(
+            r["us_per_step"]
+            for r in self.census["by_kernel_and_grid"]
+            if r["kernel"] == "badd_f32" and r["grid"][0] in (9216, 4608)
+        )
+        self.assertGreater(expected_busy_us, 0.0)
+        self.assertAlmostEqual(result["busy_us"], expected_busy_us, places=6)
+        self.assertEqual(result["grids"], [4608, 9216])
+        self.assertGreater(result["share_gpu_busy"], 0.0)
+
+    def test_ambiguous_out_mlp_collision_excludes_name_classified_rows(self):
+        """A row a NAME rule already resolves unambiguously (this
+        fixture's own `gelu_erf_bwd_dx_f32`/`dropout_fwd_f32`/
+        `cast_f32_f32`/`im2col_f32` rows, all real, all at
+        `grid=[9216,...]` too) must NOT be counted — the ambiguity is
+        specific to the tier-fallback classification, never to every
+        kernel sharing a grid."""
+        name_classified = ("gelu_erf_bwd_dx_f32", "dropout_fwd_f32", "cast_f32_f32", "im2col_f32")
+        rows_at_ambiguous_grid = [
+            r for r in self.census["by_kernel_and_grid"] if r["kernel"] in name_classified and r["grid"][0] == 9216
+        ]
+        # These rows really are present at the ambiguous grid, so this
+        # test is not vacuously true.
+        self.assertEqual({r["kernel"] for r in rows_at_ambiguous_grid}, set(name_classified))
+        for row in rows_at_ambiguous_grid:
+            chain = attribute.classify_htsat_kernel(row, self.hsig, ln_disabled=False)
+            self.assertNotIn(chain, attribute._AMBIGUOUS_OUT_MLP_CHAINS, (row["kernel"], chain))
+
+        result = attribute.htsat_ambiguous_out_mlp_collision(self.census, self.hsig, ln_disabled=False)
+        excluded_busy_us = sum(r["us_per_step"] for r in rows_at_ambiguous_grid)
+        self.assertGreater(excluded_busy_us, 0.0)
+        total_at_ambiguous_grid = excluded_busy_us + sum(
+            r["us_per_step"]
+            for r in self.census["by_kernel_and_grid"]
+            if r["kernel"] == "badd_f32" and r["grid"][0] in (9216, 4608)
+        )
+        self.assertLess(result["busy_us"], total_at_ambiguous_grid)
+
 
 class HtsatAttributeCensusD1EagerTwinTests(unittest.TestCase):
     """The whole-census pass against the REAL committed `htsat-D1` 8-row

@@ -338,6 +338,38 @@
    "launches_per_step": 24.0,
    "us_per_step": 2678.729252,
    "share": 0.01141028189973017
+  },
+  {
+   "kernel": "badd_f32",
+   "grid": [
+    9216,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 145.0,
+   "us_per_step": 22021.654736,
+   "share": 0.0938031673968848
+  },
+  {
+   "kernel": "badd_f32",
+   "grid": [
+    4608,
+    1,
+    1
+   ],
+   "block": [
+    1024,
+    1,
+    1
+   ],
+   "launches_per_step": 137.0,
+   "us_per_step": 10259.404918,
+   "share": 0.04370083394970075
   }
  ]
 }

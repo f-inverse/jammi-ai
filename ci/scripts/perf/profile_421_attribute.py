@@ -569,7 +569,13 @@ per tier:
   (deterministic, documented priority), so a row at either grid ALWAYS
   resolves to the `out`-tier bucket; this module does not claim that
   resolution is correct, only that it is DETERMINISTIC and STATED (see
-  `fixtures/profile_421_htsat_a1/PROVENANCE.md`, "Known ambiguity").
+  `fixtures/profile_421_htsat_a1/PROVENANCE.md`, "Known ambiguity"). Every
+  HTSAT leg's row also carries `ambiguous_out_mlp_collision` (`attribute_
+  leg`, beside `chains`) — the PURELY diagnostic `{busy_us, share_gpu_busy,
+  grids}` sum of every row landing at one of these two colliding element
+  counts, read straight off the census, so a consumer can see how much
+  mass sits at the ambiguous shape without this module moving any chain's
+  own busy to guess at it.
 - **`WINDOWING`/`FRONT-FUSION`: still UNDECLARED.** A window-partition/
   reverse/roll copy sits at the IDENTICAL element count as a generic
   residual-stream `PERMUTE/RESHAPE` copy (both are `rows*tokens_s*dim_s`)
@@ -1797,6 +1803,50 @@ def outside_signature_plausibly_attention(chains: dict[str, ChainResult]) -> dic
     return {"busy_us": entry.gpu_busy_us, "share_wall": entry.share_wall or 0.0}
 
 
+_AMBIGUOUS_OUT_MLP_CHAINS = (CHAIN_BIAS_RESIDUAL_OUT, CHAIN_ELEMENTWISE_OTHER_OUT, CHAIN_PERMUTE_RESHAPE)
+
+
+def htsat_ambiguous_out_mlp_collision(
+    census: dict, hsig: HtsatSignatures, ln_disabled: bool = False
+) -> dict[str, object]:
+    """`{busy_us, share_gpu_busy, grids}` for the KNOWN, stated ambiguity
+    (module doc, "HTSAT", "Known ambiguity"; `fixtures/profile_421_htsat_
+    a1/PROVENANCE.md`): `out_shape_elements(stage)` for stage `0`/`1` is a
+    MATHEMATICAL IDENTITY with `mlp_shape_elements(stage+2)`, so a row that
+    `classify_htsat_kernel` places in an `out`-tier bucket (`BIAS/
+    RESIDUAL-OUT`, `ELEMENTWISE-OTHER-OUT`, or `PERMUTE/RESHAPE`) AT one of
+    these two element counts might ACTUALLY be that stage's own
+    residual/bias/reshape, or the later stage's own MLP-tier op that
+    happens to share the count — this module cannot tell from shape alone
+    and does not guess. A row a NAME rule already resolves unambiguously
+    (LN, GELU, dropout, cast, ...) is NOT counted here even if its grid
+    happens to coincide — the ambiguity is specific to the tier-fallback
+    classification, never to every kernel that happens to share a grid.
+    This field never moves any chain's own `gpu_busy_us` — it is a PURELY
+    diagnostic sum, read straight off `census`, so a consumer can see how
+    much of the `out`-tier bucket's own mass sits at an admittedly-
+    ambiguous shape. `grids` is the SET of `grid[0]` values the matching
+    rows actually carried (sorted ascending), never a hand-copied
+    literal."""
+    rows = hsig.rows.value
+    ambiguous_elements = [s.out_shape_elements(rows) for s in hsig.stages if s.stage in (0, 1)]
+    total_busy_us = census.get("gpu_kernel_us_per_step")
+    busy_us = 0.0
+    grids: set[int] = set()
+    for entry in census.get("by_kernel_and_grid", []) or []:
+        us_per_step = entry.get("us_per_step")
+        if not isinstance(us_per_step, (int, float)) or isinstance(us_per_step, bool):
+            continue
+        if not any(_in_element_range(entry, elements) for elements in ambiguous_elements):
+            continue
+        if classify_htsat_kernel(entry, hsig, ln_disabled=ln_disabled) not in _AMBIGUOUS_OUT_MLP_CHAINS:
+            continue
+        busy_us += us_per_step
+        grids.add(entry["grid"][0])
+    share_gpu_busy = (busy_us / total_busy_us) if total_busy_us else 0.0
+    return {"busy_us": busy_us, "share_gpu_busy": share_gpu_busy, "grids": sorted(grids)}
+
+
 # Per-tower `D1` disable set (contract §D3: "D1 is PER TOWER" — CLIP has no
 # `gelu_erf_fused` admit site, naming it would make `unmatched_disables()`
 # refuse the leg).
@@ -2239,6 +2289,10 @@ def attribute_leg(leg_dir: Path) -> dict:
     row["unknown_kernels"] = unknown
     row["chains"] = {name: result.as_dict() for name, result in chains.items()}
     row["outside_signature_plausibly_attention"] = outside_signature_plausibly_attention(chains)
+    if tower == "htsat" and isinstance(sig, HtsatSignatures):
+        row["ambiguous_out_mlp_collision"] = htsat_ambiguous_out_mlp_collision(
+            census, sig, ln_disabled=ln_disabled
+        )
     row["_gpu_busy_us_per_step"] = census.get("gpu_kernel_us_per_step")
     row["_wall_s_per_step"] = census.get("wall_s_per_step")
     row["gpu_busy_us_per_step"] = census.get("gpu_kernel_us_per_step")

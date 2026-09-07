@@ -12,7 +12,7 @@ scratchpad/pod421-run2/legs/htsat-A1/census.json
 
 (`nsys 2025.3.2.474-253236389321v0`, `NVIDIA A100-SXM4-80GB`). That file is
 NOT git-tracked. The cut below was made by a short `python3 -c` script
-reading the pulled file directly and writing out ONLY the 21
+reading the pulled file directly and writing out ONLY the
 `by_kernel_and_grid` rows this crate's HTSAT tests need, byte-for-byte
 from the real export, plus the leg's own top-level
 `gpu_kernel_us_per_step`/`wall_s_per_step`.
@@ -77,7 +77,20 @@ block=[64,...]` is the window-attention softmax's own reduction (stage 0,
 `block[0]==64==window_size**2`, module doc,
 "`_is_attn_softmax_reduction_grid`").
 
-None of the 21 rows' `us_per_step`/`launches_per_step`/`share` fields are
-asserted as literal expected values anywhere in
-`test_profile_421_attribute.py` — only structural invariants (which chain
-a row lands in) are asserted, same convention as every CLIP fixture.
+- `badd_f32` at `grid=[9216,1,1]`/`grid=[4608,1,1]` — the two real rows
+  the "Known ambiguity" section above names (real, byte-for-byte from the
+  same export), added so `htsat_ambiguous_out_mlp_collision` has a genuine
+  non-zero collision to sum (`test_ambiguous_out_mlp_collision_sums_the_
+  real_colliding_rows`/`test_ambiguous_out_mlp_collision_excludes_name_
+  classified_rows`, `HtsatAttributeCensusA1FixtureTests`) — this fixture's
+  own `gelu_erf_bwd_dx_f32`/`dropout_fwd_f32`/`cast_f32_f32`/`im2col_f32`
+  rows already sit at `grid=[9216,...]` too, by NAME rather than by the
+  tier fallback, giving the second test a real, non-vacuous exclusion to
+  check.
+
+None of this fixture's rows' `us_per_step`/`launches_per_step`/`share`
+fields are asserted as literal expected values anywhere in
+`test_profile_421_attribute.py` — the `ambiguous_out_mlp_collision` tests
+above compute their own expectation by summing this same census, never a
+transcribed literal; otherwise only structural invariants (which chain a
+row lands in) are asserted, same convention as every CLIP fixture.

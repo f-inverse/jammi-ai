@@ -11,11 +11,49 @@ is IDENTICAL across the two runs and cancels in the subtraction.
 
 Promoted from the throwaway `scratchpad/pod/kernel_census.py` ancestor
 (P4, contract's precondition table): same schema query (CUPTI_ACTIVITY_
-KIND_KERNEL joined to StringIds on `shortName`; memcpy/memset totals; GPU
-wall span), hardened per contract. Every guard below is a DOMAIN check on
-whether the two sqlite exports actually describe the declared
-same-workload (N, M) pair -- none of them are generic exception handling
-for its own sake:
+KIND_KERNEL joined to StringIds; memcpy/memset totals; GPU wall span),
+hardened per contract. Every guard below is a DOMAIN check on whether the
+two sqlite exports actually describe the declared same-workload (N, M)
+pair -- none of them are generic exception handling for its own sake:
+
+Kernel identity (round-4 pod-run fix, template-wrapper collapse): the
+per-bucket key is `(COALESCE(demangledName.value, shortName.value), grid,
+block)`, never `shortName` alone. cutlass's `Kernel2<...>` template
+wrapper -- and the same latent class in `magma_sgemmEx_kernel<...>` --
+gives every GEMM tile instantiation the SAME literal `shortName`
+(`Kernel2`, `magma_sgemmEx_kernel`); a same-workload leg's own captured
+export (`clip-text-A2`, `run_m.sqlite`) has three DISTINCT cutlass
+instantiations (`cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_{nn,nt,tn}_
+align1`) sharing `shortName='Kernel2'` AND `grid=[2,1,192]`,
+`block=[128,1,1]` -- grouping on `shortName` alone SUMS all three into one
+`Kernel2` row, hiding which tile shape actually ran. `demangledName` is
+NOT NULL on every row of this schema's `CUPTI_ACTIVITY_KIND_KERNEL` table
+(nsys 2025.3.2), so `COALESCE` is a defensive fallback for schema variance
+this module has not observed, not the common case; `LEFT JOIN` (not
+`JOIN`) on the demangled-name string, so a dangling/orphaned
+`demangledName` id (a corrupt export, not this schema's normal shape)
+degrades to the `shortName` value rather than dropping the row. Because
+`demangledName` is always at least as specific as `shortName` (it is
+`shortName`'s own template instantiation), this key is a strict
+REFINEMENT of the old `(shortName, grid, block)` key -- a bucket can only
+SPLIT under the new key, never merge two old buckets into fewer new ones
+-- so `gpu_kernel_us_per_step` (a straight sum over every bucket's time
+delta) is bit-identical under the key change; only `by_kernel_and_grid`'s
+row count and per-row shares change. `magma_sgemmEx_kernel<...>`'s full
+demangled signature (its template bools/ints already distinguish real
+instantiations) and every other non-cutlass demangled name (`badd_bf16`,
+`splitKreduce_kernel<...>`) are reported AS-IS, unstripped -- only
+`void cutlass::Kernel2<INNER>(T1::Params)` is stripped down to `INNER`
+(`_strip_cutlass_kernel2_wrapper`), since `INNER` alone (e.g.
+`cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_nt_align1`) is what a
+downstream reader (and the `#421` attribution's GEMM-family name rule)
+matches against, not the C++ wrapper syntax around it. Census reports
+produced before this change (the `#356` closeout and the `#421`
+2026-09-01/06 pod artifacts) carry the pre-fix, collapsed `Kernel2`/
+`magma_sgemmEx_kernel` rows in `by_kernel_and_grid` -- their `by_kernel_
+name` totals and every other headline number are unaffected (the
+refinement is sum-preserving, see above), only the per-instantiation
+breakdown was coarser.
 
   - refuses (exit nonzero, no report) if EITHER export lacks a
     `CUPTI_ACTIVITY_KIND_KERNEL` table -- the contract's own "Per-leg
@@ -284,8 +322,37 @@ import argparse
 import collections
 import json
 import math
+import re
 import sqlite3
 import sys
+
+# The cutlass `Kernel2<...>` template-wrapper shape (module doc's "Kernel
+# identity" paragraph): every GEMM tile instantiation's demangled name is
+# `void cutlass::Kernel2<INNER>(T1::Params)` -- `INNER` (e.g.
+# `cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_nt_align1`) is the actual
+# tile identity a downstream reader (and the `#421` attribution's
+# GEMM-family name rule) matches against, so this is the only wrapper this
+# module strips. Every other demangled name -- including
+# `magma_sgemmEx_kernel<...>`'s own template signature and
+# `splitKreduce_kernel<...>`'s -- is reported AS-IS: their template
+# arguments are what DISTINGUISHES real instantiations for those kernels
+# (unlike `Kernel2`, whose own name never varies across instantiations),
+# so stripping them would re-introduce the exact collapse this fix closes.
+_CUTLASS_KERNEL2_WRAPPER_RE = re.compile(r"^void cutlass::Kernel2<(.+)>\(T1::Params\)$")
+
+
+def _normalize_kernel_name(raw_name: str | None) -> str:
+    """Strips the cutlass `Kernel2<...>` template-wrapper syntax down to
+    the inner tile-instantiation name (see `_CUTLASS_KERNEL2_WRAPPER_RE`'s
+    own comment); every other name (including `None`, when both
+    `demangledName` and `shortName` failed to resolve -- an orphaned
+    export this schema has not been observed to produce) is returned
+    unchanged."""
+    if raw_name is None:
+        return "<unresolved>"
+    m = _CUTLASS_KERNEL2_WRAPPER_RE.match(raw_name)
+    return m.group(1) if m else raw_name
+
 
 # A "tiny tolerance" (contract's own phrasing): raw (pre-division) delta
 # floors below which a negative per-key delta is treated as capture/export
@@ -434,14 +501,24 @@ def census(path: str) -> tuple[dict, dict, tuple]:
                 "trace was actually captured; a genuine all-zero census cannot be distinguished "
                 "from a broken capture, so this refuses rather than emitting an all-zero report)"
             )
-        # nsys 2025.x schema: CUPTI_ACTIVITY_KIND_KERNEL joined to StringIds for names.
-        q = """SELECT s.value, k.gridX, k.gridY, k.gridZ, k.blockX, k.blockY, k.blockZ,
-                      COUNT(*), SUM(k.end - k.start)
-               FROM CUPTI_ACTIVITY_KIND_KERNEL k JOIN StringIds s ON k.shortName = s.id
-               GROUP BY s.value, k.gridX, k.gridY, k.gridZ, k.blockX, k.blockY, k.blockZ"""
+        # nsys 2025.x schema: CUPTI_ACTIVITY_KIND_KERNEL joined to StringIds
+        # for names -- COALESCE(demangled, short), LEFT JOIN on both string
+        # lookups so a NULL/dangling id degrades to the other name rather
+        # than dropping the row (see module doc's "Kernel identity"
+        # paragraph for why `shortName` alone is not a usable kernel key).
+        q = """SELECT COALESCE(dn.value, sn.value), k.gridX, k.gridY, k.gridZ,
+                      k.blockX, k.blockY, k.blockZ, COUNT(*), SUM(k.end - k.start)
+               FROM CUPTI_ACTIVITY_KIND_KERNEL k
+               LEFT JOIN StringIds dn ON k.demangledName = dn.id
+               LEFT JOIN StringIds sn ON k.shortName = sn.id
+               GROUP BY COALESCE(dn.value, sn.value),
+                        k.gridX, k.gridY, k.gridZ, k.blockX, k.blockY, k.blockZ"""
         out: dict[tuple, tuple[int, int]] = {}
-        for name, gx, gy, gz, bx, by, bz, n, ns in cur.execute(q):
-            out[(name, gx, gy, gz, bx, by, bz)] = (n, ns or 0)
+        for raw_name, gx, gy, gz, bx, by, bz, n, ns in cur.execute(q):
+            name = _normalize_kernel_name(raw_name)
+            key = (name, gx, gy, gz, bx, by, bz)
+            prev_n, prev_ns = out.get(key, (0, 0))
+            out[key] = (prev_n + n, prev_ns + (ns or 0))
 
         # memcpy / memset totals too (host<->device traffic is a
         # capture-relevant signal) -- a missing table here (older/newer

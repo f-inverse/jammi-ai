@@ -1238,11 +1238,33 @@ def derive_htsat_signatures(manifest: dict) -> HtsatSignatures:
     plus the declared Swin geometry (module doc). Every per-stage element
     count this returns was cross-checked against the real `htsat-A1`/`D1`
     census exports (module doc, "HTSAT") before a single classification
-    rule was written — same §D3 discipline pass 1/2 used for CLIP."""
+    rule was written — same §D3 discipline pass 1/2 used for CLIP. Also
+    cross-checks the WITNESSED `manifest.fusible_site_census.n.gelu_seam_
+    calls_per_forward` against the DECLARED `sum(HTSAT_DEPTHS)` (module
+    doc: "`gelu_erf_fused` is called once per Swin block, never guessed")
+    and raises `SignatureError` naming both values on a mismatch — a leg
+    whose checkpoint does not match the declared Swin depth would
+    otherwise silently derive wrong per-stage element counts."""
     batch = manifest.get("batch")
     if not isinstance(batch, int) or isinstance(batch, bool) or batch <= 0:
         raise SignatureError(f"manifest.batch is not a positive int ({batch!r})")
     rows = Signature(3 * batch, "witnessed:manifest.batch*3 (--objective triplet, rows=3B)")
+
+    # Cross-check the WITNESSED `gelu_seam_calls_per_forward` against the
+    # DECLARED Swin depth (module doc, "HTSAT": "`gelu_erf_fused` is
+    # called once per Swin block, never guessed") — a mismatch means this
+    # leg's own checkpoint does not match the declared
+    # `HTSAT_DEPTHS`/`laion/clap-htsat-fused` geometry this module assumes,
+    # and every per-stage element count below would be silently wrong.
+    fusible = manifest.get("fusible_site_census")
+    site_n = fusible.get("n") if isinstance(fusible, dict) else None
+    gelu_seam_calls = site_n.get("gelu_seam_calls_per_forward") if isinstance(site_n, dict) else None
+    expected_gelu_seam_calls = sum(HTSAT_DEPTHS)
+    if gelu_seam_calls != expected_gelu_seam_calls:
+        raise SignatureError(
+            "manifest.fusible_site_census.n.gelu_seam_calls_per_forward="
+            f"{gelu_seam_calls!r} does not equal sum(HTSAT_DEPTHS)={expected_gelu_seam_calls!r}"
+        )
 
     num_stages = len(HTSAT_DEPTHS)
     if len(HTSAT_HEADS) != num_stages:

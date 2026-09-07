@@ -1988,9 +1988,30 @@ class HtsatSignatureDerivationTests(unittest.TestCase):
         with self.assertRaises(attribute.SignatureError):
             attribute.derive_htsat_signatures({"batch": 0})
 
+    def test_gelu_seam_calls_matching_declared_depth_sum_succeeds(self):
+        """`HTSAT_A1_MANIFEST_FIELDS`'s own witnessed
+        `gelu_seam_calls_per_forward=12` equals `sum(HTSAT_DEPTHS)=12`
+        (real, from the `htsat-A1` manifest) — `derive_htsat_signatures`
+        does not raise."""
+        self.assertEqual(sum(attribute.HTSAT_DEPTHS), 12)
+        attribute.derive_htsat_signatures(HTSAT_A1_MANIFEST_FIELDS)
+
+    def test_signature_error_on_gelu_seam_calls_mismatch(self):
+        """A leg whose witnessed `gelu_seam_calls_per_forward` does not
+        equal `sum(HTSAT_DEPTHS)` means this leg's own checkpoint does not
+        match the declared Swin depth this module assumes — every
+        per-stage element count would be silently wrong, so this module
+        refuses rather than guessing. The error NAMES both values."""
+        manifest = json.loads(json.dumps(HTSAT_A1_MANIFEST_FIELDS))
+        manifest["fusible_site_census"]["n"]["gelu_seam_calls_per_forward"] = 11
+        with self.assertRaises(attribute.SignatureError) as ctx:
+            attribute.derive_htsat_signatures(manifest)
+        self.assertIn("11", str(ctx.exception))
+        self.assertIn("12", str(ctx.exception))
+
 
 class HtsatAttributeCensusA1FixtureTests(unittest.TestCase):
-    """The whole-census pass against the REAL committed `htsat-A1` 21-row
+    """The whole-census pass against the REAL committed `htsat-A1` fixture
     cut (`kernels_disabled=[]`, every fusible seam admitted) — see
     `fixtures/profile_421_htsat_a1/PROVENANCE.md`."""
 

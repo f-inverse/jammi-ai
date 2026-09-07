@@ -11,8 +11,8 @@ scratchpad/pod421-run2/legs/clip-vision-D2/census.json
 
 `clip-vision-D1`'s TWIN — same declared shapes (`ln_row_count=1200`,
 `attn_softmax_rows=14400`, `attn_batch_count=288`), cut to drive the same
-D1-vs-D2 differential test as `clip-text-d1`/`clip-text-d2` (pass 3,
-adversarial-audit finding 2), on the SECOND tower.
+D1-vs-D2 differential test as `clip-text-d1`/`clip-text-d2`, on the SECOND
+tower.
 
 ## What this fixture is FOR: LN fused (this leg) vs LN eager (`clip-vision-d1`)
 
@@ -23,9 +23,9 @@ adversarial-audit finding 2), on the SECOND tower.
   admitted here, so the eager mean/var/std/reciprocal sequence never runs.
   `usqrt_f32`/`urecip_f32` DO still appear, but only at `grid=[1,1,1]`
   (`total_threads=1024`, NOT covering `ln_row_count=1200`) — these fall
-  through to the parameter-scale `OPTIMIZER` catch-all instead (the SAME
-  shape/reasoning `clip-vision-a1`'s own fixture documents for its stray
-  `urecip_f32`).
+  through to the parameter-scale `GRAD-BOOKKEEPING` catch-all instead (the
+  SAME shape/reasoning `clip-vision-a1`'s own fixture documents for its
+  stray `urecip_f32`).
 - `usqr_f32` at `grid=[704,1,1]` (`attn_shape_elements=720,000`, the SAME
   shape `clip-vision-d1`'s own `usqr_f32[704,1,1]` row sits at) ->
   `C-ATTN-clip-vision` via the generic attention-shape fallthrough — a row
@@ -41,10 +41,10 @@ adversarial-audit finding 2), on the SECOND tower.
 - `ampere_sgemm_128x64_nt`/`ampere_sgemm_128x128_nt`/`magma_sgemmEx_kernel`
   -> `BASE-GEMM`/`C-ATTN-clip-vision` exactly as on `clip-vision-d1`
   (unaffected by the LN toggle, another "does not move" control).
-- `Kernel2` at `grid=[6,1,18]` — the IDENTICAL anonymous grid
-  `clip-vision-d1`'s own fixture carries, staying `UNATTRIBUTED` on BOTH
-  legs (a `dim[1]=1` grid never qualifies for the anonymous-GEMM-tile
-  rule, LN toggle or not).
+- `cutlass_80_simt_sgemm_32x128_8x5_nt_align1` at `grid=[6,1,18]` — the
+  IDENTICAL row `clip-vision-d1`'s own fixture carries, landing
+  `BASE-GEMM` on BOTH legs via `GEMM_FAMILY_NAME_RE` (unaffected by the LN
+  toggle either way).
 - `adamw_moment_update_f32` -> `OPTIMIZER`, unchanged.
 - `affine_f32` at `grid=[900,1,1]` — the SAME row `clip-vision-d1`'s own
   PROVENANCE.md describes, present on BOTH legs at DIFFERENT busy (fewer

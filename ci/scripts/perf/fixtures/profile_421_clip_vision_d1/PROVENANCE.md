@@ -19,7 +19,7 @@ first, `clip-text-d1`, only carries `usqrt`/`urecip`/`bsub` at
 `ln_row_count`, never `usqr`) — this leg's own real export ALSO carries
 `usqr_f32` at `grid=[2,1,1]` (`ln_row_count` shape), which is the ONLY
 real evidence across all eight pulled CLIP legs for the contract's own
-`usqr` naming in `LN_EAGER_EXTENDED_KERNEL_NAMES` (pass 3, finding 2).
+`usqr` naming in `LN_EAGER_EXTENDED_KERNEL_NAMES`.
 
 ## What this fixture is FOR: `usqr` at the LN row count, and the D1-vs-D2 pair
 
@@ -37,16 +37,15 @@ real evidence across all eight pulled CLIP legs for the contract's own
   row (-> `LOSS/REDUCE`) — three rows, one name, disambiguated purely by
   grid, same discipline `clip-text-d1`'s fixture already established.
 - `ampere_sgemm_128x64_nt` (no `288` in grid) -> `BASE-GEMM`;
-  `ampere_sgemm_128x128_nt` at `grid=[1,1,288]` and `magma_sgemmEx_kernel`
-  at `grid=[1,2,288]` (a THIRD gemm library, unsymbolized name aside) ->
-  `C-ATTN-clip-vision` (the batched-attention grid rule, gated on
-  `grid[2]==288` — pass 3, finding 1 — fires identically for a named
-  cuBLAS tile and a MAGMA kernel alike).
-- `Kernel2` at `grid=[6,1,18]` (`dim[1]=1`, fails the "every dimension
-  `>1`" anonymous-GEMM-tile test) stays `UNATTRIBUTED` — a SECOND tower's
-  evidence that the anonymous-kernel discipline (module doc, "classified
-  ONLY by grid-family rules") does not loosen just because `clip-text-D1`'s
-  OWN anonymous row (`grid=[8,2,28]`) happened to qualify.
+  `ampere_sgemm_128x128_nt` at `grid=[1,1,288]` and `magma_sgemmEx_kernel`'s
+  own full demangled signature at `grid=[1,2,288]` (a THIRD GEMM library)
+  -> `C-ATTN-clip-vision` (the batched-attention grid rule, gated on
+  `grid[2]==288` — fires identically for a named cuBLAS tile and a MAGMA
+  kernel alike).
+- `cutlass_80_simt_sgemm_32x128_8x5_nt_align1` at `grid=[6,1,18]`
+  (`dim[1]=1`) matches `GEMM_FAMILY_NAME_RE` and lands `BASE-GEMM`
+  regardless of its own degenerate grid dimension — a SECOND tower's
+  evidence corroborating `clip-vision-A1`'s own row at the IDENTICAL grid.
 - `badd_f32` at `grid=[900,1,1]` -> `BIAS/RESIDUAL-OUT` (`out_shape_elements
   =900*1024`, real evidence: eager LoRA's extra composition adds inflate
   `launches_per_step` here relative to `clip-vision-a1`'s own fused count,

@@ -84,7 +84,7 @@
    "share": 0.011003744383775204
   },
   {
-   "kernel": "magma_sgemmEx_kernel",
+   "kernel": "void magma_sgemmEx_kernel<float, float, float, (bool)0, (bool)0, (int)6, (int)3, (int)5, (int)3, (int)3>(int, int, int, Tensor, int, Tensor, int, Tensor, int, Tensor, int, int, int, const T1 *, const T1 *, T1, T1, int, cublasLtEpilogue_t, int, const void *, long)",
    "grid": [
     1,
     2,
@@ -132,7 +132,7 @@
    "share": 0.003158146795831136
   },
   {
-   "kernel": "Kernel2",
+   "kernel": "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
    "grid": [
     6,
     1,

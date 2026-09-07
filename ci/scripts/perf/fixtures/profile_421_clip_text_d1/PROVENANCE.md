@@ -49,36 +49,36 @@ by construction):
   variants that do NOT appear anywhere in `clip-text-A1`'s vocabulary —
   cuBLAS picked different algorithms once the eager LoRA/LN arithmetic
   changed the surrounding shapes/strides slightly. Neither carries `192`
-  (`rows*heads`) in its grid -> both `BASE-GEMM`, via `GEMM_NAME_RE` alone
-  (no new name needs to be, or is, hand-added to `KNOWN_KERNEL_NAMES` for
-  either — this is the D-leg tile-variant rule the contract asks for). A
-  THIRD row, `ampere_sgemm_128x128_nn` at `grid=[1,1,192]`, IS in
+  (`rows*heads`) in its grid -> both `BASE-GEMM`, via `GEMM_FAMILY_NAME_RE`
+  alone (no new name needs to be, or is, hand-added to `KNOWN_KERNEL_NAMES`
+  for either — this is the D-leg tile-variant rule the contract asks for).
+  A THIRD row, `ampere_sgemm_128x128_nn` at `grid=[1,1,192]`, IS in
   `clip-text-A1`'s vocabulary and IS carries `192` -> `C-ATTN-clip-text`,
   unchanged, confirming the same relational rule applies identically on a
   D-leg's shifted tile selection.
 - `badd_f32` at `grid=[924,1,1]` (`launches_per_step=874` on the real
   export, vs `337` on `clip-text-A1` — eager LoRA composition adds extra
-  calls at the SAME shape, not a new one) -> `BIAS/RESIDUAL-OUT` (pass 3,
-  finding 2: `badd_*` is split out of the old coarse `ELEMENTWISE-<tier>`
-  bucket into its own tier-suffixed name-class).
+  calls at the SAME shape, not a new one) -> `BIAS/RESIDUAL-OUT` (the
+  tier-suffixed name-class bucket `badd_*` gets).
 - `usqr_f32` at `grid=[924,1,1]` (`launches_per_step=25`, matching
   `layer_norms` exactly — plausibly the eager LN's own `(x-mean)^2` step)
   -> `ELEMENTWISE-OTHER-OUT`, NOT `C-LN`: this row sits at the `out`
   ACTIVATION-tier shape (`out_shape_elements=946,176`), not at
   `ln_row_count=1,848` — `LN_EAGER_EXTENDED_KERNEL_NAMES`'s own shape gate
-  (pass 3, finding 2) only fires at the LATTER shape, so a launch-count
-  coincidence alone (`25` matching `layer_norms`) is never sufficient by
-  itself; `clip-vision-d1`'s own fixture shows the SAME name (`usqr_f32`)
-  DOES land `C-LN` on that tower, at `grid=[2,1,1]` (`ln_row_count` for
-  vision) — the rule is grounded in SHAPE, not name, and generalizes
-  per-tower exactly where the real export shows it firing.
+  only fires at the LATTER shape, so a launch-count coincidence alone
+  (`25` matching `layer_norms`) is never sufficient by itself;
+  `clip-vision-d1`'s own fixture shows the SAME name (`usqr_f32`) DOES
+  land `C-LN` on that tower, at `grid=[2,1,1]` (`ln_row_count` for vision)
+  — the rule is grounded in SHAPE, not name, and generalizes per-tower
+  exactly where the real export shows it firing.
 - `adamw_moment_update_f32` at `grid=[4,1,1]` -> `OPTIMIZER`, unchanged.
-- `Kernel2` at `grid=[8,2,28]` (`threads=57,344`, EVERY one of the three
-  grid dimensions `>1`) -> `BASE-GEMM` (pass 3, finding 3: "Anonymous
-  kernels ... classified ONLY by grid-family rules" — a genuine 3-D tile
-  grid, not a guess; `clip-text-d2`'s own fixture carries the IDENTICAL
-  anonymous grid on an INDEPENDENT eager leg, corroborating). Pass 2 called
-  this row `UNATTRIBUTED`; the correction is pass 3's own.
+- `cutlass_80_simt_sgemm_128x32_8x5_nt_align1` at `grid=[8,2,28]`
+  (`threads=57,344`) — the real name `kernel_census.py`'s demangled-name
+  keying produces here (module doc, "Kernel identity"; the raw export's
+  `shortName` collapses this to the generic `Kernel2` template-wrapper
+  name) — matches `GEMM_FAMILY_NAME_RE` and lands `BASE-GEMM`;
+  `clip-text-d2`'s own fixture carries the IDENTICAL row on an INDEPENDENT
+  eager leg, corroborating.
 
 None of the 13 rows' timing fields are asserted as literal values anywhere
 in the test suite — only which chain each lands in.

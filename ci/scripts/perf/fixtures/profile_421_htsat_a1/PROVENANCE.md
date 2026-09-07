@@ -66,8 +66,9 @@ stages 2/3's own `out` tier, which have no stage-4/5 MLP to collide with)
 and instead documents the collision here rather than papering over it with
 a cherry-picked row.
 
-`ampere_sgemm_128x128_nt grid=[1,1,6144]` and
-`magma_sgemmEx_kernel grid=[1,2,1536]` are TWO different GEMM libraries
+`ampere_sgemm_128x128_nt grid=[1,1,6144]` and `magma_sgemmEx_kernel`'s own
+full demangled template signature at `grid=[1,2,1536]` are TWO different
+GEMM libraries
 selected for TWO different stages (0 and 2 respectively), both carrying
 `grid[2] == attn_batch_count(stage)` exactly — the SAME name-independent,
 grid-position-2 relational rule CLIP's `C-ATTN-<tower>` uses, evidenced

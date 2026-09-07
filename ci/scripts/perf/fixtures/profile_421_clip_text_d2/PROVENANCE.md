@@ -13,9 +13,9 @@ scratchpad/pod421-run2/legs/clip-text-D2/census.json
 Same box/tooling, same declared shapes, as `profile_421_clip_text_d1`
 (`rows=24, seq=77, ln_row_count=1848, attn_softmax_rows=14784,
 attn_batch_count=192`) — this fixture is `clip-text-D1`'s TWIN, cut so the
-two can drive a hermetic D1-vs-D2 DIFFERENTIAL test (pass 3, adversarial-
-audit finding 2: "toggling only `layer_norm_fused` must move mass into
-`C-LN`, and the tier buckets must move by less than `C-LN` does").
+two can drive a hermetic D1-vs-D2 DIFFERENTIAL test: "toggling only
+`layer_norm_fused` must move mass into `C-LN`, and the tier buckets must
+move by less than `C-LN` does".
 
 ## What this fixture is FOR: the D1-vs-D2 differential (LN fused, this leg)
 
@@ -30,9 +30,9 @@ audit finding 2: "toggling only `layer_norm_fused` must move mass into
   `clip-text-D1`'s own `grid=[2,1,1]` eager-LN rows, because this leg's
   `layer_norm_fused` is FUSED: the eager mean/var/std/reciprocal sequence
   simply does not run, so no row at that shape exists to (mis)classify.
-  This is the fixture's own negative evidence for the `ln_disabled` gate
-  (pass 3, finding 2): even if a `bsub`/`usqr`/`usqrt`/`urecip` row
-  happened to sit at `ln_row_count` on an LN-FUSED leg, `ln_disabled=False`
+  This is the fixture's own negative evidence for the `ln_disabled` gate:
+  even if a `bsub`/`usqr`/`usqrt`/`urecip` row happened to sit at
+  `ln_row_count` on an LN-FUSED leg, `ln_disabled=False`
   here would keep it OUT of `C-LN` — this fixture simply does not exercise
   that hypothetical (no such row exists in the real export), but the
   companion `LnEagerGateUnitTests` exercise it directly on synthetic rows.
@@ -45,13 +45,10 @@ audit finding 2: "toggling only `layer_norm_fused` must move mass into
 - `ampere_sgemm_128x64_nt`/`ampere_sgemm_32x32_sliced1x4_nt` (D-leg tile
   variants, no `192` in grid) -> `BASE-GEMM`; `ampere_sgemm_128x128_nn` at
   `grid=[1,1,192]` -> `C-ATTN-clip-text` (unchanged from `D1`/`A1`).
-- `Kernel2` at `grid=[8,2,28]` — the IDENTICAL anonymous grid `D1`'s own
-  fixture carries (pass 3, finding 3: "Anonymous kernels ... classified
-  ONLY by grid-family rules") — EVERY dimension `>1`, so it lands
-  `BASE-GEMM` on BOTH legs: two INDEPENDENT eager-mode legs producing the
-  SAME unsymbolized cuBLAS launch is the corroborating evidence the module
-  doc cites for admitting this grid shape as a genuine (if anonymous) GEMM
-  tile, not a guess.
+- `cutlass_80_simt_sgemm_128x32_8x5_nt_align1` at `grid=[8,2,28]` — the
+  IDENTICAL row `D1`'s own fixture carries, matching `GEMM_FAMILY_NAME_RE`
+  and landing `BASE-GEMM` on BOTH legs: two INDEPENDENT eager-mode legs
+  producing the SAME cuBLAS tile selection is the corroborating evidence.
 - `fast_sum_f32`/`fast_max_f32` at `grid=[14784,1,1]` -> `C-ATTN-clip-text`
   (softmax rows, unchanged); `fast_sum_f32` at `grid=[1,1,1]` ->
   `LOSS/REDUCE`.

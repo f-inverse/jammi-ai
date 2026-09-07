@@ -164,7 +164,7 @@
    "share": 0.0036485633455596105
   },
   {
-   "kernel": "Kernel2",
+   "kernel": "cutlass_80_simt_sgemm_128x32_8x5_nt_align1",
    "grid": [
     8,
     2,

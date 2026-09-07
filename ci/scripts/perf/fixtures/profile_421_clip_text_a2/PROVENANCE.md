@@ -11,8 +11,12 @@ scratchpad/pod421-run2/legs/clip-text-A2/census.json
 
 Same box/tooling as `profile_421_clip_text_a1` (`nsys 2025.3.2.474-253236389321v0`,
 `NVIDIA A100-SXM4-80GB`). Cut with a short `python3 -c` script reading the
-pulled file directly and writing out ONLY the 22 `by_kernel_and_grid` rows
-this crate's tests need, byte-for-byte from the real export.
+pulled file directly and writing out ONLY the `by_kernel_and_grid` rows
+this crate's tests need, byte-for-byte from the real export (24 rows,
+`kernel_census.py`'s demangled-name keying — see its own module doc,
+"Kernel identity" — resplits the `grid=[2,1,192]` collision this fixture
+carries into three named cutlass rows instead of one collapsed `Kernel2`
+row).
 
 `clip-text-A2`'s leg parameters (its own real `manifest.json`): `batch=8`
 (-> `rows=24`), `max_seq_length=77`, `dtype="bf16"`,
@@ -27,8 +31,8 @@ so this fixture exercises the SAME declared shapes
 ## What this fixture is FOR: the twin rule and the batched-grid rule, BF16
 
 - `layer_norm_fwd_bf16_biased`/`layer_norm_bwd_dx_bf16` -> `C-LN` by name
-  (the exact bf16 twins of pass 1's f32 names — `LN_KERNEL_NAMES` lists
-  both explicitly, no regex needed since there are only two).
+  (the exact bf16 twins of the f32 names — `LN_KERNEL_NAMES` lists both
+  explicitly, no regex needed since there are only two).
 - `usigmoid_bf16` -> `C-GELU` (exclusive, any grid); `affine_bf16`/
   `bmul_bf16` -> `C-GELU` ONLY at `grid=[3696,1,1]` (the `mlp` shape tier,
   identical to `clip-text-A1`'s since `rows`/`seq`/`width` are unchanged by
@@ -36,41 +40,36 @@ so this fixture exercises the SAME declared shapes
   tensor's own shape) is included as a NEGATIVE control for the GELU-shape
   gate that is also a POSITIVE control for the attention elementwise tier:
   it must land `C-ATTN-clip-text`, not `C-GELU` and not `UNATTRIBUTED`
-  (module doc, "fall through" — this is the exact case that changed
-  behavior from pass 1, where the equivalent f32 row was asserted `None`).
+  (module doc, "fall through").
 - `fast_max_bf16`/`fast_sum_bf16` at `grid=[14784,1,1]` -> `C-ATTN-clip-text`
-  (softmax reduction rows, bf16 twin of pass 1's rule); a THIRD
+  (softmax reduction rows, bf16 twin of the f32 rule); a THIRD
   `fast_sum_bf16` row at `grid=[8,1,1]` (neither the softmax row count nor
-  `ln_row_count=1848`) must land `LOSS/REDUCE` — the new fallback pass 1
-  did not have (pass 1 would have called this `UNATTRIBUTED`).
+  `ln_row_count=1848`) must land `LOSS/REDUCE`.
 - `badd_bf16` at `grid=[1112,1,1]` (the attention tensor shape) ->
   `C-ATTN-clip-text`; at `grid=[924,1,1]` (the `out` activation tier) ->
-  `BIAS/RESIDUAL-OUT` (pass 3, finding 2 — the tier-suffixed name-class
-  bucket `badd_*` gets, replacing pass 2's coarse `ELEMENTWISE-OUT`).
-- `Kernel2` (an ANONYMOUS/unsymbolized CUDA launch — no name at all) at
-  `grid=[2,1,192]` -> `C-ATTN-clip-text` via the batched-grid RELATIONAL
-  rule alone (`192 = rows*heads` sits at grid POSITION 2 — pass 3, finding
-  1 — the rule does not care that the kernel has no name); a SECOND
-  `Kernel2` row at `grid=[16,1,10]` (no `192` at position 2, and `dim[1]=1`
-  fails the anonymous-GEMM-tile test too) stays `UNATTRIBUTED` AND, since
-  the literal `Kernel2` is not in `KNOWN_KERNEL_NAMES`, is flagged UNKNOWN
-  at `share_gpu_busy=1.40%`, exceeding `UNKNOWN_KERNEL_SHARE_LIMIT` and
-  making this ENTIRE FIXTURE'S leg `INVALID` when read through
-  `attribute_leg` — this fixture is the committed, small-scale
-  reproduction of the real `clip-text-A2` leg's own INVALIDATION (module
-  doc, "Consequence, measured"); `AttributeCensusBf16FixtureTests` does
-  not assert `unknown == []` for this fixture —
-  `UnknownKernelGateOnRealFixtureTests` asserts the INVALIDATING reason
-  instead.
+  `BIAS/RESIDUAL-OUT` (the tier-suffixed name-class bucket `badd_*` gets).
+- The `grid=[2,1,192]` collision `kernel_census.py`'s own module doc names
+  ("Kernel identity"): THREE distinct cutlass tile instantiations
+  (`cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_{nn,nt,tn}_align1`) that
+  share the SAME `shortName` (`Kernel2`) and the SAME grid/block — the
+  census keys on the DEMANGLED name instead, so all three resplit into
+  distinct rows here, each landing `C-ATTN-clip-text` via the batched-grid
+  RELATIONAL rule alone (`192 = rows*heads` sits at grid POSITION 2 — the
+  rule does not care what the name is). A FOURTH real GEMM row,
+  `cutlass_80_simt_sgemm_32x128_8x5_nt_align1` at `grid=[16,1,10]` (no
+  `192` at position 2, and `dim[1]=1`), matches `GEMM_FAMILY_NAME_RE` and
+  lands `BASE-GEMM` cleanly — NO unknown-kernel finding on this fixture at
+  all (`AttributeCensusBf16FixtureTests`/`UnknownKernelGateOnRealFixtureTests`
+  both assert `unknown == []`).
 - `cast_bf16_f32`/`cast_scale_bf16_f32` -> `CAST` by name
   (`"cast" in name.lower()`); `cast_add_bf16` -> `CAST` too, EVEN THOUGH it
   has no f32 twin in `KNOWN_KERNEL_NAMES` (`BF16_ONLY_KERNEL_NAMES`, hand
   admitted from this same real export); `cast_u8_bf16` at
-  `grid=[1112,1,1]` (the attention tensor's OWN shape) -> `C-ATTN-clip-text`
-  now, NOT `CAST` (pass 3, finding 1 corrects the priority: a cast-named
-  row is shape-gated to the attention chain FIRST; a cast row at any OTHER
-  shape still lands the generic `CAST` bucket — see the `A1` fixture's own
-  `cast_u8_f32` row at the SAME shape for the f32 analog).
+  `grid=[1112,1,1]` (the attention tensor's OWN shape) -> `C-ATTN-clip-text`,
+  NOT `CAST` (the attention-shape check runs FIRST for any cast-named row;
+  a cast row at any OTHER shape still lands the generic `CAST` bucket —
+  see the `A1` fixture's own `cast_u8_f32` row at the SAME shape for the
+  f32 analog).
 - `adamw_moment_update_f32` (an F32-NAMED kernel, even on this BF16 leg —
   the optimizer state itself stays F32 master weights) -> `OPTIMIZER` by
   name; `dropout_fwd_f32` (also F32-named on a BF16 leg) -> `DROPOUT` by
@@ -82,13 +81,11 @@ so this fixture exercises the SAME declared shapes
   fixture row (u32-typed name checks run before the generic activation-tier
   fallback).
 - `ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_nn` at
-  `grid=[4,15,1]` (no `192` at position 2) -> `BASE-GEMM`, via
-  `GEMM_NAME_RE` for CLASSIFICATION (unchanged from pass 2). For ADMISSION
-  (`is_known_kernel_name`), pass 3 (finding 3) REMOVES the `"gemm"`-
-  substring shortcut: this exact 32-character tile-variant string is now
-  hand-listed literally in `KNOWN_KERNEL_NAMES` (one of eight bf16 GEMM
-  tile names actually observed across `clip-text-A2`/`clip-vision-A2`),
-  never admitted by pattern alone.
+  `grid=[4,15,1]` (no `192` at position 2) -> `BASE-GEMM`, matched by
+  `GEMM_FAMILY_NAME_RE`'s `ampere_\w*gemm\w*` alternative — this same
+  regex ALSO admits it past the unknown-kernel gate; it is deliberately
+  NOT hand-listed in `KNOWN_KERNEL_NAMES` (module doc, "`BASE-GEMM`:
+  GEMM-family kernel identity, by NAME").
 
 None of the 22 rows' `us_per_step`/`launches_per_step`/`share` fields are
 asserted as literal expected values anywhere in the test suite — only

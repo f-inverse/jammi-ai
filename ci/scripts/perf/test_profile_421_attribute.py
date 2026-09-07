@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Hermetic tests for `profile_421_attribute.py` (issue #421 post-export
 attribution unit; CONTRACT `scratchpad/contract-421-profile.md` v2.5
-`### Attribution` / `§D3`; pass 3 = the adversarial-audit fold).
+`### Attribution` / `§D3`).
 
 No GPU, no pod, no `nsys`, no network. The kernel-name<->shape MAPPING
 itself is tested against SMALL, REAL, committed fixtures cut byte-for-byte
@@ -16,8 +16,8 @@ expected number — every assertion is STRUCTURAL: which chain a
 `gpu_kernel_us_per_step` exactly, that shares are `<= 1`, that every
 declared chain is present-or-explicitly-absent, `decision_grade`'s own
 threshold arithmetic, the two-sided decision rule evaluated on SYNTHETIC
-share numbers (never a real leg's), and (pass 3) the DIRECTION/ORDERING a
-D1-vs-D2 differential pair must move in — never a literal delta.
+share numbers (never a real leg's), and the DIRECTION/ORDERING a D1-vs-D2
+differential pair must move in — never a literal delta.
 
 Run: `python3 ci/scripts/perf/test_profile_421_attribute.py`
 """
@@ -45,6 +45,25 @@ FIXTURE_KERNELS_HTSAT_D1 = PERF_DIR / "fixtures" / "profile_421_htsat_d1" / "ker
 
 sys.path.insert(0, str(PERF_DIR))
 import profile_421_attribute as attribute  # noqa: E402
+
+# `magma_sgemmEx_kernel`'s own full demangled template signature —
+# `kernel_census.py`'s demangled-name keying (module doc, "Kernel
+# identity") never produces the bare identifier alone; every real
+# `clip-vision-A1`/`clip-vision-D1`/`clip-vision-D2`/`htsat-A1` fixture row
+# carries this exact string. Matches `GEMM_FAMILY_NAME_RE`'s
+# `magma_\w*gemm\w*` alternative on the `sgemmEx` substring.
+MAGMA_SGEMM_FULL_NAME = (
+    "void magma_sgemmEx_kernel<float, float, float, (bool)0, (bool)0, (int)6, (int)3, "
+    "(int)5, (int)3, (int)3>(int, int, int, Tensor, int, Tensor, int, Tensor, int, "
+    "Tensor, int, int, int, const T1 *, const T1 *, T1, T1, int, cublasLtEpilogue_t, "
+    "int, const void *, long)"
+)
+
+# The real cutlass tile-variant name `kernel_census.py`'s demangled-name
+# keying produces at the CLIP-vision/HTSAT `[N,1,M]`-shaped GEMM grids the
+# committed fixtures carry (`clip-vision-{A1,D1,D2}` at `grid=[6,1,18]`;
+# `htsat-A1` at `grid=[3,1,36]`/`[12,1,24]`).
+CUTLASS_SIMT_32X128_NT_NAME = "cutlass_80_simt_sgemm_32x128_8x5_nt_align1"
 
 
 # The REAL leg parameters `clip-text-A1`'s own `manifest.json` recorded
@@ -227,30 +246,63 @@ class DeriveSignaturesTests(unittest.TestCase):
 
 
 class IsKnownKernelNameTests(unittest.TestCase):
-    """`is_known_kernel_name`'s TWO admission paths (pass 3, finding 3 —
-    exact names only; no substring, no anonymous-name shortcut)."""
+    """`is_known_kernel_name`'s THREE admission paths: `GEMM_FAMILY_NAME_RE`
+    (any GEMM-library instantiation), the explicit `KNOWN_KERNEL_NAMES`/
+    `BF16_ONLY_KERNEL_NAMES` ground truth for every NON-GEMM name, and the
+    BF16-twin rule."""
 
     def test_explicit_ground_truth_names_are_known(self):
         self.assertTrue(attribute.is_known_kernel_name("badd_f32"))
 
-    def test_kernel2_is_no_longer_known_by_name(self):
-        """Pass 3, finding 3: the literal `Kernel2` admission is REMOVED —
-        an anonymous kernel is admitted ONLY by `classify_kernel`'s own
-        grid-family rules now, never by an "we've seen this before" name
-        entry."""
+    def test_bare_kernel2_is_not_known_by_name(self):
+        """The bare literal `Kernel2` — a synthetic, never-real-since-the-
+        census-fix name — matches neither `GEMM_FAMILY_NAME_RE` nor any
+        `KNOWN_KERNEL_NAMES` entry, so it is genuinely unknown; a real
+        cutlass/ampere/magma/split-K demangled name always carries its own
+        tile/stage identity (module doc, "`BASE-GEMM`: GEMM-family kernel
+        identity, by NAME") and is admitted via the regex instead."""
         self.assertFalse(attribute.is_known_kernel_name("Kernel2"))
 
     def test_bf16_only_explicit_names_are_known(self):
         for name in attribute.BF16_ONLY_KERNEL_NAMES:
             self.assertTrue(attribute.is_known_kernel_name(name))
 
-    def test_evidenced_bf16_gemm_tile_names_are_hand_listed_not_substring_matched(self):
-        """The eight real `ampere_bf16_s16816gemm_*` names observed on
-        `clip-text-A2`/`clip-vision-A2` are hand-listed literally in
-        `KNOWN_KERNEL_NAMES` now (pass 3) — NOT admitted via a `"gemm"`
-        substring shortcut, which pass 3 removes."""
+    def test_evidenced_bf16_gemm_tile_names_are_known_via_the_family_regex(self):
+        """The real `ampere_bf16_s16816gemm_*` names observed on
+        `clip-text-A2`/`clip-vision-A2` are admitted via
+        `GEMM_FAMILY_NAME_RE`'s `ampere_\\w*gemm\\w*` alternative — they
+        are deliberately NOT hand-listed in `KNOWN_KERNEL_NAMES` (module
+        doc, "`BASE-GEMM`: GEMM-family kernel identity, by NAME")."""
         name = "ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_64x3_nn"
-        self.assertIn(name, attribute.KNOWN_KERNEL_NAMES)
+        self.assertNotIn(name, attribute.KNOWN_KERNEL_NAMES)
+        self.assertTrue(attribute.GEMM_FAMILY_NAME_RE.search(name))
+        self.assertTrue(attribute.is_known_kernel_name(name))
+
+    def test_cutlass_kernel2_demangled_instantiation_is_known(self):
+        """The real stripped cutlass instantiation name
+        `kernel_census.py` now produces (module doc's own evidence row)
+        matches `GEMM_FAMILY_NAME_RE` and is therefore known."""
+        name = "cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_nt_align1"
+        self.assertTrue(attribute.GEMM_FAMILY_NAME_RE.search(name))
+        self.assertTrue(attribute.is_known_kernel_name(name))
+
+    def test_magma_full_template_signature_is_known(self):
+        """`magma_sgemmEx_kernel`'s own full demangled template signature
+        (module doc's evidence row) matches `GEMM_FAMILY_NAME_RE` via the
+        `magma_\\w*gemm\\w*` alternative on its `sgemmEx` substring."""
+        name = (
+            "void magma_sgemmEx_kernel<float, float, float, (bool)0, (bool)0, "
+            "(int)6, (int)3, (int)5, (int)3, (int)3>(int, int, int)"
+        )
+        self.assertTrue(attribute.GEMM_FAMILY_NAME_RE.search(name))
+        self.assertTrue(attribute.is_known_kernel_name(name))
+
+    def test_splitkreduce_full_template_signature_is_known(self):
+        """`splitKreduce_kernel`'s own full demangled template signature
+        matches the `\\w*splitKreduce\\w*` alternative — a SUBSTRING match,
+        since the demangled name is never the bare identifier alone."""
+        name = "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float>(int)"
+        self.assertTrue(attribute.GEMM_FAMILY_NAME_RE.search(name))
         self.assertTrue(attribute.is_known_kernel_name(name))
 
     def test_an_unobserved_gemm_shaped_name_is_not_known_by_substring(self):
@@ -302,10 +354,9 @@ class ClassifyKernelUnitTests(unittest.TestCase):
         )
 
     def test_bmul_at_the_attention_shape_falls_through_to_attn_not_gelu(self):
-        """Pass-2 behavior change from pass 1: a GELU-shape-gated kernel
-        NAME at a DIFFERENT declared shape (the attention tensor) now
-        FALLS THROUGH to `C-ATTN-<tower>` rather than stopping at
-        `UNATTRIBUTED` — see module doc, "fall through"."""
+        """A GELU-shape-gated kernel NAME at a DIFFERENT declared shape
+        (the attention tensor) FALLS THROUGH to `C-ATTN-<tower>` rather
+        than stopping at `UNATTRIBUTED` — see module doc, "fall through"."""
         wrong_shape = {"kernel": "bmul_f32", "grid": [1112, 1, 1], "block": [1024, 1, 1]}
         self.assertEqual(self.sig.attn_shape_elements(), 24 * 8 * 77 * 77)
         self.assertEqual(
@@ -323,8 +374,8 @@ class ClassifyKernelUnitTests(unittest.TestCase):
     def test_badd_at_the_gelu_shape_lands_bias_residual_mlp_not_gelu(self):
         """`badd_f32` is never GELU-shape-gated (it is not in
         `GELU_SHAPE_KERNEL_NAMES`), so at the MLP tier it lands the
-        tier-suffixed `BIAS/RESIDUAL-MLP` bucket (pass 3, finding 2) — the
-        exclusion itself (bias-add is not the activation) is unchanged."""
+        tier-suffixed `BIAS/RESIDUAL-MLP` bucket — the exclusion itself
+        (bias-add is not the activation) holds at every tier."""
         entry = {"kernel": "badd_f32", "grid": [3696, 1, 1], "block": [1024, 1, 1]}
         self.assertEqual(
             attribute.classify_kernel(entry, self.sig, "clip-text"),
@@ -357,8 +408,8 @@ class ClassifyKernelUnitTests(unittest.TestCase):
         )
 
     def test_ln_eager_extended_kernels_require_ln_disabled(self):
-        """Pass 3, finding 2: `usqrt_f32`/`urecip_f32`/`bsub_f32`/`usqr_f32`
-        at the LN row-count shape only land `C-LN` when `ln_disabled=True`
+        """`usqrt_f32`/`urecip_f32`/`bsub_f32`/`usqr_f32` at the LN
+        row-count shape only land `C-LN` when `ln_disabled=True`
         — on an LN-FUSED leg (the default), they fall through to whatever
         ELSE their shape matches (here: nothing else — `grid=[ln_row_count,
         1,1], block=[1,1,1]` is chosen to fall clear of every OTHER
@@ -383,9 +434,9 @@ class ClassifyKernelUnitTests(unittest.TestCase):
         the `3*width=1536` parameter-scale tile's block-rounded range for
         `clip-text` — when `ln_disabled=False` this row legitimately falls
         through to the `GRAD-BOOKKEEPING` catch-all instead of `C-LN`, an
-        honest outcome (not `UNATTRIBUTED`), not asserted as a bug. Pass 3
-        (finding 8): this catch-all is `GRAD-BOOKKEEPING`, NOT `OPTIMIZER`
-        — `OPTIMIZER` names `adamw_*` kernels only now."""
+        honest outcome (not `UNATTRIBUTED`), not asserted as a bug. This
+        catch-all is `GRAD-BOOKKEEPING`, NOT `OPTIMIZER` — `OPTIMIZER`
+        names `adamw_*` kernels only."""
         entry = {"kernel": "urecip_f32", "grid": [2, 1, 1], "block": [1024, 1, 1]}
         self.assertEqual(
             attribute.classify_kernel(entry, self.sig, "clip-text", ln_disabled=False),
@@ -402,15 +453,15 @@ class ClassifyKernelUnitTests(unittest.TestCase):
         )
 
     def test_batch_count_at_grid_position_0_is_a_negative_control(self):
-        """Pass 3, finding 1: the batched-attention rule is gated on grid
-        POSITION 2 specifically — a row carrying `192` at `grid[0]` (a
+        """The batched-attention rule is gated on grid POSITION 2
+        specifically — a row carrying `192` at `grid[0]` (a
         real value for some base-projection tile grids at OTHER shapes)
         must NOT be swept into `C-ATTN-<tower>` by a naive "192 anywhere in
         the grid" membership test."""
-        entry = {"kernel": "some_base_projection_gemm", "grid": [192, 4, 1], "block": [128, 1, 1]}
+        entry = {"kernel": "ampere_sgemm_128x64_nn", "grid": [192, 4, 1], "block": [128, 1, 1]}
         result = attribute.classify_kernel(entry, self.sig, "clip-text")
         self.assertNotEqual(result, attribute.chain_attn("clip-text"))
-        # It IS still GEMM-family by name (contains "gemm") -> BASE-GEMM.
+        # It IS still GEMM-family by name (`GEMM_FAMILY_NAME_RE`) -> BASE-GEMM.
         self.assertEqual(result, attribute.CHAIN_BASE_GEMM)
 
     def test_anonymous_kernel_carrying_the_batch_count_at_position_2_is_attn(self):
@@ -433,9 +484,8 @@ class ClassifyKernelUnitTests(unittest.TestCase):
         self.assertNotEqual(result, attribute.chain_attn("clip-text"))
 
     def test_ampere_sgemm_without_the_batch_count_is_base_gemm(self):
-        """Pass-2 behavior change: a base/LoRA Linear projection's plain
-        2-D matmul now lands the NAMED `BASE-GEMM` bucket instead of
-        pass 1's `UNATTRIBUTED`."""
+        """A base/LoRA Linear projection's plain 2-D matmul (not carrying
+        the attention batch count) lands the NAMED `BASE-GEMM` bucket."""
         entry = {"kernel": "ampere_sgemm_128x64_nn", "grid": [4, 29, 7], "block": [128, 1, 1]}
         self.assertEqual(
             attribute.classify_kernel(entry, self.sig, "clip-text"), attribute.CHAIN_BASE_GEMM
@@ -447,61 +497,82 @@ class ClassifyKernelUnitTests(unittest.TestCase):
             attribute.classify_kernel(entry, self.sig, "clip-text"), attribute.CHAIN_BASE_GEMM
         )
 
-    def test_anonymous_kernel_at_a_genuine_3d_tile_grid_is_base_gemm(self):
-        """Pass 3, finding 3: an anonymous kernel with EVERY grid dimension
-        `>1` (a plausible M-tile x N-tile x batch/split-K launch) is
-        `BASE-GEMM` via the grid-family fallback alone."""
-        entry = {"kernel": "Kernel2", "grid": [8, 2, 28], "block": [128, 1, 1]}
+    def test_cutlass_gemm_family_name_at_a_3d_tile_grid_is_base_gemm(self):
+        """`cutlass_80_simt_sgemm_128x32_8x5_nt_align1 grid=[8,2,28]` is the
+        real `clip-text-D1`/`D2` row `kernel_census.py`'s demangled-name
+        keying produces (module doc, "`BASE-GEMM`: GEMM-family kernel
+        identity, by NAME") — `GEMM_FAMILY_NAME_RE` matches it by name
+        alone, independent of grid shape."""
+        entry = {
+            "kernel": "cutlass_80_simt_sgemm_128x32_8x5_nt_align1",
+            "grid": [8, 2, 28],
+            "block": [128, 1, 1],
+        }
         self.assertEqual(
             attribute.classify_kernel(entry, self.sig, "clip-text"), attribute.CHAIN_BASE_GEMM
         )
 
-    def test_named_kernel_at_a_3d_tile_grid_never_lands_base_gemm_via_the_fallback(self):
-        """The anonymous grid-family fallback is restricted to
-        `Kernel<N>`/`magma_*` names ONLY — a NAMED kernel at a genuine 3-D
-        tile grid (every dimension `>1`, product well above the magnitude
-        floor) must NOT be routed here just because its grid happens to
-        look tile-shaped. These are real shapes, never observed
-        classifying this way."""
+    def test_synthetic_anonymous_name_at_the_same_grid_is_unattributed(self):
+        """A synthetic, non-GEMM-family name (`Kernel2` never appears in a
+        real export post-fix — `kernel_census.py`'s own demangled-name
+        keying always resolves it to its real cutlass/ampere/magma
+        instantiation) at the SAME grid as the row above stays
+        UNATTRIBUTED: classification is by NAME, never by grid shape
+        alone."""
+        entry = {"kernel": "Kernel2", "grid": [8, 2, 28], "block": [128, 1, 1]}
+        self.assertIsNone(attribute.classify_kernel(entry, self.sig, "clip-text"))
+
+    def test_named_kernel_at_a_3d_tile_grid_never_lands_base_gemm(self):
+        """A NAMED, non-GEMM-family kernel at a genuine 3-D tile-shaped
+        grid must NOT land `BASE-GEMM` just because its grid happens to
+        look tile-shaped — classification is by NAME (`GEMM_FAMILY_NAME_
+        RE`) or by the grid-position-2 attention rule, never by grid shape
+        alone. These are real shapes, never observed classifying this
+        way."""
         for name, grid in (
             ("badd_f32", [2, 2, 278]),
             ("ucopy_f32", [2, 2, 231]),
             ("usqrt_f32", [3, 3, 8]),
         ):
-            product = grid[0] * grid[1] * grid[2]
-            self.assertGreaterEqual(product, attribute.GEMM_TILE_GRID_PRODUCT_FLOOR, (name, grid))
             entry = {"kernel": name, "grid": grid, "block": [1, 1, 1]}
             result = attribute.classify_kernel(entry, self.sig, "clip-text")
             self.assertNotEqual(result, attribute.CHAIN_BASE_GEMM, (name, grid))
 
-    def test_anonymous_kernel_below_the_magnitude_floor_is_not_base_gemm(self):
-        """Pass 3, finding 4: a magnitude floor (`GEMM_TILE_GRID_PRODUCT_
-        FLOOR`) additionally excludes a near-scalar anonymous 3-D grid —
-        `[2,2,2]` (product `8`, every dimension `>1`) is far below the
-        smallest real evidence (`[8,2,28]`, product `448`)."""
-        entry = {"kernel": "Kernel2", "grid": [2, 2, 2], "block": [1, 1, 1]}
-        self.assertIsNone(attribute.classify_kernel(entry, self.sig, "clip-text"))
-
-    def test_anonymous_grid_fallback_runs_after_the_activation_tier_check(self):
-        """Pass 3, finding 4: the anonymous grid-family fallback is placed
-        AFTER the activation-tier checks — an anonymous kernel whose
-        launch ALSO happens to cover an activation tier's own element
-        count lands the TIER bucket, never `BASE-GEMM`, even though its
-        grid is a genuine, floor-clearing 3-D tile (`[4,3,77]`,
-        product=`924`, `924*1024` covers `out_shape_elements=946,176`)."""
-        entry = {"kernel": "Kernel2", "grid": [4, 3, 77], "block": [1024, 1, 1]}
+    def test_gemm_family_name_check_runs_before_the_activation_tier_check(self):
+        """A GEMM-family name whose launch ALSO happens to cover an
+        activation tier's own element count still lands `BASE-GEMM`, never
+        the tier bucket — the GEMM-family-by-name check (module doc,
+        "`BASE-GEMM`: GEMM-family kernel identity, by NAME") runs BEFORE
+        the activation-tier checks in `classify_kernel`'s priority order
+        (`[4,3,77]`, `924*1024` covers `out_shape_elements=946,176`)."""
+        entry = {
+            "kernel": "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+            "grid": [4, 3, 77],
+            "block": [1024, 1, 1],
+        }
         self.assertEqual(
             attribute.classify_kernel(entry, self.sig, "clip-text"),
-            attribute.CHAIN_ELEMENTWISE_OTHER_OUT,
+            attribute.CHAIN_BASE_GEMM,
         )
 
-    def test_anonymous_kernel_with_a_degenerate_dimension_is_not_base_gemm(self):
-        """Negative control for the above: a `1` in ANY position keeps an
-        anonymous kernel OUT of the grid-family GEMM fallback (module doc:
-        a genuine tile grid never degenerates to size 1 in any dimension)."""
+    def test_gemm_family_name_at_a_degenerate_grid_dimension_is_still_base_gemm(self):
+        """A `1` in some grid position never excludes a GEMM-family NAME
+        from `BASE-GEMM` — the real `clip-text-A2` evidence
+        (`cutlass_80_simt_sgemm_32x128_8x5_nt_align1` at
+        `grid=[16,1,10]`/`[4,1,24]`/`[12,1,8]`, each carrying a `1` in some
+        position) classifies cleanly by name alone, no grid-shape gate at
+        all."""
         for grid in ([16, 1, 10], [4, 1, 24], [12, 1, 8], [128, 2, 1]):
-            entry = {"kernel": "Kernel2", "grid": grid, "block": [128, 1, 1]}
-            self.assertIsNone(attribute.classify_kernel(entry, self.sig, "clip-text"), grid)
+            entry = {
+                "kernel": "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+                "grid": grid,
+                "block": [128, 1, 1],
+            }
+            self.assertEqual(
+                attribute.classify_kernel(entry, self.sig, "clip-text"),
+                attribute.CHAIN_BASE_GEMM,
+                grid,
+            )
 
     def test_attn_tensor_elementwise_ops_land_attn(self):
         elements = self.sig.attn_shape_elements()
@@ -512,10 +583,10 @@ class ClassifyKernelUnitTests(unittest.TestCase):
         )
 
     def test_cast_named_kernel_at_attn_shape_is_attn_not_cast(self):
-        """Pass 3, finding 1: `CAST`'s own priority is now SHAPE-GATED — a
-        cast row at the attention tensor's own element count lands
-        `C-ATTN-<tower>`, not the generic `CAST` bucket (pass 2's bug: the
-        name-only check returned before the shape check ever ran)."""
+        """`CAST`'s own priority is SHAPE-GATED — a cast row at the
+        attention tensor's own element count lands `C-ATTN-<tower>`, not
+        the generic `CAST` bucket: the attention-shape check runs BEFORE
+        the name-only `CAST` check."""
         entry = {"kernel": "cast_u8_f32", "grid": [1112, 1, 1], "block": [1024, 1, 1]}
         self.assertEqual(
             attribute.classify_kernel(entry, self.sig, "clip-text"), attribute.chain_attn("clip-text")
@@ -542,10 +613,9 @@ class ClassifyKernelUnitTests(unittest.TestCase):
         )
 
     def test_grad_bookkeeping_parameter_scale_by_shape_requires_1d_grid(self):
-        """Pass 3 (finding 8): the parameter-scale catch-all is named
-        `GRAD-BOOKKEEPING`, not `OPTIMIZER` — `adamw_step_fused` is already
-        admitted on A legs by NAME, so these shape-coincident rows are NOT
-        the optimizer."""
+        """The parameter-scale catch-all is named `GRAD-BOOKKEEPING`, not
+        `OPTIMIZER` — `adamw_step_fused` is already admitted on A legs by
+        NAME, so these shape-coincident rows are NOT the optimizer."""
         elements = sorted(self.sig.param_scale_elements())[0]
         entry = {"kernel": "usqrt_f32", "grid": [1, 1, 1], "block": [max(elements, 1024), 1, 1]}
         self.assertEqual(
@@ -553,20 +623,23 @@ class ClassifyKernelUnitTests(unittest.TestCase):
         )
 
     def test_grad_bookkeeping_parameter_scale_negative_control_non_1d_grid(self):
-        """Pass 3, finding 3: a kernel whose TOTAL THREAD COUNT coincides
-        with a parameter-scale element count but whose grid is NOT 1-D
+        """A kernel whose TOTAL THREAD COUNT coincides with a
+        parameter-scale element count but whose grid is NOT 1-D
         (`grid=[ceil(N/b),1,1]`) must NOT land `GRAD-BOOKKEEPING` —
-        evidenced by `clip-text-A2`'s anonymous `Kernel2 grid=[4,1,24]`
-        (`total_threads=12,288 == LORA_RANK*3*width`, yet a 3-D tiled
-        launch, not a bookkeeping op)."""
+        evidenced by `clip-text-A2`'s own
+        `cutlass_80_simt_sgemm_32x128_8x5_nt_align1 grid=[4,1,24]`
+        (`total_threads=12,288 == LORA_RANK*3*width`, yet a 3-D tiled GEMM
+        launch, not a bookkeeping op — though that real row classifies via
+        `GEMM_FAMILY_NAME_RE` before this gate is ever consulted; a
+        synthetic non-GEMM name at the identical shape exercises the gate
+        itself)."""
         elements = sorted(self.sig.param_scale_elements())[0]
         entry = {"kernel": "some_unknown_kernel", "grid": [1, 1, 4], "block": [max(elements, 1024), 1, 1]}
         self.assertIsNone(attribute.classify_kernel(entry, self.sig, "clip-text"))
 
     def test_permute_reshape_bucket_by_name_at_any_tier_shape(self):
-        """Pass 3, finding 1/2: `ucopy_*`/`copy2d_*` get their OWN bucket
-        (not tier-suffixed, and never `C-ATTN`) at any of the three
-        activation-tier shapes."""
+        """`ucopy_*`/`copy2d_*` get their OWN bucket (not tier-suffixed,
+        and never `C-ATTN`) at any of the three activation-tier shapes."""
         for elements, name in (
             (self.sig.qkv_shape_elements(), "ucopy_f32"),
             (self.sig.out_shape_elements(), "copy2d_f32"),
@@ -647,7 +720,8 @@ class AttributeCensusRealFixtureTests(unittest.TestCase):
         for name in attribute.declared_chains_for_tower("clip-text"):
             self.assertIn(name, chains, name)
         self.assertIn(attribute.CHAIN_UNATTRIBUTED, chains)
-        # `C-LORA` is NEVER a chain-partition member (pass 3, finding 4).
+        # `C-LORA` is NEVER a chain-partition member (module doc,
+        # "Realized-gain chains are NOT chain-partition members").
         self.assertNotIn(attribute.CHAIN_LORA, chains)
 
     def test_shares_are_bounded_by_one(self):
@@ -688,8 +762,8 @@ class AttributeCensusRealFixtureTests(unittest.TestCase):
         )
 
     def test_badd_and_ampere_now_land_named_buckets_not_unattributed(self):
-        """Pass-2 regression guard: the exact two rows pass 1's fixture
-        used as UNATTRIBUTED negative controls now land NAMED buckets."""
+        """`badd_f32`/`ampere_sgemm_128x64_nn` land NAMED buckets, never
+        `UNATTRIBUTED`, on this fixture."""
         chains, _unknown, _reasons = attribute.attribute_census(self.census, self.sig, "clip-text")
         self.assertIn("badd_f32", chains[attribute.CHAIN_BIAS_RESIDUAL_MLP].kernel_names)
         self.assertIn("ampere_sgemm_128x64_nn", chains[attribute.CHAIN_BASE_GEMM].kernel_names)
@@ -719,8 +793,8 @@ class AttributeCensusRealFixtureTests(unittest.TestCase):
 
     def test_outside_signature_plausibly_attention_mirrors_permute_reshape(self):
         """This fixture carries a real `ucopy_f32` row at the `out` tier
-        shape (added pass 3 — see `PROVENANCE.md`), so `PERMUTE/RESHAPE` is
-        `measured`, not `absent`, here."""
+        shape (see `PROVENANCE.md`), so `PERMUTE/RESHAPE` is `measured`,
+        not `absent`, here."""
         chains, _unknown, _reasons = attribute.attribute_census(self.census, self.sig, "clip-text")
         permute = chains[attribute.CHAIN_PERMUTE_RESHAPE]
         self.assertEqual(permute.status, "measured")
@@ -763,10 +837,32 @@ class AttributeCensusBf16FixtureTests(unittest.TestCase):
         chains, _u, _r = attribute.attribute_census(self.census, self.sig, "clip-text")
         self.assertIn("fast_sum_bf16", chains[attribute.CHAIN_LOSS_REDUCE].kernel_names)
 
-    def test_anonymous_kernel2_splits_by_grid_and_leaves_one_unattributed(self):
+    def test_cutlass_tile_variants_at_the_attn_grid_resplit_into_three_named_rows(self):
+        """`kernel_census.py`'s demangled-name keying resplits the real
+        `grid=[2,1,192]` collision into three distinct cutlass tile
+        instantiations (module doc, "Kernel identity") — all three carry
+        the attention batch count at `grid[2]` and land `C-ATTN-clip-text`
+        by the grid-position-2 rule, name-independent."""
         chains, _u, _r = attribute.attribute_census(self.census, self.sig, "clip-text")
-        self.assertIn("Kernel2", chains[attribute.chain_attn("clip-text")].kernel_names)
-        self.assertIn("Kernel2", chains[attribute.CHAIN_UNATTRIBUTED].kernel_names)
+        attn_names = set(chains[attribute.chain_attn("clip-text")].kernel_names)
+        for name in (
+            "cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_nn_align1",
+            "cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_nt_align1",
+            "cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_tn_align1",
+        ):
+            self.assertIn(name, attn_names)
+
+    def test_cutlass_tile_at_grid_16_1_10_lands_base_gemm_not_unattributed(self):
+        """`cutlass_80_simt_sgemm_32x128_8x5_nt_align1 grid=[16,1,10]` — the
+        real row this fixture's OWN Kernel2-collapsed predecessor left
+        `UNATTRIBUTED` and unknown-by-name — now classifies cleanly via
+        `GEMM_FAMILY_NAME_RE`."""
+        chains, _u, _r = attribute.attribute_census(self.census, self.sig, "clip-text")
+        self.assertIn(
+            "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
+            chains[attribute.CHAIN_BASE_GEMM].kernel_names,
+        )
+        self.assertEqual(chains[attribute.CHAIN_UNATTRIBUTED].kernel_names, [])
 
     def test_cast_bucket_includes_bf16_only_names_but_not_the_attn_shape_row(self):
         chains, _u, _r = attribute.attribute_census(self.census, self.sig, "clip-text")
@@ -774,8 +870,9 @@ class AttributeCensusBf16FixtureTests(unittest.TestCase):
         self.assertIn("cast_bf16_f32", cast_names)
         self.assertIn("cast_add_bf16", cast_names)
         self.assertIn("cast_scale_bf16_f32", cast_names)
-        # Pass 3, finding 1: `cast_u8_bf16` at the attention shape now lands
-        # `C-ATTN-clip-text`, NOT `CAST` — see the fixture's own PROVENANCE.
+        # `cast_u8_bf16` at the attention shape lands `C-ATTN-clip-text`,
+        # NOT `CAST` — the attention-shape check runs first for any
+        # cast-named row. See the fixture's own PROVENANCE.
         self.assertNotIn("cast_u8_bf16", cast_names)
         self.assertIn("cast_u8_bf16", chains[attribute.chain_attn("clip-text")].kernel_names)
 
@@ -799,20 +896,44 @@ class AttributeCensusBf16FixtureTests(unittest.TestCase):
 
 
 class UnknownKernelGateOnRealFixtureTests(unittest.TestCase):
-    """Pass 3, finding 3: `clip-text-A2`'s own real anonymous `Kernel2`
-    rows now INVALIDATE the leg (the `"gemm"`-substring/`Kernel2`-literal
-    admission shortcuts are removed) — the exact, committed reproduction of
-    the real leg's own measured outcome (module doc, "Consequence,
-    measured")."""
+    """`clip-text-A2`'s own real cutlass-tile rows (`kernel_census.py`'s
+    demangled-name keying — module doc, "Kernel identity") classify
+    cleanly via `GEMM_FAMILY_NAME_RE`: the leg carries NO unknown-kernel
+    finding at all, the exact, committed reproduction of the real leg's
+    own measured outcome (module doc, "`BASE-GEMM`: GEMM-family kernel
+    identity, by NAME")."""
 
-    def test_a2_fixture_has_an_invalidating_unknown_kernel(self):
+    def test_a2_fixture_has_no_unknown_kernel_finding(self):
         census = load_fixture_census(FIXTURE_KERNELS_A2)
         sig = attribute.derive_signatures("clip-text", CLIP_TEXT_A2_MANIFEST_FIELDS)
-        _chains, unknown, reasons = attribute.attribute_census(census, sig, "clip-text")
-        unknown_names = {(u["kernel"], tuple(u["grid"])) for u in unknown}
-        self.assertIn(("Kernel2", (16, 1, 10)), unknown_names)
-        self.assertTrue(any("Kernel2" in r for r in reasons))
-        self.assertTrue(any("1, 10" in r or "[16, 1, 10]" in r for r in reasons))
+        chains, unknown, reasons = attribute.attribute_census(census, sig, "clip-text")
+        self.assertEqual(unknown, [])
+        self.assertEqual(reasons, [])
+        self.assertEqual(chains[attribute.CHAIN_UNATTRIBUTED].kernel_names, [])
+
+    def test_a_genuinely_unknown_name_on_this_same_leg_still_trips_the_gate(self):
+        """Non-vacuous negative control: the gate above did not pass
+        because it never fires — grafting a genuinely unrecognized name at
+        a material share onto this SAME real census still invalidates it,
+        proving the gate is live, not silently disabled by the
+        `GEMM_FAMILY_NAME_RE` admission path."""
+        census = load_fixture_census(FIXTURE_KERNELS_A2)
+        sig = attribute.derive_signatures("clip-text", CLIP_TEXT_A2_MANIFEST_FIELDS)
+        grafted = dict(census)
+        grafted["by_kernel_and_grid"] = list(census["by_kernel_and_grid"]) + [
+            {
+                "kernel": "totally_unrecognized_kernel_name",
+                "grid": [999, 1, 1],
+                "block": [128, 1, 1],
+                "launches_per_step": 1.0,
+                "us_per_step": census["gpu_kernel_us_per_step"] * 0.02,
+                "share": 0.02,
+            }
+        ]
+        _chains, unknown, reasons = attribute.attribute_census(grafted, sig, "clip-text")
+        unknown_names = {u["kernel"] for u in unknown}
+        self.assertIn("totally_unrecognized_kernel_name", unknown_names)
+        self.assertTrue(any("totally_unrecognized_kernel_name" in r for r in reasons))
 
 
 class Ln1VsD2DifferentialTests(unittest.TestCase):
@@ -932,13 +1053,17 @@ class AttributeCensusD1FixtureTests(unittest.TestCase):
         self.assertIn("ampere_sgemm_32x32_sliced1x4_nt", base_gemm_names)
         self.assertIn("ampere_sgemm_128x128_nn", chains[attribute.chain_attn("clip-text")].kernel_names)
 
-    def test_anonymous_3d_tile_grid_lands_base_gemm_not_unattributed(self):
-        """Pass 3, finding 3 (corrects pass 2): `Kernel2 grid=[8,2,28]`
-        (every dimension `>1`) now lands `BASE-GEMM` — corroborated by the
-        IDENTICAL grid on the independent `clip-text-D2` fixture."""
+    def test_cutlass_tile_at_grid_8_2_28_lands_base_gemm_not_unattributed(self):
+        """`cutlass_80_simt_sgemm_128x32_8x5_nt_align1 grid=[8,2,28]` — the
+        real GEMM-family name `kernel_census.py`'s demangled-name keying
+        produces here — lands `BASE-GEMM` via `GEMM_FAMILY_NAME_RE`,
+        corroborated by the IDENTICAL row on the independent
+        `clip-text-D2` fixture."""
         chains, _u, _r = self._chains()
-        self.assertIn("Kernel2", chains[attribute.CHAIN_BASE_GEMM].kernel_names)
-        self.assertNotIn("Kernel2", chains[attribute.CHAIN_UNATTRIBUTED].kernel_names)
+        self.assertIn(
+            "cutlass_80_simt_sgemm_128x32_8x5_nt_align1", chains[attribute.CHAIN_BASE_GEMM].kernel_names
+        )
+        self.assertEqual(chains[attribute.CHAIN_UNATTRIBUTED].kernel_names, [])
 
     def test_usqr_at_out_tier_lands_elementwise_other_out_not_c_ln(self):
         """`usqr_f32` at `grid=[924,1,1]` sits at the `out` ACTIVATION tier
@@ -973,9 +1098,11 @@ class AttributeCensusD2FixtureTests(unittest.TestCase):
             {"layer_norm_fwd_f32_biased", "layer_norm_bwd_dx_f32"},
         )
 
-    def test_shared_anonymous_grid_with_d1_is_base_gemm_here_too(self):
+    def test_shared_cutlass_tile_with_d1_is_base_gemm_here_too(self):
         chains, _u, _r = self._chains()
-        self.assertIn("Kernel2", chains[attribute.CHAIN_BASE_GEMM].kernel_names)
+        self.assertIn(
+            "cutlass_80_simt_sgemm_128x32_8x5_nt_align1", chains[attribute.CHAIN_BASE_GEMM].kernel_names
+        )
 
     def test_no_unknown_kernel_names(self):
         _chains, unknown, reasons = self._chains()
@@ -1003,7 +1130,7 @@ class AttributeCensusVisionA1FixtureTests(unittest.TestCase):
 
     def test_magma_gemm_lands_attn_via_grid_not_name(self):
         chains, _u, _r = attribute.attribute_census(self.census, self.sig, "clip-vision")
-        self.assertIn("magma_sgemmEx_kernel", chains[attribute.chain_attn("clip-vision")].kernel_names)
+        self.assertIn(MAGMA_SGEMM_FULL_NAME, chains[attribute.chain_attn("clip-vision")].kernel_names)
 
     def test_badd_splits_three_bias_residual_tiers(self):
         chains, _u, _r = attribute.attribute_census(self.census, self.sig, "clip-vision")
@@ -1013,11 +1140,10 @@ class AttributeCensusVisionA1FixtureTests(unittest.TestCase):
         self.assertIn("badd_f32", chains[attribute.chain_attn("clip-vision")].kernel_names)
 
     def test_urecip_off_ln_shape_lands_grad_bookkeeping_via_the_param_scale_catch_all(self):
-        """Pass 3 (finding 8): the parameter-scale catch-all this
-        `urecip_f32` row (`grid=[1,1,1]`, `total_threads` inside the
-        `width=768` tier's block-rounded range) falls into is
-        `GRAD-BOOKKEEPING`, not `OPTIMIZER` — `OPTIMIZER` names `adamw_*`
-        kernels by name only now."""
+        """The parameter-scale catch-all this `urecip_f32` row
+        (`grid=[1,1,1]`, `total_threads` inside the `width=768` tier's
+        block-rounded range) falls into is `GRAD-BOOKKEEPING`, not
+        `OPTIMIZER` — `OPTIMIZER` names `adamw_*` kernels by name only."""
         chains, _u, _r = attribute.attribute_census(self.census, self.sig, "clip-vision")
         self.assertIn("urecip_f32", chains[attribute.CHAIN_GRAD_BOOKKEEPING].kernel_names)
 
@@ -1027,22 +1153,21 @@ class AttributeCensusVisionA1FixtureTests(unittest.TestCase):
             self.assertIn(name, chains, name)
         self.assertIn(attribute.CHAIN_PATCH_EMBED, chains)
 
-    def test_kernel2_is_unknown_but_below_threshold_never_invalidates(self):
-        """Pass 3, finding 3: `Kernel2 grid=[6,1,18]` (`dim[1]=1`, fails the
-        anonymous-GEMM-tile rule) is genuinely unknown now, but its
-        `share_gpu_busy` against the leg's REAL full busy total stays well
-        under `UNKNOWN_KERNEL_SHARE_LIMIT` — recorded, never invalidating."""
-        _chains, unknown, reasons = attribute.attribute_census(self.census, self.sig, "clip-vision")
-        self.assertEqual(len(unknown), 1)
-        self.assertEqual(unknown[0]["kernel"], "Kernel2")
-        self.assertLess(unknown[0]["share_gpu_busy"], attribute.UNKNOWN_KERNEL_SHARE_LIMIT)
+    def test_cutlass_tile_at_grid_6_1_18_lands_base_gemm_no_unknown(self):
+        """`cutlass_80_simt_sgemm_32x128_8x5_nt_align1 grid=[6,1,18]` — the
+        real row `kernel_census.py`'s demangled-name keying produces here
+        (`dim[1]=1`) — classifies via `GEMM_FAMILY_NAME_RE` regardless of
+        its own degenerate grid dimension; no unknown-kernel finding at
+        all on this leg."""
+        chains, unknown, reasons = attribute.attribute_census(self.census, self.sig, "clip-vision")
+        self.assertIn(CUTLASS_SIMT_32X128_NT_NAME, chains[attribute.CHAIN_BASE_GEMM].kernel_names)
+        self.assertEqual(unknown, [])
         self.assertEqual(reasons, [])
 
 
 class AttributeCensusVisionD1FixtureTests(unittest.TestCase):
     """`clip-vision-D1`'s own fixture — the ONLY real evidence across all
-    eight pulled CLIP legs for `usqr` at the LN row count (pass 3,
-    finding 2)."""
+    eight pulled CLIP legs for `usqr` at the LN row count."""
 
     def setUp(self):
         self.census = load_fixture_census(FIXTURE_KERNELS_VISION_D1)
@@ -1067,25 +1192,18 @@ class AttributeCensusVisionD1FixtureTests(unittest.TestCase):
     def test_magma_and_ampere_land_attn_via_grid_position_2(self):
         chains, _u, _r = self._chains()
         attn_names = set(chains[attribute.chain_attn("clip-vision")].kernel_names)
-        self.assertIn("magma_sgemmEx_kernel", attn_names)
+        self.assertIn(MAGMA_SGEMM_FULL_NAME, attn_names)
         self.assertIn("ampere_sgemm_128x128_nt", attn_names)
 
-    def test_anonymous_row_with_a_degenerate_dimension_stays_unattributed(self):
-        """A SECOND tower's evidence that the anonymous-GEMM-tile rule does
-        not loosen: `Kernel2 grid=[6,1,18]` (`dim[1]=1`) stays
-        `UNATTRIBUTED` here exactly as `clip-vision-d2`'s fixture shows."""
-        chains, _u, _r = self._chains()
-        self.assertIn("Kernel2", chains[attribute.CHAIN_UNATTRIBUTED].kernel_names)
-
-    def test_kernel2_is_unknown_but_below_threshold_never_invalidates(self):
-        """`Kernel2 grid=[6,1,18]` is genuinely unknown now (pass 3,
-        finding 3), but its `share_gpu_busy` against the leg's REAL full
-        busy total is well under `UNKNOWN_KERNEL_SHARE_LIMIT` — recorded,
-        never invalidating."""
-        _chains, unknown, reasons = self._chains()
-        self.assertEqual(len(unknown), 1)
-        self.assertEqual(unknown[0]["kernel"], "Kernel2")
-        self.assertLess(unknown[0]["share_gpu_busy"], attribute.UNKNOWN_KERNEL_SHARE_LIMIT)
+    def test_cutlass_tile_at_grid_6_1_18_lands_base_gemm_no_unknown(self):
+        """A SECOND tower's evidence: `cutlass_80_simt_sgemm_32x128_8x5_
+        nt_align1 grid=[6,1,18]` (`dim[1]=1`) classifies via
+        `GEMM_FAMILY_NAME_RE` regardless of its own degenerate grid
+        dimension, exactly as `clip-vision-A1`/`clip-vision-D2`'s fixtures
+        show."""
+        chains, unknown, reasons = self._chains()
+        self.assertIn(CUTLASS_SIMT_32X128_NT_NAME, chains[attribute.CHAIN_BASE_GEMM].kernel_names)
+        self.assertEqual(unknown, [])
         self.assertEqual(reasons, [])
 
 
@@ -1116,15 +1234,10 @@ class AttributeCensusVisionD2FixtureTests(unittest.TestCase):
             {"layer_norm_fwd_f32_biased", "layer_norm_bwd_dx_f32"},
         )
 
-    def test_anonymous_row_with_a_degenerate_dimension_stays_unattributed(self):
-        chains, _u, _r = self._chains()
-        self.assertIn("Kernel2", chains[attribute.CHAIN_UNATTRIBUTED].kernel_names)
-
-    def test_kernel2_is_unknown_but_below_threshold_never_invalidates(self):
-        _chains, unknown, reasons = self._chains()
-        self.assertEqual(len(unknown), 1)
-        self.assertEqual(unknown[0]["kernel"], "Kernel2")
-        self.assertLess(unknown[0]["share_gpu_busy"], attribute.UNKNOWN_KERNEL_SHARE_LIMIT)
+    def test_cutlass_tile_at_grid_6_1_18_lands_base_gemm_no_unknown(self):
+        chains, unknown, reasons = self._chains()
+        self.assertIn(CUTLASS_SIMT_32X128_NT_NAME, chains[attribute.CHAIN_BASE_GEMM].kernel_names)
+        self.assertEqual(unknown, [])
         self.assertEqual(reasons, [])
 
 
@@ -1171,14 +1284,11 @@ class UnknownKernelGateTests(unittest.TestCase):
         self.assertEqual(reasons, [])
 
     def test_a_novel_gemm_named_kernel_still_classifies_by_name_regardless_of_admission(self):
-        """Pass 3, finding 3 removes the `"gemm"`-substring ADMISSION
-        shortcut from `is_known_kernel_name`, but `classify_kernel`'s own
-        `GEMM_NAME_RE`-by-name CLASSIFICATION rule is UNCHANGED and
-        unconditional on grid shape — an unrecognised GEMM-NAMED kernel
-        still lands `BASE-GEMM` by name alone (classification and
-        admission are different questions, module doc), so it NEVER
-        reaches the unknown-kernel gate at all (that gate only sees rows
-        `classify_kernel` could not place)."""
+        """A never-before-seen but GEMM-FAMILY-SHAPED name (matching
+        `GEMM_FAMILY_NAME_RE`'s `ampere_\\w*gemm\\w*` alternative) lands
+        `BASE-GEMM` by name alone and is admitted via the SAME regex — it
+        never even reaches the unknown-kernel gate (that gate only sees
+        rows `classify_kernel` could not place)."""
         census = self._census_with(
             {
                 "kernel": "ampere_bf16_s16816gemm_bf16_999x999_ldg8_f2f_stages_99x9_nn",
@@ -1196,11 +1306,10 @@ class UnknownKernelGateTests(unittest.TestCase):
         self.assertEqual(reasons, [])
 
     def test_an_unnamed_kernel_at_a_non_qualifying_grid_still_triggers_the_gate(self):
-        """The REAL invalidating case (pass 3, finding 3): an ANONYMOUS
-        name (no `"gemm"` substring to classify by, and a grid that fails
-        the anonymous-tile-grid fallback) is genuinely unknown and, above
-        the share threshold, invalidates — the committed reproduction of
-        `clip-text-A2`'s own real `Kernel2` rows (see
+        """A genuinely ANONYMOUS name (matching neither `GEMM_FAMILY_NAME_
+        RE` nor any `KNOWN_KERNEL_NAMES` entry) is unknown and, above the
+        share threshold, invalidates — a SYNTHETIC negative control (a real
+        leg's own GEMM-family rows classify cleanly instead — see
         `UnknownKernelGateOnRealFixtureTests`)."""
         census = self._census_with(
             {"kernel": "Kernel2", "grid": [16, 1, 10], "block": [128, 1, 1], "us_per_step": 1e9}
@@ -1298,9 +1407,8 @@ class LegDecisionGradeTests(unittest.TestCase):
         self.assertIsNotNone(reason)
 
     def test_no_merge_row_is_never_decision_grade(self):
-        """Pass 3, finding 5: `decision_grade` REQUIRES a corresponding
-        `--merge-json` row — `merge_row=None` refuses, never assumes
-        clean."""
+        """`decision_grade` REQUIRES a corresponding `--merge-json` row —
+        `merge_row=None` refuses, never assumes clean."""
         grade, reason = attribute.leg_decision_grade(self._row(), None)
         self.assertFalse(grade)
         self.assertIn("merge", reason.lower())
@@ -1321,9 +1429,9 @@ class LegDecisionGradeTests(unittest.TestCase):
 
 
 class ComputeRealizedGainsTests(unittest.TestCase):
-    """Pass 3, finding 4: `C-LORA`/`C-LN` are realized-gain NUMBERS, never
-    chain-partition members — `compute_realized_gains` builds them as a
-    SEPARATE top-level list."""
+    """`C-LORA`/`C-LN` are realized-gain NUMBERS, never chain-partition
+    members — `compute_realized_gains` builds them as a SEPARATE top-level
+    list."""
 
     def _leg(self, leg_id, tower, role, verdict, busy, dtype="f32"):
         return {
@@ -1356,7 +1464,7 @@ class ComputeRealizedGainsTests(unittest.TestCase):
         self.assertEqual(lora["eager_leg_id"], "clip-text-D2")
         self.assertEqual(lora["fused_leg_id"], "clip-text-A1")
         # `C-LORA`'s own fused leg (`A1`) IS the baseline leg — the two
-        # denominators COINCIDE (pass 3, finding 5's own convention note).
+        # denominators COINCIDE (module doc, "Denominator convention").
         self.assertEqual(lora["baseline_leg_id"], "clip-text-A1")
         self.assertAlmostEqual(lora["baseline_wall_s"], lora["fused_twin_wall_s"], places=6)
         self.assertAlmostEqual(lora["share_of_baseline_wall"], lora["share_of_fused_twin_wall"], places=6)
@@ -1375,18 +1483,18 @@ class ComputeRealizedGainsTests(unittest.TestCase):
         self.assertAlmostEqual(ln["busy_delta_us_per_step"], 10000.0, places=6)
         self.assertEqual(ln["eager_leg_id"], "clip-text-D1")
         self.assertEqual(ln["fused_leg_id"], "clip-text-D2")
-        # Pass 3, finding 5: with no `A1` leg present, `share_of_baseline_wall`
-        # cannot be computed (there is no shipped-A1 wall to divide by) — it
-        # is `None`, never silently substituted with the fused leg's (`D2`'s)
+        # With no `A1` leg present, `share_of_baseline_wall` cannot be
+        # computed (there is no shipped-A1 wall to divide by) — it is
+        # `None`, never silently substituted with the fused leg's (`D2`'s)
         # own wall.
         self.assertIsNone(ln["baseline_wall_s"])
         self.assertIsNone(ln["share_of_baseline_wall"])
         self.assertAlmostEqual(ln["fused_twin_wall_s"], 0.13, places=6)
         self.assertAlmostEqual(ln["share_of_fused_twin_wall"], 0.02 / 0.13, places=6)
 
-    def test_c_ln_share_of_baseline_wall_divides_by_a1_not_d2_pass3_finding5(self):
-        """Pass 3, finding 5: `share_of_baseline_wall` is ALWAYS the
-        tower's SHIPPED `A1` wall, even for `C-LN` (whose pair is `D1` vs
+    def test_c_ln_share_of_baseline_wall_divides_by_a1_not_d2(self):
+        """`share_of_baseline_wall` is ALWAYS the tower's SHIPPED `A1`
+        wall, even for `C-LN` (whose pair is `D1` vs
         `D2` — `D2` is NOT what ships). `fused_twin_wall_s`/
         `share_of_fused_twin_wall` divide by `D2`'s own wall instead, and
         the two denominators here are DELIBERATELY DIFFERENT so the test
@@ -1544,8 +1652,8 @@ class TwoSidedDecisionRuleTests(unittest.TestCase):
         self.assertIn("A1 not decision-grade", decision["reason"])
 
     def test_unresolved_without_a_merge_row_even_with_a_generous_share(self):
-        """Pass 3, finding 5: a leg with NO corresponding `--merge-json`
-        row can never reach decision-grade, so the two-sided rule reads
+        """A leg with NO corresponding `--merge-json` row can never reach
+        decision-grade, so the two-sided rule reads
         UNRESOLVED honestly rather than ACTIVATE/DECLINE on an
         un-certified leg."""
         legs = [self._leg("clip-text-A1", "f32", s_wall=0.50, s_busy=0.50, u_wall=0.0, u_busy=0.0)]
@@ -1597,10 +1705,10 @@ class TwoSidedDecisionRuleTests(unittest.TestCase):
 
     def test_f32_only_caveat_names_the_invalid_reason_when_a2_is_present_but_invalid(self):
         """The SECOND way: A2 is present in `legs` but this module's own
-        `verdict` for it is INVALID — evidenced by the real
-        `clip-text-A2` (the 1%-unknown-kernel gate). The caveat must NAME
-        the actual reason, not just point at "see this leg's own
-        reasons" (pass 3, finding 1)."""
+        `verdict` for it is INVALID — a SYNTHETIC unknown-kernel finding
+        (the shape a real 1%-unknown-kernel-gate reason string takes). The
+        caveat must NAME the actual reason, not just point at "see this
+        leg's own reasons"."""
         legs = [
             self._leg("clip-text-A1", "f32", s_wall=0.01, s_busy=0.01, u_wall=0.0, u_busy=0.0),
             self._leg(
@@ -1611,7 +1719,10 @@ class TwoSidedDecisionRuleTests(unittest.TestCase):
                 u_wall=0.0,
                 u_busy=0.0,
                 verdict=attribute.VERDICT_INVALID,
-                reasons=["clip-text-A2: kernel 'Kernel2' (grid=[16, 1, 10]) is not a known kernel name"],
+                reasons=[
+                    "clip-text-A2: kernel 'totally_unrecognized_kernel_name' "
+                    "(grid=[16, 1, 10]) is not a known kernel name"
+                ],
             ),
         ]
         decision = attribute.decide_candidate_port(
@@ -1623,14 +1734,13 @@ class TwoSidedDecisionRuleTests(unittest.TestCase):
         )
         self.assertEqual(decision["verdict"], "DECLINE")
         self.assertIn("F32-only", decision["reason"])
-        self.assertIn("Kernel2", decision["reason"])
+        self.assertIn("totally_unrecognized_kernel_name", decision["reason"])
         self.assertIn("is not a known kernel name", decision["reason"])
 
     def test_f32_only_caveat_fires_when_a2_is_valid_but_has_no_merge_row(self):
         """The THIRD way: A2 is present and this module's own `verdict` is
         VALID, but `--merge-json` names no corresponding row for it — the
-        merge cannot certify it, so it is still not decision-grade (pass
-        3, finding 1)."""
+        merge cannot certify it, so it is still not decision-grade."""
         legs = [
             self._leg("clip-text-A1", "f32", s_wall=0.01, s_busy=0.01, u_wall=0.0, u_busy=0.0),
             self._leg("clip-text-A2", "bf16", s_wall=0.01, s_busy=0.01, u_wall=0.0, u_busy=0.0),
@@ -2028,15 +2138,13 @@ class HtsatAttributeCensusA1FixtureTests(unittest.TestCase):
         attributed_total = sum(c.gpu_busy_us for c in chains.values() if c.gpu_busy_us is not None)
         self.assertAlmostEqual(attributed_total, total_in_rows, places=6)
 
-    def test_only_the_two_intentional_kernel2_rows_are_unknown(self):
-        """This fixture's own negative controls (module doc,
-        `test_anonymous_kernel2_degenerate_dims_stay_unattributed`) are the
-        ONLY unknown rows, and neither invalidates the leg (each
-        individually well under the 1% gate)."""
+    def test_no_unknown_kernel_names(self):
+        """`kernel_census.py`'s demangled-name keying resolves every row
+        this fixture carries to a real cutlass/ampere/magma name — none
+        are unknown (module doc, "`BASE-GEMM`: GEMM-family kernel
+        identity, by NAME")."""
         _chains, unknown, reasons = self._chains()
-        self.assertEqual({u["kernel"] for u in unknown}, {"Kernel2"})
-        for u in unknown:
-            self.assertLess(u["share_gpu_busy"], attribute.UNKNOWN_KERNEL_SHARE_LIMIT)
+        self.assertEqual(unknown, [])
         self.assertEqual(reasons, [])
 
     def test_every_declared_chain_present_or_absent(self):
@@ -2058,14 +2166,14 @@ class HtsatAttributeCensusA1FixtureTests(unittest.TestCase):
 
     def test_attention_batched_gemm_two_different_libraries_two_stages(self):
         """`ampere_sgemm_128x128_nt grid=[1,1,6144]` (stage 0) and
-        `magma_sgemmEx_kernel grid=[1,2,1536]` (stage 2) are TWO different
-        GEMM libraries, both carrying `grid[2] == attn_batch_count(stage)`
-        — the SAME name-independent relational rule generalizing across
-        stages."""
+        `magma_sgemmEx_kernel`'s own full demangled signature at
+        `grid=[1,2,1536]` (stage 2) are TWO different GEMM libraries, both
+        carrying `grid[2] == attn_batch_count(stage)` — the SAME
+        name-independent relational rule generalizing across stages."""
         chains, _u, _r = self._chains()
         attn_names = set(chains[attribute.chain_attn("htsat")].kernel_names)
         self.assertIn("ampere_sgemm_128x128_nt", attn_names)
-        self.assertIn("magma_sgemmEx_kernel", attn_names)
+        self.assertIn(MAGMA_SGEMM_FULL_NAME, attn_names)
 
     def test_attention_elementwise_by_shape_two_stages(self):
         chains, _u, _r = self._chains()
@@ -2117,17 +2225,17 @@ class HtsatAttributeCensusA1FixtureTests(unittest.TestCase):
         chains, _u, _r = self._chains()
         self.assertIn("ampere_sgemm_128x64_nn", chains[attribute.CHAIN_BASE_GEMM].kernel_names)
 
-    def test_anonymous_kernel2_degenerate_dims_stay_unattributed(self):
-        """The two `Kernel2` rows this fixture carries (`[3,1,36]`,
-        `[12,1,24]`) both have a `1` in grid position 1 — NOT a genuine
-        3-D tile grid — so the anonymous grid-family fallback does not
-        fire and they remain `UNATTRIBUTED` (counted toward the
-        unknown-kernel gate, each individually under 1% of busy on the
-        real leg — module doc)."""
+    def test_cutlass_tile_at_degenerate_grids_lands_base_gemm(self):
+        """The two rows this fixture carries at `grid=[3,1,36]`/
+        `[12,1,24]` (both carrying a `1` in grid position 1) are the real
+        `cutlass_80_simt_sgemm_32x128_8x5_nt_align1` name
+        `kernel_census.py`'s demangled-name keying produces — classified
+        via `GEMM_FAMILY_NAME_RE` regardless of the degenerate grid
+        dimension, landing `BASE-GEMM`, never `UNATTRIBUTED`."""
         chains, unknown, _r = self._chains()
-        self.assertIn("Kernel2", chains[attribute.CHAIN_UNATTRIBUTED].kernel_names)
-        unknown_names = {u["kernel"] for u in unknown}
-        self.assertIn("Kernel2", unknown_names)
+        self.assertIn(CUTLASS_SIMT_32X128_NT_NAME, chains[attribute.CHAIN_BASE_GEMM].kernel_names)
+        self.assertEqual(chains[attribute.CHAIN_UNATTRIBUTED].kernel_names, [])
+        self.assertEqual(unknown, [])
 
     def test_ambiguous_out_mlp_collision_sums_the_real_colliding_rows(self):
         """This fixture's own `badd_f32` rows at `grid=[9216,...]`/
@@ -2435,8 +2543,8 @@ class CliEndToEndTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
 
     def test_main_refuses_when_a_legs_dir_leg_has_no_merge_json_row(self):
-        """Pass 3, finding 5: `--legs-dir`'s own leg set must be a SUBSET
-        of `--merge-json`'s — a leg this run would attribute but the merge
+        """`--legs-dir`'s own leg set must be a SUBSET of `--merge-json`'s
+        — a leg this run would attribute but the merge
         report never mentions can never be certified `decision_grade`, so
         `main` refuses rather than silently reading it as `False` and
         moving on."""

@@ -180,7 +180,7 @@
    "share": 0.09111143850002609
   },
   {
-   "kernel": "Kernel2",
+   "kernel": "cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_nt_align1",
    "grid": [
     2,
     1,
@@ -191,12 +191,44 @@
     1,
     1
    ],
-   "launches_per_step": 48.0,
-   "us_per_step": 569.109226,
-   "share": 0.013730142834017318
+   "launches_per_step": 24.0,
+   "us_per_step": 276.205548,
+   "share": 0.00666364460868541
   },
   {
-   "kernel": "Kernel2",
+   "kernel": "cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_tn_align1",
+   "grid": [
+    2,
+    1,
+    192
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 151.605122,
+   "share": 0.0036575755309027815
+  },
+  {
+   "kernel": "cutlass_75_tensorop_bf16_s1688gemm_bf16_64x64_nn_align1",
+   "grid": [
+    2,
+    1,
+    192
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "launches_per_step": 12.0,
+   "us_per_step": 141.29855600000002,
+   "share": 0.0034089226944291266
+  },
+  {
+   "kernel": "cutlass_80_simt_sgemm_32x128_8x5_nt_align1",
    "grid": [
     16,
     1,

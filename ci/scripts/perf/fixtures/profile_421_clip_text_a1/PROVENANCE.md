@@ -36,8 +36,7 @@ wanted = [
     ("dropout_fwd_f32", [3696, 1, 1]),
     ("adamw_moment_update_f32", [4, 1, 1]),
     ("bmul_f32", [1112, 1, 1]),
-    # Added in pass 3 (adversarial-audit fold, finding 1/2): the ONE real
-    # `ucopy_f32` row at the `out` tier shape, for the
+    # The ONE real `ucopy_f32` row at the `out` tier shape, for the
     # `outside_signature_plausibly_attention` field's own "a present (not
     # absent) PERMUTE/RESHAPE bucket" test — see below.
     ("ucopy_f32", [924, 1, 1]),
@@ -66,39 +65,26 @@ exercises are:
 - Attention batched-matmul count `rows*heads = 192` (the three
   `ampere_sgemm_128x128_{nt,tn,nn}` rows at `grid=[1,1,192]`).
 
-Rows chosen to be NEGATIVE controls for the shape gate (pass 1): `badd_f32`
-at the GELU shape (still lands OUT of `C-GELU`, not `C-GELU` — see
-`profile_421_attribute.py`'s module doc, "Deliberately EXCLUDED");
-`dropout_fwd_f32`/`adamw_moment_update_f32` (known names, no CHAIN-1 rule
-matched either).
-
-**Pass-2 update (contract v2.5 §Attribution, named-bucket extension — see
-`profile_421_attribute.py`'s own module doc):** three of these four
-"negative controls" were negative controls for pass 1's THREE-chain scope
-only, not for `UNATTRIBUTED` itself — they now land NAMED buckets pass 2
-adds: `ampere_sgemm_128x64_nn` at `grid=[4,29,7]` (no `192` in any
-dimension) -> `BASE-GEMM`; `badd_f32` at the GELU shape -> `BIAS/RESIDUAL-
-MLP` (pass 3, finding 2: `badd_*`'s own tier-suffixed name-class bucket —
-pass 2 first landed this row in the coarser `ELEMENTWISE-MLP`; still not
-`C-GELU` either way, the exclusion itself is UNCHANGED, only where the
-excluded row now lands); `dropout_fwd_f32` -> `DROPOUT`;
-`adamw_moment_update_f32` -> `OPTIMIZER`. The SECOND `bmul_f32` row at
-`grid=[1112,1,1]` (`1112*1024=1,138,688` elements — NOT the GELU shape)
-likewise now FALLS THROUGH pass 1's GELU-shape gate (unchanged: it is still
+Rows chosen to be NEGATIVE controls for the GELU shape gate: `badd_f32`
+at the GELU shape (lands OUT of `C-GELU` — see `profile_421_attribute.py`'s
+module doc, "Deliberately EXCLUDED"; it instead lands the tier-suffixed
+`BIAS/RESIDUAL-MLP` bucket, since a bias-add is intrinsically tied to its
+site's own width, never the activation itself); `ampere_sgemm_128x64_nn`
+at `grid=[4,29,7]` (no `192` in any dimension) -> `BASE-GEMM`;
+`dropout_fwd_f32` -> `DROPOUT`; `adamw_moment_update_f32` -> `OPTIMIZER`.
+The SECOND `bmul_f32` row at `grid=[1112,1,1]` (`1112*1024=1,138,688`
+elements — NOT the GELU shape) FALLS THROUGH the GELU-shape gate (still
 excluded from `C-GELU`) into the attention tensor's own elementwise tier
 (`attn_shape_elements() = rows*heads*seq*seq = 1,138,368`, which
 `1,138,688` covers) -> `C-ATTN-clip-text`, per `classify_kernel`'s
-documented "fall through" behavior. The rows already in this fixture's
-list keep their original grids unchanged from pass 1 — only which chain
-each classifies into changed, per the new rules `test_profile_421_attribute.py`
-now asserts. The `ucopy_f32` row (`grid=[924,1,1]`, the `out` tier shape)
-is a pass-3 addition, real and byte-for-byte from the same export:
-`ucopy_f32`/`copy2d_f32` get their OWN `PERMUTE/RESHAPE` bucket now (module
+documented "fall through" behavior. The `ucopy_f32` row (`grid=[924,1,1]`,
+the `out` tier shape) is real and byte-for-byte from the same export:
+`ucopy_f32`/`copy2d_f32` get their OWN `PERMUTE/RESHAPE` bucket (module
 doc, "split by kernel NAME-CLASS"), and this row lets the fixture exercise
 `outside_signature_plausibly_attention`'s mirroring of a NON-`"absent"`
 `PERMUTE/RESHAPE` entry directly (the BF16 `clip-text-A2` fixture's own
-`Kernel2`/`badd_bf16` rows never include a `ucopy`/`copy2d` name, so that
-fixture alone could not exercise this). The `badd_f32` row at that same
+rows never include a `ucopy`/`copy2d` name, so that fixture alone could
+not exercise this). The `badd_f32` row at that same
 `grid=[924,1,1]` shape is likewise real and byte-for-byte from the same
 export, added so this leg's own point on the `badd_f32` launch-count
 ladder (module doc, "D1-vs-D2 differential") is present here alongside
